@@ -1,0 +1,3 @@
+stormdb
+*.o
+.vscode/
