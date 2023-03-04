@@ -16,8 +16,8 @@ int main()
     int run = 1;
     char *line = (char *)storm_malloc(LINE_SIZE);
     char *ptr;
+    i8_t res;
     value_t value;
-    result_t res;
 
     while (run)
     {
@@ -28,13 +28,8 @@ int main()
         value = parse("REPL", line);
 
         res = value_fmt(&line, value);
-        if (res == Ok)
-        {
+        if (res == OK)
             printf("%s\n", line);
-        }
-
-        result_fmt(&line, res);
-        printf("result_t: %s\n", line);
 
         value_free(value);
     }

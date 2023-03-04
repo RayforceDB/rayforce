@@ -12,3 +12,24 @@ lexer_t new_lexer(str_t source)
 
     return lexer;
 }
+
+token_t next_token(lexer_t lexer)
+{
+    if (lexer->source[lexer->index] == '\0')
+    {
+        return Nil;
+    }
+
+    switch (lexer->source[lexer->index])
+    {
+    case '+':
+    {
+        lexer->index++;
+        return Plus;
+    }
+    default:
+    {
+        return Invalid;
+    }
+    }
+}

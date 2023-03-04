@@ -21,13 +21,12 @@ extern "C"
 #define TYPE_F64 3
 #define TYPE_ERR 127
 
-    typedef enum
-    {
-        Ok = 0,
-        InitError,
-        FormatError,
-        InvalidType
-    } result_t;
+// Result constants
+#define OK 0
+#define ERR_INIT 1
+#define ERR_PARSE 2
+#define ERR_FORMAT 3
+#define ERR_INVALID_TYPE 4
 
     typedef char i8_t;
     typedef char *str_t;
@@ -45,11 +44,18 @@ extern "C"
             i8_t i8_t_value;
             i64_t i64_t_value;
             f64 f64_value;
+
             struct
             {
                 i64_t len;
                 void *ptr;
             } list_value;
+
+            struct
+            {
+                i8_t code;
+                str_t message;
+            } error_value;
         };
     } __attribute__((aligned(16))) * value_t;
 
@@ -58,6 +64,9 @@ extern "C"
     // Constructors
     extern value_t new_scalar_i64(i64_t value);
     extern value_t new_vector_i64(i64_t *ptr, i64_t len);
+
+    // Error
+    extern value_t new_error(i8_t code, str_t message);
 
     // Destructor
     extern nil_t value_free(value_t value);

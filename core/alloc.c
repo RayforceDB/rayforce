@@ -5,6 +5,8 @@
 #include <sys/mman.h>
 #include <assert.h>
 
+#include <stdlib.h>
+
 #define MAP_ANONYMOUS 0x20
 
 // Global allocator reference

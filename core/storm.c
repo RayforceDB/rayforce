@@ -3,6 +3,17 @@
 #include <stdio.h>
 #include "alloc.h"
 
+extern value_t new_error(i8_t code, str_t message)
+{
+    value_t error;
+
+    error = storm_malloc(sizeof(struct value_t));
+    error->type = TYPE_ERR;
+    error->error_value.code = code;
+    error->error_value.message = message;
+    return error;
+}
+
 extern value_t new_scalar_i64(i64_t value)
 {
     value_t scalar;

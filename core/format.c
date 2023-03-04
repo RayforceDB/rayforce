@@ -7,24 +7,24 @@
 #define MAX_i64_t_WIDTH 20
 #define MAX_ROW_WIDTH MAX_i64_t_WIDTH * 2
 
-result_t nil_fmt(str_t *buffer)
+i8_t nil_fmt(str_t *buffer)
 {
     *buffer = (str_t)storm_malloc(4);
     strncpy(*buffer, "nil", 4);
-    return Ok;
+    return OK;
 }
 
-result_t scalar_i64_fmt(str_t *buffer, value_t value)
+i8_t scalar_i64_fmt(str_t *buffer, value_t value)
 {
     *buffer = (str_t)storm_malloc(MAX_i64_t_WIDTH);
     if (snprintf(*buffer, MAX_i64_t_WIDTH, "%lld", value->i64_t_value) < 0)
     {
-        return FormatError;
+        return ERR_FORMAT;
     }
-    return Ok;
+    return OK;
 }
 
-result_t vector_i64_fmt(str_t *buffer, value_t value)
+i8_t vector_i64_fmt(str_t *buffer, value_t value)
 {
     str_t buf;
     i64_t count, remains, len;
@@ -44,7 +44,7 @@ result_t vector_i64_fmt(str_t *buffer, value_t value)
         len = snprintf(buf, remains, "%lld, ", ((i64_t *)value->list_value.ptr)[i]);
         if (len < 0)
         {
-            return FormatError;
+            return ERR_FORMAT;
         }
         if (remains < len)
         {
@@ -60,7 +60,7 @@ result_t vector_i64_fmt(str_t *buffer, value_t value)
         len = snprintf(buf, remains, "%lld", ((i64_t *)value->list_value.ptr)[count]);
         if (len < 0)
         {
-            return FormatError;
+            return ERR_FORMAT;
         }
         if (remains < len)
         {
@@ -79,10 +79,48 @@ result_t vector_i64_fmt(str_t *buffer, value_t value)
     }
 
     strncpy(buf, "]", 2);
-    return Ok;
+    return OK;
 }
 
-extern result_t value_fmt(str_t *buffer, value_t value)
+i8_t error_fmt(str_t *buffer, value_t value)
+{
+    str_t code;
+    i64_t len;
+
+    *buffer = (str_t)storm_malloc(MAX_ROW_WIDTH);
+
+    switch (value->error_value.code)
+    {
+    case ERR_INIT:
+    {
+        code = "init";
+        len = 4;
+        break;
+    }
+    case ERR_PARSE:
+    {
+        code = "parse";
+        len = 5;
+        break;
+    }
+    default:
+    {
+        code = "unknown";
+        len = 7;
+        break;
+    }
+    }
+
+    len += strlen(value->error_value.message) + 12;
+    if (snprintf(*buffer, len, "** %s error: %s", code, value->error_value.message) < 0)
+    {
+        return ERR_FORMAT;
+    }
+
+    return OK;
+}
+
+extern i8_t value_fmt(str_t *buffer, value_t value)
 {
     switch (value->type)
     {
@@ -94,40 +132,13 @@ extern result_t value_fmt(str_t *buffer, value_t value)
     {
         return vector_i64_fmt(buffer, value);
     }
-    default:
+    case TYPE_ERR:
     {
-        return InvalidType;
-    }
-    }
-}
-
-extern nil_t result_fmt(str_t *buffer, result_t result_t)
-{
-    switch (result_t)
-    {
-    case Ok:
-    {
-        *buffer = (str_t)storm_malloc(3);
-        strncpy(*buffer, "Ok", 3);
-        break;
-    }
-    case FormatError:
-    {
-        *buffer = (str_t)storm_malloc(12);
-        strncpy(*buffer, "FormatError", 12);
-        break;
-    }
-    case InvalidType:
-    {
-        *buffer = (str_t)storm_malloc(12);
-        strncpy(*buffer, "InvalidType", 12);
-        break;
+        return error_fmt(buffer, value);
     }
     default:
     {
-        *buffer = (str_t)storm_malloc(10);
-        strncpy(*buffer, "Unknown", 10);
-        break;
+        return TYPE_ERR;
     }
     }
 }
