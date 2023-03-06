@@ -7,30 +7,34 @@
 #define MAX_i64_t_WIDTH 20
 #define MAX_ROW_WIDTH MAX_i64_t_WIDTH * 2
 
-i8_t nil_fmt(str_t *buffer)
+extern str_t str_fmt(str_t fmt, ...)
 {
-    *buffer = (str_t)storm_malloc(4);
-    strncpy(*buffer, "nil", 4);
-    return OK;
-}
+    int n, size = MAX_ROW_WIDTH;
+    str_t p = (str_t)storm_malloc(size);
 
-i8_t scalar_i64_fmt(str_t *buffer, value_t value)
-{
-    *buffer = (str_t)storm_malloc(MAX_i64_t_WIDTH);
-    if (snprintf(*buffer, MAX_i64_t_WIDTH, "%lld", value->i64_t_value) < 0)
+    while (1)
     {
-        return ERR_FORMAT;
+        va_list ap;
+        va_start(ap, fmt);
+        n = vsnprintf(p, size, fmt, ap);
+        va_end(ap);
+
+        if (n > -1 && n < size)
+            break;
+
+        size *= 2;
+        p = storm_realloc(p, size);
     }
-    return OK;
+
+    return p;
 }
 
-i8_t vector_i64_fmt(str_t *buffer, value_t value)
+str_t vector_i64_fmt(value_t value)
 {
-    str_t buf;
+    str_t str, buf;
     i64_t count, remains, len;
 
-    *buffer = (str_t)storm_malloc(MAX_ROW_WIDTH + 4);
-    buf = *buffer;
+    str = buf = (str_t)storm_malloc(MAX_ROW_WIDTH + 4);
     strncpy(buf, "[", 2);
     buf += 1;
 
@@ -40,36 +44,36 @@ i8_t vector_i64_fmt(str_t *buffer, value_t value)
 
     for (i64_t i = 0; i < count; i++)
     {
-        remains = MAX_ROW_WIDTH - (buf - (*buffer));
+        remains = MAX_ROW_WIDTH - (buf - str);
         len = snprintf(buf, remains, "%lld, ", ((i64_t *)value->list_value.ptr)[i]);
         if (len < 0)
         {
+            storm_free(str);
             return ERR_FORMAT;
         }
+
         if (remains < len)
         {
-            buf = (*buffer) + MAX_ROW_WIDTH - 1;
+            buf = str + MAX_ROW_WIDTH - 1;
             break;
         }
         buf += len;
     }
 
-    remains = MAX_ROW_WIDTH - (buf - (*buffer));
+    remains = MAX_ROW_WIDTH - (buf - str);
     if (value->list_value.len > 0 && remains > 0)
     {
         len = snprintf(buf, remains, "%lld", ((i64_t *)value->list_value.ptr)[count]);
+
         if (len < 0)
         {
+            storm_free(str);
             return ERR_FORMAT;
         }
         if (remains < len)
-        {
-            buf = (*buffer) + MAX_ROW_WIDTH - 1;
-        }
+            buf = str + MAX_ROW_WIDTH - 1;
         else
-        {
             buf += len;
-        }
     }
 
     if (remains < len)
@@ -79,66 +83,41 @@ i8_t vector_i64_fmt(str_t *buffer, value_t value)
     }
 
     strncpy(buf, "]", 2);
-    return OK;
+
+    return str;
 }
 
-i8_t error_fmt(str_t *buffer, value_t value)
+str_t error_fmt(value_t value)
 {
     str_t code;
-    i64_t len;
-
-    *buffer = (str_t)storm_malloc(MAX_ROW_WIDTH);
 
     switch (value->error_value.code)
     {
     case ERR_INIT:
-    {
         code = "init";
-        len = 4;
         break;
-    }
     case ERR_PARSE:
-    {
         code = "parse";
-        len = 5;
         break;
-    }
     default:
-    {
         code = "unknown";
-        len = 7;
         break;
     }
-    }
 
-    len += strlen(value->error_value.message) + 12;
-    if (snprintf(*buffer, len, "** %s error: %s", code, value->error_value.message) < 0)
-    {
-        return ERR_FORMAT;
-    }
-
-    return OK;
+    return str_fmt("** %s error: %s", code, value->error_value.message);
 }
 
-extern i8_t value_fmt(str_t *buffer, value_t value)
+extern str_t value_fmt(value_t value)
 {
     switch (value->type)
     {
     case -TYPE_i64:
-    {
-        return scalar_i64_fmt(buffer, value);
-    }
+        return str_fmt("%lld", value->i64_t_value);
     case TYPE_i64:
-    {
-        return vector_i64_fmt(buffer, value);
-    }
+        return vector_i64_fmt(value);
     case TYPE_ERR:
-    {
-        return error_fmt(buffer, value);
-    }
+        return error_fmt(value);
     default:
-    {
         return TYPE_ERR;
-    }
     }
 }

@@ -23,13 +23,9 @@ token_t next_token(lexer_t lexer)
     switch (lexer->source[lexer->index])
     {
     case '+':
-    {
         lexer->index++;
         return Plus;
-    }
     default:
-    {
         return Invalid;
-    }
     }
 }

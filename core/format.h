@@ -3,6 +3,7 @@
 
 #include "storm.h"
 
-extern i8_t value_fmt(str_t *buffer, value_t value);
+extern str_t str_fmt(str_t fmt, ...);
+extern str_t value_fmt(value_t value);
 
 #endif

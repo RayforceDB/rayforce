@@ -1,4 +1,4 @@
-
+#include <stdio.h>
 #include "lex.h"
 #include "parse.h"
 #include "../core/storm.h"
@@ -25,16 +25,11 @@ value_t parse_program(parser_t parser)
         switch (token)
         {
         case Plus:
-        {
             return new_scalar_i64(123);
-        }
-
         default:
-        {
             err_msg = (str_t)storm_malloc(24);
             snprintf(err_msg, 24, "unexpected token: '%c'", parser->lexer->source[parser->lexer->index]);
             return new_error(ERR_PARSE, err_msg);
-        }
         }
     } while (token != Nil);
 

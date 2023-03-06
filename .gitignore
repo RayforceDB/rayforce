@@ -3,3 +3,4 @@ stormdb
 .vscode/
 *.a
 *.gch
+stormdb.S

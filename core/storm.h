@@ -29,10 +29,28 @@ extern "C"
 #define ERR_INVALID_TYPE 4
 
     typedef char i8_t;
+    typedef unsigned char u8_t;
     typedef char *str_t;
+    typedef short i16_t;
+    typedef unsigned short u16_t;
+    typedef int i32_t;
+    typedef unsigned int u32_t;
     typedef long long i64_t;
+    typedef unsigned long long u64_t;
     typedef double f64;
     typedef void nil_t;
+
+    typedef struct error_t
+    {
+        i8_t code;
+        str_t message;
+    } error_t;
+
+    typedef struct vector_t
+    {
+        i64_t len;
+        void *ptr;
+    } vector_t;
 
     // Generic type
     typedef struct value_t
@@ -44,18 +62,8 @@ extern "C"
             i8_t i8_t_value;
             i64_t i64_t_value;
             f64 f64_value;
-
-            struct
-            {
-                i64_t len;
-                void *ptr;
-            } list_value;
-
-            struct
-            {
-                i8_t code;
-                str_t message;
-            } error_value;
+            vector_t list_value;
+            error_t error_value;
         };
     } __attribute__((aligned(16))) * value_t;
 

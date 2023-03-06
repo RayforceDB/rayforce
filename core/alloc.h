@@ -19,8 +19,9 @@ typedef struct alloc_t
 
 CASSERT(sizeof(struct alloc_t) % PAGE_SIZE == 0, alloc_h)
 
-extern nil_t *storm_malloc(int size);
-extern nil_t storm_free(void *block);
+extern nil_t *storm_malloc(i32_t size);
+extern nil_t *storm_realloc(nil_t *ptr, i32_t size);
+extern nil_t storm_free(nil_t *block);
 
 extern nil_t storm_alloc_init();
 extern nil_t storm_alloc_deinit();
