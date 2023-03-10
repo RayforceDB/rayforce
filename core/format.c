@@ -53,6 +53,8 @@ str_t vector_fmt(value_t *value)
             len = snprintf(buf, remains, "%lld, ", ((i64_t *)value->s0.ptr)[i]);
         else if (v_type == TYPE_F64)
             len = snprintf(buf, remains, "%.*f, ", F64_PRECISION, ((f64_t *)value->s0.ptr)[i]);
+        else if (v_type == TYPE_SYMBOL)
+            len = snprintf(buf, remains, "%s, ", symbols_get(((i64_t *)value->s0.ptr)[i]));
 
         if (len < 0)
         {
@@ -60,21 +62,23 @@ str_t vector_fmt(value_t *value)
             return NULL;
         }
 
-        if (remains < len)
+        if (remains < 3)
         {
-            buf = str + MAX_ROW_WIDTH - 1;
+            buf = str + MAX_ROW_WIDTH - 2;
             break;
         }
         buf += len;
     }
 
     remains = MAX_ROW_WIDTH - (buf - str);
-    if (value->s0.len > 0 && remains > 0)
+    if (value->s0.len > 0 && remains > 3)
     {
         if (v_type == TYPE_I64)
             len = snprintf(buf, remains, "%lld", ((i64_t *)value->s0.ptr)[count]);
         else if (v_type == TYPE_F64)
             len = snprintf(buf, remains, "%.*f", F64_PRECISION, ((f64_t *)value->s0.ptr)[count]);
+        else if (v_type == TYPE_SYMBOL)
+            len = snprintf(buf, remains, "%s", symbols_get(((i64_t *)value->s0.ptr)[count]));
 
         if (len < 0)
         {
@@ -82,18 +86,15 @@ str_t vector_fmt(value_t *value)
             return NULL;
         }
         if (remains < len)
-            buf = str + MAX_ROW_WIDTH - 1;
+            buf = str + MAX_ROW_WIDTH - 2;
         else
             buf += len;
     }
 
-    if (remains < len)
-    {
-        strncpy(buf, "..", 3);
-        buf += 2;
-    }
-
-    strncpy(buf, "]", 2);
+    if (remains < 3)
+        strncpy(buf, "..]", 4);
+    else
+        strncpy(buf, "]", 2);
 
     return str;
 }
@@ -133,6 +134,8 @@ extern str_t value_fmt(value_t *value)
     case TYPE_I64:
         return vector_fmt(value);
     case TYPE_F64:
+        return vector_fmt(value);
+    case TYPE_SYMBOL:
         return vector_fmt(value);
     case TYPE_ERROR:
         return error_fmt(value);

@@ -78,6 +78,7 @@ extern "C"
     extern value_t xf64(f64_t *ptr, i64_t len);
     extern value_t string(str_t ptr, i64_t len);
     extern value_t symbol(str_t ptr, i64_t len);
+    extern value_t xsymbol(i64_t *ptr, i64_t len);
     extern value_t s0(value_t *ptr, i64_t len);
 
     // Error

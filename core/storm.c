@@ -85,6 +85,19 @@ extern value_t symbol(str_t ptr, i64_t len)
     return list;
 }
 
+extern value_t xsymbol(i64_t *ptr, i64_t len)
+{
+    value_t vector = {
+        .type = TYPE_SYMBOL,
+        .s0 = {
+            .ptr = ptr,
+            .len = len,
+        },
+    };
+
+    return vector;
+}
+
 extern value_t s0(value_t *ptr, i64_t len)
 {
     value_t list = {

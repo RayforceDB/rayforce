@@ -77,7 +77,14 @@ value_t parse_vector(parser_t *parser)
     i64_t len = 0;
     str_t *current = &parser->current;
     value_t token;
-    u8_t is_f64 = 0;
+    /*
+     *type of vector:
+     * 0 = initial
+     * 1 = i64
+     * 2 = f64
+     * 3 = symbol
+     */
+    u8_t type = 0;
 
     (*current)++; // skip '['
 
@@ -97,22 +104,51 @@ value_t parse_vector(parser_t *parser)
 
         if (token.type == -TYPE_I64)
         {
-            if (is_f64)
-                ((f64_t *)vec)[len++] = (f64_t)token.i64;
-            else
+            if (type < 2)
+            {
                 vec[len++] = token.i64;
+                type = 1;
+            }
+            else if (type == 2)
+                ((f64_t *)vec)[len++] = (f64_t)token.i64;
+
+            else
+            {
+                storm_free(vec);
+                return error(ERR_PARSE, "Invalid token in vector");
+            }
         }
         else if (token.type == -TYPE_F64)
         {
-            if (!is_f64)
+            if (type == 2)
+                ((f64_t *)vec)[len++] = token.f64;
+            else if (type < 2)
             {
                 for (i64_t i = 0; i < len; i++)
                     ((f64_t *)vec)[i] = (f64_t)vec[i];
 
-                is_f64 = 1;
-            }
+                ((f64_t *)vec)[len++] = token.f64;
 
-            ((f64_t *)vec)[len++] = token.f64;
+                type = 2;
+            }
+            else
+            {
+                storm_free(vec);
+                return error(ERR_PARSE, "Invalid token in vector");
+            }
+        }
+        else if (token.type == -TYPE_SYMBOL)
+        {
+            if (type == 0 || type == 3)
+            {
+                vec[len++] = token.i64;
+                type = 3;
+            }
+            else
+            {
+                storm_free(vec);
+                return error(ERR_PARSE, "Invalid token in vector");
+            }
         }
         else
         {
@@ -134,10 +170,15 @@ value_t parse_vector(parser_t *parser)
 
     (*current)++;
 
-    if (is_f64)
+    switch (type)
+    {
+    case 1:
+        return xi64(vec, len);
+    case 2:
         return xf64((f64_t *)vec, len);
-
-    return xi64(vec, len);
+    case 3:
+        return xsymbol(vec, len);
+    };
 }
 
 value_t parse_symbol(parser_t *parser)
