@@ -19,7 +19,9 @@ extern "C"
 #define TYPE_I8 1
 #define TYPE_I64 2
 #define TYPE_F64 3
-#define TYPE_ERR 127
+#define TYPE_STRING 4
+#define TYPE_SYMBOL 5
+#define TYPE_ERROR 127
 
 // Result constants
 #define OK 0
@@ -72,9 +74,10 @@ extern "C"
     // Constructors
     extern value_t i64(i64_t value);
     extern value_t f64(f64_t value);
-    extern value_t vi64(i64_t *ptr, i64_t len);
-    extern value_t vf64(f64_t *ptr, i64_t len);
-    extern value_t str(str_t *ptr, i64_t len);
+    extern value_t xi64(i64_t *ptr, i64_t len);
+    extern value_t xf64(f64_t *ptr, i64_t len);
+    extern value_t string(str_t ptr, i64_t len);
+    extern value_t symbol(str_t ptr, i64_t len);
     extern value_t s0(value_t *ptr, i64_t len);
 
     // Error

@@ -128,11 +128,13 @@ extern str_t value_fmt(value_t *value)
         return str_fmt("%lld", value->i64);
     case -TYPE_F64:
         return str_fmt("%.*f", F64_PRECISION, value->f64);
+    case -TYPE_SYMBOL:
+        return str_fmt("%s", symbols_get(value->i64));
     case TYPE_I64:
         return vector_fmt(value);
     case TYPE_F64:
         return vector_fmt(value);
-    case TYPE_ERR:
+    case TYPE_ERROR:
         return error_fmt(value);
     default:
         return str_fmt("null");

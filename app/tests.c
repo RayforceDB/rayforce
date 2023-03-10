@@ -83,8 +83,9 @@ int test_symbols()
     for (int i = 0; i < 1000000; i++)
     {
         // printf("%s\n", str[i]);
-        i64_t id = symbols_intern(str[i]);
-        // str_t val = symbols_get(symbols, id);
+        string_t s = string_create(str[i], strlen(str[i]));
+        i64_t id = symbols_intern(s);
+        // str_t val = symbols_get(id);
         // if (val == NULL)
         //     printf("NULL -- ID: %lld ORIG: %s\n", id, str[i]);
         // else
@@ -98,7 +99,7 @@ int test_symbols()
     return 0;
 }
 
-int main(int argc, char **argv)
+int main()
 {
     storm_alloc_init();
 

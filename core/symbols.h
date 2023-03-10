@@ -4,6 +4,7 @@
 #include "storm.h"
 #include "hash.h"
 #include "mmap.h"
+#include "string.h"
 
 #define STRINGS_POOL_SIZE 4096
 
@@ -27,7 +28,7 @@ typedef struct symbols_t
     str_t strings_pool;
 } symbols_t;
 
-i64_t symbols_intern(str_t str);
+i64_t symbols_intern(string_t str);
 str_t symbols_get(i64_t key);
 
 symbols_t *symbols_create();

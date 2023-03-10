@@ -11,7 +11,7 @@ value_t til(i64_t count)
     {
         vec[i] = i;
     }
-    return vi64(vec, count);
+    return xi64(vec, count);
 }
 
 value_t storm_add(value_t *a, value_t *b)

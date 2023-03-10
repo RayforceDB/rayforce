@@ -1,7 +1,8 @@
+#include <stdio.h>
 #include "storm.h"
 #include "format.h"
-#include <stdio.h>
 #include "alloc.h"
+#include "string.h"
 
 extern i8_t is_null(value_t *value)
 {
@@ -10,13 +11,13 @@ extern i8_t is_null(value_t *value)
 
 extern i8_t is_error(value_t *value)
 {
-    return value->type == TYPE_ERR;
+    return value->type == TYPE_ERROR;
 }
 
 extern value_t error(i8_t code, str_t message)
 {
     value_t error = {
-        .type = TYPE_ERR,
+        .type = TYPE_ERROR,
         .error = {
             .code = code,
             .message = message,
@@ -46,7 +47,7 @@ extern value_t f64(f64_t value)
     return scalar;
 }
 
-extern value_t vi64(i64_t *ptr, i64_t len)
+extern value_t xi64(i64_t *ptr, i64_t len)
 {
     value_t vector = {
         .type = TYPE_I64,
@@ -59,7 +60,7 @@ extern value_t vi64(i64_t *ptr, i64_t len)
     return vector;
 }
 
-extern value_t vf64(f64_t *ptr, i64_t len)
+extern value_t xf64(f64_t *ptr, i64_t len)
 {
     value_t vector = {
         .type = TYPE_F64,
@@ -70,6 +71,18 @@ extern value_t vf64(f64_t *ptr, i64_t len)
     };
 
     return vector;
+}
+
+extern value_t symbol(str_t ptr, i64_t len)
+{
+    string_t string = string_create(ptr, len);
+    i64_t id = symbols_intern(string);
+    value_t list = {
+        .type = -TYPE_SYMBOL,
+        .i64 = id,
+    };
+
+    return list;
 }
 
 extern value_t s0(value_t *ptr, i64_t len)

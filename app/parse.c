@@ -135,9 +135,26 @@ value_t parse_vector(parser_t *parser)
     (*current)++;
 
     if (is_f64)
-        return vf64((f64_t *)vec, len);
+        return xf64((f64_t *)vec, len);
 
-    return vi64(vec, len);
+    return xi64(vec, len);
+}
+
+value_t parse_symbol(parser_t *parser)
+{
+    str_t pos = parser->current;
+    value_t res;
+
+    // Skip first char and proceed until the end of the symbol
+    do
+    {
+        pos++;
+    } while (is_alphanum(*pos));
+
+    res = symbol(parser->current, pos - parser->current);
+    parser->current = pos;
+
+    return res;
 }
 
 value_t advance(parser_t *parser)
@@ -156,6 +173,9 @@ value_t advance(parser_t *parser)
     if ((**current) == '-' || is_digit(**current))
         return parse_number(parser);
 
+    if (is_alpha(**current))
+        return parse_symbol(parser);
+
     return s0(NULL, 0);
 }
 
@@ -169,7 +189,7 @@ value_t parse_program(parser_t *parser)
     token = advance(parser);
     // } while (token != NULL);
 
-    if (!at_eof(*parser->current))
+    if (!is_error(&token) && !at_eof(*parser->current))
         return error(ERR_PARSE, str_fmt("Unexpected token: %s", parser->current));
 
     return token;
