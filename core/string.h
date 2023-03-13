@@ -26,17 +26,4 @@
 
 #include "bitspire.h"
 
-/*
- * String type containing length and pointer to string.
- * Does not require string to be null terminated
- */
-typedef struct string_t
-{
-    u64_t len;
-    str_t str;
-} string_t;
-
-string_t string_create(str_t str, u64_t len);
-str_t string_clone(string_t string);
-
 #endif

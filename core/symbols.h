@@ -51,7 +51,7 @@ typedef struct symbols_t
     str_t strings_pool;
 } symbols_t;
 
-i64_t symbols_intern(string_t str);
+i64_t symbols_intern(value_t *string);
 str_t symbols_get(i64_t key);
 
 symbols_t *symbols_create();

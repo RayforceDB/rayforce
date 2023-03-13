@@ -43,7 +43,7 @@
 #define TYPE_I64 2
 #define TYPE_F64 3
 #define TYPE_STRING 4
-#define TYPE_SYMBOL 5
+#define TYPE_SYMBOL 6
 #define TYPE_TABLE 98
 #define TYPE_DICT 99
 #define TYPE_ERROR 127
@@ -99,18 +99,19 @@ CASSERT(sizeof(struct value_t) == 32, bitspire_h)
 // Constructors
 extern value_t i64(i64_t value);                               // i64 scalar
 extern value_t f64(f64_t value);                               // f64 scalar
-extern value_t symbol(str_t ptr, i64_t len);                   // symbol
+extern value_t symbol(str_t ptr);                              // symbol
 extern value_t vector(i8_t type, u8_t size_of_val, i64_t len); // vector of type
+extern value_t string(i64_t len);                              // string (allocates len + 1 for \0 but sets len to a 'len')
 
 #define vector_i64(len) (vector(TYPE_I64, sizeof(i64_t), len))       // i64 vector
 #define vector_f64(len) (vector(TYPE_F64, sizeof(f64_t), len))       // f64 vector
 #define vector_symbol(len) (vector(TYPE_SYMBOL, sizeof(i64_t), len)) // symbol vector
-#define string(len) (vector(TYPE_STRING, sizeof(u8_t), len))         // string
+#define list(len) (vector(TYPE_LIST, sizeof(value_t), len))          // list
 
-extern value_t list(value_t *ptr, i64_t len); // list
-extern value_t null();                        // null (as null list)
-extern value_t table(value_t *ptr);           // table (accepts list of two vectors)
-extern value_t dict(value_t *ptr);            // dict (accepts list of two vectors)
+extern value_t str(str_t ptr, i64_t len); // str non-duplicated string, possibly non null terminated
+extern value_t null();                    // null (as null list)
+extern value_t table(value_t *ptr);       // table (accepts list of two vectors)
+extern value_t dict(value_t *ptr);        // dict (accepts list of two vectors)
 
 // Error
 extern value_t error(i8_t code, str_t message);
@@ -122,6 +123,8 @@ extern null_t value_free(value_t *value);
 #define as_vector_i64(value) ((i64_t *)(value)->list.ptr)
 #define as_vector_f64(value) ((f64_t *)(value)->list.ptr)
 #define as_vector_symbol(value) ((i64_t *)(value)->list.ptr)
+#define as_string(value) ((str_t)(value)->list.ptr)
+#define as_list(value) ((value_t *)(value)->list.ptr)
 
 // Checkers
 extern i8_t is_null(value_t *value);

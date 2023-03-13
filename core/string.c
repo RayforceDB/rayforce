@@ -26,22 +26,31 @@
 #include "bitspire.h"
 #include "alloc.h"
 
-string_t string_create(str_t str, u64_t len)
+extern value_t string(i64_t len)
 {
-    string_t string = {
-        .len = len,
-        .str = str,
+    str_t ptr = bitspire_malloc(len + 1);
+    ptr[len] = '\0';
+
+    value_t string = {
+        .type = TYPE_STRING,
+        .list = {
+            .len = len,
+            .ptr = ptr,
+        },
     };
 
     return string;
 }
 
-str_t string_clone(string_t string)
+extern value_t str(str_t ptr, i64_t len)
 {
-    if (string.len == 0)
-        return NULL;
+    value_t string = {
+        .type = TYPE_STRING,
+        .list = {
+            .len = len,
+            .ptr = ptr,
+        },
+    };
 
-    str_t res = (str_t)bitspire_malloc(string.len + 1);
-    strncpy(res, string.str, string.len + 1);
-    return res;
+    return string;
 }

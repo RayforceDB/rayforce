@@ -70,26 +70,15 @@ extern value_t f64(f64_t value)
     return scalar;
 }
 
-extern value_t symbol(str_t ptr, i64_t len)
+extern value_t symbol(str_t ptr)
 {
-    string_t string = string_create(ptr, len);
-    i64_t id = symbols_intern(string);
+    // Do not allocate new string - it would be done by symbols_intern (if needed)
+    value_t string = str(ptr, strlen(ptr));
+    string.list.ptr = ptr;
+    i64_t id = symbols_intern(&string);
     value_t list = {
         .type = -TYPE_SYMBOL,
         .i64 = id,
-    };
-
-    return list;
-}
-
-extern value_t list(value_t *ptr, i64_t len)
-{
-    value_t list = {
-        .type = TYPE_LIST,
-        .list = {
-            .ptr = ptr,
-            .len = len,
-        },
     };
 
     return list;

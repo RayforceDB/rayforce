@@ -39,9 +39,9 @@ u64_t string_hash(null_t *val)
 {
     u32_t hash = 5381;
 
-    string_t *string = (string_t *)val;
-    u32_t len = string->len;
-    str_t str = string->str;
+    value_t *string = (value_t *)val;
+    u32_t len = string->list.len;
+    str_t str = string->list.ptr;
 
     for (u32_t i = 0; i < len; i++)
         hash += (hash << 5) + str[i];
@@ -60,21 +60,21 @@ i32_t i64_cmp(null_t *a, null_t *b)
 }
 
 /*
- * Compares string_t with null terminated string.
+ * Compares value_t string with null terminated string.
  * Returns 0 if equal, 1 if not equal.
  * Should not be used elsewere but symbols
  */
 i32_t string_str_cmp(null_t *a, null_t *b)
 {
-    string_t *str_a = (string_t *)a;
+    value_t *str_a = (value_t *)a;
     str_t str_b = (str_t)b;
 
     u64_t len_b = strlen(str_b);
 
-    if (str_a->len != len_b)
+    if (str_a->list.len != len_b)
         return 1;
 
-    return strncmp(str_a->str, str_b, len_b);
+    return strncmp(str_a->list.ptr, str_b, len_b);
 }
 
 /*
@@ -98,10 +98,12 @@ null_t *str_dup(null_t *key, null_t *val, bucket_t *bucket)
     alloc_t alloc = alloc_get();
     symbols_t *symbols = alloc->symbols;
 
-    string_t *string = (string_t *)key;
+    value_t *string = (value_t *)key;
+    u64_t len = string->list.len;
+    str_t str = string->list.ptr;
 
     // Allocate new pool node
-    if ((u64_t)symbols->strings_pool + string->len + 1 - (u64_t)symbols->pool_node > STRINGS_POOL_SIZE)
+    if ((u64_t)symbols->strings_pool + len - (u64_t)symbols->pool_node > STRINGS_POOL_SIZE)
     {
         pool_node_t *node = pool_node_create();
         symbols->pool_node->next = node;
@@ -109,10 +111,10 @@ null_t *str_dup(null_t *key, null_t *val, bucket_t *bucket)
         symbols->strings_pool = (str_t)(node + sizeof(pool_node_t *)); // Skip the node size of next ptr
     }
 
-    strncpy(symbols->strings_pool, string->str, string->len);
+    strncpy(symbols->strings_pool, str, len);
     bucket->key = symbols->strings_pool;
     bucket->val = val;
-    symbols->strings_pool += string->len + 1;
+    symbols->strings_pool += len + 1; // +1 for null terminator (buffer is zeroed)
     return bucket->key;
 }
 
@@ -146,11 +148,11 @@ null_t symbols_free(symbols_t *symbols)
     ht_free(symbols->id_to_str);
 }
 
-i64_t symbols_intern(string_t str)
+i64_t symbols_intern(value_t *string)
 {
     symbols_t *symbols = alloc_get()->symbols;
     u64_t id = symbols->str_to_id->size;
-    u64_t id_or_str = (u64_t)ht_insert_with(symbols->str_to_id, &str, (null_t *)id, &str_dup);
+    u64_t id_or_str = (u64_t)ht_insert_with(symbols->str_to_id, string, (null_t *)id, &str_dup);
     if (symbols->str_to_id->size == id)
         return id_or_str;
 

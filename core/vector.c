@@ -31,6 +31,17 @@
 #define CAPACITY_FACTOR 8
 #define alignup(x, a) (((x) + (a)-1) & ~((a)-1))
 #define capacity(x) (alignup(x, CAPACITY_FACTOR))
+#define push(vector, type, value)                                                      \
+    {                                                                                  \
+        i64_t len = vector->list.len;                                                  \
+        i64_t cap = capacity(len);                                                     \
+        if (cap == 0)                                                                  \
+            vector->list.ptr = bitspire_malloc(CAPACITY_FACTOR * sizeof(type));        \
+        else if (cap == len)                                                           \
+            vector->list.ptr = bitspire_realloc(vector->list.ptr, cap * sizeof(type)); \
+        ((type *)(vector->list.ptr))[vector->list.len++] = value;                      \
+    }
+#define pop(vector, type) ((type *)(vector->list.ptr))[vector->list.len--]
 
 extern value_t vector(i8_t type, u8_t size_of_val, i64_t len)
 {
@@ -52,35 +63,30 @@ extern value_t vector(i8_t type, u8_t size_of_val, i64_t len)
 
 extern null_t vector_i64_push(value_t *vector, i64_t value)
 {
-    i64_t len = vector->list.len;
-    i64_t cap = capacity(len);
-
-    if (cap == 0)
-        vector->list.ptr = bitspire_malloc(CAPACITY_FACTOR);
-
-    else if (cap == len)
-        vector->list.ptr = bitspire_realloc(vector->list.ptr, cap);
-
-    ((i64_t *)(vector->list.ptr))[vector->list.len++] = value;
+    push(vector, i64_t, value);
 }
 
 extern i64_t vector_i64_pop(value_t *vector)
 {
-    return ((i64_t *)(vector->list.ptr))[vector->list.len--];
+    return pop(vector, i64_t);
 }
 
 extern null_t vector_f64_push(value_t *vector, f64_t value)
 {
-    i64_t len = vector->list.len;
-    i64_t cap = capacity(len);
-
-    if (cap == len)
-        vector->list.ptr = bitspire_realloc(vector->list.ptr, cap);
-
-    ((f64_t *)(vector->list.ptr))[vector->list.len++] = value;
+    push(vector, f64_t, value);
 }
 
 extern f64_t vector_f64_pop(value_t *vector)
 {
-    return ((f64_t *)(vector->list.ptr))[vector->list.len--];
+    return pop(vector, f64_t);
+}
+
+extern null_t list_push(value_t *list, value_t value)
+{
+    push(list, value_t, value);
+}
+
+extern value_t list_pop(value_t *list)
+{
+    return pop(list, value_t);
 }

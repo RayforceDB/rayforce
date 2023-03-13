@@ -53,7 +53,7 @@ u8_t is_alphanum(u8_t c)
 
 u8_t at_eof(u8_t c)
 {
-    return c == '\n';
+    return c == '\0' || c == '\n';
 }
 
 value_t parse_number(parser_t *parser)
@@ -131,7 +131,7 @@ value_t parse_vector(parser_t *parser)
             else if (vec.type == TYPE_I64)
             {
 
-                for (i64_t i = 0; i < vec.list.len; i++)
+                for (u64_t i = 0; i < vec.list.len; i++)
                     as_vector_f64(&vec)[i] = (f64_t)as_vector_i64(&vec)[i];
 
                 vector_f64_push(&vec, token.f64);
@@ -174,51 +174,43 @@ value_t parse_vector(parser_t *parser)
     return vec;
 }
 
-// value_t parse_list(parser_t *parser)
-// {
-//     i64_t cap = 8;
-//     u32_t len = 0;
-//     str_t *current = &parser->current;
-//     value_t *vec = (value_t *)bitspire_malloc(cap * sizeof(value_t));
-//     value_t token;
+value_t parse_list(parser_t *parser)
+{
+    u64_t cap = 8;
+    value_t vec = list(0), token;
+    str_t *current = &parser->current;
 
-//     (*current)++; // skip '('
+    (*current)++; // skip '('
 
-//     while (!at_eof(**current) && (**current) != ')')
-//     {
-//         token = advance(parser);
+    while (!at_eof(**current) && (**current) != ')')
+    {
+        token = advance(parser);
 
-//         if (is_error(&token))
-//         {
-//             bitspire_free(vec);
-//             return token;
-//         }
+        if (is_error(&token))
+        {
+            value_free(&vec);
+            return token;
+        }
 
-//         // extend vec if needed
-//         if (len == cap)
-//         {
-//             cap *= 2;
-//             vec = bitspire_realloc(vec, cap * sizeof(value_t));
-//         }
+        list_push(&vec, token);
+    }
 
-//         vec[len++] = token;
-//     }
+    if ((**current) != ')')
+    {
+        value_free(&vec);
+        return error(ERR_PARSE, "Expected ')'");
+    }
 
-//     if ((**current) != ')')
-//     {
-//         bitspire_free(vec);
-//         return error(ERR_PARSE, "Expected ')'");
-//     }
+    (*current)++;
 
-//     (*current)++;
-
-//     return list(vec, len);
-// }
+    return vec;
+}
 
 value_t parse_symbol(parser_t *parser)
 {
     str_t pos = parser->current;
-    value_t res;
+    value_t res, s;
+    i64_t id;
 
     // Skip first char and proceed until the end of the symbol
     do
@@ -226,7 +218,10 @@ value_t parse_symbol(parser_t *parser)
         pos++;
     } while (is_alphanum(*pos));
 
-    res = symbol(parser->current, pos - parser->current);
+    s = str(parser->current, pos - parser->current);
+    id = symbols_intern(&s);
+    res = i64(id);
+    res.type = -TYPE_SYMBOL;
     parser->current = pos;
 
     return res;
@@ -237,7 +232,7 @@ value_t parse_string(parser_t *parser)
     parser->current++; // skip '"'
     str_t pos = parser->current, new_str;
     u32_t len;
-    value_t res = string(0);
+    value_t res;
 
     while (!at_eof(*pos))
     {
@@ -254,8 +249,8 @@ value_t parse_string(parser_t *parser)
         return error(ERR_PARSE, "Expected '\"'");
 
     len = pos - parser->current;
-    // new_str = string_clone(string_create(parser->current, len));
-    // res = string(new_str, len);
+    res = string(len);
+    strncpy(as_string(&res), parser->current, len);
     parser->current = pos + 1;
 
     return res;
@@ -315,17 +310,17 @@ value_t advance(parser_t *parser)
     if ((**current) == '[')
         return parse_vector(parser);
 
-    // if ((**current) == '(')
-    //     return parse_list(parser);
+    if ((**current) == '(')
+        return parse_list(parser);
 
     if ((**current) == '-' || is_digit(**current))
         return parse_number(parser);
 
-    // if (is_alpha(**current))
-    //     return parse_symbol(parser);
+    if (is_alpha(**current))
+        return parse_symbol(parser);
 
-    // if ((**current) == '"')
-    //     return parse_string(parser);
+    if ((**current) == '"')
+        return parse_string(parser);
 
     return null();
 }
