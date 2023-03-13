@@ -71,6 +71,11 @@ u8_t is_at(value_t *token, u8_t c)
     return token->type == TYPE_TOKEN && token->i64 == (i64_t)c;
 }
 
+u8_t is_at_term(value_t *token)
+{
+    return token->type == TYPE_TOKEN && at_term(token->i64);
+}
+
 u8_t shift(str_t *current)
 {
     if (at_eof(**current))
@@ -130,7 +135,7 @@ value_t parse_number(parser_t *parser)
 value_t parse_string(parser_t *parser)
 {
     parser->current++; // skip '"'
-    str_t pos = parser->current, new_str;
+    str_t pos = parser->current;
     u32_t len;
     value_t res;
 
@@ -193,6 +198,12 @@ value_t parse_vector(parser_t *parser)
             return token;
         }
 
+        if (is_at(&token, '\0'))
+        {
+            value_free(&vec);
+            return error(ERR_PARSE, "Expected ']'");
+        }
+
         if (token.type == -TYPE_I64)
         {
             if (vec.type == TYPE_I64)
@@ -212,7 +223,7 @@ value_t parse_vector(parser_t *parser)
             else if (vec.type == TYPE_I64)
             {
 
-                for (i64_t i = 0; i < vec.list.len; i++)
+                for (u64_t i = 0; i < vec.list.len; i++)
                     as_vector_f64(&vec)[i] = (f64_t)as_vector_i64(&vec)[i];
 
                 vector_f64_push(&vec, token.f64);
@@ -344,7 +355,7 @@ value_t advance(parser_t *parser)
     str_t *current = &parser->current;
 
     if (at_eof(**current))
-        return null();
+        return to_token(0);
 
     // Skip all whitespaces
     while (is_whitespace(**current))
@@ -383,12 +394,19 @@ value_t parse_program(parser_t *parser)
     {
         token = advance(parser);
 
-        if (is_at(&token, '\0'))
-            break;
-
         if (is_error(&token))
         {
             err_msg = str_fmt(0, "%s:%d:%d: %s", parser->filename, parser->line, parser->column, as_string(&token));
+            value_free(&token);
+            return error(ERR_PARSE, err_msg);
+        }
+
+        if (is_at(&token, '\0'))
+            break;
+
+        if (is_at_term(&token))
+        {
+            err_msg = str_fmt(0, "%s:%d:%d: %s", parser->filename, parser->line, parser->column, "Unexpected token");
             value_free(&token);
             return error(ERR_PARSE, err_msg);
         }
@@ -401,7 +419,7 @@ value_t parse_program(parser_t *parser)
 
 extern value_t parse(str_t filename, str_t input)
 {
-    value_t result_t;
+    value_t prg;
 
     parser_t parser = {
         .filename = filename,
@@ -411,7 +429,7 @@ extern value_t parse(str_t filename, str_t input)
         .column = 0,
     };
 
-    result_t = parse_program(&parser);
+    prg = parse_program(&parser);
 
-    return result_t;
+    return prg;
 }

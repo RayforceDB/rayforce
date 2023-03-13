@@ -186,22 +186,7 @@ str_t list_fmt(u32_t pad, u32_t lim, value_t *value)
 
 str_t error_fmt(u32_t pad, u32_t lim, value_t *value)
 {
-    str_t code;
-
-    switch (value->error.code)
-    {
-    case ERR_INIT:
-        code = "init";
-        break;
-    case ERR_PARSE:
-        code = "parse";
-        break;
-    default:
-        code = "unknown";
-        break;
-    }
-
-    return str_fmt(0, "** %s error: %s", code, value->error.message);
+    return str_fmt(0, "** [E%.3d] error: %s", value->error.code, value->error.message);
 }
 
 str_t string_fmt(u32_t pad, u32_t lim, value_t *value)

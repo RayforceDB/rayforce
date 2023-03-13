@@ -23,17 +23,28 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 #include "../core/rayforce.h"
 #include "../core/format.h"
 #include "../core/monad.h"
 #include "../core/alloc.h"
 #include "../core/vm.h"
 #include "parse.h"
-#include <time.h>
-
-#include <stdlib.h>
 
 #define LINE_SIZE 2048
+
+#define RED "\033[1;31m"
+#define GREEN "\033[1;32m"
+#define YELLOW "\033[1;33m"
+#define BLUE "\033[1;34m"
+#define MAGENTA "\033[1;35m"
+#define CYAN "\033[1;36m"
+#define WHITE "\033[1;37m"
+#define BOLD "\033[1m"
+#define RESET "\033[0m"
+
+#define PROMPT "> "
 
 int main()
 {
@@ -51,7 +62,7 @@ int main()
     while (run)
     {
 
-        printf(">");
+        printf("%s%s%s", GREEN, PROMPT, RESET);
         ptr = fgets(line, LINE_SIZE, stdin);
         UNUSED(ptr);
 
@@ -60,7 +71,11 @@ int main()
         str_t buf = value_fmt(&value);
         if (buf == NULL)
             continue;
-        printf("%s\n", buf);
+
+        if (is_error(&value))
+            printf("%s%s%s\n", RED, buf, RESET);
+        else
+            printf("%s\n", buf);
 
         code = compile(value);
         vm_exec(vm, code);
