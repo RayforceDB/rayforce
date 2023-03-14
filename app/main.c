@@ -25,6 +25,10 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "../core/rayforce.h"
 #include "../core/format.h"
 #include "../core/monad.h"
@@ -35,6 +39,7 @@
 #define LINE_SIZE 2048
 
 #define RED "\033[1;31m"
+#define TOMATO "\033[1;38;5;9m"
 #define GREEN "\033[1;32m"
 #define YELLOW "\033[1;33m"
 #define BLUE "\033[1;34m"
@@ -45,6 +50,36 @@
 #define RESET "\033[0m"
 
 #define PROMPT "> "
+
+str_t open_file(str_t filename)
+{
+    i32_t fd;
+    str_t buffer;
+    struct stat st;
+
+    fd = open(filename, O_RDONLY); // open the file for reading
+
+    if (fd == -1)
+    { // error handling if file does not exist
+        printf("Error opening the file.\n");
+        return NULL;
+    }
+
+    fstat(fd, &st); // get the size of the file
+
+    buffer = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0); // memory-map the file
+
+    if (buffer == MAP_FAILED)
+    { // error handling if memory-mapping fails
+        printf("Error mapping the file.\n");
+        return NULL;
+    }
+
+    // munmap(buffer, st.st_size); // unmap the buffer
+    // close(fd);                  // close the file
+
+    return buffer;
+}
 
 int main()
 {
@@ -59,9 +94,17 @@ int main()
 
     vm = vm_create();
 
+    str_t file = open_file("test.ray");
+    value = parse("test.ray", file);
+    str_t buf = value_fmt(&value);
+
+    if (is_error(&value))
+        printf("%s%s%s\n", TOMATO, buf, RESET);
+    else
+        printf("%s\n", buf);
+
     while (run)
     {
-
         printf("%s%s%s", GREEN, PROMPT, RESET);
         ptr = fgets(line, LINE_SIZE, stdin);
         UNUSED(ptr);
@@ -73,7 +116,7 @@ int main()
             continue;
 
         if (is_error(&value))
-            printf("%s%s%s\n", RED, buf, RESET);
+            printf("%s%s%s\n", TOMATO, buf, RESET);
         else
             printf("%s\n", buf);
 

@@ -4,7 +4,7 @@
 
  *   Permission is hereby granted, free of charge, to any person obtaining a copy
  *   of this software and associated documentation files (the "Software"), to deal
- *   in the Software without restriction, including without limitation the rights
+ *   in the Software without restriction, including without limititation the rights
  *   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  *   copies of the Software, and to permit persons to whom the Software is
  *   furnished to do so, subject to the following conditions:
@@ -13,7 +13,7 @@
  *   copies or substantial portions of the Software.
 
  *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- *   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *   IMPLIED, INCLUDING BUT NOT limitITED TO THE WARRANTIES OF MERCHANTABILITY,
  *   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
  *   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  *   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
@@ -35,17 +35,18 @@
 
 const str_t PADDING = "                                                                                                   ";
 
-typedef struct padding_t
-{
-    u32_t left;
-    u32_t width;
-    u32_t height;
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-} padding_t;
+extern str_t value_fmt_ind(u32_t indent, u32_t limit, value_t *value);
 
-extern str_t str_fmt(u32_t lim, str_t fmt, ...)
+extern str_t str_fmt(u32_t limit, str_t fmt, ...)
 {
-    i32_t n, size = lim > 0 ? lim : MAX_ROW_WIDTH;
+    i32_t n, size = limit > 0 ? limit : MAX_ROW_WIDTH;
     str_t p = (str_t)rayforce_malloc(size);
 
     while (1)
@@ -58,10 +59,10 @@ extern str_t str_fmt(u32_t lim, str_t fmt, ...)
         if (n < 0)
         {
             rayforce_free(p);
-            return NULL;
+            return "";
         }
 
-        if (lim != 0 || n < size)
+        if (limit != 0 || n < size)
             break;
 
         size *= 2;
@@ -71,35 +72,39 @@ extern str_t str_fmt(u32_t lim, str_t fmt, ...)
     return p;
 }
 
-str_t vector_fmt(u32_t pad, u32_t lim, value_t *value)
+str_t vector_fmt(u32_t limit, value_t *value)
 {
-    if (lim < FORMAT_TRAILER_SIZE)
-        return NULL;
+    if (!limit)
+        return "";
+
+    if (value->list.len == 0)
+        return str_fmt(3, "[]");
 
     str_t str, buf;
-    i64_t count, remains, len;
+    i64_t count, len, remains = limit;
     i8_t v_type = value->type;
-    u8_t slim = lim - FORMAT_TRAILER_SIZE;
 
-    remains = slim;
-    str = buf = (str_t)rayforce_malloc(lim);
-    len = snprintf(buf, remains, "%*.*s[", pad, pad, PADDING);
+    str = buf = (str_t)rayforce_malloc(limit + FORMAT_TRAILER_SIZE);
+
+    // Print '[' with the first element
+    if (v_type == TYPE_I64)
+        len = snprintf(buf, remains, "[%lld ", ((i64_t *)value->list.ptr)[0]);
+    else if (v_type == TYPE_F64)
+        len = snprintf(buf, remains, "[%.*f ", F64_PRECISION, ((f64_t *)value->list.ptr)[0]);
+    else if (v_type == TYPE_SYMBOL)
+        len = snprintf(buf, remains, "[%s ", symbols_get(((i64_t *)value->list.ptr)[0]));
 
     if (len < 0)
     {
         rayforce_free(str);
-        return NULL;
+        return "";
     }
 
     buf += len;
+    remains -= len;
 
-    count = value->list.len < 1 ? 0 : value->list.len - 1;
-    len = 0;
-
-    for (i64_t i = 0; i < count; i++)
+    for (i64_t i = 1; i < value->list.len; i++)
     {
-        remains = slim - (buf - str);
-
         if (v_type == TYPE_I64)
             len = snprintf(buf, remains, "%lld ", ((i64_t *)value->list.ptr)[i]);
         else if (v_type == TYPE_F64)
@@ -110,143 +115,122 @@ str_t vector_fmt(u32_t pad, u32_t lim, value_t *value)
         if (len < 0)
         {
             rayforce_free(str);
-            return NULL;
+            return "";
         }
 
-        if (remains < FORMAT_TRAILER_SIZE)
+        // printf("len: %lld, remains: %lld val: %lld\n", len, remains, ((i64_t *)value->list.ptr)[i]);
+
+        if (len >= remains)
         {
-            buf = str + slim;
+            remains = 0;
             break;
         }
-        buf += len;
-    }
-
-    remains = slim - (buf - str);
-    if (value->list.len > 0 && remains > FORMAT_TRAILER_SIZE)
-    {
-        if (v_type == TYPE_I64)
-            len = snprintf(buf, remains, "%lld", ((i64_t *)value->list.ptr)[count]);
-        else if (v_type == TYPE_F64)
-            len = snprintf(buf, remains, "%.*f", F64_PRECISION, ((f64_t *)value->list.ptr)[count]);
-        else if (v_type == TYPE_SYMBOL)
-            len = snprintf(buf, remains, "%s", symbols_get(((i64_t *)value->list.ptr)[count]));
-
-        if (len < 0)
-        {
-            rayforce_free(str);
-            return NULL;
-        }
-        if (remains < len)
-            buf = str + slim;
         else
+        {
+            remains -= len;
             buf += len;
+        }
     }
 
-    if (remains < FORMAT_TRAILER_SIZE)
+    if (remains == 0)
         strncpy(buf, "..]", 4);
     else
-        strncpy(buf, "]", 2);
+        strncpy(buf - 1, "]", 2);
 
     return str;
 }
 
-str_t list_fmt(u32_t pad, u32_t lim, value_t *value)
+str_t list_fmt(u32_t indent, u32_t limit, value_t *value)
 {
-    if (lim < FORMAT_TRAILER_SIZE)
-        return NULL;
+    if (!limit)
+        return "";
 
     if (value->list.ptr == NULL)
-        return str_fmt(0, "null");
+        return str_fmt(limit, "null");
 
-    str_t s, str, buf;
-    u8_t slim = lim - FORMAT_TRAILER_SIZE;
-    i64_t count, remains = slim, len;
+    str_t s, str = str_fmt(limit, "(");
 
-    str = buf = (str_t)rayforce_malloc(2048);
-    len = snprintf(buf, remains, "%*.*s(\n", pad, pad, PADDING);
-    buf += len;
-
-    if (len < 0)
-    {
-        rayforce_free(str);
-        return NULL;
-    }
-
-    count = value->list.len < 1 ? 0 : value->list.len - 1;
+    indent += 2;
 
     for (u64_t i = 0; i < value->list.len; i++)
     {
-        s = value_fmt(((value_t *)value->list.ptr) + i);
-        buf += snprintf(buf, MAX_ROW_WIDTH, "  %s\n", s);
+        s = value_fmt_ind(indent, limit - indent, ((value_t *)value->list.ptr) + i);
+        str = str_fmt(0, "%s\n%*.*s%s", str, indent, indent, PADDING, s);
     }
 
-    strncpy(buf, ")", 2);
+    str = str_fmt(0, "%s\n%*.*s)", str, indent - 2, indent - 2, PADDING);
     return str;
 }
 
-str_t error_fmt(u32_t pad, u32_t lim, value_t *value)
+str_t error_fmt(u32_t indent, u32_t limit, value_t *value)
 {
     return str_fmt(0, "** [E%.3d] error: %s", value->error.code, value->error.message);
 }
 
-str_t string_fmt(u32_t pad, u32_t lim, value_t *value)
+str_t string_fmt(u32_t indent, u32_t limit, value_t *value)
 {
+    if (!limit)
+        return "";
+
     if (value->list.ptr == NULL)
         return str_fmt(0, "\"\"");
 
     return str_fmt(value->list.len + 3, "\"%s\"", value->list.ptr);
 }
 
-str_t dict_fmt(u32_t pad, u32_t lim, value_t *value)
+str_t dict_fmt(u32_t indent, u32_t limit, value_t *value)
 {
+    if (!limit)
+        return "";
+
     value_t *keys = &as_list(value)[0], *vals = &as_list(value)[1];
     u32_t len = keys->list.len;
+    str_t k, v, str = str_fmt(limit, "{");
 
-    if (lim < FORMAT_TRAILER_SIZE)
-        return NULL;
+    indent += 2;
 
-    str_t s, str, buf;
-    u8_t slim = lim - FORMAT_TRAILER_SIZE;
-    i64_t count, remains = slim;
-
-    str = buf = (str_t)rayforce_malloc(2048);
-    len = snprintf(buf, remains, "%*.*s{\n", pad, pad, PADDING);
-    buf += len;
-
-    for (u64_t i = 0; i < len; i++)
+    for (u64_t i = 0; i < keys->list.len; i++)
     {
-        s = value_fmt(((value_t *)value->list.ptr) + i);
-        buf += snprintf(buf, MAX_ROW_WIDTH, "  %s\n", s);
+        k = value_fmt_ind(indent, limit - indent, ((value_t *)keys->list.ptr) + i);
+        v = value_fmt_ind(indent, limit - indent, ((value_t *)vals->list.ptr) + i);
+        str = str_fmt(0, "%s\n%*.*s%s: %s", str, indent, indent, PADDING, k, v);
     }
 
+    str = str_fmt(0, "%s\n%*.*s}", str, indent - 2, indent - 2, PADDING);
     return str;
 }
 
-extern str_t value_fmt(value_t *value)
+extern str_t value_fmt_ind(u32_t indent, u32_t limit, value_t *value)
 {
     switch (value->type)
     {
     case TYPE_LIST:
-        return list_fmt(0, MAX_ROW_WIDTH, value);
+        return list_fmt(indent, limit, value);
     case -TYPE_I64:
-        return str_fmt(0, "%lld", value->i64);
+        return str_fmt(limit, "%lld", value->i64);
     case -TYPE_F64:
-        return str_fmt(0, "%.*f", F64_PRECISION, value->f64);
+        return str_fmt(limit, "%.*f", F64_PRECISION, value->f64);
     case -TYPE_SYMBOL:
-        return str_fmt(0, "%s", symbols_get(value->i64));
+        return str_fmt(limit, "%s", symbols_get(value->i64));
     case TYPE_I64:
-        return vector_fmt(0, MAX_ROW_WIDTH, value);
+        return vector_fmt(limit, value);
     case TYPE_F64:
-        return vector_fmt(0, MAX_ROW_WIDTH, value);
+        return vector_fmt(limit, value);
     case TYPE_SYMBOL:
-        return vector_fmt(0, MAX_ROW_WIDTH, value);
+        return vector_fmt(limit, value);
     case TYPE_STRING:
-        return string_fmt(0, MAX_ROW_WIDTH, value);
+        return string_fmt(indent, limit, value);
     case TYPE_DICT:
-        return dict_fmt(0, MAX_ROW_WIDTH, value);
+        return dict_fmt(indent, limit, value);
     case TYPE_ERROR:
-        return error_fmt(0, 0, value);
+        return error_fmt(indent, limit, value);
     default:
-        return str_fmt(0, "null");
+        return str_fmt(limit, "null");
     }
+}
+
+extern str_t value_fmt(value_t *value)
+{
+    u32_t indent = 0, limit = MAX_ROW_WIDTH - FORMAT_TRAILER_SIZE;
+    return value_fmt_ind(indent, limit, value);
 }

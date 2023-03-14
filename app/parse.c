@@ -35,37 +35,37 @@
 
 #define TYPE_TOKEN 126
 
-u8_t is_whitespace(u8_t c)
+u8_t is_whitespace(i8_t c)
 {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-u8_t is_digit(u8_t c)
+u8_t is_digit(i8_t c)
 {
     return c >= '0' && c <= '9';
 }
 
-u8_t is_alpha(u8_t c)
+u8_t is_alpha(i8_t c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
-u8_t is_alphanum(u8_t c)
+u8_t is_alphanum(i8_t c)
 {
     return is_alpha(c) || is_digit(c);
 }
 
-u8_t at_eof(u8_t c)
+u8_t at_eof(i8_t c)
 {
-    return c == '\0' || c == '\n';
+    return c == '\0' || c == EOF;
 }
 
-u8_t at_term(u8_t c)
+u8_t at_term(i8_t c)
 {
     return c == ')' || c == ']' || c == '}' || c == ':' || c == '\0' || c == '\n';
 }
 
-u8_t is_at(value_t *token, u8_t c)
+u8_t is_at(value_t *token, i8_t c)
 {
     // debug("is_at: %lld %d IS: %d\n", token->i64, c, token->type == TYPE_TOKEN && token->i64 == (i64_t)c);
     return token->type == TYPE_TOKEN && token->i64 == (i64_t)c;
@@ -87,7 +87,7 @@ u8_t shift(str_t *current)
     return res;
 }
 
-value_t to_token(u8_t c)
+value_t to_token(i8_t c)
 {
     value_t tok = i64(c);
     tok.type = TYPE_TOKEN;
@@ -387,6 +387,8 @@ value_t advance(parser_t *parser)
 
 value_t parse_program(parser_t *parser)
 {
+    return advance(parser);
+
     str_t err_msg;
     value_t token, list = list(0);
 
