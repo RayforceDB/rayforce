@@ -129,12 +129,11 @@ extern null_t value_free(value_t *value);
 #define is_scalar(value) ((value)->type < 0)
 
 // Mutators
-extern null_t vector_i64_push(value_t *vector, i64_t value);
-extern i64_t vector_i64_pop(value_t *vector);
-extern null_t vector_f64_push(value_t *vector, f64_t value);
-extern f64_t vector_f64_pop(value_t *vector);
-extern null_t list_push(value_t *list, value_t value);
-extern value_t list_pop(value_t *list);
+extern u64_t vector_push(value_t *vector, value_t value);
+extern u64_t vector_pop(value_t *vector);
+
+// Compare
+extern i8_t value_eq(value_t *a, value_t *b);
 
 // #ifdef __cplusplus
 // }

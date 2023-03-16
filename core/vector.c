@@ -96,19 +96,22 @@ extern value_t vector(i8_t type, u8_t size_of_val, i64_t len)
     return v;
 }
 
-extern null_t vector_i64_push(value_t *vector, i64_t value)
+extern u64_t vector_i64_push(value_t *vector, i64_t value)
 {
     push(vector, i64_t, value);
+    return vector->list.len;
 }
 
-extern i64_t vector_i64_pop(value_t *vector)
+extern u64_t vector_i64_pop(value_t *vector)
 {
-    return pop(vector, i64_t);
+    pop(vector, i64_t);
+    return vector->list.len;
 }
 
-extern null_t vector_f64_push(value_t *vector, f64_t value)
+extern u64_t vector_f64_push(value_t *vector, f64_t value)
 {
     push(vector, f64_t, value);
+    return vector->list.len;
 }
 
 extern f64_t vector_f64_pop(value_t *vector)
@@ -116,14 +119,93 @@ extern f64_t vector_f64_pop(value_t *vector)
     return pop(vector, f64_t);
 }
 
-extern null_t list_push(value_t *list, value_t value)
+extern u64_t list_push(value_t *list, value_t value)
 {
     push(list, value_t, value);
+    return list->list.len;
 }
 
 extern value_t list_pop(value_t *list)
 {
     return pop(list, value_t);
+}
+
+extern u64_t vector_push(value_t *vector, value_t value)
+{
+    i8_t type = vector->type;
+
+    switch (type)
+    {
+    case TYPE_I64:
+        vector_i64_push(vector, value.i64);
+        break;
+    case TYPE_F64:
+        vector_f64_push(vector, value.f64);
+        break;
+    case TYPE_LIST:
+        list_push(vector, value);
+        break;
+    default:
+        return vector->list.len;
+    }
+
+    return vector->list.len;
+}
+
+extern u64_t vector_i64_find(value_t *vector, i64_t key)
+{
+    i64_t *ptr = as_vector_i64(vector);
+
+    for (u64_t i = 0; i < vector->list.len; i++)
+    {
+        if (ptr[i] == key)
+            return i;
+    }
+
+    return vector->list.len;
+}
+
+extern u64_t vector_f64_find(value_t *vector, f64_t key)
+{
+    f64_t *ptr = as_vector_f64(vector);
+
+    for (u64_t i = 0; i < vector->list.len; i++)
+    {
+        if (ptr[i] == key)
+            return i;
+    }
+
+    return vector->list.len;
+}
+
+extern u64_t list_find(value_t *list, value_t key)
+{
+    value_t *ptr = as_list(list);
+
+    for (u64_t i = 0; i < list->list.len; i++)
+    {
+        if (value_eq(&ptr[i], &key))
+            return i;
+    }
+
+    return list->list.len;
+}
+
+extern u64_t vector_find(value_t *vector, value_t key)
+{
+    i8_t type = vector->type;
+
+    switch (type)
+    {
+    case TYPE_I64:
+        return vector_i64_find(vector, key.i64);
+    case TYPE_F64:
+        return vector_f64_find(vector, key.f64);
+    case TYPE_SYMBOL:
+        return vector_i64_find(vector, key.i64);
+    default:
+        return list_find(vector, key);
+    }
 }
 
 /*

@@ -135,6 +135,46 @@ extern value_t value_clone(value_t *value)
     }
 }
 
+extern i8_t value_eq(value_t *a, value_t *b)
+{
+    if (a->type != b->type)
+        return 0;
+
+    if (a->type == -TYPE_I64 || a->type == -TYPE_SYMBOL)
+        return a->i64 == b->i64;
+    else if (a->type == -TYPE_F64)
+        return a->f64 == b->f64;
+    else if (a->type == TYPE_I64 || a->type == TYPE_SYMBOL)
+    {
+        if (as_vector_i64(a) == as_vector_i64(b))
+            return 1;
+        if (a->list.len != b->list.len)
+            return 0;
+        for (i64_t i = 0; i < a->list.len; i++)
+        {
+            if (as_vector_i64(a)[i] != as_vector_i64(b)[i])
+                return 0;
+        }
+        return 1;
+    }
+    else if (a->type == TYPE_F64)
+    {
+        if (as_vector_f64(a) == as_vector_f64(b))
+            return 1;
+        if (a->list.len != b->list.len)
+            return 0;
+        for (i64_t i = 0; i < a->list.len; i++)
+        {
+            if (as_vector_f64(a)[i] != as_vector_f64(b)[i])
+                return 0;
+        }
+        return 1;
+    }
+
+    // printf("** Eq: Invalid type\n");
+    return 0;
+}
+
 extern null_t value_free(value_t *value)
 {
     switch (value->type)

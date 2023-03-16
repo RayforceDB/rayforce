@@ -29,6 +29,7 @@
 #include "symbols.h"
 #include "rayforce.h"
 #include "alloc.h"
+#include "util.h"
 
 /*
  * Improved djb2 (contains length)
@@ -63,18 +64,20 @@ i32_t i64_cmp(null_t *a, null_t *b)
  * Compares value_t string with null terminated string.
  * Returns 0 if equal, 1 if not equal.
  * Should not be used elsewere but symbols
+ * a: raw C string already stored in a hash
+ * b: value_t string to be inserted
  */
 i32_t string_str_cmp(null_t *a, null_t *b)
 {
-    value_t *str_a = (value_t *)a;
-    str_t str_b = (str_t)b;
+    str_t str_a = (str_t)a;
+    value_t *str_b = (value_t *)b;
 
-    u64_t len_b = strlen(str_b);
+    u64_t len_a = strlen(str_a);
 
-    if (str_a->list.len != len_b)
+    if (str_b->list.len != len_a)
         return 1;
 
-    return strncmp(str_a->list.ptr, str_b, len_b);
+    return strncmp(str_b->list.ptr, str_a, len_a);
 }
 
 /*

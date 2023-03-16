@@ -28,4 +28,7 @@
 #include "vector.h"
 #include "string.h"
 
+extern value_t dict_get(value_t *dict, value_t key);
+extern value_t dict_set(value_t *dict, value_t key, value_t val);
+
 #endif

@@ -28,6 +28,7 @@
 #include "rayforce.h"
 #include "alloc.h"
 #include "util.h"
+#include "dict.h"
 
 #define MAX_I64_WIDTH 20
 #define MAX_ROW_WIDTH MAX_I64_WIDTH * 2
@@ -358,8 +359,10 @@ str_t table_fmt(u32_t indent, u32_t limit, value_t *value)
 
 str_t error_fmt(u32_t indent, u32_t limit, value_t *value)
 {
-    // return str_fmt(0, "** [E%.3d] error: %s", value->error.code, value->error.message);
-    return dict_fmt(indent, limit, value);
+    value_t code = dict_get(value, symbol("code"));
+    value_t message = dict_get(value, symbol("message"));
+
+    return str_fmt(0, "** [E%.3d] error: %s", code.i64, as_string(&message));
 }
 
 extern str_t value_fmt_ind(u32_t indent, u32_t limit, value_t *value)

@@ -86,44 +86,54 @@
 //     return 0;
 // }
 
-// int test_symbols()
-// {
-//     clock_t start, end;
-//     f64_t cpu_time_used;
+int test_symbols()
+{
+    clock_t start, end;
+    f64_t cpu_time_used;
 
-//     str_t str[1000000];
+    str_t st[1000000];
 
-//     u64_t pg_size = 4096 * 1024;
+    u64_t pg_size = 4096 * 1024;
 
-//     u64_t *buckets = malloc(pg_size * sizeof(u64_t));
-//     memset(buckets, 0, pg_size * sizeof(u64_t));
+    u64_t *buckets = malloc(pg_size * sizeof(u64_t));
+    memset(buckets, 0, pg_size * sizeof(u64_t));
 
-//     for (int i = 0; i < 1000000; i++)
-//     {
-//         str[i] = (str_t)malloc(10);
-//         snprintf(str[i], 10, "%d", 100000000 + i);
-//     }
+    for (int i = 0; i < 1000000; i++)
+    {
+        st[i] = (str_t)malloc(10);
+        snprintf(st[i], 10, "%d", 100000000 + i);
+    }
 
-//     start = clock();
+    start = clock();
 
-//     for (int i = 0; i < 1000000; i++)
-//     {
-//         // printf("%s\n", str[i]);
-//         string_t s = string_create(str[i], strlen(str[i]));
-//         i64_t id = symbols_intern(s);
-//         // str_t val = symbols_get(id);
-//         // if (val == NULL)
-//         //     printf("NULL -- ID: %lld ORIG: %s\n", id, str[i]);
-//         // else
-//         //     printf("%s\n", val);
-//     }
+    for (int i = 0; i < 1000000; i++)
+    {
+        // printf("%s\n", st[i]);
+        value_t s = str(st[i], strlen(st[i]));
+        i64_t id = symbols_intern(&s);
+        // str_t val = symbols_get(id);
+        // if (val == NULL)
+        //     printf("NULL -- ID: %lld ORIG: %s\n", id, st[i]);
+        // else
+        //     printf("%s\n", val);
+    }
 
-//     end = clock();
+    // value_t s = str("code", 4);
+    // i64_t id1 = symbols_intern(&s), id2;
+    // str_t val = symbols_get(id1);
 
-//     cpu_time_used = ((f64_t)(end - start)) / CLOCKS_PER_SEC;
-//     printf("Time: %f ms\n", cpu_time_used * 1000);
-//     return 0;
-// }
+    // s = str("code", 4);
+    // id2 = symbols_intern(&s);
+    // val = symbols_get(id2);
+
+    // printf("%d == %d\n", id1, id2);
+
+    end = clock();
+
+    cpu_time_used = ((f64_t)(end - start)) / CLOCKS_PER_SEC;
+    printf("Time: %f ms\n", cpu_time_used * 1000);
+    return 0;
+}
 
 null_t test_string_match()
 {
@@ -143,7 +153,7 @@ i32_t main()
 {
     rayforce_alloc_init();
 
-    // test_symbols();
+    test_symbols();
 
     // test_string_match();
     rayforce_alloc_deinit();

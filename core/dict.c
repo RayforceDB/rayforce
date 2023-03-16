@@ -22,6 +22,7 @@
  */
 
 #include "dict.h"
+#include "vector.h"
 
 extern value_t dict(value_t keys, value_t vals)
 {
@@ -39,4 +40,40 @@ extern value_t dict(value_t keys, value_t vals)
     dict.type = TYPE_DICT;
 
     return dict;
+}
+
+extern value_t dict_get(value_t *dict, value_t key)
+{
+    if (dict->type != TYPE_DICT && dict->type != TYPE_ERROR)
+        return error(ERR_TYPE, "Expected dict");
+
+    value_t *keys = &as_list(dict)[0];
+    value_t *vals = &as_list(dict)[1];
+    u64_t index = vector_find(keys, key);
+
+    if (index == keys->list.len)
+        return null();
+
+    return value_clone(&as_list(vals)[index]);
+}
+
+extern value_t dict_set(value_t *dict, value_t key, value_t val)
+{
+    if (dict->type != TYPE_DICT)
+        return error(ERR_TYPE, "Expected dict");
+
+    value_t *keys = &as_list(dict)[0];
+    value_t *vals = &as_list(dict)[1];
+    u64_t index = vector_find(keys, key);
+
+    if (index == keys->list.len)
+    {
+        vector_push(keys, key);
+        vector_push(vals, val);
+    }
+
+    else
+        as_list(vals)[index] = val;
+
+    return null();
 }

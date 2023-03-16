@@ -4,8 +4,8 @@ AR=ar
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -Wpedantic -std=c17 -O3 -march=native
 # RELEASE_CFLAGS = -fPIC -Wall -Wextra -Wpedantic -std=c17 -O3 -march=native -g -pg
 DEBUG_CFLAGS =  -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG
-CFLAGS = $(DEBUG_CFLAGS)
-# CFLAGS = $(RELEASE_CFLAGS)
+# CFLAGS = $(DEBUG_CFLAGS)
+CFLAGS = $(RELEASE_CFLAGS)
 CORE_HEADERS = core/util.h core/vector.h core/string.h core/mmap.h core/hash.h\
  core/symbols.h core/format.h core/rayforce.h core/monad.h core/alloc.h\
  core/dict.h core/parse.h core/vm.h

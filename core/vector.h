@@ -27,5 +27,8 @@
 #include "rayforce.h"
 
 extern value_t list_flatten(value_t value);
+extern u64_t vector_find(value_t *vector, value_t key);
+extern value_t vector_get(value_t *vector, value_t key);
+extern u64_t vector_push(value_t *vector, value_t value);
 
 #endif
