@@ -32,7 +32,7 @@ extern rf_object_t dict(rf_object_t keys, rf_object_t vals)
     if (keys.type < 0 || vals.type < 0)
         return error(ERR_TYPE, "Keys and objects must be lists");
 
-    if (keys.list.len != vals.list.len)
+    if (keys.adt.len != vals.adt.len)
         return error(ERR_LENGTH, "Keys and objects must have the same length");
 
     rf_object_t dict = list(2);
@@ -47,14 +47,14 @@ extern rf_object_t dict(rf_object_t keys, rf_object_t vals)
 
 extern rf_object_t dict_get(rf_object_t *dict, rf_object_t key)
 {
-    if (dict->type != TYPE_DICT && dict->type != TYPE_ERROR)
+    if (dict->type != TYPE_DICT)
         return error(ERR_TYPE, "Expected dict");
 
     rf_object_t *keys = &as_list(dict)[0];
     rf_object_t *vals = &as_list(dict)[1];
     i64_t index = vector_find(keys, key);
 
-    if (index == keys->list.len)
+    if (index == keys->adt.len)
         return null();
 
     return object_clone(&as_list(vals)[index]);
@@ -62,14 +62,14 @@ extern rf_object_t dict_get(rf_object_t *dict, rf_object_t key)
 
 extern rf_object_t dict_set(rf_object_t *dict, rf_object_t key, rf_object_t val)
 {
-    if (dict->type != TYPE_DICT && dict->type != TYPE_ERROR)
+    if (dict->type != TYPE_DICT)
         return error(ERR_TYPE, "Expected dict");
 
     rf_object_t *keys = &as_list(dict)[0];
     rf_object_t *vals = &as_list(dict)[1];
     i64_t index = vector_find(keys, key);
 
-    if (index == keys->list.len)
+    if (index == keys->adt.len)
     {
         vector_push(keys, key);
         vector_push(vals, object_clone(&val));

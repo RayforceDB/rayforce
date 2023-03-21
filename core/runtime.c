@@ -21,23 +21,27 @@
  *   SOFTWARE.
  */
 
-#ifndef VECTOR_H
-#define VECTOR_H
+#include "runtime.h"
 
-#include "rayforce.h"
+// Global runtime reference
+runtime_t _RUNTIME = NULL;
 
-extern rf_object_t list_flatten(rf_object_t object);
-extern i64_t vector_i64_find(rf_object_t *vector, i64_t key);
-extern i64_t vector_f64_find(rf_object_t *vector, f64_t key);
-extern i64_t list_find(rf_object_t *vector, rf_object_t key);
-extern i64_t vector_find(rf_object_t *vector, rf_object_t key);
-extern rf_object_t vector_get(rf_object_t *vector, rf_object_t key);
-extern i64_t vector_push(rf_object_t *vector, rf_object_t object);
-extern i64_t vector_i64_push(rf_object_t *vector, i64_t object);
-extern i64_t vector_f64_push(rf_object_t *vector, f64_t object);
-extern i64_t vector_symbol_push(rf_object_t *vector, rf_object_t object);
-extern i64_t list_push(rf_object_t *vector, rf_object_t object);
-extern i64_t vector_i64_pop(rf_object_t *vector);
-extern f64_t vector_f64_pop(rf_object_t *vector);
-extern rf_object_t list_pop(rf_object_t *vector);
-#endif
+extern null_t runtime_init()
+{
+    alloc_t alloc = rayforce_alloc_init();
+    runtime_t runtime = rayforce_malloc(sizeof(struct runtime_t));
+    runtime->alloc = alloc;
+    _RUNTIME = runtime;
+}
+
+extern null_t runtime_cleanup()
+{
+    alloc_t alloc = _RUNTIME->alloc;
+    rayforce_free(_RUNTIME);
+    rayforce_alloc_cleanup(alloc);
+}
+
+extern runtime_t runtime_get()
+{
+    return _RUNTIME;
+}

@@ -38,7 +38,7 @@ extern rf_object_t string(i64_t len)
 
     rf_object_t string = {
         .type = TYPE_STRING,
-        .list = {
+        .adt = {
             .len = len,
             .ptr = ptr,
         },
@@ -55,7 +55,7 @@ extern rf_object_t str(str_t ptr, i64_t len)
 {
     rf_object_t string = {
         .type = TYPE_STRING,
-        .list = {
+        .adt = {
             .len = len,
             .ptr = ptr,
         },
@@ -71,7 +71,7 @@ rf_object_t string_from_str(str_t str)
 {
     i32_t len = strlen(str);
     rf_object_t s = string(len);
-    memcpy(s.list.ptr, str, len);
+    memcpy(s.adt.ptr, str, len);
     return s;
 }
 
@@ -84,7 +84,7 @@ rf_object_t string_from_const_str(str_t str)
     i32_t len = strlen(str);
     rf_object_t string = {
         .type = TYPE_STRING,
-        .list = {
+        .adt = {
             .len = len,
             .ptr = str,
         },

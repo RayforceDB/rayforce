@@ -26,9 +26,6 @@
 #include "alloc.h"
 #include "rayforce.h"
 
-// Global allocator reference
-alloc_t GLOBAL_A0 = NULL;
-
 extern null_t *rayforce_malloc(i32_t size)
 {
     return malloc(size);
@@ -44,26 +41,19 @@ extern null_t *rayforce_realloc(null_t *ptr, i32_t size)
     return realloc(ptr, size);
 }
 
-extern null_t rayforce_alloc_init()
+extern alloc_t rayforce_alloc_init()
 {
     alloc_t alloc;
 
     alloc = (alloc_t)mmap(NULL, sizeof(struct alloc_t),
                           PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
     alloc->symbols = symbols_create();
 
-    GLOBAL_A0 = alloc;
+    return alloc;
 }
 
-extern null_t rayforce_alloc_deinit()
+extern null_t rayforce_alloc_cleanup(alloc_t alloc)
 {
-    alloc_t alloc = alloc_get();
     symbols_free(alloc->symbols);
     // munmap(GLOBAL_A0, sizeof(struct alloc_t));
-}
-
-extern alloc_t alloc_get()
-{
-    return GLOBAL_A0;
 }

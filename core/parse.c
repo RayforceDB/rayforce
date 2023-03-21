@@ -36,35 +36,41 @@
 
 #define TYPE_TOKEN 126
 
-typedef struct span_t
-{
-    i32_t line_start;
-    i32_t line_end;
-    i32_t col_start;
-    i32_t col_end;
-} span_t;
-
-span_t span(parser_t *parser)
+span_t span_start(parser_t *parser)
 {
     span_t s = {
-        .line_start = parser->line,
-        .line_end = parser->line,
-        .col_start = parser->column,
-        .col_end = parser->column,
+        .start_line = parser->line,
+        .end_line = parser->line,
+        .start_column = parser->column,
+        .end_column = parser->column,
     };
 
     return s;
 }
 
+null_t span_end(parser_t *parser, span_t *span)
+{
+    // span->line_end = parser->line;
+    // span->col_end = parser->column;
+}
+
 rf_object_t label(span_t *span, str_t name)
 {
-    rf_object_t l = dict(vector_symbol(0), list(0));
-    dict_set(&l, symbol("name"), string_from_str(name));
-    dict_set(&l, symbol("start_line"), i64(span->line_start));
-    dict_set(&l, symbol("start_col"), i64(span->col_start));
-    dict_set(&l, symbol("end_line"), i64(span->line_end));
-    dict_set(&l, symbol("end_col"), i64(span->col_end));
-    return l;
+    // rf_object_t l = dict(vector_symbol(0), list(0));
+    // dict_set(&l, symbol("name"), string_from_str(name));
+    // dict_set(&l, symbol("start_line"), i64(span->line_start));
+    // dict_set(&l, symbol("start_col"), i64(span->col_start));
+    // dict_set(&l, symbol("end_line"), i64(span->line_end));
+    // dict_set(&l, symbol("end_col"), i64(span->col_end));
+    // return l;
+}
+
+set_span(rf_object_t *token, span_t span)
+{
+    // token->span.start_line = span.line_start;
+    // token->span.start_col = span.col_start;
+    // token->span.end_line = span.line_end;
+    // token->span.end_col = span.col_end;
 }
 
 null_t add_label(rf_object_t *error, span_t *span, str_t name)
@@ -225,7 +231,7 @@ rf_object_t parse_vector(parser_t *parser)
     i32_t i;
 
     // save current span
-    span_t s = span(parser);
+    span_t s = span_start(parser);
 
     shift(parser, 1); // skip '['
     token = advance(parser);
@@ -241,6 +247,7 @@ rf_object_t parse_vector(parser_t *parser)
         if (is_at(&token, '\0'))
         {
             object_free(&vec);
+            span_end(parser, &s);
             err = error(ERR_PARSE, "Expected ']'");
             add_label(&err, &s, "started here");
             return err;
@@ -265,7 +272,7 @@ rf_object_t parse_vector(parser_t *parser)
             else if (vec.type == TYPE_I64)
             {
 
-                for (i = 0; i < vec.list.len; i++)
+                for (i = 0; i < vec.adt.len; i++)
                     as_vector_f64(&vec)[i] = (f64_t)as_vector_i64(&vec)[i];
 
                 vector_f64_push(&vec, token.f64);
@@ -279,7 +286,7 @@ rf_object_t parse_vector(parser_t *parser)
         }
         else if (token.type == -TYPE_SYMBOL)
         {
-            if (vec.type == TYPE_SYMBOL || (vec.list.len == 0))
+            if (vec.type == TYPE_SYMBOL || (vec.adt.len == 0))
             {
                 vector_i64_push(&vec, token.i64);
                 vec.type = TYPE_SYMBOL;
@@ -401,6 +408,7 @@ rf_object_t parse_dict(parser_t *parser)
 
 rf_object_t advance(parser_t *parser)
 {
+
     // Skip all whitespaces
     while (is_whitespace(*parser->current))
     {
@@ -409,8 +417,6 @@ rf_object_t advance(parser_t *parser)
             parser->line++;
             parser->column = 0;
         }
-        else
-            parser->column++;
 
         shift(parser, 1);
     }

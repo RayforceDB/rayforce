@@ -42,8 +42,8 @@
 //     i64_t a_len, b_len, sum = 0;
 //     i64_t *a_vec;
 
-//     a_len = a->list.len;
-//     a_vec = a->list.ptr;
+//     a_len = a->adt.len;
+//     a_vec = a->adt.ptr;
 
 //     sum = b->i64;
 

@@ -32,10 +32,10 @@
 #include "../core/rayforce.h"
 #include "../core/format.h"
 #include "../core/monad.h"
-#include "../core/alloc.h"
 #include "../core/vm.h"
 #include "../core/vector.h"
 #include "../core/parse.h"
+#include "../core/runtime.h"
 
 #define LINE_SIZE 2048
 
@@ -152,7 +152,7 @@ null_t load_file(str_t filename)
 
 i32_t main(i32_t argc, str_t argv[])
 {
-    rayforce_alloc_init();
+    runtime_init();
     print_logo();
 
     rf_object_t args = parse_cmdline(argc, argv);
@@ -194,7 +194,7 @@ i32_t main(i32_t argc, str_t argv[])
     rayforce_free(line);
     vm_free(vm);
 
-    rayforce_alloc_deinit();
+    runtime_cleanup();
 
     return 0;
 }

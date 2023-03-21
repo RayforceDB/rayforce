@@ -30,6 +30,7 @@
 #include "rayforce.h"
 #include "alloc.h"
 #include "util.h"
+#include "runtime.h"
 
 /*
  * Improved djb2 (contains length)
@@ -39,8 +40,8 @@
 i64_t string_hash(null_t *val)
 {
     rf_object_t *string = (rf_object_t *)val;
-    i32_t hash = 5381, len = string->list.len, i;
-    str_t str = string->list.ptr;
+    i32_t hash = 5381, len = string->adt.len, i;
+    str_t str = string->adt.ptr;
 
     for (i = 0; i < len; i++)
         hash += (hash << 5) + str[i];
@@ -72,10 +73,10 @@ i32_t string_str_cmp(null_t *a, null_t *b)
 
     i64_t len_a = strlen(str_a);
 
-    if (str_b->list.len != len_a)
+    if (str_b->adt.len != len_a)
         return 1;
 
-    return strncmp(str_b->list.ptr, str_a, len_a);
+    return strncmp(str_b->adt.ptr, str_a, len_a);
 }
 
 /*
@@ -96,12 +97,12 @@ pool_node_t *pool_node_create()
  */
 null_t *str_dup(null_t *key, null_t *val, bucket_t *bucket)
 {
-    alloc_t alloc = alloc_get();
+    alloc_t alloc = runtime_get()->alloc;
     symbols_t *symbols = alloc->symbols;
 
     rf_object_t *string = (rf_object_t *)key;
-    i64_t len = string->list.len;
-    str_t str = string->list.ptr;
+    i64_t len = string->adt.len;
+    str_t str = string->adt.ptr;
 
     // Allocate new pool node
     if ((i64_t)symbols->strings_pool + len - (i64_t)symbols->pool_node > STRINGS_POOL_SIZE)
@@ -151,7 +152,7 @@ null_t symbols_free(symbols_t *symbols)
 
 i64_t symbols_intern(rf_object_t *string)
 {
-    symbols_t *symbols = alloc_get()->symbols;
+    symbols_t *symbols = runtime_get()->alloc->symbols;
     i64_t id = symbols->str_to_id->size;
     i64_t id_or_str = (i64_t)ht_insert_with(symbols->str_to_id, string, (null_t *)id, &str_dup);
     if (symbols->str_to_id->size == id)
@@ -163,6 +164,6 @@ i64_t symbols_intern(rf_object_t *string)
 
 str_t symbols_get(i64_t key)
 {
-    symbols_t *symbols = alloc_get()->symbols;
+    symbols_t *symbols = runtime_get()->alloc->symbols;
     return (str_t)ht_get(symbols->id_to_str, (null_t *)key);
 }

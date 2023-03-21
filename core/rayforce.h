@@ -63,7 +63,9 @@
 typedef char i8_t;
 typedef char *str_t;
 typedef short i16_t;
+typedef unsigned short u16_t;
 typedef int i32_t;
+typedef unsigned int u32_t;
 typedef long long i64_t;
 typedef double f64_t;
 typedef void null_t;
@@ -71,19 +73,37 @@ typedef void null_t;
 // Generic type
 typedef struct rf_object_t
 {
-    i8_t type;
+    i8_t type, flags;
+
+    u32_t id;
+
     union
     {
         i8_t i8;
         i64_t i64;
         f64_t f64;
-        struct list_t
+
+        // Aggregate types
+        struct adt_t
         {
             i64_t len;
             null_t *ptr;
-        } list;
-        struct rf_object_t *error;
+
+            union
+            {
+                // Attributes of the object
+                struct attrs_t
+                {
+                    i64_t rc;      // reference counter
+                    null_t *index; // search index (if any)
+                } *attrs;
+
+                // Error code
+                i8_t code;
+            };
+        } adt;
     };
+
 } __attribute__((aligned(16))) rf_object_t;
 
 CASSERT(sizeof(struct rf_object_t) == 32, rayforce_h)
@@ -113,14 +133,14 @@ extern rf_object_t error(i8_t code, str_t message);
 extern null_t object_free(rf_object_t *object);
 
 // Accessors
-#define as_vector_i64(object) ((i64_t *)(object)->list.ptr)
-#define as_vector_f64(object) ((f64_t *)(object)->list.ptr)
-#define as_vector_symbol(object) ((i64_t *)(object)->list.ptr)
-#define as_string(object) ((str_t)(object)->list.ptr)
-#define as_list(object) ((rf_object_t *)(object)->list.ptr)
+#define as_vector_i64(object) ((i64_t *)(object)->adt.ptr)
+#define as_vector_f64(object) ((f64_t *)(object)->adt.ptr)
+#define as_vector_symbol(object) ((i64_t *)(object)->adt.ptr)
+#define as_string(object) ((str_t)(object)->adt.ptr)
+#define as_list(object) ((rf_object_t *)(object)->adt.ptr)
 
 // Checkers
-#define is_null(object) ((object)->type == TYPE_LIST && (object)->list.ptr == NULL)
+#define is_null(object) ((object)->type == TYPE_LIST && (object)->adt.ptr == NULL)
 #define is_error(object) ((object)->type == TYPE_ERROR)
 #define is_scalar(object) ((object)->type < 0)
 

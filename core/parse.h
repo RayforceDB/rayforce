@@ -26,23 +26,27 @@
 
 #include "../core/rayforce.h"
 
-// Points to a actual error position in a source code
-typedef struct label_t
+/*
+ * Points to a actual error position in a source code
+ */
+typedef struct span_t
 {
-    str_t name;
-    i64_t start_line;
-    i64_t start_col;
-    i64_t end_line;
-    i64_t end_col;
-} label_t;
+    u16_t start_line;
+    u16_t end_line;
+    u16_t start_column;
+    u16_t end_column;
+} span_t;
 
+/*
+ * Parser structure
+ */
 typedef struct parser_t
 {
-    str_t filename;
-    str_t input;
-    str_t current;
-    i64_t line;
-    i64_t column;
+    str_t filename; // filename
+    str_t input;    // input string
+    str_t current;  // current character
+    i64_t line;     // current line
+    i64_t column;   // current column
 } __attribute__((aligned(16))) parser_t;
 
 rf_object_t advance(parser_t *parser);

@@ -21,23 +21,22 @@
  *   SOFTWARE.
  */
 
-#ifndef VECTOR_H
-#define VECTOR_H
+#ifndef RUNTIME_H
+#define RUNTIME_H
 
 #include "rayforce.h"
+#include "alloc.h"
 
-extern rf_object_t list_flatten(rf_object_t object);
-extern i64_t vector_i64_find(rf_object_t *vector, i64_t key);
-extern i64_t vector_f64_find(rf_object_t *vector, f64_t key);
-extern i64_t list_find(rf_object_t *vector, rf_object_t key);
-extern i64_t vector_find(rf_object_t *vector, rf_object_t key);
-extern rf_object_t vector_get(rf_object_t *vector, rf_object_t key);
-extern i64_t vector_push(rf_object_t *vector, rf_object_t object);
-extern i64_t vector_i64_push(rf_object_t *vector, i64_t object);
-extern i64_t vector_f64_push(rf_object_t *vector, f64_t object);
-extern i64_t vector_symbol_push(rf_object_t *vector, rf_object_t object);
-extern i64_t list_push(rf_object_t *vector, rf_object_t object);
-extern i64_t vector_i64_pop(rf_object_t *vector);
-extern f64_t vector_f64_pop(rf_object_t *vector);
-extern rf_object_t list_pop(rf_object_t *vector);
+/*
+ * Runtime structure.
+ */
+typedef struct runtime_t
+{
+    alloc_t alloc;
+} *runtime_t;
+
+extern null_t runtime_init();
+extern null_t runtime_cleanup();
+extern runtime_t runtime_get();
+
 #endif

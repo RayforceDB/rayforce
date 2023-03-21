@@ -32,12 +32,12 @@
 #define MIN_ALLOC ((i64_t)1 << MIN_ORDER)
 #define MAX_ALLOC ((i64_t)1 << MAX_ORDER)
 #define POOL_SIZE (MAX_ALLOC * 2)
-#define cell_COUNT (MAX_ORDER - MIN_ORDER + 1)
+#define CELL_COUNT (MAX_ORDER - MIN_ORDER + 1)
 
 typedef struct alloc_t
 {
     symbols_t *symbols;
-    null_t *freelist[cell_COUNT];
+    null_t *freelist[CELL_COUNT];
     i8_t pool[POOL_SIZE];
 } __attribute__((aligned(PAGE_SIZE))) * alloc_t;
 
@@ -47,9 +47,7 @@ extern null_t *rayforce_malloc(i32_t size);
 extern null_t *rayforce_realloc(null_t *ptr, i32_t size);
 extern null_t rayforce_free(null_t *block);
 
-extern null_t rayforce_alloc_init();
-extern null_t rayforce_alloc_deinit();
-
-extern alloc_t alloc_get();
+extern alloc_t rayforce_alloc_init();
+extern null_t rayforce_alloc_cleanup(alloc_t alloc);
 
 #endif

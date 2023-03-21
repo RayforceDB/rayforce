@@ -111,7 +111,7 @@ str_t vector_fmt(i32_t limit, rf_object_t *object)
     if (!limit)
         return "";
 
-    if (object->list.len == 0)
+    if (object->adt.len == 0)
         return str_fmt(3, "[]");
 
     str_t str, buf;
@@ -137,7 +137,7 @@ str_t vector_fmt(i32_t limit, rf_object_t *object)
     buf += len;
     remains -= len;
 
-    for (i = 1; i < object->list.len; i++)
+    for (i = 1; i < object->adt.len; i++)
     {
         if (v_type == TYPE_I64)
             len = snprintf(buf, remains, "%lld ", as_vector_i64(object)[i]);
@@ -152,7 +152,7 @@ str_t vector_fmt(i32_t limit, rf_object_t *object)
             return "";
         }
 
-        // printf("len: %lld, remains: %lld val: %lld\n", len, remains, ((i64_t *)object->list.ptr)[i]);
+        // printf("len: %lld, remains: %lld val: %lld\n", len, remains, ((i64_t *)object->adt.ptr)[i]);
 
         if (len >= remains)
         {
@@ -179,7 +179,7 @@ str_t list_fmt(i32_t indent, i32_t limit, rf_object_t *object)
     if (!limit)
         return "";
 
-    if (object->list.ptr == NULL)
+    if (object->adt.ptr == NULL)
         return str_fmt(limit, "null");
 
     str_t s, str = str_fmt(limit, "(");
@@ -187,9 +187,9 @@ str_t list_fmt(i32_t indent, i32_t limit, rf_object_t *object)
 
     indent += 2;
 
-    for (i = 0; i < object->list.len; i++)
+    for (i = 0; i < object->adt.len; i++)
     {
-        s = object_fmt_ind(indent, limit - indent, ((rf_object_t *)object->list.ptr) + i);
+        s = object_fmt_ind(indent, limit - indent, ((rf_object_t *)object->adt.ptr) + i);
         offset += str_fmt_into(0, offset, &str, "\n%*.*s%s", indent, indent, PADDING, s);
         rayforce_free(s);
     }
@@ -203,10 +203,10 @@ str_t string_fmt(i32_t indent, i32_t limit, rf_object_t *object)
     if (!limit)
         return "";
 
-    if (object->list.ptr == NULL)
+    if (object->adt.ptr == NULL)
         return str_fmt(0, "\"\"");
 
-    return str_fmt(object->list.len + 3, "\"%s\"", object->list.ptr);
+    return str_fmt(object->adt.len + 3, "\"%s\"", object->adt.ptr);
 }
 
 str_t dict_fmt(i32_t indent, i32_t limit, rf_object_t *object)
@@ -220,7 +220,7 @@ str_t dict_fmt(i32_t indent, i32_t limit, rf_object_t *object)
 
     indent += 2;
 
-    for (i = 0; i < keys->list.len; i++)
+    for (i = 0; i < keys->adt.len; i++)
     {
         // Dispatch keys type
         switch (keys->type)
@@ -276,11 +276,11 @@ str_t table_fmt(i32_t indent, i32_t limit, rf_object_t *object)
     str_t formatted_columns[TABLE_MAX_WIDTH][TABLE_MAX_HEIGHT] = {{NULL}};
     i32_t offset = 1, i, j;
 
-    table_width = (&as_list(object)[0])->list.len;
+    table_width = (&as_list(object)[0])->adt.len;
     if (table_width > TABLE_MAX_WIDTH)
         table_width = TABLE_MAX_WIDTH;
 
-    table_height = (&as_list(columns)[0])->list.len;
+    table_height = (&as_list(columns)[0])->adt.len;
     if (table_height > TABLE_MAX_HEIGHT)
         table_height = TABLE_MAX_HEIGHT;
 
@@ -357,14 +357,9 @@ str_t table_fmt(i32_t indent, i32_t limit, rf_object_t *object)
     return str;
 }
 
-str_t error_fmt(i32_t indent, i32_t limit, rf_object_t *object)
+str_t error_fmt(i32_t indent, i32_t limit, rf_object_t *error)
 {
-    rf_object_t code = dict_get(object, symbol("code"));
-    rf_object_t message = dict_get(object, symbol("message"));
-    rf_object_t labels = dict_get(object, symbol("labels"));
-
-    return str_fmt(0, "** [E%.3d] error: %s\n%s", code.i64, as_string(&message),
-                   object_fmt_ind(indent, limit - indent, &labels));
+    return str_fmt(0, "** [E%.3d] error: %s", error->adt.code, as_string(error));
 }
 
 extern str_t object_fmt_ind(i32_t indent, i32_t limit, rf_object_t *object)

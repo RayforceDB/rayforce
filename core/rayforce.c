@@ -22,20 +22,21 @@
  */
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include "rayforce.h"
 #include "format.h"
 #include "alloc.h"
 #include "string.h"
 #include "vector.h"
 #include "dict.h"
+#include "util.h"
+#include "string.h"
 
 extern rf_object_t error(i8_t code, str_t message)
 {
-    rf_object_t err = dict(vector_symbol(0), list(0));
-    dict_set(&err, symbol("code"), i64(code));
-    dict_set(&err, symbol("message"), string_from_str(message));
-
+    rf_object_t err = string_from_str(message);
     err.type = TYPE_ERROR;
+    err.adt.code = code;
 
     return err;
 }
@@ -64,7 +65,7 @@ extern rf_object_t symbol(str_t ptr)
 {
     // Do not allocate new string - it would be done by symbols_intern (if needed)
     rf_object_t string = str(ptr, strlen(ptr));
-    string.list.ptr = ptr;
+    string.adt.ptr = ptr;
     i64_t id = symbols_intern(&string);
     rf_object_t sym = {
         .type = -TYPE_SYMBOL,
@@ -78,7 +79,7 @@ extern rf_object_t null()
 {
     rf_object_t list = {
         .type = TYPE_LIST,
-        .list = {
+        .adt = {
             .ptr = NULL,
             .len = 0,
         },
@@ -92,13 +93,13 @@ extern rf_object_t table(rf_object_t keys, rf_object_t vals)
     if (keys.type != TYPE_SYMBOL || vals.type != 0)
         return error(ERR_TYPE, "Keys must be a symbol vector and objects must be list");
 
-    if (keys.list.len != vals.list.len)
+    if (keys.adt.len != vals.adt.len)
         return error(ERR_LENGTH, "Keys and objects must have the same length");
 
     // rf_object_t *v = as_list(&vals);
     // i64_t len = 0;
 
-    // for (i64_t i = 0; i < v.list.len; i++)
+    // for (i64_t i = 0; i < v.adt.len; i++)
     // {
     //     if (v[i].type < 0)
     //         return error(ERR_TYPE, "Values must be scalars");
@@ -112,22 +113,6 @@ extern rf_object_t table(rf_object_t keys, rf_object_t vals)
     table.type = TYPE_TABLE;
 
     return table;
-}
-
-extern rf_object_t object_clone(rf_object_t *object)
-{
-    switch (object->type)
-    {
-    case TYPE_I64:
-        return *object;
-    case TYPE_F64:
-        return *object;
-    default:
-    {
-        // printf("** Clone: Invalid type\n");
-        return *object;
-    }
-    }
 }
 
 extern i8_t object_eq(rf_object_t *a, rf_object_t *b)
@@ -145,9 +130,9 @@ extern i8_t object_eq(rf_object_t *a, rf_object_t *b)
     {
         if (as_vector_i64(a) == as_vector_i64(b))
             return 1;
-        if (a->list.len != b->list.len)
+        if (a->adt.len != b->adt.len)
             return 0;
-        for (i = 0; i < a->list.len; i++)
+        for (i = 0; i < a->adt.len; i++)
         {
             if (as_vector_i64(a)[i] != as_vector_i64(b)[i])
                 return 0;
@@ -158,9 +143,9 @@ extern i8_t object_eq(rf_object_t *a, rf_object_t *b)
     {
         if (as_vector_f64(a) == as_vector_f64(b))
             return 1;
-        if (a->list.len != b->list.len)
+        if (a->adt.len != b->adt.len)
             return 0;
-        for (i = 0; i < a->list.len; i++)
+        for (i = 0; i < a->adt.len; i++)
         {
             if (as_vector_f64(a)[i] != as_vector_f64(b)[i])
                 return 0;
@@ -172,24 +157,44 @@ extern i8_t object_eq(rf_object_t *a, rf_object_t *b)
     return 0;
 }
 
+extern rf_object_t object_clone(rf_object_t *object)
+{
+    if (object->type < 0)
+        return *object;
+
+    if (object->adt.ptr == NULL)
+        return *object;
+
+    __atomic_fetch_add(&object->adt.attrs->rc, 1, __ATOMIC_RELAXED);
+
+    return *object;
+}
+
 extern null_t object_free(rf_object_t *object)
 {
-    switch (object->type)
+    if (object->type < 0)
+        return;
+
+    if (object->adt.ptr == NULL)
+        return;
+
+    if (object->type == TYPE_ERROR)
     {
-    case TYPE_I64:
-    {
-        rayforce_free(object->list.ptr);
-        break;
+        rayforce_free(object->adt.ptr);
+        return;
     }
-    case TYPE_F64:
+
+    i64_t rc = __atomic_sub_fetch(&object->adt.attrs->rc, 1, __ATOMIC_RELAXED);
+
+    if (object->type == TYPE_LIST)
     {
-        rayforce_free(object->list.ptr);
-        break;
+        for (i64_t i = 0; i < object->adt.len; i++)
+            object_free(&as_list(object)[i]);
     }
-    default:
+
+    if (rc == 0)
     {
-        // printf("** Free: Invalid type\n");
-        break;
-    }
+        rayforce_free(object->adt.ptr);
+        rayforce_free(object->adt.attrs);
     }
 }
