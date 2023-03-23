@@ -48,7 +48,7 @@ rf_object_t vm_exec(vm_t *vm, str_t code)
     static null_t *dispatch_table[] = {
         &&vm_halt, &&vm_push, &&vm_pop};
 
-#define dispatch() goto *dispatch_table[code[vm->ip]]
+#define dispatch() goto *dispatch_table[(i32_t)code[vm->ip]]
 
     dispatch();
 

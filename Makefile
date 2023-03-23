@@ -1,4 +1,4 @@
-CC=clang
+CC=gcc
 AR=ar
 # RELEASE_CFLAGS = -fPIC -Wall -Wextra -Werror -Wpedantic -std=c17 -O3 -march=native
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -Wpedantic -std=c17 -Ofast -march=native
