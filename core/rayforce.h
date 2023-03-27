@@ -73,8 +73,8 @@ typedef void null_t;
 // Generic type
 typedef struct rf_object_t
 {
-    i8_t type, flags;
-
+    i16_t type;
+    i8_t flags, reserved;
     u32_t id;
 
     union
