@@ -170,10 +170,10 @@ i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
 
         if (!match)
         {
-            push_opcode(code, OP_PUSH);
+            object_free(code);
             err = error(ERR_LENGTH, "compile list: function proto or arity mismatch");
             err.id = object->id;
-            push_object(code, err);
+            *code = err;
             return TYPE_ERROR;
         }
 
@@ -205,7 +205,8 @@ rf_object_t cc_compile(rf_object_t *list)
         push_object(&code, null());
     }
 
-    push_opcode(&code, OP_HALT);
+    if (code.type != TYPE_ERROR)
+        push_opcode(&code, OP_HALT);
 
     // printf("CODE: %s\n", cc_code_fmt(&code));
 

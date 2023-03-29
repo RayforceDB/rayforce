@@ -198,7 +198,8 @@ rf_object_t parse_string(parser_t *parser)
     str = string(len + 1);
     strncpy(as_string(&str), parser->current, len);
     shift(parser, len + 1);
-    span_extend(parser, &span);
+
+    span.end_column += len + 1;
     str.id = span_commit(span);
 
     return str;
@@ -315,7 +316,6 @@ rf_object_t parse_vector(parser_t *parser)
         token = advance(parser);
     }
 
-    shift(parser, 1); // skip ']'
     span_extend(parser, &span);
     vec.id = span_commit(span);
 
@@ -361,7 +361,6 @@ rf_object_t parse_list(parser_t *parser)
         token = advance(parser);
     }
 
-    shift(parser, 1); // skip ')'
     span_extend(parser, &span);
     lst.id = span_commit(span);
 
@@ -432,12 +431,11 @@ rf_object_t parse_dict(parser_t *parser)
         token = advance(parser);
     }
 
-    shift(parser, 1); // skip '}'
-    span_extend(parser, &span);
-
     keys = list_flatten(keys);
     vals = list_flatten(vals);
     d = dict(keys, vals);
+
+    span_extend(parser, &span);
     d.id = span_commit(span);
 
     return d;

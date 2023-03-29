@@ -159,6 +159,9 @@ extern i8_t object_eq(rf_object_t *a, rf_object_t *b)
 
 extern rf_object_t object_clone(rf_object_t *object)
 {
+    // TODO: fixme
+    return *object;
+
     if (object->type < 0)
         return *object;
 
@@ -172,6 +175,7 @@ extern rf_object_t object_clone(rf_object_t *object)
 
 extern null_t object_free(rf_object_t *object)
 {
+    // TODO: fixme
     if (object->type < 0)
         return;
 

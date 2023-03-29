@@ -261,10 +261,11 @@ i32_t main(i32_t argc, str_t argv[])
     {
         printf("%s%s%s", GREEN, PROMPT, RESET);
         ptr = fgets(line, LINE_SIZE, stdin);
-        UNUSED(ptr);
+        if ((ptr) == NULL)
+            break;
 
         parsed = parse("REPL", line);
-        printf("%s\n", object_fmt(&parsed));
+        // printf("%s\n", object_fmt(&parsed));
 
         if (is_error(&parsed))
         {
@@ -281,7 +282,7 @@ i32_t main(i32_t argc, str_t argv[])
             continue;
         }
 
-        printf("CODE: %s\n", cc_code_fmt(&compiled));
+        // printf("CODE: %s\n", cc_code_fmt(&compiled));
         executed = vm_exec(vm, as_string(&compiled));
 
         if (is_error(&executed))
