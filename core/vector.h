@@ -40,5 +40,5 @@ extern i64_t list_push(rf_object_t *vector, rf_object_t object);
 extern i64_t vector_i64_pop(rf_object_t *vector);
 extern f64_t vector_f64_pop(rf_object_t *vector);
 extern rf_object_t list_pop(rf_object_t *vector);
-extern null_t vector_reserve(rf_object_t *vector, u32_t len);
+null_t vector_reserve(rf_object_t *vector, u32_t len);
 #endif

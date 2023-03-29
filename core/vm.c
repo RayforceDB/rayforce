@@ -72,7 +72,6 @@ op_halt:
     x = pop(vm);
     return x;
 op_push:
-    debug("OP PUSH");
     vm->ip++;
     x = *(rf_object_t *)(code + vm->ip);
     push(vm, x);

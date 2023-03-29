@@ -33,16 +33,19 @@
  */
 extern rf_object_t string(i64_t len)
 {
-    str_t ptr = rayforce_malloc(len);
-    ptr[len] = '\0';
-
     rf_object_t string = {
         .type = TYPE_STRING,
         .adt = {
             .len = len,
-            .ptr = ptr,
+            .ptr = NULL,
         },
     };
+
+    if (len == 0)
+        return string;
+
+    string.adt.ptr = rayforce_malloc(len);
+    ((str_t)string.adt.ptr)[len] = '\0';
 
     return string;
 }

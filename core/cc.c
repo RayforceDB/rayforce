@@ -29,14 +29,18 @@
 #include "util.h"
 #include "vector.h"
 
-#define push_opcode(x)       \
-    vector_reserve(code, 1); \
-    as_string(code)[code->adt.len++] = x;
+#define push_opcode(c, x)                 \
+    {                                     \
+        vector_reserve(c, 1);             \
+        as_string(c)[(c)->adt.len++] = x; \
+    }
 
-#define push_object(x)                                     \
-    vector_reserve(code, sizeof(rf_object_t));             \
-    *(rf_object_t *)(as_string(code) + code->adt.len) = x; \
-    code->adt.len += sizeof(rf_object_t);
+#define push_object(c, x)                                  \
+    {                                                      \
+        vector_reserve(c, sizeof(rf_object_t));            \
+        *(rf_object_t *)(&as_string(c)[(c)->adt.len]) = x; \
+        (c)->adt.len += sizeof(rf_object_t);               \
+    }
 
 typedef struct dispatch_record_t
 {
@@ -74,7 +78,6 @@ static dispatch_record_t _DISPATCH_TABLE[DISPATCH_TABLE_SIZE][DISPATCH_RECORD_SI
 
 i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
 {
-    debug("compil\n");
     u32_t arity, i = 0, j = 0, match = 0;
     rf_object_t *car, err;
     dispatch_record_t *rec;
@@ -83,26 +86,25 @@ i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
     switch (object->type)
     {
     case -TYPE_I64:
-        debug("compile: i64");
-        push_opcode(OP_PUSH);
-        push_object(*object);
+        push_opcode(code, OP_PUSH);
+        push_object(code, *object);
         return -TYPE_I64;
 
     case -TYPE_F64:
-        push_opcode(OP_PUSH);
-        push_object(*object);
+        push_opcode(code, OP_PUSH);
+        push_object(code, *object);
         return -TYPE_F64;
 
     case -TYPE_SYMBOL:
-        push_opcode(OP_PUSH);
-        push_object(*object);
+        push_opcode(code, OP_PUSH);
+        push_object(code, *object);
         return -TYPE_SYMBOL;
 
     case TYPE_LIST:
         if (object->adt.len == 0)
         {
-            push_opcode(OP_PUSH);
-            push_object(object_clone(object));
+            push_opcode(code, OP_PUSH);
+            push_object(code, object_clone(object));
             return TYPE_LIST;
         }
 
@@ -153,7 +155,7 @@ i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
                 }
 
                 ret = rec->ret;
-                push_opcode(rec->opcode);
+                push_opcode(code, rec->opcode);
 
                 break;
             }
@@ -161,18 +163,18 @@ i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
 
         if (!match)
         {
-            push_opcode(OP_PUSH);
+            push_opcode(code, OP_PUSH);
             err = error(ERR_LENGTH, "compile list: function proto or arity mismatch");
             err.id = object->id;
-            push_object(err);
+            push_object(code, err);
             return TYPE_ERROR;
         }
 
         return ret;
 
     default:
-        push_opcode(OP_PUSH);
-        push_object(object_clone(object));
+        push_opcode(code, OP_PUSH);
+        push_object(code, object_clone(object));
         return object->type;
     }
 }
@@ -185,21 +187,22 @@ rf_object_t cc_compile(rf_object_t *list)
     if (list->type != TYPE_LIST)
         return error(ERR_TYPE, "compile: expected list");
 
-    rf_object_t prg = string(0), *code;
+    rf_object_t code = string(0);
 
-    for (u32_t i = 0; i < list->adt.len; i++)
-        cc_compile_code(&as_list(list)[i], &prg);
+    // for (u32_t i = 0; i < list->adt.len; i++)
+    //     cc_compile_code(&as_list(list)[i], &code);
 
-    if (list->adt.len == 0)
-    {
-        code = &prg;
-        push_opcode(OP_PUSH);
-        push_object(null());
-    }
+    // if (list->adt.len == 0)
+    // {
+    push_opcode(&code, OP_PUSH);
+    push_object(&code, null());
+    // }
 
-    // debug("CODE: %s\n", cc_code_fmt(as_string(&prg)));
+    push_opcode(&code, OP_HALT);
 
-    return prg;
+    // debug("CODE: %s\n", cc_code_fmt(as_string(&code)));
+
+    return code;
 }
 
 str_t cc_code_fmt(str_t code)

@@ -281,6 +281,7 @@ i32_t main(i32_t argc, str_t argv[])
             continue;
         }
 
+        continue;
         printf("CODE: %s\n", cc_code_fmt(as_string(&compiled)));
         executed = vm_exec(vm, as_string(&compiled));
 

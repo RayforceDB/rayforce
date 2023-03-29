@@ -30,7 +30,7 @@
  * Each vector capacity is always factor of 8
  * This allows to avoid storing capacity in vector
  */
-#define CAPACITY_FACTOR 8
+#define CAPACITY_FACTOR 32
 
 /*
  * Aligns x to the nearest multiple of a
@@ -51,7 +51,7 @@
         i64_t cap = capacity(occup);                                          \
         i64_t req_cap = n * sizeof(ty);                                       \
         i64_t new_cap = capacity(cap + req_cap);                              \
-        if (cap > req_cap + occup)                                            \
+        if (cap >= req_cap + occup)                                           \
             ;                                                                 \
         else if ((vector)->adt.len == 0)                                      \
             (vector)->adt.ptr = rayforce_malloc(new_cap);                     \
@@ -203,8 +203,10 @@ extern rf_object_t vector_pop(rf_object_t *vector)
     }
 }
 
-extern null_t vector_reserve(rf_object_t *vector, u32_t len)
+null_t vector_reserve(rf_object_t *vector, u32_t len)
 {
+    debug("Reserving %d elements for vector\n", len);
+    return;
     switch (vector->type)
     {
     case TYPE_I64:
