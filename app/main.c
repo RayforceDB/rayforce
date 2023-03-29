@@ -244,7 +244,7 @@ i32_t main(i32_t argc, str_t argv[])
 {
     rf_object_t args = parse_cmdline(argc, argv), parsed, executed, compiled;
     i8_t run = 1;
-    str_t line = (str_t)rayforce_malloc(LINE_SIZE), ptr, filename = NULL;
+    str_t line = (str_t)rayforce_malloc(LINE_SIZE), ptr; //, filename = NULL;
     vm_t *vm;
 
     memset(line, 0, LINE_SIZE);
@@ -254,15 +254,17 @@ i32_t main(i32_t argc, str_t argv[])
 
     vm = vm_create();
 
+    UNUSED(args);
     // load_file("/tmp/test.ray");
 
     while (run)
     {
         printf("%s%s%s", GREEN, PROMPT, RESET);
         ptr = fgets(line, LINE_SIZE, stdin);
+        UNUSED(ptr);
 
         parsed = parse("REPL", line);
-        // printf("%s\n", object_fmt(&parsed));
+        printf("%s\n", object_fmt(&parsed));
 
         if (is_error(&parsed))
         {
@@ -279,7 +281,7 @@ i32_t main(i32_t argc, str_t argv[])
             continue;
         }
 
-        // printf("CODE: %s\n", cc_code_fmt(as_string(&compiled)));
+        printf("CODE: %s\n", cc_code_fmt(as_string(&compiled)));
         executed = vm_exec(vm, as_string(&compiled));
 
         if (is_error(&executed))

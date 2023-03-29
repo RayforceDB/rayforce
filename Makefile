@@ -4,8 +4,6 @@ AR=ar
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=c17 -Ofast -march=native
 # RELEASE_CFLAGS = -fPIC -Wall -Wextra -Wpedantic -std=c17 -Ofast -march=native -g -pg
 DEBUG_CFLAGS =  -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG
-CFLAGS = $(DEBUG_CFLAGS)
-# CFLAGS = $(RELEASE_CFLAGS)
 CORE_HEADERS = core/util.h core/vector.h core/string.h core/mmap.h core/hash.h\
  core/symbols.h core/format.h core/rayforce.h core/monad.h core/alloc.h core/runtime.h\
  core/dict.h core/parse.h core/vm.h core/debuginfo.h core/cc.h
@@ -16,6 +14,10 @@ CORE_OBJECTS = core/vector.o core/string.o core/hash.o core/symbols.o\
 APP_OBJECTS = app/main.o
 TESTS_OBJECTS = app/tests.o
 TARGET = rayforce
+
+default: debug
+
+all: default
 
 app: $(APP_OBJECTS) lib
 	$(CC) $(CFLAGS) -o $(TARGET) $(CORE_OBJECTS) $(APP_OBJECTS) -L. -l$(TARGET) 
@@ -33,9 +35,11 @@ lib: $(CORE_OBJECTS)
 disasm: app
 	objdump -d $(TARGET) -l > $(TARGET).S
 
-default: app
+debug: CFLAGS = $(DEBUG_CFLAGS)
+debug: app
 
-all: default
+release: CFLAGS = $(RELEASE_CFLAGS) 
+release: app
 
 clean:
 	-rm -f *.o

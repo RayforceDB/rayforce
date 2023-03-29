@@ -58,7 +58,7 @@ null_t span_extend(parser_t *parser, span_t *span)
     return;
 }
 
-u32_t span_commit(parser_t *parser, span_t span)
+u32_t span_commit(span_t span)
 {
     debuginfo_t *debuginfo = runtime_get()->debuginfo;
     return debuginfo_insert(debuginfo, span);
@@ -125,7 +125,7 @@ rf_object_t to_token(parser_t *parser)
 {
     rf_object_t tok = i64(*parser->current);
     tok.type = TYPE_TOKEN;
-    tok.id = span_commit(parser, span_start(parser));
+    tok.id = span_commit(span_start(parser));
     return tok;
 }
 
@@ -162,7 +162,7 @@ rf_object_t parse_number(parser_t *parser)
 
     shift(parser, end - parser->current);
     span_extend(parser, &span);
-    num.id = span_commit(parser, span);
+    num.id = span_commit(span);
 
     return num;
 }
@@ -190,7 +190,7 @@ rf_object_t parse_string(parser_t *parser)
     {
         span.end_column += (pos - parser->current);
         err = error(ERR_PARSE, "Expected '\"'");
-        err.id = span_commit(parser, span);
+        err.id = span_commit(span);
         return err;
     }
 
@@ -199,7 +199,7 @@ rf_object_t parse_string(parser_t *parser)
     strncpy(as_string(&str), parser->current, len);
     shift(parser, len + 1);
     span_extend(parser, &span);
-    str.id = span_commit(parser, span);
+    str.id = span_commit(span);
 
     return str;
 }
@@ -223,7 +223,7 @@ rf_object_t parse_symbol(parser_t *parser)
     res.type = -TYPE_SYMBOL;
     shift(parser, pos - parser->current);
     span_extend(parser, &span);
-    res.id = span_commit(parser, span);
+    res.id = span_commit(span);
 
     return res;
 }
@@ -249,7 +249,7 @@ rf_object_t parse_vector(parser_t *parser)
         {
             object_free(&vec);
             err = error(ERR_PARSE, "Expected ']'");
-            err.id = span_commit(parser, span);
+            err.id = span_commit(span);
             return err;
         }
 
@@ -317,7 +317,7 @@ rf_object_t parse_vector(parser_t *parser)
 
     shift(parser, 1); // skip ']'
     span_extend(parser, &span);
-    vec.id = span_commit(parser, span);
+    vec.id = span_commit(span);
 
     return vec;
 }
@@ -343,7 +343,7 @@ rf_object_t parse_list(parser_t *parser)
         {
             object_free(&lst);
             err = error(ERR_PARSE, "Expected ')'");
-            err.id = span_commit(parser, span);
+            err.id = span_commit(span);
             return err;
         }
 
@@ -363,7 +363,7 @@ rf_object_t parse_list(parser_t *parser)
 
     shift(parser, 1); // skip ')'
     span_extend(parser, &span);
-    lst.id = span_commit(parser, span);
+    lst.id = span_commit(span);
 
     return lst;
 }
@@ -390,7 +390,7 @@ rf_object_t parse_dict(parser_t *parser)
             object_free(&keys);
             object_free(&vals);
             err = error(ERR_PARSE, "Expected '}'");
-            err.id = span_commit(parser, span);
+            err.id = span_commit(span);
             return err;
         }
 
@@ -422,7 +422,7 @@ rf_object_t parse_dict(parser_t *parser)
             object_free(&keys);
             object_free(&vals);
             err = error(ERR_PARSE, "Expected object folowing ':'");
-            err.id = span_commit(parser, span);
+            err.id = span_commit(span);
             return err;
         }
 
@@ -438,7 +438,7 @@ rf_object_t parse_dict(parser_t *parser)
     keys = list_flatten(keys);
     vals = list_flatten(vals);
     d = dict(keys, vals);
-    d.id = span_commit(parser, span);
+    d.id = span_commit(span);
 
     return d;
 }
@@ -491,7 +491,7 @@ rf_object_t advance(parser_t *parser)
     }
 
     err = error(ERR_PARSE, str_fmt(0, "Unexpected token: '%c'", *parser->current));
-    err.id = span_commit(parser, span_start(parser));
+    err.id = span_commit(span_start(parser));
     return err;
 }
 

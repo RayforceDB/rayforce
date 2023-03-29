@@ -61,8 +61,9 @@ static dispatch_record_t _DISPATCH_TABLE[DISPATCH_TABLE_SIZE][DISPATCH_RECORD_SI
     },
     // Binary
     {
-        {"+", {-TYPE_I64, -TYPE_I64}, -TYPE_I64, OP_ADDI}, 
-        {"+", {-TYPE_F64, -TYPE_F64}, -TYPE_F64, OP_ADDF},
+        {"+",   {-TYPE_I64, -TYPE_I64}, -TYPE_I64, OP_ADDI}, 
+        {"+",   {-TYPE_F64, -TYPE_F64}, -TYPE_F64, OP_ADDF},
+        {"sum", {TYPE_I64,  -TYPE_I64},  TYPE_I64, OP_SUMI},
     },
     // Ternary
     {{0}},
@@ -73,6 +74,7 @@ static dispatch_record_t _DISPATCH_TABLE[DISPATCH_TABLE_SIZE][DISPATCH_RECORD_SI
 
 i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
 {
+    debug("compil\n");
     u32_t arity, i = 0, j = 0, match = 0;
     rf_object_t *car, err;
     dispatch_record_t *rec;
@@ -81,6 +83,7 @@ i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
     switch (object->type)
     {
     case -TYPE_I64:
+        debug("compile: i64");
         push_opcode(OP_PUSH);
         push_object(*object);
         return -TYPE_I64;
@@ -194,7 +197,7 @@ rf_object_t cc_compile(rf_object_t *list)
         push_object(null());
     }
 
-    debug("CODE: %s\n", cc_code_fmt(as_string(&prg)));
+    // debug("CODE: %s\n", cc_code_fmt(as_string(&prg)));
 
     return prg;
 }
@@ -211,6 +214,9 @@ str_t cc_code_fmt(str_t code)
     {
         switch (*ip++)
         {
+        case OP_HALT:
+            p += str_fmt_into(0, p, &s, "%.4d: halt\n", c++);
+            break;
         case OP_PUSH:
             p += str_fmt_into(0, p, &s, "%.4d: push %p\n", c++, ((rf_object_t *)(ip + 1)));
             ip += sizeof(rf_object_t);
@@ -224,13 +230,14 @@ str_t cc_code_fmt(str_t code)
         case OP_ADDF:
             p += str_fmt_into(0, p, &s, "%.4d: addf\n", c++);
             break;
+        case OP_SUMI:
+            p += str_fmt_into(0, p, &s, "%.4d: sumi\n", c++);
+            break;
         default:
             p += str_fmt_into(0, p, &s, "%.4d: unknown %d\n", c++, *ip);
             break;
         }
     }
-
-    str_fmt_into(0, p, &s, "%.4d: halt", c++);
 
     return s;
 }

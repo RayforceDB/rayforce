@@ -36,8 +36,9 @@ typedef enum vm_opcode_t
     OP_POP,      // Pop an object from the stack
     OP_ADDI,     // Add two i64 from the stack
     OP_ADDF,     // Add two f64 from the stack
-    OP_SUB,      // Subtract two objects from the stack
-    OP_MUL,      // Multiply two objects from the stack
+    // OP_SUB,      // Subtract two objects from the stack
+    // OP_MUL,      // Multiply two objects from the stack
+    OP_SUMI, // Sum i64 vector elements with scalar i64
 } vm_opcode_t;
 
 typedef struct vm_t

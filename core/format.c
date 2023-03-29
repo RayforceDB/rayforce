@@ -202,6 +202,8 @@ str_t list_fmt(i32_t indent, i32_t limit, rf_object_t *object)
 
 str_t string_fmt(i32_t indent, i32_t limit, rf_object_t *object)
 {
+    UNUSED(indent);
+
     if (!limit)
         return "";
 
@@ -361,6 +363,8 @@ str_t table_fmt(i32_t indent, i32_t limit, rf_object_t *object)
 
 str_t error_fmt(i32_t indent, i32_t limit, rf_object_t *error)
 {
+    UNUSED(indent);
+    UNUSED(limit);
     return str_fmt(0, "** [E%.3d] error: %s", error->adt.code, as_string(error));
 }
 
