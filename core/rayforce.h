@@ -105,7 +105,7 @@ typedef struct rf_object_t
         } adt;
     };
 
-} __attribute__((aligned(16))) rf_object_t;
+} rf_object_t;
 
 CASSERT(sizeof(struct rf_object_t) == 32, rayforce_h)
 

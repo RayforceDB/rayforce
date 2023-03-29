@@ -35,12 +35,11 @@
         as_string(c)[(c)->adt.len++] = (i8_t)x; \
     }
 
-#define push_object(c, x)                                             \
-    {                                                                 \
-        vector_reserve(c, sizeof(rf_object_t));                       \
-        rf_object_t o = x;                                            \
-        memcpy((c)->adt.ptr + (c)->adt.len, &o, sizeof(rf_object_t)); \
-        (c)->adt.len += sizeof(rf_object_t);                          \
+#define push_object(c, x)                                  \
+    {                                                      \
+        vector_reserve(c, sizeof(rf_object_t));            \
+        *(rf_object_t *)(as_string(c) + (c)->adt.len) = x; \
+        (c)->adt.len += sizeof(rf_object_t);               \
     }
 
 typedef struct dispatch_record_t
@@ -208,7 +207,7 @@ rf_object_t cc_compile(rf_object_t *list)
 
     push_opcode(&code, OP_HALT);
 
-    printf("CODE: %s\n", cc_code_fmt(&code));
+    // printf("CODE: %s\n", cc_code_fmt(&code));
 
     return code;
 }
@@ -223,7 +222,7 @@ str_t cc_code_fmt(rf_object_t *code)
 
     while ((ip - ((str_t)code->adt.ptr)) < len)
     {
-        switch (*ip++)
+        switch (*ip)
         {
         case OP_HALT:
             p += str_fmt_into(0, p, &s, "%.4d: halt\n", c++);
@@ -248,6 +247,8 @@ str_t cc_code_fmt(rf_object_t *code)
             p += str_fmt_into(0, p, &s, "%.4d: unknown %d\n", c++, *ip);
             break;
         }
+
+        ip++;
     }
 
     return s;

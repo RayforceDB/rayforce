@@ -281,8 +281,7 @@ i32_t main(i32_t argc, str_t argv[])
             continue;
         }
 
-        continue;
-        // printf("CODE: %s\n", cc_code_fmt(&compiled));
+        printf("CODE: %s\n", cc_code_fmt(&compiled));
         executed = vm_exec(vm, as_string(&compiled));
 
         if (is_error(&executed))
@@ -293,7 +292,6 @@ i32_t main(i32_t argc, str_t argv[])
         object_free(&parsed);
         object_free(&executed);
         object_free(&compiled);
-        run = 0;
     }
 
     rayforce_free(line);
