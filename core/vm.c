@@ -28,6 +28,7 @@
 #include "alloc.h"
 #include "format.h"
 #include "util.h"
+#include "string.h"
 
 #define push(v, x) (v->stack[v->sp++] = x)
 #define pop(v) (v->stack[--v->sp])
@@ -61,7 +62,7 @@ rf_object_t vm_exec(vm_t *vm, str_t code)
 
     // The indices of labels in the dispatch_table are the relevant opcodes
     static null_t *dispatch_table[] = {
-        &&op_halt, &&op_push, &&op_pop, &&op_addi, &&op_addf, &&op_sumi};
+        &&op_halt, &&op_push, &&op_pop, &&op_addi, &&op_addf, &&op_sumi, &&op_like};
 
 #define dispatch() goto *dispatch_table[(i32_t)code[vm->ip]]
 
@@ -69,8 +70,10 @@ rf_object_t vm_exec(vm_t *vm, str_t code)
 
 op_halt:
     vm->halted = 1;
-    x = pop(vm);
-    return x;
+    if (vm->sp > 0)
+        return pop(vm);
+    else
+        return null();
 op_push:
     vm->ip++;
     x = *(rf_object_t *)(code + vm->ip);
@@ -99,6 +102,12 @@ op_sumi:
         as_vector_i64(&x)[i] += y.i64;
 
     push(vm, x);
+    dispatch();
+op_like:
+    vm->ip++;
+    x = pop(vm);
+    y = pop(vm);
+    push(vm, i64(string_match(as_string(&x), as_string(&y))));
     dispatch();
 }
 

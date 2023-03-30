@@ -28,6 +28,7 @@
 #include "format.h"
 #include "util.h"
 #include "vector.h"
+#include "string.h"
 
 #define push_opcode(c, x)                       \
     {                                           \
@@ -51,7 +52,7 @@ typedef struct dispatch_record_t
 } dispatch_record_t;
 
 #define DISPATCH_TABLE_SIZE 5
-#define DISPATCH_RECORD_SIZE 4
+#define DISPATCH_RECORD_SIZE 16
 
 // clang-format off
 static dispatch_record_t _DISPATCH_TABLE[DISPATCH_TABLE_SIZE][DISPATCH_RECORD_SIZE] = {
@@ -65,9 +66,10 @@ static dispatch_record_t _DISPATCH_TABLE[DISPATCH_TABLE_SIZE][DISPATCH_RECORD_SI
     },
     // Binary
     {
-        {"+",   {-TYPE_I64, -TYPE_I64}, -TYPE_I64, OP_ADDI}, 
-        {"+",   {-TYPE_F64, -TYPE_F64}, -TYPE_F64, OP_ADDF},
-        {"sum", {TYPE_I64,  -TYPE_I64},  TYPE_I64, OP_SUMI},
+        {"+",    {-TYPE_I64,     -TYPE_I64}, -TYPE_I64,    OP_ADDI}, 
+        {"+",    {-TYPE_F64,     -TYPE_F64}, -TYPE_F64,    OP_ADDF},
+        {"sum",  {TYPE_I64,      -TYPE_I64},  TYPE_I64,    OP_SUMI},
+        {"like", {TYPE_STRING, TYPE_STRING},  TYPE_I64,    OP_LIKE}
     },
     // Ternary
     {{0}},
@@ -168,7 +170,7 @@ i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
             }
         }
 
-        if (!match)
+        if (!match && arity)
         {
             object_free(code);
             err = error(ERR_LENGTH, "compile list: function proto or arity mismatch");

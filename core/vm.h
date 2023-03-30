@@ -39,6 +39,7 @@ typedef enum vm_opcode_t
     // OP_SUB,      // Subtract two objects from the stack
     // OP_MUL,      // Multiply two objects from the stack
     OP_SUMI, // Sum i64 vector elements with scalar i64
+    OP_LIKE, // Compare string with regex
 } vm_opcode_t;
 
 typedef struct vm_t
