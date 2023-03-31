@@ -25,6 +25,7 @@
 #include "alloc.h"
 #include "vector.h"
 #include "util.h"
+#include "ops.h"
 
 /*
  * Each vector capacity is always factor of 8
@@ -33,19 +34,9 @@
 #define CAPACITY_FACTOR 16
 
 /*
- * Allocate vector via mmap if it's size is greater than 32 Mb
- */
-#define CAPACITY_MMAP 1024 * 1024 * 32
-
-/*
- * Aligns x to the nearest multiple of a
- */
-#define alignup(x, a) (((x) + (a)-1) & ~((a)-1))
-
-/*
  * Calculates capacity for vector of length x
  */
-#define capacity(x) (alignup(x, CAPACITY_FACTOR))
+#define capacity(x) (ALIGNUP(x, CAPACITY_FACTOR))
 
 /*
  * Reserves memory for n elements
@@ -130,13 +121,7 @@ extern rf_object_t vector(i8_t type, i8_t size_of_val, i64_t len)
     if (len == 0)
         return v;
 
-    i64_t cap = size_of_val * len;
-
-    if (cap < CAPACITY_MMAP)
-        v.adt.ptr = rayforce_malloc(capacity(cap));
-    else
-        v.adt.ptr = mmap(NULL, alignup(cap, PAGE_SIZE),
-                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    v.adt.ptr = rayforce_malloc(capacity(size_of_val * len));
 
     return v;
 }

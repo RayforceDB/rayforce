@@ -31,6 +31,7 @@
 #include "dict.h"
 #include "debuginfo.h"
 #include "runtime.h"
+#include "ops.h"
 
 #define MAX_I64_WIDTH 20
 #define MAX_ROW_WIDTH MAX_I64_WIDTH * 2
@@ -108,6 +109,22 @@ extern str_t str_fmt(i32_t limit, str_t fmt, ...)
     return p;
 }
 
+str_t i64_fmt(i32_t limit, i64_t val)
+{
+    if (val == NULL_I64)
+        return "0i";
+    else
+        return str_fmt(limit, "%lld", val);
+}
+
+str_t f64_fmt(i32_t limit, f64_t val)
+{
+    if (rf_is_nan(val))
+        return "0f";
+    else
+        return str_fmt(limit, "%.*f", F64_PRECISION, val);
+}
+
 str_t vector_fmt(i32_t limit, rf_object_t *object)
 {
     if (!limit)
@@ -121,30 +138,27 @@ str_t vector_fmt(i32_t limit, rf_object_t *object)
     i8_t v_type = object->type;
 
     str = buf = (str_t)rayforce_malloc(limit + FORMAT_TRAILER_SIZE);
-
-    // Print '[' with the first element
-    if (v_type == TYPE_I64)
-        len = snprintf(buf, remains, "[%lld ", as_vector_i64(object)[0]);
-    else if (v_type == TYPE_F64)
-        len = snprintf(buf, remains, "[%.*f ", F64_PRECISION, as_vector_f64(object)[0]);
-    else if (v_type == TYPE_SYMBOL)
-        len = snprintf(buf, remains, "[%s ", symbols_get(as_vector_symbol(object)[0]));
-
-    if (len < 0)
-    {
-        rayforce_free(str);
-        return "";
-    }
+    len = snprintf(buf, remains, "[");
 
     buf += len;
     remains -= len;
 
-    for (i = 1; i < object->adt.len; i++)
+    for (i = 0; i < object->adt.len; i++)
     {
         if (v_type == TYPE_I64)
-            len = snprintf(buf, remains, "%lld ", as_vector_i64(object)[i]);
+        {
+            if (as_vector_i64(object)[i] == NULL_I64)
+                len = snprintf(buf, remains, "0i ");
+            else
+                len = snprintf(buf, remains, "%lld ", as_vector_i64(object)[i]);
+        }
         else if (v_type == TYPE_F64)
-            len = snprintf(buf, remains, "%.*f ", F64_PRECISION, as_vector_f64(object)[i]);
+        {
+            if (as_vector_f64(object)[i] != as_vector_f64(object)[i])
+                len = snprintf(buf, remains, "0f ");
+            else
+                len = snprintf(buf, remains, "%.*f ", F64_PRECISION, as_vector_f64(object)[i]);
+        }
         else if (v_type == TYPE_SYMBOL)
             len = snprintf(buf, remains, "%s ", symbols_get(as_vector_symbol(object)[i]));
 
@@ -153,8 +167,6 @@ str_t vector_fmt(i32_t limit, rf_object_t *object)
             rayforce_free(str);
             return "";
         }
-
-        // printf("len: %lld, remains: %lld val: %lld\n", len, remains, ((i64_t *)object->adt.ptr)[i]);
 
         if (len >= remains)
         {
@@ -230,7 +242,7 @@ str_t dict_fmt(i32_t indent, i32_t limit, rf_object_t *object)
         switch (keys->type)
         {
         case TYPE_I64:
-            k = str_fmt(limit, "%lld", as_vector_i64(keys)[i]);
+            k = i64_fmt(limit, as_vector_i64(keys)[i]);
             break;
         case TYPE_F64:
             k = str_fmt(limit, "%.*f", F64_PRECISION, as_vector_f64(keys)[i]);
@@ -246,7 +258,7 @@ str_t dict_fmt(i32_t indent, i32_t limit, rf_object_t *object)
         switch (vals->type)
         {
         case TYPE_I64:
-            v = str_fmt(limit, "%lld", as_vector_i64(vals)[i]);
+            v = i64_fmt(limit, as_vector_i64(vals)[i]);
             break;
         case TYPE_F64:
             v = str_fmt(limit, "%.*f", F64_PRECISION, as_vector_f64(vals)[i]);
@@ -305,10 +317,10 @@ str_t table_fmt(i32_t indent, i32_t limit, rf_object_t *object)
             switch (column->type)
             {
             case TYPE_I64:
-                s = str_fmt(limit, "%lld", as_vector_i64(column)[j]);
+                s = i64_fmt(limit, as_vector_i64(column)[j]);
                 break;
             case TYPE_F64:
-                s = str_fmt(limit, "%.*f", F64_PRECISION, as_vector_f64(column)[j]);
+                s = f64_fmt(limit, as_vector_f64(column)[j]);
                 break;
             case TYPE_SYMBOL:
                 s = str_fmt(limit, "%s", symbols_get(as_vector_symbol(column)[j]));
@@ -375,9 +387,9 @@ extern str_t object_fmt_ind(i32_t indent, i32_t limit, rf_object_t *object)
     case TYPE_LIST:
         return list_fmt(indent, limit, object);
     case -TYPE_I64:
-        return str_fmt(limit, "%lld", object->i64);
+        return i64_fmt(limit, object->i64);
     case -TYPE_F64:
-        return str_fmt(limit, "%.*f", F64_PRECISION, object->f64);
+        return f64_fmt(limit, object->f64);
     case -TYPE_SYMBOL:
         return str_fmt(limit, "%s", symbols_get(object->i64));
     case TYPE_I64:

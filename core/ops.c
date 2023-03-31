@@ -21,50 +21,17 @@
  *   SOFTWARE.
  */
 
-#include <stdio.h>
-#include <assert.h>
-#include "alloc.h"
-#include "rayforce.h"
+#include "string.h"
 #include "ops.h"
-#include "mmap.h"
 
 /*
- * Allocate via mmap if size is greater than 32 Mb
+ * Incase of using -Ofast compiler flag, we can not just use x != x due to
+ * compiler optimizations. So we need to use memcpy to get the bits of the x
+ * and then separate check mantissa and exponent.
  */
-#define SIZE_TO_MMAP 1024 * 1024 * 32
-
-extern null_t *rayforce_malloc(i32_t size)
+extern i8_t rf_is_nan(f64_t x)
 {
-    if (size < SIZE_TO_MMAP)
-        return malloc(size);
-
-    return mmap(NULL, ALIGNUP(size, PAGE_SIZE),
-                PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-}
-
-extern null_t rayforce_free(null_t *block)
-{
-    free(block);
-}
-
-extern null_t *rayforce_realloc(null_t *ptr, i32_t size)
-{
-    return realloc(ptr, size);
-}
-
-extern alloc_t rayforce_alloc_init()
-{
-    alloc_t alloc;
-
-    alloc = (alloc_t)mmap(NULL, sizeof(struct alloc_t),
-                          PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    alloc->symbols = symbols_create();
-
-    return alloc;
-}
-
-extern null_t rayforce_alloc_cleanup(alloc_t alloc)
-{
-    symbols_free(alloc->symbols);
-    // munmap(GLOBAL_A0, sizeof(struct alloc_t));
+    u64_t bits;
+    memcpy(&bits, &x, sizeof(x));
+    return (bits & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL && (bits & 0x000FFFFFFFFFFFFFULL) != 0;
 }

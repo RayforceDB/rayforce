@@ -37,7 +37,7 @@ typedef enum vm_opcode_t
     OP_POP,      // Pop an object from the stack
     OP_ADDI,     // Add two i64 from the stack
     OP_ADDF,     // Add two f64 from the stack
-    // OP_SUB,      // Subtract two objects from the stack
+    OP_SUBI,     // Subtract two i64 from the stack
     // OP_MUL,      // Multiply two objects from the stack
     OP_SUMI,        // Sum i64 vector elements with scalar i64
     OP_LIKE,        // Compare string with regex
@@ -49,11 +49,10 @@ typedef enum vm_opcode_t
 
 typedef struct vm_t
 {
-    i32_t ip;    // Instruction pointer
-    i32_t sp;    // Stack pointer
-    i8_t halted; // Halt flag
-    rf_object_t r0, r1, r2, r3, r4,
-        r5, r6, r7, r8; // Registers of objects
+    i32_t ip;           // Instruction pointer
+    i32_t sp;           // Stack pointer
+    i8_t halted;        // Halt flag
+    rf_object_t r[8];   // Registers of objects
     clock_t timer;      // Timer for execution time
     rf_object_t *stack; // Stack of objects
 } vm_t;

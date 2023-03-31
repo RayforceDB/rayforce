@@ -24,6 +24,7 @@
 #include "rayforce.h"
 #include "alloc.h"
 #include "vm.h"
+#include "ops.h"
 
 // rf_object_t til(i64_t count)
 // {
@@ -37,16 +38,16 @@
 //     return vector_i64(vec, count);
 // }
 
-// rf_object_t rayforce_add(rf_object_t *a, rf_object_t *b)
-// {
-//     i64_t a_len;
-//     i64_t *a_vec;
+rf_object_t rayforce_add(rf_object_t *a, rf_object_t *b)
+{
+    i64_t a_len;
+    i64_t *a_vec;
 
-//     a_len = a->adt.len;
-//     a_vec = a->adt.ptr;
+    a_len = a->adt.len;
+    a_vec = a->adt.ptr;
 
-//     for (i64_t i = 0; i < a_len; i++)
-//         a_vec[i] += b->i64;
+    for (i64_t i = 0; i < a_len; i++)
+        a_vec[i] = ADDI64(a_vec[i], b->i64);
 
-//     return *a;
-// }
+    return *a;
+}

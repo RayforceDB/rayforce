@@ -137,6 +137,26 @@ rf_object_t parse_number(parser_t *parser)
     rf_object_t num;
     span_t span = span_start(parser);
 
+    // check if null
+    if (*parser->current == '0')
+    {
+        if (*(parser->current + 1) == 'i')
+        {
+            shift(parser, 2);
+            num = i64(NULL_I64);
+            num.id = span_commit(span);
+            return num;
+        }
+
+        if (*(parser->current + 1) == 'f')
+        {
+            shift(parser, 2);
+            num = f64(NULL_F64);
+            num.id = span_commit(span);
+            return num;
+        }
+    }
+
     errno = 0;
 
     num_i64 = strtoll(parser->current, &end, 10);
@@ -471,7 +491,7 @@ rf_object_t advance(parser_t *parser)
     if ((*parser->current) == '{')
         return parse_dict(parser);
 
-    if ((*parser->current) == '-' || is_digit(*parser->current))
+    if (((*parser->current) == '-' && is_digit(*(parser->current + 1))) || is_digit(*parser->current))
         return parse_number(parser);
 
     if (is_alpha(*parser->current) || is_op(*parser->current))

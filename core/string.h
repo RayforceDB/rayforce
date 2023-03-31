@@ -24,6 +24,7 @@
 #ifndef STRING_H
 #define STRING_H
 
+#include <string.h>
 #include "rayforce.h"
 
 i8_t string_match(str_t str, str_t pat);

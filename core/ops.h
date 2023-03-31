@@ -21,50 +21,19 @@
  *   SOFTWARE.
  */
 
-#include <stdio.h>
-#include <assert.h>
-#include "alloc.h"
+#ifndef OPS_H
+#define OPS_H
+
 #include "rayforce.h"
-#include "ops.h"
-#include "mmap.h"
+
+#define ADDI64(x, y) (((x | y) & NULL_I64) ? NULL_I64 : (x + y))
+#define SUBI64(x, y) (((x | y) & NULL_I64) ? NULL_I64 : (x - y))
 
 /*
- * Allocate via mmap if size is greater than 32 Mb
+ * Aligns x to the nearest multiple of a
  */
-#define SIZE_TO_MMAP 1024 * 1024 * 32
+#define ALIGNUP(x, a) (((x) + (a)-1) & ~((a)-1))
 
-extern null_t *rayforce_malloc(i32_t size)
-{
-    if (size < SIZE_TO_MMAP)
-        return malloc(size);
+extern i8_t rf_is_nan(f64_t x);
 
-    return mmap(NULL, ALIGNUP(size, PAGE_SIZE),
-                PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-}
-
-extern null_t rayforce_free(null_t *block)
-{
-    free(block);
-}
-
-extern null_t *rayforce_realloc(null_t *ptr, i32_t size)
-{
-    return realloc(ptr, size);
-}
-
-extern alloc_t rayforce_alloc_init()
-{
-    alloc_t alloc;
-
-    alloc = (alloc_t)mmap(NULL, sizeof(struct alloc_t),
-                          PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    alloc->symbols = symbols_create();
-
-    return alloc;
-}
-
-extern null_t rayforce_alloc_cleanup(alloc_t alloc)
-{
-    symbols_free(alloc->symbols);
-    // munmap(GLOBAL_A0, sizeof(struct alloc_t));
-}
+#endif

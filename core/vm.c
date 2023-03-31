@@ -29,6 +29,7 @@
 #include "format.h"
 #include "util.h"
 #include "string.h"
+#include "ops.h"
 
 #define push(v, x) (v->stack[v->sp++] = x)
 #define pop(v) (v->stack[--v->sp])
@@ -54,7 +55,7 @@ vm_t *vm_create()
  */
 rf_object_t vm_exec(vm_t *vm, str_t code)
 {
-    rf_object_t x, y;
+    rf_object_t x, y, z;
     i32_t i;
 
     vm->ip = 0;
@@ -62,8 +63,8 @@ rf_object_t vm_exec(vm_t *vm, str_t code)
 
     // The indices of labels in the dispatch_table are the relevant opcodes
     static null_t *dispatch_table[] = {
-        &&op_halt, &&op_push, &&op_pop, &&op_addi, &&op_addf, &&op_sumi, &&op_like, &&op_type,
-        &&op_timer_start, &&op_timer_get, &&op_til};
+        &&op_halt, &&op_push, &&op_pop, &&op_addi, &&op_addf, &&op_subi, &&op_sumi, &&op_like,
+        &&op_type, &&op_timer_start, &&op_timer_get, &&op_til};
 
 #define dispatch() goto *dispatch_table[(i32_t)code[vm->ip]]
 
@@ -77,42 +78,51 @@ op_halt:
         return null();
 op_push:
     vm->ip++;
-    x = *(rf_object_t *)(code + vm->ip);
-    push(vm, x);
+    y = *(rf_object_t *)(code + vm->ip);
+    push(vm, y);
     vm->ip += sizeof(rf_object_t);
     dispatch();
 op_pop:
     vm->ip++;
-    x = pop(vm);
+    y = pop(vm);
     dispatch();
 op_addi:
     vm->ip++;
+    y = pop(vm);
     x = pop(vm);
-    peek(vm)->i64 += x.i64;
+    z = i64(ADDI64(x.i64, y.i64));
+    push(vm, z);
     dispatch();
 op_addf:
     vm->ip++;
+    y = pop(vm);
+    peek(vm)->f64 += y.f64;
+    dispatch();
+op_subi:
+    vm->ip++;
+    y = pop(vm);
     x = pop(vm);
-    peek(vm)->f64 += x.f64;
+    z = i64(SUBI64(x.i64, y.i64));
+    push(vm, z);
     dispatch();
 op_sumi:
     vm->ip++;
-    x = pop(vm);
     y = pop(vm);
+    x = pop(vm);
     for (i = 0; i < x.adt.len; i++)
-        as_vector_i64(&x)[i] += y.i64;
+        as_vector_i64(&x)[i] = ADDI64(as_vector_i64(&x)[i], y.i64);
     push(vm, x);
     dispatch();
 op_like:
     vm->ip++;
-    x = pop(vm);
     y = pop(vm);
-    push(vm, i64(string_match(as_string(&x), as_string(&y))));
+    x = pop(vm);
+    push(vm, i64(string_match(as_string(&y), as_string(&x))));
     dispatch();
 op_type:
     vm->ip++;
-    x = pop(vm);
-    push(vm, symbol(type_fmt(x.type)));
+    y = pop(vm);
+    push(vm, symbol(type_fmt(y.type)));
     dispatch();
 op_timer_start:
     vm->ip++;
@@ -124,11 +134,11 @@ op_timer_get:
     dispatch();
 op_til:
     vm->ip++;
-    x = pop(vm);
-    y = vector_i64(x.i64);
-    for (i = 0; i < x.i64; i++)
-        as_vector_i64(&y)[i] = i;
-    push(vm, y);
+    y = pop(vm);
+    x = vector_i64(y.i64);
+    for (i = 0; i < y.i64; i++)
+        as_vector_i64(&x)[i] = i;
+    push(vm, x);
     dispatch();
 }
 

@@ -70,6 +70,7 @@ static dispatch_record_t _DISPATCH_TABLE[DISPATCH_TABLE_SIZE][DISPATCH_RECORD_SI
     {
         {"+",    {-TYPE_I64,     -TYPE_I64}, -TYPE_I64,    OP_ADDI}, 
         {"+",    {-TYPE_F64,     -TYPE_F64}, -TYPE_F64,    OP_ADDF},
+        {"-",    {-TYPE_I64,     -TYPE_I64}, -TYPE_I64,    OP_SUBI},
         {"sum",  {TYPE_I64,      -TYPE_I64},  TYPE_I64,    OP_SUMI},
         {"like", {TYPE_STRING, TYPE_STRING}, -TYPE_I64,    OP_LIKE}
     },
@@ -146,12 +147,13 @@ i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
 
             push_opcode(code, OP_TIMER_START);
             cc_compile_code(&as_list(object)[1], code);
+            push_opcode(code, OP_POP);
             push_opcode(code, OP_TIMER_GET);
             return -TYPE_F64;
         }
 
-        // compile arguments from right to left
-        for (j = arity; j > 0; j--)
+        // compile arguments
+        for (j = 1; j <= arity; j++)
         {
             type = cc_compile_code(&as_list(object)[j], code);
 
@@ -169,7 +171,7 @@ i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
 
             if (rec->name != 0 && strcmp(symbols_get(car->i64), rec->name) == 0)
             {
-                for (j = arity; j > 0; j--)
+                for (j = 1; j <= arity; j++)
                 {
                     if (rec->args[j - 1] != TYPE_ANY && arg_types[j - 1] != rec->args[j - 1])
                         break;
