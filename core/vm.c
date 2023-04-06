@@ -65,8 +65,8 @@ rf_object_t vm_exec(vm_t *vm, str_t code)
     // The indices of labels in the dispatch_table are the relevant opcodes
     static null_t *dispatch_table[] = {
         &&op_halt, &&op_push, &&op_pop, &&op_addi, &&op_addf, &&op_subi, &&op_subf,
-        &&op_muli, &&op_mulf, &&op_divi, &&op_divf,
-        &&op_sumi, &&op_like, &&op_type, &&op_timer_set, &&op_timer_get, &&op_til};
+        &&op_muli, &&op_mulf, &&op_divi, &&op_divf, &&op_sumi, &&op_like, &&op_type,
+        &&op_timer_set, &&op_timer_get, &&op_til, &&op_call1};
 
 #define dispatch() goto *dispatch_table[(i32_t)code[vm->ip]]
 
@@ -172,6 +172,14 @@ op_til:
     for (i = 0; i < y.i64; i++)
         as_vector_i64(&x)[i] = i;
     stack_push(vm, x);
+    dispatch();
+op_call1:
+    vm->ip++;
+    y = *(rf_object_t *)(code + vm->ip);
+    vm->ip += sizeof(rf_object_t);
+    x = stack_pop(vm);
+    unary_t f = (unary_t)y.i64;
+    stack_push(vm, f(&x));
     dispatch();
 }
 

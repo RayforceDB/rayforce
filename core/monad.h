@@ -26,8 +26,6 @@
 
 #include "rayforce.h"
 
-// Monadic functions
-rf_object_t til(i64_t count);
+rf_object_t rf_flip(rf_object_t *x);
 
-rf_object_t rayforce_add(rf_object_t a, rf_object_t b);
 #endif

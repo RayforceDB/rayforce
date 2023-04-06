@@ -36,7 +36,7 @@
 #define MAX_I64_WIDTH 20
 #define MAX_ROW_WIDTH MAX_I64_WIDTH * 2
 #define FORMAT_TRAILER_SIZE 4
-#define F64_PRECISION 4
+#define F64_PRECISION 2
 #define TABLE_MAX_WIDTH 10  // Maximum number of columns
 #define TABLE_MAX_HEIGHT 10 // Maximum number of rows
 

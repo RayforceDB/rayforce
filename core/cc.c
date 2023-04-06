@@ -47,65 +47,20 @@ i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code);
         (c)->adt->len += sizeof(rf_object_t);               \
     }
 
-i8_t cc_compile_instriction(rf_object_t *object, rf_object_t *code)
+env_record_t *find_record(rf_object_t *records, rf_object_t *car, i8_t *arg_types, u32_t arity)
 {
-    u32_t arity, i = 0, j = 0, match = 0, found = 0, records_len = 0;
-    rf_object_t *car, err;
-    env_t env = runtime_get()->env;
+    u32_t i = 0, j = 0, match = 0, records_len;
     env_record_t *rec;
-    i8_t ret = TYPE_ERROR, arg_types[8], type;
 
-    arity = object->adt->len - 1;
-    if (arity > 4)
-    {
-        object_free(code);
-        err = error(ERR_LENGTH, "compile list: too many arguments");
-        err.id = object->id;
-        *code = err;
-        return TYPE_ERROR;
-    }
-
-    car = &as_list(object)[0];
-
-    // special cases
-    if (car->i64 == symbol("time").i64)
-    {
-        if (arity != 1)
-        {
-            object_free(code);
-            err = error(ERR_LENGTH, "compile list: time takes one argument");
-            err.id = object->id;
-            *code = err;
-            return TYPE_ERROR;
-        }
-
-        push_opcode(code, OP_TIMER_SET);
-        cc_compile_fn(&as_list(object)[1], code);
-        push_opcode(code, OP_TIMER_GET);
-        return -TYPE_F64;
-    }
-
-    // compile arguments
-    for (j = 1; j <= arity; j++)
-    {
-        type = cc_compile_fn(&as_list(object)[j], code);
-
-        if (type == TYPE_ERROR)
-            return TYPE_ERROR;
-
-        arg_types[j - 1] = type;
-    }
-
-    records_len = get_records_len(&env.records, arity);
+    records_len = get_records_len(records, arity);
 
     // try to find matching function prototype
     while (i < records_len)
     {
-        rec = get_record(&env.records, arity, i++);
+        rec = get_record(records, arity, i++);
 
         if (car->i64 == rec->id)
         {
-            found = 1;
             for (j = 1; j <= arity; j++)
             {
                 if (rec->args[j - 1] != TYPE_ANY && arg_types[j - 1] != rec->args[j - 1])
@@ -114,36 +69,48 @@ i8_t cc_compile_instriction(rf_object_t *object, rf_object_t *code)
                 match++;
             }
 
-            if (match != arity)
-            {
-                match = 0;
-                found = 0;
-                continue;
-            }
+            if (match == arity)
+                return rec;
 
-            ret = rec->ret;
-            push_opcode(code, rec->opcode);
-
-            break;
+            match = 0;
         }
     }
 
-    if (!found)
-    {
-        object_free(code);
-        err = error(ERR_LENGTH, "compile list: function proto or arity mismatch");
-        err.id = object->id;
-        *code = err;
-        return TYPE_ERROR;
-    }
+    return NULL;
+}
 
-    return ret;
+i8_t cc_compile_call(rf_object_t *car, i8_t *arg_types, i8_t arity, rf_object_t *code)
+{
+    env_record_t *rec;
+
+    rec = find_record(&runtime_get()->env.functions, car, arg_types, arity);
+
+    if (!rec)
+        return TYPE_ERROR;
+
+    push_opcode(code, OP_CALL1);
+    push_object(code, i64(rec->op));
+    return rec->ret;
+}
+
+i8_t cc_compile_instriction(rf_object_t *car, i8_t *arg_types, i8_t arity, rf_object_t *code)
+{
+    env_record_t *rec;
+
+    rec = find_record(&runtime_get()->env.instructions, car, arg_types, arity);
+
+    if (!rec)
+        return TYPE_ERROR;
+
+    push_opcode(code, rec->op);
+    return rec->ret;
 }
 
 i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code)
 {
-    rf_object_t err;
-    i8_t type;
+    rf_object_t *car, err;
+    i8_t type, arg_types[MAX_ARITY];
+    u32_t i, arity;
 
     switch (object->type)
     {
@@ -170,20 +137,69 @@ i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code)
             return TYPE_LIST;
         }
 
-        if (as_list(object)[0].type != -TYPE_SYMBOL)
+        car = &as_list(object)[0];
+        if (car->type != -TYPE_SYMBOL)
         {
             object_free(code);
             err = error(ERR_LENGTH, "compile list: expected symbol in a head");
-            err.id = as_list(object)[0].id;
+            err.id = car->id;
             *code = err;
             return TYPE_ERROR;
         }
 
-        type = cc_compile_instriction(object, code);
+        arity = object->adt->len - 1;
+        if (arity > 4)
+        {
+            object_free(code);
+            err = error(ERR_LENGTH, "compile list: too many arguments");
+            err.id = object->id;
+            *code = err;
+            return TYPE_ERROR;
+        }
 
-        if (type == TYPE_ERROR)
+        // compile special forms
+        if (car->i64 == symbol("time").i64)
+        {
+            if (arity != 1)
+            {
+                object_free(code);
+                err = error(ERR_LENGTH, "compile list: time takes one argument");
+                err.id = object->id;
+                *code = err;
+                return TYPE_ERROR;
+            }
+
+            push_opcode(code, OP_TIMER_SET);
+            cc_compile_fn(&as_list(object)[1], code);
+            push_opcode(code, OP_TIMER_GET);
+            return -TYPE_F64;
+        }
+
+        // compile arguments
+        for (i = 1; i <= arity; i++)
+        {
+            type = cc_compile_fn(&as_list(object)[i], code);
+
+            if (type == TYPE_ERROR)
+                return TYPE_ERROR;
+
+            arg_types[i - 1] = type;
+        }
+
+        type = cc_compile_instriction(car, arg_types, arity, code);
+
+        if (type != TYPE_ERROR)
             return type;
 
+        type = cc_compile_call(car, arg_types, arity, code);
+
+        if (type != TYPE_ERROR)
+            return type;
+
+        object_free(code);
+        err = error(ERR_LENGTH, "compile list: function proto or arity mismatch");
+        err.id = object->id;
+        *code = err;
         return type;
 
     default:

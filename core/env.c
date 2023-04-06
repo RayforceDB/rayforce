@@ -22,15 +22,16 @@
  */
 
 #include "env.h"
+#include "monad.h"
 
-#define REC(records, arity, name, ret, opcode, ...)                      \
-    {                                                                    \
-        env_record_t rec = {symbol(name).i64, ret, opcode, __VA_ARGS__}; \
-        push(&as_list(records)[arity], env_record_t, rec);               \
+#define REC(records, arity, name, ret, op, ...)                             \
+    {                                                                       \
+        env_record_t rec = {symbol(name).i64, ret, (i64_t)op, __VA_ARGS__}; \
+        push(&as_list(records)[arity], env_record_t, rec);                  \
     }
 
 // clang-format off
-null_t init_intrinsics(rf_object_t *records)
+null_t init_instructions(rf_object_t *records)
 {
     // Nilary
     REC(records, 0, "halt",   TYPE_LIST,    OP_HALT, {0                        });
@@ -53,17 +54,37 @@ null_t init_intrinsics(rf_object_t *records)
 }
 // clang-format on
 
+// clang-format off
+null_t init_functions(rf_object_t *variables)
+{
+    // Nilary
+    // Unary
+    REC(variables, 1, "flip", TYPE_LIST, rf_flip,       { TYPE_ANY              });
+    // Binary
+    // Ternary
+    // Quaternary
+}
+// clang-format on
+
 env_t create_env()
 {
-    rf_object_t records = list(MAX_ARITY + 1);
+    rf_object_t instructions = list(MAX_ARITY + 1);
+    rf_object_t functions = list(MAX_ARITY + 1);
+    rf_object_t variables = list(0);
 
     for (i32_t i = 0; i <= MAX_ARITY; i++)
-        as_list(&records)[i] = vector(TYPE_STRING, sizeof(env_record_t), 0);
+        as_list(&instructions)[i] = vector(TYPE_STRING, sizeof(env_record_t), 0);
 
-    init_intrinsics(&records);
+    for (i32_t i = 0; i <= MAX_ARITY; i++)
+        as_list(&functions)[i] = vector(TYPE_STRING, sizeof(env_record_t), 0);
+
+    init_instructions(&instructions);
+    init_functions(&functions);
 
     env_t env = {
-        .records = records,
+        .instructions = instructions,
+        .functions = functions,
+        .variables = variables,
     };
 
     return env;

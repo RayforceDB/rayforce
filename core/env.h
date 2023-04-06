@@ -31,6 +31,11 @@
 
 #define MAX_ARITY 4
 
+typedef rf_object_t (*unary_t)(rf_object_t *);
+typedef rf_object_t (*binary_t)(rf_object_t *, rf_object_t *);
+typedef rf_object_t (*ternary_t)(rf_object_t *, rf_object_t *, rf_object_t *);
+typedef rf_object_t (*quaternary_t)(rf_object_t *, rf_object_t *, rf_object_t *, rf_object_t *);
+
 /*
  *  Environment record entry
  */
@@ -38,8 +43,8 @@ typedef struct env_record_t
 {
     i64_t id;
     i8_t ret;
-    vm_opcode_t opcode;
-    i8_t args[8];
+    i64_t op; // opcode or function id
+    i8_t args[MAX_ARITY];
 } env_record_t;
 
 /*
@@ -47,7 +52,9 @@ typedef struct env_record_t
  */
 typedef struct env_t
 {
-    rf_object_t records; // list, containing records
+    rf_object_t instructions; // list, containing records of instructions
+    rf_object_t functions;    // list, containing records of functions
+    rf_object_t variables;    // list, containing records of variables
 } env_t;
 
 env_t create_env();

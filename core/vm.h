@@ -49,7 +49,12 @@ typedef enum vm_opcode_t
     OP_TIMER_SET, // Start timer
     OP_TIMER_GET, // Get timer value
     OP_TIL,       // Create i64 vector of length n
-    OP_INVALID,   // Invalid opcode
+    OP_CALL1,     // Call function with one argument
+    OP_CALL2,     // Call function with two arguments
+    OP_CALL3,     // Call function with three arguments
+    OP_CALL4,     // Call function with four arguments
+
+    OP_INVALID, // Invalid opcode
 } vm_opcode_t;
 
 typedef struct vm_t
