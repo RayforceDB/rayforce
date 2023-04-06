@@ -33,7 +33,7 @@
 null_t init_intrinsics(rf_object_t *records)
 {
     // Nilary
-    REC(records, 0, "halt",   TYPE_LIST,    OP_HALT, {0});
+    REC(records, 0, "halt",   TYPE_LIST,    OP_HALT, {0                        });
     // Unary
     REC(records, 1, "type",  -TYPE_SYMBOL,  OP_TYPE, { TYPE_ANY                });
     REC(records, 1, "til" ,   TYPE_I64,     OP_TIL,  {-TYPE_I64                });
@@ -41,6 +41,11 @@ null_t init_intrinsics(rf_object_t *records)
     REC(records, 2, "+",     -TYPE_I64,     OP_ADDI, {-TYPE_I64,   -TYPE_I64   });
     REC(records, 2, "+",     -TYPE_F64,     OP_ADDF, {-TYPE_F64,   -TYPE_F64   });
     REC(records, 2, "-",     -TYPE_I64,     OP_SUBI, {-TYPE_I64,   -TYPE_I64   });
+    REC(records, 2, "-",     -TYPE_F64,     OP_SUBF, {-TYPE_F64,   -TYPE_F64   });
+    REC(records, 2, "*",     -TYPE_I64,     OP_MULI, {-TYPE_I64,   -TYPE_I64   });
+    REC(records, 2, "*",     -TYPE_F64,     OP_MULF, {-TYPE_F64,   -TYPE_F64   });
+    REC(records, 2, "/",     -TYPE_F64,     OP_DIVI, {-TYPE_I64,   -TYPE_I64   });
+    REC(records, 2, "/",     -TYPE_F64,     OP_DIVF, {-TYPE_F64,   -TYPE_F64   });
     REC(records, 2, "sum",    TYPE_I64,     OP_SUMI, { TYPE_I64,   -TYPE_I64   });
     REC(records, 2, "like",  -TYPE_I64,     OP_LIKE, { TYPE_STRING, TYPE_STRING});
     // Ternary

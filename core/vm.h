@@ -32,20 +32,24 @@
 
 typedef enum vm_opcode_t
 {
-    OP_HALT = 0, // Halt the VM
-    OP_PUSH,     // Push an object to the stack
-    OP_POP,      // Pop an object from the stack
-    OP_ADDI,     // Add two i64 from the stack
-    OP_ADDF,     // Add two f64 from the stack
-    OP_SUBI,     // Subtract two i64 from the stack
-    // OP_MUL,      // Multiply two objects from the stack
-    OP_SUMI,        // Sum i64 vector elements with scalar i64
-    OP_LIKE,        // Compare string with regex
-    OP_TYPE,        // Get type of object
-    OP_TIMER_START, // Start timer
-    OP_TIMER_GET,   // Get timer value
-    OP_TIL,         // Create i64 vector of length n
-    OP_INVALID,     // Invalid opcode
+    OP_HALT = 0,  // Halt the VM
+    OP_PUSH,      // Push an object to the stack
+    OP_POP,       // Pop an object from the stack
+    OP_ADDI,      // Add two i64 from the stack
+    OP_ADDF,      // Add two f64 from the stack
+    OP_SUBI,      // Subtract two i64 from the stack
+    OP_SUBF,      // Subtract two f64 from the stack
+    OP_MULI,      // Multiply two i64 from the stack
+    OP_MULF,      // Multiply two f64 from the stack
+    OP_DIVI,      // Divide two i64 from the stack
+    OP_DIVF,      // Divide two f64 from the stack
+    OP_SUMI,      // Sum i64 vector elements with scalar i64
+    OP_LIKE,      // Compare string with regex
+    OP_TYPE,      // Get type of object
+    OP_TIMER_SET, // Start timer
+    OP_TIMER_GET, // Get timer value
+    OP_TIL,       // Create i64 vector of length n
+    OP_INVALID,   // Invalid opcode
 } vm_opcode_t;
 
 typedef struct vm_t

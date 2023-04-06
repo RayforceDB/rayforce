@@ -64,8 +64,9 @@ rf_object_t vm_exec(vm_t *vm, str_t code)
 
     // The indices of labels in the dispatch_table are the relevant opcodes
     static null_t *dispatch_table[] = {
-        &&op_halt, &&op_push, &&op_pop, &&op_addi, &&op_addf, &&op_subi, &&op_sumi, &&op_like,
-        &&op_type, &&op_timer_start, &&op_timer_get, &&op_til};
+        &&op_halt, &&op_push, &&op_pop, &&op_addi, &&op_addf, &&op_subi, &&op_subf,
+        &&op_muli, &&op_mulf, &&op_divi, &&op_divf,
+        &&op_sumi, &&op_like, &&op_type, &&op_timer_set, &&op_timer_get, &&op_til};
 
 #define dispatch() goto *dispatch_table[(i32_t)code[vm->ip]]
 
@@ -106,6 +107,37 @@ op_subi:
     z = i64(SUBI64(x.i64, y.i64));
     stack_push(vm, z);
     dispatch();
+op_subf:
+    vm->ip++;
+    y = stack_pop(vm);
+    stack_peek(vm)->f64 -= y.f64;
+    dispatch();
+op_muli:
+    vm->ip++;
+    y = stack_pop(vm);
+    x = stack_pop(vm);
+    z = i64(MULI64(x.i64, y.i64));
+    stack_push(vm, z);
+    dispatch();
+op_mulf:
+    vm->ip++;
+    y = stack_pop(vm);
+    stack_peek(vm)->f64 *= y.f64;
+    dispatch();
+op_divi:
+    vm->ip++;
+    y = stack_pop(vm);
+    x = stack_pop(vm);
+    z = f64(DIVI64(x.i64, y.i64));
+    stack_push(vm, z);
+    dispatch();
+op_divf:
+    vm->ip++;
+    y = stack_pop(vm);
+    x = stack_pop(vm);
+    z = f64(DIVF64(x.f64, y.f64));
+    stack_push(vm, z);
+    dispatch();
 op_sumi:
     vm->ip++;
     y = stack_pop(vm);
@@ -125,7 +157,7 @@ op_type:
     y = stack_pop(vm);
     stack_push(vm, symbol(type_fmt(y.type)));
     dispatch();
-op_timer_start:
+op_timer_set:
     vm->ip++;
     vm->timer = clock();
     dispatch();

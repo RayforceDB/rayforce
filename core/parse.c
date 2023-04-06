@@ -378,7 +378,7 @@ rf_object_t parse_list(parser_t *parser)
 
     span_extend(parser, &span);
     lst.id = span_commit(span);
-    printf("END: %lld", parser->column);
+
     return lst;
 }
 

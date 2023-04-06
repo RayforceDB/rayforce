@@ -32,6 +32,8 @@
 #include "env.h"
 #include "runtime.h"
 
+i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code);
+
 #define push_opcode(c, x)                        \
     {                                            \
         vector_reserve(c, 1);                    \
@@ -45,13 +47,103 @@
         (c)->adt->len += sizeof(rf_object_t);               \
     }
 
-i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
+i8_t cc_compile_instriction(rf_object_t *object, rf_object_t *code)
 {
     u32_t arity, i = 0, j = 0, match = 0, found = 0, records_len = 0;
     rf_object_t *car, err;
     env_t env = runtime_get()->env;
     env_record_t *rec;
     i8_t ret = TYPE_ERROR, arg_types[8], type;
+
+    arity = object->adt->len - 1;
+    if (arity > 4)
+    {
+        object_free(code);
+        err = error(ERR_LENGTH, "compile list: too many arguments");
+        err.id = object->id;
+        *code = err;
+        return TYPE_ERROR;
+    }
+
+    car = &as_list(object)[0];
+
+    // special cases
+    if (car->i64 == symbol("time").i64)
+    {
+        if (arity != 1)
+        {
+            object_free(code);
+            err = error(ERR_LENGTH, "compile list: time takes one argument");
+            err.id = object->id;
+            *code = err;
+            return TYPE_ERROR;
+        }
+
+        push_opcode(code, OP_TIMER_SET);
+        cc_compile_fn(&as_list(object)[1], code);
+        push_opcode(code, OP_TIMER_GET);
+        return -TYPE_F64;
+    }
+
+    // compile arguments
+    for (j = 1; j <= arity; j++)
+    {
+        type = cc_compile_fn(&as_list(object)[j], code);
+
+        if (type == TYPE_ERROR)
+            return TYPE_ERROR;
+
+        arg_types[j - 1] = type;
+    }
+
+    records_len = get_records_len(&env.records, arity);
+
+    // try to find matching function prototype
+    while (i < records_len)
+    {
+        rec = get_record(&env.records, arity, i++);
+
+        if (car->i64 == rec->id)
+        {
+            found = 1;
+            for (j = 1; j <= arity; j++)
+            {
+                if (rec->args[j - 1] != TYPE_ANY && arg_types[j - 1] != rec->args[j - 1])
+                    break;
+
+                match++;
+            }
+
+            if (match != arity)
+            {
+                match = 0;
+                found = 0;
+                continue;
+            }
+
+            ret = rec->ret;
+            push_opcode(code, rec->opcode);
+
+            break;
+        }
+    }
+
+    if (!found)
+    {
+        object_free(code);
+        err = error(ERR_LENGTH, "compile list: function proto or arity mismatch");
+        err.id = object->id;
+        *code = err;
+        return TYPE_ERROR;
+    }
+
+    return ret;
+}
+
+i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code)
+{
+    rf_object_t err;
+    i8_t type;
 
     switch (object->type)
     {
@@ -78,98 +170,21 @@ i8_t cc_compile_code(rf_object_t *object, rf_object_t *code)
             return TYPE_LIST;
         }
 
-        car = &as_list(object)[0];
-        if (car->type != -TYPE_SYMBOL)
+        if (as_list(object)[0].type != -TYPE_SYMBOL)
         {
             object_free(code);
             err = error(ERR_LENGTH, "compile list: expected symbol in a head");
-            err.id = car->id;
+            err.id = as_list(object)[0].id;
             *code = err;
             return TYPE_ERROR;
         }
 
-        arity = object->adt->len - 1;
-        if (arity > 4)
-        {
-            object_free(code);
-            err = error(ERR_LENGTH, "compile list: too many arguments");
-            err.id = object->id;
-            *code = err;
-            return TYPE_ERROR;
-        }
+        type = cc_compile_instriction(object, code);
 
-        // special cases
-        if (car->i64 == symbol("time").i64)
-        {
-            if (arity != 1)
-            {
-                object_free(code);
-                err = error(ERR_LENGTH, "compile list: time takes one argument");
-                err.id = object->id;
-                *code = err;
-                return TYPE_ERROR;
-            }
+        if (type == TYPE_ERROR)
+            return type;
 
-            push_opcode(code, OP_TIMER_START);
-            cc_compile_code(&as_list(object)[1], code);
-            push_opcode(code, OP_POP);
-            push_opcode(code, OP_TIMER_GET);
-            return -TYPE_F64;
-        }
-
-        // compile arguments
-        for (j = 1; j <= arity; j++)
-        {
-            type = cc_compile_code(&as_list(object)[j], code);
-
-            if (type == TYPE_ERROR)
-                return TYPE_ERROR;
-
-            arg_types[j - 1] = type;
-        }
-
-        records_len = get_records_len(&env.records, arity);
-
-        // try to find matching function prototype
-        while (i < records_len)
-        {
-            rec = get_record(&env.records, arity, i++);
-
-            if (car->i64 == rec->id)
-            {
-                found = 1;
-                for (j = 1; j <= arity; j++)
-                {
-                    if (rec->args[j - 1] != TYPE_ANY && arg_types[j - 1] != rec->args[j - 1])
-                        break;
-
-                    match++;
-                }
-
-                if (match != arity)
-                {
-                    match = 0;
-                    found = 0;
-                    continue;
-                }
-
-                ret = rec->ret;
-                push_opcode(code, rec->opcode);
-
-                break;
-            }
-        }
-
-        if (!found)
-        {
-            object_free(code);
-            err = error(ERR_LENGTH, "compile list: function proto or arity mismatch");
-            err.id = object->id;
-            *code = err;
-            return TYPE_ERROR;
-        }
-
-        return ret;
+        return type;
 
     default:
         push_opcode(code, OP_PUSH);
@@ -189,7 +204,7 @@ rf_object_t cc_compile(rf_object_t *list)
     rf_object_t code = string(0);
 
     for (u32_t i = 0; i < list->adt->len; i++)
-        cc_compile_code(&as_list(list)[i], &code);
+        cc_compile_fn(&as_list(list)[i], &code);
 
     if (list->adt->len == 0)
     {
