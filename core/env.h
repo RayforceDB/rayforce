@@ -32,10 +32,10 @@
 #define MAX_ARITY 4
 
 typedef rf_object_t (*nilary_t)();
-typedef rf_object_t (*unary_t)(rf_object_t *__restrict);
-typedef rf_object_t (*binary_t)(rf_object_t *__restrict, rf_object_t *__restrict);
-typedef rf_object_t (*ternary_t)(rf_object_t *__restrict, rf_object_t *__restrict, rf_object_t *__restrict);
-typedef rf_object_t (*quaternary_t)(rf_object_t *__restrict, rf_object_t *__restrict, rf_object_t *__restrict, rf_object_t *__restrict);
+typedef rf_object_t (*unary_t)(rf_object_t *);
+typedef rf_object_t (*binary_t)(rf_object_t *, rf_object_t *);
+typedef rf_object_t (*ternary_t)(rf_object_t *, rf_object_t *, rf_object_t *);
+typedef rf_object_t (*quaternary_t)(rf_object_t *, rf_object_t *, rf_object_t *, rf_object_t *);
 
 /*
  *  Environment record entry

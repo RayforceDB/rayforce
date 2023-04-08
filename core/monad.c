@@ -37,18 +37,13 @@ rf_object_t rf_flip(rf_object_t *x)
     }
 }
 
-rf_object_t rf_add(rf_object_t *__restrict x, rf_object_t *__restrict y)
+rf_object_t rf_add(rf_object_t *x, rf_object_t *y)
 {
     i64_t *v = as_vector_i64(x);
+    i32_t l = x->adt->len, i;
 
-    for (i32_t i = 0; i < x->adt->len; i++)
-    {
-        v[i] = v[i] + y->i64;
-    }
+    for (i = 0; i < l; i++)
+        v[i] = ADDI64(v[i], y->i64);
 
-    // for (i32_t i = 0; i < x->adt->len; i++)
-
-    // ADDI64(as_vector_i64(x)[i], y->i64);
-
-    return *x;
+    return rf_object_clone(x);
 }
