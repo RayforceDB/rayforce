@@ -5,12 +5,14 @@ RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=c17 -Ofast -march=native -fassociative
 # RELEASE_CFLAGS = -fPIC -Wall -Wextra -Wpedantic -std=c17 -Ofast -march=native -g -pg
 DEBUG_CFLAGS =  -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG
 CORE_HEADERS = core/ops.h core/util.h core/vector.h core/string.h core/mmap.h core/hash.h\
- core/symbols.h core/format.h core/rayforce.h core/monad.h core/alloc.h core/runtime.h\
- core/dict.h core/parse.h core/vm.h core/debuginfo.h core/cc.h core/env.h
+ core/symbols.h core/format.h core/rayforce.h core/alloc.h core/runtime.h core/dict.h\
+ core/parse.h core/vm.h core/debuginfo.h core/cc.h core/env.h\
+ core/unary.h core/binary.h core/nary.h
 APP_HEADERS = app/parse.h
 CORE_OBJECTS = core/ops.c core/vector.o core/string.o core/hash.o core/symbols.o\
- core/alloc.o core/format.o core/monad.o core/rayforce.o core/parse.o\
- core/runtime.o core/dict.o core/vm.o core/debuginfo.o core/cc.o core/env.o
+ core/alloc.o core/format.o core/rayforce.o core/parse.o core/runtime.o core/dict.o\
+ core/vm.o core/debuginfo.o core/cc.o core/env.o\
+ core/unary.o core/binary.o core/nary.o
 APP_OBJECTS = app/main.o
 TESTS_OBJECTS = app/tests.o
 TARGET = rayforce

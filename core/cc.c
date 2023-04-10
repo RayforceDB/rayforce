@@ -351,6 +351,27 @@ str_t cc_code_fmt(rf_object_t *code)
         case OP_SUMI:
             p += str_fmt_into(0, p, &s, "%.4d: sumi\n", c++);
             break;
+        case OP_CALL1:
+            p += str_fmt_into(0, p, &s, "%.4d: call1 %p\n", c++, ((rf_object_t *)(ip + 1))->i64);
+            ip += sizeof(rf_object_t);
+            break;
+        case OP_CALL2:
+            p += str_fmt_into(0, p, &s, "%.4d: call2 %p\n", c++, ((rf_object_t *)(ip + 1))->i64);
+            ip += sizeof(rf_object_t);
+            break;
+        case OP_CALL3:
+            p += str_fmt_into(0, p, &s, "%.4d: call3 %p\n", c++, ((rf_object_t *)(ip + 1))->i64);
+            ip += sizeof(rf_object_t);
+            break;
+        case OP_CALL4:
+            p += str_fmt_into(0, p, &s, "%.4d: call4 %p\n", c++, ((rf_object_t *)(ip + 1))->i64);
+            ip += sizeof(rf_object_t);
+            break;
+        case OP_CALLN:
+            ip++;
+            p += str_fmt_into(0, p, &s, "%.4d: calln %p\n", c++, ((rf_object_t *)(ip + 1))->i64);
+            ip += sizeof(rf_object_t);
+            break;
         default:
             p += str_fmt_into(0, p, &s, "%.4d: unknown %d\n", c++, *ip);
             break;

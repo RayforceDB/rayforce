@@ -23,8 +23,10 @@
 
 #include <stdarg.h>
 #include "env.h"
-#include "monad.h"
 #include "dict.h"
+#include "unary.h"
+#include "binary.h"
+#include "nary.h"
 
 #define REC_SIZE (MAX_ARITY + 2)
 
@@ -58,10 +60,11 @@ null_t init_functions(rf_object_t *records)
     REC(records, 2, "/",     -TYPE_F64,     OP_DIVF,   {-TYPE_F64,   -TYPE_F64   });
     REC(records, 2, "sum",    TYPE_I64,     OP_SUMI,   { TYPE_I64,   -TYPE_I64   });
     REC(records, 2, "like",  -TYPE_I64,     OP_LIKE,   { TYPE_STRING, TYPE_STRING});
+    REC(records, 2, "dict",   TYPE_DICT,    rf_dict,   { TYPE_ANY,    TYPE_ANY   });
     // Ternary
     // Quaternary
     // Nary
-    REC(records, 5, "enlist", TYPE_LIST,    rf_enlist, {0                      });
+    REC(records, 5, "list",   TYPE_LIST,    rf_list,   { 0                       });
 }
 // clang-format on
 

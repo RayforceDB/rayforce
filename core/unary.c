@@ -21,12 +21,21 @@
  *   SOFTWARE.
  */
 
-#ifndef MONAD_H
-#define MONAD_H
-
 #include "rayforce.h"
+#include "alloc.h"
+#include "vm.h"
+#include "ops.h"
+#include "util.h"
+#include "format.h"
 
-rf_object_t rf_flip(rf_object_t *x);
-rf_object_t rf_enlist(rf_object_t *x, u32_t n);
-
-#endif
+rf_object_t rf_flip(rf_object_t *x)
+{
+    switch (x->type)
+    {
+    case TYPE_DICT:
+        x->type = TYPE_TABLE;
+        return rf_object_clone(x);
+    default:
+        return error(ERR_NOT_IMPLEMENTED, "flip: not implemented");
+    }
+}

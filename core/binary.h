@@ -21,32 +21,11 @@
  *   SOFTWARE.
  */
 
+#ifndef BINARY_H
+#define BINARY_H
+
 #include "rayforce.h"
-#include "alloc.h"
-#include "vm.h"
-#include "ops.h"
-#include "util.h"
-#include "format.h"
 
-rf_object_t rf_flip(rf_object_t *x)
-{
-    switch (x->type)
-    {
-    default:
-        return error(ERR_NOT_IMPLEMENTED, "flip: not implemented");
-    }
-}
+rf_object_t rf_dict(rf_object_t *x, rf_object_t *y);
 
-rf_object_t rf_enlist(rf_object_t *x, u32_t n)
-{
-    rf_object_t l = list(n);
-    u32_t i;
-
-    for (i = 0; i < n; i++)
-    {
-        rf_object_t *item = x + i;
-        as_list(&l)[i] = rf_object_clone(item);
-    }
-
-    return l;
-}
+#endif
