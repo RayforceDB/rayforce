@@ -343,8 +343,8 @@ str_t table_fmt(i32_t indent, i32_t limit, rf_object_t *rf_object)
     {
         width = as_vector_i64(&column_widths)[i];
         s = symbols_get(header[i]);
-        width = width - strlen(s) + 2;
-        offset += str_fmt_into(0, offset, &str, "%s%*.*s|", s, width, width, PADDING);
+        width = width - strlen(s);
+        offset += str_fmt_into(0, offset, &str, " %s%*.*s |", s, width, width, PADDING);
     }
 
     // Print table header separator

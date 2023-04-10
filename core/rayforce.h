@@ -45,8 +45,8 @@
 #define TYPE_SYMBOL 4
 #define TYPE_STRING 5
 #define TYPE_LIST 97
-#define TYPE_TABLE 98
-#define TYPE_DICT 99
+#define TYPE_DICT 98
+#define TYPE_TABLE 99
 #define TYPE_ERROR 127
 
 // Result constants

@@ -33,7 +33,7 @@
  * If the cast is not possible, returns an error object.
  * If object is already of the specified type, returns the object itself (cloned).
  */
-static inline rf_object_t rf_cast(i8_t type, rf_object_t *y)
+static inline __attribute__((always_inline)) rf_object_t rf_cast(i8_t type, rf_object_t *y)
 {
 
 #define m(a, b) ((i16_t)((u8_t)a << 8 | (u8_t)b))
@@ -73,6 +73,10 @@ static inline rf_object_t rf_cast(i8_t type, rf_object_t *y)
         break;
     case m(-TYPE_F64, TYPE_STRING):
         x = f64(strtod(as_string(y), NULL));
+        break;
+    case m(TYPE_TABLE, TYPE_DICT):
+        x = rf_object_clone(y);
+        x.type = type;
         break;
     default:
         err = error(ERR_TYPE, str_fmt(0, "'cast': there is no conversion from '%s' to '%s'",

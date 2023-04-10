@@ -78,6 +78,7 @@ null_t init_typenames(i64_t *typenames)
     typenames[TYPE_STRING  + TYPE_OFFSET] = symbol("String").i64;
     typenames[TYPE_LIST    + TYPE_OFFSET] = symbol("List")  .i64;
     typenames[TYPE_DICT    + TYPE_OFFSET] = symbol("Dict")  .i64;
+    typenames[TYPE_TABLE   + TYPE_OFFSET] = symbol("Table")  .i64;
 }
 // clang-format on
 
