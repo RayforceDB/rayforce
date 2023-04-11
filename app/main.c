@@ -242,6 +242,8 @@ null_t load_file(str_t filename)
 
 i32_t main(i32_t argc, str_t argv[])
 {
+    runtime_init();
+
     rf_object_t args = parse_cmdline(argc, argv), parsed, executed, compiled;
     i8_t run = 1;
     str_t line = (str_t)rf_malloc(LINE_SIZE), ptr; //, filename = NULL;
@@ -249,7 +251,6 @@ i32_t main(i32_t argc, str_t argv[])
 
     memset(line, 0, LINE_SIZE);
 
-    runtime_init();
     print_logo();
 
     vm = vm_create();
@@ -266,6 +267,7 @@ i32_t main(i32_t argc, str_t argv[])
 
         parsed = parse("REPL", line);
         printf("%s\n", rf_object_fmt(&parsed));
+        continue;
 
         if (is_error(&parsed))
         {

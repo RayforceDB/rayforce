@@ -519,6 +519,7 @@ rf_object_t advance(parser_t *parser)
 
 rf_object_t parse_program(parser_t *parser)
 {
+    return advance(parser);
     rf_object_t token, list = list(0), err;
 
     while (!at_eof(*parser->current))

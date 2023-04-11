@@ -39,29 +39,57 @@
 #define F64_PRECISION 2
 #define TABLE_MAX_WIDTH 10  // Maximum number of columns
 #define TABLE_MAX_HEIGHT 10 // Maximum number of rows
+#define chk(n)  \
+    if (n != 0) \
+    return n
 
 const str_t PADDING = "                                                                                                   ";
 const str_t TABLE_SEPARATOR = " | ";
 const str_t TABLE_HEADER_SEPARATOR = "------------------------------------------------------------------------------------";
 
-extern str_t rf_object_fmt_ind(i32_t indent, i32_t limit, rf_object_t *rf_object);
+extern i32_t rf_object_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object);
 
-extern i32_t str_fmt_into(i32_t limit, i32_t offset, str_t *dst, str_t fmt, ...)
+/*
+ * return values:
+ * 0 - fits into buffer
+ * >0 - truncated
+ * <0 - error
+ */
+extern i32_t str_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, str_t fmt, ...)
 {
     i32_t n = 0, size = limit > 0 ? limit : MAX_ROW_WIDTH;
     str_t p;
 
-    n = strlen(*dst);
+    size -= FORMAT_TRAILER_SIZE;
 
-    if (n < (size + offset))
+    // first call - we need to allocate new string
+    if (*len == 0)
     {
-        size = size + offset + n;
-        *dst = rf_realloc(*dst, size);
+        *dst = rf_malloc(size);
+        *len = size;
+    }
+    else if (*len <= (size + *offset))
+    {
+        if (limit)
+            size = *len - *offset - FORMAT_TRAILER_SIZE;
+        else
+        {
+            *len = size + *offset;
+            *dst = rf_realloc(*dst, *len);
+        }
+    }
+
+    if (size <= FORMAT_TRAILER_SIZE)
+    {
+        p = *dst + *offset;
+        snprintf(p, FORMAT_TRAILER_SIZE, "..");
+        *offset += FORMAT_TRAILER_SIZE;
+        return 1;
     }
 
     while (1)
     {
-        p = *dst + offset;
+        p = *dst + *offset;
 
         va_list args;
         va_start(args, fmt);
@@ -71,171 +99,121 @@ extern i32_t str_fmt_into(i32_t limit, i32_t offset, str_t *dst, str_t fmt, ...)
         if (n < 0)
             return n;
 
-        if (limit != 0 || n < size)
+        if (n < size)
             break;
 
-        size = size * 2;
-        *dst = rf_realloc(*dst, size);
+        if (limit)
+        {
+            p += size - 1;
+            snprintf(p, FORMAT_TRAILER_SIZE, "..");
+            *offset += size + FORMAT_TRAILER_SIZE;
+            return 1;
+        }
+
+        size = n + 1;
+        *len += size;
+        *dst = rf_realloc(*dst, *len);
     }
 
-    return n;
+    *offset += n;
+    return 0;
 }
 
 extern str_t str_fmt(i32_t limit, str_t fmt, ...)
 {
-    i32_t n, size = limit > 0 ? limit : MAX_ROW_WIDTH;
-    str_t p = (str_t)rf_malloc(size);
-
-    while (1)
-    {
-        va_list args;
-        va_start(args, fmt);
-        n = vsnprintf(p, size, fmt, args);
-        va_end(args);
-
-        if (n < 0)
-        {
-            rf_free(p);
-            return "";
-        }
-
-        if (limit != 0 || n < size)
-            break;
-
-        size *= 2;
-        p = rf_realloc(p, size);
-    }
-
-    return p;
+    str_t s = NULL;
+    i32_t len = 0, offset = 0;
+    str_fmt_into(&s, &len, &offset, limit, fmt);
+    return s;
 }
 
-str_t i64_fmt(i32_t limit, i64_t val)
+i32_t i64_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, i64_t val)
 {
     if (val == NULL_I64)
-        return "0i";
+        return str_fmt_into(dst, len, offset, limit, "%*.*s%lld", indent, indent, PADDING, "0i");
     else
-        return str_fmt(limit, "%lld", val);
+        return str_fmt_into(dst, len, offset, limit, "%*.*s%lld", indent, indent, PADDING, val);
 }
 
-str_t f64_fmt(i32_t limit, f64_t val)
+i32_t f64_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, f64_t val)
 {
     if (rf_is_nan(val))
-        return "0f";
+        return str_fmt_into(dst, len, offset, limit, "%*.*s%.*f", indent, indent, PADDING, F64_PRECISION, "0f");
     else
-        return str_fmt(limit, "%.*f", F64_PRECISION, val);
+        return str_fmt_into(dst, len, offset, limit, "%*.*s%.*f", indent, indent, PADDING, F64_PRECISION, val);
 }
 
-str_t vector_fmt(i32_t limit, rf_object_t *rf_object)
-
+i32_t symbol_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, i64_t val)
 {
-    if (!limit)
-        return "";
+    return str_fmt_into(dst, len, offset, limit, "%*.*s%s", indent, indent, PADDING, symbols_get(val));
+}
 
+i32_t vector_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object)
+{
     if (rf_object->adt->len == 0)
-        return str_fmt(3, "[]");
+        return str_fmt_into(dst, len, offset, limit, "%*.*s[]", indent, indent, PADDING);
 
-    str_t str, buf;
-    i64_t len = 0, remains = limit, i;
-    i8_t v_type = rf_object->type;
-
-    str = buf = (str_t)rf_malloc(limit + FORMAT_TRAILER_SIZE);
-    len = snprintf(buf, remains, "[");
-
-    buf += len;
-    remains -= len;
+    i32_t i, n = str_fmt_into(dst, len, offset, limit, "%*.*s[", indent, indent, PADDING);
 
     for (i = 0; i < rf_object->adt->len; i++)
     {
-        if (v_type == TYPE_I64)
-        {
-            if (as_vector_i64(rf_object)[i] == NULL_I64)
-                len = snprintf(buf, remains, "0i ");
-            else
-                len = snprintf(buf, remains, "%lld ", as_vector_i64(rf_object)[i]);
-        }
-        else if (v_type == TYPE_F64)
-        {
-            if (as_vector_f64(rf_object)[i] != as_vector_f64(rf_object)[i])
-                len = snprintf(buf, remains, "0f ");
-            else
-                len = snprintf(buf, remains, "%.*f ", F64_PRECISION, as_vector_f64(rf_object)[i]);
-        }
-        else if (v_type == TYPE_SYMBOL)
-            len = snprintf(buf, remains, "%s ", symbols_get(as_vector_symbol(rf_object)[i]));
+        if (rf_object->type == TYPE_I64)
+            n = i64_fmt_into(dst, len, offset, 0, limit, as_vector_i64(rf_object)[i]);
+        else if (rf_object->type == TYPE_F64)
+            n = f64_fmt_into(dst, len, offset, 0, limit, as_vector_f64(rf_object)[i]);
+        else if (rf_object->type == TYPE_SYMBOL)
+            n = symbol_fmt_into(dst, len, offset, 0, limit, as_vector_i64(rf_object)[i]);
 
-        if (len < 0)
-        {
-            rf_free(str);
-            return "";
-        }
+        chk(n);
 
-        if (len >= remains)
-        {
-            remains = 0;
-            break;
-        }
-        else
-        {
-            remains -= len;
-            buf += len;
-        }
+        if (i < rf_object->adt->len - 1)
+            n = str_fmt_into(dst, len, offset, limit, " ");
+
+        chk(n);
     }
 
-    if (remains == 0)
-        strncpy(buf, "..]", 4);
-    else
-        strncpy(buf - 1, "]", 2);
+    str_fmt_into(dst, len, offset, 0, "]");
 
-    return str;
+    return n;
 }
 
-str_t list_fmt(i32_t indent, i32_t limit, rf_object_t *rf_object)
+i32_t list_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object)
 {
-    if (!limit)
-        return "";
-
     if (rf_object->adt == NULL)
-        return str_fmt(limit, "null");
+        return str_fmt_into(dst, len, offset, limit, "%*.*s()", indent, indent, PADDING);
 
-    str_t s, str = str_fmt(limit, "(");
-    i32_t offset = 1, i;
+    i32_t i, n = str_fmt_into(dst, len, offset, limit, "%*.*s(\n", indent, indent, PADDING);
+
+    chk(n);
 
     indent += 2;
 
     for (i = 0; i < rf_object->adt->len; i++)
     {
-        s = rf_object_fmt_ind(indent, limit - indent, ((rf_object_t *)as_string(rf_object)) + i);
-        if (s == NULL)
-            return NULL;
-        offset += str_fmt_into(0, offset, &str, "\n%*.*s%s", indent, indent, PADDING, s);
-        rf_free(s);
+        n = rf_object_fmt_into(dst, len, offset, indent, limit, &as_list(rf_object)[i]);
+        chk(n);
+        n = str_fmt_into(dst, len, offset, MAX_ROW_WIDTH, "\n");
+        chk(n);
     }
 
-    // str_fmt_into(0, offset, &str, "\n%*.*s)", indent - 2, indent - 2, PADDING);
-    return str;
+    indent -= 2;
+    return str_fmt_into(dst, len, offset, limit, "%*.*s)", indent, indent, PADDING);
 }
 
-str_t string_fmt(i32_t indent, i32_t limit, rf_object_t *rf_object)
+i32_t string_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object)
 {
-    UNUSED(indent);
-
-    if (!limit)
-        return "";
-
     if (rf_object->adt == NULL)
-        return str_fmt(0, "\"\"");
+        return str_fmt_into(dst, len, offset, limit, "\"\"");
 
-    return str_fmt(rf_object->adt->len + 3, "\"%s\"", as_string(rf_object));
+    return str_fmt_into(dst, len, offset, limit, "%*.*s\"%s\"", indent, indent, PADDING, as_string(rf_object));
 }
 
-str_t dict_fmt(i32_t indent, i32_t limit, rf_object_t *rf_object)
+i32_t dict_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object)
 {
-    if (!limit)
-        return "";
-
     rf_object_t *keys = &as_list(rf_object)[0], *vals = &as_list(rf_object)[1];
-    str_t k, v, str = str_fmt(limit, "{");
-    i32_t offset = 1, i;
+    i32_t i, n = str_fmt_into(dst, len, offset, limit, "%*.*s{\n", indent, indent, PADDING);
+
+    chk(n);
 
     indent += 2;
 
@@ -245,186 +223,193 @@ str_t dict_fmt(i32_t indent, i32_t limit, rf_object_t *rf_object)
         switch (keys->type)
         {
         case TYPE_I64:
-            k = i64_fmt(limit, as_vector_i64(keys)[i]);
+            n = i64_fmt_into(dst, len, offset, indent, limit, as_vector_i64(keys)[i]);
             break;
         case TYPE_F64:
-            k = str_fmt(limit, "%.*f", F64_PRECISION, as_vector_f64(keys)[i]);
+            n = f64_fmt_into(dst, len, offset, indent, limit, as_vector_f64(keys)[i]);
             break;
         case TYPE_SYMBOL:
-            k = str_fmt(limit, "%s", symbols_get(as_vector_symbol(keys)[i]));
+            n = symbol_fmt_into(dst, len, offset, indent, limit, as_vector_symbol(keys)[i]);
             break;
         default:
-            k = rf_object_fmt_indent(indent, limit - indent, &as_list(keys)[i]);
+            n = rf_object_fmt_into(dst, len, offset, indent, limit, &as_list(keys)[i]);
             break;
         }
+
+        chk(n);
+
+        n = str_fmt_into(dst, len, offset, MAX_ROW_WIDTH, ": ");
+
+        chk(n);
+
         // Dispatch rf_objects type
         switch (vals->type)
         {
         case TYPE_I64:
-            v = i64_fmt(limit, as_vector_i64(vals)[i]);
+            n = i64_fmt_into(dst, len, offset, 0, limit, as_vector_i64(vals)[i]);
             break;
         case TYPE_F64:
-            v = str_fmt(limit, "%.*f", F64_PRECISION, as_vector_f64(vals)[i]);
+            n = f64_fmt_into(dst, len, offset, 0, limit, as_vector_f64(vals)[i]);
             break;
         case TYPE_SYMBOL:
-            v = str_fmt(limit, "%s", symbols_get(as_vector_symbol(vals)[i]));
+            n = symbol_fmt_into(dst, len, offset, 0, limit, as_vector_symbol(vals)[i]);
             break;
         default:
-            v = rf_object_fmt_indent(indent, limit - indent, &as_list(vals)[i]);
+            n = rf_object_fmt_into(dst, len, offset, 0, limit, &as_list(vals)[i]);
             break;
         }
 
-        offset += str_fmt_into(0, offset, &str, "\n%*.*s%s: %s", indent, indent, PADDING, k, v);
-        rf_free(k);
-        rf_free(v);
+        chk(n);
+
+        n = str_fmt_into(dst, len, offset, MAX_ROW_WIDTH, "\n");
+
+        chk(n);
     }
 
-    str_fmt_into(0, offset, &str, "\n%*.*s}", indent - 2, indent - 2, PADDING);
-    return str;
+    indent -= 2;
+    return str_fmt_into(dst, len, offset, limit, "%*.*s}", indent, indent, PADDING);
 }
 
-str_t table_fmt(i32_t indent, i32_t limit, rf_object_t *rf_object)
+i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object)
 {
-    if (!limit)
-        return "";
+    return 0;
+    // i64_t *header = as_vector_symbol(&as_list(rf_object)[0]);
+    // rf_object_t *columns = &as_list(rf_object)[1], column_widths;
+    // i32_t table_width, width, table_height;
+    // str_t str = str_fmt(0, "|"), s;
+    // str_t formatted_columns[TABLE_MAX_WIDTH][TABLE_MAX_HEIGHT] = {{NULL}};
+    // i32_t offset = 1, i, j;
 
-    i64_t *header = as_vector_symbol(&as_list(rf_object)[0]);
-    rf_object_t *columns = &as_list(rf_object)[1], column_widths;
-    i32_t table_width, width, table_height;
-    str_t str = str_fmt(0, "|"), s;
-    str_t formatted_columns[TABLE_MAX_WIDTH][TABLE_MAX_HEIGHT] = {{NULL}};
-    i32_t offset = 1, i, j;
+    // table_width = (&as_list(rf_object)[0])->adt->len;
+    // if (table_width > TABLE_MAX_WIDTH)
+    //     table_width = TABLE_MAX_WIDTH;
 
-    table_width = (&as_list(rf_object)[0])->adt->len;
-    if (table_width > TABLE_MAX_WIDTH)
-        table_width = TABLE_MAX_WIDTH;
+    // table_height = (&as_list(columns)[0])->adt->len;
+    // if (table_height > TABLE_MAX_HEIGHT)
+    //     table_height = TABLE_MAX_HEIGHT;
 
-    table_height = (&as_list(columns)[0])->adt->len;
-    if (table_height > TABLE_MAX_HEIGHT)
-        table_height = TABLE_MAX_HEIGHT;
+    // column_widths = vector_i64(table_width);
 
-    column_widths = vector_i64(table_width);
+    // // Calculate each column maximum width
+    // for (i = 0; i < table_width; i++)
+    // {
+    //     // First check the column name
+    //     width = strlen(symbols_get(header[i]));
+    //     as_vector_i64(&column_widths)[i] = width;
 
-    // Calculate each column maximum width
-    for (i = 0; i < table_width; i++)
-    {
-        // First check the column name
-        width = strlen(symbols_get(header[i]));
-        as_vector_i64(&column_widths)[i] = width;
+    //     // Then traverse column until maximum height limit
+    //     for (j = 0; j < table_height; j++)
+    //     {
+    //         rf_object_t *column = &as_list(columns)[i];
 
-        // Then traverse column until maximum height limit
-        for (j = 0; j < table_height; j++)
-        {
-            rf_object_t *column = &as_list(columns)[i];
+    //         switch (column->type)
+    //         {
+    //         case TYPE_I64:
+    //             s = i64_fmt_into(limit, as_vector_i64(column)[j]);
+    //             break;
+    //         case TYPE_F64:
+    //             s = f64_fmt_into(limit, as_vector_f64(column)[j]);
+    //             break;
+    //         case TYPE_SYMBOL:
+    //             s = str_fmt(limit, "%s", symbols_get(as_vector_symbol(column)[j]));
+    //             break;
+    //         default:
+    //             s = rf_object_fmt_indent(indent, limit - indent, &as_list(column)[j]);
+    //             break;
+    //         }
 
-            switch (column->type)
-            {
-            case TYPE_I64:
-                s = i64_fmt(limit, as_vector_i64(column)[j]);
-                break;
-            case TYPE_F64:
-                s = f64_fmt(limit, as_vector_f64(column)[j]);
-                break;
-            case TYPE_SYMBOL:
-                s = str_fmt(limit, "%s", symbols_get(as_vector_symbol(column)[j]));
-                break;
-            default:
-                s = rf_object_fmt_indent(indent, limit - indent, &as_list(column)[j]);
-                break;
-            }
+    //         formatted_columns[i][j] = s;
+    //         width = strlen(s);
+    //         if (width > as_vector_i64(&column_widths)[i])
+    //             as_vector_i64(&column_widths)[i] = width;
+    //     }
+    // }
 
-            formatted_columns[i][j] = s;
-            width = strlen(s);
-            if (width > as_vector_i64(&column_widths)[i])
-                as_vector_i64(&column_widths)[i] = width;
-        }
-    }
+    // // Print table header
+    // for (i = 0; i < table_width; i++)
+    // {
+    //     width = as_vector_i64(&column_widths)[i];
+    //     s = symbols_get(header[i]);
+    //     width = width - strlen(s);
+    //     offset += str_fmt_into(0, offset, &str, " %s%*.*s |", s, width, width, PADDING);
+    // }
 
-    // Print table header
-    for (i = 0; i < table_width; i++)
-    {
-        width = as_vector_i64(&column_widths)[i];
-        s = symbols_get(header[i]);
-        width = width - strlen(s);
-        offset += str_fmt_into(0, offset, &str, " %s%*.*s |", s, width, width, PADDING);
-    }
+    // // Print table header separator
+    // offset += str_fmt_into(0, offset, &str, "\n+");
 
-    // Print table header separator
-    offset += str_fmt_into(0, offset, &str, "\n+");
+    // for (i = 0; i < table_width; i++)
+    // {
+    //     width = as_vector_i64(&column_widths)[i] + 2;
+    //     offset += str_fmt_into(0, offset, &str, "%*.*s+", width, width, TABLE_HEADER_SEPARATOR);
+    // }
 
-    for (i = 0; i < table_width; i++)
-    {
-        width = as_vector_i64(&column_widths)[i] + 2;
-        offset += str_fmt_into(0, offset, &str, "%*.*s+", width, width, TABLE_HEADER_SEPARATOR);
-    }
+    // // Print table content
+    // for (j = 0; j < table_height; j++)
+    // {
+    //     offset += str_fmt_into(0, offset, &str, "\n|");
 
-    // Print table content
-    for (j = 0; j < table_height; j++)
-    {
-        offset += str_fmt_into(0, offset, &str, "\n|");
+    //     for (i = 0; i < table_width; i++)
+    //     {
+    //         width = as_vector_i64(&column_widths)[i] + 1;
+    //         s = formatted_columns[i][j];
+    //         offset += str_fmt_into(0, offset, &str, " %s%*.*s|", s, width - strlen(s), width - strlen(s), PADDING);
+    //         // Free formatted column
+    //         rf_free(s);
+    //     }
+    // }
 
-        for (i = 0; i < table_width; i++)
-        {
-            width = as_vector_i64(&column_widths)[i] + 1;
-            s = formatted_columns[i][j];
-            offset += str_fmt_into(0, offset, &str, " %s%*.*s|", s, width - strlen(s), width - strlen(s), PADDING);
-            // Free formatted column
-            rf_free(s);
-        }
-    }
-
-    return str;
+    // return str;
 }
 
-str_t error_fmt(i32_t indent, i32_t limit, rf_object_t *error)
+i32_t error_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *error)
 {
-    UNUSED(indent);
     UNUSED(limit);
-    return str_fmt(0, "** [E%.3d] error: %s", error->adt->code, as_string(error));
+    return str_fmt_into(dst, len, offset, 0, "** [E%.3d] error: %s", error->adt->code, as_string(error));
 }
 
-extern str_t rf_object_fmt_indent(i32_t indent, i32_t limit, rf_object_t *rf_object)
+extern i32_t rf_object_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object)
 {
     switch (rf_object->type)
     {
-    case TYPE_LIST:
-        return list_fmt(indent, limit, rf_object);
     case -TYPE_I64:
-        return i64_fmt(limit, rf_object->i64);
+        return i64_fmt_into(dst, len, offset, indent, limit, rf_object->i64);
     case -TYPE_F64:
-        return f64_fmt(limit, rf_object->f64);
+        return f64_fmt_into(dst, len, offset, indent, limit, rf_object->f64);
     case -TYPE_SYMBOL:
-        return str_fmt(limit, "%s", symbols_get(rf_object->i64));
+        return symbol_fmt_into(dst, len, offset, indent, limit, rf_object->i64);
     case TYPE_I64:
-        return vector_fmt(limit, rf_object);
+        return vector_fmt_into(dst, len, offset, indent, limit, rf_object);
     case TYPE_F64:
-        return vector_fmt(limit, rf_object);
+        return vector_fmt_into(dst, len, offset, indent, limit, rf_object);
     case TYPE_SYMBOL:
-        return vector_fmt(limit, rf_object);
+        return vector_fmt_into(dst, len, offset, indent, limit, rf_object);
     case TYPE_STRING:
-        return string_fmt(indent, limit, rf_object);
+        return string_fmt_into(dst, len, offset, indent, limit, rf_object);
+    case TYPE_LIST:
+        return list_fmt_into(dst, len, offset, indent, limit, rf_object);
     case TYPE_DICT:
-        return dict_fmt(indent, limit, rf_object);
+        return dict_fmt_into(dst, len, offset, indent, limit, rf_object);
     case TYPE_TABLE:
-        return table_fmt(indent, limit, rf_object);
+        return table_fmt_into(dst, len, offset, indent, limit, rf_object);
     case TYPE_ERROR:
-        return error_fmt(indent, limit, rf_object);
+        return error_fmt_into(dst, len, offset, indent, limit, rf_object);
     default:
-        return str_fmt(limit, "null");
+        return str_fmt_into(dst, len, offset, limit, "null");
     }
 }
 
 extern str_t rf_object_fmt(rf_object_t *rf_object)
 {
-    i32_t indent = 0, limit = MAX_ROW_WIDTH - FORMAT_TRAILER_SIZE;
-    str_t s = rf_object_fmt_indent(indent, limit, rf_object);
-    if (s == NULL)
+    i32_t len = 0, offset = 0, limit = MAX_ROW_WIDTH;
+    str_t dst = NULL;
+    rf_object_fmt_into(&dst, &len, &offset, 0, limit, rf_object);
+    if (dst == NULL)
         panic("format: returns null");
 
-    return s;
+    return dst;
 }
 
 extern str_t type_fmt(i8_t type)
 {
-    return str_fmt(0, "%s", symbols_get(env_get_typename_by_type(&runtime_get()->env, type)));
+    return str_fmt(0, 0, "%s", symbols_get(env_get_typename_by_type(&runtime_get()->env, type)));
 }
