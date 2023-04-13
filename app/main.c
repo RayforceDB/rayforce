@@ -258,9 +258,6 @@ i32_t main(i32_t argc, str_t argv[])
 
     while (run)
     {
-        // TODO: decide where to store debuginfo for each function
-        debuginfo_init(runtime_get()->debuginfo);
-
         printf("%s%s%s", GREEN, PROMPT, RESET);
         ptr = fgets(line, LINE_SIZE, stdin);
         if ((ptr) == NULL)
