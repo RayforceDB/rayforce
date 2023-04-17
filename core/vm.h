@@ -24,9 +24,10 @@
 #ifndef VM_H
 #define VM_H
 
+#include <time.h>
 #include "rayforce.h"
 #include "mmap.h"
-#include <time.h>
+#include "debuginfo.h"
 
 #define VM_STACK_SIZE PAGE_SIZE * 4
 
@@ -75,7 +76,7 @@ typedef struct vm_t
 } vm_t;
 
 vm_t *vm_create();
-rf_object_t vm_exec(vm_t *vm, str_t code) __attribute__((__noinline__));
+rf_object_t vm_exec(vm_t *vm, str_t code, debuginfo_t *debuginfo) __attribute__((__noinline__));
 null_t vm_free(vm_t *vm);
 
 // void vm_print_stack(int *stack, int count);

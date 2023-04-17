@@ -83,7 +83,7 @@ static inline __attribute__((always_inline)) rf_object_t rf_cast(i8_t type, rf_o
         x.type = type;
         break;
     default:
-        err = error(ERR_TYPE, str_fmt(0, "'cast': invalid conversion from '%s' to '%s'",
+        err = error(ERR_TYPE, str_fmt(0, "invalid conversion from '%s' to '%s'",
                                       symbols_get(env_get_typename_by_type(&runtime_get()->env, y->type)),
                                       symbols_get(env_get_typename_by_type(&runtime_get()->env, type))));
         err.id = y->id;

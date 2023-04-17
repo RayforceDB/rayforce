@@ -248,7 +248,8 @@ i32_t main(i32_t argc, str_t argv[])
     rf_object_t args = parse_cmdline(argc, argv), parsed, executed, compiled;
     i8_t run = 1;
     str_t line = (str_t)rf_malloc(LINE_SIZE), ptr; //, filename = NULL;
-    debuginfo_t debuginfo = debuginfo_create("REPL", "");
+    debuginfo_t cc_debuginfo = debuginfo_create("REPL", "");
+    debuginfo_t rt_debuginfo = debuginfo_create("REPL", "");
     vm_t *vm;
 
     print_logo();
@@ -260,15 +261,15 @@ i32_t main(i32_t argc, str_t argv[])
 
     while (run)
     {
-        debuginfo.filename = "REPL";
-        debuginfo.function = "";
+        cc_debuginfo.filename = "REPL";
+        cc_debuginfo.function = "";
 
         printf("%s%s%s", GREEN, PROMPT, RESET);
         ptr = fgets(line, LINE_SIZE, stdin);
         if ((ptr) == NULL)
             break;
 
-        parsed = parse("REPL", line, &debuginfo);
+        parsed = parse("REPL", line, &cc_debuginfo);
         // printf("%s\n", rf_object_fmt(&parsed));
 
         if (is_error(&parsed))
@@ -277,7 +278,7 @@ i32_t main(i32_t argc, str_t argv[])
             continue;
         }
 
-        compiled = cc_compile_function("top-level", &parsed, &debuginfo);
+        compiled = cc_compile_function("top-level", &parsed, &cc_debuginfo, &rt_debuginfo);
         if (is_error(&compiled))
         {
             print_error(&compiled, "REPL", line, LINE_SIZE);
@@ -287,7 +288,7 @@ i32_t main(i32_t argc, str_t argv[])
         }
 
         // printf("CODE: %s\n", cc_code_fmt(&compiled));
-        executed = vm_exec(vm, as_string(&compiled));
+        executed = vm_exec(vm, as_string(&compiled), &rt_debuginfo);
 
         if (is_error(&executed))
             print_error(&executed, "REPL", line, LINE_SIZE);

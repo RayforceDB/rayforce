@@ -262,11 +262,11 @@ rf_object_t parse_vector(parser_t *parser)
             return token;
         }
 
-        if (is_at(&token, '\0'))
+        if (is_at(&token, '\0') || is_at_term(&token))
         {
             rf_object_free(&vec);
             err = error(ERR_PARSE, "Expected ']'");
-            err.id = span_commit(parser, span);
+            err.id = token.id;
             return err;
         }
 

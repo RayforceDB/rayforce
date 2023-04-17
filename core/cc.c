@@ -355,28 +355,28 @@ i8_t cc_compile_fn(rf_object_t *rf_object, rf_object_t *code, debuginfo_t *cc_de
 /*
  * Compile function
  */
-rf_object_t cc_compile_function(str_t name, rf_object_t *body, debuginfo_t *cc_debuginfo)
+rf_object_t cc_compile_function(str_t name, rf_object_t *body, debuginfo_t *cc_debuginfo, debuginfo_t *rt_debuginfo)
 {
     if (body->type != TYPE_LIST)
         return error(ERR_TYPE, str_fmt(0, "compile '%s': expected list", name));
 
-    // create eval time debuginfo
-    debuginfo_t rt_debuginfo = debuginfo_create(cc_debuginfo->filename, name);
+    // // create eval time debuginfo
+    // debuginfo_t rt_debuginfo = debuginfo_create(cc_debuginfo->filename, name);
     rf_object_t code = string(0);
     i32_t i;
 
     for (i = 0; i < body->adt->len; i++)
-        cc_compile_fn(&as_list(body)[i], &code, cc_debuginfo, &rt_debuginfo);
+        cc_compile_fn(&as_list(body)[i], &code, cc_debuginfo, rt_debuginfo);
 
     if (code.type != TYPE_ERROR)
     {
         if (body->adt->len == 0)
         {
-            push_opcode(cc_debuginfo, &rt_debuginfo, body->id, &code, OP_PUSH);
+            push_opcode(cc_debuginfo, rt_debuginfo, body->id, &code, OP_PUSH);
             push_rf_object(&code, null());
         }
 
-        push_opcode(cc_debuginfo, &rt_debuginfo, body->id, &code, OP_HALT);
+        push_opcode(cc_debuginfo, rt_debuginfo, body->id, &code, OP_HALT);
     }
     else
     {

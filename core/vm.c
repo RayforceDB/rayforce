@@ -58,7 +58,7 @@ vm_create()
 /*
  * Dispatch using computed goto technique
  */
-rf_object_t vm_exec(vm_t *vm, str_t code)
+rf_object_t vm_exec(vm_t *vm, str_t code, debuginfo_t *debuginfo)
 {
     rf_object_t x1, x2, x3, x4, x5, x6, *addr;
     i64_t *v, t;
@@ -212,7 +212,10 @@ op_call1:
     x1 = f1(&x2);
     // TODO: unwind
     if (x1.type == TYPE_ERROR)
+    {
+        x1.adt->span = debuginfo_get(debuginfo, vm->ip - sizeof(rf_object_t) - 1);
         return x1;
+    }
     stack_push(vm, x1);
     dispatch();
 op_call2:
@@ -225,7 +228,11 @@ op_call2:
     x1 = f2(&x2, &x3);
     // TODO: unwind
     if (x1.type == TYPE_ERROR)
+    {
+        debug("unwind");
+        x1.adt->span = debuginfo_get(debuginfo, vm->ip - sizeof(rf_object_t) - 1);
         return x1;
+    }
     stack_push(vm, x1);
     dispatch();
 op_call3:
@@ -292,7 +299,10 @@ op_cast:
     x1 = rf_cast(i, &x2);
     // TODO: unwind
     if (x1.type == TYPE_ERROR)
+    {
+        x1.adt->span = debuginfo_get(debuginfo, vm->ip - 2);
         return x1;
+    }
     stack_push(vm, x1);
     dispatch();
 }
