@@ -34,7 +34,7 @@
 #include "binary.h"
 #include "function.h"
 
-i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code, debuginfo_t *cc_debuginfo, debuginfo_t *rt_debuginfo);
+i8_t cc_compile_expr(rf_object_t *object, rf_object_t *code, debuginfo_t *cc_debuginfo, debuginfo_t *rt_debuginfo);
 
 #define push_opcode(d, p, k, c, x)                    \
     {                                                 \
@@ -153,7 +153,7 @@ i8_t cc_compile_special_forms(rf_object_t *object, u32_t arity, rf_object_t *cod
         }
 
         push_opcode(cc_debuginfo, rt_debuginfo, car->id, code, OP_TIMER_SET);
-        type = cc_compile_fn(&as_list(object)[1], code, cc_debuginfo, rt_debuginfo);
+        type = cc_compile_expr(&as_list(object)[1], code, cc_debuginfo, rt_debuginfo);
 
         if (type == TYPE_ERROR)
             return TYPE_ERROR;
@@ -182,7 +182,7 @@ i8_t cc_compile_special_forms(rf_object_t *object, u32_t arity, rf_object_t *cod
             return TYPE_ERROR;
         }
 
-        type = cc_compile_fn(&as_list(object)[2], code, cc_debuginfo, rt_debuginfo);
+        type = cc_compile_expr(&as_list(object)[2], code, cc_debuginfo, rt_debuginfo);
 
         if (type == TYPE_ERROR)
             return TYPE_ERROR;
@@ -236,7 +236,7 @@ i8_t cc_compile_special_forms(rf_object_t *object, u32_t arity, rf_object_t *cod
             return TYPE_ERROR;
         }
 
-        if (cc_compile_fn(&as_list(object)[2], code, cc_debuginfo, rt_debuginfo) == TYPE_ERROR)
+        if (cc_compile_expr(&as_list(object)[2], code, cc_debuginfo, rt_debuginfo) == TYPE_ERROR)
             return TYPE_ERROR;
 
         push_opcode(cc_debuginfo, rt_debuginfo, car->id, code, OP_CAST);
@@ -248,7 +248,7 @@ i8_t cc_compile_special_forms(rf_object_t *object, u32_t arity, rf_object_t *cod
     return TYPE_ANY;
 }
 
-i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code, debuginfo_t *cc_debuginfo, debuginfo_t *rt_debuginfo)
+i8_t cc_compile_expr(rf_object_t *object, rf_object_t *code, debuginfo_t *cc_debuginfo, debuginfo_t *rt_debuginfo)
 {
     rf_object_t *car, err, *addr;
     i8_t type;
@@ -306,7 +306,7 @@ i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code, debuginfo_t *cc_debug
         if (car->type != -TYPE_SYMBOL)
         {
             rf_object_free(code);
-            err = error(ERR_LENGTH, "expected symbol in a head");
+            err = error(ERR_LENGTH, "expected symbol as first argument");
             err.id = car->id;
             *code = err;
             return TYPE_ERROR;
@@ -325,7 +325,7 @@ i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code, debuginfo_t *cc_debug
         // compile arguments
         for (i = 1; i <= arity; i++)
         {
-            type = cc_compile_fn(&as_list(object)[i], code, cc_debuginfo, rt_debuginfo);
+            type = cc_compile_expr(&as_list(object)[i], code, cc_debuginfo, rt_debuginfo);
 
             if (type == TYPE_ERROR)
                 return TYPE_ERROR;
@@ -367,7 +367,7 @@ rf_object_t cc_compile_function(str_t name, rf_object_t *body, debuginfo_t *cc_d
     i32_t i;
 
     for (i = 0; i < body->adt->len; i++)
-        cc_compile_fn(&as_list(body)[i], &code, cc_debuginfo, &rt_debuginfo);
+        cc_compile_expr(&as_list(body)[i], &code, cc_debuginfo, &rt_debuginfo);
 
     if (code.type != TYPE_ERROR)
     {
