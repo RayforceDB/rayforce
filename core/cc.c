@@ -361,7 +361,7 @@ rf_object_t cc_compile_function(str_t name, rf_object_t *body, debuginfo_t *cc_d
         return error(ERR_TYPE, str_fmt(0, "compile '%s': expected list", name));
 
     // // create eval time debuginfo
-    // debuginfo_t rt_debuginfo = debuginfo_create(cc_debuginfo->filename, name);
+    // debuginfo_t rt_debuginfo = debuginfo_new(cc_debuginfo->filename, name);
     rf_object_t code = string(0);
     i32_t i;
 

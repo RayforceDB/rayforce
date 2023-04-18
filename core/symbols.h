@@ -54,7 +54,7 @@ typedef struct symbols_t
 i64_t symbols_intern(rf_object_t *string);
 str_t symbols_get(i64_t key);
 
-symbols_t *symbols_create();
+symbols_t *symbols_new();
 null_t symbols_free(symbols_t *symbols);
 
 #endif

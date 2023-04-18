@@ -82,7 +82,7 @@ i32_t string_str_cmp(null_t *a, null_t *b)
 /*
  * Allocate a new pool node for the strings pool.
  */
-pool_node_t *pool_node_create()
+pool_node_t *pool_node_new()
 {
     pool_node_t *node = (pool_node_t *)mmap(NULL, STRINGS_POOL_SIZE,
                                             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -107,7 +107,7 @@ null_t *str_dup(null_t *key, null_t *val, bucket_t *bucket)
     // Allocate new pool node
     if ((i64_t)symbols->strings_pool + len - (i64_t)symbols->pool_node > STRINGS_POOL_SIZE)
     {
-        pool_node_t *node = pool_node_create();
+        pool_node_t *node = pool_node_new();
         symbols->pool_node->next = node;
         symbols->pool_node = node;
         symbols->strings_pool = (str_t)(node + sizeof(pool_node_t *)); // Skip the node size of next ptr
@@ -120,17 +120,17 @@ null_t *str_dup(null_t *key, null_t *val, bucket_t *bucket)
     return bucket->key;
 }
 
-symbols_t *symbols_create()
+symbols_t *symbols_new()
 {
     symbols_t *symbols = (symbols_t *)rf_malloc(sizeof(symbols_t));
 
-    pool_node_t *node = pool_node_create();
+    pool_node_t *node = pool_node_new();
     symbols->pool_node_0 = node;
     symbols->pool_node = node;
     symbols->strings_pool = (str_t)(node + sizeof(pool_node_t *)); // Skip the node size of next ptr
 
-    symbols->str_to_id = ht_create(&string_hash, &string_str_cmp);
-    symbols->id_to_str = ht_create(&i64_hash, &i64_cmp);
+    symbols->str_to_id = ht_new(&string_hash, &string_str_cmp);
+    symbols->id_to_str = ht_new(&i64_hash, &i64_cmp);
 
     return symbols;
 }

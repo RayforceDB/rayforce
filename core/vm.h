@@ -75,7 +75,7 @@ typedef struct vm_t
     rf_object_t *stack; // Stack of rf_objects
 } vm_t;
 
-vm_t *vm_create();
+vm_t *vm_new();
 rf_object_t vm_exec(vm_t *vm, str_t code, debuginfo_t *debuginfo) __attribute__((__noinline__));
 null_t vm_free(vm_t *vm);
 

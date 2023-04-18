@@ -44,7 +44,7 @@ typedef struct hash_table_t
     i32_t (*compare)(null_t *a, null_t *b);
 } hash_table_t;
 
-hash_table_t *ht_create(i64_t (*hasher)(null_t *a), i32_t (*compare)(null_t *a, null_t *b));
+hash_table_t *ht_new(i64_t (*hasher)(null_t *a), i32_t (*compare)(null_t *a, null_t *b));
 null_t ht_free(hash_table_t *table);
 
 null_t *ht_insert(hash_table_t *table, null_t *key, null_t *val);

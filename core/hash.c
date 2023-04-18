@@ -30,7 +30,7 @@
 #include "rayforce.h"
 #include "alloc.h"
 
-hash_table_t *ht_create(i64_t (*hasher)(null_t *a), i32_t (*compare)(null_t *a, null_t *b))
+hash_table_t *ht_new(i64_t (*hasher)(null_t *a), i32_t (*compare)(null_t *a, null_t *b))
 {
     hash_table_t *table = (hash_table_t *)rf_malloc(sizeof(hash_table_t));
 

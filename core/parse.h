@@ -32,16 +32,18 @@
  */
 typedef struct parser_t
 {
-    debuginfo_t *debuginfo; // debug info for current parser
-    u32_t count;            // number of parsed objects
-    str_t input;            // input string
-    str_t current;          // current character
-    i64_t line;             // current line
-    i64_t column;           // current column
+    debuginfo_t debuginfo; // debug info for current parser
+    u32_t count;           // number of parsed objects
+    str_t input;           // input string
+    str_t current;         // current character
+    i64_t line;            // current line
+    i64_t column;          // current column
 } __attribute__((aligned(16))) parser_t;
 
 rf_object_t advance(parser_t *parser);
 
-extern rf_object_t parse(str_t filename, str_t input, debuginfo_t *debuginfo);
+parser_t parser_new();
+null_t parser_free(parser_t *parser);
+rf_object_t parse(parser_t *parser, str_t filename, str_t input);
 
 #endif

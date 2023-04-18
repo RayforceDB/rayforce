@@ -64,7 +64,7 @@ extern alloc_t rf_alloc_init()
 
     alloc = (alloc_t)mmap(NULL, sizeof(struct alloc_t),
                           PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    alloc->symbols = symbols_create();
+    alloc->symbols = symbols_new();
 
     return alloc;
 }

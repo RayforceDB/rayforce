@@ -40,7 +40,8 @@ typedef struct debuginfo_t
     hash_table_t *spans;
 } debuginfo_t;
 
-debuginfo_t debuginfo_create(str_t filename, str_t function);
+debuginfo_t debuginfo_new(str_t filename, str_t function);
+null_t debuginfo_free(debuginfo_t *debuginfo);
 null_t debuginfo_insert(debuginfo_t *debuginfo, u32_t index, span_t span);
 span_t debuginfo_get(debuginfo_t *debuginfo, u32_t index);
 

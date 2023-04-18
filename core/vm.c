@@ -40,7 +40,7 @@
 #define stack_peek(v) (&v->stack[v->sp - 1])
 
 vm_t *
-vm_create()
+vm_new()
 {
     vm_t *vm;
 
