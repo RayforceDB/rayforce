@@ -183,7 +183,7 @@ i8_t cc_compile_special_forms(rf_object_t *object, u32_t arity, rf_object_t *cod
         if (type == TYPE_ANY)
         {
             rf_object_free(code);
-            err = error(ERR_TYPE, "'cast': unknown type");
+            err = error(ERR_TYPE, str_fmt(0, "'cast': unknown type '%s", symbols_get(as_list(object)[1].i64)));
             err.id = as_list(object)[1].id;
             *code = err;
             return TYPE_ERROR;
