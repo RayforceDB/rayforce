@@ -32,6 +32,7 @@
 #include "env.h"
 #include "runtime.h"
 #include "binary.h"
+#include "function.h"
 
 i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code, debuginfo_t *cc_debuginfo, debuginfo_t *rt_debuginfo);
 
@@ -355,33 +356,34 @@ i8_t cc_compile_fn(rf_object_t *object, rf_object_t *code, debuginfo_t *cc_debug
 /*
  * Compile function
  */
-rf_object_t cc_compile_function(str_t name, rf_object_t *body, debuginfo_t *cc_debuginfo, debuginfo_t *rt_debuginfo)
+rf_object_t cc_compile_function(str_t name, rf_object_t *body, debuginfo_t *cc_debuginfo)
 {
     if (body->type != TYPE_LIST)
         return error(ERR_TYPE, str_fmt(0, "compile '%s': expected list", name));
 
-    // // create eval time debuginfo
-    // debuginfo_t rt_debuginfo = debuginfo_new(cc_debuginfo->filename, name);
-    rf_object_t code = string(0);
+    // create eval time debuginfo
+    debuginfo_t rt_debuginfo = debuginfo_new(cc_debuginfo->filename, name);
+    rf_object_t code = string(0), fun;
     i32_t i;
 
     for (i = 0; i < body->adt->len; i++)
-        cc_compile_fn(&as_list(body)[i], &code, cc_debuginfo, rt_debuginfo);
+        cc_compile_fn(&as_list(body)[i], &code, cc_debuginfo, &rt_debuginfo);
 
     if (code.type != TYPE_ERROR)
     {
         if (body->adt->len == 0)
         {
-            push_opcode(cc_debuginfo, rt_debuginfo, body->id, &code, OP_PUSH);
+            push_opcode(cc_debuginfo, &rt_debuginfo, body->id, &code, OP_PUSH);
             push_rf_object(&code, null());
         }
 
-        push_opcode(cc_debuginfo, rt_debuginfo, body->id, &code, OP_HALT);
+        push_opcode(cc_debuginfo, &rt_debuginfo, body->id, &code, OP_HALT);
+
+        fun = function(as_string(&code), rt_debuginfo);
+        return fun;
     }
-    else
-    {
-        code.adt->span = debuginfo_get(cc_debuginfo, code.id);
-    }
+
+    code.adt->span = debuginfo_get(cc_debuginfo, code.id);
 
     return code;
 }

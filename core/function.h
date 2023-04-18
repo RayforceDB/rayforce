@@ -26,12 +26,17 @@
 
 #include "rayforce.h"
 #include "debuginfo.h"
+#include "env.h"
+
+#define as_function(object) ((function_t *)(as_string(object)))
 
 typedef struct function_t
 {
-    str_t file;
-    str_t name;
+    i64_t args[MAX_ARITY]; // arguments names as symbols
     str_t code;
+    debuginfo_t debuginfo;
 } function_t;
+
+rf_object_t function(str_t code, debuginfo_t debuginfo);
 
 #endif

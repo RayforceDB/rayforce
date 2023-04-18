@@ -22,3 +22,19 @@
  */
 
 #include "function.h"
+
+rf_object_t function(str_t code, debuginfo_t debuginfo)
+{
+    header_t *adt = rf_malloc(sizeof(header_t) + sizeof(function_t));
+    function_t *f = (function_t *)(adt + 1);
+
+    f->code = code;
+    f->debuginfo = debuginfo;
+
+    rf_object_t fun = {
+        .type = TYPE_FUNCTION,
+        .adt = adt,
+    };
+
+    return fun;
+}

@@ -34,6 +34,7 @@
 #include "runtime.h"
 #include "dict.h"
 #include "cast.h"
+#include "function.h"
 
 #define stack_push(v, x) (v->stack[v->sp++] = x)
 #define stack_pop(v) (v->stack[--v->sp])
@@ -56,10 +57,13 @@ vm_new()
 }
 
 /*
- * Dispatch using computed goto technique
+ * Execute the function
  */
-rf_object_t vm_exec(vm_t *vm, str_t code, debuginfo_t *debuginfo)
+rf_object_t vm_exec(vm_t *vm, rf_object_t *fun)
 {
+    function_t *f = as_function(fun);
+    str_t code = f->code;
+    debuginfo_t *debuginfo = &f->debuginfo;
     rf_object_t x1, x2, x3, x4, x5, x6, *addr;
     i64_t *v, t;
     i32_t i, l, b;
@@ -205,9 +209,7 @@ op_call0:
     vm->ip += sizeof(rf_object_t);
     f0 = (nilary_t)x2.i64;
     x1 = f0();
-    // TODO: unwind
-    if (x1.type == TYPE_ERROR)
-        return x1;
+    unwrap(x1, b);
     stack_push(vm, x1);
     dispatch();
 op_call1:

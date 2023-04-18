@@ -76,7 +76,7 @@ typedef struct vm_t
 } vm_t;
 
 vm_t *vm_new();
-rf_object_t vm_exec(vm_t *vm, str_t code, debuginfo_t *debuginfo) __attribute__((__noinline__));
+rf_object_t vm_exec(vm_t *vm, rf_object_t *fun) __attribute__((__noinline__));
 null_t vm_free(vm_t *vm);
 
 // void vm_print_stack(int *stack, int count);
