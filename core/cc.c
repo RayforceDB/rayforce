@@ -631,7 +631,7 @@ i8_t cc_compile_expr(cc_t *cc, rf_object_t *object)
             return type;
 
         rf_object_free(code);
-        err = error(ERR_LENGTH, "function proto or arity mismatch");
+        err = error(ERR_LENGTH, "function has not found");
         err.id = car->id;
         *code = err;
         return type;

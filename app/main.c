@@ -38,6 +38,7 @@
 #include "../core/runtime.h"
 #include "../core/cc.h"
 #include "../core/debuginfo.h"
+#include "../core/dict.h"
 
 #define LINE_SIZE 2048
 
@@ -196,12 +197,49 @@ rf_object_t parse_cmdline(i32_t argc, str_t argv[])
     return dict(keys, vals);
 }
 
-null_t load_file(parser_t *parser, str_t filename)
+null_t repl(str_t name, parser_t *parser, vm_t *vm, str_t buf, i32_t len)
+{
+    rf_object_t parsed, compiled, executed;
+
+    parsed = parse(parser, name, buf);
+    // printf("%s\n", rf_object_fmt(&parsed));
+
+    if (is_error(&parsed))
+    {
+        print_error(&parsed, name, buf, len);
+        rf_object_free(&parsed);
+        return;
+    }
+
+    compiled = cc_compile(&parsed, &parser->debuginfo);
+    if (is_error(&compiled))
+    {
+        print_error(&compiled, name, buf, len);
+        rf_object_free(&parsed);
+        rf_object_free(&compiled);
+        return;
+    }
+
+    // printf("%s\n", vm_code_fmt(&compiled));
+    executed = vm_exec(vm, &compiled);
+
+    if (is_error(&executed))
+        print_error(&executed, name, buf, len);
+    else
+        printf("%s\n", rf_object_fmt(&executed));
+
+    rf_object_free(&parsed);
+    rf_object_free(&executed);
+    rf_object_free(&compiled);
+
+    return;
+}
+
+null_t load_file(parser_t *parser, vm_t *vm, str_t filename)
 {
     i32_t fd;
-    str_t file, buf;
+    str_t file;
     struct stat st;
-    rf_object_t rf_object;
 
     fd = open(filename, O_RDONLY); // open the file for reading
 
@@ -222,27 +260,17 @@ null_t load_file(parser_t *parser, str_t filename)
         return;
     }
 
-    rf_object = parse(parser, filename, file);
-    buf = rf_object_fmt(&rf_object);
-
-    // printf("%s%s%s\n", TOMATO, buf, RESET);
-    if (is_error(&rf_object))
-        print_error(&rf_object, filename, file, st.st_size);
-    else
-        printf("%s\n", buf);
+    repl(filename, parser, vm, file, st.st_size);
 
     munmap(file, st.st_size); // unmap the buffer
     close(fd);                // close the file
-
-    rf_object_free(&rf_object);
-    rf_free(buf);
 }
 
 i32_t main(i32_t argc, str_t argv[])
 {
     runtime_init();
 
-    rf_object_t args = parse_cmdline(argc, argv), parsed, executed, compiled;
+    rf_object_t args = parse_cmdline(argc, argv), filename;
     i8_t run = 1;
     str_t line = (str_t)rf_malloc(LINE_SIZE), ptr; //, filename = NULL;
     parser_t parser = parser_new();
@@ -252,7 +280,10 @@ i32_t main(i32_t argc, str_t argv[])
 
     vm = vm_new();
 
-    // load_file(&parser, "/tmp/test.ray");
+    filename = dict_get(&args, symbol("file"));
+    if (!is_null(&filename))
+        load_file(&parser, vm, as_string(&filename));
+
     rf_object_free(&args);
 
     while (run)
@@ -262,35 +293,7 @@ i32_t main(i32_t argc, str_t argv[])
         if ((ptr) == NULL)
             break;
 
-        parsed = parse(&parser, "top-level", line);
-        // printf("%s\n", rf_object_fmt(&parsed));
-
-        if (is_error(&parsed))
-        {
-            print_error(&parsed, "top-level", line, LINE_SIZE);
-            continue;
-        }
-
-        compiled = cc_compile(&parsed, &parser.debuginfo);
-        if (is_error(&compiled))
-        {
-            print_error(&compiled, "top-level", line, LINE_SIZE);
-            rf_object_free(&parsed);
-            rf_object_free(&compiled);
-            continue;
-        }
-
-        // printf("%s\n", vm_code_fmt(&compiled));
-        executed = vm_exec(vm, &compiled);
-
-        if (is_error(&executed))
-            print_error(&executed, "top-level", line, LINE_SIZE);
-        else
-            printf("%s\n", rf_object_fmt(&executed));
-
-        rf_object_free(&parsed);
-        rf_object_free(&executed);
-        rf_object_free(&compiled);
+        repl("top-level", &parser, vm, line, LINE_SIZE);
     }
 
     rf_free(line);
