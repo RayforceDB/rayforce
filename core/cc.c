@@ -96,7 +96,7 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
 {
     i8_t type;
     i64_t id;
-    rf_object_t *car = &as_list(object)[0], *addr, *b, args, fun, name, err;
+    rf_object_t *car = &as_list(object)[0], *addr, *b, fun, name, err;
     function_t *func = as_function(&cc->function);
     rf_object_t *code = &func->code;
 
