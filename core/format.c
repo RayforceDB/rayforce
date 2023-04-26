@@ -464,6 +464,9 @@ i32_t rf_object_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i3
     }
 }
 
+/*
+ * Format an object into a string
+ */
 str_t rf_object_fmt(rf_object_t *rf_object)
 {
     i32_t len = 0, offset = 0, limit = MAX_ROW_WIDTH;
@@ -473,4 +476,48 @@ str_t rf_object_fmt(rf_object_t *rf_object)
         panic("format: returns null");
 
     return dst;
+}
+
+/*
+ * Format a list of objects into a string
+ * using format string as a template with
+ * '%' placeholders.
+ */
+str_t rf_object_fmt_n(rf_object_t *x, u32_t n)
+{
+    u32_t i;
+    i32_t l = 0, o = 0;
+    str_t s = NULL, p, tok = NULL;
+
+    if (n == 0)
+        return NULL;
+
+    if (n == 1)
+        return rf_object_fmt(x);
+
+    if (x->type != TYPE_STRING)
+        return NULL;
+
+    p = as_string(x);
+    tok = strtok(p, "%");
+
+    for (i = 1; i < n; i++)
+    {
+        if (tok)
+            str_fmt_into(&s, &l, &o, 0, tok);
+
+        tok = strtok(NULL, "%");
+
+        if (!tok && i < n - 1)
+        {
+            if (s)
+                rf_free(s);
+
+            return NULL;
+        }
+
+        rf_object_fmt_into(&s, &l, &o, 0, 0, x + i);
+    }
+
+    return s;
 }

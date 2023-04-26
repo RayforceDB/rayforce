@@ -27,5 +27,8 @@
 #include "rayforce.h"
 
 rf_object_t rf_list(rf_object_t *x, u32_t n);
+rf_object_t rf_format(rf_object_t *x, u32_t n);
+rf_object_t rf_print(rf_object_t *x, u32_t n);
+rf_object_t rf_println(rf_object_t *x, u32_t n);
 
 #endif

@@ -21,7 +21,12 @@
  *   SOFTWARE.
  */
 
+#include <stddef.h>
+#include <stdio.h>
+#include "string.h"
+#include "alloc.h"
 #include "nary.h"
+#include "format.h"
 
 rf_object_t rf_list(rf_object_t *x, u32_t n)
 {
@@ -35,4 +40,40 @@ rf_object_t rf_list(rf_object_t *x, u32_t n)
     }
 
     return l;
+}
+
+rf_object_t rf_format(rf_object_t *x, u32_t n)
+{
+    str_t s = rf_object_fmt_n(x, n);
+
+    if (!s)
+        return error(ERR_TYPE, "malformed format string");
+
+    return string_from_str(s, strlen(s));
+}
+
+rf_object_t rf_print(rf_object_t *x, u32_t n)
+{
+    str_t s = rf_object_fmt_n(x, n);
+
+    if (!s)
+        return error(ERR_TYPE, "malformed format string");
+
+    printf("%s", s);
+    rf_free(s);
+
+    return null();
+}
+
+rf_object_t rf_println(rf_object_t *x, u32_t n)
+{
+    str_t s = rf_object_fmt_n(x, n);
+
+    if (!s)
+        return error(ERR_TYPE, "malformed format string");
+
+    printf("%s\n", s);
+    rf_free(s);
+
+    return null();
 }

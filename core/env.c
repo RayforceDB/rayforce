@@ -69,7 +69,10 @@ null_t init_functions(rf_object_t *records)
     // Ternary
     // Quaternary
     // Nary
-    REC(records, 5, "list",   TYPE_LIST,    rf_list,   { 0                       });
+    REC(records, 5, "list",    TYPE_LIST,    rf_list,    { 0                       });
+    REC(records, 5, "format",  TYPE_STRING,  rf_format,  { 0                       });
+    REC(records, 5, "print",   TYPE_LIST,    rf_print,   { 0                       });
+    REC(records, 5, "println", TYPE_LIST,    rf_println, { 0                       });
 }
 
 null_t init_typenames(i64_t *typenames)
