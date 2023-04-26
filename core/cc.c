@@ -35,7 +35,7 @@
 #include "function.h"
 #include "dict.h"
 
-i8_t cc_compile_expr(cc_t *cc, rf_object_t *object);
+i8_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object);
 rf_object_t cc_compile_function(bool_t top, str_t name, i8_t rettype, rf_object_t args, rf_object_t *body, u32_t id, i32_t len, debuginfo_t *debuginfo);
 
 #define push_opcode(c, k, v, x)                                   \
@@ -92,7 +92,7 @@ env_record_t *find_record(rf_object_t *records, rf_object_t *car, i32_t args, u3
  * return TYPE_ANY if it is not a special form
  * return type of the special form if it is a special form
  */
-i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
+i8_t cc_compile_special_forms(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t arity)
 {
     i8_t type, type1, rettype = TYPE_ANY;
     i64_t id, lbl1, lbl2;
@@ -104,6 +104,9 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
     // compile special forms
     if (car->i64 == symbol("time").i64)
     {
+        if (!has_consumer)
+            return TYPE_ANY;
+
         if (arity != 1)
         {
             rf_object_free(code);
@@ -114,7 +117,7 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
         }
 
         push_opcode(cc, car->id, code, OP_TIMER_SET);
-        type = cc_compile_expr(cc, &as_list(object)[1]);
+        type = cc_compile_expr(false, cc, &as_list(object)[1]);
 
         if (type == TYPE_ERROR)
             return TYPE_ERROR;
@@ -143,7 +146,7 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
             return TYPE_ERROR;
         }
 
-        type = cc_compile_expr(cc, &as_list(object)[2]);
+        type = cc_compile_expr(true, cc, &as_list(object)[2]);
 
         if (type == TYPE_ERROR)
             return TYPE_ERROR;
@@ -162,6 +165,9 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
 
         push_opcode(cc, car->id, code, OP_GSET);
         push_rf_object(code, as_list(object)[1]);
+
+        if (!has_consumer)
+            push_opcode(cc, car->id, code, OP_POP);
 
         return type;
     }
@@ -185,7 +191,7 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
             return TYPE_ERROR;
         }
 
-        type = cc_compile_expr(cc, &as_list(object)[2]);
+        type = cc_compile_expr(true, cc, &as_list(object)[2]);
 
         if (type == TYPE_ERROR)
             return type;
@@ -203,8 +209,8 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
         id = vector_i64_find(&as_list(&func->locals)[0], as_list(object)[1].i64);
         push_rf_object(code, i64(1 + id));
 
-        // FIXME!!!!
-        push_opcode(cc, car->id, code, OP_POP);
+        if (!has_consumer)
+            push_opcode(cc, car->id, code, OP_POP);
 
         return type;
     }
@@ -240,11 +246,14 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
             return TYPE_ERROR;
         }
 
-        if (cc_compile_expr(cc, &as_list(object)[2]) == TYPE_ERROR)
+        if (cc_compile_expr(true, cc, &as_list(object)[2]) == TYPE_ERROR)
             return TYPE_ERROR;
 
         push_opcode(cc, car->id, code, OP_CAST);
         push_opcode(cc, car->id, code, type);
+
+        if (!has_consumer)
+            push_opcode(cc, car->id, code, OP_POP);
 
         return type;
     }
@@ -308,7 +317,7 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
             return TYPE_ERROR;
         }
 
-        type = cc_compile_expr(cc, &as_list(object)[1]);
+        type = cc_compile_expr(true, cc, &as_list(object)[1]);
 
         if (type == TYPE_ERROR)
             return type;
@@ -327,7 +336,7 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
         push_rf_object(code, i64(0));
 
         // true branch
-        type = cc_compile_expr(cc, &as_list(object)[2]);
+        type = cc_compile_expr(has_consumer, cc, &as_list(object)[2]);
 
         if (type == TYPE_ERROR)
             return type;
@@ -341,7 +350,7 @@ i8_t cc_compile_special_forms(cc_t *cc, rf_object_t *object, u32_t arity)
             ((rf_object_t *)(as_string(code) + lbl1))->i64 = code->adt->len;
 
             // false branch
-            type1 = cc_compile_expr(cc, &as_list(object)[3]);
+            type1 = cc_compile_expr(has_consumer, cc, &as_list(object)[3]);
 
             if (type1 == TYPE_ERROR)
                 return type1;
@@ -416,7 +425,7 @@ i8_t cc_compile_call(cc_t *cc, rf_object_t *car, i32_t args, u32_t arity)
     return rec->ret;
 }
 
-i8_t cc_compile_expr(cc_t *cc, rf_object_t *object)
+i8_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
 {
     rf_object_t *car, err, *addr, *arg_keys, *arg_vals;
     i8_t type = TYPE_ANY, len = 0;
@@ -440,6 +449,9 @@ i8_t cc_compile_expr(cc_t *cc, rf_object_t *object)
         return -TYPE_F64;
 
     case -TYPE_SYMBOL:
+        if (!has_consumer)
+            return TYPE_ANY;
+
         // symbol is quoted
         if (object->flags == 1)
         {
@@ -525,7 +537,7 @@ i8_t cc_compile_expr(cc_t *cc, rf_object_t *object)
 
         arity = object->adt->len - 1;
 
-        type = cc_compile_special_forms(cc, object, arity);
+        type = cc_compile_special_forms(has_consumer, cc, object, arity);
 
         if (type == TYPE_ERROR)
             return type;
@@ -580,7 +592,7 @@ i8_t cc_compile_expr(cc_t *cc, rf_object_t *object)
             // compile arguments
             for (i = 1; i <= arity; i++)
             {
-                type = cc_compile_expr(cc, &as_list(object)[i]);
+                type = cc_compile_expr(true, cc, &as_list(object)[i]);
 
                 if (type == TYPE_ERROR)
                     return TYPE_ERROR;
@@ -615,7 +627,7 @@ i8_t cc_compile_expr(cc_t *cc, rf_object_t *object)
         // compile arguments
         for (i = 1; i <= arity; i++)
         {
-            type = cc_compile_expr(cc, &as_list(object)[i]);
+            type = cc_compile_expr(true, cc, &as_list(object)[i]);
 
             if (type == TYPE_ERROR)
                 return TYPE_ERROR;
@@ -626,6 +638,9 @@ i8_t cc_compile_expr(cc_t *cc, rf_object_t *object)
         }
 
         type = cc_compile_call(cc, car, args, arity);
+
+        if (!has_consumer)
+            push_opcode(cc, car->id, code, OP_POP);
 
         if (type != TYPE_ERROR)
             return type;
@@ -651,7 +666,6 @@ rf_object_t cc_compile_function(bool_t top, str_t name, i8_t rettype, rf_object_
 {
     cc_t cc = {
         .top_level = top,
-        .root = true,
         .debuginfo = debuginfo,
         .function = function(rettype, args, null(), string(0), debuginfo_new(debuginfo->filename, name)),
     };
@@ -669,7 +683,7 @@ rf_object_t cc_compile_function(bool_t top, str_t name, i8_t rettype, rf_object_
         return cc.function;
     }
 
-    // Compile all arguments but last one
+    // Compile all arguments but the last one
     for (i = 0; i < len - 1; i++)
     {
         b = body + i;
@@ -677,7 +691,7 @@ rf_object_t cc_compile_function(bool_t top, str_t name, i8_t rettype, rf_object_
         if (b->type != TYPE_LIST)
             continue;
 
-        type = cc_compile_expr(&cc, b);
+        type = cc_compile_expr(false, &cc, b);
 
         if (type == TYPE_ERROR)
         {
@@ -690,7 +704,7 @@ rf_object_t cc_compile_function(bool_t top, str_t name, i8_t rettype, rf_object_
 
     // Compile last argument
     b = body + i;
-    type = cc_compile_expr(&cc, b);
+    type = cc_compile_expr(true, &cc, b);
 
     if (type == TYPE_ERROR)
     {

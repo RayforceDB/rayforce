@@ -439,7 +439,7 @@ str_t vm_code_fmt(rf_object_t *fun)
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] halt\n", c++, ip++);
             break;
         case OP_RET:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] ret %d %d\n", c++, ip, code[ip + 1], code[ip + 2]);
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] ret [%d:%d]\n", c++, ip, code[ip + 1], code[ip + 2]);
             ip += 3;
             break;
         case OP_PUSH:
