@@ -601,12 +601,11 @@ rf_object_t cc_compile_function(bool_t top, str_t name, i8_t rettype, rf_object_
     if (func->rettype != TYPE_ANY && func->rettype != type)
     {
         rf_object_free(&cc.function);
-        rf_object_free(code);
         err = error(ERR_TYPE, str_fmt(0, "function return type mismatch: specified %s, inferred %s",
                                       symbols_get(env_get_typename_by_type(env, func->rettype)),
                                       symbols_get(env_get_typename_by_type(env, type))));
-        err.id = id;
-        *code = err;
+        cc.function = err;
+        cc.function.adt->span = debuginfo_get(cc.debuginfo, b->id);
         return err;
     }
 
