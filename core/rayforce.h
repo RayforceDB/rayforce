@@ -24,10 +24,11 @@
 #ifndef RAYFORCE_H
 #define RAYFORCE_H
 
-// #ifdef __cplusplus
-// extern "C"
-// {
-// #endif
+// clang-format off
+#ifdef __cplusplus
+extern "C"
+{
+#endif
 
 // A compile time assertion check
 #define CASSERT(predicate, file) _IMPL_CASSERT_LINE(predicate, __LINE__, file)
@@ -139,26 +140,26 @@ typedef struct rf_object_t
 CASSERT(sizeof(struct rf_object_t) == 16, rayforce_h)
 
 // Constructors
-extern rf_object_t bool(bool_t val);                               // bool scalar
-extern rf_object_t i64(i64_t val);                                 // i64 scalar
-extern rf_object_t f64(f64_t val);                                 // f64 scalar
-extern rf_object_t symbol(str_t ptr);                              // symbol
-extern rf_object_t vector(i8_t type, i8_t size_of_val, i64_t len); // vector of type
-extern rf_object_t string(i64_t len);                              // string (allocates len + 1 for \0 but sets len to a 'len')
+extern rf_object_t bool(bool_t val);                                 // bool scalar
+extern rf_object_t i64(i64_t val);                                   // i64 scalar
+extern rf_object_t f64(f64_t val);                                   // f64 scalar
+extern rf_object_t symbol(str_t ptr);                                // symbol
+extern rf_object_t vector(i8_t type, i8_t size_of_val, i64_t len);   // vector of type
+extern rf_object_t string(i64_t len);                                // string 
 
 #define vector_i64(len) (vector(TYPE_I64, sizeof(i64_t), len))       // i64 vector
 #define vector_f64(len) (vector(TYPE_F64, sizeof(f64_t), len))       // f64 vector
 #define vector_symbol(len) (vector(TYPE_SYMBOL, sizeof(i64_t), len)) // symbol vector
 #define list(len) (vector(TYPE_LIST, sizeof(rf_object_t), len))      // list
 
-extern rf_object_t null();                                    // null (as null list)
-extern rf_object_t table(rf_object_t keys, rf_object_t vals); // table
-extern rf_object_t dict(rf_object_t keys, rf_object_t vals);  // dict
+extern rf_object_t null();                                           // null (as null list)
+extern rf_object_t table(rf_object_t keys, rf_object_t vals);        // table
+extern rf_object_t dict(rf_object_t keys, rf_object_t vals);         // dict
 
 // Reference counting
-extern rf_object_t rf_object_clone(rf_object_t *rf_object); // clone
-extern rf_object_t rf_object_cow(rf_object_t *rf_object);   // clone if refcount > 1
-extern i64_t rf_object_rc(rf_object_t *rf_object);          // get refcount
+extern rf_object_t rf_object_clone(rf_object_t *rf_object);          // clone
+extern rf_object_t rf_object_cow(rf_object_t *rf_object);            // clone if refcount > 1
+extern i64_t rf_object_rc(rf_object_t *rf_object);                   // get refcount
 
 // Error
 extern rf_object_t error(i8_t code, str_t message);
@@ -185,8 +186,8 @@ extern rf_object_t vector_pop(rf_object_t *vector);
 // Compare
 extern i8_t rf_object_eq(rf_object_t *a, rf_object_t *b);
 
-// #ifdef __cplusplus
-// }
-// #endif
+#ifdef __cplusplus
+}
+#endif
 
 #endif

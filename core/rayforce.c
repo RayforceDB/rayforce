@@ -161,6 +161,9 @@ i8_t rf_object_eq(rf_object_t *a, rf_object_t *b)
     return 0;
 }
 
+/*
+ * Increment the reference count of an rf_object_t
+ */
 rf_object_t rf_object_clone(rf_object_t *object)
 {
     if (object->type < 0)
@@ -179,6 +182,9 @@ rf_object_t rf_object_clone(rf_object_t *object)
     return *object;
 }
 
+/*
+ * Free an rf_object_t
+ */
 null_t rf_object_free(rf_object_t *object)
 {
     if (object->type < 0)
@@ -205,6 +211,9 @@ null_t rf_object_free(rf_object_t *object)
         rf_free(object->adt);
 }
 
+/*
+ * Copy on write rf_object_t
+ */
 rf_object_t rf_object_cow(rf_object_t *object)
 {
     rf_object_t new;
@@ -223,25 +232,35 @@ rf_object_t rf_object_cow(rf_object_t *object)
     if (object->adt->rc == 1)
         return *object;
 
-    if (object->type == TYPE_LIST)
+    switch (object->type)
     {
+    case TYPE_LIST:
         new = list(object->adt->len);
         for (i64_t i = 0; i < object->adt->len; i++)
             as_list(&new)[i] = rf_object_cow(&as_list(object)[i]);
-
-        return new;
-    }
-
-    if (object->type == TYPE_I64)
-    {
+        break;
+    case TYPE_I64:
         new = vector_i64(object->adt->len);
         memcpy(as_vector_i64(&new), as_vector_i64(object), object->adt->len * sizeof(i64_t));
-        return new;
+        break;
+    case TYPE_F64:
+        new = vector_i64(object->adt->len);
+        memcpy(as_vector_f64(&new), as_vector_f64(object), object->adt->len * sizeof(f64_t));
+        break;
+    case TYPE_SYMBOL:
+        new = vector_symbol(object->adt->len);
+        memcpy(as_vector_symbol(&new), as_vector_symbol(object), object->adt->len * sizeof(i64_t));
+        break;
+    default:
+        panic("cow: invalid type");
     }
 
-    return *object;
+    return new;
 }
 
+/*
+ * Get the reference count of an rf_object_t
+ */
 i64_t rf_object_rc(rf_object_t *object)
 {
     if (object->type < 0)
