@@ -36,40 +36,40 @@
 /*
  * Increment reference counter of the object
  */
-#define rc_inc(object)                                                 \
-    {                                                                  \
-        u16_t slaves = runtime_get()->slaves;                          \
-        if (slaves)                                                    \
-            __atomic_fetch_add(&object->adt->rc, 1, __ATOMIC_RELAXED); \
-        else                                                           \
-            object->adt->rc += 1;                                      \
+#define rc_inc(object)                                                     \
+    {                                                                      \
+        u16_t slaves = runtime_get()->slaves;                              \
+        if (slaves)                                                        \
+            __atomic_fetch_add(&((object)->adt->rc), 1, __ATOMIC_RELAXED); \
+        else                                                               \
+            (object)->adt->rc += 1;                                        \
     }
 
 /*
  * Decrement reference counter of the object
  */
-#define rc_dec(rc, object)                                                  \
-    {                                                                       \
-        u16_t slaves = runtime_get()->slaves;                               \
-        if (slaves)                                                         \
-            rc = __atomic_sub_fetch(&object->adt->rc, 1, __ATOMIC_RELAXED); \
-        else                                                                \
-        {                                                                   \
-            object->adt->rc -= 1;                                           \
-            rc = object->adt->rc;                                           \
-        }                                                                   \
+#define rc_dec(rc, object)                                                      \
+    {                                                                           \
+        u16_t slaves = runtime_get()->slaves;                                   \
+        if (slaves)                                                             \
+            rc = __atomic_sub_fetch(&((object)->adt->rc), 1, __ATOMIC_RELAXED); \
+        else                                                                    \
+        {                                                                       \
+            (object)->adt->rc -= 1;                                             \
+            rc = (object)->adt->rc;                                             \
+        }                                                                       \
     }
 
 /*
  * Get reference counter of the object
  */
-#define rc_get(rc, object)                                            \
-    {                                                                 \
-        u16_t slaves = runtime_get()->slaves;                         \
-        if (slaves)                                                   \
-            rc = __atomic_load_n(&object->adt->rc, __ATOMIC_RELAXED); \
-        else                                                          \
-            rc = object->adt->rc;                                     \
+#define rc_get(rc, object)                                                \
+    {                                                                     \
+        u16_t slaves = runtime_get()->slaves;                             \
+        if (slaves)                                                       \
+            rc = __atomic_load_n(&((object)->adt->rc), __ATOMIC_RELAXED); \
+        else                                                              \
+            rc = (object)->adt->rc;                                       \
     }
 
 rf_object_t error(i8_t code, str_t message)
@@ -206,19 +206,49 @@ i8_t rf_object_eq(rf_object_t *a, rf_object_t *b)
  */
 rf_object_t rf_object_clone(rf_object_t *object)
 {
-    if (object->type < 0)
+    i64_t i;
+
+    if (object->type < TYPE_ANY)
         return *object;
 
     if (object->adt == NULL)
         return *object;
 
-    if (object->type == TYPE_ERROR)
-    {
-        return *object;
-    }
-
     rc_inc(object);
 
+    static null_t *types_table[] = {
+        &&type_any, &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_string,
+        &&type_list, &&type_dict, &&type_table, &&type_function, &&type_error};
+
+    goto *types_table[(i32_t)object->type];
+
+type_any:
+    return *object;
+type_bool:
+    return *object;
+type_i64:
+    return *object;
+type_f64:
+    return *object;
+type_symbol:
+    return *object;
+type_string:
+    return *object;
+type_list:
+    for (i = 0; i < object->adt->len; i++)
+        rc_inc(&as_list(object)[i]);
+    return *object;
+type_dict:
+    rf_object_clone(&as_list(object)[0]);
+    rf_object_clone(&as_list(object)[1]);
+    return *object;
+type_table:
+    rf_object_clone(&as_list(object)[0]);
+    rf_object_clone(&as_list(object)[1]);
+    return *object;
+type_function:
+    return *object;
+type_error:
     return *object;
 }
 
@@ -227,29 +257,62 @@ rf_object_t rf_object_clone(rf_object_t *object)
  */
 null_t rf_object_free(rf_object_t *object)
 {
+    i64_t i, rc;
+
     if (object->type < 0)
         return;
 
     if (object->adt == NULL)
         return;
 
-    if (object->type == TYPE_ERROR)
-    {
-        rf_free(object->adt);
-        return;
-    }
-
-    i64_t rc;
     rc_dec(rc, object);
 
-    if (object->type == TYPE_LIST)
-    {
-        for (i64_t i = 0; i < object->adt->len; i++)
-            rf_object_free(&as_list(object)[i]);
-    }
+    if (rc > 0)
+        return;
 
-    if (rc == 0)
-        rf_free(object->adt);
+    static null_t *types_table[] = {
+        &&type_any, &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_string,
+        &&type_list, &&type_dict, &&type_table, &&type_function, &&type_error};
+
+    goto *types_table[(i32_t)object->type];
+
+type_any:
+    return;
+type_bool:
+    return;
+type_i64:
+    return;
+type_f64:
+    return;
+type_symbol:
+    return;
+type_string:
+    rf_free(object->adt);
+    return;
+type_list:
+    for (i = 0; i < object->adt->len; i++)
+        rf_object_free(&as_list(object)[i]);
+    rf_free(object->adt);
+    return;
+type_dict:
+    rf_object_free(&as_list(object)[0]);
+    rf_object_free(&as_list(object)[1]);
+    rf_free(object->adt);
+    return;
+type_table:
+    rf_object_free(&as_list(object)[0]);
+    rf_object_free(&as_list(object)[1]);
+    rf_free(object->adt);
+    return;
+type_function:
+    rf_object_free(&as_function(object)->args);
+    rf_object_free(&as_function(object)->locals);
+    rf_object_free(&as_function(object)->code);
+    debuginfo_free(&as_function(object)->debuginfo);
+    rf_free(object->adt);
+    return;
+type_error:
+    return;
 }
 
 /*
@@ -257,6 +320,7 @@ null_t rf_object_free(rf_object_t *object)
  */
 rf_object_t rf_object_cow(rf_object_t *object)
 {
+    i64_t i;
     rf_object_t new;
 
     if (object->type < 0)
@@ -265,38 +329,52 @@ rf_object_t rf_object_cow(rf_object_t *object)
     if (object->adt == NULL)
         return *object;
 
-    if (object->type == TYPE_ERROR)
-    {
-        return *object;
-    }
-
     if (rf_object_rc(object) == 1)
         return *object;
 
-    switch (object->type)
-    {
-    case TYPE_LIST:
-        new = list(object->adt->len);
-        for (i64_t i = 0; i < object->adt->len; i++)
-            as_list(&new)[i] = rf_object_cow(&as_list(object)[i]);
-        break;
-    case TYPE_I64:
-        new = vector_i64(object->adt->len);
-        memcpy(as_vector_i64(&new), as_vector_i64(object), object->adt->len * sizeof(i64_t));
-        break;
-    case TYPE_F64:
-        new = vector_i64(object->adt->len);
-        memcpy(as_vector_f64(&new), as_vector_f64(object), object->adt->len * sizeof(f64_t));
-        break;
-    case TYPE_SYMBOL:
-        new = vector_symbol(object->adt->len);
-        memcpy(as_vector_symbol(&new), as_vector_symbol(object), object->adt->len * sizeof(i64_t));
-        break;
-    default:
-        panic("cow: invalid type");
-    }
+    static null_t *types_table[] = {
+        &&type_any, &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_string,
+        &&type_list, &&type_dict, &&type_table, &&type_function, &&type_error};
 
+    goto *types_table[(i32_t)object->type];
+
+type_any:
+    return *object;
+type_bool:
+    new = vector_bool(object->adt->len);
+    memcpy(as_vector_bool(&new), as_vector_bool(object), object->adt->len);
     return new;
+type_i64:
+    new = vector_i64(object->adt->len);
+    memcpy(as_vector_i64(&new), as_vector_i64(object), object->adt->len * sizeof(i64_t));
+    return new;
+type_f64:
+    new = vector_i64(object->adt->len);
+    memcpy(as_vector_f64(&new), as_vector_f64(object), object->adt->len * sizeof(f64_t));
+    return new;
+type_symbol:
+    new = vector_symbol(object->adt->len);
+    memcpy(as_vector_symbol(&new), as_vector_symbol(object), object->adt->len * sizeof(i64_t));
+    return new;
+type_string:
+    new = string(object->adt->len);
+    memcpy(as_string(&new), as_string(object), object->adt->len);
+    return new;
+type_list:
+    new = list(object->adt->len);
+    for (i = 0; i < object->adt->len; i++)
+        as_list(&new)[i] = rf_object_cow(&as_list(object)[i]);
+    return new;
+type_dict:
+    new = dict(rf_object_cow(&as_list(object)[0]), rf_object_cow(&as_list(object)[1]));
+    return new;
+type_table:
+    new = table(rf_object_cow(&as_list(object)[0]), rf_object_cow(&as_list(object)[1]));
+    return new;
+type_function:
+    return *object;
+type_error:
+    return *object;
 }
 
 /*
@@ -304,16 +382,14 @@ rf_object_t rf_object_cow(rf_object_t *object)
  */
 i64_t rf_object_rc(rf_object_t *object)
 {
+    i64_t rc;
+
     if (object->type < 0)
         return 1;
 
     if (object->adt == NULL)
         return 1;
 
-    if (object->type == TYPE_ERROR)
-        return 1;
-
-    i64_t rc;
     rc_get(rc, object);
 
     return rc;

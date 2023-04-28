@@ -45,11 +45,11 @@ extern "C"
 #define TYPE_F64 3
 #define TYPE_SYMBOL 4
 #define TYPE_STRING 5
-#define TYPE_LIST 97
-#define TYPE_DICT 98
-#define TYPE_TABLE 99
-#define TYPE_FUNCTION 100
-#define TYPE_ERROR 127
+#define TYPE_LIST 6
+#define TYPE_DICT 7
+#define TYPE_TABLE 8
+#define TYPE_FUNCTION 9
+#define TYPE_ERROR 10
 
 // Result constants
 #define OK 0
@@ -147,6 +147,7 @@ extern rf_object_t symbol(str_t ptr);                                // symbol
 extern rf_object_t vector(i8_t type, i8_t size_of_val, i64_t len);   // vector of type
 extern rf_object_t string(i64_t len);                                // string 
 
+#define vector_bool(len) (vector(TYPE_BOOL, sizeof(bool_t), len))    // bool vector
 #define vector_i64(len) (vector(TYPE_I64, sizeof(i64_t), len))       // i64 vector
 #define vector_f64(len) (vector(TYPE_F64, sizeof(f64_t), len))       // f64 vector
 #define vector_symbol(len) (vector(TYPE_SYMBOL, sizeof(i64_t), len)) // symbol vector
@@ -169,6 +170,7 @@ extern null_t rf_object_free(rf_object_t *rf_object);
 
 // Accessors
 #define as_string(rf_object) ((str_t)((rf_object)->adt + 1))
+#define as_vector_bool(rf_object) ((bool_t *)(as_string(rf_object)))
 #define as_vector_i64(rf_object) ((i64_t *)(as_string(rf_object)))
 #define as_vector_f64(rf_object) ((f64_t *)(as_string(rf_object)))
 #define as_vector_symbol(rf_object) ((i64_t *)(as_string(rf_object)))
