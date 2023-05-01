@@ -36,28 +36,34 @@
 /*
  * Increment reference counter of the object
  */
-#define rc_inc(object)                                                     \
-    {                                                                      \
-        u16_t slaves = runtime_get()->slaves;                              \
-        if (slaves)                                                        \
-            __atomic_fetch_add(&((object)->adt->rc), 1, __ATOMIC_RELAXED); \
-        else                                                               \
-            (object)->adt->rc += 1;                                        \
+#define rc_inc(object)                                                         \
+    {                                                                          \
+        if ((object)->type > 0)                                                \
+        {                                                                      \
+            u16_t slaves = runtime_get()->slaves;                              \
+            if (slaves)                                                        \
+                __atomic_fetch_add(&((object)->adt->rc), 1, __ATOMIC_RELAXED); \
+            else                                                               \
+                (object)->adt->rc += 1;                                        \
+        }                                                                      \
     }
 
 /*
  * Decrement reference counter of the object
  */
-#define rc_dec(r, object)                                                      \
-    {                                                                          \
-        u16_t slaves = runtime_get()->slaves;                                  \
-        if (slaves)                                                            \
-            r = __atomic_sub_fetch(&((object)->adt->rc), 1, __ATOMIC_RELAXED); \
-        else                                                                   \
-        {                                                                      \
-            (object)->adt->rc -= 1;                                            \
-            r = (object)->adt->rc;                                             \
-        }                                                                      \
+#define rc_dec(r, object)                                                          \
+    {                                                                              \
+        if ((object)->type > 0)                                                    \
+        {                                                                          \
+            u16_t slaves = runtime_get()->slaves;                                  \
+            if (slaves)                                                            \
+                r = __atomic_sub_fetch(&((object)->adt->rc), 1, __ATOMIC_RELAXED); \
+            else                                                                   \
+            {                                                                      \
+                (object)->adt->rc -= 1;                                            \
+                r = (object)->adt->rc;                                             \
+            }                                                                      \
+        }                                                                          \
     }
 
 /*

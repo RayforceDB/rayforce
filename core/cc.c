@@ -367,7 +367,7 @@ i8_t cc_compile_call(cc_t *cc, rf_object_t *car, i32_t args, u32_t arity)
 
 i8_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
 {
-    rf_object_t *car, *addr, *arg_keys, *arg_vals;
+    rf_object_t *car, *addr, *arg_keys, *arg_vals, lst;
     i8_t type = TYPE_ANY, len = 0;
     u32_t i, arity;
     i32_t args = 0;
@@ -453,10 +453,11 @@ i8_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
     case TYPE_LIST:
         if (object->adt->len == 0 || object->flags == 1)
         {
-            object->flags = 0;
+            lst = rf_object_clone(object);
+            lst.flags = 0;
             push_opcode(cc, object->id, code, OP_PUSH);
             vector_i64_push(&func->const_addrs, code->adt->len);
-            push_rf_object(code, rf_object_clone(object));
+            push_rf_object(code, lst);
             return TYPE_LIST;
         }
 
