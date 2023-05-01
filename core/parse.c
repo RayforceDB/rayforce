@@ -225,21 +225,27 @@ rf_object_t parse_string(parser_t *parser)
 
 rf_object_t parse_symbol(parser_t *parser, i8_t quote)
 {
-    if (strncmp(parser->current, "true", 4) == 0)
-    {
-        shift(parser, 4);
-        return bool(true);
-    }
-    else if (strncmp(parser->current, "false", 5) == 0)
-    {
-        shift(parser, 5);
-        return bool(false);
-    }
-
     str_t pos = parser->current;
     rf_object_t res;
     span_t span = span_start(parser);
     i64_t id;
+
+    if (strncmp(parser->current, "true", 4) == 0)
+    {
+        shift(parser, 4);
+        span_extend(parser, &span);
+        res = bool(true);
+        res.id = span_commit(parser, span);
+        return res;
+    }
+    else if (strncmp(parser->current, "false", 5) == 0)
+    {
+        shift(parser, 5);
+        span_extend(parser, &span);
+        res = bool(false);
+        res.id = span_commit(parser, span);
+        return res;
+    }
 
     // Skip first char and proceed until the end of the symbol
     do
@@ -283,7 +289,20 @@ rf_object_t parse_vector(parser_t *parser)
             return err;
         }
 
-        if (token.type == -TYPE_I64)
+        if (token.type == -TYPE_BOOL)
+        {
+            if (vec.adt->len > 0 && vec.type != TYPE_BOOL)
+            {
+                rf_object_free(&vec);
+                err = error(ERR_PARSE, "Invalid token in vector");
+                err.id = token.id;
+                return err;
+            }
+
+            vec.type = TYPE_BOOL;
+            vector_bool_push(&vec, token.bool);
+        }
+        else if (token.type == -TYPE_I64)
         {
             if (vec.type == TYPE_I64)
                 vector_i64_push(&vec, token.i64);
@@ -303,7 +322,6 @@ rf_object_t parse_vector(parser_t *parser)
                 vector_f64_push(&vec, token.f64);
             else if (vec.type == TYPE_I64)
             {
-
                 for (i = 0; i < vec.adt->len; i++)
                     as_vector_f64(&vec)[i] = (f64_t)as_vector_i64(&vec)[i];
 

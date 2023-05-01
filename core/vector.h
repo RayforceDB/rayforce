@@ -101,17 +101,18 @@
         }                                       \
     }
 
-extern rf_object_t list_flatten(rf_object_t rf_object);
+extern rf_object_t list_flatten(rf_object_t object);
 extern i64_t vector_i64_find(rf_object_t *vector, i64_t key);
 extern i64_t vector_f64_find(rf_object_t *vector, f64_t key);
 extern i64_t list_find(rf_object_t *vector, rf_object_t key);
 extern i64_t vector_find(rf_object_t *vector, rf_object_t key);
 extern rf_object_t vector_get(rf_object_t *vector, rf_object_t key);
-extern i64_t vector_push(rf_object_t *vector, rf_object_t rf_object);
-extern i64_t vector_i64_push(rf_object_t *vector, i64_t rf_object);
-extern i64_t vector_f64_push(rf_object_t *vector, f64_t rf_object);
-extern i64_t vector_symbol_push(rf_object_t *vector, rf_object_t rf_object);
-extern i64_t list_push(rf_object_t *vector, rf_object_t rf_object);
+extern i64_t vector_push(rf_object_t *vector, rf_object_t object);
+extern i64_t vector_bool_push(rf_object_t *vector, bool_t value);
+extern i64_t vector_i64_push(rf_object_t *vector, i64_t value);
+extern i64_t vector_f64_push(rf_object_t *vector, f64_t value);
+extern i64_t vector_symbol_push(rf_object_t *vector, rf_object_t object);
+extern i64_t list_push(rf_object_t *vector, rf_object_t object);
 extern i64_t vector_i64_pop(rf_object_t *vector);
 extern f64_t vector_f64_pop(rf_object_t *vector);
 extern rf_object_t list_pop(rf_object_t *vector);

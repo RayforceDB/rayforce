@@ -54,6 +54,8 @@ static inline __attribute__((always_inline)) rf_object_t rf_cast(i8_t type, rf_o
 
     rf_object_t x, err;
     i16_t mask = m(type, y->type);
+    i32_t i;
+    str_t msg;
 
     switch (mask)
     {
@@ -82,11 +84,46 @@ static inline __attribute__((always_inline)) rf_object_t rf_cast(i8_t type, rf_o
         x = rf_object_clone(y);
         x.type = type;
         break;
+    case m(TYPE_I64, TYPE_LIST):
+        x = vector_i64(y->adt->len);
+        for (i = 0; i < y->adt->len; i++)
+        {
+            if (as_list(y)[i].type != -TYPE_I64)
+            {
+                rf_object_free(&x);
+                msg = str_fmt(0, "invalid conversion from '%s' to 'i64'",
+                              symbols_get(env_get_typename_by_type(&runtime_get()->env, as_list(y)[i].type)));
+                err = error(ERR_TYPE, msg);
+                rf_free(msg);
+                return err;
+            }
+
+            as_vector_i64(&x)[i] = as_list(y)[i].i64;
+        }
+        break;
+    case m(TYPE_F64, TYPE_LIST):
+        x = vector_f64(y->adt->len);
+        for (i = 0; i < y->adt->len; i++)
+        {
+            if (as_list(y)[i].type != -TYPE_F64)
+            {
+                rf_object_free(&x);
+                msg = str_fmt(0, "invalid conversion from '%s' to 'f64'",
+                              symbols_get(env_get_typename_by_type(&runtime_get()->env, as_list(y)[i].type)));
+                err = error(ERR_TYPE, msg);
+                rf_free(msg);
+                return err;
+            }
+
+            as_vector_f64(&x)[i] = as_list(y)[i].f64;
+        }
+        break;
     default:
-        err = error(ERR_TYPE, str_fmt(0, "invalid conversion from '%s' to '%s'",
-                                      symbols_get(env_get_typename_by_type(&runtime_get()->env, y->type)),
-                                      symbols_get(env_get_typename_by_type(&runtime_get()->env, type))));
-        err.id = y->id;
+        msg = str_fmt(0, "invalid conversion from '%s' to '%s'",
+                      symbols_get(env_get_typename_by_type(&runtime_get()->env, y->type)),
+                      symbols_get(env_get_typename_by_type(&runtime_get()->env, type)));
+        err = error(ERR_TYPE, msg);
+        rf_free(msg);
         return err;
     }
 

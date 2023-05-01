@@ -207,7 +207,9 @@ i32_t vector_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t
 
     for (i = 0; i < rf_object->adt->len; i++)
     {
-        if (rf_object->type == TYPE_I64)
+        if (rf_object->type == TYPE_BOOL)
+            n += bool_fmt_into(dst, len, offset, 0, limit, as_vector_bool(rf_object)[i]);
+        else if (rf_object->type == TYPE_I64)
             n += i64_fmt_into(dst, len, offset, 0, limit, as_vector_i64(rf_object)[i]);
         else if (rf_object->type == TYPE_F64)
             n += f64_fmt_into(dst, len, offset, 0, limit, as_vector_f64(rf_object)[i]);
@@ -450,36 +452,38 @@ i32_t function_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32
     return str_fmt_into(dst, len, offset, 0, "<function>");
 }
 
-i32_t rf_object_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object)
+i32_t rf_object_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *object)
 {
-    switch (rf_object->type)
+    switch (object->type)
     {
     case -TYPE_BOOL:
-        return bool_fmt_into(dst, len, offset, indent, limit, rf_object->bool);
+        return bool_fmt_into(dst, len, offset, indent, limit, object->bool);
     case -TYPE_I64:
-        return i64_fmt_into(dst, len, offset, indent, limit, rf_object->i64);
+        return i64_fmt_into(dst, len, offset, indent, limit, object->i64);
     case -TYPE_F64:
-        return f64_fmt_into(dst, len, offset, indent, limit, rf_object->f64);
+        return f64_fmt_into(dst, len, offset, indent, limit, object->f64);
     case -TYPE_SYMBOL:
-        return symbol_fmt_into(dst, len, offset, indent, limit, rf_object->i64);
+        return symbol_fmt_into(dst, len, offset, indent, limit, object->i64);
+    case TYPE_BOOL:
+        return vector_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_I64:
-        return vector_fmt_into(dst, len, offset, indent, limit, rf_object);
+        return vector_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_F64:
-        return vector_fmt_into(dst, len, offset, indent, limit, rf_object);
+        return vector_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_SYMBOL:
-        return vector_fmt_into(dst, len, offset, indent, limit, rf_object);
+        return vector_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_STRING:
-        return string_fmt_into(dst, len, offset, indent, limit, rf_object);
+        return string_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_LIST:
-        return list_fmt_into(dst, len, offset, indent, limit, rf_object);
+        return list_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_DICT:
-        return dict_fmt_into(dst, len, offset, indent, limit, rf_object);
+        return dict_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_TABLE:
-        return table_fmt_into(dst, len, offset, indent, limit, rf_object);
+        return table_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_FUNCTION:
-        return function_fmt_into(dst, len, offset, indent, limit, rf_object);
+        return function_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_ERROR:
-        return error_fmt_into(dst, len, offset, indent, limit, rf_object);
+        return error_fmt_into(dst, len, offset, indent, limit, object);
     default:
         return str_fmt_into(dst, len, offset, limit, "null");
     }
