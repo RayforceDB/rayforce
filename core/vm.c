@@ -46,17 +46,6 @@
         rf_object_t o = stack_pop(v); \
         rf_object_free(&o);           \
     }
-#define stack_unwind(v)          \
-    {                            \
-        debug("--stack");        \
-        while (v->sp > 0)        \
-        {                        \
-            x1 = stack_pop(v);   \
-            debug_object(&x1);   \
-            rf_object_free(&x1); \
-        }                        \
-        debug("--");             \
-    }
 
 typedef struct ctx_t
 {
@@ -115,11 +104,32 @@ rf_object_t vm_exec(vm_t *vm, rf_object_t *fun)
 
 #define dispatch() goto *dispatch_table[(i32_t)code[vm->ip]]
 
-#define unwrap(x, y)                               \
-    if (x.type == TYPE_ERROR)                      \
-    {                                              \
-        x.adt->span = debuginfo_get(debuginfo, y); \
-        return x;                                  \
+#define unwrap(x, y)                                                      \
+    {                                                                     \
+        rf_object_t o = x;                                                \
+        if (o.type == TYPE_ERROR)                                         \
+        {                                                                 \
+            o.adt->span = debuginfo_get(debuginfo, y);                    \
+            l = 6;                                                        \
+            while (vm->sp)                                                \
+            {                                                             \
+                x1 = stack_pop(vm);                                       \
+                if (vm->bp > 0 && vm->sp == vm->bp)                       \
+                {                                                         \
+                    memcpy(&ctx, &x1, sizeof(ctx_t));                     \
+                    vm->bp = ctx.bp;                                      \
+                    if (l > 0)                                            \
+                    {                                                     \
+                        printf("at: %s\n", ctx.addr->debuginfo.function); \
+                        l--;                                              \
+                    }                                                     \
+                    continue;                                             \
+                }                                                         \
+                                                                          \
+                rf_object_free(&x1);                                      \
+            }                                                             \
+            return o;                                                     \
+        }                                                                 \
     }
 
     dispatch();
@@ -393,14 +403,7 @@ op_callf:
     ctx = (ctx_t){.addr = f, .ip = vm->ip, .bp = vm->bp};
     memcpy(&x1, &ctx, sizeof(ctx_t));
     if ((vm->sp + ctx.addr->stack_size) * sizeof(rf_object_t) > VM_STACK_SIZE)
-    {
-        while (vm->sp)
-            stack_pop_free(vm);
-
-        x1 = error(ERR_STACK_OVERFLOW, "stack overflow");
-        x1.adt->span = debuginfo_get(debuginfo, b);
-        return x1;
-    }
+        unwrap(error(ERR_STACK_OVERFLOW, "stack overflow"), b);
     f = as_function(&x2);
     code = as_string(&f->code);
     vm->ip = 0;
