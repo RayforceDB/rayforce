@@ -34,6 +34,8 @@
 #define TYPE_CTX (TYPE_ERROR + 2)
 // trap type
 #define TYPE_TRAP (TYPE_ERROR + 3)
+// trow type
+#define TYPE_THROW (TYPE_ERROR + 4)
 // --
 
 #define ADDI64(x, y) (((x | y) & NULL_I64) ? NULL_I64 : (x + y))

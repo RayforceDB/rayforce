@@ -68,6 +68,8 @@ typedef enum vm_opcode_t
     OP_LLOAD,     // Load local variable
     OP_GLOAD,     // Load global variable
     OP_CAST,      // Cast rf_object to another type
+    OP_TRAP,      // Trap an expression to return here on error
+    OP_THROW,     // Throw an error
 
     OP_INVALID, // Invalid opcode
 } vm_opcode_t;

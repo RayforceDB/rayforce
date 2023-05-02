@@ -110,6 +110,9 @@ null_t print_error(rf_object_t *error, str_t filename, str_t source, u32_t len)
     case ERR_STACK_OVERFLOW:
         error_desc = "stack";
         break;
+    case ERR_THROW:
+        error_desc = "throw";
+        break;
     default:
         error_desc = "unknown";
     }

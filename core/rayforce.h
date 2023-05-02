@@ -64,6 +64,7 @@ extern "C"
 #define ERR_NOT_FOUND 9
 #define ERR_NOT_IMPLEMENTED 10
 #define ERR_STACK_OVERFLOW 11
+#define ERR_THROW 12
 #define ERR_UNKNOWN 127
 
 #define NULL_I64 ((i64_t)1 << 63)
