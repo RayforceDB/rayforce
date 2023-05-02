@@ -438,13 +438,13 @@ op_lload:
     t = ((rf_object_t *)(code + vm->ip))->i64;
     vm->ip += sizeof(rf_object_t);
     x1 = vm->stack[vm->bp + t];
-    stack_push(vm, x1);
+    stack_push(vm, rf_object_clone(&x1));
     dispatch();
 op_gload:
     b = vm->ip++;
     addr = (rf_object_t *)((rf_object_t *)(code + vm->ip))->i64;
     vm->ip += sizeof(rf_object_t);
-    stack_push(vm, *addr);
+    stack_push(vm, rf_object_clone(addr));
     dispatch();
 op_cast:
     b = vm->ip++;
