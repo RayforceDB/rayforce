@@ -28,17 +28,18 @@
 #include "symbols.h"
 
 #define MIN_ORDER 4
-#define MAX_ORDER 10
+#define MAX_ORDER 26 // 64MB
 #define MIN_ALLOC ((i64_t)1 << MIN_ORDER)
 #define MAX_ALLOC ((i64_t)1 << MAX_ORDER)
-#define POOL_SIZE (1024 * 1024)
+#define POOL_SIZE (1 << MAX_ORDER)
 
 typedef struct node_t
 {
-    null_t *block;
+    i64_t size;
     struct node_t *next;
 } node_t;
 
+CASSERT(sizeof(struct node_t) == 16, alloc_h)
 typedef struct alloc_t
 {
     node_t *freelist[MAX_ORDER + 2];

@@ -61,45 +61,60 @@ null_t rf_alloc_cleanup()
     munmap(_ALLOC, sizeof(struct alloc_t));
 }
 
+null_t debug_blocks()
+{
+    i32_t i = 0;
+    node_t *node;
+    for (; i <= MAX_ORDER; i++)
+    {
+        node = _ALLOC->freelist[i];
+        printf("-- order: %d [", i);
+        while (node)
+        {
+            printf("%p, ", node);
+            node = node->next;
+        }
+        printf("]\n");
+    }
+}
+
 null_t *rf_malloc(i32_t size)
 {
-    return malloc(size);
-    // i32_t i = 0, order;
-    // null_t *block, *buddy;
+    i32_t i = 0, order;
+    null_t *block, *buddy;
+    node_t *node;
 
-    // // calculate minimal order for this size
-    // order = 32 - __builtin_clz(size);
-    // i = order;
+    // calculate minimal order for this size
+    size += sizeof(node_t);
+    order = 32 - __builtin_clz(size - 1);
+    i = order;
 
-    // // level up until non-null list found
-    // for (;; i++)
-    // {
-    //     debug("I: %d", i);
-    //     if (i > MAX_ORDER)
-    //         return NULL;
-    //     if (_ALLOC->freelist[i])
-    //         break;
-    // }
+    // debug("malloc: size: %d, order: %d", size, order);
+    // debug_blocks();
 
-    // // remove the block out of list
-    // node_t node = _ALLOC->freelist[i];
-    // block = node.block;
-    // _ALLOC->freelist[i] = _ALLOC->freelist[i]->next;
+    // level up until non-null list found
+    for (;; i++)
+    {
+        if (i > MAX_ORDER)
+            return NULL;
+        if (_ALLOC->freelist[i])
+            break;
+    }
 
-    // // split until i == order
-    // while (i-- > order)
-    // {
-    //     buddy = buddyof(block, i);
-    //     _ALLOC->freelist[i] = buddy;
-    // }
+    // remove the block out of list
+    block = _ALLOC->freelist[i];
+    _ALLOC->freelist[i] = ((node_t *)block)->next;
 
-    // // store order in previous byte
-    // // *((i8_t *)(block - 1)) = order;
-    // // debug("SIZE: %d ORDER: %d CTZ: %d REM: %d", size, order, __builtin_clz(size), (u8_t *)block - _ALLOC->pool);
+    // split until i == order
+    while (i-- > order)
+    {
+        buddy = buddyof(block, i); // get the buddy block
+        ((node_t *)buddy)->next = _ALLOC->freelist[i];
+        _ALLOC->freelist[i] = block;
+        block = buddy;
+    }
 
-    // // debug("BLOCK: %p, ORDER: %d", block, order);
-
-    // return block;
+    return (null_t *)(((node_t *)block) + 1);
 }
 
 null_t rf_free(null_t *ptr)
@@ -108,7 +123,9 @@ null_t rf_free(null_t *ptr)
 
 null_t *rf_realloc(null_t *ptr, i32_t new_size)
 {
+
     null_t *new_ptr = rf_malloc(new_size);
-    memcpy(new_ptr, ptr, new_size);
+    if (ptr)
+        memcpy(new_ptr, ptr, new_size);
     return new_ptr;
 }

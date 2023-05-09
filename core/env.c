@@ -107,14 +107,14 @@ env_t create_env()
     for (i32_t i = 0; i < REC_SIZE; i++)
         as_list(&functions)[i] = vector(TYPE_STRING, sizeof(env_record_t), 0);
 
-    // init_functions(&functions);
+    init_functions(&functions);
 
     env_t env = {
         .functions = functions,
         .variables = variables,
     };
 
-    // init_typenames(env.typenames);
+    init_typenames(env.typenames);
 
     return env;
 }
