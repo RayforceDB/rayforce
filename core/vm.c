@@ -491,7 +491,7 @@ op_trace:
 null_t vm_free(vm_t *vm)
 {
     munmap(vm->stack, VM_STACK_SIZE);
-    rf_free(vm);
+    munmap(vm, sizeof(struct vm_t));
 }
 
 /*

@@ -45,7 +45,7 @@ alloc_t rf_alloc_init()
                            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
     memset(_ALLOC, 0, sizeof(struct alloc_t));
-    _ALLOC->freelist[MAX_ORDER] = _ALLOC->pool;
+    _ALLOC->freelist[MAX_ORDER] = (node_t *)_ALLOC->pool;
     _ALLOC->blocks = 1 << MAX_ORDER;
 
     return _ALLOC;
@@ -99,8 +99,6 @@ null_t debug_blocks()
 
 null_t *rf_malloc(i32_t size)
 {
-    debug_assert(size > 1);
-
     i32_t i, order;
     null_t *block;
     node_t *node;
@@ -110,11 +108,9 @@ null_t *rf_malloc(i32_t size)
 
     // find least order block that fits
     i = (MASK << order) & _ALLOC->blocks;
-    debug_assert(i > 0);
+    if (!i)
+        panic("OOM");
     i = __builtin_ctz(i);
-
-    if (i > MAX_ORDER)
-        return NULL;
 
     // remove the block out of list
     block = _ALLOC->freelist[i];
@@ -139,26 +135,23 @@ null_t *rf_malloc(i32_t size)
 
 null_t rf_free(null_t *block)
 {
-    return;
-    i32_t i;
-    node_t *node = (node_t *)block - 1;
+    node_t *node = (node_t *)block - 1, *n;
     block = (null_t *)node;
     null_t *buddy;
-    null_t **p;
+    i32_t i = node->order;
 
-    i = node->order;
     for (;; i++)
     {
         // calculate buddy
         buddy = buddyof(block, i);
-        p = &(_ALLOC->freelist[i]);
+        n = _ALLOC->freelist[i];
 
         // find buddy in list
-        while ((*p != NULL) && (*p != buddy))
-            p = (null_t **)*p;
+        while (n && (n != buddy))
+            n = n->ptr;
 
         // not found, insert into list
-        if (*p != buddy)
+        if (n != buddy)
         {
             node->ptr = _ALLOC->freelist[i];
             _ALLOC->freelist[i] = node;
@@ -168,8 +161,10 @@ null_t rf_free(null_t *block)
 
         // found, merged block starts from the lower one
         block = (block < buddy) ? block : buddy;
+        node = block;
+
         // remove buddy out of list
-        *p = *(null_t **)*p;
+        _ALLOC->freelist[i] = _ALLOC->freelist[i]->ptr;
         _ALLOC->blocks &= ~(1 << i);
     }
 }
@@ -182,14 +177,13 @@ null_t *rf_realloc(null_t *ptr, i32_t new_size)
     if (new_size == 0)
     {
         rf_free(ptr);
+        panic("REALLOC: new size is 0");
         return NULL;
     }
 
     node_t *node = ((node_t *)ptr) - 1;
     i32_t size = 1 << node->order;
     i32_t adjusted_size = 1 << order_of(new_size);
-
-    // debug("SIZE: %d, ADJUSTED: %d", size, adjusted_size);
 
     // If new size is smaller or equal to the current block size, no need to reallocate
     if (adjusted_size <= size)

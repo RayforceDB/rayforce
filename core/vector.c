@@ -36,10 +36,8 @@
  */
 rf_object_t vector(i8_t type, i8_t size_of_val, i64_t len)
 {
-    header_t *adt;
     i64_t size = size_of_val * len + sizeof(header_t);
-
-    adt = size < SIZE_TO_MMAP ? rf_malloc(ALIGNUP(size, CAPACITY_FACTOR)) : mmap(NULL, ALIGNUP(size, PAGE_SIZE), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    header_t *adt = rf_malloc(size);
 
     if (adt == NULL)
         panic("OOM");
@@ -279,38 +277,32 @@ rf_object_t list_flatten(rf_object_t list)
 
 null_t vector_free(rf_object_t *vector)
 {
-    i64_t size_of_val;
-    i64_t size;
+    // i64_t size_of_val;
+    // i64_t size;
 
-    switch (vector->type)
-    {
-    case TYPE_BOOL:
-        size_of_val = sizeof(i8_t);
-        break;
-    case TYPE_I64:
-        size_of_val = sizeof(i64_t);
-        break;
-    case TYPE_F64:
-        size_of_val = sizeof(f64_t);
-        break;
-    case TYPE_SYMBOL:
-        size_of_val = sizeof(i64_t);
-        break;
-    case TYPE_LIST:
-        size_of_val = sizeof(rf_object_t);
-        break;
-    case TYPE_STRING:
-        size_of_val = sizeof(i8_t);
-        break;
-    default:
-        panic(str_fmt(0, "unknown type: %d", vector->type));
-    }
+    // switch (vector->type)
+    // {
+    // case TYPE_BOOL:
+    //     size_of_val = sizeof(i8_t);
+    //     break;
+    // case TYPE_I64:
+    //     size_of_val = sizeof(i64_t);
+    //     break;
+    // case TYPE_F64:
+    //     size_of_val = sizeof(f64_t);
+    //     break;
+    // case TYPE_SYMBOL:
+    //     size_of_val = sizeof(i64_t);
+    //     break;
+    // case TYPE_LIST:
+    //     size_of_val = sizeof(rf_object_t);
+    //     break;
+    // case TYPE_STRING:
+    //     size_of_val = sizeof(i8_t);
+    //     break;
+    // default:
+    //     panic(str_fmt(0, "unknown type: %d", vector->type));
+    // }
 
-    if (vector->adt->attrs & ATTR_MMAP_ALLOCATED)
-    {
-        size = size_of_val * vector->adt->len + sizeof(header_t);
-        munmap(vector->adt, ALIGNUP(size, PAGE_SIZE));
-    }
-    else
-        rf_free(vector->adt);
+    rf_free(vector->adt);
 }
