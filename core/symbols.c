@@ -164,8 +164,8 @@ null_t symbols_free(symbols_t *symbols)
 
     ht_free(symbols->str_to_id);
     ht_free(symbols->id_to_str);
-    rf_free(symbols->str_to_id);
-    rf_free(symbols->id_to_str);
+    munmap(symbols->str_to_id, sizeof(struct hash_table_t));
+    munmap(symbols->id_to_str, sizeof(struct hash_table_t));
 }
 
 i64_t symbols_intern(str_t s, i64_t len)
