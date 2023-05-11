@@ -52,7 +52,6 @@ null_t *rf_alloc_add_pool(u32_t size)
     node_t *base = (node_t *)pool;
     base->size = size;
     base->next = _ALLOC->pools;
-    debug("ALLOC POOL: %p ORDER: %d SIZE: %d", base, orderof(size), size);
     _ALLOC->pools = base;
 
     return (null_t *)(base + 1);
@@ -81,10 +80,12 @@ alloc_t rf_alloc_get()
 
 null_t rf_alloc_cleanup()
 {
-    for (node_t *node = _ALLOC->pools; node; node = node->next)
+    node_t *node = _ALLOC->pools, *next;
+    while (node)
     {
-        // debug("FREE POOL: %p SIZE: %d", node, node->size);
+        next = node->next;
         munmap(node, node->size);
+        node = next;
     }
 
     munmap(_ALLOC, sizeof(struct alloc_t));

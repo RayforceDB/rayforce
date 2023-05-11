@@ -602,8 +602,8 @@ i8_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
         // first find in locals
         arg_keys = &as_list(&func->locals)[0];
         arg_vals = &as_list(&func->locals)[1];
-
         id = vector_i64_find(arg_keys, object->i64);
+
         if (id < arg_vals->adt->len)
         {
             sym = as_vector_i64(arg_vals)[id];
@@ -618,9 +618,7 @@ i8_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
         // then try to search in the function args
         arg_keys = &as_list(&func->args)[0];
         arg_vals = &as_list(&func->args)[1];
-
         id = vector_i64_find(arg_keys, object->i64);
-        debug("LOCALS");
 
         if (id < arg_vals->adt->len)
         {
@@ -842,5 +840,6 @@ rf_object_t cc_compile(rf_object_t *body, debuginfo_t *debuginfo)
     rf_object_t *b = as_list(body);
     i32_t len = body->adt->len;
 
-    return cc_compile_function(true, "top-level", TYPE_NULL, null(), b, body->id, len, debuginfo);
+    return cc_compile_function(true, "top-level", TYPE_NULL,
+                               dict(vector_symbol(0), vector_i64(0)), b, body->id, len, debuginfo);
 }

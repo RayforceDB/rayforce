@@ -27,11 +27,6 @@
 #include "format.h"
 
 /*
- * Allocate via mmap if size is greater than 32 Mb
- */
-#define SIZE_TO_MMAP 1024 * 1024 * 32
-
-/*
  * Creates new vector of type type
  */
 rf_object_t vector(i8_t type, i8_t size_of_val, i64_t len)
@@ -42,10 +37,7 @@ rf_object_t vector(i8_t type, i8_t size_of_val, i64_t len)
     if (adt == NULL)
         panic("OOM");
 
-    // return ;
     adt->len = len;
-    if (size >= SIZE_TO_MMAP)
-        adt->attrs |= ATTR_MMAP_ALLOCATED;
     adt->rc = 1;
 
     rf_object_t v = {
