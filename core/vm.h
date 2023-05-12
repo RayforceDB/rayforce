@@ -50,8 +50,6 @@ typedef enum vm_opcode_t
     OP_MULF,      // Multiply two f64 from the stack
     OP_DIVI,      // Divide two i64 from the stack
     OP_DIVF,      // Divide two f64 from the stack
-    OP_SUMI,      // Sum i64 vector elements with scalar i64
-    OP_LIKE,      // Compare string with regex
     OP_TYPE,      // Get type of rf_object
     OP_TIMER_SET, // Start timer
     OP_TIMER_GET, // Get timer value

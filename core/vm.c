@@ -81,7 +81,7 @@ rf_object_t vm_exec(vm_t *vm, rf_object_t *fun)
     function_t *f = as_function(fun);
     str_t code = as_string(&f->code);
     rf_object_t x1, x2, x3, x4, x5, x6, *addr;
-    i64_t *v, t;
+    i64_t t;
     i32_t i, l, b;
     nilary_t f0;
     unary_t f1;
@@ -99,7 +99,7 @@ rf_object_t vm_exec(vm_t *vm, rf_object_t *fun)
     static null_t *dispatch_table[] = {
         &&op_halt, &&op_ret, &&op_push, &&op_pop, &&op_eq, &&op_lt, &&op_jne,
         &&op_jmp, &&op_addi, &&op_addf, &&op_subi, &&op_subf, &&op_muli, &&op_mulf, &&op_divi, &&op_divf,
-        &&op_sumi, &&op_like, &&op_type, &&op_timer_set, &&op_timer_get, &&op_call0,
+        &&op_type, &&op_timer_set, &&op_timer_get, &&op_call0,
         &&op_call1, &&op_call2, &&op_call3, &&op_call4, &&op_calln, &&op_callf, &&op_lset, &&op_gset,
         &&op_lload, &&op_gload, &&op_cast, &&op_try, &&op_catch, &&op_throw, &&op_trace};
 
@@ -268,26 +268,6 @@ op_divf:
     x2 = stack_pop(vm);
     x1 = f64(DIVF64(x2.f64, x3.f64));
     stack_push(vm, x1);
-    dispatch();
-op_sumi:
-    vm->ip++;
-    x3 = stack_pop(vm);
-    x2 = stack_pop(vm);
-    x1 = rf_object_cow(&x2);
-    l = x1.adt->len;
-    v = as_vector_i64(&x1);
-    for (i = 0; i < l; i++)
-        v[i] = ADDI64(v[i], x3.i64);
-    stack_push(vm, x1);
-    rf_object_free(&x2);
-    dispatch();
-op_like:
-    vm->ip++;
-    x2 = stack_pop(vm);
-    x1 = stack_pop(vm);
-    stack_push(vm, bool(string_match(as_string(&x1), as_string(&x2))));
-    rf_object_free(&x1);
-    rf_object_free(&x2);
     dispatch();
 op_type:
     vm->ip++;
@@ -566,12 +546,6 @@ str_t vm_code_fmt(rf_object_t *fun)
             break;
         case OP_DIVF:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] divf\n", c++, ip++);
-            break;
-        case OP_SUMI:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] sumi\n", c++, ip++);
-            break;
-        case OP_LIKE:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] like\n", c++, ip++);
             break;
         case OP_TYPE:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] type\n", c++, ip++);

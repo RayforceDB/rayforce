@@ -34,7 +34,6 @@ static alloc_t _ALLOC = NULL;
 // clang-format off
 #define AVAIL_MASK    ((u64_t)0xFFFFFFFFFFFFFFFF)
 #define MEMBASE       ((i64_t)_ALLOC->base)
-
 #define offset(b)     ((i64_t)b - MEMBASE)
 #define blocksize(i)  (1 << (i))
 #define buddyof(b, i) ((null_t *)((offset(b) ^ blocksize(i)) + MEMBASE))
@@ -110,6 +109,41 @@ null_t *rf_realloc(null_t *ptr, i32_t new_size)
 
 #else
 
+// null_t bin(u32_t i)
+// {
+//     u32_t mask = 1 << 31;
+
+//     while (mask)
+//     {
+//         printf("%s ", (i & mask) ? "++" : "--");
+//         mask = mask >> 1;
+//     }
+
+//     printf("\n");
+
+//     for (i32_t i = 0; i < 32; i++)
+//         printf("%0.2d ", 31 - i);
+
+//     printf("\n");
+// }
+
+null_t print_blocks()
+{
+    i32_t i = 0;
+    node_t *node;
+    for (; i <= MAX_ORDER; i++)
+    {
+        node = _ALLOC->freelist[i];
+        printf("-- order: %d [", i);
+        while (node)
+        {
+            printf("%p, ", node);
+            node = node->next;
+        }
+        printf("]\n");
+    }
+}
+
 null_t *rf_malloc(i32_t size)
 {
     i32_t i, order;
@@ -183,7 +217,8 @@ null_t rf_free(null_t *block)
 
         // remove buddy out of list
         *n = (*n)->next;
-        _ALLOC->avail &= ~blocksize(i);
+        if (_ALLOC->freelist[i] == NULL)
+            _ALLOC->avail &= ~blocksize(i);
     }
 }
 
@@ -217,23 +252,6 @@ null_t *rf_realloc(null_t *ptr, i32_t new_size)
     }
 
     return new_ptr;
-}
-
-null_t print_blocks()
-{
-    i32_t i = 0;
-    node_t *node;
-    for (; i <= MAX_ORDER; i++)
-    {
-        node = _ALLOC->freelist[i];
-        printf("-- order: %d [", i);
-        while (node)
-        {
-            printf("%p, ", node);
-            node = node->next;
-        }
-        printf("]\n");
-    }
 }
 
 #endif

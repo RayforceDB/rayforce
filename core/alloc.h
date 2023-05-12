@@ -44,10 +44,10 @@ CASSERT(sizeof(struct node_t) == 16, alloc_h)
 
 typedef struct alloc_t
 {
-    node_t *freelist[MAX_POOL_ORDER]; // free list of blocks by order
-    node_t *pools;                    // list of pools
-    u32_t avail;                      // mask of available blocks by order
-    null_t *base;                     // base address of the pool
+    node_t *freelist[MAX_POOL_ORDER + 2]; // free list of blocks by order
+    node_t *pools;                        // list of pools
+    u32_t avail;                          // mask of available blocks by order
+    null_t *base;                         // base address of the pool
 } __attribute__((aligned(PAGE_SIZE))) * alloc_t;
 
 CASSERT(sizeof(struct alloc_t) % PAGE_SIZE == 0, alloc_h)

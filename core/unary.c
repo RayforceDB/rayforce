@@ -28,7 +28,7 @@
 #include "util.h"
 #include "format.h"
 
-rf_object_t rf_til(rf_object_t *x)
+rf_object_t rf_til_i64(rf_object_t *x)
 {
     i32_t i, l = (i32_t)x->i64;
     i64_t *v;
@@ -69,7 +69,7 @@ rf_object_t rf_distinct_i64(rf_object_t *x)
     m = as_vector_bool(&mask);
     memset(m, 0, mask_size);
 
-    vec = vector_i64(x->adt->len);
+    vec = vector_i64(l);
     vi = as_vector_i64(&vec);
 
     for (i = 0; i < l; i++)
@@ -81,8 +81,19 @@ rf_object_t rf_distinct_i64(rf_object_t *x)
         }
     }
 
-    rf_free(&mask);
+    rf_object_free(&mask);
     vec.adt->len = j;
 
     return vec;
+}
+
+rf_object_t rf_sum_I64(rf_object_t *x)
+{
+    i32_t i;
+    i64_t l = x->adt->len, sum = 0, *v = as_vector_i64(x);
+
+    for (i = 0; i < l; i++)
+        sum += v[i];
+
+    return i64(sum);
 }

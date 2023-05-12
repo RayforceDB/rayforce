@@ -45,39 +45,40 @@
 null_t init_functions(rf_object_t *records)
 {
     // Nilary
-    REC(records, 0, "halt",   TYPE_LIST,    OP_HALT,   { 0                       });
-    REC(records, 0, "env",    TYPE_DICT,    rf_env,    { 0                       });
+    REC(records, 0, "halt",      TYPE_LIST,       OP_HALT,                 { 0                        });
+    REC(records, 0, "env",       TYPE_DICT,       rf_env,                  { 0                        });
     // Unary  
-    REC(records, 1, "type",    -TYPE_SYMBOL,  OP_TYPE,         { TYPE_NULL                });
-    REC(records, 1, "til" ,     TYPE_I64,     rf_til,          {-TYPE_I64                 });
-    REC(records, 1, "trace" ,   TYPE_I64,     OP_TRACE,        {TYPE_NULL                 });
-    REC(records, 1, "distinct", TYPE_I64,     rf_distinct_i64, {TYPE_I64                  });
+    REC(records, 1, "type",     -TYPE_SYMBOL,     OP_TYPE,                 { TYPE_NULL                });
+    REC(records, 1, "til" ,      TYPE_I64,        rf_til_i64,              {-TYPE_I64                 });
+    REC(records, 1, "trace" ,    TYPE_I64,        OP_TRACE,                { TYPE_NULL                });
+    REC(records, 1, "distinct",  TYPE_I64,        rf_distinct_i64,         { TYPE_I64                 });
+    REC(records, 1, "sum",      -TYPE_I64,        rf_sum_I64,              { TYPE_I64                 });
 
     // Binary
-    REC(records, 2, "==",    -TYPE_BOOL,    OP_EQ,     { TYPE_NULL,    TYPE_NULL   });
-    // REC(records, 2, "!=",    -TYPE_BOOL,    OP_NEQ,    { TYPE_NULL,    TYPE_NULL   });
-    REC(records, 2, "<",     -TYPE_BOOL,    OP_LT,     { TYPE_NULL,    TYPE_NULL   });
-    // REC(records, 2, ">",     -TYPE_BOOL,    OP_GT,     { TYPE_NULL,    TYPE_NULL   });
-    // REC(records, 2, "<=",    -TYPE_BOOL,    OP_LE,     { TYPE_NULL,    TYPE_NULL   });
-    // REC(records, 2, ">=",    -TYPE_BOOL,    OP_GE,     { TYPE_NULL,    TYPE_NULL   });
-    REC(records, 2, "+",     -TYPE_I64,     OP_ADDI,   {-TYPE_I64,   -TYPE_I64   });
-    REC(records, 2, "+",     -TYPE_F64,     OP_ADDF,   {-TYPE_F64,   -TYPE_F64   });
-    REC(records, 2, "-",     -TYPE_I64,     OP_SUBI,   {-TYPE_I64,   -TYPE_I64   });
-    REC(records, 2, "-",     -TYPE_F64,     OP_SUBF,   {-TYPE_F64,   -TYPE_F64   });
-    REC(records, 2, "*",     -TYPE_I64,     OP_MULI,   {-TYPE_I64,   -TYPE_I64   });
-    REC(records, 2, "*",     -TYPE_F64,     OP_MULF,   {-TYPE_F64,   -TYPE_F64   });
-    REC(records, 2, "/",     -TYPE_F64,     OP_DIVI,   {-TYPE_I64,   -TYPE_I64   });
-    REC(records, 2, "/",     -TYPE_F64,     OP_DIVF,   {-TYPE_F64,   -TYPE_F64   });
-    REC(records, 2, "sum",    TYPE_I64,     OP_SUMI,   { TYPE_I64,   -TYPE_I64   });
-    REC(records, 2, "like",  -TYPE_BOOL,    OP_LIKE,   { TYPE_STRING, TYPE_STRING});
-    REC(records, 2, "dict",   TYPE_DICT,    rf_dict,   { TYPE_NULL,    TYPE_NULL });
-    // Ternary
-    // Quaternary
-    // Nary
-    REC(records, 5, "list",    TYPE_LIST,    rf_list,    { 0                       });
-    REC(records, 5, "format",  TYPE_STRING,  rf_format,  { 0                       });
-    REC(records, 5, "print",   TYPE_NULL,    rf_print,   { 0                       });
-    REC(records, 5, "println", TYPE_NULL,    rf_println, { 0                       });
+    REC(records, 2, "==",       -TYPE_BOOL,       OP_EQ,                   { TYPE_NULL,    TYPE_NULL  });
+    // REC(records, 2, "!=",       -TYPE_BOOL,       OP_NEQ,               { TYPE_NULL,    TYPE_NULL  });
+    REC(records, 2, "<",        -TYPE_BOOL,       OP_LT,                   { TYPE_NULL,    TYPE_NULL  });
+    // REC(records, 2, ">",        -TYPE_BOOL,       OP_GT,                { TYPE_NULL,    TYPE_NULL  });
+    // REC(records, 2, "<=",       -TYPE_BOOL,       OP_LE,                { TYPE_NULL,    TYPE_NULL  });
+    // REC(records, 2, ">=",       -TYPE_BOOL,       OP_GE,                { TYPE_NULL,    TYPE_NULL  });
+    REC(records, 2, "+",        -TYPE_I64,        OP_ADDI,                 {-TYPE_I64,   -TYPE_I64   });
+    REC(records, 2, "+",        -TYPE_F64,        OP_ADDF,                 {-TYPE_F64,   -TYPE_F64   });
+    REC(records, 2, "+",         TYPE_I64,        rf_add_I64_i64,          { TYPE_I64,   -TYPE_I64   });
+    REC(records, 2, "-",        -TYPE_I64,        OP_SUBI,                 {-TYPE_I64,   -TYPE_I64   });
+    REC(records, 2, "-",        -TYPE_F64,        OP_SUBF,                 {-TYPE_F64,   -TYPE_F64   });
+    REC(records, 2, "*",        -TYPE_I64,        OP_MULI,                 {-TYPE_I64,   -TYPE_I64   });
+    REC(records, 2, "*",        -TYPE_F64,        OP_MULF,                 {-TYPE_F64,   -TYPE_F64   });
+    REC(records, 2, "/",        -TYPE_F64,        OP_DIVI,                 {-TYPE_I64,   -TYPE_I64   });
+    REC(records, 2, "/",        -TYPE_F64,        OP_DIVF,                 {-TYPE_F64,   -TYPE_F64   });
+    REC(records, 2, "like",     -TYPE_BOOL,       rf_like_String_String,   { TYPE_STRING, TYPE_STRING});
+    REC(records, 2, "dict",      TYPE_DICT,       rf_dict,                 { TYPE_NULL,    TYPE_NULL });
+    // Ternary  
+    // Quaternary  
+    // Nary  
+    REC(records, 5, "list",      TYPE_LIST,       rf_list,                 { 0                       });
+    REC(records, 5, "format",    TYPE_STRING,     rf_format,               { 0                       });
+    REC(records, 5, "print",     TYPE_NULL,       rf_print,                { 0                       });
+    REC(records, 5, "println",   TYPE_NULL,       rf_println,              { 0                       });
 }
 
 null_t init_typenames(i64_t *typenames)

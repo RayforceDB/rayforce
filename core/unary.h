@@ -26,7 +26,8 @@
 
 #include "rayforce.h"
 
-rf_object_t rf_til(rf_object_t *x);
+rf_object_t rf_til_i64(rf_object_t *x);
 rf_object_t rf_distinct_i64(rf_object_t *x);
+rf_object_t rf_sum_I64(rf_object_t *x);
 
 #endif
