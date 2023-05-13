@@ -303,6 +303,7 @@ op_call1:
     f1 = (unary_t)x3.i64;
     x1 = f1(&x2);
     unwrap(x1, b);
+    rf_object_free(&x2);
     stack_push(vm, x1);
     dispatch();
 op_call2:

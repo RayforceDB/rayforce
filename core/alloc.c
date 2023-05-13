@@ -113,7 +113,19 @@ alloc_t rf_alloc_get()
 
 null_t rf_alloc_cleanup()
 {
-    print_blocks();
+    // All the nodes remains are pools, so just munmap them
+    for (i32_t i = 0; i < MAX_POOL_ORDER; i++)
+    {
+        node_t *node = _ALLOC->freelist[i];
+        while (node)
+        {
+            assert(node == node->base);
+            node_t *next = node->next;
+            munmap(node->base, node->size);
+            node = next;
+        }
+    }
+
     munmap(_ALLOC, sizeof(struct alloc_t));
 }
 
