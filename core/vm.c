@@ -448,30 +448,6 @@ str_t vm_code_fmt(rf_object_t *fun)
             str_fmt_into(&s, &l, &o, 0, "\n");
             ip += sizeof(rf_object_t);
             break;
-        case OP_ADDI:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] addi\n", c++, ip++);
-            break;
-        case OP_ADDF:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] addf\n", c++, ip++);
-            break;
-        case OP_SUBI:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] subi\n", c++, ip++);
-            break;
-        case OP_SUBF:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] subf\n", c++, ip++);
-            break;
-        case OP_MULI:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] muli\n", c++, ip++);
-            break;
-        case OP_MULF:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] mulf\n", c++, ip++);
-            break;
-        case OP_DIVI:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] divi\n", c++, ip++);
-            break;
-        case OP_DIVF:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] divf\n", c++, ip++);
-            break;
         case OP_TYPE:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] type\n", c++, ip++);
             break;

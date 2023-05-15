@@ -40,14 +40,6 @@ typedef enum vm_opcode_t
     OP_POP,       // Pop an rf_object from the stack
     OP_JNE,       // Jump if not equal
     OP_JMP,       // Jump
-    OP_ADDI,      // Add two i64 from the stack
-    OP_ADDF,      // Add two f64 from the stack
-    OP_SUBI,      // Subtract two i64 from the stack
-    OP_SUBF,      // Subtract two f64 from the stack
-    OP_MULI,      // Multiply two i64 from the stack
-    OP_MULF,      // Multiply two f64 from the stack
-    OP_DIVI,      // Divide two i64 from the stack
-    OP_DIVF,      // Divide two f64 from the stack
     OP_TYPE,      // Get type of rf_object
     OP_TIMER_SET, // Start timer
     OP_TIMER_GET, // Get timer value
