@@ -127,6 +127,26 @@ rf_object_t symbol(str_t s)
     return sym;
 }
 
+rf_object_t symboli64(i64_t id)
+{
+    rf_object_t sym = {
+        .type = -TYPE_SYMBOL,
+        .i64 = id,
+    };
+
+    return sym;
+}
+
+rf_object_t schar(char_t c)
+{
+    rf_object_t ch = {
+        .type = -TYPE_CHAR,
+        .schar = c,
+    };
+
+    return ch;
+}
+
 rf_object_t table(rf_object_t keys, rf_object_t vals)
 {
     if (keys.type != TYPE_SYMBOL || vals.type != 0)
@@ -213,7 +233,7 @@ rf_object_t rf_object_clone(rf_object_t *object)
     rc_inc(object);
 
     static null_t *types_table[] = {
-        &&type_any, &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_string,
+        &&type_any, &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_char,
         &&type_list, &&type_dict, &&type_table, &&type_function, &&type_error};
 
     goto *types_table[(i32_t)object->type];
@@ -228,7 +248,7 @@ type_f64:
     return *object;
 type_symbol:
     return *object;
-type_string:
+type_char:
     return *object;
 type_list:
     l = object->adt->len;
@@ -263,7 +283,7 @@ null_t rf_object_free(rf_object_t *object)
     rc_dec(rc, object);
 
     static null_t *types_table[] = {
-        &&type_any, &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_string,
+        &&type_any, &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_char,
         &&type_list, &&type_dict, &&type_table, &&type_function, &&type_error};
 
     goto *types_table[(i32_t)object->type];
@@ -286,7 +306,7 @@ type_symbol:
     if (rc == 0)
         vector_free(object);
     return;
-type_string:
+type_char:
     if (rc == 0)
         vector_free(object);
     return;
@@ -349,7 +369,7 @@ rf_object_t rf_object_cow(rf_object_t *object)
         return rf_object_clone(object);
 
     static null_t *types_table[] = {
-        &&type_any, &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_string,
+        &&type_any, &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_char,
         &&type_list, &&type_dict, &&type_table, &&type_function, &&type_error};
 
     goto *types_table[(i32_t)object->type];
@@ -372,7 +392,7 @@ type_symbol:
     new = vector_symbol(object->adt->len);
     memcpy(as_vector_symbol(&new), as_vector_symbol(object), object->adt->len * sizeof(i64_t));
     return new;
-type_string:
+type_char:
     new = string(object->adt->len);
     memcpy(as_string(&new), as_string(object), object->adt->len);
     return new;

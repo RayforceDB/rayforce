@@ -44,7 +44,7 @@ extern "C"
 #define TYPE_I64 2
 #define TYPE_F64 3
 #define TYPE_SYMBOL 4
-#define TYPE_STRING 5
+#define TYPE_CHAR 5
 #define TYPE_LIST 6
 #define TYPE_DICT 7
 #define TYPE_TABLE 8
@@ -75,6 +75,7 @@ extern "C"
 
 typedef char i8_t;
 typedef unsigned char u8_t;
+typedef unsigned char char_t;
 typedef char bool_t;
 typedef char *str_t;
 typedef short i16_t;
@@ -128,6 +129,7 @@ typedef struct rf_object_t
     union
     {
         bool_t bool;
+        char_t schar;
         i64_t i64;
         f64_t f64;
         header_t *adt;
@@ -147,6 +149,8 @@ extern rf_object_t bool(bool_t val);                                     // bool
 extern rf_object_t i64(i64_t val);                                       // i64 scalar
 extern rf_object_t f64(f64_t val);                                       // f64 scalar
 extern rf_object_t symbol(str_t ptr);                                    // symbol
+extern rf_object_t symboli64(i64_t id);                                  // symbol from i64
+extern rf_object_t schar(char_t c);                                      // char
 extern rf_object_t vector(i8_t type, i8_t size_of_val, i64_t len);       // vector of type
 extern rf_object_t string(i64_t len);                                    // string 
 

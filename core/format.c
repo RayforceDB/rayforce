@@ -477,6 +477,8 @@ i32_t rf_object_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i3
         return f64_fmt_into(dst, len, offset, indent, limit, object->f64);
     case -TYPE_SYMBOL:
         return symbol_fmt_into(dst, len, offset, indent, limit, object->i64);
+    case -TYPE_CHAR:
+        return str_fmt_into(dst, len, offset, limit, "'%c'", object->schar ? object->schar : 1);
     case TYPE_BOOL:
         return vector_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_I64:
@@ -485,7 +487,7 @@ i32_t rf_object_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i3
         return vector_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_SYMBOL:
         return vector_fmt_into(dst, len, offset, indent, limit, object);
-    case TYPE_STRING:
+    case TYPE_CHAR:
         return string_fmt_into(dst, len, offset, indent, limit, object);
     case TYPE_LIST:
         return list_fmt_into(dst, len, offset, indent, limit, object);
@@ -534,7 +536,7 @@ str_t rf_object_fmt_n(rf_object_t *x, u32_t n)
     if (n == 1)
         return rf_object_fmt(b);
 
-    if (b->type != TYPE_STRING)
+    if (b->type != TYPE_CHAR)
         return NULL;
 
     p = as_string(b);

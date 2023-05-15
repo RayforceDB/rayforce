@@ -49,7 +49,7 @@ bool_t rf_eq(rf_object_t *x, rf_object_t *y)
         return x->i64 == y->i64;
     case -TYPE_F64:
         return x->f64 == y->f64;
-    case TYPE_STRING:
+    case TYPE_CHAR:
         return strcmp(as_string(x), as_string(y)) == 0;
     default:
         return false;
@@ -69,7 +69,7 @@ bool_t rf_lt(rf_object_t *x, rf_object_t *y)
         return x->i64 < y->i64;
     case -TYPE_F64:
         return x->f64 < y->f64;
-    case TYPE_STRING:
+    case TYPE_CHAR:
         return strcmp(as_string(x), as_string(y)) < 0;
     default:
         return 0;

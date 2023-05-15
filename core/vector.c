@@ -157,7 +157,7 @@ null_t vector_reserve(rf_object_t *vector, u32_t len)
     case TYPE_LIST:
         reserve(vector, rf_object_t, len);
         break;
-    case TYPE_STRING:
+    case TYPE_CHAR:
         reserve(vector, i8_t, len);
         break;
     default:
@@ -228,6 +228,45 @@ i64_t vector_find(rf_object_t *vector, rf_object_t key)
     }
 }
 
+rf_object_t vector_get(rf_object_t *vector, rf_object_t key)
+{
+    i64_t l = vector->adt->len, i = key.i64;
+    i8_t type = vector->type - TYPE_BOOL;
+
+    static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
+                                    &&type_char, &&type_list};
+
+    if (type > TYPE_LIST)
+        panic("vector_get: non-gettable type");
+
+    goto *types_table[(i32_t)type];
+
+type_bool:
+    if (l < i)
+        return bool(false);
+    return bool(as_vector_bool(vector)[i]);
+type_i64:
+    if (l < i)
+        return i64(NULL_I64);
+    return i64(as_vector_i64(vector)[i]);
+type_f64:
+    if (l < i)
+        return f64(NULL_F64);
+    return f64(as_vector_f64(vector)[i]);
+type_symbol:
+    if (l < i)
+        return i64(NULL_I64);
+    return i64(as_vector_i64(vector)[i]);
+type_char:
+    if (l < i)
+        return schar(0);
+    return schar(as_string(vector)[i]);
+type_list:
+    if (l < i)
+        return null();
+    return rf_object_clone(&as_list(vector)[i]);
+}
+
 /*
  * Try to flatten list in a vector if all elements are of the same type
  */
@@ -293,7 +332,7 @@ null_t vector_free(rf_object_t *vector)
     // case TYPE_LIST:
     //     size_of_val = sizeof(rf_object_t);
     //     break;
-    // case TYPE_STRING:
+    // case TYPE_CHAR:
     //     size_of_val = sizeof(i8_t);
     //     break;
     // default:

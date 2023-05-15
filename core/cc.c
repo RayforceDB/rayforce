@@ -448,9 +448,9 @@ i8_t cc_compile_throw(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t 
 
         push_opcode(cc, car->id, code, OP_THROW);
 
-        if (type != TYPE_STRING)
+        if (type != TYPE_CHAR)
             ccerr(cc, object->id, ERR_TYPE,
-                  str_fmt(0, "'throw': argument must be a 'String', not '%s'",
+                  str_fmt(0, "'throw': argument must be a 'Char', not '%s'",
                           symbols_get(env_get_typename_by_type(env, type))));
 
         return TYPE_THROW;
@@ -474,7 +474,7 @@ i8_t cc_compile_catch(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t 
 
         push_opcode(cc, car->id, code, OP_CATCH);
 
-        return TYPE_STRING;
+        return TYPE_CHAR;
     }
 
     return TYPE_NONE;

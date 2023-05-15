@@ -380,7 +380,7 @@ op_try:
 op_catch:
     b = vm->ip++;
     x1 = vm->acc;
-    x1.type = TYPE_STRING;
+    x1.type = TYPE_CHAR;
     vm->acc = null();
     stack_push(vm, x1);
     dispatch();

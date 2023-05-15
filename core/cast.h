@@ -44,7 +44,7 @@ static inline __attribute__((always_inline)) rf_object_t rf_cast(i8_t type, rf_o
     if (type == y->type)
         return rf_object_clone(y);
 
-    if (type == TYPE_STRING)
+    if (type == TYPE_CHAR)
     {
         str_t s = rf_object_fmt(y);
         if (s == NULL)
@@ -71,13 +71,13 @@ static inline __attribute__((always_inline)) rf_object_t rf_cast(i8_t type, rf_o
         x = f64((f64_t)y->i64);
         x.type = type;
         break;
-    case m(-TYPE_SYMBOL, TYPE_STRING):
+    case m(-TYPE_SYMBOL, TYPE_CHAR):
         x = symbol(as_string(y));
         break;
-    case m(-TYPE_I64, TYPE_STRING):
+    case m(-TYPE_I64, TYPE_CHAR):
         x = i64(strtol(as_string(y), NULL, 10));
         break;
-    case m(-TYPE_F64, TYPE_STRING):
+    case m(-TYPE_F64, TYPE_CHAR):
         x = f64(strtod(as_string(y), NULL));
         break;
     case m(TYPE_TABLE, TYPE_DICT):

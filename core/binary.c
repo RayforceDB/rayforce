@@ -27,6 +27,7 @@
 #include "ops.h"
 #include "util.h"
 #include "format.h"
+#include "vector.h"
 
 rf_object_t rf_dict(rf_object_t *x, rf_object_t *y)
 {
@@ -285,7 +286,7 @@ rf_object_t rf_div_F64_F64(rf_object_t *x, rf_object_t *y)
     return vec;
 }
 
-rf_object_t rf_like_String_String(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_like_Char_Char(rf_object_t *x, rf_object_t *y)
 {
     return (bool(string_match(as_string(x), as_string(y))));
 }
@@ -733,4 +734,99 @@ rf_object_t rf_or_Bool_Bool(rf_object_t *x, rf_object_t *y)
         ov[i] = iv1[i] | iv2[i];
 
     return res;
+}
+
+rf_object_t rf_nth_I64_i64(rf_object_t *x, rf_object_t *y)
+{
+    return vector_get(x, *y);
+}
+
+rf_object_t rf_nth_I64_I64(rf_object_t *x, rf_object_t *y)
+{
+    i32_t i;
+    i64_t yl = y->adt->len, xl = x->adt->len;
+    rf_object_t vec = vector_i64(yl);
+    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y), *ov = as_vector_i64(&vec);
+
+    for (i = 0; i < yl; i++)
+    {
+        if (iv2[i] >= xl)
+            ov[i] = NULL_I64;
+        else
+            ov[i] = iv1[iv2[i]];
+    }
+
+    return (vec);
+}
+
+rf_object_t rf_nth_F64_i64(rf_object_t *x, rf_object_t *y)
+{
+    return vector_get(x, *y);
+}
+
+rf_object_t rf_nth_F64_I64(rf_object_t *x, rf_object_t *y)
+{
+    i32_t i;
+    i64_t yl = y->adt->len, xl = x->adt->len;
+    rf_object_t vec = vector_f64(yl);
+    f64_t *iv1 = as_vector_f64(x), *ov = as_vector_f64(&vec);
+    i64_t *iv2 = as_vector_i64(y);
+
+    for (i = 0; i < yl; i++)
+    {
+        if (iv2[i] >= xl)
+            ov[i] = NULL_F64;
+        else
+            ov[i] = iv1[iv2[i]];
+    }
+
+    return (vec);
+}
+
+rf_object_t rf_nth_Char_i64(rf_object_t *x, rf_object_t *y)
+{
+    return vector_get(x, *y);
+}
+
+rf_object_t rf_nth_Char_I64(rf_object_t *x, rf_object_t *y)
+{
+    i32_t i;
+    i64_t yl = y->adt->len, xl = x->adt->len;
+    rf_object_t vec = string(yl);
+    str_t iv1 = as_string(x), ov = as_string(&vec);
+    i64_t *iv2 = as_vector_i64(y);
+
+    for (i = 0; i < yl; i++)
+    {
+        if (iv2[i] >= xl)
+            ov[i] = ' ';
+        else
+            ov[i] = iv1[iv2[i]];
+    }
+
+    return vec;
+}
+
+rf_object_t rf_nth_List_i64(rf_object_t *x, rf_object_t *y)
+{
+    return vector_get(x, *y);
+}
+
+rf_object_t rf_nth_List_I64(rf_object_t *x, rf_object_t *y)
+{
+    i32_t i;
+    i64_t yl = y->adt->len, xl = x->adt->len;
+    rf_object_t vec = list(yl);
+    rf_object_t *iv1 = as_list(x), *ov = as_list(&vec);
+    i64_t *iv2 = as_vector_i64(y);
+
+    for (i = 0; i < yl; i++)
+    {
+        if (iv2[i] >= xl)
+            ov[i] = null();
+        else
+            ov[i] = rf_object_clone(&iv1[iv2[i]]);
+    }
+
+    return vec;
 }

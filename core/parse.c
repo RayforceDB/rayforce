@@ -186,6 +186,37 @@ rf_object_t parse_number(parser_t *parser)
     return num;
 }
 
+rf_object_t parse_char(parser_t *parser)
+{
+    span_t span = span_start(parser);
+    str_t pos = parser->current + 1; // skip '''
+    rf_object_t ch, err;
+
+    if (at_eof(*pos) || *pos == '\n')
+    {
+        span.end_column += (pos - parser->current);
+        err = error(ERR_PARSE, "Expected character");
+        err.id = span_commit(parser, span);
+        return err;
+    }
+
+    ch = schar(*pos++);
+
+    if (*pos != '\'')
+    {
+        span.end_column += (parser->current - parser->current);
+        err = error(ERR_PARSE, "Expected '''");
+        err.id = span_commit(parser, span);
+        return err;
+    }
+
+    shift(parser, 3);
+    span_extend(parser, &span);
+    ch.id = span_commit(parser, span);
+
+    return ch;
+}
+
 rf_object_t parse_string(parser_t *parser)
 {
     span_t span = span_start(parser);
@@ -537,7 +568,7 @@ rf_object_t advance(parser_t *parser)
         return advance(parser);
     }
 
-    if ((*parser->current) == '\'')
+    if ((*parser->current) == '`')
     {
         quote = 1;
         shift(parser, 1);
@@ -560,6 +591,9 @@ rf_object_t advance(parser_t *parser)
 
     if (is_alpha(*parser->current) || is_op(*parser->current))
         return parse_symbol(parser, quote);
+
+    if ((*parser->current) == '\'')
+        return parse_char(parser);
 
     if ((*parser->current) == '"')
         return parse_string(parser);

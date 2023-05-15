@@ -29,8 +29,8 @@
 
 /*
  * Holds a dict with such fields:
- * file: String
- * function: String
+ * file: Char
+ * function: Char
  * spans: Dict of id -- span mappings
  */
 typedef struct debuginfo_t

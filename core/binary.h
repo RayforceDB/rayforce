@@ -51,7 +51,7 @@ rf_object_t rf_div_I64_i64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_div_I64_I64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_div_F64_f64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_div_F64_F64(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_like_String_String(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_like_Char_Char(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_eq_i64_i64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_eq_f64_f64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_eq_I64_i64(rf_object_t *x, rf_object_t *y);
@@ -94,5 +94,13 @@ rf_object_t rf_and_bool_bool(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_or_bool_bool(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_and_Bool_Bool(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_or_Bool_Bool(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_nth_I64_i64(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_nth_I64_I64(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_nth_Char_i64(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_nth_Char_I64(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_nth_List_i64(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_nth_List_I64(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_nth_F64_i64(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_nth_F64_I64(rf_object_t *x, rf_object_t *y);
 
 #endif

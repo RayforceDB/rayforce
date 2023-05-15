@@ -59,7 +59,6 @@ typedef enum vm_opcode_t
     OP_CATCH,     // Catch an error from vm register and push it onto the stack
     OP_THROW,     // Throw an error
     OP_TRACE,     // Print stack trace (limit)
-    OP_MAPF,      // Apply a function to each element of a list
 
     OP_INVALID, // Invalid opcode
 } vm_opcode_t;
