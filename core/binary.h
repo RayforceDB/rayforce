@@ -33,5 +33,6 @@ rf_object_t rf_like_String_String(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_eq_i64_i64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_eq_f64_f64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_eq_I64_i64(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_eq_I64_I64(rf_object_t *x, rf_object_t *y);
 
 #endif

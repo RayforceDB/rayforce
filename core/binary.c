@@ -86,3 +86,16 @@ rf_object_t rf_eq_I64_i64(rf_object_t *x, rf_object_t *y)
 
     return res;
 }
+
+rf_object_t rf_eq_I64_I64(rf_object_t *x, rf_object_t *y)
+{
+    i32_t i;
+    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y);
+    rf_object_t res = vector_bool(x->adt->len);
+    bool_t *ov = as_vector_bool(&res);
+
+    for (i = 0; i < x->adt->len; i++)
+        ov[i] = iv1[i] == iv2[i];
+
+    return res;
+}
