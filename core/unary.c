@@ -197,3 +197,21 @@ rf_object_t rf_count(rf_object_t *x)
         return i64(x->adt->len);
     }
 }
+
+rf_object_t rf_not_bool(rf_object_t *x)
+{
+    return bool(!x->bool);
+}
+
+rf_object_t rf_not_Bool(rf_object_t *x)
+{
+    i32_t i;
+    i64_t l = x->adt->len;
+    rf_object_t res = vector_bool(l);
+    bool_t *iv = as_vector_bool(x), *ov = as_vector_bool(&res);
+
+    for (i = 0; i < l; i++)
+        ov[i] = !iv[i];
+
+    return res;
+}

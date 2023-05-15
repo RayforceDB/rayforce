@@ -38,7 +38,6 @@ typedef enum vm_opcode_t
     OP_RET,       // Return from function
     OP_PUSH,      // Push an rf_object to the stack
     OP_POP,       // Pop an rf_object from the stack
-    OP_LT,        // Compare two objects from the stack
     OP_JNE,       // Jump if not equal
     OP_JMP,       // Jump
     OP_ADDI,      // Add two i64 from the stack

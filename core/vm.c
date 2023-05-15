@@ -97,7 +97,7 @@ rf_object_t vm_exec(vm_t *vm, rf_object_t *fun)
 
     // The indices of labels in the dispatch_table are the relevant opcodes
     static null_t *dispatch_table[] = {
-        &&op_halt, &&op_ret, &&op_push, &&op_pop, &&op_lt, &&op_jne,
+        &&op_halt, &&op_ret, &&op_push, &&op_pop, &&op_jne,
         &&op_jmp, &&op_addi, &&op_addf, &&op_subi, &&op_subf, &&op_muli, &&op_mulf, &&op_divi, &&op_divf,
         &&op_type, &&op_timer_set, &&op_timer_get, &&op_call0,
         &&op_call1, &&op_call2, &&op_call3, &&op_call4, &&op_calln, &&op_callf, &&op_lset, &&op_gset,
@@ -186,15 +186,6 @@ op_push:
 op_pop:
     vm->ip++;
     stack_pop_free(vm);
-    dispatch();
-op_lt:
-    vm->ip++;
-    x3 = stack_pop(vm);
-    x2 = stack_pop(vm);
-    x1 = bool(rf_lt(&x2, &x3));
-    stack_push(vm, x1);
-    rf_object_free(&x2);
-    rf_object_free(&x3);
     dispatch();
 op_jne:
     vm->ip++;
@@ -496,9 +487,6 @@ str_t vm_code_fmt(rf_object_t *fun)
             break;
         case OP_POP:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] pop\n", c++, ip++);
-            break;
-        case OP_LT:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] lt\n", c++, ip++);
             break;
         case OP_JNE:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] jne ", c++, ip++);
