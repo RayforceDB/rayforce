@@ -51,7 +51,6 @@
 #define MAXI64(x, y) (x > y ? x : y)
 #define MAXF64(x, y) (x > y ? x : y)
 #define MINI64(x, y) (IS_NULL_I64(y) || (!IS_NULL_I64(x) && (x < y)) ? x : y)
-#define MINI64(x, y) (x < y ? x : y)
 #define MINF64(x, y) (x < y ? x : y)
 /*
  * Aligns x to the nearest multiple of a

@@ -108,12 +108,28 @@ rf_object_t rf_sum_I64(rf_object_t *x)
 rf_object_t rf_avg_I64(rf_object_t *x)
 {
     i32_t i;
-    i64_t l = x->adt->len, sum = 0, *v = __builtin_assume_aligned(as_vector_i64(x), 16);
+    i64_t l = x->adt->len, sum = 0,
+          *v = as_vector_i64(x), n = 0;
 
+    // vectorized version when we exactly know that there are no nulls
+    if (x->adt->attrs & VEC_ATTR_WITHOUT_NULLS)
+    {
+        for (i = 0; i < l; i++)
+            sum += v[i];
+
+        return i64(sum / l);
+    }
+
+    // scalar version
     for (i = 0; i < l; i++)
-        sum += v[i];
+    {
+        if (v[i] ^ NULL_I64)
+            sum += v[i];
+        else
+            n++;
+    }
 
-    return f64((f64_t)sum / l);
+    return f64((f64_t)sum / (l - n));
 }
 
 rf_object_t rf_min_I64(rf_object_t *x)
