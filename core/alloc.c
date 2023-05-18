@@ -59,11 +59,9 @@ null_t print_blocks()
 
 null_t *rf_alloc_add_pool(u32_t size)
 {
-    null_t *pool = (null_t *)mmap(NULL, size,
-                                  PROT_READ | PROT_WRITE,
-                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
+    null_t *pool = (null_t *)mmap_malloc(size);
     node_t *node = (node_t *)pool;
+
     node->size = size;
     node->base = pool;
 
@@ -82,11 +80,9 @@ null_t rf_alloc_add_main_pool()
 
 alloc_t rf_alloc_init()
 {
-    _ALLOC = (alloc_t)mmap(NULL, sizeof(struct alloc_t),
-                           PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
+    _ALLOC = (alloc_t)mmap_malloc(sizeof(struct alloc_t));
     _ALLOC->avail = 0;
+
     rf_alloc_add_main_pool();
 
     return _ALLOC;
@@ -113,12 +109,12 @@ null_t rf_alloc_cleanup()
                 node = next;
                 continue;
             }
-            munmap(node->base, node->size);
+            mmap_free(node->base, node->size);
             node = next;
         }
     }
 
-    munmap(_ALLOC, sizeof(struct alloc_t));
+    mmap_free(_ALLOC, sizeof(struct alloc_t));
 }
 
 memstat_t rf_alloc_memstat()

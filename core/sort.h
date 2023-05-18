@@ -26,8 +26,6 @@
 
 #include "rayforce.h"
 
-null_t quicksort(i64_t array[], i64_t left, i64_t right);
-void radixsort(long int arr[], int n);
 null_t rf_sort(rf_object_t *arr);
 
 #endif

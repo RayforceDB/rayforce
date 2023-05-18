@@ -33,8 +33,7 @@ null_t runtime_init(u16_t slaves)
 {
     rf_alloc_init();
 
-    _RUNTIME = mmap(NULL, ALIGNUP(sizeof(struct runtime_t), PAGE_SIZE),
-                    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    _RUNTIME = mmap_malloc(ALIGNUP(sizeof(struct runtime_t), PAGE_SIZE));
 
     _RUNTIME->slaves = slaves;
     _RUNTIME->symbols = symbols_new();
@@ -44,9 +43,9 @@ null_t runtime_init(u16_t slaves)
 null_t runtime_cleanup()
 {
     symbols_free(_RUNTIME->symbols);
-    munmap(_RUNTIME->symbols, sizeof(symbols_t));
+    mmap_free(_RUNTIME->symbols, sizeof(symbols_t));
     free_env(&_RUNTIME->env);
-    munmap(_RUNTIME, ALIGNUP(sizeof(struct runtime_t), PAGE_SIZE));
+    mmap_free(_RUNTIME, ALIGNUP(sizeof(struct runtime_t), PAGE_SIZE));
     rf_alloc_cleanup();
 }
 

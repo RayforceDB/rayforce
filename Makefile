@@ -4,7 +4,7 @@ AR=ar
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=c17 -Ofast -march=native -fassociative-math -ftree-vectorize
 # DEBUG_CFLAGS =  -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG -DSYS_MALLOC
 DEBUG_CFLAGS =  -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG
-CORE_HEADERS = core/sort.h core/cast.h core/ops.h core/util.h core/vector.h core/string.h core/mmap.h\
+CORE_HEADERS = core/mmap.h core/sort.h core/cast.h core/ops.h core/util.h core/vector.h core/string.h\
  core/hash.h core/symbols.h core/format.h core/rayforce.h core/alloc.h core/runtime.h core/dict.h\
  core/parse.h core/vm.h core/debuginfo.h core/cc.h core/env.h core/function.h\
  core/nilary.h core/unary.h core/binary.h core/nary.h

@@ -56,19 +56,13 @@ CASSERT(sizeof(ctx_t) == sizeof(rf_object_t), vm_c)
 
 vm_t *vm_new()
 {
-    vm_t *vm = (vm_t *)mmap(NULL, sizeof(struct vm_t),
-                            PROT_READ | PROT_WRITE,
-                            MAP_ANONYMOUS | MAP_PRIVATE,
-                            -1, 0);
+    vm_t *vm = (vm_t *)mmap_malloc(sizeof(struct vm_t));
 
     memset(vm, 0, sizeof(struct vm_t));
 
     vm->trace = 0;
     vm->acc = null();
-    vm->stack = (rf_object_t *)mmap(NULL, VM_STACK_SIZE,
-                                    PROT_READ | PROT_WRITE,
-                                    MAP_ANONYMOUS | MAP_PRIVATE | MAP_STACK | MAP_GROWSDOWN,
-                                    -1, 0);
+    vm->stack = (rf_object_t *)mmap_stack(VM_STACK_SIZE);
 
     return vm;
 }
@@ -401,8 +395,8 @@ op_trace:
 
 null_t vm_free(vm_t *vm)
 {
-    munmap(vm->stack, VM_STACK_SIZE);
-    munmap(vm, sizeof(struct vm_t));
+    mmap_free(vm->stack, VM_STACK_SIZE);
+    mmap_free(vm, sizeof(struct vm_t));
 }
 
 /*

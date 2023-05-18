@@ -32,10 +32,25 @@
 #include <stdlib.h>
 #include <string.h>
 
-// munmap(GLOBAL_A0, sizeof(struct alloc_t));
-// a0 alloc;
-
-// alloc = (a0)mmap(NULL, sizeof(struct A0),
-//                  PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#if defined(_WIN32) || defined(__CYGWIN__)
+#define mmap_stack(size) mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_STACK | MAP_GROWSDOWN, -1, 0);
+#define mmap_malloc(size) mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+#define mmap_file(size, flags, fd) mmap(NULL, size, flags, MAP_PRIVATE, fd, 0);
+#define mmap_free(addr, size) munmap(addr, size);
+#elif defined(__linux__)
+#define mmap_stack(size) mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_STACK | MAP_GROWSDOWN, -1, 0);
+#define mmap_malloc(size) mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+#define mmap_file(size, flags, fd) mmap(NULL, size, flags, MAP_PRIVATE, fd, 0);
+#define mmap_free(addr, size) munmap(addr, size);
+#elif defined(__APPLE__) && defined(__MACH__)
+#define MAP_ANON 0x1000
+#define MAP_ANONYMOUS MAP_ANON
+#define mmap_stack(size) mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)
+#define mmap_malloc(size) mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+#define mmap_file(size, flags, fd) mmap(NULL, size, flags, MAP_PRIVATE, fd, 0);
+#define mmap_free(addr, size) munmap(addr, size);
+#else
+#error Unknown environment!
+#endif
 
 #endif

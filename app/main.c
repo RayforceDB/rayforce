@@ -21,8 +21,6 @@
  *   SOFTWARE.
  */
 
-#define _POSIX_C_SOURCE 1
-
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -31,6 +29,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <signal.h>
+#include "../core/mmap.h"
 #include "../core/rayforce.h"
 #include "../core/format.h"
 #include "../core/unary.h"
@@ -42,7 +41,6 @@
 #include "../core/debuginfo.h"
 #include "../core/dict.h"
 #include "../core/alloc.h"
-#include "../core/mmap.h"
 
 #define LINE_SIZE 2048
 
@@ -101,7 +99,7 @@ file_t file_open(str_t filename)
 
     fstat(f.fd, &st); // get the size of the file
 
-    f.buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, f.fd, 0); // memory-map the file
+    f.buf = mmap_file(st.st_size, PROT_READ, f.fd);
 
     if (f.buf == MAP_FAILED)
     {
@@ -117,8 +115,8 @@ file_t file_open(str_t filename)
 
 null_t file_close(file_t f)
 {
-    munmap(f.buf, f.len); // unmap the buffer
-    close(f.fd);          // close the file
+    mmap_free(f.buf, f.len); // unmap the buffer
+    close(f.fd);             // close the file
 }
 
 null_t usage()
@@ -342,10 +340,7 @@ i32_t main(i32_t argc, str_t argv[])
     file_t file;
 
     print_logo();
-    line = (str_t)mmap(NULL, LINE_SIZE,
-                       PROT_READ | PROT_WRITE,
-                       MAP_ANONYMOUS | MAP_PRIVATE,
-                       -1, 0);
+    line = (str_t)mmap_malloc(LINE_SIZE);
     vm = vm_new();
 
     // load file
@@ -375,7 +370,7 @@ i32_t main(i32_t argc, str_t argv[])
 
     rf_object_free(&args);
     parser_free(&parser);
-    munmap(line, LINE_SIZE);
+    mmap_free(line, LINE_SIZE);
     vm_free(vm);
 
     runtime_cleanup();
