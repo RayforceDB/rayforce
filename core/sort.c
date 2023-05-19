@@ -33,43 +33,43 @@ inline __attribute__((always_inline)) null_t swap(i64_t *a, i64_t *b)
 
 // quick sort
 // https://www.geeksforgeeks.org/quick-sort/
-i64_t partition_asc(i64_t array[], i64_t low, i64_t high)
+i64_t partition_asc(i64_t array[], i64_t indices[], i64_t low, i64_t high)
 {
-    i64_t pivot = array[high];
+    i64_t pivot = array[indices[high]];
     i64_t i = (low - 1);
 
     for (i64_t j = low; j <= high - 1; j++)
     {
-        if (array[j] < pivot)
+        if (array[indices[j]] < pivot)
         {
             i++;
-            swap(&array[i], &array[j]);
+            swap(&indices[i], &indices[j]);
         }
     }
-    swap(&array[i + 1], &array[high]);
+    swap(&indices[i + 1], &indices[high]);
 
     return i + 1;
 }
 
-i64_t partition_desc(i64_t array[], i64_t low, i64_t high)
+i64_t partition_desc(i64_t array[], i64_t indices[], i64_t low, i64_t high)
 {
-    i64_t pivot = array[high];
+    i64_t pivot = array[indices[high]];
     i64_t i = (low - 1);
 
     for (i64_t j = low; j <= high - 1; j++)
     {
-        if (array[j] >= pivot)
+        if (array[indices[j]] > pivot)
         {
             i++;
-            swap(&array[i], &array[j]);
+            swap(&indices[i], &indices[j]);
         }
     }
-    swap(&array[i + 1], &array[high]);
+    swap(&indices[i + 1], &indices[high]);
 
     return i + 1;
 }
 
-null_t quick_sort_asc(i64_t array[], i64_t low, i64_t high)
+null_t quick_sort_asc(i64_t array[], i64_t indices[], i64_t low, i64_t high)
 {
     i64_t *stack = (i64_t *)rf_malloc(high - low + 1);
     i64_t top = -1, p;
@@ -85,7 +85,7 @@ null_t quick_sort_asc(i64_t array[], i64_t low, i64_t high)
         low = stack[top--];
 
         // Partition the array
-        p = partition_asc(array, low, high);
+        p = partition_asc(array, indices, low, high);
 
         // If there are elements on the left side of partition, push left side to stack
         if (p - 1 > low)
@@ -105,7 +105,7 @@ null_t quick_sort_asc(i64_t array[], i64_t low, i64_t high)
     rf_free(stack);
 }
 
-null_t quick_sort_desc(i64_t array[], i64_t low, i64_t high)
+null_t quick_sort_desc(i64_t array[], i64_t indices[], i64_t low, i64_t high)
 {
     i64_t *stack = (i64_t *)rf_malloc(high - low + 1);
     i64_t top = -1, p;
@@ -121,7 +121,7 @@ null_t quick_sort_desc(i64_t array[], i64_t low, i64_t high)
         low = stack[top--];
 
         // Partition the array
-        p = partition_desc(array, low, high);
+        p = partition_desc(array, indices, low, high);
 
         // If there are elements on the left side of partition, push left side to stack
         if (p - 1 > low)
@@ -142,205 +142,240 @@ null_t quick_sort_desc(i64_t array[], i64_t low, i64_t high)
 }
 
 // heap sort
-inline __attribute__((always_inline)) null_t heapify_asc(i64_t arr[], i64_t n, i64_t i)
+null_t heapify_asc(i64_t array[], i64_t indices[], i64_t n, i64_t i)
 {
     i64_t largest = i;
     i64_t left = 2 * i + 1;
     i64_t right = 2 * i + 2;
 
-    if (left < n && arr[left] > arr[largest])
+    if (left < n && array[indices[left]] > array[indices[largest]])
         largest = left;
 
-    if (right < n && arr[right] > arr[largest])
+    if (right < n && array[indices[right]] > array[indices[largest]])
         largest = right;
 
     if (largest != i)
     {
-        swap(&arr[i], &arr[largest]);
-        heapify_asc(arr, n, largest);
+        swap(&indices[i], &indices[largest]);
+        heapify_asc(array, indices, n, largest);
     }
 }
 
-inline __attribute__((always_inline)) null_t heapify_desc(i64_t arr[], i64_t n, i64_t i)
+null_t heapify_desc(i64_t array[], i64_t indices[], i64_t n, i64_t i)
 {
     i64_t largest = i;
     i64_t left = 2 * i + 1;
     i64_t right = 2 * i + 2;
 
-    if (left < n && arr[left] < arr[largest])
+    if (left < n && array[indices[left]] < array[indices[largest]])
         largest = left;
 
-    if (right < n && arr[right] < arr[largest])
+    if (right < n && array[indices[right]] < array[indices[largest]])
         largest = right;
 
     if (largest != i)
     {
-        swap(&arr[i], &arr[largest]);
-        heapify_desc(arr, n, largest);
+        swap(&indices[i], &indices[largest]);
+        heapify_desc(array, indices, n, largest);
     }
 }
 
-null_t heap_sort_asc(i64_t arr[], i64_t n)
+null_t heap_sort_asc(i64_t array[], i64_t indices[], i64_t n)
 {
     for (i64_t i = n / 2 - 1; i >= 0; i--)
-        heapify_asc(arr, n, i);
+        heapify_asc(array, indices, n, i);
 
     for (i64_t i = n - 1; i >= 0; i--)
     {
-        swap(&arr[0], &arr[i]);
-        heapify_asc(arr, i, 0);
+        swap(&indices[0], &indices[i]);
+        heapify_asc(array, indices, i, 0);
     }
 }
 
-null_t heap_sort_desc(i64_t arr[], i64_t n)
+null_t heap_sort_desc(i64_t array[], i64_t indices[], i64_t n)
 {
     for (i64_t i = n / 2 - 1; i >= 0; i--)
-        heapify_desc(arr, n, i);
+        heapify_asc(array, indices, n, i);
 
     for (i64_t i = n - 1; i >= 0; i--)
     {
-        swap(&arr[0], &arr[i]);
-        heapify_desc(arr, i, 0);
+        swap(&indices[0], &indices[i]);
+        heapify_desc(array, indices, i, 0);
     }
 }
 
 // insertion sort
-null_t insertion_sort_asc(i64_t arr[], i64_t left, i64_t right)
+null_t insertion_sort_asc(i64_t array[], i64_t indices[], i64_t left, i64_t right)
 {
     for (i64_t i = left + 1; i <= right; i++)
     {
-        i64_t temp = arr[i];
+        i64_t temp = indices[i];
         i64_t j = i - 1;
-        while (j >= left && arr[j] > temp)
+        while (j >= left && array[indices[j]] > array[temp])
         {
-            arr[j + 1] = arr[j];
+            indices[j + 1] = indices[j];
             j--;
         }
-        arr[j + 1] = temp;
+        indices[j + 1] = temp;
     }
 }
 
-null_t insertion_sort_desc(i64_t arr[], i64_t left, i64_t right)
+null_t insertion_sort_desc(i64_t array[], i64_t indices[], i64_t left, i64_t right)
 {
     for (i64_t i = left + 1; i <= right; i++)
     {
-        i64_t temp = arr[i];
+        i64_t temp = indices[i];
         i64_t j = i - 1;
-        while (j >= left && arr[j] < temp)
+        while (j >= left && array[indices[j]] < array[temp])
         {
-            arr[j + 1] = arr[j];
+            indices[j + 1] = indices[j];
             j--;
         }
-        arr[j + 1] = temp;
+        indices[j + 1] = temp;
     }
 }
 //
 
-i64_t count_out_of_order(i64_t arr[], i64_t n)
+i64_t count_out_of_order_asc(i64_t array[], i64_t n)
 {
     i64_t i, out_of_order_count = 0;
 
     for (i = 0; i < n - 1; i++)
-        if (arr[i] > arr[i + 1])
+        if (array[i] > array[i + 1])
             out_of_order_count++;
 
     return out_of_order_count;
 }
 
-null_t rf_sort_asc(rf_object_t *vec)
+i64_t count_out_of_order_desc(i64_t array[], i64_t n)
 {
-    i64_t i, len = vec->adt->len, out_of_order;
-    i64_t *v = as_vector_i64(vec);
+    i64_t i, out_of_order_count = 0;
 
-    if (vec->adt->attrs & VEC_ATTR_ASC)
-        return;
+    for (i = 0; i < n - 1; i++)
+        if (array[i] < array[i + 1])
+            out_of_order_count++;
 
-    if (vec->adt->attrs & VEC_ATTR_DESC)
-    {
-        for (i = 0; i < len / 2; i++)
-            swap(&v[i], &v[len - i - 1]);
-        return;
-    }
-
-    if (len < 100)
-    {
-        insertion_sort_asc(v, 0, len - 1);
-        return;
-    }
-
-    out_of_order = count_out_of_order(v, len);
-
-    // ascending order
-    if (out_of_order == 0)
-    {
-        vec->adt->attrs |= VEC_ATTR_ASC;
-        return;
-    }
-
-    // descending order
-    if (out_of_order == len - 1)
-    {
-        vec->adt->attrs |= VEC_ATTR_DESC;
-        for (i = 0; i < len / 2; i++)
-            swap(&v[i], &v[len - i - 1]);
-        return;
-    }
-
-    // mainly ordered
-    if (out_of_order < len / 3)
-    {
-        heap_sort_asc(v, len);
-        return;
-    }
-
-    quick_sort_asc(v, 0, len - 1);
+    return out_of_order_count;
 }
 
-null_t rf_sort_desc(rf_object_t *vec)
+rf_object_t rf_sort_asc(rf_object_t *vec)
 {
-    i64_t len = vec->adt->len, out_of_order;
-    i64_t *v = as_vector_i64(vec);
-
-    if (vec->adt->attrs & VEC_ATTR_DESC)
-        return;
+    i64_t i, len = vec->adt->len, out_of_order;
+    rf_object_t indices = vector_i64(len);
+    i64_t *iv = as_vector_i64(vec), *ov = as_vector_i64(&indices);
 
     if (vec->adt->attrs & VEC_ATTR_ASC)
     {
-        for (i64_t i = 0; i < len / 2; i++)
-            swap(&v[i], &v[len - i - 1]);
-        return;
+        for (i = 0; i < len; i++)
+            ov[i] = i;
+        return indices;
     }
 
-    out_of_order = count_out_of_order(v, len);
+    if (vec->adt->attrs & VEC_ATTR_DESC)
+    {
+        for (i = 0; i < len; i++)
+            ov[i] = len - i - 1;
+        return indices;
+    }
+
+    out_of_order = count_out_of_order_asc(iv, len);
 
     // ascending order
     if (out_of_order == 0)
     {
         vec->adt->attrs |= VEC_ATTR_ASC;
-        for (i64_t i = 0; i < len / 2; i++)
-            swap(&v[i], &v[len - i - 1]);
-        return;
+        for (i = 0; i < len; i++)
+            ov[i] = i;
+        return indices;
     }
 
     // descending order
     if (out_of_order == len - 1)
     {
         vec->adt->attrs |= VEC_ATTR_DESC;
-        return;
+        for (i = 0; i < len; i++)
+            ov[i] = len - i - 1;
+        return indices;
     }
+
+    // fill with indexes
+    for (i = 0; i < len; i++)
+        ov[i] = i;
 
     if (len < 100)
     {
-        insertion_sort_desc(v, 0, len - 1);
-        return;
+        insertion_sort_asc(iv, ov, 0, len - 1);
+        return indices;
     }
 
     // mainly ordered
     if (out_of_order < len / 3)
     {
-        heap_sort_desc(v, len);
-        return;
+        heap_sort_asc(iv, ov, len);
+        return indices;
     }
 
-    quick_sort_desc(v, 0, len - 1);
+    quick_sort_asc(iv, ov, 0, len - 1);
+    return indices;
+}
+
+rf_object_t rf_sort_desc(rf_object_t *vec)
+{
+    i64_t i, len = vec->adt->len, out_of_order;
+    rf_object_t indices = vector_i64(len);
+    i64_t *iv = as_vector_i64(vec), *ov = as_vector_i64(&indices);
+
+    if (vec->adt->attrs & VEC_ATTR_DESC)
+    {
+        for (i64_t i = 0; i < len; i++)
+            ov[i] = i;
+        return indices;
+    }
+
+    if (vec->adt->attrs & VEC_ATTR_ASC)
+    {
+        for (i64_t i = 0; i < len; i++)
+            ov[i] = len - i - 1;
+        return indices;
+    }
+
+    out_of_order = count_out_of_order_desc(iv, len);
+
+    // descending order
+    if (out_of_order == 0)
+    {
+        vec->adt->attrs |= VEC_ATTR_DESC;
+        for (i64_t i = 0; i < len; i++)
+            ov[i] = i;
+        return indices;
+    }
+
+    // ascending order
+    if (out_of_order == len - 1)
+    {
+        vec->adt->attrs |= VEC_ATTR_ASC;
+        for (i64_t i = 0; i < len; i++)
+            ov[i] = len - i - 1;
+        return indices;
+    }
+
+    // fill with indexes
+    for (i = 0; i < len; i++)
+        ov[i] = i;
+
+    if (len < 100)
+    {
+        insertion_sort_desc(iv, ov, 0, len - 1);
+        return indices;
+    }
+
+    // mainly ordered
+    if (out_of_order < len / 3)
+    {
+        heap_sort_desc(iv, ov, len);
+        return indices;
+    }
+
+    quick_sort_desc(iv, ov, 0, len - 1);
+    return indices;
 }

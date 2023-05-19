@@ -39,6 +39,8 @@ rf_object_t rf_max_F64(rf_object_t *x);
 rf_object_t rf_count(rf_object_t *x);
 rf_object_t rf_not_bool(rf_object_t *x);
 rf_object_t rf_not_Bool(rf_object_t *x);
+rf_object_t rf_iasc_I64(rf_object_t *x);
+rf_object_t rf_idesc_I64(rf_object_t *x);
 rf_object_t rf_asc_I64(rf_object_t *x);
 rf_object_t rf_desc_I64(rf_object_t *x);
 

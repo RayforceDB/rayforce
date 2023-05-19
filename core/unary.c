@@ -268,18 +268,36 @@ rf_object_t rf_not_Bool(rf_object_t *x)
     return res;
 }
 
+rf_object_t rf_iasc_I64(rf_object_t *x)
+{
+    return rf_sort_asc(x);
+}
+
+rf_object_t rf_idesc_I64(rf_object_t *x)
+{
+    return rf_sort_desc(x);
+}
+
 rf_object_t rf_asc_I64(rf_object_t *x)
 {
-    rf_object_t vec = rf_object_cow(x);
-    rf_sort_asc(&vec);
+    rf_object_t idx = rf_sort_asc(x);
+    i64_t len = x->adt->len, i,
+          *iv = as_vector_i64(x), *ov = as_vector_i64(&idx);
 
-    return vec;
+    for (i = 0; i < len; i++)
+        ov[i] = iv[ov[i]];
+
+    return idx;
 }
 
 rf_object_t rf_desc_I64(rf_object_t *x)
 {
-    rf_object_t vec = rf_object_cow(x);
-    rf_sort_desc(&vec);
+    rf_object_t idx = rf_sort_desc(x);
+    i64_t len = x->adt->len, i,
+          *iv = as_vector_i64(x), *ov = as_vector_i64(&idx);
 
-    return vec;
+    for (i = 0; i < len; i++)
+        ov[i] = iv[ov[i]];
+
+    return idx;
 }
