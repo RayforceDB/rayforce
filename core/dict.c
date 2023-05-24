@@ -47,13 +47,12 @@ rf_object_t dict(rf_object_t keys, rf_object_t vals)
 
 rf_object_t dict_get(rf_object_t *dict, rf_object_t *key)
 {
-    rf_object_t *keys = &as_list(dict)[0], *vals = &as_list(dict)[1], index;
+    rf_object_t *keys = &as_list(dict)[0], *vals = &as_list(dict)[1];
     i64_t i;
 
     i = vector_find(keys, key);
-    index = i64(i);
 
-    return vector_get(vals, &index);
+    return vector_get(vals, i);
 }
 
 rf_object_t dict_set(rf_object_t *dict, rf_object_t *key, rf_object_t val)

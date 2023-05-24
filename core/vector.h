@@ -109,7 +109,8 @@
 
 extern rf_object_t list_flatten(rf_object_t *object);
 extern i64_t vector_find(rf_object_t *vector, rf_object_t *key);
-extern rf_object_t vector_get(rf_object_t *vector, rf_object_t *key);
+extern rf_object_t vector_get(rf_object_t *vector, i64_t index);
+extern null_t vector_set(rf_object_t *vector, i64_t index, rf_object_t value);
 extern i64_t vector_push(rf_object_t *vector, rf_object_t object);
 extern i64_t vector_bool_push(rf_object_t *vector, bool_t value);
 extern i64_t vector_i64_push(rf_object_t *vector, i64_t value);

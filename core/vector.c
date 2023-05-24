@@ -230,45 +230,80 @@ type_list:
     return l;
 }
 
-rf_object_t vector_get(rf_object_t *vector, rf_object_t *key)
+rf_object_t vector_get(rf_object_t *vector, i64_t index)
 {
-    i64_t l, i = key->i64;
+    i64_t l;
     i8_t type = vector->type - TYPE_BOOL;
 
     static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_char, &&type_list};
 
-    if (type > TYPE_LIST)
-        panic("vector_get: non-gettable type");
+    // if (type > TYPE_LIST)
+    //     panic("vector_get: non-gettable type");
 
     l = vector->adt->len;
 
     goto *types_table[(i32_t)type];
 
 type_bool:
-    if (i < l)
-        return bool(as_vector_bool(vector)[i]);
+    if (index < l)
+        return bool(as_vector_bool(vector)[index]);
     return bool(false);
 type_i64:
-    if (i < l)
-        return i64(as_vector_i64(vector)[i]);
+    if (index < l)
+        return i64(as_vector_i64(vector)[index]);
     return i64(NULL_I64);
 type_f64:
-    if (i < l)
-        return f64(as_vector_f64(vector)[i]);
+    if (index < l)
+        return f64(as_vector_f64(vector)[index]);
     return f64(NULL_F64);
 type_symbol:
-    if (i < l)
-        return i64(as_vector_i64(vector)[i]);
+    if (index < l)
+        return i64(as_vector_i64(vector)[index]);
     return i64(NULL_I64);
 type_char:
-    if (i < l)
-        return schar(as_string(vector)[i]);
+    if (index < l)
+        return schar(as_string(vector)[index]);
     return schar(0);
 type_list:
-    if (i < l)
-        return rf_object_clone(&as_list(vector)[i]);
+    if (index < l)
+        return rf_object_clone(&as_list(vector)[index]);
     return null();
+}
+
+null_t vector_set(rf_object_t *vector, i64_t index, rf_object_t value)
+{
+    i8_t type = vector->type - TYPE_BOOL;
+
+    static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
+                                    &&type_char, &&type_list};
+
+    // if (type > TYPE_LIST)
+    // panic("vector_set: non-settable type");
+
+    if (index < 0 || index >= vector->adt->len)
+        return;
+
+    goto *types_table[(i32_t)type];
+
+type_bool:
+    as_vector_bool(vector)[index] = value.bool;
+    return;
+type_i64:
+    as_vector_i64(vector)[index] = value.i64;
+    return;
+type_f64:
+    as_vector_f64(vector)[index] = value.f64;
+    return;
+type_symbol:
+    as_vector_i64(vector)[index] = value.i64;
+    return;
+type_char:
+    as_string(vector)[index] = value.schar;
+    return;
+type_list:
+    as_list(vector)[index] = value;
+    return;
 }
 
 /*

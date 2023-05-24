@@ -484,29 +484,42 @@ i8_t cc_compile_catch(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t 
 
 i8_t cc_compile_map(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t arity)
 {
-    i8_t type;
-    rf_object_t *car = &as_list(object)[0], *addr;
+    UNUSED(has_consumer);
+
+    i8_t type, *args;
+    rf_object_t *car, *addr, *arg_keys, *arg_vals;
     function_t *func = as_function(&cc->function);
     rf_object_t *code = &func->code;
     env_t *env = &runtime_get()->env;
-    i64_t lbl1, lbl2;
+    i64_t i, lbl0, lbl1, lbl2, sym;
 
+    car = &as_list(object)[0];
     if (car->i64 == symbol("map").i64)
     {
-        if (arity != 2)
-            cerr(cc, car->id, ERR_LENGTH, "'map' takes two arguments");
+        if (arity < 2)
+            cerr(cc, car->id, ERR_LENGTH, "'map' takes at least two arguments");
+
+        arity -= 1;
+        args = (i8_t *)alloca(arity);
 
         // reserve space for map result
         push_opcode(cc, car->id, code, OP_PUSH);
         push_rf_object(code, null());
 
-        // compile arg
-        type = cc_compile_expr(true, cc, &as_list(object)[2]);
+        // compile args
+        for (i = 0; i < arity; i++)
+        {
+            type = cc_compile_expr(true, cc, &as_list(object)[i + 2]);
 
-        if (type == TYPE_ERROR)
-            return type;
+            if (type == TYPE_ERROR)
+                return type;
+
+            args[i] = -type;
+        }
 
         push_opcode(cc, car->id, code, OP_ALLOC);
+        lbl0 = code->adt->len;
+        push_opcode(cc, car->id, code, 0);
         // additional check for zero length argument
         push_opcode(cc, car->id, code, OP_JNE);
         lbl1 = code->adt->len;
@@ -521,8 +534,32 @@ i8_t cc_compile_map(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t ar
         addr = peek_rf_object(code);
         func = as_function(addr);
 
+        // specify type for alloc result as return type of the function
+        *(i8_t *)(as_string(code) + lbl0) = -func->rettype;
+
+        arg_keys = &as_list(&func->args)[0];
+        arg_vals = &as_list(&func->args)[1];
+
+        // check function arity
+        if (arg_keys->adt->len != arity)
+            cerr(cc, car->id, ERR_LENGTH, "'map' function arity mismatch");
+
+        // check function argument types
+        for (i = 0; i < arity; i++)
+        {
+            sym = as_vector_i64(arg_vals)[i];
+            type = env_get_type_by_typename(env, sym);
+
+            if (args[i] != type)
+                ccerr(cc, as_list(object)[i + 2].id, ERR_TYPE,
+                      str_fmt(0, "argument type mismatch: expected %s, got %s",
+                              symbols_get(env_get_typename_by_type(env, type)),
+                              symbols_get(env_get_typename_by_type(env, args[i]))));
+        }
+
         lbl2 = code->adt->len;
         push_opcode(cc, car->id, code, OP_MAP);
+        push_opcode(cc, car->id, code, (i8_t)arity);
         push_opcode(cc, car->id, code, OP_CALLF);
         push_opcode(cc, car->id, code, OP_COLLECT);
         push_opcode(cc, car->id, code, OP_JNE);
@@ -764,7 +801,7 @@ i8_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
 
         car = &as_list(object)[0];
         arity = object->adt->len - 1;
-        args = (i8_t *)calloc(arity, sizeof(i8_t));
+        args = (i8_t *)alloca(arity);
 
         // special forms compilation need to be done before arguments compilation
         type = cc_compile_special_forms(has_consumer, cc, object, arity);

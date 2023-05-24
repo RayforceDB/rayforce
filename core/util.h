@@ -76,6 +76,7 @@
         printf("%f\n", ((f64_t)(clock() - timer)) / CLOCKS_PER_SEC * 1000); \
     }
 
+i64_t size_of(i8_t type);
 u32_t next_power_of_two_u32(u32_t n);
 u64_t next_power_of_two_u64(u64_t n);
 

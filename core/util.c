@@ -21,7 +21,9 @@
  *   SOFTWARE.
  */
 
+#include <stdlib.h>
 #include "util.h"
+#include "format.h"
 
 u32_t next_power_of_two_u32(u32_t n)
 {
@@ -43,4 +45,23 @@ u64_t next_power_of_two_u64(u64_t n)
         return n;
 
     return 1UL << (64 - __builtin_clzl(n));
+}
+
+i64_t size_of(i8_t type)
+{
+    switch (type)
+    {
+    case TYPE_BOOL:
+        return 1;
+    case TYPE_I64:
+        return 8;
+    case TYPE_F64:
+        return 8;
+    case TYPE_CHAR:
+        return 1;
+    case TYPE_LIST:
+        return sizeof(struct rf_object_t);
+    default:
+        panic(str_fmt(0, "Unknown type: %d", type));
+    }
 }

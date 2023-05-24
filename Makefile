@@ -1,6 +1,6 @@
 CC=gcc
 AR=ar
-# RELEASE_CFLAGS -fPIC -Wall -Wextra -std=c17 -Ofast -march=native -g -pg
+# RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=c17 -Ofast -march=native -g -pg
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=c17 -Ofast -march=native -fassociative-math -ftree-vectorize
 # DEBUG_CFLAGS =  -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG -DSYS_MALLOC
 DEBUG_CFLAGS =  -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG

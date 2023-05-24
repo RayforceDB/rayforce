@@ -45,7 +45,12 @@
         rf_object_t o = stack_pop(v); \
         rf_object_free(&o);           \
     }
-
+#define stack_debug(v)                                                     \
+    {                                                                      \
+        i32_t i = v->sp;                                                   \
+        while (i > 0)                                                      \
+            debug("%d: %s", v->sp - i - 1, rf_object_fmt(&v->stack[--i])); \
+    }
 typedef struct ctx_t
 {
     function_t *addr;
@@ -73,11 +78,12 @@ vm_t *vm_new()
  */
 rf_object_t vm_exec(vm_t *vm, rf_object_t *fun)
 {
+    i8_t type, c;
     function_t *f = as_function(fun);
     str_t code = as_string(&f->code);
     rf_object_t x1, x2, x3, x4, x5, x6, *addr;
     i64_t t;
-    i32_t i, l, c, b;
+    i32_t i, j, l, b;
     nilary_t f0;
     unary_t f1;
     binary_t f2;
@@ -394,30 +400,39 @@ op_trace:
     dispatch();
 op_alloc:
     b = vm->ip++;
+    type = code[vm->ip++];
     vm->counter = stack_peek(vm)->adt->len;
     // allocate result and write to a preserved space on the stack
-    x1 = vector_i64(vm->counter);
-    *stack_peek_n(vm, 1) = x1;
+    debug("SIZEOF: %d", size_of(type));
+    x1 = vector(type, size_of(type), vm->counter);
+    *stack_peek_n(vm, 3) = x1;
     stack_push(vm, bool(vm->counter > 0));
+    stack_debug(vm);
     dispatch();
 op_map:
     b = vm->ip++;
-    // argument len
-    addr = stack_peek_n(vm, 1);
-    l = addr->adt->len;
-    // push argument
-    stack_push(vm, i64(as_vector_i64(addr)[l - vm->counter]));
+    // arguments count
+    c = code[vm->ip++];
+    j = 0;
+    // push arguments
+    for (i = 0; i < c; i++)
+    {
+        addr = stack_peek_n(vm, c - i + j++);
+        l = addr->adt->len;
+        stack_push(vm, vector_get(addr, l - vm->counter));
+    }
     // push function
-    x1 = rf_object_clone(stack_peek_n(vm, 1));
+    x1 = rf_object_clone(stack_peek_n(vm, c));
     stack_push(vm, x1);
     dispatch();
 op_collect:
     b = vm->ip++;
     // get the result from another iteration
     x1 = stack_pop(vm);
-    addr = stack_peek_n(vm, 1);
+    stack_debug(vm);
+    addr = stack_peek_n(vm, 2);
     l = addr->adt->len;
-    as_vector_i64(addr)[l - vm->counter--] = x1.i64;
+    vector_set(addr, l - vm->counter--, x1);
     // push counter comparison value
     x1 = bool(vm->counter == 0);
     stack_push(vm, x1);
