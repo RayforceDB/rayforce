@@ -39,17 +39,17 @@
 #define stack_push(v, x) (v->stack[v->sp++] = x)
 #define stack_pop(v) (v->stack[--v->sp])
 #define stack_peek(v) (&v->stack[v->sp - 1])
-#define stack_peek_n(v, n) (&v->stack[v->sp - 1 - n])
+#define stack_peek_n(v, n) (&v->stack[v->sp - 1 - (n)])
 #define stack_pop_free(v)             \
     {                                 \
         rf_object_t o = stack_pop(v); \
         rf_object_free(&o);           \
     }
-#define stack_debug(v)                                                     \
-    {                                                                      \
-        i32_t i = v->sp;                                                   \
-        while (i > 0)                                                      \
-            debug("%d: %s", v->sp - i - 1, rf_object_fmt(&v->stack[--i])); \
+#define stack_debug(v)                                                 \
+    {                                                                  \
+        i32_t i = v->sp;                                               \
+        while (i > 0)                                                  \
+            debug("%d: %s", v->sp - i, rf_object_fmt(&v->stack[--i])); \
     }
 typedef struct ctx_t
 {
@@ -401,13 +401,12 @@ op_trace:
 op_alloc:
     b = vm->ip++;
     type = code[vm->ip++];
+    c = code[vm->ip++];
     vm->counter = stack_peek(vm)->adt->len;
     // allocate result and write to a preserved space on the stack
-    debug("SIZEOF: %d", size_of(type));
     x1 = vector(type, size_of(type), vm->counter);
-    *stack_peek_n(vm, 3) = x1;
+    *stack_peek_n(vm, c) = x1;
     stack_push(vm, bool(vm->counter > 0));
-    stack_debug(vm);
     dispatch();
 op_map:
     b = vm->ip++;
@@ -427,15 +426,15 @@ op_map:
     dispatch();
 op_collect:
     b = vm->ip++;
+    c = code[vm->ip++];
     // get the result from another iteration
     x1 = stack_pop(vm);
-    stack_debug(vm);
-    addr = stack_peek_n(vm, 2);
+    // stack_debug(vm);
+    addr = stack_peek_n(vm, c + 1);
     l = addr->adt->len;
     vector_set(addr, l - vm->counter--, x1);
     // push counter comparison value
-    x1 = bool(vm->counter == 0);
-    stack_push(vm, x1);
+    stack_push(vm, bool(vm->counter == 0));
     dispatch();
 }
 

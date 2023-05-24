@@ -520,6 +520,7 @@ i8_t cc_compile_map(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t ar
         push_opcode(cc, car->id, code, OP_ALLOC);
         lbl0 = code->adt->len;
         push_opcode(cc, car->id, code, 0);
+        push_opcode(cc, car->id, code, (i8_t)arity);
         // additional check for zero length argument
         push_opcode(cc, car->id, code, OP_JNE);
         lbl1 = code->adt->len;
@@ -562,10 +563,14 @@ i8_t cc_compile_map(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t ar
         push_opcode(cc, car->id, code, (i8_t)arity);
         push_opcode(cc, car->id, code, OP_CALLF);
         push_opcode(cc, car->id, code, OP_COLLECT);
+        push_opcode(cc, car->id, code, (i8_t)arity);
         push_opcode(cc, car->id, code, OP_JNE);
         push_rf_object(code, i64(lbl2));
         // pop function
         push_opcode(cc, car->id, code, OP_POP);
+        // pop arguments
+        for (i = 0; i < arity; i++)
+            push_opcode(cc, car->id, code, OP_POP);
         ((rf_object_t *)(as_string(code) + lbl1))->i64 = code->adt->len;
 
         // additional one for ctx
