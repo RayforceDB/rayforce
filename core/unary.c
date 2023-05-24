@@ -179,6 +179,11 @@ rf_object_t rf_max_I64(rf_object_t *x)
     i32_t i;
     i64_t l = x->adt->len, max = x->adt->len ? as_vector_i64(x)[0] : 0, *v = as_vector_i64(x);
 
+    if (x->adt->attrs & VEC_ATTR_ASC)
+        return i64(v[l - 1]);
+    if (x->adt->attrs & VEC_ATTR_DESC)
+        return i64(v[0]);
+
     for (i = 0; i < l; i++)
         if (v[i] > max)
             max = v[i];
