@@ -96,23 +96,23 @@ alloc_t rf_alloc_get()
 null_t rf_alloc_cleanup()
 {
     // All the nodes remains are pools, so just munmap them
-    // for (i32_t i = 0; i <= MAX_POOL_ORDER; i++)
-    // {
-    //     node_t *node = _ALLOC->freelist[i], *next;
-    //     while (node)
-    //     {
-    //         next = node->next;
-    //         if (node->base != node)
-    //         {
-    //             printf("node->base: %p\n", node->base);
-    //             print_blocks();
-    //             node = next;
-    //             continue;
-    //         }
-    //         mmap_free(node->base, node->size);
-    //         node = next;
-    //     }
-    // }
+    for (i32_t i = 0; i <= MAX_POOL_ORDER; i++)
+    {
+        node_t *node = _ALLOC->freelist[i], *next;
+        while (node)
+        {
+            next = node->next;
+            if (node->base != node)
+            {
+                debug("node->base: %p\n", node->base);
+                // print_blocks();
+                node = next;
+                continue;
+            }
+            mmap_free(node->base, node->size);
+            node = next;
+        }
+    }
 
     mmap_free(_ALLOC, sizeof(struct alloc_t));
 }

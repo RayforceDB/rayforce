@@ -166,11 +166,12 @@ op_ret:
     l = (i32_t)as_list(&f->locals)[0].adt->len;
     for (i = 0; i < l; i++)
         stack_pop_free(vm); // pop locals
-    x1 = stack_pop(vm);     // ctx
+    x2 = stack_pop(vm);     // ctx
+    stack_pop_free(vm);     // <function>
     l = (i32_t)as_list(&f->args)[0].adt->len;
     for (i = 0; i < l; i++)
         stack_pop_free(vm); // pop args
-    ctx = *(ctx_t *)&x1;
+    ctx = *(ctx_t *)&x2;
     vm->ip = ctx.ip;
     vm->bp = ctx.bp;
     f = ctx.addr;
@@ -309,6 +310,8 @@ op_callf:
      * +-------------------+
      * | ctx {ret, ip, sp} | <- bp
      * +-------------------+
+     * |    <function>     |
+     * +-------------------+
      * |       argn        |
      * +-------------------+
      * |       ...         |
@@ -321,7 +324,7 @@ op_callf:
     b = vm->ip++;
     if ((vm->sp + f->stack_size) * sizeof(rf_object_t) > VM_STACK_SIZE)
         unwrap(error(ERR_STACK_OVERFLOW, "stack overflow"), b);
-    x2 = stack_pop(vm); // function
+    addr = stack_peek(vm); // function
     // save ctx
     ctx = (ctx_t){.addr = f, .ip = vm->ip, .bp = vm->bp};
     memcpy(&x1, &ctx, sizeof(ctx_t));
@@ -329,7 +332,7 @@ op_callf:
     vm->bp = vm->sp;
     stack_push(vm, x1);
     // --
-    f = as_function(&x2);
+    f = as_function(addr);
     code = as_string(&f->code);
     vm->sp += (i32_t)as_list(&f->locals)[0].adt->len;
     dispatch();

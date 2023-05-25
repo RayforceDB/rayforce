@@ -796,7 +796,7 @@ i8_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
             sym = as_vector_i64(arg_vals)[id];
             type = env_get_type_by_typename(env, sym);
             push_opcode(cc, object->id, code, OP_LLOAD);
-            push_rf_object(code, i64(-(arg_keys->adt->len - id)));
+            push_rf_object(code, i64(-(arg_keys->adt->len - id + 1)));
             func->stack_size++;
 
             return type;
