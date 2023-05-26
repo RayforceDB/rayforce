@@ -123,6 +123,30 @@ static inline __attribute__((always_inline)) rf_object_t rf_cast(i8_t type, rf_o
         for (i = 0; i < y->adt->len; i++)
             as_vector_bool(&x)[i] = as_list(y)[i].i64 != 0;
         break;
+    case m(-TYPE_GUID, TYPE_CHAR):
+        x = guid(NULL);
+
+        if (strlen(as_string(y)) != 36)
+            break;
+
+        x.guid = rf_malloc(sizeof(guid_t));
+
+        i = sscanf(as_string(y),
+                   "%02hhx%02hhx%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx%02hhx%02hhx%02hhx%02hhx",
+                   &x.guid->data[0], &x.guid->data[1], &x.guid->data[2], &x.guid->data[3],
+                   &x.guid->data[4], &x.guid->data[5],
+                   &x.guid->data[6], &x.guid->data[7],
+                   &x.guid->data[8], &x.guid->data[9],
+                   &x.guid->data[10], &x.guid->data[11], &x.guid->data[12],
+                   &x.guid->data[13], &x.guid->data[14], &x.guid->data[15]);
+
+        if (i != 16)
+        {
+            rf_free(x.guid);
+            x = guid(NULL);
+        }
+
+        break;
     default:
         msg = str_fmt(0, "invalid conversion from '%s' to '%s'",
                       symbols_get(env_get_typename_by_type(&runtime_get()->env, y->type)),
