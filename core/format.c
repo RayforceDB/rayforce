@@ -287,6 +287,22 @@ i32_t ts_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t lim
     return n;
 }
 
+i32_t guid_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *object)
+{
+    UNUSED(indent);
+
+    guid_t *guid = object->guid;
+    u8_t *uuid_buffer = (u8_t *)guid;
+    i32_t n = str_fmt_into(dst, len, offset, limit, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                           uuid_buffer[0], uuid_buffer[1], uuid_buffer[2], uuid_buffer[3],
+                           uuid_buffer[4], uuid_buffer[5],
+                           uuid_buffer[6], uuid_buffer[7],
+                           uuid_buffer[8], uuid_buffer[9],
+                           uuid_buffer[10], uuid_buffer[11], uuid_buffer[12], uuid_buffer[13], uuid_buffer[14], uuid_buffer[15]);
+
+    return n;
+}
+
 i32_t dict_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object)
 {
     rf_object_t *keys = &as_list(rf_object)[0], *vals = &as_list(rf_object)[1];
@@ -491,6 +507,8 @@ i32_t rf_object_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i3
         return symbol_fmt_into(dst, len, offset, indent, limit, object->i64);
     case -TYPE_TIMESTAMP:
         return ts_fmt_into(dst, len, offset, indent, limit, object);
+    case -TYPE_GUID:
+        return guid_fmt_into(dst, len, offset, indent, limit, object);
     case -TYPE_CHAR:
         return str_fmt_into(dst, len, offset, limit, "'%c'", object->schar ? object->schar : 1);
     case TYPE_BOOL:

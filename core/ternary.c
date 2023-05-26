@@ -21,22 +21,19 @@
  *   SOFTWARE.
  */
 
-#include <time.h>
 #include "ternary.h"
 #include "ops.h"
 #include "util.h"
 
 rf_object_t rf_rand_i64_i64_i64(rf_object_t *x, rf_object_t *y, rf_object_t *z)
 {
-    i64_t i, seed, num, count = x->i64, mod = (z->i64 - y->i64 + 1), *v;
+    i64_t i, count = x->i64, mod = (z->i64 - y->i64 + 1), *v;
     rf_object_t vec = vector_i64(count);
 
     v = as_vector_i64(&vec);
 
-    seed = time(0);
-
     for (i = 0; i < count; i++)
-        v[i] = rand_i64(&seed) % mod;
+        v[i] = rand_i64() % mod;
 
     return vec;
 }

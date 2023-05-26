@@ -21,22 +21,18 @@
  *   SOFTWARE.
  */
 
-#include <time.h>
 #include "guid.h"
 #include "alloc.h"
+#include "ops.h"
 
 rf_object_t rf_guid_generate()
 {
     i64_t i;
-    u64_t seed, num;
     rf_object_t g = guid(NULL);
     g.guid = (guid_t *)rf_malloc(sizeof(guid_t));
 
-    seed = time(0);
-
-    for (i = 0; i < 2; i++)
-    {
-    }
+    for (i = 0; i < 16; i++)
+        g.guid->data[i] = rand_i64() % 256;
 
     return g;
 }

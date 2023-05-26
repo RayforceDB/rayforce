@@ -949,28 +949,6 @@ rf_object_t rf_find_F64_F64(rf_object_t *x, rf_object_t *y)
     return vec;
 }
 
-rf_object_t rf_rand_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    // Parameters for a linear congruential generator (LCG)
-#define LCG_MULTIPLIER 1103515245ll
-#define LCG_INCREMENT 12345ll
-#define LCG_MODULUS (1ll << 63) // 2^63
-
-    i64_t i, n = x->i64, range = y->i64;
-    i64_t seed = time(0);
-    rf_object_t vec = vector_i64(n);
-    i64_t *ov = as_vector_i64(&vec);
-
-    for (i = 0; i < n; i++)
-    {
-        seed = (LCG_MULTIPLIER * seed + LCG_INCREMENT) % LCG_MODULUS;
-        ov[i] = seed % range;
-    }
-
-    vec.adt->attrs = VEC_ATTR_WITHOUT_NULLS;
-    return vec;
-}
-
 rf_object_t rf_concat_bool_bool(rf_object_t *x, rf_object_t *y)
 {
     rf_object_t vec = vector_bool(2);

@@ -137,7 +137,7 @@ rf_object_t symboli64(i64_t id)
     return sym;
 }
 
-rf_object_t guid(i8_t data[])
+rf_object_t guid(u8_t data[])
 {
     rf_object_t guid = {
         .type = -TYPE_GUID,
@@ -255,6 +255,13 @@ rf_object_t rf_object_clone(rf_object_t *object)
 {
     i64_t i, l;
 
+    if (object->type == -TYPE_GUID)
+    {
+        guid_t *g = (guid_t *)rf_malloc(sizeof(struct guid_t));
+        memcpy(g->data, object->guid->data, sizeof(guid_t));
+        return guid(g->data);
+    }
+
     if (object->type < TYPE_NULL)
         return *object;
 
@@ -308,6 +315,12 @@ null_t rf_object_free(rf_object_t *object)
 {
     i64_t i, rc, l, *addrs;
     str_t code;
+
+    if (object->type == -TYPE_GUID)
+    {
+        rf_free(object->guid);
+        return;
+    }
 
     if (object->type < 0)
         return;
