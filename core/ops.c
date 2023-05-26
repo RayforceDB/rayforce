@@ -75,3 +75,27 @@ bool_t rf_lt(rf_object_t *x, rf_object_t *y)
         return 0;
     }
 }
+
+i64_t round_f64(f64_t x)
+{
+    return x >= 0.0 ? (i64_t)(x + 0.5) : (i64_t)(x - 0.5);
+}
+
+i64_t floor_f64(f64_t x)
+{
+    return x >= 0.0 ? (i64_t)x : (i64_t)(x - 1.0);
+}
+
+i64_t ceil_f64(f64_t x)
+{
+    return x >= 0.0 ? (i64_t)(x + 1.0) : (i64_t)x;
+}
+
+i64_t rand_i64(i64_t *seed)
+{
+#define A 6364136223846793005LL
+#define C 1442695040888963407LL
+#define M (1LL << 63)
+    *seed = (A * *seed + C) % M;
+    return *seed;
+}

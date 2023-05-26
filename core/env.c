@@ -169,6 +169,7 @@ null_t init_typenames(i64_t *typenames)
     typenames[-TYPE_F64       + TYPE_OFFSET] = symbol("f64").i64;
     typenames[-TYPE_SYMBOL    + TYPE_OFFSET] = symbol("symbol").i64;
     typenames[-TYPE_TIMESTAMP + TYPE_OFFSET] = symbol("timestamp").i64;
+    typenames[-TYPE_GUID      + TYPE_OFFSET] = symbol("guid").i64;
     typenames[-TYPE_CHAR      + TYPE_OFFSET] = symbol("char").i64;
     typenames[ TYPE_NULL      + TYPE_OFFSET] = symbol("Null").i64;
     typenames[ TYPE_BOOL      + TYPE_OFFSET] = symbol("Bool").i64;
@@ -176,6 +177,7 @@ null_t init_typenames(i64_t *typenames)
     typenames[ TYPE_F64       + TYPE_OFFSET] = symbol("F64").i64;
     typenames[ TYPE_SYMBOL    + TYPE_OFFSET] = symbol("Symbol").i64;
     typenames[ TYPE_TIMESTAMP + TYPE_OFFSET] = symbol("Timestamp").i64;
+    typenames[ TYPE_GUID      + TYPE_OFFSET] = symbol("Guid").i64;
     typenames[ TYPE_CHAR      + TYPE_OFFSET] = symbol("Char").i64;
     typenames[ TYPE_LIST      + TYPE_OFFSET] = symbol("List").i64;
     typenames[ TYPE_DICT      + TYPE_OFFSET] = symbol("Dict").i64;

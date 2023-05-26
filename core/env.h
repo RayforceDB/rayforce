@@ -32,7 +32,7 @@
 #define MAX_ARITY 4
 // offset in array of typenames for each type
 #define TYPE_OFFSET TYPE_CHAR
-#define MAX_TYPE (TYPE_ERROR - TYPE_CHAR + TYPE_ERROR)
+#define MAX_TYPE (TYPE_ERROR - TYPE_CHAR + TYPE_ERROR + 1)
 
 typedef rf_object_t (*nilary_t)();
 typedef rf_object_t (*unary_t)(rf_object_t *);

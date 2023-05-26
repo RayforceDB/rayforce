@@ -4,12 +4,12 @@ AR=ar
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=c17 -Ofast -march=native -fassociative-math -ftree-vectorize -m64
 # DEBUG_CFLAGS =  -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG -DSYS_MALLOC
 DEBUG_CFLAGS =  -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG -m64
-CORE_HEADERS = core/mmap.h core/timestamp.h core/sort.h core/cast.h core/ops.h core/util.h\
+CORE_HEADERS = core/mmap.h core/timestamp.h core/guid.h core/sort.h core/cast.h core/ops.h core/util.h\
  core/vector.h core/string.h core/hash.h core/symbols.h core/format.h core/rayforce.h core/alloc.h\
  core/runtime.h core/dict.h core/parse.h core/vm.h core/debuginfo.h core/cc.h core/env.h core/function.h\
  core/nilary.h core/unary.h core/binary.h core/ternary.h core/nary.h
 APP_HEADERS = app/parse.h
-CORE_OBJECTS = core/timestamp.o core/sort.o core/ops.o core/util.o core/vector.o core/string.o core/hash.o core/symbols.o\
+CORE_OBJECTS = core/timestamp.o core/guid.o core/sort.o core/ops.o core/util.o core/vector.o core/string.o core/hash.o core/symbols.o\
  core/alloc.o core/format.o core/rayforce.o core/parse.o core/runtime.o core/dict.o\
  core/vm.o core/debuginfo.o core/cc.o core/env.o core/function.o\
  core/nilary.o core/unary.o core/binary.o core/ternary.o core/nary.o

@@ -33,6 +33,7 @@
 #include "runtime.h"
 #include "ops.h"
 #include "function.h"
+#include "timestamp.h"
 
 #define MAX_ROW_WIDTH 120
 #define FORMAT_TRAILER_SIZE 4
@@ -275,9 +276,13 @@ i32_t string_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t
     return n;
 }
 
-i32_t ts_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object)
+i32_t ts_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *object)
 {
-    i32_t n = str_fmt_into(dst, len, offset, limit, "timestamp");
+    UNUSED(indent);
+
+    timestamp_t ts = rf_timestamp_from_i64(object->i64);
+    i32_t n = str_fmt_into(dst, len, offset, limit, "%.4d.%.2d.%.2dD%.2d:%.2d:%.2d.%.9d",
+                           ts.year, ts.month, ts.day, ts.hours, ts.mins, ts.secs, ts.nanos);
 
     return n;
 }

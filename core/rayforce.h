@@ -45,12 +45,13 @@ extern "C"
 #define TYPE_F64 3
 #define TYPE_SYMBOL 4
 #define TYPE_TIMESTAMP 5
-#define TYPE_CHAR 6
-#define TYPE_LIST 7
-#define TYPE_DICT 8
-#define TYPE_TABLE 9
-#define TYPE_FUNCTION 10
-#define TYPE_ERROR 11
+#define TYPE_GUID 6
+#define TYPE_CHAR 7
+#define TYPE_LIST 8
+#define TYPE_DICT 9
+#define TYPE_TABLE 10
+#define TYPE_FUNCTION 11
+#define TYPE_ERROR 12
 #define TYPE_ANY 127
 
 // Result constants
@@ -118,6 +119,16 @@ typedef struct header_t
 
 CASSERT(sizeof(struct header_t) == 32, rayforce_h)
 
+/*
+ * GUID (Globally Unique Identifier)
+ */
+typedef struct guid_t
+{
+    i8_t data[16];
+} guid_t;
+
+CASSERT(sizeof(struct guid_t) == 16, rayforce_h)
+
 // Generic type
 typedef struct rf_object_t
 {
@@ -127,6 +138,7 @@ typedef struct rf_object_t
         char_t schar;
         i64_t i64;
         f64_t f64;
+        guid_t *guid;
         header_t *adt;
     };
 
@@ -146,6 +158,7 @@ extern rf_object_t f64(f64_t val);                                          // f
 extern rf_object_t symbol(str_t ptr);                                       // symbol
 extern rf_object_t symboli64(i64_t id);                                     // symbol from i64
 extern rf_object_t timestamp(i64_t val);                                    // timestamp
+extern rf_object_t guid(i8_t data[]);                                       // GUID
 extern rf_object_t schar(char_t c);                                         // char
 extern rf_object_t vector(i8_t type, i8_t size_of_val, i64_t len);          // vector of type
 extern rf_object_t string(i64_t len);                                       // string 
@@ -156,6 +169,7 @@ extern rf_object_t string(i64_t len);                                       // s
 #define vector_f64(len)       (vector(TYPE_F64, sizeof(f64_t), len))        // f64 vector
 #define vector_symbol(len)    (vector(TYPE_SYMBOL, sizeof(i64_t), len))     // symbol vector
 #define vector_timestamp(len) (vector(TYPE_TIMESTAMP, sizeof(i64_t), len))  // char vector
+#define vector_guid(len)      (vector(TYPE_GUID, sizeof(guid_t), len))      // GUID vector
 #define list(len)             (vector(TYPE_LIST, sizeof(rf_object_t), len)) // list
 
 extern rf_object_t table(rf_object_t keys, rf_object_t vals);               // table
@@ -179,6 +193,7 @@ extern null_t rf_object_free(rf_object_t *rf_object);
 #define as_vector_f64(object)       ((f64_t *)(as_string(object)))
 #define as_vector_symbol(object)    ((i64_t *)(as_string(object)))
 #define as_vector_timestamp(object) ((i64_t *)(as_string(object)))
+#define as_vector_guid(object)      ((guid_t *)(as_string(object)))
 #define as_list(object)             ((rf_object_t *)(as_string(object)))
 
 // Checkers

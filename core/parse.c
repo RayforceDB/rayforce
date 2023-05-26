@@ -36,6 +36,7 @@
 #include "debuginfo.h"
 #include "runtime.h"
 #include "ops.h"
+#include "timestamp.h"
 
 span_t span_start(parser_t *parser)
 {
@@ -126,6 +127,149 @@ rf_object_t to_token(parser_t *parser)
     tok.type = TYPE_TOKEN;
     tok.id = span_commit(parser, span_start(parser));
     return tok;
+}
+
+rf_object_t parse_timestamp(parser_t *parser)
+{
+    str_t end, current = parser->current;
+    u32_t nanos;
+    timestamp_t ts = {0};
+    rf_object_t res;
+    span_t span = span_start(parser);
+
+    // check if null
+    if (*current == '0')
+    {
+        if (*(current + 1) == 't')
+        {
+            shift(parser, 2);
+            res = timestamp(NULL_I64);
+            res.id = span_commit(parser, span);
+            return res;
+        }
+    }
+
+    // parse year
+    if (is_digit(*current) &&
+        is_digit(*(current + 1)) &&
+        is_digit(*(current + 2)) &&
+        is_digit(*(current + 3)))
+    {
+        ts.year = (*current - '0') * 1000 +
+                  (*(current + 1) - '0') * 100 +
+                  (*(current + 2) - '0') * 10 +
+                  (*(current + 3) - '0');
+        current += 4;
+    }
+    else
+        return null();
+
+    // skip dot
+    if (*current != '.')
+        return null();
+
+    current++;
+
+    // parse month
+    if (is_digit(*current) &&
+        is_digit(*(current + 1)))
+    {
+        ts.month = (*current - '0') * 10 +
+                   (*(current + 1) - '0');
+        current += 2;
+    }
+    else
+        return null();
+
+    // skip dot
+    if (*current != '.')
+        return null();
+
+    current++;
+
+    // parse day
+    if (is_digit(*current) &&
+        is_digit(*(current + 1)))
+    {
+        ts.day = (*current - '0') * 10 +
+                 (*(current + 1) - '0');
+        current += 2;
+    }
+    else
+        return null();
+
+    // skip D
+    if (*current != 'D')
+        return null();
+
+    current++;
+
+    // parse hour
+    if (is_digit(*current) &&
+        is_digit(*(current + 1)))
+    {
+        ts.hours = (*current - '0') * 10 +
+                   (*(current + 1) - '0');
+        current += 2;
+    }
+    else
+        return null();
+
+    // skip colon
+    if (*current != ':')
+        return null();
+
+    current++;
+
+    // parse minute
+    if (is_digit(*current) &&
+        is_digit(*(current + 1)))
+    {
+        ts.mins = (*current - '0') * 10 +
+                  (*(current + 1) - '0');
+        current += 2;
+    }
+    else
+        return null();
+
+    // skip colon
+    if (*current != ':')
+        return null();
+
+    current++;
+
+    // parse second
+    if (is_digit(*current) &&
+        is_digit(*(current + 1)))
+    {
+        ts.secs = (*current - '0') * 10 +
+                  (*(current + 1) - '0');
+        current += 2;
+    }
+    else
+        return null();
+
+    // skip dot
+    if (*current != '.')
+        return null();
+
+    current++;
+
+    // parse nanos
+    nanos = strtoul(current, &end, 10);
+
+    if (end == current)
+        return null();
+
+    ts.nanos = nanos;
+    shift(parser, parser->current - current);
+
+    res = timestamp(rf_timestamp_into_i64(ts));
+
+    span_extend(parser, &span);
+    res.id = span_commit(parser, span);
+
+    return res;
 }
 
 rf_object_t parse_number(parser_t *parser)
@@ -586,6 +730,13 @@ rf_object_t advance(parser_t *parser)
 
     if ((*parser->current) == '{')
         return parse_dict(parser);
+
+    if (is_digit(*parser->current))
+    {
+        tok = parse_timestamp(parser);
+        if (tok.type != TYPE_NULL)
+            return tok;
+    }
 
     if (((*parser->current) == '-' && is_digit(*(parser->current + 1))) || is_digit(*parser->current))
         return parse_number(parser);

@@ -60,5 +60,9 @@
 extern bool_t rf_is_nan(f64_t x);
 extern bool_t rf_eq(rf_object_t *x, rf_object_t *y);
 extern bool_t rf_lt(rf_object_t *x, rf_object_t *y);
+i64_t round_f64(f64_t x);
+i64_t floor_f64(f64_t x);
+i64_t ceil_f64(f64_t x);
+i64_t rand_i64(i64_t *seed);
 
 #endif

@@ -27,7 +27,21 @@
 #include <time.h>
 #include "rayforce.h"
 
-rf_object_t rf_timestamp_from_i64(i64_t offset);
-rf_object_t rf_timestamp_from_str(str_t str);
+typedef struct timestamp_t
+{
+    bool_t null;
+    u16_t year;
+    u8_t month;
+    u8_t day;
+    u8_t hours;
+    u8_t mins;
+    u8_t secs;
+    u32_t nanos;
+} timestamp_t;
+
+CASSERT(sizeof(struct timestamp_t) == 16, timestamp_h);
+
+timestamp_t rf_timestamp_from_i64(i64_t offset);
+i64_t rf_timestamp_into_i64(timestamp_t ts);
 
 #endif

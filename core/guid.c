@@ -22,21 +22,21 @@
  */
 
 #include <time.h>
-#include "ternary.h"
-#include "ops.h"
-#include "util.h"
+#include "guid.h"
+#include "alloc.h"
 
-rf_object_t rf_rand_i64_i64_i64(rf_object_t *x, rf_object_t *y, rf_object_t *z)
+rf_object_t rf_guid_generate()
 {
-    i64_t i, seed, num, count = x->i64, mod = (z->i64 - y->i64 + 1), *v;
-    rf_object_t vec = vector_i64(count);
-
-    v = as_vector_i64(&vec);
+    i64_t i;
+    u64_t seed, num;
+    rf_object_t g = guid(NULL);
+    g.guid = (guid_t *)rf_malloc(sizeof(guid_t));
 
     seed = time(0);
 
-    for (i = 0; i < count; i++)
-        v[i] = rand_i64(&seed) % mod;
+    for (i = 0; i < 2; i++)
+    {
+    }
 
-    return vec;
+    return g;
 }

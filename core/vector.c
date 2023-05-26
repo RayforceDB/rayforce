@@ -174,10 +174,11 @@ i64_t vector_find(rf_object_t *vector, rf_object_t *key)
     f64_t kf, *vf;
     rf_object_t *kl, *vl;
     i64_t i, l;
+    guid_t *kg, *vg;
     i8_t type = vector->type - TYPE_BOOL;
 
     static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
-                                    &&type_timestamp, &&type_char, &&type_list};
+                                    &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
     if (type > TYPE_LIST)
         panic("vector_get: non-gettable type");
@@ -221,6 +222,13 @@ type_timestamp:
         if (vi[i] == ki)
             return i;
     return l;
+type_guid:
+    vg = as_vector_guid(vector);
+    kg = key->guid;
+    for (i = 0; i < l; i++)
+        if (memcmp(vg + i, kg, sizeof(guid_t)) == 0)
+            return i;
+    return l;
 type_char:
     vc = as_string(vector);
     kc = key->schar;
@@ -243,7 +251,7 @@ rf_object_t vector_get(rf_object_t *vector, i64_t index)
     i8_t type = vector->type - TYPE_BOOL;
 
     static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
-                                    &&type_timestamp, &&type_char, &&type_list};
+                                    &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
     // if (type > TYPE_LIST)
     //     panic("vector_get: non-gettable type");
@@ -272,6 +280,10 @@ type_timestamp:
     if (index < l)
         return i64(as_vector_i64(vector)[index]);
     return i64(NULL_I64);
+type_guid:
+    if (index < l)
+        return guid(as_vector_guid(vector)[index].data);
+    return guid(NULL);
 type_char:
     if (index < l)
         return schar(as_string(vector)[index]);
@@ -284,10 +296,11 @@ type_list:
 
 null_t vector_set(rf_object_t *vector, i64_t index, rf_object_t value)
 {
+    guid_t *g;
     i8_t type = vector->type - TYPE_BOOL;
 
     static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
-                                    &&type_timestamp, &&type_char, &&type_list};
+                                    &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
     // if (type > TYPE_LIST)
     // panic("vector_set: non-settable type");
@@ -311,6 +324,10 @@ type_symbol:
     return;
 type_timestamp:
     as_vector_i64(vector)[index] = value.i64;
+    return;
+type_guid:
+    g = as_vector_guid(vector);
+    memcpy(g + index, value.guid, sizeof(guid_t));
     return;
 type_char:
     as_string(vector)[index] = value.schar;
