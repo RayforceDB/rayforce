@@ -114,6 +114,7 @@ rf_object_t vector_get(rf_object_t *vector, i64_t index);
 null_t vector_set(rf_object_t *vector, i64_t index, rf_object_t value);
 i64_t vector_push(rf_object_t *vector, rf_object_t object);
 null_t vector_reserve(rf_object_t *vector, u32_t len);
+null_t vector_grow(rf_object_t *vector, u32_t len);
 null_t vector_shrink(rf_object_t *vector, u32_t len);
 null_t vector_free(rf_object_t *vector);
 #endif
