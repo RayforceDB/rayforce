@@ -38,22 +38,23 @@ typedef struct bucket_t
     u32_t state;
 } bucket_t;
 
-typedef struct hash_table_t
+typedef struct ht_t
 {
     u64_t (*hasher)(null_t *a);
     i32_t (*compare)(null_t *a, null_t *b);
     u64_t size;
     u64_t count;
     bucket_t *buckets;
-} hash_table_t;
+} ht_t;
 
-hash_table_t *ht_new(u64_t size, u64_t (*hasher)(null_t *a), i32_t (*compare)(null_t *a, null_t *b));
-null_t ht_free(hash_table_t *table);
-
-null_t *ht_insert(hash_table_t *table, null_t *key, null_t *val);
-null_t *ht_insert_with(hash_table_t *table, null_t *key, null_t *val, null_t *(*func)(null_t *key, null_t *val, bucket_t *bucket));
-bool_t ht_update(hash_table_t *table, null_t *key, null_t *val);
-null_t *ht_get(hash_table_t *table, null_t *key);
-bucket_t *ht_next_bucket(hash_table_t *table, u64_t *index);
+// clang-format off
+ht_t     *ht_new(u64_t size, u64_t (*hasher)(null_t *a), i32_t (*compare)(null_t *a, null_t *b));
+null_t    ht_free(ht_t *table);
+null_t   *ht_insert(ht_t *table, null_t *key, null_t *val);
+null_t   *ht_insert_with(ht_t *table, null_t *key, null_t *val, null_t *(*func)(null_t *key, null_t *val, bucket_t *bucket));
+bool_t    ht_update(ht_t *table, null_t *key, null_t *val);
+null_t   *ht_get(ht_t *table, null_t *key);
+bucket_t *ht_next_bucket(ht_t *table, u64_t *index);
+// clang-format on
 
 #endif

@@ -41,7 +41,7 @@
 
 // int test_hash()
 // {
-//     hash_table_t *table = ht_new();
+//     ht_t *table = ht_new();
 //     clock_t start, end;
 //     f64_t cpu_time_used;
 

@@ -31,10 +31,10 @@
 #include "alloc.h"
 #include "util.h"
 
-hash_table_t *ht_new(u64_t size, u64_t (*hasher)(null_t *a), i32_t (*compare)(null_t *a, null_t *b))
+ht_t *ht_new(u64_t size, u64_t (*hasher)(null_t *a), i32_t (*compare)(null_t *a, null_t *b))
 {
     size = next_power_of_two_u64(size);
-    hash_table_t *table = (hash_table_t *)rf_malloc(sizeof(struct hash_table_t));
+    ht_t *table = (ht_t *)rf_malloc(sizeof(struct ht_t));
 
     table->buckets = (bucket_t *)rf_malloc(sizeof(bucket_t) * size);
     table->size = size;
@@ -47,13 +47,13 @@ hash_table_t *ht_new(u64_t size, u64_t (*hasher)(null_t *a), i32_t (*compare)(nu
     return table;
 }
 
-null_t ht_free(hash_table_t *table)
+null_t ht_free(ht_t *table)
 {
     rf_free(table->buckets);
     rf_free(table);
 }
 
-null_t rehash(hash_table_t *table)
+null_t rehash(ht_t *table)
 {
     u64_t i, old_size = table->size;
     bucket_t *old_buckets = table->buckets;
@@ -71,7 +71,7 @@ null_t rehash(hash_table_t *table)
     rf_free(old_buckets);
 }
 
-null_t rehash_with(hash_table_t *table, null_t *(*func)(null_t *key, null_t *val, bucket_t *bucket))
+null_t rehash_with(ht_t *table, null_t *(*func)(null_t *key, null_t *val, bucket_t *bucket))
 {
     u64_t i, old_size = table->size;
     bucket_t *old_buckets = table->buckets;
@@ -93,7 +93,7 @@ null_t rehash_with(hash_table_t *table, null_t *(*func)(null_t *key, null_t *val
  * Inserts new node or returns existing node.
  * Does not update existing node.
  */
-null_t *ht_insert(hash_table_t *table, null_t *key, null_t *val)
+null_t *ht_insert(ht_t *table, null_t *key, null_t *val)
 {
     // Table's size is always a power of 2
     u64_t factor = table->size - 1,
@@ -153,7 +153,7 @@ null_t *ht_insert(hash_table_t *table, null_t *key, null_t *val)
 /*
  * Does the same as ht_insert, but uses a function to set the rf_object of the bucket.
  */
-null_t *ht_insert_with(hash_table_t *table, null_t *key, null_t *val,
+null_t *ht_insert_with(ht_t *table, null_t *key, null_t *val,
                        null_t *(*func)(null_t *key, null_t *val, bucket_t *bucket))
 {
     // Table's size is always a power of 2
@@ -212,7 +212,7 @@ null_t *ht_insert_with(hash_table_t *table, null_t *key, null_t *val,
  * Inserts new node or updates existing one.
  * Returns true if the node was updated, false if it was inserted.
  */
-bool_t ht_update(hash_table_t *table, null_t *key, null_t *val)
+bool_t ht_update(ht_t *table, null_t *key, null_t *val)
 {
     // Table's size is always a power of 2
     u64_t factor = table->size - 1,
@@ -274,14 +274,15 @@ bool_t ht_update(hash_table_t *table, null_t *key, null_t *val)
  * Returns the rf_object of the node with the given key.
  * Returns -1 if the key does not exist.
  */
-null_t *ht_get(hash_table_t *table, null_t *key)
+null_t *ht_get(ht_t *table, null_t *key)
 {
     // Table's size is always a power of 2
     u64_t factor = table->size - 1,
           index = table->hasher(key) & factor;
     u32_t distance = 0;
 
-    while (table->buckets[index].state == STATE_OCCUPIED && distance <= table->buckets[index].distance)
+    while (table->buckets[index].state == STATE_OCCUPIED &&
+           distance <= table->buckets[index].distance)
     {
         if (table->compare(table->buckets[index].key, key) == 0)
             return table->buckets[index].val;
@@ -293,7 +294,7 @@ null_t *ht_get(hash_table_t *table, null_t *key)
     return (null_t *)NULL_I64;
 }
 
-bucket_t *ht_next_bucket(hash_table_t *table, u64_t *index)
+bucket_t *ht_next_bucket(ht_t *table, u64_t *index)
 {
     bucket_t *bucket;
 

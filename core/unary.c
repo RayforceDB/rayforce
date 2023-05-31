@@ -101,7 +101,7 @@ rf_object_t rf_group_I64(rf_object_t *x)
     // rf_object_t vec = vector_i64(xl), found;
     // i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y),
     //       *ov = as_vector_i64(&vec), *fv, v;
-    // hash_table_t *ht;
+    // ht_t *ht;
 
     // // otherwise, use a hash table
     // ht = ht_new(xl, i64_hash, i64_cmp);

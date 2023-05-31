@@ -44,8 +44,8 @@ typedef struct pool_node_t
  */
 typedef struct symbols_t
 {
-    hash_table_t *str_to_id;
-    hash_table_t *id_to_str;
+    ht_t *str_to_id;
+    ht_t *id_to_str;
     pool_node_t *pool_node_0;
     pool_node_t *pool_node;
     str_t strings_pool;

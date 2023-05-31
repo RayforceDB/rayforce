@@ -1060,7 +1060,7 @@ rf_object_t rf_find_I64_I64(rf_object_t *x, rf_object_t *y)
     rf_object_t vec = vector_i64(yl), found;
     i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y),
           *ov = as_vector_i64(&vec), *fv, v;
-    hash_table_t *ht;
+    ht_t *ht;
 
     for (i = 0; i < xl; i++)
     {

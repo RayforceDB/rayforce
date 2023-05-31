@@ -37,7 +37,7 @@ typedef struct debuginfo_t
 {
     str_t filename;
     str_t function;
-    hash_table_t *spans;
+    ht_t *spans;
 } debuginfo_t;
 
 debuginfo_t debuginfo_new(str_t filename, str_t function);
