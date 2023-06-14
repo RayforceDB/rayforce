@@ -29,11 +29,11 @@
 
 // clang-format off
 #define MIN_ORDER      4
-#define MAX_ORDER      25 // 2^25 = 32MB
+#define MAX_ORDER      28 // 2^28 = 256MB
 #define MAX_POOL_ORDER 36 // 2^36 = 64GB
-#define MIN_ALLOC      ((i64_t)1 << MIN_ORDER)
-#define MAX_ALLOC      ((i64_t)1 << MAX_ORDER)
-#define POOL_SIZE      (1 << MAX_ORDER)
+#define MIN_ALLOC      (1ull << MIN_ORDER)
+#define MAX_ALLOC      (1ull << MAX_ORDER)
+#define POOL_SIZE      (1ull << MAX_ORDER)
 
 typedef struct node_t
 {
@@ -49,9 +49,9 @@ CASSERT(sizeof(struct node_t) == 16, alloc_h)
 
 typedef struct memstat_t
 {
-    i64_t total;
-    i64_t used;
-    i64_t free;
+    u64_t total;
+    u64_t used;
+    u64_t free;
 } memstat_t;
 
 typedef struct alloc_t

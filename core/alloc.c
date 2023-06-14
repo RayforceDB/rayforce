@@ -34,10 +34,9 @@ static alloc_t _ALLOC = NULL;
 // clang-format off
 #define AVAIL_MASK       ((u64_t)0xFFFFFFFFFFFFFFFF)
 
-#define blocksize(i)     (1 << (i))
-#define buddyof(p, b, i) ((null_t *)(((i64_t)(p - b) ^ blocksize(i)) + b))
-#define realsize(s)      (s + sizeof(struct node_t))
-#define orderof(s)       (64 - __builtin_clzl(s - 1))
+#define blocksize(i)     (1ull << (i))
+#define buddyof(p, b, i) ((null_t *)(((u64_t)(p - b) ^ blocksize(i)) + b))
+#define orderof(s)       (64ull - __builtin_clzl(s - 1))
 // clang-format on
 
 null_t print_blocks()
@@ -65,27 +64,27 @@ null_t *rf_alloc_add_pool(u32_t size)
     assert(node != NULL);
     assert((i64_t)node % 16 == 0);
 
-    node->size = size;
     node->base = pool;
-    node->next = NULL;
+    node->size = size;
 
     return (null_t *)node;
 }
 
-null_t rf_alloc_add_main_pool()
-{
-    node_t *node = (node_t *)rf_alloc_add_pool(realsize(POOL_SIZE));
-
-    _ALLOC->freelist[MAX_ORDER] = node;
-    _ALLOC->avail |= 1 << MAX_ORDER;
-}
-
 alloc_t rf_alloc_init()
 {
+    i32_t order;
+
     _ALLOC = (alloc_t)mmap_malloc(sizeof(struct alloc_t));
     _ALLOC->avail = 0;
 
-    rf_alloc_add_main_pool();
+    for (order = MAX_ORDER - 6; order <= MAX_ORDER; order++)
+    {
+        node_t *node = (node_t *)rf_alloc_add_pool(1ull << order);
+
+        node->next = NULL;
+        _ALLOC->freelist[order] = node;
+        _ALLOC->avail |= 1ull << order;
+    }
 
     return _ALLOC;
 }
@@ -97,8 +96,10 @@ alloc_t rf_alloc_get()
 
 null_t rf_alloc_cleanup()
 {
+    i32_t i;
+
     // All the nodes remains are pools, so just munmap them
-    for (i32_t i = 0; i <= MAX_POOL_ORDER; i++)
+    for (i = 0; i <= MAX_POOL_ORDER; i++)
     {
         node_t *node = _ALLOC->freelist[i], *next;
         while (node)
@@ -161,14 +162,13 @@ null_t *rf_realloc(null_t *ptr, u64_t new_size)
 
 null_t *rf_malloc(u64_t size)
 {
-    i32_t i, order;
-    null_t *block;
+    u32_t i, order;
+    null_t *block, *base;
     node_t *node;
-
-    size = realsize(size);
+    u64_t capacity = size + sizeof(struct node_t);
 
     // calculate minimal order for this size
-    order = orderof(size);
+    order = orderof(capacity);
 
     if (order > MAX_POOL_ORDER)
         return NULL;
@@ -180,13 +180,19 @@ null_t *rf_malloc(u64_t size)
     // add a new pool and split as well
     if (i == 0)
     {
-        if (size >= POOL_SIZE)
+        if (capacity >= POOL_SIZE)
         {
-            block = rf_alloc_add_pool(size);
+            capacity = 1ull << order;
+            block = rf_alloc_add_pool(capacity);
             return (null_t *)((node_t *)block + 1);
         }
 
-        rf_alloc_add_main_pool();
+        node_t *node = (node_t *)rf_alloc_add_pool(POOL_SIZE);
+
+        node->next = NULL;
+        _ALLOC->freelist[MAX_ORDER] = node;
+        _ALLOC->avail |= 1 << MAX_ORDER;
+
         i = MAX_ORDER;
     }
     else
@@ -195,7 +201,6 @@ null_t *rf_malloc(u64_t size)
     // remove the block out of list
     block = _ALLOC->freelist[i];
     _ALLOC->freelist[i] = _ALLOC->freelist[i]->next;
-    ((node_t *)block)->size = size;
 
     if (_ALLOC->freelist[i] == NULL)
         _ALLOC->avail &= ~blocksize(i);
@@ -203,23 +208,24 @@ null_t *rf_malloc(u64_t size)
     // split until i == order
     while ((i--) > order)
     {
-        node = (node_t *)buddyof(block, ((node_t *)block)->base, i);
-        node->size = size;
+        base = ((node_t *)block)->base;
+        node = (node_t *)buddyof(block, base, i);
         node->next = _ALLOC->freelist[i];
-        node->base = ((node_t *)block)->base;
+        node->base = base;
         _ALLOC->freelist[i] = node;
         _ALLOC->avail |= blocksize(i);
     }
 
+    ((node_t *)block)->size = capacity;
     return (null_t *)((node_t *)block + 1);
 }
 
 null_t rf_free(null_t *block)
 {
     null_t *buddy;
-    node_t *node = (node_t *)((i64_t)block - sizeof(node_t)), **n;
+    node_t *node = (node_t *)block - 1, **n;
     block = (null_t *)node;
-    i32_t order = orderof(node->size);
+    u32_t order = orderof(node->size);
 
     for (;; order++)
     {

@@ -17,7 +17,7 @@ CORE_OBJECTS = core/timestamp.o core/guid.o core/sort.o core/ops.o core/util.o c
 APP_OBJECTS = app/main.o
 TESTS_OBJECTS = app/tests.o
 TARGET = rayforce
-# CFLAGS = $(DEBUG_CFLAGS)
+CFLAGS = $(DEBUG_CFLAGS)
 
 default: debug
 
