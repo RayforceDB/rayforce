@@ -26,9 +26,13 @@
 
 #include "rayforce.h"
 
-#define STATE_EMPTY 0
-#define STATE_OCCUPIED 1
-#define STATE_DELETED 2
+typedef struct bucket_t
+{
+    i64_t key;
+    i64_t val;
+} bucket_t;
+
+CASSERT(sizeof(bucket_t) == 16, hash_h);
 
 typedef struct ht_t
 {
@@ -36,8 +40,7 @@ typedef struct ht_t
     i32_t (*compare)(i64_t a, i64_t b);
     i64_t size;
     i64_t count;
-    i64_t *keys;
-    i64_t *vals;
+    bucket_t *buckets;
 } ht_t;
 
 // clang-format off
@@ -50,7 +53,6 @@ bool_t  ht_upsert(ht_t *table, i64_t key, i64_t val);
 bool_t  ht_upsert_with(ht_t *table, i64_t key, i64_t val, null_t *seed,
                   bool_t (*func)(i64_t key, i64_t val, null_t *seed, i64_t *tkey, i64_t *tval));
 i64_t   ht_get(ht_t *table, i64_t key);
-bool_t  ht_next_entry(ht_t *table, i64_t **k, i64_t **v, i64_t *index);
 // clang-format on
 
 #endif

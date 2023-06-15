@@ -31,13 +31,13 @@ set_t *set_new(i64_t size, u64_t (*hasher)(i64_t a), i32_t (*compare)(i64_t a, i
     i64_t i, *kv;
     set_t *set = (set_t *)rf_malloc(sizeof(struct set_t));
 
-    set->keys = vector_i64(size);
+    set->keys = (i64_t *)rf_malloc(size * sizeof(i64_t));
     set->size = size;
     set->count = 0;
     set->hasher = hasher;
     set->compare = compare;
 
-    kv = as_vector_i64(&set->keys);
+    kv = set->keys;
 
     for (i = 0; i < size; i++)
         kv[i] = NULL_I64;
@@ -47,42 +47,42 @@ set_t *set_new(i64_t size, u64_t (*hasher)(i64_t a), i32_t (*compare)(i64_t a, i
 
 null_t set_free(set_t *set)
 {
-    rf_object_free(&set->keys);
+    rf_free(set->keys);
     rf_free(set);
 }
 
 null_t set_rehash(set_t *set)
 {
-    i64_t i, old_size = set->size, key;
-    rf_object_t old_keys = set->keys;
-    i64_t *ok = as_vector_i64(&old_keys), *kv;
+    i64_t i, old_size = set->size, key,
+             *old_keys = set->keys, *new_keys;
     u64_t index, factor;
 
     // Double the table size.
     set->size *= 2;
-    set->keys = vector_i64(set->size);
-    kv = as_vector_i64(&set->keys);
+    set->keys = (i64_t *)rf_malloc(set->size * sizeof(i64_t));
+
+    new_keys = set->keys;
 
     for (i = 0; i < set->size; i++)
-        kv[i] = NULL_I64;
+        new_keys[i] = NULL_I64;
 
     for (i = 0; i < old_size; i++)
     {
-        if (ok[i] != NULL_I64)
+        if (old_keys[i] != NULL_I64)
         {
-            key = ok[i];
+            key = old_keys[i];
             factor = set->size - 1,
             index = set->hasher(key) & factor;
 
             // Linear probing.
-            while (kv[index] != NULL_I64)
+            while (new_keys[index] != NULL_I64)
                 index = (index + 1) & factor;
 
-            kv[index] = key;
+            new_keys[index] = key;
         }
     }
 
-    rf_object_free(&old_keys);
+    rf_free(old_keys);
 }
 
 bool_t set_insert(set_t *set, i64_t key)
@@ -90,9 +90,8 @@ bool_t set_insert(set_t *set, i64_t key)
     while (true)
     {
         i32_t i, size = set->size;
-        u64_t factor = set->size - 1,
-              index = set->hasher(key) & factor;
-        i64_t *keys = as_vector_i64(&set->keys);
+        u64_t factor = set->size - 1, index = set->hasher(key) & factor;
+        i64_t *keys = set->keys;
 
         for (i = index; i < size; i++)
         {
@@ -119,10 +118,8 @@ bool_t set_insert(set_t *set, i64_t key)
 bool_t set_contains(set_t *set, i64_t key)
 {
     i32_t i, size = set->size;
-    u64_t factor = set->size - 1,
-          index = set->hasher(key) & factor;
-
-    i64_t *keys = as_vector_i64(&set->keys);
+    u64_t factor = set->size - 1, index = set->hasher(key) & factor;
+    i64_t *keys = set->keys;
 
     for (i = index; i < size; i++)
     {
@@ -140,7 +137,7 @@ bool_t set_contains(set_t *set, i64_t key)
 
 i64_t set_next(set_t *set, i64_t *index)
 {
-    i64_t *keys = as_vector_i64(&set->keys);
+    i64_t *keys = set->keys;
 
     for (; *index < set->size; (*index)++)
     {

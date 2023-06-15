@@ -122,7 +122,7 @@ rf_object_t rf_distinct_I64(rf_object_t *x)
             m[i] = 0;
 
         // create hash set those elements are not in range
-        set = set_new(xl - inrange, &i64_hash, &i64_cmp);
+        set = set_new(xl - inrange, &kmh_hash, &i64_cmp);
 
         for (i = 0; i < xl; i++)
         {
@@ -154,10 +154,10 @@ rf_object_t rf_distinct_I64(rf_object_t *x)
     }
 
     // most of elements are not in range
-    set = set_new(xl, &i64_hash, &i64_cmp);
+    set = set_new(xl, &kmh_hash, &i64_cmp);
 
     for (i = 0; i < xl; i++)
-        if (set_insert(set, iv1[i]))
+        if (set_insert(set, normalize(iv1[i])))
             ov[j++] = iv1[i];
 
     vec.adt->attrs |= VEC_ATTR_DISTINCT;

@@ -34,69 +34,66 @@
 ht_t *ht_new(i64_t size, u64_t (*hasher)(i64_t a), i32_t (*compare)(i64_t a, i64_t b))
 {
     size = next_power_of_two_u64(size);
-    i64_t i, *kv;
+    i64_t i;
     ht_t *table = (ht_t *)rf_malloc(sizeof(struct ht_t));
+    bucket_t *buckets = (bucket_t *)rf_malloc(size * sizeof(bucket_t));
 
-    kv = (i64_t *)rf_malloc(size * 2 * sizeof(i64_t));
-    table->keys = kv;
-    table->vals = kv + size;
+    table->buckets = buckets;
     table->size = size;
     table->count = 0;
     table->hasher = hasher;
     table->compare = compare;
 
     for (i = 0; i < size; i++)
-        kv[i] = NULL_I64;
+        buckets[i].key = NULL_I64;
 
     return table;
 }
 
 null_t ht_free(ht_t *table)
 {
-    rf_free(table->keys);
+    rf_free(table->buckets);
     rf_free(table);
 }
 
 null_t ht_rehash(ht_t *table)
 {
-    i64_t i, old_size = table->size;
-    i64_t *old_keys = table->keys, *old_vals = table->vals,
-          *new_keys, *new_vals, key, val, factor, index;
+    i64_t i, old_size = table->size, key, val, factor, index;
+    bucket_t *old_buckets = table->buckets, *new_buckets;
 
     // Double the table size.
     table->size *= 2;
-    table->keys = (i64_t *)rf_malloc(table->size * 2 * sizeof(i64_t));
-    table->vals = table->keys + table->size;
+    table->buckets = (bucket_t *)rf_malloc(table->size * sizeof(bucket_t));
     factor = table->size - 1;
 
-    new_keys = table->keys;
-    new_vals = table->keys + table->size;
+    new_buckets = table->buckets;
 
     for (i = 0; i < table->size; i++)
-        new_keys[i] = NULL_I64;
+        new_buckets[i].key = NULL_I64;
 
     for (i = 0; i < old_size; i++)
     {
-        if (old_keys[i] != NULL_I64)
+        if (old_buckets[i].key != NULL_I64)
         {
-            key = old_keys[i];
-            val = old_vals[i];
+            key = old_buckets[i].key;
+            val = old_buckets[i].val;
             index = table->hasher(key) & factor;
 
             // Linear probing.
-            while (new_keys[index] != NULL_I64)
+            while (new_buckets[index].key != NULL_I64)
             {
                 if (index == table->size)
                     panic("ht is full!!");
+
                 index = index + 1;
             }
 
-            new_keys[index] = key;
-            new_vals[index] = val;
+            new_buckets[index].key = key;
+            new_buckets[index].val = val;
         }
     }
 
-    rf_free(old_keys);
+    rf_free(old_buckets);
 }
 
 /*
@@ -107,24 +104,21 @@ i64_t ht_insert(ht_t *table, i64_t key, i64_t val)
 {
     while (true)
     {
-        i32_t i = 0, size = table->size;
-        i64_t factor = table->size - 1,
+        i64_t i = 0, size = table->size, factor = table->size - 1,
               index = table->hasher(key) & factor;
-
-        i64_t *keys = table->keys;
-        i64_t *vals = table->vals;
+        bucket_t *buckets = table->buckets;
 
         for (i = index; i < size; i++)
         {
-            if (keys[i] != NULL_I64)
+            if (buckets[i].key != NULL_I64)
             {
-                if (table->compare(keys[i], key) == 0)
-                    return vals[i];
+                if (table->compare(buckets[i].key, key) == 0)
+                    return buckets[i].val;
             }
             else
             {
-                keys[i] = key;
-                vals[i] = val;
+                buckets[i].key = key;
+                buckets[i].val = val;
                 table->count++;
 
                 // Check if ht_rehash is necessary.
@@ -147,19 +141,16 @@ i64_t ht_insert_with(ht_t *table, i64_t key, i64_t val, null_t *seed,
 {
     while (true)
     {
-        i32_t i, size = table->size;
-        u64_t factor = table->size - 1,
+        i64_t i = 0, size = table->size, factor = table->size - 1,
               index = table->hasher(key) & factor;
-
-        i64_t *keys = table->keys;
-        i64_t *vals = table->vals;
+        bucket_t *buckets = table->buckets;
 
         for (i = index; i < size; i++)
         {
-            if (keys[i] != NULL_I64)
+            if (buckets[i].key != NULL_I64)
             {
-                if (table->compare(keys[i], key) == 0)
-                    return vals[i];
+                if (table->compare(buckets[i].key, key) == 0)
+                    return buckets[i].val;
             }
             else
             {
@@ -169,7 +160,7 @@ i64_t ht_insert_with(ht_t *table, i64_t key, i64_t val, null_t *seed,
                 if ((f64_t)table->count / table->size > 0.7)
                     ht_rehash(table);
 
-                return func(key, val, seed, &keys[i], &vals[i]);
+                return func(key, val, seed, &buckets[i].key, &buckets[i].val);
             }
         }
 
@@ -185,27 +176,24 @@ bool_t ht_upsert(ht_t *table, i64_t key, i64_t val)
 {
     while (true)
     {
-        i32_t i, size = table->size;
-        u64_t factor = table->size - 1,
+        i64_t i = 0, size = table->size, factor = table->size - 1,
               index = table->hasher(key) & factor;
-
-        i64_t *keys = table->keys;
-        i64_t *vals = table->vals;
+        bucket_t *buckets = table->buckets;
 
         for (i = index; i < size; i++)
         {
-            if (keys[i] != NULL_I64)
+            if (buckets[i].key != NULL_I64)
             {
-                if (table->compare(keys[i], key) == 0)
+                if (table->compare(buckets[i].key, key) == 0)
                 {
-                    vals[i] = val;
+                    buckets[i].val = val;
                     return true;
                 }
             }
             else
             {
-                keys[i] = key;
-                vals[i] = val;
+                buckets[i].key = key;
+                buckets[i].val = val;
                 table->count++;
 
                 // Check if ht_rehash is necessary.
@@ -228,24 +216,21 @@ bool_t ht_upsert_with(ht_t *table, i64_t key, i64_t val, null_t *seed,
 {
     while (true)
     {
-        i32_t i, size = table->size;
-        u64_t factor = table->size - 1,
+        i64_t i = 0, size = table->size, factor = table->size - 1,
               index = table->hasher(key) & factor;
-
-        i64_t *keys = table->keys;
-        i64_t *vals = table->vals;
+        bucket_t *buckets = table->buckets;
 
         for (i = index; i < size; i++)
         {
-            if (keys[i] != NULL_I64)
+            if (buckets[i].key != NULL_I64)
             {
-                if (table->compare(keys[i], key) == 0)
-                    return func(key, val, seed, &keys[i], &vals[i]);
+                if (table->compare(buckets[i].key, key) == 0)
+                    return func(key, val, seed, &buckets[i].key, &buckets[i].val);
             }
             else
             {
-                keys[i] = key;
-                vals[i] = val;
+                buckets[i].key = key;
+                buckets[i].val = val;
                 table->count++;
 
                 // Check if ht_rehash is necessary.
@@ -266,44 +251,20 @@ bool_t ht_upsert_with(ht_t *table, i64_t key, i64_t val, null_t *seed,
  */
 i64_t ht_get(ht_t *table, i64_t key)
 {
-    i32_t i, size = table->size;
-    u64_t factor = table->size - 1,
+    i64_t i = 0, size = table->size, factor = table->size - 1,
           index = table->hasher(key) & factor;
-    i64_t *keys = table->keys;
-    i64_t *vals = table->vals;
+    bucket_t *buckets = table->buckets;
 
     for (i = index; i < size; i++)
     {
-        if (keys[i] != NULL_I64)
+        if (buckets[i].key != NULL_I64)
         {
-            if (table->compare(keys[i], key) == 0)
-                return vals[i];
+            if (table->compare(buckets[i].key, key) == 0)
+                return buckets[i].val;
         }
         else
             return NULL_I64;
     }
 
     return NULL_I64;
-}
-
-bool_t ht_next_entry(ht_t *table, i64_t **k, i64_t **v, i64_t *index)
-{
-    i64_t i, *keys = table->keys,
-             *vals = table->vals;
-
-    while (*index < table->size)
-    {
-        if (keys[*index] != NULL_I64)
-        {
-            i = *index;
-            (*index)++;
-            *k = &keys[i];
-            *v = &vals[i];
-            return true;
-        }
-
-        (*index)++;
-    }
-
-    return false;
 }
