@@ -247,7 +247,7 @@ null_t *rf_malloc(u64_t size)
 null_t rf_free(null_t *block)
 {
     // block is a 64 bytes block
-    if (block >= _ALLOC->blocks64 && block < _ALLOC->blocks64 + NUM_64_BLOCKS * 64)
+    if (block >= _ALLOC->blocks64 && block <= _ALLOC->blocks64 + NUM_64_BLOCKS * 64 - 64)
     {
         *(null_t **)block = _ALLOC->freelist64;
         _ALLOC->freelist64 = block;
@@ -311,7 +311,7 @@ null_t *rf_realloc(null_t *block, u64_t new_size)
     }
 
     // block is a 64 bytes block
-    if (block >= _ALLOC->blocks64 && block < _ALLOC->blocks64 + NUM_64_BLOCKS * 64)
+    if (block >= _ALLOC->blocks64 && block <= _ALLOC->blocks64 + NUM_64_BLOCKS * 64 - 64)
     {
         if (new_size <= 64)
             return block;
