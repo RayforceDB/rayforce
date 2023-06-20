@@ -121,6 +121,7 @@ rf_object_t rf_get_List_i64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_get_List_I64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_get_Guid_i64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_get_Guid_I64(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_get_Table_symbol(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_find_I64_i64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_find_I64_I64(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_find_Char_char(rf_object_t *x, rf_object_t *y);

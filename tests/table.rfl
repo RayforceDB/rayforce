@@ -1,1 +1,1 @@
-(set t (table [a b] (list (til 10000) (til 10000))))
+(set t (table [Symbol Price Volume] (list [AAPL MSFT IBM] [100 200 300] [10 20 30])))

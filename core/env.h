@@ -59,6 +59,7 @@ typedef struct env_t
 {
     rf_object_t functions;     // list, containing records of instructions/functions
     rf_object_t variables;     // dict, containing mappings variables names to their values
+    rf_object_t tables;        // dict, containing tables types
     i64_t typenames[MAX_TYPE]; // array of symbols contains typenames, maps type id to type name
 } env_t;
 

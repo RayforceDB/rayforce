@@ -154,6 +154,7 @@ null_t init_functions(rf_object_t *records)
     REC(records, 2, "get",       TYPE_CHAR,       rf_get_Char_I64,         { TYPE_CHAR,       TYPE_I64         });
     REC(records, 2, "get",       TYPE_ANY,        rf_get_List_i64,         { TYPE_LIST,      -TYPE_I64         });
     REC(records, 2, "get",       TYPE_LIST,       rf_get_List_I64,         { TYPE_LIST,       TYPE_I64         });
+    REC(records, 2, "get",       TYPE_ANY,        rf_get_Table_symbol,     { TYPE_TABLE,     -TYPE_SYMBOL      });
     REC(records, 2, "find",     -TYPE_I64,        rf_find_I64_i64,         { TYPE_I64,       -TYPE_I64         });
     REC(records, 2, "find",     -TYPE_I64,        rf_find_F64_f64,         { TYPE_F64,       -TYPE_F64         });
     REC(records, 2, "find",      TYPE_I64,        rf_find_I64_I64,         { TYPE_I64,        TYPE_I64         });
@@ -217,6 +218,7 @@ env_t create_env()
 {
     rf_object_t functions = list(REC_SIZE);
     rf_object_t variables = dict(vector_symbol(0), vector_i64(0));
+    rf_object_t tables = dict(vector_symbol(0), vector_i64(0));
 
     for (i32_t i = 0; i < REC_SIZE; i++)
         as_list(&functions)[i] = vector(TYPE_CHAR, 0);
@@ -226,6 +228,7 @@ env_t create_env()
     env_t env = {
         .functions = functions,
         .variables = variables,
+        .tables = tables,
     };
 
     init_typenames(env.typenames);
@@ -249,6 +252,7 @@ null_t free_env(env_t *env)
 
     rf_object_free(&env->variables);
     rf_object_free(&env->functions);
+    rf_object_free(&env->tables);
 }
 
 rf_object_t *env_get_variable(env_t *env, rf_object_t *name)
@@ -289,4 +293,18 @@ extern i8_t env_get_type_by_typename(env_t *env, i64_t name)
             return i - TYPE_OFFSET;
 
     return TYPE_NONE;
+}
+
+null_t env_set_table(env_t *env, rf_object_t *name, rf_object_t value)
+{
+    rf_object_t addr = dict_get(&env->tables, name);
+
+    if (addr.i64 != NULL_I64)
+    {
+        rf_object_free((rf_object_t *)addr.i64);
+        dict_set(&env->tables, name, value);
+        return;
+    }
+
+    dict_set(&env->tables, name, value);
 }

@@ -1041,6 +1041,11 @@ rf_object_t rf_get_List_I64(rf_object_t *x, rf_object_t *y)
     return vec;
 }
 
+rf_object_t rf_get_Table_symbol(rf_object_t *x, rf_object_t *y)
+{
+    return dict_get(x, y);
+}
+
 rf_object_t rf_find_I64_i64(rf_object_t *x, rf_object_t *y)
 {
     i64_t l = x->adt->len, i;
