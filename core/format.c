@@ -188,6 +188,9 @@ i32_t f64_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t li
 
 i32_t symbol_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, i64_t val)
 {
+    if (val == NULL_I64)
+        return str_fmt_into(dst, len, offset, limit, "%*.*s%s", indent, indent, PADDING, "0s");
+
     i32_t n = str_fmt_into(dst, len, offset, limit, "%*.*s%s", indent, indent, PADDING, symbols_get(val));
 
     if (n > limit)

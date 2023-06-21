@@ -611,7 +611,7 @@ i8_t cc_compile_select(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t
 
     i8_t type;
     i64_t lbl1, lbl2;
-    rf_object_t *car, *params, key, val, table;
+    rf_object_t *car, *params, key, val, table, *keys, *vals;
 
     car = &as_list(object)[0];
     if (car->i64 == symbol("select").i64)
@@ -624,35 +624,37 @@ i8_t cc_compile_select(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t
         if (params->type != TYPE_DICT)
             cerr(cc, car->id, ERR_LENGTH, "'select' takes dict of params");
 
-        key = symbol("from");
-        table = dict_get(params, &key);
+        keys = &as_list(params)[0];
+        vals = &as_list(params)[1];
 
-        if (table.type == TYPE_NULL)
+        key = symbol("from");
+        val = dict_get(params, &key);
+
+        type = cc_compile_expr(true, cc, &val);
+        rf_object_free(&val);
+
+        if (type != TYPE_TABLE)
             cerr(cc, car->id, ERR_LENGTH, "'select': 'from' is required");
 
         // compile filters
         key = symbol("where");
         val = dict_get(params, &key);
 
-        if (!is_null(&val))
+        if (val.i64 != NULL_I64)
         {
             type = cc_compile_expr(true, cc, &val);
             rf_object_free(&val);
 
             if (type == TYPE_ERROR)
-            {
-                rf_object_free(&table);
                 return type;
-            }
 
             if (type != -TYPE_BOOL)
-            {
-                rf_object_free(&table);
                 cerr(cc, car->id, ERR_TYPE, "'select': condition must have a Bool result");
-            }
         }
+        else
+            rf_object_free(&val);
 
-        rf_object_free(&table);
+        return TYPE_TABLE;
         // --
     }
 

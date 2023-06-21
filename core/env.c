@@ -221,7 +221,7 @@ env_t create_env()
 {
     rf_object_t functions = list(REC_SIZE);
     rf_object_t variables = dict(vector_symbol(0), vector_i64(0));
-    rf_object_t tabletypes = dict(vector_i64(0), list(0));
+    rf_object_t usertypes = dict(vector_i64(0), list(0));
 
     for (i32_t i = 0; i < REC_SIZE; i++)
         as_list(&functions)[i] = vector(TYPE_CHAR, 0);
@@ -231,7 +231,7 @@ env_t create_env()
     env_t env = {
         .functions = functions,
         .variables = variables,
-        .tabletypes = tabletypes,
+        .usertypes = usertypes,
     };
 
     init_typenames(env.typenames);
@@ -255,7 +255,7 @@ null_t free_env(env_t *env)
 
     rf_object_free(&env->variables);
     rf_object_free(&env->functions);
-    rf_object_free(&env->tabletypes);
+    rf_object_free(&env->usertypes);
 }
 
 rf_object_t *env_get_variable(env_t *env, rf_object_t *name)
@@ -298,17 +298,17 @@ i8_t env_get_type_by_typename(env_t *env, i64_t name)
     return TYPE_NONE;
 }
 
-i64_t env_add_tabletype(env_t *env, rf_object_t type)
+i64_t env_add_usertype(env_t *env, rf_object_t type)
 {
-    i64_t id = env->tabletypes.adt->len;
+    i64_t id = env->usertypes.adt->len;
     rf_object_t id64 = i64(id);
 
-    dict_set(&env->tabletypes, &id64, type);
+    dict_set(&env->usertypes, &id64, type);
     return id;
 }
 
-rf_object_t env_get_tabletype(env_t *env, i64_t id)
+rf_object_t env_get_usertype(env_t *env, i64_t id)
 {
     rf_object_t id64 = i64(id);
-    return dict_get(&env->tabletypes, &id64);
+    return dict_get(&env->usertypes, &id64);
 }

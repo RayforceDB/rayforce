@@ -1,1 +1,10 @@
-(set t (table [Symbol Price Volume] (list [AAPL MSFT IBM] [100 200 300] [10 20 30])))
+(set t 
+    (table [Symbol Price Volume] 
+        (list [AAPL MSFT IBM] [100 200 300] [10 20 30])))
+
+
+;;(select {a: sum b} 
+;;        {from:  t 
+;;         by:    Symbol 
+;;         where: (== Symbol `AAPL)
+;;    })

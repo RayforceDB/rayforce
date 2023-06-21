@@ -59,7 +59,7 @@ typedef struct env_t
 {
     rf_object_t functions;     // list, containing records of instructions/functions
     rf_object_t variables;     // dict, containing mappings variables names to their values
-    rf_object_t tabletypes;    // dict, containing tables types
+    rf_object_t usertypes;     // dict, containing compound types (for example, tables)
     i64_t typenames[MAX_TYPE]; // array of symbols contains typenames, maps type id to type name
 } env_t;
 
@@ -73,7 +73,7 @@ rf_object_t *env_get_variable(env_t *env, rf_object_t *name);
 null_t env_set_variable(env_t *env, rf_object_t *name, rf_object_t value);
 i64_t env_get_typename_by_type(env_t *env, i8_t type);
 i8_t env_get_type_by_typename(env_t *env, i64_t name);
-i64_t env_add_tabletype(env_t *env, rf_object_t type);
-rf_object_t env_get_tabletype(env_t *env, i64_t id);
+i64_t env_add_usertype(env_t *env, rf_object_t type);
+rf_object_t env_get_usertype(env_t *env, i64_t id);
 
 #endif

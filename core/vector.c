@@ -306,12 +306,12 @@ type_f64:
     return f64(NULL_F64);
 type_symbol:
     if (index < l)
-        return i64(as_vector_i64(vector)[index]);
-    return i64(NULL_I64);
+        return symboli64(as_vector_i64(vector)[index]);
+    return symboli64(NULL_I64);
 type_timestamp:
     if (index < l)
-        return i64(as_vector_i64(vector)[index]);
-    return i64(NULL_I64);
+        return timestamp(as_vector_i64(vector)[index]);
+    return timestamp(NULL_I64);
 type_guid:
     if (index < l)
         return guid(as_vector_guid(vector)[index].data);
