@@ -40,19 +40,18 @@ extern "C"
 
 // Type constants
 #define TYPE_NULL 0
-#define TYPE_BOOL 2
-#define TYPE_I64 3
-#define TYPE_F64 4
-#define TYPE_SYMBOL 5
-#define TYPE_TIMESTAMP 6
-#define TYPE_GUID 7
-#define TYPE_CHAR 8
-#define TYPE_LIST 9
-#define TYPE_DICT 10
-#define TYPE_TABLE 11
-#define TYPE_FUNCTION 12
-#define TYPE_ERROR 13
-#define TYPE_ANY -1
+#define TYPE_BOOL 1
+#define TYPE_I64 2
+#define TYPE_F64 3
+#define TYPE_SYMBOL 4
+#define TYPE_TIMESTAMP 5
+#define TYPE_GUID 6
+#define TYPE_CHAR 7
+#define TYPE_LIST 8
+#define TYPE_DICT 9
+#define TYPE_TABLE 10
+#define TYPE_FUNCTION 11
+#define TYPE_ERROR 127
 
 // Result constants
 #define OK 0
@@ -75,12 +74,12 @@ extern "C"
 #define true (char)1
 #define false (char)0
 
-typedef int type_t;
+typedef char type_t;
 typedef char i8_t;
-typedef unsigned char u8_t;
 typedef char char_t;
 typedef char bool_t;
 typedef char *str_t;
+typedef unsigned char u8_t;
 typedef short i16_t;
 typedef unsigned short u16_t;
 typedef int i32_t;

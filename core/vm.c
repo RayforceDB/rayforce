@@ -101,8 +101,8 @@ rf_object_t __attribute__((hot)) vm_exec(vm_t *vm, rf_object_t *fun)
     // The indices of labels in the dispatch_table are the relevant opcodes
     static null_t *dispatch_table[] = {
         &&op_halt, &&op_ret, &&op_push, &&op_pop, &&op_jne, &&op_jmp, &&op_timer_set, &&op_timer_get,
-        &&op_call0, &&op_call1, &&op_call2, &&op_call3, &&op_call4, &&op_calln, &&op_callf, &&op_lset, &&op_gset,
-        &&op_lload, &&op_gload, &&op_cast, &&op_try, &&op_catch, &&op_throw, &&op_trace,
+        &&op_call0, &&op_call1, &&op_call2, &&op_call3, &&op_call4, &&op_calln, &&op_callf, &&op_store,
+        &&op_load, &&op_cast, &&op_try, &&op_catch, &&op_throw, &&op_trace,
         &&op_alloc, &&op_map, &&op_collect};
 
 #define dispatch() goto *dispatch_table[(i32_t)code[vm->ip]]
@@ -328,27 +328,16 @@ op_callf:
     code = as_string(&f->code);
     vm->sp += (i32_t)as_list(&f->locals)[0].adt->len;
     dispatch();
-op_lset:
+op_store:
     b = vm->ip++;
     load_u64(t, vm);
     vm->stack[vm->bp + t] = rf_object_clone(stack_peek(vm));
     dispatch();
-op_gset:
-    b = vm->ip++;
-    load_u64(l, vm);
-    x1 = symboli64(l);
-    env_set_variable(&runtime_get()->env, &x1, rf_object_clone(stack_peek(vm)));
-    dispatch();
-op_lload:
+op_load:
     b = vm->ip++;
     load_u64(t, vm);
     x1 = vm->stack[vm->bp + t];
     stack_push(vm, rf_object_clone(&x1));
-    dispatch();
-op_gload:
-    b = vm->ip++;
-    load_u64(l, vm);
-    stack_push(vm, rf_object_clone((rf_object_t *)l));
     dispatch();
 op_cast:
     b = vm->ip++;
@@ -522,20 +511,12 @@ str_t vm_code_fmt(rf_object_t *fun)
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] callf %d %p\n", c++, ip, code[ip + 1], ((rf_object_t *)(code + ip + 2))->i64);
             ip += 2 + sizeof(rf_object_t);
             break;
-        case OP_LSET:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] lset [%d]\n", c++, ip, (i32_t)((rf_object_t *)(code + ip + 1))->i64);
+        case OP_STORE:
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] store [%d]\n", c++, ip, (i32_t)((rf_object_t *)(code + ip + 1))->i64);
             ip += 1 + sizeof(rf_object_t);
             break;
-        case OP_GSET:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] gset %s\n", c++, ip, symbols_get(((rf_object_t *)(code + ip + 1))->i64));
-            ip += 1 + sizeof(rf_object_t);
-            break;
-        case OP_LLOAD:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] lload [%d]\n", c++, ip, (i32_t)((rf_object_t *)(code + ip + 1))->i64);
-            ip += 1 + sizeof(rf_object_t);
-            break;
-        case OP_GLOAD:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] gload %p\n", c++, ip, ((rf_object_t *)(code + ip + 1))->i64);
+        case OP_LOAD:
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] load [%d]\n", c++, ip, (i32_t)((rf_object_t *)(code + ip + 1))->i64);
             ip += 1 + sizeof(rf_object_t);
             break;
         case OP_CAST:

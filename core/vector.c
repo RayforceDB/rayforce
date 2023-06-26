@@ -207,9 +207,9 @@ i64_t vector_find(rf_object_t *vector, rf_object_t *key)
     rf_object_t *kl, *vl;
     i64_t i, l;
     guid_t *kg, *vg;
-    type_t type = vector->type - TYPE_BOOL;
+    type_t type = vector->type;
 
-    static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
+    static null_t *types_table[] = {&&type_null, &&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
     if (type > TYPE_LIST)
@@ -219,6 +219,8 @@ i64_t vector_find(rf_object_t *vector, rf_object_t *key)
 
     goto *types_table[type];
 
+type_null:
+    return 0;
 type_bool:
     vb = as_vector_bool(vector);
     kb = key->bool;
@@ -280,9 +282,9 @@ type_list:
 rf_object_t vector_get(rf_object_t *vector, i64_t index)
 {
     i64_t l;
-    type_t type = vector->type - TYPE_BOOL;
+    type_t type = vector->type;
 
-    static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
+    static null_t *types_table[] = {&&type_null, &&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
     // if (type > TYPE_LIST)
@@ -292,6 +294,8 @@ rf_object_t vector_get(rf_object_t *vector, i64_t index)
 
     goto *types_table[type];
 
+type_null:
+    return null();
 type_bool:
     if (index < l)
         return bool(as_vector_bool(vector)[index]);
@@ -329,9 +333,9 @@ type_list:
 null_t vector_set(rf_object_t *vector, i64_t index, rf_object_t value)
 {
     guid_t *g;
-    type_t type = vector->type - TYPE_BOOL;
+    type_t type = vector->type;
 
-    static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
+    static null_t *types_table[] = {&&type_null, &&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
     // if (type > TYPE_LIST)
@@ -342,6 +346,8 @@ null_t vector_set(rf_object_t *vector, i64_t index, rf_object_t value)
 
     goto *types_table[type];
 
+type_null:
+    return;
 type_bool:
     as_vector_bool(vector)[index] = value.bool;
     return;
@@ -410,10 +416,10 @@ rf_object_t list_flatten(rf_object_t *list)
 rf_object_t vector_filter(rf_object_t *x, bool_t mask[], i64_t len)
 {
     i64_t i, j = 0, l, ol;
-    type_t type = x->type - TYPE_BOOL;
+    type_t type = x->type;
     rf_object_t vec;
 
-    static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
+    static null_t *types_table[] = {&&type_null, &&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
     l = x->adt->len;
@@ -421,6 +427,8 @@ rf_object_t vector_filter(rf_object_t *x, bool_t mask[], i64_t len)
 
     goto *types_table[type];
 
+type_null:
+    return null();
 type_bool:
     vec = vector_bool(ol);
     for (i = 0; (j < ol && i < l); i++)

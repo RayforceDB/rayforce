@@ -31,15 +31,14 @@
 
 typedef struct function_t
 {
-    rf_object_t args;      // dict of arguments names as keys and their types as values
-    rf_object_t locals;    // dict of local variables names as keys and their types as values
-    rf_object_t code;      // string of bytecodes
+    rf_object_t args;      // vector of arguments names
+    rf_object_t locals;    // vector of local variables names
+    rf_object_t code;      // string of bytecode
     rf_object_t constants; // list of function constants
     debuginfo_t debuginfo; // debuginfo from cc phase
     i32_t stack_size;      // size of stack frame
-    type_t rettype;        // return type of function
 } function_t;
 
-rf_object_t function(type_t rettype, rf_object_t args, rf_object_t locals, rf_object_t code, debuginfo_t debuginfo);
+rf_object_t function(rf_object_t args, rf_object_t locals, rf_object_t code, debuginfo_t debuginfo);
 
 #endif

@@ -49,10 +49,8 @@ typedef enum vm_opcode_t
     OP_CALL4,     // Call function with four arguments
     OP_CALLN,     // Call function with n arguments
     OP_CALLF,     // Call user function
-    OP_LSET,      // Set local variable
-    OP_GSET,      // Set global variable
-    OP_LLOAD,     // Load local variable
-    OP_GLOAD,     // Load global variable
+    OP_STORE,     // Store value somewhere in a stack pointed by argument
+    OP_LOAD,      // Load value from somewhere in a stack pointed by argument
     OP_CAST,      // Cast rf_object to another type
     OP_TRY,       // Trap an expression to return here on error
     OP_CATCH,     // Catch an error from vm register and push it onto the stack

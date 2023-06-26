@@ -202,20 +202,12 @@ rf_object_t table(rf_object_t keys, rf_object_t vals)
     tkeys = vector_symbol(len);
     tvals = vector_symbol(len);
 
-    for (i = 0; i < len; i++)
-    {
-        as_vector_symbol(&tkeys)[i] = k[i];
-        as_vector_symbol(&tvals)[i] = env_get_typename_by_type(env, v[i].type);
-    }
-
-    type = env_add_tabletype(env, dict(tkeys, tvals));
-
     table = list(2);
 
     as_list(&table)[0] = keys;
     as_list(&table)[1] = vals;
 
-    table.type = type << 8 | TYPE_TABLE;
+    table.type = TYPE_TABLE;
 
     return table;
 }

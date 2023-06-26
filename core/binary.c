@@ -22,6 +22,7 @@
  */
 
 #include <time.h>
+#include "runtime.h"
 #include "binary.h"
 #include "dict.h"
 #include "util.h"
@@ -30,6 +31,11 @@
 #include "format.h"
 #include "vector.h"
 #include "hash.h"
+
+rf_object_t rf_set_variable(rf_object_t *key, rf_object_t *val)
+{
+    return dict_set(&runtime_get()->env.variables, key, rf_object_clone(val));
+}
 
 rf_object_t rf_dict(rf_object_t *x, rf_object_t *y)
 {

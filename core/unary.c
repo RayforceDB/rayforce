@@ -22,6 +22,7 @@
  */
 
 #include "rayforce.h"
+#include "dict.h"
 #include "runtime.h"
 #include "alloc.h"
 #include "vm.h"
@@ -34,6 +35,11 @@
 #include "set.h"
 #include "env.h"
 #include "group.h"
+
+rf_object_t rf_get_variable(rf_object_t *x)
+{
+    return dict_get(&runtime_get()->env.variables, x);
+}
 
 rf_object_t rf_type(rf_object_t *x)
 {

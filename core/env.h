@@ -32,7 +32,7 @@
 #define MAX_ARITY 4
 // offset in array of typenames for each type
 #define TYPE_OFFSET TYPE_CHAR
-#define MAX_TYPE (TYPE_ERROR - TYPE_CHAR + TYPE_ERROR + 4)
+#define MAX_TYPE (TYPE_ERROR + 1)
 
 typedef rf_object_t (*nilary_t)();
 typedef rf_object_t (*unary_t)(rf_object_t *);
@@ -46,10 +46,9 @@ typedef rf_object_t (*nary_t)(rf_object_t *, i64_t);
  */
 typedef struct env_record_t
 {
-    i64_t id;
-    u64_t op;               // opcode or function ptr
-    type_t args[MAX_ARITY]; // argument types
-    type_t ret;
+    i64_t id;   // symbol id
+    u64_t op;   // opcode or function ptr
+    u8_t arity; // arity of function
 } env_record_t;
 
 /*
@@ -59,7 +58,6 @@ typedef struct env_t
 {
     rf_object_t functions;     // list, containing records of instructions/functions
     rf_object_t variables;     // dict, containing mappings variables names to their values
-    rf_object_t tabletypes;    // dict, containing table types
     i64_t typenames[MAX_TYPE]; // array of symbols contains typenames, maps type id to type name
 } env_t;
 
@@ -69,11 +67,9 @@ null_t free_env(env_t *env);
 #define get_records_len(records, i) (as_list(records)[i].adt->len)
 #define get_record(records, i, j) (((env_record_t *)as_string((as_list(records) + i))) + j)
 
-rf_object_t *env_get_variable(env_t *env, rf_object_t *name);
-null_t env_set_variable(env_t *env, rf_object_t *name, rf_object_t value);
 i64_t env_get_typename_by_type(env_t *env, type_t type);
 type_t env_get_type_by_typename(env_t *env, i64_t name);
-i64_t env_add_tabletype(env_t *env, rf_object_t type);
-rf_object_t env_get_tabletype(env_t *env, i64_t id);
+rf_object_t env_set(env_t *env, rf_object_t *key, rf_object_t val);
+rf_object_t env_get(env_t *env, rf_object_t *key);
 
 #endif

@@ -29,15 +29,15 @@
 // internal types definitions:
 //
 // parser token type
-#define TYPE_TOKEN (TYPE_ERROR + 1)
+#define TYPE_TOKEN (TYPE_ERROR - 1)
 // vm context type
-#define TYPE_CTX (TYPE_ERROR + 2)
+#define TYPE_CTX (TYPE_ERROR - 2)
 // trap type
-#define TYPE_TRAP (TYPE_ERROR + 3)
+#define TYPE_TRAP (TYPE_ERROR - 3)
 // trow type
-#define TYPE_THROW (TYPE_ERROR + 4)
+#define TYPE_THROW (TYPE_ERROR - 4)
 // none type
-#define TYPE_NONE (TYPE_ERROR + 5)
+#define TYPE_NONE (TYPE_ERROR - 5)
 
 #define align8(x) ((str_t)(((u64_t)x + 7) & ~7))
 // --
