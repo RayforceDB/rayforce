@@ -179,9 +179,7 @@ rf_object_t timestamp(i64_t val)
 
 rf_object_t table(rf_object_t keys, rf_object_t vals)
 {
-    rf_object_t *v, table, tkeys, tvals;
-    i64_t *k, i, len, type;
-    env_t *env = &runtime_get()->env;
+    rf_object_t table;
 
     if (keys.type != TYPE_SYMBOL || vals.type != TYPE_LIST)
         return error(ERR_TYPE, "Keys must be a symbol vector and rf_objects must be list");
@@ -189,18 +187,13 @@ rf_object_t table(rf_object_t keys, rf_object_t vals)
     if (keys.adt->len != vals.adt->len)
         return error(ERR_LENGTH, "Keys and rf_objects must have the same length");
 
-    k = as_vector_symbol(&keys);
-    v = as_list(&vals);
-    len = vals.adt->len;
+    // len = vals.adt->len;
 
-    for (i = 0; i < len; i++)
-    {
-        if (v[i].type < 0)
-            return error(ERR_TYPE, "Values must not be scalars");
-    }
-
-    tkeys = vector_symbol(len);
-    tvals = vector_symbol(len);
+    // for (i = 0; i < len; i++)
+    // {
+    //     if (v[i].type < 0)
+    //         return error(ERR_TYPE, "Values must not be scalars");
+    // }
 
     table = list(2);
 
@@ -284,7 +277,7 @@ rf_object_t __attribute__((hot)) rf_object_clone(rf_object_t *object)
         &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_timestamp, &&type_guid,
         &&type_char, &&type_list, &&type_dict, &&type_table, &&type_function, &&type_error};
 
-    goto *types_table[type];
+    goto *types_table[(i32_t)type];
 
 type_bool:
     return *object;
@@ -347,7 +340,7 @@ null_t __attribute__((hot)) rf_object_free(rf_object_t *object)
         &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_timestamp, &&type_guid,
         &&type_char, &&type_list, &&type_dict, &&type_table, &&type_function, &&type_error};
 
-    goto *types_table[type];
+    goto *types_table[(i32_t)type];
 
 type_bool:
     if (rc == 0)
@@ -434,7 +427,7 @@ rf_object_t rf_object_cow(rf_object_t *object)
         &&type_bool, &&type_i64, &&type_f64, &&type_symbol, &&type_timestamp,
         &&type_guid, &&type_char, &&type_list, &&type_dict, &&type_table, &&type_function, &&type_error};
 
-    goto *types_table[type];
+    goto *types_table[(i32_t)type];
 
 type_bool:
     new = vector_bool(object->adt->len);

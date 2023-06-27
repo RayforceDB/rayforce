@@ -41,11 +41,12 @@
 #define KW_SET -3
 #define KW_LET -4
 #define KW_FN -5
-#define KW_IF -6
-#define KW_ELSE -7
-#define KW_TRY -8
-#define KW_CATCH -9
-#define KW_THROW -10
+#define KW_SELF -6
+#define KW_IF -7
+#define KW_ELSE -8
+#define KW_TRY -9
+#define KW_CATCH -10
+#define KW_THROW -11
 
 typedef rf_object_t (*nilary_t)();
 typedef rf_object_t (*unary_t)(rf_object_t *);

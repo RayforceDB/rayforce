@@ -108,8 +108,8 @@ rf_object_t rf_group(rf_object_t *x)
 rf_object_t rf_sum(rf_object_t *x)
 {
     i32_t i;
-    i64_t l, n = 0, isum, *iv;
-    f64_t fsum, *fv;
+    i64_t l, isum = 0, *iv;
+    f64_t fsum = 0.0, *fv;
 
     switch (MTYPE(x->type))
     {

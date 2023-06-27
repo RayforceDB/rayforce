@@ -140,6 +140,7 @@ null_t init_kw_symbols()
     assert(intern_keyword("set",   3)  == KW_SET);
     assert(intern_keyword("let",   3)  == KW_LET);
     assert(intern_keyword("fn",    2)  == KW_FN);
+    assert(intern_keyword("self",  4)  == KW_SELF);
     assert(intern_keyword("if",    2)  == KW_IF);
     assert(intern_keyword("else",  4)  == KW_ELSE);
     assert(intern_keyword("try",   3)  == KW_TRY);

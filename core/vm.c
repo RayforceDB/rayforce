@@ -23,6 +23,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "function.h"
 #include "vm.h"
 #include "rayforce.h"
 #include "alloc.h"
@@ -34,7 +35,6 @@
 #include "runtime.h"
 #include "dict.h"
 #include "cast.h"
-#include "function.h"
 
 #define stack_push(v, x) (v->stack[v->sp++] = x)
 #define stack_pop(v) (v->stack[--v->sp])
@@ -173,12 +173,12 @@ op_halt:
 op_ret:
     vm->ip++;
     x3 = stack_pop(vm); // return value
-    j = (i32_t)as_list(&f->locals)[0].adt->len;
+    j = (i32_t)f->locals.adt->len;
     for (i = 0; i < j; i++)
         stack_pop_free(vm); // pop locals
     x2 = stack_pop(vm);     // ctx
     stack_pop_free(vm);     // <function>
-    j = (i32_t)as_list(&f->args)[0].adt->len;
+    j = (i32_t)f->args.adt->len;
     for (i = 0; i < j; i++)
         stack_pop_free(vm); // pop args
     ctx = *(ctx_t *)&x2;
@@ -315,9 +315,11 @@ op_callf:
      * +-------------------+
      */
     b = vm->ip++;
-    if ((vm->sp + f->stack_size) * sizeof(rf_object_t) > VM_STACK_SIZE)
-        unwrap(error(ERR_STACK_OVERFLOW, "stack overflow"), b);
     addr = stack_peek(vm); // function
+    if (addr->type != TYPE_FUNCTION)
+        unwrap(error(ERR_TYPE, "expected function"), b);
+    if ((vm->sp + as_function(addr)->stack_size) * sizeof(rf_object_t) > VM_STACK_SIZE)
+        unwrap(error(ERR_STACK_OVERFLOW, "stack overflow"), b);
     // save ctx
     ctx = (ctx_t){.addr = f, .ip = vm->ip, .bp = vm->bp};
     vm->ip = 0;
@@ -326,7 +328,7 @@ op_callf:
     // --
     f = as_function(addr);
     code = as_string(&f->code);
-    vm->sp += (i32_t)as_list(&f->locals)[0].adt->len;
+    vm->sp += (i32_t)f->locals.adt->len;
     dispatch();
 op_store:
     b = vm->ip++;
@@ -508,7 +510,7 @@ str_t vm_code_fmt(rf_object_t *fun)
             ip += 2 + sizeof(rf_object_t);
             break;
         case OP_CALLF:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] callf %d %p\n", c++, ip, code[ip + 1], ((rf_object_t *)(code + ip + 2))->i64);
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] callf\n", c++, ip, code[ip + 1]);
             ip += 2 + sizeof(rf_object_t);
             break;
         case OP_STORE:

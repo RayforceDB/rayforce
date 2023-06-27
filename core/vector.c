@@ -33,7 +33,7 @@ i64_t size_of_val(type_t type)
     static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
-    goto *types_table[typet];
+    goto *types_table[(i32_t)typet];
 
 type_bool:
     return sizeof(bool_t);
@@ -83,7 +83,7 @@ i64_t vector_push(rf_object_t *vector, rf_object_t value)
     static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
-    goto *types_table[type];
+    goto *types_table[(i32_t)type];
 
 type_bool:
     push(vector, bool_t, value.bool);
@@ -123,7 +123,7 @@ rf_object_t vector_pop(rf_object_t *vector)
     static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
-    goto *types_table[type];
+    goto *types_table[(i32_t)type];
 
 type_bool:
     return bool(pop(vector, bool_t));
@@ -152,7 +152,7 @@ null_t vector_reserve(rf_object_t *vector, u32_t len)
     static null_t *types_table[] = {&&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
-    goto *types_table[type];
+    goto *types_table[(i32_t)type];
 
 type_bool:
     reserve(vector, bool_t, len);
@@ -212,12 +212,9 @@ i64_t vector_find(rf_object_t *vector, rf_object_t *key)
     static null_t *types_table[] = {&&type_null, &&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
-    if (type > TYPE_LIST)
-        panic("vector_get: non-gettable type");
-
     l = vector->adt->len;
 
-    goto *types_table[type];
+    goto *types_table[(i32_t)type];
 
 type_null:
     return 0;
@@ -287,12 +284,9 @@ rf_object_t vector_get(rf_object_t *vector, i64_t index)
     static null_t *types_table[] = {&&type_null, &&type_bool, &&type_i64, &&type_f64, &&type_symbol,
                                     &&type_timestamp, &&type_guid, &&type_char, &&type_list};
 
-    // if (type > TYPE_LIST)
-    //     panic("vector_get: non-gettable type");
-
     l = vector->adt->len;
 
-    goto *types_table[type];
+    goto *types_table[(i32_t)type];
 
 type_null:
     return null();
@@ -344,7 +338,7 @@ null_t vector_set(rf_object_t *vector, i64_t index, rf_object_t value)
     if (index < 0 || index >= vector->adt->len)
         return;
 
-    goto *types_table[type];
+    goto *types_table[(i32_t)type];
 
 type_null:
     return;
@@ -425,7 +419,7 @@ rf_object_t vector_filter(rf_object_t *x, bool_t mask[], i64_t len)
     l = x->adt->len;
     ol = (len == NULL_I64) ? x->adt->len : len;
 
-    goto *types_table[type];
+    goto *types_table[(i32_t)type];
 
 type_null:
     return null();

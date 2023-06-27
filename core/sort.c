@@ -193,10 +193,8 @@ null_t insertion_sort_desc(i64_t array[], i64_t indices[], i64_t left, i64_t rig
 // counting sort
 null_t counting_sort_asc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i64_t max)
 {
-    i64_t i, j = 0, l, n, p, range, *m, *v;
-    rf_object_t idxs, mask, *vv, vec;
-    ht_t *ht;
-    bucket_t *b;
+    i64_t i, j = 0, n, p, range, *m;
+    rf_object_t mask;
 
     range = max - min + 1;
     mask = vector_i64(range);
@@ -233,10 +231,8 @@ null_t counting_sort_asc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i
 
 null_t counting_sort_desc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i64_t max)
 {
-    i64_t i, j = 0, l, n, p, range, *m, *v;
-    rf_object_t idxs, mask, *vv, vec;
-    ht_t *ht;
-    bucket_t *b;
+    i64_t i, j = 0, n, p, range, *m;
+    rf_object_t mask;
 
     range = max - min + 1;
     mask = vector_i64(range);
@@ -273,7 +269,7 @@ null_t counting_sort_desc(i64_t array[], i64_t indices[], i64_t len, i64_t min, 
 
 rf_object_t rf_sort_asc(rf_object_t *vec)
 {
-    i64_t i, len = vec->adt->len, out_of_order = 0, range, inrange = 0, min, max;
+    i64_t i, len = vec->adt->len, out_of_order = 0, inrange = 0, min, max;
     rf_object_t indices = vector_i64(len);
     i64_t *iv = as_vector_i64(vec), *ov = as_vector_i64(&indices);
 
@@ -354,7 +350,7 @@ rf_object_t rf_sort_asc(rf_object_t *vec)
 
 rf_object_t rf_sort_desc(rf_object_t *vec)
 {
-    i64_t i, len = vec->adt->len, out_of_order = 0, range, inrange = 0, min, max;
+    i64_t i, len = vec->adt->len, out_of_order = 0, inrange = 0, min, max;
     rf_object_t indices = vector_i64(len);
     i64_t *iv = as_vector_i64(vec), *ov = as_vector_i64(&indices);
 

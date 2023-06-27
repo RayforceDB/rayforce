@@ -106,9 +106,7 @@ rf_object_t cc_compile_function(bool_t top, str_t name, rf_object_t args, rf_obj
 
 env_record_t *find_record(rf_object_t *records, rf_object_t *car, u32_t *arity)
 {
-    bool_t match_rec = false;
-    u8_t match_args = 0;
-    u32_t i, j, records_len;
+    u32_t i, records_len;
     env_record_t *rec;
 
     *arity = *arity > MAX_ARITY ? MAX_ARITY + 1 : *arity;
@@ -210,19 +208,14 @@ cc_result_t cc_compile_fn(bool_t has_consumer, cc_t *cc, rf_object_t *object, u3
 {
     UNUSED(has_consumer);
 
-    cc_result_t res = CC_NULL;
     rf_object_t *car = &as_list(object)[0], *b, fun;
     function_t *func = as_function(&cc->function);
     rf_object_t *code = &func->code;
-    env_t *env = &runtime_get()->env;
 
-    if (arity == 0)
-        cerr(cc, car->id, ERR_LENGTH, "'fn' expects vector of symbols with function arguments");
+    if (arity < 2)
+        cerr(cc, car->id, ERR_LENGTH, "'fn' expects vector of symbols with function arguments and a list body");
 
     b = as_list(object) + 1;
-
-    if (b->type != TYPE_SYMBOL)
-        cerr(cc, b->id, ERR_LENGTH, "'fn' expects dict with function arguments");
 
     arity -= 1;
     fun = cc_compile_function(false, "anonymous", rf_object_clone(b), b + 1, car->id, arity, cc->debuginfo);
@@ -248,7 +241,6 @@ cc_result_t cc_compile_cond(bool_t has_consumer, cc_t *cc, rf_object_t *object, 
     rf_object_t *car = &as_list(object)[0];
     function_t *func = as_function(&cc->function);
     rf_object_t *code = &func->code;
-    env_t *env = &runtime_get()->env;
 
     if (arity < 2 || arity > 3)
         cerr(cc, car->id, ERR_LENGTH, "'if' expects 2 .. 3 arguments");
@@ -397,6 +389,9 @@ type_t cc_compile_catch(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_
 type_t cc_compile_map(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t arity)
 {
     UNUSED(has_consumer);
+    UNUSED(cc);
+    UNUSED(object);
+    UNUSED(arity);
 
     //     type_t type, *args;
     //     rf_object_t *car, *addr, *arg_keys, *arg_vals;
@@ -501,6 +496,9 @@ type_t cc_compile_map(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t 
 type_t cc_compile_select(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t arity)
 {
     UNUSED(has_consumer);
+    UNUSED(cc);
+    UNUSED(object);
+    UNUSED(arity);
 
     // type_t type, i;
     // i64_t offset;
@@ -600,11 +598,9 @@ cc_result_t cc_compile_special_forms(bool_t has_consumer, cc_t *cc, rf_object_t 
 
 cc_result_t cc_compile_call(cc_t *cc, rf_object_t *car, u32_t arity)
 {
-    i32_t i, l, o = 0, n = 0;
-    u32_t found_arity = arity, j;
+    u32_t found_arity = arity;
     rf_object_t *code = &as_function(&cc->function)->code, *records = &runtime_get()->env.functions;
     env_record_t *rec = find_record(records, car, &found_arity);
-    str_t err;
 
     if (!rec)
         ccerr(cc, car->id, ERR_LENGTH, str_fmt(0, "function name/arity mismatch"));
@@ -645,12 +641,11 @@ cc_result_t cc_compile_call(cc_t *cc, rf_object_t *car, u32_t arity)
 
 cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
 {
-    rf_object_t *car, *addr, lst;
-    u32_t l, i, arity;
-    i64_t id, sym;
-    env_t *env = &runtime_get()->env;
+    rf_object_t *car;
+    u32_t i, arity;
+    i64_t id;
     function_t *func = as_function(&cc->function);
-    rf_object_t *code = &func->code, tabletype, col;
+    rf_object_t *code = &func->code;
     cc_result_t res = CC_NONE;
 
     switch (object->type)
@@ -659,6 +654,16 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
     case -TYPE_SYMBOL:
         if (!has_consumer)
             return CC_NONE;
+
+        // self is a special case
+        if (object->i64 == KW_SELF)
+        {
+            push_opcode(cc, object->id, code, OP_LOAD);
+            push_u64(code, -1);
+            func->stack_size++;
+
+            return CC_OK;
+        }
 
         // then try to find in locals
         id = vector_find(&func->locals, object);
@@ -703,8 +708,6 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
         if (res == CC_ERROR || res != CC_NONE)
             return res;
 
-        // --
-
         // compile arguments
         for (i = 0; i < arity; i++)
         {
@@ -713,95 +716,28 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
                 return CC_ERROR;
         }
 
-        // no need for compilation of car, just try to dereference it
-        if (car->type == -TYPE_SYMBOL)
+        if (car->type == -TYPE_SYMBOL && car->i64 < 0 && car->i64 != KW_SELF)
         {
-            if (car->i64 == symbol("self").i64)
+            res = cc_compile_call(cc, car, arity);
+
+            if (res == CC_ERROR)
+                return CC_ERROR;
+
+            if (res != CC_NONE)
             {
-                if (cc->top_level)
-                    cerr(cc, car->id, ERR_TYPE, "'self' has no meaning at top level");
-
-                addr = &cc->function;
-                func = as_function(addr);
-
-                // check args
-                // arg_vals = &as_list(&func->args)[1];
-                // l = arg_vals->adt->len;
-
-                // if (l != arity)
-                //     if (l != arity)
-                //         ccerr(cc, car->id, ERR_LENGTH,
-                //               str_fmt(0, "arguments length mismatch: expected %d, got %d", l, arity));
-
-                // for (i = 0; i < arity; i++)
-                // {
-                //     sym = as_vector_i64(arg_vals)[i];
-                //     type = env_get_type_by_typename(env, sym);
-
-                //     if (args[i] != type)
-                //         ccerr(cc, as_list(object)[i + 1].id, ERR_TYPE,
-                //               str_fmt(0, "argument type mismatch: expected %s, got %s",
-                //                       symbols_get(env_get_typename_by_type(env, type)), symbols_get(env_get_typename_by_type(env, args[i]))));
-                // }
-
-                push_opcode(cc, car->id, code, OP_PUSH);
-                push_const(cc, *addr);
-                push_opcode(cc, car->id, code, OP_CALLF);
-
-                // additional one for ctx
-                func->stack_size += 2;
-
-                return res;
-            }
-            else
-            {
-                res = cc_compile_call(cc, car, arity);
-
-                if (res == CC_ERROR)
-                    return CC_ERROR;
-
                 if (!has_consumer)
                     push_opcode(cc, car->id, code, OP_POP);
 
-                return CC_OK;
+                return res;
             }
         }
 
-        // compile car
-        // type = cc_compile_expr(true, cc, car);
+        // otherwise it is a function call
+        res = cc_compile_expr(true, cc, car);
+        if (res == CC_ERROR)
+            return CC_ERROR;
 
-        // if (type == TYPE_ERROR)
-        //     return TYPE_ERROR;
-
-        // if (type != TYPE_FUNCTION)
-        //     cerr(cc, car->id, ERR_TYPE, "expected function/symbol as first argument");
-
-        // addr = &as_list(&func->constants)[func->constants.adt->len - 1];
-        // func = as_function(addr);
-
-        // arg_keys = &as_list(&func->args)[0];
-        // arg_vals = &as_list(&func->args)[1];
-        // l = arg_vals->adt->len;
-
-        // if (l != arity)
-        //     ccerr(cc, car->id, ERR_LENGTH,
-        //           str_fmt(0, "arguments length mismatch: expected %d, got %d", l, arity));
-
-        // for (i = 0; i < arity; i++)
-        // {
-        //     sym = as_vector_i64(arg_vals)[i];
-        //     type = env_get_type_by_typename(env, sym);
-
-        //     if (args[i] != type)
-        //         ccerr(cc, as_list(object)[i + 1].id, ERR_TYPE,
-        //               str_fmt(0, "argument type mismatch: expected %s, got %s",
-        //                       symbols_get(env_get_typename_by_type(env, type)), symbols_get(env_get_typename_by_type(env, args[i]))));
-        // }
-
-        // push_opcode(cc, car->id, code, OP_CALLF);
-
-        // // additional one for ctx
-        // func->stack_size += 2;
+        push_opcode(cc, car->id, code, OP_CALLF);
 
         return CC_OK;
 
@@ -833,9 +769,7 @@ rf_object_t cc_compile_function(bool_t top, str_t name, rf_object_t args,
     cc_result_t res;
     i32_t i;
     function_t *func = as_function(&cc.function);
-    rf_object_t *code = &func->code, *b = body, err;
-    env_t *env = &runtime_get()->env;
-    str_t msg;
+    rf_object_t *code = &func->code, *b = body;
 
     if (len == 0)
     {

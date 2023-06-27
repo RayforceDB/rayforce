@@ -1069,6 +1069,7 @@ rf_object_t rf_take(rf_object_t *x, rf_object_t *y)
     switch (MTYPE2(x->type, y->type))
     {
     case MTYPE2(-TYPE_I64, -TYPE_I64):
+        l = x->adt->len;
         vec = vector_i64(x->i64);
         for (i = 0; i < l; i++)
             as_vector_i64(&vec)[i] = y->i64;

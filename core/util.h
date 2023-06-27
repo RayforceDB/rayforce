@@ -43,11 +43,11 @@
 
 #define debug_assert(x) (assert(x))
 
-#define debug_object(o)             \
-    {                               \
-        str_t f = rf_object_fmt(o); \
-        debug("%s", f);             \
-        rf_free(f);                 \
+#define debug_object(o)               \
+    {                                 \
+        str_t f = rf_object_fmt((o)); \
+        debug("%s", f);               \
+        rf_free(f);                   \
     }
 
 #else
