@@ -32,14 +32,14 @@ static u64_t __RND_SEED__ = 0;
  * compiler optimizations. So we need to use memcpy to get the bits of the x
  * and then separate check mantissa and exponent.
  */
-bool_t rf_is_nan(f64_t x)
+bool_t rfi_is_nan(f64_t x)
 {
     u64_t bits;
     memcpy(&bits, &x, sizeof(x));
     return (bits & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL && (bits & 0x000FFFFFFFFFFFFFULL) != 0;
 }
 
-bool_t rf_eq(rf_object_t *x, rf_object_t *y)
+bool_t rfi_eq(rf_object_t *x, rf_object_t *y)
 {
     if (x->type != y->type)
         return false;
@@ -59,7 +59,7 @@ bool_t rf_eq(rf_object_t *x, rf_object_t *y)
     }
 }
 
-bool_t rf_lt(rf_object_t *x, rf_object_t *y)
+bool_t rfi_lt(rf_object_t *x, rf_object_t *y)
 {
     if (x->type != y->type)
         return false;
@@ -79,22 +79,22 @@ bool_t rf_lt(rf_object_t *x, rf_object_t *y)
     }
 }
 
-i64_t round_f64(f64_t x)
+i64_t rfi_round_f64(f64_t x)
 {
     return x >= 0.0 ? (i64_t)(x + 0.5) : (i64_t)(x - 0.5);
 }
 
-i64_t floor_f64(f64_t x)
+i64_t rfi_floor_f64(f64_t x)
 {
     return x >= 0.0 ? (i64_t)x : (i64_t)(x - 1.0);
 }
 
-i64_t ceil_f64(f64_t x)
+i64_t rfi_ceil_f64(f64_t x)
 {
     return x >= 0.0 ? (i64_t)(x + 1.0) : (i64_t)x;
 }
 
-u64_t rand_u64()
+u64_t rfi_rand_u64()
 {
 #define A 6364136223846793005ULL
 #define C 1442695040888963407ULL
@@ -104,13 +104,13 @@ u64_t rand_u64()
     return __RND_SEED__;
 }
 
-u64_t kmh_hash(i64_t key)
+u64_t rfi_kmh_hash(i64_t key)
 {
 #define LARGE_PRIME 6364136223846793005ULL
     return (key * LARGE_PRIME) >> 32;
 }
 
-u64_t fnv1a_hash_64(i64_t key)
+u64_t rfi_fnv1a_hash_64(i64_t key)
 {
 #define FNV_OFFSET_64 14695981039346656037ULL
 #define FNV_PRIME_64 1099511628211ULL
@@ -126,7 +126,7 @@ u64_t fnv1a_hash_64(i64_t key)
     return hash;
 }
 
-u64_t i64_hash(i64_t key)
+u64_t rfi_i64_hash(i64_t key)
 {
     return (u64_t)key;
 }

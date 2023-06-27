@@ -57,1060 +57,537 @@ rf_object_t rf_table(rf_object_t *x, rf_object_t *y)
 
 rf_object_t rf_add(rf_object_t *x, rf_object_t *y)
 {
+    i32_t i;
+    i64_t l;
+    rf_object_t vec;
+
     switch (MTYPE2(x->type, y->type))
     {
-
     case MTYPE2(-TYPE_I64, -TYPE_I64):
         return (i64(ADDI64(x->i64, y->i64)));
+
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        return (f64(ADDF64(x->f64, y->f64)));
+
+    case MTYPE2(TYPE_I64, -TYPE_I64):
+        l = x->adt->len;
+        vec = vector_i64(l);
+        for (i = 0; i < l; i++)
+            as_vector_i64(&vec)[i] = ADDI64(as_vector_i64(x)[i], y->i64);
+
+        return vec;
+
+    case MTYPE2(TYPE_I64, TYPE_I64):
+        l = x->adt->len;
+        vec = vector_i64(l);
+        for (i = 0; i < l; i++)
+            as_vector_i64(&vec)[i] = ADDI64(as_vector_i64(x)[i], as_vector_i64(y)[i]);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, -TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = ADDF64(as_vector_f64(x)[i], y->f64);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(x)[i] = ADDF64(as_vector_f64(&vec)[i], as_vector_f64(y)[i]);
+
+        return vec;
 
     default:
         return error_type2(x->type, y->type, "add: unsupported types");
     }
 }
 
-rf_object_t rf_add_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    return (f64(ADDF64(x->f64, y->f64)));
-}
-
-rf_object_t rf_add_I64_i64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_sub(rf_object_t *x, rf_object_t *y)
 {
     i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_i64(l);
-    i64_t *iv = as_vector_i64(x), *ov = as_vector_i64(&vec);
+    i64_t l;
+    rf_object_t vec;
 
-    for (i = 0; i < l; i++)
-        ov[i] = ADDI64(iv[i], y->i64);
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(-TYPE_I64, -TYPE_I64):
+        return (i64(SUBI64(x->i64, y->i64)));
 
-    return vec;
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        return (f64(SUBF64(x->f64, y->f64)));
+
+    case MTYPE2(TYPE_I64, -TYPE_I64):
+        l = x->adt->len;
+        vec = vector_i64(l);
+        for (i = 0; i < l; i++)
+            as_vector_i64(&vec)[i] = SUBI64(as_vector_i64(x)[i], y->i64);
+
+        return vec;
+
+    case MTYPE2(TYPE_I64, TYPE_I64):
+        l = x->adt->len;
+        vec = vector_i64(l);
+        for (i = 0; i < l; i++)
+            as_vector_i64(&vec)[i] = SUBI64(as_vector_i64(x)[i], as_vector_i64(y)[i]);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, -TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = SUBF64(as_vector_f64(x)[i], y->f64);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = SUBF64(as_vector_f64(x)[i], as_vector_f64(y)[i]);
+
+        return vec;
+
+    default:
+        return error_type2(x->type, y->type, "sub: unsupported types");
+    }
 }
 
-rf_object_t rf_add_I64_I64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_mul(rf_object_t *x, rf_object_t *y)
 {
     i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_i64(l);
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y), *ov = as_vector_i64(&vec);
+    i64_t l;
+    rf_object_t vec;
 
-    for (i = 0; i < l; i++)
-        ov[i] = ADDI64(iv1[i], iv2[i]);
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(-TYPE_I64, -TYPE_I64):
+        return (i64(MULI64(x->i64, y->i64)));
 
-    return vec;
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        return (f64(MULF64(x->f64, y->f64)));
+
+    case MTYPE2(TYPE_I64, -TYPE_I64):
+        l = x->adt->len;
+        vec = vector_i64(l);
+        for (i = 0; i < l; i++)
+            as_vector_i64(&vec)[i] = MULI64(as_vector_i64(x)[i], y->i64);
+
+        return vec;
+
+    case MTYPE2(TYPE_I64, TYPE_I64):
+        l = x->adt->len;
+        vec = vector_i64(l);
+        for (i = 0; i < l; i++)
+            as_vector_i64(&vec)[i] = MULI64(as_vector_i64(x)[i], as_vector_i64(y)[i]);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, -TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = MULF64(as_vector_f64(x)[i], y->f64);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = MULF64(as_vector_f64(x)[i], as_vector_f64(y)[i]);
+
+        return vec;
+
+    default:
+        return error_type2(x->type, y->type, "mul: unsupported types");
+    }
 }
 
-rf_object_t rf_add_F64_f64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_fdiv(rf_object_t *x, rf_object_t *y)
 {
     i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_f64(l);
-    f64_t *iv = as_vector_f64(x), *ov = as_vector_f64(&vec);
+    i64_t l;
+    rf_object_t vec;
 
-    for (i = 0; i < l; i++)
-        ov[i] = ADDF64(iv[i], y->f64);
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(-TYPE_I64, -TYPE_I64):
+        return (f64(FDIVI64(x->i64, y->i64)));
 
-    return vec;
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        return (f64(FDIVF64(x->f64, y->f64)));
+
+    case MTYPE2(TYPE_I64, -TYPE_I64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = FDIVI64(as_vector_i64(x)[i], y->i64);
+
+        return vec;
+
+    case MTYPE2(TYPE_I64, TYPE_I64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = FDIVI64(as_vector_i64(x)[i], as_vector_i64(y)[i]);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, -TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = FDIVF64(as_vector_f64(x)[i], y->f64);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = FDIVF64(as_vector_f64(x)[i], as_vector_f64(y)[i]);
+
+        return vec;
+
+    default:
+        return error_type2(x->type, y->type, "fdiv: unsupported types");
+    }
 }
 
-rf_object_t rf_add_F64_F64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_mod(rf_object_t *x, rf_object_t *y)
 {
     i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_f64(l);
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y), *ov = as_vector_f64(&vec);
+    i64_t l;
+    rf_object_t vec;
 
-    for (i = 0; i < l; i++)
-        ov[i] = ADDF64(iv1[i], iv2[i]);
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(-TYPE_I64, -TYPE_I64):
+        return (i64(MODI64(x->i64, y->i64)));
 
-    return vec;
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        return (f64(MODF64(x->f64, y->f64)));
+
+    case MTYPE2(TYPE_I64, -TYPE_I64):
+        l = x->adt->len;
+        vec = vector_i64(l);
+        for (i = 0; i < l; i++)
+            as_vector_i64(&vec)[i] = MODI64(as_vector_i64(x)[i], y->i64);
+
+        return vec;
+
+    case MTYPE2(TYPE_I64, TYPE_I64):
+        l = x->adt->len;
+        vec = vector_i64(l);
+        for (i = 0; i < l; i++)
+            as_vector_i64(&vec)[i] = MODI64(as_vector_i64(x)[i], as_vector_i64(y)[i]);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, -TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = MODF64(as_vector_f64(x)[i], y->f64);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = MODF64(as_vector_f64(x)[i], as_vector_f64(y)[i]);
+
+        return vec;
+
+    default:
+        return error_type2(x->type, y->type, "mod: unsupported types");
+    }
 }
 
-rf_object_t rf_sub_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    return (i64(SUBI64(x->i64, y->i64)));
-}
-
-rf_object_t rf_sub_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    return (f64(SUBF64(x->f64, y->f64)));
-}
-
-rf_object_t rf_sub_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_i64(l);
-    i64_t *iv = as_vector_i64(x), *ov = as_vector_i64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = SUBI64(iv[i], y->i64);
-
-    return vec;
-}
-
-rf_object_t rf_sub_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_i64(l);
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y), *ov = as_vector_i64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = SUBI64(iv1[i], iv2[i]);
-
-    return vec;
-}
-
-rf_object_t rf_sub_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_f64(l);
-    f64_t *iv = as_vector_f64(x), *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = SUBF64(iv[i], y->f64);
-
-    return vec;
-}
-
-rf_object_t rf_sub_F64_F64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_mod(rf_object_t *x, rf_object_t *y)
 {
     i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_f64(l);
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y), *ov = as_vector_f64(&vec);
+    i64_t l;
+    rf_object_t vec;
 
-    for (i = 0; i < l; i++)
-        ov[i] = SUBF64(iv1[i], iv2[i]);
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(-TYPE_I64, -TYPE_I64):
+        return (i64(MODI64(x->i64, y->i64)));
 
-    return vec;
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        return (f64(MODF64(x->f64, y->f64)));
+
+    case MTYPE2(TYPE_I64, -TYPE_I64):
+        l = x->adt->len;
+        vec = vector_i64(l);
+        for (i = 0; i < l; i++)
+            as_vector_i64(&vec)[i] = MODI64(as_vector_i64(x)[i], y->i64);
+
+        return vec;
+
+    case MTYPE2(TYPE_I64, TYPE_I64):
+        l = x->adt->len;
+        vec = vector_i64(l);
+        for (i = 0; i < l; i++)
+            as_vector_i64(&vec)[i] = MODI64(as_vector_i64(x)[i], as_vector_i64(y)[i]);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, -TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = MODF64(as_vector_f64(x)[i], y->f64);
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, TYPE_F64):
+        l = x->adt->len;
+        vec = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&vec)[i] = MODF64(as_vector_f64(x)[i], as_vector_f64(y)[i]);
+
+        return vec;
+
+    default:
+        return error_type2(x->type, y->type, "mod: unsupported types");
+    }
 }
 
-rf_object_t rf_mul_i64_i64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_like(rf_object_t *x, rf_object_t *y)
 {
-    return (i64(MULI64(x->i64, y->i64)));
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(TYPE_CHAR, TYPE_CHAR):
+        return (bool(string_match(as_string(x), as_string(y))));
+
+    default:
+        return error_type2(x->type, y->type, "like: unsupported types");
+    }
 }
 
-rf_object_t rf_mul_f64_f64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_eq(rf_object_t *x, rf_object_t *y)
 {
-    return (f64(MULF64(x->f64, y->f64)));
-}
-
-rf_object_t rf_mul_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_i64(l);
-    i64_t *iv = as_vector_i64(x), *ov = as_vector_i64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = MULI64(iv[i], y->i64);
-
-    return vec;
-}
-
-rf_object_t rf_mul_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_i64(l);
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y), *ov = as_vector_i64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = MULI64(iv1[i], iv2[i]);
-
-    return vec;
-}
-
-rf_object_t rf_mul_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_f64(l);
-    f64_t *iv = as_vector_f64(x), *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = MULF64(iv[i], y->f64);
-
-    return vec;
-}
-
-rf_object_t rf_mul_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t vec = vector_f64(l);
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y), *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = MULF64(iv1[i], iv2[i]);
-
-    return vec;
-}
-
-rf_object_t rf_fdiv_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    return (f64(FDIVI64(x->i64, y->i64)));
-}
-
-rf_object_t rf_fdiv_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    return (f64(FDIVF64(x->f64, y->f64)));
-}
-
-rf_object_t rf_fdiv_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv = as_vector_i64(x);
-    rf_object_t vec = vector_f64(l);
-    f64_t *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = FDIVI64(iv[i], y->i64);
-
-    return vec;
-}
-
-rf_object_t rf_fdiv_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y);
-    rf_object_t vec = vector_f64(l);
-    f64_t *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = FDIVI64(iv1[i], iv2[i]);
-
-    return vec;
-}
-
-rf_object_t rf_fdiv_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv = as_vector_f64(x);
-    rf_object_t vec = vector_f64(l);
-    f64_t *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = FDIVF64(iv[i], y->f64);
-
-    return vec;
-}
-
-rf_object_t rf_fdiv_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y);
-    rf_object_t vec = vector_f64(l);
-    f64_t *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = FDIVF64(iv1[i], iv2[i]);
-
-    return vec;
-}
-
-rf_object_t rf_div_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    return (i64(DIVI64(x->i64, y->i64)));
-}
-
-rf_object_t rf_div_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    return (f64(DIVF64(x->f64, y->f64)));
-}
-
-rf_object_t rf_div_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv = as_vector_i64(x);
-    rf_object_t vec = vector_i64(l);
-    i64_t *ov = as_vector_i64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = DIVI64(iv[i], y->i64);
-
-    return vec;
-}
-
-rf_object_t rf_div_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y);
-    rf_object_t vec = vector_i64(l);
-    i64_t *ov = as_vector_i64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = DIVI64(iv1[i], iv2[i]);
-
-    return vec;
-}
-
-rf_object_t rf_div_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv = as_vector_f64(x);
-    rf_object_t vec = vector_f64(l);
-    f64_t *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = (f64_t)DIVF64(iv[i], y->f64);
-
-    return vec;
-}
-
-rf_object_t rf_div_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y);
-    rf_object_t vec = vector_f64(l);
-    f64_t *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = (f64_t)DIVF64(iv1[i], iv2[i]);
-
-    return vec;
-}
-
-rf_object_t rf_mod_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    return (i64(MODI64(x->i64, y->i64)));
-}
-
-rf_object_t rf_mod_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    return (f64(MODF64(x->f64, y->f64)));
-}
-
-rf_object_t rf_mod_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv = as_vector_i64(x);
-    rf_object_t vec = vector_i64(l);
-    i64_t *ov = as_vector_i64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = MODI64(iv[i], y->i64);
-
-    return vec;
-}
-
-rf_object_t rf_mod_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y);
-    rf_object_t vec = vector_i64(l);
-    i64_t *ov = as_vector_i64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = MODI64(iv1[i], iv2[i]);
-
-    return vec;
-}
-
-rf_object_t rf_mod_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv = as_vector_f64(x);
-    rf_object_t vec = vector_f64(l);
-    f64_t *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = MODF64(iv[i], y->f64);
-
-    return vec;
-}
-
-rf_object_t rf_mod_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y);
-    rf_object_t vec = vector_f64(l);
-    f64_t *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = MODF64(iv1[i], iv2[i]);
-
-    return vec;
-}
-
-rf_object_t rf_like_Char_Char(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(string_match(as_string(x), as_string(y))));
-}
-
-rf_object_t rf_eq_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->i64 == y->i64));
-}
-
-rf_object_t rf_eq_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->f64 == y->f64));
-}
-
-rf_object_t rf_eq_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv = as_vector_i64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] == y->i64;
-
-    return res;
-}
-
-rf_object_t rf_eq_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] == iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_eq_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv = as_vector_f64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] == y->f64;
-
-    return res;
-}
-
-rf_object_t rf_eq_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] == iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_eq_bool_bool(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->bool == y->bool));
-}
-
-rf_object_t rf_eq_symbol_symbol(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->i64 == y->i64));
-}
-
-rf_object_t rf_eq_Symbol_symbol(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv = as_vector_symbol(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] == y->i64;
-
-    return res;
-}
-
-rf_object_t rf_eq_Symbol_Symbol(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv1 = as_vector_symbol(x), *iv2 = as_vector_symbol(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] == iv2[i];
-
-    return res;
+    return bool(rfi_eq(x, y));
 }
 
 rf_object_t rf_ne_i64_i64(rf_object_t *x, rf_object_t *y)
 {
-    return (bool(x->i64 != y->i64));
+    return (bool(!rfi_eq(x, y)));
 }
 
-rf_object_t rf_ne_f64_f64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_lt(rf_object_t *x, rf_object_t *y)
 {
-    return (bool(x->f64 != y->f64));
-}
-
-rf_object_t rf_ne_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv = as_vector_i64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] != y->i64;
-
-    return res;
-}
-
-rf_object_t rf_ne_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] != iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_ne_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv = as_vector_f64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] != y->f64;
-
-    return res;
-}
-
-rf_object_t rf_ne_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] != iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_ne_Bool_Bool(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *iv1 = as_vector_bool(x), *iv2 = as_vector_bool(y), *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] != iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_lt_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->i64 < y->i64));
-}
-
-rf_object_t rf_lt_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->f64 < y->f64));
-}
-
-rf_object_t rf_lt_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv = as_vector_i64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] < y->i64;
-
-    return res;
-}
-
-rf_object_t rf_lt_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] < iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_lt_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv = as_vector_f64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] < y->f64;
-
-    return res;
-}
-
-rf_object_t rf_lt_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] < iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_le_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->i64 <= y->i64));
-}
-
-rf_object_t rf_le_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->f64 <= y->f64));
-}
-
-rf_object_t rf_le_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv = as_vector_i64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] <= y->i64;
-
-    return res;
-}
-
-rf_object_t rf_le_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] <= iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_le_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv = as_vector_f64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] <= y->f64;
-
-    return res;
-}
-
-rf_object_t rf_le_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] <= iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_gt_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->i64 > y->i64));
-}
-
-rf_object_t rf_gt_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->f64 > y->f64));
-}
-
-rf_object_t rf_gt_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv = as_vector_i64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] > y->i64;
-
-    return res;
-}
-
-rf_object_t rf_gt_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] > iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_gt_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv = as_vector_f64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] > y->f64;
-
-    return res;
-}
-
-rf_object_t rf_gt_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] > iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_ge_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->i64 >= y->i64));
-}
-
-rf_object_t rf_ge_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->f64 >= y->f64));
-}
-
-rf_object_t rf_ge_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv = as_vector_i64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] >= y->i64;
-
-    return res;
-}
-
-rf_object_t rf_ge_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] >= iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_ge_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv = as_vector_f64(x);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i] >= y->f64;
-
-    return res;
-}
-
-rf_object_t rf_ge_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y);
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] >= iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_and_bool_bool(rf_object_t *x, rf_object_t *y)
-{
-    return (bool(x->bool && y->bool));
-}
-
-rf_object_t rf_and_Bool_Bool(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *iv1 = as_vector_bool(x), *iv2 = as_vector_bool(y), *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] & iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_or_Bool_Bool(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t l = x->adt->len;
-    rf_object_t res = vector_bool(x->adt->len);
-    bool_t *iv1 = as_vector_bool(x), *iv2 = as_vector_bool(y), *ov = as_vector_bool(&res);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv1[i] | iv2[i];
-
-    return res;
-}
-
-rf_object_t rf_get_Bool_i64(rf_object_t *x, rf_object_t *y)
-{
-    return vector_get(x, y->i64);
-}
-
-rf_object_t rf_get_Bool_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t yl = y->adt->len, xl = x->adt->len;
-    rf_object_t vec = vector_bool(yl);
-    bool_t *iv1 = as_vector_bool(x), *iv2 = as_vector_bool(y), *ov = as_vector_bool(&vec);
-
-    for (i = 0; i < yl; i++)
+    switch (MTYPE2(x->type, y->type))
     {
-        if (iv2[i] >= xl)
-            ov[i] = false;
-        else
-            ov[i] = iv1[(i32_t)iv2[i]];
+    case MTYPE2(-TYPE_I64, -TYPE_I64):
+        return (bool(x->i64 < y->i64));
+
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        return (bool(x->f64 < y->f64));
+
+    default:
+        return error_type2(x->type, y->type, "lt: unsupported types");
     }
-
-    return vec;
 }
 
-rf_object_t rf_get_I64_i64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_le(rf_object_t *x, rf_object_t *y)
 {
-    return vector_get(x, y->i64);
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(-TYPE_I64, -TYPE_I64):
+        return (bool(x->i64 <= y->i64));
+
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        return (bool(x->f64 <= y->f64));
+
+    default:
+        return error_type2(x->type, y->type, "le: unsupported types");
+    }
 }
 
-rf_object_t rf_get_I64_I64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_gt(rf_object_t *x, rf_object_t *y)
+{
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(-TYPE_I64, -TYPE_I64):
+        return (bool(x->i64 > y->i64));
+
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        return (bool(x->f64 > y->f64));
+
+    default:
+        return error_type2(x->type, y->type, "gt: unsupported types");
+    }
+}
+
+rf_object_t rf_ge(rf_object_t *x, rf_object_t *y)
+{
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(-TYPE_I64, -TYPE_I64):
+        return (bool(x->i64 >= y->i64));
+
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        return (bool(x->f64 >= y->f64));
+
+    default:
+        return error_type2(x->type, y->type, "ge: unsupported types");
+    }
+}
+
+rf_object_t rf_and(rf_object_t *x, rf_object_t *y)
 {
     i32_t i;
-    i64_t yl = y->adt->len, xl = x->adt->len;
-    rf_object_t vec = vector_i64(yl);
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y), *ov = as_vector_i64(&vec);
+    i64_t l;
+    rf_object_t res;
 
-    for (i = 0; i < yl; i++)
+    switch (MTYPE2(x->type, y->type))
     {
-        if (iv2[i] >= xl)
-            ov[i] = NULL_I64;
-        else
-            ov[i] = iv1[iv2[i]];
+    case MTYPE2(-TYPE_BOOL, -TYPE_BOOL):
+        return (bool(x->bool && y->bool));
+
+    case MTYPE2(TYPE_BOOL, TYPE_BOOL):
+        l = x->adt->len;
+        res = vector_bool(x->adt->len);
+        for (i = 0; i < l; i++)
+            as_vector_bool(&res)[i] = as_vector_bool(x)[i] & as_vector_bool(y)[i];
+
+        return res;
+
+    default:
+        return error_type2(x->type, y->type, "and: unsupported types");
     }
-
-    return (vec);
 }
 
-rf_object_t rf_get_Timestamp_i64(rf_object_t *x, rf_object_t *y)
-{
-    return vector_get(x, y->i64);
-}
-
-rf_object_t rf_get_Timestamp_I64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_get(rf_object_t *x, rf_object_t *y)
 {
     i32_t i;
-    i64_t yl = y->adt->len, xl = x->adt->len;
-    rf_object_t vec = vector_timestamp(yl);
-    i64_t *iv1 = as_vector_timestamp(x), *ov = as_vector_timestamp(&vec);
-    i64_t *iv2 = as_vector_i64(y);
+    i64_t yl, xl;
+    rf_object_t vec;
 
-    for (i = 0; i < yl; i++)
+    switch (MTYPE2(x->type, y->type))
     {
-        if (iv2[i] >= xl)
-            ov[i] = NULL_I64;
-        else
-            ov[i] = iv1[iv2[i]];
+    case MTYPE2(TYPE_BOOL, -TYPE_I64):
+    case MTYPE2(TYPE_I64, -TYPE_I64):
+    case MTYPE2(TYPE_F64, -TYPE_I64):
+    case MTYPE2(TYPE_TIMESTAMP, -TYPE_I64):
+    case MTYPE2(TYPE_GUID, -TYPE_I64):
+    case MTYPE2(TYPE_CHAR, -TYPE_I64):
+    case MTYPE2(TYPE_LIST, -TYPE_I64):
+        return vector_get(x, y->i64);
+
+    case MTYPE2(TYPE_TABLE, -TYPE_SYMBOL):
+        return dict_get(x, y);
+
+    case MTYPE2(TYPE_BOOL, TYPE_I64):
+        yl = y->adt->len;
+        xl = x->adt->len;
+        vec = vector_bool(yl);
+        for (i = 0; i < yl; i++)
+        {
+            if (as_vector_bool(y)[i] >= xl)
+                as_vector_bool(&vec)[i] = false;
+            else
+                as_vector_bool(&vec)[i] = as_vector_bool(x)[(i32_t)as_vector_bool(y)[i]];
+        }
+
+        return vec;
+
+    case MTYPE2(TYPE_I64, TYPE_I64):
+        yl = y->adt->len;
+        xl = x->adt->len;
+        vec = vector_i64(yl);
+        for (i = 0; i < yl; i++)
+        {
+            if (as_vector_i64(y)[i] >= xl)
+                as_vector_i64(&vec)[i] = NULL_I64;
+            else
+                as_vector_i64(&vec)[i] = as_vector_i64(x)[(i32_t)as_vector_i64(y)[i]];
+        }
+
+        return vec;
+
+    case MTYPE2(TYPE_F64, TYPE_I64):
+        yl = y->adt->len;
+        xl = x->adt->len;
+        vec = vector_f64(yl);
+        for (i = 0; i < yl; i++)
+        {
+            if (as_vector_i64(y)[i] >= xl)
+                as_vector_f64(&vec)[i] = NULL_F64;
+            else
+                as_vector_f64(&vec)[i] = as_vector_f64(x)[(i32_t)as_vector_i64(y)[i]];
+        }
+
+        return vec;
+
+    case MTYPE2(TYPE_TIMESTAMP, TYPE_I64):
+        yl = y->adt->len;
+        xl = x->adt->len;
+        vec = vector_timestamp(yl);
+        for (i = 0; i < yl; i++)
+        {
+            if (as_vector_i64(y)[i] >= xl)
+                as_vector_timestamp(&vec)[i] = NULL_I64;
+            else
+                as_vector_timestamp(&vec)[i] = as_vector_timestamp(x)[(i32_t)as_vector_i64(y)[i]];
+        }
+
+        return vec;
+
+        // case MTYPE2(TYPE_GUID, TYPE_I64):
+        //     yl = y->adt->len;
+        //     xl = x->adt->len;
+        //     vec = vector_guid(yl);
+        //     for (i = 0; i < yl; i++)
+        //     {
+        //         if (as_vector_i64(y)[i] >= xl)
+        //             as_vector_guid(&vec)[i] = guid(NULL_GUID);
+        //         else
+        //             as_vector_guid(&vec)[i] = as_vector_guid(x)[(i32_t)as_vector_i64(y)[i]];
+        //     }
+
+        //     return vec;
+
+    case MTYPE2(TYPE_CHAR, TYPE_I64):
+        yl = y->adt->len;
+        xl = x->adt->len;
+        vec = string(yl);
+        for (i = 0; i < yl; i++)
+        {
+            if (as_vector_i64(y)[i] >= xl)
+                as_string(&vec)[i] = ' ';
+            else
+                as_string(&vec)[i] = as_string(x)[(i32_t)as_vector_i64(y)[i]];
+        }
+
+        return vec;
+
+    case MTYPE2(TYPE_LIST, TYPE_I64):
+        yl = y->adt->len;
+        xl = x->adt->len;
+        vec = list(yl);
+        for (i = 0; i < yl; i++)
+        {
+            if (as_vector_i64(y)[i] >= xl)
+                as_list(&vec)[i] = null();
+            else
+                as_list(&vec)[i] = rf_object_clone(&as_list(x)[(i32_t)as_vector_i64(y)[i]]);
+        }
+
+        return vec;
+
+    default:
+        return error_type2(x->type, y->type, "get: unsupported types");
     }
-
-    return (vec);
-}
-
-rf_object_t rf_get_Guid_i64(rf_object_t *x, rf_object_t *y)
-{
-    return vector_get(x, y->i64);
-}
-
-rf_object_t rf_get_Guid_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t yl = y->adt->len, xl = x->adt->len;
-    rf_object_t vec = vector_guid(yl);
-    guid_t *iv1 = as_vector_guid(x), *ov = as_vector_guid(&vec);
-    i64_t *iv2 = as_vector_i64(y);
-
-    for (i = 0; i < yl; i++)
-    {
-        if (iv2[i] >= xl)
-            ov[i] = (guid_t){0};
-        else
-            ov[i] = iv1[iv2[i]];
-    }
-
-    return (vec);
-}
-
-rf_object_t rf_get_F64_i64(rf_object_t *x, rf_object_t *y)
-{
-    return vector_get(x, y->i64);
-}
-
-rf_object_t rf_get_F64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t yl = y->adt->len, xl = x->adt->len;
-    rf_object_t vec = vector_f64(yl);
-    f64_t *iv1 = as_vector_f64(x), *ov = as_vector_f64(&vec);
-    i64_t *iv2 = as_vector_i64(y);
-
-    for (i = 0; i < yl; i++)
-    {
-        if (iv2[i] >= xl)
-            ov[i] = NULL_F64;
-        else
-            ov[i] = iv1[iv2[i]];
-    }
-
-    return (vec);
-}
-
-rf_object_t rf_get_Char_i64(rf_object_t *x, rf_object_t *y)
-{
-    return vector_get(x, y->i64);
-}
-
-rf_object_t rf_get_Char_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t yl = y->adt->len, xl = x->adt->len;
-    rf_object_t vec = string(yl);
-    str_t iv1 = as_string(x), ov = as_string(&vec);
-    i64_t *iv2 = as_vector_i64(y);
-
-    for (i = 0; i < yl; i++)
-    {
-        if (iv2[i] >= xl)
-            ov[i] = ' ';
-        else
-            ov[i] = iv1[iv2[i]];
-    }
-
-    return vec;
-}
-
-rf_object_t rf_get_List_i64(rf_object_t *x, rf_object_t *y)
-{
-    return vector_get(x, y->i64);
-}
-
-rf_object_t rf_get_List_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t yl = y->adt->len, xl = x->adt->len;
-    rf_object_t vec = list(yl);
-    rf_object_t *iv1 = as_list(x), *ov = as_list(&vec);
-    i64_t *iv2 = as_vector_i64(y);
-
-    for (i = 0; i < yl; i++)
-    {
-        if (iv2[i] >= xl)
-            ov[i] = null();
-        else
-            ov[i] = rf_object_clone(&iv1[iv2[i]]);
-    }
-
-    return vec;
-}
-
-rf_object_t rf_get_Table_symbol(rf_object_t *x, rf_object_t *y)
-{
-    return dict_get(x, y);
-}
-
-rf_object_t rf_find_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i64_t l = x->adt->len, i;
-
-    i = vector_find(x, y);
-
-    if (i == l)
-        return i64(NULL_I64);
-    else
-        return i64(i);
 }
 
 rf_object_t rf_find_I64_I64(rf_object_t *x, rf_object_t *y)
@@ -1162,7 +639,7 @@ rf_object_t rf_find_I64_I64(rf_object_t *x, rf_object_t *y)
     }
 
     // otherwise, use a hash table
-    ht = ht_new(xl, &kmh_hash, &i64_cmp);
+    ht = ht_new(xl, &rfi_kmh_hash, &i64_cmp);
 
     for (i = 0; i < xl; i++)
         ht_insert(ht, iv1[i], i);
@@ -1175,265 +652,198 @@ rf_object_t rf_find_I64_I64(rf_object_t *x, rf_object_t *y)
     return vec;
 }
 
-rf_object_t rf_find_F64_f64(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_find(rf_object_t *x, rf_object_t *y)
 {
-    i64_t l = x->adt->len, i;
+    i64_t l, i;
 
-    i = vector_find(x, y);
-
-    if (i == l)
-        return i64(NULL_I64);
-    else
-        return i64(i);
-}
-
-rf_object_t rf_find_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i64_t xl = x->adt->len, yl = y->adt->len, i, j;
-    rf_object_t vec = vector_i64(yl);
-    f64_t *iv1 = as_vector_f64(x);
-    i64_t *iv2 = as_vector_i64(y);
-
-    for (i = 0; i < yl; i++)
+    switch (MTYPE2(x->type, y->type))
     {
-        for (j = 0; j < xl; j++)
-            if (iv1[j] == y->f64)
-                break;
-        if (j == xl)
-            iv2[i] = NULL_I64;
+    case MTYPE2(TYPE_BOOL, -TYPE_BOOL):
+    case MTYPE2(TYPE_I64, -TYPE_I64):
+    case MTYPE2(TYPE_F64, -TYPE_F64):
+    case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
+    case MTYPE2(TYPE_GUID, -TYPE_GUID):
+    case MTYPE2(TYPE_CHAR, -TYPE_CHAR):
+    case MTYPE2(TYPE_LIST, -TYPE_LIST):
+        l = x->adt->len;
+        i = vector_find(x, y);
+
+        if (i == l)
+            return i64(NULL_I64);
         else
-            iv2[i] = j;
+            return i64(i);
+
+        return i64(vector_find(x, y));
+
+    case MTYPE2(TYPE_I64, TYPE_I64):
+        return rf_find_I64_I64(x, y);
+
+    default:
+        return error_type2(x->type, y->type, "find: unsupported types");
     }
-
-    return vec;
 }
 
-rf_object_t rf_concat_bool_bool(rf_object_t *x, rf_object_t *y)
+rf_object_t rf_concat(rf_object_t *x, rf_object_t *y)
 {
-    rf_object_t vec = vector_bool(2);
-    as_vector_bool(&vec)[0] = x->bool;
-    as_vector_bool(&vec)[1] = y->bool;
+    i64_t i, xl, yl;
+    rf_object_t vec;
 
-    return vec;
-}
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(-TYPE_BOOL, -TYPE_BOOL):
+        vec = vector_bool(2);
+        as_vector_bool(&vec)[0] = x->bool;
+        as_vector_bool(&vec)[1] = y->bool;
+        return vec;
 
-rf_object_t rf_concat_Bool_bool(rf_object_t *x, rf_object_t *y)
-{
-    rf_object_t vec = vector_bool(x->adt->len + 1);
-    as_vector_bool(&vec)[x->adt->len] = y->bool;
+    case MTYPE2(-TYPE_I64, -TYPE_I64):
+        vec = vector_i64(2);
+        as_vector_i64(&vec)[0] = x->i64;
+        as_vector_i64(&vec)[1] = y->i64;
+        return vec;
 
-    return vec;
-}
+    case MTYPE2(-TYPE_F64, -TYPE_F64):
+        vec = vector_f64(2);
+        as_vector_f64(&vec)[0] = x->f64;
+        as_vector_f64(&vec)[1] = y->f64;
+        return vec;
 
-rf_object_t rf_concat_Bool_Bool(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t xl = x->adt->len, yl = y->adt->len;
-    rf_object_t vec = vector_bool(xl + yl);
-    bool_t *iv1 = as_vector_bool(x), *iv2 = as_vector_bool(y), *ov = as_vector_bool(&vec);
+    case MTYPE2(-TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
+        vec = vector_timestamp(2);
+        as_vector_timestamp(&vec)[0] = x->i64;
+        as_vector_timestamp(&vec)[1] = y->i64;
+        return vec;
 
-    for (i = 0; i < xl; i++)
-        ov[i] = iv1[i];
-    for (i = 0; i < yl; i++)
-        ov[i + xl] = iv2[i];
+    case MTYPE2(-TYPE_GUID, -TYPE_GUID):
+        vec = vector_guid(2);
+        memcpy(&as_vector_guid(&vec)[0], x->guid, sizeof(guid_t));
+        memcpy(&as_vector_guid(&vec)[1], y->guid, sizeof(guid_t));
+        return vec;
 
-    return vec;
-}
+    case MTYPE2(-TYPE_CHAR, -TYPE_CHAR):
+        vec = string(2);
+        as_string(&vec)[0] = x->schar;
+        as_string(&vec)[1] = y->schar;
+        return vec;
 
-rf_object_t rf_concat_bool_Bool(rf_object_t *x, rf_object_t *y)
-{
-    rf_object_t vec = vector_bool(2);
-    as_vector_bool(&vec)[0] = x->bool;
-    as_vector_bool(&vec)[1] = y->bool;
+    case MTYPE2(TYPE_BOOL, -TYPE_BOOL):
+        xl = x->adt->len;
+        vec = vector_bool(xl + 1);
+        for (i = 0; i < xl; i++)
+            as_vector_bool(&vec)[i] = as_vector_bool(x)[i];
 
-    return vec;
-}
+        as_vector_bool(&vec)[xl] = y->bool;
+        return vec;
 
-rf_object_t rf_concat_i64_i64(rf_object_t *x, rf_object_t *y)
-{
-    rf_object_t vec = vector_i64(2);
-    as_vector_i64(&vec)[0] = x->i64;
-    as_vector_i64(&vec)[1] = y->i64;
+    case MTYPE2(TYPE_I64, -TYPE_I64):
+        xl = x->adt->len;
+        vec = vector_i64(xl + 1);
+        for (i = 0; i < xl; i++)
+            as_vector_i64(&vec)[i] = as_vector_i64(x)[i];
 
-    return vec;
-}
+        as_vector_i64(&vec)[xl] = y->i64;
+        return vec;
 
-rf_object_t rf_concat_I64_i64(rf_object_t *x, rf_object_t *y)
-{
-    i64_t i, l = x->adt->len, *iv, *ov;
-    rf_object_t vec = vector_i64(l + 1);
+    case MTYPE2(TYPE_F64, -TYPE_F64):
+        xl = x->adt->len;
+        vec = vector_f64(xl + 1);
+        for (i = 0; i < xl; i++)
+            as_vector_f64(&vec)[i] = as_vector_f64(x)[i];
 
-    iv = as_vector_i64(x);
-    ov = as_vector_i64(&vec);
+        as_vector_f64(&vec)[xl] = y->f64;
+        return vec;
 
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i];
+    case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
+        xl = x->adt->len;
+        vec = vector_timestamp(xl + 1);
+        for (i = 0; i < xl; i++)
+            as_vector_timestamp(&vec)[i] = as_vector_timestamp(x)[i];
 
-    ov[l] = y->i64;
+        as_vector_timestamp(&vec)[xl] = y->i64;
+        return vec;
 
-    return vec;
-}
+    case MTYPE2(TYPE_GUID, -TYPE_GUID):
+        xl = x->adt->len;
+        vec = vector_guid(xl + 1);
+        for (i = 0; i < xl; i++)
+            as_vector_guid(&vec)[i] = as_vector_guid(x)[i];
 
-rf_object_t rf_concat_I64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t xl = x->adt->len, yl = y->adt->len;
-    rf_object_t vec = vector_i64(xl + yl);
-    i64_t *iv1 = as_vector_i64(x), *iv2 = as_vector_i64(y), *ov = as_vector_i64(&vec);
+        memcpy(&as_vector_guid(&vec)[xl], y->guid, sizeof(guid_t));
+        return vec;
 
-    for (i = 0; i < xl; i++)
-        ov[i] = iv1[i];
-    for (i = 0; i < yl; i++)
-        ov[i + xl] = iv2[i];
+    case MTYPE2(TYPE_BOOL, TYPE_BOOL):
+        xl = x->adt->len;
+        yl = y->adt->len;
+        vec = vector_bool(xl + yl);
+        for (i = 0; i < xl; i++)
+            as_vector_bool(&vec)[i] = as_vector_bool(x)[i];
+        for (i = 0; i < yl; i++)
+            as_vector_bool(&vec)[i + xl] = as_vector_bool(y)[i];
+        return vec;
 
-    return vec;
-}
+    case MTYPE2(TYPE_I64, TYPE_I64):
+        xl = x->adt->len;
+        yl = y->adt->len;
+        vec = vector_i64(xl + yl);
+        for (i = 0; i < xl; i++)
+            as_vector_i64(&vec)[i] = as_vector_i64(x)[i];
+        for (i = 0; i < yl; i++)
+            as_vector_i64(&vec)[i + xl] = as_vector_i64(y)[i];
+        return vec;
 
-rf_object_t rf_concat_i64_I64(rf_object_t *x, rf_object_t *y)
-{
-    i64_t i, l = y->adt->len, *iv, *ov;
-    rf_object_t vec = vector_i64(l + 1);
+    case MTYPE2(TYPE_F64, TYPE_F64):
+        xl = x->adt->len;
+        yl = y->adt->len;
+        vec = vector_f64(xl + yl);
+        for (i = 0; i < xl; i++)
+            as_vector_f64(&vec)[i] = as_vector_f64(x)[i];
+        for (i = 0; i < yl; i++)
+            as_vector_f64(&vec)[i + xl] = as_vector_f64(y)[i];
+        return vec;
 
-    iv = as_vector_i64(y);
-    ov = as_vector_i64(&vec);
+    case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
+        xl = x->adt->len;
+        yl = y->adt->len;
+        vec = vector_timestamp(xl + yl);
+        for (i = 0; i < xl; i++)
+            as_vector_timestamp(&vec)[i] = as_vector_timestamp(x)[i];
+        for (i = 0; i < yl; i++)
+            as_vector_timestamp(&vec)[i + xl] = as_vector_timestamp(y)[i];
+        return vec;
 
-    for (i = 0; i < l; i++)
-        ov[i + 1] = iv[i];
+    case MTYPE2(TYPE_GUID, TYPE_GUID):
+        xl = x->adt->len;
+        yl = y->adt->len;
+        vec = vector_guid(xl + yl);
+        for (i = 0; i < xl; i++)
+            as_vector_guid(&vec)[i] = as_vector_guid(x)[i];
+        for (i = 0; i < yl; i++)
+            as_vector_guid(&vec)[i + xl] = as_vector_guid(y)[i];
+        return vec;
 
-    ov[0] = x->i64;
+    case MTYPE2(TYPE_CHAR, TYPE_CHAR):
+        xl = x->adt->len;
+        yl = y->adt->len;
+        vec = string(xl + yl);
+        for (i = 0; i < xl; i++)
+            as_string(&vec)[i] = as_string(x)[i];
+        for (i = 0; i < yl; i++)
+            as_string(&vec)[i + xl] = as_string(y)[i];
+        return vec;
 
-    return vec;
-}
+    case MTYPE2(TYPE_LIST, TYPE_LIST):
+        xl = x->adt->len;
+        yl = y->adt->len;
+        vec = list(xl + yl);
+        for (i = 0; i < xl; i++)
+            as_list(&vec)[i] = rf_object_clone(&as_list(x)[i]);
+        for (i = 0; i < yl; i++)
+            as_list(&vec)[i + xl] = rf_object_clone(&as_list(y)[i]);
+        return vec;
 
-rf_object_t rf_concat_f64_f64(rf_object_t *x, rf_object_t *y)
-{
-    rf_object_t vec = vector_f64(2);
-    as_vector_i64(&vec)[0] = x->f64;
-    as_vector_i64(&vec)[1] = y->f64;
-
-    return vec;
-}
-
-rf_object_t rf_concat_F64_f64(rf_object_t *x, rf_object_t *y)
-{
-    i64_t i, l = x->adt->len;
-    f64_t *iv, *ov;
-    rf_object_t vec = vector_f64(l + 1);
-
-    iv = as_vector_f64(x);
-    ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i];
-
-    ov[l] = y->f64;
-
-    return vec;
-}
-
-rf_object_t rf_concat_F64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t xl = x->adt->len, yl = y->adt->len;
-    rf_object_t vec = vector_f64(xl + yl);
-    f64_t *iv1 = as_vector_f64(x), *iv2 = as_vector_f64(y), *ov = as_vector_f64(&vec);
-
-    for (i = 0; i < xl; i++)
-        ov[i] = iv1[i];
-    for (i = 0; i < yl; i++)
-        ov[i + xl] = iv2[i];
-
-    return vec;
-}
-
-rf_object_t rf_concat_f64_F64(rf_object_t *x, rf_object_t *y)
-{
-    i64_t i, l = y->adt->len;
-    f64_t *iv, *ov;
-    rf_object_t vec = vector_f64(l + 1);
-
-    iv = as_vector_f64(y);
-    ov = as_vector_f64(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i + 1] = iv[i];
-
-    ov[0] = x->f64;
-
-    return vec;
-}
-
-rf_object_t rf_concat_char_char(rf_object_t *x, rf_object_t *y)
-{
-    rf_object_t vec = string(2);
-    as_string(&vec)[0] = x->schar;
-    as_string(&vec)[1] = y->schar;
-
-    return vec;
-}
-
-rf_object_t rf_concat_Char_char(rf_object_t *x, rf_object_t *y)
-{
-    i64_t i, l = x->adt->len;
-    str_t iv, ov;
-    rf_object_t vec = string(l + 1);
-
-    iv = as_string(x);
-    ov = as_string(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i] = iv[i];
-
-    ov[l] = y->schar;
-
-    return vec;
-}
-
-rf_object_t rf_concat_Char_Char(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t xl = x->adt->len, yl = y->adt->len;
-    rf_object_t vec = string(xl + yl);
-    str_t iv1 = as_string(x), iv2 = as_string(y), ov = as_string(&vec);
-
-    for (i = 0; i < xl; i++)
-        ov[i] = iv1[i];
-    for (i = 0; i < yl; i++)
-        ov[i + xl] = iv2[i];
-
-    return vec;
-}
-
-rf_object_t rf_concat_char_Char(rf_object_t *x, rf_object_t *y)
-{
-    i64_t i, l = y->adt->len;
-    str_t iv, ov;
-    rf_object_t vec = string(l + 1);
-
-    iv = as_string(y);
-    ov = as_string(&vec);
-
-    for (i = 0; i < l; i++)
-        ov[i + 1] = iv[i];
-
-    ov[0] = x->schar;
-
-    return vec;
-}
-
-rf_object_t rf_concat_List_List(rf_object_t *x, rf_object_t *y)
-{
-    i32_t i;
-    i64_t xl = x->adt->len, yl = y->adt->len;
-    rf_object_t vec = list(xl + yl);
-    rf_object_t *iv1 = as_list(x), *iv2 = as_list(y), *ov = as_list(&vec);
-
-    for (i = 0; i < xl; i++)
-        ov[i] = rf_object_clone(&iv1[i]);
-    for (i = 0; i < yl; i++)
-        ov[i + xl] = rf_object_clone(&iv2[i]);
-
-    return vec;
+    default:
+        return error_type2(x->type, y->type, "concat: unsupported types");
+    }
 }
 
 rf_object_t rf_filter_I64_Bool(rf_object_t *x, rf_object_t *y)

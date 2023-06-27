@@ -138,7 +138,7 @@ rf_object_t rf_distinct_I64(rf_object_t *x)
             m[i] = 0;
 
         // create hash set those elements are not in range
-        set = set_new(xl - inrange, &kmh_hash, &i64_cmp);
+        set = set_new(xl - inrange, &rfi_kmh_hash, &i64_cmp);
 
         for (i = 0; i < xl; i++)
         {
@@ -171,7 +171,7 @@ rf_object_t rf_distinct_I64(rf_object_t *x)
 
 set:
     // most of elements are not in range
-    set = set_new(xl, &kmh_hash, &i64_cmp);
+    set = set_new(xl, &rfi_kmh_hash, &i64_cmp);
 
     for (i = 0; i < xl; i++)
         if (set_insert(set, normalize(iv1[i])))
@@ -278,7 +278,7 @@ rf_object_t rf_group_I64(rf_object_t *x)
         for (i = 0; i < range; i++)
             m[i] = 0;
 
-        ht = ht_new(xl - inrange, &i64_hash, &i64_cmp);
+        ht = ht_new(xl - inrange, &rfi_i64_hash, &i64_cmp);
 
         for (i = 0; i < xl; i++)
         {
@@ -335,7 +335,7 @@ rf_object_t rf_group_I64(rf_object_t *x)
     }
 
 hash:
-    ht = ht_new(xl, &i64_hash, &i64_cmp);
+    ht = ht_new(xl, &rfi_i64_hash, &i64_cmp);
 
     // calculate counts for each key
     for (i = 0; i < xl; i++)

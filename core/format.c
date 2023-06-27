@@ -180,7 +180,7 @@ i32_t i64_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t li
 
 i32_t f64_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, f64_t val)
 {
-    if (rf_is_nan(val))
+    if (rfi_is_nan(val))
         return str_fmt_into(dst, len, offset, limit, "%*.*s%s", indent, indent, PADDING, "0f");
     else
         return str_fmt_into(dst, len, offset, limit, "%*.*s%.*f", indent, indent, PADDING, F64_PRECISION, val);

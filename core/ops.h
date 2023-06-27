@@ -69,16 +69,16 @@
  */
 #define ALIGNUP(x, a) (((x) + (a)-1) & ~((a)-1))
 
-extern bool_t rf_is_nan(f64_t x);
-extern bool_t rf_eq(rf_object_t *x, rf_object_t *y);
-extern bool_t rf_lt(rf_object_t *x, rf_object_t *y);
-i64_t round_f64(f64_t x);
-i64_t floor_f64(f64_t x);
-i64_t ceil_f64(f64_t x);
-u64_t rand_u64();
+extern bool_t rfi_is_nan(f64_t x);
+extern bool_t rfi_eq(rf_object_t *x, rf_object_t *y);
+extern bool_t rfi_lt(rf_object_t *x, rf_object_t *y);
+i64_t rfi_round_f64(f64_t x);
+i64_t rfi_floor_f64(f64_t x);
+i64_t rfi_ceil_f64(f64_t x);
+u64_t rfi_rand_u64();
 // Knuth's multiplicative hash
-u64_t kmh_hash(i64_t key);
-u64_t fnv1a_hash_64(i64_t key);
-u64_t i64_hash(i64_t a);
+u64_t rfi_kmh_hash(i64_t key);
+u64_t rfi_fnv1a_hash_64(i64_t key);
+u64_t rfi_i64_hash(i64_t a);
 
 #endif

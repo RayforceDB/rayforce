@@ -136,7 +136,7 @@ symbols_t *symbols_new()
     symbols->strings_pool = (str_t)(node + sizeof(pool_node_t *)); // Skip the node size of next ptr
 
     symbols->str_to_id = ht_new(SYMBOLS_POOL_SIZE, &string_hash, &string_str_cmp);
-    symbols->id_to_str = ht_new(SYMBOLS_POOL_SIZE, &kmh_hash, &i64_cmp);
+    symbols->id_to_str = ht_new(SYMBOLS_POOL_SIZE, &rfi_kmh_hash, &i64_cmp);
     symbols->next_sym_id = 0;
     symbols->next_kw_id = -1;
 
