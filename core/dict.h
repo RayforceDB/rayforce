@@ -28,7 +28,8 @@
 #include "vector.h"
 #include "string.h"
 
-extern rf_object_t dict_get(rf_object_t *dict, rf_object_t *key);
-extern rf_object_t dict_set(rf_object_t *dict, rf_object_t *key, rf_object_t val);
+rf_object_t dict_get(rf_object_t *dict, rf_object_t *key);
+rf_object_t dict_set(rf_object_t *dict, rf_object_t *key, rf_object_t val);
+null_t dict_clear(rf_object_t *dict);
 
 #endif

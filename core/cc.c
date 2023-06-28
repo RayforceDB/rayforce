@@ -202,7 +202,7 @@ cc_result_t cc_compile_set(bool_t has_consumer, cc_t *cc, rf_object_t *object, u
     return CC_OK;
 }
 
-cc_result_t cc_compile_let(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t arity)
+cc_result_t cc_compile_let(cc_t *cc, rf_object_t *object, u32_t arity)
 {
     i64_t id = 0;
     cc_result_t res;
@@ -210,25 +210,21 @@ cc_result_t cc_compile_let(bool_t has_consumer, cc_t *cc, rf_object_t *object, u
     function_t *func = as_function(&cc->function);
     rf_object_t *code = &func->code;
 
-    // if (!has_consumer)
-    //     return CC_NULL;
-
     if (arity != 2)
         cerr(cc, car->id, ERR_LENGTH, "'let' takes two arguments");
 
     if (as_list(object)[1].type != -TYPE_SYMBOL)
         cerr(cc, car->id, ERR_TYPE, "'let' first argument must be a symbol");
 
-    id = func->locals.adt->len;
-    vector_push(&func->locals, as_list(object)[1]);
+    push_opcode(cc, car->id, code, OP_PUSH);
+    push_const(cc, as_list(object)[1]);
 
     res = cc_compile_expr(true, cc, &as_list(object)[2]);
 
     if (res == CC_ERROR)
         return CC_ERROR;
 
-    push_opcode(cc, car->id, code, OP_STORE);
-    push_u64(code, 1 + id);
+    push_opcode(cc, car->id, code, OP_LSET);
 
     return CC_OK;
 }
@@ -560,7 +556,7 @@ cc_result_t cc_compile_special_forms(bool_t has_consumer, cc_t *cc, rf_object_t 
         res = cc_compile_set(has_consumer, cc, object, arity);
         break;
     case KW_LET:
-        res = cc_compile_let(has_consumer, cc, object, arity);
+        res = cc_compile_let(cc, object, arity);
         break;
     case KW_FN:
         res = cc_compile_fn(cc, object, arity);
@@ -654,19 +650,7 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
             return CC_OK;
         }
 
-        // then try to find in locals
-        id = vector_find(&func->locals, object);
-
-        if (id < (i64_t)func->locals.adt->len)
-        {
-            push_opcode(cc, object->id, code, OP_LOAD);
-            push_u64(code, 1 + id);
-            func->stack_size++;
-
-            return CC_OK;
-        }
-
-        // then try to search in the function args
+        // try to search in the function args
         id = vector_find(&func->args, object);
 
         if (id < (i64_t)func->args.adt->len)
@@ -678,11 +662,10 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
             return CC_OK;
         }
 
-        // then in a global env
+        // then in a local or global env
         push_opcode(cc, object->id, code, OP_PUSH);
         push_const(cc, *object);
-        push_opcode(cc, object->id, code, OP_CALL1);
-        push_u64(code, rf_get_variable);
+        push_opcode(cc, object->id, code, OP_LGET);
         func->stack_size++;
 
         return CC_OK;
@@ -752,8 +735,7 @@ rf_object_t cc_compile_function(bool_t top, str_t name, rf_object_t args,
     cc_t cc = {
         .top_level = top,
         .debuginfo = debuginfo,
-        .function = function(args, vector_symbol(0), string(0),
-                             debuginfo_new(debuginfo->filename, name)),
+        .function = function(args, string(0), debuginfo_new(debuginfo->filename, name)),
     };
 
     cc_result_t res;

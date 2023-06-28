@@ -86,3 +86,15 @@ rf_object_t dict_set(rf_object_t *dict, rf_object_t *key, rf_object_t val)
 
     return val;
 }
+
+null_t dict_clear(rf_object_t *dict)
+{
+    rf_object_t *keys = &as_list(dict)[0];
+    rf_object_t *vals = &as_list(dict)[1];
+
+    if (keys->adt->len == 0)
+        return;
+
+    vector_clear(keys);
+    vector_clear(vals);
+}

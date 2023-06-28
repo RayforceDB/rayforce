@@ -35,6 +35,7 @@
 #include "runtime.h"
 #include "dict.h"
 #include "cast.h"
+#include "unary.h"
 
 #define stack_push(v, x) (v->stack[v->sp++] = x)
 #define stack_pop(v) (v->stack[--v->sp])
@@ -102,7 +103,7 @@ rf_object_t __attribute__((hot)) vm_exec(vm_t *vm, rf_object_t *fun)
     static null_t *dispatch_table[] = {
         &&op_halt, &&op_ret, &&op_push, &&op_pop, &&op_jne, &&op_jmp, &&op_timer_set, &&op_timer_get,
         &&op_call0, &&op_call1, &&op_call2, &&op_call3, &&op_call4, &&op_calln, &&op_callf, &&op_store,
-        &&op_load, &&op_cast, &&op_try, &&op_catch, &&op_throw, &&op_trace,
+        &&op_load, &&op_lset, &&op_lget, &&op_cast, &&op_try, &&op_catch, &&op_throw, &&op_trace,
         &&op_alloc, &&op_map, &&op_collect};
 
 #define dispatch() goto *dispatch_table[(i32_t)code[vm->ip]]
@@ -172,12 +173,11 @@ op_halt:
         return null();
 op_ret:
     vm->ip++;
+    // clear locals
+    dict_clear(&f->locals);
     x3 = stack_pop(vm); // return value
-    j = (i32_t)f->locals.adt->len;
-    for (i = 0; i < j; i++)
-        stack_pop_free(vm); // pop locals
-    x2 = stack_pop(vm);     // ctx
-    stack_pop_free(vm);     // <function>
+    x2 = stack_pop(vm); // ctx
+    stack_pop_free(vm); // <function>
     j = (i32_t)f->args.adt->len;
     for (i = 0; i < j; i++)
         stack_pop_free(vm); // pop args
@@ -331,7 +331,6 @@ op_callf:
     // --
     f = as_function(addr);
     code = as_string(&f->code);
-    vm->sp += (i32_t)f->locals.adt->len;
     dispatch();
 op_store:
     b = vm->ip++;
@@ -344,6 +343,20 @@ op_load:
     load_u64(t, vm);
     x1 = vm->stack[vm->bp + t];
     stack_push(vm, rf_object_clone(&x1));
+    dispatch();
+op_lset:
+    b = vm->ip++;
+    x2 = stack_pop(vm);
+    x1 = stack_pop(vm);
+    dict_set(&f->locals, &x1, x2);
+    dispatch();
+op_lget:
+    b = vm->ip++;
+    x1 = stack_pop(vm);
+    x2 = dict_get(&f->locals, &x1);
+    if (x2.type == TYPE_NULL)
+        x2 = rf_get_variable(&x1);
+    stack_push(vm, x2);
     dispatch();
 op_cast:
     b = vm->ip++;

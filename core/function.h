@@ -32,13 +32,13 @@
 typedef struct function_t
 {
     rf_object_t args;      // vector of arguments names
-    rf_object_t locals;    // vector of local variables names
+    rf_object_t locals;    // dict of local variables
     rf_object_t code;      // string of bytecode
     rf_object_t constants; // list of function constants
     debuginfo_t debuginfo; // debuginfo from cc phase
     i32_t stack_size;      // size of stack frame
 } function_t;
 
-rf_object_t function(rf_object_t args, rf_object_t locals, rf_object_t code, debuginfo_t debuginfo);
+rf_object_t function(rf_object_t args, rf_object_t code, debuginfo_t debuginfo);
 
 #endif

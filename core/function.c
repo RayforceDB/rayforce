@@ -25,7 +25,7 @@
 #include "string.h"
 #include "alloc.h"
 
-rf_object_t function(rf_object_t args, rf_object_t locals, rf_object_t code, debuginfo_t debuginfo)
+rf_object_t function(rf_object_t args, rf_object_t code, debuginfo_t debuginfo)
 {
     header_t *adt = rf_malloc(sizeof(header_t) + sizeof(function_t));
     function_t *f = (function_t *)(adt + 1);
@@ -33,7 +33,7 @@ rf_object_t function(rf_object_t args, rf_object_t locals, rf_object_t code, deb
     adt->rc = 1;
 
     f->args = args;
-    f->locals = locals;
+    f->locals = dict(vector_symbol(0), list(0));
     f->code = code;
     f->constants = list(0);
     f->debuginfo = debuginfo;

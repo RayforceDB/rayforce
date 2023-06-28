@@ -276,6 +276,84 @@ type_list:
     return l;
 }
 
+i64_t vector_find_rev(rf_object_t *vector, rf_object_t *key)
+{
+    char_t kc, *vc;
+    bool_t kb, *vb;
+    i64_t ki, *vi;
+    f64_t kf, *vf;
+    rf_object_t *kl, *vl;
+    i64_t i, l;
+    guid_t *kg, *vg;
+    type_t type = vector->type;
+
+    static null_t *types_table[] = {&&type_null, &&type_bool, &&type_i64, &&type_f64, &&type_symbol,
+                                    &&type_timestamp, &&type_guid, &&type_char, &&type_list};
+
+    l = vector->adt->len;
+
+    goto *types_table[(i32_t)type];
+
+type_null:
+    return 0;
+type_bool:
+    vb = as_vector_bool(vector);
+    kb = key->bool;
+    for (i = l - 1; i >= 0; i--)
+        if (vb[i] == kb)
+            return i;
+    return l;
+type_i64:
+    vi = as_vector_i64(vector);
+    ki = key->i64;
+    for (i = l - 1; i >= 0; i--)
+        if (vi[i] == ki)
+            return i;
+    return l;
+type_f64:
+    vf = as_vector_f64(vector);
+    kf = key->f64;
+    for (i = l - 1; i >= 0; i--)
+        if (vf[i] == kf)
+            return i;
+    return l;
+type_symbol:
+    vi = as_vector_symbol(vector);
+    ki = key->i64;
+    for (i = l - 1; i >= 0; i--)
+        if (vi[i] == ki)
+            return i;
+    return l;
+type_timestamp:
+    vi = as_vector_timestamp(vector);
+    ki = key->i64;
+    for (i = l - 1; i >= 0; i--)
+        if (vi[i] == ki)
+            return i;
+    return l;
+type_guid:
+    vg = as_vector_guid(vector);
+    kg = key->guid;
+    for (i = l - 1; i >= 0; i--)
+        if (memcmp(vg + i, kg, sizeof(guid_t)) == 0)
+            return i;
+    return l;
+type_char:
+    vc = as_string(vector);
+    kc = key->schar;
+    for (i = l - 1; i >= 0; i--)
+        if (vc[i] == kc)
+            return i;
+    return l;
+type_list:
+    vl = as_list(vector);
+    kl = key;
+    for (i = l - 1; i >= 0; i--)
+        if (rf_object_eq(&vl[i], kl))
+            return i;
+    return l;
+}
+
 rf_object_t vector_get(rf_object_t *vector, i64_t index)
 {
     i64_t l;
@@ -486,6 +564,20 @@ type_list:
     if (len == NULL_I64)
         vector_shrink(&vec, j);
     return vec;
+}
+
+null_t vector_clear(rf_object_t *vector)
+{
+    if (vector->type == TYPE_LIST)
+    {
+        i64_t i, l = vector->adt->len;
+        rf_object_t *list = as_list(vector);
+
+        for (i = 0; i < l; i++)
+            rf_object_free(&list[i]);
+    }
+
+    vector->adt->len = 0;
 }
 
 null_t vector_free(rf_object_t *vector)
