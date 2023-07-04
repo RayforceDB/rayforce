@@ -97,6 +97,8 @@ null_t init_functions(rf_object_t *records)
     REC(records, 2, "concat",      rf_concat);
     REC(records, 2, "filter",      rf_filter);
     REC(records, 2, "take",        rf_take);
+    REC(records, 2, "in",          rf_in);
+    REC(records, 2, "except",      rf_except);
      
     // Ternary       
     REC(records, 3, "rand",        rf_rand);

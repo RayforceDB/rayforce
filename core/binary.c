@@ -31,6 +31,7 @@
 #include "format.h"
 #include "vector.h"
 #include "hash.h"
+#include "set.h"
 
 rf_object_t error_type2(type_t type1, type_t type2, str_t msg)
 {
@@ -705,7 +706,6 @@ rf_object_t rf_find_I64_I64(rf_object_t *x, rf_object_t *y)
             min = iv1[i];
     }
 
-#define mask -1ll
 #define normalize(k) ((u64_t)(k - min))
     // if range fits in 64 mb, use vector positions instead of hash table
     range = max - min + 1;
@@ -713,19 +713,21 @@ rf_object_t rf_find_I64_I64(rf_object_t *x, rf_object_t *y)
     {
         found = vector_i64(range);
         fv = as_vector_i64(&found);
-        memset(fv, 255, sizeof(i64_t) * range);
+
+        for (i = 0; i < xl; i++)
+            fv[i] = NULL_I64;
 
         for (i = 0; i < xl; i++)
         {
             n = normalize(iv1[i]);
-            if (fv[n] == mask)
+            if (fv[n] == NULL_I64)
                 fv[n] = i;
         }
 
         for (i = 0; i < yl; i++)
         {
             n = normalize(iv2[i]);
-            if (iv2[i] < min || iv2[i] > max || fv[n] == mask)
+            if (iv2[i] < min || iv2[i] > max)
                 ov[i] = NULL_I64;
             else
                 ov[i] = fv[n];
@@ -1117,5 +1119,49 @@ rf_object_t rf_take(rf_object_t *x, rf_object_t *y)
 
     default:
         return error_type2(x->type, y->type, "take: unsupported types");
+    }
+}
+
+rf_object_t rf_in(rf_object_t *x, rf_object_t *y)
+{
+    i64_t i, xl, yl;
+    rf_object_t vec;
+    set_t *set;
+
+    switch
+        MTYPE2(x->type, y->type)
+        {
+        case MTYPE2(TYPE_I64, TYPE_I64):
+        case MTYPE2(TYPE_SYMBOL, TYPE_SYMBOL):
+            xl = x->adt->len;
+            yl = y->adt->len;
+            set = set_new(yl, &rfi_i64_hash, &i64_cmp);
+
+            for (i = 0; i < yl; i++)
+                set_insert(set, as_vector_i64(y)[i]);
+
+            vec = vector_bool(xl);
+
+            for (i = 0; i < xl; i++)
+                as_vector_bool(&vec)[i] = set_contains(set, as_vector_i64(x)[i]);
+
+            set_free(set);
+
+            return vec;
+
+        default:
+            return error_type2(x->type, y->type, "in: unsupported types");
+        }
+}
+
+rf_object_t rf_except(rf_object_t *x, rf_object_t *y)
+{
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(TYPE_I64, TYPE_I64):
+    case MTYPE2(TYPE_SYMBOL, TYPE_SYMBOL):
+        return rf_find_I64_I64(x, y);
+    default:
+        return error_type2(x->type, y->type, "except: unsupported types");
     }
 }

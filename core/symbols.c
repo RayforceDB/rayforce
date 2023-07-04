@@ -59,7 +59,7 @@ u64_t string_hash(i64_t val)
 
 i32_t i64_cmp(i64_t a, i64_t b)
 {
-    return a ^ b;
+    return a != b;
 }
 
 /*
