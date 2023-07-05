@@ -461,6 +461,9 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t 
         str_fmt_into(dst, len, offset, 0, " %s%*.*s |", s, n, n, PADDING);
     }
 
+    if ((&as_list(rf_object)[0])->adt->len > TABLE_MAX_WIDTH)
+        str_fmt_into(dst, len, offset, 0, " ..");
+
     // Print table header separator
     str_fmt_into(dst, len, offset, 0, "\n+");
     for (i = 0; i < table_width; i++)
