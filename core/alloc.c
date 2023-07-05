@@ -121,23 +121,23 @@ null_t rf_alloc_cleanup()
     i32_t i;
 
     // All the nodes remains are pools, so just munmap them
-    for (i = 0; i <= MAX_POOL_ORDER; i++)
-    {
-        node_t *node = _ALLOC->freelist[i], *next;
-        while (node)
-        {
-            next = node->next;
-            if (node->base != node)
-            {
-                debug("node->base: %p\n", node->base);
-                // print_blocks();
-                node = next;
-                continue;
-            }
-            mmap_free(node->base, node->size);
-            node = next;
-        }
-    }
+    // for (i = 0; i <= MAX_POOL_ORDER; i++)
+    // {
+    //     node_t *node = _ALLOC->freelist[i], *next;
+    //     while (node)
+    //     {
+    //         next = node->next;
+    //         if (node->base != node)
+    //         {
+    //             debug("node->base: %p\n", node->base);
+    //             // print_blocks();
+    //             node = next;
+    //             continue;
+    //         }
+    //         mmap_free(node->base, node->size);
+    //         node = next;
+    //     }
+    // }
 
     mmap_free(_ALLOC->blocks32, NUM_32_BLOCKS * 32);
     mmap_free(_ALLOC->blocks64, NUM_64_BLOCKS * 64);

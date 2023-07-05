@@ -179,8 +179,8 @@ rf_object_t timestamp(i64_t val)
 
 rf_object_t table(rf_object_t keys, rf_object_t vals)
 {
-    u64_t i, len;
-    rf_object_t table, v;
+    u64_t i, j, len, cl = 1;
+    rf_object_t table, v, lst;
 
     if (keys.type != TYPE_SYMBOL || vals.type != TYPE_LIST)
         return error(ERR_TYPE, "Keys must be a symbol vector and rf_objects must be list");
@@ -190,22 +190,44 @@ rf_object_t table(rf_object_t keys, rf_object_t vals)
 
     len = vals.adt->len;
 
+    lst = list(len);
+
     for (i = 0; i < len; i++)
     {
-        if (as_list(&vals)[i].type < 0)
+        if (as_list(&vals)[i].type > 0)
+            cl = as_list(&vals)[i].adt->len;
+    }
+
+    for (i = 0; i < len; i++)
+    {
+        switch (as_list(&vals)[i].type)
         {
-            v = vector(-as_list(&vals)[i].type, 1);
-            as_vector_i64(&v)[0] = as_list(&vals)[i].i64;
-            as_list(&vals)[i] = v;
+        case -TYPE_I64:
+            v = vector_i64(cl);
+            for (j = 0; j < cl; j++)
+                as_vector_i64(&v)[j] = as_list(&vals)[i].i64;
+            as_list(&lst)[i] = v;
+            break;
+        case -TYPE_F64:
+            v = vector_f64(cl);
+            for (j = 0; j < cl; j++)
+                as_vector_f64(&v)[j] = as_list(&vals)[i].f64;
+            as_list(&lst)[i] = v;
+            break;
+
+        default:
+            as_list(&lst)[i] = rf_object_clone(&as_list(&vals)[i]);
         }
     }
 
     table = list(2);
 
     as_list(&table)[0] = keys;
-    as_list(&table)[1] = vals;
+    as_list(&table)[1] = lst;
 
     table.type = TYPE_TABLE;
+
+    rf_object_free(&vals);
 
     return table;
 }
