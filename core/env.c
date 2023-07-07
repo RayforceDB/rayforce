@@ -201,6 +201,7 @@ null_t free_env(env_t *env)
 {
     rf_object_free(&env->variables);
     rf_object_free(&env->functions);
+    rf_object_free(&env->typenames);
 }
 
 i64_t env_get_typename_by_type(env_t *env, type_t type)
