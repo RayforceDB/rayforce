@@ -104,6 +104,10 @@ rf_object_t cc_compile_lambda(bool_t top, str_t name, rf_object_t args, rf_objec
         return CC_ERROR;                                            \
     }
 
+#define cc_unary(x) ((rf_object_t){.type = TYPE_UNARY, .i64 = (i64_t)(x)})
+#define cc_binary(x) ((rf_object_t){.type = TYPE_BINARY, .i64 = (i64_t)(x)})
+#define cc_lambda(x) ((rf_object_t){.type = -TYPE_LAMBDA, .i64 = (i64_t)(x)})
+
 cc_result_t cc_compile_quote(bool_t has_consumer, cc_t *cc, rf_object_t *object)
 {
     rf_object_t *car = &as_list(object)[0];
@@ -160,8 +164,9 @@ cc_result_t cc_compile_set(bool_t has_consumer, cc_t *cc, rf_object_t *object, u
     if (res == CC_ERROR)
         return CC_ERROR;
 
+    push_opcode(cc, car->id, code, OP_PUSH);
+    push_const(cc, cc_binary(rf_set_variable));
     push_opcode(cc, car->id, code, OP_CALL);
-    push_u64(code, rf_set_variable);
 
     if (!has_consumer)
         push_opcode(cc, car->id, code, OP_POP);
