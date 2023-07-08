@@ -446,6 +446,9 @@ op_collect:
 
 null_t vm_free(vm_t *vm)
 {
+    // clear stack (if any)
+    while (vm->sp)
+        stack_pop_free(vm);
     mmap_free(vm->stack, VM_STACK_SIZE);
     mmap_free(vm, sizeof(struct vm_t));
 }
