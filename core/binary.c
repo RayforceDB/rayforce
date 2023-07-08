@@ -46,50 +46,71 @@ rf_object_t rf_dict(rf_object_t *x, rf_object_t *y)
 
 rf_object_t rf_table(rf_object_t *x, rf_object_t *y)
 {
-    // u64_t i, j, len, cl = 1;
-    //     rf_object_t table, v, lst;
+    bool_t s = false;
+    u64_t i, j, len, cl = 0;
+    rf_object_t lst, c;
 
-    //     if (keys.type != TYPE_SYMBOL || vals.type != TYPE_LIST)
-    //         return error(ERR_TYPE, "Keys must be a symbol vector and rf_objects must be list");
+    if (x->type != TYPE_SYMBOL || y->type != TYPE_LIST)
+        return error(ERR_TYPE, "Keys must be a symbol vector and Values must be list");
 
-    //     if (keys.adt->len != vals.adt->len)
-    //         return error(ERR_LENGTH, "Keys and rf_objects must have the same length");
+    if (x->adt->len != y->adt->len)
+        return error(ERR_LENGTH, "Keys and Values must have the same length");
 
-    //     len = vals.adt->len;
+    len = y->adt->len;
 
-    //     printf("--- LEN: %lld\n", len);
-    //     debug_object(&vals);
+    for (i = 0; i < len; i++)
+    {
+        switch (as_list(y)[i].type)
+        {
+        case -TYPE_BOOL:
+        case -TYPE_I64:
+        case -TYPE_F64:
+        case -TYPE_CHAR:
+        case -TYPE_SYMBOL:
+            s = true;
+            break;
+        case TYPE_BOOL:
+        case TYPE_I64:
+        case TYPE_F64:
+        case TYPE_CHAR:
+        case TYPE_SYMBOL:
+        case TYPE_LIST:
+            j = as_list(y)[i].adt->len;
+            if (cl != 0 && j != cl)
+                return error(ERR_LENGTH, "Values must be of the same length");
 
-    //     lst = list(len);
+            cl = j;
+            break;
+        default:
+            return error(ERR_TYPE, "unsupported type in a Values list");
+        }
+    }
 
-    //     for (i = 0; i < len; i++)
-    //     {
-    //         if (as_list(&vals)[i].type > 0)
-    //             cl = as_list(&vals)[i].adt->len;
-    //     }
+    // there are no scalars and all columns are of the same length
+    if (!s)
+        return table(rf_object_clone(x), rf_object_clone(y));
 
-    //     for (i = 0; i < len; i++)
-    //     {
-    //         switch (as_list(&vals)[i].type)
-    //         {
-    //             // case -TYPE_I64:
-    //             //     v = vector_i64(cl);
-    //             //     for (j = 0; j < cl; j++)
-    //             //         as_vector_i64(&v)[j] = as_list(&vals)[i].i64;
-    //             //     as_list(&lst)[i] = v;
-    //             //     break;
-    //             // case -TYPE_F64:
-    //             //     v = vector_f64(cl);
-    //             //     for (j = 0; j < cl; j++)
-    //             //         as_vector_f64(&v)[j] = as_list(&vals)[i].f64;
-    //             //     as_list(&lst)[i] = v;
-    //             //     break;
+    // otherwise we need to expand scalars to vectors
+    lst = list(len);
 
-    //         default:
-    //             as_list(&lst)[i] = rf_object_clone(&as_list(&vals)[i]);
-    //         }
-    //     }
-    return table(rf_object_clone(x), rf_object_clone(y));
+    for (i = 0; i < len; i++)
+    {
+        switch (as_list(y)[i].type)
+        {
+        case -TYPE_BOOL:
+        case -TYPE_I64:
+        case -TYPE_F64:
+        case -TYPE_CHAR:
+        case -TYPE_SYMBOL:
+            c = i64(cl);
+            as_list(&lst)[i] = rf_take(&c, &as_list(y)[i]);
+            break;
+        default:
+            as_list(&lst)[i] = rf_object_clone(&as_list(y)[i]);
+        }
+    }
+
+    return table(rf_object_clone(x), lst);
 }
 
 rf_object_t rf_rand(rf_object_t *x, rf_object_t *y)
@@ -1235,11 +1256,35 @@ rf_object_t rf_take(rf_object_t *x, rf_object_t *y)
 
     switch (MTYPE2(x->type, y->type))
     {
+    case MTYPE2(-TYPE_BOOL, -TYPE_I64):
+        l = x->i64;
+        res = vector_bool(l);
+        for (i = 0; i < l; i++)
+            as_vector_bool(&res)[i] = y->bool;
+
+        return res;
+
     case MTYPE2(-TYPE_I64, -TYPE_I64):
-        l = x->adt->len;
-        res = vector_i64(x->i64);
+        l = x->i64;
+        res = vector_i64(l);
         for (i = 0; i < l; i++)
             as_vector_i64(&res)[i] = y->i64;
+
+        return res;
+
+    case MTYPE2(-TYPE_F64, -TYPE_I64):
+        l = x->i64;
+        res = vector_f64(l);
+        for (i = 0; i < l; i++)
+            as_vector_f64(&res)[i] = y->f64;
+
+        return res;
+
+    case MTYPE2(-TYPE_TIMESTAMP, -TYPE_I64):
+        l = x->i64;
+        res = vector_timestamp(l);
+        for (i = 0; i < l; i++)
+            as_vector_timestamp(&res)[i] = y->i64;
 
         return res;
 

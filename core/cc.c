@@ -575,6 +575,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, rf_object_t *object
 
         push_opcode(cc, car->id, code, OP_CALL1);
         push_u64(code, rf_group);
+        push_opcode(cc, car->id, code, OP_POP);
 
         // detach and drop table from env
         push_opcode(cc, car->id, code, OP_LDETACH);
@@ -583,8 +584,8 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, rf_object_t *object
         push_opcode(cc, car->id, code, OP_CALL2);
         push_u64(code, rf_take);
 
-        push_opcode(cc, car->id, code, OP_CALL2);
-        push_u64(code, rf_take);
+        // push_opcode(cc, car->id, code, OP_CALL2);
+        // push_u64(code, rf_take);
     }
 
     // compile mappings (if specified)
@@ -749,7 +750,15 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
                 return CC_ERROR;
         }
 
-        return cc_compile_call(cc, car, arity);
+        res = cc_compile_call(cc, car, arity);
+
+        if (res == CC_ERROR)
+            return CC_ERROR;
+
+        if (!has_consumer)
+            push_opcode(cc, object->id, code, OP_POP);
+
+        return res;
 
     default:
         if (!has_consumer)

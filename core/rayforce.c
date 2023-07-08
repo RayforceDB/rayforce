@@ -333,8 +333,8 @@ null_t __attribute__((hot)) rf_object_free(rf_object_t *object)
         if (rc == 0)
             vector_free(object);
         return;
-    case TYPE_DICT:
     case TYPE_TABLE:
+    case TYPE_DICT:
         rc_dec(rc, object);
         rf_object_free(&as_list(object)[0]);
         rf_object_free(&as_list(object)[1]);

@@ -143,8 +143,7 @@ rf_object_t rf_sum(rf_object_t *x)
         if (x->type == TYPE_LIST)
         {
             l = x->adt->len;
-            res = list(l);
-            res.adt->len = 0;
+            res = vector_i64(l);
             for (i = 0; i < l; i++)
             {
                 v = rf_sum(&as_list(x)[i]);
@@ -153,7 +152,7 @@ rf_object_t rf_sum(rf_object_t *x)
                     rf_object_free(&res);
                     return v;
                 }
-                as_list(&res)[res.adt->len++] = v;
+                as_vector_i64(&res)[i] = v.i64;
             }
 
             return res;
