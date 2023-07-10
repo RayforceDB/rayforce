@@ -84,10 +84,10 @@ rf_object_t vector_push(rf_object_t *vec, rf_object_t value)
     rf_object_t lst;
 
     if (!is_vector(vec))
-        return error(ERR_TYPE, "vector push: can not push to scalar");
+        panic("vector push: can not push to scalar");
 
     if (is_null(vec))
-        return error(ERR_TYPE, "vector push: can not push to a null");
+        panic("vector push: can not push to a null");
 
     l = vec->adt->len;
 
@@ -138,7 +138,7 @@ rf_object_t vector_push(rf_object_t *vec, rf_object_t value)
         push(vec, rf_object_t, value);
         return null();
     default:
-        return error(ERR_TYPE, "vector push: unknown type");
+        panic("vector push: can not push to a unknown type");
     }
 }
 
