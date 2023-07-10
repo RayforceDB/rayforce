@@ -82,7 +82,7 @@ rf_object_t rf_call_unary_atomic(unary_t f, rf_object_t *x)
 rf_object_t rf_get_variable(rf_object_t *x)
 {
     rf_object_t v = dict_get(&runtime_get()->env.variables, x);
-    if (v.type == TYPE_NULL)
+    if (is_null(&v))
         return error(ERR_NOT_FOUND, "not found");
 
     return v;
@@ -96,7 +96,7 @@ rf_object_t rf_type(rf_object_t *x)
 
 rf_object_t rf_count(rf_object_t *x)
 {
-    if (x->type < TYPE_NULL)
+    if (!is_vector(x))
         return i64(1);
 
     switch (x->type)
@@ -538,5 +538,16 @@ rf_object_t rf_where(rf_object_t *x)
 
     default:
         return error_type1(x->type, "where: unsupported type");
+    }
+}
+
+rf_object_t rf_value(rf_object_t *x)
+{
+    switch (MTYPE(x->type))
+    {
+    case MTYPE(TYPE_DICT):
+        return rf_object_clone(&as_list(x)[1]);
+    default:
+        return rf_object_clone(x);
     }
 }

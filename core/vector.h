@@ -81,18 +81,19 @@
 #define pop(v, t) ((t *)(as_string(v)))[--(v)->adt->len]
 
 i64_t size_of_val(type_t type);
-rf_object_t vector_flatten(rf_object_t *object);
-i64_t vector_find(rf_object_t *vector, rf_object_t *key);
-i64_t vector_find_rev(rf_object_t *vector, rf_object_t *key);
-rf_object_t vector_get(rf_object_t *vector, i64_t index);
-rf_object_t vector_filter(rf_object_t *vector, bool_t mask[], i64_t len);
-rf_object_t vector_set(rf_object_t *vector, i64_t index, rf_object_t value);
-i64_t vector_push(rf_object_t *vector, rf_object_t object);
-null_t vector_reserve(rf_object_t *vector, u32_t len);
-null_t vector_grow(rf_object_t *vector, u32_t len);
-null_t vector_shrink(rf_object_t *vector, u32_t len);
-null_t vector_free(rf_object_t *vector);
-null_t vector_clear(rf_object_t *vector);
+i64_t vector_find(rf_object_t *vec, rf_object_t *key);
 
+rf_object_t vector_flatten(rf_object_t *object);
+rf_object_t vector_get(rf_object_t *vec, i64_t index);
+rf_object_t vector_filter(rf_object_t *vec, bool_t mask[], i64_t len);
+rf_object_t vector_set(rf_object_t *vec, i64_t index, rf_object_t value);
+rf_object_t vector_push(rf_object_t *vec, rf_object_t object);
 rf_object_t rf_list(rf_object_t *x, u32_t n);
+
+null_t vector_reserve(rf_object_t *vec, u32_t len);
+null_t vector_grow(rf_object_t *vec, u32_t len);
+null_t vector_shrink(rf_object_t *vec, u32_t len);
+null_t vector_free(rf_object_t *vec);
+null_t vector_clear(rf_object_t *vec);
+
 #endif

@@ -443,12 +443,6 @@ cc_result_t cc_compile_map(bool_t has_consumer, cc_t *cc, rf_object_t *object, u
     for (i = 0; i < arity; i++)
         push_opcode(cc, car->id, code, OP_POP);
 
-    // additional one for ctx
-    func->stack_size += 2;
-
-    push_opcode(cc, car->id, code, OP_CALL1);
-    push_u64(code, vector_flatten);
-
     if (!has_consumer)
         push_opcode(cc, car->id, code, OP_POP);
 
@@ -466,6 +460,8 @@ null_t find_used_symbols(rf_object_t *lst, rf_object_t *syms)
             vector_push(syms, *lst);
         return;
     case TYPE_LIST:
+        if (is_null(lst))
+            return;
         l = lst->adt->len;
         if (l == 0)
             return;
@@ -523,7 +519,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, rf_object_t *object
     // compile filters
     key = symboli64(KW_WHERE);
     val = dict_get(params, &key);
-    if (val.type != TYPE_NULL)
+    if (!is_null(&val))
     {
         // remap table of columns (if specified)
         if (cols.adt->len > 0)
@@ -559,7 +555,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, rf_object_t *object
     // group by
     key = symboli64(KW_BY);
     val = dict_get(params, &key);
-    if (val.type != TYPE_NULL)
+    if (!is_null(&val))
     {
 
         push_opcode(cc, car->id, code, OP_LATTACH);
@@ -684,9 +680,11 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
     rf_object_t *code = &func->code;
     cc_result_t res = CC_NONE;
 
+    if (is_null(object))
+        goto other;
+
     switch (object->type)
     {
-
     case -TYPE_SYMBOL:
         if (!has_consumer)
             return CC_NONE;
@@ -732,6 +730,9 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
         return CC_OK;
 
     case TYPE_LIST:
+        if (object->adt->len == 0)
+            goto other;
+
         car = &as_list(object)[0];
         arity = object->adt->len - 1;
 
@@ -761,6 +762,7 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object)
         return res;
 
     default:
+    other:
         if (!has_consumer)
             return CC_NONE;
 
@@ -785,7 +787,7 @@ rf_object_t cc_compile_lambda(bool_t top, str_t name, rf_object_t args,
     };
 
     cc_result_t res;
-    i32_t i;
+    i32_t i = 0;
     lambda_t *func = as_lambda(&cc.lambda);
     rf_object_t *code = &func->code, *b;
 
@@ -795,12 +797,13 @@ rf_object_t cc_compile_lambda(bool_t top, str_t name, rf_object_t args,
         push_const(&cc, null());
         goto epilogue;
     }
+
     // Compile all arguments but the last one
     for (i = 0; i < len - 1; i++)
     {
         b = body + i;
         // skip const expressions
-        if (b->type != TYPE_LIST)
+        if (b->type != TYPE_LIST || is_null(b))
             continue;
 
         res = cc_compile_expr(false, &cc, b);

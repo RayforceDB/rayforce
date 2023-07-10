@@ -49,25 +49,6 @@ u64_t next_power_of_two_u64(u64_t n)
     return 1UL << (64 - __builtin_clzl(n));
 }
 
-i64_t size_of_element(type_t type)
-{
-    switch (type)
-    {
-    case TYPE_BOOL:
-        return 1;
-    case TYPE_I64:
-        return 8;
-    case TYPE_F64:
-        return 8;
-    case TYPE_CHAR:
-        return 1;
-    case TYPE_LIST:
-        return sizeof(struct rf_object_t);
-    default:
-        panic(str_fmt(0, "Unknown type: %d", type));
-    }
-}
-
 rf_object_t error_type1(type_t type, str_t msg)
 {
     str_t fmsg = str_fmt(0, "%s: '%s'", msg, env_get_typename(type));

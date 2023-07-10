@@ -88,6 +88,7 @@ null_t init_functions(rf_object_t *functions)
     regf(functions,  "guid",       TYPE_UNARY,    rf_guid_generate);
     regf(functions,  "neg",        TYPE_UNARY,    rf_neg);
     regf(functions,  "where",      TYPE_UNARY,    rf_where);
+    regf(functions,  "value",      TYPE_UNARY,    rf_value);
       
     // Binary         
     regf(functions, "==",          TYPE_BINARY,   rf_eq);
@@ -149,7 +150,6 @@ null_t init_typenames(rf_object_t *typenames)
     regt(typenames, TYPE_BINARY,      "Binary");
     regt(typenames, TYPE_VARY,        "Vary");
     regt(typenames, TYPE_LAMBDA,      "Lambda");
-    regt(typenames, TYPE_NULL,        "Null");
     regt(typenames, TYPE_ERROR,       "Error");
 }
 

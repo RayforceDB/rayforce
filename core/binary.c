@@ -84,6 +84,8 @@ rf_object_t rf_table(rf_object_t *x, rf_object_t *y)
         case TYPE_CHAR:
         case TYPE_SYMBOL:
         case TYPE_LIST:
+            if (is_null(y))
+                return error(ERR_TYPE, "null in a Values list");
             j = as_list(y)[i].adt->len;
             if (cl != 0 && j != cl)
                 return error(ERR_LENGTH, "Values must be of the same length");

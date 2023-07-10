@@ -78,72 +78,97 @@ rf_object_t vector(type_t type, i64_t len)
     return v;
 }
 
-i64_t vector_push(rf_object_t *vector, rf_object_t value)
+rf_object_t vector_push(rf_object_t *vec, rf_object_t value)
 {
-    if (value.type != -vector->type && vector->type != TYPE_LIST)
-        panic_type2("vector push type mismatch", vector->type, value.type);
+    i64_t i, l;
+    rf_object_t lst;
 
-    switch (vector->type)
+    if (!is_vector(vec))
+        return error(ERR_TYPE, "vector push: can not push to scalar");
+
+    l = vec->adt->len;
+
+    // if (l == 0)
+    // {
+    //     vec.type = -value.type;
+    // }
+
+    // change vector type to a list
+    // if (vec->type != -value.type && vec->type != TYPE_LIST)
+    // {
+    //     lst = list(l + 1);
+    //     for (i = 0; i < l; i++)
+    //         as_list(&lst)[i] = vector_get(&vec[i], i);
+
+    //     as_list(&lst)[l] = value;
+
+    //     rf_object_free(vec);
+
+    //     *vec = lst;
+    //     return null();
+    // }
+
+    switch (vec->type)
     {
     case TYPE_BOOL:
-        push(vector, bool_t, value.bool);
-        break;
+        push(vec, bool_t, value.bool);
+        return null();
     case TYPE_I64:
-        push(vector, i64_t, value.i64);
-        break;
+        push(vec, i64_t, value.i64);
+        return null();
     case TYPE_F64:
-        push(vector, f64_t, value.f64);
-        break;
+        push(vec, f64_t, value.f64);
+        return null();
     case TYPE_SYMBOL:
-        push(vector, i64_t, value.i64);
-        break;
+        push(vec, i64_t, value.i64);
+        return null();
     case TYPE_TIMESTAMP:
-        push(vector, i64_t, value.i64);
-        break;
+        push(vec, i64_t, value.i64);
+        return null();
     case TYPE_GUID:
-        push(vector, guid_t, *value.guid);
-        break;
+        push(vec, guid_t, *value.guid);
+        return null();
     case TYPE_CHAR:
-        push(vector, char_t, value.schar);
-        break;
+        push(vec, char_t, value.schar);
+        return null();
     case TYPE_LIST:
-        push(vector, rf_object_t, value);
-        break;
+        push(vec, rf_object_t, value);
+        return null();
     default:
-        panic_type("vector push: unknown type", vector->type);
+        return error(ERR_TYPE, "vector push: unknown type");
     }
-
-    return vector->adt->len;
 }
 
-rf_object_t vector_pop(rf_object_t *vector)
+rf_object_t vector_pop(rf_object_t *vec)
 {
     guid_t *g;
 
-    if (vector->adt->len == 0)
+    if (!is_vector(vec) || vec->adt->len == 0)
         return null();
 
-    switch (vector->type)
+    switch (vec->type)
     {
     case TYPE_BOOL:
-        return bool(pop(vector, bool_t));
+        return bool(pop(vec, bool_t));
     case TYPE_I64:
-        return i64(pop(vector, i64_t));
+        return i64(pop(vec, i64_t));
     case TYPE_F64:
-        return f64(pop(vector, f64_t));
+        return f64(pop(vec, f64_t));
     case TYPE_SYMBOL:
-        return symboli64(pop(vector, i64_t));
+        return symboli64(pop(vec, i64_t));
     case TYPE_TIMESTAMP:
-        return i64(pop(vector, i64_t));
+        return i64(pop(vec, i64_t));
     case TYPE_GUID:
-        g = as_vector_guid(vector);
-        return guid(g[--vector->adt->len].data);
+        g = as_vector_guid(vec);
+        return guid(g[--vec->adt->len].data);
     case TYPE_CHAR:
-        return schar(pop(vector, char_t));
+        return schar(pop(vec, char_t));
     case TYPE_LIST:
-        return pop(vector, rf_object_t);
+        if (vec->adt == NULL)
+            return null();
+        return pop(vec, rf_object_t);
     default:
-        panic_type("vector pop: unknown type", vector->type);
+        panic_type("vector pop: unknown type", vec->type);
     }
 }
 
@@ -273,6 +298,9 @@ i64_t vector_find(rf_object_t *vector, rf_object_t *key)
                 return i;
         return l;
     case TYPE_LIST:
+        if (is_null(vector))
+            return 0;
+
         l = vector->adt->len;
         vl = as_list(vector);
         kl = key;
@@ -285,51 +313,50 @@ i64_t vector_find(rf_object_t *vector, rf_object_t *key)
     }
 }
 
-rf_object_t vector_get(rf_object_t *vector, i64_t index)
+rf_object_t vector_get(rf_object_t *vec, i64_t index)
 {
     i64_t l;
 
-    switch (vector->type)
+    if (!is_vector(vec))
+        return error(ERR_TYPE, "vector get: can not get from scalar");
+
+    l = vec->adt->len;
+
+    switch (vec->type)
     {
     case TYPE_BOOL:
-        l = vector->adt->len;
         if (index < l)
-            return bool(as_vector_bool(vector)[index]);
+            return bool(as_vector_bool(vec)[index]);
         return bool(false);
     case TYPE_I64:
-        l = vector->adt->len;
         if (index < l)
-            return i64(as_vector_i64(vector)[index]);
+            return i64(as_vector_i64(vec)[index]);
         return i64(NULL_I64);
     case TYPE_F64:
-        l = vector->adt->len;
         if (index < l)
-            return f64(as_vector_f64(vector)[index]);
+            return f64(as_vector_f64(vec)[index]);
         return f64(NULL_F64);
     case TYPE_SYMBOL:
-        l = vector->adt->len;
         if (index < l)
-            return symboli64(as_vector_i64(vector)[index]);
+            return symboli64(as_vector_i64(vec)[index]);
         return symboli64(NULL_I64);
     case TYPE_TIMESTAMP:
-        l = vector->adt->len;
         if (index < l)
-            return timestamp(as_vector_i64(vector)[index]);
+            return timestamp(as_vector_i64(vec)[index]);
         return timestamp(NULL_I64);
     case TYPE_GUID:
-        l = vector->adt->len;
         if (index < l)
-            return guid(as_vector_guid(vector)[index].data);
+            return guid(as_vector_guid(vec)[index].data);
         return guid(NULL);
     case TYPE_CHAR:
-        l = vector->adt->len;
         if (index < l)
-            return schar(as_string(vector)[index]);
+            return schar(as_string(vec)[index]);
         return schar(0);
     case TYPE_LIST:
-        l = vector->adt->len;
+        if (vec->adt == NULL)
+            return *vec;
         if (index < l)
-            return rf_object_clone(&as_list(vector)[index]);
+            return rf_object_clone(&as_list(vec)[index]);
         return null();
     default:
         return null();
@@ -361,60 +388,42 @@ rf_object_t vector_set(rf_object_t *vec, i64_t index, rf_object_t value)
         return null();
     }
 
+    l = vec->adt->len;
+    if (index >= l)
+        return error(ERR_LENGTH, "vector set: index out of bounds");
+
     switch (vec->type)
     {
     case TYPE_BOOL:
-        l = vec->adt->len;
-        if (index >= l)
-            return error(ERR_LENGTH, "vector set: index out of bounds");
         as_vector_bool(vec)[index] = value.bool;
-        return null();
+        break;
     case TYPE_I64:
-        l = vec->adt->len;
-        if (index >= l)
-            return error(ERR_LENGTH, "vector set: index out of bounds");
         as_vector_i64(vec)[index] = value.i64;
-        return null();
+        break;
     case TYPE_F64:
-        l = vec->adt->len;
-        if (index >= l)
-            return error(ERR_LENGTH, "vector set: index out of bounds");
         as_vector_f64(vec)[index] = value.f64;
-        return null();
+        break;
     case TYPE_SYMBOL:
-        l = vec->adt->len;
-        if (index >= l)
-            return error(ERR_LENGTH, "vector set: index out of bounds");
         as_vector_i64(vec)[index] = value.i64;
-        return null();
+        break;
     case TYPE_TIMESTAMP:
-        l = vec->adt->len;
-        if (index >= l)
-            return error(ERR_LENGTH, "vector set: index out of bounds");
         as_vector_i64(vec)[index] = value.i64;
-        return null();
+        break;
     case TYPE_GUID:
-        l = vec->adt->len;
-        if (index >= l)
-            return error(ERR_LENGTH, "vector set: index out of bounds");
         g = as_vector_guid(vec);
         memcpy(g + index, value.guid, sizeof(guid_t));
-        return null();
+        break;
     case TYPE_CHAR:
-        l = vec->adt->len;
-        if (index >= l)
-            return error(ERR_LENGTH, "vector set: index out of bounds");
         as_string(vec)[index] = value.schar;
-        return null();
+        break;
     case TYPE_LIST:
-        l = vec->adt->len;
-        if (index >= l)
-            return error(ERR_LENGTH, "vector set: index out of bounds");
         as_list(vec)[index] = rf_object_clone(&value);
-        return null();
+        break;
     default:
         panic_type("vector_set: unknown type", vec->type);
     }
+
+    return null();
 }
 
 /*
@@ -482,6 +491,9 @@ rf_object_t vector_filter(rf_object_t *x, bool_t mask[], i64_t len)
 {
     i64_t i, j = 0, l, ol;
     rf_object_t vec;
+
+    if (!is_vector(x))
+        return error(ERR_TYPE, "vector filter: can not filter scalar");
 
     switch (x->type)
     {
@@ -556,6 +568,8 @@ rf_object_t vector_filter(rf_object_t *x, bool_t mask[], i64_t len)
             vector_shrink(&vec, j);
         return vec;
     case TYPE_LIST:
+        if (is_null(x))
+            return null();
         l = x->adt->len;
         ol = (len == NULL_I64) ? (i64_t)x->adt->len : len;
         vec = list(ol);
@@ -570,23 +584,23 @@ rf_object_t vector_filter(rf_object_t *x, bool_t mask[], i64_t len)
     }
 }
 
-null_t vector_clear(rf_object_t *vector)
+null_t vector_clear(rf_object_t *vec)
 {
-    if (vector->type == TYPE_LIST)
+    if (vec->type == TYPE_LIST)
     {
-        i64_t i, l = vector->adt->len;
-        rf_object_t *list = as_list(vector);
+        i64_t i, l = vec->adt->len;
+        rf_object_t *list = as_list(vec);
 
         for (i = 0; i < l; i++)
             rf_object_free(&list[i]);
     }
 
-    vector_shrink(vector, 0);
+    vector_shrink(vec, 0);
 }
 
-null_t vector_free(rf_object_t *vector)
+null_t vector_free(rf_object_t *vec)
 {
-    rf_free(vector->adt);
+    rf_free(vec->adt);
 }
 
 rf_object_t rf_list(rf_object_t *x, u32_t n)

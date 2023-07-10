@@ -47,5 +47,6 @@ rf_object_t rf_desc(rf_object_t *x);
 rf_object_t rf_guid_generate(rf_object_t *x);
 rf_object_t rf_neg(rf_object_t *x);
 rf_object_t rf_where(rf_object_t *x);
+rf_object_t rf_value(rf_object_t *x);
 
 #endif

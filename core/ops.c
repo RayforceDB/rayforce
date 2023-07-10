@@ -148,8 +148,9 @@ bool_t rfi_as_bool(rf_object_t *x)
     case TYPE_F64:
     case TYPE_CHAR:
     case TYPE_LIST:
+        if (x->adt == NULL)
+            return false;
         return x->adt->len != 0;
-
     default:
         return false;
     }

@@ -172,6 +172,7 @@ op_halt:
 op_push:
     vm->ip++;
     load_u64(l, vm);
+    debug_object(&as_lambda(fun)->constants);
     x1 = vector_get(&f->constants, l);
     stack_push(vm, x1);
     dispatch();
@@ -349,10 +350,10 @@ op_lget:
     for (i = 0; i < j; i++)
     {
         x2 = dict_get(&as_list(&f->locals)[j - i - 1], &x1);
-        if (x2.type != TYPE_NULL)
+        if (!is_null(&x2))
             break;
     }
-    if (x2.type == TYPE_NULL)
+    if (is_null(&x2))
         x2 = rf_get_variable(&x1);
     unwrap(x2, b);
     stack_push(vm, x2);

@@ -283,7 +283,7 @@ i32_t vector_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t
 i32_t list_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, rf_object_t *rf_object)
 {
     if (rf_object->adt == NULL)
-        return str_fmt_into(dst, len, offset, limit, "%*.*s()", indent, indent, PADDING);
+        return str_fmt_into(dst, len, offset, limit, "%*.*snull", indent, indent, PADDING);
 
     i32_t i, n = str_fmt_into(dst, len, offset, limit, "%*.*s(\n", indent, indent, PADDING),
              list_height = rf_object->adt->len;
@@ -530,8 +530,6 @@ i32_t rf_object_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i3
 {
     switch (object->type)
     {
-    case TYPE_NULL:
-        return str_fmt_into(dst, len, offset, limit, "null");
     case -TYPE_BOOL:
         return bool_fmt_into(dst, len, offset, indent, limit, object->bool);
     case -TYPE_I64:

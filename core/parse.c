@@ -702,10 +702,7 @@ rf_object_t parse_dict(parser_t *parser)
         token = advance(parser);
     }
 
-    d = dict(vector_flatten(&keys), vector_flatten(&vals));
-
-    rf_object_free(&keys);
-    rf_object_free(&vals);
+    d = dict(keys, vals);
 
     span_extend(parser, &span);
     d.id = span_commit(parser, span);
@@ -774,7 +771,7 @@ rf_object_t advance(parser_t *parser)
     if (is_digit(*parser->current))
     {
         tok = parse_timestamp(parser);
-        if (tok.type != TYPE_NULL)
+        if (!is_null(&tok))
             return tok;
     }
 
@@ -807,7 +804,6 @@ rf_object_t advance(parser_t *parser)
 
 rf_object_t parse_program(parser_t *parser)
 {
-    // debuginfo_init(runtime_get()->debuginfo);
     rf_object_t token, list = list(0), err;
     str_t msg;
 

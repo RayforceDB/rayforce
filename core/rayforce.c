@@ -88,6 +88,16 @@ rf_object_t error(i8_t code, str_t message)
     return err;
 }
 
+rf_object_t null()
+{
+    rf_object_t obj = {
+        .type = TYPE_LIST,
+        .adt = NULL,
+    };
+
+    return obj;
+}
+
 rf_object_t bool(bool_t val)
 {
     rf_object_t scalar = {
@@ -242,48 +252,44 @@ rf_object_t __attribute__((hot)) rf_object_clone(rf_object_t *object)
 {
     i64_t i, l;
 
-    switch (object->type)
+    if (object->type == -TYPE_GUID)
     {
-    case -TYPE_BOOL:
-    case -TYPE_I64:
-    case -TYPE_F64:
-    case -TYPE_SYMBOL:
-    case -TYPE_TIMESTAMP:
-    case -TYPE_CHAR:
-    case TYPE_NULL:
-    case TYPE_UNARY:
-    case TYPE_BINARY:
-    case TYPE_VARY:
-        return *object;
-    case -TYPE_GUID:
         if (object->guid == NULL)
             return guid(NULL);
+
         return guid(object->guid->data);
+    }
+
+    if (!is_rc(object))
+        return *object;
+
+    if (is_null(object))
+        return *object;
+
+    rc_inc(object);
+
+    switch (object->type)
+    {
     case TYPE_BOOL:
     case TYPE_I64:
     case TYPE_F64:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
     case TYPE_CHAR:
-        rc_inc(object);
         return *object;
     case TYPE_LIST:
-        rc_inc(object);
         l = object->adt->len;
         for (i = 0; i < l; i++)
             rf_object_clone(&as_list(object)[i]);
         return *object;
     case TYPE_DICT:
     case TYPE_TABLE:
-        rc_inc(object);
         rf_object_clone(&as_list(object)[0]);
         rf_object_clone(&as_list(object)[1]);
         return *object;
     case TYPE_LAMBDA:
-        rc_inc(object);
         return *object;
     case TYPE_ERROR:
-        rc_inc(object);
         return *object;
     default:
         panic(str_fmt(0, "clone: invalid type: %d", object->type));
@@ -297,36 +303,32 @@ null_t __attribute__((hot)) rf_object_free(rf_object_t *object)
 {
     i64_t i, rc = 0, l;
 
-    switch (object->type)
+    if (object->type == -TYPE_GUID)
     {
-    case -TYPE_BOOL:
-    case -TYPE_I64:
-    case -TYPE_F64:
-    case -TYPE_SYMBOL:
-    case -TYPE_TIMESTAMP:
-    case -TYPE_CHAR:
-    case TYPE_NULL:
-    case TYPE_UNARY:
-    case TYPE_BINARY:
-    case TYPE_VARY:
-        return;
-    case -TYPE_GUID:
         if (object->guid == NULL)
             return;
         rf_free(object->guid);
+
         return;
+    }
+
+    if (is_null(object))
+        return;
+
+    rc_dec(rc, object);
+
+    switch (object->type)
+    {
     case TYPE_BOOL:
     case TYPE_I64:
     case TYPE_F64:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
     case TYPE_CHAR:
-        rc_dec(rc, object);
         if (rc == 0)
             vector_free(object);
         return;
     case TYPE_LIST:
-        rc_dec(rc, object);
         l = object->adt->len;
         for (i = 0; i < l; i++)
             rf_object_free(&as_list(object)[i]);
@@ -335,14 +337,12 @@ null_t __attribute__((hot)) rf_object_free(rf_object_t *object)
         return;
     case TYPE_TABLE:
     case TYPE_DICT:
-        rc_dec(rc, object);
         rf_object_free(&as_list(object)[0]);
         rf_object_free(&as_list(object)[1]);
         if (rc == 0)
             rf_free(object->adt);
         return;
     case TYPE_LAMBDA:
-        rc_dec(rc, object);
         if (rc == 0)
         {
             rf_object_free(&as_lambda(object)->constants);
@@ -354,7 +354,6 @@ null_t __attribute__((hot)) rf_object_free(rf_object_t *object)
         }
         return;
     case TYPE_ERROR:
-        rc_dec(rc, object);
         if (rc == 0)
             rf_free(object->adt);
         return;
@@ -372,26 +371,22 @@ rf_object_t rf_object_cow(rf_object_t *object)
     rf_object_t new;
     type_t type;
 
+    if (object->type == -TYPE_GUID)
+    {
+        if (object->guid == NULL)
+            return guid(NULL);
+
+        return guid(object->guid->data);
+    }
+
+    if (!is_rc(object))
+        return *object;
+
     if (rf_object_rc(object) == 1)
         return rf_object_clone(object);
 
     switch (object->type)
     {
-    case -TYPE_BOOL:
-    case -TYPE_I64:
-    case -TYPE_F64:
-    case -TYPE_SYMBOL:
-    case -TYPE_TIMESTAMP:
-    case -TYPE_CHAR:
-    case TYPE_NULL:
-    case TYPE_UNARY:
-    case TYPE_BINARY:
-    case TYPE_VARY:
-        return *object;
-    case -TYPE_GUID:
-        if (object->guid == NULL)
-            return guid(NULL);
-        return guid(object->guid->data);
     case TYPE_BOOL:
         new = vector_bool(object->adt->len);
         new.adt->attrs = object->adt->attrs;
@@ -423,6 +418,8 @@ rf_object_t rf_object_cow(rf_object_t *object)
         memcpy(as_string(&new), as_string(object), object->adt->len);
         return new;
     case TYPE_LIST:
+        if (object->adt == NULL)
+            return *object;
         l = object->adt->len;
         new = list(l);
         new.adt->attrs = object->adt->attrs;
