@@ -259,40 +259,6 @@ rf_object_t rf_add(rf_object_t *x, rf_object_t *y)
         return vec;
 
     default:
-        if (x->type == TYPE_LIST)
-        {
-            l = x->adt->len;
-            vec = list(l);
-            vec.adt->len = 0;
-            for (i = 0; i < l; i++)
-            {
-                v = rf_add(&as_list(x)[i], y);
-                if (v.type == TYPE_ERROR)
-                {
-                    rf_object_free(&vec);
-                    return v;
-                }
-                as_list(&vec)[vec.adt->len++] = v;
-            }
-            return vec;
-        }
-        if (y->type == TYPE_LIST)
-        {
-            l = y->adt->len;
-            vec = list(l);
-            vec.adt->len = 0;
-            for (i = 0; i < l; i++)
-            {
-                v = rf_add(x, &as_list(y)[i]);
-                if (v.type == TYPE_ERROR)
-                {
-                    rf_object_free(&vec);
-                    return v;
-                }
-                as_list(&vec)[vec.adt->len++] = v;
-            }
-            return vec;
-        }
         return error_type2(x->type, y->type, "add: unsupported types");
     }
 }
