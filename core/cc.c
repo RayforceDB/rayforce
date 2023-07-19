@@ -354,6 +354,7 @@ type_t cc_compile_catch(cc_t *cc, rf_object_t *object, u32_t arity)
 
 cc_result_t cc_compile_call(cc_t *cc, rf_object_t *car, u8_t arity)
 {
+    cc_result_t res;
     rf_object_t *code = &as_lambda(&cc->lambda)->code, rec;
 
     rec = dict_get(&runtime_get()->env.functions, car);
@@ -386,7 +387,11 @@ cc_result_t cc_compile_call(cc_t *cc, rf_object_t *car, u8_t arity)
 
         return CC_OK;
     default:
-        cc_compile_expr(true, cc, car);
+        res = cc_compile_expr(true, cc, car);
+
+        if (res == CC_ERROR)
+            return CC_ERROR;
+
         push_opcode(cc, car->id, code, OP_CALLD);
         push_opcode(cc, car->id, code, arity);
 
@@ -478,24 +483,6 @@ null_t find_used_symbols(rf_object_t *lst, rf_object_t *syms)
     default:
         return;
     }
-}
-
-cc_result_t cc_compile_where(cc_t *cc, rf_object_t *object)
-{
-    cc_result_t res;
-    lambda_t *func = as_lambda(&cc->lambda);
-    rf_object_t *code = &func->code;
-
-    res = cc_compile_expr(true, cc, object);
-
-    if (res == CC_ERROR)
-        return CC_ERROR;
-
-    push_opcode(cc, object->id, code, OP_CALL1);
-    push_opcode(cc, object->id, code, 0);
-    push_u64(code, rf_where);
-
-    return CC_OK;
 }
 
 cc_result_t cc_compile_by(bool_t has_consumer, cc_t *cc, rf_object_t *object, u32_t arity)
@@ -591,6 +578,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, rf_object_t *object
     // determine which of columns are used in select and which names will be used for result columns
     cols = vector_symbol(0);
     syms = vector_symbol(0);
+
     // first check by because it is special case in mapping
     key = symboli64(KW_BY);
     val = dict_get(params, &key);
@@ -636,7 +624,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, rf_object_t *object
     {
         push_opcode(cc, car->id, code, OP_LPUSH);
 
-        res = cc_compile_where(cc, &val);
+        res = cc_compile_expr(true, cc, &val);
         rf_object_free(&val);
 
         if (res == CC_ERROR)
@@ -644,6 +632,10 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, rf_object_t *object
             rf_object_free(&cols);
             return CC_ERROR;
         }
+
+        push_opcode(cc, object->id, code, OP_CALL1);
+        push_opcode(cc, object->id, code, 0);
+        push_u64(code, rf_where);
 
         push_opcode(cc, car->id, code, OP_LPOP);
 
