@@ -1832,14 +1832,13 @@ rf_object_t rf_cast(rf_object_t *x, rf_object_t *y)
 
 rf_object_t rf_group_Table(rf_object_t *x, rf_object_t *y)
 {
-    i64_t i, j, m, l;
-    rf_object_t res, val;
+    i64_t i, l;
+    rf_object_t res;
 
     switch (MTYPE2(x->type, y->type))
     {
     case MTYPE2(TYPE_TABLE, TYPE_LIST):
         l = as_list(x)[1].adt->len;
-        m = y->adt->len;
         res = list(l);
         for (i = 0; i < l; i++)
             as_list(&res)[i] = rf_call_binary_right_atomic(rf_take, &as_list(&as_list(x)[1])[i], y);

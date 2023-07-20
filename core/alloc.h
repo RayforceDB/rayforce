@@ -39,7 +39,7 @@
 
 typedef struct node_t
 {
-    null_t            *base; // base address of the root block (pool)
+    null_t            *base; // base address of the root block (pool) + original order in 7's byte
     union
     {
         struct node_t *next; // next block in the pool

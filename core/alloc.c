@@ -33,6 +33,10 @@ static alloc_t _ALLOC = NULL;
 
 // clang-format off
 #define AVAIL_MASK       ((u64_t)0xFFFFFFFFFFFFFFFF)
+#define BLOCK_ORDER_MASK (1ull << 56)        // 1 byte
+#define BLOCK_ADDR_MASK  (~BLOCK_ORDER_MASK) // 7 bytes
+#define blockorder(p)    ((u64_t)(p) >> 56)
+#define blockaddr(p)     ((null_t *)((u64_t)(p) & BLOCK_ADDR_MASK))
 #define blocksize(i)     (1ull << (i))
 #define buddyof(p, b, i) ((null_t *)(((u64_t)(p - b) ^ blocksize(i)) + b))
 #define orderof(s)       (64ull - __builtin_clzl(s - 1))
@@ -60,14 +64,15 @@ null_t print_blocks()
 null_t *rf_alloc_add_pool(u64_t size)
 {
     null_t *pool = mmap_malloc(size);
-    // printf("ADD POOL: %p, %llu O: %d\n", pool, size, orderof(size));
+
     if (pool == NULL)
         return NULL;
+
     node_t *node = (node_t *)pool;
 
     assert((i64_t)node % 16 == 0);
 
-    node->base = pool;
+    node->base = (null_t *)((orderof(size) << 56) | (u64_t)pool);
     node->size = size;
 
     return (null_t *)node;
@@ -118,6 +123,7 @@ alloc_t rf_alloc_get()
 null_t rf_alloc_cleanup()
 {
     print_blocks();
+
     i32_t i;
 
     // All the nodes remains are pools, so just munmap them
@@ -127,7 +133,7 @@ null_t rf_alloc_cleanup()
         while (node)
         {
             next = node->next;
-            if (node->base != node)
+            if (blockaddr(node->base) != node)
             {
                 debug("node->base: %p\n", node->base);
                 return;
@@ -229,8 +235,6 @@ null_t *rf_malloc(u64_t size)
         {
             capacity = 1ull << order;
             block = rf_alloc_add_pool(capacity);
-            // node_t *node = (node_t *)block;
-            // debug("ALLOC NODE: %p %p, %llu ORDER: %d\n", node, node->base, node->size, order);
             return (null_t *)((node_t *)block + 1);
         }
 
@@ -256,7 +260,7 @@ null_t *rf_malloc(u64_t size)
     while ((i--) > order)
     {
         base = ((node_t *)block)->base;
-        node = (node_t *)buddyof(block, base, i);
+        node = (node_t *)buddyof(block, blockaddr(base), i);
         node->next = _ALLOC->freelist[i];
         node->base = base;
         _ALLOC->freelist[i] = node;
@@ -272,7 +276,6 @@ null_t rf_free(null_t *block)
     null_t *buddy;
     node_t *node, **n;
     u32_t order;
-    // debug("FREE NODE: %p, BASE: %p BUDDY: %p\n", node, node->base, buddy);
 
     // block is a 32 bytes block
     if is32block (block)
@@ -295,15 +298,11 @@ null_t rf_free(null_t *block)
     node = (node_t *)block - 1;
     block = (null_t *)node;
     order = orderof(node->size);
-    // debug("FREE NODE: %p %p, %llu ORDER: %d BUDDY: %p\n", node, node->base, node->size, order, buddyof(block, node->base, order));
 
     for (;; order++)
     {
-        // calculate buddy
-        buddy = buddyof(block, node->base, order);
-
-        // node is the root block, wich can't have higher order buddies, so just insert it into list
-        if (__builtin_expect((block < buddy) && node->base == node, 0))
+        // node is the root block, so just insert it into list
+        if (order == blockorder(node->base))
         {
             node->next = _ALLOC->freelist[order];
             _ALLOC->freelist[order] = node;
@@ -311,6 +310,9 @@ null_t rf_free(null_t *block)
 
             return;
         }
+
+        // calculate buddy
+        buddy = buddyof(block, blockaddr(node->base), order);
 
         n = &_ALLOC->freelist[order];
 
@@ -416,7 +418,7 @@ null_t *rf_realloc(null_t *block, u64_t new_size)
         size = blocksize(i);
         base = (node_t *)node->base;
         node->size = size;
-        buddy = (node_t *)buddyof((null_t *)node, base, i);
+        buddy = (node_t *)buddyof((null_t *)node, blockaddr(base), i);
         buddy->next = _ALLOC->freelist[i];
         buddy->base = base;
         _ALLOC->freelist[i] = buddy;
@@ -448,8 +450,10 @@ null_t rf_alloc_mrequest(u64_t size)
 
     // add a new pool of requested size
     node = (node_t *)rf_alloc_add_pool(capacity);
+
     if (node == NULL)
         return;
+
     node->next = NULL;
     _ALLOC->freelist[order] = node;
     _ALLOC->avail |= 1 << order;
