@@ -1970,3 +1970,59 @@ rf_object_t rf_group_Table(rf_object_t *x, rf_object_t *y)
         return error_type2(x->type, y->type, "group: unsupported types");
     }
 }
+
+rf_object_t rf_xasc(rf_object_t *x, rf_object_t *y)
+{
+    rf_object_t idx, col, res;
+
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(TYPE_TABLE, -TYPE_SYMBOL):
+        col = dict_get(x, y);
+
+        if (col.type == TYPE_ERROR)
+            return col;
+
+        idx = rf_iasc(&col);
+        rf_object_free(&col);
+
+        if (idx.type == TYPE_ERROR)
+            return idx;
+
+        res = rf_take(x, &idx);
+
+        rf_object_free(&idx);
+
+        return res;
+    default:
+        return error_type2(x->type, y->type, "xasc: unsupported types");
+    }
+}
+
+rf_object_t rf_xdesc(rf_object_t *x, rf_object_t *y)
+{
+    rf_object_t idx, col, res;
+
+    switch (MTYPE2(x->type, y->type))
+    {
+    case MTYPE2(TYPE_TABLE, -TYPE_SYMBOL):
+        col = dict_get(x, y);
+
+        if (col.type == TYPE_ERROR)
+            return col;
+
+        idx = rf_idesc(&col);
+        rf_object_free(&col);
+
+        if (idx.type == TYPE_ERROR)
+            return idx;
+
+        res = rf_take(x, &idx);
+
+        rf_object_free(&idx);
+
+        return res;
+    default:
+        return error_type2(x->type, y->type, "xdesc: unsupported types");
+    }
+}

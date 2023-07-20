@@ -59,5 +59,7 @@ rf_object_t rf_sect(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_except(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_cast(rf_object_t *x, rf_object_t *y);
 rf_object_t rf_group_Table(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_xasc(rf_object_t *x, rf_object_t *y);
+rf_object_t rf_xdesc(rf_object_t *x, rf_object_t *y);
 
 #endif
