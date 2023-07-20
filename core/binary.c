@@ -68,6 +68,18 @@ rf_object_t call_binary(binary_t f, rf_object_t *x, rf_object_t *y)
     case MTYPE2(TYPE_F64, -TYPE_I64):
         cy = f64(y->i64);
         return f(x, &cy);
+    case MTYPE2(TYPE_I64, TYPE_F64):
+        cx = symbol("F64");
+        cy = rf_cast(&cx, x);
+        res = f(&cy, y);
+        rf_object_free(&cy);
+        return res;
+    case MTYPE2(TYPE_F64, TYPE_I64):
+        cx = symbol("F64");
+        cy = rf_cast(&cx, y);
+        res = f(&cy, x);
+        rf_object_free(&cy);
+        return res;
     default:
         return f(x, y);
     }
@@ -111,7 +123,7 @@ rf_object_t rf_call_binary_left_atomic(binary_t f, rf_object_t *x, rf_object_t *
         return res;
     }
 
-    return call_binary(f, x, y);
+    return f(x, y);
 }
 
 rf_object_t rf_call_binary_right_atomic(binary_t f, rf_object_t *x, rf_object_t *y)
@@ -152,7 +164,7 @@ rf_object_t rf_call_binary_right_atomic(binary_t f, rf_object_t *x, rf_object_t 
         return res;
     }
 
-    return call_binary(f, x, y);
+    return f(x, y);
 }
 
 // Atomic binary functions (iterates through list of arguments down to atoms)
