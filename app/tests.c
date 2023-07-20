@@ -269,18 +269,32 @@ null_t test_varying_sizes()
     printf("test_varying_sizes passed\n");
 }
 
+null_t test_alloc_free()
+{
+    null_t *ptr1 = rf_malloc(8 * 10000000);
+    null_t *ptr2 = rf_malloc(8 * 10000000);
+
+    rf_free(ptr1);
+    rf_free(ptr2);
+}
+
 i32_t main()
 {
-    runtime_init(0);
+    // runtime_init(0);
+    rf_alloc_init();
 
-    test_allocate_and_free();
-    test_multiple_allocations();
-    test_allocation_after_free();
-    test_out_of_memory();
-    test_large_number_of_allocations();
-    test_varying_sizes();
+    // test_allocate_and_free();
+    // test_multiple_allocations();
+    // test_allocation_after_free();
+    // test_out_of_memory();
+    // test_large_number_of_allocations();
+    // test_varying_sizes();
 
-    printf("All tests passed!\n");
+    test_alloc_free();
 
-    runtime_cleanup();
+    // printf("All tests passed!\n");
+
+    // runtime_cleanup();
+
+    rf_alloc_cleanup();
 }

@@ -59,8 +59,8 @@ null_t print_blocks()
 
 null_t *rf_alloc_add_pool(u64_t size)
 {
-    // printf("ADD POOL: %llu O: %d\n", size, orderof(size));
     null_t *pool = mmap_malloc(size);
+    // printf("ADD POOL: %p, %llu O: %d\n", pool, size, orderof(size));
     if (pool == NULL)
         return NULL;
     node_t *node = (node_t *)pool;
@@ -117,7 +117,7 @@ alloc_t rf_alloc_get()
 
 null_t rf_alloc_cleanup()
 {
-    // print_blocks();
+    print_blocks();
     i32_t i;
 
     // All the nodes remains are pools, so just munmap them
@@ -229,6 +229,8 @@ null_t *rf_malloc(u64_t size)
         {
             capacity = 1ull << order;
             block = rf_alloc_add_pool(capacity);
+            // node_t *node = (node_t *)block;
+            // debug("ALLOC NODE: %p %p, %llu ORDER: %d\n", node, node->base, node->size, order);
             return (null_t *)((node_t *)block + 1);
         }
 
@@ -270,6 +272,7 @@ null_t rf_free(null_t *block)
     null_t *buddy;
     node_t *node, **n;
     u32_t order;
+    // debug("FREE NODE: %p, BASE: %p BUDDY: %p\n", node, node->base, buddy);
 
     // block is a 32 bytes block
     if is32block (block)
@@ -292,6 +295,7 @@ null_t rf_free(null_t *block)
     node = (node_t *)block - 1;
     block = (null_t *)node;
     order = orderof(node->size);
+    // debug("FREE NODE: %p %p, %llu ORDER: %d BUDDY: %p\n", node, node->base, node->size, order, buddyof(block, node->base, order));
 
     for (;; order++)
     {
@@ -299,7 +303,7 @@ null_t rf_free(null_t *block)
         buddy = buddyof(block, node->base, order);
 
         // node is the root block, wich can't have higher order buddies, so just insert it into list
-        if (__builtin_expect((block > buddy) && node->base == node, 0))
+        if (__builtin_expect((block < buddy) && node->base == node, 0))
         {
             node->next = _ALLOC->freelist[order];
             _ALLOC->freelist[order] = node;

@@ -1841,15 +1841,8 @@ rf_object_t rf_group_Table(rf_object_t *x, rf_object_t *y)
         l = as_list(x)[1].adt->len;
         m = y->adt->len;
         res = list(l);
-
         for (i = 0; i < l; i++)
-        {
-            val = list(m);
-            for (j = 0; j < m; j++)
-                as_list(&val)[j] = rf_take(&as_list(&as_list(x)[1])[i], &as_list(y)[j]);
-
-            as_list(&res)[i] = val;
-        }
+            as_list(&res)[i] = rf_call_binary_right_atomic(rf_take, &as_list(&as_list(x)[1])[i], y);
 
         return table(rf_object_clone(&as_list(x)[0]), res);
 
