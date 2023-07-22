@@ -39,8 +39,6 @@ typedef struct timestamp_t
     u32_t nanos;
 } timestamp_t;
 
-CASSERT(sizeof(struct timestamp_t) == 16, timestamp_h);
-
 timestamp_t rf_timestamp_from_i64(i64_t offset);
 i64_t rf_timestamp_into_i64(timestamp_t ts);
 

@@ -25,6 +25,8 @@
 #include "ops.h"
 #include "util.h"
 
+CASSERT(sizeof(struct timestamp_t) == 16, timestamp_h)
+
 // An EPOCH starts from 2000.01.01T00:00:00.000
 #define EPOCH 2000
 #define UT_EPOCH_SHIFT 946684800ll

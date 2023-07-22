@@ -29,6 +29,14 @@
 #include <stdarg.h>
 #include "rayforce.h"
 
+// A compile time assertion check
+#define CASSERT(predicate, file) _IMPL_CASSERT_LINE(predicate, __LINE__, file)
+#define _IMPL_PASTE(a, b) a##b
+#define _IMPL_CASSERT_LINE(predicate, line, file) \
+    typedef char _IMPL_PASTE(assertion_failed_##file##_, line)[2 * !!(predicate)-1];
+
+#define UNUSED(x) (void)(x)
+
 #define likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
 

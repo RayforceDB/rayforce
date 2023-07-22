@@ -32,8 +32,6 @@ typedef struct bucket_t
     i64_t val;
 } bucket_t;
 
-CASSERT(sizeof(bucket_t) == 16, hash_h);
-
 typedef struct ht_t
 {
     u64_t (*hasher)(i64_t a);

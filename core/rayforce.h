@@ -30,14 +30,6 @@ extern "C"
 {
 #endif
 
-// A compile time assertion check
-#define CASSERT(predicate, file) _IMPL_CASSERT_LINE(predicate, __LINE__, file)
-#define _IMPL_PASTE(a, b) a##b
-#define _IMPL_CASSERT_LINE(predicate, line, file) \
-    typedef char _IMPL_PASTE(assertion_failed_##file##_, line)[2 * !!(predicate)-1];
-
-#define UNUSED(x) (void)(x)
-
 // Type constants
 #define TYPE_NULL 0
 #define TYPE_BOOL 1
@@ -105,8 +97,6 @@ typedef struct span_t
     u16_t end_column;
 } span_t;
 
-CASSERT(sizeof(struct span_t) == 8, debuginfo_h)
-
 /*
  * ADT header
  */
@@ -122,8 +112,6 @@ typedef struct header_t
     };
 } header_t;
 
-CASSERT(sizeof(struct header_t) == 32, rayforce_h)
-
 /*
  * GUID (Globally Unique Identifier)
  */
@@ -132,9 +120,9 @@ typedef struct guid_t
     u8_t data[16];
 } guid_t;
 
-CASSERT(sizeof(struct guid_t) == 16, rayforce_h)
-
-// Generic type
+/*
+* Generic type
+*/ 
 typedef struct rf_object_t
 {
     type_t type;
@@ -151,8 +139,6 @@ typedef struct rf_object_t
     };
 
 } rf_object_t;
-
-CASSERT(sizeof(struct rf_object_t) == 16, rayforce_h)
 
 // Constructors
 extern rf_object_t null();                                                     // null

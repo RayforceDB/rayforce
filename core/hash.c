@@ -31,6 +31,8 @@
 #include "alloc.h"
 #include "util.h"
 
+CASSERT(sizeof(bucket_t) == 16, hash_h)
+
 ht_t *ht_new(i64_t size, u64_t (*hasher)(i64_t a), i32_t (*compare)(i64_t a, i64_t b))
 {
     size = next_power_of_two_u64(size);

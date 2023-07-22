@@ -33,6 +33,13 @@
 #include "string.h"
 #include "runtime.h"
 
+// clang-format off
+CASSERT(sizeof(struct span_t     ) == 8,  debuginfo_h)
+CASSERT(sizeof(struct header_t   ) == 32, rayforce_h )
+CASSERT(sizeof(struct guid_t     ) == 16, rayforce_h )
+CASSERT(sizeof(struct rf_object_t) == 16, rayforce_h )
+// clang-format on
+
 /*
  * Increment reference counter of the object
  */

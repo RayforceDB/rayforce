@@ -29,9 +29,12 @@
 #include "mmap.h"
 #include "util.h"
 
+// clang-format off
+CASSERT(sizeof(struct node_t     ) ==            16, alloc_h)
+CASSERT(sizeof(struct alloc_t    ) % PAGE_SIZE == 0, alloc_h)
+
 static alloc_t _ALLOC = NULL;
 
-// clang-format off
 #define AVAIL_MASK       ((u64_t)0xFFFFFFFFFFFFFFFF)
 #define BLOCK_ADDR_MASK  ((u64_t)0x00FFFFFFFFFFFFFF)
 #define BLOCK_ORDER_MASK (~BLOCK_ADDR_MASK)

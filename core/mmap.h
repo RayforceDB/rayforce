@@ -51,6 +51,7 @@
 #define mmap_malloc(size) mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 #define mmap_file(size, flags, fd) mmap(NULL, size, flags, MAP_PRIVATE, fd, 0);
 #define mmap_free(addr, size) munmap(addr, size);
+#define mmap_sync(addr, size) msync(addr, size, MS_SYNC);
 #elif defined(__APPLE__) && defined(__MACH__)
 #define MAP_ANON 0x1000
 #define MAP_ANONYMOUS MAP_ANON
@@ -58,6 +59,7 @@
 #define mmap_malloc(size) mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 #define mmap_file(size, flags, fd) mmap(NULL, size, flags, MAP_PRIVATE, fd, 0);
 #define mmap_free(addr, size) munmap(addr, size);
+#define mmap_sync(addr, size) msync(addr, size, MS_SYNC);
 #else
 #error Unknown environment!
 #endif

@@ -39,6 +39,8 @@
 #include "vary.h"
 #include "cc.h"
 
+CASSERT(OP_INVALID < 127, vm_h)
+
 #define stack_push(v, x) (v->stack[v->sp++] = x)
 #define stack_pop(v) (v->stack[--v->sp])
 #define stack_peek(v) (&v->stack[v->sp - 1])

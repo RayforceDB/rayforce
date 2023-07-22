@@ -47,8 +47,6 @@ typedef struct node_t
     };
 } node_t;
 
-CASSERT(sizeof(struct node_t) == 16, alloc_h)
-
 typedef struct memstat_t
 {
     u64_t total;
@@ -65,8 +63,6 @@ typedef struct alloc_t
     node_t *freelist[MAX_POOL_ORDER + 2]; // free list of blocks by order
     u64_t   avail;                        // mask of available blocks by order
 } __attribute__((aligned(PAGE_SIZE))) * alloc_t;
-
-CASSERT(sizeof(struct alloc_t) % PAGE_SIZE == 0, alloc_h)
 
 extern null_t   *rf_malloc(u64_t size);
 extern null_t   *rf_realloc(null_t *block, u64_t size);
