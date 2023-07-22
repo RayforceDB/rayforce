@@ -111,9 +111,9 @@ typedef struct attrs_t
  */
 typedef struct header_t
 {
-    u64_t len;
-    u64_t rc;
     span_t span;
+    u64_t rc;
+    u64_t len;
     union
     {
         i8_t code;
