@@ -40,14 +40,14 @@ typedef enum cc_result_t
 typedef struct cc_t
 {
     bool_t top_level;       // is this top level lambda?
-    rf_object_t *body;      // body of lambda being compiled (list of expressions)
-    rf_object_t lambda;     // lambda being compiled
+    rf_object *body;        // body of lambda being compiled (list of expressions)
+    rf_object lambda;       // lambda being compiled
     debuginfo_t *debuginfo; // debuginfo from parse phase
 } cc_t;
 
-cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object_t *object);
-rf_object_t cc_compile_lambda(bool_t top, str_t name, rf_object_t args,
-                              rf_object_t *body, u32_t id, i32_t len, debuginfo_t *debuginfo);
-rf_object_t cc_compile(rf_object_t *body, debuginfo_t *debuginfo);
+cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, rf_object object);
+rf_object cc_compile_lambda(bool_t top, str_t name, rf_object args,
+                            rf_object *body, u32_t id, i32_t len, debuginfo_t *debuginfo);
+rf_object cc_compile(rf_object *body, debuginfo_t *debuginfo);
 
 #endif

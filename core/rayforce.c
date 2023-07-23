@@ -33,7 +33,7 @@
 #include "string.h"
 #include "runtime.h"
 
-CASSERT(sizeof(struct rf_object_t) == 24, rayforce_h)
+CASSERT(sizeof(struct rf_object_t) == 32, rayforce_h)
 
 rf_object atom(type_t type)
 {
@@ -183,7 +183,7 @@ bool_t rf_object_eq(rf_object a, rf_object b)
         return a->f64 == b->f64;
     else if (a->type == TYPE_I64 || a->type == TYPE_SYMBOL)
     {
-        if (as_vector_i64(a) == as_vector_i64(b))
+        if (as_I64(a) == as_I64(b))
             return true;
         if (a->len != b->len)
             return false;
@@ -191,14 +191,14 @@ bool_t rf_object_eq(rf_object a, rf_object b)
         l = a->len;
         for (i = 0; i < l; i++)
         {
-            if (as_vector_i64(a)[i] != as_vector_i64(b)[i])
+            if (as_I64(a)[i] != as_I64(b)[i])
                 return false;
         }
         return 1;
     }
     else if (a->type == TYPE_F64)
     {
-        if (as_vector_f64(a) == as_vector_f64(b))
+        if (as_F64(a) == as_F64(b))
             return 1;
         if (a->len != b->len)
             return false;
@@ -206,7 +206,7 @@ bool_t rf_object_eq(rf_object a, rf_object b)
         l = a->len;
         for (i = 0; i < l; i++)
         {
-            if (as_vector_f64(a)[i] != as_vector_f64(b)[i])
+            if (as_F64(a)[i] != as_F64(b)[i])
                 return false;
         }
         return true;
@@ -339,24 +339,24 @@ rf_object cow(rf_object object)
     //     memcpy(as_Bool(&new), as_Bool(object), object->adt->len);
     //     return new;
     // case TYPE_I64:
-    //     new = vector_i64(object->adt->len);
+    //     new = I64(object->adt->len);
     //     new.adt->attrs = object->adt->attrs;
-    //     memcpy(as_vector_i64(&new), as_vector_i64(object), object->adt->len * sizeof(i64_t));
+    //     memcpy(as_I64(&new), as_I64(object), object->adt->len * sizeof(i64_t));
     //     return new;
     // case TYPE_F64:
-    //     new = vector_f64(object->adt->len);
+    //     new = F64(object->adt->len);
     //     new.adt->attrs = object->adt->attrs;
-    //     memcpy(as_vector_f64(&new), as_vector_f64(object), object->adt->len * sizeof(f64_t));
+    //     memcpy(as_F64(&new), as_F64(object), object->adt->len * sizeof(f64_t));
     //     return new;
     // case TYPE_SYMBOL:
-    //     new = vector_symbol(object->adt->len);
+    //     new = Symbol(object->adt->len);
     //     new.adt->attrs = object->adt->attrs;
-    //     memcpy(as_vector_symbol(&new), as_vector_symbol(object), object->adt->len * sizeof(i64_t));
+    //     memcpy(as_Symbol(&new), as_Symbol(object), object->adt->len * sizeof(i64_t));
     //     return new;
     // case TYPE_TIMESTAMP:
-    //     new = vector_timestamp(object->adt->len);
+    //     new = Timestamp(object->adt->len);
     //     new.adt->attrs = object->adt->attrs;
-    //     memcpy(as_vector_timestamp(&new), as_vector_timestamp(object), object->adt->len * sizeof(i64_t));
+    //     memcpy(as_Timestamp(&new), as_Timestamp(object), object->adt->len * sizeof(i64_t));
     //     return new;
     // case TYPE_CHAR:
     //     new = string(object->adt->len);

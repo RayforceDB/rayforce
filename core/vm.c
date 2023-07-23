@@ -45,11 +45,6 @@ CASSERT(OP_INVALID < 127, vm_h)
 #define stack_pop(v) (v->stack[--v->sp])
 #define stack_peek(v) (&v->stack[v->sp - 1])
 #define stack_peek_n(v, n) (&v->stack[v->sp - 1 - (n)])
-#define stack_pop_free(v)             \
-    {                                 \
-        rf_object_t o = stack_pop(v); \
-        drop(&o);                     \
-    }
 #define stack_debug(v)                                                     \
     {                                                                      \
         i32_t _i = v->sp;                                                  \
@@ -71,7 +66,7 @@ typedef struct ctx_t
 
 vm_t vm_new()
 {
-    rf_object_t *stack = (rf_object_t *)mmap_stack(VM_STACK_SIZE);
+    rf_object stack = (rf_object)mmap_stack(VM_STACK_SIZE);
 
     vm_t vm = {
         .trace = 0,
@@ -84,12 +79,12 @@ vm_t vm_new()
 /*
  * Execute the lambda
  */
-rf_object_t __attribute__((hot)) vm_exec(vm_t *vm, rf_object_t *fun)
+rf_object __attribute__((hot)) vm_exec(vm_t *vm, rf_object fun)
 {
     type_t c;
     lambda_t *f = as_lambda(fun);
     str_t code = as_string(&f->code);
-    rf_object_t x0, x1, x2, x3, *addr;
+    rf_object x0, x1, x2, x3, *addr;
     i64_t t;
     u8_t n, flags;
     u64_t l, p;
@@ -109,51 +104,14 @@ rf_object_t __attribute__((hot)) vm_exec(vm_t *vm, rf_object_t *fun)
 
 #define dispatch() goto *dispatch_table[(i32_t)code[vm->ip]]
 
-#define unwrap(x, y)                                                                                               \
-    {                                                                                                              \
-        rf_object_t o = x;                                                                                         \
-        if (o.type == TYPE_ERROR)                                                                                  \
-        {                                                                                                          \
-            o.adt->span = debuginfo_get(&f->debuginfo, y);                                                         \
-            u8_t n = 0;                                                                                            \
-            while (vm->sp)                                                                                         \
-            {                                                                                                      \
-                x1 = stack_pop(vm);                                                                                \
-                if (vm->sp == vm->bp)                                                                              \
-                {                                                                                                  \
-                    memcpy(&ctx, &x1, sizeof(ctx_t));                                                              \
-                    if (!ctx.addr)                                                                                 \
-                    {                                                                                              \
-                        vm->bp = ctx.bp;                                                                           \
-                        vm->ip = ctx.ip;                                                                           \
-                        vm->acc = o;                                                                               \
-                        goto op_dispatch;                                                                          \
-                    }                                                                                              \
-                    if (n < vm->trace)                                                                             \
-                    {                                                                                              \
-                        printf("-> %s:[%d:%d:%d:%d]\n", f->debuginfo.filename,                                     \
-                               o.adt->span.start_line + 1, o.adt->span.end_line + 1, o.adt->span.start_column + 1, \
-                               o.adt->span.end_column + 1);                                                        \
-                        n++;                                                                                       \
-                    }                                                                                              \
-                    vm->ip = ctx.ip;                                                                               \
-                    vm->bp = ctx.bp;                                                                               \
-                    f = ctx.addr;                                                                                  \
-                    code = as_string(&f->code);                                                                    \
-                    continue;                                                                                      \
-                }                                                                                                  \
-                                                                                                                   \
-                if (vm->sp == 0)                                                                                   \
-                {                                                                                                  \
-                    printf("-> %s:[%d:%d:%d:%d]\n", f->debuginfo.filename,                                         \
-                           o.adt->span.start_line + 1, o.adt->span.end_line + 1, o.adt->span.start_column + 1,     \
-                           o.adt->span.end_column + 1);                                                            \
-                }                                                                                                  \
-                                                                                                                   \
-                drop(&x1);                                                                                         \
-            }                                                                                                      \
-            return o;                                                                                              \
-        }                                                                                                          \
+#define unwrap(x, y)              \
+    {                             \
+        rf_object o = x;          \
+        if (o.type == TYPE_ERROR) \
+        {                         \
+                                  \
+            return o;             \
+        }                         \
     }
 
 #define load_u64(x, v)                                    \
@@ -239,7 +197,7 @@ made_calln:
     addr = (rf_object_t *)(&vm->stack[vm->sp - n]);
     x1 = rf_call_vary(flags, (vary_t)l, addr, n);
     for (i = 0; i < n; i++)
-        stack_pop_free(vm); // pop args
+        drop(stack_pop(vm)); // pop args
     unwrap(x1, b);
     stack_push(vm, x1);
     dispatch();
@@ -287,7 +245,7 @@ made_calld:
          * |       arg1        |
          * +-------------------+
          */
-        if (n != as_lambda(addr)->args.adt->len)
+        if (n != as_lambda(*addr)->args->len)
             unwrap(error(ERR_LENGTH, "wrong number of arguments"), b);
         if ((vm->sp + as_lambda(addr)->stack_size) * sizeof(rf_object_t) > VM_STACK_SIZE)
             unwrap(error(ERR_STACK_OVERFLOW, "stack overflow"), b);
@@ -344,7 +302,7 @@ op_lset:
     x2 = stack_pop(vm);
     x1 = stack_pop(vm);
     if (f->locals.adt->len == 0)
-        vector_push(&f->locals, dict(vector_symbol(0), list(0)));
+        vector_push(&f->locals, dict(Symbol(0), list(0)));
     dict_set(&as_list(&f->locals)[f->locals.adt->len - 1], &x1, x2);
     dispatch();
 op_lget:
@@ -456,7 +414,7 @@ op_eval:
         drop(&x1);
         unwrap(error(ERR_TYPE, "eval: expects list"), b);
     }
-    x2 = cc_compile_lambda(false, "anonymous", vector_symbol(0), as_list(&x1), x1.id, x1.adt->len, NULL);
+    x2 = cc_compile_lambda(false, "anonymous", Symbol(0), as_list(x1), x1.id, x1.adt->len, NULL);
     drop(&x1);
     unwrap(x2, b);
     stack_push(vm, x2);
@@ -484,7 +442,7 @@ null_t vm_free(vm_t *vm)
 /*
  * Format code object in a user readable form for debugging
  */
-str_t vm_code_fmt(rf_object_t *fun)
+str_t vm_code_fmt(rf_object fun)
 {
     lambda_t *f = as_lambda(fun);
     str_t code = as_string(&f->code);
@@ -505,24 +463,24 @@ str_t vm_code_fmt(rf_object_t *fun)
             break;
         case OP_PUSH:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] push ", c++, ip++);
-            rf_object_fmt_into(&s, &l, &o, 0, 0, (rf_object_t *)(code + ip));
+            rf_object_fmt_into(&s, &l, &o, 0, 0, (rf_object)(code + ip));
             str_fmt_into(&s, &l, &o, 0, "\n");
-            ip += sizeof(rf_object_t);
+            ip += sizeof(rf_object);
             break;
         case OP_POP:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] pop\n", c++, ip++);
             break;
         case OP_JNE:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] jne ", c++, ip++);
-            rf_object_fmt_into(&s, &l, &o, 0, 0, (rf_object_t *)(code + ip));
+            rf_object_fmt_into(&s, &l, &o, 0, 0, (rf_object)(code + ip));
             str_fmt_into(&s, &l, &o, 0, "\n");
-            ip += sizeof(rf_object_t);
+            ip += sizeof(rf_object);
             break;
         case OP_JMP:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] jmp ", c++, ip++);
-            rf_object_fmt_into(&s, &l, &o, 0, 0, (rf_object_t *)(code + ip));
+            rf_object_fmt_into(&s, &l, &o, 0, 0, (rf_object)(code + ip));
             str_fmt_into(&s, &l, &o, 0, "\n");
-            ip += sizeof(rf_object_t);
+            ip += sizeof(rf_object);
             break;
         case OP_CALL1:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] call1 ", c++, ip++);
@@ -534,18 +492,18 @@ str_t vm_code_fmt(rf_object_t *fun)
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] timer_get\n", c++, ip++);
             break;
         case OP_STORE:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] store [%d]\n", c++, ip, (i32_t)((rf_object_t *)(code + ip + 1))->i64);
-            ip += 1 + sizeof(rf_object_t);
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] store [%d]\n", c++, ip, (i32_t)((rf_object)(code + ip + 1))->i64);
+            ip += 1 + sizeof(rf_object);
             break;
         case OP_LOAD:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] load [%d]\n", c++, ip, (i32_t)((rf_object_t *)(code + ip + 1))->i64);
-            ip += 1 + sizeof(rf_object_t);
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] load [%d]\n", c++, ip, (i32_t)((rf_object)(code + ip + 1))->i64);
+            ip += 1 + sizeof(rf_object);
             break;
         case OP_TRY:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] try ", c++, ip++);
-            rf_object_fmt_into(&s, &l, &o, 0, 0, (rf_object_t *)(code + ip));
+            rf_object_fmt_into(&s, &l, &o, 0, 0, (rf_object)(code + ip));
             str_fmt_into(&s, &l, &o, 0, "\n");
-            ip += sizeof(rf_object_t);
+            ip += sizeof(rf_object);
             break;
         case OP_CATCH:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] catch ", c++, ip++);

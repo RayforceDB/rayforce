@@ -197,8 +197,8 @@ null_t counting_sort_asc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i
     rf_object_t mask;
 
     range = max - min + 1;
-    mask = vector_i64(range);
-    m = as_vector_i64(&mask);
+    mask = I64(range);
+    m = as_I64(&mask);
 
     memset(m, 0, range * sizeof(i64_t));
 
@@ -235,8 +235,8 @@ null_t counting_sort_desc(i64_t array[], i64_t indices[], i64_t len, i64_t min, 
     rf_object_t mask;
 
     range = max - min + 1;
-    mask = vector_i64(range);
-    m = as_vector_i64(&mask);
+    mask = I64(range);
+    m = as_I64(&mask);
 
     memset(m, 0, range * sizeof(i64_t));
 
@@ -270,8 +270,8 @@ null_t counting_sort_desc(i64_t array[], i64_t indices[], i64_t len, i64_t min, 
 rf_object_t rf_sort_asc(rf_object_t *vec)
 {
     i64_t i, len = vec->adt->len, out_of_order = 0, inrange = 0, min, max;
-    rf_object_t indices = vector_i64(len);
-    i64_t *iv = as_vector_i64(vec), *ov = as_vector_i64(&indices);
+    rf_object_t indices = I64(len);
+    i64_t *iv = as_I64(vec), *ov = as_I64(&indices);
 
     if (vec->adt->attrs.flags & VEC_ATTR_ASC)
     {
@@ -351,8 +351,8 @@ rf_object_t rf_sort_asc(rf_object_t *vec)
 rf_object_t rf_sort_desc(rf_object_t *vec)
 {
     i64_t i, len = vec->adt->len, out_of_order = 0, inrange = 0, min, max;
-    rf_object_t indices = vector_i64(len);
-    i64_t *iv = as_vector_i64(vec), *ov = as_vector_i64(&indices);
+    rf_object_t indices = I64(len);
+    i64_t *iv = as_I64(vec), *ov = as_I64(&indices);
 
     if (vec->adt->attrs.flags & VEC_ATTR_DESC)
     {

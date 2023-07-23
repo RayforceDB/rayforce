@@ -349,7 +349,7 @@ i32_t dict_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t l
 
 i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, rf_object object)
 {
-    i64_t *header = as_vector_symbol(as_list(object)[0]);
+    i64_t *header = as_Symbol(as_list(object)[0]);
     rf_object columns = as_list(object)[1], column_widths, c;
     i32_t table_width, table_height;
     str_t s, formatted_columns[TABLE_MAX_WIDTH][TABLE_MAX_HEIGHT] = {{NULL}};
@@ -363,14 +363,14 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, rf_obj
     if (table_height > TABLE_MAX_HEIGHT)
         table_height = TABLE_MAX_HEIGHT;
 
-    column_widths = vector_i64(table_width);
+    column_widths = I64(table_width);
 
     // Calculate each column maximum width
     for (i = 0; i < table_width; i++)
     {
         // First check the column name
         n = strlen(symbols_get(header[i]));
-        as_vector_i64(column_widths)[i] = n;
+        as_I64(column_widths)[i] = n;
 
         // Then traverse column until maximum height limit
         for (j = 0; j < table_height; j++)
@@ -385,14 +385,14 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, rf_obj
             drop(&c);
 
             formatted_columns[i][j] = s;
-            maxn(as_vector_i64(column_widths)[i], n);
+            maxn(as_I64(column_widths)[i], n);
         }
     }
 
     // Print table header
     for (i = 0; i < table_width; i++)
     {
-        n = as_vector_i64(column_widths)[i];
+        n = as_I64(column_widths)[i];
         s = symbols_get(header[i]);
         n = n - strlen(s);
         str_fmt_into(dst, len, offset, 0, " %s%*.*s |", s, n, n, PADDING);
@@ -405,7 +405,7 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, rf_obj
     str_fmt_into(dst, len, offset, 0, "\n%*.*s+", indent, indent, PADDING);
     for (i = 0; i < table_width; i++)
     {
-        n = as_vector_i64(column_widths)[i] + 2;
+        n = as_I64(column_widths)[i] + 2;
         str_fmt_into(dst, len, offset, 0, "%*.*s+", n, n, TABLE_HEADER_SEPARATOR);
     }
 
@@ -416,7 +416,7 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, rf_obj
 
         for (i = 0; i < table_width; i++)
         {
-            n = as_vector_i64(column_widths)[i] + 1;
+            n = as_I64(column_widths)[i] + 1;
             s = formatted_columns[i][j];
             n = n - strlen(s);
             str_fmt_into(dst, len, offset, 0, " %s%*.*s|", s, n, n, PADDING);
@@ -446,7 +446,7 @@ i32_t internal_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, rf_o
     i64_t id, sym;
 
     id = vector_find(&as_list(functions)[1], object);
-    sym = as_vector_symbol(as_list(functions)[0])[id];
+    sym = as_Symbol(as_list(functions)[0])[id];
 
     return symbol_fmt_into(dst, len, offset, limit, sym);
 }

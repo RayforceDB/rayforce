@@ -138,10 +138,10 @@ int test_symbols()
 
 null_t test_find()
 {
-    // rf_object_t v = vector_i64(100000000);
+    // rf_object_t v = I64(100000000);
     // for (int i = 0; i < 100000000; i++)
     // {
-    //     as_vector_i64(&v)[i] = i;
+    //     as_I64(&v)[i] = i;
     // }
 
     // clock_t start, end;
@@ -172,8 +172,8 @@ null_t test_vector()
 {
     debug("testing vector");
 
-    rf_object_t v = vector_i64(1);
-    as_vector_i64(&v)[0] = 1;
+    rf_object_t v = I64(1);
+    as_I64(&v)[0] = 1;
 
     for (i32_t i = 0; i < 1000000; i++)
     {

@@ -136,9 +136,9 @@ rf_object rf_til(rf_object x)
     i64_t *v;
     rf_object vec = NULL;
 
-    vec = vector_i64(l);
+    vec = I64(l);
 
-    v = as_vector_i64(vec);
+    v = as_I64(vec);
 
     for (i = 0; i < l; i++)
         v[i] = i;
@@ -186,7 +186,7 @@ rf_object rf_sum(rf_object x)
         return clone(x);
     case MTYPE(TYPE_I64):
         l = x->len;
-        iv = as_vector_i64(x);
+        iv = as_I64(x);
         if (x->flags & VEC_ATTR_WITHOUT_NULLS)
         {
             for (i = 0; i < l; i++)
@@ -205,7 +205,7 @@ rf_object rf_sum(rf_object x)
 
     case MTYPE(TYPE_F64):
         l = x->len;
-        fv = as_vector_f64(x);
+        fv = as_F64(x);
         for (i = 0; i < l; i++)
             fsum += fv[i];
 
@@ -226,7 +226,7 @@ rf_object_t rf_avg(rf_object_t *x)
     {
     case MTYPE(TYPE_I64):
         l = x->adt->len;
-        iv = as_vector_i64(x);
+        iv = as_I64(x);
         isum = 0;
         // vectorized version when we exactly know that there are no nulls
         if (x->adt->attrs.flags & VEC_ATTR_WITHOUT_NULLS)
@@ -249,7 +249,7 @@ rf_object_t rf_avg(rf_object_t *x)
 
     case MTYPE(TYPE_F64):
         l = x->adt->len;
-        fv = as_vector_f64(x);
+        fv = as_F64(x);
         fsum = 0;
         for (i = 0; i < l; i++)
             fsum += fv[i];
@@ -275,7 +275,7 @@ rf_object_t rf_min(rf_object_t *x)
         if (!l)
             return i64(NULL_I64);
 
-        iv = as_vector_i64(x);
+        iv = as_I64(x);
         imin = iv[0];
         // vectorized version when we exactly know that there are no nulls
         if (x->adt->attrs.flags & VEC_ATTR_WITHOUT_NULLS)
@@ -315,7 +315,7 @@ rf_object_t rf_min(rf_object_t *x)
         if (!l)
             return f64(NULL_F64);
 
-        fv = as_vector_f64(x);
+        fv = as_F64(x);
         fmin = fv[0];
         // vectorized version when we exactly know that there are no nulls
         if (x->adt->attrs.flags & VEC_ATTR_WITHOUT_NULLS)
@@ -355,7 +355,7 @@ rf_object_t rf_max(rf_object_t *x)
         if (!l)
             return i64(NULL_I64);
 
-        iv = as_vector_i64(x);
+        iv = as_I64(x);
         imax = iv[0];
         // vectorized version when we exactly know that there are no nulls
         if (x->adt->attrs.flags & VEC_ATTR_WITHOUT_NULLS)
@@ -452,7 +452,7 @@ rf_object_t rf_asc(rf_object_t *x)
     case MTYPE(TYPE_I64):
         l = x->adt->len;
         for (i = 0; i < l; i++)
-            as_vector_i64(&idx)[i] = as_vector_i64(x)[as_vector_i64(&idx)[i]];
+            as_I64(&idx)[i] = as_I64(x)[as_I64(&idx)[i]];
 
         idx.adt->attrs.flags |= VEC_ATTR_ASC;
 
@@ -473,7 +473,7 @@ rf_object_t rf_desc(rf_object_t *x)
     case MTYPE(TYPE_I64):
         l = x->adt->len;
         for (i = 0; i < l; i++)
-            as_vector_i64(&idx)[i] = as_vector_i64(x)[as_vector_i64(&idx)[i]];
+            as_I64(&idx)[i] = as_I64(x)[as_I64(&idx)[i]];
 
         idx.adt->attrs.flags |= VEC_ATTR_DESC;
 
@@ -494,8 +494,8 @@ rf_object_t rf_guid_generate(rf_object_t *x)
     {
     case MTYPE(-TYPE_I64):
         count = x->i64;
-        vec = vector_guid(count);
-        g = as_vector_guid(&vec);
+        vec = Guid(count);
+        g = as_Guid(&vec);
 
         for (i = 0; i < count; i++)
             guid_generate(g + i);
@@ -522,15 +522,15 @@ rf_object_t rf_neg(rf_object_t *x)
         return f64(-x->f64);
     case MTYPE(TYPE_I64):
         l = x->adt->len;
-        res = vector_i64(l);
+        res = I64(l);
         for (i = 0; i < l; i++)
-            as_vector_i64(&res)[i] = -as_vector_i64(x)[i];
+            as_I64(&res)[i] = -as_I64(x)[i];
         return res;
     case MTYPE(TYPE_F64):
         l = x->adt->len;
-        res = vector_f64(l);
+        res = F64(l);
         for (i = 0; i < l; i++)
-            as_vector_f64(&res)[i] = -as_vector_f64(x)[i];
+            as_F64(&res)[i] = -as_F64(x)[i];
         return res;
 
     default:
@@ -550,8 +550,8 @@ rf_object_t rf_where(rf_object_t *x)
     case MTYPE(TYPE_BOOL):
         l = x->adt->len;
         iv = as_Bool(x);
-        res = vector_i64(l);
-        ov = as_vector_i64(&res);
+        res = I64(l);
+        ov = as_I64(&res);
         for (i = 0; i < l; i++)
             if (iv[i])
                 ov[j++] = i;
@@ -672,7 +672,7 @@ rf_object_t rf_read_parse_compile(rf_object_t *x)
             return par;
         }
 
-        com = cc_compile_lambda(false, as_string(x), vector_symbol(0),
+        com = cc_compile_lambda(false, as_string(x), Symbol(0),
                                 as_list(&par), par.id, par.adt->len, &parser.debuginfo);
         drop(&par);
         parser_free(&parser);

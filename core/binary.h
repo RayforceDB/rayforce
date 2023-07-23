@@ -26,40 +26,40 @@
 
 #include "rayforce.h"
 
-typedef rf_object_t (*binary_t)(rf_object_t *, rf_object_t *);
+typedef rf_object (*binary_t)(rf_object, rf_object);
 
-rf_object_t rf_call_binary(u8_t flags, binary_t f, rf_object_t *x, rf_object_t *y);
-rf_object_t rf_set_variable(rf_object_t *key, rf_object_t *val);
-rf_object_t rf_dict(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_table(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_rand(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_add(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_sub(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_mul(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_div(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_mod(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_fdiv(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_like(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_eq(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_ne(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_lt(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_gt(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_le(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_ge(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_and(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_or(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_and(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_get(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_find(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_concat(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_filter(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_take(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_in(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_sect(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_except(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_cast(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_group_Table(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_xasc(rf_object_t *x, rf_object_t *y);
-rf_object_t rf_xdesc(rf_object_t *x, rf_object_t *y);
+rf_object rf_call_binary(u8_t flags, binary_t f, rf_object x, rf_object y);
+rf_object rf_set_variable(rf_object key, rf_object val);
+rf_object rf_dict(rf_object x, rf_object y);
+rf_object rf_table(rf_object x, rf_object y);
+rf_object rf_rand(rf_object x, rf_object y);
+rf_object rf_add(rf_object x, rf_object y);
+rf_object rf_sub(rf_object x, rf_object y);
+rf_object rf_mul(rf_object x, rf_object y);
+rf_object rf_div(rf_object x, rf_object y);
+rf_object rf_mod(rf_object x, rf_object y);
+rf_object rf_fdiv(rf_object x, rf_object y);
+rf_object rf_like(rf_object x, rf_object y);
+rf_object rf_eq(rf_object x, rf_object y);
+rf_object rf_ne(rf_object x, rf_object y);
+rf_object rf_lt(rf_object x, rf_object y);
+rf_object rf_gt(rf_object x, rf_object y);
+rf_object rf_le(rf_object x, rf_object y);
+rf_object rf_ge(rf_object x, rf_object y);
+rf_object rf_and(rf_object x, rf_object y);
+rf_object rf_or(rf_object x, rf_object y);
+rf_object rf_and(rf_object x, rf_object y);
+rf_object rf_get(rf_object x, rf_object y);
+rf_object rf_find(rf_object x, rf_object y);
+rf_object rf_concat(rf_object x, rf_object y);
+rf_object rf_filter(rf_object x, rf_object y);
+rf_object rf_take(rf_object x, rf_object y);
+rf_object rf_in(rf_object x, rf_object y);
+rf_object rf_sect(rf_object x, rf_object y);
+rf_object rf_except(rf_object x, rf_object y);
+rf_object rf_cast(rf_object x, rf_object y);
+rf_object rf_group_Table(rf_object x, rf_object y);
+rf_object rf_xasc(rf_object x, rf_object y);
+rf_object rf_xdesc(rf_object x, rf_object y);
 
 #endif

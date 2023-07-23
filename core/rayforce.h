@@ -101,6 +101,7 @@ typedef struct rf_object_t
     type_t type;
     u8_t flags;
     u8_t code;
+    u32_t id;
     u32_t rc;
     union
     {
@@ -130,12 +131,12 @@ extern rf_object guid(u8_t data[]);                                          // 
 extern rf_object schar(char_t c);                                            // char
 extern rf_object string(i64_t len);                                          // string 
 
-#define Bool(len)      (vector(TYPE_BOOL,                       len ))  // bool vector
-#define vector_i64(len)       (vector(TYPE_I64,                        len ))  // i64 vector
-#define vector_f64(len)       (vector(TYPE_F64,                        len ))  // f64 vector
-#define vector_symbol(len)    (vector(TYPE_SYMBOL,                     len ))  // symbol vector
-#define vector_timestamp(len) (vector(TYPE_TIMESTAMP,                  len ))  // char vector
-#define vector_guid(len)      (vector(TYPE_GUID,                       len ))  // GUID vector
+#define Bool(len)      (vector(TYPE_BOOL,       len ))  // bool vector
+#define I64(len)       (vector(TYPE_I64,        len ))  // i64 vector
+#define F64(len)       (vector(TYPE_F64,        len ))  // f64 vector
+#define Symbol(len)    (vector(TYPE_SYMBOL,     len ))  // symbol vector
+#define Timestamp(len) (vector(TYPE_TIMESTAMP,  len ))  // char vector
+#define Guid(len)      (vector(TYPE_GUID,       len ))  // GUID vector
 
 extern rf_object table(rf_object keys, rf_object vals);                  // table
 extern rf_object dict(rf_object keys,  rf_object vals);                  // dict
@@ -152,21 +153,20 @@ extern rf_object error(i8_t code, str_t message);
 extern null_t drop(rf_object   object);
 
 // Accessors
-#define as_string(object)           ((object)->ptr)
+#define as_string(object)    ((object)->ptr)
 #define as_Bool(object)      ((bool_t *)(as_string(object)))
-#define as_vector_i64(object)       ((i64_t *)(as_string(object)))
-#define as_vector_f64(object)       ((f64_t *)(as_string(object)))
-#define as_vector_symbol(object)    ((i64_t *)(as_string(object)))
-#define as_vector_timestamp(object) ((i64_t *)(as_string(object)))
-#define as_vector_guid(object)      ((guid_t *)(as_string(object)))
-#define as_list(object)             ((rf_object *)(as_string(object)))
+#define as_I64(object)       ((i64_t *)(as_string(object)))
+#define as_F64(object)       ((f64_t *)(as_string(object)))
+#define as_Symbol(object)    ((i64_t *)(as_string(object)))
+#define as_Timestamp(object) ((i64_t *)(as_string(object)))
+#define as_Guid(object)      ((guid_t *)(as_string(object)))
+#define as_list(object)      ((rf_object *)(as_string(object)))
 
 // Checkers
 extern bool_t is_null(rf_object object);
 #define is_error(object)  ((object)->type == TYPE_ERROR)
 #define is_scalar(object) ((object)->type < 0)
 #define is_vector(object) ((object)->type > 0 && (object)->type < TYPE_TABLE)
-#define is_rc(object)     (((object)->type > 0 && (object)->type < TYPE_UNARY) || (object)->type == TYPE_ERROR)
 
 // Mutators
 extern rf_object vector_push(rf_object vector, rf_object object);

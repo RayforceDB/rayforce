@@ -27,35 +27,25 @@
 #include "format.h"
 #include "util.h"
 
-rf_object_t dict(rf_object_t keys, rf_object_t vals)
+rf_object dict(rf_object keys, rf_object vals)
 {
-    if (!is_vector(&keys) || !is_vector(&vals))
-    {
-        drop(&keys);
-        drop(&vals);
+    rf_object dict;
+
+    if (!is_vector(keys) || !is_vector(vals))
         return error(ERR_TYPE, "Keys and Values must be lists");
-    }
 
-    if (keys.adt->len != vals.adt->len)
-    {
-        drop(&keys);
-        drop(&vals);
+    if (keys->len != vals->len)
         return error(ERR_LENGTH, "Keys and Values must have the same length");
-    }
 
-    rf_object_t dict = list(2);
-
-    as_list(&dict)[0] = keys;
-    as_list(&dict)[1] = vals;
-
-    dict.type = TYPE_DICT;
+    dict = list(2, keys, vals);
+    dict->type = TYPE_DICT;
 
     return dict;
 }
 
-rf_object_t dict_get(rf_object_t *dict, rf_object_t *key)
+rf_object dict_get(rf_object dict, rf_object key)
 {
-    rf_object_t *keys = &as_list(dict)[0], *vals = &as_list(dict)[1];
+    rf_object keys = as_list(dict)[0], vals = as_list(dict)[1];
     i64_t i;
 
     i = vector_find(keys, key);

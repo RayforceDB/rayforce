@@ -87,7 +87,7 @@
 u32_t next_power_of_two_u32(u32_t n);
 u64_t next_power_of_two_u64(u64_t n);
 
-rf_object_t error_type1(type_t type, str_t msg);
-rf_object_t error_type2(type_t type1, type_t type2, str_t msg);
+rf_object error_type1(type_t type, str_t msg);
+rf_object error_type2(type_t type1, type_t type2, str_t msg);
 
 #endif

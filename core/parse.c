@@ -464,7 +464,7 @@ rf_object_t parse_symbol(parser_t *parser)
 
 rf_object_t parse_vector(parser_t *parser)
 {
-    rf_object_t token, vec = vector_i64(0), err;
+    rf_object_t token, vec = I64(0), err;
     i32_t i;
     span_t span = span_start(parser);
 
@@ -522,7 +522,7 @@ rf_object_t parse_vector(parser_t *parser)
             {
                 vec.type = TYPE_F64;
                 for (i = 0; i < (i32_t)vec.adt->len; i++)
-                    as_vector_f64(&vec)[i] = (f64_t)as_vector_i64(&vec)[i];
+                    as_F64(&vec)[i] = (f64_t)as_I64(&vec)[i];
 
                 vector_push(&vec, token);
             }
@@ -802,43 +802,43 @@ rf_object_t advance(parser_t *parser)
     return err;
 }
 
-rf_object_t parse_program(parser_t *parser)
+rf_object parse_program(parser_t *parser)
 {
-    rf_object_t token, list = list(0), err;
+    rf_object token, lst = list(0), err;
     str_t msg;
 
     while (!at_eof(*parser->current))
     {
         token = advance(parser);
 
-        if (is_error(&token))
+        if (is_error(token))
         {
             drop(&list);
             return token;
         }
 
-        if (is_at_term(&token))
+        if (is_at_term(token))
         {
-            drop(&list);
-            msg = str_fmt(0, "Unexpected token: '%c'", token.i64);
+            drop(lst);
+            msg = str_fmt(0, "Unexpected token: '%c'", token->i64);
             err = error(ERR_PARSE, msg);
             rf_free(msg);
-            err.id = token.id;
+            err->id = token->id;
             return err;
         }
 
-        if (is_at(&token, '\0'))
+        if (is_at(token, '\0'))
             break;
 
-        list_push(&list, token);
+        list_push(lst, token);
     }
 
     return list;
 }
 
-rf_object_t parse(parser_t *parser, str_t filename, str_t input)
+rf_object parse(parser_t *parser, str_t filename, str_t input)
 {
-    rf_object_t prg;
+    rf_object prg;
 
     parser->debuginfo.lambda = "";
     parser->debuginfo.filename = filename;
@@ -849,8 +849,8 @@ rf_object_t parse(parser_t *parser, str_t filename, str_t input)
 
     prg = parse_program(parser);
 
-    if (is_error(&prg))
-        prg.adt->span = debuginfo_get(&parser->debuginfo, prg.id);
+    // if (is_error(prg))
+    //     prg->span = debuginfo_get(&parser->debuginfo, prg.id);
 
     return prg;
 }

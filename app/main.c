@@ -64,10 +64,10 @@ null_t print_logo()
     rf_free(logo);
 }
 
-rf_object_t parse_cmdline(i32_t argc, str_t argv[])
+rf_object parse_cmdline(i32_t argc, str_t argv[])
 {
     i32_t opt, len;
-    rf_object_t keys = vector_symbol(0), vals = list(0), str;
+    rf_object keys = Symbol(0), vals = list(0), str;
 
     for (opt = 1; opt < argc && argv[opt][0] == '-'; opt++)
     {
@@ -82,8 +82,8 @@ rf_object_t parse_cmdline(i32_t argc, str_t argv[])
             vector_push(&keys, symbol("file"));
             len = strlen(argv[opt]);
             str = string(len);
-            strncpy(as_string(&str), argv[opt], len);
-            vector_push(&vals, str);
+            strncpy(as_string(str), argv[opt], len);
+            vector_push(vals, str);
             break;
         default:
             usage();
@@ -97,41 +97,42 @@ rf_object_t parse_cmdline(i32_t argc, str_t argv[])
 
 null_t repl(str_t name, parser_t *parser, str_t buf, i32_t len)
 {
-    rf_object_t parsed, compiled, executed;
+    rf_object parsed, compiled, executed;
     str_t formatted = NULL;
 
     parsed = parse(parser, name, buf);
-    // printf("%s\n", rf_object_fmt(&parsed));
+    printf("%s\n", rf_object_fmt(parsed));
+    return;
 
-    if (is_error(&parsed))
+    if (is_error(parsed))
     {
-        print_error(&parsed, name, buf, len);
-        drop(&parsed);
+        print_error(parsed, name, buf, len);
+        drop(parsed);
         return;
     }
 
-    compiled = cc_compile(&parsed, &parser->debuginfo);
-    if (is_error(&compiled))
+    compiled = cc_compile(parsed, &parser->debuginfo);
+    if (is_error(compiled))
     {
-        print_error(&compiled, name, buf, len);
-        drop(&parsed);
-        drop(&compiled);
+        print_error(compiled, name, buf, len);
+        drop(parsed);
+        drop(compiled);
         return;
     }
 
     // printf("%s\n", vm_code_fmt(&compiled));
 
     // release rc's of parsed asap
-    drop(&parsed);
+    drop(parsed);
 
-    executed = vm_exec(&runtime_get()->vm, &compiled);
-    drop(&compiled);
+    executed = vm_exec(&runtime_get()->vm, compiled);
+    drop(compiled);
 
-    if (is_error(&executed))
-        print_error(&executed, name, buf, len);
-    else if (!is_null(&executed))
+    if (is_error(executed))
+        print_error(executed, name, buf, len);
+    else if (!is_null(executed))
     {
-        formatted = rf_object_fmt(&executed);
+        formatted = rf_object_fmt(executed);
         if (formatted != NULL)
         {
             printf("%s\n", formatted);
@@ -139,7 +140,7 @@ null_t repl(str_t name, parser_t *parser, str_t buf, i32_t len)
         }
     }
 
-    drop(&executed);
+    drop(executed);
 
     return;
 }
@@ -164,7 +165,7 @@ i32_t main(i32_t argc, str_t argv[])
 
     runtime_init(0);
 
-    rf_object_t args = parse_cmdline(argc, argv), filename, symfile = symbol("file"), file;
+    rf_object args = parse_cmdline(argc, argv), filename, symfile = symbol("file"), file;
     str_t line, ptr;
     parser_t parser = parser_new();
 
@@ -175,20 +176,20 @@ i32_t main(i32_t argc, str_t argv[])
     line = (str_t)mmap_malloc(LINE_SIZE);
 
     // load file
-    filename = dict_get(&args, &symfile);
-    if (!is_null(&filename))
+    filename = dict_get(args, symfile);
+    if (!is_null(filename))
     {
-        file = rf_fread(&filename);
-        if (file.type == TYPE_ERROR)
-            print_error(&file, as_string(&filename), NULL, 0);
+        file = rf_fread(filename);
+        if (file->type == TYPE_ERROR)
+            print_error(file, as_string(filename), NULL, 0);
         else
-            repl(as_string(&filename), &parser, as_string(&file), file.adt->len);
+            repl(as_string(filename), &parser, as_string(file), file->len);
 
-        drop(&file);
+        drop(file);
     }
     // --
 
-    drop(&filename);
+    drop(filename);
 
     while (running)
     {
@@ -200,7 +201,7 @@ i32_t main(i32_t argc, str_t argv[])
         repl("top-level", &parser, line, LINE_SIZE);
     }
 
-    drop(&args);
+    drop(args);
     parser_free(&parser);
     mmap_free(line, LINE_SIZE);
 
