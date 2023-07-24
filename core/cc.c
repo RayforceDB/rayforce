@@ -24,7 +24,7 @@
 #include <stdio.h>
 #include "cc.h"
 #include "vm.h"
-#include "alloc.h"
+#include "heap.h"
 #include "format.h"
 #include "util.h"
 #include "vector.h"
@@ -87,7 +87,7 @@
         str_t m = e;               \
         drop(&(c)->lambda);        \
         (c)->lambda = error(t, m); \
-        alloc_free(m);             \
+        heap_free(m);              \
         return CC_ERROR;           \
     }
 
@@ -412,7 +412,7 @@ cc_result_t cc_compile_map(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t arity
     //         return CC_ERROR;
     // }
 
-    // push_opcode(cc, car->id, code, OP_ALLOC);
+    // push_opcode(cc, car->id, code, OP_HEAP);
     // push_u8(code, arity);
 
     // // check if iteration is done
@@ -983,7 +983,7 @@ obj_t cc_compile(obj_t body, debuginfo_t *debuginfo)
     {
         msg = str_fmt(0, "compile '%s': expected list", "top-level");
         err = error(ERR_TYPE, msg);
-        alloc_free(msg);
+        heap_free(msg);
         return err;
     }
 

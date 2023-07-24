@@ -22,16 +22,16 @@
  */
 
 #include "set.h"
-#include "alloc.h"
+#include "heap.h"
 #include "util.h"
 
 set_t *set_new(i64_t size, u64_t (*hasher)(i64_t a), i32_t (*compare)(i64_t a, i64_t b))
 {
     size = next_power_of_two_u64(size);
     i64_t i, *kv;
-    set_t *set = (set_t *)alloc_malloc(sizeof(struct set_t));
+    set_t *set = (set_t *)heap_malloc(sizeof(struct set_t));
 
-    set->keys = (i64_t *)alloc_malloc(size * sizeof(i64_t));
+    set->keys = (i64_t *)heap_malloc(size * sizeof(i64_t));
     set->size = size;
     set->count = 0;
     set->hasher = hasher;
@@ -47,8 +47,8 @@ set_t *set_new(i64_t size, u64_t (*hasher)(i64_t a), i32_t (*compare)(i64_t a, i
 
 nil_t set_free(set_t *set)
 {
-    alloc_free(set->keys);
-    alloc_free(set);
+    heap_free(set->keys);
+    heap_free(set);
 }
 
 nil_t set_rehash(set_t *set)
@@ -59,7 +59,7 @@ nil_t set_rehash(set_t *set)
 
     // Double the table size.
     set->size *= 2;
-    set->keys = (i64_t *)alloc_malloc(set->size * sizeof(i64_t));
+    set->keys = (i64_t *)heap_malloc(set->size * sizeof(i64_t));
 
     new_keys = set->keys;
 
@@ -82,7 +82,7 @@ nil_t set_rehash(set_t *set)
         }
     }
 
-    alloc_free(old_keys);
+    heap_free(old_keys);
 }
 
 bool_t set_insert(set_t *set, i64_t key)

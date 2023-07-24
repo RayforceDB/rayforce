@@ -23,7 +23,7 @@
 
 #include <stdio.h>
 #include "vary.h"
-#include "alloc.h"
+#include "heap.h"
 #include "string.h"
 #include "format.h"
 #include "ops.h"
@@ -58,7 +58,7 @@ obj_trf_gc(obj_t *x, i64_t n)
 {
     UNUSED(x);
     UNUSED(n);
-    return i64(alloc_gc());
+    return i64(heap_gc());
 }
 
 obj_t rf_format(obj_t *x, i64_t n)
@@ -70,7 +70,7 @@ obj_t rf_format(obj_t *x, i64_t n)
         return error(ERR_TYPE, "malformed format string");
 
     ret = string_from_str(s, strlen(s));
-    alloc_free(s);
+    heap_free(s);
 
     return ret;
 }
@@ -83,7 +83,7 @@ obj_t rf_print(obj_t *x, i64_t n)
         return error(ERR_TYPE, "malformed format string");
 
     printf("%s", s);
-    alloc_free(s);
+    heap_free(s);
 
     return null();
 }
@@ -96,7 +96,7 @@ obj_t rf_println(obj_t *x, i64_t n)
         return error(ERR_TYPE, "malformed format string");
 
     printf("%s\n", s);
-    alloc_free(s);
+    heap_free(s);
 
     return null();
 }

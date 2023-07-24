@@ -24,7 +24,7 @@
 #include <stdlib.h>
 #include "util.h"
 #include "format.h"
-#include "alloc.h"
+#include "heap.h"
 #include "env.h"
 
 u32_t next_power_of_two_u32(u32_t n)
@@ -53,7 +53,7 @@ obj_t error_type1(type_t type, str_t msg)
 {
     str_t fmsg = str_fmt(0, "%s: '%s'", msg, env_get_typename(type));
     obj_t err = error(ERR_TYPE, fmsg);
-    alloc_free(fmsg);
+    heap_free(fmsg);
     return err;
 }
 
@@ -61,6 +61,6 @@ obj_t error_type2(type_t type1, type_t type2, str_t msg)
 {
     str_t fmsg = str_fmt(0, "%s: '%s', '%s'", msg, env_get_typename(type1), env_get_typename(type2));
     obj_t err = error(ERR_TYPE, fmsg);
-    alloc_free(fmsg);
+    heap_free(fmsg);
     return err;
 }

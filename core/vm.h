@@ -58,7 +58,7 @@ typedef enum vm_opcode_t
     OP_CATCH,     // Catch an error from vm register and push it onto the stack
     OP_THROW,     // Throw an error
     OP_TRACE,     // Print stack trace (limit)
-    OP_ALLOC,     // Allocate obj_t
+    OP_HEAP,     // Allocate obj_t
     OP_MAP,       // Map lambda over array
     OP_COLLECT,   // Collect array of results
     OP_EVAL,      // Compile/evaluate list of expressions as a lambda

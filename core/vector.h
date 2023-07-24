@@ -25,7 +25,7 @@
 #define VECTOR_H
 
 #include "rayforce.h"
-#include "alloc.h"
+#include "heap.h"
 #include "ops.h"
 #include "util.h"
 
@@ -60,7 +60,7 @@
         {                                                                                                          \
             i64_t new_cap = capacity(cap + req_cap);                                                               \
             /*debug("realloc: len %lld n %lld from %lld to %lld occup: %lld", (v)->len, n, cap, new_cap, occup);*/ \
-            (v)->ptr = alloc_realloc((v)->ptr, new_cap);                                                           \
+            (v)->ptr = heap_realloc((v)->ptr, new_cap);                                                            \
         }                                                                                                          \
     }
 

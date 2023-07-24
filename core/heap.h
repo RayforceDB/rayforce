@@ -31,8 +31,8 @@
 #define MIN_ORDER        6                   // 2^6  = 64 bytes
 #define MAX_ORDER        25                  // 2^25 = 32MB
 #define MAX_POOL_ORDER   36                  // 2^36 = 64GB
-#define MIN_ALLOC        (1ull << MIN_ORDER) // 64 bytes
-#define MAX_ALLOC        (1ull << MAX_ORDER) // 32MB
+#define MIN_HEAP        (1ull << MIN_ORDER) // 64 bytes
+#define MAX_HEAP        (1ull << MAX_ORDER) // 32MB
 #define POOL_SIZE        (1ull << MAX_ORDER) // 32MB
 #define NUM_32_BLOCKS    1024 * 1024 * 8     // 8M blocks
 #define NUM_64_BLOCKS    1024 * 1024 * 8     // 8M blocks
@@ -54,25 +54,25 @@ typedef struct memstat_t
     u64_t free;
 } memstat_t;
 
-typedef struct alloc_t
+typedef struct heap_t
 {
-    nil_t *blocks32;                     // pool of 32 bytes blocks
-    nil_t *freelist32;                   // blocks of 32 bytes
-    nil_t *blocks64;                     // pool of 64 bytes blocks
-    nil_t *freelist64;                   // blocks of 64 bytes
+    nil_t *blocks32;                      // pool of 32 bytes blocks
+    nil_t *freelist32;                    // blocks of 32 bytes
+    nil_t *blocks64;                      // pool of 64 bytes blocks
+    nil_t *freelist64;                    // blocks of 64 bytes
     node_t *freelist[MAX_POOL_ORDER + 2]; // free list of blocks by order
     u64_t   avail;                        // mask of available blocks by order
-} __attribute__((aligned(PAGE_SIZE))) * alloc_t;
+} __attribute__((aligned(PAGE_SIZE))) *heap_t;
 
-extern nil_t   *alloc_malloc(u64_t size);
-extern nil_t   *alloc_realloc(nil_t *block, u64_t size);
-extern nil_t    alloc_free(nil_t *block);
-extern nil_t    alloc_mrequest(u64_t size);
-extern alloc_t   alloc_init();
-extern alloc_t   alloc_get();
-extern i64_t     alloc_gc();
-extern nil_t    alloc_cleanup();
-extern memstat_t alloc_memstat();
+extern nil_t    *heap_malloc(u64_t size);
+extern nil_t    *heap_realloc(nil_t *block, u64_t size);
+extern nil_t     heap_free(nil_t *block);
+extern nil_t     heap_mrequest(u64_t size);
+extern heap_t    heap_init();
+extern heap_t    heap_get();
+extern i64_t     heap_gc();
+extern nil_t     heap_cleanup();
+extern memstat_t heap_memstat();
 // clang-format on
 
 #endif

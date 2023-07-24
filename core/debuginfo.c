@@ -23,7 +23,7 @@
 
 #include "debuginfo.h"
 #include "string.h"
-#include "alloc.h"
+#include "heap.h"
 #include "ops.h"
 
 i32_t u32_cmp(i64_t a, i64_t b)

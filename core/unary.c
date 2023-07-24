@@ -24,7 +24,7 @@
 #include "unary.h"
 #include "dict.h"
 #include "runtime.h"
-#include "alloc.h"
+#include "heap.h"
 #include "vm.h"
 #include "ops.h"
 #include "util.h"
@@ -129,7 +129,7 @@ obj_t rf_count(obj_t x)
 
 obj_t rf_til(obj_t x)
 {
-    if (MTYPE(x->type) != MTYPE(-TYPE_vector_i64))
+    if (MTYPE(x->type) != MTYPE(-TYPE_I64))
         return error(ERR_TYPE, "til: expected i64");
 
     i32_t i, l = (i32_t)x->i64;
@@ -153,7 +153,7 @@ obj_t rf_distinct(obj_t x)
 
     switch (MTYPE(x->type))
     {
-    case MTYPE(TYPE_vector_i64):
+    case MTYPE(TYPE_I64):
         return rf_distinct_vector_i64(x);
     case MTYPE(TYPE_SYMBOL):
         res = rf_distinct_vector_i64(x);
@@ -166,7 +166,7 @@ obj_t rf_distinct(obj_t x)
 
 obj_t rf_group(obj_t x)
 {
-    if (MTYPE(x->type) != MTYPE(TYPE_vector_i64))
+    if (MTYPE(x->type) != MTYPE(TYPE_I64))
         return error(ERR_TYPE, "group: expected vector_i64");
 
     return rf_group_vector_i64(x);
@@ -180,11 +180,11 @@ obj_t rf_sum(obj_t x)
 
     switch (MTYPE(x->type))
     {
-    case MTYPE(-TYPE_vector_i64):
+    case MTYPE(-TYPE_I64):
         return clone(x);
-    case MTYPE(-TYPE_vector_f64):
+    case MTYPE(-TYPE_F64):
         return clone(x);
-    case MTYPE(TYPE_vector_i64):
+    case MTYPE(TYPE_I64):
         l = x->len;
         iv = as_vector_i64(x);
         if (x->flags & VEC_ATTR_WITHOUT_NULLS)
@@ -203,7 +203,7 @@ obj_t rf_sum(obj_t x)
 
         return i64(isum);
 
-    case MTYPE(TYPE_vector_f64):
+    case MTYPE(TYPE_F64):
         l = x->len;
         fv = as_vector_f64(x);
         for (i = 0; i < l; i++)
@@ -224,7 +224,7 @@ obj_t rf_avg(obj_t x)
 
     switch (MTYPE(x->type))
     {
-    case MTYPE(TYPE_vector_i64):
+    case MTYPE(TYPE_I64):
         l = x->len;
         iv = as_vector_i64(x);
         isum = 0;
@@ -247,7 +247,7 @@ obj_t rf_avg(obj_t x)
         }
         return f64((f64_t)isum / (l - n));
 
-    case MTYPE(TYPE_vector_f64):
+    case MTYPE(TYPE_F64):
         l = x->len;
         fv = as_vector_f64(x);
         fsum = 0;
@@ -269,7 +269,7 @@ obj_t rf_min(obj_t x)
 
     switch (MTYPE(x->type))
     {
-    case MTYPE(TYPE_vector_i64):
+    case MTYPE(TYPE_I64):
         l = x->len;
 
         if (!l)
@@ -309,7 +309,7 @@ obj_t rf_min(obj_t x)
 
         return i64(imin);
 
-    case MTYPE(TYPE_vector_f64):
+    case MTYPE(TYPE_F64):
         l = x->len;
 
         if (!l)
@@ -349,7 +349,7 @@ obj_t rf_max(obj_t x)
 
     switch (MTYPE(x->type))
     {
-    case MTYPE(TYPE_vector_i64):
+    case MTYPE(TYPE_I64):
         l = x->len;
 
         if (!l)
@@ -422,7 +422,7 @@ obj_t rf_iasc(obj_t x)
 {
     switch (MTYPE(x->type))
     {
-    case MTYPE(TYPE_vector_i64):
+    case MTYPE(TYPE_I64):
         return rf_sort_asc(x);
 
     default:
@@ -434,7 +434,7 @@ obj_trf_idesc(obj_t x)
 {
     switch (MTYPE(x->type))
     {
-    case MTYPE(TYPE_vector_i64):
+    case MTYPE(TYPE_I64):
         return rf_sort_desc(x);
 
     default:
@@ -449,7 +449,7 @@ obj_t rf_asc(obj_t x)
 
     switch (MTYPE(x->type))
     {
-    case MTYPE(TYPE_vector_i64):
+    case MTYPE(TYPE_I64):
         l = x->len;
         for (i = 0; i < l; i++)
             as_vector_i64(idx)[i] = as_vector_i64(x)[as_vector_i64(idx)[i]];
@@ -470,7 +470,7 @@ obj_t rf_desc(obj_t x)
 
     switch (MTYPE(x->type))
     {
-    case MTYPE(TYPE_vector_i64):
+    case MTYPE(TYPE_I64):
         l = x->len;
         for (i = 0; i < l; i++)
             as_vector_i64(idx)[i] = as_vector_i64(x)[as_vector_i64(idx)[i]];
@@ -492,7 +492,7 @@ obj_t rf_guid_generate(obj_t x)
 
     switch (MTYPE(x->type))
     {
-    case MTYPE(-TYPE_vector_i64):
+    case MTYPE(-TYPE_I64):
         count = x->i64;
         vec = vector_guid(count);
         g = as_vector_guid(vec);
@@ -516,17 +516,17 @@ obj_t rf_neg(obj_t x)
     {
     case MTYPE(-TYPE_BOOL):
         return i64(-x->bool);
-    case MTYPE(-TYPE_vector_i64):
+    case MTYPE(-TYPE_I64):
         return i64(-x->i64);
-    case MTYPE(-TYPE_vector_f64):
+    case MTYPE(-TYPE_F64):
         return f64(-x->f64);
-    case MTYPE(TYPE_vector_i64):
+    case MTYPE(TYPE_I64):
         l = x->len;
         res = vector_i64(l);
         for (i = 0; i < l; i++)
             as_vector_i64(res)[i] = -as_vector_i64(x)[i];
         return res;
-    case MTYPE(TYPE_vector_f64):
+    case MTYPE(TYPE_F64):
         l = x->len;
         res = vector_f64(l);
         for (i = 0; i < l; i++)
@@ -605,7 +605,7 @@ obj_t rf_fread(obj_t x)
         {
             fmsg = str_fmt(0, "file: '%s' does not exist", as_string(x));
             err = error(ERR_NOT_EXIST, fmsg);
-            alloc_free(fmsg);
+            heap_free(fmsg);
             err->id = x->id;
             return err;
         }
@@ -618,7 +618,7 @@ obj_t rf_fread(obj_t x)
         {
             fmsg = str_fmt(0, "file: '%s' read error", as_string(x));
             err = error(ERR_IO, fmsg);
-            alloc_free(fmsg);
+            heap_free(fmsg);
             close(fd);
             err->id = x->id;
             return err;

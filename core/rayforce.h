@@ -33,8 +33,8 @@ extern "C"
 // Type constants
 #define TYPE_LIST 0
 #define TYPE_BOOL 1
-#define TYPE_vector_i64 2
-#define TYPE_vector_f64 3
+#define TYPE_I64 2
+#define TYPE_F64 3
 #define TYPE_SYMBOL 4
 #define TYPE_TIMESTAMP 5
 #define TYPE_GUID 6
@@ -56,7 +56,7 @@ extern "C"
 #define ERR_TYPE 4
 #define ERR_LENGTH 5
 #define ERR_INDEX 6
-#define ERR_ALLOC 7
+#define ERR_HEAP 7
 #define ERR_IO 8
 #define ERR_NOT_FOUND 9
 #define ERR_NOT_EXIST 10

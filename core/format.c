@@ -26,7 +26,7 @@
 #include <stdarg.h>
 #include "format.h"
 #include "rayforce.h"
-#include "alloc.h"
+#include "heap.h"
 #include "util.h"
 #include "dict.h"
 #include "debuginfo.h"
@@ -66,11 +66,11 @@ i32_t str_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, str_t fmt
     if (*len <= (size + *offset))
     {
         *len += size + 1;
-        s = alloc_realloc(*dst, *len);
+        s = heap_realloc(*dst, *len);
 
         if (s == NULL)
         {
-            alloc_free(*dst);
+            heap_free(*dst);
             panic("str_fmt_into: OOM");
         }
 
@@ -89,7 +89,7 @@ i32_t str_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, str_t fmt
         if (n < 0)
         {
             if (*dst != NULL)
-                alloc_free(*dst);
+                heap_free(*dst);
 
             panic("str_fmt_into: OOM");
         }
@@ -104,11 +104,11 @@ i32_t str_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, str_t fmt
         }
 
         size = n + 1;
-        s = alloc_realloc(*dst, size);
+        s = heap_realloc(*dst, size);
 
         if (s == NULL)
         {
-            alloc_free(*dst);
+            heap_free(*dst);
             panic("str_fmt_into: OOM");
         }
 
@@ -123,7 +123,7 @@ i32_t str_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, str_t fmt
 str_t str_fmt(i32_t limit, str_t fmt, ...)
 {
     i32_t n = 0, size = limit > 0 ? limit : MAX_ROW_WIDTH;
-    str_t p = alloc_malloc(size), s;
+    str_t p = heap_malloc(size), s;
 
     while (1)
     {
@@ -134,7 +134,7 @@ str_t str_fmt(i32_t limit, str_t fmt, ...)
 
         if (n < 0)
         {
-            alloc_free(p);
+            heap_free(p);
             panic("str_fmt_into: OOM");
         }
 
@@ -145,11 +145,11 @@ str_t str_fmt(i32_t limit, str_t fmt, ...)
             return p;
 
         size = n + 1;
-        s = alloc_realloc(p, size);
+        s = heap_realloc(p, size);
 
         if (s == NULL)
         {
-            alloc_free(p);
+            heap_free(p);
             panic("str_fmt_into: OOM");
         }
 
@@ -421,7 +421,7 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, obj_t 
             n = n - strlen(s);
             str_fmt_into(dst, len, offset, 0, " %s%*.*s|", s, n, n, PADDING);
             // Free formatted column
-            alloc_free(s);
+            heap_free(s);
         }
     }
 
@@ -467,9 +467,9 @@ i32_t obj_t_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t 
     {
     case -TYPE_BOOL:
         return bool_fmt_into(dst, len, offset, limit, obj->bool);
-    case -TYPE_vector_i64:
+    case -TYPE_I64:
         return i64_fmt_into(dst, len, offset, limit, obj->i64);
-    case -TYPE_vector_f64:
+    case -TYPE_F64:
         return f64_fmt_into(dst, len, offset, limit, obj->f64);
     case -TYPE_SYMBOL:
         return symbol_fmt_into(dst, len, offset, limit, obj->i64);
@@ -481,9 +481,9 @@ i32_t obj_t_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t 
         return str_fmt_into(dst, len, offset, limit, "'%c'", obj->schar ? obj->schar : 1);
     case TYPE_BOOL:
         return vector_fmt_into(dst, len, offset, limit, obj);
-    case TYPE_vector_i64:
+    case TYPE_I64:
         return vector_fmt_into(dst, len, offset, limit, obj);
-    case TYPE_vector_f64:
+    case TYPE_F64:
         return vector_fmt_into(dst, len, offset, limit, obj);
     case TYPE_SYMBOL:
         return vector_fmt_into(dst, len, offset, limit, obj);
@@ -560,7 +560,7 @@ str_t obj_t_fmt_n(obj_t x, u32_t n)
         if (!end)
         {
             if (s)
-                alloc_free(s);
+                heap_free(s);
 
             return NULL;
         }
@@ -577,7 +577,7 @@ str_t obj_t_fmt_n(obj_t x, u32_t n)
     if (sz > 0 && memchr(start, '%', sz))
     {
         if (s)
-            alloc_free(s);
+            heap_free(s);
 
         return NULL;
     }
@@ -617,7 +617,7 @@ nil_t print_error(obj_t error, str_t filename, str_t source, u32_t len)
     case ERR_INDEX:
         error_desc = "index";
         break;
-    case ERR_ALLOC:
+    case ERR_HEAP:
         error_desc = "alloc";
         break;
     case ERR_IO:

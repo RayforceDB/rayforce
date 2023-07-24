@@ -51,7 +51,7 @@ obj_t rf_env()
 obj_t rf_memstat()
 {
     // obj_t keys, vals;
-    // memstat_t stat = alloc_memstat();
+    // memstat_t stat = heap_memstat();
 
     // keys = vector_symbol(3);
     // as_vector_symbol(&keys)[0] = symbol("total").i64;
@@ -140,16 +140,16 @@ nil_t init_functions(obj_t functions)
 nil_t init_typenames(obj_t typenames)    
 {
     // regt(typenames,   -TYPE_BOOL,       "bool");
-    // regt(typenames,   -TYPE_vector_i64,        "i64");
-    // regt(typenames,   -TYPE_vector_f64,        "f64");
+    // regt(typenames,   -TYPE_I64,        "i64");
+    // regt(typenames,   -TYPE_F64,        "f64");
     // regt(typenames,   -TYPE_CHAR,       "char");
     // regt(typenames,   -TYPE_SYMBOL,     "symbol");
     // regt(typenames,   -TYPE_TIMESTAMP,  "timestamp");
     // regt(typenames,   -TYPE_GUID,       "guid");
     // regt(typenames,    TYPE_NULL,       "null");
     // regt(typenames,    TYPE_BOOL,       "vector_bool");
-    // regt(typenames,    TYPE_vector_i64,        "vector_i64");
-    // regt(typenames,    TYPE_vector_f64,        "vector_f64");
+    // regt(typenames,    TYPE_I64,        "vector_i64");
+    // regt(typenames,    TYPE_F64,        "vector_f64");
     // regt(typenames,    TYPE_CHAR,       "Char");
     // regt(typenames,    TYPE_SYMBOL,     "vector_symbol");
     // regt(typenames,    TYPE_TIMESTAMP,  "vector_timestamp");

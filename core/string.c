@@ -24,7 +24,7 @@
 #include <string.h>
 #include "string.h"
 #include "rayforce.h"
-#include "alloc.h"
+#include "heap.h"
 #include "util.h"
 
 /*

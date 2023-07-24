@@ -25,7 +25,7 @@
 #include <stdatomic.h>
 #include "rayforce.h"
 #include "format.h"
-#include "alloc.h"
+#include "heap.h"
 #include "string.h"
 #include "vector.h"
 #include "dict.h"
@@ -37,7 +37,7 @@ CASSERT(sizeof(struct obj_t) == 32, rayforce_h)
 
 obj_t atom(type_t type)
 {
-    obj_t a = (obj_t)alloc_malloc(sizeof(struct obj_t));
+    obj_t a = (obj_t)heap_malloc(sizeof(struct obj_t));
 
     a->type = -type;
     a->rc = 1;
@@ -48,11 +48,11 @@ obj_t atom(type_t type)
 obj_t list(i64_t len, ...)
 {
     i32_t i;
-    obj_t l = (obj_t)alloc_malloc(sizeof(struct obj_t));
+    obj_t l = (obj_t)heap_malloc(sizeof(struct obj_t));
 
     l->type = TYPE_LIST;
     l->rc = 1;
-    l->ptr = alloc_malloc(sizeof(obj_t) * len);
+    l->ptr = heap_malloc(sizeof(obj_t) * len);
 
     va_list args;
     va_start(args, len);
@@ -67,7 +67,7 @@ obj_t list(i64_t len, ...)
 
 obj_t error(i8_t code, str_t message)
 {
-    obj_t err = alloc_malloc(sizeof(struct obj_t));
+    obj_t err = heap_malloc(sizeof(struct obj_t));
 
     err->type = TYPE_ERROR;
     err->len = strlen(message);
@@ -90,14 +90,14 @@ obj_t bool(bool_t val)
 
 obj_t i64(i64_t val)
 {
-    obj_t i = atom(TYPE_vector_i64);
+    obj_t i = atom(TYPE_I64);
     i->i64 = val;
     return i;
 }
 
 obj_t f64(f64_t val)
 {
-    obj_t f = atom(TYPE_vector_f64);
+    obj_t f = atom(TYPE_F64);
     f->f64 = val;
     return f;
 }
@@ -125,7 +125,7 @@ obj_t guid(u8_t data[])
     // if (data == NULL)
     //     return guid;
 
-    // guid_t *g = (guid_t *)alloc_malloc(sizeof(struct guid_t));
+    // guid_t *g = (guid_t *)heap_malloc(sizeof(struct guid_t));
     // memcpy(g->data, data, sizeof(guid_t));
 
     // guid.guid = g;
@@ -175,10 +175,10 @@ obj_t dict(obj_t keys, obj_t vals)
 
 bool_t is_null(obj_t obj)
 {
-    return (obj->type == TYPE_LIST && obj->ptr == NULL) ||
-           (obj->type == -TYPE_vector_i64 && obj->i64 == NULL_vector_i64) ||
+    return (obj == NULL) ||
+           (obj->type == -TYPE_I64 && obj->i64 == NULL_vector_i64) ||
            (obj->type == -TYPE_SYMBOL && obj->i64 == NULL_vector_i64) ||
-           (obj->type == -TYPE_vector_f64 && obj->f64 == NULL_vector_f64) ||
+           (obj->type == -TYPE_F64 && obj->f64 == NULL_vector_f64) ||
            (obj->type == -TYPE_TIMESTAMP && obj->i64 == NULL_vector_i64) ||
            (obj->type == -TYPE_CHAR && obj->schar == '\0');
 }
@@ -193,11 +193,11 @@ bool_t obj_t_eq(obj_t a, obj_t b)
     if (a->type != b->type)
         return 0;
 
-    if (a->type == -TYPE_vector_i64 || a->type == -TYPE_SYMBOL || a->type == TYPE_UNARY || a->type == TYPE_BINARY || a->type == TYPE_VARY)
+    if (a->type == -TYPE_I64 || a->type == -TYPE_SYMBOL || a->type == TYPE_UNARY || a->type == TYPE_BINARY || a->type == TYPE_VARY)
         return a->i64 == b->i64;
-    else if (a->type == -TYPE_vector_f64)
+    else if (a->type == -TYPE_F64)
         return a->f64 == b->f64;
-    else if (a->type == TYPE_vector_i64 || a->type == TYPE_SYMBOL)
+    else if (a->type == TYPE_I64 || a->type == TYPE_SYMBOL)
     {
         if (as_vector_i64(a) == as_vector_i64(b))
             return true;
@@ -212,7 +212,7 @@ bool_t obj_t_eq(obj_t a, obj_t b)
         }
         return 1;
     }
-    else if (a->type == TYPE_vector_f64)
+    else if (a->type == TYPE_F64)
     {
         if (as_vector_f64(a) == as_vector_f64(b))
             return 1;
@@ -236,6 +236,9 @@ bool_t obj_t_eq(obj_t a, obj_t b)
  */
 obj_t __attribute__((hot)) clone(obj_t obj)
 {
+    if (obj == NULL)
+        return NULL;
+
     i64_t i, l;
     u16_t slaves = runtime_get()->slaves;
 
@@ -247,8 +250,8 @@ obj_t __attribute__((hot)) clone(obj_t obj)
     switch (obj->type)
     {
     case TYPE_BOOL:
-    case TYPE_vector_i64:
-    case TYPE_vector_f64:
+    case TYPE_I64:
+    case TYPE_F64:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
     case TYPE_CHAR:
@@ -277,6 +280,9 @@ obj_t __attribute__((hot)) clone(obj_t obj)
  */
 nil_t __attribute__((hot)) drop(obj_t obj)
 {
+    if (obj == NULL)
+        return;
+
     i64_t i, rc, l;
     u16_t slaves = runtime_get()->slaves;
 
@@ -291,42 +297,42 @@ nil_t __attribute__((hot)) drop(obj_t obj)
     switch (obj->type)
     {
     case TYPE_BOOL:
-    case TYPE_vector_i64:
-    case TYPE_vector_f64:
+    case TYPE_I64:
+    case TYPE_F64:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
     case TYPE_CHAR:
         if (rc == 0)
-            alloc_free(obj->ptr);
+            heap_free(obj->ptr);
         return;
     case TYPE_LIST:
         l = obj->len;
         for (i = 0; i < l; i++)
             drop(as_list(obj)[i]);
         if (rc == 0)
-            alloc_free(obj->ptr);
+            heap_free(obj->ptr);
         return;
     case TYPE_TABLE:
     case TYPE_DICT:
-        drop(&as_list(obj)[0]);
-        drop(&as_list(obj)[1]);
+        drop(as_list(obj)[0]);
+        drop(as_list(obj)[1]);
         if (rc == 0)
-            alloc_free(obj->ptr);
+            heap_free(obj->ptr);
         return;
     case TYPE_LAMBDA:
         if (rc == 0)
         {
-            drop(&as_lambda(obj)->constants);
-            drop(&as_lambda(obj)->args);
-            drop(&as_lambda(obj)->locals);
-            drop(&as_lambda(obj)->code);
+            drop(as_lambda(obj)->constants);
+            drop(as_lambda(obj)->args);
+            drop(as_lambda(obj)->locals);
+            drop(as_lambda(obj)->code);
             debuginfo_free(&as_lambda(obj)->debuginfo);
-            alloc_free(obj->ptr);
+            heap_free(obj->ptr);
         }
         return;
     case TYPE_ERROR:
         if (rc == 0)
-            alloc_free(obj->ptr);
+            heap_free(obj->ptr);
         return;
     default:
         panic(str_fmt(0, "free: invalid type: %d", obj->type));
@@ -354,12 +360,12 @@ obj_t cow(obj_t obj)
     //     new.adt->attrs = obj->attrs;
     //     memcpy(as_vector_bool(&new), as_vector_bool(obj), obj->len);
     //     return new;
-    // case TYPE_vector_i64:
+    // case TYPE_I64:
     //     new = vector_i64(obj->len);
     //     new.adt->attrs = obj->attrs;
     //     memcpy(as_vector_i64(&new), as_vector_i64(obj), obj->len * sizeof(i64_t));
     //     return new;
-    // case TYPE_vector_f64:
+    // case TYPE_F64:
     //     new = vector_f64(obj->len);
     //     new.adt->attrs = obj->attrs;
     //     memcpy(as_vector_f64(&new), as_vector_f64(obj), obj->len * sizeof(f64_t));

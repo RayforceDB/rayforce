@@ -48,9 +48,9 @@ bool_t rfi_eq(obj_t x, obj_t y)
     {
     case -TYPE_BOOL:
         return x->bool == y->bool;
-    case -TYPE_vector_i64:
+    case -TYPE_I64:
         return x->i64 == y->i64;
-    case -TYPE_vector_f64:
+    case -TYPE_F64:
         return x->f64 == y->f64;
     case TYPE_CHAR:
         return strcmp(as_string(x), as_string(y)) == 0;
@@ -68,9 +68,9 @@ bool_t rfi_lt(obj_t x, obj_t y)
     {
     case -TYPE_BOOL:
         return x->bool - y->bool;
-    case -TYPE_vector_i64:
+    case -TYPE_I64:
         return x->i64 < y->i64;
-    case -TYPE_vector_f64:
+    case -TYPE_F64:
         return x->f64 < y->f64;
     case TYPE_CHAR:
         return strcmp(as_string(x), as_string(y)) < 0;
@@ -137,15 +137,15 @@ bool_t rfi_as_vector_bool(obj_t x)
     {
     case -TYPE_BOOL:
         return x->bool;
-    case -TYPE_vector_i64:
+    case -TYPE_I64:
         return x->i64 != 0;
-    case -TYPE_vector_f64:
+    case -TYPE_F64:
         return x->f64 != 0.0;
     case -TYPE_CHAR:
         return x->schar != 0;
     case TYPE_BOOL:
-    case TYPE_vector_i64:
-    case TYPE_vector_f64:
+    case TYPE_I64:
+    case TYPE_F64:
     case TYPE_CHAR:
     case TYPE_LIST:
         if (x->ptr == NULL)

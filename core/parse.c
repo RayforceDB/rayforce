@@ -27,7 +27,7 @@
 #include <limits.h>
 #include "parse.h"
 #include "rayforce.h"
-#include "alloc.h"
+#include "heap.h"
 #include "format.h"
 #include "string.h"
 #include "vector.h"
@@ -502,11 +502,11 @@ obj_t parse_vector(parser_t *parser)
             vec->type = TYPE_BOOL;
             vector_push(vec, token);
         }
-        else if (token->type == -TYPE_vector_i64)
+        else if (token->type == -TYPE_I64)
         {
-            if (vec->type == TYPE_vector_i64)
+            if (vec->type == TYPE_I64)
                 vector_push(vec, token);
-            else if (vec->type == TYPE_vector_f64)
+            else if (vec->type == TYPE_F64)
                 vector_push(vec, f64((f64_t)token->i64));
             else
             {
@@ -517,13 +517,13 @@ obj_t parse_vector(parser_t *parser)
                 return err;
             }
         }
-        else if (token->type == -TYPE_vector_f64)
+        else if (token->type == -TYPE_F64)
         {
-            if (vec->type == TYPE_vector_f64)
+            if (vec->type == TYPE_F64)
                 vector_push(vec, token);
-            else if (vec->type == TYPE_vector_i64)
+            else if (vec->type == TYPE_I64)
             {
-                vec->type = TYPE_vector_f64;
+                vec->type = TYPE_F64;
                 for (i = 0; i < (i32_t)vec->len; i++)
                     as_vector_f64(vec)[i] = (f64_t)as_vector_i64(vec)[i];
 
@@ -619,7 +619,7 @@ obj_t parse_list(parser_t *parser)
             drop(token);
             msg = str_fmt(0, "There is no opening found for: '%c'", token->i64);
             err = error(ERR_PARSE, msg);
-            alloc_free(msg);
+            heap_free(msg);
             err->id = token->id;
             return err;
         }
@@ -799,7 +799,7 @@ obj_t advance(parser_t *parser)
 
     msg = str_fmt(0, "Unexpected token: '%c'", *parser->current);
     err = error(ERR_PARSE, msg);
-    alloc_free(msg);
+    heap_free(msg);
     err->id = span_commit(parser, span_start(parser));
     return err;
 }
@@ -824,7 +824,7 @@ obj_t parse_program(parser_t *parser)
             drop(lst);
             msg = str_fmt(0, "Unexpected token: '%c'", token->i64);
             err = error(ERR_PARSE, msg);
-            alloc_free(msg);
+            heap_free(msg);
             err->id = token->id;
             return err;
         }

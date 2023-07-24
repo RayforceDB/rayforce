@@ -39,7 +39,7 @@
 #include "../core/cc.h"
 #include "../core/debuginfo.h"
 #include "../core/dict.h"
-#include "../core/alloc.h"
+#include "../core/heap.h"
 
 #define LINE_SIZE 2048
 #define PROMPT "> "
@@ -61,7 +61,7 @@ nil_t print_logo()
 {
     str_t logo = str_fmt(0, LOGO, VERSION);
     printf("%s%s%s", DARK_CYAN, logo, RESET);
-    alloc_free(logo);
+    heap_free(logo);
 }
 
 obj_t parse_cmdline(i32_t argc, str_t argv[])
@@ -79,11 +79,11 @@ obj_t parse_cmdline(i32_t argc, str_t argv[])
             if (argv[opt] == NULL)
                 usage();
 
-            vector_push(keys, symbol("file"));
+            join_sym(&keys, symbol("file"));
             len = strlen(argv[opt]);
             str = string(len);
             strncpy(as_string(str), argv[opt], len);
-            vector_push(vals, str);
+            join_obj(&vals, str);
             break;
         default:
             usage();
@@ -136,7 +136,7 @@ nil_t repl(str_t name, parser_t *parser, str_t buf, i32_t len)
         if (formatted != NULL)
         {
             printf("%s\n", formatted);
-            alloc_free(formatted);
+            heap_free(formatted);
         }
     }
 
@@ -186,10 +186,9 @@ i32_t main(i32_t argc, str_t argv[])
             repl(as_string(filename), &parser, as_string(file), file->len);
 
         drop(file);
+        drop(filename);
     }
     // --
-
-    drop(filename);
 
     while (running)
     {

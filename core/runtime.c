@@ -23,7 +23,7 @@
 
 #include "runtime.h"
 #include "mmap.h"
-#include "alloc.h"
+#include "heap.h"
 #include "util.h"
 #include "cc.h"
 
@@ -32,7 +32,7 @@ runtime_t _RUNTIME = NULL;
 
 nil_t runtime_init(u16_t slaves)
 {
-    alloc_init();
+    heap_init();
 
     _RUNTIME = mmap_malloc(ALIGNUP(sizeof(struct runtime_t), PAGE_SIZE));
 
@@ -49,7 +49,7 @@ nil_t runtime_cleanup()
     free_env(&_RUNTIME->env);
     vm_free(&_RUNTIME->vm);
     mmap_free(_RUNTIME, ALIGNUP(sizeof(struct runtime_t), PAGE_SIZE));
-    alloc_cleanup();
+    heap_cleanup();
 }
 
 runtime_t runtime_get()

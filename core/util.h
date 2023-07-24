@@ -55,7 +55,7 @@
     {                                  \
         str_t _f = obj_t_fmt((o)); \
         debug("%s", _f);               \
-        alloc_free(_f);                   \
+        heap_free(_f);                   \
     }
 
 #else

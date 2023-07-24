@@ -25,7 +25,7 @@
 #define RUNTIME_H
 
 #include "rayforce.h"
-#include "alloc.h"
+#include "heap.h"
 #include "env.h"
 #include "vm.h"
 

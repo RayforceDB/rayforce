@@ -25,7 +25,7 @@
 #define ENV_H
 
 #include "rayforce.h"
-#include "alloc.h"
+#include "heap.h"
 #include "vm.h"
 #include "vector.h"
 

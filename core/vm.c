@@ -26,7 +26,7 @@
 #include "lambda.h"
 #include "vm.h"
 #include "rayforce.h"
-#include "alloc.h"
+#include "heap.h"
 #include "format.h"
 #include "util.h"
 #include "string.h"
@@ -514,7 +514,7 @@ str_t vm_code_fmt(obj_t fun)
         case OP_TRACE:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] trace\n", c++, ip++);
             break;
-        case OP_ALLOC:
+        case OP_HEAP:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] alloc\n", c++, ip++);
             break;
         case OP_MAP:

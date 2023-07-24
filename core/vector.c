@@ -36,9 +36,9 @@ i64_t size_of_val(type_t type)
     {
     case TYPE_BOOL:
         return sizeof(bool_t);
-    case TYPE_vector_i64:
+    case TYPE_I64:
         return sizeof(i64_t);
-    case TYPE_vector_f64:
+    case TYPE_F64:
         return sizeof(f64_t);
     case TYPE_SYMBOL:
         return sizeof(i64_t);
@@ -61,12 +61,12 @@ i64_t size_of_val(type_t type)
 obj_t vector(type_t type, i64_t len)
 {
     i64_t size = capacity(len * size_of_val(type));
-    obj_t vec = alloc_malloc(sizeof(struct obj_t));
+    obj_t vec = heap_malloc(sizeof(struct obj_t));
 
     vec->type = type;
     vec->rc = 1;
     vec->len = len;
-    vec->ptr = alloc_malloc(size);
+    vec->ptr = heap_malloc(size);
 
     return vec;
 }
@@ -78,10 +78,10 @@ obj_t _push(obj_t vec, obj_t value)
     case TYPE_BOOL:
         push(vec, bool_t, value->bool);
         return null();
-    case TYPE_vector_i64:
+    case TYPE_I64:
         push(vec, i64_t, value->i64);
         return null();
-    case TYPE_vector_f64:
+    case TYPE_F64:
         push(vec, f64_t, value->f64);
         return null();
     case TYPE_SYMBOL:
@@ -162,9 +162,9 @@ obj_t vector_pop(obj_t vec)
     {
     case TYPE_BOOL:
         return bool(pop(vec, bool_t));
-    case TYPE_vector_i64:
+    case TYPE_I64:
         return i64(pop(vec, i64_t));
-    case TYPE_vector_f64:
+    case TYPE_F64:
         return f64(pop(vec, f64_t));
     case TYPE_SYMBOL:
         return symboli64(pop(vec, i64_t));
@@ -191,10 +191,10 @@ nil_t vector_reserve(obj_t vec, u32_t len)
     case TYPE_BOOL:
         reserve(vec, bool_t, len);
         return;
-    case TYPE_vector_i64:
+    case TYPE_I64:
         reserve(vec, i64_t, len);
         return;
-    case TYPE_vector_f64:
+    case TYPE_F64:
         reserve(vec, f64_t, len);
         return;
     case TYPE_SYMBOL:
@@ -226,7 +226,7 @@ nil_t vector_grow(obj_t vec, u32_t len)
     // calculate size of vector with new length
     i64_t new_size = capacity(len * size_of_val(vec->type));
 
-    alloc_realloc(vec->ptr, new_size);
+    heap_realloc(vec->ptr, new_size);
     vec->len = len;
 }
 
@@ -240,7 +240,7 @@ nil_t vector_shrink(obj_t vec, u32_t len)
     // calculate size of vector with new length
     i64_t new_size = capacity(len * size_of_val(vec->type));
 
-    alloc_realloc(vec->ptr, new_size);
+    heap_realloc(vec->ptr, new_size);
     vec->len = len;
 }
 
@@ -271,14 +271,14 @@ i64_t vector_find(obj_t vec, obj_t key)
     //         if (vb[i] == kb)
     //             return i;
     //     return l;
-    // case TYPE_vector_i64:
+    // case TYPE_I64:
     //     vi = as_vector_i64(vec);
     //     ki = key->i64;
     //     for (i = 0; i < l; i++)
     //         if (vi[i] == ki)
     //             return i;
     //     return l;
-    // case TYPE_vector_f64:
+    // case TYPE_F64:
     //     vf = as_vector_f64(vec);
     //     kf = key->f64;
     //     for (i = 0; i < l; i++)
@@ -339,11 +339,11 @@ obj_t vector_get(obj_t vec, i64_t index)
     //     if (index < l)
     //         return bool(as_vector_bool(vec)[index]);
     //     return bool(false);
-    // case TYPE_vector_i64:
+    // case TYPE_I64:
     //     if (index < l)
     //         return i64(as_vector_i64(vec)[index]);
     //     return i64(NULL_vector_i64);
-    // case TYPE_vector_f64:
+    // case TYPE_F64:
     //     if (index < l)
     //         return f64(as_vector_f64(vec)[index]);
     //     return f64(NULL_vector_f64);
@@ -408,10 +408,10 @@ obj_t vector_set(obj_t vec, i64_t index, obj_t value)
     // case TYPE_BOOL:
     //     as_vector_bool(vec)[index] = value.bool;
     //     break;
-    // case TYPE_vector_i64:
+    // case TYPE_I64:
     //     as_vector_i64(vec)[index] = value.i64;
     //     break;
-    // case TYPE_vector_f64:
+    // case TYPE_F64:
     //     as_vector_f64(vec)[index] = value.f64;
     //     break;
     // case TYPE_SYMBOL:
@@ -471,10 +471,10 @@ nil_t vector_write(obj_t vec, i64_t index, obj_t value)
     // case TYPE_BOOL:
     //     as_vector_bool(vec)[index] = value.bool;
     //     break;
-    // case TYPE_vector_i64:
+    // case TYPE_I64:
     //     as_vector_i64(vec)[index] = value.i64;
     //     break;
-    // case TYPE_vector_f64:
+    // case TYPE_F64:
     //     as_vector_f64(vec)[index] = value.f64;
     //     break;
     // case TYPE_SYMBOL:
@@ -520,7 +520,7 @@ obj_t vector_filter(obj_t vec, bool_t mask[], i64_t len)
     //     if (len == NULL_vector_i64)
     //         vector_shrink(&res, j);
     //     return res;
-    // case TYPE_vector_i64:
+    // case TYPE_I64:
     //     res = vector_i64(ol);
     //     for (i = 0; (j < ol && i < l); i++)
     //         if (mask[i])
@@ -528,7 +528,7 @@ obj_t vector_filter(obj_t vec, bool_t mask[], i64_t len)
     //     if (len == NULL_vector_i64)
     //         vector_shrink(&res, j);
     //     return res;
-    // case TYPE_vector_f64:
+    // case TYPE_F64:
     //     res = vector_f64(ol);
     //     for (i = 0; (j < ol && i < l); i++)
     //         if (mask[i])
@@ -618,4 +618,24 @@ obj_t rf_enlist(obj_t x, u32_t n)
     }
 
     return l;
+}
+
+obj_t join_raw(obj_t *obj, nil_t *val)
+{
+    return *obj;
+}
+
+obj_t join_obj(obj_t *obj, obj_t val)
+{
+    return null();
+}
+
+obj_t join_sym(obj_t *obj, str_t str)
+{
+    return null();
+}
+
+obj_t join_lst(obj_t *obj, obj_t val)
+{
+    return null();
 }

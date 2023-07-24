@@ -23,17 +23,17 @@
 
 #include <stdio.h>
 #include <assert.h>
-#include "alloc.h"
+#include "heap.h"
 #include "rayforce.h"
 #include "ops.h"
 #include "mmap.h"
 #include "util.h"
 
 // clang-format off
-CASSERT(sizeof(struct node_t     ) ==            16, alloc_h)
-CASSERT(sizeof(struct alloc_t    ) % PAGE_SIZE == 0, alloc_h)
+CASSERT(sizeof(struct node_t     ) ==            16, heap_h)
+CASSERT(sizeof(struct heap_t    ) % PAGE_SIZE == 0,  heap_h)
 
-static alloc_t _ALLOC = NULL;
+static heap_t _HEAP = NULL;
 
 #define AVAIL_MASK       ((u64_t)0xFFFFFFFFFFFFFFFF)
 #define BLOCK_ADDR_MASK  ((u64_t)0x00FFFFFFFFFFFFFF)
@@ -43,17 +43,27 @@ static alloc_t _ALLOC = NULL;
 #define blocksize(i)     (1ull << (i))
 #define buddyof(p, b, i) ((nil_t *)(((u64_t)(p - b) ^ blocksize(i)) + b))
 #define orderof(s)       (64ull - __builtin_clzl(s - 1))
-#define is32block(b)     ((b) >= _ALLOC->blocks32 && (b) < _ALLOC->blocks32 + NUM_32_BLOCKS * 32)
-#define is64block(b)     ((b) >= _ALLOC->blocks64 && (b) < _ALLOC->blocks64 + NUM_64_BLOCKS * 64)
-// clang-format on
+#define is32block(b)     ((b) >= _HEAP->blocks32 && (b) < _HEAP->blocks32 + NUM_32_BLOCKS * 32)
+#define is64block(b)     ((b) >= _HEAP->blocks64 && (b) < _HEAP->blocks64 + NUM_64_BLOCKS * 64)
 
-nil_t print_blocks()
+#ifdef SYS_MALLOC
+
+nil_t *heap_malloc(u64_t size)                  { return malloc(size);           }
+nil_t heap_free(nil_t *block)                   { free(block);                   }
+nil_t *heap_realloc(nil_t *ptr, u64_t new_size) { return realloc(ptr, new_size); }
+i64_t heap_gc()                                 { return 0;                      }
+nil_t heap_mrequest(u64_t size)                 {                                }
+
+#else
+
+// clang-format on
+nil_t heap_print_blocks()
 {
     i32_t i = 0;
     node_t *node;
     for (; i <= MAX_POOL_ORDER; i++)
     {
-        node = _ALLOC->freelist[i];
+        node = _HEAP->freelist[i];
         printf("-- order: %d [", i);
         while (node)
         {
@@ -64,7 +74,7 @@ nil_t print_blocks()
     }
 }
 
-nil_t *alloc_add_pool(u64_t order)
+nil_t *heap_add_pool(u64_t order)
 {
     u64_t size = blocksize(order);
     nil_t *pool = mmap_malloc(size);
@@ -72,52 +82,51 @@ nil_t *alloc_add_pool(u64_t order)
     if (pool == NULL)
         return NULL;
 
+    debug_assert((i64_t)pool % 16 == 0);
+
     node_t *node = (node_t *)pool;
-
-    debug_assert((i64_t)node % 16 == 0);
-
     node->base = (nil_t *)(order << 56 | (u64_t)pool);
     node->size = size;
 
     return (nil_t *)node;
 }
 
-alloc_t alloc_init()
+heap_t heap_init()
 {
     i32_t i;
 
-    _ALLOC = (alloc_t)mmap_malloc(sizeof(struct alloc_t));
-    _ALLOC->avail = 0;
-    _ALLOC->blocks32 = mmap_malloc(NUM_32_BLOCKS * 32);
-    _ALLOC->freelist32 = NULL;
-    _ALLOC->blocks64 = mmap_malloc(NUM_64_BLOCKS * 64);
-    _ALLOC->freelist64 = NULL;
+    _HEAP = (heap_t)mmap_malloc(sizeof(struct heap_t));
+    _HEAP->avail = 0;
+    _HEAP->blocks32 = mmap_malloc(NUM_32_BLOCKS * 32);
+    _HEAP->freelist32 = NULL;
+    _HEAP->blocks64 = mmap_malloc(NUM_64_BLOCKS * 64);
+    _HEAP->freelist64 = NULL;
 
     // fill linked list of 32 bytes blocks
     for (i = NUM_32_BLOCKS - 1; i >= 0; i--)
     {
-        nil_t *block32 = _ALLOC->blocks32 + i * 32;
-        *(nil_t **)block32 = _ALLOC->freelist32;
-        _ALLOC->freelist32 = block32;
+        nil_t *block32 = _HEAP->blocks32 + i * 32;
+        *(nil_t **)block32 = _HEAP->freelist32;
+        _HEAP->freelist32 = block32;
     }
 
     // fill linked list of 64 bytes blocks
     for (i = NUM_64_BLOCKS - 1; i >= 0; i--)
     {
-        nil_t *block64 = _ALLOC->blocks64 + i * 64;
-        *(nil_t **)block64 = _ALLOC->freelist64;
-        _ALLOC->freelist64 = block64;
+        nil_t *block64 = _HEAP->blocks64 + i * 64;
+        *(nil_t **)block64 = _HEAP->freelist64;
+        _HEAP->freelist64 = block64;
     }
 
-    return _ALLOC;
+    return _HEAP;
 }
 
-alloc_t alloc_get()
+heap_t heap_get()
 {
-    return _ALLOC;
+    return _HEAP;
 }
 
-nil_t alloc_cleanup()
+nil_t heap_cleanup()
 {
     i32_t i, order;
     node_t *node, *next;
@@ -125,7 +134,7 @@ nil_t alloc_cleanup()
     // All the nodes remains are pools, so just munmap them
     for (i = 0; i <= MAX_POOL_ORDER; i++)
     {
-        node = _ALLOC->freelist[i];
+        node = _HEAP->freelist[i];
         while (node)
         {
             next = node->next;
@@ -141,12 +150,12 @@ nil_t alloc_cleanup()
         }
     }
 
-    mmap_free(_ALLOC->blocks32, NUM_32_BLOCKS * 32);
-    mmap_free(_ALLOC->blocks64, NUM_64_BLOCKS * 64);
-    mmap_free(_ALLOC, sizeof(struct alloc_t));
+    mmap_free(_HEAP->blocks32, NUM_32_BLOCKS * 32);
+    mmap_free(_HEAP->blocks64, NUM_64_BLOCKS * 64);
+    mmap_free(_HEAP, sizeof(struct heap_t));
 }
 
-memstat_t alloc_memstat()
+memstat_t heap_memstat()
 {
     memstat_t stat = {0};
     i32_t i = 0;
@@ -154,7 +163,7 @@ memstat_t alloc_memstat()
 
     for (; i <= MAX_POOL_ORDER; i++)
     {
-        node = _ALLOC->freelist[i];
+        node = _HEAP->freelist[i];
         while (node)
         {
             stat.total += node->size;
@@ -167,30 +176,7 @@ memstat_t alloc_memstat()
     return stat;
 }
 
-#ifdef SYS_MALLOC
-
-nil_t *alloc_malloc(u64_t size)
-{
-    return malloc(size);
-}
-
-nil_t alloc_free(nil_t *block)
-{
-    free(block);
-}
-
-nil_t *alloc_realloc(nil_t *ptr, u64_t new_size)
-{
-    return realloc(ptr, new_size);
-}
-
-i64_t alloc_gc() { return 0; }
-
-nil_t alloc_mrequest(u64_t size) {}
-
-#else
-
-nil_t *alloc_malloc(u64_t size)
+nil_t *heap_malloc(u64_t size)
 {
     u32_t i, order;
     nil_t *block, *base;
@@ -201,18 +187,18 @@ nil_t *alloc_malloc(u64_t size)
         return NULL;
 
     // block is a 32 bytes block
-    if (size <= 32 && _ALLOC->freelist32)
+    if (size <= 32 && _HEAP->freelist32)
     {
-        block = _ALLOC->freelist32;
-        _ALLOC->freelist32 = *(nil_t **)block;
+        block = _HEAP->freelist32;
+        _HEAP->freelist32 = *(nil_t **)block;
         return block;
     }
 
     // block is a 64 bytes block
-    if (size <= 64 && _ALLOC->freelist64)
+    if (size <= 64 && _HEAP->freelist64)
     {
-        block = _ALLOC->freelist64;
-        _ALLOC->freelist64 = *(nil_t **)block;
+        block = _HEAP->freelist64;
+        _HEAP->freelist64 = *(nil_t **)block;
         return block;
     }
 
@@ -225,7 +211,7 @@ nil_t *alloc_malloc(u64_t size)
         return NULL;
 
     // find least order block that fits
-    i = (AVAIL_MASK << order) & _ALLOC->avail;
+    i = (AVAIL_MASK << order) & _HEAP->avail;
 
     // no free block found for this size, so mmap it directly if it is bigger than pool size or
     // add a new pool and split as well
@@ -233,15 +219,15 @@ nil_t *alloc_malloc(u64_t size)
     {
         if (capacity >= POOL_SIZE)
         {
-            block = alloc_add_pool(order);
+            block = heap_add_pool(order);
             return (nil_t *)((node_t *)block + 1);
         }
 
-        node_t *node = (node_t *)alloc_add_pool(MAX_ORDER);
+        node_t *node = (node_t *)heap_add_pool(MAX_ORDER);
 
         node->next = NULL;
-        _ALLOC->freelist[MAX_ORDER] = node;
-        _ALLOC->avail |= 1 << MAX_ORDER;
+        _HEAP->freelist[MAX_ORDER] = node;
+        _HEAP->avail |= 1 << MAX_ORDER;
 
         i = MAX_ORDER;
     }
@@ -249,28 +235,28 @@ nil_t *alloc_malloc(u64_t size)
         i = __builtin_ctzl(i);
 
     // remove the block out of list
-    block = _ALLOC->freelist[i];
-    _ALLOC->freelist[i] = _ALLOC->freelist[i]->next;
+    block = _HEAP->freelist[i];
+    _HEAP->freelist[i] = _HEAP->freelist[i]->next;
 
-    if (_ALLOC->freelist[i] == NULL)
-        _ALLOC->avail &= ~blocksize(i);
+    if (_HEAP->freelist[i] == NULL)
+        _HEAP->avail &= ~blocksize(i);
 
     // split until i == order
     while ((i--) > order)
     {
         base = ((node_t *)block)->base;
         node = (node_t *)buddyof(block, blockaddr(base), i);
-        node->next = _ALLOC->freelist[i];
+        node->next = _HEAP->freelist[i];
         node->base = base;
-        _ALLOC->freelist[i] = node;
-        _ALLOC->avail |= blocksize(i);
+        _HEAP->freelist[i] = node;
+        _HEAP->avail |= blocksize(i);
     }
 
     ((node_t *)block)->size = capacity;
     return (nil_t *)((node_t *)block + 1);
 }
 
-nil_t alloc_free(nil_t *block)
+nil_t heap_free(nil_t *block)
 {
     nil_t *buddy;
     node_t *node, **n;
@@ -279,8 +265,8 @@ nil_t alloc_free(nil_t *block)
     // block is a 32 bytes block
     if is32block (block)
     {
-        *(nil_t **)block = _ALLOC->freelist32;
-        _ALLOC->freelist32 = block;
+        *(nil_t **)block = _HEAP->freelist32;
+        _HEAP->freelist32 = block;
 
         return;
     }
@@ -288,8 +274,8 @@ nil_t alloc_free(nil_t *block)
     // block is a 64 bytes block
     if is64block (block)
     {
-        *(nil_t **)block = _ALLOC->freelist64;
-        _ALLOC->freelist64 = block;
+        *(nil_t **)block = _HEAP->freelist64;
+        _HEAP->freelist64 = block;
 
         return;
     }
@@ -303,9 +289,9 @@ nil_t alloc_free(nil_t *block)
         // node is the root block, so just insert it into list
         if (order == blockorder(node->base))
         {
-            node->next = _ALLOC->freelist[order];
-            _ALLOC->freelist[order] = node;
-            _ALLOC->avail |= blocksize(order);
+            node->next = _HEAP->freelist[order];
+            _HEAP->freelist[order] = node;
+            _HEAP->avail |= blocksize(order);
 
             return;
         }
@@ -313,7 +299,7 @@ nil_t alloc_free(nil_t *block)
         // calculate buddy
         buddy = buddyof(block, blockaddr(node->base), order);
 
-        n = &_ALLOC->freelist[order];
+        n = &_HEAP->freelist[order];
 
         // then continue to find the buddy of the block in the freelist.
         while ((*n != NULL) && (*n != buddy))
@@ -322,17 +308,17 @@ nil_t alloc_free(nil_t *block)
         // not found, insert into freelist
         if (*n == NULL)
         {
-            node->next = _ALLOC->freelist[order];
-            _ALLOC->freelist[order] = node;
-            _ALLOC->avail |= blocksize(order);
+            node->next = _HEAP->freelist[order];
+            _HEAP->freelist[order] = node;
+            _HEAP->avail |= blocksize(order);
 
             return;
         }
 
         // remove buddy out of list
         *n = (*n)->next;
-        if (_ALLOC->freelist[order] == NULL)
-            _ALLOC->avail &= ~blocksize(order);
+        if (_HEAP->freelist[order] == NULL)
+            _HEAP->avail &= ~blocksize(order);
 
         // check if buddy is lower address than block (means it is of higher order), if so, swap them
         block = (buddy > block) ? block : buddy;
@@ -340,18 +326,18 @@ nil_t alloc_free(nil_t *block)
     }
 }
 
-nil_t *alloc_realloc(nil_t *block, u64_t new_size)
+nil_t *heap_realloc(nil_t *block, u64_t new_size)
 {
     node_t *node, *buddy;
     u64_t i, capacity, size, order;
     nil_t *new_block, *base;
 
     if (block == NULL)
-        return alloc_malloc(new_size);
+        return heap_malloc(new_size);
 
     if (new_size == 0)
     {
-        alloc_free(block);
+        heap_free(block);
         return NULL;
     }
 
@@ -361,12 +347,12 @@ nil_t *alloc_realloc(nil_t *block, u64_t new_size)
         if (new_size <= 32)
             return block;
 
-        new_block = alloc_malloc(new_size);
+        new_block = heap_malloc(new_size);
         if (new_block)
             memcpy(new_block, block, 32);
 
-        *(nil_t **)block = _ALLOC->freelist32;
-        _ALLOC->freelist32 = block;
+        *(nil_t **)block = _HEAP->freelist32;
+        _HEAP->freelist32 = block;
 
         return new_block;
     }
@@ -377,12 +363,12 @@ nil_t *alloc_realloc(nil_t *block, u64_t new_size)
         if (new_size <= 64)
             return block;
 
-        new_block = alloc_malloc(new_size);
+        new_block = heap_malloc(new_size);
         if (new_block)
             memcpy(new_block, block, 64);
 
-        *(nil_t **)block = _ALLOC->freelist64;
-        _ALLOC->freelist64 = block;
+        *(nil_t **)block = _HEAP->freelist64;
+        _HEAP->freelist64 = block;
 
         return new_block;
     }
@@ -397,12 +383,12 @@ nil_t *alloc_realloc(nil_t *block, u64_t new_size)
     // grow
     if (new_size > size)
     {
-        new_block = alloc_malloc(new_size);
+        new_block = heap_malloc(new_size);
 
         if (new_block)
             memcpy(new_block, block, size);
 
-        alloc_free(block);
+        heap_free(block);
 
         return new_block;
     }
@@ -418,16 +404,16 @@ nil_t *alloc_realloc(nil_t *block, u64_t new_size)
         base = (node_t *)node->base;
         node->size = size;
         buddy = (node_t *)buddyof((nil_t *)node, blockaddr(base), i);
-        buddy->next = _ALLOC->freelist[i];
+        buddy->next = _HEAP->freelist[i];
         buddy->base = base;
-        _ALLOC->freelist[i] = buddy;
-        _ALLOC->avail |= size;
+        _HEAP->freelist[i] = buddy;
+        _HEAP->avail |= size;
     }
 
     return block;
 }
 
-i64_t alloc_gc()
+i64_t heap_gc()
 {
     i64_t i, order, total = 0;
     node_t *node, *prev, *next;
@@ -435,7 +421,7 @@ i64_t alloc_gc()
     for (i = 0; i <= MAX_POOL_ORDER; i++)
     {
         prev = NULL;
-        node = _ALLOC->freelist[i];
+        node = _HEAP->freelist[i];
         while (node)
         {
             next = node->next;
@@ -445,13 +431,13 @@ i64_t alloc_gc()
                 if (prev != NULL)
                     prev->next = next;
                 else
-                    _ALLOC->freelist[i] = next;
+                    _HEAP->freelist[i] = next;
 
                 mmap_free(node, blocksize(order));
                 total += blocksize(order);
 
-                if (_ALLOC->freelist[i] == NULL)
-                    _ALLOC->avail &= ~blocksize(order);
+                if (_HEAP->freelist[i] == NULL)
+                    _HEAP->avail &= ~blocksize(order);
 
                 // As node is now freed, move onto the next node.
                 node = next;
@@ -467,7 +453,7 @@ i64_t alloc_gc()
     return total;
 }
 
-nil_t alloc_mrequest(u64_t size)
+nil_t heap_mrequest(u64_t size)
 {
     u32_t order;
     node_t *node;
@@ -484,18 +470,18 @@ nil_t alloc_mrequest(u64_t size)
     if (order > MAX_POOL_ORDER)
         return;
 
-    if (_ALLOC->avail & (AVAIL_MASK << order))
+    if (_HEAP->avail & (AVAIL_MASK << order))
         return;
 
     // add a new pool of requested size
-    node = (node_t *)alloc_add_pool(order);
+    node = (node_t *)heap_add_pool(order);
 
     if (node == NULL)
         return;
 
     node->next = NULL;
-    _ALLOC->freelist[order] = node;
-    _ALLOC->avail |= 1 << order;
+    _HEAP->freelist[order] = node;
+    _HEAP->avail |= 1 << order;
 }
 
 #endif

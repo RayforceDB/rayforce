@@ -29,12 +29,14 @@
 
 obj_t dict_get(obj_t dict, obj_t key)
 {
-    obj_t keys = as_list(dict)[0], vals = as_list(dict)[1];
-    i64_t i;
+    // obj_t keys = as_list(dict)[0], vals = as_list(dict)[1];
+    // i64_t i;
 
-    i = vector_find(keys, key);
+    // i = vector_find(keys, key);
 
-    return vector_get(vals, i);
+    // return vector_get(vals, i);
+
+    return null();
 }
 
 obj_t dict_set(obj_t dict, obj_t key, obj_t val)

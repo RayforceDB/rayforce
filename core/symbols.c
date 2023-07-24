@@ -28,7 +28,7 @@
 #include <stdint.h>
 #include "symbols.h"
 #include "rayforce.h"
-#include "alloc.h"
+#include "heap.h"
 #include "util.h"
 #include "runtime.h"
 
