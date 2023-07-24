@@ -54,7 +54,7 @@ obj_t rf_call_vary(u8_t flags, vary_t f, obj_t *x, i64_t n)
     }
 }
 
-obj_trf_gc(obj_t *x, i64_t n)
+obj_t rf_gc(obj_t *x, i64_t n)
 {
     UNUSED(x);
     UNUSED(n);
@@ -63,7 +63,7 @@ obj_trf_gc(obj_t *x, i64_t n)
 
 obj_t rf_format(obj_t *x, i64_t n)
 {
-    str_t s = obj_t_fmt_n(x, n);
+    str_t s = obj_fmt_n(x, n);
     obj_t ret;
 
     if (!s)
@@ -77,7 +77,7 @@ obj_t rf_format(obj_t *x, i64_t n)
 
 obj_t rf_print(obj_t *x, i64_t n)
 {
-    str_t s = obj_t_fmt_n(x, n);
+    str_t s = obj_fmt_n(x, n);
 
     if (!s)
         return error(ERR_TYPE, "malformed format string");
@@ -90,7 +90,7 @@ obj_t rf_print(obj_t *x, i64_t n)
 
 obj_t rf_println(obj_t *x, i64_t n)
 {
-    str_t s = obj_t_fmt_n(x, n);
+    str_t s = obj_fmt_n(x, n);
 
     if (!s)
         return error(ERR_TYPE, "malformed format string");

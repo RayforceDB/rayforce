@@ -41,18 +41,18 @@ obj_t dict_get(obj_t dict, obj_t key)
 
 obj_t dict_set(obj_t dict, obj_t key, obj_t val)
 {
-    obj_t keys = as_list(dict)[0];
-    obj_t vals = as_list(dict)[1];
-    i64_t index = vector_find(keys, key);
+    // obj_t keys = as_list(dict)[0];
+    // obj_t vals = as_list(dict)[1];
+    // i64_t index = vector_find(keys, key);
 
-    if (index == (i64_t)keys->len)
-    {
-        vector_push(keys, clone(key));
-        vector_push(vals, clone(val));
-        return val;
-    }
+    // if (index == (i64_t)keys->len)
+    // {
+    //     vector_push(keys, clone(key));
+    //     vector_push(vals, clone(val));
+    //     return val;
+    // }
 
-    vector_set(vals, index, clone(val));
+    // vector_set(vals, index, clone(val));
 
     return val;
 }

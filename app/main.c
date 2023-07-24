@@ -79,11 +79,11 @@ obj_t parse_cmdline(i32_t argc, str_t argv[])
             if (argv[opt] == NULL)
                 usage();
 
-            join_sym(&keys, symbol("file"));
+            join_sym(&keys, "file");
             len = strlen(argv[opt]);
             str = string(len);
             strncpy(as_string(str), argv[opt], len);
-            join_obj(&vals, str);
+            join_obj(vals, str);
             break;
         default:
             usage();
@@ -101,7 +101,8 @@ nil_t repl(str_t name, parser_t *parser, str_t buf, i32_t len)
     str_t formatted = NULL;
 
     parsed = parse(parser, name, buf);
-    printf("%s\n", obj_t_fmt(parsed));
+    printf("%s\n", obj_fmt(parsed));
+    drop(parsed);
     return;
 
     if (is_error(parsed))
@@ -132,7 +133,7 @@ nil_t repl(str_t name, parser_t *parser, str_t buf, i32_t len)
         print_error(executed, name, buf, len);
     else if (!is_null(executed))
     {
-        formatted = obj_t_fmt(executed);
+        formatted = obj_fmt(executed);
         if (formatted != NULL)
         {
             printf("%s\n", formatted);

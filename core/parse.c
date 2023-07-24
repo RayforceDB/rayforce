@@ -143,7 +143,7 @@ obj_t parse_timestamp(parser_t *parser)
         if (*(current + 1) == 't')
         {
             shift(parser, 2);
-            res = timestamp(NULL_vector_i64);
+            res = timestamp(NULL_I64);
             res->id = span_commit(parser, span);
             return res;
         }
@@ -285,7 +285,7 @@ obj_t parse_number(parser_t *parser)
         if (*(parser->current + 1) == 'i')
         {
             shift(parser, 2);
-            num = i64(NULL_vector_i64);
+            num = i64(NULL_I64);
             num->id = span_commit(parser, span);
             return num;
         }
@@ -293,7 +293,7 @@ obj_t parse_number(parser_t *parser)
         if (*(parser->current + 1) == 'f')
         {
             shift(parser, 2);
-            num = f64(NULL_vector_f64);
+            num = f64(NULL_F64);
             num->id = span_commit(parser, span);
             return num;
         }
@@ -301,7 +301,7 @@ obj_t parse_number(parser_t *parser)
         if (*(parser->current + 1) == 't')
         {
             shift(parser, 2);
-            num = timestamp(NULL_vector_i64);
+            num = timestamp(NULL_I64);
             num->id = span_commit(parser, span);
             return num;
         }
@@ -500,14 +500,14 @@ obj_t parse_vector(parser_t *parser)
             }
 
             vec->type = TYPE_BOOL;
-            vector_push(vec, token);
+            join_raw(vec, token->bool);
         }
         else if (token->type == -TYPE_I64)
         {
             if (vec->type == TYPE_I64)
-                vector_push(vec, token);
+                join_raw(vec, token->i64);
             else if (vec->type == TYPE_F64)
-                vector_push(vec, f64((f64_t)token->i64));
+                join_raw(vec, token->i64);
             else
             {
                 drop(vec);
@@ -520,14 +520,14 @@ obj_t parse_vector(parser_t *parser)
         else if (token->type == -TYPE_F64)
         {
             if (vec->type == TYPE_F64)
-                vector_push(vec, token);
+                join_raw(vec, token);
             else if (vec->type == TYPE_I64)
             {
                 vec->type = TYPE_F64;
                 for (i = 0; i < (i32_t)vec->len; i++)
                     as_vector_f64(vec)[i] = (f64_t)as_vector_i64(vec)[i];
 
-                vector_push(vec, token);
+                join_raw(vec, (i64_t)token->f64);
             }
             else
             {
@@ -543,7 +543,7 @@ obj_t parse_vector(parser_t *parser)
             if (vec->type == TYPE_SYMBOL || (vec->len == 0))
             {
                 vec->type = TYPE_SYMBOL;
-                vector_push(vec, token);
+                join_raw(vec, token->i64);
             }
             else
             {
@@ -557,7 +557,7 @@ obj_t parse_vector(parser_t *parser)
         {
             if (vec->type == TYPE_TIMESTAMP || (vec->len == 0))
             {
-                vector_push(&vec, token);
+                join_raw(vec, token);
                 vec->type = TYPE_TIMESTAMP;
             }
             else
@@ -576,6 +576,7 @@ obj_t parse_vector(parser_t *parser)
             return err;
         }
 
+        drop(token);
         span_extend(parser, &span);
         token = advance(parser);
     }
@@ -624,7 +625,7 @@ obj_t parse_list(parser_t *parser)
             return err;
         }
 
-        list_push(lst, token);
+        join_obj(lst, token);
 
         span_extend(parser, &span);
         token = advance(parser);
@@ -662,7 +663,7 @@ obj_t parse_dict(parser_t *parser)
             return err;
         }
 
-        vector_push(keys, token);
+        join_obj(keys, token);
 
         span_extend(parser, &span);
         token = advance(parser);
@@ -678,9 +679,9 @@ obj_t parse_dict(parser_t *parser)
         {
             err = error(ERR_PARSE, "Expected ':'");
             err->id = token->id;
-            drop(&vals);
-            drop(&keys);
-            drop(&token);
+            drop(vals);
+            drop(keys);
+            drop(token);
             return err;
         }
 
@@ -702,7 +703,7 @@ obj_t parse_dict(parser_t *parser)
             return err;
         }
 
-        vector_push(vals, token);
+        join_obj(vals, token);
 
         span_extend(parser, &span);
         token = advance(parser);
@@ -773,7 +774,7 @@ obj_t advance(parser_t *parser)
     if (is_digit(*parser->current))
     {
         tok = parse_timestamp(parser);
-        if (!is_null(&tok))
+        if (!is_null(tok))
             return tok;
     }
 
@@ -799,8 +800,8 @@ obj_t advance(parser_t *parser)
 
     msg = str_fmt(0, "Unexpected token: '%c'", *parser->current);
     err = error(ERR_PARSE, msg);
-    heap_free(msg);
     err->id = span_commit(parser, span_start(parser));
+
     return err;
 }
 
@@ -815,7 +816,7 @@ obj_t parse_program(parser_t *parser)
 
         if (is_error(token))
         {
-            drop(&list);
+            drop(list);
             return token;
         }
 
@@ -832,10 +833,10 @@ obj_t parse_program(parser_t *parser)
         if (is_at(token, '\0'))
             break;
 
-        list_push(lst, token);
+        join_obj(lst, token);
     }
 
-    return list;
+    return lst;
 }
 
 obj_t parse(parser_t *parser, str_t filename, str_t input)

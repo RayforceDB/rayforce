@@ -27,23 +27,18 @@
 #include "format.h"
 #include "env.h"
 
-#define panic_type(m, t1) panic(str_fmt(0, "%s: '%s'", m, env_get_typename(t1)))
-#define panic_type2(m, t1, t2) panic(str_fmt(0, "%s: '%s', '%s'", m, env_get_typename(t1), env_get_typename(t2)))
-
-i64_t size_of_val(type_t type)
+i32_t size_of(type_t type)
 {
     switch (type)
     {
     case TYPE_BOOL:
         return sizeof(bool_t);
     case TYPE_I64:
+    case TYPE_SYMBOL:
+    case TYPE_TIMESTAMP:
         return sizeof(i64_t);
     case TYPE_F64:
         return sizeof(f64_t);
-    case TYPE_SYMBOL:
-        return sizeof(i64_t);
-    case TYPE_TIMESTAMP:
-        return sizeof(i64_t);
     case TYPE_GUID:
         return sizeof(guid_t);
     case TYPE_CHAR:
@@ -51,7 +46,7 @@ i64_t size_of_val(type_t type)
     case TYPE_LIST:
         return sizeof(obj_t);
     default:
-        panic_type("size of val unknown type", type);
+        panic(str_fmt(0, "sizeof: unknown type: %d", type));
     }
 }
 
@@ -60,7 +55,7 @@ i64_t size_of_val(type_t type)
  */
 obj_t vector(type_t type, i64_t len)
 {
-    i64_t size = capacity(len * size_of_val(type));
+    i32_t size = len * size_of(type);
     obj_t vec = heap_malloc(sizeof(struct obj_t));
 
     vec->type = type;
@@ -71,178 +66,42 @@ obj_t vector(type_t type, i64_t len)
     return vec;
 }
 
-obj_t _push(obj_t vec, obj_t value)
-{
-    switch (vec->type)
-    {
-    case TYPE_BOOL:
-        push(vec, bool_t, value->bool);
-        return null();
-    case TYPE_I64:
-        push(vec, i64_t, value->i64);
-        return null();
-    case TYPE_F64:
-        push(vec, f64_t, value->f64);
-        return null();
-    case TYPE_SYMBOL:
-        push(vec, i64_t, value->i64);
-        return null();
-    case TYPE_TIMESTAMP:
-        push(vec, i64_t, value->i64);
-        return null();
-    // case TYPE_GUID:
-    //     push(vec, guid_t, *value->guid);
-    //     return null();
-    case TYPE_CHAR:
-        push(vec, char_t, value->schar);
-        return null();
-    // case TYPE_LIST:
-    //     push(vec, obj_t, clone(value));
-    //     return null();
-    default:
-        panic("vector push: can not push to a unknown type");
-    }
-}
+// obj_t vector_push(obj_t vec, obj_t value)
+// {
+//     u64_t i, l;
+//     obj_t lst = NULL;
 
-obj_t list_push(obj_t vec, obj_t value)
-{
-    debug_assert(is_vector(vec));
+//     debug_assert(is_vector(vec));
 
-    if (vec->type != -value->type && vec->type != TYPE_LIST)
-        panic("vector push: can not push to a non-list");
+//     l = vec->len;
 
-    return _push(vec, value);
-}
+//     if (l == 0)
+//     {
+//         if (is_scalar(value))
+//             vec->type = -value->type;
+//         else
+//             vec->type = TYPE_LIST;
+//     }
+//     else
+//     {
+//         // change vector type to a list
+//         if (vec->type != -value->type && vec->type != TYPE_LIST)
+//         {
+//             lst = list(l + 1);
+//             for (i = 0; i < l; i++)
+//                 as_list(lst)[i] = vector_get(vec, i);
 
-obj_t vector_push(obj_t vec, obj_t value)
-{
-    u64_t i, l;
-    obj_t lst = NULL;
+//             as_list(lst)[l] = value;
 
-    debug_assert(is_vector(vec));
+//             drop(vec);
 
-    l = vec->len;
+//             vec = lst;
+//             return null();
+//         }
+//     }
 
-    if (l == 0)
-    {
-        if (is_scalar(value))
-            vec->type = -value->type;
-        else
-            vec->type = TYPE_LIST;
-    }
-    else
-    {
-        // change vector type to a list
-        if (vec->type != -value->type && vec->type != TYPE_LIST)
-        {
-            lst = list(l + 1);
-            for (i = 0; i < l; i++)
-                as_list(lst)[i] = vector_get(vec, i);
-
-            as_list(lst)[l] = value;
-
-            drop(vec);
-
-            vec = lst;
-            return null();
-        }
-    }
-
-    return _push(vec, value);
-}
-
-obj_t vector_pop(obj_t vec)
-{
-    guid_t *g;
-
-    if (!is_vector(vec) || vec->len == 0)
-        return null();
-
-    switch (vec->type)
-    {
-    case TYPE_BOOL:
-        return bool(pop(vec, bool_t));
-    case TYPE_I64:
-        return i64(pop(vec, i64_t));
-    case TYPE_F64:
-        return f64(pop(vec, f64_t));
-    case TYPE_SYMBOL:
-        return symboli64(pop(vec, i64_t));
-    case TYPE_TIMESTAMP:
-        return i64(pop(vec, i64_t));
-    case TYPE_GUID:
-        g = as_vector_guid(vec);
-        return guid(g[--vec->len].data);
-    case TYPE_CHAR:
-        return schar(pop(vec, char_t));
-    case TYPE_LIST:
-        if (vec->ptr == NULL)
-            return null();
-        return pop(vec, obj_t);
-    default:
-        panic_type("vector pop: unknown type", vec->type);
-    }
-}
-
-nil_t vector_reserve(obj_t vec, u32_t len)
-{
-    switch (vec->type)
-    {
-    case TYPE_BOOL:
-        reserve(vec, bool_t, len);
-        return;
-    case TYPE_I64:
-        reserve(vec, i64_t, len);
-        return;
-    case TYPE_F64:
-        reserve(vec, f64_t, len);
-        return;
-    case TYPE_SYMBOL:
-        reserve(vec, i64_t, len);
-        return;
-    case TYPE_TIMESTAMP:
-        reserve(vec, i64_t, len);
-        return;
-    case TYPE_GUID:
-        reserve(vec, guid_t, len);
-        return;
-    case TYPE_CHAR:
-        reserve(vec, char_t, len);
-        return;
-    case TYPE_LIST:
-        if (vec->ptr == NULL)
-            panic_type("vector reserve: can not reserve a null", vec->type);
-        reserve(vec, obj_t, len);
-        return;
-    default:
-        panic_type("vector reserve: unknown type", vec->type);
-    }
-}
-
-nil_t vector_grow(obj_t vec, u32_t len)
-{
-    debug_assert(is_vector(vec));
-
-    // calculate size of vector with new length
-    i64_t new_size = capacity(len * size_of_val(vec->type));
-
-    heap_realloc(vec->ptr, new_size);
-    vec->len = len;
-}
-
-nil_t vector_shrink(obj_t vec, u32_t len)
-{
-    debug_assert(is_vector(vec));
-
-    if (vec->len == len)
-        return;
-
-    // calculate size of vector with new length
-    i64_t new_size = capacity(len * size_of_val(vec->type));
-
-    heap_realloc(vec->ptr, new_size);
-    vec->len = len;
-}
+//     return _push(vec, value);
+// }
 
 i64_t vector_find(obj_t vec, obj_t key)
 {
@@ -342,19 +201,19 @@ obj_t vector_get(obj_t vec, i64_t index)
     // case TYPE_I64:
     //     if (index < l)
     //         return i64(as_vector_i64(vec)[index]);
-    //     return i64(NULL_vector_i64);
+    //     return i64(NULL_I64);
     // case TYPE_F64:
     //     if (index < l)
     //         return f64(as_vector_f64(vec)[index]);
-    //     return f64(NULL_vector_f64);
+    //     return f64(NULL_F64);
     // case TYPE_SYMBOL:
     //     if (index < l)
     //         return symboli64(as_vector_i64(vec)[index]);
-    //     return symboli64(NULL_vector_i64);
+    //     return symboli64(NULL_I64);
     // case TYPE_TIMESTAMP:
     //     if (index < l)
     //         return timestamp(as_vector_i64(vec)[index]);
-    //     return timestamp(NULL_vector_i64);
+    //     return timestamp(NULL_I64);
     // case TYPE_GUID:
     //     if (index < l)
     //         return guid(as_vector_guid(vec)[index].data);
@@ -428,7 +287,7 @@ obj_t vector_set(obj_t vec, i64_t index, obj_t value)
     //     as_string(vec)[index] = value.schar;
     //     break;
     // case TYPE_LIST:
-    //     drop(&as_list(vec)[index]);
+    //     drop(as_list(vec)[index]);
     //     as_list(vec)[index] = value;
     //     break;
     // default:
@@ -508,7 +367,7 @@ obj_t vector_filter(obj_t vec, bool_t mask[], i64_t len)
     return res;
 
     // l = vec->len;
-    // ol = (len == NULL_vector_i64) ? (i64_t)vec->len : len;
+    // ol = (len == NULL_I64) ? (i64_t)vec->len : len;
 
     // switch (vec->type)
     // {
@@ -517,64 +376,64 @@ obj_t vector_filter(obj_t vec, bool_t mask[], i64_t len)
     //     for (i = 0; (j < ol && i < l); i++)
     //         if (mask[i])
     //             as_vector_bool(&res)[j++] = as_vector_bool(vec)[i];
-    //     if (len == NULL_vector_i64)
-    //         vector_shrink(&res, j);
+    //     if (len == NULL_I64)
+    //         shrink(&res, j);
     //     return res;
     // case TYPE_I64:
     //     res = vector_i64(ol);
     //     for (i = 0; (j < ol && i < l); i++)
     //         if (mask[i])
     //             as_vector_i64(&res)[j++] = as_vector_i64(vec)[i];
-    //     if (len == NULL_vector_i64)
-    //         vector_shrink(&res, j);
+    //     if (len == NULL_I64)
+    //         shrink(&res, j);
     //     return res;
     // case TYPE_F64:
     //     res = vector_f64(ol);
     //     for (i = 0; (j < ol && i < l); i++)
     //         if (mask[i])
     //             as_vector_f64(&res)[j++] = as_vector_f64(vec)[i];
-    //     if (len == NULL_vector_i64)
-    //         vector_shrink(&res, j);
+    //     if (len == NULL_I64)
+    //         shrink(&res, j);
     //     return res;
     // case TYPE_SYMBOL:
     //     res = vector_symbol(ol);
     //     for (i = 0; (j < ol && i < l); i++)
     //         if (mask[i])
     //             as_vector_i64(&res)[j++] = as_vector_i64(vec)[i];
-    //     if (len == NULL_vector_i64)
-    //         vector_shrink(&res, j);
+    //     if (len == NULL_I64)
+    //         shrink(&res, j);
     //     return res;
     // case TYPE_TIMESTAMP:
     //     res = vector_timestamp(ol);
     //     for (i = 0; (j < ol && i < l); i++)
     //         if (mask[i])
     //             as_vector_i64(&res)[j++] = as_vector_i64(vec)[i];
-    //     if (len == NULL_vector_i64)
-    //         vector_shrink(&res, j);
+    //     if (len == NULL_I64)
+    //         shrink(&res, j);
     //     return res;
     // case TYPE_GUID:
     //     res = vector_guid(ol);
     //     for (i = 0; (j < ol && i < l); i++)
     //         if (mask[i])
     //             as_vector_guid(&res)[j++] = as_vector_guid(vec)[i];
-    //     if (len == NULL_vector_i64)
-    //         vector_shrink(&res, j);
+    //     if (len == NULL_I64)
+    //         shrink(&res, j);
     //     return res;
     // case TYPE_CHAR:
     //     res = string(ol);
     //     for (i = 0; (j < ol && i < l); i++)
     //         if (mask[i])
     //             as_string(&res)[j++] = as_string(vec)[i];
-    //     if (len == NULL_vector_i64)
-    //         vector_shrink(&res, j);
+    //     if (len == NULL_I64)
+    //         shrink(&res, j);
     //     return res;
     // case TYPE_LIST:
     //     res = list(ol);
     //     for (i = 0; (j < ol && i < l); i++)
     //         if (mask[i])
     //             as_list(&res)[j++] = clone(&as_list(vec)[i]);
-    //     if (len == NULL_vector_i64)
-    //         vector_shrink(&res, j);
+    //     if (len == NULL_I64)
+    //         shrink(&res, j);
     //     return res;
     // default:
     //     panic_type("vector_filter: unknown type", vec->type);
@@ -589,10 +448,10 @@ nil_t vector_clear(obj_t vec)
     //     obj_t*list = as_list(vec);
 
     //     for (i = 0; i < l; i++)
-    //         drop(&list[i]);
+    //         drop(list[i]);
     // }
 
-    // vector_shrink(vec, 0);
+    // shrink(vec, 0);
 }
 
 obj_t rf_list(obj_t x, u32_t n)
@@ -614,28 +473,68 @@ obj_t rf_enlist(obj_t x, u32_t n)
     for (i = 0; i < n; i++)
     {
         obj_t item = x + i;
-        vector_push(l, clone(item));
+        join_obj(l, clone(item));
     }
 
     return l;
 }
 
-obj_t join_raw(obj_t *obj, nil_t *val)
+nil_t shrink(obj_t obj, u32_t len)
 {
-    return *obj;
+    debug_assert(is_vector(obj));
+
+    if (obj->len == len)
+        return;
+
+    // calculate size of vector with new length
+    i64_t new_size = len * size_of(obj->type);
+
+    heap_realloc(obj->ptr, new_size);
+    obj->len = len;
 }
 
-obj_t join_obj(obj_t *obj, obj_t val)
+obj_t join_raw(obj_t obj, nil_t *val)
 {
-    return null();
+    i64_t occup, req;
+    i32_t size = size_of(obj->type);
+
+    occup = obj->len * size;
+    req = occup + size;
+    obj->ptr = heap_realloc(obj->ptr, req);
+    memcpy(obj->ptr + occup, &val, size);
+    obj->len++;
+
+    return obj;
 }
 
-obj_t join_sym(obj_t *obj, str_t str)
+obj_t join_obj(obj_t obj, obj_t val)
 {
-    return null();
+    obj_t lst = NULL;
+    u64_t i, l;
+
+    // change vector type to a list
+    // if (obj->type && obj->type != -val->type)
+    // {
+    //     l = obj->len;
+    //     lst = list(l + 1);
+
+    //     for (i = 0; i < l; i++)
+    //         as_list(lst)[i] = vector_get(vec, i);
+
+    //     as_list(&lst)[index] = value;
+
+    //     drop(vec);
+
+    //     *vec = lst;
+
+    //     return lst;
+    // }
+
+    return join_raw(obj, val);
 }
 
-obj_t join_lst(obj_t *obj, obj_t val)
+obj_t join_sym(obj_t obj, str_t str)
 {
-    return null();
+    i64_t sym = intern_symbol(str, strlen(str));
+    return join_raw(obj, sym);
 }

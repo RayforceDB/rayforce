@@ -176,10 +176,10 @@ obj_t dict(obj_t keys, obj_t vals)
 bool_t is_null(obj_t obj)
 {
     return (obj == NULL) ||
-           (obj->type == -TYPE_I64 && obj->i64 == NULL_vector_i64) ||
-           (obj->type == -TYPE_SYMBOL && obj->i64 == NULL_vector_i64) ||
-           (obj->type == -TYPE_F64 && obj->f64 == NULL_vector_f64) ||
-           (obj->type == -TYPE_TIMESTAMP && obj->i64 == NULL_vector_i64) ||
+           (obj->type == -TYPE_I64 && obj->i64 == NULL_I64) ||
+           (obj->type == -TYPE_SYMBOL && obj->i64 == NULL_I64) ||
+           (obj->type == -TYPE_F64 && obj->f64 == NULL_F64) ||
+           (obj->type == -TYPE_TIMESTAMP && obj->i64 == NULL_I64) ||
            (obj->type == -TYPE_CHAR && obj->schar == '\0');
 }
 
@@ -249,6 +249,12 @@ obj_t __attribute__((hot)) clone(obj_t obj)
 
     switch (obj->type)
     {
+    case -TYPE_BOOL:
+    case -TYPE_I64:
+    case -TYPE_F64:
+    case -TYPE_SYMBOL:
+    case -TYPE_TIMESTAMP:
+    case -TYPE_CHAR:
     case TYPE_BOOL:
     case TYPE_I64:
     case TYPE_F64:
@@ -259,12 +265,12 @@ obj_t __attribute__((hot)) clone(obj_t obj)
     case TYPE_LIST:
         l = obj->len;
         for (i = 0; i < l; i++)
-            clone(&as_list(obj)[i]);
+            clone(as_list(obj)[i]);
         return obj;
     case TYPE_DICT:
     case TYPE_TABLE:
-        clone(&as_list(obj)[0]);
-        clone(&as_list(obj)[1]);
+        clone(as_list(obj)[0]);
+        clone(as_list(obj)[1]);
         return obj;
     case TYPE_LAMBDA:
         return obj;
@@ -296,6 +302,15 @@ nil_t __attribute__((hot)) drop(obj_t obj)
 
     switch (obj->type)
     {
+    case -TYPE_BOOL:
+    case -TYPE_I64:
+    case -TYPE_F64:
+    case -TYPE_SYMBOL:
+    case -TYPE_TIMESTAMP:
+    case -TYPE_CHAR:
+        if (rc == 0)
+            heap_free(obj);
+        return;
     case TYPE_BOOL:
     case TYPE_I64:
     case TYPE_F64:
@@ -303,21 +318,30 @@ nil_t __attribute__((hot)) drop(obj_t obj)
     case TYPE_TIMESTAMP:
     case TYPE_CHAR:
         if (rc == 0)
+        {
             heap_free(obj->ptr);
+            heap_free(obj);
+        }
         return;
     case TYPE_LIST:
         l = obj->len;
         for (i = 0; i < l; i++)
             drop(as_list(obj)[i]);
         if (rc == 0)
+        {
             heap_free(obj->ptr);
+            heap_free(obj);
+        }
         return;
     case TYPE_TABLE:
     case TYPE_DICT:
         drop(as_list(obj)[0]);
         drop(as_list(obj)[1]);
         if (rc == 0)
+        {
             heap_free(obj->ptr);
+            heap_free(obj);
+        }
         return;
     case TYPE_LAMBDA:
         if (rc == 0)
@@ -328,11 +352,15 @@ nil_t __attribute__((hot)) drop(obj_t obj)
             drop(as_lambda(obj)->code);
             debuginfo_free(&as_lambda(obj)->debuginfo);
             heap_free(obj->ptr);
+            heap_free(obj);
         }
         return;
     case TYPE_ERROR:
         if (rc == 0)
+        {
             heap_free(obj->ptr);
+            heap_free(obj);
+        }
         return;
     default:
         panic(str_fmt(0, "free: invalid type: %d", obj->type));

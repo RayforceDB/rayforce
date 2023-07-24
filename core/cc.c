@@ -72,12 +72,13 @@
     {                                            \
         lambda_t *_f = as_lambda(&(c)->lambda);  \
         push_u64(&_f->code, _f->constants->len); \
-        vector_push(&_f->constants, k);          \
+        join_obj(_f->constants, k);              \
+        drop(k);                                 \
     }
 
 #define cerr(c, i, t, e)           \
     {                              \
-        drop(&(c)->lambda);        \
+        drop((c)->lambda);         \
         (c)->lambda = error(t, e); \
         return CC_ERROR;           \
     }
@@ -85,7 +86,7 @@
 #define ccerr(c, i, t, e)          \
     {                              \
         str_t m = e;               \
-        drop(&(c)->lambda);        \
+        drop((c)->lambda);         \
         (c)->lambda = error(t, m); \
         heap_free(m);              \
         return CC_ERROR;           \
@@ -202,7 +203,7 @@ cc_result_t cc_compile_fn(cc_t *cc, obj_t obj, u32_t arity)
 
     // if (fun.type == TYPE_ERROR)
     // {
-    //     drop(&cc->lambda);
+    //     drop(cc->lambda);
     //     cc->lambda = fun;
     //     return CC_ERROR;
     // }
@@ -494,7 +495,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     // key = symboli64(KW_FROM);
     // val = dict_get(params, &key);
     // res = cc_compile_expr(true, cc, &val);
-    // drop(&val);
+    // drop(val);
 
     // if (res == CC_ERROR)
     //     return CC_ERROR;
@@ -522,7 +523,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     //     {
     //         v = dict_get(params, &k);
     //         find_used_symbols(&v, &syms);
-    //         drop(&v);
+    //         drop(v);
 
     //         if (k.i64 == KW_BY)
     //             continue;
@@ -536,12 +537,12 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
 
     // if (k.type == TYPE_ERROR)
     // {
-    //     drop(&cols);
-    //     drop(&syms);
+    //     drop(cols);
+    //     drop(syms);
     //     return CC_ERROR;
     // }
 
-    // drop(&syms);
+    // drop(syms);
 
     // // compile filters
     // key = symboli64(KW_WHERE);
@@ -551,11 +552,11 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     //     push_opcode(cc, car->id, code, OP_LPUSH);
 
     //     res = cc_compile_expr(true, cc, &val);
-    //     drop(&val);
+    //     drop(val);
 
     //     if (res == CC_ERROR)
     //     {
-    //         drop(&cols);
+    //         drop(cols);
     //         return CC_ERROR;
     //     }
 
@@ -583,7 +584,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     //         push_u64(code, rf_take);
     //     }
     //     else
-    //         drop(&k);
+    //         drop(k);
 
     //     push_opcode(cc, car->id, code, OP_SWAP);
 
@@ -611,7 +612,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     //         push_u64(code, rf_take);
     //     }
     //     else
-    //         drop(&k);
+    //         drop(k);
     // }
 
     // if (map || groupby)
@@ -623,11 +624,11 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     // if (!is_null(&val))
     // {
     //     res = cc_compile_expr(true, cc, &val);
-    //     drop(&val);
+    //     drop(val);
 
     //     if (res == CC_ERROR)
     //     {
-    //         drop(&cols);
+    //         drop(cols);
     //         return CC_ERROR;
     //     }
 
@@ -692,7 +693,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     //         {
     //             v = dict_get(params, &k);
     //             res = cc_compile_expr(true, cc, &v);
-    //             drop(&v);
+    //             drop(v);
 
     //             if (res == CC_ERROR)
     //                 return CC_ERROR;
@@ -709,7 +710,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     //     push_u64(code, rf_table);
     // }
     // else
-    //     drop(&cols);
+    //     drop(cols);
 
     // if (!has_consumer)
     // push_opcode(cc, car->id, code, OP_POP);

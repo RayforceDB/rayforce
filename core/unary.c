@@ -196,7 +196,7 @@ obj_t rf_sum(obj_t x)
         {
             for (i = 0; i < l; i++)
             {
-                if (iv[i] ^ NULL_vector_i64)
+                if (iv[i] ^ NULL_I64)
                     isum += iv[i];
             }
         }
@@ -239,7 +239,7 @@ obj_t rf_avg(obj_t x)
             // scalar version
             for (i = 0; i < l; i++)
             {
-                if (iv[i] ^ NULL_vector_i64)
+                if (iv[i] ^ NULL_I64)
                     isum += iv[i];
                 else
                     n++;
@@ -273,7 +273,7 @@ obj_t rf_min(obj_t x)
         l = x->len;
 
         if (!l)
-            return i64(NULL_vector_i64);
+            return i64(NULL_I64);
 
         iv = as_vector_i64(x);
         imin = iv[0];
@@ -295,7 +295,7 @@ obj_t rf_min(obj_t x)
         // scalar version
         // find first nonnull value
         for (i = 0; i < l; i++)
-            if (iv[i] ^ NULL_vector_i64)
+            if (iv[i] ^ NULL_I64)
             {
                 imin = iv[i];
                 break;
@@ -303,7 +303,7 @@ obj_t rf_min(obj_t x)
 
         for (i = 0; i < l; i++)
         {
-            if (iv[i] ^ NULL_vector_i64)
+            if (iv[i] ^ NULL_I64)
                 imin = iv[i] < imin ? iv[i] : imin;
         }
 
@@ -313,7 +313,7 @@ obj_t rf_min(obj_t x)
         l = x->len;
 
         if (!l)
-            return f64(NULL_vector_f64);
+            return f64(NULL_F64);
 
         fv = as_vector_f64(x);
         fmin = fv[0];
@@ -353,7 +353,7 @@ obj_t rf_max(obj_t x)
         l = x->len;
 
         if (!l)
-            return i64(NULL_vector_i64);
+            return i64(NULL_I64);
 
         iv = as_vector_i64(x);
         imax = iv[0];
@@ -375,7 +375,7 @@ obj_t rf_max(obj_t x)
         // scalar version
         // find first nonnull value
         for (i = 0; i < l; i++)
-            if (iv[i] ^ NULL_vector_i64)
+            if (iv[i] ^ NULL_I64)
             {
                 imax = iv[i];
                 break;
@@ -383,7 +383,7 @@ obj_t rf_max(obj_t x)
 
         for (i = 0; i < l; i++)
         {
-            if (iv[i] ^ NULL_vector_i64)
+            if (iv[i] ^ NULL_I64)
                 imax = iv[i] > imax ? iv[i] : imax;
         }
 
@@ -556,7 +556,7 @@ obj_trf_where(obj_t x)
             if (iv[i])
                 ov[j++] = i;
 
-        vector_shrink(&res, j);
+        shrink(&res, j);
 
         return res;
 
@@ -663,7 +663,7 @@ obj_t rf_read_parse_compile(obj_t x)
 
         parser = parser_new();
         par = parse(&parser, as_string(x), as_string(red));
-        drop(&red);
+        drop(red);
 
         if (par->type == TYPE_ERROR)
         {
@@ -674,7 +674,7 @@ obj_t rf_read_parse_compile(obj_t x)
 
         com = cc_compile_lambda(false, as_string(x), vector_symbol(0),
                                 as_list(par), par->id, par->len, &parser.debuginfo);
-        drop(&par);
+        drop(par);
         parser_free(&parser);
 
         return com;

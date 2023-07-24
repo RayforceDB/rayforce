@@ -40,7 +40,7 @@ set_t *set_new(i64_t size, u64_t (*hasher)(i64_t a), i32_t (*compare)(i64_t a, i
     kv = set->keys;
 
     for (i = 0; i < size; i++)
-        kv[i] = NULL_vector_i64;
+        kv[i] = NULL_I64;
 
     return set;
 }
@@ -64,18 +64,18 @@ nil_t set_rehash(set_t *set)
     new_keys = set->keys;
 
     for (i = 0; i < set->size; i++)
-        new_keys[i] = NULL_vector_i64;
+        new_keys[i] = NULL_I64;
 
     for (i = 0; i < old_size; i++)
     {
-        if (old_keys[i] != NULL_vector_i64)
+        if (old_keys[i] != NULL_I64)
         {
             key = old_keys[i];
             factor = set->size - 1,
             index = set->hasher(key) & factor;
 
             // Linear probing.
-            while (new_keys[index] != NULL_vector_i64)
+            while (new_keys[index] != NULL_I64)
                 index = (index + 1) & factor;
 
             new_keys[index] = key;
@@ -95,7 +95,7 @@ bool_t set_insert(set_t *set, i64_t key)
 
         for (i = index; i < size; i++)
         {
-            if (keys[i] == NULL_vector_i64)
+            if (keys[i] == NULL_I64)
             {
                 keys[i] = key;
                 set->count++;
@@ -123,7 +123,7 @@ bool_t set_contains(set_t *set, i64_t key)
 
     for (i = index; i < size; i++)
     {
-        if (keys[i] != NULL_vector_i64)
+        if (keys[i] != NULL_I64)
         {
             if (set->compare(keys[i], key) == 0)
                 return true;
@@ -141,9 +141,9 @@ i64_t set_next(set_t *set, i64_t *index)
 
     for (; *index < set->size; (*index)++)
     {
-        if (keys[*index] != NULL_vector_i64)
+        if (keys[*index] != NULL_I64)
             return keys[(*index)++];
     }
 
-    return NULL_vector_i64;
+    return NULL_I64;
 }

@@ -47,7 +47,7 @@ ht_t *ht_new(i64_t size, u64_t (*hasher)(i64_t a), i32_t (*compare)(i64_t a, i64
     table->compare = compare;
 
     for (i = 0; i < size; i++)
-        buckets[i].key = NULL_vector_i64;
+        buckets[i].key = NULL_I64;
 
     return table;
 }
@@ -71,18 +71,18 @@ nil_t ht_rehash(ht_t *table)
     new_buckets = table->buckets;
 
     for (i = 0; i < table->size; i++)
-        new_buckets[i].key = NULL_vector_i64;
+        new_buckets[i].key = NULL_I64;
 
     for (i = 0; i < old_size; i++)
     {
-        if (old_buckets[i].key != NULL_vector_i64)
+        if (old_buckets[i].key != NULL_I64)
         {
             key = old_buckets[i].key;
             val = old_buckets[i].val;
             index = table->hasher(key) & factor;
 
             // Linear probing.
-            while (new_buckets[index].key != NULL_vector_i64)
+            while (new_buckets[index].key != NULL_I64)
             {
                 if (index == table->size)
                     panic("ht is full!!");
@@ -112,7 +112,7 @@ i64_t ht_insert(ht_t *table, i64_t key, i64_t val)
 
         for (i = index; i < size; i++)
         {
-            if (buckets[i].key != NULL_vector_i64)
+            if (buckets[i].key != NULL_I64)
             {
                 if (table->compare(buckets[i].key, key) == 0)
                     return buckets[i].val;
@@ -149,7 +149,7 @@ i64_t ht_insert_with(ht_t *table, i64_t key, i64_t val, nil_t *seed,
 
         for (i = index; i < size; i++)
         {
-            if (buckets[i].key != NULL_vector_i64)
+            if (buckets[i].key != NULL_I64)
             {
                 if (table->compare(buckets[i].key, key) == 0)
                     return buckets[i].val;
@@ -184,7 +184,7 @@ bool_t ht_upsert(ht_t *table, i64_t key, i64_t val)
 
         for (i = index; i < size; i++)
         {
-            if (buckets[i].key != NULL_vector_i64)
+            if (buckets[i].key != NULL_I64)
             {
                 if (table->compare(buckets[i].key, key) == 0)
                 {
@@ -224,7 +224,7 @@ bool_t ht_upsert_with(ht_t *table, i64_t key, i64_t val, nil_t *seed,
 
         for (i = index; i < size; i++)
         {
-            if (buckets[i].key != NULL_vector_i64)
+            if (buckets[i].key != NULL_I64)
             {
                 if (table->compare(buckets[i].key, key) == 0)
                     return func(key, val, seed, &buckets[i].key, &buckets[i].val);
@@ -259,14 +259,14 @@ i64_t ht_get(ht_t *table, i64_t key)
 
     for (i = index; i < size; i++)
     {
-        if (buckets[i].key != NULL_vector_i64)
+        if (buckets[i].key != NULL_I64)
         {
             if (table->compare(buckets[i].key, key) == 0)
                 return buckets[i].val;
         }
         else
-            return NULL_vector_i64;
+            return NULL_I64;
     }
 
-    return NULL_vector_i64;
+    return NULL_I64;
 }

@@ -159,17 +159,17 @@ str_t str_fmt(i32_t limit, str_t fmt, ...)
     return p;
 }
 
-i32_t bool_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, i64_t val)
+i32_t bool_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, bool_t val)
 {
-    if (val == 0)
-        return str_fmt_into(dst, len, offset, limit, "false");
-    else
+    if (val)
         return str_fmt_into(dst, len, offset, limit, "true");
+    else
+        return str_fmt_into(dst, len, offset, limit, "false");
 }
 
 i32_t i64_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, i64_t val)
 {
-    if (val == NULL_vector_i64)
+    if (val == NULL_I64)
         return str_fmt_into(dst, len, offset, limit, "%s", "0i");
     else
         return str_fmt_into(dst, len, offset, limit, "%lld", val);
@@ -185,7 +185,7 @@ i32_t f64_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, f64_t val
 
 i32_t symbol_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, i64_t val)
 {
-    if (val == NULL_vector_i64)
+    if (val == NULL_I64)
         return str_fmt_into(dst, len, offset, limit, "0s");
 
     i32_t n = str_fmt_into(dst, len, offset, limit, "%s", symbols_get(val));
@@ -198,7 +198,7 @@ i32_t symbol_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, i64_t 
 
 i32_t ts_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, i64_t val)
 {
-    if (val == NULL_vector_i64)
+    if (val == NULL_I64)
         return str_fmt_into(dst, len, offset, limit, "0t");
 
     timestamp_t ts = rf_timestamp_from_i64(val);
@@ -244,9 +244,27 @@ i32_t vector_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, obj_t 
 
     for (i = 0; i < l; i++)
     {
-        v = vector_get(obj, i);
-        n += obj_t_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, &v);
-        drop(&v);
+        switch (obj->type)
+        {
+        case TYPE_BOOL:
+            n += bool_fmt_into(dst, len, offset, limit, as_vector_bool(obj)[i]);
+            break;
+        case TYPE_I64:
+            n += i64_fmt_into(dst, len, offset, limit, as_vector_i64(obj)[i]);
+            break;
+        case TYPE_F64:
+            n += f64_fmt_into(dst, len, offset, limit, as_vector_f64(obj)[i]);
+            break;
+        case TYPE_SYMBOL:
+            n += symbol_fmt_into(dst, len, offset, limit, as_vector_symbol(obj)[i]);
+            break;
+        case TYPE_TIMESTAMP:
+            n += ts_fmt_into(dst, len, offset, limit, as_vector_timestamp(obj)[i]);
+            break;
+        default:
+            n += str_fmt_into(dst, len, offset, limit, "null");
+            break;
+        }
 
         if (n > limit)
             break;
@@ -283,7 +301,7 @@ i32_t list_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t l
     for (i = 0; i < list_height; i++)
     {
         maxn(n, str_fmt_into(dst, len, offset, 0, "\n%*.*s", indent, indent, PADDING));
-        maxn(n, obj_t_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, &as_list(obj)[i]));
+        maxn(n, obj_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, as_list(obj)[i]));
     }
 
     if (list_height < (i32_t)obj->len)
@@ -327,14 +345,14 @@ i32_t dict_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t l
     {
         maxn(n, str_fmt_into(dst, len, offset, 0, "\n%*.*s", indent, indent, PADDING));
         v = vector_get(keys, i);
-        maxn(n, obj_t_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, &v));
-        drop(&v);
+        maxn(n, obj_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, &v));
+        drop(v);
 
         n += str_fmt_into(dst, len, offset, MAX_ROW_WIDTH, ": ");
 
         v = vector_get(vals, i);
-        maxn(n, obj_t_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, &v));
-        drop(&v);
+        maxn(n, obj_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, &v));
+        drop(v);
     }
 
     if (dict_height < (i32_t)keys->len)
@@ -381,8 +399,8 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, obj_t 
             o = 0;
 
             c = vector_get(column, j);
-            maxn(n, obj_t_fmt_into(&s, &l, &o, 0, 31, &c));
-            drop(&c);
+            maxn(n, obj_fmt_into(&s, &l, &o, 0, 31, &c));
+            drop(c);
 
             formatted_columns[i][j] = s;
             maxn(as_vector_i64(column_widths)[i], n);
@@ -425,7 +443,7 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, obj_t 
         }
     }
 
-    drop(&column_widths);
+    drop(column_widths);
 
     if (table_height < (i32_t)(as_list(columns)[0])->len)
         str_fmt_into(dst, len, offset, 0, "\n..");
@@ -461,7 +479,7 @@ i32_t lambda_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, obj_t 
     return str_fmt_into(dst, len, offset, 0, "<lambda>");
 }
 
-i32_t obj_t_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, obj_t obj)
+i32_t obj_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, obj_t obj)
 {
     switch (obj->type)
     {
@@ -515,11 +533,11 @@ i32_t obj_t_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t 
 /*
  * Format an obj into a string
  */
-str_t obj_t_fmt(obj_t obj)
+str_t obj_fmt(obj_t obj)
 {
     i32_t len = 0, offset = 0, limit = MAX_ROW_WIDTH;
     str_t dst = NULL;
-    obj_t_fmt_into(&dst, &len, &offset, 0, limit, obj);
+    obj_fmt_into(&dst, &len, &offset, 0, limit, obj);
     if (dst == NULL)
         panic("format: returns null");
 
@@ -531,7 +549,7 @@ str_t obj_t_fmt(obj_t obj)
  * using format string as a template with
  * '%' placeholders.
  */
-str_t obj_t_fmt_n(obj_t x, u32_t n)
+str_t obj_fmt_n(obj_t x, u32_t n)
 {
     u32_t i;
     i32_t l = 0, o = 0, sz = 0;
@@ -542,7 +560,7 @@ str_t obj_t_fmt_n(obj_t x, u32_t n)
         return NULL;
 
     if (n == 1)
-        return obj_t_fmt(b);
+        return obj_fmt(b);
 
     if (b->type != TYPE_CHAR)
         return NULL;
@@ -571,7 +589,7 @@ str_t obj_t_fmt_n(obj_t x, u32_t n)
         sz -= (end + 1 - start);
         start = end + 1;
 
-        obj_t_fmt_into(&s, &l, &o, 0, 0, b);
+        obj_fmt_into(&s, &l, &o, 0, 0, b);
     }
 
     if (sz > 0 && memchr(start, '%', sz))

@@ -172,17 +172,15 @@ nil_t test_vector()
 {
     debug("testing vector");
 
-    obj_tv = vector_i64(1);
-    as_vector_i64(&v)[0] = 1;
+    obj_t v = vector_i64(1);
+    as_vector_i64(v)[0] = 1;
 
     for (i32_t i = 0; i < 1000000; i++)
-    {
-        vector_push(&v, i64(i));
-    }
+        join_raw(v, i);
 
     debug("testing vector done");
 
-    drop(&v);
+    drop(v);
 }
 
 nil_t test_allocate_and_free()

@@ -40,46 +40,6 @@
  */
 #define CAPACITY_FACTOR 16
 
-/*
- * Calculates capacity for vector of length x
- */
-#define capacity(x) (ALIGNUP(x, CAPACITY_FACTOR))
-
-/*
- * Reserves memory for n elements
- * v - vector to reserve memory for
- * t - type of element
- * n - number of elements
- */
-#define reserve(v, t, n)                                                                                           \
-    {                                                                                                              \
-        i64_t occup = (v)->len * sizeof(t);                                                                        \
-        i64_t cap = capacity(occup);                                                                               \
-        i64_t req_cap = n * sizeof(t);                                                                             \
-        if (cap < req_cap + occup)                                                                                 \
-        {                                                                                                          \
-            i64_t new_cap = capacity(cap + req_cap);                                                               \
-            /*debug("realloc: len %lld n %lld from %lld to %lld occup: %lld", (v)->len, n, cap, new_cap, occup);*/ \
-            (v)->ptr = heap_realloc((v)->ptr, new_cap);                                                            \
-        }                                                                                                          \
-    }
-
-/*
- * Appends obj_tect to the end of vector (dynamically grows vector if needed)
- * v - vector to append to
- * t - type of obj_tect to append
- * x - obj_tect to append
- */
-#define push(v, t, x)                                                 \
-    {                                                                 \
-        reserve(v, t, 1);                                             \
-        memcpy(as_string(v) + ((v)->len * sizeof(t)), &x, sizeof(t)); \
-        (v)->len++;                                                   \
-    }
-
-#define pop(v, t) ((t *)(as_string(v)))[--(v)->len]
-
-i64_t size_of_val(type_t type);
 i64_t vector_find(obj_t vec, obj_t key);
 
 obj_t vector_get(obj_t vec, i64_t index);
@@ -93,7 +53,7 @@ obj_t rf_enlist(obj_t x, u32_t n);
 
 nil_t vector_reserve(obj_t vec, u32_t len);
 nil_t vector_grow(obj_t vec, u32_t len);
-nil_t vector_shrink(obj_t vec, u32_t len);
+nil_t shrink(obj_t vec, u32_t len);
 nil_t vector_free(obj_t vec);
 nil_t vector_clear(obj_t vec);
 

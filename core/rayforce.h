@@ -65,10 +65,10 @@ extern "C"
 #define ERR_THROW 13
 #define ERR_UNKNOWN 127
 
-#define NULL_vector_i64 ((i64_t)0x8000000000000000LL)
-#define NULL_vector_f64 ((f64_t)(0 / 0.0))
-#define true (char)1
-#define false (char)0
+#define NULL_I64 ((i64_t)0x8000000000000000LL)
+#define NULL_F64 ((f64_t)(0 / 0.0))
+#define true     (char)1
+#define false    (char)0
 
 typedef char type_t;
 typedef char i8_t;
@@ -169,10 +169,9 @@ extern bool_t is_null(obj_t obj);
 #define is_vector(obj) ((obj)->type > 0 && (obj)->type < TYPE_TABLE)
 
 // Joins
-extern obj_t join_raw(obj_t *obj, nil_t *val); // join raw value into a list
-extern obj_t join_obj(obj_t *obj, obj_t  val); // join object to a list
-extern obj_t join_sym(obj_t *obj, str_t  str); // join interned string to a symbol vector
-extern obj_t join_lst(obj_t *obj, obj_t  val); // join two lists (must be of the same type)
+extern obj_t join_raw(obj_t obj, nil_t *val); // join raw value into a list
+extern obj_t join_obj(obj_t obj, obj_t  val); // join object to a list
+extern obj_t join_sym(obj_t obj, str_t  str); // join interned string to a symbol vector
 
 #ifdef __cplusplus
 }

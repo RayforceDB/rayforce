@@ -53,7 +53,7 @@
 
 #define debug_obj(o)                \
     {                                  \
-        str_t _f = obj_t_fmt((o)); \
+        str_t _f = obj_fmt((o)); \
         debug("%s", _f);               \
         heap_free(_f);                   \
     }

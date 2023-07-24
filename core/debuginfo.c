@@ -53,7 +53,7 @@ span_t debuginfo_get(debuginfo_t *debuginfo, u32_t index)
 {
     i64_t s = ht_get(debuginfo->spans, (i64_t)index);
 
-    if (s == NULL_vector_i64)
+    if (s == NULL_I64)
         return (span_t){0};
 
     span_t span;

@@ -212,9 +212,9 @@ env_t create_env()
 
 nil_t free_env(env_t *env)
 {
-    drop(&env->variables);
-    drop(&env->functions);
-    drop(&env->typenames);
+    drop(env->variables);
+    drop(env->functions);
+    drop(env->typenames);
 }
 
 i64_t env_get_typename_by_type(env_t *env, type_t type)
@@ -225,7 +225,7 @@ i64_t env_get_typename_by_type(env_t *env, type_t type)
 
     // return n.i64;
 
-    return NULL_vector_i64;
+    return NULL_I64;
 }
 
 type_t env_get_type_by_typename(env_t *env, obj_t sym)

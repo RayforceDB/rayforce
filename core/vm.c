@@ -45,14 +45,14 @@ CASSERT(OP_INVALID < 127, vm_h)
 #define stack_pop(v) (v->stack[--v->sp])
 #define stack_peek(v) (&v->stack[v->sp - 1])
 #define stack_peek_n(v, n) (&v->stack[v->sp - 1 - (n)])
-#define stack_debug(v)                                                 \
-    {                                                                  \
-        i32_t _i = v->sp;                                              \
-        while (_i > 0)                                                 \
-        {                                                              \
-            debug("%d: %s", v->sp - _i, obj_t_fmt(&v->stack[_i - 1])); \
-            _i--;                                                      \
-        }                                                              \
+#define stack_debug(v)                                               \
+    {                                                                \
+        i32_t _i = v->sp;                                            \
+        while (_i > 0)                                               \
+        {                                                            \
+            debug("%d: %s", v->sp - _i, obj_fmt(&v->stack[_i - 1])); \
+            _i--;                                                    \
+        }                                                            \
     }
 
 typedef struct ctx_t
@@ -171,7 +171,7 @@ op_call1:
 made_call1:
     x2 = stack_pop(vm);
     x1 = rf_call_unary(flags, (unary_t)l, &x2);
-    drop(&x2);
+    drop(x2);
     unwrap(x1, b);
     stack_push(vm, x1);
     dispatch();
@@ -183,8 +183,8 @@ made_call2:
     x3 = stack_pop(vm);
     x2 = stack_pop(vm);
     x1 = rf_call_binary(flags, (binary_t)l, &x2, &x3);
-    drop(&x2);
-    drop(&x3);
+    drop(x2);
+    drop(x3);
     unwrap(x1, b);
     stack_push(vm, x1);
     dispatch();
@@ -301,9 +301,9 @@ op_lset:
     b = vm->ip++;
     x2 = stack_pop(vm);
     x1 = stack_pop(vm);
-    if (f->locals->len == 0)
-        vector_push(&f->locals, dict(vector_symbol(0), list(0)));
-    dict_set(&as_list(f->locals)[f->locals->len - 1], x1, x2);
+    // if (f->locals->len == 0)
+    //     vector_push(&f->locals, dict(vector_symbol(0), list(0)));
+    // dict_set(&as_list(f->locals)[f->locals->len - 1], x1, x2);
     dispatch();
 op_lget:
     b = vm->ip++;
@@ -324,14 +324,14 @@ op_lget:
 op_lpush:
     b = vm->ip++;
     x1 = stack_pop(vm); // table or dict
-    if (x1->type != TYPE_TABLE && x1->type != TYPE_DICT)
-        unwrap(error(ERR_TYPE, "expected dict or table"), b);
-    vector_push(&f->locals, x1);
+    // if (x1->type != TYPE_TABLE && x1->type != TYPE_DICT)
+    //     unwrap(error(ERR_TYPE, "expected dict or table"), b);
+    // vector_push(&f->locals, x1);
     dispatch();
 op_lpop:
     b = vm->ip++;
-    x1 = vector_pop(&f->locals);
-    stack_push(vm, x1);
+    // x1 = vector_pop(&f->locals);
+    // stack_push(vm, x1);
     dispatch();
 op_try:
     b = vm->ip++;
@@ -411,11 +411,11 @@ op_eval:
     // x1 = stack_pop(vm);
     // if (x1.type != TYPE_LIST)
     // {
-    //     drop(&x1);
+    //     drop(x1);
     //     unwrap(error(ERR_TYPE, "eval: expects list"), b);
     // }
     // x2 = cc_compile_lambda(false, "anonymous", vector_symbol(0), as_list(x1), x1.id, x1->len, NULL);
-    // drop(&x1);
+    // drop(x1);
     // unwrap(x2, b);
     // stack_push(vm, x2);
     // n = 0;
@@ -424,7 +424,7 @@ op_fload:
     b = vm->ip++;
     // x1 = stack_pop(vm);
     // x2 = rf_read_parse_compile(&x1);
-    // drop(&x1);
+    // drop(x1);
     // unwrap(x2, b);
     // stack_push(vm, x2);
     // n = 0;
@@ -463,7 +463,7 @@ str_t vm_code_fmt(obj_t fun)
             break;
         case OP_PUSH:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] push ", c++, ip++);
-            obj_t_fmt_into(&s, &l, &o, 0, 0, (obj_t)(code + ip));
+            obj_fmt_into(&s, &l, &o, 0, 0, (obj_t)(code + ip));
             str_fmt_into(&s, &l, &o, 0, "\n");
             ip += sizeof(obj_t);
             break;
@@ -472,13 +472,13 @@ str_t vm_code_fmt(obj_t fun)
             break;
         case OP_JNE:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] jne ", c++, ip++);
-            obj_t_fmt_into(&s, &l, &o, 0, 0, (obj_t)(code + ip));
+            obj_fmt_into(&s, &l, &o, 0, 0, (obj_t)(code + ip));
             str_fmt_into(&s, &l, &o, 0, "\n");
             ip += sizeof(obj_t);
             break;
         case OP_JMP:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] jmp ", c++, ip++);
-            obj_t_fmt_into(&s, &l, &o, 0, 0, (obj_t)(code + ip));
+            obj_fmt_into(&s, &l, &o, 0, 0, (obj_t)(code + ip));
             str_fmt_into(&s, &l, &o, 0, "\n");
             ip += sizeof(obj_t);
             break;
@@ -501,7 +501,7 @@ str_t vm_code_fmt(obj_t fun)
             break;
         case OP_TRY:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] try ", c++, ip++);
-            obj_t_fmt_into(&s, &l, &o, 0, 0, (obj_t)(code + ip));
+            obj_fmt_into(&s, &l, &o, 0, 0, (obj_t)(code + ip));
             str_fmt_into(&s, &l, &o, 0, "\n");
             ip += sizeof(obj_t);
             break;
