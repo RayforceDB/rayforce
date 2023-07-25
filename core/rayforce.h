@@ -178,6 +178,8 @@ extern obj_t shrink(obj_t *obj, u64_t len);
 
 // Search
 extern i64_t find_raw(obj_t obj, nil_t *val); // find raw value in a list, return index (obj->len if not found)
+extern i64_t find_obj(obj_t obj, obj_t  val); // find object in a list, return index (obj->len if not found)
+extern i64_t find_sym(obj_t obj, str_t  str); // find interned string in a symbol vector, return index (obj->len if not found)
 
 // Comparison
 extern bool_t equal(obj_t a, obj_t b);

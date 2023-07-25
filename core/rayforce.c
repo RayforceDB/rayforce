@@ -350,16 +350,45 @@ i64_t find_raw(obj_t obj, nil_t *val)
             if (equal(as_list(obj)[i], val))
                 return i;
         return NULL_I64;
-    case TYPE_DICT:
-    case TYPE_TABLE:
-        l = as_list(obj)[0]->len;
-        for (i = 0; i < l; i++)
-            if (equal(as_list(as_list(obj)[0])[i], val))
-                return i;
-        return NULL_I64;
     default:
         panic(str_fmt(0, "find: invalid type: %d", obj->type));
     }
+}
+
+i64_t find_obj(obj_t obj, obj_t val)
+{
+    i64_t i, l;
+
+    if (obj == NULL)
+        return NULL_I64;
+
+    switch (obj->type)
+    {
+    case -TYPE_I64:
+    case -TYPE_SYMBOL:
+    case -TYPE_F64:
+    case -TYPE_TIMESTAMP:
+    case -TYPE_CHAR:
+        return NULL_I64;
+    case TYPE_I64:
+    case TYPE_SYMBOL:
+    case TYPE_TIMESTAMP:
+        return find_raw(obj, val->i64);
+    case TYPE_F64:
+        return find_raw(obj, *(nil_t **)&val->f64);
+    case TYPE_CHAR:
+        return find_raw(obj, *(nil_t **)&val->schar);
+    case TYPE_LIST:
+        return find_raw(obj, val);
+    default:
+        panic(str_fmt(0, "find: invalid type: %d", obj->type));
+    }
+}
+
+i64_t find_sym(obj_t obj, str_t str)
+{
+    i64_t n = intern_symbol(str, strlen(str));
+    return find_raw(obj, n);
 }
 
 /*

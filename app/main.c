@@ -82,7 +82,7 @@ obj_t parse_cmdline(i32_t argc, str_t argv[])
             len = strlen(argv[opt]);
             str = string(len);
             strncpy(as_string(str), argv[opt], len);
-            join_obj(vals, str);
+            join_obj(&vals, str);
             break;
         default:
             usage();
@@ -168,8 +168,9 @@ i32_t main(i32_t argc, str_t argv[])
 
     runtime_init(0);
 
-    obj_t args = parse_cmdline(argc, argv), filename, file;
-    str_t line, ptr;
+    obj_t args = parse_cmdline(argc, argv), file;
+    i64_t i;
+    str_t filename, line, ptr;
     parser_t parser = parser_new();
 
 #if defined(__linux__) || defined(__APPLE__) && defined(__MACH__)
@@ -179,18 +180,18 @@ i32_t main(i32_t argc, str_t argv[])
     line = (str_t)mmap_malloc(LINE_SIZE);
 
     // load file
-    // filename = dict_get(args, symfile);
-    // if (!is_null(filename))
-    // {
-    //     file = rf_fread(filename);
-    //     if (file->type == TYPE_ERROR)
-    //         print_error(file, as_string(filename), NULL, 0);
-    //     else
-    //         repl(as_string(filename), &parser, as_string(file), file->len);
+    i = find_sym(as_list(args)[0], "file");
+    if (i < as_list(args)[0]->len)
+    {
+        filename = as_list(as_list(args)[1])[i];
+        file = rf_fread(filename);
+        if (file->type == TYPE_ERROR)
+            print_error(file, filename, NULL, 0);
+        else
+            repl(filename, &parser, as_string(file), file->len);
 
-    //     drop(file);
-    //     drop(filename);
-    // }
+        drop(file);
+    }
     // --
 
     while (running)
