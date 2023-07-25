@@ -25,33 +25,29 @@
 #include "string.h"
 #include "heap.h"
 #include "ops.h"
-
-i32_t u32_cmp(i64_t a, i64_t b)
-{
-    return !((u32_t)a == (u32_t)b);
-}
+#include "util.h"
 
 nfo_t nfo_new(str_t filename, str_t lambda)
 {
     nfo_t nfo = {
         .filename = filename,
         .lambda = lambda,
-        .spans = ht_new(32, &rfi_kmh_hash, &u32_cmp),
+        .spans = ht_new(32, &rfi_i64_hash, &i64_cmp),
     };
 
     return nfo;
 }
 
-nil_t nfo_insert(nfo_t *nfo, u32_t index, span_t span)
+nil_t nfo_insert(nfo_t *nfo, i64_t index, span_t span)
 {
-    u64_t s;
+    i64_t s;
     memcpy(&s, &span, sizeof(span_t));
-    ht_upsert(nfo->spans, (i64_t)index, (i64_t)s);
+    ht_upsert(nfo->spans, index, s);
 }
 
-span_t nfo_get(nfo_t *nfo, u32_t index)
+span_t nfo_get(nfo_t *nfo, i64_t index)
 {
-    i64_t s = ht_get(nfo->spans, (i64_t)index);
+    i64_t s = ht_get(nfo->spans, index);
 
     if (s == NULL_I64)
         return (span_t){0};

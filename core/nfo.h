@@ -27,6 +27,8 @@
 #include "rayforce.h"
 #include "hash.h"
 
+// clang-format off
+
 /*
  * Points to a actual error position in a source code
  */
@@ -51,9 +53,10 @@ typedef struct nfo_t
     ht_t *spans;
 } nfo_t;
 
-nfo_t nfo_new(str_t filename, str_t lambda);
-nil_t nfo_free(nfo_t *nfo);
-nil_t nfo_insert(nfo_t *nfo, u32_t index, span_t span);
-span_t nfo_get(nfo_t *nfo, u32_t index);
+nfo_t  nfo_new(str_t filename, str_t lambda);
+nil_t  nfo_free(nfo_t *nfo);
+nil_t  nfo_insert(nfo_t *nfo, i64_t index, span_t span);
+span_t nfo_get(nfo_t *nfo, i64_t index);
+// clang-format on
 
 #endif

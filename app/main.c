@@ -100,11 +100,6 @@ nil_t repl(str_t name, parser_t *parser, str_t buf, i32_t len)
     str_t formatted = NULL;
 
     parsed = parse(parser, name, buf);
-    formatted = obj_fmt(parsed);
-    printf("%s\n", formatted);
-    drop(parsed);
-    heap_free(formatted);
-    return;
 
     if (is_error(parsed))
     {
@@ -112,6 +107,12 @@ nil_t repl(str_t name, parser_t *parser, str_t buf, i32_t len)
         drop(parsed);
         return;
     }
+
+    formatted = obj_fmt(parsed);
+    printf("%s\n", formatted);
+    drop(parsed);
+    heap_free(formatted);
+    return;
 
     compiled = cc_compile(parsed, &parser->nfo);
     if (is_error(compiled))

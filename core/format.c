@@ -473,6 +473,9 @@ i32_t lambda_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, obj_t 
 
 i32_t obj_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, obj_t obj)
 {
+    if (obj == NULL)
+        return str_fmt_into(dst, len, offset, limit, "null");
+
     switch (obj->type)
     {
     case -TYPE_BOOL:
@@ -527,6 +530,9 @@ i32_t obj_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t li
  */
 str_t obj_fmt(obj_t obj)
 {
+    if (obj == NULL)
+        return str_fmt(0, "null");
+
     i32_t len = 0, offset = 0, limit = MAX_ROW_WIDTH;
     str_t dst = NULL;
     obj_fmt_into(&dst, &len, &offset, 0, limit, obj);
@@ -604,8 +610,7 @@ nil_t print_error(obj_t error, str_t filename, str_t source, u32_t len)
     str_t start = source;
     str_t end = NULL;
     str_t error_desc, lf = "", msg, p;
-    // TODO!!!!!
-    span_t span = (span_t){0};
+    span_t span = *(span_t *)&as_list(error)[2];
 
     switch (error->code)
     {
@@ -655,7 +660,7 @@ nil_t print_error(obj_t error, str_t filename, str_t source, u32_t len)
     if (!source)
     {
         printf("%s** [E%.3d] error%s: %s\n %s-->%s %s:%d:%d\n    %s %s %s\n", TOMATO, error->code, RESET,
-               error_desc, CYAN, RESET, filename, span.end_line, span.end_column, TOMATO, as_string(error), RESET);
+               error_desc, CYAN, RESET, filename, span.end_line, span.end_column, TOMATO, as_string(as_list(error)[1]), RESET);
         return;
     }
 
@@ -688,7 +693,7 @@ nil_t print_error(obj_t error, str_t filename, str_t source, u32_t len)
                     printf("%s^%s", TOMATO, RESET);
 
                 l = 0;
-                msg = as_string(error);
+                msg = as_string(as_list(error)[1]);
                 p = strtok(msg, "\n");
                 while (p != NULL)
                 {
@@ -715,7 +720,7 @@ nil_t print_error(obj_t error, str_t filename, str_t source, u32_t len)
                     for (i = 0; i < span.end_column + 6; i++)
                         printf(" ");
 
-                    printf("%s^ %s%s\n", TOMATO, as_string(error), RESET);
+                    printf("%s^ %s%s\n", TOMATO, as_string(as_list(error)[1]), RESET);
                 }
             }
         }

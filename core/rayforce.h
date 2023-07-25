@@ -165,9 +165,9 @@ extern nil_t drop(obj_t obj);
 
 // Checkers
 extern bool_t is_null(obj_t obj);
-#define is_error(obj)  ((obj)->type == TYPE_ERROR)
-#define is_scalar(obj) ((obj)->type < 0)
-#define is_vector(obj) ((obj)->type >= 0 && (obj)->type < TYPE_TABLE)
+#define is_error(obj)  (obj && (obj)->type == TYPE_ERROR)
+#define is_scalar(obj) (obj && (obj)->type < 0)
+#define is_vector(obj) (obj && (obj)->type >= 0 && (obj)->type < TYPE_TABLE)
 
 // Joins
 extern obj_t join_raw(obj_t *obj, nil_t *val); // join raw value into a list

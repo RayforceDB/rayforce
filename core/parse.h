@@ -33,7 +33,7 @@
 typedef struct parser_t
 {
     nfo_t nfo;     // debug info for current parser
-    u32_t count;   // number of parsed objs
+    i64_t count;   // counter for spans without objects
     str_t input;   // input string
     str_t current; // current character
     i64_t line;    // current line

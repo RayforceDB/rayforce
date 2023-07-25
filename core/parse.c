@@ -30,9 +30,7 @@
 #include "heap.h"
 #include "format.h"
 #include "string.h"
-
 #include "util.h"
-
 #include "nfo.h"
 #include "runtime.h"
 #include "ops.h"
@@ -58,10 +56,15 @@ nil_t span_extend(parser_t *parser, span_t *span)
     return;
 }
 
-u32_t span_commit(parser_t *parser, span_t span)
+obj_t parse_error(parser_t *parser, i64_t id, str_t msg)
 {
-    nfo_insert(&parser->nfo, parser->count, span);
-    return parser->count++;
+    obj_t obj = error(ERR_PARSE, msg);
+    span_t span = nfo_get(&parser->nfo, id);
+    *(span_t *)(&as_list(obj)[2]) = span;
+
+    heap_free(msg);
+
+    return obj;
 }
 
 bool_t is_whitespace(char_t c)
@@ -101,12 +104,12 @@ bool_t at_term(char_t c)
 
 bool_t is_at(obj_t token, char_t c)
 {
-    return token->type == TYPE_CHAR && token->schar == c;
+    return token && token->type == TYPE_CHAR && token->schar == c;
 }
 
 bool_t is_at_term(obj_t token)
 {
-    return token->type == TYPE_CHAR && at_term(token->schar);
+    return token && token->type == TYPE_CHAR && at_term(token->schar);
 }
 
 i8_t shift(parser_t *parser, i32_t num)
@@ -125,7 +128,8 @@ obj_t to_token(parser_t *parser)
 {
     obj_t tok = schar(*parser->current);
     tok->type = TYPE_CHAR;
-    // tok->id = span_commit(parser, span_start(parser));
+    nfo_insert(&parser->nfo, tok, span_start(parser));
+
     return tok;
 }
 
@@ -144,7 +148,8 @@ obj_t parse_timestamp(parser_t *parser)
         {
             shift(parser, 2);
             res = timestamp(NULL_I64);
-            // res->id = span_commit(parser, span);
+            nfo_insert(&parser->nfo, res, span);
+
             return res;
         }
     }
@@ -266,7 +271,7 @@ obj_t parse_timestamp(parser_t *parser)
     res = timestamp(rf_timestamp_into_i64(ts));
 
     span_extend(parser, &span);
-    // res->id = span_commit(parser, span);
+    nfo_insert(&parser->nfo, res, span);
 
     return res;
 }
@@ -286,7 +291,8 @@ obj_t parse_number(parser_t *parser)
         {
             shift(parser, 2);
             num = i64(NULL_I64);
-            // num->id = span_commit(parser, span);
+            nfo_insert(&parser->nfo, num, span);
+
             return num;
         }
 
@@ -294,7 +300,8 @@ obj_t parse_number(parser_t *parser)
         {
             shift(parser, 2);
             num = f64(NULL_F64);
-            // num->id = span_commit(parser, span);
+            nfo_insert(&parser->nfo, num, span);
+
             return num;
         }
 
@@ -302,7 +309,8 @@ obj_t parse_number(parser_t *parser)
         {
             shift(parser, 2);
             num = timestamp(NULL_I64);
-            // num->id = span_commit(parser, span);
+            nfo_insert(&parser->nfo, num, span);
+
             return num;
         }
 
@@ -310,7 +318,8 @@ obj_t parse_number(parser_t *parser)
         {
             shift(parser, 2);
             num = guid(NULL);
-            // num->id = span_commit(parser, span);
+            nfo_insert(&parser->nfo, num, span);
+
             return num;
         }
     }
@@ -340,7 +349,7 @@ obj_t parse_number(parser_t *parser)
 
     shift(parser, end - parser->current);
     span_extend(parser, &span);
-    // num->id = span_commit(parser, span);
+    nfo_insert(&parser->nfo, num, span);
 
     return num;
 }
@@ -354,8 +363,9 @@ obj_t parse_char(parser_t *parser)
     if (at_eof(*pos) || *pos == '\n')
     {
         span.end_column += (pos - parser->current);
-        err = error(ERR_PARSE, "Expected character");
-        // err->id = span_commit(parser, span);
+        nfo_insert(&parser->nfo, parser->count, span);
+        err = parse_error(parser, parser->count++, str_fmt(0, "Expected character"));
+
         return err;
     }
 
@@ -363,15 +373,16 @@ obj_t parse_char(parser_t *parser)
 
     if (*pos != '\'')
     {
-        span.end_column += (parser->current - parser->current);
-        err = error(ERR_PARSE, "Expected '''");
-        // err->id = span_commit(parser, span);
+        span.end_column += (pos - parser->current);
+        nfo_insert(&parser->nfo, parser->count, span);
+        err = parse_error(parser, parser->count++, str_fmt(0, "Expected '''"));
+
         return err;
     }
 
     shift(parser, 3);
     span_extend(parser, &span);
-    // ch->id = span_commit(parser, span);
+    nfo_insert(&parser->nfo, ch, span);
 
     return ch;
 }
@@ -385,7 +396,6 @@ obj_t parse_string(parser_t *parser)
 
     while (!at_eof(*pos) && *pos != '\n')
     {
-
         if (*(pos - 1) == '\\' && *pos == '"')
             pos++;
         else if (*pos == '"')
@@ -397,8 +407,9 @@ obj_t parse_string(parser_t *parser)
     if ((*pos++) != '"')
     {
         span.end_column += (pos - parser->current);
-        err = error(ERR_PARSE, "Expected '\"'");
-        // err->id = span_commit(parser, span);
+        nfo_insert(&parser->nfo, parser->count, span);
+        err = parse_error(parser, parser->count++, str_fmt(0, "Expected '\"'"));
+
         return err;
     }
 
@@ -407,7 +418,7 @@ obj_t parse_string(parser_t *parser)
 
     shift(parser, len + 2);
     span_extend(parser, &span);
-    // str->id = span_commit(parser, span);
+    nfo_insert(&parser->nfo, str, span);
 
     return str;
 }
@@ -424,7 +435,8 @@ obj_t parse_symbol(parser_t *parser)
         shift(parser, 4);
         span_extend(parser, &span);
         res = bool(true);
-        // res->id = span_commit(parser, span);
+        nfo_insert(&parser->nfo, res, span);
+
         return res;
     }
 
@@ -433,7 +445,8 @@ obj_t parse_symbol(parser_t *parser)
         shift(parser, 5);
         span_extend(parser, &span);
         res = bool(false);
-        // res->id = span_commit(parser, span);
+        nfo_insert(&parser->nfo, res, span);
+
         return res;
     }
 
@@ -442,7 +455,8 @@ obj_t parse_symbol(parser_t *parser)
         shift(parser, 4);
         span_extend(parser, &span);
         res = null();
-        // res->id = span_commit(parser, span);
+        nfo_insert(&parser->nfo, res, span);
+
         return res;
     }
 
@@ -457,271 +471,279 @@ obj_t parse_symbol(parser_t *parser)
     res->type = -TYPE_SYMBOL;
     shift(parser, pos - parser->current);
     span_extend(parser, &span);
-    // res->id = span_commit(parser, span);
+    nfo_insert(&parser->nfo, res, span);
 
     return res;
 }
 
 obj_t parse_vector(parser_t *parser)
 {
-    obj_t token, vec = vector_i64(0), err;
+    obj_t tok, vec = vector_i64(0), err;
     i32_t i;
+    f64_t f;
     span_t span = span_start(parser);
 
     shift(parser, 1); // skip '['
-    token = advance(parser);
+    tok = advance(parser);
 
-    while (!is_at(token, ']'))
+    while (!is_at(tok, ']'))
     {
-        if (is_error(token))
+        if (is_error(tok))
         {
             drop(vec);
-            return token;
+            return tok;
         }
 
-        if (is_at(token, '\0') || is_at_term(token))
+        if (is_at(tok, '\0') || is_at_term(tok))
         {
+            err = parse_error(parser, tok, str_fmt(0, "Expected ']'"));
             drop(vec);
-            drop(token);
-            err = error(ERR_PARSE, "Expected ']'");
-            // err->id = token->id;
+            drop(tok);
+
             return err;
         }
 
-        if (token->type == -TYPE_BOOL)
+        if (tok->type == -TYPE_BOOL)
         {
             if (vec->len > 0 && vec->type != TYPE_BOOL)
             {
+                err = parse_error(parser, tok, str_fmt(0, "Invalid token in vector"));
                 drop(vec);
-                drop(token);
-                err = error(ERR_PARSE, "Invalid token in vector");
-                // err->id = token->id;
+                drop(tok);
+
                 return err;
             }
 
             vec->type = TYPE_BOOL;
-            join_raw(&vec, token->bool);
+            join_raw(&vec, tok->bool);
         }
-        else if (token->type == -TYPE_I64)
+        else if (tok->type == -TYPE_I64)
         {
             if (vec->type == TYPE_I64)
-                join_raw(&vec, token->i64);
+                join_raw(&vec, tok->i64);
             else if (vec->type == TYPE_F64)
-                join_raw(&vec, token->i64);
+            {
+                f64_t f = (f64_t)tok->i64;
+                join_raw(&vec, *(nil_t **)&f);
+            }
             else
             {
+                err = parse_error(parser, tok, str_fmt(0, "Invalid token in vector"));
                 drop(vec);
-                drop(token);
-                err = error(ERR_PARSE, "Invalid token in vector");
-                // err->id = token->id;
+                drop(tok);
+
                 return err;
             }
         }
-        else if (token->type == -TYPE_F64)
+        else if (tok->type == -TYPE_F64)
         {
             if (vec->type == TYPE_F64)
-                join_raw(&vec, token);
+                join_raw(&vec, *(nil_t **)&tok->f64);
             else if (vec->type == TYPE_I64)
             {
                 vec->type = TYPE_F64;
                 for (i = 0; i < (i32_t)vec->len; i++)
                     as_vector_f64(vec)[i] = (f64_t)as_vector_i64(vec)[i];
 
-                join_raw(&vec, (i64_t)token->f64);
+                join_raw(&vec, *(nil_t **)&tok->f64);
             }
             else
             {
+                err = parse_error(parser, tok, str_fmt(0, "Invalid token in vector"));
                 drop(vec);
-                drop(token);
-                err = error(ERR_PARSE, "Invalid token in vector");
-                // err->id = token->id;
+                drop(tok);
+
                 return err;
             }
         }
-        else if (token->type == -TYPE_SYMBOL)
+        else if (tok->type == -TYPE_SYMBOL)
         {
             if (vec->type == TYPE_SYMBOL || (vec->len == 0))
             {
                 vec->type = TYPE_SYMBOL;
-                join_raw(&vec, token->i64);
+                join_raw(&vec, tok->i64);
             }
             else
             {
+                err = parse_error(parser, tok, str_fmt(0, "Invalid token in vector"));
                 drop(vec);
-                drop(token);
-                err = error(ERR_PARSE, "Invalid token in vector");
-                // err->id = token->id;
+                drop(tok);
+
                 return err;
             }
         }
-        else if (token->type == -TYPE_TIMESTAMP)
+        else if (tok->type == -TYPE_TIMESTAMP)
         {
             if (vec->type == TYPE_TIMESTAMP || (vec->len == 0))
             {
-                join_raw(&vec, token);
+                join_raw(&vec, tok);
                 vec->type = TYPE_TIMESTAMP;
             }
             else
             {
+                err = parse_error(parser, tok, str_fmt(0, "Invalid token in vector"));
                 drop(vec);
-                drop(token);
-                err = error(ERR_PARSE, "Invalid token in vector");
-                // err->id = token->id;
+                drop(tok);
+
                 return err;
             }
         }
         else
         {
+            err = parse_error(parser, tok, str_fmt(0, "Invalid token in vector"));
             drop(vec);
-            drop(token);
-            err = error(ERR_PARSE, "Invalid token in vector");
-            // err->id = token->id;
+            drop(tok);
+
             return err;
         }
 
-        drop(token);
+        drop(tok);
         span_extend(parser, &span);
-        token = advance(parser);
+        tok = advance(parser);
     }
 
-    drop(token);
+    drop(tok);
     span_extend(parser, &span);
-    // vec->id = span_commit(parser, span);
+    nfo_insert(&parser->nfo, vec, span);
 
     return vec;
 }
 
 obj_t parse_list(parser_t *parser)
 {
-    obj_t lst = list(0), token, err;
+    obj_t lst = list(0), tok, err;
     span_t span = span_start(parser);
     str_t msg;
 
     shift(parser, 1); // skip '('
-    token = advance(parser);
+    tok = advance(parser);
 
-    while (!is_at(token, ')'))
+    while (!is_at(tok, ')'))
     {
 
-        if (is_error(token))
+        if (is_error(tok))
         {
             drop(lst);
-            return token;
+            return tok;
         }
 
         if (at_eof(*parser->current))
         {
+            nfo_insert(&parser->nfo, parser->count, span);
+            err = parse_error(parser, parser->count++, str_fmt(0, "Expected ')'"));
             drop(lst);
-            drop(token);
-            err = error(ERR_PARSE, "Expected ')'");
-            // err->id = span_commit(parser, span);
+            drop(tok);
+
             return err;
         }
 
-        if (is_at_term(&token))
+        if (is_at_term(tok))
         {
+            err = parse_error(parser, tok, str_fmt(0, "There is no opening found for: '%c'", tok->schar));
             drop(lst);
-            drop(token);
-            msg = str_fmt(0, "There is no opening found for: '%c'", token->i64);
-            err = error(ERR_PARSE, msg);
-            heap_free(msg);
-            // err->id = token->id;
+            drop(tok);
+
             return err;
         }
 
-        join_obj(&lst, token);
+        join_obj(&lst, tok);
 
         span_extend(parser, &span);
-        token = advance(parser);
+        tok = advance(parser);
     }
 
-    drop(token);
     span_extend(parser, &span);
-    // lst->id = span_commit(parser, span);
+    nfo_insert(&parser->nfo, lst, span);
+    drop(tok);
 
     return lst;
 }
 
 obj_t parse_dict(parser_t *parser)
 {
-    obj_t token, keys = list(0), vals = list(0), d, err;
+    obj_t tok, keys = list(0), vals = list(0), d, err;
     span_t span = span_start(parser);
 
     shift(parser, 1); // skip '{'
-    token = advance(parser);
+    tok = advance(parser);
 
-    while (!is_at(token, '}'))
+    while (!is_at(tok, '}'))
     {
-        if (is_error(token))
+        if (is_error(tok))
         {
             drop(keys);
             drop(vals);
-            return token;
+            return tok;
         }
 
-        if (at_eof(*parser->current) || is_at_term(token))
+        if (at_eof(*parser->current) || is_at_term(tok))
         {
+            nfo_insert(&parser->nfo, parser->count, span);
+            err = parse_error(parser, parser->count++, str_fmt(0, "Expected '}'"));
             drop(keys);
             drop(vals);
-            drop(token);
-            err = error(ERR_PARSE, "Expected '}'");
-            // err->id = token->id;
+            drop(tok);
+
             return err;
         }
 
-        join_obj(&keys, token);
+        join_obj(&keys, tok);
 
         span_extend(parser, &span);
-        token = advance(parser);
+        tok = advance(parser);
 
-        if (is_error(token))
+        if (is_error(tok))
         {
             drop(keys);
             drop(vals);
-            return token;
+
+            return tok;
         }
 
-        if (!is_at(token, ':'))
+        if (!is_at(tok, ':'))
         {
-            err = error(ERR_PARSE, "Expected ':'");
-            // err->id = token->id;
+            err = parse_error(parser, tok, str_fmt(0, "Expected ':'"));
             drop(vals);
             drop(keys);
-            drop(token);
+            drop(tok);
+
             return err;
         }
-
-        drop(token);
-        token = advance(parser);
-
-        if (is_error(token))
-        {
-            drop(keys);
-            drop(vals);
-            return token;
-        }
-
-        if (at_eof(*parser->current) || is_at_term(token))
-        {
-            drop(keys);
-            drop(vals);
-            drop(token);
-            err = error(ERR_PARSE, "Expected value folowing ':'");
-            // err->id = token->id;
-            return err;
-        }
-
-        join_obj(&vals, token);
 
         span_extend(parser, &span);
-        token = advance(parser);
+        drop(tok);
+        tok = advance(parser);
+
+        if (is_error(tok))
+        {
+            drop(keys);
+            drop(vals);
+
+            return tok;
+        }
+
+        if (at_eof(*parser->current) || is_at_term(tok))
+        {
+            nfo_insert(&parser->nfo, parser->count, span);
+            err = parse_error(parser, parser->count++, str_fmt(0, "Expected value folowing ':'"));
+            drop(keys);
+            drop(vals);
+            drop(tok);
+
+            return err;
+        }
+
+        join_obj(&vals, tok);
+
+        span_extend(parser, &span);
+        tok = advance(parser);
     }
 
-    drop(token);
+    drop(tok);
     d = dict(keys, vals);
 
     span_extend(parser, &span);
-    // d->id = span_commit(parser, span);
+    nfo_insert(&parser->nfo, d, span);
 
     return d;
 }
@@ -809,9 +831,9 @@ obj_t advance(parser_t *parser)
         return tok;
     }
 
-    msg = str_fmt(0, "Unexpected token: '%c'", *parser->current);
-    err = error(ERR_PARSE, msg);
-    // err->id = span_commit(parser, span_start(parser));
+    nfo_insert(&parser->nfo, tok, span_start(parser));
+    err = parse_error(parser, tok, str_fmt(0, "Unexpected token: '%c'", *parser->current));
+    drop(tok);
 
     return err;
 }
@@ -833,12 +855,9 @@ obj_t parse_program(parser_t *parser)
 
         if (is_at_term(tok))
         {
-            msg = str_fmt(0, "Unexpected token: '%c'", tok->schar);
+            err = parse_error(parser, tok, str_fmt(0, "Unexpected token: '%c'", tok->schar));
             drop(lst);
             drop(tok);
-            err = error(ERR_PARSE, msg);
-            heap_free(msg);
-            // err->id = token->id;
             return err;
         }
 
@@ -866,9 +885,6 @@ obj_t parse(parser_t *parser, str_t filename, str_t input)
     parser->column = 0;
 
     prg = parse_program(parser);
-
-    // if (is_error(prg))
-    //     prg->span = nfo_get(&parser->nfo, prg->id );
 
     return prg;
 }

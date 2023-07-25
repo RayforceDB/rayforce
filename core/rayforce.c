@@ -424,7 +424,6 @@ nil_t __attribute__((hot)) drop(obj_t obj)
         {
             drop(as_list(obj)[0]);
             drop(as_list(obj)[1]);
-            drop(as_list(obj)[2]);
             heap_free(obj);
         }
         return;
