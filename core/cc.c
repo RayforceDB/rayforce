@@ -27,14 +27,14 @@
 #include "heap.h"
 #include "format.h"
 #include "util.h"
-#include "vector.h"
+
 #include "string.h"
 #include "env.h"
 #include "runtime.h"
 #include "unary.h"
 #include "binary.h"
 #include "lambda.h"
-#include "dict.h"
+
 #include "ops.h"
 
 #if defined(_WIN32) || defined(__CYGWIN__)

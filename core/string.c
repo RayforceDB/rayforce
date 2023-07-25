@@ -29,18 +29,6 @@
 
 /*
  * Creates new obj_tstring from a C string.
- * Guarantees that the string is null-terminated.
- */
-obj_t string(i64_t len)
-{
-    obj_t string = vector(TYPE_CHAR, len + 1);
-    as_string(string)[len] = '\0';
-    string->len = len;
-    return string;
-}
-
-/*
- * Creates new obj_tstring from a C string.
  */
 obj_t string_from_str(str_t str, i32_t len)
 {

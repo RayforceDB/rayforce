@@ -23,7 +23,7 @@
 
 #include <stdarg.h>
 #include "env.h"
-#include "dict.h"
+#include "util.h"
 #include "unary.h"
 #include "binary.h"
 #include "vary.h"
@@ -31,15 +31,15 @@
 #include "runtime.h"
 #include "format.h"
 
-#define regf(r, n, t, f, o)                                                   \
-    {                                                                         \
+#define regf(r, n, t, f, o)                                               \
+    {                                                                     \
         obj_t k = symboli64(intern_keyword(n, strlen(n)));                \
         dict_set(r, &k, (obj_t){.type = t, .flags = f, .i64 = (i64_t)o}); \
     };
 
 #define regt(r, i, s)               \
     {                               \
-        obj_t k = i64(i);       \
+        obj_t k = i64(i);           \
         dict_set(r, &k, symbol(s)); \
     };
 
@@ -212,8 +212,8 @@ env_t create_env()
 
 nil_t free_env(env_t *env)
 {
-    drop(env->variables);
     drop(env->functions);
+    drop(env->variables);
     drop(env->typenames);
 }
 

@@ -22,7 +22,7 @@
  */
 
 #include "unary.h"
-#include "dict.h"
+
 #include "runtime.h"
 #include "heap.h"
 #include "vm.h"
@@ -30,7 +30,7 @@
 #include "util.h"
 #include "format.h"
 #include "sort.h"
-#include "vector.h"
+
 #include "guid.h"
 #include "set.h"
 #include "env.h"
@@ -46,43 +46,43 @@ obj_t rf_call_unary_atomic(unary_t f, obj_t x)
     obj_t res = NULL, item = NULL;
 
     // argument is a list, so iterate through it
-    if (x->type == TYPE_LIST)
-    {
-        l = x->len;
+    // if (x->type == TYPE_LIST)
+    // {
+    //     l = x->len;
 
-        if (l == 0)
-            return error(ERR_TYPE, "empty list");
+    //     if (l == 0)
+    //         return error(ERR_TYPE, "empty list");
 
-        item = rf_call_unary_atomic(f, as_list(x)); // call function with first item
+    //     item = rf_call_unary_atomic(f, as_list(x)); // call function with first item
 
-        if (item->type == TYPE_ERROR)
-            return item;
+    //     if (item->type == TYPE_ERROR)
+    //         return item;
 
-        // probably we can fold it in a vector if all other values will be of the same type
-        if (is_scalar(item))
-            res = vector(-item->type, l);
-        else
-            res = list(l);
+    //     // probably we can fold it in a vector if all other values will be of the same type
+    //     if (is_scalar(item))
+    //         res = vector(-item->type, l);
+    //     else
+    //         res = list(l);
 
-        vector_write(res, 0, item);
-        drop(item);
+    //     vector_write(res, 0, item);
+    //     drop(item);
 
-        for (i = 1; i < l; i++)
-        {
-            item = rf_call_unary_atomic(f, &as_list(x)[i]);
+    //     for (i = 1; i < l; i++)
+    //     {
+    //         item = rf_call_unary_atomic(f, &as_list(x)[i]);
 
-            if (item->type == TYPE_ERROR)
-            {
-                res->len = i;
-                drop(res);
-                return item;
-            }
+    //         if (item->type == TYPE_ERROR)
+    //         {
+    //             res->len = i;
+    //             drop(res);
+    //             return item;
+    //         }
 
-            vector_write(&res, i, item);
-        }
+    //         vector_write(&res, i, item);
+    //     }
 
-        return res;
-    }
+    //     return res;
+    // }
 
     return f(x);
 }
@@ -100,11 +100,12 @@ obj_t rf_call_unary(u8_t flags, unary_t f, obj_t x)
 
 obj_t rf_get_variable(obj_t x)
 {
-    obj_t v = dict_get(&runtime_get()->env.variables, x);
-    if (is_null(v))
-        return error(ERR_NOT_FOUND, "symbol not found");
+    return error(ERR_NOT_FOUND, "symbol not found");
+    // obj_t v = dict_get(&runtime_get()->env.variables, x);
+    // if (is_null(v))
+    //     return error(ERR_NOT_FOUND, "symbol not found");
 
-    return v;
+    // return v;
 }
 
 obj_t rf_type(obj_t x)

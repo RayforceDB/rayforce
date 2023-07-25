@@ -28,8 +28,6 @@
 
 // internal types definitions:
 //
-// parser token type
-#define TYPE_TOKEN (TYPE_ERROR - 1)
 // vm context type
 #define TYPE_CTX (TYPE_ERROR - 2)
 // trap type
@@ -83,9 +81,12 @@ i64_t rfi_round_f64(f64_t x);
 i64_t rfi_floor_f64(f64_t x);
 i64_t rfi_ceil_f64(f64_t x);
 u64_t rfi_rand_u64();
+
 // Knuth's multiplicative hash
 u64_t rfi_kmh_hash(i64_t key);
+// FNV-1a hash
 u64_t rfi_fnv1a_hash_64(i64_t key);
+// Identity
 u64_t rfi_i64_hash(i64_t a);
 
 #endif

@@ -22,7 +22,7 @@
  */
 
 #include "sort.h"
-#include "vector.h"
+#include "util.h"
 
 #define COUNTING_SORT_LIMIT 1024 * 1024
 

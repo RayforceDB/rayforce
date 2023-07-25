@@ -34,7 +34,7 @@ nil_t runtime_init(u16_t slaves)
 {
     heap_init();
 
-    _RUNTIME = mmap_malloc(ALIGNUP(sizeof(struct runtime_t), PAGE_SIZE));
+    _RUNTIME = mmap_malloc(sizeof(struct runtime_t));
 
     _RUNTIME->slaves = slaves;
     _RUNTIME->symbols = symbols_new();
@@ -48,7 +48,7 @@ nil_t runtime_cleanup()
     mmap_free(_RUNTIME->symbols, sizeof(symbols_t));
     free_env(&_RUNTIME->env);
     vm_free(&_RUNTIME->vm);
-    mmap_free(_RUNTIME, ALIGNUP(sizeof(struct runtime_t), PAGE_SIZE));
+    mmap_free(_RUNTIME, sizeof(struct runtime_t));
     heap_cleanup();
 }
 

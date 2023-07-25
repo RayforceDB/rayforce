@@ -27,8 +27,6 @@
 #include "format.h"
 #include "heap.h"
 #include "string.h"
-#include "vector.h"
-#include "dict.h"
 #include "util.h"
 #include "string.h"
 #include "runtime.h"
@@ -43,49 +41,6 @@ obj_t atom(type_t type)
     a->rc = 1;
 
     return a;
-}
-
-obj_t vector(type_t type, i64_t len)
-{
-    obj_t vec = (obj_t)heap_malloc(sizeof(struct obj_t) + len * size_of(type));
-
-    vec->type = type;
-    vec->rc = 1;
-    vec->len = len;
-
-    return vec;
-}
-
-obj_t list(i64_t len, ...)
-{
-    i32_t i;
-    obj_t l = (obj_t)heap_malloc(sizeof(obj_t) * len + sizeof(struct obj_t));
-    va_list args;
-
-    l->type = TYPE_LIST;
-    l->rc = 1;
-
-    va_start(args, len);
-
-    for (i = 0; i < len; i++)
-        l->arr[i] = va_arg(args, obj_t);
-
-    va_end(args);
-
-    return l;
-}
-
-obj_t error(i8_t code, str_t message)
-{
-    i32_t len = strlen(message);
-    obj_t err = heap_malloc(sizeof(struct obj_t) + len + 1);
-
-    err->type = TYPE_ERROR;
-    err->len = len;
-    err->rc = 1;
-    strcpy(err->arr, message);
-
-    return err;
 }
 
 obj_t null()
@@ -161,12 +116,44 @@ obj_t timestamp(i64_t val)
     return t;
 }
 
-obj_t table(obj_t keys, obj_t vals)
+obj_t vector(type_t type, u64_t len)
 {
-    obj_t t = list(2, keys, vals);
-    t->type = TYPE_TABLE;
+    obj_t vec = (obj_t)heap_malloc(sizeof(struct obj_t) + len * size_of(type));
 
-    return t;
+    vec->type = type;
+    vec->rc = 1;
+    vec->len = len;
+
+    return vec;
+}
+
+obj_t string(u64_t len)
+{
+    obj_t string = vector(TYPE_CHAR, len + 1);
+    as_string(string)[len] = '\0';
+    string->len = len;
+
+    return string;
+}
+
+obj_t list(u64_t len, ...)
+{
+    i32_t i;
+    obj_t l = (obj_t)heap_malloc(sizeof(struct obj_t) + sizeof(obj_t) * len);
+    va_list args;
+
+    l->type = TYPE_LIST;
+    l->rc = 1;
+    l->len = len;
+
+    va_start(args, len);
+
+    for (i = 0; i < len; i++)
+        as_list(l)[i] = va_arg(args, obj_t);
+
+    va_end(args);
+
+    return l;
 }
 
 obj_t dict(obj_t keys, obj_t vals)
@@ -183,6 +170,90 @@ obj_t dict(obj_t keys, obj_t vals)
     dict->type = TYPE_DICT;
 
     return dict;
+}
+
+obj_t table(obj_t keys, obj_t vals)
+{
+    obj_t t = list(2, keys, vals);
+    t->type = TYPE_TABLE;
+
+    return t;
+}
+
+obj_t error(i8_t code, str_t message)
+{
+    i32_t len = strlen(message);
+    obj_t err = heap_malloc(sizeof(struct obj_t) + len + 1);
+
+    err->type = TYPE_ERROR;
+    err->len = len;
+    err->rc = 1;
+    strcpy(err->arr, message);
+
+    return err;
+}
+
+obj_t shrink(obj_t *obj, u64_t len)
+{
+    debug_assert(is_vector(*obj));
+
+    if ((*obj)->len == len)
+        return;
+
+    // calculate size of vector with new length
+    i64_t new_size = sizeof(struct obj_t) + len * size_of((*obj)->type);
+
+    *obj = heap_realloc(*obj, new_size);
+    (*obj)->len = len;
+
+    return *obj;
+}
+
+obj_t join_raw(obj_t *obj, nil_t *val)
+{
+    i64_t off, occup, req;
+    i32_t size = size_of((*obj)->type);
+
+    off = (*obj)->len * size;
+    occup = sizeof(struct obj_t) + off;
+    req = occup + size;
+    *obj = heap_realloc(*obj, req);
+    memcpy((*obj)->arr + off, &val, size);
+    (*obj)->len++;
+
+    return obj;
+}
+
+obj_t join_obj(obj_t *obj, obj_t val)
+{
+    obj_t lst = NULL;
+    u64_t i, l;
+
+    // change vector type to a list
+    // if (obj->type && obj->type != -val->type)
+    // {
+    //     l = obj->len;
+    //     lst = list(l + 1);
+
+    //     for (i = 0; i < l; i++)
+    //         as_list(lst)[i] = vector_get(vec, i);
+
+    //     as_list(&lst)[index] = value;
+
+    //     drop(vec);
+
+    //     *vec = lst;
+
+    //     return lst;
+    // }
+
+    return join_raw(obj, val);
+}
+
+obj_t join_sym(obj_t *obj, str_t str)
+{
+    i64_t sym = intern_symbol(str, strlen(str));
+    return join_raw(obj, sym);
 }
 
 bool_t is_null(obj_t obj)
@@ -251,7 +322,7 @@ obj_t __attribute__((hot)) clone(obj_t obj)
     if (obj == NULL)
         return NULL;
 
-    i64_t i, l;
+    u64_t i, l;
     u16_t slaves = runtime_get()->slaves;
 
     if (slaves)
@@ -301,7 +372,8 @@ nil_t __attribute__((hot)) drop(obj_t obj)
     if (obj == NULL)
         return;
 
-    i64_t i, rc, l;
+    u32_t rc;
+    u64_t i, l;
     u16_t slaves = runtime_get()->slaves;
 
     if (slaves)
@@ -362,7 +434,8 @@ nil_t __attribute__((hot)) drop(obj_t obj)
             heap_free(obj);
         return;
     default:
-        panic(str_fmt(0, "free: invalid type: %d", obj->type));
+        if (rc == 0)
+            heap_free(obj);
     }
 }
 
@@ -440,9 +513,9 @@ obj_t cow(obj_t obj)
 /*
  * Get the reference count of an rf_
  */
-i64_t rc(obj_t obj)
+u32_t rc(obj_t obj)
 {
-    i64_t rc;
+    u32_t rc;
     u16_t slaves = runtime_get()->slaves;
 
     if (slaves)

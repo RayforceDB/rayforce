@@ -31,6 +31,7 @@
 #include "heap.h"
 #include "util.h"
 #include "runtime.h"
+#include "ops.h"
 
 #define SYMBOLS_POOL_SIZE 4096 * 8
 

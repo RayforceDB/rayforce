@@ -30,9 +30,9 @@
 #include "heap.h"
 #include "format.h"
 #include "string.h"
-#include "vector.h"
+
 #include "util.h"
-#include "dict.h"
+
 #include "debuginfo.h"
 #include "runtime.h"
 #include "ops.h"
@@ -64,49 +64,49 @@ u32_t span_commit(parser_t *parser, span_t span)
     return parser->count++;
 }
 
-bool_t is_whitespace(i8_t c)
+bool_t is_whitespace(char_t c)
 {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-bool_t is_digit(i8_t c)
+bool_t is_digit(char_t c)
 {
     return c >= '0' && c <= '9';
 }
 
-bool_t is_alpha(i8_t c)
+bool_t is_alpha(char_t c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
-bool_t is_alphanum(i8_t c)
+bool_t is_alphanum(char_t c)
 {
     return is_alpha(c) || is_digit(c);
 }
 
-bool_t is_op(i8_t c)
+bool_t is_op(char_t c)
 {
     return strchr("+-*/%&|^~<>!=", c) != NULL;
 }
 
-bool_t at_eof(i8_t c)
+bool_t at_eof(char_t c)
 {
     return c == '\0' || c == EOF;
 }
 
-bool_t at_term(i8_t c)
+bool_t at_term(char_t c)
 {
     return c == ')' || c == ']' || c == '}' || c == ':' || c == '\n';
 }
 
-bool_t is_at(obj_t token, i8_t c)
+bool_t is_at(obj_t token, char_t c)
 {
-    return token->type == TYPE_TOKEN && token->i64 == (i64_t)c;
+    return token->type == TYPE_CHAR && token->schar == c;
 }
 
 bool_t is_at_term(obj_t token)
 {
-    return token->type == TYPE_TOKEN && at_term(token->i64);
+    return token->type == TYPE_CHAR && at_term(token->schar);
 }
 
 i8_t shift(parser_t *parser, i32_t num)
@@ -123,8 +123,8 @@ i8_t shift(parser_t *parser, i32_t num)
 
 obj_t to_token(parser_t *parser)
 {
-    obj_t tok = i64(*parser->current);
-    tok->type = TYPE_TOKEN;
+    obj_t tok = schar(*parser->current);
+    tok->type = TYPE_CHAR;
     // tok->id = span_commit(parser, span_start(parser));
     return tok;
 }
@@ -548,6 +548,7 @@ obj_t parse_vector(parser_t *parser)
             else
             {
                 drop(vec);
+                drop(token);
                 err = error(ERR_PARSE, "Invalid token in vector");
                 // err->id = token->id;
                 return err;
@@ -563,6 +564,7 @@ obj_t parse_vector(parser_t *parser)
             else
             {
                 drop(vec);
+                drop(token);
                 err = error(ERR_PARSE, "Invalid token in vector");
                 // err->id = token->id;
                 return err;
@@ -571,6 +573,7 @@ obj_t parse_vector(parser_t *parser)
         else
         {
             drop(vec);
+            drop(token);
             err = error(ERR_PARSE, "Invalid token in vector");
             // err->id = token->id;
             return err;
@@ -581,6 +584,7 @@ obj_t parse_vector(parser_t *parser)
         token = advance(parser);
     }
 
+    drop(token);
     span_extend(parser, &span);
     // vec->id = span_commit(parser, span);
 
@@ -631,6 +635,7 @@ obj_t parse_list(parser_t *parser)
         token = advance(parser);
     }
 
+    drop(token);
     span_extend(parser, &span);
     // lst->id = span_commit(parser, span);
 
@@ -658,6 +663,7 @@ obj_t parse_dict(parser_t *parser)
         {
             drop(keys);
             drop(vals);
+            drop(token);
             err = error(ERR_PARSE, "Expected '}'");
             // err->id = token->id;
             return err;
@@ -675,7 +681,7 @@ obj_t parse_dict(parser_t *parser)
             return token;
         }
 
-        if (!is_at(&token, ':'))
+        if (!is_at(token, ':'))
         {
             err = error(ERR_PARSE, "Expected ':'");
             // err->id = token->id;
@@ -685,6 +691,7 @@ obj_t parse_dict(parser_t *parser)
             return err;
         }
 
+        drop(token);
         token = advance(parser);
 
         if (is_error(token))
@@ -698,6 +705,7 @@ obj_t parse_dict(parser_t *parser)
         {
             drop(keys);
             drop(vals);
+            drop(token);
             err = error(ERR_PARSE, "Expected value folowing ':'");
             // err->id = token->id;
             return err;
@@ -709,6 +717,7 @@ obj_t parse_dict(parser_t *parser)
         token = advance(parser);
     }
 
+    drop(token);
     d = dict(keys, vals);
 
     span_extend(parser, &span);
@@ -776,6 +785,8 @@ obj_t advance(parser_t *parser)
         tok = parse_timestamp(parser);
         if (!is_null(tok))
             return tok;
+
+        drop(tok);
     }
 
     if (((*parser->current) == '-' && is_digit(*(parser->current + 1))) || is_digit(*parser->current))
@@ -807,34 +818,37 @@ obj_t advance(parser_t *parser)
 
 obj_t parse_program(parser_t *parser)
 {
-    obj_t token, lst = list(0), err;
+    obj_t tok, lst = list(0), err;
     str_t msg;
 
     while (!at_eof(*parser->current))
     {
-        token = advance(parser);
-        printf("T: %d\n", token->type);
+        tok = advance(parser);
 
-        if (is_error(token))
-        {
-            drop(list);
-            return token;
-        }
-
-        if (is_at_term(token))
+        if (is_error(tok))
         {
             drop(lst);
-            msg = str_fmt(0, "Unexpected token: '%c'", token->i64);
+            return tok;
+        }
+
+        if (is_at_term(tok))
+        {
+            msg = str_fmt(0, "Unexpected token: '%c'", tok->schar);
+            drop(lst);
+            drop(tok);
             err = error(ERR_PARSE, msg);
             heap_free(msg);
             // err->id = token->id;
             return err;
         }
 
-        if (is_at(token, '\0'))
+        if (is_at(tok, '\0'))
+        {
+            drop(tok);
             break;
+        }
 
-        join_obj(&lst, token);
+        join_obj(&lst, tok);
     }
 
     return lst;

@@ -56,8 +56,8 @@ obj_t rf_call_vary(u8_t flags, vary_t f, obj_t *x, i64_t n)
 
 obj_t rf_gc(obj_t *x, i64_t n)
 {
-    UNUSED(x);
-    UNUSED(n);
+    unused(x);
+    unused(n);
     return i64(heap_gc());
 }
 

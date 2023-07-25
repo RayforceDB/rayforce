@@ -33,12 +33,11 @@
 #include "../core/format.h"
 #include "../core/unary.h"
 #include "../core/vm.h"
-#include "../core/vector.h"
 #include "../core/parse.h"
 #include "../core/runtime.h"
 #include "../core/cc.h"
+#include "../core/util.h"
 #include "../core/debuginfo.h"
-#include "../core/dict.h"
 #include "../core/heap.h"
 
 #define LINE_SIZE 2048
@@ -101,8 +100,10 @@ nil_t repl(str_t name, parser_t *parser, str_t buf, i32_t len)
     str_t formatted = NULL;
 
     parsed = parse(parser, name, buf);
-    printf("%s\n", obj_fmt(parsed));
+    formatted = obj_fmt(parsed);
+    printf("%s\n", formatted);
     drop(parsed);
+    heap_free(formatted);
     return;
 
     if (is_error(parsed))
@@ -148,7 +149,7 @@ nil_t repl(str_t name, parser_t *parser, str_t buf, i32_t len)
 
 nil_t int_handler(i32_t sig)
 {
-    UNUSED(sig);
+    unused(sig);
     running = false;
 }
 
@@ -166,7 +167,7 @@ i32_t main(i32_t argc, str_t argv[])
 
     runtime_init(0);
 
-    obj_t args = parse_cmdline(argc, argv), filename, symfile = symbol("file"), file;
+    obj_t args = parse_cmdline(argc, argv), filename, file;
     str_t line, ptr;
     parser_t parser = parser_new();
 
@@ -177,18 +178,18 @@ i32_t main(i32_t argc, str_t argv[])
     line = (str_t)mmap_malloc(LINE_SIZE);
 
     // load file
-    filename = dict_get(args, symfile);
-    if (!is_null(filename))
-    {
-        file = rf_fread(filename);
-        if (file->type == TYPE_ERROR)
-            print_error(file, as_string(filename), NULL, 0);
-        else
-            repl(as_string(filename), &parser, as_string(file), file->len);
+    // filename = dict_get(args, symfile);
+    // if (!is_null(filename))
+    // {
+    //     file = rf_fread(filename);
+    //     if (file->type == TYPE_ERROR)
+    //         print_error(file, as_string(filename), NULL, 0);
+    //     else
+    //         repl(as_string(filename), &parser, as_string(file), file->len);
 
-        drop(file);
-        drop(filename);
-    }
+    //     drop(file);
+    //     drop(filename);
+    // }
     // --
 
     while (running)

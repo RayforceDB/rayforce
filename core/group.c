@@ -22,18 +22,20 @@
  */
 
 #include "group.h"
-#include "vector.h"
+#include "util.h"
 #include "set.h"
+#include "ops.h"
+#include "symbols.h"
 
 #define MAX_LINEAR_VALUE 1024 * 1024 * 64
 #define normalize(k) ((u64_t)(k - min))
 
 bool_t cnt_update(i64_t key, i64_t val, nil_t *seed, i64_t *tkey, i64_t *tval)
 {
-    UNUSED(key);
-    UNUSED(*tkey);
-    UNUSED(seed);
-    UNUSED(val);
+    unused(key);
+    unused(*tkey);
+    unused(seed);
+    unused(val);
 
     *tval += 1;
     return true;
@@ -41,8 +43,8 @@ bool_t cnt_update(i64_t key, i64_t val, nil_t *seed, i64_t *tkey, i64_t *tval)
 
 bool_t pos_update(i64_t key, i64_t val, nil_t *seed, i64_t *tkey, i64_t *tval)
 {
-    UNUSED(key);
-    UNUSED(*tkey);
+    unused(key);
+    unused(*tkey);
 
     // contains count of elements (replace with vector)
     if ((*tval & (1ll << 62)) == 0)
@@ -120,7 +122,7 @@ obj_t rf_distinct_vector_i64(obj_t x)
         }
 
         drop(mask);
-        shrink(vec, j);
+        shrink(&vec, j);
 
         vec->flags |= VEC_ATTR_DISTINCT;
 
@@ -162,7 +164,7 @@ obj_t rf_distinct_vector_i64(obj_t x)
         }
 
         vec->flags |= VEC_ATTR_DISTINCT;
-        shrink(vec, j);
+        shrink(&vec, j);
         drop(mask);
         set_free(set);
 
@@ -178,7 +180,7 @@ set:
             ov[j++] = iv1[i];
 
     vec->flags |= VEC_ATTR_DISTINCT;
-    shrink(vec, j);
+    shrink(&vec, j);
     set_free(set);
 
     return vec;
@@ -256,8 +258,8 @@ obj_t rf_group_vector_i64(obj_t x)
 
         drop(mask);
 
-        shrink(keys, j);
-        shrink(vals, j);
+        shrink(&keys, j);
+        shrink(&vals, j);
 
         return dict(keys, vals);
     }

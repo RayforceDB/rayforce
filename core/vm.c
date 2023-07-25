@@ -33,7 +33,7 @@
 #include "ops.h"
 #include "env.h"
 #include "runtime.h"
-#include "dict.h"
+
 #include "unary.h"
 #include "binary.h"
 #include "vary.h"
@@ -133,7 +133,7 @@ op_halt:
 op_push:
     vm->ip++;
     load_u64(l, vm);
-    x1 = vector_get(&f->constants, l);
+    x1 = clone(as_list(f->constants)[l]);
     stack_push(vm, x1);
     dispatch();
 op_pop:
@@ -307,19 +307,19 @@ op_lset:
     dispatch();
 op_lget:
     b = vm->ip++;
-    x1 = stack_pop(vm);
-    j = f->locals->len;
-    x2 = null();
-    for (i = 0; i < j; i++)
-    {
-        x2 = dict_get(&as_list(f->locals)[j - i - 1], x1);
-        if (!is_null(&x2))
-            break;
-    }
-    if (is_null(&x2))
-        x2 = rf_get_variable(&x1);
-    unwrap(x2, b);
-    stack_push(vm, x2);
+    // x1 = stack_pop(vm);
+    // j = f->locals->len;
+    // x2 = null();
+    // for (i = 0; i < j; i++)
+    // {
+    //     x2 = dict_get(&as_list(f->locals)[j - i - 1], x1);
+    //     if (!is_null(&x2))
+    //         break;
+    // }
+    // if (is_null(&x2))
+    //     x2 = rf_get_variable(&x1);
+    // unwrap(x2, b);
+    // stack_push(vm, x2);
     dispatch();
 op_lpush:
     b = vm->ip++;

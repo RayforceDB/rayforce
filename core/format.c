@@ -28,7 +28,7 @@
 #include "rayforce.h"
 #include "heap.h"
 #include "util.h"
-#include "dict.h"
+
 #include "debuginfo.h"
 #include "runtime.h"
 #include "ops.h"
@@ -228,6 +228,31 @@ i32_t guid_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, guid_t *
     return n;
 }
 
+i32_t raw_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t limit, obj_t obj, i32_t i)
+{
+    switch (obj->type)
+    {
+    case TYPE_BOOL:
+        return bool_fmt_into(dst, len, offset, limit, as_vector_bool(obj)[i]);
+    case TYPE_I64:
+        return i64_fmt_into(dst, len, offset, limit, as_vector_i64(obj)[i]);
+    case TYPE_F64:
+        return f64_fmt_into(dst, len, offset, limit, as_vector_f64(obj)[i]);
+    case TYPE_SYMBOL:
+        return symbol_fmt_into(dst, len, offset, limit, as_vector_symbol(obj)[i]);
+    case TYPE_TIMESTAMP:
+        return ts_fmt_into(dst, len, offset, limit, as_vector_timestamp(obj)[i]);
+    // case TYPE_GUID:
+    //     return guid_fmt_into(dst, len, offset, limit, as_vector_guid(obj)[i]);
+    // case TYPE_CHAR:
+    //     return str_fmt_into(dst, len, offset, limit, "%c", as_vector_char(obj)[i]);
+    case TYPE_LIST:
+        return obj_fmt_into(dst, len, offset, indent, limit, as_list(obj)[i]);
+    default:
+        return str_fmt_into(dst, len, offset, limit, "null");
+    }
+}
+
 i32_t vector_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, obj_t obj)
 {
     if (obj->len == 0)
@@ -244,28 +269,7 @@ i32_t vector_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, obj_t 
 
     for (i = 0; i < l; i++)
     {
-        switch (obj->type)
-        {
-        case TYPE_BOOL:
-            n += bool_fmt_into(dst, len, offset, limit, as_vector_bool(obj)[i]);
-            break;
-        case TYPE_I64:
-            n += i64_fmt_into(dst, len, offset, limit, as_vector_i64(obj)[i]);
-            break;
-        case TYPE_F64:
-            n += f64_fmt_into(dst, len, offset, limit, as_vector_f64(obj)[i]);
-            break;
-        case TYPE_SYMBOL:
-            n += symbol_fmt_into(dst, len, offset, limit, as_vector_symbol(obj)[i]);
-            break;
-        case TYPE_TIMESTAMP:
-            n += ts_fmt_into(dst, len, offset, limit, as_vector_timestamp(obj)[i]);
-            break;
-        default:
-            n += str_fmt_into(dst, len, offset, limit, "null");
-            break;
-        }
-
+        n += raw_fmt_into(dst, len, offset, indent, limit, obj, i);
         if (n > limit)
             break;
 
@@ -341,15 +345,9 @@ i32_t dict_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t l
     for (i = 0; i < dict_height; i++)
     {
         maxn(n, str_fmt_into(dst, len, offset, 0, "\n%*.*s", indent, indent, PADDING));
-        v = vector_get(keys, i);
-        maxn(n, obj_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, &v));
-        drop(v);
-
+        maxn(n, raw_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, keys, i));
         n += str_fmt_into(dst, len, offset, MAX_ROW_WIDTH, ": ");
-
-        v = vector_get(vals, i);
-        maxn(n, obj_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, &v));
-        drop(v);
+        maxn(n, raw_fmt_into(dst, len, offset, indent, MAX_ROW_WIDTH, vals, i));
     }
 
     if (dict_height < (i32_t)keys->len)
@@ -394,11 +392,7 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, obj_t 
             s = NULL;
             l = 0;
             o = 0;
-
-            c = vector_get(column, j);
-            maxn(n, obj_fmt_into(&s, &l, &o, 0, 31, &c));
-            drop(c);
-
+            raw_fmt_into(&s, &l, &o, 0, 31, column, j);
             formatted_columns[i][j] = s;
             maxn(as_vector_i64(column_widths)[i], n);
         }
@@ -450,8 +444,6 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, obj_t 
 
 i32_t error_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, obj_t error)
 {
-    UNUSED(limit);
-
     return str_fmt_into(dst, len, offset, limit, "** [E%.3d] error: %s", error->code, as_string(error));
 }
 
@@ -460,16 +452,18 @@ i32_t internal_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, obj_
     obj_t functions = &runtime_get()->env.functions;
     i64_t id, sym;
 
-    id = vector_find(&as_list(functions)[1], obj);
-    sym = as_vector_symbol(as_list(functions)[0])[id];
+    // id = vector_find(&as_list(functions)[1], obj);
+    // sym = as_vector_symbol(as_list(functions)[0])[id];
 
-    return symbol_fmt_into(dst, len, offset, limit, sym);
+    // return symbol_fmt_into(dst, len, offset, limit, sym);
+
+    return str_fmt_into(dst, len, offset, limit, "<internal>");
 }
 
 i32_t lambda_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, obj_t obj)
 {
-    UNUSED(limit);
-    UNUSED(obj);
+    unused(limit);
+    unused(obj);
 
     // lambda_t *lambda = as_lambda(obj_t);
 

@@ -27,7 +27,7 @@
 #include "rayforce.h"
 #include "heap.h"
 #include "vm.h"
-#include "vector.h"
+
 
 // offset in array of typenames for each type
 #define TYPE_OFFSET TYPE_CHAR
