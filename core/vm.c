@@ -45,14 +45,14 @@ CASSERT(OP_INVALID < 127, vm_h)
 #define stack_pop(v) (v->stack[--v->sp])
 #define stack_peek(v) (&v->stack[v->sp - 1])
 #define stack_peek_n(v, n) (&v->stack[v->sp - 1 - (n)])
-#define stack_debug(v)                                               \
-    {                                                                \
-        i32_t _i = v->sp;                                            \
-        while (_i > 0)                                               \
-        {                                                            \
-            debug("%d: %s", v->sp - _i, obj_fmt(&v->stack[_i - 1])); \
-            _i--;                                                    \
-        }                                                            \
+#define stack_debug(v)                                              \
+    {                                                               \
+        i32_t _i = v->sp;                                           \
+        while (_i > 0)                                              \
+        {                                                           \
+            debug("%d: %s", v->sp - _i, obj_fmt(v->stack[_i - 1])); \
+            _i--;                                                   \
+        }                                                           \
     }
 
 typedef struct ctx_t
@@ -66,7 +66,7 @@ typedef struct ctx_t
 
 vm_t vm_new()
 {
-    obj_t stack = (obj_t)mmap_stack(VM_STACK_SIZE);
+    obj_t *stack = (obj_t *)mmap_stack(VM_STACK_SIZE);
 
     vm_t vm = {
         .trace = 0,

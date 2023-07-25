@@ -58,7 +58,7 @@ typedef enum vm_opcode_t
     OP_CATCH,     // Catch an error from vm register and push it onto the stack
     OP_THROW,     // Throw an error
     OP_TRACE,     // Print stack trace (limit)
-    OP_HEAP,     // Allocate obj_t
+    OP_HEAP,      // Allocate obj_t
     OP_MAP,       // Map lambda over array
     OP_COLLECT,   // Collect array of results
     OP_EVAL,      // Compile/evaluate list of expressions as a lambda
@@ -69,12 +69,12 @@ typedef enum vm_opcode_t
 
 typedef struct vm_t
 {
-    i8_t halted;     // Halt flag
-    u8_t trace;      // Trace flag (print stack trace on error limited to n frames)
-    i32_t ip;        // Instruction pointer
-    i32_t sp;        // Stack pointer
-    i32_t bp;        // Base pointer (beginning on stack frame)
-    i64_t timer;     // Timer for execution time
+    i8_t halted;  // Halt flag
+    u8_t trace;   // Trace flag (print stack trace on error limited to n frames)
+    i32_t ip;     // Instruction pointer
+    i32_t sp;     // Stack pointer
+    i32_t bp;     // Base pointer (beginning on stack frame)
+    i64_t timer;  // Timer for execution time
     obj_t *stack; // Stack of arguments
 } vm_t;
 
