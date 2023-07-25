@@ -30,17 +30,21 @@
 #include "guid.h"
 #include "runtime.h"
 #include "format.h"
+#include "ops.h"
 
-#define regf(r, n, t, f, o)                                               \
-    {                                                                     \
-        obj_t k = symboli64(intern_keyword(n, strlen(n)));                \
-        dict_set(r, &k, (obj_t){.type = t, .flags = f, .i64 = (i64_t)o}); \
+#define regf(r, n, t, f, o)                                     \
+    {                                                           \
+        join_raw(&as_list(r)[0], intern_keyword(n, strlen(n))); \
+        obj_t _o = atom(-t);                                    \
+        _o->flags = f;                                          \
+        _o->i64 = (i64_t)o;                                     \
+        join_raw(&as_list(r)[1], _o);                           \
     };
 
-#define regt(r, i, s)               \
-    {                               \
-        obj_t k = i64(i);           \
-        dict_set(r, &k, symbol(s)); \
+#define regt(r, i, s)                \
+    {                                \
+        join_raw(&as_list(r)[0], i); \
+        join_sym(&as_list(r)[1], s); \
     };
 
 obj_t rf_env()
@@ -72,8 +76,7 @@ obj_t rf_memstat()
 nil_t init_functions(obj_t functions)
 {
     // Unary
-    // REC(functions,  "trace",      OP_TRACE);   
-    // regf(functions,  "type",      TYPE_UNARY,    FLAG_NONE,         rf_type);
+    regf(functions,  "type",      TYPE_UNARY,    FLAG_NONE,         rf_type);
     // regf(functions,  "til",       TYPE_UNARY,    FLAG_NONE,         rf_til);
     // regf(functions,  "distinct",  TYPE_UNARY,    FLAG_ATOMIC,       rf_distinct);
     // regf(functions,  "group",     TYPE_UNARY,    FLAG_ATOMIC,       rf_group);
@@ -139,29 +142,28 @@ nil_t init_functions(obj_t functions)
     
 nil_t init_typenames(obj_t typenames)    
 {
-    // regt(typenames,   -TYPE_BOOL,       "bool");
-    // regt(typenames,   -TYPE_I64,        "i64");
-    // regt(typenames,   -TYPE_F64,        "f64");
-    // regt(typenames,   -TYPE_CHAR,       "char");
-    // regt(typenames,   -TYPE_SYMBOL,     "symbol");
-    // regt(typenames,   -TYPE_TIMESTAMP,  "timestamp");
-    // regt(typenames,   -TYPE_GUID,       "guid");
-    // regt(typenames,    TYPE_NULL,       "null");
-    // regt(typenames,    TYPE_BOOL,       "vector_bool");
-    // regt(typenames,    TYPE_I64,        "vector_i64");
-    // regt(typenames,    TYPE_F64,        "vector_f64");
-    // regt(typenames,    TYPE_CHAR,       "Char");
-    // regt(typenames,    TYPE_SYMBOL,     "vector_symbol");
-    // regt(typenames,    TYPE_TIMESTAMP,  "vector_timestamp");
-    // regt(typenames,    TYPE_GUID,       "vector_guid");
-    // regt(typenames,    TYPE_LIST,       "List");
-    // regt(typenames,    TYPE_TABLE,      "Table");
-    // regt(typenames,    TYPE_DICT,       "Dict");
-    // regt(typenames,    TYPE_UNARY,      "Unary");
-    // regt(typenames,    TYPE_BINARY,     "Binary");
-    // regt(typenames,    TYPE_VARY,       "Vary");
-    // regt(typenames,    TYPE_LAMBDA,     "Lambda");
-    // regt(typenames,    TYPE_ERROR,      "Error");
+    regt(typenames,   -TYPE_BOOL,       "bool");
+    regt(typenames,   -TYPE_I64,        "i64");
+    regt(typenames,   -TYPE_F64,        "f64");
+    regt(typenames,   -TYPE_CHAR,       "char");
+    regt(typenames,   -TYPE_SYMBOL,     "symbol");
+    regt(typenames,   -TYPE_TIMESTAMP,  "timestamp");
+    regt(typenames,   -TYPE_GUID,       "guid");
+    regt(typenames,    TYPE_BOOL,       "vector_bool");
+    regt(typenames,    TYPE_I64,        "vector_i64");
+    regt(typenames,    TYPE_F64,        "vector_f64");
+    regt(typenames,    TYPE_CHAR,       "Char");
+    regt(typenames,    TYPE_SYMBOL,     "vector_symbol");
+    regt(typenames,    TYPE_TIMESTAMP,  "vector_timestamp");
+    regt(typenames,    TYPE_GUID,       "vector_guid");
+    regt(typenames,    TYPE_LIST,       "List");
+    regt(typenames,    TYPE_TABLE,      "Table");
+    regt(typenames,    TYPE_DICT,       "Dict");
+    regt(typenames,    TYPE_UNARY,      "Unary");
+    regt(typenames,    TYPE_BINARY,     "Binary");
+    regt(typenames,    TYPE_VARY,       "Vary");
+    regt(typenames,    TYPE_LAMBDA,     "Lambda");
+    regt(typenames,    TYPE_ERROR,      "Error");
 }
 
 
@@ -197,9 +199,9 @@ env_t create_env()
 
     init_kw_symbols();
 
-    init_functions(&functions);
+    init_functions(functions);
 
-    init_typenames(&typenames);
+    init_typenames(typenames);
 
     env_t env = {
         .functions = functions,

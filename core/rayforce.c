@@ -340,6 +340,9 @@ obj_t __attribute__((hot)) clone(obj_t obj)
     case TYPE_TIMESTAMP:
     case TYPE_CHAR:
     case TYPE_LAMBDA:
+    case TYPE_UNARY:
+    case TYPE_BINARY:
+    case TYPE_VARY:
     case TYPE_ERROR:
         return obj;
     case TYPE_LIST:
@@ -391,6 +394,9 @@ nil_t __attribute__((hot)) drop(obj_t obj)
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
     case TYPE_CHAR:
+    case TYPE_UNARY:
+    case TYPE_BINARY:
+    case TYPE_VARY:
         if (rc == 0)
             heap_free(obj);
         return;
