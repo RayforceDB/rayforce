@@ -126,7 +126,7 @@ cc_result_t cc_compile_time(cc_t *cc, obj_t obj, u32_t arity)
 cc_result_t cc_compile_set(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t arity)
 {
     cc_result_t res;
-    obj_t car = &as_list(obj)[0];
+    obj_t car = as_list(obj)[0];
     lambda_t *func = as_lambda(cc->lambda);
     obj_t *code = &func->code;
 
@@ -765,12 +765,6 @@ cc_result_t cc_compile_load(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t arit
     return CC_OK;
 }
 
-/*
- * Special forms are those that are not in a table of lambdas because of their special nature.
- * return TYPE_ERROR if there is an error
- * return TYPE_NONE if it is not a special form
- * return type of the special form if it is a special form
- */
 cc_result_t cc_compile_special_forms(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t arity)
 {
     switch (as_list(obj)[0]->i64)

@@ -104,14 +104,15 @@ obj_t __attribute__((hot)) vm_exec(vm_t *vm, obj_t fun)
 
 #define dispatch() goto *dispatch_table[(i32_t)code[vm->ip]]
 
-#define unwrap(x, y)                    \
-    {                                   \
-        obj_t o = x;                    \
-        if (o && o->type == TYPE_ERROR) \
-        {                               \
-                                        \
-            return o;                   \
-        }                               \
+#define unwrap(x, y)                           \
+    {                                          \
+        obj_t o = x;                           \
+        if (o && o->type == TYPE_ERROR)        \
+        {                                      \
+            span_t span = nfo_get(&f->nfo, y); \
+            *(span_t *)&as_list(o)[2] = span;  \
+            return o;                          \
+        }                                      \
     }
 
 #define load_u64(x, v)                                    \

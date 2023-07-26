@@ -311,10 +311,24 @@ obj_t rf_dict(obj_t x, obj_t y)
 
 obj_t rf_cast(obj_t x, obj_t y)
 {
+    type_t type;
+    obj_t err;
+    str_t fmt, msg;
+
     if (x->type != -TYPE_SYMBOL)
         raise(ERR_TYPE, "cast: first argument must be a symbol");
 
-    type_t type = env_get_type_by_typename(&runtime_get()->env, x->i64);
+    type = env_get_type_by_typename(&runtime_get()->env, x->i64);
+
+    if (type == TYPE_ERROR)
+    {
+        fmt = obj_fmt(x);
+        msg = str_fmt(0, "cast: unknown type: '%s'", fmt);
+        err = error(ERR_TYPE, msg);
+        heap_free(fmt);
+        heap_free(msg);
+        return err;
+    }
 
     return cast(type, y);
 }

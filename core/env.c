@@ -223,7 +223,7 @@ i64_t env_get_typename_by_type(env_t *env, type_t type)
 {
     i64_t i = find_raw(as_list(env->typenames)[0], type);
 
-    if (i == env->typenames->len)
+    if (i == as_list(env->typenames)[0])
         return NULL_I64;
 
     return as_vector_symbol(as_list(env->typenames)[1])[i];
@@ -233,8 +233,8 @@ type_t env_get_type_by_typename(env_t *env, i64_t name)
 {
     i64_t i = find_raw(as_list(env->typenames)[1], name);
 
-    if (i == env->typenames->len)
-        return TYPE_NONE;
+    if (i == as_list(env->typenames)[1]->len)
+        return TYPE_ERROR;
 
     return (type_t)as_vector_i64(as_list(env->typenames)[0])[i];
 }
