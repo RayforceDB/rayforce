@@ -126,15 +126,13 @@ obj_t rf_count(obj_t x)
     if (!x)
         return i64(0);
 
-    if (is_vector(x))
-        return i64(x->len);
-
     switch (x->type)
     {
     case TYPE_TABLE:
+    case TYPE_DICT:
         return i64(as_list(as_list(x)[1])[0]->len);
     default:
-        return i64(1);
+        return i64(x->len);
     }
 }
 

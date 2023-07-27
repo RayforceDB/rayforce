@@ -41,6 +41,7 @@ obj_t atom(type_t type)
     a->type = -type;
     a->rc = 1;
     a->attrs = 0;
+    a->len = 1;
 
     return a;
 }
@@ -141,6 +142,7 @@ obj_t vector(type_t type, u64_t len)
     vec->type = type;
     vec->rc = 1;
     vec->len = len;
+    vec->attrs = 0;
 
     return vec;
 }
@@ -163,6 +165,7 @@ obj_t list(u64_t len, ...)
     l->type = TYPE_LIST;
     l->rc = 1;
     l->len = len;
+    l->attrs = 0;
 
     va_start(args, len);
 

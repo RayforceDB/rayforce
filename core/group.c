@@ -164,6 +164,7 @@ obj_t rf_distinct_vector_i64(obj_t x)
         }
 
         vec->attrs |= ATTR_DISTINCT;
+
         resize(&vec, j);
         drop(mask);
         set_free(set);
@@ -180,6 +181,7 @@ set:
             ov[j++] = iv1[i];
 
     vec->attrs |= ATTR_DISTINCT;
+
     resize(&vec, j);
     set_free(set);
 
