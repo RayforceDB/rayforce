@@ -100,6 +100,7 @@ nil_t repl(str_t name, parser_t *parser, str_t buf, i32_t len)
     str_t formatted = NULL;
 
     parsed = parse(parser, name, buf);
+    // printf("%s\n", obj_fmt(parsed));
 
     if (is_error(parsed))
     {

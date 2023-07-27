@@ -329,7 +329,11 @@ obj_t parse_number(parser_t *parser)
     num_i64 = strtoll(parser->current, &end, 10);
 
     if ((num_i64 == LONG_MAX || num_i64 == LONG_MIN) && errno == ERANGE)
-        return error(ERR_PARSE, "Number out of range");
+    {
+        span.end_column += (end - parser->current - 1);
+        nfo_insert(&parser->nfo, parser->count, span);
+        return parse_error(parser, parser->count++, str_fmt(0, "Number is out of range"));
+    }
 
     if (end == parser->current)
         return error(ERR_PARSE, "Invalid number");
@@ -340,7 +344,11 @@ obj_t parse_number(parser_t *parser)
         num_f64 = strtod(parser->current, &end);
 
         if (errno == ERANGE)
-            return error(ERR_PARSE, "Number out of range");
+        {
+            span.end_column += (end - parser->current);
+            nfo_insert(&parser->nfo, parser->count, span);
+            return parse_error(parser, parser->count++, str_fmt(0, "Number is out of range"));
+        }
 
         num = f64(num_f64);
     }
@@ -381,6 +389,13 @@ obj_t parse_char(parser_t *parser)
         // continue parsing a symbol
         while (!at_eof(*pos) && *pos != '\n' && (is_alphanum(*pos) || is_op(*pos)))
             pos++;
+
+        if (*pos == '\'')
+        {
+            span.end_column += (pos - parser->current);
+            nfo_insert(&parser->nfo, parser->count, span);
+            return parse_error(parser, parser->count++, str_fmt(0, "Invalid literal: char can not contain more than one symbol"));
+        }
 
         id = intern_symbol(parser->current + 1, pos - (parser->current + 1));
         res = i64(id);

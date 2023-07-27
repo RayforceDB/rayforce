@@ -969,6 +969,8 @@ obj_t cc_compile_lambda(bool_t top, str_t name, obj_t args, obj_t body, nfo_t *n
     // Compile all arguments but the last one
     for (i = 0; i < len - 1; i++)
     {
+        b++;
+
         // skip const expressions
         if ((*b)->type != TYPE_LIST)
             continue;
@@ -977,8 +979,6 @@ obj_t cc_compile_lambda(bool_t top, str_t name, obj_t args, obj_t body, nfo_t *n
 
         if (res == CC_ERROR)
             return cc.lambda;
-
-        b++;
     }
 
     // Compile last argument
