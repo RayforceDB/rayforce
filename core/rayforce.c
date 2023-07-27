@@ -379,7 +379,6 @@ obj_t at_idx(obj_t obj, u64_t idx)
 obj_t at_obj(obj_t obj, obj_t idx)
 {
     u64_t i;
-    obj_t res;
 
     if (obj == NULL)
         return null(0);
@@ -392,9 +391,7 @@ obj_t at_obj(obj_t obj, obj_t idx)
     case mtype2(TYPE_F64, -TYPE_I64):
     case mtype2(TYPE_CHAR, -TYPE_I64):
     case mtype2(TYPE_LIST, -TYPE_I64):
-        res = at_idx(obj, idx->i64);
-        drop(idx);
-        return res;
+        return at_idx(obj, idx->i64);
     default:
         if (obj->type == TYPE_DICT)
         {
@@ -427,10 +424,14 @@ obj_t set_idx(obj_t *obj, u64_t idx, obj_t val)
         as_string(*obj)[idx] = val->schar;
         drop(val);
         return *obj;
-    case mtype2(TYPE_LIST, -TYPE_I64):
-        as_list(*obj)[idx] = val;
-        return *obj;
     default:
+        if ((*obj)->type == TYPE_LIST)
+        {
+            drop(as_list(*obj)[idx]);
+            as_list(*obj)[idx] = val;
+            return *obj;
+        }
+
         raise(ERR_TYPE, "set_idx: invalid types: %d, %d", (*obj)->type, val->type);
     }
 }
@@ -448,21 +449,16 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
     case mtype2(TYPE_F64, -TYPE_I64):
     case mtype2(TYPE_CHAR, -TYPE_I64):
     case mtype2(TYPE_LIST, -TYPE_I64):
-        res = set_idx(obj, idx->i64, val);
-        drop(idx);
-        return res;
+        return set_idx(obj, idx->i64, val);
     default:
         if ((*obj)->type == TYPE_DICT)
         {
             i = find_obj(as_list(*obj)[0], idx);
             if (i == as_list(*obj)[0]->len)
             {
-                res = join_obj(&as_list(*obj)[0], idx);
+                res = join_obj(&as_list(*obj)[0], clone(idx));
                 if (res->type == TYPE_ERROR)
-                {
-                    drop(idx);
                     return res;
-                }
 
                 res = join_obj(&as_list(*obj)[1], val);
 
@@ -472,7 +468,7 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
                 return *obj;
             }
 
-            set_obj(&as_list(*obj)[1], i, val);
+            set_idx(&as_list(*obj)[1], i, val);
 
             return *obj;
         }

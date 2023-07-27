@@ -303,7 +303,7 @@ obj_t rf_set(obj_t key, obj_t val)
 {
     obj_t res;
 
-    res = set_obj(&runtime_get()->env.variables, clone(key), clone(val));
+    res = set_obj(&runtime_get()->env.variables, key, clone(val));
 
     if (res->type == TYPE_ERROR)
         return res;

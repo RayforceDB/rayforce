@@ -98,7 +98,15 @@ obj_t rf_call_unary(u8_t flags, unary_t f, obj_t x)
 
 obj_t rf_get(obj_t x)
 {
-    return at_obj(runtime_get()->env.variables, clone(x));
+    if (!x || x->type != -TYPE_SYMBOL)
+        raise(ERR_TYPE, "get: expected symbol");
+
+    obj_t val = at_obj(runtime_get()->env.variables, x);
+
+    if (is_null(val))
+        raise(ERR_NOT_EXIST, "variable '%s' does not exist", symbols_get(x->i64));
+
+    return val;
 }
 
 obj_t rf_type(obj_t x)
@@ -115,6 +123,9 @@ obj_t rf_type(obj_t x)
 
 obj_t rf_count(obj_t x)
 {
+    if (!x)
+        return i64(0);
+
     if (is_vector(x))
         return i64(x->len);
 
