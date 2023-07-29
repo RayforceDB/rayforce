@@ -202,7 +202,7 @@ bool_t pos_update(i64_t key, i64_t val, nil_t *seed, i64_t *tkey, i64_t *tval)
 
 obj_t distinct(obj_t x)
 {
-    i64_t i, j = 0, l, *p;
+    i64_t i, j = 0, l, *p, min, max, range;
     obj_t mask, vec, set;
 
     if (!x || x->len == 0)
@@ -211,7 +211,45 @@ obj_t distinct(obj_t x)
     if (x->attrs & ATTR_DISTINCT)
         return clone(x);
 
+    min = max = as_i64(x)[0];
+
     l = x->len;
+
+    for (i = 0; i < l; i++)
+    {
+        if (as_i64(x)[i] < min)
+            min = as_i64(x)[i];
+        else if (as_i64(x)[i] > max)
+            max = as_i64(x)[i];
+    }
+
+    range = max - min + 1;
+
+    if (range <= l)
+    {
+        mask = vector_bool(range);
+        memset(as_bool(mask), 0, range);
+
+        for (i = 0; i < l; i++)
+        {
+            if (!as_bool(mask)[as_i64(x)[i] - min])
+            {
+                as_bool(mask)[as_i64(x)[i] - min] = true;
+                j++;
+            }
+        }
+
+        vec = vector_i64(j);
+        l = mask->len;
+        j = 0;
+        for (i = 0; i < l; i++)
+            if (as_bool(mask)[i])
+                as_i64(vec)[j++] = i + min;
+
+        drop(mask);
+
+        return vec;
+    }
 
     set = ht_set(l);
     vec = vector_i64(l);
