@@ -202,7 +202,7 @@ bool_t pos_update(i64_t key, i64_t val, nil_t *seed, i64_t *tkey, i64_t *tval)
 
 obj_t distinct(obj_t x)
 {
-    i64_t i, j = 0, l, r, *p, min, max, range, k, w, b;
+    i64_t i, j, l, r, *p, min, max, range, k, w, b;
     obj_t mask, vec, set;
 
     if (!x || x->len == 0)
@@ -225,16 +225,16 @@ obj_t distinct(obj_t x)
 
     range = max - min + 1;
 
-    if (range <= l)
+    // if (range <= l)
     {
         r = alignup(range / 8, 8);
         if (!r)
             r = 1;
-        printf("RANGE: %lld\n", r);
+
         mask = vector_bool(r);
         memset(as_bool(mask), 0, r);
 
-        for (i = 0; i < l; i++)
+        for (i = 0, j = 0; i < l; i++)
         {
             k = as_i64(x)[i] - min;
             w = k / 8;
@@ -249,14 +249,17 @@ obj_t distinct(obj_t x)
 
         vec = vector_i64(j);
 
-        for (i = 0, j = 0; i < r; i++)
+        for (i = 0, j = 0; i < l; i++)
         {
             k = as_i64(x)[i] - min;
             w = k / 8;
             b = k & 7;
 
             if (as_bool(mask)[w] & (1 << b))
-                as_i64(vec)[j++] = 123;
+            {
+                as_i64(vec)[j++] = as_i64(x)[i];
+                as_bool(mask)[w] &= ~(1 << b);
+            }
         }
 
         drop(mask);
