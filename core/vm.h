@@ -36,35 +36,38 @@
 
 typedef enum vm_opcode_t
 {
-    OP_HALT = 0,  // Halt the VM
-    OP_PUSH,      // Push an obj_t to the stack
-    OP_POP,       // Pop an obj_t from the stack
-    OP_SWAP,      // Swap two obj_ts on the stack
-    OP_DUP,       // Duplicate an obj_t on the stack
-    OP_JNE,       // Jump if not equal
-    OP_JMP,       // Jump
-    OP_CALL1,     // Call unary
-    OP_CALL2,     // Call binary
-    OP_CALLN,     // Call vary
-    OP_CALLD,     // Dynamic call (call function from stack with n arguments)
-    OP_RET,       // Return from lambda
-    OP_TIMER_SET, // Start timer
-    OP_TIMER_GET, // Get timer value
-    OP_STORE,     // Store value somewhere in a stack pointed by argument
-    OP_LOAD,      // Load value from somewhere in a stack pointed by argument
-    OP_LSET,      // Set local variable
-    OP_LGET,      // Get local variable
-    OP_LPUSH,     // Attach dict frame to local variables
-    OP_LPOP,      // Detach dict frame from local variables
-    OP_TRY,       // Trap an expression to return here on error
-    OP_CATCH,     // Catch an error from vm register and push it onto the stack
-    OP_THROW,     // Throw an error
-    OP_TRACE,     // Print stack trace (limit)
-    OP_HEAP,      // Allocate obj_t
-    OP_MAP,       // Map lambda over array
-    OP_COLLECT,   // Collect array of results
-    OP_EVAL,      // Compile/evaluate list of expressions as a lambda
-    OP_FLOAD,     // Load source file
+    OP_HALT = 0,   // Halt the VM
+    OP_PUSH_CONST, // Push an obj_t to the stack
+    OP_PUSH_ACC,   // Push an accumulator to the stack
+    OP_POP,        // Pop an obj_t from the stack
+    OP_SWAP,       // Swap two obj_ts on the stack
+    OP_DUP,        // Duplicate an obj_t on the stack
+    OP_CMP,        // Get top of stack, interpret it as bool and push result into cmp register
+    OP_JNE,        // Jump if not equal
+    OP_JMP,        // Jump
+    OP_CALL1,      // Call unary
+    OP_CALL2,      // Call binary
+    OP_CALLN,      // Call vary
+    OP_CALLD,      // Dynamic call (call function from stack with n arguments)
+    OP_RET,        // Return from lambda
+    OP_TIMER_SET,  // Start timer
+    OP_TIMER_GET,  // Get timer value
+    OP_STORE,      // Store value somewhere in a stack pointed by argument
+    OP_LOAD,       // Load value from somewhere in a stack pointed by argument
+    OP_LSET,       // Set local variable
+    OP_LGET,       // Get local variable
+    OP_LPUSH,      // Attach dict frame to local variables
+    OP_LPOP,       // Detach dict frame from local variables
+    OP_TRY,        // Trap an expression to return here on error
+    OP_CATCH,      // Catch an error from vm register and push it onto the stack
+    OP_THROW,      // Throw an error
+    OP_TRACE,      // Print stack trace (limit)
+    OP_ALLOC,      // Allocate obj_t
+    OP_MAP,        // Map lambda over array
+    OP_COLLECT,    // Collect array of results
+    OP_EVAL,       // Compile/evaluate list of expressions as a lambda
+    OP_FLOAD,      // Load source file
+    OP_DEBUG,      // Print msg for debugging
 
     OP_INVALID, // Invalid opcode
 } vm_opcode_t;
@@ -72,6 +75,7 @@ typedef enum vm_opcode_t
 typedef struct vm_t
 {
     i8_t halted;  // Halt flag
+    bool_t cmp;   // Compare result flag
     u8_t trace;   // Trace flag (print stack trace on error limited to n frames)
     i64_t ip;     // Instruction pointer
     i64_t sp;     // Stack pointer

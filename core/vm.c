@@ -44,15 +44,11 @@ CASSERT(OP_INVALID < 127, vm_h)
 #define stack_push(x) (vm->stack[vm->sp++] = x)
 #define stack_pop() (vm->stack[--vm->sp])
 #define stack_peek() (&vm->stack[vm->sp - 1])
-#define stack_peek_n(n) (&vm->stack[vm->sp - 1 - (n)])
-#define stack_debug()                                        \
-    {                                                        \
-        i64_t _i = vm->sp;                                   \
-        while (_i > 0)                                       \
-        {                                                    \
-            debug("%d: %p", vm->sp - _i, vm->stack[_i - 1]); \
-            _i--;                                            \
-        }                                                    \
+#define stack_peek_n(n) (&vm->stack[vm->sp - (n)])
+#define stack_debug()                                      \
+    {                                                      \
+        for (i64_t _i = vm->sp; _i > 0;)                   \
+            debug("%d: %p", vm->sp - _i, vm->stack[--_i]); \
     }
 
 vm_t vm_new()
@@ -78,7 +74,8 @@ obj_t __attribute__((hot)) vm_exec(vm_t *vm, obj_t fun)
     obj_t x0, x1, x2, x3, *addr;
     u8_t n, attrs;
     u64_t l, p;
-    i64_t i, j, b, t;
+    i64_t i, j, b;
+    type_t t;
 
     vm->ip = 0;
     vm->sp = 0;
@@ -89,7 +86,7 @@ obj_t __attribute__((hot)) vm_exec(vm_t *vm, obj_t fun)
 
     // The indices of labels in the dispatch_table are the relevant opcodes
     static nil_t *dispatch_table[] = {
-        &&op_halt, &&op_push, &&op_pop, &&op_swap, &&op_dup, &&op_jne, &&op_jmp, &&op_call1, &&op_call2, &&op_calln,
+        &&op_halt, &&op_push_const, &&op_push_acc, &&op_pop, &&op_swap, &&op_dup, &&op_cmp, &&op_jne, &&op_jmp, &&op_call1, &&op_call2, &&op_calln,
         &&op_calld, &&op_ret, &&op_timer_set, &&op_timer_get, &&op_store, &&op_load, &&op_lset,
         &&op_lget, &&op_lpush, &&op_lpop, &&op_try, &&op_catch, &&op_throw,
         &&op_trace, &&op_alloc, &&op_map, &&op_collect, &&op_eval, &&op_fload};
@@ -140,11 +137,15 @@ op_halt:
         return stack_pop();
     else
         return null(0);
-op_push:
+op_push_const:
     vm->ip++;
     n = code[vm->ip++];
     x1 = clone(as_list(f->constants)[n]);
     stack_push(x1);
+    dispatch();
+op_push_acc:
+    vm->ip++;
+    stack_push(vm->acc);
     dispatch();
 op_pop:
     vm->ip++;
@@ -162,13 +163,17 @@ op_dup:
     addr = stack_peek();
     stack_push(clone(addr));
     dispatch();
+op_cmp:
+    vm->ip++;
+    x1 = stack_pop();
+    vm->cmp = rfi_as_bool(x1);
+    drop(x1);
+    dispatch();
 op_jne:
     vm->ip++;
-    x2 = stack_pop();
     load_u64(l, vm);
-    if (!rfi_as_bool(x2))
+    if (!vm->cmp)
         vm->ip = l;
-    drop(x2);
     dispatch();
 op_jmp:
     vm->ip++;
@@ -397,46 +402,38 @@ op_trace:
 op_alloc:
     b = vm->ip++;
     c = code[vm->ip++];
-    // addr = stack_peek_n(vm, c - 1);
-    // l = addr->len;
-    // // allocate result and write to a preserved space on the stack
-    // x1 = vector(addr->type, l);
-    // x1->len = 0;
-    // *stack_peek_n(vm, c) = x1;
-    // // push counter
-    // stack_push( i64(l));
+    addr = stack_peek_n(c);
+    l = (*addr)->len;
+    t = (*addr)->type;
+    // check lengths
+    for (i = 0; i < c; i++)
+    {
+        addr = stack_peek_n(c - i);
+        if (is_vector(*addr) && (*addr)->len != l)
+            unwrap(error(ERR_TYPE, "map: arguments must be of the same length or atoms"), b);
+    }
+    vm->acc = vector(t, l);
+    vm->cnt = 0;
     dispatch();
 op_map:
     b = vm->ip++;
     // arguments count
-    // c = code[vm->ip++];
-    // l = stack_peek_n(vm, c)->len;
-    // j = 0;
-    // // push arguments
-    // for (i = c - 1; i >= 0; i--)
-    // {
-    //     addr = stack_peek_n(vm, i + j++);
-    //     if (addr->type > 0)
-    //         stack_push( vector_get(addr, l));
-    //     else
-    //         stack_push( *addr);
-    // }
+    c = code[vm->ip++];
+    // push arguments
+    for (i = 0, j = 0; i < c; i++)
+    {
+        addr = stack_peek_n(c - i + j++);
+        if (!is_vector(*addr))
+            stack_push(clone(*addr));
+        else
+            stack_push(at_idx(*addr, vm->cnt));
+    }
     dispatch();
 op_collect:
     b = vm->ip++;
-    // arguments count
-    // c = code[vm->ip++];
-    // // get the result from previous iteration
-    // x1 = stack_pop();
-    // // load result
-    // addr = stack_peek_n(vm, c);
-    // l = addr->len++;
-    // // store result
-    // vector_write(addr, l, x1);
-    // // load first argument len
-    // p = stack_peek_n(vm, c - 1)->len;
-    // // push counter
-    // stack_push( i64(p - l - 1));
+    x1 = stack_pop();
+    write_obj(&vm->acc, vm->cnt, x1);
+    vm->cmp = ++vm->cnt == vm->acc->len;
     dispatch();
 op_eval:
     b = vm->ip++;
@@ -466,8 +463,9 @@ op_fload:
 nil_t vm_free(vm_t *vm)
 {
     // clear stack (if any)
-    while (vm->sp)
+    while (vm->sp > 0)
         drop(stack_pop());
+
     mmap_free(vm->stack, VM_STACK_SIZE);
 }
 
@@ -500,31 +498,33 @@ str_t vm_code_fmt(obj_t fun)
             b = ip++;
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] halt\n", c++, b);
             break;
-        // case OP_RET:
-        //     str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] ret [%d:%d]\n", c++, ip, code[ip + 1], code[ip + 2]);
-        //     ip += 3;
-        //     break;
-        case OP_PUSH:
+        case OP_RET:
+            b = ip++;
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] ret\n", c++, b);
+            break;
+        case OP_PUSH_CONST:
             b = ip++;
             n = code[ip++];
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] push <const id: %d>\n", c++, b, n);
+            break;
+        case OP_PUSH_ACC:
+            b = ip++;
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] push <acc>\n", c++, b);
             break;
         case OP_POP:
             b = ip++;
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] pop\n", c++, b);
             break;
-        // case OP_JNE:
-        //     str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] jne ", c++, ip++);
-        //     obj_fmt_into(&s, &l, &o, 0, 0, (obj_t)(code + ip));
-        //     str_fmt_into(&s, &l, &o, 0, "\n");
-        //     ip += sizeof(obj_t);
-        //     break;
-        // case OP_JMP:
-        //     str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] jmp ", c++, ip++);
-        //     obj_fmt_into(&s, &l, &o, 0, 0, (obj_t)(code + ip));
-        //     str_fmt_into(&s, &l, &o, 0, "\n");
-        //     ip += sizeof(obj_t);
-        //     break;
+        case OP_JNE:
+            b = ip++;
+            load_u64(p, code, ip);
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] jne <to: %lld>\n", c++, b, p);
+            break;
+        case OP_JMP:
+            b = ip++;
+            load_u64(p, code, ip);
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] jmp <to: %lld>\n", c++, b, p);
+            break;
         case OP_CALL1:
             b = ip++;
             n = code[ip++];
@@ -544,19 +544,36 @@ str_t vm_code_fmt(obj_t fun)
             load_u64(p, code, ip);
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] calln <argn: %d attrs: %d fn: %p>\n", c++, b, m, n, p);
             break;
+        case OP_CALLD:
+            b = ip++;
+            m = code[ip++];
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] calld <argn: %d>\n", c++, b, m);
+            break;
         case OP_TIMER_SET:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] timer_set\n", c++, ip++);
+            b = ip++;
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] timer_set\n", c++, b);
             break;
         case OP_TIMER_GET:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] timer_get\n", c++, ip++);
+            b = ip++;
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] timer_get\n", c++, b);
             break;
         case OP_STORE:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] store [%d]\n", c++, ip, (i32_t)((obj_t)(code + ip + 1))->i64);
-            ip += 1 + sizeof(obj_t);
+            b = ip++;
+            load_u64(p, code, ip);
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] store <at: %d>\n", c++, b, (i32_t)p);
             break;
         case OP_LOAD:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] load [%d]\n", c++, ip, (i32_t)((obj_t)(code + ip + 1))->i64);
-            ip += 1 + sizeof(obj_t);
+            b = ip++;
+            load_u64(p, code, ip);
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] load <at: %d>\n", c++, b, (i32_t)p);
+            break;
+        case OP_LSET:
+            b = ip++;
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] lset\n", c++, b);
+            break;
+        case OP_LGET:
+            b = ip++;
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] lget\n", c++, b);
             break;
         case OP_TRY:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] try ", c++, ip++);
@@ -573,14 +590,19 @@ str_t vm_code_fmt(obj_t fun)
         case OP_TRACE:
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] trace\n", c++, ip++);
             break;
-        case OP_HEAP:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] alloc\n", c++, ip++);
+        case OP_ALLOC:
+            b = ip++;
+            n = code[ip++];
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] alloc <cnt: %d>\n", c++, b, n);
             break;
         case OP_MAP:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] map\n", c++, ip++);
+            b = ip++;
+            n = code[ip++];
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] map <argn: %d>\n", c++, b, n);
             break;
         case OP_COLLECT:
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] collect\n", c++, ip++);
+            b = ip++;
+            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] collect\n", c++, b);
             break;
         default:
             str_fmt_into(&s, &l, &o, 0, "%.4d: unknown %d\n", c++, ip++);

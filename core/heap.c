@@ -165,7 +165,7 @@ memstat_t heap_memstat()
     return stat;
 }
 
-nil_t *heap_malloc(u64_t size)
+nil_t __attribute__((hot)) * heap_malloc(u64_t size)
 {
     u32_t i, order;
     nil_t *block, *base;
@@ -237,7 +237,7 @@ nil_t *heap_malloc(u64_t size)
     return (nil_t *)((node_t *)block + 1);
 }
 
-nil_t heap_free(nil_t *block)
+nil_t __attribute__((hot)) heap_free(nil_t *block)
 {
     nil_t *buddy;
     node_t *node, **n;

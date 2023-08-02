@@ -96,7 +96,7 @@ cc_result_t cc_compile_quote(bool_t has_consumer, cc_t *cc, obj_t obj)
     if (!has_consumer)
         return CC_NULL;
 
-    push_opcode(cc, car, code, OP_PUSH);
+    push_opcode(cc, car, code, OP_PUSH_CONST);
     push_const(cc, clone(as_list(obj)[1]));
 
     return CC_OK;
@@ -136,7 +136,7 @@ cc_result_t cc_compile_set(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t arity
     if (as_list(obj)[1]->type != -TYPE_SYMBOL)
         cerr(cc, car, ERR_TYPE, "'set' first argument must be a symbol");
 
-    push_opcode(cc, car, code, OP_PUSH);
+    push_opcode(cc, car, code, OP_PUSH_CONST);
     push_const(cc, clone(as_list(obj)[1]));
     res = cc_compile_expr(true, cc, as_list(obj)[2]);
 
@@ -166,7 +166,7 @@ cc_result_t cc_compile_let(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t arity
     if (as_list(obj)[1]->type != -TYPE_SYMBOL)
         cerr(cc, car, ERR_TYPE, "'let' first argument must be a symbol");
 
-    push_opcode(cc, car, code, OP_PUSH);
+    push_opcode(cc, car, code, OP_PUSH_CONST);
     push_const(cc, clone(as_list(obj)[1]));
 
     res = cc_compile_expr(true, cc, as_list(obj)[2]);
@@ -193,7 +193,6 @@ cc_result_t cc_compile_fn(cc_t *cc, obj_t obj, u32_t arity)
 
     arity -= 1;
     fun = cc_compile_lambda(false, "anonymous", clone(*(as_list(obj) + 1)), as_list(obj) + 2, arity, cc->nfo);
-
     if (fun->type == TYPE_ERROR)
     {
         drop(cc->lambda);
@@ -201,7 +200,7 @@ cc_result_t cc_compile_fn(cc_t *cc, obj_t obj, u32_t arity)
         return CC_ERROR;
     }
 
-    push_opcode(cc, obj, code, OP_PUSH);
+    push_opcode(cc, obj, code, OP_PUSH_CONST);
     push_const(cc, fun);
     func->stack_size++;
 
@@ -223,6 +222,8 @@ cc_result_t cc_compile_cond(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t arit
 
     if (res == CC_ERROR)
         return CC_ERROR;
+
+    push_opcode(cc, car, code, OP_CMP);
 
     push_opcode(cc, car, code, OP_JNE);
     push_u64(code, 0);
@@ -385,64 +386,52 @@ cc_result_t cc_compile_call(cc_t *cc, obj_t car, u8_t arity)
 
 cc_result_t cc_compile_map(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t arity)
 {
-    // cc_result_t res = CC_NULL;
-    // obj_t car;
-    // lambda_t *func = as_lambda(&cc->lambda);
-    // obj_t code = &func->code;
-    // i64_t i, lbl0, lbl1;
+    cc_result_t res = CC_NULL;
+    lambda_t *func = as_lambda(cc->lambda);
+    obj_t *code = &func->code;
+    i64_t i, lbl0, lbl1;
 
-    // if (arity < 2)
-    //     cerr(cc, obj->id, ERR_LENGTH, "'map' takes at least two arguments");
+    if (arity < 2)
+        cerr(cc, obj, ERR_LENGTH, "'map' takes at least two arguments");
 
-    // obj = as_list(obj) + 1;
-    // car = obj;
+    arity -= 1;
 
-    // arity -= 1;
+    // compile args
+    for (i = 0; i < arity; i++)
+    {
+        res = cc_compile_expr(true, cc, as_list(obj)[2 + i]);
 
-    // // reserve space for map result (accumulator)
-    // push_opcode(cc, car->id, code, OP_PUSH);
-    // push_const(cc, null(0));
+        if (res == CC_ERROR)
+            return CC_ERROR;
+    }
 
-    // // compile args
-    // for (i = 0; i < arity; i++)
-    // {
-    //     res = cc_compile_expr(true, cc, obj + 1 + i);
+    push_opcode(cc, obj, code, OP_ALLOC);
+    push_u8(code, arity);
 
-    //     if (res == CC_ERROR)
-    //         return CC_ERROR;
-    // }
+    lbl0 = (*code)->len;
+    push_opcode(cc, obj, code, OP_MAP);
+    push_u8(code, arity);
 
-    // push_opcode(cc, car->id, code, OP_HEAP);
-    // push_u8(code, arity);
+    // compile lambda
+    res = cc_compile_call(cc, as_list(obj)[1], arity);
 
-    // // check if iteration is done
-    // lbl0 = code->len;
-    // push_opcode(cc, car->id, code, OP_JNE);
-    // push_u64(code, 0);
-    // lbl1 = code->len - sizeof(u64_t);
+    if (res == CC_ERROR)
+        return CC_ERROR;
 
-    // push_opcode(cc, car->id, code, OP_MAP);
-    // push_u8(code, arity);
+    push_opcode(cc, obj, code, OP_COLLECT);
 
-    // // compile lambda
-    // res = cc_compile_call(cc, obj, arity);
+    // check if iteration is done
+    push_opcode(cc, obj, code, OP_JNE);
+    push_u64(code, lbl0);
 
-    // if (res == CC_ERROR)
-    //     return CC_ERROR;
+    // pop arguments
+    for (i = 0; i < arity; i++)
+        push_opcode(cc, obj, code, OP_POP);
 
-    // push_opcode(cc, car->id, code, OP_COLLECT);
-    // push_u8(code, arity);
-    // push_opcode(cc, car->id, code, OP_JMP);
-    // push_u64(code, lbl0);
+    push_opcode(cc, obj, code, OP_PUSH_ACC);
 
-    // *(u64_t *)(as_string(code) + lbl1) = code->len;
-
-    // // pop arguments
-    // for (i = 0; i < arity; i++)
-    //     push_opcode(cc, car->id, code, OP_POP);
-
-    // if (!has_consumer)
-    //     push_opcode(cc, car->id, code, OP_POP);
+    if (!has_consumer)
+        push_opcode(cc, obj, code, OP_POP);
 
     return CC_OK;
 }
@@ -573,7 +562,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     //         push_opcode(cc, car->id, code, OP_CALL1);
     //         push_opcode(cc, car->id, code, 0);
     //         push_u64(code, rf_key);
-    //         push_opcode(cc, car->id, code, OP_PUSH);
+    //         push_opcode(cc, car->id, code, OP_PUSH_CONST);
     //         push_const(cc, k);
     //         push_opcode(cc, car->id, code, OP_CALL2);
     //         push_opcode(cc, car->id, code, 0);
@@ -601,7 +590,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     //         push_opcode(cc, car->id, code, OP_CALL1);
     //         push_opcode(cc, car->id, code, 0);
     //         push_u64(code, rf_key);
-    //         push_opcode(cc, car->id, code, OP_PUSH);
+    //         push_opcode(cc, car->id, code, OP_PUSH_CONST);
     //         push_const(cc, k);
     //         push_opcode(cc, car->id, code, OP_CALL2);
     //         push_opcode(cc, car->id, code, 0);
@@ -647,7 +636,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     //     push_opcode(cc, car->id, code, OP_CALL1);
     //     push_opcode(cc, car->id, code, 0);
     //     push_u64(code, rf_key);
-    //     push_opcode(cc, car->id, code, OP_PUSH);
+    //     push_opcode(cc, car->id, code, OP_PUSH_CONST);
     //     push_const(cc, vector_get(&cols, 0));
     //     push_opcode(cc, car->id, code, OP_CALL2);
     //     push_opcode(cc, car->id, code, 0);
@@ -679,7 +668,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     // // compile mappings (if specified)
     // if (map)
     // {
-    //     push_opcode(cc, car->id, code, OP_PUSH);
+    //     push_opcode(cc, car->id, code, OP_PUSH_CONST);
     //     push_const(cc, cols);
 
     //     if (groupby)
@@ -813,7 +802,7 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, obj_t obj)
         // Symbol is quoted
         if (obj->attrs & ATTR_QUOTED)
         {
-            push_opcode(cc, obj, code, OP_PUSH);
+            push_opcode(cc, obj, code, OP_PUSH_CONST);
             push_const(cc, symboli64(obj->i64));
             func->stack_size++;
 
@@ -833,7 +822,7 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, obj_t obj)
         // internal function
         if (obj->i64 < 0)
         {
-            push_opcode(cc, obj, code, OP_PUSH);
+            push_opcode(cc, obj, code, OP_PUSH_CONST);
 
             id = find_obj(as_list(runtime_get()->env.functions)[0], obj);
 
@@ -859,7 +848,7 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, obj_t obj)
         }
 
         // then in a local or global env
-        push_opcode(cc, obj, code, OP_PUSH);
+        push_opcode(cc, obj, code, OP_PUSH_CONST);
         push_const(cc, clone(obj));
         push_opcode(cc, obj, code, OP_LGET);
         func->stack_size++;
@@ -901,7 +890,7 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, obj_t obj)
         if (!has_consumer)
             return CC_NULL;
 
-        push_opcode(cc, obj, code, OP_PUSH);
+        push_opcode(cc, obj, code, OP_PUSH_CONST);
         push_const(cc, clone(obj));
         func->stack_size++;
 
@@ -942,7 +931,7 @@ obj_t cc_compile_lambda(bool_t top, str_t name, obj_t args, obj_t *body, u64_t l
 
     if (len == 0)
     {
-        push_opcode(&cc, *body, code, OP_PUSH);
+        push_opcode(&cc, *body, code, OP_PUSH_CONST);
         push_const(&cc, null(0));
         goto epilogue;
     }
