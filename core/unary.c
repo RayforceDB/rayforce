@@ -654,7 +654,7 @@ obj_t rf_read_parse_compile(obj_t x)
             return par;
         }
 
-        com = cc_compile_lambda(false, as_string(x), vector_symbol(0), &par, 1, &parser.nfo);
+        com = cc_compile_lambda(as_string(x), vector_symbol(0), &par, 1, &parser.nfo);
         drop(par);
         parser_free(&parser);
 

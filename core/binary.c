@@ -1296,7 +1296,7 @@ obj_t rf_find(obj_t x, obj_t y)
     }
 }
 
-obj_t rf_join(obj_t x, obj_t y)
+obj_t rf_concat(obj_t x, obj_t y)
 {
     i64_t i, xl, yl;
     obj_t vec;

@@ -36,7 +36,7 @@
 
 typedef enum vm_opcode_t
 {
-    OP_HALT = 0,   // Halt the VM
+    OP_RET = 0,    // Return
     OP_PUSH_CONST, // Push an obj_t to the stack
     OP_PUSH_ACC,   // Push an accumulator to the stack
     OP_POP,        // Pop an obj_t from the stack
@@ -49,7 +49,6 @@ typedef enum vm_opcode_t
     OP_CALL2,      // Call binary
     OP_CALLN,      // Call vary
     OP_CALLD,      // Dynamic call (call function from stack with n arguments)
-    OP_RET,        // Return from lambda
     OP_TIMER_SET,  // Start timer
     OP_TIMER_GET,  // Get timer value
     OP_STORE,      // Store value somewhere in a stack pointed by argument
@@ -74,7 +73,6 @@ typedef enum vm_opcode_t
 
 typedef struct vm_t
 {
-    i8_t halted;  // Halt flag
     bool_t cmp;   // Compare result flag
     u8_t trace;   // Trace flag (print stack trace on error limited to n frames)
     i64_t ip;     // Instruction pointer
@@ -86,7 +84,7 @@ typedef struct vm_t
     obj_t *stack; // Stack of arguments
 } vm_t;
 
-vm_t vm_new();
+vm_t vm_new(obj_t *stack);
 obj_t vm_exec(vm_t *vm, obj_t fun) __attribute__((__noinline__));
 nil_t vm_free(vm_t *vm);
 str_t vm_code_fmt(obj_t fun);

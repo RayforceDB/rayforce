@@ -51,13 +51,14 @@ CASSERT(OP_INVALID < 127, vm_h)
             debug("%d: %p", vm->sp - _i, vm->stack[--_i]); \
     }
 
-vm_t vm_new()
+vm_t vm_new(obj_t *stack)
 {
-    obj_t *stack = (obj_t *)mmap_stack(VM_STACK_SIZE);
+    if (stack == NULL)
+        stack = (obj_t *)mmap_stack(VM_STACK_SIZE);
 
     vm_t vm = {
-        .trace = 0,
         .stack = stack,
+        .sp = 0,
     };
 
     return vm;
@@ -68,26 +69,24 @@ vm_t vm_new()
  */
 obj_t __attribute__((hot)) vm_exec(vm_t *vm, obj_t fun)
 {
-    type_t c;
+    type_t t;
     lambda_t *f = as_lambda(fun);
     str_t code = as_string(f->code);
     obj_t x0, x1, x2, x3, *addr;
     u8_t n, attrs;
     u64_t l, p;
     i64_t i, j, b;
-    type_t t;
 
+    // init registers
     vm->ip = 0;
-    vm->sp = 0;
-    vm->bp = -1;
+    vm->bp = vm->sp;
     vm->cnt = 0;
     vm->acc = null(0);
-    vm->halted = 0;
 
     // The indices of labels in the dispatch_table are the relevant opcodes
     static nil_t *dispatch_table[] = {
-        &&op_halt, &&op_push_const, &&op_push_acc, &&op_pop, &&op_swap, &&op_dup, &&op_cmp, &&op_jne, &&op_jmp, &&op_call1, &&op_call2, &&op_calln,
-        &&op_calld, &&op_ret, &&op_timer_set, &&op_timer_get, &&op_store, &&op_load, &&op_lset,
+        &&op_ret, &&op_push_const, &&op_push_acc, &&op_pop, &&op_swap, &&op_dup, &&op_cmp, &&op_jne, &&op_jmp, &&op_call1, &&op_call2, &&op_calln,
+        &&op_calld, &&op_timer_set, &&op_timer_get, &&op_store, &&op_load, &&op_lset,
         &&op_lget, &&op_lpush, &&op_lpop, &&op_try, &&op_catch, &&op_throw,
         &&op_trace, &&op_alloc, &&op_map, &&op_collect, &&op_eval, &&op_fload};
 
@@ -131,8 +130,7 @@ obj_t __attribute__((hot)) vm_exec(vm_t *vm, obj_t fun)
 
 op_dispatch:
     dispatch();
-op_halt:
-    vm->halted = 1;
+op_ret:
     if (vm->sp > 0)
         return stack_pop();
     else
@@ -221,96 +219,45 @@ op_calld:
     b = vm->ip++;
     n = code[vm->ip++];
 made_calld:
-    addr = stack_peek();
-    switch ((*addr)->type)
+    x0 = stack_pop();
+    switch (x0->type)
     {
     case TYPE_UNARY:
         if (n != 1)
             unwrap(error(ERR_LENGTH, "wrong number of arguments"), b);
-        x0 = stack_pop();
         l = x0->i64;
         attrs = x0->attrs;
+        drop(x0);
         goto made_call1;
     case TYPE_BINARY:
         if (n != 2)
             unwrap(error(ERR_LENGTH, "wrong number of arguments"), b);
-        x0 = stack_pop();
         l = x0->i64;
         attrs = x0->attrs;
+        drop(x0);
         goto made_call2;
     case TYPE_VARY:
-        x0 = stack_pop();
         l = x0->i64;
         attrs = x0->attrs;
+        drop(x0);
         goto made_calln;
     case TYPE_LAMBDA:
-        /* Call stack of user lambda call looks as follows:
-         * +-------------------+
-         * |       ...         |
-         * +-------------------+
-         * |   VM_STACK_STUB   |
-         * +-------------------+
-         * |        f          |
-         * +-------------------+
-         * |       cnt         |
-         * +-------------------+
-         * |       acc         |
-         * +-------------------+
-         * |        ip         |
-         * +-------------------+
-         * |        bp         |
-         * +-------------------+
-         * |     <lambda>      |
-         * +-------------------+
-         * |       argn        |
-         * +-------------------+
-         * |       ...         |
-         * +-------------------+
-         * |       arg2        |
-         * +-------------------+
-         * |       arg1        |
-         * +-------------------+
-         */
-        if (n != as_lambda(*addr)->args->len)
+        if (n != as_lambda(x0)->args->len)
             unwrap(error(ERR_LENGTH, "wrong number of arguments"), b);
-        if ((vm->sp + as_lambda(*addr)->stack_size) * sizeof(obj_t) > VM_STACK_SIZE)
+        if ((vm->sp + as_lambda(x0)->stack_size) * sizeof(obj_t) > VM_STACK_SIZE)
             unwrap(error(ERR_STACK_OVERFLOW, "stack overflow"), b);
 
-        // push regs
-        stack_push(vm->bp);
-        stack_push(vm->ip);
-        stack_push(vm->acc);
-        stack_push(vm->cnt);
-        stack_push(f);
-        stack_push(VM_STACK_STUB);
-
-        vm->ip = 0;
-        vm->bp = vm->sp;
-        f = as_lambda(*addr);
-        code = as_string(f->code);
+        vm_t cvm = vm_new(vm->stack);
+        cvm.sp = vm->sp;
+        x1 = vm_exec(&cvm, x0);
+        vm->sp = cvm.sp;
+        drop(x0);
+        unwrap(x1, b);
+        stack_push(x1);
         dispatch();
     default:
         unwrap(error(ERR_TYPE, "call"), b);
     }
-op_ret:
-    vm->ip++;
-    x3 = stack_pop();        // return value
-    j = (i32_t)f->args->len; // args count
-    // pop regs
-    stack_pop();     // POP STUB
-    f = stack_pop(); // callee
-    code = as_string(f->code);
-    vm->cnt = stack_pop();
-    vm->acc = stack_pop();
-    vm->ip = stack_pop();
-    vm->bp = stack_pop();
-    // pop lambda
-    drop(stack_pop());
-    // pop args
-    for (i = 0; i < j; i++)
-        drop(stack_pop());
-    stack_push(x3); // push back return value
-    dispatch();
 op_timer_set:
     vm->ip++;
     vm->timer = clock();
@@ -401,16 +348,16 @@ op_trace:
     dispatch();
 op_alloc:
     b = vm->ip++;
-    c = code[vm->ip++];
+    n = code[vm->ip++];
     x1 = stack_pop(); // result of first iteration
-    addr = stack_peek_n(c);
+    addr = stack_peek_n(n);
     l = is_vector(*addr) ? (*addr)->len : 1;
     vm->cnt = 0;
 
     // check lengths
-    for (i = 0; i < c; i++)
+    for (i = 0; i < n; i++)
     {
-        addr = stack_peek_n(c - i);
+        addr = stack_peek_n(n - i);
         if (is_vector(*addr) && (*addr)->len != l)
             unwrap(error(ERR_TYPE, "map: arguments must be of the same length or atoms"), b);
     }
@@ -434,11 +381,11 @@ op_alloc:
 op_map:
     b = vm->ip++;
     // arguments count
-    c = code[vm->ip++];
+    n = code[vm->ip++];
     // push arguments
-    for (i = 0, j = 0; i < c; i++)
+    for (i = 0, j = 0; i < n; i++)
     {
-        addr = stack_peek_n(c - i + j++);
+        addr = stack_peek_n(n - i + j++);
         if (is_vector(*addr))
             stack_push(at_idx(*addr, vm->cnt));
         else
@@ -459,7 +406,7 @@ op_eval:
     //     drop(x1);
     //     unwrap(error(ERR_TYPE, "eval: expects list"), b);
     // }
-    // x2 = cc_compile_lambda(false, "anonymous", vector_symbol(0), as_list(x1), x1.id, x1->len, NULL);
+    // x2 = cc_compile_lambda("anonymous", vector_symbol(0), as_list(x1), x1.id, x1->len, NULL);
     // drop(x1);
     // unwrap(x2, b);
     // stack_push( x2);
@@ -510,10 +457,6 @@ str_t vm_code_fmt(obj_t fun)
     {
         switch (code[ip])
         {
-        case OP_HALT:
-            b = ip++;
-            str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] halt\n", c++, b);
-            break;
         case OP_RET:
             b = ip++;
             str_fmt_into(&s, &l, &o, 0, "%.4d: [%.4d] ret\n", c++, b);

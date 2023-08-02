@@ -192,7 +192,7 @@ cc_result_t cc_compile_fn(cc_t *cc, obj_t obj, u32_t arity)
         cerr(cc, obj, ERR_LENGTH, "'fn' expects vector of symbols with lambda arguments and a list body");
 
     arity -= 1;
-    fun = cc_compile_lambda(false, "anonymous", clone(*(as_list(obj) + 1)), as_list(obj) + 2, arity, cc->nfo);
+    fun = cc_compile_lambda("anonymous", clone(*(as_list(obj) + 1)), as_list(obj) + 2, arity, cc->nfo);
     if (fun->type == TYPE_ERROR)
     {
         drop(cc->lambda);
@@ -770,6 +770,33 @@ cc_result_t cc_compile_load(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t arit
     return CC_OK;
 }
 
+cc_result_t cc_compile_return(cc_t *cc, obj_t obj, u32_t arity)
+{
+    cc_result_t res;
+    obj_t car = as_list(obj)[0];
+    lambda_t *func = as_lambda(cc->lambda);
+    obj_t *code = &func->code;
+
+    switch (arity)
+    {
+    case 0:
+        push_opcode(cc, car, code, OP_PUSH_CONST);
+        push_const(cc, null(0));
+        break;
+    case 1:
+        res = cc_compile_expr(true, cc, as_list(obj)[1]);
+        if (res == CC_ERROR)
+            return res;
+        break;
+    default:
+        cerr(cc, obj, ERR_LENGTH, "'return' takes at most one argument");
+    }
+
+    push_opcode(cc, car, code, OP_RET);
+
+    return CC_OK;
+}
+
 cc_result_t cc_compile_special_forms(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t arity)
 {
     switch (as_list(obj)[0]->i64)
@@ -798,6 +825,8 @@ cc_result_t cc_compile_special_forms(bool_t has_consumer, cc_t *cc, obj_t obj, u
         return cc_compile_eval(has_consumer, cc, obj, arity);
     case KW_LOAD:
         return cc_compile_load(has_consumer, cc, obj, arity);
+    case KW_RETURN:
+        return cc_compile_return(cc, obj, arity);
     default:
         return CC_NULL;
     }
@@ -843,8 +872,8 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, obj_t obj)
         // self is a special case
         if (obj->i64 == KW_SELF)
         {
-            push_opcode(cc, obj, code, OP_LOAD);
-            push_u64(code, VM_SPILL_REGS + 1);
+            push_opcode(cc, obj, code, OP_PUSH_CONST);
+            push_const(cc, clone(cc->lambda));
             func->stack_size++;
 
             return CC_OK;
@@ -872,7 +901,7 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, obj_t obj)
         if (id < (i64_t)func->args->len)
         {
             push_opcode(cc, obj, code, OP_LOAD);
-            push_u64(code, func->args->len - id + VM_SPILL_REGS + 1);
+            push_u64(code, func->args->len - id);
             func->stack_size++;
 
             return CC_OK;
@@ -931,7 +960,7 @@ cc_result_t cc_compile_expr(bool_t has_consumer, cc_t *cc, obj_t obj)
     return CC_OK;
 }
 
-obj_t cc_compile_lambda(bool_t top, str_t name, obj_t args, obj_t *body, u64_t len, nfo_t *nfo)
+obj_t cc_compile_lambda(str_t name, obj_t args, obj_t *body, u64_t len, nfo_t *nfo)
 {
     obj_t err;
     nfo_t *pi, di;
@@ -952,7 +981,6 @@ obj_t cc_compile_lambda(bool_t top, str_t name, obj_t args, obj_t *body, u64_t l
     }
 
     cc_t cc = {
-        .top_level = top,
         .nfo = pi,
         .lambda = lambda(args, string(0), di),
     };
@@ -966,6 +994,7 @@ obj_t cc_compile_lambda(bool_t top, str_t name, obj_t args, obj_t *body, u64_t l
         push_const(&cc, null(0));
         goto epilogue;
     }
+
     // Compile all arguments but the last one
     for (i = 0; i < len - 1; i++, body++)
     {
@@ -987,7 +1016,7 @@ obj_t cc_compile_lambda(bool_t top, str_t name, obj_t args, obj_t *body, u64_t l
     // --
 
 epilogue:
-    push_opcode(&cc, body, code, top ? OP_HALT : OP_RET);
+    push_opcode(&cc, body, code, OP_RET);
 
     return cc.lambda;
 }
@@ -1012,5 +1041,5 @@ obj_t cc_compile(obj_t body, nfo_t *nfo)
         return err;
     }
 
-    return cc_compile_lambda(true, "top-level", vector_symbol(0), as_list(body), body->len, nfo);
+    return cc_compile_lambda("top-level", vector_symbol(0), as_list(body), body->len, nfo);
 }

@@ -119,7 +119,7 @@ nil_t init_functions(obj_t functions)
     regf(functions,  "table",     TYPE_BINARY,   FLAG_NONE,         rf_table);
     // regf(functions,  "get",       TYPE_BINARY,   FLAG_NONE,         rf_get);
     regf(functions,  "find",      TYPE_BINARY,   FLAG_ATOMIC,       rf_find);
-    regf(functions,  "join",      TYPE_BINARY,   FLAG_NONE,         rf_join);
+    regf(functions,  "concat",    TYPE_BINARY,   FLAG_NONE,         rf_concat);
     regf(functions,  "filter",    TYPE_BINARY,   FLAG_ATOMIC,       rf_filter);
     regf(functions,  "take",      TYPE_BINARY,   FLAG_RIGHT_ATOMIC, rf_take);
     regf(functions,  "in",        TYPE_BINARY,   FLAG_ATOMIC,       rf_in);
@@ -171,25 +171,27 @@ nil_t init_typenames(obj_t typenames)
 
 nil_t init_kw_symbols()
 {
-    assert(intern_symbol("",       0)  == NULL_SYM);
-    assert(intern_keyword("time",  4)  == KW_TIME);
-    assert(intern_keyword("`",     1)  == KW_QUOTE);
-    assert(intern_keyword("set",   3)  == KW_SET);
-    assert(intern_keyword("let",   3)  == KW_LET);
-    assert(intern_keyword("fn",    2)  == KW_FN);
-    assert(intern_keyword("self",  4)  == KW_SELF);
-    assert(intern_keyword("if",    2)  == KW_IF);
-    assert(intern_keyword("try",   3)  == KW_TRY);
-    assert(intern_keyword("catch", 5)  == KW_CATCH);
-    assert(intern_keyword("throw", 5)  == KW_THROW);
-    assert(intern_keyword("map",   3)  == KW_MAP);
-    assert(intern_keyword("select",6)  == KW_SELECT);
-    assert(intern_keyword("from",  4)  == KW_FROM);
-    assert(intern_keyword("where", 5)  == KW_WHERE);
-    assert(intern_keyword("by",    2)  == KW_BY);
-    assert(intern_keyword("order", 5)  == KW_ORDER);
-    assert(intern_keyword("eval",  4)  == KW_EVAL);
-    assert(intern_keyword("load",  4)  == KW_LOAD);
+    assert(intern_symbol("",         0)  == NULL_SYM);
+    assert(intern_keyword("time",    4)  == KW_TIME);
+    assert(intern_keyword("`",       1)  == KW_QUOTE);
+    assert(intern_keyword("set",     3)  == KW_SET);
+    assert(intern_keyword("let",     3)  == KW_LET);
+    assert(intern_keyword("fn",      2)  == KW_FN);
+    assert(intern_keyword("self",    4)  == KW_SELF);
+    assert(intern_keyword("if",      2)  == KW_IF);
+    assert(intern_keyword("try",     3)  == KW_TRY);
+    assert(intern_keyword("catch",   5)  == KW_CATCH);
+    assert(intern_keyword("throw",   5)  == KW_THROW);
+    assert(intern_keyword("map",     3)  == KW_MAP);
+    assert(intern_keyword("select",  6)  == KW_SELECT);
+    assert(intern_keyword("from",    4)  == KW_FROM);
+    assert(intern_keyword("where",   5)  == KW_WHERE);
+    assert(intern_keyword("by",      2)  == KW_BY);
+    assert(intern_keyword("order",   5)  == KW_ORDER);
+    assert(intern_keyword("eval",    4)  == KW_EVAL);
+    assert(intern_keyword("load",    4)  == KW_LOAD);
+    assert(intern_keyword("return",  6)  == KW_RETURN);
+
 }
 // clang-format on
 

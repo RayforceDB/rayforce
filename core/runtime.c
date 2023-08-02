@@ -39,7 +39,7 @@ nil_t runtime_init(u16_t slaves)
     _RUNTIME->slaves = slaves;
     _RUNTIME->symbols = symbols_new();
     _RUNTIME->env = create_env();
-    _RUNTIME->vm = vm_new();
+    _RUNTIME->vm = vm_new(NULL);
 }
 
 nil_t runtime_cleanup()
