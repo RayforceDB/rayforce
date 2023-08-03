@@ -107,13 +107,16 @@ obj_t rf_map_vary(obj_t *x, u64_t n)
             b = x + j;
             v = is_vector(*b) ? at_idx(*b, 0) : clone(*b);
             vm.stack[vm.sp++] = v;
-            v = vm_exec(&vm, *x);
-            if (v->type == TYPE_ERROR)
-                return v;
-
-            res = vector(v->type, l);
-            write_obj(&res, 0, v);
         }
+
+        v = vm_exec(&vm, *x);
+
+        if (is_error(v))
+            return v;
+
+        res = vector(v->type, l);
+
+        write_obj(&res, 0, v);
 
         // drop args
         for (j = 1; j < n; j++)

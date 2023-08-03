@@ -142,7 +142,7 @@ obj_t vector(type_t type, u64_t len)
 
     if (type < 0)
         t = -type;
-    else if (type >= 0 && type < TYPE_TABLE)
+    else if (type > 0 && type < TYPE_TABLE)
         t = type;
     else
         t = TYPE_LIST;

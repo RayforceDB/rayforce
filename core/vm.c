@@ -45,10 +45,10 @@ CASSERT(OP_INVALID < 127, vm_h)
 #define stack_pop() (vm->stack[--vm->sp])
 #define stack_peek() (&vm->stack[vm->sp - 1])
 #define stack_peek_n(n) (&vm->stack[vm->sp - (n)])
-#define stack_debug()                                      \
-    {                                                      \
-        for (i64_t _i = vm->sp; _i > 0;)                   \
-            debug("%d: %p", vm->sp - _i, vm->stack[--_i]); \
+#define stack_debug()                                        \
+    {                                                        \
+        for (i64_t _i = vm->sp; _i > 0;)                     \
+            debug("%lld: %p", vm->sp - _i, vm->stack[--_i]); \
     }
 
 vm_t vm_new(obj_t *stack)
