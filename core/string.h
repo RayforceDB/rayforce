@@ -24,11 +24,13 @@
 #ifndef STRING_H
 #define STRING_H
 
+#define _POSIX_C_SOURCE 1
 #include <string.h>
 #include "rayforce.h"
 
 bool_t string_match(str_t str, str_t pat);
 obj_t string_from_str(str_t str, i32_t len);
 str_t str_dup(str_t str);
+u64_t string_len(str_t s, u64_t n);
 
 #endif

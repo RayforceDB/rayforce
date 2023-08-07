@@ -30,6 +30,10 @@
 #include <stdlib.h>
 #include "rayforce.h"
 
+#define RAYFORCE_MAJOR_VERSION 0
+#define RAYFORCE_MINOR_VERSION 1
+#define RAYFORCE_VERSION (RAYFORCE_MAJOR_VERSION >> 3 | RAYFORCE_MINOR_VERSION)
+
 // A compile time assertion check
 #define CASSERT(predicate, file) _IMPL_CASSERT_LINE(predicate, __LINE__, file)
 #define _IMPL_PASTE(a, b) a##b

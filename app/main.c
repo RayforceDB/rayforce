@@ -21,11 +21,7 @@
  *   SOFTWARE.
  */
 
-#define _POSIX_C_SOURCE 1
-
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
+#include "../core/string.h"
 #include <time.h>
 #include <signal.h>
 #include "../core/mmap.h"
@@ -42,9 +38,8 @@
 
 #define LINE_SIZE 2048
 #define PROMPT "> "
-#define VERSION "0.0.1"
 #define LOGO "\n\
-  ▒█▀▀█ █▀▀█ █░░█ ▒█▀▀▀ █▀▀█ █▀▀█ █▀▀ █▀▀ | Version: %s\n\
+  ▒█▀▀█ █▀▀█ █░░█ ▒█▀▀▀ █▀▀█ █▀▀█ █▀▀ █▀▀ | Version: %d.%d\n\
   ▒█▄▄▀ █▄▄█ █▄▄█ ▒█▀▀▀ █░░█ █▄▄▀ █░░ █▀▀ | Documentation: https://singaraiona.github.io/rayforce\n\
   ▒█░▒█ ▀░░▀ ▄▄▄█ ▒█░░░ ▀▀▀▀ ▀░▀▀ ▀▀▀ ▀▀▀ | Official: https://github.com/singaraiona/rayforce\n\n"
 
@@ -58,7 +53,7 @@ nil_t usage()
 
 nil_t print_logo()
 {
-    str_t logo = str_fmt(0, LOGO, VERSION);
+    str_t logo = str_fmt(0, LOGO, RAYFORCE_MAJOR_VERSION, RAYFORCE_MINOR_VERSION);
     printf("%s%s%s", DARK_CYAN, logo, RESET);
     heap_free(logo);
 }

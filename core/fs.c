@@ -28,6 +28,7 @@
 #include "fs.h"
 #include "string.h"
 #include "util.h"
+#include "heap.h"
 
 i64_t fs_fopen(str_t path, i64_t attrs)
 {
@@ -116,20 +117,13 @@ i64_t fs_dopen(str_t path)
         if (!dir)
             return -1;
 
-        return dir;
+        return (i64_t)dir;
     }
 
-    return dir;
+    return (i64_t)dir;
 }
 
 i64_t fs_dclose(i64_t fd)
 {
     return closedir((DIR *)fd);
-}
-
-str_t fs_dname(str_t path)
-{
-    str_t last_slash = strrchr(path, '/');
-    if (last_slash != NULL)
-        *last_slash = '\0'; // cut the path at the last slash
 }

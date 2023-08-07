@@ -33,12 +33,13 @@ extern "C"
 // Type constants
 #define TYPE_LIST 0
 #define TYPE_BOOL 1
-#define TYPE_I64 2
-#define TYPE_F64 3
-#define TYPE_SYMBOL 4
-#define TYPE_TIMESTAMP 5
-#define TYPE_GUID 6
-#define TYPE_CHAR 7
+#define TYPE_BYTE 2
+#define TYPE_I64 3
+#define TYPE_F64 4
+#define TYPE_SYMBOL 5
+#define TYPE_TIMESTAMP 6
+#define TYPE_GUID 7
+#define TYPE_CHAR 8
 #define TYPE_TABLE 98
 #define TYPE_DICT 99
 #define TYPE_LAMBDA 100
@@ -60,8 +61,9 @@ extern "C"
 #define ERR_NOT_FOUND 9
 #define ERR_NOT_EXIST 10
 #define ERR_NOT_IMPLEMENTED 11
-#define ERR_STACK_OVERFLOW 12
-#define ERR_THROW 13
+#define ERR_NOT_SUPPORTED 12
+#define ERR_STACK_OVERFLOW 13
+#define ERR_THROW 14
 #define ERR_UNKNOWN 127
 
 #define NULL_I64 ((i64_t)0x8000000000000000LL)
@@ -71,6 +73,7 @@ extern "C"
 
 typedef char type_t;
 typedef char i8_t;
+typedef char byte_t;
 typedef char char_t;
 typedef char bool_t;
 typedef char *str_t;
@@ -106,6 +109,7 @@ typedef struct obj_t
     union
     {
         bool_t bool;
+        byte_t byte;
         char_t schar;
         i64_t i64;
         f64_t f64;
@@ -116,12 +120,16 @@ typedef struct obj_t
     };
 } *obj_t;
 
+// Version
+extern u8_t version(); // get version as u8_t (major - 5 bits, minor - 3 bits)
+
 // Constructors
 extern obj_t null(type_t type);                             // create null of type
 extern obj_t atom(type_t type);                             // create atom of type
 extern obj_t list(u64_t len, ...);                          // create list
 extern obj_t vector(type_t type, u64_t len);                // create vector of type
 extern obj_t bool(bool_t val);                              // bool atom
+extern obj_t byte(byte_t val);                                // byte atom
 extern obj_t i64(i64_t val);                                // i64 atom
 extern obj_t f64(f64_t val);                                // f64 atom
 extern obj_t symbol(str_t ptr);                             // symbol
@@ -155,6 +163,7 @@ extern nil_t drop(obj_t obj);
 // Accessors
 #define as_string(obj)    ((i8_t *)__builtin_assume_aligned((obj + 1), 16))
 #define as_bool(obj)      ((bool_t *)(as_string(obj)))
+#define as_byte(obj)      ((byte_t *)(as_string(obj)))
 #define as_i64(obj)       ((i64_t *)(as_string(obj)))
 #define as_f64(obj)       ((f64_t *)(as_string(obj)))
 #define as_symbol(obj)    ((i64_t *)(as_string(obj)))
@@ -184,6 +193,7 @@ extern obj_t write_sym(obj_t *obj, u64_t idx, str_t str); // write interned stri
 // Read
 extern obj_t at_idx(obj_t obj, u64_t idx); // read raw value from a obj at index
 extern obj_t at_obj(obj_t obj, obj_t idx); // read from obj indexed by obj
+extern str_t symtostr(i64_t id);           // return interned string by interned id
 
 // Set
 extern obj_t set_idx(obj_t *obj, u64_t idx, obj_t val); // set obj at index
@@ -202,6 +212,10 @@ extern obj_t cast(type_t type, obj_t obj);      // cast object x o a type
 
 // Comparison
 extern bool_t equal(obj_t a, obj_t b);
+
+// Serialization
+extern obj_t ser(obj_t obj);
+extern obj_t de(obj_t buf);
 
 #ifdef __cplusplus
 }

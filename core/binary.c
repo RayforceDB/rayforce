@@ -317,10 +317,16 @@ obj_t rf_set(obj_t x, obj_t y)
         return clone(y);
 
     case TYPE_CHAR:
+        if (x->len == 0)
+            raise(ERR_LENGTH, "set: empty string path");
 
         switch (y->type)
         {
         case TYPE_TABLE:
+            if (as_string(x)[x->len - 1] != '/')
+                raise(ERR_TYPE, "set: table path must be a directory");
+
+            // TODO!!!!
 
         default:
             fd = fs_fopen(as_string(x), O_RDWR | O_CREAT | O_TRUNC);

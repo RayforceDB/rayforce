@@ -106,7 +106,7 @@ obj_t rf_get(obj_t x)
         res = at_obj(runtime_get()->env.variables, x);
 
         if (is_null(res))
-            raise(ERR_NOT_EXIST, "variable '%s' does not exist", symbols_get(x->i64));
+            raise(ERR_NOT_EXIST, "variable '%s' does not exist", symtostr(x->i64));
 
         return res;
 

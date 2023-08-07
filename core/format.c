@@ -22,8 +22,8 @@
  */
 
 #include <stdio.h>
-#include <string.h>
 #include <stdarg.h>
+#include "string.h"
 #include "format.h"
 #include "rayforce.h"
 #include "heap.h"
@@ -167,6 +167,11 @@ i32_t bool_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, bool_t v
         return str_fmt_into(dst, len, offset, limit, "false");
 }
 
+i32_t byte_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, u8_t val)
+{
+    return str_fmt_into(dst, len, offset, limit, "0x%02x", val);
+}
+
 i32_t i64_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, i64_t val)
 {
     if (val == NULL_I64)
@@ -188,7 +193,7 @@ i32_t symbol_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, i64_t 
     if (val == NULL_I64)
         return str_fmt_into(dst, len, offset, limit, "0s");
 
-    i32_t n = str_fmt_into(dst, len, offset, limit, "%s", symbols_get(val));
+    i32_t n = str_fmt_into(dst, len, offset, limit, "%s", symtostr(val));
 
     if (n > limit)
         n += str_fmt_into(dst, len, offset, 3, "..");
@@ -234,6 +239,8 @@ i32_t raw_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t li
     {
     case TYPE_BOOL:
         return bool_fmt_into(dst, len, offset, limit, as_bool(obj)[i]);
+    case TYPE_BYTE:
+        return byte_fmt_into(dst, len, offset, limit, as_byte(obj)[i]);
     case TYPE_I64:
         return i64_fmt_into(dst, len, offset, limit, as_i64(obj)[i]);
     case TYPE_F64:
@@ -381,7 +388,7 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, obj_t 
     for (i = 0; i < table_width; i++)
     {
         // First check the column name
-        n = strlen(symbols_get(header[i]));
+        n = strlen(symtostr(header[i]));
 
         // Then traverse column until maximum height limit
         for (j = 0; j < table_height; j++)
@@ -401,7 +408,7 @@ i32_t table_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, obj_t 
     for (i = 0; i < table_width; i++)
     {
         n = as_i64(column_widths)[i];
-        s = symbols_get(header[i]);
+        s = symtostr(header[i]);
         n = n - strlen(s);
         str_fmt_into(dst, len, offset, 0, " %s%*.*s |", s, n, n, PADDING);
     }
@@ -483,6 +490,8 @@ i32_t obj_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t li
     {
     case -TYPE_BOOL:
         return bool_fmt_into(dst, len, offset, limit, obj->bool);
+    case -TYPE_BYTE:
+        return byte_fmt_into(dst, len, offset, limit, obj->byte);
     case -TYPE_I64:
         return i64_fmt_into(dst, len, offset, limit, obj->i64);
     case -TYPE_F64:
@@ -496,6 +505,8 @@ i32_t obj_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t li
     case -TYPE_CHAR:
         return str_fmt_into(dst, len, offset, limit, "'%c'", obj->schar ? obj->schar : 1);
     case TYPE_BOOL:
+        return vector_fmt_into(dst, len, offset, limit, obj);
+    case TYPE_BYTE:
         return vector_fmt_into(dst, len, offset, limit, obj);
     case TYPE_I64:
         return vector_fmt_into(dst, len, offset, limit, obj);

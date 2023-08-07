@@ -33,6 +33,8 @@ i32_t size_of_type(type_t type)
     {
     case TYPE_BOOL:
         return sizeof(bool_t);
+    case TYPE_BYTE:
+        return sizeof(u8_t);
     case TYPE_I64:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:

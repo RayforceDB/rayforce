@@ -58,6 +58,6 @@ i64_t intern_keyword(str_t s, i64_t len);
 
 symbols_t *symbols_new();
 nil_t symbols_free(symbols_t *symbols);
-str_t symbols_get(i64_t key);
+str_t symtostr(i64_t key);
 
 #endif

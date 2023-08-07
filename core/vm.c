@@ -22,7 +22,7 @@
  */
 
 #include <stdio.h>
-#include <string.h>
+#include "string.h"
 #include "lambda.h"
 #include "vm.h"
 #include "rayforce.h"

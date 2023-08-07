@@ -31,6 +31,7 @@
 #include "runtime.h"
 #include "format.h"
 #include "ops.h"
+#include "serde.h"
 
 #define regf(r, n, t, f, o)                      \
     {                                            \
@@ -100,6 +101,8 @@ nil_t init_functions(obj_t functions)
     regf(functions,  "value",     TYPE_UNARY,    FLAG_NONE,         rf_value);
     regf(functions,  "read",      TYPE_UNARY,    FLAG_NONE,         rf_read);
     regf(functions,  "parse",     TYPE_UNARY,    FLAG_NONE,         rf_parse);
+    regf(functions,  "ser",       TYPE_UNARY,    FLAG_NONE,         ser);
+    regf(functions,  "de",        TYPE_UNARY,    FLAG_NONE,         de);
     
     // Binary           
     regf(functions,  "set",       TYPE_BINARY,   FLAG_NONE,         rf_set);
@@ -149,6 +152,7 @@ nil_t init_typenames(obj_t typenames)
 {
     regt(typenames,   -TYPE_ERROR,      "Null");
     regt(typenames,   -TYPE_BOOL,       "bool");
+    regt(typenames,   -TYPE_BYTE,       "byte");
     regt(typenames,   -TYPE_I64,        "i64");
     regt(typenames,   -TYPE_F64,        "f64");
     regt(typenames,   -TYPE_CHAR,       "char");
@@ -156,6 +160,7 @@ nil_t init_typenames(obj_t typenames)
     regt(typenames,   -TYPE_TIMESTAMP,  "timestamp");
     regt(typenames,   -TYPE_GUID,       "guid");
     regt(typenames,    TYPE_BOOL,       "Bool");
+    regt(typenames,    TYPE_BYTE,       "Byte");
     regt(typenames,    TYPE_I64,        "I64");
     regt(typenames,    TYPE_F64,        "F64");
     regt(typenames,    TYPE_CHAR,       "string");
@@ -258,5 +263,5 @@ str_t env_get_typename(type_t type)
     env_t *env = &runtime_get()->env;
     i64_t name = env_get_typename_by_type(env, type);
 
-    return symbols_get(name);
+    return symtostr(name);
 }

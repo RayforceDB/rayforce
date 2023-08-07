@@ -21,7 +21,6 @@
  *   SOFTWARE.
  */
 
-#include <string.h>
 #include "string.h"
 #include "rayforce.h"
 #include "heap.h"
@@ -139,4 +138,12 @@ str_t str_dup(str_t str)
     strncpy(dup, str, len);
     dup[len] = '\0';
     return dup;
+}
+
+u64_t string_len(str_t s, u64_t n)
+{
+    u64_t i;
+    for (i = 0; i < n && s[i] != '\0'; ++i)
+        ;
+    return i;
 }

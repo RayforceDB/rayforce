@@ -22,10 +22,10 @@
  */
 
 #include <stddef.h>
-#include <string.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
+#include "string.h"
 #include "hash.h"
 #include "rayforce.h"
 #include "heap.h"

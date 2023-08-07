@@ -35,6 +35,11 @@
 
 CASSERT(sizeof(struct obj_t) == 16, rayforce_h)
 
+u8_t version()
+{
+    return RAYFORCE_VERSION;
+}
+
 obj_t atom(type_t type)
 {
     obj_t a = (obj_t)heap_alloc(sizeof(struct obj_t));
@@ -72,6 +77,13 @@ obj_t bool(bool_t val)
 {
     obj_t b = atom(TYPE_BOOL);
     b->bool = val;
+    return b;
+}
+
+obj_t byte(byte_t val)
+{
+    obj_t b = atom(TYPE_BYTE);
+    b->byte = val;
     return b;
 }
 
@@ -752,8 +764,8 @@ obj_t cast(type_t type, obj_t obj)
         return res;
     default:
         msg = str_fmt(0, "invalid conversion from '%s' to '%s'",
-                      symbols_get(env_get_typename_by_type(&runtime_get()->env, obj->type)),
-                      symbols_get(env_get_typename_by_type(&runtime_get()->env, type)));
+                      symtostr(env_get_typename_by_type(&runtime_get()->env, obj->type)),
+                      symtostr(env_get_typename_by_type(&runtime_get()->env, type)));
         err = error(ERR_TYPE, msg);
         heap_free(msg);
         return err;

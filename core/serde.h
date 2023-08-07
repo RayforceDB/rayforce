@@ -25,5 +25,18 @@
 #define SERDE_H
 
 #include "rayforce.h"
+#include "util.h"
+typedef struct header_t
+{
+    u8_t version;
+    u8_t flags;
+    u16_t reserved;
+    u32_t padding;
+    u64_t size;
+} header_t;
+
+CASSERT(sizeof(header_t) == 16, header_t);
+
+u64_t obj_size(obj_t obj);
 
 #endif // SERDE_H

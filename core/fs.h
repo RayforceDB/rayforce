@@ -35,6 +35,5 @@ i64_t fs_fclose(i64_t fd);
 i64_t fs_dcreate(str_t path);
 i64_t fs_dopen(str_t path);
 i64_t fs_dclose(i64_t fd);
-str_t fs_dname(str_t path);
 
 #endif // FS_H
