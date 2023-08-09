@@ -161,7 +161,7 @@ bool_t rfi_as_bool(obj_t x)
     case -TYPE_F64:
         return x->f64 != 0.0;
     case -TYPE_CHAR:
-        return x->achar != 0;
+        return x->vchar != 0;
     case TYPE_BOOL:
     case TYPE_I64:
     case TYPE_F64:

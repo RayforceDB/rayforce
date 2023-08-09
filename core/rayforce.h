@@ -111,7 +111,7 @@ typedef struct obj_t
     {
         bool_t bool;
         byte_t byte;
-        char_t achar;
+        char_t vchar;
         i64_t i64;
         f64_t f64;
         struct {
@@ -130,16 +130,16 @@ extern obj_t atom(type_t type);                             // create atom of ty
 extern obj_t list(u64_t len, ...);                          // create list
 extern obj_t vector(type_t type, u64_t len);                // create vector of type
 extern obj_t bool(bool_t val);                              // bool atom
-extern obj_t abyte(byte_t val);                             // byte atom
+extern obj_t vbyte(byte_t val);                             // byte atom
 extern obj_t i64(i64_t val);                                // i64 atom
 extern obj_t f64(f64_t val);                                // f64 atom
 extern obj_t symbol(str_t ptr);                             // symbol
 extern obj_t symboli64(i64_t id);                           // symbol from i64
 extern obj_t timestamp(i64_t val);                          // timestamp
 extern obj_t guid(u8_t data[]);                             // GUID
-extern obj_t achar(char_t c);                               // char
+extern obj_t vchar(char_t c);                               // char
 extern obj_t string(u64_t len);                             // string 
-extern obj_t aenum(obj_t sym, obj_t vec);                   // enum
+extern obj_t venum(obj_t sym, obj_t vec);                   // enum
 
 #define vector_bool(len)      (vector(TYPE_BOOL,      len)) // bool vector
 #define vector_byte(len)      (vector(TYPE_BYTE,      len)) // byte vector

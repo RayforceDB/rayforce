@@ -63,7 +63,7 @@ obj_t null(type_t type)
     case TYPE_F64:
         return f64(NULL_F64);
     case TYPE_CHAR:
-        return achar('\0');
+        return vchar('\0');
     case TYPE_SYMBOL:
         return symboli64(NULL_I64);
     case TYPE_TIMESTAMP:
@@ -80,7 +80,7 @@ obj_t bool(bool_t val)
     return b;
 }
 
-obj_t abyte(byte_t val)
+obj_t vbyte(byte_t val)
 {
     obj_t b = atom(TYPE_BYTE);
     b->byte = val;
@@ -135,10 +135,10 @@ obj_t guid(u8_t data[])
     return NULL;
 }
 
-obj_t achar(char_t c)
+obj_t vchar(char_t c)
 {
     obj_t s = atom(TYPE_CHAR);
-    s->achar = c;
+    s->vchar = c;
     return s;
 }
 
@@ -149,7 +149,7 @@ obj_t timestamp(i64_t val)
     return t;
 }
 
-obj_t aenum(obj_t sym, obj_t vec)
+obj_t venum(obj_t sym, obj_t vec)
 {
     obj_t e = list(2, sym, vec);
     e->type = TYPE_ENUM;
@@ -302,7 +302,7 @@ obj_t join_obj(obj_t *obj, obj_t val)
         drop(val);
         return res;
     case mtype2(TYPE_CHAR, -TYPE_CHAR):
-        res = join_raw(obj, &val->achar);
+        res = join_raw(obj, &val->vchar);
         drop(val);
         return res;
     default:
@@ -368,7 +368,7 @@ obj_t write_obj(obj_t *obj, u64_t idx, obj_t val)
         drop(val);
         break;
     case TYPE_CHAR:
-        ret = write_raw(obj, idx, &val->achar);
+        ret = write_raw(obj, idx, &val->vchar);
         drop(val);
         break;
     case TYPE_LIST:
@@ -412,8 +412,8 @@ obj_t at_idx(obj_t obj, u64_t idx)
         return f64(NULL_F64);
     case TYPE_CHAR:
         if (idx < obj->len)
-            return achar(as_string(obj)[idx]);
-        return achar('\0');
+            return vchar(as_string(obj)[idx]);
+        return vchar('\0');
     case TYPE_LIST:
         if (idx < obj->len)
             return clone(as_list(obj)[idx]);
@@ -468,7 +468,7 @@ obj_t set_idx(obj_t *obj, u64_t idx, obj_t val)
         drop(val);
         return *obj;
     case mtype2(TYPE_CHAR, -TYPE_CHAR):
-        as_string(*obj)[idx] = val->achar;
+        as_string(*obj)[idx] = val->vchar;
         drop(val);
         return *obj;
     default:
@@ -540,7 +540,7 @@ obj_t pop_obj(obj_t *obj)
     case TYPE_F64:
         return f64(as_f64(*obj)[(*obj)->len--]);
     case TYPE_CHAR:
-        return achar(as_string(*obj)[(*obj)->len--]);
+        return vchar(as_string(*obj)[(*obj)->len--]);
     case TYPE_LIST:
         return as_list(*obj)[(*obj)->len--];
 
@@ -556,7 +556,7 @@ bool_t is_null(obj_t obj)
            (obj->type == -TYPE_SYMBOL && obj->i64 == NULL_I64) ||
            (obj->type == -TYPE_F64 && obj->f64 == NULL_F64) ||
            (obj->type == -TYPE_TIMESTAMP && obj->i64 == NULL_I64) ||
-           (obj->type == -TYPE_CHAR && obj->achar == '\0');
+           (obj->type == -TYPE_CHAR && obj->vchar == '\0');
 }
 
 bool_t equal(obj_t a, obj_t b)
@@ -661,7 +661,7 @@ i64_t find_obj(obj_t obj, obj_t val)
     case TYPE_F64:
         return find_raw(obj, &val->f64);
     case TYPE_CHAR:
-        return find_raw(obj, &val->achar);
+        return find_raw(obj, &val->vchar);
     case TYPE_LIST:
         return find_raw(obj, &val);
     default:

@@ -101,7 +101,7 @@ u64_t save_obj(byte_t *buf, u64_t len, obj_t obj)
         strncpy(buf, s, len);
         return sizeof(type_t) + str_len(s, len) + 1;
     case -TYPE_CHAR:
-        buf[0] = obj->achar;
+        buf[0] = obj->vchar;
         return sizeof(type_t) + sizeof(char_t);
     // case TYPE_GUID:
     //     memcpy(buf, &obj->guid, sizeof(guid_t));
@@ -206,7 +206,7 @@ obj_t load_obj(byte_t **buf, u64_t len)
         (*buf) += l + 1;
         return obj;
     case -TYPE_CHAR:
-        obj = achar((*buf)[0]);
+        obj = vchar((*buf)[0]);
         (*buf)++;
         return obj;
     // case TYPE_GUID:

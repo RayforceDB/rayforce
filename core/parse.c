@@ -104,12 +104,12 @@ bool_t at_term(char_t c)
 
 bool_t is_at(obj_t token, char_t c)
 {
-    return token && token->type == TYPE_CHAR && token->achar == c;
+    return token && token->type == TYPE_CHAR && token->vchar == c;
 }
 
 bool_t is_at_term(obj_t token)
 {
-    return token && token->type == TYPE_CHAR && at_term(token->achar);
+    return token && token->type == TYPE_CHAR && at_term(token->vchar);
 }
 
 i8_t shift(parser_t *parser, i32_t num)
@@ -126,7 +126,7 @@ i8_t shift(parser_t *parser, i32_t num)
 
 obj_t to_token(parser_t *parser)
 {
-    obj_t tok = achar(*parser->current);
+    obj_t tok = vchar(*parser->current);
     tok->type = TYPE_CHAR;
     nfo_insert(&parser->nfo, (i64_t)tok, span_start(parser));
 
@@ -408,7 +408,7 @@ obj_t parse_char(parser_t *parser)
         return res;
     }
 
-    res = achar(ch);
+    res = vchar(ch);
 
     shift(parser, 3);
     span_extend(parser, &span);
@@ -666,7 +666,7 @@ obj_t parse_list(parser_t *parser)
 
         if (is_at_term(tok))
         {
-            err = parse_error(parser, (i64_t)tok, str_fmt(0, "There is no opening found for: '%c'", tok->achar));
+            err = parse_error(parser, (i64_t)tok, str_fmt(0, "There is no opening found for: '%c'", tok->vchar));
             drop(lst);
             drop(tok);
 
@@ -869,7 +869,7 @@ obj_t parse_program(parser_t *parser)
 
         if (is_at_term(tok))
         {
-            err = parse_error(parser, (i64_t)tok, str_fmt(0, "Unexpected token: '%c'", tok->achar));
+            err = parse_error(parser, (i64_t)tok, str_fmt(0, "Unexpected token: '%c'", tok->vchar));
             drop(lst);
             drop(tok);
             return err;

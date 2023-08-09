@@ -335,6 +335,105 @@ obj_t rf_call_binary(u8_t attrs, binary_f f, obj_t x, obj_t y)
     }
 }
 
+obj_t rf_distinctn(obj_t *x, u64_t n)
+{
+    i64_t r, p, min, max, k, w, b;
+    u64_t i, j, h, l, range;
+    obj_t mask, vec, set, a;
+
+    if (n == 0 || !*x)
+        return vector_i64(0);
+
+    a = *x;
+
+    // check all types (must be the same)
+    if (a->type != TYPE_I64 && a->type != TYPE_SYMBOL && a->type != TYPE_F64 && a->type != TYPE_TIMESTAMP)
+        raise(ERR_TYPE, "'distinct': unsupported type: %d", a->type);
+
+    for (i = 0; i < n; i++)
+        if (a->type != x[i]->type)
+            raise(ERR_TYPE, "'distinct': all arguments must be of the same type");
+
+    if (n == 1 && (a->attrs & ATTR_DISTINCT))
+        return clone(a);
+
+    min = max = as_i64(a)[0];
+
+    // find min and max of all vectors
+    for (i = 0; i < n; i++)
+    {
+        a = *(x + i);
+
+        l = a->len;
+
+        for (j = 0; j < l; j++)
+        {
+            if (as_i64(a)[j] < min)
+                min = as_i64(a)[j];
+            else if (as_i64(a)[j] > max)
+                max = as_i64(a)[j];
+        }
+    }
+
+    range = max - min + 1;
+
+    if (range <= l)
+    {
+        r = alignup(range / 8, 8);
+        if (!r)
+            r = 1;
+
+        mask = vector_bool(r);
+        memset(as_bool(mask), 0, r);
+        vec = vector_i64(range);
+
+        for (i = 0; i < n; i++)
+        {
+            for (j = 0, h = 0; j < l; j++)
+            {
+                k = as_i64(a)[j] - min;
+                w = k >> 3; // k / 8
+                b = k & 7;  // k % 8
+
+                if (as_bool(mask)[w] & (1 << b))
+                    continue;
+
+                as_bool(mask)[w] |= (1 << b);
+                as_i64(vec)[h++] = as_i64(a)[j];
+            }
+        }
+
+        drop(mask);
+
+        resize(&vec, h);
+
+        return vec;
+    }
+
+    set = ht_tab(l, -1);
+    vec = vector_i64(l);
+
+    for (i = 0; i < n; i++)
+    {
+        for (j = 0, h = 0; j < l; j++)
+        {
+            p = ht_tab_next(&set, as_i64(a)[j] - min);
+            if (as_i64(as_list(set)[0])[p] == NULL_I64)
+            {
+                as_i64(as_list(set)[0])[p] = as_i64(a)[j] - min;
+                as_i64(vec)[h++] = as_i64(a)[j];
+            }
+        }
+    }
+
+    vec->attrs |= ATTR_DISTINCT;
+
+    resize(&vec, h);
+    drop(set);
+
+    return vec;
+}
+
 obj_t rf_set(obj_t x, obj_t y)
 {
     obj_t res, col, s;
@@ -1338,74 +1437,80 @@ obj_t rf_at(obj_t x, obj_t y)
 
 obj_t rf_find_vector_i64_vector_i64(obj_t x, obj_t y)
 {
-    unused(x);
-    unused(y);
-    //     u64_t i, n, range, xl = x->len, yl = y->len;
-    //     i64_t max = 0, min = 0;
-    //     obj_t vec = vector_i64(yl), found;
-    //     i64_t *iv1 = as_i64(x), *iv2 = as_i64(y),
-    //           *ov = as_i64(vec), *fv;
-    //     ht_t *ht;
+    u64_t i, n, range, xl = x->len, yl = y->len;
+    i64_t max = 0, min = 0, p;
+    obj_t vec, found, ht;
 
-    //     for (i = 0; i < xl; i++)
-    //     {
-    //         if (iv1[i] > max)
-    //             max = iv1[i];
-    //         else if (iv1[i] < min)
-    //             min = iv1[i];
-    //     }
+    for (i = 0; i < xl; i++)
+    {
+        if (as_i64(x)[i] > max)
+            max = as_i64(x)[i];
+        else if (as_i64(x)[i] < min)
+            min = as_i64(x)[i];
+    }
 
-    // #define normalize(k) ((u64_t)(k - min))
-    //     // if range fits in 64 mb, use vector positions instead of hash table
-    //     range = max - min + 1;
-    //     if (range < 1024 * 1024 * 64)
-    //     {
-    //         found = vector_i64(range);
-    //         fv = as_i64(found);
+    vec = vector_i64(yl);
 
-    //         for (i = 0; i < xl; i++)
-    //             fv[i] = NULL_I64;
+    range = max - min + 1;
 
-    //         for (i = 0; i < xl; i++)
-    //         {
-    //             n = normalize(iv1[i]);
-    //             if (fv[n] == NULL_I64)
-    //                 fv[n] = i;
-    //         }
+    if (range <= yl)
+    {
+        found = vector_i64(range);
 
-    //         for (i = 0; i < yl; i++)
-    //         {
-    //             n = normalize(iv2[i]);
-    //             if (iv2[i] < min || iv2[i] > max)
-    //                 ov[i] = NULL_I64;
-    //             else
-    //                 ov[i] = fv[n];
-    //         }
+        for (i = 0; i < xl; i++)
+            as_i64(found)[i] = NULL_I64;
 
-    //         drop(found);
+        for (i = 0; i < xl; i++)
+        {
+            n = as_i64(x)[i] - min;
+            if (as_i64(found)[n] == NULL_I64)
+                as_i64(found)[n] = i;
+        }
 
-    //         return vec;
-    //     }
+        for (i = 0; i < yl; i++)
+        {
+            n = as_i64(y)[i] - min;
+            if (as_i64(y)[i] < min || as_i64(y)[i] > max)
+                as_i64(vec)[i] = NULL_I64;
+            else
+                as_i64(vec)[i] = as_i64(found)[n];
+        }
 
-    //     // otherwise, use a hash table
-    //     ht = ht_new(xl, &rfi_kmh_hash);
+        drop(found);
 
-    //     for (i = 0; i < xl; i++)
-    //         ht_insert(ht, iv1[i], i);
+        return vec;
+    }
 
-    //     for (i = 0; i < yl; i++)
-    //         ov[i] = ht_get(ht, iv2[i]);
+    // otherwise, use a hash table
+    ht = ht_tab(xl, TYPE_I64);
 
-    //     drop(ht);
+    for (i = 0; i < xl; i++)
+    {
+        p = ht_tab_next(&ht, as_i64(x)[i] - min);
+        if (as_i64(as_list(ht)[0])[p] == NULL_I64)
+        {
+            as_i64(as_list(ht)[0])[p] = as_i64(x)[i] - min;
+            as_i64(as_list(ht)[1])[p] = i;
+        }
+    }
 
-    //     return vec;
+    for (i = 0; i < yl; i++)
+    {
+        p = ht_tab_next(&ht, as_i64(y)[i] - min);
+        if (as_i64(as_list(ht)[0])[p] == NULL_I64)
+            as_i64(vec)[i] = NULL_I64;
+        else
+            as_i64(vec)[i] = as_i64(as_list(ht)[1])[p] + min;
+    }
 
-    raise(ERR_NOT_IMPLEMENTED, "find: unsupported types");
+    drop(ht);
+
+    return vec;
 }
 
 obj_t rf_find(obj_t x, obj_t y)
 {
-    // i64_t l, i;
+    u64_t l, i;
 
     switch (mtype2(x->type, y->type))
     {
@@ -1415,19 +1520,17 @@ obj_t rf_find(obj_t x, obj_t y)
     case mtype2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
     case mtype2(TYPE_GUID, -TYPE_GUID):
     case mtype2(TYPE_CHAR, -TYPE_CHAR):
-        // case mtype2(TYPE_LIST, -TYPE_LIST):
-        //     l = x->len;
-        //     i = vector_find(x, y);
+        l = x->len;
+        i = find_obj(x, y);
 
-        //     if (i == l)
-        //         return i64(NULL_I64);
-        //     else
-        //         return i64(i);
+        if (i == l)
+            return i64(NULL_I64);
+        else
+            return i64(i);
 
-        //     return i64(vector_find(x, y));
-
-        // case mtype2(TYPE_I64, TYPE_I64):
-        //     return rf_find_vector_i64_vector_i64(x, y);
+    case mtype2(TYPE_I64, TYPE_I64):
+    case mtype2(TYPE_SYMBOL, TYPE_SYMBOL):
+        return rf_find_vector_i64_vector_i64(x, y);
 
     default:
         raise(ERR_TYPE, "find: unsupported types: %d %d", x->type, y->type);
@@ -1476,8 +1579,8 @@ obj_t rf_concat(obj_t x, obj_t y)
 
     case mtype2(-TYPE_CHAR, -TYPE_CHAR):
         vec = string(2);
-        as_string(vec)[0] = x->achar;
-        as_string(vec)[1] = y->achar;
+        as_string(vec)[0] = x->vchar;
+        as_string(vec)[1] = y->vchar;
         return vec;
 
     case mtype2(TYPE_BOOL, -TYPE_BOOL):
@@ -2085,10 +2188,23 @@ obj_t rf_xdesc(obj_t x, obj_t y)
 
 obj_t rf_enum(obj_t x, obj_t y)
 {
+    obj_t s, v;
+
     switch (mtype2(x->type, y->type))
     {
-    case mtype2(-TYPE_SYMBOL, TYPE_I64):
-        return aenum(clone(x), clone(y));
+    case mtype2(-TYPE_SYMBOL, TYPE_SYMBOL):
+        s = rf_get(x);
+
+        if (is_error(s))
+            return s;
+
+        if (!s || s->type != TYPE_SYMBOL)
+            raise(ERR_TYPE, "enum: expected vector symbol");
+
+        v = rf_find(s, y);
+        drop(s);
+
+        return aenum(clone(x), v);
     default:
         raise(ERR_TYPE, "enum: unsupported types: %d %d", x->type, y->type);
     }

@@ -522,7 +522,7 @@ i32_t obj_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t li
     // case -TYPE_GUID:
     //     return guid_fmt_into(dst, len, offset, limit, obj->guid);
     case -TYPE_CHAR:
-        return str_fmt_into(dst, len, offset, limit, "'%c'", obj->achar ? obj->achar : 1);
+        return str_fmt_into(dst, len, offset, limit, "'%c'", obj->vchar ? obj->vchar : 1);
     case TYPE_BOOL:
         return vector_fmt_into(dst, len, offset, limit, obj);
     case TYPE_BYTE:
