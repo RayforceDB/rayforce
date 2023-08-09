@@ -2204,7 +2204,7 @@ obj_t rf_enum(obj_t x, obj_t y)
         v = rf_find(s, y);
         drop(s);
 
-        return aenum(clone(x), v);
+        return venum(clone(x), v);
     default:
         raise(ERR_TYPE, "enum: unsupported types: %d %d", x->type, y->type);
     }

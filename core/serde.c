@@ -190,7 +190,7 @@ obj_t load_obj(byte_t **buf, u64_t len)
         (*buf)++;
         return obj;
     case -TYPE_BYTE:
-        obj = abyte((*buf)[0]);
+        obj = vbyte((*buf)[0]);
         (*buf)++;
         return obj;
     case -TYPE_I64:
