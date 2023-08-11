@@ -2190,7 +2190,7 @@ obj_t rf_take(obj_t x, obj_t y)
 
         l = y->i64;
 
-        if (!s || !is_vector(s))
+        if (!s || s->type != TYPE_SYMBOL)
         {
             res = vector_i64(l);
 

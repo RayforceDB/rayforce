@@ -41,6 +41,7 @@ extern "C"
 #define TYPE_GUID 7
 #define TYPE_CHAR 8
 #define TYPE_ENUM 20
+#define TYPE_ANYMAP 77
 #define TYPE_TABLE 98
 #define TYPE_DICT 99
 #define TYPE_LAMBDA 100
@@ -140,6 +141,7 @@ extern obj_t guid(u8_t data[]);                             // GUID
 extern obj_t vchar(char_t c);                               // char
 extern obj_t string(u64_t len);                             // string 
 extern obj_t venum(obj_t sym, obj_t vec);                   // enum
+extern obj_t anymap(obj_t sym, obj_t vec);                  // anymap
 
 #define vector_bool(len)      (vector(TYPE_BOOL,      len)) // bool vector
 #define vector_byte(len)      (vector(TYPE_BYTE,      len)) // byte vector

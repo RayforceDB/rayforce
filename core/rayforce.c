@@ -151,15 +151,6 @@ obj_t timestamp(i64_t val)
     return t;
 }
 
-obj_t venum(obj_t sym, obj_t vec)
-{
-    obj_t e = list(2, sym, vec);
-
-    e->type = TYPE_ENUM;
-
-    return e;
-}
-
 obj_t vector(type_t type, u64_t len)
 {
     type_t t;
@@ -231,6 +222,24 @@ obj_t table(obj_t keys, obj_t vals)
     t->type = TYPE_TABLE;
 
     return t;
+}
+
+obj_t venum(obj_t sym, obj_t vec)
+{
+    obj_t e = list(2, sym, vec);
+
+    e->type = TYPE_ENUM;
+
+    return e;
+}
+
+obj_t anymap(obj_t sym, obj_t vec)
+{
+    obj_t e = list(2, sym, vec);
+
+    e->type = TYPE_ANYMAP;
+
+    return e;
 }
 
 obj_t error(i8_t code, str_t msg)
