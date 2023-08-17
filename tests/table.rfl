@@ -4,8 +4,8 @@
 
 ;; (set l (take 10000000 (til 100)))
 ;; (set l (til 10000000))
-(set n 10000000)
-(set l (rand n 100))
+(set n 100)
+(set l (til n))
 ;; (set l (rand 10000000 1000000000000))
 ;; (set t (table [a b c d e f g h] (list (as 'F64 l) l (as 'F64 l) (as 'Timestamp l) l l l l)))
 ;; (set t (table [a b c d e f g h] (list l l l l l l l l)))

@@ -157,7 +157,7 @@ obj_t rf_map_vary(obj_t *x, u64_t n)
 obj_t rf_list(obj_t *x, u64_t n)
 {
     u64_t i;
-    obj_t lst = list(n);
+    obj_t lst = vector(TYPE_LIST, n);
 
     for (i = 0; i < n; i++)
         as_list(lst)[i] = clone(x[i]);
@@ -171,10 +171,12 @@ obj_t rf_enlist(obj_t *x, u64_t n)
         return list(0);
 
     u64_t i;
-    obj_t lst = list(n);
+    obj_t lst;
+
+    lst = vector(x[0]->type, n);
 
     for (i = 0; i < n; i++)
-        as_list(lst)[i] = clone(x[i]);
+        write_obj(&lst, i, clone(x[i]));
 
     return lst;
 }

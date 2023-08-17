@@ -487,6 +487,8 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
             join_obj(&cols, k);
             map = true;
         }
+        else
+            drop(k);
     }
 
     k = rf_distinct(syms);
@@ -504,6 +506,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     key = symboli64(KW_WHERE);
     val = at_obj(params, key);
     drop(key);
+
     if (!is_null(val))
     {
         push_opcode(cc, car, code, OP_LPUSH);
@@ -518,9 +521,8 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
         }
 
         push_opcode(cc, obj, code, OP_CALL1);
-        push_opcode(cc, obj, code, 0);
+        push_u8(code, 0);
         push_u64(code, rf_where);
-
         push_opcode(cc, car, code, OP_LPOP);
 
         // reduce by used columns (if any)
@@ -528,15 +530,15 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
         {
             push_opcode(cc, car, code, OP_DUP);
             push_opcode(cc, car, code, OP_CALL1);
-            push_opcode(cc, car, code, 0);
+            push_u8(code, 0);
             push_u64(code, rf_key);
             push_opcode(cc, car, code, OP_PUSH);
             push_const(cc, k);
             push_opcode(cc, car, code, OP_CALL2);
-            push_opcode(cc, car, code, 0);
+            push_u8(code, 0);
             push_u64(code, rf_sect);
             push_opcode(cc, car, code, OP_CALL2);
-            push_opcode(cc, car, code, 0);
+            push_u8(code, 0);
             push_u64(code, rf_take);
         }
         else
@@ -546,8 +548,8 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
 
         // apply filters
         push_opcode(cc, car, code, OP_CALL2);
-        push_opcode(cc, car, code, 0);
-        push_u64(code, rf_take);
+        push_u8(code, 0);
+        push_u64(code, rf_at);
     }
     else
     {
@@ -556,15 +558,15 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
         {
             push_opcode(cc, car, code, OP_DUP);
             push_opcode(cc, car, code, OP_CALL1);
-            push_opcode(cc, car, code, 0);
+            push_u8(code, 0);
             push_u64(code, rf_key);
             push_opcode(cc, car, code, OP_PUSH);
             push_const(cc, k);
             push_opcode(cc, car, code, OP_CALL2);
-            push_opcode(cc, car, code, 0);
+            push_u8(code, 0);
             push_u64(code, rf_sect);
             push_opcode(cc, car, code, OP_CALL2);
-            push_opcode(cc, car, code, 0);
+            push_u8(code, 0);
             push_u64(code, rf_take);
         }
         else
@@ -608,7 +610,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
         push_opcode(cc, car, code, OP_PUSH);
         push_const(cc, at_idx(cols, 0));
         push_opcode(cc, car, code, OP_CALL2);
-        push_opcode(cc, car, code, 0);
+        push_u8(code, 0);
         push_u64(code, rf_except);
         push_opcode(cc, car, code, OP_CALL2);
         push_opcode(cc, car, code, 0);
@@ -618,13 +620,13 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
 
         // apply grouping
         push_opcode(cc, car, code, OP_CALL2);
-        push_opcode(cc, car, code, 0);
+        push_u8(code, 0);
         push_u64(code, rf_group_Table);
 
         push_opcode(cc, car, code, OP_LPUSH);
 
         push_opcode(cc, obj, code, OP_CALL1);
-        push_opcode(cc, obj, code, 0);
+        push_u8(code, 0);
         push_u64(code, rf_key);
 
         // TODO!!!
@@ -659,12 +661,12 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
         }
 
         push_opcode(cc, car, code, OP_CALLN);
-        push_opcode(cc, car, code, (u8_t)cols->len);
-        push_opcode(cc, car, code, 0);
+        push_u8(code, cols->len);
+        push_u8(code, 0);
         push_u64(code, rf_list);
 
         push_opcode(cc, car, code, OP_CALL2);
-        push_opcode(cc, car, code, 0);
+        push_u8(code, 0);
         push_u64(code, rf_table);
     }
     else

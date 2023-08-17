@@ -1479,9 +1479,8 @@ obj_t rf_or(obj_t x, obj_t y)
 
 obj_t rf_at(obj_t x, obj_t y)
 {
-    i32_t i;
-    i64_t yl, xl;
-    obj_t res, k, s, v;
+    u64_t i, j, yl, xl;
+    obj_t res, k, s, v, c, cols;
     byte_t *buf;
 
     switch (mtype2(x->type, y->type))
@@ -1504,7 +1503,7 @@ obj_t rf_at(obj_t x, obj_t y)
         res = vector_bool(yl);
         for (i = 0; i < yl; i++)
         {
-            if (as_bool(y)[i] >= xl)
+            if (as_bool(y)[i] >= (i64_t)xl)
                 as_bool(res)[i] = false;
             else
                 as_bool(res)[i] = as_bool(x)[(i32_t)as_bool(y)[i]];
@@ -1513,15 +1512,17 @@ obj_t rf_at(obj_t x, obj_t y)
         return res;
 
     case mtype2(TYPE_I64, TYPE_I64):
+    case mtype2(TYPE_SYMBOL, TYPE_I64):
+    case mtype2(TYPE_TIMESTAMP, TYPE_I64):
         yl = y->len;
         xl = x->len;
-        res = vector_i64(yl);
+        res = vector(x->type, yl);
         for (i = 0; i < yl; i++)
         {
-            if (as_i64(y)[i] >= xl)
+            if (as_i64(y)[i] >= (i64_t)xl)
                 as_i64(res)[i] = NULL_I64;
             else
-                as_i64(res)[i] = as_i64(x)[(i32_t)as_i64(y)[i]];
+                as_i64(res)[i] = as_i64(x)[as_i64(y)[i]];
         }
 
         return res;
@@ -1532,24 +1533,10 @@ obj_t rf_at(obj_t x, obj_t y)
         res = vector_f64(yl);
         for (i = 0; i < yl; i++)
         {
-            if (as_i64(y)[i] >= xl)
+            if (as_i64(y)[i] >= (i64_t)xl)
                 as_f64(res)[i] = NULL_F64;
             else
                 as_f64(res)[i] = as_f64(x)[(i32_t)as_i64(y)[i]];
-        }
-
-        return res;
-
-    case mtype2(TYPE_TIMESTAMP, TYPE_I64):
-        yl = y->len;
-        xl = x->len;
-        res = vector_timestamp(yl);
-        for (i = 0; i < yl; i++)
-        {
-            if (as_i64(y)[i] >= xl)
-                as_timestamp(res)[i] = NULL_I64;
-            else
-                as_timestamp(res)[i] = as_timestamp(x)[(i32_t)as_i64(y)[i]];
         }
 
         return res;
@@ -1574,7 +1561,7 @@ obj_t rf_at(obj_t x, obj_t y)
         res = string(yl);
         for (i = 0; i < yl; i++)
         {
-            if (as_i64(y)[i] >= xl)
+            if (as_i64(y)[i] >= (i64_t)xl)
                 as_string(res)[i] = ' ';
             else
                 as_string(res)[i] = as_string(x)[(i32_t)as_i64(y)[i]];
@@ -1588,11 +1575,62 @@ obj_t rf_at(obj_t x, obj_t y)
         res = list(yl);
         for (i = 0; i < yl; i++)
         {
-            if (as_i64(y)[i] >= xl)
+            if (as_i64(y)[i] >= (i64_t)xl)
                 as_list(res)[i] = null(0);
             else
                 as_list(res)[i] = clone(as_list(x)[(i32_t)as_i64(y)[i]]);
         }
+
+        return res;
+
+    case mtype2(TYPE_TABLE, TYPE_I64):
+        xl = as_list(x)[0]->len;
+        cols = vector(TYPE_LIST, xl);
+        for (i = 0; i < xl; i++)
+        {
+            c = rf_at(as_list(as_list(x)[1])[i], y);
+
+            if (is_atom(c))
+                c = rf_enlist(&c, 1);
+
+            if (is_error(c))
+            {
+                cols->len = i;
+                drop(cols);
+                return c;
+            }
+
+            write_obj(&cols, i, c);
+        }
+
+        res = table(clone(as_list(x)[0]), cols);
+
+        return res;
+
+    case mtype2(TYPE_TABLE, TYPE_SYMBOL):
+        xl = as_list(x)[1]->len;
+        yl = y->len;
+        cols = vector(TYPE_LIST, yl);
+        for (i = 0; i < yl; i++)
+        {
+            for (j = 0; j < xl; j++)
+            {
+                if (as_symbol(as_list(x)[0])[j] == as_symbol(y)[i])
+                {
+                    as_list(cols)[i] = clone(as_list(as_list(x)[1])[i]);
+                    break;
+                }
+            }
+
+            if (j == xl)
+            {
+                cols->len = i;
+                drop(cols);
+                raise(ERR_INDEX, "at: column '%s' has not found in a table", symtostr(as_symbol(y)[i]));
+            }
+        }
+
+        res = table(clone(y), cols);
 
         return res;
 
@@ -1682,6 +1720,30 @@ obj_t rf_at(obj_t x, obj_t y)
         buf = as_byte(k) + as_i64(v)[y->i64];
 
         return load_obj(&buf, xl);
+
+        // case mtype2(TYPE_ANYMAP, TYPE_I64):
+        //     k = anymap_key(x);
+        //     v = anymap_val(x);
+
+        //     xl = k->len;
+        //     yl = v->len;
+
+        //     res = vector_i64(yl);
+
+        //     for (i = 0; i < yl; i++)
+        //     {
+        //         if (as_i64(v)[y->i64] >= (i64_t)xl)
+        //         {
+        //             drop(res);
+        //             raise(ERR_INDEX, "at: anymap can not be resolved: index out of range");
+        //         }
+
+        //         buf = as_byte(k) + as_i64(v)[y->i64];
+
+        //         as_i64(res)[i] = load_obj(&buf, xl);
+        //     }
+
+        //     return res;
 
     default:
         raise(ERR_TYPE, "at: unsupported types: %d %d", x->type, y->type);
@@ -2143,47 +2205,37 @@ obj_t rf_filter(obj_t x, obj_t y)
 
 obj_t rf_take(obj_t x, obj_t y)
 {
-    u64_t i, l, m, n;
-    obj_t k, s, v, res;
+    u64_t i, j, l, m, n;
+    obj_t k, s, v, res, c, cols;
     byte_t *buf;
 
     switch (mtype2(x->type, y->type))
     {
-        // case mtype2(TYPE_BOOL, -TYPE_I64):
-        // case mtype2(TYPE_I64, -TYPE_I64):
-        // case mtype2(TYPE_F64, -TYPE_I64):
-        // case mtype2(TYPE_TIMESTAMP, -TYPE_I64):
-        // case mtype2(TYPE_GUID, -TYPE_I64):
-        // case mtype2(TYPE_SYMBOL, -TYPE_I64):
-        //     return vector_get(x, y->i64);
-
     case mtype2(-TYPE_I64, TYPE_I64):
+    case mtype2(-TYPE_I64, TYPE_SYMBOL):
+    case mtype2(-TYPE_I64, TYPE_TIMESTAMP):
         l = y->len;
         m = x->i64;
-        res = vector_i64(m);
+        res = vector(y->type, m);
 
         for (i = 0; i < m; i++)
             as_i64(res)[i] = as_i64(y)[i % l];
 
         return res;
 
-    case mtype2(-TYPE_I64, TYPE_SYMBOL):
+    case mtype2(-TYPE_I64, TYPE_F64):
         l = y->len;
         m = x->i64;
-        res = vector_symbol(m);
+        res = vector_f64(m);
 
         for (i = 0; i < m; i++)
-            as_symbol(res)[i] = as_symbol(y)[i % l];
+            as_f64(res)[i] = as_f64(y)[i % l];
 
         return res;
-        // case mtype2(-TYPE_I64, TYPE_NULL):
-        //     l = x->i64;
-        //     res = list(l);
-        //     for (i = 0; i < l; i++)
-        //         as_list(res)[i] = *y;
 
-        return res;
     case mtype2(-TYPE_I64, -TYPE_I64):
+    case mtype2(-TYPE_I64, -TYPE_SYMBOL):
+    case mtype2(-TYPE_I64, -TYPE_TIMESTAMP):
         l = x->i64;
         res = vector_i64(l);
         for (i = 0; i < l; i++)
@@ -2199,7 +2251,6 @@ obj_t rf_take(obj_t x, obj_t y)
 
         return res;
 
-    case mtype2(-TYPE_I64, -TYPE_TIMESTAMP):
         l = x->i64;
         res = vector_timestamp(l);
         for (i = 0; i < l; i++)
@@ -2207,101 +2258,17 @@ obj_t rf_take(obj_t x, obj_t y)
 
         return res;
 
-    case mtype2(TYPE_TABLE, -TYPE_I64):
-        // case mtype2(TYPE_TABLE, TYPE_I64):
-        //     l = as_list(x)[0]->len;
-        //     cols = list(l);
-        //     for (i = 0; i < l; i++)
-        //     {
-        //         c = rf_take(as_list(as_list(x)[1])[i], y);
-
-        //         if (is_atom(c))
-        //             c = rf_enlist(c, 1);
-
-        //         if (is_error(c))
-        //         {
-        //             res->len = i;
-        //             drop(res);
-        //             return c;
-        //         }
-
-        //         write_obj(&cols, i, c);
-        //     }
-
-        //     res = rf_table(as_list(x)[0], cols);
-
-        //     return res;
-
-        // case mtype2(TYPE_TABLE, TYPE_SYMBOL):
-        //     l = y->len;
-        //     cols = list(l);
-        //     for (i = 0; i < l; i++)
-        //     {
-        //         sym = symboli64(as_symbol(y)[i]);
-        //         as_list(&cols)[i] = at_obj(x, sym);
-        //     }
-
-        //     res = rf_table(y, &cols);
-        //     drop(cols);
-
-        //     return res;
-
-        // case mtype2(TYPE_I64, TYPE_I64):
-        //     l = y->len;
-        //     res = vector_i64(l);
-
-        //     for (i = 0; i < l; i++)
-        //         as_i64(res)[i] = vector_get(x, as_i64(y)[i]).i64;
-
-        //     return res;
-
-        // case mtype2(TYPE_SYMBOL, TYPE_I64):
-        //     l = y->len;
-        //     res = vector_symbol(l);
-
-        //     for (i = 0; i < l; i++)
-        //         as_symbol(res)[i] = vector_get(x, as_i64(y)[i]).i64;
-
-        //     return res;
-
-        // case mtype2(TYPE_F64, TYPE_I64):
-        //     l = y->len;
-        //     res = vector_f64(l);
-
-        //     for (i = 0; i < l; i++)
-        //         as_f64(res)[i] = vector_get(x, as_i64(y)[i]).f64;
-
-        //     return res;
-
-        // case mtype2(TYPE_TIMESTAMP, TYPE_I64):
-        //     l = y->len;
-        //     res = vector_timestamp(l);
-
-        //     for (i = 0; i < l; i++)
-        //         as_timestamp(res)[i] = vector_get(x, as_i64(y)[i]).i64;
-
-        //     return res;
-
-    case mtype2(TYPE_LIST, TYPE_I64):
-        l = y->len;
-        res = list(l);
-
-        for (i = 0; i < l; i++)
-            as_list(res)[i] = clone(as_list(x)[as_i64(y)[i]]);
-
-        return res;
-
-    case mtype2(TYPE_ENUM, -TYPE_I64):
-        k = rf_key(x);
+    case mtype2(-TYPE_I64, TYPE_ENUM):
+        k = rf_key(y);
         s = rf_get(k);
         drop(k);
 
         if (is_error(s))
             return s;
 
-        v = enum_val(x);
+        v = enum_val(y);
 
-        l = y->i64;
+        l = x->i64;
         m = v->len;
 
         if (!s || s->type != TYPE_SYMBOL)
@@ -2335,12 +2302,12 @@ obj_t rf_take(obj_t x, obj_t y)
 
         return res;
 
-    case mtype2(TYPE_ANYMAP, -TYPE_I64):
-        l = y->i64;
+    case mtype2(-TYPE_I64, TYPE_ANYMAP):
+        l = x->i64;
         res = list(l);
 
-        k = anymap_key(x);
-        s = anymap_val(x);
+        k = anymap_key(y);
+        s = anymap_val(y);
 
         m = k->len;
         n = s->len;

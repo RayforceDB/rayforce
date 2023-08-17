@@ -552,17 +552,17 @@ obj_t pop_obj(obj_t *obj)
     switch ((*obj)->type)
     {
     case TYPE_I64:
-        return i64(as_i64(*obj)[(*obj)->len--]);
+        return i64(as_i64(*obj)[--(*obj)->len]);
     case TYPE_SYMBOL:
-        return symboli64(as_symbol(*obj)[(*obj)->len--]);
+        return symboli64(as_symbol(*obj)[--(*obj)->len]);
     case TYPE_TIMESTAMP:
-        return timestamp(as_timestamp(*obj)[(*obj)->len--]);
+        return timestamp(as_timestamp(*obj)[--(*obj)->len]);
     case TYPE_F64:
-        return f64(as_f64(*obj)[(*obj)->len--]);
+        return f64(as_f64(*obj)[--(*obj)->len]);
     case TYPE_CHAR:
-        return vchar(as_string(*obj)[(*obj)->len--]);
+        return vchar(as_string(*obj)[--(*obj)->len]);
     case TYPE_LIST:
-        return as_list(*obj)[(*obj)->len--];
+        return as_list(*obj)[--(*obj)->len];
 
     default:
         panic(str_fmt(0, "pop_obj: invalid type: %d", (*obj)->type));

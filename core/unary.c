@@ -57,11 +57,7 @@ obj_t rf_call_unary_atomic(unary_f f, obj_t x)
         if (item->type == TYPE_ERROR)
             return item;
 
-        // probably we can fold it in a vector if all other values will be of the same type
-        if (is_atom(item))
-            res = vector(-item->type, l);
-        else
-            res = list(l);
+        res = vector(item->type, l);
 
         write_obj(&res, 0, item);
 
@@ -652,21 +648,17 @@ obj_t rf_neg(obj_t x)
 
 obj_t rf_where(obj_t x)
 {
-    i32_t i, j = 0;
-    i64_t l, *ov;
-    bool_t *iv;
+    u64_t i, j, l;
     obj_t res;
 
     switch (x->type)
     {
     case TYPE_BOOL:
         l = x->len;
-        iv = as_bool(x);
         res = vector_i64(l);
-        ov = as_i64(res);
-        for (i = 0; i < l; i++)
-            if (iv[i])
-                ov[j++] = i;
+        for (i = 0, j = 0; i < l; i++)
+            if (as_bool(x)[i])
+                as_i64(res)[j++] = i;
 
         resize(&res, j);
 

@@ -385,7 +385,7 @@ i32_t enum_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t l
     {
         limit = TABLE_MAX_HEIGHT;
         idx = i64(TABLE_MAX_HEIGHT);
-        e = rf_take(obj, idx);
+        e = rf_take(idx, obj);
         drop(idx);
     }
     else
@@ -411,7 +411,7 @@ i32_t anymap_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t
     {
         limit = TABLE_MAX_HEIGHT;
         idx = i64(TABLE_MAX_HEIGHT);
-        a = rf_take(obj, idx);
+        a = rf_take(idx, obj);
         drop(idx);
     }
     else
