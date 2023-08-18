@@ -476,19 +476,8 @@ obj_t rf_max(obj_t x)
         iv = as_i64(x);
         imax = iv[0];
 
-        // find first nonnull value
         for (i = 0; i < l; i++)
-            if (iv[i] ^ NULL_I64)
-            {
-                imax = iv[i];
-                break;
-            }
-
-        for (i = 0; i < l; i++)
-        {
-            if (iv[i] ^ NULL_I64)
-                imax = iv[i] > imax ? iv[i] : imax;
-        }
+            imax = iv[i] > imax ? iv[i] : imax;
 
         return i64(imax);
 
