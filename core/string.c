@@ -47,6 +47,7 @@ obj_t string_from_str(str_t str, i32_t len)
 bool_t str_match(str_t str, str_t pat)
 {
     str_t last_str = NULL, last_pat = NULL;
+    bool_t inv;
 
     while (*str)
     {
@@ -66,24 +67,26 @@ bool_t str_match(str_t str, str_t pat)
         }
         else if (*pat == '[')
         {
-            bool_t inv = false, match = false;
+            char_t char_class[256] = {0}; // Assuming ASCII, adjust for other character sets
+            inv = false;
             pat++;
+
             if (*pat == '^')
             {
                 inv = true;
                 pat++;
             }
-            while (*pat != ']' && *pat != '\0')
+
+            while (*pat != ']' && *pat)
             {
-                if (*str == *pat)
-                {
-                    match = true;
-                }
+                char_class[(i32_t)*pat] = 1;
                 pat++;
             }
-            if (*pat == '\0')
+
+            if (!*pat)
                 return false; // unmatched '['
-            if (match == inv)
+
+            if (char_class[(i32_t)*str] == inv)
             {
                 if (last_pat)
                 {
@@ -91,9 +94,7 @@ bool_t str_match(str_t str, str_t pat)
                     pat = last_pat;
                 }
                 else
-                {
                     return false;
-                }
             }
             else
             {
@@ -107,9 +108,7 @@ bool_t str_match(str_t str, str_t pat)
             pat = last_pat;
         }
         else
-        {
             return false;
-        }
     }
 
     // Check for trailing patterns
