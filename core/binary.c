@@ -823,7 +823,7 @@ obj_t rf_table(obj_t x, obj_t y)
     }
 
     // otherwise we need to expand atoms to vectors
-    lst = list(len);
+    lst = vector(TYPE_LIST, len);
 
     if (cl == 0)
         cl = 1;
@@ -832,7 +832,6 @@ obj_t rf_table(obj_t x, obj_t y)
     {
         switch (as_list(y)[i]->type)
         {
-        // case TYPE_NULL:
         case -TYPE_BOOL:
         case -TYPE_I64:
         case -TYPE_F64:
@@ -840,6 +839,7 @@ obj_t rf_table(obj_t x, obj_t y)
         case -TYPE_SYMBOL:
             c = i64(cl);
             as_list(lst)[i] = rf_take(c, as_list(y)[i]);
+            drop(c);
             break;
         default:
             as_list(lst)[i] = clone(as_list(y)[i]);
@@ -1821,7 +1821,7 @@ obj_t rf_at(obj_t x, obj_t y)
             {
                 if (as_symbol(as_list(x)[0])[j] == as_symbol(y)[i])
                 {
-                    as_list(cols)[i] = clone(as_list(as_list(x)[1])[i]);
+                    as_list(cols)[i] = clone(as_list(as_list(x)[1])[j]);
                     break;
                 }
             }
@@ -1962,7 +1962,7 @@ obj_t rf_at(obj_t x, obj_t y)
         return res;
 
     default:
-        raise(ERR_TYPE, "at: unsupported types: %d %d", x->type, y->type);
+        return at_obj(x, y);
     }
 
     return null(0);

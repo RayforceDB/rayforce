@@ -165,6 +165,7 @@ extern obj_t error(i8_t code, str_t msg);
 
 // Destructor
 extern nil_t drop(obj_t obj);
+extern nil_t dropn(u64_t n, ...);
 
 // Accessors
 #define as_string(obj)    ((str_t)__builtin_assume_aligned((obj + 1), 16))

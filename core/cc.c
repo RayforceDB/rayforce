@@ -408,7 +408,7 @@ nil_t find_used_symbols(obj_t lst, obj_t *syms)
     {
     case -TYPE_SYMBOL:
         if (lst->i64 > 0)
-            join_obj(syms, lst);
+            join_raw(syms, &lst->i64);
         return;
     case TYPE_LIST:
         l = lst->len;
@@ -447,8 +447,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     key = symboli64(KW_FROM);
     val = at_obj(params, key);
     res = cc_compile_expr(true, cc, val);
-    drop(key);
-    drop(val);
+    dropn(2, key, val);
 
     if (res == CC_ERROR)
         return CC_ERROR;
@@ -460,6 +459,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     // first check by because it is special case in mapping
     key = symboli64(KW_BY);
     val = at_obj(params, key);
+
     if (!is_null(val))
     {
         groupby = true;
@@ -469,12 +469,12 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
             join_sym(&cols, "x");
     }
 
-    drop(key);
-    drop(val);
+    dropn(2, key, val);
 
     for (i = 0; i < l; i++)
     {
         k = at_idx(as_list(params)[0], i);
+
         if (k->i64 != KW_FROM && k->i64 != KW_WHERE)
         {
             v = at_obj(params, k);
@@ -495,9 +495,8 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
 
     if (is_error(k))
     {
-        drop(cols);
-        drop(syms);
-        return CC_ERROR;
+        dropn(2, cols, syms);
+        cerr(cc, car, ERR_TYPE, "invalid column name");
     }
 
     drop(syms);
@@ -512,61 +511,60 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
         push_opcode(cc, car, code, OP_LPUSH);
 
         res = cc_compile_expr(true, cc, val);
-        drop(val);
 
         if (res == CC_ERROR)
         {
-            drop(cols);
+            dropn(2, cols, val);
             return CC_ERROR;
         }
 
-        return CC_OK;
         push_opcode(cc, obj, code, OP_CALL1);
         push_u8(code, 0);
         push_u64(code, rf_where);
-        push_opcode(cc, car, code, OP_LPOP);
+        push_opcode(cc, val, code, OP_LPOP);
 
         // reduce by used columns (if any)
         if (map)
         {
-            push_opcode(cc, car, code, OP_DUP);
-            push_opcode(cc, car, code, OP_CALL1);
+            push_opcode(cc, val, code, OP_DUP);
+            push_opcode(cc, val, code, OP_CALL1);
             push_u8(code, 0);
             push_u64(code, rf_key);
-            push_opcode(cc, car, code, OP_PUSH);
+            push_opcode(cc, val, code, OP_PUSH);
             push_const(cc, k);
-            push_opcode(cc, car, code, OP_CALL2);
+            push_opcode(cc, val, code, OP_CALL2);
             push_u8(code, 0);
             push_u64(code, rf_sect);
-            push_opcode(cc, car, code, OP_CALL2);
+            push_opcode(cc, val, code, OP_CALL2);
             push_u8(code, 0);
-            push_u64(code, rf_take);
+            push_u64(code, rf_at);
         }
         else
             drop(k);
 
-        push_opcode(cc, car, code, OP_SWAP);
+        push_opcode(cc, val, code, OP_SWAP);
 
         // apply filters
-        push_opcode(cc, car, code, OP_CALL2);
+        push_opcode(cc, val, code, OP_CALL2);
         push_u8(code, 0);
         push_u64(code, rf_at);
+        drop(val);
     }
     else
     {
         // reduce by used columns (if any)
         if (map)
         {
-            push_opcode(cc, car, code, OP_DUP);
-            push_opcode(cc, car, code, OP_CALL1);
+            push_opcode(cc, params, code, OP_DUP);
+            push_opcode(cc, params, code, OP_CALL1);
             push_u8(code, 0);
             push_u64(code, rf_key);
-            push_opcode(cc, car, code, OP_PUSH);
+            push_opcode(cc, params, code, OP_PUSH);
             push_const(cc, k);
-            push_opcode(cc, car, code, OP_CALL2);
+            push_opcode(cc, params, code, OP_CALL2);
             push_u8(code, 0);
             push_u64(code, rf_sect);
-            push_opcode(cc, car, code, OP_CALL2);
+            push_opcode(cc, params, code, OP_CALL2);
             push_u8(code, 0);
             push_u64(code, rf_take);
         }
@@ -652,14 +650,15 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
             k = at_idx(as_list(params)[0], i);
             if (k->i64 != KW_FROM && k->i64 != KW_WHERE && k->i64 != KW_BY)
             {
-                v = at_obj(params, k);
+                v = at_idx(as_list(params)[1], i);
                 res = cc_compile_expr(true, cc, v);
-                drop(k);
-                drop(v);
+                dropn(2, k, v);
 
                 if (res == CC_ERROR)
                     return CC_ERROR;
             }
+            else
+                drop(k);
         }
 
         push_opcode(cc, car, code, OP_CALLN);

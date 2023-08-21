@@ -940,6 +940,19 @@ nil_t __attribute__((hot)) drop(obj_t obj)
     }
 }
 
+nil_t dropn(u64_t n, ...)
+{
+    u64_t i;
+    va_list args;
+
+    va_start(args, n);
+
+    for (i = 0; i < n; i++)
+        drop(va_arg(args, obj_t));
+
+    va_end(args);
+}
+
 obj_t cow(obj_t obj)
 {
     // i64_t i, l;

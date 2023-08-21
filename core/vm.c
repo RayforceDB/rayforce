@@ -163,8 +163,8 @@ op_swap:
     vm->ip++;
     arg[1] = stack_pop();
     arg[0] = stack_pop();
-    stack_push(arg[0]);
     stack_push(arg[1]);
+    stack_push(arg[0]);
     dispatch();
 op_dup:
     vm->ip++;

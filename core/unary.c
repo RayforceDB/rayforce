@@ -389,6 +389,9 @@ obj_t rf_avg(obj_t x)
 
     switch (x->type)
     {
+    case -TYPE_I64:
+    case -TYPE_F64:
+        return clone(x);
     case TYPE_I64:
         l = x->len;
         isum = 0;
