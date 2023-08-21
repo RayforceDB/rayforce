@@ -451,7 +451,6 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
 
     if (res == CC_ERROR)
         return CC_ERROR;
-
     // determine which of columns are used in select and which names will be used for result columns
     cols = vector_symbol(0);
     syms = vector_symbol(0);
@@ -464,7 +463,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
     {
         groupby = true;
         if (val->type == -TYPE_SYMBOL)
-            join_obj(&cols, val);
+            join_obj(&cols, clone(val));
         else
             join_sym(&cols, "x");
     }
@@ -614,7 +613,7 @@ cc_result_t cc_compile_select(bool_t has_consumer, cc_t *cc, obj_t obj, u32_t ar
         push_u64(code, rf_except);
         push_opcode(cc, car, code, OP_CALL2);
         push_opcode(cc, car, code, 0);
-        push_u64(code, rf_take);
+        push_u64(code, rf_at);
 
         push_opcode(cc, car, code, OP_SWAP);
 

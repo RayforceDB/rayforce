@@ -57,7 +57,7 @@ obj_t rf_call_unary_atomic(unary_f f, obj_t x)
         if (item->type == TYPE_ERROR)
             return item;
 
-        res = vector(item->type, l);
+        res = item->type < 0 ? vector(item->type, l) : vector(TYPE_LIST, l);
 
         write_obj(&res, 0, item);
 

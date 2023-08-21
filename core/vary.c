@@ -57,33 +57,30 @@ obj_t rf_call_vary(u8_t attrs, vary_f f, obj_t *x, u64_t n)
     }
 }
 
-obj_t rf_map_vary(obj_t *x, u64_t n)
+obj_t rf_map_vary_f(obj_t f, obj_t *x, u64_t n)
 {
     u64_t i, j, l;
     vm_t *vm;
     obj_t v, *b, res;
     i32_t bp, ip;
 
-    if (n < 2)
-        return null(0);
-
-    switch ((*x)->type)
+    switch (f->type)
     {
     case TYPE_UNARY:
-        if (n != 2)
+        if (n != 1)
             raise(ERR_TYPE, "'map': unary call with wrong arguments count");
-        return rf_call_unary(FLAG_ATOMIC, (unary_f)(*x)->i64, x[1]);
+        return rf_call_unary(FLAG_ATOMIC, (unary_f)f->i64, x[0]);
     case TYPE_BINARY:
-        if (n != 3)
+        if (n != 2)
             raise(ERR_TYPE, "'map': binary call with wrong arguments count");
-        return rf_call_binary(FLAG_ATOMIC, (binary_f)(*x)->i64, x[1], x[2]);
+        return rf_call_binary(FLAG_ATOMIC, (binary_f)f->i64, x[0], x[1]);
     case TYPE_VARY:
-        return rf_call_vary(FLAG_ATOMIC, (vary_f)(*x)->i64, x + 1, n - 1);
+        return rf_call_vary(FLAG_ATOMIC, (vary_f)f->i64, x, n);
     case TYPE_LAMBDA:
-        if ((n - 1) != as_lambda(*x)->args->len)
+        if (n != as_lambda(f)->args->len)
             raise(ERR_TYPE, "'map': lambda call with wrong arguments count");
         l = 0xffffffffffffffff;
-        for (i = 1; i < n; i++)
+        for (i = 0; i < n; i++)
         {
             b = x + i;
             if (is_vector(*b) && l == 0xffffffffffffffff)
@@ -102,7 +99,7 @@ obj_t rf_map_vary(obj_t *x, u64_t n)
         vm = &runtime_get()->vm;
 
         // first item to get type of res
-        for (j = 1; j < n; j++)
+        for (j = 0; j < n; j++)
         {
             b = x + j;
             v = is_vector(*b) ? at_idx(*b, 0) : clone(*b);
@@ -111,24 +108,24 @@ obj_t rf_map_vary(obj_t *x, u64_t n)
 
         ip = vm->ip;
         bp = vm->bp;
-        v = vm_exec(vm, *x);
+        v = vm_exec(vm, f);
         vm->ip = ip;
         vm->bp = bp;
 
         if (is_error(v))
             return v;
 
-        res = vector(v->type, l);
+        res = v->type < 0 ? vector(v->type, l) : vector(TYPE_LIST, l);
 
         write_obj(&res, 0, v);
 
         // drop args
-        for (j = 1; j < n; j++)
+        for (j = 0; j < n; j++)
             drop(vm->stack[--vm->sp]);
 
         for (i = 1; i < l; i++)
         {
-            for (j = 1; j < n; j++)
+            for (j = 0; j < n; j++)
             {
                 b = x + j;
                 v = is_vector(*b) ? at_idx(*b, i) : clone(*b);
@@ -137,12 +134,12 @@ obj_t rf_map_vary(obj_t *x, u64_t n)
 
             ip = vm->ip;
             bp = vm->bp;
-            v = vm_exec(vm, *x);
+            v = vm_exec(vm, f);
             vm->ip = ip;
             vm->bp = bp;
 
             // drop args
-            for (j = 1; j < n; j++)
+            for (j = 0; j < n; j++)
                 drop(vm->stack[--vm->sp]);
 
             // check error
@@ -158,8 +155,16 @@ obj_t rf_map_vary(obj_t *x, u64_t n)
 
         return res;
     default:
-        raise(ERR_TYPE, "'map': unsupported function type: %d", (*x)->type);
+        raise(ERR_TYPE, "'map': unsupported function type: %d", f->type);
     }
+}
+
+obj_t rf_map_vary(obj_t *x, u64_t n)
+{
+    if (n == 0)
+        return list(0);
+
+    return rf_map_vary_f(x[0], x + 1, n - 1);
 }
 
 obj_t rf_list(obj_t *x, u64_t n)

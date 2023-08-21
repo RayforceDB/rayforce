@@ -28,6 +28,7 @@
 #include "ops.h"
 
 obj_t rf_call_vary(u8_t attrs, vary_f f, obj_t *x, u64_t n);
+obj_t rf_map_vary_f(obj_t f, obj_t *x, u64_t n);
 obj_t rf_map_vary(obj_t *x, u64_t n);
 obj_t rf_list(obj_t *x, u64_t n);
 obj_t rf_enlist(obj_t *x, u64_t n);

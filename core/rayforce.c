@@ -155,20 +155,11 @@ obj_t timestamp(i64_t val)
 
 obj_t vector(type_t type, u64_t len)
 {
-    type_t t;
-
-    if (type < 0)
-        t = -type;
-    else if (type > 0 && type < TYPE_TABLE)
-        t = type;
-    else
-        t = TYPE_LIST;
-
-    obj_t vec = (obj_t)heap_alloc(sizeof(struct obj_t) + len * size_of_type(t));
+    obj_t vec = (obj_t)heap_alloc(sizeof(struct obj_t) + len * size_of_type(type));
 
     vec->mmod = MMOD_INTERNAL;
     vec->refc = 1;
-    vec->type = t;
+    vec->type = type;
     vec->rc = 1;
     vec->len = len;
     vec->attrs = 0;

@@ -140,7 +140,7 @@ obj_t rf_call_binary_left_atomic(binary_f f, obj_t x, obj_t y)
         if (item->type == TYPE_ERROR)
             return item;
 
-        res = vector(item->type, l);
+        res = item->type < 0 ? vector(item->type, l) : vector(TYPE_LIST, l);
 
         write_obj(&res, 0, item);
 
@@ -181,7 +181,7 @@ obj_t rf_call_binary_right_atomic(binary_f f, obj_t x, obj_t y)
         if (item->type == TYPE_ERROR)
             return item;
 
-        res = vector(item->type, l);
+        res = item->type < 0 ? vector(item->type, l) : vector(TYPE_LIST, l);
 
         write_obj(&res, 0, item);
 
@@ -230,7 +230,7 @@ obj_t rf_call_binary_atomic(binary_f f, obj_t x, obj_t y)
         if (is_error(item))
             return item;
 
-        res = vector(item->type, l);
+        res = item->type < 0 ? vector(item->type, l) : vector(TYPE_LIST, l);
 
         write_obj(&res, 0, item);
 
@@ -264,7 +264,7 @@ obj_t rf_call_binary_atomic(binary_f f, obj_t x, obj_t y)
         if (item->type == TYPE_ERROR)
             return item;
 
-        res = vector(item->type, l);
+        res = item->type < 0 ? vector(item->type, l) : vector(TYPE_LIST, l);
 
         write_obj(&res, 0, item);
 
@@ -296,7 +296,7 @@ obj_t rf_call_binary_atomic(binary_f f, obj_t x, obj_t y)
         if (item->type == TYPE_ERROR)
             return item;
 
-        res = vector(item->type, l);
+        res = item->type < 0 ? vector(item->type, l) : vector(TYPE_LIST, l);
 
         write_obj(&res, 0, item);
 
@@ -2554,6 +2554,18 @@ obj_t rf_take(obj_t x, obj_t y)
 
         return res;
 
+    case mtype2(-TYPE_I64, TYPE_TABLE):
+        k = atom(-TYPE_VARY);
+        k->i64 = (i64_t)rf_take;
+        k->attrs = FLAG_NONE;
+        v = rf_map_vary_f(k, as_list(as_list(y)[1]), as_list(y)[1]->len);
+        drop(k);
+
+        if (is_error(v))
+            return v;
+
+        return table(clone(as_list(y)[0]), v);
+
     default:
         raise(ERR_TYPE, "take: unsupported types: %d %d", x->type, y->type);
     }
@@ -2664,9 +2676,9 @@ obj_t rf_group_Table(obj_t x, obj_t y)
     {
     case mtype2(TYPE_TABLE, TYPE_LIST):
         l = as_list(x)[1]->len;
-        res = list(l);
+        res = vector(TYPE_LIST, l);
         for (i = 0; i < l; i++)
-            as_list(res)[i] = rf_call_binary_right_atomic(rf_take, as_list(as_list(x)[1])[i], y);
+            as_list(res)[i] = rf_call_binary_right_atomic(rf_at, as_list(as_list(x)[1])[i], y);
 
         return table(clone(as_list(x)[0]), res);
 
