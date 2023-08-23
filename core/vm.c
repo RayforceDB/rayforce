@@ -74,13 +74,15 @@ obj_t __attribute__((hot)) vm_exec(vm_t *vm, obj_t fun)
     str_t code = as_string(f->code);
     obj_t arg[4], e, r, *addr;
     u8_t n, attrs;
-    u64_t i, j, l, a;
+    u64_t i, j, l;
     i32_t b, sp, bp, ip;
+    volatile u64_t a;
 
     // init registers
     vm->ip = 0;
     vm->bp = vm->sp;
 
+    b = 0;
     // offset into an args array
     a = 0;
 

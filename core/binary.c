@@ -125,6 +125,7 @@ call:
     return res;
 }
 
+// TODO: optimize getting items in case of lists to avoid alloc/drops of an nodes
 obj_t rf_call_binary_left_atomic(binary_f f, obj_t x, obj_t y)
 {
     u64_t i, l;
@@ -261,7 +262,7 @@ obj_t rf_call_binary_atomic(binary_f f, obj_t x, obj_t y)
         item = rf_call_binary_atomic(f, a, y);
         drop(a);
 
-        if (item->type == TYPE_ERROR)
+        if (is_error(item))
             return item;
 
         res = item->type < 0 ? vector(item->type, l) : vector(TYPE_LIST, l);
@@ -274,7 +275,7 @@ obj_t rf_call_binary_atomic(binary_f f, obj_t x, obj_t y)
             item = rf_call_binary_atomic(f, a, y);
             drop(a);
 
-            if (item->type == TYPE_ERROR)
+            if (is_error(item))
             {
                 res->len = i;
                 drop(res);
@@ -1226,10 +1227,29 @@ obj_t rf_mod(obj_t x, obj_t y)
 
 obj_t rf_like(obj_t x, obj_t y)
 {
+    i64_t i, l;
+    obj_t res, e;
+
     switch (mtype2(x->type, y->type))
     {
     case mtype2(TYPE_CHAR, TYPE_CHAR):
         return (bool(str_match(as_string(x), as_string(y))));
+    case mtype2(TYPE_LIST, TYPE_CHAR):
+        l = x->len;
+        res = vector_bool(l);
+        for (i = 0; i < l; i++)
+        {
+            e = as_list(x)[i];
+            if (!e || e->type != TYPE_CHAR)
+            {
+                drop(res);
+                raise(ERR_TYPE, "like: unsupported types: %d %d", e->type, y->type);
+            }
+
+            as_bool(res)[i] = str_match(as_string(e), as_string(y));
+        }
+
+        return res;
 
     default:
         raise(ERR_TYPE, "like: unsupported types: %d %d", x->type, y->type);

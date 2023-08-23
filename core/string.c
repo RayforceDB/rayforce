@@ -46,69 +46,93 @@ obj_t string_from_str(str_t str, i32_t len)
  */
 bool_t str_match(str_t str, str_t pat)
 {
-    str_t last_str = NULL, last_pat = NULL;
+    str_t s = NULL;
+    bool_t inv = false, match = false;
 
     while (*str)
     {
-        if (*pat == '?' || *str == *pat)
+        switch (*pat)
         {
-            str++;
-            pat++;
-        }
-        else if (*pat == '*')
-        {
-            // Skip consecutive '*'
+        case '*':
             while (*pat == '*')
                 pat++;
 
-            last_str = str;
-            last_pat = pat;
-        }
-        else if (*pat == '[')
-        {
-            bool_t inv = false, match = false;
-            pat++;
-            if (*pat == '^')
+            if (*pat == '\0')
+                return true;
+
+            if (*pat != '[' && *pat != '?')
             {
-                inv = true;
-                pat++;
+                s = str;
+                while (*s && *s != *pat)
+                    s++;
+
+                // If character is not found in the rest of the string
+                if (!*s)
+                    return false;
+
+                str = s; // Move str to the position of the found character
             }
+            else
+            {
+                // If followed by wildcard or set, we'll need to consider every possibility
+                s = str;
+            }
+            break;
+
+        case '?':
+            str++;
+            pat++;
+            break;
+
+        case '[':
+            pat++;
+            inv = (*pat == '^') ? true : false;
+            if (inv)
+                pat++;
+
+            match = false;
             while (*pat != ']' && *pat != '\0')
             {
                 if (*str == *pat)
-                {
                     match = true;
-                }
                 pat++;
             }
+
             if (*pat == '\0')
                 return false; // unmatched '['
-            if (match == inv)
+
+            if ((match && inv) || (!match && !inv))
             {
-                if (last_pat)
-                {
-                    str = ++last_str;
-                    pat = last_pat;
-                }
-                else
-                {
+                // Failed to match with the current character set
+                if (!s)
                     return false;
-                }
+
+                // Revert back to the position right after the '*'
+                str = s + 1;
+                pat -= (inv ? 2 : 1); // Go back to '['
             }
             else
             {
                 str++;
                 pat++;
             }
-        }
-        else if (last_pat)
-        {
-            str = ++last_str;
-            pat = last_pat;
-        }
-        else
-        {
-            return false;
+            break;
+
+        default:
+            if (*str != *pat)
+            {
+                if (!s)
+                    return false;
+
+                str = ++s;
+                pat -= 2; // To account for the next iteration's increment
+            }
+            else
+            {
+                str++;
+                pat++;
+            }
+            break;
         }
     }
 

@@ -121,7 +121,7 @@ nil_t init_functions(obj_t functions)
     regf(functions,  "/",         TYPE_BINARY,   FLAG_ATOMIC,       rf_div);
     regf(functions,  "%",         TYPE_BINARY,   FLAG_ATOMIC,       rf_mod);
     regf(functions,  "div",       TYPE_BINARY,   FLAG_ATOMIC,       rf_fdiv);
-    regf(functions,  "like",      TYPE_BINARY,   FLAG_LEFT_ATOMIC,  rf_like);
+    regf(functions,  "like",      TYPE_BINARY,   FLAG_NONE,         rf_like);
     regf(functions,  "dict",      TYPE_BINARY,   FLAG_NONE,         rf_dict);
     regf(functions,  "table",     TYPE_BINARY,   FLAG_NONE,         rf_table);
     regf(functions,  "find",      TYPE_BINARY,   FLAG_ATOMIC,       rf_find);
