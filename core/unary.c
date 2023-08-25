@@ -383,7 +383,30 @@ obj_t rf_group(obj_t x)
     if (!x || x->type != TYPE_I64)
         raise(ERR_TYPE, "group: expected vector_i64");
 
-    return group(x);
+    obj_t g, vals, *vi, res;
+    u64_t i, j, l;
+    i64_t o, *iv, *offsets, *indices, *ki;
+
+    g = group(x);
+
+    l = as_list(g)[0]->len;
+    offsets = as_i64(as_list(g)[1]);
+    indices = as_i64(as_list(g)[2]);
+
+    vals = vector(TYPE_LIST, l);
+    vi = as_list(vals);
+
+    for (i = 0, o = 0; i < l; i++)
+    {
+        vi[i] = vector_i64(offsets[i] - o);
+        memcpy(as_i64(vi[i]), indices + o, (offsets[i] - o) * sizeof(i64_t));
+        o = offsets[i];
+    }
+
+    res = dict(clone(as_list(g)[0]), vals);
+    drop(g);
+
+    return res;
 }
 
 obj_t rf_sum(obj_t x)
