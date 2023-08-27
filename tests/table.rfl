@@ -22,11 +22,11 @@
 
 
 (set t (table [OrderId Symbol Tape Price Size Timestamp] 
-    (list  (take n (til 1000))
+    (list (+ 984563 (take n (til 1000)))
           (take n [AAPL GOOG MSFT IBM AMZN FB BABA]) 
           (map (fn [x] (as 'string x)) l) 
           (as 'F64 l) 
-          (* l l)
+          (+ l l)
           (as 'Timestamp l) 
     ))
 )
