@@ -127,6 +127,12 @@ obj_t rf_call_unary(u8_t attrs, unary_f f, obj_t x)
     case FLAG_ATOMIC:
         return rf_call_unary_atomic(f, x);
     default:
+        if (x->type == TYPE_VECMAP)
+        {
+            ctx_t ctx = {0};
+            ctx.indices = as_list(x)[1];
+            return f(as_list(x)[0], &ctx);
+        }
         return f(x, NULL);
     }
 }
@@ -411,12 +417,28 @@ obj_t rf_sum(obj_t x, ctx_t *ctx)
     case -TYPE_F64:
         return clone(x);
     case TYPE_I64:
-        l = x->len;
-
-        for (i = 0; i < l; i++)
+        if (ctx == NULL)
         {
-            v = (as_i64(x)[i] == NULL_I64) ? 0 : as_i64(x)[i];
-            isum += v;
+            l = x->len;
+            values = as_i64(x);
+
+            for (i = 0; i < l; i++)
+            {
+                v = (values[i] == NULL_I64) ? 0 : values[i];
+                isum += v;
+            }
+        }
+        else
+        {
+            l = ctx->indices->len;
+            indices = as_i64(ctx->indices);
+            values = as_i64(x);
+            for (i = 0; i < l; i++)
+            {
+                v = values[indices[i]];
+                v = (v == NULL_I64) ? 0 : v;
+                isum += v;
+            }
         }
 
         return i64(isum);
@@ -426,20 +448,6 @@ obj_t rf_sum(obj_t x, ctx_t *ctx)
             fsum += as_f64(x)[i];
 
         return f64(fsum);
-
-    case TYPE_VECMAP:
-        l = as_list(x)[1]->len;
-        values = as_i64(as_list(x)[0]);
-        indices = as_i64(as_list(x)[1]);
-
-        for (i = 0; i < l; i++)
-        {
-            v = values[indices[i]];
-            v = (v == NULL_I64) ? 0 : v;
-            isum += v;
-        }
-
-        return i64(isum);
 
     default:
         raise(ERR_TYPE, "sum: unsupported type: %d", x->type);

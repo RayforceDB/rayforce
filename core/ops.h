@@ -78,7 +78,7 @@
 // Calling context
 typedef struct ctx_t
 {
-    i64_t *indices;
+    obj_t indices;
 } ctx_t;
 
 // Function types
