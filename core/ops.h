@@ -103,7 +103,7 @@ u64_t rfi_fnv1a_hash_64(i64_t key);
 u64_t rfi_i64_hash(i64_t a);
 
 obj_t distinct(obj_t x);
-obj_t group(obj_t x);
+obj_t group(i64_t values[], i64_t indices[], i64_t len);
 u64_t count(obj_t x);
 
 str_t get_os_error();

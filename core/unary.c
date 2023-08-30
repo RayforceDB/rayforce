@@ -382,14 +382,22 @@ obj_t rf_distinct(obj_t x)
 
 obj_t rf_group(obj_t x)
 {
-    if (!x || x->type != TYPE_I64)
-        raise(ERR_TYPE, "group: expected vector_i64");
 
     obj_t g, vals, *vi, res;
     u64_t i, l;
     i64_t j, *offsets, *indices;
 
-    g = group(x);
+    switch (x->type)
+    {
+    case TYPE_I64:
+        g = group(as_i64(x), NULL, x->len);
+        break;
+    case TYPE_VECMAP:
+        g = group(as_i64(as_list(x)[0]), as_i64(as_list(x)[1]), as_list(x)[1]->len);
+        break;
+    default:
+        raise(ERR_TYPE, "group: invalid type: %d", x->type);
+    }
 
     l = as_list(g)[0]->len;
     offsets = as_i64(as_list(g)[1]);

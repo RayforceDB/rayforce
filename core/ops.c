@@ -286,45 +286,70 @@ obj_t distinct(obj_t x)
     return vec;
 }
 
-obj_t group(obj_t x)
+obj_t group(i64_t values[], i64_t indices[], i64_t len)
 {
-    i64_t i, j, n, m, xl, idx, min, max, range, *iv, *hk, *hv, *kv, *vv;
+    i64_t i, j, n, m, idx, min, max, range, *hk, *hv, *kv, *vv;
     obj_t keys, vals, k, v, ht;
 
-    if (x->len == 0)
+    if (len == 0)
         return dict(vector_i64(0), list(0));
 
-    xl = x->len;
-
-    iv = as_i64(x);
-    min = max = iv[0];
-
-    for (i = 0; i < xl; i++)
+    if (indices)
     {
-        min = iv[i] < min ? iv[i] : min;
-        max = iv[i] > max ? iv[i] : max;
+        min = max = values[indices[0]];
+        for (i = 0; i < len; i++)
+        {
+            min = values[indices[i]] < min ? values[indices[i]] : min;
+            max = values[indices[i]] > max ? values[indices[i]] : max;
+        }
+    }
+    else
+    {
+        min = max = values[0];
+        for (i = 0; i < len; i++)
+        {
+            min = values[i] < min ? values[i] : min;
+            max = values[i] > max ? values[i] : max;
+        }
     }
 
     range = max - min + 1;
 
     // use flat vector instead of hash table
-    if (range <= xl)
+    if (range <= len)
     {
         ht = vector_i64(range);
         hk = as_i64(ht);
         memset(hk, 0, range * sizeof(i64_t));
 
         // First pass - Count occurrences
-        for (i = 0, j = 0; i < xl; i++)
+        if (indices)
         {
-            n = iv[i] - min;
-            if (hk[n] == 0)
+            for (i = 0, j = 0; i < len; i++)
             {
-                hk[n] = 1;
-                j++;
+                n = values[indices[i]] - min;
+                if (hk[n] == 0)
+                {
+                    hk[n] = 1;
+                    j++;
+                }
+                else
+                    hk[n]++;
             }
-            else
-                hk[n]++;
+        }
+        else
+        {
+            for (i = 0, j = 0; i < len; i++)
+            {
+                n = values[i] - min;
+                if (hk[n] == 0)
+                {
+                    hk[n] = 1;
+                    j++;
+                }
+                else
+                    hk[n]++;
+            }
         }
 
         // allocate space for distinct keys
@@ -347,10 +372,21 @@ obj_t group(obj_t x)
         vv = as_i64(vals);
 
         // Single pass through the input, populating all_indices
-        for (i = 0; i < xl; i++)
+        if (indices)
         {
-            n = iv[i] - min;
-            vv[hk[n]++] = i;
+            for (i = 0; i < len; i++)
+            {
+                n = values[indices[i]] - min;
+                vv[hk[n]++] = indices[i];
+            }
+        }
+        else
+        {
+            for (i = 0; i < len; i++)
+            {
+                n = values[i] - min;
+                vv[hk[n]++] = i;
+            }
         }
 
         // pack offsets and fill keys
@@ -370,22 +406,40 @@ obj_t group(obj_t x)
     }
 
     // Use hash table
-    ht = ht_tab(xl, TYPE_I64);
+    ht = ht_tab(len, TYPE_I64);
     hk = as_i64(as_list(ht)[0]);
     hv = as_i64(as_list(ht)[1]);
 
     // First pass - Count occurrences
-    for (i = 0; i < xl; i++)
+    if (indices)
     {
-        n = iv[i] - min;
-        idx = ht_tab_next(&ht, n);
-        if (hk[idx] == NULL_I64)
+        for (i = 0; i < len; i++)
         {
-            hk[idx] = n;
-            hv[idx] = 1;
+            n = values[indices[i]] - min;
+            idx = ht_tab_next(&ht, n);
+            if (hk[idx] == NULL_I64)
+            {
+                hk[idx] = n;
+                hv[idx] = 1;
+            }
+            else
+                hv[idx]++;
         }
-        else
-            hv[idx]++;
+    }
+    else
+    {
+        for (i = 0; i < len; i++)
+        {
+            n = values[i] - min;
+            idx = ht_tab_next(&ht, n);
+            if (hk[idx] == NULL_I64)
+            {
+                hk[idx] = n;
+                hv[idx] = 1;
+            }
+            else
+                hv[idx]++;
+        }
     }
 
     // Pre-compute offsets into all_indices array
@@ -407,11 +461,23 @@ obj_t group(obj_t x)
     vv = as_i64(vals);
 
     // Single pass through the input, populating all_indices
-    for (i = 0; i < xl; i++)
+    if (indices)
     {
-        n = iv[i] - min;
-        idx = ht_tab_next(&ht, n);
-        vv[as_i64(as_list(ht)[1])[idx]++] = i;
+        for (i = 0; i < len; i++)
+        {
+            n = values[indices[i]] - min;
+            idx = ht_tab_next(&ht, n);
+            vv[as_i64(as_list(ht)[1])[idx]++] = indices[i];
+        }
+    }
+    else
+    {
+        for (i = 0; i < len; i++)
+        {
+            n = values[i] - min;
+            idx = ht_tab_next(&ht, n);
+            vv[as_i64(as_list(ht)[1])[idx]++] = i;
+        }
     }
 
     // pack offsets and fill keys

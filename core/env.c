@@ -84,7 +84,7 @@ nil_t init_functions(obj_t functions)
     regf(functions,  "type",      TYPE_UNARY,    FN_NONE,           rf_type);
     regf(functions,  "til",       TYPE_UNARY,    FN_NONE,           rf_til);
     regf(functions,  "distinct",  TYPE_UNARY,    FN_NONE,           rf_distinct);
-    regf(functions,  "group",     TYPE_UNARY,    FN_NONE,           rf_group);
+    regf(functions,  "group",     TYPE_UNARY,    FN_NONE | FN_LAZY, rf_group);
     regf(functions,  "sum",       TYPE_UNARY,    FN_NONE | FN_LAZY, rf_sum);
     regf(functions,  "avg",       TYPE_UNARY,    FN_NONE | FN_LAZY, rf_avg);
     regf(functions,  "min",       TYPE_UNARY,    FN_ATOMIC,         rf_min);
