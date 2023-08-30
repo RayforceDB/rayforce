@@ -461,11 +461,7 @@ dispatch:
         {
             xfvals = as_f64(x);
             for (i = 0; i < l; i++)
-            {
-                v = xfvals[xids[i]];
-                v = (v == NULL_I64) ? 0 : v;
-                fsum += v;
-            }
+                fsum += xfvals[xids[i]];
 
             return f64(fsum);
         }
@@ -480,6 +476,7 @@ dispatch:
     default:
         if (x->type == TYPE_VECMAP)
         {
+            // debug_obj(as_list(x)[1]);
             xids = as_i64(as_list(x)[1]);
             l = as_list(x)[1]->len;
             x = as_list(x)[0];

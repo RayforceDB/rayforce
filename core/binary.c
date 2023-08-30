@@ -2994,7 +2994,6 @@ obj_t rf_vecmap(obj_t x, obj_t y)
     case TYPE_TABLE:
         l = as_list(x)[1]->len;
         res = vector(TYPE_LIST, l);
-
         for (i = 0; i < l; i++)
             as_list(res)[i] = rf_vecmap(as_list(as_list(x)[1])[i], y);
 

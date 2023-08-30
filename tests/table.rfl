@@ -26,7 +26,7 @@
           (take n [AAPL GOOG MSFT IBM AMZN FB BABA]) 
           (map (fn [x] (as 'string x)) l) 
           (as 'F64 l) 
-          (+ l l)
+          (+ 3 l)
           (as 'Timestamp l) 
     ))
 )
