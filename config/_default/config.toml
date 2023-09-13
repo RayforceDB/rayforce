@@ -1,4 +1,4 @@
-baseurl = "https://doks-child-theme.netlify.app/"
+baseurl = "https://singaraiona.github.io/rayforce/"
 canonifyURLs = false
 disableAliases = true
 disableHugoGeneratorInject = true
