@@ -7,5 +7,7 @@
     "MD033": false,
     "MD034": false
   },
-  "ignores": ["node_modules", "CHANGELOG.md", "README.md"]
+  "ignores": [
+    "node_modules"
+  ]
 }

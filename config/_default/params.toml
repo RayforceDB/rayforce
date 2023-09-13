@@ -21,7 +21,7 @@ schemaType = "Organization"
 schemaName = "Doks"
 schemaAuthor = "Henk Verlinde"
 schemaAuthorLinkedIn = "https://www.linkedin.com/in/henkverlinde/"
-schemaAuthorGitHub = "https://github.com/h-enk"
+schemaAuthorGitHub = "https://github.com/singaraiona"
 schemaLocale = "en-US"
 schemaLogo = "logo-doks.png"
 schemaLogoWidth = 512
@@ -30,7 +30,7 @@ schemaImage = "doks.png"
 schemaImageWidth = 1280
 schemaImageHeight = 640
 schemaLinkedIn = ""
-schemaGitHub = "https://github.com/h-enk/doks"
+schemaGitHub = "https://github.com/singaraiona/rayforce"
 schemaSection = "blog"
 
 ## Sitelinks Search Box

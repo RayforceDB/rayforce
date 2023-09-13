@@ -1,6 +1,6 @@
 name = "RayforceDB"
 license = "MIT"
-licenselink = "https://github.com/h-enk/doks/blob/master/LICENSE"
+licenselink = "https://github.com/singaraiona/rayforce/blob/master/LICENSE"
 description = "Fast columnar time-series database."
 
 tags = ["database", "columnar", "big data", "trading", "time-series"]
