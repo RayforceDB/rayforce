@@ -1,7 +1,6 @@
 ---
 title: "Introduction"
-description: "Doks is a Hugo theme for building secure, fast, and SEO-ready documentation websites, which you can easily update and customize."
-lead: "Doks is a Hugo theme for building secure, fast, and SEO-ready documentation websites, which you can easily update and customize."
+description: "Welcome to RayforceDB, where performance, efficiency, and simplicity converge to set a new standard in the world of database systems."
 date: 2020-10-06T08:48:57+00:00
 lastmod: 2020-10-06T08:48:57+00:00
 draft: false
@@ -14,7 +13,7 @@ toc: true
 ---
 
 ## Get started
-
+<!-- 
 There are two main ways to get started with Doks:
 
 ### Tutorial
@@ -55,4 +54,4 @@ Find out how to contribute to Doks. [Contributing →](https://getdoks.org/docs/
 
 ## Help
 
-Get help on Doks. [Help →]({{< relref "how-to-update" >}})
+Get help on Doks. [Help →]({{< relref "how-to-update" >}}) -->
