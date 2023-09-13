@@ -4,7 +4,7 @@
 title = "RayforceDB"
 titleSeparator = "-"
 titleAddition = "Fast columnar time-series database."
-description = "Doks is a Hugo theme for building secure, fast, and SEO-ready documentation websites, which you can easily update and customize."
+description = "Fast columnar time-series database."
 
 ## Documentation
 # docsVersion = "0.3"
@@ -14,24 +14,6 @@ images = ["doks.png"]
 ogLocale = "en_US"
 domainTLD = "doks.netlify.app"
 titleHome = "RayforceDB"
-
-## JSON-LD
-# schemaType = "Person"
-schemaType = "Organization"
-schemaName = "Doks"
-schemaAuthor = "Henk Verlinde"
-schemaAuthorLinkedIn = "https://www.linkedin.com/in/henkverlinde/"
-schemaAuthorGitHub = "https://github.com/singaraiona"
-schemaLocale = "en-US"
-schemaLogo = "logo-doks.png"
-schemaLogoWidth = 512
-schemaLogoHeight = 512
-schemaImage = "doks.png"
-schemaImageWidth = 1280
-schemaImageHeight = 640
-schemaLinkedIn = ""
-schemaGitHub = "https://github.com/singaraiona/rayforce"
-schemaSection = "blog"
 
 ## Sitelinks Search Box
 siteLinksSearchBox = false
