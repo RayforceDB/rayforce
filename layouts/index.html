@@ -5,10 +5,21 @@
       <h1 class="mt-0">{{ .Title }}</h1>
     </div>
     <div class="col-lg-9 col-xl-8 text-center">
-      <p class="lead">{{ .Params.lead | safeHTML }}</p>
-      <a class="btn btn-primary btn-lg px-4 mb-2" href="/docs/{{ if .Site.Params.options.docsVersioning }}{{ .Site.Params.docsVersion }}/{{ end }}prologue/introduction/" role="button">Get Started</a>
-      <p class="meta">Open-source MIT Licensed. <a href="https://github.com/h-enk/doks">GitHub v{{ $data := getJSON "/package.json" }}{{ $data.version }}</a></p>
+
+      <div class="container"></div>
+      <p class="lead">
+        {{ .Params.lead | safeHTML }}
+        {{ partial "asciinema.html" (dict "id" "xSGHuYtUVvH84o0xkQog0wWbi") }}
+      </p>
+
+      <a class="btn btn-primary btn-lg px-4 mb-2"
+        href="/docs/{{ if .Site.Params.options.docsVersioning }}{{ .Site.Params.docsVersion }}/{{ end }}prologue/introduction/"
+        role="button">Get Started</a>
+      <p class="meta">Open-source MIT Licensed. <a href="https://github.com/h-enk/doks">GitHub v{{ $data := getJSON
+          "/package.json" }}{{ $data.version }}</a></p>
+
     </div>
+  </div>
   </div>
 </section>
 {{ end }}
@@ -18,30 +29,43 @@
   <div class="container">
     <div class="row justify-content-center text-center">
       <div class="col-lg-5">
-        <h2 class="h4">Security aware</h2>
-        <p>Get A+ scores on <a href="https://observatory.mozilla.org/analyze/doks-child-theme.netlify.app">Mozilla Observatory</a> out of the box. Easily change the default Security Headers to suit your needs.</p>
+        <h2 class="h4">Feather-light Footprint</h2>
+        <p>While most modern databases are heavy with features, they come at the cost of increased size and complexity.
+          RayforceDB stands distinctively apart with its incredibly minimal footprint of just about 300K. This allows to
+          fit entirely in a CPU cache.</p>
       </div>
       <div class="col-lg-5">
-        <h2 class="h4">Fast by default ⚡️</h2>
-        <p>Get 100 scores on <a href="https://googlechrome.github.io/lighthouse/viewer/?gist=59aafe464a68f8bc30b8e9a636d5b053">Google Lighthouse</a> by default. Doks removes unused css, prefetches links, and lazy loads images.</p>
+        <h2 class="h4">Elevated Performance ⚡️</h2>
+        <p>Leveraging the raw power of columnar storage, RayforceDB unlocks the full potential of data retrieval and
+          querying. Coupled with the prowess of vectorization, the system promises seamless data processing, ensuring
+          optimal speed regardless of the dataset size.</p>
       </div>
+
       <div class="col-lg-5">
-        <h2 class="h4">SEO-ready</h2>
-        <p>Use sensible defaults for structured data, open graph, and Twitter cards. Or easily change the SEO settings to your liking.</p>
+        <h2 class="h4">Adept at Handling Big Data</h2>
+        <p> RayforceDB is meticulously crafted to manage the colossal waves of big data. With a foundation rooted in
+          columnar storage and vectorization, RayforceDB can scale horizontally and vertically, catering to massive
+          datasets without compromising performance.</p>
       </div>
     </div>
     <div class="row justify-content-center text-center">
       <div class="col-lg-5">
-        <h2 class="h4">Full text search</h2>
-        <p>Search your Doks site with FlexSearch. Easily customize index settings and search options to your liking.</p>
+        <h2 class="h4">Time-Series Mastery</h2>
+        <p>With built-in support for time-series data management, you can effortlessly store, retrieve, and analyze
+          time-bound datasets. </p>
       </div>
       <div class="col-lg-5">
-        <h2 class="h4">Page layouts</h2>
-        <p>Build pages with a landing page, blog, or documentation layout. Add custom sections and components to suit your needs.</p>
+        <h2 class="h4">The Power of Simplicity</h2>
+        <p>To converse with RayforceDB, you won't need to learn complex SQL or proprietary query languages. Instead,
+          engage with a clean, intuitive lisp-like language. The simplicity does not come at the cost of capability.
+          This unique language, while being minimalistic, empowers you to perform intricate queries and operations with
+          elegance and efficiency.</p>
       </div>
       <div class="col-lg-5">
-        <h2 class="h4">Dark mode</h2>
-        <p>Switch to a low-light UI with the click of a button. Change colors with variables to match your branding.</p>
+        <h2 class="h4">Zero Dependencies</h2>
+        <p>Bid adieu to cumbersome installations and intricate setups. RayforceDB is self-contained and autonomous. With
+          no dependencies, not only does it assure smooth deployment, but it also guarantees a consistent experience
+          across platforms, ensuring that your projects remain unhindered by external factors.</p>
       </div>
     </div>
   </div>
