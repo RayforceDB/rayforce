@@ -12,9 +12,8 @@
         {{ partial "asciinema.html" (dict "id" "XtX0yeFY1Z5qmsExLcv88nzDb") }}
       </p>
 
-      <a class="btn btn-primary btn-lg px-4 mb-2"
-        href="/docs/{{ if .Site.Params.options.docsVersioning }}{{ .Site.Params.docsVersion }}/{{ end }}prologue/introduction/"
-        role="button">Get Started</a>
+      <a class="btn btn-primary btn-lg px-4 mb-2" href="{{ "docs/" | absURL }}{{ if .Site.Params.options.docsVersioning
+        }}{{ .Site.Params.docsVersion }}/{{ end }}getstarted/introduction/" role="button">Get Started</a>
       <p class="meta">Open-source MIT Licensed. <a href="https://github.com/singaraiona/rayforce">GitHub v{{ $data :=
           getJSON
           "/package.json" }}{{ $data.version }}</a></p>

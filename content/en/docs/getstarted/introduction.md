@@ -7,7 +7,7 @@ draft: false
 images: []
 menu:
   docs:
-    parent: "prologue"
-weight: 100
+    parent: "getstarted"
+weight: 1
 toc: true
 ---
