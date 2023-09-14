@@ -12,7 +12,6 @@ weight: 1
 toc: true
 ---
 
-
 {{< details "All the types are divided onto 3 categories:" open >}}
 
 - Atoms
@@ -21,12 +20,11 @@ toc: true
 
 {{< /details >}}
 
-Atoms are the types that can be stored in a single cell of a table. Vectors are the types that can be stored in a single cell of a table, but they are stored in a special way. Other types are the types that can't be stored in a single cell of a
-table.
+Atoms are the types that are stored in a single "cell" like a register in a CPU world. Vectors are the lists of atoms, literally, contiguous arrays. Other types are functions, compounds, etc.
 
-```ray
-(select {from: t by: id where: (== id 1)})
-```
+{{< alert icon="👉" context="info" text="Note that there is no separate type for Null. It cannot be explicitly created and has no \"physical\" representation, as it's merely a null pointer." />}}
+
+List of atoms called vectors. Vectors are contiguous arrays of atoms. They are the most used data structure in RayforceDB. They are used to store data in tables, dictionaries, and other data structures. Such way of storing data is very efficient and allows to use [SIMD](https://uk.wikipedia.org/wiki/SIMD) instructions to speed up the processing. Vectors have positive type ids of it's atoms, for example: if atom id is -3 (i64), then vector id is 3 (I64). Typenames, starting from capital letter, are used to denote vectors, for example: `I64` is a vector of `i64` atoms.
 
 ## Reference card
 
