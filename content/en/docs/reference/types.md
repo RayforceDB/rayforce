@@ -24,8 +24,8 @@ toc: true
 Atoms are the types that can be stored in a single cell of a table. Vectors are the types that can be stored in a single cell of a table, but they are stored in a special way. Other types are the types that can't be stored in a single cell of a
 table.
 
-```go
-fmt.Println("Hello, World!")
+```ray
+(select {from: t by: id where: (== id 1)})
 ```
 
 ## Reference card
