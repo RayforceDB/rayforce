@@ -61,7 +61,6 @@ contributor = "contributors"
 category = "categories"
 tag = "tags"
 
-
 [minify.tdewolff.html]
 keepWhitespace = false
 

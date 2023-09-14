@@ -9,12 +9,6 @@ description = "Fast columnar time-series database."
 ## Documentation
 # docsVersion = "0.3"
 
-## Open Graph
-images = ["doks.png"]
-ogLocale = "en_US"
-domainTLD = "doks.netlify.app"
-titleHome = "RayforceDB"
-
 ## Sitelinks Search Box
 siteLinksSearchBox = false
 
@@ -39,6 +33,19 @@ imageAddClass = "img-fluid lazyload blur-up"
 ### Image template
 defaultImage = "default-image.png" # put in `./assets/images/`
 fillImage = "1270x740 Center"      # normalize image size
+
+## JSON-LD
+schemaType = "Organization"
+schemaName = "Rayforce"
+schemaAuthor = "Anton Kundenko"
+schemaAuthorGitHub = "https://github.com/singaraiona"
+schemaLocale = "en-US"
+schemaLogo = "logo-rayforcedb.png"
+schemaLogoWidth = 512
+schemaLogoHeight = 512
+schemaImage = "rayforcedb.png"
+schemaImageWidth = 1280
+schemaImageHeight = 640
 
 # Footer
 footer = "Powered by <a class=\"text-muted\" href=\"https://www.netlify.com/\">Netlify</a>, <a class=\"text-muted\" href=\"https://gohugo.io/\">Hugo</a>, and <a class=\"text-muted\" href=\"https://getdoks.org/\">Doks</a>"
