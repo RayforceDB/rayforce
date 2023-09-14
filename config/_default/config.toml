@@ -77,3 +77,7 @@ weight = 80
 [[related.indices]]
 name = "date"
 weight = 10
+
+pygmentsCodefences = true
+pygmentsUseClasses = true
+pygmentsCodefencesGuessSyntax = true
