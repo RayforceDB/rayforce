@@ -1,6 +1,6 @@
 [[main]]
 name = "Docs"
-url = "/docs/getstarted/introduction/"
+url = "/docs/"
 weight = 1
 
 [[main]]
