@@ -1,0 +1,41 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - '*'
+    branches:
+      - master
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Install dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: sudo apt-get install -y build-essential
+
+    - name: Make (Ubuntu)
+      if: runner.os == 'Linux'
+      run: make
+
+    # - name: Install dependencies (Windows)
+    #   if: runner.os == 'Windows'
+    #   run: choco install make mingw
+
+    # - name: Make (Windows)
+    #   if: runner.os == 'Windows'
+    #   run: make
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: program-${{ runner.os }}
+        path: |
+          ./
