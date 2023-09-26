@@ -1,0 +1,117 @@
+site_name: RayforceDB
+repo_url: https://github.com/singaraiona/rayforce
+repo_name: GitHub
+
+theme:
+  name: material
+  custom_dir: overrides
+  icon:
+    repo: fontawesome/brands/github 
+  # logo: assets/logo.png
+  favicon: images/favicon.png
+  features:
+    - header.autohide
+    - announce.dismiss
+    # - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - navigation.footer
+    - content.code.copy
+    # - content.action.view
+    - toc.follow
+
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/brightness-3
+        name: Switch to light mode
+  font:
+    text: Roboto
+    code: Roboto Mono
+  icon:
+    logo: material/lumx
+
+
+extra:
+    social:
+      - icon: fontawesome/brands/github 
+        link: https://github.com/singaraiona
+      - icon: fontawesome/brands/linkedin
+        link: https://www.linkedin.com/in/anton-kundenko-a22a3667
+      - icon: fontawesome/solid/paper-plane
+        link: mailto:<singaraiona@gmail.com>
+
+copyright: Copyright &copy; 2023 RayforceDB
+
+plugins:
+  - offline
+  - search:
+      separator: '[\s\u200b\-_,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  # - minify:
+  #     minify_html: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.betterem:
+      smart_enable: all
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.arithmatex:
+      generic: true
+  - toc:
+      permalink: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.details
+  - pymdownx.tilde
+  - attr_list
+  - md_in_html
+  - tables
+  - admonition
+  - footnotes
+
+extra_css:
+  - css/custom.css
+  - https://cdnjs.cloudflare.com/ajax/libs/asciinema-player/2.6.1/asciinema-player.css
+
+extra_javascript:
+  - https://cdnjs.cloudflare.com/ajax/libs/asciinema-player/2.6.1/asciinema-player.js
+  
+# Page tree
+nav:
+  - Home: index.md
+  - Documentation:
+    - Getting Started: 
+      - Install: content/getstarted/install.md
+      - Tutorial: content/getstarted/tutorial.md
+    - Reference:
+      - Types: content/reference/types.md
+      - Math: content/reference/math.md
+      - Serialization: content/reference/serialization.md
+    - Interfacing: 
+      - IPC: content/interfacing/ipc.md
+  - FAQ: content/faq.md

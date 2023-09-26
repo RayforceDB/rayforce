@@ -12,3 +12,7 @@
 .player-item {
     width: 78%;
 }
+
+.admonition.seealso {
+    background-color: #e0f7fa;
+}
