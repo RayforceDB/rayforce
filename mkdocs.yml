@@ -4,7 +4,7 @@ repo_name: GitHub
 
 theme:
   name: material
-  custom_dir: overrides
+  # custom_dir: overrides
   icon:
     repo: fontawesome/brands/github 
   # logo: assets/logo.png
