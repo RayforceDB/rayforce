@@ -12,7 +12,7 @@ theme:
   features:
     - header.autohide
     - announce.dismiss
-    - navigation.tabs
+    # - navigation.tabs
     - navigation.sections
     - navigation.top
     - search.suggest
@@ -39,12 +39,16 @@ markdown_extensions:
   - pymdownx.emoji:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.tasklist:
+      custom_checkbox: true
   - pymdownx.inlinehilite
   - pymdownx.snippets
   - pymdownx.superfences
+  - pymdownx.details
   - attr_list
   - md_in_html
   - tables
+  - admonition
 
 extra_css:
   - css/custom.css
@@ -54,7 +58,16 @@ extra_javascript:
   - https://cdnjs.cloudflare.com/ajax/libs/asciinema-player/2.6.1/asciinema-player.js
 
 nav:
-  - 'Home': 'index.md'
+  - 'Home': 'content/index.md'
   - 'Documentation':
-    - 'Getting Started': 'docs.md'
-    - 'Advanced Usage': 'docs.md'
+    - 'Getting Started': 
+      - 'Introduction': 'content/getstarted/introduction.md'
+      - 'Tutorial': 'content/getstarted/tutorial.md'
+    - 'Reference':
+      - 'Types': 'content/reference/types.md'
+      - 'Math': 'content/reference/math.md'
+      - 'Serialization': 'content/reference/serialization.md'
+    - 'Interfacing': 
+      - 'IPC': 'content/interfacing/ipc.md'
+  - 'Tutorial': 'content/getstarted/tutorial.md'
+  - 'FAQ': 'content/faq.md'
