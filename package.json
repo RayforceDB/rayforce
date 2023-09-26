@@ -42,7 +42,7 @@
     "@babel/core": "^7.18",
     "@babel/preset-env": "^7.18",
     "@fullhuman/postcss-purgecss": "^4.1",
-    "@hyas/doks": "^0.5",
+    "@hyas/doks-core": "^1.0.7",
     "@hyas/images": "^0.2.1",
     "auto-changelog": "^2.4.0",
     "autoprefixer": "^10.4",
