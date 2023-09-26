@@ -1,3 +1,60 @@
 site_name: RayforceDB
+repo_url: https://github.com/singaraiona/rayforce
+repo_name: GitHub
+
 theme:
   name: material
+  custom_dir: overrides
+  icon:
+    repo: fontawesome/brands/github 
+  # logo: assets/logo.png
+  favicon: images/favicon.png
+  features:
+    - header.autohide
+    - announce.dismiss
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - navigation.footer
+    - content.code.copy
+
+extra:
+    social:
+      - icon: fontawesome/brands/github 
+        link: https://github.com/singaraiona
+      - icon: fontawesome/brands/linkedin
+        link: https://www.linkedin.com/in/anton-kundenko-a22a3667
+
+plugins:
+  - offline
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - attr_list
+  - md_in_html
+  - tables
+
+extra_css:
+  - css/custom.css
+  - https://cdnjs.cloudflare.com/ajax/libs/asciinema-player/2.6.1/asciinema-player.css
+
+extra_javascript:
+  - https://cdnjs.cloudflare.com/ajax/libs/asciinema-player/2.6.1/asciinema-player.js
+
+nav:
+  - 'Home': 'index.md'
+  - 'Documentation':
+    - 'Getting Started': 'docs.md'
+    - 'Advanced Usage': 'docs.md'
