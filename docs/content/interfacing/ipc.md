@@ -33,7 +33,8 @@ Now, you can send data to the remote process:
 
 There are two ways of sending ipc messages: string or list. In case of string it will be parsed an evaluated then, in case of list it will be evaluated as is.
 
-{{< alert icon="👆" context="warning" text="Do not forget to call hclose for any unused connection handles!" />}}
+!!! note
+    Do not forget to call hclose for any unused connection handle!
 
 ``` clj
 (hclose h)
