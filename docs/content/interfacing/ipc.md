@@ -63,7 +63,7 @@ Response messages are used to send a response to a sync message. Response messag
 Async messages are used to send a message without waiting for a response. Async messages are not blocking, so the sender will not wait for the response. To send an async message, use negate for a connection handle with a `write` function:
 
 ``` clj
-> (write -h (list (+ 1 2)))
+> (write (neg h) (list (+ 1 2)))
 ```
 
 ## Protocol
