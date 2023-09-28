@@ -40,6 +40,10 @@ jobs:
       if: runner.os == 'Windows'
       run: echo "::set-output name=ext::.exe"
 
+    - name: Set zip alias
+      if: runner.os == 'Windows'
+      run: Set-Alias -Name zip -Value "C:\Program Files\7-Zip\7z.exe"
+
     - name: Create build directory and copy binary
       run: |
         mkdir build
