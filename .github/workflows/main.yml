@@ -99,7 +99,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.PAT }}
       with:
         upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./ubuntu-latest.zip
+        asset_path: ubuntu-latest.zip
         asset_name: linux.zip
         asset_content_type: application/zip
 
@@ -109,7 +109,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.PAT }}
       with:
         upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./windows-latest.zip
+        asset_path: windows-latest.zip
         asset_name: windows.zip
         asset_content_type: application/zip
 
@@ -119,6 +119,6 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.PAT }}
       with:
         upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./macos-latest.zip
+        asset_path: macos-latest.zip
         asset_name: macos.zip
         asset_content_type: application/zip
