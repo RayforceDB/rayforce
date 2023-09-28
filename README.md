@@ -2,7 +2,7 @@
 
 Welcome to RayforceDB, where performance, efficiency, and simplicity converge to set a new standard in the world of database systems.
 
-[![Build and Release](https://github.com/singaraiona/rayforce/actions/workflows/main.yml/badge.svg?branch=master)](https://github.com/singaraiona/rayforce/actions/workflows/main.yml)
+[![Build and Release](https://github.com/singaraiona/rayforce/actions/workflows/release.yml/badge.svg)](https://github.com/singaraiona/rayforce/actions/workflows/release.yml)
 
 ## Elevated Performance
 
