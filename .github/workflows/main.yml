@@ -30,13 +30,12 @@ jobs:
         Invoke-WebRequest -Uri "https://github.com/jmeubank/tdm-gcc/releases/download/v10.3.0-tdm64-2/tdm64-gcc-10.3.0-2.exe" -OutFile "tdm-gcc-installer.exe"
         Start-Process "tdm-gcc-installer.exe" -ArgumentList "/S" -NoNewWindow -Wait
         
+
     - name: Make (Windows)
       if: runner.os == 'Windows'
-      run: mingw32-make.exe CC="gcc" release 
-
-    - name: Determine binary extension
-      id: artifact_ext
-      run: echo "::set-output name=ext::$(if [[ "${{ runner.os }}" == "Windows" ]]; then echo '.exe'; else echo ''; fi)"
+      run: |
+        mingw32-make.exe CC="gcc" release 
+        echo "::set-output name=ext::.exe"
 
     - name: Create build directory and copy binary
       run: |
