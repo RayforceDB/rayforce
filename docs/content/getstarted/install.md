@@ -5,6 +5,10 @@ There are two ways to install RayforceDB:
 - [Download a pre-built binary](#download-a-pre-built-binary)
 - [Build from source](#building-from-source)
 
+# :material-download: Download a pre-built binary
+
+Refer to a [release page](https://github.com/singaraiona/rayforce/releases)
+
 # :material-source-repository-multiple: Building from source
 
 These OSes are supported (for now):
@@ -39,7 +43,7 @@ rlwrap ./rayforce -f tests/table.rfl
 ``` sh
 git clone https://github.com/singaraiona/rayforce
 cd rayforce
-mingw32-make.exe CC="Path/To/TDM/GCC/bin/gcc.exe" release 
+mingw32-make.exe CC="gcc" LIBS="-lm -lws2_32 -lkernel32" release 
 ./rayforce.exe -f tests/table.rfl
 ```
 
