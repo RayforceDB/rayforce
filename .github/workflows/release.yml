@@ -33,17 +33,15 @@ jobs:
       if: runner.os == 'Windows'
       run: choco install make -y
 
-    - name: Get gcc (Windows)
-      if: runner.os == 'Windows'
-      run: Invoke-WebRequest -Uri "https://github.com/jmeubank/tdm-gcc/releases/download/v10.3.0-tdm64-2/tdm64-gcc-10.3.0-2.exe" -OutFile "tdm-gcc.exe"
-
     - name: Install gcc (Windows)
       if: runner.os == 'Windows'
-      run: Start-Process -FilePath ./tdm-gcc.exe -ArgumentList "/S" -Wait
+      uses: egor-tensin/setup-mingw@v2
+      with:
+        platform: x64
 
     - name: Make (Windows)
       if: runner.os == 'Windows'
-      run: mingw32-make.exe CC="C:\TDM-GCC-64\bin\gcc.exe" release 
+      run: mingw32-make.exe CC="cc" release 
     
     - name: Install dependencies (macOS)
       if: runner.os == 'macOS'
