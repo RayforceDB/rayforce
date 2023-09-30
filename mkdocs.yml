@@ -111,6 +111,7 @@ nav:
     - Reference:
       - Types: content/reference/types.md
       - Math: content/reference/math.md
+      - Queries: content/reference/queries.md
       - Serialization: content/reference/serialization.md
     - Interfacing: 
       - IPC: content/interfacing/ipc.md

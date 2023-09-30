@@ -1,3 +1,5 @@
+# :material-package: Serialization
+
 Serialization is the process of converting nearly any Rayforce datatypes into a format suitable for storage or transmission, say: vector of bytes. This fundamental concept is integral to many software operations, from persisting object states to facilitating remote procedure calls.  
 
 Let's dive in.

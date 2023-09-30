@@ -1,3 +1,5 @@
+# :material-dna: Types
+
 All the types are divided onto 3 categories:
 
 - Atoms

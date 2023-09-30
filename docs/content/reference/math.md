@@ -1,3 +1,5 @@
+# :material-math-integral-box: Math
+
 ## Add `+`
 
 Makes an addition of it's arguments. Supports such types and their combinations: `i64`, `I64`, `f64`, `F64`, `Timestamp`.
