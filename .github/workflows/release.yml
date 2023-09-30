@@ -62,7 +62,8 @@ jobs:
         mkdir build
         cp ./rayforce ./build/
         cp -r ./examples ./build/
-        tar -cvpzf ${{ matrix.os }}.tar.gz ./build
+        cd ./build
+        tar -cvpzf ../${{ matrix.os }}.tar.gz *
 
     - name: Create build directory and copy binary (Windows)
       if: runner.os == 'Windows'
@@ -80,7 +81,8 @@ jobs:
         mkdir build
         cp ./rayforce ./build/
         cp -r ./examples ./build/
-        tar -cvpzf ${{ matrix.os }}.tar.gz ./build
+        cd ./build
+        tar -cvpzf ../${{ matrix.os }}.tar.gz *
 
     - name: Upload Artifact (Linux)
       uses: actions/upload-artifact@v2
