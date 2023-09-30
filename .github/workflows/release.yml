@@ -42,7 +42,7 @@ jobs:
     - name: Make (Windows)
       if: runner.os == 'Windows'
       run: |
-        mingw32-make.exe CC="${{ github.workspace }}/mingw/mingw64/bin/gcc" LIBS="-lm -lws2_32 -lkernel32" release
+        mingw32-make.exe CC="${{ github.workspace }}/mingw/mingw64/bin/gcc" RELEASE_CFLAGS="-fPIC -Wall -Wextra -std=c17 -Ofast -march=x86-64 -msse -msse2 -mavx -mavx2 -fassociative-math -ftree-vectorize -m64" LIBS="-lm -lws2_32 -lkernel32" release
     
     - name: Install dependencies (macOS)
       if: runner.os == 'macOS'
