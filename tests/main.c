@@ -86,15 +86,19 @@ nil_t teardown()
 // Macro to encapsulate the pattern
 #define RUN_TEST(name, func, pass)                                          \
     test_result_t res;                                                      \
+    clock_t timer;                                                          \
+    f64_t ms;                                                               \
     do                                                                      \
     {                                                                       \
         setup();                                                            \
         printf("%s  Running %s%s ... ", CYAN, RESET, name);                 \
+        timer = clock();                                                    \
         res = func();                                                       \
+        ms = (((f64_t)(clock() - timer)) / CLOCKS_PER_SEC) * 1000;          \
         if (res.status == TEST_PASS)                                        \
         {                                                                   \
             (*pass)++;                                                      \
-            printf("%sDone.%s\n", GREEN, RESET);                            \
+            printf("%sPassed%s at: %.*f ms\n", GREEN, RESET, 4, ms);        \
         }                                                                   \
         else                                                                \
         {                                                                   \

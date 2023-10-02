@@ -33,6 +33,7 @@ all: default
 app: $(APP_OBJECTS) lib
 	$(CC) $(CFLAGS) -o $(TARGET) $(CORE_OBJECTS) $(APP_OBJECTS) -L. -l$(TARGET) $(LIBS)
 
+tests: CFLAGS = $(RELEASE_CFLAGS)
 tests: $(TESTS_OBJECTS) lib
 	$(CC) $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) -L. -l$(TARGET) $(LIBS)
 	./$(TARGET).test
