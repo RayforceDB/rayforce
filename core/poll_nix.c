@@ -178,6 +178,7 @@ i64_t poll_del(poll_t select, i64_t fd)
 {
     epoll_ctl(select->poll_fd, EPOLL_CTL_DEL, fd, NULL);
     remove_data(&select->data, fd);
+    close(fd);
     return 0;
 }
 
@@ -202,8 +203,9 @@ i64_t poll_dispatch(poll_t select)
 
         for (n = 0; n < nfds; ++n)
         {
-            if (events[n].events & EPOLLERR)
+            if (events[n].events & EPOLLERR || events[n].events & EPOLLHUP)
             {
+                // debug("POLL HUP!!!!");
                 poll_del(select, events[n].data.fd);
                 continue;
             }
@@ -287,7 +289,7 @@ i64_t poll_dispatch(poll_t select)
                 {
                     poll = poll_send(select, data);
 
-                    if (poll == -1)
+                    if (poll == POLL_ERROR)
                         poll_del(select, data->fd);
                 }
             }
