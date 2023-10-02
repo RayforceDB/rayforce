@@ -30,7 +30,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
-#include "select.h"
+#include "poll.h"
 #include "string.h"
 #include "hash.h"
 #include "format.h"
@@ -42,8 +42,6 @@
 #define MAX_EVENTS 1024
 
 i32_t __EVENT_FD[2]; // eventfd to notify epoll loop of shutdown
-i64_t select_send(select_t select, ipc_data_t data);
-obj_t select_recv(select_t select, ipc_data_t data);
 
 nil_t sigint_handler(i32_t signo)
 {
@@ -53,10 +51,10 @@ nil_t sigint_handler(i32_t signo)
     write(__EVENT_FD[1], &val, sizeof(val));
 }
 
-select_t select_init(i64_t port)
+poll_t poll_init(i64_t port)
 {
     i64_t kq_fd = -1, listen_fd = -1;
-    select_t s;
+    poll_t s;
     ipc_data_t data = NULL;
     struct kevent ev;
 
@@ -110,7 +108,7 @@ select_t select_init(i64_t port)
         }
     }
 
-    s = (select_t)heap_alloc(sizeof(struct select_t));
+    s = (poll_t)heap_alloc(sizeof(struct poll_t));
 
     s->poll_fd = kq_fd;
     s->ipc_fd = listen_fd;
@@ -119,7 +117,7 @@ select_t select_init(i64_t port)
     return s;
 }
 
-nil_t select_cleanup(select_t select)
+nil_t poll_cleanup(poll_t select)
 {
     ipc_data_t data;
     obj_t v;
@@ -155,7 +153,7 @@ nil_t select_cleanup(select_t select)
     heap_free(select);
 }
 
-ipc_data_t select_add(select_t select, i64_t fd)
+ipc_data_t poll_add(poll_t select, i64_t fd)
 {
     ipc_data_t data = NULL;
     struct kevent ev;
@@ -177,7 +175,7 @@ ipc_data_t select_add(select_t select, i64_t fd)
     return data;
 }
 
-i64_t select_del(select_t select, i64_t fd)
+i64_t poll_del(poll_t select, i64_t fd)
 {
     struct kevent ev;
     EV_SET(&ev, fd, EVFILT_READ | EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
@@ -188,7 +186,7 @@ i64_t select_del(select_t select, i64_t fd)
     return 0;
 }
 
-i64_t select_dispatch(select_t select)
+i64_t poll_dispatch(poll_t select)
 {
     i64_t kq_fd = select->poll_fd, listen_fd = select->ipc_fd,
           nfds, len, snd;
@@ -228,7 +226,7 @@ i64_t select_dispatch(select_t select)
             // accept new connections
             else if (events[n].ident == listen_fd)
             {
-                select_add(select, sock_accept(listen_fd));
+                poll_add(select, sock_accept(listen_fd));
             }
             else if (events[n].ident == __EVENT_FD[0])
             {
@@ -242,7 +240,7 @@ i64_t select_dispatch(select_t select)
                 // ipc in
                 if (events[n].filter & EVFILT_READ)
                 {
-                    res = select_recv(select, data);
+                    res = poll_recv(select, data);
 
                     if (res == NULL)
                         continue;
@@ -256,7 +254,7 @@ i64_t select_dispatch(select_t select)
                             prompt();
                         }
                         drop(res);
-                        select_del(select, data->fd);
+                        poll_del(select, data->fd);
                     }
                     else
                     {
@@ -275,9 +273,9 @@ i64_t select_dispatch(select_t select)
                             if (data->msgtype == MSG_TYPE_SYNC)
                             {
                                 ipc_enqueue_msg(data, v, MSG_TYPE_RESP);
-                                snd = select_send(select, data);
+                                snd = poll_send(select, data);
 
-                                if (snd == IPC_ERROR)
+                                if (snd == POLL_ERROR)
                                     perror("send reply");
                             }
                             else
@@ -288,10 +286,10 @@ i64_t select_dispatch(select_t select)
                 // ipc out
                 if (events[n].filter & EVFILT_WRITE)
                 {
-                    snd = select_send(select, data);
+                    snd = poll_send(select, data);
 
                     if (snd == -1)
-                        select_del(select, data->fd);
+                        poll_del(select, data->fd);
                 }
             }
         }
@@ -300,7 +298,7 @@ i64_t select_dispatch(select_t select)
     return 0;
 }
 
-obj_t select_recv(select_t select, ipc_data_t data)
+obj_t poll_recv(poll_t select, ipc_data_t data)
 {
     unused(select);
     i64_t size, r;
@@ -390,7 +388,7 @@ obj_t select_recv(select_t select, ipc_data_t data)
     return res;
 }
 
-i64_t select_send(select_t select, ipc_data_t data)
+i64_t poll_send(poll_t select, ipc_data_t data)
 {
     i64_t size;
     obj_t obj;
@@ -403,14 +401,14 @@ send:
     {
         size = sock_send(data->fd, &data->tx.buf[data->tx.write_size], data->tx.size - data->tx.write_size);
         if (size < 1)
-            return IPC_ERROR;
+            return POLL_ERROR;
         else if (size == 0)
         {
             EV_SET(&ev, data->fd, EVFILT_WRITE, EV_ADD, 0, 0, NULL);
             if (kevent(select->poll_fd, &ev, 1, NULL, 0, NULL) == -1)
                 perror("epollctl");
 
-            return IPC_NOT_READY;
+            return POLL_PENDING;
         }
 
         data->tx.write_size += size;
@@ -421,7 +419,7 @@ send:
             if (kevent(select->poll_fd, &ev, 1, NULL, 0, NULL) == -1)
                 perror("epollctl");
 
-            return IPC_NOT_READY;
+            return POLL_PENDING;
         }
     }
 
@@ -434,7 +432,7 @@ send:
         size = ser_raw(&data->tx.buf, obj);
         drop(obj);
         if (size == -1)
-            return IPC_ERROR;
+            return POLL_ERROR;
 
         data->tx.size = size;
         data->tx.write_size = 0;
@@ -452,7 +450,7 @@ send:
     if (kevent(select->poll_fd, &ev, 1, NULL, 0, NULL) == -1)
         perror("epollctl");
 
-    return IPC_OK;
+    return POLL_READY;
 }
 
 ipc_data_t add_data(ipc_data_t *head, i32_t fd, i32_t size)

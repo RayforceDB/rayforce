@@ -26,7 +26,7 @@
 #include "heap.h"
 #include "util.h"
 #include "cc.h"
-#include "select.h"
+#include "poll.h"
 #include "unary.h"
 #include "io.h"
 
@@ -121,18 +121,18 @@ nil_t runtime_init(i32_t argc, str_t argv[])
 
     drop(filename);
 
-    _RUNTIME->select = select_init(_RUNTIME->addr.port);
+    _RUNTIME->select = poll_init(_RUNTIME->addr.port);
 }
 
 i32_t runtime_run()
 {
-    return select_dispatch(_RUNTIME->select);
+    return poll_dispatch(_RUNTIME->select);
 }
 
 nil_t runtime_cleanup()
 {
     drop(_RUNTIME->args);
-    select_cleanup(_RUNTIME->select);
+    poll_cleanup(_RUNTIME->select);
     symbols_free(_RUNTIME->symbols);
     mmap_free(_RUNTIME->symbols, sizeof(symbols_t));
     free_env(&_RUNTIME->env);

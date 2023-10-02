@@ -28,7 +28,7 @@
 #include "sock.h"
 #include "heap.h"
 #include "serde.h"
-#include "select.h"
+#include "poll.h"
 #include "runtime.h"
 
 obj_t ray_hopen(obj_t x)
@@ -61,7 +61,7 @@ obj_t ray_hopen(obj_t x)
         return sys_error(TYPE_GETLASTERROR, "hopen");
     }
 
-    data = select_add(runtime_get()->select, fd);
+    data = poll_add(runtime_get()->select, fd);
     data->rx.version = handshake[1];
 
     return i64(fd);
@@ -72,7 +72,7 @@ obj_t ray_hclose(obj_t x)
     if (sock_close(x->i64) == -1)
         return sys_error(TYPE_GETLASTERROR, "hclose");
 
-    select_del(runtime_get()->select, x->i64);
+    poll_del(runtime_get()->select, x->i64);
 
     return null(0);
 }

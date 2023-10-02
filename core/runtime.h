@@ -29,7 +29,7 @@
 #include "env.h"
 #include "parse.h"
 #include "vm.h"
-#include "select.h"
+#include "poll.h"
 #include "sock.h"
 
 /*
@@ -41,7 +41,7 @@ typedef struct runtime_t
     env_t env;          // Environment.
     parser_t parser;    // Parser.
     vm_t vm;            // Virtual machine.
-    select_t select;    // I/O event loop handle.
+    poll_t select;    // I/O event loop handle.
     obj_t args;         // Command line arguments.
     symbols_t *symbols; // vector_symbols pool.
     sock_addr_t addr;   // Socket address that a process listen.

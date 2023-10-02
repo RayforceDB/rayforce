@@ -76,7 +76,6 @@ obj_t ray_til(obj_t x)
 
 obj_t ray_reverse(obj_t x)
 {
-
     i64_t i, l;
     obj_t res;
 

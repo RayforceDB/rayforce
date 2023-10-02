@@ -21,19 +21,19 @@
  *   SOFTWARE.
  */
 
-#include "select.h"
+#include "poll.h"
 #include "format.h"
 #include "cc.h"
 #include "sock.h"
 
 #if defined(_WIN32) || defined(__CYGWIN__)
-#include "select_win.c"
+#include "poll_win.c"
 #elif defined(__APPLE__) && defined(__MACH__)
-#include "select_osx.c"
+#include "poll_osx.c"
 #elif defined(__linux__)
-#include "select_nix.c"
+#include "poll_nix.c"
 #elif defined(__EMSCRIPTEN__)
-#include "select_emc.c"
+#include "poll_emc.c"
 #else
 #error "Unsupported platform"
 #endif
@@ -64,7 +64,7 @@ ipc_data_t find_data(ipc_data_t *head, i64_t fd)
     return NULL;
 }
 
-obj_t ipc_send_sync(select_t select, i64_t fd, obj_t obj)
+obj_t ipc_send_sync(poll_t select, i64_t fd, obj_t obj)
 {
     obj_t v;
     i64_t r;
@@ -80,12 +80,12 @@ obj_t ipc_send_sync(select_t select, i64_t fd, obj_t obj)
     // flush all messages in the queue
     while (true)
     {
-        r = select_send(select, data);
-        if (r == IPC_OK)
+        r = poll_send(select, data);
+        if (r == POLL_READY)
             break;
-        else if (r == IPC_ERROR)
+        else if (r == POLL_ERROR)
         {
-            select_del(select, fd);
+            poll_del(select, fd);
             return sys_error(TYPE_GETLASTERROR, "ipc send sync");
         }
     }
@@ -93,14 +93,14 @@ obj_t ipc_send_sync(select_t select, i64_t fd, obj_t obj)
     // read until we get response
     while (true)
     {
-        r = select_recv(select, data);
+        r = poll_recv(select, data);
 
-        if (r == IPC_NOT_READY)
+        if (r == POLL_PENDING)
             continue;
 
-        if (r == IPC_ERROR)
+        if (r == POLL_ERROR)
         {
-            select_del(select, fd);
+            poll_del(select, fd);
             return sys_error(TYPE_GETLASTERROR, "ipc send sync");
         }
 
@@ -113,7 +113,7 @@ obj_t ipc_send_sync(select_t select, i64_t fd, obj_t obj)
     }
 }
 
-obj_t ipc_send_async(select_t select, i64_t fd, obj_t obj)
+obj_t ipc_send_async(poll_t select, i64_t fd, obj_t obj)
 {
     ipc_data_t data;
     i64_t snd;
@@ -125,11 +125,11 @@ obj_t ipc_send_async(select_t select, i64_t fd, obj_t obj)
 
     ipc_enqueue_msg(data, clone(obj), MSG_TYPE_ASYN);
 
-    snd = select_send(select, data);
+    snd = poll_send(select, data);
 
-    if (snd == IPC_ERROR)
+    if (snd == POLL_ERROR)
     {
-        select_del(select, fd);
+        poll_del(select, fd);
         return sys_error(TYPE_GETLASTERROR, "ipc send async");
     }
 

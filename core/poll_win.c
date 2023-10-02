@@ -35,7 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "select.h"
+#include "poll.h"
 #include "string.h"
 #include "hash.h"
 #include "format.h"
@@ -48,9 +48,6 @@
 #define MAX_IOCP_RESULTS 64
 
 char_t _STDIN_BUFFER[STDIN_BUFFER_SIZE];
-
-i64_t select_recv(select_t select, ipc_data_t data);
-i64_t select_send(select_t select, ipc_data_t data);
 
 DWORD WINAPI StdinThread(LPVOID lpParam)
 {
@@ -80,7 +77,7 @@ nil_t exit_werror()
     obj_t err;
     str_t fmt;
 
-    err = sys_error(TYPE_WSAGETLASTERROR, "select_init");
+    err = sys_error(TYPE_WSAGETLASTERROR, "poll_init");
     fmt = obj_fmt(err);
     printf("%s\n", fmt);
     heap_free(fmt);
@@ -89,7 +86,7 @@ nil_t exit_werror()
     exit(1);
 }
 
-i64_t select_accept(select_t select, ipc_data_t data)
+i64_t poll_accept(poll_t select, ipc_data_t data)
 {
     i32_t code;
     LPFN_ACCEPTEX lpfnAcceptEx = NULL;
@@ -102,7 +99,7 @@ i64_t select_accept(select_t select, ipc_data_t data)
         return -1;
 
     // Ensure the accept socket is associated with the IOCP.
-    sock_data = select_add(select, sock_fd);
+    sock_data = poll_add(select, sock_fd);
     CreateIoCompletionPort((HANDLE)sock_fd, (HANDLE)select->poll_fd, (i64_t)sock_data, 0);
 
     // Load AcceptEx function
@@ -111,7 +108,7 @@ i64_t select_accept(select_t select, ipc_data_t data)
                  &lpfnAcceptEx, sizeof(lpfnAcceptEx),
                  &dwBytes, NULL, NULL) == SOCKET_ERROR)
     {
-        select_del(select, sock_fd);
+        poll_del(select, sock_fd);
         code = WSAGetLastError();
         closesocket(sock_fd);
         WSASetLastError(code);
@@ -127,7 +124,7 @@ i64_t select_accept(select_t select, ipc_data_t data)
         code = WSAGetLastError();
         if (code != ERROR_IO_PENDING)
         {
-            select_del(select, sock_fd);
+            poll_del(select, sock_fd);
             code = WSAGetLastError();
             closesocket(sock_fd);
             WSASetLastError(code);
@@ -140,7 +137,7 @@ i64_t select_accept(select_t select, ipc_data_t data)
     return (i64_t)sock_fd;
 }
 
-select_t select_init(i64_t port)
+poll_t poll_init(i64_t port)
 {
     WSADATA wsaData;
     i64_t ipc_fd = -1, poll_fd = -1;
@@ -157,7 +154,7 @@ select_t select_init(i64_t port)
     // Create a thread to read from stdin
     CreateThread(NULL, 0, StdinThread, (HANDLE)poll_fd, 0, NULL);
 
-    select_t select = (select_t)heap_alloc(sizeof(struct select_t));
+    poll_t select = (poll_t)heap_alloc(sizeof(struct poll_t));
 
     select->poll_fd = poll_fd;
 
@@ -181,7 +178,7 @@ select_t select_init(i64_t port)
         memset(&data->rx.overlapped, 0, sizeof(data->rx.overlapped));
         select->data = data;
 
-        if (select_accept(select, data) == -1)
+        if (poll_accept(select, data) == -1)
         {
             heap_free(select);
             heap_free(data);
@@ -192,7 +189,7 @@ select_t select_init(i64_t port)
     return select;
 }
 
-nil_t select_cleanup(select_t select)
+nil_t poll_cleanup(poll_t select)
 {
     // Cleanup code
     CloseHandle((HANDLE)select->poll_fd);
@@ -206,7 +203,7 @@ nil_t select_cleanup(select_t select)
     fflush(stdout);
 }
 
-ipc_data_t select_add(select_t select, i64_t fd)
+ipc_data_t poll_add(poll_t select, i64_t fd)
 {
     ipc_data_t data = NULL;
 
@@ -217,14 +214,14 @@ ipc_data_t select_add(select_t select, i64_t fd)
     return data;
 }
 
-i64_t select_del(select_t select, i64_t fd)
+i64_t poll_del(poll_t select, i64_t fd)
 {
     unused(select);
     unused(fd);
     return 0;
 }
 
-i64_t select_dispatch(select_t select)
+i64_t poll_dispatch(poll_t select)
 {
     DWORD i, num = 5, size;
     OVERLAPPED *overlapped;
@@ -289,21 +286,21 @@ i64_t select_dispatch(select_t select)
                         sock_data = find_data(&select->data, data->tx.size);
                         if (sock_data == NULL)
                         {
-                            select_accept(select, data);
+                            poll_accept(select, data);
                             break;
                         }
-                        poll = select_recv(select, sock_data);
-                        select_accept(select, data);
-                        if (poll == IPC_ERROR)
+                        poll = poll_recv(select, sock_data);
+                        poll_accept(select, data);
+                        if (poll == POLL_ERROR)
                         {
-                            select_del(select, key);
+                            poll_del(select, key);
                             res = sys_error(TYPE_WSAGETLASTERROR, "ipc");
                             fmt = obj_fmt(res);
                             printf("%s\n", fmt);
                             heap_free(fmt);
                             drop(res);
                         }
-                        else if (poll == IPC_OK)
+                        else if (poll == POLL_READY)
                         {
                             res = de_raw(sock_data->rx.buf, sock_data->rx.size);
                             sock_data->rx.read_size = 0;
@@ -325,9 +322,9 @@ i64_t select_dispatch(select_t select)
                                 if (data->msgtype == MSG_TYPE_SYNC)
                                 {
                                     ipc_enqueue_msg(data, v, MSG_TYPE_RESP);
-                                    poll = select_send(select, data);
+                                    poll = poll_send(select, data);
 
-                                    if (poll == IPC_ERROR)
+                                    if (poll == POLL_ERROR)
                                         perror("send reply");
                                 }
                                 else
@@ -350,17 +347,17 @@ i64_t select_dispatch(select_t select)
                     if (overlapped == &(data->rx.overlapped))
                     {
                         sock_data->rx.read_size += size;
-                        poll = select_recv(select, sock_data);
-                        if (poll == IPC_ERROR)
+                        poll = poll_recv(select, sock_data);
+                        if (poll == POLL_ERROR)
                         {
-                            select_del(select, key);
+                            poll_del(select, key);
                             res = sys_error(TYPE_WSAGETLASTERROR, "ipc");
                             fmt = obj_fmt(res);
                             printf("%s\n", fmt);
                             heap_free(fmt);
                             drop(res);
                         }
-                        else if (poll == IPC_OK)
+                        else if (poll == POLL_READY)
                         {
                             res = de_raw(data->rx.buf, data->rx.size);
                             data->rx.read_size = 0;
@@ -382,9 +379,9 @@ i64_t select_dispatch(select_t select)
                                 if (data->msgtype == MSG_TYPE_SYNC)
                                 {
                                     ipc_enqueue_msg(data, v, MSG_TYPE_RESP);
-                                    poll = select_send(select, data);
+                                    poll = poll_send(select, data);
 
-                                    if (poll == IPC_ERROR)
+                                    if (poll == POLL_ERROR)
                                         perror("send reply");
                                 }
                                 else
@@ -395,9 +392,9 @@ i64_t select_dispatch(select_t select)
                     // send
                     else if (overlapped == &(data->tx.overlapped))
                     {
-                        poll = select_send(select, data);
+                        poll = poll_send(select, data);
 
-                        if (poll == IPC_ERROR)
+                        if (poll == POLL_ERROR)
                             perror("send reply");
                     }
 
@@ -407,7 +404,7 @@ i64_t select_dispatch(select_t select)
         }
         else
         {
-            res = sys_error(TYPE_WSAGETLASTERROR, "select_init");
+            res = sys_error(TYPE_WSAGETLASTERROR, "poll_init");
             fmt = obj_fmt(res);
             printf("%s\n", fmt);
             heap_free(fmt);
@@ -418,7 +415,7 @@ i64_t select_dispatch(select_t select)
     return 0;
 }
 
-i64_t select_recv(select_t select, ipc_data_t data)
+i64_t poll_recv(poll_t select, ipc_data_t data)
 {
     unused(select);
 
@@ -447,9 +444,9 @@ i64_t select_recv(select_t select, ipc_data_t data)
             {
                 error = WSAGetLastError();
                 if (error == ERROR_IO_PENDING)
-                    return IPC_NOT_READY;
+                    return POLL_PENDING;
 
-                return IPC_ERROR;
+                return POLL_ERROR;
             }
 
             data->rx.read_size += size;
@@ -465,9 +462,9 @@ i64_t select_recv(select_t select, ipc_data_t data)
             {
                 error = WSAGetLastError();
                 if (error == ERROR_IO_PENDING)
-                    return IPC_NOT_READY;
+                    return POLL_PENDING;
 
-                return IPC_ERROR;
+                return POLL_ERROR;
             }
 
             data->rx.read_size += size;
@@ -490,9 +487,9 @@ i64_t select_recv(select_t select, ipc_data_t data)
         {
             error = WSAGetLastError();
             if (error == ERROR_IO_PENDING)
-                return IPC_NOT_READY;
+                return POLL_PENDING;
 
-            return IPC_ERROR;
+            return POLL_ERROR;
         }
     }
 
@@ -512,15 +509,15 @@ i64_t select_recv(select_t select, ipc_data_t data)
     {
         error = WSAGetLastError();
         if (error == ERROR_IO_PENDING)
-            return IPC_NOT_READY;
+            return POLL_PENDING;
 
-        return IPC_ERROR;
+        return POLL_ERROR;
     }
 
-    return IPC_OK;
+    return POLL_READY;
 }
 
-i64_t select_send(select_t select, ipc_data_t data)
+i64_t poll_send(poll_t select, ipc_data_t data)
 {
     unused(select);
 
@@ -544,7 +541,7 @@ send:
             size = ser_raw(&data->tx.buf, obj);
             drop(obj);
             if (size == -1)
-                return IPC_ERROR;
+                return POLL_ERROR;
 
             data->tx.size = size;
             data->tx.write_size = 0;
@@ -560,7 +557,7 @@ send:
         result = WSASend(data->fd, &wsaBuf, 1, &dsize, flags, &data->tx.overlapped, NULL);
 
         if (result == SOCKET_ERROR)
-            return IPC_ERROR;
+            return POLL_ERROR;
 
         heap_free(data->tx.buf);
 

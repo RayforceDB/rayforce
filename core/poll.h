@@ -21,8 +21,8 @@
  *   SOFTWARE.
  */
 
-#ifndef SELECT_H
-#define SELECT_H
+#ifndef POLL_H
+#define POLL_H
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 #include <winsock2.h>
@@ -44,9 +44,9 @@
 
 #define TX_QUEUE_SIZE 16
 
-#define IPC_ERROR -1
-#define IPC_OK 0
-#define IPC_NOT_READY 1
+#define POLL_ERROR -1
+#define POLL_READY 0
+#define POLL_PENDING 1
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 
@@ -103,12 +103,12 @@ typedef struct ipc_data_t
 
 #endif
 
-typedef struct select_t
+typedef struct poll_t
 {
     i64_t poll_fd;
     i64_t ipc_fd;
     ipc_data_t data;
-} *select_t;
+} *poll_t;
 
 nil_t prompt();
 nil_t remove_data(ipc_data_t *head, i64_t fd);
@@ -116,12 +116,14 @@ ipc_data_t add_data(ipc_data_t *head, i32_t fd, i32_t size);
 ipc_data_t find_data(ipc_data_t *head, i64_t fd);
 nil_t ipc_enqueue_msg(ipc_data_t data, obj_t obj, i8_t msg_type);
 
-select_t select_init(i64_t port);
-nil_t select_cleanup(select_t select);
-obj_t ipc_send_sync(select_t select, i64_t fd, obj_t obj);
-obj_t ipc_send_async(select_t select, i64_t fd, obj_t obj);
-i64_t select_dispatch(select_t select);
-ipc_data_t select_add(select_t select, i64_t fd);
-i64_t select_del(select_t select, i64_t fd);
+poll_t poll_init(i64_t port);
+i64_t poll_recv(poll_t poll, ipc_data_t data);
+i64_t poll_send(poll_t poll, ipc_data_t data);
+nil_t poll_cleanup(poll_t poll);
+obj_t ipc_send_sync(poll_t poll, i64_t fd, obj_t obj);
+obj_t ipc_send_async(poll_t poll, i64_t fd, obj_t obj);
+i64_t poll_dispatch(poll_t poll);
+ipc_data_t poll_add(poll_t poll, i64_t fd);
+i64_t poll_del(poll_t poll, i64_t fd);
 
-#endif // SELECT_H
+#endif // POLL_H
