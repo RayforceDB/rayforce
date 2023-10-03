@@ -127,21 +127,14 @@ obj_t symboli64(i64_t id)
     return a;
 }
 
-obj_t guid(u8_t data[])
+obj_t guid(u8_t buf[16])
 {
+    obj_t guid = vector(TYPE_I64, 2);
+    guid->type = -TYPE_GUID;
 
-    (void)(data);
-    // if (data == NULL)
-    //     return guid;
+    memcpy(as_guid(guid)[0].buf, buf, 16);
 
-    // guid_t *g = (guid_t *)heap_alloc(sizeof(struct guid_t));
-    // memcpy(g->data, data, sizeof(guid_t));
-
-    // guid.guid = g;
-
-    // return guid;
-
-    return NULL;
+    return guid;
 }
 
 obj_t vchar(char_t c)
@@ -475,6 +468,12 @@ dispatch:
             idx = obj->len + idx;
         if (idx >= 0 && idx < (i64_t)obj->len)
             return clone(as_list(obj)[idx]);
+        return null(0);
+    case TYPE_GUID:
+        if (idx < 0)
+            idx = obj->len + idx;
+        if (idx >= 0 && idx < (i64_t)obj->len)
+            return guid(as_guid(obj)[idx].buf);
         return null(0);
     case TYPE_ENUM:
         if (idx < 0)

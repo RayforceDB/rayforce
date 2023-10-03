@@ -557,9 +557,9 @@ obj_t ray_concat(obj_t x, obj_t y)
         yl = y->len;
         vec = vector_guid(xl + yl);
         for (i = 0; i < xl; i++)
-            as_guid(vec)[i] = as_guid(x)[i];
+            memcpy(as_guid(vec)[i].buf, as_guid(x)[i].buf, sizeof(guid_t));
         for (i = 0; i < yl; i++)
-            as_guid(vec)[i + xl] = as_guid(y)[i];
+            memcpy(as_guid(vec)[i + xl].buf, as_guid(y)[i].buf, sizeof(guid_t));
         return vec;
 
     case mtype2(TYPE_CHAR, TYPE_CHAR):

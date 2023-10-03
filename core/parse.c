@@ -317,7 +317,7 @@ obj_t parse_number(parser_t *parser)
         if (*(parser->current + 1) == 'g')
         {
             shift(parser, 2);
-            num = guid(NULL);
+            num = guid(NULL_GUID);
             nfo_insert(&parser->nfo, (i64_t)num, span);
 
             return num;

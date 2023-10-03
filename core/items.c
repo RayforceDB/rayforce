@@ -526,7 +526,7 @@ obj_t ray_filter(obj_t x, obj_t y)
         res = vector_guid(l);
         for (i = 0; i < l; i++)
             if (as_bool(y)[i])
-                as_guid(res)[j++] = as_guid(x)[i];
+                memcpy(as_guid(res)[j++].buf, as_guid(x)[i].buf, sizeof(guid_t));
 
         resize(&res, j);
 
@@ -590,46 +590,56 @@ obj_t ray_take(obj_t x, obj_t y)
     case mtype2(-TYPE_I64, TYPE_SYMBOL):
     case mtype2(-TYPE_I64, TYPE_TIMESTAMP):
         l = y->len;
-        m = x->i64;
+        m = absi64(x->i64);
         res = vector(y->type, m);
 
-        for (i = 0; i < m; i++)
-            as_i64(res)[i] = as_i64(y)[i % l];
+        if (x->i64 >= 0)
+        {
+            for (i = 0; i < m; i++)
+                as_i64(res)[i] = as_i64(y)[i % l];
+        }
+        else
+        {
+            for (i = 0; i < m; i++)
+                as_i64(res)[i] = as_i64(y)[l - 1 - (i % l)];
+        }
 
         return res;
 
     case mtype2(-TYPE_I64, TYPE_F64):
         l = y->len;
-        m = x->i64;
+        m = absi64(x->i64);
         res = vector_f64(m);
 
-        for (i = 0; i < m; i++)
-            as_f64(res)[i] = as_f64(y)[i % l];
+        if (x->i64 >= 0)
+        {
+            for (i = 0; i < m; i++)
+                as_f64(res)[i] = as_f64(y)[i % l];
+        }
+        else
+        {
+            for (i = 0; i < m; i++)
+                as_f64(res)[i] = as_f64(y)[l - 1 - (i % l)];
+        }
 
         return res;
 
     case mtype2(-TYPE_I64, -TYPE_I64):
     case mtype2(-TYPE_I64, -TYPE_SYMBOL):
     case mtype2(-TYPE_I64, -TYPE_TIMESTAMP):
-        l = x->i64;
+        l = absi64(x->i64);
         res = vector_i64(l);
+
         for (i = 0; i < l; i++)
             as_i64(res)[i] = y->i64;
 
         return res;
 
     case mtype2(-TYPE_I64, -TYPE_F64):
-        l = x->i64;
+        l = absi64(x->i64);
         res = vector_f64(l);
         for (i = 0; i < l; i++)
             as_f64(res)[i] = y->f64;
-
-        return res;
-
-        l = x->i64;
-        res = vector_timestamp(l);
-        for (i = 0; i < l; i++)
-            as_timestamp(res)[i] = y->i64;
 
         return res;
 
@@ -643,15 +653,23 @@ obj_t ray_take(obj_t x, obj_t y)
 
         v = enum_val(y);
 
-        l = x->i64;
+        l = absi64(x->i64);
         m = v->len;
 
         if (!s || s->type != TYPE_SYMBOL)
         {
             res = vector_i64(l);
 
-            for (i = 0; i < l; i++)
-                as_i64(res)[i] = as_i64(v)[i];
+            if (x->i64 >= 0)
+            {
+                for (i = 0; i < l; i++)
+                    as_i64(res)[i] = as_i64(v)[i % m];
+            }
+            else
+            {
+                for (i = 0; i < l; i++)
+                    as_i64(res)[i] = as_i64(v)[m - 1 - (i % m)];
+            }
 
             drop(s);
 
@@ -660,17 +678,33 @@ obj_t ray_take(obj_t x, obj_t y)
 
         res = vector_symbol(l);
 
-        for (i = 0; i < l; i++)
+        if (x->i64 >= 0)
         {
-
-            if (as_i64(v)[i % m] >= (i64_t)s->len)
+            for (i = 0; i < l; i++)
             {
-                drop(s);
-                drop(res);
-                emit(ERR_INDEX, "take: enum can not be resolved: index out of range");
-            }
+                if (as_i64(v)[i % m] >= (i64_t)s->len)
+                {
+                    drop(s);
+                    drop(res);
+                    emit(ERR_INDEX, "take: enum can not be resolved: index out of range");
+                }
 
-            as_symbol(res)[i] = as_i64(s)[as_i64(v)[i % m]];
+                as_symbol(res)[i] = as_symbol(s)[as_i64(v)[i % m]];
+            }
+        }
+        else
+        {
+            for (i = 0; i < l; i++)
+            {
+                if (as_i64(v)[m - 1 - (i % m)] >= (i64_t)s->len)
+                {
+                    drop(s);
+                    drop(res);
+                    emit(ERR_INDEX, "take: enum can not be resolved: index out of range");
+                }
+
+                as_symbol(res)[i] = as_symbol(s)[as_i64(v)[m - 1 - (i % m)]];
+            }
         }
 
         drop(s);
@@ -678,7 +712,7 @@ obj_t ray_take(obj_t x, obj_t y)
         return res;
 
     case mtype2(-TYPE_I64, TYPE_ANYMAP):
-        l = x->i64;
+        l = absi64(x->i64);
         res = vector(TYPE_LIST, l);
 
         k = anymap_key(y);
@@ -687,49 +721,112 @@ obj_t ray_take(obj_t x, obj_t y)
         m = k->len;
         n = s->len;
 
-        for (i = 0; i < l; i++)
+        if (x->i64 >= 0)
         {
-            if (as_i64(s)[i % n] < (i64_t)m)
+            for (i = 0; i < l; i++)
             {
-                buf = as_u8(k) + as_i64(s)[i % n];
-                v = load_obj(&buf, l);
+                if (as_i64(s)[i % n] >= (i64_t)m)
+                {
+                    buf = as_u8(k) + as_i64(s)[i % n];
+                    v = load_obj(&buf, l);
 
-                if (is_error(v))
+                    if (is_error(v))
+                    {
+                        res->len = i;
+                        drop(res);
+                        return v;
+                    }
+
+                    as_list(res)[i] = v;
+                }
+                else
                 {
                     res->len = i;
                     drop(res);
-                    return v;
+                    emit(ERR_INDEX, "anymap value: index out of range: %d", as_i64(s)[i % n]);
                 }
-
-                as_list(res)[i] = v;
             }
-            else
+        }
+        else
+        {
+            for (i = 0; i < l; i++)
             {
-                res->len = i;
-                drop(res);
-                emit(ERR_INDEX, "anymap value: index out of range: %d", as_i64(s)[i % n]);
+                if (as_i64(s)[n - 1 - (i % n)] >= (i64_t)m)
+                {
+                    buf = as_u8(k) + as_i64(s)[n - 1 - (i % n)];
+                    v = load_obj(&buf, l);
+
+                    if (is_error(v))
+                    {
+                        res->len = i;
+                        drop(res);
+                        return v;
+                    }
+
+                    as_list(res)[i] = v;
+                }
+                else
+                {
+                    res->len = i;
+                    drop(res);
+                    emit(ERR_INDEX, "anymap value: index out of range: %d", as_i64(s)[n - 1 - (i % n)]);
+                }
             }
         }
 
         return res;
 
     case mtype2(-TYPE_I64, TYPE_CHAR):
-        m = x->i64;
+        m = absi64(x->i64);
         n = y->len;
         res = string(m);
 
-        for (i = 0; i < m; i++)
-            as_string(res)[i] = as_string(y)[i % n];
+        if (x->i64 >= 0)
+        {
+            for (i = 0; i < m; i++)
+                as_string(res)[i] = as_string(y)[i % n];
+        }
+        else
+        {
+            for (i = 0; i < m; i++)
+                as_string(res)[i] = as_string(y)[n - 1 - (i % n)];
+        }
 
         return res;
 
     case mtype2(-TYPE_I64, TYPE_LIST):
-        m = x->i64;
+        m = absi64(x->i64);
         n = y->len;
         res = vector(TYPE_LIST, m);
 
-        for (i = 0; i < m; i++)
-            as_list(res)[i] = clone(as_list(y)[i % n]);
+        if (x->i64 >= 0)
+        {
+            for (i = 0; i < m; i++)
+                as_list(res)[i] = clone(as_list(y)[i % n]);
+        }
+        else
+        {
+            for (i = 0; i < m; i++)
+                as_list(res)[i] = clone(as_list(y)[n - 1 - (i % n)]);
+        }
+
+        return res;
+
+    case mtype2(-TYPE_I64, TYPE_GUID):
+        m = absi64(x->i64);
+        n = y->len;
+        res = vector_guid(m);
+
+        if (x->i64 >= 0)
+        {
+            for (i = 0; i < m; i++)
+                memcpy(as_guid(res)[i].buf, as_guid(y)[i % n].buf, sizeof(guid_t));
+        }
+        else
+        {
+            for (i = 0; i < m; i++)
+                memcpy(as_guid(res)[i].buf, as_guid(y)[n - 1 - (i % n)].buf, sizeof(guid_t));
+        }
 
         return res;
 

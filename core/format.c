@@ -227,19 +227,18 @@ i32_t ts_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, i64_t val)
     return n;
 }
 
-i32_t guid_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, guid_t *guid)
+i32_t guid_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, guid_t *val)
 {
-    u8_t *uuid_buffer = (u8_t *)guid;
+    u8_t *guid = val->buf;
 
-    if (uuid_buffer == NULL)
+    if (memcmp(guid, NULL_GUID, 16) == 0)
         return str_fmt_into(dst, len, offset, limit, "0g");
 
     i32_t n = str_fmt_into(dst, len, offset, limit, "%02hhx%02hhx%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                           uuid_buffer[0], uuid_buffer[1], uuid_buffer[2], uuid_buffer[3],
-                           uuid_buffer[4], uuid_buffer[5],
-                           uuid_buffer[6], uuid_buffer[7],
-                           uuid_buffer[8], uuid_buffer[9],
-                           uuid_buffer[10], uuid_buffer[11], uuid_buffer[12], uuid_buffer[13], uuid_buffer[14], uuid_buffer[15]);
+                           guid[0], guid[1], guid[2], guid[3],
+                           guid[4], guid[5], guid[6], guid[7],
+                           guid[8], guid[9], guid[10], guid[11],
+                           guid[12], guid[13], guid[14], guid[15]);
 
     return n;
 }
@@ -421,8 +420,8 @@ i32_t raw_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t li
         return symbol_fmt_into(dst, len, offset, limit, as_symbol(obj)[i]);
     case TYPE_TIMESTAMP:
         return ts_fmt_into(dst, len, offset, limit, as_timestamp(obj)[i]);
-    // case TYPE_GUID:
-    //     return guid_fmt_into(dst, len, offset, limit, as_guid(obj)[i]);
+    case TYPE_GUID:
+        return guid_fmt_into(dst, len, offset, limit, &as_guid(obj)[i]);
     case TYPE_CHAR:
         return str_fmt_into(dst, len, offset, limit, "%c", as_string(obj)[i]);
     case TYPE_LIST:
@@ -772,8 +771,8 @@ i32_t obj_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t indent, i32_t li
         return symbol_fmt_into(dst, len, offset, limit, obj->i64);
     case -TYPE_TIMESTAMP:
         return ts_fmt_into(dst, len, offset, limit, obj->i64);
-    // case -TYPE_GUID:
-    //     return guid_fmt_into(dst, len, offset, limit, obj->guid);
+    case -TYPE_GUID:
+        return guid_fmt_into(dst, len, offset, limit, as_guid(obj));
     case -TYPE_CHAR:
         return str_fmt_into(dst, len, offset, limit, "'%c'", obj->vchar ? obj->vchar : 1);
     case TYPE_BOOL:

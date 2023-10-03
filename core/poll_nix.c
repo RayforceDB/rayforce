@@ -178,7 +178,7 @@ i64_t poll_del(poll_t select, i64_t fd)
 {
     epoll_ctl(select->poll_fd, EPOLL_CTL_DEL, fd, NULL);
     remove_data(&select->data, fd);
-    close(fd);
+    // close(fd);
     return 0;
 }
 
@@ -203,15 +203,16 @@ i64_t poll_dispatch(poll_t select)
 
         for (n = 0; n < nfds; ++n)
         {
-            if (events[n].events & EPOLLERR || events[n].events & EPOLLHUP)
+            data = (ipc_data_t)events[n].data.ptr;
+
+            if (((events[n].events & EPOLLERR) == EPOLLERR) ||
+                ((events[n].events & EPOLLHUP) == EPOLLHUP))
             {
-                // debug("POLL HUP!!!!");
-                poll_del(select, events[n].data.fd);
+                poll_del(select, data->fd);
                 continue;
             }
 
             // stdin
-            data = (ipc_data_t)events[n].data.ptr;
             if (data->fd == STDIN_FILENO)
             {
                 len = read(STDIN_FILENO, data->rx.buf, BUF_SIZE);
@@ -238,10 +239,8 @@ i64_t poll_dispatch(poll_t select)
             // tcp socket event
             else
             {
-                data = (ipc_data_t)events[n].data.ptr;
-
                 // ipc in
-                if (events[n].events & EPOLLIN)
+                if ((events[n].events & EPOLLIN) == EPOLLIN)
                 {
                     poll = poll_recv(select, data);
                     if (poll == POLL_PENDING)
@@ -285,7 +284,7 @@ i64_t poll_dispatch(poll_t select)
                     }
                 }
                 // ipc out
-                if (events[n].events & EPOLLOUT)
+                if ((events[n].events & EPOLLOUT) == EPOLLOUT)
                 {
                     poll = poll_send(select, data);
 

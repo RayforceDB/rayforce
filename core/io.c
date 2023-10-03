@@ -69,10 +69,9 @@ obj_t ray_hopen(obj_t x)
 
 obj_t ray_hclose(obj_t x)
 {
-    if (sock_close(x->i64) == -1)
-        return sys_error(TYPE_GETLASTERROR, "hclose");
+    sock_close(x->i64);
 
-    poll_del(runtime_get()->select, x->i64);
+    // poll_del(runtime_get()->select, x->i64);
 
     return null(0);
 }

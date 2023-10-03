@@ -70,11 +70,12 @@ extern "C"
 #define ERR_THROW 14
 #define ERR_UNKNOWN 127
 
-#define NULL_I64 ((i64_t)0x8000000000000000LL)
-#define NULL_F64 ((f64_t)(0 / 0.0))
-#define MAX_I64  ((i64_t)0x7FFFFFFFFFFFFFFFLL)
-#define true     (char)1
-#define false    (char)0
+#define NULL_I64  ((i64_t)0x8000000000000000LL)
+#define NULL_F64  ((f64_t)(0 / 0.0))
+#define NULL_GUID ((u8_t[16]){0, 0, 0, 0})
+#define MAX_I64   ((i64_t)0x7FFFFFFFFFFFFFFFLL)
+#define true      (char)1
+#define false     (char)0
 
 typedef signed char type_t;
 typedef char i8_t;
@@ -95,9 +96,8 @@ typedef void nil_t;
 /*
  * GUID (Globally Unique Identifier)
  */
-typedef struct guid_t
-{
-    u8_t data[16];
+typedef struct guid_t {
+    u8_t buf[16];
 } guid_t;
 
 /*
@@ -140,7 +140,7 @@ extern obj_t f64(f64_t val);                                // f64 atom
 extern obj_t symbol(str_t ptr);                             // symbol
 extern obj_t symboli64(i64_t id);                           // symbol from i64
 extern obj_t timestamp(i64_t val);                          // timestamp
-extern obj_t guid(u8_t data[]);                             // GUID
+extern obj_t guid(u8_t buf[16]);                            // GUID
 extern obj_t vchar(char_t c);                               // char
 extern obj_t string(u64_t len);                             // string 
 extern obj_t venum(obj_t sym, obj_t vec);                   // enum
@@ -170,7 +170,7 @@ extern nil_t drop(obj_t obj);
 extern nil_t dropn(u64_t n, ...);
 
 // Accessors
-#define as_string(obj)    ((str_t)__builtin_assume_aligned((obj + 1), 16))
+#define as_string(obj)    ((str_t)__builtin_assume_aligned((obj + 1), sizeof(struct obj_t)))
 #define as_bool(obj)      ((bool_t *)(as_string(obj)))
 #define as_u8(obj)        ((u8_t *)(as_string(obj)))
 #define as_i64(obj)       ((i64_t *)(as_string(obj)))

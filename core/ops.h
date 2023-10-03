@@ -59,6 +59,7 @@
 #define mtype2(x, y) ((u8_t)(x) | ((u8_t)(y) << 8))
 
 #define is_null_i64(x) (((x) >> 63) & 1)
+#define absi64(x) ((x) == NULL_I64 ? 0 : (((x) < 0 ? -(x) : (x))))
 #define addi64(x, y) ((((x) + (y)) & ~((i64_t)is_null_i64(x) | (i64_t)is_null_i64(y))) | ((i64_t)is_null_i64(x) | (i64_t)is_null_i64(y)) << 63)
 #define addf64(x, y) (x + y)
 #define subi64(x, y) ((x == NULL_I64 || y == NULL_I64) ? NULL_I64 : (x - y))
