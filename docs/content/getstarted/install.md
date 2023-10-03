@@ -29,7 +29,7 @@ These OSes are supported (for now):
 git clone https://github.com/singaraiona/rayforce
 cd rayforce
 make release
-rlwrap ./rayforce -f tests/table.rfl
+rlwrap ./rayforce -f examples/table.rfl
 ```
 
 # :material-microsoft-windows: Windows
@@ -44,7 +44,7 @@ rlwrap ./rayforce -f tests/table.rfl
 git clone https://github.com/singaraiona/rayforce
 cd rayforce
 mingw32-make.exe CC="gcc" LIBS="-lm -lws2_32 -lkernel32" release 
-./rayforce.exe -f tests/table.rfl
+./rayforce.exe -f examples/table.rfl
 ```
 
 # :simple-macos: MacOS
@@ -57,5 +57,13 @@ mingw32-make.exe CC="gcc" LIBS="-lm -lws2_32 -lkernel32" release
 git clone https://github.com/singaraiona/rayforce
 cd rayforce
 make release
-rlwrap ./rayforce -f tests/table.rfl
+rlwrap ./rayforce -f examples/table.rfl
+```
+
+# :material-checkbox-multiple-blank: Tests
+
+Tests are under tests/ directory. To run tests:
+
+``` sh
+make clean && make tests
 ```
