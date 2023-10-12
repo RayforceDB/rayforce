@@ -90,7 +90,7 @@ u64_t size_obj(obj_t obj)
     case TYPE_VARY:
         return sizeof(type_t) + sizeof(env_get_internal_name(obj)) + 1;
     case TYPE_ERROR:
-        return sizeof(i8_t) + 1 + as_list(obj)[1]->len;
+        return sizeof(type_t) + sizeof(i8_t) + as_list(obj)[1]->len + 1;
     default:
         return 0;
     }
