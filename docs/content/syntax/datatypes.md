@@ -1,4 +1,4 @@
-# :material-dna: Types
+# :material-dna: Datatypes
 
 All the types are divided onto 3 categories:
 

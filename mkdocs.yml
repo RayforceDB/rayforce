@@ -108,11 +108,26 @@ nav:
     - Getting Started: 
       - Install: content/getstarted/install.md
       - Tutorial: content/getstarted/tutorial.md
-    - Reference:
-      - Types: content/reference/types.md
-      - Math: content/reference/math.md
-      - Queries: content/reference/queries.md
-      - Serialization: content/reference/serialization.md
+    - Syntax:
+      - Overview: content/syntax/overview.md
+      - Data Types: content/syntax/datatypes.md
+    - Functions:
+      - Math:
+        - Add: content/functions/math/add.md
+        - Sub: content/functions/math/sub.md
+        - Mul: content/functions/math/mul.md
+        - Div: content/functions/math/div.md
+        - Fdiv: content/functions/math/fdiv.md
+        - Mod: content/functions/math/mod.md
+        - Sum: content/functions/math/sum.md
+        - Avg: content/functions/math/avg.md
+        - Min: content/functions/math/min.md
+        - Max: content/functions/math/max.md
+    - Evaluation Control:
+      - Control Flow: content/flow/controlflow.md
+      - Error Handling: content/flow/errorhandling.md
+    - Queries: content/queries.md
+    - Serialization: content/serialization.md
     - Interfacing: 
       - IPC: content/interfacing/ipc.md
   - FAQ: content/faq.md
