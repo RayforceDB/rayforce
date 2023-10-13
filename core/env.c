@@ -74,9 +74,9 @@ obj_t ray_memstat()
     ins_sym(&keys, 2, "free ");
 
     vals = vector(TYPE_LIST, 3);
-    as_list(&vals)[0] = i64(stat.total);
-    as_list(&vals)[1] = i64(stat.used);
-    as_list(&vals)[2] = i64(stat.free);
+    as_list(vals)[0] = i64(stat.total);
+    as_list(vals)[1] = i64(stat.used);
+    as_list(vals)[2] = i64(stat.free);
 
     return dict(keys, vals);
 }
