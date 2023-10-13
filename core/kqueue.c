@@ -316,6 +316,19 @@ send:
     return POLL_DONE;
 }
 
+obj_t read_obj(selector_t selector)
+{
+    obj_t res;
+
+    res = de_raw(selector->rx.buf, selector->rx.size);
+    heap_free(selector->rx.buf);
+    selector->rx.buf = NULL;
+    selector->rx.bytes_transfered = 0;
+    selector->rx.size = 0;
+
+    return res;
+}
+
 nil_t process_request(poll_t poll, selector_t selector)
 {
     poll_result_t poll_result;
