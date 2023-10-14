@@ -154,7 +154,7 @@ i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
     selector->id = id;
     selector->version = version;
     selector->fd = fd;
-    selector->tx.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+    selector->tx.isset = false;
     selector->rx.buf = NULL;
     selector->rx.size = 0;
     selector->rx.bytes_transfered = 0;
@@ -287,10 +287,10 @@ send:
         else if (size == 0)
         {
             // setup epoll for EPOLLOUT only if it's not already set
-            if ((selector->tx.events & EPOLLOUT) == 0)
+            if (!selector->tx.isset)
             {
-                selector->tx.events |= EPOLLOUT;
-                ev.events = selector->tx.events;
+                selector->tx.isset = true;
+                ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;
                 ev.data.ptr = selector;
                 if (epoll_ctl(poll->poll_fd, EPOLL_CTL_MOD, selector->fd, &ev) == -1)
                     return POLL_ERROR;
@@ -324,10 +324,10 @@ send:
     }
 
     // remove EPOLLOUT only if it's set
-    if ((selector->tx.events & EPOLLOUT) != 0)
+    if (selector->tx.isset)
     {
-        selector->tx.events &= ~EPOLLOUT;
-        ev.events = selector->tx.events;
+        selector->tx.isset = false;
+        ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
         ev.data.ptr = selector;
         if (epoll_ctl(poll->poll_fd, EPOLL_CTL_MOD, selector->fd, &ev) == -1)
             return POLL_ERROR;
@@ -501,15 +501,18 @@ obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
 
         if (result == -1)
         {
-            poll_deregister(poll, selector->id);
-            emit(ERR_IO, "ipc_send_sync: error sending message (can't block on send)");
+            if (errno != EINTR)
+            {
+                poll_deregister(poll, selector->id);
+                return sys_error(ERROR_TYPE_OS, "ipc_send_sync: error sending message (can't block on send)");
+            }
         }
     }
 
     if (poll_result == POLL_ERROR)
     {
         poll_deregister(poll, selector->id);
-        emit(ERR_IO, "ipc_send_sync: error sending message");
+        return sys_error(ERROR_TYPE_OS, "ipc_send_sync: error sending message");
     }
 
 recv:
@@ -527,15 +530,18 @@ recv:
 
         if (result == -1)
         {
-            poll_deregister(poll, selector->id);
-            emit(ERR_IO, "ipc_send_sync: error receiving message (can't block on recv)");
+            if (errno != EINTR)
+            {
+                poll_deregister(poll, selector->id);
+                return sys_error(ERROR_TYPE_OS, "ipc_send_sync: error receiving message (can't block on recv)");
+            }
         }
     }
 
     if (poll_result == POLL_ERROR)
     {
         poll_deregister(poll, selector->id);
-        emit(ERR_IO, "ipc_send_sync: error receiving message");
+        return sys_error(ERROR_TYPE_OS, "ipc_send_sync: error receiving message");
     }
 
     // recv until we get response
