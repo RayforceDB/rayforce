@@ -155,10 +155,12 @@ i64_t fs_fread(i64_t fd, str_t buf, i64_t size)
 
 i64_t fs_fwrite(i64_t fd, str_t buf, i64_t size)
 {
-    i64_t c = 0;
-
-    while ((c = write(fd, buf, size - c)) > 0)
+    i64_t c = 0, l = size;
+    while ((c = write(fd, buf, l)) > 0)
+    {
         buf += c;
+        l -= c;
+    }
 
     if (c == -1)
         return c;

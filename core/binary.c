@@ -545,7 +545,7 @@ obj_t ray_set(obj_t x, obj_t y)
     obj_t res, col, s, p, k, v, e, cols, sym, buf;
     i64_t fd, c = 0;
     u64_t i, l, sz, size;
-    u8_t *b;
+    u8_t *b, mmod;
 
     switch (x->type)
     {
@@ -830,28 +830,28 @@ obj_t ray_set(obj_t x, obj_t y)
                 if (fd == -1)
                     return sys_error(ERROR_TYPE_SYS, as_string(x));
 
-                p = (obj_t)heap_alloc(sizeof(struct obj_t));
+                size = size_of(y);
 
-                memcpy(p, y, sizeof(struct obj_t));
+                c = fs_fwrite(fd, (str_t)y, size);
 
-                p->mmod = MMOD_EXTERNAL_SIMPLE;
-
-                c = fs_fwrite(fd, (str_t)p, sizeof(struct obj_t));
                 if (c == -1)
                 {
-                    heap_free(p);
+                    e = sys_error(ERROR_TYPE_SYS, as_string(x));
                     fs_fclose(fd);
-                    return sys_error(ERROR_TYPE_SYS, as_string(x));
+                    return e;
                 }
 
-                size = size_of(y) - sizeof(struct obj_t);
-
-                c = fs_fwrite(fd, as_string(y), size);
-                heap_free(p);
-                fs_fclose(fd);
-
+                // write mmod
+                lseek(fd, 0, SEEK_SET);
+                mmod = MMOD_EXTERNAL_SIMPLE;
+                c = fs_fwrite(fd, (str_t)&mmod, sizeof(u8_t));
                 if (c == -1)
-                    return sys_error(ERROR_TYPE_SYS, as_string(x));
+                {
+                    e = sys_error(ERROR_TYPE_SYS, as_string(x));
+                    fs_fclose(fd);
+                    return e;
+                }
+                fs_fclose(fd);
 
                 return clone(x);
             }

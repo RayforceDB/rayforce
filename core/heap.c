@@ -29,9 +29,8 @@
 #include "mmap.h"
 #include "util.h"
 
-// clang-format off
-CASSERT(sizeof(struct node_t     ) ==            16, heap_h)
-CASSERT(sizeof(struct heap_t    ) % PAGE_SIZE == 0,  heap_h)
+CASSERT(sizeof(struct node_t) ==            16, heap_h)
+CASSERT(sizeof(struct heap_t) % PAGE_SIZE == 0,  heap_h)
 
 __thread heap_t __HEAP = NULL;
 
@@ -53,10 +52,10 @@ nil_t  *heap_realloc(nil_t *ptr, u64_t new_size) { return realloc(ptr, new_size)
 i64_t   heap_gc()                                { return 0;                      }
 nil_t   heap_cleanup()                           {                                }
 heap_t  heap_init()                              { return NULL;                   }
+memstat_t heap_memstat()                         { return (memstat_t){0};         }
 
 #else
 
-// clang-format on
 nil_t heap_print_blocks()
 {
     i32_t i = 0;

@@ -27,18 +27,17 @@
 #include "rayforce.h"
 #include "symbols.h"
 
-// clang-format off
 #define MIN_ORDER       6                   // 2^6  = 64 bytes
 #define MAX_ORDER       25                  // 2^25 = 32MB
 #define MAX_POOL_ORDER  36                  // 2^36 = 64GB
-#define MIN__HEAP        (1ull << MIN_ORDER) // 64 bytes
-#define MAX__HEAP        (1ull << MAX_ORDER) // 32MB
+#define MIN__HEAP       (1ull << MIN_ORDER) // 64 bytes
+#define MAX__HEAP       (1ull << MAX_ORDER) // 32MB
 #define POOL_SIZE       (1ull << MAX_ORDER) // 32MB
 #define NUM_16_BLOCKS   1024 * 1024 * 32    // 32M blocks
 
 typedef struct node_t
 {
-    nil_t            *base; // base address of the root block (pool) + original order in 7's byte
+    nil_t            *base;  // base address of the root block (pool) + original order in 7's byte
     union
     {
         struct node_t *next; // next block in the pool
@@ -69,6 +68,5 @@ extern heap_t    heap_get();
 extern i64_t     heap_gc();
 extern nil_t     heap_cleanup();
 extern memstat_t heap_memstat();
-// clang-format on
 
 #endif

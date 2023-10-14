@@ -24,7 +24,6 @@
 #ifndef RAYFORCE_H
 #define RAYFORCE_H
 
-// clang-format off
 #ifdef __cplusplus
 extern "C"
 {
