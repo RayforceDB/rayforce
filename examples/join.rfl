@@ -1,10 +1,10 @@
 (set n 10000000)
 
 (set x (table [a b c d] 
-    (list (take n (list "aaaaaa" "bb" "cc" "dd")) (take n [I J K]) (til n) (til n))))
+    (list (take n (list "aaaaaa" "bbbbbbbbbb" "cc" "dd")) (take n [I J K]) (til n) (til n))))
 
 (set y (table [a b c d e] 
-    (list (take n (list "aa" "bbbbbbbbbb" "cc" "dd" "ee")) (take n [I J K]) (til n) (til n) (til n))))
+    (list (take n (list "aa" "bb" "cc" "dd" "ee")) (take n [I J K]) (til n) (til n) (til n))))
 
 ;; (lj [a] x y)
 ;; (lj [a b] x y)

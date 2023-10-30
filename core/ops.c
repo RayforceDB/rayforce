@@ -593,21 +593,24 @@ obj_t sys_error(os_error_type_t type, str_t msg)
 
 u64_t hash_obj(obj_t obj)
 {
-    u64_t hash = 5381, len, i;
+    u64_t hash, len, i;
     str_t str;
 
     switch (obj->type)
     {
     case TYPE_CHAR:
         len = obj->len;
-
+        hash = 0xcbf29ce484222325ULL;
         str = as_string(obj);
         for (i = 0; i < len; i++)
-            hash += (hash << 5) + str[i];
+        {
+            hash ^= (u64_t)str[i];
+            hash *= 0x100000001b3ULL;
+        }
 
         return hash;
     // TODO: implement hash for other types
     default:
-        return 0;
+        return (u64_t)obj;
     }
 }

@@ -32,12 +32,11 @@
 
 typedef struct lj_ctx_t
 {
-    obj_t lcols;
-    obj_t rcols;
+    obj_t cols;
     u64_t *hashes;
 } lj_ctx_t;
 
-obj_t lj_column(obj_t left_col, obj_t right_col, i64_t ids[], u64_t len)
+obj_t select_column(obj_t left_col, obj_t right_col, i64_t ids[], u64_t len)
 {
     u64_t i;
     obj_t v, res;
@@ -69,32 +68,6 @@ obj_t lj_column(obj_t left_col, obj_t right_col, i64_t ids[], u64_t len)
     return res;
 }
 
-inline __attribute__((always_inline)) u64_t hashi64(u64_t h, u64_t k)
-{
-    k *= 0x87c37b91114253d5ull;
-    k = roti64(k, 31);
-    k *= 0x4cf5ad432745937full;
-    h ^= k;
-    h = roti64(h, 27);
-    h = h * 5 + 0x52dce729;
-
-    // Additional mixing for small input sizes
-    h ^= h >> 25;
-    h *= 0x9e3779b97f4a7c15ull; // another 64-bit prime
-
-    return h;
-}
-
-inline __attribute__((always_inline)) u64_t fmixi64(u64_t h, u64_t n)
-{
-    h ^= n;
-    h ^= h >> 33;
-    h *= 0xff51afd7ed558ccdull;
-    h ^= h >> 33;
-    h *= 0xc4ceb9fe1a85ec53ull;
-    return h ^ (h >> 33);
-}
-
 inline __attribute__((always_inline)) bool_t __eq(obj_t a, i64_t ai, obj_t b, i64_t bi)
 {
     switch (a->type)
@@ -116,6 +89,83 @@ inline __attribute__((always_inline)) bool_t __eq(obj_t a, i64_t ai, obj_t b, i6
     }
 }
 
+inline __attribute__((always_inline)) u64_t hashi64(u64_t h, u64_t k)
+{
+    u64_t a, b;
+
+    a = (h ^ k) * 0x9ddfea08eb382d69ull;
+    a ^= (a >> 47);
+    b = (roti64(k, 31) ^ a) * 0x9ddfea08eb382d69ull;
+    b ^= (b >> 47);
+    b *= 0x9ddfea08eb382d69ull;
+
+    return b;
+}
+
+nil_t hash_column(obj_t obj, u64_t *out, u64_t len)
+{
+    u8_t *u8v;
+    f64_t *f64v;
+    guid_t *g64v;
+    u64_t i, *u64v;
+
+    switch (obj->type)
+    {
+    case TYPE_BOOL:
+    case TYPE_BYTE:
+    case TYPE_CHAR:
+        u8v = as_u8(obj);
+        for (i = 0; i < len; i++)
+            out[i] = hashi64((u64_t)u8v[i], out[i]);
+        break;
+    case TYPE_I64:
+    case TYPE_SYMBOL:
+    case TYPE_TIMESTAMP:
+        u64v = (u64_t *)as_i64(obj);
+        for (i = 0; i < len; i++)
+            out[i] = hashi64(u64v[i], out[i]);
+        break;
+    case TYPE_F64:
+        f64v = as_f64(obj);
+        for (i = 0; i < len; i++)
+            out[i] = hashi64((u64_t)f64v[i], out[i]);
+        break;
+    case TYPE_GUID:
+        g64v = as_guid(obj);
+        for (i = 0; i < len; i++)
+        {
+            out[i] = hashi64(*(u64_t *)&g64v[i], out[i]);
+            out[i] = hashi64(*((u64_t *)&g64v[i] + 1), out[i]);
+        }
+        break;
+    case TYPE_LIST:
+        for (i = 0; i < len; i++)
+            out[i] = hashi64(hash_obj(as_list(obj)[i]), out[i]);
+        break;
+    default:
+        // TODO: error
+        break;
+    }
+
+    return;
+}
+
+nil_t precalc_hash(obj_t cols, u64_t *out, u64_t ncols, u64_t nrows)
+{
+    u64_t i, j;
+
+    // initialize hashes
+    for (j = 0; j < nrows; j++)
+        out[j] = 0xa5b6c7d8e9f01234ull;
+
+    hash_column(as_list(cols)[0], out, nrows);
+
+    for (i = 1; i < ncols; i++)
+        hash_column(as_list(cols)[i], out, nrows);
+
+    return;
+}
+
 u64_t hash_get(i64_t row, nil_t *seed)
 {
     lj_ctx_t *ctx = (lj_ctx_t *)seed;
@@ -126,13 +176,12 @@ i32_t cmp_row(i64_t row1, i64_t row2, nil_t *seed)
 {
     u64_t i, l;
     lj_ctx_t *ctx = (lj_ctx_t *)seed;
-    obj_t lcols = ctx->lcols;
-    obj_t rcols = ctx->rcols;
+    obj_t *cols = as_list(ctx->cols);
 
-    l = lcols->len;
+    l = ctx->cols->len;
 
     for (i = 0; i < l; i++)
-        if (__eq(as_list(lcols)[i], row1, as_list(rcols)[i], row2))
+        if (!__eq(cols[i], row1, cols[i], row2))
             return 1;
 
     return 0;
@@ -140,8 +189,8 @@ i32_t cmp_row(i64_t row1, i64_t row2, nil_t *seed)
 
 obj_t build_idx(obj_t lcols, obj_t rcols, u64_t len)
 {
-    u64_t i, j, ll, rl, k;
-    obj_t ht, v, res;
+    u64_t i, ll, rl;
+    obj_t ht, res;
     i64_t idx;
     lj_ctx_t ctx;
 
@@ -150,31 +199,12 @@ obj_t build_idx(obj_t lcols, obj_t rcols, u64_t len)
 
     ll = as_list(lcols)[0]->len;
     rl = as_list(rcols)[0]->len;
-    ht = ht_tab(maxi64(ll, rl), -1);
-
-    // Precalculate right hashes
+    ht = ht_tab(maxi64(ll, rl) * 2, -1);
     res = vector_i64(maxi64(ll, rl));
 
-    // initialization
-    for (j = 0; j < rl; j++)
-        as_i64(res)[j] = 0xa5b6c7d8e9f01234ull;
-
-    for (i = 0; i < len; i++)
-    {
-        v = as_list(rcols)[i];
-        for (j = 0; j < rl; j++)
-        {
-            k = hashi64(as_i64(res)[j], hash_idx(v, j));
-            as_i64(res)[j] = k;
-        }
-    }
-
-    // finalization
-    for (j = 0; j < rl; j++)
-        as_i64(res)[j] = fmixi64(as_i64(res)[j], len);
-
-    // Build hash table
-    ctx = (lj_ctx_t){rcols, rcols, (u64_t *)as_i64(res)};
+    // Right hashes
+    precalc_hash(rcols, (u64_t *)as_i64(res), len, rl);
+    ctx = (lj_ctx_t){rcols, (u64_t *)as_i64(res)};
     for (i = 0; i < rl; i++)
     {
         idx = ht_tab_next_with(&ht, i, &hash_get, &cmp_row, &ctx);
@@ -182,25 +212,9 @@ obj_t build_idx(obj_t lcols, obj_t rcols, u64_t len)
             as_i64(as_list(ht)[0])[idx] = i;
     }
 
-    // Precalculate left hashes
-    for (j = 0; j < ll; j++)
-        as_i64(res)[j] = 0xa5b6c7d8e9f01234ull;
-
-    for (i = 0; i < len; i++)
-    {
-        v = as_list(lcols)[i];
-        for (j = 0; j < ll; j++)
-        {
-            k = hashi64(as_i64(res)[j], hash_idx(v, j));
-            as_i64(res)[j] = k;
-        }
-    }
-
-    // finalization
-    for (j = 0; j < ll; j++)
-        as_i64(res)[j] = fmixi64(as_i64(res)[j], len);
-
-    ctx = (lj_ctx_t){rcols, lcols, (u64_t *)as_i64(res)};
+    // Left hashes
+    precalc_hash(lcols, (u64_t *)as_i64(res), len, ll);
+    ctx = (lj_ctx_t){lcols, (u64_t *)as_i64(res)};
     for (i = 0; i < ll; i++)
     {
         idx = ht_tab_get_with(ht, i, &hash_get, &cmp_row, &ctx);
@@ -307,7 +321,7 @@ obj_t ray_lj(obj_t *x, u64_t n)
             }
         }
 
-        col = lj_column(c1, c2, as_i64(idx), ll);
+        col = select_column(c1, c2, as_i64(idx), ll);
         if (is_error(col))
         {
             dropn(4, k1, cols, idx, vals);

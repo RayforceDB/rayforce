@@ -127,10 +127,8 @@ i64_t ht_tab_next_with(obj_t *obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *see
     while (true)
     {
         size = as_list(*obj)[0]->len;
-        // printf("** NEXT WITH: %lld\n", size);
         for (i = hash(key, seed) & (size - 1); i < size; i++)
         {
-            // printf("-- I: %lld\n", i);
             if (as_i64(as_list(*obj)[0])[i] == NULL_I64 || cmp(as_i64(as_list(*obj)[0])[i], key, seed) == 0)
                 return i;
         }
@@ -159,10 +157,8 @@ i64_t ht_tab_get_with(obj_t obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed)
 {
     u64_t i, size = as_list(obj)[0]->len;
 
-    // printf("** GET WITH: %lld\n", size);
     for (i = hash(key, seed) & (size - 1); i < size; i++)
     {
-        // printf("-- I: %lld\n", i);
         if (as_i64(as_list(obj)[0])[i] == NULL_I64)
             return NULL_I64;
 
