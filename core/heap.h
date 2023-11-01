@@ -27,11 +27,11 @@
 #include "rayforce.h"
 #include "symbols.h"
 
-#define MIN_ORDER 6                   // 2^6  = 64 bytes
-#define MAX_ORDER 25                  // 2^25 = 32MB
-#define MAX_POOL_ORDER 36             // 2^36 = 64GB
-#define POOL_SIZE (1ull << MAX_ORDER) // 32MB
-#define NUM_16_BLOCKS 1024 * 1024     // 1M blocks
+#define MIN_ORDER 6                    // 2^6  = 64 bytes
+#define MAX_ORDER 25                   // 2^25 = 32MB
+#define MAX_POOL_ORDER 36              // 2^36 = 64GB
+#define POOL_SIZE (1ull << MAX_ORDER)  // 32MB
+#define NUM_16_BLOCKS 1024 * 1024 * 16 // 16M blocks
 
 typedef struct node_t
 {
