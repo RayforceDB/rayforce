@@ -40,7 +40,7 @@ obj_t ray_amend(obj_t *x, u64_t n)
         env = as_list(runtime_get()->env.variables);
         i = find_obj(env[0], x[0]);
         if (i == env[0]->len)
-            emit(ERR_NOT_FOUND, "amend");
+            emit(ERR_NOT_FOUND, "amend: object not found");
         obj = cow(as_list(env[1])[i]);
         break;
     default:

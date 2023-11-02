@@ -34,4 +34,11 @@ i64_t ht_tab_next_with(obj_t *obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *see
 i64_t ht_tab_get(obj_t obj, i64_t key);
 i64_t ht_tab_get_with(obj_t obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed);
 
+// Knuth's multiplicative hash
+u64_t kmh_hash(i64_t key, nil_t *seed);
+// FNV-1a hash
+u64_t fnv1a_hash_64(i64_t key, nil_t *seed);
+// Identity
+u64_t i64_hash(i64_t a, nil_t *seed);
+
 #endif

@@ -30,5 +30,5 @@ nil_t guid_generate(guid_t *g)
     i64_t i;
 
     for (i = 0; i < 16; i++)
-        g->buf[i] = rfi_rand_u64() % 256;
+        g->buf[i] = ops_rand_u64() % 256;
 }

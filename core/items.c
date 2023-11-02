@@ -905,7 +905,7 @@ obj_t ray_in(obj_t x, obj_t y)
 
             for (i = 0; i < yl; i++)
             {
-                // p = ht_tab_next_with(&set, as_i64(y)[i], &rfi_i64_hash, &i64_cmp);
+                // p = ht_tab_next_with(&set, as_i64(y)[i], &i64_hash, &i64_cmp);
                 p = ht_tab_next(&set, as_i64(y)[i]);
                 if (as_i64(as_list(set)[0])[p] == NULL_I64)
                     as_i64(as_list(set)[0])[p] = as_i64(y)[i];
@@ -915,7 +915,7 @@ obj_t ray_in(obj_t x, obj_t y)
 
             for (i = 0; i < xl; i++)
             {
-                // p = ht_tab_next_with(&set, as_i64(x)[i], &rfi_i64_hash, &i64_cmp);
+                // p = ht_tab_next_with(&set, as_i64(x)[i], &i64_hash, &i64_cmp);
                 p = ht_tab_get(set, as_i64(x)[i]);
                 as_bool(vec)[i] = (p != NULL_I64);
             }

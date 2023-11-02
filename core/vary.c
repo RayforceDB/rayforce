@@ -78,8 +78,8 @@ u64_t args_height(obj_t *x, u64_t n)
     {
         b = x + i;
         if ((is_vector(*b) || (*b)->type == TYPE_LISTMAP) && l == __NULL_ARG)
-            l = count(*b);
-        else if ((is_vector(*b) || (*b)->type == TYPE_LISTMAP) && count(*b) != l)
+            l = ops_count(*b);
+        else if ((is_vector(*b) || (*b)->type == TYPE_LISTMAP) && ops_count(*b) != l)
             return __NULL_ARG;
     }
 

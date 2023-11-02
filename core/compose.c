@@ -403,7 +403,7 @@ obj_t ray_rand(obj_t x, obj_t y)
         vec = vector_i64(count);
 
         for (i = 0; i < count; i++)
-            as_i64(vec)[i] = rfi_rand_u64() % y->i64;
+            as_i64(vec)[i] = ops_rand_u64() % y->i64;
 
         return vec;
 

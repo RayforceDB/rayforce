@@ -48,9 +48,9 @@ obj_t call_binary(binary_f f, obj_t x, obj_t y)
 
     if (xt == TYPE_LISTMAP && yt == TYPE_LISTMAP)
     {
-        l = count(x);
+        l = ops_count(x);
 
-        if (l != count(y))
+        if (l != ops_count(y))
             return error(ERR_LENGTH, "binary: vectors must be of the same length");
 
         a = ray_vecmap(as_list(x)[0], as_list(as_list(x)[1])[0]);
@@ -85,7 +85,7 @@ obj_t call_binary(binary_f f, obj_t x, obj_t y)
     }
     else if (xt == TYPE_LISTMAP)
     {
-        l = count(x);
+        l = ops_count(x);
         a = ray_vecmap(as_list(x)[0], as_list(as_list(x)[1])[0]);
 
         item = call_binary(f, a, y);
@@ -116,7 +116,7 @@ obj_t call_binary(binary_f f, obj_t x, obj_t y)
     }
     else if (yt == TYPE_LISTMAP)
     {
-        l = count(y);
+        l = ops_count(y);
         b = ray_vecmap(as_list(y)[0], as_list(as_list(y)[1])[0]);
 
         item = call_binary(f, x, b);
@@ -157,7 +157,7 @@ obj_t ray_call_binary_left_atomic(binary_f f, obj_t x, obj_t y)
     switch (x->type)
     {
     case TYPE_LIST:
-        l = count(x);
+        l = ops_count(x);
         a = as_list(x)[0];
         item = ray_call_binary_left_atomic(f, a, y);
 
@@ -186,7 +186,7 @@ obj_t ray_call_binary_left_atomic(binary_f f, obj_t x, obj_t y)
         return res;
 
     case TYPE_ANYMAP:
-        l = count(x);
+        l = ops_count(x);
         a = at_idx(x, 0);
         item = ray_call_binary_left_atomic(f, a, y);
         drop(a);
@@ -217,7 +217,7 @@ obj_t ray_call_binary_left_atomic(binary_f f, obj_t x, obj_t y)
         return res;
 
     case TYPE_LISTMAP:
-        l = count(x);
+        l = ops_count(x);
         a = ray_vecmap(as_list(x)[0], as_list(as_list(x)[1])[0]);
         item = ray_call_binary_left_atomic(f, a, y);
 
@@ -258,7 +258,7 @@ obj_t ray_call_binary_right_atomic(binary_f f, obj_t x, obj_t y)
     switch (y->type)
     {
     case TYPE_LIST:
-        l = count(y);
+        l = ops_count(y);
         b = as_list(y)[0];
         item = ray_call_binary_right_atomic(f, x, b);
 
@@ -287,7 +287,7 @@ obj_t ray_call_binary_right_atomic(binary_f f, obj_t x, obj_t y)
         return res;
 
     case TYPE_ANYMAP:
-        l = count(y);
+        l = ops_count(y);
         b = at_idx(y, 0);
         item = ray_call_binary_right_atomic(f, x, b);
         drop(b);
@@ -318,7 +318,7 @@ obj_t ray_call_binary_right_atomic(binary_f f, obj_t x, obj_t y)
         return res;
 
     case TYPE_LISTMAP:
-        l = count(y);
+        l = ops_count(y);
         b = ray_vecmap(as_list(y)[0], as_list(as_list(y)[1])[0]);
         item = ray_call_binary_right_atomic(f, x, b);
 
@@ -366,9 +366,9 @@ obj_t ray_call_binary_atomic(binary_f f, obj_t x, obj_t y)
     if (((xt == TYPE_LIST || xt == TYPE_ANYMAP || xt == TYPE_LISTMAP) && is_vector(y)) ||
         ((yt == TYPE_LIST || yt == TYPE_ANYMAP || yt == TYPE_LISTMAP) && is_vector(x)))
     {
-        l = count(x);
+        l = ops_count(x);
 
-        if (l != count(y))
+        if (l != ops_count(y))
             return error(ERR_LENGTH, "binary: vectors must be of the same length");
 
         a = xt == TYPE_LIST ? as_list(x)[0] : at_idx(x, 0);
@@ -412,7 +412,7 @@ obj_t ray_call_binary_atomic(binary_f f, obj_t x, obj_t y)
     }
     else if (xt == TYPE_LIST || xt == TYPE_ANYMAP || xt == TYPE_LISTMAP)
     {
-        l = count(x);
+        l = ops_count(x);
         a = xt == TYPE_LIST ? as_list(x)[0] : at_idx(x, 0);
         item = ray_call_binary_atomic(f, a, y);
         if (xt != TYPE_LIST)
@@ -446,7 +446,7 @@ obj_t ray_call_binary_atomic(binary_f f, obj_t x, obj_t y)
     }
     else if (yt == TYPE_LIST || yt == TYPE_ANYMAP || yt == TYPE_LISTMAP)
     {
-        l = count(y);
+        l = ops_count(y);
         b = yt == TYPE_LIST ? as_list(y)[0] : at_idx(y, 0);
         item = ray_call_binary_atomic(f, x, b);
         if (yt != TYPE_LIST)

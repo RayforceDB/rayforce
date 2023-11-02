@@ -37,22 +37,19 @@
 
 static u64_t __RND_SEED__ = 0;
 
-#define MAX_LINEAR_VALUE 1024 * 1024 * 64
-#define normalize(k) ((u64_t)(k - min))
-
 /*
- * Incase of using -Ofast compiler flag, we can not just use x != x due to
+ * In case of using -Ofast compiler flag, we can not just use x != x due to
  * compiler optimizations. So we need to use memcpy to get the bits of the x
  * and then separate check mantissa and exponent.
  */
-bool_t rfi_is_nan(f64_t x)
+bool_t ops_is_nan(f64_t x)
 {
     u64_t bits;
     memcpy(&bits, &x, sizeof(x));
     return (bits & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL && (bits & 0x000FFFFFFFFFFFFFULL) != 0;
 }
 
-bool_t rfi_eq(obj_t x, obj_t y)
+bool_t ops_eq(obj_t x, obj_t y)
 {
     if (x->type != y->type)
         return false;
@@ -72,7 +69,7 @@ bool_t rfi_eq(obj_t x, obj_t y)
     }
 }
 
-bool_t rfi_lt(obj_t x, obj_t y)
+bool_t ops_lt(obj_t x, obj_t y)
 {
     if (x->type != y->type)
         return false;
@@ -92,28 +89,22 @@ bool_t rfi_lt(obj_t x, obj_t y)
     }
 }
 
-i32_t i64_cmp(i64_t a, i64_t b, nil_t *seed)
-{
-    unused(seed);
-    return a != b;
-}
-
-i64_t rfi_round_f64(f64_t x)
+i64_t ops_round_f64(f64_t x)
 {
     return x >= 0.0 ? (i64_t)(x + 0.5) : (i64_t)(x - 0.5);
 }
 
-i64_t rfi_floor_f64(f64_t x)
+i64_t ops_floor_f64(f64_t x)
 {
     return x >= 0.0 ? (i64_t)x : (i64_t)(x - 1.0);
 }
 
-i64_t rfi_ceil_f64(f64_t x)
+i64_t ops_ceil_f64(f64_t x)
 {
     return x >= 0.0 ? (i64_t)(x + 1.0) : (i64_t)x;
 }
 
-u64_t rfi_rand_u64()
+u64_t ops_rand_u64()
 {
 #define A 6364136223846793005ULL
 #define C 1442695040888963407ULL
@@ -123,37 +114,7 @@ u64_t rfi_rand_u64()
     return __RND_SEED__;
 }
 
-u64_t rfi_kmh_hash(i64_t key, nil_t *seed)
-{
-    unused(seed);
-#define LARGE_PRIME 6364136223846793005ULL
-    return (key * LARGE_PRIME) >> 32;
-}
-
-u64_t rfi_fnv1a_hash_64(i64_t key, nil_t *seed)
-{
-    unused(seed);
-#define FNV_OFFSET_64 14695981039346656037ULL
-#define FNV_PRIME_64 1099511628211ULL
-    u64_t hash = FNV_OFFSET_64;
-    i32_t i;
-    for (i = 0; i < 8; i++)
-    {
-        u8_t byte = (key >> (i * 8)) & 0xff;
-        hash ^= byte;
-        hash *= FNV_PRIME_64;
-    }
-
-    return hash;
-}
-
-u64_t rfi_i64_hash(i64_t key, nil_t *seed)
-{
-    unused(seed);
-    return (u64_t)key;
-}
-
-bool_t rfi_as_bool(obj_t x)
+bool_t ops_as_bool(obj_t x)
 {
     if (is_null(x))
         return false;
@@ -215,7 +176,7 @@ bool_t pos_update(i64_t key, i64_t val, nil_t *seed, i64_t *tkey, i64_t *tval)
     return true;
 }
 
-obj_t distinct(obj_t x)
+obj_t ops_distinct(obj_t x)
 {
     i64_t i, j, l, r, p, min, max, range, k, w, b;
     obj_t mask, vec, set;
@@ -291,7 +252,7 @@ obj_t distinct(obj_t x)
     return vec;
 }
 
-obj_t group(i64_t values[], i64_t indices[], i64_t len)
+obj_t ops_group(i64_t values[], i64_t indices[], i64_t len)
 {
     i64_t i, j, n, m, idx, min, max, range, *hk, *hv, *kv, *vv;
     obj_t keys, vals, k, v, ht;
@@ -509,7 +470,7 @@ obj_t group(i64_t values[], i64_t indices[], i64_t len)
     return list(3, k, v, vals);
 }
 
-u64_t count(obj_t x)
+u64_t ops_count(obj_t x)
 {
     if (!x)
         return 0;
@@ -591,7 +552,7 @@ obj_t sys_error(os_error_type_t type, str_t msg)
 
 #endif
 
-u64_t hash_obj(obj_t obj)
+u64_t ops_hash_obj(obj_t obj)
 {
     u64_t hash, len, i;
     str_t str;

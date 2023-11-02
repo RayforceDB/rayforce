@@ -168,3 +168,27 @@ i64_t ht_tab_get_with(obj_t obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed)
 
     return NULL_I64;
 }
+
+u64_t kmh_hash(i64_t key, nil_t *seed)
+{
+    unused(seed);
+#define LARGE_PRIME 6364136223846793005ULL
+    return (key * LARGE_PRIME) >> 32;
+}
+
+u64_t fnv1a_hash_64(i64_t key, nil_t *seed)
+{
+    unused(seed);
+#define FNV_OFFSET_64 14695981039346656037ULL
+#define FNV_PRIME_64 1099511628211ULL
+    u64_t hash = FNV_OFFSET_64;
+    i32_t i;
+    for (i = 0; i < 8; i++)
+    {
+        u8_t byte = (key >> (i * 8)) & 0xff;
+        hash ^= byte;
+        hash *= FNV_PRIME_64;
+    }
+
+    return hash;
+}

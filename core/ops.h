@@ -85,28 +85,18 @@ typedef obj_t (*unary_f)(obj_t);
 typedef obj_t (*binary_f)(obj_t, obj_t);
 typedef obj_t (*vary_f)(obj_t *, i64_t n);
 
-i32_t i64_cmp(i64_t a, i64_t b, nil_t *);
-
-bool_t rfi_is_nan(f64_t x);
-bool_t rfi_eq(obj_t x, obj_t y);
-bool_t rfi_lt(obj_t x, obj_t y);
-bool_t rfi_as_bool(obj_t x);
-
-i64_t rfi_round_f64(f64_t x);
-i64_t rfi_floor_f64(f64_t x);
-i64_t rfi_ceil_f64(f64_t x);
-u64_t rfi_rand_u64();
-
-// Knuth's multiplicative hash
-u64_t rfi_kmh_hash(i64_t key, nil_t *seed);
-// FNV-1a hash
-u64_t rfi_fnv1a_hash_64(i64_t key, nil_t *seed);
-// Identity
-u64_t rfi_i64_hash(i64_t a, nil_t *seed);
-obj_t distinct(obj_t x);
-obj_t group(i64_t values[], i64_t indices[], i64_t len);
-u64_t count(obj_t x);
-u64_t hash_obj(obj_t obj);
+bool_t ops_is_nan(f64_t x);
+bool_t ops_eq(obj_t x, obj_t y);
+bool_t ops_lt(obj_t x, obj_t y);
+bool_t ops_as_bool(obj_t x);
+i64_t ops_round_f64(f64_t x);
+i64_t ops_floor_f64(f64_t x);
+i64_t ops_ceil_f64(f64_t x);
+u64_t ops_rand_u64();
+obj_t ops_distinct(obj_t x);
+obj_t ops_group(i64_t values[], i64_t indices[], i64_t len);
+u64_t ops_count(obj_t x);
+u64_t ops_hash_obj(obj_t obj);
 
 typedef enum
 {

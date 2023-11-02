@@ -106,7 +106,7 @@ obj_t ray_call_unary_atomic(u8_t attrs, unary_f f, obj_t x)
     switch (x->type)
     {
     case TYPE_LIST:
-        l = count(x);
+        l = ops_count(x);
 
         if (l == 0)
             return null(0);
@@ -138,7 +138,7 @@ obj_t ray_call_unary_atomic(u8_t attrs, unary_f f, obj_t x)
         return res;
 
     case TYPE_ANYMAP:
-        l = count(x);
+        l = ops_count(x);
         if (l == 0)
             return null(0);
 

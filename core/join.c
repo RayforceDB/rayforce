@@ -140,7 +140,7 @@ nil_t hash_column(obj_t obj, u64_t *out, u64_t len)
         break;
     case TYPE_LIST:
         for (i = 0; i < len; i++)
-            out[i] = hashi64(hash_obj(as_list(obj)[i]), out[i]);
+            out[i] = hashi64(ops_hash_obj(as_list(obj)[i]), out[i]);
         break;
     default:
         // TODO: error
@@ -244,10 +244,10 @@ obj_t ray_lj(obj_t *x, u64_t n)
     if (x[2]->type != TYPE_TABLE)
         emit(ERR_TYPE, "lj: third argument must be a table");
 
-    if (count(x[1]) == 0 || count(x[2]) == 0)
+    if (ops_count(x[1]) == 0 || ops_count(x[2]) == 0)
         return clone(x[1]);
 
-    ll = count(x[1]);
+    ll = ops_count(x[1]);
 
     k1 = ray_at(x[1], x[0]);
     if (is_error(k1))

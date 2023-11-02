@@ -188,7 +188,7 @@ i32_t f64_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, f64_t val
 {
     f64_t order;
 
-    if (rfi_is_nan(val))
+    if (ops_is_nan(val))
         return str_fmt_into(dst, len, offset, limit, "0f");
 
     // Find the order of magnitude of the number to select the appropriate format

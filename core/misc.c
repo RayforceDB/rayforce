@@ -44,7 +44,7 @@ obj_t ray_type(obj_t x)
 
 obj_t ray_count(obj_t x)
 {
-    return i64(count(x));
+    return i64(ops_count(x));
 }
 
 obj_t ray_distinct(obj_t x)
@@ -54,9 +54,9 @@ obj_t ray_distinct(obj_t x)
     switch (x->type)
     {
     case TYPE_I64:
-        return distinct(x);
+        return ops_distinct(x);
     case TYPE_SYMBOL:
-        res = distinct(x);
+        res = ops_distinct(x);
         res->type = TYPE_SYMBOL;
         return res;
     default:
@@ -77,18 +77,18 @@ dispatch:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
         l = indices == NULL ? x->len : l;
-        g = group(as_i64(x), indices, l);
+        g = ops_group(as_i64(x), indices, l);
         as_list(g)[0]->type = x->type;
         break;
     case TYPE_ENUM:
-        l = indices == NULL ? count(x) : l;
+        l = indices == NULL ? ops_count(x) : l;
         k = ray_key(x);
         v = ray_get(k);
         drop(k);
         if (is_error(v))
             return v;
 
-        g = group(as_i64(enum_val(x)), indices, l);
+        g = ops_group(as_i64(enum_val(x)), indices, l);
         drop(v);
         l = as_list(g)[0]->len;
         res = vector(TYPE_SYMBOL, l);
