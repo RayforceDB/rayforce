@@ -32,28 +32,28 @@
 #include "items.h"
 #include "guid.h"
 
-obj_t ray_cast(obj_t x, obj_t y)
+obj_t ray_as(obj_t x, obj_t y)
 {
     type_t type;
     obj_t err;
     str_t fmt, msg;
 
     if (x->type != -TYPE_SYMBOL)
-        throw(ERR_TYPE, "cast: first argument must be a symbol");
+        throw(ERR_TYPE, "as: first argument must be a symbol");
 
     type = env_get_type_by_typename(&runtime_get()->env, x->i64);
 
     if (type == TYPE_ERROR)
     {
         fmt = obj_fmt(x);
-        msg = str_fmt(0, "cast: unknown type: '%s'", fmt);
+        msg = str_fmt(0, "as: not a type: '%s", fmt);
         err = error(ERR_TYPE, msg);
         heap_free(fmt);
         heap_free(msg);
         return err;
     }
 
-    return cast(type, y);
+    return as(type, y);
 }
 
 obj_t ray_til(obj_t x)

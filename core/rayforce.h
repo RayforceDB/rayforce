@@ -217,7 +217,7 @@ extern i64_t find_obj(obj_t obj, obj_t val); // find object in a list, return in
 extern i64_t find_sym(obj_t obj, str_t str); // find interned string in a symbol vector, return index (obj->len if not found)
 
 // Cast
-extern obj_t cast(type_t type, obj_t obj);   // cast object x o a type
+extern obj_t as(type_t type, obj_t obj);   // as object x o a type
 
 // Comparison
 extern i32_t objcmp(obj_t a, obj_t b);

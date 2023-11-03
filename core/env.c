@@ -156,7 +156,7 @@ nil_t init_functions(obj_t functions)
     regf(functions,  "sect",      TYPE_BINARY,   FN_ATOMIC,         ray_sect);
     regf(functions,  "except",    TYPE_BINARY,   FN_ATOMIC,         ray_except);
     regf(functions,  "rand",      TYPE_BINARY,   FN_ATOMIC,         ray_rand);
-    regf(functions,  "as",        TYPE_BINARY,   FN_NONE,           ray_cast);
+    regf(functions,  "as",        TYPE_BINARY,   FN_NONE,           ray_as);
     regf(functions,  "xasc",      TYPE_BINARY,   FN_NONE,           ray_xasc);
     regf(functions,  "xdesc",     TYPE_BINARY,   FN_NONE,           ray_xdesc);
     regf(functions,  "enum",      TYPE_BINARY,   FN_NONE,           ray_enum);

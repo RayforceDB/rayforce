@@ -235,7 +235,7 @@ obj_t ray_get(obj_t x)
             for (i = 0; i < l; i++)
             {
                 v = at_idx(keys, i);
-                s = cast(TYPE_CHAR, v);
+                s = as(TYPE_CHAR, v);
                 col = ray_concat(x, s);
                 val = ray_get(col);
 

@@ -29,7 +29,7 @@
 obj_t ray_dict(obj_t x, obj_t y);
 obj_t ray_table(obj_t x, obj_t y);
 obj_t ray_rand(obj_t x, obj_t y);
-obj_t ray_cast(obj_t x, obj_t y);
+obj_t ray_as(obj_t x, obj_t y);
 obj_t ray_enum(obj_t x, obj_t y);
 obj_t ray_vecmap(obj_t x, obj_t y);
 obj_t ray_listmap(obj_t x, obj_t y);

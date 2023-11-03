@@ -662,7 +662,7 @@ obj_t ray_set(obj_t x, obj_t y)
                 }
 
                 p = at_idx(as_list(y)[0], i);
-                s = cast(TYPE_CHAR, p);
+                s = as(TYPE_CHAR, p);
                 col = ray_concat(x, s);
                 res = ray_set(col, v);
 

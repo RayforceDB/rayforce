@@ -892,7 +892,7 @@ i64_t find_sym(obj_t obj, str_t str)
     return find_raw(obj, &n);
 }
 
-obj_t cast(type_t type, obj_t obj)
+obj_t as(type_t type, obj_t obj)
 {
     obj_t res, err;
     u64_t i, l;
