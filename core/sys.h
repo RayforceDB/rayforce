@@ -21,37 +21,17 @@
  *   SOFTWARE.
  */
 
-#define _POSIX_C_SOURCE 1
+#ifndef SYS_H
+#define SYS_H
 
-#include "../core/runtime.h"
-#include "../core/format.h"
-#include "../core/util.h"
-#include "../core/sys.h"
+#include "rayforce.h"
 
-#define LINE_SIZE 2048
-#define PROMPT "> "
-#define LOGO "\
-  RayforceDB: %d.%d %s\n\
-  %s %d(MB)\n\
-  Documentation: https://rayforcedb.com/\n\
-  Github: https://github.com/singaraiona/rayforce\n"
-
-nil_t print_logo()
+typedef struct sys_info_t
 {
-    sys_info_t nfo = get_sys_info();
-    str_t logo = str_fmt(0, LOGO, RAYFORCE_MAJOR_VERSION, RAYFORCE_MINOR_VERSION, __DATE__, nfo.cpu, nfo.mem);
-    printf("%s%s%s", BOLD, logo, RESET);
-    heap_free(logo);
-}
+    char_t cpu[256];
+    i32_t mem;
+} sys_info_t;
 
-i32_t main(i32_t argc, str_t argv[])
-{
-    i32_t code = -1;
+sys_info_t get_sys_info();
 
-    runtime_init(argc, argv);
-    print_logo();
-    code = runtime_run();
-    runtime_cleanup();
-
-    return code;
-}
+#endif // SYS_H
