@@ -226,7 +226,7 @@ obj_t ray_get(obj_t x)
             if (keys->type != TYPE_SYMBOL)
             {
                 drop(keys);
-                throw(ERR_TYPE, "get: expected table schema as a symbol vector, got: %d", keys->type);
+                throw(ERR_TYPE, "get: expected table schema as a symbol vector, got: '%s", typename(keys->type));
             }
 
             l = keys->len;
@@ -323,7 +323,7 @@ obj_t ray_get(obj_t x)
                 {
                     drop(keys);
                     mmap_free(res, size);
-                    throw(ERR_TYPE, "get: expected anymap schema as a byte vector, got: %d", keys->type);
+                    throw(ERR_TYPE, "get: expected anymap schema as a byte vector, got: '%s", typename(keys->type));
                 }
 
                 ((obj_t)((str_t)res - PAGE_SIZE))->obj = keys;
@@ -335,6 +335,6 @@ obj_t ray_get(obj_t x)
         }
 
     default:
-        throw(ERR_TYPE, "get: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "get: unsupported type: '%s", typename(x->type));
     }
 }

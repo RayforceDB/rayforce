@@ -60,7 +60,7 @@ obj_t ray_distinct(obj_t x)
         res->type = TYPE_SYMBOL;
         return res;
     default:
-        throw(ERR_TYPE, "distinct: invalid type: %d", x->type);
+        throw(ERR_TYPE, "distinct: invalid type: '%s", typename(x->type));
     }
 }
 
@@ -103,7 +103,7 @@ dispatch:
         x = as_list(x)[0];
         goto dispatch;
     default:
-        throw(ERR_TYPE, "group: invalid type: %d", x->type);
+        throw(ERR_TYPE, "group: invalid type: '%s", typename(x->type));
     }
 
     l = as_list(g)[0]->len;

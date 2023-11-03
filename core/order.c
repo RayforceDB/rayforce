@@ -44,7 +44,7 @@ obj_t ray_iasc(obj_t x)
         return res;
 
     default:
-        throw(ERR_TYPE, "iasc: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "iasc: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -64,7 +64,7 @@ obj_t ray_idesc(obj_t x)
         return res;
 
     default:
-        throw(ERR_TYPE, "idesc: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "idesc: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -95,7 +95,7 @@ obj_t ray_asc(obj_t x)
         return res;
 
     default:
-        throw(ERR_TYPE, "asc: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "asc: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -126,7 +126,7 @@ obj_t ray_desc(obj_t x)
         return res;
 
     default:
-        throw(ERR_TYPE, "desc: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "desc: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -154,7 +154,7 @@ obj_t ray_xasc(obj_t x, obj_t y)
 
         return res;
     default:
-        throw(ERR_TYPE, "xasc: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "xasc: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -182,7 +182,7 @@ obj_t ray_xdesc(obj_t x, obj_t y)
 
         return res;
     default:
-        throw(ERR_TYPE, "xdesc: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "xdesc: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -206,7 +206,7 @@ obj_t ray_not(obj_t x)
         return res;
 
     default:
-        throw(ERR_TYPE, "not: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "not: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -237,6 +237,6 @@ obj_t ray_neg(obj_t x)
         return res;
 
     default:
-        throw(ERR_TYPE, "neg: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "neg: unsupported type: '%s", typename(x->type));
     }
 }

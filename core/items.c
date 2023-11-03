@@ -418,7 +418,7 @@ obj_t ray_find(obj_t x, obj_t y)
 
         return res;
     default:
-        throw(ERR_TYPE, "find: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "find: unsupported types: '%s '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -555,7 +555,7 @@ obj_t ray_filter(obj_t x, obj_t y)
         return table(clone(as_list(x)[0]), res);
 
     default:
-        throw(ERR_TYPE, "filter: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "filter: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -854,7 +854,7 @@ obj_t ray_take(obj_t x, obj_t y)
         return res;
 
     default:
-        throw(ERR_TYPE, "take: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "take: unsupported types: '%s, %s", typename(x->type), typename(y->type));
     }
 }
 
@@ -894,7 +894,7 @@ obj_t ray_in(obj_t x, obj_t y)
             return vec;
 
         default:
-            throw(ERR_TYPE, "in: unsupported types: %d %d", x->type, y->type);
+            throw(ERR_TYPE, "in: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
         }
 
     return null(0);
@@ -914,7 +914,7 @@ obj_t ray_sect(obj_t x, obj_t y)
         return res;
 
     default:
-        throw(ERR_TYPE, "sect: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "sect: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 
     return null(0);
@@ -950,7 +950,7 @@ obj_t ray_except(obj_t x, obj_t y)
         drop(nmask);
         return res;
     default:
-        throw(ERR_TYPE, "except: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "except: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -1172,6 +1172,6 @@ obj_t ray_where(obj_t x)
         return res;
 
     default:
-        throw(ERR_TYPE, "where: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "where: unsupported type: '%s", typename(x->type));
     }
 }

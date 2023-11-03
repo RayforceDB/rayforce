@@ -400,7 +400,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "add: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "add: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -778,7 +778,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "sub: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "sub: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -1154,7 +1154,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "mul: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "mul: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -1530,7 +1530,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "div: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "div: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -1906,7 +1906,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "add: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "add: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -2281,7 +2281,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "add: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "add: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -2348,7 +2348,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "sum: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "sum: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -2419,7 +2419,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "avg: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "avg: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -2514,7 +2514,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "min: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "min: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -2600,7 +2600,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "max: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "max: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -2648,7 +2648,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "round: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "round: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -2696,7 +2696,7 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "floor: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "floor: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -2744,6 +2744,6 @@ dispatch:
             goto dispatch;
         }
 
-        throw(ERR_TYPE, "ceil: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "ceil: unsupported type: '%s", typename(x->type));
     }
 }

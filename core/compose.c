@@ -125,7 +125,7 @@ obj_t ray_reverse(obj_t x)
         return res;
 
     default:
-        throw(ERR_TYPE, "reverse: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "reverse: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -275,7 +275,7 @@ obj_t ray_guid(obj_t x)
         return vec;
 
     default:
-        throw(ERR_TYPE, "guid: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "guid: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -335,7 +335,7 @@ obj_t ray_enum(obj_t x, obj_t y)
 
         return venum(clone(x), v);
     default:
-        throw(ERR_TYPE, "enum: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "enum: unsupported types: '%s '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -411,7 +411,7 @@ obj_t ray_rand(obj_t x, obj_t y)
         return vec;
 
     default:
-        throw(ERR_TYPE, "rand: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "rand: unsupported types: '%s '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -608,6 +608,6 @@ obj_t ray_concat(obj_t x, obj_t y)
             return vec;
         }
 
-        throw(ERR_TYPE, "join: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "concat: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }

@@ -374,7 +374,7 @@ obj_t push_obj(obj_t *obj, obj_t val)
             return res;
         }
 
-        throw(ERR_TYPE, "join: invalid types: %d, %d", (*obj)->type, val->type);
+        throw(ERR_TYPE, "push_obj: invalid types: '%s, '%s", typename((*obj)->type), typename(val->type));
     }
 }
 
@@ -449,7 +449,7 @@ obj_t ins_obj(obj_t *obj, i64_t idx, obj_t val)
         ret = ins_raw(obj, idx, &val);
         break;
     default:
-        throw(ERR_TYPE, "write obj: invalid type: %d", (*obj)->type);
+        throw(ERR_TYPE, "write_obj: invalid type: '%s", typename((*obj)->type));
     }
 
     return ret;
@@ -580,7 +580,7 @@ dispatch:
         return res;
 
     default:
-        throw(ERR_TYPE, "at_idx: invalid type: %d", obj->type);
+        throw(ERR_TYPE, "at_idx: invalid type: '%s", typename(obj->type));
     }
 }
 
@@ -614,7 +614,7 @@ obj_t at_obj(obj_t obj, obj_t idx)
             return at_idx(as_list(obj)[1], i);
         }
 
-        throw(ERR_TYPE, "at_obj: invalid type: %d", obj->type);
+        throw(ERR_TYPE, "at_obj: invalid type: '%s", typename(obj->type));
     }
 }
 
@@ -644,7 +644,7 @@ obj_t set_idx(obj_t *obj, i64_t idx, obj_t val)
             return *obj;
         }
 
-        throw(ERR_TYPE, "set_idx: invalid types: %d, %d", (*obj)->type, val->type);
+        throw(ERR_TYPE, "set_idx: invalid types: '%s, '%s", typename((*obj)->type), typename(val->type));
     }
 }
 
@@ -685,7 +685,7 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
             return *obj;
         }
 
-        throw(ERR_TYPE, "set_obj: invalid types: %d, %d", (*obj)->type, val->type);
+        throw(ERR_TYPE, "set_obj: invalid types: '%s, '%s", typename((*obj)->type), typename(val->type));
     }
 }
 
@@ -982,9 +982,7 @@ obj_t cast(type_t type, obj_t obj)
             as_timestamp(res)[i] = as_i64(obj)[i];
         return res;
     default:
-        msg = str_fmt(0, "invalid conversion from '%s' to '%s'",
-                      symtostr(env_get_typename_by_type(&runtime_get()->env, obj->type)),
-                      symtostr(env_get_typename_by_type(&runtime_get()->env, type)));
+        msg = str_fmt(0, "invalid conversion from '%s to '%s", typename(obj->type), typename(type));
         err = error(ERR_TYPE, msg);
         heap_free(msg);
         return err;
@@ -1276,4 +1274,9 @@ obj_t eval_str(i64_t fd, str_t name, str_t str)
     parser->input = "";
 
     return res;
+}
+
+str_t typename(type_t type)
+{
+    return symtostr(env_get_typename_by_type(&runtime_get()->env, type));
 }

@@ -856,10 +856,10 @@ obj_t ray_set(obj_t x, obj_t y)
                 return clone(x);
             }
 
-            throw(ERR_TYPE, "set: unsupported types: %d %d", x->type, y->type);
+            throw(ERR_TYPE, "set: unsupported types: %d %d", typename(x->type), typename(y->type));
         }
 
     default:
-        throw(ERR_TYPE, "set: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "set: unsupported types: %d %d", typename(x->type), typename(y->type));
     }
 }

@@ -123,7 +123,7 @@ obj_t ray_eq(obj_t x, obj_t y)
         return vec;
 
     default:
-        throw(ERR_TYPE, "eq: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "eq: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -197,7 +197,7 @@ obj_t ray_ne(obj_t x, obj_t y)
         return vec;
 
     default:
-        throw(ERR_TYPE, "ne: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "ne: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -268,7 +268,7 @@ obj_t ray_lt(obj_t x, obj_t y)
         return vec;
 
     default:
-        throw(ERR_TYPE, "lt: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "lt: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -339,7 +339,7 @@ obj_t ray_le(obj_t x, obj_t y)
         return vec;
 
     default:
-        throw(ERR_TYPE, "le: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "le: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -410,7 +410,7 @@ obj_t ray_gt(obj_t x, obj_t y)
         return vec;
 
     default:
-        throw(ERR_TYPE, "gt: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "gt: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }
 
@@ -481,6 +481,6 @@ obj_t ray_ge(obj_t x, obj_t y)
         return vec;
 
     default:
-        throw(ERR_TYPE, "ge: unsupported types: %d %d", x->type, y->type);
+        throw(ERR_TYPE, "ge: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
     }
 }

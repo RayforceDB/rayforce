@@ -103,7 +103,7 @@ obj_t ray_read(obj_t x)
 
         return res;
     default:
-        throw(ERR_TYPE, "read: unsupported type: %d", x->type);
+        throw(ERR_TYPE, "read: unsupported type: '%s", typename(x->type));
     }
 }
 
@@ -198,7 +198,7 @@ obj_t parse_csv_field(type_t type, str_t start, str_t end, i64_t row, obj_t out)
         as_list(out)[row] = string_from_str(start, end - start);
         break;
     default:
-        throw(ERR_TYPE, "csv: unsupported type: %d", type);
+        throw(ERR_TYPE, "csv: unsupported type: '%s", typename(type));
     }
 
     return null(0);
@@ -280,11 +280,11 @@ obj_t ray_csv(obj_t *x, i64_t n)
     case 2:
         // expect vector of types as 1st arg:
         if (x[0]->type != TYPE_SYMBOL)
-            throw(ERR_TYPE, "csv: expected vector of types as 1st argument, got: %d", x[0]->type);
+            throw(ERR_TYPE, "csv: expected vector of types as 1st argument, got: '%s", typename(x[0]->type));
 
         // expect string as 2nd arg:
         if (x[1]->type != TYPE_CHAR)
-            throw(ERR_TYPE, "csv: expected string as 2nd argument, got: %d", x[1]->type);
+            throw(ERR_TYPE, "csv: expected string as 2nd argument, got: '%s", typename(x[1]->type));
 
         // check that all symbols are valid typenames and convert them to types
         l = x[0]->len;
@@ -295,7 +295,7 @@ obj_t ray_csv(obj_t *x, i64_t n)
             if (type == TYPE_ERROR)
             {
                 drop(types);
-                throw(ERR_TYPE, "csv: invalid type: %s", symtostr(as_symbol(x[0])[i]));
+                throw(ERR_TYPE, "csv: invalid type: '%s", symtostr(as_symbol(x[0])[i]));
             }
 
             if (type < 0)
