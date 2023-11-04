@@ -40,6 +40,34 @@
 __thread u64_t __RND_SEED__ = 0;
 
 /*
+ * Treat obj as a bool
+ */
+bool_t ops_as_bool(obj_t x)
+{
+    switch (x->type)
+    {
+    case -TYPE_BOOL:
+        return x->bool;
+    case -TYPE_BYTE:
+    case -TYPE_CHAR:
+        return x->u8 != 0;
+    case -TYPE_I64:
+    case -TYPE_SYMBOL:
+    case -TYPE_TIMESTAMP:
+        return x->i64 != 0;
+    case TYPE_BOOL:
+    case TYPE_BYTE:
+    case TYPE_CHAR:
+    case TYPE_I64:
+    case TYPE_SYMBOL:
+    case TYPE_TIMESTAMP:
+    case TYPE_LIST:
+        return x->len != 0;
+    default:
+        return true;
+    }
+}
+/*
  * In case of using -Ofast compiler flag, we can not just use x != x due to
  * compiler optimizations. So we need to use memcpy to get the bits of the x
  * and then separate check mantissa and exponent.

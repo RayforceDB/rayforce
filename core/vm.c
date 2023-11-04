@@ -76,8 +76,8 @@ obj_t __attribute__((hot)) vm_exec(vm_t *vm, obj_t fun)
     u8_t n, attrs;
     register u64_t i, j, l;
     register i32_t sp, bp, ip;
-    volatile i32_t b;
-    volatile u64_t a;
+    i32_t b;
+    u64_t a;
 
     // init registers
     vm->ip = 0;
@@ -195,7 +195,7 @@ op_jne:
     vm->ip++;
     arg[0] = stack_pop();
     load_u64(l, vm);
-    if (!as_bool(arg[0]))
+    if (!ops_as_bool(arg[0]))
         vm->ip = l;
     drop(arg[0]);
     dispatch();
