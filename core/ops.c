@@ -330,8 +330,11 @@ nil_t ops_hash_list(obj_t obj, u64_t out[], u64_t len, u64_t seed)
         }
         else
         {
-            out[i] = hashu64(*(u64_t *)&g64v[i], out[i]);
-            out[i] = hashu64(*((u64_t *)&g64v[i] + 1), out[i]);
+            for (i = 0; i < len; i++)
+            {
+                out[i] = hashu64(*(u64_t *)&g64v[i], out[i]);
+                out[i] = hashu64(*((u64_t *)&g64v[i] + 1), out[i]);
+            }
         }
         break;
     case TYPE_LIST:
