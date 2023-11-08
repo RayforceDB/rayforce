@@ -476,7 +476,7 @@ obj_t ops_find(i64_t x[], u64_t xl, i64_t y[], u64_t yl)
     return vec;
 }
 
-obj_t ops_group(i64_t values[], i64_t indices[], i64_t len)
+obj_t ops_group_raw(i64_t values[], i64_t indices[], i64_t len)
 {
     i64_t i, j, n, m, l, idx, min, max, range, *hk, *hv;
     obj_t keys, vals, ht, *vv;

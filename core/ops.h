@@ -94,7 +94,7 @@ bool_t ops_is_nan(f64_t x);
 u64_t ops_rand_u64();
 obj_t ops_distinct_raw(i64_t values[], i64_t indices[], u64_t len);
 obj_t ops_distinct_obj(obj_t values[], i64_t indices[], u64_t len);
-obj_t ops_group(i64_t values[], i64_t indices[], i64_t len);
+obj_t ops_group_raw(i64_t values[], i64_t indices[], i64_t len);
 u64_t ops_count(obj_t x);
 bool_t ops_eq_idx(obj_t a, i64_t ai, obj_t b, i64_t bi);
 u64_t ops_hash_obj(obj_t obj);

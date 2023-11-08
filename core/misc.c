@@ -95,12 +95,12 @@ dispatch:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
         l = indices == NULL ? x->len : l;
-        res = ops_group(as_i64(x), indices, l);
+        res = ops_group_raw(as_i64(x), indices, l);
         as_list(res)[0]->type = x->type;
         return res;
     case TYPE_ENUM:
         l = indices == NULL ? ops_count(x) : l;
-        res = ops_group(as_i64(enum_val(x)), indices, l);
+        res = ops_group_raw(as_i64(enum_val(x)), indices, l);
         as_list(res)[0] = venum(ray_key(x), as_list(res)[0]);
         return res;
     case TYPE_VECMAP:
