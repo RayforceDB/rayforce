@@ -133,9 +133,16 @@ obj_t ops_distinct_raw(i64_t values[], i64_t indices[], u64_t len)
         out = as_i64(vec);
         memset(out, 0, sizeof(i64_t) * range);
 
-        for (i = 0; i < len; i++)
-            out[values[i] - min]++;
-
+        if (indices)
+        {
+            for (i = 0; i < len; i++)
+                out[values[indices[i]] - min]++;
+        }
+        else
+        {
+            for (i = 0; i < len; i++)
+                out[values[i] - min]++;
+        }
         // compact keys
         for (i = 0, j = 0; i < range; i++)
         {

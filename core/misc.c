@@ -60,11 +60,17 @@ dispatch:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
         l = indices == NULL ? x->len : l;
-        res = ops_distinct_raw(as_i64(x), indices, x->len);
+        res = ops_distinct_raw(as_i64(x), indices, l);
         res->type = x->type;
         return res;
+    case TYPE_ENUM:
+        l = indices == NULL ? ops_count(x) : l;
+        res = ops_distinct_raw(as_i64(enum_val(x)), indices, l);
+        res = venum(ray_key(x), res);
+        return res;
     case TYPE_LIST:
-        res = ops_distinct_obj(as_list(x), indices, x->len);
+        l = indices == NULL ? ops_count(x) : l;
+        res = ops_distinct_obj(as_list(x), indices, l);
         return res;
     case TYPE_VECMAP:
         l = as_list(x)[1]->len;
