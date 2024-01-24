@@ -43,6 +43,36 @@
 #include "error.h"
 #include "query.h"
 #include "index.h"
+#include "group.h"
+
+obj_t call_unary(u8_t attrs, unary_f f, obj_t x)
+{
+    obj_t v, res;
+
+    if (x->type == TYPE_GROUPMAP)
+    {
+        if (attrs & FN_AGGR)
+            return f(x);
+        else
+        {
+            v = group_collect(x);
+            if (attrs & FN_ATOMIC)
+            {
+                res = call_unary_atomic(attrs, f, v);
+                drop(v);
+                return res;
+            }
+            else
+            {
+                res = f(v);
+                drop(v);
+                return res;
+            }
+        }
+    }
+
+    return f(x);
+}
 
 // Atomic unary functions (iterates through list of argument items down to atoms)
 obj_t call_unary_atomic(u8_t attrs, unary_f f, obj_t x)
@@ -119,7 +149,7 @@ obj_t call_unary_atomic(u8_t attrs, unary_f f, obj_t x)
         return res;
 
     default:
-        return f(x);
+        return call_unary(attrs, f, x);
     }
 }
 
@@ -131,7 +161,7 @@ obj_t ray_call_unary(u8_t attrs, unary_f f, obj_t x)
     if (attrs & FN_ATOMIC)
         return call_unary_atomic(attrs, f, x);
 
-    return f(x);
+    return call_unary(attrs, f, x);
 }
 
 obj_t ray_get(obj_t x)

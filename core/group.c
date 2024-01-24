@@ -29,11 +29,15 @@
 #include "aggr.h"
 
 /*
- * result is a list:
- *   [0] - groups number
- *   [1] - bins
- *   [2] - filters
- *   [3] - count of each group
+ * group index is a list:
+ * [0] - groups number
+ * [1] - bins
+ * [2] - count of each group
+ * --
+ * result is a list
+ * [0] - indexed object
+ * [1] - group index (see above)
+ * [2] - filters
  */
 obj_t __group(obj_t x, obj_t y, obj_t z)
 {
@@ -54,7 +58,7 @@ obj_t __group(obj_t x, obj_t y, obj_t z)
         return table(clone(as_list(x)[0]), res);
 
     default:
-        res = vn_list(4, clone(x), clone(y), clone(z), NULL);
+        res = vn_list(3, clone(x), clone(y), clone(z));
         res->type = TYPE_GROUPMAP;
         return res;
     }
@@ -110,15 +114,18 @@ obj_t group_map(obj_t *aggr, obj_t x, obj_t y, obj_t z)
     return res;
 }
 
-obj_t group_collect(obj_t obj, obj_t grp)
+obj_t group_collect(obj_t x)
 {
     u64_t i, l, m, n;
-    obj_t bins, res, group_counts;
+    obj_t obj, grp, bins, res, group_counts;
     i64_t *cnts, *grps, *ids;
+
+    obj = as_list(x)[0];
+    grp = as_list(x)[1];
 
     // Count groups
     // TODO: this point must be synchronized in case of parallel execution
-    group_counts = as_list(grp)[3];
+    group_counts = as_list(grp)[2];
     if (group_counts == NULL)
     {
         n = as_list(grp)[0]->i64;
@@ -130,7 +137,7 @@ obj_t group_collect(obj_t obj, obj_t grp)
         for (i = 0; i < l; i++)
             grps[ids[i]]++;
 
-        as_list(grp)[3] = group_counts;
+        as_list(grp)[2] = group_counts;
     }
     // --
 

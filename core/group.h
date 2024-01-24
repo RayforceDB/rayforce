@@ -27,6 +27,6 @@
 #include "rayforce.h"
 
 obj_t group_map(obj_t *aggr, obj_t x, obj_t y, obj_t z);
-obj_t group_collect(obj_t obj, obj_t grp);
+obj_t group_collect(obj_t x);
 
 #endif // GROUP_H

@@ -378,6 +378,14 @@ obj_t ray_select(obj_t obj)
             return val;
         }
 
+        // Materialize groupmaps
+        if (val->type == TYPE_GROUPMAP)
+        {
+            prm = group_collect(val);
+            drop(val);
+            val = prm;
+        }
+
         ins_obj(&vals, i, val);
     }
 
@@ -399,5 +407,9 @@ obj_t ray_select(obj_t obj)
     unmount_env(tablen);
     drop(tab);
 
-    return table(keys, vals);
+    val = ray_table(keys, vals);
+    drop(keys);
+    drop(vals);
+
+    return val;
 }

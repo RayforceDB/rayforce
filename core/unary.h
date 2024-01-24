@@ -28,6 +28,7 @@
 #include "ops.h"
 
 obj_t ray_call_unary(u8_t attrs, unary_f f, obj_t x);
+obj_t call_unary_atomic(u8_t attrs, unary_f f, obj_t x);
 obj_t ray_get(obj_t x);
 obj_t ray_time(obj_t x);
 obj_t ray_bins(obj_t x);

@@ -148,12 +148,12 @@ obj_t ray_table(obj_t x, obj_t y)
     obj_t lst, c, l = null(0);
 
     if (x->type != TYPE_SYMBOL)
-        return error_str(ERR_TYPE, "Keys must be a symbol vector");
+        return error_str(ERR_TYPE, "table: keys must be a symbol vector");
 
     if (y->type != TYPE_LIST)
     {
         if (x->len != 1)
-            return error_str(ERR_LENGTH, "Keys and Values must have the same length");
+            return error_str(ERR_LENGTH, "table: keys and values must have the same length");
 
         l = vn_list(1);
         as_list(l)[0] = clone(y);
@@ -163,7 +163,7 @@ obj_t ray_table(obj_t x, obj_t y)
     if (x->len != y->len && y->len > 0)
     {
         drop(l);
-        return error_str(ERR_LENGTH, "Keys and Values must have the same length");
+        return error_str(ERR_LENGTH, "table: keys and values must have the same length");
     }
 
     len = y->len;
@@ -193,28 +193,20 @@ obj_t ray_table(obj_t x, obj_t y)
         case TYPE_GUID:
             j = as_list(y)[i]->len;
             if (cl != 0 && j != cl)
-                return error_str(ERR_LENGTH, "Values must be of the same length");
+                return error_str(ERR_LENGTH, "table: values must be of the same length");
 
             cl = j;
             break;
         case TYPE_ENUM:
-        case TYPE_FILTERMAP:
             synergy = false;
             j = as_list(as_list(y)[i])[1]->len;
             if (cl != 0 && j != cl)
-                return error_str(ERR_LENGTH, "Values must be of the same length");
+                return error_str(ERR_LENGTH, "table: values must be of the same length");
 
             cl = j;
             break;
-        case TYPE_GROUPMAP:
-            synergy = false;
-            j = as_list(as_list(y)[i])[1]->len;
-            if (cl != 0 && j != cl)
-                return error_str(ERR_LENGTH, "Values must be of the same length");
-            cl = j;
-            break;
         default:
-            return error_str(ERR_TYPE, "Unsupported type in a Values list");
+            return error_str(ERR_TYPE, "table: unsupported type in a values list");
         }
     }
 
