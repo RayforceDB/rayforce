@@ -111,21 +111,21 @@ obj_t group_by(obj_t x, obj_t y, obj_t z)
     case TYPE_BOOL:
     case TYPE_BYTE:
     case TYPE_CHAR:
-        bins = index_bins_i8((i8_t *)as_u8(x), ids, l);
+        bins = index_group_i8((i8_t *)as_u8(x), ids, l);
         break;
     case TYPE_I64:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
-        bins = index_bins_i64(as_i64(x), ids, l);
+        bins = index_group_i64(as_i64(x), ids, l);
         break;
     case TYPE_F64:
-        bins = index_bins_i64((i64_t *)as_f64(x), ids, l);
+        bins = index_group_i64((i64_t *)as_f64(x), ids, l);
         break;
     case TYPE_GUID:
-        bins = index_bins_guid(as_guid(x), ids, l);
+        bins = index_group_guid(as_guid(x), ids, l);
         break;
     case TYPE_LIST:
-        bins = index_bins_obj(as_list(x), ids, l);
+        bins = index_group_obj(as_list(x), ids, l);
         break;
     default:
         throw(ERR_TYPE, "'by' unable to group by: %s", typename(x->type));

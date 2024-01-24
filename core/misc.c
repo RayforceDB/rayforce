@@ -129,7 +129,7 @@ obj_t ray_group(obj_t x)
     case TYPE_I64:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
-        g = index_bins_i64(as_i64(x), NULL, ops_count(x));
+        g = index_group_i64(as_i64(x), NULL, ops_count(x));
         l = as_list(g)[0]->i64;
         k = vector(x->type, l);
         v = list(l);
@@ -159,7 +159,7 @@ obj_t ray_group(obj_t x)
         return dict(k, v);
 
     case TYPE_F64:
-        g = index_bins_i64((i64_t *)as_f64(x), NULL, ops_count(x));
+        g = index_group_i64((i64_t *)as_f64(x), NULL, ops_count(x));
         l = as_list(g)[0]->i64;
         k = vector_f64(l);
         v = list(l);
@@ -187,7 +187,7 @@ obj_t ray_group(obj_t x)
 
         return dict(k, v);
     case TYPE_ENUM:
-        g = index_bins_i64(as_i64(enum_val(x)), NULL, ops_count(x));
+        g = index_group_i64(as_i64(enum_val(x)), NULL, ops_count(x));
         l = as_list(g)[0]->i64;
         k = vector(x->type, l);
         v = list(l);
@@ -216,7 +216,7 @@ obj_t ray_group(obj_t x)
 
         return dict(k, v);
     case TYPE_GUID:
-        g = index_bins_guid(as_guid(x), NULL, ops_count(x));
+        g = index_group_guid(as_guid(x), NULL, ops_count(x));
         l = as_list(g)[0]->i64;
         k = vector_guid(l);
         v = list(l);
@@ -246,7 +246,7 @@ obj_t ray_group(obj_t x)
         return dict(k, v);
 
     case TYPE_LIST:
-        g = index_bins_obj(as_list(x), NULL, ops_count(x));
+        g = index_group_obj(as_list(x), NULL, ops_count(x));
         l = as_list(g)[0]->i64;
         k = vector(TYPE_LIST, l);
         v = list(l);

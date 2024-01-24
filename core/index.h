@@ -26,19 +26,15 @@
 
 #include "rayforce.h"
 
-obj_t index_bins_i8(i8_t values[], i64_t indices[], u64_t len);
-obj_t index_bins_i64(i64_t values[], i64_t indices[], u64_t len);
-obj_t index_bins_guid(guid_t values[], i64_t indices[], u64_t len);
-obj_t index_bins_obj(obj_t values[], i64_t indices[], u64_t len);
+obj_t index_group_i8(i8_t values[], i64_t indices[], u64_t len);
+obj_t index_group_i64(i64_t values[], i64_t indices[], u64_t len);
+obj_t index_group_guid(guid_t values[], i64_t indices[], u64_t len);
+obj_t index_group_obj(obj_t values[], i64_t indices[], u64_t len);
 i64_t index_range(i64_t *pmin, i64_t *pmax, i64_t values[], i64_t indices[], u64_t len);
 obj_t index_distinct_i8(i8_t values[], i64_t indices[], u64_t len);
 obj_t index_distinct_i64(i64_t values[], i64_t indices[], u64_t len);
 obj_t index_distinct_guid(guid_t values[], i64_t indices[], u64_t len);
 obj_t index_distinct_obj(obj_t values[], i64_t indices[], u64_t len);
-obj_t index_group_i8(i8_t values[], i64_t indices[], u64_t len);
-obj_t index_group_i64(i64_t values[], i64_t indices[], u64_t len);
-obj_t index_group_guid(guid_t values[], i64_t indices[], u64_t len);
-obj_t index_group_obj(obj_t values[], i64_t indices[], u64_t len);
 obj_t index_group_cnts(obj_t grp);
 
 #endif // INDEX_H

@@ -226,7 +226,7 @@ i64_t index_range(i64_t *pmin, i64_t *pmax, i64_t values[], i64_t indices[], u64
     return max - min + 1;
 }
 
-obj_t index_bins_i8(i8_t values[], i64_t indices[], u64_t len)
+obj_t index_group_i8(i8_t values[], i64_t indices[], u64_t len)
 {
     u64_t i, j, n, range;
     i64_t min, *hk, *hv;
@@ -273,7 +273,7 @@ obj_t index_bins_i8(i8_t values[], i64_t indices[], u64_t len)
     return vn_list(2, i64(j), vals);
 }
 
-obj_t index_bins_i64(i64_t values[], i64_t indices[], u64_t len)
+obj_t index_group_i64(i64_t values[], i64_t indices[], u64_t len)
 {
     u64_t i, j, n, range;
     i64_t idx, min, max, *hk, *hv, *hp;
@@ -384,7 +384,7 @@ obj_t index_bins_i64(i64_t values[], i64_t indices[], u64_t len)
     return vn_list(2, i64(j), vals);
 }
 
-obj_t index_bins_guid(guid_t values[], i64_t indices[], u64_t len)
+obj_t index_group_guid(guid_t values[], i64_t indices[], u64_t len)
 {
     u64_t i, j, n;
     i64_t idx, *hk, *hv, *hp;
@@ -449,7 +449,7 @@ obj_t index_bins_guid(guid_t values[], i64_t indices[], u64_t len)
     return vn_list(2, i64(j), vals);
 }
 
-obj_t index_bins_obj(obj_t values[], i64_t indices[], u64_t len)
+obj_t index_group_obj(obj_t values[], i64_t indices[], u64_t len)
 {
     u64_t i, j, n;
     i64_t idx, *hk, *hv, *hp;
