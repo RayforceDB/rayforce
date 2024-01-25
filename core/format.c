@@ -396,7 +396,7 @@ i32_t error_fmt_into(str_t *dst, i32_t *len, i32_t *offset, i32_t limit, obj_t o
         error_desc = "unable to parse input";
         break;
     case ERR_EVAL:
-        error_desc = "unable to eval object";
+        error_desc = "object evaluation failed";
         break;
     case ERR_FORMAT:
         error_desc = "unable to format object";
