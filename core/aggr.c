@@ -149,6 +149,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
                     xo[n] = xi[i];
             }
         }
+
         return res;
     case TYPE_F64:
         xf = as_f64(val);

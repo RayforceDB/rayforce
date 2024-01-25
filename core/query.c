@@ -305,6 +305,15 @@ obj_t ray_select(obj_t obj)
         }
 
         prm = group_map(&bycol, groupby, tab, filters);
+
+        if (is_error(prm))
+        {
+            drop(filters);
+            drop(groupby);
+            drop(tab);
+            return prm;
+        }
+
         mount_env(prm);
 
         drop(prm);

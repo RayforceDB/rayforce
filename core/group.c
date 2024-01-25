@@ -81,6 +81,9 @@ obj_t group_map(obj_t *aggr, obj_t x, obj_t y, obj_t z)
         ids = NULL;
     }
 
+    if (l > ops_count(y))
+        throw(ERR_LENGTH, "'by': groups count: %lld can't be greater than source length: %lld", l, ops_count(y));
+
     switch (x->type)
     {
     case TYPE_BOOL:
@@ -118,10 +121,12 @@ obj_t group_collect(obj_t x)
 {
     u64_t i, l, m, n;
     obj_t obj, grp, bins, res, group_counts;
-    i64_t *cnts, *grps, *ids;
+    i64_t *cnts, *grps, *ids, *filters;
 
     obj = as_list(x)[0];
     grp = as_list(x)[1];
+
+    filters = (as_list(x)[2] != NULL) ? as_i64(as_list(x)[2]) : NULL;
 
     // Count groups
     // TODO: this point must be synchronized in case of parallel execution
@@ -152,6 +157,7 @@ obj_t group_collect(obj_t x)
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
         res = list(n);
+
         for (i = 0; i < n; i++)
         {
             m = cnts[i];
@@ -159,10 +165,21 @@ obj_t group_collect(obj_t x)
             as_list(res)[i]->len = 0;
         }
 
-        for (i = 0; i < l; i++)
+        if (filters)
         {
-            n = as_i64(bins)[i];
-            as_i64(as_list(res)[n])[as_list(res)[n]->len++] = as_i64(obj)[i];
+            for (i = 0; i < l; i++)
+            {
+                n = as_i64(bins)[i];
+                as_i64(as_list(res)[n])[as_list(res)[n]->len++] = as_i64(obj)[filters[i]];
+            }
+        }
+        else
+        {
+            for (i = 0; i < l; i++)
+            {
+                n = as_i64(bins)[i];
+                as_i64(as_list(res)[n])[as_list(res)[n]->len++] = as_i64(obj)[i];
+            }
         }
 
         return res;
