@@ -229,7 +229,7 @@ obj_t parse_csv_field(type_t type, str_t start, str_t end, i64_t row, obj_t out)
     return null(0);
 }
 
-obj_t parse_csv_line(type_t types[], i64_t cnt, str_t start, str_t end, i64_t row, obj_t cols)
+obj_t parse_csv_line(type_t types[], i64_t cnt, str_t start, str_t end, i64_t row, obj_t cols, char_t sep)
 {
     i64_t i, len;
     str_t prev, pos;
@@ -278,7 +278,7 @@ obj_t parse_csv_line(type_t types[], i64_t cnt, str_t start, str_t end, i64_t ro
             continue;
         }
 
-        pos = memchr(pos, ',', len);
+        pos = memchr(pos, sep, len);
         if (pos == NULL)
             pos = end;
 
@@ -299,10 +299,19 @@ obj_t ray_csv(obj_t *x, i64_t n)
     str_t buf, prev, pos, line;
     obj_t types, names, cols, res;
     type_t type;
+    char_t sep = ',';
 
     switch (n)
     {
     case 2:
+    case 3:
+        if (n == 3)
+        {
+            if (x[2]->type != -TYPE_CHAR)
+                throw(ERR_TYPE, "csv: expected 'char' as 3rd argument, got: '%s", typename(x[2]->type));
+
+            sep = x[2]->u8;
+        }
         // expect vector of types as 1st arg:
         if (x[0]->type != TYPE_SYMBOL)
             throw(ERR_TYPE, "csv: expected vector of types as 1st argument, got: '%s", typename(x[0]->type));
@@ -386,7 +395,7 @@ obj_t ray_csv(obj_t *x, i64_t n)
         for (i = 0; i < l; i++)
         {
             prev = pos;
-            pos = memchr(pos, ',', len);
+            pos = memchr(pos, sep, len);
             if (pos == NULL)
                 pos = prev + len;
             as_symbol(names)[i] = intern_symbol(prev, pos - prev);
@@ -420,7 +429,7 @@ obj_t ray_csv(obj_t *x, i64_t n)
         for (j = 0, prev = line; j < lines; j++)
         {
             line = memchr(prev, '\n', size);
-            res = parse_csv_line((type_t *)as_string(types), l, prev, line, j, cols);
+            res = parse_csv_line((type_t *)as_string(types), l, prev, line, j, cols, sep);
             if (!is_null(res))
             {
                 drop(types);

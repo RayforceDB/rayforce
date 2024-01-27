@@ -29,7 +29,7 @@
 /*
  * Creates new obj_tstring from a C string.
  */
-obj_t string_from_str(str_t str, i32_t len)
+obj_t string_from_str(str_t str, i64_t len)
 {
     obj_t s;
 
@@ -261,7 +261,7 @@ obj_t vn_vstring(str_t fmt, va_list args)
 {
     obj_t res = string(0);
     str_t dst = (str_t)res;
-    i32_t n, len = sizeof(struct obj_t), offset = sizeof(struct obj_t);
+    i64_t n, len = sizeof(struct obj_t), offset = sizeof(struct obj_t);
 
     n = str_vfmt_into(&dst, &len, &offset, 0, fmt, args);
 
