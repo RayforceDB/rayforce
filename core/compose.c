@@ -173,6 +173,7 @@ obj_t ray_table(obj_t x, obj_t y)
         switch (as_list(y)[i]->type)
         {
         case -TYPE_BOOL:
+        case -TYPE_BYTE:
         case -TYPE_I64:
         case -TYPE_F64:
         case -TYPE_CHAR:
@@ -184,6 +185,7 @@ obj_t ray_table(obj_t x, obj_t y)
             synergy = false;
             break;
         case TYPE_BOOL:
+        case TYPE_BYTE:
         case TYPE_I64:
         case TYPE_F64:
         case TYPE_TIMESTAMP:
@@ -228,6 +230,7 @@ obj_t ray_table(obj_t x, obj_t y)
         switch (as_list(y)[i]->type)
         {
         case -TYPE_BOOL:
+        case -TYPE_BYTE:
         case -TYPE_I64:
         case -TYPE_F64:
         case -TYPE_CHAR:

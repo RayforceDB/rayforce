@@ -175,6 +175,18 @@ obj_t parse_csv_field(type_t type, str_t start, str_t end, i64_t row, obj_t out)
 
     switch (type)
     {
+    case TYPE_BYTE:
+        if (start == NULL || end == NULL)
+        {
+            as_u8(out)[row] = 0;
+            break;
+        }
+        inum = strtoll(start, &end, 10);
+        if ((inum == LONG_MAX || inum == LONG_MIN) && errno == ERANGE)
+            as_u8(out)[row] = 0;
+        else
+            as_u8(out)[row] = inum;
+        break;
     case TYPE_I64:
         if (start == NULL || end == NULL)
         {

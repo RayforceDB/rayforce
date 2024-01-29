@@ -135,18 +135,11 @@ obj_t group_map(obj_t *aggr, obj_t x, obj_t y, obj_t z)
     return res;
 }
 
-obj_t group_collect(obj_t x)
+nil_t group_fill_counts(obj_t grp)
 {
-    u64_t i, l, m, n;
-    obj_t obj, grp, bins, k, v, res, group_counts;
-    i64_t *cnts, *grps, *ids, *filters;
+    obj_t group_counts;
+    i64_t *grps, *ids, n, l, i;
 
-    obj = as_list(x)[0];
-    grp = as_list(x)[1];
-
-    filters = (as_list(x)[2] != NULL) ? as_i64(as_list(x)[2]) : NULL;
-
-    // Count groups
     // TODO: this point must be synchronized in case of parallel execution
     group_counts = as_list(grp)[2];
     if (group_counts == NULL)
@@ -162,11 +155,24 @@ obj_t group_collect(obj_t x)
 
         as_list(grp)[2] = group_counts;
     }
-    // --
+}
 
-    cnts = as_i64(group_counts);
+obj_t group_collect(obj_t x)
+{
+    u64_t i, l, m, n;
+    obj_t obj, grp, bins, k, v, res;
+    i64_t *cnts, *filters;
+
+    obj = as_list(x)[0];
+    grp = as_list(x)[1];
+
+    filters = (as_list(x)[2] != NULL) ? as_i64(as_list(x)[2]) : NULL;
+
+    group_fill_counts(grp);
+
+    cnts = as_i64(as_list(grp)[2]);
     bins = as_list(grp)[1];
-    n = group_counts->len;
+    n = as_list(grp)[2]->len;
     l = bins->len;
 
     switch (obj->type)

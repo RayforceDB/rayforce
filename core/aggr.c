@@ -29,6 +29,7 @@
 #include "util.h"
 #include "items.h"
 #include "unary.h"
+#include "group.h"
 
 u64_t handle_filters(i64_t **ids, obj_t by, obj_t filter)
 {
@@ -51,7 +52,7 @@ u64_t handle_filters(i64_t **ids, obj_t by, obj_t filter)
 obj_t aggr_sum(obj_t val, obj_t bins, obj_t filter)
 {
     u64_t i, l, n;
-    i64_t *xi, *xb, *xo, *ids;
+    i64_t *xi, *xm, *xo, *ids;
     f64_t *xf, *fo;
     obj_t res;
 
@@ -64,7 +65,7 @@ obj_t aggr_sum(obj_t val, obj_t bins, obj_t filter)
     case TYPE_TIMESTAMP:
     case TYPE_SYMBOL:
         xi = as_i64(val);
-        xb = as_i64(as_list(bins)[1]);
+        xm = as_i64(as_list(bins)[1]);
         res = vector(val->type, n);
         xo = as_i64(res);
         for (i = 0; i < n; i++)
@@ -74,18 +75,18 @@ obj_t aggr_sum(obj_t val, obj_t bins, obj_t filter)
         {
             ids = as_i64(filter);
             for (i = 0; i < l; i++)
-                xo[xb[i]] = addi64(xo[xb[i]], xi[ids[i]]);
+                xo[xm[i]] = addi64(xo[xm[i]], xi[ids[i]]);
         }
         else
         {
             for (i = 0; i < l; i++)
-                xo[xb[i]] = addi64(xo[xb[i]], xi[i]);
+                xo[xm[i]] = addi64(xo[xm[i]], xi[i]);
         }
         return res;
     case TYPE_F64:
         xf = as_f64(val);
 
-        xb = as_i64(as_list(bins)[1]);
+        xm = as_i64(as_list(bins)[1]);
         res = vector_f64(n);
         fo = as_f64(res);
 
@@ -96,12 +97,12 @@ obj_t aggr_sum(obj_t val, obj_t bins, obj_t filter)
         {
             ids = as_i64(filter);
             for (i = 0; i < l; i++)
-                fo[xb[i]] = addf64(fo[xb[i]], xf[ids[i]]);
+                fo[xm[i]] = addf64(fo[xm[i]], xf[ids[i]]);
         }
         else
         {
             for (i = 0; i < l; i++)
-                fo[xb[i]] = addf64(fo[xb[i]], xf[i]);
+                fo[xm[i]] = addf64(fo[xm[i]], xf[i]);
         }
         return res;
     default:
@@ -112,7 +113,8 @@ obj_t aggr_sum(obj_t val, obj_t bins, obj_t filter)
 obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
 {
     u64_t i, l, n;
-    i64_t *xi, *ei, *xb, *xo, *ids;
+    u8_t *xb, *bo;
+    i64_t *xi, *ei, *xm, *xo, *ids;
     f64_t *xf, *fo;
     obj_t *oi, *oo, k, v, res;
     guid_t *xg, *og;
@@ -122,11 +124,41 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
 
     switch (val->type)
     {
+    case TYPE_BYTE:
+    case TYPE_BOOL:
+        xb = as_u8(val);
+        xm = as_i64(as_list(bins)[1]);
+        res = vector(val->type, n);
+        bo = as_u8(res);
+        for (i = 0; i < n; i++)
+            bo[i] = 0;
+
+        if (filter)
+        {
+            ids = as_i64(filter);
+            for (i = 0; i < l; i++)
+            {
+                n = xm[i];
+                if (!bo[n])
+                    bo[n] = xb[ids[i]];
+            }
+        }
+        else
+        {
+            for (i = 0; i < l; i++)
+            {
+                n = xm[i];
+                if (!bo[n])
+                    bo[n] = xb[i];
+            }
+        }
+
+        return res;
     case TYPE_I64:
     case TYPE_TIMESTAMP:
     case TYPE_SYMBOL:
         xi = as_i64(val);
-        xb = as_i64(as_list(bins)[1]);
+        xm = as_i64(as_list(bins)[1]);
         res = vector(val->type, n);
         xo = as_i64(res);
         for (i = 0; i < n; i++)
@@ -137,7 +169,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
             ids = as_i64(filter);
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 if (xo[n] == NULL_I64)
                     xo[n] = xi[ids[i]];
             }
@@ -146,7 +178,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
         {
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 if (xo[n] == NULL_I64)
                     xo[n] = xi[i];
             }
@@ -155,7 +187,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
         return res;
     case TYPE_F64:
         xf = as_f64(val);
-        xb = as_i64(as_list(bins)[1]);
+        xm = as_i64(as_list(bins)[1]);
         res = vector_f64(n);
         fo = as_f64(res);
         for (i = 0; i < n; i++)
@@ -166,7 +198,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
             ids = as_i64(filter);
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 if (ops_is_nan(fo[n]))
                     fo[n] = xf[ids[i]];
             }
@@ -175,7 +207,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
         {
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 if (ops_is_nan(fo[n]))
                     fo[n] = xf[i];
             }
@@ -184,7 +216,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
         return res;
     case TYPE_LIST:
         oi = as_list(val);
-        xb = as_i64(as_list(bins)[1]);
+        xm = as_i64(as_list(bins)[1]);
         res = list(n);
         xo = as_i64(res);
         for (i = 0; i < n; i++)
@@ -197,7 +229,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
             ids = as_i64(filter);
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 if (xo[n] == NULL_I64)
                     oo[n] = clone(oi[ids[i]]);
             }
@@ -206,7 +238,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
         {
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 if (xo[n] == NULL_I64)
                     oo[n] = clone(oi[i]);
             }
@@ -216,7 +248,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
 
     case TYPE_GUID:
         xg = as_guid(val);
-        xb = as_i64(as_list(bins)[1]);
+        xm = as_i64(as_list(bins)[1]);
         res = vector_guid(n);
         og = as_guid(res);
         for (i = 0; i < n; i++)
@@ -227,7 +259,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
             ids = as_i64(filter);
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 if (0 == memcmp(og + n, NULL_GUID, sizeof(guid_t)))
                     og[n] = xg[ids[i]];
             }
@@ -236,7 +268,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
         {
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 if (0 == memcmp(og + n, NULL_GUID, sizeof(guid_t)))
                     og[n] = xg[i];
             }
@@ -258,7 +290,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
         if (v->type != TYPE_SYMBOL)
             return error(ERR_TYPE, "enum: '%s' is not a 'Symbol'", typename(v->type));
 
-        xb = as_i64(as_list(bins)[1]);
+        xm = as_i64(as_list(bins)[1]);
         res = vector_symbol(n);
         xo = as_i64(res);
         for (i = 0; i < n; i++)
@@ -272,7 +304,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
             ids = as_i64(filter);
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 if (xo[n] == NULL_I64)
                     xo[n] = xi[ei[ids[i]]];
             }
@@ -281,7 +313,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
         {
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 if (xo[n] == NULL_I64)
                     xo[n] = xi[ei[i]];
             }
@@ -303,7 +335,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
 obj_t aggr_last(obj_t val, obj_t bins, obj_t filter)
 {
     u64_t i, l, n;
-    i64_t *xi, *xb, *xo, *ids;
+    i64_t *xi, *xm, *xo, *ids;
     obj_t res;
 
     n = as_list(bins)[0]->i64;
@@ -315,7 +347,7 @@ obj_t aggr_last(obj_t val, obj_t bins, obj_t filter)
     case TYPE_TIMESTAMP:
     case TYPE_SYMBOL:
         xi = as_i64(val);
-        xb = as_i64(as_list(bins)[1]);
+        xm = as_i64(as_list(bins)[1]);
         res = vector(val->type, n);
         xo = as_i64(res);
         for (i = 0; i < n; i++)
@@ -326,7 +358,7 @@ obj_t aggr_last(obj_t val, obj_t bins, obj_t filter)
             ids = as_i64(filter);
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 xo[n] = xi[ids[i]];
             }
         }
@@ -334,7 +366,7 @@ obj_t aggr_last(obj_t val, obj_t bins, obj_t filter)
         {
             for (i = 0; i < l; i++)
             {
-                n = xb[i];
+                n = xm[i];
                 xo[n] = xi[i];
             }
         }
@@ -348,79 +380,63 @@ obj_t aggr_last(obj_t val, obj_t bins, obj_t filter)
 obj_t aggr_avg(obj_t val, obj_t bins, obj_t filter)
 {
     u64_t i, l, n;
-    i64_t *xi, *xb, *ci, *ids;
+    i64_t *xi, *xm, *ci, *ids;
     f64_t *xf, *fo;
-    obj_t cnts, res;
+    obj_t res;
 
     n = as_list(bins)[0]->i64;
     l = as_list(bins)[1]->len;
+
+    group_fill_counts(bins);
+
+    ci = as_i64(as_list(bins)[2]);
 
     switch (val->type)
     {
     case TYPE_I64:
         xi = as_i64(val);
-        xb = as_i64(as_list(bins)[1]);
+        xm = as_i64(as_list(bins)[1]);
         res = vector_f64(n);
         fo = as_f64(res);
         memset(fo, 0, n * sizeof(i64_t));
-        cnts = vector_i64(n);
-        ci = as_i64(cnts);
-        memset(ci, 0, n * sizeof(i64_t));
-
-        // fill counts
-        for (i = 0; i < l; i++)
-            ci[xb[i]]++;
-
         if (filter)
         {
             ids = as_i64(filter);
             for (i = 0; i < l; i++)
-                fo[xb[i]] = addf64(fo[xb[i]], xi[ids[i]]);
+                fo[xm[i]] = addi64(fo[xm[i]], xi[ids[i]]);
         }
         else
         {
             for (i = 0; i < l; i++)
-                fo[xb[i]] = addf64(fo[xb[i]], xi[i]);
+                fo[xm[i]] = addi64(fo[xm[i]], xi[i]);
         }
 
         // calc avgs
         for (i = 0; i < n; i++)
-            fo[i] = divf64(fo[i], ci[i]);
-
-        drop(cnts);
+            fo[i] = divi64(fo[i], ci[i]);
 
         return res;
     case TYPE_F64:
         xf = as_f64(val);
-        xb = as_i64(as_list(bins)[1]);
+        xm = as_i64(as_list(bins)[1]);
         res = vector_f64(n);
         fo = as_f64(res);
         memset(fo, 0, n * sizeof(i64_t));
-        cnts = vector_i64(n);
-        ci = as_i64(cnts);
-        memset(ci, 0, n * sizeof(i64_t));
-
-        // fill counts
-        for (i = 0; i < l; i++)
-            ci[xb[i]]++;
-
         if (filter)
         {
             ids = as_i64(filter);
             for (i = 0; i < l; i++)
-                fo[xb[i]] = addf64(fo[xb[i]], xf[ids[i]]);
+                fo[xm[i]] = addf64(fo[xm[i]], xf[ids[i]]);
         }
         else
         {
             for (i = 0; i < l; i++)
-                fo[xb[i]] = addf64(fo[xb[i]], xf[i]);
+                fo[xm[i]] = addf64(fo[xm[i]], xf[i]);
         }
 
         // calc avgs
         for (i = 0; i < n; i++)
-            fo[i] = divf64(fo[i], ci[i]);
-
-        drop(cnts);
+            fo[i] = fdivf64(fo[i], ci[i]);
 
         return res;
     default:
