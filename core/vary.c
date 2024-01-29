@@ -33,52 +33,64 @@
 #include "runtime.h"
 #include "error.h"
 #include "group.h"
-
-obj_t __vary_call(u8_t attrs, vary_f f, obj_t *x, u64_t n)
-{
-    u64_t i;
-    obj_t v;
-
-    // remap all arguments with dereferencing groupmaps
-    if (attrs & FN_AGGR)
-        return f(x, n);
-
-    if (attrs & FN_GROUP_MAP)
-    {
-        for (i = 0; i < n; i++)
-        {
-            v = x[i];
-            if (v->type == TYPE_GROUPMAP)
-            {
-                x[i] = group_collect(v);
-                drop(v);
-            }
-        }
-    }
-
-    return f(x, n);
-}
+#include "ops.h"
 
 obj_t vary_call_atomic(u8_t attrs, vary_f f, obj_t *x, u64_t n)
 {
-    u64_t i, lists = 0;
+    i64_t i, j, l;
+    obj_t v, res;
 
-    // for (i = 0; i < n; i++)
-    //     if (is_vector(x[i]))
-    //         lists++;
+    if (n == 0)
+        return null(0);
 
-    // if (lists == n)
-    return __vary_call(attrs, f, x, n);
-    // else
-    // return f(x, n);
+    l = ops_rank(x, n);
+    if (l == -1)
+        throw(ERR_LENGTH, "vary: arguments have different lengths");
+
+    for (j = 0; j < (i64_t)n; j++)
+        stack_push(at_idx(x[j], 0));
+
+    v = f(x + n, n);
+
+    if (is_error(v))
+    {
+        res = v;
+    }
+
+    res = v->type < 0 ? vector(v->type, l) : list(l);
+
+    ins_obj(&res, 0, v);
+
+    for (i = 1; i < l; i++)
+    {
+        for (j = 0; j < (i64_t)n; j++)
+            stack_push(at_idx(x[j], i));
+
+        v = f(x + n, n);
+
+        // cleanup stack
+        for (j = 0; j < (i64_t)n; j++)
+            drop(stack_pop());
+
+        if (is_error(v))
+        {
+            res->len = i;
+            drop(res);
+            return v;
+        }
+
+        ins_obj(&res, i, v);
+    }
+
+    return res;
 }
 
 obj_t vary_call(u8_t attrs, vary_f f, obj_t *x, u64_t n)
 {
-    if (attrs & FN_ATOMIC)
+    if ((attrs & FN_ATOMIC) || (attrs & FN_GROUP_MAP))
         return vary_call_atomic(attrs, f, x, n);
     else
-        return __vary_call(attrs, f, x, n);
+        return f(x, n);
 }
 
 obj_t ray_do(obj_t *x, u64_t n)

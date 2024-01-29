@@ -32,42 +32,9 @@
 #include "eval.h"
 #include "error.h"
 
-#define __NULL_ARG 0xffffffffffffffff
-#define __args_height(l, x, n)                                   \
-    {                                                            \
-        l = args_height(x, n);                                   \
-        if (l == __NULL_ARG)                                     \
-            throw(ERR_LENGTH, "inconsistent arguments lengths"); \
-                                                                 \
-        if (l == 0)                                              \
-            return null(0);                                      \
-    }
-
-u64_t args_height(obj_t *x, u64_t n)
-{
-    u64_t i, l;
-    obj_t *b;
-
-    l = __NULL_ARG;
-    for (i = 0; i < n; i++)
-    {
-        b = x + i;
-        if ((is_vector(*b) || (*b)->type == TYPE_GROUPMAP) && l == __NULL_ARG)
-            l = ops_count(*b);
-        else if ((is_vector(*b) || (*b)->type == TYPE_GROUPMAP) && ops_count(*b) != l)
-            return __NULL_ARG;
-    }
-
-    // all are atoms
-    if (l == __NULL_ARG)
-        l = 1;
-
-    return l;
-}
-
 obj_t ray_map(obj_t *x, u64_t n)
 {
-    u64_t i, j, l;
+    i64_t i, j, l;
     obj_t f, v, *b, res;
 
     if (n < 2)
@@ -93,10 +60,12 @@ obj_t ray_map(obj_t *x, u64_t n)
         if (n != as_lambda(f)->args->len)
             throw(ERR_LENGTH, "'map': lambda call with wrong arguments count");
 
-        __args_height(l, x, n);
+        l = ops_rank(x, n);
+        if (l == -1)
+            throw(ERR_LENGTH, "'map': arguments have different lengths");
 
         // first item to get type of res
-        for (j = 0; j < n; j++)
+        for (j = 0; j < (i64_t)n; j++)
         {
             b = x + j;
             v = (is_vector(*b) || (*b)->type == TYPE_GROUPMAP) ? at_idx(*b, 0) : clone(*b);
@@ -113,7 +82,7 @@ obj_t ray_map(obj_t *x, u64_t n)
 
         for (i = 1; i < l; i++)
         {
-            for (j = 0; j < n; j++)
+            for (j = 0; j < (i64_t)n; j++)
             {
                 b = x + j;
                 v = (is_vector(*b) || (*b)->type == TYPE_GROUPMAP) ? at_idx(*b, i) : clone(*b);
@@ -139,7 +108,7 @@ obj_t ray_map(obj_t *x, u64_t n)
 
 obj_t ray_fold(obj_t *x, u64_t n)
 {
-    u64_t o, i, l;
+    i64_t o, i, l;
     obj_t f, v, *b, x1, x2;
 
     if (n < 2)
@@ -156,7 +125,10 @@ obj_t ray_fold(obj_t *x, u64_t n)
             throw(ERR_LENGTH, "'fold': unary call with wrong arguments count");
         return unary_call(FN_ATOMIC, (unary_f)f->i64, x[0]);
     case TYPE_BINARY:
-        __args_height(l, x, n);
+        l = ops_rank(x, n);
+        if (l == -1)
+            throw(ERR_LENGTH, "'map': arguments have different lengths");
+
         if (n == 1)
         {
             o = 1;
@@ -191,7 +163,9 @@ obj_t ray_fold(obj_t *x, u64_t n)
         if (n != as_lambda(f)->args->len)
             throw(ERR_LENGTH, "'fold': lambda call with wrong arguments count");
 
-        __args_height(l, x, n);
+        l = ops_rank(x, n);
+        if (l == -1)
+            throw(ERR_LENGTH, "'map': arguments have different lengths");
         return NULL;
 
         // vm = &runtime_get()->vm;

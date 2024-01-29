@@ -432,10 +432,10 @@ obj_t ins_obj(obj_t *obj, i64_t idx, obj_t val)
         val = null((*obj)->type);
 
     // we need to convert vector to list
-    if ((*obj)->type != -val->type && (*obj)->type != TYPE_LIST)
+    if ((*obj)->type - -val->type != 0 && (*obj)->type != TYPE_LIST)
     {
         l = (*obj)->len;
-        ret = vector(TYPE_LIST, l);
+        ret = list(l);
 
         for (i = 0; i < idx; i++)
             as_list(ret)[i] = at_idx(*obj, i);
@@ -520,7 +520,7 @@ obj_t at_idx(obj_t obj, i64_t idx)
     case TYPE_F64:
         if (idx < 0)
             idx = obj->len + idx;
-        if (idx > 0 && idx < (i64_t)obj->len)
+        if (idx >= 0 && idx < (i64_t)obj->len)
             return f64(as_f64(obj)[idx]);
         return f64(NULL_F64);
     case TYPE_CHAR:
@@ -574,7 +574,7 @@ obj_t at_idx(obj_t obj, i64_t idx)
         return null(0);
 
     default:
-        throw(ERR_TYPE, "at_idx: invalid type: '%s", typename(obj->type));
+        return clone(obj);
     }
 }
 

@@ -344,7 +344,12 @@ __attribute__((hot)) obj_t eval(obj_t obj)
                         return x;
 
                     if (!(car->attrs & FN_AGGR) && x->type == TYPE_GROUPMAP)
+                    {
                         attrs = FN_GROUP_MAP;
+                        y = group_collect(x);
+                        drop(x);
+                        x = y;
+                    }
                     else if (x->type == TYPE_FILTERMAP)
                     {
                         y = filter_collect(x);

@@ -230,6 +230,31 @@ u64_t ops_count(obj_t x)
         return x->len;
     }
 }
+/*
+ * Returns the rank of an arguments, i.e.
+ * if there are at least one vector - it's length, otherwise - 1.
+ * In case if there are vectors with different lengths - returns -1.
+ */
+i64_t ops_rank(obj_t *x, u64_t n)
+{
+    i64_t i, l = NULL_I64;
+    obj_t *b;
+
+    for (i = 0; i < (i64_t)n; i++)
+    {
+        b = x + i;
+        if (is_vector(*b) && l == NULL_I64)
+            l = ops_count(*b);
+        else if (is_vector(*b) && (i64_t)ops_count(*b) != l)
+            return -1;
+    }
+
+    // all are atoms
+    if (l == NULL_I64)
+        l = 1;
+
+    return l;
+}
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 

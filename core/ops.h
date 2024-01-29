@@ -98,6 +98,7 @@ bool_t ops_as_bool(obj_t x);
 bool_t ops_is_nan(f64_t x);
 u64_t ops_rand_u64();
 u64_t ops_count(obj_t x);
+i64_t ops_rank(obj_t *x, u64_t n);
 bool_t ops_eq_idx(obj_t a, i64_t ai, obj_t b, i64_t bi);
 obj_t ops_find(i64_t x[], u64_t xl, i64_t y[], u64_t yl);
 obj_t sys_error(os_error_type_t, str_t msg);
