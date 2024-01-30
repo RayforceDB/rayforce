@@ -4,7 +4,7 @@ CFLAGS = -fPIC -Wall -Wextra -std=c17 -Ofast -march=native -fassociative-math -f
  -fno-math-errno -funsafe-math-optimizations -ffinite-math-only -funroll-loops -m64
 
 default:
-	$(CC) $(CFLAGS) -shared -fPIC -I../core -o $(TARGET) example.c -undefined dynamic_lookup
+	$(CC) $(CFLAGS) -shared -fPIC -I../core -o $(TARGET) example.c
 
 clean:
 	rm -f $(TARGET)
