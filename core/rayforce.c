@@ -699,6 +699,78 @@ obj_t set_idx(obj_t *obj, i64_t idx, obj_t val)
     }
 }
 
+obj_t set_ids(obj_t *obj, i64_t ids[], u64_t len, obj_t vals)
+{
+    u64_t i, l;
+
+    if (!is_vector(*obj))
+    {
+        drop(vals);
+        throw(ERR_TYPE, "set_ids: invalid type: '%s", typename((*obj)->type));
+    }
+
+    l = (*obj)->len;
+
+    if (is_vector(vals))
+        if (vals->len != len)
+        {
+            drop(vals);
+            throw(ERR_LENGTH, "set_ids: length mismatch: '%lld' != '%lld'", len, vals->len);
+        }
+
+    for (i = 0; i < len; i++)
+        if (ids[i] >= (i64_t)l)
+        {
+            drop(vals);
+            throw(ERR_TYPE, "index: '%lld' is out of range '0..%lld'", ids[i], l - 1);
+        }
+
+    switch (mtype2((*obj)->type, vals->type))
+    {
+    case mtype2(TYPE_I64, -TYPE_I64):
+    case mtype2(TYPE_SYMBOL, -TYPE_I64):
+    case mtype2(TYPE_TIMESTAMP, -TYPE_I64):
+        for (i = 0; i < len; i++)
+            as_i64(*obj)[ids[i]] = vals->i64;
+        drop(vals);
+        return *obj;
+    case mtype2(TYPE_F64, -TYPE_F64):
+        for (i = 0; i < len; i++)
+            as_f64(*obj)[ids[i]] = vals->f64;
+        drop(vals);
+        return *obj;
+    case mtype2(TYPE_CHAR, -TYPE_CHAR):
+        for (i = 0; i < len; i++)
+            as_string(*obj)[ids[i]] = vals->vchar;
+        drop(vals);
+        return *obj;
+    // case mtype2(TYPE_LIST, -TYPE_LIST):
+    //     for (i = 0; i < len; i++)
+    //     {
+    //         drop(as_list(*obj)[ids[i]]);
+    //         as_list(*obj)[ids[i]] = clone(as_list(vals)[i]);
+    //     }
+    //     drop(vals);
+    //     return *obj;
+    case mtype2(TYPE_I64, TYPE_I64):
+    case mtype2(TYPE_SYMBOL, TYPE_I64):
+    case mtype2(TYPE_TIMESTAMP, TYPE_I64):
+        for (i = 0; i < len; i++)
+            as_i64(*obj)[ids[i]] = as_i64(vals)[i];
+
+        drop(vals);
+        return *obj;
+    case mtype2(TYPE_F64, TYPE_F64):
+        for (i = 0; i < len; i++)
+            as_f64(*obj)[ids[i]] = as_f64(vals)[i];
+
+        drop(vals);
+        return *obj;
+    default:
+        throw(ERR_TYPE, "set_ids: types mismatch: '%s, '%s", typename((*obj)->type), typename(vals->type));
+    }
+}
+
 obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
 {
     obj_t res;
@@ -714,6 +786,9 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
     case mtype2(TYPE_LIST, -TYPE_I64):
         return set_idx(obj, idx->i64, val);
     default:
+        if (idx->type == TYPE_I64)
+            return set_ids(obj, as_i64(idx), idx->len, val);
+
         if ((*obj)->type == TYPE_DICT)
         {
             i = find_obj(as_list(*obj)[0], idx);
@@ -1171,13 +1246,19 @@ obj_t cow(obj_t obj)
     we can just check for rc == 1 and if it is the case, we can just return the object
     */
     if (!__RC_SYNC)
-        rc = (obj)->rc;
+        rc = ++(obj)->rc;
     else
-        rc = __atomic_load_n(&obj->rc, __ATOMIC_RELAXED);
+        rc = __atomic_add_fetch(&obj->rc, 1, __ATOMIC_ACQ_REL);
 
     // we only owns the reference, so we can freely modify it
-    if (rc == 1)
+    if (rc == 2)
         return obj;
+
+    // Decrease rc by 1, since we don't own the reference
+    if (!__RC_SYNC)
+        (obj)->rc -= 1;
+    else
+        __atomic_sub_fetch(&obj->rc, 1, __ATOMIC_RELAXED);
 
     // we don't own the reference, so we need to copy it
     switch (obj->type)
@@ -1192,10 +1273,10 @@ obj_t cow(obj_t obj)
         size = size_of(obj);
         res = heap_alloc(size);
         memcpy(res, obj, size);
-        res->rc = 2;
+        res->rc = 1;
         return res;
     default:
-        throw(ERR_NOT_IMPLEMENTED, "cow: not implemented");
+        throw(ERR_NOT_IMPLEMENTED, "cow: not implemented for type: '%s", typename(obj->type));
     }
 }
 

@@ -1,0 +1,4 @@
+(set m (til 10))
+(set n m)
+(amend 'n 0 set 100)
+(amend 'n [4 5] set 99)

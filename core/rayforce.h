@@ -231,8 +231,9 @@ str_t symtostr(i64_t id);                        // return interned string by in
 nil_t zero_obj(obj_t obj);
 
 // Set
-obj_t set_idx(obj_t *obj, i64_t idx, obj_t val); // set obj at index
-obj_t set_obj(obj_t *obj, obj_t idx, obj_t val); // set obj indexed by obj
+obj_t set_idx(obj_t *obj, i64_t idx, obj_t val);               // set obj at index
+obj_t set_ids(obj_t *obj, i64_t ids[], u64_t len, obj_t vals); // set obj at indexes
+obj_t set_obj(obj_t *obj, obj_t idx, obj_t val);               // set obj indexed by obj
 
 // Resize
 obj_t resize(obj_t *obj, u64_t len);
