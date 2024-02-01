@@ -228,7 +228,7 @@ obj_t call(obj_t obj, u64_t arity)
 __attribute__((hot)) obj_t eval(obj_t obj)
 {
     u64_t len, i;
-    obj_t car, *sym, *args, x, y, z, res;
+    obj_t car, *val, *args, x, y, z, res;
     lambda_t *lambda;
     u8_t attrs = 0;
 
@@ -399,10 +399,10 @@ __attribute__((hot)) obj_t eval(obj_t obj)
             return unwrap(lambda_call(attrs, car, stack_peek(len - 1), len), (i64_t)obj);
 
         case -TYPE_SYMBOL:
-            sym = deref(car);
-            if (sym == NULL)
+            val = deref(car);
+            if (val == NULL)
                 return unwrap(error_str(ERR_EVAL, "undefined symbol"), (i64_t)obj);
-            car = *sym;
+            car = *val;
             goto call;
 
         default:
@@ -411,10 +411,10 @@ __attribute__((hot)) obj_t eval(obj_t obj)
     case -TYPE_SYMBOL:
         if (obj->attrs & ATTR_QUOTED)
             return symboli64(obj->i64);
-        sym = deref(obj);
-        if (sym == NULL)
+        val = deref(obj);
+        if (val == NULL)
             return unwrap(error_str(ERR_EVAL, "undefined symbol"), (i64_t)obj);
-        return clone(*sym);
+        return clone(*val);
     default:
         return clone(obj);
     }

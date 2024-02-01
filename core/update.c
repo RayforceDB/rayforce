@@ -31,16 +31,16 @@
 obj_t __fetch(obj_t x, obj_t **out)
 {
     u64_t i;
-    obj_t *sym, *env;
+    obj_t *val, *env;
 
     switch (x->type)
     {
     case -TYPE_SYMBOL:
-        sym = deref(x);
-        if (sym == NULL)
+        val = deref(x);
+        if (val == NULL)
             throw(ERR_NOT_FOUND, "fetch: symbol not found");
-        *out = sym;
-        return cow(*sym);
+        *out = val;
+        return cow(*val);
     default:
         return cow(x);
     }
@@ -149,4 +149,12 @@ obj_t ray_updepth(obj_t *x, u64_t n)
 obj_t ray_update(obj_t *x, u64_t n)
 {
     throw(ERR_NOT_IMPLEMENTED, "update");
+}
+
+/*
+ * update/inserts for tables
+ */
+obj_t ray_upsert(obj_t *x, u64_t n)
+{
+    throw(ERR_NOT_IMPLEMENTED, "upsert");
 }

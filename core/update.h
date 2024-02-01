@@ -26,8 +26,9 @@
 
 #include "rayforce.h"
 
-obj_t ray_update(obj_t *x, u64_t n);
 obj_t ray_upwidth(obj_t *x, u64_t n);
 obj_t ray_updepth(obj_t *x, u64_t n);
+obj_t ray_update(obj_t *x, u64_t n);
+obj_t ray_upsert(obj_t *x, u64_t n);
 
 #endif // UPDATE_H
