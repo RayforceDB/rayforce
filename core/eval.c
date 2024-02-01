@@ -228,7 +228,7 @@ obj_t call(obj_t obj, u64_t arity)
 __attribute__((hot)) obj_t eval(obj_t obj)
 {
     u64_t len, i;
-    obj_t car, *args, x, y, z, res;
+    obj_t car, *sym, *args, x, y, z, res;
     lambda_t *lambda;
     u8_t attrs = 0;
 
@@ -399,9 +399,10 @@ __attribute__((hot)) obj_t eval(obj_t obj)
             return unwrap(lambda_call(attrs, car, stack_peek(len - 1), len), (i64_t)obj);
 
         case -TYPE_SYMBOL:
-            car = get_symbol(car);
-            if (is_error(car))
-                return unwrap(car, (i64_t)obj);
+            sym = deref(car);
+            if (sym == NULL)
+                return unwrap(error_str(ERR_EVAL, "undefined symbol"), (i64_t)obj);
+            car = *sym;
             goto call;
 
         default:
@@ -410,14 +411,16 @@ __attribute__((hot)) obj_t eval(obj_t obj)
     case -TYPE_SYMBOL:
         if (obj->attrs & ATTR_QUOTED)
             return symboli64(obj->i64);
-        res = get_symbol(obj);
-        return is_error(res) ? unwrap(res, (i64_t)obj) : clone(res);
+        sym = deref(obj);
+        if (sym == NULL)
+            return unwrap(error_str(ERR_EVAL, "undefined symbol"), (i64_t)obj);
+        return clone(*sym);
     default:
         return clone(obj);
     }
 }
 
-obj_t get_symbol(obj_t sym)
+obj_t *deref(obj_t sym)
 {
     i64_t bp, *args;
     obj_t lambda, env;
@@ -428,7 +431,7 @@ obj_t get_symbol(obj_t sym)
     lambda = ctx->lambda;
 
     if (sym->i64 == KW_SELF)
-        return lambda;
+        return &ctx->lambda;
 
     l = as_lambda(lambda)->args->len;
     bp = ctx->sp;
@@ -442,7 +445,7 @@ obj_t get_symbol(obj_t sym)
         for (i = n; i > 0; i--)
         {
             if (as_symbol(as_list(env)[0])[i - 1] == sym->i64)
-                return as_list(as_list(env)[1])[i - 1];
+                return &as_list(as_list(env)[1])[i - 1];
         }
     }
 
@@ -451,18 +454,18 @@ obj_t get_symbol(obj_t sym)
     for (i = 0; i < l; i++)
     {
         if (args[i] == sym->i64)
-            return __INTERPRETER->stack[bp + i];
+            return &__INTERPRETER->stack[bp + i];
     }
 
     // search globals
     i = find_raw(as_list(runtime_get()->env.variables)[0], &sym->i64);
     if (i == as_list(runtime_get()->env.variables)[0]->len)
-        throw(ERR_NOT_EXIST, "variable '%s' does not exist", symtostr(sym->i64));
+        return NULL;
 
-    return as_list(as_list(runtime_get()->env.variables)[1])[i];
+    return &as_list(as_list(runtime_get()->env.variables)[1])[i];
 }
 
-obj_t set_symbol(obj_t sym, obj_t val)
+obj_t amend(obj_t sym, obj_t val)
 {
     obj_t *env;
     obj_t lambda;

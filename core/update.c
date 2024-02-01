@@ -26,21 +26,21 @@
 #include "util.h"
 #include "runtime.h"
 #include "error.h"
+#include "eval.h"
 
 obj_t __fetch(obj_t x, obj_t **out)
 {
     u64_t i;
-    obj_t *env;
+    obj_t *sym, *env;
 
     switch (x->type)
     {
     case -TYPE_SYMBOL:
-        env = as_list(runtime_get()->env.variables);
-        i = find_obj(env[0], x);
-        if (i == env[0]->len)
-            throw(ERR_NOT_FOUND, "amend: object not found");
-        *out = &as_list(env[1])[i];
-        return cow(as_list(env[1])[i]);
+        sym = deref(x);
+        if (sym == NULL)
+            throw(ERR_NOT_FOUND, "fetch: symbol not found");
+        *out = sym;
+        return cow(*sym);
     default:
         return cow(x);
     }
@@ -115,12 +115,21 @@ obj_t ray_upwidth(obj_t *x, u64_t n)
  */
 obj_t __updepth(obj_t src, obj_t idx, obj_t fun, obj_t val)
 {
+    u64_t i, l;
     obj_t *out = NULL, obj, res;
 
     switch (idx->type)
     {
     case -TYPE_I64:
         return __upwidth(src, idx, fun, val);
+        // case TYPE_I64:
+        // if ()
+        // l = idx->len;
+        // for (i = 0; i < l; i++)
+        // {
+        //     obj =
+        //     if ()
+        // }
     default:
         throw(ERR_NOT_IMPLEMENTED, "updepth");
     }

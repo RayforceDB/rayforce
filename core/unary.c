@@ -135,17 +135,17 @@ obj_t unary_call(u8_t attrs, unary_f f, obj_t x)
 obj_t ray_get(obj_t x)
 {
     i64_t fd;
-    obj_t res, col, keys, vals, val, s, v, id;
+    obj_t res, col, keys, vals, val, s, v, id, *sym;
     u64_t i, l, size;
 
     switch (x->type)
     {
     case -TYPE_SYMBOL:
-        v = get_symbol(x);
-        if (!is_error(v))
-            return clone(v);
-        else
-            return v;
+        sym = deref(x);
+        if (sym == NULL)
+            return error(ERR_TYPE, "get: symbol '%s' not found", as_string(x));
+
+        return clone(*sym);
     case TYPE_CHAR:
         if (x->len == 0)
             throw(ERR_LENGTH, "get: empty string path");

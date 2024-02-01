@@ -727,7 +727,7 @@ obj_t ray_let(obj_t x, obj_t y)
         if (is_error(e))
             return e;
 
-        return set_symbol(x, e);
+        return amend(x, e);
 
     default:
         throw(ERR_TYPE, "let: unsupported types: %d %d", typename(x->type), typename(y->type));

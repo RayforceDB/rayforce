@@ -51,8 +51,8 @@ typedef struct interpreter_t
 interpreter_t interpreter_new();
 nil_t interpreter_free();
 obj_t call(obj_t obj, u64_t arity);
-obj_t get_symbol(obj_t sym);
-obj_t set_symbol(obj_t sym, obj_t val);
+obj_t *deref(obj_t sym);
+obj_t amend(obj_t sym, obj_t val);
 obj_t mount_env(obj_t obj);
 obj_t unmount_env(u64_t n);
 obj_t eval(obj_t obj);
