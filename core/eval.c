@@ -98,20 +98,10 @@ inline __attribute__((always_inline)) ctx_t *ctx_clone(obj_t info)
     i64_t sp;
     obj_t f;
 
-    if (__INTERPRETER->cp == 1)
-    {
-        sp = __INTERPRETER->sp;
-        stack_push(NULL_OBJ);
-        f = lambda(vector_symbol(0), NULL_OBJ, info);
-        as_lambda(f)->name = symbol("top-level");
-    }
-    else
-    {
-        ctx = ctx_get();
-        sp = ctx->sp;
-        f = ctx->lambda;
-        drop(info);
-    }
+    sp = __INTERPRETER->sp;
+    stack_push(NULL_OBJ);
+    f = lambda(vector_symbol(0), NULL_OBJ, info);
+    as_lambda(f)->name = symbol("top-level");
 
     ctx = ctx_push(f);
     ctx->sp = sp;
@@ -678,27 +668,11 @@ obj_t eval_str(i64_t fd, obj_t str, obj_t file)
 
     ctx = ctx_clone(info);
 
-    if (setjmp(ctx->jmp) == 0)
-    {
-        res = eval(parsed);
-        ctx_pop();
-        if (__INTERPRETER->cp == 1)
-            drop(ctx->lambda);
-        drop(parsed);
-
-        // cleanup stack frame
-        sp = ctx->sp;
-        while (__INTERPRETER->sp > sp)
-            drop(stack_pop());
-
-        return res;
-    }
+    res = (setjmp(ctx->jmp) == 0) ? eval(parsed) : stack_pop();
 
     ctx_pop();
     drop(parsed);
-    if (__INTERPRETER->cp == 1)
-        drop(ctx->lambda);
-    res = stack_pop();
+    drop(ctx->lambda);
 
     // cleanup stack frame
     sp = ctx->sp;

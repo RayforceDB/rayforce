@@ -1,1 +1,4 @@
+(set 6 7)
+(set m (til 10))
+(upwidth 'm [0 100] set 100)
 (set t (table [sym price volume] (list [aapl vod goog] [102 99 203] [500 400 900])))
