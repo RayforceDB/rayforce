@@ -397,7 +397,7 @@ __attribute__((hot)) obj_t eval(obj_t obj)
             goto call;
 
         default:
-            return unwrap(error_str(ERR_EVAL, "not a callable"), (i64_t)args[-1]);
+            return unwrap(error(ERR_EVAL, "'%s is not a function", typename(car->type)), (i64_t)args[-1]);
         }
     case -TYPE_SYMBOL:
         if (obj->attrs & ATTR_QUOTED)
