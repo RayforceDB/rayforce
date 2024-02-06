@@ -114,7 +114,7 @@ obj_t ray_alter(obj_t *x, u64_t n)
     res = __update(&obj, x, n);
     if (is_error(res))
     {
-        if (val && (*val != obj))
+        if ((val != NULL) || (*val != obj))
             drop(obj);
 
         return res;
