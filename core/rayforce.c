@@ -782,7 +782,7 @@ obj_t set_idx(obj_t *obj, i64_t idx, obj_t val)
 
 obj_t set_ids(obj_t *obj, i64_t ids[], u64_t len, obj_t vals)
 {
-    u64_t i, l;
+    u64_t i;
 
     switch (mtype2((*obj)->type, vals->type))
     {
@@ -903,7 +903,7 @@ obj_t __expand(obj_t obj, u64_t len)
 obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
 {
     obj_t k, v, res;
-    u64_t i, j, n, l;
+    u64_t i, n, l;
     i64_t id = NULL_I64, *ids = NULL;
 
     // dispatch:

@@ -39,11 +39,8 @@
 obj_t ray_at(obj_t x, obj_t y)
 {
     u64_t i, j, yl, xl, n;
-    obj_t res, k, s, v, c, cols;
+    obj_t res, k, s, v, cols;
     u8_t *buf;
-
-    if (!x || !y)
-        return NULL_OBJ;
 
     switch (mtype2(x->type, y->type))
     {

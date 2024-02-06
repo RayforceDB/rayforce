@@ -98,7 +98,7 @@ obj_t __commit(obj_t src, obj_t obj, obj_t *val)
 
 obj_t ray_alter(obj_t *x, u64_t n)
 {
-    obj_t *val = NULL, v, obj, idx, res;
+    obj_t *val = NULL, obj, res;
 
     if (n < 3)
         throw(ERR_LENGTH, "alter: expected at least 3 arguments");
@@ -123,39 +123,11 @@ obj_t ray_alter(obj_t *x, u64_t n)
     return __commit(x[0], obj, val);
 }
 
-/*
- * recursive for alter
- */
-obj_t __modify(obj_t src, obj_t idx, obj_t fun, obj_t val)
-{
-    u64_t i, l;
-    obj_t *out = NULL, obj, res;
-
-    switch (idx->type)
-    {
-    case -TYPE_I64:
-        // return __alter(src, idx, fun, val);
-        // case TYPE_I64:
-        // if ()
-        // l = idx->len;
-        // for (i = 0; i < l; i++)
-        // {
-        //     obj =
-        //     if ()
-        // }
-    default:
-        throw(ERR_NOT_IMPLEMENTED, "modify");
-    }
-}
-
 obj_t ray_modify(obj_t *x, u64_t n)
 {
+    unused(x);
     switch (n)
     {
-    case 4:
-        return __modify(x[0], x[1], x[2], x[3]);
-    case 3:
-        return __modify(x[0], x[1], x[2], NULL_OBJ);
     default:
         throw(ERR_LENGTH, "modify: expected 3 or 4 arguments");
     }
@@ -166,6 +138,8 @@ obj_t ray_modify(obj_t *x, u64_t n)
  */
 obj_t ray_update(obj_t *x, u64_t n)
 {
+    unused(x);
+    unused(n);
     throw(ERR_NOT_IMPLEMENTED, "update");
 }
 
@@ -174,5 +148,7 @@ obj_t ray_update(obj_t *x, u64_t n)
  */
 obj_t ray_upsert(obj_t *x, u64_t n)
 {
+    unused(x);
+    unused(n);
     throw(ERR_NOT_IMPLEMENTED, "upsert");
 }

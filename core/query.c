@@ -63,7 +63,7 @@ obj_t get_symbols(obj_t obj)
 obj_t remap_filter(obj_t x, obj_t y)
 {
     u64_t i, l;
-    obj_t res, prm, val;
+    obj_t res;
 
     l = as_list(x)[1]->len;
     res = list(l);
