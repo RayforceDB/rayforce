@@ -78,3 +78,9 @@ clean:
 	-rm -f $(TARGET).test
 	-rm -rf *.out
 	-rm -rf *.so
+
+nightly:
+	git push origin :nightly
+	git -d :nightly
+	git tag nightly
+	git push origin nightly
