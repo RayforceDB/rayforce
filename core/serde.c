@@ -284,11 +284,12 @@ u64_t save_obj(u8_t *buf, u64_t len, obj_t obj)
         return sizeof(type_t) + c + 1;
 
     case TYPE_ERROR:
-        buf[0] = (i8_t)as_list(obj)[0]->i64;
+        buf[0] = (i8_t)as_error(obj)->code;
         buf++;
-        memcpy(buf, as_string(as_list(obj)[1]), as_list(obj)[1]->len);
-        buf[as_list(obj)[1]->len] = '\0';
-        return sizeof(i8_t) + as_list(obj)[1]->len + 1;
+        c = ops_count(as_error(obj)->msg);
+        memcpy(buf, as_string(as_error(obj)->msg), c);
+        buf[c] = '\0';
+        return sizeof(i8_t) + as_list(obj)[1]->len + c;
 
     default:
         return 0;
@@ -468,7 +469,7 @@ obj_t load_obj(u8_t **buf, u64_t len)
     case TYPE_LIST:
         memcpy(&l, *buf, sizeof(u64_t));
         *buf += sizeof(u64_t);
-        obj = vector(TYPE_LIST, l);
+        obj = list(l);
         for (i = 0; i < l; i++)
         {
             v = load_obj(buf, len);
@@ -503,21 +504,21 @@ obj_t load_obj(u8_t **buf, u64_t len)
         else
             return dict(k, v);
 
-        // case TYPE_LAMBDA:
-        //     k = load_obj(buf, len);
+    case TYPE_LAMBDA:
+        k = load_obj(buf, len);
 
-        //     if (is_error(k))
-        //         return k;
+        if (is_error(k))
+            return k;
 
-        //     v = load_obj(buf, len);
+        v = load_obj(buf, len);
 
-        //     if (is_error(v))
-        //     {
-        //         drop(k);
-        //         return v;
-        //     }
+        if (is_error(v))
+        {
+            drop(k);
+            return v;
+        }
 
-        //     return cc_compile_lambda("repl", k, v, NULL);
+        return lambda(k, v, NULL_OBJ);
 
     case TYPE_UNARY:
     case TYPE_BINARY:

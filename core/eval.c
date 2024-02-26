@@ -41,6 +41,10 @@ nil_t error_add_loc(obj_t err, i64_t id, ctx_t *ctx)
     span_t span;
 
     nfo = as_lambda(ctx->lambda)->nfo;
+
+    if (nfo == NULL_OBJ)
+        return;
+
     span = nfo_get(nfo, id);
     loc = vn_list(4,
                   i64(span.id),                        // span
