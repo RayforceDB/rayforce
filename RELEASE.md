@@ -10,3 +10,7 @@
 - Basic functions
 - Basic operators
 - Basic control flow
+- Updates (alter, insert, upsert, update)
+- IPC (inter-process communication)
+- Requests (select)
+- Splayed tables (on-disk)
