@@ -13,11 +13,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Upload RELEASE.md
       if: matrix.os == 'ubuntu-latest'
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: release-notes
         path: RELEASE.md  
@@ -86,21 +86,21 @@ jobs:
         tar -cvpzf ../${{ matrix.os }}.tar.gz *
 
     - name: Upload Artifact (Linux)
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       if: runner.os == 'Linux'
       with:
         name: ${{ matrix.os }}.tar.gz
         path: ${{ matrix.os }}.tar.gz
 
     - name: Upload Artifact (Windows)
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       if: runner.os == 'Windows'
       with:
         name: ${{ matrix.os }}.zip
         path: ${{ matrix.os }}.zip
 
     - name: Upload Artifact (macOS)
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       if: runner.os == 'macOS'
       with:
         name: ${{ matrix.os }}.tar.gz
