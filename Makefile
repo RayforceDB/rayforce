@@ -79,6 +79,7 @@ clean:
 	-rm -rf *.out
 	-rm -rf *.so
 
+# trigger github to make a nightly build
 nightly:
 	git push origin :nightly
 	git tag -d nightly

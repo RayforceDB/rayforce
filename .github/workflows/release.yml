@@ -112,45 +112,33 @@ jobs:
     steps:
     - name: Download Artifacts
       uses: actions/download-artifact@v4
-
+  
+    - name: Setup GitHub CLI
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+  
     - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
+      run: |
+        gh auth setup-git
+        gh release create ${{ github.ref }} \
+          --title "${{ github.ref }}" \
+          --notes-file ${{ github.workspace }}/release-notes/RELEASE.md \
+          --draft=false --prerelease=false
       env:
-        GITHUB_TOKEN: ${{ secrets.PAT }} 
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: ${{ github.ref }}
-        body_path: ${{ github.workspace }}/release-notes/RELEASE.md
-        draft: false
-        prerelease: false
-
+        GITHUB_TOKEN: ${{ secrets.PAT }}
+  
     - name: Upload Release Asset (Linux)
-      uses: actions/upload-release-asset@v1
+      run: gh release upload ${{ github.ref }} ${{ github.workspace }}/ubuntu-latest.tar.gz/ubuntu-latest.tar.gz --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.PAT }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/ubuntu-latest.tar.gz/ubuntu-latest.tar.gz
-        asset_name: linux.tar.gz
-        asset_content_type: application/gzip
-
+  
     - name: Upload Release Asset (Windows)
-      uses: actions/upload-release-asset@v1
+      run: gh release upload ${{ github.ref }} ${{ github.workspace }}/windows-latest.zip/windows-latest.zip --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.PAT }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/windows-latest.zip/windows-latest.zip
-        asset_name: windows.zip
-        asset_content_type: application/zip
-
+  
     - name: Upload Release Asset (macOS)
-      uses: actions/upload-release-asset@v1
+      run: gh release upload ${{ github.ref }} ${{ github.workspace }}/macos-latest.tar.gz/macos-latest.tar.gz --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.PAT }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/macos-latest.tar.gz/macos-latest.tar.gz
-        asset_name: macos.tar.gz
-        asset_content_type: application/gzip
