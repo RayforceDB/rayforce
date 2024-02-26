@@ -81,6 +81,6 @@ clean:
 
 nightly:
 	git push origin :nightly
-	git tag -d :nightly
+	git tag -d nightly
 	git tag nightly
 	git push origin nightly
