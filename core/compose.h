@@ -32,6 +32,7 @@ obj_t ray_rand(obj_t x, obj_t y);
 obj_t ray_as(obj_t x, obj_t y);
 obj_t ray_enum(obj_t x, obj_t y);
 obj_t ray_concat(obj_t x, obj_t y);
+obj_t ray_distinct(obj_t x);
 obj_t ray_til(obj_t x);
 obj_t ray_reverse(obj_t x);
 obj_t ray_group(obj_t x);
