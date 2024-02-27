@@ -17,6 +17,22 @@
     background-color: #e0f7fa;
 }
 
+.ray-dense td,
+.ray-dense th {
+    font-size: 85%;
+    padding: 0 .4em;
+}
+
+.ray-dense th {
+    border-bottom: 1px solid rgba(0, 0, 0, .3);
+    opacity: .7;
+    text-align: left;
+}
+
+.ray-dense thead {
+    border-bottom: 1px solid #aaa;
+}
+
 /* 
 .md-header {
     background-color: #FF5722;

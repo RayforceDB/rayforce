@@ -2,28 +2,36 @@
 
 The "another one" columnar database engineered to optimize your data analytics and storage solutions, ensuring a seamless, high-speed experience, which has:
 
-# :material-tag: Existing features
+<div class="grid cards" markdown>
 
-- [x] Simple LISP-like syntax
+- :fontawesome-solid-feather-pointed:{ .lg .middle } __Simple LISP-like syntax__
 
-- [x] Columnar storage
+    ---
 
-- [x] SIMD-accelerated engine
+    Using a simple and intuitive syntax simplifies the learning curve and making things clear.
 
-- [x] Simple query language
+    [:octicons-arrow-right-24: Syntax](content/syntax.md)
 
-- [x] No dependencies
+- :material-poll:{ .lg .middle } __Columnar storage__
 
-- [x] Single binary with small size <1Mb directly fits in a CPU cache
+    ---
 
-- [x] Supports Linux, Windows, MacOS out of the box
+    The columnar storage is a great way to optimize the storage and speed up the queries
+    due to heavy usage of the vectorized operations.
 
-# :material-tag: Incoming features
+- :material-language-c:{ .lg .middle } __Plain C__
 
-- [ ] Indexing
+    ---
 
-- [ ] Compression
+    RayforceDB is written in plain C with no dependencies,
+    which makes it easy to integrate and maintain. As a bonus, it's very compact (less 1Mb) to fit directly into CPU cache.
 
-- [ ] Paralleling
+- :material-scale-balance:{ .lg .middle } __Open Source, MIT__
+
+    ---
+
+    RayforceDB is licensed under MIT and available on [GitHub](https://github.com/singaraiona/rayforce)
+
+</div>
 
 <asciinema-player src="assets/intro.cast" preload rows="24"></asciinema-player>

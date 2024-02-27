@@ -108,26 +108,59 @@ nav:
     - Getting Started: 
       - Install: content/getstarted/install.md
       - Tutorial: content/getstarted/tutorial.md
-    - Syntax:
-      - Overview: content/syntax/overview.md
-      - Data Types: content/syntax/datatypes.md
-    - Functions:
-      - Math:
-        - Add: content/functions/math/add.md
-        - Sub: content/functions/math/sub.md
-        - Mul: content/functions/math/mul.md
-        - Div: content/functions/math/div.md
-        - Fdiv: content/functions/math/fdiv.md
-        - Mod: content/functions/math/mod.md
-        - Sum: content/functions/math/sum.md
-        - Avg: content/functions/math/avg.md
-        - Min: content/functions/math/min.md
-        - Max: content/functions/math/max.md
+    - Reference card: content/reference.md
+    - Syntax: content/syntax.md
+    - Atomic functions: content/atomic.md
+    - Math:
+      - Add: content/math/add.md
+      - Sub: content/math/sub.md
+      - Mul: content/math/mul.md
+      - Div: content/math/div.md
+      - Fdiv: content/math/fdiv.md
+      - Mod: content/math/mod.md
+      - Sum: content/math/sum.md
+      - Avg: content/math/avg.md
+      - Min: content/math/min.md
+      - Max: content/math/max.md
     - Evaluation Control:
-      - Control Flow: content/flow/controlflow.md
-      - Error Handling: content/flow/errorhandling.md
+      - If: content/control/if.md
+      - Try: content/control/try.md
+      - Exit: content/control/exit.md
+    - Compose:
+      - Casting: content/compose/as.md
+      - Concat: content/compose/concat.md
+      - Create Dict: content/compose/dict.md
+      - Create Table: content/compose/table.md
+      - Create List: content/compose/list.md
+      - Create Vector: content/compose/enlist.md
+      - Group: content/compose/group.md
+      - GUID: content/compose/guid.md
+      - Rand: content/compose/rand.md
+      - Reverse: content/compose/reverse.md
+      - Til: content/compose/til.md
+    - Env:
+      - Set: content/env/set.md
+      - Let: content/env/let.md
+      - Get env: content/env/env.md
+      - Memstat: content/env/memstat.md
+    - IO:
+      - Read CSV: content/io/csv.md
+      - Print: content/io/print.md
+      - Println: content/io/println.md
+      - Read: content/io/read.md
+      - Write: content/io/write.md
+    - Logic:
+      - And: content/logic/and.md
+      - Or: content/logic/or.md
+      - Like: content/logic/like.md
+    - REPL:
+      - Parse: content/repl/parse.md
+      - Eval: content/repl/eval.md
+      - Load: content/repl/load.md
     - Queries: content/queries.md
     - Serialization: content/serialization.md
     - Interfacing: 
       - IPC: content/interfacing/ipc.md
+      - Extending: content/interfacing/extending.md
   - FAQ: content/faq.md
+  - License: content/license.md
