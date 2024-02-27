@@ -33,6 +33,22 @@
     border-bottom: 1px solid #aaa;
 }
 
+/* Syntax highlighting */
+:root>* {
+    --md-code-hl-number-color: teal;
+    --md-code-hl-variable-color: teal;
+    /* --md-code-hl-special-color: #66D9EF; */
+    --md-code-hl-function-color: navy;
+    --md-code-hl-constant-color: navy;
+    --md-code-hl-keyword-color: navy;
+    --md-code-hl-string-color: maroon;
+    --md-code-hl-name-color: #A6E22E;
+    --md-code-hl-operator-color: #F92672;
+    --md-code-hl-punctuation-color: gray;
+    --md-code-hl-comment-color: gray;
+    --md-code-hl-generic-color: #66D9EF;
+}
+
 /* 
 .md-header {
     background-color: #FF5722;

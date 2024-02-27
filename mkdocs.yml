@@ -68,6 +68,7 @@ markdown_extensions:
       pygments_lang_class: true
   - pymdownx.betterem:
       smart_enable: all
+  - pymdownx.inlinehilite
   - pymdownx.caret
   - pymdownx.details
   - pymdownx.emoji:
@@ -120,8 +121,14 @@ nav:
       - Mod: content/math/mod.md
       - Sum: content/math/sum.md
       - Avg: content/math/avg.md
+      - Med: content/math/med.md
+      - Dev: content/math/dev.md
       - Min: content/math/min.md
       - Max: content/math/max.md
+      - Ceil: content/math/ceil.md
+      - Floor: content/math/floor.md
+      - Round: content/math/round.md
+      - Xbar: content/math/xbar.md
     - Evaluation Control:
       - If: content/control/if.md
       - Try: content/control/try.md
@@ -162,5 +169,6 @@ nav:
     - Interfacing: 
       - IPC: content/interfacing/ipc.md
       - Extending: content/interfacing/extending.md
+      - Load function: content/ext/loadfn.md
   - FAQ: content/faq.md
   - License: content/license.md
