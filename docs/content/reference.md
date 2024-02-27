@@ -12,7 +12,7 @@
 </tr>
 <tr markdown><td markdown>control</td>
   <td markdown>
-  [if](control/if.md), [try](control/try.md), [exit](control/exit.md)
+  [if](control/if.md), [try](control/try.md), [raise](control/raise.md), [exit](control/exit.md)
   </td>
 </tr>
 <tr markdown><td markdown>math</td>
@@ -22,17 +22,62 @@
 </tr>
 <tr markdown><td markdown>logic</td>
 <td markdown>
-  [and](logic/and.md), [or](logic/or.md), [like](logic/like.md)
+  [and](logic/and.md), [or](logic/or.md), [not](logic/not.md), [like](logic/like.md)
+</td>
+</tr>
+<tr markdown><td markdown>items</td>
+<td markdown>
+  [at](items/at.md), [except](items/except.md), [filter](items/filter.md), [find](items/find.md), [first](items/first.md), [last](items/last.md), [key](items/key.md), [value](items/value.md), [take](items/take.md), [sect](items/sect.md) [union](items/union.md), [where](items/where.md), [in](items/in.md)
+</td>
+</tr>
+<tr markdown><td markdown>order</td>
+<td markdown>
+  [asc](order/asc.md), [desc](order/desc.md), [iasc](order/iasc.md), [idesc](order/idesc.md), [neg](order/neg.md),
+</td>
+</tr>
+<tr markdown><td markdown>relation</td>
+<td markdown>
+  [eq](rel/eq.md), [ne](rel/ne.md), [lt](rel/lt.md), [le](rel/le.md), [gt](rel/gt.md), [ge](rel/ge.md)
 </td>
 </tr>
 <tr markdown><td markdown>compose</td>
 <td markdown>
-  [as](compose/as.md), [concat](compose/concat.md), [dict](compose/dict.md), [table](compose/table.md), [group](compose/group.md), [guid](compose/guid.md), [list](compose/list.md), [enlist](compose/enlist.md), [rand](compose/rand.md), [reverse](compose/reverse.md), [til](compose/til.md)
+  [as](compose/as.md), [concat](compose/concat.md), [dict](compose/dict.md), [table](compose/table.md), [group](compose/group.md), [guid](compose/guid.md), [list](compose/list.md), [enlist](compose/enlist.md), [rand](compose/rand.md), [reverse](compose/reverse.md), [til](compose/til.md), [distinct](compose/distinct.md)
+</td>
+</tr>
+<tr markdown><td markdown>iter</td>
+<td markdown>
+  [apply](iter/apply.md), [do](iter/do.md), [map](iter/map.md), [fold](iter/fold.md)
+</td>
+</tr>
+<tr markdown><td markdown>items</td>
+<td markdown>
+  [map](iter/map.md), [fold](iter/fold.md)
+</td>
+</tr>
+<tr markdown><td markdown>join</td>
+<td markdown>
+  [lj](join/lj.md)
+</td>
+</tr>
+<tr markdown><td markdown>update</td>
+<td markdown>
+  [alter](update/alter.md), [insert](update/insert.md), [upsert](update/upsert.md), [update](update/update.md)
 </td>
 </tr>
 <tr markdown><td markdown>repl</td>
 <td markdown>
-  [parse](repl/parse.md), [eval](repl/eval.md), [load](repl/load.md)
+  [parse](repl/parse.md), [eval](repl/eval.md), [exec](repl/exec.md), [load](repl/load.md)
+</td>
+</tr>
+<tr markdown><td markdown>misc</td>
+<td markdown>
+  [count](misc/count.md), [type](misc/type.md), [rc](misc/rc.md)
+</td>
+</tr>
+<tr markdown><td markdown>time</td>
+<td markdown>
+  [timer](time/timer.md)
 </td>
 </tr>
 <tr markdown><td markdown>ext</td>
@@ -42,7 +87,12 @@
 </tr>
 <tr markdown><td markdown>io</td>
 <td markdown>
-  [write](io/write.md), [read](io/read.md), [csv](io/csv.md), [print](io/print.md), [println](io/println.md)
+  [write](io/write.md), [read](io/read.md), [csv](io/csv.md), [print](io/print.md), [println](io/println.md), [hopen](io/hopen.md), [hclose](io/hclose.md)
+</td>
+</tr>
+<tr markdown><td markdown>serde</td>
+<td markdown>
+  [ser](serde/ser.md), [de](serde/de.md)
 </td>
 </tr>
 </tbody></table>

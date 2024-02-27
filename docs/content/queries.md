@@ -11,7 +11,6 @@ RayforceDB has an simple but powerful query language. It has dictionary notation
         from: <expr>
         [where: <expr>]
         [by: <expr>]
-        [take: <i64>]
         ;; fields
         [field1: <expr>]
         [field2: <expr>]
@@ -28,7 +27,6 @@ RayforceDB has an simple but powerful query language. It has dictionary notation
         from: orders
         where: (= 0 (% Size 2))
         by: Symbol
-        take: 10
         id: OrderId
         price: (avg Price)
         tape: (first Tape)

@@ -132,6 +132,7 @@ nav:
     - Evaluation Control:
       - If: content/control/if.md
       - Try: content/control/try.md
+      - Raise: content/control/raise.md
       - Exit: content/control/exit.md
     - Compose:
       - Casting: content/compose/as.md
@@ -145,6 +146,7 @@ nav:
       - Rand: content/compose/rand.md
       - Reverse: content/compose/reverse.md
       - Til: content/compose/til.md
+      - Distinct: content/compose/distinct.md
     - Env:
       - Set: content/env/set.md
       - Let: content/env/let.md
@@ -156,16 +158,68 @@ nav:
       - Println: content/io/println.md
       - Read: content/io/read.md
       - Write: content/io/write.md
+      - Hopen: content/io/hopen.md
+      - Hclose: content/io/hclose.md
     - Logic:
       - And: content/logic/and.md
       - Or: content/logic/or.md
+      - Not: content/logic/not.md
       - Like: content/logic/like.md
+    - Items:
+      - At: content/items/at.md
+      - First: content/items/first.md
+      - Last: content/items/last.md
+      - Take: content/items/take.md
+      - Except: content/items/except.md
+      - Union: content/items/union.md
+      - Sect: content/items/sect.md
+      - In: content/items/in.md
+      - Where: content/items/where.md
+      - Filter: content/items/filter.md
+      - Find: content/items/find.md
+      - Key: content/items/key.md
+      - Value: content/items/value.md
+    - Order:
+      - Asc: content/order/asc.md
+      - Desc: content/order/desc.md
+      - Iasc: content/order/iasc.md
+      - Idesc: content/order/idesc.md
+      - Neg: content/order/neg.md
+    - Relation:
+      - Equal: content/rel/eq.md
+      - Not equal: content/rel/ne.md
+      - Greater than: content/rel/gt.md
+      - Greater or equal: content/rel/ge.md
+      - Lower than: content/rel/lt.md
+      - Lower or equal: content/rel/le.md
+    - Iter:
+      - Apply: content/iter/apply.md
+      - Do: content/iter/do.md
+      - Map: content/iter/map.md
+      - Fold: content/iter/fold.md
+    - Queries: content/queries.md
+    - Joins:
+      - Left join: content/join/lj.md
+    - Updates:
+      - Alter: content/update/alter.md
+      - Insert: content/update/insert.md
+      - Upsert: content/update/upsert.md
+      - Update: content/update/update.md
     - REPL:
       - Parse: content/repl/parse.md
       - Eval: content/repl/eval.md
+      - Exec: content/repl/exec.md
       - Load: content/repl/load.md
-    - Queries: content/queries.md
-    - Serialization: content/serialization.md
+    - Serialization: 
+      - Overall: content/serde/index.md
+      - Serialize: content/serde/ser.md
+      - Deserialize: content/serde/de.md
+    - Misc:
+      - Type: content/misc/type.md
+      - Count: content/misc/count.md
+      - Reference count: content/misc/rc.md
+    - Time:
+      - Set/unset timer: content/time/timer.md
     - Interfacing: 
       - IPC: content/interfacing/ipc.md
       - Extending: content/interfacing/extending.md
