@@ -87,44 +87,41 @@
 
     document.getElementById('input').addEventListener('keydown', function (event) {
       const inputField = document.getElementById('input');
-      let handled = false;
 
-      // Enter key: Execute the command and add it to history
+      // Enter key: Submit command
       if (event.keyCode === 13) {
-        const command = inputField.value.trim();
-        if (command !== '') {
-          handleInput(command);
-          history.unshift(command); // Add command to the start of the history array
-          historyIndex = 0; // Reset history index after a new command is entered
-          inputField.value = ''; // Clear the input field
-        }
-        handled = true;
-      }
+        const input = inputField.value.trim();
+        if (input !== '') {
+          handleInput(input);
 
-      // Up arrow key: Navigate back through command history
-      else if (event.keyCode === 38 && history.length > 0) {
-        if (historyIndex < history.length - 1) {
-          historyIndex++;
-        }
-        inputField.value = history[historyIndex];
-        handled = true;
-      }
+          // Prevent duplicate consecutive entries
+          if (history.length === 0 || history[history.length - 1] !== input) {
+            history.push(input); // Add the command to the end of the history array
+          }
 
-      // Down arrow key: Navigate forward through command history
-      else if (event.keyCode === 40 && history.length > 0) {
+          inputField.value = ''; // Clear input field
+          historyIndex = history.length; // Set history index to point past the last item
+        }
+        event.preventDefault(); // Prevent default to stop form submission
+      }
+      // Up arrow key: Move to previous command
+      else if (event.keyCode === 38) {
         if (historyIndex > 0) {
           historyIndex--;
           inputField.value = history[historyIndex];
-        } else {
-          historyIndex = 0; // Return to the "new command" state
-          inputField.value = '';
+          event.preventDefault(); // Prevent the cursor from moving
         }
-        handled = true;
       }
-
-      if (handled) {
-        event.preventDefault(); // Prevent the default action to avoid moving the cursor
-        event.stopPropagation(); // Stop the event from propagating further
+      // Down arrow key: Move to next command
+      else if (event.keyCode === 40) {
+        if (historyIndex < history.length - 1) {
+          historyIndex++;
+          inputField.value = history[historyIndex];
+        } else {
+          historyIndex = history.length;
+          inputField.value = ''; // Clear input when moving past the most recent command
+        }
+        event.preventDefault(); // Prevent the cursor from moving
       }
     });
 
