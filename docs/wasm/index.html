@@ -76,13 +76,58 @@
     <div id="output"></div>
     <div>
       <span style="color: green;">&gt; </span>
-      <input id="input" type="text" autofocus
-        onkeydown="if(event.keyCode === 13) {handleInput(this.value); this.value='';}">
+      <input id="input" type="text" autofocus>
     </div>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/ansi_up@5"></script>
   <script src="rayforce.js"></script>
   <script>
+    let history = []; // Array to store command history
+    let historyIndex = 0; // Current position in history; initialized to 0
+
+    document.getElementById('input').addEventListener('keydown', function (event) {
+      const inputField = document.getElementById('input');
+      let handled = false;
+
+      // Enter key: Execute the command and add it to history
+      if (event.keyCode === 13) {
+        const command = inputField.value.trim();
+        if (command !== '') {
+          handleInput(command);
+          history.unshift(command); // Add command to the start of the history array
+          historyIndex = 0; // Reset history index after a new command is entered
+          inputField.value = ''; // Clear the input field
+        }
+        handled = true;
+      }
+
+      // Up arrow key: Navigate back through command history
+      else if (event.keyCode === 38 && history.length > 0) {
+        if (historyIndex < history.length - 1) {
+          historyIndex++;
+        }
+        inputField.value = history[historyIndex];
+        handled = true;
+      }
+
+      // Down arrow key: Navigate forward through command history
+      else if (event.keyCode === 40 && history.length > 0) {
+        if (historyIndex > 0) {
+          historyIndex--;
+          inputField.value = history[historyIndex];
+        } else {
+          historyIndex = 0; // Return to the "new command" state
+          inputField.value = '';
+        }
+        handled = true;
+      }
+
+      if (handled) {
+        event.preventDefault(); // Prevent the default action to avoid moving the cursor
+        event.stopPropagation(); // Stop the event from propagating further
+      }
+    });
+
     function handleInput(input) {
       appendOutput(input);
       Module.ccall('wasm_repl', 'null', ['string'], [input]);
