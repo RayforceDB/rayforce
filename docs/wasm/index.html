@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Wasm REPL</title>
+  <style>
+    body,
+    html {
+      height: 100%;
+      margin: 0;
+      font-family: monospace;
+      background-color: black;
+      color: white;
+    }
+
+    #container {
+      padding: 20px;
+      height: calc(100% - 40px);
+      overflow-y: auto;
+    }
+
+    #output {
+      white-space: pre-wrap;
+    }
+
+    .input-line {
+      display: flex;
+      align-items: center;
+    }
+
+    .prompt {
+      margin-right: 5px;
+    }
+
+    #input {
+      border: none;
+      background-color: black;
+      color: white;
+      flex-grow: 1;
+      margin-top: 5px;
+    }
+
+    #input:focus {
+      outline: none;
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Adjust your HTML to include a static prompt next to the input field -->
+  <div id="container" onclick="document.getElementById('input').focus();">
+    <div id="output"></div>
+    <div>
+      <span style="color: green;">&gt;</span>
+      <input id="input" type="text" autofocus
+        onkeydown="if(event.keyCode === 13) {handleInput(this.value); this.value='';}">
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/ansi_up@5"></script>
+  <script src="rayforce.js"></script>
+  <script>
+    function handleInput(input) {
+      appendOutput(input);
+      Module.ccall('wasm_repl', 'null', ['string'], [input]);
+      document.getElementById('input').focus(); // Refocus on the input field
+    }
+
+    // Function that your Wasm module can call to output text
+    function appendOutput(text) {
+      const outputElement = document.getElementById('output');
+      // Handle escape sequences in text, if any
+      const ansiUp = new AnsiUp();
+      const html = ansiUp.ansi_to_html(text);
+      outputElement.innerHTML += html + '<br>';
+      // Scroll to the bottom of the container to keep the input in view
+      const container = document.getElementById('container');
+      container.scrollTop = container.scrollHeight;
+    }
+
+    // Make the appendOutput function accessible from Wasm
+    Module['appendOutput'] = appendOutput;
+  </script>
+</body>
+
+</html>

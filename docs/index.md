@@ -32,6 +32,8 @@ The "another one" columnar database engineered to optimize your data analytics a
 
     RayforceDB is licensed under MIT and available on [GitHub](https://github.com/singaraiona/rayforce)
 
+    [:octicons-arrow-right-24: Try it online](wasm/index.html)
+
 </div>
 
 <asciinema-player src="assets/intro.cast" preload rows="24"></asciinema-player>
