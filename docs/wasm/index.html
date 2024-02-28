@@ -83,7 +83,7 @@
   <script src="rayforce.js"></script>
   <script>
     let history = []; // Array to store command history
-    let historyIndex = 0; // Current position in history; initialized to 0
+    let historyIndex = -1; // Current position in history;
 
     document.getElementById('input').addEventListener('keydown', function (event) {
       const inputField = document.getElementById('input');
