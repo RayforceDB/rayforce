@@ -3,6 +3,7 @@
 
 <head>
   <title>Wasm REPL</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css">
   <style>
     body,
     html {
@@ -10,12 +11,31 @@
       margin: 0;
       font-family: monospace;
       background-color: black;
+      color: gray;
+      display: flex;
+    }
+
+    #sidebar {
+      display: flex;
+      flex-direction: column;
+      padding: 10px;
+      background-color: #333;
+      /* Or any other color */
+    }
+
+    #sidebar button {
+      background: none;
+      border: none;
       color: white;
+      cursor: pointer;
+      margin-bottom: 10px;
+      font-size: 24px;
+      /* padding-bottom: 20px; */
     }
 
     #container {
+      flex-grow: 1;
       padding: 20px;
-      height: calc(100% - 40px);
       overflow-y: auto;
     }
 
@@ -35,7 +55,7 @@
     #input {
       border: none;
       background-color: black;
-      color: white;
+      color: gray;
       flex-grow: 1;
       margin-top: 5px;
     }
@@ -47,11 +67,15 @@
 </head>
 
 <body>
-  <!-- Adjust your HTML to include a static prompt next to the input field -->
+  <div id="sidebar">
+    <button onclick="location.href='/'"><i class="fas fa-home"></i></button>
+    <button onclick="location.href='https://github.com/singaraiona/rayforce'"><i class="fab fa-github"></i></button>
+    <button class="icon-btn" onclick="clearInput()"><i class="fas fa-broom"></i></button>
+  </div>
   <div id="container" onclick="document.getElementById('input').focus();">
     <div id="output"></div>
     <div>
-      <span style="color: green;">&gt;</span>
+      <span style="color: green;">&gt; </span>
       <input id="input" type="text" autofocus
         onkeydown="if(event.keyCode === 13) {handleInput(this.value); this.value='';}">
     </div>
@@ -65,19 +89,21 @@
       document.getElementById('input').focus(); // Refocus on the input field
     }
 
-    // Function that your Wasm module can call to output text
     function appendOutput(text) {
       const outputElement = document.getElementById('output');
-      // Handle escape sequences in text, if any
       const ansiUp = new AnsiUp();
       const html = ansiUp.ansi_to_html(text);
       outputElement.innerHTML += html + '<br>';
-      // Scroll to the bottom of the container to keep the input in view
       const container = document.getElementById('container');
       container.scrollTop = container.scrollHeight;
     }
 
-    // Make the appendOutput function accessible from Wasm
+    function clearInput() {
+      document.getElementById('output').innerHTML = '';
+      document.getElementById('input').value = '';
+      document.getElementById('input').focus();
+    }
+
     Module['appendOutput'] = appendOutput;
   </script>
 </body>
