@@ -125,13 +125,20 @@
       }
     });
 
+    function onRuntimeInit(info) {
+      sendOutput(info);
+    };
+
     function handleInput(input) {
-      printf(input);
-      Module.ccall('wasm_repl', 'null', ['string'], [input]);
+      const obj = Module.ccall('parseval', 'number', ['string'], [input]);
+      const fmt = Module.ccall('obj_fmt', 'string', ['number'], [obj]);
+      sendOutput(fmt);
+      Module.ccall('drop', 'null', ['number'], [obj]);
+      Module.ccall('disp', 'null', ['string'], [fmt]);
       document.getElementById('input').focus(); // Refocus on the input field
     }
 
-    function printf(text) {
+    function sendOutput(text) {
       const outputElement = document.getElementById('output');
       const ansiUp = new AnsiUp();
       const html = ansiUp.ansi_to_html(text);
@@ -146,7 +153,8 @@
       document.getElementById('input').focus();
     }
 
-    Module['printf'] = printf;
+    Module['rayforce_ready'] = onRuntimeInit;
+
   </script>
 </body>
 
