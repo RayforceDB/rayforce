@@ -71,7 +71,7 @@ wasm: CC = emcc
 wasm: AR = emar
 wasm: $(APP_OBJECTS) lib
 	$(CC) $(CFLAGS) -o $(TARGET).js $(CORE_OBJECTS) \
-	-s "EXPORTED_FUNCTIONS=['_main', '_version', '_null', '_drop', '_clone', '_release', '_parseval', '_obj_fmt']" \
+	-s "EXPORTED_FUNCTIONS=['_main', '_version', '_null', '_drop', '_clone', '_disp', '_parseval', '_obj_fmt']" \
 	-s "EXPORTED_RUNTIME_METHODS=['ccall', 'cwrap']" -s ALLOW_MEMORY_GROWTH=1 -L. -l$(TARGET) $(LIBS) 
 # -DSYS_MALLOC -g
 

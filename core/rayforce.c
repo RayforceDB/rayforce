@@ -1677,10 +1677,11 @@ str_t typename(type_t type)
     return symtostr(env_get_typename_by_type(&runtime_get()->env, type));
 }
 
-nil_t release(raw_t ptr)
+nil_t disp(raw_t ptr)
 {
-    printf("RELEASE!!!!!!!!!!!!!!!!!!");
-    // heap_free(ptr);
+    printf("FREE: %p\n", ptr);
+
+    heap_free(ptr);
 }
 
 obj_t parseval(str_t str)

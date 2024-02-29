@@ -190,8 +190,8 @@ extern u32_t rc(obj_t obj);    // get refcount
 extern obj_t error(i8_t code, str_t fmt, ...);       // Creates an error object
 
 // Destructors
-extern nil_t drop(obj_t obj);    // Free an object
-extern nil_t release(raw_t ptr); // Free a raw pointer
+extern nil_t drop(obj_t obj); // Free an object
+extern nil_t disp(raw_t ptr); // Free a raw pointer
 
 // Accessors
 #define as_string(obj)    ((str_t)__builtin_assume_aligned((obj + 1), sizeof(struct obj_t)))
