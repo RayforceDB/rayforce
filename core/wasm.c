@@ -21,12 +21,12 @@
  *   SOFTWARE.
  */
 
+#include <emscripten.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
-#include "wasm.h"
 #include "parse.h"
 #include "hash.h"
 #include "format.h"
@@ -93,29 +93,6 @@ obj_t ipc_send_async(poll_t poll, i64_t id, obj_t msg)
     return NULL_OBJ;
 }
 
-// Define the wasm_repl function to be called from JavaScript
-EMSCRIPTEN_KEEPALIVE nil_t wasm_repl(str_t input)
-{
-    obj_t src, res;
-    str_t fmt;
-    u64_t n;
-    poll_t poll = runtime_get()->poll;
-
-    n = strlen(input);
-
-    if (n == 0)
-        return;
-
-    // src = string_from_str(input, n);
-    // res = eval_str(src, poll->replfile);
-    // drop(src);
-
-    // fmt = obj_fmt(res);
-    // js_printf(fmt);
-    // heap_free(fmt);
-    // drop(res);
-}
-
 // nil_t print_logo(nil_t)
 // {
 //     str_t logo = str_fmt(0, LOGO, RAYFORCE_MAJOR_VERSION, RAYFORCE_MINOR_VERSION, __DATE__);
@@ -129,7 +106,5 @@ EMSCRIPTEN_KEEPALIVE i32_t main(i32_t argc, str_t argv[])
 {
     atexit(runtime_cleanup);
     runtime_init(argc, argv);
-    // print_logo();
-
     return runtime_run();
 }

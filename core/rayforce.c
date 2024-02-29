@@ -1677,12 +1677,19 @@ str_t typename(type_t type)
     return symtostr(env_get_typename_by_type(&runtime_get()->env, type));
 }
 
-str_t objtostr(obj_t obj)
-{
-    return obj_fmt(obj);
-}
-
 nil_t release(raw_t ptr)
 {
-    heap_free(ptr);
+    printf("RELEASE!!!!!!!!!!!!!!!!!!");
+    // heap_free(ptr);
+}
+
+obj_t parseval(str_t str)
+{
+    obj_t s, res;
+
+    s = string_from_str(str, strlen(str));
+    res = eval_str(s, NULL_OBJ);
+    drop(s);
+
+    return res;
 }

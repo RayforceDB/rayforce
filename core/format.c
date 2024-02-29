@@ -309,8 +309,8 @@ i64_t error_frame_fmt_into(str_t *dst, i64_t *len, i64_t *offset, i64_t limit, o
     span_t span = (span_t){0};
 
     span.id = frame[0]->i64;
-    filename = frame[1] ? as_string(frame[1]) : "repl";
-    function = frame[2] ? symtostr(frame[2]->i64) : "anonymous";
+    filename = (frame[1] != NULL_OBJ) ? as_string(frame[1]) : "repl";
+    function = (frame[2] != NULL_OBJ) ? symtostr(frame[2]->i64) : "anonymous";
     source = as_string(frame[3]);
 
     n += str_fmt_into(dst, len, offset, MAX_ERROR_LEN, "%s [%lld] %s%s-->%s %s:%d:%d..%d:%d in function: @%s\n",

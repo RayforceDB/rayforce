@@ -233,7 +233,6 @@ extern obj_t at_ids(obj_t obj, i64_t ids[], u64_t len); // read values from an o
 extern obj_t at_obj(obj_t obj, obj_t idx);              // read from obj indexed by obj
 extern obj_t at_sym(obj_t obj, str_t str);              // read value indexed by symbol created from str
 extern str_t symtostr(i64_t id);                        // return interned string by interned id
-extern str_t objtostr(obj_t obj);                       // return string representation of an object
 
 // Initialize obj with zeroed memory
 extern nil_t zero_obj(obj_t obj);
@@ -268,6 +267,9 @@ extern obj_t parse_str(i64_t fd, obj_t str, obj_t file);
 extern obj_t eval_str(obj_t str, obj_t file);
 extern obj_t eval_obj(obj_t obj); // Moves ownership of obj to the eval function
 extern obj_t try_obj(obj_t obj, obj_t catch);
+
+// Parse and evaluate
+extern obj_t parseval(str_t str);
 
 #ifdef __cplusplus
 }
