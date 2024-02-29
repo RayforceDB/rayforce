@@ -126,12 +126,12 @@
     });
 
     function handleInput(input) {
-      appendOutput(input);
+      printf(input);
       Module.ccall('wasm_repl', 'null', ['string'], [input]);
       document.getElementById('input').focus(); // Refocus on the input field
     }
 
-    function appendOutput(text) {
+    function printf(text) {
       const outputElement = document.getElementById('output');
       const ansiUp = new AnsiUp();
       const html = ansiUp.ansi_to_html(text);
@@ -146,7 +146,7 @@
       document.getElementById('input').focus();
     }
 
-    Module['appendOutput'] = appendOutput;
+    Module['printf'] = printf;
   </script>
 </body>
 
