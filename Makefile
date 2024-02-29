@@ -66,14 +66,13 @@ chkleak: app
 	valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes ./$(TARGET)
 
 # wasm: CFLAGS = -O0
-wasm: CFLAGS = -fPIC -Wall -std=c17 -O3 -msimd128 -fassociative-math -ftree-vectorize -fno-math-errno -funsafe-math-optimizations -ffinite-math-only -funroll-loops
+wasm: CFLAGS = -fPIC -Wall -std=c17 -O3 -msimd128 -fassociative-math -ftree-vectorize -fno-math-errno -funsafe-math-optimizations -ffinite-math-only -funroll-loops -DSYS_MALLOC
 wasm: CC = emcc 
 wasm: AR = emar
 wasm: $(APP_OBJECTS) lib
 	$(CC) $(CFLAGS) -o $(TARGET).js $(CORE_OBJECTS) \
 	-s "EXPORTED_FUNCTIONS=['_main', '_version', '_null', '_drop', '_clone', '_disp', '_parseval', '_obj_fmt']" \
-	-s "EXPORTED_RUNTIME_METHODS=['ccall', 'cwrap']" -s ALLOW_MEMORY_GROWTH=1 -L. -l$(TARGET) $(LIBS) 
-# -DSYS_MALLOC -g
+	-s "EXPORTED_RUNTIME_METHODS=['ccall', 'cwrap']" -s ALLOW_MEMORY_GROWTH=1 -L. -l$(TARGET) $(LIBS)
 
 clean:
 	-rm -f *.o
