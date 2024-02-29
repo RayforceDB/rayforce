@@ -134,7 +134,7 @@
       const fmt = Module.ccall('obj_fmt', 'string', ['number'], [obj]);
       sendOutput(fmt);
       Module.ccall('drop', 'null', ['number'], [obj]);
-      Module.ccall('disp', 'null', ['string'], [fmt]);
+      // Module.ccall('disp', 'null', ['string'], [fmt]);
       document.getElementById('input').focus(); // Refocus on the input field
     }
 
