@@ -27,41 +27,41 @@
 #include "ops.h"
 #include "error.h"
 
-obj_t ray_eq(obj_t x, obj_t y)
+obj_p ray_eq(obj_p x, obj_p y)
 {
     i64_t i, l;
-    obj_t vec;
+    obj_p vec;
 
     switch (mtype2(x->type, y->type))
     {
-    case mtype2(TYPE_BOOL, TYPE_BOOL):
-        return (bool(x->bool == y->bool));
+    case mtype2(TYPE_B8, TYPE_B8):
+        return (b8(x->b8 == y->b8));
 
     case mtype2(-TYPE_I64, -TYPE_I64):
     case mtype2(-TYPE_SYMBOL, -TYPE_SYMBOL):
     case mtype2(-TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
-        return (bool(x->i64 == y->i64));
+        return (b8(x->i64 == y->i64));
 
     case mtype2(-TYPE_F64, -TYPE_F64):
-        return (bool(x->f64 == y->f64));
+        return (b8(x->f64 == y->f64));
 
     case mtype2(TYPE_I64, -TYPE_I64):
     case mtype2(TYPE_SYMBOL, -TYPE_SYMBOL):
     case mtype2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] == y->i64;
+            as_b8(vec)[i] = as_i64(x)[i] == y->i64;
 
         return vec;
 
     case mtype2(TYPE_F64, -TYPE_F64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] == y->f64;
+            as_b8(vec)[i] = as_f64(x)[i] == y->f64;
 
         return vec;
 
@@ -69,19 +69,19 @@ obj_t ray_eq(obj_t x, obj_t y)
     case mtype2(-TYPE_SYMBOL, TYPE_SYMBOL):
     case mtype2(-TYPE_TIMESTAMP, TYPE_TIMESTAMP):
         l = y->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = x->i64 == as_i64(y)[i];
+            as_b8(vec)[i] = x->i64 == as_i64(y)[i];
 
         return vec;
 
     case mtype2(-TYPE_F64, TYPE_F64):
         l = y->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = x->f64 == as_f64(y)[i];
+            as_b8(vec)[i] = x->f64 == as_f64(y)[i];
 
         return vec;
 
@@ -92,10 +92,10 @@ obj_t ray_eq(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "eq: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] == as_i64(y)[i];
+            as_b8(vec)[i] = as_i64(x)[i] == as_i64(y)[i];
 
         return vec;
 
@@ -104,10 +104,10 @@ obj_t ray_eq(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "eq: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] == as_f64(y)[i];
+            as_b8(vec)[i] = as_f64(x)[i] == as_f64(y)[i];
 
         return vec;
 
@@ -116,39 +116,39 @@ obj_t ray_eq(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "eq: lists of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = (objcmp(as_list(x)[i], as_list(y)[i]) == 0);
+            as_b8(vec)[i] = (cmp_obj(as_list(x)[i], as_list(y)[i]) == 0);
 
         return vec;
 
     default:
-        throw(ERR_TYPE, "eq: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "eq: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_ne(obj_t x, obj_t y)
+obj_p ray_ne(obj_p x, obj_p y)
 {
     i64_t i, l;
-    obj_t vec;
+    obj_p vec;
 
     switch (mtype2(x->type, y->type))
     {
-    case mtype2(TYPE_BOOL, TYPE_BOOL):
-        return (bool(x->bool != y->bool));
+    case mtype2(TYPE_B8, TYPE_B8):
+        return (b8(x->b8 != y->b8));
 
     case mtype2(-TYPE_I64, -TYPE_I64):
-        return (bool(x->i64 != y->i64));
+        return (b8(x->i64 != y->i64));
 
     case mtype2(-TYPE_F64, -TYPE_F64):
-        return (bool(x->f64 != y->f64));
+        return (b8(x->f64 != y->f64));
 
     case mtype2(TYPE_I64, -TYPE_I64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] != y->i64;
+            as_b8(vec)[i] = as_i64(x)[i] != y->i64;
 
         return vec;
 
@@ -157,18 +157,18 @@ obj_t ray_ne(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "ne: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] != as_i64(y)[i];
+            as_b8(vec)[i] = as_i64(x)[i] != as_i64(y)[i];
 
         return vec;
 
     case mtype2(TYPE_F64, -TYPE_F64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] != y->f64;
+            as_b8(vec)[i] = as_f64(x)[i] != y->f64;
 
         return vec;
 
@@ -177,10 +177,10 @@ obj_t ray_ne(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "ne: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] != as_f64(y)[i];
+            as_b8(vec)[i] = as_f64(x)[i] != as_f64(y)[i];
 
         return vec;
 
@@ -189,37 +189,37 @@ obj_t ray_ne(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "ne: lists of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] =
-                (objcmp(as_list(x)[i], as_list(y)[i]) != 0);
+            as_b8(vec)[i] =
+                (cmp_obj(as_list(x)[i], as_list(y)[i]) != 0);
 
         return vec;
 
     default:
-        throw(ERR_TYPE, "ne: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "ne: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_lt(obj_t x, obj_t y)
+obj_p ray_lt(obj_p x, obj_p y)
 {
     i64_t i, l;
-    obj_t vec;
+    obj_p vec;
 
     switch (mtype2(x->type, y->type))
     {
     case mtype2(-TYPE_I64, -TYPE_I64):
-        return (bool(x->i64 < y->i64));
+        return (b8(x->i64 < y->i64));
 
     case mtype2(-TYPE_F64, -TYPE_F64):
-        return (bool(x->f64 < y->f64));
+        return (b8(x->f64 < y->f64));
 
     case mtype2(TYPE_I64, -TYPE_I64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] < y->i64;
+            as_b8(vec)[i] = as_i64(x)[i] < y->i64;
 
         return vec;
 
@@ -228,18 +228,18 @@ obj_t ray_lt(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "lt: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] < as_i64(y)[i];
+            as_b8(vec)[i] = as_i64(x)[i] < as_i64(y)[i];
 
         return vec;
 
     case mtype2(TYPE_F64, -TYPE_F64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] < y->f64;
+            as_b8(vec)[i] = as_f64(x)[i] < y->f64;
 
         return vec;
 
@@ -248,10 +248,10 @@ obj_t ray_lt(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "lt: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] < as_f64(y)[i];
+            as_b8(vec)[i] = as_f64(x)[i] < as_f64(y)[i];
 
         return vec;
 
@@ -260,37 +260,37 @@ obj_t ray_lt(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "ne: lists of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] =
-                (objcmp(as_list(x)[i], as_list(y)[i]) < 0);
+            as_b8(vec)[i] =
+                (cmp_obj(as_list(x)[i], as_list(y)[i]) < 0);
 
         return vec;
 
     default:
-        throw(ERR_TYPE, "lt: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "lt: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_le(obj_t x, obj_t y)
+obj_p ray_le(obj_p x, obj_p y)
 {
     i64_t i, l;
-    obj_t vec;
+    obj_p vec;
 
     switch (mtype2(x->type, y->type))
     {
     case mtype2(-TYPE_I64, -TYPE_I64):
-        return (bool(x->i64 <= y->i64));
+        return (b8(x->i64 <= y->i64));
 
     case mtype2(-TYPE_F64, -TYPE_F64):
-        return (bool(x->f64 <= y->f64));
+        return (b8(x->f64 <= y->f64));
 
     case mtype2(TYPE_I64, -TYPE_I64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] <= y->i64;
+            as_b8(vec)[i] = as_i64(x)[i] <= y->i64;
 
         return vec;
 
@@ -299,18 +299,18 @@ obj_t ray_le(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "le: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] <= as_i64(y)[i];
+            as_b8(vec)[i] = as_i64(x)[i] <= as_i64(y)[i];
 
         return vec;
 
     case mtype2(TYPE_F64, -TYPE_F64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] <= y->f64;
+            as_b8(vec)[i] = as_f64(x)[i] <= y->f64;
 
         return vec;
 
@@ -319,10 +319,10 @@ obj_t ray_le(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "le: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] <= as_f64(y)[i];
+            as_b8(vec)[i] = as_f64(x)[i] <= as_f64(y)[i];
 
         return vec;
 
@@ -331,37 +331,37 @@ obj_t ray_le(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "ne: lists of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] =
-                (objcmp(as_list(x)[i], as_list(y)[i]) <= 0);
+            as_b8(vec)[i] =
+                (cmp_obj(as_list(x)[i], as_list(y)[i]) <= 0);
 
         return vec;
 
     default:
-        throw(ERR_TYPE, "le: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "le: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_gt(obj_t x, obj_t y)
+obj_p ray_gt(obj_p x, obj_p y)
 {
     i64_t i, l;
-    obj_t vec;
+    obj_p vec;
 
     switch (mtype2(x->type, y->type))
     {
     case mtype2(-TYPE_I64, -TYPE_I64):
-        return (bool(x->i64 > y->i64));
+        return (b8(x->i64 > y->i64));
 
     case mtype2(-TYPE_F64, -TYPE_F64):
-        return (bool(x->f64 > y->f64));
+        return (b8(x->f64 > y->f64));
 
     case mtype2(TYPE_I64, -TYPE_I64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] > y->i64;
+            as_b8(vec)[i] = as_i64(x)[i] > y->i64;
 
         return vec;
 
@@ -370,18 +370,18 @@ obj_t ray_gt(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "gt: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] > as_i64(y)[i];
+            as_b8(vec)[i] = as_i64(x)[i] > as_i64(y)[i];
 
         return vec;
 
     case mtype2(TYPE_F64, -TYPE_F64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] > y->f64;
+            as_b8(vec)[i] = as_f64(x)[i] > y->f64;
 
         return vec;
 
@@ -390,10 +390,10 @@ obj_t ray_gt(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "gt: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] > as_f64(y)[i];
+            as_b8(vec)[i] = as_f64(x)[i] > as_f64(y)[i];
 
         return vec;
 
@@ -402,37 +402,37 @@ obj_t ray_gt(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "ne: lists of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] =
-                (objcmp(as_list(x)[i], as_list(y)[i]) > 0);
+            as_b8(vec)[i] =
+                (cmp_obj(as_list(x)[i], as_list(y)[i]) > 0);
 
         return vec;
 
     default:
-        throw(ERR_TYPE, "gt: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "gt: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_ge(obj_t x, obj_t y)
+obj_p ray_ge(obj_p x, obj_p y)
 {
     i64_t i, l;
-    obj_t vec;
+    obj_p vec;
 
     switch (mtype2(x->type, y->type))
     {
     case mtype2(-TYPE_I64, -TYPE_I64):
-        return (bool(x->i64 >= y->i64));
+        return (b8(x->i64 >= y->i64));
 
     case mtype2(-TYPE_F64, -TYPE_F64):
-        return (bool(x->f64 >= y->f64));
+        return (b8(x->f64 >= y->f64));
 
     case mtype2(TYPE_I64, -TYPE_I64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] >= y->i64;
+            as_b8(vec)[i] = as_i64(x)[i] >= y->i64;
 
         return vec;
 
@@ -441,18 +441,18 @@ obj_t ray_ge(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "ge: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_i64(x)[i] >= as_i64(y)[i];
+            as_b8(vec)[i] = as_i64(x)[i] >= as_i64(y)[i];
 
         return vec;
 
     case mtype2(TYPE_F64, -TYPE_F64):
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] >= y->f64;
+            as_b8(vec)[i] = as_f64(x)[i] >= y->f64;
 
         return vec;
 
@@ -461,10 +461,10 @@ obj_t ray_ge(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "ge: vectors of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] = as_f64(x)[i] >= as_f64(y)[i];
+            as_b8(vec)[i] = as_f64(x)[i] >= as_f64(y)[i];
 
         return vec;
 
@@ -473,15 +473,15 @@ obj_t ray_ge(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "ne: lists of different length");
 
         l = x->len;
-        vec = vector_bool(l);
+        vec = vector_b8(l);
 
         for (i = 0; i < l; i++)
-            as_bool(vec)[i] =
-                (objcmp(as_list(x)[i], as_list(y)[i]) >= 0);
+            as_b8(vec)[i] =
+                (cmp_obj(as_list(x)[i], as_list(y)[i]) >= 0);
 
         return vec;
 
     default:
-        throw(ERR_TYPE, "ge: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "ge: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }

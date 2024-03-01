@@ -39,56 +39,56 @@
 #include "filter.h"
 #include "update.h"
 
-obj_t get_fields(obj_t obj)
+obj_p get_fields(obj_p obj)
 {
-    obj_t keywords, symbols;
+    obj_p keywords, symbols;
 
     keywords = vn_symbol(4, "take", "by", "from", "where");
     symbols = ray_except(as_list(obj)[0], keywords);
-    drop(keywords);
+    drop_obj(keywords);
 
     return symbols;
 }
 
-obj_t remap_filter(obj_t x, obj_t y)
+obj_p remap_filter(obj_p x, obj_p y)
 {
     u64_t i, l;
-    obj_t res;
+    obj_p res;
 
     l = as_list(x)[1]->len;
     res = list(l);
     for (i = 0; i < l; i++)
-        as_list(res)[i] = filter_map(clone(as_list(as_list(x)[1])[i]), clone(y));
+        as_list(res)[i] = filter_map(clone_obj(as_list(as_list(x)[1])[i]), clone_obj(y));
 
-    return table(clone(as_list(x)[0]), res);
+    return table(clone_obj(as_list(x)[0]), res);
 }
 
-obj_t remap_group(obj_t *aggr, obj_t x, obj_t y, obj_t z, obj_t k)
+obj_p remap_group(obj_p *aggr, obj_p x, obj_p y, obj_p z, obj_p k)
 {
-    obj_t bins, v, res;
+    obj_p bins, v, res;
 
     bins = group_bins(x, y, z);
     res = group_map(y, bins, z);
-    drop(bins);
+    drop_obj(bins);
 
     v = (k == NULL_OBJ) ? aggr_first(x, bins, z) : aggr_first(k, bins, z);
     if (is_error(v))
     {
-        drop(res);
-        drop(bins);
+        drop_obj(res);
+        drop_obj(bins);
         return v;
     }
 
     *aggr = v;
-    drop(bins);
+    drop_obj(bins);
 
     return res;
 }
 
-obj_t find_symbol_column(obj_t cols, obj_t obj)
+obj_p find_symbol_column(obj_p cols, obj_p obj)
 {
     u64_t i, l;
-    obj_t x;
+    obj_p x;
 
     switch (obj->type)
     {
@@ -112,10 +112,10 @@ obj_t find_symbol_column(obj_t cols, obj_t obj)
     }
 }
 
-obj_t ray_select(obj_t obj)
+obj_p ray_select(obj_p obj)
 {
     u64_t i, l, tablen;
-    obj_t keys = NULL_OBJ, vals = NULL_OBJ, filters = NULL_OBJ, groupby = NULL_OBJ,
+    obj_p keys = NULL_OBJ, vals = NULL_OBJ, filters = NULL_OBJ, groupby = NULL_OBJ,
           bycol = NULL_OBJ, bysym = NULL_OBJ, byval = NULL_OBJ, tab, sym, prm, val;
 
     if (obj->type != TYPE_DICT)
@@ -131,14 +131,14 @@ obj_t ray_select(obj_t obj)
         throw(ERR_LENGTH, "'select' expects 'from' param");
 
     tab = eval(prm);
-    drop(prm);
+    drop_obj(prm);
 
     if (is_error(tab))
         return tab;
 
     if (tab->type != TYPE_TABLE)
     {
-        drop(tab);
+        drop_obj(tab);
         throw(ERR_TYPE, "'select' from: expects table");
     }
 
@@ -151,18 +151,18 @@ obj_t ray_select(obj_t obj)
     if (prm != NULL_OBJ)
     {
         val = eval(prm);
-        drop(prm);
+        drop_obj(prm);
         if (is_error(val))
         {
-            drop(tab);
+            drop_obj(tab);
             return val;
         }
 
         filters = ray_where(val);
-        drop(val);
+        drop_obj(val);
         if (is_error(filters))
         {
-            drop(tab);
+            drop_obj(tab);
             return filters;
         }
     }
@@ -173,7 +173,7 @@ obj_t ray_select(obj_t obj)
     {
         bysym = find_symbol_column(as_list(tab)[0], prm);
         groupby = eval(prm);
-        drop(prm);
+        drop_obj(prm);
 
         if (bysym == NULL_OBJ)
             bysym = symbol("By");
@@ -184,35 +184,35 @@ obj_t ray_select(obj_t obj)
 
         if (is_error(groupby))
         {
-            drop(bysym);
-            drop(byval);
-            drop(filters);
-            drop(tab);
+            drop_obj(bysym);
+            drop_obj(byval);
+            drop_obj(filters);
+            drop_obj(tab);
             return groupby;
         }
 
         prm = remap_group(&bycol, groupby, tab, filters, byval);
-        drop(byval);
+        drop_obj(byval);
 
         if (is_error(prm))
         {
-            drop(filters);
-            drop(groupby);
-            drop(bysym);
-            drop(bycol);
-            drop(tab);
+            drop_obj(filters);
+            drop_obj(groupby);
+            drop_obj(bysym);
+            drop_obj(bycol);
+            drop_obj(tab);
             return prm;
         }
 
         mount_env(prm);
 
-        drop(prm);
-        drop(filters);
-        drop(groupby);
+        drop_obj(prm);
+        drop_obj(filters);
+        drop_obj(groupby);
 
         if (is_error(bycol))
         {
-            drop(tab);
+            drop_obj(tab);
             return bycol;
         }
     }
@@ -222,9 +222,9 @@ obj_t ray_select(obj_t obj)
         unmount_env(tablen);
         // Create filtermaps over table
         val = remap_filter(tab, filters);
-        drop(filters);
+        drop_obj(filters);
         mount_env(val);
-        drop(val);
+        drop_obj(val);
     }
 
     // Find all mappings (non-keyword fields)
@@ -239,18 +239,18 @@ obj_t ray_select(obj_t obj)
         {
             sym = at_idx(keys, i);
             prm = at_obj(obj, sym);
-            drop(sym);
+            drop_obj(sym);
             val = eval(prm);
-            drop(prm);
+            drop_obj(prm);
 
             if (is_error(val))
             {
                 vals->len = i;
-                drop(vals);
-                drop(tab);
-                drop(keys);
-                drop(bysym);
-                drop(bycol);
+                drop_obj(vals);
+                drop_obj(tab);
+                drop_obj(keys);
+                drop_obj(bysym);
+                drop_obj(bycol);
                 return val;
             }
 
@@ -258,30 +258,30 @@ obj_t ray_select(obj_t obj)
             if (val->type == TYPE_GROUPMAP)
             {
                 prm = group_collect(val);
-                drop(val);
+                drop_obj(val);
                 val = prm;
             }
             else if (val->type == TYPE_FILTERMAP)
             {
                 prm = filter_collect(val);
-                drop(val);
+                drop_obj(val);
                 val = prm;
             }
             else if (val->type == TYPE_ENUM)
             {
                 prm = ray_value(val);
-                drop(val);
+                drop_obj(val);
                 val = prm;
             }
 
             if (is_error(val))
             {
                 vals->len = i;
-                drop(vals);
-                drop(tab);
-                drop(keys);
-                drop(bysym);
-                drop(bycol);
+                drop_obj(vals);
+                drop_obj(tab);
+                drop_obj(keys);
+                drop_obj(bysym);
+                drop_obj(bycol);
                 return val;
             }
 
@@ -290,7 +290,7 @@ obj_t ray_select(obj_t obj)
     }
     else
     {
-        drop(keys);
+        drop_obj(keys);
 
         // Groupings
         if (bysym != NULL_OBJ)
@@ -303,21 +303,21 @@ obj_t ray_select(obj_t obj)
             {
                 sym = at_idx(keys, i);
                 prm = ray_get(sym);
-                drop(sym);
+                drop_obj(sym);
 
                 if (is_error(prm))
                 {
                     vals->len = i;
-                    drop(vals);
-                    drop(tab);
-                    drop(keys);
-                    drop(bysym);
-                    drop(bycol);
+                    drop_obj(vals);
+                    drop_obj(tab);
+                    drop_obj(keys);
+                    drop_obj(bysym);
+                    drop_obj(bycol);
                     return prm;
                 }
 
                 val = aggr_first(as_list(prm)[0], as_list(prm)[1], as_list(prm)[2]);
-                drop(prm);
+                drop_obj(prm);
 
                 as_list(vals)[i] = val;
             }
@@ -325,7 +325,7 @@ obj_t ray_select(obj_t obj)
         // No groupings
         else
         {
-            keys = clone(as_list(tab)[0]);
+            keys = clone_obj(as_list(tab)[0]);
             l = keys->len;
             vals = list(l);
 
@@ -333,17 +333,17 @@ obj_t ray_select(obj_t obj)
             {
                 sym = at_idx(keys, i);
                 prm = ray_get(sym);
-                drop(sym);
+                drop_obj(sym);
 
                 if (prm->type == TYPE_FILTERMAP)
                 {
                     val = filter_collect(prm);
-                    drop(prm);
+                    drop_obj(prm);
                 }
                 else if (prm->type == TYPE_ENUM)
                 {
                     val = ray_value(prm);
-                    drop(prm);
+                    drop_obj(prm);
                 }
                 else
                     val = prm;
@@ -351,11 +351,11 @@ obj_t ray_select(obj_t obj)
                 if (is_error(val))
                 {
                     vals->len = i;
-                    drop(vals);
-                    drop(tab);
-                    drop(keys);
-                    drop(bysym);
-                    drop(bycol);
+                    drop_obj(vals);
+                    drop_obj(tab);
+                    drop_obj(keys);
+                    drop_obj(bysym);
+                    drop_obj(bycol);
                     return val;
                 }
 
@@ -368,23 +368,23 @@ obj_t ray_select(obj_t obj)
     if (bysym != NULL_OBJ)
     {
         val = ray_concat(bysym, keys);
-        drop(keys);
-        drop(bysym);
+        drop_obj(keys);
+        drop_obj(bysym);
         keys = val;
         val = list(vals->len + 1);
         as_list(val)[0] = bycol;
         for (i = 0; i < vals->len; i++)
-            as_list(val)[i + 1] = clone(as_list(vals)[i]);
-        drop(vals);
+            as_list(val)[i + 1] = clone_obj(as_list(vals)[i]);
+        drop_obj(vals);
         vals = val;
     }
 
     unmount_env(tablen);
-    drop(tab);
+    drop_obj(tab);
 
     val = ray_table(keys, vals);
-    drop(keys);
-    drop(vals);
+    drop_obj(keys);
+    drop_obj(vals);
 
     return val;
 }

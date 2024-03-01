@@ -26,7 +26,7 @@
 
 #include "rayforce.h"
 
-obj_t ray_sort_asc(obj_t vec);
-obj_t ray_sort_desc(obj_t vec);
+obj_p ray_sort_asc(obj_p vec);
+obj_p ray_sort_desc(obj_p vec);
 
 #endif // SORT_H

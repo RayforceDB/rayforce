@@ -47,7 +47,7 @@ typedef enum test_status_t
 typedef struct test_result_t
 {
     test_status_t status;
-    str_t msg;
+    str_p msg;
 } test_result_t;
 
 // Test function prototype
@@ -56,7 +56,7 @@ typedef test_result_t (*test_func)();
 // Define a struct to hold a test function and its name
 typedef struct test_entry_t
 {
-    str_t name;
+    str_p name;
     test_func func;
 } test_entry_t;
 

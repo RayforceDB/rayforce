@@ -30,10 +30,10 @@
 #include "error.h"
 #include "aggr.h"
 
-obj_t ray_add(obj_t x, obj_t y)
+obj_p ray_add(obj_p x, obj_p y)
 {
     u64_t i, l = 0;
-    obj_t vec;
+    obj_p vec;
     i64_t *xivals = NULL, *yivals = NULL, *iout;
     f64_t *xfvals = NULL, *yfvals = NULL, *fout;
 
@@ -173,14 +173,14 @@ obj_t ray_add(obj_t x, obj_t y)
 
         return vec;
     default:
-        throw(ERR_TYPE, "add: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "add: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_sub(obj_t x, obj_t y)
+obj_p ray_sub(obj_p x, obj_p y)
 {
     u64_t i, l = 0;
-    obj_t vec;
+    obj_p vec;
     i64_t *xivals = NULL, *yivals = NULL;
     f64_t *xfvals = NULL, *yfvals = NULL;
 
@@ -309,14 +309,14 @@ obj_t ray_sub(obj_t x, obj_t y)
 
         return vec;
     default:
-        throw(ERR_TYPE, "sub: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "sub: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_mul(obj_t x, obj_t y)
+obj_p ray_mul(obj_p x, obj_p y)
 {
     u64_t i, l = 0;
-    obj_t vec;
+    obj_p vec;
     i64_t *xivals = NULL, *yivals = NULL;
     f64_t *xfvals = NULL, *yfvals = NULL;
 
@@ -443,14 +443,14 @@ obj_t ray_mul(obj_t x, obj_t y)
 
         return vec;
     default:
-        throw(ERR_TYPE, "mul: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "mul: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_div(obj_t x, obj_t y)
+obj_p ray_div(obj_p x, obj_p y)
 {
     u64_t i, l = 0;
-    obj_t vec;
+    obj_p vec;
     i64_t *xivals = NULL, *yivals = NULL;
     f64_t *xfvals = NULL, *yfvals = NULL;
 
@@ -577,14 +577,14 @@ obj_t ray_div(obj_t x, obj_t y)
 
         return vec;
     default:
-        throw(ERR_TYPE, "div: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "div: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_fdiv(obj_t x, obj_t y)
+obj_p ray_fdiv(obj_p x, obj_p y)
 {
     u64_t i, l = 0;
-    obj_t vec;
+    obj_p vec;
     i64_t *xivals = NULL, *yivals = NULL;
     f64_t *xfvals = NULL, *yfvals = NULL;
 
@@ -711,14 +711,14 @@ obj_t ray_fdiv(obj_t x, obj_t y)
 
         return vec;
     default:
-        throw(ERR_TYPE, "add: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "add: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_mod(obj_t x, obj_t y)
+obj_p ray_mod(obj_p x, obj_p y)
 {
     u64_t i, l = 0;
-    obj_t vec;
+    obj_p vec;
     i64_t *xivals = NULL, *yivals = NULL;
     f64_t *xfvals = NULL, *yfvals = NULL;
 
@@ -845,11 +845,11 @@ obj_t ray_mod(obj_t x, obj_t y)
 
         return vec;
     default:
-        throw(ERR_TYPE, "add: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "add: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_sum(obj_t x)
+obj_p ray_sum(obj_p x)
 {
     u64_t i, l;
     i64_t isum, *xii;
@@ -858,9 +858,9 @@ obj_t ray_sum(obj_t x)
     switch (x->type)
     {
     case -TYPE_I64:
-        return clone(x);
+        return clone_obj(x);
     case -TYPE_F64:
-        return clone(x);
+        return clone_obj(x);
     case TYPE_I64:
         l = x->len;
         xii = as_i64(x);
@@ -879,11 +879,11 @@ obj_t ray_sum(obj_t x)
         return aggr_sum(as_list(x)[0], as_list(x)[1], as_list(x)[2]);
 
     default:
-        throw(ERR_TYPE, "sum: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "sum: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_avg(obj_t x)
+obj_p ray_avg(obj_p x)
 {
     u64_t i, l = 0, n;
     i64_t isum = 0, *xivals = NULL;
@@ -893,7 +893,7 @@ obj_t ray_avg(obj_t x)
     {
     case -TYPE_I64:
     case -TYPE_F64:
-        return clone(x);
+        return clone_obj(x);
     case TYPE_I64:
         l = x->len;
         xivals = as_i64(x);
@@ -921,16 +921,16 @@ obj_t ray_avg(obj_t x)
         return aggr_avg(as_list(x)[0], as_list(x)[1], as_list(x)[2]);
 
     default:
-        throw(ERR_TYPE, "avg: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "avg: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_min(obj_t x)
+obj_p ray_min(obj_p x)
 {
     u64_t i, l = 0;
     i64_t imin, iv, *xivals = NULL;
     f64_t fmin = 0.0, *xfvals = NULL;
-    obj_t res;
+    obj_p res;
 
     switch (x->type)
     {
@@ -976,16 +976,16 @@ obj_t ray_min(obj_t x)
         return aggr_min(as_list(x)[0], as_list(x)[1], as_list(x)[2]);
 
     default:
-        throw(ERR_TYPE, "min: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "min: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_max(obj_t x)
+obj_p ray_max(obj_p x)
 {
     u64_t i, l = 0;
     i64_t imax = 0, *xivals = NULL;
     f64_t fmax = 0.0, *xfvals = NULL;
-    obj_t res;
+    obj_p res;
 
     switch (x->type)
     {
@@ -1025,15 +1025,15 @@ obj_t ray_max(obj_t x)
         return aggr_max(as_list(x)[0], as_list(x)[1], as_list(x)[2]);
 
     default:
-        throw(ERR_TYPE, "max: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "max: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_dev(obj_t x)
+obj_p ray_dev(obj_p x)
 {
     u64_t i, l = 0;
     f64_t fsum = 0.0, favg = 0.0, *xfvals = NULL;
-    obj_t res;
+    obj_p res;
 
     switch (x->type)
     {
@@ -1086,16 +1086,16 @@ obj_t ray_dev(obj_t x)
         return aggr_dev(as_list(x)[0], as_list(x)[1], as_list(x)[2]);
 
     default:
-        throw(ERR_TYPE, "dev: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "dev: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_med(obj_t x)
+obj_p ray_med(obj_p x)
 {
     // u64_t i, l = 0;
     // i64_t *xivals = NULL;
     // f64_t *xfvals = NULL;
-    // obj_t res;
+    // obj_p res;
 
     switch (x->type)
     {
@@ -1129,16 +1129,16 @@ obj_t ray_med(obj_t x)
         return aggr_med(as_list(x)[0], as_list(x)[1], as_list(x)[2]);
 
     default:
-        throw(ERR_TYPE, "med: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "med: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_round(obj_t x)
+obj_p ray_round(obj_p x)
 {
     u64_t i, l = 0;
     i64_t *rvals;
     f64_t *xfvals;
-    obj_t res;
+    obj_p res;
 
     switch (x->type)
     {
@@ -1156,16 +1156,16 @@ obj_t ray_round(obj_t x)
 
         return res;
     default:
-        throw(ERR_TYPE, "round: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "round: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_floor(obj_t x)
+obj_p ray_floor(obj_p x)
 {
     u64_t i, l = 0;
     i64_t *rvals;
     f64_t *xfvals;
-    obj_t res;
+    obj_p res;
 
     switch (x->type)
     {
@@ -1183,16 +1183,16 @@ obj_t ray_floor(obj_t x)
 
         return res;
     default:
-        throw(ERR_TYPE, "floor: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "floor: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_ceil(obj_t x)
+obj_p ray_ceil(obj_p x)
 {
     u64_t i, l = 0;
     i64_t *rvals;
     f64_t *xfvals;
-    obj_t res;
+    obj_p res;
 
     switch (x->type)
     {
@@ -1210,16 +1210,16 @@ obj_t ray_ceil(obj_t x)
 
         return res;
     default:
-        throw(ERR_TYPE, "ceil: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "ceil: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_xbar(obj_t x, obj_t y)
+obj_p ray_xbar(obj_p x, obj_p y)
 {
     u64_t i, l = 0;
     i64_t *xivals = NULL;
     f64_t *xfvals = NULL;
-    obj_t res;
+    obj_p res;
 
     switch (mtype2(x->type, y->type))
     {
@@ -1248,6 +1248,6 @@ obj_t ray_xbar(obj_t x, obj_t y)
         return res;
 
     default:
-        throw(ERR_TYPE, "xbar: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "xbar: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }

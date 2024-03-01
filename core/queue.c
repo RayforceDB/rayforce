@@ -31,7 +31,7 @@ queue_t queue_new(i64_t size)
         .size = size,
         .head = 0,
         .tail = 0,
-        .data = heap_alloc(size * sizeof(nil_t *)),
+        .data = (nil_t **)heap_alloc(size * sizeof(nil_t *)),
     };
 }
 
@@ -45,7 +45,7 @@ nil_t queue_push(queue_t *queue, nil_t *val)
     if (queue->tail - queue->head == queue->size)
     {
         queue->size *= 2;
-        queue->data = heap_realloc(queue->data, queue->size * sizeof(nil_t *));
+        queue->data = (nil_t **)heap_realloc(queue->data, queue->size * sizeof(nil_t *));
     }
 
     queue->data[queue->tail % queue->size] = val;

@@ -26,8 +26,8 @@
 
 #include "rayforce.h"
 
-obj_t ray_and(obj_t x, obj_t y);
-obj_t ray_or(obj_t x, obj_t y);
-obj_t ray_like(obj_t x, obj_t y);
+obj_p ray_and(obj_p x, obj_p y);
+obj_p ray_or(obj_p x, obj_p y);
+obj_p ray_like(obj_p x, obj_p y);
 
 #endif // LOGIC_H

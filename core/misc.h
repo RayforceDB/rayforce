@@ -26,8 +26,8 @@
 
 #include "rayforce.h"
 
-obj_t ray_type(obj_t x);
-obj_t ray_count(obj_t x);
-obj_t ray_rc(obj_t x);
+obj_p ray_type(obj_p x);
+obj_p ray_count(obj_p x);
+obj_p ray_rc(obj_p x);
 
 #endif // MISC_H

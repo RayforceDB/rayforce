@@ -26,9 +26,9 @@
 
 #include "rayforce.h"
 
-obj_t get_fields(obj_t obj);
-obj_t remap_filter(obj_t x, obj_t y);
-obj_t remap_group(obj_t *aggr, obj_t x, obj_t y, obj_t z, obj_t k);
-obj_t ray_select(obj_t obj);
+obj_p get_fields(obj_p obj);
+obj_p remap_filter(obj_p x, obj_p y);
+obj_p remap_group(obj_p *aggr, obj_p x, obj_p y, obj_p z, obj_p k);
+obj_p ray_select(obj_p obj);
 
 #endif // QUERY_H

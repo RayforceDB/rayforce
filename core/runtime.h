@@ -36,19 +36,21 @@
  */
 typedef struct runtime_t
 {
-    obj_t args;         // Command line arguments.
+    obj_p args;         // Command line arguments.
     env_t env;          // Environment.
     symbols_t *symbols; // vector_symbols pool.
-    poll_t poll;        // I/O event loop handle.
-    obj_t fds;          // File descriptors.
+    poll_p poll;        // I/O event loop handle.
+    obj_p fds;          // File descriptors.
     u16_t slaves;       // Number of slave threads.
     sock_addr_t addr;   // Socket address that a process listen.
-} *runtime_t;
+} *runtime_p;
 
-nil_t runtime_init(i32_t argc, str_t argv[]);
+extern runtime_p __RUNTIME;
+
+i32_t runtime_init(i32_t argc, str_p argv[]);
 i32_t runtime_run(nil_t);
 nil_t runtime_cleanup(nil_t);
-runtime_t runtime_get(nil_t);
-obj_t runtime_get_arg(str_t key);
+obj_p runtime_get_arg(str_p key);
+inline __attribute__((always_inline)) runtime_p runtime_get(nil_t) { return __RUNTIME; }
 
 #endif // RUNTIME_H

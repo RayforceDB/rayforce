@@ -32,16 +32,16 @@
 #include "error.h"
 #include "index.h"
 
-obj_t select_column(obj_t left_col, obj_t right_col, i64_t ids[], u64_t len)
+obj_p select_column(obj_p left_col, obj_p right_col, i64_t ids[], u64_t len)
 {
     u64_t i;
-    obj_t v, res;
+    obj_p v, res;
     i64_t idx;
-    type_t type;
+    i8_t type;
 
     // there is no such column in the right table
     if (is_null(right_col))
-        return clone(left_col);
+        return clone_obj(left_col);
 
     type = is_null(left_col) ? right_col->type : left_col->type;
 
@@ -64,11 +64,11 @@ obj_t select_column(obj_t left_col, obj_t right_col, i64_t ids[], u64_t len)
     return res;
 }
 
-obj_t ray_lj(obj_t *x, u64_t n)
+obj_p ray_lj(obj_p *x, u64_t n)
 {
     u64_t ll;
     i64_t i, j, l;
-    obj_t k1, k2, c1, c2, un, col, cols, vals, idx, rescols, resvals;
+    obj_p k1, k2, c1, c2, un, col, cols, vals, idx, rescols, resvals;
 
     if (n != 3)
         throw(ERR_LENGTH, "lj");
@@ -83,7 +83,7 @@ obj_t ray_lj(obj_t *x, u64_t n)
         throw(ERR_TYPE, "lj: third argument must be a table");
 
     if (ops_count(x[1]) == 0 || ops_count(x[2]) == 0)
-        return clone(x[1]);
+        return clone_obj(x[1]);
 
     ll = ops_count(x[1]);
 
@@ -94,34 +94,34 @@ obj_t ray_lj(obj_t *x, u64_t n)
     k2 = ray_at(x[2], x[0]);
     if (is_error(k2))
     {
-        drop(k1);
+        drop_obj(k1);
         return k2;
     }
 
     idx = index_join_obj(k1, k2, x[0]->len);
-    drop(k2);
+    drop_obj(k2);
 
     if (is_error(idx))
     {
-        drop(k1);
+        drop_obj(k1);
         return idx;
     }
 
     un = ray_union(as_list(x[1])[0], as_list(x[2])[0]);
     if (is_error(un))
     {
-        drop(k1);
+        drop_obj(k1);
         return un;
     }
 
     // exclude columns that we are joining on
     cols = ray_except(un, x[0]);
-    drop(un);
+    drop_obj(un);
 
     if (is_error(cols))
     {
-        drop(k1);
-        drop(idx);
+        drop_obj(k1);
+        drop_obj(idx);
         return cols;
     }
 
@@ -129,9 +129,9 @@ obj_t ray_lj(obj_t *x, u64_t n)
 
     if (l == 0)
     {
-        drop(k1);
-        drop(idx);
-        drop(cols);
+        drop_obj(k1);
+        drop_obj(idx);
+        drop_obj(cols);
         throw(ERR_LENGTH, "lj: no columns to join on");
     }
 
@@ -165,10 +165,10 @@ obj_t ray_lj(obj_t *x, u64_t n)
         col = select_column(c1, c2, as_i64(idx), ll);
         if (is_error(col))
         {
-            drop(k1);
-            drop(cols);
-            drop(idx);
-            drop(vals);
+            drop_obj(k1);
+            drop_obj(cols);
+            drop_obj(idx);
+            drop_obj(vals);
             return col;
         }
 
@@ -176,9 +176,9 @@ obj_t ray_lj(obj_t *x, u64_t n)
     }
 
     // cleanup and assemble result table
-    drop(idx);
+    drop_obj(idx);
     rescols = ray_concat(x[0], cols);
-    drop(cols);
+    drop_obj(cols);
 
     // handle case when columns list is just one-element list
     if (x[0]->len == 1)
@@ -187,14 +187,14 @@ obj_t ray_lj(obj_t *x, u64_t n)
         resvals = vector(TYPE_LIST, l);
         as_list(resvals)[0] = k1;
         for (i = 1; i < l; i++)
-            as_list(resvals)[i] = clone(as_list(vals)[i - 1]);
-        drop(vals);
+            as_list(resvals)[i] = clone_obj(as_list(vals)[i - 1]);
+        drop_obj(vals);
     }
     else
     {
         resvals = ray_concat(k1, vals);
-        drop(k1);
-        drop(vals);
+        drop_obj(k1);
+        drop_obj(vals);
     }
 
     return table(rescols, resvals);

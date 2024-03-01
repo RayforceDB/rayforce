@@ -75,7 +75,7 @@
 
 #define debug_obj(o)             \
     {                            \
-        str_t _f = obj_fmt((o)); \
+        str_p _f = obj_fmt((o)); \
         debug("%s", _f);         \
         heap_free(_f);           \
     }
@@ -101,13 +101,13 @@
         printf("%f\n", ((f64_t)(clock() - timer)) / CLOCKS_PER_SEC * 1000); \
     }
 
-#define enum_key(x) (x->mmod == MMOD_INTERNAL ? symtostr(as_list(x)[0]->i64) : as_string((obj_t)((str_t)x - PAGE_SIZE)))
+#define enum_key(x) (x->mmod == MMOD_INTERNAL ? strof_sym(as_list(x)[0]->i64) : as_string((obj_p)((str_p)x - PAGE_SIZE)))
 #define enum_val(x) (x->mmod == MMOD_INTERNAL ? as_list(x)[1] : x)
 
-#define anymap_key(x) (((obj_t)((str_t)x - PAGE_SIZE))->obj)
+#define anymap_key(x) (((obj_p)((str_p)x - PAGE_SIZE))->obj)
 #define anymap_val(x) (x)
 
-bool_t is_valid(obj_t obj);
+b8_t is_valid(obj_p obj);
 u32_t next_power_of_two_u32(u32_t n);
 u64_t next_power_of_two_u64(u64_t n);
 

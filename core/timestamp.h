@@ -29,7 +29,7 @@
 
 typedef struct timestamp_t
 {
-    bool_t null;
+    b8_t null;
     u16_t year;
     u8_t month;
     u8_t day;
@@ -40,7 +40,7 @@ typedef struct timestamp_t
 } timestamp_t;
 
 timestamp_t timestamp_from_i64(i64_t offset);
-timestamp_t timestamp_from_str(str_t src);
+timestamp_t timestamp_from_str(str_p src);
 i64_t timestamp_into_i64(timestamp_t ts);
 
 #endif // TIMESTAMP_H

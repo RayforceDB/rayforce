@@ -27,12 +27,12 @@
 #include "ops.h"
 #include "util.h"
 
-obj_t nfo(obj_t filename, obj_t source)
+obj_p nfo(obj_p filename, obj_p source)
 {
     return vn_list(3, filename, source, ht_tab(32, TYPE_I64));
 }
 
-nil_t nfo_insert(obj_t nfo, i64_t index, span_t span)
+nil_t nfo_insert(obj_p nfo, i64_t index, span_t span)
 {
     i64_t i;
 
@@ -44,7 +44,7 @@ nil_t nfo_insert(obj_t nfo, i64_t index, span_t span)
     memcpy(&as_i64(as_list(as_list(nfo)[2])[1])[i], &span, sizeof(span_t));
 }
 
-span_t nfo_get(obj_t nfo, i64_t index)
+span_t nfo_get(obj_p nfo, i64_t index)
 {
     i64_t i;
     span_t span = {0};

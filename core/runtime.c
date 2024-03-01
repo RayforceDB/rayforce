@@ -30,7 +30,7 @@
 #include "io.h"
 
 // Global runtime reference
-runtime_t __RUNTIME = NULL;
+runtime_p __RUNTIME = NULL;
 
 nil_t usage(nil_t)
 {
@@ -38,11 +38,11 @@ nil_t usage(nil_t)
     exit(EXIT_FAILURE);
 }
 
-obj_t parse_cmdline(i32_t argc, str_t argv[])
+obj_p parse_cmdline(i32_t argc, str_p argv[])
 {
     i32_t opt;
-    obj_t keys = vector_symbol(0), vals = vn_list(0), str;
-    bool_t file_handled = false; // flag to indicate if the file has been handled
+    obj_p keys = vector_symbol(0), vals = vn_list(0), str;
+    b8_t file_handled = B8_FALSE; // flag to indicate if the file has been handled
 
     for (opt = 1; opt < argc; opt++)
     {
@@ -59,7 +59,7 @@ obj_t parse_cmdline(i32_t argc, str_t argv[])
                 push_sym(&keys, "file");
                 str = string_from_str(argv[opt], strlen(argv[opt]));
                 push_obj(&vals, str);
-                file_handled = true;
+                file_handled = B8_TRUE;
                 break;
 
             case 'p':
@@ -85,7 +85,7 @@ obj_t parse_cmdline(i32_t argc, str_t argv[])
                 push_sym(&keys, "file");
                 str = string_from_str(argv[opt], strlen(argv[opt]));
                 push_obj(&vals, str);
-                file_handled = true;
+                file_handled = B8_TRUE;
             }
             else
             {
@@ -98,15 +98,15 @@ obj_t parse_cmdline(i32_t argc, str_t argv[])
     return dict(keys, vals);
 }
 
-nil_t runtime_init(i32_t argc, str_t argv[])
+i32_t runtime_init(i32_t argc, str_p argv[])
 {
     i64_t i;
-    obj_t file, res;
-    str_t fmt;
+    obj_p file, res;
+    str_p fmt;
 
     heap_init();
 
-    __RUNTIME = mmap_malloc(sizeof(struct runtime_t));
+    __RUNTIME = (runtime_p)mmap_malloc(sizeof(struct runtime_t));
     __RUNTIME->symbols = symbols_new();
     __RUNTIME->env = create_env();
     __RUNTIME->addr = (sock_addr_t){0};
@@ -129,19 +129,21 @@ nil_t runtime_init(i32_t argc, str_t argv[])
         if (!is_null(file))
         {
             res = ray_load(file);
-            drop(file);
+            drop_obj(file);
 
             if (res)
             {
                 fmt = obj_fmt(res);
                 printf("%s\n", fmt);
                 heap_free(fmt);
-                drop(res);
+                drop_obj(res);
             }
         }
     }
     else
         __RUNTIME->poll = NULL;
+
+    return 0;
 }
 
 i32_t runtime_run(nil_t)
@@ -151,25 +153,20 @@ i32_t runtime_run(nil_t)
 
 nil_t runtime_cleanup(nil_t)
 {
-    drop(__RUNTIME->args);
+    drop_obj(__RUNTIME->args);
     if (__RUNTIME->poll)
         poll_cleanup(__RUNTIME->poll);
     symbols_free(__RUNTIME->symbols);
     mmap_free(__RUNTIME->symbols, sizeof(symbols_t));
     free_env(&__RUNTIME->env);
-    drop(__RUNTIME->fds);
+    drop_obj(__RUNTIME->fds);
     interpreter_free();
     mmap_free(__RUNTIME, sizeof(struct runtime_t));
     heap_cleanup();
     __RUNTIME = NULL;
 }
 
-inline __attribute__((always_inline)) runtime_t runtime_get(nil_t)
-{
-    return __RUNTIME;
-}
-
-obj_t runtime_get_arg(str_t key)
+obj_p runtime_get_arg(str_p key)
 {
     i64_t i = find_sym(as_list(__RUNTIME->args)[0], key);
     if (i < (i64_t)as_list(__RUNTIME->args)[0]->len)

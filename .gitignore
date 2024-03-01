@@ -5,3 +5,8 @@ rayforce
 *.gch
 rayforce.S
 gmon.out
+nodejs/build/
+python/__pycache__/
+python/*.c
+python/*.cxx
+python/*.so

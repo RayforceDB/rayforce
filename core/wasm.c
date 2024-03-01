@@ -38,30 +38,30 @@
 #include "sys.h"
 
 // Declare rayforce_ready callback on js side
-EM_JS(nil_t, js_rayforce_ready, (str_t text), {
+EM_JS(nil_t, js_rayforce_ready, (str_p text), {
     Module.rayforce_ready(UTF8ToString(text));
 });
 
-poll_t poll_init(i64_t port)
+poll_p poll_init(i64_t port)
 {
-    poll_t poll = (poll_t)heap_alloc(sizeof(struct poll_t));
+    poll_p poll = (poll_p)heap_alloc(sizeof(struct poll_t));
     poll->code = NULL_I64;
 
     return poll;
 }
 
-nil_t poll_cleanup(poll_t poll)
+nil_t poll_cleanup(poll_p poll)
 {
     heap_free(poll);
 }
 
-i64_t poll_run(poll_t poll)
+i64_t poll_run(poll_p poll)
 {
     unused(poll);
     return 0;
 }
 
-i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
+i64_t poll_register(poll_p poll, i64_t fd, u8_t version)
 {
     unused(poll);
     unused(fd);
@@ -69,21 +69,13 @@ i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
     return 0;
 }
 
-nil_t poll_deregister(poll_t poll, i64_t id)
+nil_t poll_deregister(poll_p poll, i64_t id)
 {
     unused(poll);
     unused(id);
 }
 
-obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
-{
-    unused(poll);
-    unused(id);
-    unused(msg);
-    return NULL_OBJ;
-}
-
-obj_t ipc_send_async(poll_t poll, i64_t id, obj_t msg)
+obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg)
 {
     unused(poll);
     unused(id);
@@ -91,7 +83,15 @@ obj_t ipc_send_async(poll_t poll, i64_t id, obj_t msg)
     return NULL_OBJ;
 }
 
-EMSCRIPTEN_KEEPALIVE i32_t main(i32_t argc, str_t argv[])
+obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg)
+{
+    unused(poll);
+    unused(id);
+    unused(msg);
+    return NULL_OBJ;
+}
+
+EMSCRIPTEN_KEEPALIVE i32_t main(i32_t argc, str_p argv[])
 {
     i32_t code;
 

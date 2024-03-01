@@ -27,11 +27,11 @@
 #include "util.h"
 
 /*
- * Creates new obj_tstring from a C string.
+ * Creates new obj_pstring from a C string.
  */
-obj_t string_from_str(str_t str, i64_t len)
+obj_p string_from_str(str_p str, i64_t len)
 {
-    obj_t s;
+    obj_p s;
 
     if (len == 0)
         return string(0);
@@ -45,10 +45,10 @@ obj_t string_from_str(str_t str, i64_t len)
 /*
  * Checks if pattern is like *?**literal.
  */
-str_t str_chk_from_end(str_t pat)
+str_p str_chk_from_end(str_p pat)
 {
     u64_t l;
-    str_t p, s;
+    str_p p, s;
 
     l = strlen(pat);
 
@@ -75,14 +75,14 @@ str_t str_chk_from_end(str_t pat)
 /*
  * Checks if string starts with a literal.
  */
-bool_t str_starts_with(str_t str, str_t pat)
+b8_t str_starts_with(str_p str, str_p pat)
 {
     u64_t str_len = strlen(str);
     u64_t pat_len = strlen(pat);
 
     // If the pattern is longer than the string, it can't be a suffix.
     if (pat_len > str_len)
-        return false;
+        return B8_FALSE;
 
     // Compare the tail of the string with the pattern.
     return strcmp(pat, str) == 0;
@@ -91,7 +91,7 @@ bool_t str_starts_with(str_t str, str_t pat)
 /*
  * Checks if string ends with a literal.
  */
-bool_t str_ends_with(str_t str, str_t pat)
+b8_t str_ends_with(str_p str, str_p pat)
 {
     // Pointers to the ends of the strings
     const char *s = str, *p = pat;
@@ -107,7 +107,7 @@ bool_t str_ends_with(str_t str, str_t pat)
     {
         if (*s != *p)
         {
-            return false;
+            return B8_FALSE;
         }
         s--;
         p--;
@@ -120,14 +120,14 @@ bool_t str_ends_with(str_t str, str_t pat)
 
 /*
  * match() lambda takes in two pointers to character arrays: pattern and text.
- * It returns a i8_t obj_t indicating whether the text string matches the pattern string.
+ * It returns a i8_t obj_p indicating whether the text string matches the pattern string.
  * Note that this implementation assumes that the pattern and text strings do not contain any null characters ('\0').
  * If this is not the case, a more sophisticated implementation may be required.
  */
-bool_t str_match(str_t str, str_t pat)
+b8_t str_match(str_p str, str_p pat)
 {
-    str_t s = NULL;
-    bool_t inv = false, match = false;
+    str_p s = NULL;
+    b8_t inv = B8_FALSE, match = B8_FALSE;
 
     while (*str)
     {
@@ -138,7 +138,7 @@ bool_t str_match(str_t str, str_t pat)
                 pat++;
 
             if (*pat == '\0')
-                return true;
+                return B8_TRUE;
 
             if (*pat != '[' && *pat != '?')
             {
@@ -148,7 +148,7 @@ bool_t str_match(str_t str, str_t pat)
 
                 // If character is not found in the rest of the string
                 if (!*s)
-                    return false;
+                    return B8_FALSE;
 
                 str = s; // Move str to the position of the found character
             }
@@ -166,26 +166,26 @@ bool_t str_match(str_t str, str_t pat)
 
         case '[':
             pat++;
-            inv = (*pat == '^') ? true : false;
+            inv = (*pat == '^') ? B8_TRUE : B8_FALSE;
             if (inv)
                 pat++;
 
-            match = false;
+            match = B8_FALSE;
             while (*pat != ']' && *pat != '\0')
             {
                 if (*str == *pat)
-                    match = true;
+                    match = B8_TRUE;
                 pat++;
             }
 
             if (*pat == '\0')
-                return false; // unmatched '['
+                return B8_FALSE; // unmatched '['
 
             if ((match && inv) || (!match && !inv))
             {
                 // Failed to match with the current character set
                 if (!s)
-                    return false;
+                    return B8_FALSE;
 
                 // Revert back to the position right after the '*'
                 str = s + 1;
@@ -202,7 +202,7 @@ bool_t str_match(str_t str, str_t pat)
             if (*str != *pat)
             {
                 if (!s)
-                    return false;
+                    return B8_FALSE;
 
                 str = ++s;
                 pat -= 2; // To account for the next iteration's increment
@@ -220,25 +220,25 @@ bool_t str_match(str_t str, str_t pat)
     while (*pat)
     {
         if (*pat == '?')
-            return false;
+            return B8_FALSE;
         if (*pat++ != '*')
-            return false;
+            return B8_FALSE;
         while (*pat == '*')
             pat++;
     }
 
-    return true;
+    return B8_TRUE;
 }
 
-str_t str_dup(str_t str)
+str_p str_dup(str_p str)
 {
     u64_t len = strlen(str) + 1;
-    str_t dup = heap_alloc(len);
+    str_p dup = (str_p)heap_alloc(len);
     strncpy(dup, str, len);
     return dup;
 }
 
-u64_t str_len(str_t s, u64_t n)
+u64_t str_len(str_p s, u64_t n)
 {
     u64_t i;
     for (i = 0; i < n && s[i] != '\0'; ++i)
@@ -246,7 +246,7 @@ u64_t str_len(str_t s, u64_t n)
     return i;
 }
 
-u64_t str_cpy(str_t dst, str_t src)
+u64_t str_cpy(str_p dst, str_p src)
 {
     u64_t i;
     for (i = 0; src[i] != '\0'; ++i)
@@ -256,15 +256,15 @@ u64_t str_cpy(str_t dst, str_t src)
     return i;
 }
 
-obj_t vn_vstring(str_t fmt, va_list args)
+obj_p vn_vstring(str_p fmt, va_list args)
 {
-    obj_t res = string(0);
-    str_t dst = (str_t)res;
+    obj_p res = string(0);
+    str_p dst = (str_p)res;
     i64_t n, len = sizeof(struct obj_t), offset = sizeof(struct obj_t);
 
     n = str_vfmt_into(&dst, &len, &offset, 0, fmt, args);
 
-    res = (obj_t)dst;
+    res = (obj_p)dst;
 
     if (res == NULL_OBJ)
         return res;
@@ -274,9 +274,9 @@ obj_t vn_vstring(str_t fmt, va_list args)
     return res;
 }
 
-obj_t vn_string(str_t fmt, ...)
+obj_p vn_string(str_p fmt, ...)
 {
-    obj_t res;
+    obj_p res;
     va_list args;
 
     va_start(args, fmt);

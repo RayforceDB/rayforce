@@ -26,7 +26,7 @@
 
 #include "rayforce.h"
 
-obj_t filter_map(obj_t x, obj_t y);
-obj_t filter_collect(obj_t x);
+obj_p filter_map(obj_p x, obj_p y);
+obj_p filter_collect(obj_p x);
 
 #endif // FILTER_H

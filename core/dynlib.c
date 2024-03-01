@@ -34,7 +34,7 @@
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 
-obj_t dynlib_loadfn(str_t path, str_t func, i64_t nargs)
+obj_p dynlib_loadfn(str_p path, str_p func, i64_t nargs)
 {
     unused(path);
     unused(func);
@@ -44,11 +44,11 @@ obj_t dynlib_loadfn(str_t path, str_t func, i64_t nargs)
 
 #else
 
-obj_t dynlib_loadfn(str_t path, str_t func, i64_t nargs)
+obj_p dynlib_loadfn(str_p path, str_p func, i64_t nargs)
 {
-    raw_t handle, dsym;
-    obj_t fn;
-    str_t error;
+    raw_p handle, dsym;
+    obj_p fn;
+    str_p error;
 
     handle = dlopen(path, RTLD_NOW);
     if (!handle)
@@ -79,7 +79,7 @@ obj_t dynlib_loadfn(str_t path, str_t func, i64_t nargs)
 
 #endif
 
-obj_t ray_loadfn(obj_t *args, u64_t n)
+obj_p ray_loadfn(obj_p *args, u64_t n)
 {
     if (n != 3)
         throw(ERR_ARITY, "Expected 3 arguments, got %llu", n);
@@ -88,13 +88,13 @@ obj_t ray_loadfn(obj_t *args, u64_t n)
         throw(ERR_TYPE, "Null is not a valid argument");
 
     if (args[0]->type != TYPE_CHAR)
-        throw(ERR_TYPE, "Expected 'string path, got %s", typename(args[0]->type));
+        throw(ERR_TYPE, "Expected 'string path, got %s", type_name(args[0]->type));
 
     if (args[1]->type != TYPE_CHAR)
-        throw(ERR_TYPE, "Expected 'string fname, got %s", typename(args[1]->type));
+        throw(ERR_TYPE, "Expected 'string fname, got %s", type_name(args[1]->type));
 
     if (args[2]->type != -TYPE_I64)
-        throw(ERR_TYPE, "Expected 'i64 arguments, got %s", typename(args[2]->type));
+        throw(ERR_TYPE, "Expected 'i64 arguments, got %s", type_name(args[2]->type));
 
     return dynlib_loadfn(as_string(args[0]), as_string(args[1]), args[2]->i64);
 }

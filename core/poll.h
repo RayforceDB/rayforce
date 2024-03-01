@@ -63,9 +63,9 @@ typedef struct selector_t
 
     struct
     {
-        bool_t ignore;
+        b8_t ignore;
         u8_t msgtype;
-        bool_t header;
+        b8_t header;
         OVERLAPPED overlapped;
         DWORD flags;
         DWORD bytes_transfered;
@@ -76,7 +76,7 @@ typedef struct selector_t
 
     struct
     {
-        bool_t ignore;
+        b8_t ignore;
         OVERLAPPED overlapped;
         DWORD flags;
         DWORD bytes_transfered;
@@ -86,7 +86,7 @@ typedef struct selector_t
         queue_t queue; // queue for async messages waiting to be sent
     } tx;
 
-} *selector_t;
+} *selector_p;
 
 #else
 typedef struct selector_t
@@ -105,14 +105,14 @@ typedef struct selector_t
 
     struct
     {
-        bool_t isset;
+        b8_t isset;
         i64_t bytes_transfered;
         i64_t size;
         u8_t *buf;
         queue_t queue; // queue for async messages waiting to be sent
     } tx;
 
-} *selector_t;
+} *selector_p;
 
 #endif
 
@@ -121,24 +121,24 @@ typedef struct poll_t
     i64_t code;
     i64_t poll_fd;
     i64_t ipc_fd;
-    obj_t replfile;
-    obj_t ipcfile;
-    freelist_t selectors; // freelist of selectors
+    obj_p replfile;
+    obj_p ipcfile;
+    freelist_p selectors; // freelist of selectors
     timers_t *timers;     // timers heap
-} *poll_t;
+} *poll_p;
 
-poll_t poll_init(i64_t port);
-nil_t poll_cleanup(poll_t poll);
-i64_t poll_run(poll_t poll);
-i64_t poll_register(poll_t poll, i64_t fd, u8_t version);
-nil_t poll_deregister(poll_t poll, i64_t id);
+poll_p poll_init(i64_t port);
+nil_t poll_cleanup(poll_p poll);
+i64_t poll_run(poll_p poll);
+i64_t poll_register(poll_p poll, i64_t fd, u8_t version);
+nil_t poll_deregister(poll_p poll, i64_t id);
 
 // send ipc messages
-obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg);
-obj_t ipc_send_async(poll_t poll, i64_t id, obj_t msg);
+obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg);
+obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg);
 
 // Exit the app
-nil_t poll_exit(poll_t poll, i64_t code);
+nil_t poll_exit(poll_p poll, i64_t code);
 nil_t prompt(nil_t);
 
 #endif // POLL_H

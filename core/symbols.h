@@ -45,17 +45,17 @@ typedef struct pool_node_t
 typedef struct symbols_t
 {
     i64_t next_sym_id;
-    obj_t str_to_id;
-    obj_t id_to_str;
+    obj_p str_po_id;
+    obj_p id_to_str;
     pool_node_t *pool_node_0;
     pool_node_t *pool_node;
-    str_t strings_pool;
+    str_p strings_pool;
 } symbols_t;
 
-i64_t intern_symbol(str_t s, i64_t len);
+i64_t intern_symbol(str_p s, i64_t len);
 symbols_t *symbols_new(nil_t);
 nil_t symbols_free(symbols_t *symbols);
-str_t symtostr(i64_t key);
+str_p strof_sym(i64_t key);
 u64_t symbols_count(symbols_t *symbols);
 u64_t symbols_memsize(symbols_t *symbols);
 

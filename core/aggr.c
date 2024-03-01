@@ -32,12 +32,12 @@
 #include "unary.h"
 #include "group.h"
 
-obj_t aggr_sum(obj_t val, obj_t bins, obj_t filter)
+obj_p aggr_sum(obj_p val, obj_p bins, obj_p filter)
 {
     u64_t i, l, n;
     i64_t *xi, *xm, *xo, *ids;
     f64_t *xf, *fo;
-    obj_t res;
+    obj_p res;
 
     n = as_list(bins)[0]->i64;
     l = as_list(bins)[1]->len;
@@ -89,17 +89,17 @@ obj_t aggr_sum(obj_t val, obj_t bins, obj_t filter)
         }
         return res;
     default:
-        return error(ERR_TYPE, "sum: unsupported type: '%s'", typename(val->type));
+        return error(ERR_TYPE, "sum: unsupported type: '%s'", type_name(val->type));
     }
 }
 
-obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
+obj_p aggr_first(obj_p val, obj_p bins, obj_p filter)
 {
     u64_t i, l, n;
-    u8_t *xb, *bo;
+    u8_t *xb, *bo, NULL_GUID[16] = {0};
     i64_t *xi, *ei, *xm, *xo, *ids;
     f64_t *xf, *fo;
-    obj_t *oi, *oo, k, v, res;
+    obj_p *oi, *oo, k, v, res;
     guid_t *xg, *og;
 
     n = as_list(bins)[0]->i64;
@@ -107,8 +107,8 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
 
     switch (val->type)
     {
-    case TYPE_BYTE:
-    case TYPE_BOOL:
+    case TYPE_U8:
+    case TYPE_B8:
         xb = as_u8(val);
         xm = as_i64(as_list(bins)[1]);
         res = vector(val->type, n);
@@ -214,7 +214,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
             {
                 n = xm[i];
                 if (xo[n] == NULL_I64)
-                    oo[n] = clone(oi[ids[i]]);
+                    oo[n] = clone_obj(oi[ids[i]]);
             }
         }
         else
@@ -223,7 +223,7 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
             {
                 n = xm[i];
                 if (xo[n] == NULL_I64)
-                    oo[n] = clone(oi[i]);
+                    oo[n] = clone_obj(oi[i]);
             }
         }
 
@@ -265,13 +265,13 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
             return k;
 
         v = ray_get(k);
-        drop(k);
+        drop_obj(k);
 
         if (is_error(v))
             return v;
 
         if (v->type != TYPE_SYMBOL)
-            return error(ERR_TYPE, "enum: '%s' is not a 'Symbol'", typename(v->type));
+            return error(ERR_TYPE, "enum: '%s' is not a 'Symbol'", type_name(v->type));
 
         xm = as_i64(as_list(bins)[1]);
         res = vector_symbol(n);
@@ -302,24 +302,24 @@ obj_t aggr_first(obj_t val, obj_t bins, obj_t filter)
             }
         }
 
-        drop(v);
+        drop_obj(v);
 
         return res;
     case TYPE_ANYMAP:
         v = ray_value(val);
         res = aggr_first(v, bins, filter);
-        drop(v);
+        drop_obj(v);
         return res;
     default:
-        return error(ERR_TYPE, "first: unsupported type: '%s'", typename(val->type));
+        return error(ERR_TYPE, "first: unsupported type: '%s'", type_name(val->type));
     }
 }
 
-obj_t aggr_last(obj_t val, obj_t bins, obj_t filter)
+obj_p aggr_last(obj_p val, obj_p bins, obj_p filter)
 {
     u64_t i, l, n;
     i64_t *xi, *xm, *xo, *ids;
-    obj_t res;
+    obj_p res;
 
     n = as_list(bins)[0]->i64;
     l = as_list(bins)[1]->len;
@@ -356,16 +356,16 @@ obj_t aggr_last(obj_t val, obj_t bins, obj_t filter)
         return res;
 
     default:
-        return error(ERR_TYPE, "last: unsupported type: '%s'", typename(val->type));
+        return error(ERR_TYPE, "last: unsupported type: '%s'", type_name(val->type));
     }
 }
 
-obj_t aggr_avg(obj_t val, obj_t bins, obj_t filter)
+obj_p aggr_avg(obj_p val, obj_p bins, obj_p filter)
 {
     u64_t i, l, n;
     i64_t *xi, *xm, *ci, *ids;
     f64_t *xf, *fo;
-    obj_t res;
+    obj_p res;
 
     n = as_list(bins)[0]->i64;
     l = as_list(bins)[1]->len;
@@ -423,16 +423,16 @@ obj_t aggr_avg(obj_t val, obj_t bins, obj_t filter)
 
         return res;
     default:
-        return error(ERR_TYPE, "avg: unsupported type: '%s'", typename(val->type));
+        return error(ERR_TYPE, "avg: unsupported type: '%s'", type_name(val->type));
     }
 }
 
-obj_t aggr_max(obj_t val, obj_t bins, obj_t filter)
+obj_p aggr_max(obj_p val, obj_p bins, obj_p filter)
 {
     u64_t i, l, n;
     i64_t *xi, *xm, *xo, *ids;
     f64_t *xf, *fo;
-    obj_t res;
+    obj_p res;
 
     n = as_list(bins)[0]->i64;
     l = as_list(bins)[1]->len;
@@ -494,16 +494,16 @@ obj_t aggr_max(obj_t val, obj_t bins, obj_t filter)
         }
         return res;
     default:
-        return error(ERR_TYPE, "max: unsupported type: '%s'", typename(val->type));
+        return error(ERR_TYPE, "max: unsupported type: '%s'", type_name(val->type));
     }
 }
 
-obj_t aggr_min(obj_t val, obj_t bins, obj_t filter)
+obj_p aggr_min(obj_p val, obj_p bins, obj_p filter)
 {
     u64_t i, l, n;
     i64_t *xi, *xm, *xo, *ids;
     f64_t *xf, *fo;
-    obj_t res;
+    obj_p res;
 
     n = as_list(bins)[0]->i64;
     l = as_list(bins)[1]->len;
@@ -566,25 +566,25 @@ obj_t aggr_min(obj_t val, obj_t bins, obj_t filter)
         }
         return res;
     default:
-        return error(ERR_TYPE, "min: unsupported type: '%s'", typename(val->type));
+        return error(ERR_TYPE, "min: unsupported type: '%s'", type_name(val->type));
     }
 }
 
-obj_t aggr_count(obj_t val, obj_t bins, obj_t filter)
+obj_p aggr_count(obj_p val, obj_p bins, obj_p filter)
 {
     unused(val);
     unused(filter);
     group_fill_counts(bins);
 
-    return clone(as_list(bins)[2]);
+    return clone_obj(as_list(bins)[2]);
 }
 
-obj_t aggr_med(obj_t val, obj_t bins, obj_t filter)
+obj_p aggr_med(obj_p val, obj_p bins, obj_p filter)
 {
     u64_t i, l, n;
     i64_t *xi, *xm, *ids;
     f64_t *xf, *fo;
-    obj_t res;
+    obj_p res;
 
     n = as_list(bins)[0]->i64;
     l = as_list(bins)[1]->len;
@@ -638,16 +638,16 @@ obj_t aggr_med(obj_t val, obj_t bins, obj_t filter)
 
         return res;
     default:
-        return error(ERR_TYPE, "median: unsupported type: '%s'", typename(val->type));
+        return error(ERR_TYPE, "median: unsupported type: '%s'", type_name(val->type));
     }
 }
 
-obj_t aggr_dev(obj_t val, obj_t bins, obj_t filter)
+obj_p aggr_dev(obj_p val, obj_p bins, obj_p filter)
 {
     u64_t i, l, n;
     i64_t *xi, *xm, *ids;
     f64_t *xf, *fo;
-    obj_t res;
+    obj_p res;
 
     n = as_list(bins)[0]->i64;
     l = as_list(bins)[1]->len;
@@ -701,6 +701,6 @@ obj_t aggr_dev(obj_t val, obj_t bins, obj_t filter)
 
         return res;
     default:
-        return error(ERR_TYPE, "stddev: unsupported type: '%s'", typename(val->type));
+        return error(ERR_TYPE, "stddev: unsupported type: '%s'", type_name(val->type));
     }
 }

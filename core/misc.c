@@ -32,9 +32,9 @@
 #include "error.h"
 #include "index.h"
 
-obj_t ray_type(obj_t x)
+obj_p ray_type(obj_p x)
 {
-    type_t type;
+    i8_t type;
     if (!x)
         type = -TYPE_ERROR;
     else
@@ -44,13 +44,13 @@ obj_t ray_type(obj_t x)
     return symboli64(t);
 }
 
-obj_t ray_count(obj_t x)
+obj_p ray_count(obj_p x)
 {
     return i64(ops_count(x));
 }
 
-obj_t ray_rc(obj_t x)
+obj_p ray_rc(obj_p x)
 {
     // substract 1 to skip the our reference
-    return i64(rc(x) - 1);
+    return i64(rc_obj(x) - 1);
 }

@@ -22,7 +22,11 @@
  */
 
 #include <stdio.h>
+#ifdef __cplusplus
+#include <atomic>
+#else
 #include <stdatomic.h>
+#endif
 #include "rayforce.h"
 #include "mmap.h"
 #include "format.h"
@@ -49,20 +53,30 @@ CASSERT(sizeof(struct obj_t) == 16, rayforce_h)
 // Synchronization flag (use atomics on rc operations).
 static i32_t __RC_SYNC = 0;
 
+i32_t ray_init()
+{
+    return runtime_init(0, NULL);
+}
+
+nil_t ray_clean()
+{
+    runtime_cleanup();
+}
+
 u8_t version(nil_t)
 {
     return RAYFORCE_VERSION;
 }
 
-nil_t zero_obj(obj_t obj)
+nil_t zero_obj(obj_p obj)
 {
     u64_t size = size_of(obj) - sizeof(struct obj_t);
     memset(obj->arr, 0, size);
 }
 
-obj_t atom(type_t type)
+obj_p atom(i8_t type)
 {
-    obj_t a = (obj_t)heap_alloc(sizeof(struct obj_t));
+    obj_p a = (obj_p)heap_alloc(sizeof(struct obj_t));
 
     if (!a)
         panic("oom");
@@ -75,12 +89,12 @@ obj_t atom(type_t type)
     return a;
 }
 
-obj_t null(type_t type)
+obj_p null(i8_t type)
 {
     switch (type)
     {
-    case TYPE_BOOL:
-        return bool(false);
+    case TYPE_B8:
+        return b8(B8_FALSE);
     case TYPE_I64:
         return i64(NULL_I64);
     case TYPE_F64:
@@ -96,11 +110,11 @@ obj_t null(type_t type)
     }
 }
 
-obj_t nullv(type_t type, u64_t len)
+obj_p nullv(i8_t type, u64_t len)
 {
     u64_t i;
-    obj_t vec;
-    type_t t;
+    obj_p vec;
+    i8_t t;
 
     if (type == TYPE_CHAR)
         t = TYPE_LIST;
@@ -113,8 +127,8 @@ obj_t nullv(type_t type, u64_t len)
 
     switch (t)
     {
-    case TYPE_BOOL:
-    case TYPE_BYTE:
+    case TYPE_B8:
+    case TYPE_U8:
     case TYPE_CHAR:
         memset(vec->arr, 0, len);
         break;
@@ -144,54 +158,54 @@ obj_t nullv(type_t type, u64_t len)
     return vec;
 }
 
-obj_t bool(bool_t val)
+obj_p b8(b8_t val)
 {
-    obj_t b = atom(TYPE_BOOL);
-    b->bool = val;
+    obj_p b = atom(TYPE_B8);
+    b->b8 = val;
     return b;
 }
 
-obj_t u8(u8_t val)
+obj_p u8(u8_t val)
 {
-    obj_t b = atom(TYPE_BYTE);
+    obj_p b = atom(TYPE_U8);
     b->u8 = val;
     return b;
 }
 
-obj_t i64(i64_t val)
+obj_p i64(i64_t val)
 {
-    obj_t i = atom(TYPE_I64);
+    obj_p i = atom(TYPE_I64);
     i->i64 = val;
     return i;
 }
 
-obj_t f64(f64_t val)
+obj_p f64(f64_t val)
 {
-    obj_t f = atom(TYPE_F64);
+    obj_p f = atom(TYPE_F64);
     f->f64 = val;
     return f;
 }
 
-obj_t symbol(str_t s)
+obj_p symbol(str_p s)
 {
     i64_t id = intern_symbol(s, strlen(s));
-    obj_t a = atom(TYPE_SYMBOL);
+    obj_p a = atom(TYPE_SYMBOL);
     a->i64 = id;
 
     return a;
 }
 
-obj_t symboli64(i64_t id)
+obj_p symboli64(i64_t id)
 {
-    obj_t a = atom(TYPE_SYMBOL);
+    obj_p a = atom(TYPE_SYMBOL);
     a->i64 = id;
 
     return a;
 }
 
-obj_t guid(u8_t buf[16])
+obj_p guid(u8_t buf[16])
 {
-    obj_t guid = vector(TYPE_I64, 2);
+    obj_p guid = vector(TYPE_I64, 2);
     guid->type = -TYPE_GUID;
 
     if (buf == NULL)
@@ -202,26 +216,26 @@ obj_t guid(u8_t buf[16])
     return guid;
 }
 
-obj_t vchar(char_t c)
+obj_p vchar(char_t c)
 {
-    obj_t s = atom(TYPE_CHAR);
+    obj_p s = atom(TYPE_CHAR);
     s->vchar = c;
 
     return s;
 }
 
-obj_t timestamp(i64_t val)
+obj_p timestamp(i64_t val)
 {
-    obj_t t = atom(TYPE_TIMESTAMP);
+    obj_p t = atom(TYPE_TIMESTAMP);
     t->i64 = val;
 
     return t;
 }
 
-obj_t vector(type_t type, u64_t len)
+obj_p vector(i8_t type, u64_t len)
 {
-    type_t t;
-    obj_t vec;
+    i8_t t;
+    obj_p vec;
 
     if (type < 0)
         t = -type;
@@ -237,7 +251,7 @@ obj_t vector(type_t type, u64_t len)
     else
         t = TYPE_LIST;
 
-    vec = (obj_t)heap_alloc(sizeof(struct obj_t) + len * size_of_type(t));
+    vec = (obj_p)heap_alloc(sizeof(struct obj_t) + len * size_of_type(t));
 
     if (!vec)
         panic("oom");
@@ -255,12 +269,12 @@ obj_t vector(type_t type, u64_t len)
     return vec;
 }
 
-obj_t vn_symbol(u64_t len, ...)
+obj_p vn_symbol(u64_t len, ...)
 {
     u64_t i;
     i64_t sym, *syms;
-    obj_t res;
-    str_t s;
+    obj_p res;
+    str_p s;
     va_list args;
 
     res = vector_symbol(len);
@@ -270,7 +284,7 @@ obj_t vn_symbol(u64_t len, ...)
 
     for (i = 0; i < len; i++)
     {
-        s = va_arg(args, str_t);
+        s = va_arg(args, str_p);
         sym = intern_symbol(s, strlen(s));
         syms[i] = sym;
     }
@@ -280,23 +294,23 @@ obj_t vn_symbol(u64_t len, ...)
     return res;
 }
 
-obj_t string(u64_t len)
+obj_p string(u64_t len)
 {
     return vector(TYPE_CHAR, len);
 }
 
-obj_t list(u64_t len)
+obj_p list(u64_t len)
 {
     return vector(TYPE_LIST, len);
 }
 
-obj_t vn_list(u64_t len, ...)
+obj_p vn_list(u64_t len, ...)
 {
     u64_t i;
-    obj_t l;
+    obj_p l;
     va_list args;
 
-    l = (obj_t)heap_alloc(sizeof(struct obj_t) + sizeof(obj_t) * len);
+    l = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(obj_p) * len);
 
     l->mmod = MMOD_INTERNAL;
     l->refc = 1;
@@ -308,16 +322,16 @@ obj_t vn_list(u64_t len, ...)
     va_start(args, len);
 
     for (i = 0; i < len; i++)
-        as_list(l)[i] = va_arg(args, obj_t);
+        as_list(l)[i] = va_arg(args, obj_p);
 
     va_end(args);
 
     return l;
 }
 
-obj_t dict(obj_t keys, obj_t vals)
+obj_p dict(obj_p keys, obj_p vals)
 {
-    obj_t d;
+    obj_p d;
 
     d = vn_list(2, keys, vals);
     d->type = TYPE_DICT;
@@ -325,9 +339,9 @@ obj_t dict(obj_t keys, obj_t vals)
     return d;
 }
 
-obj_t table(obj_t keys, obj_t vals)
+obj_p table(obj_p keys, obj_p vals)
 {
-    obj_t t;
+    obj_p t;
 
     t = vn_list(2, keys, vals);
     t->type = TYPE_TABLE;
@@ -335,9 +349,9 @@ obj_t table(obj_t keys, obj_t vals)
     return t;
 }
 
-obj_t venum(obj_t sym, obj_t vec)
+obj_p venum(obj_p sym, obj_p vec)
 {
-    obj_t e;
+    obj_p e;
 
     e = vn_list(2, sym, vec);
     e->type = TYPE_ENUM;
@@ -345,9 +359,9 @@ obj_t venum(obj_t sym, obj_t vec)
     return e;
 }
 
-obj_t anymap(obj_t sym, obj_t vec)
+obj_p anymap(obj_p sym, obj_p vec)
 {
-    obj_t e;
+    obj_p e;
 
     e = vn_list(2, sym, vec);
     e->type = TYPE_ANYMAP;
@@ -355,10 +369,10 @@ obj_t anymap(obj_t sym, obj_t vec)
     return e;
 }
 
-obj_t resize(obj_t *obj, u64_t len)
+obj_p resize_obj(obj_p *obj, u64_t len)
 {
     i64_t new_size;
-    obj_t new_obj;
+    obj_p new_obj;
 
     debug_assert(is_vector(*obj), "resize: invalid type: %d", (*obj)->type);
 
@@ -369,16 +383,16 @@ obj_t resize(obj_t *obj, u64_t len)
     new_size = sizeof(struct obj_t) + len * size_of_type((*obj)->type);
 
     if (is_internal(*obj))
-        *obj = heap_realloc(*obj, new_size);
+        *obj = (obj_p)heap_realloc(*obj, new_size);
     else
     {
-        new_obj = heap_alloc(new_size);
+        new_obj = (obj_p)heap_alloc(new_size);
         memcpy(new_obj, *obj, size_of(*obj));
         new_obj->mmod = MMOD_INTERNAL;
         new_obj->refc = 1;
         new_obj->type = (*obj)->type;
         new_obj->rc = 1;
-        drop(*obj);
+        drop_obj(*obj);
         *obj = new_obj;
     }
 
@@ -387,27 +401,27 @@ obj_t resize(obj_t *obj, u64_t len)
     return *obj;
 }
 
-obj_t push_raw(obj_t *obj, raw_t val)
+obj_p push_raw(obj_p *obj, raw_p val)
 {
     i64_t off, occup, req;
     i32_t size = size_of_type((*obj)->type);
-    obj_t new_obj;
+    obj_p new_obj;
 
     off = (*obj)->len * size;
     occup = sizeof(struct obj_t) + off;
     req = occup + size;
 
     if (is_internal(*obj))
-        *obj = heap_realloc(*obj, req);
+        *obj = (obj_p)heap_realloc(*obj, req);
     else
     {
-        new_obj = heap_alloc(req);
+        new_obj = (obj_p)heap_alloc(req);
         memcpy(new_obj, *obj, occup);
         new_obj->mmod = MMOD_INTERNAL;
         new_obj->refc = 1;
         new_obj->type = (*obj)->type;
         new_obj->rc = 1;
-        drop(*obj);
+        drop_obj(*obj);
         *obj = new_obj;
     }
 
@@ -417,11 +431,11 @@ obj_t push_raw(obj_t *obj, raw_t val)
     return *obj;
 }
 
-obj_t push_obj(obj_t *obj, obj_t val)
+obj_p push_obj(obj_p *obj, obj_p val)
 {
     u64_t i, l;
-    type_t t = val ? val->type : TYPE_LIST;
-    obj_t res, lst = NULL;
+    i8_t t = val ? val->type : TYPE_LIST;
+    obj_p res, lst = NULL;
 
     // change vector type to a list
     if ((*obj)->type != -t && (*obj)->type != TYPE_LIST)
@@ -434,7 +448,7 @@ obj_t push_obj(obj_t *obj, obj_t val)
 
         as_list(lst)[i] = val;
 
-        drop(*obj);
+        drop_obj(*obj);
 
         *obj = lst;
 
@@ -447,19 +461,19 @@ obj_t push_obj(obj_t *obj, obj_t val)
     case mtype2(TYPE_SYMBOL, -TYPE_SYMBOL):
     case mtype2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
         res = push_raw(obj, &val->i64);
-        drop(val);
+        drop_obj(val);
         return res;
     case mtype2(TYPE_F64, -TYPE_F64):
         res = push_raw(obj, &val->f64);
-        drop(val);
+        drop_obj(val);
         return res;
     case mtype2(TYPE_CHAR, -TYPE_CHAR):
         res = push_raw(obj, &val->vchar);
-        drop(val);
+        drop_obj(val);
         return res;
     case mtype2(TYPE_GUID, -TYPE_GUID):
         res = push_raw(obj, as_guid(val));
-        drop(val);
+        drop_obj(val);
         return res;
     default:
         if ((*obj)->type == TYPE_LIST)
@@ -468,14 +482,14 @@ obj_t push_obj(obj_t *obj, obj_t val)
             return res;
         }
 
-        throw(ERR_TYPE, "push_obj: invalid types: '%s, '%s", typename((*obj)->type), typename(val->type));
+        throw(ERR_TYPE, "push_obj: invalid types: '%s, '%s", type_name((*obj)->type), type_name(val->type));
     }
 }
 
-obj_t append(obj_t *obj, obj_t vals)
+obj_p append_list(obj_p *obj, obj_p vals)
 {
     u64_t i, c, l, size1, size2;
-    obj_t res;
+    obj_p res;
 
     switch (mtype2((*obj)->type, vals->type))
     {
@@ -484,25 +498,25 @@ obj_t append(obj_t *obj, obj_t vals)
     case mtype2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
         size1 = size_of(*obj) - sizeof(struct obj_t);
         size2 = size_of(vals) - sizeof(struct obj_t);
-        res = resize(obj, (*obj)->len + vals->len);
+        res = resize_obj(obj, (*obj)->len + vals->len);
         memcpy((*obj)->arr + size1, as_i64(vals), size2);
         return res;
     case mtype2(TYPE_F64, TYPE_F64):
         size1 = size_of(*obj) - sizeof(struct obj_t);
         size2 = size_of(vals) - sizeof(struct obj_t);
-        res = resize(obj, (*obj)->len + vals->len);
+        res = resize_obj(obj, (*obj)->len + vals->len);
         memcpy((*obj)->arr + size1, as_f64(vals), size2);
         return res;
     case mtype2(TYPE_CHAR, TYPE_CHAR):
         size1 = size_of(*obj) - sizeof(struct obj_t);
         size2 = size_of(vals) - sizeof(struct obj_t);
-        res = resize(obj, (*obj)->len + vals->len);
+        res = resize_obj(obj, (*obj)->len + vals->len);
         memcpy((*obj)->arr + size1, as_string(vals), size2);
         return res;
     case mtype2(TYPE_GUID, TYPE_GUID):
         size1 = size_of(*obj) - sizeof(struct obj_t);
         size2 = size_of(vals) - sizeof(struct obj_t);
-        res = resize(obj, (*obj)->len + vals->len);
+        res = resize_obj(obj, (*obj)->len + vals->len);
         memcpy((*obj)->arr + size1, as_guid(vals), size2);
         return res;
     default:
@@ -510,35 +524,35 @@ obj_t append(obj_t *obj, obj_t vals)
         {
             l = (*obj)->len;
             c = ops_count(vals);
-            res = resize(obj, l + c);
+            res = resize_obj(obj, l + c);
             for (i = 0; i < c; i++)
                 as_list(res)[l + i] = at_idx(vals, i);
 
             return res;
         }
 
-        throw(ERR_TYPE, "push_obj: invalid types: '%s, '%s", typename((*obj)->type), typename(vals->type));
+        throw(ERR_TYPE, "push_obj: invalid types: '%s, '%s", type_name((*obj)->type), type_name(vals->type));
     }
 }
 
-obj_t push_sym(obj_t *obj, str_t str)
+obj_p push_sym(obj_p *obj, str_p str)
 {
     i64_t sym = intern_symbol(str, strlen(str));
     return push_raw(obj, &sym);
 }
 
-obj_t ins_raw(obj_t *obj, i64_t idx, raw_t val)
+obj_p ins_raw(obj_p *obj, i64_t idx, raw_p val)
 {
     i32_t size = size_of_type((*obj)->type);
     memcpy((*obj)->arr + idx * size, val, size);
     return *obj;
 }
 
-obj_t ins_obj(obj_t *obj, i64_t idx, obj_t val)
+obj_p ins_obj(obj_p *obj, i64_t idx, obj_p val)
 {
     i64_t i;
     u64_t l;
-    obj_t ret;
+    obj_p ret;
 
     if (!is_vector(*obj))
         return *obj;
@@ -557,7 +571,7 @@ obj_t ins_obj(obj_t *obj, i64_t idx, obj_t val)
 
         as_list(ret)[idx] = val;
 
-        drop(*obj);
+        drop_obj(*obj);
 
         *obj = ret;
 
@@ -566,48 +580,48 @@ obj_t ins_obj(obj_t *obj, i64_t idx, obj_t val)
 
     switch ((*obj)->type)
     {
-    case TYPE_BOOL:
-        ret = ins_raw(obj, idx, &val->bool);
-        drop(val);
+    case TYPE_B8:
+        ret = ins_raw(obj, idx, &val->b8);
+        drop_obj(val);
         break;
-    case TYPE_BYTE:
+    case TYPE_U8:
         ret = ins_raw(obj, idx, &val->u8);
-        drop(val);
+        drop_obj(val);
         break;
     case TYPE_I64:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
         ret = ins_raw(obj, idx, &val->i64);
-        drop(val);
+        drop_obj(val);
         break;
     case TYPE_F64:
         ret = ins_raw(obj, idx, &val->f64);
-        drop(val);
+        drop_obj(val);
         break;
     case TYPE_CHAR:
         ret = ins_raw(obj, idx, &val->vchar);
-        drop(val);
+        drop_obj(val);
         break;
     case TYPE_LIST:
         ret = ins_raw(obj, idx, &val);
         break;
     default:
-        throw(ERR_TYPE, "write_obj: invalid type: '%s", typename((*obj)->type));
+        throw(ERR_TYPE, "write_obj: invalid type: '%s", type_name((*obj)->type));
     }
 
     return ret;
 }
 
-obj_t ins_sym(obj_t *obj, i64_t idx, str_t str)
+obj_p ins_sym(obj_p *obj, i64_t idx, str_p str)
 {
     i64_t sym = intern_symbol(str, strlen(str));
     return ins_raw(obj, idx, &sym);
 }
 
-obj_t at_idx(obj_t obj, i64_t idx)
+obj_p at_idx(obj_p obj, i64_t idx)
 {
     u64_t i, n, l;
-    obj_t k, v, res;
+    obj_p k, v, res;
     u8_t *buf;
 
     switch (obj->type)
@@ -647,7 +661,7 @@ obj_t at_idx(obj_t obj, i64_t idx)
         if (idx < 0)
             idx = obj->len + idx;
         if (idx >= 0 && idx < (i64_t)obj->len)
-            return clone(as_list(obj)[idx]);
+            return clone_obj(as_list(obj)[idx]);
         return NULL_OBJ;
     case TYPE_GUID:
         if (idx < 0)
@@ -664,12 +678,12 @@ obj_t at_idx(obj_t obj, i64_t idx)
             if (is_error(k))
                 return k;
             v = ray_get(k);
-            drop(k);
+            drop_obj(k);
             if (is_error(v))
                 return v;
             idx = as_i64(enum_val(obj))[idx];
             res = at_idx(v, idx);
-            drop(v);
+            drop_obj(v);
             return res;
         }
         return symboli64(NULL_I64);
@@ -701,12 +715,12 @@ obj_t at_idx(obj_t obj, i64_t idx)
                 if (is_error(k))
                 {
                     v->len = i;
-                    drop(v);
+                    drop_obj(v);
                     return k;
                 }
                 ins_obj(&v, i, k);
             }
-            return dict(clone(as_list(obj)[0]), v);
+            return dict(clone_obj(as_list(obj)[0]), v);
         }
 
         for (i = 0; i < n; i++)
@@ -715,19 +729,19 @@ obj_t at_idx(obj_t obj, i64_t idx)
             ins_obj(&v, i, k);
         }
 
-        return dict(clone(as_list(obj)[0]), v);
+        return dict(clone_obj(as_list(obj)[0]), v);
 
     default:
-        return clone(obj);
+        return clone_obj(obj);
     }
 }
 
-obj_t at_ids(obj_t obj, i64_t ids[], u64_t len)
+obj_p at_ids(obj_p obj, i64_t ids[], u64_t len)
 {
     u64_t i, xl;
     i64_t *iinp, *iout;
     f64_t *finp, *fout;
-    obj_t k, v, cols, res;
+    obj_p k, v, cols, res;
 
     switch (obj->type)
     {
@@ -758,7 +772,7 @@ obj_t at_ids(obj_t obj, i64_t ids[], u64_t len)
     case TYPE_LIST:
         res = list(len);
         for (i = 0; i < len; i++)
-            as_list(res)[i] = clone(as_list(obj)[ids[i]]);
+            as_list(res)[i] = clone_obj(as_list(obj)[ids[i]]);
 
         return res;
     case TYPE_ENUM:
@@ -767,19 +781,19 @@ obj_t at_ids(obj_t obj, i64_t ids[], u64_t len)
             return k;
 
         v = ray_get(k);
-        drop(k);
+        drop_obj(k);
 
         if (is_error(v))
             return v;
 
         if (v->type != TYPE_SYMBOL)
-            return error(ERR_TYPE, "enum: '%s' is not a 'Symbol'", typename(v->type));
+            return error(ERR_TYPE, "enum: '%s' is not a 'Symbol'", type_name(v->type));
 
         res = vector_symbol(len);
         for (i = 0; i < len; i++)
             as_i64(res)[i] = as_i64(v)[as_i64(enum_val(obj))[ids[i]]];
 
-        drop(v);
+        drop_obj(v);
         return res;
     case TYPE_TABLE:
         xl = as_list(obj)[0]->len;
@@ -794,14 +808,14 @@ obj_t at_ids(obj_t obj, i64_t ids[], u64_t len)
             if (is_error(k))
             {
                 cols->len = i;
-                drop(cols);
+                drop_obj(cols);
                 return k;
             }
 
             ins_obj(&cols, i, k);
         }
 
-        return table(clone(as_list(obj)[0]), cols);
+        return table(clone_obj(as_list(obj)[0]), cols);
     default:
         res = vector(TYPE_LIST, len);
         for (i = 0; i < len; i++)
@@ -811,11 +825,11 @@ obj_t at_ids(obj_t obj, i64_t ids[], u64_t len)
     }
 }
 
-obj_t at_obj(obj_t obj, obj_t idx)
+obj_p at_obj(obj_p obj, obj_p idx)
 {
     u64_t i, j, n, l;
     i64_t *ids;
-    obj_t v;
+    obj_p v;
 
     switch (mtype2(obj->type, idx->type))
     {
@@ -872,22 +886,22 @@ obj_t at_obj(obj_t obj, obj_t idx)
             return at_idx(as_list(obj)[1], i);
         }
 
-        throw(ERR_TYPE, "at_obj: unable to index: '%s by '%s", typename(obj->type), typename(idx->type));
+        throw(ERR_TYPE, "at_obj: unable to index: '%s by '%s", type_name(obj->type), type_name(idx->type));
     }
 }
 
-obj_t at_sym(obj_t obj, str_t str)
+obj_p at_sym(obj_p obj, str_p str)
 {
-    obj_t sym, res;
+    obj_p sym, res;
 
     sym = symbol(str);
     res = at_obj(obj, sym);
-    drop(sym);
+    drop_obj(sym);
 
     return res;
 }
 
-obj_t set_idx(obj_t *obj, i64_t idx, obj_t val)
+obj_p set_idx(obj_p *obj, i64_t idx, obj_p val)
 {
     switch (mtype2((*obj)->type, val->type))
     {
@@ -895,33 +909,33 @@ obj_t set_idx(obj_t *obj, i64_t idx, obj_t val)
     case mtype2(TYPE_SYMBOL, -TYPE_SYMBOL):
     case mtype2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
         as_i64(*obj)[idx] = val->i64;
-        drop(val);
+        drop_obj(val);
         return *obj;
     case mtype2(TYPE_F64, -TYPE_F64):
         as_f64(*obj)[idx] = val->f64;
-        drop(val);
+        drop_obj(val);
         return *obj;
     case mtype2(TYPE_CHAR, -TYPE_CHAR):
         as_string(*obj)[idx] = val->vchar;
-        drop(val);
+        drop_obj(val);
         return *obj;
     case mtype2(TYPE_GUID, -TYPE_GUID):
         as_guid(*obj)[idx] = as_guid(val)[0];
-        drop(val);
+        drop_obj(val);
         return *obj;
     default:
         if ((*obj)->type == TYPE_LIST)
         {
-            drop(as_list(*obj)[idx]);
+            drop_obj(as_list(*obj)[idx]);
             as_list(*obj)[idx] = val;
             return *obj;
         }
 
-        throw(ERR_TYPE, "set_idx: invalid types: '%s, '%s", typename((*obj)->type), typename(val->type));
+        throw(ERR_TYPE, "set_idx: invalid types: '%s, '%s", type_name((*obj)->type), type_name(val->type));
     }
 }
 
-obj_t set_ids(obj_t *obj, i64_t ids[], u64_t len, obj_t vals)
+obj_p set_ids(obj_p *obj, i64_t ids[], u64_t len, obj_p vals)
 {
     u64_t i;
 
@@ -932,52 +946,52 @@ obj_t set_ids(obj_t *obj, i64_t ids[], u64_t len, obj_t vals)
     case mtype2(TYPE_TIMESTAMP, -TYPE_I64):
         for (i = 0; i < len; i++)
             as_i64(*obj)[ids[i]] = vals->i64;
-        drop(vals);
+        drop_obj(vals);
         return *obj;
     case mtype2(TYPE_F64, -TYPE_F64):
         for (i = 0; i < len; i++)
             as_f64(*obj)[ids[i]] = vals->f64;
-        drop(vals);
+        drop_obj(vals);
         return *obj;
     case mtype2(TYPE_CHAR, -TYPE_CHAR):
         for (i = 0; i < len; i++)
             as_string(*obj)[ids[i]] = vals->vchar;
-        drop(vals);
+        drop_obj(vals);
         return *obj;
     case mtype2(TYPE_GUID, -TYPE_GUID):
         for (i = 0; i < len; i++)
             as_guid(*obj)[ids[i]] = as_guid(vals)[i];
-        drop(vals);
+        drop_obj(vals);
         return *obj;
     case mtype2(TYPE_I64, TYPE_I64):
     case mtype2(TYPE_SYMBOL, TYPE_I64):
     case mtype2(TYPE_TIMESTAMP, TYPE_I64):
         for (i = 0; i < len; i++)
             as_i64(*obj)[ids[i]] = as_i64(vals)[i];
-        drop(vals);
+        drop_obj(vals);
         return *obj;
     case mtype2(TYPE_F64, TYPE_F64):
         for (i = 0; i < len; i++)
             as_f64(*obj)[ids[i]] = as_f64(vals)[i];
-        drop(vals);
+        drop_obj(vals);
         return *obj;
     case mtype2(TYPE_CHAR, TYPE_CHAR):
         for (i = 0; i < len; i++)
             as_string(*obj)[ids[i]] = as_string(vals)[i];
-        drop(vals);
+        drop_obj(vals);
         return *obj;
     case mtype2(TYPE_GUID, TYPE_GUID):
         for (i = 0; i < len; i++)
             as_guid(*obj)[ids[i]] = as_guid(vals)[i];
-        drop(vals);
+        drop_obj(vals);
         return *obj;
     case mtype2(TYPE_LIST, TYPE_CHAR):
         for (i = 0; i < len; i++)
         {
-            drop(as_list(*obj)[ids[i]]);
-            as_list(*obj)[ids[i]] = clone(vals);
+            drop_obj(as_list(*obj)[ids[i]]);
+            as_list(*obj)[ids[i]] = clone_obj(vals);
         }
-        drop(vals);
+        drop_obj(vals);
         return *obj;
     default:
         if ((*obj)->type == TYPE_LIST)
@@ -986,43 +1000,43 @@ obj_t set_ids(obj_t *obj, i64_t ids[], u64_t len, obj_t vals)
             {
                 for (i = 0; i < len; i++)
                 {
-                    drop(as_list(*obj)[ids[i]]);
-                    as_list(*obj)[ids[i]] = clone(vals);
+                    drop_obj(as_list(*obj)[ids[i]]);
+                    as_list(*obj)[ids[i]] = clone_obj(vals);
                 }
             }
             else
             {
                 for (i = 0; i < len; i++)
                 {
-                    drop(as_list(*obj)[ids[i]]);
+                    drop_obj(as_list(*obj)[ids[i]]);
                     as_list(*obj)[ids[i]] = at_idx(vals, i);
                 }
             }
 
-            drop(vals);
+            drop_obj(vals);
 
             return *obj;
         }
 
-        throw(ERR_TYPE, "set_ids: types mismatch/unsupported: '%s, '%s", typename((*obj)->type), typename(vals->type));
+        throw(ERR_TYPE, "set_ids: types mismatch/unsupported: '%s, '%s", type_name((*obj)->type), type_name(vals->type));
     }
 }
 
-obj_t __expand(obj_t obj, u64_t len)
+obj_p __expand(obj_p obj, u64_t len)
 {
     u64_t i;
-    obj_t res;
+    obj_p res;
 
     switch (obj->type)
     {
-    case -TYPE_BOOL:
-    case -TYPE_BYTE:
+    case -TYPE_B8:
+    case -TYPE_U8:
     case -TYPE_CHAR:
         res = vector(obj->type, len);
         for (i = 0; i < len; i++)
             as_u8(res)[i] = obj->u8;
 
-        drop(obj);
+        drop_obj(obj);
 
         return res;
     case -TYPE_I64:
@@ -1032,7 +1046,7 @@ obj_t __expand(obj_t obj, u64_t len)
         for (i = 0; i < len; i++)
             as_i64(res)[i] = obj->i64;
 
-        drop(obj);
+        drop_obj(obj);
 
         return res;
     case -TYPE_F64:
@@ -1040,7 +1054,7 @@ obj_t __expand(obj_t obj, u64_t len)
         for (i = 0; i < len; i++)
             as_f64(res)[i] = obj->f64;
 
-        drop(obj);
+        drop_obj(obj);
 
         return res;
     case -TYPE_GUID:
@@ -1048,13 +1062,13 @@ obj_t __expand(obj_t obj, u64_t len)
         for (i = 0; i < len; i++)
             memcpy(&as_guid(res)[i], as_guid(obj)->buf, sizeof(struct guid_t));
 
-        drop(obj);
+        drop_obj(obj);
 
         return res;
     default:
         if (ops_count(obj) != len)
         {
-            drop(obj);
+            drop_obj(obj);
             throw(ERR_LENGTH, "set: invalid length: '%lld' != '%lld'", ops_count(obj), len);
         }
 
@@ -1062,9 +1076,9 @@ obj_t __expand(obj_t obj, u64_t len)
     }
 }
 
-obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
+obj_p set_obj(obj_p *obj, obj_p idx, obj_p val)
 {
-    obj_t k, v, res;
+    obj_p k, v, res;
     u64_t i, n, l;
     i64_t id = NULL_I64, *ids = NULL;
 
@@ -1080,7 +1094,7 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
     case mtype2(TYPE_GUID, -TYPE_I64):
         if (idx->i64 < 0 || idx->i64 >= (i64_t)(*obj)->len)
         {
-            drop(val);
+            drop_obj(val);
             throw(ERR_TYPE, "set_obj: '%lld' is out of range '0..%lld'", idx->i64, (*obj)->len - 1);
         }
         return set_idx(obj, idx->i64, val);
@@ -1093,7 +1107,7 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
     case mtype2(TYPE_LIST, TYPE_I64):
         if (is_vector(val) && idx->len != val->len)
         {
-            drop(val);
+            drop_obj(val);
             throw(ERR_LENGTH, "set_obj: idx and vals length mismatch: '%lld' != '%lld'", idx->len, val->len);
         }
         ids = as_i64(idx);
@@ -1103,7 +1117,7 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
         {
             if (ids[i] < 0 || ids[i] >= (i64_t)l)
             {
-                drop(val);
+                drop_obj(val);
                 throw(ERR_TYPE, "set_obj: '%lld' is out of range '0..%lld'", ids[i], l - 1);
             }
         }
@@ -1115,7 +1129,7 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
         i = find_obj(as_list(*obj)[0], idx);
         if (i == as_list(*obj)[0]->len)
         {
-            res = push_obj(&as_list(*obj)[0], clone(idx));
+            res = push_obj(&as_list(*obj)[0], clone_obj(idx));
             if (is_error(res))
                 return res;
 
@@ -1132,14 +1146,14 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
     case mtype2(TYPE_TABLE, TYPE_SYMBOL):
         if (val->type != TYPE_LIST)
         {
-            drop(val);
-            throw(ERR_TYPE, "set_obj: 'Table indexed via vector expects 'List in a values, found: '%s", typename(val->type));
+            drop_obj(val);
+            throw(ERR_TYPE, "set_obj: 'Table indexed via vector expects 'List in a values, found: '%s", type_name(val->type));
         }
 
         l = ops_count(idx);
         if (l != ops_count(val))
         {
-            drop(val);
+            drop_obj(val);
             throw(ERR_LENGTH, "set_obj: idx and vals length mismatch: '%lld' != '%lld'", ops_count(*obj), ops_count(val));
         }
 
@@ -1147,20 +1161,20 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
         v = list(l);
         for (i = 0; i < l; i++)
         {
-            k = __expand(clone(as_list(val)[i]), n);
+            k = __expand(clone_obj(as_list(val)[i]), n);
 
             if (is_error(k))
             {
                 v->len = i;
-                drop(v);
-                drop(val);
+                drop_obj(v);
+                drop_obj(val);
                 return k;
             }
 
             as_list(v)[i] = k;
         }
 
-        drop(val);
+        drop_obj(val);
         val = v;
 
         for (i = 0; i < l; i++)
@@ -1169,15 +1183,15 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
             if (id == (i64_t)as_list(*obj)[0]->len)
             {
                 push_raw(&as_list(*obj)[0], &as_symbol(idx)[i]);
-                push_obj(&as_list(*obj)[1], clone(as_list(val)[i]));
+                push_obj(&as_list(*obj)[1], clone_obj(as_list(val)[i]));
             }
             else
             {
-                set_idx(&as_list(*obj)[1], id, clone(as_list(val)[i]));
+                set_idx(&as_list(*obj)[1], id, clone_obj(as_list(val)[i]));
             }
         }
 
-        drop(val);
+        drop_obj(val);
 
         return *obj;
     default:
@@ -1186,7 +1200,7 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
             i = find_obj(as_list(*obj)[0], idx);
             if (i == as_list(*obj)[0]->len)
             {
-                res = push_obj(&as_list(*obj)[0], clone(idx));
+                res = push_obj(&as_list(*obj)[0], clone_obj(idx));
                 if (res->type == TYPE_ERROR)
                     return res;
 
@@ -1203,11 +1217,11 @@ obj_t set_obj(obj_t *obj, obj_t idx, obj_t val)
             return *obj;
         }
 
-        throw(ERR_TYPE, "set_obj: invalid types: '%s, '%s", typename((*obj)->type), typename(val->type));
+        throw(ERR_TYPE, "set_obj: invalid types: '%s, '%s", type_name((*obj)->type), type_name(val->type));
     }
 }
 
-obj_t pop_obj(obj_t *obj)
+obj_p pop_obj(obj_p *obj)
 {
     if ((*obj)->len == 0)
         return NULL_OBJ;
@@ -1232,21 +1246,21 @@ obj_t pop_obj(obj_t *obj)
     }
 }
 
-obj_t remove_idx(obj_t *obj, i64_t idx)
+obj_p remove_idx(obj_p *obj, i64_t idx)
 {
     unused(idx);
 
     return *obj;
 }
 
-obj_t remove_obj(obj_t *obj, obj_t idx)
+obj_p remove_obj(obj_p *obj, obj_p idx)
 {
     unused(idx);
 
     return *obj;
 }
 
-bool_t is_null(obj_t obj)
+b8_t is_null(obj_p obj)
 {
     return (obj->type == TYPE_NULL) ||
            (obj->type == -TYPE_I64 && obj->i64 == NULL_I64) ||
@@ -1256,7 +1270,7 @@ bool_t is_null(obj_t obj)
            (obj->type == -TYPE_CHAR && obj->vchar == '\0');
 }
 
-i32_t objcmp(obj_t a, obj_t b)
+i32_t cmp_obj(obj_p a, obj_p b)
 {
     i64_t i, l, d;
 
@@ -1268,9 +1282,9 @@ i32_t objcmp(obj_t a, obj_t b)
 
     switch (a->type)
     {
-    case -TYPE_BOOL:
-        return a->bool - b->bool;
-    case -TYPE_BYTE:
+    case -TYPE_B8:
+        return a->b8 - b->b8;
+    case -TYPE_U8:
     case -TYPE_CHAR:
         return (i32_t)a->u8 - (i32_t)b->u8;
     case -TYPE_I64:
@@ -1330,7 +1344,7 @@ i32_t objcmp(obj_t a, obj_t b)
         l = a->len;
         for (i = 0; i < l; i++)
         {
-            d = objcmp(as_list(a)[i], as_list(b)[i]);
+            d = cmp_obj(as_list(a)[i], as_list(b)[i]);
             if (d != 0)
                 return d;
         }
@@ -1342,7 +1356,7 @@ i32_t objcmp(obj_t a, obj_t b)
     }
 }
 
-i64_t find_raw(obj_t obj, raw_t val)
+i64_t find_raw(obj_p obj, raw_p val)
 {
     i64_t i, l;
 
@@ -1374,7 +1388,7 @@ i64_t find_raw(obj_t obj, raw_t val)
     case TYPE_LIST:
         l = obj->len;
         for (i = 0; i < l; i++)
-            if (objcmp(as_list(obj)[i], *(obj_t *)val) == 0)
+            if (cmp_obj(as_list(obj)[i], *(obj_p *)val) == 0)
                 return i;
         return l;
     default:
@@ -1382,7 +1396,7 @@ i64_t find_raw(obj_t obj, raw_t val)
     }
 }
 
-i64_t find_obj(obj_t obj, obj_t val)
+i64_t find_obj(obj_p obj, obj_p val)
 {
     if (!is_vector(obj))
         return NULL_I64;
@@ -1404,21 +1418,21 @@ i64_t find_obj(obj_t obj, obj_t val)
     }
 }
 
-i64_t find_sym(obj_t obj, str_t str)
+i64_t find_sym(obj_p obj, str_p str)
 {
     i64_t n = intern_symbol(str, strlen(str));
     return find_raw(obj, &n);
 }
 
-obj_t as(type_t type, obj_t obj)
+obj_p cast_obj(i8_t type, obj_p obj)
 {
-    obj_t res, err;
+    obj_p res, err;
     u64_t i, l;
-    str_t msg;
+    str_p msg;
 
     // Do nothing if the type is the same
     if (type == obj->type)
-        return clone(obj);
+        return clone_obj(obj);
 
     if (type == TYPE_CHAR)
         return obj_stringify(obj);
@@ -1440,9 +1454,9 @@ obj_t as(type_t type, obj_t obj)
     case mtype2(-TYPE_F64, TYPE_CHAR):
         return f64(strtod(as_string(obj), NULL));
     case mtype2(TYPE_TABLE, TYPE_DICT):
-        return table(clone(as_list(obj)[0]), clone(as_list(obj)[1]));
+        return table(clone_obj(as_list(obj)[0]), clone_obj(as_list(obj)[1]));
     case mtype2(TYPE_DICT, TYPE_TABLE):
-        return dict(clone(as_list(obj)[0]), clone(as_list(obj)[1]));
+        return dict(clone_obj(as_list(obj)[0]), clone_obj(as_list(obj)[1]));
     case mtype2(TYPE_F64, TYPE_I64):
         l = obj->len;
         res = vector_f64(l);
@@ -1455,11 +1469,11 @@ obj_t as(type_t type, obj_t obj)
         for (i = 0; i < l; i++)
             as_i64(res)[i] = (i64_t)as_f64(obj)[i];
         return res;
-    case mtype2(TYPE_BOOL, TYPE_I64):
+    case mtype2(TYPE_B8, TYPE_I64):
         l = obj->len;
-        res = vector_bool(l);
+        res = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(res)[i] = (bool_t)as_i64(obj)[i];
+            as_b8(res)[i] = (b8_t)as_i64(obj)[i];
         return res;
     case mtype2(-TYPE_GUID, TYPE_CHAR):
         res = guid(NULL);
@@ -1493,7 +1507,7 @@ obj_t as(type_t type, obj_t obj)
             as_timestamp(res)[i] = as_i64(obj)[i];
         return res;
     default:
-        msg = str_fmt(0, "invalid conversion from '%s to '%s", typename(obj->type), typename(type));
+        msg = str_fmt(0, "invalid conversion from '%s to '%s", type_name(obj->type), type_name(type));
         err = error_str(ERR_TYPE, msg);
         heap_free(msg);
         return err;
@@ -1502,7 +1516,7 @@ obj_t as(type_t type, obj_t obj)
     return res;
 }
 
-obj_t __attribute__((hot)) clone(obj_t obj)
+obj_p __attribute__((hot)) clone_obj(obj_p obj)
 {
     debug_assert(is_valid(obj), "invalid object type: %d", obj->type);
 
@@ -1514,13 +1528,13 @@ obj_t __attribute__((hot)) clone(obj_t obj)
     return obj;
 }
 
-nil_t __attribute__((hot)) drop(obj_t obj)
+nil_t __attribute__((hot)) drop_obj(obj_p obj)
 {
     debug_assert(is_valid(obj), "invalid object type: %d", obj->type);
 
     u32_t rc;
     u64_t i, l;
-    obj_t id, k;
+    obj_p id, k;
 
     if (!__RC_SYNC)
     {
@@ -1540,7 +1554,7 @@ nil_t __attribute__((hot)) drop(obj_t obj)
     case TYPE_GROUPMAP:
         l = obj->len;
         for (i = 0; i < l; i++)
-            drop(as_list(obj)[i]);
+            drop_obj(as_list(obj)[i]);
 
         if (is_external_simple(obj))
             mmap_free(obj, size_of(obj));
@@ -1549,36 +1563,36 @@ nil_t __attribute__((hot)) drop(obj_t obj)
         return;
     case TYPE_ENUM:
         if (is_external_compound(obj))
-            mmap_free((str_t)obj - PAGE_SIZE, size_of(obj) + PAGE_SIZE);
+            mmap_free((str_p)obj - PAGE_SIZE, size_of(obj) + PAGE_SIZE);
         else
         {
-            drop(as_list(obj)[0]);
-            drop(as_list(obj)[1]);
+            drop_obj(as_list(obj)[0]);
+            drop_obj(as_list(obj)[1]);
             heap_free(obj);
         }
         return;
     case TYPE_ANYMAP:
         mmap_free(anymap_key(obj), size_of(obj));
-        mmap_free((str_t)obj - PAGE_SIZE, size_of(obj) + PAGE_SIZE);
+        mmap_free((str_p)obj - PAGE_SIZE, size_of(obj) + PAGE_SIZE);
         return;
     case TYPE_TABLE:
     case TYPE_DICT:
-        drop(as_list(obj)[0]);
-        drop(as_list(obj)[1]);
+        drop_obj(as_list(obj)[0]);
+        drop_obj(as_list(obj)[1]);
         heap_free(obj);
         return;
     case TYPE_LAMBDA:
-        drop(as_lambda(obj)->name);
-        drop(as_lambda(obj)->args);
-        drop(as_lambda(obj)->body);
-        drop(as_lambda(obj)->nfo);
+        drop_obj(as_lambda(obj)->name);
+        drop_obj(as_lambda(obj)->args);
+        drop_obj(as_lambda(obj)->body);
+        drop_obj(as_lambda(obj)->nfo);
         heap_free(obj);
         return;
     case TYPE_NULL:
         return;
     case TYPE_ERROR:
-        drop(as_error(obj)->msg);
-        drop(as_error(obj)->locs);
+        drop_obj(as_error(obj)->msg);
+        drop_obj(as_error(obj)->locs);
         heap_free(obj);
         return;
     default:
@@ -1590,21 +1604,21 @@ nil_t __attribute__((hot)) drop(obj_t obj)
             if (!is_null(k))
             {
                 fs_fclose(k->i64);
-                drop(k);
+                drop_obj(k);
                 set_obj(&runtime_get()->fds, id, null(TYPE_I64));
             }
 
-            drop(id);
+            drop_obj(id);
         }
         else
             heap_free(obj);
     }
 }
 
-obj_t copy(obj_t obj)
+obj_p copy_obj(obj_p obj)
 {
     u64_t i, l;
-    obj_t res;
+    obj_p res;
 
     switch (obj->type)
     {
@@ -1622,27 +1636,27 @@ obj_t copy(obj_t obj)
         res = list(l);
         res->rc = 1;
         for (i = 0; i < l; i++)
-            as_list(res)[i] = clone(as_list(obj)[i]);
+            as_list(res)[i] = clone_obj(as_list(obj)[i]);
         return res;
     case TYPE_ENUM:
     case TYPE_ANYMAP:
         return ray_value(obj);
     case TYPE_TABLE:
-        return table(copy(as_list(obj)[0]), copy(as_list(obj)[1]));
+        return table(copy_obj(as_list(obj)[0]), copy_obj(as_list(obj)[1]));
     case TYPE_DICT:
-        return dict(copy(as_list(obj)[0]), copy(as_list(obj)[1]));
+        return dict(copy_obj(as_list(obj)[0]), copy_obj(as_list(obj)[1]));
     default:
-        throw(ERR_NOT_IMPLEMENTED, "cow: not implemented for type: '%s", typename(obj->type));
+        throw(ERR_NOT_IMPLEMENTED, "cow: not implemented for type: '%s", type_name(obj->type));
     }
 }
 
-obj_t cow(obj_t obj)
+obj_p cow_obj(obj_p obj)
 {
     u32_t rc;
 
     // Complex types like enumerations or anymap may not be modified inplace
     if (obj->type == TYPE_ENUM || obj->type == TYPE_ANYMAP)
-        return copy(obj);
+        return copy_obj(obj);
 
     /*
     Since it is forbidden to modify globals from several threads simultenously,
@@ -1658,10 +1672,10 @@ obj_t cow(obj_t obj)
         return obj;
 
     // we don't own the reference, so we need to copy object
-    return copy(obj);
+    return copy_obj(obj);
 }
 
-u32_t rc(obj_t obj)
+u32_t rc_obj(obj_p obj)
 {
     u32_t rc;
 
@@ -1673,23 +1687,28 @@ u32_t rc(obj_t obj)
     return rc;
 }
 
-str_t typename(type_t type)
+str_p type_name(i8_t type)
 {
-    return symtostr(env_get_typename_by_type(&runtime_get()->env, type));
+    return strof_sym(env_get_typename_by_type(&runtime_get()->env, type));
 }
 
-nil_t disp(raw_t ptr)
+nil_t drop_raw(raw_p ptr)
 {
     heap_free(ptr);
 }
 
-obj_t parseval(str_t str)
+obj_p eval_str(str_p str)
 {
-    obj_t s, res;
+    obj_p s, res;
 
     s = string_from_str(str, strlen(str));
-    res = eval_str(s, NULL_OBJ);
-    drop(s);
+    res = ray_eval_str(s, NULL_OBJ);
+    drop_obj(s);
 
     return res;
+}
+
+str_p strof_obj(obj_p obj)
+{
+    return obj_fmt(obj);
 }

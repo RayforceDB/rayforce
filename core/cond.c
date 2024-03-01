@@ -28,9 +28,9 @@
 #include "heap.h"
 #include "error.h"
 
-obj_t ray_cond(obj_t *x, u64_t n)
+obj_p ray_cond(obj_p *x, u64_t n)
 {
-    obj_t res;
+    obj_p res;
 
     switch (n)
     {
@@ -38,23 +38,23 @@ obj_t ray_cond(obj_t *x, u64_t n)
         res = eval(x[0]);
         if (is_error(res))
             return res;
-        if (ops_as_bool(res))
+        if (ops_as_b8(res))
         {
-            drop(res);
+            drop_obj(res);
             return eval(x[1]);
         }
-        drop(res);
+        drop_obj(res);
         return NULL_OBJ;
     case 3:
         res = eval(x[0]);
         if (is_error(res))
             return res;
-        if (ops_as_bool(res))
+        if (ops_as_b8(res))
         {
-            drop(res);
+            drop_obj(res);
             return eval(x[1]);
         }
-        drop(res);
+        drop_obj(res);
         return eval(x[2]);
     default:
         throw(ERR_LENGTH, "cond: invalid number of arguments");

@@ -46,14 +46,14 @@
 #include "rayforce.h"
 #include <fcntl.h>
 
-i64_t fs_fopen(str_t path, i64_t attrs);
+i64_t fs_fopen(str_p path, i64_t attrs);
 i64_t fs_fsize(i64_t fd);
-i64_t fs_fread(i64_t fd, str_t buf, i64_t size);
-i64_t fs_fwrite(i64_t fd, str_t buf, i64_t size);
+i64_t fs_fread(i64_t fd, str_p buf, i64_t size);
+i64_t fs_fwrite(i64_t fd, str_p buf, i64_t size);
 i64_t fs_ftruncate(i64_t fd, i64_t size);
 i64_t fs_fclose(i64_t fd);
-i64_t fs_dcreate(str_t path);
-i64_t fs_dopen(str_t path);
+i64_t fs_dcreate(str_p path);
+i64_t fs_dopen(str_p path);
 i64_t fs_dclose(i64_t fd);
 
 #endif // FS_H

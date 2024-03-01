@@ -1,6 +1,5 @@
 ;; Author: 0x0L 
 (set fib (fn [x]
-    (let m 8)
     (if (< x 2) 
         1
         (+ (self (- x 1)) (self (- x 2)))

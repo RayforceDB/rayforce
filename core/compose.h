@@ -26,18 +26,18 @@
 
 #include "rayforce.h"
 
-obj_t ray_dict(obj_t x, obj_t y);
-obj_t ray_table(obj_t x, obj_t y);
-obj_t ray_rand(obj_t x, obj_t y);
-obj_t ray_as(obj_t x, obj_t y);
-obj_t ray_enum(obj_t x, obj_t y);
-obj_t ray_concat(obj_t x, obj_t y);
-obj_t ray_distinct(obj_t x);
-obj_t ray_til(obj_t x);
-obj_t ray_reverse(obj_t x);
-obj_t ray_group(obj_t x);
-obj_t ray_guid(obj_t x);
-obj_t ray_list(obj_t *x, u64_t n);
-obj_t ray_enlist(obj_t *x, u64_t n);
+obj_p ray_dict(obj_p x, obj_p y);
+obj_p ray_table(obj_p x, obj_p y);
+obj_p ray_rand(obj_p x, obj_p y);
+obj_p ray_cast_obj(obj_p x, obj_p y);
+obj_p ray_enum(obj_p x, obj_p y);
+obj_p ray_concat(obj_p x, obj_p y);
+obj_p ray_distinct(obj_p x);
+obj_p ray_til(obj_p x);
+obj_p ray_reverse(obj_p x);
+obj_p ray_group(obj_p x);
+obj_p ray_guid(obj_p x);
+obj_p ray_list(obj_p *x, u64_t n);
+obj_p ray_enlist(obj_p *x, u64_t n);
 
 #endif // COMPOSE_H

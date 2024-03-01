@@ -26,10 +26,10 @@
 
 #include "rayforce.h"
 
-obj_t group_bins(obj_t x, obj_t y, obj_t z);
-obj_t group_map(obj_t x, obj_t y, obj_t z);
-obj_t group_collect(obj_t x);
-nil_t group_fill_counts(obj_t grp);
-obj_t group_ids(obj_t grp, i64_t ids[]);
+obj_p group_bins(obj_p x, obj_p y, obj_p z);
+obj_p group_map(obj_p x, obj_p y, obj_p z);
+obj_p group_collect(obj_p x);
+nil_t group_fill_counts(obj_p grp);
+obj_p group_ids(obj_p grp, i64_t ids[]);
 
 #endif // GROUP_H

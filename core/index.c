@@ -59,11 +59,11 @@ i64_t index_range(i64_t *pmin, i64_t *pmax, i64_t values[], i64_t indices[], u64
     return max - min + 1;
 }
 
-obj_t index_distinct_i8(i8_t values[], u64_t len, bool_t term)
+obj_p index_distinct_i8(i8_t values[], u64_t len, b8_t term)
 {
     u64_t i, j, range;
     i8_t min, *out;
-    obj_t vec;
+    obj_p vec;
 
     min = -128;
     range = 256;
@@ -88,17 +88,17 @@ obj_t index_distinct_i8(i8_t values[], u64_t len, bool_t term)
     if (term)
         out[j++] = 0;
 
-    resize(&vec, j);
+    resize_obj(&vec, j);
     vec->attrs |= ATTR_DISTINCT;
 
     return vec;
 }
 
-obj_t index_distinct_i64(i64_t values[], u64_t len)
+obj_p index_distinct_i64(i64_t values[], u64_t len)
 {
     u64_t i, j, range;
     i64_t p, min, max, k, *out;
-    obj_t vec, set;
+    obj_p vec, set;
 
     range = index_range(&min, &max, values, NULL, len);
 
@@ -119,7 +119,7 @@ obj_t index_distinct_i64(i64_t values[], u64_t len)
                 out[j++] = i + min;
         }
 
-        resize(&vec, j);
+        resize_obj(&vec, j);
         vec->attrs |= ATTR_DISTINCT;
 
         return vec;
@@ -146,26 +146,26 @@ obj_t index_distinct_i64(i64_t values[], u64_t len)
             out[j++] = out[i] + min;
     }
 
-    resize(&as_list(set)[0], j);
-    vec = clone(as_list(set)[0]);
+    resize_obj(&as_list(set)[0], j);
+    vec = clone_obj(as_list(set)[0]);
     vec->attrs |= ATTR_DISTINCT;
-    drop(set);
+    drop_obj(set);
 
     return vec;
 }
 
-obj_t index_distinct_guid(guid_t values[], u64_t len)
+obj_p index_distinct_guid(guid_t values[], u64_t len)
 {
     u64_t i, j;
     i64_t p, *out;
-    obj_t vec, set;
+    obj_p vec, set;
     guid_t *g;
 
     set = ht_tab(len, -1);
 
     for (i = 0, j = 0; i < len; i++)
     {
-        p = ht_tab_next_with(&set, (i64_t)&values[i], &hash_guid, &cmp_guid, NULL);
+        p = ht_tab_next_with(&set, (i64_t)&values[i], &hash_guid, &hash_cmp_guid, NULL);
         out = as_i64(as_list(set)[0]);
         if (out[p] == NULL_I64)
         {
@@ -186,25 +186,25 @@ obj_t index_distinct_guid(guid_t values[], u64_t len)
     }
 
     vec->attrs |= ATTR_DISTINCT;
-    drop(set);
+    drop_obj(set);
 
     return vec;
 }
 
-obj_t index_distinct_obj(obj_t values[], u64_t len)
+obj_p index_distinct_obj(obj_p values[], u64_t len)
 {
     u64_t i, j;
     i64_t p, *out;
-    obj_t vec, set;
+    obj_p vec, set;
 
     set = ht_tab(len, -1);
 
     for (i = 0; i < len; i++)
     {
-        p = ht_tab_next_with(&set, (i64_t)values[i], &hash_obj, &cmp_obj, NULL);
+        p = ht_tab_next_with(&set, (i64_t)values[i], &hash_obj, &hash_cmp_obj, NULL);
         out = as_i64(as_list(set)[0]);
         if (out[p] == NULL_I64)
-            out[p] = (i64_t)clone(values[i]);
+            out[p] = (i64_t)clone_obj(values[i]);
     }
 
     // compact keys
@@ -216,20 +216,20 @@ obj_t index_distinct_obj(obj_t values[], u64_t len)
             out[j++] = out[i];
     }
 
-    resize(&as_list(set)[0], j);
-    vec = clone(as_list(set)[0]);
+    resize_obj(&as_list(set)[0], j);
+    vec = clone_obj(as_list(set)[0]);
     vec->attrs |= ATTR_DISTINCT;
     vec->type = TYPE_LIST;
-    drop(set);
+    drop_obj(set);
 
     return vec;
 }
 
-obj_t index_find_i8(i8_t x[], u64_t xl, i8_t y[], u64_t yl)
+obj_p index_find_i8(i8_t x[], u64_t xl, i8_t y[], u64_t yl)
 {
     u64_t i, range;
     i64_t min, n, *r, *f;
-    obj_t vec;
+    obj_p vec;
 
     min = -128;
     range = 256;
@@ -256,16 +256,16 @@ obj_t index_find_i8(i8_t x[], u64_t xl, i8_t y[], u64_t yl)
         r[i] = f[n];
     }
 
-    resize(&vec, yl);
+    resize_obj(&vec, yl);
 
     return vec;
 }
 
-obj_t index_find_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl)
+obj_p index_find_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl)
 {
     u64_t i, range;
     i64_t max = 0, min = 0, n, p, *r, *f;
-    obj_t vec, ht;
+    obj_p vec, ht;
 
     if (xl == 0)
         return vector_i64(0);
@@ -293,7 +293,7 @@ obj_t index_find_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl)
             r[i] = (y[i] < min || y[i] > max) ? NULL_I64 : f[n];
         }
 
-        resize(&vec, yl);
+        resize_obj(&vec, yl);
 
         return vec;
     }
@@ -320,15 +320,15 @@ obj_t index_find_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl)
         r[i] = p == NULL_I64 ? NULL_I64 : as_i64(as_list(ht)[1])[p];
     }
 
-    drop(ht);
+    drop_obj(ht);
 
     return vec;
 }
 
 typedef struct __find_ctx_t
 {
-    raw_t lobj;
-    raw_t robj;
+    raw_p lobj;
+    raw_p robj;
     u64_t *hashes;
 } __find_ctx_t;
 
@@ -341,19 +341,19 @@ u64_t __hash_get(i64_t row, nil_t *seed)
 i64_t __cmp_obj(i64_t row1, i64_t row2, nil_t *seed)
 {
     __find_ctx_t *ctx = (__find_ctx_t *)seed;
-    return objcmp(((obj_t *)ctx->lobj)[row1], ((obj_t *)ctx->robj)[row2]);
+    return cmp_obj(((obj_p *)ctx->lobj)[row1], ((obj_p *)ctx->robj)[row2]);
 }
 
-i64_t __cmp_guid(i64_t row1, i64_t row2, nil_t *seed)
+i64_t __hash_cmp_guid(i64_t row1, i64_t row2, nil_t *seed)
 {
     __find_ctx_t *ctx = (__find_ctx_t *)seed;
     return memcmp((guid_t *)ctx->lobj + row1, (guid_t *)ctx->robj + row2, sizeof(guid_t));
 }
 
-obj_t index_find_guid(guid_t x[], u64_t xl, guid_t y[], u64_t yl)
+obj_p index_find_guid(guid_t x[], u64_t xl, guid_t y[], u64_t yl)
 {
     u64_t i, *hashes;
-    obj_t ht, res;
+    obj_p ht, res;
     i64_t idx;
     __find_ctx_t ctx;
 
@@ -364,36 +364,36 @@ obj_t index_find_guid(guid_t x[], u64_t xl, guid_t y[], u64_t yl)
     hashes = (u64_t *)as_i64(res);
 
     for (i = 0; i < xl; i++)
-        hashes[i] = index_hash_u64(*(u64_t *)(x + i), *((u64_t *)(x + i) + 1));
+        hashes[i] = hash_index_u64(*(u64_t *)(x + i), *((u64_t *)(x + i) + 1));
 
     ctx = (__find_ctx_t){.lobj = x, .robj = x, .hashes = hashes};
     for (i = 0; i < xl; i++)
     {
-        idx = ht_tab_next_with(&ht, i, &__hash_get, &__cmp_guid, &ctx);
+        idx = ht_tab_next_with(&ht, i, &__hash_get, &__hash_cmp_guid, &ctx);
         if (as_i64(as_list(ht)[0])[idx] == NULL_I64)
             as_i64(as_list(ht)[0])[idx] = i;
     }
 
     for (i = 0; i < yl; i++)
-        hashes[i] = index_hash_u64(*(u64_t *)(y + i), *((u64_t *)(y + i) + 1));
+        hashes[i] = hash_index_u64(*(u64_t *)(y + i), *((u64_t *)(y + i) + 1));
 
     ctx = (__find_ctx_t){.lobj = x, .robj = y, .hashes = hashes};
     for (i = 0; i < yl; i++)
     {
-        idx = ht_tab_get_with(ht, i, &__hash_get, &__cmp_guid, &ctx);
+        idx = ht_tab_get_with(ht, i, &__hash_get, &__hash_cmp_guid, &ctx);
         as_i64(res)[i] = (idx == NULL_I64) ? NULL_I64 : as_i64(as_list(ht)[0])[idx];
     }
 
-    drop(ht);
-    resize(&res, yl);
+    drop_obj(ht);
+    resize_obj(&res, yl);
 
     return res;
 }
 
-obj_t index_find_obj(obj_t x[], u64_t xl, obj_t y[], u64_t yl)
+obj_p index_find_obj(obj_p x[], u64_t xl, obj_p y[], u64_t yl)
 {
     u64_t i, *hashes;
-    obj_t ht, res;
+    obj_p ht, res;
     i64_t idx;
     __find_ctx_t ctx;
 
@@ -404,7 +404,7 @@ obj_t index_find_obj(obj_t x[], u64_t xl, obj_t y[], u64_t yl)
     hashes = (u64_t *)as_i64(res);
 
     for (i = 0; i < xl; i++)
-        hashes[i] = index_hash_u64(index_hash_obj(x[i]), 0xa5b6c7d8e9f01234ull);
+        hashes[i] = hash_index_u64(hash_index_obj(x[i]), 0xa5b6c7d8e9f01234ull);
 
     ctx = (__find_ctx_t){.lobj = x, .robj = x, .hashes = hashes};
     for (i = 0; i < xl; i++)
@@ -415,7 +415,7 @@ obj_t index_find_obj(obj_t x[], u64_t xl, obj_t y[], u64_t yl)
     }
 
     for (i = 0; i < yl; i++)
-        hashes[i] = index_hash_u64(index_hash_obj(y[i]), 0xa5b6c7d8e9f01234ull);
+        hashes[i] = hash_index_u64(hash_index_obj(y[i]), 0xa5b6c7d8e9f01234ull);
 
     ctx = (__find_ctx_t){.lobj = x, .robj = y, .hashes = hashes};
     for (i = 0; i < yl; i++)
@@ -424,8 +424,8 @@ obj_t index_find_obj(obj_t x[], u64_t xl, obj_t y[], u64_t yl)
         as_i64(res)[i] = (idx == NULL_I64) ? NULL_I64 : as_i64(as_list(ht)[0])[idx];
     }
 
-    drop(ht);
-    resize(&res, yl);
+    drop_obj(ht);
+    resize_obj(&res, yl);
 
     return res;
 }
@@ -437,11 +437,11 @@ obj_t index_find_obj(obj_t x[], u64_t xl, obj_t y[], u64_t yl)
  * [2] - count of each group (will be filled later on demand)
  */
 
-obj_t index_group_i8(i8_t values[], i64_t indices[], u64_t len)
+obj_p index_group_i8(i8_t values[], i64_t indices[], u64_t len)
 {
     u64_t i, j, n, range;
     i64_t min, *hk, *hv;
-    obj_t keys, vals;
+    obj_p keys, vals;
 
     min = -128;
     range = 256;
@@ -479,16 +479,16 @@ obj_t index_group_i8(i8_t values[], i64_t indices[], u64_t len)
         }
     }
 
-    drop(keys);
+    drop_obj(keys);
 
     return vn_list(3, i64(j), vals, NULL_OBJ);
 }
 
-obj_t index_group_i64(i64_t values[], i64_t indices[], u64_t len)
+obj_p index_group_i64(i64_t values[], i64_t indices[], u64_t len)
 {
     u64_t i, j, n, range;
     i64_t idx, min, max, *hk, *hv, *hp;
-    obj_t keys, vals, ht;
+    obj_p keys, vals, ht;
 
     range = index_range(&min, &max, values, indices, len);
 
@@ -528,7 +528,7 @@ obj_t index_group_i64(i64_t values[], i64_t indices[], u64_t len)
             }
         }
 
-        drop(keys);
+        drop_obj(keys);
 
         return vn_list(3, i64(j), vals, NULL_OBJ);
     }
@@ -542,7 +542,7 @@ obj_t index_group_i64(i64_t values[], i64_t indices[], u64_t len)
         for (i = 0, j = 0; i < len; i++)
         {
             n = values[indices[i]] - min;
-            idx = ht_tab_next_with(&ht, n, &hash_fnv1a, &cmp_i64, NULL);
+            idx = ht_tab_next_with(&ht, n, &hash_fnv1a, &hash_cmp_i64, NULL);
             hk = as_i64(as_list(ht)[0]);
             hv = as_i64(as_list(ht)[1]);
             if (hk[idx] == NULL_I64)
@@ -557,7 +557,7 @@ obj_t index_group_i64(i64_t values[], i64_t indices[], u64_t len)
         for (i = 0, j = 0; i < len; i++)
         {
             n = values[i] - min;
-            idx = ht_tab_next_with(&ht, n, &hash_fnv1a, &cmp_i64, NULL);
+            idx = ht_tab_next_with(&ht, n, &hash_fnv1a, &hash_cmp_i64, NULL);
             hk = as_i64(as_list(ht)[0]);
             hv = as_i64(as_list(ht)[1]);
             if (hk[idx] == NULL_I64)
@@ -576,7 +576,7 @@ obj_t index_group_i64(i64_t values[], i64_t indices[], u64_t len)
         for (i = 0; i < len; i++)
         {
             n = values[indices[i]] - min;
-            idx = ht_tab_get_with(ht, n, &hash_fnv1a, &cmp_i64, NULL);
+            idx = ht_tab_get_with(ht, n, &hash_fnv1a, &hash_cmp_i64, NULL);
             hp[i] = hv[idx];
         }
     }
@@ -585,21 +585,21 @@ obj_t index_group_i64(i64_t values[], i64_t indices[], u64_t len)
         for (i = 0; i < len; i++)
         {
             n = values[i] - min;
-            idx = ht_tab_get_with(ht, n, &hash_fnv1a, &cmp_i64, NULL);
+            idx = ht_tab_get_with(ht, n, &hash_fnv1a, &hash_cmp_i64, NULL);
             hp[i] = hv[idx];
         }
     }
 
-    drop(ht);
+    drop_obj(ht);
 
     return vn_list(3, i64(j), vals, NULL_OBJ);
 }
 
-obj_t index_group_guid(guid_t values[], i64_t indices[], u64_t len)
+obj_p index_group_guid(guid_t values[], i64_t indices[], u64_t len)
 {
     u64_t i, j, n;
     i64_t idx, *hk, *hv, *hp;
-    obj_t vals, ht;
+    obj_p vals, ht;
 
     ht = ht_tab(len, TYPE_I64);
 
@@ -608,7 +608,7 @@ obj_t index_group_guid(guid_t values[], i64_t indices[], u64_t len)
     {
         for (i = 0, j = 0; i < len; i++)
         {
-            idx = ht_tab_next_with(&ht, (i64_t)&values[indices[i]], &hash_guid, &cmp_guid, NULL);
+            idx = ht_tab_next_with(&ht, (i64_t)&values[indices[i]], &hash_guid, &hash_cmp_guid, NULL);
             hk = as_i64(as_list(ht)[0]);
             hv = as_i64(as_list(ht)[1]);
             if (hk[idx] == NULL_I64)
@@ -622,7 +622,7 @@ obj_t index_group_guid(guid_t values[], i64_t indices[], u64_t len)
     {
         for (i = 0, j = 0; i < len; i++)
         {
-            idx = ht_tab_next_with(&ht, (i64_t)&values[i], &hash_guid, &cmp_guid, NULL);
+            idx = ht_tab_next_with(&ht, (i64_t)&values[i], &hash_guid, &hash_cmp_guid, NULL);
             hk = as_i64(as_list(ht)[0]);
             hv = as_i64(as_list(ht)[1]);
             if (hk[idx] == NULL_I64)
@@ -641,7 +641,7 @@ obj_t index_group_guid(guid_t values[], i64_t indices[], u64_t len)
         for (i = 0; i < len; i++)
         {
             n = (i64_t)&values[indices[i]];
-            idx = ht_tab_get_with(ht, n, &hash_guid, &cmp_guid, NULL);
+            idx = ht_tab_get_with(ht, n, &hash_guid, &hash_cmp_guid, NULL);
             hp[i] = hv[idx];
         }
     }
@@ -650,21 +650,21 @@ obj_t index_group_guid(guid_t values[], i64_t indices[], u64_t len)
         for (i = 0; i < len; i++)
         {
             n = (i64_t)&values[i];
-            idx = ht_tab_get_with(ht, n, &hash_guid, &cmp_guid, NULL);
+            idx = ht_tab_get_with(ht, n, &hash_guid, &hash_cmp_guid, NULL);
             hp[i] = hv[idx];
         }
     }
 
-    drop(ht);
+    drop_obj(ht);
 
     return vn_list(3, i64(j), vals, NULL_OBJ);
 }
 
-obj_t index_group_obj(obj_t values[], i64_t indices[], u64_t len)
+obj_p index_group_obj(obj_p values[], i64_t indices[], u64_t len)
 {
     u64_t i, j, n;
     i64_t idx, *hk, *hv, *hp;
-    obj_t vals, ht;
+    obj_p vals, ht;
 
     ht = ht_tab(len, TYPE_I64);
 
@@ -674,7 +674,7 @@ obj_t index_group_obj(obj_t values[], i64_t indices[], u64_t len)
         for (i = 0, j = 0; i < len; i++)
         {
             n = (i64_t)values[indices[i]];
-            idx = ht_tab_next_with(&ht, n, &hash_obj, &cmp_obj, NULL);
+            idx = ht_tab_next_with(&ht, n, &hash_obj, &hash_cmp_obj, NULL);
             hk = as_i64(as_list(ht)[0]);
             hv = as_i64(as_list(ht)[1]);
             if (hk[idx] == NULL_I64)
@@ -689,7 +689,7 @@ obj_t index_group_obj(obj_t values[], i64_t indices[], u64_t len)
         for (i = 0, j = 0; i < len; i++)
         {
             n = (i64_t)values[i];
-            idx = ht_tab_next_with(&ht, n, &hash_obj, &cmp_obj, NULL);
+            idx = ht_tab_next_with(&ht, n, &hash_obj, &hash_cmp_obj, NULL);
             hk = as_i64(as_list(ht)[0]);
             hv = as_i64(as_list(ht)[1]);
             if (hk[idx] == NULL_I64)
@@ -708,7 +708,7 @@ obj_t index_group_obj(obj_t values[], i64_t indices[], u64_t len)
         for (i = 0; i < len; i++)
         {
             n = (i64_t)values[indices[i]];
-            idx = ht_tab_get_with(ht, n, &hash_obj, &cmp_obj, NULL);
+            idx = ht_tab_get_with(ht, n, &hash_obj, &hash_cmp_obj, NULL);
             hp[i] = hv[idx];
         }
     }
@@ -717,63 +717,63 @@ obj_t index_group_obj(obj_t values[], i64_t indices[], u64_t len)
         for (i = 0; i < len; i++)
         {
             n = (i64_t)values[i];
-            idx = ht_tab_get_with(ht, n, &hash_obj, &cmp_obj, NULL);
+            idx = ht_tab_get_with(ht, n, &hash_obj, &hash_cmp_obj, NULL);
             hp[i] = hv[idx];
         }
     }
 
-    drop(ht);
+    drop_obj(ht);
 
     return vn_list(3, i64(j), vals, NULL_OBJ);
 }
 
-nil_t index_hash_list(obj_t obj, u64_t out[], u64_t len, u64_t seed)
+nil_t hash_index_list(obj_p obj, u64_t out[], u64_t len, u64_t seed)
 {
     u8_t *u8v;
     f64_t *f64v;
     guid_t *g64v;
     u64_t i, *u64v;
-    obj_t k, v;
+    obj_p k, v;
     i64_t *ids;
 
     switch (obj->type)
     {
-    case -TYPE_BOOL:
-    case -TYPE_BYTE:
+    case -TYPE_B8:
+    case -TYPE_U8:
     case -TYPE_CHAR:
         if (seed != 0)
-            out[0] = index_hash_u64((u64_t)obj->u8, seed);
+            out[0] = hash_index_u64((u64_t)obj->u8, seed);
         else
-            out[0] = index_hash_u64((u64_t)obj->u8, out[0]);
+            out[0] = hash_index_u64((u64_t)obj->u8, out[0]);
         break;
     case -TYPE_I64:
     case -TYPE_SYMBOL:
     case -TYPE_TIMESTAMP:
         if (seed != 0)
-            out[0] = index_hash_u64((u64_t)obj->i64, seed);
+            out[0] = hash_index_u64((u64_t)obj->i64, seed);
         else
-            out[0] = index_hash_u64((u64_t)obj->i64, out[0]);
+            out[0] = hash_index_u64((u64_t)obj->i64, out[0]);
         break;
     case -TYPE_F64:
         if (seed != 0)
-            out[0] = index_hash_u64((u64_t)obj->f64, seed);
+            out[0] = hash_index_u64((u64_t)obj->f64, seed);
         else
-            out[0] = index_hash_u64((u64_t)obj->f64, out[0]);
+            out[0] = hash_index_u64((u64_t)obj->f64, out[0]);
         break;
     case -TYPE_GUID:
-        out[0] = index_hash_u64(*(u64_t *)as_guid(obj), seed);
-        out[0] = index_hash_u64(*((u64_t *)as_guid(obj) + 1), out[0]);
+        out[0] = hash_index_u64(*(u64_t *)as_guid(obj), seed);
+        out[0] = hash_index_u64(*((u64_t *)as_guid(obj) + 1), out[0]);
         break;
-    case TYPE_BOOL:
-    case TYPE_BYTE:
+    case TYPE_B8:
+    case TYPE_U8:
     case TYPE_CHAR:
         u8v = as_u8(obj);
         if (seed != 0)
             for (i = 0; i < len; i++)
-                out[i] = index_hash_u64((u64_t)u8v[i], seed);
+                out[i] = hash_index_u64((u64_t)u8v[i], seed);
         else
             for (i = 0; i < len; i++)
-                out[i] = index_hash_u64((u64_t)u8v[i], out[i]);
+                out[i] = hash_index_u64((u64_t)u8v[i], out[i]);
         break;
     case TYPE_I64:
     case TYPE_SYMBOL:
@@ -781,19 +781,19 @@ nil_t index_hash_list(obj_t obj, u64_t out[], u64_t len, u64_t seed)
         u64v = (u64_t *)as_i64(obj);
         if (seed != 0)
             for (i = 0; i < len; i++)
-                out[i] = index_hash_u64(u64v[i], seed);
+                out[i] = hash_index_u64(u64v[i], seed);
         else
             for (i = 0; i < len; i++)
-                out[i] = index_hash_u64(u64v[i], out[i]);
+                out[i] = hash_index_u64(u64v[i], out[i]);
         break;
     case TYPE_F64:
         f64v = as_f64(obj);
         if (seed != 0)
             for (i = 0; i < len; i++)
-                out[i] = index_hash_u64((u64_t)f64v[i], seed);
+                out[i] = hash_index_u64((u64_t)f64v[i], seed);
         else
             for (i = 0; i < len; i++)
-                out[i] = index_hash_u64((u64_t)f64v[i], out[i]);
+                out[i] = hash_index_u64((u64_t)f64v[i], out[i]);
         break;
     case TYPE_GUID:
         g64v = as_guid(obj);
@@ -801,40 +801,40 @@ nil_t index_hash_list(obj_t obj, u64_t out[], u64_t len, u64_t seed)
         {
             for (i = 0; i < len; i++)
             {
-                out[i] = index_hash_u64(*(u64_t *)&g64v[i], seed);
-                out[i] = index_hash_u64(*((u64_t *)&g64v[i] + 1), out[i]);
+                out[i] = hash_index_u64(*(u64_t *)&g64v[i], seed);
+                out[i] = hash_index_u64(*((u64_t *)&g64v[i] + 1), out[i]);
             }
         }
         else
         {
             for (i = 0; i < len; i++)
             {
-                out[i] = index_hash_u64(*(u64_t *)&g64v[i], out[i]);
-                out[i] = index_hash_u64(*((u64_t *)&g64v[i] + 1), out[i]);
+                out[i] = hash_index_u64(*(u64_t *)&g64v[i], out[i]);
+                out[i] = hash_index_u64(*((u64_t *)&g64v[i] + 1), out[i]);
             }
         }
         break;
     case TYPE_LIST:
         if (seed != 0)
             for (i = 0; i < len; i++)
-                out[i] = index_hash_u64(index_hash_obj(as_list(obj)[i]), seed);
+                out[i] = hash_index_u64(hash_index_obj(as_list(obj)[i]), seed);
         else
             for (i = 0; i < len; i++)
-                out[i] = index_hash_u64(index_hash_obj(as_list(obj)[i]), out[i]);
+                out[i] = hash_index_u64(hash_index_obj(as_list(obj)[i]), out[i]);
         break;
     case TYPE_ENUM:
         k = ray_key(obj);
         v = ray_get(k);
-        drop(k);
+        drop_obj(k);
         u64v = (u64_t *)as_symbol(v);
         ids = as_i64(enum_val(obj));
         if (seed != 0)
             for (i = 0; i < len; i++)
-                out[i] = index_hash_u64(u64v[ids[i]], seed);
+                out[i] = hash_index_u64(u64v[ids[i]], seed);
         else
             for (i = 0; i < len; i++)
-                out[i] = index_hash_u64(u64v[ids[i]], out[i]);
-        drop(v);
+                out[i] = hash_index_u64(u64v[ids[i]], out[i]);
+        drop_obj(v);
         break;
     case TYPE_ANYMAP:
         if (seed != 0)
@@ -842,8 +842,8 @@ nil_t index_hash_list(obj_t obj, u64_t out[], u64_t len, u64_t seed)
             for (i = 0; i < len; i++)
             {
                 v = at_idx(obj, i);
-                out[i] = index_hash_u64(index_hash_obj(v), seed);
-                drop(v);
+                out[i] = hash_index_u64(hash_index_obj(v), seed);
+                drop_obj(v);
             }
         }
         else
@@ -851,8 +851,8 @@ nil_t index_hash_list(obj_t obj, u64_t out[], u64_t len, u64_t seed)
             for (i = 0; i < len; i++)
             {
                 v = at_idx(obj, i);
-                out[i] = index_hash_u64(index_hash_obj(v), out[i]);
-                drop(v);
+                out[i] = hash_index_u64(hash_index_obj(v), out[i]);
+                drop_obj(v);
             }
         }
         break;
@@ -861,11 +861,11 @@ nil_t index_hash_list(obj_t obj, u64_t out[], u64_t len, u64_t seed)
     }
 }
 
-obj_t index_group_cnts(obj_t grp)
+obj_p index_group_cnts(obj_p grp)
 {
     u64_t i, l, n;
     i64_t *grps, *ids;
-    obj_t res;
+    obj_p res;
 
     // Count groups
     n = as_list(grp)[0]->i64;
@@ -882,19 +882,19 @@ obj_t index_group_cnts(obj_t grp)
 
 typedef struct __join_ctx_t
 {
-    obj_t lcols;
-    obj_t rcols;
+    obj_p lcols;
+    obj_p rcols;
     u64_t *hashes;
 } __join_ctx_t;
 
-nil_t precalc_hash(obj_t cols, u64_t *out, u64_t ncols, u64_t nrows)
+nil_t precalc_hash(obj_p cols, u64_t *out, u64_t ncols, u64_t nrows)
 {
     u64_t i;
 
-    index_hash_list(as_list(cols)[0], out, nrows, 0xa5b6c7d8e9f01234ull);
+    hash_index_list(as_list(cols)[0], out, nrows, 0xa5b6c7d8e9f01234ull);
 
     for (i = 1; i < ncols; i++)
-        index_hash_list(as_list(cols)[i], out, nrows, 0);
+        hash_index_list(as_list(cols)[i], out, nrows, 0);
 
     return;
 }
@@ -909,8 +909,8 @@ i64_t __join_cmp_row(i64_t row1, i64_t row2, nil_t *seed)
 {
     u64_t i, l;
     __join_ctx_t *ctx = (__join_ctx_t *)seed;
-    obj_t *lcols = as_list(ctx->lcols);
-    obj_t *rcols = as_list(ctx->rcols);
+    obj_p *lcols = as_list(ctx->lcols);
+    obj_p *rcols = as_list(ctx->rcols);
 
     l = ctx->lcols->len;
 
@@ -921,10 +921,10 @@ i64_t __join_cmp_row(i64_t row1, i64_t row2, nil_t *seed)
     return 0;
 }
 
-obj_t index_join_obj(obj_t lcols, obj_t rcols, u64_t len)
+obj_p index_join_obj(obj_p lcols, obj_p rcols, u64_t len)
 {
     u64_t i, ll, rl;
-    obj_t ht, res;
+    obj_p ht, res;
     i64_t idx;
     __join_ctx_t ctx;
     if (len == 1)
@@ -933,7 +933,7 @@ obj_t index_join_obj(obj_t lcols, obj_t rcols, u64_t len)
         if (res->type == -TYPE_I64)
         {
             idx = res->i64;
-            drop(res);
+            drop_obj(res);
             res = vector_i64(1);
             as_i64(res)[0] = idx;
         }
@@ -965,7 +965,7 @@ obj_t index_join_obj(obj_t lcols, obj_t rcols, u64_t len)
         as_i64(res)[i] = (idx == NULL_I64) ? NULL_I64 : as_i64(as_list(ht)[0])[idx];
     }
 
-    drop(ht);
+    drop_obj(ht);
 
     return res;
 }

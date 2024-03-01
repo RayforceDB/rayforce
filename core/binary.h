@@ -28,8 +28,8 @@
 #include "ops.h"
 #include "math.h"
 
-obj_t binary_call(u8_t attrs, binary_f f, obj_t x, obj_t y);
-obj_t ray_set(obj_t x, obj_t y);
-obj_t ray_let(obj_t x, obj_t y);
+obj_p binary_call(u8_t attrs, binary_f f, obj_p x, obj_p y);
+obj_p ray_set(obj_p x, obj_p y);
+obj_p ray_let(obj_p x, obj_p y);
 
 #endif // BINARY_H

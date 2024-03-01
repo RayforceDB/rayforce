@@ -32,16 +32,16 @@
  *  [1] - vector of indices
  */
 
-obj_t filter_map(obj_t x, obj_t y)
+obj_p filter_map(obj_p x, obj_p y)
 {
-    obj_t res;
+    obj_p res;
 
     res = vn_list(2, x, y);
     res->type = TYPE_FILTERMAP;
     return res;
 }
 
-obj_t filter_collect(obj_t x)
+obj_p filter_collect(obj_p x)
 {
     return at_ids(as_list(x)[0], as_i64(as_list(x)[1]), as_list(x)[1]->len);
 }

@@ -26,10 +26,10 @@
 #include "heap.h"
 #include "util.h"
 
-obj_t error_obj(i8_t code, obj_t msg)
+obj_p error_obj(i8_t code, obj_p msg)
 {
-    obj_t obj = heap_alloc(sizeof(struct obj_t) + sizeof(error_t));
-    error_t *e = (error_t *)obj->arr;
+    obj_p obj = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(ray_error_t));
+    ray_error_t *e = (ray_error_t *)obj->arr;
 
     e->code = code;
     e->msg = msg;
@@ -41,14 +41,14 @@ obj_t error_obj(i8_t code, obj_t msg)
     return obj;
 }
 
-obj_t error_str(i8_t code, str_t msg)
+obj_p error_str(i8_t code, str_p msg)
 {
     return error_obj(code, string_from_str(msg, strlen(msg)));
 }
 
-obj_t error(i8_t code, str_t fmt, ...)
+obj_p error(i8_t code, str_p fmt, ...)
 {
-    obj_t e;
+    obj_p e;
     va_list args;
 
     va_start(args, fmt);

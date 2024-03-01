@@ -30,11 +30,11 @@
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 
-i64_t fs_fopen(str_t path, i64_t attrs)
+i64_t fs_fopen(str_p path, i64_t attrs)
 {
-    str_t tmp_path = str_dup(path);
-    str_t p = tmp_path;
-    str_t slash;
+    str_p tmp_path = str_dup(path);
+    str_p p = tmp_path;
+    str_p slash;
 
     while ((slash = strchr(p + 1, '/')) != NULL)
     {
@@ -58,7 +58,7 @@ i64_t fs_fsize(i64_t fd)
     return (i64_t)size.QuadPart;
 }
 
-i64_t fs_fread(i64_t fd, str_t buf, i64_t size)
+i64_t fs_fread(i64_t fd, str_p buf, i64_t size)
 {
     DWORD bytesRead = 0;
     if (!ReadFile((HANDLE)fd, buf, size, &bytesRead, NULL))
@@ -67,7 +67,7 @@ i64_t fs_fread(i64_t fd, str_t buf, i64_t size)
     return (i64_t)bytesRead;
 }
 
-i64_t fs_fwrite(i64_t fd, str_t buf, i64_t size)
+i64_t fs_fwrite(i64_t fd, str_p buf, i64_t size)
 {
     DWORD bytesWritten = 0;
     if (!WriteFile((HANDLE)fd, buf, size, &bytesWritten, NULL))
@@ -81,12 +81,12 @@ i64_t fs_fclose(i64_t fd)
     return CloseHandle((HANDLE)fd);
 }
 
-i64_t fs_dcreate(str_t path)
+i64_t fs_dcreate(str_p path)
 {
     return CreateDirectory(path, NULL);
 }
 
-i64_t fs_dopen(str_t path)
+i64_t fs_dopen(str_p path)
 {
     HANDLE hFind;
     WIN32_FIND_DATA FindFileData;
@@ -112,11 +112,11 @@ i64_t fs_dclose(i64_t fd)
 
 #else
 
-i64_t fs_fopen(str_t path, i64_t attrs)
+i64_t fs_fopen(str_p path, i64_t attrs)
 {
-    str_t tmp_path = str_dup(path);
-    str_t p = tmp_path;
-    str_t slash;
+    str_p tmp_path = str_dup(path);
+    str_p p = tmp_path;
+    str_p slash;
 
     while ((slash = strchr(p + 1, '/')) != NULL)
     {
@@ -138,7 +138,7 @@ i64_t fs_fsize(i64_t fd)
     return st.st_size;
 }
 
-i64_t fs_fread(i64_t fd, str_t buf, i64_t size)
+i64_t fs_fread(i64_t fd, str_p buf, i64_t size)
 {
     i64_t c = 0;
 
@@ -153,7 +153,7 @@ i64_t fs_fread(i64_t fd, str_t buf, i64_t size)
     return size;
 }
 
-i64_t fs_fwrite(i64_t fd, str_t buf, i64_t size)
+i64_t fs_fwrite(i64_t fd, str_p buf, i64_t size)
 {
     i64_t c = 0, l = size;
     while ((c = write(fd, buf, l)) > 0)
@@ -173,7 +173,7 @@ i64_t fs_fclose(i64_t fd)
     return close(fd);
 }
 
-i64_t fs_dcreate(str_t path)
+i64_t fs_dcreate(str_p path)
 {
     struct stat st = {0};
 
@@ -186,7 +186,7 @@ i64_t fs_dcreate(str_t path)
     return 0;
 }
 
-i64_t fs_dopen(str_t path)
+i64_t fs_dopen(str_p path)
 {
     DIR *dir = opendir(path);
 

@@ -26,13 +26,13 @@
 
 #include "rayforce.h"
 
-obj_t ray_iasc(obj_t x);
-obj_t ray_idesc(obj_t x);
-obj_t ray_asc(obj_t x);
-obj_t ray_desc(obj_t x);
-obj_t ray_xasc(obj_t x, obj_t y);
-obj_t ray_xdesc(obj_t x, obj_t y);
-obj_t ray_not(obj_t x);
-obj_t ray_neg(obj_t x);
+obj_p ray_iasc(obj_p x);
+obj_p ray_idesc(obj_p x);
+obj_p ray_asc(obj_p x);
+obj_p ray_desc(obj_p x);
+obj_p ray_xasc(obj_p x, obj_p y);
+obj_p ray_xdesc(obj_p x, obj_p y);
+obj_p ray_not(obj_p x);
+obj_p ray_neg(obj_p x);
 
 #endif // ORDER_H

@@ -31,12 +31,12 @@
 
 nil_t print_logo(nil_t)
 {
-  str_t nfo = sys_about_info();
+  str_p nfo = sys_about_info();
   printf("%s%s%s", BOLD, nfo, RESET);
   heap_free(nfo);
 }
 
-i32_t main(i32_t argc, str_t argv[])
+i32_t main(i32_t argc, str_p argv[])
 {
   i32_t code = -1;
 

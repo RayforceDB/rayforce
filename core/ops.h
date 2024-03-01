@@ -60,7 +60,7 @@ extern struct obj_t __NULL_OBJECT;
 #define is_external_serialized(x) ((x)->mmod == MMOD_EXTERNAL_SERIALIZED)
 
 #define alignup(x, a) (((x) + (a)-1) & ~((a)-1))
-#define align8(x) ((str_t)(((u64_t)x + 7) & ~7))
+#define align8(x) ((str_p)(((u64_t)x + 7) & ~7))
 #define mtype2(x, y) ((u8_t)(x) | ((u8_t)(y) << 8))
 #define absi64(x) ((x) == NULL_I64 ? 0 : (((x) < 0 ? -(x) : (x))))
 #define addi64(x, y) (((x) == NULL_I64 || (y) == NULL_I64) ? NULL_I64 : (x) + (y))
@@ -90,24 +90,24 @@ extern struct obj_t __NULL_OBJECT;
 // Function types
 typedef u64_t (*hash_f)(i64_t, nil_t *);
 typedef i64_t (*cmp_f)(i64_t, i64_t, nil_t *);
-typedef obj_t (*unary_f)(obj_t);
-typedef obj_t (*binary_f)(obj_t, obj_t);
-typedef obj_t (*vary_f)(obj_t *, i64_t n);
+typedef obj_p (*unary_f)(obj_p);
+typedef obj_p (*binary_f)(obj_p, obj_p);
+typedef obj_p (*vary_f)(obj_p *, i64_t n);
 
 typedef enum
 {
     ERROR_TYPE_OS,
     ERROR_TYPE_SYS,
     ERROR_TYPE_SOCK
-} os_error_type_t;
+} os_ray_error_type_t;
 
-bool_t ops_as_bool(obj_t x);
-bool_t ops_is_nan(f64_t x);
+b8_t ops_as_b8(obj_p x);
+b8_t ops_is_nan(f64_t x);
 u64_t ops_rand_u64(nil_t);
-u64_t ops_count(obj_t x);
-u64_t ops_rank(obj_t *x, u64_t n);
-bool_t ops_eq_idx(obj_t a, i64_t ai, obj_t b, i64_t bi);
-obj_t index_find_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl);
-obj_t sys_error(os_error_type_t, str_t msg);
+u64_t ops_count(obj_p x);
+u64_t ops_rank(obj_p *x, u64_t n);
+b8_t ops_eq_idx(obj_p a, i64_t ai, obj_p b, i64_t bi);
+obj_p index_find_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl);
+obj_p sys_error(os_ray_error_type_t, str_p msg);
 
 #endif // OPS_H

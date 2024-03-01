@@ -45,7 +45,7 @@ nil_t prompt(nil_t)
     fflush(stdout);
 }
 
-nil_t poll_exit(poll_t poll, i64_t code)
+nil_t poll_exit(poll_p poll, i64_t code)
 {
     poll->code = code;
 }

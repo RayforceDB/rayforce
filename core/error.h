@@ -29,15 +29,15 @@
 #include "heap.h"
 #include "format.h"
 
-#define as_error(obj) ((error_t *)(as_string(obj)))
+#define as_error(obj) ((ray_error_t *)(as_string(obj)))
 
 /*
  * Create a new error object and return it
  */
 #define throw(t, ...)                       \
     {                                       \
-        str_t _m = str_fmt(0, __VA_ARGS__); \
-        obj_t _e = error_str(t, _m);        \
+        str_p _m = str_fmt(0, __VA_ARGS__); \
+        obj_p _e = error_str(t, _m);        \
         heap_free(_m);                      \
         return _e;                          \
     }
@@ -55,18 +55,18 @@
 typedef struct loc_t
 {
     span_t span;
-    obj_t file;
-    obj_t source;
+    obj_p file;
+    obj_p source;
 } loc_t;
 
-typedef struct error_t
+typedef struct ray_error_t
 {
     i64_t code;
-    obj_t msg;
-    obj_t locs;
-} error_t;
+    obj_p msg;
+    obj_p locs;
+} ray_error_t;
 
-obj_t error_obj(i8_t code, obj_t msg);
-obj_t error_str(i8_t code, str_t msg);
+obj_p error_obj(i8_t code, obj_p msg);
+obj_p error_str(i8_t code, str_p msg);
 
 #endif // ERROR_H

@@ -155,7 +155,7 @@ timestamp_t timestamp_from_i64(i64_t offset)
     timespan_t sp = timespan_from_nanos(span);
 
     timestamp_t ts = {
-        .null = false,
+        .null = B8_FALSE,
         .year = dt.year,
         .month = dt.month,
         .day = dt.day,
@@ -198,7 +198,7 @@ i64_t timestamp_into_i64(timestamp_t ts)
     return (dss * NSECS_IN_DAY + offs);
 }
 
-timestamp_t timestamp_from_str(str_t src)
+timestamp_t timestamp_from_str(str_p src)
 {
     i64_t cnt, val;
     timestamp_t ts = {0};
@@ -274,7 +274,7 @@ timestamp_t timestamp_from_str(str_t src)
     if (cnt < 3)
     {
     null:
-        ts.null = true;
+        ts.null = B8_TRUE;
     }
 
     return ts;

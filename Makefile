@@ -5,20 +5,20 @@ RELEASE_CFLAGS = -fPIC -Wall -Wpedantic -Wextra -std=c17 -Ofast -march=native -f
  -fno-math-errno -funsafe-math-optimizations -ffinite-math-only -funroll-loops -m64
 # DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG -DSYS_MALLOC
 DEBUG_CFLAGS = -fPIC -Wall -Wpedantic -Wextra -std=c17 -g -O0 -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
-CORE_HEADERS = core/poll.h core/sys.h core/fs.h core/mmap.h core/serde.h core/timestamp.h\
+CORE_HEADERS = core/runtime.h core/poll.h core/sys.h core/fs.h core/mmap.h core/serde.h core/timestamp.h\
  core/guid.h core/sort.h core/ops.h core/util.h core/string.h core/hash.h core/symbols.h\
- core/format.h core/rayforce.h core/heap.h core/runtime.h core/parse.h core/eval.h core/nfo.h\
+ core/format.h core/rayforce.h core/heap.h core/parse.h core/eval.h core/nfo.h core/timer.h\
  core/env.h core/lambda.h core/unary.h core/binary.h core/vary.h core/sock.h core/error.h\
  core/math.h core/rel.h core/items.h core/logic.h core/compose.h core/order.h core/io.h\
  core/misc.h core/queue.h core/freelist.h core/update.h core/join.h core/query.h core/cond.h\
- core/iter.h core/dynlib.h core/aggr.h core/index.h core/group.h core/filter.h core/timer.h
-CORE_OBJECTS = core/poll.o core/sys.o core/fs.o core/mmap.o core/serde.o core/timestamp.o\
+ core/iter.h core/dynlib.h core/aggr.h core/index.h core/group.h core/filter.h
+CORE_OBJECTS = core/runtime.o core/poll.o core/sys.o core/fs.o core/mmap.o core/serde.o core/timestamp.o\
  core/guid.o core/sort.o core/ops.o core/util.o core/string.o core/hash.o core/symbols.o\
- core/format.o core/rayforce.o core/heap.o core/runtime.o core/parse.o core/eval.o core/nfo.o\
+ core/format.o core/rayforce.o core/heap.o core/parse.o core/eval.o core/nfo.o core/timer.o\
  core/env.o core/lambda.o core/unary.o core/binary.o core/vary.o core/sock.o core/error.o\
  core/math.o core/rel.o core/items.o core/logic.o core/compose.o core/order.o core/io.o\
  core/misc.o core/queue.o core/freelist.o core/update.o core/join.o core/query.o core/cond.o\
- core/iter.o core/dynlib.o core/aggr.o core/index.o core/group.o core/filter.o core/timer.o
+ core/iter.o core/dynlib.o core/aggr.o core/index.o core/group.o core/filter.o
 APP_OBJECTS = app/main.o
 TESTS_OBJECTS = tests/main.o
 TARGET = rayforce
@@ -65,13 +65,12 @@ chkleak: CC = gcc
 chkleak: app
 	valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes ./$(TARGET)
 
-# wasm: CFLAGS = -O0
 wasm: CFLAGS = -fPIC -Wall -std=c17 -O3 -msimd128 -fassociative-math -ftree-vectorize -fno-math-errno -funsafe-math-optimizations -ffinite-math-only -funroll-loops -DSYS_MALLOC
 wasm: CC = emcc 
 wasm: AR = emar
 wasm: $(APP_OBJECTS) lib
 	$(CC) $(CFLAGS) -o $(TARGET).js $(CORE_OBJECTS) \
-	-s "EXPORTED_FUNCTIONS=['_main', '_version', '_null', '_drop', '_clone', '_disp', '_parseval', '_obj_fmt']" \
+	-s "EXPORTED_FUNCTIONS=['_main', '_version', '_null', '_drop_obj', '_clone_obj', '_drop_raw', '_parseval', '_obj_fmt']" \
 	-s "EXPORTED_RUNTIME_METHODS=['ccall', 'cwrap']" -s ALLOW_MEMORY_GROWTH=1 -L. -l$(TARGET) $(LIBS)
 
 clean:

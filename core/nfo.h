@@ -43,8 +43,8 @@ typedef union span_t
 
 } span_t;
 
-obj_t nfo(obj_t filename, obj_t source);
-nil_t nfo_insert(obj_t nfo, i64_t index, span_t span);
-span_t nfo_get(obj_t nfo, i64_t index);
+obj_p nfo(obj_p filename, obj_p source);
+nil_t nfo_insert(obj_p nfo, i64_t index, span_t span);
+span_t nfo_get(obj_p nfo, i64_t index);
 
 #endif // NFO_H

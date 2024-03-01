@@ -52,7 +52,7 @@ u64_t next_power_of_two_u64(u64_t n)
     return 1ull << (64 - __builtin_clzll(n));
 }
 
-bool_t is_valid(obj_t obj)
+b8_t is_valid(obj_p obj)
 {
     // clang-format off
     return (obj->type >= -TYPE_CHAR       && obj->type <= TYPE_CHAR)

@@ -25,14 +25,14 @@
 #include "heap.h"
 #include "util.h"
 
-freelist_t freelist_new(i64_t size)
+freelist_p freelist_new(i64_t size)
 {
-    freelist_t freelist;
+    freelist_p freelist;
 
-    freelist = heap_alloc(sizeof(struct freelist_t));
-    freelist->data = heap_alloc(size * sizeof(i64_t));
+    freelist = (freelist_p)heap_alloc(sizeof(struct freelist_t));
+    freelist->data = (i64_t *)heap_alloc(size * sizeof(i64_t));
     freelist->data_pos = 0;
-    freelist->free = heap_alloc(size * sizeof(i64_t));
+    freelist->free = (i64_t *)heap_alloc(size * sizeof(i64_t));
     freelist->data_size = size;
     freelist->free_size = size;
     freelist->free_pos = 0;
@@ -40,14 +40,14 @@ freelist_t freelist_new(i64_t size)
     return freelist;
 }
 
-nil_t freelist_free(freelist_t freelist)
+nil_t freelist_free(freelist_p freelist)
 {
     heap_free(freelist->data);
     heap_free(freelist->free);
     heap_free(freelist);
 }
 
-i64_t freelist_push(freelist_t freelist, i64_t val)
+i64_t freelist_push(freelist_p freelist, i64_t val)
 {
     i64_t pos;
 
@@ -61,7 +61,7 @@ i64_t freelist_push(freelist_t freelist, i64_t val)
     if (freelist->data_pos == freelist->data_size)
     {
         freelist->data_size *= 2;
-        freelist->data = heap_realloc(freelist->data, freelist->data_size * sizeof(i64_t));
+        freelist->data = (i64_t *)heap_realloc(freelist->data, freelist->data_size * sizeof(i64_t));
     }
 
     pos = freelist->data_pos;
@@ -71,7 +71,7 @@ i64_t freelist_push(freelist_t freelist, i64_t val)
     return pos;
 }
 
-i64_t freelist_pop(freelist_t freelist, i64_t pos)
+i64_t freelist_pop(freelist_p freelist, i64_t pos)
 {
     i64_t val;
 
@@ -81,7 +81,7 @@ i64_t freelist_pop(freelist_t freelist, i64_t pos)
     if (freelist->free_pos == freelist->free_size)
     {
         freelist->free_size *= 2;
-        freelist->free = heap_realloc(freelist->free, freelist->free_size * sizeof(i64_t));
+        freelist->free = (i64_t *)heap_realloc(freelist->free, freelist->free_size * sizeof(i64_t));
     }
 
     val = freelist->data[pos];
@@ -91,7 +91,7 @@ i64_t freelist_pop(freelist_t freelist, i64_t pos)
     return val;
 }
 
-i64_t freelist_get(freelist_t freelist, i64_t idx)
+i64_t freelist_get(freelist_p freelist, i64_t idx)
 {
     if (idx < 0 || idx >= freelist->data_pos)
         return NULL_I64;

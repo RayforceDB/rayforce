@@ -48,7 +48,7 @@ u64_t get_time_millis(nil_t)
 }
 #endif
 
-ray_timer_t *timer_new(i64_t id, u64_t tic, u64_t exp, i64_t num, obj_t clb)
+ray_timer_t *timer_new(i64_t id, u64_t tic, u64_t exp, i64_t num, obj_p clb)
 {
     ray_timer_t *timer = (ray_timer_t *)heap_alloc(sizeof(ray_timer_t));
 
@@ -63,7 +63,7 @@ ray_timer_t *timer_new(i64_t id, u64_t tic, u64_t exp, i64_t num, obj_t clb)
 
 nil_t timer_free(ray_timer_t *t)
 {
-    drop(t->clb);
+    drop_obj(t->clb);
     heap_free(t);
 }
 
@@ -150,7 +150,7 @@ nil_t timers_free(timers_t *timers)
     heap_free(timers);
 }
 
-i64_t timer_add(timers_t *timers, u64_t tic, u64_t exp, u64_t num, obj_t clb)
+i64_t timer_add(timers_t *timers, u64_t tic, u64_t exp, u64_t num, obj_p clb)
 {
     i64_t id;
     ray_timer_t *timer;
@@ -187,7 +187,7 @@ i64_t timer_next_timeout(timers_t *timers)
 {
     i64_t now = get_time_millis();
     ray_timer_t *timer;
-    obj_t res;
+    obj_p res;
 
     if (timers->size == 0)
         return TIMEOUT_INFINITY;
@@ -204,7 +204,7 @@ i64_t timer_next_timeout(timers_t *timers)
         if (is_error(res))
             io_write(1, MSG_TYPE_RESP, res);
 
-        drop(res);
+        drop_obj(res);
 
         // Check if the timer should be repeated
         if (timer->num > 0 || timer->num == NULL_I64)
@@ -240,7 +240,7 @@ i64_t timer_next_timeout(timers_t *timers)
     return (timers->size > 0) ? timers->timers[0]->exp - now : TIMEOUT_INFINITY;
 }
 
-obj_t ray_timer(obj_t *x, u64_t n)
+obj_p ray_timer(obj_p *x, u64_t n)
 {
     i64_t id;
     timers_t *timers;
@@ -277,7 +277,7 @@ obj_t ray_timer(obj_t *x, u64_t n)
 
     timers = runtime_get()->poll->timers;
 
-    id = timer_add(timers, x[0]->i64, x[0]->i64 + get_time_millis(), x[1]->i64, clone(x[2]));
+    id = timer_add(timers, x[0]->i64, x[0]->i64 + get_time_millis(), x[1]->i64, clone_obj(x[2]));
 
     return i64(id);
 }

@@ -196,7 +196,7 @@ nil_t insertion_sort_desc(i64_t array[], i64_t indices[], i64_t left, i64_t righ
 nil_t counting_sort_asc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i64_t max)
 {
     i64_t i, j = 0, n, p, range, *m;
-    obj_t mask;
+    obj_p mask;
 
     range = max - min + 1;
     mask = vector_i64(range);
@@ -228,13 +228,13 @@ nil_t counting_sort_asc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i6
         indices[m[n]++] = i;
     }
 
-    drop(mask);
+    drop_obj(mask);
 }
 
 nil_t counting_sort_desc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i64_t max)
 {
     i64_t i, j = 0, n, p, range, *m;
-    obj_t mask;
+    obj_p mask;
 
     range = max - min + 1;
     mask = vector_i64(range);
@@ -266,13 +266,13 @@ nil_t counting_sort_desc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i
         indices[m[n]++] = i;
     }
 
-    drop(mask);
+    drop_obj(mask);
 }
 
-obj_t ray_sort_asc(obj_t vec)
+obj_p ray_sort_asc(obj_p vec)
 {
     i64_t i, len = vec->len, out_of_order = 0, inrange = 0, min, max;
-    obj_t indices = vector_i64(len);
+    obj_p indices = vector_i64(len);
     i64_t *iv = as_i64(vec), *ov = as_i64(indices);
 
     if (vec->attrs & ATTR_ASC)
@@ -350,10 +350,10 @@ obj_t ray_sort_asc(obj_t vec)
     return indices;
 }
 
-obj_t ray_sort_desc(obj_t vec)
+obj_p ray_sort_desc(obj_p vec)
 {
     i64_t i, len = vec->len, out_of_order = 0, inrange = 0, min, max;
-    obj_t indices = vector_i64(len);
+    obj_p indices = vector_i64(len);
     i64_t *iv = as_i64(vec), *ov = as_i64(indices);
 
     if (vec->attrs & ATTR_DESC)

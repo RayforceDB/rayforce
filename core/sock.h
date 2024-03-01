@@ -32,8 +32,8 @@ typedef struct sock_addr_t
     i64_t port;
 } sock_addr_t;
 
-i64_t sock_addr_from_str(str_t addr_str, sock_addr_t *addr);
-i64_t sock_set_nonblocking(i64_t fd, bool_t flag);
+i64_t sock_addr_from_str(str_p addr_str, sock_addr_t *addr);
+i64_t sock_set_nonblocking(i64_t fd, b8_t flag);
 i64_t sock_open(sock_addr_t *addr);
 i64_t sock_close(i64_t fd);
 i64_t sock_listen(i64_t port);

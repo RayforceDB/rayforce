@@ -37,7 +37,7 @@
 
 typedef struct str_slice_t
 {
-    str_t str;
+    str_p str;
     i64_t len;
 } str_slice_t;
 
@@ -51,7 +51,7 @@ u64_t string_hash(i64_t val, nil_t *seed)
     unused(seed);
     str_slice_t *string;
     u64_t hash = 5381, len, i;
-    str_t str;
+    str_p str;
 
     if ((1ull << 63) & val)
     {
@@ -61,7 +61,7 @@ u64_t string_hash(i64_t val, nil_t *seed)
     }
     else
     {
-        str = (str_t)val;
+        str = (str_p)val;
         len = strlen(str);
     }
 
@@ -81,7 +81,7 @@ u64_t string_hash(i64_t val, nil_t *seed)
 i64_t string_str_cmp(i64_t a, i64_t b, nil_t *seed)
 {
     unused(seed);
-    str_t str_a = (str_t)a;
+    str_p str_a = (str_p)a;
     str_slice_t *str_b = (str_slice_t *)(b & ~(1ull << 63));
 
     i64_t len_a = strlen(str_a);
@@ -108,9 +108,9 @@ nil_t pool_node_free(pool_node_t *node)
     mmap_free(node, STRINGS_POOL_SIZE);
 }
 
-str_t str_intern(symbols_t *symbols, str_t str, i64_t len)
+str_p str_intern(symbols_t *symbols, str_p str, i64_t len)
 {
-    str_t p = symbols->strings_pool;
+    str_p p = symbols->strings_pool;
 
     // Allocate new pool node
     if ((i64_t)symbols->strings_pool + len - (i64_t)symbols->pool_node + 1 >= STRINGS_POOL_SIZE)
@@ -118,7 +118,7 @@ str_t str_intern(symbols_t *symbols, str_t str, i64_t len)
         pool_node_t *node = pool_node_new();
         symbols->pool_node->next = node;
         symbols->pool_node = node;
-        symbols->strings_pool = (str_t)(node + sizeof(pool_node_t *)); // Skip the node size of next ptr
+        symbols->strings_pool = (str_p)(node + sizeof(pool_node_t *)); // Skip the node size of next ptr
         p = symbols->strings_pool;
     }
 
@@ -134,9 +134,9 @@ symbols_t *symbols_new(nil_t)
 
     symbols->pool_node_0 = node;
     symbols->pool_node = node;
-    symbols->strings_pool = (str_t)(node + sizeof(pool_node_t *)); // Skip the node size of next ptr
+    symbols->strings_pool = (str_p)(node + sizeof(pool_node_t *)); // Skip the node size of next ptr
 
-    symbols->str_to_id = ht_tab(SYMBOLS_POOL_SIZE, TYPE_I64);
+    symbols->str_po_id = ht_tab(SYMBOLS_POOL_SIZE, TYPE_I64);
     symbols->id_to_str = ht_tab(SYMBOLS_POOL_SIZE, TYPE_I64);
     symbols->next_sym_id = 0;
 
@@ -154,24 +154,24 @@ nil_t symbols_free(symbols_t *symbols)
         node = next;
     }
 
-    drop(symbols->str_to_id);
-    drop(symbols->id_to_str);
+    drop_obj(symbols->str_po_id);
+    drop_obj(symbols->id_to_str);
 }
 
-i64_t intern_symbol(str_t s, i64_t len)
+i64_t intern_symbol(str_p s, i64_t len)
 {
-    str_t p;
+    str_p p;
     symbols_t *symbols = runtime_get()->symbols;
     str_slice_t str_slice = {s, len};
-    i64_t idx = ht_tab_next_with(&symbols->str_to_id, (1ull << 63) | (i64_t)&str_slice,
+    i64_t idx = ht_tab_next_with(&symbols->str_po_id, (1ull << 63) | (i64_t)&str_slice,
                                  &string_hash, &string_str_cmp, NULL);
 
     // insert new symbol
-    if (as_i64(as_list(symbols->str_to_id)[0])[idx] == NULL_I64)
+    if (as_i64(as_list(symbols->str_po_id)[0])[idx] == NULL_I64)
     {
         p = str_intern(symbols, s, len);
-        as_i64(as_list(symbols->str_to_id)[0])[idx] = (i64_t)p;
-        as_i64(as_list(symbols->str_to_id)[1])[idx] = symbols->next_sym_id;
+        as_i64(as_list(symbols->str_po_id)[0])[idx] = (i64_t)p;
+        as_i64(as_list(symbols->str_po_id)[1])[idx] = symbols->next_sym_id;
 
         // insert id into id_to_str
         idx = ht_tab_next(&symbols->id_to_str, symbols->next_sym_id);
@@ -184,17 +184,17 @@ i64_t intern_symbol(str_t s, i64_t len)
     }
     // symbol is already interned
     else
-        return as_i64(as_list(symbols->str_to_id)[1])[idx];
+        return as_i64(as_list(symbols->str_po_id)[1])[idx];
 }
 
-str_t symtostr(i64_t key)
+str_p strof_sym(i64_t key)
 {
     symbols_t *symbols = runtime_get()->symbols;
     i64_t idx = ht_tab_next(&symbols->id_to_str, key);
     if (as_i64(as_list(symbols->id_to_str)[0])[idx] == NULL_I64)
         return "";
 
-    return (str_t)as_i64(as_list(symbols->id_to_str)[1])[idx];
+    return (str_p)as_i64(as_list(symbols->id_to_str)[1])[idx];
 }
 
 u64_t symbols_count(symbols_t *symbols)

@@ -29,7 +29,7 @@
 #include "sort.h"
 #include "error.h"
 
-obj_t ray_iasc(obj_t x)
+obj_p ray_iasc(obj_p x)
 {
     switch (x->type)
     {
@@ -37,11 +37,11 @@ obj_t ray_iasc(obj_t x)
         return ray_sort_asc(x);
 
     default:
-        throw(ERR_TYPE, "iasc: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "iasc: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_idesc(obj_t x)
+obj_p ray_idesc(obj_p x)
 {
     switch (x->type)
     {
@@ -49,13 +49,13 @@ obj_t ray_idesc(obj_t x)
         return ray_sort_desc(x);
 
     default:
-        throw(ERR_TYPE, "idesc: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "idesc: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_asc(obj_t x)
+obj_p ray_asc(obj_p x)
 {
-    obj_t idx;
+    obj_p idx;
     i64_t l, i;
 
     switch (x->type)
@@ -71,13 +71,13 @@ obj_t ray_asc(obj_t x)
         return idx;
 
     default:
-        throw(ERR_TYPE, "asc: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "asc: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_desc(obj_t x)
+obj_p ray_desc(obj_p x)
 {
-    obj_t idx;
+    obj_p idx;
     i64_t l, i;
 
     switch (x->type)
@@ -93,13 +93,13 @@ obj_t ray_desc(obj_t x)
         return idx;
 
     default:
-        throw(ERR_TYPE, "desc: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "desc: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_xasc(obj_t x, obj_t y)
+obj_p ray_xasc(obj_p x, obj_p y)
 {
-    obj_t idx, col, res;
+    obj_p idx, col, res;
 
     switch (mtype2(x->type, y->type))
     {
@@ -110,24 +110,24 @@ obj_t ray_xasc(obj_t x, obj_t y)
             return col;
 
         idx = ray_iasc(col);
-        drop(col);
+        drop_obj(col);
 
         if (is_error(idx))
             return idx;
 
         res = ray_take(x, idx);
 
-        drop(idx);
+        drop_obj(idx);
 
         return res;
     default:
-        throw(ERR_TYPE, "xasc: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "xasc: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_xdesc(obj_t x, obj_t y)
+obj_p ray_xdesc(obj_p x, obj_p y)
 {
-    obj_t idx, col, res;
+    obj_p idx, col, res;
 
     switch (mtype2(x->type, y->type))
     {
@@ -138,54 +138,54 @@ obj_t ray_xdesc(obj_t x, obj_t y)
             return col;
 
         idx = ray_idesc(col);
-        drop(col);
+        drop_obj(col);
 
         if (is_error(idx))
             return idx;
 
         res = ray_take(x, idx);
 
-        drop(idx);
+        drop_obj(idx);
 
         return res;
     default:
-        throw(ERR_TYPE, "xdesc: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "xdesc: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_not(obj_t x)
+obj_p ray_not(obj_p x)
 {
     i32_t i;
     i64_t l;
-    obj_t res;
+    obj_p res;
 
     switch (x->type)
     {
-    case -TYPE_BOOL:
-        return bool(!x->bool);
+    case -TYPE_B8:
+        return b8(!x->b8);
 
-    case TYPE_BOOL:
+    case TYPE_B8:
         l = x->len;
-        res = vector_bool(l);
+        res = vector_b8(l);
         for (i = 0; i < l; i++)
-            as_bool(res)[i] = !as_bool(x)[i];
+            as_b8(res)[i] = !as_b8(x)[i];
 
         return res;
 
     default:
-        throw(ERR_TYPE, "not: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "not: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_neg(obj_t x)
+obj_p ray_neg(obj_p x)
 {
-    obj_t res;
+    obj_p res;
     i64_t i, l;
 
     switch (x->type)
     {
-    case -TYPE_BOOL:
-        return i64(-x->bool);
+    case -TYPE_B8:
+        return i64(-x->b8);
     case -TYPE_I64:
         return i64(-x->i64);
     case -TYPE_F64:
@@ -204,6 +204,6 @@ obj_t ray_neg(obj_t x)
         return res;
 
     default:
-        throw(ERR_TYPE, "neg: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "neg: unsupported type: '%s", type_name(x->type));
     }
 }

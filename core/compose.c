@@ -34,16 +34,16 @@
 #include "index.h"
 #include "error.h"
 
-obj_t ray_as(obj_t x, obj_t y)
+obj_p ray_cast_obj(obj_p x, obj_p y)
 {
-    type_t type;
-    obj_t err;
-    str_t fmt, msg;
+    i8_t type;
+    obj_p err;
+    str_p fmt, msg;
 
     if (x->type != -TYPE_SYMBOL)
         throw(ERR_TYPE, "as: first argument must be a symbol");
 
-    type = env_get_type_by_typename(&runtime_get()->env, x->i64);
+    type = env_get_type_by_type_name(&runtime_get()->env, x->i64);
 
     if (type == TYPE_ERROR)
     {
@@ -55,16 +55,16 @@ obj_t ray_as(obj_t x, obj_t y)
         return err;
     }
 
-    return as(type, y);
+    return cast_obj(type, y);
 }
 
-obj_t ray_til(obj_t x)
+obj_p ray_til(obj_p x)
 {
     if (x->type != -TYPE_I64)
         return error_str(ERR_TYPE, "til: expected i64");
 
     i32_t i, l = (i32_t)x->i64;
-    obj_t vec = NULL;
+    obj_p vec = NULL;
 
     vec = vector_i64(l);
 
@@ -79,16 +79,16 @@ obj_t ray_til(obj_t x)
     return vec;
 }
 
-obj_t ray_reverse(obj_t x)
+obj_p ray_reverse(obj_p x)
 {
     i64_t i, l;
-    obj_t res;
+    obj_p res;
 
     switch (x->type)
     {
     case TYPE_CHAR:
-    case TYPE_BYTE:
-    case TYPE_BOOL:
+    case TYPE_U8:
+    case TYPE_B8:
         l = x->len;
         res = string(l);
 
@@ -122,16 +122,16 @@ obj_t ray_reverse(obj_t x)
         res = vector(TYPE_LIST, l);
 
         for (i = 0; i < l; i++)
-            as_list(res)[i] = clone(as_list(x)[l - i - 1]);
+            as_list(res)[i] = clone_obj(as_list(x)[l - i - 1]);
 
         return res;
 
     default:
-        throw(ERR_TYPE, "reverse: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "reverse: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_dict(obj_t x, obj_t y)
+obj_p ray_dict(obj_p x, obj_p y)
 {
     if (!is_vector(x) || !is_vector(y))
         return error_str(ERR_TYPE, "Keys and Values must be lists");
@@ -139,14 +139,14 @@ obj_t ray_dict(obj_t x, obj_t y)
     if (ops_count(x) != ops_count(y))
         return error_str(ERR_LENGTH, "Keys and Values must have the same length");
 
-    return dict(clone(x), clone(y));
+    return dict(clone_obj(x), clone_obj(y));
 }
 
-obj_t ray_table(obj_t x, obj_t y)
+obj_p ray_table(obj_p x, obj_p y)
 {
-    bool_t synergy = true;
+    b8_t synergy = B8_TRUE;
     u64_t i, j, len, cl = 0;
-    obj_t lst, c, l = NULL_OBJ;
+    obj_p lst, c, l = NULL_OBJ;
 
     if (x->type != TYPE_SYMBOL)
         return error_str(ERR_TYPE, "table: keys must be a symbol vector");
@@ -157,13 +157,13 @@ obj_t ray_table(obj_t x, obj_t y)
             return error_str(ERR_LENGTH, "table: keys and values must have the same length");
 
         l = vn_list(1);
-        as_list(l)[0] = clone(y);
+        as_list(l)[0] = clone_obj(y);
         y = l;
     }
 
     if (x->len != y->len && y->len > 0)
     {
-        drop(l);
+        drop_obj(l);
         return error_str(ERR_LENGTH, "table: keys and values must have the same length");
     }
 
@@ -173,8 +173,8 @@ obj_t ray_table(obj_t x, obj_t y)
     {
         switch (as_list(y)[i]->type)
         {
-        case -TYPE_BOOL:
-        case -TYPE_BYTE:
+        case -TYPE_B8:
+        case -TYPE_U8:
         case -TYPE_I64:
         case -TYPE_F64:
         case -TYPE_CHAR:
@@ -183,10 +183,10 @@ obj_t ray_table(obj_t x, obj_t y)
         case TYPE_LAMBDA:
         case TYPE_DICT:
         case TYPE_TABLE:
-            synergy = false;
+            synergy = B8_FALSE;
             break;
-        case TYPE_BOOL:
-        case TYPE_BYTE:
+        case TYPE_B8:
+        case TYPE_U8:
         case TYPE_I64:
         case TYPE_F64:
         case TYPE_TIMESTAMP:
@@ -201,7 +201,7 @@ obj_t ray_table(obj_t x, obj_t y)
             cl = j;
             break;
         case TYPE_ENUM:
-            synergy = false;
+            synergy = B8_FALSE;
             j = as_list(as_list(y)[i])[1]->len;
             if (cl != 0 && j != cl)
                 return error(ERR_LENGTH, "table: values must be of the same length");
@@ -209,15 +209,15 @@ obj_t ray_table(obj_t x, obj_t y)
             cl = j;
             break;
         default:
-            return error(ERR_TYPE, "table: unsupported type: '%s' in a values list", typename(as_list(y)[i]->type));
+            return error(ERR_TYPE, "table: unsupported type: '%s' in a values list", type_name(as_list(y)[i]->type));
         }
     }
 
     // there are no atoms, no lazytypes and all columns are of the same length
     if (synergy)
     {
-        drop(l);
-        return table(clone(x), clone(y));
+        drop_obj(l);
+        return table(clone_obj(x), clone_obj(y));
     }
 
     // otherwise we need to expand atoms to vectors
@@ -230,33 +230,33 @@ obj_t ray_table(obj_t x, obj_t y)
     {
         switch (as_list(y)[i]->type)
         {
-        case -TYPE_BOOL:
-        case -TYPE_BYTE:
+        case -TYPE_B8:
+        case -TYPE_U8:
         case -TYPE_I64:
         case -TYPE_F64:
         case -TYPE_CHAR:
         case -TYPE_SYMBOL:
             c = i64(cl);
             as_list(lst)[i] = ray_take(c, as_list(y)[i]);
-            drop(c);
+            drop_obj(c);
             break;
         case TYPE_ENUM:
             as_list(lst)[i] = ray_value(as_list(y)[i]);
             break;
         default:
-            as_list(lst)[i] = clone(as_list(y)[i]);
+            as_list(lst)[i] = clone_obj(as_list(y)[i]);
         }
     }
 
-    drop(l);
+    drop_obj(l);
 
-    return table(clone(x), lst);
+    return table(clone_obj(x), lst);
 }
 
-obj_t ray_guid(obj_t x)
+obj_p ray_guid(obj_p x)
 {
     i64_t i, count;
-    obj_t vec;
+    obj_p vec;
     guid_t *g;
 
     switch (x->type)
@@ -272,25 +272,25 @@ obj_t ray_guid(obj_t x)
         return vec;
 
     default:
-        throw(ERR_TYPE, "guid: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "guid: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_list(obj_t *x, u64_t n)
+obj_p ray_list(obj_p *x, u64_t n)
 {
     u64_t i;
-    obj_t lst = list(n);
+    obj_p lst = list(n);
 
     for (i = 0; i < n; i++)
-        as_list(lst)[i] = clone(x[i]);
+        as_list(lst)[i] = clone_obj(x[i]);
 
     return lst;
 }
 
-obj_t ray_enlist(obj_t *x, u64_t n)
+obj_p ray_enlist(obj_p *x, u64_t n)
 {
     u64_t i;
-    obj_t lst;
+    obj_p lst;
 
     if (n == 0)
         return list(0);
@@ -298,14 +298,14 @@ obj_t ray_enlist(obj_t *x, u64_t n)
     lst = vector(x[0]->type, n);
 
     for (i = 0; i < n; i++)
-        ins_obj(&lst, i, clone(x[i]));
+        ins_obj(&lst, i, clone_obj(x[i]));
 
     return lst;
 }
 
-obj_t ray_enum(obj_t x, obj_t y)
+obj_p ray_enum(obj_p x, obj_p y)
 {
-    obj_t s, v;
+    obj_p s, v;
 
     switch (mtype2(x->type, y->type))
     {
@@ -317,29 +317,29 @@ obj_t ray_enum(obj_t x, obj_t y)
 
         if (!s || s->type != TYPE_SYMBOL)
         {
-            drop(s);
+            drop_obj(s);
             throw(ERR_TYPE, "enum: expected vector symbol");
         }
 
         v = index_find_i64(as_i64(s), s->len, as_i64(y), y->len);
-        drop(s);
+        drop_obj(s);
 
         if (is_error(v))
         {
-            drop(v);
+            drop_obj(v);
             throw(ERR_TYPE, "enum: can not be fully indexed");
         }
 
-        return venum(clone(x), v);
+        return venum(clone_obj(x), v);
     default:
-        throw(ERR_TYPE, "enum: unsupported types: '%s '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "enum: unsupported types: '%s '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_rand(obj_t x, obj_t y)
+obj_p ray_rand(obj_p x, obj_p y)
 {
     i64_t i, count;
-    obj_t vec;
+    obj_p vec;
 
     switch (mtype2(x->type, y->type))
     {
@@ -353,24 +353,24 @@ obj_t ray_rand(obj_t x, obj_t y)
         return vec;
 
     default:
-        throw(ERR_TYPE, "rand: unsupported types: '%s '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "rand: unsupported types: '%s '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_concat(obj_t x, obj_t y)
+obj_p ray_concat(obj_p x, obj_p y)
 {
     i64_t i, xl, yl;
-    obj_t vec;
+    obj_p vec;
 
     if (!x || !y)
-        return vn_list(2, clone(x), clone(y));
+        return vn_list(2, clone_obj(x), clone_obj(y));
 
     switch (mtype2(x->type, y->type))
     {
-    case mtype2(-TYPE_BOOL, -TYPE_BOOL):
-        vec = vector_bool(2);
-        as_bool(vec)[0] = x->bool;
-        as_bool(vec)[1] = y->bool;
+    case mtype2(-TYPE_B8, -TYPE_B8):
+        vec = vector_b8(2);
+        as_b8(vec)[0] = x->b8;
+        as_b8(vec)[1] = y->b8;
         return vec;
 
     case mtype2(-TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
@@ -399,13 +399,13 @@ obj_t ray_concat(obj_t x, obj_t y)
         as_string(vec)[1] = y->vchar;
         return vec;
 
-    case mtype2(TYPE_BOOL, -TYPE_BOOL):
+    case mtype2(TYPE_B8, -TYPE_B8):
         xl = x->len;
-        vec = vector_bool(xl + 1);
+        vec = vector_b8(xl + 1);
         for (i = 0; i < xl; i++)
-            as_bool(vec)[i] = as_bool(x)[i];
+            as_b8(vec)[i] = as_b8(x)[i];
 
-        as_bool(vec)[xl] = y->bool;
+        as_b8(vec)[xl] = y->b8;
         return vec;
 
     case mtype2(TYPE_I64, -TYPE_I64):
@@ -457,14 +457,14 @@ obj_t ray_concat(obj_t x, obj_t y)
 
         return vec;
 
-    case mtype2(TYPE_BOOL, TYPE_BOOL):
+    case mtype2(TYPE_B8, TYPE_B8):
         xl = x->len;
         yl = y->len;
-        vec = vector_bool(xl + yl);
+        vec = vector_b8(xl + yl);
         for (i = 0; i < xl; i++)
-            as_bool(vec)[i] = as_bool(x)[i];
+            as_b8(vec)[i] = as_b8(x)[i];
         for (i = 0; i < yl; i++)
-            as_bool(vec)[i + xl] = as_bool(y)[i];
+            as_b8(vec)[i + xl] = as_b8(y)[i];
         return vec;
 
     case mtype2(TYPE_I64, TYPE_I64):
@@ -515,9 +515,9 @@ obj_t ray_concat(obj_t x, obj_t y)
         yl = y->len;
         vec = list(xl + yl);
         for (i = 0; i < xl; i++)
-            as_list(vec)[i] = clone(as_list(x)[i]);
+            as_list(vec)[i] = clone_obj(as_list(x)[i]);
         for (i = 0; i < yl; i++)
-            as_list(vec)[i + xl] = clone(as_list(y)[i]);
+            as_list(vec)[i + xl] = clone_obj(as_list(y)[i]);
         return vec;
 
     default:
@@ -526,8 +526,8 @@ obj_t ray_concat(obj_t x, obj_t y)
             xl = x->len;
             vec = list(xl + 1);
             for (i = 0; i < xl; i++)
-                as_list(vec)[i] = clone(as_list(x)[i]);
-            as_list(vec)[xl] = clone(y);
+                as_list(vec)[i] = clone_obj(as_list(x)[i]);
+            as_list(vec)[xl] = clone_obj(y);
 
             return vec;
         }
@@ -535,26 +535,26 @@ obj_t ray_concat(obj_t x, obj_t y)
         {
             yl = y->len;
             vec = list(yl + 1);
-            as_list(vec)[0] = clone(x);
+            as_list(vec)[0] = clone_obj(x);
             for (i = 0; i < yl; i++)
-                as_list(vec)[i + 1] = clone(as_list(y)[i]);
+                as_list(vec)[i + 1] = clone_obj(as_list(y)[i]);
 
             return vec;
         }
 
-        throw(ERR_TYPE, "concat: unsupported types: '%s, '%s", typename(x->type), typename(y->type));
+        throw(ERR_TYPE, "concat: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
 
-obj_t ray_distinct(obj_t x)
+obj_p ray_distinct(obj_p x)
 {
-    obj_t res = NULL;
+    obj_p res = NULL;
     u64_t l;
 
     switch (x->type)
     {
-    case TYPE_BOOL:
-    case TYPE_BYTE:
+    case TYPE_B8:
+    case TYPE_U8:
     case TYPE_CHAR:
         l = ops_count(x);
         res = index_distinct_i8((i8_t *)as_u8(x), l, x->type == TYPE_CHAR);
@@ -581,19 +581,19 @@ obj_t ray_distinct(obj_t x)
         res = index_distinct_guid(as_guid(x), l);
         return res;
     default:
-        throw(ERR_TYPE, "distinct: invalid type: '%s", typename(x->type));
+        throw(ERR_TYPE, "distinct: invalid type: '%s", type_name(x->type));
     }
 }
 
-obj_t ray_group(obj_t x)
+obj_p ray_group(obj_p x)
 {
-    obj_t c, g, k, v;
+    obj_p c, g, k, v;
     u64_t i, m, n, l;
 
     switch (x->type)
     {
-    case TYPE_BYTE:
-    case TYPE_BOOL:
+    case TYPE_U8:
+    case TYPE_B8:
     case TYPE_CHAR:
         g = index_group_i8((i8_t *)as_u8(x), NULL, ops_count(x));
         l = as_list(g)[0]->i64;
@@ -619,8 +619,8 @@ obj_t ray_group(obj_t x)
             as_u8(k)[n] = as_u8(x)[i];
         }
 
-        drop(c);
-        drop(g);
+        drop_obj(c);
+        drop_obj(g);
 
         return dict(k, v);
     case TYPE_I64:
@@ -650,8 +650,8 @@ obj_t ray_group(obj_t x)
             as_i64(k)[n] = as_i64(x)[i];
         }
 
-        drop(c);
-        drop(g);
+        drop_obj(c);
+        drop_obj(g);
 
         return dict(k, v);
 
@@ -680,7 +680,7 @@ obj_t ray_group(obj_t x)
             as_f64(k)[n] = as_f64(x)[i];
         }
 
-        drop(g);
+        drop_obj(g);
 
         return dict(k, v);
     case TYPE_ENUM:
@@ -708,8 +708,8 @@ obj_t ray_group(obj_t x)
             as_i64(k)[n] = as_i64(enum_val(x))[i];
         }
 
-        drop(c);
-        drop(g);
+        drop_obj(c);
+        drop_obj(g);
 
         return dict(k, v);
     case TYPE_GUID:
@@ -737,8 +737,8 @@ obj_t ray_group(obj_t x)
             as_guid(k)[n] = as_guid(x)[i];
         }
 
-        drop(c);
-        drop(g);
+        drop_obj(c);
+        drop_obj(g);
 
         return dict(k, v);
 
@@ -766,16 +766,16 @@ obj_t ray_group(obj_t x)
             m = as_list(v)[n]->len;
             as_i64(as_list(v)[n])[m] = i;
             if (m == 0)
-                as_list(k)[n] = clone(as_list(x)[i]);
+                as_list(k)[n] = clone_obj(as_list(x)[i]);
 
             as_list(v)[n]->len++;
         }
 
-        drop(c);
-        drop(g);
+        drop_obj(c);
+        drop_obj(g);
 
         return dict(k, v);
     default:
-        throw(ERR_TYPE, "group: unsupported type: '%s", typename(x->type));
+        throw(ERR_TYPE, "group: unsupported type: '%s", type_name(x->type));
     }
 }

@@ -28,9 +28,9 @@
 #include "util.h"
 #include "group.h"
 
-obj_t lambda(obj_t args, obj_t body, obj_t nfo)
+obj_p lambda(obj_p args, obj_p body, obj_p nfo)
 {
-    obj_t obj = heap_alloc(sizeof(struct obj_t) + sizeof(lambda_t));
+    obj_p obj = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(lambda_t));
     lambda_t *f = (lambda_t *)obj->arr;
 
     f->name = NULL_OBJ;
@@ -44,10 +44,10 @@ obj_t lambda(obj_t args, obj_t body, obj_t nfo)
     return obj;
 }
 
-obj_t lambda_map(obj_t f, obj_t *x, u64_t n)
+obj_p lambda_map(obj_p f, obj_p *x, u64_t n)
 {
     u64_t i, j, l;
-    obj_t v, res;
+    obj_p v, res;
 
     l = ops_rank(x, n);
 
@@ -79,7 +79,7 @@ obj_t lambda_map(obj_t f, obj_t *x, u64_t n)
         if (is_error(v))
         {
             res->len = i;
-            drop(res);
+            drop_obj(res);
             res = v;
             goto cleanup;
         }
@@ -90,12 +90,12 @@ obj_t lambda_map(obj_t f, obj_t *x, u64_t n)
 // cleanup stack
 cleanup:
     for (j = 0; j < n; j++)
-        drop(stack_pop());
+        drop_obj(stack_pop());
 
     return res;
 }
 
-obj_t lambda_call(u8_t attrs, obj_t f, obj_t *x, u64_t n)
+obj_p lambda_call(u8_t attrs, obj_p f, obj_p *x, u64_t n)
 {
     if (attrs & FN_GROUP_MAP)
         return lambda_map(f, x, n);

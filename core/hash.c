@@ -33,10 +33,10 @@
 #include "eval.h"
 #include "error.h"
 
-obj_t ht_tab(u64_t size, type_t vals)
+obj_p ht_tab(u64_t size, i8_t vals)
 {
     u64_t i;
-    obj_t k, v;
+    obj_p k, v;
 
     size = next_power_of_two_u64(size);
     k = vector(TYPE_I64, size);
@@ -52,11 +52,11 @@ obj_t ht_tab(u64_t size, type_t vals)
     return dict(k, v);
 }
 
-nil_t rehash(obj_t *obj, hash_f hash, nil_t *seed)
+nil_t rehash(obj_p *obj, hash_f hash, nil_t *seed)
 {
     u64_t i, j, size, key, factor;
-    obj_t new_obj;
-    type_t type;
+    obj_p new_obj;
+    i8_t type;
     i64_t *orig_keys, *new_keys, *orig_vals = NULL, *new_vals = NULL;
 
     size = as_list(*obj)[0]->len;
@@ -99,11 +99,11 @@ nil_t rehash(obj_t *obj, hash_f hash, nil_t *seed)
         }
     }
 
-    drop(*obj);
+    drop_obj(*obj);
     *obj = new_obj;
 }
 
-i64_t ht_tab_next(obj_t *obj, i64_t key)
+i64_t ht_tab_next(obj_p *obj, i64_t key)
 {
     u64_t i, size;
     i64_t *keys;
@@ -111,7 +111,7 @@ i64_t ht_tab_next(obj_t *obj, i64_t key)
     size = as_list(*obj)[0]->len;
     keys = as_i64(as_list(*obj)[0]);
 
-    while (true)
+    while (B8_TRUE)
     {
         for (i = (u64_t)key & (size - 1); i < size; i++)
         {
@@ -125,7 +125,7 @@ i64_t ht_tab_next(obj_t *obj, i64_t key)
     }
 }
 
-i64_t ht_tab_next_with(obj_t *obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed)
+i64_t ht_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed)
 {
     u64_t i, size;
     i64_t *keys;
@@ -133,7 +133,7 @@ i64_t ht_tab_next_with(obj_t *obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *see
     size = as_list(*obj)[0]->len;
     keys = as_i64(as_list(*obj)[0]);
 
-    while (true)
+    while (B8_TRUE)
     {
         for (i = hash(key, seed) & (size - 1); i < size; i++)
         {
@@ -147,7 +147,7 @@ i64_t ht_tab_next_with(obj_t *obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *see
     }
 }
 
-i64_t ht_tab_get(obj_t obj, i64_t key)
+i64_t ht_tab_get(obj_p obj, i64_t key)
 {
     u64_t i, size;
     i64_t *keys;
@@ -166,7 +166,7 @@ i64_t ht_tab_get(obj_t obj, i64_t key)
     return NULL_I64;
 }
 
-i64_t ht_tab_get_with(obj_t obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed)
+i64_t ht_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed)
 {
     u64_t i, size;
     i64_t *keys;
@@ -185,23 +185,10 @@ i64_t ht_tab_get_with(obj_t obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed)
     return NULL_I64;
 }
 
-inline __attribute__((always_inline)) u64_t index_hash_u64(u64_t h, u64_t k)
-{
-    u64_t a, b;
-
-    a = (h ^ k) * 0x9ddfea08eb382d69ull;
-    a ^= (a >> 47);
-    b = (roti64(k, 31) ^ a) * 0x9ddfea08eb382d69ull;
-    b ^= (b >> 47);
-    b *= 0x9ddfea08eb382d69ull;
-
-    return b;
-}
-
-u64_t index_hash_obj(obj_t obj)
+u64_t hash_index_obj(obj_p obj)
 {
     u64_t hash, len, i, c;
-    str_t str;
+    str_p str;
 
     switch (obj->type)
     {
@@ -212,7 +199,7 @@ u64_t index_hash_obj(obj_t obj)
     case -TYPE_F64:
         return (u64_t)obj->f64;
     case -TYPE_GUID:
-        return index_hash_u64(*(u64_t *)as_guid(obj), *((u64_t *)as_guid(obj) + 1));
+        return hash_index_u64(*(u64_t *)as_guid(obj), *((u64_t *)as_guid(obj) + 1));
     case TYPE_CHAR:
         str = as_string(obj);
         hash = 5381;
@@ -225,7 +212,7 @@ u64_t index_hash_obj(obj_t obj)
     case TYPE_TIMESTAMP:
         len = obj->len;
         for (i = 0, hash = 0xcbf29ce484222325ull; i < len; i++)
-            hash = index_hash_u64((u64_t)as_i64(obj)[i], hash);
+            hash = hash_index_u64((u64_t)as_i64(obj)[i], hash);
         return hash;
     default:
         panic("hash: unsupported type: %d", obj->type);
@@ -271,22 +258,22 @@ u64_t hash_guid(i64_t a, nil_t *seed)
 u64_t hash_obj(i64_t a, nil_t *seed)
 {
     unused(seed);
-    return index_hash_obj((obj_t)a);
+    return hash_index_obj((obj_p)a);
 }
 
-i64_t cmp_i64(i64_t a, i64_t b, nil_t *seed)
+i64_t hash_cmp_i64(i64_t a, i64_t b, nil_t *seed)
 {
     unused(seed);
     return a - b;
 }
 
-i64_t cmp_obj(i64_t a, i64_t b, nil_t *seed)
+i64_t hash_cmp_obj(i64_t a, i64_t b, nil_t *seed)
 {
     unused(seed);
-    return objcmp((obj_t)a, (obj_t)b);
+    return cmp_obj((obj_p)a, (obj_p)b);
 }
 
-i64_t cmp_guid(i64_t a, i64_t b, nil_t *seed)
+i64_t hash_cmp_guid(i64_t a, i64_t b, nil_t *seed)
 {
     unused(seed);
     guid_t *g1 = (guid_t *)a, *g2 = (guid_t *)b;

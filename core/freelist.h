@@ -34,13 +34,13 @@ typedef struct freelist_t
     i64_t free_size;
     i64_t free_pos;
     i64_t *free;
-} *freelist_t;
+} *freelist_p;
 
-freelist_t freelist_new(i64_t data_size);
-nil_t freelist_free(freelist_t freelist);
+freelist_p freelist_new(i64_t data_size);
+nil_t freelist_free(freelist_p freelist);
 
-i64_t freelist_push(freelist_t freelist, i64_t val);
-i64_t freelist_pop(freelist_t freelist, i64_t val);
-i64_t freelist_get(freelist_t freelist, i64_t idx);
+i64_t freelist_push(freelist_p freelist, i64_t val);
+i64_t freelist_pop(freelist_p freelist, i64_t val);
+i64_t freelist_get(freelist_p freelist, i64_t idx);
 
 #endif // FREELIST_H

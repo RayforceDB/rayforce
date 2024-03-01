@@ -32,10 +32,10 @@
 #include "eval.h"
 #include "error.h"
 
-obj_t ray_apply(obj_t *x, u64_t n)
+obj_p ray_apply(obj_p *x, u64_t n)
 {
     u64_t i;
-    obj_t f;
+    obj_p f;
 
     if (n < 2)
         return null(0);
@@ -61,18 +61,18 @@ obj_t ray_apply(obj_t *x, u64_t n)
             throw(ERR_LENGTH, "'apply': lambda call with wrong arguments count");
 
         for (i = 0; i < n; i++)
-            stack_push(clone(x[i]));
+            stack_push(clone_obj(x[i]));
 
         return call(f, n);
     default:
-        throw(ERR_TYPE, "'map': unsupported function type: '%s", typename(f->type));
+        throw(ERR_TYPE, "'map': unsupported function type: '%s", type_name(f->type));
     }
 }
 
-obj_t ray_map(obj_t *x, u64_t n)
+obj_p ray_map(obj_p *x, u64_t n)
 {
     u64_t i, j, l;
-    obj_t f, v, *b, res;
+    obj_p f, v, *b, res;
 
     if (n < 2)
         return list(0);
@@ -105,7 +105,7 @@ obj_t ray_map(obj_t *x, u64_t n)
         for (j = 0; j < n; j++)
         {
             b = x + j;
-            v = (is_vector(*b) || (*b)->type == TYPE_GROUPMAP) ? at_idx(*b, 0) : clone(*b);
+            v = (is_vector(*b) || (*b)->type == TYPE_GROUPMAP) ? at_idx(*b, 0) : clone_obj(*b);
             stack_push(v);
         }
 
@@ -122,7 +122,7 @@ obj_t ray_map(obj_t *x, u64_t n)
             for (j = 0; j < n; j++)
             {
                 b = x + j;
-                v = (is_vector(*b) || (*b)->type == TYPE_GROUPMAP) ? at_idx(*b, i) : clone(*b);
+                v = (is_vector(*b) || (*b)->type == TYPE_GROUPMAP) ? at_idx(*b, i) : clone_obj(*b);
                 stack_push(v);
             }
 
@@ -130,7 +130,7 @@ obj_t ray_map(obj_t *x, u64_t n)
             if (is_error(v))
             {
                 res->len = i;
-                drop(res);
+                drop_obj(res);
                 return v;
             }
 
@@ -139,14 +139,14 @@ obj_t ray_map(obj_t *x, u64_t n)
 
         return res;
     default:
-        throw(ERR_TYPE, "'map': unsupported function type: '%s", typename(f->type));
+        throw(ERR_TYPE, "'map': unsupported function type: '%s", type_name(f->type));
     }
 }
 
-obj_t ray_fold(obj_t *x, u64_t n)
+obj_p ray_fold(obj_p *x, u64_t n)
 {
     u64_t o, i, j, l;
-    obj_t f, v, *b, x1, x2;
+    obj_p f, v, *b, x1, x2;
 
     if (n < 2)
         return vn_list(0);
@@ -176,7 +176,7 @@ obj_t ray_fold(obj_t *x, u64_t n)
         {
             o = 0;
             b = x + 1;
-            v = clone(x[0]);
+            v = clone_obj(x[0]);
         }
         else
             throw(ERR_LENGTH, "'fold': binary call with wrong arguments count");
@@ -186,8 +186,8 @@ obj_t ray_fold(obj_t *x, u64_t n)
             x1 = v;
             x2 = at_idx(*b, i);
             v = binary_call(FN_ATOMIC, (binary_f)f->i64, x1, x2);
-            drop(x1);
-            drop(x2);
+            drop_obj(x1);
+            drop_obj(x2);
 
             if (is_error(v))
                 return v;
@@ -208,7 +208,7 @@ obj_t ray_fold(obj_t *x, u64_t n)
         if (n > 1)
         {
             o = 1;
-            v = clone(x[0]);
+            v = clone_obj(x[0]);
         }
         else
         {
@@ -235,6 +235,6 @@ obj_t ray_fold(obj_t *x, u64_t n)
 
         return v;
     default:
-        throw(ERR_TYPE, "'fold': unsupported function type: '%s", typename(f->type));
+        throw(ERR_TYPE, "'fold': unsupported function type: '%s", type_name(f->type));
     }
 }

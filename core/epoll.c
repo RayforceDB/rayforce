@@ -58,10 +58,10 @@ nil_t sigint_handler(i32_t signo)
     unused(res);
 }
 
-poll_t poll_init(i64_t port)
+poll_p poll_init(i64_t port)
 {
     i64_t epoll_fd = -1, listen_fd = -1;
-    poll_t poll;
+    poll_p poll;
     struct epoll_event ev;
 
     epoll_fd = epoll_create1(0);
@@ -116,7 +116,7 @@ poll_t poll_init(i64_t port)
         }
     }
 
-    poll = (poll_t)heap_alloc(sizeof(struct poll_t));
+    poll = (poll_p)heap_alloc(sizeof(struct poll_t));
     poll->code = NULL_I64;
     poll->poll_fd = epoll_fd;
     poll->ipc_fd = listen_fd;
@@ -128,7 +128,7 @@ poll_t poll_init(i64_t port)
     return poll;
 }
 
-nil_t poll_cleanup(poll_t poll)
+nil_t poll_cleanup(poll_p poll)
 {
     i64_t i, l;
 
@@ -143,8 +143,8 @@ nil_t poll_cleanup(poll_t poll)
             poll_deregister(poll, i + SELECTOR_ID_OFFSET);
     }
 
-    drop(poll->replfile);
-    drop(poll->ipcfile);
+    drop_obj(poll->replfile);
+    drop_obj(poll->ipcfile);
 
     freelist_free(poll->selectors);
     timers_free(poll->timers);
@@ -157,18 +157,18 @@ nil_t poll_cleanup(poll_t poll)
     fflush(stdout);
 }
 
-i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
+i64_t poll_register(poll_p poll, i64_t fd, u8_t version)
 {
     i64_t id;
-    selector_t selector;
+    selector_p selector;
     struct epoll_event ev;
 
-    selector = heap_alloc(sizeof(struct selector_t));
+    selector = (selector_p)heap_alloc(sizeof(struct selector_t));
     id = freelist_push(poll->selectors, (i64_t)selector) + SELECTOR_ID_OFFSET;
     selector->id = id;
     selector->version = version;
     selector->fd = fd;
-    selector->tx.isset = false;
+    selector->tx.isset = B8_FALSE;
     selector->rx.buf = NULL;
     selector->rx.size = 0;
     selector->rx.bytes_transfered = 0;
@@ -185,17 +185,17 @@ i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
     return id;
 }
 
-nil_t poll_deregister(poll_t poll, i64_t id)
+nil_t poll_deregister(poll_p poll, i64_t id)
 {
     i64_t idx;
-    selector_t selector;
+    selector_p selector;
 
     idx = freelist_pop(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
         return;
 
-    selector = (selector_t)idx;
+    selector = (selector_p)idx;
 
     epoll_ctl(poll->poll_fd, EPOLL_CTL_DEL, selector->fd, NULL);
     close(selector->fd);
@@ -206,7 +206,7 @@ nil_t poll_deregister(poll_t poll, i64_t id)
     heap_free(selector);
 }
 
-poll_result_t _recv(poll_t poll, selector_t selector)
+poll_result_t _recv(poll_p poll, selector_p selector)
 {
     unused(poll);
 
@@ -215,7 +215,7 @@ poll_result_t _recv(poll_t poll, selector_t selector)
     u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
 
     if (selector->rx.buf == NULL)
-        selector->rx.buf = heap_alloc(sizeof(struct header_t));
+        selector->rx.buf = (u8_t *)heap_alloc(sizeof(struct header_t));
 
     // wait for handshake
     if (selector->version == 0)
@@ -265,7 +265,7 @@ poll_result_t _recv(poll_t poll, selector_t selector)
         header = (header_t *)selector->rx.buf;
         selector->rx.msgtype = header->msgtype;
         selector->rx.size = header->size + sizeof(struct header_t);
-        selector->rx.buf = heap_realloc(selector->rx.buf, selector->rx.size);
+        selector->rx.buf = (u8_t *)heap_realloc(selector->rx.buf, selector->rx.size);
     }
 
     while (selector->rx.bytes_transfered < selector->rx.size)
@@ -283,10 +283,10 @@ poll_result_t _recv(poll_t poll, selector_t selector)
     return POLL_DONE;
 }
 
-poll_result_t _send(poll_t poll, selector_t selector)
+poll_result_t _send(poll_p poll, selector_p selector)
 {
     i64_t size;
-    obj_t obj;
+    obj_p obj;
     nil_t *v;
     i8_t msg_type = MSG_TYPE_RESP;
     struct epoll_event ev;
@@ -303,7 +303,7 @@ send:
             // setup epoll for EPOLLOUT only if it's not already set
             if (!selector->tx.isset)
             {
-                selector->tx.isset = true;
+                selector->tx.isset = B8_TRUE;
                 ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;
                 ev.data.ptr = selector;
                 if (epoll_ctl(poll->poll_fd, EPOLL_CTL_MOD, selector->fd, &ev) == -1)
@@ -325,11 +325,11 @@ send:
 
     if (v != NULL_OBJ)
     {
-        obj = (obj_t)((i64_t)v & ~(3ll << 61));
+        obj = (obj_p)((i64_t)v & ~(3ll << 61));
         msg_type = (((i64_t)v & (3ll << 61)) >> 61);
         size = ser_raw(&selector->tx.buf, obj);
         selector->tx.size = size;
-        drop(obj);
+        drop_obj(obj);
         if (size == -1)
             return POLL_ERROR;
 
@@ -340,7 +340,7 @@ send:
     // remove EPOLLOUT only if it's set
     if (selector->tx.isset)
     {
-        selector->tx.isset = false;
+        selector->tx.isset = B8_FALSE;
         ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
         ev.data.ptr = selector;
         if (epoll_ctl(poll->poll_fd, EPOLL_CTL_MOD, selector->fd, &ev) == -1)
@@ -350,9 +350,9 @@ send:
     return POLL_DONE;
 }
 
-obj_t read_obj(selector_t selector)
+obj_p read_obj(selector_p selector)
 {
-    obj_t res;
+    obj_p res;
 
     res = de_raw(selector->rx.buf, selector->rx.size);
     heap_free(selector->rx.buf);
@@ -363,10 +363,10 @@ obj_t read_obj(selector_t selector)
     return res;
 }
 
-nil_t process_request(poll_t poll, selector_t selector)
+nil_t process_request(poll_p poll, selector_p selector)
 {
     poll_result_t poll_result;
-    obj_t v, res;
+    obj_p v, res;
 
     res = read_obj(selector);
 
@@ -374,13 +374,13 @@ nil_t process_request(poll_t poll, selector_t selector)
         v = res;
     else if (res->type == TYPE_CHAR)
     {
-        v = eval_str(res, poll->ipcfile);
-        drop(res);
+        v = ray_eval_str(res, poll->ipcfile);
+        drop_obj(res);
     }
     else
     {
         v = eval_obj(res);
-        drop(res);
+        drop_obj(res);
     }
 
     // sync request
@@ -393,16 +393,16 @@ nil_t process_request(poll_t poll, selector_t selector)
             poll_deregister(poll, selector->id);
     }
     else
-        drop(v);
+        drop_obj(v);
 }
 
-i64_t poll_run(poll_t poll)
+i64_t poll_run(poll_p poll)
 {
     i64_t epoll_fd = poll->poll_fd, listen_fd = poll->ipc_fd,
           n, nfds, len, sock, timeout = TIMEOUT_INFINITY;
-    obj_t str, res;
+    obj_p str, res;
     poll_result_t poll_result;
-    selector_t selector;
+    selector_p selector;
     struct epoll_event ev, events[MAX_EVENTS];
 
     prompt();
@@ -423,11 +423,11 @@ i64_t poll_run(poll_t poll)
                 len = read(STDIN_FILENO, __STDIN_BUF, BUF_SIZE);
                 if (len > 1)
                 {
-                    str = string_from_str((str_t)__STDIN_BUF, len - 1);
-                    res = eval_str(str, poll->replfile);
-                    drop(str);
+                    str = string_from_str((str_p)__STDIN_BUF, len - 1);
+                    res = ray_eval_str(str, poll->replfile);
+                    drop_obj(str);
                     io_write(STDOUT_FILENO, MSG_TYPE_RESP, res);
-                    drop(res);
+                    drop_obj(res);
                 }
                 prompt();
             }
@@ -444,7 +444,7 @@ i64_t poll_run(poll_t poll)
             // tcp socket event
             else
             {
-                selector = (selector_t)ev.data.ptr;
+                selector = (selector_p)ev.data.ptr;
 
                 if ((ev.events & EPOLLERR) || (ev.events & EPOLLHUP))
                 {
@@ -485,13 +485,13 @@ i64_t poll_run(poll_t poll)
     return poll->code;
 }
 
-obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
+obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg)
 {
     poll_result_t poll_result = POLL_PENDING;
-    selector_t selector;
+    selector_p selector;
     i32_t result;
     i64_t idx;
-    obj_t res;
+    obj_p res;
     fd_set fds;
 
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
@@ -499,11 +499,11 @@ obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
     if (idx == NULL_I64)
         throw(ERR_IO, "ipc_send_sync: invalid socket fd: %lld", id);
 
-    selector = (selector_t)idx;
+    selector = (selector_p)idx;
 
     queue_push(&selector->tx.queue, (nil_t *)((i64_t)msg | ((i64_t)MSG_TYPE_SYNC << 61)));
 
-    while (true)
+    while (B8_TRUE)
     {
         poll_result = _send(poll, selector);
 
@@ -532,7 +532,7 @@ obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
     }
 
 recv:
-    while (true)
+    while (B8_TRUE)
     {
         poll_result = _recv(poll, selector);
 
@@ -574,17 +574,17 @@ recv:
     return res;
 }
 
-obj_t ipc_send_async(poll_t poll, i64_t id, obj_t msg)
+obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg)
 {
     i64_t idx;
-    selector_t selector;
+    selector_p selector;
 
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
         throw(ERR_IO, "ipc_send_sync: invalid socket fd: %lld", id);
 
-    selector = (selector_t)idx;
+    selector = (selector_p)idx;
     if (selector == NULL)
         throw(ERR_IO, "ipc_send_async: invalid socket fd: %lld", id);
 

@@ -26,18 +26,18 @@
 
 #include "rayforce.h"
 
-obj_t ray_at(obj_t x, obj_t y);
-obj_t ray_find(obj_t x, obj_t y);
-obj_t ray_filter(obj_t x, obj_t y);
-obj_t ray_take(obj_t x, obj_t y);
-obj_t ray_in(obj_t x, obj_t y);
-obj_t ray_sect(obj_t x, obj_t y);
-obj_t ray_except(obj_t x, obj_t y);
-obj_t ray_union(obj_t x, obj_t y);
-obj_t ray_first(obj_t x);
-obj_t ray_last(obj_t x);
-obj_t ray_key(obj_t x);
-obj_t ray_value(obj_t x);
-obj_t ray_where(obj_t x);
+obj_p ray_at(obj_p x, obj_p y);
+obj_p ray_find(obj_p x, obj_p y);
+obj_p ray_filter(obj_p x, obj_p y);
+obj_p ray_take(obj_p x, obj_p y);
+obj_p ray_in(obj_p x, obj_p y);
+obj_p ray_sect(obj_p x, obj_p y);
+obj_p ray_except(obj_p x, obj_p y);
+obj_p ray_union(obj_p x, obj_p y);
+obj_p ray_first(obj_p x);
+obj_p ray_last(obj_p x);
+obj_p ray_key(obj_p x);
+obj_p ray_value(obj_p x);
+obj_p ray_where(obj_p x);
 
 #endif // ITEMS_H

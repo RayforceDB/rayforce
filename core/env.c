@@ -52,7 +52,7 @@
     {                                           \
         i64_t _k = intern_symbol(n, strlen(n)); \
         push_raw(&as_list(r)[0], &_k);          \
-        obj_t _o = atom(-t);                    \
+        obj_p _o = atom(-t);                    \
         _o->attrs = f | ATTR_PROTECTED;         \
         _o->i64 = (i64_t)o;                     \
         push_raw(&as_list(r)[1], &_o);          \
@@ -65,14 +65,14 @@
         push_sym(&as_list(r)[1], s);   \
     };
 
-obj_t ray_env(nil_t)
+obj_p ray_env(nil_t)
 {
-    return clone(runtime_get()->env.variables);
+    return clone_obj(runtime_get()->env.variables);
 }
 
-obj_t ray_memstat(nil_t)
+obj_p ray_memstat(nil_t)
 {
-    obj_t keys, vals;
+    obj_p keys, vals;
     memstat_t stat = heap_memstat();
     symbols_t *symbols = runtime_get()->symbols;
 
@@ -92,7 +92,7 @@ obj_t ray_memstat(nil_t)
 }
 
 // clang-format off
-nil_t init_functions(obj_t functions)
+nil_t init_functions(obj_p functions)
 {
     // Unary
     regf(functions,  "get",       TYPE_UNARY,    FN_NONE,                   ray_get);
@@ -100,7 +100,6 @@ nil_t init_functions(obj_t functions)
     regf(functions,  "read",      TYPE_UNARY,    FN_NONE,                   ray_read);
     regf(functions,  "parse",     TYPE_UNARY,    FN_NONE,                   ray_parse);
     regf(functions,  "eval",      TYPE_UNARY,    FN_NONE,                   ray_eval);
-    regf(functions,  "exec",      TYPE_UNARY,    FN_NONE,                   ray_exec);
     regf(functions,  "load",      TYPE_UNARY,    FN_NONE,                   ray_load);
     regf(functions,  "type",      TYPE_UNARY,    FN_NONE,                   ray_type);
     regf(functions,  "til",       TYPE_UNARY,    FN_NONE,                   ray_til);
@@ -128,8 +127,8 @@ nil_t init_functions(obj_t functions)
     regf(functions,  "key",       TYPE_UNARY,    FN_NONE,                   ray_key);
     regf(functions,  "value",     TYPE_UNARY,    FN_NONE,                   ray_value);
     regf(functions,  "parse",     TYPE_UNARY,    FN_NONE,                   ray_parse);
-    regf(functions,  "ser",       TYPE_UNARY,    FN_NONE,                   ser);
-    regf(functions,  "de",        TYPE_UNARY,    FN_NONE,                   de);
+    regf(functions,  "ser",       TYPE_UNARY,    FN_NONE,                   ser_obj);
+    regf(functions,  "de",        TYPE_UNARY,    FN_NONE,                   de_obj);
     regf(functions,  "hopen",     TYPE_UNARY,    FN_NONE,                   ray_hopen);
     regf(functions,  "hclose",    TYPE_UNARY,    FN_NONE,                   ray_hclose);
     regf(functions,  "rc",        TYPE_UNARY,    FN_NONE,                   ray_rc);
@@ -169,7 +168,7 @@ nil_t init_functions(obj_t functions)
     regf(functions,  "sect",      TYPE_BINARY,   FN_ATOMIC,                 ray_sect);
     regf(functions,  "except",    TYPE_BINARY,   FN_ATOMIC,                 ray_except);
     regf(functions,  "rand",      TYPE_BINARY,   FN_ATOMIC,                 ray_rand);
-    regf(functions,  "as",        TYPE_BINARY,   FN_NONE,                   ray_as);
+    regf(functions,  "as",        TYPE_BINARY,   FN_NONE,                   ray_cast_obj);
     regf(functions,  "xasc",      TYPE_BINARY,   FN_NONE,                   ray_xasc);
     regf(functions,  "xdesc",     TYPE_BINARY,   FN_NONE,                   ray_xdesc);
     regf(functions,  "enum",      TYPE_BINARY,   FN_NONE,                   ray_enum);
@@ -204,19 +203,19 @@ nil_t init_functions(obj_t functions)
     regf(functions,  "timer",     TYPE_VARY,     FN_NONE,                   ray_timer);
 }    
     
-nil_t init_typenames(obj_t typenames)    
+nil_t init_typenames(obj_p typenames)    
 {
     regt(typenames,   -TYPE_ERROR,      "Null");
-    regt(typenames,   -TYPE_BOOL,       "bool");
-    regt(typenames,   -TYPE_BYTE,       "byte");
+    regt(typenames,   -TYPE_B8,       "b8");
+    regt(typenames,   -TYPE_U8,       "byte");
     regt(typenames,   -TYPE_I64,        "i64");
     regt(typenames,   -TYPE_F64,        "f64");
     regt(typenames,   -TYPE_CHAR,       "char");
     regt(typenames,   -TYPE_SYMBOL,     "symbol");
     regt(typenames,   -TYPE_TIMESTAMP,  "timestamp");
     regt(typenames,   -TYPE_GUID,       "guid");
-    regt(typenames,    TYPE_BOOL,       "Bool");
-    regt(typenames,    TYPE_BYTE,       "Byte");
+    regt(typenames,    TYPE_B8,       "b8");
+    regt(typenames,    TYPE_U8,       "Byte");
     regt(typenames,    TYPE_I64,        "I64");
     regt(typenames,    TYPE_F64,        "F64");
     regt(typenames,    TYPE_CHAR,       "String");
@@ -251,9 +250,9 @@ nil_t init_kw(nil_t)
 
 env_t create_env(nil_t)
 {
-    obj_t functions = dict(vector_symbol(0), vn_list(0));
-    obj_t variables = dict(vector_symbol(0), vn_list(0));
-    obj_t typenames = dict(vector_i64(0), vector_symbol(0));
+    obj_p functions = dict(vector_symbol(0), vn_list(0));
+    obj_p variables = dict(vector_symbol(0), vn_list(0));
+    obj_p typenames = dict(vector_i64(0), vector_symbol(0));
 
     init_kw();
     init_functions(functions);
@@ -270,12 +269,12 @@ env_t create_env(nil_t)
 
 nil_t free_env(env_t *env)
 {
-    drop(env->functions);
-    drop(env->variables);
-    drop(env->typenames);
+    drop_obj(env->functions);
+    drop_obj(env->variables);
+    drop_obj(env->typenames);
 }
 
-i64_t env_get_typename_by_type(env_t *env, type_t type)
+i64_t env_get_typename_by_type(env_t *env, i8_t type)
 {
     i64_t t, i;
 
@@ -288,7 +287,7 @@ i64_t env_get_typename_by_type(env_t *env, type_t type)
     return as_symbol(as_list(env->typenames)[1])[i];
 }
 
-type_t env_get_type_by_typename(env_t *env, i64_t name)
+i8_t env_get_type_by_type_name(env_t *env, i64_t name)
 {
     i64_t n, i;
 
@@ -298,20 +297,20 @@ type_t env_get_type_by_typename(env_t *env, i64_t name)
     if (i == (i64_t)as_list(env->typenames)[1]->len)
         return TYPE_ERROR;
 
-    return (type_t)as_i64(as_list(env->typenames)[0])[i];
+    return (i8_t)as_i64(as_list(env->typenames)[0])[i];
 }
 
-str_t env_get_typename(type_t type)
+str_p env_get_type_name(i8_t type)
 {
     env_t *env = &runtime_get()->env;
     i64_t name = env_get_typename_by_type(env, type);
 
-    return symtostr(name);
+    return strof_sym(name);
 }
 
-str_t env_get_internal_name(obj_t obj)
+str_p env_get_internal_name(obj_p obj)
 {
-    obj_t functions = runtime_get()->env.functions;
+    obj_p functions = runtime_get()->env.functions;
     i64_t sym = 0;
     u64_t i, l;
 
@@ -326,31 +325,31 @@ str_t env_get_internal_name(obj_t obj)
     }
 
     if (sym)
-        return symtostr(sym);
+        return strof_sym(sym);
 
     return "@fn";
 }
 
-obj_t env_get_internal_function(str_t name)
+obj_p env_get_internal_function(str_p name)
 {
     i64_t i;
 
     i = find_sym(as_list(runtime_get()->env.functions)[0], name);
 
     if (i < (i64_t)as_list(runtime_get()->env.functions)[0]->len)
-        return clone(as_list(as_list(runtime_get()->env.functions)[1])[i]);
+        return clone_obj(as_list(as_list(runtime_get()->env.functions)[1])[i]);
 
     return NULL_OBJ;
 }
 
-obj_t env_get_internal_function_by_id(i64_t id)
+obj_p env_get_internal_function_by_id(i64_t id)
 {
     i64_t i;
 
     i = find_raw(as_list(runtime_get()->env.functions)[0], &id);
 
     if (i < (i64_t)as_list(runtime_get()->env.functions)[0]->len)
-        return clone(as_list(as_list(runtime_get()->env.functions)[1])[i]);
+        return clone_obj(as_list(as_list(runtime_get()->env.functions)[1])[i]);
 
     return NULL_OBJ;
 }

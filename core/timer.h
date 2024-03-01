@@ -34,7 +34,7 @@ typedef struct ray_timer_t
     i64_t tic; // Interval between timer calls
     i64_t exp; // Expiration time of the timer
     i64_t num; // Number of times the timer has to be called
-    obj_t clb; // Callback function to be called when timer expires
+    obj_p clb; // Callback function to be called when timer expires
 } ray_timer_t;
 
 typedef struct timers_t
@@ -49,6 +49,6 @@ timers_t *timers_new(u64_t capacity);
 nil_t timers_free(timers_t *timers);
 i64_t timer_next_timeout(timers_t *timers);
 
-obj_t ray_timer(obj_t *x, u64_t n);
+obj_p ray_timer(obj_p *x, u64_t n);
 
 #endif // TIMER_H

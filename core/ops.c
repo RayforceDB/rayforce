@@ -44,23 +44,23 @@ __thread u64_t __RND_SEED__ = 0;
 struct obj_t __NULL_OBJECT = {.mmod = 0, .refc = 0, .type = TYPE_NULL, .attrs = 0, .rc = 0, .len = 0};
 
 /*
- * Treat obj as a bool
+ * Treat obj as a b8
  */
-bool_t ops_as_bool(obj_t x)
+b8_t ops_as_b8(obj_p x)
 {
     switch (x->type)
     {
-    case -TYPE_BOOL:
-        return x->bool;
-    case -TYPE_BYTE:
+    case -TYPE_B8:
+        return x->b8;
+    case -TYPE_U8:
     case -TYPE_CHAR:
         return x->u8 != 0;
     case -TYPE_I64:
     case -TYPE_SYMBOL:
     case -TYPE_TIMESTAMP:
         return x->i64 != 0;
-    case TYPE_BOOL:
-    case TYPE_BYTE:
+    case TYPE_B8:
+    case TYPE_U8:
     case TYPE_CHAR:
     case TYPE_I64:
     case TYPE_SYMBOL:
@@ -68,7 +68,7 @@ bool_t ops_as_bool(obj_t x)
     case TYPE_LIST:
         return x->len != 0;
     default:
-        return true;
+        return B8_TRUE;
     }
 }
 /*
@@ -76,7 +76,7 @@ bool_t ops_as_bool(obj_t x)
  * compiler optimizations. So we need to use memcpy to get the bits of the x
  * and then separate check mantissa and exponent.
  */
-bool_t ops_is_nan(f64_t x)
+b8_t ops_is_nan(f64_t x)
 {
     u64_t bits;
     memcpy(&bits, &x, sizeof(x));
@@ -99,23 +99,23 @@ u64_t ops_rand_u64(nil_t)
     return __RND_SEED__;
 }
 
-bool_t ops_eq_idx(obj_t a, i64_t ai, obj_t b, i64_t bi)
+b8_t ops_eq_idx(obj_p a, i64_t ai, obj_p b, i64_t bi)
 {
-    obj_t lv, rv;
-    bool_t eq;
+    obj_p lv, rv;
+    b8_t eq;
 
     switch (mtype2(a->type, b->type))
     {
-    case mtype2(TYPE_BYTE, -TYPE_BYTE):
+    case mtype2(TYPE_U8, -TYPE_U8):
     case mtype2(TYPE_CHAR, -TYPE_CHAR):
-    case mtype2(TYPE_BOOL, -TYPE_BOOL):
+    case mtype2(TYPE_B8, -TYPE_B8):
         return as_u8(a)[ai] == b->u8;
     case mtype2(TYPE_I64, -TYPE_I64):
     case mtype2(TYPE_SYMBOL, -TYPE_SYMBOL):
     case mtype2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
         return as_i64(a)[ai] == b->i64;
-    case mtype2(TYPE_BYTE, TYPE_BYTE):
-    case mtype2(TYPE_BOOL, TYPE_BOOL):
+    case mtype2(TYPE_U8, TYPE_U8):
+    case mtype2(TYPE_B8, TYPE_B8):
     case mtype2(TYPE_CHAR, TYPE_CHAR):
         return as_u8(a)[ai] == as_u8(b)[bi];
     case mtype2(TYPE_I64, TYPE_I64):
@@ -132,34 +132,34 @@ bool_t ops_eq_idx(obj_t a, i64_t ai, obj_t b, i64_t bi)
         return memcmp(as_guid(a) + ai, as_guid(b) + bi, sizeof(guid_t)) == 0;
         // TODO: figure out how to distinguish between list as column and a list as a value
     case mtype2(TYPE_LIST, TYPE_LIST):
-        return objcmp(as_list(a)[ai], as_list(b)[bi]) == 0;
+        return cmp_obj(as_list(a)[ai], as_list(b)[bi]) == 0;
     case mtype2(TYPE_ENUM, TYPE_ENUM):
         lv = at_idx(a, ai);
         rv = at_idx(b, bi);
         eq = lv->i64 == rv->i64;
-        drop(lv);
-        drop(rv);
+        drop_obj(lv);
+        drop_obj(rv);
         return eq;
     case mtype2(TYPE_ANYMAP, TYPE_ANYMAP):
         lv = at_idx(a, ai);
         rv = at_idx(b, bi);
-        eq = objcmp(lv, rv) == 0;
-        drop(lv);
-        drop(rv);
+        eq = cmp_obj(lv, rv) == 0;
+        drop_obj(lv);
+        drop_obj(rv);
         return eq;
     default:
         panic("hash: unsupported type: %d", a->type);
     }
 }
 
-u64_t ops_count(obj_t x)
+u64_t ops_count(obj_p x)
 {
     switch (x->type)
     {
     case TYPE_NULL:
         return 0;
-    case TYPE_BOOL:
-    case TYPE_BYTE:
+    case TYPE_B8:
+    case TYPE_U8:
     case TYPE_I64:
     case TYPE_F64:
     case TYPE_SYMBOL:
@@ -191,10 +191,10 @@ u64_t ops_count(obj_t x)
  * if there are at least one vector - it's length, otherwise - 1.
  * In case if there are vectors with different lengths - returns -1.
  */
-u64_t ops_rank(obj_t *x, u64_t n)
+u64_t ops_rank(obj_p *x, u64_t n)
 {
     u64_t i, l = 0xfffffffffffffffful;
-    obj_t *b;
+    obj_p *b;
 
     for (i = 0; i < n; i++)
     {
@@ -214,14 +214,14 @@ u64_t ops_rank(obj_t *x, u64_t n)
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 
-obj_t sys_error(os_error_type_t type, str_t msg)
+obj_p sys_error(os_ray_error_type_t tp, str_p msg)
 {
-    str_t emsg;
-    obj_t err;
+    str_p emsg;
+    obj_p err;
     DWORD dw;
     LPVOID lpMsgBuf;
 
-    switch (type)
+    switch (tp)
     {
     case ERROR_TYPE_OS:
         emsg = str_fmt(0, "%s: %s", msg, strerror(errno));
@@ -257,9 +257,9 @@ obj_t sys_error(os_error_type_t type, str_t msg)
 
 #else
 
-obj_t sys_error(os_error_type_t type, str_t msg)
+obj_p sys_error(os_ray_error_type_t tp, str_p msg)
 {
-    return error(type, "'%s': %s", msg, strerror(errno));
+    return error(tp, "'%s': %s", msg, strerror(errno));
 }
 
 #endif

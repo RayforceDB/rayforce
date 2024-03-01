@@ -36,7 +36,7 @@
 #include <emscripten.h>
 #endif
 
-str_t sys_about_info(nil_t)
+str_p sys_about_info(nil_t)
 {
 #if defined(__EMSCRIPTEN__)
     return str_fmt(0, "  RayforceDB: %d.%d %s\n"

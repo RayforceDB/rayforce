@@ -32,7 +32,7 @@
 CASSERT(sizeof(struct node_t) == 16, heap_h)
 CASSERT(sizeof(struct heap_t) % PAGE_SIZE == 0, heap_h)
 
-__thread heap_t __HEAP = NULL;
+__thread heap_p __HEAP = NULL;
 __thread nil_t *__HEAP_16_BLOCKS_START = NULL;
 __thread nil_t *__HEAP_16_BLOCKS_END = NULL;
 
@@ -53,7 +53,7 @@ nil_t heap_free(nil_t *block) { free(block); }
 nil_t *heap_realloc(nil_t *ptr, u64_t new_size) { return realloc(ptr, new_size); }
 i64_t heap_gc(nil_t) { return 0; }
 nil_t heap_cleanup(nil_t) {}
-heap_t heap_init(nil_t) { return NULL; }
+heap_p heap_init(nil_t) { return NULL; }
 memstat_t heap_memstat(nil_t) { return (memstat_t){0}; }
 
 #else
@@ -69,7 +69,7 @@ nil_t heap_print_blocks(nil_t)
         printf("-- order: %lld [", i);
         while (node)
         {
-            printf("%p, ", (raw_t)node);
+            printf("%p, ", (raw_p)node);
             node = node->next;
         }
         printf("]\n");
@@ -94,12 +94,12 @@ nil_t *heap_add_pool(u64_t order)
     return (nil_t *)node;
 }
 
-heap_t heap_init(nil_t)
+heap_p heap_init(nil_t)
 {
     i32_t i;
     nil_t *block16;
 
-    __HEAP = (heap_t)mmap_malloc(sizeof(struct heap_t));
+    __HEAP = (heap_p)mmap_malloc(sizeof(struct heap_t));
     __HEAP->avail = 0;
     __HEAP->blocks16 = mmap_malloc(NUM_16_BLOCKS * 16);
     __HEAP->freelist16 = NULL;
@@ -109,13 +109,13 @@ heap_t heap_init(nil_t)
     // fill linked list of 16 bytes blocks
     for (i = NUM_16_BLOCKS - 1; i >= 0; i--)
     {
-        block16 = (nil_t *)((str_t)__HEAP->blocks16 + i * 16);
+        block16 = (nil_t *)((str_p)__HEAP->blocks16 + i * 16);
         *(nil_t **)block16 = __HEAP->freelist16;
         __HEAP->freelist16 = block16;
     }
 
     __HEAP_16_BLOCKS_START = __HEAP->blocks16;
-    __HEAP_16_BLOCKS_END = (nil_t *)((str_t)__HEAP->blocks16 + NUM_16_BLOCKS * 16);
+    __HEAP_16_BLOCKS_END = (nil_t *)((str_p)__HEAP->blocks16 + NUM_16_BLOCKS * 16);
 
     return __HEAP;
 }
@@ -147,7 +147,7 @@ nil_t heap_cleanup(nil_t)
             order = blockorder(node->base);
             if (order != i)
             {
-                debug("order: %lld node: %p\n", i, (raw_t)node);
+                debug("order: %lld node: %p\n", i, (raw_p)node);
                 return;
             }
 
@@ -160,7 +160,7 @@ nil_t heap_cleanup(nil_t)
     mmap_free(__HEAP, sizeof(struct heap_t));
 }
 
-heap_t heap_get(nil_t)
+heap_p heap_get(nil_t)
 {
     return __HEAP;
 }
@@ -316,7 +316,7 @@ nil_t __attribute__((hot)) heap_free(nil_t *block)
 
         // check if buddy is lower address than block (means it is of higher order), if so, swap them
         block = (buddy > block) ? block : buddy;
-        node = block;
+        node = (node_t *)block;
     }
 }
 
@@ -451,11 +451,11 @@ memstat_t heap_memstat(nil_t)
     }
 
     // calculate free 16 blocks
-    node = __HEAP->freelist16;
+    node = (node_t *)__HEAP->freelist16;
     while (node)
     {
         __HEAP->memstat.free += 16;
-        node = *(nil_t **)node;
+        node = (node_t *)(*(nil_t **)node);
     }
 
     return __HEAP->memstat;

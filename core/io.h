@@ -26,15 +26,14 @@
 
 #include "rayforce.h"
 
-obj_t ray_hopen(obj_t x);
-obj_t ray_hclose(obj_t x);
-obj_t ray_read(obj_t x);
-obj_t ray_write(obj_t x, obj_t y);
-obj_t ray_csv(obj_t *x, i64_t n);
-obj_t ray_parse(obj_t x);
-obj_t ray_eval(obj_t x);
-obj_t ray_exec(obj_t x);
-obj_t ray_load(obj_t x);
-obj_t io_write(i64_t fd, u8_t msg_type, obj_t obj);
+obj_p ray_hopen(obj_p x);
+obj_p ray_hclose(obj_p x);
+obj_p ray_read(obj_p x);
+obj_p ray_write(obj_p x, obj_p y);
+obj_p ray_csv(obj_p *x, i64_t n);
+obj_p ray_parse(obj_p x);
+obj_p ray_eval(obj_p x);
+obj_p ray_load(obj_p x);
+obj_p io_write(i64_t fd, u8_t msg_type, obj_p obj);
 
 #endif // IO_H

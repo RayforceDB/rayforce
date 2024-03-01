@@ -53,10 +53,10 @@ nil_t sigint_handler(i32_t signo)
     write(__EVENT_FD[1], &val, sizeof(val));
 }
 
-poll_t poll_init(i64_t port)
+poll_p poll_init(i64_t port)
 {
     i64_t kq_fd = -1, listen_fd = -1;
-    poll_t poll;
+    poll_p poll;
     struct kevent ev;
 
     kq_fd = kqueue();
@@ -109,7 +109,7 @@ poll_t poll_init(i64_t port)
         }
     }
 
-    poll = (poll_t)heap_alloc(sizeof(struct poll_t));
+    poll = (poll_p)heap_alloc(sizeof(struct poll_t));
     poll->code = NULL_I64;
     poll->poll_fd = kq_fd;
     poll->ipc_fd = listen_fd;
@@ -121,7 +121,7 @@ poll_t poll_init(i64_t port)
     return poll;
 }
 
-nil_t poll_cleanup(poll_t poll)
+nil_t poll_cleanup(poll_p poll)
 {
     i64_t i, l;
 
@@ -136,8 +136,8 @@ nil_t poll_cleanup(poll_t poll)
             poll_deregister(poll, i + SELECTOR_ID_OFFSET);
     }
 
-    drop(poll->replfile);
-    drop(poll->ipcfile);
+    drop_obj(poll->replfile);
+    drop_obj(poll->ipcfile);
 
     freelist_free(poll->selectors);
     timers_free(poll->timers);
@@ -151,10 +151,10 @@ nil_t poll_cleanup(poll_t poll)
     fflush(stdout);
 }
 
-i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
+i64_t poll_register(poll_p poll, i64_t fd, u8_t version)
 {
     i64_t id;
-    selector_t selector;
+    selector_p selector;
     struct kevent ev;
 
     selector = heap_alloc(sizeof(struct selector_t));
@@ -162,7 +162,7 @@ i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
     selector->id = id;
     selector->version = version;
     selector->fd = fd;
-    selector->tx.isset = false;
+    selector->tx.isset = B8_FALSE;
     selector->rx.buf = NULL;
     selector->rx.size = 0;
     selector->rx.bytes_transfered = 0;
@@ -178,10 +178,10 @@ i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
     return id;
 }
 
-nil_t poll_deregister(poll_t poll, i64_t id)
+nil_t poll_deregister(poll_p poll, i64_t id)
 {
     i64_t idx;
-    selector_t selector;
+    selector_p selector;
     struct kevent ev[2];
 
     idx = freelist_pop(poll->selectors, id - SELECTOR_ID_OFFSET);
@@ -189,7 +189,7 @@ nil_t poll_deregister(poll_t poll, i64_t id)
     if (idx == NULL_I64)
         return;
 
-    selector = (selector_t)idx;
+    selector = (selector_p)idx;
 
     EV_SET(&ev[0], selector->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
     EV_SET(&ev[1], selector->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
@@ -203,7 +203,7 @@ nil_t poll_deregister(poll_t poll, i64_t id)
     heap_free(selector);
 }
 
-poll_result_t _recv(poll_t poll, selector_t selector)
+poll_result_t _recv(poll_p poll, selector_p selector)
 {
     unused(poll);
 
@@ -280,12 +280,12 @@ poll_result_t _recv(poll_t poll, selector_t selector)
     return POLL_DONE;
 }
 
-poll_result_t _send(poll_t poll, selector_t selector)
+poll_result_t _send(poll_p poll, selector_p selector)
 {
     unused(poll);
 
     i64_t size;
-    obj_t obj;
+    obj_p obj;
     nil_t *v;
     i8_t msg_type = MSG_TYPE_RESP;
     struct kevent ev;
@@ -302,7 +302,7 @@ send:
             // setup kqueue for EVFILT_WRITE only if it's not already set
             if (!selector->tx.isset)
             {
-                selector->tx.isset = true;
+                selector->tx.isset = B8_TRUE;
                 EV_SET(&ev, selector->fd, EVFILT_WRITE, EV_ADD, 0, 0, selector);
                 if (kevent(poll->poll_fd, &ev, 1, NULL, 0, NULL) == -1)
                     return POLL_ERROR;
@@ -323,11 +323,11 @@ send:
 
     if (v != NULL_OBJ)
     {
-        obj = (obj_t)((i64_t)v & ~(3ll << 61));
+        obj = (obj_p)((i64_t)v & ~(3ll << 61));
         msg_type = (((i64_t)v & (3ll << 61)) >> 61);
         size = ser_raw(&selector->tx.buf, obj);
         selector->tx.size = size;
-        drop(obj);
+        drop_obj(obj);
         if (size == -1)
             return POLL_ERROR;
 
@@ -338,7 +338,7 @@ send:
     // remove EVFILT_WRITE only if it's set
     if (selector->tx.isset)
     {
-        selector->tx.isset = false;
+        selector->tx.isset = B8_FALSE;
         EV_SET(&ev, selector->fd, EVFILT_WRITE, EV_DELETE, 0, 0, selector);
         if (kevent(poll->poll_fd, &ev, 1, NULL, 0, NULL) == -1)
             return POLL_ERROR;
@@ -347,9 +347,9 @@ send:
     return POLL_DONE;
 }
 
-obj_t read_obj(selector_t selector)
+obj_p read_obj(selector_p selector)
 {
-    obj_t res;
+    obj_p res;
 
     res = de_raw(selector->rx.buf, selector->rx.size);
     heap_free(selector->rx.buf);
@@ -360,10 +360,10 @@ obj_t read_obj(selector_t selector)
     return res;
 }
 
-nil_t process_request(poll_t poll, selector_t selector)
+nil_t process_request(poll_p poll, selector_p selector)
 {
     poll_result_t poll_result;
-    obj_t v, res;
+    obj_p v, res;
 
     res = read_obj(selector);
 
@@ -371,8 +371,8 @@ nil_t process_request(poll_t poll, selector_t selector)
         v = res;
     else if (res->type == TYPE_CHAR)
     {
-        v = eval_str(res, poll->ipcfile);
-        drop(res);
+        v = ray_eval_str(res, poll->ipcfile);
+        drop_obj(res);
     }
     else
         v = eval_obj(res);
@@ -387,16 +387,16 @@ nil_t process_request(poll_t poll, selector_t selector)
             poll_deregister(poll, selector->id);
     }
     else
-        drop(v);
+        drop_obj(v);
 }
 
-i64_t poll_run(poll_t poll)
+i64_t poll_run(poll_p poll)
 {
     i64_t kq_fd = poll->poll_fd, listen_fd = poll->ipc_fd,
           nfds, len, poll_result, sock, next_tm;
     i32_t n;
-    selector_t selector;
-    obj_t str, res;
+    selector_p selector;
+    obj_p str, res;
     struct kevent ev, events[MAX_EVENTS];
     struct timespec tm, *timeout = NULL;
 
@@ -419,11 +419,11 @@ i64_t poll_run(poll_t poll)
                 len = read(STDIN_FILENO, __STDIN_BUF, BUF_SIZE);
                 if (len > 1)
                 {
-                    str = string_from_str((str_t)__STDIN_BUF, len - 1);
-                    res = eval_str(str, poll->replfile);
-                    drop(str);
+                    str = string_from_str((str_p)__STDIN_BUF, len - 1);
+                    res = ray_eval_str(str, poll->replfile);
+                    drop_obj(str);
                     io_write(STDOUT_FILENO, MSG_TYPE_RESP, res);
-                    drop(res);
+                    drop_obj(res);
                 }
                 prompt();
             }
@@ -439,7 +439,7 @@ i64_t poll_run(poll_t poll)
             // tcp socket event
             else
             {
-                selector = (selector_t)ev.udata;
+                selector = (selector_p)ev.udata;
 
                 if ((ev.flags & EV_ERROR) || (ev.fflags & EV_EOF))
                 {
@@ -489,13 +489,13 @@ i64_t poll_run(poll_t poll)
     return poll->code;
 }
 
-obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
+obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg)
 {
     poll_result_t poll_result = POLL_PENDING;
-    selector_t selector;
+    selector_p selector;
     i32_t result;
     i64_t idx;
-    obj_t res;
+    obj_p res;
     fd_set fds;
 
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
@@ -503,11 +503,11 @@ obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
     if (idx == NULL_I64)
         throw(ERR_IO, "ipc_send_sync: invalid socket fd: %lld", id);
 
-    selector = (selector_t)idx;
+    selector = (selector_p)idx;
 
     queue_push(&selector->tx.queue, (nil_t *)((i64_t)msg | ((i64_t)MSG_TYPE_SYNC << 61)));
 
-    while (true)
+    while (B8_TRUE)
     {
         poll_result = _send(poll, selector);
 
@@ -536,7 +536,7 @@ obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
     }
 
 recv:
-    while (true)
+    while (B8_TRUE)
     {
         poll_result = _recv(poll, selector);
 
@@ -578,17 +578,17 @@ recv:
     return res;
 }
 
-obj_t ipc_send_async(poll_t poll, i64_t id, obj_t msg)
+obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg)
 {
     i64_t idx;
-    selector_t selector;
+    selector_p selector;
 
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
         throw(ERR_IO, "ipc_send_sync: invalid socket fd: %lld", id);
 
-    selector = (selector_t)idx;
+    selector = (selector_p)idx;
     if (selector == NULL)
         throw(ERR_IO, "ipc_send_async: invalid socket fd: %lld", id);
 

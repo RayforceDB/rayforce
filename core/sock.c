@@ -38,10 +38,10 @@
 #include "string.h"
 #include "util.h"
 
-i64_t sock_addr_from_str(str_t addr_str, sock_addr_t *addr)
+i64_t sock_addr_from_str(str_p addr_str, sock_addr_t *addr)
 {
     char_t temp_str[256]; // Temporary string for tokenization
-    str_t token;
+    str_p token;
 
     // Check for NULL pointers
     if (addr_str == NULL || addr == NULL)
@@ -70,7 +70,7 @@ i64_t sock_addr_from_str(str_t addr_str, sock_addr_t *addr)
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 
-i64_t sock_set_nonblocking(i64_t fd, bool_t flag)
+i64_t sock_set_nonblocking(i64_t fd, b8_t flag)
 {
     u_long mode = flag ? 1 : 0; // 1 to set non-blocking, 0 to set blocking
     if (ioctlsocket(fd, FIONBIO, &mode) != 0)
@@ -172,7 +172,7 @@ i64_t sock_close(i64_t fd)
 
 i64_t sock_recv(i64_t fd, u8_t *buf, i64_t size)
 {
-    i64_t sz = recv(fd, (str_t)buf, size, MSG_NOSIGNAL);
+    i64_t sz = recv(fd, (str_p)buf, size, MSG_NOSIGNAL);
 
     switch (sz)
     {
@@ -192,7 +192,7 @@ i64_t sock_recv(i64_t fd, u8_t *buf, i64_t size)
 
 i64_t sock_send(i64_t fd, u8_t *buf, i64_t size)
 {
-    i64_t sz = send(fd, (str_t)buf, size, MSG_NOSIGNAL);
+    i64_t sz = send(fd, (str_p)buf, size, MSG_NOSIGNAL);
 
     switch (sz)
     {
@@ -212,7 +212,7 @@ i64_t sock_send(i64_t fd, u8_t *buf, i64_t size)
 
 #else
 
-i64_t sock_set_nonblocking(i64_t fd, bool_t flag)
+i64_t sock_set_nonblocking(i64_t fd, b8_t flag)
 {
     i64_t flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1)
@@ -266,7 +266,7 @@ i64_t sock_accept(i64_t fd)
     acc_fd = accept(fd, (struct sockaddr *)&addr, &len);
     if (acc_fd == -1)
         return -1;
-    if (sock_set_nonblocking(acc_fd, true) == -1)
+    if (sock_set_nonblocking(acc_fd, B8_TRUE) == -1)
         return -1;
 
     linger_opt.l_onoff = 1;  // Enable SO_LINGER
@@ -308,7 +308,7 @@ i64_t sock_recv(i64_t fd, u8_t *buf, i64_t size)
     i64_t sz;
 
 recv:
-    sz = recv(fd, (str_t)buf, size, MSG_NOSIGNAL);
+    sz = recv(fd, (str_p)buf, size, MSG_NOSIGNAL);
 
     switch (sz)
     {
@@ -332,7 +332,7 @@ i64_t sock_send(i64_t fd, u8_t *buf, i64_t size)
 {
     i64_t sz;
 send:
-    sz = send(fd, (str_t)buf, size, MSG_NOSIGNAL);
+    sz = send(fd, (str_p)buf, size, MSG_NOSIGNAL);
     switch (sz)
     {
     case -1:

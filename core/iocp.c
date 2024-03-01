@@ -98,7 +98,7 @@ DWORD WINAPI StdinThread(LPVOID lpParam)
     DWORD bytesRead;
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
 
-    while (true)
+    while (B8_TRUE)
     {
         // Blocking read from stdin
         if (ReadFile(hStdin, __STDIN_BUF, BUF_SIZE, &bytesRead, NULL))
@@ -117,19 +117,19 @@ DWORD WINAPI StdinThread(LPVOID lpParam)
 
 nil_t exit_werror()
 {
-    obj_t err;
-    str_t fmt;
+    obj_p err;
+    str_p fmt;
 
     err = sys_error(ERROR_TYPE_SOCK, "poll_init");
     fmt = obj_fmt(err);
     printf("%s\n", fmt);
     heap_free(fmt);
-    drop(err);
+    drop_obj(err);
     fflush(stdout);
     exit(1);
 }
 
-i64_t poll_accept(poll_t poll)
+i64_t poll_accept(poll_p poll)
 {
     i32_t code;
     LPFN_ACCEPTEX lpfnAcceptEx = NULL;
@@ -155,10 +155,10 @@ i64_t poll_accept(poll_t poll)
         return -1;
     }
 
-    BOOL success = lpfnAcceptEx(poll->ipc_fd, sock_fd,
-                                __LISTENER->buf, 0,
-                                sizeof(SOCKADDR_IN) + 16, sizeof(SOCKADDR_IN) + 16,
-                                &__LISTENER->dwBytes, &__LISTENER->overlapped);
+    b8 success = lpfnAcceptEx(poll->ipc_fd, sock_fd,
+                              __LISTENER->buf, 0,
+                              sizeof(SOCKADDR_IN) + 16, sizeof(SOCKADDR_IN) + 16,
+                              &__LISTENER->dwBytes, &__LISTENER->overlapped);
     if (!success)
     {
         code = WSAGetLastError();
@@ -176,7 +176,7 @@ i64_t poll_accept(poll_t poll)
     return (i64_t)sock_fd;
 }
 
-poll_t poll_init(i64_t port)
+poll_p poll_init(i64_t port)
 {
     WSADATA wsaData;
     i64_t ipc_fd = -1, poll_fd = -1;
@@ -192,7 +192,7 @@ poll_t poll_init(i64_t port)
     // Create a thread to read from stdin
     CreateThread(NULL, 0, StdinThread, (HANDLE)poll_fd, 0, NULL);
 
-    poll_t poll = (poll_t)heap_alloc(sizeof(struct poll_t));
+    poll_p poll = (poll_p)heap_alloc(sizeof(struct poll_t));
 
     poll->poll_fd = poll_fd;
 
@@ -227,7 +227,7 @@ poll_t poll_init(i64_t port)
     return poll;
 }
 
-nil_t poll_cleanup(poll_t poll)
+nil_t poll_cleanup(poll_p poll)
 {
     i64_t i, l;
 
@@ -242,8 +242,8 @@ nil_t poll_cleanup(poll_t poll)
             poll_deregister(poll, i + SELECTOR_ID_OFFSET);
     }
 
-    drop(poll->replfile);
-    drop(poll->ipcfile);
+    drop_obj(poll->replfile);
+    drop_obj(poll->ipcfile);
 
     freelist_free(poll->selectors);
     timers_free(poll->timers);
@@ -257,17 +257,17 @@ nil_t poll_cleanup(poll_t poll)
     fflush(stdout);
 }
 
-nil_t poll_deregister(poll_t poll, i64_t id)
+nil_t poll_deregister(poll_p poll, i64_t id)
 {
     i64_t idx;
-    selector_t selector;
+    selector_p selector;
 
     idx = freelist_pop(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
         return;
 
-    selector = (selector_t)idx;
+    selector = (selector_p)idx;
 
     CloseHandle((HANDLE)selector->fd);
 
@@ -277,10 +277,10 @@ nil_t poll_deregister(poll_t poll, i64_t id)
     heap_free(selector);
 }
 
-i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
+i64_t poll_register(poll_p poll, i64_t fd, u8_t version)
 {
     i64_t id;
-    selector_t selector;
+    selector_p selector;
 
     selector = heap_alloc(sizeof(struct selector_t));
     id = freelist_push(poll->selectors, (i64_t)selector) + SELECTOR_ID_OFFSET;
@@ -288,22 +288,22 @@ i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
     selector->version = version;
     selector->fd = fd;
     selector->rx.flags = 0;
-    selector->rx.ignore = false;
-    selector->rx.header = false;
+    selector->rx.ignore = B8_FALSE;
+    selector->rx.header = B8_FALSE;
     selector->rx.buf = NULL;
     selector->rx.size = 0;
     selector->rx.wsa_buf.buf = NULL;
     selector->rx.wsa_buf.len = 0;
-    selector->rx.overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    selector->rx.overlapped.hEvent = CreateEvent(NULL, B8_TRUE, B8_FALSE, NULL);
     selector->rx.bytes_transfered = 0;
     selector->tx.flags = 0;
-    selector->tx.ignore = false;
+    selector->tx.ignore = B8_FALSE;
     selector->tx.buf = NULL;
     selector->tx.size = 0;
     selector->tx.wsa_buf.buf = NULL;
     selector->tx.wsa_buf.len = 0;
     selector->tx.bytes_transfered = 0;
-    selector->tx.overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    selector->tx.overlapped.hEvent = CreateEvent(NULL, B8_TRUE, B8_FALSE, NULL);
     selector->tx.queue = queue_new(TX_QUEUE_SIZE);
 
     CreateIoCompletionPort((HANDLE)fd, (HANDLE)poll->poll_fd, (ULONG_PTR)selector, 0);
@@ -314,7 +314,7 @@ i64_t poll_register(poll_t poll, i64_t fd, u8_t version)
     return id;
 }
 
-poll_result_t _recv(poll_t poll, selector_t selector)
+poll_result_t _recv(poll_p poll, selector_p selector)
 {
     unused(poll);
 
@@ -338,7 +338,7 @@ poll_result_t _recv(poll_t poll, selector_t selector)
                 size = selector->rx.size;
                 selector->rx.size *= 2;
                 selector->rx.buf = heap_realloc(selector->rx.buf, selector->rx.size);
-                selector->rx.wsa_buf.buf = (str_t)selector->rx.buf + size;
+                selector->rx.wsa_buf.buf = (str_p)selector->rx.buf + size;
                 selector->rx.wsa_buf.len = size;
             }
             else
@@ -357,7 +357,7 @@ poll_result_t _recv(poll_t poll, selector_t selector)
         if (selector->version == 0)
             return POLL_ERROR;
 
-        selector->rx.wsa_buf.buf = (str_t)selector->rx.buf;
+        selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
         selector->rx.wsa_buf.len = sizeof(struct header_t);
         selector->rx.bytes_transfered = 0;
 
@@ -378,7 +378,7 @@ poll_result_t _recv(poll_t poll, selector_t selector)
     {
         selector->rx.buf = heap_alloc(sizeof(struct header_t));
         selector->rx.size = sizeof(struct header_t);
-        selector->rx.wsa_buf.buf = (str_t)selector->rx.buf;
+        selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
         selector->rx.wsa_buf.len = selector->rx.size;
     }
 
@@ -400,11 +400,11 @@ poll_result_t _recv(poll_t poll, selector_t selector)
         if (header->size == 0)
             return POLL_ERROR;
 
-        selector->rx.header = true;
+        selector->rx.header = B8_TRUE;
         selector->rx.size = header->size + sizeof(struct header_t);
         selector->rx.msgtype = header->msgtype;
         selector->rx.buf = heap_realloc(selector->rx.buf, selector->rx.size);
-        selector->rx.wsa_buf.buf = (str_t)selector->rx.buf + sizeof(struct header_t);
+        selector->rx.wsa_buf.buf = (str_p)selector->rx.buf + sizeof(struct header_t);
         selector->rx.wsa_buf.len = selector->rx.size - sizeof(struct header_t);
         selector->rx.bytes_transfered = 0;
     }
@@ -421,16 +421,16 @@ poll_result_t _recv(poll_t poll, selector_t selector)
         _recv_op(poll, selector);
     }
 
-    selector->rx.header = false;
+    selector->rx.header = B8_FALSE;
 
     return POLL_DONE;
 }
 
-poll_result_t _recv_initiate(poll_t poll, selector_t selector)
+poll_result_t _recv_initiate(poll_p poll, selector_p selector)
 {
     selector->rx.buf = heap_alloc(sizeof(struct header_t));
     selector->rx.size = sizeof(struct header_t);
-    selector->rx.wsa_buf.buf = (str_t)selector->rx.buf;
+    selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
     selector->rx.wsa_buf.len = selector->rx.size;
 
     _recv_op(poll, selector);
@@ -438,11 +438,11 @@ poll_result_t _recv_initiate(poll_t poll, selector_t selector)
     return _recv(poll, selector);
 }
 
-poll_result_t _send(poll_t poll, selector_t selector)
+poll_result_t _send(poll_p poll, selector_p selector)
 {
     unused(poll);
 
-    obj_t obj;
+    obj_p obj;
     nil_t *v;
     u8_t msg_type;
     i64_t size;
@@ -468,14 +468,14 @@ send:
 
     if (v != NULL_OBJ)
     {
-        obj = (obj_t)((i64_t)v & ~(3ll << 61));
+        obj = (obj_p)((i64_t)v & ~(3ll << 61));
         msg_type = (((i64_t)v & (3ll << 61)) >> 61);
         size = ser_raw(&selector->tx.buf, obj);
-        drop(obj);
+        drop_obj(obj);
         if (size == -1)
             return POLL_ERROR;
         selector->tx.size = size;
-        selector->tx.wsa_buf.buf = (str_t)selector->tx.buf;
+        selector->tx.wsa_buf.buf = (str_p)selector->tx.buf;
         selector->tx.wsa_buf.len = selector->tx.size;
         selector->tx.bytes_transfered = 0;
         ((header_t *)selector->tx.buf)->msgtype = msg_type;
@@ -485,9 +485,9 @@ send:
     return POLL_DONE;
 }
 
-obj_t read_obj(selector_t selector)
+obj_p read_obj(selector_p selector)
 {
-    obj_t res;
+    obj_p res;
 
     res = de_raw(selector->rx.buf, selector->rx.size);
     heap_free(selector->rx.buf);
@@ -500,9 +500,9 @@ obj_t read_obj(selector_t selector)
     return res;
 }
 
-nil_t process_request(poll_t poll, selector_t selector)
+nil_t process_request(poll_p poll, selector_p selector)
 {
-    obj_t v, res;
+    obj_p v, res;
     poll_result_t poll_result;
 
     res = read_obj(selector);
@@ -511,8 +511,8 @@ nil_t process_request(poll_t poll, selector_t selector)
         v = res;
     if (res->type == TYPE_CHAR)
     {
-        v = eval_str(poll->ipcfile, res);
-        drop(res);
+        v = ray_eval_str(poll->ipcfile, res);
+        drop_obj(res);
     }
     else
         v = eval_obj(res);
@@ -527,21 +527,21 @@ nil_t process_request(poll_t poll, selector_t selector)
             poll_deregister(poll, selector->id);
     }
     else
-        drop(v);
+        drop_obj(v);
 }
 
-i64_t poll_run(poll_t poll)
+i64_t poll_run(poll_p poll)
 {
     DWORD i, num = 5, size;
     OVERLAPPED *overlapped;
     HANDLE hPollFd = (HANDLE)poll->poll_fd;
     SOCKET hAccepted;
     OVERLAPPED_ENTRY events[MAX_EVENTS];
-    BOOL success;
+    b8 success;
     i64_t key, poll_result, idx;
-    obj_t str, res;
-    str_t fmt;
-    selector_t selector;
+    obj_p str, res;
+    str_p fmt;
+    selector_p selector;
 
     prompt();
 
@@ -553,7 +553,7 @@ i64_t poll_run(poll_t poll)
             MAX_IOCP_RESULTS,
             &num,
             INFINITE,
-            TRUE // set this to TRUE if you want to return on alertable wait
+            B8_TRUE // set this to B8_TRUE if you want to return on alertable wait
         );
         // Handle IOCP events
         if (success)
@@ -573,10 +573,10 @@ i64_t poll_run(poll_t poll)
                         break;
                     }
                     str = string_from_str(__STDIN_BUF, size);
-                    res = eval_str(str, poll->replfile);
-                    drop(str);
+                    res = ray_eval_str(str, poll->replfile);
+                    drop_obj(str);
                     io_write(STDOUT_FILENO, MSG_TYPE_RESP, res);
-                    drop(res);
+                    drop_obj(res);
                     prompt();
                     break;
 
@@ -589,7 +589,7 @@ i64_t poll_run(poll_t poll)
                         if (hAccepted != INVALID_SOCKET)
                         {
                             idx = poll_register(poll, hAccepted, 0);
-                            selector = (selector_t)freelist_get(poll->selectors, idx - SELECTOR_ID_OFFSET);
+                            selector = (selector_p)freelist_get(poll->selectors, idx - SELECTOR_ID_OFFSET);
                             poll_result = _recv_initiate(poll, selector);
 
                             if (poll_result == POLL_ERROR)
@@ -600,7 +600,7 @@ i64_t poll_run(poll_t poll)
                     }
                     else
                     {
-                        selector = (selector_t)key;
+                        selector = (selector_p)key;
 
                         // Connection closed
                         if (size == 0)
@@ -614,7 +614,7 @@ i64_t poll_run(poll_t poll)
                         {
                             if (selector->rx.ignore)
                             {
-                                selector->rx.ignore = false;
+                                selector->rx.ignore = B8_FALSE;
                                 selector->rx.bytes_transfered = 0;
                             }
                             else
@@ -641,7 +641,7 @@ i64_t poll_run(poll_t poll)
                         {
                             if (selector->tx.ignore)
                             {
-                                selector->tx.ignore = false;
+                                selector->tx.ignore = B8_FALSE;
                                 selector->tx.bytes_transfered = 0;
                             }
                             else
@@ -664,19 +664,19 @@ i64_t poll_run(poll_t poll)
             fmt = obj_fmt(res);
             printf("%s\n", fmt);
             heap_free(fmt);
-            drop(res);
+            drop_obj(res);
         }
     }
 
     return 0;
 }
 
-obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
+obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg)
 {
     poll_result_t poll_result = POLL_PENDING;
-    selector_t selector;
+    selector_p selector;
     i64_t idx;
-    obj_t res;
+    obj_p res;
     DWORD dwResult;
 
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
@@ -684,12 +684,12 @@ obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
     if (idx == NULL_I64)
         throw(ERR_IO, "ipc_send_sync: invalid socket fd: %lld", id);
 
-    selector = (selector_t)idx;
+    selector = (selector_p)idx;
 
     queue_push(&selector->tx.queue, (nil_t *)((i64_t)msg | ((i64_t)MSG_TYPE_SYNC << 61)));
 
     // set ignore flag to tx
-    selector->tx.ignore = true;
+    selector->tx.ignore = B8_TRUE;
 
     while (poll_result == POLL_PENDING)
     {
@@ -703,7 +703,7 @@ obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
         if (dwResult == WAIT_FAILED)
             throw(ERR_IO, "ipc_send_sync: error waiting for event");
 
-        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->tx.overlapped, &selector->tx.bytes_transfered, FALSE))
+        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->tx.overlapped, &selector->tx.bytes_transfered, B8_FALSE))
             throw(ERR_IO, "ipc_send_sync: error getting result");
     }
 
@@ -716,13 +716,13 @@ obj_t ipc_send_sync(poll_t poll, i64_t id, obj_t msg)
     poll_result = POLL_PENDING;
 
     // set ignore flag to rx
-    selector->rx.ignore = true;
+    selector->rx.ignore = B8_TRUE;
 
     if (selector->rx.buf == NULL)
     {
         selector->rx.buf = heap_alloc(sizeof(struct header_t));
         selector->rx.size = sizeof(struct header_t);
-        selector->rx.wsa_buf.buf = (str_t)selector->rx.buf;
+        selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
         selector->rx.wsa_buf.len = selector->rx.size;
         poll_result = _recv(poll, selector);
     }
@@ -735,7 +735,7 @@ recv:
         if (dwResult == WAIT_FAILED)
             throw(ERR_IO, "ipc_send_sync: error waiting for event");
 
-        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->rx.overlapped, &selector->rx.bytes_transfered, FALSE))
+        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->rx.overlapped, &selector->rx.bytes_transfered, B8_FALSE))
             throw(ERR_IO, "ipc_send_sync: error getting result");
 
         poll_result = _recv(poll, selector);
@@ -762,17 +762,17 @@ recv:
     return res;
 }
 
-obj_t ipc_send_async(poll_t poll, i64_t id, obj_t msg)
+obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg)
 {
     i64_t idx;
-    selector_t selector;
+    selector_p selector;
 
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
         throw(ERR_IO, "ipc_send_sync: invalid socket fd: %lld", id);
 
-    selector = (selector_t)idx;
+    selector = (selector_p)idx;
     if (selector == NULL)
         throw(ERR_IO, "ipc_send_async: invalid socket fd: %lld", id);
 
