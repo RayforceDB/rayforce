@@ -5,6 +5,9 @@ rayforce
 *.a
 *.gch
 rayforce.S
+rayforce.js
+rayforce.py
+rayforce_wrap.*
 gmon.out
 nodejs/build/
 python/__pycache__/
