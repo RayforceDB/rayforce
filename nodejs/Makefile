@@ -1,13 +1,9 @@
 TARGET = rayforce
 
 default:
-	cd ../ && make dll
-	swig -c++ -javascript -node -o rayforce.c rayforce.i
-	node-gyp configure
-	node-gyp build
-
-node:
+	cd ../ && make CC="gcc" dll
 	swig -c++ -javascript -node rayforce.i
+	g++ -std=c++17 -fPIC -o rayforce.node -shared rayforce_wrap.cxx -I/usr/include/node/ -I$(node -p "require('node-addon-api').include") -L$(node -p "process.execPath") -I../core/ -lnode
 
 clean:
 	rm -rf build

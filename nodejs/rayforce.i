@@ -1,4 +1,5 @@
 %module rayforce
+
 %{
 #include "rayforce.h"
 %}
