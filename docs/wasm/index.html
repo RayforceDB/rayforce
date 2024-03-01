@@ -9,7 +9,7 @@
     html {
       height: 100%;
       margin: 0;
-      font-family: monospace;
+
       background-color: black;
       color: gray;
       display: flex;
@@ -40,11 +40,15 @@
     }
 
     #output {
+      font-family: monospace;
+      overflow-y: auto;
+      flex-grow: 1;
       white-space: pre-wrap;
     }
 
     .input-line {
       display: flex;
+      flex-shrink: 0;
       align-items: center;
     }
 
@@ -53,6 +57,7 @@
     }
 
     #input {
+      font-family: monospace;
       border: none;
       background-color: black;
       color: gray;
@@ -130,11 +135,10 @@
     };
 
     function handleInput(input) {
-      const obj = Module.ccall('parseval', 'number', ['string'], [input]);
-      const fmt = Module.ccall('obj_fmt', 'string', ['number'], [obj]);
+      const obj = Module.ccall('eval_str', 'number', ['string'], [input]);
+      const fmt = Module.ccall('strof_obj', 'string', ['number'], [obj]);
       sendOutput(fmt);
-      Module.ccall('drop', 'null', ['number'], [obj]);
-      // Module.ccall('disp', 'null', ['string'], [fmt]);
+      Module.ccall('drop_obj', 'null', ['number'], [obj]);
       document.getElementById('input').focus(); // Refocus on the input field
     }
 
