@@ -43,7 +43,7 @@ obj_p ray_hopen(obj_p x)
     obj_p err;
     u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
 
-    if (x->type != TYPE_CHAR)
+    if (x->type != TYPE_C8)
         throw(ERR_TYPE, "hopen: expected char");
 
     if (sock_addr_from_str(as_string(x), &addr) == -1)
@@ -87,7 +87,7 @@ obj_p ray_read(obj_p x)
 
     switch (x->type)
     {
-    case TYPE_CHAR:
+    case TYPE_C8:
         fd = fs_fopen(as_string(x), ATTR_RDONLY);
 
         // error handling if file does not exist
@@ -124,7 +124,7 @@ obj_p io_write(i64_t fd, u8_t msg_type, obj_p obj)
     switch (fd)
     {
     case 0:
-        if (obj->type == TYPE_CHAR)
+        if (obj->type == TYPE_C8)
             return ray_eval_str(obj, NULL);
         else
             return eval_obj(obj);
@@ -232,7 +232,7 @@ obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out)
             n--;
         as_symbol(out)[row] = intern_symbol(start, n);
         break;
-    case TYPE_CHAR:
+    case TYPE_C8:
         n = end - start;
         if ((n > 0) && (*(end - 1) == '\r'))
             n--;
@@ -245,7 +245,7 @@ obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out)
     return NULL_OBJ;
 }
 
-obj_p parse_csv_line(i8_t types[], i64_t cnt, str_p start, str_p end, i64_t row, obj_p cols, char_t sep)
+obj_p parse_csv_line(i8_t types[], i64_t cnt, str_p start, str_p end, i64_t row, obj_p cols, c8_t sep)
 {
     i64_t i, len;
     str_p prev, pos;
@@ -319,7 +319,7 @@ obj_p ray_csv(obj_p *x, i64_t n)
     str_p buf, prev, pos, line;
     obj_p types, names, cols, res;
     i8_t type;
-    char_t sep = ',';
+    c8_t sep = ',';
 
     switch (n)
     {
@@ -327,7 +327,7 @@ obj_p ray_csv(obj_p *x, i64_t n)
     case 3:
         if (n == 3)
         {
-            if (x[2]->type != -TYPE_CHAR)
+            if (x[2]->type != -TYPE_C8)
                 throw(ERR_TYPE, "csv: expected 'char' as 3rd argument, got: '%s", type_name(x[2]->type));
 
             sep = x[2]->u8;
@@ -337,7 +337,7 @@ obj_p ray_csv(obj_p *x, i64_t n)
             throw(ERR_TYPE, "csv: expected vector of types as 1st argument, got: '%s", type_name(x[0]->type));
 
         // expect string as 2nd arg:
-        if (x[1]->type != TYPE_CHAR)
+        if (x[1]->type != TYPE_C8)
             throw(ERR_TYPE, "csv: expected string as 2nd argument, got: '%s", type_name(x[1]->type));
 
         // check that all symbols are valid typenames and convert them to types
@@ -455,7 +455,7 @@ obj_p ray_csv(obj_p *x, i64_t n)
         cols = list(l);
         for (i = 0; i < l; i++)
         {
-            if (as_string(types)[i] == TYPE_CHAR)
+            if (as_string(types)[i] == TYPE_C8)
                 as_list(cols)[i] = vector(TYPE_LIST, lines);
             else
                 as_list(cols)[i] = vector(as_string(types)[i], lines);
@@ -509,7 +509,7 @@ obj_p ray_csv(obj_p *x, i64_t n)
 
 obj_p ray_parse(obj_p x)
 {
-    if (!x || x->type != TYPE_CHAR)
+    if (!x || x->type != TYPE_C8)
         throw(ERR_TYPE, "parse: expected string");
 
     return ray_parse_str(0, x, NULL);
@@ -517,7 +517,7 @@ obj_p ray_parse(obj_p x)
 
 obj_p ray_eval(obj_p x)
 {
-    if (!x || x->type != TYPE_CHAR)
+    if (!x || x->type != TYPE_C8)
         throw(ERR_TYPE, "eval: expected string");
 
     return ray_eval_str(x, NULL_OBJ);
@@ -527,7 +527,7 @@ obj_p ray_load(obj_p x)
 {
     obj_p file, res;
 
-    if (!x || x->type != TYPE_CHAR)
+    if (!x || x->type != TYPE_C8)
         throw(ERR_TYPE, "load: expected string");
 
     file = ray_read(x);

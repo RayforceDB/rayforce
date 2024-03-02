@@ -517,7 +517,7 @@ obj_p ray_raise(obj_p obj)
 {
     obj_p e;
 
-    if (obj->type != TYPE_CHAR)
+    if (obj->type != TYPE_C8)
         throw(ERR_TYPE, "raise: expected 'string, got '%s", type_name(obj->type));
 
     e = error_obj(ERR_RAISE, clone_obj(obj));
@@ -538,7 +538,7 @@ obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file)
     unused(fd);
     obj_p info, res;
 
-    if (str->type != TYPE_CHAR)
+    if (str->type != TYPE_C8)
         throw(ERR_TYPE, "parse: expected string, got %s", type_name(str->type));
 
     info = nfo(clone_obj(file), clone_obj(str));
@@ -573,7 +573,7 @@ obj_p ray_eval_str(obj_p str, obj_p file)
     ctx_t *ctx;
     i64_t sp;
 
-    if (str->type != TYPE_CHAR)
+    if (str->type != TYPE_C8)
         throw(ERR_TYPE, "eval: expected string, got %s", type_name(str->type));
 
     info = nfo(clone_obj(file), clone_obj(str));

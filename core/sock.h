@@ -28,7 +28,7 @@
 
 typedef struct sock_addr_t
 {
-    char_t ip[16]; // For IPv4 addresses
+    c8_t ip[16]; // For IPv4 addresses
     i64_t port;
 } sock_addr_t;
 

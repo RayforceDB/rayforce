@@ -209,7 +209,7 @@ i64_t byte_fmt_into(str_p *dst, i64_t *len, i64_t *offset, i64_t limit, u8_t val
     return str_fmt_into(dst, len, offset, limit, "0x%02x", val);
 }
 
-i64_t char_fmt_into(str_p *dst, i64_t *len, i64_t *offset, i64_t limit, b8_t full, char_t val)
+i64_t char_fmt_into(str_p *dst, i64_t *len, i64_t *offset, i64_t limit, b8_t full, c8_t val)
 {
     switch (val)
     {
@@ -489,7 +489,7 @@ i64_t raw_fmt_into(str_p *dst, i64_t *len, i64_t *offset, i64_t indent, i64_t li
         return ts_fmt_into(dst, len, offset, limit, as_timestamp(obj)[i]);
     case TYPE_GUID:
         return guid_fmt_into(dst, len, offset, limit, &as_guid(obj)[i]);
-    case TYPE_CHAR:
+    case TYPE_C8:
         return char_fmt_into(dst, len, offset, limit, B8_TRUE, as_string(obj)[i]);
     case TYPE_LIST:
         return obj_fmt_into(dst, len, offset, indent, limit, B8_FALSE, as_list(obj)[i]);
@@ -884,8 +884,8 @@ i64_t obj_fmt_into(str_p *dst, i64_t *len, i64_t *offset, i64_t indent, i64_t li
         return ts_fmt_into(dst, len, offset, limit, obj->i64);
     case -TYPE_GUID:
         return guid_fmt_into(dst, len, offset, limit, as_guid(obj));
-    case -TYPE_CHAR:
-        return str_fmt_into(dst, len, offset, limit, "'%c'", obj->vchar ? obj->vchar : 1);
+    case -TYPE_C8:
+        return str_fmt_into(dst, len, offset, limit, "'%c'", obj->c8 ? obj->c8 : 1);
     case TYPE_B8:
         return vector_fmt_into(dst, len, offset, limit, obj);
     case TYPE_U8:
@@ -900,7 +900,7 @@ i64_t obj_fmt_into(str_p *dst, i64_t *len, i64_t *offset, i64_t indent, i64_t li
         return vector_fmt_into(dst, len, offset, limit, obj);
     case TYPE_GUID:
         return vector_fmt_into(dst, len, offset, limit, obj);
-    case TYPE_CHAR:
+    case TYPE_C8:
         return string_fmt_into(dst, len, offset, limit, obj);
     case TYPE_LIST:
         return list_fmt_into(dst, len, offset, indent, limit, full, obj);
@@ -982,7 +982,7 @@ str_p obj_fmt_n(obj_p *x, u64_t n)
     if (n == 1)
         return obj_fmt(*b);
 
-    if ((*b)->type != TYPE_CHAR)
+    if ((*b)->type != TYPE_C8)
         return NULL;
 
     p = as_string(*b);

@@ -86,7 +86,7 @@ obj_p ray_reverse(obj_p x)
 
     switch (x->type)
     {
-    case TYPE_CHAR:
+    case TYPE_C8:
     case TYPE_U8:
     case TYPE_B8:
         l = x->len;
@@ -177,7 +177,7 @@ obj_p ray_table(obj_p x, obj_p y)
         case -TYPE_U8:
         case -TYPE_I64:
         case -TYPE_F64:
-        case -TYPE_CHAR:
+        case -TYPE_C8:
         case -TYPE_SYMBOL:
         case -TYPE_TIMESTAMP:
         case TYPE_LAMBDA:
@@ -190,7 +190,7 @@ obj_p ray_table(obj_p x, obj_p y)
         case TYPE_I64:
         case TYPE_F64:
         case TYPE_TIMESTAMP:
-        case TYPE_CHAR:
+        case TYPE_C8:
         case TYPE_SYMBOL:
         case TYPE_LIST:
         case TYPE_GUID:
@@ -234,7 +234,7 @@ obj_p ray_table(obj_p x, obj_p y)
         case -TYPE_U8:
         case -TYPE_I64:
         case -TYPE_F64:
-        case -TYPE_CHAR:
+        case -TYPE_C8:
         case -TYPE_SYMBOL:
             c = i64(cl);
             as_list(lst)[i] = ray_take(c, as_list(y)[i]);
@@ -393,10 +393,10 @@ obj_p ray_concat(obj_p x, obj_p y)
         memcpy(&as_guid(vec)[1], as_guid(y), sizeof(guid_t));
         return vec;
 
-    case mtype2(-TYPE_CHAR, -TYPE_CHAR):
+    case mtype2(-TYPE_C8, -TYPE_C8):
         vec = string(2);
-        as_string(vec)[0] = x->vchar;
-        as_string(vec)[1] = y->vchar;
+        as_string(vec)[0] = x->c8;
+        as_string(vec)[1] = y->c8;
         return vec;
 
     case mtype2(TYPE_B8, -TYPE_B8):
@@ -499,7 +499,7 @@ obj_p ray_concat(obj_p x, obj_p y)
             memcpy(as_guid(vec)[i + xl].buf, as_guid(y)[i].buf, sizeof(guid_t));
         return vec;
 
-    case mtype2(TYPE_CHAR, TYPE_CHAR):
+    case mtype2(TYPE_C8, TYPE_C8):
         xl = ops_count(x);
         yl = ops_count(y);
         vec = string(xl + yl);
@@ -555,9 +555,9 @@ obj_p ray_distinct(obj_p x)
     {
     case TYPE_B8:
     case TYPE_U8:
-    case TYPE_CHAR:
+    case TYPE_C8:
         l = ops_count(x);
-        res = index_distinct_i8((i8_t *)as_u8(x), l, x->type == TYPE_CHAR);
+        res = index_distinct_i8((i8_t *)as_u8(x), l, x->type == TYPE_C8);
         res->type = x->type;
         return res;
     case TYPE_I64:
@@ -594,7 +594,7 @@ obj_p ray_group(obj_p x)
     {
     case TYPE_U8:
     case TYPE_B8:
-    case TYPE_CHAR:
+    case TYPE_C8:
         g = index_group_i8((i8_t *)as_u8(x), NULL, ops_count(x));
         l = as_list(g)[0]->i64;
         k = vector_u8(l);

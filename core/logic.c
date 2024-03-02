@@ -82,15 +82,15 @@ obj_p ray_like(obj_p x, obj_p y)
 
     switch (mtype2(x->type, y->type))
     {
-    case mtype2(TYPE_CHAR, TYPE_CHAR):
+    case mtype2(TYPE_C8, TYPE_C8):
         return (b8(str_match(as_string(x), as_string(y))));
-    case mtype2(TYPE_LIST, TYPE_CHAR):
+    case mtype2(TYPE_LIST, TYPE_C8):
         l = x->len;
         res = vector_b8(l);
         for (i = 0; i < l; i++)
         {
             e = as_list(x)[i];
-            if (!e || e->type != TYPE_CHAR)
+            if (!e || e->type != TYPE_C8)
             {
                 res->len = i;
                 drop_obj(res);
@@ -102,13 +102,13 @@ obj_p ray_like(obj_p x, obj_p y)
 
         return res;
 
-    case mtype2(TYPE_ANYMAP, TYPE_CHAR):
+    case mtype2(TYPE_ANYMAP, TYPE_C8):
         l = x->len;
         res = vector_b8(l);
         for (i = 0; i < l; i++)
         {
             e = at_idx(x, i);
-            if (!e || e->type != TYPE_CHAR)
+            if (!e || e->type != TYPE_C8)
             {
                 res->len = i;
                 drop_obj(res);

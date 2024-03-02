@@ -40,7 +40,7 @@
 
 i64_t sock_addr_from_str(str_p addr_str, sock_addr_t *addr)
 {
-    char_t temp_str[256]; // Temporary string for tokenization
+    c8_t temp_str[256]; // Temporary string for tokenization
     str_p token;
 
     // Check for NULL pointers
@@ -129,7 +129,7 @@ i64_t sock_listen(i64_t port)
 {
     struct sockaddr_in addr;
     SOCKET fd;
-    char_t opt = 1;
+    c8_t opt = 1;
     i32_t code;
 
     fd = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);

@@ -740,7 +740,7 @@ nil_t hash_index_list(obj_p obj, u64_t out[], u64_t len, u64_t seed)
     {
     case -TYPE_B8:
     case -TYPE_U8:
-    case -TYPE_CHAR:
+    case -TYPE_C8:
         if (seed != 0)
             out[0] = hash_index_u64((u64_t)obj->u8, seed);
         else
@@ -766,7 +766,7 @@ nil_t hash_index_list(obj_p obj, u64_t out[], u64_t len, u64_t seed)
         break;
     case TYPE_B8:
     case TYPE_U8:
-    case TYPE_CHAR:
+    case TYPE_C8:
         u8v = as_u8(obj);
         if (seed != 0)
             for (i = 0; i < len; i++)

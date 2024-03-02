@@ -32,7 +32,7 @@
 
 typedef struct sys_info_t
 {
-    char_t cpu[256];
+    c8_t cpu[256];
     i32_t mem;
 } sys_info_t;
 

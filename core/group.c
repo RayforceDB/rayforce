@@ -54,7 +54,7 @@ obj_p group_bins(obj_p x, obj_p y, obj_p z)
     {
     case TYPE_B8:
     case TYPE_U8:
-    case TYPE_CHAR:
+    case TYPE_C8:
         return index_group_i8((i8_t *)as_u8(x), ids, l);
     case TYPE_I64:
     case TYPE_SYMBOL:

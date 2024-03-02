@@ -113,10 +113,10 @@ obj_p ray_loadfn(obj_p *args, u64_t n)
     if (!args[0] || !args[1] || !args[2])
         throw(ERR_TYPE, "Null is not a valid argument");
 
-    if (args[0]->type != TYPE_CHAR)
+    if (args[0]->type != TYPE_C8)
         throw(ERR_TYPE, "Expected 'string path, got %s", type_name(args[0]->type));
 
-    if (args[1]->type != TYPE_CHAR)
+    if (args[1]->type != TYPE_C8)
         throw(ERR_TYPE, "Expected 'string fname, got %s", type_name(args[1]->type));
 
     if (args[2]->type != -TYPE_I64)

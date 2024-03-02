@@ -58,7 +58,7 @@ typedef struct listener_t
     SOCKET hAccepted;
 } *listener_t;
 
-char_t __STDIN_BUF[BUF_SIZE + 1];
+c8_t __STDIN_BUF[BUF_SIZE + 1];
 __thread listener_t __LISTENER;
 
 #define _recv_op(poll, selector)                                                                      \
@@ -511,7 +511,7 @@ nil_t process_request(poll_p poll, selector_p selector)
 
     if (is_error(res) || is_null(res))
         v = res;
-    if (res->type == TYPE_CHAR)
+    if (res->type == TYPE_C8)
     {
         v = ray_eval_str(poll->ipcfile, res);
         drop_obj(res);

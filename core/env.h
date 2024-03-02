@@ -28,7 +28,7 @@
 #include "heap.h"
 
 // offset in array of typenames for each type
-#define TYPE_OFFSET TYPE_CHAR
+#define TYPE_OFFSET TYPE_C8
 #define MAX_TYPE (TYPE_ERROR + TYPE_OFFSET + 2)
 
 // reserved symbols (keywords)

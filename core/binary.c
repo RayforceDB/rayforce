@@ -394,7 +394,7 @@ obj_p __ray_set(obj_p x, obj_p y)
 
         return clone_obj(y);
 
-    case TYPE_CHAR:
+    case TYPE_C8:
         switch (y->type)
         {
         case TYPE_SYMBOL:
@@ -499,7 +499,7 @@ obj_p __ray_set(obj_p x, obj_p y)
                 }
 
                 p = at_idx(as_list(y)[0], i);
-                s = cast_obj(TYPE_CHAR, p);
+                s = cast_obj(TYPE_C8, p);
                 col = ray_concat(x, s);
                 res = __ray_set(col, v);
 

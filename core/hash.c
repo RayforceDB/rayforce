@@ -200,7 +200,7 @@ u64_t hash_index_obj(obj_p obj)
         return (u64_t)obj->f64;
     case -TYPE_GUID:
         return hash_index_u64(*(u64_t *)as_guid(obj), *((u64_t *)as_guid(obj) + 1));
-    case TYPE_CHAR:
+    case TYPE_C8:
         str = as_string(obj);
         hash = 5381;
         while ((c = *str++))

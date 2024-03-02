@@ -49,8 +49,8 @@ u64_t size_of_type(i8_t type)
         return sizeof(f64_t);
     case TYPE_GUID:
         return sizeof(guid_t);
-    case TYPE_CHAR:
-        return sizeof(char_t);
+    case TYPE_C8:
+        return sizeof(c8_t);
     case TYPE_LIST:
     case TYPE_NULL:
         return sizeof(obj_p);
@@ -107,8 +107,8 @@ u64_t size_obj(obj_p obj)
         return sizeof(i8_t) + sizeof(f64_t);
     case -TYPE_SYMBOL:
         return sizeof(i8_t) + strlen(strof_sym(obj->i64)) + 1;
-    case -TYPE_CHAR:
-        return sizeof(i8_t) + sizeof(char_t);
+    case -TYPE_C8:
+        return sizeof(i8_t) + sizeof(c8_t);
     case -TYPE_GUID:
         return sizeof(i8_t) + sizeof(guid_t);
     case TYPE_GUID:
@@ -122,8 +122,8 @@ u64_t size_obj(obj_p obj)
         return sizeof(i8_t) + sizeof(u64_t) + obj->len * sizeof(i64_t);
     case TYPE_F64:
         return sizeof(i8_t) + sizeof(u64_t) + obj->len * sizeof(f64_t);
-    case TYPE_CHAR:
-        return sizeof(i8_t) + sizeof(u64_t) + obj->len * sizeof(char_t);
+    case TYPE_C8:
+        return sizeof(i8_t) + sizeof(u64_t) + obj->len * sizeof(c8_t);
     case TYPE_SYMBOL:
         l = obj->len;
         size = sizeof(i8_t) + sizeof(u64_t);
@@ -185,9 +185,9 @@ u64_t save_obj(u8_t *buf, u64_t len, obj_p obj)
         s = strof_sym(obj->i64);
         return sizeof(i8_t) + str_cpy((str_p)buf, s) + 1;
 
-    case -TYPE_CHAR:
-        buf[0] = obj->vchar;
-        return sizeof(i8_t) + sizeof(char_t);
+    case -TYPE_C8:
+        buf[0] = obj->c8;
+        return sizeof(i8_t) + sizeof(c8_t);
     case -TYPE_GUID:
         memcpy(buf, as_string(obj), sizeof(guid_t));
         return sizeof(i8_t) + sizeof(guid_t);
@@ -210,13 +210,13 @@ u64_t save_obj(u8_t *buf, u64_t len, obj_p obj)
 
         return sizeof(i8_t) + sizeof(u64_t) + l * sizeof(u8_t);
 
-    case TYPE_CHAR:
+    case TYPE_C8:
         l = ops_count(obj);
         memcpy(buf, &l, sizeof(u64_t));
         buf += sizeof(u64_t);
         memcpy(buf, as_string(obj), l);
 
-        return sizeof(i8_t) + sizeof(u64_t) + l * sizeof(char_t);
+        return sizeof(i8_t) + sizeof(u64_t) + l * sizeof(c8_t);
 
     case TYPE_I64:
     case TYPE_TIMESTAMP:
@@ -394,8 +394,8 @@ obj_p load_obj(u8_t **buf, u64_t len)
         *buf += l + 1;
         return obj;
 
-    case -TYPE_CHAR:
-        obj = vchar((*buf)[0]);
+    case -TYPE_C8:
+        obj = c8((*buf)[0]);
         (*buf)++;
         return obj;
 
@@ -420,12 +420,12 @@ obj_p load_obj(u8_t **buf, u64_t len)
         *buf += l * sizeof(u8_t);
         return obj;
 
-    case TYPE_CHAR:
+    case TYPE_C8:
         memcpy(&l, *buf, sizeof(u64_t));
         *buf += sizeof(u64_t);
         obj = string(l);
-        memcpy(as_string(obj), *buf, l * sizeof(char_t));
-        *buf += l * sizeof(char_t);
+        memcpy(as_string(obj), *buf, l * sizeof(c8_t));
+        *buf += l * sizeof(c8_t);
         return obj;
 
     case TYPE_I64:

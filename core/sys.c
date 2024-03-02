@@ -71,7 +71,7 @@ sys_info_t sys_hw_info(nil_t)
 
 #elif defined(__linux__)
     FILE *cpuFile = fopen("/proc/cpuinfo", "r");
-    char_t line[256];
+    c8_t line[256];
 
     while (fgets(line, sizeof(line), cpuFile))
     {

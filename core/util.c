@@ -55,7 +55,7 @@ u64_t next_power_of_two_u64(u64_t n)
 b8_t is_valid(obj_p obj)
 {
     // clang-format off
-    return (obj->type >= -TYPE_CHAR       && obj->type <= TYPE_CHAR)
+    return (obj->type >= -TYPE_C8       && obj->type <= TYPE_C8)
            || obj->type == TYPE_TABLE     || obj->type == TYPE_DICT   
            || obj->type == TYPE_LAMBDA    || obj->type == TYPE_UNARY 
            || obj->type == TYPE_BINARY    || obj->type == TYPE_VARY   

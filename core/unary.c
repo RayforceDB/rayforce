@@ -146,7 +146,7 @@ obj_p ray_get(obj_p x)
             return error(ERR_TYPE, "get: symbol '%s' not found", as_string(x));
 
         return clone_obj(*sym);
-    case TYPE_CHAR:
+    case TYPE_C8:
         if (x->len == 0)
             throw(ERR_LENGTH, "get: empty string path");
 
@@ -175,7 +175,7 @@ obj_p ray_get(obj_p x)
             for (i = 0; i < l; i++)
             {
                 v = at_idx(keys, i);
-                s = cast_obj(TYPE_CHAR, v);
+                s = cast_obj(TYPE_C8, v);
                 col = ray_concat(x, s);
                 val = ray_get(col);
 
@@ -300,7 +300,7 @@ obj_p ray_bins(obj_p x)
     {
     case TYPE_B8:
     case TYPE_U8:
-    case TYPE_CHAR:
+    case TYPE_C8:
         bins = index_group_i8((i8_t *)as_u8(x), NULL, x->len);
         break;
     case TYPE_I64:

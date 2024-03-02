@@ -53,7 +53,7 @@ b8_t ops_as_b8(obj_p x)
     case -TYPE_B8:
         return x->b8;
     case -TYPE_U8:
-    case -TYPE_CHAR:
+    case -TYPE_C8:
         return x->u8 != 0;
     case -TYPE_I64:
     case -TYPE_SYMBOL:
@@ -61,7 +61,7 @@ b8_t ops_as_b8(obj_p x)
         return x->i64 != 0;
     case TYPE_B8:
     case TYPE_U8:
-    case TYPE_CHAR:
+    case TYPE_C8:
     case TYPE_I64:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
@@ -107,7 +107,7 @@ b8_t ops_eq_idx(obj_p a, i64_t ai, obj_p b, i64_t bi)
     switch (mtype2(a->type, b->type))
     {
     case mtype2(TYPE_U8, -TYPE_U8):
-    case mtype2(TYPE_CHAR, -TYPE_CHAR):
+    case mtype2(TYPE_C8, -TYPE_C8):
     case mtype2(TYPE_B8, -TYPE_B8):
         return as_u8(a)[ai] == b->u8;
     case mtype2(TYPE_I64, -TYPE_I64):
@@ -116,7 +116,7 @@ b8_t ops_eq_idx(obj_p a, i64_t ai, obj_p b, i64_t bi)
         return as_i64(a)[ai] == b->i64;
     case mtype2(TYPE_U8, TYPE_U8):
     case mtype2(TYPE_B8, TYPE_B8):
-    case mtype2(TYPE_CHAR, TYPE_CHAR):
+    case mtype2(TYPE_C8, TYPE_C8):
         return as_u8(a)[ai] == as_u8(b)[bi];
     case mtype2(TYPE_I64, TYPE_I64):
     case mtype2(TYPE_SYMBOL, TYPE_SYMBOL):
@@ -167,7 +167,7 @@ u64_t ops_count(obj_p x)
     case TYPE_GUID:
     case TYPE_LIST:
         return x->len;
-    case TYPE_CHAR:
+    case TYPE_C8:
         return x->len ? x->len - 1 : x->len;
     case TYPE_TABLE:
         return as_list(x)[1]->len ? ops_count(as_list(as_list(x)[1])[0]) : 0;

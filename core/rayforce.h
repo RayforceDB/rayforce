@@ -39,7 +39,7 @@ extern "C"
 #define TYPE_SYMBOL 5
 #define TYPE_TIMESTAMP 6
 #define TYPE_GUID 7
-#define TYPE_CHAR 8
+#define TYPE_C8 8
 #define TYPE_ENUM 20
 #define TYPE_ANYMAP 77
 #define TYPE_FILTERMAP 78
@@ -75,7 +75,7 @@ extern "C"
 #define ERR_UNKNOWN 127
 
 typedef char i8_t;
-typedef char char_t;
+typedef char c8_t;
 typedef char b8_t;
 typedef char *str_p;
 typedef unsigned char u8_t;
@@ -125,7 +125,7 @@ typedef struct obj_t
     {
         b8_t b8;
         u8_t u8;
-        char_t vchar;
+        c8_t c8;
         i64_t i64;
         f64_t f64;
         struct obj_t *obj;
@@ -155,13 +155,13 @@ extern obj_p vector(i8_t type, u64_t len);  // create vector of type
 extern obj_p vn_symbol(u64_t len, ...);     // create vector symbols from strings
 extern obj_p b8(b8_t val);                  // bool atom
 extern obj_p u8(u8_t val);                  // byte atom
+extern obj_p c8(c8_t c);                    // char
 extern obj_p i64(i64_t val);                // i64 atom
 extern obj_p f64(f64_t val);                // f64 atom
 extern obj_p symbol(str_p ptr);             // symbol
 extern obj_p symboli64(i64_t id);           // symbol from i64
 extern obj_p timestamp(i64_t val);          // timestamp
 extern obj_p guid(u8_t buf[16]);            // GUID
-extern obj_p vchar(char_t c);               // char
 extern obj_p string(u64_t len);             // string 
 extern obj_p vn_string(str_p fmt, ...);     // string from format
 extern obj_p venum(obj_p sym, obj_p vec);   // enum
@@ -207,7 +207,7 @@ extern b8_t is_null(obj_p obj);
 extern str_p type_name(i8_t tp);
 #define is_error(obj)  ((obj)->type == TYPE_ERROR)
 #define is_atom(obj)   ((obj)->type < 0)
-#define is_vector(obj) ((obj)->type >= 0 && (obj)->type <= TYPE_CHAR)
+#define is_vector(obj) ((obj)->type >= 0 && (obj)->type <= TYPE_C8)
 
 // Push a value to the end of a list
 extern obj_p push_raw(obj_p *obj, raw_p val); // push raw value into a list

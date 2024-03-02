@@ -214,7 +214,7 @@ nil_t init_typenames(obj_p typenames)
     regt(typenames,   -TYPE_U8,       "byte");
     regt(typenames,   -TYPE_I64,        "i64");
     regt(typenames,   -TYPE_F64,        "f64");
-    regt(typenames,   -TYPE_CHAR,       "char");
+    regt(typenames,   -TYPE_C8,       "char");
     regt(typenames,   -TYPE_SYMBOL,     "symbol");
     regt(typenames,   -TYPE_TIMESTAMP,  "timestamp");
     regt(typenames,   -TYPE_GUID,       "guid");
@@ -222,7 +222,7 @@ nil_t init_typenames(obj_p typenames)
     regt(typenames,    TYPE_U8,       "Byte");
     regt(typenames,    TYPE_I64,        "I64");
     regt(typenames,    TYPE_F64,        "F64");
-    regt(typenames,    TYPE_CHAR,       "String");
+    regt(typenames,    TYPE_C8,       "String");
     regt(typenames,    TYPE_ENUM,       "Enum");
     regt(typenames,    TYPE_ANYMAP,     "Anymap");
     regt(typenames,    TYPE_SYMBOL,     "Symbol");

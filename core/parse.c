@@ -85,49 +85,49 @@ obj_p parse_error(parser_t *parser, i64_t id, str_p msg)
     return obj;
 }
 
-b8_t is_whitespace(char_t c)
+b8_t is_whitespace(c8_t c)
 {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-b8_t is_digit(char_t c)
+b8_t is_digit(c8_t c)
 {
     return c >= '0' && c <= '9';
 }
 
-b8_t is_alpha(char_t c)
+b8_t is_alpha(c8_t c)
 {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
-b8_t is_alphanum(char_t c)
+b8_t is_alphanum(c8_t c)
 {
     return is_alpha(c) || is_digit(c);
 }
 
-b8_t is_op(char_t c)
+b8_t is_op(c8_t c)
 {
     return strchr("+-*/%&|^~<>!=._", c) != NULL;
 }
 
-b8_t at_eof(char_t c)
+b8_t at_eof(c8_t c)
 {
     return c == '\0' || (signed char)c == EOF;
 }
 
-b8_t at_term(char_t c)
+b8_t at_term(c8_t c)
 {
     return c == ')' || c == ']' || c == '}' || c == ':' || c == '\n';
 }
 
-b8_t is_at(obj_p token, char_t c)
+b8_t is_at(obj_p token, c8_t c)
 {
-    return token && token->type == -TYPE_CHAR && token->vchar == c;
+    return token && token->type == -TYPE_C8 && token->c8 == c;
 }
 
 b8_t is_at_term(obj_p token)
 {
-    return token && token->type == -TYPE_CHAR && at_term(token->vchar);
+    return token && token->type == -TYPE_C8 && at_term(token->c8);
 }
 
 i8_t shift(parser_t *parser, i32_t num)
@@ -146,8 +146,8 @@ i8_t shift(parser_t *parser, i32_t num)
 
 obj_p to_token(parser_t *parser)
 {
-    obj_p tok = vchar(*parser->current);
-    tok->type = -TYPE_CHAR;
+    obj_p tok = c8(*parser->current);
+    tok->type = -TYPE_C8;
     nfo_insert(parser->nfo, (i64_t)tok, span_start(parser));
 
     return tok;
@@ -442,7 +442,7 @@ obj_p parse_char(parser_t *parser)
     str_p pos = parser->current + 1; // skip '''
     obj_p res = NULL_OBJ;
     i64_t id;
-    char_t ch;
+    c8_t ch;
 
     if (at_eof(*pos) || *pos == '\n')
     {
@@ -482,7 +482,7 @@ obj_p parse_char(parser_t *parser)
         return res;
     }
 
-    res = vchar(ch);
+    res = c8(ch);
 
     shift(parser, 3);
     span_extend(parser, &span);
@@ -497,7 +497,7 @@ obj_p parse_string(parser_t *parser)
     str_p pos = parser->current + 1; // skip '"'
     i32_t len = 0;
     obj_p str, err;
-    char_t nl = '\0', lf = '\n', cr = '\r', tb = '\t';
+    c8_t nl = '\0', lf = '\n', cr = '\r', tb = '\t';
 
     str = string(0);
 
@@ -834,7 +834,7 @@ obj_p parse_list(parser_t *parser)
 
         if (is_at_term(tok))
         {
-            err = parse_error(parser, (i64_t)tok, str_fmt(0, "There is no opening found for: '%c'", tok->vchar));
+            err = parse_error(parser, (i64_t)tok, str_fmt(0, "There is no opening found for: '%c'", tok->c8));
             drop_obj(lst);
             drop_obj(tok);
 

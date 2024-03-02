@@ -202,7 +202,7 @@ timestamp_t timestamp_from_str(str_p src)
 {
     i64_t cnt, val;
     timestamp_t ts = {0};
-    char_t *cur, *end;
+    c8_t *cur, *end;
 
     if (src == NULL)
         goto null;

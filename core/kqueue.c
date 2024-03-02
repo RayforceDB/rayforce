@@ -369,7 +369,7 @@ nil_t process_request(poll_p poll, selector_p selector)
 
     if (is_error(res) || is_null(res))
         v = res;
-    else if (res->type == TYPE_CHAR)
+    else if (res->type == TYPE_C8)
     {
         v = ray_eval_str(res, poll->ipcfile);
         drop_obj(res);

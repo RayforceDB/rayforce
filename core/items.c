@@ -50,7 +50,7 @@ obj_p ray_at(obj_p x, obj_p y)
     case mtype2(TYPE_F64, -TYPE_I64):
     case mtype2(TYPE_TIMESTAMP, -TYPE_I64):
     case mtype2(TYPE_GUID, -TYPE_I64):
-    case mtype2(TYPE_CHAR, -TYPE_I64):
+    case mtype2(TYPE_C8, -TYPE_I64):
     case mtype2(TYPE_LIST, -TYPE_I64):
         return at_idx(x, y->i64);
 
@@ -115,7 +115,7 @@ obj_p ray_at(obj_p x, obj_p y)
 
         return res;
 
-    case mtype2(TYPE_CHAR, TYPE_I64):
+    case mtype2(TYPE_C8, TYPE_I64):
         yl = y->len;
         xl = x->len;
         res = string(yl);
@@ -321,7 +321,7 @@ obj_p ray_find(obj_p x, obj_p y)
     case mtype2(TYPE_F64, -TYPE_F64):
     case mtype2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
     case mtype2(TYPE_GUID, -TYPE_GUID):
-    case mtype2(TYPE_CHAR, -TYPE_CHAR):
+    case mtype2(TYPE_C8, -TYPE_C8):
         l = x->len;
         i = find_obj(x, y);
 
@@ -331,7 +331,7 @@ obj_p ray_find(obj_p x, obj_p y)
             return i64(i);
     case mtype2(TYPE_B8, TYPE_B8):
     case mtype2(TYPE_U8, TYPE_U8):
-    case mtype2(TYPE_CHAR, TYPE_CHAR):
+    case mtype2(TYPE_C8, TYPE_C8):
         return index_find_i8((i8_t *)as_u8(x), x->len, (i8_t *)as_u8(y), y->len);
     case mtype2(TYPE_I64, TYPE_I64):
     case mtype2(TYPE_SYMBOL, TYPE_SYMBOL):
@@ -439,7 +439,7 @@ obj_p ray_filter(obj_p x, obj_p y)
 
         return res;
 
-    case mtype2(TYPE_CHAR, TYPE_B8):
+    case mtype2(TYPE_C8, TYPE_B8):
         if (x->len != y->len)
             return error_str(ERR_LENGTH, "filter: vector and filter vector must be of same length");
 
@@ -683,7 +683,7 @@ obj_p ray_take(obj_p x, obj_p y)
 
         return res;
 
-    case mtype2(-TYPE_I64, TYPE_CHAR):
+    case mtype2(-TYPE_I64, TYPE_C8):
         m = absi64(x->i64);
         n = y->len;
         res = string(m);
