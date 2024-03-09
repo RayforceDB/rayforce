@@ -83,7 +83,7 @@ nil_t *heap_add_pool(u64_t order)
     node_t *node;
 
     if (pool == NULL)
-        return NULL_OBJ;
+        return NULL;
 
     // debug_assert((i64_t)pool % 16 == 0, "pool is not aligned");
 
@@ -172,7 +172,7 @@ nil_t *__attribute__((hot)) heap_alloc(u64_t size)
     node_t *node;
 
     if (size == 0)
-        return NULL_OBJ;
+        return NULL;
 
     // block is a 16 bytes block
     if (size <= 16 && __HEAP->freelist16)
@@ -188,7 +188,7 @@ nil_t *__attribute__((hot)) heap_alloc(u64_t size)
     order = orderof(capacity);
 
     if (order > MAX_POOL_ORDER)
-        return NULL_OBJ;
+        return NULL;
 
     // find least order block that fits
     i = (AVAIL_MASK << order) & __HEAP->avail;
@@ -201,7 +201,7 @@ nil_t *__attribute__((hot)) heap_alloc(u64_t size)
         {
             block = heap_add_pool(order);
             if (block == NULL)
-                return NULL_OBJ;
+                return NULL;
 
             __HEAP->memstat.system += blocksize(order);
             return (nil_t *)((node_t *)block + 1);
@@ -212,7 +212,7 @@ nil_t *__attribute__((hot)) heap_alloc(u64_t size)
         node_t *node = (node_t *)heap_add_pool(i);
 
         if (node == NULL)
-            return NULL_OBJ;
+            return NULL;
 
         block_size = blocksize(i);
         node->next = NULL;
@@ -332,7 +332,7 @@ nil_t *__attribute__((hot)) heap_realloc(nil_t *block, u64_t new_size)
     if (new_size == 0)
     {
         heap_free(block);
-        return NULL_OBJ;
+        return NULL;
     }
 
     // block is a 16 bytes block

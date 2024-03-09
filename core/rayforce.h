@@ -35,9 +35,9 @@ extern "C"
 #define TYPE_B8 1
 #define TYPE_U8 2
 #define TYPE_I64 3
-#define TYPE_F64 4
-#define TYPE_SYMBOL 5
-#define TYPE_TIMESTAMP 6
+#define TYPE_SYMBOL 4
+#define TYPE_TIMESTAMP 5
+#define TYPE_F64 6
 #define TYPE_GUID 7
 #define TYPE_C8 8
 #define TYPE_ENUM 20

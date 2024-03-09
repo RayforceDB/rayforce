@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include <limits.h>
 #include "index.h"
 #include "ops.h"
 #include "hash.h"
@@ -28,20 +29,6 @@
 #include "error.h"
 #include "items.h"
 #include "unary.h"
-
-typedef struct __index_list_ctx_t
-{
-    obj_p lcols;
-    obj_p rcols;
-    u64_t *hashes;
-} __index_list_ctx_t;
-
-typedef struct __find_ctx_t
-{
-    raw_p lobj;
-    raw_p robj;
-    u64_t *hashes;
-} __find_ctx_t;
 
 u64_t __hash_get(i64_t row, nil_t *seed)
 {
@@ -83,20 +70,18 @@ i64_t __index_list_cmp_row(i64_t row1, i64_t row2, nil_t *seed)
     return 0;
 }
 
-nil_t __index_list_precalc_hash(obj_p cols, u64_t *out, u64_t ncols, u64_t nrows)
+nil_t __index_list_precalc_hash(obj_p cols, u64_t *out, u64_t ncols, u64_t nrows, i64_t filter[], b8_t deref)
 {
     u64_t i;
 
     for (i = 0; i < nrows; i++)
-        out[i] = 0xa5b6c7d8e9f01234ull;
+        out[i] = 0x9ddfea08eb382d69ull;
 
     for (i = 0; i < ncols; i++)
-        index_hash_obj(as_list(cols)[i], out, nrows);
-
-    return;
+        index_hash_obj(as_list(cols)[i], out, filter, nrows, deref);
 }
 
-i64_t index_range(i64_t *pmin, i64_t *pmax, i64_t values[], i64_t indices[], u64_t len)
+index_scope_t index_scope(i64_t values[], i64_t indices[], u64_t len)
 {
     u64_t i;
     i64_t min, max;
@@ -120,10 +105,7 @@ i64_t index_range(i64_t *pmin, i64_t *pmax, i64_t values[], i64_t indices[], u64
         }
     }
 
-    *pmin = min;
-    *pmax = max;
-
-    return max - min + 1;
+    return (index_scope_t){min, max, max - min + 1};
 }
 
 obj_p index_distinct_i8(i8_t values[], u64_t len, b8_t term)
@@ -163,27 +145,26 @@ obj_p index_distinct_i8(i8_t values[], u64_t len, b8_t term)
 
 obj_p index_distinct_i64(i64_t values[], u64_t len)
 {
-    u64_t i, j, range;
-    i64_t p, min, max, k, *out;
+    u64_t i, j;
+    i64_t p, k, *out;
     obj_p vec, set;
-
-    range = index_range(&min, &max, values, NULL, len);
+    const index_scope_t scope = index_scope(values, NULL, len);
 
     // use open addressing if range is small
-    if (range <= len)
+    if (scope.range <= len)
     {
-        vec = vector_i64(range);
+        vec = vector_i64(scope.range);
         out = as_i64(vec);
-        memset(out, 0, sizeof(i64_t) * range);
+        memset(out, 0, sizeof(i64_t) * scope.range);
 
         for (i = 0; i < len; i++)
-            out[values[i] - min]++;
+            out[values[i] - scope.min]++;
 
         // compact keys
-        for (i = 0, j = 0; i < range; i++)
+        for (i = 0, j = 0; i < scope.range; i++)
         {
             if (out[i])
-                out[j++] = i + min;
+                out[j++] = i + scope.min;
         }
 
         resize_obj(&vec, j);
@@ -197,7 +178,7 @@ obj_p index_distinct_i64(i64_t values[], u64_t len)
 
     for (i = 0; i < len; i++)
     {
-        k = values[i] - min;
+        k = values[i] - scope.min;
         p = ht_tab_next(&set, k);
         out = as_i64(as_list(set)[0]);
         if (out[p] == NULL_I64)
@@ -210,7 +191,7 @@ obj_p index_distinct_i64(i64_t values[], u64_t len)
     for (i = 0, j = 0; i < len; i++)
     {
         if (out[i] != NULL_I64)
-            out[j++] = out[i] + min;
+            out[j++] = out[i] + scope.min;
     }
 
     resize_obj(&as_list(set)[0], j);
@@ -330,34 +311,34 @@ obj_p index_find_i8(i8_t x[], u64_t xl, i8_t y[], u64_t yl)
 
 obj_p index_find_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl)
 {
-    u64_t i, range;
-    i64_t max = 0, min = 0, n, p, *r, *f;
+    u64_t i;
+    i64_t n, p, *r, *f;
     obj_p vec, ht;
 
     if (xl == 0)
         return vector_i64(0);
 
-    range = index_range(&min, &max, x, NULL, xl);
+    const index_scope_t scope = index_scope(x, NULL, xl);
 
-    if (range <= yl)
+    if (scope.range <= yl)
     {
-        vec = vector_i64(yl + range);
+        vec = vector_i64(yl + scope.range);
         r = as_i64(vec);
         f = r + yl;
 
-        for (i = 0; i < range; i++)
+        for (i = 0; i < scope.range; i++)
             f[i] = NULL_I64;
 
         for (i = 0; i < xl; i++)
         {
-            n = x[i] - min;
+            n = x[i] - scope.min;
             f[n] = (f[n] == NULL_I64) ? (i64_t)i : NULL_I64;
         }
 
         for (i = 0; i < yl; i++)
         {
-            n = y[i] - min;
-            r[i] = (y[i] < min || y[i] > max) ? NULL_I64 : f[n];
+            n = y[i] - scope.min;
+            r[i] = (y[i] < scope.min || y[i] > scope.max) ? NULL_I64 : f[n];
         }
 
         resize_obj(&vec, yl);
@@ -373,17 +354,17 @@ obj_p index_find_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl)
 
     for (i = 0; i < xl; i++)
     {
-        p = ht_tab_next(&ht, x[i] - min);
+        p = ht_tab_next(&ht, x[i] - scope.min);
         if (as_i64(as_list(ht)[0])[p] == NULL_I64)
         {
-            as_i64(as_list(ht)[0])[p] = x[i] - min;
+            as_i64(as_list(ht)[0])[p] = x[i] - scope.min;
             as_i64(as_list(ht)[1])[p] = i;
         }
     }
 
     for (i = 0; i < yl; i++)
     {
-        p = ht_tab_get(ht, y[i] - min);
+        p = ht_tab_get(ht, y[i] - scope.min);
         r[i] = p == NULL_I64 ? NULL_I64 : as_i64(as_list(ht)[1])[p];
     }
 
@@ -526,24 +507,22 @@ obj_p index_group_i8(i8_t values[], i64_t indices[], u64_t len)
     return vn_list(3, i64(j), vals, NULL_OBJ);
 }
 
-obj_p index_group_i64(i64_t values[], i64_t indices[], u64_t len)
+obj_p index_group_i64_scoped(i64_t values[], i64_t indices[], u64_t len, const index_scope_t scope)
 {
-    u64_t i, j, n, range;
-    i64_t idx, min, max, *hk, *hv, *hp;
+    u64_t i, j, n;
+    i64_t idx, *hk, *hv, *hp;
     obj_p keys, vals, ht;
 
-    range = index_range(&min, &max, values, indices, len);
-
     // use open addressing if range is compatible with the input length
-    if (range <= len)
+    if (scope.range <= len)
     {
-        keys = vector_i64(range);
+        keys = vector_i64(scope.range);
         hk = as_i64(keys);
 
         vals = vector_i64(len);
         hv = as_i64(vals);
 
-        for (i = 0; i < range; i++)
+        for (i = 0; i < scope.range; i++)
             hk[i] = NULL_I64;
 
         // distribute bins
@@ -551,7 +530,7 @@ obj_p index_group_i64(i64_t values[], i64_t indices[], u64_t len)
         {
             for (i = 0, j = 0; i < len; i++)
             {
-                n = values[indices[i]] - min;
+                n = values[indices[i]] - scope.min;
                 if (hk[n] == NULL_I64)
                     hk[n] = j++;
 
@@ -562,7 +541,7 @@ obj_p index_group_i64(i64_t values[], i64_t indices[], u64_t len)
         {
             for (i = 0, j = 0; i < len; i++)
             {
-                n = values[i] - min;
+                n = values[i] - scope.min;
                 if (hk[n] == NULL_I64)
                     hk[n] = j++;
 
@@ -577,13 +556,15 @@ obj_p index_group_i64(i64_t values[], i64_t indices[], u64_t len)
 
     // use hash table if range is large
     ht = ht_tab(len, TYPE_I64);
+    vals = vector_i64(len);
+    hp = as_i64(vals);
 
     // distribute bins
     if (indices)
     {
         for (i = 0, j = 0; i < len; i++)
         {
-            n = values[indices[i]] - min;
+            n = values[indices[i]] - scope.min;
             idx = ht_tab_next_with(&ht, n, &hash_fnv1a, &hash_cmp_i64, NULL);
             hk = as_i64(as_list(ht)[0]);
             hv = as_i64(as_list(ht)[1]);
@@ -592,13 +573,15 @@ obj_p index_group_i64(i64_t values[], i64_t indices[], u64_t len)
                 hk[idx] = n;
                 hv[idx] = j++;
             }
+
+            hp[i] = hv[idx];
         }
     }
     else
     {
         for (i = 0, j = 0; i < len; i++)
         {
-            n = values[i] - min;
+            n = values[i] - scope.min;
             idx = ht_tab_next_with(&ht, n, &hash_fnv1a, &hash_cmp_i64, NULL);
             hk = as_i64(as_list(ht)[0]);
             hv = as_i64(as_list(ht)[1]);
@@ -607,27 +590,7 @@ obj_p index_group_i64(i64_t values[], i64_t indices[], u64_t len)
                 hk[idx] = n;
                 hv[idx] = j++;
             }
-        }
-    }
 
-    vals = vector_i64(len);
-    hp = as_i64(vals);
-
-    if (indices)
-    {
-        for (i = 0; i < len; i++)
-        {
-            n = values[indices[i]] - min;
-            idx = ht_tab_get_with(ht, n, &hash_fnv1a, &hash_cmp_i64, NULL);
-            hp[i] = hv[idx];
-        }
-    }
-    else
-    {
-        for (i = 0; i < len; i++)
-        {
-            n = values[i] - min;
-            idx = ht_tab_get_with(ht, n, &hash_fnv1a, &hash_cmp_i64, NULL);
             hp[i] = hv[idx];
         }
     }
@@ -637,13 +600,21 @@ obj_p index_group_i64(i64_t values[], i64_t indices[], u64_t len)
     return vn_list(3, i64(j), vals, NULL_OBJ);
 }
 
+obj_p index_group_i64(i64_t values[], i64_t indices[], u64_t len)
+{
+    index_scope_t scope = index_scope(values, indices, len);
+    return index_group_i64_scoped(values, indices, len, scope);
+}
+
 obj_p index_group_guid(guid_t values[], i64_t indices[], u64_t len)
 {
-    u64_t i, j, n;
+    u64_t i, j;
     i64_t idx, *hk, *hv, *hp;
     obj_p vals, ht;
 
     ht = ht_tab(len, TYPE_I64);
+    vals = vector_i64(len);
+    hp = as_i64(vals);
 
     // distribute bins
     if (indices)
@@ -658,6 +629,8 @@ obj_p index_group_guid(guid_t values[], i64_t indices[], u64_t len)
                 hk[idx] = (i64_t)&values[indices[i]];
                 hv[idx] = j++;
             }
+
+            hp[i] = hv[idx];
         }
     }
     else
@@ -672,27 +645,7 @@ obj_p index_group_guid(guid_t values[], i64_t indices[], u64_t len)
                 hk[idx] = (i64_t)&values[i];
                 hv[idx] = j++;
             }
-        }
-    }
 
-    vals = vector_i64(len);
-    hp = as_i64(vals);
-
-    if (indices)
-    {
-        for (i = 0; i < len; i++)
-        {
-            n = (i64_t)&values[indices[i]];
-            idx = ht_tab_get_with(ht, n, &hash_guid, &hash_cmp_guid, NULL);
-            hp[i] = hv[idx];
-        }
-    }
-    else
-    {
-        for (i = 0; i < len; i++)
-        {
-            n = (i64_t)&values[i];
-            idx = ht_tab_get_with(ht, n, &hash_guid, &hash_cmp_guid, NULL);
             hp[i] = hv[idx];
         }
     }
@@ -709,6 +662,8 @@ obj_p index_group_obj(obj_p values[], i64_t indices[], u64_t len)
     obj_p vals, ht;
 
     ht = ht_tab(len, TYPE_I64);
+    vals = vector_i64(len);
+    hp = as_i64(vals);
 
     // distribute bins
     if (indices)
@@ -724,6 +679,8 @@ obj_p index_group_obj(obj_p values[], i64_t indices[], u64_t len)
                 hk[idx] = n;
                 hv[idx] = j++;
             }
+
+            hp[i] = hv[idx];
         }
     }
     else
@@ -739,27 +696,7 @@ obj_p index_group_obj(obj_p values[], i64_t indices[], u64_t len)
                 hk[idx] = n;
                 hv[idx] = j++;
             }
-        }
-    }
 
-    vals = vector_i64(len);
-    hp = as_i64(vals);
-
-    if (indices)
-    {
-        for (i = 0; i < len; i++)
-        {
-            n = (i64_t)values[indices[i]];
-            idx = ht_tab_get_with(ht, n, &hash_obj, &hash_cmp_obj, NULL);
-            hp[i] = hv[idx];
-        }
-    }
-    else
-    {
-        for (i = 0; i < len; i++)
-        {
-            n = (i64_t)values[i];
-            idx = ht_tab_get_with(ht, n, &hash_obj, &hash_cmp_obj, NULL);
             hp[i] = hv[idx];
         }
     }
@@ -769,6 +706,143 @@ obj_p index_group_obj(obj_p values[], i64_t indices[], u64_t len)
     return vn_list(3, i64(j), vals, NULL_OBJ);
 }
 
+obj_p index_group_list_direct(obj_p lst, i64_t filter[], u64_t len)
+{
+    u8_t *xb;
+    u64_t i, j, product, l = lst->len, multipliers[l];
+    i64_t *xi, *xo;
+    obj_p ht, col, res;
+    index_scope_t *scopes, scope;
+
+    if (l == 0)
+        return NULL_OBJ;
+
+    // First, check if columns types are suitable for direct hashing
+    for (i = 0; i < l; i++)
+    {
+        switch (as_list(lst)[i]->type)
+        {
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
+        case TYPE_I64:
+        case TYPE_SYMBOL:
+        case TYPE_TIMESTAMP:
+        case TYPE_ENUM:
+            break;
+        default:
+            return NULL_OBJ;
+        }
+    }
+
+    scopes = heap_alloc(l * sizeof(index_scope_t));
+
+    // calculate scopes of each column to check if we can use direct hashing
+    for (i = 0; i < l; i++)
+    {
+        switch (as_list(lst)[i]->type)
+        {
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
+            scopes[i].max = 255;
+            scopes[i].min = 0;
+            scopes[i].range = 256;
+            break;
+        case TYPE_I64:
+        case TYPE_SYMBOL:
+        case TYPE_TIMESTAMP:
+        case TYPE_ENUM:
+            scopes[i] = index_scope(as_i64(as_list(lst)[i]), filter, len);
+            break;
+        default:
+            // because we already checked the types, this should never happen
+            __builtin_unreachable();
+        }
+    }
+
+    // Precompute multipliers for each column
+    for (i = 0, product = 1, scope = (index_scope_t){0, 0, 0}; i < l; i++)
+    {
+        if (ULLONG_MAX / product < scopes[i].range)
+        {
+            heap_free(scopes);
+            return NULL_OBJ; // Overflow would occur
+        }
+
+        scope.max += (scopes[i].max - scopes[i].min) * product;
+
+        multipliers[i] = product;
+        product *= scopes[i].range;
+    }
+
+    scope.range = scope.max + 1;
+
+    ht = vector_i64(len);
+    xo = as_i64(ht);
+    memset(xo, 0, len * sizeof(i64_t));
+
+    for (i = 0; i < l; i++)
+    {
+        col = as_list(lst)[i];
+        switch (col->type)
+        {
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
+            xb = as_u8(col);
+            if (filter)
+            {
+                for (j = 0; j < len; j++)
+                    xo[j] += (xb[filter[j]] - scopes[i].min) * multipliers[i];
+            }
+            else
+            {
+                for (j = 0; j < len; j++)
+                    xo[j] += (xb[j] - scopes[i].min) * multipliers[i];
+            }
+            break;
+        case TYPE_I64:
+        case TYPE_SYMBOL:
+        case TYPE_TIMESTAMP:
+            xi = as_i64(col);
+            if (filter)
+            {
+                for (j = 0; j < len; j++)
+                    xo[j] += (xi[filter[j]] - scopes[i].min) * multipliers[i];
+            }
+            else
+            {
+                for (j = 0; j < len; j++)
+                    xo[j] += (xi[j] - scopes[i].min) * multipliers[i];
+            }
+            break;
+        case TYPE_ENUM:
+            xi = as_i64(enum_val(col));
+            if (filter)
+            {
+                for (j = 0; j < len; j++)
+                    xo[j] += (xi[filter[j]] - scopes[i].min) * multipliers[i];
+            }
+            else
+            {
+                for (j = 0; j < len; j++)
+                    xo[j] += (xi[j] - scopes[i].min) * multipliers[i];
+            }
+            break;
+        default:
+            // because we already checked the types, this should never happen
+            __builtin_unreachable();
+        }
+    }
+
+    heap_free(scopes);
+    res = index_group_i64_scoped(xo, NULL, len, scope);
+    drop_obj(ht);
+
+    return res;
+}
+
 obj_p index_group_list(obj_p lst, i64_t filter[], u64_t len)
 {
     u64_t i;
@@ -776,27 +850,53 @@ obj_p index_group_list(obj_p lst, i64_t filter[], u64_t len)
     obj_p ht, res;
     __index_list_ctx_t ctx;
 
+    // If the list values are small, use direct hashing
+    res = index_group_list_direct(lst, filter, len);
+    if (!is_null(res))
+        return res;
+
+    // Otherwise use a hash table
     ht = ht_tab(len, TYPE_I64);
     res = vector_i64(len);
-    ctx = (__index_list_ctx_t){lst, lst, (u64_t *)as_i64(res)};
     xo = as_i64(res);
+    ctx = (__index_list_ctx_t){lst, lst, (u64_t *)as_i64(res)};
 
     // distribute bins
-    __index_list_precalc_hash(lst, (u64_t *)as_i64(res), lst->len, len);
+    __index_list_precalc_hash(lst, (u64_t *)as_i64(res), lst->len, len, filter, B8_FALSE);
 
-    for (i = 0, g = 0; i < len; i++)
+    if (filter)
     {
-        idx = ht_tab_next_with(&ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
-        hk = as_i64(as_list(ht)[0]);
-        hv = as_i64(as_list(ht)[1]);
-
-        if (hk[idx] == NULL_I64)
+        for (i = 0, g = 0; i < len; i++)
         {
-            hk[idx] = i;
-            hv[idx] = g++;
-        }
+            idx = ht_tab_next_with(&ht, filter[i], &__index_list_hash_get, &__index_list_cmp_row, &ctx);
+            hk = as_i64(as_list(ht)[0]);
+            hv = as_i64(as_list(ht)[1]);
 
-        xo[i] = hv[idx];
+            if (hk[idx] == NULL_I64)
+            {
+                hk[idx] = filter[i];
+                hv[idx] = g++;
+            }
+
+            xo[i] = hv[idx];
+        }
+    }
+    else
+    {
+        for (i = 0, g = 0; i < len; i++)
+        {
+            idx = ht_tab_next_with(&ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
+            hk = as_i64(as_list(ht)[0]);
+            hv = as_i64(as_list(ht)[1]);
+
+            if (hk[idx] == NULL_I64)
+            {
+                hk[idx] = i;
+                hv[idx] = g++;
+            }
+
+            xo[i] = hv[idx];
+        }
     }
 
     drop_obj(ht);
@@ -804,7 +904,7 @@ obj_p index_group_list(obj_p lst, i64_t filter[], u64_t len)
     return vn_list(3, i64(g), res, NULL_OBJ);
 }
 
-nil_t index_hash_obj(obj_p obj, u64_t out[], u64_t len)
+nil_t index_hash_obj(obj_p obj, u64_t out[], i64_t filter[], u64_t len, b8_t deref)
 {
     u8_t *u8v;
     f64_t *f64v;
@@ -835,50 +935,98 @@ nil_t index_hash_obj(obj_p obj, u64_t out[], u64_t len)
     case TYPE_U8:
     case TYPE_C8:
         u8v = as_u8(obj);
-        for (i = 0; i < len; i++)
-            out[i] = hash_index_u64((u64_t)u8v[i], out[i]);
+        if (filter)
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64((u64_t)u8v[filter[i]], out[i]);
+        else
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64((u64_t)u8v[i], out[i]);
         break;
     case TYPE_I64:
     case TYPE_SYMBOL:
     case TYPE_TIMESTAMP:
         u64v = (u64_t *)as_i64(obj);
-        for (i = 0; i < len; i++)
-            out[i] = hash_index_u64(u64v[i], out[i]);
+        if (filter)
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64(u64v[filter[i]], out[i]);
+        else
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64(u64v[i], out[i]);
         break;
     case TYPE_F64:
         f64v = as_f64(obj);
-        for (i = 0; i < len; i++)
-            out[i] = hash_index_u64((u64_t)f64v[i], out[i]);
+        if (filter)
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64((u64_t)f64v[filter[i]], out[i]);
+        else
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64((u64_t)f64v[i], out[i]);
         break;
     case TYPE_GUID:
         g64v = as_guid(obj);
-        for (i = 0; i < len; i++)
-        {
-            out[i] = hash_index_u64(*(u64_t *)&g64v[i], out[i]);
-            out[i] = hash_index_u64(*((u64_t *)&g64v[i] + 1), out[i]);
-        }
+        if (filter)
+            for (i = 0; i < len; i++)
+            {
+                out[i] = hash_index_u64(*(u64_t *)&g64v[filter[i]], out[i]);
+                out[i] = hash_index_u64(*((u64_t *)&g64v[filter[i]] + 1), out[i]);
+            }
+        else
+            for (i = 0; i < len; i++)
+            {
+                out[i] = hash_index_u64(*(u64_t *)&g64v[i], out[i]);
+                out[i] = hash_index_u64(*((u64_t *)&g64v[i] + 1), out[i]);
+            }
         break;
     case TYPE_LIST:
-        for (i = 0; i < len; i++)
-            out[i] = hash_index_u64(hash_index_obj(as_list(obj)[i]), out[i]);
+        if (filter)
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64(hash_index_obj(as_list(obj)[filter[i]]), out[i]);
+        else
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64(hash_index_obj(as_list(obj)[i]), out[i]);
         break;
     case TYPE_ENUM:
-        k = ray_key(obj);
-        v = ray_get(k);
-        drop_obj(k);
-        u64v = (u64_t *)as_symbol(v);
-        ids = as_i64(enum_val(obj));
-        for (i = 0; i < len; i++)
-            out[i] = hash_index_u64(u64v[ids[i]], out[i]);
-        drop_obj(v);
-        break;
-    case TYPE_ANYMAP:
-        for (i = 0; i < len; i++)
+        if (deref)
         {
-            v = at_idx(obj, i);
-            out[i] = hash_index_u64(hash_index_obj(v), out[i]);
+            k = ray_key(obj);
+            v = ray_get(k);
+            drop_obj(k);
+            u64v = (u64_t *)as_symbol(v);
+            ids = as_i64(enum_val(obj));
+            if (filter)
+                for (i = 0; i < len; i++)
+                    out[i] = hash_index_u64(u64v[ids[filter[i]]], out[i]);
+            else
+                for (i = 0; i < len; i++)
+                    out[i] = hash_index_u64(u64v[ids[i]], out[i]);
             drop_obj(v);
         }
+        else
+        {
+            u64v = (u64_t *)as_i64(enum_val(obj));
+            if (filter)
+                for (i = 0; i < len; i++)
+                    out[i] = hash_index_u64(u64v[filter[i]], out[i]);
+            else
+                for (i = 0; i < len; i++)
+                    out[i] = hash_index_u64(u64v[i], out[i]);
+        }
+        break;
+    case TYPE_ANYMAP:
+        if (filter)
+            for (i = 0; i < len; i++)
+            {
+                v = at_idx(obj, filter[i]);
+                out[i] = hash_index_u64(hash_index_obj(v), out[i]);
+                drop_obj(v);
+            }
+        else
+            for (i = 0; i < len; i++)
+            {
+                v = at_idx(obj, i);
+                out[i] = hash_index_u64(hash_index_obj(v), out[i]);
+                drop_obj(v);
+            }
         break;
     default:
         panic("hash list: unsupported type: %d", obj->type);
@@ -931,7 +1079,7 @@ obj_p index_join_obj(obj_p lcols, obj_p rcols, u64_t len)
     res = vector_i64(maxi64(ll, rl));
 
     // Right hashes
-    __index_list_precalc_hash(rcols, (u64_t *)as_i64(res), len, rl);
+    __index_list_precalc_hash(rcols, (u64_t *)as_i64(res), len, rl, NULL, B8_TRUE);
     ctx = (__index_list_ctx_t){rcols, rcols, (u64_t *)as_i64(res)};
     for (i = 0; i < rl; i++)
     {
@@ -941,7 +1089,7 @@ obj_p index_join_obj(obj_p lcols, obj_p rcols, u64_t len)
     }
 
     // Left hashes
-    __index_list_precalc_hash(lcols, (u64_t *)as_i64(res), len, ll);
+    __index_list_precalc_hash(lcols, (u64_t *)as_i64(res), len, ll, NULL, B8_TRUE);
     ctx = (__index_list_ctx_t){rcols, lcols, (u64_t *)as_i64(res)};
     for (i = 0; i < ll; i++)
     {

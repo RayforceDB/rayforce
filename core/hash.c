@@ -111,18 +111,18 @@ i64_t ht_tab_next(obj_p *obj, i64_t key)
     size = as_list(*obj)[0]->len;
     keys = as_i64(as_list(*obj)[0]);
 
-    while (B8_TRUE)
+next:
+    for (i = (u64_t)key & (size - 1); i < size; i++)
     {
-        for (i = (u64_t)key & (size - 1); i < size; i++)
-        {
-            if ((keys[i] == NULL_I64) || (keys[i] == key))
-                return i;
-        }
-
-        rehash(obj, NULL, NULL);
-        size = as_list(*obj)[0]->len;
-        keys = as_i64(as_list(*obj)[0]);
+        if ((keys[i] == NULL_I64) || (keys[i] == key))
+            return i;
     }
+
+    rehash(obj, NULL, NULL);
+    size = as_list(*obj)[0]->len;
+    keys = as_i64(as_list(*obj)[0]);
+
+    goto next;
 }
 
 i64_t ht_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed)
@@ -133,18 +133,19 @@ i64_t ht_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *see
     size = as_list(*obj)[0]->len;
     keys = as_i64(as_list(*obj)[0]);
 
-    while (B8_TRUE)
+next:
+    for (i = hash(key, seed) & (size - 1); i < size; i++)
     {
-        for (i = hash(key, seed) & (size - 1); i < size; i++)
-        {
-            if (keys[i] == NULL_I64 || cmp(keys[i], key, seed) == 0)
-                return i;
-        }
-
-        rehash(obj, hash, seed);
-        size = as_list(*obj)[0]->len;
-        keys = as_i64(as_list(*obj)[0]);
+        if (keys[i] == NULL_I64 || cmp(keys[i], key, seed) == 0)
+            return i;
     }
+
+    rehash(obj, hash, seed);
+
+    size = as_list(*obj)[0]->len;
+    keys = as_i64(as_list(*obj)[0]);
+
+    goto next;
 }
 
 i64_t ht_tab_get(obj_p obj, i64_t key)
@@ -239,19 +240,6 @@ u64_t hash_fnv1a(i64_t key, nil_t *seed)
     }
 
     return hash;
-}
-
-u64_t hash_index_u64(u64_t h, u64_t k)
-{
-    u64_t a, b;
-
-    a = (h ^ k) * 0x9ddfea08eb382d69ull;
-    a ^= (a >> 47);
-    b = (roti64(k, 31) ^ a) * 0x9ddfea08eb382d69ull;
-    b ^= (b >> 47);
-    b *= 0x9ddfea08eb382d69ull;
-
-    return b;
 }
 
 u64_t hash_guid(i64_t a, nil_t *seed)

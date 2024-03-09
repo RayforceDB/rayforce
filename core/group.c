@@ -81,7 +81,7 @@ obj_p group_bins(obj_p obj, obj_p tab, obj_p filter)
 
 obj_p group_bins_list(obj_p obj, obj_p tab, obj_p filter)
 {
-    u64_t l;
+    u64_t i, c, n, l;
     i64_t *ids;
     obj_p bins;
 
@@ -101,6 +101,15 @@ obj_p group_bins_list(obj_p obj, obj_p tab, obj_p filter)
 
     if (l > ops_count(tab))
         throw(ERR_LENGTH, "'group index': groups count: %lld can't be greater than source length: %lld", l, ops_count(tab));
+
+    n = obj->len;
+
+    c = ops_count(as_list(obj)[0]);
+    for (i = 1; i < n; i++)
+    {
+        if (ops_count(as_list(obj)[i]) != c)
+            throw(ERR_LENGTH, "'group index': source length: %lld must be equal to groups count: %lld", ops_count(as_list(obj)[i]), c);
+    }
 
     bins = index_group_list(obj, ids, l);
 

@@ -26,7 +26,28 @@
 
 #include "rayforce.h"
 
-i64_t index_range(i64_t *pmin, i64_t *pmax, i64_t values[], i64_t filter[], u64_t len);
+typedef struct __index_list_ctx_t
+{
+    obj_p lcols;
+    obj_p rcols;
+    u64_t *hashes;
+} __index_list_ctx_t;
+
+typedef struct __find_ctx_t
+{
+    raw_p lobj;
+    raw_p robj;
+    u64_t *hashes;
+} __find_ctx_t;
+
+typedef struct index_scope_t
+{
+    i64_t min;
+    i64_t max;
+    u64_t range;
+} index_scope_t;
+
+index_scope_t index_scope(i64_t values[], i64_t filter[], u64_t len);
 obj_p index_distinct_i8(i8_t values[], u64_t len, b8_t term);
 obj_p index_distinct_i64(i64_t values[], u64_t len);
 obj_p index_distinct_guid(guid_t values[], u64_t len);
@@ -42,6 +63,6 @@ obj_p index_group_obj(obj_p values[], i64_t filter[], u64_t len);
 obj_p index_group_list(obj_p lst, i64_t filter[], u64_t len);
 obj_p index_group_cnts(obj_p grp);
 obj_p index_join_obj(obj_p lcols, obj_p rcols, u64_t len);
-nil_t index_hash_obj(obj_p obj, u64_t *out, u64_t len);
+nil_t index_hash_obj(obj_p obj, u64_t out[], i64_t filter[], u64_t len, b8_t deref);
 
 #endif // INDEX_H

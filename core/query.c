@@ -72,6 +72,10 @@ obj_p remap_group(obj_p *gvals, obj_p cols, obj_p tab, obj_p filter, obj_p gkeys
     {
     case -TYPE_SYMBOL:
         bins = group_bins(cols, tab, filter);
+
+        if (is_error(bins))
+            return bins;
+
         res = group_map(tab, bins, filter);
         v = (gcols == NULL_OBJ) ? aggr_first(cols, bins, filter) : aggr_first(gcols, bins, filter);
         if (is_error(v))
@@ -86,6 +90,10 @@ obj_p remap_group(obj_p *gvals, obj_p cols, obj_p tab, obj_p filter, obj_p gkeys
         return res;
     case TYPE_SYMBOL:
         bins = group_bins_list(cols, tab, filter);
+
+        if (is_error(bins))
+            return bins;
+
         res = group_map(tab, bins, filter);
 
         l = cols->len;
@@ -312,6 +320,8 @@ obj_p ray_select(obj_p obj)
         mount_env(val);
         drop_obj(val);
     }
+
+    // TODO !!!! Handle case when filters are 0-length list
 
     // Find all mappings (non-keyword fields)
     keys = get_fields(obj);
