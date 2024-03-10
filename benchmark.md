@@ -18,7 +18,7 @@ Q3: select id3, sum(v1) AS v1, mean(v3) AS v3 from t group by id3; --> 360ms
 Q4: select id4, mean(v1) AS v1, mean(v2) AS v2, mean(v3) AS v3 from t group by id4; --> 23ms
 Q5: select id6, sum(v1) AS v1, sum(v2) AS v2, sum(v3) AS v3 from t group by id6; --> 322ms
 Q6: select id3, max(v1)-min(v2) AS range_v1_v2 from t group by id3; --> 330ms
-Q7: select id1, id2, id3, id4, id5, id6, sum(v3) AS v3 count(*) AS count from t group by id1, id2, id3, id4, id5, id6; --> 878ms
+Q7: select id1, id2, id3, id4, id5, id6, sum(v3) AS v3, count(*) AS count from t group by id1, id2, id3, id4, id5, id6; --> 878ms
 
 ## DuckDB (multithread turned off)
 
@@ -29,7 +29,7 @@ Q3: select id3, sum(v1) AS v1, mean(v3) AS v3 from t group by id3; --> 601ms
 Q4: select id4, mean(v1) AS v1, mean(v2) AS v2, mean(v3) AS v3 from t group by id4; --> 108ms
 Q5: select id6, sum(v1) AS v1, sum(v2) AS v2, sum(v3) AS v3 from t group by id6; --> 440ms
 Q6: select id3, max(v1)-min(v2) AS range_v1_v2 from t group by id3; --> 528ms
-Q7: select id1, id2, id3, id4, id5, id6, sum(v3) AS v3 count(*) AS count from t group by id1, id2, id3, id4, id5, id6; --> 3269ms
+Q7: select id1, id2, id3, id4, id5, id6, sum(v3) AS v3, count(*) AS count from t group by id1, id2, id3, id4, id5, id6; --> 3269ms
 
 ## KDB+ (4.0)
 
