@@ -89,7 +89,7 @@ Load CSV: ```t: ("SSSJJJJJF";enlist",") 0: `$":./db-benchmark/G1_1e7_1e2_0_0.csv
 - Q3: ```\t 0N#.?[t;();`id3!`id3;`v2`v3!((sum;`v2);(avg;`v3))] --> 507ms```
 - Q4: ```\t 0N#.?[t;();`id4!`id4;`v1`v2`v3!((avg;`v1);(avg;`v2);(avg;`v3))] --> 285ms```
 - Q5: ```\t 0N#.?[t;();`id6!`id6;`v1`v2`v3!((sum;`v1);(sum;`v2);(sum;`v3))] --> 488ms```
-- Q6: ```N/A```
+- Q6: ```\t 0N#.?[?[t;();`id3!`id3;`v1`v2!((max;`v1);(min;`v2))];();0b;`id3`range_v1_v2!(`id3;(-;`v1;`v2))] --> 465ms```
 - Q7: ```\t 0N#.?[t;();`id1`id2`id3`id4`id5`id6!`id1`id2`id3`id4`id5`id6;`v3`count!((sum;`v3);(count;`v3))] --> 15712ms```
 
 ### Group By Results
@@ -100,7 +100,7 @@ Load CSV: ```t: ("SSSJJJJJF";enlist",") 0: `$":./db-benchmark/G1_1e7_1e2_0_0.csv
 | DuckDB (multithread turned off) | 347 | 690 | 601 | 108 | 440 | 528 | 3269  |
 | ? (4.0)                         | 59  | 143 | 166 | 99  | 156 | 551 | 4497  |
 | Rayforce                        | 60  | 74  | 118 | 72  | 122 | 104 | 1394  |
-| ThePlatform                     | 213 | 723 | 507 | 285 | 488 | N/A | 15712 |
+| ThePlatform                     | 213 | 723 | 507 | 285 | 488 | 465 | 15712 |
 
 ## Join Benchmark
 
