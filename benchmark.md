@@ -7,9 +7,22 @@
 Dataset: G1_1e7_1e2_0_0.csv (10 million rows)
 
 Ubuntu:
-> sudo apt install r-base
-run R and then in a R console type: install.packages("data.table")
-> Rscript _data/groupby-datagen.R 1e7 1e2 0 0
+
+```sh
+sudo apt install r-base
+```
+
+Run `R` and then in a R console type: 
+
+```sh
+install.packages("data.table")
+```
+
+Exit from R and type in a terminal:
+
+```sh
+Rscript _data/groupby-datagen.R 1e7 1e2 0 0
+```
 
 ### DuckDB (multithread turned on)
 
