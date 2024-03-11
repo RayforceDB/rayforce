@@ -44,6 +44,7 @@ Load CSV: ```create table t as SELECT * FROM read_csv('./db-benchmark/G1_1e7_1e2
 ### DuckDB (multithread turned off)
 
 ```.timer "on"```
+```SET threads = 1;```
 
 Load CSV: ```create table t as SELECT * FROM read_csv('./db-benchmark/G1_1e7_1e2_0_0.csv');```
 
@@ -107,6 +108,30 @@ Load CSV: ```t: ("SSSJJJJJF";enlist",") 0: `$":./db-benchmark/G1_1e7_1e2_0_0.csv
 Rscript _data/join-datagen.R 1e7 1e2 0 0
 ```
 
+### DuckDB (multithread turned on)
+
+```.timer "on"```
+
+Load CSV:
+
+- x: ```create table x as SELECT * FROM read_csv('./db-benchmark/J1_1e7_NA_0_0.csv');```
+- y: ```create table y as SELECT * FROM read_csv('./db-benchmark/J1_1e7_1e7_0_0.csv');```
+
+Queries:
+
+- Q1: ```select * from x left join y on x.id1 = y.id1 and x.id2 = y.id2; --> OOM```
+- Q2: ```select * from x inner join y on x.id1 = y.id1 and x.id2 = y.id2; --> OOM```
+
+### DuckDB (multithread turned off)
+
+```.timer "on"```
+```SET threads = 1;```
+
+Queries:
+
+- Q1: ```select * from x left join y on x.id1 = y.id1 and x.id2 = y.id2; --> OOM```
+- Q2: ```select * from x inner join y on x.id1 = y.id1 and x.id2 = y.id2; --> OOM```
+ 
 ### ? (4.0)
 
 Load CSV:
@@ -117,7 +142,7 @@ Load CSV:
 Queries:
 
 - Q1: ```\t x lj 2!y --> 3174ms```
-- Q2: ```\t x ij 2!y --> 3902ms```
+- Q2: ```\t x ij 2!y --> 3098ms```
 
 ### Rayforce
 
@@ -125,6 +150,11 @@ Load CSV:
 
 - ```(set x (csv [I64 I64 I64 Symbol Symbol Symbol F64] "./db-benchmark/J1_1e7_NA_0_0.csv"))```
 - ```(set y (csv [I64 I64 I64 Symbol Symbol Symbol F64] "./db-benchmark/J1_1e7_1e7_0_0.csv"))```
+
+Queries:
+
+- Q1: ```\t (lj [id1 id2] x y) --> 3149ms```
+- Q2: ```\t (ij [id1 id2] x y) --> 1610ms```
 
 ### ThePlatform
 
@@ -138,3 +168,4 @@ Queries:
 - Q1: ```\t 0N#.(?[lj[(`x;x);(`y;y);((~`x`id1;~`x`id2);(~`y`id1;~`y`id2))]; (); 0b; `a`b`c`d`e`f`g`h!(~`y`id1;~`y`id2;`y`id3;~`y`id4;~`y`id5;~`y`id6;~`x`v1;~`y`v2)]) --> 23987ms```
  
 - Q2: ```\t 0N#.(?[ij[(`x;x);(`y;y);((~`x`id1;~`x`id2);(~`y`id1;~`y`id2))]; (); 0b; `a`b`c`d`e`f`g`h!(~`y`id1;~`y`id2;`y`id3;~`y`id4;~`y`id5;~`y`id6;~`x`v1;~`y`v2)]) --> 34104ms```
+  
