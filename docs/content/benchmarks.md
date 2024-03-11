@@ -169,3 +169,13 @@ Queries:
  
 - Q2: ```\t 0N#.(?[ij[(`x;x);(`y;y);((~`x`id1;~`x`id2);(~`y`id1;~`y`id2))]; (); 0b; `a`b`c`d`e`f`g`h!(~`y`id1;~`y`id2;`y`id3;~`y`id4;~`y`id5;~`y`id6;~`x`v1;~`y`v2)]) --> 34104ms```
   
+
+### Join Results
+
+| DB                              | Q1    | Q2    |
+| ------------------------------- | ----- | ----- |
+| DuckDB (multithread turned on)  | OOM   | OOM   |
+| DuckDB (multithread turned off) | OOM   | OOM   |
+| ? (4.0)                         | 3174  | 3098  |
+| Rayforce                        | 3149  | 1610  |
+| ThePlatform                     | 23987 | 34104 |
