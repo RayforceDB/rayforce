@@ -1,0 +1,140 @@
+# :material-speedometer: DB(s) Benchmark
+
+For benches we are using the following tool:
+[H2OAI Bench](https://h2oai.github.io/db-benchmark)
+
+## Prerequisites
+
+Ubuntu:
+
+```sh
+sudo apt install r-base
+```
+
+Run `R` and then in a R console type: 
+
+```sh
+install.packages("data.table")
+```
+
+Exit from R and type in a terminal:
+
+```sh
+Rscript _data/groupby-datagen.R 1e7 1e2 0 0
+```
+
+## Group By behchmark
+
+Dataset: G1_1e7_1e2_0_0.csv (10 million rows)
+
+### DuckDB (multithread turned on)
+
+```.timer "on"```
+
+Load CSV: ```create table t as SELECT * FROM read_csv('./db-benchmark/G1_1e7_1e2_0_0.csv');```
+
+- Q1: ```select id1, sum(v1) AS v1 from t group by id1; --> 63ms```
+- Q2: ```select id1, id2, sum(v1) AS v1 from t group by id1, id2; --> 153ms```
+- Q3: ```select id3, sum(v1) AS v1, mean(v3) AS v3 from t group by id3; --> 360ms```
+- Q4: ```select id4, mean(v1) AS v1, mean(v2) AS v2, mean(v3) AS v3 from t group by id4; --> 23ms```
+- Q5: ```select id6, sum(v1) AS v1, sum(v2) AS v2, sum(v3) AS v3 from t group by id6; --> 322ms```
+- Q6: ```select id3, max(v1)-min(v2) AS range_v1_v2 from t group by id3; --> 330ms```
+- Q7: ```select id1, id2, id3, id4, id5, id6, sum(v3) AS v3, count(*) AS count from t group by id1, id2, id3, id4, id5, id6; --> 878ms```
+
+### DuckDB (multithread turned off)
+
+```.timer "on"```
+
+Load CSV: ```create table t as SELECT * FROM read_csv('./db-benchmark/G1_1e7_1e2_0_0.csv');```
+
+- Q1: ```select id1, sum(v1) AS v1 from t group by id1; --> 347ms```
+- Q2: ```select id1, id2, sum(v1) AS v1 from t group by id1, id2; --> 690ms```
+- Q3: ```select id3, sum(v1) AS v1, mean(v3) AS v3 from t group by id3; --> 601ms```
+- Q4: ```select id4, mean(v1) AS v1, mean(v2) AS v2, mean(v3) AS v3 from t group by id4; --> 108ms```
+- Q5: ```select id6, sum(v1) AS v1, sum(v2) AS v2, sum(v3) AS v3 from t group by id6; --> 440ms```
+- Q6: ```select id3, max(v1)-min(v2) AS range_v1_v2 from t group by id3; --> 528ms```
+- Q7: ```select id1, id2, id3, id4, id5, id6, sum(v3) AS v3, count(*) AS count from t group by id1, id2, id3, id4, id5, id6; --> 3269ms```
+
+### ? (4.0)
+
+Load CSV: ```t: ("SSSJJJJJF";enlist",") 0: hsym `$":./db-benchmark/G1_1e7_1e2_0_0.csv"```
+
+- Q1: ```\t select v1: sum v1 by id1 from t --> 59ms```
+- Q2: ```\t select v1: sum v1 by id1, id2 from t --> 143ms```
+- Q3: ```\t select v1: sum v1, v3: avg v3 by id3 from t --> 166ms```
+- Q4: ```\t select v1: avg v1, v2: avg v2, v3: avg v3 by id4 from t --> 99ms```
+- Q5: ```\t select v1: sum v1, v2: sum v2, v3: sum v3 by id6 from t --> 156ms```
+- Q6: ```\t select range_v1_v2: (max v1) - (min v2) by id3 from t --> 551ms```
+- Q7: ```\t select v3: sum v3, cnt: count i by id1, id2, id3, id4, id5, id6 from t --> 4497ms```
+
+### Rayforce
+
+Load CSV: ```(set t (csv [Symbol Symbol Symbol I64 I64 I64 I64 I64 F64] "./db-benchmark/G1_1e7_1e2_0_0.csv"))```
+
+- Q1: ```\t (select {v1: (sum v1) from: t by: id1}) --> 60ms```
+- Q2: ```\t (select {v1: (sum v1) from: t by: {id1: id1 id2: id2}}) --> 74ms```
+- Q3: ```\t (select {v1: (sum v1) v3: (avg v3) from: t by: id3}) --> 118ms```
+- Q4: ```\t (select {v1: (avg v1) v2: (avg v2) v3: (avg v3) from: t by: id4}) --> 72ms```
+- Q5: ```\t (select {v1: (sum v1) v2: (sum v2) v3: (sum v3) from: t by: id6}) --> 122ms```
+- Q6: ```\t (select {range_v1_v2: (- (max v1) (min v2)) from: t by: id3}) --> 104ms```
+- Q7: ```\t (select {v3: (sum v3) count: (map count v3) from: t by: {id1: id1 id2: id2 id3: id3 id4: id4 id5: id5 id6: id6}}) --> 1394ms```
+
+### ThePlatform
+
+Load CSV: ```t: ("SSSJJJJJF";enlist",") 0: `$":./db-benchmark/G1_1e7_1e2_0_0.csv"```
+
+- Q1: ```\t 0N#.?[t;();`id1!`id1;`v1!(sum;`v1)] --> 213ms```
+- Q2: ```\t 0N#.?[t;();`id1`id2!`id1`id2;`v1!(sum;`v1)] --> 723ms```
+- Q3: ```\t 0N#.?[t;();`id3!`id3;`v2`v3!((sum;`v2);(avg;`v3))] --> 507ms```
+- Q4: ```\t 0N#.?[t;();`id4!`id4;`v1`v2`v3!((avg;`v1);(avg;`v2);(avg;`v3))] --> 285ms```
+- Q5: ```\t 0N#.?[t;();`id6!`id6;`v1`v2`v3!((sum;`v1);(sum;`v2);(sum;`v3))] --> 488ms```
+- Q6: ```N/A```
+- Q7: ```\t 0N#.?[t;();`id1`id2`id3`id4`id5`id6!`id1`id2`id3`id4`id5`id6;`v3`count!((sum;`v3);(count;`v3))] --> 15712ms```
+
+### Group By Results
+
+| DB                              | Q1  | Q2  | Q3  | Q4  | Q5  | Q6  | Q7    |
+| ------------------------------- | --- | --- | --- | --- | --- | --- | ----- |
+| DuckDB (multithread turned on)  | 63  | 153 | 360 | 23  | 322 | 330 | 878   |
+| DuckDB (multithread turned off) | 347 | 690 | 601 | 108 | 440 | 528 | 3269  |
+| ? (4.0)                         | 59  | 143 | 166 | 99  | 156 | 551 | 4497  |
+| Rayforce                        | 60  | 74  | 118 | 72  | 122 | 104 | 1394  |
+| ThePlatform                     | 213 | 723 | 507 | 285 | 488 | N/A | 15712 |
+
+## Join Benchmark
+
+```sh
+Rscript _data/join-datagen.R 1e7 1e2 0 0
+```
+
+### ? (4.0)
+
+Load CSV:
+
+- x: ```("JJJSSSF";enlist",") 0: `$":./db-benchmark/J1_1e7_NA_0_0.csv"```
+- y: ```("JJJSSSF";enlist",") 0: `$":./db-benchmark/J1_1e7_1e7_0_0.csv"```
+  
+Queries:
+
+- Q1: ```\t x lj 2!y --> 3174ms```
+- Q2: ```\t x ij 2!y --> 3902ms```
+
+### Rayforce
+
+Load CSV:
+
+- ```(set x (csv [I64 I64 I64 Symbol Symbol Symbol F64] "./db-benchmark/J1_1e7_NA_0_0.csv"))```
+- ```(set y (csv [I64 I64 I64 Symbol Symbol Symbol F64] "./db-benchmark/J1_1e7_1e7_0_0.csv"))```
+
+### ThePlatform
+
+Load CSV:
+
+- x: ```("JJJSSSF";enlist",") 0: `$":./db-benchmark/J1_1e7_NA_0_0.csv"```
+- y: ```("JJJSSSF";enlist",") 0: `$":./db-benchmark/J1_1e7_1e7_0_0.csv"```
+
+Queries:
+
+- Q1: ```\t 0N#.(?[lj[(`x;x);(`y;y);((~`x`id1;~`x`id2);(~`y`id1;~`y`id2))]; (); 0b; `a`b`c`d`e`f`g`h!(~`y`id1;~`y`id2;`y`id3;~`y`id4;~`y`id5;~`y`id6;~`x`v1;~`y`v2)]) --> 23987ms```
+ 
+- Q2: ```\t 0N#.(?[ij[(`x;x);(`y;y);((~`x`id1;~`x`id2);(~`y`id1;~`y`id2))]; (); 0b; `a`b`c`d`e`f`g`h!(~`y`id1;~`y`id2;`y`id3;~`y`id4;~`y`id5;~`y`id6;~`x`v1;~`y`v2)]) --> 34104ms```

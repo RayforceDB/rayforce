@@ -109,6 +109,7 @@ nav:
     - Getting Started: 
       - Install: content/getstarted/install.md
       - Tutorial: content/getstarted/tutorial.md
+    - Benchmarks: content/benchmarks.md
     - Reference card: content/reference.md
     - Syntax: content/syntax.md
     - Atomic functions: content/atomic.md
