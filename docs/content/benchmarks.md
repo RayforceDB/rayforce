@@ -56,6 +56,21 @@ Load CSV: ```create table t as SELECT * FROM read_csv('./db-benchmark/G1_1e7_1e2
 - Q6: ```select id3, max(v1)-min(v2) AS range_v1_v2 from t group by id3; --> 528ms```
 - Q7: ```select id1, id2, id3, id4, id5, id6, sum(v3) AS v3, count(*) AS count from t group by id1, id2, id3, id4, id5, id6; --> 3269ms```
 
+### ClickHouse 
+
+Load CSV: ```CREATE TABLE t (id1 String, id2 String, id3 String, id4 Int64, id5 Int64, id6 Int64, v1 Int64, v2 Int64, v3 Float64) ENGINE = Memory;```
+
+clickhouse-client -q "INSERT INTO default.t FORMAT CSV" < ./db-benchmark/G1_1e7_1e2_0_0.csv
+
+- Q1: ```select id1, sum(v1) AS v1 from t group by id1; --> 51ms```
+- Q2: ```select id1, id2, sum(v1) AS v1 from t group by id1, id2; --> 189ms```
+- Q3: ```select id3, sum(v1) AS v1, avg(v3) AS v3 from t group by id3; --> 235ms```
+- Q4: ```select id4, avg(v1) AS v1, avg(v2) AS v2, avg(v3) AS v3 from t group by id4; --> 47ms```
+- Q5: ```select id6, sum(v1) AS v1, sum(v2) AS v2, sum(v3) AS v3 from t group by id6; --> 265ms```
+- Q6: ```select id3, max(v1)-min(v2) AS range_v1_v2 from t group by id3; --> 249ms```
+- Q7: ```select id1, id2, id3, id4, id5, id6, sum(v3) AS v3, count(*) AS count from t group by id1, id2, id3, id4, id5, id6; --> 1732ms```
+
+
 ### ? (4.0)
 
 Load CSV: ```t: ("SSSJJJJJF";enlist",") 0: hsym `$":./db-benchmark/G1_1e7_1e2_0_0.csv"```
@@ -98,6 +113,7 @@ Load CSV: ```t: ("SSSJJJJJF";enlist",") 0: `$":./db-benchmark/G1_1e7_1e2_0_0.csv
 | ------------------------------- | --- | --- | --- | --- | --- | --- | ----- |
 | DuckDB (multithread turned on)  | 63  | 153 | 360 | 23  | 322 | 330 | 878   |
 | DuckDB (multithread turned off) | 347 | 690 | 601 | 108 | 440 | 528 | 3269  |
+| ClickHouse                      | 51  | 189 | 235 | 47  | 265 | 249 | 1732  |
 | ? (4.0)                         | 59  | 143 | 166 | 99  | 156 | 551 | 4497  |
 | Rayforce                        | 60  | 74  | 118 | 72  | 122 | 104 | 1394  |
 | ThePlatform                     | 213 | 723 | 507 | 285 | 488 | 465 | 15712 |
@@ -131,7 +147,22 @@ Queries:
 
 - Q1: ```select * from x left join y on x.id1 = y.id1 and x.id2 = y.id2; --> OOM```
 - Q2: ```select * from x inner join y on x.id1 = y.id1 and x.id2 = y.id2; --> OOM```
- 
+
+### ClickHouse
+
+Load CSV:
+
+- ```CREATE TABLE x (id1 Int64, id2 Int64, id3 Int64, id4 String, id5 String, id6 String, v1 Float64) ENGINE = Memory;```
+- ```CREATE TABLE y (id1 Int64, id2 Int64, id3 Int64, id4 String, id5 String, id6 String, v2 Float64) ENGINE = Memory;```
+
+clickhouse-client -q "INSERT INTO default.x FORMAT CSV" < ./db-benchmark/J1_1e7_NA_0_0.csv
+clickhouse-client -q "INSERT INTO default.y FORMAT CSV" < ./db-benchmark/J1_1e7_1e7_0_0.csv
+
+Queries:
+
+- Q1: ```select * from x left join y on x.id1 = y.id1 and x.id2 = y.id2; --> OOM```
+- Q2: ```select * from x inner join y on x.id1 = y.id1 and x.id2 = y.id2; --> OOM```
+
 ### ? (4.0)
 
 Load CSV:
@@ -176,6 +207,7 @@ Queries:
 | ------------------------------- | ----- | ----- |
 | DuckDB (multithread turned on)  | OOM   | OOM   |
 | DuckDB (multithread turned off) | OOM   | OOM   |
+| ClickHouse                      | OOM   | OOM   |
 | ? (4.0)                         | 3174  | 3098  |
 | Rayforce                        | 3149  | 1610  |
 | ThePlatform                     | 23987 | 34104 |
