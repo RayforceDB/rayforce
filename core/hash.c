@@ -52,7 +52,7 @@ obj_p ht_tab(u64_t size, i8_t vals)
     return dict(k, v);
 }
 
-nil_t rehash(obj_p *obj, hash_f hash, nil_t *seed)
+nil_t rehash(obj_p *obj, hash_f hash, raw_p seed)
 {
     u64_t i, j, size, key, factor;
     obj_p new_obj;
@@ -125,7 +125,7 @@ next:
     goto next;
 }
 
-i64_t ht_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed)
+i64_t ht_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed)
 {
     u64_t i, size;
     i64_t *keys;
@@ -167,7 +167,7 @@ i64_t ht_tab_get(obj_p obj, i64_t key)
     return NULL_I64;
 }
 
-i64_t ht_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed)
+i64_t ht_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed)
 {
     u64_t i, size;
     i64_t *keys;
@@ -242,7 +242,7 @@ u64_t hash_fnv1a(i64_t key, nil_t *seed)
     return hash;
 }
 
-u64_t hash_guid(i64_t a, nil_t *seed)
+u64_t hash_guid(i64_t a, raw_p seed)
 {
     unused(seed);
     guid_t *g = (guid_t *)a;
@@ -256,25 +256,25 @@ u64_t hash_guid(i64_t a, nil_t *seed)
     return upper_part ^ lower_part;
 }
 
-u64_t hash_obj(i64_t a, nil_t *seed)
+u64_t hash_obj(i64_t a, raw_p seed)
 {
     unused(seed);
     return hash_index_obj((obj_p)a);
 }
 
-i64_t hash_cmp_i64(i64_t a, i64_t b, nil_t *seed)
+i64_t hash_cmp_i64(i64_t a, i64_t b, raw_p seed)
 {
     unused(seed);
     return a - b;
 }
 
-i64_t hash_cmp_obj(i64_t a, i64_t b, nil_t *seed)
+i64_t hash_cmp_obj(i64_t a, i64_t b, raw_p seed)
 {
     unused(seed);
     return cmp_obj((obj_p)a, (obj_p)b);
 }
 
-i64_t hash_cmp_guid(i64_t a, i64_t b, nil_t *seed)
+i64_t hash_cmp_guid(i64_t a, i64_t b, raw_p seed)
 {
     unused(seed);
     guid_t *g1 = (guid_t *)a, *g2 = (guid_t *)b;

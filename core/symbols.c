@@ -33,109 +33,162 @@
 #include "runtime.h"
 #include "ops.h"
 
-#define SYMBOLS_POOL_SIZE 2
-
-typedef struct str_slice_t
-{
-    str_p str;
-    i64_t len;
-} str_slice_t;
+#define SYMBOLS_POOL_SIZE 4096
 
 /*
- * Improved djb2 (contains length)
- * by Dan Bernstein
- * http://www.cse.yorku.ca/~oz/hash.html
+ * Simplefied version of murmurhash
  */
-u64_t string_hash(i64_t val, nil_t *seed)
+u64_t str_hash(str_p key, u64_t len)
 {
-    unused(seed);
-    str_slice_t *string;
-    u64_t hash = 5381, len, i;
-    str_p str;
+    u64_t i, k, k1;
+    u64_t hash = 0x1234ABCD1234ABCD;
+    u64_t c1 = 0x87c37b91114253d5ULL;
+    u64_t c2 = 0x4cf5ad432745937fULL;
+    const int r1 = 31;
+    const int r2 = 27;
+    const u64_t m = 5ULL;
+    const u64_t n = 0x52dce729ULL;
 
-    if ((1ull << 63) & val)
+    // Process each 8-byte block of the key
+    for (i = 0; i + 7 < len; i += 8)
     {
-        string = (str_slice_t *)(val & ~(1ull << 63));
-        len = string->len;
-        str = string->str;
-    }
-    else
-    {
-        str = (str_p)val;
-        len = strlen(str);
+        k = (u64_t)key[i] |
+            ((u64_t)key[i + 1] << 8) |
+            ((u64_t)key[i + 2] << 16) |
+            ((u64_t)key[i + 3] << 24) |
+            ((u64_t)key[i + 4] << 32) |
+            ((u64_t)key[i + 5] << 40) |
+            ((u64_t)key[i + 6] << 48) |
+            ((u64_t)key[i + 7] << 56);
+
+        k *= c1;
+        k = (k << r1) | (k >> (64 - r1));
+        k *= c2;
+
+        hash ^= k;
+        hash = ((hash << r2) | (hash >> (64 - r2))) * m + n;
     }
 
-    for (i = 0; i < len; i++)
-        hash += (hash << 5) + str[i];
+    // Process the tail of the data
+    k1 = 0;
+    switch (len & 7)
+    {
+    case 7:
+        k1 ^= ((u64_t)key[i + 6]) << 48;
+    case 6:
+        k1 ^= ((u64_t)key[i + 5]) << 40;
+    case 5:
+        k1 ^= ((u64_t)key[i + 4]) << 32;
+    case 4:
+        k1 ^= ((u64_t)key[i + 3]) << 24;
+    case 3:
+        k1 ^= ((u64_t)key[i + 2]) << 16;
+    case 2:
+        k1 ^= ((u64_t)key[i + 1]) << 8;
+    case 1:
+        k1 ^= ((u64_t)key[i]);
+        k1 *= c1;
+        k1 = (k1 << r1) | (k1 >> (64 - r1));
+        k1 *= c2;
+        hash ^= k1;
+    }
+
+    // Finalize the hash
+    hash ^= len;
+    hash ^= (hash >> 33);
+    hash *= 0xff51afd7ed558ccdULL;
+    hash ^= (hash >> 33);
+    hash *= 0xc4ceb9fe1a85ec53ULL;
+    hash ^= (hash >> 33);
 
     return hash;
 }
 
-/*
- * Compares str_slice_t with null terminated string.
- * Returns 0 if equal, 1 if not equal.
- * Should not be used elsewere but symbols
- * a: raw C string already stored in a hash
- * b: str_slice_t string to be inserted
- */
-i64_t string_str_cmp(i64_t a, i64_t b, nil_t *seed)
+u64_t string_hash(i64_t key, raw_p seed)
 {
     unused(seed);
-    str_p str_a = (str_p)a;
-    str_slice_t *str_b = (str_slice_t *)(b & ~(1ull << 63));
+    symbol_p sym = (symbol_p)key;
 
-    i64_t len_a = strlen(str_a);
+    return str_hash(sym->str, sym->len);
+}
 
-    if (str_b->len != len_a)
+i64_t str_cmp(str_p a, u64_t aln, str_p b, u64_t bln)
+{
+    if (aln != bln)
         return 1;
 
-    return strncmp(str_b->str, str_a, len_a);
+    return strncmp(a, b, aln);
+}
+
+i64_t symbols_next(obj_p *obj, str_p str, u64_t len)
+{
+    u64_t i, size;
+    i64_t *keys;
+    symbol_p sym;
+
+    size = as_list(*obj)[0]->len;
+    keys = as_i64(as_list(*obj)[0]);
+
+next:
+    for (i = str_hash(str, len) & (size - 1); i < size; i++)
+    {
+        sym = (symbol_p)keys[i];
+        if (keys[i] == NULL_I64 || str_cmp(sym->str, sym->len, str, len) == 0)
+            return i;
+    }
+
+    rehash(obj, &string_hash, NULL);
+
+    size = as_list(*obj)[0]->len;
+    keys = as_i64(as_list(*obj)[0]);
+
+    goto next;
 }
 
 /*
  * Allocate a new pool node for the strings pool.
  */
-pool_node_t *pool_node_new(nil_t)
+pool_node_p pool_node_new(nil_t)
 {
-    pool_node_t *node = (pool_node_t *)mmap_malloc(STRINGS_POOL_SIZE);
-    memset(node, 0, STRINGS_POOL_SIZE);
-
-    return node;
+    return (pool_node_p)mmap_malloc(STRINGS_POOL_SIZE);
 }
 
-nil_t pool_node_free(pool_node_t *node)
+nil_t pool_node_free(pool_node_p node)
 {
     mmap_free(node, STRINGS_POOL_SIZE);
 }
 
-str_p str_intern(symbols_t *symbols, str_p str, i64_t len)
+symbol_p str_intern(symbols_p symbols, str_p str, u64_t len)
 {
-    str_p p = symbols->strings_pool;
+    symbol_p sym = symbols->symbols_pool;
+    u64_t size = alignup(sizeof(struct symbol_t) + len + 1, sizeof(struct symbol_t));
+    pool_node_p node;
 
     // Allocate new pool node
-    if ((i64_t)symbols->strings_pool + len - (i64_t)symbols->pool_node + 1 >= STRINGS_POOL_SIZE)
+    if ((i64_t)symbols->symbols_pool + size - (i64_t)symbols->pool_node >= STRINGS_POOL_SIZE)
     {
-        pool_node_t *node = pool_node_new();
+        node = pool_node_new();
         symbols->pool_node->next = node;
         symbols->pool_node = node;
-        symbols->strings_pool = (str_p)(node + sizeof(pool_node_t *)); // Skip the node size of next ptr
-        p = symbols->strings_pool;
+        symbols->symbols_pool = (symbol_p)(node + sizeof(pool_node_p)); // Skip the node size of next ptr
+        sym = symbols->symbols_pool;
     }
 
-    strncpy(symbols->strings_pool, str, len);
-    symbols->strings_pool += len + 1; // +1 for null terminator (buffer is zeroed)
-    return p;
+    sym->len = len;
+    strncpy(sym->str, str, len);
+    symbols->symbols_pool += size;
+
+    return sym;
 }
 
-symbols_t *symbols_new(nil_t)
+symbols_p symbols_new(nil_t)
 {
-    symbols_t *symbols = (symbols_t *)mmap_malloc(sizeof(struct symbols_t));
-    pool_node_t *node = pool_node_new();
+    symbols_p symbols = (symbols_p)mmap_malloc(sizeof(struct symbols_t));
+    pool_node_p node = pool_node_new();
 
     symbols->pool_node_0 = node;
     symbols->pool_node = node;
-    symbols->strings_pool = (str_p)(node + sizeof(pool_node_t *)); // Skip the node size of next ptr
-
+    symbols->symbols_pool = (symbol_p)(node + sizeof(pool_node_p)); // Skip the node size of next ptr
     symbols->str_po_id = ht_tab(SYMBOLS_POOL_SIZE, TYPE_I64);
     symbols->id_to_str = ht_tab(SYMBOLS_POOL_SIZE, TYPE_I64);
     symbols->next_sym_id = 0;
@@ -143,13 +196,13 @@ symbols_t *symbols_new(nil_t)
     return symbols;
 }
 
-nil_t symbols_free(symbols_t *symbols)
+nil_t symbols_free(symbols_p symbols)
 {
-    pool_node_t *node = symbols->pool_node_0;
+    pool_node_p node = symbols->pool_node_0;
 
     while (node)
     {
-        pool_node_t *next = node->next;
+        pool_node_p next = node->next;
         pool_node_free(node);
         node = next;
     }
@@ -158,19 +211,17 @@ nil_t symbols_free(symbols_t *symbols)
     drop_obj(symbols->id_to_str);
 }
 
-i64_t intern_symbol(str_p s, i64_t len)
+i64_t intern_symbol(str_p s, u64_t len)
 {
-    str_p p;
-    symbols_t *symbols = runtime_get()->symbols;
-    str_slice_t str_slice = {s, len};
-    i64_t idx = ht_tab_next_with(&symbols->str_po_id, (1ull << 63) | (i64_t)&str_slice,
-                                 &string_hash, &string_str_cmp, NULL);
+    symbol_p sym;
+    symbols_p symbols = runtime_get()->symbols;
+    i64_t idx = symbols_next(&symbols->str_po_id, s, len);
 
     // insert new symbol
     if (as_i64(as_list(symbols->str_po_id)[0])[idx] == NULL_I64)
     {
-        p = str_intern(symbols, s, len);
-        as_i64(as_list(symbols->str_po_id)[0])[idx] = (i64_t)p;
+        sym = str_intern(symbols, s, len);
+        as_i64(as_list(symbols->str_po_id)[0])[idx] = (i64_t)sym;
         as_i64(as_list(symbols->str_po_id)[1])[idx] = symbols->next_sym_id;
 
         // insert id into id_to_str
@@ -178,7 +229,7 @@ i64_t intern_symbol(str_p s, i64_t len)
         debug_assert(as_i64(as_list(symbols->id_to_str)[0])[idx] == NULL_I64, "Symbol id: '%lld' already exists",
                      symbols->next_sym_id);
         as_i64(as_list(symbols->id_to_str)[0])[idx] = symbols->next_sym_id;
-        as_i64(as_list(symbols->id_to_str)[1])[idx] = (i64_t)p;
+        as_i64(as_list(symbols->id_to_str)[1])[idx] = (i64_t)sym;
 
         return symbols->next_sym_id++;
     }
@@ -189,22 +240,26 @@ i64_t intern_symbol(str_p s, i64_t len)
 
 str_p strof_sym(i64_t key)
 {
-    symbols_t *symbols = runtime_get()->symbols;
+    symbols_p symbols = runtime_get()->symbols;
     i64_t idx = ht_tab_next(&symbols->id_to_str, key);
+    symbol_p sym;
+
     if (as_i64(as_list(symbols->id_to_str)[0])[idx] == NULL_I64)
         return "";
 
-    return (str_p)as_i64(as_list(symbols->id_to_str)[1])[idx];
+    sym = (symbol_p)as_i64(as_list(symbols->id_to_str)[1])[idx];
+
+    return sym->str;
 }
 
-u64_t symbols_count(symbols_t *symbols)
+u64_t symbols_count(symbols_p symbols)
 {
     return symbols->next_sym_id;
 }
 
-u64_t symbols_memsize(symbols_t *symbols)
+u64_t symbols_memsize(symbols_p symbols)
 {
-    pool_node_t *node = symbols->pool_node_0;
+    pool_node_p node = symbols->pool_node_0;
     u64_t size = 0;
 
     // calculate all nodes

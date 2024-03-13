@@ -78,7 +78,7 @@ obj_p ray_memstat(obj_p *x, u64_t n)
     unused(n);
     obj_p keys, vals;
     memstat_t stat = heap_memstat();
-    symbols_t *symbols = runtime_get()->symbols;
+    symbols_p symbols = runtime_get()->symbols;
 
     keys = vector_symbol(4);
     ins_sym(&keys, 0, "msys");

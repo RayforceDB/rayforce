@@ -37,7 +37,13 @@ Holds memory for strings pool as a node in a linked list
 typedef struct pool_node_t
 {
     struct pool_node_t *next;
-} pool_node_t;
+} *pool_node_p;
+
+typedef struct symbol_t
+{
+    u64_t len;
+    i8_t str[];
+} *symbol_p;
 
 /*
  *Intern symbols here. Assume symbols are never freed.
@@ -47,16 +53,16 @@ typedef struct symbols_t
     i64_t next_sym_id;
     obj_p str_po_id;
     obj_p id_to_str;
-    pool_node_t *pool_node_0;
-    pool_node_t *pool_node;
-    str_p strings_pool;
-} symbols_t;
+    pool_node_p pool_node_0;
+    pool_node_p pool_node;
+    symbol_p symbols_pool;
+} *symbols_p;
 
-i64_t intern_symbol(str_p s, i64_t len);
-symbols_t *symbols_new(nil_t);
-nil_t symbols_free(symbols_t *symbols);
+i64_t intern_symbol(str_p s, u64_t len);
+symbols_p symbols_new(nil_t);
+nil_t symbols_free(symbols_p symbols);
 str_p strof_sym(i64_t key);
-u64_t symbols_count(symbols_t *symbols);
-u64_t symbols_memsize(symbols_t *symbols);
+u64_t symbols_count(symbols_p symbols);
+u64_t symbols_memsize(symbols_p symbols);
 
 #endif // SYMBOLS_H

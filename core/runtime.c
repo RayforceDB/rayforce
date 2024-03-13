@@ -157,7 +157,7 @@ nil_t runtime_cleanup(nil_t)
     if (__RUNTIME->poll)
         poll_cleanup(__RUNTIME->poll);
     symbols_free(__RUNTIME->symbols);
-    mmap_free(__RUNTIME->symbols, sizeof(symbols_t));
+    mmap_free(__RUNTIME->symbols, sizeof(struct symbols_t));
     free_env(&__RUNTIME->env);
     drop_obj(__RUNTIME->fds);
     interpreter_free();

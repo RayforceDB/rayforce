@@ -30,22 +30,23 @@
 obj_p ht_tab(u64_t size, i8_t vals);
 obj_p ht_set(u64_t size);
 i64_t ht_tab_next(obj_p *obj, i64_t key);
-i64_t ht_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed);
+i64_t ht_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed);
 i64_t ht_tab_get(obj_p obj, i64_t key);
-i64_t ht_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, nil_t *seed);
+i64_t ht_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed);
+nil_t rehash(obj_p *obj, hash_f hash, raw_p seed);
 
 // Knuth's multiplicative hash
-u64_t hash_kmh(i64_t key, nil_t *seed);
+u64_t hash_kmh(i64_t key, raw_p seed);
 // FNV-1a hash
-u64_t hash_fnv1a(i64_t key, nil_t *seed);
+u64_t hash_fnv1a(i64_t key, raw_p seed);
 // Identity
-u64_t hash_i64(i64_t a, nil_t *seed);
-u64_t hash_obj(i64_t a, nil_t *seed);
-u64_t hash_guid(i64_t a, nil_t *seed);
+u64_t hash_i64(i64_t a, raw_p seed);
+u64_t hash_obj(i64_t a, raw_p seed);
+u64_t hash_guid(i64_t a, raw_p seed);
 
-i64_t hash_cmp_obj(i64_t a, i64_t b, nil_t *seed);
-i64_t hash_cmp_guid(i64_t a, i64_t b, nil_t *seed);
-i64_t hash_cmp_i64(i64_t a, i64_t b, nil_t *seed);
+i64_t hash_cmp_obj(i64_t a, i64_t b, raw_p seed);
+i64_t hash_cmp_guid(i64_t a, i64_t b, raw_p seed);
+i64_t hash_cmp_i64(i64_t a, i64_t b, raw_p seed);
 
 // Special hashes
 u64_t hash_index_obj(obj_p obj);
