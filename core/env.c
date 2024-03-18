@@ -47,7 +47,6 @@
 #include "iter.h"
 #include "dynlib.h"
 #include "timer.h"
-#include "pool.h"
 
 #define regf(r, n, t, f, o)                     \
     {                                           \
@@ -94,37 +93,6 @@ obj_p ray_memstat(obj_p *x, u64_t n)
     as_list(vals)[3] = i64(symbols_count(symbols));
 
     return dict(keys, vals);
-}
-
-obj_p ee(raw_p x, u64_t n)
-{
-    obj_p o = (obj_p)x;
-    return ray_do(&o, n);
-}
-
-obj_p ray_turn(obj_p obj)
-{
-    u64_t i, l;
-    pool_p pool = runtime_get()->pool;
-    task_p tasks = pool->shared->tasks;
-
-    l = pool->executors_count;
-
-    for (i = 0; i < l; i++)
-    {
-        tasks[i].fn = ee;
-        tasks[i].arg = clone_obj(obj);
-        tasks[i].len = 1;
-    }
-
-    pool_run(pool);
-
-    pool_wait(pool);
-
-    for (i = 0; i < l; i++)
-        drop_obj(tasks[i].arg);
-
-    return pool_collect(pool, i64(9876));
 }
 
 // clang-format off
@@ -174,7 +142,7 @@ nil_t init_functions(obj_p functions)
     regf(functions,  "time",      TYPE_UNARY,    FN_NONE | FN_SPECIAL_FORM, ray_time);
     regf(functions,  "bins",      TYPE_UNARY,    FN_NONE,                   ray_bins);
     regf(functions,  "update",    TYPE_UNARY,    FN_NONE,                   ray_update);
-    regf(functions,  "turn",    TYPE_UNARY,    FN_NONE,                   ray_turn);
+    regf(functions,  "pmap",      TYPE_UNARY,    FN_NONE,                   ray_pmap);
     
     // Binary           
     regf(functions,  "try",       TYPE_BINARY,   FN_NONE | FN_SPECIAL_FORM, try_obj);

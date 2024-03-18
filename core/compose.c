@@ -631,10 +631,10 @@ obj_p ray_group(obj_p x)
     case TYPE_TIMESTAMP:
         g = index_group_i64(as_i64(x), NULL, ops_count(x));
         l = as_list(g)[0]->i64;
+        c = index_group_cnts(g);
+
         k = vector(x->type, l);
         v = list(l);
-
-        c = index_group_cnts(g);
 
         // Allocate vectors for each group indices
         for (i = 0; i < l; i++)

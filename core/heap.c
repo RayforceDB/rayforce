@@ -127,50 +127,6 @@ heap_p heap_init(u64_t id, u64_t small_blocks)
     return __HEAP;
 }
 
-nil_t heap_cleanup(nil_t)
-{
-    u64_t i, order;
-    node_t *node, *next;
-
-    // check if all small blocks are freed
-    if (__HEAP->blocks16)
-    {
-        for (i = 0; i < NUM_16_BLOCKS; i++)
-        {
-            if (__HEAP->freelist16 == NULL)
-            {
-                debug("-- HEAP[%lld]: blocks16 leak: %p", __HEAP->id, __HEAP->blocks16);
-                return;
-            }
-
-            __HEAP->freelist16 = *(nil_t **)__HEAP->freelist16;
-        }
-    }
-
-    // All the nodes remains are pools, so just munmap them
-    for (i = 0; i <= MAX_POOL_ORDER; i++)
-    {
-        node = __HEAP->freelist[i];
-        while (node)
-        {
-            next = node->next;
-            order = blockorder(node->base);
-            if (order != i)
-            {
-                debug("-- HEAP[%lld]: node leak order: %lld node: %p\n", __HEAP->id,
-                      i, (raw_p)node);
-                return;
-            }
-
-            mmap_free(node, blocksize(order));
-            node = next;
-        }
-    }
-
-    mmap_free(__HEAP->blocks16, NUM_16_BLOCKS * 16);
-    mmap_free(__HEAP, sizeof(struct heap_t));
-}
-
 heap_p heap_get(nil_t)
 {
     return __HEAP;
@@ -492,6 +448,50 @@ memstat_t heap_memstat(nil_t)
     }
 
     return __HEAP->memstat;
+}
+
+nil_t heap_cleanup(nil_t)
+{
+    u64_t i, order;
+    node_t *node, *next;
+
+    // check if all small blocks are freed
+    if (__HEAP->blocks16)
+    {
+        for (i = 0; i < NUM_16_BLOCKS; i++)
+        {
+            if (__HEAP->freelist16 == NULL)
+            {
+                debug("-- HEAP[%lld]: blocks16 leak: %p", __HEAP->id, __HEAP->blocks16);
+                return;
+            }
+
+            __HEAP->freelist16 = *(nil_t **)__HEAP->freelist16;
+        }
+    }
+
+    // All the nodes remains are pools, so just munmap them
+    for (i = 0; i <= MAX_POOL_ORDER; i++)
+    {
+        node = __HEAP->freelist[i];
+        while (node)
+        {
+            next = node->next;
+            order = blockorder(node->base);
+            if (order != i)
+            {
+                debug("-- HEAP[%lld]: node leak order: %lld node: %p\n", __HEAP->id,
+                      i, (raw_p)node);
+                return;
+            }
+
+            mmap_free(node, blocksize(order));
+            node = next;
+        }
+    }
+
+    mmap_free(__HEAP->blocks16, NUM_16_BLOCKS * 16);
+    mmap_free(__HEAP, sizeof(struct heap_t));
 }
 
 #endif

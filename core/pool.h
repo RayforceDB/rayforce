@@ -68,6 +68,7 @@ nil_t pool_free(pool_p pool);
 nil_t pool_run(pool_p pool);
 nil_t pool_wait(pool_p pool);
 obj_p pool_collect(pool_p pool, obj_p x);
+u64_t pool_executors_count(pool_p pool);
 nil_t pool_stop(pool_p pool);
 
 #endif // POOL_H

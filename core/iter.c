@@ -31,6 +31,8 @@
 #include "vary.h"
 #include "eval.h"
 #include "error.h"
+#include "runtime.h"
+#include "pool.h"
 
 obj_p ray_apply(obj_p *x, u64_t n)
 {
@@ -237,4 +239,32 @@ obj_p ray_fold(obj_p *x, u64_t n)
     default:
         throw(ERR_TYPE, "'fold': unsupported function type: '%s", type_name(f->type));
     }
+}
+
+obj_p ee(raw_p x, u64_t n)
+{
+    obj_p o = (obj_p)x;
+    return ray_do(&o, n);
+}
+
+obj_p ray_pmap(obj_p obj)
+{
+    u64_t i, l;
+    pool_p pool = runtime_get()->pool;
+    task_p tasks = pool->shared->tasks;
+
+    l = pool->executors_count;
+
+    for (i = 0; i < l; i++)
+    {
+        tasks[i].fn = ee;
+        tasks[i].arg = obj;
+        tasks[i].len = 1;
+    }
+
+    pool_run(pool);
+
+    pool_wait(pool);
+
+    return pool_collect(pool, i64(9876));
 }

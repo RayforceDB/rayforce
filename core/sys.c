@@ -39,9 +39,7 @@
 
 str_p sys_about_info(nil_t)
 {
-    u64_t threads = 1;
-    if (runtime_get()->pool && runtime_get()->pool->executors_count)
-        threads += runtime_get()->pool->executors_count;
+    u64_t threads = pool_executors_count(runtime_get()->pool);
 
 #if defined(__EMSCRIPTEN__)
     return str_fmt(0, "  RayforceDB: %d.%d %s\n"

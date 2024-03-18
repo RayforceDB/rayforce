@@ -40,6 +40,9 @@ nil_t error_add_loc(obj_p err, i64_t id, ctx_t *ctx)
     obj_p loc, nfo;
     span_t span;
 
+    if (ctx->lambda == NULL_OBJ)
+        return;
+
     nfo = as_lambda(ctx->lambda)->nfo;
 
     if (nfo == NULL_OBJ)

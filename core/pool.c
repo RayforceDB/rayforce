@@ -51,7 +51,9 @@ raw_p executor_run(raw_p arg)
         pthread_mutex_unlock(&shared->lock);
 
         // execute task
+        rc_sync(B8_TRUE);
         task->result = task->fn(task->arg, task->len);
+        rc_sync(B8_FALSE);
 
         pthread_mutex_lock(&shared->lock);
         shared->tasks_remaining--;
@@ -137,18 +139,49 @@ nil_t pool_wait(pool_p pool)
 obj_p pool_collect(pool_p pool, obj_p x)
 {
     u64_t i;
-    obj_p lst;
+    obj_p v, lst;
     shared_p shared = pool->shared;
     u64_t n = pool->executors_count;
+
+    if (is_error(x))
+    {
+        for (i = 0; i < n; i++)
+            drop_obj(shared->tasks[i].result);
+
+        return x;
+    }
 
     lst = vector(x->type, n + 1);
 
     for (i = 0; i < n; i++)
-        ins_obj(&lst, i, shared->tasks[i].result);
+    {
+        v = shared->tasks[i].result;
+        if (is_error(v))
+        {
+            v = clone_obj(v);
+            lst->len = i;
+            drop_obj(lst);
+
+            for (i = 0; i < n; i++)
+                drop_obj(shared->tasks[i].result);
+
+            return v;
+        }
+
+        ins_obj(&lst, i, v);
+    }
 
     ins_obj(&lst, n, x);
 
     return lst;
+}
+
+u64_t pool_executors_count(pool_p pool)
+{
+    if (pool)
+        return pool->executors_count + 1;
+    else
+        return 1;
 }
 
 nil_t pool_stop(pool_p pool)
