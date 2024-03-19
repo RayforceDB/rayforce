@@ -29,19 +29,27 @@
 #include "../core/util.h"
 #include "../core/sys.h"
 
-nil_t print_logo(nil_t)
+nil_t print_logo(sys_info_t *info)
 {
-  str_p nfo = sys_about_info();
-  printf("%s%s%s", BOLD, nfo, RESET);
-  heap_free(nfo);
+  printf("%s"
+         "  RayforceDB: %d.%d %s\n"
+         "  %s %d(MB) %d core(s)\n"
+         "  Using %d threads(s)\n"
+         "  Documentation: https://rayforcedb.com/\n"
+         "  Github: https://github.com/singaraiona/rayforce\n"
+         "%s",
+         BOLD, info->major_version, info->minor_version,
+         info->build_date, info->cpu, info->mem, info->cores, info->threads, RESET);
 }
 
 i32_t main(i32_t argc, str_p argv[])
 {
   i32_t code = -1;
+  sys_info_t *info;
 
   runtime_init(argc, argv);
-  print_logo();
+  info = &runtime_get()->sys_info;
+  print_logo(info);
   code = runtime_run();
   runtime_cleanup();
 

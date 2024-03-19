@@ -140,7 +140,14 @@ i32_t runtime_init(i32_t argc, str_p argv[])
             if (n > 1)
                 __RUNTIME->pool = pool_new(n - 1); // -1 for the main thread
 
+            __RUNTIME->sys_info = sys_info(n);
             drop_obj(arg);
+        }
+        else
+        {
+            __RUNTIME->sys_info = sys_info(0);
+            if (__RUNTIME->sys_info.threads > 1)
+                __RUNTIME->pool = pool_new(__RUNTIME->sys_info.threads - 1);
         }
 
         arg = runtime_get_arg("port");
@@ -169,7 +176,12 @@ i32_t runtime_init(i32_t argc, str_p argv[])
         }
     }
     else
+    {
         __RUNTIME->poll = NULL;
+        __RUNTIME->sys_info = sys_info(0);
+        if (__RUNTIME->sys_info.threads > 1)
+            __RUNTIME->pool = pool_new(__RUNTIME->sys_info.threads - 1);
+    }
 
     return 0;
 }

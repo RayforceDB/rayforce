@@ -32,11 +32,16 @@
 
 typedef struct sys_info_t
 {
+    i32_t major_version;
+    i32_t minor_version;
+    c8_t build_date[256];
     c8_t cpu[256];
+    c8_t os[256];
     i32_t mem;
+    i32_t cores;
+    i32_t threads;
 } sys_info_t;
 
-str_p sys_about_info(nil_t);
-sys_info_t sys_hw_info(nil_t);
+sys_info_t sys_info(i32_t threads);
 
 #endif // SYS_H

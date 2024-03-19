@@ -32,35 +32,38 @@
 #elif defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#include <stdint.h>
+#include <unistd.h>
 #elif defined(__linux__)
+#include <stdint.h>
+#include <unistd.h>
 #elif defined(__EMSCRIPTEN__)
 #include <emscripten.h>
 #endif
 
-str_p sys_about_info(nil_t)
+i32_t cpu_cores()
 {
-    u64_t threads = pool_executors_count(runtime_get()->pool);
-
-#if defined(__EMSCRIPTEN__)
-    return str_fmt(0, "  RayforceDB: %d.%d %s\n"
-                      "  WASM target %lld thread(s)\n"
-                      "  Documentation: https://rayforcedb.com/\n"
-                      "  Github: https://github.com/singaraiona/rayforce\n",
-                   RAYFORCE_MAJOR_VERSION, RAYFORCE_MINOR_VERSION, __DATE__, threads);
+#if defined(_WIN32) || defined(__CYGWIN__)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors;
+#elif defined(__unix__)
+    return sysconf(_SC_NPROCESSORS_ONLN);
 #else
-    sys_info_t nfo = sys_hw_info();
-    return str_fmt(0, "  RayforceDB: %d.%d %s\n"
-                      "  %s %d(MB) %lld thread(s)\n"
-                      "  Documentation: https://rayforcedb.com/\n"
-                      "  Github: https://github.com/singaraiona/rayforce\n",
-                   RAYFORCE_MAJOR_VERSION, RAYFORCE_MINOR_VERSION,
-                   __DATE__, nfo.cpu, nfo.mem, threads);
+    return 1;
 #endif
 }
 
-sys_info_t sys_hw_info(nil_t)
+sys_info_t sys_info(i32_t threads)
 {
     sys_info_t info;
+
+    info.major_version = RAYFORCE_MAJOR_VERSION;
+    info.minor_version = RAYFORCE_MINOR_VERSION;
+    strncpy(info.build_date, __DATE__, sizeof(info.build_date));
+    info.build_date[strcspn(info.build_date, "\n")] = 0; // Remove the newline
+    info.cores = cpu_cores();
+    info.threads = (threads == 0) ? info.cores : threads;
 
 #if defined(_WIN32) || defined(__CYGWIN__)
     SYSTEM_INFO si;
