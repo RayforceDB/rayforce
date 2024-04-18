@@ -1,5 +1,5 @@
 CC = clang
-STD=c17
+STD = c17
 AR = ar
 PROFILER = gprof
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -Ofast -march=native -fassociative-math -ftree-vectorize\

@@ -28,7 +28,7 @@
 
 #define AVAIL_MASK ((u64_t)0xffffffffffffffff)
 #define MIN_ORDER 4                                   // 2^4 = 16B
-#define MAX_ORDER 25                                  // 2^25 = 32MB
+#define MAX_ORDER 26                                  // 2^26 = 64MB
 #define MAX_POOL_ORDER 36                             // 2^36 = 64GB
 #define POOL_SIZE (1024 * 1024 * (1ull << MAX_ORDER)) // 32TB
 #define ORDER_SHIFT 56ull                             // Shift to extract the order
