@@ -66,9 +66,10 @@ heap_p heap_init(u64_t id)
     __HEAP = (heap_p)mmap_alloc(sizeof(struct heap_t));
     __HEAP->id = id;
     __HEAP->avail = 0;
-    memset(__HEAP->freelist, 0, sizeof(__HEAP->freelist));
     __HEAP->memoffset = 0;
     __HEAP->memory = (block_p)mmap_reserve(POOL_SIZE);
+
+    memset(__HEAP->freelist, 0, sizeof(__HEAP->freelist));
 
     return __HEAP;
 }
@@ -80,7 +81,16 @@ block_p heap_add_pool(u64_t size)
     debug_assert(block != NULL, "Failed to add pool");
     debug_assert((u64_t)block % PAGE_SIZE == 0, "Pool is not page aligned");
 
+    __HEAP->memoffset += bsizeof(MAX_ORDER);
+    __HEAP->memstat.system += size;
+
     return block;
+}
+
+nil_t heap_remove_pool(block_p block)
+{
+    mmap_free(block, bsizeof(MAX_ORDER));
+    __HEAP->memstat.system -= bsizeof(MAX_ORDER);
 }
 
 // inline __attribute__((always_inline))
@@ -150,8 +160,6 @@ obj_p __attribute__((hot)) heap_alloc_obj(u64_t size)
             if (block == NULL)
                 return NULL;
 
-            __HEAP->memstat.system += size;
-
             goto complete;
         }
 
@@ -160,9 +168,6 @@ obj_p __attribute__((hot)) heap_alloc_obj(u64_t size)
 
         if (block == NULL)
             return NULL;
-
-        __HEAP->memstat.system += bsizeof(MAX_ORDER);
-        __HEAP->memoffset += bsizeof(MAX_ORDER);
 
         insert_block(block, i);
     }
@@ -202,12 +207,7 @@ __attribute__((hot)) nil_t heap_free_obj(obj_p obj)
 
     // blocks over MAX_ORDER are directly munmaped
     if (order > MAX_ORDER)
-    {
-        mmap_free(block, bsizeof(order));
-        __HEAP->memstat.heap -= bsizeof(order);
-        __HEAP->memstat.system -= bsizeof(order);
-        return;
-    }
+        return heap_remove_pool(block);
 
     for (;; order++)
     {
