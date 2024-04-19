@@ -40,7 +40,7 @@
 #include "error.h"
 #include "filter.h"
 
-#define MAX_ROW_WIDTH 80
+#define MAX_ROW_WIDTH 800
 #define FORMAT_TRAILER_SIZE 4
 #define F64_PRECISION 2
 #define TABLE_MAX_WIDTH 10      // Maximum number of columns
@@ -876,19 +876,19 @@ i64_t internal_fmt_into(obj_p *dst, i64_t limit, obj_p obj)
     return str_fmt_into(dst, limit, "%s", env_get_internal_name(obj));
 }
 
-i64_t lambda_fmt_into(obj_p *dst, i64_t indent, i64_t limit, obj_p obj)
+i64_t lambda_fmt_into(obj_p *dst, i64_t limit, obj_p obj)
 {
     i64_t n;
 
     if (as_lambda(obj)->name)
-        n = str_fmt_into(dst, indent, "@%s", strof_sym((as_lambda(obj)->name)->i64));
+        n = str_fmt_into(dst, limit, "@%s", strof_sym((as_lambda(obj)->name)->i64));
     else
     {
-        n = str_fmt_into(dst, indent, "(fn ");
-        n += obj_fmt_into(dst, indent, limit, B8_FALSE, as_lambda(obj)->args);
-        n += str_fmt_into(dst, indent, " ");
-        n += obj_fmt_into(dst, indent, limit, B8_FALSE, as_lambda(obj)->body);
-        n += str_fmt_into(dst, indent, ")");
+        n = str_fmt_into(dst, 4, "(fn ");
+        n += obj_fmt_into(dst, 0, limit, B8_FALSE, as_lambda(obj)->args);
+        n += str_fmt_into(dst, 2, " ");
+        n += obj_fmt_into(dst, 0, limit, B8_FALSE, as_lambda(obj)->body);
+        n += str_fmt_into(dst, 2, ")");
     }
 
     return n;
@@ -945,7 +945,7 @@ i64_t obj_fmt_into(obj_p *dst, i64_t indent, i64_t limit, b8_t full, obj_p obj)
     case TYPE_VARY:
         return internal_fmt_into(dst, limit, obj);
     case TYPE_LAMBDA:
-        return lambda_fmt_into(dst, indent, limit, obj);
+        return lambda_fmt_into(dst, limit, obj);
     case TYPE_NULL:
         return str_fmt_into(dst, limit, "null");
     case TYPE_ERROR:

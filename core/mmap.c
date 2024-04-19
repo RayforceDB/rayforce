@@ -113,8 +113,8 @@ raw_p mmap_alloc(u64_t size)
 
 raw_p mmap_file(i64_t fd, u64_t size)
 {
-    // raw_p ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    raw_p ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_POPULATE | MAP_NORESERVE, fd, 0);
+    raw_p ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    // raw_p ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_POPULATE | MAP_NORESERVE, fd, 0);
     // madvise(ptr, size, MADV_HUGEPAGE | MADV_SEQUENTIAL);
 
     return ptr;

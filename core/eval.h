@@ -30,6 +30,8 @@
 #include "lambda.h"
 #include "mmap.h"
 #include "nfo.h"
+#include "util.h"
+#include "heap.h"
 
 #define EVAL_STACK_SIZE 1024
 

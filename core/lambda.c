@@ -30,8 +30,8 @@
 
 obj_p lambda(obj_p args, obj_p body, obj_p nfo)
 {
-    obj_p obj = heap_alloc_obj(sizeof(lambda_t));
-    lambda_t *f = (lambda_t *)obj->arr;
+    obj_p obj = heap_alloc_obj(sizeof(struct lambda_t));
+    lambda_p f = (lambda_p)obj->arr;
 
     f->name = NULL_OBJ;
     f->args = args;

@@ -501,7 +501,6 @@ obj_p __ray_set(obj_p x, obj_p y)
                 {
                     s = symbol("sym");
                     e = ray_enum(s, v);
-
                     drop_obj(s);
                     drop_obj(v);
 

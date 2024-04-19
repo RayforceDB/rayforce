@@ -27,7 +27,7 @@
 #include "rayforce.h"
 #include "nfo.h"
 
-#define as_lambda(obj) ((lambda_t *)(as_string(obj)))
+#define as_lambda(obj) ((lambda_p)(as_string(obj)))
 
 typedef struct lambda_t
 {
@@ -35,7 +35,7 @@ typedef struct lambda_t
     obj_p args; // vector of arguments names
     obj_p body; // body of lambda
     obj_p nfo;  // nfo from cc phase
-} lambda_t;
+} *lambda_p;
 
 obj_p lambda(obj_p args, obj_p body, obj_p nfo);
 

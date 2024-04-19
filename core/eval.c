@@ -98,7 +98,7 @@ nil_t interpreter_free(nil_t)
 
 obj_p call(obj_p obj, u64_t arity)
 {
-    lambda_t *lambda;
+    lambda_p lambda;
     ctx_t *ctx;
     obj_p res;
     i64_t sp;
@@ -156,7 +156,7 @@ __attribute__((hot)) obj_p eval(obj_p obj)
 {
     u64_t len, i;
     obj_p car, *val, *args, x, y, z, res;
-    lambda_t *lambda;
+    lambda_p lambda;
     u8_t attrs = 0;
 
     switch (obj->type)
@@ -369,6 +369,7 @@ obj_p *deref(obj_p sym)
     if (env != NULL_OBJ)
     {
         n = as_list(env)[0]->len;
+
         // search in a reverse order
         for (i = n; i > 0; i--)
         {
@@ -584,6 +585,7 @@ obj_p ray_eval_str(obj_p str, obj_p file)
         drop_obj(info);
         return parsed;
     }
+
     ctx = ctx_top(info);
 
     res = (setjmp(ctx->jmp) == 0) ? eval(parsed) : stack_pop();

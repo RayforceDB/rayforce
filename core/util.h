@@ -79,7 +79,7 @@ nil_t dump_stack(nil_t);
 #define debug_obj(o)                                  \
     {                                                 \
         obj_p _f = obj_fmt((o));                      \
-        debug("%*.s", (i32_t)_f->len, as_string(_f)); \
+        debug("%.*s", (i32_t)_f->len, as_string(_f)); \
         heap_free_obj(_f);                            \
     }
 
