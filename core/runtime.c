@@ -55,7 +55,7 @@ obj_p parse_cmdline(i32_t argc, str_p argv[])
                     usage();
 
                 push_sym(&keys, "file");
-                str = string_from_str(argv[opt], strlen(argv[opt]));
+                str = cstring_from_str(argv[opt], strlen(argv[opt]));
                 push_obj(&vals, str);
                 file_handled = B8_TRUE;
                 break;
@@ -67,7 +67,7 @@ obj_p parse_cmdline(i32_t argc, str_p argv[])
                     usage();
 
                 push_sym(&keys, "port");
-                str = string_from_str(argv[opt], strlen(argv[opt]));
+                str = cstring_from_str(argv[opt], strlen(argv[opt]));
                 push_obj(&vals, str);
                 break;
 
@@ -78,7 +78,7 @@ obj_p parse_cmdline(i32_t argc, str_p argv[])
                     usage();
 
                 push_sym(&keys, "threads");
-                str = string_from_str(argv[opt], strlen(argv[opt]));
+                str = cstring_from_str(argv[opt], strlen(argv[opt]));
                 push_obj(&vals, str);
                 break;
 
@@ -92,7 +92,7 @@ obj_p parse_cmdline(i32_t argc, str_p argv[])
             if (!file_handled)
             {
                 push_sym(&keys, "file");
-                str = string_from_str(argv[opt], strlen(argv[opt]));
+                str = cstring_from_str(argv[opt], strlen(argv[opt]));
                 push_obj(&vals, str);
                 file_handled = B8_TRUE;
             }

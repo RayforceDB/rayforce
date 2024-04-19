@@ -352,52 +352,6 @@ __attribute__((hot)) obj_p eval(obj_p obj)
     }
 }
 
-obj_p *deref(obj_p sym)
-{
-    i64_t bp, *args;
-    obj_p lambda, env;
-    u64_t i, l, n;
-    ctx_p ctx;
-
-    ctx = ctx_get();
-    lambda = ctx->lambda;
-
-    if (sym->i64 == KW_SELF)
-        return &ctx->lambda;
-
-    l = as_lambda(lambda)->args->len;
-    bp = ctx->sp;
-
-    // search locals
-    env = __INTERPRETER->stack[bp + l];
-    if (env != NULL_OBJ)
-    {
-        n = as_list(env)[0]->len;
-
-        // search in a reverse order
-        for (i = n; i > 0; i--)
-        {
-            if (as_symbol(as_list(env)[0])[i - 1] == sym->i64)
-                return &as_list(as_list(env)[1])[i - 1];
-        }
-    }
-
-    // search args
-    args = as_symbol(as_lambda(lambda)->args);
-    for (i = 0; i < l; i++)
-    {
-        if (args[i] == sym->i64)
-            return &__INTERPRETER->stack[bp + i];
-    }
-
-    // search globals
-    i = find_raw(as_list(runtime_get()->env.variables)[0], &sym->i64);
-    if (i == as_list(runtime_get()->env.variables)[0]->len)
-        return NULL;
-
-    return &as_list(as_list(runtime_get()->env.variables)[1])[i];
-}
-
 obj_p amend(obj_p sym, obj_p val)
 {
     obj_p *env;
@@ -674,4 +628,50 @@ obj_p try_obj(obj_p obj, obj_p ctch)
     }
 
     return res;
+}
+
+obj_p *deref(obj_p sym)
+{
+    i64_t bp, *args;
+    obj_p lambda, env;
+    u64_t i, l, n;
+    ctx_p ctx;
+
+    ctx = ctx_get();
+    lambda = ctx->lambda;
+
+    if (sym->i64 == KW_SELF)
+        return &ctx->lambda;
+
+    l = as_lambda(lambda)->args->len;
+    bp = ctx->sp;
+
+    // search locals
+    env = __INTERPRETER->stack[bp + l];
+    if (env != NULL_OBJ)
+    {
+        n = as_list(env)[0]->len;
+
+        // search in a reverse order
+        for (i = n; i > 0; i--)
+        {
+            if (as_symbol(as_list(env)[0])[i - 1] == sym->i64)
+                return &as_list(as_list(env)[1])[i - 1];
+        }
+    }
+
+    // search args
+    args = as_symbol(as_lambda(lambda)->args);
+    for (i = 0; i < l; i++)
+    {
+        if (args[i] == sym->i64)
+            return &__INTERPRETER->stack[bp + i];
+    }
+
+    // search globals
+    i = find_raw(as_list(runtime_get()->env.variables)[0], &sym->i64);
+    if (i == as_list(runtime_get()->env.variables)[0]->len)
+        return NULL;
+
+    return &as_list(as_list(runtime_get()->env.variables)[1])[i];
 }
