@@ -102,7 +102,7 @@ i64_t str_vfmt_into(obj_p *dst, i64_t limit, str_p fmt, va_list vargs)
         l = (*dst)->len;
         if (is_null(resize_obj(dst, l + size)))
         {
-            heap_free_raw(*dst);
+            heap_free(*dst);
             panic("str_vfmt_into: OOM");
         }
     }
@@ -118,7 +118,7 @@ i64_t str_vfmt_into(obj_p *dst, i64_t limit, str_p fmt, va_list vargs)
 
         if (n < 0)
         {
-            heap_free_raw(*dst);
+            heap_free(*dst);
             panic("str_vfmt_into: Error in vsnprintf");
         }
 
@@ -136,7 +136,7 @@ i64_t str_vfmt_into(obj_p *dst, i64_t limit, str_p fmt, va_list vargs)
         size = n + 1; // +1 for the null terminator
         if (is_null(resize_obj(dst, l + size)))
         {
-            heap_free_raw(*dst);
+            heap_free(*dst);
             panic("str_vfmt_into: OOM");
         }
     }
@@ -191,7 +191,7 @@ obj_p str_vfmt(i64_t limit, str_p fmt, va_list vargs)
         if (n < 0)
         {
             // Handle encoding error
-            heap_free_raw(res);
+            heap_free(res);
             return NULL_OBJ;
         }
 
@@ -859,7 +859,7 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj)
             str_fmt_into_n(dst, NO_LIMIT, n, " ");
             str_fmt_into(dst, 2, "|");
             // Free formatted column
-            heap_free_obj(s);
+            drop_obj(s);
         }
     }
 
@@ -999,7 +999,7 @@ obj_p obj_fmt_n(obj_p *x, u64_t n)
         if (!end)
         {
             if (res)
-                heap_free_raw(res);
+                heap_free(res);
 
             return NULL;
         }
@@ -1016,7 +1016,7 @@ obj_p obj_fmt_n(obj_p *x, u64_t n)
     if (sz > 0 && memchr(start, '%', sz))
     {
         if (res)
-            heap_free_raw(res);
+            heap_free(res);
 
         return NULL;
     }

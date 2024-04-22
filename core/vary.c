@@ -129,7 +129,7 @@ obj_p ray_print(obj_p *x, u64_t n)
         return error_str(ERR_TYPE, "malformed format string");
 
     printf("%.*s", (i32_t)s->len, as_string(s));
-    heap_free_obj(s);
+    drop_obj(s);
 
     return NULL_OBJ;
 }
@@ -142,7 +142,7 @@ obj_p ray_println(obj_p *x, u64_t n)
         return error_str(ERR_TYPE, "malformed format string");
 
     printf("%.*s\n", (i32_t)s->len, as_string(s));
-    heap_free_obj(s);
+    drop_obj(s);
 
     return NULL_OBJ;
 }

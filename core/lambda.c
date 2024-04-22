@@ -30,16 +30,19 @@
 
 obj_p lambda(obj_p args, obj_p body, obj_p nfo)
 {
-    obj_p obj = heap_alloc_obj(sizeof(struct lambda_t));
-    lambda_p f = (lambda_p)obj->arr;
+    obj_p obj;
+    lambda_p f;
 
+    obj = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(struct lambda_t));
+    obj->mmod = MMOD_INTERNAL;
+    obj->type = TYPE_LAMBDA;
+    obj->rc = 1;
+
+    f = (lambda_p)obj->arr;
     f->name = NULL_OBJ;
     f->args = args;
     f->body = body;
     f->nfo = nfo;
-
-    obj->type = TYPE_LAMBDA;
-    obj->rc = 1;
 
     return obj;
 }

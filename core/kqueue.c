@@ -110,7 +110,7 @@ poll_p poll_init(i64_t port)
         }
     }
 
-    poll = (poll_p)heap_alloc_raw(sizeof(struct poll_t));
+    poll = (poll_p)heap_alloc(sizeof(struct poll_t));
     poll->code = NULL_I64;
     poll->poll_fd = kq_fd;
     poll->ipc_fd = listen_fd;
@@ -146,7 +146,7 @@ nil_t poll_cleanup(poll_p poll)
     close(__EVENT_FD[0]);
     close(__EVENT_FD[1]);
     close(poll->poll_fd);
-    heap_free_raw(poll);
+    heap_free(poll);
 }
 
 i64_t poll_register(poll_p poll, i64_t fd, u8_t version)
@@ -155,7 +155,7 @@ i64_t poll_register(poll_p poll, i64_t fd, u8_t version)
     selector_p selector;
     struct kevent ev;
 
-    selector = heap_alloc_raw(sizeof(struct selector_t));
+    selector = heap_alloc(sizeof(struct selector_t));
     id = freelist_push(poll->selectors, (i64_t)selector) + SELECTOR_ID_OFFSET;
     selector->id = id;
     selector->version = version;
@@ -195,10 +195,10 @@ nil_t poll_deregister(poll_p poll, i64_t id)
 
     close(selector->fd);
 
-    heap_free_raw(selector->rx.buf);
-    heap_free_raw(selector->tx.buf);
+    heap_free(selector->rx.buf);
+    heap_free(selector->tx.buf);
     queue_free(&selector->tx.queue);
-    heap_free_raw(selector);
+    heap_free(selector);
 }
 
 poll_result_t _recv(poll_p poll, selector_p selector)
@@ -210,7 +210,7 @@ poll_result_t _recv(poll_p poll, selector_p selector)
     u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
 
     if (selector->rx.buf == NULL)
-        selector->rx.buf = heap_alloc_raw(sizeof(struct header_t));
+        selector->rx.buf = heap_alloc(sizeof(struct header_t));
 
     // wait for handshake
     if (selector->version == 0)
@@ -260,7 +260,7 @@ poll_result_t _recv(poll_p poll, selector_p selector)
         header = (header_t *)selector->rx.buf;
         selector->rx.msgtype = header->msgtype;
         selector->rx.size = header->size + sizeof(struct header_t);
-        selector->rx.buf = heap_realloc_raw(selector->rx.buf, selector->rx.size);
+        selector->rx.buf = heap_realloc(selector->rx.buf, selector->rx.size);
     }
 
     while (selector->rx.bytes_transfered < selector->rx.size)
@@ -312,7 +312,7 @@ send:
         selector->tx.bytes_transfered += size;
     }
 
-    heap_free_raw(selector->tx.buf);
+    heap_free(selector->tx.buf);
     selector->tx.buf = NULL;
     selector->tx.size = 0;
     selector->tx.bytes_transfered = 0;
@@ -350,7 +350,7 @@ obj_p read_obj(selector_p selector)
     obj_p res;
 
     res = de_raw(selector->rx.buf, selector->rx.size);
-    heap_free_raw(selector->rx.buf);
+    heap_free(selector->rx.buf);
     selector->rx.buf = NULL;
     selector->rx.bytes_transfered = 0;
     selector->rx.size = 0;

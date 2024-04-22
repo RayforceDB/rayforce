@@ -27,12 +27,9 @@
 #include "rayforce.h"
 
 #define AVAIL_MASK ((u64_t)0xffffffffffffffff)
-#define MIN_ORDER 4                                   // 2^4 = 16B
-#define MAX_ORDER 26                                  // 2^26 = 64MB
-#define MAX_POOL_ORDER 38                             // 2^38 = 256GB
-#define POOL_SIZE (10 * 4 * (1ull << MAX_POOL_ORDER)) // 1TB
-#define ORDER_SHIFT 56ull                             // Shift to extract the order
-#define ORDER_MASK 0xff00000000000000ull              // Mask to extract the order
+#define MIN_ORDER 5       // 2^5 = 32 bytes
+#define MAX_ORDER 26      // 2^26 = 64MB
+#define MAX_POOL_ORDER 38 // 2^38 = 256GB
 
 // Memory modes
 #define MMOD_INTERNAL 0xff
@@ -49,6 +46,12 @@ typedef struct memstat_t
 
 typedef struct block_t
 {
+    u8_t order;
+    u8_t used;
+    u8_t pool_order;
+    u8_t mode;
+    u32_t pad;
+    struct block_t *pool;
     struct block_t *prev;
     struct block_t *next;
 } *block_p;
@@ -56,20 +59,15 @@ typedef struct block_t
 typedef struct heap_t
 {
     u64_t id;
-    u64_t avail;                          // mask of available blocks by order
-    u64_t memoffset;                      // memory offset
-    block_p memory;                       // memory pool
     block_p freelist[MAX_POOL_ORDER + 2]; // free list of blocks by order
+    u64_t avail;                          // mask of available blocks by order
     memstat_t memstat;
 } *heap_p;
 
 heap_p heap_init(u64_t id);
-obj_p heap_alloc_obj(u64_t size);
-obj_p heap_realloc_obj(obj_p obj, u64_t size);
-nil_t heap_free_obj(obj_p obj);
-raw_p heap_alloc_raw(u64_t size);
-raw_p heap_realloc_raw(raw_p ptr, u64_t size);
-nil_t heap_free_raw(raw_p ptr);
+raw_p heap_alloc(u64_t size);
+raw_p heap_realloc(raw_p ptr, u64_t size);
+nil_t heap_free(raw_p ptr);
 i64_t heap_gc(nil_t);
 nil_t heap_borrow(heap_p heap);
 nil_t heap_merge(heap_p heap);

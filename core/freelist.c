@@ -29,10 +29,10 @@ freelist_p freelist_new(i64_t size)
 {
     freelist_p freelist;
 
-    freelist = (freelist_p)heap_alloc_raw(sizeof(struct freelist_t));
-    freelist->data = (i64_t *)heap_alloc_raw(size * sizeof(i64_t));
+    freelist = (freelist_p)heap_alloc(sizeof(struct freelist_t));
+    freelist->data = (i64_t *)heap_alloc(size * sizeof(i64_t));
     freelist->data_pos = 0;
-    freelist->free = (i64_t *)heap_alloc_raw(size * sizeof(i64_t));
+    freelist->free = (i64_t *)heap_alloc(size * sizeof(i64_t));
     freelist->data_size = size;
     freelist->free_size = size;
     freelist->free_pos = 0;
@@ -42,9 +42,9 @@ freelist_p freelist_new(i64_t size)
 
 nil_t freelist_free(freelist_p freelist)
 {
-    heap_free_raw(freelist->data);
-    heap_free_raw(freelist->free);
-    heap_free_raw(freelist);
+    heap_free(freelist->data);
+    heap_free(freelist->free);
+    heap_free(freelist);
 }
 
 i64_t freelist_push(freelist_p freelist, i64_t val)
@@ -61,7 +61,7 @@ i64_t freelist_push(freelist_p freelist, i64_t val)
     if (freelist->data_pos == freelist->data_size)
     {
         freelist->data_size *= 2;
-        freelist->data = (i64_t *)heap_realloc_raw(freelist->data, freelist->data_size * sizeof(i64_t));
+        freelist->data = (i64_t *)heap_realloc(freelist->data, freelist->data_size * sizeof(i64_t));
     }
 
     pos = freelist->data_pos;
@@ -81,7 +81,7 @@ i64_t freelist_pop(freelist_p freelist, i64_t pos)
     if (freelist->free_pos == freelist->free_size)
     {
         freelist->free_size *= 2;
-        freelist->free = (i64_t *)heap_realloc_raw(freelist->free, freelist->free_size * sizeof(i64_t));
+        freelist->free = (i64_t *)heap_realloc(freelist->free, freelist->free_size * sizeof(i64_t));
     }
 
     val = freelist->data[pos];

@@ -124,7 +124,7 @@ nil_t exit_werror()
     err = sys_error(ERROR_TYPE_SOCK, "poll_init");
     fmt = obj_fmt(err);
     printf("%s\n", fmt);
-    heap_free_raw(fmt);
+    heap_free(fmt);
     drop_obj(err);
     fflush(stdout);
     exit(1);
@@ -194,7 +194,7 @@ poll_p poll_init(i64_t port)
     // Create a thread to read from stdin
     CreateThread(NULL, 0, StdinThread, (HANDLE)poll_fd, 0, NULL);
 
-    poll_p poll = (poll_p)heap_alloc_raw(sizeof(struct poll_t));
+    poll_p poll = (poll_p)heap_alloc(sizeof(struct poll_t));
 
     poll->poll_fd = poll_fd;
 
@@ -203,19 +203,19 @@ poll_p poll_init(i64_t port)
         ipc_fd = sock_listen(port);
         if (ipc_fd == -1)
         {
-            heap_free_raw(poll);
+            heap_free(poll);
             exit_werror();
         }
 
         poll->ipc_fd = ipc_fd;
         CreateIoCompletionPort((HANDLE)ipc_fd, (HANDLE)poll_fd, ipc_fd, 0);
 
-        __LISTENER = (listener_t)heap_alloc_raw(sizeof(struct listener_t));
+        __LISTENER = (listener_t)heap_alloc(sizeof(struct listener_t));
         memset(__LISTENER, 0, sizeof(struct listener_t));
 
         if (poll_accept(poll) == -1)
         {
-            heap_free_raw(poll);
+            heap_free(poll);
             exit_werror();
         }
     }
@@ -251,7 +251,7 @@ nil_t poll_cleanup(poll_p poll)
     timers_free(poll->timers);
 
     CloseHandle((HANDLE)poll->poll_fd);
-    heap_free_raw(poll);
+    heap_free(poll);
 
     WSACleanup();
 }
@@ -270,10 +270,10 @@ nil_t poll_deregister(poll_p poll, i64_t id)
 
     CloseHandle((HANDLE)selector->fd);
 
-    heap_free_raw(selector->rx.buf);
-    heap_free_raw(selector->tx.buf);
+    heap_free(selector->rx.buf);
+    heap_free(selector->tx.buf);
     queue_free(&selector->tx.queue);
-    heap_free_raw(selector);
+    heap_free(selector);
 }
 
 i64_t poll_register(poll_p poll, i64_t fd, u8_t version)
@@ -281,7 +281,7 @@ i64_t poll_register(poll_p poll, i64_t fd, u8_t version)
     i64_t id;
     selector_p selector;
 
-    selector = heap_alloc_raw(sizeof(struct selector_t));
+    selector = heap_alloc(sizeof(struct selector_t));
     id = freelist_push(poll->selectors, (i64_t)selector) + SELECTOR_ID_OFFSET;
     selector->id = id;
     selector->version = version;
@@ -336,7 +336,7 @@ poll_result_t _recv(poll_p poll, selector_p selector)
             {
                 size = selector->rx.size;
                 selector->rx.size *= 2;
-                selector->rx.buf = heap_realloc_raw(selector->rx.buf, selector->rx.size);
+                selector->rx.buf = heap_realloc(selector->rx.buf, selector->rx.size);
                 selector->rx.wsa_buf.buf = (str_p)selector->rx.buf + size;
                 selector->rx.wsa_buf.len = size;
             }
@@ -375,7 +375,7 @@ poll_result_t _recv(poll_p poll, selector_p selector)
 
     if (selector->rx.buf == NULL)
     {
-        selector->rx.buf = heap_alloc_raw(sizeof(struct header_t));
+        selector->rx.buf = heap_alloc(sizeof(struct header_t));
         selector->rx.size = sizeof(struct header_t);
         selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
         selector->rx.wsa_buf.len = selector->rx.size;
@@ -402,7 +402,7 @@ poll_result_t _recv(poll_p poll, selector_p selector)
         selector->rx.header = B8_TRUE;
         selector->rx.size = header->size + sizeof(struct header_t);
         selector->rx.msgtype = header->msgtype;
-        selector->rx.buf = heap_realloc_raw(selector->rx.buf, selector->rx.size);
+        selector->rx.buf = heap_realloc(selector->rx.buf, selector->rx.size);
         selector->rx.wsa_buf.buf = (str_p)selector->rx.buf + sizeof(struct header_t);
         selector->rx.wsa_buf.len = selector->rx.size - sizeof(struct header_t);
         selector->rx.bytes_transfered = 0;
@@ -427,7 +427,7 @@ poll_result_t _recv(poll_p poll, selector_p selector)
 
 poll_result_t _recv_initiate(poll_p poll, selector_p selector)
 {
-    selector->rx.buf = heap_alloc_raw(sizeof(struct header_t));
+    selector->rx.buf = heap_alloc(sizeof(struct header_t));
     selector->rx.size = sizeof(struct header_t);
     selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
     selector->rx.wsa_buf.len = selector->rx.size;
@@ -458,7 +458,7 @@ send:
 
     if (selector->tx.buf)
     {
-        heap_free_raw(selector->tx.buf);
+        heap_free(selector->tx.buf);
         selector->tx.buf = NULL;
         selector->tx.size = 0;
     }
@@ -489,7 +489,7 @@ obj_p read_obj(selector_p selector)
     obj_p res;
 
     res = de_raw(selector->rx.buf, selector->rx.size);
-    heap_free_raw(selector->rx.buf);
+    heap_free(selector->rx.buf);
     selector->rx.buf = NULL;
     selector->rx.size = 0;
     selector->rx.wsa_buf.buf = NULL;
@@ -662,7 +662,7 @@ i64_t poll_run(poll_p poll)
             res = sys_error(ERROR_TYPE_SOCK, "poll_init");
             fmt = obj_fmt(res);
             printf("%s\n", fmt);
-            heap_free_raw(fmt);
+            heap_free(fmt);
             drop_obj(res);
         }
     }
@@ -719,7 +719,7 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg)
 
     if (selector->rx.buf == NULL)
     {
-        selector->rx.buf = heap_alloc_raw(sizeof(struct header_t));
+        selector->rx.buf = heap_alloc(sizeof(struct header_t));
         selector->rx.size = sizeof(struct header_t);
         selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
         selector->rx.wsa_buf.len = selector->rx.size;

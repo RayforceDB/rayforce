@@ -141,12 +141,12 @@ obj_p io_write(i64_t fd, u8_t msg_type, obj_p obj)
     case 1:
         fmt = obj_fmt(obj);
         fprintf(stdout, "%.*s\n", (i32_t)fmt->len, as_string(fmt));
-        heap_free_obj(fmt);
+        drop_obj(fmt);
         return NULL_OBJ;
     case 2:
         fmt = obj_fmt(obj);
         fprintf(stderr, "%.*s\n", (i32_t)fmt->len, as_string(fmt));
-        heap_free_obj(fmt);
+        drop_obj(fmt);
         return NULL_OBJ;
     default:
         // send ipc msg

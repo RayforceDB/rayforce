@@ -32,8 +32,8 @@
         drop_obj(fmt);                                                                                                     \
         drop_obj(re);                                                                                                      \
         drop_obj(le);                                                                                                      \
-        heap_free_obj(lns);                                                                                                \
-        heap_free_obj(rns);                                                                                                \
+        drop_obj(lns);                                                                                                     \
+        drop_obj(rns);                                                                                                     \
     }
 
 test_result_t test_lang_basic()

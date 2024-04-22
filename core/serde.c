@@ -305,7 +305,7 @@ i64_t ser_raw(u8_t **buf, obj_p obj)
     if (size == 0)
         return -1;
 
-    *buf = (u8_t *)heap_realloc_raw(*buf, sizeof(struct header_t) + size);
+    *buf = (u8_t *)heap_realloc(*buf, sizeof(struct header_t) + size);
     header = (header_t *)*buf;
 
     header->prefix = SERDE_PREFIX;
@@ -317,7 +317,7 @@ i64_t ser_raw(u8_t **buf, obj_p obj)
 
     if (save_obj(*buf + sizeof(struct header_t), size, obj) == 0)
     {
-        heap_free_raw(*buf);
+        heap_free(*buf);
         *buf = NULL;
         return -1;
     }

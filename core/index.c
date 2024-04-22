@@ -736,7 +736,7 @@ obj_p index_group_list_direct(obj_p lst, i64_t filter[], u64_t len)
         }
     }
 
-    scopes = (index_scope_t *)heap_alloc_raw(l * sizeof(index_scope_t));
+    scopes = (index_scope_t *)heap_alloc(l * sizeof(index_scope_t));
 
     // calculate scopes of each column to check if we can use direct hashing
     for (i = 0; i < l; i++)
@@ -767,7 +767,7 @@ obj_p index_group_list_direct(obj_p lst, i64_t filter[], u64_t len)
     {
         if (ULLONG_MAX / product < scopes[i].range)
         {
-            heap_free_raw(scopes);
+            heap_free(scopes);
             return NULL_OBJ; // Overflow would occur
         }
 
@@ -837,7 +837,7 @@ obj_p index_group_list_direct(obj_p lst, i64_t filter[], u64_t len)
         }
     }
 
-    heap_free_raw(scopes);
+    heap_free(scopes);
     res = index_group_i64_scoped(xo, NULL, len, scope);
     drop_obj(ht);
 

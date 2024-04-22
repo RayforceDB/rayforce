@@ -44,7 +44,7 @@ EM_JS(nil_t, js_rayforce_ready, (str_p text), {
 
 poll_p poll_init(i64_t port)
 {
-    poll_p poll = (poll_p)heap_alloc_raw(sizeof(struct poll_t));
+    poll_p poll = (poll_p)heap_alloc(sizeof(struct poll_t));
     poll->code = NULL_I64;
 
     return poll;
@@ -52,7 +52,7 @@ poll_p poll_init(i64_t port)
 
 nil_t poll_cleanup(poll_p poll)
 {
-    heap_free_raw(poll);
+    heap_free(poll);
 }
 
 i64_t poll_run(poll_p poll)

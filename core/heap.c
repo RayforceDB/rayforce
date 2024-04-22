@@ -30,38 +30,23 @@
 #include "util.h"
 #include "string.h"
 
-CASSERT(sizeof(struct block_t) == sizeof(struct obj_t), heap_h);
+CASSERT(sizeof(struct block_t) == 2 * sizeof(struct obj_t), heap_h);
 
 __thread heap_p __HEAP = NULL;
 
-#define blocksize(s) (sizeof(struct block_t) + (s))
+#define blocksize(s) (sizeof(struct obj_t) + (s))
 #define bsizeof(o) (1ull << (u64_t)(o))
-#define buddyof(b, o) ((block_p)((u64_t)__HEAP->memory + (((u64_t)(b) - (u64_t)__HEAP->memory) ^ bsizeof(o))))
+#define buddyof(b, o) ((block_p)((u64_t)(b)->pool + (((u64_t)(b) - (u64_t)(b)->pool) ^ bsizeof(o))))
 #define orderof(s) (64ull - __builtin_clzll((s) - 1))
-#define blockprev(b) ((block_p)((u64_t)(b->prev) & ~ORDER_MASK))
-#define blockorder(b) ((u64_t)(b->prev) >> ORDER_SHIFT)
-#define blockaddr(p, o) ((block_p)((u64_t)(p) | ((u64_t)(o) << ORDER_SHIFT)))
-#define obj2raw(o) ((raw_p)(o)->arr)
-#define raw2obj(r) ((obj_p)((i64_t)(r) - sizeof(struct obj_t)))
+#define block2raw(b) ((raw_p)((u64_t)(b) + sizeof(struct obj_t)))
+#define raw2block(r) ((block_p)((u64_t)(r) - sizeof(struct obj_t)))
 
 #ifdef SYS_MALLOC
 
-obj_p heap_alloc_obj(u64_t size)
-{
-    obj_p obj = (obj_p)malloc(blocksize(size));
-    obj->mmod = MMOD_INTERNAL;
-    return obj;
-}
-heap_p heap_init(u64_t id)
-{
-    unused(id);
-    return NULL;
-}
-nil_t heap_free_obj(obj_p obj) { free(obj); }
-obj_p heap_realloc_obj(obj_p ptr, u64_t new_size) { return realloc(ptr, blocksize(new_size)); }
-raw_p heap_alloc_raw(u64_t size) { return malloc(size); }
-nil_t heap_free_raw(raw_p ptr) { free(ptr); }
-raw_p heap_realloc_raw(raw_p ptr, u64_t size) { return realloc(ptr, size); }
+heap_p heap_init(u64_t) { return NULL; }
+raw_p heap_alloc(u64_t size) { return malloc(size); }
+nil_t heap_free(raw_p ptr) { free(ptr); }
+raw_p heap_realloc(raw_p ptr, u64_t size) { return realloc(ptr, size); }
 i64_t heap_gc(nil_t) { return 0; }
 nil_t heap_cleanup(nil_t) {}
 nil_t heap_borrow(heap_p heap) { unused(heap); }
@@ -75,8 +60,6 @@ heap_p heap_init(u64_t id)
     __HEAP = (heap_p)mmap_alloc(sizeof(struct heap_t));
     __HEAP->id = id;
     __HEAP->avail = 0;
-    __HEAP->memoffset = 0;
-    __HEAP->memory = (block_p)mmap_reserve(POOL_SIZE);
 
     memset(__HEAP->freelist, 0, sizeof(__HEAP->freelist));
 
@@ -85,9 +68,11 @@ heap_p heap_init(u64_t id)
 
 block_p heap_add_pool(u64_t size)
 {
-    block_p block = (block_p)mmap_commit(__HEAP->memory + __HEAP->memoffset, size);
+    block_p block = (block_p)mmap_alloc(size);
 
-    __HEAP->memoffset += size;
+    block->pool = block;
+    block->pool_order = orderof(size);
+
     __HEAP->memstat.system += size;
 
     return block;
@@ -97,7 +82,6 @@ nil_t heap_remove_pool(block_p block, u64_t size)
 {
     mmap_free(block, size);
 
-    __HEAP->memoffset -= size;
     __HEAP->memstat.system -= size;
 }
 
@@ -105,11 +89,13 @@ inline __attribute__((always_inline)) nil_t heap_insert_block(block_p block, u64
 {
     u64_t size = bsizeof(order);
 
-    block->prev = blockaddr(NULL, order);
+    block->prev = NULL;
     block->next = __HEAP->freelist[order];
+    block->used = 0;
+    block->order = order;
 
     if (__HEAP->freelist[order] != NULL)
-        __HEAP->freelist[order]->prev = blockaddr(block, order);
+        __HEAP->freelist[order]->prev = block;
     else
         __HEAP->avail |= size;
 
@@ -118,10 +104,8 @@ inline __attribute__((always_inline)) nil_t heap_insert_block(block_p block, u64
 
 inline __attribute__((always_inline)) nil_t heap_remove_block(block_p block, u64_t order)
 {
-    block_p prev = blockprev(block);
-
-    if (prev)
-        prev->next = block->next;
+    if (block->prev)
+        block->prev->next = block->next;
     if (block->next)
         block->next->prev = block->prev;
 
@@ -134,34 +118,29 @@ inline __attribute__((always_inline)) nil_t heap_remove_block(block_p block, u64
 
 inline __attribute__((always_inline)) nil_t heap_split_block(block_p block, u64_t block_order, u64_t order)
 {
+    block_p buddy;
+
     while ((order--) > block_order)
-        heap_insert_block((block_p)((u64_t)block + bsizeof(order)), order);
+    {
+        buddy = (block_p)((u64_t)block + bsizeof(order));
+        buddy->pool = block->pool;
+        buddy->pool_order = block->pool_order;
+        heap_insert_block(buddy, order);
+    }
 }
 
-obj_p __attribute__((hot)) heap_alloc_obj(u64_t size)
+raw_p __attribute__((hot)) heap_alloc(u64_t size)
 {
     u64_t i, order, block_size;
     block_p block;
-    obj_p obj;
+
+    if (size == 0 || size > bsizeof(MAX_POOL_ORDER))
+        return NULL;
 
     block_size = blocksize(size);
 
     // calculate minimal order for this size
     order = orderof(block_size);
-
-    if (order > MAX_ORDER)
-    {
-        size = bsizeof(order);
-        block = (block_p)mmap_alloc(size);
-
-        // try to gc if no memory left
-        if (block == NULL)
-            return NULL;
-
-        __HEAP->memstat.system += size;
-
-        goto complete;
-    }
 
     // find least order block that fits
     i = (AVAIL_MASK << order) & __HEAP->avail;
@@ -170,9 +149,23 @@ obj_p __attribute__((hot)) heap_alloc_obj(u64_t size)
     // add a new pool and split as well
     if (i == 0)
     {
+        if (order >= MAX_ORDER)
+        {
+            size = bsizeof(order);
+            block = heap_add_pool(size);
+
+            if (block == NULL)
+                return NULL;
+
+            block->order = order;
+
+            __HEAP->memstat.system += size;
+
+            return block2raw(block);
+        }
+
         block = heap_add_pool(bsizeof(MAX_ORDER));
 
-        // try to gc if no memory left
         if (block == NULL)
             return NULL;
 
@@ -184,55 +177,45 @@ obj_p __attribute__((hot)) heap_alloc_obj(u64_t size)
 
     // remove the block out of list
     block = __HEAP->freelist[i];
+    block->order = order;
+    block->used = 1;
 
     __HEAP->freelist[i] = block->next;
     if (__HEAP->freelist[i] != NULL)
-        __HEAP->freelist[i]->prev = blockaddr(NULL, i);
+        __HEAP->freelist[i]->prev = NULL;
     else
         __HEAP->avail &= ~bsizeof(i);
 
     heap_split_block(block, order, i);
 
-complete:
-    obj = (obj_p)block;
-    obj->mmod = MMOD_INTERNAL;
-    obj->order = order;
-
-    return obj;
+    return block2raw(block);
 }
 
-__attribute__((hot)) nil_t heap_free_obj(obj_p obj)
+__attribute__((hot)) nil_t heap_free(raw_p ptr)
 {
     block_p block, buddy;
-    obj_p buddy_obj;
     u64_t order;
 
-    if (obj == NULL)
+    if (ptr == NULL)
         return;
 
-    order = obj->order;
-    block = (block_p)obj;
-
-    // blocks over MAX_ORDER are not being splitted
-    if (order > MAX_ORDER)
-    {
-        mmap_free(block, bsizeof(order));
-        return;
-        // return heap_insert_block(block, order);
-    }
+    block = raw2block(ptr);
+    order = block->order;
 
     for (;; order++)
     {
         // check if we are at the root block (no buddies left)
-        if (order == MAX_ORDER)
+        if (block->pool_order == order)
+        {
+
             return heap_insert_block(block, order);
+        }
 
         // calculate buddy
         buddy = buddyof(block, order);
-        buddy_obj = (obj_p)buddy;
 
         // buddy is used, or buddy is of different order, so we can't merge
-        if (buddy_obj->mmod == MMOD_INTERNAL || blockorder(buddy) != order)
+        if (buddy->used || buddy->order != order)
             return heap_insert_block(block, order);
 
         // merge blocks: remove buddy from its freelist.
@@ -243,82 +226,44 @@ __attribute__((hot)) nil_t heap_free_obj(obj_p obj)
     }
 }
 
-__attribute__((hot)) obj_p heap_realloc_obj(obj_p obj, u64_t new_size)
+__attribute__((hot)) raw_p heap_realloc(raw_p ptr, u64_t new_size)
 {
     block_p block;
-    obj_p new_obj;
     u64_t i, old_size, cap, order;
+    raw_p new_ptr;
 
-    old_size = bsizeof(obj->order);
-    block = (block_p)obj;
+    block = raw2block(ptr);
+    old_size = bsizeof(block->order);
     cap = blocksize(new_size);
     order = orderof(cap);
 
-    if (obj->order == order)
-        return obj;
+    if (block->order == order)
+        return ptr;
 
     // grow
-    if (cap > old_size)
+    if (order > block->order)
     {
-        new_obj = heap_alloc_obj(new_size);
+        new_ptr = heap_alloc(new_size);
 
-        if (new_obj == NULL)
+        if (new_ptr == NULL)
         {
-            heap_free_obj(obj);
+            heap_free(ptr);
             return NULL;
         }
 
-        memcpy(new_obj, obj, old_size);
-        new_obj->order = order;
+        memcpy(new_ptr, ptr, old_size - sizeof(struct obj_t));
+        heap_free(ptr);
 
-        heap_free_obj(obj);
-
-        return new_obj;
+        return new_ptr;
     }
 
-    // resize
-    i = obj->order;
-    obj->order = order;
+    // shrink
+    i = block->order;
+    block->order = order;
 
     heap_split_block(block, order, i);
 
-    return obj;
-}
-
-raw_p heap_alloc_raw(u64_t size)
-{
-    obj_p obj;
-
-    if (size == 0)
-        return NULL;
-
-    obj = heap_alloc_obj(size);
-
-    if (obj == NULL)
-        return NULL;
-
-    return obj2raw(obj);
-}
-
-raw_p heap_realloc_raw(raw_p ptr, u64_t size)
-{
-    obj_p obj, new_obj;
-
-    obj = raw2obj(ptr);
-    new_obj = heap_realloc_obj(obj, size + sizeof(struct obj_t));
-
-    if (new_obj == NULL)
-        return NULL;
-
-    return obj2raw(new_obj);
-}
-
-nil_t heap_free_raw(raw_p ptr)
-{
-    if (ptr == NULL)
-        return;
-
-    heap_free_obj(raw2obj(ptr));
+    return ptr;
 }
 
 i64_t heap_gc(nil_t)
@@ -326,7 +271,7 @@ i64_t heap_gc(nil_t)
     u64_t i, size, total = 0;
     block_p block, next;
 
-    for (i = MAX_ORDER; i <= MAX_POOL_ORDER; i++)
+    for (i = MIN_ORDER; i <= MAX_POOL_ORDER; i++)
     {
         block = __HEAP->freelist[i];
         size = bsizeof(i);
@@ -389,7 +334,7 @@ nil_t heap_merge(heap_p heap)
         {
             next = block;
             block = block->next;
-            heap_free_raw(next);
+            heap_free(next);
         }
 
         heap->freelist[i] = NULL;
@@ -409,6 +354,8 @@ memstat_t heap_memstat(nil_t)
 {
     u64_t i;
     block_p block;
+
+    heap_print_blocks(__HEAP);
 
     __HEAP->memstat.free = 0;
 
@@ -438,7 +385,7 @@ nil_t heap_cleanup(nil_t)
         while (block)
         {
             next = block->next;
-            if (i != blockorder(block))
+            if (i != block->pool_order)
             {
                 debug("%s-- HEAP[%lld]: leak order: %lld block: %p%s", RED, __HEAP->id, i, block, RESET);
                 return;
@@ -449,7 +396,6 @@ nil_t heap_cleanup(nil_t)
         }
     }
 
-    mmap_free(__HEAP->memory, POOL_SIZE);
     mmap_free(__HEAP, sizeof(struct heap_t));
 
     __HEAP = NULL;

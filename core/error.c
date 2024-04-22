@@ -29,15 +29,18 @@
 
 obj_p error_obj(i8_t code, obj_p msg)
 {
-    obj_p obj = heap_alloc_obj(sizeof(ray_error_t));
-    ray_error_t *e = (ray_error_t *)obj->arr;
+    obj_p obj;
+    ray_error_t *e;
 
+    obj = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(ray_error_t));
+    obj->mmod = MMOD_INTERNAL;
+    obj->rc = 1;
+    obj->type = TYPE_ERROR;
+
+    e = (ray_error_t *)obj->arr;
     e->code = code;
     e->msg = msg;
     e->locs = NULL_OBJ;
-
-    obj->rc = 1;
-    obj->type = TYPE_ERROR;
 
     return obj;
 }

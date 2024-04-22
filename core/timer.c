@@ -50,7 +50,7 @@ u64_t get_time_millis(nil_t)
 
 ray_timer_p timer_new(i64_t id, u64_t tic, u64_t exp, i64_t num, obj_p clb)
 {
-    ray_timer_p timer = (ray_timer_p)heap_alloc_raw(sizeof(struct ray_timer_t));
+    ray_timer_p timer = (ray_timer_p)heap_alloc(sizeof(struct ray_timer_t));
 
     timer->id = id;
     timer->tic = tic;
@@ -64,7 +64,7 @@ ray_timer_p timer_new(i64_t id, u64_t tic, u64_t exp, i64_t num, obj_p clb)
 nil_t timer_free(ray_timer_p t)
 {
     drop_obj(t->clb);
-    heap_free_raw(t);
+    heap_free(t);
 }
 
 nil_t timers_swap(ray_timer_p *a, ray_timer_p *b)
@@ -127,9 +127,9 @@ ray_timer_p timer_pop(timers_p timers)
 
 timers_p timers_new(u64_t capacity)
 {
-    timers_p timers = (timers_p)heap_alloc_raw(sizeof(struct timers_t));
+    timers_p timers = (timers_p)heap_alloc(sizeof(struct timers_t));
 
-    timers->timers = (ray_timer_p *)heap_alloc_raw(capacity * sizeof(ray_timer_p));
+    timers->timers = (ray_timer_p *)heap_alloc(capacity * sizeof(ray_timer_p));
     timers->capacity = capacity;
     timers->size = 0;
     timers->counter = 0;
@@ -146,8 +146,8 @@ nil_t timers_free(timers_p timers)
     for (i = 0; i < l; i++)
         timer_free(timers->timers[i]);
 
-    heap_free_raw(timers->timers);
-    heap_free_raw(timers);
+    heap_free(timers->timers);
+    heap_free(timers);
 }
 
 i64_t timer_add(timers_p timers, u64_t tic, u64_t exp, u64_t num, obj_p clb)
