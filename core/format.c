@@ -351,19 +351,29 @@ i64_t error_frame_fmt_into(obj_p *dst, i64_t limit, obj_p obj, i64_t idx, str_p 
 {
     unused(limit);
     i64_t n = 0;
-    u32_t line_len;
+    u32_t line_len, fname_len;
     u16_t line_number = 0, i;
     str_p filename, source, function, start, end, lf = "", flname = "repl", fnname = "anonymous";
     obj_p *frame = as_list(obj);
     span_t span = (span_t){0};
 
     span.id = frame[0]->i64;
-    filename = (frame[1] != NULL_OBJ) ? as_string(frame[1]) : flname;
+    if (frame[1] != NULL_OBJ)
+    {
+        filename = as_string(frame[1]);
+        fname_len = frame[1]->len;
+    }
+    else
+    {
+        filename = flname;
+        fname_len = strlen(flname);
+    }
     function = (frame[2] != NULL_OBJ) ? strof_sym(frame[2]->i64) : fnname;
     source = as_string(frame[3]);
+    line_len = frame[3]->len;
 
-    n += str_fmt_into(dst, MAX_ERROR_LEN, "%s [%lld] %s%s-->%s %s:%d:%d..%d:%d in function: @%s\n",
-                      MAGENTA, idx, RESET, CYAN, RESET, filename,
+    n += str_fmt_into(dst, MAX_ERROR_LEN, "%s [%lld] %s%s-->%s %.*s:%d:%d..%d:%d in function: @%s\n",
+                      MAGENTA, idx, RESET, CYAN, RESET, fname_len, filename,
                       span.start_line + 1, span.start_column + 1, span.end_line + 1, span.end_column + 1,
                       function);
 
@@ -372,7 +382,7 @@ i64_t error_frame_fmt_into(obj_p *dst, i64_t limit, obj_p obj, i64_t idx, str_p 
 
     while (1)
     {
-        end = strchr(start, '\n');
+        end = memchr(start, '\n', line_len);
 
         if (end == NULL)
         {
@@ -434,7 +444,7 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj)
     u64_t msg_len;
     u16_t i, l, m;
     str_p error_desc, msg;
-    ray_error_t *error = as_error(obj);
+    ray_error_p error = as_error(obj);
 
     switch (error->code)
     {
@@ -503,6 +513,7 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj)
         for (i = 0; i < m; i++)
         {
             n += error_frame_fmt_into(dst, MAX_ERROR_LEN, as_list(error->locs)[i], l - i - 1, msg, msg_len);
+            msg = "";
             msg_len = 0;
         }
 
@@ -855,7 +866,7 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj)
             s = formatted_columns[i][j];
             p = as_string(s);
             n = n - s->len;
-            str_fmt_into(dst, s->len + 2, " %s", p);
+            str_fmt_into(dst, s->len + 2, " %.*s", s->len, p);
             str_fmt_into_n(dst, NO_LIMIT, n, " ");
             str_fmt_into(dst, 2, "|");
             // Free formatted column

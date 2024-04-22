@@ -114,7 +114,7 @@ i32_t runtime_init(i32_t argc, str_p argv[])
 
     heap_init(0);
 
-    __RUNTIME = (runtime_p)mmap_alloc(sizeof(struct runtime_t));
+    __RUNTIME = (runtime_p)heap_mmap(sizeof(struct runtime_t));
     __RUNTIME->symbols = symbols_new();
     __RUNTIME->env = create_env();
     __RUNTIME->addr = (sock_addr_t){0};
@@ -196,13 +196,13 @@ nil_t runtime_cleanup(nil_t)
     if (__RUNTIME->poll)
         poll_cleanup(__RUNTIME->poll);
     symbols_free(__RUNTIME->symbols);
-    mmap_free(__RUNTIME->symbols, sizeof(struct symbols_t));
+    heap_unmap(__RUNTIME->symbols, sizeof(struct symbols_t));
     free_env(&__RUNTIME->env);
     drop_obj(__RUNTIME->fds);
     interpreter_free();
     if (__RUNTIME->pool)
         pool_free(__RUNTIME->pool);
-    mmap_free(__RUNTIME, sizeof(struct runtime_t));
+    heap_unmap(__RUNTIME, sizeof(struct runtime_t));
     heap_cleanup();
     __RUNTIME = NULL;
 }

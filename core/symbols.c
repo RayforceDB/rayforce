@@ -150,12 +150,12 @@ next:
  */
 pool_node_p pool_node_new(nil_t)
 {
-    return (pool_node_p)mmap_alloc(STRINGS_POOL_SIZE);
+    return (pool_node_p)heap_mmap(STRINGS_POOL_SIZE);
 }
 
 nil_t pool_node_free(pool_node_p node)
 {
-    mmap_free(node, STRINGS_POOL_SIZE);
+    heap_unmap(node, STRINGS_POOL_SIZE);
 }
 
 symbol_p str_intern(symbols_p symbols, str_p str, u64_t len)
@@ -183,7 +183,7 @@ symbol_p str_intern(symbols_p symbols, str_p str, u64_t len)
 
 symbols_p symbols_new(nil_t)
 {
-    symbols_p symbols = (symbols_p)mmap_alloc(sizeof(struct symbols_t));
+    symbols_p symbols = (symbols_p)heap_mmap(sizeof(struct symbols_t));
     pool_node_p node = pool_node_new();
 
     pthread_mutex_init(&symbols->lock, NULL);

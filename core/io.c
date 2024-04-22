@@ -452,7 +452,7 @@ obj_p ray_csv(obj_p *x, i64_t n)
 {
     i64_t i, l, fd, len, lines, size;
     str_p buf, prev, pos, line;
-    obj_p types, names, cols, res;
+    obj_p types, names, cols, path, res;
     i8_t type;
     c8_t sep = ',';
 
@@ -493,12 +493,15 @@ obj_p ray_csv(obj_p *x, i64_t n)
             types->arr[i] = type;
         }
 
-        fd = fs_fopen(as_string(x[1]), ATTR_RDONLY);
+        path = cstring_from_obj(x[1]);
+        fd = fs_fopen(as_string(path), ATTR_RDONLY);
 
         if (fd == -1)
         {
             drop_obj(types);
-            return sys_error(ERROR_TYPE_SYS, as_string(x[1]));
+            res = sys_error(ERROR_TYPE_SYS, as_string(path));
+            drop_obj(path);
+            return res;
         }
 
         size = fs_fsize(fd);
@@ -507,7 +510,9 @@ obj_p ray_csv(obj_p *x, i64_t n)
         {
             drop_obj(types);
             fs_fclose(fd);
-            throw(ERR_LENGTH, "get: file '%s': invalid size: %d", as_string(x[1]), size);
+            res = error(ERR_LENGTH, "get: file '%s': invalid size: %d", as_string(path), size);
+            drop_obj(path);
+            return res;
         }
 
         buf = (str_p)mmap_file(fd, size);
@@ -533,7 +538,9 @@ obj_p ray_csv(obj_p *x, i64_t n)
             drop_obj(types);
             fs_fclose(fd);
             mmap_free(buf, size);
-            throw(ERR_LENGTH, "csv: file '%s': invalid size: %d", as_string(x[1]), size);
+            res = error(ERR_LENGTH, "csv: file '%s': invalid size: %d", as_string(path), size);
+            drop_obj(path);
+            return res;
         }
 
         // Adjust for the file not ending with a newline
@@ -580,7 +587,9 @@ obj_p ray_csv(obj_p *x, i64_t n)
             drop_obj(names);
             fs_fclose(fd);
             mmap_free(buf, size);
-            throw(ERR_LENGTH, "csv: file '%s': invalid header (number of fields is less then csv contains)", as_string(x[1]));
+            res = error(ERR_LENGTH, "csv: file '%s': invalid header (number of fields is less then csv contains)", as_string(path));
+            drop_obj(path);
+            return res;
         }
 
         // exclude header
@@ -602,6 +611,7 @@ obj_p ray_csv(obj_p *x, i64_t n)
         drop_obj(types);
         fs_fclose(fd);
         mmap_free(buf, size);
+        drop_obj(path);
 
         if (!is_null(res))
         {

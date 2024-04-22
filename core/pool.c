@@ -67,7 +67,7 @@ raw_p executor_run(raw_p arg)
 pool_p pool_new(u64_t executors_count)
 {
     u64_t i;
-    pool_p pool = (pool_p)mmap_alloc(sizeof(struct pool_t) + (sizeof(executor_t) * executors_count));
+    pool_p pool = (pool_p)heap_mmap(sizeof(struct pool_t) + (sizeof(executor_t) * executors_count));
     pool->executors_count = executors_count;
 
     for (i = 0; i < executors_count; i++)
@@ -190,5 +190,5 @@ nil_t pool_stop(pool_p pool)
 nil_t pool_free(pool_p pool)
 {
     pool_stop(pool);
-    mmap_free(pool, sizeof(struct pool_t) + sizeof(executor_t) * pool->executors_count);
+    heap_unmap(pool, sizeof(struct pool_t) + sizeof(executor_t) * pool->executors_count);
 }

@@ -67,11 +67,11 @@ interpreter_p interpreter_new(nil_t)
     interpreter_p interpreter;
     obj_p f;
 
-    interpreter = (interpreter_p)mmap_alloc(sizeof(struct interpreter_t));
+    interpreter = (interpreter_p)heap_mmap(sizeof(struct interpreter_t));
     interpreter->sp = 0;
-    interpreter->stack = (obj_p *)mmap_stack(sizeof(obj_p) * EVAL_STACK_SIZE);
+    interpreter->stack = (obj_p *)heap_stack(sizeof(obj_p) * EVAL_STACK_SIZE);
     interpreter->cp = 0;
-    interpreter->ctxstack = (ctx_p)mmap_stack(sizeof(struct ctx_t) * EVAL_STACK_SIZE);
+    interpreter->ctxstack = (ctx_p)heap_stack(sizeof(struct ctx_t) * EVAL_STACK_SIZE);
     memset(interpreter->ctxstack, 0, sizeof(struct ctx_t) * EVAL_STACK_SIZE);
 
     __INTERPRETER = interpreter;
@@ -90,14 +90,10 @@ nil_t interpreter_free(nil_t)
     while (__INTERPRETER->sp)
         drop_obj(__INTERPRETER->stack[--__INTERPRETER->sp]);
 
-    mmap_free(__INTERPRETER->stack, EVAL_STACK_SIZE);
-
-    // cleanup context stack
+    heap_unmap(__INTERPRETER->stack, EVAL_STACK_SIZE);
     drop_obj(__INTERPRETER->ctxstack[0].lambda);
-
-    mmap_free(__INTERPRETER->ctxstack, sizeof(struct ctx_t) * EVAL_STACK_SIZE);
-
-    mmap_free(__INTERPRETER, sizeof(struct interpreter_t));
+    heap_unmap(__INTERPRETER->ctxstack, sizeof(struct ctx_t) * EVAL_STACK_SIZE);
+    heap_unmap(__INTERPRETER, sizeof(struct interpreter_t));
 }
 
 obj_p call(obj_p obj, u64_t arity)

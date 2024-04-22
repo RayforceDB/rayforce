@@ -29,7 +29,7 @@
 #include "heap.h"
 #include "format.h"
 
-#define as_error(obj) ((ray_error_t *)(as_string(obj)))
+#define as_error(obj) ((ray_error_p)(as_string(obj)))
 
 /*
  * Create a new error object and return it
@@ -63,7 +63,7 @@ typedef struct ray_error_t
     i64_t code;
     obj_p msg;
     obj_p locs;
-} ray_error_t;
+} *ray_error_p;
 
 obj_p error_obj(i8_t code, obj_p msg);
 obj_p error_str(i8_t code, str_p msg);

@@ -45,8 +45,11 @@ __thread heap_p __HEAP = NULL;
 
 heap_p heap_init(u64_t) { return NULL; }
 raw_p heap_alloc(u64_t size) { return malloc(size); }
+raw_p heap_mmap(u64_t size) { return mmap_alloc(size); }
+raw_p heap_stack(u64_t size) { return mmap_stack(size); }
 nil_t heap_free(raw_p ptr) { free(ptr); }
 raw_p heap_realloc(raw_p ptr, u64_t size) { return realloc(ptr, size); }
+nil_t heap_unmap(raw_p ptr, u64_t size) { mmap_free(ptr, size); }
 i64_t heap_gc(nil_t) { return 0; }
 nil_t heap_cleanup(nil_t) {}
 nil_t heap_borrow(heap_p heap) { unused(heap); }
@@ -70,10 +73,14 @@ block_p heap_add_pool(u64_t size)
 {
     block_p block = (block_p)mmap_alloc(size);
 
+    if (block == NULL)
+        return NULL;
+
     block->pool = block;
     block->pool_order = orderof(size);
 
     __HEAP->memstat.system += size;
+    __HEAP->memstat.heap += size;
 
     return block;
 }
@@ -83,6 +90,7 @@ nil_t heap_remove_pool(block_p block, u64_t size)
     mmap_free(block, size);
 
     __HEAP->memstat.system -= size;
+    __HEAP->memstat.heap -= size;
 }
 
 inline __attribute__((always_inline)) nil_t heap_insert_block(block_p block, u64_t order)
@@ -127,6 +135,30 @@ inline __attribute__((always_inline)) nil_t heap_split_block(block_p block, u64_
         buddy->pool_order = block->pool_order;
         heap_insert_block(buddy, order);
     }
+}
+
+raw_p heap_mmap(u64_t size)
+{
+    raw_p ptr = mmap_alloc(size);
+
+    if (ptr == NULL)
+        return NULL;
+
+    __HEAP->memstat.system += size;
+
+    return ptr;
+}
+
+raw_p heap_stack(u64_t size)
+{
+    raw_p ptr = mmap_stack(size);
+
+    if (ptr == NULL)
+        return NULL;
+
+    __HEAP->memstat.system += size;
+
+    return ptr;
 }
 
 raw_p __attribute__((hot)) heap_alloc(u64_t size)
@@ -263,6 +295,12 @@ __attribute__((hot)) raw_p heap_realloc(raw_p ptr, u64_t new_size)
     return ptr;
 }
 
+nil_t heap_unmap(raw_p ptr, u64_t size)
+{
+    mmap_free(ptr, size);
+    __HEAP->memstat.system -= size;
+}
+
 i64_t heap_gc(nil_t)
 {
     u64_t i, size, total = 0;
@@ -351,8 +389,6 @@ memstat_t heap_memstat(nil_t)
 {
     u64_t i;
     block_p block;
-
-    heap_print_blocks(__HEAP);
 
     __HEAP->memstat.free = 0;
 

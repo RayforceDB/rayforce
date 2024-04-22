@@ -65,9 +65,12 @@ typedef struct heap_t
 } *heap_p;
 
 heap_p heap_init(u64_t id);
+raw_p heap_mmap(u64_t size);
+raw_p heap_stack(u64_t size);
 raw_p heap_alloc(u64_t size);
 raw_p heap_realloc(raw_p ptr, u64_t size);
 nil_t heap_free(raw_p ptr);
+nil_t heap_unmap(raw_p ptr, u64_t size);
 i64_t heap_gc(nil_t);
 nil_t heap_borrow(heap_p heap);
 nil_t heap_merge(heap_p heap);

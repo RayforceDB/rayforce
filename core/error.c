@@ -30,14 +30,14 @@
 obj_p error_obj(i8_t code, obj_p msg)
 {
     obj_p obj;
-    ray_error_t *e;
+    ray_error_p e;
 
-    obj = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(ray_error_t));
+    obj = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(struct ray_error_t));
     obj->mmod = MMOD_INTERNAL;
-    obj->rc = 1;
     obj->type = TYPE_ERROR;
+    obj->rc = 1;
 
-    e = (ray_error_t *)obj->arr;
+    e = (ray_error_p)obj->arr;
     e->code = code;
     e->msg = msg;
     e->locs = NULL_OBJ;
@@ -47,7 +47,7 @@ obj_p error_obj(i8_t code, obj_p msg)
 
 obj_p error_str(i8_t code, str_p msg)
 {
-    return error_obj(code, string_from_str(msg, strlen(msg)));
+    return error_obj(code, cstring_from_str(msg, strlen(msg)));
 }
 
 obj_p error(i8_t code, str_p fmt, ...)
