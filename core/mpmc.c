@@ -35,7 +35,14 @@
 
 static inline void cpu_relax()
 {
-    __asm__ volatile("pause" ::: "memory");
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__arm__) || defined(__aarch64__)
+    __asm__ volatile("yield" ::: "memory");
+#else
+    // Generic fallback: no-op or compiler barrier
+    __asm__ volatile("" ::: "memory"); // acts as a compiler barrier
+#endif
 }
 
 nil_t backoff_spin(u64_t *rounds)
