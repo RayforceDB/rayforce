@@ -175,7 +175,8 @@ symbol_p str_intern(symbols_p symbols, lit_p str, u64_t len)
     }
 
     sym->len = len;
-    strncpy(sym->str, str, len);
+    memcpy(sym->str, str, len);
+    sym->str[len] = '\0';
     symbols->symbols_pool += size;
 
     return sym;

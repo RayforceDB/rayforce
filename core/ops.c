@@ -42,7 +42,7 @@
 __thread u64_t __RND_SEED__ = 0;
 
 // Initialize the Global null object
-struct obj_t __NULL_OBJECT = {.mmod = 0, .order = 0, .type = TYPE_NULL, .attrs = 0, .rc = 0, .len = 0};
+struct obj_t __NULL_OBJECT = {.mmod = MMOD_INTERNAL, .order = 0, .type = TYPE_NULL, .attrs = 0, .rc = 0, .len = 0};
 
 /*
  * Treat obj as a b8

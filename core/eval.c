@@ -95,6 +95,7 @@ interpreter_p interpreter_new(nil_t)
 nil_t interpreter_destroy(nil_t)
 {
     // cleanup stack (if any)
+    debug("sp: %lld", __INTERPRETER->sp);
     debug_assert(__INTERPRETER->sp == 0, "stack is not empty");
 
     heap_unmap(__INTERPRETER->stack, EVAL_STACK_SIZE);
@@ -645,35 +646,17 @@ obj_p interpreter_env_get(nil_t)
     l = as_lambda(lambda)->args->len;
     env = __INTERPRETER->stack[ctx->sp + l];
 
-    return clone_obj(env);
+    return env;
 }
 
 nil_t interpreter_env_set(interpreter_p interpreter, obj_p env)
 {
-    obj_p lambda;
-    u64_t l;
-    ctx_p ctx;
-
-    ctx = ctx_get();
-    lambda = ctx->lambda;
-
-    l = as_lambda(lambda)->args->len;
-    interpreter->stack[ctx->sp + l] = env;
+    interpreter->stack[interpreter->sp++] = env;
 }
 
 nil_t interpreter_env_unset(interpreter_p interpreter)
 {
-    obj_p lambda, env;
-    u64_t l;
-    ctx_p ctx;
-
-    ctx = ctx_get();
-    lambda = ctx->lambda;
-
-    l = as_lambda(lambda)->args->len;
-    env = interpreter->stack[ctx->sp + l];
-    drop_obj(env);
-    interpreter->stack[ctx->sp + l] = NULL_OBJ;
+    drop_obj(interpreter->stack[--interpreter->sp]);
 }
 
 obj_p *deref(obj_p sym)
@@ -694,6 +677,7 @@ obj_p *deref(obj_p sym)
 
     // search locals
     env = __INTERPRETER->stack[bp + l];
+
     if (env != NULL_OBJ)
     {
         n = as_list(env)[0]->len;

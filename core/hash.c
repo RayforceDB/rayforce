@@ -265,7 +265,7 @@ u64_t hash_obj(i64_t a, raw_p seed)
 i64_t hash_cmp_i64(i64_t a, i64_t b, raw_p seed)
 {
     unused(seed);
-    return a - b;
+    return (a < b) ? -1 : ((a > b) ? 1 : 0);
 }
 
 i64_t hash_cmp_obj(i64_t a, i64_t b, raw_p seed)

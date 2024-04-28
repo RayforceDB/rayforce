@@ -86,6 +86,7 @@ nil_t dump_stack(nil_t);
 #else
 #define debug(fmt, ...) (nil_t)0
 #define debug_assert(x, fmt, ...) (nil_t)0
+#define debug_obj(o) (nil_t)0
 #endif
 
 #define printbits_n(x, n)                                                \

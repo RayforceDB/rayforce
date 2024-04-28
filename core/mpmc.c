@@ -161,3 +161,8 @@ mpmc_data_t mpmc_pop(mpmc_p queue)
 
     return data;
 }
+
+u64_t mpmc_size(mpmc_p queue)
+{
+    return queue->mask + 1;
+}

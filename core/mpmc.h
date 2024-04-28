@@ -77,5 +77,6 @@ mpmc_p mpmc_create(u64_t size);
 nil_t mpmc_destroy(mpmc_p queue);
 i64_t mpmc_push(mpmc_p queue, mpmc_data_t data);
 mpmc_data_t mpmc_pop(mpmc_p queue);
+u64_t mpmc_size(mpmc_p queue);
 
 #endif // MPMC_H

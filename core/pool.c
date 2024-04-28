@@ -131,7 +131,7 @@ nil_t pool_destroy(pool_p pool)
     heap_unmap(pool, sizeof(struct pool_t) + sizeof(executor_t) * pool->executors_count);
 }
 
-nil_t pool_prepare(pool_p pool)
+nil_t pool_prepare(pool_p pool, u64_t tasks_count)
 {
     if (!pool)
         return;
@@ -144,13 +144,21 @@ nil_t pool_prepare(pool_p pool)
     n = pool->executors_count;
     pool->done_count = 0;
 
+    if (tasks_count > mpmc_size(pool->task_queue))
+    {
+        // Grow task queue
+        mpmc_destroy(pool->task_queue);
+        pool->task_queue = mpmc_create(tasks_count);
+        // Grow result queue
+        mpmc_destroy(pool->result_queue);
+        pool->result_queue = mpmc_create(tasks_count);
+    }
+
     for (i = 0; i < n; i++)
     {
         heap_borrow(pool->executors[i].heap);
         interpreter_env_set(pool->executors[i].interpreter, clone_obj(env));
     }
-
-    drop_obj(env);
 }
 
 nil_t pool_add_task(pool_p pool, u64_t id, task_fn fn, raw_p arg, u64_t len)
@@ -194,8 +202,8 @@ obj_p pool_run(pool_p pool, u64_t tasks_count)
     // merge heaps
     for (i = 0; i < n; i++)
     {
-        interpreter_env_unset(pool->executors[i].interpreter);
         heap_merge(pool->executors[i].heap);
+        interpreter_env_unset(pool->executors[i].interpreter);
     }
 
     // collect results
@@ -204,9 +212,7 @@ obj_p pool_run(pool_p pool, u64_t tasks_count)
     for (i = 0; i < tasks_count; i++)
     {
         data = mpmc_pop(pool->result_queue);
-        if (data.id == -1)
-            panic("Pool run: invalid data id!!!!");
-
+        debug_assert(data.id != -1, "Pool run: invalid data id!!!!");
         drop_obj(data.out.arg);
         ins_obj(&res, data.id, data.out.result);
     }

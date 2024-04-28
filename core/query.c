@@ -405,7 +405,7 @@ obj_p ray_select(obj_p obj)
         }
         else
         {
-            pool_prepare(pool);
+            pool_prepare(pool, l);
 
             for (i = 0; i < l; i++)
             {
