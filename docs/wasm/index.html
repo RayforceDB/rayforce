@@ -4,7 +4,7 @@
 <head>
   <title>Playground</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css">
-  <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code&display=swap" rel="stylesheet">
   <style>
     body,
     html {
@@ -39,7 +39,8 @@
     }
 
     .textout {
-      font-family: 'Roboto Mono', monospace;
+      font-family: 'Fira Code', monospace;
+      font-weight: bold;
       background-color: #4f4f4f;
       color: white;
       font-size: 14px;
@@ -54,31 +55,44 @@
       display: flex;
       align-items: center;
       width: 100%;
-      /* Ensure container fills horizontal space */
     }
 
     .prompt {
-      font-size: 16px;
+      font-size: 18px;
       font-weight: bold;
       color: #00da1a;
       white-space: nowrap;
-      /* Prevent prompt from wrapping */
+    }
+
+    .caret {
+      position: absolute;
+      width: 8px;
+      height: 1.2em;
+      background-color: white;
+      animation: blink 1s step-end infinite;
+      vertical-align: middle;
+    }
+
+    @keyframes blink {
+
+      0%,
+      100% {
+        opacity: 0;
+      }
+
+      50% {
+        opacity: 1;
+      }
     }
 
     #input {
       flex-grow: 1;
       background-color: transparent;
       border: none;
-      color: white;
-      font-size: 14px;
       outline: none;
       width: auto;
-      /* Let it expand as needed */
-    }
-
-
-    #input:focus {
-      outline: none;
+      caret-color: transparent;
+      /* padding-left: 0.5em; */
     }
   </style>
 </head>
@@ -91,9 +105,10 @@
   </div>
   <div id="container" class="textout" onclick="document.getElementById('input').focus();">
     <div id="output" class="textout"></div>
-    <div class="input-container">
+    <div id="input-container" class="input-container">
       <span class="textout prompt">&gt; </span>
       <input id="input" class="textout" type="text" autofocus>
+      <span id="caret" class="caret"></span>
     </div>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/ansi_up@5"></script>
@@ -101,6 +116,35 @@
   <script>
     let history = []; // Array to store command history
     let historyIndex = -1; // Current position in history;
+
+
+
+    function updateCaretPosition() {
+      const input = document.getElementById('input');
+      const caret = document.getElementById('caret');
+      const prompt = document.querySelector('.prompt');  // Select the prompt element
+      // Measure text width
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      context.font = "bold 14px 'Fira Code', monospace";  // Ensure this matches the input font and size
+      const textWidth = context.measureText(input.value).width;
+      const promptWidth = prompt.offsetWidth;  // Get the width of the prompt element
+      // Move the caret to the end of the text, adding the prompt's width
+      caret.style.transform = `translateX(${promptWidth + textWidth}px)`;
+    }
+
+    document.getElementById('input').addEventListener('input', function () {
+      updateCaretPosition();
+    });
+
+    document.getElementById('input').addEventListener('focus', function () {
+      document.getElementById('caret').style.visibility = 'visible';
+      updateCaretPosition();
+    });
+
+    document.getElementById('input').addEventListener('blur', function () {
+      document.getElementById('caret').style.visibility = 'hidden';
+    });
 
     document.getElementById('input').addEventListener('keydown', function (event) {
       const inputField = document.getElementById('input');
@@ -153,7 +197,6 @@
       sendOutput(input + '\n' + fmt);
       Module.ccall('drop_obj', 'null', ['number'], [fob]);
       Module.ccall('drop_obj', 'null', ['number'], [obj]);
-      document.getElementById('input').focus(); // Refocus on the input field
     }
 
     function sendOutput(text) {
@@ -163,6 +206,9 @@
       outputElement.innerHTML += html + '<br>';
       const container = document.getElementById('container');
       container.scrollTop = container.scrollHeight;
+      document.getElementById('input').value = '';
+      document.getElementById('input').focus(); // Refocus on the input field
+      updateCaretPosition();
     }
 
     function clearInput() {
