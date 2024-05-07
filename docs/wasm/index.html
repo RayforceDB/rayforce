@@ -11,7 +11,7 @@
       margin: 0;
 
       background-color: black;
-      color: gray;
+      color: #d3d3d3;
       display: flex;
     }
 
@@ -60,7 +60,7 @@
       font-family: monospace;
       border: none;
       background-color: black;
-      color: gray;
+      color: white;
       flex-grow: 1;
       margin-top: 5px;
     }
@@ -136,8 +136,10 @@
 
     function handleInput(input) {
       const obj = Module.ccall('eval_str', 'number', ['string'], [input]);
-      const fmt = Module.ccall('strof_obj', 'string', ['number'], [obj]);
+      const fob = Module.ccall('obj_fmt', 'number', ['number'], [obj]);
+      const fmt = Module.ccall('strof_obj', 'string', ['number'], [fob]);
       sendOutput(fmt);
+      Module.ccall('drop_obj', 'null', ['number'], [fob]);
       Module.ccall('drop_obj', 'null', ['number'], [obj]);
       document.getElementById('input').focus(); // Refocus on the input field
     }
