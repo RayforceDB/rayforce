@@ -4,23 +4,21 @@
 <head>
   <title>Playground</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css">
+  <link href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400&display=swap" rel="stylesheet">
   <style>
     body,
     html {
       height: 100%;
+      width: 100%;
       margin: 0;
-
-      background-color: black;
-      color: #d3d3d3;
       display: flex;
     }
 
     #sidebar {
       display: flex;
       flex-direction: column;
-      padding: 10px;
+      padding: 20px;
       background-color: #333;
-      /* Or any other color */
     }
 
     #sidebar button {
@@ -30,40 +28,54 @@
       cursor: pointer;
       margin-bottom: 10px;
       font-size: 24px;
-      /* padding-bottom: 20px; */
     }
 
     #container {
       flex-grow: 1;
-      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      padding: 10px;
       overflow-y: auto;
+    }
+
+    .textout {
+      font-family: 'Roboto Mono', monospace;
+      background-color: #4f4f4f;
+      color: white;
+      font-size: 14px;
     }
 
     #output {
-      font-family: monospace;
       overflow-y: auto;
-      flex-grow: 1;
       white-space: pre-wrap;
     }
 
-    .input-line {
+    .input-container {
       display: flex;
-      flex-shrink: 0;
       align-items: center;
+      width: 100%;
+      /* Ensure container fills horizontal space */
     }
 
     .prompt {
-      margin-right: 5px;
+      font-size: 16px;
+      font-weight: bold;
+      color: #00da1a;
+      white-space: nowrap;
+      /* Prevent prompt from wrapping */
     }
 
     #input {
-      font-family: monospace;
-      border: none;
-      background-color: black;
-      color: white;
       flex-grow: 1;
-      margin-top: 5px;
+      background-color: transparent;
+      border: none;
+      color: white;
+      font-size: 14px;
+      outline: none;
+      width: auto;
+      /* Let it expand as needed */
     }
+
 
     #input:focus {
       outline: none;
@@ -77,11 +89,11 @@
     <button onclick="location.href='https://github.com/singaraiona/rayforce'"><i class="fab fa-github"></i></button>
     <button class="icon-btn" onclick="clearInput()"><i class="fas fa-broom"></i></button>
   </div>
-  <div id="container" onclick="document.getElementById('input').focus();">
-    <div id="output"></div>
-    <div>
-      <span style="color: green;">&gt; </span>
-      <input id="input" type="text" autofocus>
+  <div id="container" class="textout" onclick="document.getElementById('input').focus();">
+    <div id="output" class="textout"></div>
+    <div class="input-container">
+      <span class="textout prompt">&gt; </span>
+      <input id="input" class="textout" type="text" autofocus>
     </div>
   </div>
   <script src="https://cdn.jsdelivr.net/npm/ansi_up@5"></script>
@@ -138,7 +150,7 @@
       const obj = Module.ccall('eval_str', 'number', ['string'], [input]);
       const fob = Module.ccall('obj_fmt', 'number', ['number'], [obj]);
       const fmt = Module.ccall('strof_obj', 'string', ['number'], [fob]);
-      sendOutput(fmt);
+      sendOutput(input + '\n' + fmt);
       Module.ccall('drop_obj', 'null', ['number'], [fob]);
       Module.ccall('drop_obj', 'null', ['number'], [obj]);
       document.getElementById('input').focus(); // Refocus on the input field
