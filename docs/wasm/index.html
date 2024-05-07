@@ -148,14 +148,17 @@
     }
 
     function sendOutput(text) {
-      const outputElement = document.getElementById('output');
+      const output = document.getElementById('output');
       const ansiUp = new AnsiUp();
       const html = ansiUp.ansi_to_html(text);
-      outputElement.innerHTML += html + '<br>';
+      output.innerHTML += html + '<br>';
       const container = document.getElementById('container');
       container.scrollTop = container.scrollHeight;
-      document.getElementById('input').value = '';
-      document.getElementById('input').focus(); // Refocus on the input field
+      const input = document.getElementById('input');
+      input.value = '';
+      input.focus(); // Refocus on the input field
+      input.scrollTop = input.scrollHeight;
+      output.scrollTop = output.scrollHeight;
     }
 
     function clearInput() {
