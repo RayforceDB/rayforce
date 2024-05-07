@@ -114,29 +114,6 @@ i64_t fs_dclose(i64_t fd)
 
 #include <emscripten.h>
 
-// void list_directory_contents(const char *path)
-// {
-//     DIR *dir;
-//     struct dirent *entry;
-
-//     // Attempt to open the directory
-//     dir = opendir(path);
-//     if (dir == NULL)
-//     {
-//         fprintf(stderr, "Error opening directory '%s'\n", path);
-//         return;
-//     }
-
-//     // Read each entry in the directory
-//     while ((entry = readdir(dir)) != NULL)
-//     {
-//         printf("Found file: %s\n", entry->d_name);
-//     }
-
-//     // Close the directory
-//     closedir(dir);
-// }
-
 // clang-format off
 EM_JS(nil_t, fs_dcreate_js, (lit_p path), {
     FS.mkdir(UTF8ToString(path));

@@ -36,6 +36,7 @@
 #include "heap.h"
 #include "runtime.h"
 #include "sys.h"
+#include "fs.h"
 
 #define __ABOUT "\
   %s%sRayforceDB: %d.%d %s\n\
@@ -98,6 +99,34 @@ obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg)
     return NULL_OBJ;
 }
 
+nil_t list_examples(obj_p *dst)
+{
+    DIR *dir;
+    struct dirent *entry;
+
+    str_fmt_into(dst, -1, "\n-- Here is the list of examples:\n");
+
+    // Attempt to open the directory
+    dir = opendir("examples/");
+    if (dir == NULL)
+        return;
+
+    // Read each entry in the directory
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strncmp(entry->d_name, ".", 1) == 0 || strncmp(entry->d_name, "..", 2) == 0)
+            continue;
+        str_fmt_into(dst, -1, "|- %s\n", entry->d_name);
+    }
+
+    // Close the directory
+    closedir(dir);
+
+    str_fmt_into(dst, -1, "-- To try an example, type: (load \"examples/<example_name>)\"\n");
+
+    return;
+}
+
 EMSCRIPTEN_KEEPALIVE str_p strof_obj(obj_p obj)
 {
     return as_string(obj);
@@ -106,11 +135,13 @@ EMSCRIPTEN_KEEPALIVE str_p strof_obj(obj_p obj)
 EMSCRIPTEN_KEEPALIVE i32_t main(i32_t argc, str_p argv[])
 {
     i32_t code;
-    obj_p fmt;
     sys_info_t info = sys_info(1);
+    obj_p fmt = NULL_OBJ;
 
-    fmt = str_fmt(-1, __ABOUT, BOLD, YELLOW,
-                  info.major_version, info.minor_version, info.build_date, info.cwd, RESET);
+    str_fmt_into(&fmt, -1, __ABOUT, BOLD, YELLOW,
+                 info.major_version, info.minor_version, info.build_date, info.cwd, RESET);
+
+    list_examples(&fmt);
 
     atexit(runtime_destroy);
     runtime_init(0, NULL);
