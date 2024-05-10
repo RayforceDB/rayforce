@@ -92,7 +92,7 @@
     <button onclick="location.href='https://github.com/singaraiona/rayforce'"><i class="fab fa-github"></i></button>
     <button class="icon-btn" onclick="clearInput()"><i class="fas fa-broom"></i></button>
   </div>
-  <div id="container" class="textout" onclick="document.getElementById('input').focus();">
+  <div id="container" class="textout">
     <div id="about" class="textout"></div>
     <pre id="output" class="textout"><code class="language-clojure"></code></pre>
     <div id="input-container" class="input-container">
@@ -151,8 +151,6 @@
       const ansiUp = new AnsiUp();
       const html = ansiUp.ansi_to_html(info);
       about.innerHTML = '<pre><code class="language-clojure">' + html + '</code></pre>';
-      handleInput('(set t (table [a b c] (list [1 2 3] [AAPL MSFT IBM] (list "aa" "bb" "cc"))))');
-      handleInput('gg');
     };
 
     function handleInput(input) {
@@ -179,7 +177,6 @@
     function clearInput() {
       document.getElementById('output').innerHTML = '';
       document.getElementById('input').value = '';
-      document.getElementById('input').focus();
     }
 
     Module['rayforce_ready'] = onRuntimeInit;
