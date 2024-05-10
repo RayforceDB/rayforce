@@ -4,7 +4,14 @@
 <head>
   <title>Playground</title>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css">
-  <link href="https://fonts.googleapis.com/css2?family=Fira+Code&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Reddit+Mono:wght@100&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/default.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/clojure.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/obsidian.min.css">
+
   <style>
     body,
     html {
@@ -14,11 +21,15 @@
       display: flex;
     }
 
+    * {
+      box-sizing: border-box;
+    }
+
     #sidebar {
       display: flex;
       flex-direction: column;
-      padding: 20px;
-      background-color: #333;
+      padding: 12px;
+      background-color: #444;
     }
 
     #sidebar button {
@@ -34,16 +45,15 @@
       flex-grow: 1;
       display: flex;
       flex-direction: column;
-      padding: 10px;
       overflow-y: auto;
     }
 
     .textout {
-      font-family: 'Fira Code', monospace;
-      font-weight: bold;
-      background-color: #4f4f4f;
+      font-family: "Reddit Mono", monospace;
+      background-color: #282b2e;
       color: white;
-      font-size: 14px;
+      font-size: 16px;
+      margin-top: 0;
     }
 
     #output {
@@ -58,10 +68,11 @@
     }
 
     .prompt {
-      font-size: 18px;
+      font-size: 20px;
       font-weight: bold;
       color: #00da1a;
       white-space: nowrap;
+      padding-left: 5px;
     }
 
     #input {
@@ -82,9 +93,10 @@
     <button class="icon-btn" onclick="clearInput()"><i class="fas fa-broom"></i></button>
   </div>
   <div id="container" class="textout" onclick="document.getElementById('input').focus();">
-    <div id="output" class="textout"></div>
+    <div id="about" class="textout"></div>
+    <pre id="output" class="textout"><code class="language-clojure"></code></pre>
     <div id="input-container" class="input-container">
-      <span class="textout prompt">&gt; </span>
+      <span class="textout prompt">&#x21AA; </span>
       <input id="input" class="textout" type="text" autofocus>
     </div>
   </div>
@@ -135,7 +147,12 @@
     });
 
     function onRuntimeInit(info) {
-      sendOutput(info);
+      const about = document.getElementById('about');
+      const ansiUp = new AnsiUp();
+      const html = ansiUp.ansi_to_html(info);
+      about.innerHTML = '<pre><code class="language-clojure">' + html + '</code></pre>';
+      handleInput('(set t (table [a b c] (list [1 2 3] [AAPL MSFT IBM] (list "aa" "bb" "cc"))))');
+      handleInput('gg');
     };
 
     function handleInput(input) {
@@ -151,15 +168,13 @@
       const output = document.getElementById('output');
       const ansiUp = new AnsiUp();
       const html = ansiUp.ansi_to_html(text);
-      output.innerHTML += html + '<br>';
+      output.innerHTML += '<pre><code class="language-clojure">' + html + '</code></pre>';
+      hljs.highlightElement(output.lastChild.firstChild); // Highlight the latest code block
       const container = document.getElementById('container');
       container.scrollTop = container.scrollHeight;
-      const input = document.getElementById('input');
-      input.value = '';
-      input.focus(); // Refocus on the input field
-      input.scrollTop = input.scrollHeight;
       output.scrollTop = output.scrollHeight;
     }
+
 
     function clearInput() {
       document.getElementById('output').innerHTML = '';
