@@ -46,6 +46,7 @@
 #define BOLD "\033[1m"
 #define RESET "\033[0m"
 
+nil_t prompt(nil_t);
 i64_t str_vfmt_into(obj_p *dst, i64_t limit, lit_p fmt, va_list vargs);
 i64_t str_fmt_into(obj_p *dst, i64_t limit, lit_p fmt, ...);
 obj_p str_fmt(i64_t limit, lit_p fmt, ...);
@@ -54,5 +55,6 @@ obj_p obj_stringify(obj_p obj);
 obj_p obj_fmt(obj_p obj);
 i64_t obj_fmt_into(obj_p *dst, i64_t indent, i64_t limit, b8_t full, obj_p obj);
 obj_p obj_fmt_n(obj_p *obj, u64_t n);
+nil_t use_unicode(b8_t use);
 
 #endif // FORMAT_H

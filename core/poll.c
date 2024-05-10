@@ -39,12 +39,6 @@
 
 #include "eval.h"
 
-nil_t prompt(nil_t)
-{
-    printf("%s> %s", GREEN, RESET);
-    fflush(stdout);
-}
-
 nil_t poll_exit(poll_p poll, i64_t code)
 {
     poll->code = code;

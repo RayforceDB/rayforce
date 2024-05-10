@@ -139,6 +139,5 @@ obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg);
 
 // Exit the app
 nil_t poll_exit(poll_p poll, i64_t code);
-nil_t prompt(nil_t);
 
 #endif // POLL_H
