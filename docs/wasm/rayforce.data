@@ -6,7 +6,7 @@
         ))
 )
 
-;; \t (fib 35)
+;; :t (fib 35)
 ;; (exit 0)
 (set t (table [sym price volume] (list [aapl vod goog] [102 99 203] [500 400 900])));; Example updating vectors
 (set m (til 10))
