@@ -190,8 +190,8 @@ symbols_p symbols_create(nil_t)
     symbols->pool_node_0 = node;
     symbols->pool_node = node;
     symbols->symbols_pool = (symbol_p)(node + sizeof(pool_node_p)); // Skip the node size of next ptr
-    symbols->str_po_id = ht_tab(SYMBOLS_POOL_SIZE, TYPE_I64);
-    symbols->id_to_str = ht_tab(SYMBOLS_POOL_SIZE, TYPE_I64);
+    symbols->str_po_id = ht_create(SYMBOLS_POOL_SIZE, TYPE_I64);
+    symbols->id_to_str = ht_create(SYMBOLS_POOL_SIZE, TYPE_I64);
     symbols->next_sym_id = 0;
 
     return symbols;

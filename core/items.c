@@ -782,7 +782,7 @@ obj_p ray_in(obj_p x, obj_p y)
         case mtype2(TYPE_SYMBOL, TYPE_SYMBOL):
             xl = x->len;
             yl = y->len;
-            set = ht_tab(yl, -1);
+            set = ht_create(yl, -1);
 
             for (i = 0; i < yl; i++)
             {

@@ -33,7 +33,7 @@
 #include "eval.h"
 #include "error.h"
 
-obj_p ht_tab(u64_t size, i8_t vals)
+obj_p ht_create(u64_t size, i8_t vals)
 {
     u64_t i;
     obj_p k, v;
@@ -67,7 +67,7 @@ nil_t rehash(obj_p *obj, hash_f hash, raw_p seed)
     if (type > -1)
         orig_vals = as_i64(as_list(*obj)[1]);
 
-    new_obj = ht_tab(size * 2, type);
+    new_obj = ht_create(size * 2, type);
 
     factor = as_list(new_obj)[0]->len - 1;
     new_keys = as_i64(as_list(new_obj)[0]);
@@ -218,6 +218,143 @@ u64_t hash_index_obj(obj_p obj)
     default:
         panic("hash: unsupported type: %d", obj->type);
     }
+}
+
+lfhash_p lfhash_create(u64_t size)
+{
+    u64_t i;
+    lfhash_p hash;
+
+    size = next_power_of_two_u64(size);
+    hash = heap_alloc(sizeof(struct lfhash_t) + size * sizeof(bucket_p));
+    if (hash == NULL)
+        return NULL;
+
+    hash->mask = size - 1;
+    for (i = 0; i < size; i++)
+        hash->table[i] = NULL;
+
+    return hash;
+}
+
+nil_t lfhash_destroy(lfhash_p hash)
+{
+    heap_free(hash);
+}
+
+b8_t lfhash_insert(lfhash_p hash, i64_t key, i64_t val)
+{
+    i64_t index;
+    bucket_p bucket;
+
+    index = key & hash->mask;
+
+    for (;;)
+    {
+        bucket = hash->table[index];
+
+        if (bucket == NULL)
+        {
+            bucket = heap_alloc(sizeof(struct bucket_t));
+            if (bucket == NULL)
+                return B8_FALSE;
+
+            bucket->key = key;
+            bucket->val = val;
+            bucket->next = NULL;
+            hash->table[index] = bucket;
+            return B8_TRUE;
+        }
+
+        while (bucket != NULL)
+        {
+            if (bucket->key == key)
+            {
+                // Key already exists, update the value
+                bucket->val = val;
+                return B8_TRUE;
+            }
+
+            bucket = bucket->next;
+        }
+
+        // Key does not exist, insert a new bucket
+        bucket = heap_alloc(sizeof(struct bucket_t));
+        if (bucket == NULL)
+            return B8_FALSE;
+
+        bucket->key = key;
+        bucket->val = val;
+        bucket->next = hash->table[index];
+        hash->table[index] = bucket;
+
+        return B8_TRUE;
+    }
+}
+
+i64_t lfhash_insert_with(lfhash_p ht, i64_t key, i64_t val, hash_f hash, cmp_f cmp, raw_p seed)
+{
+    i64_t index;
+    bucket_p bucket;
+
+    index = hash(key, seed) & ht->mask;
+
+    for (;;)
+    {
+        bucket = ht->table[index];
+
+        if (bucket == NULL)
+        {
+            bucket = heap_alloc(sizeof(struct bucket_t));
+            if (bucket == NULL)
+                return NULL_I64;
+
+            bucket->key = key;
+            bucket->val = val;
+            bucket->next = NULL;
+            ht->table[index] = bucket;
+
+            return val;
+        }
+
+        while (bucket != NULL)
+        {
+            if (cmp(bucket->key, key, seed) == 0)
+                return bucket->val;
+
+            bucket = bucket->next;
+        }
+
+        // Key does not exist, insert a new bucket
+        bucket = heap_alloc(sizeof(struct bucket_t));
+        if (bucket == NULL)
+            return NULL_I64;
+
+        bucket->key = key;
+        bucket->val = val;
+        bucket->next = ht->table[index];
+        ht->table[index] = bucket;
+
+        return val;
+    }
+}
+
+b8_t lfhash_get(lfhash_p hash, i64_t key, i64_t *val)
+{
+    u64_t index = key & hash->mask;
+    bucket_p current = hash->table[index];
+
+    while (current != NULL)
+    {
+        if (current->key == key)
+        {
+            *val = current->val;
+            return B8_TRUE;
+        }
+        current = current->next;
+    }
+
+    return B8_FALSE;
 }
 
 u64_t hash_kmh(i64_t key, nil_t *seed)

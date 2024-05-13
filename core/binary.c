@@ -339,7 +339,7 @@ obj_p distinct_syms(obj_p *x, u64_t n)
 
     l = (*x)->len;
 
-    set = ht_tab(l, -1);
+    set = ht_create(l, -1);
 
     for (i = 0, h = 0; i < n; i++)
     {

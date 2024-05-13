@@ -29,7 +29,7 @@
 
 obj_p nfo(obj_p filename, obj_p source)
 {
-    return vn_list(3, filename, source, ht_tab(32, TYPE_I64));
+    return vn_list(3, filename, source, ht_create(32, TYPE_I64));
 }
 
 nil_t nfo_insert(obj_p nfo, i64_t index, span_t span)

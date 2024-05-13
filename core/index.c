@@ -175,7 +175,7 @@ obj_p index_distinct_i64(i64_t values[], u64_t len)
     }
 
     // otherwise, use a hash table
-    set = ht_tab(len, -1);
+    set = ht_create(len, -1);
 
     for (i = 0; i < len; i++)
     {
@@ -210,7 +210,7 @@ obj_p index_distinct_guid(guid_t values[], u64_t len)
     obj_p vec, set;
     guid_t *g;
 
-    set = ht_tab(len, -1);
+    set = ht_create(len, -1);
 
     for (i = 0, j = 0; i < len; i++)
     {
@@ -246,7 +246,7 @@ obj_p index_distinct_obj(obj_p values[], u64_t len)
     i64_t p, *out;
     obj_p vec, set;
 
-    set = ht_tab(len, -1);
+    set = ht_create(len, -1);
 
     for (i = 0; i < len; i++)
     {
@@ -351,7 +351,7 @@ obj_p index_find_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl)
     r = as_i64(vec);
 
     // otherwise, use a hash table
-    ht = ht_tab(xl, TYPE_I64);
+    ht = ht_create(xl, TYPE_I64);
 
     for (i = 0; i < xl; i++)
     {
@@ -383,7 +383,7 @@ obj_p index_find_guid(guid_t x[], u64_t xl, guid_t y[], u64_t yl)
 
     // calc hashes
     res = vector_i64(maxi64(xl, yl));
-    ht = ht_tab(maxi64(xl, yl) * 2, -1);
+    ht = ht_create(maxi64(xl, yl) * 2, -1);
 
     hashes = (u64_t *)as_i64(res);
 
@@ -423,7 +423,7 @@ obj_p index_find_obj(obj_p x[], u64_t xl, obj_p y[], u64_t yl)
 
     // calc hashes
     res = vector_i64(maxi64(xl, yl));
-    ht = ht_tab(maxi64(xl, yl) * 2, -1);
+    ht = ht_create(maxi64(xl, yl) * 2, -1);
 
     hashes = (u64_t *)as_i64(res);
 
@@ -556,7 +556,7 @@ obj_p index_group_i64_scoped(i64_t values[], i64_t indices[], u64_t len, const i
     }
 
     // use hash table if range is large
-    ht = ht_tab(len, TYPE_I64);
+    ht = ht_create(len, TYPE_I64);
     vals = vector_i64(len);
     hp = as_i64(vals);
 
@@ -613,7 +613,7 @@ obj_p index_group_guid(guid_t values[], i64_t indices[], u64_t len)
     i64_t idx, *hk, *hv, *hp;
     obj_p vals, ht;
 
-    ht = ht_tab(len, TYPE_I64);
+    ht = ht_create(len, TYPE_I64);
     vals = vector_i64(len);
     hp = as_i64(vals);
 
@@ -662,7 +662,7 @@ obj_p index_group_obj(obj_p values[], i64_t indices[], u64_t len)
     i64_t idx, *hk, *hv, *hp;
     obj_p vals, ht;
 
-    ht = ht_tab(len, TYPE_I64);
+    ht = ht_create(len, TYPE_I64);
     vals = vector_i64(len);
     hp = as_i64(vals);
 
@@ -857,7 +857,7 @@ obj_p index_group_list(obj_p lst, i64_t filter[], u64_t len)
         return res;
 
     // Otherwise use a hash table
-    ht = ht_tab(len, TYPE_I64);
+    ht = ht_create(len, TYPE_I64);
     res = vector_i64(len);
     xo = as_i64(res);
     ctx = (__index_list_ctx_t){lst, lst, (u64_t *)as_i64(res)};
@@ -1076,7 +1076,7 @@ obj_p index_join_obj(obj_p lcols, obj_p rcols, u64_t len)
 
     ll = ops_count(as_list(lcols)[0]);
     rl = ops_count(as_list(rcols)[0]);
-    ht = ht_tab(maxi64(ll, rl), -1);
+    ht = ht_create(maxi64(ll, rl), -1);
     res = vector_i64(maxi64(ll, rl));
 
     // Right hashes

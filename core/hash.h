@@ -27,13 +27,33 @@
 #include "rayforce.h"
 #include "ops.h"
 
-obj_p ht_tab(u64_t size, i8_t vals);
-obj_p ht_set(u64_t size);
+// Single threaded open addressing hash table
+obj_p ht_create(u64_t size, i8_t vals);
 i64_t ht_tab_next(obj_p *obj, i64_t key);
 i64_t ht_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed);
 i64_t ht_tab_get(obj_p obj, i64_t key);
 i64_t ht_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed);
 nil_t rehash(obj_p *obj, hash_f hash, raw_p seed);
+
+// Multithreaded lockfree hash table
+typedef struct bucket_t
+{
+    i64_t key;
+    i64_t val;
+    struct bucket_t *next;
+} *bucket_p;
+
+typedef struct lfhash_t
+{
+    u64_t mask;
+    bucket_p table[];
+} *lfhash_p;
+
+lfhash_p lfhash_create(u64_t size);
+nil_t lfhash_destroy(lfhash_p ht);
+b8_t lfhash_insert(lfhash_p ht, i64_t key, i64_t val);
+i64_t lfhash_insert_with(lfhash_p ht, i64_t key, i64_t val, hash_f hash, cmp_f cmp, raw_p seed);
+b8_t lfhash_get(lfhash_p hash, i64_t key, i64_t *val);
 
 // Knuth's multiplicative hash
 u64_t hash_kmh(i64_t key, raw_p seed);
@@ -43,7 +63,7 @@ u64_t hash_fnv1a(i64_t key, raw_p seed);
 u64_t hash_i64(i64_t a, raw_p seed);
 u64_t hash_obj(i64_t a, raw_p seed);
 u64_t hash_guid(i64_t a, raw_p seed);
-
+// Compare
 i64_t hash_cmp_obj(i64_t a, i64_t b, raw_p seed);
 i64_t hash_cmp_guid(i64_t a, i64_t b, raw_p seed);
 i64_t hash_cmp_i64(i64_t a, i64_t b, raw_p seed);
