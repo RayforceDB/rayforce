@@ -49,6 +49,17 @@
     --md-code-hl-generic-color: #66D9EF;
 }
 
+.asciinema-player,
+.asciinema-player * {
+    font-size: 12px !important;
+    display: block;
+    overflow-x: auto;
+    font-family: 'Roboto Mono', 'Source Code Pro', 'SF Mono', 'SFMono-Regular', ui-monospace, 'DejaVu Sans Mono', 'Menlo',
+        'Consolas', 'Roboto', monospace;
+    white-space-collapse: preserve;
+    text-wrap: nowrap;
+}
+
 /* 
 .md-header {
     background-color: #FF5722;

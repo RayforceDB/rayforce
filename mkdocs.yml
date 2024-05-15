@@ -96,8 +96,9 @@ markdown_extensions:
   - footnotes
 
 extra_css:
-  - css/custom.css
+  - https://adobe-fonts.github.io/source-code-pro/source-code-pro.css
   - https://cdnjs.cloudflare.com/ajax/libs/asciinema-player/2.6.1/asciinema-player.css
+  - css/custom.css
 
 extra_javascript:
   - https://cdnjs.cloudflare.com/ajax/libs/asciinema-player/2.6.1/asciinema-player.js

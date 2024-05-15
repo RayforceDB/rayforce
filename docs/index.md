@@ -36,4 +36,4 @@ The "another one" columnar database engineered to optimize your data analytics a
 
 </div>
 
-<asciinema-player src="assets/intro.cast" preload rows="24"></asciinema-player>
+<asciinema-player src="assets/demo.cast" preload rows="24" loop=1></asciinema-player>
