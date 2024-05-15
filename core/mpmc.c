@@ -22,39 +22,10 @@
  */
 
 #include "mpmc.h"
-#ifdef __cplusplus
-#include <atomic>
-#else
-#include <stdatomic.h>
-#endif
+#include "atomic.h"
 #include "util.h"
 #include "heap.h"
 #include "string.h"
-
-#define BACKOFF_SPIN_LIMIT 8
-
-static inline void cpu_relax()
-{
-#if defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#elif defined(__arm__) || defined(__aarch64__)
-    __asm__ volatile("yield" ::: "memory");
-#else
-    // Generic fallback: no-op or compiler barrier
-    __asm__ volatile("" ::: "memory"); // acts as a compiler barrier
-#endif
-}
-
-nil_t backoff_spin(u64_t *rounds)
-{
-    u64_t i;
-
-    for (i = 0; i < (1ull << *rounds); i++)
-        cpu_relax();
-
-    if (*rounds <= BACKOFF_SPIN_LIMIT)
-        (*rounds)++;
-}
 
 mpmc_p mpmc_create(u64_t size)
 {
@@ -64,12 +35,12 @@ mpmc_p mpmc_create(u64_t size)
     mpmc_p queue;
     cell_p buf;
 
-    queue = heap_mmap(sizeof(struct mpmc_t));
+    queue = (mpmc_p)heap_mmap(sizeof(struct mpmc_t));
 
     if (queue == NULL)
         return NULL;
 
-    buf = heap_mmap(size * sizeof(struct cell_t));
+    buf = (cell_p)heap_mmap(size * sizeof(struct cell_t));
 
     if (buf == NULL)
         return NULL;
@@ -131,7 +102,7 @@ i64_t mpmc_push(mpmc_p queue, mpmc_data_t data)
 mpmc_data_t mpmc_pop(mpmc_p queue)
 {
     cell_p cell;
-    mpmc_data_t data = {.id = -1, .in = {0}};
+    mpmc_data_t data = {.id = -1, .in = {0, 0, 0, 0}};
     i64_t pos, seq, dif;
     u64_t rounds = 0;
 

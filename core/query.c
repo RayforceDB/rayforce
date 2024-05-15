@@ -238,6 +238,12 @@ obj_p eval_field(raw_p x, u64_t n)
     return res;
 }
 
+nil_t drop_field_arg(raw_p x, u64_t n)
+{
+    unused(n);
+    drop_obj((obj_p)x);
+}
+
 obj_p ray_select(obj_p obj)
 {
     u64_t i, l, tablen;
@@ -412,7 +418,7 @@ obj_p ray_select(obj_p obj)
                 sym = at_idx(keys, i);
                 prm = at_obj(obj, sym);
                 drop_obj(sym);
-                pool_add_task(pool, i, eval_field, prm, 1);
+                pool_add_task(pool, i, eval_field, drop_field_arg, prm, 1);
             }
 
             vals = pool_run(pool, l);

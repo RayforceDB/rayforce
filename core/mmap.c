@@ -67,6 +67,24 @@ i64_t mmap_sync(raw_p addr, u64_t size)
     return FlushViewOfFile(addr, size);
 }
 
+raw_p mmap_reserve(u64_t size)
+{
+    raw_p addr = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);
+
+    if (addr == NULL)
+        return NULL;
+
+    return addr;
+}
+
+i64_t mmap_commit(raw_p addr, u64_t size)
+{
+    if (VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE) == NULL)
+        return -1;
+
+    return 0;
+}
+
 #elif defined(__linux__) || defined(__EMSCRIPTEN__)
 
 raw_p mmap_stack(u64_t size)
@@ -78,7 +96,6 @@ raw_p mmap_alloc(u64_t size)
 {
     raw_p ptr;
 
-    // ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
     ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
 
     if (ptr == MAP_FAILED)
@@ -90,8 +107,9 @@ raw_p mmap_alloc(u64_t size)
 raw_p mmap_file(i64_t fd, u64_t size)
 {
     raw_p ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    // raw_p ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_POPULATE | MAP_NORESERVE, fd, 0);
-    // madvise(ptr, size, MADV_HUGEPAGE | MADV_SEQUENTIAL);
+
+    if (ptr == MAP_FAILED)
+        return NULL;
 
     return ptr;
 }
@@ -104,6 +122,23 @@ i64_t mmap_free(raw_p addr, u64_t size)
 i64_t mmap_sync(raw_p addr, u64_t size)
 {
     return msync(addr, size, MS_SYNC);
+}
+
+raw_p mmap_reserve(u64_t size)
+{
+    raw_p addr = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (addr == MAP_FAILED)
+    {
+        return NULL;
+    }
+
+    return addr;
+}
+
+i64_t mmap_commit(raw_p addr, u64_t size)
+{
+    return mprotect(addr, size, PROT_READ | PROT_WRITE);
 }
 
 #elif defined(__APPLE__) && defined(__MACH__)
@@ -134,6 +169,23 @@ i64_t mmap_free(raw_p addr, u64_t size)
 i64_t mmap_sync(raw_p addr, u64_t size)
 {
     return msync(addr, size, MS_SYNC);
+}
+
+raw_p mmap_reserve(u64_t size)
+{
+    raw_p addr = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (addr == MAP_FAILED)
+    {
+        return NULL;
+    }
+
+    return addr;
+}
+
+i64_t mmap_commit(raw_p addr, u64_t size)
+{
+    return mprotect(addr, size, PROT_READ | PROT_WRITE);
 }
 
 #else

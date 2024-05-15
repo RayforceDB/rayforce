@@ -225,7 +225,7 @@ lfhash_p lfhash_create(u64_t size)
     u64_t i;
     lfhash_p hash;
 
-    hash = heap_alloc(sizeof(struct lfhash_t) + size * sizeof(bucket_p));
+    hash = (lfhash_p)heap_alloc(sizeof(struct lfhash_t) + size * sizeof(bucket_p));
     if (hash == NULL)
         return NULL;
 
@@ -254,7 +254,7 @@ b8_t lfhash_insert(lfhash_p hash, i64_t key, i64_t val)
 
         if (bucket == NULL)
         {
-            bucket = heap_alloc(sizeof(struct bucket_t));
+            bucket = (bucket_p)heap_alloc(sizeof(struct bucket_t));
             if (bucket == NULL)
                 return B8_FALSE;
 
@@ -278,7 +278,7 @@ b8_t lfhash_insert(lfhash_p hash, i64_t key, i64_t val)
         }
 
         // Key does not exist, insert a new bucket
-        bucket = heap_alloc(sizeof(struct bucket_t));
+        bucket = (bucket_p)heap_alloc(sizeof(struct bucket_t));
         if (bucket == NULL)
             return B8_FALSE;
 
@@ -304,7 +304,7 @@ i64_t lfhash_insert_with(lfhash_p ht, i64_t key, i64_t val, hash_f hash, cmp_f c
 
         if (bucket == NULL)
         {
-            bucket = heap_alloc(sizeof(struct bucket_t));
+            bucket = (bucket_p)heap_alloc(sizeof(struct bucket_t));
             if (bucket == NULL)
                 return NULL_I64;
 
@@ -325,7 +325,7 @@ i64_t lfhash_insert_with(lfhash_p ht, i64_t key, i64_t val, hash_f hash, cmp_f c
         }
 
         // Key does not exist, insert a new bucket
-        bucket = heap_alloc(sizeof(struct bucket_t));
+        bucket = (bucket_p)heap_alloc(sizeof(struct bucket_t));
         if (bucket == NULL)
             return NULL_I64;
 

@@ -22,12 +22,8 @@
  */
 
 #include <stdio.h>
-#ifdef __cplusplus
-#include <atomic>
-#else
-#include <stdatomic.h>
-#endif
 #include "rayforce.h"
+#include "atomic.h"
 #include "mmap.h"
 #include "format.h"
 #include "heap.h"

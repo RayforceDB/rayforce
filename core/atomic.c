@@ -21,65 +21,29 @@
  *   SOFTWARE.
  */
 
-#ifndef MPMC_H
-#define MPMC_H
+#include "atomic.h"
 
-#include "rayforce.h"
+#define BACKOFF_SPIN_LIMIT 8
 
-#define CACHELINE_SIZE 64
-
-typedef c8_t cachepad_t[CACHELINE_SIZE];
-typedef obj_p (*task_fn)(raw_p, u64_t);
-typedef nil_t (*drop_fn)(raw_p, u64_t);
-
-typedef struct
+static inline void cpu_relax()
 {
-    task_fn fn;
-    drop_fn drop;
-    raw_p arg;
-    u64_t len;
-} mpmc_data_in_t;
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__arm__) || defined(__aarch64__)
+    __asm__ volatile("yield" ::: "memory");
+#else
+    // Generic fallback: no-op or compiler barrier
+    __asm__ volatile("" ::: "memory"); // acts as a compiler barrier
+#endif
+}
 
-typedef struct
+nil_t backoff_spin(u64_t *rounds)
 {
-    drop_fn drop;
-    raw_p arg;
-    u64_t len;
-    obj_p result;
-} mpmc_data_out_t;
+    u64_t i;
 
-typedef struct
-{
-    i64_t id;
-    union
-    {
-        mpmc_data_in_t in;
-        mpmc_data_out_t out;
-    };
-} mpmc_data_t;
+    for (i = 0; i < (1ull << *rounds); i++)
+        cpu_relax();
 
-typedef struct cell_t
-{
-    u64_t seq;
-    mpmc_data_t data;
-} *cell_p;
-
-typedef struct mpmc_t
-{
-    cachepad_t pad0;
-    cell_p buf;
-    i64_t mask;
-    cachepad_t pad1;
-    i64_t tail;
-    cachepad_t pad2;
-    i64_t head;
-    cachepad_t pad3;
-} *mpmc_p;
-
-mpmc_p mpmc_create(u64_t size);
-nil_t mpmc_destroy(mpmc_p queue);
-i64_t mpmc_push(mpmc_p queue, mpmc_data_t data);
-mpmc_data_t mpmc_pop(mpmc_p queue);
-u64_t mpmc_size(mpmc_p queue);
-
-#endif // MPMC_H
+    if (*rounds <= BACKOFF_SPIN_LIMIT)
+        (*rounds)++;
+}

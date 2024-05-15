@@ -62,7 +62,8 @@ raw_p executor_run(raw_p arg)
 
             // execute task
             res = data.in.fn(data.in.arg, data.in.len);
-            mpmc_push(executor->pool->result_queue, (mpmc_data_t){data.id, .out = {data.in.arg, data.in.len, res}});
+            mpmc_push(executor->pool->result_queue, (mpmc_data_t){data.id,
+                                                                  .out = {data.in.drop, data.in.arg, data.in.len, res}});
         }
 
         mutex_lock(&executor->pool->mutex);
@@ -159,9 +160,9 @@ nil_t pool_prepare(pool_p pool, u64_t tasks_count)
     }
 }
 
-nil_t pool_add_task(pool_p pool, u64_t id, task_fn fn, raw_p arg, u64_t len)
+nil_t pool_add_task(pool_p pool, u64_t id, task_fn fn, drop_fn drop, raw_p arg, u64_t len)
 {
-    mpmc_push(pool->task_queue, (mpmc_data_t){id, .in = {fn, arg, len}});
+    mpmc_push(pool->task_queue, (mpmc_data_t){.id = (i64_t)id, .in = {fn, drop, arg, len}});
 }
 
 obj_p pool_run(pool_p pool, u64_t tasks_count)
@@ -188,7 +189,7 @@ obj_p pool_run(pool_p pool, u64_t tasks_count)
 
         // execute task
         res = data.in.fn(data.in.arg, data.in.len);
-        mpmc_push(pool->result_queue, (mpmc_data_t){data.id, .out = {data.in.arg, data.in.len, res}});
+        mpmc_push(pool->result_queue, (mpmc_data_t){data.id, .out = {data.in.drop, data.in.arg, data.in.len, res}});
     }
 
     mutex_lock(&pool->mutex);
@@ -211,7 +212,9 @@ obj_p pool_run(pool_p pool, u64_t tasks_count)
     {
         data = mpmc_pop(pool->result_queue);
         debug_assert(data.id != -1, "Pool run: invalid data id!!!!");
-        drop_obj(data.out.arg);
+        // call destructor (if any)
+        if (data.out.drop != NULL)
+            data.out.drop(data.out.arg, data.out.len);
         ins_obj(&res, data.id, data.out.result);
     }
 

@@ -31,6 +31,14 @@
 
 #define STRINGS_POOL_SIZE 4096
 
+typedef struct symbols_pool_t
+{
+    str_p pool_base;
+    u64_t pools_count;
+    u64_t symbols_count;
+
+} *symbols_pool_p;
+
 /*
 Holds memory for strings pool as a node in a linked list
 */
