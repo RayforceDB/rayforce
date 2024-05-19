@@ -339,14 +339,14 @@ obj_p distinct_syms(obj_p *x, u64_t n)
 
     l = (*x)->len;
 
-    set = ht_create(l, -1);
+    set = ht_oa_create(l, -1);
 
     for (i = 0, h = 0; i < n; i++)
     {
         a = *(x + i);
         for (j = 0; j < l; j++)
         {
-            p = ht_tab_next(&set, as_symbol(a)[j]);
+            p = ht_oa_tab_next(&set, as_symbol(a)[j]);
             if (as_symbol(as_list(set)[0])[p] == NULL_I64)
             {
                 as_symbol(as_list(set)[0])[p] = as_symbol(a)[j];

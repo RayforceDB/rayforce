@@ -28,12 +28,12 @@
 #include "ops.h"
 
 // Single threaded open addressing hash table
-obj_p ht_create(u64_t size, i8_t vals);
-i64_t ht_tab_next(obj_p *obj, i64_t key);
-i64_t ht_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed);
-i64_t ht_tab_get(obj_p obj, i64_t key);
-i64_t ht_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed);
-nil_t rehash(obj_p *obj, hash_f hash, raw_p seed);
+obj_p ht_oa_create(u64_t size, i8_t vals);
+i64_t ht_oa_tab_next(obj_p *obj, i64_t key);
+i64_t ht_oa_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed);
+i64_t ht_oa_tab_get(obj_p obj, i64_t key);
+i64_t ht_oa_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed);
+nil_t ht_oa_rehash(obj_p *obj, hash_f hash, raw_p seed);
 
 // Multithreaded lockfree hash table
 typedef struct bucket_t
@@ -43,17 +43,17 @@ typedef struct bucket_t
     struct bucket_t *next;
 } *bucket_p;
 
-typedef struct lfhash_t
+typedef struct ht_bk_t
 {
     u64_t size;
     bucket_p table[];
-} *lfhash_p;
+} *ht_bk_p;
 
-lfhash_p lfhash_create(u64_t size);
-nil_t lfhash_destroy(lfhash_p ht);
-b8_t lfhash_insert(lfhash_p ht, i64_t key, i64_t val);
-i64_t lfhash_insert_with(lfhash_p ht, i64_t key, i64_t val, hash_f hash, cmp_f cmp, raw_p seed);
-b8_t lfhash_get(lfhash_p hash, i64_t key, i64_t *val);
+ht_bk_p ht_bk_create(u64_t size);
+nil_t ht_bk_destroy(ht_bk_p ht);
+b8_t ht_bk_insert(ht_bk_p ht, i64_t key, i64_t val);
+i64_t ht_bk_insert_with(ht_bk_p ht, i64_t key, i64_t val, hash_f hash, cmp_f cmp, raw_p seed);
+b8_t ht_bk_get(ht_bk_p hash, i64_t key, i64_t *val);
 
 // Knuth's multiplicative hash
 u64_t hash_kmh(i64_t key, raw_p seed);

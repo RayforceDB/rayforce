@@ -29,7 +29,7 @@
 
 obj_p nfo(obj_p filename, obj_p source)
 {
-    return vn_list(3, filename, source, ht_create(32, TYPE_I64));
+    return vn_list(3, filename, source, ht_oa_create(32, TYPE_I64));
 }
 
 nil_t nfo_insert(obj_p nfo, i64_t index, span_t span)
@@ -39,7 +39,7 @@ nil_t nfo_insert(obj_p nfo, i64_t index, span_t span)
     if (nfo == NULL_OBJ)
         return;
 
-    i = ht_tab_next(&as_list(nfo)[2], index);
+    i = ht_oa_tab_next(&as_list(nfo)[2], index);
     as_i64(as_list(as_list(nfo)[2])[0])[i] = index;
     memcpy(&as_i64(as_list(as_list(nfo)[2])[1])[i], &span, sizeof(span_t));
 }
@@ -52,7 +52,7 @@ span_t nfo_get(obj_p nfo, i64_t index)
     if (!nfo)
         return span;
 
-    i = ht_tab_next(&as_list(nfo)[2], index);
+    i = ht_oa_tab_next(&as_list(nfo)[2], index);
     if (as_i64(as_list(as_list(nfo)[2])[0])[i] == NULL_I64)
         return span;
 

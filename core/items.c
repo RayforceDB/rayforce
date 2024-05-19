@@ -782,12 +782,12 @@ obj_p ray_in(obj_p x, obj_p y)
         case mtype2(TYPE_SYMBOL, TYPE_SYMBOL):
             xl = x->len;
             yl = y->len;
-            set = ht_create(yl, -1);
+            set = ht_oa_create(yl, -1);
 
             for (i = 0; i < yl; i++)
             {
-                // p = ht_tab_next_with(&set, as_i64(y)[i], &hash_i64, &cmp_i64);
-                p = ht_tab_next(&set, as_i64(y)[i]);
+                // p = ht_oa_tab_next_with(&set, as_i64(y)[i], &hash_i64, &cmp_i64);
+                p = ht_oa_tab_next(&set, as_i64(y)[i]);
                 if (as_i64(as_list(set)[0])[p] == NULL_I64)
                     as_i64(as_list(set)[0])[p] = as_i64(y)[i];
             }
@@ -796,8 +796,8 @@ obj_p ray_in(obj_p x, obj_p y)
 
             for (i = 0; i < xl; i++)
             {
-                // p = ht_tab_next_with(&set, as_i64(x)[i], &hash_i64, &cmp_i64);
-                p = ht_tab_get(set, as_i64(x)[i]);
+                // p = ht_oa_tab_next_with(&set, as_i64(x)[i], &hash_i64, &cmp_i64);
+                p = ht_oa_tab_get(set, as_i64(x)[i]);
                 as_b8(vec)[i] = (p != NULL_I64);
             }
 

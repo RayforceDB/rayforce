@@ -26,6 +26,7 @@
 #include "util.h"
 #include "unary.h"
 #include "io.h"
+#include "string.h"
 
 // Global runtime reference
 runtime_p __RUNTIME = NULL;

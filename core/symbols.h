@@ -26,26 +26,6 @@
 
 #include "rayforce.h"
 #include "hash.h"
-#include "mmap.h"
-#include "string.h"
-
-#define STRINGS_POOL_SIZE 4096
-
-typedef struct symbols_pool_t
-{
-    str_p pool_base;
-    u64_t pools_count;
-    u64_t symbols_count;
-
-} *symbols_pool_p;
-
-/*
-Holds memory for strings pool as a node in a linked list
-*/
-typedef struct pool_node_t
-{
-    struct pool_node_t *next;
-} *pool_node_p;
 
 typedef struct symbol_t
 {
@@ -53,17 +33,13 @@ typedef struct symbol_t
     i8_t str[];
 } *symbol_p;
 
-/*
- *Intern symbols here. Assume symbols are never freed.
- */
 typedef struct symbols_t
 {
-    i64_t next_sym_id;
-    obj_p str_po_id;
-    obj_p id_to_str;
-    pool_node_p pool_node_0;
-    pool_node_p pool_node;
-    symbol_p symbols_pool;
+    symbol_p pool_base;
+    u64_t pools_count;
+    u64_t symbols_count;
+    ht_bk_p sym_to_id;
+    symbol_p *id_to_sym;
 } *symbols_p;
 
 i64_t intern_symbol(lit_p s, u64_t len);

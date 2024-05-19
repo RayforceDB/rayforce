@@ -33,7 +33,7 @@
 #include "eval.h"
 #include "error.h"
 
-obj_p ht_create(u64_t size, i8_t vals)
+obj_p ht_oa_create(u64_t size, i8_t vals)
 {
     u64_t i;
     obj_p k, v;
@@ -52,7 +52,7 @@ obj_p ht_create(u64_t size, i8_t vals)
     return dict(k, v);
 }
 
-nil_t rehash(obj_p *obj, hash_f hash, raw_p seed)
+nil_t ht_oa_rehash(obj_p *obj, hash_f hash, raw_p seed)
 {
     u64_t i, j, size, key, factor;
     obj_p new_obj;
@@ -67,7 +67,7 @@ nil_t rehash(obj_p *obj, hash_f hash, raw_p seed)
     if (type > -1)
         orig_vals = as_i64(as_list(*obj)[1]);
 
-    new_obj = ht_create(size * 2, type);
+    new_obj = ht_oa_create(size * 2, type);
 
     factor = as_list(new_obj)[0]->len - 1;
     new_keys = as_i64(as_list(new_obj)[0]);
@@ -103,7 +103,7 @@ nil_t rehash(obj_p *obj, hash_f hash, raw_p seed)
     *obj = new_obj;
 }
 
-i64_t ht_tab_next(obj_p *obj, i64_t key)
+i64_t ht_oa_tab_next(obj_p *obj, i64_t key)
 {
     u64_t i, size;
     i64_t *keys;
@@ -118,14 +118,14 @@ next:
             return i;
     }
 
-    rehash(obj, NULL, NULL);
+    ht_oa_rehash(obj, NULL, NULL);
     size = as_list(*obj)[0]->len;
     keys = as_i64(as_list(*obj)[0]);
 
     goto next;
 }
 
-i64_t ht_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed)
+i64_t ht_oa_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed)
 {
     u64_t i, size;
     i64_t *keys;
@@ -140,7 +140,7 @@ next:
             return i;
     }
 
-    rehash(obj, hash, seed);
+    ht_oa_rehash(obj, hash, seed);
 
     size = as_list(*obj)[0]->len;
     keys = as_i64(as_list(*obj)[0]);
@@ -148,7 +148,7 @@ next:
     goto next;
 }
 
-i64_t ht_tab_get(obj_p obj, i64_t key)
+i64_t ht_oa_tab_get(obj_p obj, i64_t key)
 {
     u64_t i, size;
     i64_t *keys;
@@ -167,7 +167,7 @@ i64_t ht_tab_get(obj_p obj, i64_t key)
     return NULL_I64;
 }
 
-i64_t ht_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed)
+i64_t ht_oa_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed)
 {
     u64_t i, size;
     i64_t *keys;
@@ -220,12 +220,12 @@ u64_t hash_index_obj(obj_p obj)
     }
 }
 
-lfhash_p lfhash_create(u64_t size)
+ht_bk_p ht_bk_create(u64_t size)
 {
     u64_t i;
-    lfhash_p hash;
+    ht_bk_p hash;
 
-    hash = (lfhash_p)heap_alloc(sizeof(struct lfhash_t) + size * sizeof(bucket_p));
+    hash = (ht_bk_p)heap_alloc(sizeof(struct ht_bk_t) + size * sizeof(bucket_p));
     if (hash == NULL)
         return NULL;
 
@@ -236,12 +236,12 @@ lfhash_p lfhash_create(u64_t size)
     return hash;
 }
 
-nil_t lfhash_destroy(lfhash_p hash)
+nil_t ht_bk_destroy(ht_bk_p hash)
 {
     heap_free(hash);
 }
 
-b8_t lfhash_insert(lfhash_p hash, i64_t key, i64_t val)
+b8_t ht_bk_insert(ht_bk_p hash, i64_t key, i64_t val)
 {
     i64_t index;
     bucket_p bucket;
@@ -291,7 +291,7 @@ b8_t lfhash_insert(lfhash_p hash, i64_t key, i64_t val)
     }
 }
 
-i64_t lfhash_insert_with(lfhash_p ht, i64_t key, i64_t val, hash_f hash, cmp_f cmp, raw_p seed)
+i64_t ht_bk_insert_with(ht_bk_p ht, i64_t key, i64_t val, hash_f hash, cmp_f cmp, raw_p seed)
 {
     i64_t index;
     bucket_p bucket;
@@ -338,7 +338,7 @@ i64_t lfhash_insert_with(lfhash_p ht, i64_t key, i64_t val, hash_f hash, cmp_f c
     }
 }
 
-b8_t lfhash_get(lfhash_p ht, i64_t key, i64_t *val)
+b8_t ht_bk_get(ht_bk_p ht, i64_t key, i64_t *val)
 {
     u64_t index = key % ht->size;
     bucket_p current = ht->table[index];
