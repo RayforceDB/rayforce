@@ -366,10 +366,20 @@ obj_p vn_string(lit_p fmt, ...)
     return res;
 }
 
-i64_t string_cmp(obj_p lhs, obj_p rhs)
+i64_t str_cmp(lit_p lhs, u64_t m, lit_p rhs, u64_t n)
 {
-    if (lhs->len != rhs->len)
-        return lhs->len - rhs->len;
+    u64_t len = (m < n) ? m : n;
+    i64_t res = __builtin_memcmp(lhs, rhs, len);
 
-    return strncmp(as_string(lhs), as_string(rhs), lhs->len);
+    if (res == 0)
+    {
+        if (m < n)
+            return -1;
+        else if (m > n)
+            return 1;
+        else
+            return 0;
+    }
+
+    return res;
 }

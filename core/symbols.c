@@ -103,57 +103,146 @@ static inline u64_t str_hash(lit_p key, u64_t len)
     return hash;
 }
 
-str_p heap_intern(symbols_p symbols, u64_t len)
+str_p string_intern(symbols_p symbols, lit_p str, u64_t len)
 {
-    str_p str;
+    str_p curr, node;
 
-    // add node if there is no space left
-    if (((u64_t)symbols->string_curr + len) >= (u64_t)symbols->string_node)
+    curr = __atomic_fetch_add(&symbols->string_curr, len + 1, __ATOMIC_RELAXED);
+    node = __atomic_load_n(&symbols->string_node, __ATOMIC_ACQUIRE);
+
+    while (curr + len + 1 >= node)
     {
-        if (mmap_commit(symbols->string_node, STRING_NODE_SIZE) != 0)
+        if ((i64_t)node == NULL_I64)
         {
-            perror("mmap_commit");
-            return NULL;
+            node = __atomic_load_n(&symbols->string_node, __ATOMIC_ACQUIRE);
+            continue;
         }
 
-        symbols->string_node += STRING_NODE_SIZE;
+        // Attempt to commit more memory
+        if (__atomic_compare_exchange_n(&symbols->string_node, &node, (str_p)NULL_I64, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        {
+            if (mmap_commit(node, STRING_NODE_SIZE) != 0)
+            {
+                perror("mmap_commit");
+                exit(1);
+            }
+
+            node += STRING_NODE_SIZE;
+            __atomic_store_n(&symbols->string_node, node, __ATOMIC_RELEASE);
+        }
+        else
+        {
+            node = __atomic_load_n(&symbols->string_node, __ATOMIC_ACQUIRE);
+        }
     }
 
-    // Additional check before memcpy to prevent out of bounds write
-    if (symbols->string_curr + len > symbols->string_pool + STRING_POOL_SIZE)
-    {
-        fprintf(stderr, "Error: Out of bounds write attempt\n");
-        return NULL;
-    }
+    // Copy the string into the allocated space
+    memcpy(curr, str, len);
+    curr[len] = '\0';
 
-    str = symbols->string_curr;
-    symbols->string_curr += len;
-
-    return str;
+    return curr;
 }
 
-nil_t heap_untern(symbols_p symbols, u64_t len)
+i64_t symbols_intern(lit_p str, u64_t len)
 {
-    symbols->string_curr -= len;
+    i64_t index;
+    str_p intr;
+    symbols_p symbols = runtime_get()->symbols;
+    symbol_p new_bucket, current_bucket, b, *syms;
+
+    syms = symbols->syms;
+    index = str_hash(str, len) % symbols->size;
+
+    for (;;)
+    {
+        current_bucket = __atomic_load_n(&syms[index], __ATOMIC_ACQUIRE);
+        b = current_bucket;
+
+        if ((i64_t)b == NULL_I64)
+            continue;
+
+        while (b != NULL)
+        {
+            if (str_cmp(b->str, b->len, str, len) == 0)
+                return (i64_t)b->str;
+
+            b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE);
+        }
+
+        for (;;)
+        {
+            if (__atomic_compare_exchange_n(&syms[index], &current_bucket, (symbol_p)NULL_I64,
+                                            1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+                break;
+
+            b = current_bucket;
+
+            while (b != NULL)
+            {
+                if (str_cmp(b->str, b->len, str, len) == 0)
+                {
+                    __atomic_store_n(&syms[index], current_bucket, __ATOMIC_RELEASE);
+                    return (i64_t)b->str;
+                }
+
+                b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE);
+            }
+        }
+
+        new_bucket = (symbol_p)heap_alloc(sizeof(struct symbol_t));
+        if (new_bucket == NULL)
+            return NULL_I64;
+
+        intr = string_intern(symbols, str, len);
+        new_bucket->len = len;
+        new_bucket->str = intr;
+        new_bucket->next = current_bucket;
+
+        __atomic_store_n(&syms[index], new_bucket, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&symbols->count, 1, __ATOMIC_RELAXED);
+
+        return (i64_t)intr;
+    }
 }
 
 symbols_p symbols_create(nil_t)
 {
-    symbols_p symbols = (symbols_p)heap_mmap(sizeof(struct symbols_t));
-    raw_p pooladdr = (raw_p)(16 * PAGE_SIZE);
+    symbols_p symbols;
+    raw_p pooladdr, string_pool;
+
+    symbols = (symbols_p)heap_mmap(sizeof(struct symbols_t));
+
+    if (symbols == NULL)
+    {
+        perror("symbols mmap");
+        exit(1);
+    }
+
+// Allocate the string pool as close to the start of the address space as possible
+#ifdef DEBUG
+    pooladdr = NULL;
+#else
+    pooladdr = (raw_p)(16 * PAGE_SIZE);
+#endif
 
     symbols->size = SYMBOLS_HT_SIZE;
     symbols->count = 0;
     symbols->syms = (symbol_p *)heap_mmap(SYMBOLS_HT_SIZE * sizeof(symbol_p));
-    symbols->string_pool = (str_p)mmap_reserve(pooladdr, STRING_POOL_SIZE);
+    string_pool = (str_p)mmap_reserve(pooladdr, STRING_POOL_SIZE);
 
-    debug("STRING POOL ADDR: %p", symbols->string_pool);
-    if (symbols->string_pool == NULL)
+    if (string_pool == NULL)
     {
-        perror("string_pool mmap_reserve");
-        exit(1);
+        // try to reserve memory without specifying the address
+        string_pool = (str_p)mmap_reserve(NULL, STRING_POOL_SIZE);
+
+        if (string_pool == NULL)
+        {
+            perror("string_pool mmap_reserve");
+            exit(1);
+        }
     }
 
+    symbols->string_pool = string_pool;
     symbols->string_curr = symbols->string_pool;
     symbols->string_node = symbols->string_pool + STRING_NODE_SIZE;
 
@@ -168,54 +257,24 @@ symbols_p symbols_create(nil_t)
 
 nil_t symbols_destroy(symbols_p symbols)
 {
-    mmap_free(symbols->syms, symbols->size * sizeof(symbol_p));
-    heap_unmap(symbols, sizeof(struct symbols_t));
-}
+    u64_t i;
+    symbol_p b, next;
 
-i64_t symbols_intern(lit_p str, u64_t len)
-{
-    i64_t index;
-    str_p intr;
-    symbols_p symbols = runtime_get()->symbols;
-    symbol_p new_bucket, current_bucket, b, *syms;
-
-    syms = symbols->syms;
-    index = str_hash(str, len) % symbols->size;
-    intr = heap_intern(symbols, len + 1);
-
-    new_bucket = (symbol_p)heap_alloc(sizeof(struct symbol_t));
-    if (new_bucket == NULL)
-        return NULL_I64;
-
-    memcpy(intr, str, len);
-    intr[len] = '\0';
-
-    new_bucket->str = intr;
-
-    for (;;)
+    // free the symbol pool nodes
+    for (i = 0; i < symbols->size; i++)
     {
-        current_bucket = __atomic_load_n(&syms[index], __ATOMIC_ACQUIRE);
-        b = current_bucket;
-
+        b = symbols->syms[i];
         while (b != NULL)
         {
-            if (strncmp(b->str, str, len) == 0)
-            {
-                heap_untern(symbols, len + 1);
-                heap_free(new_bucket);
-                return (i64_t)b->str;
-            }
-
-            b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE);
-        }
-
-        new_bucket->next = current_bucket;
-        if (__atomic_compare_exchange(&syms[index], &current_bucket, &new_bucket, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
-        {
-            __atomic_fetch_add(&symbols->count, 1, __ATOMIC_RELAXED);
-            return (i64_t)intr;
+            next = b->next;
+            heap_free(b);
+            b = next;
         }
     }
+
+    mmap_free(symbols->syms, symbols->size * sizeof(symbol_p));
+    mmap_free(symbols->string_pool, STRING_POOL_SIZE);
+    heap_unmap(symbols, sizeof(struct symbols_t));
 }
 
 str_p str_from_symbol(i64_t key)

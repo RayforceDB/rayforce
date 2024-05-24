@@ -28,7 +28,7 @@
         obj_p lns = obj_fmt(le);                                                                                           \
         obj_p rns = obj_fmt(re);                                                                                           \
         obj_p fmt = str_fmt(-1, "Expected %s, got %s\n -- at: %s:%d", as_string(rns), as_string(lns), __FILE__, __LINE__); \
-        TEST_ASSERT(string_cmp(lns, rns) == 0, as_string(fmt));                                                            \
+        TEST_ASSERT(str_cmp(as_string(lns), lns->len, as_string(rns), rns->len) == 0, as_string(fmt));                     \
         drop_obj(fmt);                                                                                                     \
         drop_obj(re);                                                                                                      \
         drop_obj(le);                                                                                                      \
