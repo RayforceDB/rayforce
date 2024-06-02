@@ -29,6 +29,7 @@
 #include "ops.h"
 #include "error.h"
 #include "aggr.h"
+#include "pool.h"
 
 obj_p ray_add(obj_p x, obj_p y)
 {
@@ -849,11 +850,38 @@ obj_p ray_mod(obj_p x, obj_p y)
     }
 }
 
-obj_p ray_sum(obj_p x)
+typedef struct
 {
+    u64_t len;
+    i64_t *input;
+    i64_t sum;
+} sum_ctx_t;
+
+obj_p ray_sum_ctx(raw_p x, u64_t n)
+{
+    sum_ctx_t *ctx = (sum_ctx_t *)x;
     u64_t i, l;
     i64_t isum, *xii;
+
+    l = ctx->len;
+    xii = ctx->input;
+
+    for (i = 0, isum = 0; i < l; i++)
+        isum += (xii[i] == NULL_I64) ? 0 : xii[i];
+
+    ctx->sum = isum;
+
+    return NULL_OBJ;
+}
+
+obj_p ray_sum(obj_p x)
+{
+    u64_t i, l, chunks, chunk;
+    i64_t isum, *xii;
     f64_t fsum, *xfi;
+    pool_p pool;
+    obj_p res;
+    sum_ctx_t ctx[128];
 
     switch (x->type)
     {
@@ -864,10 +892,41 @@ obj_p ray_sum(obj_p x)
     case TYPE_I64:
         l = x->len;
         xii = as_i64(x);
-        for (i = 0, isum = 0; i < l; i++)
-            isum += (xii[i] == NULL_I64) ? 0 : xii[i];
+
+        pool = pool_get();
+        chunks = pool_executors_count(pool);
+        pool_prepare(pool, chunks);
+
+        if (chunks == 1)
+        {
+            for (i = 0, isum = 0; i < l; i++)
+                isum += (xii[i] == NULL_I64) ? 0 : xii[i];
+
+            return i64(isum);
+        }
+
+        chunk = l / chunks;
+
+        for (i = 0; i < chunks - 1; i++)
+        {
+            ctx[i].len = chunk;
+            ctx[i].input = xii + i * chunk;
+            pool_add_task(pool, i, ray_sum_ctx, NULL, &ctx[i], chunk);
+        }
+
+        ctx[chunks - 1].len = l - i * chunk;
+        ctx[chunks - 1].input = xii + i * chunk;
+        pool_add_task(pool, i, ray_sum_ctx, NULL, &ctx[i], l - i * chunk);
+
+        res = pool_run(pool, chunks);
+
+        drop_obj(res);
+
+        for (i = 0, isum = 0; i < chunks; i++)
+            isum += ctx[i].sum;
 
         return i64(isum);
+
     case TYPE_F64:
         l = x->len;
         xfi = as_f64(x);
