@@ -28,7 +28,7 @@ jobs:
 
     - name: Make (Linux)
       if: runner.os == 'Linux'
-      run: make CC="gcc" RELEASE_CFLAGS="-fPIC -Wall -Wextra -std=c17 -Ofast -march=x86-64 -msse -msse2 -mavx -mavx2 -fassociative-math -ftree-vectorize -m64" release
+      run: make CC="gcc" RELEASE_CFLAGS="-fPIC -Wall -Wextra -std=c17 -Ofast -march=x86-64 -msse -msse2 -mavx -mavx2 -fassociative-math -ftree-vectorize  -mfma -mpclmul -mbmi2 -m64" release
 
     - name: Install dependencies (Windows)
       if: runner.os == 'Windows'
@@ -43,7 +43,7 @@ jobs:
     - name: Make (Windows)
       if: runner.os == 'Windows'
       run: |
-        mingw32-make.exe LFLAGS="" CC="${{ github.workspace }}/mingw/mingw64/bin/gcc" AR="${{ github.workspace }}/mingw/mingw64/bin/ar" RELEASE_CFLAGS="-fPIC -Wall -Wextra -std=c17 -Ofast -march=x86-64 -msse -msse2 -mavx -mavx2 -fassociative-math -ftree-vectorize -m64" LIBS="-lm -lws2_32 -lkernel32" release
+        mingw32-make.exe LFLAGS="" CC="${{ github.workspace }}/mingw/mingw64/bin/gcc" AR="${{ github.workspace }}/mingw/mingw64/bin/ar" RELEASE_CFLAGS="-fPIC -Wall -Wextra -std=c17 -Ofast -march=x86-64 -msse -msse2 -mavx -mavx2 -fassociative-math -ftree-vectorize  -mfma -mpclmul -mbmi2 -m64" LIBS="-lm -lws2_32 -lkernel32" release
     
     - name: Install dependencies (macOS)
       if: runner.os == 'macOS'
@@ -55,7 +55,7 @@ jobs:
 
     - name: Make (macOS)
       if: runner.os == 'macOS'
-      run: make RELEASE_CFLAGS="-fPIC -Wall -Wextra -std=c17 -Ofast -march=native -fassociative-math -ftree-vectorize -m64" release
+      run: make RELEASE_CFLAGS="-fPIC -Wall -Wextra -std=c17 -Ofast -march=native -fassociative-math -ftree-vectorize  -mfma -mpclmul -mbmi2 -m64" release
 
     - name: Create build directory and copy binary (Linux)
       if: runner.os == 'Linux'

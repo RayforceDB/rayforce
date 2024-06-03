@@ -189,7 +189,7 @@ raw_p heap_mmap(u64_t size)
     if (ptr == NULL)
         return NULL;
 
-    __HEAP->memstat.system += size;
+    // __HEAP->memstat.system += size;
 
     return ptr;
 }

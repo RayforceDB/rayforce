@@ -225,12 +225,12 @@ symbols_p symbols_create(nil_t)
         exit(1);
     }
 
-// Allocate the string pool as close to the start of the address space as possible
-#ifdef DEBUG
+    // Allocate the string pool as close to the start of the address space as possible
+    // #ifdef DEBUG
     pooladdr = NULL;
-#else
-    pooladdr = (raw_p)(16 * PAGE_SIZE);
-#endif
+    // #else
+    // pooladdr = (raw_p)(16 * PAGE_SIZE);
+    // #endif
 
     symbols->size = SYMBOLS_HT_SIZE;
     symbols->count = 0;

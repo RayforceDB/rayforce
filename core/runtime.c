@@ -112,11 +112,12 @@ i32_t runtime_create(i32_t argc, str_p argv[])
 {
     u64_t n;
     obj_p arg, fmt, res;
+    symbols_p symbols = symbols_create();
 
     heap_create(0);
 
     __RUNTIME = (runtime_p)heap_mmap(sizeof(struct runtime_t));
-    __RUNTIME->symbols = symbols_create();
+    __RUNTIME->symbols = symbols;
     __RUNTIME->env = env_create();
     __RUNTIME->addr = (sock_addr_t){{0}, 0};
     __RUNTIME->fds = dict(vector_i64(0), vector_i64(0));
