@@ -53,7 +53,7 @@ typedef struct term_t
 
 history_p history_create();
 nil_t history_destroy(history_p history);
-nil_t history_add(history_p history, str_p line);
+nil_t history_add(history_p history, c8_t buf[], u64_t len);
 i64_t history_prev(history_p history, c8_t buf[]);
 i64_t history_next(history_p history, c8_t buf[]);
 i64_t history_save_current(history_p history, c8_t buf[], u64_t len);

@@ -120,16 +120,42 @@ nil_t history_destroy(history_p history)
 {
     if (mmap_sync(history->lines, history->size) == -1)
         perror("can't sync history buffer");
+
     mmap_free(history->lines, history->size);
     fs_fclose(history->fd);
     heap_unmap(history, sizeof(struct history_t));
 }
 
-nil_t history_add(history_p history, str_p line)
+nil_t history_add(history_p history, c8_t buf[], u64_t len)
 {
-    u64_t len = strlen(line);
-    u64_t pos = history->pos;
-    u64_t size = history->size;
+    u64_t pos, size, index, last_len;
+
+    pos = history->pos;
+    size = history->size;
+    index = history->index;
+
+    // Find the previous line
+    while (index > 0)
+    {
+        if (history->lines[--index] == '\n')
+        {
+            last_len = history->index - index - 1;
+            // Check if the line is already in the history buffer
+            if (last_len == len && strncmp(history->lines + index + 1, buf, len) == 0)
+                return;
+
+            break;
+        }
+    }
+
+    if (index == 0)
+    {
+        // Check if the line is already in the history buffer
+        if (history->index == len && strncmp(history->lines, buf, len) == 0)
+            return;
+    }
+
+    pos = history->pos;
 
     if (len + pos + 1 > size)
     {
@@ -146,7 +172,7 @@ nil_t history_add(history_p history, str_p line)
     }
 
     // Add the line to the history buffer
-    memcpy(history->lines + pos, line, len);
+    memcpy(history->lines + pos, buf, len);
     history->lines[pos + len] = '\n';
     history->pos += len + 1;
     history->index = history->pos - 1;
@@ -485,7 +511,7 @@ obj_p term_read(term_p term)
             else
                 res = (term->buf_len) ? cstring_from_str(term->buf, term->buf_len) : NULL_OBJ;
 
-            history_add(term->history, term->buf);
+            history_add(term->history, term->buf, term->buf_len);
 
             term->buf_len = 0;
             term->buf_pos = 0;
