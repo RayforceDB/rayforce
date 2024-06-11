@@ -309,8 +309,8 @@ term_p term_create()
     // Initialize the input buffer
     term->buf_len = 0;
     term->buf_pos = 0;
-
     term->history = history_create();
+    term->tabidx = 0;
 
     return term;
 }
@@ -386,7 +386,7 @@ i64_t term_redraw_into(term_p term, obj_p *dst)
                 }
 
                 // try to find in a verbs list
-                verb = env_get_internal_function_lit(term->buf + i, j - i);
+                verb = env_get_internal_function_lit(term->buf + i, j - i, NULL, B8_TRUE);
                 if (verb != NULL)
                 {
                     n += str_fmt_into(dst, -1, "%s%s%s%s", BOLD, GREEN, verb, RESET);
@@ -395,7 +395,7 @@ i64_t term_redraw_into(term_p term, obj_p *dst)
                     break;
                 }
 
-                verb = env_get_internal_kw_lit(term->buf + i, j - i);
+                verb = env_get_internal_kw_lit(term->buf + i, j - i, B8_TRUE);
                 if (verb != NULL)
                 {
                     n += str_fmt_into(dst, -1, "%s%s%s%s", BOLD, YELLOW, verb, RESET);
@@ -404,7 +404,7 @@ i64_t term_redraw_into(term_p term, obj_p *dst)
                     break;
                 }
 
-                verb = env_get_internal_lit_lit(term->buf + i, j - i);
+                verb = env_get_internal_lit_lit(term->buf + i, j - i, B8_TRUE);
                 if (verb != NULL)
                 {
                     n += str_fmt_into(dst, -1, "%s%s%s%s", BOLD, GREEN, verb, RESET);
@@ -476,6 +476,66 @@ nil_t term_redraw(term_p term)
     drop_obj(fmt);
 }
 
+nil_t term_autocomplete(term_p term)
+{
+    u64_t i, l, n;
+    str_p verb;
+
+    if (term->tabidx == 0)
+    {
+        debug("SAVE CURRENT HISTORY!!");
+        history_save_current(term->history, term->buf, term->buf_len);
+    }
+    else
+    {
+        l = history_restore_current(term->history, term->buf);
+        term->buf_len = l;
+        term->buf_pos = l;
+    }
+
+    // Find start of the word
+    for (i = term->buf_pos; i > 0; i--)
+    {
+        if (!is_alphanum(term->buf[i - 1]) && term->buf[i - 1] != '-')
+            break;
+    }
+
+    n = term->buf_pos - i;
+
+    verb = env_get_internal_function_lit(term->buf + i, n, &term->tabidx, B8_FALSE);
+    if (verb != NULL)
+    {
+        l = strlen(verb);
+        strncpy(term->buf + i, verb, l);
+        term->buf_len = i + l;
+        term->buf_pos = i + l;
+        term_redraw(term);
+        return;
+    }
+
+    verb = env_get_internal_kw_lit(term->buf + i, n, B8_FALSE);
+    if (verb != NULL)
+    {
+        l = strlen(verb);
+        strncpy(term->buf + i, verb, l);
+        term->buf_len = i + l;
+        term->buf_pos = i + l;
+        term_redraw(term);
+        return;
+    }
+
+    verb = env_get_internal_lit_lit(term->buf + i, n, B8_FALSE);
+    if (verb != NULL)
+    {
+        l = strlen(verb);
+        strncpy(term->buf + i, verb, l);
+        term->buf_len = i + l;
+        term->buf_pos = i + l;
+        term_redraw(term);
+        return;
+    }
+}
+
 nil_t term_backspace(term_p term)
 {
     if (term->buf_pos == 0)
@@ -533,6 +593,7 @@ obj_p term_read(term_p term)
 
             term->buf_len = 0;
             term->buf_pos = 0;
+            term->tabidx = 0;
 
             printf("\n");
             fflush(stdout);
@@ -540,12 +601,14 @@ obj_p term_read(term_p term)
             return res;
         case 127:  // Del
         case '\b': // Backspace
+            term->tabidx = 0;
             term_backspace(term);
             return res;
         case '\t': // Tab
-            // term_autocomplete(term);
+            term_autocomplete(term);
             return res;
         case '\033': // Escape sequence
+            term->tabidx = 0;
             if (read(STDIN_FILENO, &c, 1) == 1 && c == '[')
             {
                 if (read(STDIN_FILENO, &c, 1) == 1)
@@ -602,6 +665,7 @@ obj_p term_read(term_p term)
 
             return res;
         default:
+            term->tabidx = 0;
             // regular character
             if (term->buf_pos < term->buf_len)
             {

@@ -368,7 +368,7 @@ obj_p env_get_internal_function_by_id(i64_t id)
     return NULL_OBJ;
 }
 
-str_p env_get_internal_function_lit(lit_p name, u64_t len)
+str_p env_get_internal_function_lit(lit_p name, u64_t len, u64_t *start, b8_t exact)
 {
     i64_t i, l, *names;
     u64_t n;
@@ -377,56 +377,97 @@ str_p env_get_internal_function_lit(lit_p name, u64_t len)
     l = as_list(runtime_get()->env.functions)[0]->len;
     names = as_i64(as_list(runtime_get()->env.functions)[0]);
 
-    for (i = 0; i < l; i++)
+    if (exact)
     {
-        nm = str_from_symbol(names[i]);
-        n = strlen(nm);
-        if (n == len && strncmp(name, nm, len) == 0)
-            return nm;
+        for (i = 0; i < l; i++)
+        {
+            nm = str_from_symbol(names[i]);
+            n = strlen(nm);
+            if (n == len && strncmp(name, nm, len) == 0)
+                return nm;
+        }
+    }
+    else
+    {
+        for (i = *start; i < l; i++)
+        {
+            nm = str_from_symbol(names[i]);
+            n = mini64((i64_t)len, (i64_t)strlen(nm));
+            if (strncmp(name, nm, n) == 0)
+            {
+                *start = i + 1;
+                return nm;
+            }
+        }
     }
 
     return NULL;
 }
 
-str_p env_get_internal_kw_lit(lit_p name, u64_t len)
+str_p env_get_internal_kw_lit(lit_p name, u64_t len, b8_t exact)
 {
-    if (len == 2 && strncmp(name, "fn", 2) == 0)
-        return (str_p) "fn";
-
-    if (len == 4 && strncmp(name, "self", 4) == 0)
-        return (str_p) "self";
-
-    if (len == 2 && strncmp(name, "do", 2) == 0)
-        return (str_p) "do";
-
-    if (len == 3 && strncmp(name, "set", 3) == 0)
-        return (str_p) "set";
-
-    if (len == 3 && strncmp(name, "let", 3) == 0)
-        return (str_p) "let";
+    if (exact)
+    {
+        if (len == 2 && strncmp(name, "fn", 2) == 0)
+            return (str_p) "fn";
+        if (len == 4 && strncmp(name, "self", 4) == 0)
+            return (str_p) "self";
+        if (len == 2 && strncmp(name, "do", 2) == 0)
+            return (str_p) "do";
+        if (len == 3 && strncmp(name, "set", 3) == 0)
+            return (str_p) "set";
+        if (len == 3 && strncmp(name, "let", 3) == 0)
+            return (str_p) "let";
+    }
+    else
+    {
+        if (strncmp(name, "fn", mini64((i64_t)len, 2)) == 0)
+            return (str_p) "fn";
+        if (strncmp(name, "self", mini64((i64_t)len, 4)) == 0)
+            return (str_p) "self";
+        if (strncmp(name, "do", mini64((i64_t)len, 2)) == 0)
+            return (str_p) "do";
+        if (strncmp(name, "set", mini64((i64_t)len, 3)) == 0)
+            return (str_p) "set";
+        if (strncmp(name, "let", mini64((i64_t)len, 3)) == 0)
+            return (str_p) "let";
+    }
 
     return NULL;
 }
 
-str_p env_get_internal_lit_lit(lit_p name, u64_t len)
+str_p env_get_internal_lit_lit(lit_p name, u64_t len, b8_t exact)
 {
-    if (len == 2 && strncmp(name, "0i", 2) == 0)
-        return (str_p) "0i";
-
-    if (len == 2 && strncmp(name, "0f", 2) == 0)
-        return (str_p) "0f";
-
-    if (len == 2 && strncmp(name, "by", 2) == 0)
-        return (str_p) "by";
-
-    if (len == 4 && strncmp(name, "from", 4) == 0)
-        return (str_p) "from";
-
-    if (len == 4 && strncmp(name, "true", 4) == 0)
-        return (str_p) "true";
-
-    if (len == 5 && strncmp(name, "false", 5) == 0)
-        return (str_p) "false";
+    if (exact)
+    {
+        if (len == 2 && strncmp(name, "0i", 2) == 0)
+            return (str_p) "0i";
+        if (len == 2 && strncmp(name, "0f", 2) == 0)
+            return (str_p) "0f";
+        if (len == 2 && strncmp(name, "by", 2) == 0)
+            return (str_p) "by";
+        if (len == 4 && strncmp(name, "from", 4) == 0)
+            return (str_p) "from";
+        if (len == 4 && strncmp(name, "true", 4) == 0)
+            return (str_p) "true";
+        if (len == 5 && strncmp(name, "false", 5) == 0)
+            return (str_p) "false";
+    }
+    else
+    {
+        if (strncmp(name, "0i", mini64((i64_t)len, 2)) == 0)
+            return (str_p) "0i";
+        if (strncmp(name, "0f", mini64((i64_t)len, 2)) == 0)
+            return (str_p) "0f";
+        if (strncmp(name, "by", mini64((i64_t)len, 2)) == 0)
+            return (str_p) "by";
+        if (strncmp(name, "from", mini64((i64_t)len, 4)) == 0)
+            return (str_p) "from";
+        if (strncmp(name, "true", mini64((i64_t)len, 4)) == 0)
+            return (str_p) "true";
+        if (strncmp(name, "false", mini64((i64_t)len, 5)) == 0)
+            return (str_p) "false";
+    }
 
     return NULL;
 }
