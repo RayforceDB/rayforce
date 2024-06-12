@@ -368,7 +368,7 @@ obj_p env_get_internal_function_by_id(i64_t id)
     return NULL_OBJ;
 }
 
-str_p env_get_internal_function_lit(lit_p name, u64_t len, u64_t *start, b8_t exact)
+str_p env_get_internal_function_lit(lit_p name, u64_t len, u64_t *fnidx, b8_t exact)
 {
     i64_t i, l, *names;
     u64_t n;
@@ -389,13 +389,13 @@ str_p env_get_internal_function_lit(lit_p name, u64_t len, u64_t *start, b8_t ex
     }
     else
     {
-        for (i = *start; i < l; i++)
+        for (i = *fnidx; i < l; i++)
         {
             nm = str_from_symbol(names[i]);
             n = mini64((i64_t)len, (i64_t)strlen(nm));
             if (strncmp(name, nm, n) == 0)
             {
-                *start = i + 1;
+                *fnidx = i + 1;
                 return nm;
             }
         }
@@ -467,6 +467,47 @@ str_p env_get_internal_lit_lit(lit_p name, u64_t len, b8_t exact)
             return (str_p) "true";
         if (strncmp(name, "false", mini64((i64_t)len, 5)) == 0)
             return (str_p) "false";
+    }
+
+    return NULL;
+}
+
+str_p env_get_global_lit_lit(lit_p name, u64_t len, u64_t *varidx, u64_t *colidx)
+{
+    i64_t *names, *cols;
+    u64_t i, j, n, l, m;
+    str_p nm;
+    obj_p *vals;
+
+    l = as_list(runtime_get()->env.variables)[0]->len;
+    names = as_i64(as_list(runtime_get()->env.variables)[0]);
+    vals = as_list(as_list(runtime_get()->env.variables)[1]);
+
+    for (i = 0; i < l; i++)
+    {
+        nm = str_from_symbol(names[i]);
+        n = mini64((i64_t)len, (i64_t)strlen(nm));
+        if (strncmp(name, nm, n) == 0)
+        {
+            *varidx = i + 1;
+            return nm;
+        }
+
+        if (vals[i]->type == TYPE_TABLE)
+        {
+            cols = as_i64(as_list(vals[i])[0]);
+            m = as_list(vals[i])[0]->len;
+            for (j = *colidx; j < m; j++)
+            {
+                nm = str_from_symbol(cols[j]);
+                n = mini64((i64_t)len, (i64_t)strlen(nm));
+                if (strncmp(name, nm, n) == 0)
+                {
+                    *colidx = j + 1;
+                    return nm;
+                }
+            }
+        }
     }
 
     return NULL;

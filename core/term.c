@@ -34,6 +34,7 @@
 #include "env.h"
 #include "mmap.h"
 #include "fs.h"
+#include "eval.h"
 
 #define HISTORY_FILE_PATH ".rayhist.dat"
 #define HISTORY_SIZE 4096
@@ -331,7 +332,9 @@ term_p term_create()
     term->buf_len = 0;
     term->buf_pos = 0;
     term->history = history_create();
-    term->tabidx = 0;
+    term->fnidx = 0;
+    term->varidx = 0;
+    term->colidx = 0;
 
     return term;
 }
@@ -537,7 +540,7 @@ nil_t term_autocomplete(term_p term)
     if (n == 0)
         return;
 
-    verb = env_get_internal_function_lit(buf + i, n, &term->tabidx, B8_FALSE);
+    verb = env_get_internal_function_lit(buf + i, n, &term->fnidx, B8_FALSE);
     if (verb != NULL)
     {
         l = strlen(verb);
@@ -569,6 +572,24 @@ nil_t term_autocomplete(term_p term)
         term_redraw(term);
         return;
     }
+
+    verb = env_get_global_lit_lit(term->buf + i, n, &term->varidx, &term->colidx);
+    if (verb != NULL)
+    {
+        l = strlen(verb);
+        strncpy(term->buf + i, verb, l);
+        term->buf_len = i + l;
+        term->buf_pos = i + l;
+        term_redraw(term);
+        return;
+    }
+}
+
+nil_t term_reset_idx(term_p term)
+{
+    term->fnidx = 0;
+    term->varidx = 0;
+    term->colidx = 0;
 }
 
 obj_p term_read(term_p term)
@@ -606,10 +627,9 @@ obj_p term_read(term_p term)
                 res = (term->buf_len) ? cstring_from_str(term->buf, term->buf_len) : NULL_OBJ;
 
             history_add(term->history, term->buf, term->buf_len);
-
             term->buf_len = 0;
             term->buf_pos = 0;
-            term->tabidx = 0;
+            term_reset_idx(term);
             history_reset_current(term->history);
 
             printf("\n");
@@ -618,16 +638,16 @@ obj_p term_read(term_p term)
             return res;
         case 127:  // Del
         case '\b': // Backspace
-            term->tabidx = 0;
-            term_backspace(term);
+            term_reset_idx(term);
             history_reset_current(term->history);
+            term_backspace(term);
             return res;
         case '\t': // Tab
             history_save_current(term->history, term->buf, term->buf_len);
             term_autocomplete(term);
             return res;
         case '\033': // Escape sequence
-            term->tabidx = 0;
+            term_reset_idx(term);
             if (read(STDIN_FILENO, &c, 1) == 1 && c == '[')
             {
                 if (read(STDIN_FILENO, &c, 1) == 1)
@@ -700,7 +720,7 @@ obj_p term_read(term_p term)
 
             return res;
         default:
-            term->tabidx = 0;
+            term_reset_idx(term);
             history_reset_current(term->history);
 
             // regular character

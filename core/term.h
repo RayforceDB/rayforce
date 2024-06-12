@@ -49,7 +49,9 @@ typedef struct term_t
     i32_t buf_len;
     i32_t buf_pos;
     c8_t buf[TERM_BUF_SIZE];
-    u64_t tabidx;
+    u64_t fnidx;
+    u64_t varidx;
+    u64_t colidx;
     history_p history;
 } *term_p;
 
