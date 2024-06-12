@@ -2,11 +2,28 @@ CC = clang
 STD = c17
 AR = ar
 PROFILER = gprof
+
+OS := $(shell uname -s | tr "[:upper:]" "[:lower:]")
+$(info OS="$(OS)")
+
+ifeq ($(OS),mingw64_nt-10.0-22000)
+DEBUG_CFLAGS="-fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG -DSYS_MALLOC"
+LIBS = -lm -lws2_32 -lkernel32
+endif
+
+ifeq ($(OS),linux)
+DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
+LIBS = -lm -ldl
+endif
+
+ifeq ($(OS),darwin)
+DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
+LIBS = -lm -ldl
+endif
+
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -Ofast -fsigned-char -march=native -fassociative-math -ftree-vectorize\
  -fno-math-errno -funsafe-math-optimizations -ffinite-math-only -funroll-loops -mfma -mpclmul -mbmi2\
  -fno-unwind-tables -m64
-# DEBUG_CFLAGS="-fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG -DSYS_MALLOC"
-DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
 CORE_HEADERS = core/runtime.h core/poll.h core/sys.h core/fs.h core/mmap.h core/serde.h core/timestamp.h\
  core/guid.h core/sort.h core/ops.h core/util.h core/string.h core/hash.h core/symbols.h\
  core/format.h core/rayforce.h core/heap.h core/parse.h core/eval.h core/nfo.h core/timer.h\
@@ -26,10 +43,6 @@ CORE_OBJECTS = core/runtime.o core/poll.o core/sys.o core/fs.o core/mmap.o core/
 APP_OBJECTS = app/main.o
 TESTS_OBJECTS = tests/main.o
 TARGET = rayforce
-# windows flags
-# LIBS = -lm -lws2_32 -lkernel32
-# nix flags
-LIBS = -lm -ldl
 CFLAGS = $(DEBUG_CFLAGS)
 LFLAGS = -rdynamic
 PYTHON = python3.10
