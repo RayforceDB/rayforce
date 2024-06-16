@@ -12,21 +12,24 @@ $(info OS="$(OS)")
 ifeq ($(OS),Windows_NT)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG
 LIBS = -lm -lws2_32 -lkernel32
+LFLAGS =
 endif
 
 ifeq ($(OS),linux)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
 LIBS = -lm -ldl -lpthread
+LFLAGS = -rdynamic
 endif
 
 ifeq ($(OS),darwin)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
 LIBS = -lm -ldl -lpthread
+LFLAGS = -rdynamic
 endif
 
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -Ofast -fsigned-char -march=native -fassociative-math -ftree-vectorize\
  -fno-math-errno -funsafe-math-optimizations -ffinite-math-only -funroll-loops -fno-unwind-tables -m64
-CORE_HEADERS = core/runtime.h core/poll.h core/sys.h core/fs.h core/mmap.h core/serde.h core/timestamp.h\
+CORE_HEADERS = core/poll.h core/runtime.h core/sys.h core/fs.h core/mmap.h core/serde.h core/timestamp.h\
  core/guid.h core/sort.h core/ops.h core/util.h core/string.h core/hash.h core/symbols.h\
  core/format.h core/rayforce.h core/heap.h core/parse.h core/eval.h core/nfo.h core/timer.h\
  core/env.h core/lambda.h core/unary.h core/binary.h core/vary.h core/sock.h core/error.h\
@@ -34,7 +37,7 @@ CORE_HEADERS = core/runtime.h core/poll.h core/sys.h core/fs.h core/mmap.h core/
  core/misc.h core/queue.h core/freelist.h core/update.h core/join.h core/query.h core/cond.h\
  core/iter.h core/dynlib.h core/aggr.h core/index.h core/group.h core/filter.h core/atomic.h core/mpmc.h\
  core/thread.h core/pool.h core/term.h
-CORE_OBJECTS = core/runtime.o core/poll.o core/sys.o core/fs.o core/mmap.o core/serde.o core/timestamp.o\
+CORE_OBJECTS = core/poll.o core/runtime.o core/sys.o core/fs.o core/mmap.o core/serde.o core/timestamp.o\
  core/guid.o core/sort.o core/ops.o core/util.o core/string.o core/hash.o core/symbols.o\
  core/format.o core/rayforce.o core/heap.o core/parse.o core/eval.o core/nfo.o core/timer.o\
  core/env.o core/lambda.o core/unary.o core/binary.o core/vary.o core/sock.o core/error.o\
@@ -46,7 +49,6 @@ APP_OBJECTS = app/main.o
 TESTS_OBJECTS = tests/main.o
 TARGET = rayforce
 CFLAGS = $(DEBUG_CFLAGS)
-LFLAGS = -rdynamic
 PYTHON = python3.10
 
 default: debug

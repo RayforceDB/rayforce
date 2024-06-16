@@ -56,10 +56,16 @@ typedef struct listener_t
     OVERLAPPED overlapped;
     DWORD dwBytes;
     SOCKET hAccepted;
-} *listener_t;
+} *listener_p;
 
-c8_t __STDIN_BUF[BUF_SIZE + 1];
-__thread listener_t __LISTENER;
+typedef struct stdin_thread_ctx_t
+{
+    HANDLE hCompletionPort;
+    c8_t *buf;
+} *stdin_thread_ctx_p;
+
+listener_p __LISTENER = NULL;
+stdin_thread_ctx_p __STDIN_THREAD_CTX = NULL;
 
 #define _recv_op(poll, selector)                                                                      \
     {                                                                                                 \
@@ -95,21 +101,22 @@ __thread listener_t __LISTENER;
 
 DWORD WINAPI StdinThread(LPVOID lpParam)
 {
-    HANDLE hCompletionPort = (HANDLE)lpParam;
+    stdin_thread_ctx_p ctx = (stdin_thread_ctx_p)lpParam;
+    c8_t *buf = ctx->buf;
+    HANDLE hCompletionPort = ctx->hCompletionPort;
     DWORD bytesRead;
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
 
     while (B8_TRUE)
     {
         // Blocking read from stdin
-        if (ReadFile(hStdin, __STDIN_BUF, BUF_SIZE, &bytesRead, NULL))
+        if (ReadFile(hStdin, buf, 1, &bytesRead, NULL))
         {
-            __STDIN_BUF[bytesRead] = '\0';
             // Check for CTRL+C (ASCII code 3)
-            if (bytesRead == 1 && __STDIN_BUF[0] == 0x03)
+            if (buf[0] == 0x03)
                 PostQueuedCompletionStatus(hCompletionPort, 0, STDIN_WAKER_ID, NULL);
             else
-                PostQueuedCompletionStatus(hCompletionPort, bytesRead, STDIN_WAKER_ID, NULL);
+                PostQueuedCompletionStatus(hCompletionPort, 1, STDIN_WAKER_ID, NULL);
         }
     }
 
@@ -190,11 +197,7 @@ poll_p poll_init(i64_t port)
     if (!poll_fd)
         exit_werror();
 
-    // Create a thread to read from stdin
-    CreateThread(NULL, 0, StdinThread, (HANDLE)poll_fd, 0, NULL);
-
     poll_p poll = (poll_p)heap_alloc(sizeof(struct poll_t));
-
     poll->poll_fd = poll_fd;
 
     if (port)
@@ -209,7 +212,7 @@ poll_p poll_init(i64_t port)
         poll->ipc_fd = ipc_fd;
         CreateIoCompletionPort((HANDLE)ipc_fd, (HANDLE)poll_fd, ipc_fd, 0);
 
-        __LISTENER = (listener_t)heap_alloc(sizeof(struct listener_t));
+        __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
         memset(__LISTENER, 0, sizeof(struct listener_t));
 
         if (poll_accept(poll) == -1)
@@ -222,8 +225,16 @@ poll_p poll_init(i64_t port)
     poll->code = NULL_I64;
     poll->replfile = string_from_str("repl", 4);
     poll->ipcfile = string_from_str("ipc", 3);
+    poll->term = term_create();
     poll->selectors = freelist_create(128);
     poll->timers = timers_create(16);
+
+    __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
+    __STDIN_THREAD_CTX->hCompletionPort = (HANDLE)poll_fd;
+    __STDIN_THREAD_CTX->buf = &poll->term->input;
+
+    // Create a thread to read from stdin
+    CreateThread(NULL, 0, StdinThread, (LPVOID)__STDIN_THREAD_CTX, 0, NULL);
 
     return poll;
 }
@@ -246,11 +257,16 @@ nil_t poll_destroy(poll_p poll)
     drop_obj(poll->replfile);
     drop_obj(poll->ipcfile);
 
+    term_destroy(poll->term);
+
     freelist_free(poll->selectors);
     timers_destroy(poll->timers);
 
     CloseHandle((HANDLE)poll->poll_fd);
     heap_free(poll);
+
+    heap_free(__LISTENER);
+    heap_free(__STDIN_THREAD_CTX);
 
     WSACleanup();
 }
@@ -540,7 +556,7 @@ i64_t poll_run(poll_p poll)
     obj_p str, fmt, res;
     selector_p selector;
 
-    prompt();
+    term_prompt(poll->term);
 
     while (poll->code == NULL_I64)
     {
@@ -569,12 +585,22 @@ i64_t poll_run(poll_p poll)
                         poll->code = 0;
                         break;
                     }
-                    str = cstring_from_str(__STDIN_BUF, size);
-                    res = ray_eval_str(str, poll->replfile);
-                    drop_obj(str);
-                    io_write(STDOUT_FILENO, MSG_TYPE_RESP, res);
-                    drop_obj(res);
-                    prompt();
+                    str = term_read(poll->term);
+                    if (str != NULL)
+                    {
+                        if (is_error(str))
+                            io_write(STDOUT_FILENO, MSG_TYPE_RESP, str);
+                        else if (str != NULL_OBJ)
+                        {
+                            res = ray_eval_str(str, poll->replfile);
+                            drop_obj(str);
+                            io_write(STDOUT_FILENO, MSG_TYPE_RESP, res);
+                            drop_obj(res);
+                        }
+
+                        term_prompt(poll->term);
+                    }
+
                     break;
 
                 default:

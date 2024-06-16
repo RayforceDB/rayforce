@@ -59,6 +59,27 @@ nil_t line_clear()
 }
 
 // Function to extend the file size
+#if defined(_WIN32) || defined(__CYGWIN__)
+
+i64_t extend_file_size(i64_t fd, u64_t new_size)
+{
+    HANDLE hFile = (HANDLE)fd;
+    LARGE_INTEGER li;
+    li.QuadPart = new_size;
+
+    // Move the file pointer to the desired position
+    if (!SetFilePointerEx(hFile, li, NULL, FILE_BEGIN))
+        return -1;
+
+    // Set the end of the file to the current position of the file pointer
+    if (!SetEndOfFile(hFile))
+        return -1;
+
+    return new_size;
+}
+
+#else
+
 i64_t extend_file_size(i64_t fd, u64_t new_size)
 {
     if (lseek(fd, new_size - 1, SEEK_SET) == -1)
@@ -70,13 +91,15 @@ i64_t extend_file_size(i64_t fd, u64_t new_size)
     return new_size;
 }
 
+#endif
+
 history_p history_create()
 {
     i64_t pos, fd, fsize;
     str_p lines;
     history_p history;
 
-    fd = fs_fopen(HISTORY_FILE_PATH, O_RDWR | ATTR_CREAT);
+    fd = fs_fopen(HISTORY_FILE_PATH, GENERIC_READ | GENERIC_WRITE);
 
     if (fd == -1)
     {
@@ -313,9 +336,66 @@ nil_t history_reset_current(history_p history)
     history->curr_len = 0;
 }
 
+#if defined(_WIN32) || defined(__CYGWIN__)
+
 term_p term_create()
 {
     term_p term;
+    history_p history;
+
+    history = history_create();
+    if (history == NULL)
+        panic("can't create history");
+
+    term = (term_p)heap_mmap(sizeof(struct term_t));
+
+    if (term == NULL)
+        return NULL;
+
+    // Save the current input mode
+    GetConsoleMode(STDIN_FILENO, &term->oldMode);
+
+    // For windows 10, set the output encoding to UTF-8
+    // [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+    // Set the new input mode (disable line input, echo input, etc.)
+    term->newMode = term->oldMode;
+    term->newMode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+    // term->newMode &= ~ENABLE_LINE_INPUT;
+    SetConsoleMode(STDIN_FILENO, term->newMode);
+
+    // Initialize the input buffer
+    term->buf_len = 0;
+    term->buf_pos = 0;
+    term->history = history;
+    term->fnidx = 0;
+    term->varidx = 0;
+    term->colidx = 0;
+
+    return term;
+}
+
+nil_t term_destroy(term_p term)
+{
+    // Restore the terminal attributes
+    SetConsoleMode(STDIN_FILENO, term->oldMode);
+
+    history_destroy(term->history);
+
+    // Unmap the terminal structure
+    heap_unmap(term, sizeof(struct term_t));
+}
+
+#else
+
+term_p term_create()
+{
+    term_p term;
+    history_p history;
+
+    history = history_create();
+    if (history == NULL)
+        panic("can't create history");
 
     term = (term_p)heap_mmap(sizeof(struct term_t));
 
@@ -331,7 +411,7 @@ term_p term_create()
     // Initialize the input buffer
     term->buf_len = 0;
     term->buf_pos = 0;
-    term->history = history_create();
+    term->history = history;
     term->fnidx = 0;
     term->varidx = 0;
     term->colidx = 0;
@@ -349,6 +429,8 @@ nil_t term_destroy(term_p term)
     // Unmap the terminal structure
     heap_unmap(term, sizeof(struct term_t));
 }
+
+#endif
 
 nil_t term_prompt(term_p term)
 {
@@ -583,6 +665,155 @@ nil_t term_reset_idx(term_p term)
     term->colidx = 0;
 }
 
+#if defined(_WIN32) || defined(__CYGWIN__)
+
+obj_p term_read(term_p term)
+{
+    INPUT_RECORD inputRecord;
+    DWORD events;
+    i64_t exit_code;
+    u64_t l;
+    c8_t c = term->input;
+    obj_p res = NULL;
+
+    switch (c)
+    {
+    case '\r': // Enter key
+        if (term->buf_len == 0)
+        {
+            res = NULL_OBJ;
+            goto ret;
+        }
+
+        term->buf[term->buf_len] = '\0';
+
+        if (strncmp(term->buf, ":q", 2) == 0)
+        {
+            exit_code = (term->buf_len > 2) ? i64_from_str(term->buf + 2, term->buf_len - 3) : 0;
+            poll_exit(runtime_get(), exit_code);
+        }
+        else if (strncmp(term->buf, ":?", 2) == 0)
+        {
+            printf("\n%s** Commands list:\n%s%s", YELLOW, COMMANDS_LIST, RESET);
+            fflush(stdout);
+            res = NULL_OBJ;
+        }
+        else
+            res = cstring_from_str(term->buf, term->buf_len);
+
+        history_add(term->history, term->buf, term->buf_len);
+
+    ret:
+        term->buf_len = 0;
+        term->buf_pos = 0;
+        term_reset_idx(term);
+        history_reset_current(term->history);
+        printf("\n");
+        fflush(stdout);
+
+        return res;
+    case '\b': // Backspace key
+        term_reset_idx(term);
+        history_reset_current(term->history);
+        term_backspace(term);
+        return res;
+    case '\t': // Tab key
+        history_save_current(term->history, term->buf, term->buf_len);
+        term_autocomplete(term);
+        return res;
+    case 0: // Non-printable character, handle arrow keys and other control keys
+        switch (inputRecord.Event.KeyEvent.wVirtualKeyCode)
+        {
+        case VK_UP: // Up arrow key
+            history_save_current(term->history, term->buf, term->buf_len);
+            l = history_prev(term->history, term->buf);
+            if (l > 0)
+            {
+                term->buf_len = l;
+                term->buf_pos = l;
+                term_redraw(term);
+            }
+            break;
+        case VK_DOWN: // Down arrow key
+            l = history_next(term->history, term->buf);
+            if (l > 0)
+            {
+                term->buf_len = l;
+                term->buf_pos = l;
+            }
+            else
+            {
+                l = history_restore_current(term->history, term->buf);
+                term->buf_len = l;
+                term->buf_pos = l;
+            }
+
+            term_redraw(term);
+            break;
+        case VK_RIGHT: // Right arrow key
+            if (term->buf_pos < term->buf_len)
+            {
+                term->buf_pos++;
+                cursor_move_right(1);
+                fflush(stdout);
+            }
+            break;
+        case VK_LEFT: // Left arrow key
+            if (term->buf_pos > 0)
+            {
+                term->buf_pos--;
+                cursor_move_left(1);
+                fflush(stdout);
+            }
+            break;
+        case VK_HOME: // Home key
+            if (term->buf_pos > 0)
+            {
+                cursor_move_left(term->buf_pos);
+                term->buf_pos = 0;
+                fflush(stdout);
+            }
+            break;
+        case VK_END: // End key
+            if (term->buf_len > 0)
+            {
+                cursor_move_right(term->buf_len - term->buf_pos);
+                term->buf_pos = term->buf_len;
+                fflush(stdout);
+            }
+            break;
+        default:
+            break;
+        }
+        return res;
+    default:
+        term_reset_idx(term);
+        history_reset_current(term->history);
+        // Regular character
+        if (term->buf_pos < term->buf_len)
+        {
+            memmove(term->buf + term->buf_pos + 1, term->buf + term->buf_pos, term->buf_len - term->buf_pos);
+            term->buf[term->buf_pos] = c;
+            term->buf_len++;
+            term->buf_pos++;
+        }
+        else if (term->buf_pos == term->buf_len && term->buf_len < TERM_BUF_SIZE - 1)
+        {
+            term->buf[term->buf_len++] = c;
+            term->buf_pos++;
+        }
+
+        term->buf[term->buf_len] = '\0';
+
+        term_redraw(term);
+        return res;
+    }
+
+    return res;
+}
+
+#else
+
 obj_p term_read(term_p term)
 {
     c8_t c;
@@ -742,3 +973,5 @@ obj_p term_read(term_p term)
 
     return res;
 }
+
+#endif

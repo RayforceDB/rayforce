@@ -32,11 +32,53 @@
 
 #if defined(DEBUG)
 
-#if defined(__EMSCRIPTEN__)
+#if defined(_WIN32) || defined(__CYGWIN__)
 
-nil_t dump_stack(nil_t) {}
+// #include <windows.h>
+// #include <dbghelp.h>
+// #include <stdio.h>
+// #include <stdlib.h>
 
-#else
+// #pragma comment(lib, "dbghelp.lib")
+
+nil_t dump_stack(nil_t)
+{
+    // // Initialize DbgHelp
+    // if (!SymInitialize(GetCurrentProcess(), NULL, TRUE))
+    // {
+    //     fprintf(stderr, "SymInitialize failed: %lu\n", GetLastError());
+    //     return;
+    // }
+
+    // // Capture stack backtrace
+    // void *stack[100];
+    // USHORT frames = CaptureStackBackTrace(0, 100, stack, NULL);
+
+    // // Allocate memory for symbol information
+    // SYMBOL_INFO *symbol = (SYMBOL_INFO *)calloc(sizeof(SYMBOL_INFO) + 256 * sizeof(char), 1);
+    // symbol->MaxNameLen = 255;
+    // symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+
+    // // Print stack trace
+    // for (USHORT i = 0; i < frames; i++)
+    // {
+    //     DWORD64 address = (DWORD64)(stack[i]);
+    //     if (SymFromAddr(GetCurrentProcess(), address, 0, symbol))
+    //     {
+    //         printf("%i: %s - 0x%0X\n", frames - i - 1, symbol->Name, symbol->Address);
+    //     }
+    //     else
+    //     {
+    //         printf("%i: No symbol found for 0x%0X\n", frames - i - 1, address);
+    //     }
+    // }
+
+    // // Cleanup
+    // free(symbol);
+    // SymCleanup(GetCurrentProcess());
+}
+
+#elif defined(__linux__)
 
 #include <execinfo.h>
 
@@ -57,6 +99,10 @@ nil_t dump_stack(nil_t)
         free(strings); // Free the memory allocated by backtrace_symbols
     }
 }
+
+#else
+
+nil_t dump_stack(nil_t) {}
 
 #endif
 

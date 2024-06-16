@@ -25,7 +25,11 @@
 #define TERM_H
 
 #include "rayforce.h"
+#if defined(_WIN32) || defined(__CYGWIN__)
+#include <windows.h>
+#else
 #include <termios.h>
+#endif
 
 #define TERM_BUF_SIZE 1024
 
@@ -44,10 +48,16 @@ typedef struct history_t
 
 typedef struct term_t
 {
-    struct termios oldattr;
-    struct termios newattr;
+#if defined(_WIN32) || defined(__CYGWIN__)
+    DWORD oldMode; // Store the old console mode
+    DWORD newMode; // Store the new console mode
+#else
+    struct termios oldattr; // Store the old terminal attributes
+    struct termios newattr; // Store the new terminal attributes
+#endif
     i32_t buf_len;
     i32_t buf_pos;
+    c8_t input;
     c8_t buf[TERM_BUF_SIZE];
     u64_t fnidx;
     u64_t varidx;
