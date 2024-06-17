@@ -36,12 +36,17 @@
 #include "fs.h"
 #include "eval.h"
 
-#define HISTORY_FILE_PATH ".rayhist.dat"
-#define HISTORY_SIZE 4096
+#define hist_FILE_PATH ".rayhist.dat"
+#define hist_SIZE 4096
 #define COMMANDS_LIST "\
   :?  - Displays help.\n\
   :g  - Use rich graphic formatting: [0|1].\n\
   :q  - Exits the application: [exit code]."
+
+nil_t cursor_move_start()
+{
+    printf("\r");
+}
 
 nil_t cursor_move_left(i32_t i)
 {
@@ -93,13 +98,13 @@ i64_t extend_file_size(i64_t fd, u64_t new_size)
 
 #endif
 
-history_p history_create()
+hist_p hist_create()
 {
     i64_t pos, fd, fsize;
     str_p lines;
-    history_p history;
+    hist_p hist;
 
-    fd = fs_fopen(HISTORY_FILE_PATH, GENERIC_READ | GENERIC_WRITE);
+    fd = fs_fopen(hist_FILE_PATH, GENERIC_READ | GENERIC_WRITE);
 
     if (fd == -1)
     {
@@ -111,14 +116,14 @@ history_p history_create()
     if (fsize == 0)
     {
         // Set initial file size if the file is empty
-        if (extend_file_size(fd, HISTORY_SIZE) == -1)
+        if (extend_file_size(fd, hist_SIZE) == -1)
         {
             perror("can't truncate history file");
             fs_fclose(fd);
             return NULL;
         }
 
-        fsize = HISTORY_SIZE;
+        fsize = hist_SIZE;
     }
 
     // Map file to memory
@@ -130,8 +135,8 @@ history_p history_create()
         return NULL;
     }
 
-    history = (history_p)heap_mmap(sizeof(struct history_t));
-    if (history == NULL)
+    hist = (hist_p)heap_mmap(sizeof(struct hist_t));
+    if (hist == NULL)
     {
         perror("can't allocate memory for history");
         fs_fclose(fd);
@@ -144,44 +149,44 @@ history_p history_create()
     while (pos < fsize && lines[pos] != '\0')
         pos++;
 
-    history->fd = fd;
-    history->lines = lines;
-    history->size = fsize;
-    history->pos = pos;
-    history->search_dir = 1;
-    history->index = (pos == 0) ? 0 : pos - 1;
-    history->curr_saved = 0;
-    history->curr_len = 0;
+    hist->fd = fd;
+    hist->lines = lines;
+    hist->size = fsize;
+    hist->pos = pos;
+    hist->search_dir = 1;
+    hist->index = (pos == 0) ? 0 : pos - 1;
+    hist->curr_saved = 0;
+    hist->curr_len = 0;
 
-    return history;
+    return hist;
 }
 
-nil_t history_destroy(history_p history)
+nil_t hist_destroy(hist_p hist)
 {
-    if (mmap_sync(history->lines, history->size) == -1)
+    if (mmap_sync(hist->lines, hist->size) == -1)
         perror("can't sync history buffer");
 
-    mmap_free(history->lines, history->size);
-    fs_fclose(history->fd);
-    heap_unmap(history, sizeof(struct history_t));
+    mmap_free(hist->lines, hist->size);
+    fs_fclose(hist->fd);
+    heap_unmap(hist, sizeof(struct hist_t));
 }
 
-nil_t history_add(history_p history, c8_t buf[], u64_t len)
+nil_t hist_add(hist_p hist, c8_t buf[], u64_t len)
 {
     u64_t pos, size, index, last_len;
 
-    pos = history->pos;
-    size = history->size;
-    index = history->index;
+    pos = hist->pos;
+    size = hist->size;
+    index = hist->index;
 
     // Find the previous line
     while (index > 0)
     {
-        if (history->lines[--index] == '\n')
+        if (hist->lines[--index] == '\n')
         {
-            last_len = history->index - index - 1;
+            last_len = hist->index - index - 1;
             // Check if the line is already in the history buffer
-            if (last_len == len && strncmp(history->lines + index + 1, buf, len) == 0)
+            if (last_len == len && strncmp(hist->lines + index + 1, buf, len) == 0)
                 return;
 
             break;
@@ -191,149 +196,149 @@ nil_t history_add(history_p history, c8_t buf[], u64_t len)
     if (index == 0)
     {
         // Check if the line is already in the history buffer
-        if (history->index == len && strncmp(history->lines, buf, len) == 0)
+        if (hist->index == len && strncmp(hist->lines, buf, len) == 0)
             return;
     }
 
-    pos = history->pos;
+    pos = hist->pos;
 
     if (len + pos + 1 > size)
     {
         // Resize the history buffer
         size = size * 2;
-        history->lines = (str_p)mmap_reserve(history->lines, size);
-        if (history->lines == NULL)
+        hist->lines = (str_p)mmap_reserve(hist->lines, size);
+        if (hist->lines == NULL)
         {
             perror("can't resize history buffer");
             return;
         }
 
-        history->size = size;
+        hist->size = size;
     }
 
     // Add the line to the history buffer
-    memcpy(history->lines + pos, buf, len);
-    history->lines[pos + len] = '\n';
-    history->pos += len + 1;
-    history->index = history->pos - 1;
-    history->search_dir = 1;
+    memcpy(hist->lines + pos, buf, len);
+    hist->lines[pos + len] = '\n';
+    hist->pos += len + 1;
+    hist->index = hist->pos - 1;
+    hist->search_dir = 1;
 
     // Sync the history buffer to the file
-    if (mmap_sync(history->lines, history->size) == -1)
+    if (mmap_sync(hist->lines, hist->size) == -1)
         perror("can't sync history buffer");
 }
 
-i64_t history_prev(history_p history, c8_t buf[])
+i64_t hist_prev(hist_p hist, c8_t buf[])
 {
-    u64_t index = history->index;
+    u64_t index = hist->index;
     i64_t len = 0;
 
     if (index == 0)
         return len;
 
     // Skip current line if search direction was next
-    if (history->search_dir == 0)
+    if (hist->search_dir == 0)
     {
         while (index > 0)
         {
-            if (history->lines[--index] == '\n')
+            if (hist->lines[--index] == '\n')
                 break;
         }
 
-        history->index = index;
-        history->search_dir = 1;
+        hist->index = index;
+        hist->search_dir = 1;
     }
 
     // Find the previous line
     while (index > 0)
     {
-        if (history->lines[--index] == '\n')
+        if (hist->lines[--index] == '\n')
         {
-            len = history->index - index - 1;
-            strncpy(buf, history->lines + index + 1, len);
+            len = hist->index - index - 1;
+            strncpy(buf, hist->lines + index + 1, len);
             buf[len] = '\0';
-            history->index = index;
+            hist->index = index;
             return len;
         }
     }
 
-    len = history->index;
-    strncpy(buf, history->lines, len);
+    len = hist->index;
+    strncpy(buf, hist->lines, len);
     buf[len] = '\0';
-    history->index = index;
-    history->search_dir = 1;
+    hist->index = index;
+    hist->search_dir = 1;
 
     return len;
 }
 
-i64_t history_next(history_p history, c8_t buf[])
+i64_t hist_next(hist_p hist, c8_t buf[])
 {
-    u64_t index = history->index;
+    u64_t index = hist->index;
     i64_t len = 0;
 
     // Skip current line if search direction was previous
-    if (history->search_dir == 1)
+    if (hist->search_dir == 1)
     {
-        while (index + 1 < history->pos)
+        while (index + 1 < hist->pos)
         {
-            if (history->lines[++index] == '\n')
+            if (hist->lines[++index] == '\n')
                 break;
         }
 
-        history->index = index;
-        history->search_dir = 0;
+        hist->index = index;
+        hist->search_dir = 0;
     }
 
     // Find the next line
-    while (index + 1 < history->pos)
+    while (index + 1 < hist->pos)
     {
-        if (history->lines[++index] == '\n')
+        if (hist->lines[++index] == '\n')
         {
-            len = index - history->index - 1;
-            strncpy(buf, history->lines + history->index + 1, len);
+            len = index - hist->index - 1;
+            strncpy(buf, hist->lines + hist->index + 1, len);
             buf[len] = '\0';
             break;
         }
     }
 
-    history->index = index;
+    hist->index = index;
 
     if (len == 0)
-        history->search_dir = 1;
+        hist->search_dir = 1;
 
     return len;
 }
 
-i64_t history_save_current(history_p history, c8_t buf[], u64_t len)
+i64_t hist_save_current(hist_p hist, c8_t buf[], u64_t len)
 {
-    if (history->curr_saved == 1)
+    if (hist->curr_saved == 1)
         return 0;
 
-    memcpy(history->curr, buf, len);
-    history->curr[len] = '\0';
-    history->curr_len = len;
-    history->curr_saved = 1;
+    memcpy(hist->curr, buf, len);
+    hist->curr[len] = '\0';
+    hist->curr_len = len;
+    hist->curr_saved = 1;
     return len;
 }
 
-i64_t history_restore_current(history_p history, c8_t buf[])
+i64_t hist_restore_current(hist_p hist, c8_t buf[])
 {
     u64_t l;
-    l = history->curr_len;
+    l = hist->curr_len;
 
-    if (history->curr_saved == 0)
+    if (hist->curr_saved == 0)
         return l;
 
-    memcpy(buf, history->curr, l);
+    memcpy(buf, hist->curr, l);
     buf[l] = '\0';
-    history->curr_saved = 0;
+    hist->curr_saved = 0;
     return l;
 }
 
-nil_t history_reset_current(history_p history)
+nil_t hist_reset_current(hist_p hist)
 {
-    history->curr_saved = 0;
-    history->curr_len = 0;
+    hist->curr_saved = 0;
+    hist->curr_len = 0;
 }
 
 #if defined(_WIN32) || defined(__CYGWIN__)
@@ -341,10 +346,11 @@ nil_t history_reset_current(history_p history)
 term_p term_create()
 {
     term_p term;
-    history_p history;
+    hist_p hist;
+    HANDLE hConsoleInput = GetStdHandle(STD_INPUT_HANDLE);
 
-    history = history_create();
-    if (history == NULL)
+    hist = hist_create();
+    if (hist == NULL)
         panic("can't create history");
 
     term = (term_p)heap_mmap(sizeof(struct term_t));
@@ -353,7 +359,7 @@ term_p term_create()
         return NULL;
 
     // Save the current input mode
-    GetConsoleMode(STDIN_FILENO, &term->oldMode);
+    GetConsoleMode(hConsoleInput, &term->oldMode);
 
     // For windows 10, set the output encoding to UTF-8
     // [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -361,13 +367,15 @@ term_p term_create()
     // Set the new input mode (disable line input, echo input, etc.)
     term->newMode = term->oldMode;
     term->newMode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
-    // term->newMode &= ~ENABLE_LINE_INPUT;
-    SetConsoleMode(STDIN_FILENO, term->newMode);
+    SetConsoleMode(hConsoleInput, term->newMode);
 
     // Initialize the input buffer
+    term->lock = mutex_create();
     term->buf_len = 0;
     term->buf_pos = 0;
-    term->history = history;
+    term->out = NULL_OBJ;
+    prompt_fmt_into(&term->out);
+    term->hist = hist;
     term->fnidx = 0;
     term->varidx = 0;
     term->colidx = 0;
@@ -377,13 +385,28 @@ term_p term_create()
 
 nil_t term_destroy(term_p term)
 {
-    // Restore the terminal attributes
-    SetConsoleMode(STDIN_FILENO, term->oldMode);
+    HANDLE hConsoleInput;
 
-    history_destroy(term->history);
+    // Restore the terminal attributes
+    hConsoleInput = GetStdHandle(STD_INPUT_HANDLE);
+    SetConsoleMode(hConsoleInput, term->oldMode);
+
+    hist_destroy(term->hist);
+
+    mutex_destroy(&term->lock);
+
+    drop_obj(term->out);
 
     // Unmap the terminal structure
     heap_unmap(term, sizeof(struct term_t));
+}
+
+b8_t __getc(c8_t *c)
+{
+    DWORD bytesRead;
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+
+    return ReadFile(hStdin, (LPVOID)c, 1, &bytesRead, NULL);
 }
 
 #else
@@ -391,10 +414,10 @@ nil_t term_destroy(term_p term)
 term_p term_create()
 {
     term_p term;
-    history_p history;
+    hist_p hist;
 
-    history = history_create();
-    if (history == NULL)
+    hist = hist_create();
+    if (hist == NULL)
         panic("can't create history");
 
     term = (term_p)heap_mmap(sizeof(struct term_t));
@@ -411,7 +434,7 @@ term_p term_create()
     // Initialize the input buffer
     term->buf_len = 0;
     term->buf_pos = 0;
-    term->history = history;
+    term->hist = hist;
     term->fnidx = 0;
     term->varidx = 0;
     term->colidx = 0;
@@ -424,10 +447,15 @@ nil_t term_destroy(term_p term)
     // Restore the terminal attributes
     tcsetattr(STDIN_FILENO, TCSANOW, &term->oldattr);
 
-    history_destroy(term->history);
+    hist_destroy(term->hist);
 
     // Unmap the terminal structure
     heap_unmap(term, sizeof(struct term_t));
+}
+
+b8_t __getc(c8_t *c)
+{
+    return read(STDIN_FILENO, c, 1) == 1;
 }
 
 #endif
@@ -567,19 +595,52 @@ i64_t term_redraw_into(term_p term, obj_p *dst)
     return n;
 }
 
+i32_t term_out_diff(obj_p old_out, obj_p new_out)
+{
+    i32_t pos, old_len, new_len, len;
+    str_p old_str, new_str;
+
+    old_len = old_out->len;
+    new_len = new_out->len;
+    old_str = as_string(old_out);
+    new_str = as_string(new_out);
+
+    len = (old_len < new_len) ? old_len : new_len;
+
+    // if (old_len == 0)
+    //     return 0;
+
+    for (pos = 0; pos < len; pos++)
+    {
+        if (old_str[pos] != new_str[pos])
+            return pos;
+    }
+
+    return len;
+}
+
 nil_t term_redraw(term_p term)
 {
-    obj_p fmt = NULL_OBJ;
-    i32_t n;
+    obj_p out = NULL_OBJ;
+    i32_t n, offset, diff;
 
-    line_clear();
-    term_redraw_into(term, &fmt);
-    printf("%s", as_string(fmt));
-    n = term->buf_len - term->buf_pos;
-    if (n > 0)
-        cursor_move_left(n);
+    term_redraw_into(term, &out);
+
+    // Compare old out with new out
+    diff = term_out_diff(term->out, out);
+
+    if (diff < term->out->len - 1)
+    {
+        offset = term->out->len - diff;
+        cursor_move_left(offset);
+        // line_clear();
+    }
+
+    printf("%s", as_string(out) + diff);
     fflush(stdout);
-    drop_obj(fmt);
+
+    drop_obj(term->out);
+    term->out = out;
 }
 
 nil_t term_backspace(term_p term)
@@ -609,8 +670,8 @@ nil_t term_autocomplete(term_p term)
     str_p verb;
 
     pos = term->buf_pos;
-    len = term->history->curr_len;
-    hbuf = term->history->curr;
+    len = term->hist->curr_len;
+    hbuf = term->hist->curr;
     tbuf = term->buf;
 
     // Find start of the word
@@ -665,20 +726,17 @@ nil_t term_reset_idx(term_p term)
     term->colidx = 0;
 }
 
-#if defined(_WIN32) || defined(__CYGWIN__)
-
 obj_p term_read(term_p term)
 {
-    INPUT_RECORD inputRecord;
-    DWORD events;
     i64_t exit_code;
-    u64_t l;
-    c8_t c = term->input;
+    u64_t l, n;
     obj_p res = NULL;
 
-    switch (c)
+    mutex_lock(&term->lock);
+
+    switch (term->nextc)
     {
-    case '\r': // Enter key
+    case KEYCODE_RETURN:
         if (term->buf_len == 0)
         {
             res = NULL_OBJ;
@@ -690,288 +748,132 @@ obj_p term_read(term_p term)
         if (strncmp(term->buf, ":q", 2) == 0)
         {
             exit_code = (term->buf_len > 2) ? i64_from_str(term->buf + 2, term->buf_len - 3) : 0;
-            poll_exit(runtime_get(), exit_code);
+            poll_exit(runtime_get()->poll, exit_code);
         }
         else if (strncmp(term->buf, ":?", 2) == 0)
         {
             printf("\n%s** Commands list:\n%s%s", YELLOW, COMMANDS_LIST, RESET);
             fflush(stdout);
-            res = NULL_OBJ;
         }
         else
+        {
             res = cstring_from_str(term->buf, term->buf_len);
-
-        history_add(term->history, term->buf, term->buf_len);
+            hist_add(term->hist, term->buf, term->buf_len);
+        }
 
     ret:
+        term_reset_idx(term);
+        hist_reset_current(term->hist);
         term->buf_len = 0;
         term->buf_pos = 0;
-        term_reset_idx(term);
-        history_reset_current(term->history);
         printf("\n");
         fflush(stdout);
 
-        return res;
-    case '\b': // Backspace key
-        term_reset_idx(term);
-        history_reset_current(term->history);
-        term_backspace(term);
-        return res;
-    case '\t': // Tab key
-        history_save_current(term->history, term->buf, term->buf_len);
-        term_autocomplete(term);
-        return res;
-    case 0: // Non-printable character, handle arrow keys and other control keys
-        switch (inputRecord.Event.KeyEvent.wVirtualKeyCode)
-        {
-        case VK_UP: // Up arrow key
-            history_save_current(term->history, term->buf, term->buf_len);
-            l = history_prev(term->history, term->buf);
-            if (l > 0)
-            {
-                term->buf_len = l;
-                term->buf_pos = l;
-                term_redraw(term);
-            }
-            break;
-        case VK_DOWN: // Down arrow key
-            l = history_next(term->history, term->buf);
-            if (l > 0)
-            {
-                term->buf_len = l;
-                term->buf_pos = l;
-            }
-            else
-            {
-                l = history_restore_current(term->history, term->buf);
-                term->buf_len = l;
-                term->buf_pos = l;
-            }
+        term_redraw(term);
 
-            term_redraw(term);
-            break;
-        case VK_RIGHT: // Right arrow key
-            if (term->buf_pos < term->buf_len)
-            {
-                term->buf_pos++;
-                cursor_move_right(1);
-                fflush(stdout);
-            }
-            break;
-        case VK_LEFT: // Left arrow key
-            if (term->buf_pos > 0)
-            {
-                term->buf_pos--;
-                cursor_move_left(1);
-                fflush(stdout);
-            }
-            break;
-        case VK_HOME: // Home key
-            if (term->buf_pos > 0)
-            {
-                cursor_move_left(term->buf_pos);
-                term->buf_pos = 0;
-                fflush(stdout);
-            }
-            break;
-        case VK_END: // End key
-            if (term->buf_len > 0)
-            {
-                cursor_move_right(term->buf_len - term->buf_pos);
-                term->buf_pos = term->buf_len;
-                fflush(stdout);
-            }
-            break;
-        default:
-            break;
-        }
-        return res;
+        break;
+    case KEYCODE_BACKSPACE:
+    case KEYCODE_DELETE:
+        term_reset_idx(term);
+        hist_reset_current(term->hist);
+        term_backspace(term);
+        break;
+    case KEYCODE_TAB:
+        hist_save_current(term->hist, term->buf, term->buf_len);
+        term_autocomplete(term);
+        break;
+    case KEYCODE_CTRL_C:
+        poll_exit(runtime_get()->poll, 0);
+        break;
+    // case 0: // Non-printable character, handle arrow keys and other control keys
+    //     switch (inputRecord.Event.KeyEvent.wVirtualKeyCode)
+    //     {
+    //     case VK_UP: // Up arrow key
+    //         hist_save_current(term->hist, term->buf, term->buf_len);
+    //         l = hist_prev(term->hist, term->buf);
+    //         if (l > 0)
+    //         {
+    //             term->buf_len = l;
+    //             term->buf_pos = l;
+    //             term_redraw(term);
+    //         }
+    //         break;
+    //     case VK_DOWN: // Down arrow key
+    //         l = hist_next(term->hist, term->buf);
+    //         if (l > 0)
+    //         {
+    //             term->buf_len = l;
+    //             term->buf_pos = l;
+    //         }
+    //         else
+    //         {
+    //             l = hist_restore_current(term->hist, term->buf);
+    //             term->buf_len = l;
+    //             term->buf_pos = l;
+    //         }
+
+    //         term_redraw(term);
+    //         break;
+    //     case VK_RIGHT: // Right arrow key
+    //         if (term->buf_pos < term->buf_len)
+    //         {
+    //             term->buf_pos++;
+    //             cursor_move_right(1);
+    //             fflush(stdout);
+    //         }
+    //         break;
+    //     case VK_LEFT: // Left arrow key
+    //         if (term->buf_pos > 0)
+    //         {
+    //             term->buf_pos--;
+    //             cursor_move_left(1);
+    //             fflush(stdout);
+    //         }
+    //         break;
+    //     case VK_HOME: // Home key
+    //         if (term->buf_pos > 0)
+    //         {
+    //             cursor_move_left(term->buf_pos);
+    //             term->buf_pos = 0;
+    //             fflush(stdout);
+    //         }
+    //         break;
+    //     case VK_END: // End key
+    //         if (term->buf_len > 0)
+    //         {
+    //             cursor_move_right(term->buf_len - term->buf_pos);
+    //             term->buf_pos = term->buf_len;
+    //             fflush(stdout);
+    //         }
+    //         break;
+    //     default:
+    //         break;
+    //     }
+    //     return res;
     default:
         term_reset_idx(term);
-        history_reset_current(term->history);
-        // Regular character
+        hist_reset_current(term->hist);
+
         if (term->buf_pos < term->buf_len)
         {
             memmove(term->buf + term->buf_pos + 1, term->buf + term->buf_pos, term->buf_len - term->buf_pos);
-            term->buf[term->buf_pos] = c;
+            term->buf[term->buf_pos] = term->nextc;
             term->buf_len++;
             term->buf_pos++;
         }
         else if (term->buf_pos == term->buf_len && term->buf_len < TERM_BUF_SIZE - 1)
         {
-            term->buf[term->buf_len++] = c;
+            term->buf[term->buf_len++] = term->nextc;
             term->buf_pos++;
         }
 
         term->buf[term->buf_len] = '\0';
-
         term_redraw(term);
-        return res;
+
+        break;
     }
+
+    mutex_unlock(&term->lock);
 
     return res;
 }
-
-#else
-
-obj_p term_read(term_p term)
-{
-    c8_t c;
-    u64_t l;
-    i64_t exit_code;
-    obj_p res = NULL;
-
-    if (read(STDIN_FILENO, &c, 1) == 1)
-    {
-        // Process the character
-        switch (c)
-        {
-        case '\n': // New line
-            if (term->buf_len == 0)
-            {
-                res = NULL_OBJ;
-                goto ret;
-            }
-
-            term->buf[term->buf_len] = '\0';
-
-            if (strncmp(term->buf, ":q", 2) == 0)
-            {
-                if (term->buf_len > 2)
-                    exit_code = i64_from_str(term->buf + 2, term->buf_len - 3);
-                else
-                    exit_code = 0;
-
-                poll_exit(runtime_get()->poll, exit_code);
-            }
-            else if (strncmp(term->buf, ":?", 2) == 0)
-            {
-                printf("\n%s** Commands list:\n%s%s", YELLOW, COMMANDS_LIST, RESET);
-                fflush(stdout);
-                res = NULL_OBJ;
-            }
-            else
-                res = cstring_from_str(term->buf, term->buf_len);
-
-            history_add(term->history, term->buf, term->buf_len);
-
-        ret:
-            term->buf_len = 0;
-            term->buf_pos = 0;
-            term_reset_idx(term);
-            history_reset_current(term->history);
-            printf("\n");
-            fflush(stdout);
-
-            return res;
-        case 127:  // Del
-        case '\b': // Backspace
-            term_reset_idx(term);
-            history_reset_current(term->history);
-            term_backspace(term);
-            return res;
-        case '\t': // Tab
-            history_save_current(term->history, term->buf, term->buf_len);
-            term_autocomplete(term);
-            return res;
-        case '\033': // Escape sequence
-            term_reset_idx(term);
-            if (read(STDIN_FILENO, &c, 1) == 1 && c == '[')
-            {
-                if (read(STDIN_FILENO, &c, 1) == 1)
-                {
-                    switch (c)
-                    {
-                    case 'A': // Up arrow
-                        history_save_current(term->history, term->buf, term->buf_len);
-                        l = history_prev(term->history, term->buf);
-                        if (l > 0)
-                        {
-                            term->buf_len = l;
-                            term->buf_pos = l;
-                            term_redraw(term);
-                        }
-                        break;
-                    case 'B': // Down arrow
-                        l = history_next(term->history, term->buf);
-                        if (l > 0)
-                        {
-                            term->buf_len = l;
-                            term->buf_pos = l;
-                        }
-                        else
-                        {
-                            l = history_restore_current(term->history, term->buf);
-                            term->buf_len = l;
-                            term->buf_pos = l;
-                        }
-
-                        term_redraw(term);
-                        break;
-                    case 'C': // Right arrow
-                        if (term->buf_pos < term->buf_len)
-                        {
-                            term->buf_pos++;
-                            cursor_move_right(1);
-                            fflush(stdout);
-                        }
-                        break;
-                    case 'D': // Left arrow
-                        if (term->buf_pos > 0)
-                        {
-                            term->buf_pos--;
-                            cursor_move_left(1);
-                            fflush(stdout);
-                        }
-                        break;
-                    case 'H': // Home
-                        if (term->buf_pos > 0)
-                        {
-                            cursor_move_left(term->buf_pos);
-                            term->buf_pos = 0;
-                            fflush(stdout);
-                        }
-                        break;
-                    case 'F': // End
-                        if (term->buf_len > 0)
-                        {
-                            cursor_move_right(term->buf_len - term->buf_pos);
-                            term->buf_pos = term->buf_len;
-                            fflush(stdout);
-                        }
-                        break;
-                    default:
-                        break;
-                    }
-                }
-            }
-
-            return res;
-        default:
-            term_reset_idx(term);
-            history_reset_current(term->history);
-
-            // regular character
-            if (term->buf_pos < term->buf_len)
-            {
-                memmove(term->buf + term->buf_pos + 1, term->buf + term->buf_pos, term->buf_len - term->buf_pos);
-                term->buf[term->buf_pos] = c;
-                term->buf_len++;
-                term->buf_pos++;
-            }
-            else if (term->buf_pos == term->buf_len && term->buf_len < TERM_BUF_SIZE - 1)
-            {
-                term->buf[term->buf_len++] = c;
-                term->buf_pos++;
-            }
-
-            term_redraw(term);
-
-            return res;
-        }
-    }
-
-    return res;
-}
-
-#endif

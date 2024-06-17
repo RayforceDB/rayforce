@@ -61,7 +61,7 @@ typedef struct listener_t
 typedef struct stdin_thread_ctx_t
 {
     HANDLE hCompletionPort;
-    c8_t *buf;
+    term_p term;
 } *stdin_thread_ctx_p;
 
 listener_p __LISTENER = NULL;
@@ -102,23 +102,27 @@ stdin_thread_ctx_p __STDIN_THREAD_CTX = NULL;
 DWORD WINAPI StdinThread(LPVOID lpParam)
 {
     stdin_thread_ctx_p ctx = (stdin_thread_ctx_p)lpParam;
-    c8_t *buf = ctx->buf;
+    term_p term = ctx->term;
     HANDLE hCompletionPort = ctx->hCompletionPort;
-    DWORD bytesRead;
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD bytesRead;
+    c8_t c;
 
-    while (B8_TRUE)
+    for (;;)
     {
-        // Blocking read from stdin
-        if (ReadFile(hStdin, buf, 1, &bytesRead, NULL))
-        {
-            // Check for CTRL+C (ASCII code 3)
-            if (buf[0] == 0x03)
-                PostQueuedCompletionStatus(hCompletionPort, 0, STDIN_WAKER_ID, NULL);
-            else
-                PostQueuedCompletionStatus(hCompletionPort, 1, STDIN_WAKER_ID, NULL);
-        }
+        if (!ReadFile(hStdin, (LPVOID)&c, 1, &bytesRead, NULL))
+            break;
+
+        mutex_lock(&term->lock);
+
+        term->nextc = c;
+
+        mutex_unlock(&term->lock);
+
+        PostQueuedCompletionStatus(hCompletionPort, bytesRead, STDIN_WAKER_ID, NULL);
     }
+
+    PostQueuedCompletionStatus(hCompletionPort, 0, STDIN_WAKER_ID, NULL);
 
     return 0;
 }
@@ -231,7 +235,7 @@ poll_p poll_init(i64_t port)
 
     __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
     __STDIN_THREAD_CTX->hCompletionPort = (HANDLE)poll_fd;
-    __STDIN_THREAD_CTX->buf = &poll->term->input;
+    __STDIN_THREAD_CTX->term = poll->term;
 
     // Create a thread to read from stdin
     CreateThread(NULL, 0, StdinThread, (LPVOID)__STDIN_THREAD_CTX, 0, NULL);
@@ -585,6 +589,7 @@ i64_t poll_run(poll_p poll)
                         poll->code = 0;
                         break;
                     }
+
                     str = term_read(poll->term);
                     if (str != NULL)
                     {

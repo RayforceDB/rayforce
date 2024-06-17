@@ -27,13 +27,37 @@
 #include "rayforce.h"
 #if defined(_WIN32) || defined(__CYGWIN__)
 #include <windows.h>
+#include "pool.h"
+#define KEYCODE_RETURN '\r'
+#define KEYCODE_BACKSPACE '\b'
+#define KEYCODE_DELETE 127
+#define KEYCODE_TAB '\t'
+#define KEYCODE_UP 0x48
+#define KEYCODE_DOWN 0x50
+#define KEYCODE_LEFT 0x4b
+#define KEYCODE_RIGHT 0x4d
+#define KEYCODE_HOME 0x47
+#define KEYCODE_END 0x4f
+#define KEYCODE_ESC 0x1b
+#define KEYCODE_CTRL_C 0x03
 #else
 #include <termios.h>
+#define KEYCODE_RETURN '\n'
+#define KEYCODE_BACKSPACE '\b'
+#define KEYCODE_DELETE 127
+#define KEYCODE_UP 0x48
+#define KEYCODE_DOWN 0x50
+#define KEYCODE_LEFT 0x4b
+#define KEYCODE_RIGHT 0x4d
+#define KEYCODE_HOME 0x47
+#define KEYCODE_END 0x4f
+#define KEYCODE_ESC 0x1b
+#define KEYCODE_CTRL_C 0x03
 #endif
 
 #define TERM_BUF_SIZE 1024
 
-typedef struct history_t
+typedef struct hist_t
 {
     i64_t fd;
     str_p lines;
@@ -44,34 +68,36 @@ typedef struct history_t
     i64_t curr_saved;
     u64_t curr_len;
     c8_t curr[TERM_BUF_SIZE];
-} *history_p;
+} *hist_p;
 
 typedef struct term_t
 {
 #if defined(_WIN32) || defined(__CYGWIN__)
     DWORD oldMode; // Store the old console mode
     DWORD newMode; // Store the new console mode
+    mutex_t lock;
 #else
     struct termios oldattr; // Store the old terminal attributes
     struct termios newattr; // Store the new terminal attributes
 #endif
+    c8_t nextc; // Next input character
     i32_t buf_len;
     i32_t buf_pos;
-    c8_t input;
     c8_t buf[TERM_BUF_SIZE];
+    obj_p out;
     u64_t fnidx;
     u64_t varidx;
     u64_t colidx;
-    history_p history;
+    hist_p hist;
 } *term_p;
 
-history_p history_create();
-nil_t history_destroy(history_p history);
-nil_t history_add(history_p history, c8_t buf[], u64_t len);
-i64_t history_prev(history_p history, c8_t buf[]);
-i64_t history_next(history_p history, c8_t buf[]);
-i64_t history_save_current(history_p history, c8_t buf[], u64_t len);
-i64_t history_restore_current(history_p history, c8_t buf[]);
+hist_p hist_create();
+nil_t hist_destroy(hist_p history);
+nil_t hist_add(hist_p hist, c8_t buf[], u64_t len);
+i64_t hist_prev(hist_p hist, c8_t buf[]);
+i64_t hist_next(hist_p hist, c8_t buf[]);
+i64_t hist_save_current(hist_p hist, c8_t buf[], u64_t len);
+i64_t hist_restore_current(hist_p hist, c8_t buf[]);
 
 term_p term_create();
 nil_t term_prompt(term_p term);
