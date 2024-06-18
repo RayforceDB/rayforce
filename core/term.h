@@ -63,8 +63,12 @@ typedef struct hist_t
 typedef struct term_t
 {
 #if defined(_WIN32) || defined(__CYGWIN__)
-    DWORD oldMode; // Store the old console mode
-    DWORD newMode; // Store the new console mode
+    HANDLE h_stdin;
+    HANDLE h_stdout;
+    DWORD old_stdin_mode;
+    DWORD new_stdin_mode;
+    DWORD old_stdout_mode;
+    DWORD new_stdout_mode;
     mutex_t lock;
 #else
     struct termios oldattr; // Store the old terminal attributes

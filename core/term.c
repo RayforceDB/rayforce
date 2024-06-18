@@ -363,11 +363,10 @@ term_p term_create()
 {
     term_p term;
     hist_p hist;
-    HANDLE hin, hout;
-    DWORD mode;
+    HANDLE h_stdin, h_stdout;
 
-    hin = GetStdHandle(STD_INPUT_HANDLE);
-    hout = GetStdHandle(STD_OUTPUT_HANDLE);
+    h_stdin = GetStdHandle(STD_INPUT_HANDLE);
+    h_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
 
     hist = hist_create();
     if (hist == NULL)
@@ -386,19 +385,22 @@ term_p term_create()
         use_unicode(B8_FALSE); // Disable unicode support
 
     // Save the current input mode
-    GetConsoleMode(hin, &term->oldMode);
+    GetConsoleMode(h_stdin, &term->old_stdin_mode);
 
     // Set the new input mode (disable line input, echo input, etc.)
-    term->newMode = term->oldMode;
-    term->newMode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
-    SetConsoleMode(hin, term->newMode);
+    term->new_stdin_mode = term->old_stdin_mode;
+    term->new_stdin_mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+    term->new_stdin_mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+    SetConsoleMode(h_stdin, term->new_stdin_mode);
 
     // Enable ANSI escape codes for the console
-    GetConsoleMode(hout, &mode);
-    mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    SetConsoleMode(hout, mode);
+    GetConsoleMode(h_stdout, &term->old_stdout_mode);
+    term->new_stdout_mode = term->old_stdout_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    SetConsoleMode(h_stdout, term->new_stdout_mode);
 
     // Initialize the input buffer
+    term->h_stdin = h_stdin;
+    term->h_stdout = h_stdout;
     term->lock = mutex_create();
     term->input_len = 0;
     memset(term->input, 0, 8);
@@ -414,15 +416,12 @@ term_p term_create()
 
 nil_t term_destroy(term_p term)
 {
-    HANDLE hConsoleInput;
-
     // Restore the terminal attributes
-    hConsoleInput = GetStdHandle(STD_INPUT_HANDLE);
-    SetConsoleMode(hConsoleInput, term->oldMode);
-
-    hist_destroy(term->hist);
+    SetConsoleMode(term->h_stdin, term->old_stdin_mode);
+    SetConsoleMode(term->h_stdout, term->old_stdout_mode);
 
     mutex_destroy(&term->lock);
+    hist_destroy(term->hist);
 
     // Unmap the terminal structure
     heap_unmap(term, sizeof(struct term_t));
@@ -430,17 +429,22 @@ nil_t term_destroy(term_p term)
 
 i64_t term_getc(term_p term)
 {
-    i64_t sz;
+    c8_t buf[8];
+    DWORD bytesRead;
 
-    if (term->input[0] != KEYCODE_ESCAPE)
+    if (!ReadFile(term->h_stdin, (LPVOID)buf, 1, &bytesRead, NULL))
+        return 0;
+
+    mutex_lock(&term->lock);
+
+    if (term->input[0] != KEYCODE_ESCAPE || term->input_len == 3)
         term->input_len = 0;
 
-    sz = (i64_t)read(STDIN_FILENO, term->input + term->input_len++, 1);
+    term->input[term->input_len++] = buf[0];
 
-    if (sz == -1)
-        return -1;
+    mutex_unlock(&term->lock);
 
-    return sz;
+    return (i64_t)bytesRead;
 }
 
 #else

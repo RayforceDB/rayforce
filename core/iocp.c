@@ -60,7 +60,7 @@ typedef struct listener_t
 
 typedef struct stdin_thread_ctx_t
 {
-    HANDLE hCompletionPort;
+    HANDLE h_cp;
     term_p term;
 } *stdin_thread_ctx_p;
 
@@ -99,30 +99,23 @@ stdin_thread_ctx_p __STDIN_THREAD_CTX = NULL;
         }                                                                                             \
     }
 
-DWORD WINAPI StdinThread(LPVOID lpParam)
+DWORD WINAPI StdinThread(LPVOID prm)
 {
-    stdin_thread_ctx_p ctx = (stdin_thread_ctx_p)lpParam;
+    stdin_thread_ctx_p ctx = (stdin_thread_ctx_p)prm;
     term_p term = ctx->term;
-    HANDLE hCompletionPort = ctx->hCompletionPort;
-    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD bytesRead;
-    c8_t c;
+    HANDLE h_cp = ctx->h_cp;
+    DWORD bytes;
 
     for (;;)
     {
-        if (!ReadFile(hStdin, (LPVOID)&c, 1, &bytesRead, NULL))
+        bytes = (DWORD)term_getc(term);
+        if (bytes == 0)
             break;
 
-        mutex_lock(&term->lock);
-
-        term->nextc = c;
-
-        mutex_unlock(&term->lock);
-
-        PostQueuedCompletionStatus(hCompletionPort, bytesRead, STDIN_WAKER_ID, NULL);
+        PostQueuedCompletionStatus(h_cp, bytes, STDIN_WAKER_ID, NULL);
     }
 
-    PostQueuedCompletionStatus(hCompletionPort, 0, STDIN_WAKER_ID, NULL);
+    PostQueuedCompletionStatus(h_cp, 0, STDIN_WAKER_ID, NULL);
 
     return 0;
 }
@@ -234,7 +227,7 @@ poll_p poll_init(i64_t port)
     poll->timers = timers_create(16);
 
     __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
-    __STDIN_THREAD_CTX->hCompletionPort = (HANDLE)poll_fd;
+    __STDIN_THREAD_CTX->h_cp = (HANDLE)poll_fd;
     __STDIN_THREAD_CTX->term = poll->term;
 
     // Create a thread to read from stdin
