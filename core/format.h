@@ -45,6 +45,13 @@
 #define SALAD "\033[1;38;5;118m"
 #define DARK_CYAN "\033[1;38;5;30m"
 #define BOLD "\033[1m"
+#define BACK_RED "\033[41m"
+#define BACK_GREEN "\033[42m"
+#define BACK_YELLOW "\033[43m"
+#define BACK_BLUE "\033[44m"
+#define BACK_MAGENTA "\033[45m"
+#define BACK_CYAN "\033[46m"
+#define BACK_WHITE "\033[47m"
 #define RESET "\033[0m"
 
 i64_t str_vfmt_into(obj_p *dst, i64_t limit, lit_p fmt, va_list vargs);

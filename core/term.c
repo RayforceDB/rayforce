@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include "term.h"
+#include "timer.h"
 #include "heap.h"
 #include "string.h"
 #include "error.h"
@@ -406,6 +407,7 @@ term_p term_create()
     memset(term->input, 0, 8);
     term->buf_len = 0;
     term->buf_pos = 0;
+    term->parens_len = 0;
     term->hist = hist;
     term->fnidx = 0;
     term->varidx = 0;
@@ -466,8 +468,11 @@ term_p term_create()
     // Set the terminal to non-canonical mode
     tcgetattr(STDIN_FILENO, &term->oldattr);
     term->newattr = term->oldattr;
-    term->newattr.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &term->newattr);
+    term->newattr.c_lflag &= ~(ICANON | ECHO | ISIG);
+    // Deny long pressing keys as repeated input
+    term->newattr.c_cc[VMIN] = 1;
+    term->newattr.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &term->newattr);
 
     // Initialize the input buffer
     term->input_len = 0;
@@ -485,7 +490,7 @@ term_p term_create()
 nil_t term_destroy(term_p term)
 {
     // Restore the terminal attributes
-    tcsetattr(STDIN_FILENO, TCSANOW, &term->oldattr);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &term->oldattr);
 
     hist_destroy(term->hist);
 
@@ -535,12 +540,12 @@ i64_t term_redraw_into(term_p term, obj_p *dst)
         c = 0;
         switch (term->buf[i])
         {
-        case '(':
-        case ')':
-        case '[':
-        case ']':
-        case '{':
-        case '}':
+        case KEYCODE_LPAREN:
+        case KEYCODE_LCURLY:
+        case KEYCODE_LBRACKET:
+        case KEYCODE_RPAREN:
+        case KEYCODE_RCURLY:
+        case KEYCODE_RBRACKET:
             n += str_fmt_into(dst, -1, "%s%c%s", GRAY, term->buf[i], RESET);
             break;
         case ':':
@@ -689,11 +694,11 @@ nil_t term_handle_backspace(term_p term)
     term_redraw(term);
 }
 
-nil_t term_handle_tab(term_p term)
+b8_t term_autocomplete_word(term_p term)
 {
     u64_t l, n, len, pos, start, end;
     c8_t *tbuf, *hbuf;
-    str_p verb;
+    str_p word;
 
     pos = term->buf_pos;
     len = term->hist->curr_len;
@@ -716,33 +721,145 @@ nil_t term_handle_tab(term_p term)
 
     n = end - start;
     if (n == 0)
-        return;
+        return B8_FALSE;
 
-    verb = env_get_internal_function_lit(tbuf + start, n, &term->fnidx, B8_FALSE);
-    if (verb != NULL)
+    word = env_get_internal_function_lit(tbuf + start, n, &term->fnidx, B8_FALSE);
+    if (word != NULL)
         goto redraw;
 
-    verb = env_get_internal_kw_lit(tbuf + start, n, B8_FALSE);
-    if (verb != NULL)
+    word = env_get_internal_kw_lit(tbuf + start, n, B8_FALSE);
+    if (word != NULL)
         goto redraw;
 
-    verb = env_get_internal_lit_lit(tbuf + start, n, B8_FALSE);
-    if (verb != NULL)
+    word = env_get_internal_lit_lit(tbuf + start, n, B8_FALSE);
+    if (word != NULL)
         goto redraw;
 
-    verb = env_get_global_lit_lit(tbuf + start, n, &term->varidx, &term->colidx);
-    if (verb != NULL)
+    word = env_get_global_lit_lit(tbuf + start, n, &term->varidx, &term->colidx);
+    if (word != NULL)
         goto redraw;
 
-    return;
+    return B8_FALSE;
 
 redraw:
-    l = strlen(verb);
-    strncpy(tbuf + start, verb, l);
+    l = strlen(word);
+
+    // if the word is the same as the current one, then skip it
+    if (l == n && strncmp(word, hbuf + start, n) == 0)
+        return B8_FALSE;
+
+    strncpy(tbuf + start, word, l);
     strncpy(tbuf + start + l, hbuf + end, len - end);
     term->buf_len = start + l + len - end;
     term->buf_pos = start + l;
     term_redraw(term);
+
+    return B8_TRUE;
+}
+
+nil_t term_highlight_pos(term_p term, u64_t pos)
+{
+    u64_t n;
+
+    n = term->buf_pos - pos;
+
+    cursor_hide();
+    cursor_move_left(n);
+    printf("%s%c%s", BACK_CYAN, term->buf[pos], RESET);
+    fflush(stdout);
+    timer_sleep(80);
+    cursor_show();
+}
+
+c8_t opposite_paren(c8_t c)
+{
+    switch (c)
+    {
+    case KEYCODE_LPAREN:
+        return KEYCODE_RPAREN;
+    case KEYCODE_LCURLY:
+        return KEYCODE_RCURLY;
+    case KEYCODE_LBRACKET:
+        return KEYCODE_RBRACKET;
+    case KEYCODE_RPAREN:
+        return KEYCODE_LPAREN;
+    case KEYCODE_RCURLY:
+        return KEYCODE_LCURLY;
+    case KEYCODE_RBRACKET:
+        return KEYCODE_LBRACKET;
+    default:
+        return c;
+    }
+}
+
+paren_t term_find_open_paren(term_p term)
+{
+    i32_t i, p;
+    paren_t parens[TERM_BUF_SIZE];
+
+    if (term->buf_pos == 0 || term->buf_pos < term->buf_len)
+        return (paren_t){-1, 0};
+
+    p = 0;
+
+    // Find the last open parenthesis
+    for (i = term->buf_pos - 1; i >= 0; i--)
+    {
+        switch (term->buf[i])
+        {
+        case KEYCODE_RPAREN:
+        case KEYCODE_RCURLY:
+        case KEYCODE_RBRACKET:
+            parens[p].pos = i;
+            parens[p].type = term->buf[i];
+            p++;
+            break;
+        case KEYCODE_LPAREN:
+        case KEYCODE_LCURLY:
+        case KEYCODE_LBRACKET:
+            if (p == 0)
+                return (paren_t){i, term->buf[i]};
+
+            // if the current parenthesis is the opposite of the last one, then pop it
+            if (opposite_paren(parens[p - 1].type) == term->buf[i])
+                p--;
+            else
+                return (paren_t){-1, 0}; // mismatched parenthesis
+        default:
+            break;
+        }
+    }
+
+    return (paren_t){-1, 0};
+}
+
+b8_t term_autocomplete_paren(term_p term)
+{
+    paren_t open_paren;
+
+    open_paren = term_find_open_paren(term);
+
+    if (open_paren.pos == -1)
+        return B8_FALSE;
+
+    term_highlight_pos(term, open_paren.pos);
+
+    term->buf[term->buf_pos] = opposite_paren(open_paren.type);
+    term->buf_pos++;
+    term->buf_len++;
+
+    term_redraw(term);
+
+    return B8_TRUE;
+}
+
+nil_t term_handle_tab(term_p term)
+{
+    if (term_autocomplete_word(term))
+        return;
+
+    if (term_autocomplete_paren(term))
+        return;
 }
 
 nil_t term_reset_idx(term_p term)

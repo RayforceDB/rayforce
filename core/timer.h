@@ -49,6 +49,7 @@ timers_p timers_create(u64_t capacity);
 nil_t timers_destroy(timers_p timers);
 i64_t timer_next_timeout(timers_p timers);
 
+nil_t timer_sleep(u64_t ms);
 obj_p ray_timer(obj_p *x, u64_t n);
 obj_p ray_timeit(obj_p x);
 

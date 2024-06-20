@@ -44,6 +44,12 @@
 #define KEYCODE_END 'F'
 #define KEYCODE_ESCAPE 0x1b
 #define KEYCODE_CTRL_C 0x03
+#define KEYCODE_LPAREN '('
+#define KEYCODE_RPAREN ')'
+#define KEYCODE_LCURLY '{'
+#define KEYCODE_RCURLY '}'
+#define KEYCODE_LBRACKET '['
+#define KEYCODE_RBRACKET ']'
 
 #define TERM_BUF_SIZE 1024
 
@@ -60,6 +66,12 @@ typedef struct hist_t
     c8_t curr[TERM_BUF_SIZE];
 } *hist_p;
 
+typedef struct
+{
+    i32_t pos;
+    c8_t type;
+} paren_t;
+
 typedef struct term_t
 {
 #if defined(_WIN32) || defined(__CYGWIN__)
@@ -74,7 +86,7 @@ typedef struct term_t
     struct termios oldattr; // Store the old terminal attributes
     struct termios newattr; // Store the new terminal attributes
 #endif
-    u64_t input_len;
+    i32_t input_len;
     c8_t input[8];
     i32_t buf_len;
     i32_t buf_pos;

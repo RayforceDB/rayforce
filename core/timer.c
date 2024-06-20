@@ -31,6 +31,14 @@
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 
+nil_t timer_sleep(u64_t ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    nanosleep(&ts, NULL);
+}
+
 u64_t get_time_millis(nil_t)
 {
     FILETIME ft;
@@ -62,6 +70,14 @@ obj_p ray_timeit(obj_p x)
 }
 
 #else
+
+nil_t timer_sleep(u64_t ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    nanosleep(&ts, NULL);
+}
 
 u64_t get_time_millis(nil_t)
 {
