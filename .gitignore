@@ -8,6 +8,7 @@ rayforce.test
 rayforce.S
 rayforce.js
 rayforce.py
+rayforce.data
 rayforce_wrap.*
 *.dat
 gmon.out

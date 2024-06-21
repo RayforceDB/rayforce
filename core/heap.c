@@ -30,7 +30,9 @@
 #include "util.h"
 #include "string.h"
 
+#ifndef __EMSCRIPTEN__
 CASSERT(sizeof(struct block_t) == (2 * sizeof(struct obj_t)), heap_h);
+#endif
 
 __thread heap_p __HEAP = NULL;
 

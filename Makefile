@@ -12,19 +12,16 @@ $(info OS="$(OS)")
 ifeq ($(OS),Windows_NT)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG
 LIBS = -lm -lws2_32 -lkernel32
-LFLAGS =
 endif
 
 ifeq ($(OS),linux)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
 LIBS = -lm -ldl -lpthread
-LFLAGS = -rdynamic
 endif
 
 ifeq ($(OS),darwin)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
 LIBS = -lm -ldl -lpthread
-LFLAGS = -rdynamic
 endif
 
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -Ofast -fsigned-char -march=native -fassociative-math -ftree-vectorize\
@@ -111,6 +108,7 @@ wasm: $(APP_OBJECTS) lib
 	-L. -l$(TARGET) $(LIBS)
 
 python: CFLAGS = $(RELEASE_CFLAGS)
+python: LFLAGS = -rdynamic
 python: $(CORE_OBJECTS)
 	swig -python $(TARGET).i
 	$(CC) $(CFLAGS) -shared -fPIC $(CORE_OBJECTS) $(TARGET)_wrap.c -o _$(TARGET).so -I/usr/include/$(PYTHON) -l$(PYTHON) $(LIBS) $(LFLAGS)
