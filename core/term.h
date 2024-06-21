@@ -48,6 +48,8 @@
 #define KEYCODE_RPAREN ')'
 #define KEYCODE_LCURLY '{'
 #define KEYCODE_RCURLY '}'
+#define KEYCODE_SQUOTE '\''
+#define KEYCODE_DQUOTE '"'
 #define KEYCODE_LBRACKET '['
 #define KEYCODE_RBRACKET ']'
 

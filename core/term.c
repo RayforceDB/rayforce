@@ -791,41 +791,61 @@ c8_t opposite_paren(c8_t c)
 
 paren_t term_find_open_paren(term_p term)
 {
-    i32_t i, p;
+    i32_t i, p, squote, dquote;
     paren_t parens[TERM_BUF_SIZE];
 
-    if (term->buf_pos == 0 || term->buf_pos < term->buf_len)
-        return (paren_t){-1, 0};
-
     p = 0;
+    squote = -1;
+    dquote = -1;
 
     // Find the last open parenthesis
-    for (i = term->buf_pos - 1; i >= 0; i--)
+    for (i = 0; i < term->buf_pos; i++)
     {
         switch (term->buf[i])
         {
+
         case KEYCODE_RPAREN:
         case KEYCODE_RCURLY:
         case KEYCODE_RBRACKET:
+            // if the current parenthesis is the opposite of the last one, then pop it
+            if (opposite_paren(parens[p - 1].type) == term->buf[i])
+            {
+                p--;
+                break;
+            }
+            // fallthrough
+        case KEYCODE_LPAREN:
+        case KEYCODE_LCURLY:
+        case KEYCODE_LBRACKET:
             parens[p].pos = i;
             parens[p].type = term->buf[i];
             p++;
             break;
-        case KEYCODE_LPAREN:
-        case KEYCODE_LCURLY:
-        case KEYCODE_LBRACKET:
-            if (p == 0)
-                return (paren_t){i, term->buf[i]};
-
-            // if the current parenthesis is the opposite of the last one, then pop it
-            if (opposite_paren(parens[p - 1].type) == term->buf[i])
-                p--;
+        case KEYCODE_SQUOTE:
+            if (squote == -1)
+                squote = i;
             else
-                return (paren_t){-1, 0}; // mismatched parenthesis
+                squote = -1;
+            break;
+        case KEYCODE_DQUOTE:
+            if (dquote == -1)
+                dquote = i;
+            else
+                dquote = -1;
+            break;
         default:
             break;
         }
     }
+
+    if (squote != -1)
+        return (paren_t){squote, KEYCODE_SQUOTE};
+
+    if (dquote != -1)
+        return (paren_t){dquote, KEYCODE_DQUOTE};
+
+    if (p > 0)
+        return parens[p - 1];
 
     return (paren_t){-1, 0};
 }
@@ -840,6 +860,9 @@ b8_t term_autocomplete_paren(term_p term)
         return B8_FALSE;
 
     term_highlight_pos(term, open_paren.pos);
+
+    if (term->buf_pos < term->buf_len)
+        memmove(term->buf + term->buf_pos + 1, term->buf + term->buf_pos, term->buf_len - term->buf_pos);
 
     term->buf[term->buf_pos] = opposite_paren(open_paren.type);
     term->buf_pos++;
