@@ -38,7 +38,7 @@
 #include "eval.h"
 
 #define HIST_FILE_PATH ".rayhist.dat"
-#define HIST_SIZE 4096
+#define HIST_SIZE 4096 * 1024 // 4MB
 #define COMMANDS_LIST "\
   :?  - Displays help.\n\
   :g  - Use rich graphic formatting: [0|1].\n\
