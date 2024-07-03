@@ -325,10 +325,8 @@ nil_t pool_add_task(pool_p pool, raw_p fn, u64_t argc, ...)
 
     va_start(args, argc);
 
-    data.argv[0] = va_arg(args, raw_p);
-
     for (i = 0; i < argc; i++)
-        data.argv[i + 1] = va_arg(args, raw_p);
+        data.argv[i] = va_arg(args, raw_p);
 
     va_end(args);
 
