@@ -39,17 +39,18 @@
 obj_p aggr_map(raw_p aggr, obj_p val, obj_p index)
 {
     pool_p pool = runtime_get()->pool;
-    u64_t i, l, n, chunk, buckets;
+    u64_t i, l, n, group_count, chunk, buckets;
     obj_p res, parts;
     raw_p argv[6];
 
     buckets = (u64_t)as_list(index)[0]->i64;
     n = pool_executors_count(pool);
+    group_count = index_group_count(index);
 
-    if (n == 1)
+    if (n == 1 || group_count < 2)
     {
         res = vector(val->type, buckets);
-        argv[0] = (raw_p)val->len;
+        argv[0] = (raw_p)group_count;
         argv[1] = (raw_p)0;
         argv[2] = val;
         argv[3] = index;

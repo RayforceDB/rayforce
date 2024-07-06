@@ -120,6 +120,9 @@ index_scope_t index_scope(i64_t values[], i64_t indices[], u64_t len)
     pool_p pool = pool_get();
     obj_p v;
 
+    if (len == 0)
+        return (index_scope_t){NULL_I64, NULL_I64, 0};
+
     chunks = pool_executors_count(pool);
 
     if (chunks == 1)
