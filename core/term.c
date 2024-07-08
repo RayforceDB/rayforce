@@ -197,8 +197,10 @@ nil_t hist_add(hist_p hist, c8_t buf[], u64_t len)
     u64_t pos, size, index, last_len;
 
     pos = hist->pos;
+    hist->index = pos - 1;
     size = hist->size;
     index = hist->index;
+    last_len = 0;
 
     // Find the previous line
     while (index > 0)
@@ -217,7 +219,7 @@ nil_t hist_add(hist_p hist, c8_t buf[], u64_t len)
     if (index == 0)
     {
         // Check if the line is already in the history buffer
-        if (hist->index == len && strncmp(hist->lines, buf, len) == 0)
+        if (last_len == len && strncmp(hist->lines, buf, len) == 0)
             return;
     }
 

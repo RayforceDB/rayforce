@@ -1020,15 +1020,16 @@ obj_p ray_where(obj_p x)
     switch (x->type)
     {
     case TYPE_B8:
-        ones = ops_count_ones(x);
-        res = vector_i64(ones);
+        l = x->len;
+        res = vector_i64(l);
         cur = as_i64(res);
         bcur = as_b8(x);
-        l = x->len;
 
         for (i = 0, j = 0; i < l; i++)
             if (bcur[i])
                 cur[j++] = i;
+
+        resize_obj(&res, j);
 
         return res;
     case TYPE_NULL:
