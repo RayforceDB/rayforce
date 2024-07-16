@@ -24,19 +24,6 @@
 #ifndef MMAP_H
 #define MMAP_H
 
-#ifndef __USE_MISC
-#define __USE_MISC
-#define _DEFAULT_SOURCE
-#endif
-
-#ifdef OS_WASM
-#ifndef PAGE_SIZE
-#define PAGE_SIZE 65536
-#endif
-#else
-#define PAGE_SIZE 4096
-#endif
-
 #include "rayforce.h"
 
 raw_p mmap_stack(u64_t size);

@@ -42,6 +42,11 @@
 #define OS_LINUX
 #define OS_UNIX
 #define _POSIX_C_SOURCE 200809L // Define POSIX source version for CLOCK_REALTIME
+#ifndef __USE_MISC
+#define __USE_MISC
+#define _DEFAULT_SOURCE
+#endif
+#define PAGE_SIZE 4096
 #include <stdint.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
@@ -55,6 +60,11 @@
 #define OS_MACOS
 #define OS_UNIX
 #define _DARWIN_C_SOURCE
+#ifndef __USE_MISC
+#define __USE_MISC
+#define _DEFAULT_SOURCE
+#endif
+#define PAGE_SIZE 4096
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #include <sys/mman.h>
@@ -68,6 +78,7 @@
 #include <pthread.h>
 #elif defined(__EMSCRIPTEN__)
 #define OS_WASM
+#define PAGE_SIZE 65536
 #include <unistd.h>
 #include <emscripten.h>
 #else

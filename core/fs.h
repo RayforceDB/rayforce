@@ -26,8 +26,7 @@
 
 // File attrs
 #if defined(OS_WINDOWS)
-#include <winsock2.h>
-#include <windows.h>
+
 #define ATTR_RDONLY GENERIC_READ
 #define ATTR_WRONLY GENERIC_WRITE
 #define ATTR_RDWR (ATTR_RDONLY | ATTR_WRONLY)
