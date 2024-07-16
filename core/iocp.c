@@ -21,17 +21,6 @@
  *   SOFTWARE.
  */
 
-#if defined(_WIN32) || defined(__CYGWIN__)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <MSWSock.h>
-#include <windows.h>
-#else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

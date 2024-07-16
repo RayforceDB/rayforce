@@ -26,8 +26,8 @@ endif
 
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -Ofast -fsigned-char -march=native -fassociative-math -ftree-vectorize\
  -fno-math-errno -funsafe-math-optimizations -ffinite-math-only -funroll-loops -fno-unwind-tables -m64
-CORE_HEADERS = core/poll.h core/runtime.h core/sys.h core/fs.h core/mmap.h core/serde.h core/timestamp.h\
- core/guid.h core/sort.h core/ops.h core/util.h core/string.h core/hash.h core/symbols.h\
+CORE_HEADERS = core/poll.h core/runtime.h core/sys.h core/fs.h core/mmap.h core/serde.h\
+ core/timestamp.h core/guid.h core/sort.h core/ops.h core/util.h core/string.h core/hash.h core/symbols.h\
  core/format.h core/rayforce.h core/heap.h core/parse.h core/eval.h core/nfo.h core/time.h\
  core/env.h core/lambda.h core/unary.h core/binary.h core/vary.h core/sock.h core/error.h\
  core/math.h core/rel.h core/items.h core/logic.h core/compose.h core/order.h core/io.h\
@@ -61,11 +61,11 @@ tests: CC = gcc
 # tests: CFLAGS = $(DEBUG_CFLAGS)
 tests: CFLAGS = $(RELEASE_CFLAGS) -DSTOP_ON_FAIL=$(STOP_ON_FAIL) -DDEBUG
 tests: $(TESTS_OBJECTS) lib
-	$(CC) $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LFLAGS)
+	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LFLAGS)
 	./$(TARGET).test
 
 %.o: %.c
-	$(CC) -c $^ $(CFLAGS) -o $@
+	$(CC) -include core/def.h -c $^ $(CFLAGS) -o $@
 
 lib: $(CORE_OBJECTS)
 	$(AR) rc lib$(TARGET).a $(CORE_OBJECTS)
@@ -81,7 +81,7 @@ release: app
 
 dll: CFLAGS = $(RELEASE_CFLAGS)
 dll: $(CORE_OBJECTS)
-	$(CC) $(CFLAGS) -shared -fPIC -o lib$(TARGET).so $(CORE_OBJECTS) $(LIBS) $(LFLAGS)
+	$(CC) -include core/def.h $(CFLAGS) -shared -fPIC -o lib$(TARGET).so $(CORE_OBJECTS) $(LIBS) $(LFLAGS)
 
 chkleak: CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 -DDEBUG -DSYS_MALLOC
 chkleak: CC = gcc
@@ -101,7 +101,7 @@ wasm: CFLAGS = -fPIC -Wall -std=c17 -O3 -msimd128 -fassociative-math -ftree-vect
 wasm: CC = emcc 
 wasm: AR = emar
 wasm: $(APP_OBJECTS) lib
-	$(CC) $(CFLAGS) -o $(TARGET).js $(CORE_OBJECTS) \
+	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).js $(CORE_OBJECTS) \
 	-s "EXPORTED_FUNCTIONS=['_main', '_version', '_null', '_drop_obj', '_clone_obj', '_eval_str', '_obj_fmt', '_strof_obj']" \
 	-s "EXPORTED_RUNTIME_METHODS=['ccall', 'cwrap', 'FS']" -s ALLOW_MEMORY_GROWTH=1 \
 	--preload-file examples@/examples \
@@ -111,7 +111,7 @@ python: CFLAGS = $(RELEASE_CFLAGS)
 python: LFLAGS = -rdynamic
 python: $(CORE_OBJECTS)
 	swig -python $(TARGET).i
-	$(CC) $(CFLAGS) -shared -fPIC $(CORE_OBJECTS) $(TARGET)_wrap.c -o _$(TARGET).so -I/usr/include/$(PYTHON) -l$(PYTHON) $(LIBS) $(LFLAGS)
+	$(CC) -include core/def.h $(CFLAGS) -shared -fPIC $(CORE_OBJECTS) $(TARGET)_wrap.c -o _$(TARGET).so -I/usr/include/$(PYTHON) -l$(PYTHON) $(LIBS) $(LFLAGS)
 
 clean:
 	-rm -f *.o

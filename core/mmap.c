@@ -22,19 +22,10 @@
  */
 
 #include "mmap.h"
-
-#if defined(_WIN32) || defined(__CYGWIN__)
-#include <windows.h>
-#define MAP_FAILED (raw_p)(-1)
-#else
-#include <sys/mman.h>
-#endif
-
-#include <stdlib.h>
 #include "string.h"
 #include "util.h"
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 raw_p mmap_stack(u64_t size)
 {
@@ -103,7 +94,7 @@ i64_t mmap_commit(raw_p addr, u64_t size)
     return 0;
 }
 
-#elif defined(__linux__) || defined(__EMSCRIPTEN__)
+#elif defined(OS_LINUX)
 
 raw_p mmap_stack(u64_t size)
 {
@@ -160,7 +151,7 @@ i64_t mmap_commit(raw_p addr, u64_t size)
     return mprotect(addr, size, PROT_READ | PROT_WRITE);
 }
 
-#elif defined(__APPLE__) && defined(__MACH__)
+#elif defined(OS_MACOS)
 
 #define MAP_ANON 0x1000
 #define MAP_ANONYMOUS MAP_ANON
@@ -213,6 +204,4 @@ i64_t mmap_commit(raw_p addr, u64_t size)
     return mprotect(addr, size, PROT_READ | PROT_WRITE);
 }
 
-#else
-#error Unknown environment!
 #endif

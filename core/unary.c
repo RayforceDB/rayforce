@@ -21,7 +21,6 @@
  *   SOFTWARE.
  */
 
-#define _POSIX_C_SOURCE 200809L
 #include <time.h>
 #include "unary.h"
 #include "binary.h"

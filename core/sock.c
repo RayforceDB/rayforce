@@ -21,16 +21,6 @@
  *   SOFTWARE.
  */
 
-#if defined(_WIN32) || defined(__CYGWIN__)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#define MSG_NOSIGNAL 0
-#else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#endif
 #include <errno.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -68,7 +58,7 @@ i64_t sock_addr_from_str(str_p addr_str, sock_addr_t *addr)
     return 0;
 }
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 i64_t sock_set_nonblocking(i64_t fd, b8_t flag)
 {

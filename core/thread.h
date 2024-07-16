@@ -26,9 +26,7 @@
 
 #include "rayforce.h"
 
-#if defined(_WIN32) || defined(__CYGWIN__)
-
-#include <windows.h>
+#if defined(OS_WINDOWS)
 
 typedef struct
 {
@@ -46,8 +44,6 @@ typedef struct
 } cond_t;
 
 #else
-
-#include <pthread.h>
 
 typedef struct
 {

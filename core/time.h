@@ -25,12 +25,6 @@
 #define TIME_H
 
 #include "rayforce.h"
-#if defined(_WIN32) || defined(__CYGWIN__)
-#include <windows.h>
-#else
-#define _POSIX_C_SOURCE 200809L // Define POSIX source version for CLOCK_REALTIME
-#include <time.h>
-#endif
 
 #define TIMEOUT_INFINITY -1
 #define TIMEIT_SPANS_MAX 1024
@@ -52,7 +46,7 @@ typedef struct timers_t
     i64_t counter;       // Counter to assign unique IDs to timers
 } *timers_p;
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 typedef struct
 {

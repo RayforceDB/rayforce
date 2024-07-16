@@ -1,5 +1,5 @@
 /*
- *   Copyright (c) 2023 Anton Kundenko <singaraiona@gmail.com>
+ *   Copyright (c) 2024 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
 
  *   Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -21,40 +21,57 @@
  *   SOFTWARE.
  */
 
-#ifndef FS_H
-#define FS_H
+#ifndef DEF_H
+#define DEF_H
 
-// File attrs
-#if defined(OS_WINDOWS)
+#define RAYFORCE_MAJOR_VERSION 0
+#define RAYFORCE_MINOR_VERSION 1
+#define RAYFORCE_VERSION (RAYFORCE_MAJOR_VERSION >> 3 | RAYFORCE_MINOR_VERSION)
+
+#if defined(_WIN32) || defined(__CYGWIN__)
+#define OS_WINDOWS
 #include <winsock2.h>
+#include <ws2tcpip.h>
+#include <MSWSock.h>
 #include <windows.h>
-#define ATTR_RDONLY GENERIC_READ
-#define ATTR_WRONLY GENERIC_WRITE
-#define ATTR_RDWR (ATTR_RDONLY | ATTR_WRONLY)
-#define ATTR_CREAT 0
-#define ATTR_TRUNC 0
-#else
+#include <direct.h>
+#define MSG_NOSIGNAL 0
+#define MAP_FAILED (raw_p)(-1)
+#define getcwd _getcwd
+#elif defined(__linux__)
+#define OS_LINUX
+#define OS_UNIX
+#define _POSIX_C_SOURCE 200809L // Define POSIX source version for CLOCK_REALTIME
 #include <stdint.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
+#include <sys/mman.h>
 #include <unistd.h>
-#include <dirent.h>
-#define ATTR_RDONLY O_RDONLY
-#define ATTR_WRONLY O_WRONLY
-#define ATTR_RDWR O_RDWR
-#define ATTR_CREAT O_CREAT
-#define ATTR_TRUNC O_TRUNC
+#include <time.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <pthread.h>
+#elif defined(__APPLE__) && defined(__MACH__)
+#define OS_MACOS
+#define OS_UNIX
+#define _DARWIN_C_SOURCE
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#include <sys/mman.h>
+#include <arpa/inet.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include "dynlib.h"
+#include <dlfcn.h>
+#include <errno.h>
+#include <pthread.h>
+#elif defined(__EMSCRIPTEN__)
+#define OS_WASM
+#include <unistd.h>
+#include <emscripten.h>
+#else
+#error "Unsupported platform"
 #endif
-#include "rayforce.h"
-#include <fcntl.h>
 
-i64_t fs_fopen(lit_p path, i64_t attrs);
-i64_t fs_fsize(i64_t fd);
-i64_t fs_fread(i64_t fd, str_p buf, i64_t size);
-i64_t fs_fwrite(i64_t fd, str_p buf, i64_t size);
-i64_t fs_ftruncate(i64_t fd, i64_t size);
-i64_t fs_fclose(i64_t fd);
-i64_t fs_dcreate(lit_p path);
-i64_t fs_dopen(lit_p path);
-i64_t fs_dclose(i64_t fd);
-obj_p fs_read_dir(lit_p path);
-
-#endif // FS_H
+#endif // DEF_H

@@ -24,10 +24,6 @@
 #ifndef POLL_H
 #define POLL_H
 
-#if defined(_WIN32) || defined(__CYGWIN__)
-#include <winsock2.h>
-#include <windows.h>
-#endif
 #include "rayforce.h"
 #include "parse.h"
 #include "serde.h"
@@ -54,7 +50,7 @@ typedef enum poll_result_t
     POLL_ERROR = 2,
 } poll_result_t;
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 typedef struct selector_t
 {
@@ -90,6 +86,7 @@ typedef struct selector_t
 } *selector_p;
 
 #else
+
 typedef struct selector_t
 {
     i64_t fd; // socket fd

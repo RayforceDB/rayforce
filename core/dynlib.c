@@ -22,18 +22,10 @@
  */
 
 #include <stdio.h>
-
-#if defined(_WIN32) || defined(__CYGWIN__)
-#include <windows.h>
-#else
-#include "dynlib.h"
-#include <dlfcn.h>
-#endif
-
 #include "util.h"
 #include "error.h"
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 obj_p dynlib_loadfn(str_p path, str_p func, i64_t nargs)
 {

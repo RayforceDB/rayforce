@@ -32,9 +32,8 @@
 
 #if defined(DEBUG)
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
-// #include <windows.h>
 // #include <dbghelp.h>
 // #include <stdio.h>
 // #include <stdlib.h>
@@ -78,7 +77,7 @@ nil_t dump_stack(nil_t)
     // SymCleanup(GetCurrentProcess());
 }
 
-#elif defined(__linux__)
+#elif defined(OS_LINUX)
 
 #include <execinfo.h>
 

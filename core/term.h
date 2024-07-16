@@ -25,8 +25,7 @@
 #define TERM_H
 
 #include "rayforce.h"
-#if defined(_WIN32) || defined(__CYGWIN__)
-#include <windows.h>
+#if defined(OS_WINDOWS)
 #include "pool.h"
 #define KEYCODE_RETURN '\r'
 #else
@@ -83,7 +82,7 @@ typedef struct
 
 typedef struct term_t
 {
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
     HANDLE h_stdin;
     HANDLE h_stdout;
     DWORD old_stdin_mode;

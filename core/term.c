@@ -85,7 +85,7 @@ nil_t cursor_show()
 }
 
 // Function to extend the file size
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 i64_t extend_file_size(i64_t fd, u64_t new_size)
 {
@@ -351,7 +351,7 @@ nil_t hist_reset_current(hist_p hist)
     hist->curr_len = 0;
 }
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 term_p term_create()
 {
@@ -1133,7 +1133,7 @@ obj_p term_read(term_p term)
 {
     obj_p res = NULL;
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
     mutex_lock(&term->lock);
 #endif
 
@@ -1178,7 +1178,7 @@ obj_p term_read(term_p term)
         break;
     }
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
     mutex_unlock(&term->lock);
 #endif
 

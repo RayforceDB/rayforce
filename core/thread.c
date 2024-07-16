@@ -24,7 +24,7 @@
 #include "thread.h"
 #include "util.h"
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 // Mutex functions
 mutex_t mutex_create()

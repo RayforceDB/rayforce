@@ -33,12 +33,6 @@
 #include "eval.h"
 #include "error.h"
 
-#if defined(_WIN32) || defined(__CYGWIN__)
-#include <windows.h>
-#else
-#include <errno.h>
-#endif
-
 __thread u64_t __RND_SEED__ = 0;
 
 // Initialize the Global null object
@@ -212,7 +206,7 @@ u64_t ops_rank(obj_p *x, u64_t n)
     return l;
 }
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 obj_p sys_error(os_ray_error_type_t tp, lit_p msg)
 {

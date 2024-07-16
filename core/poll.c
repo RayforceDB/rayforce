@@ -25,16 +25,14 @@
 #include "format.h"
 #include "sock.h"
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 #include "iocp.c"
-#elif defined(__APPLE__) && defined(__MACH__)
+#elif defined(OS_MACOS)
 #include "kqueue.c"
-#elif defined(__linux__)
+#elif defined(OS_LINUX)
 #include "epoll.c"
-#elif defined(__EMSCRIPTEN__)
+#elif defined(OS_WASM)
 #include "wasm.c"
-#else
-#error "Unsupported platform"
 #endif
 
 #include "eval.h"

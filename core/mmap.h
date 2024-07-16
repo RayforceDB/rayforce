@@ -29,7 +29,7 @@
 #define _DEFAULT_SOURCE
 #endif
 
-#ifdef __EMSCRIPTEN__
+#ifdef OS_WASM
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 65536
 #endif

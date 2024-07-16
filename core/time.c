@@ -28,7 +28,7 @@
 #include "eval.h"
 #include "io.h"
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 nil_t timer_sleep(u64_t ms)
 {

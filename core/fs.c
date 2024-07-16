@@ -29,7 +29,7 @@
 #include "heap.h"
 #include "ops.h"
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
 
 i64_t fs_fopen(lit_p path, i64_t attrs)
 {
@@ -138,9 +138,7 @@ obj_p fs_read_dir(lit_p path)
     return lst;
 }
 
-#elif defined(__EMSCRIPTEN__)
-
-#include <emscripten.h>
+#elif defined(OS_WASM)
 
 // clang-format off
 EM_JS(nil_t, fs_dcreate_js, (lit_p path), {

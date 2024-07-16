@@ -26,10 +26,6 @@
 
 #include "rayforce.h"
 
-#define RAYFORCE_MAJOR_VERSION 0
-#define RAYFORCE_MINOR_VERSION 1
-#define RAYFORCE_VERSION (RAYFORCE_MAJOR_VERSION >> 3 | RAYFORCE_MINOR_VERSION)
-
 typedef struct sys_info_t
 {
     i32_t major_version;

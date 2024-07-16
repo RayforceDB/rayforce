@@ -27,33 +27,15 @@
 #include "format.h"
 #include "runtime.h"
 
-#if defined(_WIN32) || defined(__CYGWIN__)
-#include <windows.h>
-#include <direct.h>
-#define getcwd _getcwd
-#elif defined(__APPLE__) && defined(__MACH__)
-#define _DARWIN_C_SOURCE
-#include <sys/types.h>
-#include <sys/sysctl.h>
-#include <stdint.h>
-#include <unistd.h>
-#elif defined(__linux__)
-#include <stdint.h>
-#include <unistd.h>
-#elif defined(__EMSCRIPTEN__)
-#include <unistd.h>
-#include <emscripten.h>
-#endif
-
 i32_t cpu_cores()
 {
-#if defined(__EMSCRIPTEN__)
+#if defined(OS_WASM)
     return 1;
-#elif defined(_WIN32) || defined(__CYGWIN__)
+#elif defined(OS_WINDOWS)
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     return si.dwNumberOfProcessors;
-#elif defined(__unix__)
+#elif defined(OS_UNIX)
     return sysconf(_SC_NPROCESSORS_ONLN);
 #else
     return 1;
@@ -73,7 +55,7 @@ sys_info_t sys_info(i32_t threads)
     if (getcwd(info.cwd, sizeof(info.cwd)) == NULL)
         printf("Unable to get current working directory\n");
 
-#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(OS_WINDOWS)
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     snprintf(info.cpu, sizeof(info.cpu), "%lu", si.dwProcessorType);
@@ -83,7 +65,7 @@ sys_info_t sys_info(i32_t threads)
     GlobalMemoryStatusEx(&memInfo);
     info.mem = (i32_t)(memInfo.ullTotalPhys / (1024 * 1024));
 
-#elif defined(__linux__)
+#elif defined(OS_LINUX)
     FILE *cpuFile = fopen("/proc/cpuinfo", "r");
     c8_t line[256] = {0};
 
@@ -117,7 +99,7 @@ sys_info_t sys_info(i32_t threads)
     }
     fclose(memFile);
 
-#elif defined(__APPLE__) && defined(__MACH__)
+#elif defined(OS_MACOS)
     size_t len = sizeof(info.cpu);
     sysctlbyname("machdep.cpu.brand_string", &info.cpu, &len, NULL, 0);
 
@@ -126,7 +108,7 @@ sys_info_t sys_info(i32_t threads)
     sysctlbyname("hw.memsize", &memSize, &len, NULL, 0);
     info.mem = (i32_t)(memSize / (1024 * 1024));
 
-#elif defined(__EMSCRIPTEN__)
+#elif defined(OS_WASM)
     snprintf(info.cpu, sizeof(info.cpu), "WASM target");
     info.mem = 0;
 
