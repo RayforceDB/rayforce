@@ -508,7 +508,7 @@ u64_t index_group_count(obj_p index)
 
 u64_t index_group_len(obj_p index)
 {
-    if (!is_null(as_list(index)[4])) // filter
+    if (as_list(index)[4] != NULL_OBJ) // filter
         return as_list(index)[4]->len;
 
     return as_list(index)[3]->len; // source

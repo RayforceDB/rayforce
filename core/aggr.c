@@ -95,7 +95,7 @@ obj_p aggr_map(raw_p aggr, obj_p val, obj_p index)
 {
     pool_p pool = runtime_get()->pool;
     u64_t i, l, n, group_count, group_len, chunk;
-    obj_p res, parts;
+    obj_p res;
     raw_p argv[6];
 
     n = pool_executors_count(pool);
@@ -125,9 +125,7 @@ obj_p aggr_map(raw_p aggr, obj_p val, obj_p index)
 
     pool_add_task(pool, aggr, 5, l - i * chunk, i * chunk, val, index, vector(val->type, group_count));
 
-    parts = pool_run(pool, n);
-
-    return parts;
+    return pool_run(pool, n);
 }
 
 obj_p aggr_sum_partial(u64_t len, u64_t offset, obj_p val, obj_p index, obj_p res)

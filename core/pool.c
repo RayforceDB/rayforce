@@ -385,7 +385,9 @@ obj_p pool_run(pool_p pool, u64_t tasks_count)
     for (i = 0; i < tasks_count; i++)
     {
         data = mpmc_pop(pool->result_queue);
-        debug_assert(data.id != -1, "Pool run: invalid data id!!!!");
+        if (data.id < 0 || data.id >= (i64_t)tasks_count)
+            panic("Pool run: corrupted data: %lld\n", data.id);
+
         ins_obj(&res, data.id, data.result);
     }
 
