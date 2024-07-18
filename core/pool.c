@@ -292,23 +292,21 @@ pool_p pool_get(nil_t)
 
 nil_t pool_prepare(pool_p pool)
 {
-    if (!pool)
-        return;
-
     u64_t i, n;
-    obj_p env = interpreter_env_get();
+    obj_p env;
+
+    env = interpreter_env_get();
 
     mutex_lock(&pool->mutex);
 
-    n = pool->executors_count;
+    pool->tasks_count = 0;
 
+    n = pool->executors_count;
     for (i = 0; i < n; i++)
     {
         heap_borrow(pool->executors[i].heap);
         interpreter_env_set(pool->executors[i].interpreter, clone_obj(env));
     }
-
-    pool->tasks_count = 0;
 
     mutex_unlock(&pool->mutex);
 }
@@ -350,7 +348,7 @@ nil_t pool_add_task(pool_p pool, raw_p fn, u64_t argc, ...)
 
 obj_p pool_run(pool_p pool)
 {
-    u64_t i, n, tasks_count;
+    u64_t i, n, m, tasks_count;
     obj_p res;
     task_data_t data;
 
@@ -358,11 +356,13 @@ obj_p pool_run(pool_p pool)
 
     rc_sync(B8_TRUE);
 
-    pool->done_count = 0;
+    // pool->done_count = 0;
     tasks_count = pool->tasks_count;
+    m = (pool->executors_count < tasks_count) ? pool->executors_count : tasks_count;
 
-    // wake up all executors
-    cond_broadcast(&pool->run);
+    // wake up needed executors
+    for (i = 0; i < m; i++)
+        cond_signal(&pool->run);
 
     mutex_unlock(&pool->mutex);
 
@@ -409,6 +409,7 @@ obj_p pool_run(pool_p pool)
         interpreter_env_unset(pool->executors[i].interpreter);
     }
 
+    pool->done_count = 0;
     rc_sync(B8_FALSE);
 
     mutex_unlock(&pool->mutex);

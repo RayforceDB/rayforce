@@ -153,6 +153,28 @@ i32_t cond_wait(cond_t *cond, mutex_t *mutex)
     return pthread_cond_wait(&cond->inner, &mutex->inner);
 }
 
+i32_t cond_wait_timeout(cond_t *cond, mutex_t *mutex, u64_t timeout_ms)
+{
+    struct timespec ts;
+
+    // Get current time
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    // Add timeout to current time
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+
+    // Normalize the timespec
+    if (ts.tv_nsec >= 1000000000)
+    {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000;
+    }
+
+    // Wait with timeout
+    return pthread_cond_timedwait(&cond->inner, &mutex->inner, &ts);
+}
+
 i32_t cond_signal(cond_t *cond)
 {
     return pthread_cond_signal(&cond->inner);
