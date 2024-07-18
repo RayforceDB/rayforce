@@ -133,7 +133,7 @@ index_scope_t index_scope(i64_t values[], i64_t indices[], u64_t len)
     {
         i64_t mins[chunks];
         i64_t maxs[chunks];
-        pool_prepare(pool, chunks);
+        pool_prepare(pool);
         chunk = len / chunks;
         for (i = 0; i < chunks - 1; i++)
             pool_add_task(pool, index_scope_partial, 6, chunk, values, indices, i * chunk, &mins[i], &maxs[i]);

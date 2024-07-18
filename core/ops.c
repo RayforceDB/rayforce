@@ -273,7 +273,7 @@ obj_p ops_where(b8_t *mask, u64_t len)
         return res;
     }
 
-    pool_prepare(pool, n);
+    pool_prepare(pool);
 
     chunk = len / n;
 

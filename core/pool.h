@@ -105,7 +105,7 @@ pool_p pool_create(u64_t executors_count);
 nil_t pool_destroy(pool_p pool);
 pool_p pool_get(nil_t);
 u64_t pool_executors_count(pool_p pool);
-nil_t pool_prepare(pool_p pool, u64_t tasks_count);
+nil_t pool_prepare(pool_p pool);
 nil_t pool_add_task(pool_p pool, raw_p fn, u64_t argc, ...);
 obj_p pool_call_task_fn(raw_p fn, u64_t argc, raw_p argv[]);
 obj_p pool_run(pool_p pool);

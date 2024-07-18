@@ -115,7 +115,7 @@ obj_p aggr_map(raw_p aggr, obj_p val, obj_p index)
         return vn_list(1, res);
     }
 
-    pool_prepare(pool, n);
+    pool_prepare(pool);
 
     l = group_len;
     chunk = l / n;

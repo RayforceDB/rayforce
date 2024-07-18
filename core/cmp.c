@@ -52,7 +52,7 @@ obj_p cmp_map(raw_p cmp, obj_p lhs, obj_p rhs)
         return res;
     }
 
-    pool_prepare(pool, n);
+    pool_prepare(pool);
 
     chunk = l / n;
 

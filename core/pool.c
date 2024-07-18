@@ -31,7 +31,7 @@
 #include "heap.h"
 #include "string.h"
 
-#define MPMC_SIZE 256
+#define MPMC_SIZE 2048
 
 mpmc_p mpmc_create(u64_t size)
 {
@@ -141,7 +141,7 @@ task_data_t mpmc_pop(mpmc_p queue)
 
 u64_t mpmc_count(mpmc_p queue)
 {
-    return __atomic_load_n(&queue->tail, __ATOMIC_RELAXED) - __atomic_load_n(&queue->head, __ATOMIC_RELAXED);
+    return __atomic_load_n(&queue->tail, __ATOMIC_SEQ_CST) - __atomic_load_n(&queue->head, __ATOMIC_SEQ_CST);
 }
 
 u64_t mpmc_size(mpmc_p queue)
@@ -290,7 +290,7 @@ pool_p pool_get(nil_t)
     return runtime_get()->pool;
 }
 
-nil_t pool_prepare(pool_p pool, u64_t tasks_count)
+nil_t pool_prepare(pool_p pool)
 {
     if (!pool)
         return;
@@ -302,23 +302,13 @@ nil_t pool_prepare(pool_p pool, u64_t tasks_count)
 
     n = pool->executors_count;
 
-    if (tasks_count > mpmc_size(pool->task_queue))
-    {
-        // Grow task queue
-        mpmc_destroy(pool->task_queue);
-        pool->task_queue = mpmc_create(tasks_count);
-        // Grow result queue
-        mpmc_destroy(pool->result_queue);
-        pool->result_queue = mpmc_create(tasks_count);
-    }
-
     for (i = 0; i < n; i++)
     {
         heap_borrow(pool->executors[i].heap);
         interpreter_env_set(pool->executors[i].interpreter, clone_obj(env));
     }
 
-    pool->tasks_count = tasks_count;
+    pool->tasks_count = 0;
 
     mutex_unlock(&pool->mutex);
 }
@@ -329,9 +319,22 @@ nil_t pool_add_task(pool_p pool, raw_p fn, u64_t argc, ...)
     va_list args;
     task_data_t data;
 
-    data.id = mpmc_count(pool->task_queue);
+    mutex_lock(&pool->mutex);
+
+    data.id = pool->tasks_count++;
     data.fn = fn;
     data.argc = argc;
+
+    // TODO: resize task queue
+    // if (tasks_count > mpmc_size(pool->task_queue))
+    //     {
+    //         // Grow task queue
+    //         mpmc_destroy(pool->task_queue);
+    //         pool->task_queue = mpmc_create(tasks_count);
+    //         // Grow result queue
+    //         mpmc_destroy(pool->result_queue);
+    //         pool->result_queue = mpmc_create(tasks_count);
+    //     }
 
     va_start(args, argc);
 
@@ -341,6 +344,8 @@ nil_t pool_add_task(pool_p pool, raw_p fn, u64_t argc, ...)
     va_end(args);
 
     mpmc_push(pool->task_queue, data);
+
+    mutex_unlock(&pool->mutex);
 }
 
 obj_p pool_run(pool_p pool)
@@ -352,9 +357,9 @@ obj_p pool_run(pool_p pool)
     mutex_lock(&pool->mutex);
 
     rc_sync(B8_TRUE);
-    n = pool->executors_count;
-    tasks_count = pool->tasks_count;
+
     pool->done_count = 0;
+    tasks_count = pool->tasks_count;
 
     // wake up all executors
     cond_broadcast(&pool->run);
@@ -397,6 +402,7 @@ obj_p pool_run(pool_p pool)
     }
 
     // merge heaps
+    n = pool->executors_count;
     for (i = 0; i < n; i++)
     {
         heap_merge(pool->executors[i].heap);
