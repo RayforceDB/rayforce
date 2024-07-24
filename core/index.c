@@ -84,6 +84,135 @@ nil_t __index_list_precalc_hash(obj_p cols, u64_t *out, u64_t ncols, u64_t nrows
         index_hash_obj(as_list(cols)[i], out, filter, nrows, resolve);
 }
 
+nil_t index_hash_obj(obj_p obj, u64_t out[], i64_t filter[], u64_t len, b8_t resolve)
+{
+    u8_t *u8v;
+    f64_t *f64v;
+    guid_t *g64v;
+    u64_t i, *u64v;
+    obj_p k, v;
+    i64_t *ids;
+
+    switch (obj->type)
+    {
+    case -TYPE_B8:
+    case -TYPE_U8:
+    case -TYPE_C8:
+        out[0] = hash_index_u64((u64_t)obj->u8, out[0]);
+        break;
+    case -TYPE_I64:
+    case -TYPE_SYMBOL:
+    case -TYPE_TIMESTAMP:
+        out[0] = hash_index_u64((u64_t)obj->i64, out[0]);
+        break;
+    case -TYPE_F64:
+        out[0] = hash_index_u64((u64_t)obj->f64, out[0]);
+        break;
+    case -TYPE_GUID:
+        out[0] = hash_index_u64(*(u64_t *)as_guid(obj), *((u64_t *)as_guid(obj) + 1));
+        break;
+    case TYPE_B8:
+    case TYPE_U8:
+    case TYPE_C8:
+        u8v = as_u8(obj);
+        if (filter)
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64((u64_t)u8v[filter[i]], out[i]);
+        else
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64((u64_t)u8v[i], out[i]);
+        break;
+    case TYPE_I64:
+    case TYPE_SYMBOL:
+    case TYPE_TIMESTAMP:
+        u64v = (u64_t *)as_i64(obj);
+        if (filter)
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64(u64v[filter[i]], out[i]);
+        else
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64(u64v[i], out[i]);
+        break;
+    case TYPE_F64:
+        u64v = (u64_t *)as_f64(obj);
+        if (filter)
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64(u64v[filter[i]], out[i]);
+        else
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64(u64v[i], out[i]);
+        break;
+    case TYPE_GUID:
+        g64v = as_guid(obj);
+        if (filter)
+            for (i = 0; i < len; i++)
+            {
+                out[i] = hash_index_u64(*(u64_t *)&g64v[filter[i]], out[i]);
+                out[i] = hash_index_u64(*((u64_t *)&g64v[filter[i]] + 1), out[i]);
+            }
+        else
+            for (i = 0; i < len; i++)
+            {
+                out[i] = hash_index_u64(*(u64_t *)&g64v[i], out[i]);
+                out[i] = hash_index_u64(*((u64_t *)&g64v[i] + 1), out[i]);
+            }
+        break;
+    case TYPE_LIST:
+        if (filter)
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64(hash_index_obj(as_list(obj)[filter[i]]), out[i]);
+        else
+            for (i = 0; i < len; i++)
+                out[i] = hash_index_u64(hash_index_obj(as_list(obj)[i]), out[i]);
+        break;
+    case TYPE_ENUM:
+        if (resolve)
+        {
+            k = ray_key(obj);
+            v = ray_get(k);
+            drop_obj(k);
+            u64v = (u64_t *)as_symbol(v);
+            ids = as_i64(enum_val(obj));
+            if (filter)
+                for (i = 0; i < len; i++)
+                    out[i] = hash_index_u64(u64v[ids[filter[i]]], out[i]);
+            else
+                for (i = 0; i < len; i++)
+                    out[i] = hash_index_u64(u64v[ids[i]], out[i]);
+            drop_obj(v);
+        }
+        else
+        {
+            u64v = (u64_t *)as_i64(enum_val(obj));
+            if (filter)
+                for (i = 0; i < len; i++)
+                    out[i] = hash_index_u64(u64v[filter[i]], out[i]);
+            else
+                for (i = 0; i < len; i++)
+                    out[i] = hash_index_u64(u64v[i], out[i]);
+        }
+        break;
+    case TYPE_ANYMAP:
+        if (filter)
+            for (i = 0; i < len; i++)
+            {
+                v = at_idx(obj, filter[i]);
+                out[i] = hash_index_u64(hash_index_obj(v), out[i]);
+                drop_obj(v);
+            }
+        else
+            for (i = 0; i < len; i++)
+            {
+                v = at_idx(obj, i);
+                out[i] = hash_index_u64(hash_index_obj(v), out[i]);
+                drop_obj(v);
+            }
+        break;
+    default:
+        panic("hash list: unsupported type: %d", obj->type);
+    }
+}
+
 obj_p index_scope_partial(u64_t len, i64_t *values, i64_t *indices, u64_t offset, i64_t *pmin, i64_t *pmax)
 {
     i64_t min, max;
@@ -1051,7 +1180,7 @@ obj_p index_group_list(obj_p obj, obj_p filter)
     ctx = (__index_list_ctx_t){obj, obj, (u64_t *)as_i64(res)};
 
     // distribute bins
-    __index_list_precalc_hash(obj, (u64_t *)as_i64(res), obj->len, len, filter, B8_FALSE);
+    __index_list_precalc_hash(obj, (u64_t *)as_i64(res), obj->len, len, indices, B8_FALSE);
 
     if (indices)
     {
@@ -1091,135 +1220,6 @@ obj_p index_group_list(obj_p obj, obj_p filter)
     drop_obj(ht);
 
     return index_group_build(g, res, NULL_I64, NULL_OBJ, clone_obj(filter));
-}
-
-nil_t index_hash_obj(obj_p obj, u64_t out[], i64_t filter[], u64_t len, b8_t resolve)
-{
-    u8_t *u8v;
-    f64_t *f64v;
-    guid_t *g64v;
-    u64_t i, *u64v;
-    obj_p k, v;
-    i64_t *ids;
-
-    switch (obj->type)
-    {
-    case -TYPE_B8:
-    case -TYPE_U8:
-    case -TYPE_C8:
-        out[0] = hash_index_u64((u64_t)obj->u8, out[0]);
-        break;
-    case -TYPE_I64:
-    case -TYPE_SYMBOL:
-    case -TYPE_TIMESTAMP:
-        out[0] = hash_index_u64((u64_t)obj->i64, out[0]);
-        break;
-    case -TYPE_F64:
-        out[0] = hash_index_u64((u64_t)obj->f64, out[0]);
-        break;
-    case -TYPE_GUID:
-        out[0] = hash_index_u64(*(u64_t *)as_guid(obj), *((u64_t *)as_guid(obj) + 1));
-        break;
-    case TYPE_B8:
-    case TYPE_U8:
-    case TYPE_C8:
-        u8v = as_u8(obj);
-        if (filter)
-            for (i = 0; i < len; i++)
-                out[i] = hash_index_u64((u64_t)u8v[filter[i]], out[i]);
-        else
-            for (i = 0; i < len; i++)
-                out[i] = hash_index_u64((u64_t)u8v[i], out[i]);
-        break;
-    case TYPE_I64:
-    case TYPE_SYMBOL:
-    case TYPE_TIMESTAMP:
-        u64v = (u64_t *)as_i64(obj);
-        if (filter)
-            for (i = 0; i < len; i++)
-                out[i] = hash_index_u64(u64v[filter[i]], out[i]);
-        else
-            for (i = 0; i < len; i++)
-                out[i] = hash_index_u64(u64v[i], out[i]);
-        break;
-    case TYPE_F64:
-        f64v = as_f64(obj);
-        if (filter)
-            for (i = 0; i < len; i++)
-                out[i] = hash_index_u64((u64_t)f64v[filter[i]], out[i]);
-        else
-            for (i = 0; i < len; i++)
-                out[i] = hash_index_u64((u64_t)f64v[i], out[i]);
-        break;
-    case TYPE_GUID:
-        g64v = as_guid(obj);
-        if (filter)
-            for (i = 0; i < len; i++)
-            {
-                out[i] = hash_index_u64(*(u64_t *)&g64v[filter[i]], out[i]);
-                out[i] = hash_index_u64(*((u64_t *)&g64v[filter[i]] + 1), out[i]);
-            }
-        else
-            for (i = 0; i < len; i++)
-            {
-                out[i] = hash_index_u64(*(u64_t *)&g64v[i], out[i]);
-                out[i] = hash_index_u64(*((u64_t *)&g64v[i] + 1), out[i]);
-            }
-        break;
-    case TYPE_LIST:
-        if (filter)
-            for (i = 0; i < len; i++)
-                out[i] = hash_index_u64(hash_index_obj(as_list(obj)[filter[i]]), out[i]);
-        else
-            for (i = 0; i < len; i++)
-                out[i] = hash_index_u64(hash_index_obj(as_list(obj)[i]), out[i]);
-        break;
-    case TYPE_ENUM:
-        if (resolve)
-        {
-            k = ray_key(obj);
-            v = ray_get(k);
-            drop_obj(k);
-            u64v = (u64_t *)as_symbol(v);
-            ids = as_i64(enum_val(obj));
-            if (filter)
-                for (i = 0; i < len; i++)
-                    out[i] = hash_index_u64(u64v[ids[filter[i]]], out[i]);
-            else
-                for (i = 0; i < len; i++)
-                    out[i] = hash_index_u64(u64v[ids[i]], out[i]);
-            drop_obj(v);
-        }
-        else
-        {
-            u64v = (u64_t *)as_i64(enum_val(obj));
-            if (filter)
-                for (i = 0; i < len; i++)
-                    out[i] = hash_index_u64(u64v[filter[i]], out[i]);
-            else
-                for (i = 0; i < len; i++)
-                    out[i] = hash_index_u64(u64v[i], out[i]);
-        }
-        break;
-    case TYPE_ANYMAP:
-        if (filter)
-            for (i = 0; i < len; i++)
-            {
-                v = at_idx(obj, filter[i]);
-                out[i] = hash_index_u64(hash_index_obj(v), out[i]);
-                drop_obj(v);
-            }
-        else
-            for (i = 0; i < len; i++)
-            {
-                v = at_idx(obj, i);
-                out[i] = hash_index_u64(hash_index_obj(v), out[i]);
-                drop_obj(v);
-            }
-        break;
-    default:
-        panic("hash list: unsupported type: %d", obj->type);
-    }
 }
 
 obj_p index_group_cnts(obj_p grp)
