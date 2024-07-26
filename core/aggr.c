@@ -322,7 +322,6 @@ obj_p aggr_first(obj_p val, obj_p index)
                 return sym;
             }
 
-            debug_obj(sym);
             if (is_null(sym) || sym->type != TYPE_SYMBOL)
             {
                 drop_obj(sym);
