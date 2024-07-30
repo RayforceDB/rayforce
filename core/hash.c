@@ -203,9 +203,7 @@ i64_t ht_oa_tab_insert_with(obj_p *obj, i64_t key, i64_t val, hash_f hash, cmp_f
                 return vals[i];
         }
 
-        printf("TO REHASH: %p\n", *obj);
         ht_oa_rehash(obj, hash, cmp);
-        printf("REHASED: %p\n", *obj);
     }
 }
 
