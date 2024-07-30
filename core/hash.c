@@ -62,7 +62,7 @@ obj_p ht_oa_create(u64_t size, i8_t vals)
 
 nil_t ht_oa_rehash(obj_p *obj, hash_f hash, raw_p seed)
 {
-    u64_t i, j, size, key, new_size;
+    u64_t i, j, idx, size, key, start, new_size;
     i8_t type;
     i64_t *orig_keys, *new_keys, *orig_vals = NULL, *new_vals = NULL;
     obj_p new_obj;
@@ -90,20 +90,22 @@ nil_t ht_oa_rehash(obj_p *obj, hash_f hash, raw_p seed)
             key = orig_keys[i];
 
             // Recalculate the index for the new table
-            j = hash ? hash(key, seed) % new_size : (u64_t)key % new_size;
+            start = hash ? hash(key, seed) % new_size : (u64_t)key % new_size;
+            idx = start;
 
-            while (new_keys[j] != NULL_I64)
+            // NOTE: this won't fail because the new table is twice the size of the old one
+            for (j = start; j < new_size + start; j++) // Linear probing with wrap-around
             {
-                j++;
+                idx = j % new_size;
 
-                if (j == size)
-                    panic("ht is full");
+                if (new_keys[idx] == NULL_I64)
+                    break;
             }
 
-            new_keys[j] = key;
+            new_keys[idx] = key;
 
             if (type > -1)
-                new_vals[j] = orig_vals[i];
+                new_vals[idx] = orig_vals[i];
         }
     }
 
