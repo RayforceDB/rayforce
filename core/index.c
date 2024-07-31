@@ -722,7 +722,7 @@ obj_p index_group_distribute_partial(u64_t blob, u64_t *groups, i64_t keys[], i6
             if (segment != part)
                 continue;
 
-            idx = ht_oa_tab_next_with(ht, n, hash, cmp, NULL);
+            idx = ht_oa_tab_next_with(&ht, n, hash, cmp, NULL);
             k = as_i64(as_list(ht)[0]);
             v = as_i64(as_list(ht)[1]);
 
@@ -746,7 +746,7 @@ obj_p index_group_distribute_partial(u64_t blob, u64_t *groups, i64_t keys[], i6
             if (segment != part)
                 continue;
 
-            idx = ht_oa_tab_next_with(ht, n, hash, cmp, NULL);
+            idx = ht_oa_tab_next_with(&ht, n, hash, cmp, NULL);
             k = as_i64(as_list(ht)[0]);
             v = as_i64(as_list(ht)[1]);
 
