@@ -162,23 +162,33 @@ obj_p aggr_sum(obj_p val, obj_p index)
     f64_t *fo, *fi;
     obj_p res, parts;
 
-    parts = aggr_map(aggr_sum_partial, val, index);
-    unwrap_list(parts);
-    n = as_list(index)[0]->i64;
-    l = parts->len;
-    res = clone_obj(as_list(parts)[0]);
+    // parts = aggr_map(aggr_sum_partial, val, index);
+    // unwrap_list(parts);
+    n = index_group_count(index);
+    l = index_group_len(index);
+    // l = parts->len;
+    // res = clone_obj(as_list(parts)[0]);
 
     switch (val->type)
     {
     case TYPE_I64:
+        res = vector(val->type, n);
+        xi = as_i64(val);
         xo = as_i64(res);
-        for (i = 1; i < l; i++)
-        {
-            xi = as_i64(as_list(parts)[i]);
-            for (j = 0; j < n; j++)
-                xo[j] = addi64(xo[j], xi[j]);
-        }
-        drop_obj(parts);
+        memset(xo, 0, n * sizeof(i64_t));
+
+        aggr_iter(index, l, 0, xo[$y] = addi64(xo[$y], xi[$x]));
+
+        return res;
+
+        // xo = as_i64(res);
+        // for (i = 1; i < l; i++)
+        // {
+        //     xi = as_i64(as_list(parts)[i]);
+        //     for (j = 0; j < n; j++)
+        //         xo[j] = addi64(xo[j], xi[j]);
+        // }
+        // drop_obj(parts);
         return res;
     case TYPE_F64:
         fo = as_f64(res);

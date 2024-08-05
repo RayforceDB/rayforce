@@ -699,16 +699,24 @@ obj_p index_group_build(u64_t groups_count, obj_p group_ids, i64_t index_min, ob
     return vn_list(5, i64(groups_count), group_ids, i64(index_min), source, filter);
 }
 
-obj_p index_group_distribute_partial(u64_t blob, u64_t *groups, i64_t keys[], i64_t filter[], i64_t out[], u64_t len, hash_f hash, cmp_f cmp)
+typedef struct __group_radix_part_ctx_t
 {
-    u64_t i, j, segment, parts, size, part;
+    u64_t partitions;
+    u64_t executors;
+    u64_t executor;
+} *group_radix_part_ctx_p;
+
+obj_p index_group_distribute_partial(group_radix_part_ctx_p ctx, u64_t *groups, i64_t keys[], i64_t filter[], i64_t out[], u64_t len, hash_f hash, cmp_f cmp)
+{
+    u64_t i, j, executor_id, partitions, size, executor, executors;
     i64_t *k, *v, n, idx;
     obj_p ht;
 
-    parts = blob >> 32;
-    part = blob & 0xff;
+    partitions = ctx->partitions;
+    executor = ctx->executor;
+    executors = ctx->executors;
 
-    size = (part + 1 < parts) ? (len / parts) : (len - (len / parts) * part);
+    size = (executor + 1 < executors) ? (len / executors) : (len - (len / executors) * executor);
     ht = ht_oa_create(size, TYPE_I64);
 
     if (filter)
@@ -718,8 +726,8 @@ obj_p index_group_distribute_partial(u64_t blob, u64_t *groups, i64_t keys[], i6
             n = keys[filter[i]];
 
             // determine if the key is ours due to radix partitioning
-            segment = n % parts;
-            if (segment != part)
+            executor_id = n % partitions % executors;
+            if (executor_id != executor)
                 continue;
 
             idx = ht_oa_tab_next_with(&ht, n, hash, cmp, NULL);
@@ -742,8 +750,8 @@ obj_p index_group_distribute_partial(u64_t blob, u64_t *groups, i64_t keys[], i6
             n = keys[i];
 
             // determine if the key is ours due to radix partitioning
-            segment = n % parts;
-            if (segment != part)
+            executor_id = n % partitions % executors;
+            if (executor_id != executor)
                 continue;
 
             idx = ht_oa_tab_next_with(&ht, n, hash, cmp, NULL);
@@ -822,9 +830,16 @@ u64_t index_group_distribute(i64_t keys[], i64_t filter[], i64_t out[], u64_t le
         return groups;
     }
 
+    struct __group_radix_part_ctx_t ctx[parts];
+
     pool_prepare(pool);
     for (i = 0; i < parts; i++)
-        pool_add_task(pool, index_group_distribute_partial, 8, i | parts << 32, &groups, keys, filter, out, len, hash, cmp);
+    {
+        ctx[i].partitions = 1 << parts;
+        ctx[i].executors = parts;
+        ctx[i].executor = i;
+        pool_add_task(pool, index_group_distribute_partial, 8, &ctx[i], &groups, keys, filter, out, len, hash, cmp);
+    }
 
     res = pool_run(pool);
     drop_obj(res);

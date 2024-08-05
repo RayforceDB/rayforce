@@ -34,6 +34,7 @@
 #include "index.h"
 #include "error.h"
 #include "string.h"
+#include "group.h"
 
 obj_p ray_cast_obj(obj_p x, obj_p y)
 {
@@ -591,7 +592,10 @@ obj_p ray_group(obj_p x)
 {
     obj_p c, g, k, v;
     u64_t i, m, n, l;
-    return index_group(x, NULL_OBJ);
+
+    // return index_group(x, NULL_OBJ);
+    return i64(group_build_index(as_i64(x), x->len, &hash_fnv1a, &hash_cmp_i64));
+
     switch (x->type)
     {
     // case TYPE_U8:

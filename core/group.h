@@ -25,7 +25,9 @@
 #define GROUP_H
 
 #include "rayforce.h"
+#include "hash.h"
 
 obj_p group_map(obj_p val, obj_p index);
+u64_t group_build_index(i64_t keys[], u64_t len, hash_f hash, cmp_f cmp);
 
 #endif // GROUP_H
