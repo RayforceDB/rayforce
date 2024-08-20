@@ -369,9 +369,9 @@ i64_t ts_fmt_into(obj_p *dst, i64_t val)
     i64_t n;
 
     if (!ts.hours && !ts.mins && !ts.secs && !ts.nanos)
-        n = str_fmt_into(dst, 11, "%.4d.%.2d.%.2d", ts.year, ts.month, ts.day);
+        n = str_fmt_into(dst, NO_LIMIT, "%.4d.%.2d.%.2d", ts.year, ts.month, ts.day);
     else
-        n = str_fmt_into(dst, 30, "%.4d.%.2d.%.2dD%.2d:%.2d:%.2d.%.9d",
+        n = str_fmt_into(dst, NO_LIMIT, "%.4d.%.2d.%.2dD%.2d:%.2d:%.2d.%.9d",
                          ts.year, ts.month, ts.day, ts.hours, ts.mins, ts.secs, ts.nanos);
 
     return n;

@@ -26,6 +26,8 @@
 #include "timestamp.h"
 #include "ops.h"
 #include "util.h"
+#include "error.h"
+#include "string.h"
 
 CASSERT(sizeof(struct timestamp_t) == 16, timestamp_h)
 
@@ -90,7 +92,7 @@ date_t date_from_days(i64_t v)
     u8_t leap = leap_year(yy);
     u8_t mid = 0;
 
-    for (mid = 0; mid < 12; mid++)
+    for (mid = 12; mid >= 0; mid--)
         if (MONTHDAYS_FWD[leap][mid] != 0 && days / MONTHDAYS_FWD[leap][mid] != 0)
             break;
 
@@ -278,4 +280,76 @@ timestamp_t timestamp_from_str(str_p src)
     }
 
     return ts;
+}
+#if defined(OS_WINDOWS)
+
+timestamp_t timestamp_current(lit_p tz)
+{
+    time_t rawtime;
+    struct tm *timeinfo;
+
+    // Get the current time
+    time(&rawtime);
+
+    // Determine if UTC or local time should be used based on the argument
+    if (tz != NULL && strcmp(tz, "utc") == 0)
+        timeinfo = gmtime(&rawtime); // UTC time
+    else
+        timeinfo = localtime(&rawtime); // Local time
+
+    // Populate the timestamp_t struct
+    timestamp_t ts = {
+        .null = B8_FALSE,
+        .year = (u16_t)(timeinfo->tm_year + 1900),
+        .month = (u8_t)(timeinfo->tm_mon + 1),
+        .day = (u8_t)timeinfo->tm_mday,
+        .hours = (u8_t)timeinfo->tm_hour,
+        .mins = (u8_t)timeinfo->tm_min,
+        .secs = (u8_t)timeinfo->tm_sec,
+        .nanos = 0 // Windows does not support nanoseconds in time_t
+    };
+
+    return ts;
+}
+
+#else
+
+timestamp_t timestamp_current(lit_p tz)
+{
+    time_t rawtime;
+    struct tm *timeinfo;
+
+    // Get the current time
+    time(&rawtime);
+
+    // Choose local time or UTC based on the argument
+    if (tz != NULL && strcmp(tz, "utc") == 0)
+        timeinfo = gmtime(&rawtime); // UTC time
+    else
+        timeinfo = localtime(&rawtime); // Local time
+
+    timestamp_t ts = {
+        .null = B8_FALSE,
+        .year = (u16_t)(timeinfo->tm_year + 1900),
+        .month = (u8_t)(timeinfo->tm_mon + 1),
+        .day = (u8_t)timeinfo->tm_mday,
+        .hours = (u8_t)timeinfo->tm_hour,
+        .mins = (u8_t)timeinfo->tm_min,
+        .secs = (u8_t)timeinfo->tm_sec,
+        .nanos = 0,
+    };
+
+    return ts;
+}
+
+#endif
+
+obj_p ray_timestamp(obj_p arg)
+{
+    if (arg->type != -TYPE_SYMBOL)
+        throw(ERR_TYPE, "timestamp: expected 'Symbol, got '%s'", type_name(arg->type));
+
+    timestamp_t ts = timestamp_current(str_from_symbol(arg->i64));
+
+    return timestamp(timestamp_into_i64(ts));
 }

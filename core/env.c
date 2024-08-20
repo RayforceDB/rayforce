@@ -48,6 +48,7 @@
 #include "dynlib.h"
 #include "time.h"
 #include "string.h"
+#include "timestamp.h"
 
 i64_t SYMBOL_FN;
 i64_t SYMBOL_SELF;
@@ -153,6 +154,7 @@ nil_t init_functions(obj_p functions)
     regf(functions,  "timeit",              TYPE_UNARY,    FN_NONE | FN_SPECIAL_FORM, ray_timeit);
     regf(functions,  "bins",                TYPE_UNARY,    FN_NONE,                   ray_bins);
     regf(functions,  "update",              TYPE_UNARY,    FN_NONE,                   ray_update);
+    regf(functions,  "timestamp",           TYPE_UNARY,    FN_NONE,                   ray_timestamp);
     regf(functions,  "use-unicode-format",  TYPE_UNARY,    FN_NONE,                   ray_unicode_format);
     regf(functions,  "set-fpr",             TYPE_UNARY,    FN_NONE,                   ray_set_fpr);
     regf(functions,  "set-display-width",   TYPE_UNARY,    FN_NONE,                   ray_set_display_width);
