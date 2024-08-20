@@ -169,7 +169,7 @@ raw_p mmap_alloc(u64_t size)
 raw_p mmap_file(i64_t fd, u64_t size, i32_t shared)
 {
     i32_t flags = (shared) ? MAP_SHARED : MAP_PRIVATE;
-    raw_p ptr = mmap(NULL, size, PROT_READ | PROT_WRITE | MAP_POPULATE | MAP_NONBLOCK, flags, fd, 0);
+    raw_p ptr = mmap(NULL, size, PROT_READ | PROT_WRITE | MADV_WILLNEED, flags, fd, 0);
 
     if (ptr == MAP_FAILED)
         return NULL;
