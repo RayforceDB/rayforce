@@ -112,6 +112,7 @@ nil_t init_functions(obj_p functions)
 {
     // Unary
     regf(functions,  "get",                 TYPE_UNARY,    FN_NONE,                   ray_get);
+    regf(functions,  "quote",               TYPE_UNARY,    FN_NONE | FN_SPECIAL_FORM, ray_quote);
     regf(functions,  "raise",               TYPE_UNARY,    FN_NONE,                   ray_raise);
     regf(functions,  "read",                TYPE_UNARY,    FN_NONE,                   ray_read);
     regf(functions,  "parse",               TYPE_UNARY,    FN_NONE,                   ray_parse);

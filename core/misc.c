@@ -54,3 +54,8 @@ obj_p ray_rc(obj_p x)
     // substract 1 to skip the our reference
     return i64(rc_obj(x) - 1);
 }
+
+obj_p ray_quote(obj_p x)
+{
+    return clone_obj(x);
+}
