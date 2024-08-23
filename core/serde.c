@@ -144,7 +144,7 @@ u64_t size_obj(obj_p obj)
     case TYPE_UNARY:
     case TYPE_BINARY:
     case TYPE_VARY:
-        return sizeof(i8_t) + sizeof(env_get_internal_name(obj)) + 1;
+        return sizeof(i8_t) + strlen(env_get_internal_name(obj)) + 1;
     case TYPE_NULL:
         return sizeof(i8_t);
     case TYPE_ERROR:
