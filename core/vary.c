@@ -125,7 +125,7 @@ obj_p ray_print(obj_p *x, u64_t n)
 {
     obj_p s = obj_fmt_n(x, n);
 
-    if (!s)
+    if (s == NULL_OBJ)
         return error_str(ERR_TYPE, "malformed format string");
 
     printf("%.*s", (i32_t)s->len, as_string(s));
@@ -138,7 +138,7 @@ obj_p ray_println(obj_p *x, u64_t n)
 {
     obj_p s = obj_fmt_n(x, n);
 
-    if (!s)
+    if (s == NULL_OBJ)
         return error_str(ERR_TYPE, "malformed format string");
 
     printf("%.*s\n", (i32_t)s->len, as_string(s));

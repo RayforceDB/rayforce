@@ -170,6 +170,8 @@ i64_t str_vfmt_into(obj_p *dst, i64_t limit, lit_p fmt, va_list vargs)
     else
     {
         l = (*dst)->len;
+        if (l > 0 && as_string(*dst)[l - 1] == '\0')
+            l--;
         if (is_null(resize_obj(dst, l + size)))
         {
             heap_free(*dst);
@@ -1225,19 +1227,19 @@ obj_p obj_fmt_n(obj_p *x, u64_t n)
     u64_t i;
     i64_t sz = 0;
     str_p p, start = NULL, end = NULL;
-    obj_p res = NULL, *b = x;
+    obj_p res = NULL_OBJ, *b = x;
 
     if (n == 0)
-        return NULL;
+        return NULL_OBJ;
 
     if (n == 1)
         return obj_fmt(*b, B8_TRUE);
 
     if ((*b)->type != TYPE_C8)
-        return NULL;
+        return NULL_OBJ;
 
     p = as_string(*b);
-    sz = strlen(p);
+    sz = (*b)->len;
     start = p;
     n -= 1;
 
@@ -1251,7 +1253,7 @@ obj_p obj_fmt_n(obj_p *x, u64_t n)
             if (res)
                 heap_free(res);
 
-            return NULL;
+            return NULL_OBJ;
         }
 
         if (end > start)
@@ -1268,7 +1270,7 @@ obj_p obj_fmt_n(obj_p *x, u64_t n)
         if (res)
             heap_free(res);
 
-        return NULL;
+        return NULL_OBJ;
     }
 
     str_fmt_into(&res, end - start, "%s", start);
