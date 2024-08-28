@@ -198,6 +198,7 @@ obj_p aggr_first(obj_p val, obj_p index)
     case TYPE_TIMESTAMP:
     case TYPE_ENUM:
         res = AGGR_COLLECT(index, n, i64, if ($out[$y] == NULL_I64) $out[$y] = $in[$x]);
+        res->type = val->type;
         drop_obj(parts);
         if (val->type == TYPE_ENUM)
         {

@@ -245,19 +245,19 @@ i32_t thread_pin(ray_thread_t thread, u64_t core)
 
 i32_t thread_pin(ray_thread_t thread, u64_t core)
 {
-    thread_port_t mach_thread;
-    thread_affinity_policy_data_t policy;
-    kern_return_t kr;
+    // thread_port_t mach_thread;
+    // thread_affinity_policy_data_t policy;
+    // kern_return_t kr;
 
-    mach_thread = pthread_mach_thread_np(thread.handle);
-    policy.affinity_tag = core;
-    kr = thread_policy_set(mach_thread, THREAD_AFFINITY_POLICY, (thread_policy_t)&policy, THREAD_AFFINITY_POLICY_COUNT);
+    // mach_thread = pthread_mach_thread_np(thread.handle);
+    // policy.affinity_tag = core;
+    // kr = thread_policy_set(mach_thread, THREAD_AFFINITY_POLICY, (thread_policy_t)&policy, THREAD_AFFINITY_POLICY_COUNT);
 
-    if (kr != KERN_SUCCESS)
-    {
-        fprintf(stderr, "Error setting thread policy: %s\n", mach_error_string(kr));
-        return -1;
-    }
+    // if (kr != KERN_SUCCESS)
+    // {
+    //     fprintf(stderr, "Error setting thread policy: %s\n", mach_error_string(kr));
+    //     return -1;
+    // }
 
     return 0;
 }
