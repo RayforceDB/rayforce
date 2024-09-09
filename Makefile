@@ -20,7 +20,7 @@ LIBS = -lm -ldl -lpthread
 endif
 
 ifeq ($(OS),darwin)
-DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
+DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -march=native -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
 LIBS = -lm -ldl -lpthread
 endif
 
@@ -57,7 +57,7 @@ obj: $(CORE_OBJECTS)
 app: $(APP_OBJECTS) obj
 	$(CC) $(CFLAGS) -o $(TARGET) $(CORE_OBJECTS) $(APP_OBJECTS) $(LIBS) $(LFLAGS)
 
-tests: CC = gcc
+# tests: CC = gcc
 # tests: CFLAGS = $(DEBUG_CFLAGS)
 tests: CFLAGS = $(RELEASE_CFLAGS) -DSTOP_ON_FAIL=$(STOP_ON_FAIL) -DDEBUG
 tests: $(TESTS_OBJECTS) lib
