@@ -38,6 +38,8 @@ str_p string_intern(symbols_p symbols, lit_p str, u64_t len) {
     u64_t rounds = 0, cap;
     str_p curr, node;
 
+    assert(len > 0);
+
     cap = len + 1;
     curr = __atomic_fetch_add(&symbols->string_curr, cap, __ATOMIC_RELAXED);
     node = __atomic_load_n(&symbols->string_node, __ATOMIC_ACQUIRE);
@@ -78,6 +80,9 @@ i64_t symbols_intern(lit_p str, u64_t len) {
     str_p intr;
     symbols_p symbols = runtime_get()->symbols;
     symbol_p new_bucket, current_bucket, b, *syms;
+
+    if (len == 0)
+        return NULL_I64;
 
     syms = symbols->syms;
     index = str_hash(str, len) % symbols->size;
@@ -185,7 +190,7 @@ nil_t symbols_destroy(symbols_p symbols) {
     heap_unmap(symbols, sizeof(struct symbols_t));
 }
 
-str_p str_from_symbol(i64_t key) { return (str_p)key; }
+str_p str_from_symbol(i64_t key) { return (key == NULL_I64) ? (str_p)"" : (str_p)key; }
 
 u64_t symbols_count(symbols_p symbols) { return symbols->count; }
 
