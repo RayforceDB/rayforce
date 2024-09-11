@@ -941,9 +941,9 @@ obj_p ray_sum(obj_p x) {
             chunk = l / chunks;
 
             for (i = 0; i < chunks - 1; i++)
-                pool_add_task(pool, ray_sum_partial, 2, chunk, xii + i * chunk);
+                pool_add_task(pool, (raw_p)ray_sum_partial, 2, chunk, xii + i * chunk);
 
-            pool_add_task(pool, ray_sum_partial, 2, l - i * chunk, xii + i * chunk);
+            pool_add_task(pool, (raw_p)ray_sum_partial, 2, l - i * chunk, xii + i * chunk);
 
             res = pool_run(pool);
 

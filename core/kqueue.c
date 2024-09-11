@@ -146,7 +146,7 @@ i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
     selector_p selector;
     struct kevent ev;
 
-    selector = heap_alloc(sizeof(struct selector_t));
+    selector = (selector_p)heap_alloc(sizeof(struct selector_t));
     id = freelist_push(poll->selectors, (i64_t)selector) + SELECTOR_ID_OFFSET;
     selector->id = id;
     selector->version = version;
@@ -199,7 +199,7 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
     u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
 
     if (selector->rx.buf == NULL)
-        selector->rx.buf = heap_alloc(sizeof(struct header_t));
+        selector->rx.buf = (u8_t *)heap_alloc(sizeof(struct header_t));
 
     // wait for handshake
     if (selector->version == 0) {
@@ -244,7 +244,7 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
         header = (header_t *)selector->rx.buf;
         selector->rx.msgtype = header->msgtype;
         selector->rx.size = header->size + sizeof(struct header_t);
-        selector->rx.buf = heap_realloc(selector->rx.buf, selector->rx.size);
+        selector->rx.buf = (u8_t *)heap_realloc(selector->rx.buf, selector->rx.size);
     }
 
     while (selector->rx.bytes_transfered < selector->rx.size) {

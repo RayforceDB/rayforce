@@ -221,11 +221,11 @@ nil_t __index_list_precalc_hash(obj_p cols, u64_t out[], u64_t ncols, u64_t nrow
             pool_prepare(pool);
 
             for (j = 0; j < chunks - 1; j++)
-                pool_add_task(pool, index_hash_obj_partial, 6, AS_LIST(cols)[i], out, filter, chunk, j * chunk,
+                pool_add_task(pool, (raw_p)index_hash_obj_partial, 6, AS_LIST(cols)[i], out, filter, chunk, j * chunk,
                               resolve);
 
-            pool_add_task(pool, index_hash_obj_partial, 6, AS_LIST(cols)[i], out, filter, nrows - j * chunk, j * chunk,
-                          resolve);
+            pool_add_task(pool, (raw_p)index_hash_obj_partial, 6, AS_LIST(cols)[i], out, filter, nrows - j * chunk,
+                          j * chunk, resolve);
 
             v = pool_run(pool);
             drop_obj(v);
@@ -282,9 +282,10 @@ index_scope_t index_scope(i64_t values[], i64_t indices[], u64_t len) {
         pool_prepare(pool);
         chunk = len / chunks;
         for (i = 0; i < chunks - 1; i++)
-            pool_add_task(pool, index_scope_partial, 6, chunk, values, indices, i * chunk, &mins[i], &maxs[i]);
+            pool_add_task(pool, (raw_p)index_scope_partial, 6, chunk, values, indices, i * chunk, &mins[i], &maxs[i]);
 
-        pool_add_task(pool, index_scope_partial, 6, len - i * chunk, values, indices, i * chunk, &mins[i], &maxs[i]);
+        pool_add_task(pool, (raw_p)index_scope_partial, 6, len - i * chunk, values, indices, i * chunk, &mins[i],
+                      &maxs[i]);
 
         v = pool_run(pool);
         drop_obj(v);
@@ -755,7 +756,8 @@ u64_t index_group_distribute(i64_t keys[], i64_t filter[], i64_t out[], u64_t le
     for (i = 0; i < parts; i++) {
         ctx[i].partitions = parts;
         ctx[i].partition = i;
-        pool_add_task(pool, index_group_distribute_partial, 8, &ctx[i], &groups, keys, filter, out, len, hash, cmp);
+        pool_add_task(pool, (raw_p)index_group_distribute_partial, 8, &ctx[i], &groups, keys, filter, out, len, hash,
+                      cmp);
     }
 
     res = pool_run(pool);
@@ -896,11 +898,11 @@ obj_p index_group_i64_scoped(obj_p obj, obj_p filter, const index_scope_t scope)
             pool_prepare(pool);
             chunk = len / chunks;
             for (i = 0; i < chunks - 1; i++)
-                pool_add_task(pool, index_group_i64_scoped_partial, 7, values, indices, hk, chunk, i * chunk, scope.min,
-                              hv);
+                pool_add_task(pool, (raw_p)index_group_i64_scoped_partial, 7, values, indices, hk, chunk, i * chunk,
+                              scope.min, hv);
 
-            pool_add_task(pool, index_group_i64_scoped_partial, 7, values, indices, hk, len - i * chunk, i * chunk,
-                          scope.min, hv);
+            pool_add_task(pool, (raw_p)index_group_i64_scoped_partial, 7, values, indices, hk, len - i * chunk,
+                          i * chunk, scope.min, hv);
 
             v = pool_run(pool);
             drop_obj(v);

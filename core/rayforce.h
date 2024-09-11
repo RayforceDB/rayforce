@@ -253,10 +253,10 @@ extern obj_p eval_obj(obj_p obj); // Moves ownership of obj to the eval function
 extern obj_p try_obj(obj_p obj, obj_p ctch);
 
 // Initialize runtime
-extern i32_t ray_init();
+extern i32_t ray_init(nil_t);
 
 // Cleanup runtime
-extern nil_t ray_clean();
+extern nil_t ray_clean(nil_t);
 
 #ifdef __cplusplus
 }

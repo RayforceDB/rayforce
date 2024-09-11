@@ -182,7 +182,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
     i64_t *xo, *xe;
     obj_p parts, res, ek, sym;
     n = index_group_count(index);
-    parts = aggr_map(aggr_first_partial, val, val->type, index);
+    parts = aggr_map((raw_p)aggr_first_partial, val, val->type, index);
     UNWRAP_LIST(parts);
 
     switch (val->type) {
@@ -274,7 +274,7 @@ obj_p aggr_last(obj_p val, obj_p index) {
     obj_p parts, res, ek, sym;
 
     n = index_group_count(index);
-    parts = aggr_map(aggr_last_partial, val, val->type, index);
+    parts = aggr_map((raw_p)aggr_last_partial, val, val->type, index);
     UNWRAP_LIST(parts);
 
     switch (val->type) {
@@ -348,7 +348,7 @@ obj_p aggr_sum(obj_p val, obj_p index) {
     obj_p parts, res;
 
     n = index_group_count(index);
-    parts = aggr_map(aggr_sum_partial, val, val->type, index);
+    parts = aggr_map((raw_p)aggr_sum_partial, val, val->type, index);
     UNWRAP_LIST(parts);
 
     switch (val->type) {
@@ -386,7 +386,7 @@ obj_p aggr_max(obj_p val, obj_p index) {
     obj_p parts, res;
 
     n = index_group_count(index);
-    parts = aggr_map(aggr_max_partial, val, val->type, index);
+    parts = aggr_map((raw_p)aggr_max_partial, val, val->type, index);
     UNWRAP_LIST(parts);
 
     switch (val->type) {
@@ -424,7 +424,7 @@ obj_p aggr_min(obj_p val, obj_p index) {
     obj_p parts, res;
 
     n = index_group_count(index);
-    parts = aggr_map(aggr_max_partial, val, val->type, index);
+    parts = aggr_map((raw_p)aggr_max_partial, val, val->type, index);
     UNWRAP_LIST(parts);
 
     switch (val->type) {
@@ -481,7 +481,7 @@ obj_p aggr_count(obj_p val, obj_p index) {
     obj_p parts, res;
 
     n = index_group_count(index);
-    parts = aggr_map(aggr_count_partial, val, TYPE_I64, index);
+    parts = aggr_map((raw_p)aggr_count_partial, val, TYPE_I64, index);
     UNWRAP_LIST(parts);
     res = AGGR_COLLECT(parts, n, i64, i64, $out[$y] += $in[$x]);
     drop_obj(parts);

@@ -48,9 +48,9 @@ CASSERT(sizeof(struct obj_t) == 16, rayforce_h)
 // Synchronization flag (use atomics on rc operations).
 __thread i64_t __RC_SYNC = 0;
 
-i32_t ray_init() { return runtime_create(0, NULL); }
+i32_t ray_init(nil_t) { return runtime_create(0, NULL); }
 
-nil_t ray_clean() { runtime_destroy(); }
+nil_t ray_clean(nil_t) { runtime_destroy(); }
 
 u8_t version(nil_t) { return RAYFORCE_VERSION; }
 

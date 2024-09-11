@@ -130,7 +130,7 @@ obj_p ray_eq(obj_p x, obj_p y) {
         case MTYPE2(TYPE_SYMBOL, -TYPE_SYMBOL):
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
         case MTYPE2(TYPE_ENUM, -TYPE_SYMBOL):
-            return cmp_map(ray_eq_partial, x, y);
+            return cmp_map((raw_p)ray_eq_partial, x, y);
         case MTYPE2(TYPE_F64, -TYPE_F64):
             l = x->len;
             vec = B8(l);
@@ -151,7 +151,7 @@ obj_p ray_eq(obj_p x, obj_p y) {
         case MTYPE2(-TYPE_I64, TYPE_I64):
         case MTYPE2(-TYPE_SYMBOL, TYPE_SYMBOL):
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_TIMESTAMP):
-            return cmp_map(ray_eq_partial, y, x);
+            return cmp_map((raw_p)ray_eq_partial, y, x);
         case MTYPE2(-TYPE_F64, TYPE_F64):
             l = y->len;
             vec = B8(l);

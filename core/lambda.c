@@ -73,7 +73,7 @@ obj_p lambda_map(obj_p f, obj_p *x, u64_t n) {
         pool_prepare(pool);
 
         for (j = 0; j < l; j++)
-            pool_add_task(pool, lambda_map_partial, 4, f, x, n, j);
+            pool_add_task(pool, (raw_p)lambda_map_partial, 4, f, x, n, j);
 
         res = pool_run(pool);
         UNWRAP_LIST(res);
