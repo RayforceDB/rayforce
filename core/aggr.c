@@ -149,6 +149,11 @@ obj_p aggr_map(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
     return pool_run(pool);
 }
 
+nil_t destroy_partial_result(obj_p res) {
+    res->len = 0;
+    drop_obj(res);
+}
+
 obj_p aggr_first_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg5) {
     u64_t len = (u64_t)arg1, offset = (u64_t)arg2;
     obj_p val = (obj_p)arg3, index = (obj_p)arg4, res = (obj_p)arg5;
@@ -174,8 +179,7 @@ obj_p aggr_first_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p a
                       if ($out[$y] == NULL_OBJ) $out[$y] = clone_obj($in[$x]));
             return res;
         default:
-            res->len = 0;
-            drop_obj(res);
+            destroy_partial_result(res);
             return error(ERR_TYPE, "first: unsupported type: '%s'", type_name(val->type));
     }
 }
@@ -276,8 +280,7 @@ obj_p aggr_last_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p ar
                 });
             return res;
         default:
-            res->len = 0;
-            drop_obj(res);
+            destroy_partial_result(res);
             return error(ERR_TYPE, "last: unsupported type: '%s'", type_name(val->type));
     }
 }
@@ -355,8 +358,7 @@ obj_p aggr_sum_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = 0.0, $out[$y] = ADDF64($out[$y], $in[$x]));
             return res;
         default:
-            res->len = 0;
-            drop_obj(res);
+            destroy_partial_result(res);
             return error(ERR_TYPE, "sum: unsupported type: '%s'", type_name(val->type));
     }
 }
@@ -397,8 +399,7 @@ obj_p aggr_max_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = 0.0, $out[$y] = MAXF64($out[$y], $in[$x]));
             return res;
         default:
-            res->len = 0;
-            drop_obj(res);
+            destroy_partial_result(res);
             return error(ERR_TYPE, "max: unsupported type: '%s'", type_name(val->type));
     }
 }
