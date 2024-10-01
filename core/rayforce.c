@@ -1494,17 +1494,23 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             heap_free(obj);
             return;
         case TYPE_ENUM:
-            if (IS_EXTERNAL_COMPOUND(obj))
-                mmap_free((str_p)obj - RAY_PAGE_SIZE, size_of(obj) + RAY_PAGE_SIZE);
-            else {
+            if (IS_EXTERNAL_COMPOUND(obj)) {
+                fdmap = runtime_fdmap_pop(runtime_get(), obj);
+                drop_obj(fdmap);
+                // mmap_free((str_p)obj - RAY_PAGE_SIZE, size_of(obj) + RAY_PAGE_SIZE);
+            } else {
                 drop_obj(AS_LIST(obj)[0]);
                 drop_obj(AS_LIST(obj)[1]);
                 heap_free(obj);
             }
             return;
         case TYPE_ANYMAP:
-            mmap_free(ANYMAP_KEY(obj), size_of(obj));
-            mmap_free((str_p)obj - RAY_PAGE_SIZE, size_of(obj) + RAY_PAGE_SIZE);
+            fdmap = runtime_fdmap_pop(runtime_get(), ANYMAP_KEY(obj));
+            drop_obj(fdmap);
+            fdmap = runtime_fdmap_pop(runtime_get(), obj);
+            drop_obj(fdmap);
+            // mmap_free(ANYMAP_KEY(obj), size_of(obj));
+            // mmap_free((str_p)obj - RAY_PAGE_SIZE, size_of(obj) + RAY_PAGE_SIZE);
             return;
         case TYPE_TABLE:
         case TYPE_DICT:
