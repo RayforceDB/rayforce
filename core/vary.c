@@ -191,8 +191,8 @@ obj_p ray_set_parted(obj_p *x, u64_t n) {
 }
 
 obj_p ray_get_parted(obj_p *x, u64_t n) {
-    u64_t i, l, m;
-    obj_p path, dir, sym, dirs, gcol, ord, t1, t2, eq, res;
+    u64_t i, j, l, wide;
+    obj_p path, colpath, dir, sym, dirs, gcol, ord, t1, t2, eq, fmap, fmaps, res;
 
     switch (n) {
         case 2:
@@ -265,14 +265,24 @@ obj_p ray_get_parted(obj_p *x, u64_t n) {
                 return t1;
             }
 
-            m = ops_count(t1);
+            wide = AS_LIST(t1)[1]->len;
 
-            if (m == 0) {
+            if (wide == 0) {
                 drop_obj(gcol);
                 drop_obj(res);
                 drop_obj(t1);
                 drop_obj(path);
-                THROW(ERR_LENGTH, "get parted: empty partition");
+                THROW(ERR_LENGTH, "get parted: partition may not have zero columns");
+            }
+
+            fmaps = LIST(l);
+            for (j = 0; j < l; j++)
+                AS_LIST(fmaps)[j] = LIST(0);
+
+            // Create filemaps over columns of the 1st partition
+            for (i = 0; i < wide; i++) {
+                colpath = str_fmt(-1, "%s%s", AS_C8(path), str_from_symbol(AS_SYMBOL(AS_LIST(t1)[0])[i]));
+                push_obj(AS_LIST(fmaps), colpath);
             }
 
             drop_obj(path);
@@ -293,13 +303,13 @@ obj_p ray_get_parted(obj_p *x, u64_t n) {
                 }
 
                 // Partitions must have the same length
-                if (ops_count(t1) != ops_count(t2)) {
+                if (wide != AS_LIST(t2)[1]->len) {
                     drop_obj(gcol);
                     drop_obj(res);
                     drop_obj(t1);
                     drop_obj(t2);
                     drop_obj(path);
-                    THROW(ERR_LENGTH, "get parted: partitions have different lengths");
+                    THROW(ERR_LENGTH, "get parted: partitions have different wides");
                 }
 
                 // Partitions must have the same column names
@@ -317,8 +327,8 @@ obj_p ray_get_parted(obj_p *x, u64_t n) {
                 drop_obj(eq);
 
                 // Partitions must have the same column types
-                for (i = 0; i < m; i++) {
-                    if (AS_LIST(AS_LIST(t1)[1])[i]->type != AS_LIST(AS_LIST(t2)[1])[i]->type) {
+                for (j = 0; j < wide; j++) {
+                    if (AS_LIST(AS_LIST(t1)[1])[j]->type != AS_LIST(AS_LIST(t2)[1])[j]->type) {
                         drop_obj(gcol);
                         drop_obj(res);
                         drop_obj(t1);
@@ -327,13 +337,21 @@ obj_p ray_get_parted(obj_p *x, u64_t n) {
                         THROW(ERR_LENGTH, "get parted: partitions have different column types");
                     }
                 }
+
+                // Create filemaps over columns of the partition
+                for (j = 0; j < wide; j++) {
+                    colpath = str_fmt(-1, "%s%s", AS_C8(path), str_from_symbol(AS_SYMBOL(AS_LIST(t2)[0])[j]));
+                    push_obj(AS_LIST(fmaps) + i, colpath);
+                }
+
+                drop_obj(t2);
+                drop_obj(path);
             }
 
-            for (i = 0; i < l; i++) {
-                path = ray_concat(x[0], at_idx(res, i));
-            }
+            drop_obj(t1);
+            drop_obj(res);
 
-            return vn_list(2, gcol, res);
+            return vn_list(2, gcol, fmaps);
 
         default:
             THROW(ERR_LENGTH, "get parted: expected 2 arguments, got %lld", n);

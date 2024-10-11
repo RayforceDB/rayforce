@@ -482,11 +482,17 @@ obj_p ray_concat(obj_p x, obj_p y) {
         case MTYPE2(TYPE_C8, TYPE_C8):
             xl = ops_count(x);
             yl = ops_count(y);
+
+            if (xl > 0 && AS_C8(x)[xl - 1] == '\0')
+                xl--;
+
             vec = C8(xl + yl);
+
             for (i = 0; i < xl; i++)
                 AS_C8(vec)[i] = AS_C8(x)[i];
             for (i = 0; i < yl; i++)
                 AS_C8(vec)[i + xl] = AS_C8(y)[i];
+
             return vec;
 
         case MTYPE2(TYPE_LIST, TYPE_LIST):
