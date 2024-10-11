@@ -39,6 +39,7 @@
 #include "compose.h"
 #include "items.h"
 #include "order.h"
+#include "cmp.h"
 
 obj_p vary_call_atomic(vary_f f, obj_p *x, u64_t n) {
     u64_t i, j, l;
@@ -190,8 +191,8 @@ obj_p ray_set_parted(obj_p *x, u64_t n) {
 }
 
 obj_p ray_get_parted(obj_p *x, u64_t n) {
-    u64_t i, l;
-    obj_p path, dir, sym, dirs, gcol, ord, res;
+    u64_t i, l, m;
+    obj_p path, dir, sym, dirs, gcol, ord, t1, t2, eq, res;
 
     switch (n) {
         case 2:
@@ -244,7 +245,92 @@ obj_p ray_get_parted(obj_p *x, u64_t n) {
 
             // Trverse dirs for requested table
             l = res->len;
+
+            if (l == 0) {
+                drop_obj(gcol);
+                drop_obj(res);
+                THROW(ERR_LENGTH, "get parted: empty directory");
+            }
+
+            // Load schema of the first partition
+            path = str_fmt(-1, "%.*s%.*s/%s/", (i32_t)x[0]->len, AS_C8(x[0]), (i32_t)AS_LIST(res)[0]->len,
+                           AS_C8(AS_LIST(res)[0]), str_from_symbol(x[1]->i64));
+
+            t1 = io_get_table_splayed(path, NULL_OBJ);
+
+            if (IS_ERROR(t1)) {
+                drop_obj(gcol);
+                drop_obj(res);
+                drop_obj(path);
+                return t1;
+            }
+
+            m = ops_count(t1);
+
+            if (m == 0) {
+                drop_obj(gcol);
+                drop_obj(res);
+                drop_obj(t1);
+                drop_obj(path);
+                THROW(ERR_LENGTH, "get parted: empty partition");
+            }
+
+            drop_obj(path);
+
+            // Check all the remaining partitions
+            for (i = 1; i < l; i++) {
+                path = str_fmt(-1, "%.*s%.*s/%s/", (i32_t)x[0]->len, AS_C8(x[0]), (i32_t)AS_LIST(res)[i]->len,
+                               AS_C8(AS_LIST(res)[i]), str_from_symbol(x[1]->i64));
+
+                t2 = io_get_table_splayed(path, NULL_OBJ);
+
+                if (IS_ERROR(t2)) {
+                    drop_obj(gcol);
+                    drop_obj(res);
+                    drop_obj(t1);
+                    drop_obj(path);
+                    return t2;
+                }
+
+                // Partitions must have the same length
+                if (ops_count(t1) != ops_count(t2)) {
+                    drop_obj(gcol);
+                    drop_obj(res);
+                    drop_obj(t1);
+                    drop_obj(t2);
+                    drop_obj(path);
+                    THROW(ERR_LENGTH, "get parted: partitions have different lengths");
+                }
+
+                // Partitions must have the same column names
+                eq = ray_eq(AS_LIST(t1)[0], AS_LIST(t2)[0]);
+                if (!eq->b8) {
+                    drop_obj(eq);
+                    drop_obj(gcol);
+                    drop_obj(res);
+                    drop_obj(t1);
+                    drop_obj(t2);
+                    drop_obj(path);
+                    THROW(ERR_LENGTH, "get parted: partitions have different column names");
+                }
+
+                drop_obj(eq);
+
+                // Partitions must have the same column types
+                for (i = 0; i < m; i++) {
+                    if (AS_LIST(AS_LIST(t1)[1])[i]->type != AS_LIST(AS_LIST(t2)[1])[i]->type) {
+                        drop_obj(gcol);
+                        drop_obj(res);
+                        drop_obj(t1);
+                        drop_obj(t2);
+                        drop_obj(path);
+                        THROW(ERR_LENGTH, "get parted: partitions have different column types");
+                    }
+                }
+            }
+
             for (i = 0; i < l; i++) {
+                path = ray_concat(x[0], at_idx(res, i));
             }
 
             return vn_list(2, gcol, res);

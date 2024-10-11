@@ -129,7 +129,9 @@ i64_t mmap_commit(raw_p addr, u64_t size) { return mprotect(addr, size, PROT_REA
 #define MAP_ANON 0x1000
 #define MAP_ANONYMOUS MAP_ANON
 
-raw_p mmap_stack(u64_t size) { return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0); }
+raw_p mmap_stack(u64_t size) {
+    return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
+}
 
 raw_p mmap_alloc(u64_t size) { return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0); }
 

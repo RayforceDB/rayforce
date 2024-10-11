@@ -132,7 +132,8 @@ b8_t is_valid(obj_p obj) {
            || obj->type == TYPE_BINARY    || obj->type == TYPE_VARY   
            || obj->type == TYPE_ENUM      || obj->type == TYPE_ANYMAP       
            || obj->type == TYPE_FILTERMAP || obj->type == TYPE_GROUPMAP 
-           || obj->type == TYPE_FDMAP     || obj->type == TYPE_LIST
-           || obj->type == TYPE_NULL      || obj->type == TYPE_ERROR;
+           || obj->type == TYPE_FDMAP     || obj->type == TYPE_FILEMAP
+           || obj->type == TYPE_LIST      || obj->type == TYPE_NULL
+           || obj->type == TYPE_ERROR;
     // clang-format on
 }

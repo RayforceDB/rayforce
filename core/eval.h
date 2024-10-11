@@ -94,6 +94,19 @@ inline __attribute__((always_inline)) ctx_p ctx_pop(nil_t) { return &__INTERPRET
 
 inline __attribute__((always_inline)) ctx_p ctx_get(nil_t) { return &__INTERPRETER->ctxstack[__INTERPRETER->cp - 1]; }
 
+inline __attribute__((always_inline)) ctx_p ctx_top(obj_p info) {
+    ctx_p ctx;
+    i64_t sp;
+
+    sp = __INTERPRETER->sp;
+    stack_push(NULL_OBJ);
+    ctx = ctx_get();
+    AS_LAMBDA(ctx->lambda)->nfo = info;
+    ctx->sp = sp;
+
+    return ctx;
+}
+
 inline __attribute__((always_inline)) obj_p unwrap(obj_p obj, i64_t id) {
     if (IS_ERROR(obj))
         error_add_loc(obj, id, ctx_get());

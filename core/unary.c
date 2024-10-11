@@ -169,6 +169,8 @@ obj_p ray_get(obj_p x) {
             // get other obj
             else {
                 path = cstring_from_obj(x);
+                DEBUG_PRINT("GET: %s\n", AS_C8(path));
+                DEBUG_OBJ(path);
                 fd = fs_fopen(AS_C8(path), ATTR_RDWR);
 
                 if (fd == -1) {

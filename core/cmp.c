@@ -116,15 +116,15 @@ obj_p ray_eq(obj_p x, obj_p y) {
 
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(-TYPE_B8, -TYPE_B8):
-            return (b8(x->b8 == y->b8));
+            return b8(x->b8 == y->b8);
 
         case MTYPE2(-TYPE_I64, -TYPE_I64):
         case MTYPE2(-TYPE_SYMBOL, -TYPE_SYMBOL):
         case MTYPE2(-TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
-            return (b8(x->i64 == y->i64));
+            return b8(x->i64 == y->i64);
 
         case MTYPE2(-TYPE_F64, -TYPE_F64):
-            return (b8(x->f64 == y->f64));
+            return b8(x->f64 == y->f64);
 
         case MTYPE2(TYPE_I64, -TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, -TYPE_SYMBOL):

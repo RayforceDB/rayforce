@@ -53,8 +53,7 @@ obj_p cstring_from_str(lit_p str, u64_t len) {
     } else {
         s = C8(len + 1);
         memcpy(AS_C8(s), str, len);
-        AS_C8(s)
-        [len] = '\0';
+        AS_C8(s)[len] = '\0';
         return s;
     }
 
