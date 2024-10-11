@@ -192,7 +192,7 @@ obj_p ray_set_parted(obj_p *x, u64_t n) {
 
 obj_p ray_get_parted(obj_p *x, u64_t n) {
     u64_t i, j, l, wide;
-    obj_p path, colpath, dir, sym, dirs, gcol, ord, t1, t2, eq, fmaps, fdmap, res;
+    obj_p path, colpath, dir, sym, dirs, gcol, ord, t1, t2, eq, fmaps, fdmap, keys, vals, res;
     runtime_p runtime;
 
     runtime = runtime_get();
@@ -355,13 +355,21 @@ obj_p ray_get_parted(obj_p *x, u64_t n) {
                 drop_obj(path);
             }
 
-            drop_obj(t1);
+            sym = (gcol->type == TYPE_TIMESTAMP) ? symbol("Date", 4) : symbol("Id", 2);
+            keys = ray_concat(sym, AS_LIST(t1)[0]);
+            vals = ray_concat(gcol, fmaps);
+
+            drop_obj(sym);
             drop_obj(res);
+            drop_obj(t1);
+            drop_obj(gcol);
+            drop_obj(fmaps);
 
-            for (i = 0; i < wide; i++)
-                AS_LIST(fmaps)[i]->type = TYPE_FILEMAP;
+            l = wide + 1;
+            for (i = 1; i < l; i++)
+                AS_LIST(vals)[i]->type = TYPE_FILEMAP;
 
-            return vn_list(2, gcol, fmaps);
+            return table(keys, vals);
 
         default:
             THROW(ERR_LENGTH, "get parted: expected 2 arguments, got %lld", n);
