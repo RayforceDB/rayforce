@@ -393,6 +393,11 @@ obj_p select_apply_mappings(obj_p obj, query_ctx_p ctx) {
     return NULL_OBJ;
 }
 
+obj_p filemap_materialize(obj_p filemap) {
+    DEBUG_PRINT("L: %lld", filemap->len);
+    return I64(filemap->len);
+}
+
 obj_p select_collect_fields(query_ctx_p ctx) {
     u64_t i, l;
     obj_p prm, sym, val, keys, res;
@@ -449,14 +454,22 @@ obj_p select_collect_fields(query_ctx_p ctx) {
         prm = ray_get(sym);
         drop_obj(sym);
 
-        if (prm->type == TYPE_FILTERMAP) {
-            val = filter_collect(AS_LIST(prm)[0], AS_LIST(prm)[1]);
-            drop_obj(prm);
-        } else if (prm->type == TYPE_ENUM) {
-            val = ray_value(prm);
-            drop_obj(prm);
-        } else
-            val = prm;
+        switch (prm->type) {
+            case TYPE_FILTERMAP:
+                val = filter_collect(AS_LIST(prm)[0], AS_LIST(prm)[1]);
+                drop_obj(prm);
+                break;
+            case TYPE_ENUM:
+                val = ray_value(prm);
+                drop_obj(prm);
+                break;
+            case TYPE_FILEMAP:
+                val = filemap_materialize(prm);
+                drop_obj(prm);
+                break;
+            default:
+                val = prm;
+        }
 
         if (IS_ERROR(val)) {
             res->len = i;
