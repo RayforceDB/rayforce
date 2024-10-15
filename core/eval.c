@@ -127,7 +127,7 @@ obj_p call(obj_p obj, u64_t arity) {
         // normal return
         case 0:
             res = eval(lambda->body);
-            ctx = ctx_pop();
+            ctx_pop();
 
             // cleanup stack frame
             while (__INTERPRETER->sp > sp)
@@ -138,7 +138,7 @@ obj_p call(obj_p obj, u64_t arity) {
         // return from function via 'return' call
         case 1:
             res = stack_pop();
-            ctx = ctx_pop();
+            ctx_pop();
 
             // cleanup stack frame
             while (__INTERPRETER->sp > sp)
@@ -149,7 +149,7 @@ obj_p call(obj_p obj, u64_t arity) {
         // error
         default:
             res = stack_pop();
-            ctx = ctx_pop();
+            ctx_pop();
 
             // cleanup stack frame
             while (__INTERPRETER->sp > sp)

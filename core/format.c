@@ -1041,7 +1041,6 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
 
     m = n;
     n += glyph_fmt_into(dst, GLYPH_BL_CORNER, unicode);
-    m = n - m;
     for (i = 0; i < total_width; i++)
         n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
 

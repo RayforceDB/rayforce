@@ -734,16 +734,14 @@ obj_p at_ids(obj_p obj, i64_t ids[], u64_t len) {
         case TYPE_MAPF64:
         case TYPE_MAPGUID:
         case TYPE_MAPENUM:
-            // res = LIST(len);
-            // res->type = obj->type;
-            // oinp = AS_LIST(obj);
-            // oout = AS_LIST(res);
-            // for (i = 0; i < len; i++)
-            //     oout[i] = clone_obj(oinp[ids[i]]);
+            res = LIST(len);
+            res->type = obj->type;
+            oinp = AS_LIST(obj);
+            oout = AS_LIST(res);
+            for (i = 0; i < len; i++)
+                oout[i] = clone_obj(oinp[ids[i]]);
 
-            // return res;
-
-            return clone_obj(AS_LIST(obj)[0]);
+            return res;
         case TYPE_VIRTMAP:
             l = AS_I64(AS_LIST(obj)[1])[0];
             res = vector(AS_LIST(obj)[0]->type, l);

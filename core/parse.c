@@ -460,7 +460,7 @@ obj_p parse_C8(parser_t *parser) {
                     drop_obj(str);
                     span.end_column += (pos - parser->current);
                     nfo_insert(parser->nfo, parser->count, span);
-                    err = parse_error(parser, parser->count++, str_fmt(-1, "Invalid escape sequence"));
+                    return parse_error(parser, parser->count++, str_fmt(-1, "Invalid escape sequence"));
             }
 
             continue;

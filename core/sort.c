@@ -183,9 +183,7 @@ nil_t counting_sort_asc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i6
         m[n]++;
     }
 
-    j = 0;
-    p = 0;
-    for (i = 0; i < range; i++) {
+    for (i = 0, j = 0; i < range; i++) {
         if (m[i] > 0) {
             p = j;
             j += m[i];
@@ -216,9 +214,7 @@ nil_t counting_sort_desc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i
         m[n]++;
     }
 
-    j = 0;
-    p = 0;
-    for (i = range - 1; i >= 0; i--) {
+    for (i = range - 1, j = 0; i >= 0; i--) {
         if (m[i] > 0) {
             p = j;
             j += m[i];

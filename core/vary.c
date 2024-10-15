@@ -193,9 +193,6 @@ obj_p ray_set_parted(obj_p *x, u64_t n) {
 obj_p ray_get_parted(obj_p *x, u64_t n) {
     u64_t i, j, l, wide;
     obj_p path, colpath, dir, sym, dirs, gcol, ord, t1, t2, eq, fmaps, fdmap, virtmap, keys, vals, res;
-    runtime_p runtime;
-
-    runtime = runtime_get();
 
     switch (n) {
         case 2:
