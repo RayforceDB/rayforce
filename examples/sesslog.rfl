@@ -1,0 +1,29 @@
+(set sesslog
+  (table [time sym sn outlie origSNRC origSN origTR body proxyId feId]
+    (list
+      (as 'Timestamp (list))
+      (as 'Symbol (list))
+      []
+      []
+      []
+      []
+      []
+      (list)
+      (as 'Symbol (list))
+      (as 'Symbol (list)))))
+
+(set putLog
+  (fn [stream_id sn outlie orig_snrc orig_sn orig_cat body proxy_id]
+    (insert 'sesslog
+      (list
+        (timestamp 'utc)
+        stream_id
+        sn
+        outlie
+        orig_snrc
+        orig_sn
+        orig_cat
+        body
+        proxy_id
+        0s))
+    0))
