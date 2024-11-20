@@ -394,7 +394,7 @@ obj_p aggr_last(obj_p val, obj_p index) {
             return res;
         default:
             drop_obj(parts);
-            return error(ERR_TYPE, "sum: unsupported type: '%s'", type_name(val->type));
+            return error(ERR_TYPE, "last: unsupported type: '%s'", type_name(val->type));
     }
 }
 
