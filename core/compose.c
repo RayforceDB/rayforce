@@ -200,7 +200,7 @@ obj_p ray_table(obj_p x, obj_p y) {
 
                 cl = j;
                 break;
-            case TYPE_MAPGENERATOR:
+            case TYPE_MAPCOMMON:
                 j = AS_LIST(AS_LIST(y)[i])[0]->len;
                 if (cl != 0 && j != cl)
                     return error(ERR_LENGTH, "table: values must be of the same length");
@@ -240,7 +240,7 @@ obj_p ray_table(obj_p x, obj_p y) {
             case TYPE_ENUM:
                 AS_LIST(lst)[i] = ray_value(AS_LIST(y)[i]);
                 break;
-            case TYPE_MAPGENERATOR:
+            case TYPE_MAPCOMMON:
                 AS_LIST(lst)[i] = clone_obj(AS_LIST(AS_LIST(y)[i])[0]);
                 break;
             default:

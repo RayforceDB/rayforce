@@ -1030,7 +1030,7 @@ obj_p index_group(obj_p val, obj_p filter) {
             bins = index_group_obj(v, filter);
             drop_obj(v);
             return bins;
-        case TYPE_MAPGENERATOR:
+        case TYPE_MAPCOMMON:
             return index_group_build(INDEX_TYPE_GENERATOR, AS_LIST(val)[0]->len, clone_obj(val), NULL_I64, NULL_OBJ,
                                      clone_obj(filter));
         default:

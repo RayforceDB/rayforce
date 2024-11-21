@@ -355,7 +355,7 @@ obj_p ray_get_parted(obj_p *x, u64_t n) {
             // Create a virtual column for the grouping column
             l = gcol->len;
             virtcol = vn_list(2, vector(gcol->type, l), I64(l));
-            virtcol->type = TYPE_MAPGENERATOR;
+            virtcol->type = TYPE_MAPCOMMON;
             for (i = 0; i < l; i++) {
                 n = ops_count(AS_LIST(AS_LIST(fmaps)[0])[i]);
                 AS_I64(AS_LIST(virtcol)[0])[i] = AS_I64(gcol)[i];

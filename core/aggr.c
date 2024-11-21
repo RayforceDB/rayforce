@@ -297,7 +297,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
             for (i = 0; i < n; i++)
                 memcpy(AS_GUID(res) + i, AS_GUID(AS_LIST(val)[i])[0], sizeof(guid_t));
             return res;
-        case TYPE_MAPGENERATOR:
+        case TYPE_MAPCOMMON:
             return clone_obj(AS_LIST(val)[0]);
         default:
             return error(ERR_TYPE, "first: unsupported type: '%s'", type_name(val->type));

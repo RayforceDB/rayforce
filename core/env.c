@@ -261,7 +261,7 @@ nil_t init_typenames(obj_p typenames)
     REGISTER_TYPE(typenames,    TYPE_MAPFILTER,       "Mapfilter");
     REGISTER_TYPE(typenames,    TYPE_MAPGROUP,        "Mapgroup");
     REGISTER_TYPE(typenames,    TYPE_MAPFD,           "Mapfd");
-    REGISTER_TYPE(typenames,    TYPE_MAPGENERATOR,    "Mapgenerator");
+    REGISTER_TYPE(typenames,    TYPE_MAPCOMMON,       "Mapcommon");
     REGISTER_TYPE(typenames,    TYPE_SYMBOL,          "Symbol");
     REGISTER_TYPE(typenames,    TYPE_TIMESTAMP,       "Timestamp");
     REGISTER_TYPE(typenames,    TYPE_GUID,            "Guid");

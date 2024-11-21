@@ -667,7 +667,7 @@ i64_t raw_fmt_into(obj_p *dst, i64_t indent, i64_t limit, obj_p obj, i64_t i) {
         case TYPE_PARTEDF64:
         case TYPE_PARTEDGUID:
         case TYPE_PARTEDENUM:
-        case TYPE_MAPGENERATOR:
+        case TYPE_MAPCOMMON:
             res = at_idx(obj, i);
             n = obj_fmt_into(dst, indent, limit, B8_FALSE, res);
             drop_obj(res);

@@ -44,7 +44,7 @@ extern "C"
 #define TYPE_MAPFILTER 72
 #define TYPE_MAPGROUP 73
 #define TYPE_MAPFD 74
-#define TYPE_MAPGENERATOR 75
+#define TYPE_MAPCOMMON 75
 #define TYPE_MAPLIST 76
 // Parted types 77..97 (TYPE_PARTEDLIST 77 + type)
 #define TYPE_PARTEDLIST 77

@@ -1124,9 +1124,20 @@ obj_p ray_value(obj_p x) {
 }
 
 obj_p ray_where(obj_p x) {
+    obj_p vec, map;
+
     switch (x->type) {
         case TYPE_B8:
             return ops_where(AS_B8(x), x->len);
+        case TYPE_MAPCOMMON:
+            if (AS_LIST(x)[0]->type != TYPE_B8)
+                THROW(ERR_TYPE, "where: first argument must be a boolean vector");
+
+            vec = ops_where(AS_B8(AS_LIST(x)[0]), AS_LIST(x)[0]->len);
+            map = vn_list(2, vec, NULL_OBJ);
+            map->type = TYPE_MAPCOMMON;
+
+            return map;
         default:
             THROW(ERR_TYPE, "where: unsupported type: '%s", type_name(x->type));
     }

@@ -728,7 +728,7 @@ obj_p at_idx(obj_p obj, i64_t idx) {
 
             return guid(NULL);
 
-        case TYPE_MAPGENERATOR:
+        case TYPE_MAPCOMMON:
             l = AS_LIST(obj)[0]->len;
             for (i = 0, n = 0; i < l; i++) {
                 m = AS_I64(AS_LIST(obj)[1])[i];
@@ -1649,7 +1649,7 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
         case TYPE_LIST:
         case TYPE_MAPFILTER:
         case TYPE_MAPGROUP:
-        case TYPE_MAPGENERATOR:
+        case TYPE_MAPCOMMON:
         case TYPE_PARTEDLIST:
         case TYPE_PARTEDB8:
         case TYPE_PARTEDU8:

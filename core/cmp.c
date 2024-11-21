@@ -113,7 +113,7 @@ obj_p ray_eq_partial(u64_t len, u64_t offset, obj_p lhs, obj_p rhs, obj_p res) {
 
 obj_p ray_eq(obj_p x, obj_p y) {
     i64_t i, l;
-    obj_p vec;
+    obj_p vec, map;
 
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(-TYPE_B8, -TYPE_B8):
@@ -231,6 +231,30 @@ obj_p ray_eq(obj_p x, obj_p y) {
 
             return vec;
         default:
+            if (x->type == TYPE_MAPCOMMON) {
+                vec = ray_eq(AS_LIST(x)[0], y);
+                if (IS_ERROR(vec))
+                    return vec;
+
+                map = LIST(2);
+                map->type = TYPE_MAPCOMMON;
+                AS_LIST(map)[0] = vec;
+                AS_LIST(map)[1] = clone_obj(AS_LIST(x)[1]);
+
+                return map;
+            } else if (y->type == TYPE_MAPCOMMON) {
+                vec = ray_eq(x, AS_LIST(y)[0]);
+                if (IS_ERROR(vec))
+                    return vec;
+
+                map = LIST(2);
+                map->type = TYPE_MAPCOMMON;
+                AS_LIST(map)[0] = vec;
+                AS_LIST(map)[1] = clone_obj(AS_LIST(y)[1]);
+
+                return map;
+            }
+
             THROW(ERR_TYPE, "eq: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
