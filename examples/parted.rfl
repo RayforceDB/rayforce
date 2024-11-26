@@ -4,7 +4,7 @@
 (set sympath (format "%/sym" dbpath))
 (set gen-tab 
     (fn [x]
-        (let p (format "%/%/%/" dbpath (+ 2021.01.01 (* 24 (* 3600 (* x 1000000000)))) tabname))
+        (let p (format "%/%/%/" dbpath (+ 2024.01.01 (* 24 (* 3600 (* x 1000000000)))) tabname))
         (println "Creating table: %" p)
         (let t (table [OrderId Symbol Price Size Tape Timestamp] 
             (list (take n (guid 1000000))

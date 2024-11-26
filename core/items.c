@@ -1118,6 +1118,27 @@ obj_p ray_value(obj_p x) {
             }
 
             return res;
+
+            // case TYPE_MAPCOMMON:
+            //     l = AS_LIST(x)[0]->len;
+            //     if (l == 0)
+            //         return NULL_OBJ;
+
+            //     n = ops_count(x);
+            //     res = vector(AS_LIST(x)[0]->type, n);
+            //     i64ptr = AS_I64(res);
+
+            //     for (i = 0; i < l; i++) {
+            //         n = AS_I64(AS_LIST(x)[1])[i];
+
+            //         for (j = 0; j < n; j++)
+            //             i64ptr[j] = AS_I64(AS_LIST(x)[0])[i];
+
+            //         i64ptr += n;
+            //     }
+
+            //     return res;
+
         default:
             return clone_obj(x);
     }

@@ -241,7 +241,7 @@ obj_p ray_table(obj_p x, obj_p y) {
                 AS_LIST(lst)[i] = ray_value(AS_LIST(y)[i]);
                 break;
             case TYPE_MAPCOMMON:
-                AS_LIST(lst)[i] = clone_obj(AS_LIST(AS_LIST(y)[i])[0]);
+                AS_LIST(lst)[i] = ray_value(AS_LIST(y)[i]);
                 break;
             default:
                 AS_LIST(lst)[i] = clone_obj(AS_LIST(y)[i]);

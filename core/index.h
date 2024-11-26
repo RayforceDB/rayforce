@@ -57,6 +57,7 @@ u64_t index_group_count(obj_p index);
 u64_t index_group_len(obj_p index);
 index_type_t index_group_type(obj_p index);
 i64_t *index_group_source(obj_p index);
+i64_t *index_group_ids(obj_p index);
 i64_t *index_group_filter(obj_p index);
 i64_t index_group_shift(obj_p index);
 obj_p index_distinct_i8(i8_t values[], u64_t len, b8_t term);
