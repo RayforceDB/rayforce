@@ -128,7 +128,7 @@
 
 obj_p aggr_map(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
     pool_p pool = runtime_get()->pool;
-    u64_t i, l, n, group_count, group_len, chunk;
+    u64_t i, l, n, group_count, group_len, out_len, chunk;
     obj_p res;
     index_type_t index_type;
     raw_p argv[6];
@@ -139,6 +139,7 @@ obj_p aggr_map(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
     index_type = index_group_type(index);
     group_count = index_group_count(index);
     group_len = (index_type == INDEX_TYPE_PARTEDCOMMON) ? val->len : index_group_len(index);
+    out_len = (index_type == INDEX_TYPE_PARTEDCOMMON) ? 1 : group_count;
 
     n = pool_split_by(pool, group_len, group_count);
     if (n == 1) {
@@ -146,7 +147,7 @@ obj_p aggr_map(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
         argv[1] = (raw_p)0;
         argv[2] = val;
         argv[3] = index;
-        argv[4] = (index_type == INDEX_TYPE_PARTEDCOMMON) ? vector(outype, 1) : vector(outype, group_count);
+        argv[4] = (index_type == INDEX_TYPE_PARTEDCOMMON) ? vector(outype, 1) : vector(outype, out_len);
         res = pool_call_task_fn(aggr, 5, argv);
 
         return vn_list(1, res);
@@ -157,20 +158,10 @@ obj_p aggr_map(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
     l = group_len;
     chunk = l / n;
 
-    switch (index_type) {
-        case INDEX_TYPE_PARTEDCOMMON:
-            for (i = 0; i < n - 1; i++)
-                pool_add_task(pool, aggr, 5, chunk, i * chunk, val, index, vector(outype, 1));
+    for (i = 0; i < n - 1; i++)
+        pool_add_task(pool, aggr, 5, chunk, i * chunk, val, index, vector(outype, out_len));
 
-            pool_add_task(pool, aggr, 5, l - i * chunk, i * chunk, val, index, vector(outype, 1));
-            break;
-
-        default:
-            for (i = 0; i < n - 1; i++)
-                pool_add_task(pool, aggr, 5, chunk, i * chunk, val, index, vector(outype, group_count));
-
-            pool_add_task(pool, aggr, 5, l - i * chunk, i * chunk, val, index, vector(outype, group_count));
-    }
+    pool_add_task(pool, aggr, 5, l - i * chunk, i * chunk, val, index, vector(outype, out_len));
 
     return pool_run(pool);
 }
