@@ -37,15 +37,15 @@
 #include "cmp.h"
 #include "pool.h"
 
-#define __i8(x) I8(x)
-#define __u8(x) U8(x)
-#define __b8(x) B8(x)
-#define __c8(x) C8(x)
-#define __symbol(x) SYMBOL(x)
-#define __i64(x) I64(x)
-#define __f64(x) F64(x)
-#define __guid(x) GUID(x)
-#define __list(x) LIST(x)
+#define __v_i8(x) I8(x)
+#define __v_u8(x) U8(x)
+#define __v_b8(x) B8(x)
+#define __v_c8(x) C8(x)
+#define __v_symbol(x) SYMBOL(x)
+#define __v_i64(x) I64(x)
+#define __v_f64(x) F64(x)
+#define __v_guid(x) GUID(x)
+#define __v_list(x) LIST(x)
 
 #define __AS_i8(x) AS_I8(x)
 #define __AS_u8(x) AS_U8(x)
@@ -56,6 +56,15 @@
 #define __AS_f64(x) AS_F64(x)
 #define __AS_guid(x) AS_GUID(x)
 #define __AS_list(x) AS_LIST(x)
+
+#define SIZE_OF_i8 sizeof(i8_t)
+#define SIZE_OF_u8 sizeof(u8_t)
+#define SIZE_OF_b8 sizeof(b8_t)
+#define SIZE_OF_c8 sizeof(c8_t)
+#define SIZE_OF_i64 sizeof(i64_t)
+#define SIZE_OF_f64 sizeof(f64_t)
+#define SIZE_OF_guid sizeof(guid_t)
+#define SIZE_OF_list sizeof(obj_p)
 
 #define AGGR_ITER(index, len, offset, val, res, incoerse, outcoerse, ini, aggr)      \
     ({                                                                               \
@@ -136,23 +145,23 @@
         $res;                                                  \
     })
 
-#define PARTED_MAP(groups, val, index, preaggr, incoerse, outcoerse, postaggr)                  \
-    ({                                                                                          \
-        u64_t $$i, $$j, $$l;                                                                    \
-        obj_p $$parts, $$res, $$filter, $$v;                                                    \
-        $$l = val->len;                                                                         \
-        $$filter = index_group_filter(index);                                                   \
-        $$res = __##outcoerse(groups);                                                          \
-        for ($$i = 0, $$j = 0; $$i < $$l; $$i++) {                                              \
-            if (AS_LIST($$filter)[$$i] != NULL_OBJ) {                                           \
-                $$parts = aggr_map(preaggr, AS_LIST(val)[$$i], AS_LIST(val)[$$i]->type, index); \
-                $$v = AGGR_COLLECT($$parts, 1, incoerse, outcoerse, postaggr);                  \
-                drop_obj($$parts);                                                              \
-                __AS_##outcoerse($$res)[$$j++] = __AS_##incoerse($$v)[0];                       \
-                drop_obj($$v);                                                                  \
-            }                                                                                   \
-        }                                                                                       \
-        $$res;                                                                                  \
+#define PARTED_MAP(groups, val, index, preaggr, incoerse, outcoerse, postaggr)                      \
+    ({                                                                                              \
+        u64_t $$i, $$j, $$l;                                                                        \
+        obj_p $$parts, $$res, $$filter, $$v;                                                        \
+        $$l = val->len;                                                                             \
+        $$filter = index_group_filter(index);                                                       \
+        $$res = __v_##outcoerse(groups);                                                            \
+        for ($$i = 0, $$j = 0; $$i < $$l; $$i++) {                                                  \
+            if (AS_LIST($$filter)[$$i] != NULL_OBJ) {                                               \
+                $$parts = aggr_map(preaggr, AS_LIST(val)[$$i], AS_LIST(val)[$$i]->type, index);     \
+                $$v = AGGR_COLLECT($$parts, 1, incoerse, outcoerse, postaggr);                      \
+                drop_obj($$parts);                                                                  \
+                memcpy(__AS_##outcoerse($$res) + $$j++, __AS_##incoerse($$v), SIZE_OF_##outcoerse); \
+                drop_obj($$v);                                                                      \
+            }                                                                                       \
+        }                                                                                           \
+        $$res;                                                                                      \
     })
 
 obj_p aggr_map(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
@@ -327,15 +336,12 @@ obj_p aggr_first(obj_p val, obj_p index) {
 
             return res;
         case TYPE_PARTEDF64:
-            res = vector(AS_LIST(val)[0]->type, n);
-            for (i = 0; i < n; i++)
-                AS_F64(res)[i] = AS_F64(AS_LIST(val)[i])[0];
-            return res;
+            return PARTED_MAP(n, val, index, (raw_p)aggr_first_partial, f64, f64,
+                              if (ops_is_nan($out[$y])) $out[$y] = $in[$x]);
         case TYPE_PARTEDGUID:
-            res = vector(AS_LIST(val)[0]->type, n);
-            for (i = 0; i < n; i++)
-                memcpy(AS_GUID(res) + i, AS_GUID(AS_LIST(val)[i])[0], sizeof(guid_t));
-            return res;
+            return PARTED_MAP(n, val, index, (raw_p)aggr_first_partial, guid, guid,
+                              if (memcmp($out[$y], NULL_GUID, sizeof(guid_t)) == 0)
+                                  memcpy($out[$y], $in[$x], sizeof(guid_t)));
         case TYPE_MAPCOMMON:
             filter = index_group_filter(index);
             if (filter == NULL_OBJ)
