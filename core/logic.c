@@ -51,9 +51,8 @@ obj_p ray_and(obj_p x, obj_p y) {
 }
 
 obj_p ray_or(obj_p x, obj_p y) {
-    i32_t i;
-    i64_t l;
-    obj_p res;
+    u64_t i, l;
+    obj_p v, res;
 
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(-TYPE_B8, -TYPE_B8):
@@ -64,6 +63,34 @@ obj_p ray_or(obj_p x, obj_p y) {
             res = B8(x->len);
             for (i = 0; i < l; i++)
                 AS_B8(res)[i] = AS_B8(x)[i] | AS_B8(y)[i];
+
+            return res;
+
+        case MTYPE2(TYPE_PARTEDB8, TYPE_PARTEDB8):
+            l = x->len;
+            if (l != y->len)
+                THROW(ERR_TYPE, "or: different lengths: '%ld, '%ld", x->len, y->len);
+
+            res = LIST(l);
+            res->type = TYPE_PARTEDB8;
+            for (i = 0; i < l; i++) {
+                if (AS_LIST(x)[i] == NULL_OBJ)
+                    AS_LIST(res)[i] = clone_obj(AS_LIST(y)[i]);
+                else if (AS_LIST(y)[i] == NULL_OBJ)
+                    AS_LIST(res)[i] = clone_obj(AS_LIST(x)[i]);
+                else if (AS_LIST(x)[i]->type == -TYPE_B8 || AS_LIST(y)[i]->type == -TYPE_B8)
+                    AS_LIST(res)[i] = b8(B8_TRUE);
+                else {
+                    v = ray_or(AS_LIST(x)[i], AS_LIST(y)[i]);
+                    if (IS_ERROR(v)) {
+                        res->len = i;
+                        drop_obj(res);
+                        return v;
+                    }
+
+                    AS_LIST(res)[i] = v;
+                }
+            }
 
             return res;
 

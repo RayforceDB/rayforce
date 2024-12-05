@@ -802,6 +802,23 @@ obj_p ray_within(obj_p x, obj_p y) {
 
                 return res;
 
+            case MTYPE2(TYPE_MAPCOMMON, TYPE_TIMESTAMP):
+                l = AS_LIST(x)[0]->len;
+                min = AS_I64(y)[0];
+                max = AS_I64(y)[1];
+
+                res = LIST(l);
+                res->type = TYPE_PARTEDB8;
+
+                for (i = 0; i < l; i++) {
+                    if (AS_TIMESTAMP(AS_LIST(x)[0])[i] < min || AS_TIMESTAMP(AS_LIST(x)[0])[i] > max)
+                        AS_LIST(res)[i] = NULL_OBJ;
+                    else
+                        AS_LIST(res)[i] = b8(B8_TRUE);
+                }
+
+                return res;
+
             default:
                 THROW(ERR_TYPE, "within: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
         }

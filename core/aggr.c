@@ -57,14 +57,14 @@
 #define __AS_guid(x) AS_GUID(x)
 #define __AS_list(x) AS_LIST(x)
 
-#define SIZE_OF_i8 sizeof(i8_t)
-#define SIZE_OF_u8 sizeof(u8_t)
-#define SIZE_OF_b8 sizeof(b8_t)
-#define SIZE_OF_c8 sizeof(c8_t)
-#define SIZE_OF_i64 sizeof(i64_t)
-#define SIZE_OF_f64 sizeof(f64_t)
-#define SIZE_OF_guid sizeof(guid_t)
-#define SIZE_OF_list sizeof(obj_p)
+#define __SIZE_OF_i8 sizeof(i8_t)
+#define __SIZE_OF_u8 sizeof(u8_t)
+#define __SIZE_OF_b8 sizeof(b8_t)
+#define __SIZE_OF_c8 sizeof(c8_t)
+#define __SIZE_OF_i64 sizeof(i64_t)
+#define __SIZE_OF_f64 sizeof(f64_t)
+#define __SIZE_OF_guid sizeof(guid_t)
+#define __SIZE_OF_list sizeof(obj_p)
 
 #define AGGR_ITER(index, len, offset, val, res, incoerse, outcoerse, ini, aggr)      \
     ({                                                                               \
@@ -145,23 +145,23 @@
         $res;                                                  \
     })
 
-#define PARTED_MAP(groups, val, index, preaggr, incoerse, outcoerse, postaggr)                      \
-    ({                                                                                              \
-        u64_t $$i, $$j, $$l;                                                                        \
-        obj_p $$parts, $$res, $$filter, $$v;                                                        \
-        $$l = val->len;                                                                             \
-        $$filter = index_group_filter(index);                                                       \
-        $$res = __v_##outcoerse(groups);                                                            \
-        for ($$i = 0, $$j = 0; $$i < $$l; $$i++) {                                                  \
-            if (AS_LIST($$filter)[$$i] != NULL_OBJ) {                                               \
-                $$parts = aggr_map(preaggr, AS_LIST(val)[$$i], AS_LIST(val)[$$i]->type, index);     \
-                $$v = AGGR_COLLECT($$parts, 1, incoerse, outcoerse, postaggr);                      \
-                drop_obj($$parts);                                                                  \
-                memcpy(__AS_##outcoerse($$res) + $$j++, __AS_##incoerse($$v), SIZE_OF_##outcoerse); \
-                drop_obj($$v);                                                                      \
-            }                                                                                       \
-        }                                                                                           \
-        $$res;                                                                                      \
+#define PARTED_MAP(groups, val, index, preaggr, incoerse, outcoerse, postaggr)                        \
+    ({                                                                                                \
+        u64_t $$i, $$j, $$l;                                                                          \
+        obj_p $$parts, $$res, $$filter, $$v;                                                          \
+        $$l = val->len;                                                                               \
+        $$filter = index_group_filter(index);                                                         \
+        $$res = __v_##outcoerse(groups);                                                              \
+        for ($$i = 0, $$j = 0; $$i < $$l; $$i++) {                                                    \
+            if (AS_LIST($$filter)[$$i] != NULL_OBJ) {                                                 \
+                $$parts = aggr_map(preaggr, AS_LIST(val)[$$i], AS_LIST(val)[$$i]->type, index);       \
+                $$v = AGGR_COLLECT($$parts, 1, incoerse, outcoerse, postaggr);                        \
+                drop_obj($$parts);                                                                    \
+                memcpy(__AS_##outcoerse($$res) + $$j++, __AS_##incoerse($$v), __SIZE_OF_##outcoerse); \
+                drop_obj($$v);                                                                        \
+            }                                                                                         \
+        }                                                                                             \
+        $$res;                                                                                        \
     })
 
 obj_p aggr_map(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
@@ -484,7 +484,7 @@ obj_p aggr_sum_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
 }
 
 obj_p aggr_sum(obj_p val, obj_p index) {
-    u64_t n, l;
+    u64_t n;
     obj_p parts, res;
 
     n = index_group_count(index);
@@ -530,8 +530,8 @@ obj_p aggr_max_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
 }
 
 obj_p aggr_max(obj_p val, obj_p index) {
-    u64_t i, l, n;
-    obj_p parts, v, res;
+    u64_t n;
+    obj_p parts, res;
 
     n = index_group_count(index);
 
