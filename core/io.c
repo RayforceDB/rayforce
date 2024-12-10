@@ -210,6 +210,17 @@ obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out) {
                 n--;
             AS_LIST(out)[row] = string_from_str(start, n);
             break;
+        case TYPE_GUID:
+            if (start == NULL || end == NULL) {
+                memcpy(AS_GUID(out)[row], NULL_GUID, sizeof(guid_t));
+                break;
+            }
+            if (guid_from_str(start, end - start, AS_GUID(out)[row]) == -1) {
+                memcpy(AS_GUID(out)[row], NULL_GUID, sizeof(guid_t));
+                break;
+            }
+
+            break;
         default:
             THROW(ERR_TYPE, "csv: unsupported type: '%s", type_name(type));
     }
@@ -477,8 +488,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                         pos--;
                 }
 
-                AS_SYMBOL(names)
-                [i] = symbols_intern(prev, pos - prev);
+                AS_SYMBOL(names)[i] = symbols_intern(prev, pos - prev);
                 pos++;
                 len -= (pos - prev);
             }
@@ -501,9 +511,9 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
             cols = LIST(l);
             for (i = 0; i < l; i++) {
                 if (AS_C8(types)[i] == TYPE_C8)
-                    AS_LIST(cols)
-                [i] = LIST(lines);
-                else AS_LIST(cols)[i] = vector(AS_C8(types)[i], lines);
+                    AS_LIST(cols)[i] = LIST(lines);
+                else
+                    AS_LIST(cols)[i] = vector(AS_C8(types)[i], lines);
             }
 
             // parse lines

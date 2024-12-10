@@ -87,7 +87,7 @@ i64_t i64_from_str(lit_p str, u64_t len) {
     return result * sign;
 }
 
-f64_t f64_from_str(const char *str, u64_t len) {
+f64_t f64_from_str(lit_p str, u64_t len) {
     f64_t result = 0.0, factor = 1.0, fraction = 0.1, exp_factor = 1.0;
     i64_t exp;
     b8_t has_digits = B8_FALSE, exp_negative = B8_FALSE;
@@ -167,6 +167,41 @@ f64_t f64_from_str(const char *str, u64_t len) {
         return NULL_F64;
 
     return result * factor;
+}
+
+i64_t guid_from_str(lit_p str, u64_t len, guid_t dst) {
+    u64_t i, j, k;
+    i64_t n;
+    u8_t c;
+
+    if (len != 36)
+        return -1;
+
+    for (i = 0, j = 0, k = 0; i < len; i++) {
+        c = str[i];
+        if (c == '-')
+            continue;
+
+        if (c >= '0' && c <= '9')
+            n = c - '0';
+        else if (c >= 'a' && c <= 'f')
+            n = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F')
+            n = c - 'A' + 10;
+        else
+            return -1;
+
+        if (j % 2 == 0) {
+            dst[k] = n << 4;
+        } else {
+            dst[k] |= n;
+            k++;
+        }
+
+        j++;
+    }
+
+    return 0;
 }
 
 /*

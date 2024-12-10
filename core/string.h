@@ -37,6 +37,7 @@ obj_p cstring_from_str(lit_p str, u64_t len);
 obj_p cstring_from_obj(obj_p obj);
 i64_t i64_from_str(lit_p str, u64_t len);
 f64_t f64_from_str(lit_p str, u64_t len);
+i64_t guid_from_str(lit_p str, u64_t len, guid_t dst);
 u64_t str_cpy(str_p dst, str_p src);
 u64_t str_len(str_p s, u64_t n);
 i64_t str_cmp(lit_p lhs, u64_t m, lit_p rhs, u64_t n);
