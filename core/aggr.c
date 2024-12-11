@@ -605,6 +605,8 @@ obj_p aggr_count_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p a
     UNUSED(val);
     switch (val->type) {
         case TYPE_I64:
+        case TYPE_SYMBOL:
+        case TYPE_TIMESTAMP:
             AGGR_ITER(index, len, offset, val, res, i64, i64, $out[$y] = 0, {
                 UNUSED($in);
                 $out[$y]++;
