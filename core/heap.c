@@ -53,6 +53,7 @@ heap_p heap_create(u64_t id) {
 
     __HEAP->id = id;
     __HEAP->avail = 0;
+    __HEAP->foreign_blocks = NULL;
 
     memset(__HEAP->freelist, 0, sizeof(__HEAP->freelist));
 
@@ -62,6 +63,10 @@ heap_p heap_create(u64_t id) {
 nil_t heap_destroy(nil_t) {
     u64_t i;
     block_p block, next;
+
+    // Ensure foreign blocks are freed
+    if (__HEAP->foreign_blocks != NULL)
+        DEBUG_PRINT("%s-- HEAP[%lld]: foreign blocks not freed%s", RED, __HEAP->id, RESET);
 
     // All the nodes remains are pools, so just munmap them
     for (i = MIN_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
@@ -216,6 +221,7 @@ raw_p __attribute__((hot)) heap_alloc(u64_t size) {
 
             block->order = order;
             block->used = 1;
+            block->heap_id = __HEAP->id;
 
             __HEAP->memstat.system += size;
 
@@ -245,6 +251,7 @@ raw_p __attribute__((hot)) heap_alloc(u64_t size) {
 
     block->order = order;
     block->used = 1;
+    block->heap_id = __HEAP->id;
 
     return BLOCK2RAW(block);
 }
@@ -258,6 +265,12 @@ __attribute__((hot)) nil_t heap_free(raw_p ptr) {
 
     block = RAW2BLOCK(ptr);
     order = block->order;
+
+    if (__HEAP->id != 0 && block->heap_id != __HEAP->id) {
+        block->next = __HEAP->foreign_blocks;
+        __HEAP->foreign_blocks = block;
+        return;
+    }
 
     for (;; order++) {
         // check if we are at the root block (no buddies left)
@@ -295,8 +308,8 @@ __attribute__((hot)) raw_p heap_realloc(raw_p ptr, u64_t new_size) {
     if (block->order == order)
         return ptr;
 
-    // grow
-    if (order > block->order) {
+    // grow or block is not in the same heap
+    if (order > block->order || (__HEAP->id != 0 && block->heap_id != __HEAP->id)) {
         new_ptr = heap_alloc(new_size);
 
         if (new_ptr == NULL) {
@@ -369,6 +382,17 @@ nil_t heap_borrow(heap_p heap) {
 nil_t heap_merge(heap_p heap) {
     u64_t i;
     block_p block, last;
+
+    // First traverse foreign blocks and free them
+    block = heap->foreign_blocks;
+    while (block != NULL) {
+        last = block;
+        block = block->next;
+        last->heap_id = __HEAP->id;
+        heap_free(BLOCK2RAW(last));
+    }
+
+    heap->foreign_blocks = NULL;
 
     for (i = MIN_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
         block = heap->freelist[i];

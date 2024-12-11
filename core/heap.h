@@ -48,7 +48,8 @@ typedef struct block_t {
     u8_t used;
     u8_t pool_order;
     u8_t mode;
-    u32_t pad;
+    u16_t heap_id;
+    u16_t pad;
     struct block_t *pool;
     struct block_t *prev;
     struct block_t *next;
@@ -58,6 +59,7 @@ typedef struct heap_t {
     u64_t id;
     block_p freelist[MAX_POOL_ORDER + 2];  // free list of blocks by order
     u64_t avail;                           // mask of available blocks by order
+    block_p foreign_blocks;                // foreign blocks (to be freed by the owner)
     memstat_t memstat;
 } *heap_p;
 
