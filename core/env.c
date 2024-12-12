@@ -237,15 +237,21 @@ nil_t init_typenames(obj_p typenames)
 {
     REGISTER_TYPE(typenames,   -TYPE_ERROR,           "Null");
     REGISTER_TYPE(typenames,   -TYPE_B8,              "b8");
-    REGISTER_TYPE(typenames,   -TYPE_U8,              "byte");
+    REGISTER_TYPE(typenames,   -TYPE_U8,              "u8");
+    REGISTER_TYPE(typenames,   -TYPE_I16,             "i16");
+    REGISTER_TYPE(typenames,   -TYPE_I32,             "i32");
     REGISTER_TYPE(typenames,   -TYPE_I64,             "i64");
     REGISTER_TYPE(typenames,   -TYPE_F64,             "f64");
     REGISTER_TYPE(typenames,   -TYPE_C8,              "char");
     REGISTER_TYPE(typenames,   -TYPE_SYMBOL,          "symbol");
+    REGISTER_TYPE(typenames,   -TYPE_DATE,            "date");
+    REGISTER_TYPE(typenames,   -TYPE_TIME,            "time");
     REGISTER_TYPE(typenames,   -TYPE_TIMESTAMP,       "timestamp");
     REGISTER_TYPE(typenames,   -TYPE_GUID,            "guid");
     REGISTER_TYPE(typenames,    TYPE_B8,              "B8");
-    REGISTER_TYPE(typenames,    TYPE_U8,              "Byte");
+    REGISTER_TYPE(typenames,    TYPE_U8,              "U8");
+    REGISTER_TYPE(typenames,    TYPE_I16,             "I16");
+    REGISTER_TYPE(typenames,    TYPE_I32,             "I32");
     REGISTER_TYPE(typenames,    TYPE_I64,             "I64");
     REGISTER_TYPE(typenames,    TYPE_F64,             "F64");
     REGISTER_TYPE(typenames,    TYPE_C8,              "String");
@@ -264,6 +270,8 @@ nil_t init_typenames(obj_p typenames)
     REGISTER_TYPE(typenames,    TYPE_MAPFD,           "Mapfd");
     REGISTER_TYPE(typenames,    TYPE_MAPCOMMON,       "Mapcommon");
     REGISTER_TYPE(typenames,    TYPE_SYMBOL,          "Symbol");
+    REGISTER_TYPE(typenames,    TYPE_DATE,            "Date");
+    REGISTER_TYPE(typenames,    TYPE_TIME,            "Time");
     REGISTER_TYPE(typenames,    TYPE_TIMESTAMP,       "Timestamp");
     REGISTER_TYPE(typenames,    TYPE_GUID,            "Guid");
     REGISTER_TYPE(typenames,    TYPE_LIST,            "List");

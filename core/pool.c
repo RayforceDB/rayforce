@@ -101,7 +101,11 @@ i64_t mpmc_push(mpmc_p queue, task_data_t data) {
 
 task_data_t mpmc_pop(mpmc_p queue) {
     cell_p cell;
-    task_data_t data = {.id = -1, .fn = NULL, .argc = 0, .result = NULL_OBJ};
+    task_data_t data = {.id = -1,
+                        .fn = NULL,
+                        .argc = 0,
+                        .argv = {NULL},  // Initialize the array elements
+                        .result = NULL_OBJ};
     i64_t pos, seq, dif;
     u64_t rounds = 0;
 

@@ -38,10 +38,12 @@ extern "C"
 #define TYPE_I32 4
 #define TYPE_I64 5
 #define TYPE_SYMBOL 6
-#define TYPE_TIMESTAMP 7
-#define TYPE_F64 8
-#define TYPE_GUID 9
-#define TYPE_C8 10
+#define TYPE_DATE 7
+#define TYPE_TIME 8
+#define TYPE_TIMESTAMP 9
+#define TYPE_F64 10
+#define TYPE_GUID 11
+#define TYPE_C8 12
 #define TYPE_ENUM 20
 #define TYPE_MAPFILTER 71
 #define TYPE_MAPGROUP 72
@@ -108,10 +110,11 @@ typedef u8_t guid_t[16];
 
 #define NULL_I64  ((i64_t)0x8000000000000000LL)
 #define NULL_F64  ((f64_t)(0 / 0.0))
-#define NULL_GUID ((guid_t){0})
+// #define NULL_GUID ((guid_t){0})
 #define MAX_I64   ((i64_t)0x7FFFFFFFFFFFFFFFLL)
 #define B8_TRUE   (char)1
 #define B8_FALSE  (char)0
+static const guid_t NULL_GUID = {0};
 
 // Object (generic type)
 typedef struct obj_t
@@ -126,6 +129,8 @@ typedef struct obj_t
         b8_t b8;
         u8_t u8;
         c8_t c8;
+        i16_t i16;
+        i32_t i32;
         i64_t i64;
         f64_t f64;
         struct obj_t *obj;
@@ -151,12 +156,16 @@ extern obj_p vn_symbol(u64_t len, ...);       // create vector symbols from stri
 extern obj_p b8(b8_t val);                    // bool atom
 extern obj_p u8(u8_t val);                    // byte atom
 extern obj_p c8(c8_t c);                      // char
+extern obj_p i16(i16_t val);                  // i16 atom
+extern obj_p i32(i32_t val);                  // i32 atom
 extern obj_p i64(i64_t val);                  // i64 atom
 extern obj_p f64(f64_t val);                  // f64 atom
 extern obj_p symbol(lit_p ptr, u64_t len);    // symbol
 extern obj_p symboli64(i64_t id);             // symbol from i64
+extern obj_p adate(i32_t val);                // date
+extern obj_p atime(i32_t val);                // time
 extern obj_p timestamp(i64_t val);            // timestamp
-extern obj_p guid(guid_t buf);                // GUID
+extern obj_p guid(const guid_t buf);          // GUID
 extern obj_p vn_c8(lit_p fmt, ...);           // string from format
 extern obj_p enumerate(obj_p sym, obj_p vec); // enum
 extern obj_p anymap(obj_p sym, obj_p vec);    // anymap
@@ -164,9 +173,13 @@ extern obj_p anymap(obj_p sym, obj_p vec);    // anymap
 #define B8(len)        (vector(TYPE_B8,        len)) // bool vector
 #define U8(len)        (vector(TYPE_U8,        len)) // byte vector
 #define C8(len)        (vector(TYPE_C8,        len)) // string
+#define I16(len)       (vector(TYPE_I16,       len)) // i16 vector
+#define I32(len)       (vector(TYPE_I32,       len)) // i32 vector
 #define I64(len)       (vector(TYPE_I64,       len)) // i64 vector
 #define F64(len)       (vector(TYPE_F64,       len)) // f64 vector
 #define SYMBOL(len)    (vector(TYPE_SYMBOL,    len)) // symbol vector
+#define DATE(len)      (vector(TYPE_DATE,      len)) // date vector
+#define TIME(len)      (vector(TYPE_TIME,      len)) // time vector
 #define TIMESTAMP(len) (vector(TYPE_TIMESTAMP, len)) // char vector
 #define GUID(len)      (vector(TYPE_GUID,      len)) // GUID vector
 #define LIST(len)      (vector(TYPE_LIST,      len)) // list
@@ -195,6 +208,8 @@ extern nil_t drop_raw(raw_p ptr); // Free a raw pointer
 #define AS_I64(obj)       ((i64_t *)(AS_C8(obj)))
 #define AS_F64(obj)       ((f64_t *)(AS_C8(obj)))
 #define AS_SYMBOL(obj)    ((i64_t *)(AS_C8(obj)))
+#define AS_DATE(obj)      ((i32_t *)(AS_C8(obj)))
+#define AS_TIME(obj)      ((i32_t *)(AS_C8(obj)))
 #define AS_TIMESTAMP(obj) ((i64_t *)(AS_C8(obj)))
 #define AS_GUID(obj)      ((guid_t *)(AS_C8(obj)))
 #define AS_LIST(obj)      ((obj_p *)(AS_C8(obj)))

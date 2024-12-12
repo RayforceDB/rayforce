@@ -173,7 +173,7 @@ i64_t timestamp_into_i64(timestamp_t ts) {
         .nanos = ts.nanos,
     };
 
-    u64_t dss = date_into_days(dt);
+    i64_t dss = date_into_days(dt);
     i64_t offs = timespan_into_nanos(sp);
 
     if (dss < 0) {

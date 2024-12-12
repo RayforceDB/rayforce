@@ -152,6 +152,18 @@ obj_p u8(u8_t val) {
     return b;
 }
 
+obj_p i16(i16_t val) {
+    obj_p i = atom(TYPE_I16);
+    i->i16 = val;
+    return i;
+}
+
+obj_p i32(i32_t val) {
+    obj_p i = atom(TYPE_I32);
+    i->i32 = val;
+    return i;
+}
+
 obj_p i64(i64_t val) {
     obj_p i = atom(TYPE_I64);
     i->i64 = val;
@@ -179,7 +191,7 @@ obj_p symboli64(i64_t id) {
     return a;
 }
 
-obj_p guid(guid_t buf) {
+obj_p guid(const guid_t buf) {
     obj_p guid = vector(TYPE_I64, 2);
     guid->type = -TYPE_GUID;
 
@@ -196,6 +208,20 @@ obj_p c8(c8_t c) {
     s->c8 = c;
 
     return s;
+}
+
+obj_p adate(i32_t val) {
+    obj_p t = atom(TYPE_DATE);
+    t->i32 = val;
+
+    return t;
+}
+
+obj_p atime(i32_t val) {
+    obj_p t = atom(TYPE_TIME);
+    t->i32 = val;
+
+    return t;
 }
 
 obj_p timestamp(i64_t val) {
