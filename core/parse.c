@@ -124,7 +124,7 @@ obj_p parse_0x(parser_t *parser) {
     if (*current == '0') {
         span = span_start(parser);
 
-        if (*(current + 1) == 't') {
+        if (*(current + 1) == 'p') {
             res = timestamp(NULL_I64);
             shift(parser, 2);
             nfo_insert(parser->nfo, (i64_t)res, span);
@@ -132,7 +132,7 @@ obj_p parse_0x(parser_t *parser) {
             return res;
         }
 
-        if (*(parser->current + 1) == 'i') {
+        if (*(parser->current + 1) == 'l') {
             res = i64(NULL_I64);
             shift(parser, 2);
             nfo_insert(parser->nfo, (i64_t)res, span);

@@ -315,7 +315,7 @@ i64_t c8_fmt_into(obj_p *dst, b8_t full, c8_t val) {
 
 i64_t i64_fmt_into(obj_p *dst, i64_t val) {
     if (val == NULL_I64)
-        return str_fmt_into(dst, 3, "%s", "0i");
+        return str_fmt_into(dst, 3, "%s", "0l");
 
     return str_fmt_into(dst, NO_LIMIT, "%lld", val);
 }
@@ -339,7 +339,7 @@ i64_t ts_fmt_into(obj_p *dst, i64_t val) {
     i64_t n;
 
     if (val == NULL_I64)
-        return str_fmt_into(dst, 3, "0t");
+        return str_fmt_into(dst, 3, "0p");
 
     ts = timestamp_from_i64(val);
 
