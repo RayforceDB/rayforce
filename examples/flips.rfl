@@ -33,7 +33,7 @@
     )
 )
 
-(map create-tab (til 5))
+(map create-tab (til 10))
 
 (println "Done.")
 (exit 0)
