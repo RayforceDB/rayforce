@@ -58,20 +58,42 @@ obj_p ray_cast_obj(obj_p x, obj_p y) {
     return cast_obj(type, y);
 }
 
+obj_p ray_til_partial(u64_t len, u64_t offset, i64_t out[]) {
+    u64_t i;
+
+    for (i = 0; i < len; i++)
+        out[i] = i + offset;
+
+    return NULL_OBJ;
+}
+
 obj_p ray_til(obj_p x) {
+    u64_t i, l, n, chunk;
+    obj_p v, vec;
+    pool_p pool;
+
     if (x->type != -TYPE_I64)
         return error_str(ERR_TYPE, "til: expected i64");
 
-    i32_t i, l = (i32_t)x->i64;
-    obj_p vec = NULL;
-
+    l = (u64_t)x->i64;
     vec = I64(l);
 
     if (IS_ERROR(vec))
         return vec;
 
-    for (i = 0; i < l; i++)
-        AS_I64(vec)[i] = i;
+    pool = pool_get();
+    n = pool_split_by(pool, l, 0);
+
+    chunk = l / n;
+    pool_prepare(pool);
+
+    for (i = 0; i < n - 1; i++)
+        pool_add_task(pool, (raw_p)ray_til_partial, 3, chunk, i * chunk, AS_I64(vec) + i * chunk);
+
+    pool_add_task(pool, (raw_p)ray_til_partial, 3, l - i * chunk, i * chunk, AS_I64(vec) + i * chunk);
+
+    v = pool_run(pool);
+    drop_obj(v);
 
     vec->attrs = ATTR_ASC | ATTR_DISTINCT;
 
