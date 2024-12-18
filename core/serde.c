@@ -97,6 +97,12 @@ u64_t size_obj(obj_p obj) {
             return sizeof(i8_t) + sizeof(b8_t);
         case -TYPE_U8:
             return sizeof(i8_t) + sizeof(u8_t);
+        case -TYPE_I16:
+            return sizeof(i8_t) + sizeof(i16_t);
+        case -TYPE_I32:
+        case -TYPE_DATE:
+        case -TYPE_TIME:
+            return sizeof(i8_t) + sizeof(i32_t);
         case -TYPE_I64:
         case -TYPE_TIMESTAMP:
             return sizeof(i8_t) + sizeof(i64_t);
@@ -169,6 +175,16 @@ u64_t save_obj(u8_t *buf, u64_t len, obj_p obj) {
             buf[0] = obj->u8;
             return sizeof(i8_t) + sizeof(u8_t);
 
+        case -TYPE_I16:
+            memcpy(buf, &obj->i16, sizeof(i16_t));
+            return sizeof(i8_t) + sizeof(i16_t);
+
+        case -TYPE_I32:
+        case -TYPE_DATE:
+        case -TYPE_TIME:
+            memcpy(buf, &obj->i32, sizeof(i32_t));
+            return sizeof(i8_t) + sizeof(i32_t);
+
         case -TYPE_I64:
         case -TYPE_TIMESTAMP:
             memcpy(buf, &obj->i64, sizeof(i64_t));
@@ -214,6 +230,26 @@ u64_t save_obj(u8_t *buf, u64_t len, obj_p obj) {
             memcpy(buf, AS_C8(obj), l);
 
             return sizeof(i8_t) + sizeof(u64_t) + l * sizeof(c8_t);
+
+        case TYPE_I16:
+            l = obj->len;
+            memcpy(buf, &l, sizeof(u64_t));
+            buf += sizeof(u64_t);
+            for (i = 0; i < l; i++)
+                memcpy(buf + i * sizeof(i16_t), &AS_I16(obj)[i], sizeof(i16_t));
+
+            return sizeof(i8_t) + sizeof(u64_t) + l * sizeof(i16_t);
+
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            l = obj->len;
+            memcpy(buf, &l, sizeof(u64_t));
+            buf += sizeof(u64_t);
+            for (i = 0; i < l; i++)
+                memcpy(buf + i * sizeof(i32_t), &AS_I32(obj)[i], sizeof(i32_t));
+
+            return sizeof(i8_t) + sizeof(u64_t) + l * sizeof(i32_t);
 
         case TYPE_I64:
         case TYPE_TIMESTAMP:
@@ -361,6 +397,20 @@ obj_p load_obj(u8_t **buf, u64_t len) {
         case -TYPE_U8:
             obj = u8(**buf);
             (*buf)++;
+            return obj;
+
+        case -TYPE_I16:
+            obj = i16(0);
+            memcpy(&obj->i16, *buf, sizeof(i16_t));
+            *buf += sizeof(i16_t);
+            return obj;
+
+        case -TYPE_I32:
+        case -TYPE_DATE:
+        case -TYPE_TIME:
+            obj = i32(0);
+            memcpy(&obj->i32, *buf, sizeof(i32_t));
+            *buf += sizeof(i32_t);
             return obj;
 
         case -TYPE_I64:
