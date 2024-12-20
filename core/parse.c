@@ -425,6 +425,7 @@ obj_p specify_number(parser_t *parser, str_p current, span_t span, obj_p num) {
             num->type = -TYPE_I64;
             break;
         default:
+            current--;
             break;
     }
 
@@ -1061,7 +1062,6 @@ obj_p parser_advance(parser_t *parser) {
     if (at_term(*parser->current)) {
         tok = to_token(parser);
         shift(parser, 1);
-
         return tok;
     }
 
@@ -1073,7 +1073,7 @@ obj_p parser_advance(parser_t *parser) {
 }
 
 obj_p parse_do(parser_t *parser) {
-    obj_p tok, car = NULL_OBJ, lst = NULL_OBJ;
+    obj_p tok, car = PARSE_ADVANCE, lst = NULL_OBJ;
 
     while (!at_eof(*parser->current)) {
         tok = parser_advance(parser);
@@ -1097,7 +1097,7 @@ obj_p parse_do(parser_t *parser) {
             break;
         }
 
-        if (car == NULL_OBJ)
+        if (car == PARSE_ADVANCE)
             car = tok;
         else if (lst == NULL_OBJ)
             lst = vn_list(3, env_get_internal_function_by_id(SYMBOL_DO), car, tok);
