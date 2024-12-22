@@ -30,12 +30,14 @@
 #include "fs.h"
 #include "util.h"
 #include "string.h"
+#include "sys.h"
 
 #ifndef __EMSCRIPTEN__
 RAYASSERT(sizeof(struct block_t) == (2 * sizeof(struct obj_t)), heap_h);
 #endif
 
 __thread heap_p __HEAP = NULL;
+__thread static c8_t HEAP_SWAP[64] = {0};
 
 #define BLOCKSIZE(s) (sizeof(struct obj_t) + (s))
 #define BSIZEOF(o) (1ull << (u64_t)(o))
@@ -43,7 +45,7 @@ __thread heap_p __HEAP = NULL;
 #define ORDEROF(s) (64ull - __builtin_clzll((s) - 1))
 #define BLOCK2RAW(b) ((raw_p)((u64_t)(b) + sizeof(struct obj_t)))
 #define RAW2BLOCK(r) ((block_p)((u64_t)(r) - sizeof(struct obj_t)))
-#define MMAP_BACKED_PATH "/tmp/"
+#define DEFAULT_HEAP_SWAP "/tmp/"
 
 heap_p heap_create(u64_t id) {
     __HEAP = (heap_p)mmap_alloc(sizeof(struct heap_t));
@@ -58,6 +60,12 @@ heap_p heap_create(u64_t id) {
     __HEAP->foreign_blocks = NULL;
 
     memset(__HEAP->freelist, 0, sizeof(__HEAP->freelist));
+
+    if (sys_get_var("HEAP_SWAP", HEAP_SWAP, sizeof(HEAP_SWAP)) == -1)
+        snprintf(HEAP_SWAP, sizeof(HEAP_SWAP), "%s", DEFAULT_HEAP_SWAP);
+
+    if (HEAP_SWAP[strlen(HEAP_SWAP) - 1] != '/')
+        strcat(HEAP_SWAP, "/");
 
     return __HEAP;
 }
@@ -120,7 +128,7 @@ block_p heap_add_pool(u64_t size) {
     if (block == NULL) {
         // Try to mmap with a file
         id = ops_rand_u64();
-        snprintf(filename, sizeof(filename), "%svec_%llu.dat", MMAP_BACKED_PATH, id);
+        snprintf(filename, sizeof(filename), "%svec_%llu.dat", HEAP_SWAP, id);
         fd = fs_fopen(filename, ATTR_RDWR | ATTR_CREAT);
 
         if (fd == -1) {

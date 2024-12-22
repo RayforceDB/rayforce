@@ -39,5 +39,6 @@ typedef struct sys_info_t {
 } sys_info_t;
 
 sys_info_t sys_info(i32_t threads);
+i64_t sys_get_var(lit_p name, c8_t buf[], u64_t len);
 
 #endif  // SYS_H

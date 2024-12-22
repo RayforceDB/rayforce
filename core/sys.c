@@ -110,3 +110,40 @@ sys_info_t sys_info(i32_t threads) {
 
     return info;
 }
+
+i64_t sys_get_var(lit_p name, c8_t buf[], u64_t len) {
+    str_p value;
+
+    if (!name || !buf || len == 0) {
+        fprintf(stderr, "Invalid arguments.\n");
+        return -1;
+    }
+
+#if defined(OS_WINDOWS)
+    // Windows implementation using GetEnvironmentVariable
+    DWORD result = GetEnvironmentVariableA(var_name, buffer, (DWORD)length);
+    if (result == 0)
+        return -1;
+
+    if (result >= length) {
+        fprintf(stderr, "Buffer too small for environment variable '%s'.\n", var_name);
+        return -1;
+    }
+#else
+    // UNIX implementation using getenv
+    value = getenv(name);
+    if (!value)
+        return -1;
+
+    if (strlen(value) >= len) {
+        fprintf(stderr, "Buffer too small for environment variable '%s'.\n", name);
+        return -1;
+    }
+
+    strncpy(buf, value, len - 1);
+    buf[len - 1] = '\0';  // Ensure null termination
+
+#endif
+
+    return 0;
+}
