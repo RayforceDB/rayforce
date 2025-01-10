@@ -155,7 +155,7 @@ nav:
       - Get env: content/env/env.md
       - Memstat: content/env/memstat.md
     - IO:
-      - Read CSV: content/io/csv.md
+      - Read CSV: content/io/read_csv.md
       - Print: content/io/print.md
       - Println: content/io/println.md
       - Read: content/io/read.md
