@@ -19,7 +19,8 @@
 
 <tr markdown><td markdown>control</td>
   <td markdown>
-  [if](control/if.md), [try](control/try.md), [raise](control/raise.md), [exit](control/exit.md)
+  [if](control/if.md), [try](control/try.md), [raise](control/raise.md), [exit](control/exit.md),
+  [do](control/do.md), [return](control/return.md)
   </td>
 </tr>
 
@@ -44,37 +45,39 @@
 
 <tr markdown><td markdown>interfacing</td>
 <td markdown>
-  [loadfn](interfacing/loadfn.md), [call-ext](interfacing/call_ext.md), [call-async](interfacing/call_async.md), [call-ext-async](interfacing/call_ext_async.md)
+  [extending](interfacing/extending.md), [ipc](interfacing/ipc.md)
 </td>
 </tr>
 
 <tr markdown><td markdown>io</td>
 <td markdown>
-  [write](io/write.md), [read](io/read.md), [read-csv](io/read_csv.md), [print](io/print.md), [println](io/println.md), [hopen](io/hopen.md), [hclose](io/hclose.md)
+  [read](io/read.md), [write](io/write.md), [read-csv](io/read_csv.md), [get-parted](io/get_parted.md),
+  [get-splayed](io/get_splayed.md), [get](io/get.md), [hopen](io/hopen.md), [hclose](io/hclose.md),
+  [set-parted](io/set_parted.md), [set-splayed](io/set_splayed.md)
 </td>
 </tr>
 
 <tr markdown><td markdown>items</td>
 <td markdown>
-  [at](items/at.md), [except](items/except.md), [filter](items/filter.md), [find](items/find.md), [first](items/first.md), [last](items/last.md), [key](items/key.md), [value](items/value.md), [take](items/take.md), [sect](items/sect.md) [union](items/union.md), [where](items/where.md), [in](items/in.md)
+  [at](items/at.md), [enum](items/enum.md), [except](items/except.md), [filter](items/filter.md), [find](items/find.md), [first](items/first.md), [in](items/in.md), [key](items/key.md), [last](items/last.md), [sect](items/sect.md), [take](items/take.md), [union](items/union.md), [where](items/where.md), [within](items/within.md)
 </td>
 </tr>
 
 <tr markdown><td markdown>iter</td>
 <td markdown>
-  [apply](iter/apply.md), [do](iter/do.md), [map](iter/map.md), [fold](iter/fold.md)
+  [apply](iter/apply.md), [map](iter/map.md), [fold](iter/fold.md)
 </td>
 </tr>
 
 <tr markdown><td markdown>join</td>
 <td markdown>
-  [lj](join/lj.md)
+  [lj](join/lj.md), [ij](join/ij.md)
 </td>
 </tr>
 
 <tr markdown><td markdown>logic</td>
 <td markdown>
-  [and](logic/and.md), [or](logic/or.md), [not](logic/not.md), [like](logic/like.md)
+  [and](logic/and.md), [or](logic/or.md), [not](logic/not.md), [like](logic/like.md), [nil?](logic/nil?.md)
 </td>
 </tr>
 
@@ -86,13 +89,13 @@
 
 <tr markdown><td markdown>misc</td>
 <td markdown>
-  [count](misc/count.md), [type](misc/type.md), [rc](misc/rc.md)
+  [count](misc/count.md), [type](misc/type.md), [rc](misc/rc.md), [gc](misc/gc.md), [meta](misc/meta.md)
 </td>
 </tr>
 
 <tr markdown><td markdown>order</td>
 <td markdown>
-  [asc](order/asc.md), [desc](order/desc.md), [iasc](order/iasc.md), [idesc](order/idesc.md), [neg](order/neg.md),
+  [asc](order/asc.md), [desc](order/desc.md), [iasc](order/iasc.md), [idesc](order/idesc.md), [neg](order/neg.md), [xasc](order/xasc.md), [xdesc](order/xdesc.md)
 </td>
 </tr>
 
@@ -110,19 +113,14 @@
 
 <tr markdown><td markdown>repl</td>
 <td markdown>
-  [parse](repl/parse.md), [eval](repl/eval.md), [exec](repl/exec.md), [load](repl/load.md)
+  [args](repl/args.md), [commands](repl/commands.md), [eva](repl/eval.md), [exec](repl/exec.md), [load](repl/load.md), [parse](repl/parse.md), [quote](repl/quote.md), [resolve](repl/resolve.md),
+  [set-display-width](repl/set_display_width.md), [set-fpr](repl/set_fpr.md), [use-unicode-format](repl/use_unicode_format.md)
 </td>
 </tr>
 
 <tr markdown><td markdown>serde</td>
 <td markdown>
   [ser](serde/ser.md), [de](serde/de.md)
-</td>
-</tr>
-
-<tr markdown><td markdown>items</td>
-<td markdown>
-  [map](iter/map.md), [fold](iter/fold.md)
 </td>
 </tr>
 
@@ -134,7 +132,7 @@
 
 <tr markdown><td markdown>time</td>
 <td markdown>
-  [timer](time/timer.md)
+  [timer](time/timer.md), [timeit](time/timeit.md)
 </td>
 </tr>
 
@@ -151,18 +149,19 @@
 | Id  | Name        | Size | Description                        |
 | --- | ----------- | ---- | ---------------------------------- |
 | 0   | `List`      | -    | Generic List                       |
-| 1   | `Bool`      | 1    | Boolean                            |
-| 2   | `Byte`      | 1    | Byte                               |
-| 3   | `I64`       | 8    | Signed 64-bit Integer              |
-| 4   | `F64`       | 8    | 64-bit Floating Point              |
-| 5   | `Symbol`    | 8    | Symbol (interned string)           |
-| 6   | `Timestamp` | 8    | Timestamp                          |
-| 7   | `Guid`      | 16   | Globally Unique Identifier         |
-| 8   | `Char`      | 4    | Character                          |
+| 1   | `B8`        | 1    | Boolean                            |
+| 2   | `U8`        | 1    | Byte                               |
+| 3   | `I16`       | 2    | Signed Short                       |
+| 4   | `I32`       | 4    | Signed 32-bit Integer              |
+| 5   | `I64`       | 8    | Signed 64-bit Integer              |
+| 6   | `Symbol`    | 8    | Symbol (interned string)           |
+| 7   | `Date`      | 4    | Date                               |
+| 8   | `Time`      | 4    | Time                               |
+| 9   | `Timestamp` | 8    | Timestamp                          |
+| 10  | `F64`       | 8    | 64-bit Floating Point              |
+| 11  | `Guid`      | 16   | Globally Unique Identifier         |
+| 12  | `C8`        | 8    | Char                               |
 | 20  | `Enum`      | -    | Enumerated Type                    |
-| 77  | `AnyMap`    | -    | Generic Map                        |
-| 78  | `FilterMap` | -    | Filter Map                         |
-| 79  | `GroupMap`  | -    | Group Map                          |
 | 98  | `Table`     | -    | Table                              |
 | 99  | `Dict`      | -    | Dictionary                         |
 | 100 | `Lambda`    | -    | Lambda (user function)             |
