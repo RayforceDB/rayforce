@@ -99,6 +99,7 @@ obj_p ray_hclose(obj_p x) {
 }
 
 obj_p ray_read(obj_p x) {
+    u64_t sz;
     i64_t fd, size, c = 0;
     u8_t *map, *cur;
     str_p buf;
@@ -108,17 +109,19 @@ obj_p ray_read(obj_p x) {
         case -TYPE_I32:
             fd = x->i32;
             size = fs_fsize(fd);
+
+            if (size < 1)
+                return sys_error(ERROR_TYPE_SYS, "read");
+
             map = (u8_t *)mmap_file(fd, NULL, size, 0);
             cur = map;
-            c = size;
+            sz = size;
 
-            if (map == NULL) {
-                printf("FD: %lld SIZE: %lld\n", fd, size);
+            if (map == NULL)
                 return sys_error(ERROR_TYPE_SYS, "read");
-            }
 
-            while (c > 0) {
-                val = load_obj(&cur, c);
+            while (sz > 0) {
+                val = load_obj(&cur, &sz);
 
                 if (IS_ERROR(val)) {
                     mmap_free(map, size);
@@ -134,7 +137,6 @@ obj_p ray_read(obj_p x) {
                 }
 
                 drop_obj(res);
-                c -= cur - map;
             }
 
             mmap_free(map, size);

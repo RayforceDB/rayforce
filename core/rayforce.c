@@ -580,6 +580,7 @@ obj_p ins_sym(obj_p *obj, i64_t idx, lit_p str) {
 }
 
 obj_p at_idx(obj_p obj, i64_t idx) {
+    u64_t size;
     i64_t i, m, n, l;
     obj_p k, v, res;
     u8_t *buf;
@@ -663,11 +664,12 @@ obj_p at_idx(obj_p obj, i64_t idx) {
         case TYPE_MAPLIST:
             k = MAPLIST_KEY(obj);
             v = MAPLIST_VAL(obj);
+            size = k->len;
             if (idx < 0)
                 idx = obj->len + idx;
             if (idx >= 0 && idx < (i64_t)v->len) {
                 buf = AS_U8(k) + AS_I64(v)[idx];
-                return load_obj(&buf, k->len);
+                return load_obj(&buf, &size);
             }
 
             return NULL_OBJ;

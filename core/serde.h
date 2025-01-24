@@ -46,6 +46,6 @@ u64_t size_of_type(i8_t type);
 u64_t size_of(obj_p obj);
 u64_t size_obj(obj_p obj);
 u64_t save_obj(u8_t *buf, u64_t len, obj_p obj);
-obj_p load_obj(u8_t **buf, u64_t len);
+obj_p load_obj(u8_t **buf, u64_t *len);
 
 #endif  // SERDE_H

@@ -280,7 +280,9 @@ i64_t fs_fdelete(lit_p path) {
 
 i64_t fs_fsize(i64_t fd) {
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) == -1)
+        return -1;
+
     return st.st_size;
 }
 

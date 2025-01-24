@@ -41,7 +41,7 @@
 #include "cmp.h"
 
 obj_p ray_at(obj_p x, obj_p y) {
-    u64_t i, j, yl, xl, n;
+    u64_t i, j, yl, xl, n, size;
     obj_p res, k, s, v, cols;
     u8_t *buf;
 
@@ -277,11 +277,13 @@ obj_p ray_at(obj_p x, obj_p y) {
 
             buf = AS_U8(k) + AS_I64(v)[y->i64];
 
-            return load_obj(&buf, xl);
+            return load_obj(&buf, &xl);
 
         case MTYPE2(TYPE_MAPLIST, TYPE_I64):
             k = MAPLIST_KEY(x);
             v = MAPLIST_VAL(x);
+
+            size = k->len;
 
             n = v->len;
             yl = y->len;
@@ -296,7 +298,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                 }
 
                 buf = AS_U8(k) + AS_I64(v)[AS_I64(y)[i]];
-                AS_LIST(res)[i] = load_obj(&buf, k->len);
+                AS_LIST(res)[i] = load_obj(&buf, &size);
             }
 
             return res;
@@ -486,7 +488,7 @@ obj_p ray_filter(obj_p x, obj_p y) {
 }
 
 obj_p ray_take(obj_p x, obj_p y) {
-    u64_t i, l, m, n;
+    u64_t i, l, m, n, size;
     obj_p k, s, v, res;
     u8_t *buf;
 
@@ -631,6 +633,8 @@ obj_p ray_take(obj_p x, obj_p y) {
             l = ABSI64(x->i64);
             res = vector(TYPE_LIST, l);
 
+            size = l;
+
             k = MAPLIST_KEY(y);
             s = MAPLIST_VAL(y);
 
@@ -641,7 +645,7 @@ obj_p ray_take(obj_p x, obj_p y) {
                 for (i = 0; i < l; i++) {
                     if (AS_I64(s)[i % n] >= (i64_t)m) {
                         buf = AS_U8(k) + AS_I64(s)[i % n];
-                        v = load_obj(&buf, l);
+                        v = load_obj(&buf, &size);
 
                         if (IS_ERROR(v)) {
                             res->len = i;
@@ -661,7 +665,7 @@ obj_p ray_take(obj_p x, obj_p y) {
                 for (i = 0; i < l; i++) {
                     if (AS_I64(s)[n - 1 - (i % n)] >= (i64_t)m) {
                         buf = AS_U8(k) + AS_I64(s)[n - 1 - (i % n)];
-                        v = load_obj(&buf, l);
+                        v = load_obj(&buf, &size);
 
                         if (IS_ERROR(v)) {
                             res->len = i;
@@ -1020,6 +1024,7 @@ obj_p ray_key(obj_p x) {
 obj_p ray_value(obj_p x) {
     obj_p sym, k, v, res, e, *objptr;
     u8_t *u8ptr, *buf;
+    u64_t size;
     i64_t i, j, l, n, sl, xl, *i64ptr;
     f64_t *f64ptr;
     guid_t *guidptr;
@@ -1067,12 +1072,14 @@ obj_p ray_value(obj_p x) {
             xl = e->len;
             sl = k->len;
 
+            size = sl;
+
             res = vector(TYPE_LIST, xl);
 
             for (i = 0; i < xl; i++) {
                 if (AS_I64(e)[i] < sl) {
                     buf = AS_U8(k) + AS_I64(e)[i];
-                    v = load_obj(&buf, sl);
+                    v = load_obj(&buf, &size);
 
                     if (IS_ERROR(v)) {
                         res->len = i;
@@ -1118,10 +1125,11 @@ obj_p ray_value(obj_p x) {
                 n = ops_count(AS_LIST(x)[i]);
                 k = MAPLIST_KEY(AS_LIST(x)[i]);
                 v = MAPLIST_VAL(AS_LIST(x)[i]);
+                size = k->len;
 
                 for (j = 0; j < n; j++) {
                     buf = AS_U8(k) + AS_I64(v)[j];
-                    objptr[j] = load_obj(&buf, k->len);
+                    objptr[j] = load_obj(&buf, &size);
                 }
 
                 objptr += n;

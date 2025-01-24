@@ -157,13 +157,13 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
         if (!is_null(arg)) {
             res = ray_load(arg);
             drop_obj(arg);
-
-            if (res) {
-                fmt = obj_fmt(res, B8_TRUE);
-                printf("%.*s\n", (i32_t)fmt->len, AS_C8(fmt));
-                drop_obj(fmt);
-                drop_obj(res);
-            }
+            drop_obj(res);
+            // if (res) {
+            //     fmt = obj_fmt(res, B8_TRUE);
+            //     printf("%.*s\n", (i32_t)fmt->len, AS_C8(fmt));
+            //     drop_obj(fmt);
+            //     drop_obj(res);
+            // }
         }
 
         // timeit
