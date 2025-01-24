@@ -521,8 +521,7 @@ obj_p load_obj(u8_t **buf, u64_t len) {
                     return v;
                 }
 
-                AS_LIST(obj)
-                [i] = v;
+                AS_LIST(obj)[i] = v;
             }
             return obj;
 

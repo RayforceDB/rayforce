@@ -46,49 +46,100 @@
 obj_p ray_hopen(obj_p x) {
     i64_t fd;
     sock_addr_t addr;
-    obj_p err;
     u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
+    obj_p err;
 
     if (x->type != TYPE_C8)
         THROW(ERR_TYPE, "hopen: expected char");
 
-    if (sock_addr_from_str(AS_C8(x), &addr) == -1)
-        THROW(ERR_IO, "hopen: invalid address: %s", AS_C8(x));
+    // Open socket
+    if (sock_addr_from_str(AS_C8(x), &addr) != -1) {
+        fd = sock_open(&addr);
 
-    fd = sock_open(&addr);
+        if (fd == -1)
+            return sys_error(ERROR_TYPE_SOCK, "hopen");
+
+        if (sock_send(fd, handshake, 2) == -1) {
+            err = sys_error(ERROR_TYPE_SOCK, "hopen: send handshake");
+            sock_close(fd);
+            return err;
+        }
+
+        if (sock_recv(fd, handshake, 2) == -1) {
+            err = sys_error(ERROR_TYPE_SOCK, "hopen: recv handshake");
+            sock_close(fd);
+            return err;
+        }
+
+        sock_set_nonblocking(fd, B8_TRUE);
+
+        return i64(poll_register(runtime_get()->poll, fd, RAYFORCE_VERSION));
+    }
+
+    // Otherwise, open file
+    fd = fs_fopen(AS_C8(x), ATTR_RDWR | ATTR_CREAT | ATTR_APPEND);
 
     if (fd == -1)
-        return sys_error(ERROR_TYPE_SOCK, "hopen");
+        return sys_error(ERROR_TYPE_SYS, AS_C8(x));
 
-    if (sock_send(fd, handshake, 2) == -1) {
-        err = sys_error(ERROR_TYPE_SOCK, "hopen: send handshake");
-        sock_close(fd);
-        return err;
-    }
-
-    if (sock_recv(fd, handshake, 2) == -1) {
-        err = sys_error(ERROR_TYPE_SOCK, "hopen: recv handshake");
-        sock_close(fd);
-        return err;
-    }
-
-    sock_set_nonblocking(fd, B8_TRUE);
-
-    return i64(poll_register(runtime_get()->poll, fd, RAYFORCE_VERSION));
+    return i32((i32_t)fd);
 }
 
 obj_p ray_hclose(obj_p x) {
-    poll_deregister(runtime_get()->poll, x->i64);
-
-    return NULL_OBJ;
+    switch (x->type) {
+        case -TYPE_I32:
+            fs_fclose(x->i32);
+            return NULL_OBJ;
+        case -TYPE_I64:
+            poll_deregister(runtime_get()->poll, x->i64);
+            return NULL_OBJ;
+        default:
+            THROW(ERR_TYPE, "hclose: unsupported type: '%s'", type_name(x->type));
+    }
 }
 
 obj_p ray_read(obj_p x) {
     i64_t fd, size, c = 0;
+    u8_t *map, *cur;
     str_p buf;
-    obj_p s, res;
+    obj_p s, val, res;
 
     switch (x->type) {
+        case -TYPE_I32:
+            fd = x->i32;
+            size = fs_fsize(fd);
+            map = (u8_t *)mmap_file(fd, NULL, size, 0);
+            cur = map;
+            c = size;
+
+            if (map == NULL) {
+                printf("FD: %lld SIZE: %lld\n", fd, size);
+                return sys_error(ERROR_TYPE_SYS, "read");
+            }
+
+            while (c > 0) {
+                val = load_obj(&cur, c);
+
+                if (IS_ERROR(val)) {
+                    mmap_free(map, size);
+                    return val;
+                }
+
+                res = eval_obj(val);
+                drop_obj(val);
+
+                if (IS_ERROR(res)) {
+                    mmap_free(map, size);
+                    return res;
+                }
+
+                drop_obj(res);
+                c -= cur - map;
+            }
+
+            mmap_free(map, size);
+
+            return NULL_OBJ;
         case TYPE_C8:
             s = cstring_from_obj(x);
             fd = fs_fopen(AS_C8(s), ATTR_RDONLY);
@@ -160,16 +211,27 @@ obj_p io_write(i64_t fd, u8_t msg_type, obj_p obj) {
 }
 
 obj_p ray_write(obj_p x, obj_p y) {
-    // send to sock handle
-    if (x->type == -TYPE_I64) {
-        // send ipc msg
-        if (x->i64 < 0)
-            return io_write(-x->i64, MSG_TYPE_ASYN, y);
-        else
-            return io_write(x->i64, MSG_TYPE_SYNC, y);
-    }
+    i64_t size;
+    obj_p buf;
 
-    THROW(ERR_NOT_IMPLEMENTED, "write: not implemented");
+    // send to sock handle
+    switch (x->type) {
+        case -TYPE_I32:
+            size = size_obj(y);
+            buf = U8(size);
+            size = save_obj(AS_U8(buf), size, y);
+            fs_fwrite(x->i32, AS_C8(buf), size);
+            drop_obj(buf);
+            return NULL_OBJ;
+        case -TYPE_I64:
+            // send ipc msg
+            if (x->i64 < 0)
+                return io_write(-x->i64, MSG_TYPE_ASYN, y);
+            else
+                return io_write(x->i64, MSG_TYPE_SYNC, y);
+        default:
+            THROW(ERR_NOT_IMPLEMENTED, "write: not implemented");
+    }
 }
 
 obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out) {

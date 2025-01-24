@@ -41,6 +41,7 @@
 #define ATTR_RDWR O_RDWR
 #define ATTR_CREAT O_CREAT
 #define ATTR_TRUNC O_TRUNC
+#define ATTR_APPEND O_APPEND
 #endif
 #include "rayforce.h"
 #include <fcntl.h>
