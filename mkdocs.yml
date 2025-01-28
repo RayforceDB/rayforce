@@ -132,9 +132,11 @@ nav:
       - Round: content/math/round.md
       - Xbar: content/math/xbar.md
     - Evaluation Control:
+      - Do: content/control/do.md
       - If: content/control/if.md
       - Try: content/control/try.md
       - Raise: content/control/raise.md
+      - Return: content/control/return.md
       - Exit: content/control/exit.md
     - Compose:
       - Casting: content/compose/as.md
@@ -154,10 +156,18 @@ nav:
       - Let: content/env/let.md
       - Get env: content/env/env.md
       - Memstat: content/env/memstat.md
+    - Format:
+      - Format: content/format/format.md
+      - Print: content/format/print.md
+      - Println: content/format/println.md
+      - Show: content/format/show.md
     - IO:
+      - Get: content/io/get.md
+      - Get Splayed: content/io/get_splayed.md
+      - Set Splayed: content/io/set_splayed.md
+      - Get Parted: content/io/get_parted.md
+      - Set Parted: content/io/set_parted.md
       - Read CSV: content/io/read_csv.md
-      - Print: content/io/print.md
-      - Println: content/io/println.md
       - Read: content/io/read.md
       - Write: content/io/write.md
       - Hopen: content/io/hopen.md
@@ -167,6 +177,7 @@ nav:
       - Or: content/logic/or.md
       - Not: content/logic/not.md
       - Like: content/logic/like.md
+      - Nil?: content/logic/isnil.md
     - Items:
       - At: content/items/at.md
       - First: content/items/first.md
@@ -181,27 +192,36 @@ nav:
       - Find: content/items/find.md
       - Key: content/items/key.md
       - Value: content/items/value.md
+      - Enum: content/items/enum.md
+      - Within: content/items/within.md
     - Order:
       - Asc: content/order/asc.md
       - Desc: content/order/desc.md
       - Iasc: content/order/iasc.md
       - Idesc: content/order/idesc.md
       - Neg: content/order/neg.md
-    - Relation:
-      - Equal: content/rel/eq.md
-      - Not equal: content/rel/ne.md
-      - Greater than: content/rel/gt.md
-      - Greater or equal: content/rel/ge.md
-      - Lower than: content/rel/lt.md
-      - Lower or equal: content/rel/le.md
+      - Xasc: content/order/xasc.md
+      - Xdesc: content/order/xdesc.md
+    - Comparison:
+      - Equal: content/cmp/eq.md
+      - Not equal: content/cmp/ne.md
+      - Greater than: content/cmp/gt.md
+      - Greater or equal: content/cmp/ge.md
+      - Lower than: content/cmp/lt.md
+      - Lower or equal: content/cmp/le.md
+    - Temporal:
+      - Date: content/temporal/date.md
+      - Time: content/temporal/time.md
+      - Timestamp: content/temporal/timestamp.md
     - Iter:
       - Apply: content/iter/apply.md
-      - Do: content/iter/do.md
       - Map: content/iter/map.md
       - Fold: content/iter/fold.md
-    - Queries: content/queries.md
+    - Queries: 
+      - Select: content/query/select.md
     - Joins:
-      - Left join: content/join/lj.md
+      - Left join: content/join/left_join.md
+      - Inner join: content/join/inner_join.md
     - Updates:
       - Alter: content/update/alter.md
       - Insert: content/update/insert.md
@@ -212,6 +232,13 @@ nav:
       - Eval: content/repl/eval.md
       - Exec: content/repl/exec.md
       - Load: content/repl/load.md
+      - Args: content/repl/args.md
+      - Commands: content/repl/commands.md
+      - Quote: content/repl/quote.md
+      - Resolve: content/repl/resolve.md
+      - Display width: content/repl/set_display_width.md
+      - FPR: content/repl/set_fpr.md
+      - Use unicode format: content/repl/use_unicode_format.md
     - Serialization: 
       - Overall: content/serde/index.md
       - Serialize: content/serde/ser.md
@@ -220,8 +247,11 @@ nav:
       - Type: content/misc/type.md
       - Count: content/misc/count.md
       - Reference count: content/misc/rc.md
+      - GC: content/misc/gc.md
+      - Meta: content/misc/meta.md
     - Time:
-      - Set/unset timer: content/time/timer.md
+      - Timer: content/time/timer.md
+      - Timeit: content/time/timeit.md
     - Interfacing: 
       - IPC: content/interfacing/ipc.md
       - Extending: content/interfacing/extending.md

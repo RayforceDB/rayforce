@@ -71,13 +71,13 @@
 
 <tr markdown><td markdown>join</td>
 <td markdown>
-  [lj](join/lj.md), [ij](join/ij.md)
+  [left-join](join/left_join.md), [inner-join](join/inner_join.md)
 </td>
 </tr>
 
 <tr markdown><td markdown>logic</td>
 <td markdown>
-  [and](logic/and.md), [or](logic/or.md), [not](logic/not.md), [like](logic/like.md), [nil?](logic/nil?.md)
+  [and](logic/and.md), [or](logic/or.md), [not](logic/not.md), [like](logic/like.md), [nil?](logic/isnil.md)
 </td>
 </tr>
 
@@ -102,12 +102,6 @@
 <tr markdown><td markdown>query</td>
 <td markdown>
   [select](query/select.md)
-</td>
-</tr>
-
-<tr markdown><td markdown>relation</td>
-<td markdown>
-  [eq](rel/eq.md), [ne](rel/ne.md), [lt](rel/lt.md), [le](rel/le.md), [gt](rel/gt.md), [ge](rel/ge.md)
 </td>
 </tr>
 
