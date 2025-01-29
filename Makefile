@@ -17,6 +17,8 @@ endif
 ifeq ($(OS),linux)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -march=native -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
 LIBS = -lm -ldl -lpthread
+# These should be used if you want to use plugins
+# LIBS = -lm -ldl -lpthread -rdynamic 
 endif
 
 ifeq ($(OS),darwin)
