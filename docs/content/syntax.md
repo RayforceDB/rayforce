@@ -48,7 +48,7 @@
 
 ``` clj title="lists"
 ;; List
-> (list 1 "2" {a: 3 b: 4} 5)
+↪ (list 1 "2" {a: 3 b: 4} 5)
 (
   1
   "2"
@@ -69,7 +69,7 @@
 
 ``` clj title="tables"
 ;; Table
-> (table [a b c] (list [AA BB CC DD] (list 1 2 3 4) 8.9))
+↪ (table [a b c] (list [AA BB CC DD] (list 1 2 3 4) 8.9))
 | a  | b | c    |
 +----+---+------+
 | AA | 1 | 8.90 |
@@ -83,11 +83,11 @@
 Guid has not it's literal representation, but it can be created with `guid` function or parsed from string:
 
 ``` clj
-> (guid 2)
+↪ (guid 2)
 [9c782460-ec88-f4f0-3c98-c4808ca89410 af72b934-d3c6-7da8-375a-815cdb2ec550]
-> (first (guid 1))
+↪ (first (guid 1))
 9c782460-ec88-f4f0-3c98-c4808ca89410
-> (as 'guid "9c782460-ec88-f4f0-3c98-c4808ca89410")
+↪ (as 'guid "9c782460-ec88-f4f0-3c98-c4808ca89410")
 9c782460-ec88-f4f0-3c98-c4808ca89410
 ```
 
@@ -100,9 +100,9 @@ Guid has not it's literal representation, but it can be created with `guid` func
 ## User defined functions
 
 ``` clj
-> (set f (fn [x] (+ 1 x)))
+↪ (set f (fn [x] (+ 1 x)))
 (fn [x] ..)
-> (f 2)
+↪ (f 2)
 3
 ```
 
@@ -111,16 +111,16 @@ Guid has not it's literal representation, but it can be created with `guid` func
 Expressions uses a prefix notation, where the function is placed before its operands. For example, the expression `1 + 2` is written as `(+ 1 2)` in Rayforce. Each function belongs to a one of three types by its arity: unary, binary, and vary. Unary functions take one argument, binary functions take two arguments, and vary functions take any number of arguments. For example, the `avg` function is the unary function, the `+` function is a binary function, and the `list` function is a vary function.
 
 ``` clj
-> (+ 1 2)
+↪ (+ 1 2)
 3
-> (- 1 2)
+↪ (- 1 2)
 -1
-> (avg [1 2 3])
+↪ (avg [1 2 3])
 2
-> ((fn [x] (+ 1 x)) 2)
+↪ ((fn [x] (+ 1 x)) 2)
 3
-> (set f (fn [x] (+ 1 x)))
+↪ (set f (fn [x] (+ 1 x)))
 (fn [x] ..)
-> (f 2)
+↪ (f 2)
 3
 ```

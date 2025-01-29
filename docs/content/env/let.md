@@ -3,7 +3,7 @@
 `let` is a special form that allows you to define local variables. It is used to create a new variable and assign a value to it. The variable is only available within the scope of the `let` form.
 
 ```clj
-> (do (let a 123) (+ a 1))
+↪ (do (let a 123) (+ a 1))
 124
 > a
 •• [E003] error: object evaluation failed
@@ -17,7 +17,7 @@ In the example above, the variable `a` is defined within the `let` form and is n
 `let` can also be used to define local variables inside a function body.
 
 ```clj
-> (set add (fn [a b] (let c (+ a b)) c))
-> (add 1 2)
+↪ (set add (fn [a b] (let c (+ a b)) c))
+↪ (add 1 2)
 3
 ```

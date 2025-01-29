@@ -3,7 +3,7 @@
 Accepts a list and return a dictionary with the keys as distinct elements of the list and the values as the indexes of the elements in the list.
 
 ```clj
-> (group [1 2 3 1 2 3 4 5 6 7 8 9 0])
+↪ (group [1 2 3 1 2 3 4 5 6 7 8 9 0])
 {
   0: [9]
   1: [0 3]

@@ -3,7 +3,7 @@
 Takes two arguments: a symbol vector of the column names and a list of values and construct a table.
 
 ```clj
-> (table [A B C] (list (til 5) [6 7 8 9 0] (list "A" "B" "C" "D" "E")))
+↪ (table [A B C] (list (til 5) [6 7 8 9 0] (list "A" "B" "C" "D" "E")))
 ┌────┬────┬──────────────────────────────┐
 │ A  │ B  │ C                            │
 ├────┼────┼──────────────────────────────┤
