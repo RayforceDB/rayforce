@@ -30,22 +30,10 @@
 </td>
 </tr>
 
-<tr markdown><td markdown>ext</td>
-<td markdown>
-  [loadfn](ext/loadfn.md)
-</td>
-</tr>
-
 <tr markdown><td markdown>format</td>
 <td markdown>
   [format](format/format.md), [print](format/print.md),
   [println](format/println.md), [show](format/show.md)
-</td>
-</tr>
-
-<tr markdown><td markdown>interfacing</td>
-<td markdown>
-  [extending](interfacing/extending.md), [ipc](interfacing/ipc.md)
 </td>
 </tr>
 
@@ -133,6 +121,12 @@
 <tr markdown><td markdown>update</td>
 <td markdown>
   [alter](update/alter.md), [insert](update/insert.md), [upsert](update/upsert.md), [update](update/update.md)
+</td>
+</tr>
+
+<tr markdown><td markdown>interfacing</td>
+<td markdown>
+  [loadfn](interfacing/loadfn.md)
 </td>
 </tr>
 

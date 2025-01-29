@@ -254,7 +254,6 @@ nav:
       - Timeit: content/time/timeit.md
     - Interfacing: 
       - IPC: content/interfacing/ipc.md
-      - Extending: content/interfacing/extending.md
-      - Load function: content/ext/loadfn.md
+      - Load function: content/interfacing/loadfn.md
   - FAQ: content/faq.md
   - License: content/license.md
