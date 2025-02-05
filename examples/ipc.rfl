@@ -2,9 +2,10 @@
 ;; $ rayforce -p 5101
 ;; (set .z.po (fn [x] (println "Open: %" x)))
 ;; (set .z.pc (fn [x] (println "Close: %" x)))
+;; (set f (fn [] .z.w))
 
 ;; Start the client:
 ;; $ rayforce
 ;; (set h (hopen "127.0.0.1:5101"))
-;; (write h "Hello, world!")
+;; (write h (list 'f))
 ;; (hclose h)

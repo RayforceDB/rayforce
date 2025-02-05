@@ -423,6 +423,8 @@ nil_t process_request(poll_p poll, selector_p selector) {
 
     res = read_obj(selector);
 
+    poll_set_usr_fd(selector->id);
+
     if (IS_ERROR(res) || is_null(res))
         v = res;
     else if (res->type == TYPE_C8) {
@@ -432,6 +434,8 @@ nil_t process_request(poll_p poll, selector_p selector) {
         v = eval_obj(res);
         drop_obj(res);
     }
+
+    poll_set_usr_fd(0);
 
     // sync request
     if (selector->rx.msgtype == MSG_TYPE_SYNC) {
