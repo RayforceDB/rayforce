@@ -200,29 +200,45 @@ timestamp_t timestamp_from_str(str_p src, u64_t len) {
 #if defined(OS_WINDOWS)
 
 timestamp_t timestamp_current(lit_p tz) {
-    time_t rawtime;
+    i64_t nanos;
+    FILETIME ft;
+    ULARGE_INTEGER uli;
+    struct tm timeinfo_buf;
     struct tm *timeinfo;
+    time_t rawtime;
 
-    // Get the current time
-    time(&rawtime);
+    // Get system time in 100-nanosecond intervals since 1601-01-01
+    GetSystemTimePreciseAsFileTime(&ft);
 
-    // Determine if UTC or local time should be used based on the argument
-    if (tz != NULL && strcmp(tz, "utc") == 0)
-        timeinfo = gmtime(&rawtime);  // UTC time
-    else
-        timeinfo = localtime(&rawtime);  // Local time
+    // Convert to Unix epoch (1970-01-01)
+    uli.LowPart = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
+
+    // Windows FILETIME is in 100-nanosecond intervals, subtract Unix epoch offset
+    const i64_t WINDOWS_TO_UNIX_EPOCH = 116444736000000000LL;
+    uli.QuadPart -= WINDOWS_TO_UNIX_EPOCH;
+
+    // Convert to seconds and nanoseconds
+    rawtime = (time_t)(uli.QuadPart / 10000000LL);
+    nanos = (uli.QuadPart % 10000000LL) * 100;  // Convert to nanoseconds
+
+    // Determine if UTC or local time should be used
+    if (tz && strcmp(tz, "utc") == 0) {
+        gmtime_s(&timeinfo_buf, &rawtime);
+    } else {
+        localtime_s(&timeinfo_buf, &rawtime);
+    }
+    timeinfo = &timeinfo_buf;
 
     // Populate the timestamp_t struct
-    timestamp_t ts = {
-        .null = B8_FALSE,
-        .year = (u16_t)(timeinfo->tm_year + 1900),
-        .month = (u8_t)(timeinfo->tm_mon + 1),
-        .day = (u8_t)timeinfo->tm_mday,
-        .hours = (u8_t)timeinfo->tm_hour,
-        .mins = (u8_t)timeinfo->tm_min,
-        .secs = (u8_t)timeinfo->tm_sec,
-        .nanos = 0  // Windows does not support nanoseconds in time_t
-    };
+    timestamp_t ts = {.null = B8_FALSE,
+                      .year = (u16_t)(timeinfo->tm_year + 1900),
+                      .month = (u8_t)(timeinfo->tm_mon + 1),
+                      .day = (u8_t)timeinfo->tm_mday,
+                      .hours = (u8_t)timeinfo->tm_hour,
+                      .mins = (u8_t)timeinfo->tm_min,
+                      .secs = (u8_t)timeinfo->tm_sec,
+                      .nanos = nanos};
 
     return ts;
 }
@@ -230,28 +246,31 @@ timestamp_t timestamp_current(lit_p tz) {
 #else
 
 timestamp_t timestamp_current(lit_p tz) {
-    time_t rawtime;
+    struct timespec tspec;
+    struct tm timeinfo_buf;
     struct tm *timeinfo;
+    time_t rawtime;
 
-    // Get the current time
-    time(&rawtime);
+    // Get current time with nanoseconds
+    clock_gettime(CLOCK_REALTIME, &tspec);
 
-    // Choose local time or UTC based on the argument
+    rawtime = tspec.tv_sec;
+
+    // Choose UTC or local time
     if (tz != NULL && strcmp(tz, "utc") == 0)
-        timeinfo = gmtime(&rawtime);  // UTC time
+        timeinfo = gmtime_r(&rawtime, &timeinfo_buf);
     else
-        timeinfo = localtime(&rawtime);  // Local time
+        timeinfo = localtime_r(&rawtime, &timeinfo_buf);
 
-    timestamp_t ts = {
-        .null = B8_FALSE,
-        .year = (u16_t)(timeinfo->tm_year + 1900),
-        .month = (u8_t)(timeinfo->tm_mon + 1),
-        .day = (u8_t)timeinfo->tm_mday,
-        .hours = (u8_t)timeinfo->tm_hour,
-        .mins = (u8_t)timeinfo->tm_min,
-        .secs = (u8_t)timeinfo->tm_sec,
-        .nanos = 0,
-    };
+    // Populate timestamp structure
+    timestamp_t ts = {.null = B8_FALSE,
+                      .year = (u16_t)(timeinfo->tm_year + 1900),
+                      .month = (u8_t)(timeinfo->tm_mon + 1),
+                      .day = (u8_t)timeinfo->tm_mday,
+                      .hours = (u8_t)timeinfo->tm_hour,
+                      .mins = (u8_t)timeinfo->tm_min,
+                      .secs = (u8_t)timeinfo->tm_sec,
+                      .nanos = tspec.tv_nsec};
 
     return ts;
 }
