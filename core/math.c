@@ -34,22 +34,22 @@
 #include "order.h"
 #include "runtime.h"
 
-#define __UNOP_V_A(x, lt, ot, op, ln, of, iv, ov) \
-    ({                                            \
-        lt##_t *$lhs = __AS_##lt(x) + of;         \
-        ot##_t $out = iv;                         \
-        for (u64_t $i = 0; $i < ln; $i++)         \
-            $out = op($out, $lhs[$i]);            \
-        ot($out);                                 \
+#define __UNOP_V_A(x, lt, ot, op, ln, of, iv) \
+    ({                                        \
+        lt##_t *$lhs = __AS_##lt(x) + of;     \
+        ot##_t $out = iv;                     \
+        for (u64_t $i = 0; $i < ln; $i++)     \
+            $out = op($out, $lhs[$i]);        \
+        ot($out);                             \
     })
 
 #define __UNOP_V_V(x, lt, ot, op, ln, of, ov) \
     ({                                        \
         lt##_t *$lhs = __AS_##lt(x) + of;     \
-        ot##_t $out = ov;                     \
+        ot##_t *$out = __AS_##lt(ov) + of;    \
         for (u64_t $i = 0; $i < ln; $i++)     \
-            $out = op($out, $lhs[$i]);        \
-        ot($out);                             \
+            $out[$i] = op($lhs[$i]);          \
+        NULL_OBJ;                             \
     })
 
 #define __UNOP_FOLD(x, lt, ot, op)            \
@@ -543,7 +543,7 @@ obj_p ray_sum_partial(obj_p x, u64_t len, u64_t offset) {
         case -TYPE_F64:
             return clone_obj(x);
         case TYPE_I64:
-            return __UNOP_V_A(x, i64, i64, ADDI64, len, offset, 0);
+            return __UNOP_V_A(x, i64, i64, ADDI64, len, offset, XFIRST(x, i64));
         case TYPE_MAPGROUP:
             return aggr_sum(AS_LIST(x)[0], AS_LIST(x)[1]);
 
@@ -578,7 +578,7 @@ obj_p ray_min_partial(obj_p x, u64_t len, u64_t offset) {
         case TYPE_TIMESTAMP:
             return __UNOP_V_A(x, i64, i64, MINI64, len, offset, XFIRST(x, i64));
         case TYPE_F64:
-            return __UNOP_V_A(x, f64, f64, MINF64, len, offset, 0);
+            return __UNOP_V_A(x, f64, f64, MINF64, len, offset, XFIRST(x, f64));
         case TYPE_MAPGROUP:
             return aggr_min(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
@@ -592,7 +592,7 @@ obj_p ray_max_partial(obj_p x, u64_t len, u64_t offset) {
         case TYPE_TIMESTAMP:
             return __UNOP_V_A(x, i64, i64, MAXI64, len, offset, XFIRST(x, i64));
         case TYPE_F64:
-            return __UNOP_V_A(x, f64, f64, MAXF64, len, offset, 0);
+            return __UNOP_V_A(x, f64, f64, MAXF64, len, offset, XFIRST(x, f64));
         case TYPE_MAPGROUP:
             return aggr_max(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
@@ -600,40 +600,34 @@ obj_p ray_max_partial(obj_p x, u64_t len, u64_t offset) {
     }
 }
 
-obj_p ray_round_partial(obj_p x, u64_t len, u64_t offset) {
+obj_p ray_round_partial(obj_p x, u64_t len, u64_t offset, obj_p out) {
     switch (x->type) {
-        case TYPE_I64:
-            return clone_obj(x);
         case TYPE_F64:
-            return __UNOP_V_V(x, f64, f64, ROUNDF64, len, offset, 0);
-        case TYPE_MAPGROUP:
-            return aggr_round(AS_LIST(x)[0], AS_LIST(x)[1]);
+            return __UNOP_V_V(x, f64, f64, ROUNDF64, len, offset, out);
+        // case TYPE_MAPGROUP:
+        //     return aggr_round(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
             THROW(ERR_TYPE, "round: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_p ray_floor_partial(obj_p x, u64_t len, u64_t offset) {
+obj_p ray_floor_partial(obj_p x, u64_t len, u64_t offset, obj_p out) {
     switch (x->type) {
-        case TYPE_I64:
-            return clone_obj(x);
         case TYPE_F64:
-            return __UNOP_V_V(x, f64, f64, FLOORF64, len, offset, 0);
-        case TYPE_MAPGROUP:
-            return aggr_floor(AS_LIST(x)[0], AS_LIST(x)[1]);
+            return __UNOP_V_V(x, f64, f64, FLOORF64, len, offset, out);
+        // case TYPE_MAPGROUP:
+        //     return aggr_floor(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
             THROW(ERR_TYPE, "floor: unsupported type: '%s", type_name(x->type));
     }
 }
 
-obj_p ray_ceil_partial(obj_p x, u64_t len, u64_t offset) {
+obj_p ray_ceil_partial(obj_p x, u64_t len, u64_t offset, obj_p out) {
     switch (x->type) {
-        case TYPE_I64:
-            return clone_obj(x);
         case TYPE_F64:
-            return __UNOP_V_V(x, f64, f64, CEILF64, len, offset, 0);
-        case TYPE_MAPGROUP:
-            return aggr_ceil(AS_LIST(x)[0], AS_LIST(x)[1]);
+            return __UNOP_V_V(x, f64, f64, CEILF64, len, offset, out);
+        // case TYPE_MAPGROUP:
+        //     return aggr_ceil(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
             THROW(ERR_TYPE, "ceil: unsupported type: '%s", type_name(x->type));
     }
@@ -778,7 +772,7 @@ obj_p ray_med(obj_p x) {
     }
 }
 
-obj_p unop_map(raw_p op, obj_p x) {
+obj_p unop_fold(raw_p op, obj_p x) {
     pool_p pool;
     u64_t i, l, n, chunk;
     obj_p v;
@@ -812,10 +806,53 @@ obj_p unop_map(raw_p op, obj_p x) {
     return __UNOP_FOLD(v, i64, i64, ADDI64);
 }
 
+obj_p unop_map(raw_p op, obj_p x) {
+    pool_p pool;
+    u64_t i, l, n, chunk;
+    obj_p v, out;
+    raw_p argv[4];
+
+    l = x->len;
+
+    pool = runtime_get()->pool;
+    n = pool_split_by(pool, l, 0);
+    out = vector(x->type, l);
+
+    if (n == 1) {
+        argv[0] = (raw_p)x;
+        argv[1] = (raw_p)l;
+        argv[2] = (raw_p)0;
+        argv[3] = (raw_p)out;
+        v = pool_call_task_fn(op, 4, argv);
+        if (IS_ERROR(v)) {
+            out->len = 0;
+            drop_obj(out);
+            return v;
+        }
+        return out;
+    }
+
+    pool_prepare(pool);
+    chunk = l / n;
+
+    for (i = 0; i < n - 1; i++)
+        pool_add_task(pool, op, 4, x, chunk, i * chunk, out);
+
+    pool_add_task(pool, op, 4, x, l - i * chunk, i * chunk, out);
+
+    v = pool_run(pool);
+    if (IS_ERROR(v))
+        return v;
+
+    drop_obj(v);
+
+    return out;
+}
+
 obj_p binop_map(raw_p op, obj_p x, obj_p y) {
     pool_p pool;
     u64_t i, l, n, chunk;
-    obj_p v, res;
+    obj_p v, out;
     raw_p argv[5];
     i8_t t;
 
@@ -838,47 +875,47 @@ obj_p binop_map(raw_p op, obj_p x, obj_p y) {
 
     pool = runtime_get()->pool;
     n = pool_split_by(pool, l, 0);
-    res = vector(t, l);
+    out = vector(t, l);
 
     if (n == 1) {
         argv[0] = (raw_p)x;
         argv[1] = (raw_p)y;
         argv[2] = (raw_p)l;
         argv[3] = (raw_p)0;
-        argv[4] = (raw_p)res;
+        argv[4] = (raw_p)out;
         v = pool_call_task_fn(op, 5, argv);
         if (IS_ERROR(v)) {
-            res->len = 0;
-            drop_obj(res);
+            out->len = 0;
+            drop_obj(out);
             return v;
         }
-        return res;
+        return out;
     }
 
     pool_prepare(pool);
     chunk = l / n;
 
     for (i = 0; i < n - 1; i++)
-        pool_add_task(pool, op, 5, x, y, chunk, i * chunk, res);
+        pool_add_task(pool, op, 5, x, y, chunk, i * chunk, out);
 
-    pool_add_task(pool, op, 5, x, y, l - i * chunk, i * chunk, res);
+    pool_add_task(pool, op, 5, x, y, l - i * chunk, i * chunk, out);
 
     v = pool_run(pool);
     if (IS_ERROR(v)) {
-        res->len = 0;
-        drop_obj(res);
+        out->len = 0;
+        drop_obj(out);
         return v;
     }
 
     drop_obj(v);
 
-    return res;
+    return out;
 }
 
 // Unaries
-obj_p ray_sum(obj_p x) { return unop_map(ray_sum_partial, x); }
-obj_p ray_min(obj_p x) { return unop_map(ray_min_partial, x); }
-obj_p ray_max(obj_p x) { return unop_map(ray_max_partial, x); }
+obj_p ray_sum(obj_p x) { return unop_fold(ray_sum_partial, x); }
+obj_p ray_min(obj_p x) { return unop_fold(ray_min_partial, x); }
+obj_p ray_max(obj_p x) { return unop_fold(ray_max_partial, x); }
 obj_p ray_round(obj_p x) { return unop_map(ray_round_partial, x); }
 obj_p ray_floor(obj_p x) { return unop_map(ray_floor_partial, x); }
 obj_p ray_ceil(obj_p x) { return unop_map(ray_ceil_partial, x); }
