@@ -34,32 +34,22 @@
 #include "order.h"
 #include "runtime.h"
 
-#define __UNOP_V_A(x, lt, ot, op, ln, of, iv) \
-    ({                                        \
-        lt##_t *$lhs = __AS_##lt(x) + of;     \
-        ot##_t $out = iv;                     \
-        for (u64_t $i = 0; $i < ln; $i++)     \
-            $out = op($out, $lhs[$i]);        \
-        ot($out);                             \
+#define __UNOP_FOLD(x, lt, ot, op, ln, of, iv) \
+    ({                                         \
+        lt##_t *$lhs = __AS_##lt(x) + of;      \
+        ot##_t $out = iv;                      \
+        for (u64_t $i = 0; $i < ln; $i++)      \
+            $out = op($out, $lhs[$i]);         \
+        ot($out);                              \
     })
 
-#define __UNOP_V_V(x, lt, ot, op, ln, of, ov) \
+#define __UNOP_MAP(x, lt, ot, op, ln, of, ov) \
     ({                                        \
         lt##_t *$lhs = __AS_##lt(x) + of;     \
         ot##_t *$out = __AS_##lt(ov) + of;    \
         for (u64_t $i = 0; $i < ln; $i++)     \
             $out[$i] = op($lhs[$i]);          \
         NULL_OBJ;                             \
-    })
-
-#define __UNOP_FOLD(x, lt, ot, op)            \
-    ({                                        \
-        obj_p *$lhs = AS_LIST(x);             \
-        ot##_t $out = $lhs[0]->lt;            \
-        for (u64_t $i = 1; $i < x->len; $i++) \
-            $out = op($out, $lhs[$i]->lt);    \
-        drop_obj(x);                          \
-        ot($out);                             \
     })
 
 #define __DISPATCH_BINOP(x, y, op, ot, ov)                       \
@@ -543,7 +533,7 @@ obj_p ray_sum_partial(obj_p x, u64_t len, u64_t offset) {
         case -TYPE_F64:
             return clone_obj(x);
         case TYPE_I64:
-            return __UNOP_V_A(x, i64, i64, ADDI64, len, offset, XFIRST(x, i64));
+            return __UNOP_FOLD(x, i64, i64, ADDI64, len, offset, 0);
         case TYPE_MAPGROUP:
             return aggr_sum(AS_LIST(x)[0], AS_LIST(x)[1]);
 
@@ -576,9 +566,9 @@ obj_p ray_min_partial(obj_p x, u64_t len, u64_t offset) {
     switch (x->type) {
         case TYPE_I64:
         case TYPE_TIMESTAMP:
-            return __UNOP_V_A(x, i64, i64, MINI64, len, offset, XFIRST(x, i64));
+            return __UNOP_FOLD(x, i64, i64, MINI64, len, offset, XFIRST(x, i64));
         case TYPE_F64:
-            return __UNOP_V_A(x, f64, f64, MINF64, len, offset, XFIRST(x, f64));
+            return __UNOP_FOLD(x, f64, f64, MINF64, len, offset, XFIRST(x, f64));
         case TYPE_MAPGROUP:
             return aggr_min(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
@@ -590,9 +580,9 @@ obj_p ray_max_partial(obj_p x, u64_t len, u64_t offset) {
     switch (x->type) {
         case TYPE_I64:
         case TYPE_TIMESTAMP:
-            return __UNOP_V_A(x, i64, i64, MAXI64, len, offset, XFIRST(x, i64));
+            return __UNOP_FOLD(x, i64, i64, MAXI64, len, offset, XFIRST(x, i64));
         case TYPE_F64:
-            return __UNOP_V_A(x, f64, f64, MAXF64, len, offset, XFIRST(x, f64));
+            return __UNOP_FOLD(x, f64, f64, MAXF64, len, offset, XFIRST(x, f64));
         case TYPE_MAPGROUP:
             return aggr_max(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
@@ -603,7 +593,7 @@ obj_p ray_max_partial(obj_p x, u64_t len, u64_t offset) {
 obj_p ray_round_partial(obj_p x, u64_t len, u64_t offset, obj_p out) {
     switch (x->type) {
         case TYPE_F64:
-            return __UNOP_V_V(x, f64, f64, ROUNDF64, len, offset, out);
+            return __UNOP_MAP(x, f64, f64, ROUNDF64, len, offset, out);
         // case TYPE_MAPGROUP:
         //     return aggr_round(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
@@ -614,7 +604,7 @@ obj_p ray_round_partial(obj_p x, u64_t len, u64_t offset, obj_p out) {
 obj_p ray_floor_partial(obj_p x, u64_t len, u64_t offset, obj_p out) {
     switch (x->type) {
         case TYPE_F64:
-            return __UNOP_V_V(x, f64, f64, FLOORF64, len, offset, out);
+            return __UNOP_MAP(x, f64, f64, FLOORF64, len, offset, out);
         // case TYPE_MAPGROUP:
         //     return aggr_floor(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
@@ -625,7 +615,7 @@ obj_p ray_floor_partial(obj_p x, u64_t len, u64_t offset, obj_p out) {
 obj_p ray_ceil_partial(obj_p x, u64_t len, u64_t offset, obj_p out) {
     switch (x->type) {
         case TYPE_F64:
-            return __UNOP_V_V(x, f64, f64, CEILF64, len, offset, out);
+            return __UNOP_MAP(x, f64, f64, CEILF64, len, offset, out);
         // case TYPE_MAPGROUP:
         //     return aggr_ceil(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
@@ -806,7 +796,7 @@ obj_p unop_fold(raw_p op, obj_p x) {
     // Fold the results
     v = unify_list(&v);
     argv[0] = (raw_p)v;
-    argv[1] = (raw_p)n;
+    argv[1] = (raw_p)v->len;
     argv[2] = (raw_p)0;
     res = pool_call_task_fn(op, 3, argv);
     drop_obj(v);
