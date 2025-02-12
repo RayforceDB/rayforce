@@ -35,6 +35,7 @@
 #else
 #include <stdlib.h>
 #include <unistd.h>
+#include <signal.h>
 #endif
 
 i32_t cpu_cores() {

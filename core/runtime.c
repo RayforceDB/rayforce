@@ -27,9 +27,21 @@
 #include "unary.h"
 #include "io.h"
 #include "string.h"
+#include "signal.h"
 
 // Global runtime reference
 runtime_p __RUNTIME = NULL;
+
+static volatile pid_t __CHILD_PID = -1;  // Store child process ID
+
+// Signal handler: forward SIGINT and SIGTERM to the child process
+nil_t handle_signal(i32_t sig) {
+    if (__CHILD_PID > 0) {
+        kill(__CHILD_PID, sig);  // Forward signal to child process
+    }
+    signal(sig, SIG_DFL);  // Restore default behavior
+    raise(sig);            // Re-raise the signal to terminate self
+}
 
 nil_t usage(nil_t) {
     printf("%s%s%s", BOLD, YELLOW, "Usage: rayforce [-f file] [-p port] [-t timeit] [-c cores] [file]\n");
@@ -170,6 +182,10 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
         // if (__RUNTIME->sys_info.threads > 1)
         //     __RUNTIME->pool = pool_create(__RUNTIME->sys_info.threads - 1);
     }
+
+    // Setup signal handling to forward SIGINT and SIGTERM
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
 
     return 0;
 }
