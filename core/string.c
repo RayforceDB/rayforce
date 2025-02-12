@@ -79,10 +79,14 @@ i32_t i32_from_str(lit_p str, u64_t len) {
     }
 
     // Parse the digits
-    while (is_digit(*str)) {
+    while (len > 0 && is_digit(*str)) {
         result = result * 10 + (*str - '0');
         str++;
+        len--;
     }
+
+    if (len)
+        return NULL_I32;
 
     return result * sign;
 }
@@ -104,10 +108,14 @@ i64_t i64_from_str(lit_p str, u64_t len) {
     }
 
     // Parse the digits
-    while (len-- > 0 && is_digit(*str)) {
+    while (len > 0 && is_digit(*str)) {
         result = result * 10 + (*str - '0');
         str++;
+        len--;
     }
+
+    if (len)
+        return NULL_I64;
 
     return result * sign;
 }

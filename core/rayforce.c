@@ -1760,6 +1760,8 @@ obj_p cast_obj(i8_t type, obj_p obj) {
             return res;
         case MTYPE2(-TYPE_SYMBOL, TYPE_C8):
             return symbol(AS_C8(obj), obj->len);
+        case MTYPE2(-TYPE_I32, TYPE_C8):
+            return i32(i32_from_str(AS_C8(obj), obj->len));
         case MTYPE2(-TYPE_I64, TYPE_C8):
             return i64(i64_from_str(AS_C8(obj), obj->len));
         case MTYPE2(-TYPE_DATE, TYPE_C8):
@@ -1769,7 +1771,7 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_C8):
             return timestamp(timestamp_into_i64(timestamp_from_str(AS_C8(obj), obj->len)));
         case MTYPE2(-TYPE_F64, TYPE_C8):
-            return f64(strtod(AS_C8(obj), NULL));
+            return f64(f64_from_str(AS_C8(obj), obj->len));
         case MTYPE2(TYPE_TABLE, TYPE_DICT):
             return table(clone_obj(AS_LIST(obj)[0]), clone_obj(AS_LIST(obj)[1]));
         case MTYPE2(TYPE_DICT, TYPE_TABLE):
