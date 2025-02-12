@@ -64,7 +64,6 @@ obj_p eval(obj_p obj);
 obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file);
 obj_p ray_eval_str(obj_p str, obj_p file);
 obj_p ray_raise(obj_p obj);
-obj_p try_eval(obj_p obj, obj_p ctch);
 obj_p ray_return(obj_p *x, u64_t n);
 obj_p interpreter_env_get(nil_t);
 nil_t error_add_loc(obj_p err, i64_t id, ctx_p ctx);

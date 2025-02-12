@@ -549,8 +549,8 @@ obj_p ray_eval_str(obj_p str, obj_p file) {
 
 obj_p try_obj(obj_p obj, obj_p ctch) {
     ctx_p ctx;
-    obj_p fn, *pfn, res;
-    b8_t sig;
+    obj_p fn, *pfn, res = NULL_OBJ;
+    b8_t sig = B8_FALSE;
 
     ctx = ctx_get();
     fn = ctch;
@@ -598,7 +598,7 @@ obj_p try_obj(obj_p obj, obj_p ctch) {
                     // Fallthrough
                 default:
                     drop_obj(res);
-                    return clone_obj(ctch);
+                    return clone_obj(fn);
             }
         } else {
             drop_obj(res);
