@@ -141,6 +141,33 @@ nil_t poll_destroy(poll_p poll) {
     heap_free(poll);
 }
 
+i64_t poll_listen(poll_p poll, i64_t port) {
+    i64_t listen_fd;
+    struct kevent ev;
+
+    if (poll == NULL)
+        return -1;
+
+    if (poll->ipc_fd != -1) {
+        return -2;
+    }
+
+    listen_fd = sock_listen(port);
+    if (listen_fd == -1)
+        return -1;
+
+    EV_SET(&ev, listen_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+
+    if (kevent(poll->poll_fd, &ev, 1, NULL, 0, NULL) == -1) {
+        close(listen_fd);
+        return -1;
+    }
+
+    poll->ipc_fd = listen_fd;
+
+    return listen_fd;
+}
+
 i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
     i64_t id;
     selector_p selector;

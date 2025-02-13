@@ -36,6 +36,7 @@
 #endif
 
 #include "eval.h"
+#include "binary.h"
 
 nil_t poll_set_usr_fd(i64_t fd) {
     obj_p s, k, v;
