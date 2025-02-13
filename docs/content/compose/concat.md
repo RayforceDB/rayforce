@@ -1,6 +1,6 @@
 # Concat `concat`
 
-Concatenates two values.
+Concatenates two values into a single list or array.
 
 ```clj
 ↪ (concat 1 2)
@@ -17,3 +17,11 @@ Concatenates two values.
   7
 )
 ```
+
+!!! info
+    - When concatenating arrays of the same type, the result is an array
+    - When concatenating different types, the result is a list
+    - Single values are treated as one-element lists/arrays
+
+!!! tip
+    Use concat to build arrays incrementally or combine heterogeneous data

@@ -1,6 +1,6 @@
 # Dict `dict`
 
-The `dict` function creates a dictionary with the specified keys and values.
+Creates a dictionary with the specified keys and values.
 
 ```clj
 ↪ (dict [a b c] [1 2 3])
@@ -16,3 +16,11 @@ The `dict` function creates a dictionary with the specified keys and values.
   c: 5.77
 }
 ```
+
+!!! warning
+    The keys and values arrays must have the same length
+
+!!! info
+    - Keys can be symbols or strings
+    - Values can be of any type
+    - Keys must be unique

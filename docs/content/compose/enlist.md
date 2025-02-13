@@ -1,6 +1,6 @@
-# Enlist `enlist`.
+# Enlist `enlist`
 
-Enlist is a variadic function that takes n arguments and construct a list from ones, folding it into a vector if the arguments types are the same.
+Creates a list from multiple arguments, folding into a vector if all arguments have the same type.
 
 ```clj
 ↪ (enlist 1 2 3)
@@ -18,3 +18,11 @@ Enlist is a variadic function that takes n arguments and construct a list from o
   asd
 )
 ```
+
+!!! info
+    - Creates a vector if all arguments are of the same type
+    - Creates a list if arguments have different types
+    - Preserves nested structures
+
+!!! tip
+    Use enlist when you need to combine multiple values into a single collection
