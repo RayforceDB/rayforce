@@ -289,7 +289,7 @@ obj_p ray_map_right(obj_p *x, u64_t n) {
 }
 
 obj_p ray_fold(obj_p *x, u64_t n) {
-    u64_t a, o, i, j, l;
+    u64_t a, o, i, l;
     obj_p f, v, *b, x1, x2;
 
     if (n < 2)

@@ -42,6 +42,7 @@
 #include "error.h"
 #include "sys.h"
 #include "eval.h"
+#include "binary.h"
 
 __thread i32_t __EVENT_FD[2];  // eventfd to notify epoll loop of shutdown
 __thread u8_t __STDIN_BUF[BUF_SIZE + 1];
@@ -86,21 +87,6 @@ poll_p poll_init(i64_t port) {
         exit(EXIT_FAILURE);
     }
 
-    // Add server socket
-    if (port) {
-        listen_fd = sock_listen(port);
-        if (listen_fd == -1) {
-            perror("listen");
-            exit(EXIT_FAILURE);
-        }
-
-        EV_SET(&ev, listen_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-        if (kevent(kq_fd, &ev, 1, NULL, 0, NULL) == -1) {
-            perror("kevent: listenfd");
-            exit(EXIT_FAILURE);
-        }
-    }
-
     poll = (poll_p)heap_alloc(sizeof(struct poll_t));
     poll->code = NULL_I64;
     poll->poll_fd = kq_fd;
@@ -111,7 +97,35 @@ poll_p poll_init(i64_t port) {
     poll->term = term_create();
     poll->timers = timers_create(128);
 
+    // Add server socket
+    if (port) {
+        listen_fd = poll_listen(poll, port);
+        if (listen_fd == -1) {
+            perror("listen");
+            exit(EXIT_FAILURE);
+        }
+    }
+
     return poll;
+}
+
+i64_t poll_listen(poll_p poll, i64_t port) {
+    i64_t listen_fd;
+    struct kevent ev;
+
+    listen_fd = sock_listen(port);
+    if (listen_fd == -1) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+
+    EV_SET(&ev, listen_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    if (kevent(poll->poll_fd, &ev, 1, NULL, 0, NULL) == -1) {
+        perror("kevent: listenfd");
+        exit(EXIT_FAILURE);
+    }
+
+    return listen_fd;
 }
 
 nil_t poll_destroy(poll_p poll) {
