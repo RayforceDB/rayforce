@@ -24,21 +24,25 @@ theme:
     - toc.follow
 
   palette:
-    - scheme: default
-      primary: indigo
-      accent: indigo
+    # Light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue       # Milvus-style blue
+      accent: light blue # Lighter accent like Milvus
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
-    - scheme: slate
-      primary: black
-      accent: indigo
+    # Dark mode    
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue      # Keep consistent branding
+      accent: light blue # Keep consistent accent
       toggle:
-        icon: material/brightness-3
+        icon: material/brightness-4
         name: Switch to light mode
   font:
     text: Roboto
-    code: Roboto Mono
+    code: JetBrains Mono  # Changed to JetBrains Mono for better code readability
   icon:
     logo: material/lumx
 
