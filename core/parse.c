@@ -95,9 +95,9 @@ b8_t at_eof(c8_t c) { return c == '\0' || (signed char)c == EOF; }
 
 b8_t at_term(c8_t c) { return c == ')' || c == ']' || c == '}' || c == ':' || c == ' ' || c == '\r' || c == '\n'; }
 
-b8_t is_at(obj_p token, c8_t c) { return token && token->type == -TYPE_C8 && token->c8 == c; }
+b8_t is_at(obj_p token, c8_t c) { return token && token->type == TYPE_TOKEN && token->c8 == c; }
 
-b8_t is_at_term(obj_p token) { return token && token->type == -TYPE_C8 && at_term(token->c8); }
+b8_t is_at_term(obj_p token) { return token && token->type == TYPE_TOKEN && at_term(token->c8); }
 
 i8_t shift(parser_t *parser, i32_t num) {
     i8_t res;
@@ -114,7 +114,7 @@ i8_t shift(parser_t *parser, i32_t num) {
 
 obj_p to_token(parser_t *parser) {
     obj_p tok = c8(*parser->current);
-    tok->type = -TYPE_C8;
+    tok->type = TYPE_TOKEN;
     nfo_insert(parser->nfo, (i64_t)tok, span_start(parser));
 
     return tok;
@@ -530,41 +530,28 @@ obj_p parse_char(parser_t *parser) {
     i64_t id;
     c8_t ch;
 
-    if (at_eof(*pos) || at_term(*pos)) {
-        shift(parser, pos - parser->current);
+    // Check for empty char literal ''
+    if (*pos == '\'') {
+        res = c8(0);
+        shift(parser, 2);  // Skip both quotes
         span_extend(parser, &span);
         nfo_insert(parser->nfo, (i64_t)res, span);
-
-        res = null(TYPE_SYMBOL);
-        res->attrs = ATTR_QUOTED;
-
         return res;
     }
 
-    if (*pos != '\'') {
-        // char?
-        if (*(pos + 1) == '\'') {
-            ch = *pos++;
-            res = c8(ch);
-
-            shift(parser, 3);
-            span_extend(parser, &span);
-            nfo_insert(parser->nfo, (i64_t)res, span);
-
-            return res;
-        }
-
-        // continue parsing a symbol
-        while (is_alphanum(*pos) || is_op(*pos))
-            pos++;
-
-        if (*pos == '\'') {
-            span.end_column += (pos - parser->current);
-            nfo_insert(parser->nfo, parser->count, span);
-            return parse_error(parser, parser->count++,
-                               str_fmt(-1, "Invalid literal: char can not contain more than one symbol"));
-        }
+    // Check for regular char literal 'x'
+    if (*(pos + 1) == '\'') {
+        ch = *pos;
+        res = c8(ch);
+        shift(parser, 3);  // Skip both quotes and the character
+        span_extend(parser, &span);
+        nfo_insert(parser->nfo, (i64_t)res, span);
+        return res;
     }
+
+    // If not a char literal, parse as quoted symbol
+    while (is_alphanum(*pos) || is_op(*pos))
+        pos++;
 
     id = symbols_intern(parser->current + 1, pos - (parser->current + 1));
     res = i64(id);

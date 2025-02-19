@@ -70,6 +70,7 @@ extern "C"
 #define TYPE_UNARY 101
 #define TYPE_BINARY 102
 #define TYPE_VARY 103
+#define TYPE_TOKEN 125
 // Special types
 #define TYPE_NULL 126
 #define TYPE_ERROR 127

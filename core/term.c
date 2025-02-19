@@ -499,16 +499,26 @@ i64_t term_redraw_into(term_p term, obj_p *dst) {
                         }
                     }
                 } else if (term->buf[i] == '\'') {
-                    // char
-                    for (j = i + 1; j < l; j++) {
-                        if (term->buf[j] == '\'') {
-                            n += str_fmt_into(dst, -1, "%s", SALAD);
-                            n += str_fmt_into(dst, -1, "%.*s", j - i + 1, term->buf + i);
-                            n += str_fmt_into(dst, -1, "%s", RESET);
-                            i = j;
-                            c = 1;
-                            break;
+                    // Modified character literal detection
+                    if (i + 1 < l && term->buf[i + 1] == '\'') {
+                        // This is an empty character literal ('')
+                        n += str_fmt_into(dst, -1, "%s%.*s%s", SALAD, 2, term->buf + i, RESET);
+                        i += 1;
+                        c = 1;
+                    } else if (i + 2 < l && term->buf[i + 2] == '\'') {
+                        // This is a character literal ('x')
+                        n += str_fmt_into(dst, -1, "%s%.*s%s", SALAD, 3, term->buf + i, RESET);
+                        i += 2;
+                        c = 1;
+                    } else {
+                        // This is a quoted symbol ('xyz)
+                        for (j = i + 1; j < l; j++) {
+                            if (!is_alphanum(term->buf[j]) && term->buf[j] != '-')
+                                break;
                         }
+                        n += str_fmt_into(dst, -1, "%s%.*s%s", CYAN, j - i, term->buf + i, RESET);
+                        i = j - 1;
+                        c = 1;
                     }
                 }
 

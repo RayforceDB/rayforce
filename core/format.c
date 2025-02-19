@@ -310,6 +310,8 @@ i64_t c8_fmt_into(obj_p *dst, b8_t full, c8_t val) {
             return full ? str_fmt_into(dst, 5, "'\\r'") : str_fmt_into(dst, 3, "\\r");
         case '\t':
             return full ? str_fmt_into(dst, 5, "'\\t'") : str_fmt_into(dst, 3, "\\t");
+        case '\0':
+            return full ? str_fmt_into(dst, 3, "''") : str_fmt_into(dst, 2, " ");
         default:
             return full ? str_fmt_into(dst, 4, "'%c'", val) : str_fmt_into(dst, 2, "%c", val);
     }
@@ -1132,6 +1134,8 @@ i64_t obj_fmt_into(obj_p *dst, i64_t indent, i64_t limit, b8_t full, obj_p obj) 
     switch (obj->type) {
         case -TYPE_B8:
             return b8_fmt_into(dst, obj->b8);
+        case -TYPE_C8:
+            return c8_fmt_into(dst, full, obj->c8);
         case -TYPE_U8:
             return byte_fmt_into(dst, obj->u8);
         case -TYPE_I16:
@@ -1152,8 +1156,6 @@ i64_t obj_fmt_into(obj_p *dst, i64_t indent, i64_t limit, b8_t full, obj_p obj) 
             return timestamp_fmt_into(dst, obj->i64);
         case -TYPE_GUID:
             return guid_fmt_into(dst, AS_GUID(obj));
-        case -TYPE_C8:
-            return c8_fmt_into(dst, full, obj->c8);
         case TYPE_B8:
         case TYPE_U8:
         case TYPE_I16:

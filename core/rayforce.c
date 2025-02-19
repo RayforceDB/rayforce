@@ -206,7 +206,9 @@ obj_p guid(const guid_t buf) {
 }
 
 obj_p c8(c8_t c) {
-    obj_p s = atom(TYPE_C8);
+    obj_p s;
+
+    s = atom(TYPE_C8);
     s->c8 = c;
 
     return s;
