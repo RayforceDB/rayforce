@@ -1099,6 +1099,8 @@ obj_p set_idx(obj_p *obj, i64_t idx, obj_p val) {
                 return *obj;
             }
 
+            drop_obj(val);
+
             THROW(ERR_TYPE, "set_idx: invalid types: '%s, '%s", type_name((*obj)->type), type_name(val->type));
     }
 }
