@@ -12,7 +12,7 @@ Returns command line arguments passed to the script.
 true
 
 ;; Access specific argument
-↪ (at 0 (args))
+↪ (at (args) 0)
 "arg1"
 ```
 
