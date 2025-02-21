@@ -970,7 +970,7 @@ obj_p io_get_table_splayed(obj_p path, obj_p symfile) {
 
         AS_LIST(vals)[i] = val;
 
-        if (val->type == TYPE_SYMBOL)
+        if (val->type == TYPE_ENUM)
             syms_present = B8_TRUE;
     }
 

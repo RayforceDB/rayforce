@@ -1631,7 +1631,7 @@ obj_p remove_obj(obj_p *obj, obj_p idx) {
 
             return *obj;
         default:
-            PANIC("remove_obj: invalid type: %d", (*obj)->type);
+            THROW(ERR_TYPE, "remove_obj: invalid type: %d", (*obj)->type);
     }
 }
 
@@ -2075,7 +2075,6 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
 
     u32_t rc;
     u64_t i, l;
-    obj_p fdmap;
 
     if (!__RC_SYNC) {
         (obj)->rc -= 1;
@@ -2118,8 +2117,7 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             return;
         case TYPE_ENUM:
             if (IS_EXTERNAL_COMPOUND(obj)) {
-                fdmap = runtime_fdmap_pop(runtime_get(), obj);
-                drop_obj(fdmap);
+                runtime_fdmap_pop(runtime_get(), obj);
                 // mmap_free((str_p)obj - RAY_PAGE_SIZE, size_of(obj) + RAY_PAGE_SIZE);
             } else {
                 drop_obj(AS_LIST(obj)[0]);
@@ -2128,10 +2126,8 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             }
             return;
         case TYPE_MAPLIST:
-            fdmap = runtime_fdmap_pop(runtime_get(), MAPLIST_KEY(obj));
-            drop_obj(fdmap);
-            fdmap = runtime_fdmap_pop(runtime_get(), obj);
-            drop_obj(fdmap);
+            runtime_fdmap_pop(runtime_get(), MAPLIST_KEY(obj));
+            runtime_fdmap_pop(runtime_get(), obj);
             // mmap_free(MAPLIST_KEY(obj), size_of(obj));
             // mmap_free((str_p)obj - RAY_PAGE_SIZE, size_of(obj) + RAY_PAGE_SIZE);
             return;
@@ -2156,10 +2152,9 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             heap_free(obj);
             return;
         default:
-            if (IS_EXTERNAL_SIMPLE(obj)) {
-                fdmap = runtime_fdmap_pop(runtime_get(), obj);
-                drop_obj(fdmap);
-            } else
+            if (IS_EXTERNAL_SIMPLE(obj))
+                runtime_fdmap_pop(runtime_get(), obj);
+            else
                 heap_free(obj);
 
             return;

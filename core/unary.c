@@ -223,7 +223,7 @@ obj_p ray_get(obj_p x) {
                     ((obj_p)((str_p)res - RAY_PAGE_SIZE))->obj = keys;
                 }
 
-                res->rc += 1;
+                res = clone_obj(res);  // increment ref count
 
                 return res;
             }
