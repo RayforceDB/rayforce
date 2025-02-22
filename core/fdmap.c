@@ -27,24 +27,24 @@
 #include "ops.h"
 #include "util.h"
 
-obj_p fdmap_create(u64_t size) {
+obj_p fdmap_create() {
     obj_p fdmap;
 
-    fdmap = LIST(size);
+    fdmap = LIST(1);
     fdmap->type = TYPE_MAPFD;
-    fdmap->len = 0;
 
     return fdmap;
 }
 
-nil_t fdmap_add_fd(obj_p fdmap, obj_p obj, i64_t fd, i64_t size) {
+nil_t fdmap_add_fd(obj_p *fdmap, obj_p obj, i64_t fd, i64_t size) {
     obj_p v;
 
     v = I64(3);
     AS_I64(v)[0] = (i64_t)obj;
     AS_I64(v)[1] = fd;
     AS_I64(v)[2] = size;
-    AS_LIST(fdmap)[fdmap->len++] = v;
+    AS_LIST(*fdmap)[0] = v;
+    // push_obj(fdmap, v);
 }
 
 nil_t fdmap_destroy(obj_p fdmap) {
@@ -59,10 +59,12 @@ nil_t fdmap_destroy(obj_p fdmap) {
         fd = (u64_t)AS_I64(AS_LIST(fdmap)[i])[1];
         size = AS_I64(AS_LIST(fdmap)[i])[2];
 
-        if (obj != NULL_OBJ)
+        if (obj != NULL)
             mmap_free(obj, size);
 
         if (fd != -1)
             fs_fclose(fd);
+
+        drop_obj(AS_LIST(fdmap)[i]);
     }
 }

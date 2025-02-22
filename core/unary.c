@@ -189,13 +189,13 @@ obj_p ray_get(obj_p x) {
                 fs_fclose(fd);
                 return v;
             } else if (IS_EXTERNAL_COMPOUND(res)) {
-                fdmap = fdmap_create(1);
-                fdmap_add_fd(fdmap, res, fd, size);
+                fdmap = fdmap_create();
+                fdmap_add_fd(&fdmap, res, fd, size);
                 res = (obj_p)((str_p)res + RAY_PAGE_SIZE);
                 runtime_fdmap_push(runtime_get(), res, fdmap);
             } else {
-                fdmap = fdmap_create(1);
-                fdmap_add_fd(fdmap, res, fd, size);
+                fdmap = fdmap_create();
+                fdmap_add_fd(&fdmap, res, fd, size);
                 runtime_fdmap_push(runtime_get(), res, fdmap);
             }
 
@@ -215,7 +215,6 @@ obj_p ray_get(obj_p x) {
 
                 ((obj_p)((str_p)res - RAY_PAGE_SIZE))->obj = keys;
             }
-
             return clone_obj(res);  // increment ref count
 
         default:

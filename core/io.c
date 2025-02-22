@@ -950,9 +950,6 @@ obj_p io_get_table_splayed(obj_p path, obj_p symfile) {
     l = keys->len;
     vals = LIST(l);
 
-    for (i = 0; i < l; i++)
-        AS_LIST(vals)[i] = NULL_OBJ;
-
     for (i = 0; i < l; i++) {
         v = at_idx(keys, i);
         s = cast_obj(TYPE_C8, v);
@@ -972,7 +969,6 @@ obj_p io_get_table_splayed(obj_p path, obj_p symfile) {
         }
 
         AS_LIST(vals)[i] = val;
-        DEBUG_OBJ(AS_LIST(vals)[2]);
 
         if (val->type == TYPE_ENUM)
             syms_present = B8_TRUE;

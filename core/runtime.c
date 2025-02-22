@@ -218,11 +218,16 @@ obj_p runtime_get_arg(lit_p key) {
 }
 
 nil_t runtime_fdmap_push(runtime_p runtime, obj_p assoc, obj_p fdmap) {
-    obj_p id;
+    obj_p id, r;
 
     id = i64((i64_t)assoc);
-    set_obj(&runtime->fdmaps, id, fdmap);
+    r = set_obj(&runtime->fdmaps, id, fdmap);
     drop_obj(id);
+
+    if (IS_ERROR(r)) {
+        DEBUG_OBJ(r);
+        return;
+    }
 }
 
 obj_p runtime_fdmap_pop(runtime_p runtime, obj_p assoc) {

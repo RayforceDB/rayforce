@@ -59,14 +59,18 @@ nil_t ray_clean(nil_t) { runtime_destroy(); }
 u8_t version(nil_t) { return RAYFORCE_VERSION; }
 
 nil_t zero_obj(obj_p obj) {
-    u64_t size = size_of(obj) - sizeof(struct obj_t);
+    u64_t size;
+
+    size = size_of(obj) - sizeof(struct obj_t);
     memset(obj->arr, 0, size);
 }
 
 obj_p atom(i8_t type) {
-    obj_p a = (obj_p)heap_alloc(sizeof(struct obj_t));
+    obj_p a;
 
-    if (!a)
+    a = (obj_p)heap_alloc(sizeof(struct obj_t));
+
+    if (a == NULL)
         PANIC("oom");
 
     a->mmod = MMOD_INTERNAL;
@@ -534,13 +538,19 @@ obj_p unify_list(obj_p *obj) {
 }
 
 obj_p push_sym(obj_p *obj, lit_p str) {
-    i64_t sym = symbols_intern(str, strlen(str));
+    i64_t sym;
+
+    sym = symbols_intern(str, strlen(str));
+
     return push_raw(obj, &sym);
 }
 
 obj_p ins_raw(obj_p *obj, i64_t idx, raw_p val) {
-    i32_t size = size_of_type((*obj)->type);
+    i32_t size;
+
+    size = size_of_type((*obj)->type);
     memcpy((*obj)->arr + idx * size, val, size);
+
     return *obj;
 }
 
@@ -551,9 +561,6 @@ obj_p ins_obj(obj_p *obj, i64_t idx, obj_p val) {
 
     if (!IS_VECTOR(*obj))
         return *obj;
-
-    if (!val)
-        val = null((*obj)->type);
 
     // we need to convert vector to list
     if (((*obj)->type - (-val->type) != 0) && (*obj)->type != TYPE_LIST) {
@@ -616,7 +623,10 @@ obj_p ins_obj(obj_p *obj, i64_t idx, obj_p val) {
 }
 
 obj_p ins_sym(obj_p *obj, i64_t idx, lit_p str) {
-    i64_t sym = symbols_intern(str, strlen(str));
+    i64_t sym;
+
+    sym = symbols_intern(str, strlen(str));
+
     return ins_raw(obj, idx, &sym);
 }
 
@@ -1055,10 +1065,7 @@ obj_p at_obj(obj_p obj, obj_p idx) {
         default:
             if (obj->type == TYPE_DICT) {
                 j = find_obj_idx(AS_LIST(obj)[0], idx);
-                if (j == NULL_I64)
-                    return null(AS_LIST(obj)[1]->type);
-
-                return at_idx(AS_LIST(obj)[1], j);
+                return (j == NULL_I64) ? null(AS_LIST(obj)[1]->type) : at_idx(AS_LIST(obj)[1], j);
             }
 
             THROW(ERR_TYPE, "at_obj: unable to index: '%s by '%s", type_name(obj->type), type_name(idx->type));
@@ -1076,6 +1083,11 @@ obj_p at_sym(obj_p obj, lit_p str, u64_t n) {
 }
 
 obj_p set_idx(obj_p *obj, i64_t idx, obj_p val) {
+    if (idx < 0 || idx >= (i64_t)(*obj)->len) {
+        drop_obj(val);
+        THROW(ERR_INDEX, "set_idx: '%lld' is out of range '0..%lld'", idx, (*obj)->len - 1);
+    }
+
     switch (MTYPE2((*obj)->type, val->type)) {
         case MTYPE2(TYPE_I64, -TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, -TYPE_SYMBOL):
@@ -1299,18 +1311,22 @@ obj_p set_dict_obj(obj_p *obj, obj_p idx, obj_p val) {
         case -TYPE_SYMBOL:
         case -TYPE_TIMESTAMP:
             i = find_obj_idx(AS_LIST(*obj)[0], idx);
+            // Key not found, add it
             if (i == NULL_I64) {
                 res = push_obj(&AS_LIST(*obj)[0], clone_obj(idx));
-                if (res->type == TYPE_ERROR)
+                if (IS_ERROR(res))
                     return res;
 
-                res = push_obj(&AS_LIST(*obj)[1], clone_obj(val));
+                res = push_obj(&AS_LIST(*obj)[1], val);
+                if (IS_ERROR(res))
+                    return res;
             }
-
-            res = set_idx(&AS_LIST(*obj)[1], i, val);
-
-            if (IS_ERROR(res))
-                return res;
+            // Key found, update it
+            else {
+                res = set_idx(&AS_LIST(*obj)[1], i, val);
+                if (IS_ERROR(res))
+                    return res;
+            }
 
             return *obj;
         case TYPE_I64:
@@ -2111,10 +2127,6 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             return;
         case TYPE_MAPFD:
             fdmap_destroy(obj);
-            l = obj->len;
-            for (i = 0; i < l; i++)
-                drop_obj(AS_LIST(obj)[i]);
-
             heap_free(obj);
             return;
         case TYPE_ENUM:
@@ -2156,7 +2168,10 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
         default:
             if (IS_EXTERNAL_SIMPLE(obj))
                 runtime_fdmap_pop(runtime_get(), obj);
-            else
+            else if (IS_EXTERNAL_COMPOUND(obj)) {
+                runtime_fdmap_pop(runtime_get(), MAPLIST_KEY(obj));
+                runtime_fdmap_pop(runtime_get(), obj);
+            } else
                 heap_free(obj);
 
             return;
@@ -2192,11 +2207,15 @@ obj_p copy_obj(obj_p obj) {
             return timestamp(obj->i64);
         case -TYPE_F64:
             return f64(obj->f64);
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
+        case TYPE_I16:
+        case TYPE_I32:
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
         case TYPE_F64:
-        case TYPE_C8:
         case TYPE_GUID:
             res = vector(obj->type, obj->len);
             memcpy(res->arr, obj->arr, size_of(obj) - sizeof(struct obj_t));

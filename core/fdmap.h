@@ -26,8 +26,8 @@
 
 #include "rayforce.h"
 
-obj_p fdmap_create(u64_t size);
-nil_t fdmap_add_fd(obj_p fdmap, obj_p obj, i64_t fd, i64_t size);
+obj_p fdmap_create();
+nil_t fdmap_add_fd(obj_p *fdmap, obj_p obj, i64_t fd, i64_t size);
 nil_t fdmap_destroy(obj_p fdmap);
 
 #endif  // FDMAP_H
