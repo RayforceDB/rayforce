@@ -48,7 +48,7 @@ APP_OBJECTS = app/main.o
 TESTS_OBJECTS = tests/main.o
 TARGET = rayforce
 CFLAGS = $(RELEASE_CFLAGS)
-PYTHON = python3.10
+PYTHON = python3
 
 default: debug
 
@@ -110,12 +110,18 @@ wasm: $(APP_OBJECTS) lib
 	--preload-file examples@/examples \
 	-L. -l$(TARGET) $(LIBS)
 
-shared: CFLAGS += -fPIC
+shared: CFLAGS += -fPIC -fvisibility=default
 shared: $(CORE_OBJECTS)
-	$(CC) -shared -o librayforce.so $(CORE_OBJECTS) $(LIBS)
+	mkdir -p lib
+	$(CC) -shared -o lib/librayforce.so $(CORE_OBJECTS) $(LIBS)
 
 python: shared
-	cd python && python3 setup.py build_ext --inplace
+	# Create package structure if not exists
+	mkdir -p python/rayforce
+	# Generate SWIG wrapper with better options
+	swig -python -modern -py3 -o python/rayforce_python.c python/rayforce.i
+	# Build the extension in place
+	cd python && LIBRARY_PATH=../lib:$$LIBRARY_PATH $(PYTHON) setup.py build_ext --inplace
 
 .PHONY: python shared
 
@@ -146,6 +152,7 @@ clean:
 	-rm -f python/rayforce/*.pyc
 	-rm -f python/rayforce/*.pyo
 	-rm -f python/rayforce/*.pyd
+	-rm -f python/rayforce_python.c
 
 # trigger github to make a nightly build
 nightly:

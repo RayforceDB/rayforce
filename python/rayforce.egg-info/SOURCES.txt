@@ -1,0 +1,7 @@
+setup.py
+./rayforce_python.c
+rayforce/__init__.py
+rayforce.egg-info/PKG-INFO
+rayforce.egg-info/SOURCES.txt
+rayforce.egg-info/dependency_links.txt
+rayforce.egg-info/top_level.txt

@@ -1,0 +1,13 @@
+Metadata-Version: 2.1
+Name: rayforce
+Version: 0.1
+Summary: Python bindings for RayforceDB
+Home-page: https://github.com/singaraiona/rayforce
+Author: Anton Kundenko
+Author-email: singaraiona@gmail.com
+License: UNKNOWN
+Platform: UNKNOWN
+Requires-Python: >=3.9
+
+UNKNOWN
+
