@@ -369,7 +369,7 @@ obj_p binary_set(obj_p x, obj_p y) {
 
                     return clone_obj(x);
                 case TYPE_TABLE:
-                    return io_set_table_splayed(x, y, NULL_OBJ);
+                    return io_set_table(x, y);
 
                 case TYPE_ENUM:
                     path = cstring_from_obj(x);

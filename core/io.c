@@ -802,18 +802,19 @@ obj_p io_get_symfile(obj_p path) {
     return NULL_OBJ;
 }
 
+obj_p io_set_table(obj_p path, obj_p table) {
+    // Save as a blob (serialized)
+    if (path->len < 2 || AS_C8(path)[path->len - 1] != '/') {
+        THROW(ERR_TYPE, "set: table path must be a directory");
+    }
+    // Save splayed
+    else
+        return io_set_table_splayed(path, table, NULL_OBJ);
+}
+
 obj_p io_set_table_splayed(obj_p path, obj_p table, obj_p symfile) {
     u64_t i, l;
     obj_p res, col, s, p, v, e, cols, sym;
-
-    if (path->type != TYPE_C8)
-        THROW(ERR_TYPE, "set: table path must be a string");
-
-    if (table->type != TYPE_TABLE)
-        THROW(ERR_TYPE, "set: table must be a table");
-
-    if (path->len < 2 || AS_C8(path)[path->len - 1] != '/')
-        THROW(ERR_TYPE, "set: table path must be a directory");
 
     // save columns schema
     s = cstring_from_str(".d", 2);

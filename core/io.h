@@ -37,6 +37,7 @@ obj_p ray_load(obj_p x);
 obj_p ray_listen(obj_p x);
 obj_p io_write(i64_t fd, u8_t msg_type, obj_p obj);
 obj_p io_get_symfile(obj_p path);
+obj_p io_set_table(obj_p path, obj_p table);
 obj_p io_set_table_splayed(obj_p path, obj_p table, obj_p symfile);
 obj_p io_get_table_splayed(obj_p path, obj_p symfile);
 

@@ -164,6 +164,15 @@ obj_p ray_set_splayed(obj_p *x, u64_t n) {
         case 2:
             return ray_set(x[0], x[1]);
         case 3:
+            if (x[0]->type != TYPE_C8)
+                THROW(ERR_TYPE, "set: table path must be a string");
+
+            if (x[1]->type != TYPE_TABLE)
+                THROW(ERR_TYPE, "set: table must be a table");
+
+            if (x[0]->len < 2 || AS_C8(x[0])[x[0]->len - 1] != '/')
+                THROW(ERR_TYPE, "set: table path must be a directory");
+
             return io_set_table_splayed(x[0], x[1], x[2]);
         default:
             THROW(ERR_LENGTH, "set splayed: expected 2, 3 arguments, got %lld", n);
