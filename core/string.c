@@ -315,9 +315,10 @@ b8_t str_ends_with(str_p str, str_p pat) {
  * If this is not the case, a more sophisticated implementation may be required.
  */
 b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len) {
-    str_p s = NULL;
     b8_t inv = B8_FALSE, match = B8_FALSE;
     u64_t str_pos = 0, pat_pos = 0, s_pos;
+    u64_t last_star_pat_pos = UINT64_MAX;  // Track position of last '*' in pattern
+    u64_t last_star_str_pos = 0;           // Track corresponding string position
 
     while (str_pos < str_len) {
         if (pat_pos >= pat_len)
@@ -325,26 +326,32 @@ b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len) {
 
         switch (pat[pat_pos]) {
             case '*':
+                // Save the position of this star for backtracking
+                last_star_pat_pos = pat_pos;
+                last_star_str_pos = str_pos;
+
+                // Skip consecutive stars
                 while (pat_pos < pat_len && pat[pat_pos] == '*')
                     pat_pos++;
+
                 if (pat_pos == pat_len)
                     return B8_TRUE;
+
                 if (pat[pat_pos] != '[' && pat[pat_pos] != '?') {
-                    s = str + str_pos;
                     s_pos = str_pos;
                     while (s_pos < str_len && str[s_pos] != pat[pat_pos])
                         s_pos++;
                     if (s_pos == str_len)
                         return B8_FALSE;
                     str_pos = s_pos;
-                } else {
-                    s = str + str_pos;
                 }
                 break;
+
             case '?':
                 str_pos++;
                 pat_pos++;
                 break;
+
             case '[':
                 pat_pos++;
                 if (pat_pos >= pat_len)
@@ -361,21 +368,28 @@ b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len) {
                 if (pat_pos == pat_len)
                     return B8_FALSE;  // unmatched '['
                 if ((match && inv) || (!match && !inv)) {
-                    if (!s)
+                    // Mismatch - backtrack to last '*' if possible
+                    if (last_star_pat_pos != UINT64_MAX) {
+                        pat_pos = last_star_pat_pos + 1;
+                        str_pos = ++last_star_str_pos;
+                    } else {
                         return B8_FALSE;
-                    str_pos = (s - str) + 1;
-                    pat_pos -= (inv ? 2 : 1);
+                    }
                 } else {
                     str_pos++;
                     pat_pos++;
                 }
                 break;
+
             default:
                 if (str[str_pos] != pat[pat_pos]) {
-                    if (!s)
+                    // Mismatch - backtrack to last '*' if possible
+                    if (last_star_pat_pos != UINT64_MAX) {
+                        pat_pos = last_star_pat_pos + 1;
+                        str_pos = ++last_star_str_pos;
+                    } else {
                         return B8_FALSE;
-                    str_pos = (s - str) + 1;
-                    pat_pos -= 2;
+                    }
                 } else {
                     str_pos++;
                     pat_pos++;
@@ -384,16 +398,11 @@ b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len) {
         }
     }
 
-    while (pat_pos < pat_len) {
-        if (pat[pat_pos] == '?')
-            return B8_FALSE;
-        if (pat[pat_pos] != '*')
-            return B8_FALSE;
+    // Check if remaining pattern consists only of '*'
+    while (pat_pos < pat_len && pat[pat_pos] == '*')
         pat_pos++;
-        while (pat_pos < pat_len && pat[pat_pos] == '*')
-            pat_pos++;
-    }
-    return B8_TRUE;
+
+    return (pat_pos == pat_len);
 }
 
 u64_t str_len(str_p s, u64_t n) {

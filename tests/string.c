@@ -31,5 +31,17 @@ test_result_t test_str_match() {
     TEST_ASSERT(str_match("bro^wn", 6, "[^wertf]ro^wn", 13), "bro^wn\", \"[^wertf]ro^wn");
     TEST_ASSERT(!str_match("brown", 5, "br[?*]wn", 8), "brown\", \"br[?*]wn");
 
+    // FIX protocol message tests - previously caused infinite loop
+    TEST_ASSERT(!str_match("8=FIX.4.29=004835=049=TR56=CL134=252=20250225-16:15:36.31410=157", 67, "*35=A*", 6),
+                "FIX message with 35=0 tag should not match *35=A* pattern");
+    TEST_ASSERT(str_match("8=FIX.4.29=004835=049=TR56=CL134=252=20250225-16:15:36.31410=157", 67, "*35=0*", 6),
+                "FIX message with 35=0 tag should match *35=0* pattern");
+
+    // Additional edge cases for backtracking
+    TEST_ASSERT(!str_match("abc", 3, "*d*", 3), "abc should not match *d*");
+    TEST_ASSERT(str_match("abcdefg", 7, "*c*g", 4), "abcdefg should match *c*g");
+    TEST_ASSERT(str_match("abcdefg", 7, "a*d*g", 5), "abcdefg should match a*d*g");
+    TEST_ASSERT(!str_match("abcdefg", 7, "a*x*g", 5), "abcdefg should not match a*x*g");
+
     PASS();
 }
