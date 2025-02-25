@@ -179,8 +179,6 @@ obj_p ray_get(obj_p x) {
                 return res;
             }
 
-            drop_obj(path);
-
             res = (obj_p)mmap_file(fd, NULL, size, 0);
 
             if (IS_EXTERNAL_SERIALIZED(res)) {
@@ -193,11 +191,17 @@ obj_p ray_get(obj_p x) {
                 fdmap_add_fd(&fdmap, res, fd, size);
                 res = (obj_p)((str_p)res + RAY_PAGE_SIZE);
                 runtime_fdmap_push(runtime_get(), res, fdmap);
-            } else {
+            } else if (IS_EXTERNAL_SIMPLE(res)) {
                 fdmap = fdmap_create();
                 fdmap_add_fd(&fdmap, res, fd, size);
                 runtime_fdmap_push(runtime_get(), res, fdmap);
+            } else {
+                res = error(ERR_TYPE, "get: corrupted file: '%.*s", (i32_t)path->len, AS_C8(path));
+                drop_obj(path);
+                return res;
             }
+
+            drop_obj(path);
 
             // anymap needs additional nested mapping of dependencies
             if (res->type == TYPE_MAPLIST) {

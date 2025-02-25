@@ -460,8 +460,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                             THROW(ERR_NOT_SUPPORTED, "set: unsupported type: %s", type_name(y->type));
                         }
 
-                        AS_I64(k)
-                        [i] = size;
+                        AS_I64(k)[i] = size;
 
                         size += sz;
                         b += sz;
