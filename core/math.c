@@ -137,6 +137,7 @@ i8_t infer_math_type(obj_p x, obj_p y) {
 }
 
 obj_p ray_add_partial(obj_p x, obj_p y, u64_t len, u64_t offset, obj_p out) {
+    i32_t vi32;
     i64_t vi64;
 
     switch (MTYPE2(x->type, y->type)) {
@@ -174,8 +175,8 @@ obj_p ray_add_partial(obj_p x, obj_p y, u64_t len, u64_t offset, obj_p out) {
         case MTYPE2(-TYPE_DATE, -TYPE_I32):
             return adate(ADDI32(x->i32, y->i32));
         case MTYPE2(-TYPE_TIME, -TYPE_I64):
-            vi64 = i32_to_i64(y->i32);
-            return atime(i64_to_i32(ADDI64(vi64, y->i64)));
+            vi32 = i64_to_i32(y->i64);
+            return atime(ADDI32(x->i32, vi32));
         case MTYPE2(-TYPE_TIME, -TYPE_I32):
             return atime(ADDI32(x->i32, y->i32));
         case MTYPE2(-TYPE_TIMESTAMP, -TYPE_I64):

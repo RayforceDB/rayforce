@@ -1636,7 +1636,7 @@ obj_p remove_ids(obj_p *obj, i64_t ids[], u64_t len) {
 }
 
 obj_p remove_obj(obj_p *obj, obj_p idx) {
-    i64_t i;
+    i64_t i, j;
     obj_p v;
 
     switch (MTYPE2((*obj)->type, idx->type)) {
@@ -1684,7 +1684,23 @@ obj_p remove_obj(obj_p *obj, obj_p idx) {
 
             return *obj;
         default:
-            THROW(ERR_TYPE, "remove_obj: invalid type: %d", (*obj)->type);
+            if ((*obj)->type == TYPE_DICT) {
+                j = find_obj_idx(AS_LIST(*obj)[0], idx);
+                if (j == NULL_I64)
+                    return *obj;
+
+                v = remove_idx(&AS_LIST(*obj)[0], j);
+                if (IS_ERROR(v))
+                    return v;
+
+                v = remove_idx(&AS_LIST(*obj)[1], j);
+                if (IS_ERROR(v))
+                    return v;
+
+                return *obj;
+            }
+
+            THROW(ERR_TYPE, "remove_obj: invalid types: '%s' '%s'", type_name((*obj)->type), type_name(idx->type));
     }
 }
 

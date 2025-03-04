@@ -179,7 +179,7 @@ obj_p __alter(obj_p *obj, obj_p func, obj_p idx, obj_p val) {
 
     // special case for remove
     if (func->type == TYPE_BINARY && func->i64 == (i64_t)ray_remove)
-        return remove_obj(obj, idx);
+        return remove_obj(obj, val);
 
     // retrieve the object via indices
     v = at_obj(*obj, idx);
@@ -231,6 +231,11 @@ obj_p ray_alter(obj_p *x, u64_t n) {
     if (x[0]->type != -TYPE_SYMBOL)
         return obj;
 
+    if ((*cur) != obj) {
+        drop_obj(*cur);
+        *cur = obj;
+    }
+
     return clone_obj(x[0]);
 }
 
@@ -268,6 +273,11 @@ obj_p ray_modify(obj_p *x, u64_t n) {
 
     if (x[0]->type != -TYPE_SYMBOL)
         return obj;
+
+    if ((*cur) != obj) {
+        drop_obj(*cur);
+        *cur = obj;
+    }
 
     return clone_obj(x[0]);
 }
