@@ -67,42 +67,39 @@
             i64_t: ov = f64_to_##ot(__BINOP_F64_I64(x, y, op)),  \
             f64_t: ov = op(x, y)))
 
-#define __BINOP_A_V(x, y, lt, rt, ot, op, ln, of, ov)            \
-    ({                                                           \
-        __INNER_##rt *$rhs;                                      \
-        __INNER_##ot *$out;                                      \
-        $rhs = __AS_##rt(y) + of;                                \
-        $out = __AS_##ot(ov) + of;                               \
-        for (u64_t $i = 0; $i < ln; $i++)                        \
-            $out[$i] = op(lt##_to_##ot(x->__BASE_##lt),          \
-                          rt##_to_##ot($rhs[$i]));               \
-        NULL_OBJ;                                                \
+#define __BINOP_A_V(x, y, lt, rt, ot, op, ln, of, ov)                            \
+    ({                                                                           \
+        __BASE_##rt##_t *$rhs;                                                   \
+        __BASE_##ot##_t *$out;                                                   \
+        $rhs = __AS_##rt(y) + of;                                                \
+        $out = __AS_##ot(ov) + of;                                               \
+        for (u64_t $i = 0; $i < ln; $i++)                                        \
+            $out[$i] = op(lt##_to_##ot(x->__BASE_##lt), rt##_to_##ot($rhs[$i])); \
+        NULL_OBJ;                                                                \
     })
 
-#define __BINOP_V_A(x, y, lt, rt, ot, op, ln, of, ov)            \
-    ({                                                           \
-        __INNER_##lt *$lhs;                                      \
-        __INNER_##ot *$out;                                      \
-        $lhs = __AS_##lt(x) + of;                                \
-        $out = __AS_##ot(ov) + of;                               \
-        for (u64_t $i = 0; $i < ln; $i++)                        \
-            $out[$i] = op(lt##_to_##ot($lhs[$i]),                \
-                          rt##_to_##ot(y->__BASE_##rt));         \
-        NULL_OBJ;                                                \
+#define __BINOP_V_A(x, y, lt, rt, ot, op, ln, of, ov)                            \
+    ({                                                                           \
+        __BASE_##lt##_t *$lhs;                                                   \
+        __BASE_##ot##_t *$out;                                                   \
+        $lhs = __AS_##lt(x) + of;                                                \
+        $out = __AS_##ot(ov) + of;                                               \
+        for (u64_t $i = 0; $i < ln; $i++)                                        \
+            $out[$i] = op(lt##_to_##ot($lhs[$i]), rt##_to_##ot(y->__BASE_##rt)); \
+        NULL_OBJ;                                                                \
     })
 
-#define __BINOP_V_V(x, y, lt, rt, ot, op, ln, of, ov)               \
-    ({                                                              \
-        __INNER_##lt *$lhs;                                         \
-        __INNER_##rt *$rhs;                                         \
-        __INNER_##ot *$out;                                         \
-        $lhs = __AS_##lt(x) + of;                                   \
-        $rhs = __AS_##rt(y) + of;                                   \
-        $out = __AS_##ot(ov) + of;                                  \
-        for (u64_t $i = 0; $i < ln; $i++)                           \
-            $out[$i] = op(lt##_to_##ot($lhs[$i]),                   \
-                          rt##_to_##ot($rhs[$i]));                  \
-        NULL_OBJ;                                                   \
+#define __BINOP_V_V(x, y, lt, rt, ot, op, ln, of, ov)                      \
+    ({                                                                     \
+        __BASE_##lt##_t *$lhs;                                             \
+        __BASE_##rt##_t *$rhs;                                             \
+        __BASE_##ot##_t *$out;                                             \
+        $lhs = __AS_##lt(x) + of;                                          \
+        $rhs = __AS_##rt(y) + of;                                          \
+        $out = __AS_##ot(ov) + of;                                         \
+        for (u64_t $i = 0; $i < ln; $i++)                                  \
+            $out[$i] = op(lt##_to_##ot($lhs[$i]), rt##_to_##ot($rhs[$i])); \
+        NULL_OBJ;                                                          \
     })
 
 i8_t infer_math_type(obj_p x, obj_p y) {

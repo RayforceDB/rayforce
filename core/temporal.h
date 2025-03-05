@@ -29,10 +29,15 @@
 // An EPOCH starts from 2000.01.01T00:00:00.000
 #define EPOCH 2000
 #define UT_EPOCH_SHIFT 946684800ll
+
 // secs between UT epoch and our
 #define SECS_IN_DAY (i64_t)(24 * 60 * 60)
 #define MSECS_IN_DAY (SECS_IN_DAY * 1000)
 #define NSECS_IN_DAY (SECS_IN_DAY * 1000000000)
+
+// nanos in a day and a millisecond
+#define NANOS_FROM_DAY 86400000000000
+#define NANOS_FROM_MILLIS 1000000
 
 extern const u32_t MONTHDAYS_FWD[2][13];
 extern const u32_t MONTHDAYS_ABS[2][12];

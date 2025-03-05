@@ -25,6 +25,7 @@
 #define OPS_H
 
 #include "rayforce.h"
+#include "temporal.h"
 
 // Global null object to be referenced by all null objects.
 extern struct obj_t __NULL_OBJECT;
@@ -170,29 +171,26 @@ static inline f64_t f64_to_f64(f64_t x) { return x; }
 static inline i32_t f64_to_date(f64_t x) { return (x == NULL_F64) ? NULL_I32 : (i32_t)x; }
 static inline i32_t f64_to_time(f64_t x) { return (x == NULL_F64) ? NULL_I32 : (i32_t)x; }
 static inline i64_t f64_to_timestamp(f64_t x) { return (x == NULL_F64) ? NULL_I64 : (i64_t)x; }
-
-#define DAY2NANO 86400000000000
-#define MILLI2NANO 1000000
-
 static inline i32_t date_to_i32(i32_t x) { return x; }
 static inline i64_t date_to_i64(i32_t x) { return (x == NULL_I32) ? NULL_I64 : (i64_t)x; }
 static inline f64_t date_to_f64(i32_t x) { return (x == NULL_I32) ? NULL_F64 : (f64_t)x; }
 static inline i32_t date_to_date(i32_t x) { return x; }
 static inline i32_t date_to_time(i32_t x) { return x; }
-static inline i64_t date_to_timestamp(i32_t x) { return (x == NULL_I32) ? NULL_I64 : DAY2NANO * (i64_t)x; }
+static inline i64_t date_to_timestamp(i32_t x) { return (x == NULL_I32) ? NULL_I64 : NANOS_FROM_DAY * (i64_t)x; }
 static inline i32_t time_to_i32(i32_t x) { return x; }
 static inline i64_t time_to_i64(i32_t x) { return (x == NULL_I32) ? NULL_I64 : (i64_t)x; }
 static inline f64_t time_to_f64(i32_t x) { return (x == NULL_I32) ? NULL_F64 : (f64_t)x; }
 static inline i32_t time_to_date(i32_t x) { return x; }
 static inline i32_t time_to_time(i32_t x) { return x; }
-static inline i64_t time_to_timestamp(i32_t x) { return (x == NULL_I32) ? NULL_I64 : MILLI2NANO * (i64_t)x; }
+static inline i64_t time_to_timestamp(i32_t x) { return (x == NULL_I32) ? NULL_I64 : NANOS_FROM_MILLIS * (i64_t)x; }
 static inline i32_t timestamp_to_i32(i64_t x) { return (x == NULL_I64) ? NULL_I32 : (i32_t)x; }
 static inline i64_t timestamp_to_i64(i64_t x) { return x; }
 static inline f64_t timestamp_to_f64(i64_t x) { return (x == NULL_I64) ? NULL_F64 : (f64_t)x; }
-static inline i32_t timestamp_to_date(i64_t x) { return (x == NULL_I64) ? NULL_I32 : (i32_t)(x / DAY2NANO); }
-static inline i32_t timestamp_to_time(i64_t x) { return (x == NULL_I64) ? NULL_I32 : (i32_t)(x % DAY2NANO / MILLI2NANO); }
+static inline i32_t timestamp_to_date(i64_t x) { return (x == NULL_I64) ? NULL_I32 : (i32_t)(x / NANOS_FROM_DAY); }
+static inline i32_t timestamp_to_time(i64_t x) {
+    return (x == NULL_I64) ? NULL_I32 : (i32_t)(x % NANOS_FROM_DAY / NANOS_FROM_MILLIS);
+}
 static inline i64_t timestamp_to_timestamp(i64_t x) { return x; }
-
 
 #define __BINOP_I32_I64(x, y, op) \
     ({                            \
