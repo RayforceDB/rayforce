@@ -1089,10 +1089,9 @@ obj_p parser_advance(parser_t *parser) {
         tok = parse_time(parser);
         if (tok != PARSE_ADVANCE)
             return tok;
-        
+
         return parse_number(parser);
     }
-        
 
     if ((*parser->current) == '\'')
         return parse_char(parser);

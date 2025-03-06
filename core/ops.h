@@ -105,7 +105,7 @@ extern struct obj_t __NULL_OBJECT;
 #define MULF64(x, y) ((x) * (y))
 #define DIVI32(x, y) (((y) == 0) ? NULL_I32 : (((x) == NULL_I32 || (y) == NULL_I32) ? NULL_F64 : ((x) / (y))))
 #define DIVI64(x, y) (((y) == 0) ? NULL_I64 : (((x) == NULL_I64 || (y) == NULL_I64) ? NULL_F64 : ((x) / (y))))
-#define DIVF64(x, y) ((i64_t)((x) / (y)))
+#define DIVF64(x, y) ((((y)==0) ||((y) == 0.0)) ? NULL_F64 : ((f64_t)((i64_t)((x) / (y)))))
 #define FDIVI32(x, y) (((x) == NULL_I32 || (y) == NULL_I32) ? NULL_F64 : ((f64_t)(x) / (f64_t)(y)))
 #define FDIVI64(x, y) (((x) == NULL_I64 || (y) == NULL_I64) ? NULL_F64 : ((f64_t)(x) / (f64_t)(y)))
 #define FDIVF64(x, y) ((x) / (y))
@@ -175,12 +175,10 @@ static inline i32_t date_to_i32(i32_t x) { return x; }
 static inline i64_t date_to_i64(i32_t x) { return (x == NULL_I32) ? NULL_I64 : (i64_t)x; }
 static inline f64_t date_to_f64(i32_t x) { return (x == NULL_I32) ? NULL_F64 : (f64_t)x; }
 static inline i32_t date_to_date(i32_t x) { return x; }
-static inline i32_t date_to_time(i32_t x) { return x; }
 static inline i64_t date_to_timestamp(i32_t x) { return (x == NULL_I32) ? NULL_I64 : NANOS_FROM_DAY * (i64_t)x; }
 static inline i32_t time_to_i32(i32_t x) { return x; }
 static inline i64_t time_to_i64(i32_t x) { return (x == NULL_I32) ? NULL_I64 : (i64_t)x; }
 static inline f64_t time_to_f64(i32_t x) { return (x == NULL_I32) ? NULL_F64 : (f64_t)x; }
-static inline i32_t time_to_date(i32_t x) { return x; }
 static inline i32_t time_to_time(i32_t x) { return x; }
 static inline i64_t time_to_timestamp(i32_t x) { return (x == NULL_I32) ? NULL_I64 : NANOS_FROM_MILLIS * (i64_t)x; }
 static inline i32_t timestamp_to_i32(i64_t x) { return (x == NULL_I64) ? NULL_I32 : (i32_t)x; }
