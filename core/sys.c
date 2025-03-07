@@ -231,12 +231,6 @@ obj_p ray_internal_command(obj_p cmd) {
 
     cmd_str = cmd_buf;
 
-    // Make a copy of the command string
-    strncpy(cmd_buf, current, sizeof(cmd_buf) - 1);
-    cmd_buf[sizeof(cmd_buf) - 1] = '\0';
-
-    cmd_str = cmd_buf;
-
     // Find first space
     for (i = 0; i < cmd_len && current[i] != ' '; i++)
         ;
@@ -292,6 +286,8 @@ obj_p ray_internal_command(obj_p cmd) {
                     current += i + 1;
                     remaining_len -= i + 1;
                 } else {
+                    // Ensure the last argument is null-terminated
+                    current[remaining_len] = '\0';
                     argv[argc++] = current;
                     remaining_len = 0;
                 }
