@@ -43,29 +43,27 @@
         }                                                                                                              \
     }
 
-#define TEST_ASSERT_ER(lhs, rhs)                                                                       \
-    {                                                                                                  \
-        obj_p le = eval_str(lhs);                                                                      \
-        obj_p lns = obj_fmt(le, B8_TRUE);                                                              \
-        char* file = __FILE__;                                                                         \
-        int line = __LINE__;                                                                           \
-        if (!IS_ERROR(le)) {                                                                            \
-            obj_p fmt = str_fmt(-1, "Expected error: %s\n -- at: %s:%d", AS_C8(lns), file, line);         \
-            TEST_ASSERT(0, AS_C8(lns));                                                                \
-            drop_obj(lns);                                                                             \
-            drop_obj(fmt);                                                                             \
-            drop_obj(le);                                                                              \
-        } else {                                                                                       \
-            lit_p err_text = AS_C8(lns);                                                               \
-            lit_p last_part = strrchr(err_text, '‾');                                                  \
-            if (last_part == NULL || strstr(last_part, rhs) == NULL) {                                 \
-                obj_p fmt = str_fmt(-1, "Expect %s, in: %s -- at: %s:%d", rhs, err_text, file, line); \
-                TEST_ASSERT(0, AS_C8(fmt));                                                            \
-                drop_obj(fmt);                                                                         \
-            }                                                                                          \
-            drop_obj(le);                                                                              \
-            drop_obj(lns);                                                                             \
-        }                                                                                              \
+#define TEST_ASSERT_ER(lhs, rhs)                                                                                \
+    {                                                                                                           \
+        obj_p le = eval_str(lhs);                                                                               \
+        obj_p lns = obj_fmt(le, B8_TRUE);                                                                       \
+        if (!IS_ERROR(le)) {                                                                                    \
+            obj_p fmt = str_fmt(-1, "Expected error: %s\n -- at: %s:%d", AS_C8(lns), __FILE__, __LINE__);       \
+            TEST_ASSERT(0, AS_C8(lns));                                                                         \
+            drop_obj(lns);                                                                                      \
+            drop_obj(fmt);                                                                                      \
+            drop_obj(le);                                                                                       \
+        } else {                                                                                                \
+            lit_p err_text = AS_C8(lns);                                                                        \
+            if (err_text == NULL || strstr(err_text, rhs) == NULL) {                                            \
+                obj_p fmt =                                                                                     \
+                    str_fmt(-1, "Expect \"%s\", in: \"%s\"\n -- at: %s:%d", rhs, err_text, __FILE__, __LINE__); \
+                TEST_ASSERT(0, AS_C8(fmt));                                                                     \
+                drop_obj(fmt);                                                                                  \
+            }                                                                                                   \
+            drop_obj(le);                                                                                       \
+            drop_obj(lns);                                                                                      \
+        }                                                                                                       \
     }
 
 test_result_t test_lang_basic() {
@@ -690,13 +688,6 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(/ 10.0 [-5.0])", "[-2.0]");
     TEST_ASSERT_EQ("(/ 10.0 [])", "[]");
 
-    TEST_ASSERT_EQ("(/ 10:20:15.000 3)", "03:26:45.000");
-    TEST_ASSERT_EQ("(/ 10:20:15.000 3i)", "03:26:45.000");
-    TEST_ASSERT_EQ("(/ 10:20:15.000 3.0)", "03:26:45.000");
-    TEST_ASSERT_EQ("(/ 10:20:15.000 [3])", "[03:26:45.000]");
-    TEST_ASSERT_EQ("(/ 10:20:15.000 [3i])", "[03:26:45.000]");
-    TEST_ASSERT_EQ("(/ 10:20:15.000 [3.0])", "[03:26:45.000]");
-
     TEST_ASSERT_EQ("(/ [-10i] 5i)", "[-2i]");
     TEST_ASSERT_EQ("(/ [-9i] 5i)", "[-1i]");
     TEST_ASSERT_EQ("(/ [-3i] 5i)", "[0i]");
@@ -1004,13 +995,6 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(/ [10.0] [-5.0])", "[-2.0]");
     TEST_ASSERT_EQ("(/ [11.5] [1.0])", "[11.0]");
     TEST_ASSERT_EQ("(/ 11.5 1.0)", "11.0");
-
-    TEST_ASSERT_EQ("(/ [10:20:15.000] 3)", "[03:26:45.000]");
-    TEST_ASSERT_EQ("(/ [10:20:15.000] 3i)", "[03:26:45.000]");
-    TEST_ASSERT_EQ("(/ [10:20:15.000] 3.0)", "[03:26:45.000]");
-    TEST_ASSERT_EQ("(/ [10:20:15.000] [3])", "[03:26:45.000]");
-    TEST_ASSERT_EQ("(/ [10:20:15.000] [3i])", "[03:26:45.000]");
-    TEST_ASSERT_EQ("(/ [10:20:15.000] [3.0])", "[03:26:45.000]");
     TEST_ASSERT_ER("(/ 02:15:07.000 02:15:07.000)", "div: unsupported types: 'time, 'time");
 
     TEST_ASSERT_EQ("(% 10i 0i)", "0Ni");
@@ -1317,6 +1301,27 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(% [100000000001.0] [5i])", "[1.0]");
     TEST_ASSERT_EQ("(% [18.4] 5.1)", "[3.1]");
     TEST_ASSERT_ER("(% 02:15:07.000 02:15:07.000)", "mod: unsupported types: 'time, 'time");
+
+    TEST_ASSERT_EQ("(/ 10:20:15.000 3)", "03:26:45.000");
+    TEST_ASSERT_EQ("(/ 10:20:15.000 3i)", "03:26:45.000");
+    TEST_ASSERT_EQ("(/ 10:20:15.000 3.0)", "03:26:45.000");
+    TEST_ASSERT_EQ("(/ 10:20:15.000 [3])", "[03:26:45.000]");
+    TEST_ASSERT_EQ("(/ 10:20:15.000 [3i])", "[03:26:45.000]");
+    TEST_ASSERT_EQ("(/ 10:20:15.000 [3.0])", "[03:26:45.000]");
+    TEST_ASSERT_EQ("(/ [10:20:15.000] 3)", "[03:26:45.000]");
+    TEST_ASSERT_EQ("(/ [10:20:15.000] 3i)", "[03:26:45.000]");
+    TEST_ASSERT_EQ("(/ [10:20:15.000] 3.0)", "[03:26:45.000]");
+    TEST_ASSERT_EQ("(/ [10:20:15.000] [3])", "[03:26:45.000]");
+    TEST_ASSERT_EQ("(/ [10:20:15.000] [3i])", "[03:26:45.000]");
+    TEST_ASSERT_EQ("(/ [10:20:15.000] [3.0])", "[03:26:45.000]");
+    TEST_ASSERT_EQ("(% 10:20:15.000 100000)", "00:00:15.000");
+    TEST_ASSERT_EQ("(% 10:20:15.000 100000i)", "00:00:15.000");
+    TEST_ASSERT_EQ("(% 10:20:15.000 [100000])", "[00:00:15.000]");
+    TEST_ASSERT_EQ("(% 10:20:15.000 [100000i])", "[00:00:15.000]");
+    TEST_ASSERT_EQ("(% [10:20:15.000] 100000)", "[00:00:15.000]");
+    TEST_ASSERT_EQ("(% [10:20:15.000] 100000i)", "[00:00:15.000]");
+    TEST_ASSERT_EQ("(% [10:20:15.000] [100000])", "[00:00:15.000]");
+    TEST_ASSERT_EQ("(% [10:20:15.000] [100000i])", "[00:00:15.000]");
 
     TEST_ASSERT_EQ("(div -10i 5i)", "-2.0");
     TEST_ASSERT_EQ("(div -9i 5i)", "-1.8");
