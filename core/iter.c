@@ -796,6 +796,10 @@ obj_p ray_fold(obj_p *x, u64_t n) {
 
                 v = call(f, a);
 
+                // cleanup stack
+                drop_obj(stack_pop());
+                drop_obj(stack_pop());
+
                 if (IS_ERROR(v))
                     return v;
             }
