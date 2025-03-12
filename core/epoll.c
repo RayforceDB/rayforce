@@ -457,6 +457,7 @@ i64_t poll_run(poll_p poll) {
     term_prompt(poll->term);
 
     while (poll->code == NULL_I64) {
+        timeout = timer_next_timeout(poll->timers);
         nfds = epoll_wait(poll->poll_fd, events, MAX_EVENTS, timeout);
         if (nfds == -1 && errno == EINTR)
             continue;
@@ -532,8 +533,6 @@ i64_t poll_run(poll_p poll) {
                 }
             }
         }
-
-        timeout = timer_next_timeout(poll->timers);
     }
 
     return poll->code;

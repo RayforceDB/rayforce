@@ -385,6 +385,16 @@ i64_t poll_run(poll_p poll) {
     term_prompt(poll->term);
 
     while (poll->code == NULL_I64) {
+        next_tm = timer_next_timeout(poll->timers);
+
+        if (next_tm == TIMEOUT_INFINITY)
+            timeout = NULL;
+        else {
+            tm.tv_sec = next_tm / 1000;
+            tm.tv_nsec = (next_tm % 1000) * 1000000;
+            timeout = &tm;
+        }
+
         nfds = kevent(kq_fd, NULL, 0, events, MAX_EVENTS, timeout);
 
         if (nfds == -1)
@@ -455,16 +465,6 @@ i64_t poll_run(poll_p poll) {
                         poll_deregister(poll, selector->id);
                 }
             }
-        }
-
-        next_tm = timer_next_timeout(poll->timers);
-
-        if (next_tm == TIMEOUT_INFINITY)
-            timeout = NULL;
-        else {
-            tm.tv_sec = next_tm / 1000;
-            tm.tv_nsec = (next_tm % 1000) * 1000000;
-            timeout = &tm;
         }
     }
 
