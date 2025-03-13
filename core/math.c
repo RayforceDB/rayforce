@@ -1069,6 +1069,7 @@ obj_p ray_xbar_partial(obj_p x, obj_p y, u64_t len, u64_t offset, obj_p out) {
     }
 }
 
+// count non-null values
 obj_p ray_cnt_partial(obj_p x, u64_t len, u64_t offset) {
     switch (x->type) {
         case -TYPE_I32:
@@ -1096,7 +1097,7 @@ obj_p ray_cnt_partial(obj_p x, u64_t len, u64_t offset) {
         case TYPE_TIMESTAMP:
             return __UNOP_FOLD(x, i64, i64, CNTI64, len, offset, 0);
         default:
-            THROW(ERR_TYPE, "cnt not null: unsupported type: '%s", type_name(x->type));
+            THROW(ERR_TYPE, "cnt non-null: unsupported type: '%s", type_name(x->type));
     }
 }
 
@@ -1207,62 +1208,6 @@ obj_p ray_ceil_partial(obj_p x, u64_t len, u64_t offset, obj_p out) {
         //     return aggr_ceil(AS_LIST(x)[0], AS_LIST(x)[1]);
         default:
             THROW(ERR_TYPE, "ceil: unsupported type: '%s", type_name(x->type));
-    }
-}
-
-obj_p ray_avg(obj_p x) {
-    u64_t i, l = 0, n;
-    i32_t *xi32vals = NULL;
-    i64_t isum = 0, *xivals = NULL;
-    f64_t fsum = 0.0, *xfvals = NULL;
-
-    switch (x->type) {
-        case -TYPE_I32:
-            return f64(i32_to_f64(x->i32));
-        case -TYPE_I64:
-            return f64(i64_to_f64(x->i64));
-        case -TYPE_F64:
-            return clone_obj(x);
-        case TYPE_I32:
-            l = x->len;
-            xi32vals = AS_I32(x);
-
-            for (i = 0, n = 0; i < l; i++) {
-                if (xi32vals[i] != NULL_I32)
-                    isum += (i64_t)xi32vals[i];
-                else
-                    n++;
-            }
-
-            return f64((f64_t)isum / (l - n));
-
-        case TYPE_I64:
-            l = x->len;
-            xivals = AS_I64(x);
-
-            for (i = 0, n = 0; i < l; i++) {
-                if (xivals[i] != NULL_I64)
-                    isum += xivals[i];
-                else
-                    n++;
-            }
-
-            return f64((f64_t)isum / (l - n));
-
-        case TYPE_F64:
-            l = x->len;
-            xfvals = AS_F64(x);
-
-            for (i = 0, n = 0; i < l; i++)
-                fsum += xfvals[i];
-
-            return f64(fsum / l);
-
-        case TYPE_MAPGROUP:
-            return aggr_avg(AS_LIST(x)[0], AS_LIST(x)[1]);
-
-        default:
-            THROW(ERR_TYPE, "avg: unsupported type: '%s", type_name(x->type));
     }
 }
 
@@ -1531,6 +1476,7 @@ obj_p binop_map(raw_p op, obj_p x, obj_p y) {
 
 // Unaries
 obj_p ray_sum(obj_p x) { return unop_fold(ray_sum_partial, x); }
+obj_p ray_cnt(obj_p x) { return unop_fold(ray_cnt_partial, x); }
 obj_p ray_min(obj_p x) { return unop_fold(ray_min_partial, x); }
 obj_p ray_max(obj_p x) { return unop_fold(ray_max_partial, x); }
 obj_p ray_round(obj_p x) { return unop_map(ray_round_partial, x); }
@@ -1545,3 +1491,26 @@ obj_p ray_div(obj_p x, obj_p y) { return binop_map(ray_div_partial, x, y); }
 obj_p ray_fdiv(obj_p x, obj_p y) { return binop_map(ray_fdiv_partial, x, y); }
 obj_p ray_mod(obj_p x, obj_p y) { return binop_map(ray_mod_partial, x, y); }
 obj_p ray_xbar(obj_p x, obj_p y) { return binop_map(ray_xbar_partial, x, y); }
+
+// Functions which used functions with parallel execution
+obj_p ray_avg(obj_p x) {
+    switch (x->type) {
+        case -TYPE_I32:
+            return f64(i32_to_f64(x->i32));
+        case -TYPE_I64:
+            return f64(i64_to_f64(x->i64));
+        case -TYPE_F64:
+            return clone_obj(x);
+        case TYPE_I32:
+            return f64(FDIVI64(i32_to_i64(ray_sum(x)->i32), ray_cnt(x)->i64));
+        case TYPE_I64:
+            return f64(FDIVI64(ray_sum(x)->i64, ray_cnt(x)->i64));
+        case TYPE_F64:
+            return f64(FDIVF64(ray_sum(x)->f64, i64_to_f64(ray_cnt(x)->i64)));
+        case TYPE_MAPGROUP:
+            return aggr_avg(AS_LIST(x)[0], AS_LIST(x)[1]);
+
+        default:
+            THROW(ERR_TYPE, "avg: unsupported type: '%s", type_name(x->type));
+    }
+}

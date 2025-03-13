@@ -1679,6 +1679,8 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(avg -24)", "-24.0");
     TEST_ASSERT_EQ("(avg [1.0 2.0 3.0])", "2.0");
     TEST_ASSERT_EQ("(avg [1i 2i -3i])", "0.0");
+    TEST_ASSERT_EQ("(avg [-24 12 6 0Nl])", "-2.0");
+    TEST_ASSERT_EQ("(avg [0Ni])", "0Nf");
     TEST_ASSERT_EQ("(avg 0Nf)", "0Nf");
 
     TEST_ASSERT_EQ("(floor [1.1 2.5 -1.1])", "[1.0 2.0 -2.0]");
