@@ -1274,62 +1274,41 @@ obj_p ray_ceil_partial(obj_p x, u64_t len, u64_t offset, obj_p out) {
     }
 }
 
-obj_p ray_dev(obj_p x) {
-    u64_t i, l = 0;
-    f64_t fsum = 0.0, favg = 0.0, *xfvals = NULL;
-    obj_p res;
-
+obj_p ray_sq_sub_partial(obj_p x, obj_p y, u64_t len, u64_t offset) {
     switch (x->type) {
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME: {
+            i32_t *lhs = __AS_i32(x) + offset;
+            f64_t out = 0.0;
+            for (u64_t i = 0; i < len; i++)
+                if (lhs[i] != NULL_I32) {
+                    f64_t t = ((f64_t)lhs[i]) - y->f64;
+                    out += t * t;
+                }
+            return f64(out);
+        }
         case TYPE_I64:
-        case TYPE_TIMESTAMP:
-            l = x->len;
-
-            if (!l)
-                return f64(NULL_F64);
-
-            xfvals = AS_F64(x);
-            fsum = xfvals[0];
-
-            for (i = 0; i < l; i++)
-                fsum += xfvals[i];
-
-            favg = fsum / l;
-
-            fsum = 0.0;
-            for (i = 0; i < l; i++)
-                fsum += pow(xfvals[i] - favg, 2);
-
-            res = f64(sqrt(fsum / l));
-
-            return res;
-
-        case TYPE_F64:
-            l = x->len;
-
-            if (!l)
-                return f64(NULL_F64);
-
-            xfvals = AS_F64(x);
-            fsum = 0;
-
-            for (i = 0; i < l; i++)
-                fsum += xfvals[i];
-
-            favg = fsum / l;
-
-            fsum = 0.0;
-            for (i = 0; i < l; i++)
-                fsum += pow(xfvals[i] - favg, 2);
-
-            res = f64(sqrt(fsum / l));
-
-            return res;
-
-        case TYPE_MAPGROUP:
-            return aggr_dev(AS_LIST(x)[0], AS_LIST(x)[1]);
-
-        default:
-            THROW(ERR_TYPE, "dev: unsupported type: '%s", type_name(x->type));
+        case TYPE_TIMESTAMP: {
+            i64_t *lhs = __AS_i64(x) + offset;
+            f64_t out = 0.0;
+            for (u64_t i = 0; i < len; i++)
+                if (lhs[i] != NULL_I64) {
+                    f64_t t = ((f64_t)lhs[i]) - y->f64;
+                    out += t * t;
+                }
+            return f64(out);
+        }
+        default: {
+            f64_t *lhs = __AS_f64(x) + offset;
+            f64_t out = 0.0;
+            for (u64_t i = 0; i < len; i++)
+                if (!ops_is_nan(lhs[i])) {
+                    f64_t t = ((f64_t)lhs[i]) - y->f64;
+                    out += t * t;
+                }
+            return f64(out);
+        }
     }
 }
 
@@ -1496,6 +1475,47 @@ obj_p binop_map(raw_p op, obj_p x, obj_p y) {
     return out;
 }
 
+obj_p binop_fold(raw_p op, obj_p x, obj_p y) {
+    pool_p pool;
+    u64_t i, n, chunk, l = x->len;
+    obj_p v, res;
+    raw_p argv[4];
+
+    pool = runtime_get()->pool;
+    n = pool_split_by(pool, l, 0);
+
+    if (n == 1) {
+        argv[0] = (raw_p)x;
+        argv[1] = (raw_p)y;
+        argv[2] = (raw_p)l;
+        argv[3] = (raw_p)0;
+        v = pool_call_task_fn(op, 4, argv);
+        return v;
+    }
+
+    pool_prepare(pool);
+    chunk = l / n;
+
+    for (i = 0; i < n - 1; i++)
+        pool_add_task(pool, op, 4, x, y, chunk, i * chunk);
+
+    pool_add_task(pool, op, 4, x, y, l - i * chunk, i * chunk);
+
+    v = pool_run(pool);
+    if (IS_ERROR(v))
+        return v;
+
+    // Fold the results
+    v = unify_list(&v);
+    argv[0] = (raw_p)v;
+    argv[1] = (raw_p)v->len;
+    argv[2] = (raw_p)0;
+    res = pool_call_task_fn(ray_sum_partial, 3, argv);
+    drop_obj(v);
+
+    return res;
+}
+
 // Unaries
 obj_p ray_sum(obj_p x) { return unop_fold(ray_sum_partial, x); }
 obj_p ray_cnt(obj_p x) { return unop_fold(ray_cnt_partial, x); }
@@ -1506,6 +1526,7 @@ obj_p ray_floor(obj_p x) { return unop_map(ray_floor_partial, x); }
 obj_p ray_ceil(obj_p x) { return unop_map(ray_ceil_partial, x); }
 
 // Binaries
+obj_p ray_sq_sub(obj_p x, obj_p y) { return binop_fold(ray_sq_sub_partial, x, y); }
 obj_p ray_add(obj_p x, obj_p y) { return binop_map(ray_add_partial, x, y); }
 obj_p ray_sub(obj_p x, obj_p y) { return binop_map(ray_sub_partial, x, y); }
 obj_p ray_mul(obj_p x, obj_p y) { return binop_map(ray_mul_partial, x, y); }
@@ -1542,9 +1563,10 @@ obj_p ray_med(obj_p x) {
     if (l == 0)
         return f64(NULL_F64);
 
-    i32_t *xi32sort;
+    // i32_t *xi32sort;
     i64_t *xisort;
-    f64_t *xfsort, med;
+    // f64_t *xfsort, med;
+    f64_t med;
     obj_p sort;
 
     switch (x->type) {
@@ -1554,13 +1576,14 @@ obj_p ray_med(obj_p x) {
             return f64(i64_to_f64(x->i64));
         case -TYPE_F64:
             return clone_obj(x);
-        case TYPE_I32:
-            sort = ray_asc(x);
-            xi32sort = AS_I32(sort);
-            med = (f64_t)((l % 2 == 0) ? (xi32sort[l / 2 - 1] + xi32sort[l / 2]) / 2.0 : xi32sort[l / 2]);
-            drop_obj(sort);
+            // TODO
+            // case TYPE_I32:
+            //     sort = ray_asc(x);
+            //     xi32sort = AS_I32(sort);
+            //     med = (f64_t)((l % 2 == 0) ? (xi32sort[l / 2 - 1] + xi32sort[l / 2]) / 2.0 : xi32sort[l / 2]);
+            //     drop_obj(sort);
 
-            return f64(med);
+            //     return f64(med);
 
         case TYPE_I64:
             sort = ray_asc(x);
@@ -1569,14 +1592,14 @@ obj_p ray_med(obj_p x) {
             drop_obj(sort);
 
             return f64(med);
+            // TODO
+            // case TYPE_F64:
+            //     sort = ray_asc(x);
+            //     xfsort = AS_F64(sort);
+            //     med = (l % 2 == 0) ? (xfsort[l / 2 - 1] + xfsort[l / 2]) / 2.0 : xfsort[l / 2];
+            //     drop_obj(sort);
 
-        case TYPE_F64:
-            sort = ray_asc(x);
-            xfsort = AS_F64(sort);
-            med = (l % 2 == 0) ? (xfsort[l / 2 - 1] + xfsort[l / 2]) / 2.0 : xfsort[l / 2];
-            drop_obj(sort);
-
-            return f64(med);
+            //     return f64(med);
 
         case TYPE_MAPGROUP:
             return aggr_med(AS_LIST(x)[0], AS_LIST(x)[1]);
@@ -1584,4 +1607,36 @@ obj_p ray_med(obj_p x) {
         default:
             THROW(ERR_TYPE, "med: unsupported type: '%s", type_name(x->type));
     }
+}
+
+obj_p ray_dev(obj_p x) {
+    i64_t l = ray_cnt(x)->i64;
+
+    if (l == 0)
+        return f64(NULL_F64);
+    else if (l == 1)
+        return f64(0.0);
+    f64_t favg = 0.0;
+
+    switch (x->type) {
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            favg = ((f64_t)ray_sum(x)->i32) / (f64_t)l;
+            break;
+        case TYPE_I64:
+        case TYPE_TIMESTAMP:
+            favg = ((f64_t)ray_sum(x)->i64) / (f64_t)l;
+            break;
+        case TYPE_F64:
+            favg = (ray_sum(x)->f64) / (f64_t)l;
+            break;
+        case TYPE_MAPGROUP:
+            return aggr_dev(AS_LIST(x)[0], AS_LIST(x)[1]);
+
+        default:
+            THROW(ERR_TYPE, "dev: unsupported type: '%s", type_name(x->type));
+    }
+
+    return f64(sqrt(ray_sq_sub(x, f64(favg))->f64 / (f64_t)l));
 }

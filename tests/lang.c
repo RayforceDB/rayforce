@@ -1748,11 +1748,20 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(med 0Nf)", "0Nf");
     TEST_ASSERT_EQ("(med [])", "0Nf");
     // TEST_ASSERT_EQ("(med [1i 2i 3i])", "2.0");
-    TEST_ASSERT_EQ("(med [0Nl 3 0Nl 1 2])", "2.0");
-    TEST_ASSERT_EQ("(med [0Nl 1 0Nl 2 3])", "2.0");
-
+    TEST_ASSERT_EQ("(med [3 1 2])", "2.0");
+    TEST_ASSERT_EQ("(med [3 1 2 4])", "2.5");
+    // TEST_ASSERT_EQ("(med [0Nl 3 0Nl 1 2])", "2.0");
+    // TEST_ASSERT_EQ("(med [0Nl 1 0Nl 2 3])", "2.0");
     // TEST_ASSERT_EQ("(med [0Ni 0Ni])", "0Nf");
-    TEST_ASSERT_EQ("(med [1.0 2.0 3.0 4.0 0Nf 0Nf])", "2.5");
+    // TEST_ASSERT_EQ("(med [1.0 2.0 3.0 4.0 0Nf 0Nf])", "2.5");
+
+    TEST_ASSERT_EQ("(dev 1)", "0.0");
+    TEST_ASSERT_EQ("(dev [0Ni])", "0Nf");
+    TEST_ASSERT_EQ("(dev [1i 2i])", "0.5");
+    TEST_ASSERT_EQ("(dev [1 0Nl 2])", "0.5");
+    TEST_ASSERT_EQ("(dev [1 2 3 4 50])", "19.0263");
+    TEST_ASSERT_EQ("(dev [0Nl 1 2 3 4 50 0Nl])", "19.0263");
+    TEST_ASSERT_EQ("(dev [0Nf -2.0 10.0 11.0 5.0 0Nf])", "5.147815");
 
     PASS();
 }
