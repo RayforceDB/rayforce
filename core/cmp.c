@@ -309,11 +309,21 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, u64_t, u64_t, obj_p);
                 return ray_##op##_partial(y, x, len, offset, res);                                          \
                                                                                                             \
             case MTYPE2(-TYPE_GUID, -TYPE_GUID):                                                            \
-                return b8(memcmp(AS_GUID(x)[0], AS_GUID(y)[0], sizeof(guid_t)) == 0);                       \
+                return b8(op##GUID(AS_GUID(x)[0], AS_GUID(y)[0]));                                          \
+            case MTYPE2(-TYPE_GUID, TYPE_GUID):                                                             \
+                out = AS_B8(res) + offset;                                                                  \
+                for (i = 0; i < len; i++)                                                                   \
+                    out[i] = op##GUID(AS_GUID(x)[0], AS_GUID(y)[i]);                                        \
+                return res;                                                                                 \
+            case MTYPE2(TYPE_GUID, -TYPE_GUID):                                                             \
+                out = AS_B8(res) + offset;                                                                  \
+                for (i = 0; i < len; i++)                                                                   \
+                    out[i] = op##GUID(AS_GUID(x)[i], AS_GUID(y)[0]);                                        \
+                return res;                                                                                 \
             case MTYPE2(TYPE_GUID, TYPE_GUID):                                                              \
                 out = AS_B8(res) + offset;                                                                  \
                 for (i = 0; i < len; i++)                                                                   \
-                    out[i] = memcmp(AS_GUID(x)[i], AS_GUID(y)[i], sizeof(guid_t)) == 0;                     \
+                    out[i] = op##GUID(AS_GUID(x)[i], AS_GUID(y)[i]);                                        \
                 return res;                                                                                 \
             case MTYPE2(TYPE_ERROR, TYPE_ERROR):                                                            \
                 return b8(cmp_obj(x, y) == 0);                                                              \
