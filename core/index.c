@@ -549,8 +549,8 @@ obj_p index_find_guid(guid_t x[], u64_t xl, guid_t y[], u64_t yl) {
     __index_find_ctx_t ctx;
 
     // calc hashes
-    res = I64(MAXI64(xl, yl));
-    ht = ht_oa_create(MAXI64(xl, yl) * 2, -1);
+    res = I64(MAXU64(xl, yl));
+    ht = ht_oa_create(MAXU64(xl, yl) * 2, -1);
 
     hashes = (u64_t *)AS_I64(res);
 
@@ -586,8 +586,8 @@ obj_p index_find_obj(obj_p x[], u64_t xl, obj_p y[], u64_t yl) {
     __index_find_ctx_t ctx;
 
     // calc hashes
-    res = I64(MAXI64(xl, yl));
-    ht = ht_oa_create(MAXI64(xl, yl) * 2, -1);
+    res = I64(MAXU64(xl, yl));
+    ht = ht_oa_create(MAXU64(xl, yl) * 2, -1);
 
     hashes = (u64_t *)AS_I64(res);
 
@@ -1263,8 +1263,8 @@ obj_p index_join_obj(obj_p lcols, obj_p rcols, u64_t len) {
 
     ll = ops_count(AS_LIST(lcols)[0]);
     rl = ops_count(AS_LIST(rcols)[0]);
-    ht = ht_oa_create(MAXI64(ll, rl), -1);
-    res = I64(MAXI64(ll, rl));
+    ht = ht_oa_create(MAXU64(ll, rl), -1);
+    res = I64(MAXU64(ll, rl));
 
     // Right hashes
     __index_list_precalc_hash(rcols, (u64_t *)AS_I64(res), len, rl, NULL, B8_TRUE);

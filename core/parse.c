@@ -193,6 +193,11 @@ obj_p parse_time(parser_t *parser) {
     str_p current = parser->current;
     span_t span = span_start(parser);
 
+    if (*current == '-') {
+        tm.sign = -1;
+        current++;
+    }
+
     if (is_digit(*current) && is_digit(*(current + 1))) {
         tm.hours = (*current - '0') * 10 + (*(current + 1) - '0');
         current += 2;
@@ -1160,10 +1165,6 @@ obj_p parser_advance(parser_t *parser) {
         if (tok != PARSE_ADVANCE)
             return tok;
 
-        tok = parse_time(parser);
-        if (tok != PARSE_ADVANCE)
-            return tok;
-
         tok = parse_timestamp(parser);
         if (tok != PARSE_ADVANCE)
             return tok;
@@ -1171,8 +1172,13 @@ obj_p parser_advance(parser_t *parser) {
         drop_obj(tok);
     }
 
-    if (((*parser->current) == '-' && is_digit(*(parser->current + 1))) || is_digit(*parser->current))
+    if (((*parser->current) == '-' && is_digit(*(parser->current + 1))) || is_digit(*parser->current)) {
+        tok = parse_time(parser);
+        if (tok != PARSE_ADVANCE)
+            return tok;
+
         return parse_number(parser);
+    }
 
     if ((*parser->current) == '\'')
         return parse_char(parser);

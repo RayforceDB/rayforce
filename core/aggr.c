@@ -21,7 +21,6 @@
  *   SOFTWARE.
  */
 
-#include <math.h>
 #include "aggr.h"
 #include "math.h"
 #include "ops.h"

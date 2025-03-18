@@ -123,18 +123,32 @@ nil_t dump_stack(nil_t);
 #define __TYPE_symbol TYPE_SYMBOL
 #define __TYPE_list TYPE_LIST
 
-#define __INNER_u8 u8_t
-#define __INNER_b8 b8_t
-#define __INNER_c8 c8_t
-#define __INNER_i32 i32_t
-#define __INNER_date i32_t
-#define __INNER_time i32_t
-#define __INNER_timestamp i64_t
-#define __INNER_i64 i64_t
-#define __INNER_f64 f64_t
-#define __INNER_guid guid_t
-#define __INNER_symbol i64_t
-#define __INNER_list obj_p
+// Base type for use in pointer declarations
+#define __BASE_u8 u8
+#define __BASE_b8 b8
+#define __BASE_c8 c8
+#define __BASE_i32 i32
+#define __BASE_date i32
+#define __BASE_time i32
+#define __BASE_timestamp i64
+#define __BASE_i64 i64
+#define __BASE_f64 f64
+#define __BASE_guid guid
+#define __BASE_symbol i64
+
+// Base type with _t suffix for use in pointer declarations
+#define __BASE_u8_t u8_t
+#define __BASE_b8_t b8_t
+#define __BASE_c8_t c8_t
+#define __BASE_i32_t i32_t
+#define __BASE_date_t i32_t
+#define __BASE_time_t i32_t
+#define __BASE_timestamp_t i64_t
+#define __BASE_i64_t i64_t
+#define __BASE_f64_t f64_t
+#define __BASE_guid_t guid_t
+#define __BASE_symbol_t i64_t
+#define __BASE_list_t obj_p
 
 #define __v_i8(x) I8(x)
 #define __v_u8(x) U8(x)
