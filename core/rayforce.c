@@ -639,11 +639,15 @@ obj_p ins_obj(obj_p *obj, i64_t idx, obj_p val) {
             ret = ins_raw(obj, idx, &val->c8);
             drop_obj(val);
             break;
+        case TYPE_GUID:
+            ret = ins_raw(obj, idx, AS_GUID(val));
+            drop_obj(val);
+            break;
         case TYPE_LIST:
             ret = ins_raw(obj, idx, &val);
             break;
         default:
-            THROW(ERR_TYPE, "write_obj: invalid type: '%s", type_name((*obj)->type));
+            PANIC("ins_obj: invalid type: '%s", type_name((*obj)->type));
     }
 
     return ret;

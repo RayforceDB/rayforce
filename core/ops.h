@@ -62,7 +62,7 @@ extern struct obj_t __NULL_OBJECT;
 #define EQI16(x, y) ((x) == (y))
 #define EQI32(x, y) ((x) == (y))
 #define EQI64(x, y) ((x) == (y))
-#define EQF64(x, y) ((x) == (y))
+#define EQF64(x, y) (ops_is_nan(x) ? ops_is_nan(y) : ops_is_nan(y) ? 0 : (x) == (y))
 #define EQGUID(x, y) (memcmp((x), (y), sizeof(guid_t)) == 0)
 #define EQSTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) == 0)
 #define NEI8(x, y) ((x) != (y))
@@ -70,7 +70,7 @@ extern struct obj_t __NULL_OBJECT;
 #define NEI16(x, y) ((x) != (y))
 #define NEI32(x, y) ((x) != (y))
 #define NEI64(x, y) ((x) != (y))
-#define NEF64(x, y) ((x) != (y))
+#define NEF64(x, y) (!EQF64((x), (y)))
 #define NEGUID(x, y) (memcmp((x), (y), sizeof(guid_t)) != 0)
 #define NESTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) != 0)
 #define LTI8(x, y) ((x) < (y))
@@ -78,28 +78,32 @@ extern struct obj_t __NULL_OBJECT;
 #define LTI16(x, y) ((x) < (y))
 #define LTI32(x, y) ((x) < (y))
 #define LTI64(x, y) ((x) < (y))
-#define LTF64(x, y) ((x) < (y))
+#define LTF64(x, y) (ops_is_nan(x) ? !ops_is_nan(y) : ops_is_nan(y) ? 0 : (x) < (y))
+#define LTGUID(x, y) (memcmp((x), (y), sizeof(guid_t)) < 0)
 #define LTSTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) < 0)
 #define GTI8(x, y) ((x) > (y))
 #define GTC8(x, y) ((x) > (y))
 #define GTI16(x, y) ((x) > (y))
 #define GTI32(x, y) ((x) > (y))
 #define GTI64(x, y) ((x) > (y))
-#define GTF64(x, y) ((x) > (y))
+#define GTF64(x, y) (ops_is_nan(y) ? !ops_is_nan(x) : ops_is_nan(x) ? 0 : (x) > (y))
+#define GTGUID(x, y) (memcmp((x), (y), sizeof(guid_t)) > 0)
 #define GTSTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) > 0)
 #define LEI8(x, y) ((x) <= (y))
 #define LEC8(x, y) ((x) <= (y))
 #define LEI16(x, y) ((x) <= (y))
 #define LEI32(x, y) ((x) <= (y))
 #define LEI64(x, y) ((x) <= (y))
-#define LEF64(x, y) ((x) <= (y))
+#define LEF64(x, y) (!GTF64((x), (y)))
+#define LEGUID(x, y) (!GTGUID((x), (y)))
 #define LESTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) <= 0)
 #define GEI8(x, y) ((x) >= (y))
 #define GEC8(x, y) ((x) >= (y))
 #define GEI16(x, y) ((x) >= (y))
 #define GEI32(x, y) ((x) >= (y))
 #define GEI64(x, y) ((x) >= (y))
-#define GEF64(x, y) ((x) >= (y))
+#define GEF64(x, y) (!LTF64((x), (y)))
+#define GEGUID(x, y) (!LTGUID((x), (y)))
 #define GESTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) >= 0)
 #define ABSI8(x) ((x) < 0 ? -(x) : (x))
 #define ABSI32(x) ((x) == NULL_I32 ? NULL_I32 : (((x) < 0 ? -(x) : (x))))
@@ -176,6 +180,15 @@ obj_p sys_error(os_ray_error_type_t, lit_p msg);
 
 // Binary ops/coersions
 
+static inline i16_t i16_to_i16(i16_t x) { return x; }
+static inline i32_t i16_to_i32(i16_t x) { return (x == NULL_I16) ? NULL_I32 : (i32_t)x; }
+static inline i64_t i16_to_i64(i16_t x) { return (x == NULL_I16) ? NULL_I64 : (i64_t)x; }
+static inline f64_t i16_to_f64(i16_t x) { return (x == NULL_I16) ? NULL_F64 : (f64_t)x; }
+static inline i32_t i16_to_date(i16_t x) { return (x == NULL_I16) ? NULL_I32 : (i32_t)x; }
+static inline i32_t i16_to_time(i16_t x) { return (x == NULL_I16) ? NULL_I32 : (i32_t)x; }
+static inline i32_t i16_to_adate(i16_t x) { return (x == NULL_I16) ? NULL_I32 : (i32_t)x; }
+static inline i32_t i16_to_atime(i16_t x) { return (x == NULL_I16) ? NULL_I32 : (i32_t)x; }
+static inline i64_t i16_to_timestamp(i16_t x) { return (x == NULL_I16) ? NULL_I64 : (i64_t)x; }
 static inline i32_t i32_to_i32(i32_t x) { return x; }
 static inline i64_t i32_to_i64(i32_t x) { return (x == NULL_I32) ? NULL_I64 : (i64_t)x; }
 static inline f64_t i32_to_f64(i32_t x) { return (x == NULL_I32) ? NULL_F64 : (f64_t)x; }
@@ -214,47 +227,5 @@ static inline i32_t timestamp_to_time(i64_t x) {
     return (x == NULL_I64) ? NULL_I32 : (i32_t)(x % NANOS_FROM_DAY / NANOS_FROM_MILLIS);
 }
 static inline i64_t timestamp_to_timestamp(i64_t x) { return x; }
-
-#define __BINOP_I32_I64(x, y, op) \
-    ({                            \
-        i64_t $l = i32_to_i64(x); \
-        i64_t $r = y;             \
-        op($l, $r);               \
-    })
-
-#define __BINOP_I64_I32(x, y, op) \
-    ({                            \
-        i64_t $l = x;             \
-        i64_t $r = i32_to_i64(y); \
-        op($l, $r);               \
-    })
-
-#define __BINOP_I32_F64(x, y, op) \
-    ({                            \
-        f64_t $l = i32_to_f64(x); \
-        f64_t $r = y;             \
-        op($l, $r);               \
-    })
-
-#define __BINOP_I64_F64(x, y, op) \
-    ({                            \
-        f64_t $l = i64_to_f64(x); \
-        f64_t $r = y;             \
-        op($l, $r);               \
-    })
-
-#define __BINOP_F64_I32(x, y, op) \
-    ({                            \
-        f64_t $l = x;             \
-        f64_t $r = i32_to_f64(y); \
-        op($l, $r);               \
-    })
-
-#define __BINOP_F64_I64(x, y, op) \
-    ({                            \
-        f64_t $l = x;             \
-        f64_t $r = i64_to_f64(y); \
-        op($l, $r);               \
-    })
 
 #endif  // OPS_H

@@ -127,6 +127,7 @@ nil_t dump_stack(nil_t);
 #define __BASE_u8 u8
 #define __BASE_b8 b8
 #define __BASE_c8 c8
+#define __BASE_i16 i16
 #define __BASE_i32 i32
 #define __BASE_date i32
 #define __BASE_time i32
@@ -140,6 +141,7 @@ nil_t dump_stack(nil_t);
 #define __BASE_u8_t u8_t
 #define __BASE_b8_t b8_t
 #define __BASE_c8_t c8_t
+#define __BASE_i16_t i16_t
 #define __BASE_i32_t i32_t
 #define __BASE_date_t i32_t
 #define __BASE_time_t i32_t
