@@ -1008,16 +1008,6 @@ obj_p term_read(term_p term) {
             poll_exit(runtime_get()->poll, 0);
             term->input_len = 0;
             break;
-        case KEYCODE_CTRL_U:
-            hist_reset_current(term->hist);
-            term->buf_len = 0;
-            term->buf_pos = 0;
-            term->input_len = 0;
-            cursor_move_start();
-            line_clear();
-            term_prompt(term);
-            fflush(stdout);
-            break;
         case KEYCODE_ESCAPE:
             res = term_handle_escape(term);
             break;
