@@ -814,9 +814,10 @@ obj_p parse_vector(parser_t *parser) {
             vec->type = TYPE_U8;
             push_raw(&vec, &tok->u8);
         } else if (tok->type == -TYPE_I16) {
-            if (vec->type == TYPE_I16 || (vec->len == 0))
+            if (vec->type == TYPE_I16 || (vec->len == 0)) {
                 push_raw(&vec, &tok->i16);
-            else if (vec->type == TYPE_F64) {
+                vec->type = TYPE_I16;
+            } else if (vec->type == TYPE_F64) {
                 v = (f64_t)tok->i16;
                 push_raw(&vec, &v);
             } else {
