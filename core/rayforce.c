@@ -1727,7 +1727,7 @@ i32_t cmp_obj(obj_p a, obj_p b) {
             return (ops_is_nan(a->f64) && ops_is_nan(b->f64))   ? 0
                    : (ops_is_nan(a->f64) || ops_is_nan(b->f64)) ? 1
                    : (ABSF64(a->f64 - b->f64) < 1e-16)          ? 0
-                                                                : (a->f64 - b->f64);
+                                                                : 1;
 
         case -TYPE_I64:
         case -TYPE_I32:
@@ -1756,7 +1756,10 @@ i32_t cmp_obj(obj_p a, obj_p b) {
 
             l = a->len;
             for (i = 0; i < l; i++) {
-                d = AS_F64(a)[i] - AS_F64(b)[i];
+                d = (ops_is_nan(AS_F64(a)[i]) && ops_is_nan(AS_F64(b)[i]))   ? 0
+                    : (ops_is_nan(AS_F64(a)[i]) || ops_is_nan(AS_F64(b)[i])) ? 1
+                    : (ABSF64(AS_F64(a)[i] - AS_F64(b)[i]) < 1e-16)          ? 0
+                                                                             : 1;
                 if (d != 0)
                     return d;
             }

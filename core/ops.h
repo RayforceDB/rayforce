@@ -123,7 +123,7 @@ extern struct obj_t __NULL_OBJECT;
 #define MULF64(x, y) (ops_is_nan(x) || ops_is_nan(y) ? NULL_F64 : ((x) * (y)))
 #define DIVI32(x, y) (((y) == 0 || (x) == NULL_I32 || (y) == NULL_I32) ? NULL_I32 : ((x) / (y)))
 #define DIVI64(x, y) (((y) == 0 || (x) == NULL_I64 || (y) == NULL_I64) ? NULL_I64 : ((x) / (y)))
-#define DIVF64(x, y) ((y) == 0.0 || ops_is_nan(x) || ops_is_nan(y) ? NULL_F64 : ((x) / (y)))
+#define DIVF64(x, y) ((y) == 0.0 || ops_is_nan(x) || ops_is_nan(y) ? NULL_F64 : ((f64_t)(i64_t)((x) / (y))))
 #define FDIVI32(x, y) (((y) == 0 || (x) == NULL_I32 || (y) == NULL_I32) ? NULL_F64 : ((f64_t)(x) / (f64_t)(y)))
 #define FDIVI64(x, y) (((y) == 0 || (x) == NULL_I64 || (y) == NULL_I64) ? NULL_F64 : ((f64_t)(x) / (f64_t)(y)))
 #define FDIVF64(x, y) ((y) == 0.0 || ops_is_nan(x) || ops_is_nan(y) ? NULL_F64 : ((x) / (y)))
