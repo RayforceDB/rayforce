@@ -184,6 +184,8 @@ nil_t dump_stack(nil_t);
 #define __SIZE_OF_u8 sizeof(u8_t)
 #define __SIZE_OF_b8 sizeof(b8_t)
 #define __SIZE_OF_c8 sizeof(c8_t)
+#define __SIZE_OF_i16 sizeof(i16_t)
+#define __SIZE_OF_i32 sizeof(i32_t)
 #define __SIZE_OF_i64 sizeof(i64_t)
 #define __SIZE_OF_time sizeof(i32_t)
 #define __SIZE_OF_date sizeof(i32_t)

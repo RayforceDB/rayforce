@@ -687,6 +687,139 @@ obj_p ray_row_index(obj_p *x, u64_t n) {
     return res;
 }
 
+#define CUT_VECTOR(x, xt, y, yt)                                                                       \
+    ({                                                                                                 \
+        i64_t $i, $j, $xl, $yl;                                                                        \
+        yt##_t $id, $last_id;                                                                          \
+        obj_p $v, $res;                                                                                \
+        $xl = x->len;                                                                                  \
+        $yl = y->len;                                                                                  \
+        if ($yl > $xl)                                                                                 \
+            THROW(ERR_LENGTH, "cut: vector length mismatch: %d, %d", $xl, $yl);                        \
+                                                                                                       \
+        $res = LIST($yl);                                                                              \
+        $last_id = __AS_##yt(y)[0];                                                                    \
+        if ($last_id < 0 || $last_id >= $xl) {                                                         \
+            drop_obj($res);                                                                            \
+            THROW(ERR_INDEX, "cut: invalid index or index vector is not sorted: %lld", $last_id);      \
+        }                                                                                              \
+                                                                                                       \
+        for ($i = 0; $i < $yl; $i++) {                                                                 \
+            $id = ($i == $yl - 1) ? $xl : __AS_##yt(y)[$i + 1];                                        \
+            if ($id < $last_id || $id > $xl) {                                                         \
+                $res->len = $i;                                                                        \
+                drop_obj($res);                                                                        \
+                THROW(ERR_INDEX, "cut: invalid index or index vector is not sorted: %lld", $id);       \
+            }                                                                                          \
+                                                                                                       \
+            if ($id == $last_id)                                                                       \
+                $v = vector(x->type, 0);                                                               \
+            else {                                                                                     \
+                $v = vector(x->type, $id - $last_id);                                                  \
+                if (x->type == TYPE_LIST) {                                                            \
+                    for ($j = 0; $j < $id - $last_id; $j++)                                            \
+                        AS_LIST($v)[$j] = clone_obj(AS_LIST(x)[$last_id + $j]);                        \
+                } else {                                                                               \
+                    memcpy(__AS_##xt($v), &__AS_##xt(x)[$last_id], ($id - $last_id) * __SIZE_OF_##xt); \
+                }                                                                                      \
+            }                                                                                          \
+                                                                                                       \
+            AS_LIST($res)[$i] = $v;                                                                    \
+            $last_id = $id;                                                                            \
+        }                                                                                              \
+        $res;                                                                                          \
+    })
+
+obj_p cut_vector(obj_p x, obj_p y) {
+    switch (x->type) {
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
+            switch (y->type) {
+                case TYPE_I16:
+                    return CUT_VECTOR(x, u8, y, i16);
+                case TYPE_I32:
+                    return CUT_VECTOR(x, u8, y, i32);
+                case TYPE_I64:
+                    return CUT_VECTOR(x, u8, y, i64);
+                default:
+                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+            }
+        case TYPE_I16:
+            switch (y->type) {
+                case TYPE_I16:
+                    return CUT_VECTOR(x, i16, y, i16);
+                case TYPE_I32:
+                    return CUT_VECTOR(x, i16, y, i32);
+                case TYPE_I64:
+                    return CUT_VECTOR(x, i16, y, i64);
+                default:
+                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+            }
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            switch (y->type) {
+                case TYPE_I16:
+                    return CUT_VECTOR(x, i32, y, i16);
+                case TYPE_I32:
+                    return CUT_VECTOR(x, i32, y, i32);
+                case TYPE_I64:
+                    return CUT_VECTOR(x, i32, y, i64);
+                default:
+                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+            }
+        case TYPE_I64:
+        case TYPE_SYMBOL:
+        case TYPE_TIMESTAMP:
+            switch (y->type) {
+                case TYPE_I16:
+                    return CUT_VECTOR(x, i64, y, i16);
+                case TYPE_I32:
+                    return CUT_VECTOR(x, i64, y, i32);
+                case TYPE_I64:
+                    return CUT_VECTOR(x, i64, y, i64);
+                default:
+                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+            }
+        case TYPE_F64:
+            switch (y->type) {
+                case TYPE_I16:
+                    return CUT_VECTOR(x, f64, y, i16);
+                case TYPE_I32:
+                    return CUT_VECTOR(x, f64, y, i32);
+                case TYPE_I64:
+                    return CUT_VECTOR(x, f64, y, i64);
+                default:
+                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+            }
+        case TYPE_GUID:
+            switch (y->type) {
+                case TYPE_I16:
+                    return CUT_VECTOR(x, guid, y, i16);
+                case TYPE_I32:
+                    return CUT_VECTOR(x, guid, y, i32);
+                case TYPE_I64:
+                    return CUT_VECTOR(x, guid, y, i64);
+                default:
+                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+            }
+        case TYPE_LIST:
+            switch (y->type) {
+                case TYPE_I16:
+                    return CUT_VECTOR(x, list, y, i16);
+                case TYPE_I32:
+                    return CUT_VECTOR(x, list, y, i32);
+                case TYPE_I64:
+                    return CUT_VECTOR(x, list, y, i64);
+                default:
+                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+            }
+        default:
+            THROW(ERR_TYPE, "cut: unsupported vector type: '%s", type_name(x->type));
+    }
+}
+
 obj_p ray_split(obj_p x, obj_p y) {
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(-TYPE_SYMBOL, -TYPE_C8):
@@ -698,6 +831,9 @@ obj_p ray_split(obj_p x, obj_p y) {
         case MTYPE2(TYPE_C8, TYPE_C8):
             return str_split(AS_C8(x), x->len, AS_C8(y), y->len);
         default:
+            if (IS_VECTOR(x))
+                return cut_vector(x, y);
+
             THROW(ERR_TYPE, "split: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
 }
