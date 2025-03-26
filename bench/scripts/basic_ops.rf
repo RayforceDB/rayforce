@@ -1,0 +1,25 @@
+;; --iterations=1000 --expected-time=0.015
+
+;; Create a large list and perform operations on it
+(let [n 10000
+      lst (range n)]
+  (-> lst
+      (map (fn [x] (* x x)))
+      (filter (fn [x] (> x (/ n 2))))
+      (reduce +)
+      (sort >)))
+
+;; Map operation
+(def mapped (map lst (fn (x) (* x x))))
+
+;; Filter operation
+(def filtered (filter lst (fn (x) (> x (/ n 2)))))
+
+;; Reduce operation
+(def sum (reduce lst + 0))
+
+;; Sort operation
+(def sorted (sort lst >))
+
+;; Return results to prevent optimization
+[mapped filtered sum sorted] 

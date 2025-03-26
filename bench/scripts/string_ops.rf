@@ -1,0 +1,20 @@
+;; --iterations=100 --expected-time=10
+
+;; Create a large string and perform operations on it
+(def str "The quick brown fox jumps over the lazy dog. ")
+(def n 1000)
+
+;; String concatenation
+(def long_str (reduce (range n) (fn (acc _) (str+ acc str)) ""))
+
+;; String splitting
+(def words (split long_str " "))
+
+;; String joining
+(def joined (join words ","))
+
+;; String replacement
+(def replaced (replace long_str "dog" "cat"))
+
+;; Return results to prevent optimization
+[long_str words joined replaced] 

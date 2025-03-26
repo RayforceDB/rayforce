@@ -1,0 +1,9 @@
+;; This is an initialization script that runs before the main benchmark
+;; It sets up any necessary environment or data that should not be measured
+
+;; Set random seed for reproducibility
+(set random_seed 42)
+(rand random_seed)
+
+;; Create any necessary global variables or functions
+(set global_config {max_rows: 10000 min_price: 0 max_price: 1000}) 

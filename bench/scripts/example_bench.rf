@@ -1,0 +1,29 @@
+;; --expected-time=100 --iterations=5
+
+;; This is an example benchmark script that demonstrates various features
+;; It creates a large table and performs some operations on it
+
+;; Create a large table with random data
+(set n 10000)
+(set symbols (take n (list "AAPL" "GOOGL" "MSFT" "AMZN" "META" "TSLA" "NVDA" "AMD" "INTC" "CSCO")))
+(set prices (as 'F64 (rand n)))
+(set volumes (as 'I64 (* 1000 (rand n))))
+(set timestamps (as 'Timestamp (til n)))
+
+(set t (table [symbol price volume timestamp] (list symbols prices volumes timestamps)))
+
+;; Perform some operations
+;; 1. Calculate average price by symbol
+(set avg_prices (select {from: t by: symbol agg: {price: avg}}))
+
+;; 2. Find top 5 symbols by volume
+(set top_volumes (select {from: t order: {volume: desc} take: 5}))
+
+;; 3. Calculate price changes
+(set price_changes (select {from: t calc: {change: (- price (prev price))}}))
+
+;; 4. Find symbols with price > 100
+(set high_prices (select {from: t where: (> price 100)}))
+
+;; Return some statistics
+(list (count t) (count high_prices) (avg (at price_changes 'change))) 

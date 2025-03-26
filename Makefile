@@ -46,6 +46,7 @@ CORE_OBJECTS = core/poll.o core/runtime.o core/sys.o core/os.o core/proc.o core/
  core/thread.o core/pool.o core/progress.o core/term.o core/fdmap.o core/signal.o
 APP_OBJECTS = app/main.o
 TESTS_OBJECTS = tests/main.o
+BENCH_OBJECTS = bench/main.o
 TARGET = rayforce
 CFLAGS = $(RELEASE_CFLAGS)
 PYTHON = python3.10
@@ -65,6 +66,12 @@ tests: -DSTOP_ON_FAIL=$(STOP_ON_FAIL) -DDEBUG
 tests: $(TESTS_OBJECTS) lib
 	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LFLAGS)
 	./$(TARGET).test
+
+bench: CC = gcc
+bench: CFLAGS = $(RELEASE_CFLAGS)
+bench: $(BENCH_OBJECTS) lib
+	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).bench $(BENCH_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LFLAGS)
+	./$(TARGET).bench
 
 %.o: %.c
 	$(CC) -include core/def.h -c $^ $(CFLAGS) -o $@
@@ -124,11 +131,13 @@ clean:
 	-rm -f core/*.o
 	-rm -f app/*.o
 	-rm -rf tests/*.o
+	-rm -rf bench/*.o
 	-rm -f lib$(TARGET).a
 	-rm -f core/*.gch
 	-rm -f app/*.gch
 	-rm -f $(TARGET).S
 	-rm -f $(TARGET).test
+	-rm -f $(TARGET).bench
 	-rm -rf *.out
 	-rm -rf *.so
 	-rm -f $(TARGET).js
