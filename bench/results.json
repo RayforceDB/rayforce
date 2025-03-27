@@ -3,12 +3,12 @@
     {
       "script": "system",
       "min_time": 0.002,
-      "max_time": 0.006,
+      "max_time": 0.007,
       "avg_time": 0.004,
-      "timestamp": "2025-03-27 13:37:04",
+      "timestamp": "2025-03-27 13:40:59",
       "os_info": "Rayforce 0.1 (Mar 27 2025)",
       "cpu_info": "Intel(R) Core(TM) i7-14700",
-      "git_commit": "506622e18ef9604c1aed19a868e92c3c61270c4d"
+      "git_commit": "4882954b024052b2a8a3c57e8e59f36b485cd18f"
     },
     {
       "script": "example_bench",

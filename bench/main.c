@@ -371,29 +371,29 @@ void save_results(bench_results_t* results) {
 
 // Compare and print results
 void compare_and_print_results(bench_result_t* current, bench_result_t* previous) {
-    printf("\n\033[1;36mBenchmark Results for %s:\033[0m\n", current->script_name);
-    printf("\033[1;33m----------------------------------------\033[0m\n");
+    printf("\n%sBenchmark Results for %s:%s\n", CYAN, current->script_name, RESET);
+    printf("%s----------------------------------------%s\n", YELLOW, RESET);
 
     if (previous) {
-        printf("\033[1;34mPrevious Run:\033[0m %s\n", previous->timestamp);
-        printf("\033[1;34mCurrent Run:\033[0m  %s\n\n", current->timestamp);
+        printf("%sPrevious Run:%s %s\n", BLUE, RESET, previous->timestamp);
+        printf("%sCurrent Run:%s  %s\n\n", BLUE, RESET, current->timestamp);
     }
 
-    printf("\033[1;35mPerformance Metrics:\033[0m\n");
+    printf("%sPerformance Metrics:%s\n", MAGENTA, RESET);
     if (previous) {
-        printf("  \033[1;34mMin Time:\033[0m %.3f ms ", current->min_time);
+        printf("  %sMin Time:%s %.3f ms ", BLUE, RESET, current->min_time);
         print_colored_diff(current->min_time, previous->min_time);
         printf("\n");
 
-        printf("  \033[1;34mMax Time:\033[0m %.3f ms ", current->max_time);
+        printf("  %sMax Time:%s %.3f ms ", BLUE, RESET, current->max_time);
         print_colored_diff(current->max_time, previous->max_time);
         printf("\n");
 
-        printf("  \033[1;34mAvg Time:\033[0m %.3f ms ", current->avg_time);
+        printf("  %sAvg Time:%s %.3f ms ", BLUE, RESET, current->avg_time);
         print_colored_diff(current->avg_time, previous->avg_time);
         printf("\n");
 
-        printf("  \033[1;34mExp Time:\033[0m %.3f ms ", current->expected_time);
+        printf("  %sExp Time:%s %.3f ms ", BLUE, RESET, current->expected_time);
         print_colored_diff(current->avg_time, current->expected_time);
         printf("\n");
         printf("\n");
@@ -401,66 +401,66 @@ void compare_and_print_results(bench_result_t* current, bench_result_t* previous
         // Print summary
         double avg_diff_percent = ((current->avg_time - previous->avg_time) / previous->avg_time) * 100;
         if (fabs(avg_diff_percent) > 5) {
-            printf("\n\033[1;35mSummary:\033[0m Performance has ");
+            printf("\n%sSummary:%s Performance has ", MAGENTA, RESET);
             if (avg_diff_percent > 0) {
-                printf("\033[1;31mdegraded by %.1f%%\033[0m", avg_diff_percent);
+                printf("%sdegraded by %.1f%%%s", RED, avg_diff_percent, RESET);
             } else {
-                printf("\033[1;32mimproved by %.1f%%\033[0m", -avg_diff_percent);
+                printf("%simproved by %.1f%%%s", GREEN, -avg_diff_percent, RESET);
             }
             printf(" since last run\n");
         } else {
-            printf("\n\033[1;35mSummary:\033[0m Performance is \033[1;33mstable\033[0m (%.1f%% change)\n",
+            printf("\n%sSummary:%s Performance is %sstable%s (%.1f%% change)\n", MAGENTA, RESET, YELLOW, RESET,
                    avg_diff_percent);
         }
     } else {
-        printf("  \033[1;34mMin Time:\033[0m %.3f ms \033[1;32m(new)\033[0m\n", current->min_time);
-        printf("  \033[1;34mMax Time:\033[0m %.3f ms \033[1;32m(new)\033[0m\n", current->max_time);
-        printf("  \033[1;34mAvg Time:\033[0m %.3f ms \033[1;32m(new)\033[0m\n", current->avg_time);
-        printf("  \033[1;34mExp Time:\033[0m %.3f ms\n", current->expected_time);
-        printf("\n\033[1;35mSummary:\033[0m First run of this benchmark\n");
+        printf("  %sMin Time:%s %.3f ms %s(new)%s\n", BLUE, RESET, current->min_time, GREEN, RESET);
+        printf("  %sMax Time:%s %.3f ms %s(new)%s\n", BLUE, RESET, current->max_time, GREEN, RESET);
+        printf("  %sAvg Time:%s %.3f ms %s(new)%s\n", BLUE, RESET, current->avg_time, GREEN, RESET);
+        printf("  %sExp Time:%s %.3f ms\n", BLUE, RESET, current->expected_time);
+        printf("\n%sSummary:%s First run of this benchmark\n", MAGENTA, RESET);
     }
 
     // Always show expected time comparison if it's set
     if (current->expected_time > 0.0) {
-        printf("\n\033[1;34mExpected Time:\033[0m %.3f ms ", current->expected_time);
+        printf("\n%sExpected Time:%s %.3f ms ", BLUE, RESET, current->expected_time);
         print_expected_time_diff(current->avg_time, current->expected_time);
         printf("\n");
     }
 
-    printf("\033[1;33m----------------------------------------\033[0m\n\n");
+    printf("%s----------------------------------------%s\n\n", YELLOW, RESET);
 }
 
 // Print system information
 void print_system_info(bench_result_t* result) {
-    printf("\n\033[1;36mSystem Information:\033[0m\n");
-    printf("\033[1;33m----------------------------------------\033[0m\n");
-    printf("  \033[1;34mOS:\033[0m %s\n", result->os_info);
-    printf("  \033[1;34mCPU:\033[0m %s\n", result->cpu_info);
-    printf("  \033[1;34mGit Commit:\033[0m %s\n", result->git_commit);
-    printf("  \033[1;34mTimestamp:\033[0m %s\n", result->timestamp);
-    printf("\033[1;33m----------------------------------------\033[0m\n\n");
+    printf("\n%sSystem Information:%s\n", CYAN, RESET);
+    printf("%s----------------------------------------%s\n", YELLOW, RESET);
+    printf("  %sOS:%s %s\n", BLUE, RESET, result->os_info);
+    printf("  %sCPU:%s %s\n", BLUE, RESET, result->cpu_info);
+    printf("  %sGit Commit:%s %s\n", BLUE, RESET, result->git_commit);
+    printf("  %sTimestamp:%s %s\n", BLUE, RESET, result->timestamp);
+    printf("%s----------------------------------------%s\n\n", YELLOW, RESET);
 }
 
 // Print colored diff between current and previous results
 void print_colored_diff(double current, double previous) {
     double diff = ((current - previous) / previous) * 100.0;
     if (diff > 0) {
-        printf("\033[1;31m+%.1f%%\033[0m", diff);
+        printf("%s+%.1f%%%s", RED, diff, RESET);
     } else if (diff < 0) {
-        printf("\033[1;32m%.1f%%\033[0m", diff);
+        printf("%s%.1f%%%s", GREEN, diff, RESET);
     } else {
-        printf("\033[1;33m0.0%%\033[0m");
+        printf("%s0.0%%%s", YELLOW, RESET);
     }
 }
 
 void print_expected_time_diff(double actual, double expected) {
     double diff = ((actual - expected) / expected) * 100.0;
     if (fabs(diff) < 5.0) {
-        printf("\033[1;33m(within ±5%% of expected)\033[0m");
+        printf("%s(within ±5%% of expected)%s", YELLOW, RESET);
     } else if (diff > 0) {
-        printf("\033[1;31m(%.1f%% slower than expected)\033[0m", diff);
+        printf("%s(%.1f%% slower than expected)%s", RED, diff, RESET);
     } else {
-        printf("\033[1;32m(%.1f%% faster than expected)\033[0m", -diff);
+        printf("%s(%.1f%% faster than expected)%s", GREEN, -diff, RESET);
     }
 }
 
