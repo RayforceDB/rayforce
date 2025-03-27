@@ -114,7 +114,9 @@ nav:
     - Getting Started: 
       - Install: content/getstarted/install.md
       - Tutorial: content/getstarted/tutorial.md
-    - Benchmarks: content/benchmarks.md
+    - Benchmarks: 
+      - Compare to other DBs: content/benchmarks/bench.md
+      - Run benchmarks: content/benchmarks/run.md
     - Reference card: content/reference.md
     - Syntax: content/syntax.md
     - Atomic functions: content/atomic.md
