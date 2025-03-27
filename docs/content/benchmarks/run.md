@@ -29,7 +29,14 @@ Benchmark scripts are Rayforce scripts with special comments that specify benchm
 ```rayforce
 ;; --iterations=1000 --expected-time=10.0
 
-# Your benchmark code here
+;; Create a large list and perform operations on it
+(let [n 10000
+      lst (range n)]
+  (-> lst
+      (map (fn [x] (* x x)))
+      (filter (fn [x] (> x (/ n 2))))
+      (reduce +)
+      (sort >)))
 ```
 
 ### Parameters
@@ -71,27 +78,43 @@ Summary: Performance has degraded by 138.9% since last run
 1. Create a new `.rf` file in the `bench/scripts` directory
 2. Add benchmark parameters using the `;;` comment syntax
 3. Write your benchmark code
-4. Optionally, create an initialization script with the same name but `.init` suffix
+4. Optionally, create an initialization script with the same name but `.init.rf` suffix
 
 ### Example
 
 ```rayforce
 ;; --iterations=1000 --expected-time=10.0
 
-# Initialize test data
-let data = range(1000) |> map(x => str(x))
-
-# Benchmark string operations
-let result = data |> map(x => str_len(x)) |> sum()
+;; Create a large string and perform operations on it
+(let [str "The quick brown fox jumps over the lazy dog. "
+      n 1000]
+  ;; String concatenation
+  (let [long_str (reduce (range n) (fn [acc _] (str+ acc str)) "")
+        ;; String splitting
+        words (split long_str " ")
+        ;; String joining
+        joined (join words ",")
+        ;; String replacement
+        replaced (replace long_str "dog" "cat")]
+    ;; Return results to prevent optimization
+    [long_str words joined replaced]))
 ```
 
 ## Initialization Scripts
 
-If you need to set up test data or perform initialization before running the benchmark, create an initialization script with the same name as your benchmark script but with a `.init` suffix:
+If you need to set up test data or perform initialization before running the benchmark, create an initialization script with the same name as your benchmark script but with a `.init.rf` suffix:
 
 ```rayforce
-# bench/scripts/string_ops.init
-let global_data = range(1000) |> map(x => str(x))
+;; bench/scripts/example_bench.init.rf
+;; This is an initialization script that runs before the main benchmark
+
+;; Set random seed for reproducibility
+(let [random_seed 42]
+  (rand random_seed)
+  ;; Create any necessary global variables or functions
+  (def global_config {max_rows: 10000 
+                     min_price: 0 
+                     max_price: 1000}))
 ```
 
 The initialization script runs once before the benchmark iterations begin.
