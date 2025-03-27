@@ -3086,3 +3086,22 @@ test_result_t test_lang_cmp() {
 
     PASS();
 }
+
+test_result_t test_lang_distinct() {
+    TEST_ASSERT_EQ("(distinct [true true])", "[true]");
+    TEST_ASSERT_EQ("(distinct [0x12 0x12 0x10])", "[0x10 0x12]");
+    TEST_ASSERT_EQ("(distinct \"test\")", "\"est\"");
+    TEST_ASSERT_EQ("(distinct \"\")", "\"\"");
+    TEST_ASSERT_EQ("(distinct [1h 2h 2h])", "[1 2]");
+    TEST_ASSERT_EQ("(distinct [1i 0Ni 1i])", "[1i]");
+    TEST_ASSERT_EQ("(distinct [2012.12.12 2012.12.12])", "[2012.12.12]");
+    TEST_ASSERT_EQ("(distinct [10:00:00.000 20:10:10.500 10:00:00.000])", "[10:00:00.000 20:10:10.500]");
+    TEST_ASSERT_EQ("(distinct [1 1 1 2 3 4 2 3 4 2 3 4])", "[1 2 3 4]");
+    TEST_ASSERT_EQ("(distinct [2024.01.01D10:00:00.000000000 2024.01.01D10:00:00.000000000])",
+                   "[2024.01.01D10:00:00.000000000]");
+    TEST_ASSERT_EQ("(distinct ['a 'b 'ab 'aa 'a 'aa])", "['a 'b 'ab 'aa]");
+    TEST_ASSERT_EQ("(set l (guid 2)) (set l (concat l l)) (count (distinct l))", "2");
+    TEST_ASSERT_EQ("(distinct (list [3i 3i] 2i [3i 3i] 2i))", "(list 2i [3i 3i])");
+
+    PASS();
+}

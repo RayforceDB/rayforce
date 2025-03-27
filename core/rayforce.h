@@ -310,7 +310,7 @@ extern i64_t find_sym(obj_p obj, lit_p str);      // find interned string in a s
 extern obj_p cast_obj(i8_t type, obj_p obj);
 
 // Comparison
-extern i32_t cmp_obj(obj_p a, obj_p b);
+extern i64_t cmp_obj(obj_p a, obj_p b);
 
 // Serialization
 extern obj_p ser_obj(obj_p obj);

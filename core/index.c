@@ -302,7 +302,7 @@ index_scope_t index_scope(i64_t values[], i64_t indices[], u64_t len) {
     return (index_scope_t){min, max, (u64_t)(max - min + 1)};
 }
 
-obj_p index_distinct_i8(i8_t values[], u64_t len, b8_t term) {
+obj_p index_distinct_i8(i8_t values[], u64_t len) {
     u64_t i, j, range;
     i8_t min, *out;
     obj_p vec;
@@ -325,11 +325,70 @@ obj_p index_distinct_i8(i8_t values[], u64_t len, b8_t term) {
             out[j++] = i + min;
     }
 
-    if (term)
-        out[j++] = 0;
+    resize_obj(&vec, j);
+    vec->attrs |= ATTR_DISTINCT;
+
+    return vec;
+}
+
+obj_p index_distinct_i16(i16_t values[], u64_t len) {
+    u64_t i, j, range;
+    i16_t min, *out;
+    obj_p vec;
+
+    min = -32768;
+    range = 65536;
+
+    vec = I16(range);
+    out = AS_I16(vec);
+    memset(out, 0, sizeof(i16_t) * range);
+
+    for (i = 0; i < len; i++)
+        // TODO need bench // if (out[values[i] - min] == 0)
+        out[values[i] - min] = 1;
+
+    // compact keys
+    for (i = 0, j = 0; i < range; i++) {
+        if (out[i])
+            out[j++] = i + min;
+    }
 
     resize_obj(&vec, j);
     vec->attrs |= ATTR_DISTINCT;
+
+    return vec;
+}
+
+obj_p index_distinct_i32(i32_t values[], u64_t len) {
+    u64_t i, j;
+    i64_t p, k, *tmp;
+    i32_t *out;
+    obj_p vec, set;
+
+    // TODO needs improvement
+    set = ht_oa_create(len, -1);
+
+    for (i = 0; i < len; i++) {
+        k = i32_to_i64(values[i]);
+        p = ht_oa_tab_next(&set, k);
+        tmp = AS_I64(AS_LIST(set)[0]);
+        if (tmp[p] == NULL_I64)
+            tmp[p] = k;
+    }
+
+    tmp = AS_I64(AS_LIST(set)[0]);
+    len = AS_LIST(set)[0]->len;
+    vec = I32(len);
+    out = AS_I32(vec);
+
+    for (i = 0, j = 0; i < len; i++) {
+        if (tmp[i] != NULL_I64)
+            out[j++] = (i32_t)tmp[i];
+    }
+
+    vec->attrs |= ATTR_DISTINCT;
+    resize_obj(&vec, j);
+    drop_obj(set);
 
     return vec;
 }
@@ -347,7 +406,8 @@ obj_p index_distinct_i64(i64_t values[], u64_t len) {
         memset(out, 0, sizeof(i64_t) * scope.range);
 
         for (i = 0; i < len; i++)
-            out[values[i] - scope.min]++;
+            // TODO need bench // if (out[values[i] - scope.min] == 0)
+            out[values[i] - scope.min] = 1;
 
         // compact keys
         for (i = 0, j = 0; i < scope.range; i++) {

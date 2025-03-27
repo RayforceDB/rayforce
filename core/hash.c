@@ -253,6 +253,12 @@ u64_t hash_index_obj(obj_p obj) {
     u64_t hash, len, i;
 
     switch (obj->type) {
+        case -TYPE_I16:
+            return (u64_t)obj->i16;
+        case -TYPE_I32:
+        case -TYPE_DATE:
+        case -TYPE_TIME:
+            return (u64_t)obj->i32;
         case -TYPE_I64:
         case -TYPE_SYMBOL:
         case -TYPE_TIMESTAMP:
@@ -263,12 +269,29 @@ u64_t hash_index_obj(obj_p obj) {
             return hash_index_u64(*(u64_t *)AS_GUID(obj), *((u64_t *)AS_GUID(obj) + 1));
         case TYPE_C8:
             return str_hash(AS_C8(obj), obj->len);
+        case TYPE_I16:
+            len = obj->len;
+            for (i = 0, hash = 0xcbf29ce484222325ull; i < len; i++)
+                hash = hash_index_u64((u64_t)AS_I16(obj)[i], hash);
+            return hash;
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            len = obj->len;
+            for (i = 0, hash = 0xcbf29ce484222325ull; i < len; i++)
+                hash = hash_index_u64((u64_t)AS_I32(obj)[i], hash);
+            return hash;
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
             len = obj->len;
             for (i = 0, hash = 0xcbf29ce484222325ull; i < len; i++)
                 hash = hash_index_u64((u64_t)AS_I64(obj)[i], hash);
+            return hash;
+        case TYPE_F64:
+            len = obj->len;
+            for (i = 0, hash = 0xcbf29ce484222325ull; i < len; i++)
+                hash = hash_index_u64((u64_t)AS_F64(obj)[i], hash);
             return hash;
         default:
             PANIC("hash: unsupported type: %d", obj->type);

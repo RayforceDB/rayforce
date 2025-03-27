@@ -1718,7 +1718,7 @@ b8_t is_null(obj_p obj) {
            (obj->type == -TYPE_TIMESTAMP && obj->i64 == NULL_I64) || (obj->type == -TYPE_C8 && obj->c8 == '\0');
 }
 
-i32_t cmp_obj(obj_p a, obj_p b) {
+i64_t cmp_obj(obj_p a, obj_p b) {
     i64_t i, l, d;
 
     if (a == b)
@@ -1729,24 +1729,48 @@ i32_t cmp_obj(obj_p a, obj_p b) {
 
     switch (a->type) {
         case -TYPE_B8:
-            return a->b8 - b->b8;
+            return (i64_t)a->b8 - (i64_t)b->b8;
         case -TYPE_U8:
         case -TYPE_C8:
-            return (i32_t)a->u8 - (i32_t)b->u8;
-        case -TYPE_F64:
-            return (ops_is_nan(a->f64) && ops_is_nan(b->f64))   ? 0
-                   : (ops_is_nan(a->f64) || ops_is_nan(b->f64)) ? 1
-                   : (ABSF64(a->f64 - b->f64) < 1e-16)          ? 0
-                                                                : 1;
-
-        case -TYPE_I64:
+            return (i64_t)a->u8 - (i32_t)b->u8;
         case -TYPE_I32:
+            return (i64_t)a->i32 - (i64_t)b->i32;
+        case -TYPE_I64:
         case -TYPE_SYMBOL:
         case -TYPE_TIMESTAMP:
         case TYPE_UNARY:
         case TYPE_BINARY:
         case TYPE_VARY:
             return a->i64 - b->i64;
+        case -TYPE_F64:
+            return (ops_is_nan(a->f64) && ops_is_nan(b->f64))   ? 0
+                   : (ops_is_nan(a->f64) || ops_is_nan(b->f64)) ? 1
+                   : (ABSF64(a->f64 - b->f64) < 1e-16)          ? 0
+                                                                : 1;
+        case TYPE_I16:
+            if (a->len != b->len)
+                return a->len - b->len;
+
+            l = a->len;
+            for (i = 0; i < l; i++) {
+                d = (i64_t)(AS_I16(a)[i] - AS_I16(b)[i]);
+                if (d != 0)
+                    return d;
+            }
+            return 0;
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            if (a->len != b->len)
+                return a->len - b->len;
+
+            l = a->len;
+            for (i = 0; i < l; i++) {
+                d = (i64_t)(AS_I32(a)[i] - AS_I32(b)[i]);
+                if (d != 0)
+                    return d;
+            }
+            return 0;
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:

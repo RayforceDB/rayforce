@@ -606,7 +606,19 @@ obj_p ray_distinct(obj_p x) {
         case TYPE_U8:
         case TYPE_C8:
             l = ops_count(x);
-            res = index_distinct_i8((i8_t *)AS_U8(x), l, x->type == TYPE_C8);
+            res = index_distinct_i8((i8_t *)AS_U8(x), l);
+            res->type = x->type;
+            return res;
+        case TYPE_I16:
+            l = x->len;
+            res = index_distinct_i16(AS_I16(x), l);
+            res->type = x->type;
+            return res;
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            l = x->len;
+            res = index_distinct_i32(AS_I32(x), l);
             res->type = x->type;
             return res;
         case TYPE_I64:
