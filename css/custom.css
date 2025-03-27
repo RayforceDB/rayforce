@@ -1,0 +1,135 @@
+/* custom.css */
+.flex-container {
+    display: flex;
+    justify-content: flex-start;
+}
+
+.text-item {
+    width: 20%;
+    padding-right: 2%;
+}
+
+.player-item {
+    width: 78%;
+}
+
+.admonition.seealso {
+    background-color: #e3f2fd;
+}
+
+.ray-dense td,
+.ray-dense th {
+    font-size: 85%;
+    padding: 0 .4em;
+}
+
+.ray-dense th {
+    border-bottom: 1px solid rgba(0, 0, 0, .3);
+    opacity: .7;
+    text-align: left;
+}
+
+.ray-dense thead {
+    border-bottom: 1px solid #aaa;
+}
+
+/* Modern tech styling inspired by Milvus */
+:root>* {
+    --md-code-hl-number-color: #2196f3;
+    /* Blue - numbers */
+    --md-code-hl-special-color: #1976d2;
+    /* Darker blue - special */
+    --md-code-hl-function-color: #0288d1;
+    /* Another blue shade - functions */
+    --md-code-hl-constant-color: #03a9f4;
+    /* Light blue - constants */
+    --md-code-hl-keyword-color: #1565c0;
+    /* Deep blue - keywords */
+    --md-code-hl-string-color: #0277bd;
+    /* Another blue - strings */
+    --md-code-hl-name-color: #0091ea;
+    /* Bright blue - names */
+    --md-code-hl-operator-color: #0d47a1;
+    /* Very deep blue - operators */
+    --md-code-hl-punctuation-color: #757575;
+    /* Grey - punctuation */
+    --md-code-hl-comment-color: #9e9e9e;
+    /* Light grey - comments */
+    --md-code-hl-generic-color: #2962ff;
+    /* Bright blue - generic */
+}
+
+/* Header styling */
+.md-header {
+    background-color: #1565c0;
+    /* Milvus-style blue */
+    color: #ffffff;
+}
+
+.md-tabs {
+    background-color: #1976d2;
+    /* Slightly lighter blue */
+}
+
+/* Search box styling */
+.md-search__input {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.md-search__input:hover {
+    background-color: rgba(255, 255, 255, 0.15);
+}
+
+/* Code block styling */
+.highlight {
+    background-color: #fafafa;
+}
+
+/* Dark mode adjustments */
+[data-md-color-scheme="slate"] {
+    --md-default-bg-color: #171717;
+    /* Very dark grey like Milvus */
+    --md-code-bg-color: #212121;
+    /* Slightly lighter */
+    --md-code-hl-background-color: #262626;
+    /* For highlighted code */
+}
+
+/* Better admonition styling */
+.md-typeset .admonition {
+    border-left: 4px solid var(--md-primary-fg-color);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, .1);
+}
+
+/* Navigation refinements */
+.md-nav__item .md-nav__link--active {
+    color: var(--md-primary-fg-color);
+    font-weight: bold;
+}
+
+/* Table improvements */
+.md-typeset table:not([class]) th {
+    background-color: var(--md-primary-fg-color);
+    color: var(--md-primary-bg-color);
+}
+
+/* Improved table density */
+.md-typeset table:not([class]) {
+    font-size: 0.75rem;
+}
+
+/* REPL styling */
+.language-clj {
+    font-size: 0.9em;
+}
+
+.asciinema-player,
+.asciinema-player * {
+    font-size: 12px !important;
+    display: block;
+    overflow-x: auto;
+    font-family: 'Roboto Mono', 'Source Code Pro', 'SF Mono', 'SFMono-Regular', ui-monospace, 'DejaVu Sans Mono', 'Menlo',
+        'Consolas', 'Roboto', monospace;
+    white-space-collapse: preserve;
+    text-wrap: nowrap;
+}

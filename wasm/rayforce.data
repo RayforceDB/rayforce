@@ -1,0 +1,62 @@
+;; Author: 0x0L 
+(set fib (fn [x]
+    (if (< x 2) 
+        1
+        (+ (self (- x 1)) (self (- x 2)))
+        ))
+)
+
+;; :t (fib 35)
+;; (exit 0)
+(set t (table [sym price volume] (list [aapl vod goog] [102 99 203] [500 400 900])));; Example updating vectors
+(set m (til 10))
+(set n m)
+(alter 'n set 0 100)
+(alter 'n set [4 5] 99)
+(set k (guid 6))
+(alter 'k set [4 5 1] (guid 3))
+
+;; Generic lists
+(set l (list [1 2] "asd" 66))
+(alter 'l set [0 2] 192)
+
+;; And tables
+(set t (table [sym price volume tape] (list [aapl vod goog] [102 99 203] [500 400 900] (list "A" "B" "C"))))
+;;(alter 't + [price volume] 12.7)
+
+(set a (table [a b c d] (list (til 10) (til 10) (til 10) (til 10))))
+(set b (table [a b c] (list (+ 8 (til 5)) (+ 8 (til 5)) (+ 10 (til 5)))))
+(upsert a 2 b)
+
+(insert a (list 67 77 8 9))
+
+(set tab (table [sym price volume tape] (list [aapl vod goog aapl aapl vod mod] 
+   [102 99 203 102 103 10 3] [500 400 900 10 30 40 78] (list "A" "B" "C" "D" "E" "F" "G"))))
+
+;; (load "examples/update.rfl") (update {price: (+ 1 price) from: tab})
+;; (load "examples/update.rfl") (update {price: ((fn [x] (+ x 11)) price) from: tab where: (== volume 78)})
+;; (load "examples/update.rfl") (update {price: 0 from: tab where: (== volume 78)})
+;; (load "examples/update.rfl") (update {price: 0 from: 'tab where: (== volume 78)})
+;; (load "examples/update.rfl") (update {price: 0 from: tab by: sym where: (> volume 400)})(set n 10000000)
+
+(set x (table [a b c d] 
+    (list (take n (list "aaaaaa" "bbbbbbbbbb" "cc" "dd")) (take n [I J K]) (til n) (til n))))
+
+(set y (table [a b c d e] 
+    (list (take n (list "aa" "bb" "cc" "dd" "ee")) (take n [I J K]) (til n) (til n) (til n))))
+
+;; (lj [a] x y)
+;; (lj [a b] x y)(set n 10000000)
+;; (set l (rand 10000000 1000000000000))
+;; (set t (table [a b c] (list [1 2 3] [AAPL MSFT IBM] (list "aa" "bb" "cc"))))
+
+(set t (table [OrderId Symbol Price Size Tape Timestamp] 
+    (list (take n (guid 1000000))
+          (take n [AAPL GOOG MSFT IBM AMZN FB BABA]) 
+          (as 'F64 (til n)) 
+          (take n (+ 1 (til 3)))
+          (map (fn [x] (as 'String x)) (take n (til 10)))
+          (as 'Timestamp (til n)) 
+    ))
+)
+            
