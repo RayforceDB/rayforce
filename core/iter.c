@@ -827,3 +827,158 @@ obj_p ray_fold(obj_p *x, u64_t n) {
             THROW(ERR_TYPE, "'fold': unsupported function type: '%s", type_name(f->type));
     }
 }
+
+obj_p ray_fold_left(obj_p *x, u64_t n) {
+    u64_t i, j, l;
+    obj_p f, v, x1, x2;
+
+    if (n < 2)
+        return LIST(0);
+
+    f = x[0];
+    x++;
+    n--;
+
+    switch (f->type) {
+        case TYPE_UNARY:
+            if (n != 1)
+                THROW(ERR_LENGTH, "'fold-left': unary call with wrong arguments count");
+            return unary_call(f, x[0]);
+        case TYPE_BINARY:
+            if (n < 2)
+                THROW(ERR_LENGTH, "'fold-left': binary call with wrong arguments count");
+
+            l = ops_count(x[0]);
+            if (l == 0)
+                return clone_obj(x[1]);
+
+            v = clone_obj(x[1]);  // Use rightmost argument as initial value
+            for (i = 0; i < l; i++) {
+                x1 = at_idx(x[0], i);        // Current element from leftmost argument
+                x2 = v;                      // Result of previous iteration
+                v = binary_call(f, x1, x2);  // Pass current element as first argument
+                drop_obj(x1);
+                drop_obj(x2);
+
+                if (IS_ERROR(v))
+                    return v;
+            }
+
+            return v;
+        case TYPE_VARY:
+            return vary_call(f, x, n);
+        case TYPE_LAMBDA:
+            if (n < 2 || AS_LAMBDA(f)->args->len != n)
+                THROW(ERR_LENGTH, "'fold-left': lambda call with wrong arguments count");
+
+            l = ops_count(x[0]);
+            if (l == 0)
+                return clone_obj(x[1]);
+
+            v = clone_obj(x[1]);  // Use rightmost argument as initial value
+            for (i = 0; i < l; i++) {
+                // Push current element from the leftmost argument first
+                x1 = at_idx(x[0], i);
+                stack_push(x1);
+                // Push result of previous iteration as second argument
+                stack_push(v);
+                // Push all other arguments in between
+                for (j = 1; j < n - 1; j++) {
+                    stack_push(clone_obj(x[j]));
+                }
+
+                v = call(f, n);
+
+                // Cleanup stack
+                for (j = 0; j < n; j++) {
+                    drop_obj(stack_pop());
+                }
+
+                if (IS_ERROR(v))
+                    return v;
+            }
+
+            return v;
+        default:
+            THROW(ERR_TYPE, "'fold-left': unsupported function type: '%s", type_name(f->type));
+    }
+}
+
+obj_p ray_fold_right(obj_p *x, u64_t n) {
+    u64_t i, j, l;
+    obj_p f, v, x1, x2;
+
+    if (n < 2)
+        return LIST(0);
+
+    f = x[0];
+    x++;
+    n--;
+
+    switch (f->type) {
+        case TYPE_UNARY:
+            if (n != 1)
+                THROW(ERR_LENGTH, "'fold-right': unary call with wrong arguments count");
+            return unary_call(f, x[0]);
+        case TYPE_BINARY:
+            if (n < 2)
+                THROW(ERR_LENGTH, "'fold-right': binary call with wrong arguments count");
+
+            l = ops_count(x[n - 1]);  // Last argument is the one we iterate over
+            if (l == 0)
+                return clone_obj(x[0]);
+
+            v = clone_obj(x[0]);
+            for (i = 0; i < l; i++) {
+                x1 = at_idx(x[n - 1], i);
+                x2 = v;
+                v = binary_call(f, x1, x2);
+                drop_obj(x1);
+                drop_obj(x2);
+
+                if (IS_ERROR(v))
+                    return v;
+            }
+
+            return v;
+        case TYPE_VARY:
+            return vary_call(f, x, n);
+        case TYPE_LAMBDA:
+            if (n < 2 || AS_LAMBDA(f)->args->len != n)
+                THROW(ERR_LENGTH, "'fold-right': lambda call with wrong arguments count");
+
+            l = ops_count(x[n - 1]);  // Last argument is the one we iterate over
+            if (l == 0)
+                return clone_obj(x[0]);
+
+            v = clone_obj(x[0]);
+            for (i = 0; i < l; i++) {
+                // Push all arguments except the last one (which we iterate over)
+                for (j = 0; j < n - 1; j++) {
+                    if (j == 0) {
+                        stack_push(v);  // Push accumulator
+                    } else {
+                        x1 = at_idx(x[j], i);
+                        stack_push(x1);
+                    }
+                }
+                // Push current element from the last argument
+                x1 = at_idx(x[n - 1], i);
+                stack_push(x1);
+
+                v = call(f, n);
+
+                // Cleanup stack
+                for (j = 0; j < n; j++) {
+                    drop_obj(stack_pop());
+                }
+
+                if (IS_ERROR(v))
+                    return v;
+            }
+
+            return v;
+        default:
+            THROW(ERR_TYPE, "'fold-right': unsupported function type: '%s", type_name(f->type));
+    }
+}
