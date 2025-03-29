@@ -941,7 +941,7 @@ obj_p ray_fold(obj_p *x, u64_t n) {
 
 obj_p ray_fold_left(obj_p *x, u64_t n) {
     u64_t i, j, l;
-    obj_p f, v, x1, x2, res;
+    obj_p f, v, x1, x2;
 
     if (n < 2)
         return LIST(0);

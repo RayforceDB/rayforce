@@ -404,9 +404,6 @@ obj_p ray_concat(obj_p x, obj_p y) {
     i64_t i, xl, yl;
     obj_p vec, kx, kxy, ix, iy, dx, dy;
 
-    if (!x || !y)
-        return vn_list(2, clone_obj(x), clone_obj(y));
-
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(-TYPE_B8, -TYPE_B8):
             vec = B8(2);
