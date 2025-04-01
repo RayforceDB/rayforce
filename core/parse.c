@@ -1210,8 +1210,13 @@ obj_p parse_do(parser_t *parser) {
         tok = parser_advance(parser);
 
         if (IS_ERROR(tok)) {
-            drop_obj(car);
-            drop_obj(lst);
+            if (lst == NULL_OBJ) {
+                // Only free car if it's not part of a list
+                drop_obj(car);
+            } else {
+                // If we have a list, just free the list (which will free car)
+                drop_obj(lst);
+            }
             return tok;
         }
 

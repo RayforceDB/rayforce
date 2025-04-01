@@ -674,9 +674,6 @@ obj_p ray_in(obj_p x, obj_p y) {
             return b8(0);
     }
 
-    if (!IS_VECTOR(x))
-        return b8(find_obj_idx(y, x) != NULL_I64);
-
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(TYPE_U8, TYPE_U8):
         case MTYPE2(TYPE_B8, TYPE_B8):
