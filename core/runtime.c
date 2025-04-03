@@ -134,7 +134,7 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
         // thread count
         arg = runtime_get_arg("cores");
         if (!is_null(arg)) {
-            n = atoi(AS_C8(arg));
+            n = i64_from_str(AS_C8(arg), arg->len);
             if (n > 1)
                 __RUNTIME->pool = pool_create(n - 1);  // -1 for the main thread
 
@@ -148,7 +148,7 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
 
         arg = runtime_get_arg("port");
         if (!is_null(arg)) {
-            __RUNTIME->addr.port = atoi(AS_C8(arg));
+            __RUNTIME->addr.port = i64_from_str(AS_C8(arg), arg->len);
             drop_obj(arg);
         }
 
@@ -157,7 +157,7 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
         // timeit
         arg = runtime_get_arg("timeit");
         if (!is_null(arg)) {
-            n = atoi(AS_C8(arg));
+            n = i64_from_str(AS_C8(arg), arg->len);
             drop_obj(arg);
             timeit_activate(n);
         }

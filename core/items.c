@@ -671,17 +671,7 @@ obj_p ray_in(obj_p x, obj_p y) {
         case MTYPE2(TYPE_U8, TYPE_U8):
         case MTYPE2(TYPE_B8, TYPE_B8):
         case MTYPE2(TYPE_C8, TYPE_C8):
-            range = 256;
-            set = B8(range);
-            memset(AS_U8(set), 0, range);
-            for (i = 0; i < (i64_t)y->len; i++)
-                AS_B8(set)[AS_U8(y)[i]] = 1;
-            vec = B8(x->len);
-            for (i = 0; i < (i64_t)x->len; i++)
-                AS_B8(vec)[i] = AS_B8(set)[AS_U8(x)[i]];
-            drop_obj(set);
-            return vec;
-
+            return index_in_i8_i8(AS_I8(x), x->len, AS_I8(y), y->len);
         case MTYPE2(TYPE_I16, TYPE_I16):
         case MTYPE2(TYPE_I32, TYPE_I16):
         case MTYPE2(TYPE_I64, TYPE_I16):
