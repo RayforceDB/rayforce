@@ -204,7 +204,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "remove",              TYPE_BINARY,   FN_NONE,                   ray_remove);
     REGISTER_FN(functions,  "filter",              TYPE_BINARY,   FN_NONE,                   ray_filter);
     REGISTER_FN(functions,  "take",                TYPE_BINARY,   FN_NONE,                   ray_take);
-    REGISTER_FN(functions,  "in",                  TYPE_BINARY,   FN_NONE,                   ray_in);
+    REGISTER_FN(functions,  "in",                  TYPE_BINARY,   FN_LEFT_ATOMIC,            ray_in);
     REGISTER_FN(functions,  "within",              TYPE_BINARY,   FN_NONE,                   ray_within);
     REGISTER_FN(functions,  "sect",                TYPE_BINARY,   FN_ATOMIC,                 ray_sect);
     REGISTER_FN(functions,  "except",              TYPE_BINARY,   FN_NONE,                   ray_except);

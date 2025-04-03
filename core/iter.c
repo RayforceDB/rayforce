@@ -135,43 +135,33 @@ obj_p map_binary_left(obj_p f, obj_p x, obj_p y) {
     obj_p res, item, a;
 
     switch (x->type) {
+        case TYPE_C8:
+        case TYPE_U8:
+        case TYPE_B8:
+        case TYPE_I16:
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+        case TYPE_I64:
+        case TYPE_SYMBOL:
+        case TYPE_TIMESTAMP:
+        case TYPE_F64:
+        case TYPE_GUID:
         case TYPE_LIST:
-            l = ops_count(x);
-            a = AS_LIST(x)[0];
-            item = map_binary_left(f, a, y);
-
-            if (IS_ERROR(item))
-                return item;
-
-            res = item->type < 0 ? vector(item->type, l) : LIST(l);
-
-            ins_obj(&res, 0, item);
-
-            for (i = 1; i < l; i++) {
-                a = AS_LIST(x)[i];
-                item = map_binary_left(f, a, y);
-
-                if (IS_ERROR(item)) {
-                    res->len = i;
-                    drop_obj(res);
-                    return item;
-                }
-
-                ins_obj(&res, i, item);
-            }
-
-            return res;
-
         case TYPE_MAPLIST:
             l = ops_count(x);
+
+            if (l == 0)
+                return null(x->type);
+
             a = at_idx(x, 0);
             item = map_binary_left(f, a, y);
             drop_obj(a);
 
-            if (item->type == TYPE_ERROR)
+            if (IS_ERROR(item))
                 return item;
 
-            res = item->type < 0 ? vector(item->type, l) : LIST(l);
+            res = vector(item->type, l);
 
             ins_obj(&res, 0, item);
 
@@ -190,7 +180,6 @@ obj_p map_binary_left(obj_p f, obj_p x, obj_p y) {
             }
 
             return res;
-
         default:
             fn = (binary_f)f->i64;
             return fn(x, y);
@@ -200,55 +189,45 @@ obj_p map_binary_left(obj_p f, obj_p x, obj_p y) {
 obj_p map_binary_right(obj_p f, obj_p x, obj_p y) {
     u64_t i, l;
     binary_f fn;
-    obj_p res, item, b;
+    obj_p res, item, a;
 
     switch (y->type) {
+        case TYPE_C8:
+        case TYPE_U8:
+        case TYPE_B8:
+        case TYPE_I16:
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+        case TYPE_I64:
+        case TYPE_SYMBOL:
+        case TYPE_TIMESTAMP:
+        case TYPE_F64:
+        case TYPE_GUID:
         case TYPE_LIST:
-            l = ops_count(y);
-            b = AS_LIST(y)[0];
-            item = map_binary_right(f, x, b);
-
-            if (IS_ERROR(item))
-                return item;
-
-            res = item->type < 0 ? vector(item->type, l) : LIST(l);
-
-            ins_obj(&res, 0, item);
-
-            for (i = 1; i < l; i++) {
-                b = AS_LIST(y)[i];
-                item = map_binary_right(f, x, b);
-
-                if (IS_ERROR(item)) {
-                    res->len = i;
-                    drop_obj(res);
-                    return item;
-                }
-
-                ins_obj(&res, i, item);
-            }
-
-            return res;
-
         case TYPE_MAPLIST:
             l = ops_count(y);
-            b = at_idx(y, 0);
-            item = map_binary_right(f, x, b);
-            drop_obj(b);
+
+            if (l == 0)
+                return null(y->type);
+
+            a = at_idx(y, 0);
+            item = map_binary_right(f, x, a);
+            drop_obj(a);
 
             if (IS_ERROR(item))
                 return item;
 
-            res = item->type < 0 ? vector(item->type, l) : LIST(l);
+            res = vector(item->type, l);
 
             ins_obj(&res, 0, item);
 
             for (i = 1; i < l; i++) {
-                b = at_idx(y, i);
-                item = map_binary_right(f, x, b);
-                drop_obj(b);
+                a = at_idx(y, i);
+                item = map_binary_right(f, x, a);
+                drop_obj(a);
 
-                if (item->type == TYPE_ERROR) {
+                if (IS_ERROR(item)) {
                     res->len = i;
                     drop_obj(res);
                     return item;

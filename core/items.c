@@ -678,12 +678,6 @@ obj_p ray_in(obj_p x, obj_p y) {
     if (!IS_VECTOR(x))
         return b8(find_obj_idx(y, x) != NULL_I64);
 
-    // if (!IS_VECTOR(y)) {
-    //     vec = LIST(1);
-    //     AS_LIST(vec)[0] = y;
-    //     return ray_in(x, vec);
-    // }
-
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(TYPE_U8, TYPE_U8):
         case MTYPE2(TYPE_B8, TYPE_B8):
