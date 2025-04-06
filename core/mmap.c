@@ -31,25 +31,17 @@ raw_p mmap_stack(u64_t size) { return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_
 
 raw_p mmap_alloc(u64_t size) { return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); }
 
-raw_p mmap_file(i64_t fd, raw_p addr, u64_t size) {
+raw_p mmap_file(i64_t fd, raw_p addr, u64_t size, i64_t offset) {
     HANDLE hMapping;
     raw_p ptr;
 
     hMapping = CreateFileMapping((HANDLE)fd, NULL, PAGE_READWRITE, 0, size, NULL);
 
     if (hMapping == NULL) {
-        fprintf(stderr, "CreateFileMapping failed: %lu\n", GetLastError());
         return NULL;
     }
 
-    ptr = MapViewOfFile(hMapping, FILE_MAP_ALL_ACCESS, 0, 0, size);
-    if (ptr == NULL) {
-        fprintf(stderr, "MapViewOfFile failed: %lu\n", GetLastError());
-        CloseHandle(hMapping);
-        return NULL;
-    }
-
-    // Close the handle to the file mapping object (the mapping remains valid)
+    ptr = MapViewOfFile(hMapping, FILE_MAP_ALL_ACCESS, (DWORD)(offset >> 32), (DWORD)(offset & 0xFFFFFFFF), size);
     CloseHandle(hMapping);
 
     return ptr;
