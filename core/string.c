@@ -370,7 +370,7 @@ b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len) {
                     return B8_FALSE;  // unmatched '['
                 if ((match && inv) || (!match && !inv)) {
                     // Mismatch - backtrack to last '*' if possible
-                    if (last_star_pat_pos != UINT64_MAX) {
+                    if (last_star_pat_pos != MAX_U64) {
                         pat_pos = last_star_pat_pos + 1;
                         str_pos = ++last_star_str_pos;
                     } else {
@@ -385,7 +385,7 @@ b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len) {
             default:
                 if (str[str_pos] != pat[pat_pos]) {
                     // Mismatch - backtrack to last '*' if possible
-                    if (last_star_pat_pos != UINT64_MAX) {
+                    if (last_star_pat_pos != MAX_U64) {
                         pat_pos = last_star_pat_pos + 1;
                         str_pos = ++last_star_str_pos;
                     } else {
