@@ -664,6 +664,9 @@ obj_p ray_in(obj_p x, obj_p y) {
     i64_t i, yl;
     obj_p v, vec;
 
+    if (IS_ATOM(x) && IS_ATOM(y))
+        return b8(cmp_obj(x, y) == 0);
+
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(TYPE_U8, TYPE_U8):
         case MTYPE2(TYPE_B8, TYPE_B8):
@@ -716,34 +719,32 @@ obj_p ray_in(obj_p x, obj_p y) {
                     return b8(0);
             }
 
+            if (x->type == TYPE_LIST) {
+                vec = LIST(x->len);
+                for (i = 0; i < (i64_t)x->len; i++)
+                    AS_LIST(vec)[i] = ray_in(AS_LIST(x)[i], y);
+                return vec;
+            }
+
+            if (IS_VECTOR(x) || !IS_VECTOR(y))
+                return map_binary_left_fn(ray_in, 0, x, y);
+
             if (!IS_VECTOR(x))
                 return b8(find_obj_idx(y, x) != NULL_I64);
 
-            if (!IS_VECTOR(y))
-                return map_binary_left_fn(ray_in, 0, x, y);
-
             if (y->type == TYPE_LIST) {
                 yl = y->len;
-                vec = B8(yl);
 
                 for (i = 0; i < yl; i++) {
                     v = ray_eq(x, AS_LIST(y)[i]);
-                    if (IS_ERROR(v)) {
-                        drop_obj(vec);
-                        return v;
+                    if (v->type == -TYPE_B8 && v->b8 == B8_TRUE) {
+                        drop_obj(v);
+                        return b8(B8_TRUE);
                     }
-
-                    // if (v->type != -TYPE_B8) {
-                    //     drop_obj(v);
-                    //     drop_obj(vec);
-                    //     THROW(ERR_TYPE, "in: returned vector instead of atom");
-                    // }
-
-                    AS_B8(vec)[i] = v->b8;
                     drop_obj(v);
                 }
 
-                return vec;
+                return b8(B8_FALSE);
             }
 
             THROW(ERR_TYPE, "in: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
