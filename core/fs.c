@@ -35,6 +35,8 @@
 i64_t fs_fopen(lit_p path, i64_t attrs) {
     obj_p s;
     str_p tmp_path, p, slash;
+    DWORD flags = FILE_ATTRIBUTE_NORMAL;
+    DWORD disposition = OPEN_ALWAYS;
 
     s = cstring_from_str(path, strlen(path));
     tmp_path = AS_C8(s);
@@ -49,8 +51,12 @@ i64_t fs_fopen(lit_p path, i64_t attrs) {
 
     drop_obj(s);
 
-    return (i64_t)CreateFile(path, attrs, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
-                             NULL);
+    // Handle append flag
+    if (attrs & ATTR_APPEND) {
+        flags |= FILE_FLAG_APPEND_DATA;
+    }
+
+    return (i64_t)CreateFile(path, attrs, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, disposition, flags, NULL);
 }
 
 i64_t fs_fdelete(lit_p path) {

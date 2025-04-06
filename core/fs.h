@@ -32,6 +32,7 @@
 #define ATTR_RDWR (ATTR_RDONLY | ATTR_WRONLY)
 #define ATTR_CREAT 0
 #define ATTR_TRUNC 0
+#define ATTR_APPEND FILE_APPEND_DATA
 #else
 #include <stdint.h>
 #include <unistd.h>
