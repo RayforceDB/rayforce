@@ -114,8 +114,8 @@ coverage: $(TESTS_OBJECTS) coverage-lib
 	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LFLAGS)
 	lcov --directory . --zerocounters
 	./$(TARGET).test
-	lcov --capture --directory . --output-file coverage.info
-	lcov --remove coverage.info '/usr/*' 'tests/*' --output-file coverage.info
+	lcov --capture --directory . --output-file coverage.info --ignore-errors unused
+	lcov --remove coverage.info '/usr/*' 'tests/*' --output-file coverage.info --ignore-errors unused
 	lcov --list coverage.info
 	genhtml coverage.info --output-directory coverage_report
 	@echo "Coverage report generated in coverage_report/index.html"
