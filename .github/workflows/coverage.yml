@@ -39,9 +39,12 @@ jobs:
     - name: Generate coverage badge
       if: github.ref == 'refs/heads/main'
       run: |
-        COVERAGE=$(lcov --summary coverage.info | grep "lines" | awk '{print $4}' | cut -d'%' -f1)
+        if [ -f coverage.info ]; then
+          COVERAGE=$(lcov --summary coverage.info | grep "lines" | awk '{print $4}' | cut -d'%' -f1)
+        else
+          COVERAGE=0
+        fi
         echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
-        echo "::set-output name=coverage::$COVERAGE"
         
     - name: Update coverage badge
       if: github.ref == 'refs/heads/main'
