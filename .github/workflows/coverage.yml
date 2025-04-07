@@ -7,19 +7,12 @@ on:
     branches: [ master ]
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
-
 jobs:
   coverage:
     runs-on: ubuntu-latest
     
     steps:
     - uses: actions/checkout@v4
-      with:
-        ref: coverage-badge-update
-        token: ${{ secrets.GITHUB_TOKEN }}
     
     - name: Install dependencies
       run: |
@@ -36,62 +29,15 @@ jobs:
         
     - name: Create basic coverage report
       run: |
-        echo "<html><body><h1>Coverage Report</h1><p>No tests available yet.</p></body></html>" > coverage_report/index.html
+        if [ -f coverage.info ]; then
+          genhtml coverage.info -o coverage_report
+        else
+          echo "<html><body><h1>Coverage Report</h1><p>No tests available yet.</p></body></html>" > coverage_report/index.html
+        fi
         
     - name: Upload coverage report
       uses: actions/upload-artifact@v4
       with:
         name: coverage-report
         path: coverage_report/
-        
-    - name: Update README badge
-      run: |
-        if [ -f coverage.info ]; then
-          # Extract coverage percentage using a more robust method
-          COVERAGE=$(lcov --summary coverage.info | grep "lines" | sed 's/.*: \([0-9.]*\)%.*/\1/' | cut -d. -f1)
-          if [ -z "$COVERAGE" ]; then
-            COVERAGE=0
-          fi
-        else
-          COVERAGE=0
-        fi
-        
-        if [ $COVERAGE -gt 80 ]; then
-          COLOR="success"
-        elif [ $COVERAGE -gt 60 ]; then
-          COLOR="warning"
-        else
-          COLOR="critical"
-        fi
-        
-        BADGE_URL="https://img.shields.io/badge/coverage-$COVERAGE%25-$COLOR"
-        ARTIFACT_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        
-        # Update README.md if it exists
-        if [ -f README.md ]; then
-          # Check if badge already exists
-          if grep -q "!\[coverage\]" README.md; then
-            # Replace existing badge
-            sed -i "s|!\[coverage\].*|![coverage]($BADGE_URL)|" README.md
-          else
-            # Add badge at the top of the file
-            sed -i "1i ![coverage]($BADGE_URL)" README.md
-          fi
-          
-          # Commit changes
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add README.md
-          git commit -m "Update coverage badge" || echo "No changes to commit"
-          git push
-        fi
-        
-    - name: Create Pull Request
-      uses: peter-evans/create-pull-request@v5
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        branch: coverage-badge-update
-        base: master
-        title: 'Update coverage badge'
-        body: 'Automatically update coverage badge'
-        delete-branch: true 
+        retention-days: 30 
