@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url }}/tests_report/
     steps:
     - uses: actions/checkout@v4
     
@@ -28,23 +28,14 @@ jobs:
         
     - name: Run tests and generate report
       run: |
-        # Create tests directory in docs
-        mkdir -p docs/tests_report
+        # Create tests directory
+        mkdir -p tests_report
         
         # Run tests and capture output, stripping ANSI escape sequences
         make tests | sed 's/\x1b\[[0-9;]*m//g' | tee test_output.txt
         
-        # Download current coverage report
-        mkdir -p temp_current
-        curl -L "https://singaraiona.github.io/rayforce/coverage_report/index.html" -o temp_current/coverage_index.html || true
-        if [ -f temp_current/coverage_index.html ]; then
-          mkdir -p docs/coverage_report
-          cp -r temp_current/* docs/coverage_report/
-        fi
-        rm -rf temp_current
-
         # Convert test output to HTML
-        cat > docs/tests_report/index.html << 'EOF'
+        cat > tests_report/index.html << 'EOF'
         <!DOCTYPE html>
         <html>
         <head>
@@ -136,10 +127,10 @@ jobs:
                 echo "</div>"
             done
             echo "</div>"
-        } >> docs/tests_report/index.html
+        } >> tests_report/index.html
         
         # Close HTML
-        echo '</div></body></html>' >> docs/tests_report/index.html
+        echo '</div></body></html>' >> tests_report/index.html
 
     - name: Setup Pages
       uses: actions/configure-pages@v4
@@ -147,7 +138,7 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-pages-artifact@v3
       with:
-        path: docs
+        path: tests_report
         
     - name: Deploy to GitHub Pages
       id: deployment
