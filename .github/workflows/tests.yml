@@ -26,11 +26,17 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y build-essential
         
+    - name: Create site directories
+      run: |
+        # Create site directories
+        mkdir -p _site/tests_report
+        mkdir -p _site/coverage_report
+        
+        # Try to download existing coverage report
+        curl -L "https://singaraiona.github.io/rayforce/coverage_report/index.html" -o _site/coverage_report/index.html || true
+        
     - name: Run tests and generate report
       run: |
-        # Create tests directory
-        mkdir -p _site/tests_report
-        
         # Run tests and capture output, stripping ANSI escape sequences
         make tests | sed 's/\x1b\[[0-9;]*m//g' | tee test_output.txt
         

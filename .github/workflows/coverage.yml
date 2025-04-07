@@ -50,17 +50,12 @@ jobs:
         
     - name: Download existing site
       run: |
-        # Create temporary directory
-        mkdir -p temp_site
+        # Create _site directory and subdirectories
+        mkdir -p _site/tests_report
+        mkdir -p _site/coverage_report
         
-        # Try to download the current site artifact
-        curl -L "https://singaraiona.github.io/rayforce/tests_report/index.html" -o temp_site/tests_report/index.html || true
-        
-        # Create _site directory and copy existing content
-        mkdir -p _site
-        if [ -d "temp_site" ]; then
-          cp -r temp_site/* _site/ || true
-        fi
+        # Try to download the current site artifacts
+        curl -L "https://singaraiona.github.io/rayforce/tests_report/index.html" -o _site/tests_report/index.html || true
         
     - name: Generate coverage report
       id: coverage
@@ -76,7 +71,6 @@ jobs:
             exit 1
           fi
         else
-          mkdir -p _site/coverage_report
           echo "<html><body><h1>Coverage Report</h1><p>No tests available yet.</p></body></html>" > _site/coverage_report/index.html
           echo "coverage=0" >> $GITHUB_OUTPUT
           exit 1
