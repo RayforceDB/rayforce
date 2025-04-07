@@ -49,33 +49,27 @@ jobs:
         make coverage || echo "No tests available yet"
         
     - name: Generate coverage report
+      id: coverage
       run: |
         if [ -f coverage.info ]; then
           genhtml coverage.info -o docs/coverage_report
           # Extract coverage percentage for the badge
           COVERAGE=$(lcov --summary coverage.info | grep "lines" | awk '{print $4}' | cut -d'%' -f1)
-          # Determine badge color based on coverage percentage
-          if [ "$COVERAGE" -ge 90 ]; then
-            COLOR="success"
-          elif [ "$COVERAGE" -ge 70 ]; then
-            COLOR="important"
-          else
-            COLOR="critical"
+          echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+          # Set job status based on coverage
+          if [ "$COVERAGE" -lt 70 ]; then
+            echo "Coverage is below 70%"
+            exit 1
           fi
-          # Update README.md with the coverage percentage and color
-          sed -i "s/badge\/coverage-[0-9]*%25-[a-z]*/badge\/coverage-${COVERAGE}%25-${COLOR}/" README.md
-          # Commit the updated README.md
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git add README.md
-          git commit -m "Update coverage badge to ${COVERAGE}%" || echo "No changes to commit"
-          git push || echo "No changes to push"
         else
           mkdir -p docs/coverage_report
           echo "<html><body><h1>Coverage Report</h1><p>No tests available yet.</p></body></html>" > docs/coverage_report/index.html
+          echo "coverage=0" >> $GITHUB_OUTPUT
+          exit 1
         fi
 
     - name: Build documentation
+      if: success() || failure()  # Continue even if coverage check fails
       run: |
         # Create a temporary directory for MkDocs build
         mkdir -p temp_site
@@ -87,13 +81,16 @@ jobs:
         rm -rf temp_site
         
     - name: Setup Pages
+      if: success() || failure()  # Continue even if coverage check fails
       uses: actions/configure-pages@v4
       
     - name: Upload artifact
+      if: success() || failure()  # Continue even if coverage check fails
       uses: actions/upload-pages-artifact@v3
       with:
         path: docs
         
     - name: Deploy to GitHub Pages
+      if: success() || failure()  # Continue even if coverage check fails
       id: deployment
       uses: actions/deploy-pages@v4 

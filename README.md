@@ -2,7 +2,7 @@
 
 [![Coverage](https://img.shields.io/badge/Coverage-passing-success?logo=github&style=flat)](https://github.com/singaraiona/rayforce/actions/workflows/coverage.yml)
 [![Release](https://img.shields.io/badge/Release-latest-blue?logo=github&style=flat)](https://github.com/singaraiona/rayforce/releases)
-[![Coverage](https://img.shields.io/badge/coverage-0%25-critical?logo=github&style=flat)](https://singaraiona.github.io/rayforce/coverage_report/)
+[![Coverage](https://github.com/singaraiona/rayforce/actions/workflows/coverage.yml/badge.svg)](https://singaraiona.github.io/rayforce/coverage_report/)
 
 ## Elevated Performance
 
