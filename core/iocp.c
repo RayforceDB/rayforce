@@ -130,8 +130,11 @@ DWORD WINAPI StdinThread(LPVOID prm) {
 
 nil_t exit_werror() {
     obj_p fmt, err;
+    DWORD error = GetLastError();
+    char error_msg[256];
 
-    err = sys_error(ERROR_TYPE_SOCK, "poll_init");
+    snprintf(error_msg, sizeof(error_msg), "poll_init: %lu", error);
+    err = sys_error(ERROR_TYPE_SOCK, error_msg);
     fmt = obj_fmt(err, B8_TRUE);
     printf("%s\n", AS_C8(fmt));
     drop_obj(fmt);
@@ -190,31 +193,35 @@ poll_p poll_init(i64_t port) {
     poll_p poll;
     WSADATA wsaData;
     int result;
+    DWORD error;
 
     // Initialize Winsock
     result = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (result != 0) {
-        fprintf(stderr, "WSAStartup failed: %d\n", result);
+        fprintf(stderr, "WSAStartup failed with error: %d\n", result);
         return NULL;
     }
 
     // Create IOCP
     g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (g_iocp == NULL) {
-        fprintf(stderr, "CreateIoCompletionPort failed: %d\n", GetLastError());
+        error = GetLastError();
+        fprintf(stderr, "CreateIoCompletionPort failed with error: %lu\n", error);
         WSACleanup();
         return NULL;
     }
 
     poll = (poll_p)heap_alloc(sizeof(struct poll_t));
     if (poll == NULL) {
+        error = GetLastError();
+        fprintf(stderr, "heap_alloc failed with error: %lu\n", error);
         CloseHandle(g_iocp);
         WSACleanup();
         return NULL;
     }
 
     poll->code = NULL_I64;
-    poll->poll_fd = (i64_t)g_iocp;
+    poll->poll_fd = g_iocp;  // Store IOCP handle directly
     poll->ipc_fd = -1;
     poll->replfile = string_from_str("repl", 4);
     poll->ipcfile = string_from_str("ipc", 3);
@@ -222,30 +229,66 @@ poll_p poll_init(i64_t port) {
     poll->selectors = freelist_create(128);
     poll->timers = timers_create(16);
 
+    __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
+    if (__LISTENER == NULL) {
+        error = GetLastError();
+        fprintf(stderr, "heap_alloc for listener failed with error: %lu\n", error);
+        poll_destroy(poll);
+        return NULL;
+    }
+    memset(__LISTENER, 0, sizeof(struct listener_t));
+
     // Add server socket if port is specified
     if (port) {
         listen_fd = poll_listen(poll, port);
         if (listen_fd == -1) {
-            fprintf(stderr, "Failed to listen on port %lld\n", port);
-            poll_destroy(poll);
+            error = GetLastError();
+            fprintf(stderr, "poll_listen failed with error: %lu\n", error);
+            heap_free(__LISTENER);
+            heap_free(poll);
+            CloseHandle(g_iocp);
+            WSACleanup();
             return NULL;
         }
+        poll->ipc_fd = listen_fd;
     }
 
-    __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
-    memset(__LISTENER, 0, sizeof(struct listener_t));
-
     if (poll_accept(poll) == -1) {
+        error = GetLastError();
+        fprintf(stderr, "poll_accept failed with error: %lu\n", error);
+        heap_free(__LISTENER);
         heap_free(poll);
-        exit_werror();
+        CloseHandle(g_iocp);
+        WSACleanup();
+        return NULL;
     }
 
     __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
-    __STDIN_THREAD_CTX->h_cp = (HANDLE)poll->poll_fd;
+    if (__STDIN_THREAD_CTX == NULL) {
+        error = GetLastError();
+        fprintf(stderr, "heap_alloc for stdin thread context failed with error: %lu\n", error);
+        heap_free(__LISTENER);
+        heap_free(poll);
+        CloseHandle(g_iocp);
+        WSACleanup();
+        return NULL;
+    }
+    __STDIN_THREAD_CTX->h_cp = poll->poll_fd;  // Use IOCP handle directly
     __STDIN_THREAD_CTX->term = poll->term;
 
     // Create a thread to read from stdin
-    CreateThread(NULL, 0, StdinThread, (LPVOID)__STDIN_THREAD_CTX, 0, NULL);
+    HANDLE hThread = CreateThread(NULL, 0, StdinThread, (LPVOID)__STDIN_THREAD_CTX, 0, NULL);
+    if (hThread == NULL) {
+        error = GetLastError();
+        fprintf(stderr, "CreateThread failed with error: %lu\n", error);
+        heap_free(__STDIN_THREAD_CTX);
+        heap_free(__LISTENER);
+        heap_free(poll);
+        CloseHandle(g_iocp);
+        WSACleanup();
+        return NULL;
+    }
+    CloseHandle(hThread);  // We don't need the handle anymore
 
     return poll;
 }
@@ -260,6 +303,7 @@ i64_t poll_listen(poll_p poll, i64_t port) {
     SOCKET listen_fd;
     struct sockaddr_in addr;
     int opt = 1;
+    HANDLE hResult;
 
     if (poll == NULL)
         return -1;
@@ -269,11 +313,14 @@ i64_t poll_listen(poll_p poll, i64_t port) {
 
     // Create socket
     listen_fd = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
-    if (listen_fd == INVALID_SOCKET)
+    if (listen_fd == INVALID_SOCKET) {
+        fprintf(stderr, "WSASocket failed with error: %d\n", WSAGetLastError());
         return -1;
+    }
 
     // Set socket options
     if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt)) == SOCKET_ERROR) {
+        fprintf(stderr, "setsockopt failed with error: %d\n", WSAGetLastError());
         closesocket(listen_fd);
         return -1;
     }
@@ -286,18 +333,24 @@ i64_t poll_listen(poll_p poll, i64_t port) {
 
     // Bind
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        fprintf(stderr, "bind failed with error: %d\n", WSAGetLastError());
         closesocket(listen_fd);
         return -1;
     }
 
     // Listen
     if (listen(listen_fd, SOMAXCONN) == SOCKET_ERROR) {
+        fprintf(stderr, "listen failed with error: %d\n", WSAGetLastError());
         closesocket(listen_fd);
         return -1;
     }
 
     // Associate the listen socket with the IOCP
-    if (CreateIoCompletionPort((HANDLE)listen_fd, (HANDLE)poll->poll_fd, 0, 0) == NULL) {
+    hResult =
+        CreateIoCompletionPort((HANDLE)listen_fd, poll->poll_fd, (ULONG_PTR)listen_fd, 0);  // Use IOCP handle directly
+    if (hResult == NULL) {
+        DWORD error = GetLastError();
+        fprintf(stderr, "CreateIoCompletionPort failed with error: %lu\n", error);
         closesocket(listen_fd);
         return -1;
     }
@@ -599,7 +652,7 @@ nil_t process_request(poll_p poll, selector_p selector) {
 i64_t poll_run(poll_p poll) {
     DWORD i, num = 5, size;
     OVERLAPPED *overlapped;
-    HANDLE hPollFd = (HANDLE)poll->poll_fd;
+    HANDLE hPollFd = poll->poll_fd;  // Use IOCP handle directly
     SOCKET hAccepted;
     OVERLAPPED_ENTRY events[MAX_EVENTS];
     b8_t success, error;

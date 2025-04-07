@@ -343,6 +343,13 @@ obj_p sys_error(os_ray_error_type_t tp, lit_p msg) {
             dw = GetLastError();
     }
 
+    if (dw == 0) {
+        // If the error code is 0 (ERROR_SUCCESS), just return the message without the error text
+        emsg = str_fmt(-1, "%s", msg);
+        err = error_obj(ERR_IO, emsg);
+        return err;
+    }
+
     FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
                    dw, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&lpMsgBuf, 0, NULL);
 

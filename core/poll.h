@@ -109,7 +109,11 @@ typedef struct selector_t {
 
 typedef struct poll_t {
     i64_t code;
+#if defined(OS_WINDOWS)
+    HANDLE poll_fd;  // IOCP handle
+#else
     i64_t poll_fd;
+#endif
     i64_t ipc_fd;
     obj_p replfile;
     obj_p ipcfile;
