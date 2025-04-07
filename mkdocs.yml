@@ -1,0 +1,36 @@
+site_name: RayforceDB
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: content/getstarted/install.md
+    - Tutorial: content/getstarted/tutorial.md
+  - Reference:
+    - Syntax: content/syntax.md
+    - Functions: content/reference.md
+  - Coverage Report: coverage_report/index.html 
