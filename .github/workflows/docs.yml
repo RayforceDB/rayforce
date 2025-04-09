@@ -49,8 +49,8 @@ jobs:
 
     - name: Run Tests
       run: |
-        # Run tests and capture output
-        make tests | tee test_output.txt
+        # Run tests and capture output, stripping ANSI escape sequences
+        make tests | sed 's/\x1b\[[0-9;]*m//g' | tee test_output.txt
 
     - name: Upload Test Report
       uses: actions/upload-artifact@v4
@@ -58,7 +58,8 @@ jobs:
         name: test-report
         path: test_output.txt
 
-    - name: Include Test Report in Site
+    - name: Convert Test Output to HTML
       run: |
-        mkdir -p site/tests_report
-        cp test_output.txt site/tests_report/index.html 
+        echo '<html><head><style>body { font-family: Arial, sans-serif; } .passed { color: green; } .failed { color: red; }</style></head><body><h1>Test Report</h1><pre>' > site/tests_report/index.html
+        cat test_output.txt | sed 's/Passed/<span class="passed">✓ Passed<\/span>/g' | sed 's/Failed/<span class="failed">✗ Failed<\/span>/g' >> site/tests_report/index.html
+        echo '</pre></body></html>' >> site/tests_report/index.html 
