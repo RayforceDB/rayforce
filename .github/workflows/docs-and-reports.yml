@@ -70,11 +70,11 @@ jobs:
           </tr>' > site/tests_report/index.html
         grep -E "Test:.*|Passed|Failed" test_output.txt | while read -r line; do
           if [[ $line =~ Test:\ (.*) ]]; then
-            echo "<tr><td class='test-name'>${BASH_REMATCH[1]}</td><td>" >> site/tests_report/index.html
+            test_name="${BASH_REMATCH[1]}"
           elif [[ $line =~ Passed ]]; then
-            echo "<span class='passed'>✓ Passed</span></td></tr>" >> site/tests_report/index.html
+            echo "<tr><td class='test-name'>${test_name}</td><td><span class='passed'>✓ Passed</span></td></tr>" >> site/tests_report/index.html
           elif [[ $line =~ Failed ]]; then
-            echo "<span class='failed'>✗ Failed</span></td></tr>" >> site/tests_report/index.html
+            echo "<tr><td class='test-name'>${test_name}</td><td><span class='failed'>✗ Failed</span></td></tr>" >> site/tests_report/index.html
           fi
         done
         echo '</table></body></html>' >> site/tests_report/index.html
