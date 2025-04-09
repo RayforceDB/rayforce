@@ -53,7 +53,7 @@ jobs:
         make tests | tee test_output.txt
 
     - name: Upload Test Report
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: test-report
         path: test_output.txt
