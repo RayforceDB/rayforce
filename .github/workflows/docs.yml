@@ -27,14 +27,6 @@ jobs:
       with:
         python-version: 3.x
 
-    - name: Cache MkDocs dependencies
-      uses: actions/cache@v3
-      with:
-        key: mkdocs-material-${{ hashFiles('requirements.txt') }}
-        path: .cache
-        restore-keys: |
-          mkdocs-material-
-        
     - name: Install MkDocs
       run: |
         pip install mkdocs-material
