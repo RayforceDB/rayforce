@@ -1,14 +1,11 @@
-[![License](https://img.shields.io/github/license/singaraiona/rayforce?style=flat)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/singaraiona/rayforce?style=flat)](https://github.com/singaraiona/rayforce/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/singaraiona/rayforce?style=flat)](https://github.com/singaraiona/rayforce/network)
-[![GitHub issues](https://img.shields.io/github/issues/singaraiona/rayforce?style=flat)](https://github.com/singaraiona/rayforce/issues)
-[![GitHub pull requests](https://img.shields.io/github/issues-pr/singaraiona/rayforce?style=flat)](https://github.com/singaraiona/rayforce/pulls)
-[![GitHub contributors](https://img.shields.io/github/contributors/singaraiona/rayforce?style=flat)](https://github.com/singaraiona/rayforce/graphs/contributors)
-[![GitHub last commit](https://img.shields.io/github/last-commit/singaraiona/rayforce?style=flat)](https://github.com/singaraiona/rayforce/commits)
-
 # RayforceDB: Redefining Speed and Simplicity in Data Management
 
+
+![RayforceDB Cover](docs/assets/images/cover-image.jpg)
+
+
 [![Tests](https://img.shields.io/badge/Tests-passing-success?logo=github&style=flat)](https://singaraiona.github.io/rayforce/tests_report/) [![Coverage](https://img.shields.io/badge/Coverage-passing-brightgreen?style=flat&logo=github)](https://singaraiona.github.io/rayforce/coverage_report/) [![Release](https://img.shields.io/badge/Release-latest-blue?logo=github&style=flat)](https://github.com/singaraiona/rayforce/releases) [![Documentation](https://img.shields.io/badge/Documentation-latest-blue?logo=github&style=flat)](https://singaraiona.github.io/rayforce/)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
 ## Elevated Performance
 
