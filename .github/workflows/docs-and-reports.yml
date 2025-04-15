@@ -39,6 +39,10 @@ jobs:
       run: |
         cd docs
         mkdocs build
+        cd ..
+        mv docs/site .
+        cp docs/CNAME site/
+        cp docs/.nojekyll site/
 
     - name: Create Directories for Reports
       run: |
@@ -103,12 +107,19 @@ jobs:
 
     - name: Setup Pages
       uses: actions/configure-pages@v4
+      with:
+        enablement: true
+        token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Upload artifact
       uses: actions/upload-pages-artifact@v3
       with:
-        path: site
+        path: ./site
 
     - name: Deploy to GitHub Pages
       id: deployment
       uses: actions/deploy-pages@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        branch: gh-pages
+        folder: site
