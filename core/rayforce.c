@@ -895,20 +895,51 @@ obj_p at_idx(obj_p obj, i64_t idx) {
 }
 
 obj_p at_ids(obj_p obj, i64_t ids[], u64_t len) {
-    u64_t i, mapid, xl;
-    i64_t *iinp, *iout, n, m;
+    i64_t i, mapid, xl, m, n;
+    u8_t *u8inp, *u8out;    
+    i16_t *i16inp, *i16out;
+    i32_t *i32inp, *i32out;
+    i64_t *i64inp, *i64out;
     f64_t *finp, *fout;
     obj_p k, v, cols, res;
 
     switch (obj->type) {
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
+        res = vector(obj->type, len);
+        u8inp = AS_U8(obj);
+        u8out = AS_U8(res);
+        for (i = 0; i < len; i++)
+            u8out[i] = u8inp[ids[i]];
+
+        return res;
+        case TYPE_I16:
+        res = I16(len);
+        i16inp = AS_I16(obj);
+        i16out = AS_I16(res);
+        for (i = 0; i < len; i++)
+                i16out[i] = i16inp[ids[i]];
+
+            return res;
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+        res = vector(obj->type, len);
+        i32inp = AS_I32(obj);
+        i32out = AS_I32(res);
+        for (i = 0; i < len; i++)
+            i32out[i] = i32inp[ids[i]];
+        
+            return res;
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
             res = vector(obj->type, len);
-            iinp = AS_I64(obj);
-            iout = AS_I64(res);
+            i64inp = AS_I64(obj);
+            i64out = AS_I64(res);
             for (i = 0; i < len; i++)
-                iout[i] = iinp[ids[i]];
+                i64out[i] = i64inp[ids[i]];
 
             return res;
         case TYPE_F64:

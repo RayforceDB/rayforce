@@ -299,8 +299,7 @@ obj_p ray_inner_join(obj_p *x, u64_t n) {
             return col;
         }
 
-        AS_LIST(vals)
-        [i] = col;
+        AS_LIST(vals)[i] = col;
     }
 
     // cleanup and assemble result table

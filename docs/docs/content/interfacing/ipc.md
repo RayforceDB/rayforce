@@ -42,7 +42,6 @@ There are two ways of sending ipc messages: string or list. In case of string it
 ```
 
 There are 3 types of messages:
-
 - Sync (request)
 - Response
 - Async
@@ -76,8 +75,68 @@ The protocol is very simple. One just utilizes serialization to send/receive mes
 
 After a client has opened a connection to a server, the first message sent by the client is a handshake message. It is a simple null-terminated ASCII string followed by a version number byte of next format: ["username:password"]v
 
-Version is ancoded as follows:
+Version is encoded as follows:
 
 ``` c
 (RAYFORCE_MAJOR_VERSION << 3 | RAYFORCE_MINOR_VERSION)
 ```
+
+### Handshake Process
+
+1. Client connects to the server
+2. Client sends handshake message (null-terminated ASCII string followed by a version number byte):
+   - Format: `[username:password]v`
+   - `username:password` is optional, can be empty `[]`
+   - `v` is a single byte version number
+3. Server validates the handshake:
+   - Checks version compatibility
+   - Validates credentials if provided
+4. Server responds with:
+   - Success: `\x01` (1 byte)
+   - Failure: `\x00` (1 byte) followed by error message
+
+Example handshake messages:
+```
+[]v                    # No credentials, just version
+[admin:secret123]v     # With credentials
+```
+
+## :material-table: Data Type Serialization
+
+Each IPC message consists of a header followed by the serialized data. The header format is:
+```
+prefix(1) version(1) flags(1) endian(1) msgtype(1) size(8)
+```
+
+The following table describes the serialization format for each data type:
+
+| Type Name | Type ID | Size (bytes) | Literal                                | Null      |
+| --------- | ------- | ------------ | -------------------------------------- | --------- |
+| List      | 0       |              | `(1 2)`                                | `()`      |
+| Bool      | 1       | 2            | `true`                                 | `false`   |
+| U8        | 2       | 2            | `255x`                                 | `0x`      |
+| I16       | 3       | 3            | `1h`                                   | `0Nh`     |
+| I32       | 4       | 5            | `1i`                                   | `0Ni`     |
+| I64       | 5       | 9            | `1`                                    | `0Nl`     |
+| Symbol    | 6       |              | `'foo`                                 | `''`      |
+| Date      | 7       | 4            | `2024.01.01`                           | `0Nd`     |
+| Time      | 8       | 4            | `00:00:01`                             | `0Nt`     |
+| Timestamp | 9       | 8            | `2024.01.01D00:00:01.000000001`        | `0Np`     |
+| F64       | 10      | 8            | `1.0`                                  | `0Nf`     |
+| GUID      | 11      | 16           | `01020304-0506-0708-090A-0B0C0D0E0F10` | `0Ng`     |
+| C8        | 12      |              | `'A'`    "AAAA"                        | `'\0'` "" |
+| Dict      | 99      |              | `{a: 1 b: 2 c: 3}`                     | `{}`      |
+| Null      | 126     |              | null                                   | `null`    |
+
+### Serialization Notes
+
+- All numeric values are in network byte order (big-endian)
+- Header fields:
+  - `prefix`: 0xcefadefa
+  - `version`: Protocol version
+  - `flags`: Message flags: 0 - no flags
+  - `endian`: Endianness indicator: 0 - little, 1 - big
+  - `msgtype`: Message type: 0 - sync, 1 - response, 2 - async
+  - `size`: Total message size
+- String and symbol data is UTF-8 encoded
+- Error messages include the error code and description
