@@ -849,11 +849,8 @@ obj_p ray_row_index(obj_p *x, u64_t n) {
     rt = runtime_get();
     ctx = rt->query_ctx;
 
-    if (ctx == NULL)
-        return error_str(ERR_LENGTH, "row_index: no table selected");
-
-    if (ctx->tablen == 0)
-        return error_str(ERR_LENGTH, "row_index: no table selected");
+    if (ctx == NULL || ctx->tablen == 0)
+        return I64(0);
 
     if (ctx->group_index != NULL_OBJ)
         return aggr_row_index(AS_LIST(AS_LIST(ctx->table)[1])[0], ctx->group_index);

@@ -173,8 +173,7 @@ obj_p ray_left_join(obj_p *x, u64_t n) {
             return col;
         }
 
-        AS_LIST(vals)
-        [i] = col;
+        AS_LIST(vals)[i] = col;
     }
 
     // cleanup and assemble result table
@@ -186,11 +185,9 @@ obj_p ray_left_join(obj_p *x, u64_t n) {
     if (x[0]->len == 1) {
         l = rescols->len;
         resvals = vector(TYPE_LIST, l);
-        AS_LIST(resvals)
-        [0] = k1;
+        AS_LIST(resvals)[0] = k1;
         for (i = 1; i < l; i++)
-            AS_LIST(resvals)
-        [i] = clone_obj(AS_LIST(vals)[i - 1]);
+            AS_LIST(resvals)[i] = clone_obj(AS_LIST(vals)[i - 1]);
         drop_obj(vals);
     } else {
         resvals = ray_concat(k1, vals);

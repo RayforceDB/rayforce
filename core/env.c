@@ -187,7 +187,6 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "<=",                  TYPE_BINARY,   FN_ATOMIC,                 ray_le);
     REGISTER_FN(functions,  ">=",                  TYPE_BINARY,   FN_ATOMIC,                 ray_ge);
     REGISTER_FN(functions,  "!=",                  TYPE_BINARY,   FN_ATOMIC,                 ray_ne);
-    REGISTER_FN(functions,  "or",                  TYPE_BINARY,   FN_ATOMIC,                 ray_or);
     REGISTER_FN(functions,  "+",                   TYPE_BINARY,   FN_ATOMIC,                 ray_add);
     REGISTER_FN(functions,  "-",                   TYPE_BINARY,   FN_ATOMIC,                 ray_sub);
     REGISTER_FN(functions,  "*",                   TYPE_BINARY,   FN_ATOMIC,                 ray_mul);
@@ -219,6 +218,7 @@ nil_t init_functions(obj_p functions)
     // Vary               
     REGISTER_FN(functions,  "do",                  TYPE_VARY,     FN_NONE | FN_SPECIAL_FORM, ray_do);
     REGISTER_FN(functions,  "and",                 TYPE_VARY,     FN_NONE | FN_SPECIAL_FORM, ray_and);
+    REGISTER_FN(functions,  "or",                  TYPE_VARY,     FN_NONE | FN_SPECIAL_FORM, ray_or);
     REGISTER_FN(functions,  "env",                 TYPE_VARY,     FN_NONE,                   ray_env);
     REGISTER_FN(functions,  "timeit",              TYPE_VARY,     FN_NONE | FN_SPECIAL_FORM, ray_timeit);
     REGISTER_FN(functions,  "memstat",             TYPE_VARY,     FN_NONE,                   ray_memstat);
