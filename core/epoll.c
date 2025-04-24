@@ -602,6 +602,7 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
     i64_t idx;
     obj_p res;
     fd_set fds;
+    struct timeval tv;
 
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
 
@@ -621,7 +622,9 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
         // block on select until we can send
         FD_ZERO(&fds);
         FD_SET(selector->fd, &fds);
-        result = select(selector->fd + 1, NULL, &fds, NULL, NULL);
+        tv.tv_sec = 30;  // 30 second timeout
+        tv.tv_usec = 0;
+        result = select(selector->fd + 1, NULL, &fds, NULL, &tv);
 
         if (result == -1) {
             if (errno != EINTR) {
@@ -646,7 +649,9 @@ recv:
         // block on select until we can recv
         FD_ZERO(&fds);
         FD_SET(selector->fd, &fds);
-        result = select(selector->fd + 1, &fds, NULL, NULL, NULL);
+        tv.tv_sec = 30;  // 30 second timeout
+        tv.tv_usec = 0;
+        result = select(selector->fd + 1, &fds, NULL, NULL, &tv);
 
         if (result == -1) {
             if (errno != EINTR) {
