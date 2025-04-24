@@ -63,11 +63,23 @@ i64_t poll_run(poll_p poll) {
     return 0;
 }
 
-i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
+i64_t poll_register(poll_p poll, i64_t fd) {
     UNUSED(poll);
     UNUSED(fd);
-    UNUSED(version);
-    return 0;
+
+    return -1;
+}
+
+i64_t poll_register_with_callbacks(poll_p poll, i64_t fd, on_read_callback_t on_read, on_write_callback_t on_write,
+                                   on_error_callback_t on_error, raw_p user_data) {
+    UNUSED(poll);
+    UNUSED(fd);
+    UNUSED(on_read);
+    UNUSED(on_write);
+    UNUSED(on_error);
+    UNUSED(user_data);
+
+    return -1;
 }
 
 nil_t poll_deregister(poll_p poll, i64_t id) {

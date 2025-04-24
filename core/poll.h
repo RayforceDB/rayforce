@@ -49,12 +49,31 @@ typedef enum poll_result_t {
     POLL_ERROR = 2,
 } poll_result_t;
 
+// Forward declaration
+struct poll_t;
+struct selector_t;
+typedef struct poll_t *poll_p;
+typedef struct selector_t *selector_p;
+
+// Callback types for event handling
+typedef poll_result_t (*on_read_callback_t)(poll_p poll, selector_p selector);
+typedef poll_result_t (*on_write_callback_t)(poll_p poll, selector_p selector);
+typedef poll_result_t (*on_error_callback_t)(poll_p poll, selector_p selector);
+
 #if defined(OS_WINDOWS)
 
 typedef struct selector_t {
-    i64_t fd;  // socket fd
-    i64_t id;  // selector id
-    u8_t version;
+    i64_t fd;                  // socket fd
+    i64_t id;                  // selector id
+    u8_t handshake_completed;  // Flag indicating if handshake is completed
+    u32_t events;              // Current event flags
+
+    // Event callbacks
+    on_read_callback_t on_read;
+    on_write_callback_t on_write;
+    on_error_callback_t on_error;
+
+    raw_p user_data;  // Optional user data pointer
 
     struct {
         b8_t ignore;
@@ -84,9 +103,17 @@ typedef struct selector_t {
 #else
 
 typedef struct selector_t {
-    i64_t fd;  // socket fd
-    i64_t id;  // selector id
-    u8_t version;
+    i64_t fd;                  // socket fd
+    i64_t id;                  // selector id
+    u8_t handshake_completed;  // Flag indicating if handshake is completed
+    u32_t events;              // Current event flags
+
+    // Event callbacks
+    on_read_callback_t on_read;
+    on_write_callback_t on_write;
+    on_error_callback_t on_error;
+
+    raw_p user_data;  // Optional user data pointer
 
     struct {
         u8_t msgtype;
@@ -110,7 +137,6 @@ typedef struct selector_t {
 typedef struct poll_t {
     i64_t code;
     i64_t poll_fd;
-    i64_t ipc_fd;
     obj_p replfile;
     obj_p ipcfile;
     term_p term;
@@ -123,7 +149,9 @@ i64_t poll_listen(poll_p poll, i64_t port);
 nil_t poll_destroy(poll_p poll);
 i64_t poll_run(poll_p poll);
 nil_t poll_set_usr_fd(i64_t fd);
-i64_t poll_register(poll_p poll, i64_t fd, u8_t version);
+i64_t poll_register(poll_p poll, i64_t fd);
+i64_t poll_register_with_callbacks(poll_p poll, i64_t fd, on_read_callback_t on_read, on_write_callback_t on_write,
+                                   on_error_callback_t on_error, raw_p user_data);
 nil_t poll_deregister(poll_p poll, i64_t id);
 nil_t poll_call_usr_on_open(poll_p poll, i64_t id);
 nil_t poll_call_usr_on_close(poll_p poll, i64_t id);

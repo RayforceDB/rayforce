@@ -86,7 +86,7 @@ obj_p ray_hopen(obj_p *x, u64_t n) {
 
         sock_set_nonblocking(fd, B8_TRUE);
 
-        return i64(poll_register(runtime_get()->poll, fd, RAYFORCE_VERSION));
+        return i64(poll_register(runtime_get()->poll, fd));
     }
 
     // Otherwise, open file
