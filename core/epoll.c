@@ -136,6 +136,9 @@ i64_t poll_listen(poll_p poll, i64_t port) {
 nil_t poll_destroy(poll_p poll) {
     i64_t i, l;
 
+    term_destroy(poll->term);
+    close(STDIN_FILENO);
+
     // Free all selectors
     l = poll->selectors->data_pos;
     for (i = 0; i < l; i++) {
@@ -145,8 +148,6 @@ nil_t poll_destroy(poll_p poll) {
 
     drop_obj(poll->replfile);
     drop_obj(poll->ipcfile);
-
-    term_destroy(poll->term);
 
     freelist_free(poll->selectors);
     timers_destroy(poll->timers);
@@ -579,6 +580,7 @@ i64_t poll_run(poll_p poll) {
 // Default handler for error events
 poll_result_t default_on_error(poll_p poll, selector_p selector) {
     UNUSED(poll);
+    UNUSED(selector);
     return POLL_ERROR;  // Simply signal an error for cleanup
 }
 

@@ -26,6 +26,7 @@
 #include "../core/format.h"
 #include "../core/util.h"
 #include "../core/sys.h"
+#include <stdlib.h>
 
 nil_t print_logo(sys_info_t *info) {
     printf(

@@ -330,6 +330,9 @@ term_p term_create() {
 }
 
 nil_t term_destroy(term_p term) {
+    // Ensure cursor is visible
+    cursor_show();
+
     // Restore the terminal attributes
     SetConsoleMode(term->h_stdin, term->old_stdin_mode);
     SetConsoleMode(term->h_stdout, term->old_stdout_mode);
