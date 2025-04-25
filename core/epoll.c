@@ -54,9 +54,9 @@ __thread i32_t __EVENT_FD;  // eventfd to notify epoll loop of shutdown
 poll_result_t stdin_on_read(poll_p poll, selector_p selector);
 poll_result_t event_fd_on_read(poll_p poll, selector_p selector);
 poll_result_t listener_on_read(poll_p poll, selector_p selector);
-poll_result_t default_on_read(poll_p poll, selector_p selector);
-poll_result_t default_on_write(poll_p poll, selector_p selector);
-poll_result_t default_on_error(poll_p poll, selector_p selector);
+poll_result_t ipc_on_read(poll_p poll, selector_p selector);
+poll_result_t ipc_on_write(poll_p poll, selector_p selector);
+poll_result_t ipc_on_error(poll_p poll, selector_p selector);
 
 nil_t sigint_handler(i32_t signo) {
     u64_t val = 1;
@@ -159,7 +159,7 @@ nil_t poll_destroy(poll_p poll) {
 
 i64_t poll_register(poll_p poll, i64_t fd) {
     // Default to using the default handlers
-    return poll_register_with_callbacks(poll, fd, default_on_read, default_on_write, default_on_error, NULL);
+    return poll_register_with_callbacks(poll, fd, ipc_on_read, ipc_on_write, ipc_on_error, NULL);
 }
 
 i64_t poll_register_with_callbacks(poll_p poll, i64_t fd, on_read_callback_t on_read, on_write_callback_t on_write,
@@ -170,6 +170,7 @@ i64_t poll_register_with_callbacks(poll_p poll, i64_t fd, on_read_callback_t on_
 
     selector = (selector_p)heap_alloc(sizeof(struct selector_t));
     id = freelist_push(poll->selectors, (i64_t)selector) + SELECTOR_ID_OFFSET;
+
     selector->id = id;
     selector->handshake_completed = B8_FALSE;  // Start with handshake not completed
     selector->fd = fd;
@@ -320,6 +321,7 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
         while (selector->rx.bytes_transfered < (i64_t)sizeof(struct header_t)) {
             size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered],
                              sizeof(struct header_t) - selector->rx.bytes_transfered);
+            printf("header size: %lld\n", size);
             if (size == -1)
                 return POLL_ERROR;
             else if (size == 0)
@@ -337,6 +339,7 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
     while (selector->rx.bytes_transfered < selector->rx.size) {
         size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered],
                          selector->rx.size - selector->rx.bytes_transfered);
+        printf("recv size: %lld\n", size);
         if (size == -1)
             return POLL_ERROR;
         else if (size == 0)
@@ -506,16 +509,27 @@ poll_result_t listener_on_read(poll_p poll, selector_p selector) {
 }
 
 // Default handler for regular socket connections
-poll_result_t default_on_read(poll_p poll, selector_p selector) {
+poll_result_t ipc_on_read(poll_p poll, selector_p selector) {
     poll_result_t poll_result;
+    static i64_t call_count = 0;
+
+    printf("ipc_on_read call #%lld for fd %lld, rx.bytes_transfered=%lld, rx.size=%lld\n", ++call_count, selector->fd,
+           selector->rx.bytes_transfered, selector->rx.size);
 
     poll_result = _recv(poll, selector);
-    if (poll_result == POLL_PENDING)
+    printf("  _recv result: %d\n", poll_result);
+
+    if (poll_result == POLL_PENDING) {
+        printf("  POLL_PENDING: Waiting for more data, will return to epoll\n");
         return POLL_PENDING;
+    }
 
-    if (poll_result == POLL_ERROR)
+    if (poll_result == POLL_ERROR) {
+        printf("  POLL_ERROR: Error in receive, connection will be deregistered\n");
         return POLL_ERROR;
+    }
 
+    printf("  Processing request (complete message received)\n");
     process_request(poll, selector);
 
     return POLL_DONE;
@@ -578,14 +592,14 @@ i64_t poll_run(poll_p poll) {
 }
 
 // Default handler for error events
-poll_result_t default_on_error(poll_p poll, selector_p selector) {
+poll_result_t ipc_on_error(poll_p poll, selector_p selector) {
     UNUSED(poll);
     UNUSED(selector);
     return POLL_ERROR;  // Simply signal an error for cleanup
 }
 
 // Default handler for write events
-poll_result_t default_on_write(poll_p poll, selector_p selector) {
+poll_result_t ipc_on_write(poll_p poll, selector_p selector) {
     poll_result_t poll_result;
 
     poll_result = _send(poll, selector);
