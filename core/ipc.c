@@ -67,7 +67,7 @@ i64_t ipc_listener_accept(poll_p poll, selector_p selector) {
 
     if (fd != -1) {
         ctx = (ipc_ctx_p)heap_alloc(sizeof(struct ipc_ctx_t));
-        ctx->name = symbol("ipc", 4);
+        ctx->name = string_from_str("ipc", 4);
 
         registry.fd = fd;
         registry.type = SELECTOR_TYPE_SOCKET;

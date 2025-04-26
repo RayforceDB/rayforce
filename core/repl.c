@@ -96,7 +96,7 @@ repl_p repl_create(poll_p poll) {
     struct poll_registry_t registry;
 
     repl = (repl_p)heap_alloc(sizeof(struct repl_t));
-    repl->name = symbol("repl", 4);
+    repl->name = string_from_str("repl", 4);
     repl->term = term_create();
 
     registry.fd = STDIN_FILENO;
