@@ -26,6 +26,26 @@
 #include "binary.h"
 #include "symbols.h"
 #include "error.h"
+#include "sock.h"
+#include "poll.h"
+
+// forward declarations
+poll_result_t ipc_read_handshake(poll_p poll, selector_p selector);
+poll_result_t ipc_read_header(poll_p poll, selector_p selector);
+poll_result_t ipc_read_msg_sync(poll_p poll, selector_p selector);
+poll_result_t ipc_read_msg_async(poll_p poll, selector_p selector);
+poll_result_t ipc_on_error(poll_p poll, selector_p selector);
+poll_result_t ipc_on_close(poll_p poll, selector_p selector);
+
+i64_t ipc_recv(poll_p poll, selector_p selector) {
+    return sock_recv(selector->fd, &AS_U8(selector->rx.buf)[selector->rx.size],
+                     selector->rx.buf->len - selector->rx.size);
+}
+
+i64_t ipc_send(poll_p poll, selector_p selector) {
+    return sock_send(selector->fd, &AS_U8(selector->tx.buf)[selector->tx.size],
+                     selector->tx.buf->len - selector->tx.size);
+}
 
 nil_t poll_set_usr_fd(i64_t fd) {
     obj_p s, k, v;
@@ -38,108 +58,192 @@ nil_t poll_set_usr_fd(i64_t fd) {
     drop_obj(s);
 }
 
-i64_t ipc_recv(poll_p poll, selector_p selector) {
-    return sock_recv(selector->fd, &AS_U8(selector->rx.buf)[selector->rx.bytes_transfered],
-                     selector->rx.buf->len - selector->rx.bytes_transfered);
+i64_t ipc_listener_accept(poll_p poll, selector_p selector) {
+    i64_t fd;
+    struct poll_registry_t registry;
+    ipc_ctx_p ctx;
+
+    fd = sock_accept(selector->fd);
+
+    if (fd != -1) {
+        ctx = (ipc_ctx_p)heap_alloc(sizeof(struct ipc_ctx_t));
+        ctx->name = symbol("ipc", 4);
+
+        registry.fd = fd;
+        registry.type = SELECTOR_TYPE_SOCKET;
+        registry.events = POLL_EVENT_READ | POLL_EVENT_ERROR | POLL_EVENT_HUP;
+        registry.recv_fn = ipc_recv;
+        registry.read_fn = ipc_read_handshake;
+        registry.close_fn = ipc_on_close;
+        registry.error_fn = ipc_on_error;
+        registry.data = ctx;
+
+        if (poll_register(poll, &registry) == -1) {
+            heap_free(ctx);
+            return -1;
+        }
+    }
+
+    return fd;
 }
 
-i64_t ipc_send(poll_p poll, selector_p selector) {
-    return sock_send(selector->fd, &AS_U8(selector->tx.buf)[selector->tx.bytes_transfered],
-                     selector->tx.buf->len - selector->tx.bytes_transfered);
-}
-
-poll_result_t ipc_on_open(poll_p poll, selector_p selector) {
+i64_t ipc_listener_close(poll_p poll, selector_p selector) {
     UNUSED(poll);
-    // i64_t clbnm;
-    // obj_p v, f, *clbfn;
+    UNUSED(selector);
 
-    // stack_push(NULL_OBJ);  // null env
-    // clbnm = symbols_intern(".z.po", 5);
-    // clbfn = resolve(clbnm);
-    // stack_pop();  // null env
+    return 0;
+}
 
-    // // Call the callback if it's a lambda
-    // if (clbfn != NULL && (*clbfn)->type == TYPE_LAMBDA) {
-    //     poll_set_usr_fd(selector->id);
-    //     stack_push(i64(selector->id));
-    //     v = call(*clbfn, 1);
-    //     drop_obj(stack_pop());
-    //     poll_set_usr_fd(0);
-    //     if (IS_ERR(v)) {
-    //         f = obj_fmt(v, B8_FALSE);
-    //         fprintf(stderr, "Error in .z.po callback: \n%.*s\n", (i32_t)f->len, AS_C8(f));
-    //         drop_obj(f);
-    //     }
+i64_t ipc_listen(poll_p poll, i64_t port) {
+    i64_t fd;
+    struct poll_registry_t registry;
 
+    if (poll == NULL)
+        return -1;
+
+    fd = sock_listen(port);
+    if (fd == -1)
+        return -1;
+
+    registry.fd = fd;
+    registry.type = SELECTOR_TYPE_SOCKET;
+    registry.events = POLL_EVENT_READ | POLL_EVENT_ERROR | POLL_EVENT_HUP;
+    registry.recv_fn = ipc_listener_accept;
+    registry.read_fn = NULL;
+    registry.close_fn = ipc_listener_close;
+    registry.error_fn = NULL;
+    registry.data = NULL;
+
+    return poll_register(poll, &registry);
+}
+
+poll_result_t ipc_call_usr_cb(poll_p poll, selector_p selector, lit_p sym, i64_t len) {
+    UNUSED(poll);
+    i64_t clbnm;
+    obj_p v, f, *clbfn;
+
+    stack_push(NULL_OBJ);  // null env
+    clbnm = symbols_intern(sym, len);
+    clbfn = resolve(clbnm);
+    stack_pop();  // null env
+
+    // Call the callback if it's a lambda
+    if (clbfn != NULL && (*clbfn)->type == TYPE_LAMBDA) {
+        poll_set_usr_fd(selector->id);
+        stack_push(i64(selector->id));
+        v = call(*clbfn, 1);
+        drop_obj(stack_pop());
+        poll_set_usr_fd(0);
+        if (IS_ERR(v)) {
+            f = obj_fmt(v, B8_FALSE);
+            fprintf(stderr, "Error in user callback: \n%.*s\n", (i32_t)f->len, AS_C8(f));
+            drop_obj(f);
+        }
+
+        drop_obj(v);
+    }
+
+    return POLL_READY;
+}
+
+poll_result_t ipc_read_handshake(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+
+    i64_t size;
+
+    if (AS_U8(selector->rx.buf)[selector->rx.size - 1] == '\0') {
+        // send handshake response
+        if (ipc_send_handshake(poll, selector) == POLL_ERROR)
+            return POLL_ERROR;
+
+        // Now we are ready for income messages and can call userspace callback (if any)
+        ipc_call_usr_cb(poll, selector, ".z.po", 5);
+
+        selector->rx.read_fn = ipc_read_header;
+        selector->rx.size = 0;
+
+        return ipc_read_header(poll, selector);
+    }
+
+    return POLL_PENDING;
+}
+
+poll_result_t ipc_read_header(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+
+    header_t *header;
+
+    header = (header_t *)AS_U8(selector->rx.buf);
+
+    if (poll_rx_buf_request(poll, selector, header->size + sizeof(struct header_t)) == -1)
+        return POLL_ERROR;
+
+    // determine the read function based on the message type
+    // selector->rx.msgtype = header->msgtype;
+    selector->rx.read_fn = ipc_read_msg_sync;
+
+    return POLL_READY;
+}
+
+poll_result_t ipc_read_msg_sync(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+
+    obj_p v, res;
+    ipc_ctx_p ctx;
+
+    ctx = (ipc_ctx_p)selector->data;
+
+    res = de_raw(selector->rx.buf, selector->rx.size);
+    poll_rx_buf_release(poll, selector);
+
+    poll_set_usr_fd(selector->id);
+
+    if (IS_ERR(res) || is_null(res))
+        v = res;
+    else if (res->type == TYPE_C8) {
+        v = ray_eval_str(res, ctx->name);
+        drop_obj(res);
+    } else {
+        v = eval_obj(res);
+        drop_obj(res);
+    }
+
+    poll_set_usr_fd(0);
+
+    // respond
+    // queue_push(selector->tx.queue, (nil_t *)((i64_t)v | ((i64_t)MSG_TYPE_RESP << 61)));
+    // poll_result = _send(poll, selector);
+
+    //     if (poll_result == POLL_ERROR)
+    //         poll_deregister(poll, selector->id);
+    // } else
     //     drop_obj(v);
-    // }
+
+    return POLL_READY;
+}
+
+poll_result_t ipc_read_msg_async(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+    UNUSED(selector);
+
+    return POLL_READY;
+}
+
+poll_result_t ipc_on_error(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+    UNUSED(selector);
 
     return POLL_READY;
 }
 
 poll_result_t ipc_on_close(poll_p poll, selector_p selector) {
     UNUSED(poll);
-    // i64_t clbnm;
-    // obj_p v, f, *clbfn;
 
-    // stack_push(NULL_OBJ);  // null env
-    // clbnm = symbols_intern(".z.pc", 5);
-    // clbfn = resolve(clbnm);
-    // stack_pop();  // null env
+    ipc_ctx_p ctx;
 
-    // // Call the callback if it's a lambda
-    // if (clbfn != NULL && (*clbfn)->type == TYPE_LAMBDA) {
-    //     poll_set_usr_fd(selector->id);
-    //     stack_push(i64(selector->id));
-    //     v = call(*clbfn, 1);
-    //     drop_obj(stack_pop());
-    //     poll_set_usr_fd(0);
-    //     if (IS_ERR(v)) {
-    //         f = obj_fmt(v, B8_FALSE);
-    //         fprintf(stderr, "Error in .z.pc callback: \n%.*s\n", (i32_t)f->len, AS_C8(f));
-    //         drop_obj(f);
-    //     }
-
-    //     drop_obj(v);
-    // }
-
-    return POLL_READY;
-}
-
-// accept new connections
-// else if (ev.data.fd == poll->ipc_fd) {
-//     sock = sock_accept(poll->ipc_fd);
-//     if (sock != -1)
-//         poll_register(poll, sock, 0);
-// }
-i64_t ipc_listen(poll_p poll, i64_t port) {
-    i64_t listen_fd;
-    // struct epoll_event ev;
-
-    // if (poll == NULL)
-    //     return -1;
-
-    // if (poll->ipc_fd != -1)
-    //     return -2;
-
-    // listen_fd = sock_listen(port);
-    // if (listen_fd == -1)
-    //     return -1;
-
-    // ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-    // ev.data.fd = listen_fd;
-
-    // if (epoll_ctl(poll->poll_fd, EPOLL_CTL_ADD, listen_fd, &ev) == -1)
-    //     return -1;
-
-    // poll->ipc_fd = listen_fd;
-
-    return listen_fd;
-}
-
-poll_result_t ipc_on_error(poll_p poll, selector_p selector) {
-    UNUSED(poll);
-    UNUSED(selector);
+    ctx = (ipc_ctx_p)selector->data;
+    drop_obj(ctx->name);
+    drop_obj(ctx);
 
     return POLL_READY;
 }
@@ -163,94 +267,6 @@ poll_result_t ipc_send_handshake(poll_p poll, selector_p selector) {
     return POLL_READY;
 }
 
-poll_result_t ipc_recv_handshake(poll_p poll, selector_p selector) {
-    UNUSED(poll);
-
-    i64_t size;
-
-    // if (selector->rx.buf == NULL)
-    //     selector->rx.buf = (u8_t *)heap_alloc(sizeof(struct header_t));
-
-    // while (selector->rx.bytes_transfered == 0 || selector->rx.buf[selector->rx.bytes_transfered - 1] != '\0') {
-    //     size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered], sizeof(struct header_t));
-    //     if (size == -1)
-    //         return POLL_ERROR;
-    //     else if (size == 0)
-    //         return POLL_PENDING;
-
-    //     selector->rx.bytes_transfered += size;
-
-    //     if (selector->rx.bytes_transfered == sizeof(struct header_t)) {
-    //         if (heap_realloc(selector->rx.buf, selector->rx.bytes_transfered + sizeof(struct header_t)) == NULL)
-    //             return POLL_ERROR;
-    //     }
-    // }
-
-    // selector->rx.bytes_transfered = 0;
-
-    // // send handshake response
-    // if (ipc_send_handshake(poll, selector) == POLL_ERROR)
-    //     return POLL_ERROR;
-
-    // // Now we are ready for income messages and can call userspace callback (if any)
-    // poll_call_usr_on_open(poll, selector->id);
-
-    // selector->recv_fn = ipc_recv_header;
-
-    return ipc_recv_header(poll, selector);
-}
-
-poll_result_t ipc_recv_msg(poll_p poll, selector_p selector) {
-    UNUSED(poll);
-
-    // i64_t size;
-
-    // while (selector->rx.bytes_transfered < selector->rx.size) {
-    //     size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered],
-    //                      selector->rx.size - selector->rx.bytes_transfered);
-    //     if (size == -1)
-    //         return POLL_ERROR;
-    //     else if (size == 0)
-    //         return POLL_PENDING;
-
-    //     selector->rx.bytes_transfered += size;
-    // }
-
-    return POLL_READY;
-}
-
-poll_result_t ipc_recv_header(poll_p poll, selector_p selector) {
-    UNUSED(poll);
-
-    // i64_t size;
-    // header_t *header;
-
-    // while (selector->rx.bytes_transfered < (i64_t)sizeof(struct header_t)) {
-    //     size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered],
-    //                      sizeof(struct header_t) - selector->rx.bytes_transfered);
-    //     if (size == -1)
-    //         return POLL_ERROR;
-    //     else if (size == 0)
-    //         return POLL_PENDING;
-
-    //     selector->rx.bytes_transfered += size;
-    // }
-
-    // header = (header_t *)selector->rx.buf;
-    // selector->rx.msgtype = header->msgtype;
-    // selector->rx.size = header->size + sizeof(struct header_t);
-    // selector->rx.buf = (u8_t *)heap_realloc(selector->rx.buf, selector->rx.size);
-
-    return POLL_READY;
-}
-
-poll_result_t ipc_recv1(poll_p poll, selector_p selector) {
-    if (selector->rx.buf == NULL)
-        selector->rx.buf = (u8_t *)heap_alloc(sizeof(struct header_t));
-
-    return ipc_recv_header(poll, selector);
-}
-
 // Send
 poll_result_t _send(poll_p poll, selector_p selector) {
     //     i64_t size;
@@ -260,9 +276,9 @@ poll_result_t _send(poll_p poll, selector_p selector) {
     //     struct epoll_event ev;
 
     // send:
-    //     while (selector->tx.bytes_transfered < selector->tx.size) {
-    //         size = sock_send(selector->fd, &selector->tx.buf[selector->tx.bytes_transfered],
-    //                          selector->tx.size - selector->tx.bytes_transfered);
+    //     while (selector->tx.size < selector->tx.size) {
+    //         size = sock_send(selector->fd, &selector->tx.buf[selector->tx.size],
+    //                          selector->tx.size - selector->tx.size);
     //         if (size == -1)
     //             return POLL_ERROR;
     //         else if (size == 0) {
@@ -278,13 +294,13 @@ poll_result_t _send(poll_p poll, selector_p selector) {
     //             return POLL_PENDING;
     //         }
 
-    //         selector->tx.bytes_transfered += size;
+    //         selector->tx.size += size;
     //     }
 
     //     heap_free(selector->tx.buf);
     //     selector->tx.buf = NULL;
     //     selector->tx.size = 0;
-    //     selector->tx.bytes_transfered = 0;
+    //     selector->tx.size = 0;
 
     //     v = queue_pop(selector->tx.queue);
 
@@ -311,49 +327,6 @@ poll_result_t _send(poll_p poll, selector_p selector) {
     //     }
 
     return POLL_READY;
-}
-
-obj_p read_obj(selector_p selector) {
-    obj_p res;
-
-    // res = de_raw(selector->rx.buf, selector->rx.size);
-    // heap_free(selector->rx.buf);
-    // selector->rx.buf = NULL;
-    // selector->rx.bytes_transfered = 0;
-    // selector->rx.size = 0;
-
-    return res;
-}
-
-nil_t process_request(poll_p poll, selector_p selector) {
-    // poll_result_t poll_result;
-    // obj_p v, res;
-
-    // res = read_obj(selector);
-
-    // poll_set_usr_fd(selector->id);
-
-    // if (IS_ERR(res) || is_null(res))
-    //     v = res;
-    // else if (res->type == TYPE_C8) {
-    //     // v = ray_eval_str(res, poll->ipcfile);
-    //     drop_obj(res);
-    // } else {
-    //     v = eval_obj(res);
-    //     drop_obj(res);
-    // }
-
-    // poll_set_usr_fd(0);
-
-    // // sync request
-    // if (selector->rx.msgtype == MSG_TYPE_SYNC) {
-    //     queue_push(selector->tx.queue, (nil_t *)((i64_t)v | ((i64_t)MSG_TYPE_RESP << 61)));
-    //     poll_result = _send(poll, selector);
-
-    //     if (poll_result == POLL_ERROR)
-    //         poll_deregister(poll, selector->id);
-    // } else
-    //     drop_obj(v);
 }
 
 obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {

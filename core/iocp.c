@@ -79,34 +79,34 @@ typedef struct stdin_thread_ctx_t {
 listener_p __LISTENER = NULL;
 stdin_thread_ctx_p __STDIN_THREAD_CTX = NULL;
 
-#define _RECV_OP(poll, selector)                                                                      \
-    {                                                                                                 \
-        i32_t poll_result;                                                                            \
-                                                                                                      \
-        poll_result = WSARecv(selector->fd, &selector->rx.wsa_buf, 1, &selector->rx.bytes_transfered, \
-                              &selector->rx.flags, &selector->rx.overlapped, NULL);                   \
-                                                                                                      \
-        if (poll_result == SOCKET_ERROR) {                                                            \
-            if (WSAGetLastError() == ERROR_IO_PENDING)                                                \
-                return POLL_PENDING;                                                                  \
-                                                                                                      \
-            return POLL_ERROR;                                                                        \
-        }                                                                                             \
+#define _RECV_OP(poll, selector)                                                                               \
+    {                                                                                                          \
+        i32_t poll_result;                                                                                     \
+                                                                                                               \
+        poll_result = WSARecv(selector->fd, &selector->rx.wsa_buf, 1, &selector->rx.size, &selector->rx.flags, \
+                              &selector->rx.overlapped, NULL);                                                 \
+                                                                                                               \
+        if (poll_result == SOCKET_ERROR) {                                                                     \
+            if (WSAGetLastError() == ERROR_IO_PENDING)                                                         \
+                return POLL_PENDING;                                                                           \
+                                                                                                               \
+            return POLL_ERROR;                                                                                 \
+        }                                                                                                      \
     }
 
-#define _SEND_OP(poll, selector)                                                                      \
-    {                                                                                                 \
-        i32_t poll_result;                                                                            \
-                                                                                                      \
-        poll_result = WSASend(selector->fd, &selector->tx.wsa_buf, 1, &selector->tx.bytes_transfered, \
-                              selector->tx.flags, &selector->tx.overlapped, NULL);                    \
-                                                                                                      \
-        if (poll_result == SOCKET_ERROR) {                                                            \
-            if (WSAGetLastError() == ERROR_IO_PENDING)                                                \
-                return POLL_PENDING;                                                                  \
-                                                                                                      \
-            return POLL_ERROR;                                                                        \
-        }                                                                                             \
+#define _SEND_OP(poll, selector)                                                                              \
+    {                                                                                                         \
+        i32_t poll_result;                                                                                    \
+                                                                                                              \
+        poll_result = WSASend(selector->fd, &selector->tx.wsa_buf, 1, &selector->tx.size, selector->tx.flags, \
+                              &selector->tx.overlapped, NULL);                                                \
+                                                                                                              \
+        if (poll_result == SOCKET_ERROR) {                                                                    \
+            if (WSAGetLastError() == ERROR_IO_PENDING)                                                        \
+                return POLL_PENDING;                                                                          \
+                                                                                                              \
+            return POLL_ERROR;                                                                                \
+        }                                                                                                     \
     }
 
 DWORD WINAPI StdinThread(LPVOID prm) {
@@ -382,14 +382,14 @@ i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
     selector->rx.wsa_buf.buf = NULL;
     selector->rx.wsa_buf.len = 0;
     selector->rx.overlapped.hEvent = CreateEvent(NULL, B8_TRUE, B8_FALSE, NULL);
-    selector->rx.bytes_transfered = 0;
+    selector->rx.size = 0;
     selector->tx.flags = 0;
     selector->tx.ignore = B8_FALSE;
     selector->tx.buf = NULL;
     selector->tx.size = 0;
     selector->tx.wsa_buf.buf = NULL;
     selector->tx.wsa_buf.len = 0;
-    selector->tx.bytes_transfered = 0;
+    selector->tx.size = 0;
     selector->tx.overlapped.hEvent = CreateEvent(NULL, B8_TRUE, B8_FALSE, NULL);
     selector->tx.queue = queue_create(TX_QUEUE_SIZE);
 
@@ -411,13 +411,12 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
     // wait for handshake
     while (selector->version == 0) {
         // malformed handshake
-        if ((selector->rx.bytes_transfered == 0) ||
-            (selector->rx.wsa_buf.len == sizeof(struct header_t) && selector->rx.bytes_transfered == 1))
+        if ((selector->rx.size == 0) || (selector->rx.wsa_buf.len == sizeof(struct header_t) && selector->rx.size == 1))
             return POLL_ERROR;
 
         // incomplete handshake
-        if (selector->rx.wsa_buf.buf[selector->rx.bytes_transfered - 1] != '\0') {
-            selector->rx.wsa_buf.len = selector->rx.wsa_buf.len - selector->rx.bytes_transfered;
+        if (selector->rx.wsa_buf.buf[selector->rx.size - 1] != '\0') {
+            selector->rx.wsa_buf.len = selector->rx.wsa_buf.len - selector->rx.size;
             if (selector->rx.wsa_buf.len == 0) {
                 size = selector->rx.size;
                 selector->rx.size *= 2;
@@ -425,7 +424,7 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
                 selector->rx.wsa_buf.buf = (str_p)selector->rx.buf + size;
                 selector->rx.wsa_buf.len = size;
             } else {
-                selector->rx.wsa_buf.buf = selector->rx.wsa_buf.buf + selector->rx.bytes_transfered;
+                selector->rx.wsa_buf.buf = selector->rx.wsa_buf.buf + selector->rx.size;
             }
 
             _RECV_OP(poll, selector);
@@ -433,7 +432,7 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
             continue;
         }
 
-        selector->version = selector->rx.wsa_buf.buf[selector->rx.bytes_transfered - 2];
+        selector->version = selector->rx.wsa_buf.buf[selector->rx.size - 2];
 
         // malformed version
         if (selector->version == 0)
@@ -441,7 +440,7 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
 
         selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
         selector->rx.wsa_buf.len = sizeof(struct header_t);
-        selector->rx.bytes_transfered = 0;
+        selector->rx.size = 0;
 
         // send handshake response
         size = 0;
@@ -464,8 +463,8 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
 
     // read header
     while (!selector->rx.header) {
-        selector->rx.wsa_buf.buf += selector->rx.bytes_transfered;
-        selector->rx.wsa_buf.len -= selector->rx.bytes_transfered;
+        selector->rx.wsa_buf.buf += selector->rx.size;
+        selector->rx.wsa_buf.len -= selector->rx.size;
 
         if (selector->rx.wsa_buf.len != 0) {
             _RECV_OP(poll, selector);
@@ -484,13 +483,13 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
         selector->rx.buf = heap_realloc(selector->rx.buf, selector->rx.size);
         selector->rx.wsa_buf.buf = (str_p)selector->rx.buf + sizeof(struct header_t);
         selector->rx.wsa_buf.len = selector->rx.size - sizeof(struct header_t);
-        selector->rx.bytes_transfered = 0;
+        selector->rx.size = 0;
     }
 
     // read body
     while (selector->rx.wsa_buf.len > 0) {
-        selector->rx.wsa_buf.buf += selector->rx.bytes_transfered;
-        selector->rx.wsa_buf.len -= selector->rx.bytes_transfered;
+        selector->rx.wsa_buf.buf += selector->rx.size;
+        selector->rx.wsa_buf.len -= selector->rx.size;
 
         if (selector->rx.wsa_buf.len == 0)
             break;
@@ -524,8 +523,8 @@ poll_result_t _send(poll_p poll, selector_p selector) {
 
 send:
     while (selector->tx.wsa_buf.len > 0) {
-        selector->tx.wsa_buf.buf += selector->tx.bytes_transfered;
-        selector->tx.wsa_buf.len -= selector->tx.bytes_transfered;
+        selector->tx.wsa_buf.buf += selector->tx.size;
+        selector->tx.wsa_buf.len -= selector->tx.size;
 
         if (selector->tx.wsa_buf.len != 0)
             _SEND_OP(poll, selector);
@@ -549,7 +548,7 @@ send:
         selector->tx.size = size;
         selector->tx.wsa_buf.buf = (str_p)selector->tx.buf;
         selector->tx.wsa_buf.len = selector->tx.size;
-        selector->tx.bytes_transfered = 0;
+        selector->tx.size = 0;
         ((header_t *)selector->tx.buf)->msgtype = msg_type;
         goto send;
     }
@@ -566,7 +565,7 @@ obj_p read_obj(selector_p selector) {
     selector->rx.size = 0;
     selector->rx.wsa_buf.buf = NULL;
     selector->rx.wsa_buf.len = 0;
-    selector->rx.bytes_transfered = 0;
+    selector->rx.size = 0;
 
     return res;
 }
@@ -674,9 +673,9 @@ i64_t poll_run(poll_p poll) {
                             if (overlapped == &(selector->rx.overlapped)) {
                                 if (selector->rx.ignore) {
                                     selector->rx.ignore = B8_FALSE;
-                                    selector->rx.bytes_transfered = 0;
+                                    selector->rx.size = 0;
                                 } else
-                                    selector->rx.bytes_transfered = size;
+                                    selector->rx.size = size;
                             recv:
                                 poll_result = _recv(poll, selector);
 
@@ -696,9 +695,9 @@ i64_t poll_run(poll_p poll) {
                             if (overlapped == &(selector->tx.overlapped)) {
                                 if (selector->tx.ignore) {
                                     selector->tx.ignore = B8_FALSE;
-                                    selector->tx.bytes_transfered = 0;
+                                    selector->tx.size = 0;
                                 } else
-                                    selector->tx.bytes_transfered = size;
+                                    selector->tx.size = size;
 
                                 // setup next send
                                 poll_result = _send(poll, selector);
@@ -752,8 +751,7 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
         if (dwResult == WAIT_FAILED)
             THROW(ERR_IO, "ipc_send_sync: error waiting for event");
 
-        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->tx.overlapped, &selector->tx.bytes_transfered,
-                                 B8_FALSE))
+        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->tx.overlapped, &selector->tx.size, B8_FALSE))
             THROW(ERR_IO, "ipc_send_sync: error getting result");
     }
 
@@ -782,8 +780,7 @@ recv:
         if (dwResult == WAIT_FAILED)
             THROW(ERR_IO, "ipc_send_sync: error waiting for event");
 
-        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->rx.overlapped, &selector->rx.bytes_transfered,
-                                 B8_FALSE))
+        if (!GetOverlappedResult((HANDLE)selector->fd, &selector->rx.overlapped, &selector->rx.size, B8_FALSE))
             THROW(ERR_IO, "ipc_send_sync: error getting result");
 
         poll_result = _recv(poll, selector);

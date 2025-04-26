@@ -31,13 +31,9 @@
 #define MSG_TYPE_SYNC 1
 #define MSG_TYPE_RESP 2
 
-// recv ipc messages
-poll_result_t ipc_on_open(poll_p poll, selector_p selector);
-poll_result_t ipc_on_close(poll_p poll, selector_p selector);
-poll_result_t ipc_recv_handshake(poll_p poll, selector_p selector);
-poll_result_t ipc_recv_msg(poll_p poll, selector_p selector);
-poll_result_t ipc_recv_header(poll_p poll, selector_p selector);
-poll_result_t ipc_on_error(poll_p poll, selector_p selector);
+typedef struct ipc_ctx_t {
+    obj_p name;
+} *ipc_ctx_p;
 
 // send ipc messages
 poll_result_t ipc_send_handshake(poll_p poll, selector_p selector);

@@ -44,6 +44,7 @@ i64_t repl_recv(poll_p poll, selector_p selector) {
         return -1;
     }
 
+    // TODO: pass buff to a term_read
     str = term_read(repl->term);
 
     if (str == NULL)
@@ -55,6 +56,7 @@ i64_t repl_recv(poll_p poll, selector_p selector) {
         return 0;
     }
 
+    poll_rx_buf_release(poll, selector);
     selector->rx.buf = str;
 
     return str->len;
@@ -69,13 +71,17 @@ poll_result_t repl_read(poll_p poll, selector_p selector) {
     str = selector->rx.buf;
 
     if (IS_ERR(str))
-        io_write(STDOUT_FILENO, 2, str);
+        io_write(STDERR_FILENO, 2, str);
     else if (str != NULL_OBJ) {
         res = ray_eval_str(str, repl->name);
-        drop_obj(str);
-        io_write(STDOUT_FILENO, 2, res);
         error = IS_ERR(res);
+        if (error)
+            io_write(STDERR_FILENO, 2, res);
+        else
+            io_write(STDOUT_FILENO, 2, res);
+
         drop_obj(res);
+
         if (!error)
             timeit_print();
     }

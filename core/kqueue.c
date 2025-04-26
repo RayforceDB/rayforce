@@ -168,10 +168,10 @@ i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
     selector->tx.isset = B8_FALSE;
     selector->rx.buf = NULL;
     selector->rx.size = 0;
-    selector->rx.bytes_transfered = 0;
+    selector->rx.size = 0;
     selector->tx.buf = NULL;
     selector->tx.size = 0;
-    selector->tx.bytes_transfered = 0;
+    selector->tx.size = 0;
     selector->tx.queue = queue_create(TX_QUEUE_SIZE);
 
     EV_SET(&ev, fd, EVFILT_READ, EV_ADD, 0, 0, selector);
@@ -217,18 +217,18 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
 
     // wait for handshake
     if (selector->version == 0) {
-        while (selector->rx.bytes_transfered == 0 || selector->rx.buf[selector->rx.bytes_transfered - 1] != '\0') {
-            size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered], sizeof(struct header_t));
+        while (selector->rx.size == 0 || selector->rx.buf[selector->rx.size - 1] != '\0') {
+            size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.size], sizeof(struct header_t));
             if (size == -1)
                 return POLL_ERROR;
             else if (size == 0)
                 return POLL_PENDING;
 
-            selector->rx.bytes_transfered += size;
+            selector->rx.size += size;
         }
 
-        selector->version = selector->rx.buf[selector->rx.bytes_transfered - 2];
-        selector->rx.bytes_transfered = 0;
+        selector->version = selector->rx.buf[selector->rx.size - 2];
+        selector->rx.size = 0;
 
         // send handshake response
         size = 0;
@@ -244,15 +244,15 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
 
     // read header
     if (selector->rx.size == 0) {
-        while (selector->rx.bytes_transfered < (i64_t)sizeof(struct header_t)) {
-            size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered],
-                             sizeof(struct header_t) - selector->rx.bytes_transfered);
+        while (selector->rx.size < (i64_t)sizeof(struct header_t)) {
+            size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.size],
+                             sizeof(struct header_t) - selector->rx.size);
             if (size == -1)
                 return POLL_ERROR;
             else if (size == 0)
                 return POLL_PENDING;
 
-            selector->rx.bytes_transfered += size;
+            selector->rx.size += size;
         }
 
         header = (header_t *)selector->rx.buf;
@@ -261,15 +261,14 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
         selector->rx.buf = (u8_t *)heap_realloc(selector->rx.buf, selector->rx.size);
     }
 
-    while (selector->rx.bytes_transfered < selector->rx.size) {
-        size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered],
-                         selector->rx.size - selector->rx.bytes_transfered);
+    while (selector->rx.size < selector->rx.size) {
+        size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.size], selector->rx.size - selector->rx.size);
         if (size == -1)
             return POLL_ERROR;
         else if (size == 0)
             return POLL_PENDING;
 
-        selector->rx.bytes_transfered += size;
+        selector->rx.size += size;
     }
 
     return POLL_DONE;
@@ -285,9 +284,8 @@ poll_result_t _send(poll_p poll, selector_p selector) {
     struct kevent ev;
 
 send:
-    while (selector->tx.bytes_transfered < selector->tx.size) {
-        size = sock_send(selector->fd, &selector->tx.buf[selector->tx.bytes_transfered],
-                         selector->tx.size - selector->tx.bytes_transfered);
+    while (selector->tx.size < selector->tx.size) {
+        size = sock_send(selector->fd, &selector->tx.buf[selector->tx.size], selector->tx.size - selector->tx.size);
         if (size == -1)
             return POLL_ERROR;
         else if (size == 0) {
@@ -302,13 +300,13 @@ send:
             return POLL_PENDING;
         }
 
-        selector->tx.bytes_transfered += size;
+        selector->tx.size += size;
     }
 
     heap_free(selector->tx.buf);
     selector->tx.buf = NULL;
     selector->tx.size = 0;
-    selector->tx.bytes_transfered = 0;
+    selector->tx.size = 0;
 
     v = queue_pop(selector->tx.queue);
 
@@ -342,7 +340,7 @@ obj_p read_obj(selector_p selector) {
     res = de_raw(selector->rx.buf, selector->rx.size);
     heap_free(selector->rx.buf);
     selector->rx.buf = NULL;
-    selector->rx.bytes_transfered = 0;
+    selector->rx.size = 0;
     selector->rx.size = 0;
 
     return res;

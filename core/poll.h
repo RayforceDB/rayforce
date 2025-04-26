@@ -80,7 +80,7 @@ typedef struct selector_t {
         b8_t header;
         OVERLAPPED overlapped;
         DWORD flags;
-        DWORD bytes_transfered;
+        DWORD size;
         i64_t size;
         u8_t *buf;
         WSABUF wsa_buf;
@@ -90,7 +90,7 @@ typedef struct selector_t {
         b8_t ignore;
         OVERLAPPED overlapped;
         DWORD flags;
-        DWORD bytes_transfered;
+        DWORD size;
         i64_t size;
         u8_t *buf;
         WSABUF wsa_buf;
@@ -113,7 +113,7 @@ typedef struct selector_t {
     raw_p data;
 
     struct {
-        i64_t bytes_transfered;
+        i64_t size;
         obj_p buf;
         poll_recv_fn recv_fn;  // to be called when the selector is ready to read
         poll_read_fn read_fn;  // to be called when the recv_fn returns POLL_READY
@@ -121,7 +121,7 @@ typedef struct selector_t {
 
     struct {
         b8_t isset;
-        i64_t bytes_transfered;
+        i64_t size;
         obj_p buf;
         queue_p queue;         // queue for buffers waiting to be sent
         poll_send_fn send_fn;  // to be called when the selector is ready to send
@@ -161,6 +161,8 @@ i64_t poll_run(poll_p poll);
 i64_t poll_register(poll_p poll, poll_registry_p registry);
 nil_t poll_deregister(poll_p poll, i64_t id);
 selector_p poll_get_selector(poll_p poll, i64_t id);
+i64_t poll_rx_buf_request(poll_p poll, selector_p selector, i64_t size);
+i64_t poll_rx_buf_release(poll_p poll, selector_p selector);
 
 // Exit the app
 nil_t poll_exit(poll_p poll, i64_t code);

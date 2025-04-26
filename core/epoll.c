@@ -31,6 +31,8 @@
 
 __thread i32_t __EVENT_FD;  // eventfd to notify epoll loop of shutdown
 
+#define INITIAL_RX_BUFFER_SIZE 16
+
 nil_t sigint_handler(i32_t signo) {
     u64_t val = 1;
     i32_t res;
@@ -113,10 +115,10 @@ i64_t poll_register(poll_p poll, poll_registry_p registry) {
     selector->tx.send_fn = registry->send_fn;
     selector->data = registry->data;
     selector->tx.isset = B8_FALSE;
-    selector->rx.buf = NULL_OBJ;
-    selector->rx.bytes_transfered = 0;
+    selector->rx.buf = C8(INITIAL_RX_BUFFER_SIZE);
+    selector->rx.size = 0;
     selector->tx.buf = NULL_OBJ;
-    selector->tx.bytes_transfered = 0;
+    selector->tx.size = 0;
     selector->tx.queue = queue_create(TX_QUEUE_SIZE);
 
     ev.events = registry->events;
@@ -155,14 +157,14 @@ nil_t poll_deregister(poll_p poll, i64_t id) {
 poll_result_t poll_recv(poll_p poll, selector_p selector) {
     i64_t size;
 
-    while (selector->rx.bytes_transfered < selector->rx.buf->len || is_null(selector->rx.buf)) {
+    while (selector->rx.size < selector->rx.buf->len || is_null(selector->rx.buf)) {
         size = selector->rx.recv_fn(poll, selector);
         if (size == -1)
             return POLL_ERROR;
         else if (size == 0)
             return POLL_PENDING;
 
-        selector->rx.bytes_transfered += size;
+        selector->rx.size += size;
     }
 
     return POLL_READY;
@@ -174,7 +176,7 @@ poll_result_t poll_send(poll_p poll, selector_p selector) {
     struct epoll_event ev;
 
 send:
-    while (selector->tx.bytes_transfered < selector->tx.buf->len) {
+    while (selector->tx.size < selector->tx.buf->len) {
         size = selector->tx.send_fn(poll, selector);
         if (size == -1)
             return POLL_ERROR;
@@ -191,13 +193,13 @@ send:
             return POLL_PENDING;
         }
 
-        selector->tx.bytes_transfered += size;
+        selector->tx.size += size;
     }
 
     // reset tx buffer
     drop_obj(selector->tx.buf);
     selector->tx.buf = NULL_OBJ;
-    selector->tx.bytes_transfered = 0;
+    selector->tx.size = 0;
 
     buf = (obj_p)queue_pop(selector->tx.queue);
 
@@ -266,10 +268,7 @@ i64_t poll_run(poll_p poll) {
                 if (poll_result == POLL_READY && selector->rx.read_fn != NULL)
                     poll_result = selector->rx.read_fn(poll, selector);
 
-                // clear rx buffer
-                selector->rx.bytes_transfered = 0;
-                drop_obj(selector->rx.buf);
-                selector->rx.buf = NULL_OBJ;
+                selector->rx.size = 0;
 
                 if (poll_result == POLL_ERROR)
                     poll_deregister(poll, selector->id);
@@ -286,4 +285,30 @@ i64_t poll_run(poll_p poll) {
     }
 
     return poll->code;
+}
+
+i64_t poll_rx_buf_request(poll_p poll, selector_p selector, i64_t size) {
+    if (selector->rx.buf == NULL_OBJ)
+        selector->rx.buf = heap_alloc(size);
+    else {
+        if (selector->rx.buf->len < size) {
+            selector->rx.buf = heap_realloc(selector->rx.buf, size + sizeof(struct obj_t));
+
+            if (selector->rx.buf == NULL)
+                return -1;
+
+            selector->rx.buf->len = size;
+        }
+    }
+
+    selector->rx.size = size;
+
+    return size;
+}
+
+i64_t poll_rx_buf_release(poll_p poll, selector_p selector) {
+    drop_obj(selector->rx.buf);
+    selector->rx.buf = NULL_OBJ;
+    selector->rx.size = 0;
+    return 0;
 }
