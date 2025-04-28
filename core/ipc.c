@@ -259,74 +259,11 @@ poll_result_t ipc_on_close(poll_p poll, selector_p selector) {
 
     ipc_ctx_p ctx;
 
+    ipc_call_usr_cb(poll, selector, ".z.pc", 5);
+
     ctx = (ipc_ctx_p)selector->data;
     drop_obj(ctx->name);
     heap_free(ctx);
-
-    return POLL_OK;
-}
-
-// Send
-poll_result_t _send(poll_p poll, selector_p selector) {
-    UNUSED(poll);
-    UNUSED(selector);
-
-    //     i64_t size;
-    //     obj_p obj;
-    //     nil_t *v;
-    //     i8_t msg_type = MSG_TYPE_RESP;
-    //     struct epoll_event ev;
-
-    // send:
-    //     while (selector->tx.size < selector->tx.size) {
-    //         size = sock_send(selector->fd, &selector->tx.buf[selector->tx.size],
-    //                          selector->tx.size - selector->tx.size);
-    //         if (size == -1)
-    //             return POLL_ERROR;
-    //         else if (size == 0) {
-    //             // setup epoll for EPOLLOUT only if it's not already set
-    //             if (!selector->tx.isset) {
-    //                 selector->tx.isset = B8_TRUE;
-    //                 ev.events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP;
-    //                 ev.data.ptr = selector;
-    //                 if (epoll_ctl(poll->fd, EPOLL_CTL_MOD, selector->fd, &ev) == -1)
-    //                     return POLL_ERROR;
-    //             }
-
-    //             return POLL_OK;
-    //         }
-
-    //         selector->tx.size += size;
-    //     }
-
-    //     heap_free(selector->tx.buf);
-    //     selector->tx.buf = NULL;
-    //     selector->tx.size = 0;
-    //     selector->tx.size = 0;
-
-    //     v = queue_pop(selector->tx.queue);
-
-    //     if (v != NULL) {
-    //         obj = (obj_p)((i64_t)v & ~(3ll << 61));
-    //         msg_type = (((i64_t)v & (3ll << 61)) >> 61);
-    //         size = ser_raw(&selector->tx.buf, obj);
-    //         selector->tx.size = size;
-    //         drop_obj(obj);
-    //         if (size == -1)
-    //             return POLL_ERROR;
-
-    //         ((header_t *)selector->tx.buf)->msgtype = msg_type;
-    //         goto send;
-    //     }
-
-    //     // remove EPOLLOUT only if it's set
-    //     if (selector->tx.isset) {
-    //         selector->tx.isset = B8_FALSE;
-    //         ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-    //         ev.data.ptr = selector;
-    //         if (epoll_ctl(poll->fd, EPOLL_CTL_MOD, selector->fd, &ev) == -1)
-    //             return POLL_ERROR;
-    //     }
 
     return POLL_OK;
 }
