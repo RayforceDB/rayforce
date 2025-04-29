@@ -561,14 +561,22 @@ i64_t hash_murmur3(i64_t key, raw_p seed) {
 i64_t hash_guid(i64_t a, raw_p seed) {
     UNUSED(seed);
     guid_t *g = (guid_t *)a;
-    i64_t upper_part, lower_part;
+    i64_t hash = 0xcbf29ce484222325ull;  // FNV-1a offset basis
 
-    // Cast the first and second halves of the GUID to i64_t
-    memcpy(&upper_part, *g, sizeof(i64_t));
-    memcpy(&lower_part, *g + 8, sizeof(i64_t));
+    // Hash each byte of the GUID
+    for (size_t i = 0; i < sizeof(guid_t); i++) {
+        hash ^= ((u8_t *)g)[i];
+        hash *= 1099511628211ull;  // FNV-1a prime
+    }
 
-    // Combine the two parts
-    return upper_part ^ lower_part;
+    // Final mixing step
+    hash ^= hash >> 33;
+    hash *= 0xff51afd7ed558ccdull;
+    hash ^= hash >> 33;
+    hash *= 0xc4ceb9fe1a85ec53ull;
+    hash ^= hash >> 33;
+
+    return hash;
 }
 
 i64_t hash_i64(i64_t a, raw_p seed) {
@@ -594,5 +602,5 @@ i64_t hash_cmp_obj(i64_t a, i64_t b, raw_p seed) {
 i64_t hash_cmp_guid(i64_t a, i64_t b, raw_p seed) {
     UNUSED(seed);
     guid_t *g1 = (guid_t *)a, *g2 = (guid_t *)b;
-    return memcmp(*g1, *g2, sizeof(guid_t));
+    return memcmp(g1, g2, sizeof(guid_t));
 }

@@ -28,7 +28,7 @@
 nil_t guid_generate(guid_t *g) {
     i64_t i;
 
-    for (i = 0; i < 16; i++)
+    for (i = 0; i < ISIZEOF(guid_t); i++)
         (*g)[i] = ops_rand_u64() % 256;
 
     // Set the version to 4 for a random UUID
