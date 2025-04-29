@@ -257,6 +257,7 @@ poll_result_t poll_run(poll_p poll) {
             return POLL_ERROR;
         }
 
+    process_events:
         for (n = 0; n < nfds; n++) {
             ev = events[n];
 
@@ -285,11 +286,11 @@ poll_result_t poll_run(poll_p poll) {
 
                         if (poll_result == POLL_ERROR) {
                             poll_deregister(poll, selector->id);
-                            continue;
+                            goto process_events;
                         }
 
                         if (poll_result == POLL_OK)
-                            continue;
+                            break;
                     }
 
                     if (POLL_IS_READY(poll_result) && selector->rx.read_fn != NULL)
@@ -303,10 +304,18 @@ poll_result_t poll_run(poll_p poll) {
 
             // write
             if (ev.events & POLL_EVENT_WRITE) {
-                poll_result = poll_send(poll, selector);
+                do {
+                    poll_result = poll_send(poll, selector);
 
-                if (poll_result == POLL_ERROR)
-                    poll_deregister(poll, selector->id);
+                    if (poll_result == POLL_ERROR) {
+                        poll_deregister(poll, selector->id);
+                        goto process_events;
+                    }
+
+                    if (poll_result == POLL_OK)
+                        break;
+
+                } while (selector->tx.buf != NULL);
             }
         }
     }

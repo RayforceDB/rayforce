@@ -147,20 +147,14 @@ poll_result_t ipc_call_usr_cb(poll_p poll, selector_p selector, lit_p sym, i64_t
 poll_result_t ipc_read_handshake(poll_p poll, selector_p selector) {
     UNUSED(poll);
 
-    i64_t sz, size;
+    poll_buffer_p buf;
     u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
 
     if (selector->rx.buf->offset > 0 && selector->rx.buf->data[selector->rx.buf->offset - 1] == '\0') {
         // send handshake response
-        size = 0;
-        while (size < ISIZEOF(handshake)) {
-            sz = sock_send(selector->fd, &handshake[size], ISIZEOF(handshake) - size);
-
-            if (sz == -1)
-                return POLL_ERROR;
-
-            size += sz;
-        }
+        buf = poll_buf_create(ISIZEOF(handshake));
+        memcpy(buf->data, handshake, ISIZEOF(handshake));
+        poll_send_buf(poll, selector, buf);
 
         // Now we are ready for income messages and can call userspace callback (if any)
         ipc_call_usr_cb(poll, selector, ".z.po", 5);
@@ -196,8 +190,10 @@ poll_result_t ipc_read_header(poll_p poll, selector_p selector) {
 poll_result_t ipc_read_msg_sync(poll_p poll, selector_p selector) {
     UNUSED(poll);
 
+    i64_t size;
     obj_p v, res;
     ipc_ctx_p ctx;
+    poll_buffer_p buf;
 
     ctx = (ipc_ctx_p)selector->data;
 
@@ -223,13 +219,10 @@ poll_result_t ipc_read_msg_sync(poll_p poll, selector_p selector) {
     selector->rx.read_fn = ipc_read_header;
 
     // respond
-    // queue_push(selector->tx.queue, (nil_t *)((i64_t)v | ((i64_t)MSG_TYPE_RESP << 61)));
-    // poll_result = _send(poll, selector);
-
-    //     if (poll_result == POLL_ERROR)
-    //         poll_deregister(poll, selector->id);
-    // } else
-
+    size = size_obj(v);
+    buf = poll_buf_create(size);
+    save_obj(buf->data, size, v);
+    poll_send_buf(poll, selector, buf);
     drop_obj(v);
 
     return POLL_READY;

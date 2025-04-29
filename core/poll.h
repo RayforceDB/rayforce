@@ -179,9 +179,12 @@ poll_result_t poll_run(poll_p poll);
 poll_result_t poll_register(poll_p poll, poll_registry_p registry);
 poll_result_t poll_deregister(poll_p poll, i64_t id);
 selector_p poll_get_selector(poll_p poll, i64_t id);
+poll_buffer_p poll_buf_create(i64_t size);
+nil_t poll_buf_destroy(poll_buffer_p buf);
 poll_result_t poll_rx_buf_request(poll_p poll, selector_p selector, i64_t size);
 poll_result_t poll_rx_buf_release(poll_p poll, selector_p selector);
 poll_result_t poll_rx_buf_reset(poll_p poll, selector_p selector);
+poll_result_t poll_send_buf(poll_p poll, selector_p selector, poll_buffer_p buf);
 
 // Exit the app
 nil_t poll_exit(poll_p poll, i64_t code);
