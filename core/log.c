@@ -1,3 +1,5 @@
+#ifdef DEBUG
+
 #include "log.h"
 #include "def.h"
 #include "os.h"
@@ -13,41 +15,30 @@ static b8_t level_initialized = B8_FALSE;
 
 // Parse log level and file filters from environment variable
 static void parse_log_config(c8_t* config) {
-    fprintf(stderr, "Parsing config: %s\n", config);
     str_p level_end = strchr(config, '[');
     str_p files_start = level_end;
     str_p files_end = strchr(config, ']');
 
     // Parse log level
-    if (level_end) {
+    if (level_end)
         *level_end = '\0';
-    }
 
     // Convert to uppercase for case-insensitive comparison
-    for (str_p p = config; *p; p++) {
+    for (str_p p = config; *p; p++)
         *p = toupper(*p);
-    }
 
-    fprintf(stderr, "Comparing level: %s\n", config);
-    if (strcmp(config, "OFF") == 0) {
+    if (strcmp(config, "OFF") == 0)
         current_level = LOG_LEVEL_OFF;
-        fprintf(stderr, "Setting level to OFF (0)\n");
-    } else if (strcmp(config, "ERROR") == 0) {
+    else if (strcmp(config, "ERROR") == 0)
         current_level = LOG_LEVEL_ERROR;
-        fprintf(stderr, "Setting level to ERROR (1)\n");
-    } else if (strcmp(config, "WARN") == 0) {
+    else if (strcmp(config, "WARN") == 0)
         current_level = LOG_LEVEL_WARN;
-        fprintf(stderr, "Setting level to WARN (2)\n");
-    } else if (strcmp(config, "INFO") == 0) {
+    else if (strcmp(config, "INFO") == 0)
         current_level = LOG_LEVEL_INFO;
-        fprintf(stderr, "Setting level to INFO (3)\n");
-    } else if (strcmp(config, "DEBUG") == 0) {
+    else if (strcmp(config, "DEBUG") == 0)
         current_level = LOG_LEVEL_DEBUG;
-        fprintf(stderr, "Setting level to DEBUG (4)\n");
-    } else if (strcmp(config, "TRACE") == 0) {
+    else if (strcmp(config, "TRACE") == 0)
         current_level = LOG_LEVEL_TRACE;
-        fprintf(stderr, "Setting level to TRACE (5)\n");
-    }
 
     // Parse file filters if present
     if (files_start && files_end) {
@@ -60,8 +51,6 @@ static void parse_log_config(c8_t* config) {
             if (*p == ',')
                 num_filters++;
         }
-
-        fprintf(stderr, "Found %d file filters\n", num_filters);
 
         // Allocate and copy file filters
         file_filters = (str_p)malloc(strlen(files_start) + 1);
@@ -78,16 +67,12 @@ static void parse_log_config(c8_t* config) {
 // Initialize log level from environment variable
 static void init_log_level(nil_t) {
     if (!level_initialized) {
-        fprintf(stderr, "Initializing log level...\n");
         c8_t config[256];
         if (os_get_var("RAYFORCE_LOG_LEVEL", config, sizeof(config)) == 0) {
-            fprintf(stderr, "Got environment variable: %s\n", config);
             parse_log_config(config);
-            fprintf(stderr, "Final log level: %d\n", current_level);
         } else {
             // If environment variable is not set, use default level
             current_level = LOG_LEVEL_INFO;
-            fprintf(stderr, "Using default log level: %d\n", current_level);
         }
         level_initialized = B8_TRUE;
     }
@@ -174,7 +159,6 @@ static lit_p get_level_name(log_level_t level) {
 nil_t log_internal(log_level_t level, lit_p file, i32_t line, lit_p func, lit_p fmt, ...) {
     // Get current log level
     log_level_t current = log_get_level();
-    printf("level: %d, current_level: %d\n", level, current);
 
     // Filter messages based on log level
     // If current level is OFF (0), show nothing
@@ -211,3 +195,5 @@ nil_t log_internal(log_level_t level, lit_p file, i32_t line, lit_p func, lit_p 
 
     va_end(args);
 }
+
+#endif  // DEBUG
