@@ -256,6 +256,7 @@ poll_result_t ipc_on_open(poll_p poll, selector_p selector) {
 
 poll_result_t ipc_on_error(poll_p poll, selector_p selector) {
     UNUSED(poll);
+    UNUSED(selector);
     LOG_ERROR("Error occurred on connection %lld", selector->id);
     return POLL_OK;
 }

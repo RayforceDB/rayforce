@@ -1959,7 +1959,10 @@ i64_t find_raw(obj_p obj, raw_p val) {
             return NULL_I64;
         case TYPE_GUID:
             for (i = 0; i < l; i++)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
                 if (memcmp(AS_GUID(obj)[i], *(guid_t *)val, sizeof(guid_t)) == 0)
+#pragma GCC diagnostic pop
                     return i;
             return NULL_I64;
         case TYPE_LIST:
