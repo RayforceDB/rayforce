@@ -229,16 +229,7 @@ obj_p io_write(i64_t fd, u8_t msg_type, obj_p obj) {
             if (!ray_is_main_thread())
                 THROW(ERR_NOT_SUPPORTED, "write sock: expected main thread");
 
-            switch (msg_type) {
-                case MSG_TYPE_RESP:
-                    return ipc_send_async(runtime_get()->poll, fd, clone_obj(obj));
-                case MSG_TYPE_ASYN:
-                    return ipc_send_async(runtime_get()->poll, fd, clone_obj(obj));
-                case MSG_TYPE_SYNC:
-                    return ipc_send_sync(runtime_get()->poll, fd, clone_obj(obj));
-                default:
-                    THROW(ERR_TYPE, "write: unsupported msg type: '%d", msg_type);
-            }
+            return ipc_send(runtime_get()->poll, fd, obj, msg_type);
     }
 }
 

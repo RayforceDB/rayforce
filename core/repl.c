@@ -77,7 +77,7 @@ option_t repl_read(poll_p poll, selector_p selector) {
 
     if (!term_getc(repl->term)) {
         poll->code = 1;
-        return option_error("term_getc failed");
+        return option_error(sys_error(ERR_IO, "term_getc failed"));
     }
 
     str = term_read(repl->term);

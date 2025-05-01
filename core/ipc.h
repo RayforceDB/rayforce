@@ -33,6 +33,7 @@
 #define MSG_TYPE_RESP 2
 
 typedef struct ipc_ctx_t {
+    u8_t msgtype;
     obj_p name;
 } *ipc_ctx_p;
 
@@ -53,7 +54,6 @@ i64_t ipc_listen(poll_p poll, i64_t port);
 i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout);
 
 // send messages
-obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg);
-obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg);
+obj_p ipc_send(poll_p poll, i64_t id, obj_p msg, u8_t msgtype);
 
 #endif  // IPC_H

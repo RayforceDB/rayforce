@@ -37,7 +37,14 @@
 #endif
 
 selector_p poll_get_selector(poll_p poll, i64_t id) {
-    return (selector_p)freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
+    i64_t idx;
+
+    idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
+
+    if (idx == NULL_I64)
+        return NULL;
+
+    return (selector_p)idx;
 }
 
 poll_buffer_p poll_buf_create(i64_t size) {

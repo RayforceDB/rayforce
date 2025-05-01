@@ -53,7 +53,7 @@ static inline __attribute__((always_inline, const)) option_t option_none() {
 }
 
 // Create an Error variant
-static inline __attribute__((always_inline, const)) option_t option_error(lit_p msg) {
+static inline __attribute__((always_inline, const)) option_t option_error(obj_p msg) {
     return (option_t){.code = OPTION_CODE_ERROR, .value = (raw_p)msg};
 }
 

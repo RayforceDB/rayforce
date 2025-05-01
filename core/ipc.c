@@ -47,6 +47,7 @@ option_t ipc_listener_accept(poll_p poll, selector_p selector) {
     if (fd != -1) {
         ctx = (ipc_ctx_p)heap_alloc(sizeof(struct ipc_ctx_t));
         ctx->name = string_from_str("ipc", 4);
+        ctx->msgtype = MSG_TYPE_RESP;
 
         registry.fd = fd;
         registry.type = SELECTOR_TYPE_SOCKET;
@@ -63,7 +64,8 @@ option_t ipc_listener_accept(poll_p poll, selector_p selector) {
         if (poll_register(poll, &registry) == -1) {
             LOG_ERROR("Failed to register new connection in poll registry");
             heap_free(ctx);
-            return option_error("ipc_listener_accept: failed to register new connection in poll registry");
+            return option_error(
+                sys_error(ERR_IO, "ipc_listener_accept: failed to register new connection in poll registry"));
         }
 
         LOG_INFO("New connection registered successfully");
@@ -202,7 +204,7 @@ option_t ipc_read_handshake(poll_p poll, selector_p selector) {
     if (selector->rx.buf == NULL) {
         LOG_DEBUG("No handshake buffer received, closing connection");
         poll_deregister(poll, selector->id);
-        return option_error("ipc_read_handshake: no handshake buffer received, closing connection");
+        return option_error(sys_error(ERR_IO, "ipc_read_handshake: no handshake buffer received, closing connection"));
     }
 
     if (selector->rx.buf->offset > 0 && selector->rx.buf->data[selector->rx.buf->offset - 1] == '\0') {
@@ -231,9 +233,11 @@ option_t ipc_read_header(poll_p poll, selector_p selector) {
     UNUSED(poll);
 
     ipc_header_t *header;
+    ipc_ctx_p ctx;
 
     LOG_DEBUG("Reading header from connection %lld", selector->id);
 
+    ctx = (ipc_ctx_p)selector->data;
     header = (ipc_header_t *)selector->rx.buf->data;
 
     LOG_TRACE("Header read: {.prefix: 0x%08x, .version: %d, .flags: %d, .endian: %d, .msgtype: %d, .size: %lld}",
@@ -245,6 +249,7 @@ option_t ipc_read_header(poll_p poll, selector_p selector) {
 
     LOG_DEBUG("Switching to message reading mode");
     selector->rx.read_fn = ipc_read_msg;
+    ctx->msgtype = header->msgtype;
 
     return option_some(NULL);
 }
@@ -256,9 +261,7 @@ option_t ipc_read_msg(poll_p poll, selector_p selector) {
     ipc_ctx_p ctx;
 
     ctx = (ipc_ctx_p)selector->data;
-
     LOG_DEBUG("Reading message from connection %.*s", (i32_t)ctx->name->len, AS_C8(ctx->name));
-
     res = de_raw(selector->rx.buf->data, selector->rx.buf->size);
 
     // Prepare for the next message
@@ -267,13 +270,6 @@ option_t ipc_read_msg(poll_p poll, selector_p selector) {
     selector->rx.read_fn = ipc_read_header;
 
     return option_some(res);
-}
-
-option_t ipc_read_msg_async(poll_p poll, selector_p selector) {
-    UNUSED(poll);
-    UNUSED(selector);
-
-    return option_none();
 }
 
 // ============================================================================
@@ -310,16 +306,14 @@ nil_t ipc_send_msg(poll_p poll, selector_p selector, obj_p msg, u8_t msgtype) {
     poll_buffer_p buf;
     ipc_header_t *header;
 
-    LOG_TRACE("Serializing response message");
+    LOG_TRACE("Serializing message");
     size = size_obj(msg);
     buf = poll_buf_create(ISIZEOF(struct ipc_header_t) + size);
     ser_raw(buf->data, size, msg);
     header = (ipc_header_t *)buf->data;
     header->msgtype = msgtype;
-    LOG_DEBUG("Sending response message of size %lld", size);
+    LOG_DEBUG("Sending message of size %lld", size);
     poll_send_buf(poll, selector, buf);
-
-    drop_obj(msg);
 }
 
 nil_t ipc_on_data(poll_p poll, selector_p selector, raw_p data) {
@@ -327,15 +321,21 @@ nil_t ipc_on_data(poll_p poll, selector_p selector, raw_p data) {
 
     LOG_TRACE("Received data from connection %lld", selector->id);
 
+    ipc_ctx_p ctx;
     obj_p v, res;
 
+    ctx = (ipc_ctx_p)selector->data;
     res = (obj_p)data;
 
     poll_set_usr_fd(selector->id);
     v = ipc_process_msg(poll, selector, res);
     poll_set_usr_fd(0);
 
-    ipc_send_msg(poll, selector, v, MSG_TYPE_RESP);
+    // Send a response if the message is a synchronous request
+    if (ctx->msgtype == MSG_TYPE_SYNC)
+        ipc_send_msg(poll, selector, v, MSG_TYPE_RESP);
+
+    drop_obj(v);
 }
 
 nil_t ipc_on_open(poll_p poll, selector_p selector) {
@@ -376,81 +376,47 @@ nil_t ipc_on_close(poll_p poll, selector_p selector) {
 // Message Sending
 // ============================================================================
 
-obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
+obj_p ipc_send(poll_p poll, i64_t id, obj_p msg, u8_t msgtype) {
     selector_p selector;
     option_t result;
-    poll_buffer_p buf;
-    i64_t nb, idx, size;
-    obj_p res;
+    obj_p v, res;
+    ipc_ctx_p ctx;
 
     LOG_DEBUG("Starting synchronous IPC send for id %lld", id);
 
-    // Get the selector for the given id
-    idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
-    if (idx == NULL_I64) {
-        LOG_ERROR("Invalid socket fd %lld", id);
-        return sys_error(ERR_IO, "ipc_send_sync: invalid socket fd");
-    }
-
-    selector = (selector_p)idx;
+    selector = poll_get_selector(poll, id);
     if (selector == NULL) {
         LOG_ERROR("Invalid selector for fd %lld", id);
-        return sys_error(ERR_IO, "ipc_send_sync: invalid selector for fd");
+        return sys_error(ERR_IO, "ipc_send: invalid selector for fd");
     }
 
-    LOG_DEBUG("Setting up message buffer for fd %lld", selector->fd);
-    // Set up the message in the selector's transmit buffer
-    size = size_obj(msg);
-    buf = poll_buf_create(ISIZEOF(struct ipc_header_t) + size);
-    if (buf == NULL) {
-        LOG_ERROR("Failed to create message buffer");
-        return sys_error(ERR_IO, "ipc_send_sync: failed to create message buffer");
-    }
-
-    LOG_TRACE("Serializing message");
-    ser_raw(buf->data, size, msg);
-    ((ipc_header_t *)buf->data)->msgtype = MSG_TYPE_SYNC;
-
-    LOG_DEBUG("Sending message on fd %lld", selector->fd);
-    nb = poll_send_buf(poll, selector, buf);
-    if (nb == -1) {
-        LOG_ERROR("Failed to send message on fd %lld", selector->fd);
-        return sys_error(ERR_IO, "ipc_send_sync: error sending message");
-    }
+    ctx = (ipc_ctx_p)selector->data;
+    ipc_send_msg(poll, selector, msg, msgtype);
 
     res = NULL_OBJ;
 
-    do {
-        result = poll_block_on(poll, selector);
+    // wait for the response
+    if (msgtype == MSG_TYPE_SYNC) {
+        do {
+            result = poll_block_on(poll, selector);
 
-        if (option_is_some(&result)) {
-            res = option_take(&result);
-            break;
-        }
+            if (option_is_some(&result) && result.value != NULL) {
+                res = option_take(&result);
+                // If the message is a response, break the loop
+                if (ctx->msgtype == MSG_TYPE_RESP)
+                    break;
 
-    } while (option_is_none(&result));
+                // Process the request otherwise
+                v = ipc_process_msg(poll, selector, res);
+                drop_obj(res);
+                drop_obj(v);
+            } else if (option_is_error(&result)) {
+                LOG_ERROR("Error occurred on connection %lld", selector->id);
+                return option_take(&result);
+            }
+
+        } while (option_is_none(&result));
+    }
 
     return res;
-}
-
-obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg) {
-    UNUSED(poll);
-    UNUSED(id);
-    UNUSED(msg);
-
-    // idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
-
-    // if (idx == NULL_I64)
-    //     THROW(ERR_IO, "ipc_send_sync: invalid socket fd: %lld", id);
-
-    // selector = (selector_p)idx;
-    // if (selector == NULL)
-    //     THROW(ERR_IO, "ipc_send_async: invalid socket fd: %lld", id);
-
-    // queue_push(selector->tx.queue, (nil_t *)msg);
-
-    // if (_send(poll, selector) == POLL_ERROR)
-    //     THROW(ERR_IO, "ipc_send_async: error sending message");
-
-    return NULL_OBJ;
 }
