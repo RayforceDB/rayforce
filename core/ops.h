@@ -156,7 +156,7 @@ extern struct obj_t __NULL_OBJECT;
 #define XBARF64(x, y) (FLOORF64((x) / (y)) * (y))
 
 // Function types
-typedef i64_t (*hash_f)(i64_t, raw_p);
+typedef u64_t (*hash_f)(i64_t, raw_p);
 typedef i64_t (*cmp_f)(i64_t, i64_t, raw_p);
 typedef obj_p (*unary_f)(obj_p);
 typedef obj_p (*binary_f)(obj_p, obj_p);

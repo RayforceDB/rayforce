@@ -61,26 +61,26 @@ i64_t ht_bk_insert_with(ht_bk_p ht, i64_t key, i64_t val, hash_f hash, cmp_f cmp
 i64_t ht_bk_insert_with_par(ht_bk_p ht, i64_t key, i64_t val, hash_f hash, cmp_f cmp, raw_p seed);
 i64_t ht_bk_get(ht_bk_p ht, i64_t key);
 
-// Knuth's multiplicative hash
-i64_t hash_kmh(i64_t key, raw_p seed);
-// FNV-1a hash
-i64_t hash_fnv1a(i64_t key, raw_p seed);
-i64_t hash_murmur3(i64_t key, raw_p seed);
+// Hash functions
+u64_t hash_kmh(i64_t key, raw_p seed);
+u64_t hash_fnv1a(i64_t key, raw_p seed);
+u64_t hash_murmur3(i64_t key, raw_p seed);
 
 // Identity
-i64_t hash_i64(i64_t a, raw_p seed);
-i64_t hash_obj(i64_t a, raw_p seed);
-i64_t hash_guid(i64_t a, raw_p seed);
+u64_t hash_i64(i64_t a, raw_p seed);
+u64_t hash_obj(i64_t a, raw_p seed);
+u64_t hash_guid(i64_t a, raw_p seed);
+
 // Compare
 i64_t hash_cmp_obj(i64_t a, i64_t b, raw_p seed);
 i64_t hash_cmp_guid(i64_t a, i64_t b, raw_p seed);
 i64_t hash_cmp_i64(i64_t a, i64_t b, raw_p seed);
 
 // Special hashes
-i64_t hash_index_obj(obj_p obj);
-inline __attribute__((always_inline)) i64_t hash_index_u64(i64_t h, i64_t k) {
-    const i64_t s = U64_HASH_SEED;
-    i64_t a, b;
+u64_t hash_index_obj(obj_p obj);
+inline __attribute__((always_inline)) u64_t hash_index_u64(u64_t h, u64_t k) {
+    const u64_t s = U64_HASH_SEED;
+    u64_t a, b;
 
     a = (h ^ k) * s;
     a ^= (a >> 47);

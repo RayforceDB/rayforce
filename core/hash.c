@@ -85,7 +85,7 @@ nil_t ht_oa_rehash(obj_p *obj, hash_f hash, raw_p seed) {
             key = orig_keys[i];
 
             // Recalculate the index for the new table
-            start = hash ? hash(key, seed) % new_size : (i64_t)key % new_size;
+            start = hash ? hash(key, seed) % new_size : (u64_t)key % new_size;
             idx = start;
 
             // NOTE: this won't fail because the new table is twice the size of the old one
@@ -249,49 +249,49 @@ i64_t ht_oa_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, raw_p see
     return NULL_I64;
 }
 
-i64_t hash_index_obj(obj_p obj) {
-    i64_t hash, len, i;
+u64_t hash_index_obj(obj_p obj) {
+    u64_t hash, len, i;
 
     switch (obj->type) {
         case -TYPE_I16:
-            return (i64_t)obj->i16;
+            return (u64_t)obj->i16;
         case -TYPE_I32:
         case -TYPE_DATE:
         case -TYPE_TIME:
-            return (i64_t)obj->i32;
+            return (u64_t)obj->i32;
         case -TYPE_I64:
         case -TYPE_SYMBOL:
         case -TYPE_TIMESTAMP:
-            return (i64_t)obj->i64;
+            return (u64_t)obj->i64;
         case -TYPE_F64:
-            return (i64_t)obj->f64;
+            return (u64_t)obj->f64;
         case -TYPE_GUID:
-            return hash_index_u64(*(i64_t *)AS_GUID(obj), *((i64_t *)AS_GUID(obj) + 1));
+            return hash_index_u64(*(u64_t *)AS_GUID(obj), *((u64_t *)AS_GUID(obj) + 1));
         case TYPE_C8:
             return str_hash(AS_C8(obj), obj->len);
         case TYPE_I16:
             len = obj->len;
             for (i = 0, hash = 0xcbf29ce484222325ull; i < len; i++)
-                hash = hash_index_u64((i64_t)AS_I16(obj)[i], hash);
+                hash = hash_index_u64((u64_t)AS_I16(obj)[i], hash);
             return hash;
         case TYPE_I32:
         case TYPE_DATE:
         case TYPE_TIME:
             len = obj->len;
             for (i = 0, hash = 0xcbf29ce484222325ull; i < len; i++)
-                hash = hash_index_u64((i64_t)AS_I32(obj)[i], hash);
+                hash = hash_index_u64((u64_t)AS_I32(obj)[i], hash);
             return hash;
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
             len = obj->len;
             for (i = 0, hash = 0xcbf29ce484222325ull; i < len; i++)
-                hash = hash_index_u64((i64_t)AS_I64(obj)[i], hash);
+                hash = hash_index_u64((u64_t)AS_I64(obj)[i], hash);
             return hash;
         case TYPE_F64:
             len = obj->len;
             for (i = 0, hash = 0xcbf29ce484222325ull; i < len; i++)
-                hash = hash_index_u64((i64_t)AS_F64(obj)[i], hash);
+                hash = hash_index_u64((u64_t)AS_F64(obj)[i], hash);
             return hash;
         default:
             PANIC("hash: unsupported type: %d", obj->type);
@@ -525,14 +525,14 @@ i64_t ht_bk_get(ht_bk_p ht, i64_t key) {
     return NULL_I64;
 }
 
-i64_t hash_kmh(i64_t key, raw_p seed) {
+u64_t hash_kmh(i64_t key, raw_p seed) {
     UNUSED(seed);
     return (key * 6364136223846793005ull) >> 32;
 }
 
-i64_t hash_fnv1a(i64_t key, raw_p seed) {
+u64_t hash_fnv1a(i64_t key, raw_p seed) {
     UNUSED(seed);
-    i64_t hash = 14695981039346656037ull;
+    u64_t hash = 14695981039346656037ull;
     i32_t i;
 
     for (i = 0; i < 8; i++) {
@@ -544,9 +544,9 @@ i64_t hash_fnv1a(i64_t key, raw_p seed) {
     return hash;
 }
 
-i64_t hash_murmur3(i64_t key, raw_p seed) {
+u64_t hash_murmur3(i64_t key, raw_p seed) {
     UNUSED(seed);
-    i64_t hash = key;
+    u64_t hash = key;
 
     // Use a 64-bit mix function
     hash ^= hash >> 33;
@@ -558,10 +558,10 @@ i64_t hash_murmur3(i64_t key, raw_p seed) {
     return hash;
 }
 
-i64_t hash_guid(i64_t a, raw_p seed) {
+u64_t hash_guid(i64_t a, raw_p seed) {
     UNUSED(seed);
     guid_t *g = (guid_t *)a;
-    i64_t hash = 0xcbf29ce484222325ull;  // FNV-1a offset basis
+    u64_t hash = 0xcbf29ce484222325ull;  // FNV-1a offset basis
 
     // Hash each byte of the GUID
     for (size_t i = 0; i < sizeof(guid_t); i++) {
@@ -579,12 +579,12 @@ i64_t hash_guid(i64_t a, raw_p seed) {
     return hash;
 }
 
-i64_t hash_i64(i64_t a, raw_p seed) {
+u64_t hash_i64(i64_t a, raw_p seed) {
     UNUSED(seed);
-    return (i64_t)a;
+    return a;
 }
 
-i64_t hash_obj(i64_t a, raw_p seed) {
+u64_t hash_obj(i64_t a, raw_p seed) {
     UNUSED(seed);
     return hash_index_obj((obj_p)a);
 }

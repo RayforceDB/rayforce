@@ -36,7 +36,7 @@
 
 const i64_t MAX_RANGE = 1 << 20;
 
-i64_t __hash_get(i64_t row, raw_p seed) {
+u64_t __hash_get(i64_t row, raw_p seed) {
     __index_find_ctx_t *ctx = (__index_find_ctx_t *)seed;
     return ctx->hashes[row];
 }
@@ -51,7 +51,7 @@ i64_t __hash_cmp_guid(i64_t row1, i64_t row2, raw_p seed) {
     return memcmp((guid_t *)ctx->lobj + row1, (guid_t *)ctx->robj + row2, sizeof(guid_t));
 }
 
-i64_t __index_list_hash_get(i64_t row, raw_p seed) {
+u64_t __index_list_hash_get(i64_t row, raw_p seed) {
     __index_list_ctx_t *ctx = (__index_list_ctx_t *)seed;
     return ctx->hashes[row];
 }
