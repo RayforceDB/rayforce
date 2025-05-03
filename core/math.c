@@ -1203,13 +1203,13 @@ obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
         case -TYPE_TIMESTAMP:
             return clone_obj(x);
         case TYPE_I32:
-            return __UNOP_FOLD(x, i32, i32, ADDI32, len, offset, 0);
+            return __UNOP_FOLD(x, i32, i32, FOLD_ADDI32, len, offset, 0);
         case TYPE_I64:
-            return __UNOP_FOLD(x, i64, i64, ADDI64, len, offset, 0);
+            return __UNOP_FOLD(x, i64, i64, FOLD_ADDI64, len, offset, 0);
         case TYPE_F64:
-            return __UNOP_FOLD(x, f64, f64, ADDF64, len, offset, 0);
+            return __UNOP_FOLD(x, f64, f64, FOLD_ADDF64, len, offset, 0);
         case TYPE_TIME:
-            return __UNOP_FOLD(x, i32, atime, ADDI32, len, offset, 0);
+            return __UNOP_FOLD(x, i32, atime, FOLD_ADDI32, len, offset, 0);
         case TYPE_MAPGROUP:
             return aggr_sum(AS_LIST(x)[0], AS_LIST(x)[1]);
 

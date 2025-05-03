@@ -95,19 +95,19 @@ test_result_t test_lang_basic() {
 
 test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(+ 0Ni 0Ni)", "0Ni");
-    TEST_ASSERT_EQ("(+ 0i 0Ni)", "0i");
-    TEST_ASSERT_EQ("(+ 0Ni -1i)", "-1i");
+    TEST_ASSERT_EQ("(+ 0i 0Ni)", "0Ni");
+    TEST_ASSERT_EQ("(+ 0Ni -1i)", "0Ni");
     TEST_ASSERT_EQ("(+ 0Nl 0Nl)", "0Nl");
-    TEST_ASSERT_EQ("(+ 0 0Nl)", "0i");
-    TEST_ASSERT_EQ("(+ 0Ni -1i)", "-1i");
-    TEST_ASSERT_EQ("(+ 0Ni -10.00)", "-10.00")
+    TEST_ASSERT_EQ("(+ 0 0Nl)", "0Nl");
+    TEST_ASSERT_EQ("(+ 0Ni -1i)", "0Ni");
+    TEST_ASSERT_EQ("(+ 0Ni -10.00)", "0Nf");
     TEST_ASSERT_EQ("(+ 0Ni 0Nl)", "0Nl");
     TEST_ASSERT_EQ("(+ 0Nf 0Ni)", "0Nf");
-    TEST_ASSERT_EQ("(+ 0Nf 5)", "5.0");
-    TEST_ASSERT_EQ("(+ 0.00 0Ni)", "0.0")
-    TEST_ASSERT_EQ("(+ 0Ni -0.00)", "0.00")
-    TEST_ASSERT_EQ("(+ -0.00 0Nl)", "0.00")
-    TEST_ASSERT_EQ("(+ 0Nf [-0.00])", "[0.00]")
+    TEST_ASSERT_EQ("(+ 0Nf 5)", "0Nf");
+    TEST_ASSERT_EQ("(+ 0.00 0Ni)", "0Nf");
+    TEST_ASSERT_EQ("(+ 0Ni -0.00)", "0Nf");
+    TEST_ASSERT_EQ("(+ -0.00 0Nl)", "0Nf");
+    TEST_ASSERT_EQ("(+ 0Nf [-0.00])", "[0Nf]");
     TEST_ASSERT_ER("(+ 0Nf 2024.03.20)", "add: unsupported types: 'f64, 'date");
 
     TEST_ASSERT_EQ("(+ 3i 5i)", "8i");
@@ -259,7 +259,7 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(- 2.5 [3 5])", "[-0.5 -2.5]");
     TEST_ASSERT_EQ("(- 2.5 [3.1 5.2])", "[-0.6 -2.7]");
     TEST_ASSERT_EQ("(- -0.00 0.00)", "0.00")
-    TEST_ASSERT_EQ("(- -0.00 0Nf)", "0.00")
+    TEST_ASSERT_EQ("(- -0.00 0Nf)", "0Nf")
 
     TEST_ASSERT_EQ("(- 2024.03.20 5i)", "2024.03.15");
     TEST_ASSERT_EQ("(- 2024.03.20 5)", "2024.03.15");
@@ -2411,6 +2411,7 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(sum [-24 12 3])", "-9");
     TEST_ASSERT_EQ("(sum -24)", "-24");
     TEST_ASSERT_EQ("(sum [1.0 2.0 3.0])", "6.0");
+    TEST_ASSERT_EQ("(sum [1 2 3 0Nl 4])", "10");
     TEST_ASSERT_EQ("(sum [1i 2i -3i])", "0i");
     TEST_ASSERT_EQ("(sum [02:01:03.000 00:00:02.500])", "02:01:05.500");
     TEST_ASSERT_ER("(sum [2020.02.03 2025.02.03])", "sum: unsupported type: 'Date");
