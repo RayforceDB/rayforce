@@ -142,6 +142,7 @@ test_entry_t tests[] = {
     {"test_str_match", test_str_match},
     {"test_lang_basic", test_lang_basic},
     {"test_lang_math", test_lang_math},
+    {"test_lang_take", test_lang_take},
     {"test_lang_query", test_lang_query},
     {"test_lang_update", test_lang_update},
     {"test_lang_serde", test_lang_serde},
