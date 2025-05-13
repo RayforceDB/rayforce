@@ -45,7 +45,7 @@ typedef struct raykx_header_t {
     u8_t compressed;
     u8_t reserved;
     u32_t size;
-} __attribute__((packed)) * raykx_header_p;
+} *raykx_header_p;
 
 obj_p raykx_hopen(obj_p addr);
 obj_p raykx_hclose(obj_p fd);

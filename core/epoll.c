@@ -268,7 +268,7 @@ i64_t poll_send(poll_p poll, selector_p selector) {
 
 send_loop:
     while (selector->tx.buf->offset < selector->tx.buf->size) {
-        size = selector->tx.send_fn(selector->fd, &selector->tx.buf->data[selector->tx.buf->offset],
+        size = selector->tx.send_fn(selector->fd, selector->tx.buf->data + selector->tx.buf->offset,
                                     selector->tx.buf->size - selector->tx.buf->offset);
 
         LOG_TRACE("Sent %lld bytes to selector %lld", size, selector->id);

@@ -207,16 +207,16 @@ obj_p raykx_hclose(obj_p fd) {
 option_t raykx_read_handshake(poll_p poll, selector_p selector) {
     UNUSED(poll);
 
-    LOG_DEBUG("Reading handshake from connection %lld", selector->id);
-
     poll_buffer_p buf;
-    u8_t handshake[2] = {0x03, 0x00};
+
+    LOG_DEBUG("Reading handshake from connection %lld", selector->id);
 
     if (selector->rx.buf->offset > 0 && selector->rx.buf->data[selector->rx.buf->offset - 1] == '\0') {
         LOG_TRACE("Handshake from connection %lld: '%s'", selector->id, selector->rx.buf->data);
-        // send handshake response
-        buf = poll_buf_create(sizeof(handshake));
-        memcpy(buf->data, handshake, ISIZEOF(handshake));
+
+        // send handshake response (single byte version)
+        buf = poll_buf_create(1);
+        buf->data[0] = 0x03;
         poll_send_buf(poll, selector, buf);
 
         selector->rx.read_fn = raykx_read_header;
@@ -311,7 +311,7 @@ static nil_t raykx_on_close(poll_p poll, selector_p selector) {
 obj_p raykx_process_msg(poll_p poll, selector_p selector, obj_p msg) {
     UNUSED(poll);
 
-    obj_p res;
+    obj_p s, res;
     raykx_ctx_p ctx;
 
     ctx = (raykx_ctx_p)selector->data;
@@ -321,9 +321,11 @@ obj_p raykx_process_msg(poll_p poll, selector_p selector, obj_p msg) {
     if (IS_ERR(msg) || is_null(msg))
         res = msg;
     else if (msg->type == TYPE_C8) {
-        LOG_TRACE("Evaluating string message: %.*s", (i32_t)msg->len, AS_C8(msg));
-        res = ray_eval_str(msg, ctx->name);
+        s = cstring_from_obj(msg);
         drop_obj(msg);
+        LOG_TRACE("Evaluating string message: %s", AS_C8(s));
+        res = ray_eval_str(s, ctx->name);
+        drop_obj(s);
     } else {
         LOG_TRACE("Evaluating object message");
         res = eval_obj(msg);

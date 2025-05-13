@@ -96,6 +96,9 @@ i64_t poll_rx_buf_request(poll_p poll, selector_p selector, i64_t size) {
         if (selector->rx.buf == NULL)
             return -1;
 
+        selector->rx.buf->size = size;
+        selector->rx.buf->offset = 0;
+
         LOG_TRACE("New buffer offset: %d", selector->rx.buf->offset);
     }
 
