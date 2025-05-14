@@ -69,6 +69,7 @@ typedef enum poll_events_t {
     POLL_EVENT_ERROR = EPOLLERR,
     POLL_EVENT_HUP = EPOLLHUP,
     POLL_EVENT_RDHUP = EPOLLRDHUP,
+    POLL_EVENT_EDGE = EPOLLET,
 } poll_events_t;
 
 typedef struct poll_buffer_t {

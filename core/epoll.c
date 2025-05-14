@@ -148,9 +148,7 @@ i64_t poll_register(poll_p poll, poll_registry_p registry) {
 
     LOG_DEBUG("Setting up epoll event");
 
-    // Add EPOLLRDHUP to the initial interest flags to detect client disconnections
-    selector->interest |= POLL_EVENT_RDHUP;
-    ev.events = selector->interest | EPOLLET;  // Add edge-triggered mode
+    ev.events = selector->interest;
     ev.data.ptr = selector;
 
     if (epoll_ctl(poll->fd, EPOLL_CTL_ADD, selector->fd, &ev) == -1) {

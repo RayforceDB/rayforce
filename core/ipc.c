@@ -51,7 +51,8 @@ option_t ipc_listener_accept(poll_p poll, selector_p selector) {
 
         registry.fd = fd;
         registry.type = SELECTOR_TYPE_SOCKET;
-        registry.events = POLL_EVENT_READ | POLL_EVENT_WRITE | POLL_EVENT_ERROR | POLL_EVENT_HUP;
+        registry.events =
+            POLL_EVENT_READ | POLL_EVENT_WRITE | POLL_EVENT_ERROR | POLL_EVENT_HUP | POLL_EVENT_RDHUP | POLL_EVENT_EDGE;
         registry.open_fn = ipc_on_open;
         registry.close_fn = ipc_on_close;
         registry.error_fn = ipc_on_error;

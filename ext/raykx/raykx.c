@@ -173,7 +173,8 @@ obj_p raykx_hopen(obj_p addr) {
 
     registry.fd = fd;
     registry.type = SELECTOR_TYPE_SOCKET;
-    registry.events = POLL_EVENT_READ | POLL_EVENT_ERROR | POLL_EVENT_HUP;
+    registry.events =
+        POLL_EVENT_READ | POLL_EVENT_WRITE | POLL_EVENT_ERROR | POLL_EVENT_HUP | POLL_EVENT_RDHUP | POLL_EVENT_EDGE;
     registry.recv_fn = sock_recv;
     registry.send_fn = sock_send;
     registry.read_fn = raykx_read_header;
