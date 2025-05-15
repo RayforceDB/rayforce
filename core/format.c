@@ -397,10 +397,12 @@ i64_t guid_fmt_into(obj_p *dst, guid_t *val) {
 }
 
 i64_t symbol_fmt_into(obj_p *dst, i64_t limit, b8_t full, i64_t val) {
+    i64_t n;
+
     if (val == NULL_I64)
         return full ? str_fmt_into(dst, 4, LIT_NULL_SYMBOL) : str_fmt_into(dst, 1, "");
 
-    i64_t n = str_fmt_into(dst, limit, "%s", str_from_symbol(val));
+    n = str_fmt_into(dst, limit, "%s", str_from_symbol(val));
     if (limit_reached(limit, n))
         n += str_fmt_into(dst, 3, "..");
 

@@ -403,6 +403,21 @@ str_p env_get_type_name(i8_t type) {
     return str_from_symbol(name);
 }
 
+i64_t env_get_internal_id(obj_p obj) {
+    obj_p functions = runtime_get()->env.functions;
+    i64_t i, l, s = NULL_I64;
+
+    l = AS_LIST(functions)[1]->len;
+    for (i = 0; i < l; i++) {
+        if (AS_LIST(AS_LIST(functions)[1])[i]->i64 == obj->i64) {
+            s = AS_SYMBOL(AS_LIST(functions)[0])[i];
+            break;
+        }
+    }
+
+    return s;
+}
+
 str_p env_get_internal_name(obj_p obj) {
     obj_p functions = runtime_get()->env.functions;
     i64_t sym = 0;
