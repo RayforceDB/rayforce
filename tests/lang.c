@@ -21,51 +21,6 @@
  *   SOFTWARE.
  */
 
-#define TEST_ASSERT_EQ(lhs, rhs)                                                                                       \
-    {                                                                                                                  \
-        obj_p le = eval_str(lhs);                                                                                      \
-        obj_p lns = obj_fmt(le, B8_TRUE);                                                                              \
-        if (IS_ERR(le)) {                                                                                              \
-            obj_p fmt = str_fmt(-1, "Input error: %s\n -- at: %s:%d", AS_C8(lns), __FILE__, __LINE__);                 \
-            TEST_ASSERT(0, AS_C8(lns));                                                                                \
-            drop_obj(lns);                                                                                             \
-            drop_obj(fmt);                                                                                             \
-        } else {                                                                                                       \
-            obj_p re = eval_str(rhs);                                                                                  \
-            obj_p rns = obj_fmt(re, B8_TRUE);                                                                          \
-            obj_p fmt = str_fmt(-1, "Expected %s, got %s\n -- at: %s:%d", AS_C8(rns), AS_C8(lns), __FILE__, __LINE__); \
-            TEST_ASSERT(str_cmp(AS_C8(lns), lns->len, AS_C8(rns), rns->len) == 0, AS_C8(fmt));                         \
-            drop_obj(fmt);                                                                                             \
-            drop_obj(re);                                                                                              \
-            drop_obj(le);                                                                                              \
-            drop_obj(lns);                                                                                             \
-            drop_obj(rns);                                                                                             \
-        }                                                                                                              \
-    }
-
-#define TEST_ASSERT_ER(lhs, rhs)                                                                                \
-    {                                                                                                           \
-        obj_p le = eval_str(lhs);                                                                               \
-        obj_p lns = obj_fmt(le, B8_TRUE);                                                                       \
-        if (!IS_ERR(le)) {                                                                                      \
-            obj_p fmt = str_fmt(-1, "Expected error: %s\n -- at: %s:%d", AS_C8(lns), __FILE__, __LINE__);       \
-            TEST_ASSERT(0, AS_C8(lns));                                                                         \
-            drop_obj(lns);                                                                                      \
-            drop_obj(fmt);                                                                                      \
-            drop_obj(le);                                                                                       \
-        } else {                                                                                                \
-            lit_p err_text = AS_C8(lns);                                                                        \
-            if (err_text == NULL || strstr(err_text, rhs) == NULL) {                                            \
-                obj_p fmt =                                                                                     \
-                    str_fmt(-1, "Expect \"%s\", in: \"%s\"\n -- at: %s:%d", rhs, err_text, __FILE__, __LINE__); \
-                TEST_ASSERT(0, AS_C8(fmt));                                                                     \
-                drop_obj(fmt);                                                                                  \
-            }                                                                                                   \
-            drop_obj(le);                                                                                       \
-            drop_obj(lns);                                                                                      \
-        }                                                                                                       \
-    }
-
 test_result_t test_lang_basic() {
     TEST_ASSERT_EQ("null", "null");
     TEST_ASSERT_EQ("0x1a", "0x1a");

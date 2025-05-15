@@ -21,6 +21,112 @@
  *   SOFTWARE.
  */
 
-test_result_t test_sort_asc() { PASS(); }
+test_result_t test_sort_asc() {
+    TEST_ASSERT_EQ("(iasc [true false true false])", "[1 3 0 2]");
+    TEST_ASSERT_EQ("(asc [true false true false])", "[false false true true]");
 
-test_result_t test_sort_desc() { PASS(); }
+    TEST_ASSERT_EQ("(iasc [0x03 0x01 0x04 0x02 0x01])", "[1 4 3 0 2]");
+    TEST_ASSERT_EQ("(asc [0x03 0x01 0x04 0x02 0x01])", "[0x01 0x01 0x02 0x03 0x04]");
+
+    TEST_ASSERT_EQ("(iasc \"\")", "[]");
+    TEST_ASSERT_EQ("(iasc \"dacba\")", "[1 4 3 2 0]");
+    TEST_ASSERT_EQ("(asc \"dacba\")", "\"aabcd\"");
+
+    TEST_ASSERT_EQ("(iasc [-10h 20h -30h 40h 0h 0Nh])", "[5 2 0 4 1 3]");
+    TEST_ASSERT_EQ("(asc [-10h 20h -30h 40h 0h 0Nh])", "[0Nh -30h -10h 0h 20h 40h]");
+
+    TEST_ASSERT_EQ("(iasc [-10i 20i -30i 40i 0Ni 0i])", "[4 2 0 5 1 3]");
+    TEST_ASSERT_EQ("(asc [-10i 20i -30i 40i 0Ni 0i])", "[0Ni -30i -10i 0i 20i 40i]");
+
+    TEST_ASSERT_EQ("(iasc [2023.01.03 2023.01.01 2023.01.04 2023.01.02 0Nd])", "[4 1 3 0 2]");
+    TEST_ASSERT_EQ("(asc [2023.01.03 2023.01.01 2023.01.04 2023.01.02 0Nd])",
+                   "[0Nd 2023.01.01 2023.01.02 2023.01.03 2023.01.04]");
+
+    TEST_ASSERT_EQ("(iasc [00:00:03.000 00:00:01.000 00:00:04.000 00:00:02.000 0Nt])", "[4 1 3 0 2]");
+    TEST_ASSERT_EQ("(asc [00:00:03.000 00:00:01.000 00:00:04.000 00:00:02.000 0Nt])",
+                   "[0Nt 00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000]");
+
+    TEST_ASSERT_EQ("(iasc [-10 20 -30 40 0Nl 0])", "[4 2 0 5 1 3]");
+    TEST_ASSERT_EQ("(asc [-10 20 -30 40 0Nl 0])", "[0Nl -30 -10 0 20 40]");
+
+    TEST_ASSERT_EQ(
+        "(iasc [2023.01.03D00:00:00.000000000 2023.01.01D00:00:00.000000000 "
+        "2023.01.04D00:00:00.000000000 2023.01.02D00:00:00.000000000 0Np])",
+        "[4 1 3 0 2]");
+    TEST_ASSERT_EQ(
+        "(asc [2023.01.03D00:00:00.000000000 2023.01.01D00:00:00.000000000 "
+        "2023.01.04D00:00:00.000000000 2023.01.02D00:00:00.000000000 0Np])",
+        "[0Np 2023.01.01D00:00:00.000000000 2023.01.02D00:00:00.000000000 "
+        "2023.01.03D00:00:00.000000000 2023.01.04D00:00:00.000000000]");
+
+    TEST_ASSERT_EQ("(iasc [-1.0 2.0 -3.0 4.0 0.0 0Nf])", "[5 2 0 4 1 3]");
+    TEST_ASSERT_EQ("(asc [-1.0 2.0 -3.0 4.0 0.0 0Nf])", "[0Nf -3.0 -1.0 0.0 2.0 4.0]");
+
+    TEST_ASSERT_EQ("(iasc [])", "[]");
+    TEST_ASSERT_EQ("(asc [])", "[]");
+
+    TEST_ASSERT_EQ("(iasc [42])", "[0]");
+    TEST_ASSERT_EQ("(asc [42])", "[42]");
+
+    TEST_ASSERT_EQ("(iasc (asc [4 3 2 1]))", "[0 1 2 3]");
+    TEST_ASSERT_EQ("(asc (asc [4 3 2 1]))", "[1 2 3 4]");
+
+    PASS();
+}
+
+test_result_t test_sort_desc() {
+    TEST_ASSERT_EQ("(idesc [false true])", "[1 0]");
+    TEST_ASSERT_EQ("(desc [true false true false])", "[true true false false]");
+
+    TEST_ASSERT_EQ("(idesc [0x03 0x01 0x04 0x02])", "[2 0 3 1]");
+    TEST_ASSERT_EQ("(desc [0x03 0x01 0x04 0x02])", "[0x04 0x03 0x02 0x01]");
+
+    TEST_ASSERT_EQ("(idesc \"dacb\")", "[0 2 3 1]");
+    TEST_ASSERT_EQ("(desc \"dacb\")", "\"dcba\"");
+
+    TEST_ASSERT_EQ("(idesc [-10h 20h -30h 40h 0Nh 0h])", "[3 1 5 0 2 4]");
+    TEST_ASSERT_EQ("(desc [-10h 20h -30h 40h 0Nh 0h])", "[40h 20h 0h -10h -30h 0Nh]");
+
+    TEST_ASSERT_EQ("(idesc [-10i 20i -30i 40i 0Ni 0i])", "[3 1 5 0 2 4]");
+    TEST_ASSERT_EQ("(desc [-10i 20i -30i 40i 0Ni 0i])", "[40i 20i 0i -10i -30i 0Ni]");
+
+    TEST_ASSERT_EQ("(idesc [2023.01.03 2023.01.01 2023.01.04 2023.01.02 0Nd])", "[2 0 3 1 4]");
+    TEST_ASSERT_EQ("(desc [2023.01.03 2023.01.01 2023.01.04 2023.01.02 0Nd])",
+                   "[2023.01.04 2023.01.03 2023.01.02 2023.01.01 0Nd]");
+
+    TEST_ASSERT_EQ("(idesc [00:00:03.000 00:00:01.000 00:00:04.000 00:00:02.000 0Nt])", "[2 0 3 1 4]");
+    TEST_ASSERT_EQ("(desc [00:00:03.000 00:00:01.000 00:00:04.000 00:00:02.000 0Nt])",
+                   "[00:00:04.000 00:00:03.000 00:00:02.000 00:00:01.000 0Nt]");
+
+    TEST_ASSERT_EQ("(idesc [-10 20 -30 40 0Nl 0])", "[3 1 5 0 2 4]");
+    TEST_ASSERT_EQ("(desc [-10 20 -30 40 0Nl 0])", "[40 20 0 -10 -30 0Nl]");
+
+    TEST_ASSERT_EQ(
+        "(idesc [2023.01.03D00:00:00.000000000 2023.01.01D00:00:00.000000000 "
+        "2023.01.04D00:00:00.000000000 2023.01.02D00:00:00.000000000 0Np])",
+        "[2 0 3 1 4]");
+    TEST_ASSERT_EQ(
+        "(desc [2023.01.03D00:00:00.000000000 2023.01.01D00:00:00.000000000 "
+        "2023.01.04D00:00:00.000000000 2023.01.02D00:00:00.000000000 0Np])",
+        "[2023.01.04D00:00:00.000000000 2023.01.03D00:00:00.000000000 "
+        "2023.01.02D00:00:00.000000000 2023.01.01D00:00:00.000000000 0Np]");
+
+    TEST_ASSERT_EQ("(idesc [-1.0 2.0 -3.0 4.0 0Nf 0.0])", "[3 1 5 0 2 4]");
+    TEST_ASSERT_EQ("(desc [-1.0 2.0 -3.0 4.0 0Nf 0.0])", "[4.0 2.0 0.0 -1.0 -3.0 0Nf]");
+
+    TEST_ASSERT_EQ("(idesc [])", "[]");
+    TEST_ASSERT_EQ("(desc [])", "[]");
+
+    TEST_ASSERT_EQ("(idesc [42])", "[0]");
+    TEST_ASSERT_EQ("(desc [42])", "[42]");
+
+    TEST_ASSERT_EQ("(idesc (desc [4 3 2 1]))", "[0 1 2 3]");
+    TEST_ASSERT_EQ("(idesc (asc [4 3 2 1]))", "[3 2 1 0]");
+    TEST_ASSERT_EQ("(iasc (desc [4 3 2 1]))", "[3 2 1 0]");
+
+    TEST_ASSERT_EQ("(desc (desc [4 3 2 1]))", "[4 3 2 1]");
+    TEST_ASSERT_EQ("(desc (asc [4 3 2 1]))", "[4 3 2 1]");
+    TEST_ASSERT_EQ("(asc (desc [4 3 2 1]))", "[1 2 3 4]");
+
+    PASS();
+}

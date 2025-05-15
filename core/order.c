@@ -28,14 +28,21 @@
 #include "heap.h"
 #include "sort.h"
 #include "error.h"
+#include "compose.h"
 
 obj_p ray_iasc(obj_p x) {
     switch (x->type) {
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
+        case TYPE_I16:
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
         case TYPE_I64:
         case TYPE_TIMESTAMP:
         case TYPE_F64:
             return ray_sort_asc(x);
-
         default:
             THROW(ERR_TYPE, "iasc: unsupported type: '%s", type_name(x->type));
     }
@@ -43,41 +50,82 @@ obj_p ray_iasc(obj_p x) {
 
 obj_p ray_idesc(obj_p x) {
     switch (x->type) {
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
+        case TYPE_I16:
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
         case TYPE_I64:
         case TYPE_TIMESTAMP:
         case TYPE_F64:
             return ray_sort_desc(x);
-
         default:
             THROW(ERR_TYPE, "idesc: unsupported type: '%s", type_name(x->type));
     }
 }
 
 obj_p ray_asc(obj_p x) {
-    obj_p idx;
+    obj_p idx, res;
     i64_t l, i;
 
+    if (x->attrs & ATTR_ASC)
+        return clone_obj(x);
+
+    if (x->attrs & ATTR_DESC){
+        res = ray_reverse(x);
+        res->attrs &= ~ATTR_DESC;
+        res->attrs |= ATTR_ASC;
+        return res;
+    }
+
     switch (x->type) {
-        case TYPE_I64:
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
             idx = ray_sort_asc(x);
             l = x->len;
+            res = C8(l);
+            res->type = x->type;
             for (i = 0; i < l; i++)
-                AS_I64(idx)
-            [i] = AS_I64(x)[AS_I64(idx)[i]];
+                AS_C8(res)[i] = AS_C8(x)[AS_I64(idx)[i]];
+            res->attrs |= ATTR_ASC;
+            drop_obj(idx);
+            return res;
 
-            idx->attrs |= ATTR_ASC;
+        case TYPE_I16:
+            idx = ray_sort_asc(x);
+            l = x->len;
+            res = I16(l);
+            for (i = 0; i < l; i++)
+                AS_I16(res)[i] = AS_I16(x)[AS_I64(idx)[i]];
+            res->attrs |= ATTR_ASC;
+            drop_obj(idx);
+            return res;
 
-            return idx;
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            idx = ray_sort_asc(x);
+            l = x->len;
+            res = I32(l);
+            res->type = x->type;
+            for (i = 0; i < l; i++)
+                AS_I32(res)[i] = AS_I32(x)[AS_I64(idx)[i]];
+            res->attrs |= ATTR_ASC;
+            drop_obj(idx);
+            return res;
 
+        case TYPE_I64:
+        case TYPE_TIMESTAMP:
         case TYPE_F64:
             idx = ray_sort_asc(x);
             l = x->len;
             for (i = 0; i < l; i++)
-                AS_F64(idx)
-            [i] = AS_F64(x)[AS_I64(idx)[i]];
-
+                AS_I64(idx)[i] = AS_I64(x)[AS_I64(idx)[i]];
             idx->attrs |= ATTR_ASC;
-
+            idx->type = x->type;
             return idx;
 
         default:
@@ -86,32 +134,66 @@ obj_p ray_asc(obj_p x) {
 }
 
 obj_p ray_desc(obj_p x) {
-    obj_p idx;
+    obj_p idx, res;
     i64_t l, i;
 
+    if (x->attrs & ATTR_DESC)
+        return clone_obj(x);
+
+    if (x->attrs & ATTR_ASC){
+        res = ray_reverse(x);
+        res->attrs &= ~ATTR_ASC;
+        res->attrs |= ATTR_DESC;
+        return res;
+    }
+
     switch (x->type) {
-        case TYPE_I64:
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
             idx = ray_sort_desc(x);
             l = x->len;
+            res = C8(l);
+            res->type = x->type;
             for (i = 0; i < l; i++)
-                AS_I64(idx)
-            [i] = AS_I64(x)[AS_I64(idx)[i]];
+                AS_C8(res)[i] = AS_C8(x)[AS_I64(idx)[i]];
+            res->attrs |= ATTR_DESC;
+            drop_obj(idx);
+            return res;
 
-            idx->attrs |= ATTR_DESC;
+        case TYPE_I16:
+            idx = ray_sort_desc(x);
+            l = x->len;
+            res = I16(l);
+            for (i = 0; i < l; i++)
+                AS_I16(res)[i] = AS_I16(x)[AS_I64(idx)[i]];
+            res->attrs |= ATTR_DESC;
+            drop_obj(idx);
+            return res;
 
-            return idx;
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            idx = ray_sort_desc(x);
+            l = x->len;
+            res = I32(l);
+            res->type = x->type;
+            for (i = 0; i < l; i++)
+                AS_I32(res)[i] = AS_I32(x)[AS_I64(idx)[i]];
+            res->attrs |= ATTR_DESC;
+            drop_obj(idx);
+            return res;
 
+        case TYPE_I64:
+        case TYPE_TIMESTAMP:
         case TYPE_F64:
             idx = ray_sort_desc(x);
             l = x->len;
             for (i = 0; i < l; i++)
-                AS_F64(idx)
-            [i] = AS_F64(x)[AS_I64(idx)[i]];
-
+                AS_I64(idx)[i] = AS_I64(x)[AS_I64(idx)[i]];
             idx->attrs |= ATTR_DESC;
-
+            idx->type = x->type;
             return idx;
-
         default:
             THROW(ERR_TYPE, "desc: unsupported type: '%s", type_name(x->type));
     }

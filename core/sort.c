@@ -25,6 +25,7 @@
 #include "util.h"
 #include "string.h"
 #include "ops.h"
+#include "error.h"
 
 #define COUNTING_SORT_LIMIT 1024 * 1024
 
@@ -230,22 +231,88 @@ nil_t counting_sort_desc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i
     drop_obj(mask);
 }
 
-obj_p ray_sort_asc(obj_p vec) {
+obj_p ray_sort_asc_u8(obj_p vec) {
+    i64_t i, len = vec->len;
+    obj_p indices = I64(len);
+    i64_t *ov = AS_I64(indices);
+    u8_t *iv = AS_U8(vec);
+
+    u64_t pos[257] = {0};
+
+    for (i = 0; i < len; i++) {
+        pos[iv[i] + 1]++;
+    }
+    for (i = 2; i < 256; i++) {
+        pos[i] += pos[i - 1];
+    }
+
+    for (i = 0; i < len; i++) {
+        ov[pos[iv[i]]++] = i;
+    }
+
+    return indices;
+}
+
+obj_p ray_sort_asc_i16(obj_p vec) {
+    i64_t i, len = vec->len;
+    obj_p indices = I64(len);
+    i64_t *ov = AS_I64(indices);
+    i16_t *iv = AS_I16(vec);
+
+    u64_t pos[65537] = {0};
+
+    for (i = 0; i < len; i++) {
+        pos[iv[i] + 32769]++;
+    }
+    for (i = 2; i < 65536; i++) {
+        pos[i] += pos[i - 1];
+    }
+
+    for (i = 0; i < len; i++) {
+        ov[pos[iv[i] + 32768]++] = i;
+    }
+
+    return indices;
+}
+
+obj_p ray_sort_asc_i32(obj_p vec) {
+    i64_t i, t, len = vec->len;
+    obj_p indices = I64(len);
+    obj_p temp = I64(len);
+    i64_t *ov = AS_I64(indices);
+    i32_t *iv = AS_I32(vec);
+    i64_t *ti = AS_I64(temp);
+
+    u64_t pos1[65537] = {0};
+    u64_t pos2[65537] = {0};
+
+    for (i = 0; i < len; i++) {
+        t = (u32_t)iv[i] ^ 0x80000000;
+        pos1[(t & 0xffff) + 1]++;
+        pos2[(t >> 16) + 1]++;
+    }
+    for (i = 2; i < 65536; i++) {
+        pos1[i] += pos1[i - 1];
+        pos2[i] += pos2[i - 1];
+    }
+    for (i = 0; i < len; i++) {
+        t = (u32_t)iv[i];
+        ti[pos1[iv[i] & 0xffff]++] = i;
+    }
+    for (i = 0; i < len; i++) {
+        t = (u32_t)iv[ti[i]] ^ 0x80000000;
+        ov[pos2[t >> 16]++] = ti[i];
+    }
+
+    drop_obj(temp);
+    return indices;
+}
+
+//TODO need fix
+obj_p ray_sort_asc_i64_(obj_p vec) {
     i64_t i, len = vec->len, out_of_order = 0, inrange = 0, min, max;
     obj_p indices = I64(len);
     i64_t *iv = AS_I64(vec), *ov = AS_I64(indices);
-
-    if (vec->attrs & ATTR_ASC) {
-        for (i = 0; i < len; i++)
-            ov[i] = i;
-        return indices;
-    }
-
-    if (vec->attrs & ATTR_DESC) {
-        for (i = 0; i < len; i++)
-            ov[i] = len - i - 1;
-        return indices;
-    }
 
     max = min = iv[0];
 
@@ -302,22 +369,11 @@ obj_p ray_sort_asc(obj_p vec) {
     return indices;
 }
 
-obj_p ray_sort_desc(obj_p vec) {
+//TODO need fix
+obj_p ray_sort_desc_i64_(obj_p vec) {
     i64_t i, len = vec->len, out_of_order = 0, inrange = 0, min, max;
     obj_p indices = I64(len);
     i64_t *iv = AS_I64(vec), *ov = AS_I64(indices);
-
-    if (vec->attrs & ATTR_DESC) {
-        for (i64_t i = 0; i < len; i++)
-            ov[i] = i;
-        return indices;
-    }
-
-    if (vec->attrs & ATTR_ASC) {
-        for (i64_t i = 0; i < len; i++)
-            ov[i] = len - i - 1;
-        return indices;
-    }
 
     max = min = iv[0];
 
@@ -371,5 +427,259 @@ obj_p ray_sort_desc(obj_p vec) {
     }
 
     quick_sort_desc(iv, ov, 0, len - 1);
+    return indices;
+}
+
+// Helper inline function to convert f64 to sortable u64
+static inline u64_t f64_to_sortable_u64(f64_t value) {
+    union {
+        f64_t f;
+        u64_t u;
+    } u;
+
+    if (ops_is_nan(value)) {
+        return 0ull;
+    }
+    u.f = value;
+
+    // Flip sign bit for negative values to maintain correct ordering
+    if (u.u & 0x8000000000000000ULL) {
+        u.u = ~u.u;
+    } else {
+        u.u |= 0x8000000000000000ULL;
+    }
+
+    return u.u;
+}
+
+obj_p ray_sort_asc_i64(obj_p vec) {
+    i64_t i, len = vec->len;
+    obj_p indices = I64(len);
+    obj_p temp = I64(len);
+    i64_t *ov = AS_I64(indices);
+    i64_t *iv = AS_I64(vec);
+    i64_t *t = AS_I64(temp);
+
+    u64_t pos1[65537] = {0};
+    u64_t pos2[65537] = {0};
+    u64_t pos3[65537] = {0};
+    u64_t pos4[65537] = {0};
+
+    // Initialize index array
+    for (i = 0; i < len; i++) {
+        ov[i] = i;
+    }
+
+    // Count occurrences of each 16-bit chunk
+    for (i = 0; i < len; i++) {
+        u64_t u = iv[i] ^ 0x8000000000000000ULL;
+
+        pos1[(u & 0xffff) + 1]++;
+        pos2[((u >> 16) & 0xffff) + 1]++;
+        pos3[((u >> 32) & 0xffff) + 1]++;
+        pos4[(u >> 48) + 1]++;
+    }
+
+    // Calculate cumulative positions for each pass
+    for (i = 1; i < 65536; i++) {
+        pos1[i] += pos1[i - 1];
+        pos2[i] += pos2[i - 1];
+        pos3[i] += pos3[i - 1];
+        pos4[i] += pos4[i - 1];
+    }
+
+    // First pass: sort by least significant 16 bits
+    for (i = 0; i < len; i++) {
+        u64_t u = iv[ov[i]] ^ 0x8000000000000000ULL;
+        t[pos1[u & 0xffff]++] = ov[i];
+    }
+
+    // Second pass: sort by second 16-bit chunk
+    for (i = 0; i < len; i++) {
+        u64_t u = iv[t[i]] ^ 0x8000000000000000ULL;
+        ov[pos2[(u >> 16) & 0xffff]++] = t[i];
+    }
+
+    // Third pass: sort by third 16-bit chunk
+    for (i = 0; i < len; i++) {
+        u64_t u = iv[ov[i]] ^ 0x8000000000000000ULL;
+        t[pos3[(u >> 32) & 0xffff]++] = ov[i];
+    }
+
+    // Fourth pass: sort by most significant 16 bits
+    for (i = 0; i < len; i++) {
+        u64_t u = iv[t[i]] ^ 0x8000000000000000ULL;
+        ov[pos4[u >> 48]++] = t[i];
+    }
+
+    drop_obj(temp);
+    return indices;
+}
+
+obj_p ray_sort_asc_f64(obj_p vec) {
+    i64_t i, len = vec->len;
+    obj_p indices = I64(len);
+    obj_p temp = I64(len);
+    i64_t *ov = AS_I64(indices);
+    f64_t *fv = AS_F64(vec);
+    i64_t *t = AS_I64(temp);
+
+    u64_t pos1[65537] = {0};
+    u64_t pos2[65537] = {0};
+    u64_t pos3[65537] = {0};
+    u64_t pos4[65537] = {0};
+
+    // Initialize index array
+    for (i = 0; i < len; i++) {
+        ov[i] = i;
+    }
+
+    // Count occurrences of each 16-bit chunk
+    for (i = 0; i < len; i++) {
+        u64_t u = f64_to_sortable_u64(fv[i]);
+
+        pos1[(u & 0xffff) + 1]++;
+        pos2[((u >> 16) & 0xffff) + 1]++;
+        pos3[((u >> 32) & 0xffff) + 1]++;
+        pos4[(u >> 48) + 1]++;
+    }
+
+    // Calculate cumulative positions for each pass
+    for (i = 1; i < 65536; i++) {
+        pos1[i] += pos1[i - 1];
+        pos2[i] += pos2[i - 1];
+        pos3[i] += pos3[i - 1];
+        pos4[i] += pos4[i - 1];
+    }
+
+    // First pass: sort by least significant 16 bits
+    for (i = 0; i < len; i++) {
+        u64_t u = f64_to_sortable_u64(fv[ov[i]]);
+        t[pos1[u & 0xffff]++] = ov[i];
+    }
+
+    // Second pass: sort by second 16-bit chunk
+    for (i = 0; i < len; i++) {
+        u64_t u = f64_to_sortable_u64(fv[t[i]]);
+        ov[pos2[(u >> 16) & 0xffff]++] = t[i];
+    }
+
+    // Third pass: sort by third 16-bit chunk
+    for (i = 0; i < len; i++) {
+        u64_t u = f64_to_sortable_u64(fv[ov[i]]);
+        t[pos3[(u >> 32) & 0xffff]++] = ov[i];
+    }
+
+    // Fourth pass: sort by most significant 16 bits
+    for (i = 0; i < len; i++) {
+        u64_t u = f64_to_sortable_u64(fv[t[i]]);
+        ov[pos4[u >> 48]++] = t[i];
+    }
+
+    drop_obj(temp);
+    return indices;
+}
+
+obj_p ray_sort_asc(obj_p vec) {
+    i64_t i, len = vec->len;
+    obj_p indices;
+    i64_t *ov;
+
+    if (vec->len == 0)
+        return I64(0);
+
+    if (vec->attrs & ATTR_ASC) {
+        indices = I64(len);
+        ov = AS_I64(indices);
+        for (i = 0; i < len; i++)
+            ov[i] = i;
+        return indices;
+    }
+
+    if (vec->attrs & ATTR_DESC) {
+        indices = I64(len);
+        ov = AS_I64(indices);
+        for (i = 0; i < len; i++)
+            ov[i] = len - i - 1;
+        return indices;
+    }
+
+    switch (vec->type) {
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8:
+            return ray_sort_asc_u8(vec);
+        case TYPE_I16:
+            return ray_sort_asc_i16(vec);
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            return ray_sort_asc_i32(vec);
+        case TYPE_I64:
+        case TYPE_TIMESTAMP:
+            return ray_sort_asc_i64(vec);
+        case TYPE_F64:
+            return ray_sort_asc_f64(vec);
+        default:
+            THROW(ERR_TYPE, "sort: unsupported type: '%s", type_name(vec->type));
+    }
+}
+
+obj_p ray_sort_desc(obj_p vec) {
+    i64_t i, len = vec->len;
+    obj_p indices;
+    i64_t *ov;
+
+    if (vec->len == 0)
+        return I64(0);
+
+    if (vec->attrs & ATTR_DESC) {
+        indices = I64(len);
+        ov = AS_I64(indices);
+        for (i = 0; i < len; i++)
+            ov[i] = i;
+        return indices;
+    }
+
+    if (vec->attrs & ATTR_ASC) {
+        indices = I64(len);
+        ov = AS_I64(indices);
+        for (i = 0; i < len; i++)
+            ov[i] = len - i - 1;
+        return indices;
+    }
+
+    switch (vec->type) {
+        case TYPE_B8:
+        case TYPE_U8:
+        case TYPE_C8: {
+            indices = ray_sort_asc_u8(vec);
+            break;
+        };
+        case TYPE_I16: {
+            indices = ray_sort_asc_i16(vec);
+            break;
+        };
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME: {
+            indices = ray_sort_asc_i32(vec);
+            break;
+        };
+        case TYPE_I64:
+        case TYPE_TIMESTAMP:
+            indices = ray_sort_asc_i64(vec);
+            break;
+        case TYPE_F64: {
+            indices = ray_sort_asc_f64(vec);
+            break;
+        };
+        default:
+            THROW(ERR_TYPE, "sort: unsupported type: '%s", type_name(vec->type));
+    }
+    ov = AS_I64(indices);
+    for (i = 0; i < len / 2; i++)
+        swap(&ov[i], &ov[len - i - 1]);
+
     return indices;
 }
