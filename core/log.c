@@ -1,11 +1,12 @@
 #ifdef DEBUG
 
+#include <ctype.h>
 #include "log.h"
 #include "def.h"
 #include "os.h"
 #include "string.h"
 #include "format.h"
-#include <ctype.h>
+#include "mmap.h"
 
 // Default log level if not specified
 static log_level_t current_level = LOG_LEVEL_OFF;
@@ -14,9 +15,14 @@ static i32_t num_filters = 0;
 static b8_t level_initialized = B8_FALSE;
 
 // Cleanup function to free allocated memory
+static void cleanup_log_config(nil_t) __attribute__((destructor));
 static void cleanup_log_config(nil_t) {
-    if (file_filters) {
-        free(file_filters);
+    printf("Cleaning up log config\n");
+    if (file_filters && file_filters != (void*)0x160) {  // Check for invalid pointer
+        size_t len = strlen(file_filters);
+        if (len < 1024) {  // Sanity check on length
+            mmap_free(file_filters, len + 1);
+        }
         file_filters = NULL;
         num_filters = 0;
     }
@@ -65,7 +71,7 @@ static void parse_log_config(c8_t* config) {
         }
 
         // Allocate and copy file filters
-        file_filters = (str_p)malloc(strlen(files_start) + 1);
+        file_filters = (str_p)mmap_alloc(strlen(files_start) + 1);
         strcpy(file_filters, files_start);
 
         // Replace commas with null terminators
