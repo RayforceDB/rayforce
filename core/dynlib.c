@@ -25,6 +25,9 @@
 #include "util.h"
 #include "error.h"
 #include "string.h"
+#include "dynlib.h"
+#include "heap.h"
+#include "runtime.h"
 
 #if defined(OS_WINDOWS)
 
@@ -123,4 +126,26 @@ obj_p ray_loadfn(obj_p *args, i64_t n) {
     drop_obj(func);
 
     return res;
+}
+
+obj_p dynlib_open(obj_p path) {
+    dynlib_p dl;
+    raw_p handle;
+
+    handle = dlopen(AS_C8(path), RTLD_NOW | RTLD_GLOBAL);
+    if (!handle)
+        THROW(ERR_SYS, "Failed to load shared library: %s", dlerror());
+
+    dl = (dynlib_p)heap_mmap(sizeof(struct dynlib_t));
+    dl->path = path;
+    dl->handle = handle;
+
+    return (obj_p)dl;
+}
+
+nil_t dynlib_close(dynlib_p dl) {
+    if (dl->handle)
+        dlclose(dl->handle);
+
+    heap_unmap(dl, sizeof(struct dynlib_t));
 }

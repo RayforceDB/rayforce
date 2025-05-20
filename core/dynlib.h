@@ -26,13 +26,14 @@
 
 #include "rayforce.h"
 
-/*
- *  Load a function from a shared library.
- *  @param path Path to the shared library.
- *  @param func Name of the function to load.
- *  @param nargs Number of arguments the function takes. (NULL_I64 or > 2 means vary)
- */
-obj_p dynlib_loadfn(str_p path, str_p func, i64_t nargs);
+typedef struct dynlib_t {
+    obj_p path;
+    raw_p handle;
+} *dynlib_p;
+
+obj_p dynlib_open(obj_p path);
+nil_t dynlib_close(dynlib_p dl);
+obj_p dynlib_loadfn(obj_p path, obj_p func, i64_t nargs);
 obj_p ray_loadfn(obj_p *args, i64_t n);
 
 #endif  // DYNLIB_H

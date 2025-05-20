@@ -47,6 +47,7 @@ typedef struct runtime_t {
     obj_p fdmaps;           // File descriptors mappings.
     query_ctx_p query_ctx;  // Query context stack.
     pool_p pool;            // Executors pool.
+    obj_p dynlibs;          // Dynamic libraries.
 } *runtime_p;
 
 extern runtime_p __RUNTIME;

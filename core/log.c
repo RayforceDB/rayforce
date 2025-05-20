@@ -17,7 +17,6 @@ static b8_t level_initialized = B8_FALSE;
 // Cleanup function to free allocated memory
 static void cleanup_log_config(nil_t) __attribute__((destructor));
 static void cleanup_log_config(nil_t) {
-    printf("Cleaning up log config\n");
     if (file_filters && file_filters != (void*)0x160) {  // Check for invalid pointer
         size_t len = strlen(file_filters);
         if (len < 1024) {  // Sanity check on length

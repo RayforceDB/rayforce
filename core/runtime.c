@@ -30,6 +30,7 @@
 #include "signal.h"
 #include "repl.h"
 #include "ipc.h"
+#include "dynlib.h"
 
 // Global runtime reference
 runtime_p __RUNTIME = NULL;
@@ -127,6 +128,7 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
     __RUNTIME->args = NULL_OBJ;
     __RUNTIME->query_ctx = NULL;
     __RUNTIME->pool = NULL;
+    __RUNTIME->dynlibs = LIST(0);
 
     interpreter_create(0);
 
@@ -209,6 +211,9 @@ i32_t runtime_run(nil_t) {
 }
 
 nil_t runtime_destroy(nil_t) {
+    i64_t i, l;
+    dynlib_p dl;
+
     drop_obj(__RUNTIME->args);
     if (__RUNTIME->poll)
         poll_destroy(__RUNTIME->poll);
@@ -216,6 +221,13 @@ nil_t runtime_destroy(nil_t) {
     heap_unmap(__RUNTIME->symbols, sizeof(struct symbols_t));
     env_destroy(&__RUNTIME->env);
     drop_obj(__RUNTIME->fdmaps);
+    // destroy dynamic libraries
+    l = __RUNTIME->dynlibs->len;
+    for (i = 0; i < l; i++) {
+        dl = (dynlib_p)AS_LIST(__RUNTIME->dynlibs)[i];
+        dynlib_close(dl);
+    }
+    drop_obj(__RUNTIME->dynlibs);
     interpreter_destroy();
     if (__RUNTIME->pool)
         pool_destroy(__RUNTIME->pool);
