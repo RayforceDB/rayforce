@@ -1285,6 +1285,9 @@ obj_p parse(lit_p input, i64_t input_len, obj_p nfo) {
     if (IS_ERR(res))
         return res;
 
+    // Skip any remaining whitespace before checking for unparsed input
+    skip_whitespaces(&parser);
+
     if (!at_eof(&parser)) {
         span = nfo_get(parser.nfo, (i64_t)res);
         span.start_column = span.end_column + 1;
