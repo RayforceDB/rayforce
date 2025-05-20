@@ -28,6 +28,7 @@
 #include "dynlib.h"
 #include "heap.h"
 #include "runtime.h"
+#include "log.h"
 
 #if defined(OS_WINDOWS)
 
@@ -78,14 +79,19 @@ dynlib_p dynlib_open(obj_p path) {
 
     for (i = 0; i < l; i++) {
         dl = (dynlib_p)AS_I64(dynlibs)[i];
-        if (str_cmp(AS_C8(dl->path), dl->path->len, AS_C8(path), path->len) == 0)
+        if (str_cmp(AS_C8(dl->path), dl->path->len, AS_C8(path), path->len) == 0) {
+            LOG_TRACE("dynlib: %s already opened", AS_C8(path));
             return dl;
+        }
     }
 
     // otherwise, open the dynlib
+    LOG_TRACE("dynlib: opening %s", AS_C8(path));
     handle = dlopen(AS_C8(path), RTLD_NOW | RTLD_GLOBAL);
-    if (handle == NULL)
+    if (handle == NULL) {
+        LOG_ERROR("dynlib: failed to open %s: %s", AS_C8(path), dlerror());
         return NULL;
+    }
 
     dl = (dynlib_p)heap_mmap(sizeof(struct dynlib_t));
     dl->path = clone_obj(path);
