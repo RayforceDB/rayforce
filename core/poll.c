@@ -87,15 +87,18 @@ i64_t poll_rx_buf_request(poll_p poll, selector_p selector, i64_t size) {
 }
 
 i64_t poll_rx_buf_extend(poll_p poll, selector_p selector, i64_t size) {
+    i64_t new_size;
     UNUSED(poll);
 
-    LOG_TRACE("Extending buffer from %d to %d", selector->rx.buf->size, size);
-    selector->rx.buf = heap_realloc(selector->rx.buf, ISIZEOF(struct poll_buffer_t) + size);
+    new_size = selector->rx.buf->offset + size;
+
+    LOG_TRACE("Extending buffer from %d to %d", selector->rx.buf->size, new_size);
+    selector->rx.buf = heap_realloc(selector->rx.buf, ISIZEOF(struct poll_buffer_t) + new_size);
     LOG_TRACE("New buffer: %p", selector->rx.buf);
     if (selector->rx.buf == NULL)
         return -1;
 
-    selector->rx.buf->size = size;
+    selector->rx.buf->size = new_size;
 
     return 0;
 }
