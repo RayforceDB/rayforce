@@ -36,7 +36,7 @@
 runtime_p __RUNTIME = NULL;
 
 nil_t usage(nil_t) {
-    printf("%s%s%s", BOLD, YELLOW, "Usage: rayforce [-f file] [-p port] [-t timeit] [-c cores] [file]\n");
+    printf("%s%s%s", BOLD, YELLOW, "Usage: rayforce [-f file] [-p port] [-t timeit] [-c cores] [-s] [file]\n");
     exit(EXIT_FAILURE);
 }
 
@@ -73,6 +73,12 @@ obj_p parse_cmdline(i32_t argc, str_p argv[]) {
                 if (++opt >= argc)
                     usage();
                 push_sym(&keys, "timeit");
+                str = string_from_str(argv[opt], strlen(argv[opt]));
+                push_obj(&vals, str);
+            } else if (!user_defined && (strcmp(flag, "r") == 0 || strcmp(flag, "repl") == 0)) {
+                if (++opt >= argc)
+                    usage();
+                push_sym(&keys, "repl");
                 str = string_from_str(argv[opt], strlen(argv[opt]));
                 push_obj(&vals, str);
             } else if (!user_defined && (strcmp(flag, "-") == 0)) {
@@ -188,11 +194,22 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
 }
 
 i32_t runtime_run(nil_t) {
+    b8_t repl_enabled = B8_FALSE;
     i64_t port;
     obj_p arg;
 
     if (__RUNTIME->poll) {
-        repl_create(__RUNTIME->poll);
+        arg = runtime_get_arg("repl");
+        if (is_null(arg)) {
+            repl_create(__RUNTIME->poll);
+            drop_obj(arg);
+        } else {
+            repl_enabled =
+                (str_cmp(AS_C8(arg), arg->len, "true", 4) == 0) || (str_cmp(AS_C8(arg), arg->len, "1", 1) == 0);
+            drop_obj(arg);
+            if (repl_enabled)
+                repl_create(__RUNTIME->poll);
+        }
 
         arg = runtime_get_arg("port");
         if (!is_null(arg)) {
