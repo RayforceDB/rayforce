@@ -52,7 +52,7 @@ typedef struct runtime_t {
 
 extern runtime_p __RUNTIME;
 
-i32_t runtime_create(i32_t argc, str_p argv[]);
+runtime_p runtime_create(i32_t argc, str_p argv[]);
 i32_t runtime_run(nil_t);
 nil_t runtime_destroy(nil_t);
 obj_p runtime_get_arg(lit_p key);

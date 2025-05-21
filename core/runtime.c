@@ -119,7 +119,7 @@ obj_p parse_cmdline(i32_t argc, str_p argv[]) {
     return dict(keys, vals);
 }
 
-i32_t runtime_create(i32_t argc, str_p argv[]) {
+runtime_p runtime_create(i32_t argc, str_p argv[]) {
     i64_t n;
     obj_p arg, fmt, res;
     symbols_p symbols;
@@ -159,7 +159,7 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
         __RUNTIME->poll = poll_create();
         if (__RUNTIME->poll == NULL) {
             printf("Failed to create poll\n");
-            return 1;
+            return NULL;
         }
 
         // timeit
@@ -190,7 +190,7 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
         //     __RUNTIME->pool = pool_create(__RUNTIME->sys_info.threads - 1);
     }
 
-    return 0;
+    return __RUNTIME;
 }
 
 i32_t runtime_run(nil_t) {
