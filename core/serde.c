@@ -143,7 +143,7 @@ i64_t size_obj(obj_p obj) {
             return size;
         case TYPE_TABLE:
         case TYPE_DICT:
-            return ISIZEOF(i8_t) + 1 + ISIZEOF(i64_t) + size_obj(AS_LIST(obj)[0]) + size_obj(AS_LIST(obj)[1]);
+            return ISIZEOF(i8_t) + 1 + size_obj(AS_LIST(obj)[0]) + size_obj(AS_LIST(obj)[1]);
         case TYPE_LAMBDA:
             return ISIZEOF(i8_t) + 1 + ISIZEOF(i64_t) + size_obj(AS_LAMBDA(obj)->args) + size_obj(AS_LAMBDA(obj)->body);
         case TYPE_UNARY:
@@ -460,10 +460,11 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case TYPE_LIST:
             if (*len < ISIZEOF(i64_t))
                 return error_str(ERR_IO, "de_raw: buffer underflow");
+
             buf++;  // skip attrs
             memcpy(&l, buf, ISIZEOF(i64_t));
             buf += ISIZEOF(i64_t);
-            (*len) -= ISIZEOF(i64_t);
+            (*len) -= ISIZEOF(i64_t) + 1;
 
             // Check for unreasonable length values that might indicate corruption
             if (l > 1000000000)  // 1 billion elements is likely a corrupted value
@@ -559,8 +560,9 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                     obj = LIST(l);
                     if (IS_ERR(obj))
                         return obj;
+                    c = *len;
                     for (i = 0; i < l; i++) {
-                        v = de_raw(buf, len);
+                        v = de_raw(buf + c - *len, len);
                         if (IS_ERR(v)) {
                             obj->len = i;
                             drop_obj(obj);
@@ -577,12 +579,14 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case TYPE_TABLE:
         case TYPE_DICT:
             buf++;  // skip attrs
+            (*len) -= 1;
+            c = *len;
             k = de_raw(buf, len);
 
             if (IS_ERR(k))
                 return k;
 
-            v = de_raw(buf, len);
+            v = de_raw(buf + c - *len, len);
 
             if (IS_ERR(v)) {
                 drop_obj(k);
@@ -596,12 +600,14 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
 
         case TYPE_LAMBDA:
             buf++;  // skip attrs
+            (*len) -= 1;
+            c = *len;
             k = de_raw(buf, len);
 
             if (IS_ERR(k))
                 return k;
 
-            v = de_raw(buf, len);
+            v = de_raw(buf + c - *len, len);
 
             if (IS_ERR(v)) {
                 drop_obj(k);

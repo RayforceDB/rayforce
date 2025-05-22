@@ -155,7 +155,7 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     if (fd == -1)
         return -1;
 
-    if (sock_send(fd, buf, 1) == -1)
+    if (sock_send(fd, buf, 2) == -1)
         return -1;
 
     if (sock_recv(fd, buf, 1) == -1)
@@ -293,6 +293,8 @@ obj_p ipc_process_msg(poll_p poll, selector_p selector, obj_p msg) {
     ipc_ctx_p ctx;
 
     ctx = (ipc_ctx_p)selector->data;
+
+    DEBUG_OBJ(msg);
 
     if (IS_ERR(msg) || is_null(msg))
         res = msg;
