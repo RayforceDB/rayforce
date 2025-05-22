@@ -145,7 +145,7 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     selector_p selector;
     struct poll_registry_t registry = ZERO_INIT_STRUCT;
     ipc_ctx_p ctx;
-    u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
+    u8_t buf[2] = {RAYFORCE_VERSION, 0x00};
 
     LOG_DEBUG("Opening connection to %s:%lld", addr->ip, addr->port);
 
@@ -155,10 +155,10 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     if (fd == -1)
         return -1;
 
-    if (sock_send(fd, handshake, 2) == -1)
+    if (sock_send(fd, buf, 1) == -1)
         return -1;
 
-    if (sock_recv(fd, handshake, 2) == -1)
+    if (sock_recv(fd, buf, 1) == -1)
         return -1;
 
     LOG_TRACE("Setting socket to non-blocking mode");
@@ -200,7 +200,6 @@ option_t ipc_read_handshake(poll_p poll, selector_p selector) {
     UNUSED(poll);
 
     poll_buffer_p buf;
-    u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
 
     if (selector->rx.buf == NULL) {
         LOG_DEBUG("No handshake buffer received, closing connection");
@@ -212,8 +211,8 @@ option_t ipc_read_handshake(poll_p poll, selector_p selector) {
         LOG_DEBUG("Handshake received, sending response");
 
         // send handshake response (single byte version)
-        buf = poll_buf_create(2);
-        memcpy(buf->data, handshake, 2);
+        buf = poll_buf_create(1);
+        buf->data[0] = RAYFORCE_VERSION;
         poll_send_buf(poll, selector, buf);
 
         // Now we are ready for income messages and can call userspace callback (if any)
