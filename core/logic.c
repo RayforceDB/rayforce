@@ -30,44 +30,66 @@
 #include "eval.h"
 #include "runtime.h"
 
-typedef obj_p (*logic_op_f)(raw_p, raw_p, raw_p, raw_p);
+typedef obj_p (*logic_op_f)(raw_p, raw_p, raw_p, raw_p, raw_p);
 
 // Operation functions
-static obj_p and_op_partial(raw_p x, raw_p y, raw_p z, raw_p k) {
-    b8_t *mask, *next_mask;
-    i64_t i, n, offset;
+static obj_p and_op_partial(raw_p x, raw_p y, raw_p z, raw_p k, raw_p l) {
+    b8_t m, *mask, *next_mask;
+    i64_t i, n, c, offset;
 
-    offset = (i64_t)k;
     n = (i64_t)z;
+    offset = (i64_t)k;
+    c = (i64_t)l;
 
-    mask = AS_B8((obj_p)x) + offset;
-    next_mask = AS_B8((obj_p)y) + offset;
+    mask = (b8_t *)x + offset;
+    next_mask = (b8_t *)y + offset;
 
+    // both vectors are the same length
+    if (n == c) {
+        for (i = 0; i < n; i++)
+            mask[i] &= next_mask[i];
+
+        return NULL_OBJ;
+    }
+
+    // else right is scalar
+    m = next_mask[0];
     for (i = 0; i < n; i++)
-        mask[i] &= next_mask[i];
+        mask[i] &= m;
 
     return NULL_OBJ;
 }
 
-static obj_p or_op_partial(raw_p x, raw_p y, raw_p z, raw_p k) {
-    b8_t *mask, *next_mask;
-    i64_t i, n, offset;
+static obj_p or_op_partial(raw_p x, raw_p y, raw_p z, raw_p k, raw_p l) {
+    b8_t m, *mask, *next_mask;
+    i64_t i, n, c, offset;
 
-    offset = (i64_t)k;
     n = (i64_t)z;
+    offset = (i64_t)k;
+    c = (i64_t)l;
 
-    mask = AS_B8((obj_p)x) + offset;
-    next_mask = AS_B8((obj_p)y) + offset;
+    mask = (b8_t *)x + offset;
+    next_mask = (b8_t *)y + offset;
 
+    // both vectors are the same length
+    if (n == c) {
+        for (i = 0; i < n; i++)
+            mask[i] |= next_mask[i];
+
+        return NULL_OBJ;
+    }
+
+    // else right is scalar
+    m = next_mask[0];
     for (i = 0; i < n; i++)
-        mask[i] |= next_mask[i];
+        mask[i] |= m;
 
     return NULL_OBJ;
 }
 
 // Actual logic operation
 static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
-    i64_t i, m, l, chunk;
+    i64_t i, c, m, l, chunk;
     obj_p next, res, v;
     pool_p pool = runtime_get()->pool;
 
@@ -79,15 +101,6 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
     if (IS_ERR(res) || n == 1)
         return res;
 
-    if (res->type != TYPE_B8) {
-        drop_obj(res);
-        THROW(ERR_TYPE, "%s: unsupported types: '%s, '%s", op_name, type_name(res->type), type_name(TYPE_B8));
-    }
-
-    l = res->len;
-
-    m = pool_split_by(pool, res->len, 0);
-
     // Process remaining expressions
     for (i = 1; i < n; i++) {
         next = eval(x[i]);
@@ -96,42 +109,90 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
             return next;
         }
 
-        if (next->type != TYPE_B8) {
-            drop_obj(res);
-            drop_obj(next);
-            THROW(ERR_TYPE, "%s: unsupported types: '%s, '%s", op_name, type_name(next->type), type_name(TYPE_B8));
-        }
+        switch (MTYPE2(res->type, next->type)) {
+            case MTYPE2(-TYPE_B8, -TYPE_B8):
+                op_func(&res->b8, &next->b8, (raw_p)1, (raw_p)0, (raw_p)1);
+                drop_obj(next);
+                break;
+            case MTYPE2(TYPE_B8, TYPE_B8):
+                l = ops_count(res);
+                c = ops_count(next);
 
-        if (next->len != l) {
-            drop_obj(res);
-            drop_obj(next);
-            THROW(ERR_TYPE, "%s: different lengths: '%ld, '%ld", op_name, l, next->len);
-        }
+                if (l != c) {
+                    drop_obj(res);
+                    drop_obj(next);
+                    THROW(ERR_TYPE, "%s: different lengths: '%ld, '%ld", op_name, l, c);
+                }
 
-        // Perform element-wise operation using the provided function
-        if (m == 1) {
-            op_func(res, next, (raw_p)l, (raw_p)0);
-        } else {
-            pool_prepare(pool);
-            chunk = l / m;
+                // Perform element-wise operation using the provided function
+                m = pool_split_by(pool, l, 0);
+                if (m == 1) {
+                    op_func(AS_B8(res), AS_B8(next), (raw_p)l, (raw_p)0, (raw_p)l);
+                } else {
+                    pool_prepare(pool);
+                    chunk = l / m;
 
-            for (i = 0; i < m - 1; i++)
-                pool_add_task(pool, op_func, 5, res, next, chunk, i * chunk, res);
+                    for (i = 0; i < m - 1; i++)
+                        pool_add_task(pool, op_func, 5, AS_B8(res), AS_B8(next), chunk, i * chunk, res, (raw_p)l);
 
-            pool_add_task(pool, op_func, 5, res, next, l - i * chunk, i * chunk, res);
+                    pool_add_task(pool, op_func, 5, AS_B8(res), AS_B8(next), l - i * chunk, i * chunk, res, (raw_p)l);
 
-            v = pool_run(pool);
+                    v = pool_run(pool);
 
-            if (IS_ERR(v)) {
+                    if (IS_ERR(v)) {
+                        drop_obj(res);
+                        drop_obj(next);
+                        return v;
+                    }
+
+                    drop_obj(v);
+                }
+
+                drop_obj(next);
+
+                break;
+
+            case MTYPE2(TYPE_B8, -TYPE_B8):
+            va:
+                l = ops_count(res);
+                m = pool_split_by(pool, l, 0);
+                if (m == 1) {
+                    op_func(AS_B8(res), &next->b8, (raw_p)l, (raw_p)0, (raw_p)1);
+                } else {
+                    pool_prepare(pool);
+                    chunk = l / m;
+
+                    for (i = 0; i < m - 1; i++)
+                        pool_add_task(pool, op_func, 5, AS_B8(res), &next->b8, chunk, i * chunk, res, (raw_p)1);
+
+                    pool_add_task(pool, op_func, 5, AS_B8(res), &next->b8, l - i * chunk, i * chunk, res, (raw_p)1);
+
+                    v = pool_run(pool);
+
+                    if (IS_ERR(v)) {
+                        drop_obj(res);
+                        drop_obj(next);
+                        return v;
+                    }
+
+                    drop_obj(v);
+                }
+
+                drop_obj(next);
+
+                break;
+
+            case MTYPE2(-TYPE_B8, TYPE_B8):
+                v = res;
+                res = next;
+                next = v;
+                goto va;
+            default:
                 drop_obj(res);
                 drop_obj(next);
-                return v;
-            }
-
-            drop_obj(v);
+                THROW(ERR_TYPE, "%s: unsupported types: '%s, '%s", op_name, type_name(res->type),
+                      type_name(next->type));
         }
-
-        drop_obj(next);
     }
 
     return res;

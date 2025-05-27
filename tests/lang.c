@@ -3443,7 +3443,7 @@ test_result_t test_lang_and() {
     TEST_ASSERT_EQ("(and true true)", "true");
     TEST_ASSERT_EQ("(and [true false true] [false true false])", "[false false false]");
     TEST_ASSERT_EQ("(and [true false true] [false true false] [true false true])", "[false false false]");
-    TEST_ASSERT_EQ("(and [true false true] true)", "[false false true]");
+    TEST_ASSERT_EQ("(and [true false true] true)", "[true false true]");
 
     PASS();
 }
