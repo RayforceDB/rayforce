@@ -154,6 +154,8 @@ test_entry_t tests[] = {
     {"test_lang_concat", test_lang_concat},
     {"test_lang_filter", test_lang_filter},
     {"test_lang_in", test_lang_in},
+    {"test_lang_or", test_lang_or},
+    {"test_lang_and", test_lang_and},
 };
 // ---
 

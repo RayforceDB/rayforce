@@ -2659,9 +2659,11 @@ test_result_t test_lang_take() {
     TEST_ASSERT_EQ("(type (take 0i (table [a b] (list [1 2 3 4] ['a 'b 'c 'd]))))", "'Table");
     TEST_ASSERT_EQ("(take 3 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))", "(table [a b] (list [1 2 3] ['a 'b 'c]))");
     TEST_ASSERT_EQ("(take -3 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))", "(table [a b] (list [2 3 4] ['b 'c 'd]))");
-    TEST_ASSERT_EQ("(take 5 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))", "(table [a b] (list [1 2 3 4 1] ['a 'b 'c 'd 'a]))");
-    TEST_ASSERT_EQ("(take -5 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))", "(table [a b] (list [4 1 2 3 4] ['d 'a 'b 'c 'd]))");
-    
+    TEST_ASSERT_EQ("(take 5 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))",
+                   "(table [a b] (list [1 2 3 4 1] ['a 'b 'c 'd 'a]))");
+    TEST_ASSERT_EQ("(take -5 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))",
+                   "(table [a b] (list [4 1 2 3 4] ['d 'a 'b 'c 'd]))");
+
     TEST_ASSERT_ER("(take 2.0 1.0)", "take: unsupported types: 'f64, f64");
     TEST_ASSERT_ER("(take 2 take)", "take: unsupported types: 'i64, Binary");
 
@@ -3419,5 +3421,29 @@ test_result_t test_lang_in() {
     TEST_ASSERT_EQ("(set l (guid 2)) (in (list (first l)) l)", "(list true)");
     TEST_ASSERT_EQ("(set l (guid 2)) (in (list (first l)) (list l))", "(list false)");
     TEST_ASSERT_EQ("(set l (guid 2)) (in (list (first l)) (list (first l)))", "(list true)");
+    PASS();
+}
+
+test_result_t test_lang_or() {
+    TEST_ASSERT_EQ("(or true false)", "true");
+    TEST_ASSERT_EQ("(or false true)", "true");
+    TEST_ASSERT_EQ("(or false false)", "false");
+    TEST_ASSERT_EQ("(or true true)", "true");
+    TEST_ASSERT_EQ("(or [true false true] [false true false])", "[true true true]");
+    TEST_ASSERT_EQ("(or [true false true] [false true false] [true false true])", "[true true true]");
+    TEST_ASSERT_EQ("(or [true false true] true)", "[true true true]");
+
+    PASS();
+}
+
+test_result_t test_lang_and() {
+    TEST_ASSERT_EQ("(and true false)", "false");
+    TEST_ASSERT_EQ("(and false true)", "false");
+    TEST_ASSERT_EQ("(and false false)", "false");
+    TEST_ASSERT_EQ("(and true true)", "true");
+    TEST_ASSERT_EQ("(and [true false true] [false true false])", "[false false false]");
+    TEST_ASSERT_EQ("(and [true false true] [false true false] [true false true])", "[false false false]");
+    TEST_ASSERT_EQ("(and [true false true] true)", "[false false true]");
+
     PASS();
 }
