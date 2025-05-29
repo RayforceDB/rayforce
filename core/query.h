@@ -27,7 +27,7 @@
 #include "rayforce.h"
 
 typedef struct query_ctx_t {
-    u64_t tablen;
+    i64_t tablen;
     obj_p take;
     obj_p table;
     obj_p filter;

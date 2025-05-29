@@ -37,60 +37,60 @@ typedef enum index_type_t {
 typedef struct __index_list_ctx_t {
     obj_p lcols;
     obj_p rcols;
-    u64_t *hashes;
+    i64_t *hashes;
     i64_t *filter;
 } __index_list_ctx_t;
 
 typedef struct __index_find_ctx_t {
     raw_p lobj;
     raw_p robj;
-    u64_t *hashes;
+    i64_t *hashes;
 } __index_find_ctx_t;
 
 typedef struct index_scope_t {
     i64_t min;
     i64_t max;
-    u64_t range;
+    i64_t range;
 } index_scope_t;
 
-u64_t index_group_count(obj_p index);
-u64_t index_group_len(obj_p index);
+i64_t index_group_count(obj_p index);
+i64_t index_group_len(obj_p index);
 index_type_t index_group_type(obj_p index);
 i64_t *index_group_source(obj_p index);
 i64_t *index_group_ids(obj_p index);
 i64_t *index_group_filter_ids(obj_p index);
 obj_p index_group_filter(obj_p index);
 i64_t index_group_shift(obj_p index);
-obj_p index_distinct_i8(i8_t values[], u64_t len);
-obj_p index_distinct_i16(i16_t values[], u64_t len);
-obj_p index_distinct_i32(i32_t values[], u64_t len);
-obj_p index_distinct_i64(i64_t values[], u64_t len);
-obj_p index_distinct_guid(guid_t values[], u64_t len);
-obj_p index_distinct_obj(obj_p values[], u64_t len);
-obj_p index_in_i8_i8(i8_t x[], u64_t xl, i8_t y[], u64_t yl);
-obj_p index_in_i8_i16(i8_t x[], u64_t xl, i16_t y[], u64_t yl);
-obj_p index_in_i8_i32(i8_t x[], u64_t xl, i32_t y[], u64_t yl);
-obj_p index_in_i8_i64(i8_t x[], u64_t xl, i64_t y[], u64_t yl);
-obj_p index_in_i16_i8(i16_t x[], u64_t xl, i8_t y[], u64_t yl);
-obj_p index_in_i16_i16(i16_t x[], u64_t xl, i16_t y[], u64_t yl);
-obj_p index_in_i16_i32(i16_t x[], u64_t xl, i32_t y[], u64_t yl);
-obj_p index_in_i16_i64(i16_t x[], u64_t xl, i64_t y[], u64_t yl);
-obj_p index_in_i32_i8(i32_t x[], u64_t xl, i8_t y[], u64_t yl);
-obj_p index_in_i32_i16(i32_t x[], u64_t xl, i16_t y[], u64_t yl);
-obj_p index_in_i32_i32(i32_t x[], u64_t xl, i32_t y[], u64_t yl);
-obj_p index_in_i32_i64(i32_t x[], u64_t xl, i64_t y[], u64_t yl);
-obj_p index_in_i64_i8(i64_t x[], u64_t xl, i8_t y[], u64_t yl);
-obj_p index_in_i64_i16(i64_t x[], u64_t xl, i16_t y[], u64_t yl);
-obj_p index_in_i64_i32(i64_t x[], u64_t xl, i32_t y[], u64_t yl);
-obj_p index_in_i64_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl);
-obj_p index_in_guid_guid(guid_t x[], u64_t xl, guid_t y[], u64_t yl);
-obj_p index_find_i8(i8_t x[], u64_t xl, i8_t y[], u64_t yl);
-obj_p index_find_i64(i64_t x[], u64_t xl, i64_t y[], u64_t yl);
-obj_p index_find_guid(guid_t x[], u64_t xl, guid_t y[], u64_t yl);
-obj_p index_find_obj(obj_p x[], u64_t xl, obj_p y[], u64_t yl);
+obj_p index_distinct_i8(i8_t values[], i64_t len);
+obj_p index_distinct_i16(i16_t values[], i64_t len);
+obj_p index_distinct_i32(i32_t values[], i64_t len);
+obj_p index_distinct_i64(i64_t values[], i64_t len);
+obj_p index_distinct_guid(guid_t values[], i64_t len);
+obj_p index_distinct_obj(obj_p values[], i64_t len);
+obj_p index_in_i8_i8(i8_t x[], i64_t xl, i8_t y[], i64_t yl);
+obj_p index_in_i8_i16(i8_t x[], i64_t xl, i16_t y[], i64_t yl);
+obj_p index_in_i8_i32(i8_t x[], i64_t xl, i32_t y[], i64_t yl);
+obj_p index_in_i8_i64(i8_t x[], i64_t xl, i64_t y[], i64_t yl);
+obj_p index_in_i16_i8(i16_t x[], i64_t xl, i8_t y[], i64_t yl);
+obj_p index_in_i16_i16(i16_t x[], i64_t xl, i16_t y[], i64_t yl);
+obj_p index_in_i16_i32(i16_t x[], i64_t xl, i32_t y[], i64_t yl);
+obj_p index_in_i16_i64(i16_t x[], i64_t xl, i64_t y[], i64_t yl);
+obj_p index_in_i32_i8(i32_t x[], i64_t xl, i8_t y[], i64_t yl);
+obj_p index_in_i32_i16(i32_t x[], i64_t xl, i16_t y[], i64_t yl);
+obj_p index_in_i32_i32(i32_t x[], i64_t xl, i32_t y[], i64_t yl);
+obj_p index_in_i32_i64(i32_t x[], i64_t xl, i64_t y[], i64_t yl);
+obj_p index_in_i64_i8(i64_t x[], i64_t xl, i8_t y[], i64_t yl);
+obj_p index_in_i64_i16(i64_t x[], i64_t xl, i16_t y[], i64_t yl);
+obj_p index_in_i64_i32(i64_t x[], i64_t xl, i32_t y[], i64_t yl);
+obj_p index_in_i64_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl);
+obj_p index_in_guid_guid(guid_t x[], i64_t xl, guid_t y[], i64_t yl);
+obj_p index_find_i8(i8_t x[], i64_t xl, i8_t y[], i64_t yl);
+obj_p index_find_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl);
+obj_p index_find_guid(guid_t x[], i64_t xl, guid_t y[], i64_t yl);
+obj_p index_find_obj(obj_p x[], i64_t xl, obj_p y[], i64_t yl);
 obj_p index_group(obj_p val, obj_p filter);
 obj_p index_group_list(obj_p obj, obj_p filter);
-obj_p index_join_obj(obj_p lcols, obj_p rcols, u64_t len);
-nil_t index_hash_obj(obj_p obj, u64_t out[], i64_t filter[], u64_t len, b8_t resolve);
+obj_p index_join_obj(obj_p lcols, obj_p rcols, i64_t len);
+nil_t index_hash_obj(obj_p obj, i64_t out[], i64_t filter[], i64_t len, b8_t resolve);
 
 #endif  // INDEX_H

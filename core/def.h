@@ -30,6 +30,7 @@
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 #define OS_WINDOWS
+#include <stdio.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <MSWSock.h>
@@ -51,8 +52,10 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <arpa/inet.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -74,6 +77,7 @@
 #else
 #define RAY_PAGE_SIZE 16384  // 16K for Intel Mac
 #endif
+#include <stdio.h>
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #include <sys/mman.h>

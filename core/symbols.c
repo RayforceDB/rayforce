@@ -34,13 +34,13 @@
 #include "ops.h"
 #include "atomic.h"
 
-str_p string_intern(symbols_p symbols, lit_p str, u64_t len) {
-    u64_t rounds = 0, cap;
+str_p string_intern(symbols_p symbols, lit_p str, i64_t len) {
+    i64_t rounds = 0, cap;
     str_p curr, node;
 
     assert(len > 0);
 
-    cap = len + 1;
+    cap = sizeof(u32_t) + len + 1;
     curr = __atomic_fetch_add(&symbols->string_curr, cap, __ATOMIC_RELAXED);
     node = __atomic_load_n(&symbols->string_node, __ATOMIC_ACQUIRE);
 
@@ -68,15 +68,16 @@ str_p string_intern(symbols_p symbols, lit_p str, u64_t len) {
     }
 
     // Copy the string into the allocated space
-    memcpy(curr, str, len);
-    curr[len] = '\0';
+    *((u32_t *)curr) = len;
+    node = curr + sizeof(u32_t);
+    memcpy(node, str, len);
+    node[len] = '\0';
 
-    return curr;
+    return node;
 }
 
-i64_t symbols_intern(lit_p str, u64_t len) {
-    u64_t rounds = 0;
-    i64_t index;
+i64_t symbols_intern(lit_p str, i64_t len) {
+    i64_t l, index, rounds = 0;
     str_p intr;
     symbols_p symbols = runtime_get()->symbols;
     symbol_p new_bucket, current_bucket, b, *syms;
@@ -97,7 +98,8 @@ load:
     }
 
     while (b != NULL) {
-        if (str_cmp(b->str, b->len, str, len) == 0)
+        l = SYMBOL_STRLEN((i64_t)b->str);
+        if (str_cmp(b->str, l, str, len) == 0)
             return (i64_t)b->str;
 
         b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE);
@@ -112,7 +114,8 @@ load:
     b = current_bucket;
 
     while (b != NULL) {
-        if (str_cmp(b->str, b->len, str, len) == 0) {
+        l = SYMBOL_STRLEN((i64_t)b->str);
+        if (str_cmp(b->str, l, str, len) == 0) {
             __atomic_store_n(&syms[index], current_bucket, __ATOMIC_RELEASE);
             return (i64_t)b->str;
         }
@@ -125,7 +128,6 @@ load:
         return NULL_I64;
 
     intr = string_intern(symbols, str, len);
-    new_bucket->len = len;
     new_bucket->str = intr;
     new_bucket->next = current_bucket;
 
@@ -172,7 +174,7 @@ symbols_p symbols_create(nil_t) {
 }
 
 nil_t symbols_destroy(symbols_p symbols) {
-    u64_t i;
+    i64_t i;
     symbol_p b, next;
 
     // free the symbol pool nodes
@@ -190,14 +192,14 @@ nil_t symbols_destroy(symbols_p symbols) {
     heap_unmap(symbols, sizeof(struct symbols_t));
 }
 
-str_p str_from_symbol(i64_t key) { return (key == NULL_I64) ? (str_p)"" : (str_p)key; }
+str_p str_from_symbol(i64_t key) { return (key == NULL_I64) ? (str_p) "" : (str_p)key; }
 
-u64_t symbols_count(symbols_p symbols) { return symbols->count; }
+i64_t symbols_count(symbols_p symbols) { return symbols->count; }
 
 // TODO
 nil_t symbols_rebuild(symbols_p symbols) {
     UNUSED(symbols);
-    // u64_t i, size, new_size;
+    // i64_t i, size, new_size;
     // symbol_p bucket, *syms, *new_syms;
 
     // syms = symbols->syms;

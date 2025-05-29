@@ -1,5 +1,5 @@
 /*
- *   Copyright (c) 2024 Anton Kundenko <singaraiona@gmail.com>
+ *   Copyright (c) 2025 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
 
  *   Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -21,15 +21,39 @@
  *   SOFTWARE.
  */
 
-#include <stdio.h>
-#include "../core/rayforce.h"
+#ifndef IPC_H
+#define IPC_H
 
-obj_p myfn(obj_p a, obj_p b) {
-    if (is_null(a) || is_null(b))
-        return null(0);
+#include "rayforce.h"
+#include "poll.h"
+#include "sock.h"
 
-    if (a->type != -TYPE_I64 || b->type != -TYPE_I64)
-        return error(ERR_TYPE, "Expected two i64 arguments, found: '%s, '%s", type_name(a->type), type_name(b->type));
+#define MSG_TYPE_ASYN 0
+#define MSG_TYPE_SYNC 1
+#define MSG_TYPE_RESP 2
 
-    return i64(a->i64 + b->i64);
-}
+typedef struct ipc_ctx_t {
+    u8_t msgtype;
+    obj_p name;
+} *ipc_ctx_p;
+
+option_t ipc_read_handshake(poll_p poll, selector_p selector);
+option_t ipc_read_header(poll_p poll, selector_p selector);
+option_t ipc_read_msg(poll_p poll, selector_p selector);
+nil_t ipc_on_open(poll_p poll, selector_p selector);
+nil_t ipc_on_close(poll_p poll, selector_p selector);
+nil_t ipc_on_error(poll_p poll, selector_p selector);
+option_t ipc_on_data(poll_p poll, selector_p selector, raw_p data);
+nil_t ipc_send_msg(poll_p poll, selector_p selector, obj_p msg, u8_t msgtype);
+obj_p ipc_process_msg(poll_p poll, selector_p selector, obj_p msg);
+
+// listen for incoming connections
+i64_t ipc_listen(poll_p poll, i64_t port);
+
+// open a connection
+i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout);
+
+// send messages
+obj_p ipc_send(poll_p poll, i64_t id, obj_p msg, u8_t msgtype);
+
+#endif  // IPC_H

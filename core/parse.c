@@ -81,7 +81,7 @@ obj_p parse_error(parser_t *parser, i64_t id, obj_p msg) {
     return err;
 }
 
-b8_t is_whitespace(c8_t c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+b8_t is_whitespace(c8_t c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\0'; }
 
 b8_t is_digit(c8_t c) { return c >= '0' && c <= '9'; }
 
@@ -91,9 +91,17 @@ b8_t is_alphanum(c8_t c) { return is_alpha(c) || is_digit(c); }
 
 b8_t is_op(c8_t c) { return c && strchr("+-*/%&|^~<>!=._?", c) != NULL; }
 
-b8_t at_eof(c8_t c) { return c == '\0' || (signed char)c == EOF; }
+b8_t at_eof(parser_t *parser) {
+    return parser->current >= parser->input + parser->input_len || *parser->current == '\0';
+}
 
-b8_t at_term(c8_t c) { return c == ')' || c == ']' || c == '}' || c == ':' || c == ' ' || c == '\r' || c == '\n'; }
+b8_t before_eof(parser_t *parser) {
+    return parser->current + 1 >= parser->input + parser->input_len || *parser->current == '\0';
+}
+
+b8_t at_term(c8_t c) {
+    return c == ')' || c == ']' || c == '}' || c == ':' || c == ' ' || c == '\r' || c == '\n' || c == '\0';
+}
 
 b8_t is_at(obj_p token, c8_t c) { return token && token->type == TYPE_TOKEN && token->c8 == c; }
 
@@ -102,7 +110,7 @@ b8_t is_at_term(obj_p token) { return token && token->type == TYPE_TOKEN && at_t
 i8_t shift(parser_t *parser, i32_t num) {
     i8_t res;
 
-    if (at_eof(*parser->current))
+    if (at_eof(parser))
         return 0;
 
     res = *parser->current;
@@ -243,15 +251,17 @@ obj_p parse_time(parser_t *parser) {
 }
 
 obj_p parse_timestamp(parser_t *parser) {
-    str_p end, current = parser->current;
+    const char *end, *current = parser->current;
     u32_t nanos;
     datestruct_t dt = {.null = B8_FALSE, .year = 0, .month = 0, .day = 0};
     timestamp_t ts = {.null = B8_FALSE, .year = 0, .month = 0, .day = 0, .hours = 0, .mins = 0, .secs = 0, .nanos = 0};
     obj_p res;
     span_t span = span_start(parser);
+    i64_t remaining = parser->input_len - (current - parser->input);
 
     // parse year
-    if (is_digit(*current) && is_digit(*(current + 1)) && is_digit(*(current + 2)) && is_digit(*(current + 3))) {
+    if (remaining >= 4 && is_digit(*current) && is_digit(*(current + 1)) && is_digit(*(current + 2)) &&
+        is_digit(*(current + 3))) {
         ts.year = (*current - '0') * 1000 + (*(current + 1) - '0') * 100 + (*(current + 2) - '0') * 10 +
                   (*(current + 3) - '0');
         current += 4;
@@ -265,7 +275,7 @@ obj_p parse_timestamp(parser_t *parser) {
     current++;
 
     // parse month
-    if (is_digit(*current) && is_digit(*(current + 1))) {
+    if (remaining >= 6 && is_digit(*current) && is_digit(*(current + 1))) {
         ts.month = (*current - '0') * 10 + (*(current + 1) - '0');
 
         current += 2;
@@ -286,7 +296,7 @@ obj_p parse_timestamp(parser_t *parser) {
     current++;
 
     // parse day
-    if (is_digit(*current) && is_digit(*(current + 1))) {
+    if (remaining >= 8 && is_digit(*current) && is_digit(*(current + 1))) {
         ts.day = (*current - '0') * 10 + (*(current + 1) - '0');
 
         current += 2;
@@ -317,7 +327,7 @@ obj_p parse_timestamp(parser_t *parser) {
     current++;
 
     // parse hour
-    if (is_digit(*current) && is_digit(*(current + 1))) {
+    if (remaining >= 11 && is_digit(*current) && is_digit(*(current + 1))) {
         ts.hours = (*current - '0') * 10 + (*(current + 1) - '0');
 
         current += 2;
@@ -338,7 +348,7 @@ obj_p parse_timestamp(parser_t *parser) {
     current++;
 
     // parse minute
-    if (is_digit(*current) && is_digit(*(current + 1))) {
+    if (remaining >= 14 && is_digit(*current) && is_digit(*(current + 1))) {
         ts.mins = (*current - '0') * 10 + (*(current + 1) - '0');
 
         current += 2;
@@ -359,7 +369,7 @@ obj_p parse_timestamp(parser_t *parser) {
     current++;
 
     // parse second
-    if (is_digit(*current) && is_digit(*(current + 1))) {
+    if (remaining >= 17 && is_digit(*current) && is_digit(*(current + 1))) {
         ts.secs = (*current - '0') * 10 + (*(current + 1) - '0');
 
         current += 2;
@@ -380,7 +390,10 @@ obj_p parse_timestamp(parser_t *parser) {
     current++;
 
     // parse nanos
-    nanos = strtoul(current, &end, 10);
+    nanos = strtoul(current, (char **)&end, 10);
+    if (end > parser->input + parser->input_len) {
+        end = parser->input + parser->input_len;
+    }
 
     if (end == current)
         return PARSE_ADVANCE;
@@ -395,7 +408,7 @@ obj_p parse_timestamp(parser_t *parser) {
     return res;
 }
 
-obj_p specify_number(parser_t *parser, str_p current, span_t span, obj_p num) {
+obj_p specify_number(parser_t *parser, const char *current, span_t span, obj_p num) {
     obj_p res;
 
     // Check first
@@ -477,17 +490,21 @@ obj_p specify_number(parser_t *parser, str_p current, span_t span, obj_p num) {
 }
 
 obj_p parse_number(parser_t *parser) {
-    str_p end;
+    const char *end;
     u8_t num_u8;
     i64_t num_i64;
     f64_t num_f64;
     obj_p num;
     span_t span = span_start(parser);
+    i64_t remaining = parser->input_len - (parser->current - parser->input);
 
     errno = 0;
 
-    if (*parser->current == '0' && (*(parser->current + 1) == 'x')) {
-        num_i64 = strtoll(parser->current + 2, &end, 16);
+    if (remaining >= 2 && *parser->current == '0' && (*(parser->current + 1) == 'x')) {
+        num_i64 = strtoll(parser->current + 2, (char **)&end, 16);
+        if (end > parser->input + parser->input_len) {
+            end = parser->input + parser->input_len;
+        }
         if (num_i64 > 255) {
             span.end_column += (end - parser->current);
             nfo_insert(parser->nfo, parser->count, span);
@@ -502,7 +519,10 @@ obj_p parse_number(parser_t *parser) {
         return num;
     }
 
-    num_i64 = strtoll(parser->current, &end, 10);
+    num_i64 = strtoll(parser->current, (char **)&end, 10);
+    if (end > parser->input + parser->input_len) {
+        end = parser->input + parser->input_len;
+    }
 
     if ((num_i64 == LONG_MAX || num_i64 == LONG_MIN) && errno == ERANGE) {
         span.end_column += (end - parser->current - 1);
@@ -515,7 +535,10 @@ obj_p parse_number(parser_t *parser) {
 
     // try double instead
     if (*end == '.') {
-        num_f64 = strtod(parser->current, &end);
+        num_f64 = strtod(parser->current, (char **)&end);
+        if (end > parser->input + parser->input_len) {
+            end = parser->input + parser->input_len;
+        }
 
         if (errno == ERANGE) {
             span.end_column += (end - parser->current);
@@ -538,7 +561,7 @@ obj_p parse_char(parser_t *parser) {
     c8_t ch;
 
     // Handle empty quoted symbol (single quote)
-    if (at_eof(*pos) || at_term(*pos)) {
+    if (before_eof(parser) || at_term(*pos)) {
         // Return a null symbol (0Ns)
         shift(parser, 1);  // Skip the opening quote
         span_extend(parser, &span);
@@ -586,7 +609,7 @@ obj_p parse_char(parser_t *parser) {
                 ch = *pos - '0';
                 pos++;
                 for (i = 0; i < 2; i++) {
-                    if (at_eof(*pos) || !is_digit(*pos) || *pos > '7' || *pos < '0') {
+                    if (at_eof(parser) || !is_digit(*pos) || *pos > '7' || *pos < '0') {
                         span.end_column += (pos - parser->current);
                         nfo_insert(parser->nfo, parser->count, span);
                         return parse_error(parser, parser->count++, str_fmt(-1, "Invalid octal escape sequence"));
@@ -616,8 +639,8 @@ obj_p parse_char(parser_t *parser) {
     }
 
     // If not a char literal, parse as quoted symbol
-    while (is_alphanum(*pos) || is_op(*pos))
-        pos++;
+    for (; (pos < parser->input + parser->input_len) && (is_alphanum(*pos) || is_op(*pos)); pos++)
+        ;
 
     if (*pos == '\'') {
         span.end_column += (pos - parser->current);
@@ -645,7 +668,7 @@ obj_p parse_string(parser_t *parser) {
 
     str = C8(0);
 
-    while (!at_eof(*pos) && *pos != '\n') {
+    while (!at_eof(parser) && *pos != '\n') {
         if (*pos == '\\') {
             switch (*++pos) {
                 case '\\':
@@ -677,7 +700,7 @@ obj_p parse_string(parser_t *parser) {
                 case '7':
                     // Parse octal escape sequence \xxx
                     for (i = 0; i < 3; i++) {
-                        if (at_eof(*pos) || !is_digit(*pos) || *pos > '7' || *pos < '0') {
+                        if (at_eof(parser) || !is_digit(*pos) || *pos > '7' || *pos < '0') {
                             drop_obj(str);
                             span.end_column += (pos - parser->current);
                             nfo_insert(parser->nfo, parser->count, span);
@@ -726,8 +749,9 @@ obj_p parse_symbol(parser_t *parser) {
     obj_p res = NULL_OBJ;
     span_t span = span_start(parser);
     i64_t id;
+    i64_t remaining = parser->input_len - (pos - parser->input);
 
-    if (strncmp(parser->current, "true", 4) == 0) {
+    if (remaining >= 4 && strncmp(pos, "true", 4) == 0) {
         shift(parser, 4);
         span_extend(parser, &span);
         res = b8(B8_TRUE);
@@ -735,7 +759,7 @@ obj_p parse_symbol(parser_t *parser) {
         return res;
     }
 
-    if (strncmp(parser->current, "false", 5) == 0) {
+    if (remaining >= 5 && strncmp(pos, "false", 5) == 0) {
         shift(parser, 5);
         span_extend(parser, &span);
         res = b8(B8_FALSE);
@@ -743,7 +767,7 @@ obj_p parse_symbol(parser_t *parser) {
         return res;
     }
 
-    if (strncmp(parser->current, "null", 4) == 0) {
+    if (remaining >= 4 && strncmp(pos, "null", 4) == 0) {
         shift(parser, 4);
         span_extend(parser, &span);
         res = NULL_OBJ;
@@ -754,7 +778,7 @@ obj_p parse_symbol(parser_t *parser) {
     // Skip first char and proceed until the end of the symbol
     do {
         pos++;
-    } while (*pos && (is_alphanum(*pos) || is_op(*pos)));
+    } while (pos < parser->input + parser->input_len && (is_alphanum(*pos) || is_op(*pos)));
 
     id = symbols_intern(parser->current, pos - parser->current);
 
@@ -773,7 +797,7 @@ obj_p parse_symbol(parser_t *parser) {
 
 obj_p parse_vector(parser_t *parser) {
     obj_p tok, vec = I64(0), err;
-    u64_t i;
+    i64_t i;
     f64_t v;
     span_t span = span_start(parser);
 
@@ -985,7 +1009,7 @@ obj_p parse_list(parser_t *parser) {
             return tok;
         }
 
-        if (at_eof(*parser->current)) {
+        if (at_eof(parser)) {
             nfo_insert(parser->nfo, parser->count, span);
             err = parse_error(parser, parser->count++, str_fmt(-1, "Expected ')'"));
             drop_obj(lst);
@@ -1034,7 +1058,7 @@ obj_p parse_dict(parser_t *parser) {
             return tok;
         }
 
-        if (at_eof(*parser->current) || is_at_term(tok)) {
+        if (at_eof(parser) || is_at_term(tok)) {
             nfo_insert(parser->nfo, parser->count, span);
             err = parse_error(parser, parser->count++, str_fmt(-1, "Expected '}'"));
             drop_obj(keys);
@@ -1107,13 +1131,10 @@ obj_p parse_dict(parser_t *parser) {
 }
 
 nil_t skip_whitespaces(parser_t *parser) {
-    while (B8_TRUE) {
-        if (at_eof(*parser->current))
-            break;
-
+    while (!at_eof(parser)) {
         // Skip shebang
         if (*parser->current == '#' && *(parser->current + 1) == '!') {
-            while (*parser->current != '\n' && !at_eof(*parser->current))
+            while (*parser->current != '\n' && !at_eof(parser))
                 parser->current++;
 
             parser->line++;
@@ -1122,18 +1143,19 @@ nil_t skip_whitespaces(parser_t *parser) {
 
         // Handle whitespace characters
         if (is_whitespace(*parser->current)) {
-            if (*parser->current == '\n') {
+            // Treat newline and carriage return as spaces
+            if (*parser->current == '\n' || *parser->current == '\r') {
                 parser->line++;
                 parser->column = 0;
-            } else
+            } else {
                 parser->column++;
-
+            }
             parser->current++;
         }
 
         // Handle comments
         else if (*parser->current == ';') {
-            while (*parser->current != '\n' && !at_eof(*parser->current)) {
+            while (*parser->current != '\n' && !at_eof(parser)) {
                 parser->current++;
                 parser->column++;
             }
@@ -1149,16 +1171,16 @@ obj_p parser_advance(parser_t *parser) {
 
     skip_whitespaces(parser);
 
-    if (at_eof(*parser->current))
+    if (at_eof(parser))
         return to_token(parser);
 
-    if ((*parser->current) == '[')
+    if (*parser->current == '[')
         return parse_vector(parser);
 
-    if ((*parser->current) == '(')
+    if (*parser->current == '(')
         return parse_list(parser);
 
-    if ((*parser->current) == '{')
+    if (*parser->current == '{')
         return parse_dict(parser);
 
     if (is_digit(*parser->current)) {
@@ -1178,13 +1200,16 @@ obj_p parser_advance(parser_t *parser) {
         if (tok != PARSE_ADVANCE)
             return tok;
 
-        return parse_number(parser);
+        tok = parse_number(parser);
+        if (at_eof(parser))
+            return tok;
+        return tok;
     }
 
-    if ((*parser->current) == '\'')
+    if (*parser->current == '\'')
         return parse_char(parser);
 
-    if ((*parser->current) == '"')
+    if (*parser->current == '"')
         return parse_string(parser);
 
     if (is_alpha(*parser->current) || is_op(*parser->current))
@@ -1197,7 +1222,8 @@ obj_p parser_advance(parser_t *parser) {
     }
 
     nfo_insert(parser->nfo, (i64_t)tok, span_start(parser));
-    err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Unexpected token: '%c'", *parser->current));
+    err = parse_error(parser, (i64_t)tok,
+                      str_fmt(-1, "Unexpected token: '%c'", !at_eof(parser) ? *parser->current : '?'));
     drop_obj(tok);
 
     return err;
@@ -1206,7 +1232,7 @@ obj_p parser_advance(parser_t *parser) {
 obj_p parse_do(parser_t *parser) {
     obj_p tok, car = PARSE_ADVANCE, lst = NULL_OBJ;
 
-    while (!at_eof(*parser->current)) {
+    while (!at_eof(parser)) {
         tok = parser_advance(parser);
 
         if (IS_ERR(tok)) {
@@ -1218,11 +1244,6 @@ obj_p parse_do(parser_t *parser) {
                 drop_obj(lst);
             }
             return tok;
-        }
-
-        if (is_at(tok, '\0')) {
-            drop_obj(tok);
-            break;
         }
 
         if (is_at_term(tok)) {
@@ -1244,7 +1265,7 @@ obj_p parse_do(parser_t *parser) {
     return lst != NULL_OBJ ? lst : car;
 }
 
-obj_p parse(lit_p input, obj_p nfo) {
+obj_p parse(lit_p input, i64_t input_len, obj_p nfo) {
     obj_p res, err;
     span_t span;
 
@@ -1253,6 +1274,7 @@ obj_p parse(lit_p input, obj_p nfo) {
         .count = 0,
         .input = input,
         .current = (str_p)input,
+        .input_len = input_len,
         .line = 0,
         .column = 0,
         .replace_symbols = B8_TRUE,
@@ -1263,7 +1285,10 @@ obj_p parse(lit_p input, obj_p nfo) {
     if (IS_ERR(res))
         return res;
 
-    if (!at_eof(*parser.current)) {
+    // Skip any remaining whitespace before checking for unparsed input
+    skip_whitespaces(&parser);
+
+    if (!at_eof(&parser)) {
         span = nfo_get(parser.nfo, (i64_t)res);
         span.start_column = span.end_column + 1;
         span.end_column = span.start_column;

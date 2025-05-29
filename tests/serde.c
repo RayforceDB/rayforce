@@ -29,7 +29,7 @@ test_result_t test_serde_different_sizes() {
     x = error(5, "myerror");
 
     size = size_obj(x);
-    size1 = save_obj(buf, size, x);
+    size1 = ser_raw(buf, x);
 
     drop_obj(x);
 

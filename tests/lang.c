@@ -50,19 +50,19 @@ test_result_t test_lang_basic() {
 
 test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(+ 0Ni 0Ni)", "0Ni");
-    TEST_ASSERT_EQ("(+ 0i 0Ni)", "0i");
-    TEST_ASSERT_EQ("(+ 0Ni -1i)", "-1i");
+    TEST_ASSERT_EQ("(+ 0i 0Ni)", "0Ni");
+    TEST_ASSERT_EQ("(+ 0Ni -1i)", "0Ni");
     TEST_ASSERT_EQ("(+ 0Nl 0Nl)", "0Nl");
-    TEST_ASSERT_EQ("(+ 0 0Nl)", "0i");
-    TEST_ASSERT_EQ("(+ 0Ni -1i)", "-1i");
-    TEST_ASSERT_EQ("(+ 0Ni -10.00)", "-10.00")
+    TEST_ASSERT_EQ("(+ 0 0Nl)", "0Nl");
+    TEST_ASSERT_EQ("(+ 0Ni -1i)", "0Ni");
+    TEST_ASSERT_EQ("(+ 0Ni -10.00)", "0Nf");
     TEST_ASSERT_EQ("(+ 0Ni 0Nl)", "0Nl");
     TEST_ASSERT_EQ("(+ 0Nf 0Ni)", "0Nf");
-    TEST_ASSERT_EQ("(+ 0Nf 5)", "5.0");
-    TEST_ASSERT_EQ("(+ 0.00 0Ni)", "0.0")
-    TEST_ASSERT_EQ("(+ 0Ni -0.00)", "0.00")
-    TEST_ASSERT_EQ("(+ -0.00 0Nl)", "0.00")
-    TEST_ASSERT_EQ("(+ 0Nf [-0.00])", "[0.00]")
+    TEST_ASSERT_EQ("(+ 0Nf 5)", "0Nf");
+    TEST_ASSERT_EQ("(+ 0.00 0Ni)", "0Nf");
+    TEST_ASSERT_EQ("(+ 0Ni -0.00)", "0Nf");
+    TEST_ASSERT_EQ("(+ -0.00 0Nl)", "0Nf");
+    TEST_ASSERT_EQ("(+ 0Nf [-0.00])", "[0Nf]");
     TEST_ASSERT_ER("(+ 0Nf 2024.03.20)", "add: unsupported types: 'f64, 'date");
 
     TEST_ASSERT_EQ("(+ 3i 5i)", "8i");
@@ -214,7 +214,7 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(- 2.5 [3 5])", "[-0.5 -2.5]");
     TEST_ASSERT_EQ("(- 2.5 [3.1 5.2])", "[-0.6 -2.7]");
     TEST_ASSERT_EQ("(- -0.00 0.00)", "0.00")
-    TEST_ASSERT_EQ("(- -0.00 0Nf)", "0.00")
+    TEST_ASSERT_EQ("(- -0.00 0Nf)", "0Nf")
 
     TEST_ASSERT_EQ("(- 2024.03.20 5i)", "2024.03.15");
     TEST_ASSERT_EQ("(- 2024.03.20 5)", "2024.03.15");
@@ -2366,6 +2366,7 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(sum [-24 12 3])", "-9");
     TEST_ASSERT_EQ("(sum -24)", "-24");
     TEST_ASSERT_EQ("(sum [1.0 2.0 3.0])", "6.0");
+    TEST_ASSERT_EQ("(sum [1 2 3 0Nl 4])", "10");
     TEST_ASSERT_EQ("(sum [1i 2i -3i])", "0i");
     TEST_ASSERT_EQ("(sum [02:01:03.000 00:00:02.500])", "02:01:05.500");
     TEST_ASSERT_ER("(sum [2020.02.03 2025.02.03])", "sum: unsupported type: 'Date");
@@ -2613,9 +2614,11 @@ test_result_t test_lang_take() {
     TEST_ASSERT_EQ("(type (take 0i (table [a b] (list [1 2 3 4] ['a 'b 'c 'd]))))", "'Table");
     TEST_ASSERT_EQ("(take 3 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))", "(table [a b] (list [1 2 3] ['a 'b 'c]))");
     TEST_ASSERT_EQ("(take -3 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))", "(table [a b] (list [2 3 4] ['b 'c 'd]))");
-    TEST_ASSERT_EQ("(take 5 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))", "(table [a b] (list [1 2 3 4 1] ['a 'b 'c 'd 'a]))");
-    TEST_ASSERT_EQ("(take -5 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))", "(table [a b] (list [4 1 2 3 4] ['d 'a 'b 'c 'd]))");
-    
+    TEST_ASSERT_EQ("(take 5 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))",
+                   "(table [a b] (list [1 2 3 4 1] ['a 'b 'c 'd 'a]))");
+    TEST_ASSERT_EQ("(take -5 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))",
+                   "(table [a b] (list [4 1 2 3 4] ['d 'a 'b 'c 'd]))");
+
     TEST_ASSERT_ER("(take 2.0 1.0)", "take: unsupported types: 'f64, f64");
     TEST_ASSERT_ER("(take 2 take)", "take: unsupported types: 'i64, Binary");
 
@@ -3373,5 +3376,29 @@ test_result_t test_lang_in() {
     TEST_ASSERT_EQ("(set l (guid 2)) (in (list (first l)) l)", "(list true)");
     TEST_ASSERT_EQ("(set l (guid 2)) (in (list (first l)) (list l))", "(list false)");
     TEST_ASSERT_EQ("(set l (guid 2)) (in (list (first l)) (list (first l)))", "(list true)");
+    PASS();
+}
+
+test_result_t test_lang_or() {
+    TEST_ASSERT_EQ("(or true false)", "true");
+    TEST_ASSERT_EQ("(or false true)", "true");
+    TEST_ASSERT_EQ("(or false false)", "false");
+    TEST_ASSERT_EQ("(or true true)", "true");
+    TEST_ASSERT_EQ("(or [true false true] [false true false])", "[true true true]");
+    TEST_ASSERT_EQ("(or [true false true] [false true false] [true false true])", "[true true true]");
+    TEST_ASSERT_EQ("(or [true false true] true)", "[true true true]");
+
+    PASS();
+}
+
+test_result_t test_lang_and() {
+    TEST_ASSERT_EQ("(and true false)", "false");
+    TEST_ASSERT_EQ("(and false true)", "false");
+    TEST_ASSERT_EQ("(and false false)", "false");
+    TEST_ASSERT_EQ("(and true true)", "true");
+    TEST_ASSERT_EQ("(and [true false true] [false true false])", "[false false false]");
+    TEST_ASSERT_EQ("(and [true false true] [false true false] [true false true])", "[false false false]");
+    TEST_ASSERT_EQ("(and [true false true] true)", "[true false true]");
+
     PASS();
 }

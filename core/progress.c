@@ -33,7 +33,7 @@
 #define PROGRESS_BAR_EMPTY_UNICODE "░"
 #define PROGRESS_BAR_EMPTY_ASCII "."
 
-nil_t progress_init(progress_p progress, u64_t parts) {
+nil_t progress_init(progress_p progress, i64_t parts) {
     if (progress == NULL)
         return;
 
@@ -41,7 +41,7 @@ nil_t progress_init(progress_p progress, u64_t parts) {
     progress->completed = 0;
 }
 
-nil_t progress_tick(progress_p progress, u64_t parts, str_p label) {
+nil_t progress_tick(progress_p progress, i64_t parts, str_p label) {
     i64_t i, percentage, filled_width;
     b8_t unicode;
 

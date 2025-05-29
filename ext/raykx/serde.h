@@ -1,5 +1,5 @@
 /*
- *   Copyright (c) 2023 Anton Kundenko <singaraiona@gmail.com>
+ *   Copyright (c) 2025 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
 
  *   Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -21,45 +21,13 @@
  *   SOFTWARE.
  */
 
-#include "queue.h"
-#include "heap.h"
-#include "util.h"
-#include "ops.h"
+#ifndef RAYKX_SERDE_H
+#define RAYKX_SERDE_H
 
-queue_p queue_create(i64_t size) {
-    queue_p queue = (queue_p)heap_alloc(sizeof(struct queue_t));
+#include "../../core/rayforce.h"
 
-    queue->size = size;
-    queue->head = 0;
-    queue->tail = 0;
-    queue->data = (raw_p *)heap_alloc(size * sizeof(raw_p));
+i64_t raykx_size_obj(obj_p obj);
+i64_t raykx_ser_obj(u8_t *buf, obj_p obj);
+obj_p raykx_des_obj(u8_t *buf, i64_t *len);
 
-    return queue;
-}
-
-nil_t queue_free(queue_p queue) {
-    heap_free(queue->data);
-    heap_free(queue);
-}
-
-nil_t queue_push(queue_p queue, raw_p val) {
-    if (queue->tail - queue->head == queue->size) {
-        queue->size *= 2;
-        queue->data = (raw_p *)heap_realloc(queue->data, queue->size * sizeof(raw_p));
-    }
-
-    queue->data[queue->tail % queue->size] = val;
-    queue->tail++;
-}
-
-raw_p queue_pop(queue_p queue) {
-    raw_p v;
-
-    if (queue->head == queue->tail)
-        return NULL;
-
-    v = queue->data[queue->head % queue->size];
-    queue->head++;
-
-    return v;
-}
+#endif  // RAYKX_SERDE_H

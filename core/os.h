@@ -26,7 +26,7 @@
 
 #include "rayforce.h"
 
-i64_t os_get_var(lit_p name, c8_t buf[], u64_t len);
+i64_t os_get_var(lit_p name, c8_t buf[], i64_t len);
 i64_t os_set_var(lit_p name, lit_p value);
 obj_p ray_os_get_var(obj_p x);
 obj_p ray_os_set_var(obj_p x, obj_p y);

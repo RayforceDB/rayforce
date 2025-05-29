@@ -31,11 +31,11 @@ typedef struct datestruct_t {
     u16_t year;
     u8_t month;
     u8_t day;
-    u64_t pad;
+    i64_t pad;
 } datestruct_t;
 
 datestruct_t date_from_i32(i32_t offset);
-datestruct_t date_from_str(str_p src, u64_t len);
+datestruct_t date_from_str(str_p src, i64_t len);
 i32_t date_into_i32(datestruct_t dt);
 obj_p ray_date(obj_p arg);
 

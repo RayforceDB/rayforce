@@ -59,8 +59,8 @@ obj_p ray_cast_obj(obj_p x, obj_p y) {
     return cast_obj(type, y);
 }
 
-obj_p ray_til_partial(u64_t len, u64_t offset, i64_t filter[], i64_t out[]) {
-    u64_t i;
+obj_p ray_til_partial(i64_t len, i64_t offset, i64_t filter[], i64_t out[]) {
+    i64_t i;
 
     if (filter) {
         for (i = 0; i < len; i++)
@@ -74,12 +74,12 @@ obj_p ray_til_partial(u64_t len, u64_t offset, i64_t filter[], i64_t out[]) {
 }
 
 obj_p __til(obj_p x, obj_p filter) {
-    u64_t i, l, n, chunk;
+    i64_t i, l, n, chunk;
     i64_t *ids = NULL;
     obj_p v, vec;
     pool_p pool;
 
-    l = (u64_t)x->i64;
+    l = (i64_t)x->i64;
 
     if (filter != NULL_OBJ) {
         ids = AS_I64(filter);
@@ -184,7 +184,7 @@ obj_p ray_dict(obj_p x, obj_p y) {
 
 obj_p ray_table(obj_p x, obj_p y) {
     b8_t synergy = B8_TRUE;
-    u64_t i, j, len, cl = 0;
+    i64_t i, j, len, cl = 0;
     obj_p lst, c, l = NULL_OBJ;
 
     if (x->type != TYPE_SYMBOL)
@@ -327,8 +327,8 @@ obj_p ray_guid(obj_p x) {
     }
 }
 
-obj_p ray_list(obj_p *x, u64_t n) {
-    u64_t i;
+obj_p ray_list(obj_p *x, i64_t n) {
+    i64_t i;
     obj_p lst = LIST(n);
 
     for (i = 0; i < n; i++)
@@ -337,8 +337,8 @@ obj_p ray_list(obj_p *x, u64_t n) {
     return lst;
 }
 
-obj_p ray_enlist(obj_p *x, u64_t n) {
-    u64_t i;
+obj_p ray_enlist(obj_p *x, i64_t n) {
+    i64_t i;
     obj_p lst;
 
     if (n == 0)
@@ -766,7 +766,7 @@ obj_p ray_remove(obj_p x, obj_p y) {
 
 obj_p ray_distinct(obj_p x) {
     obj_p res = NULL;
-    u64_t l;
+    i64_t l;
 
     switch (x->type) {
         case TYPE_B8:
@@ -838,7 +838,7 @@ obj_p ray_unify(obj_p x) {
     return unify_list(&res);
 }
 
-obj_p ray_row_index(obj_p *x, u64_t n) {
+obj_p ray_row_index(obj_p *x, i64_t n) {
     UNUSED(x);
     UNUSED(n);
 
@@ -1003,9 +1003,9 @@ obj_p cut_vector(obj_p x, obj_p y) {
 obj_p ray_split(obj_p x, obj_p y) {
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(-TYPE_SYMBOL, -TYPE_C8):
-            return str_split(str_from_symbol(x->i64), strlen(str_from_symbol(x->i64)), &y->c8, 1);
+            return str_split(str_from_symbol(x->i64), SYMBOL_STRLEN(x->i64), &y->c8, 1);
         case MTYPE2(-TYPE_SYMBOL, TYPE_C8):
-            return str_split(str_from_symbol(x->i64), strlen(str_from_symbol(x->i64)), AS_C8(y), y->len);
+            return str_split(str_from_symbol(x->i64), SYMBOL_STRLEN(x->i64), AS_C8(y), y->len);
         case MTYPE2(TYPE_C8, -TYPE_C8):
             return str_split(AS_C8(x), x->len, &y->c8, 1);
         case MTYPE2(TYPE_C8, TYPE_C8):

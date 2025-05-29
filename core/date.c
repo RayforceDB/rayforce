@@ -66,7 +66,7 @@ datestruct_t date_from_i32(i32_t offset) {
     };
 }
 
-datestruct_t date_from_str(str_p src, u64_t len) {
+datestruct_t date_from_str(str_p src, i64_t len) {
     i64_t cnt = 0, val = 0, digit_count, digit;
     datestruct_t dt = {.null = B8_FALSE, .year = 0, .month = 0, .day = 0};
     lit_p cur = src;

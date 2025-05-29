@@ -62,7 +62,7 @@ obj_p ray_rc(obj_p x) {
 obj_p ray_quote(obj_p x) { return clone_obj(x); }
 
 obj_p ray_meta(obj_p x) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p keys, vals;
 
     switch (x->type) {

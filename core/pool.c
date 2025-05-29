@@ -36,7 +36,7 @@
 #define POOL_SPLIT_THRESHOLD (RAY_PAGE_SIZE * 4)
 #define GROUP_SPLIT_THRESHOLD 100000
 
-mpmc_p mpmc_create(u64_t size) {
+mpmc_p mpmc_create(i64_t size) {
     size = next_power_of_two_u64(size);
 
     i64_t i;
@@ -75,7 +75,7 @@ nil_t mpmc_destroy(mpmc_p queue) {
 i64_t mpmc_push(mpmc_p queue, task_data_t data) {
     cell_p cell;
     i64_t pos, seq, dif;
-    u64_t rounds = 0;
+    i64_t rounds = 0;
 
     pos = __atomic_load_n(&queue->tail, __ATOMIC_RELAXED);
 
@@ -109,7 +109,7 @@ task_data_t mpmc_pop(mpmc_p queue) {
                         .argv = {NULL},  // Initialize the array elements
                         .result = NULL_OBJ};
     i64_t pos, seq, dif;
-    u64_t rounds = 0;
+    i64_t rounds = 0;
 
     pos = __atomic_load_n(&queue->head, __ATOMIC_RELAXED);
 
@@ -134,13 +134,13 @@ task_data_t mpmc_pop(mpmc_p queue) {
     return data;
 }
 
-u64_t mpmc_count(mpmc_p queue) {
+i64_t mpmc_count(mpmc_p queue) {
     return __atomic_load_n(&queue->tail, __ATOMIC_SEQ_CST) - __atomic_load_n(&queue->head, __ATOMIC_SEQ_CST);
 }
 
-u64_t mpmc_size(mpmc_p queue) { return queue->mask + 1; }
+i64_t mpmc_size(mpmc_p queue) { return queue->mask + 1; }
 
-obj_p pool_call_task_fn(raw_p fn, u64_t argc, raw_p argv[]) {
+obj_p pool_call_task_fn(raw_p fn, i64_t argc, raw_p argv[]) {
     switch (argc) {
         case 0:
             return ((fn0)fn)();
@@ -168,7 +168,7 @@ obj_p pool_call_task_fn(raw_p fn, u64_t argc, raw_p argv[]) {
 raw_p executor_run(raw_p arg) {
     executor_t *executor = (executor_t *)arg;
     task_data_t data;
-    u64_t i, tasks_count;
+    i64_t i, tasks_count;
     obj_p res;
     interpreter_p interpreter;
     heap_p heap;
@@ -221,8 +221,8 @@ raw_p executor_run(raw_p arg) {
     return NULL;
 }
 
-pool_p pool_create(u64_t executors_count) {
-    u64_t i, rounds = 0;
+pool_p pool_create(i64_t executors_count) {
+    i64_t i, rounds = 0;
     pool_p pool;
 
     pool = (pool_p)heap_mmap(sizeof(struct pool_t) + (sizeof(executor_t) * executors_count));
@@ -262,7 +262,7 @@ pool_p pool_create(u64_t executors_count) {
 }
 
 nil_t pool_destroy(pool_p pool) {
-    u64_t i, n;
+    i64_t i, n;
 
     mutex_lock(&pool->mutex);
     pool->state = RUN_STATE_STOPPED;
@@ -287,7 +287,7 @@ nil_t pool_destroy(pool_p pool) {
 pool_p pool_get(nil_t) { return runtime_get()->pool; }
 
 nil_t pool_prepare(pool_p pool) {
-    u64_t i, n;
+    i64_t i, n;
     obj_p env;
 
     if (pool == NULL)
@@ -309,8 +309,8 @@ nil_t pool_prepare(pool_p pool) {
     mutex_unlock(&pool->mutex);
 }
 
-nil_t pool_add_task(pool_p pool, raw_p fn, u64_t argc, ...) {
-    u64_t i, size;
+nil_t pool_add_task(pool_p pool, raw_p fn, i64_t argc, ...) {
+    i64_t i, size;
     va_list args;
     task_data_t data, old_data;
     mpmc_p queue;
@@ -358,7 +358,7 @@ nil_t pool_add_task(pool_p pool, raw_p fn, u64_t argc, ...) {
 }
 
 obj_p pool_run(pool_p pool) {
-    u64_t i, n, tasks_count, executors_count;
+    i64_t i, n, tasks_count, executors_count;
     obj_p e, res;
     task_data_t data;
 
@@ -437,7 +437,7 @@ obj_p pool_run(pool_p pool) {
     return res;
 }
 
-u64_t pool_split_by(pool_p pool, u64_t input_len, u64_t groups_len) {
+i64_t pool_split_by(pool_p pool, i64_t input_len, i64_t groups_len) {
     if (pool == NULL || input_len < POOL_SPLIT_THRESHOLD)
         return 1;
     else if (rc_sync_get())

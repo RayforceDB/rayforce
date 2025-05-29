@@ -36,10 +36,10 @@ static inline void cpu_relax() {
 #endif
 }
 
-nil_t backoff_spin(u64_t *rounds) {
-    u64_t i;
+nil_t backoff_spin(i64_t *rounds) {
+    i64_t i;
 
-    for (i = 0; i < (1ull << *rounds); i++)
+    for (i = 0; i < (1ll << *rounds); i++)
         cpu_relax();
 
     if (*rounds <= BACKOFF_SPIN_LIMIT)

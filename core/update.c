@@ -130,7 +130,7 @@ obj_p *at_obj_ref(obj_p obj, obj_p idx) {
 }
 
 obj_p dot_obj(obj_p obj, obj_p idx) {
-    u64_t i, l;
+    i64_t i, l;
 
     switch (idx->type) {
         case TYPE_NULL:
@@ -200,7 +200,7 @@ obj_p __alter(obj_p *obj, obj_p func, obj_p idx, obj_p val) {
     return set_obj(obj, idx, res);
 }
 
-obj_p ray_alter(obj_p *x, u64_t n) {
+obj_p ray_alter(obj_p *x, i64_t n) {
     obj_p obj, res, *cur = NULL;
 
     if (n < 3)
@@ -239,7 +239,7 @@ obj_p ray_alter(obj_p *x, u64_t n) {
     return clone_obj(x[0]);
 }
 
-obj_p ray_modify(obj_p *x, u64_t n) {
+obj_p ray_modify(obj_p *x, i64_t n) {
     obj_p obj, res, *cur, idx;
 
     cur = NULL;
@@ -287,8 +287,8 @@ obj_p ray_modify(obj_p *x, u64_t n) {
 /*
  * inserts for tables
  */
-obj_p ray_insert(obj_p *x, u64_t n) {
-    u64_t i, m, l;
+obj_p ray_insert(obj_p *x, i64_t n) {
+    i64_t i, m, l;
     obj_p lst, col, *val = NULL, obj, res;
     b8_t need_drop;
 
@@ -410,8 +410,8 @@ insert:
 /*
  * update/inserts for tables
  */
-obj_p ray_upsert(obj_p *x, u64_t n) {
-    u64_t i, j, m, p, l, keys;
+obj_p ray_upsert(obj_p *x, i64_t n) {
+    i64_t i, j, m, p, l, keys;
     i64_t row, *rows;
     obj_p obj, k1, k2, idx, col, lst, *val = NULL, v;
     b8_t single_rec;
@@ -568,7 +568,7 @@ upsert:
 }
 
 obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p groupby) {
-    u64_t i, l, m, n;
+    i64_t i, l, m, n;
     i64_t j, *ids;
     obj_p prm, obj, *val = NULL, gids, v, col, index, res;
 
@@ -756,7 +756,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
 }
 
 obj_p ray_update(obj_p obj) {
-    u64_t i, keyslen, tablen;
+    i64_t i, keyslen, tablen;
     obj_p tabsym, keys = NULL_OBJ, vals = NULL_OBJ, filters = NULL_OBJ, bins = NULL_OBJ, groupby = NULL_OBJ, tab, sym,
                   prm, val;
 

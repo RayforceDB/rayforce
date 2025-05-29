@@ -48,7 +48,7 @@ nil_t fdmap_add_fd(obj_p *fdmap, obj_p obj, i64_t fd, i64_t size) {
 }
 
 nil_t fdmap_destroy(obj_p fdmap) {
-    u64_t i, l, size;
+    i64_t i, l, size;
     i64_t fd;
     raw_p obj;
 
@@ -56,7 +56,7 @@ nil_t fdmap_destroy(obj_p fdmap) {
 
     for (i = 0; i < l; i++) {
         obj = (raw_p)AS_I64(AS_LIST(fdmap)[i])[0];
-        fd = (u64_t)AS_I64(AS_LIST(fdmap)[i])[1];
+        fd = (i64_t)AS_I64(AS_LIST(fdmap)[i])[1];
         size = AS_I64(AS_LIST(fdmap)[i])[2];
 
         if (obj != NULL)

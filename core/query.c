@@ -47,7 +47,7 @@
 obj_p remap_filter(obj_p tab, obj_p index) { return filter_map(tab, index); }
 
 obj_p remap_group(obj_p *gvals, obj_p cols, obj_p gkeys, obj_p gcols, query_ctx_p ctx) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p index, v, lst, res;
 
     switch (gkeys->type) {
@@ -111,7 +111,7 @@ obj_p remap_group(obj_p *gvals, obj_p cols, obj_p gkeys, obj_p gcols, query_ctx_
 }
 
 obj_p get_gkeys(obj_p cols, obj_p obj) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p x;
 
     switch (obj->type) {
@@ -145,7 +145,7 @@ obj_p get_gkeys(obj_p cols, obj_p obj) {
 }
 
 obj_p get_gvals(obj_p obj) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p vals, v, r, res;
 
     switch (obj->type) {
@@ -281,7 +281,7 @@ obj_p select_apply_filters(obj_p obj, query_ctx_p ctx) {
 }
 
 obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
-    u64_t tablen;
+    i64_t tablen;
     obj_p prm, val, gkeys = NULL_OBJ, gvals = NULL_OBJ, groupby = NULL_OBJ, gcol = NULL_OBJ;
 
     prm = at_sym(obj, "by", 2);
@@ -356,7 +356,7 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
 }
 
 obj_p select_apply_mappings(obj_p obj, query_ctx_p ctx) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p prm, sym, val, keys, res;
 
     // Find all mappings (non-keyword fields)
@@ -424,7 +424,7 @@ obj_p select_apply_mappings(obj_p obj, query_ctx_p ctx) {
 }
 
 obj_p select_collect_fields(query_ctx_p ctx) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p prm, sym, val, keys, res;
 
     // Already collected by mappings
@@ -509,7 +509,7 @@ obj_p select_collect_fields(query_ctx_p ctx) {
 }
 
 obj_p select_build_table(query_ctx_p ctx) {
-    u64_t i, l, m;
+    i64_t i, l, m;
     obj_p take, res, keys, vals;
 
     switch (ctx->group_fields->type) {

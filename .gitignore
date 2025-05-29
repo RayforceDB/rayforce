@@ -3,7 +3,6 @@
 .vscode/
 *.a
 *.gch
-*.rfl
 rayforce
 rayforce.test
 rayforce.bench

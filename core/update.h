@@ -26,10 +26,10 @@
 
 #include "rayforce.h"
 
-obj_p ray_alter(obj_p *x, u64_t n);
-obj_p ray_modify(obj_p *x, u64_t n);
-obj_p ray_insert(obj_p *x, u64_t n);
-obj_p ray_upsert(obj_p *x, u64_t n);
+obj_p ray_alter(obj_p *x, i64_t n);
+obj_p ray_modify(obj_p *x, i64_t n);
+obj_p ray_insert(obj_p *x, i64_t n);
+obj_p ray_upsert(obj_p *x, i64_t n);
 obj_p ray_update(obj_p obj);
 
 #endif  // UPDATE_H

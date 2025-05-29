@@ -27,6 +27,7 @@
 #include "format.h"
 #include "runtime.h"
 #include "error.h"
+#include "ipc.h"
 
 #if defined(OS_WINDOWS)
 #include <windows.h>
@@ -139,6 +140,7 @@ command_entry_t commands[] = {
     COMMAND("set-display-width", sys_set_display_width),
     COMMAND("timeit-activate", sys_timeit_activate),
     COMMAND("listen", sys_listen),
+    COMMAND("exit", sys_exit),
 };
 
 obj_p sys_set_fpr(i32_t argc, str_p argv[]) {
@@ -198,7 +200,10 @@ obj_p sys_timeit_activate(i32_t argc, str_p argv[]) {
 }
 
 obj_p sys_listen(i32_t argc, str_p argv[]) {
-    i64_t res;
+    UNUSED(argc);
+    UNUSED(argv);
+
+    i64_t res = 0;
 
     if (argc != 1)
         THROW(ERR_LENGTH, "listen: expected 1 argument");
@@ -207,7 +212,7 @@ obj_p sys_listen(i32_t argc, str_p argv[]) {
     if (res < 0)
         THROW(ERR_TYPE, "listen: expected integer");
 
-    res = poll_listen(runtime_get()->poll, res);
+    res = ipc_listen(runtime_get()->poll, res);
 
     if (res == -1)
         return sys_error(ERROR_TYPE_SOCK, "listen");
@@ -216,6 +221,23 @@ obj_p sys_listen(i32_t argc, str_p argv[]) {
         THROW(ERR_LENGTH, "listen: already listening");
 
     return i64(res);
+}
+
+obj_p sys_exit(i32_t argc, str_p argv[]) {
+    i64_t code;
+
+    if (argc == 0)
+        code = 0;
+    else
+        code = i64_from_str(argv[0], strlen(argv[0]));
+
+    poll_exit(runtime_get()->poll, code);
+
+    stack_push(NULL_OBJ);
+
+    longjmp(ctx_get()->jmp, 2);
+
+    __builtin_unreachable();
 }
 
 obj_p ray_internal_command(obj_p cmd) {

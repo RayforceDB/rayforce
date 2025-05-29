@@ -30,7 +30,7 @@
 #define U64_HASH_SEED 0x9ddfea08eb382d69ull
 
 // Single threaded open addressing hash table
-obj_p ht_oa_create(u64_t size, i8_t vals);
+obj_p ht_oa_create(i64_t size, i8_t vals);
 i64_t ht_oa_tab_next(obj_p *obj, i64_t key);
 i64_t ht_oa_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed);
 i64_t ht_oa_tab_insert(obj_p *obj, i64_t key, i64_t val);
@@ -47,23 +47,22 @@ typedef struct bucket_t {
 } *bucket_p;
 
 typedef struct ht_bk_t {
-    u64_t size;
-    u64_t count;
+    i64_t size;
+    i64_t count;
     bucket_p table[];
 } *ht_bk_p;
 
-ht_bk_p ht_bk_create(u64_t size);
+ht_bk_p ht_bk_create(i64_t size);
 nil_t ht_bk_destroy(ht_bk_p ht);
-nil_t ht_bk_rehash(ht_bk_p *ht, u64_t new_size);
+nil_t ht_bk_rehash(ht_bk_p *ht, i64_t new_size);
 i64_t ht_bk_insert(ht_bk_p ht, i64_t key, i64_t val);
 i64_t ht_bk_insert_par(ht_bk_p ht, i64_t key, i64_t val);
 i64_t ht_bk_insert_with(ht_bk_p ht, i64_t key, i64_t val, hash_f hash, cmp_f cmp, raw_p seed);
 i64_t ht_bk_insert_with_par(ht_bk_p ht, i64_t key, i64_t val, hash_f hash, cmp_f cmp, raw_p seed);
 i64_t ht_bk_get(ht_bk_p ht, i64_t key);
 
-// Knuth's multiplicative hash
+// Hash functions
 u64_t hash_kmh(i64_t key, raw_p seed);
-// FNV-1a hash
 u64_t hash_fnv1a(i64_t key, raw_p seed);
 u64_t hash_murmur3(i64_t key, raw_p seed);
 
@@ -71,6 +70,7 @@ u64_t hash_murmur3(i64_t key, raw_p seed);
 u64_t hash_i64(i64_t a, raw_p seed);
 u64_t hash_obj(i64_t a, raw_p seed);
 u64_t hash_guid(i64_t a, raw_p seed);
+
 // Compare
 i64_t hash_cmp_obj(i64_t a, i64_t b, raw_p seed);
 i64_t hash_cmp_guid(i64_t a, i64_t b, raw_p seed);

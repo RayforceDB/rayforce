@@ -90,13 +90,13 @@ i64_t SYMBOL_SYM;
         push_raw(&AS_LIST(r)[1], &_v);           \
     };
 
-obj_p ray_env(obj_p *x, u64_t n) {
+obj_p ray_env(obj_p *x, i64_t n) {
     UNUSED(x);
     UNUSED(n);
     return clone_obj(runtime_get()->env.variables);
 }
 
-obj_p ray_memstat(obj_p *x, u64_t n) {
+obj_p ray_memstat(obj_p *x, i64_t n) {
     UNUSED(x);
     UNUSED(n);
     obj_p keys, vals;
@@ -403,10 +403,25 @@ str_p env_get_type_name(i8_t type) {
     return str_from_symbol(name);
 }
 
+i64_t env_get_internal_id(obj_p obj) {
+    obj_p functions = runtime_get()->env.functions;
+    i64_t i, l, s = NULL_I64;
+
+    l = AS_LIST(functions)[1]->len;
+    for (i = 0; i < l; i++) {
+        if (AS_LIST(AS_LIST(functions)[1])[i]->i64 == obj->i64) {
+            s = AS_SYMBOL(AS_LIST(functions)[0])[i];
+            break;
+        }
+    }
+
+    return s;
+}
+
 str_p env_get_internal_name(obj_p obj) {
     obj_p functions = runtime_get()->env.functions;
     i64_t sym = 0;
-    u64_t i, l;
+    i64_t i, l;
 
     l = AS_LIST(functions)[1]->len;
     for (i = 0; i < l; i++) {
@@ -444,9 +459,9 @@ obj_p env_get_internal_function_by_id(i64_t id) {
     return NULL_OBJ;
 }
 
-str_p env_get_internal_entry_name(lit_p name, u64_t len, obj_p entries, u64_t *index, b8_t exact) {
+str_p env_get_internal_entry_name(lit_p name, i64_t len, obj_p entries, i64_t *index, b8_t exact) {
     i64_t i, l, *names;
-    u64_t n;
+    i64_t n;
     str_p nm;
 
     l = entries->len;
@@ -455,14 +470,14 @@ str_p env_get_internal_entry_name(lit_p name, u64_t len, obj_p entries, u64_t *i
     if (exact) {
         for (i = 0; i < l; i++) {
             nm = str_from_symbol(names[i]);
-            n = strlen(nm);
+            n = SYMBOL_STRLEN(names[i]);
             if (n == len && strncmp(name, nm, len) == 0)
                 return nm;
         }
     } else {
         for (i = *index; i < l; i++) {
             nm = str_from_symbol(names[i]);
-            n = strlen(nm);
+            n = SYMBOL_STRLEN(names[i]);
             if (len < n && strncmp(name, nm, len) == 0) {
                 *index = i + 1;
                 return nm;
@@ -473,17 +488,17 @@ str_p env_get_internal_entry_name(lit_p name, u64_t len, obj_p entries, u64_t *i
     return NULL;
 }
 
-str_p env_get_internal_keyword_name(lit_p name, u64_t len, u64_t *index, b8_t exact) {
+str_p env_get_internal_keyword_name(lit_p name, i64_t len, i64_t *index, b8_t exact) {
     return env_get_internal_entry_name(name, len, runtime_get()->env.keywords, index, exact);
 }
 
-str_p env_get_internal_function_name(lit_p name, u64_t len, u64_t *index, b8_t exact) {
+str_p env_get_internal_function_name(lit_p name, i64_t len, i64_t *index, b8_t exact) {
     return env_get_internal_entry_name(name, len, AS_LIST(runtime_get()->env.functions)[0], index, exact);
 }
 
-str_p env_get_global_name(lit_p name, u64_t len, u64_t *index, u64_t *sbidx) {
+str_p env_get_global_name(lit_p name, i64_t len, i64_t *index, i64_t *sbidx) {
     i64_t *names, *cols;
-    u64_t i, j, n, l, m;
+    i64_t i, j, n, l, m;
     str_p nm;
     obj_p *vals;
 
@@ -493,7 +508,7 @@ str_p env_get_global_name(lit_p name, u64_t len, u64_t *index, u64_t *sbidx) {
 
     for (i = *index; i < l; i++) {
         nm = str_from_symbol(names[i]);
-        n = strlen(nm);
+        n = SYMBOL_STRLEN(names[i]);
         if (len < n && strncmp(name, nm, len) == 0) {
             *index = i + 1;
             return nm;
@@ -504,7 +519,7 @@ str_p env_get_global_name(lit_p name, u64_t len, u64_t *index, u64_t *sbidx) {
             m = AS_LIST(vals[i])[0]->len;
             for (j = *sbidx; j < m; j++) {
                 nm = str_from_symbol(cols[j]);
-                n = strlen(nm);
+                n = SYMBOL_STRLEN(cols[j]);
                 if (len < n && strncmp(name, nm, len) == 0) {
                     *sbidx = j + 1;
                     return nm;
@@ -518,7 +533,7 @@ str_p env_get_global_name(lit_p name, u64_t len, u64_t *index, u64_t *sbidx) {
     return NULL;
 }
 
-obj_p ray_internals(obj_p *x, u64_t n) {
+obj_p ray_internals(obj_p *x, i64_t n) {
     UNUSED(x);
     UNUSED(n);
     return clone_obj(runtime_get()->env.internals);

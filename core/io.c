@@ -42,12 +42,12 @@
 #include "binary.h"
 #include "compose.h"
 #include "items.h"
+#include "ipc.h"
 
-obj_p ray_hopen(obj_p *x, u64_t n) {
-    i64_t fd, timeout = 0;
+obj_p ray_hopen(obj_p *x, i64_t n) {
+    i64_t fd, id, timeout = 0;
     sock_addr_t addr;
-    u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
-    obj_p path, err;
+    obj_p path;
 
     if (n == 0)
         THROW(ERR_LENGTH, "hopen: expected at least 1 argument, got 0");
@@ -65,28 +65,18 @@ obj_p ray_hopen(obj_p *x, u64_t n) {
         timeout = x[1]->i64;
     }
 
+    // Allow only in main thread
+    if (!ray_is_main_thread())
+        THROW(ERR_NOT_SUPPORTED, "hopen: expected main thread");
+
     // Open socket
     if (sock_addr_from_str(AS_C8(x[0]), x[0]->len, &addr) != -1) {
-        fd = sock_open(&addr, timeout);
+        id = ipc_open(runtime_get()->poll, &addr, timeout);
 
-        if (fd == -1)
-            THROW(ERR_IO, "hopen: failed to connect to %s:%d", addr.ip, addr.port);
+        if (id == -1)
+            return sys_error(ERROR_TYPE_SYS, AS_C8(x));
 
-        if (sock_send(fd, handshake, 2) == -1) {
-            err = sys_error(ERROR_TYPE_SOCK, "hopen: send handshake");
-            sock_close(fd);
-            return err;
-        }
-
-        if (sock_recv(fd, handshake, 2) == -1) {
-            err = sys_error(ERROR_TYPE_SOCK, "hopen: recv handshake");
-            sock_close(fd);
-            return err;
-        }
-
-        sock_set_nonblocking(fd, B8_TRUE);
-
-        return i64(poll_register(runtime_get()->poll, fd, RAYFORCE_VERSION));
+        return i64(id);
     }
 
     // Otherwise, open file
@@ -101,6 +91,10 @@ obj_p ray_hopen(obj_p *x, u64_t n) {
 }
 
 obj_p ray_hclose(obj_p x) {
+    // Allow only in main thread
+    if (!ray_is_main_thread())
+        THROW(ERR_NOT_SUPPORTED, "hclose: expected main thread");
+
     switch (x->type) {
         case -TYPE_I32:
             fs_fclose(x->i32);
@@ -114,7 +108,7 @@ obj_p ray_hclose(obj_p x) {
 }
 
 obj_p ray_read(obj_p x) {
-    u64_t sz, rs = 0;
+    i64_t sz, rs = 0;
     i64_t fd, size, c = 0;
     u8_t *map, *cur;
     str_p buf;
@@ -138,16 +132,16 @@ obj_p ray_read(obj_p x) {
                 return sys_error(ERROR_TYPE_SYS, "read");
 
             // Validate minimum file size for header
-            if (size < (i64_t)sizeof(struct header_t)) {
+            if (size < (i64_t)sizeof(struct ipc_header_t)) {
                 mmap_free(map, size);
                 return error_str(ERR_IO, "read: file too small to contain valid header");
             }
 
-            cur = map;
             sz = size;
 
             while (sz > 0) {
-                val = load_obj(&cur, &sz);
+                cur = map + sz;
+                val = de_raw(cur, &sz);
 
                 if (IS_ERR(val)) {
                     drop_obj(val);
@@ -230,16 +224,12 @@ obj_p io_write(i64_t fd, u8_t msg_type, obj_p obj) {
             return NULL_OBJ;
         default:
             // send ipc msg
-            switch (msg_type) {
-                case MSG_TYPE_RESP:
-                    return ipc_send_async(runtime_get()->poll, fd, clone_obj(obj));
-                case MSG_TYPE_ASYN:
-                    return ipc_send_async(runtime_get()->poll, fd, clone_obj(obj));
-                case MSG_TYPE_SYNC:
-                    return ipc_send_sync(runtime_get()->poll, fd, clone_obj(obj));
-                default:
-                    THROW(ERR_TYPE, "write: unsupported msg type: '%d", msg_type);
-            }
+
+            // Allow only in main thread
+            if (!ray_is_main_thread())
+                THROW(ERR_NOT_SUPPORTED, "write sock: expected main thread");
+
+            return ipc_send(runtime_get()->poll, fd, obj, msg_type);
     }
 }
 
@@ -252,7 +242,7 @@ obj_p ray_write(obj_p x, obj_p y) {
         case -TYPE_I32:
             size = size_obj(y);
             buf = U8(size);
-            size = save_obj(AS_U8(buf), size, y);
+            size = ser_raw(AS_U8(buf), y);
             fs_fwrite(x->i32, AS_C8(buf), size);
             drop_obj(buf);
             return NULL_OBJ;
@@ -415,9 +405,9 @@ obj_p parse_csv_line(i8_t types[], i64_t cnt, str_p start, str_p end, i64_t row,
     return NULL_OBJ;
 }
 
-obj_p parse_csv_range(i8_t *types, i64_t num_types, str_p buf, i64_t size, u64_t lines, i64_t start_line, obj_p cols,
+obj_p parse_csv_range(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t lines, i64_t start_line, obj_p cols,
                       c8_t sep) {
-    u64_t i, j, k, l;
+    i64_t i, j, k, l;
     str_p line_end, prev;
     obj_p res = NULL_OBJ;
 
@@ -450,9 +440,9 @@ obj_p parse_csv_range(i8_t *types, i64_t num_types, str_p buf, i64_t size, u64_t
     return NULL_OBJ;  // Success
 }
 
-obj_p parse_csv_lines(i8_t *types, i64_t num_types, str_p buf, i64_t size, u64_t total_lines, obj_p cols, c8_t sep) {
+obj_p parse_csv_lines(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t total_lines, obj_p cols, c8_t sep) {
     obj_p err, res = NULL_OBJ;
-    u64_t i, l, batch, batch_size, num_batches, lines_per_batch, start_line, end_line, lines_in_batch;
+    i64_t i, l, batch, batch_size, num_batches, lines_per_batch, start_line, end_line, lines_in_batch;
     str_p batch_start, batch_end;
     pool_p pool = runtime_get()->pool;
 
@@ -516,7 +506,7 @@ obj_p parse_csv_lines(i8_t *types, i64_t num_types, str_p buf, i64_t size, u64_t
 
 obj_p ray_read_csv(obj_p *x, i64_t n) {
     i64_t fd, size;
-    u64_t i, l, len, lines;
+    i64_t i, l, len, lines;
     str_p buf, prev, pos, line;
     obj_p types, names, cols, path, res;
     i8_t type;
@@ -552,7 +542,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                 if (type < 0)
                     type = -type;
 
-                types->arr[i] = type;
+                types->raw[i] = type;
             }
 
             path = cstring_from_obj(x[1]);
@@ -705,7 +695,7 @@ obj_p ray_eval(obj_p x) {
 }
 
 obj_p ray_load(obj_p x) {
-    u64_t flen;
+    i64_t flen;
     obj_p file, sym, tab, res;
     lit_p fname;
 
@@ -741,9 +731,9 @@ obj_p ray_load(obj_p x) {
     return res;
 }
 
-obj_p distinct_syms(obj_p *x, u64_t n) {
+obj_p distinct_syms(obj_p *x, i64_t n) {
     i64_t p;
-    u64_t i, j, h, l;
+    i64_t i, j, h, l;
     obj_p vec, set, a;
 
     if (n == 0 || (*x)->len == 0)
@@ -845,7 +835,7 @@ obj_p io_set_table(obj_p path, obj_p table) {
 }
 
 obj_p io_set_table_splayed(obj_p path, obj_p table, obj_p symfile) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p res, col, s, p, v, e, cols, sym;
 
     // save columns schema

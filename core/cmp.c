@@ -32,7 +32,7 @@
 #include "pool.h"
 #include "string.h"
 
-typedef obj_p (*ray_cmp_f)(obj_p, obj_p, u64_t, u64_t, obj_p);
+typedef obj_p (*ray_cmp_f)(obj_p, obj_p, i64_t, i64_t, obj_p);
 
 #define __CMP_A_V(x, y, lt, rt, mt, op, ln, of, ov)                              \
     ({                                                                           \
@@ -40,7 +40,7 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, u64_t, u64_t, obj_p);
         b8_t *$out;                                                              \
         $rhs = __AS_##rt(y) + of;                                                \
         $out = AS_B8(ov) + of;                                                   \
-        for (u64_t $i = 0; $i < ln; $i++)                                        \
+        for (i64_t $i = 0; $i < ln; $i++)                                        \
             $out[$i] = op(lt##_to_##mt(x->__BASE_##lt), rt##_to_##mt($rhs[$i])); \
         NULL_OBJ;                                                                \
     })
@@ -51,7 +51,7 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, u64_t, u64_t, obj_p);
         b8_t *$out;                                                              \
         $lhs = __AS_##lt(x) + of;                                                \
         $out = AS_B8(ov) + of;                                                   \
-        for (u64_t $i = 0; $i < ln; $i++)                                        \
+        for (i64_t $i = 0; $i < ln; $i++)                                        \
             $out[$i] = op(lt##_to_##mt($lhs[$i]), rt##_to_##mt(y->__BASE_##rt)); \
         NULL_OBJ;                                                                \
     })
@@ -64,14 +64,14 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, u64_t, u64_t, obj_p);
         $lhs = __AS_##lt(x) + of;                                          \
         $rhs = __AS_##rt(y) + of;                                          \
         $out = AS_B8(ov) + of;                                             \
-        for (u64_t $i = 0; $i < ln; $i++)                                  \
+        for (i64_t $i = 0; $i < ln; $i++)                                  \
             $out[$i] = op(lt##_to_##mt($lhs[$i]), rt##_to_##mt($rhs[$i])); \
         NULL_OBJ;                                                          \
     })
 
 #define __DECLARE_CMP_FN(op)                                                                                \
-    obj_p ray_##op##_partial(obj_p x, obj_p y, u64_t len, u64_t offset, obj_p res) {                        \
-        u64_t i;                                                                                            \
+    obj_p ray_##op##_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p res) {                        \
+        i64_t i;                                                                                            \
         i64_t *xi, *ei, si;                                                                                 \
         b8_t *out;                                                                                          \
         obj_p k, sym, e;                                                                                    \
@@ -336,7 +336,7 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, u64_t, u64_t, obj_p);
 
 obj_p cmp_map(raw_p op, obj_p x, obj_p y) {
     pool_p pool = runtime_get()->pool;
-    u64_t i, l, n, chunk;
+    i64_t i, l, n, chunk;
     obj_p v, map, res;
     ray_cmp_f cmp_fn = (ray_cmp_f)op;
 

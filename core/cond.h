@@ -26,6 +26,6 @@
 
 #include "rayforce.h"
 
-obj_p ray_cond(obj_p *x, u64_t n);
+obj_p ray_cond(obj_p *x, i64_t n);
 
 #endif  // COND_H

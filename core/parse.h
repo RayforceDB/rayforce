@@ -35,15 +35,16 @@ typedef struct parser_t {
     i64_t count;           // counter for spans without objects
     lit_p input;           // input string
     str_p current;         // current character
+    i64_t input_len;       // length of input string
     i64_t line;            // current line
     i64_t column;          // current column
     b8_t replace_symbols;  // replace symbols if they are internal functions
-} __attribute__((aligned(16))) parser_t;
+} parser_t;
 
 obj_p parser_advance(parser_t *parser);
 nil_t parser_free(parser_t *parser);
 obj_p parse_do(parser_t *parser);
-obj_p parse(lit_p input, obj_p nfo);
+obj_p parse(lit_p input, i64_t input_len, obj_p nfo);
 b8_t is_whitespace(c8_t c);
 b8_t is_digit(c8_t c);
 b8_t is_alpha(c8_t c);

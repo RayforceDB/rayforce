@@ -28,12 +28,15 @@
 #include "io.h"
 #include "string.h"
 #include "signal.h"
+#include "repl.h"
+#include "ipc.h"
+#include "dynlib.h"
 
 // Global runtime reference
 runtime_p __RUNTIME = NULL;
 
 nil_t usage(nil_t) {
-    printf("%s%s%s", BOLD, YELLOW, "Usage: rayforce [-f file] [-p port] [-t timeit] [-c cores] [file]\n");
+    printf("%s%s%s", BOLD, YELLOW, "Usage: rayforce [-f file] [-p port] [-t timeit] [-c cores] [-r repl] [file]\n");
     exit(EXIT_FAILURE);
 }
 
@@ -70,6 +73,12 @@ obj_p parse_cmdline(i32_t argc, str_p argv[]) {
                 if (++opt >= argc)
                     usage();
                 push_sym(&keys, "timeit");
+                str = string_from_str(argv[opt], strlen(argv[opt]));
+                push_obj(&vals, str);
+            } else if (!user_defined && (strcmp(flag, "r") == 0 || strcmp(flag, "repl") == 0)) {
+                if (++opt >= argc)
+                    usage();
+                push_sym(&keys, "repl");
                 str = string_from_str(argv[opt], strlen(argv[opt]));
                 push_obj(&vals, str);
             } else if (!user_defined && (strcmp(flag, "-") == 0)) {
@@ -110,21 +119,22 @@ obj_p parse_cmdline(i32_t argc, str_p argv[]) {
     return dict(keys, vals);
 }
 
-i32_t runtime_create(i32_t argc, str_p argv[]) {
-    u64_t n;
+runtime_p runtime_create(i32_t argc, str_p argv[]) {
+    i64_t n;
     obj_p arg, fmt, res;
-    symbols_p symbols = symbols_create();
+    symbols_p symbols;
 
+    symbols = symbols_create();
     heap_create(0);
 
     __RUNTIME = (runtime_p)heap_mmap(sizeof(struct runtime_t));
     __RUNTIME->symbols = symbols;
     __RUNTIME->env = env_create();
-    __RUNTIME->addr = (sock_addr_t){{0}, 0};
     __RUNTIME->fdmaps = dict(I64(0), LIST(0));
     __RUNTIME->args = NULL_OBJ;
     __RUNTIME->query_ctx = NULL;
     __RUNTIME->pool = NULL;
+    __RUNTIME->dynlibs = I64(0);
 
     interpreter_create(0);
 
@@ -146,13 +156,11 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
                 __RUNTIME->pool = pool_create(__RUNTIME->sys_info.threads - 1);
         }
 
-        arg = runtime_get_arg("port");
-        if (!is_null(arg)) {
-            __RUNTIME->addr.port = i64_from_str(AS_C8(arg), arg->len);
-            drop_obj(arg);
+        __RUNTIME->poll = poll_create();
+        if (__RUNTIME->poll == NULL) {
+            printf("Failed to create poll\n");
+            return NULL;
         }
-
-        __RUNTIME->poll = poll_init(__RUNTIME->addr.port);
 
         // timeit
         arg = runtime_get_arg("timeit");
@@ -182,17 +190,47 @@ i32_t runtime_create(i32_t argc, str_p argv[]) {
         //     __RUNTIME->pool = pool_create(__RUNTIME->sys_info.threads - 1);
     }
 
-    return 0;
+    return __RUNTIME;
 }
 
 i32_t runtime_run(nil_t) {
-    if (__RUNTIME->poll)
+    b8_t repl_enabled = B8_FALSE;
+    i64_t port;
+    obj_p arg;
+
+    if (__RUNTIME->poll) {
+        arg = runtime_get_arg("repl");
+        if (is_null(arg)) {
+            repl_create(__RUNTIME->poll);
+            drop_obj(arg);
+        } else {
+            repl_enabled =
+                (str_cmp(AS_C8(arg), arg->len, "true", 4) == 0) || (str_cmp(AS_C8(arg), arg->len, "1", 1) == 0);
+            drop_obj(arg);
+            if (repl_enabled)
+                repl_create(__RUNTIME->poll);
+        }
+
+        arg = runtime_get_arg("port");
+        if (!is_null(arg)) {
+            port = i64_from_str(AS_C8(arg), arg->len);
+            drop_obj(arg);
+            if (ipc_listen(__RUNTIME->poll, port) == -1) {
+                printf("Failed to listen on port %lld\n", port);
+                return 1;
+            }
+        }
+
         return poll_run(__RUNTIME->poll);
+    }
 
     return 0;
 }
 
 nil_t runtime_destroy(nil_t) {
+    i64_t i, l;
+    dynlib_p dl;
+
     drop_obj(__RUNTIME->args);
     if (__RUNTIME->poll)
         poll_destroy(__RUNTIME->poll);
@@ -200,6 +238,13 @@ nil_t runtime_destroy(nil_t) {
     heap_unmap(__RUNTIME->symbols, sizeof(struct symbols_t));
     env_destroy(&__RUNTIME->env);
     drop_obj(__RUNTIME->fdmaps);
+    // destroy dynamic libraries
+    l = __RUNTIME->dynlibs->len;
+    for (i = 0; i < l; i++) {
+        dl = (dynlib_p)AS_I64(__RUNTIME->dynlibs)[i];
+        dynlib_close(dl);
+    }
+    drop_obj(__RUNTIME->dynlibs);
     interpreter_destroy();
     if (__RUNTIME->pool)
         pool_destroy(__RUNTIME->pool);
@@ -250,3 +295,5 @@ obj_p runtime_fdmap_get(runtime_p runtime, obj_p assoc) {
 
     return fdmap;
 }
+
+runtime_p runtime_get_ext(nil_t) { return __RUNTIME; }

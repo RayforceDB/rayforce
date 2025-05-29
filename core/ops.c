@@ -35,7 +35,7 @@
 #include "runtime.h"
 #include "pool.h"
 
-__thread u64_t __RND_SEED__ = 0;
+__thread i64_t __RND_SEED__ = 0;
 
 // Initialize the Global null object
 struct obj_t __NULL_OBJECT = {.mmod = MMOD_INTERNAL, .order = 0, .type = TYPE_NULL, .attrs = 0, .rc = 0, .len = 0};
@@ -66,19 +66,9 @@ b8_t ops_as_b8(obj_p x) {
             return B8_TRUE;
     }
 }
-/*
- * In case of using -Ofast compiler flag, we can not just use x != x due to
- * compiler optimizations. So we need to use memcpy to get the bits of the x
- * and then separate check mantissa and exponent.
- */
-b8_t ops_is_nan(f64_t x) {
-    u64_t bits;
-    memcpy(&bits, &x, sizeof(x));
-    return (bits & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (bits & 0x000fffffffffffffull) != 0;
-}
 
-b8_t ops_is_prime(u64_t x) {
-    u64_t i;
+b8_t ops_is_prime(i64_t x) {
+    i64_t i;
 
     if (x <= 1)
         return B8_FALSE;
@@ -94,17 +84,17 @@ b8_t ops_is_prime(u64_t x) {
     return B8_TRUE;
 }
 
-u64_t ops_next_prime(u64_t x) {
+i64_t ops_next_prime(i64_t x) {
     while (!ops_is_prime(x))
         x++;
 
     return x;
 }
 
-u64_t ops_rand_u64(nil_t) {
+i64_t ops_rand_u64(nil_t) {
     if (__RND_SEED__ == 0) {
         // Use a more robust seeding strategy
-        __RND_SEED__ = time(NULL) ^ (u64_t)&ops_rand_u64 ^ (u64_t)&time;
+        __RND_SEED__ = time(NULL) ^ (i64_t)&ops_rand_u64 ^ (i64_t)&time;
     }
 
     // XORShift algorithm for better randomness
@@ -166,8 +156,8 @@ b8_t ops_eq_idx(obj_p a, i64_t ai, obj_p b, i64_t bi) {
     }
 }
 
-u64_t ops_count(obj_p x) {
-    u64_t i, l, c;
+i64_t ops_count(obj_p x) {
+    i64_t i, l, c;
 
     switch (x->type) {
         case TYPE_NULL:
@@ -227,33 +217,33 @@ u64_t ops_count(obj_p x) {
  * if there are at least one vector - it's length, otherwise - 1.
  * In case if there are vectors with different lengths - returns -1.
  */
-u64_t ops_rank(obj_p *x, u64_t n) {
-    u64_t i, l = 0xfffffffffffffffful;
+i64_t ops_rank(obj_p *x, i64_t n) {
+    i64_t i, l = NULL_I64;
     obj_p *b;
 
     for (i = 0; i < n; i++) {
         b = x + i;
-        if (IS_VECTOR(*b) && l == 0xfffffffffffffffful)
+        if (IS_VECTOR(*b) && l == NULL_I64)
             l = ops_count(*b);
         else if (IS_VECTOR(*b) && ops_count(*b) != l)
-            return 0xfffffffffffffffful;
+            return NULL_I64;
     }
 
     // all are atoms
-    if (l == 0xfffffffffffffffful)
+    if (l == NULL_I64)
         l = 1;
 
     return l;
 }
 
 // TODO: optimize this via parallel processing
-obj_p ops_where(b8_t *mask, u64_t len) {
-    u64_t i, j,count;
+obj_p ops_where(b8_t *mask, i64_t len) {
+    i64_t i, j, count;
     i64_t *ids;
     obj_p res;
 
     count = 0;
-    for (i = 0; i < len; i++) 
+    for (i = 0; i < len; i++)
         count += mask[i];
 
     res = I64(count);
@@ -265,7 +255,6 @@ obj_p ops_where(b8_t *mask, u64_t len) {
     }
 
     return res;
-
 }
 
 #if defined(OS_WINDOWS)

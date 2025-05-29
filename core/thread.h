@@ -42,6 +42,8 @@ typedef struct {
 
 #else
 
+#include <pthread.h>
+
 typedef struct {
     pthread_t handle;
 } ray_thread_t;
@@ -64,7 +66,7 @@ nil_t mutex_unlock(mutex_t *mutex);
 cond_t cond_create();
 nil_t cond_destroy(cond_t *cond);
 i32_t cond_wait(cond_t *cond, mutex_t *mutex);
-i32_t cond_wait_timeout(cond_t *cond, mutex_t *mutex, u64_t timeout_ms);
+i32_t cond_wait_timeout(cond_t *cond, mutex_t *mutex, i64_t timeout_ms);
 i32_t cond_signal(cond_t *cond);
 i32_t cond_broadcast(cond_t *cond);
 
@@ -74,6 +76,6 @@ i32_t thread_join(ray_thread_t thread);
 i32_t thread_detach(ray_thread_t thread);
 nil_t thread_exit(raw_p res);
 ray_thread_t thread_self();
-i32_t thread_pin(ray_thread_t thread, u64_t core);
+i32_t thread_pin(ray_thread_t thread, i64_t core);
 
 #endif  // THREAD_H

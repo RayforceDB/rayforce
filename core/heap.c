@@ -32,6 +32,7 @@
 #include "string.h"
 #include "sys.h"
 #include "os.h"
+#include "log.h"
 
 #ifndef __EMSCRIPTEN__
 RAYASSERT(sizeof(struct block_t) == (2 * sizeof(struct obj_t)), heap_h);
@@ -41,18 +42,19 @@ __thread heap_p __HEAP = NULL;
 __thread c8_t HEAP_SWAP[64] = {0};
 
 #define BLOCKSIZE(s) (sizeof(struct obj_t) + (s))
-#define BSIZEOF(o) (1ull << (u64_t)(o))
-#define BUDDYOF(b, o) ((block_p)((u64_t)(b)->pool + (((u64_t)(b) - (u64_t)(b)->pool) ^ BSIZEOF(o))))
-#define ORDEROF(s) (64ull - __builtin_clzll((s) - 1))
-#define BLOCK2RAW(b) ((raw_p)((u64_t)(b) + sizeof(struct obj_t)))
-#define RAW2BLOCK(r) ((block_p)((u64_t)(r) - sizeof(struct obj_t)))
+#define BSIZEOF(o) (1ll << (i64_t)(o))
+#define BUDDYOF(b, o) ((block_p)((i64_t)(b)->pool + (((i64_t)(b) - (i64_t)(b)->pool) ^ BSIZEOF(o))))
+#define ORDEROF(s) (64ll - __builtin_clzll((s) - 1))
+#define BLOCK2RAW(b) ((raw_p)((i64_t)(b) + sizeof(struct obj_t)))
+#define RAW2BLOCK(r) ((block_p)((i64_t)(r) - sizeof(struct obj_t)))
 #define DEFAULT_HEAP_SWAP "/tmp/"
 
-heap_p heap_create(u64_t id) {
+heap_p heap_create(i64_t id) {
+    LOG_INFO("Creating heap with id %lld", id);
     __HEAP = (heap_p)mmap_alloc(sizeof(struct heap_t));
 
     if (__HEAP == NULL) {
-        perror("heap mmap_alloc");
+        LOG_ERROR("Failed to allocate heap: %s", strerror(errno));
         exit(1);
     }
 
@@ -68,16 +70,19 @@ heap_p heap_create(u64_t id) {
     if (HEAP_SWAP[strlen(HEAP_SWAP) - 1] != '/')
         strcat(HEAP_SWAP, "/");
 
+    LOG_DEBUG("Heap created successfully with swap path: %s", HEAP_SWAP);
     return __HEAP;
 }
 
 nil_t heap_destroy(nil_t) {
-    u64_t i;
+    i64_t i;
     block_p block, next;
+
+    LOG_INFO("Destroying heap");
 
     // Ensure foreign blocks are freed
     if (__HEAP->foreign_blocks != NULL)
-        DEBUG_PRINT("%s-- HEAP[%lld]: foreign blocks not freed%s", RED, __HEAP->id, RESET);
+        LOG_WARN("Heap[%lld]: foreign blocks not freed", __HEAP->id);
 
     // All the nodes remains are pools, so just munmap them
     for (i = MIN_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
@@ -86,7 +91,7 @@ nil_t heap_destroy(nil_t) {
         while (block) {
             next = block->next;
             if (i != block->pool_order) {
-                DEBUG_PRINT("%s-- HEAP[%lld]: leak order: %lld block: %p%s", RED, __HEAP->id, i, block, RESET);
+                LOG_ERROR("Heap[%lld]: leak order: %lld block: %p", __HEAP->id, i, block);
                 return;
             }
 
@@ -99,21 +104,25 @@ nil_t heap_destroy(nil_t) {
     mmap_free(__HEAP, sizeof(struct heap_t));
 
     __HEAP = NULL;
+    LOG_DEBUG("Heap destroyed successfully");
 }
 
-heap_p heap_get(nil_t) { return __HEAP; }
+heap_p heap_get(nil_t) {
+    LOG_TRACE("Getting heap instance");
+    return __HEAP;
+}
 
 #ifdef SYS_MALLOC
 
-raw_p heap_alloc(u64_t size) { return malloc(size); }
-raw_p heap_mmap(u64_t size) { return mmap_alloc(size); }
-raw_p heap_stack(u64_t size) { return mmap_stack(size); }
+raw_p heap_alloc(i64_t size) { return malloc(size); }
+raw_p heap_mmap(i64_t size) { return mmap_alloc(size); }
+raw_p heap_stack(i64_t size) { return mmap_stack(size); }
 nil_t heap_free(raw_p ptr) {
     if (ptr != NULL && ptr != NULL_OBJ)
         free(ptr);
 }
-raw_p heap_realloc(raw_p ptr, u64_t size) { return realloc(ptr, size); }
-nil_t heap_unmap(raw_p ptr, u64_t size) { mmap_free(ptr, size); }
+raw_p heap_realloc(raw_p ptr, i64_t size) { return realloc(ptr, size); }
+nil_t heap_unmap(raw_p ptr, i64_t size) { mmap_free(ptr, size); }
 i64_t heap_gc(nil_t) { return 0; }
 nil_t heap_borrow(heap_p heap) { UNUSED(heap); }
 nil_t heap_merge(heap_p heap) { UNUSED(heap); }
@@ -121,11 +130,13 @@ memstat_t heap_memstat(nil_t) { return (memstat_t){0}; }
 
 #else
 
-block_p heap_add_pool(u64_t size) {
-    u64_t id;
+block_p heap_add_pool(i64_t size) {
+    i64_t id;
     i64_t fd;
     block_p block;
     c8_t filename[128];
+
+    LOG_TRACE("Adding pool of size %lld", size);
 
     block = (block_p)mmap_alloc(size);
 
@@ -170,15 +181,15 @@ block_p heap_add_pool(u64_t size) {
     return block;
 }
 
-nil_t heap_remove_pool(block_p block, u64_t size) {
+nil_t heap_remove_pool(block_p block, i64_t size) {
     mmap_free(block, size);
 
     __HEAP->memstat.system -= size;
     __HEAP->memstat.heap -= size;
 }
 
-inline __attribute__((always_inline)) nil_t heap_insert_block(block_p block, u64_t order) {
-    u64_t size = BSIZEOF(order);
+inline __attribute__((always_inline)) nil_t heap_insert_block(block_p block, i64_t order) {
+    i64_t size = BSIZEOF(order);
 
     block->prev = NULL;
     block->next = __HEAP->freelist[order];
@@ -193,7 +204,7 @@ inline __attribute__((always_inline)) nil_t heap_insert_block(block_p block, u64
     __HEAP->freelist[order] = block;
 }
 
-inline __attribute__((always_inline)) nil_t heap_remove_block(block_p block, u64_t order) {
+inline __attribute__((always_inline)) nil_t heap_remove_block(block_p block, i64_t order) {
     if (block->prev)
         block->prev->next = block->next;
     if (block->next)
@@ -206,18 +217,18 @@ inline __attribute__((always_inline)) nil_t heap_remove_block(block_p block, u64
         __HEAP->avail &= ~BSIZEOF(order);
 }
 
-inline __attribute__((always_inline)) nil_t heap_split_block(block_p block, u64_t block_order, u64_t order) {
+inline __attribute__((always_inline)) nil_t heap_split_block(block_p block, i64_t block_order, i64_t order) {
     block_p buddy;
 
     while ((order--) > block_order) {
-        buddy = (block_p)((u64_t)block + BSIZEOF(order));
+        buddy = (block_p)((i64_t)block + BSIZEOF(order));
         buddy->pool = block->pool;
         buddy->pool_order = block->pool_order;
         heap_insert_block(buddy, order);
     }
 }
 
-raw_p heap_mmap(u64_t size) {
+raw_p heap_mmap(i64_t size) {
     raw_p ptr = mmap_alloc(size);
 
     if (ptr == NULL)
@@ -228,7 +239,7 @@ raw_p heap_mmap(u64_t size) {
     return ptr;
 }
 
-raw_p heap_stack(u64_t size) {
+raw_p heap_stack(i64_t size) {
     raw_p ptr = mmap_stack(size);
 
     if (ptr == NULL)
@@ -239,8 +250,8 @@ raw_p heap_stack(u64_t size) {
     return ptr;
 }
 
-raw_p __attribute__((hot)) heap_alloc(u64_t size) {
-    u64_t i, order, block_size;
+raw_p __attribute__((hot)) heap_alloc(i64_t size) {
+    i64_t i, order, block_size;
     block_p block;
 
     if (size == 0 || size > BSIZEOF(MAX_POOL_ORDER))
@@ -258,6 +269,7 @@ raw_p __attribute__((hot)) heap_alloc(u64_t size) {
     // add a new pool and split as well
     if (i == 0) {
         if (order >= MAX_BLOCK_ORDER) {
+            LOG_TRACE("Adding pool of size %lld requested size %lld", BSIZEOF(order), size);
             size = BSIZEOF(order);
             block = heap_add_pool(size);
 
@@ -305,7 +317,7 @@ raw_p __attribute__((hot)) heap_alloc(u64_t size) {
 __attribute__((hot)) nil_t heap_free(raw_p ptr) {
     block_p block, buddy;
     i64_t fd, res;
-    u64_t order;
+    i64_t order;
     c8_t filename[64];
 
     if (ptr == NULL || ptr == NULL_OBJ)
@@ -354,9 +366,9 @@ __attribute__((hot)) nil_t heap_free(raw_p ptr) {
     }
 }
 
-__attribute__((hot)) raw_p heap_realloc(raw_p ptr, u64_t new_size) {
+__attribute__((hot)) raw_p heap_realloc(raw_p ptr, i64_t new_size) {
     block_p block;
-    u64_t i, old_size, cap, order;
+    i64_t i, old_size, cap, order;
     raw_p new_ptr;
 
     if (ptr == NULL)
@@ -393,13 +405,13 @@ __attribute__((hot)) raw_p heap_realloc(raw_p ptr, u64_t new_size) {
     return ptr;
 }
 
-nil_t heap_unmap(raw_p ptr, u64_t size) {
+nil_t heap_unmap(raw_p ptr, i64_t size) {
     mmap_free(ptr, size);
     __HEAP->memstat.system -= size;
 }
 
 i64_t heap_gc(nil_t) {
-    u64_t i, size, total = 0;
+    i64_t i, size, total = 0;
     block_p block, next;
 
     for (i = MAX_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
@@ -423,7 +435,7 @@ i64_t heap_gc(nil_t) {
 }
 
 nil_t heap_borrow(heap_p heap) {
-    u64_t i;
+    i64_t i;
 
     for (i = MAX_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
         // Only borrow if the source heap has a freelist[i] and it has more than one node and it is the pool (not a
@@ -442,7 +454,7 @@ nil_t heap_borrow(heap_p heap) {
 }
 
 nil_t heap_merge(heap_p heap) {
-    u64_t i;
+    i64_t i;
     block_p block, last;
 
     // First traverse foreign blocks and free them
@@ -482,7 +494,7 @@ nil_t heap_merge(heap_p heap) {
 }
 
 memstat_t heap_memstat(nil_t) {
-    u64_t i;
+    i64_t i;
     block_p block;
 
     __HEAP->memstat.free = 0;
@@ -500,7 +512,7 @@ memstat_t heap_memstat(nil_t) {
 }
 
 nil_t heap_print_blocks(heap_p heap) {
-    u64_t i;
+    i64_t i;
     block_p block;
 
     printf("-- HEAP[%lld]: BLOCKS:\n", heap->id);

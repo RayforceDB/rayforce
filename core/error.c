@@ -26,17 +26,20 @@
 #include "heap.h"
 #include "util.h"
 #include "string.h"
+#include "log.h"
 
 obj_p error_obj(i8_t code, obj_p msg) {
     obj_p obj;
     ray_error_p e;
+
+    LOG_DEBUG("Creating error object with code %d", code);
 
     obj = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(struct ray_error_t));
     obj->mmod = MMOD_INTERNAL;
     obj->type = TYPE_ERR;
     obj->rc = 1;
 
-    e = (ray_error_p)obj->arr;
+    e = (ray_error_p)obj->raw;
     e->code = code;
     e->msg = msg;
     e->locs = NULL_OBJ;
@@ -44,7 +47,10 @@ obj_p error_obj(i8_t code, obj_p msg) {
     return obj;
 }
 
-obj_p error_str(i8_t code, lit_p msg) { return error_obj(code, cstring_from_str(msg, strlen(msg))); }
+obj_p error_str(i8_t code, lit_p msg) {
+    LOG_DEBUG("Creating error string with code %d: %s", code, msg);
+    return error_obj(code, cstring_from_str(msg, strlen(msg)));
+}
 
 obj_p error(i8_t code, lit_p fmt, ...) {
     obj_p e;
@@ -54,5 +60,6 @@ obj_p error(i8_t code, lit_p fmt, ...) {
     e = vn_vc8(fmt, args);
     va_end(args);
 
+    LOG_ERROR("Error occurred: code=%d, message=%s", code, AS_C8(e));
     return error_obj(code, e);
 }

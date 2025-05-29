@@ -280,17 +280,40 @@ obj_p ray_neg(obj_p x) {
 
     switch (x->type) {
         case -TYPE_B8:
+        case -TYPE_U8:
             return i64(-x->b8);
+        case -TYPE_I16:
+            return i16(-x->i16);
+        case -TYPE_I32:
+            return i32(-x->i32);
         case -TYPE_I64:
             return i64(-x->i64);
         case -TYPE_F64:
             return f64(-x->f64);
+        case TYPE_B8:
+        case TYPE_U8:
+            l = x->len;
+            res = I64(l);
+            for (i = 0; i < l; i++)
+                AS_I64(res)[i] = -(i64_t)AS_U8(x)[i];
+            return res;
+        case TYPE_I16:
+            l = x->len;
+            res = I64(l);
+            for (i = 0; i < l; i++)
+                AS_I64(res)[i] = -(i64_t)AS_I16(x)[i];
+            return res;
+        case TYPE_I32:
+            l = x->len;
+            res = I64(l);
+            for (i = 0; i < l; i++)
+                AS_I64(res)[i] = -(i64_t)AS_I32(x)[i];
+            return res;
         case TYPE_I64:
             l = x->len;
             res = I64(l);
             for (i = 0; i < l; i++)
-                AS_I64(res)
-            [i] = -AS_I64(x)[i];
+                AS_I64(res)[i] = -AS_I64(x)[i];
             return res;
         case TYPE_F64:
             l = x->len;

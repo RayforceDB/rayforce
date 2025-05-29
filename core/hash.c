@@ -35,13 +35,13 @@
 #include "atomic.h"
 #include "pool.h"
 
-u64_t optimal_hash_table_size(u64_t len, f64_t load_factor) {
-    u64_t size = (u64_t)CEILF64(len / load_factor);
+i64_t optimal_hash_table_size(i64_t len, f64_t load_factor) {
+    i64_t size = (i64_t)CEILF64(len / load_factor);
     return ops_next_prime(size);
 }
 
-obj_p ht_oa_create(u64_t size, i8_t vals) {
-    u64_t i, adjusted_size;
+obj_p ht_oa_create(i64_t size, i8_t vals) {
+    i64_t i, adjusted_size;
     obj_p k, v;
 
     adjusted_size = optimal_hash_table_size(size, 0.75);
@@ -59,7 +59,7 @@ obj_p ht_oa_create(u64_t size, i8_t vals) {
 }
 
 nil_t ht_oa_rehash(obj_p *obj, hash_f hash, raw_p seed) {
-    u64_t i, j, idx, size, key, start, new_size;
+    i64_t i, j, idx, size, key, start, new_size;
     i8_t type;
     i64_t *orig_keys, *new_keys, *orig_vals = NULL, *new_vals = NULL;
     obj_p new_obj;
@@ -109,14 +109,14 @@ nil_t ht_oa_rehash(obj_p *obj, hash_f hash, raw_p seed) {
 }
 
 i64_t ht_oa_tab_next(obj_p *obj, i64_t key) {
-    u64_t i, idx, size, start;
+    i64_t i, idx, size, start;
     i64_t *keys;
 
     for (;;) {
         size = AS_LIST(*obj)[0]->len;
         keys = AS_I64(AS_LIST(*obj)[0]);
 
-        start = (u64_t)key % size;
+        start = (i64_t)key % size;
 
         for (i = start; i < size + start; i++) {
             idx = i % size;
@@ -130,7 +130,7 @@ i64_t ht_oa_tab_next(obj_p *obj, i64_t key) {
 }
 
 i64_t ht_oa_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed) {
-    u64_t i, idx, size, start;
+    i64_t i, idx, size, start;
     i64_t *keys;
 
     for (;;) {
@@ -151,7 +151,7 @@ i64_t ht_oa_tab_next_with(obj_p *obj, i64_t key, hash_f hash, cmp_f cmp, raw_p s
 }
 
 i64_t ht_oa_tab_insert(obj_p *obj, i64_t key, i64_t val) {
-    u64_t i, idx, size, start;
+    i64_t i, idx, size, start;
     i64_t *keys, *vals;
 
     for (;;) {
@@ -159,7 +159,7 @@ i64_t ht_oa_tab_insert(obj_p *obj, i64_t key, i64_t val) {
         keys = AS_I64(AS_LIST(*obj)[0]);
         vals = AS_I64(AS_LIST(*obj)[1]);
 
-        start = (u64_t)key % size;
+        start = (i64_t)key % size;
 
         for (i = start; i < size + start; i++) {
             idx = i % size;
@@ -179,7 +179,7 @@ i64_t ht_oa_tab_insert(obj_p *obj, i64_t key, i64_t val) {
 }
 
 i64_t ht_oa_tab_insert_with(obj_p *obj, i64_t key, i64_t val, hash_f hash, cmp_f cmp, raw_p seed) {
-    u64_t i, idx, size, start;
+    i64_t i, idx, size, start;
     i64_t *keys, *vals;
 
     for (;;) {
@@ -208,13 +208,13 @@ i64_t ht_oa_tab_insert_with(obj_p *obj, i64_t key, i64_t val, hash_f hash, cmp_f
 }
 
 i64_t ht_oa_tab_get(obj_p obj, i64_t key) {
-    u64_t i, idx, size, start;
+    i64_t i, idx, size, start;
     i64_t *keys;
 
     size = AS_LIST(obj)[0]->len;
     keys = AS_I64(AS_LIST(obj)[0]);
 
-    start = (u64_t)key % size;
+    start = (i64_t)key % size;
 
     for (i = start; i < size + start; i++) {
         idx = i % size;
@@ -229,7 +229,7 @@ i64_t ht_oa_tab_get(obj_p obj, i64_t key) {
 }
 
 i64_t ht_oa_tab_get_with(obj_p obj, i64_t key, hash_f hash, cmp_f cmp, raw_p seed) {
-    u64_t i, idx, size, start;
+    i64_t i, idx, size, start;
     i64_t *keys;
 
     size = AS_LIST(obj)[0]->len;
@@ -298,8 +298,8 @@ u64_t hash_index_obj(obj_p obj) {
     }
 }
 
-ht_bk_p ht_bk_create(u64_t size) {
-    u64_t i;
+ht_bk_p ht_bk_create(i64_t size) {
+    i64_t i;
     ht_bk_p ht;
 
     ht = (ht_bk_p)heap_alloc(sizeof(struct ht_bk_t) + size * sizeof(bucket_p));
@@ -315,7 +315,7 @@ ht_bk_p ht_bk_create(u64_t size) {
 }
 
 nil_t ht_bk_destroy(ht_bk_p ht) {
-    u64_t i;
+    i64_t i;
     bucket_p current, next;
 
     // free buckets
@@ -331,8 +331,8 @@ nil_t ht_bk_destroy(ht_bk_p ht) {
     heap_free(ht);
 }
 
-nil_t ht_bk_rehash(ht_bk_p *ht, u64_t new_size) {
-    u64_t i;
+nil_t ht_bk_rehash(ht_bk_p *ht, i64_t new_size) {
+    i64_t i;
     bucket_p bucket;
     ht_bk_p new_ht = ht_bk_create(new_size);
 
@@ -512,7 +512,7 @@ i64_t ht_bk_insert_with_par(ht_bk_p ht, i64_t key, i64_t val, hash_f hash, cmp_f
 }
 
 i64_t ht_bk_get(ht_bk_p ht, i64_t key) {
-    u64_t index = key % ht->size;
+    i64_t index = key % ht->size;
     bucket_p current = ht->table[index];
 
     while (current != NULL) {
@@ -561,19 +561,27 @@ u64_t hash_murmur3(i64_t key, raw_p seed) {
 u64_t hash_guid(i64_t a, raw_p seed) {
     UNUSED(seed);
     guid_t *g = (guid_t *)a;
-    u64_t upper_part, lower_part;
+    u64_t hash = 0xcbf29ce484222325ull;  // FNV-1a offset basis
 
-    // Cast the first and second halves of the GUID to u64_t
-    memcpy(&upper_part, *g, sizeof(u64_t));
-    memcpy(&lower_part, *g + 8, sizeof(u64_t));
+    // Hash each byte of the GUID
+    for (size_t i = 0; i < sizeof(guid_t); i++) {
+        hash ^= ((u8_t *)g)[i];
+        hash *= 1099511628211ull;  // FNV-1a prime
+    }
 
-    // Combine the two parts
-    return upper_part ^ lower_part;
+    // Final mixing step
+    hash ^= hash >> 33;
+    hash *= 0xff51afd7ed558ccdull;
+    hash ^= hash >> 33;
+    hash *= 0xc4ceb9fe1a85ec53ull;
+    hash ^= hash >> 33;
+
+    return hash;
 }
 
 u64_t hash_i64(i64_t a, raw_p seed) {
     UNUSED(seed);
-    return (u64_t)a;
+    return a;
 }
 
 u64_t hash_obj(i64_t a, raw_p seed) {
@@ -594,5 +602,5 @@ i64_t hash_cmp_obj(i64_t a, i64_t b, raw_p seed) {
 i64_t hash_cmp_guid(i64_t a, i64_t b, raw_p seed) {
     UNUSED(seed);
     guid_t *g1 = (guid_t *)a, *g2 = (guid_t *)b;
-    return memcmp(*g1, *g2, sizeof(guid_t));
+    return memcmp(g1, g2, sizeof(guid_t));
 }

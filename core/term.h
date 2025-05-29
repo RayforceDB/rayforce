@@ -58,12 +58,12 @@
 typedef struct hist_t {
     i64_t fd;
     str_p lines;
-    u64_t size;
-    u64_t pos;
-    u64_t index;
+    i64_t size;
+    i64_t pos;
+    i64_t index;
     i64_t search_dir;
     i64_t curr_saved;
-    u64_t curr_len;
+    i64_t curr_len;
     c8_t curr[TERM_BUF_SIZE];
 } *hist_p;
 
@@ -73,9 +73,9 @@ typedef struct {
 } paren_t;
 
 typedef struct {
-    u64_t entry;
-    u64_t index;
-    u64_t sbidx;
+    i64_t entry;
+    i64_t index;
+    i64_t sbidx;
 } autocp_idx_t;
 
 typedef struct term_t {
@@ -102,10 +102,10 @@ typedef struct term_t {
 
 hist_p hist_create();
 nil_t hist_destroy(hist_p history);
-nil_t hist_add(hist_p hist, c8_t buf[], u64_t len);
+nil_t hist_add(hist_p hist, c8_t buf[], i64_t len);
 i64_t hist_prev(hist_p hist, c8_t buf[]);
 i64_t hist_next(hist_p hist, c8_t buf[]);
-i64_t hist_save_current(hist_p hist, c8_t buf[], u64_t len);
+i64_t hist_save_current(hist_p hist, c8_t buf[], i64_t len);
 i64_t hist_restore_current(hist_p hist, c8_t buf[]);
 
 term_p term_create();

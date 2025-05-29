@@ -52,8 +52,8 @@ timestruct_t time_from_i32(i32_t offset) {
     return (timestruct_t){.null = 0, .sign = sign, .hours = hh, .mins = mm, .secs = ss, .msecs = ms};
 }
 
-timestruct_t time_from_str(str_p src, u64_t len) {
-    u64_t i;
+timestruct_t time_from_str(str_p src, i64_t len) {
+    i64_t i;
     i64_t cnt = 0, val = 0, digit;
     timestruct_t ts = {.null = 0, .sign = 1, .hours = 0, .mins = 0, .secs = 0, .msecs = 0};
 

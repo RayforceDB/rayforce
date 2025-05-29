@@ -33,11 +33,11 @@ typedef struct timestruct_t {
     u8_t mins;
     u8_t secs;
     u16_t msecs;
-    u64_t pad;
+    i64_t pad;
 } timestruct_t;
 
 timestruct_t time_from_i32(i32_t offset);
-timestruct_t time_from_str(str_p src, u64_t len);
+timestruct_t time_from_str(str_p src, i64_t len);
 i32_t time_into_i32(timestruct_t tm);
 obj_p ray_time(obj_p arg);
 

@@ -32,7 +32,7 @@
 #define IS_SPACE(c) ((c) == ' ' || (c) == '\t' || (c) == '\n' || (c) == '\r')
 
 // Creates new obj_p string from a C string.
-obj_p string_from_str(lit_p str, u64_t len) {
+obj_p string_from_str(lit_p str, i64_t len) {
     obj_p s;
 
     s = C8(len);
@@ -42,7 +42,7 @@ obj_p string_from_str(lit_p str, u64_t len) {
 }
 
 // Null terminated string
-obj_p cstring_from_str(lit_p str, u64_t len) {
+obj_p cstring_from_str(lit_p str, i64_t len) {
     obj_p s;
 
     if (len <= 0)
@@ -63,7 +63,7 @@ obj_p cstring_from_str(lit_p str, u64_t len) {
 
 obj_p cstring_from_obj(obj_p obj) { return cstring_from_str(AS_C8(obj), obj->len); }
 
-i32_t i32_from_str(lit_p str, u64_t len) {
+i32_t i32_from_str(lit_p str, i64_t len) {
     i32_t result = 0, sign = 1;
 
     if (len == 0)
@@ -92,7 +92,7 @@ i32_t i32_from_str(lit_p str, u64_t len) {
     return result * sign;
 }
 
-i64_t i64_from_str(lit_p str, u64_t len) {
+i64_t i64_from_str(lit_p str, i64_t len) {
     i64_t result = 0, sign = 1;
 
     if (len == 0)
@@ -121,7 +121,7 @@ i64_t i64_from_str(lit_p str, u64_t len) {
     return result * sign;
 }
 
-f64_t f64_from_str(lit_p str, u64_t len) {
+f64_t f64_from_str(lit_p str, i64_t len) {
     f64_t result = 0.0, factor = 1.0, fraction = 0.1, exp_factor = 1.0;
     i64_t exp;
     b8_t has_digits = B8_FALSE, exp_negative = B8_FALSE;
@@ -203,8 +203,8 @@ f64_t f64_from_str(lit_p str, u64_t len) {
     return result * factor;
 }
 
-i64_t guid_from_str(lit_p str, u64_t len, guid_t dst) {
-    u64_t i, j, k;
+i64_t guid_from_str(lit_p str, i64_t len, guid_t dst) {
+    i64_t i, j, k;
     i64_t n;
     u8_t c;
 
@@ -242,7 +242,7 @@ i64_t guid_from_str(lit_p str, u64_t len, guid_t dst) {
  * Checks if pattern is like *?**literal.
  */
 str_p str_chk_from_end(str_p pat) {
-    u64_t l;
+    i64_t l;
     str_p p, s;
 
     l = strlen(pat);
@@ -271,8 +271,8 @@ str_p str_chk_from_end(str_p pat) {
  * Checks if string starts with a literal.
  */
 b8_t str_starts_with(str_p str, str_p pat) {
-    u64_t str_len = strlen(str);
-    u64_t pat_len = strlen(pat);
+    i64_t str_len = strlen(str);
+    i64_t pat_len = strlen(pat);
 
     // If the pattern is longer than the string, it can't be a suffix.
     if (pat_len > str_len)
@@ -315,11 +315,11 @@ b8_t str_ends_with(str_p str, str_p pat) {
  * Note that this implementation assumes that the pattern and text strings do not contain any null characters ('\0').
  * If this is not the case, a more sophisticated implementation may be required.
  */
-b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len) {
+b8_t str_match(str_p str, i64_t str_len, str_p pat, i64_t pat_len) {
     b8_t inv = B8_FALSE, match = B8_FALSE;
-    u64_t str_pos = 0, pat_pos = 0, s_pos;
-    u64_t last_star_pat_pos = MAX_U64;  // Track position of last '*' in pattern
-    u64_t last_star_str_pos = 0;        // Track corresponding string position
+    i64_t str_pos = 0, pat_pos = 0, s_pos;
+    i64_t last_star_pat_pos = NULL_I64;  // Track position of last '*' in pattern
+    i64_t last_star_str_pos = 0;         // Track corresponding string position
 
     while (str_pos < str_len) {
         if (pat_pos >= pat_len)
@@ -370,7 +370,7 @@ b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len) {
                     return B8_FALSE;  // unmatched '['
                 if ((match && inv) || (!match && !inv)) {
                     // Mismatch - backtrack to last '*' if possible
-                    if (last_star_pat_pos != MAX_U64) {
+                    if (last_star_pat_pos != NULL_I64) {
                         pat_pos = last_star_pat_pos + 1;
                         str_pos = ++last_star_str_pos;
                     } else {
@@ -385,7 +385,7 @@ b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len) {
             default:
                 if (str[str_pos] != pat[pat_pos]) {
                     // Mismatch - backtrack to last '*' if possible
-                    if (last_star_pat_pos != MAX_U64) {
+                    if (last_star_pat_pos != NULL_I64) {
                         pat_pos = last_star_pat_pos + 1;
                         str_pos = ++last_star_str_pos;
                     } else {
@@ -406,15 +406,15 @@ b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len) {
     return (pat_pos == pat_len);
 }
 
-u64_t str_len(str_p s, u64_t n) {
-    u64_t i;
+i64_t str_len(str_p s, i64_t n) {
+    i64_t i;
     for (i = 0; i < n && s[i] != '\0'; ++i)
         ;
     return i;
 }
 
-u64_t str_cpy(str_p dst, str_p src) {
-    u64_t i;
+i64_t str_cpy(str_p dst, str_p src) {
+    i64_t i;
     for (i = 0; src[i] != '\0'; ++i)
         dst[i] = src[i];
     dst[i] = '\0';
@@ -441,8 +441,8 @@ obj_p vn_c8(lit_p fmt, ...) {
     return res;
 }
 
-i64_t str_cmp(lit_p lhs, u64_t m, lit_p rhs, u64_t n) {
-    u64_t len = (m < n) ? m : n;
+i64_t str_cmp(lit_p lhs, i64_t m, lit_p rhs, i64_t n) {
+    i64_t len = (m < n) ? m : n;
     i64_t res = __builtin_memcmp(lhs, rhs, len);
 
     if (res == 0) {
@@ -457,7 +457,7 @@ i64_t str_cmp(lit_p lhs, u64_t m, lit_p rhs, u64_t n) {
     return res;
 }
 
-str_p str_rchr(lit_p s, i32_t c, u64_t n) {
+str_p str_rchr(lit_p s, i32_t c, i64_t n) {
     lit_p ptr, last_ptr, found_ptr;
 
     ptr = s;
@@ -474,8 +474,9 @@ str_p str_rchr(lit_p s, i32_t c, u64_t n) {
 /*
  * Simplefied version of murmurhash
  */
-u64_t str_hash(lit_p str, u64_t len) {
-    u64_t i, k, k1;
+u64_t str_hash(lit_p str, i64_t len) {
+    i64_t i;
+    u64_t k, k1;
     u64_t hash = 0x1234ABCD1234ABCD;
     u64_t c1 = 0x87c37b91114253d5ULL;
     u64_t c2 = 0x4cf5ad432745937fULL;
@@ -532,8 +533,8 @@ u64_t str_hash(lit_p str, u64_t len) {
     return hash;
 }
 
-obj_p str_split(lit_p str, u64_t str_len, lit_p delim, u64_t delim_len) {
-    u64_t i;
+obj_p str_split(lit_p str, i64_t str_len, lit_p delim, i64_t delim_len) {
+    i64_t i;
     lit_p start, end;
     obj_p part, last_part, result = NULL_OBJ;
 

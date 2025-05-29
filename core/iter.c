@@ -34,7 +34,7 @@
 #include "pool.h"
 
 obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
-    u64_t i, l, n;
+    i64_t i, l, n;
     obj_p res, item, a, *v, parts;
     pool_p pool;
 
@@ -129,7 +129,7 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
 obj_p map_unary(obj_p f, obj_p x) { return map_unary_fn((unary_f)f->i64, f->attrs, x); }
 
 obj_p map_binary_left_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p res, item, a;
 
     switch (x->type) {
@@ -186,7 +186,7 @@ obj_p map_binary_left_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
 obj_p map_binary_left(obj_p f, obj_p x, obj_p y) { return map_binary_left_fn((binary_f)f->i64, f->attrs, x, y); }
 
 obj_p map_binary_right_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p res, item, a;
 
     switch (y->type) {
@@ -244,7 +244,7 @@ obj_p map_binary_right_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
 obj_p map_binary_right(obj_p f, obj_p x, obj_p y) { return map_binary_right_fn((binary_f)f->i64, f->attrs, x, y); }
 
 obj_p map_binary_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p res, item, a, b;
     i8_t xt, yt;
 
@@ -373,15 +373,15 @@ obj_p map_binary_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
 
 obj_p map_binary(obj_p f, obj_p x, obj_p y) { return map_binary_fn((binary_f)f->i64, f->attrs, x, y); }
 
-obj_p map_vary_fn(vary_f fn, i64_t attrs, obj_p *x, u64_t n) {
-    u64_t i, j, l;
+obj_p map_vary_fn(vary_f fn, i64_t attrs, obj_p *x, i64_t n) {
+    i64_t i, j, l;
     obj_p v, res;
 
     if (n == 0)
         return NULL_OBJ;
 
     l = ops_rank(x, n);
-    if (l == 0xfffffffffffffffful)
+    if (l == NULL_I64)
         THROW(ERR_LENGTH, "vary: arguments have different lengths");
 
     for (j = 0; j < n; j++)
@@ -418,10 +418,10 @@ obj_p map_vary_fn(vary_f fn, i64_t attrs, obj_p *x, u64_t n) {
     return res;
 }
 
-obj_p map_vary(obj_p f, obj_p *x, u64_t n) { return map_vary_fn((vary_f)f->i64, f->attrs, x, n); }
+obj_p map_vary(obj_p f, obj_p *x, i64_t n) { return map_vary_fn((vary_f)f->i64, f->attrs, x, n); }
 
-obj_p map_lambda_partial(obj_p f, obj_p *lst, u64_t n, u64_t arg) {
-    u64_t i;
+obj_p map_lambda_partial(obj_p f, obj_p *lst, i64_t n, i64_t arg) {
+    i64_t i;
     obj_p res;
 
     for (i = 0; i < n; i++)
@@ -435,14 +435,14 @@ obj_p map_lambda_partial(obj_p f, obj_p *lst, u64_t n, u64_t arg) {
     return res;
 }
 
-obj_p map_lambda(obj_p f, obj_p *x, u64_t n) {
-    u64_t i, j, l, executors;
+obj_p map_lambda(obj_p f, obj_p *x, i64_t n) {
+    i64_t i, j, l, executors;
     obj_p v, res;
     pool_p pool;
 
     l = ops_rank(x, n);
 
-    if (n == 0 || l == 0 || l == 0xfffffffffffffffful)
+    if (n == 0 || l == 0 || l == NULL_I64)
         return NULL_OBJ;
 
     pool = pool_get();
@@ -493,8 +493,8 @@ obj_p map_lambda(obj_p f, obj_p *x, u64_t n) {
     return res;
 }
 
-obj_p ray_map(obj_p *x, u64_t n) {
-    u64_t l;
+obj_p ray_map(obj_p *x, i64_t n) {
+    i64_t l;
     obj_p f;
 
     if (n < 2)
@@ -520,7 +520,7 @@ obj_p ray_map(obj_p *x, u64_t n) {
                 THROW(ERR_LENGTH, "'map': lambda call with wrong arguments count");
 
             l = ops_rank(x, n);
-            if (l == 0xfffffffffffffffful)
+            if (l == NULL_I64)
                 THROW(ERR_LENGTH, "'map': arguments have different lengths");
 
             if (l < 1)
@@ -533,8 +533,8 @@ obj_p ray_map(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_map_left(obj_p *x, u64_t n) {
-    u64_t i, j, l;
+obj_p ray_map_left(obj_p *x, i64_t n) {
+    i64_t i, j, l;
     obj_p f, v, *b, res;
 
     if (n < 2)
@@ -620,8 +620,8 @@ obj_p ray_map_left(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_map_right(obj_p *x, u64_t n) {
-    u64_t i, j, l;
+obj_p ray_map_right(obj_p *x, i64_t n) {
+    i64_t i, j, l;
     obj_p f, v, *b, res;
 
     if (n < 2)
@@ -706,8 +706,8 @@ obj_p ray_map_right(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_fold(obj_p *x, u64_t n) {
-    u64_t i, j, l;
+obj_p ray_fold(obj_p *x, i64_t n) {
+    i64_t i, j, l;
     obj_p f, v, x1, x2;
     i8_t xt, yt;
 
@@ -823,7 +823,7 @@ obj_p ray_fold(obj_p *x, u64_t n) {
                 return NULL_OBJ;
 
             l = ops_rank(x, n);
-            if (l == 0xfffffffffffffffful)
+            if (l == NULL_I64)
                 THROW(ERR_LENGTH, "'fold': arguments have different lengths");
 
             for (i = 0; i < n; i++)
@@ -855,7 +855,7 @@ obj_p ray_fold(obj_p *x, u64_t n) {
             return v;
         case TYPE_LAMBDA:
             l = ops_rank(x, n);
-            if (l == 0xfffffffffffffffful)
+            if (l == NULL_I64)
                 THROW(ERR_LENGTH, "'fold': arguments have different lengths");
 
             if (n != 1 && n != AS_LAMBDA(f)->args->len)
@@ -912,8 +912,8 @@ obj_p ray_fold(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_fold_left(obj_p *x, u64_t n) {
-    u64_t i, j, l;
+obj_p ray_fold_left(obj_p *x, i64_t n) {
+    i64_t i, j, l;
     obj_p f, v, x1, x2;
 
     if (n < 2)
@@ -1001,8 +1001,8 @@ obj_p ray_fold_left(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_fold_right(obj_p *x, u64_t n) {
-    u64_t i, j, l;
+obj_p ray_fold_right(obj_p *x, i64_t n) {
+    i64_t i, j, l;
     obj_p f, v, x1, x2;
 
     if (n < 2)
@@ -1080,8 +1080,8 @@ obj_p ray_fold_right(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_scan(obj_p *x, u64_t n) {
-    u64_t i, j, l;
+obj_p ray_scan(obj_p *x, i64_t n) {
+    i64_t i, j, l;
     obj_p f, v, x1, x2, res;
     i8_t xt, yt;
 
@@ -1233,7 +1233,7 @@ obj_p ray_scan(obj_p *x, u64_t n) {
                 return NULL_OBJ;
 
             l = ops_rank(x, n);
-            if (l == 0xfffffffffffffffful)
+            if (l == NULL_I64)
                 THROW(ERR_LENGTH, "'scan': arguments have different lengths");
 
             for (i = 0; i < n; i++)
@@ -1275,7 +1275,7 @@ obj_p ray_scan(obj_p *x, u64_t n) {
             return res;
         case TYPE_LAMBDA:
             l = ops_rank(x, n);
-            if (l == 0xfffffffffffffffful)
+            if (l == NULL_I64)
                 THROW(ERR_LENGTH, "'scan': arguments have different lengths");
 
             if (n != 1 && n != AS_LAMBDA(f)->args->len)
@@ -1350,8 +1350,8 @@ obj_p ray_scan(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_scan_left(obj_p *x, u64_t n) {
-    u64_t i, j, l;
+obj_p ray_scan_left(obj_p *x, i64_t n) {
+    i64_t i, j, l;
     obj_p f, v, x1, x2, res;
 
     if (n < 2)
@@ -1447,8 +1447,8 @@ obj_p ray_scan_left(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_scan_right(obj_p *x, u64_t n) {
-    u64_t i, j, l;
+obj_p ray_scan_right(obj_p *x, i64_t n) {
+    i64_t i, j, l;
     obj_p f, v, x1, x2, res;
 
     if (n < 2)

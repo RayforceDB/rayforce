@@ -75,7 +75,7 @@ i64_t prompt_fmt_into(obj_p *dst);
 obj_p obj_fmt(obj_p obj, b8_t full);
 i64_t obj_fmt_into(obj_p *dst, i64_t indent, i64_t limit, b8_t full, obj_p obj);
 i64_t guid_fmt_into(obj_p *dst, guid_t *val);
-obj_p obj_fmt_n(obj_p *obj, u64_t n);
+obj_p obj_fmt_n(obj_p *obj, i64_t n);
 obj_p ray_show(obj_p obj);
 obj_p timeit_fmt(nil_t);
 i64_t format_set_use_unicode(b8_t use);   // set use unicode

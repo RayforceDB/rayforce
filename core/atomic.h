@@ -31,6 +31,6 @@
 #include <stdatomic.h>
 #endif
 
-nil_t backoff_spin(u64_t *rounds);
+nil_t backoff_spin(i64_t *rounds);
 
 #endif  // ATOMIC_H

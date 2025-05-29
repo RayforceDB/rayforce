@@ -27,12 +27,13 @@
 #include "error.h"
 #include "eval.h"
 #include "io.h"
+#include "ipc.h"
 
 #if defined(OS_WINDOWS)
 
-nil_t timer_sleep(u64_t ms) { Sleep((DWORD)ms); }
+nil_t timer_sleep(i64_t ms) { Sleep((DWORD)ms); }
 
-u64_t get_time_millis(nil_t) {
+i64_t get_time_millis(nil_t) {
     FILETIME ft;
     ULARGE_INTEGER uli;
     GetSystemTimeAsFileTime(&ft);
@@ -52,17 +53,17 @@ f64_t ray_clock_elapsed_ms(ray_clock_t *start, ray_clock_t *end) {
 
 #else
 
-nil_t timer_sleep(u64_t ms) {
+nil_t timer_sleep(i64_t ms) {
     struct timespec ts;
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (ms % 1000) * 1000000;
     nanosleep(&ts, NULL);
 }
 
-u64_t get_time_millis(nil_t) {
+i64_t get_time_millis(nil_t) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    return (u64_t)ts.tv_sec * 1000 + (u64_t)ts.tv_nsec / 1000000;
+    return (i64_t)ts.tv_sec * 1000 + (i64_t)ts.tv_nsec / 1000000;
 }
 
 nil_t ray_clock_get_time(ray_clock_t *clock) { clock_gettime(CLOCK_MONOTONIC, &clock->clock); }
@@ -131,7 +132,7 @@ nil_t timeit_print(nil_t) {
     drop_obj(fmt);
 }
 
-obj_p ray_timeit(obj_p *x, u64_t n) {
+obj_p ray_timeit(obj_p *x, i64_t n) {
     i64_t i, l;
     ray_clock_t start, end;
     obj_p v;
@@ -174,7 +175,7 @@ obj_p ray_timeit(obj_p *x, u64_t n) {
     }
 }
 
-ray_timer_p ray_timer_create(i64_t id, u64_t tic, u64_t exp, i64_t num, obj_p clb) {
+ray_timer_p ray_timer_create(i64_t id, i64_t tic, i64_t exp, i64_t num, obj_p clb) {
     ray_timer_p timer = (ray_timer_p)heap_alloc(sizeof(struct ray_timer_t));
 
     timer->id = id;
@@ -197,8 +198,8 @@ nil_t timers_swap(ray_timer_p *a, ray_timer_p *b) {
     *b = temp;
 }
 
-nil_t timer_up(timers_p timers, u64_t index) {
-    u64_t parent_index = (index - 1) / 2;
+nil_t timer_up(timers_p timers, i64_t index) {
+    i64_t parent_index = (index - 1) / 2;
 
     if (index > 0 && timers->timers[parent_index]->exp > timers->timers[index]->exp) {
         timers_swap(&(timers->timers[parent_index]), &(timers->timers[index]));
@@ -206,10 +207,10 @@ nil_t timer_up(timers_p timers, u64_t index) {
     }
 }
 
-nil_t timer_down(timers_p timers, u64_t index) {
-    u64_t left_child_index = 2 * index + 1;
-    u64_t right_child_index = 2 * index + 2;
-    u64_t smallest_index = index;
+nil_t timer_down(timers_p timers, i64_t index) {
+    i64_t left_child_index = 2 * index + 1;
+    i64_t right_child_index = 2 * index + 2;
+    i64_t smallest_index = index;
 
     if (left_child_index < timers->size && timers->timers[left_child_index]->exp < timers->timers[smallest_index]->exp)
         smallest_index = left_child_index;
@@ -243,7 +244,7 @@ ray_timer_p timer_pop(timers_p timers) {
     return timer;
 }
 
-timers_p timers_create(u64_t capacity) {
+timers_p timers_create(i64_t capacity) {
     timers_p timers = (timers_p)heap_alloc(sizeof(struct timers_t));
 
     timers->timers = (ray_timer_p *)heap_alloc(capacity * sizeof(ray_timer_p));
@@ -255,7 +256,7 @@ timers_p timers_create(u64_t capacity) {
 }
 
 nil_t timers_destroy(timers_p timers) {
-    u64_t i, l;
+    i64_t i, l;
 
     l = timers->size;
 
@@ -266,7 +267,7 @@ nil_t timers_destroy(timers_p timers) {
     heap_free(timers);
 }
 
-i64_t timer_add(timers_p timers, u64_t tic, u64_t exp, u64_t num, obj_p clb) {
+i64_t timer_add(timers_p timers, i64_t tic, i64_t exp, i64_t num, obj_p clb) {
     i64_t id;
     ray_timer_p timer;
 
@@ -345,9 +346,9 @@ i64_t timer_next_timeout(timers_p timers) {
     return (timers->size > 0) ? timers->timers[0]->exp - now : TIMEOUT_INFINITY;
 }
 
-obj_p ray_timer(obj_p *x, u64_t n) {
+obj_p ray_timer(obj_p *x, i64_t n) {
     i64_t id;
-    u64_t num;
+    i64_t num;
     timers_p timers;
 
     if (n == 0)
@@ -381,7 +382,7 @@ obj_p ray_timer(obj_p *x, u64_t n) {
 
     timers = runtime_get()->poll->timers;
 
-    num = (u64_t)((x[1]->i64 == 0) ? NULL_I64 : x[1]->i64);
+    num = (i64_t)((x[1]->i64 == 0) ? NULL_I64 : x[1]->i64);
 
     id = timer_add(timers, x[0]->i64, x[0]->i64 + get_time_millis(), num, clone_obj(x[2]));
 

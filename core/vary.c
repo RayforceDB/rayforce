@@ -42,7 +42,7 @@
 #include "cmp.h"
 #include "iter.h"
 
-obj_p vary_call(obj_p f, obj_p *x, u64_t n) {
+obj_p vary_call(obj_p f, obj_p *x, i64_t n) {
     vary_f fn;
 
     if ((f->attrs & FN_ATOMIC) || (n && x[0]->type == TYPE_MAPGROUP))
@@ -53,8 +53,8 @@ obj_p vary_call(obj_p f, obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_apply(obj_p *x, u64_t n) {
-    u64_t i;
+obj_p ray_apply(obj_p *x, i64_t n) {
+    i64_t i;
     obj_p f, res;
 
     if (n < 2)
@@ -91,8 +91,8 @@ obj_p ray_apply(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_do(obj_p *x, u64_t n) {
-    u64_t i;
+obj_p ray_do(obj_p *x, i64_t n) {
+    i64_t i;
     obj_p res = NULL_OBJ;
 
     for (i = 0; i < n; i++) {
@@ -105,15 +105,15 @@ obj_p ray_do(obj_p *x, u64_t n) {
     return res;
 }
 
-obj_p ray_gc(obj_p *x, u64_t n) {
+obj_p ray_gc(obj_p *x, i64_t n) {
     UNUSED(x);
     UNUSED(n);
     return i64(heap_gc());
 }
 
-obj_p ray_format(obj_p *x, u64_t n) { return obj_fmt_n(x, n); }
+obj_p ray_format(obj_p *x, i64_t n) { return obj_fmt_n(x, n); }
 
-obj_p ray_print(obj_p *x, u64_t n) {
+obj_p ray_print(obj_p *x, i64_t n) {
     obj_p s = obj_fmt_n(x, n);
 
     if (s == NULL_OBJ)
@@ -125,7 +125,7 @@ obj_p ray_print(obj_p *x, u64_t n) {
     return NULL_OBJ;
 }
 
-obj_p ray_println(obj_p *x, u64_t n) {
+obj_p ray_println(obj_p *x, i64_t n) {
     obj_p s = obj_fmt_n(x, n);
 
     if (s == NULL_OBJ)
@@ -137,13 +137,13 @@ obj_p ray_println(obj_p *x, u64_t n) {
     return NULL_OBJ;
 }
 
-obj_p ray_args(obj_p *x, u64_t n) {
+obj_p ray_args(obj_p *x, i64_t n) {
     UNUSED(x);
     UNUSED(n);
     return clone_obj(runtime_get()->args);
 }
 
-obj_p ray_set_splayed(obj_p *x, u64_t n) {
+obj_p ray_set_splayed(obj_p *x, i64_t n) {
     switch (n) {
         case 2:
             return ray_set(x[0], x[1]);
@@ -163,7 +163,7 @@ obj_p ray_set_splayed(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_get_splayed(obj_p *x, u64_t n) {
+obj_p ray_get_splayed(obj_p *x, i64_t n) {
     switch (n) {
         case 1:
             return io_get_table_splayed(x[0], NULL_OBJ);
@@ -174,7 +174,7 @@ obj_p ray_get_splayed(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_set_parted(obj_p *x, u64_t n) {
+obj_p ray_set_parted(obj_p *x, i64_t n) {
     switch (n) {
         case 2:
             return ray_set(x[0], x[1]);
@@ -183,9 +183,9 @@ obj_p ray_set_parted(obj_p *x, u64_t n) {
     }
 }
 
-obj_p ray_get_parted(obj_p *x, u64_t n) {
+obj_p ray_get_parted(obj_p *x, i64_t n) {
     i8_t type;
-    u64_t i, j, l, wide;
+    i64_t i, j, l, wide;
     obj_p path, dir, sym, dirs, gcol, ord, t1, t2, eq, fmaps, virtcol, v, keys, vals, res;
 
     switch (n) {

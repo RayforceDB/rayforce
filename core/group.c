@@ -35,7 +35,7 @@
 #include "pool.h"
 
 obj_p group_map(obj_p val, obj_p index) {
-    u64_t i, l;
+    i64_t i, l;
     obj_p v, res;
 
     switch (val->type) {

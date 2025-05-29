@@ -63,7 +63,7 @@ obj_p unary_call(obj_p f, obj_p x) {
 obj_p ray_get(obj_p x) {
     i64_t fd;
     obj_p res, col, keys, s, v, *sym, path, fdmap;
-    u64_t size;
+    i64_t sz, size;
 
     switch (x->type) {
         case -TYPE_SYMBOL:
@@ -87,7 +87,7 @@ obj_p ray_get(obj_p x) {
 
             size = fs_fsize(fd);
 
-            if (size < sizeof(struct obj_t)) {
+            if (size < ISIZEOF(struct obj_t)) {
                 res = error(ERR_LENGTH, "get: file '%s': invalid size: %d", AS_C8(path), size);
                 drop_obj(path);
                 fs_fclose(fd);
@@ -97,7 +97,8 @@ obj_p ray_get(obj_p x) {
             res = (obj_p)mmap_file(fd, NULL, size, 0);
 
             if (IS_EXTERNAL_SERIALIZED(res)) {
-                v = de_raw((u8_t *)res, size);
+                sz = size;
+                v = de_raw((u8_t *)res, &sz);
                 mmap_free(res, size);
                 fs_fclose(fd);
                 drop_obj(path);

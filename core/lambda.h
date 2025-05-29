@@ -36,6 +36,6 @@ typedef struct lambda_f {
 #define AS_LAMBDA(o) ((lambda_p)(AS_C8(o)))
 
 obj_p lambda(obj_p args, obj_p body, obj_p nfo);
-obj_p lambda_call(obj_p f, obj_p *x, u64_t n);
+obj_p lambda_call(obj_p f, obj_p *x, i64_t n);
 
 #endif  // LAMBDA_H

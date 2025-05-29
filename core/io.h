@@ -26,7 +26,7 @@
 
 #include "rayforce.h"
 
-obj_p ray_hopen(obj_p *x, u64_t n);
+obj_p ray_hopen(obj_p *x, i64_t n);
 obj_p ray_hclose(obj_p x);
 obj_p ray_read(obj_p x);
 obj_p ray_write(obj_p x, obj_p y);

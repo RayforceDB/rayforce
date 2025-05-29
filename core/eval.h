@@ -42,7 +42,7 @@ typedef struct ctx_t {
 } *ctx_p;
 
 typedef struct interpreter_t {
-    u64_t id;         // Interpreter id.
+    i64_t id;         // Interpreter id.
     i64_t sp;         // Stack pointer.
     obj_p *stack;     // Stack.
     i64_t cp;         // Context pointer.
@@ -52,19 +52,19 @@ typedef struct interpreter_t {
 
 extern __thread interpreter_p __INTERPRETER;
 
-interpreter_p interpreter_create(u64_t id);
+interpreter_p interpreter_create(i64_t id);
 nil_t interpreter_destroy(nil_t);
 interpreter_p interpreter_current(nil_t);
-obj_p call(obj_p obj, u64_t arity);
+obj_p call(obj_p obj, i64_t arity);
 obj_p *resolve(i64_t sym);
 obj_p amend(obj_p sym, obj_p val);
 obj_p mount_env(obj_p obj);
-obj_p unmount_env(u64_t n);
+obj_p unmount_env(i64_t n);
 obj_p eval(obj_p obj);
 obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file);
 obj_p ray_eval_str(obj_p str, obj_p file);
 obj_p ray_raise(obj_p obj);
-obj_p ray_return(obj_p *x, u64_t n);
+obj_p ray_return(obj_p *x, i64_t n);
 obj_p interpreter_env_get(nil_t);
 nil_t error_add_loc(obj_p err, i64_t id, ctx_p ctx);
 // TODO: replace with correct functions
@@ -113,8 +113,9 @@ inline __attribute__((always_inline)) obj_p unwrap(obj_p obj, i64_t id) {
     return obj;
 }
 
-inline __attribute__((always_inline)) b8_t stack_enough(u64_t n) { return __INTERPRETER->sp + n < EVAL_STACK_SIZE; }
+inline __attribute__((always_inline)) b8_t stack_enough(i64_t n) { return __INTERPRETER->sp + n < EVAL_STACK_SIZE; }
 
-obj_p ray_exit(obj_p *x, u64_t n);
+obj_p ray_exit(obj_p *x, i64_t n);
+b8_t ray_is_main_thread(nil_t);
 
 #endif  // EVAL_H

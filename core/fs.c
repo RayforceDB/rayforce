@@ -153,7 +153,7 @@ obj_p fs_read_dir(lit_p path) {
     return lst;
 }
 
-i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], u64_t len) {
+i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], i64_t len) {
     HANDLE hFile = (HANDLE)_get_osfhandle(fd);  // Convert fd to Windows HANDLE
     if (hFile == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "Invalid file descriptor.\n");
@@ -250,7 +250,7 @@ i64_t fs_dopen(lit_p path) { return fs_dopen_js(path); }
 
 i64_t fs_dclose(i64_t fd) { return closedir((DIR *)fd); }
 
-i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], u64_t len) { return -1; }
+i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], i64_t len) { return -1; }
 
 #else
 
@@ -386,7 +386,7 @@ obj_p fs_read_dir(lit_p path) {
     return lst;
 }
 
-i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], u64_t len) {
+i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], i64_t len) {
     i64_t l;
     c8_t path[PATH_MAX];
 
@@ -406,8 +406,8 @@ i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], u64_t len) {
 
 #endif
 
-u64_t fs_filename(lit_p path, lit_p *name) {
-    u64_t i, len;
+i64_t fs_filename(lit_p path, lit_p *name) {
+    i64_t i, len;
     lit_p p;
 
     *name = NULL;

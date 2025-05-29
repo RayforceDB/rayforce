@@ -32,8 +32,8 @@
 #include "error.h"
 #include "index.h"
 
-obj_p select_column(obj_p left_col, obj_p right_col, i64_t ids[], u64_t len) {
-    u64_t i;
+obj_p select_column(obj_p left_col, obj_p right_col, i64_t ids[], i64_t len) {
+    i64_t i;
     obj_p v, res;
     i64_t idx;
     i8_t type;
@@ -77,8 +77,8 @@ obj_p get_column(obj_p left_col, obj_p right_col, obj_p lids, obj_p rids) {
     return at_ids(right_col, AS_I64(rids), rids->len);
 }
 
-obj_p ray_left_join(obj_p *x, u64_t n) {
-    u64_t ll;
+obj_p ray_left_join(obj_p *x, i64_t n) {
+    i64_t ll;
     i64_t i, j, l;
     obj_p k1, k2, c1, c2, un, col, cols, vals, idx, rescols, resvals;
 
@@ -198,7 +198,7 @@ obj_p ray_left_join(obj_p *x, u64_t n) {
     return table(rescols, resvals);
 }
 
-obj_p ray_inner_join(obj_p *x, u64_t n) {
+obj_p ray_inner_join(obj_p *x, i64_t n) {
     i64_t i, j, l;
     obj_p k1, k2, c1, c2, un, col, cols, vals, idx;
 

@@ -31,20 +31,20 @@
 str_p str_chk_from_end(str_p pat);
 b8_t str_starts_with(str_p str, str_p pat);
 b8_t str_ends_with(str_p str, str_p pat);
-b8_t str_match(str_p str, u64_t str_len, str_p pat, u64_t pat_len);
-obj_p string_from_str(lit_p str, u64_t len);
-obj_p cstring_from_str(lit_p str, u64_t len);
+b8_t str_match(str_p str, i64_t str_len, str_p pat, i64_t pat_len);
+obj_p string_from_str(lit_p str, i64_t len);
+obj_p cstring_from_str(lit_p str, i64_t len);
 obj_p cstring_from_obj(obj_p obj);
-i32_t i32_from_str(lit_p str, u64_t len);
-i64_t i64_from_str(lit_p str, u64_t len);
-f64_t f64_from_str(lit_p str, u64_t len);
-i64_t guid_from_str(lit_p str, u64_t len, guid_t dst);
-u64_t str_cpy(str_p dst, str_p src);
-u64_t str_len(str_p s, u64_t n);
-i64_t str_cmp(lit_p lhs, u64_t m, lit_p rhs, u64_t n);
-str_p str_rchr(lit_p s, i32_t c, u64_t n);
-u64_t str_hash(lit_p str, u64_t len);
+i32_t i32_from_str(lit_p str, i64_t len);
+i64_t i64_from_str(lit_p str, i64_t len);
+f64_t f64_from_str(lit_p str, i64_t len);
+i64_t guid_from_str(lit_p str, i64_t len, guid_t dst);
+i64_t str_cpy(str_p dst, str_p src);
+i64_t str_len(str_p s, i64_t n);
+i64_t str_cmp(lit_p lhs, i64_t m, lit_p rhs, i64_t n);
+str_p str_rchr(lit_p s, i32_t c, i64_t n);
+u64_t str_hash(lit_p str, i64_t len);
 obj_p vn_vc8(lit_p fmt, va_list args);
-obj_p str_split(lit_p str, u64_t str_len, lit_p delim, u64_t delim_len);
+obj_p str_split(lit_p str, i64_t str_len, lit_p delim, i64_t delim_len);
 
 #endif  // STRING_H

@@ -44,6 +44,7 @@ obj_p sys_use_unicode(i32_t argc, str_p argv[]);
 obj_p sys_set_display_width(i32_t argc, str_p argv[]);
 obj_p sys_timeit_activate(i32_t argc, str_p argv[]);
 obj_p sys_listen(i32_t argc, str_p argv[]);
+obj_p sys_exit(i32_t argc, str_p argv[]);
 obj_p ray_internal_command(obj_p cmd);
 obj_p ray_system(obj_p cmd);
 

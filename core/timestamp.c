@@ -118,7 +118,7 @@ i64_t timestamp_into_i64(timestamp_t ts) {
     return (dss * NSECS_IN_DAY + offs);
 }
 
-timestamp_t timestamp_from_str(str_p src, u64_t len) {
+timestamp_t timestamp_from_str(str_p src, i64_t len) {
     i64_t cnt = 0, val = 0, digit_count, digit;
     timestamp_t ts = {.null = B8_FALSE, .year = 0, .month = 0, .day = 0, .hours = 0, .mins = 0, .secs = 0, .nanos = 0};
     lit_p cur = src;

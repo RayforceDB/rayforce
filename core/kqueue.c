@@ -44,18 +44,17 @@
 #include "eval.h"
 #include "binary.h"
 
-__thread i32_t __EVENT_FD[2];  // eventfd to notify epoll loop of shutdown
-__thread u8_t __STDIN_BUF[BUF_SIZE + 1];
+__thread i32_t __POLL_WAKER[2];  // pipe to notify kqueue loop of shutdown
 
 nil_t sigint_handler(i32_t signo) {
     UNUSED(signo);
-    u64_t val = 1;
-    // Write to the eventfd to wake up the epoll loop.
-    write(__EVENT_FD[1], &val, sizeof(val));
+    i64_t val = 1;
+    // Write to the pipe to wake up the kqueue loop.
+    write(__POLL_WAKER[1], &val, sizeof(val));
 }
 
-poll_p poll_init(i64_t port) {
-    i64_t kq_fd = -1, listen_fd = -1;
+poll_p poll_create() {
+    i64_t kq_fd = -1;
     poll_p poll;
     struct kevent ev;
 
@@ -66,122 +65,114 @@ poll_p poll_init(i64_t port) {
     }
 
     // Create a pipe
-    if (pipe(__EVENT_FD) == -1) {
+    if (pipe(__POLL_WAKER) == -1) {
         perror("pipe");
         exit(EXIT_FAILURE);
     }
-    // Add eventfd to kqueue
-    EV_SET(&ev, __EVENT_FD[0], EVFILT_READ, EV_ADD, 0, 0, NULL);
+    // Add pipe to kqueue
+    EV_SET(&ev, __POLL_WAKER[0], POLL_EVENT_READ, EV_ADD, 0, 0, NULL);
     if (kevent(kq_fd, &ev, 1, NULL, 0, NULL) == -1) {
-        perror("kevent: eventfd");
+        perror("kevent: pipe");
         exit(EXIT_FAILURE);
     }
 
     // Set up the SIGINT signal handler
     signal(SIGINT, sigint_handler);
 
-    // Add stdin
-    EV_SET(&ev, STDIN_FILENO, EVFILT_READ, EV_ADD, 0, 0, NULL);
-    if (kevent(kq_fd, &ev, 1, NULL, 0, NULL) == -1) {
-        perror("kevent: stdinfd");
-        exit(EXIT_FAILURE);
-    }
-
     poll = (poll_p)heap_alloc(sizeof(struct poll_t));
+    poll->fd = kq_fd;
     poll->code = NULL_I64;
-    poll->poll_fd = kq_fd;
-    poll->ipc_fd = listen_fd;
     poll->selectors = freelist_create(128);
-    poll->replfile = string_from_str("repl", 4);
-    poll->ipcfile = string_from_str("ipc", 3);
-    poll->term = term_create();
     poll->timers = timers_create(128);
 
-    // Add server socket
-    if (port) {
-        listen_fd = poll_listen(poll, port);
-        if (listen_fd == -1) {
-            perror("listen");
-            exit(EXIT_FAILURE);
-        }
-    }
-
     return poll;
-}
-
-i64_t poll_listen(poll_p poll, i64_t port) {
-    i64_t listen_fd;
-    struct kevent ev;
-
-    listen_fd = sock_listen(port);
-    if (listen_fd == -1) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    EV_SET(&ev, listen_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-    if (kevent(poll->poll_fd, &ev, 1, NULL, 0, NULL) == -1) {
-        perror("kevent: listenfd");
-        exit(EXIT_FAILURE);
-    }
-
-    return listen_fd;
 }
 
 nil_t poll_destroy(poll_p poll) {
     i64_t i, l;
 
-    if (poll->ipc_fd != -1)
-        close(poll->ipc_fd);
-
     // Free all selectors
+    LOG_DEBUG("Freeing all selectors");
     l = poll->selectors->data_pos;
     for (i = 0; i < l; i++) {
         if (poll->selectors->data[i] != NULL_I64)
             poll_deregister(poll, i + SELECTOR_ID_OFFSET);
     }
 
-    drop_obj(poll->replfile);
-    drop_obj(poll->ipcfile);
-
-    term_destroy(poll->term);
-
+    LOG_DEBUG("Freeing selectors list");
     freelist_free(poll->selectors);
     timers_destroy(poll->timers);
 
-    close(__EVENT_FD[0]);
-    close(__EVENT_FD[1]);
-    close(poll->poll_fd);
+    LOG_DEBUG("Closing eventfd");
+    close(__POLL_WAKER[0]);
+    close(__POLL_WAKER[1]);
+
+    LOG_DEBUG("Closing epoll instance");
+    close(poll->fd);
+
+    LOG_DEBUG("Freeing poll instance");
     heap_free(poll);
 }
 
-i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
+i64_t poll_register(poll_p poll, poll_registry_p registry) {
     i64_t id;
     selector_p selector;
-    struct kevent ev;
+    struct kevent ev[2];
 
     selector = (selector_p)heap_alloc(sizeof(struct selector_t));
     id = freelist_push(poll->selectors, (i64_t)selector) + SELECTOR_ID_OFFSET;
     selector->id = id;
-    selector->version = version;
-    selector->fd = fd;
-    selector->tx.isset = B8_FALSE;
+    selector->fd = registry->fd;
+    selector->type = registry->type;
+    selector->interest = registry->events;
+    selector->open_fn = registry->open_fn;
+    selector->close_fn = registry->close_fn;
+    selector->error_fn = registry->error_fn;
+    selector->rx.recv_fn = registry->recv_fn;
+    selector->rx.read_fn = registry->read_fn;
+    selector->tx.write_fn = registry->write_fn;
+    selector->tx.send_fn = registry->send_fn;
+    selector->data_fn = registry->data_fn;
+    selector->data = registry->data;
     selector->rx.buf = NULL;
-    selector->rx.size = 0;
-    selector->rx.bytes_transfered = 0;
     selector->tx.buf = NULL;
-    selector->tx.size = 0;
-    selector->tx.bytes_transfered = 0;
-    selector->tx.queue = queue_create(TX_QUEUE_SIZE);
 
-    EV_SET(&ev, fd, EVFILT_READ, EV_ADD, 0, 0, selector);
-    if (kevent(poll->poll_fd, &ev, 1, NULL, 0, NULL) == -1)
-        perror("kevent add");
+    // Set up events
+    if (registry->events & POLL_EVENT_READ) {
+        EV_SET(&ev[0], selector->fd, EVFILT_READ, EV_ADD, 0, 0, selector);
+        if (kevent(poll->fd, &ev[0], 1, NULL, 0, NULL) == -1) {
+            perror("kevent add read");
+            heap_free(selector);
+            return -1;
+        }
+    }
+
+    if (registry->events & POLL_EVENT_WRITE) {
+        EV_SET(&ev[0], selector->fd, EVFILT_WRITE, EV_ADD, 0, 0, selector);
+        if (kevent(poll->fd, &ev[0], 1, NULL, 0, NULL) == -1) {
+            perror("kevent add write");
+            heap_free(selector);
+            return -1;
+        }
+    }
+
+    // Add error and EOF events if requested
+    if (registry->events & (POLL_EVENT_ERROR | POLL_EVENT_HUP | POLL_EVENT_RDHUP)) {
+        EV_SET(&ev[0], selector->fd, EVFILT_READ, EV_ADD | EV_ENABLE, EV_ERROR | EV_EOF, 0, selector);
+        if (kevent(poll->fd, &ev[0], 1, NULL, 0, NULL) == -1) {
+            perror("kevent add error");
+            heap_free(selector);
+            return -1;
+        }
+    }
+
+    if (registry->open_fn != NULL)
+        registry->open_fn(poll, selector);
 
     return id;
 }
 
-nil_t poll_deregister(poll_p poll, i64_t id) {
+i64_t poll_deregister(poll_p poll, i64_t id) {
     i64_t idx;
     selector_p selector;
     struct kevent ev[2];
@@ -189,384 +180,295 @@ nil_t poll_deregister(poll_p poll, i64_t id) {
     idx = freelist_pop(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
-        return;
+        return 0;
 
     selector = (selector_p)idx;
 
-    EV_SET(&ev[0], selector->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-    EV_SET(&ev[1], selector->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-    kevent(poll->poll_fd, ev, 2, NULL, 0, NULL);
+    EV_SET(&ev[0], selector->fd, selector->interest, EV_DELETE, 0, 0, NULL);
+    kevent(poll->fd, ev, 1, NULL, 0, NULL);
 
     close(selector->fd);
 
     heap_free(selector->rx.buf);
     heap_free(selector->tx.buf);
-    queue_free(selector->tx.queue);
     heap_free(selector);
+
+    return 0;
 }
 
-poll_result_t _recv(poll_p poll, selector_p selector) {
+i64_t poll_recv(poll_p poll, selector_p selector) {
     UNUSED(poll);
 
-    i64_t sz, size;
-    header_t *header;
-    u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
+    i64_t size, total;
 
-    if (selector->rx.buf == NULL)
-        selector->rx.buf = (u8_t *)heap_alloc(sizeof(struct header_t));
+    LOG_TRACE("Receiving data from selector %lld", selector->id);
 
-    // wait for handshake
-    if (selector->version == 0) {
-        while (selector->rx.bytes_transfered == 0 || selector->rx.buf[selector->rx.bytes_transfered - 1] != '\0') {
-            size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered], sizeof(struct header_t));
-            if (size == -1)
-                return POLL_ERROR;
-            else if (size == 0)
-                return POLL_PENDING;
+    total = selector->rx.buf->offset;
 
-            selector->rx.bytes_transfered += size;
+    while (selector->rx.buf->offset < selector->rx.buf->size) {
+        LOG_DEBUG("buf size, offset: %lld, %lld", selector->rx.buf->size, selector->rx.buf->offset);
+        LOG_DEBUG("READ SIZE: %lld", selector->rx.buf->size - selector->rx.buf->offset);
+        size = selector->rx.recv_fn(selector->fd, &selector->rx.buf->data[selector->rx.buf->offset],
+                                    selector->rx.buf->size - selector->rx.buf->offset);
+
+        LOG_TRACE("Received %lld bytes from selector %lld", size, selector->id);
+
+        if (size == -1) {
+            if (errno == EINTR)
+                continue;
+
+            return -1;
         }
 
-        selector->version = selector->rx.buf[selector->rx.bytes_transfered - 2];
-        selector->rx.bytes_transfered = 0;
+        if (size == 0) {
+            // closed
+            if (errno != EAGAIN && errno != EWOULDBLOCK)
+                return -1;
 
-        // send handshake response
-        size = 0;
-        while (size < (i64_t)sizeof(handshake)) {
-            sz = sock_send(selector->fd, &handshake[size], sizeof(handshake) - size);
-
-            if (sz == -1)
-                return POLL_ERROR;
-
-            size += sz;
-        }
-    }
-
-    // read header
-    if (selector->rx.size == 0) {
-        while (selector->rx.bytes_transfered < (i64_t)sizeof(struct header_t)) {
-            size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered],
-                             sizeof(struct header_t) - selector->rx.bytes_transfered);
-            if (size == -1)
-                return POLL_ERROR;
-            else if (size == 0)
-                return POLL_PENDING;
-
-            selector->rx.bytes_transfered += size;
+            return 0;
         }
 
-        header = (header_t *)selector->rx.buf;
-        selector->rx.msgtype = header->msgtype;
-        selector->rx.size = header->size + sizeof(struct header_t);
-        selector->rx.buf = (u8_t *)heap_realloc(selector->rx.buf, selector->rx.size);
+        selector->rx.buf->offset += size;
     }
 
-    while (selector->rx.bytes_transfered < selector->rx.size) {
-        size = sock_recv(selector->fd, &selector->rx.buf[selector->rx.bytes_transfered],
-                         selector->rx.size - selector->rx.bytes_transfered);
-        if (size == -1)
-            return POLL_ERROR;
-        else if (size == 0)
-            return POLL_PENDING;
+    total = selector->rx.buf->offset - total;
 
-        selector->rx.bytes_transfered += size;
-    }
+    LOG_TRACE("Total bytes received from selector %lld: %lld", selector->id, total);
 
-    return POLL_DONE;
+    return total;
 }
 
-poll_result_t _send(poll_p poll, selector_p selector) {
+i64_t poll_send(poll_p poll, selector_p selector) {
     UNUSED(poll);
 
-    i64_t size;
-    obj_p obj;
-    nil_t *v;
-    i8_t msg_type = MSG_TYPE_RESP;
+    i64_t size, total;
+    poll_buffer_p buf;
     struct kevent ev;
 
-send:
-    while (selector->tx.bytes_transfered < selector->tx.size) {
-        size = sock_send(selector->fd, &selector->tx.buf[selector->tx.bytes_transfered],
-                         selector->tx.size - selector->tx.bytes_transfered);
-        if (size == -1)
-            return POLL_ERROR;
-        else if (size == 0) {
-            // setup kqueue for EVFILT_WRITE only if it's not already set
-            if (!selector->tx.isset) {
-                selector->tx.isset = B8_TRUE;
-                EV_SET(&ev, selector->fd, EVFILT_WRITE, EV_ADD, 0, 0, selector);
-                if (kevent(poll->poll_fd, &ev, 1, NULL, 0, NULL) == -1)
-                    return POLL_ERROR;
-            }
+    LOG_TRACE("Sending data to selector %lld", selector->id);
 
-            return POLL_PENDING;
+    total = 0;
+
+send_loop:
+    while (selector->tx.buf->offset < selector->tx.buf->size) {
+        size = selector->tx.send_fn(selector->fd, selector->tx.buf->data + selector->tx.buf->offset,
+                                    selector->tx.buf->size - selector->tx.buf->offset);
+
+        LOG_TRACE("Sent %lld bytes to selector %lld", size, selector->id);
+
+        if (size == -1) {
+            if (errno == EINTR)
+                continue;
+
+            return -1;
         }
 
-        selector->tx.bytes_transfered += size;
+        if (size == 0) {
+            // closed
+            if (errno != EAGAIN && errno != EWOULDBLOCK)
+                return -1;
+
+            return 0;
+        }
+
+        selector->tx.buf->offset += size;
     }
 
+    total = selector->tx.buf->offset;
+
+    // switch to next buffer
+    LOG_TRACE("Switching to next buffer");
+    buf = selector->tx.buf->next;
     heap_free(selector->tx.buf);
-    selector->tx.buf = NULL;
-    selector->tx.size = 0;
-    selector->tx.bytes_transfered = 0;
+    selector->tx.buf = buf;
 
-    v = queue_pop(selector->tx.queue);
+    if (selector->tx.buf != NULL)
+        goto send_loop;
 
-    if (v != NULL) {
-        obj = (obj_p)((i64_t)v & ~(3ll << 61));
-        msg_type = (((i64_t)v & (3ll << 61)) >> 61);
-        size = ser_raw(&selector->tx.buf, obj);
-        selector->tx.size = size;
-        drop_obj(obj);
-        if (size == -1)
-            return POLL_ERROR;
-
-        ((header_t *)selector->tx.buf)->msgtype = msg_type;
-        goto send;
+    // If we've sent all data, disable write events
+    EV_SET(&ev, selector->fd, EVFILT_WRITE, EV_DISABLE, 0, 0, selector);
+    if (kevent(poll->fd, &ev, 1, NULL, 0, NULL) == -1) {
+        perror("kevent disable write");
+        return -1;
     }
 
-    // remove EVFILT_WRITE only if it's set
-    if (selector->tx.isset) {
-        selector->tx.isset = B8_FALSE;
-        EV_SET(&ev, selector->fd, EVFILT_WRITE, EV_DELETE, 0, 0, selector);
-        if (kevent(poll->poll_fd, &ev, 1, NULL, 0, NULL) == -1)
-            return POLL_ERROR;
-    }
+    LOG_TRACE("Total bytes sent to selector %lld: %lld", selector->id, total);
 
-    return POLL_DONE;
-}
-
-obj_p read_obj(selector_p selector) {
-    obj_p res;
-
-    res = de_raw(selector->rx.buf, selector->rx.size);
-    heap_free(selector->rx.buf);
-    selector->rx.buf = NULL;
-    selector->rx.bytes_transfered = 0;
-    selector->rx.size = 0;
-
-    return res;
-}
-
-nil_t process_request(poll_p poll, selector_p selector) {
-    poll_result_t poll_result;
-    obj_p v, res;
-
-    res = read_obj(selector);
-
-    if (IS_ERR(res) || is_null(res))
-        v = res;
-    else if (res->type == TYPE_C8) {
-        v = ray_eval_str(res, poll->ipcfile);
-        drop_obj(res);
-    } else
-        v = eval_obj(res);
-
-    // sync request
-    if (selector->rx.msgtype == MSG_TYPE_SYNC) {
-        queue_push(selector->tx.queue, (nil_t *)((i64_t)v | ((i64_t)MSG_TYPE_RESP << 61)));
-        poll_result = _send(poll, selector);
-
-        if (poll_result == POLL_ERROR)
-            poll_deregister(poll, selector->id);
-    } else
-        drop_obj(v);
+    return total;
 }
 
 i64_t poll_run(poll_p poll) {
-    i64_t kq_fd = poll->poll_fd, listen_fd = poll->ipc_fd, nfds, poll_result, sock, next_tm;
-    i32_t n;
-    b8_t error;
+    i64_t n, nbytes, nfds, next_tm;
+    option_t poll_result;
     selector_p selector;
-    obj_p str, res;
     struct kevent ev, events[MAX_EVENTS];
     struct timespec tm, *timeout = NULL;
 
-    term_prompt(poll->term);
-
     while (poll->code == NULL_I64) {
         next_tm = timer_next_timeout(poll->timers);
+        timeout = (next_tm == TIMEOUT_INFINITY)
+                      ? NULL
+                      : (tm.tv_sec = next_tm / 1000, tm.tv_nsec = (next_tm % 1000) * 1000000, &tm);
 
-        if (next_tm == TIMEOUT_INFINITY)
-            timeout = NULL;
-        else {
-            tm.tv_sec = next_tm / 1000;
-            tm.tv_nsec = (next_tm % 1000) * 1000000;
-            timeout = &tm;
-        }
-
-        nfds = kevent(kq_fd, NULL, 0, events, MAX_EVENTS, timeout);
-
+        nfds = kevent(poll->fd, NULL, 0, events, MAX_EVENTS, timeout);
         if (nfds == -1)
             return 1;
 
         for (n = 0; n < nfds; ++n) {
             ev = events[n];
 
-            // stdin
-            if (ev.ident == STDIN_FILENO) {
-                if (!term_getc(poll->term)) {
-                    poll->code = 1;
+            // Check for shutdown signal
+            if (ev.ident == (u32_t)__POLL_WAKER[0]) {
+                LOG_DEBUG("Shutdown event received");
+                poll->code = 0;
+                break;
+            }
+
+            selector = (selector_p)ev.udata;
+
+            // error or hang up
+            if (ev.flags & EV_ERROR) {
+                LOG_DEBUG("Connection error for selector %lld, flags: 0x%x", selector->id, ev.flags);
+                poll_deregister(poll, selector->id);
+                continue;
+            }
+
+            if (ev.flags & EV_EOF) {
+                LOG_DEBUG("Connection closed for selector %lld, flags: 0x%x", selector->id, ev.flags);
+                poll_deregister(poll, selector->id);
+                continue;
+            }
+
+            // read
+            if (ev.filter == EVFILT_READ) {
+                LOG_TRACE("Read event received for selector %lld", selector->id);
+                while (B8_TRUE) {
+                    // In case we have a low level IO recv function, use it
+                    nbytes = 0;
+                    if (selector->rx.recv_fn != NULL) {
+                        nbytes = poll_recv(poll, selector);
+
+                        if (nbytes == -1) {
+                            // Error or connection closed
+                            LOG_DEBUG("Error or connection closed for selector %lld", selector->id);
+                            poll_deregister(poll, selector->id);
+                            goto next_event;
+                        }
+
+                        if (nbytes == 0) {
+                            // No more data to read (EAGAIN/EWOULDBLOCK), wait for next edge trigger
+                            goto next_event;
+                        }
+                    }
+
+                    poll_result = option_none();
+
+                    if (selector->rx.read_fn != NULL)
+                        poll_result = selector->rx.read_fn(poll, selector);
+
+                    if (option_is_some(&poll_result)) {
+                        if (poll_result.value != NULL && selector->data_fn != NULL)
+                            poll_result = selector->data_fn(poll, selector, poll_result.value);
+
+                        if (option_is_some(&poll_result))
+                            continue;
+                    }
+
+                    if (option_is_error(&poll_result))
+                        poll_deregister(poll, selector->id);
+
                     break;
                 }
+            }
 
-                str = term_read(poll->term);
-                if (str != NULL) {
-                    if (IS_ERR(str))
-                        io_write(STDOUT_FILENO, MSG_TYPE_RESP, str);
-                    else if (str != NULL_OBJ) {
-                        res = ray_eval_str(str, poll->replfile);
-                        drop_obj(str);
-                        io_write(STDOUT_FILENO, MSG_TYPE_RESP, res);
-                        error = IS_ERR(res);
-                        drop_obj(res);
-                        if (!error)
-                            timeit_print();
+            // write
+            if (ev.filter == EVFILT_WRITE) {
+                LOG_TRACE("Write event received for selector %lld", selector->id);
+                nbytes = 0;
+
+                // If there's no data to write, disable write events
+                if (selector->tx.buf == NULL) {
+                    struct kevent ev;
+                    EV_SET(&ev, selector->fd, EVFILT_WRITE, EV_DISABLE, 0, 0, selector);
+                    kevent(poll->fd, &ev, 1, NULL, 0, NULL);
+                    goto next_event;
+                }
+
+                while (selector->tx.buf != NULL) {
+                    nbytes = poll_send(poll, selector);
+
+                    if (nbytes == -1) {
+                        poll_deregister(poll, selector->id);
+                        goto next_event;
                     }
 
-                    term_prompt(poll->term);
+                    if (nbytes == 0)
+                        break;
                 }
             }
-            // accept new connections
-            else if (ev.ident == (uintptr_t)listen_fd) {
-                sock = sock_accept(listen_fd);
-                if (sock != -1)
-                    poll_register(poll, sock, 0);
-            } else if (ev.ident == (uintptr_t)__EVENT_FD[0])
-                poll->code = 0;
-            // tcp socket event
-            else {
-                selector = (selector_p)ev.udata;
 
-                if ((ev.flags & EV_ERROR) || (ev.fflags & EV_EOF)) {
-                    poll_deregister(poll, selector->id);
-                    continue;
-                }
-
-                // ipc in
-                if (ev.filter == EVFILT_READ) {
-                    poll_result = _recv(poll, selector);
-                    if (poll_result == POLL_PENDING)
-                        continue;
-
-                    if (poll_result == POLL_ERROR) {
-                        poll_deregister(poll, selector->id);
-                        continue;
-                    }
-
-                    process_request(poll, selector);
-                }
-
-                // ipc out
-                else if (ev.filter == EVFILT_WRITE) {
-                    poll_result = _send(poll, selector);
-
-                    if (poll_result == POLL_ERROR)
-                        poll_deregister(poll, selector->id);
-                }
-            }
+        next_event:;
         }
     }
 
     return poll->code;
 }
 
-obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
-    poll_result_t poll_result = POLL_PENDING;
-    selector_p selector;
-    i32_t result;
-    i64_t idx;
-    obj_p res;
-    fd_set fds;
+option_t poll_block_on(poll_p poll, selector_p selector) {
+    option_t result;
+    fd_set readfds;
+    struct timeval timeout;
+    i64_t nbytes, ret;
 
-    idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
+    LOG_TRACE("Blocking on selector id: %lld, fd: %lld", selector->id, selector->fd);
 
-    if (idx == NULL_I64)
-        THROW(ERR_IO, "ipc_send_sync: invalid socket fd: %lld", id);
+    // Setup select
+    FD_ZERO(&readfds);
+    FD_SET(selector->fd, &readfds);
+    timeout.tv_sec = 0;
+    // timeout.tv_usec = 30000000;  // 30 seconds
+    timeout.tv_usec = 3000000;
 
-    selector = (selector_p)idx;
-
-    queue_push(selector->tx.queue, (nil_t *)((i64_t)msg | ((i64_t)MSG_TYPE_SYNC << 61)));
-
-    while (B8_TRUE) {
-        poll_result = _send(poll, selector);
-
-        if (poll_result != POLL_PENDING)
-            break;
-
-        // block on select until we can send
-        FD_ZERO(&fds);
-        FD_SET(selector->fd, &fds);
-        result = select(selector->fd + 1, NULL, &fds, NULL, NULL);
-
-        if (result == -1) {
-            if (errno != EINTR) {
-                poll_deregister(poll, selector->id);
-                return sys_error(ERROR_TYPE_OS, "ipc_send_sync: error sending message (can't block on send)");
-            }
+    // Perform the read operation
+    while (selector->rx.buf != NULL) {
+        // Wait for the file descriptor to become readable
+        ret = select(selector->fd + 1, &readfds, NULL, NULL, &timeout);
+        if (ret == -1) {
+            LOG_ERROR("select failed");
+            return option_error(sys_error(ERR_IO, "recv select failed"));
         }
-    }
 
-    if (poll_result == POLL_ERROR) {
-        poll_deregister(poll, selector->id);
-        return sys_error(ERROR_TYPE_OS, "ipc_send_sync: error sending message");
-    }
+        LOG_TRACE("select returned %lld", ret);
 
-recv:
-    while (B8_TRUE) {
-        poll_result = _recv(poll, selector);
+        if (ret == 0)
+            return option_error(sys_error(ERR_IO, "recv timeout"));
 
-        if (poll_result != POLL_PENDING)
-            break;
+        // In case we have a low level IO recv function, use it
+        if (selector->rx.buf != NULL && selector->rx.recv_fn != NULL) {
+            nbytes = poll_recv(poll, selector);
 
-        // block on select until we can recv
-        FD_ZERO(&fds);
-        FD_SET(selector->fd, &fds);
-        result = select(selector->fd + 1, &fds, NULL, NULL, NULL);
-
-        if (result == -1) {
-            if (errno != EINTR) {
+            if (nbytes == -1) {
                 poll_deregister(poll, selector->id);
-                return sys_error(ERROR_TYPE_OS, "ipc_send_sync: error receiving message (can't block on recv)");
+                return option_error(sys_error(ERR_IO, "recv failed"));
             }
+
+            if (nbytes == 0)
+                return option_none();
         }
+
+        if (selector->rx.read_fn != NULL)
+            result = selector->rx.read_fn(poll, selector);
+
+        if (option_is_error(&result)) {
+            poll_deregister(poll, selector->id);
+            return result;
+        }
+
+        if (option_is_some(&result) && result.value != NULL)
+            return result;
     }
 
-    if (poll_result == POLL_ERROR) {
-        poll_deregister(poll, selector->id);
-        return sys_error(ERROR_TYPE_OS, "ipc_send_sync: error receiving message");
-    }
+    LOG_DEBUG("empty buffer");
 
-    // recv until we get response
-    switch (selector->rx.msgtype) {
-        case MSG_TYPE_RESP:
-            res = read_obj(selector);
-            break;
-        default:
-            process_request(poll, selector);
-            goto recv;
-    }
-
-    return res;
-}
-
-obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg) {
-    i64_t idx;
-    selector_p selector;
-
-    idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
-
-    if (idx == NULL_I64)
-        THROW(ERR_IO, "ipc_send_sync: invalid socket fd: %lld", id);
-
-    selector = (selector_p)idx;
-    if (selector == NULL)
-        THROW(ERR_IO, "ipc_send_async: invalid socket fd: %lld", id);
-
-    queue_push(selector->tx.queue, (nil_t *)msg);
-
-    if (_send(poll, selector) == POLL_ERROR)
-        THROW(ERR_IO, "ipc_send_async: error sending message");
-
-    return NULL_OBJ;
+    return option_none();
 }

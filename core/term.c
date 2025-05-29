@@ -131,8 +131,8 @@ nil_t hist_destroy(hist_p hist) {
     heap_unmap(hist, sizeof(struct hist_t));
 }
 
-nil_t hist_add(hist_p hist, c8_t buf[], u64_t len) {
-    u64_t pos, size, index, last_len;
+nil_t hist_add(hist_p hist, c8_t buf[], i64_t len) {
+    i64_t pos, size, index, last_len;
 
     pos = hist->pos;
     hist->index = (pos > 0) ? pos - 1 : 0;
@@ -176,7 +176,7 @@ nil_t hist_add(hist_p hist, c8_t buf[], u64_t len) {
 }
 
 i64_t hist_prev(hist_p hist, c8_t buf[]) {
-    u64_t index = hist->index;
+    i64_t index = hist->index;
     i64_t len = 0;
 
     if (index == 0)
@@ -214,7 +214,7 @@ i64_t hist_prev(hist_p hist, c8_t buf[]) {
 }
 
 i64_t hist_next(hist_p hist, c8_t buf[]) {
-    u64_t index = hist->index;
+    i64_t index = hist->index;
     i64_t len = 0;
 
     // Skip current line if search direction was previous
@@ -246,7 +246,7 @@ i64_t hist_next(hist_p hist, c8_t buf[]) {
     return len;
 }
 
-i64_t hist_save_current(hist_p hist, c8_t buf[], u64_t len) {
+i64_t hist_save_current(hist_p hist, c8_t buf[], i64_t len) {
     if (hist->curr_saved == 1)
         return 0;
 
@@ -258,7 +258,7 @@ i64_t hist_save_current(hist_p hist, c8_t buf[], u64_t len) {
 }
 
 i64_t hist_restore_current(hist_p hist, c8_t buf[]) {
-    u64_t l;
+    i64_t l;
     l = hist->curr_len;
 
     if (hist->curr_saved == 0)
@@ -394,7 +394,8 @@ term_p term_create() {
 
 nil_t term_destroy(term_p term) {
     // Restore the terminal attributes
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &term->oldattr);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &term->oldattr) == -1)
+        perror("Failed to restore terminal attributes");
 
     hist_destroy(term->hist);
 
@@ -426,7 +427,7 @@ nil_t term_prompt(term_p term) {
 }
 
 i64_t term_redraw_into(term_p term, obj_p *dst) {
-    u64_t i, j, l, n, c;
+    i64_t i, j, l, n, c;
     str_p verb;
 
     n = prompt_fmt_into(dst);
@@ -533,7 +534,7 @@ i64_t term_redraw_into(term_p term, obj_p *dst) {
 }
 
 nil_t term_redraw(term_p term) {
-    u64_t n;
+    i64_t n;
     obj_p out = NULL_OBJ;
 
     term_redraw_into(term, &out);
@@ -554,7 +555,7 @@ nil_t term_redraw(term_p term) {
 }
 
 // Helper function to calculate display width of a UTF-8 character
-static u64_t utf8_char_width(const c8_t *str, u64_t pos) {
+static i64_t utf8_char_width(const c8_t *str, i64_t pos) {
     c8_t byte = str[pos];
 
     // ASCII character
@@ -573,7 +574,7 @@ static u64_t utf8_char_width(const c8_t *str, u64_t pos) {
 }
 
 // Helper function to find the start of the previous UTF-8 character
-static u64_t find_prev_utf8_char(const c8_t *str, u64_t pos) {
+static i64_t find_prev_utf8_char(const c8_t *str, i64_t pos) {
     if (pos == 0)
         return 0;
 
@@ -597,9 +598,9 @@ nil_t term_handle_backspace(term_p term) {
         return;
     else if (term->buf_pos == term->buf_len) {
         // Find the start of the previous UTF-8 character
-        u64_t prev_pos = find_prev_utf8_char(term->buf, term->buf_pos);
+        i64_t prev_pos = find_prev_utf8_char(term->buf, term->buf_pos);
         // Calculate display width of the character being removed
-        u64_t char_width = utf8_char_width(term->buf, prev_pos);
+        i64_t char_width = utf8_char_width(term->buf, prev_pos);
 
         term->buf_pos = prev_pos;
         term->buf[term->buf_pos] = '\0';
@@ -609,12 +610,12 @@ nil_t term_handle_backspace(term_p term) {
         cursor_move_left(char_width);
     } else {
         // Find the start of the previous UTF-8 character
-        u64_t prev_pos = find_prev_utf8_char(term->buf, term->buf_pos);
+        i64_t prev_pos = find_prev_utf8_char(term->buf, term->buf_pos);
         // Calculate display width of the character being removed
-        u64_t char_width = utf8_char_width(term->buf, prev_pos);
+        i64_t char_width = utf8_char_width(term->buf, prev_pos);
 
         // Calculate how many bytes to move
-        u64_t bytes_to_move = term->buf_len - term->buf_pos;
+        i64_t bytes_to_move = term->buf_len - term->buf_pos;
         memmove(term->buf + prev_pos, term->buf + term->buf_pos, bytes_to_move);
         term->buf_len -= (term->buf_pos - prev_pos);
         term->buf_pos = prev_pos;
@@ -632,8 +633,8 @@ nil_t autocp_idx_reset(autocp_idx_t *idx) {
     idx->sbidx = 0;
 }
 
-nil_t term_highlight_pos(term_p term, u64_t pos) {
-    u64_t n;
+nil_t term_highlight_pos(term_p term, i64_t pos) {
+    i64_t n;
 
     n = term->buf_pos - pos;
 
@@ -720,7 +721,7 @@ paren_t term_find_open_paren(term_p term) {
 }
 
 b8_t term_autocomplete_word(term_p term) {
-    u64_t l, n, len, pos, start, end;
+    i64_t l, n, len, pos, start, end;
     c8_t *tbuf, *hbuf;
     str_p word;
 
@@ -789,8 +790,8 @@ redraw:
     return B8_TRUE;
 }
 
-b8_t term_autocomplete_path(term_p term, u64_t start) {
-    u64_t i, l, n, m, end, len, path_len, prefix_len;
+b8_t term_autocomplete_path(term_p term, i64_t start) {
+    i64_t i, l, n, m, end, len, path_len, prefix_len;
     obj_p files;
     str_p last_slash, file;
     c8_t path[MAX_PATH_LEN], prefix[MAX_PATH_LEN], *hbuf, *tbuf;
@@ -928,7 +929,7 @@ obj_p term_handle_return(term_p term) {
 }
 
 obj_p term_handle_escape(term_p term) {
-    u64_t l;
+    i64_t l;
 
     // Up arrow esc
     if (IS_ESC(term, "\x1b[A")) {

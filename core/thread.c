@@ -94,7 +94,7 @@ ray_thread_t thread_self() {
     return t;
 }
 
-i32_t thread_pin(ray_thread_t thread, u64_t core) {
+i32_t thread_pin(ray_thread_t thread, i64_t core) {
     DWORD_PTR mask = 1ULL << core;
     if (SetThreadAffinityMask(thread.handle, mask) == 0) {
         return -1;
@@ -126,7 +126,7 @@ nil_t cond_destroy(cond_t *cond) { pthread_cond_destroy(&cond->inner); }
 
 i32_t cond_wait(cond_t *cond, mutex_t *mutex) { return pthread_cond_wait(&cond->inner, &mutex->inner); }
 
-i32_t cond_wait_timeout(cond_t *cond, mutex_t *mutex, u64_t timeout_ms) {
+i32_t cond_wait_timeout(cond_t *cond, mutex_t *mutex, i64_t timeout_ms) {
     struct timespec ts;
 
     // Get current time
@@ -172,7 +172,7 @@ ray_thread_t thread_self() {
 
 #if defined(OS_LINUX)
 
-i32_t thread_pin(ray_thread_t thread, u64_t core) {
+i32_t thread_pin(ray_thread_t thread, i64_t core) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core, &cpuset);
@@ -195,7 +195,7 @@ i32_t thread_pin(ray_thread_t thread, u64_t core) {
 
 #else
 
-i32_t thread_pin(ray_thread_t thread, u64_t core) {
+i32_t thread_pin(ray_thread_t thread, i64_t core) {
     UNUSED(thread);
     UNUSED(core);
     // thread_port_t mach_thread;

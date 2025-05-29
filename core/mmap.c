@@ -27,11 +27,11 @@
 
 #if defined(OS_WINDOWS)
 
-raw_p mmap_stack(u64_t size) { return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); }
+raw_p mmap_stack(i64_t size) { return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); }
 
-raw_p mmap_alloc(u64_t size) { return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); }
+raw_p mmap_alloc(i64_t size) { return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); }
 
-raw_p mmap_file(i64_t fd, raw_p addr, u64_t size, i64_t offset) {
+raw_p mmap_file(i64_t fd, raw_p addr, i64_t size, i64_t offset) {
     UNUSED(addr);  // Mark addr as intentionally unused on Windows
     HANDLE hMapping;
     raw_p ptr;
@@ -48,14 +48,14 @@ raw_p mmap_file(i64_t fd, raw_p addr, u64_t size, i64_t offset) {
     return ptr;
 }
 
-i64_t mmap_free(raw_p addr, u64_t size) {
+i64_t mmap_free(raw_p addr, i64_t size) {
     UNUSED(size);
     return VirtualFree(addr, 0, MEM_RELEASE);
 }
 
-i64_t mmap_sync(raw_p addr, u64_t size) { return FlushViewOfFile(addr, size); }
+i64_t mmap_sync(raw_p addr, i64_t size) { return FlushViewOfFile(addr, size); }
 
-raw_p mmap_reserve(raw_p addr, u64_t size) {
+raw_p mmap_reserve(raw_p addr, i64_t size) {
     raw_p ptr = VirtualAlloc(addr, size, MEM_RESERVE, PAGE_NOACCESS);
 
     if (ptr == NULL)
@@ -64,7 +64,7 @@ raw_p mmap_reserve(raw_p addr, u64_t size) {
     return ptr;
 }
 
-i64_t mmap_commit(raw_p addr, u64_t size) {
+i64_t mmap_commit(raw_p addr, i64_t size) {
     if (VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE) == NULL)
         return -1;
 
@@ -73,11 +73,11 @@ i64_t mmap_commit(raw_p addr, u64_t size) {
 
 #elif defined(OS_LINUX)
 
-raw_p mmap_stack(u64_t size) {
+raw_p mmap_stack(i64_t size) {
     return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE | MAP_STACK, -1, 0);
 }
 
-raw_p mmap_alloc(u64_t size) {
+raw_p mmap_alloc(i64_t size) {
     raw_p ptr;
 
     ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED | MAP_NONBLOCK | MAP_POPULATE, -1, 0);
@@ -88,7 +88,7 @@ raw_p mmap_alloc(u64_t size) {
     return ptr;
 }
 
-raw_p mmap_file(i64_t fd, raw_p addr, u64_t size, i64_t offset) {
+raw_p mmap_file(i64_t fd, raw_p addr, i64_t size, i64_t offset) {
     raw_p ptr = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NONBLOCK | MAP_POPULATE, fd, offset);
 
     if (ptr == MAP_FAILED)
@@ -97,11 +97,11 @@ raw_p mmap_file(i64_t fd, raw_p addr, u64_t size, i64_t offset) {
     return ptr;
 }
 
-i64_t mmap_free(raw_p addr, u64_t size) { return munmap(addr, size); }
+i64_t mmap_free(raw_p addr, i64_t size) { return munmap(addr, size); }
 
-i64_t mmap_sync(raw_p addr, u64_t size) { return msync(addr, size, MS_SYNC); }
+i64_t mmap_sync(raw_p addr, i64_t size) { return msync(addr, size, MS_SYNC); }
 
-raw_p mmap_reserve(raw_p addr, u64_t size) {
+raw_p mmap_reserve(raw_p addr, i64_t size) {
     raw_p ptr;
 
     ptr = mmap(addr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -112,18 +112,18 @@ raw_p mmap_reserve(raw_p addr, u64_t size) {
     return ptr;
 }
 
-i64_t mmap_commit(raw_p addr, u64_t size) { return mprotect(addr, size, PROT_READ | PROT_WRITE); }
+i64_t mmap_commit(raw_p addr, i64_t size) { return mprotect(addr, size, PROT_READ | PROT_WRITE); }
 
 #elif defined(OS_MACOS)
 
 #define MAP_ANON 0x1000
 #define MAP_ANONYMOUS MAP_ANON
 
-raw_p mmap_stack(u64_t size) {
+raw_p mmap_stack(i64_t size) {
     return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
 }
 
-raw_p mmap_alloc(u64_t size) {
+raw_p mmap_alloc(i64_t size) {
     raw_p ptr;
 
     ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
@@ -134,7 +134,7 @@ raw_p mmap_alloc(u64_t size) {
     return ptr;
 }
 
-raw_p mmap_file(i64_t fd, raw_p addr, u64_t size, i64_t offset) {
+raw_p mmap_file(i64_t fd, raw_p addr, i64_t size, i64_t offset) {
     raw_p ptr;
 
     ptr = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
@@ -145,11 +145,11 @@ raw_p mmap_file(i64_t fd, raw_p addr, u64_t size, i64_t offset) {
     return ptr;
 }
 
-i64_t mmap_free(raw_p addr, u64_t size) { return munmap(addr, size); }
+i64_t mmap_free(raw_p addr, i64_t size) { return munmap(addr, size); }
 
-i64_t mmap_sync(raw_p addr, u64_t size) { return msync(addr, size, MS_SYNC); }
+i64_t mmap_sync(raw_p addr, i64_t size) { return msync(addr, size, MS_SYNC); }
 
-raw_p mmap_reserve(raw_p addr, u64_t size) {
+raw_p mmap_reserve(raw_p addr, i64_t size) {
     raw_p ptr;
 
     ptr = mmap(addr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -160,6 +160,6 @@ raw_p mmap_reserve(raw_p addr, u64_t size) {
     return ptr;
 }
 
-i64_t mmap_commit(raw_p addr, u64_t size) { return mprotect(addr, size, PROT_READ | PROT_WRITE); }
+i64_t mmap_commit(raw_p addr, i64_t size) { return mprotect(addr, size, PROT_READ | PROT_WRITE); }
 
 #endif

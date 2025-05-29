@@ -55,11 +55,11 @@ i64_t fs_fwrite(i64_t fd, str_p buf, i64_t size);
 i64_t fs_file_extend(i64_t fd, i64_t size);
 i64_t fs_ftruncate(i64_t fd, i64_t size);
 i64_t fs_fclose(i64_t fd);
-i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], u64_t len);
+i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], i64_t len);
 i64_t fs_dcreate(lit_p path);
 i64_t fs_dopen(lit_p path);
 i64_t fs_dclose(i64_t fd);
 obj_p fs_read_dir(lit_p path);
-u64_t fs_filename(lit_p path, lit_p *name);
+i64_t fs_filename(lit_p path, lit_p *name);
 
 #endif  // FS_H

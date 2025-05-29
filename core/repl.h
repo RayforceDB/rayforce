@@ -1,5 +1,5 @@
 /*
- *   Copyright (c) 2023 Anton Kundenko <singaraiona@gmail.com>
+ *   Copyright (c) 2025 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
 
  *   Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -21,21 +21,24 @@
  *   SOFTWARE.
  */
 
-#ifndef QUEUE_H
-#define QUEUE_H
+#ifndef REPL_H
+#define REPL_H
 
 #include "rayforce.h"
+#include "poll.h"
+#include "term.h"
 
-typedef struct queue_t {
-    i64_t size;
-    i64_t head;
-    i64_t tail;
-    raw_p *data;
-} *queue_p;
+typedef struct repl_t {
+    i64_t id;
+    obj_p name;
+    term_p term;
+} *repl_p;
 
-queue_p queue_create(i64_t size);
-nil_t queue_free(queue_p queue);
-nil_t queue_push(queue_p queue, raw_p val);
-raw_p queue_pop(queue_p queue);
+repl_p repl_create(poll_p poll);
+nil_t repl_destroy(repl_p repl);
 
-#endif  // QUEUE_H
+nil_t repl_on_open(poll_p poll, selector_p selector);
+nil_t repl_on_close(poll_p poll, selector_p selector);
+nil_t repl_on_error(poll_p poll, selector_p selector);
+
+#endif  // REPL_H

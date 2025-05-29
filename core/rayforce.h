@@ -135,9 +135,9 @@ typedef u8_t guid_t[16];
 #define NULL_I32 ((i32_t)0x80000000)
 #define NULL_I64 ((i64_t)0x8000000000000000LL)
 #define NULL_F64 ((f64_t)(0 / 0.0))
-#define MAX_I32 ((i32_t)0x7FFFFFFF)
-#define MAX_I64 ((i64_t)0x7FFFFFFFFFFFFFFFLL)
-#define MAX_U64 ((u64_t)0xFFFFFFFFFFFFFFFFULL)
+#define INF_I32 ((i32_t)0x7FFFFFFF)
+#define INF_I64 ((i64_t)0x7FFFFFFFFFFFFFFFLL)
+#define INF_U64 ((u64_t)0xFFFFFFFFFFFFFFFFULL)
 #define B8_TRUE (char)1
 #define B8_FALSE (char)0
 
@@ -164,8 +164,8 @@ typedef struct obj_t {
         f64_t f64;
         struct obj_t *obj;
         struct {
-            u64_t len;
-            i8_t arr[];
+            i64_t len;
+            i8_t raw[];
         };
     };
 } *obj_p;
@@ -181,11 +181,11 @@ extern u8_t version(nil_t);  // get version as u8_t (major - 5 bits, minor - 3 b
 
 // Constructors
 extern obj_p null(i8_t type);                  // create null atom of type
-extern obj_p nullv(i8_t type, u64_t len);      // create null list of type and length
+extern obj_p nullv(i8_t type, i64_t len);      // create null list of type and length
 extern obj_p atom(i8_t type);                  // create atom of type
-extern obj_p vn_list(u64_t len, ...);          // create list from values
-extern obj_p vector(i8_t type, u64_t len);     // create vector of type
-extern obj_p vn_symbol(u64_t len, ...);        // create vector symbols from strings
+extern obj_p vn_list(i64_t len, ...);          // create list from values
+extern obj_p vector(i8_t type, i64_t len);     // create vector of type
+extern obj_p vn_symbol(i64_t len, ...);        // create vector symbols from strings
 extern obj_p b8(b8_t val);                     // bool atom
 extern obj_p u8(u8_t val);                     // byte atom
 extern obj_p c8(c8_t c);                       // char
@@ -193,7 +193,7 @@ extern obj_p i16(i16_t val);                   // i16 atom
 extern obj_p i32(i32_t val);                   // i32 atom
 extern obj_p i64(i64_t val);                   // i64 atom
 extern obj_p f64(f64_t val);                   // f64 atom
-extern obj_p symbol(lit_p ptr, u64_t len);     // symbol
+extern obj_p symbol(lit_p ptr, i64_t len);     // symbol
 extern obj_p symboli64(i64_t id);              // symbol from i64
 extern obj_p adate(i32_t val);                 // date
 extern obj_p atime(i32_t val);                 // time
@@ -234,7 +234,7 @@ extern nil_t drop_obj(obj_p obj);  // Free an object
 extern nil_t drop_raw(raw_p ptr);  // Free a raw pointer
 
 // Accessors
-#define AS_C8(obj) ((str_p)__builtin_assume_aligned((obj + 1), sizeof(struct obj_t)))
+#define AS_C8(obj) ((str_p)(obj + 1))
 #define AS_B8(obj) ((b8_t *)(AS_C8(obj)))
 #define AS_I8(obj) ((i8_t *)(AS_C8(obj)))
 #define AS_U8(obj) ((u8_t *)(AS_C8(obj)))
@@ -270,7 +270,7 @@ extern obj_p diverse_obj(obj_p *obj);  // Diverse object to a list
 // Pop a value from the end of a list
 extern obj_p pop_obj(obj_p *obj);                             // pop object from a list
 extern obj_p remove_idx(obj_p *obj, i64_t idx);               // remove value from a obj by index
-extern obj_p remove_ids(obj_p *obj, i64_t ids[], u64_t len);  // remove value from a obj by indices
+extern obj_p remove_ids(obj_p *obj, i64_t ids[], i64_t len);  // remove value from a obj by indices
 extern obj_p remove_obj(obj_p *obj, obj_p idx);               // remove value from a obj by obj
 
 // Insert a value into a list by an index (doesn't call a drop)
@@ -280,9 +280,9 @@ extern obj_p ins_sym(obj_p *obj, i64_t idx, lit_p str);  // write interned strin
 
 // Read
 extern obj_p at_idx(obj_p obj, i64_t idx);               // read value from an obj at index
-extern obj_p at_ids(obj_p obj, i64_t ids[], u64_t len);  // read values from an obj at indexes
+extern obj_p at_ids(obj_p obj, i64_t ids[], i64_t len);  // read values from an obj at indexes
 extern obj_p at_obj(obj_p obj, obj_p idx);               // read from obj indexed by obj
-extern obj_p at_sym(obj_p obj, lit_p str, u64_t len);    // read value indexed by symbol created from str
+extern obj_p at_sym(obj_p obj, lit_p str, i64_t len);    // read value indexed by symbol created from str
 
 // Format
 extern str_p str_from_symbol(i64_t id);  // return interned string by interned id
@@ -292,7 +292,7 @@ extern nil_t zero_obj(obj_p obj);
 
 // Set
 extern obj_p set_idx(obj_p *obj, i64_t idx, obj_p val);                // set obj at index
-extern obj_p set_ids(obj_p *obj, i64_t ids[], u64_t len, obj_p vals);  // set obj at indexes
+extern obj_p set_ids(obj_p *obj, i64_t ids[], i64_t len, obj_p vals);  // set obj at indexes
 extern obj_p set_obj(obj_p *obj, obj_p idx, obj_p val);                // set obj indexed by obj
 
 // Sync
@@ -300,7 +300,7 @@ extern b8_t rc_sync_get();          // get reference counting synchronization st
 extern nil_t rc_sync_set(b8_t on);  // turn on/off reference counting synchronization
 
 // Resize
-extern obj_p resize_obj(obj_p *obj, u64_t len);
+extern obj_p resize_obj(obj_p *obj, i64_t len);
 
 // Search
 extern i64_t find_raw(obj_p obj, raw_p val);      // find raw value in a list, return index (obj->len if not found)

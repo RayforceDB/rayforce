@@ -82,7 +82,7 @@ nil_t dump_stack(nil_t) {
 
 nil_t dump_stack(nil_t) {
     raw_p array[10];  // Array to store the backtrace addresses
-    u64_t i, size;
+    i64_t i, size;
     str_p *strings;
 
     size = backtrace(array, 10);               // Capture the backtrace
@@ -114,7 +114,7 @@ u32_t next_power_of_two_u32(u32_t n) {
     return 1 << (32 - __builtin_clzl(n));
 }
 
-u64_t next_power_of_two_u64(u64_t n) {
+i64_t next_power_of_two_u64(i64_t n) {
     if (n == 0)
         return 1;
     // If n is already a power of 2

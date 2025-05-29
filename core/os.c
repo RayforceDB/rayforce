@@ -35,7 +35,7 @@
 #include <unistd.h>
 #endif
 
-i64_t os_get_var(lit_p name, c8_t buf[], u64_t len) {
+i64_t os_get_var(lit_p name, c8_t buf[], i64_t len) {
     if (!name || !buf || len == 0) {
         fprintf(stderr, "Invalid arguments.\n");
         return -1;
@@ -53,7 +53,7 @@ i64_t os_get_var(lit_p name, c8_t buf[], u64_t len) {
     const char* value = getenv(name);
     if (!value)
         return -1;
-    if (strlen(value) >= len) {
+    if (strlen(value) >= (u64_t)len) {
         fprintf(stderr, "Buffer too small for environment variable '%s'.\n", name);
         return -1;
     }

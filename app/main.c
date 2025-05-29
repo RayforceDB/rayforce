@@ -44,7 +44,12 @@ nil_t print_logo(sys_info_t *info) {
 i32_t main(i32_t argc, str_p argv[]) {
     i32_t code = -1;
     sys_info_t *info;
-    runtime_create(argc, argv);
+    runtime_p runtime;
+
+    runtime = runtime_create(argc, argv);
+    if (runtime == NULL)
+        return -1;
+
     info = &runtime_get()->sys_info;
     print_logo(info);
     code = runtime_run();

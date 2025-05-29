@@ -8,14 +8,14 @@ Serialization is the process of converting nearly any Rayforce datatypes into a 
 Each serialized object starts with a 16-byte header:
 
 ```c
-typedef struct header_t
+typedef struct ipc_header_t
 {
     u32_t prefix;     // Magic number (0xRAF0) to identify Rayforce serialized data
     u8_t  version;    // Serialization format version (current: 1)
     u8_t  flags;      // Additional flags for special handling (compression, encryption)
     u16_t reserved;   // Reserved for future use (must be 0)
-    u64_t size;       // Total size of the payload in bytes
-} header_t;
+    i64_t size;       // Total size of the payload in bytes
+} ipc_header_t;
 ```
 
 ### Type Identifier (1 byte)

@@ -63,7 +63,7 @@ nil_t error_add_loc(obj_p err, i64_t id, ctx_p ctx) {
         push_raw(&AS_ERROR(err)->locs, &loc);
 }
 
-interpreter_p interpreter_create(u64_t id) {
+interpreter_p interpreter_create(i64_t id) {
     interpreter_p interpreter;
     obj_p f;
 
@@ -106,7 +106,7 @@ nil_t interpreter_destroy(nil_t) {
 
 interpreter_p interpreter_current(nil_t) { return __INTERPRETER; }
 
-obj_p call(obj_p obj, u64_t arity) {
+obj_p call(obj_p obj, i64_t arity) {
     lambda_p lambda;
     ctx_p ctx;
     obj_p res;
@@ -136,7 +136,7 @@ obj_p call(obj_p obj, u64_t arity) {
 }
 
 __attribute__((hot)) obj_p eval(obj_p obj) {
-    u64_t len, i;
+    i64_t len, i;
     obj_p car, *val, *args, x, y, z, res;
     lambda_p lambda;
 
@@ -335,7 +335,7 @@ obj_p amend(obj_p sym, obj_p val) {
 }
 
 obj_p mount_env(obj_p obj) {
-    u64_t i, l1, l2, l;
+    i64_t i, l1, l2, l;
     obj_p *env;
     obj_p lambda, keys, vals;
     i64_t bp;
@@ -375,11 +375,11 @@ obj_p mount_env(obj_p obj) {
     return NULL_OBJ;
 }
 
-obj_p unmount_env(u64_t n) {
+obj_p unmount_env(i64_t n) {
     obj_p *env;
     obj_p lambda;
     i64_t bp;
-    u64_t i, l;
+    i64_t i, l;
     ctx_p ctx;
 
     ctx = ctx_get();
@@ -405,7 +405,7 @@ obj_p unmount_env(u64_t n) {
     return NULL_OBJ;
 }
 
-obj_p ray_return(obj_p *x, u64_t n) {
+obj_p ray_return(obj_p *x, i64_t n) {
     if (__INTERPRETER->cp == 1)
         THROW(ERR_NOT_SUPPORTED, "return outside of function");
 
@@ -446,7 +446,7 @@ obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file) {
         THROW(ERR_TYPE, "parse: expected string, got %s", type_name(str->type));
 
     info = nfo(clone_obj(file), clone_obj(str));
-    res = parse(AS_C8(str), info);
+    res = parse(AS_C8(str), str->len, info);
     drop_obj(info);
 
     return res;
@@ -479,29 +479,25 @@ obj_p eval_obj(obj_p obj) {
     return res;
 }
 
-obj_p ray_eval_str(obj_p str, obj_p file) {
-    obj_p parsed, res, info, fn;
+obj_p eval_str_w_attr(lit_p str, i64_t len, obj_p nfo) {
+    obj_p parsed, res, fn;
     ctx_p ctx;
     i64_t sp;
 
-    if (str->type != TYPE_C8)
-        THROW(ERR_TYPE, "eval: expected string, got %s", type_name(str->type));
-
-    info = nfo(clone_obj(file), clone_obj(str));
-
     timeit_reset();
     timeit_span_start("top-level");
-    parsed = parse(AS_C8(str), info);
+
+    parsed = parse(str, len, nfo);
     timeit_tick("parse");
 
     if (IS_ERR(parsed)) {
-        drop_obj(info);
+        drop_obj(nfo);
         return parsed;
     }
 
     sp = __INTERPRETER->sp;
     stack_push(NULL_OBJ);  // null env
-    fn = lambda(NULL_OBJ, NULL_OBJ, info);
+    fn = lambda(NULL_OBJ, NULL_OBJ, nfo);
 
     ctx = ctx_push(fn);
     ctx->sp = sp;
@@ -520,6 +516,19 @@ obj_p ray_eval_str(obj_p str, obj_p file) {
     timeit_span_end("top-level");
 
     return res;
+}
+
+obj_p eval_str(lit_p str) { return eval_str_w_attr(str, strlen(str), NULL_OBJ); }
+
+obj_p ray_eval_str(obj_p str, obj_p file) {
+    obj_p info;
+
+    if (str->type != TYPE_C8)
+        THROW(ERR_TYPE, "eval: expected string, got %s", type_name(str->type));
+
+    info = (file != NULL && file != NULL_OBJ) ? nfo(clone_obj(file), clone_obj(str)) : NULL_OBJ;
+
+    return eval_str_w_attr(AS_C8(str), str->len, info);
 }
 
 obj_p try_obj(obj_p obj, obj_p ctch) {
@@ -592,7 +601,7 @@ obj_p try_obj(obj_p obj, obj_p ctch) {
 
 obj_p interpreter_env_get(nil_t) {
     obj_p lambda, env;
-    u64_t l;
+    i64_t l;
     ctx_p ctx;
 
     ctx = ctx_get();
@@ -611,7 +620,7 @@ nil_t interpreter_env_unset(interpreter_p interpreter) { drop_obj(interpreter->s
 obj_p *resolve(i64_t sym) {
     i64_t j, bp, *args;
     obj_p lambda, env;
-    u64_t i, l, n;
+    i64_t i, l, n;
     ctx_p ctx;
 
     ctx = ctx_get();
@@ -651,7 +660,7 @@ obj_p *resolve(i64_t sym) {
     return &AS_LIST(AS_LIST(runtime_get()->env.variables)[1])[j];
 }
 
-obj_p ray_exit(obj_p *x, u64_t n) {
+obj_p ray_exit(obj_p *x, i64_t n) {
     i64_t code;
 
     if (n == 0)
@@ -667,3 +676,5 @@ obj_p ray_exit(obj_p *x, u64_t n) {
 
     __builtin_unreachable();
 }
+
+b8_t ray_is_main_thread(nil_t) { return heap_get()->id == 0; }

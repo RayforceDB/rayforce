@@ -28,7 +28,7 @@
 
 #define AVAIL_MASK ((u64_t)0xffffffffffffffff)
 #define MIN_BLOCK_ORDER 5   // 2^5 = 32B
-#define MAX_BLOCK_ORDER 26  // 2^26 = 64MB
+#define MAX_BLOCK_ORDER 25  // 2^25 = 32MB
 #define MAX_POOL_ORDER 38   // 2^38 = 256GB
 
 // Memory modes
@@ -38,9 +38,9 @@
 #define MMOD_EXTERNAL_SERIALIZED 0xfa
 
 typedef struct memstat_t {
-    u64_t system;  // system memory used
-    u64_t heap;    // total heap memory
-    u64_t free;    // free heap memory
+    i64_t system;  // system memory used
+    i64_t heap;    // total heap memory
+    i64_t free;    // free heap memory
 } memstat_t;
 
 typedef struct block_t {
@@ -57,23 +57,23 @@ typedef struct block_t {
 } *block_p;
 
 typedef struct heap_t {
-    u64_t id;
+    i64_t id;
     block_p freelist[MAX_POOL_ORDER + 2];  // free list of blocks by order
-    u64_t avail;                           // mask of available blocks by order
+    i64_t avail;                           // mask of available blocks by order
     block_p foreign_blocks;                // foreign blocks (to be freed by the owner)
     block_p backed_blocks;                 // backed blocks (to be unmapped)
     memstat_t memstat;
 } *heap_p;
 
-heap_p heap_create(u64_t id);
+heap_p heap_create(i64_t id);
 nil_t heap_destroy(nil_t);
 heap_p heap_get(nil_t);
-raw_p heap_mmap(u64_t size);
-raw_p heap_stack(u64_t size);
-raw_p heap_alloc(u64_t size);
-raw_p heap_realloc(raw_p ptr, u64_t size);
+raw_p heap_mmap(i64_t size);
+raw_p heap_stack(i64_t size);
+raw_p heap_alloc(i64_t size);
+raw_p heap_realloc(raw_p ptr, i64_t size);
 nil_t heap_free(raw_p ptr);
-nil_t heap_unmap(raw_p ptr, u64_t size);
+nil_t heap_unmap(raw_p ptr, i64_t size);
 i64_t heap_gc(nil_t);
 nil_t heap_borrow(heap_p heap);
 nil_t heap_merge(heap_p heap);

@@ -27,12 +27,12 @@
 #include "rayforce.h"
 
 typedef struct progress_t {
-    u64_t parts;
-    u64_t completed;
+    i64_t parts;
+    i64_t completed;
 } *progress_p;
 
-nil_t progress_init(progress_p progress, u64_t parts);
-nil_t progress_tick(progress_p progress, u64_t parts, str_p label);
+nil_t progress_init(progress_p progress, i64_t parts);
+nil_t progress_tick(progress_p progress, i64_t parts, str_p label);
 nil_t progress_finalize(progress_p progress);
 
 #endif  // PROGRESS_H

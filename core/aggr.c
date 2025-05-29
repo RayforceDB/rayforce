@@ -38,7 +38,7 @@
 
 #define AGGR_ITER(index, len, offset, val, res, incoerse, outcoerse, ini, aggr)      \
     ({                                                                               \
-        u64_t $i, $x, $y, $n;                                                        \
+        i64_t $i, $x, $y, $n;                                                        \
         i64_t *group_ids, *source, *filter, shift;                                   \
         index_type_t index_type;                                                     \
         incoerse##_t *$in;                                                           \
@@ -97,7 +97,7 @@
 
 #define AGGR_COLLECT(parts, groups, incoerse, outcoerse, aggr) \
     ({                                                         \
-        u64_t $x, $y, $i, $j, $l;                              \
+        i64_t $x, $y, $i, $j, $l;                              \
         incoerse##_t *$in;                                     \
         outcoerse##_t *$out;                                   \
         obj_p $res;                                            \
@@ -117,7 +117,7 @@
 
 #define PARTED_MAP(groups, val, index, preaggr, incoerse, outcoerse, postaggr)                        \
     ({                                                                                                \
-        u64_t $$i, $$j, $$l;                                                                          \
+        i64_t $$i, $$j, $$l;                                                                          \
         obj_p $$parts, $$res, $$filter, $$v;                                                          \
         $$l = val->len;                                                                               \
         $$filter = index_group_filter(index);                                                         \
@@ -136,7 +136,7 @@
 
 obj_p aggr_map(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
     pool_p pool = runtime_get()->pool;
-    u64_t i, l, n, group_count, group_len, out_len, chunk;
+    i64_t i, l, n, group_count, group_len, out_len, chunk;
     obj_p res;
     index_type_t index_type;
     raw_p argv[6];
@@ -180,7 +180,7 @@ nil_t destroy_partial_result(obj_p res) {
 }
 
 obj_p aggr_first_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg5) {
-    u64_t len = (u64_t)arg1, offset = (u64_t)arg2;
+    i64_t len = (i64_t)arg1, offset = (i64_t)arg2;
     obj_p val = (obj_p)arg3, index = (obj_p)arg4, res = (obj_p)arg5;
 
     switch (val->type) {
@@ -193,7 +193,7 @@ obj_p aggr_first_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p a
             return res;
         case TYPE_F64:
             AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = NULL_F64,
-                      if (ops_is_nan($out[$y])) $out[$y] = $in[$x]);
+                      if (ISNANF64($out[$y])) $out[$y] = $in[$x]);
             return res;
         case TYPE_GUID:
             AGGR_ITER(index, len, offset, val, res, guid, guid, memset($out[$y], 0, sizeof(guid_t)),
@@ -210,7 +210,7 @@ obj_p aggr_first_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p a
 }
 
 obj_p aggr_first(obj_p val, obj_p index) {
-    u64_t i, j, n, l;
+    i64_t i, j, n, l;
     i64_t *xo, *xe;
     obj_p parts, res, ek, filter, sym;
 
@@ -258,7 +258,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
             parts = aggr_map((raw_p)aggr_first_partial, val, val->type, index);
             if (IS_ERR(parts))
                 return parts;
-            res = AGGR_COLLECT(parts, n, f64, f64, if (ops_is_nan($out[$y])) $out[$y] = $in[$x]);
+            res = AGGR_COLLECT(parts, n, f64, f64, if (ISNANF64($out[$y])) $out[$y] = $in[$x]);
             drop_obj(parts);
             return res;
         case TYPE_GUID:
@@ -311,7 +311,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
             return res;
         case TYPE_PARTEDF64:
             return PARTED_MAP(n, val, index, (raw_p)aggr_first_partial, f64, f64,
-                              if (ops_is_nan($out[$y])) $out[$y] = $in[$x]);
+                              if (ISNANF64($out[$y])) $out[$y] = $in[$x]);
         case TYPE_PARTEDGUID:
             return PARTED_MAP(n, val, index, (raw_p)aggr_first_partial, guid, guid,
                               if (memcmp($out[$y], NULL_GUID, sizeof(guid_t)) == 0)
@@ -336,7 +336,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
 }
 
 obj_p aggr_last_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg5) {
-    u64_t len = (u64_t)arg1, offset = (u64_t)arg2;
+    i64_t len = (i64_t)arg1, offset = (i64_t)arg2;
     obj_p val = (obj_p)arg3, index = (obj_p)arg4, res = (obj_p)arg5;
 
     switch (val->type) {
@@ -349,7 +349,7 @@ obj_p aggr_last_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p ar
             return res;
         case TYPE_F64:
             AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = NULL_F64,
-                      if (!ops_is_nan($in[$x])) $out[$y] = $in[$x]);
+                      if (!ISNANF64($in[$x])) $out[$y] = $in[$x]);
             return res;
         case TYPE_GUID:
             AGGR_ITER(index, len, offset, val, res, guid, guid, memset($out[$y], 0, sizeof(guid_t)),
@@ -369,7 +369,7 @@ obj_p aggr_last_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p ar
 }
 
 obj_p aggr_last(obj_p val, obj_p index) {
-    u64_t i, n;
+    i64_t i, n;
     i64_t *xo, *xe;
     obj_p parts, res, ek, sym;
 
@@ -414,7 +414,7 @@ obj_p aggr_last(obj_p val, obj_p index) {
             parts = aggr_map((raw_p)aggr_last_partial, val, val->type, index);
             if (IS_ERR(parts))
                 return parts;
-            res = AGGR_COLLECT(parts, n, f64, f64, if (ops_is_nan($out[$y])) $out[$y] = $in[$x]);
+            res = AGGR_COLLECT(parts, n, f64, f64, if (ISNANF64($out[$y])) $out[$y] = $in[$x]);
             drop_obj(parts);
             return res;
         case TYPE_GUID:
@@ -444,7 +444,7 @@ obj_p aggr_last(obj_p val, obj_p index) {
 }
 
 obj_p aggr_sum_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg5) {
-    u64_t len = (u64_t)arg1, offset = (u64_t)arg2;
+    i64_t len = (i64_t)arg1, offset = (i64_t)arg2;
     obj_p val = (obj_p)arg3, index = (obj_p)arg4, res = (obj_p)arg5;
 
     switch (val->type) {
@@ -461,7 +461,7 @@ obj_p aggr_sum_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
 }
 
 obj_p aggr_sum(obj_p val, obj_p index) {
-    u64_t n;
+    i64_t n;
     obj_p parts, res;
 
     n = index_group_count(index);
@@ -491,7 +491,7 @@ obj_p aggr_sum(obj_p val, obj_p index) {
 }
 
 obj_p aggr_max_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg5) {
-    u64_t len = (u64_t)arg1, offset = (u64_t)arg2;
+    i64_t len = (i64_t)arg1, offset = (i64_t)arg2;
     obj_p val = (obj_p)arg3, index = (obj_p)arg4, res = (obj_p)arg5;
 
     switch (val->type) {
@@ -509,7 +509,7 @@ obj_p aggr_max_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
 }
 
 obj_p aggr_max(obj_p val, obj_p index) {
-    u64_t n;
+    i64_t n;
     obj_p parts, res;
 
     n = index_group_count(index);
@@ -539,7 +539,7 @@ obj_p aggr_max(obj_p val, obj_p index) {
 }
 
 obj_p aggr_min_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg5) {
-    u64_t len = (u64_t)arg1, offset = (u64_t)arg2;
+    i64_t len = (i64_t)arg1, offset = (i64_t)arg2;
     obj_p val = (obj_p)arg3, index = (obj_p)arg4, res = (obj_p)arg5;
 
     switch (val->type) {
@@ -558,7 +558,7 @@ obj_p aggr_min_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
 }
 
 obj_p aggr_min(obj_p val, obj_p index) {
-    u64_t n;
+    i64_t n;
     obj_p parts, res;
 
     n = index_group_count(index);
@@ -581,7 +581,7 @@ obj_p aggr_min(obj_p val, obj_p index) {
 }
 
 obj_p aggr_count_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg5) {
-    u64_t len = (u64_t)arg1, offset = (u64_t)arg2;
+    i64_t len = (i64_t)arg1, offset = (i64_t)arg2;
     obj_p val = (obj_p)arg3, index = (obj_p)arg4, res = (obj_p)arg5;
 
     UNUSED(val);
@@ -622,7 +622,7 @@ obj_p aggr_count_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p a
 }
 
 obj_p aggr_count(obj_p val, obj_p index) {
-    u64_t n;
+    i64_t n;
     obj_p parts, res;
 
     n = index_group_count(index);
@@ -636,7 +636,7 @@ obj_p aggr_count(obj_p val, obj_p index) {
 }
 
 obj_p aggr_avg(obj_p val, obj_p index) {
-    u64_t i, l;
+    i64_t i, l;
     i64_t *xi, *ci;
     f64_t *xf, *fo;
     obj_p res, sums, cnts;
@@ -707,7 +707,7 @@ obj_p aggr_dev(obj_p val, obj_p index) {
 }
 
 obj_p aggr_collect(obj_p val, obj_p index) {
-    u64_t l, m, n;
+    i64_t l, m, n;
     i64_t *cnts;
     obj_p cnt, k, v, res;
 
@@ -799,7 +799,7 @@ obj_p aggr_collect(obj_p val, obj_p index) {
 }
 
 obj_p aggr_row_index(obj_p val, obj_p index) {
-    u64_t l, m, n;
+    i64_t l, m, n;
     i64_t *cnts;
     obj_p cnt, res;
 
