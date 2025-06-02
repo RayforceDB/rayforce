@@ -490,9 +490,8 @@ obj_p specify_number(parser_t *parser, const char *current, span_t span, obj_p n
 }
 
 obj_p parse_number(parser_t *parser) {
-    const char *end;
     u8_t num_u8;
-    i64_t num_i64;
+    i64_t r, num_i64;
     f64_t num_f64;
     obj_p num;
     span_t span = span_start(parser);
@@ -500,41 +499,34 @@ obj_p parse_number(parser_t *parser) {
 
     errno = 0;
 
-    if (remaining >= 2 && *parser->current == '0' && (*(parser->current + 1) == 'x')) {
-        num_i64 = strtoll(parser->current + 2, (char **)&end, 16);
-        if (end > parser->input + parser->input_len) {
-            end = parser->input + parser->input_len;
-        }
-        if (num_i64 > 255) {
-            span.end_column += (end - parser->current);
-            nfo_insert(parser->nfo, parser->count, span);
-            return parse_error(parser, parser->count++, str_fmt(-1, "Number is out of range"));
-        }
-        num_u8 = (u8_t)num_i64;
-        shift(parser, end - parser->current);
-        span_extend(parser, &span);
-        num = u8(num_u8);
-        nfo_insert(parser->nfo, (i64_t)num, span);
+    // if (remaining >= 2 && *parser->current == '0' && (*(parser->current + 1) == 'x')) {
+    //     num_i64 = strtoll(parser->current + 2, (char **)&end, 16);
+    //     if (end > parser->input + parser->input_len) {
+    //         end = parser->input + parser->input_len;
+    //     }
+    //     if (num_i64 > 255) {
+    //         span.end_column += (end - parser->current);
+    //         nfo_insert(parser->nfo, parser->count, span);
+    //         return parse_error(parser, parser->count++, str_fmt(-1, "Number is out of range"));
+    //     }
+    //     num_u8 = (u8_t)num_i64;
+    //     shift(parser, end - parser->current);
+    //     span_extend(parser, &span);
+    //     num = u8(num_u8);
+    //     nfo_insert(parser->nfo, (i64_t)num, span);
 
-        return num;
-    }
+    //     return num;
+    // }
 
-    num_i64 = strtoll(parser->current, (char **)&end, 10);
-    if (end > parser->input + parser->input_len) {
-        end = parser->input + parser->input_len;
-    }
-
-    if ((num_i64 == LONG_MAX || num_i64 == LONG_MIN) && errno == ERANGE) {
-        span.end_column += (end - parser->current - 1);
-        nfo_insert(parser->nfo, parser->count, span);
-        return parse_error(parser, parser->count++, str_fmt(-1, "Number is out of range"));
-    }
-
-    if (end == parser->current)
-        return error_str(ERR_PARSE, "Invalid number");
+    r = i64_from_str(parser->current, remaining, &num_i64);
+    printf("num: %lld, r: %lld, remaining: %lld\n", num_i64, r, remaining);
+    remaining -= r;
+    // if we parsed a number, and the next character is not a dot, then we can specify the number
+    if (r > 0 && *(parser->current + r) != '.')
+        return specify_number(parser, parser->current, span, i64(num_i64));
 
     // try double instead
-    if (*end == '.') {
+    if (remaining >= 1 && *(parser->current + r) == '.') {
         num_f64 = strtod(parser->current, (char **)&end);
         if (end > parser->input + parser->input_len) {
             end = parser->input + parser->input_len;

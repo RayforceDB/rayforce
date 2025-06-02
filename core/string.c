@@ -92,33 +92,38 @@ i32_t i32_from_str(lit_p str, i64_t len) {
     return result * sign;
 }
 
-i64_t i64_from_str(lit_p str, i64_t len) {
-    i64_t result = 0, sign = 1;
+i64_t i64_from_str(lit_p src, i64_t len, i64_t *dst) {
+    i64_t result = 0, sign = 1, n;
+    lit_p end;
+
+    *dst = NULL_I64;
+    end = src;
 
     if (len == 0)
-        return NULL_I64;
+        return 0;
 
     // Skip leading whitespace
-    while (IS_SPACE(*str))
-        str++;
+    while (IS_SPACE(*end))
+        end++;
 
     // Handle optional sign
-    if (*str == '-') {
+    if (*end == '-') {
         sign = -1;
-        str++;
+        end++;
     }
 
     // Parse the digits
-    while (len > 0 && is_digit(*str)) {
-        result = result * 10 + (*str - '0');
-        str++;
-        len--;
-    }
+    len -= end - src;
+    for (n = 0; n < len && is_digit(end[n]); n++)
+        result = result * 10 + (end[n] - '0');
 
-    if (len)
-        return NULL_I64;
+    // If we didn't parse any digits, return 0
+    if (n == 0)
+        return 0;
 
-    return result * sign;
+    *dst = result * sign;
+
+    return len - n;
 }
 
 f64_t f64_from_str(lit_p str, i64_t len) {

@@ -31,6 +31,7 @@
 #include "ops.h"
 
 i64_t sock_addr_from_str(str_p str, i64_t len, sock_addr_t *addr) {
+    i64_t r;
     str_p tok;
 
     // Check for NULL pointers
@@ -51,7 +52,10 @@ i64_t sock_addr_from_str(str_p str, i64_t len, sock_addr_t *addr) {
 
     // Get port part
     len -= tok - str;
-    addr->port = i64_from_str(tok, len);
+    r = i64_from_str(tok, len, &addr->port);
+
+    if (r != len)
+        return -1;
 
     return 0;
 }

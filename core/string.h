@@ -36,7 +36,7 @@ obj_p string_from_str(lit_p str, i64_t len);
 obj_p cstring_from_str(lit_p str, i64_t len);
 obj_p cstring_from_obj(obj_p obj);
 i32_t i32_from_str(lit_p str, i64_t len);
-i64_t i64_from_str(lit_p str, i64_t len);
+i64_t i64_from_str(lit_p src, i64_t len, i64_t *dst);
 f64_t f64_from_str(lit_p str, i64_t len);
 i64_t guid_from_str(lit_p str, i64_t len, guid_t dst);
 i64_t str_cpy(str_p dst, str_p src);

@@ -1987,7 +1987,7 @@ i64_t find_raw(obj_p obj, raw_p val) {
 obj_p cast_obj(i8_t type, obj_p obj) {
     obj_p v, res, err, msg;
     u8_t *g;
-    i64_t i, l;
+    i64_t i, l, num_i64;
     lit_p str;
 
     // Do nothing if the type is the same
@@ -2072,7 +2072,8 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(-TYPE_I32, TYPE_C8):
             return i32(i32_from_str(AS_C8(obj), obj->len));
         case MTYPE2(-TYPE_I64, TYPE_C8):
-            return i64(i64_from_str(AS_C8(obj), obj->len));
+            res = i64_from_str(AS_C8(obj), obj->len, &num_i64);
+            return i64(num_i64);
         case MTYPE2(-TYPE_DATE, TYPE_C8):
             return adate(date_into_i32(date_from_str(AS_C8(obj), obj->len)));
         case MTYPE2(-TYPE_TIME, TYPE_C8):
