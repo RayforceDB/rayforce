@@ -32,9 +32,9 @@ LIBS = -lm -ldl -lpthread
 LIBNAME = librayforce.dylib
 endif
 
-# -mavx2 -mfma -mpclmul -mbmi2
+# -mavx2 -mfma -mpclmul -mbmi2 -ffast-math 
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
- -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -ffast-math -m64\
+ -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
  -flax-vector-conversions -fno-math-errno
 CORE_OBJECTS = core/poll.o core/ipc.o core/repl.o core/runtime.o core/sys.o core/os.o core/proc.o core/fs.o core/mmap.o core/serde.o\
  core/temporal.o core/date.o core/time.o core/timestamp.o core/guid.o core/sort.o core/ops.o core/util.o\
