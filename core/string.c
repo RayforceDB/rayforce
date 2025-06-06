@@ -63,6 +63,32 @@ obj_p cstring_from_str(lit_p str, i64_t len) {
 
 obj_p cstring_from_obj(obj_p obj) { return cstring_from_str(AS_C8(obj), obj->len); }
 
+// in hex
+i64_t u8_from_str(lit_p str, i64_t len, u8_t *dst) {
+    i64_t i, n;
+
+    if (len < 2)
+        return 0;
+
+    n = 0;
+
+    for (i = 0; i < 2; i++) {
+        n = (n << 4);  // Shift left by 4 bits for each new hex digit
+        if (str[i] >= '0' && str[i] <= '9')
+            n |= (str[i] - '0');
+        else if (str[i] >= 'a' && str[i] <= 'f')
+            n |= (str[i] - 'a' + 10);
+        else if (str[i] >= 'A' && str[i] <= 'F')
+            n |= (str[i] - 'A' + 10);
+        else
+            return 0;
+    }
+
+    *dst = n;
+
+    return i;
+}
+
 i32_t i32_from_str(lit_p str, i64_t len) {
     i32_t result = 0, sign = 1;
 
@@ -93,29 +119,35 @@ i32_t i32_from_str(lit_p str, i64_t len) {
 }
 
 i64_t i64_from_str(lit_p src, i64_t len, i64_t *dst) {
-    i64_t result = 0, sign = 1, n;
-    lit_p end;
+    i64_t i, n, result, sign;
 
-    *dst = NULL_I64;
-    end = src;
+    result = 0;
+    sign = 1;
 
     if (len == 0)
         return 0;
 
     // Skip leading whitespace
-    while (IS_SPACE(*end))
-        end++;
+    for (i = 0; i < len && IS_SPACE(src[i]); i++)
+        ;
+
+    len -= i;
+
+    if (len == 0)
+        return 0;
 
     // Handle optional sign
-    if (*end == '-') {
+    if (src[i] == '-') {
         sign = -1;
-        end++;
+        i++;
+        len--;
     }
 
+    src += i;
+
     // Parse the digits
-    len -= end - src;
-    for (n = 0; n < len && is_digit(end[n]); n++)
-        result = result * 10 + (end[n] - '0');
+    for (n = 0; n < len && is_digit(src[n]); n++)
+        result = result * 10 + (src[n] - '0');
 
     // If we didn't parse any digits, return 0
     if (n == 0)
@@ -123,74 +155,79 @@ i64_t i64_from_str(lit_p src, i64_t len, i64_t *dst) {
 
     *dst = result * sign;
 
-    return len - n;
+    return i + n;
 }
 
-f64_t f64_from_str(lit_p str, i64_t len) {
+i64_t f64_from_str(lit_p str, i64_t len, f64_t *dst) {
     f64_t result = 0.0, factor = 1.0, fraction = 0.1, exp_factor = 1.0;
-    i64_t exp;
-    b8_t has_digits = B8_FALSE, exp_negative = B8_FALSE;
+    i64_t l, exp;
+    b8_t has_digits, exp_negative;
 
-    if (len == 0 || str == NULL)
-        return NULL_F64;
+    *dst = NULL_F64;
+    l = len;
+    has_digits = B8_FALSE;
+    exp_negative = B8_FALSE;
+
+    if (l == 0 || str == NULL)
+        return 0;
 
     // Skip leading whitespace
-    while (len > 0 && IS_SPACE(*str)) {
+    while (l > 0 && IS_SPACE(*str)) {
         str++;
-        len--;
+        l--;
     }
 
     // Handle optional sign
-    if (len > 0 && *str == '-') {
+    if (l > 0 && *str == '-') {
         factor = -1.0;
         str++;
-        len--;
-    } else if (len > 0 && *str == '+') {
+        l--;
+    } else if (l > 0 && *str == '+') {
         str++;
-        len--;
+        l--;
     }
 
     // Parse the integer part
-    while (len > 0 && is_digit(*str)) {
+    while (l > 0 && is_digit(*str)) {
         result = result * 10.0 + (*str - '0');
         str++;
-        len--;
+        l--;
         has_digits = B8_TRUE;
     }
 
     // Parse the fractional part
-    if (len > 0 && *str == '.') {
+    if (l > 0 && *str == '.') {
         str++;
-        len--;
-        while (len > 0 && is_digit(*str)) {
+        l--;
+        while (l > 0 && is_digit(*str)) {
             result += (*str - '0') * fraction;
             fraction *= 0.1;
             str++;
-            len--;
+            l--;
             has_digits = B8_TRUE;
         }
     }
 
     // Handle exponent
-    if (len > 0 && (*str == 'e' || *str == 'E')) {
+    if (l > 0 && (*str == 'e' || *str == 'E')) {
         str++;
-        len--;
+        l--;
         exp = 0;
         exp_negative = B8_FALSE;
 
-        if (len > 0 && *str == '-') {
+        if (l > 0 && *str == '-') {
             exp_negative = B8_TRUE;
             str++;
-            len--;
-        } else if (len > 0 && *str == '+') {
+            l--;
+        } else if (l > 0 && *str == '+') {
             str++;
-            len--;
+            l--;
         }
 
-        while (len > 0 && is_digit(*str)) {
+        while (l > 0 && is_digit(*str)) {
             exp = exp * 10 + (*str - '0');
             str++;
-            len--;
+            l--;
         }
 
         // Apply exponent
@@ -203,9 +240,11 @@ f64_t f64_from_str(lit_p str, i64_t len) {
     }
 
     if (has_digits == B8_FALSE)
-        return NULL_F64;
+        return 0;
 
-    return result * factor;
+    *dst = result * factor;
+
+    return len - l;
 }
 
 i64_t guid_from_str(lit_p str, i64_t len, guid_t dst) {

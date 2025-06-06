@@ -144,12 +144,12 @@ command_entry_t commands[] = {
 };
 
 obj_p sys_set_fpr(i32_t argc, str_p argv[]) {
-    i64_t r, fpr, res;
+    i64_t fpr, res;
 
     if (argc != 1)
         THROW(ERR_LENGTH, "set-fpr: expected 1 argument");
 
-    r = i64_from_str(argv[0], strlen(argv[0]), &fpr);
+    i64_from_str(argv[0], strlen(argv[0]), &fpr);
     if (fpr < 0)
         THROW(ERR_LENGTH, "set-fpr: expected a positive integer");
 
@@ -161,13 +161,13 @@ obj_p sys_set_fpr(i32_t argc, str_p argv[]) {
 }
 
 obj_p sys_use_unicode(i32_t argc, str_p argv[]) {
-    i64_t r, res;
+    i64_t res;
 
     if (argc != 1)
         THROW(ERR_LENGTH, "use-unicode: expected 1 argument");
 
-    r = i64_from_str(argv[0], strlen(argv[0]), &res);
-    if (r != strlen(argv[0]))
+    i64_from_str(argv[0], strlen(argv[0]), &res);
+    if (res < 0)
         THROW(ERR_LENGTH, "use-unicode: expected a positive integer");
 
     res = format_set_use_unicode(res);
@@ -178,13 +178,13 @@ obj_p sys_use_unicode(i32_t argc, str_p argv[]) {
 }
 
 obj_p sys_set_display_width(i32_t argc, str_p argv[]) {
-    i64_t r, width, res;
+    i64_t width, res;
 
     if (argc != 1)
         THROW(ERR_LENGTH, "set-display-width: expected 1 argument");
 
-    r = i64_from_str(argv[0], strlen(argv[0]), &width);
-    if (r != strlen(argv[0]))
+    i64_from_str(argv[0], strlen(argv[0]), &width);
+    if (width < 0)
         THROW(ERR_LENGTH, "set-display-width: expected a positive integer");
 
     if (width < 0)
@@ -198,13 +198,13 @@ obj_p sys_set_display_width(i32_t argc, str_p argv[]) {
 }
 
 obj_p sys_timeit(i32_t argc, str_p argv[]) {
-    i64_t r, res;
+    i64_t res;
 
     if (argc != 1)
         THROW(ERR_LENGTH, "timeit: expected 1 argument");
 
-    r = i64_from_str(argv[0], strlen(argv[0]), &res);
-    if (r != strlen(argv[0]))
+    i64_from_str(argv[0], strlen(argv[0]), &res);
+    if (res < 0)
         THROW(ERR_LENGTH, "timeit: expected a positive integer");
 
     timeit_activate(res != 0);
@@ -216,14 +216,14 @@ obj_p sys_listen(i32_t argc, str_p argv[]) {
     UNUSED(argc);
     UNUSED(argv);
 
-    i64_t r, l, res = 0;
+    i64_t l, res = 0;
 
     if (argc != 1)
         THROW(ERR_LENGTH, "listen: expected 1 argument");
 
     l = strlen(argv[0]);
-    r = i64_from_str(argv[0], l, &res);
-    if (r != l)
+    i64_from_str(argv[0], l, &res);
+    if (res < 0)
         THROW(ERR_LENGTH, "listen: expected a positive integer");
 
     if (res < 0)
@@ -241,14 +241,14 @@ obj_p sys_listen(i32_t argc, str_p argv[]) {
 }
 
 obj_p sys_exit(i32_t argc, str_p argv[]) {
-    i64_t r, l, code;
+    i64_t l, code;
 
     if (argc == 0)
         code = 0;
     else {
         l = strlen(argv[0]);
-        r = i64_from_str(argv[0], l, &code);
-        if (r != l)
+        i64_from_str(argv[0], l, &code);
+        if (code < 0)
             THROW(ERR_LENGTH, "exit: expected a positive integer");
     }
 

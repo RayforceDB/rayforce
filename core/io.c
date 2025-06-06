@@ -258,7 +258,7 @@ obj_p ray_write(obj_p x, obj_p y) {
 }
 
 obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out) {
-    i64_t n, num_i64, res;
+    i64_t n, num_i64;
 
     switch (type) {
         case TYPE_B8:
@@ -266,7 +266,7 @@ obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out) {
                 AS_B8(out)[row] = 0;
                 break;
             }
-            res = i64_from_str(start, end - start, &num_i64);
+            i64_from_str(start, end - start, &num_i64);
             AS_B8(out)[row] = 0 != num_i64;
             break;
         case TYPE_U8:
@@ -274,7 +274,7 @@ obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out) {
                 AS_U8(out)[row] = 0;
                 break;
             }
-            res = i64_from_str(start, end - start, &num_i64);
+            i64_from_str(start, end - start, &num_i64);
             AS_U8(out)[row] = (u8_t)num_i64;
             break;
         case TYPE_I32:
@@ -299,7 +299,7 @@ obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out) {
             AS_TIME(out)[row] = time_into_i32(time_from_str(start, end - start));
             break;
         case TYPE_I64:
-            res = i64_from_str(start, end - start, &num_i64);
+            i64_from_str(start, end - start, &num_i64);
             AS_I64(out)[row] = num_i64;
             break;
         case TYPE_TIMESTAMP:
@@ -310,7 +310,7 @@ obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out) {
             AS_TIMESTAMP(out)[row] = timestamp_into_i64(timestamp_from_str(start, end - start));
             break;
         case TYPE_F64:
-            AS_F64(out)[row] = f64_from_str(start, end - start);
+            f64_from_str(start, end - start, &AS_F64(out)[row]);
             break;
         case TYPE_SYMBOL:
             if (start == NULL || end == NULL) {
