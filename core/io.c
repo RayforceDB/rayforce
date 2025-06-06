@@ -282,7 +282,7 @@ obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out) {
                 AS_I32(out)[row] = NULL_I32;
                 break;
             }
-            AS_I32(out)[row] = i32_from_str(start, end - start);
+            i32_from_str(start, end - start, &AS_I32(out)[row]);
             break;
         case TYPE_DATE:
             if (start == NULL || end == NULL) {

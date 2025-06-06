@@ -1987,6 +1987,7 @@ i64_t find_raw(obj_p obj, raw_p val) {
 obj_p cast_obj(i8_t type, obj_p obj) {
     obj_p v, res, err, msg;
     u8_t *g;
+    i32_t num_i32;
     i64_t i, l, num_i64;
     f64_t num_f64;
     lit_p str;
@@ -2071,7 +2072,8 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(-TYPE_B8, TYPE_C8):
             return b8(obj->len > 0);
         case MTYPE2(-TYPE_I32, TYPE_C8):
-            return i32(i32_from_str(AS_C8(obj), obj->len));
+            i32_from_str(AS_C8(obj), obj->len, &num_i32);
+            return i32(num_i32);
         case MTYPE2(-TYPE_I64, TYPE_C8):
             i64_from_str(AS_C8(obj), obj->len, &num_i64);
             return i64(num_i64);
