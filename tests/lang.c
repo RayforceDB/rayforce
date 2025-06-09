@@ -74,6 +74,9 @@ test_result_t test_lang_basic() {
     TEST_ASSERT_EQ("false", "false");
     TEST_ASSERT_EQ("1", "1");
     TEST_ASSERT_EQ("1.1", "1.10");
+    TEST_ASSERT_EQ("0.6", "0.60");
+    TEST_ASSERT_EQ("0.599999999999999999", "0.60");
+    TEST_ASSERT_EQ("0.599999999999999999999999999999999999999999999999999999999999999", "0.60");
     TEST_ASSERT_EQ("\"\"", "\"\"");
     TEST_ASSERT_EQ("'asd", "'asd");
     TEST_ASSERT_EQ("'", "0Ns");

@@ -21,8 +21,8 @@
  *   SOFTWARE.
  */
 
+#include <math.h>
 #include "string.h"
-#include "rayforce.h"
 #include "heap.h"
 #include "util.h"
 #include "ops.h"
@@ -165,58 +165,54 @@ i64_t i64_from_str(lit_p src, i64_t len, i64_t *dst) {
 }
 
 i64_t f64_from_str(lit_p str, i64_t len, f64_t *dst) {
-    i32_t sign, frac_digits, exp_sign, exp;
-    i64_t i, start, int_part, frac_part, exp_start;
-    f64_t multiplier, divisor, val;
+    i64_t i = 0;
 
-    i = 0;
-
-    // Skip leading whitespace
     while (i < len && IS_SPACE(str[i]))
         i++;
-
     if (i >= len)
         return 0;
 
-    // Sign
-    sign = 1;
+    int sign = 1;
     if (str[i] == '-') {
         sign = -1;
         i++;
+    } else if (str[i] == '+') {
+        i++;
     }
 
+    f64_t val = 0.0;
+    int digit_found = 0;
+
     // Integer part
-    int_part = 0;
-    start = i;
     while (i < len && IS_DIGIT(str[i])) {
-        int_part = int_part * 10 + (str[i++] - '0');
+        val = val * 10.0 + (str[i++] - '0');
+        digit_found = 1;
     }
 
     // Fractional part
-    frac_part = 0;
-    frac_digits = 0;
     if (i < len && str[i] == '.') {
         i++;
+        f64_t frac = 0.0;
+        f64_t base = 0.1;
+        int frac_found = 0;
+
         while (i < len && IS_DIGIT(str[i])) {
-            frac_part = frac_part * 10 + (str[i++] - '0');
-            frac_digits++;
+            frac += (str[i++] - '0') * base;
+            base *= 0.1;
+            frac_found = 1;
         }
+
+        val += frac;
+        digit_found |= frac_found;
     }
 
-    // Combine integer and fractional
-    val = (f64_t)int_part;
-    if (frac_digits > 0) {
-        divisor = 1.0;
-        for (int j = 0; j < frac_digits; j++) {
-            divisor *= 10.0;
-        }
-        val += (f64_t)frac_part / divisor;
-    }
+    if (!digit_found)
+        return 0;
 
-    // Exponent
+    // Exponent part
     if (i < len && (str[i] == 'e' || str[i] == 'E')) {
         i++;
-        exp_sign = 1;
+        int exp_sign = 1;
         if (i < len && str[i] == '-') {
             exp_sign = -1;
             i++;
@@ -224,25 +220,16 @@ i64_t f64_from_str(lit_p str, i64_t len, f64_t *dst) {
             i++;
         }
 
-        exp = 0;
-        exp_start = i;
+        int exp_val = 0;
+        int exp_digits = 0;
         while (i < len && IS_DIGIT(str[i])) {
-            exp = exp * 10 + (str[i++] - '0');
+            exp_val = exp_val * 10 + (str[i++] - '0');
+            exp_digits = 1;
         }
-        if (i > exp_start) {
-            multiplier = 1.0;
-            for (int j = 0; j < exp_sign * exp; j++) {
-                multiplier *= 10.0;
-            }
-            val *= multiplier;
-        } else {
-            // Invalid exponent; rewind if needed
-            i = exp_start - 1;
-        }
-    }
 
-    if (i == start)
-        return 0;  // No digits parsed
+        if (exp_digits)
+            val *= pow(10.0, exp_sign * exp_val);
+    }
 
     *dst = sign * val;
 
