@@ -444,7 +444,7 @@ obj_p specify_number(parser_t *parser, const char *current, span_t span, obj_p n
             num->type = -TYPE_U8;
             break;
         case 'h':
-            if (num->i64 > 32767) {
+            if (num->i64 < -32767 || num->i64 > 32767) {
                 drop_obj(num);
                 span.end_column += (current - parser->current);
                 nfo_insert(parser->nfo, parser->count, span);
@@ -454,7 +454,7 @@ obj_p specify_number(parser_t *parser, const char *current, span_t span, obj_p n
             num->type = -TYPE_I16;
             break;
         case 'i':
-            if (num->i64 > 2147483647) {
+            if (num->i64 < -2147483647 || num->i64 > 2147483647) {
                 drop_obj(num);
                 span.end_column += (current - parser->current);
                 nfo_insert(parser->nfo, parser->count, span);

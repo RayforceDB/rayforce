@@ -125,7 +125,7 @@ i64_t i32_from_str(lit_p str, i64_t len, i32_t *dst) {
 }
 
 i64_t i64_from_str(lit_p src, i64_t len, i64_t *dst) {
-    i64_t i, n, result, sign;
+    i64_t i, n, result, sign, old;
 
     result = 0;
     sign = 1;
@@ -152,8 +152,12 @@ i64_t i64_from_str(lit_p src, i64_t len, i64_t *dst) {
     src += i;
 
     // Parse the digits
-    for (n = 0; n < len && IS_DIGIT(src[n]); n++)
+    for (n = 0; n < len && IS_DIGIT(src[n]); n++) {
+        old = result;
         result = result * 10 + (src[n] - '0');
+        if (result < old)
+            return 0;
+    }
 
     // If we didn't parse any digits, return 0
     if (n == 0)
@@ -165,54 +169,58 @@ i64_t i64_from_str(lit_p src, i64_t len, i64_t *dst) {
 }
 
 i64_t f64_from_str(lit_p str, i64_t len, f64_t *dst) {
-    i64_t i = 0;
+    i32_t sign, frac_digits, exp_sign, exp;
+    i64_t i, start, exp_start;
+    f64_t int_part, frac_part, multiplier, divisor, val;
 
+    i = 0;
+
+    // Skip leading whitespace
     while (i < len && IS_SPACE(str[i]))
         i++;
+
     if (i >= len)
         return 0;
 
-    int sign = 1;
+    // Sign
+    sign = 1;
     if (str[i] == '-') {
         sign = -1;
         i++;
-    } else if (str[i] == '+') {
-        i++;
     }
 
-    f64_t val = 0.0;
-    int digit_found = 0;
-
     // Integer part
+    int_part = 0;
+    start = i;
     while (i < len && IS_DIGIT(str[i])) {
-        val = val * 10.0 + (str[i++] - '0');
-        digit_found = 1;
+        int_part = int_part * 10 + (str[i++] - '0');
     }
 
     // Fractional part
+    frac_part = 0;
+    frac_digits = 0;
     if (i < len && str[i] == '.') {
         i++;
-        f64_t frac = 0.0;
-        f64_t base = 0.1;
-        int frac_found = 0;
-
         while (i < len && IS_DIGIT(str[i])) {
-            frac += (str[i++] - '0') * base;
-            base *= 0.1;
-            frac_found = 1;
+            frac_part = frac_part * 10 + (str[i++] - '0');
+            frac_digits++;
         }
-
-        val += frac;
-        digit_found |= frac_found;
     }
 
-    if (!digit_found)
-        return 0;
+    // Combine integer and fractional
+    val = int_part;
+    if (frac_digits > 0) {
+        divisor = 1.0;
+        for (int j = 0; j < frac_digits; j++) {
+            divisor *= 10.0;
+        }
+        val += frac_part / divisor;
+    }
 
-    // Exponent part
+    // Exponent
     if (i < len && (str[i] == 'e' || str[i] == 'E')) {
         i++;
-        int exp_sign = 1;
+        exp_sign = 1;
         if (i < len && str[i] == '-') {
             exp_sign = -1;
             i++;
@@ -220,16 +228,29 @@ i64_t f64_from_str(lit_p str, i64_t len, f64_t *dst) {
             i++;
         }
 
-        int exp_val = 0;
-        int exp_digits = 0;
-        while (i < len && IS_DIGIT(str[i])) {
-            exp_val = exp_val * 10 + (str[i++] - '0');
-            exp_digits = 1;
-        }
+        exp = 0;
+        exp_start = i;
 
-        if (exp_digits)
-            val *= pow(10.0, exp_sign * exp_val);
+        while (i < len && IS_DIGIT(str[i])) {
+            exp = exp * 10 + (str[i++] - '0');
+        }
+        if (i > exp_start) {
+            multiplier = 1.0;
+            for (int j = 0; j < exp; j++) {
+                if (exp_sign > 0)
+                    multiplier *= 10.0;
+                else
+                    multiplier /= 10.0;
+            }
+            val *= multiplier;
+        } else {
+            // Invalid exponent; rewind if needed
+            i = exp_start - 1;
+        }
     }
+
+    if (i == start)
+        return 0;  // No digits parsed
 
     *dst = sign * val;
 
