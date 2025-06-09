@@ -138,7 +138,7 @@ command_entry_t commands[] = {
     COMMAND("use-unicode", sys_use_unicode),
     COMMAND("set-fpr", sys_set_fpr),
     COMMAND("set-display-width", sys_set_display_width),
-    COMMAND("timeit-activate", sys_timeit_activate),
+    COMMAND("timeit", sys_timeit),
     COMMAND("listen", sys_listen),
     COMMAND("exit", sys_exit),
 };
@@ -190,13 +190,16 @@ obj_p sys_set_display_width(i32_t argc, str_p argv[]) {
     return i64(res);
 }
 
-obj_p sys_timeit_activate(i32_t argc, str_p argv[]) {
+obj_p sys_timeit(i32_t argc, str_p argv[]) {
+    i64_t res;
+
     if (argc != 1)
-        THROW(ERR_LENGTH, "timeit-activate: expected 1 argument");
+        THROW(ERR_LENGTH, "timeit: expected 1 argument");
 
-    timeit_activate(i64_from_str(argv[0], strlen(argv[0])));
+    res = i64_from_str(argv[0], strlen(argv[0]));
+    timeit_activate(res != 0);
 
-    return i64(0);
+    return i64(res);
 }
 
 obj_p sys_listen(i32_t argc, str_p argv[]) {

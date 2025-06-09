@@ -480,9 +480,7 @@ obj_p eval_obj(obj_p obj) {
 }
 
 obj_p eval_str_w_attr(lit_p str, i64_t len, obj_p nfo) {
-    obj_p parsed, res, fn;
-    ctx_p ctx;
-    i64_t sp;
+    obj_p parsed, res;
 
     timeit_reset();
     timeit_span_start("top-level");
@@ -495,23 +493,8 @@ obj_p eval_str_w_attr(lit_p str, i64_t len, obj_p nfo) {
         return parsed;
     }
 
-    sp = __INTERPRETER->sp;
-    stack_push(NULL_OBJ);  // null env
-    fn = lambda(NULL_OBJ, NULL_OBJ, nfo);
-
-    ctx = ctx_push(fn);
-    ctx->sp = sp;
-
-    res = (setjmp(ctx->jmp) == 0) ? eval(parsed) : stack_pop();
-
+    res = EVAL_WITH_CTX(eval(parsed), nfo);
     drop_obj(parsed);
-    drop_obj(fn);
-
-    // cleanup stack frame
-    while (__INTERPRETER->sp > sp)
-        drop_obj(stack_pop());
-
-    ctx_pop();
 
     timeit_span_end("top-level");
 

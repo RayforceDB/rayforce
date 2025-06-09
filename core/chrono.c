@@ -82,6 +82,7 @@ f64_t ray_clock_elapsed_ms(ray_clock_t *start, ray_clock_t *end) {
 nil_t timeit_activate(b8_t active) {
     timeit_t *timeit = &interpreter_current()->timeit;
     timeit->active = active;
+    timeit->n = 0;
 }
 
 nil_t timeit_reset() {

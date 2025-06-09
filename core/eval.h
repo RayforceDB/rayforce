@@ -35,6 +35,24 @@
 
 #define EVAL_STACK_SIZE 1024
 
+#define EVAL_WITH_CTX(x, n)                              \
+    ({                                                   \
+        obj_p $f, $r;                                    \
+        ctx_p $c;                                        \
+        i64_t $s;                                        \
+        $s = __INTERPRETER->sp;                          \
+        stack_push(NULL_OBJ);                            \
+        $f = lambda(NULL_OBJ, NULL_OBJ, n);              \
+        $c = ctx_push($f);                               \
+        $c->sp = $s;                                     \
+        $r = (setjmp($c->jmp) == 0) ? (x) : stack_pop(); \
+        drop_obj($f);                                    \
+        while (__INTERPRETER->sp > $s)                   \
+            drop_obj(stack_pop());                       \
+        ctx_pop();                                       \
+        $r;                                              \
+    })
+
 typedef struct ctx_t {
     i64_t sp;      // Stack pointer.
     obj_p lambda;  // Lambda being evaluated.

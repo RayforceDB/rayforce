@@ -35,7 +35,7 @@ typedef enum {
 } option_code_t;
 
 // Pack the struct to avoid padding and ensure consistent size
-typedef struct __attribute__((packed, aligned(16))) {
+typedef struct __attribute__((aligned(16))) {
     option_code_t code;
     raw_p value;
 } option_t;
