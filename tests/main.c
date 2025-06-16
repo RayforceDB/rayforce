@@ -157,7 +157,6 @@ nil_t on_fail(str_p msg) {
         }                                                                                                       \
     }
 
-
 // Include tests files
 #include "heap.c"
 #include "hash.c"
@@ -185,6 +184,9 @@ test_entry_t tests[] = {
     {"test_env", test_env},
     {"test_sort_asc", test_sort_asc},
     {"test_sort_desc", test_sort_desc},
+    {"test_asc_desc", test_asc_desc},
+    {"test_sort_xasc", test_sort_xasc},
+    {"test_sort_xdesc", test_sort_xdesc},
     {"test_str_match", test_str_match},
     {"test_lang_basic", test_lang_basic},
     {"test_lang_math", test_lang_math},

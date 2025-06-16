@@ -437,7 +437,7 @@ static inline u64_t f64_to_sortable_u64(f64_t value) {
         u64_t u;
     } u;
 
-    if (ops_is_nan(value)) {
+    if (ISNANF64(value)) {
         return 0ull;
     }
     u.f = value;

@@ -29,6 +29,7 @@
 #include "sort.h"
 #include "error.h"
 #include "compose.h"
+#include <string.h>
 
 obj_p ray_iasc(obj_p x) {
     switch (x->type) {
@@ -73,7 +74,7 @@ obj_p ray_asc(obj_p x) {
     if (x->attrs & ATTR_ASC)
         return clone_obj(x);
 
-    if (x->attrs & ATTR_DESC){
+    if (x->attrs & ATTR_DESC) {
         res = ray_reverse(x);
         res->attrs &= ~ATTR_DESC;
         res->attrs |= ATTR_ASC;
@@ -140,7 +141,7 @@ obj_p ray_desc(obj_p x) {
     if (x->attrs & ATTR_DESC)
         return clone_obj(x);
 
-    if (x->attrs & ATTR_ASC){
+    if (x->attrs & ATTR_ASC) {
         res = ray_reverse(x);
         res->attrs &= ~ATTR_ASC;
         res->attrs |= ATTR_DESC;
@@ -205,7 +206,6 @@ obj_p ray_xasc(obj_p x, obj_p y) {
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(TYPE_TABLE, -TYPE_SYMBOL):
             col = at_obj(x, y);
-
             if (IS_ERR(col))
                 return col;
 
@@ -215,11 +215,51 @@ obj_p ray_xasc(obj_p x, obj_p y) {
             if (IS_ERR(idx))
                 return idx;
 
-            res = ray_take(x, idx);
-
+            res = at_obj(x, idx);
             drop_obj(idx);
 
             return res;
+
+        case MTYPE2(TYPE_TABLE, TYPE_SYMBOL): {
+            i64_t n = y->len;
+            i64_t nrow = AS_LIST(AS_LIST(x)[1])[0]->len;
+            obj_p idx = I64(nrow);
+            i64_t *indices = AS_I64(idx);
+            for (i64_t i = 0; i < nrow; i++)
+                indices[i] = i;
+
+            // Stable sort by each column from last to first, extracting only one column at a time
+            for (i64_t c = n - 1; c >= 0; c--) {
+                obj_p col_name = at_idx(y, c);
+                obj_p col = at_obj(x, col_name);
+                drop_obj(col_name);
+                if (IS_ERR(col)) {
+                    drop_obj(idx);
+                    return col;
+                }
+
+                obj_p col_reordered = at_obj(col, idx);
+                drop_obj(col);
+                obj_p local_idx = ray_iasc(col_reordered);
+
+                // Reorder indices according to local_idx
+                i64_t *local = AS_I64(local_idx);
+                i64_t *tmp = malloc(sizeof(i64_t) * nrow);
+                for (i64_t i = 0; i < nrow; i++)
+                    tmp[i] = indices[local[i]];
+
+                memcpy(indices, tmp, sizeof(i64_t) * nrow);
+                free(tmp);
+
+                drop_obj(col_reordered);
+                drop_obj(local_idx);
+            }
+
+            obj_p res = at_obj(x, idx);
+            drop_obj(idx);
+            return res;
+        }
+
         default:
             THROW(ERR_TYPE, "xasc: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
@@ -231,7 +271,6 @@ obj_p ray_xdesc(obj_p x, obj_p y) {
     switch (MTYPE2(x->type, y->type)) {
         case MTYPE2(TYPE_TABLE, -TYPE_SYMBOL):
             col = at_obj(x, y);
-
             if (IS_ERR(col))
                 return col;
 
@@ -241,11 +280,51 @@ obj_p ray_xdesc(obj_p x, obj_p y) {
             if (IS_ERR(idx))
                 return idx;
 
-            res = ray_take(x, idx);
-
+            res = at_obj(x, idx);
             drop_obj(idx);
 
             return res;
+
+        case MTYPE2(TYPE_TABLE, TYPE_SYMBOL): {
+            i64_t n = y->len;
+            i64_t nrow = AS_LIST(x)[1]->len;
+            obj_p idx = I64(nrow);
+            i64_t *indices = AS_I64(idx);
+            for (i64_t i = 0; i < nrow; i++)
+                indices[i] = i;
+
+            // Stable sort by each column from last to first, extracting only one column at a time
+            for (i64_t c = n - 1; c >= 0; c--) {
+                obj_p col_name = at_idx(y, c);
+                obj_p col = at_obj(x, col_name);
+                drop_obj(col_name);
+                if (IS_ERR(col)) {
+                    drop_obj(idx);
+                    return col;
+                }
+
+                obj_p col_reordered = at_obj(col, idx);
+                drop_obj(col);
+                obj_p local_idx = ray_idesc(col_reordered);
+
+                // Reorder indices according to local_idx
+                i64_t *local = AS_I64(local_idx);
+                i64_t *tmp = malloc(sizeof(i64_t) * nrow);
+                for (i64_t i = 0; i < nrow; i++)
+                    tmp[i] = indices[local[i]];
+                for (i64_t i = 0; i < nrow; i++)
+                    indices[i] = tmp[i];
+                free(tmp);
+
+                drop_obj(col_reordered);
+                drop_obj(local_idx);
+            }
+
+            obj_p res = at_obj(x, idx);
+            drop_obj(idx);
+            return res;
+        }
+
         default:
             THROW(ERR_TYPE, "xdesc: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
     }
