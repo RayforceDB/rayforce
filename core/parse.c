@@ -444,7 +444,7 @@ obj_p specify_number(parser_t *parser, const char *current, span_t span, obj_p n
             num->type = -TYPE_U8;
             break;
         case 'h':
-            if (num->i64 > 32767) {
+            if (num->i64 < -32767 || num->i64 > 32767) {
                 drop_obj(num);
                 span.end_column += (current - parser->current);
                 nfo_insert(parser->nfo, parser->count, span);
@@ -454,7 +454,7 @@ obj_p specify_number(parser_t *parser, const char *current, span_t span, obj_p n
             num->type = -TYPE_I16;
             break;
         case 'i':
-            if (num->i64 > 2147483647) {
+            if (num->i64 < -2147483647 || num->i64 > 2147483647) {
                 drop_obj(num);
                 span.end_column += (current - parser->current);
                 nfo_insert(parser->nfo, parser->count, span);
@@ -490,67 +490,37 @@ obj_p specify_number(parser_t *parser, const char *current, span_t span, obj_p n
 }
 
 obj_p parse_number(parser_t *parser) {
-    const char *end;
     u8_t num_u8;
-    i64_t num_i64;
+    i64_t r, num_i64;
     f64_t num_f64;
     obj_p num;
     span_t span = span_start(parser);
-    i64_t remaining = parser->input_len - (parser->current - parser->input);
+    i64_t remaining;
 
-    errno = 0;
+    remaining = parser->input_len - (parser->current - parser->input);
 
     if (remaining >= 2 && *parser->current == '0' && (*(parser->current + 1) == 'x')) {
-        num_i64 = strtoll(parser->current + 2, (char **)&end, 16);
-        if (end > parser->input + parser->input_len) {
-            end = parser->input + parser->input_len;
-        }
-        if (num_i64 > 255) {
-            span.end_column += (end - parser->current);
-            nfo_insert(parser->nfo, parser->count, span);
-            return parse_error(parser, parser->count++, str_fmt(-1, "Number is out of range"));
-        }
-        num_u8 = (u8_t)num_i64;
-        shift(parser, end - parser->current);
+        r = u8_from_str(parser->current + 2, remaining - 2, &num_u8);
+        shift(parser, r + 2);
         span_extend(parser, &span);
         num = u8(num_u8);
         nfo_insert(parser->nfo, (i64_t)num, span);
-
         return num;
     }
 
-    num_i64 = strtoll(parser->current, (char **)&end, 10);
-    if (end > parser->input + parser->input_len) {
-        end = parser->input + parser->input_len;
-    }
+    r = i64_from_str(parser->current, remaining, &num_i64);
+    // if we parsed a number, and the next character is not a dot, then we can specify the number
+    if (r > 0 && *(parser->current + r) != '.')
+        return specify_number(parser, parser->current + r, span, i64(num_i64));
 
-    if ((num_i64 == LONG_MAX || num_i64 == LONG_MIN) && errno == ERANGE) {
-        span.end_column += (end - parser->current - 1);
-        nfo_insert(parser->nfo, parser->count, span);
-        return parse_error(parser, parser->count++, str_fmt(-1, "Number is out of range"));
-    }
+    // try f64 instead
+    r = f64_from_str(parser->current, remaining, &num_f64);
+    if (r > 0)
+        return specify_number(parser, parser->current + r, span, f64(num_f64));
 
-    if (end == parser->current)
-        return error_str(ERR_PARSE, "Invalid number");
-
-    // try double instead
-    if (*end == '.') {
-        num_f64 = strtod(parser->current, (char **)&end);
-        if (end > parser->input + parser->input_len) {
-            end = parser->input + parser->input_len;
-        }
-
-        if (errno == ERANGE) {
-            span.end_column += (end - parser->current);
-            nfo_insert(parser->nfo, parser->count, span);
-            return parse_error(parser, parser->count++, str_fmt(-1, "Number is out of range"));
-        }
-
-        num = f64(num_f64);
-    } else
-        num = i64(num_i64);
-
-    return specify_number(parser, end, span, num);
+    span.end_column += (parser->current + remaining - parser->input);
+    nfo_insert(parser->nfo, parser->count, span);
+    return parse_error(parser, parser->count++, str_fmt(-1, "Not a number"));
 }
 
 obj_p parse_char(parser_t *parser) {

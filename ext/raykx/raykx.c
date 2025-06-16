@@ -425,6 +425,15 @@ obj_p raykx_send(obj_p fd, obj_p msg) {
     }
 
     ctx = (raykx_ctx_p)selector->data;
+
+    // Initialize receive buffer for header
+    if (selector->rx.buf == NULL) {
+        if (poll_rx_buf_request(poll, selector, ISIZEOF(struct raykx_header_t)) == -1) {
+            LOG_ERROR("Failed to initialize receive buffer");
+            return sys_error(ERR_IO, "raykx_send: failed to initialize receive buffer");
+        }
+    }
+
     raykx_send_msg(poll, selector, msg, msgtype);
 
     res = NULL_OBJ;

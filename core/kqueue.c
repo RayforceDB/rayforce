@@ -31,6 +31,8 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include "poll.h"
 #include "string.h"
 #include "hash.h"
@@ -416,59 +418,111 @@ i64_t poll_run(poll_p poll) {
 
 option_t poll_block_on(poll_p poll, selector_p selector) {
     option_t result;
-    fd_set readfds;
-    struct timeval timeout;
     i64_t nbytes, ret;
+    struct kevent ev;
+    struct timespec timeout;
 
     LOG_TRACE("Blocking on selector id: %lld, fd: %lld", selector->id, selector->fd);
 
-    // Setup select
-    FD_ZERO(&readfds);
-    FD_SET(selector->fd, &readfds);
-    timeout.tv_sec = 0;
-    // timeout.tv_usec = 30000000;  // 30 seconds
-    timeout.tv_usec = 3000000;
+    // Validate file descriptor
+    if (selector->fd < 0) {
+        LOG_ERROR("Invalid file descriptor %lld", selector->fd);
+        return option_error(sys_error(ERR_IO, "invalid file descriptor"));
+    }
+
+    // Verify file descriptor is still valid
+    if (fcntl(selector->fd, F_GETFD) == -1) {
+        LOG_ERROR("File descriptor %lld is not valid: %s", selector->fd, strerror(errno));
+        return option_error(sys_error(ERR_IO, "invalid file descriptor"));
+    }
+
+    // Setup timeout
+    timeout.tv_sec = 3;  // 3 seconds
+    timeout.tv_nsec = 0;
 
     // Perform the read operation
     while (selector->rx.buf != NULL) {
-        // Wait for the file descriptor to become readable
-        ret = select(selector->fd + 1, &readfds, NULL, NULL, &timeout);
-        if (ret == -1) {
-            LOG_ERROR("select failed");
-            return option_error(sys_error(ERR_IO, "recv select failed"));
+        // Try to read first without blocking
+        if (selector->rx.recv_fn != NULL) {
+            nbytes = poll_recv(poll, selector);
+            if (nbytes > 0) {
+                // We got data, process it
+                if (selector->rx.read_fn != NULL) {
+                    result = selector->rx.read_fn(poll, selector);
+                    if (option_is_error(&result)) {
+                        poll_deregister(poll, selector->id);
+                        return result;
+                    }
+                    if (option_is_some(&result) && result.value != NULL)
+                        return result;
+                }
+                continue;
+            }
+            if (nbytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                // Would block, use kqueue to wait
+            } else if (nbytes == -1) {
+                poll_deregister(poll, selector->id);
+                return option_error(sys_error(ERR_IO, "recv failed"));
+            }
         }
 
-        LOG_TRACE("select returned %lld", ret);
+        // Setup kqueue event
+        EV_SET(&ev, selector->fd, EVFILT_READ, EV_ADD, 0, 0, selector);
+
+        // Wait for the file descriptor to become readable
+        ret = kevent(poll->fd, &ev, 1, &ev, 1, &timeout);
+        if (ret == -1) {
+            if (errno == EINVAL) {
+                // Check if the file descriptor is still valid
+                if (fcntl(selector->fd, F_GETFD) == -1) {
+                    LOG_ERROR("File descriptor %lld became invalid: %s", selector->fd, strerror(errno));
+                    return option_error(sys_error(ERR_IO, "file descriptor became invalid"));
+                }
+                // Try to get more information about the file descriptor
+                int flags = fcntl(selector->fd, F_GETFL);
+                if (flags == -1) {
+                    LOG_ERROR("Cannot get file descriptor flags: %s", strerror(errno));
+                } else {
+                    LOG_ERROR("File descriptor flags: 0x%x", flags);
+                }
+                LOG_ERROR("kevent failed: Invalid argument (fd=%lld, errno=%d)", selector->fd, errno);
+                return option_error(sys_error(ERR_IO, "kevent failed: invalid argument"));
+            }
+            LOG_ERROR("kevent failed: %s (fd=%lld, errno=%d)", strerror(errno), selector->fd, errno);
+            return option_error(sys_error(ERR_IO, "recv kevent failed"));
+        }
 
         if (ret == 0)
             return option_error(sys_error(ERR_IO, "recv timeout"));
 
-        // In case we have a low level IO recv function, use it
-        if (selector->rx.buf != NULL && selector->rx.recv_fn != NULL) {
-            nbytes = poll_recv(poll, selector);
+        // Check if we got an error event
+        if (ev.flags & (EV_ERROR | EV_EOF)) {
+            LOG_ERROR("kevent error events: 0x%x", ev.flags);
+            return option_error(sys_error(ERR_IO, "kevent error events"));
+        }
 
+        // Try to read again after kevent indicates data is available
+        if (selector->rx.recv_fn != NULL) {
+            nbytes = poll_recv(poll, selector);
             if (nbytes == -1) {
                 poll_deregister(poll, selector->id);
                 return option_error(sys_error(ERR_IO, "recv failed"));
             }
-
             if (nbytes == 0)
                 return option_none();
         }
 
-        if (selector->rx.read_fn != NULL)
+        if (selector->rx.read_fn != NULL) {
             result = selector->rx.read_fn(poll, selector);
-
-        if (option_is_error(&result)) {
-            poll_deregister(poll, selector->id);
-            return result;
+            if (option_is_error(&result)) {
+                poll_deregister(poll, selector->id);
+                return result;
+            }
+            if (option_is_some(&result) && result.value != NULL)
+                return result;
         }
-
-        if (option_is_some(&result) && result.value != NULL)
-            return result;
     }
 
     LOG_DEBUG("empty buffer");
-
     return option_none();
 }

@@ -886,7 +886,7 @@ b8_t term_autocomplete_paren(term_p term) {
 nil_t term_handle_tab(term_p term) { term_autocomplete_paren(term); }
 
 obj_p term_handle_return(term_p term) {
-    i64_t exit_code;
+    i64_t r, exit_code;
     obj_p res = NULL_OBJ;
     b8_t onoff;
 
@@ -896,7 +896,9 @@ obj_p term_handle_return(term_p term) {
     term->buf[term->buf_len] = '\0';
 
     if (IS_CMD(term, ":q")) {
-        exit_code = (term->buf_len > 2) ? i64_from_str(term->buf + 2, term->buf_len - 3) : 0;
+        r = i64_from_str(term->buf + 2, term->buf_len - 2, &exit_code);
+        if (r != term->buf_len - 2)
+            exit_code = 0;
         poll_exit(runtime_get()->poll, exit_code);
         return NULL;
     }

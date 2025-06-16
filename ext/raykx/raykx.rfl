@@ -1,7 +1,7 @@
-(set .kx.listen (loadfn "ext/raykx/libraykx.so" "raykx_listen" 1))
-(set .kx.hopen (loadfn "ext/raykx/libraykx.so" "raykx_hopen" 1))
-(set .kx.hclose (loadfn "ext/raykx/libraykx.so" "raykx_hclose" 1))
-(set .kx.send (loadfn "ext/raykx/libraykx.so" "raykx_send" 2))
+(set .kx.listen (loadfn "ext/raykx/libraykx.dylib" "raykx_listen" 1))
+(set .kx.hopen (loadfn "ext/raykx/libraykx.dylib" "raykx_hopen" 1))
+(set .kx.hclose (loadfn "ext/raykx/libraykx.dylib" "raykx_hclose" 1))
+(set .kx.send (loadfn "ext/raykx/libraykx.dylib" "raykx_send" 2))
 
 (.kx.listen 5102)
 (println "Listening on port 5102")

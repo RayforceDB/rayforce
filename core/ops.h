@@ -188,6 +188,10 @@ obj_p ops_where(b8_t *mask, i64_t n);
 obj_p sys_error(os_ray_error_type_t, lit_p msg);
 
 // Binary ops/coersions
+static inline u8_t b8_to_b8(b8_t x) { return x; }
+static inline i64_t b8_to_i64(i64_t x) { return x != 0 && x != NULL_I64; }
+static inline b8_t i64_to_b8(i64_t x) { return x != 0 && x != NULL_I64; }
+
 static inline i16_t i16_to_i16(i16_t x) { return x; }
 static inline i32_t i16_to_i32(i16_t x) { return (x == NULL_I16) ? NULL_I32 : (i32_t)x; }
 static inline i64_t i16_to_i64(i16_t x) { return (x == NULL_I16) ? NULL_I64 : (i64_t)x; }

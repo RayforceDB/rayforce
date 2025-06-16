@@ -144,7 +144,7 @@ runtime_p runtime_create(i32_t argc, str_p argv[]) {
         // thread count
         arg = runtime_get_arg("cores");
         if (!is_null(arg)) {
-            n = i64_from_str(AS_C8(arg), arg->len);
+            i64_from_str(AS_C8(arg), arg->len, &n);
             if (n > 1)
                 __RUNTIME->pool = pool_create(n - 1);  // -1 for the main thread
 
@@ -165,7 +165,7 @@ runtime_p runtime_create(i32_t argc, str_p argv[]) {
         // timeit
         arg = runtime_get_arg("timeit");
         if (!is_null(arg)) {
-            n = i64_from_str(AS_C8(arg), arg->len);
+            i64_from_str(AS_C8(arg), arg->len, &n);
             drop_obj(arg);
             timeit_activate(n);
         }
@@ -213,7 +213,7 @@ i32_t runtime_run(nil_t) {
 
         arg = runtime_get_arg("port");
         if (!is_null(arg)) {
-            port = i64_from_str(AS_C8(arg), arg->len);
+            i64_from_str(AS_C8(arg), arg->len, &port);
             drop_obj(arg);
             if (ipc_listen(__RUNTIME->poll, port) == -1) {
                 printf("Failed to listen on port %lld\n", port);

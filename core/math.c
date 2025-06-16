@@ -89,6 +89,9 @@
 
 i8_t infer_math_type(obj_p x, obj_p y) {
     switch (MTYPE2(ABSI8(x->type), ABSI8(y->type))) {
+        case MTYPE2(TYPE_B8, TYPE_I64):
+        case MTYPE2(TYPE_I64, TYPE_B8):
+            return TYPE_I64;
         case MTYPE2(TYPE_I32, TYPE_I32):
         case MTYPE2(TYPE_DATE, TYPE_DATE):
             return TYPE_I32;
@@ -306,6 +309,10 @@ obj_p ray_add_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
             return __BINOP_V_A(x, y, i32, i32, time, time, ADDI32, len, offset, out);
         case MTYPE2(TYPE_I32, -TYPE_TIMESTAMP):
             return __BINOP_V_A(x, y, i32, i64, timestamp, timestamp, ADDI64, len, offset, out);
+        case MTYPE2(TYPE_B8, TYPE_I64):
+            return __BINOP_V_V(x, y, b8, i64, i64, i64, ADDI64, len, offset, out);
+        case MTYPE2(TYPE_I64, TYPE_B8):
+            return __BINOP_V_V(x, y, i64, b8, i64, i64, ADDI64, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_I32):
             return __BINOP_V_V(x, y, i32, i32, i32, i32, ADDI32, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_I64):
@@ -700,13 +707,16 @@ obj_p ray_mul_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
             return __BINOP_V_A(x, y, f64, i64, f64, f64, MULF64, len, offset, out);
         case MTYPE2(TYPE_F64, -TYPE_F64):
             return __BINOP_V_A(x, y, f64, f64, f64, f64, MULF64, len, offset, out);
+        case MTYPE2(TYPE_B8, TYPE_I64):
+            return __BINOP_V_V(x, y, b8, i64, b8, i64, MULI64, len, offset, out);
+        case MTYPE2(TYPE_I64, TYPE_B8):
+            return __BINOP_V_V(x, y, i64, b8, i64, i64, MULI64, len, offset, out);
         case MTYPE2(TYPE_F64, TYPE_I32):
             return __BINOP_V_V(x, y, f64, i32, f64, f64, MULF64, len, offset, out);
         case MTYPE2(TYPE_F64, TYPE_I64):
             return __BINOP_V_V(x, y, f64, i64, f64, f64, MULF64, len, offset, out);
         case MTYPE2(TYPE_F64, TYPE_F64):
             return __BINOP_V_V(x, y, f64, f64, f64, f64, MULF64, len, offset, out);
-
         case MTYPE2(TYPE_TIME, -TYPE_I32):
             return __BINOP_V_A(x, y, time, i32, time, time, MULI32, len, offset, out);
         case MTYPE2(TYPE_TIME, -TYPE_I64):
@@ -1470,7 +1480,7 @@ obj_p unop_map(raw_p op, obj_p x) {
 
     pool = runtime_get()->pool;
     n = pool_split_by(pool, l, 0);
-    out = vector(x->type, l);
+    out = (rc_obj(x) == 1) ? clone_obj(x) : vector(x->type, l);
 
     if (n == 1) {
         argv[0] = (raw_p)x;
@@ -1533,7 +1543,7 @@ obj_p binop_map(raw_p op, obj_p x, obj_p y) {
 
     pool = runtime_get()->pool;
     n = pool_split_by(pool, l, 0);
-    out = vector(t, l);
+    out = (rc_obj(x) == 1) ? clone_obj(x) : (rc_obj(y) == 1) ? clone_obj(y) : vector(t, l);
 
     if (n == 1) {
         argv[0] = (raw_p)x;
