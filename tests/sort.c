@@ -157,10 +157,10 @@ test_result_t test_sort_xdesc() {
     TEST_ASSERT_EQ("(xdesc (table ['a 'b] (list [3 1 2 1] [30 0 20 10])) 'a)",
                    "(table ['a 'b] (list [3 2 1 1] [30 20 0 10]))");
 
-    TEST_ASSERT_EQ("(xdesc (table ['a 'b] (list [2 1 2] [20 10 10])) ['a 'b])",
-                   "(table ['a 'b] (list [2 2 1] [20 10 10]))");
-    TEST_ASSERT_EQ("(xdesc (table ['a 'b] (list [2 1 2] [20 10 10])) ['b 'a])",
-                   "(table ['a 'b] (list [2 1 2] [20 10 10]))");
+    TEST_ASSERT_EQ("(xdesc (table ['a 'b] (list [1 1 2 2 3 3] [10 20 10 20 10 20])) ['a 'b])",
+                   "(table ['a 'b] (list [3 3 2 2 1 1] [20 10 20 10 20 10]))");
+    TEST_ASSERT_EQ("(xdesc (table ['a 'b] (list [1 1 2 2 3 3] [10 20 10 20 10 20])) ['b 'a])",
+                   "(table ['a 'b] (list [3 2 1 3 2 1] [20 20 20 10 10 10]))");
     TEST_ASSERT_EQ("(xdesc (table ['a 'b] (list [1 1 1] [3 2 1])) ['a 'b])", "(table ['a 'b] (list [1 1 1] [3 2 1]))");
     PASS();
 }

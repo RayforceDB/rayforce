@@ -287,7 +287,7 @@ obj_p ray_xdesc(obj_p x, obj_p y) {
 
         case MTYPE2(TYPE_TABLE, TYPE_SYMBOL): {
             i64_t n = y->len;
-            i64_t nrow = AS_LIST(x)[1]->len;
+            i64_t nrow = AS_LIST(AS_LIST(x)[1])[0]->len;
             obj_p idx = I64(nrow);
             i64_t *indices = AS_I64(idx);
             for (i64_t i = 0; i < nrow; i++)
