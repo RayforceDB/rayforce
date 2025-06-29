@@ -2118,17 +2118,20 @@ obj_p index_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
     i64_t idx;
     __index_list_ctx_t ctx;
 
-    // if (len == 1) {
-    //     lids = ray_find(rcols, lcols);
-    //     if (lids->type == TYPE_I64) {
-    //         idx = lids->i64;
-    //         drop_obj(lids);
-    //         lids = I64(1);
-    //         AS_I64(lids)[0] = idx;
-    //     }
+    if (len == 1) {
+        lids = ray_find(rcols, lcols);
+        if (IS_ERR(lids))
+            return lids;
 
-    //     return vn_list(2, lids, rids);
-    // }
+        if (lids->type == TYPE_I64) {
+            idx = lids->i64;
+            drop_obj(lids);
+            lids = I64(1);
+            AS_I64(lids)[0] = idx;
+        }
+
+        return vn_list(2, lids, lids);
+    }
 
     ll = ops_count(AS_LIST(lcols)[0]);
     rl = ops_count(AS_LIST(rcols)[0]);

@@ -562,23 +562,43 @@ upsert:
         case TYPE_DICT:
             if (AS_LIST(lst)[0]->type != TYPE_SYMBOL) {
                 drop_obj(obj);
-                return error(ERR_TYPE, "upsert: expected 'Symbol as 1st element in a dictionary, got '%s'",
+                return error(ERR_TYPE, "upsert: expected 'Symbol as keys in a dictionary, got '%s'",
                              type_name(AS_LIST(lst)[0]->type));
             }
-            // Fall through
-        case TYPE_TABLE:
-            // Check columns
+
             l = AS_LIST(lst)[0]->len;
 
             if (l > p) {
                 drop_obj(obj);
-                return error(ERR_LENGTH, "upsert: 'Table with inconsistent columns");
+                return error(ERR_LENGTH, "upsert: inconsistent columns");
+            }
+
+            // m = AS_LIST(lst)[0]->len;
+
+            for (i = 0; i < l; i++) {
+                if (AS_SYMBOL(AS_LIST(lst)[0])[i] != AS_SYMBOL(AS_LIST(obj)[0])[i]) {
+                    drop_obj(obj);
+                    return error(ERR_TYPE, "upsert: inconsistent columns: '%s != '%s",
+                                 str_from_symbol(AS_SYMBOL(AS_LIST(lst)[0])[i]),
+                                 str_from_symbol(AS_SYMBOL(AS_LIST(obj)[0])[i]));
+                }
+            }
+
+            lst = AS_LIST(lst)[1];
+            goto upsert;
+
+        case TYPE_TABLE:
+            l = AS_LIST(lst)[0]->len;
+
+            if (l > p) {
+                drop_obj(obj);
+                return error(ERR_LENGTH, "upsert: inconsistent columns");
             }
 
             for (i = 0; i < l; i++) {
                 if (AS_SYMBOL(AS_LIST(lst)[0])[i] != AS_SYMBOL(AS_LIST(obj)[0])[i]) {
                     drop_obj(obj);
-                    return error(ERR_TYPE, "upsert: expected 'Table with inconsistent columns: '%s != '%s",
+                    return error(ERR_TYPE, "upsert: inconsistent columns: '%s != '%s",
                                  str_from_symbol(AS_SYMBOL(AS_LIST(lst)[0])[i]),
                                  str_from_symbol(AS_SYMBOL(AS_LIST(obj)[0])[i]));
                 }
