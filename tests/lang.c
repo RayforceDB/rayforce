@@ -2794,6 +2794,102 @@ test_result_t test_lang_query() {
                    "(table [Symbol s]"
                    "(list [apll good msfk ibmd amznt fbad baba]"
                    "[7.00 9.00 11.00 3.00 4.00 5.00 6.00]))");
+    TEST_ASSERT_EQ("(select {a: (avg Price) from: t by: Symbol})",
+                   "(table [Symbol a]"
+                   "(list [apll good msfk ibmd amznt fbad baba]"
+                   "[3.50 4.50 5.50 3.00 4.00 5.00 6.00]))");
+    TEST_ASSERT_EQ("(select {mx: (max Price) from: t by: Symbol})",
+                   "(table [Symbol mx]"
+                   "(list [apll good msfk ibmd amznt fbad baba]"
+                   "[7.00 8.00 9.00 3.00 4.00 5.00 6.00]))");
+    TEST_ASSERT_EQ("(select {mn: (min Price) from: t by: Symbol})",
+                   "(table [Symbol mn]"
+                   "(list [apll good msfk ibmd amznt fbad baba]"
+                   "[0.00 1.00 2.00 3.00 4.00 5.00 6.00]))");
+    TEST_ASSERT_EQ("(select {wa: (wavg Price Size) from: t by: Symbol})",
+                   "(table [Symbol wa]"
+                   "(list [apll good msfk ibmd amznt fbad baba]"
+                   "[4.67 5.20 3.75 3.00 4.00 5.00 6.00]))");
+
+    // Test aggregation functions with negative values
+    TEST_ASSERT_EQ(
+        "(set tneg (table [Symbol Price Size] "
+        "(list [apll apll good good msfk msfk ibmd] "
+        "[-10.0 -3.0 -8.0 -1.0 -5.0 -2.0 -4.0] "
+        "[1 2 2 3 3 1 1]))) null",
+        "null");
+    TEST_ASSERT_EQ("(select {a: (avg Price) from: tneg by: Symbol})",
+                   "(table [Symbol a]"
+                   "(list [apll good msfk ibmd]"
+                   "[-6.50 -4.50 -3.50 -4.00]))");
+    TEST_ASSERT_EQ("(select {mx: (max Price) from: tneg by: Symbol})",
+                   "(table [Symbol mx]"
+                   "(list [apll good msfk ibmd]"
+                   "[-3.00 -1.00 -2.00 -4.00]))");
+    TEST_ASSERT_EQ("(select {mn: (min Price) from: tneg by: Symbol})",
+                   "(table [Symbol mn]"
+                   "(list [apll good msfk ibmd]"
+                   "[-10.00 -8.00 -5.00 -4.00]))");
+    TEST_ASSERT_EQ("(select {wa: (wavg Price Size) from: tneg by: Symbol})",
+                   "(table [Symbol wa]"
+                   "(list [apll good msfk ibmd]"
+                   "[-5.33 -3.80 -4.25 -4.00]))");
+
+    // Test proper aggregation with multiple elements per group
+    TEST_ASSERT_EQ(
+        "(set taggr (table [Symbol Price Size] "
+        "(list [AAA AAA AAA BBB BBB BBB CCC CCC] "
+        "[10.0 20.0 30.0 5.0 15.0 25.0 100.0 200.0] "
+        "[1 2 3 2 1 3 1 1]))) null",
+        "null");
+
+    TEST_ASSERT_EQ("(select {a: (avg Price) from: taggr by: Symbol})",
+                   "(table [Symbol a]"
+                   "(list [AAA BBB CCC]"
+                   "[20.00 15.00 150.00]))");
+
+    TEST_ASSERT_EQ("(select {mx: (max Price) from: taggr by: Symbol})",
+                   "(table [Symbol mx]"
+                   "(list [AAA BBB CCC]"
+                   "[30.00 25.00 200.00]))");
+
+    TEST_ASSERT_EQ("(select {mn: (min Price) from: taggr by: Symbol})",
+                   "(table [Symbol mn]"
+                   "(list [AAA BBB CCC]"
+                   "[10.00 5.00 100.00]))");
+
+    TEST_ASSERT_EQ("(select {wa: (wavg Price Size) from: taggr by: Symbol})",
+                   "(table [Symbol wa]"
+                   "(list [AAA BBB CCC]"
+                   "[23.33 16.67 150.00]))");
+
+    // Test integer aggregation with multiple elements per group
+    TEST_ASSERT_EQ(
+        "(set taggrI (table [Symbol Price Size] "
+        "(list [XXX XXX XXX YYY YYY ZZZ ZZZ] "
+        "[100 300 200 -10 -30 0 50] "
+        "[1 3 2 1 2 2 1]))) null",
+        "null");
+
+    TEST_ASSERT_EQ("(select {a: (avg Price) from: taggrI by: Symbol})",
+                   "(table [Symbol a]"
+                   "(list [XXX YYY ZZZ]"
+                   "[200.00 -20.00 25.00]))");
+
+    TEST_ASSERT_EQ("(select {mx: (max Price) from: taggrI by: Symbol})",
+                   "(table [Symbol mx]"
+                   "(list [XXX YYY ZZZ]"
+                   "[300 -10 50]))");
+
+    TEST_ASSERT_EQ("(select {mn: (min Price) from: taggrI by: Symbol})",
+                   "(table [Symbol mn]"
+                   "(list [XXX YYY ZZZ]"
+                   "[100 -30 0]))");
+
+    TEST_ASSERT_EQ("(select {wa: (wavg Price Size) from: taggrI by: Symbol})",
+                   "(table [Symbol wa]"
+                   "(list [XXX YYY ZZZ]"
+                   "[233.33 -23.33 16.67]))");
     PASS();
 }
 

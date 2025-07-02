@@ -497,10 +497,12 @@ obj_p aggr_max_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
     switch (val->type) {
         case TYPE_I64:
         case TYPE_TIMESTAMP:
-            AGGR_ITER(index, len, offset, val, res, i64, i64, $out[$y] = 0, $out[$y] = MAXI64($out[$y], $in[$x]));
+            AGGR_ITER(index, len, offset, val, res, i64, i64, $out[$y] = NULL_I64,
+                      $out[$y] = MAXI64($out[$y], $in[$x]));
             return res;
         case TYPE_F64:
-            AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = 0.0, $out[$y] = MAXF64($out[$y], $in[$x]));
+            AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = NULL_F64,
+                      $out[$y] = MAXF64($out[$y], $in[$x]));
             return res;
         default:
             destroy_partial_result(res);
@@ -545,10 +547,12 @@ obj_p aggr_min_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
     switch (val->type) {
         case TYPE_I64:
         case TYPE_TIMESTAMP:
-            AGGR_ITER(index, len, offset, val, res, i64, i64, $out[$y] = 0, $out[$y] = MINI64($out[$y], $in[$x]));
+            AGGR_ITER(index, len, offset, val, res, i64, i64, $out[$y] = NULL_I64,
+                      $out[$y] = MINI64($out[$y], $in[$x]));
             return res;
         case TYPE_F64:
-            AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = 0.0, $out[$y] = MINF64($out[$y], $in[$x]));
+            AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = NULL_F64,
+                      $out[$y] = MINF64($out[$y], $in[$x]));
             return res;
         default:
             res->len = 0;
@@ -562,7 +566,7 @@ obj_p aggr_min(obj_p val, obj_p index) {
     obj_p parts, res;
 
     n = index_group_count(index);
-    parts = aggr_map((raw_p)aggr_max_partial, val, val->type, index);
+    parts = aggr_map((raw_p)aggr_min_partial, val, val->type, index);
     if (IS_ERR(parts))
         return parts;
     switch (val->type) {
