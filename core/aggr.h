@@ -30,6 +30,7 @@ obj_p aggr_sum(obj_p val, obj_p index);
 obj_p aggr_first(obj_p val, obj_p index);
 obj_p aggr_last(obj_p val, obj_p index);
 obj_p aggr_avg(obj_p val, obj_p index);
+obj_p aggr_wavg(obj_p val, obj_p weight, obj_p index);
 obj_p aggr_max(obj_p val, obj_p index);
 obj_p aggr_min(obj_p val, obj_p index);
 obj_p aggr_count(obj_p val, obj_p index);

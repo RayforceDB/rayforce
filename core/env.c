@@ -136,6 +136,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "group",               TYPE_UNARY,    FN_NONE,                   ray_group);
     REGISTER_FN(functions,  "sum",                 TYPE_UNARY,    FN_ATOMIC | FN_AGGR,       ray_sum);
     REGISTER_FN(functions,  "avg",                 TYPE_UNARY,    FN_ATOMIC | FN_AGGR,       ray_avg);
+    REGISTER_FN(functions,  "wavg",                TYPE_BINARY,   FN_ATOMIC,                 ray_wavg);
     REGISTER_FN(functions,  "med",                 TYPE_UNARY,    FN_ATOMIC | FN_AGGR,       ray_med);
     REGISTER_FN(functions,  "dev",                 TYPE_UNARY,    FN_ATOMIC | FN_AGGR,       ray_dev);
     REGISTER_FN(functions,  "min",                 TYPE_UNARY,    FN_ATOMIC | FN_AGGR,       ray_min);

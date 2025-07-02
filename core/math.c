@@ -87,6 +87,24 @@
         NULL_OBJ;                                                                        \
     })
 
+// Macro for folding weighted average: accumulates sum(x*w) and sum(w) simultaneously
+// Writes results to output pointers instead of creating objects
+#define __BINOP_FOLD_WAVG(x, y, lt, rt, ln, of, weighted_sum_out, weight_sum_out) \
+    ({                                                                            \
+        __BASE_##lt##_t *__restrict__ $lhs;                                       \
+        __BASE_##rt##_t *__restrict__ $rhs;                                       \
+        f64_t $out1 = 0.0, $out2 = 0.0;                                           \
+        $lhs = __AS_##lt(x) + of;                                                 \
+        $rhs = __AS_##rt(y) + of;                                                 \
+        for (i64_t $i = 0; $i < ln; $i++) {                                       \
+            $out1 += lt##_to_f64($lhs[$i]) * rt##_to_f64($rhs[$i]);               \
+            $out2 += rt##_to_f64($rhs[$i]);                                       \
+        }                                                                         \
+        *(weighted_sum_out) = $out1;                                              \
+        *(weight_sum_out) = $out2;                                                \
+        NULL_OBJ;                                                                 \
+    })
+
 i8_t infer_math_type(obj_p x, obj_p y) {
     switch (MTYPE2(ABSI8(x->type), ABSI8(y->type))) {
         case MTYPE2(TYPE_B8, TYPE_I64):
@@ -1416,6 +1434,33 @@ obj_p ray_sq_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset) {
     }
 }
 
+// Optimized weighted average partial using macro - minimal code, no combinatorics!
+// Returns NULL_OBJ on success, writes results to output pointers
+obj_p ray_wavg_partial(obj_p x, obj_p w, i64_t len, i64_t offset, f64_t *weighted_sum, f64_t *weight_sum) {
+    switch (MTYPE2(x->type, w->type)) {
+        case MTYPE2(TYPE_I32, TYPE_I32):
+            return __BINOP_FOLD_WAVG(x, w, i32, i32, len, offset, weighted_sum, weight_sum);
+        case MTYPE2(TYPE_I32, TYPE_I64):
+            return __BINOP_FOLD_WAVG(x, w, i32, i64, len, offset, weighted_sum, weight_sum);
+        case MTYPE2(TYPE_I32, TYPE_F64):
+            return __BINOP_FOLD_WAVG(x, w, i32, f64, len, offset, weighted_sum, weight_sum);
+        case MTYPE2(TYPE_I64, TYPE_I32):
+            return __BINOP_FOLD_WAVG(x, w, i64, i32, len, offset, weighted_sum, weight_sum);
+        case MTYPE2(TYPE_I64, TYPE_I64):
+            return __BINOP_FOLD_WAVG(x, w, i64, i64, len, offset, weighted_sum, weight_sum);
+        case MTYPE2(TYPE_I64, TYPE_F64):
+            return __BINOP_FOLD_WAVG(x, w, i64, f64, len, offset, weighted_sum, weight_sum);
+        case MTYPE2(TYPE_F64, TYPE_I32):
+            return __BINOP_FOLD_WAVG(x, w, f64, i32, len, offset, weighted_sum, weight_sum);
+        case MTYPE2(TYPE_F64, TYPE_I64):
+            return __BINOP_FOLD_WAVG(x, w, f64, i64, len, offset, weighted_sum, weight_sum);
+        case MTYPE2(TYPE_F64, TYPE_F64):
+            return __BINOP_FOLD_WAVG(x, w, f64, f64, len, offset, weighted_sum, weight_sum);
+        default:
+            THROW(ERR_TYPE, "wavg_partial: unsupported type combination");
+    }
+}
+
 obj_p unop_fold(raw_p op, obj_p x) {
     pool_p pool;
     i64_t i, l, n, chunk;
@@ -1660,6 +1705,55 @@ obj_p ray_avg(obj_p x) {
 
         default:
             THROW(ERR_TYPE, "avg: unsupported type: '%s", type_name(x->type));
+    }
+}
+
+// Optimized weighted average: wavg(values, weights) = sum(values * weights) / sum(weights)
+obj_p ray_wavg(obj_p x, obj_p w) {
+    // Check that both vectors have the same length
+    if (x->len != w->len) {
+        THROW(ERR_LENGTH, "wavg: values and weights must have same length");
+    }
+
+    // Handle empty vectors
+    if (x->len == 0) {
+        return f64(0.0);
+    }
+
+    // Check for supported combinations of types
+    switch (MTYPE2(x->type, w->type)) {
+        case MTYPE2(TYPE_I32, TYPE_I32):
+        case MTYPE2(TYPE_I32, TYPE_I64):
+        case MTYPE2(TYPE_I32, TYPE_F64):
+        case MTYPE2(TYPE_I64, TYPE_I32):
+        case MTYPE2(TYPE_I64, TYPE_I64):
+        case MTYPE2(TYPE_I64, TYPE_F64):
+        case MTYPE2(TYPE_F64, TYPE_I32):
+        case MTYPE2(TYPE_F64, TYPE_I64):
+        case MTYPE2(TYPE_F64, TYPE_F64): {
+            // Use optimized partial function with output parameters to avoid allocations
+            f64_t weighted_sum, weight_sum;
+            obj_p result = ray_wavg_partial(x, w, x->len, 0, &weighted_sum, &weight_sum);
+
+            // Check if error occurred
+            if (result != NULL_OBJ) {
+                return result;  // return error object
+            }
+
+            // Calculate weighted average: weighted_sum / weight_sum
+            if (weight_sum == 0.0) {
+                THROW(ERR_TYPE, "wavg: zero sum of weights");
+            }
+
+            return f64(weighted_sum / weight_sum);
+        }
+
+        case MTYPE2(TYPE_MAPGROUP, TYPE_MAPGROUP):
+            return aggr_wavg(AS_LIST(x)[0], AS_LIST(w)[0], AS_LIST(x)[1]);
+
+        default:
+            THROW(ERR_TYPE, "wavg: unsupported type combination: '%s' and '%s'", type_name(x->type),
+                  type_name(w->type));
     }
 }
 

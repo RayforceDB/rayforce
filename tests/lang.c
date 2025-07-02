@@ -2524,6 +2524,27 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("((fn [x y] (+ x y)) 1 [2.3 4])", "[3.3 5.0]");
     TEST_ASSERT_EQ("(map count (list (list \"aaa\" \"bbb\")))", "[2]");
 
+    // Test wavg (weighted average) function
+    TEST_ASSERT_EQ("(wavg [1 2 3] [1 1 1])", "2.00");
+    TEST_ASSERT_EQ("(wavg [1 2 3] [2 1 3])", "2.17");
+    TEST_ASSERT_EQ("(wavg [10 20 30] [1 2 3])", "23.33");
+    TEST_ASSERT_EQ("(wavg [1.0 2.0 3.0] [1.0 1.0 1.0])", "2.00");
+    TEST_ASSERT_EQ("(wavg [1.5 2.5 3.5] [2.0 1.0 3.0])", "2.67");
+
+    // Test wavg with mixed types
+    TEST_ASSERT_EQ("(wavg [1i 2i 3i] [1 2 3])", "2.33");
+    TEST_ASSERT_EQ("(wavg [1 2 3] [1.0 2.0 3.0])", "2.33");
+    TEST_ASSERT_EQ("(wavg [1.0 2.0 3.0] [1i 2i 3i])", "2.33");
+
+    // Test wavg edge cases
+    TEST_ASSERT_EQ("(wavg [5] [1])", "5.00");
+    TEST_ASSERT_EQ("(wavg [10 20] [3 7])", "17.00");
+    TEST_ASSERT_EQ("(wavg [] [])", "0.00");
+
+    // Test wavg error cases
+    TEST_ASSERT_ER("(wavg [1 2 3] [1 2])", "wavg: values and weights must have same length");
+    TEST_ASSERT_ER("(wavg [1 2 3] [0 0 0])", "wavg: zero sum of weights");
+
     PASS();
 }
 

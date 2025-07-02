@@ -684,6 +684,50 @@ obj_p aggr_avg(obj_p val, obj_p index) {
     }
 }
 
+obj_p aggr_wavg(obj_p val, obj_p weight, obj_p index) {
+    i64_t i, l;
+    f64_t *result;
+    obj_p val_groups, weight_groups, res, group_result;
+    obj_p *val_list, *weight_list;
+
+    // Collect values and weights into groups
+    val_groups = aggr_collect(val, index);
+    if (IS_ERR(val_groups)) {
+        return val_groups;
+    }
+
+    weight_groups = aggr_collect(weight, index);
+    if (IS_ERR(weight_groups)) {
+        drop_obj(val_groups);
+        return weight_groups;
+    }
+
+    // Calculate weighted average for each group using ray_wavg
+    l = val_groups->len;
+    res = F64(l);
+    result = AS_F64(res);
+    val_list = AS_LIST(val_groups);
+    weight_list = AS_LIST(weight_groups);
+
+    for (i = 0; i < l; i++) {
+        group_result = ray_wavg(val_list[i], weight_list[i]);
+        if (IS_ERR(group_result)) {
+            drop_obj(val_groups);
+            drop_obj(weight_groups);
+            drop_obj(res);
+            return group_result;
+        }
+
+        result[i] = group_result->f64;
+        drop_obj(group_result);
+    }
+
+    drop_obj(val_groups);
+    drop_obj(weight_groups);
+
+    return res;
+}
+
 obj_p aggr_med(obj_p val, obj_p index) {
     obj_p res;
 

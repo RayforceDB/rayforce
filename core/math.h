@@ -38,6 +38,8 @@ obj_p ray_floor(obj_p x);
 obj_p ray_sum(obj_p x);
 obj_p ray_cnt(obj_p x);
 obj_p ray_avg(obj_p x);
+obj_p ray_wavg(obj_p x, obj_p w);
+obj_p ray_wavg_partial(obj_p x, obj_p w, i64_t len, i64_t offset, f64_t *weighted_sum, f64_t *weight_sum);
 obj_p ray_min(obj_p x);
 obj_p ray_max(obj_p x);
 obj_p ray_ceil(obj_p x);
