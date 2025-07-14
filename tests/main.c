@@ -204,6 +204,9 @@ test_entry_t tests[] = {
     {"test_lang_in", test_lang_in},
     {"test_lang_or", test_lang_or},
     {"test_lang_and", test_lang_and},
+    //{"test_sort_lists_by_type", test_sort_lists_by_type},
+    //{"test_sort_lists_nested", test_sort_lists_nested},
+    {"test_timsort_numbers", test_timsort_numbers},
 };
 // ---
 

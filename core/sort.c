@@ -26,6 +26,8 @@
 #include "string.h"
 #include "ops.h"
 #include "error.h"
+#include "symbols.h"
+#include <stdlib.h>
 
 #define COUNTING_SORT_LIMIT 1024 * 1024
 
@@ -35,111 +37,175 @@ inline __attribute__((always_inline)) nil_t swap(i64_t *a, i64_t *b) {
     *b = t;
 }
 
-// quick sort
-// https://www.geeksforgeeks.org/quick-sort/
-i64_t partition_asc(i64_t array[], i64_t indices[], i64_t low, i64_t high) {
-    i64_t pivot = array[indices[high]];
-    i64_t i = (low - 1);
+static obj_p timsort_generic_obj(obj_p *data, i64_t len, i64_t asc) {
+    if (len == 0)
+        return I64(0);
 
-    for (i64_t j = low; j <= high - 1; j++) {
-        if (array[indices[j]] < pivot) {
-            i++;
-            swap(&indices[i], &indices[j]);
+    obj_p indices = I64(len);
+    i64_t *ov = AS_I64(indices);
+
+    // Initialize indices
+    for (i64_t i = 0; i < len; i++) {
+        ov[i] = i;
+    }
+
+#define MIN_MERGE 32
+
+    // For small arrays, use insertion sort
+    if (len < MIN_MERGE) {
+        for (i64_t i = 1; i < len; i++) {
+            i64_t key = ov[i];
+            i64_t j = i - 1;
+            while (j >= 0 && asc * cmp_obj(data[ov[j]], data[key]) > 0) {
+                ov[j + 1] = ov[j];
+                j--;
+            }
+            ov[j + 1] = key;
         }
+        return indices;
     }
-    swap(&indices[i + 1], &indices[high]);
 
-    return i + 1;
-}
+    // TimSort: Find natural runs and merge them
+    i64_t stack_size = 0;
+    i64_t runs[64][2];  // [start, length] pairs
 
-i64_t partition_desc(i64_t array[], i64_t indices[], i64_t low, i64_t high) {
-    i64_t pivot = array[indices[high]];
-    i64_t i = (low - 1);
+    // Find runs and merge them
+    i64_t pos = 0;
+    while (pos < len) {
+        i64_t run_start = pos;
+        i64_t run_len = 1;
 
-    for (i64_t j = low; j <= high - 1; j++) {
-        if (array[indices[j]] > pivot) {
-            i++;
-            swap(&indices[i], &indices[j]);
+        // Find natural run
+        if (pos + 1 < len) {
+            i64_t cmp = asc * cmp_obj(data[ov[pos]], data[ov[pos + 1]]);
+            if (cmp <= 0) {
+                // Ascending run
+                while (pos + run_len < len &&
+                       asc * cmp_obj(data[ov[pos + run_len - 1]], data[ov[pos + run_len]]) <= 0) {
+                    run_len++;
+                }
+            } else {
+                // Descending run - reverse it
+                while (pos + run_len < len && asc * cmp_obj(data[ov[pos + run_len - 1]], data[ov[pos + run_len]]) > 0) {
+                    run_len++;
+                }
+                // Reverse the descending run
+                for (i64_t i = 0; i < run_len / 2; i++) {
+                    i64_t temp = ov[run_start + i];
+                    ov[run_start + i] = ov[run_start + run_len - 1 - i];
+                    ov[run_start + run_len - 1 - i] = temp;
+                }
+            }
         }
+
+        // Extend short runs with insertion sort
+        if (run_len < MIN_MERGE) {
+            i64_t force_len = (pos + MIN_MERGE <= len) ? MIN_MERGE : (len - pos);
+            for (i64_t i = run_start + run_len; i < run_start + force_len; i++) {
+                i64_t key = ov[i];
+                i64_t j = i - 1;
+                while (j >= run_start && asc * cmp_obj(data[ov[j]], data[key]) > 0) {
+                    ov[j + 1] = ov[j];
+                    j--;
+                }
+                ov[j + 1] = key;
+            }
+            run_len = force_len;
+        }
+
+        // Add run to stack
+        runs[stack_size][0] = run_start;
+        runs[stack_size][1] = run_len;
+        stack_size++;
+
+        // Merge runs to maintain stack invariant
+        while (stack_size > 1) {
+            i64_t n = stack_size - 1;
+            if ((n >= 2 && runs[n - 2][1] <= runs[n - 1][1] + runs[n][1]) ||
+                (n >= 3 && runs[n - 3][1] <= runs[n - 2][1] + runs[n - 1][1])) {
+                // Determine which runs to merge
+                i64_t merge_at = (n >= 2 && runs[n - 2][1] < runs[n][1]) ? n - 2 : n - 1;
+
+                // Merge two adjacent runs
+                i64_t start1 = runs[merge_at][0];
+                i64_t len1 = runs[merge_at][1];
+                i64_t start2 = runs[merge_at + 1][0];
+                i64_t len2 = runs[merge_at + 1][1];
+
+                i64_t *temp = malloc(sizeof(i64_t) * (len1 + len2));
+                i64_t i = 0, j = 0, k = 0;
+
+                while (i < len1 && j < len2) {
+                    if (asc * cmp_obj(data[ov[start1 + i]], data[ov[start2 + j]]) <= 0) {
+                        temp[k++] = ov[start1 + i++];
+                    } else {
+                        temp[k++] = ov[start2 + j++];
+                    }
+                }
+
+                while (i < len1)
+                    temp[k++] = ov[start1 + i++];
+                while (j < len2)
+                    temp[k++] = ov[start2 + j++];
+
+                for (i = 0; i < len1 + len2; i++) {
+                    ov[start1 + i] = temp[i];
+                }
+
+                free(temp);
+
+                // Update runs stack
+                runs[merge_at][1] = len1 + len2;
+                for (i64_t i = merge_at + 1; i < stack_size - 1; i++) {
+                    runs[i][0] = runs[i + 1][0];
+                    runs[i][1] = runs[i + 1][1];
+                }
+                stack_size--;
+            } else {
+                break;
+            }
+        }
+
+        pos += run_len;
     }
-    swap(&indices[i + 1], &indices[high]);
 
-    return i + 1;
-}
+    // Merge remaining runs
+    while (stack_size > 1) {
+        i64_t n = stack_size - 1;
 
-nil_t quick_sort_asc(i64_t array[], i64_t indices[], i64_t low, i64_t high) {
-    i64_t pi;
+        // Merge last two runs
+        i64_t start1 = runs[n - 1][0];
+        i64_t len1 = runs[n - 1][1];
+        i64_t start2 = runs[n][0];
+        i64_t len2 = runs[n][1];
 
-    if (low < high) {
-        pi = partition_asc(array, indices, low, high);
-        quick_sort_asc(array, indices, low, pi - 1);
-        quick_sort_asc(array, indices, pi + 1, high);
+        i64_t *temp = malloc(sizeof(i64_t) * (len1 + len2));
+        i64_t i = 0, j = 0, k = 0;
+
+        while (i < len1 && j < len2) {
+            if (asc * cmp_obj(data[ov[start1 + i]], data[ov[start2 + j]]) <= 0) {
+                temp[k++] = ov[start1 + i++];
+            } else {
+                temp[k++] = ov[start2 + j++];
+            }
+        }
+
+        while (i < len1)
+            temp[k++] = ov[start1 + i++];
+        while (j < len2)
+            temp[k++] = ov[start2 + j++];
+
+        for (i = 0; i < len1 + len2; i++) {
+            ov[start1 + i] = temp[i];
+        }
+
+        free(temp);
+
+        runs[n - 1][1] = len1 + len2;
+        stack_size--;
     }
-}
 
-nil_t quick_sort_desc(i64_t array[], i64_t indices[], i64_t low, i64_t high) {
-    i64_t pi;
-
-    if (low < high) {
-        pi = partition_desc(array, indices, low, high);
-        quick_sort_desc(array, indices, low, pi - 1);
-        quick_sort_desc(array, indices, pi + 1, high);
-    }
-}
-
-// heap sort
-nil_t heapify_asc(i64_t array[], i64_t indices[], i64_t n, i64_t i) {
-    i64_t largest = i;
-    i64_t left = 2 * i + 1;
-    i64_t right = 2 * i + 2;
-
-    if (left < n && array[indices[left]] > array[indices[largest]])
-        largest = left;
-
-    if (right < n && array[indices[right]] > array[indices[largest]])
-        largest = right;
-
-    if (largest != i) {
-        swap(&indices[i], &indices[largest]);
-        heapify_asc(array, indices, n, largest);
-    }
-}
-
-nil_t heapify_desc(i64_t array[], i64_t indices[], i64_t n, i64_t i) {
-    i64_t largest = i;
-    i64_t left = 2 * i + 1;
-    i64_t right = 2 * i + 2;
-
-    if (left < n && array[indices[left]] < array[indices[largest]])
-        largest = left;
-
-    if (right < n && array[indices[right]] < array[indices[largest]])
-        largest = right;
-
-    if (largest != i) {
-        swap(&indices[i], &indices[largest]);
-        heapify_desc(array, indices, n, largest);
-    }
-}
-
-nil_t heap_sort_asc(i64_t array[], i64_t indices[], i64_t n) {
-    for (i64_t i = n / 2 - 1; i >= 0; i--)
-        heapify_asc(array, indices, n, i);
-
-    for (i64_t i = n - 1; i >= 0; i--) {
-        swap(&indices[0], &indices[i]);
-        heapify_asc(array, indices, i, 0);
-    }
-}
-
-nil_t heap_sort_desc(i64_t array[], i64_t indices[], i64_t n) {
-    for (i64_t i = n / 2 - 1; i >= 0; i--)
-        heapify_asc(array, indices, n, i);
-
-    for (i64_t i = n - 1; i >= 0; i--) {
-        swap(&indices[0], &indices[i]);
-        heapify_desc(array, indices, i, 0);
-    }
+    return indices;
 }
 
 // insertion sort
@@ -303,67 +369,6 @@ obj_p ray_sort_asc_i32(obj_p vec) {
     }
 
     drop_obj(temp);
-    return indices;
-}
-
-// TODO need fix
-obj_p ray_sort_asc_i64_(obj_p vec) {
-    i64_t i, len = vec->len, out_of_order = 0, inrange = 0, min, max;
-    obj_p indices = I64(len);
-    i64_t *iv = AS_I64(vec), *ov = AS_I64(indices);
-
-    max = min = iv[0];
-
-    for (i = 0; i < len; i++) {
-        if (iv[i] < min)
-            min = iv[i];
-        else if (iv[i] > max)
-            max = iv[i];
-
-        if ((iv[i] - min) < COUNTING_SORT_LIMIT)
-            inrange++;
-
-        if (i > 0 && iv[i] < iv[i - 1])
-            out_of_order++;
-    }
-
-    // ascending order
-    if (out_of_order == 0) {
-        vec->attrs |= ATTR_ASC;
-        for (i = 0; i < len; i++)
-            ov[i] = i;
-        return indices;
-    }
-
-    // descending order
-    if (out_of_order == len - 1) {
-        vec->attrs |= ATTR_DESC;
-        for (i = 0; i < len; i++)
-            ov[i] = len - i - 1;
-        return indices;
-    }
-
-    if (inrange == len) {
-        counting_sort_asc(iv, ov, len, min, max);
-        return indices;
-    }
-
-    // fill with indexes
-    for (i = 0; i < len; i++)
-        ov[i] = i;
-
-    if (len < 100) {
-        insertion_sort_asc(iv, ov, 0, len - 1);
-        return indices;
-    }
-
-    // mainly ordered
-    if (out_of_order < len / 3) {
-        heap_sort_asc(iv, ov, len);
-        return indices;
-    }
-
-    quick_sort_asc(iv, ov, 0, len - 1);
     return indices;
 }
 
@@ -546,6 +551,10 @@ obj_p ray_sort_asc(obj_p vec) {
             return ray_sort_asc_i64(vec);
         case TYPE_F64:
             return ray_sort_asc_f64(vec);
+        case TYPE_SYMBOL:
+            return timsort_generic_obj(&vec, vec->len, 1);
+        case TYPE_LIST:
+            return timsort_generic_obj(AS_LIST(vec), vec->len, 1);
         default:
             THROW(ERR_TYPE, "sort: unsupported type: '%s", type_name(vec->type));
     }
@@ -755,23 +764,23 @@ obj_p ray_sort_desc(obj_p vec) {
     switch (vec->type) {
         case TYPE_B8:
         case TYPE_U8:
-        case TYPE_C8: {
+        case TYPE_C8:
             return ray_sort_desc_u8(vec);
-        };
-        case TYPE_I16: {
+        case TYPE_I16:
             return ray_sort_desc_i16(vec);
-        };
         case TYPE_I32:
         case TYPE_DATE:
-        case TYPE_TIME: {
+        case TYPE_TIME:
             return ray_sort_desc_i32(vec);
-        };
         case TYPE_I64:
         case TYPE_TIMESTAMP:
             return ray_sort_desc_i64(vec);
-        case TYPE_F64: {
+        case TYPE_F64:
             return ray_sort_desc_f64(vec);
-        };
+        case TYPE_SYMBOL:
+            return timsort_generic_obj(&vec, vec->len, -1);
+        case TYPE_LIST:
+            return timsort_generic_obj(AS_LIST(vec), vec->len, -1);
         default:
             THROW(ERR_TYPE, "sort: unsupported type: '%s", type_name(vec->type));
     }

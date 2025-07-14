@@ -1819,23 +1819,60 @@ i64_t cmp_obj(obj_p a, obj_p b) {
         return 0;
 
     if (a->type != b->type)
+        // if ((a->type == -TYPE_I16 || a->type == -TYPE_I32 || a->type == -TYPE_I64) &&
+        //     (b->type == -TYPE_I16 || b->type == -TYPE_I32 || b->type != -TYPE_I64)) {
+        //     switch (a->type) {
+        //         case -TYPE_I16:
+        //             switch (b->type) {
+        //                 case -TYPE_I32:
+        //                     return (i64_t)a->i16 - (i64_t)b->i32;
+        //                 case -TYPE_I64:
+        //                     return (i64_t)a->i16 < b->i64 ? -1 : (i64_t)a->i16 > b->i64 ? 1 : 0;
+        //             }
+        //         case -TYPE_I32:
+        //             switch (b->type) {
+        //                 case -TYPE_I16:
+        //                     return (i64_t)a->i32 - (i64_t)b->i16;
+        //                 case -TYPE_I64:
+        //                     return (i64_t)a->i32 < b->i64 ? -1 : (i64_t)a->i32 > b->i64 ? 1 : 0;
+        //             }
+        //         case -TYPE_I64:
+        //             switch (b->type) {
+        //                 case -TYPE_I16:
+        //                     return a->i64<(i64_t)b->i16 ? -1 : a->i64>(i64_t) b->i16 ? 1 : 0;
+        //                 case -TYPE_I32:
+        //                     return a->i64<(i64_t)b->i32 ? -1 : a->i64>(i64_t) b->i32 ? 1 : 0;
+        //             }
+        //     }
+        // } else {
         return a->type - b->type;
+    // }
 
     switch (a->type) {
         case -TYPE_B8:
             return (i64_t)a->b8 - (i64_t)b->b8;
         case -TYPE_U8:
+            return (i64_t)a->u8 - (i64_t)b->u8;
+        case -TYPE_I16:
+            return (i64_t)a->i16 - (i64_t)b->i16;
         case -TYPE_C8:
-            return (i64_t)a->u8 - (i32_t)b->u8;
+            return (i64_t)a->u8 - (i64_t)b->u8;
         case -TYPE_I32:
+        case -TYPE_DATE:
+        case -TYPE_TIME:
             return (i64_t)a->i32 - (i64_t)b->i32;
         case -TYPE_I64:
-        case -TYPE_SYMBOL:
         case -TYPE_TIMESTAMP:
+            return a->i64 > b->i64 ? 1 : a->i64 < b->i64 ? -1 : 0;
         case TYPE_UNARY:
         case TYPE_BINARY:
         case TYPE_VARY:
             return a->i64 - b->i64;
+        case -TYPE_SYMBOL: {
+            str_p str_a = str_from_symbol(a->i64);
+            str_p str_b = str_from_symbol(b->i64);
+            return strcmp(str_a, str_b);
+        }
         case -TYPE_F64:
             return (ISNANF64(a->f64) && ISNANF64(b->f64))   ? 0
                    : (ISNANF64(a->f64) || ISNANF64(b->f64)) ? 1
@@ -1843,48 +1880,58 @@ i64_t cmp_obj(obj_p a, obj_p b) {
                                                             : 1;
         case -TYPE_GUID:
             return memcmp(AS_GUID(a), AS_GUID(b), sizeof(guid_t));
-        case TYPE_I16:
-            if (a->len != b->len)
-                return a->len - b->len;
-
-            l = a->len;
+        case TYPE_B8:
+        case TYPE_C8:
+        case TYPE_U8: {
+            l = a->len < b->len ? a->len : b->len;
+            d = memcmp(AS_C8(a), AS_C8(b), l);
+            if (d != 0)
+                return d;
+            return a->len - b->len;
+        }
+        case TYPE_I16: {
+            l = a->len < b->len ? a->len : b->len;
             for (i = 0; i < l; i++) {
                 d = (i64_t)(AS_I16(a)[i] - AS_I16(b)[i]);
                 if (d != 0)
                     return d;
             }
-            return 0;
+            return a->len - b->len;
+        }
         case TYPE_I32:
         case TYPE_DATE:
-        case TYPE_TIME:
-            if (a->len != b->len)
-                return a->len - b->len;
-
-            l = a->len;
+        case TYPE_TIME: {
+            l = a->len < b->len ? a->len : b->len;
             for (i = 0; i < l; i++) {
                 d = (i64_t)(AS_I32(a)[i] - AS_I32(b)[i]);
                 if (d != 0)
                     return d;
             }
-            return 0;
+            return a->len - b->len;
+        }
         case TYPE_I64:
-        case TYPE_SYMBOL:
-        case TYPE_TIMESTAMP:
-            if (a->len != b->len)
-                return a->len - b->len;
-
-            l = a->len;
+        case TYPE_TIMESTAMP: {
+            l = a->len < b->len ? a->len : b->len;
             for (i = 0; i < l; i++) {
-                d = AS_I64(a)[i] - AS_I64(b)[i];
+                d = AS_I64(a)[i] > AS_I64(b)[i] ? 1 : AS_I64(a)[i] < AS_I64(b)[i] ? -1 : 0;
                 if (d != 0)
                     return d;
             }
-            return 0;
-        case TYPE_F64:
-            if (a->len != b->len)
-                return a->len - b->len;
-
-            l = a->len;
+            return a->len - b->len;
+        }
+        case TYPE_SYMBOL: {
+            l = a->len < b->len ? a->len : b->len;
+            for (i = 0; i < l; i++) {
+                str_p str_a = str_from_symbol(AS_I64(a)[i]);
+                str_p str_b = str_from_symbol(AS_I64(b)[i]);
+                d = strcmp(str_a, str_b);
+                if (d != 0)
+                    return d;
+            }
+            return a->len - b->len;
+        }
+        case TYPE_F64: {
+            l = a->len < b->len ? a->len : b->len;
             for (i = 0; i < l; i++) {
                 d = (ISNANF64(AS_F64(a)[i]) && ISNANF64(AS_F64(b)[i]))   ? 0
                     : (ISNANF64(AS_F64(a)[i]) || ISNANF64(AS_F64(b)[i])) ? 1
@@ -1893,33 +1940,19 @@ i64_t cmp_obj(obj_p a, obj_p b) {
                 if (d != 0)
                     return d;
             }
-
-            return 0;
-        case TYPE_C8:
-            if (a->len != b->len)
-                return a->len - b->len;
-
-            l = a->len;
+            return a->len - b->len;
+        }
+        case TYPE_LIST: {
+            l = a->len < b->len ? a->len : b->len;
             for (i = 0; i < l; i++) {
-                d = AS_C8(a)[i] - AS_C8(b)[i];
+                obj_p elem_a = AS_LIST(a)[i];
+                obj_p elem_b = AS_LIST(b)[i];
+                d = cmp_obj(elem_a, elem_b);
                 if (d != 0)
                     return d;
             }
-
-            return 0;
-
-        case TYPE_LIST:
-            if (a->len != b->len)
-                return a->len - b->len;
-
-            l = a->len;
-            for (i = 0; i < l; i++) {
-                d = cmp_obj(AS_LIST(a)[i], AS_LIST(b)[i]);
-                if (d != 0)
-                    return d;
-            }
-
-            return 0;
+            return a->len - b->len;
+        }
 
         default:
             return -1;

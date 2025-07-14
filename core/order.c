@@ -43,6 +43,8 @@ obj_p ray_iasc(obj_p x) {
         case TYPE_I64:
         case TYPE_TIMESTAMP:
         case TYPE_F64:
+        case TYPE_LIST:
+        case TYPE_SYMBOL:
             return ray_sort_asc(x);
         default:
             THROW(ERR_TYPE, "iasc: unsupported type: '%s", type_name(x->type));
@@ -61,6 +63,8 @@ obj_p ray_idesc(obj_p x) {
         case TYPE_I64:
         case TYPE_TIMESTAMP:
         case TYPE_F64:
+        case TYPE_LIST:
+        case TYPE_SYMBOL:
             return ray_sort_desc(x);
         default:
             THROW(ERR_TYPE, "idesc: unsupported type: '%s", type_name(x->type));
@@ -119,6 +123,7 @@ obj_p ray_asc(obj_p x) {
             return res;
 
         case TYPE_I64:
+        case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
         case TYPE_F64:
             idx = ray_sort_asc(x);
@@ -128,6 +133,16 @@ obj_p ray_asc(obj_p x) {
             idx->attrs |= ATTR_ASC;
             idx->type = x->type;
             return idx;
+
+        case TYPE_LIST:
+            idx = ray_sort_asc(x);
+            l = x->len;
+            res = LIST(l);
+            for (i = 0; i < l; i++)
+                AS_LIST(res)[i] = clone_obj(AS_LIST(x)[AS_I64(idx)[i]]);
+            res->attrs |= ATTR_ASC;
+            drop_obj(idx);
+            return res;
 
         default:
             THROW(ERR_TYPE, "asc: unsupported type: '%s", type_name(x->type));
@@ -186,6 +201,7 @@ obj_p ray_desc(obj_p x) {
             return res;
 
         case TYPE_I64:
+        case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
         case TYPE_F64:
             idx = ray_sort_desc(x);
@@ -195,6 +211,17 @@ obj_p ray_desc(obj_p x) {
             idx->attrs |= ATTR_DESC;
             idx->type = x->type;
             return idx;
+
+        case TYPE_LIST:
+            idx = ray_sort_desc(x);
+            l = x->len;
+            res = LIST(l);
+            for (i = 0; i < l; i++)
+                AS_LIST(res)[i] = clone_obj(AS_LIST(x)[AS_I64(idx)[i]]);
+            res->attrs |= ATTR_DESC;
+            drop_obj(idx);
+            return res;
+
         default:
             THROW(ERR_TYPE, "desc: unsupported type: '%s", type_name(x->type));
     }

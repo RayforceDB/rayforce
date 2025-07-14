@@ -21,6 +21,20 @@
  *   SOFTWARE.
  */
 
+test_result_t test_timsort_numbers() {
+    TEST_ASSERT_EQ("(asc [5 2 8 1 9 3 7 4 6])", "[1 2 3 4 5 6 7 8 9]");
+    TEST_ASSERT_EQ("(desc [5 2 8 1 9 3 7 4 6])", "[9 8 7 6 5 4 3 2 1]");
+    TEST_ASSERT_EQ("(asc [-5 2 -8 1 -9 3 -7 4 -6])", "[-9 -8 -7 -6 -5 1 2 3 4]");
+    TEST_ASSERT_EQ("(asc [3 1 4 1 5 9 2 6 5 3 5])", "[1 1 2 3 3 4 5 5 5 6 9]");
+    TEST_ASSERT_EQ("(asc [42])", "[42]");
+    TEST_ASSERT_EQ("(asc [])", "[]");
+    TEST_ASSERT_EQ("(asc [1 2 3 4 5])", "[1 2 3 4 5]");
+    TEST_ASSERT_EQ("(asc [5 4 3 2 1])", "[1 2 3 4 5]");
+    TEST_ASSERT_EQ("(asc [9 8 7 6 5 4 3 2 1 0 -1 -2 -3 -4 -5])", "[-5 -4 -3 -2 -1 0 1 2 3 4 5 6 7 8 9]");
+
+    PASS();
+}
+
 test_result_t test_sort_asc() {
     TEST_ASSERT_EQ("(iasc [true false true false])", "[1 3 0 2]");
     TEST_ASSERT_EQ("(asc [true false true false])", "[false false true true]");
@@ -70,6 +84,10 @@ test_result_t test_sort_asc() {
 
     TEST_ASSERT_EQ("(iasc (asc [4 3 2 1]))", "[0 1 2 3]");
     TEST_ASSERT_EQ("(asc (asc [4 3 2 1]))", "[1 2 3 4]");
+
+    TEST_ASSERT_EQ("(iasc (list 'a 0 3i 'b 'aa [5 6] (list [1 2 3]) 3i [6i 7i] 0Nl))", "[0 4 3 9 1 2 7 6 8 5]");
+    TEST_ASSERT_EQ("(asc (list 'a 0 3i 'b 'aa [5 6] (list [1 2 3]) 3i [6i 7i] 0Nl))",
+                   "(list 'a 'aa 'b 0Nl 0 3i 3i (list [1 2 3]) [6i 7i] [5 6])");
 
     PASS();
 }
@@ -123,6 +141,10 @@ test_result_t test_sort_desc() {
     TEST_ASSERT_EQ("(idesc (desc [4 3 2 1]))", "[0 1 2 3]");
     TEST_ASSERT_EQ("(desc (desc [4 3 2 1]))", "[4 3 2 1]");
 
+    TEST_ASSERT_EQ("(idesc (list 'a 0 3i 'b 'aa [5 6] (list [1 2 3]) 3i [6i 7i] 0Nl))", "[5 8 6 2 7 1 9 3 4 0]");
+    TEST_ASSERT_EQ("(desc (list 'a 0 3i 'b 'aa [5 6] (list [1 2 3]) 3i [6i 7i] 0Nl))",
+                   "(list [5 6] [6i 7i] (list [1 2 3]) 3i 3i 0 0Nl 'b 'aa 'a)");
+
     PASS();
 }
 
@@ -162,5 +184,15 @@ test_result_t test_sort_xdesc() {
     TEST_ASSERT_EQ("(xdesc (table ['a 'b] (list [1 1 2 2 3 3] [10 20 10 20 10 20])) ['b 'a])",
                    "(table ['a 'b] (list [3 2 1 3 2 1] [20 20 20 10 10 10]))");
     TEST_ASSERT_EQ("(xdesc (table ['a 'b] (list [1 1 1] [3 2 1])) ['a 'b])", "(table ['a 'b] (list [1 1 1] [3 2 1]))");
+    PASS();
+}
+
+test_result_t test_sort_timsort_symbols() {
+    TEST_ASSERT_EQ("(iasc (list 'zebra 'apple 'banana 'cherry))", "[1 2 3 0]");
+    TEST_ASSERT_EQ("(asc (list 'zebra 'apple 'banana 'cherry))", "(list 'apple 'banana 'cherry 'zebra)");
+
+    TEST_ASSERT_EQ("(iasc (list 'single))", "[0]");
+    TEST_ASSERT_EQ("(asc (list 'single))", "(list 'single)");
+
     PASS();
 }

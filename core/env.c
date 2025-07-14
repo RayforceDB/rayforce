@@ -147,10 +147,10 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "last",                TYPE_UNARY,    FN_NONE | FN_AGGR,         ray_last);
     REGISTER_FN(functions,  "count",               TYPE_UNARY,    FN_NONE | FN_AGGR,         ray_count);
     REGISTER_FN(functions,  "not",                 TYPE_UNARY,    FN_ATOMIC,                 ray_not);
-    REGISTER_FN(functions,  "iasc",                TYPE_UNARY,    FN_ATOMIC,                 ray_iasc);
-    REGISTER_FN(functions,  "idesc",               TYPE_UNARY,    FN_ATOMIC,                 ray_idesc);
-    REGISTER_FN(functions,  "asc",                 TYPE_UNARY,    FN_ATOMIC,                 ray_asc);
-    REGISTER_FN(functions,  "desc",                TYPE_UNARY,    FN_ATOMIC,                 ray_desc);
+    REGISTER_FN(functions,  "iasc",                TYPE_UNARY,    FN_NONE,                   ray_iasc);
+    REGISTER_FN(functions,  "idesc",               TYPE_UNARY,    FN_NONE,                   ray_idesc);
+    REGISTER_FN(functions,  "asc",                 TYPE_UNARY,    FN_NONE,                   ray_asc);
+    REGISTER_FN(functions,  "desc",                TYPE_UNARY,    FN_NONE,                   ray_desc);
     REGISTER_FN(functions,  "guid",                TYPE_UNARY,    FN_ATOMIC,                 ray_guid);
     REGISTER_FN(functions,  "neg",                 TYPE_UNARY,    FN_ATOMIC,                 ray_neg);
     REGISTER_FN(functions,  "where",               TYPE_UNARY,    FN_ATOMIC,                 ray_where);
