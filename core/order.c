@@ -45,6 +45,7 @@ obj_p ray_iasc(obj_p x) {
         case TYPE_F64:
         case TYPE_LIST:
         case TYPE_SYMBOL:
+        case TYPE_DICT:
             return ray_sort_asc(x);
         default:
             THROW(ERR_TYPE, "iasc: unsupported type: '%s", type_name(x->type));
@@ -65,6 +66,7 @@ obj_p ray_idesc(obj_p x) {
         case TYPE_F64:
         case TYPE_LIST:
         case TYPE_SYMBOL:
+        case TYPE_DICT:
             return ray_sort_desc(x);
         default:
             THROW(ERR_TYPE, "idesc: unsupported type: '%s", type_name(x->type));
@@ -144,6 +146,17 @@ obj_p ray_asc(obj_p x) {
             drop_obj(idx);
             return res;
 
+        case TYPE_DICT: {
+            idx = ray_sort_asc(AS_LIST(x)[1]);
+            obj_p sorted_keys = at_obj(AS_LIST(x)[0], idx);
+            obj_p sorted_vals = at_obj(AS_LIST(x)[1], idx);
+
+            res = dict(sorted_keys, sorted_vals);
+            res->attrs |= ATTR_ASC;
+            drop_obj(idx);
+            return res;
+        }
+
         default:
             THROW(ERR_TYPE, "asc: unsupported type: '%s", type_name(x->type));
     }
@@ -221,6 +234,17 @@ obj_p ray_desc(obj_p x) {
             res->attrs |= ATTR_DESC;
             drop_obj(idx);
             return res;
+
+        case TYPE_DICT: {
+            idx = ray_sort_desc(AS_LIST(x)[1]);
+            obj_p sorted_keys = at_obj(AS_LIST(x)[0], idx);
+            obj_p sorted_vals = at_obj(AS_LIST(x)[1], idx);
+
+            res = dict(sorted_keys, sorted_vals);
+            res->attrs |= ATTR_DESC;
+            drop_obj(idx);
+            return res;
+        }
 
         default:
             THROW(ERR_TYPE, "desc: unsupported type: '%s", type_name(x->type));

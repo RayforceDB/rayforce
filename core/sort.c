@@ -555,6 +555,8 @@ obj_p ray_sort_asc(obj_p vec) {
             return timsort_generic_obj(&vec, vec->len, 1);
         case TYPE_LIST:
             return timsort_generic_obj(AS_LIST(vec), vec->len, 1);
+        case TYPE_DICT:
+            return at_obj(AS_LIST(vec)[0], ray_sort_asc(AS_LIST(vec)[1]));
         default:
             THROW(ERR_TYPE, "sort: unsupported type: '%s", type_name(vec->type));
     }
@@ -781,6 +783,8 @@ obj_p ray_sort_desc(obj_p vec) {
             return timsort_generic_obj(&vec, vec->len, -1);
         case TYPE_LIST:
             return timsort_generic_obj(AS_LIST(vec), vec->len, -1);
+        case TYPE_DICT:
+            return at_obj(AS_LIST(vec)[0], ray_sort_desc(AS_LIST(vec)[1]));
         default:
             THROW(ERR_TYPE, "sort: unsupported type: '%s", type_name(vec->type));
     }
