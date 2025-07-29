@@ -37,7 +37,20 @@ inline __attribute__((always_inline)) nil_t swap(i64_t *a, i64_t *b) {
     *b = t;
 }
 
-static obj_p timsort_generic_obj(obj_p *data, i64_t len, i64_t asc) {
+// Function pointer for comparison
+typedef i64_t (*compare_func_t)(obj_p vec, i64_t idx_i, i64_t idx_j);
+
+static i64_t compare_symbols(obj_p vec, i64_t idx_i, i64_t idx_j) {
+    return strcmp(str_from_symbol(AS_I64(vec)[idx_i]), str_from_symbol(AS_I64(vec)[idx_j]));
+}
+
+static i64_t compare_lists(obj_p vec, i64_t idx_i, i64_t idx_j) {
+    return cmp_obj(AS_LIST(vec)[idx_i], AS_LIST(vec)[idx_j]);
+}
+
+static obj_p timsort_generic_obj(obj_p vec, i64_t asc) {
+    i64_t len = vec->len;
+
     if (len == 0)
         return I64(0);
 
@@ -51,12 +64,25 @@ static obj_p timsort_generic_obj(obj_p *data, i64_t len, i64_t asc) {
 
 #define MIN_MERGE 32
 
+    // Select comparison function once
+    compare_func_t compare_fn;
+    switch (vec->type) {
+        case TYPE_SYMBOL:
+            compare_fn = compare_symbols;
+            break;
+        case TYPE_LIST:
+            compare_fn = compare_lists;
+            break;
+        default:
+            return I64(0);
+    }
+
     // For small arrays, use insertion sort
     if (len < MIN_MERGE) {
         for (i64_t i = 1; i < len; i++) {
             i64_t key = ov[i];
             i64_t j = i - 1;
-            while (j >= 0 && asc * cmp_obj(data[ov[j]], data[key]) > 0) {
+            while (j >= 0 && asc * compare_fn(vec, ov[j], key) > 0) {
                 ov[j + 1] = ov[j];
                 j--;
             }
@@ -77,16 +103,15 @@ static obj_p timsort_generic_obj(obj_p *data, i64_t len, i64_t asc) {
 
         // Find natural run
         if (pos + 1 < len) {
-            i64_t cmp = asc * cmp_obj(data[ov[pos]], data[ov[pos + 1]]);
+            i64_t cmp = asc * compare_fn(vec, ov[pos], ov[pos + 1]);
             if (cmp <= 0) {
                 // Ascending run
-                while (pos + run_len < len &&
-                       asc * cmp_obj(data[ov[pos + run_len - 1]], data[ov[pos + run_len]]) <= 0) {
+                while (pos + run_len < len && asc * compare_fn(vec, ov[pos + run_len - 1], ov[pos + run_len]) <= 0) {
                     run_len++;
                 }
             } else {
                 // Descending run - reverse it
-                while (pos + run_len < len && asc * cmp_obj(data[ov[pos + run_len - 1]], data[ov[pos + run_len]]) > 0) {
+                while (pos + run_len < len && asc * compare_fn(vec, ov[pos + run_len - 1], ov[pos + run_len]) > 0) {
                     run_len++;
                 }
                 // Reverse the descending run
@@ -104,7 +129,7 @@ static obj_p timsort_generic_obj(obj_p *data, i64_t len, i64_t asc) {
             for (i64_t i = run_start + run_len; i < run_start + force_len; i++) {
                 i64_t key = ov[i];
                 i64_t j = i - 1;
-                while (j >= run_start && asc * cmp_obj(data[ov[j]], data[key]) > 0) {
+                while (j >= run_start && asc * compare_fn(vec, ov[j], key) > 0) {
                     ov[j + 1] = ov[j];
                     j--;
                 }
@@ -136,7 +161,7 @@ static obj_p timsort_generic_obj(obj_p *data, i64_t len, i64_t asc) {
                 i64_t i = 0, j = 0, k = 0;
 
                 while (i < len1 && j < len2) {
-                    if (asc * cmp_obj(data[ov[start1 + i]], data[ov[start2 + j]]) <= 0) {
+                    if (asc * compare_fn(vec, ov[start1 + i], ov[start2 + j]) <= 0) {
                         temp[k++] = ov[start1 + i++];
                     } else {
                         temp[k++] = ov[start2 + j++];
@@ -183,7 +208,7 @@ static obj_p timsort_generic_obj(obj_p *data, i64_t len, i64_t asc) {
         i64_t i = 0, j = 0, k = 0;
 
         while (i < len1 && j < len2) {
-            if (asc * cmp_obj(data[ov[start1 + i]], data[ov[start2 + j]]) <= 0) {
+            if (asc * compare_fn(vec, ov[start1 + i], ov[start2 + j]) <= 0) {
                 temp[k++] = ov[start1 + i++];
             } else {
                 temp[k++] = ov[start2 + j++];
@@ -552,9 +577,9 @@ obj_p ray_sort_asc(obj_p vec) {
         case TYPE_F64:
             return ray_sort_asc_f64(vec);
         case TYPE_SYMBOL:
-            return timsort_generic_obj(&vec, vec->len, 1);
+            return timsort_generic_obj(vec, 1);
         case TYPE_LIST:
-            return timsort_generic_obj(AS_LIST(vec), vec->len, 1);
+            return timsort_generic_obj(vec, 1);
         case TYPE_DICT:
             return at_obj(AS_LIST(vec)[0], ray_sort_asc(AS_LIST(vec)[1]));
         default:
@@ -780,9 +805,9 @@ obj_p ray_sort_desc(obj_p vec) {
         case TYPE_F64:
             return ray_sort_desc_f64(vec);
         case TYPE_SYMBOL:
-            return timsort_generic_obj(&vec, vec->len, -1);
+            return timsort_generic_obj(vec, -1);
         case TYPE_LIST:
-            return timsort_generic_obj(AS_LIST(vec), vec->len, -1);
+            return timsort_generic_obj(vec, -1);
         case TYPE_DICT:
             return at_obj(AS_LIST(vec)[0], ray_sort_desc(AS_LIST(vec)[1]));
         default:

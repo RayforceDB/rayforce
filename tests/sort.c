@@ -92,6 +92,9 @@ test_result_t test_sort_asc() {
     TEST_ASSERT_EQ("(iasc (dict [a b c d] [8 0 6 7]))", "[b c d a]");
     TEST_ASSERT_EQ("(asc (dict [a b c d] [8 0 6 7]))", "(dict [b c d a] [0 6 7 8])");
 
+    TEST_ASSERT_EQ("(iasc ['d 'b 'aa 'ab 'a 'bc 'c])", "[4 2 3 1 5 6 0]");
+    TEST_ASSERT_EQ("(asc ['d 'b 'aa 'ab 'a 'bc 'c])", "['a 'aa 'ab 'b 'bc 'c 'd]");
+
     PASS();
 }
 
@@ -150,6 +153,9 @@ test_result_t test_sort_desc() {
 
     TEST_ASSERT_EQ("(idesc (dict [a b c d] [8 0 6 7]))", "[a d c b]");
     TEST_ASSERT_EQ("(desc (dict [a b c d] [8 0 6 7]))", "(dict [a d c b] [8 7 6 0])");
+
+    TEST_ASSERT_EQ("(idesc ['d 'b 'aa 'ab 'a 'bc 'c])", "[0 6 5 1 3 2 4]");
+    TEST_ASSERT_EQ("(desc ['d 'b 'aa 'ab 'a 'bc 'c])", "['d 'c 'bc 'b 'ab 'aa 'a]");
 
     PASS();
 }
