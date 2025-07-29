@@ -89,6 +89,9 @@ test_result_t test_sort_asc() {
     TEST_ASSERT_EQ("(asc (list 'a 0 3i 'b 'aa [5 6] (list [1 2 3]) 3i [6i 7i] 0Nl))",
                    "(list 'a 'aa 'b 0Nl 0 3i 3i (list [1 2 3]) [6i 7i] [5 6])");
 
+    TEST_ASSERT_EQ("(iasc (dict [a b c d] [8 0 6 7]))", "[b c d a]");
+    TEST_ASSERT_EQ("(asc (dict [a b c d] [8 0 6 7]))", "(dict [b c d a] [0 6 7 8])");
+
     PASS();
 }
 
@@ -144,6 +147,9 @@ test_result_t test_sort_desc() {
     TEST_ASSERT_EQ("(idesc (list 'a 0 3i 'b 'aa [5 6] (list [1 2 3]) 3i [6i 7i] 0Nl))", "[5 8 6 2 7 1 9 3 4 0]");
     TEST_ASSERT_EQ("(desc (list 'a 0 3i 'b 'aa [5 6] (list [1 2 3]) 3i [6i 7i] 0Nl))",
                    "(list [5 6] [6i 7i] (list [1 2 3]) 3i 3i 0 0Nl 'b 'aa 'a)");
+
+    TEST_ASSERT_EQ("(idesc (dict [a b c d] [8 0 6 7]))", "[a d c b]");
+    TEST_ASSERT_EQ("(desc (dict [a b c d] [8 0 6 7]))", "(dict [a d c b] [8 7 6 0])");
 
     PASS();
 }
