@@ -353,6 +353,8 @@ obj_p raykx_des_obj(u8_t *buf, i64_t *len) {
             return v;
         case KJ:
             return RAYKX_DES_VEC(buf, len, i64, I64);
+        case KF:
+            return RAYKX_DES_VEC(buf, len, f64, F64);
         case UU:
             return RAYKX_DES_VEC(buf, len, guid, GUID);
         case KS:
@@ -369,16 +371,6 @@ obj_p raykx_des_obj(u8_t *buf, i64_t *len) {
                 buf += n + 1;
                 (*len) -= n + 1;
             }
-            return obj;
-        case KF:
-            buf++;  // attrs
-            memcpy(&l, buf, sizeof(i32_t));
-            buf += sizeof(i32_t);
-            (*len) -= sizeof(i32_t);
-            obj = F64(l);
-            memcpy(obj->raw, buf, l * ISIZEOF(f64_t));
-            buf += l * ISIZEOF(f64_t);
-            (*len) -= l * ISIZEOF(f64_t);
             return obj;
         case XD:
             l = *len;
