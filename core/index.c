@@ -959,10 +959,16 @@ obj_p index_in_i32_i32(i32_t x[], i64_t xl, i32_t y[], i64_t yl) {
 
     min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
     max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
-    range = max - min + 1;
 
     vec = B8(xl);
     r = AS_B8(vec);
+
+    if (min > max) {
+        memset(r, 0, xl);
+        return vec;
+    }
+
+    range = max - min + 1;
 
     if (range <= MAX_RANGE) {
         set = B8(range);
@@ -1020,10 +1026,16 @@ obj_p index_in_i32_i64(i32_t x[], i64_t xl, i64_t y[], i64_t yl) {
 
     min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
     max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
-    range = max - min + 1;
 
     vec = B8(xl);
     r = AS_B8(vec);
+
+    if (min > max) {
+        memset(r, 0, xl);
+        return vec;
+    }
+
+    range = max - min + 1;
 
     if (range <= MAX_RANGE) {
         set = B8(range);
@@ -1155,10 +1167,16 @@ obj_p index_in_i64_i32(i64_t x[], i64_t xl, i32_t y[], i64_t yl) {
 
     min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
     max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
-    range = max - min + 1;
 
     vec = B8(xl);
     r = AS_B8(vec);
+
+    if (min > max) {
+        memset(r, 0, xl);
+        return vec;
+    }
+
+    range = max - min + 1;
 
     if (range <= MAX_RANGE) {
         set = B8(range);
@@ -1219,12 +1237,17 @@ obj_p index_in_i64_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl) {
     min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
     max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
 
+    vec = B8(xl);
+    r = AS_B8(vec);
+
+    if (min > max) {
+        memset(r, 0, xl);
+        return vec;
+    }
+
     // TODO: fix this
     __int128 rng = (__int128)max - (__int128)min;
     range = rng > (__int128)MAX_RANGE ? INF_I64 : (i64_t)rng + 1;
-
-    vec = B8(xl);
-    r = AS_B8(vec);
 
     if (range <= MAX_RANGE) {
         set = B8(range);
@@ -1358,10 +1381,17 @@ obj_p index_find_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl) {
 
     min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
     max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
-    range = max - min + 1;
 
     vec = I64(yl);
     r = AS_I64(vec);
+
+    if (min > max) {
+        for (i = 0; i < yl; i++)
+            r[i] = NULL_I64;
+        return vec;
+    }
+
+    range = max - min + 1;
 
     if (range <= MAX_RANGE) {
         dict = I64(range);

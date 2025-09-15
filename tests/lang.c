@@ -3390,6 +3390,42 @@ test_result_t test_lang_in() {
     PASS();
 }
 
+test_result_t test_lang_except() {
+    // Basic symbol except
+    TEST_ASSERT_EQ("(except ['a 'b 'c] ['u 'o])", "[a b c]");
+    TEST_ASSERT_EQ("(except ['a 'b 'c] ['a 'c])", "[b]");
+    TEST_ASSERT_EQ("(except ['a 'b 'c] ['b])", "[a c]");
+    TEST_ASSERT_EQ("(except ['a 'b 'c] ['a 'b 'c])", "[]");
+
+    // Integer except
+    TEST_ASSERT_EQ("(except [1 2 3 4 5] [2 4])", "[1 3 5]");
+    TEST_ASSERT_EQ("(except [1 2 3] [5 6 7])", "[1 2 3]");
+    TEST_ASSERT_EQ("(except [10 20 30] [10 30])", "[20]");
+    TEST_ASSERT_EQ("(except [1 2 3] [1 2 3])", "[]");
+
+    // Empty cases
+    TEST_ASSERT_EQ("(except [] [1 2 3])", "[]");
+    TEST_ASSERT_EQ("(except [1 2 3] [])", "[1 2 3]");
+    TEST_ASSERT_EQ("(except [] [])", "[]");
+
+    // Single element except
+    TEST_ASSERT_EQ("(except ['x] ['x])", "[]");
+    TEST_ASSERT_EQ("(except ['x] ['y])", "[x]");
+    TEST_ASSERT_EQ("(except [42] [42])", "[]");
+    TEST_ASSERT_EQ("(except [42] [99])", "[42]");
+
+    // Scalar except vector
+    TEST_ASSERT_EQ("(except [1 2 3 4 5] 3)", "[1 2 4 5]");
+    TEST_ASSERT_EQ("(except ['a 'b 'c] 'b)", "[a c]");
+    TEST_ASSERT_EQ("(except [1 2 3] 9)", "[1 2 3]");
+
+    // Duplicates handling
+    TEST_ASSERT_EQ("(except [1 1 2 2 3] [1 3])", "[2 2]");
+    TEST_ASSERT_EQ("(except ['a 'a 'b 'c 'c] ['a 'c])", "[b]");
+
+    PASS();
+}
+
 test_result_t test_lang_or() {
     TEST_ASSERT_EQ("(or true false)", "true");
     TEST_ASSERT_EQ("(or false true)", "true");
