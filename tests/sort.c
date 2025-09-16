@@ -182,6 +182,46 @@ test_result_t test_sort_xasc() {
                    "(table ['a 'b] (list [1 2 2] [10 10 20]))");
     TEST_ASSERT_EQ("(xasc (table ['a 'b] (list [1 1 1] [3 2 1])) ['a 'b])", "(table ['a 'b] (list [1 1 1] [1 2 3]))");
 
+    // Test sorting by time column
+    TEST_ASSERT_EQ(
+        "(xasc (table ['sym 'time 'price] (list ['AAPL 'GOOG 'MSFT] [10:30:00.000 09:30:00.000 11:00:00.000] [150.5 "
+        "2800.0 300.0])) 'time)",
+        "(table ['sym 'time 'price] (list ['GOOG 'AAPL 'MSFT] [09:30:00.000 10:30:00.000 11:00:00.000] [2800.0 150.5 "
+        "300.0]))");
+
+    // Test sorting by timestamp column
+    TEST_ASSERT_EQ(
+        "(xasc (table ['id 'ts 'value] (list [1 2 3] [2024.01.01D12:00:00.000000000 2024.01.01D10:00:00.000000000 "
+        "2024.01.01D14:00:00.000000000] [100 200 300])) 'ts)",
+        "(table ['id 'ts 'value] (list [2 1 3] [2024.01.01D10:00:00.000000000 2024.01.01D12:00:00.000000000 "
+        "2024.01.01D14:00:00.000000000] [200 100 300]))");
+
+    // Test sorting by date column
+    TEST_ASSERT_EQ(
+        "(xasc (table ['event 'date 'count] (list ['A 'B 'C] [2024.01.03 2024.01.01 2024.01.02] [10 20 30])) 'date)",
+        "(table ['event 'date 'count] (list ['B 'C 'A] [2024.01.01 2024.01.02 2024.01.03] [20 30 10]))");
+
+    // Test sorting by vector of symbols ['time] instead of single symbol 'time
+    TEST_ASSERT_EQ(
+        "(xasc (table ['sym 'time 'price] (list ['AAPL 'GOOG 'MSFT] [10:30:00.000 09:30:00.000 11:00:00.000] [150.5 "
+        "2800.0 300.0])) ['time])",
+        "(table ['sym 'time 'price] (list ['GOOG 'AAPL 'MSFT] [09:30:00.000 10:30:00.000 11:00:00.000] [2800.0 150.5 "
+        "300.0]))");
+
+    // Test sorting by multiple columns with vector syntax
+    TEST_ASSERT_EQ(
+        "(xasc (table ['sym 'time 'price] (list ['AAPL 'AAPL 'GOOG] [10:30:00.000 09:30:00.000 11:00:00.000] [150.5 "
+        "140.0 2800.0])) ['sym 'time])",
+        "(table ['sym 'time 'price] (list ['AAPL 'AAPL 'GOOG] [09:30:00.000 10:30:00.000 11:00:00.000] [140.0 150.5 "
+        "2800.0]))");
+
+    // Test sorting by empty vector of symbols [] - should return original table
+    TEST_ASSERT_EQ(
+        "(xasc (table ['sym 'time 'price] (list ['AAPL 'GOOG 'MSFT] [10:30:00.000 09:30:00.000 11:00:00.000] [150.5 "
+        "2800.0 300.0])) [])",
+        "(table ['sym 'time 'price] (list ['AAPL 'GOOG 'MSFT] [10:30:00.000 09:30:00.000 11:00:00.000] [150.5 "
+        "2800.0 300.0]))");
+
     PASS();
 }
 
@@ -196,6 +236,47 @@ test_result_t test_sort_xdesc() {
     TEST_ASSERT_EQ("(xdesc (table ['a 'b] (list [1 1 2 2 3 3] [10 20 10 20 10 20])) ['b 'a])",
                    "(table ['a 'b] (list [3 2 1 3 2 1] [20 20 20 10 10 10]))");
     TEST_ASSERT_EQ("(xdesc (table ['a 'b] (list [1 1 1] [3 2 1])) ['a 'b])", "(table ['a 'b] (list [1 1 1] [3 2 1]))");
+
+    // Test sorting by time column in descending order
+    TEST_ASSERT_EQ(
+        "(xdesc (table ['sym 'time 'price] (list ['AAPL 'GOOG 'MSFT] [10:30:00.000 09:30:00.000 11:00:00.000] [150.5 "
+        "2800.0 300.0])) 'time)",
+        "(table ['sym 'time 'price] (list ['MSFT 'AAPL 'GOOG] [11:00:00.000 10:30:00.000 09:30:00.000] [300.0 150.5 "
+        "2800.0]))");
+
+    // Test sorting by timestamp column in descending order
+    TEST_ASSERT_EQ(
+        "(xdesc (table ['id 'ts 'value] (list [1 2 3] [2024.01.01D12:00:00.000000000 2024.01.01D10:00:00.000000000 "
+        "2024.01.01D14:00:00.000000000] [100 200 300])) 'ts)",
+        "(table ['id 'ts 'value] (list [3 1 2] [2024.01.01D14:00:00.000000000 2024.01.01D12:00:00.000000000 "
+        "2024.01.01D10:00:00.000000000] [300 100 200]))");
+
+    // Test sorting by date column in descending order
+    TEST_ASSERT_EQ(
+        "(xdesc (table ['event 'date 'count] (list ['A 'B 'C] [2024.01.03 2024.01.01 2024.01.02] [10 20 30])) 'date)",
+        "(table ['event 'date 'count] (list ['A 'C 'B] [2024.01.03 2024.01.02 2024.01.01] [10 30 20]))");
+
+    // Test sorting by vector of symbols ['time] instead of single symbol 'time
+    TEST_ASSERT_EQ(
+        "(xdesc (table ['sym 'time 'price] (list ['AAPL 'GOOG 'MSFT] [10:30:00.000 09:30:00.000 11:00:00.000] [150.5 "
+        "2800.0 300.0])) ['time])",
+        "(table ['sym 'time 'price] (list ['MSFT 'AAPL 'GOOG] [11:00:00.000 10:30:00.000 09:30:00.000] [300.0 150.5 "
+        "2800.0]))");
+
+    // Test sorting by multiple columns with vector syntax in descending order
+    TEST_ASSERT_EQ(
+        "(xdesc (table ['sym 'time 'price] (list ['AAPL 'AAPL 'GOOG] [10:30:00.000 09:30:00.000 11:00:00.000] [150.5 "
+        "140.0 2800.0])) ['sym 'time])",
+        "(table ['sym 'time 'price] (list ['GOOG 'AAPL 'AAPL] [11:00:00.000 10:30:00.000 09:30:00.000] [2800.0 150.5 "
+        "140.0]))");
+
+    // Test sorting by empty vector of symbols [] - should return original table
+    TEST_ASSERT_EQ(
+        "(xdesc (table ['sym 'time 'price] (list ['AAPL 'GOOG 'MSFT] [10:30:00.000 09:30:00.000 11:00:00.000] [150.5 "
+        "2800.0 300.0])) [])",
+        "(table ['sym 'time 'price] (list ['AAPL 'GOOG 'MSFT] [10:30:00.000 09:30:00.000 11:00:00.000] [150.5 "
+        "2800.0 300.0]))");
+
     PASS();
 }
 

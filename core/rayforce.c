@@ -681,6 +681,13 @@ obj_p at_idx(obj_p obj, i64_t idx) {
         return null(obj->type);
 
     switch (obj->type) {
+        case TYPE_B8:
+        case TYPE_U8:
+            if (idx < 0)
+                idx = obj->len + idx;
+            if (idx >= 0 && idx < (i64_t)obj->len)
+                return b8(AS_B8(obj)[idx]);
+            return b8(B8_FALSE);
         case TYPE_I16:
             if (idx < 0)
                 idx = obj->len + idx;
@@ -1104,10 +1111,17 @@ obj_p at_obj(obj_p obj, obj_p idx) {
     obj_p v;
 
     switch (MTYPE2(obj->type, idx->type)) {
+        case MTYPE2(TYPE_B8, -TYPE_I64):
+        case MTYPE2(TYPE_U8, -TYPE_I64):
+        case MTYPE2(TYPE_I16, -TYPE_I64):
+        case MTYPE2(TYPE_I32, -TYPE_I64):
+        case MTYPE2(TYPE_DATE, -TYPE_I64):
+        case MTYPE2(TYPE_TIME, -TYPE_I64):
         case MTYPE2(TYPE_I64, -TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, -TYPE_I64):
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_I64):
         case MTYPE2(TYPE_F64, -TYPE_I64):
+        case MTYPE2(TYPE_GUID, -TYPE_I64):
         case MTYPE2(TYPE_C8, -TYPE_I64):
         case MTYPE2(TYPE_LIST, -TYPE_I64):
         case MTYPE2(TYPE_ENUM, -TYPE_I64):
@@ -1119,6 +1133,12 @@ obj_p at_obj(obj_p obj, obj_p idx) {
             if (j == NULL_I64)
                 return null(AS_LIST(obj)[1]->type);
             return at_idx(AS_LIST(obj)[1], j);
+        case MTYPE2(TYPE_B8, TYPE_I64):
+        case MTYPE2(TYPE_U8, TYPE_I64):
+        case MTYPE2(TYPE_I16, TYPE_I64):
+        case MTYPE2(TYPE_I32, TYPE_I64):
+        case MTYPE2(TYPE_DATE, TYPE_I64):
+        case MTYPE2(TYPE_TIME, TYPE_I64):
         case MTYPE2(TYPE_I64, TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, TYPE_I64):
         case MTYPE2(TYPE_TIMESTAMP, TYPE_I64):
