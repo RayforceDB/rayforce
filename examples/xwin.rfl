@@ -1,0 +1,8 @@
+(set t (table [Symbol Time Price] 
+    (list (take 100 [AAPL IBM MSFT GOOG]) 
+          (as 'Time (* 1000 (til 100))) 
+          (as 'F64 (take 100 [123 11 456 33])))))
+
+
+;; (select {from: t p: (max Price) by: (xwin Time 1000)})
+
