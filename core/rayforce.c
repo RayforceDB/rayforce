@@ -2215,6 +2215,12 @@ obj_p cast_obj(i8_t type, obj_p obj) {
             for (i = 0; i < l; i++)
                 AS_I32(res)[i] = (i32_t)AS_I64(obj)[i];
             return res;
+        case MTYPE2(TYPE_TIME, TYPE_I64):
+            l = obj->len;
+            res = TIME(l);
+            for (i = 0; i < l; i++)
+                AS_TIME(res)[i] = (i32_t)AS_I64(obj)[i];
+            return res;
         case MTYPE2(TYPE_DATE, TYPE_I64):
             l = obj->len;
             res = DATE(l);

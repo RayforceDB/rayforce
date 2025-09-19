@@ -43,5 +43,6 @@ obj_p ray_max(obj_p x);
 obj_p ray_ceil(obj_p x);
 obj_p ray_med(obj_p x);
 obj_p ray_dev(obj_p x);
+obj_p ray_xwin(obj_p x, obj_p y);
 
 #endif  // MATH_H

@@ -93,5 +93,6 @@ obj_p index_group_list(obj_p obj, obj_p filter);
 obj_p index_join_obj(obj_p lcols, obj_p rcols, i64_t len);
 obj_p index_upsert_obj(obj_p lcols, obj_p rcols, i64_t len);
 nil_t index_hash_obj(obj_p obj, i64_t out[], i64_t filter[], i64_t len, b8_t resolve);
+obj_p index_xwin(obj_p val, obj_p n, obj_p filter);
 
 #endif  // INDEX_H

@@ -23,15 +23,14 @@
 
 #include <math.h>
 #include "util.h"
-#include "heap.h"
 #include "ops.h"
 #include "error.h"
 #include "aggr.h"
 #include "pool.h"
-#include "sort.h"
 #include "order.h"
 #include "runtime.h"
-#include "serde.h" // for size_of_type
+#include "serde.h" 
+#include "index.h"
 
 #define __UNOP_FOLD(x, lt, ot, op, ln, of, iv)                  \
     ({                                                          \
@@ -1785,4 +1784,15 @@ obj_p ray_dev(obj_p x) {
     }
 
     return f64(sqrt(ray_sq_sub(x, f64(favg))->f64 / (f64_t)l));
+}
+
+obj_p ray_xwin(obj_p x, obj_p y) {
+    switch MTYPE2(x->type, y->type) {
+        case MTYPE2(TYPE_I32, -TYPE_I64):
+        case MTYPE2(TYPE_TIME, -TYPE_I64):
+        case MTYPE2(TYPE_DATE, -TYPE_I64):
+            return index_xwin(x, y, NULL_OBJ);
+        default:
+            THROW(ERR_TYPE, "xwin: unsupported type: '%s", type_name(x->type));
+    }
 }
