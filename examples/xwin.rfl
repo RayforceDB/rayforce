@@ -2,7 +2,7 @@
 
 (set t (table [Symbol Time Price] 
     (list (take n [AAPL IBM MSFT GOOG]) 
-          (as 'Time (% (* 1000 (til n)) n)) 
+          (as 'Time (til n))
           (as 'F64 (take n [123 11 456 33])))))
 
 
