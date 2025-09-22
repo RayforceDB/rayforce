@@ -812,13 +812,17 @@ b8_t term_autocomplete_path(term_p term, i64_t start) {
     str_p last_slash, file;
     c8_t path[MAX_PATH_LEN], prefix[MAX_PATH_LEN], *hbuf, *tbuf;
 
-    len = term->hist->curr_len;
-    hbuf = term->hist->curr;
+
+    if (term->autocp_buf_len == 0)
+        autocp_save_current(term);
+
+    len = term->autocp_buf_len;
+    hbuf = term->autocp_buf;
     tbuf = term->buf;
 
     // Find end of the path
     for (end = start; end < len; end++) {
-        if (is_whitespace(hbuf[end]) || hbuf[end] == KEYCODE_DQUOTE)
+        if (is_whitespace(hbuf[end]) || hbuf[end] == '"')
             break;
     }
 
