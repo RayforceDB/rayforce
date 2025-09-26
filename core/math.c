@@ -31,7 +31,7 @@
 #include "sort.h"
 #include "order.h"
 #include "runtime.h"
-#include "serde.h" // for size_of_type
+#include "serde.h"  // for size_of_type
 
 #define __UNOP_FOLD(x, lt, ot, op, ln, of, iv)                  \
     ({                                                          \
@@ -1446,7 +1446,8 @@ obj_p unop_fold(raw_p op, obj_p x) {
     i64_t elem_size = size_of_type(x->type);
     i64_t page_size = RAY_PAGE_SIZE;
     i64_t elems_per_page = page_size / elem_size;
-    if (elems_per_page == 0) elems_per_page = 1;
+    if (elems_per_page == 0)
+        elems_per_page = 1;
     i64_t base_chunk = (l + n - 1) / n;
     // round up to nearest multiple of elems_per_page
     base_chunk = ((base_chunk + elems_per_page - 1) / elems_per_page) * elems_per_page;
@@ -1455,10 +1456,12 @@ obj_p unop_fold(raw_p op, obj_p x) {
     i64_t offset = 0;
     for (i = 0; i < n - 1; i++) {
         i64_t this_chunk = base_chunk;
-        if (offset + this_chunk > l) this_chunk = l - offset;
+        if (offset + this_chunk > l)
+            this_chunk = l - offset;
         pool_add_task(pool, op, 3, x, this_chunk, offset);
         offset += this_chunk;
-        if (offset >= l) break;
+        if (offset >= l)
+            break;
     }
     // last chunk
     if (offset < l)
@@ -1558,7 +1561,9 @@ obj_p binop_map(raw_p op, obj_p x, obj_p y) {
 
     pool = runtime_get()->pool;
     n = pool_split_by(pool, l, 0);
-    out = (rc_obj(x) == 1 && IS_VECTOR(x)) ? clone_obj(x) : (rc_obj(y) == 1 && IS_VECTOR(y)) ? clone_obj(y) : vector(t, l);
+    out = (rc_obj(x) == 1 && IS_VECTOR(x))   ? clone_obj(x)
+          : (rc_obj(y) == 1 && IS_VECTOR(y)) ? clone_obj(y)
+                                             : vector(t, l);
 
     if (n == 1) {
         argv[0] = (raw_p)x;
@@ -1579,7 +1584,8 @@ obj_p binop_map(raw_p op, obj_p x, obj_p y) {
     i64_t elem_size = size_of_type(t);
     i64_t page_size = RAY_PAGE_SIZE;
     i64_t elems_per_page = page_size / elem_size;
-    if (elems_per_page == 0) elems_per_page = 1;
+    if (elems_per_page == 0)
+        elems_per_page = 1;
     i64_t base_chunk = (l + n - 1) / n;
     base_chunk = ((base_chunk + elems_per_page - 1) / elems_per_page) * elems_per_page;
 
@@ -1587,10 +1593,12 @@ obj_p binop_map(raw_p op, obj_p x, obj_p y) {
     i64_t offset = 0;
     for (i = 0; i < n - 1; i++) {
         i64_t this_chunk = base_chunk;
-        if (offset + this_chunk > l) this_chunk = l - offset;
+        if (offset + this_chunk > l)
+            this_chunk = l - offset;
         pool_add_task(pool, op, 5, x, y, this_chunk, offset, out);
         offset += this_chunk;
-        if (offset >= l) break;
+        if (offset >= l)
+            break;
     }
     if (offset < l)
         pool_add_task(pool, op, 5, x, y, l - offset, offset, out);
@@ -1630,7 +1638,8 @@ obj_p binop_fold(raw_p op, obj_p x, obj_p y) {
     i64_t elem_size = size_of_type(x->type);
     i64_t page_size = RAY_PAGE_SIZE;
     i64_t elems_per_page = page_size / elem_size;
-    if (elems_per_page == 0) elems_per_page = 1;
+    if (elems_per_page == 0)
+        elems_per_page = 1;
     i64_t base_chunk = (l + n - 1) / n;
     base_chunk = ((base_chunk + elems_per_page - 1) / elems_per_page) * elems_per_page;
 
@@ -1638,10 +1647,12 @@ obj_p binop_fold(raw_p op, obj_p x, obj_p y) {
     i64_t offset = 0;
     for (i = 0; i < n - 1; i++) {
         i64_t this_chunk = base_chunk;
-        if (offset + this_chunk > l) this_chunk = l - offset;
+        if (offset + this_chunk > l)
+            this_chunk = l - offset;
         pool_add_task(pool, op, 4, x, y, this_chunk, offset);
         offset += this_chunk;
-        if (offset >= l) break;
+        if (offset >= l)
+            break;
     }
     if (offset < l)
         pool_add_task(pool, op, 4, x, y, l - offset, offset);
@@ -1682,6 +1693,7 @@ obj_p ray_xbar(obj_p x, obj_p y) { return binop_map(ray_xbar_partial, x, y); }
 
 // Functions which used functions with parallel execution
 obj_p ray_avg(obj_p x) {
+    obj_p l, r, res;
     switch (x->type) {
         case -TYPE_I32:
             return f64(i32_to_f64(x->i32));
@@ -1690,11 +1702,26 @@ obj_p ray_avg(obj_p x) {
         case -TYPE_F64:
             return clone_obj(x);
         case TYPE_I32:
-            return f64(FDIVI64(i32_to_i64(ray_sum(x)->i32), ray_cnt(x)->i64));
+            l = ray_sum(x);
+            r = ray_cnt(x);
+            res = f64(FDIVI64(i32_to_i64(l->i32), r->i64));
+            drop_obj(l);
+            drop_obj(r);
+            return res;
         case TYPE_I64:
-            return f64(FDIVI64(ray_sum(x)->i64, ray_cnt(x)->i64));
+            l = ray_sum(x);
+            r = ray_cnt(x);
+            res = f64(FDIVI64(l->i64, r->i64));
+            drop_obj(l);
+            drop_obj(r);
+            return res;
         case TYPE_F64:
-            return f64(FDIVF64(ray_sum(x)->f64, i64_to_f64(ray_cnt(x)->i64)));
+            l = ray_sum(x);
+            r = ray_cnt(x);
+            res = f64(FDIVF64(l->f64, i64_to_f64(r->i64)));
+            drop_obj(l);
+            drop_obj(r);
+            return res;
         case TYPE_MAPGROUP:
             return aggr_avg(AS_LIST(x)[0], AS_LIST(x)[1]);
 

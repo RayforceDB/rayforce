@@ -2405,7 +2405,7 @@ clean:
     return ids;
 }
 
-static inline obj_p __window_aggr_i32(i32_t min, i32_t max, i32_t vals[], obj_p tab, obj_p expr, obj_p filter) {
+static inline obj_p __window_filter_i32(i32_t min, i32_t max, i32_t vals[], obj_p filter) {
     i64_t left = __bin_idx_i32(min, vals, AS_I64(filter), filter->len);
     i64_t right = __bin_idx_i32(max, vals, AS_I64(filter), filter->len);
     i64_t i, l;
@@ -2421,20 +2421,13 @@ static inline obj_p __window_aggr_i32(i32_t min, i32_t max, i32_t vals[], obj_p 
     for (i = 0; i < l; i++)
         AS_I64(f)[i] = AS_I64(filter)[left + i];
 
-    t = filter_map(tab, f);
-    mount_env(t);
-    v = eval(expr);
-    unmount_env(AS_LIST(t)[0]->len);
-    drop_obj(f);
-    drop_obj(t);
-
-    return v;
+    return f;
 }
 
 obj_p index_window_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol, obj_p windows, obj_p ltab, obj_p rtab,
                             obj_p aggr) {
     i64_t i, j, ll, rl, n, chunk;
-    obj_p v, ht, hashes, aggrvals;
+    obj_p v, ht, hashes, aggrvals, f, t;
     i64_t idx;
     __index_list_ctx_t ctx;
     pool_p pool;
@@ -2474,11 +2467,18 @@ obj_p index_window_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol, 
             for (i = 0; i < ll; i++) {
                 idx = ht_oa_tab_get_with(ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
                 if (idx != NULL_I64) {
+                    f = __window_filter_i32(AS_I32(AS_LIST(windows)[0])[i], AS_I32(AS_LIST(windows)[1])[i],
+                                            AS_I32(rxcol), AS_LIST(AS_LIST(ht)[1])[idx]);
+                    t = filter_map(rtab, f);
+                    mount_env(t);
+
                     for (j = 0; j < aggr->len; j++) {
-                        v = __window_aggr_i32(AS_I32(AS_LIST(windows)[0])[i], AS_I32(AS_LIST(windows)[1])[i],
-                                              AS_I32(rxcol), rtab, AS_LIST(aggr)[j], AS_LIST(AS_LIST(ht)[1])[idx]);
+                        v = eval(AS_LIST(aggr)[j]);
 
                         if (IS_ERR(v)) {
+                            unmount_env(AS_LIST(t)[0]->len);
+                            drop_obj(f);
+                            drop_obj(t);
                             for (j = 0; j < aggr->len; j++)
                                 AS_LIST(aggrvals)[j]->len = i;
                             drop_obj(aggrvals);
@@ -2492,6 +2492,10 @@ obj_p index_window_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol, 
                         }
                         push_obj(AS_LIST(aggrvals) + j, v);
                     }
+
+                    unmount_env(AS_LIST(t)[0]->len);
+                    drop_obj(f);
+                    drop_obj(t);
                 } else {
                     for (j = 0; j < aggr->len; j++)
                         push_obj(AS_LIST(aggrvals) + j, null(AS_LIST(aggrvals)[i]->type));
@@ -2503,6 +2507,7 @@ obj_p index_window_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol, 
     }
 
     drop_obj(hashes);
+    rl = AS_LIST(ht)[0]->len;
     for (i = 0; i < rl; i++)
         if (AS_I64(AS_LIST(ht)[0])[i] != NULL_I64)
             drop_obj(AS_LIST(AS_LIST(ht)[1])[i]);
