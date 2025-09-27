@@ -968,6 +968,109 @@ static void binary_insertion_sort_numeric(i64_t *indices, i64_t *data, i64_t len
     }
 }
 
+// Maximum range for counting sort - configurable constant
+#define COUNTING_SORT_MAX_RANGE 1000000
+
+// General counting sort for integer vectors when range is reasonable
+static obj_p counting_sort_integers(obj_p vec, i64_t asc) {
+    i64_t len = vec->len;
+    if (len == 0)
+        return I64(0);
+
+    i64_t *data = AS_I64(vec);
+
+    // Find min/max symbol IDs
+    i64_t min_sym = data[0], max_sym = data[0];
+    for (i64_t i = 1; i < len; i++) {
+        if (data[i] < min_sym)
+            min_sym = data[i];
+        if (data[i] > max_sym)
+            max_sym = data[i];
+    }
+
+    i64_t range = max_sym - min_sym + 1;
+
+    // Use counting sort only if range is reasonable
+    // Don't use if too sparse (range > len) or exceeds maximum range
+    if (range > len || range > COUNTING_SORT_MAX_RANGE) {
+        return NULL;  // Fall back to other sorting
+    }
+
+    // Allocate counting array
+    i64_t *counts = (i64_t *)calloc(range, sizeof(i64_t));
+    if (!counts)
+        return NULL;
+
+    // Create buckets to store indices for each symbol
+    i64_t **buckets = (i64_t **)calloc(range, sizeof(i64_t *));
+    if (!buckets) {
+        free(counts);
+        return NULL;
+    }
+
+    // Count occurrences and allocate buckets
+    for (i64_t i = 0; i < len; i++) {
+        counts[data[i] - min_sym]++;
+    }
+
+    // Allocate memory for each bucket
+    for (i64_t i = 0; i < range; i++) {
+        if (counts[i] > 0) {
+            buckets[i] = (i64_t *)malloc(counts[i] * sizeof(i64_t));
+            if (!buckets[i]) {
+                // Cleanup on failure
+                for (i64_t j = 0; j < i; j++) {
+                    free(buckets[j]);
+                }
+                free(buckets);
+                free(counts);
+                return NULL;
+            }
+        }
+    }
+
+    // Reset counts to use as bucket indices
+    memset(counts, 0, range * sizeof(i64_t));
+
+    // Fill buckets with indices
+    for (i64_t i = 0; i < len; i++) {
+        i64_t bucket_idx = data[i] - min_sym;
+        buckets[bucket_idx][counts[bucket_idx]++] = i;
+    }
+
+    // Create result indices array
+    obj_p indices = I64(len);
+    i64_t *result = AS_I64(indices);
+    i64_t pos = 0;
+
+    if (asc > 0) {
+        // Ascending: iterate symbols from min to max
+        for (i64_t sym = 0; sym < range; sym++) {
+            i64_t count = counts[sym];
+            for (i64_t i = 0; i < count; i++) {
+                result[pos++] = buckets[sym][i];
+            }
+        }
+    } else {
+        // Descending: iterate symbols from max to min
+        for (i64_t sym = range - 1; sym >= 0; sym--) {
+            i64_t count = counts[sym];
+            for (i64_t i = 0; i < count; i++) {
+                result[pos++] = buckets[sym][i];
+            }
+        }
+    }
+
+    // Cleanup buckets
+    for (i64_t i = 0; i < range; i++) {
+        free(buckets[i]);
+    }
+    free(buckets);
+
+    free(counts);
+    return indices;
+}
+
 // Optimized sort dispatcher
 static obj_p optimized_sort(obj_p vec, i64_t asc) {
     i64_t len = vec->len;
@@ -996,6 +1099,20 @@ static obj_p optimized_sort(obj_p vec, i64_t asc) {
                 binary_insertion_sort_symbols(result, vec, len, asc);
                 return indices;
         }
+    }
+
+    // For larger arrays: try counting sort first for integer types
+    switch (vec->type) {
+        case TYPE_I64:
+        case TYPE_TIME:
+        case TYPE_SYMBOL: {
+            obj_p counting_result = counting_sort_integers(vec, asc);
+            if (counting_result) {
+                return counting_result;
+            }
+        } break;
+        default:
+            break;
     }
 
     // Fall back to merge sort for larger arrays
