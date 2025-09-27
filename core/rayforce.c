@@ -934,50 +934,50 @@ static obj_p at_ids_partial(obj_p obj, i64_t ids[], i64_t len, i64_t offset, obj
         case TYPE_B8:
         case TYPE_U8:
         case TYPE_C8:
-            u8inp = AS_U8(obj) + offset;
+            u8inp = AS_U8(obj);
             u8out = AS_U8(out) + offset;
             for (i = 0; i < len; i++)
-                u8out[i] = u8inp[ids[i]];
+                u8out[i] = u8inp[ids[offset + i]];
             return NULL_OBJ;
         case TYPE_I16:
-            i16inp = AS_I16(obj) + offset;
+            i16inp = AS_I16(obj);
             i16out = AS_I16(out) + offset;
             for (i = 0; i < len; i++)
-                i16out[i] = i16inp[ids[i]];
+                i16out[i] = i16inp[ids[offset + i]];
             return NULL_OBJ;
         case TYPE_I32:
         case TYPE_DATE:
         case TYPE_TIME:
-            i32inp = AS_I32(obj) + offset;
+            i32inp = AS_I32(obj);
             i32out = AS_I32(out) + offset;
             for (i = 0; i < len; i++)
-                i32out[i] = i32inp[ids[i]];
+                i32out[i] = i32inp[ids[offset + i]];
             return NULL_OBJ;
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
-            i64inp = AS_I64(obj) + offset;
+            i64inp = AS_I64(obj);
             i64out = AS_I64(out) + offset;
             for (i = 0; i < len; i++)
-                i64out[i] = i64inp[ids[i]];
+                i64out[i] = i64inp[ids[offset + i]];
             return NULL_OBJ;
         case TYPE_F64:
-            f64inp = AS_F64(obj) + offset;
+            f64inp = AS_F64(obj);
             f64out = AS_F64(out) + offset;
             for (i = 0; i < len; i++)
-                f64out[i] = f64inp[ids[i]];
+                f64out[i] = f64inp[ids[offset + i]];
             return NULL_OBJ;
         case TYPE_GUID:
-            guidinp = AS_GUID(obj) + offset;
+            guidinp = AS_GUID(obj);
             guidout = AS_GUID(out) + offset;
             for (i = 0; i < len; i++)
-                memcpy(guidout[i], guidinp[ids[i]], sizeof(guid_t));
+                memcpy(guidout[i], guidinp[ids[offset + i]], sizeof(guid_t));
             return NULL_OBJ;
         case TYPE_LIST:
-            listinp = AS_LIST(obj) + offset;
+            listinp = AS_LIST(obj);
             listout = AS_LIST(out) + offset;
             for (i = 0; i < len; i++)
-                listout[i] = clone_obj(listinp[ids[i]]);
+                listout[i] = clone_obj(listinp[ids[offset + i]]);
             return NULL_OBJ;
         default:
             return NULL_OBJ;
