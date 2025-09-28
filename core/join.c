@@ -346,7 +346,7 @@ obj_p ray_asof_join(obj_p *x, i64_t n) {
 }
 
 obj_p ray_window_join(obj_p *x, i64_t n) {
-    obj_p v, ajkl, ajkr, keys, lvals, rvals, idx;
+    obj_p v, wjkl, wjkr, keys, lvals, rvals, idx;
     obj_p resyms, recols;
 
     if (n != 5)
@@ -368,19 +368,19 @@ obj_p ray_window_join(obj_p *x, i64_t n) {
         THROW(ERR_TYPE, "window-join: fifth argument must be a dict");
 
     v = ray_last(x[0]);
-    ajkl = ray_at(x[2], v);
-    ajkr = ray_at(x[3], v);
+    wjkl = ray_at(x[2], v);
+    wjkr = ray_at(x[3], v);
     drop_obj(v);
 
-    if (is_null(ajkl) || is_null(ajkr)) {
-        drop_obj(ajkl);
-        drop_obj(ajkr);
+    if (is_null(wjkl) || is_null(wjkr)) {
+        drop_obj(wjkl);
+        drop_obj(wjkr);
         THROW(ERR_INDEX, "window-join: key not found");
     }
 
-    if (ajkl->type != ajkr->type) {
-        drop_obj(ajkl);
-        drop_obj(ajkr);
+    if (wjkl->type != wjkr->type) {
+        drop_obj(wjkl);
+        drop_obj(wjkr);
         THROW(ERR_TYPE, "window-join: incompatible types");
     }
 
@@ -389,13 +389,13 @@ obj_p ray_window_join(obj_p *x, i64_t n) {
     lvals = at_obj(x[2], keys);
     rvals = at_obj(x[3], keys);
 
-    idx = index_window_join_obj(lvals, ajkl, rvals, ajkr, x[1], x[2], x[3], AS_LIST(x[4])[1]);
+    idx = index_window_join_obj(lvals, wjkl, rvals, wjkr, x[1], x[2], x[3], AS_LIST(x[4])[1]);
 
     drop_obj(keys);
     drop_obj(lvals);
     drop_obj(rvals);
-    drop_obj(ajkl);
-    drop_obj(ajkr);
+    drop_obj(wjkl);
+    drop_obj(wjkr);
 
     resyms = ray_concat(AS_LIST(x[2])[0], AS_LIST(x[4])[0]);
     recols = ray_concat(AS_LIST(x[2])[1], idx);

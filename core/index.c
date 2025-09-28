@@ -2308,7 +2308,7 @@ static inline i64_t __bin_idx_i32(i32_t val, i32_t vals[], i64_t ids[], i64_t le
         }
     }
 
-    return ids[idx];
+    return idx;
 }
 
 static obj_p __asof_ids_partial(__index_list_ctx_t *ctx, obj_p lxcol, obj_p rxcol, obj_p ht, obj_p hashes, i64_t len,
@@ -2321,11 +2321,12 @@ static obj_p __asof_ids_partial(__index_list_ctx_t *ctx, obj_p lxcol, obj_p rxco
         case TYPE_TIME:
             for (i = offset; i < len + offset; i++) {
                 idx = ht_oa_tab_get_with(ht, i, &__index_list_hash_get, &__index_list_cmp_row, ctx);
-                if (idx != NULL_I64)
-                    AS_I64(ids)
-                [i] = __bin_idx_i32(AS_I32(lxcol)[i], AS_I32(rxcol), AS_I64(AS_LIST(AS_LIST(ht)[1])[idx]),
-                                    AS_LIST(AS_LIST(ht)[1])[idx]->len);
-                else AS_I64(ids)[i] = NULL_I64;
+                if (idx != NULL_I64) {
+                    i64_t bin_idx = __bin_idx_i32(AS_I32(lxcol)[i], AS_I32(rxcol), AS_I64(AS_LIST(AS_LIST(ht)[1])[idx]),
+                                                  AS_LIST(AS_LIST(ht)[1])[idx]->len);
+                    AS_I64(ids)[i] = (bin_idx != NULL_I64) ? AS_I64(AS_LIST(AS_LIST(ht)[1])[idx])[bin_idx] : NULL_I64;
+                } else
+                    AS_I64(ids)[i] = NULL_I64;
             }
             break;
         default:
