@@ -2308,7 +2308,7 @@ static inline i64_t __bin_idx_i32(i32_t val, i32_t vals[], i64_t ids[], i64_t le
         }
     }
 
-    return idx;
+    return ids[idx];
 }
 
 static obj_p __asof_ids_partial(__index_list_ctx_t *ctx, obj_p lxcol, obj_p rxcol, obj_p ht, obj_p hashes, i64_t len,
