@@ -26,6 +26,7 @@
 #include "ops.h"
 #include "error.h"
 #include "hash.h"
+#include "rayforce.h"
 #include "util.h"
 #include "items.h"
 #include "unary.h"
@@ -554,10 +555,12 @@ obj_p aggr_max_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
     switch (val->type) {
         case TYPE_I64:
         case TYPE_TIMESTAMP:
-            AGGR_ITER(index, len, offset, val, res, i64, i64, $out[$y] = $in[0], $out[$y] = MAXI64($out[$y], $in[$x]));
+            AGGR_ITER(index, len, offset, val, res, i64, i64, $out[$y] = NULL_I64,
+                      $out[$y] = MAXI64($out[$y], $in[$x]));
             return res;
         case TYPE_F64:
-            AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = $in[0], $out[$y] = MAXF64($out[$y], $in[$x]));
+            AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = NULL_F64,
+                      $out[$y] = MAXF64($out[$y], $in[$x]));
             return res;
         default:
             destroy_partial_result(res);
@@ -602,10 +605,10 @@ obj_p aggr_min_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
     switch (val->type) {
         case TYPE_I64:
         case TYPE_TIMESTAMP:
-            AGGR_ITER(index, len, offset, val, res, i64, i64, $out[$y] = $in[0], $out[$y] = MINI64($out[$y], $in[$x]));
+            AGGR_ITER(index, len, offset, val, res, i64, i64, $out[$y] = INF_I64, $out[$y] = MINI64($out[$y], $in[$x]));
             return res;
         case TYPE_F64:
-            AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = $in[0], $out[$y] = MINF64($out[$y], $in[$x]));
+            AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = INF_F64, $out[$y] = MINF64($out[$y], $in[$x]));
             return res;
         default:
             res->len = 0;
