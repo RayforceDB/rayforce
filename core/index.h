@@ -62,6 +62,7 @@ i64_t *index_group_ids(obj_p index);
 i64_t *index_group_filter_ids(obj_p index);
 obj_p index_group_filter(obj_p index);
 i64_t index_group_shift(obj_p index);
+obj_p index_group_meta(obj_p index);
 obj_p index_distinct_i8(i8_t values[], i64_t len);
 obj_p index_distinct_i16(i16_t values[], i64_t len);
 obj_p index_distinct_i32(i32_t values[], i64_t len);
@@ -101,7 +102,8 @@ i64_t index_bin_f64(f64_t val, f64_t vals[], i64_t ids[], i64_t len);
 i64_t index_bin_guid(guid_t val, guid_t vals[], i64_t ids[], i64_t len);
 i64_t index_bin_list(obj_p val, obj_p vals[], i64_t ids[], i64_t len);
 obj_p index_asof_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol);
-obj_p index_window_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol, obj_p windows, obj_p ltab, obj_p rtab);
+obj_p index_window_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol, obj_p windows, obj_p ltab, obj_p rtab,
+                            i64_t jtype);
 obj_p index_upsert_obj(obj_p lcols, obj_p rcols, i64_t len);
 nil_t index_hash_obj(obj_p obj, i64_t out[], i64_t filter[], i64_t len, b8_t resolve);
 

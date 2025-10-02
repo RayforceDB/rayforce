@@ -73,7 +73,7 @@ i64_t indexl_bin_i32_(i32_t val, i32_t vals[], i32_t offset, i64_t len) {
 
 #define AGGR_ITER(Index, Len, Offset, Val, Res, Incoerce, Outcoerse, Ini, Aggr, Null)              \
     ({                                                                                             \
-        i64_t $i, $x, $y, $n, $o, $li, $ri, $fi, $ti, $kl, $kr;                                    \
+        i64_t $i, $x, $y, $n, $o, $li, $ri, $fi, $ti, $kl, $kr, $it;                               \
         i64_t *group_ids, *source, *filter, shift;                                                 \
         obj_p $rn;                                                                                 \
         index_type_t index_type;                                                                   \
@@ -132,6 +132,7 @@ i64_t indexl_bin_i32_(i32_t val, i32_t vals[], i32_t offset, i64_t len) {
                 }                                                                                  \
                 break;                                                                             \
             case INDEX_TYPE_WINDOW:                                                                \
+                $it = index_group_meta(Index)->i64;                                                \
                 for ($i = Offset; $i < Offset + Len; ++$i) {                                       \
                     $y = $i;                                                                       \
                     $rn = AS_LIST(AS_LIST(Index)[5])[$i];                                          \
