@@ -2499,9 +2499,10 @@ static obj_p __window_join_fill(__index_list_ctx_t *ctx, obj_p ht, i64_t len, i6
     i64_t i, idx;
     obj_p *ids;
 
-    ids = AS_LIST(out) + offset;
+    ids = AS_LIST(out);
+    len += offset;
 
-    for (i = 0; i < len; i++) {
+    for (i = offset; i < len; i++) {
         idx = ht_oa_tab_get_with(ht, i, &__index_list_hash_get, &__index_list_cmp_row, ctx);
         if (idx != NULL_I64)
             ids[i] = clone_obj(AS_LIST(AS_LIST(ht)[1])[idx]);
