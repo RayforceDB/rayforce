@@ -59,8 +59,7 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
                 }
 
                 parts = pool_run(pool);
-
-                return parts;
+                return unify_list(&parts);
             }
 
             item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, v[0]) : fn(v[0]);
@@ -68,7 +67,7 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
             if (IS_ERR(item))
                 return item;
 
-            res = vector(item->type, l);
+            res = (item->type < 0) ? vector(item->type, l) : LIST(l);
 
             ins_obj(&res, 0, item);
 
@@ -98,7 +97,7 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
             if (IS_ERR(item))
                 return item;
 
-            res = vector(item->type, l);
+            res = (item->type < 0) ? vector(item->type, l) : LIST(l);
 
             ins_obj(&res, 0, item);
 
