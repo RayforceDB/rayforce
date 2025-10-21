@@ -308,13 +308,14 @@ obj_p ray_xasc(obj_p x, obj_p y) {
 
                 // Reorder indices according to local_idx
                 i64_t *local = AS_I64(local_idx);
-                i64_t *tmp = malloc(sizeof(i64_t) * nrow);
+                obj_p obj_tmp = I64(nrow);
+                i64_t *tmp = AS_I64(obj_tmp);
                 for (i64_t i = 0; i < nrow; i++)
                     tmp[i] = indices[local[i]];
 
                 memcpy(indices, tmp, sizeof(i64_t) * nrow);
-                free(tmp);
 
+                drop_obj(obj_tmp);
                 drop_obj(col_reordered);
                 drop_obj(local_idx);
             }
@@ -395,13 +396,14 @@ obj_p ray_xdesc(obj_p x, obj_p y) {
 
                 // Reorder indices according to local_idx
                 i64_t *local = AS_I64(local_idx);
-                i64_t *tmp = malloc(sizeof(i64_t) * nrow);
+                obj_p obj_tmp = I64(nrow);
+                i64_t *tmp = AS_I64(obj_tmp);
                 for (i64_t i = 0; i < nrow; i++)
                     tmp[i] = indices[local[i]];
                 for (i64_t i = 0; i < nrow; i++)
                     indices[i] = tmp[i];
-                free(tmp);
 
+                drop_obj(obj_tmp);
                 drop_obj(col_reordered);
                 drop_obj(local_idx);
             }

@@ -26,15 +26,9 @@
 #include "ops.h"
 #include "error.h"
 #include "symbols.h"
-#include <stdlib.h>
 
-#define COUNTING_SORT_LIMIT 1024 * 1024
-
-inline __attribute__((always_inline)) nil_t swap(i64_t *a, i64_t *b) {
-    i64_t t = *a;
-    *a = *b;
-    *b = t;
-}
+// Maximum range for counting sort - configurable constant
+#define COUNTING_SORT_MAX_RANGE 1000000
 
 // Function pointer for comparison
 typedef i64_t (*compare_func_t)(obj_p vec, i64_t idx_i, i64_t idx_j);
@@ -130,16 +124,17 @@ obj_p mergesort_generic_obj(obj_p vec, i64_t asc) {
     }
 
     // Allocate temporary array for merging
-    i64_t *temp = malloc(len * sizeof(i64_t));
-    if (!temp) {
+    obj_p obj_temp = I64(len);
+    if (!obj_temp) {
         drop_obj(indices);
         return I64(0);
     }
+    i64_t *temp = AS_I64(obj_temp);
 
     // Perform merge sort
     merge_sort_indices(vec, ov, temp, 0, len - 1, compare_fn, asc);
 
-    free(temp);
+    drop_obj(obj_temp);
     return indices;
 }
 
@@ -168,69 +163,6 @@ nil_t insertion_sort_desc(i64_t array[], i64_t indices[], i64_t left, i64_t righ
     }
 }
 //
-
-// counting sort
-nil_t counting_sort_asc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i64_t max) {
-    i64_t i, j = 0, n, p, range, *m;
-    obj_p mask;
-
-    range = max - min + 1;
-    mask = I64(range);
-    m = AS_I64(mask);
-
-    memset(m, 0, range * sizeof(i64_t));
-
-    for (i = 0; i < len; i++) {
-        n = array[i] - min;
-        m[n]++;
-    }
-
-    for (i = 0, j = 0; i < range; i++) {
-        if (m[i] > 0) {
-            p = j;
-            j += m[i];
-            m[i] = p;
-        }
-    }
-
-    for (i = 0; i < len; i++) {
-        n = array[i] - min;
-        indices[m[n]++] = i;
-    }
-
-    drop_obj(mask);
-}
-
-nil_t counting_sort_desc(i64_t array[], i64_t indices[], i64_t len, i64_t min, i64_t max) {
-    i64_t i, j = 0, n, p, range, *m;
-    obj_p mask;
-
-    range = max - min + 1;
-    mask = I64(range);
-    m = AS_I64(mask);
-
-    memset(m, 0, range * sizeof(i64_t));
-
-    for (i = 0; i < len; i++) {
-        n = array[i] - min;
-        m[n]++;
-    }
-
-    for (i = range - 1, j = 0; i >= 0; i--) {
-        if (m[i] > 0) {
-            p = j;
-            j += m[i];
-            m[i] = p;
-        }
-    }
-
-    for (i = 0; i < len; i++) {
-        n = array[i] - min;
-        indices[m[n]++] = i;
-    }
-
-    drop_obj(mask);
-}
 
 obj_p ray_sort_asc_u8(obj_p vec) {
     i64_t i, len = vec->len;
@@ -782,11 +714,8 @@ static void binary_insertion_sort_numeric(i64_t *indices, i64_t *data, i64_t len
     }
 }
 
-// Maximum range for counting sort - configurable constant
-#define COUNTING_SORT_MAX_RANGE 1000000
-
 // General counting sort for integer vectors when range is reasonable
-static obj_p counting_sort_integers(obj_p vec, i64_t asc) {
+static obj_p counting_sort_i64(obj_p vec, i64_t asc) {
     i64_t len = vec->len;
     if (len == 0)
         return I64(0);
@@ -806,38 +735,36 @@ static obj_p counting_sort_integers(obj_p vec, i64_t asc) {
 
     // Use counting sort only if range is reasonable
     // Don't use if too sparse (range > len) or exceeds maximum range
-    if (range > len || range > COUNTING_SORT_MAX_RANGE) {
+    if (range > len || range > COUNTING_SORT_MAX_RANGE)
         return NULL;  // Fall back to other sorting
-    }
 
     // Allocate counting array
-    i64_t *counts = (i64_t *)calloc(range, sizeof(i64_t));
+    i64_t *counts = (i64_t *)heap_alloc(range * sizeof(i64_t));
     if (!counts)
         return NULL;
 
     // Create buckets to store indices for each symbol
-    i64_t **buckets = (i64_t **)calloc(range, sizeof(i64_t *));
+    i64_t **buckets = (i64_t **)heap_alloc(range * sizeof(i64_t *));
     if (!buckets) {
-        free(counts);
+        heap_free(counts);
         return NULL;
     }
 
     // Count occurrences and allocate buckets
-    for (i64_t i = 0; i < len; i++) {
+    for (i64_t i = 0; i < len; i++)
         counts[data[i] - min_sym]++;
-    }
 
     // Allocate memory for each bucket
     for (i64_t i = 0; i < range; i++) {
         if (counts[i] > 0) {
-            buckets[i] = (i64_t *)malloc(counts[i] * sizeof(i64_t));
+            buckets[i] = (i64_t *)heap_alloc(counts[i] * sizeof(i64_t));
             if (!buckets[i]) {
                 // Cleanup on failure
                 for (i64_t j = 0; j < i; j++) {
-                    free(buckets[j]);
+                    heap_free(buckets[j]);
                 }
-                free(buckets);
-                free(counts);
+                heap_free(buckets);
+                heap_free(counts);
                 return NULL;
             }
         }
@@ -876,22 +803,21 @@ static obj_p counting_sort_integers(obj_p vec, i64_t asc) {
     }
 
     // Cleanup buckets
-    for (i64_t i = 0; i < range; i++) {
-        free(buckets[i]);
-    }
-    free(buckets);
+    for (i64_t i = 0; i < range; i++)
+        heap_free(buckets[i]);
 
-    free(counts);
+    heap_free(buckets);
+    heap_free(counts);
     return indices;
 }
 
 // Optimized sort dispatcher
 static obj_p optimized_sort(obj_p vec, i64_t asc) {
+    obj_p res;
     i64_t len = vec->len;
 
-    if (len <= 1) {
+    if (len <= 1)
         return I64(len);
-    }
 
     // Small arrays: use insertion sort
     if (len <= 32) {
@@ -919,12 +845,11 @@ static obj_p optimized_sort(obj_p vec, i64_t asc) {
     switch (vec->type) {
         case TYPE_I64:
         case TYPE_TIME:
-        case TYPE_SYMBOL: {
-            obj_p counting_result = counting_sort_integers(vec, asc);
-            if (counting_result) {
-                return counting_result;
-            }
-        } break;
+        case TYPE_SYMBOL:
+            res = counting_sort_i64(vec, asc);
+            if (res)
+                return res;
+            break;
         default:
             break;
     }
