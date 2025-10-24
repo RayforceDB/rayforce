@@ -14,3 +14,5 @@ rayforce_wrap.*
 *.dat
 gmon.out
 __pycache__/
+CLAUDE.md
+.claude/
