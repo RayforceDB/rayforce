@@ -15,16 +15,16 @@ Let's start with some basic arithmetic operations:
 ↪ (* (+ 2 3) 4)
 20
 
-;; Integer part of division
+;; Integer division (quotient)
 ↪ (/ -10 3)
--3
+-4
 
 ;; Remainder from division
 ↪ (% 5 -3)
--2
+-1
 
-;; Division with decimals
-↪ (/ 10 3)
+;; Floating-point division
+↪ (div 10 3)
 3.33
 ```
 

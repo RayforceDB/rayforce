@@ -1,19 +1,19 @@
 
-# Fdiv `div`
+# Fdiv `fdiv`
 
-Makes a division of it's arguments. Supports such types and their combinations: `i64`, `I64`, `f64`, `F64`.
+Makes a floating-point division of its arguments. Always returns a float result. Supports such types and their combinations: `i64`, `I64`, `f64`, `F64`.
 
 ``` clj
 ↪ (div 1 2)
-0.5
+0.50
 ↪ (div 1.2 2.2)
-0.5454545454545454
+0.55
 ↪ (div 1 3.4)
-0.29411764705882354
+0.29
 ↪ (div [1 2 3] 3)
-[0.3333333333333333 0.6666666666666666 1]
+[0.33 0.67 1.00]
 ↪ (div [1 2 3] 2.1)
-[0.47619047619047616 0.9523809523809523 1.4285714285714286]
+[0.48 0.95 1.43]
 ↪ (div 3.1 [1 2 3])
-[3.1 1.55 1.0333333333333334]
+[3.10 1.55 1.03]
 ```
