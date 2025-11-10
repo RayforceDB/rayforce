@@ -56,8 +56,8 @@ Contributions are welcome! You can help by:
 - Creating example scripts and use cases
 - Improving documentation
 
-## Sponsor
+## Development Partnership
 
-RayforceDB is proudly sponsored by **[Lynx Capital](https://www.lynxcapitalsecurities.com/)**.
+RayforceDB is jointly developed with and sponsored by **[Lynx Capital](https://www.lynxcapitalsecurities.com/)**.
 
-Their support has been instrumental in making RayforceDB a mature, production-ready database system. Lynx Capital's commitment to innovative open-source technologies in the financial sector has enabled RayforceDB to reach its full potential.
+This partnership has been instrumental in making RayforceDB a mature, production-ready database system. Lynx Capital's active involvement in development and their commitment to innovative open-source technologies in the financial sector has enabled RayforceDB to reach its full potential.
