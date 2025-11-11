@@ -125,7 +125,6 @@ nav:
       - Sub: content/math/sub.md
       - Mul: content/math/mul.md
       - Div: content/math/div.md
-      - Fdiv: content/math/fdiv.md
       - Mod: content/math/mod.md
       - Sum: content/math/sum.md
       - Avg: content/math/avg.md
