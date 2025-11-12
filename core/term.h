@@ -42,9 +42,17 @@
 #define KEYCODE_HOME 'H'
 #define KEYCODE_END 'F'
 #define KEYCODE_ESCAPE 0x1b
+#define KEYCODE_CTRL_A 0x01
+#define KEYCODE_CTRL_B 0x02
 #define KEYCODE_CTRL_C 0x03
 #define KEYCODE_CTRL_D 0x04
+#define KEYCODE_CTRL_E 0x05
+#define KEYCODE_CTRL_F 0x06
+#define KEYCODE_CTRL_K 0x0b
+#define KEYCODE_CTRL_N 0x0e
+#define KEYCODE_CTRL_P 0x10
 #define KEYCODE_CTRL_U 0x15
+#define KEYCODE_CTRL_W 0x17
 #define KEYCODE_LPAREN '('
 #define KEYCODE_RPAREN ')'
 #define KEYCODE_LCURLY '{'

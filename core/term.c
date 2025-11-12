@@ -812,6 +812,13 @@ static i64_t find_prev_utf8_char(const c8_t *str, i64_t pos) {
     return pos;
 }
 
+nil_t term_handle_delete_char(term_p term) {
+    if (term->buf_pos < term->buf_len) {
+        memmove(term->buf + term->buf_pos, term->buf + term->buf_pos + 1, term->buf_len - term->buf_pos);
+        term->buf_len--;
+    }
+}
+
 nil_t term_handle_backspace(term_p term) {
     if (term->buf_pos == 0)
         return;
@@ -1197,11 +1204,35 @@ obj_p term_handle_escape(term_p term) {
         goto proceed;
     }
 
+    // CTRL+Right/ALT+Right (wordwise) esc
+    if (IS_ESC(term, "\x1b""f") || IS_ESC(term,"\x1b[5C")) {
+        if(term->buf_pos < term->buf_len) {
+            i32_t old_pos = term->buf_pos;
+            term->buf_pos++;
+            while(term->buf_pos < term->buf_len && is_alphanum(term->buf[term->buf_pos]))term->buf_pos++;
+            term_goto_position(term, old_pos, term->buf_pos);
+            fflush(stdout);
+        }
+        goto proceed;
+    }
+
     // Right arrow esc
     if (IS_ESC(term, "\x1b[C")) {
         if (term->buf_pos < term->buf_len) {
             i32_t old_pos = term->buf_pos;
             term->buf_pos++;
+            term_goto_position(term, old_pos, term->buf_pos);
+            fflush(stdout);
+        }
+        goto proceed;
+    }
+
+    // CTRL+Left/ALT+Left (wordwise) esc
+    if (IS_ESC(term, "\x1b""b") || IS_ESC(term,"\x1b[5D")) {
+        if(term->buf_pos > 0) {
+            i32_t old_pos = term->buf_pos;
+            term->buf_pos--;
+            while(term->buf_pos > 0 && is_alphanum(term->buf[term->buf_pos-1]))term->buf_pos--;
             term_goto_position(term, old_pos, term->buf_pos);
             fflush(stdout);
         }
@@ -1220,7 +1251,7 @@ obj_p term_handle_escape(term_p term) {
     }
 
     // Home esc
-    if (IS_ESC(term, "\x1b[H")) {
+    if (IS_ESC(term, "\x1b[1~")||IS_ESC(term, "\x1b[H")) {
         if (term->buf_pos > 0) {
             i32_t old_pos = term->buf_pos;
             term->buf_pos = 0;
@@ -1231,7 +1262,7 @@ obj_p term_handle_escape(term_p term) {
     }
 
     // End esc
-    if (IS_ESC(term, "\x1b[F")) {
+    if (IS_ESC(term,"\x1b[4~")||IS_ESC(term, "\x1b[F")) {
         if (term->buf_len > 0) {
             i32_t old_pos = term->buf_pos;
             term->buf_pos = term->buf_len;
@@ -1243,11 +1274,8 @@ obj_p term_handle_escape(term_p term) {
 
     // Delete esc
     if (IS_ESC(term, "\x1b[3~")) {
-        if (term->buf_pos < term->buf_len) {
-            memmove(term->buf + term->buf_pos, term->buf + term->buf_pos + 1, term->buf_len - term->buf_pos);
-            term->buf_len--;
-            term_redraw(term);
-        }
+        term_handle_delete_char(term);
+        term_redraw(term);
         goto proceed;
     }
 
@@ -1318,17 +1346,70 @@ obj_p term_read(term_p term) {
             term->input_len = 0;
             break;
         case KEYCODE_CTRL_U:
-            autocp_reset_current(term);
-            term_handle_ctrl_u(term);
-            term->input_len = 0;
-            break;
         case KEYCODE_CTRL_C:
             autocp_reset_current(term);
             term_handle_ctrl_u(term);
             term->input_len = 0;
             break;
+        case KEYCODE_CTRL_A:
+            term_goto_position(term, term->buf_pos, 0);fflush(stdout);
+            term->buf_pos = 0;term->input_len = 0;
+            break;
+
+        case KEYCODE_CTRL_B:
+            if(term->buf_pos) {
+                term_goto_position(term, term->buf_pos, term->buf_pos-1);
+                term->buf_pos--;
+                fflush(stdout);
+            }
+            term->input_len = 0;
+            break;
+
         case KEYCODE_CTRL_D:
-            poll_exit(runtime_get()->poll, 0);
+            if(term->buf_pos == 0 && term->buf_len == 0){
+                poll_exit(runtime_get()->poll, 0);
+            } else {
+                term_handle_delete_char(term);
+                term_redraw(term);
+            }
+            term->input_len = 0;
+            break;
+
+        case KEYCODE_CTRL_E:
+            term_goto_position(term, term->buf_pos, term->buf_len);fflush(stdout);
+            term->buf_pos = term->buf_len;
+            term->input_len = 0;
+            break;
+
+        case KEYCODE_CTRL_F:
+            if(term->buf_pos < term->buf_len) {
+                term_goto_position(term, term->buf_pos, term->buf_pos + 1);
+                term->buf_pos++;
+                fflush(stdout);
+            }
+            term->input_len = 0;
+            break;
+
+        case KEYCODE_CTRL_K:
+            while(term->buf_pos<term->buf_len)term_handle_delete_char(term);
+            term_redraw(term);
+            term->input_len = 0;
+            break;
+        case KEYCODE_CTRL_N:
+            hist_save_current(term->hist, term->buf, term->buf_len);
+            term->buf_len = term->buf_pos = hist_prev(term->hist, term->buf);
+            goto update_history;
+        case KEYCODE_CTRL_P:
+            hist_save_current(term->hist, term->buf, term->buf_len);
+            term->buf_len = term->buf_pos = hist_next(term->hist, term->buf);
+        update_history:
+            if(term->buf_len < 0)term->buf_len = term->buf_pos = 0;
+            term_redraw(term);
+            term->input_len = 0;
+            break;
+        case KEYCODE_CTRL_W:
+            autocp_reset_current(term);
+            while(term->buf_pos>0&&is_alphanum(term->buf[term->buf_pos-1]))term_handle_backspace(term);
             term->input_len = 0;
             break;
         case KEYCODE_ESCAPE:
