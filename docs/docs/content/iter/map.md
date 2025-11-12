@@ -23,6 +23,13 @@ Applies a function to each element of a list and returns a new list with the res
 ["1" "2" "3"]
 ```
 
+### Mapping with operators
+
+```clj
+↪ (map + 5 [4 5 6])
+[9 10 11]
+```
+
 ### Mapping with built-in functions
 
 ```clj
