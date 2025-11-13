@@ -596,7 +596,7 @@ obj_p ray_map_left(obj_p *x, i64_t n) {
                 }
 
                 v = call(f, n);
-                for (i = 0; i < n; i++)
+                for (j = 0; j < n; j++)
                     drop_obj(stack_pop());
 
                 if (IS_ERR(v)) {
@@ -682,7 +682,7 @@ obj_p ray_map_right(obj_p *x, i64_t n) {
                 stack_push(at_idx(x[n - 1], i));
 
                 v = call(f, n);
-                for (i = 0; i < n; i++)
+                for (j = 0; j < n; j++)
                     drop_obj(stack_pop());
 
                 if (IS_ERR(v)) {
