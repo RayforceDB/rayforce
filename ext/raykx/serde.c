@@ -95,7 +95,11 @@ i64_t raykx_size_obj(obj_p obj) {
         case TYPE_DICT:
             return ISIZEOF(i8_t) + raykx_size_obj(AS_LIST(obj)[0]) + raykx_size_obj(AS_LIST(obj)[1]);
         case TYPE_ERR:
-            return ISIZEOF(i8_t) + AS_ERROR(obj)->msg->len + 1;
+            l = AS_ERROR(obj)->msg->len;
+            //If there isn't a null terminator on the original message add an extra byte to add one
+            if (AS_C8(AS_ERROR(obj)->msg)[l - 1] != '\0')
+                l++;
+            return ISIZEOF(i8_t) + l + 1;
         case TYPE_NULL:
             return ISIZEOF(i8_t) + 1 + sizeof(i32_t);
         // // case TYPE_LAMBDA:
@@ -281,12 +285,17 @@ i64_t raykx_ser_obj(u8_t *buf, obj_p obj) {
                 return ISIZEOF(i8_t) + 1;
             }
 
-            if (AS_C8(AS_ERROR(obj)->msg)[l - 1] == '\0')
-                l--;
-
             memcpy(buf, AS_C8(AS_ERROR(obj)->msg), l);
             buf += l;
-            return ISIZEOF(i8_t) + l + 1;
+
+            //Add an null terminator if there isn't one there already
+            if (AS_C8(AS_ERROR(obj)->msg)[l - 1] != '\0'){
+                buf[0] = '\0';
+                l++;
+                buf++;
+            }
+
+            return ISIZEOF(i8_t) + l;
         default:
             return 0;
     }
