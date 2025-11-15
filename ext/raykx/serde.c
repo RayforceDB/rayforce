@@ -97,9 +97,9 @@ i64_t raykx_size_obj(obj_p obj) {
         case TYPE_ERR:
             l = AS_ERROR(obj)->msg->len;
             //If there isn't a null terminator on the original message add an extra byte to add one
-            if (AS_C8(AS_ERROR(obj)->msg)[l - 1] != '\0')
+            if (l == 0 || AS_C8(AS_ERROR(obj)->msg)[l - 1] != '\0')
                 l++;
-            return ISIZEOF(i8_t) + l + 1;
+            return ISIZEOF(i8_t) + l;
         case TYPE_NULL:
             return ISIZEOF(i8_t) + 1 + sizeof(i32_t);
         // // case TYPE_LAMBDA:
