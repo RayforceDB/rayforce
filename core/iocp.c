@@ -51,6 +51,7 @@
 #include "sys.h"
 #include "chrono.h"
 #include "binary.h"
+#include "repl.h"
 
 // Link with Ws2_32.lib
 #pragma comment(lib, "Ws2_32.lib")
@@ -69,12 +70,12 @@ typedef struct listener_t {
     OVERLAPPED overlapped;
     DWORD dwBytes;
     SOCKET hAccepted;
-} *listener_p;
+} * listener_p;
 
 typedef struct stdin_thread_ctx_t {
     HANDLE h_cp;
     term_p term;
-} *stdin_thread_ctx_p;
+} * stdin_thread_ctx_p;
 
 listener_p __LISTENER = NULL;
 stdin_thread_ctx_p __STDIN_THREAD_CTX = NULL;
@@ -230,14 +231,14 @@ poll_p poll_init(i64_t port) {
             poll_destroy(poll);
             return NULL;
         }
-    }
 
-    __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
-    memset(__LISTENER, 0, sizeof(struct listener_t));
+        __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
+        memset(__LISTENER, 0, sizeof(struct listener_t));
 
-    if (poll_accept(poll) == -1) {
-        heap_free(poll);
-        exit_werror();
+        if (poll_accept(poll) == -1) {
+            heap_free(poll);
+            exit_werror();
+        }
     }
 
     __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
@@ -342,7 +343,10 @@ nil_t poll_destroy(poll_p poll) {
     WSACleanup();
     heap_free(poll);
 
-    heap_free(__LISTENER);
+    if (__LISTENER != NULL) {
+        heap_free(__LISTENER);
+        __LISTENER = NULL;
+    }
     heap_free(__STDIN_THREAD_CTX);
 }
 
@@ -560,7 +564,7 @@ send:
 obj_p read_obj(selector_p selector) {
     obj_p res;
 
-    res = de_raw(selector->rx.buf, selector->rx.size);
+    res = de_raw(selector->rx.buf, &selector->rx.size);
     heap_free(selector->rx.buf);
     selector->rx.buf = NULL;
     selector->rx.size = 0;
@@ -709,7 +713,7 @@ i64_t poll_run(poll_p poll) {
                         }
 
                 }  // switch
-            }  // for
+            }      // for
         } else {
             res = sys_error(ERROR_TYPE_SOCK, "poll_init");
             fmt = obj_fmt(res, B8_TRUE);
@@ -825,4 +829,34 @@ obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg) {
         THROW(ERR_IO, "ipc_send_async: error sending message");
 
     return NULL_OBJ;
+}
+
+// ============================================================================
+// Unix API compatibility wrappers
+// ============================================================================
+
+poll_p poll_create() { return poll_init(0); }
+
+repl_p repl_create(poll_p poll) {
+    // Windows REPL is integrated into IOCP, not a separate component
+    // Return NULL to indicate REPL is handled internally
+    UNUSED(poll);
+    return NULL;
+}
+
+i64_t ipc_listen(poll_p poll, i64_t port) { return poll_listen(poll, port); }
+
+i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
+    UNUSED(poll);
+    UNUSED(addr);
+    UNUSED(timeout);
+    // Not implemented for Windows IOCP
+    return -1;
+}
+
+obj_p ipc_send(poll_p poll, i64_t id, obj_p msg, u8_t msgtype) {
+    if (msgtype == MSG_TYPE_SYNC)
+        return ipc_send_sync(poll, id, msg);
+    else
+        return ipc_send_async(poll, id, msg);
 }

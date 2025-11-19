@@ -18,7 +18,7 @@ These OSes are supported (for now):
 
 - [Linux](#linux)
 - [MacOS](#macos)
-- [Windows](#windows) (unstable)
+- [Windows](#windows)
 
 # :material-linux: Linux
 
@@ -39,16 +39,36 @@ rlwrap ./rayforce -f examples/table.rfl
 
 ## Requirements
 
-- [Git](https://git-scm.com/)
-- [MinGW](http://www.mingw.org/)
-- [TDM-GCC](https://jmeubank.github.io/tdm-gcc/)
+- [Git](https://git-scm.com/) (includes Git Bash)
+- **Choose one:**
+  - [Clang/LLVM](https://llvm.org/) - **Recommended** (install via [Scoop](https://scoop.sh/): `scoop install llvm make`)
+  - [MinGW](http://www.mingw.org/) or [TDM-GCC](https://jmeubank.github.io/tdm-gcc/)
 
+## Build with Clang (Recommended)
+
+**Using Git Bash:**
 ``` sh
 git clone https://github.com/singaraiona/rayforce
 cd rayforce
-mingw32-make.exe CC="gcc" LIBS="-lm -lws2_32 -lkernel32" release 
+make release          # Uses clang by default, creates rayforce.exe
 ./rayforce.exe -f examples/table.rfl
 ```
+
+## Build with GCC/MinGW
+
+**Using Git Bash:**
+``` sh
+git clone https://github.com/singaraiona/rayforce
+cd rayforce
+make release CC=gcc   # Explicitly use GCC
+./rayforce.exe -f examples/table.rfl
+```
+
+**Important Notes:**
+- The Makefile automatically detects Clang with MSVC target and uses appropriate linker flags
+- Build creates `rayforce.exe` automatically on Windows
+- **Use Git Bash** for best compatibility (includes Unix tools like `rm`, `cp`)
+- In cmd.exe, some make commands may fail without Git's bin directory in PATH
 
 # :simple-macos: MacOS
 

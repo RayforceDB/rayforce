@@ -12,13 +12,35 @@ endif
 $(info OS="$(OS)")
 
 ifeq ($(OS),Windows_NT)
-DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -DDEBUG
+# Detect if we're using clang with MSVC target or GCC
+COMPILER_VERSION := $(shell $(CC) --version 2>&1)
+IS_CLANG_MSVC := $(if $(findstring windows-msvc,$(COMPILER_VERSION)),1,0)
+
+DEBUG_CFLAGS = -Wall -Wextra -std=$(STD) -g -O0 -DDEBUG
+RELEASE_CFLAGS = -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
+ -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
+ -flax-vector-conversions -fno-math-errno
+
+ifeq ($(IS_CLANG_MSVC),1)
+# Clang with MSVC backend - use MSVC-style linker flags
+LIBS = -lws2_32 -lkernel32
+LIBNAME = rayforce.dll
+RELEASE_LDFLAGS = -Xlinker /STACK:8388608
+DEBUG_LDFLAGS = -Xlinker /STACK:8388608
+else
+# GCC or MinGW-targeted clang - use GNU-style flags
 LIBS = -lm -lws2_32 -lkernel32
 LIBNAME = rayforce.dll
+RELEASE_LDFLAGS = -Wl,--stack,8388608
+DEBUG_LDFLAGS = -Wl,--stack,8388608
+endif
 endif
 
 ifeq ($(OS),linux)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -march=native -fsigned-char -DDEBUG -m64
+RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
+ -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
+ -flax-vector-conversions -fno-math-errno
 LIBS = -lm -ldl -lpthread
 RELEASE_LDFLAGS = -Wl,--strip-all -Wl,--gc-sections -Wl,--as-needed\
  -Wl,--build-id=none -Wl,--no-eh-frame-hdr -Wl,--no-ld-generated-unwind-info -rdynamic
@@ -28,14 +50,14 @@ endif
 
 ifeq ($(OS),darwin)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -Wunused-function -std=$(STD) -g -O0 -march=native -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
+RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
+ -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
+ -flax-vector-conversions -fno-math-errno
 LIBS = -lm -ldl -lpthread
 LIBNAME = librayforce.dylib
 endif
 
-# -mavx2 -mfma -mpclmul -mbmi2 -ffast-math 
-RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
- -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
- -flax-vector-conversions -fno-math-errno
+# -mavx2 -mfma -mpclmul -mbmi2 -ffast-math
 CORE_OBJECTS = core/poll.o core/ipc.o core/repl.o core/runtime.o core/sys.o core/os.o core/proc.o core/fs.o core/mmap.o core/serde.o\
  core/temporal.o core/date.o core/time.o core/timestamp.o core/guid.o core/sort.o core/ops.o core/util.o\
  core/string.o core/hash.o core/symbols.o core/format.o core/rayforce.o core/heap.o core/parse.o\
@@ -43,11 +65,16 @@ CORE_OBJECTS = core/poll.o core/ipc.o core/repl.o core/runtime.o core/sys.o core
  core/sock.o core/error.o core/math.o core/cmp.o core/items.o core/logic.o core/compose.o core/order.o core/io.o\
  core/misc.o core/freelist.o core/update.o core/join.o core/query.o core/cond.o\
  core/iter.o core/dynlib.o core/aggr.o core/index.o core/group.o core/filter.o core/atomic.o\
- core/thread.o core/pool.o core/progress.o core/term.o core/fdmap.o core/signal.o core/log.o
+ core/thread.o core/pool.o core/progress.o core/term.o core/fdmap.o core/signal.o core/log.o core/queue.o
 APP_OBJECTS = app/main.o
 TESTS_OBJECTS = tests/main.o
 BENCH_OBJECTS = bench/main.o
 TARGET = rayforce
+ifeq ($(OS),Windows_NT)
+TARGET_EXE = $(TARGET).exe
+else
+TARGET_EXE = $(TARGET)
+endif
 CFLAGS = $(RELEASE_CFLAGS)
 
 default: debug
@@ -57,11 +84,12 @@ all: default
 obj: $(CORE_OBJECTS)
 
 app: $(APP_OBJECTS) obj
-	$(CC) $(CFLAGS) -o $(TARGET) $(CORE_OBJECTS) $(APP_OBJECTS) $(LIBS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $(TARGET_EXE) $(CORE_OBJECTS) $(APP_OBJECTS) $(LIBS) $(LDFLAGS)
 
 tests: -DSTOP_ON_FAIL=$(STOP_ON_FAIL) -DDEBUG
-tests: $(TESTS_OBJECTS) lib
-	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LDFLAGS)
+tests: LDFLAGS = $(DEBUG_LDFLAGS)
+tests: $(TESTS_OBJECTS) obj
+	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) $(LIBS) $(LDFLAGS)
 	./$(TARGET).test
 
 bench: CC = gcc
@@ -159,6 +187,7 @@ clean:
 	-rm -f $(TARGET).js
 	-rm -f $(TARGET).wasm
 	-rm -f $(TARGET)
+	-rm -f $(TARGET).exe
 	-rm -f tests/*.gcno tests/*.gcda tests/*.gcov
 	-rm -f core/*.gcno core/*.gcda core/*.gcov
 	-rm -f coverage.info

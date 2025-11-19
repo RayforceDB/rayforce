@@ -21,6 +21,9 @@
  *   SOFTWARE.
  */
 
+// IPC functions are implemented in platform-specific files for Windows
+#if !defined(OS_WINDOWS)
+
 #include "ipc.h"
 #include "eval.h"
 #include "binary.h"
@@ -440,3 +443,4 @@ obj_p ipc_send(poll_p poll, i64_t id, obj_p msg, u8_t msgtype) {
 
     return res;
 }
+#endif  // !OS_WINDOWS

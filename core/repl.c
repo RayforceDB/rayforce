@@ -21,6 +21,9 @@
  *   SOFTWARE.
  */
 
+// REPL functions are implemented in platform-specific files for Windows
+#if !defined(OS_WINDOWS)
+
 #include <stdio.h>
 #include <unistd.h>
 #include "repl.h"
@@ -136,3 +139,4 @@ nil_t repl_on_error(poll_p poll, selector_p selector) {
 
     perror("repl_on_error");
 }
+#endif  // !OS_WINDOWS

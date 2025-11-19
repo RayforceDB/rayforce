@@ -21,6 +21,9 @@
  *   SOFTWARE.
  */
 
+#ifdef _WIN32
+#include <io.h>
+#endif
 #include "binary.h"
 #include "compose.h"
 #include "def.h"

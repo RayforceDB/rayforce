@@ -23,6 +23,9 @@
 
 #include <stdio.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
 #include "fs.h"
 #include "string.h"
 #include "util.h"

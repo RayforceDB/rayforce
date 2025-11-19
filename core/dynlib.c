@@ -31,6 +31,48 @@
 
 #if defined(OS_WINDOWS)
 
+dynlib_p dynlib_open(obj_p path) {
+    i64_t i, l;
+    dynlib_p dl;
+    HMODULE handle;
+    obj_p dynlibs;
+
+    // try to find the dynlib in the list (if it is already opened)
+    dynlibs = runtime_get()->dynlibs;
+    l = dynlibs->len;
+
+    for (i = 0; i < l; i++) {
+        dl = (dynlib_p)AS_I64(dynlibs)[i];
+        if (str_cmp(AS_C8(dl->path), dl->path->len, AS_C8(path), path->len) == 0) {
+            LOG_TRACE("dynlib: %s already opened", AS_C8(path));
+            return dl;
+        }
+    }
+
+    // otherwise, open the dynlib
+    LOG_TRACE("dynlib: opening %s", AS_C8(path));
+    handle = LoadLibrary(AS_C8(path));
+    if (handle == NULL) {
+        LOG_ERROR("dynlib: failed to open %s: %d", AS_C8(path), GetLastError());
+        return NULL;
+    }
+
+    dl = (dynlib_p)heap_mmap(sizeof(struct dynlib_t));
+    dl->path = clone_obj(path);
+    dl->handle = handle;
+
+    // add the dynlib to the list
+    push_raw(&runtime_get()->dynlibs, (raw_p)&dl);
+
+    return dl;
+}
+
+nil_t dynlib_close(dynlib_p dl) {
+    FreeLibrary((HMODULE)dl->handle);
+    drop_obj(dl->path);
+    heap_unmap(dl, sizeof(struct dynlib_t));
+}
+
 obj_p dynlib_loadfn(str_p path, str_p func, i64_t nargs) {
     HMODULE handle;
     FARPROC dsym;

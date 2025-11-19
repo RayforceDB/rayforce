@@ -24,7 +24,12 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#if !defined(OS_WINDOWS)
 #include <netdb.h>
+#else
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 #include "sock.h"
 #include "string.h"
 #include "log.h"
@@ -61,6 +66,9 @@ i64_t sock_addr_from_str(str_p str, i64_t len, sock_addr_t *addr) {
 }
 
 #if defined(OS_WINDOWS)
+
+// MSG_NOSIGNAL is not available on Windows
+#define MSG_NOSIGNAL 0
 
 i64_t sock_set_nonblocking(i64_t fd, b8_t flag) {
     u_long mode = flag ? 1 : 0;  // 1 to set non-blocking, 0 to set blocking
@@ -143,6 +151,7 @@ i64_t sock_accept(i64_t fd) {
     struct linger linger_opt;
     socklen_t len = sizeof(addr);
     i64_t acc_fd;
+    i32_t code;
 
     acc_fd = accept((SOCKET)fd, (struct sockaddr *)&addr, &len);
     if (acc_fd == INVALID_SOCKET)
@@ -158,7 +167,7 @@ i64_t sock_accept(i64_t fd) {
     linger_opt.l_linger = 0;  // Timeout in seconds (0 means terminate immediately)
 
     // Apply the linger option to the accepted socket
-    if (setsockopt(acc_fd, SOL_SOCKET, SO_LINGER, &linger_opt, sizeof(linger_opt)) < 0) {
+    if (setsockopt(acc_fd, SOL_SOCKET, SO_LINGER, (const char *)&linger_opt, sizeof(linger_opt)) < 0) {
         LOG_ERROR("Failed to set SO_LINGER on accepted socket: %s", strerror(errno));
         closesocket(acc_fd);
         return -1;
@@ -184,7 +193,7 @@ i64_t sock_listen(i64_t port) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt)) < 0) {
         code = WSAGetLastError();
         closesocket(fd);
         WSASetLastError(code);
@@ -238,7 +247,7 @@ i64_t sock_send(i64_t fd, u8_t *buf, i64_t size) {
     i64_t sz, total = 0;
 
 send:
-    sz = send(fd, buf + total, size - total, MSG_NOSIGNAL);
+    sz = send(fd, (const char *)(buf + total), size - total, MSG_NOSIGNAL);
     switch (sz) {
         case -1:
             if (errno == EINTR)

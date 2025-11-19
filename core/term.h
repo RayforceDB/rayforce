@@ -95,6 +95,7 @@ typedef struct term_t {
     DWORD new_stdin_mode;
     DWORD old_stdout_mode;
     DWORD new_stdout_mode;
+    UINT old_codepage;
     mutex_t lock;
 #else
     struct termios oldattr;  // Store the old terminal attributes

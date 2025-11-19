@@ -35,6 +35,7 @@
 #include "wasm.c"
 #endif
 
+#if !defined(OS_WINDOWS)
 RAYASSERT(sizeof(struct poll_buffer_t) == 16, poll_h)
 
 selector_p poll_get_selector(poll_p poll, i64_t id) {
@@ -129,6 +130,7 @@ i64_t poll_send_buf(poll_p poll, selector_p selector, poll_buffer_p buf) {
 
     return poll_send(poll, selector);
 }
+#endif  // !OS_WINDOWS
 
 nil_t poll_exit(poll_p poll, i64_t code) { poll->code = code; }
 

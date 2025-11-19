@@ -30,6 +30,7 @@
 #include "parse.h"
 #include "serde.h"
 #include "format.h"
+#include "queue.h"
 #include "freelist.h"
 #include "chrono.h"
 #include "term.h"
@@ -71,6 +72,19 @@ typedef struct poll_buffer_t {
 // Platform-specific event definitions and structures
 #if defined(OS_WINDOWS)
 #include <windows.h>
+
+// Message types for IPC
+#define MSG_TYPE_ASYN 0
+#define MSG_TYPE_SYNC 1
+#define MSG_TYPE_RESP 2
+
+typedef enum poll_result_t {
+    POLL_DONE = 0,
+    POLL_PENDING = 1,
+    POLL_ERROR = 2,
+    POLL_OK = 1,  // Alias for POLL_PENDING
+} poll_result_t;
+
 typedef enum poll_events_t {
     POLL_EVENT_READ = POLLIN,
     POLL_EVENT_WRITE = POLLOUT,
@@ -88,7 +102,6 @@ typedef struct selector_t {
         b8_t header;
         OVERLAPPED overlapped;
         DWORD flags;
-        DWORD size;
         i64_t size;
         u8_t *buf;
         WSABUF wsa_buf;
@@ -98,13 +111,24 @@ typedef struct selector_t {
         b8_t ignore;
         OVERLAPPED overlapped;
         DWORD flags;
-        DWORD size;
         i64_t size;
         u8_t *buf;
         WSABUF wsa_buf;
         queue_p queue;  // queue for async messages waiting to be sent
     } tx;
 } *selector_p;
+
+typedef struct poll_t {
+    i64_t code;
+    i64_t poll_fd;         // IOCP handle as i64_t
+    i64_t ipc_fd;
+    obj_p replfile;
+    obj_p ipcfile;
+    term_p term;
+    freelist_p selectors;
+    timers_p timers;
+} *poll_p;
+
 #else
 #if defined(OS_LINUX)
 #include <sys/epoll.h>
@@ -178,9 +202,20 @@ typedef struct poll_registry_t {
 #endif
 
 // Function declarations
-poll_p poll_create();
+#if defined(OS_WINDOWS)
+poll_p poll_init(i64_t port);
+poll_p poll_create();  // Wrapper for compatibility
+i64_t poll_listen(poll_p poll, i64_t port);
 nil_t poll_destroy(poll_p poll);
 i64_t poll_run(poll_p poll);
+i64_t poll_register(poll_p poll, i64_t fd, u8_t version);
+nil_t poll_deregister(poll_p poll, i64_t id);
+nil_t poll_call_usr_on_open(poll_p poll, i64_t id);
+nil_t poll_call_usr_on_close(poll_p poll, i64_t id);
+obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg);
+obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg);
+#else
+poll_p poll_create();
 i64_t poll_register(poll_p poll, poll_registry_p registry);
 i64_t poll_deregister(poll_p poll, i64_t id);
 selector_p poll_get_selector(poll_p poll, i64_t id);
@@ -192,6 +227,9 @@ i64_t poll_rx_buf_release(poll_p poll, selector_p selector);
 i64_t poll_rx_buf_reset(poll_p poll, selector_p selector);
 i64_t poll_send_buf(poll_p poll, selector_p selector, poll_buffer_p buf);
 option_t poll_block_on(poll_p poll, selector_p selector);
+nil_t poll_destroy(poll_p poll);
+i64_t poll_run(poll_p poll);
+#endif
 nil_t poll_exit(poll_p poll, i64_t code);
 nil_t poll_set_usr_fd(i64_t fd);
 

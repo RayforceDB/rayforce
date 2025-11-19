@@ -22,7 +22,9 @@
  */
 
 #include <stdio.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include "term.h"
 #include "chrono.h"
 #include "heap.h"
@@ -197,7 +199,7 @@ hist_p hist_create() {
     // Lock file for reading existing history
 #if defined(OS_WINDOWS)
     OVERLAPPED overlapped = {0};
-    if (!LockFileEx((HANDLE)_get_osfhandle(fd), 0, 0, MAXDWORD, MAXDWORD, &overlapped)) {
+    if (!LockFileEx((HANDLE)fd, 0, 0, MAXDWORD, MAXDWORD, &overlapped)) {
         perror("can't lock history file for reading");
         fs_fclose(fd);
         return NULL;
@@ -217,7 +219,7 @@ hist_p hist_create() {
             perror("can't truncate history file");
 #if defined(OS_WINDOWS)
             OVERLAPPED overlapped_err = {0};
-            UnlockFileEx((HANDLE)_get_osfhandle(fd), 0, MAXDWORD, MAXDWORD, &overlapped_err);
+            UnlockFileEx((HANDLE)fd, 0, MAXDWORD, MAXDWORD, &overlapped_err);
 #else
             flock(fd, LOCK_UN);
 #endif
@@ -273,7 +275,7 @@ hist_p hist_create() {
     // Unlock file after reading
 #if defined(OS_WINDOWS)
     OVERLAPPED overlapped_unlock = {0};
-    UnlockFileEx((HANDLE)_get_osfhandle(fd), 0, MAXDWORD, MAXDWORD, &overlapped_unlock);
+    UnlockFileEx((HANDLE)fd, 0, MAXDWORD, MAXDWORD, &overlapped_unlock);
 #else
     flock(fd, LOCK_UN);
 #endif
@@ -285,7 +287,7 @@ nil_t hist_destroy(hist_p hist) {
     // Lock file exclusively for writing
 #if defined(OS_WINDOWS)
     OVERLAPPED overlapped = {0};
-    if (!LockFileEx((HANDLE)_get_osfhandle(hist->fd), LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped)) {
+    if (!LockFileEx((HANDLE)hist->fd, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped)) {
         perror("can't lock history file for writing");
     }
 #else
@@ -301,7 +303,7 @@ nil_t hist_destroy(hist_p hist) {
     // Unlock file
 #if defined(OS_WINDOWS)
     OVERLAPPED overlapped_unlock = {0};
-    UnlockFileEx((HANDLE)_get_osfhandle(hist->fd), 0, MAXDWORD, MAXDWORD, &overlapped_unlock);
+    UnlockFileEx((HANDLE)hist->fd, 0, MAXDWORD, MAXDWORD, &overlapped_unlock);
 #else
     flock(hist->fd, LOCK_UN);
 #endif
@@ -473,9 +475,18 @@ term_p term_create() {
     // For windows 10, set the output encoding to UTF-8
     // [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-    // Set the console output code page to UTF-8
-    if (!SetConsoleOutputCP(CP_UTF8))
-        format_set_use_unicode(B8_FALSE);  // Disable unicode support
+    // Save the original code page before changing it
+    term->old_codepage = GetConsoleOutputCP();
+
+    // Only use UTF-8 if console already supports it
+    // Don't force code page change to avoid breaking Far Manager and other tools
+    if (term->old_codepage != CP_UTF8) {
+        format_set_use_unicode(B8_FALSE);  // Disable unicode if not UTF-8
+    } else {
+        // Console is already UTF-8, try to set it explicitly
+        if (!SetConsoleOutputCP(CP_UTF8))
+            format_set_use_unicode(B8_FALSE);
+    }
 
     // Save the current input mode
     GetConsoleMode(h_stdin, &term->old_stdin_mode);
@@ -515,6 +526,9 @@ nil_t term_destroy(term_p term) {
     // Restore the terminal attributes
     SetConsoleMode(term->h_stdin, term->old_stdin_mode);
     SetConsoleMode(term->h_stdout, term->old_stdout_mode);
+
+    // Restore the original code page
+    SetConsoleOutputCP(term->old_codepage);
 
     mutex_destroy(&term->lock);
     hist_destroy(term->hist);

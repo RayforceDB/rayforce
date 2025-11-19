@@ -30,7 +30,7 @@ raw_p mmap_stack(i64_t size) { return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_
 raw_p mmap_alloc(i64_t size) { return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); }
 
 raw_p mmap_file(i64_t fd, raw_p addr, i64_t size, i64_t offset) {
-    UNUSED(addr);  // Mark addr as intentionally unused on Windows
+    (void)addr;  // Mark addr as intentionally unused on Windows
     HANDLE hMapping;
     raw_p ptr;
 
@@ -47,13 +47,18 @@ raw_p mmap_file(i64_t fd, raw_p addr, i64_t size, i64_t offset) {
 }
 
 i64_t mmap_free(raw_p addr, i64_t size) {
-    UNUSED(size);
+    (void)size;
     return VirtualFree(addr, 0, MEM_RELEASE);
 }
 
 i64_t mmap_sync(raw_p addr, i64_t size) { return FlushViewOfFile(addr, size); }
 
 raw_p mmap_reserve(raw_p addr, i64_t size) {
+    // On Windows, low addresses are reserved by the OS and cannot be allocated
+    // If addr is below 64KB, pass NULL to let VirtualAlloc choose the address
+    if (addr != NULL && (i64_t)addr < 65536)
+        addr = NULL;
+
     raw_p ptr = VirtualAlloc(addr, size, MEM_RESERVE, PAGE_NOACCESS);
 
     if (ptr == NULL)
