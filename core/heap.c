@@ -40,6 +40,7 @@ RAYASSERT(sizeof(struct block_t) == (2 * sizeof(struct obj_t)), heap_h);
 
 __thread heap_p __HEAP = NULL;
 __thread c8_t HEAP_SWAP[64] = {0};
+heap_p __HEAP_REGISTRY[MAX_HEAPS] = {0};
 
 #define BLOCKSIZE(s) (sizeof(struct obj_t) + (s))
 #define BSIZEOF(o) (1ll << (i64_t)(o))
@@ -61,8 +62,13 @@ heap_p heap_create(i64_t id) {
     __HEAP->id = id;
     __HEAP->avail = 0;
     __HEAP->foreign_blocks = NULL;
+    __HEAP->deferred_free = NULL;
 
     memset(__HEAP->freelist, 0, sizeof(__HEAP->freelist));
+
+    // Register heap for cross-executor deferred free
+    if (id >= 0 && id < MAX_HEAPS)
+        __atomic_store_n(&__HEAP_REGISTRY[id], __HEAP, __ATOMIC_RELEASE);
 
     if (os_get_var("HEAP_SWAP", HEAP_SWAP, sizeof(HEAP_SWAP)) == -1)
         snprintf(HEAP_SWAP, sizeof(HEAP_SWAP), "%s", DEFAULT_HEAP_SWAP);
@@ -79,6 +85,13 @@ nil_t heap_destroy(nil_t) {
     block_p block, next;
 
     LOG_INFO("Destroying heap");
+
+    // Unregister heap
+    if (__HEAP->id >= 0 && __HEAP->id < MAX_HEAPS)
+        __atomic_store_n(&__HEAP_REGISTRY[__HEAP->id], NULL, __ATOMIC_RELEASE);
+
+    // Drain any remaining deferred blocks
+    heap_drain_deferred();
 
     // Ensure foreign blocks are freed
     if (__HEAP->foreign_blocks != NULL)
@@ -126,6 +139,7 @@ nil_t heap_unmap(raw_p ptr, i64_t size) { mmap_free(ptr, size); }
 i64_t heap_gc(nil_t) { return 0; }
 nil_t heap_borrow(heap_p heap) { UNUSED(heap); }
 nil_t heap_merge(heap_p heap) { UNUSED(heap); }
+nil_t heap_drain_deferred(nil_t) {}
 memstat_t heap_memstat(nil_t) { return (memstat_t){0}; }
 
 #else
@@ -268,6 +282,15 @@ raw_p __attribute__((hot)) heap_alloc(i64_t size) {
     // no free block found for this size, so mmap it directly if it is bigger than pool size or
     // add a new pool and split as well
     if (i == 0) {
+        // Check deferred queue for larger allocations when executors are running
+        if (order >= DEFERRED_FREE_ORDER && rc_sync_get() && __HEAP->deferred_free != NULL) {
+            heap_drain_deferred();
+            // Retry freelist lookup
+            i = (AVAIL_MASK << order) & __HEAP->avail;
+            if (i != 0)
+                goto found_block;
+        }
+
         if (order >= MAX_BLOCK_ORDER) {
             LOG_TRACE("Adding pool of size %lld requested size %lld", BSIZEOF(order), size);
             size = BSIZEOF(order);
@@ -295,6 +318,7 @@ raw_p __attribute__((hot)) heap_alloc(i64_t size) {
     } else
         i = __builtin_ctzll(i);
 
+found_block:
     // remove the block out of list
     block = __HEAP->freelist[i];
 
@@ -341,8 +365,20 @@ __attribute__((hot)) nil_t heap_free(raw_p ptr) {
     }
 
     if (__HEAP->id != 0 && block->heap_id != __HEAP->id) {
-        block->next = __HEAP->foreign_blocks;
-        __HEAP->foreign_blocks = block;
+        // Push to owner's deferred_free queue using lock-free CAS
+        heap_p owner = __atomic_load_n(&__HEAP_REGISTRY[block->heap_id], __ATOMIC_ACQUIRE);
+        if (owner != NULL) {
+            block_p expected;
+            do {
+                expected = __atomic_load_n(&owner->deferred_free, __ATOMIC_RELAXED);
+                block->next = expected;
+            } while (!__atomic_compare_exchange_n(&owner->deferred_free, &expected, block,
+                                                   0, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+        } else {
+            // Fallback to foreign_blocks if owner heap is gone
+            block->next = __HEAP->foreign_blocks;
+            __HEAP->foreign_blocks = block;
+        }
         return;
     }
 
@@ -491,6 +527,21 @@ nil_t heap_merge(heap_p heap) {
 
     __HEAP->avail |= heap->avail;
     heap->avail = 0;
+}
+
+nil_t heap_drain_deferred(nil_t) {
+    block_p block, next;
+
+    // Atomically swap deferred_free list with NULL
+    block = __atomic_exchange_n(&__HEAP->deferred_free, NULL, __ATOMIC_ACQ_REL);
+
+    // Free all blocks in the list
+    while (block != NULL) {
+        next = block->next;
+        block->heap_id = __HEAP->id;  // Reassign ownership for proper buddy merging
+        heap_free(BLOCK2RAW(block));
+        block = next;
+    }
 }
 
 memstat_t heap_memstat(nil_t) {

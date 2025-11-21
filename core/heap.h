@@ -30,6 +30,7 @@
 #define MIN_BLOCK_ORDER 5   // 2^5 = 32B
 #define MAX_BLOCK_ORDER 25  // 2^25 = 32MB
 #define MAX_POOL_ORDER 38   // 2^38 = 256GB
+#define DEFERRED_FREE_ORDER 9  // 2^9 = 512B - threshold for checking deferred queue
 
 // Memory modes
 #define MMOD_INTERNAL 0xff
@@ -62,8 +63,12 @@ typedef struct heap_t {
     i64_t avail;                           // mask of available blocks by order
     block_p foreign_blocks;                // foreign blocks (to be freed by the owner)
     block_p backed_blocks;                 // backed blocks (to be unmapped)
+    block_p deferred_free;                 // lock-free queue of blocks to free (pushed by other executors)
     memstat_t memstat;
 } *heap_p;
+
+#define MAX_HEAPS 64
+extern heap_p __HEAP_REGISTRY[MAX_HEAPS];
 
 heap_p heap_create(i64_t id);
 nil_t heap_destroy(nil_t);
@@ -77,6 +82,7 @@ nil_t heap_unmap(raw_p ptr, i64_t size);
 i64_t heap_gc(nil_t);
 nil_t heap_borrow(heap_p heap);
 nil_t heap_merge(heap_p heap);
+nil_t heap_drain_deferred(nil_t);
 memstat_t heap_memstat(nil_t);
 nil_t heap_print_blocks(heap_p heap);
 
