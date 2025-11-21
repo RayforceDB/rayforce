@@ -3,8 +3,8 @@
 Adds new rows to a table.
 
 ```clj
-↪ (set t (table [name age] [["Alice" "Bob"] [25 30]]))
-↪ (insert t {name: "Charlie" age: 35})
+↪ (set t (table [name age] (list (list "Alice" "Bob") [25 30])))
+↪ (set t (insert t {name: 'Charlie age: 35}))
 ┌─────────┬─────┐
 │ name    │ age │
 ├─────────┼─────┤
@@ -13,7 +13,7 @@ Adds new rows to a table.
 │ Charlie │ 35  │
 └─────────┴─────┘
 
-↪ (insert t [{name: "David" age: 40} {name: "Eve" age: 45}])
+↪ (set t (insert t {name: ['David 'Eve] age:[40 25]}))
 ┌─────────┬─────┐
 │ name    │ age │
 ├─────────┼─────┤
@@ -28,10 +28,10 @@ Adds new rows to a table.
 !!! info
     - Can insert a single row or multiple rows
     - Rows are added at the end of the table
-    - Modifies the table in place
+    - Returns a new table (use `set` to reassign)
 
 !!! warning
     New rows must have all required columns with correct types
 
 !!! tip
-    Use insert when adding new data to existing tables
+    Insert multiple rows by providing lists as column values
