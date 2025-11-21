@@ -58,6 +58,11 @@
 // Link with Mswsock.lib
 #pragma comment(lib, "Mswsock.lib")
 
+// Define Windows 8+ constants if not available in older MinGW
+#ifndef FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
+#define FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 0x1
+#endif
+
 // Global IOCP handle
 HANDLE g_iocp = INVALID_HANDLE_VALUE;
 
@@ -400,7 +405,16 @@ i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
     CreateIoCompletionPort((HANDLE)fd, (HANDLE)poll->poll_fd, (ULONG_PTR)selector, 0);
 
     // prevent the IOCP mechanism from getting signaled on synchronous completions
-    SetFileCompletionNotificationModes((HANDLE)fd, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS);
+    // This is an optimization available on Windows 8+
+    typedef BOOL (WINAPI *PSetFileCompletionNotificationModes)(HANDLE, UCHAR);
+    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    if (hKernel32) {
+        PSetFileCompletionNotificationModes pFunc =
+            (PSetFileCompletionNotificationModes)GetProcAddress(hKernel32, "SetFileCompletionNotificationModes");
+        if (pFunc) {
+            pFunc((HANDLE)fd, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS);
+        }
+    }
 
     return id;
 }

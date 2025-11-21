@@ -1,4 +1,4 @@
-CC = clang
+CC = gcc
 STD = c17
 AR = ar
 PROFILER = gprof

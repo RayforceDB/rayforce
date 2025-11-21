@@ -78,6 +78,11 @@ typedef struct poll_buffer_t {
 #define MSG_TYPE_SYNC 1
 #define MSG_TYPE_RESP 2
 
+// Windows doesn't have poll.h, so define these constants for compatibility
+#define POLLIN  0x001
+#define POLLOUT 0x004
+#define POLLERR 0x008
+
 typedef enum poll_result_t {
     POLL_DONE = 0,
     POLL_PENDING = 1,
