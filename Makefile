@@ -13,7 +13,7 @@ $(info OS="$(OS)")
 
 ifeq ($(OS),Windows_NT)
 # Detect if we're using clang with MSVC target or GCC
-COMPILER_VERSION := $(shell $(CC) --version 2>&1)
+COMPILER_VERSION := $(shell $(CC) --version)
 IS_CLANG_MSVC := $(if $(findstring windows-msvc,$(COMPILER_VERSION)),1,0)
 
 DEBUG_CFLAGS = -Wall -Wextra -std=$(STD) -g -O0 -DDEBUG

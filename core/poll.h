@@ -79,9 +79,16 @@ typedef struct poll_buffer_t {
 #define MSG_TYPE_RESP 2
 
 // Windows doesn't have poll.h, so define these constants for compatibility
+// Only define if not already defined (newer MinGW has them in winsock2.h)
+#ifndef POLLIN
 #define POLLIN  0x001
+#endif
+#ifndef POLLOUT
 #define POLLOUT 0x004
+#endif
+#ifndef POLLERR
 #define POLLERR 0x008
+#endif
 
 typedef enum poll_result_t {
     POLL_DONE = 0,
