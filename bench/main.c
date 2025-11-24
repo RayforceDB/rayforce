@@ -21,18 +21,21 @@
  *   SOFTWARE.
  */
 
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
+#include <unistd.h>
+#include <dirent.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 #include <errno.h>
-#include <dirent.h>
 #include <math.h>
 #include <stdbool.h>
 #include "../core/rayforce.h"

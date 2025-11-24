@@ -11,6 +11,22 @@ endif
 
 $(info OS="$(OS)")
 
+# Detect shell environment on Windows
+ifeq ($(OS),Windows_NT)
+# Try to detect if bash is available
+BASH_EXISTS := $(shell bash --version >nul 2>&1 && echo yes || echo no)
+ifeq ($(BASH_EXISTS),yes)
+SHELL := bash
+USE_WINDOWS_COMMANDS := 0
+else
+# Use cmd.exe with Windows-native commands
+SHELL := cmd
+USE_WINDOWS_COMMANDS := 1
+endif
+else
+USE_WINDOWS_COMMANDS := 0
+endif
+
 ifeq ($(OS),Windows_NT)
 # Detect if we're using clang with MSVC target or GCC
 COMPILER_VERSION := $(shell $(CC) --version)
@@ -22,6 +38,7 @@ RELEASE_CFLAGS = -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
  -flax-vector-conversions -fno-math-errno
 
 ifeq ($(IS_CLANG_MSVC),1)
+$(info Detected clang with MSVC target)
 # Clang with MSVC backend - use MSVC-style linker flags
 LIBS = -lws2_32 -lkernel32
 LIBNAME = rayforce.dll
@@ -95,8 +112,13 @@ tests: $(TESTS_OBJECTS) obj
 bench: CC = gcc
 bench: CFLAGS = $(RELEASE_CFLAGS)
 bench: $(BENCH_OBJECTS) lib
+ifeq ($(OS),Windows_NT)
+	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).bench.exe $(BENCH_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LDFLAGS)
+	./$(TARGET).bench.exe
+else
 	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).bench $(BENCH_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LDFLAGS)
 	BENCH=$(BENCH) ./$(TARGET).bench
+endif
 
 %.o: %.c
 	$(CC) -include core/def.h -c $^ $(CFLAGS) -o $@
@@ -170,6 +192,40 @@ shared: $(CORE_OBJECTS)
 	$(CC) -shared -o $(LIBNAME) $(CFLAGS) $(CORE_OBJECTS) $(LIBS) $(LDFLAGS)
 
 clean:
+ifeq ($(USE_WINDOWS_COMMANDS),1)
+	-if exist *.o del /F /Q *.o
+	-if exist core\*.o del /F /Q core\*.o
+	-if exist app\*.o del /F /Q app\*.o
+	-if exist tests\*.o del /F /Q tests\*.o
+	-if exist bench\*.o del /F /Q bench\*.o
+	-if exist lib$(TARGET).a del /F /Q lib$(TARGET).a
+	-if exist core\*.gch del /F /Q core\*.gch
+	-if exist app\*.gch del /F /Q app\*.gch
+	-if exist $(TARGET).S del /F /Q $(TARGET).S
+	-if exist $(TARGET).test del /F /Q $(TARGET).test
+	-if exist $(TARGET).bench del /F /Q $(TARGET).bench
+	-if exist *.out del /F /Q *.out
+	-if exist *.so del /F /Q *.so
+	-if exist *.dylib del /F /Q *.dylib
+	-if exist *.dll del /F /Q *.dll
+	-if exist $(TARGET).js del /F /Q $(TARGET).js
+	-if exist $(TARGET).wasm del /F /Q $(TARGET).wasm
+	-if exist $(TARGET) del /F /Q $(TARGET)
+	-if exist $(TARGET).exe del /F /Q $(TARGET).exe
+	-if exist tests\*.gcno del /F /Q tests\*.gcno
+	-if exist tests\*.gcda del /F /Q tests\*.gcda
+	-if exist tests\*.gcov del /F /Q tests\*.gcov
+	-if exist core\*.gcno del /F /Q core\*.gcno
+	-if exist core\*.gcda del /F /Q core\*.gcda
+	-if exist core\*.gcov del /F /Q core\*.gcov
+	-if exist coverage.info del /F /Q coverage.info
+	-if exist coverage_report rmdir /S /Q coverage_report
+	-if exist .DS_Store del /F /Q .DS_Store
+	-if exist core\*.opt.yaml del /F /Q core\*.opt.yaml
+	-if exist app\*.opt.yaml del /F /Q app\*.opt.yaml
+	-if exist tests\*.opt.yaml del /F /Q tests\*.opt.yaml
+	-if exist bench\*.opt.yaml del /F /Q bench\*.opt.yaml
+else
 	-rm -f *.o
 	-rm -f core/*.o
 	-rm -f app/*.o
@@ -198,6 +254,7 @@ clean:
 	-rm -f app/*.opt.yaml
 	-rm -f tests/*.opt.yaml
 	-rm -f bench/*.opt.yaml
+endif
 
 # trigger github to make a nightly build
 nightly:
