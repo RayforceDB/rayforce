@@ -120,6 +120,7 @@ debug: app
 release: CFLAGS = $(RELEASE_CFLAGS)
 release: LDFLAGS = $(RELEASE_LDFLAGS)
 release: app
+	strip $(TARGET_EXE)
 
 chkleak: CC = gcc
 chkleak: DEBUG_CFLAGS += -DDEBUG -DSYS_MALLOC
