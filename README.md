@@ -47,6 +47,10 @@ make bench      # Run benchmark suite
 - [Test Reports](https://singaraiona.github.io/rayforce/tests_report/)
 - [Coverage Reports](https://singaraiona.github.io/rayforce/coverage_report/)
 
+## Python bindings
+
+Rayforce has powerful [Python bindings](https://github.com/singaraiona/raypy) (beta stage, but contributions are welcome)
+
 ## Contributing
 
 Contributions are welcome! You can help by:
