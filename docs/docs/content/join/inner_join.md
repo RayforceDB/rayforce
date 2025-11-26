@@ -4,13 +4,13 @@ Performs an inner join between two tables based on matching key columns.
 
 ```clj
 ;; Create sample tables
-↪ (set x (table [a b c d] 
+ (set x (table [a b c d] 
     (list (list "aaaaaa" "bbbbbbbbbb" "cc" "dd")
           ['I 'J 'K 'I] 
           [0 1 2 3]
           [0 1 2 3])))
 
-↪ (set y (table [a b c d e] 
+ (set y (table [a b c d e] 
     (list (list "aa" "bb" "cc" "dd" "ee")
           ['I 'J 'K 'I 'J]
           [0 1 2 3 4]
@@ -18,7 +18,7 @@ Performs an inner join between two tables based on matching key columns.
           [0 1 2 3 4])))
 
 ;; Inner join on single column
-↪ (inner-join [a] x y)
+ (inner-join [a] x y)
 ┌──────┬───┬───┬───┬───┐
 │ a    │ b │ c │ d │ e │
 ├──────┼───┼───┼───┼───┤
@@ -27,7 +27,7 @@ Performs an inner join between two tables based on matching key columns.
 └──────┴───┴───┴───┴───┘
 
 ;; Inner join on multiple columns
-↪ (inner-join [a b] x y)
+ (inner-join [a b] x y)
 ┌──────┬───┬───┬───┬───┐
 │ a    │ b │ c │ d │ e │
 ├──────┼───┼───┼───┼───┤

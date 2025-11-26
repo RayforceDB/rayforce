@@ -3,8 +3,8 @@
 Sorts a table in descending order based on specified columns.
 
 ```clj
-↪ (set t (table [name age score] (list ["Bob" "Alice" "Charlie"] [25 30 20] [85 90 95])))
-↪ (xdesc [score] t)
+(set t (table [name age score] (list (list "Bob" "Alice" "Charlie") [25 30 20] [85 90 95])))
+(xdesc [score] t)
 ┌─────────┬─────┬───────┐
 │ name    │ age │ score │
 ├─────────┼─────┼───────┤

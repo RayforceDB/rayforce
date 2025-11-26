@@ -9,7 +9,7 @@ Casts a value to a specified type.
 1.0
 ↪ (as 'I64 [1.2 3 4])
 [1 3 4]
-↪ (as 'f64 [1 2 3])
+↪ (as 'F64 [1 2 3])
 [1.0 2.0 3.0]
 ↪ (as 'String 1)
 "1"

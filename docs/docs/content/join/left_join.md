@@ -4,13 +4,13 @@ Performs a left join between two tables, keeping all rows from the left table an
 
 ```clj
 ;; Create sample tables
-↪ (set x (table [a b c d] 
+ (set x (table [a b c d] 
     (list (list "aaaaaa" "bbbbbbbbbb" "cc" "dd")
           ['I 'J 'K 'I] 
           [0 1 2 3]
           [0 1 2 3])))
 
-↪ (set y (table [a b c d e] 
+ (set y (table [a b c d e] 
     (list (list "aa" "bb" "cc" "dd" "ee")
           ['I 'J 'K 'I 'J]
           [0 1 2 3 4]
@@ -18,7 +18,7 @@ Performs a left join between two tables, keeping all rows from the left table an
           [0 1 2 3 4])))
 
 ;; Left join on single column
-↪ (left-join [a] x y)
+ (left-join [a] x y)
 ┌────────────┬───┬───┬───┬─────┐
 │ a          │ b │ c │ d │ e   │
 ├────────────┼───┼───┼───┼─────┤
@@ -29,7 +29,7 @@ Performs a left join between two tables, keeping all rows from the left table an
 └────────────┴───┴───┴───┴─────┘
 
 ;; Left join on multiple columns
-↪ (left-join [a b] x y)
+ (left-join [a b] x y)
 ┌────────────┬───┬───┬───┬─────┐
 │ a          │ b │ c │ d │ e   │
 ├────────────┼───┼───┼───┼─────┤

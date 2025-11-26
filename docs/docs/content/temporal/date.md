@@ -3,29 +3,33 @@
 Represents a calendar date.
 
 ```clj
-;; Get current date in local timezone
-↪ (date 'local)
-2024.03.15
-
-;; Get current date in UTC
-↪ (date 'utc) 
-2024.03.15
-
-;; Create dates from numbers
+;; Create dates from literals
 ↪ (as 'date 2024.03.15)
 2024.03.15
 
-;; Date arithmetic
-↪ (+ 2024.03.15 1)  ;; Add one day
+;; Date arithmetic - add days
+↪ (+ 2024.03.15 1)
 2024.03.16
+
+;; Date arithmetic - subtract dates (returns days)
+↪ (- 2024.03.20 2024.03.15)
+5
 
 ;; Compare dates
 ↪ (< 2024.03.15 2024.03.16)
 true
 
-;; Extract from timestamp
-↪ (as 'date 2024.03.15T10:30:00)
-2024.03.15
+↪ (<= 2024.03.15 2024.03.16)
+true
+
+↪ (== 2024.03.15 2024.03.15)
+true
+```
+
+```clj
+;; Get current date (returns current date - non-deterministic)
+(date 'local)
+(date 'utc)
 ```
 
 !!! info "Format"

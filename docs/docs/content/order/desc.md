@@ -5,8 +5,9 @@ Sorts elements in descending order.
 ```clj
 ↪ (desc [3 1 4 1 5 9 2 6])
 [9 6 5 4 3 2 1 1]
-↪ (desc ["banana" "apple" "cherry"])
-[cherry banana apple]
+
+↪ (desc (list "banana" "apple" "cherry"))
+(cherry banana apple)
 ```
 
 !!! info

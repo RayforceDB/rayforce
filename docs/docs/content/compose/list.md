@@ -4,17 +4,10 @@ Creates a heterogeneous list from the provided arguments.
 
 ```clj
 ↪ (list 1 2 3)
-(
-  1
-  2
-  3
-)
+(1 2 3)
+
 ↪ (list 1 2 [3 4])
-(
-  1
-  2
-  [3 4]
-)
+(1 2 [3 4])
 ```
 
 !!! info

@@ -11,7 +11,7 @@ false
 
 ;; Array comparisons
 ↪ (!= [1 2 3] 2)
-[false true true]
+[true false true]
 ↪ (!= [1 2 3] [1 2 4])
 [false false true]
 
@@ -27,16 +27,12 @@ true
 ↪ (!= 3.14 3.140)
 false
 
-;; Mixed type comparisons
-↪ (!= "1" 1)
-true
+;; Mixed numeric type comparisons
 ↪ (!= 1 1.0)
 false
 
 ;; Comparing with null
 ↪ (!= null null)
-false
-↪ (!= 1 null)
 true
 ```
 

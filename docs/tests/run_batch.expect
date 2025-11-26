@@ -1,0 +1,99 @@
+#!/usr/bin/expect -f
+# Runs multiple RayForce expressions and outputs results
+# Usage: echo -e "expr1\nexpr2\n..." | ./run_batch.expect
+
+log_user 0
+set timeout 10
+
+# Start rayforce
+spawn ./rayforce
+expect "↪"
+
+# Read expressions from stdin
+set input [read stdin]
+set expressions [split $input "\n"]
+
+puts "\["
+
+set first 1
+foreach expr $expressions {
+    # Skip empty lines
+    if {[string trim $expr] eq ""} continue
+
+    if {!$first} {
+        puts ","
+    }
+    set first 0
+
+    # Escape the expression for JSON
+    set json_expr [string map {"\\" "\\\\" "\"" "\\\"" "\n" "\\n" "\r" ""} $expr]
+
+    send "$expr\r"
+
+    # Wait for the result - look for newline followed by prompt
+    # The output pattern is: [echo of input]\n[result lines]\n↪
+    set result ""
+    expect {
+        -re "\r\n(.+)\r\n\[^\r\n\]*↪ " {
+            set raw $expect_out(1,string)
+
+            # Clean ANSI codes
+            regsub -all {\x1b\[[0-9;]*[a-zA-Z]} $raw "" cleaned
+            regsub -all {\x1b\[\?[0-9]*[a-zA-Z]} $cleaned "" cleaned
+            regsub -all {\r} $cleaned "" cleaned
+
+            # Split into lines
+            set lines [split $cleaned "\n"]
+            set output_lines {}
+
+            foreach line $lines {
+                set trimmed [string trim $line]
+                if {$trimmed eq ""} continue
+                # Skip lines containing the prompt character sequence
+                if {[string match "*↪*" $trimmed]} continue
+                lappend output_lines $trimmed
+            }
+
+            # Process the output lines
+            if {[llength $output_lines] > 0} {
+                set first_line [lindex $output_lines 0]
+
+                # Check if multi-line structure
+                if {$first_line eq "(" || $first_line eq "\{" || $first_line eq "\["} {
+                    # Join all lines
+                    set joined [join $output_lines " "]
+                    # Normalize spacing around brackets
+                    regsub -all {\(\s+} $joined "(" joined
+                    regsub -all {\s+\)} $joined ")" joined
+                    regsub -all {\{\s+} $joined "\{" joined
+                    regsub -all {\s+\}} $joined "\}" joined
+                    regsub -all {\[\s+} $joined "\[" joined
+                    regsub -all {\s+\]} $joined "\]" joined
+                    regsub -all {\s+} $joined " " joined
+                    set result $joined
+                } elseif {[llength $output_lines] == 1} {
+                    set result $first_line
+                } else {
+                    # Multiple lines but not starting with bracket - join with space
+                    set result [join $output_lines " "]
+                }
+            }
+        }
+        timeout {
+            set result "TIMEOUT"
+        }
+    }
+
+    if {$result eq "" || $result eq "TIMEOUT"} {
+        puts -nonewline "  \{\"expr\": \"$json_expr\", \"result\": null\}"
+    } else {
+        # Escape for JSON
+        set json_result [string map {"\\" "\\\\" "\"" "\\\"" "\n" "\\n" "\t" "\\t"} $result]
+        puts -nonewline "  \{\"expr\": \"$json_expr\", \"result\": \"$json_result\"\}"
+    }
+}
+
+puts "\n\]"
+
+send ":q\r"
+expect eof

@@ -4,7 +4,7 @@ The `dev` function returns the standard deviation of a given list of numbers. Al
 
 ```clj
 ↪ (dev [1 2 3 4 50])
-19.0263
+19.03
 
 ↪ (dev [1i 2i])
 0.5
@@ -16,10 +16,10 @@ The `dev` function returns the standard deviation of a given list of numbers. Al
 0.5
 
 ↪ (dev [0Nf -2.0 10.0 11.0 5.0 0Nf])
-5.147815
+5.15
 
 ↪ (dev [0Nl 1 2 3 4 50 0Nl])
-19.0263
+19.03
 ```
 
 ## Notes

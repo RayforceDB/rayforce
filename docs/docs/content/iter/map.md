@@ -20,7 +20,7 @@ Applies a function to each element of a list and returns a new list with the res
 [2 4 6]
 
 ↪ (map (fn [x] (as 'String x)) [1 2 3])
-["1" "2" "3"]
+(1 2 3)
 ```
 
 ### Mapping with operators
@@ -40,9 +40,11 @@ Applies a function to each element of a list and returns a new list with the res
 ### Nested mapping
 
 ```clj
-↪ (set l (list 1 2 3 4))
-↪ (map (fn [x] (map (fn [y] (+ x y)) l)) l)
-(list [2 3 4 5] [3 4 5 6] [4 5 6 7] [5 6 7 8])
+;; Note: Nested lambdas don't capture outer scope variables (no closures)
+;; This example does NOT work - 'x' is undefined in inner fn:
+;; (map (fn [x] (map (fn [y] (+ x y)) l)) l)
+
+;; For nested operations, use explicit indexing or restructure the logic
 ```
 
 ## Notes

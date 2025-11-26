@@ -5,7 +5,7 @@ Returns indices that would sort the input in descending order.
 ```clj
 ↪ (idesc [3 1 4 1 5])
 [4 2 0 1 3]
-↪ (idesc ["banana" "apple" "cherry"])
+↪ (idesc (list "banana" "apple" "cherry"))
 [2 0 1]
 ```
 

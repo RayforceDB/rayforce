@@ -3,8 +3,17 @@
 Adds new rows to a table.
 
 ```clj
-↪ (set t (table [name age] (list (list "Alice" "Bob") [25 30])))
-↪ (set t (insert t {name: 'Charlie age: 35}))
+(set t (table [name age] (list (list "Alice" "Bob") [25 30])))
+┌───────┬──────────────────────────────┐
+│ name  │ age                          │
+├───────┼──────────────────────────────┤
+│ Alice │ 25                           │
+│ Bob   │ 30                           │
+├───────┴──────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown) │
+└──────────────────────────────────────┘
+
+(set t (insert t {name: 'Charlie age: 35}))
 ┌─────────┬─────┐
 │ name    │ age │
 ├─────────┼─────┤
@@ -13,7 +22,7 @@ Adds new rows to a table.
 │ Charlie │ 35  │
 └─────────┴─────┘
 
-↪ (set t (insert t {name: ['David 'Eve] age:[40 25]}))
+(set t (insert t {name: ['David 'Eve] age:[40 25]}))
 ┌─────────┬─────┐
 │ name    │ age │
 ├─────────┼─────┤

@@ -29,11 +29,9 @@ true
 ↪ (== 3.14 3.140)
 true
 
-;; Mixed type comparisons
+;; Mixed numeric type comparisons
 ↪ (== 1 1.0)
 true
-↪ (== "1" 1)
-false
 
 ;; Array comparisons
 ↪ (== [1 2 3] [1.0 2.0 3.0])
@@ -42,11 +40,20 @@ false
 ;; Comparing with null
 ↪ (== null null)
 true
-↪ (== 1 null)
-false
 ```
 
-!!! warning
+!!! warning "Use `==` Not `=`"
+    RayFall uses `==` for equality comparison, NOT `=`. The `=` operator does not exist for equality checks.
+
+    ```clj
+    ;; CORRECT
+    (== x 5)
+
+    ;; WRONG - will cause an error
+    ;; (= x 5)
+    ```
+
+!!! warning "Type Compatibility"
     Comparing values of different types may lead to unexpected results. Always ensure you're comparing compatible types.
 
 !!! info

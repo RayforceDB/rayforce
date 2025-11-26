@@ -9,7 +9,7 @@ Makes a division of it's arguments, takes a remainder. Supports such types and t
 ↪ (% 1.2 2.2)
 1.20
 ↪ (% 2 3.4)
-2
+2.00
 ↪ (% [-1 -2 -3] 3)
 [2 1 0]
 ↪ (% [10 -10 3] 2.1)

@@ -1,31 +1,45 @@
 # Alter `alter`
 
-Modifies elements in a collection based on a condition.
+Modifies an element at a specific index using a function.
 
 ```clj
-↪ (set arr [1 2 3 4 5])
-↪ (alter arr (> arr 3) (* arr 2))
-[1 2 3 8 10]
+;; Basic syntax: (alter obj func index value)
+;; Applies (func element value) at the specified index
 
-↪ (set t (table [name age] [["Alice" "Bob" "Charlie"] [25 30 35]]))
-↪ (alter t (> age 28) {age: (+ age 1)})
-┌─────────┬─────┐
-│ name    │ age │
-├─────────┼─────┤
-│ Alice   │ 25  │
-│ Bob     │ 31  │
-│ Charlie │ 36  │
-└─────────┴─────┘
+;; Set element at index
+↪ (set arr [10 20 30])
+↪ (alter arr set 0 99)
+[99 20 30]
+
+;; Add to element at index
+↪ (set arr [10 20 30])
+↪ (alter arr + 1 100)
+[10 120 30]
+
+;; Multiply element at index
+↪ (set arr [10 20 30])
+↪ (alter arr * 2 5)
+[10 20 150]
 ```
 
-!!! info
-    - First argument: collection to modify
-    - Second argument: condition for selecting elements
-    - Third argument: transformation to apply
-    - Modifies the collection in place
+!!! warning "Returns New Value"
+    `alter` returns a modified copy - it does NOT modify the original.
+    To persist changes, reassign:
+    ```clj
+    (set arr (alter arr set 0 99))
+    ```
 
-!!! warning
-    The condition and transformation must be compatible with the collection's type
+!!! info "Syntax"
+    ```clj
+    (alter object function index value)
+    ```
+    - `object`: Array, list, or table to modify
+    - `function`: Binary function (`+`, `*`, `set`, etc.)
+    - `index`: Index of element to modify
+    - `value`: Value to apply with function
 
-!!! tip
-    Use alter for conditional updates on arrays or tables
+!!! tip "Common Functions"
+    - `set` - Replace element: `(alter arr set 0 99)`
+    - `+` - Add to element: `(alter arr + 0 10)`
+    - `*` - Multiply element: `(alter arr * 0 2)`
+    - `concat` - Append to element (for lists)

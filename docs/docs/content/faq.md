@@ -118,6 +118,26 @@ Using the `load` function:
 - UTC timezone available for all temporal functions
 - Timezone conversion respects daylight savings
 
+## Common Gotchas
+
+### Reserved word columns need `at`
+If a column name matches a built-in function (like `timestamp`, `type`, `count`), use `(at table 'column)`:
+```clj
+;; WRONG - timestamp is a built-in function
+;; (select {ts: timestamp from: trades})
+
+;; CORRECT
+(select {ts: (at trades 'timestamp) from: trades})
+```
+
+Reserved words include: `timestamp`, `type`, `count`, `date`, `time`, `first`, `last`, `sum`, `avg`, `min`, `max`, `key`, `value`, `where`, `group`, `distinct`, `reverse`, `not`.
+
+### Large datasets may timeout
+Use `(take N table)` to work with subsets:
+```clj
+(set sample (take 5000 large_table))
+```
+
 ## Memory Management
 
 ### Is there garbage collection?

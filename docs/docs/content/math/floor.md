@@ -16,7 +16,7 @@ The `floor` function returns the largest integer less than or equal to a given n
 [1.0 2.0 -2.0]
 
 ↪ (floor -5i)
--5i
+-5
 
 ↪ (floor 0Nf)
 0Nf

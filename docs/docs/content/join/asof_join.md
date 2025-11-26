@@ -5,7 +5,7 @@ Returns a table with records from the left-join of t1 and t2. Join columns (but 
 ```clj
 (set n 10000000)
 10000000
-↪ (set trades (table [Sym Ts Qty Price] (list (take n (as 'Symbol (map-right as 'String (til 8000)))) (as 'Time (+ 2 (* 1000 (til n)))) (til n) (as 'F64 (til n)))))
+ (set trades (table [Sym Ts Qty Price] (list (take n (as 'Symbol (map-right as 'String (til 8000)))) (as 'Time (+ 2 (* 1000 (til n)))) (til n) (as 'F64 (til n)))))
 ┌──────┬───────────────┬─────────┬──────────────┐
 │ Sym  │ Ts            │ Qty     │ Price        │
 ├──────┼───────────────┼─────────┼──────────────┤
@@ -33,7 +33,7 @@ Returns a table with records from the left-join of t1 and t2. Join columns (but 
 ├──────┴───────────────┴─────────┴──────────────┤
 │ 10000000 rows (20 shown) 4 columns (4 shown)  │
 └───────────────────────────────────────────────┘
-↪ (set quotes (table [Sym Ts Bid Ask] (list (take n (as 'Symbol (map-right as 'String (til 18000)))) (as 'Time (* 1000 (til n))) (as 'F64 (til n)) (as 'F64 (til n)))))
+ (set quotes (table [Sym Ts Bid Ask] (list (take n (as 'Symbol (map-right as 'String (til 18000)))) (as 'Time (* 1000 (til n))) (as 'F64 (til n)) (as 'F64 (til n)))))
 ┌──────┬───────────────┬──────────────┬──────────────┐
 │ Sym  │ Ts            │ Bid          │ Ask          │
 ├──────┼───────────────┼──────────────┼──────────────┤
@@ -61,7 +61,7 @@ Returns a table with records from the left-join of t1 and t2. Join columns (but 
 ├──────┴───────────────┴──────────────┴──────────────┤
 │ 10000000 rows (20 shown) 4 columns (4 shown)       │
 └────────────────────────────────────────────────────┘
-↪ (asof-join [Sym Ts] trades quotes)
+ (asof-join [Sym Ts] trades quotes)
 ┌──────┬───────────────┬──────────────┬──────────────┬─────────┬──────────────┐
 │ Sym  │ Ts            │ Bid          │ Ask          │ Qty     │ Price        │
 ├──────┼───────────────┼──────────────┼──────────────┼─────────┼──────────────┤

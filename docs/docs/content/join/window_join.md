@@ -3,23 +3,23 @@
 Returns a table with records from the left-join of t1 and t2. Join columns (but last one) are matched for equality. The resulting set matches for the last and values over the matching intervals in windows argument is passed to an aggregation functions set, producing additional columns in the resulting table.
 
 ```clj
-↪ (set n 100000)
+ (set n 100000)
 100000
-↪ (set tsym (take n (concat (take 99 'AAPL) (take 1 'MSFT))))
+ (set tsym (take n (concat (take 99 'AAPL) (take 1 'MSFT))))
 [AAPL AAPL AAPL AAPL AAPL AAPL AAPL AAPL AAPL AAPL AAPL AAPL AAPL AAPL AAPL AAPL..]
-↪ (set ttime (+ 09:00:00 (as 'Time (/ (* (til n) 3) 10))))
+ (set ttime (+ 09:00:00 (as 'Time (/ (* (til n) 3) 10))))
 [09:00:00.000 09:00:00.000 09:00:00.000 09:00:00.000 09:00:00.001 09:00:00.001 09:00:00.001..]
-↪ (set price (+ 10 (til n)))
+ (set price (+ 10 (til n)))
 [10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36..]
-↪ (set bsym (take (* 2 n) (concat (concat (take 3 'AAPL) (take 2 'MSFT)) (take 1 'GOOG))))
+ (set bsym (take (* 2 n) (concat (concat (take 3 'AAPL) (take 2 'MSFT)) (take 1 'GOOG))))
 [AAPL AAPL AAPL MSFT MSFT GOOG AAPL AAPL AAPL MSFT MSFT GOOG AAPL AAPL AAPL MSFT..]
-↪ (set btime (+ 09:00:00 (as 'Time (/ (* (til (* 2 n)) 2) 10))))
+ (set btime (+ 09:00:00 (as 'Time (/ (* (til (* 2 n)) 2) 10))))
 [09:00:00.000 09:00:00.000 09:00:00.000 09:00:00.000 09:00:00.000 09:00:00.001 09:00:00.001..]
-↪ (set bid (+ 8 (/ (til (* 2 n))2)))
+ (set bid (+ 8 (/ (til (* 2 n))2)))
 [8 8 9 9 10 10 11 11 12 12 13 13 14 14 15 15 16 16 17 17 18 18 19 19 20 20 21 21..]
-↪ (set ask (+ 12 (/ (til (* 2 n))2)))
+ (set ask (+ 12 (/ (til (* 2 n))2)))
 [12 12 13 13 14 14 15 15 16 16 17 17 18 18 19 19 20 20 21 21 22 22 23 23 24 24 25..]
-↪ (set trades (table [Sym Ts Price] (list tsym ttime price)))
+ (set trades (table [Sym Ts Price] (list tsym ttime price)))
 ┌──────┬──────────────┬──────────────────────┐
 │ Sym  │ Ts           │ Price                │
 ├──────┼──────────────┼──────────────────────┤
@@ -47,7 +47,7 @@ Returns a table with records from the left-join of t1 and t2. Join columns (but 
 ├──────┴──────────────┴──────────────────────┤
 │ 100000 rows (20 shown) 3 columns (3 shown) │
 └────────────────────────────────────────────┘
-↪ (set quotes (table [Sym Ts Bid Ask] (list bsym btime bid ask)))
+ (set quotes (table [Sym Ts Bid Ask] (list bsym btime bid ask)))
 ┌──────┬──────────────┬────────┬─────────────┐
 │ Sym  │ Ts           │ Bid    │ Ask         │
 ├──────┼──────────────┼────────┼─────────────┤
@@ -75,12 +75,12 @@ Returns a table with records from the left-join of t1 and t2. Join columns (but 
 ├──────┴──────────────┴────────┴─────────────┤
 │ 200000 rows (20 shown) 4 columns (4 shown) │
 └────────────────────────────────────────────┘
-↪ (set intervals (map-left + [-1000 1000] (at trades 'Ts)))
+ (set intervals (map-left + [-1000 1000] (at trades 'Ts)))
 (
   [08:59:59.000 08:59:59.000 08:59:59.000 08:59:59.000 08:59:59.001 08:59:59.001 08:59:59.001..]
   [09:00:01.000 09:00:01.000 09:00:01.000 09:00:01.000 09:00:01.001 09:00:01.001 09:00:01.001..]
 )
-↪ (window-join [Sym Ts] intervals trades quotes {bid: (min Bid) ask: (max Ask)})
+ (window-join [Sym Ts] intervals trades quotes {bid: (min Bid) ask: (max Ask)})
 ┌──────┬──────────────┬────────┬───────┬───────┐
 │ Sym  │ Ts           │ Price  │ bid   │ ask   │
 ├──────┼──────────────┼────────┼───────┼───────┤
@@ -108,7 +108,7 @@ Returns a table with records from the left-join of t1 and t2. Join columns (but 
 ├──────┴──────────────┴────────┴───────┴───────┤
 │ 100000 rows (20 shown) 5 columns (5 shown)   │
 └──────────────────────────────────────────────┘
-↪ (window-join1 [Sym Ts] intervals trades quotes {bid: (min Bid) ask: (max Ask)})
+ (window-join1 [Sym Ts] intervals trades quotes {bid: (min Bid) ask: (max Ask)})
 ┌──────┬──────────────┬────────┬───────┬───────┐
 │ Sym  │ Ts           │ Price  │ bid   │ ask   │
 ├──────┼──────────────┼────────┼───────┼───────┤

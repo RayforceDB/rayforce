@@ -16,7 +16,7 @@ Returns a value rounded up to the nearest integer greater than or equal to the g
 [2.0 3.0 -1.0]
 
 ↪ (ceil -5i)
--5i
+-5
 
 ↪ (ceil 0Nf)
 0Nf

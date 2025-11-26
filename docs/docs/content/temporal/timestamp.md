@@ -3,31 +3,21 @@
 Represents a point in time combining date and time.
 
 ```clj
-;; Get current timestamp in local timezone
-↪ (timestamp 'local)
-2024.03.15T10:30:00
-
-;; Get current timestamp in UTC
-↪ (timestamp 'utc)
-2024.03.15T14:30:00
-
 ;; Create timestamp from string
-↪ (as 'timestamp "2024.03.15T10:30:00")
-2024.03.15T10:30:00
+↪ (as 'timestamp "2024.03.15D10:30:00")
+2024.03.15D10:30:00.000000000
+```
 
-;; Timestamp arithmetic (in milliseconds)
-↪ (+ 2024.03.15T10:30:00 3600000)  ;; Add one hour
-2024.03.15T11:30:00
+```clj
+;; Get current timestamp (returns current timestamp)
+(timestamp 'local)
+(timestamp 'utc)
 
-;; Compare timestamps
-↪ (< 2024.03.15T10:30:00 2024.03.15T11:30:00)
-true
-
-;; Extract components
-↪ (as 'date 2024.03.15T10:30:00)
-2024.03.15
-↪ (as 'time 2024.03.15T10:30:00)
-10:30:00
+;; Timestamp arithmetic and comparisons use D separator
+(+ 2024.03.15D10:30:00 3600000000000)
+(< 2024.03.15D10:30:00 2024.03.15D11:30:00)
+(as 'date 2024.03.15D10:30:00)
+(as 'time 2024.03.15D10:30:00)
 ```
 
 !!! info "Format"

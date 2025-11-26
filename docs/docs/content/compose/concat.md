@@ -12,12 +12,7 @@ Concatenates two values into a single list or array.
 ↪ (concat [1 2] 3)
 [1 2 3]
 ↪ (concat (list 1 2 "asd") 7)
-(
-  1
-  2
-  asd
-  7
-)
+(1 2 asd 7)
 ```
 
 ## Type-Specific Examples
@@ -25,6 +20,9 @@ Concatenates two values into a single list or array.
 ```clj
 ↪ (concat true false)
 [true false]
+```
+
+```clj
 ↪ (concat 0x0d 0x0a)
 [0x0d 0x0a]
 ↪ (concat 't' "est")

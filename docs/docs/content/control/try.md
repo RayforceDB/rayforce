@@ -5,6 +5,6 @@
 ```clj
 ↪ (try (raise "A") 1)
 1
->(try (raise "A") (fn [x] x))
+↪ (try (raise "A") (fn [x] x))
 "A"
 ```
