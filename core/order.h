@@ -34,5 +34,7 @@ obj_p ray_xasc(obj_p x, obj_p y);
 obj_p ray_xdesc(obj_p x, obj_p y);
 obj_p ray_not(obj_p x);
 obj_p ray_neg(obj_p x);
+obj_p ray_rank(obj_p x);
+obj_p ray_xrank(obj_p x, obj_p y);
 
 #endif  // ORDER_H

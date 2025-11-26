@@ -27,6 +27,7 @@
 #include "error.h"
 #include "compose.h"
 #include "string.h"
+#include "pool.h"
 
 obj_p ray_iasc(obj_p x) {
     switch (x->type) {
@@ -501,4 +502,131 @@ obj_p ray_neg(obj_p x) {
         default:
             THROW(ERR_TYPE, "neg: unsupported type: '%s", type_name(x->type));
     }
+}
+
+// Partial function for parallel rank computation
+obj_p ray_rank_partial(i64_t len, i64_t offset, i64_t perm[], i64_t out[]) {
+    for (i64_t i = 0; i < len; i++)
+        out[perm[i + offset]] = i + offset;
+    return NULL_OBJ;
+}
+
+obj_p ray_rank(obj_p x) {
+    i64_t i, l, n, chunk;
+    obj_p perm, res, v;
+    pool_p pool;
+
+    // Get permutation indices
+    perm = ray_iasc(x);
+    if (IS_ERR(perm))
+        return perm;
+
+    l = x->len;
+    res = I64(l);
+    if (IS_ERR(res)) {
+        drop_obj(perm);
+        return res;
+    }
+
+    pool = pool_get();
+    n = pool_split_by(pool, l, 0);
+
+    if (n == 1) {
+        // Sequential: result[perm[i]] = i
+        i64_t* p = AS_I64(perm);
+        i64_t* r = AS_I64(res);
+        for (i = 0; i < l; i++)
+            r[p[i]] = i;
+        drop_obj(perm);
+        return res;
+    }
+
+    // Parallel inverse permutation
+    chunk = l / n;
+    pool_prepare(pool);
+
+    for (i = 0; i < n - 1; i++)
+        pool_add_task(pool, (raw_p)ray_rank_partial, 4, chunk, i * chunk, AS_I64(perm), AS_I64(res));
+
+    pool_add_task(pool, (raw_p)ray_rank_partial, 4, l - i * chunk, i * chunk, AS_I64(perm), AS_I64(res));
+
+    v = pool_run(pool);
+    drop_obj(v);
+    drop_obj(perm);
+
+    return res;
+}
+
+// Partial function for parallel xrank computation
+obj_p ray_xrank_partial(i64_t len, i64_t offset, i64_t n_buckets, i64_t total_len, i64_t perm[], i64_t out[]) {
+    for (i64_t i = 0; i < len; i++) {
+        i64_t rank = i + offset;
+        out[perm[rank]] = (rank * n_buckets) / total_len;
+    }
+    return NULL_OBJ;
+}
+
+obj_p ray_xrank(obj_p x, obj_p y) {
+    i64_t i, l, n, chunk, n_buckets;
+    obj_p perm, res, v;
+    pool_p pool;
+
+    switch (x->type) {
+        case -TYPE_I64:
+            n_buckets = x->i64;
+            break;
+        case -TYPE_I32:
+            n_buckets = x->i32;
+            break;
+        case -TYPE_I16:
+            n_buckets = x->i16;
+            break;
+        case -TYPE_U8:
+            n_buckets = x->u8;
+            break;
+        default:
+            THROW(ERR_TYPE, "xrank: first arg must be integer");
+    }
+    if (n_buckets <= 0)
+        THROW(ERR_TYPE, "xrank: number of buckets must be positive");
+
+    // Get permutation indices
+    perm = ray_iasc(y);
+    if (IS_ERR(perm))
+        return perm;
+
+    l = y->len;
+    res = I64(l);
+    if (IS_ERR(res)) {
+        drop_obj(perm);
+        return res;
+    }
+
+    pool = pool_get();
+    n = pool_split_by(pool, l, 0);
+
+    if (n == 1) {
+        // Sequential: result[perm[i]] = (i * n_buckets) / l
+        i64_t* p = AS_I64(perm);
+        i64_t* r = AS_I64(res);
+        for (i = 0; i < l; i++)
+            r[p[i]] = (i * n_buckets) / l;
+        drop_obj(perm);
+        return res;
+    }
+
+    // Parallel xrank
+    chunk = l / n;
+    pool_prepare(pool);
+
+    for (i = 0; i < n - 1; i++)
+        pool_add_task(pool, (raw_p)ray_xrank_partial, 6, chunk, i * chunk, n_buckets, l, AS_I64(perm), AS_I64(res));
+
+    pool_add_task(pool, (raw_p)ray_xrank_partial, 6, l - i * chunk, i * chunk, n_buckets, l, AS_I64(perm), AS_I64(res));
+
+    v = pool_run(pool);
+    drop_obj(v);
+    drop_obj(perm);
+
+    return res;
 }

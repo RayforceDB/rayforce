@@ -187,6 +187,7 @@ test_entry_t tests[] = {
     {"test_asc_desc", test_asc_desc},
     {"test_sort_xasc", test_sort_xasc},
     {"test_sort_xdesc", test_sort_xdesc},
+    {"test_rank_xrank", test_rank_xrank},
     {"test_str_match", test_str_match},
     {"test_lang_basic", test_lang_basic},
     {"test_lang_math", test_lang_math},

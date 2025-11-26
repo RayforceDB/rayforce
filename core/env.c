@@ -147,6 +147,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "not",                 TYPE_UNARY,    FN_ATOMIC,                 ray_not);
     REGISTER_FN(functions,  "iasc",                TYPE_UNARY,    FN_NONE,                   ray_iasc);
     REGISTER_FN(functions,  "idesc",               TYPE_UNARY,    FN_NONE,                   ray_idesc);
+    REGISTER_FN(functions,  "rank",                TYPE_UNARY,    FN_NONE,                   ray_rank);
     REGISTER_FN(functions,  "asc",                 TYPE_UNARY,    FN_NONE,                   ray_asc);
     REGISTER_FN(functions,  "desc",                TYPE_UNARY,    FN_NONE,                   ray_desc);
     REGISTER_FN(functions,  "guid",                TYPE_UNARY,    FN_ATOMIC,                 ray_guid);
@@ -209,6 +210,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "as",                  TYPE_BINARY,   FN_NONE,                   ray_cast_obj);
     REGISTER_FN(functions,  "xasc",                TYPE_BINARY,   FN_NONE,                   ray_xasc);
     REGISTER_FN(functions,  "xdesc",               TYPE_BINARY,   FN_NONE,                   ray_xdesc);
+    REGISTER_FN(functions,  "xrank",               TYPE_BINARY,   FN_NONE,                   ray_xrank);
     REGISTER_FN(functions,  "enum",                TYPE_BINARY,   FN_NONE,                   ray_enum);
     REGISTER_FN(functions,  "xbar",                TYPE_BINARY,   FN_ATOMIC,                 ray_xbar);
     REGISTER_FN(functions,  "os-set-var",          TYPE_BINARY,   FN_ATOMIC,                 ray_os_set_var);
