@@ -133,19 +133,17 @@ obj_p ray_reverse(obj_p x) {
 
             for (i = l - 1; i >= 0; i--)
                 AS_C8(res)[l - i] = AS_C8(x)[i];
+            break;
 
-            return res;
-
-				case TYPE_I32:
-				case TYPE_DATE:
-				case TYPE_TIME:
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
             l = x->len;
             res = vector(x->type, l);
 
             for (i = 0; i < l; i++)
                 AS_I32(res)[i] = AS_I32(x)[l - i - 1];
-
-            return res;
+            break;
 
         case TYPE_I64:
         case TYPE_TIMESTAMP:
@@ -155,8 +153,7 @@ obj_p ray_reverse(obj_p x) {
 
             for (i = 0; i < l; i++)
                 AS_I64(res)[i] = AS_I64(x)[l - i - 1];
-
-            return res;
+            break;
 
         case TYPE_F64:
             l = x->len;
@@ -164,8 +161,7 @@ obj_p ray_reverse(obj_p x) {
 
             for (i = 0; i < l; i++)
                 AS_F64(res)[i] = AS_F64(x)[l - i - 1];
-
-            return res;
+            break;
 
         case TYPE_LIST:
             l = x->len;
@@ -173,12 +169,17 @@ obj_p ray_reverse(obj_p x) {
 
             for (i = 0; i < l; i++)
                 AS_LIST(res)[i] = clone_obj(AS_LIST(x)[l - i - 1]);
-
-            return res;
+            break;
 
         default:
             THROW(ERR_TYPE, "reverse: unsupported type: '%s", type_name(x->type));
     }
+
+    res->attrs = (x->attrs & ~(ATTR_ASC | ATTR_DESC)) |
+                 ((x->attrs & ATTR_ASC) ? ATTR_DESC : 0) |
+                 ((x->attrs & ATTR_DESC) ? ATTR_ASC : 0);
+
+    return res;
 }
 
 obj_p ray_dict(obj_p x, obj_p y) {

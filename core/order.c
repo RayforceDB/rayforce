@@ -79,12 +79,8 @@ obj_p ray_asc(obj_p x) {
     if (x->attrs & ATTR_ASC)
         return clone_obj(x);
 
-    if (x->attrs & ATTR_DESC) {
-        res = ray_reverse(x);
-        res->attrs &= ~ATTR_DESC;
-        res->attrs |= ATTR_ASC | distinct;
-        return res;
-    }
+    if (x->attrs & ATTR_DESC)
+        return ray_reverse(x);
 
     switch (x->type) {
         case TYPE_B8:
@@ -169,12 +165,8 @@ obj_p ray_desc(obj_p x) {
     if (x->attrs & ATTR_DESC)
         return clone_obj(x);
 
-    if (x->attrs & ATTR_ASC) {
-        res = ray_reverse(x);
-        res->attrs &= ~ATTR_ASC;
-        res->attrs |= ATTR_DESC | distinct;
-        return res;
-    }
+    if (x->attrs & ATTR_ASC)
+        return ray_reverse(x);
 
     switch (x->type) {
         case TYPE_B8:
