@@ -499,7 +499,15 @@ obj_p ray_neg(obj_p x) {
 typedef struct {
     i64_t* perm;
     i64_t* out;
+    i64_t total_len;
 } rank_ctx_t;
+
+obj_p rank_desc_worker(i64_t len, i64_t offset, void* ctx) {
+    rank_ctx_t* c = ctx;
+    for (i64_t i = 0; i < len; i++)
+        c->out[offset + i] = c->total_len - 1 - (offset + i);
+    return NULL_OBJ;
+}
 
 obj_p rank_worker(i64_t len, i64_t offset, void* ctx) {
     rank_ctx_t* c = ctx;
@@ -511,6 +519,23 @@ obj_p rank_worker(i64_t len, i64_t offset, void* ctx) {
 obj_p ray_rank(obj_p x) {
     i64_t l;
     obj_p perm, res;
+
+    // Fast path for sorted vectors
+    if (x->attrs & ATTR_ASC) {
+        obj_p n = i64(x->len);
+        res = ray_til(n);
+        drop_obj(n);
+        return res;
+    }
+    if (x->attrs & ATTR_DESC) {
+        l = x->len;
+        res = I64(l);
+        if (IS_ERR(res))
+            return res;
+        rank_ctx_t ctx = { NULL, AS_I64(res), l };
+        pool_map(l, rank_desc_worker, &ctx);
+        return res;
+    }
 
     perm = ray_iasc(x);
     if (IS_ERR(perm))
@@ -528,6 +553,30 @@ obj_p ray_rank(obj_p x) {
 
     drop_obj(perm);
     return res;
+}
+
+typedef struct {
+    i64_t* out;
+    i64_t n_buckets;
+    i64_t total_len;
+} xrank_asc_ctx_t;
+
+obj_p xrank_asc_worker(i64_t len, i64_t offset, void* ctx) {
+    xrank_asc_ctx_t* c = ctx;
+    for (i64_t i = 0; i < len; i++) {
+        i64_t idx = i + offset;
+        c->out[idx] = (idx * c->n_buckets) / c->total_len;
+    }
+    return NULL_OBJ;
+}
+
+obj_p xrank_desc_worker(i64_t len, i64_t offset, void* ctx) {
+    xrank_asc_ctx_t* c = ctx;
+    for (i64_t i = 0; i < len; i++) {
+        i64_t idx = i + offset;
+        c->out[idx] = ((c->total_len - 1 - idx) * c->n_buckets) / c->total_len;
+    }
+    return NULL_OBJ;
 }
 
 typedef struct {
@@ -561,15 +610,27 @@ obj_p ray_xrank(obj_p x, obj_p y) {
     if (n_buckets <= 0)
         THROW(ERR_TYPE, "xrank: number of buckets must be positive");
 
-    perm = ray_iasc(y);
-    if (IS_ERR(perm))
-        return perm;
-
     l = y->len;
     res = I64(l);
-    if (IS_ERR(res)) {
-        drop_obj(perm);
+    if (IS_ERR(res))
         return res;
+
+    // Fast path for sorted vectors
+    if (y->attrs & ATTR_ASC) {
+        xrank_asc_ctx_t ctx = { AS_I64(res), n_buckets, l };
+        pool_map(l, xrank_asc_worker, &ctx);
+        return res;
+    }
+    if (y->attrs & ATTR_DESC) {
+        xrank_asc_ctx_t ctx = { AS_I64(res), n_buckets, l };
+        pool_map(l, xrank_desc_worker, &ctx);
+        return res;
+    }
+
+    perm = ray_iasc(y);
+    if (IS_ERR(perm)) {
+        drop_obj(res);
+        return perm;
     }
 
     xrank_ctx_t ctx = { AS_I64(perm), AS_I64(res), n_buckets, l };

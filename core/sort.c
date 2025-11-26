@@ -26,9 +26,29 @@
 #include "ops.h"
 #include "error.h"
 #include "symbols.h"
+#include "pool.h"
 
 // Maximum range for counting sort - configurable constant
 #define COUNTING_SORT_MAX_RANGE 1000000
+
+typedef struct {
+    i64_t* out;
+    i64_t len;
+} iota_ctx_t;
+
+obj_p iota_asc_worker(i64_t len, i64_t offset, void* ctx) {
+    iota_ctx_t* c = ctx;
+    for (i64_t i = 0; i < len; i++)
+        c->out[offset + i] = offset + i;
+    return NULL_OBJ;
+}
+
+obj_p iota_desc_worker(i64_t len, i64_t offset, void* ctx) {
+    iota_ctx_t* c = ctx;
+    for (i64_t i = 0; i < len; i++)
+        c->out[offset + i] = c->len - 1 - (offset + i);
+    return NULL_OBJ;
+}
 
 // Function pointer for comparison
 typedef i64_t (*compare_func_t)(obj_p vec, i64_t idx_i, i64_t idx_j);
@@ -379,28 +399,25 @@ obj_p ray_sort_asc_f64(obj_p vec) {
 }
 
 obj_p ray_sort_asc(obj_p vec) {
-    i64_t i, len = vec->len;
+    i64_t len = vec->len;
     obj_p indices;
-    i64_t* ov;
 
-    if (vec->len == 0)
+    if (len == 0)
         return I64(0);
 
     if (vec->attrs & ATTR_ASC) {
         indices = I64(len);
         indices->attrs = ATTR_ASC | ATTR_DISTINCT;
-        ov = AS_I64(indices);
-        for (i = 0; i < len; i++)
-            ov[i] = i;
+        iota_ctx_t ctx = { AS_I64(indices), len };
+        pool_map(len, iota_asc_worker, &ctx);
         return indices;
     }
 
     if (vec->attrs & ATTR_DESC) {
         indices = I64(len);
         indices->attrs = ATTR_DESC | ATTR_DISTINCT;
-        ov = AS_I64(indices);
-        for (i = 0; i < len; i++)
-            ov[i] = len - i - 1;
+        iota_ctx_t ctx = { AS_I64(indices), len };
+        pool_map(len, iota_desc_worker, &ctx);
         return indices;
     }
 
@@ -610,28 +627,25 @@ obj_p ray_sort_desc_f64(obj_p vec) {
 }
 
 obj_p ray_sort_desc(obj_p vec) {
-    i64_t i, len = vec->len;
+    i64_t len = vec->len;
     obj_p indices;
-    i64_t* ov;
 
-    if (vec->len == 0)
+    if (len == 0)
         return I64(0);
 
     if (vec->attrs & ATTR_DESC) {
         indices = I64(len);
         indices->attrs = ATTR_ASC | ATTR_DISTINCT;
-        ov = AS_I64(indices);
-        for (i = 0; i < len; i++)
-            ov[i] = i;
+        iota_ctx_t ctx = { AS_I64(indices), len };
+        pool_map(len, iota_asc_worker, &ctx);
         return indices;
     }
 
     if (vec->attrs & ATTR_ASC) {
         indices = I64(len);
         indices->attrs = ATTR_DESC | ATTR_DISTINCT;
-        ov = AS_I64(indices);
-        for (i = 0; i < len; i++)
-            ov[i] = len - i - 1;
+        iota_ctx_t ctx = { AS_I64(indices), len };
+        pool_map(len, iota_desc_worker, &ctx);
         return indices;
     }
 

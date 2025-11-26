@@ -167,6 +167,16 @@ test_result_t test_asc_desc() {
     TEST_ASSERT_EQ("(desc (asc [4 3 2 1]))", "[4 3 2 1]");
     TEST_ASSERT_EQ("(idesc (asc [4 3 2 1]))", "[3 2 1 0]");
 
+    TEST_ASSERT_EQ("(iasc (til 100000))", "(til 100000)");
+    TEST_ASSERT_EQ("(iasc (desc (til 100000)))", "(desc (til 100000))");
+    TEST_ASSERT_EQ("(idesc (til 100000))", "(desc (til 100000))");
+    TEST_ASSERT_EQ("(idesc (desc (til 100000)))", "(til 100000)");
+
+    TEST_ASSERT_EQ("(first (iasc (til 100000)))", "0");
+    TEST_ASSERT_EQ("(last (iasc (til 100000)))", "99999");
+    TEST_ASSERT_EQ("(first (iasc (desc (til 100000))))", "99999");
+    TEST_ASSERT_EQ("(last (iasc (desc (til 100000))))", "0");
+
     PASS();
 }
 
