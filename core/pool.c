@@ -455,3 +455,28 @@ i64_t pool_get_executors_count(pool_p pool) {
     else
         return pool->executors_count + 1;
 }
+
+nil_t pool_map(i64_t total_len, pool_map_fn fn, void* ctx) {
+    pool_p pool;
+    i64_t i, n, chunk;
+    obj_p v;
+
+    pool = pool_get();
+    n = pool_split_by(pool, total_len, 0);
+
+    if (n == 1) {
+        fn(total_len, 0, ctx);
+        return;
+    }
+
+    chunk = total_len / n;
+    pool_prepare(pool);
+
+    for (i = 0; i < n - 1; i++)
+        pool_add_task(pool, (raw_p)fn, 3, (raw_p)chunk, (raw_p)(i * chunk), ctx);
+
+    pool_add_task(pool, (raw_p)fn, 3, (raw_p)(total_len - i * chunk), (raw_p)(i * chunk), ctx);
+
+    v = pool_run(pool);
+    drop_obj(v);
+}

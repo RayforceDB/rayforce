@@ -102,4 +102,7 @@ obj_p pool_run(pool_p pool);
 i64_t pool_split_by(pool_p pool, i64_t input_len, i64_t groups_len);
 i64_t pool_get_executors_count(pool_p pool);
 
+typedef obj_p (*pool_map_fn)(i64_t len, i64_t offset, void* ctx);
+nil_t pool_map(i64_t total_len, pool_map_fn fn, void* ctx);
+
 #endif  // POOL_H
