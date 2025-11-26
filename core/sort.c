@@ -388,6 +388,7 @@ obj_p ray_sort_asc(obj_p vec) {
 
     if (vec->attrs & ATTR_ASC) {
         indices = I64(len);
+        indices->attrs = ATTR_ASC | ATTR_DISTINCT;
         ov = AS_I64(indices);
         for (i = 0; i < len; i++)
             ov[i] = i;
@@ -396,6 +397,7 @@ obj_p ray_sort_asc(obj_p vec) {
 
     if (vec->attrs & ATTR_DESC) {
         indices = I64(len);
+        indices->attrs = ATTR_DESC | ATTR_DISTINCT;
         ov = AS_I64(indices);
         for (i = 0; i < len; i++)
             ov[i] = len - i - 1;
@@ -617,6 +619,7 @@ obj_p ray_sort_desc(obj_p vec) {
 
     if (vec->attrs & ATTR_DESC) {
         indices = I64(len);
+        indices->attrs = ATTR_ASC | ATTR_DISTINCT;
         ov = AS_I64(indices);
         for (i = 0; i < len; i++)
             ov[i] = i;
@@ -625,6 +628,7 @@ obj_p ray_sort_desc(obj_p vec) {
 
     if (vec->attrs & ATTR_ASC) {
         indices = I64(len);
+        indices->attrs = ATTR_DESC | ATTR_DISTINCT;
         ov = AS_I64(indices);
         for (i = 0; i < len; i++)
             ov[i] = len - i - 1;

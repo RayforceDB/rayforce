@@ -73,6 +73,7 @@ obj_p ray_idesc(obj_p x) {
 obj_p ray_asc(obj_p x) {
     obj_p idx, res;
     i64_t l, i;
+    u8_t distinct = x->attrs & ATTR_DISTINCT;
 
     if (x->attrs & ATTR_ASC)
         return clone_obj(x);
@@ -80,7 +81,7 @@ obj_p ray_asc(obj_p x) {
     if (x->attrs & ATTR_DESC) {
         res = ray_reverse(x);
         res->attrs &= ~ATTR_DESC;
-        res->attrs |= ATTR_ASC;
+        res->attrs |= ATTR_ASC | distinct;
         return res;
     }
 
@@ -94,7 +95,7 @@ obj_p ray_asc(obj_p x) {
             res->type = x->type;
             for (i = 0; i < l; i++)
                 AS_C8(res)[i] = AS_C8(x)[AS_I64(idx)[i]];
-            res->attrs |= ATTR_ASC;
+            res->attrs |= ATTR_ASC | distinct;
             drop_obj(idx);
             return res;
 
@@ -104,7 +105,7 @@ obj_p ray_asc(obj_p x) {
             res = I16(l);
             for (i = 0; i < l; i++)
                 AS_I16(res)[i] = AS_I16(x)[AS_I64(idx)[i]];
-            res->attrs |= ATTR_ASC;
+            res->attrs |= ATTR_ASC | distinct;
             drop_obj(idx);
             return res;
 
@@ -117,7 +118,7 @@ obj_p ray_asc(obj_p x) {
             res->type = x->type;
             for (i = 0; i < l; i++)
                 AS_I32(res)[i] = AS_I32(x)[AS_I64(idx)[i]];
-            res->attrs |= ATTR_ASC;
+            res->attrs |= ATTR_ASC | distinct;
             drop_obj(idx);
             return res;
 
@@ -129,7 +130,7 @@ obj_p ray_asc(obj_p x) {
             l = x->len;
             for (i = 0; i < l; i++)
                 AS_I64(idx)[i] = AS_I64(x)[AS_I64(idx)[i]];
-            idx->attrs |= ATTR_ASC;
+            idx->attrs |= ATTR_ASC | distinct;
             idx->type = x->type;
             return idx;
 
@@ -139,7 +140,7 @@ obj_p ray_asc(obj_p x) {
             res = LIST(l);
             for (i = 0; i < l; i++)
                 AS_LIST(res)[i] = clone_obj(AS_LIST(x)[AS_I64(idx)[i]]);
-            res->attrs |= ATTR_ASC;
+            res->attrs |= ATTR_ASC | distinct;
             drop_obj(idx);
             return res;
 
@@ -149,7 +150,7 @@ obj_p ray_asc(obj_p x) {
             obj_p sorted_vals = at_obj(AS_LIST(x)[1], idx);
 
             res = dict(sorted_keys, sorted_vals);
-            res->attrs |= ATTR_ASC;
+            res->attrs |= ATTR_ASC | distinct;
             drop_obj(idx);
             return res;
         }
@@ -162,6 +163,7 @@ obj_p ray_asc(obj_p x) {
 obj_p ray_desc(obj_p x) {
     obj_p idx, res;
     i64_t l, i;
+    u8_t distinct = x->attrs & ATTR_DISTINCT;
 
     if (x->attrs & ATTR_DESC)
         return clone_obj(x);
@@ -169,7 +171,7 @@ obj_p ray_desc(obj_p x) {
     if (x->attrs & ATTR_ASC) {
         res = ray_reverse(x);
         res->attrs &= ~ATTR_ASC;
-        res->attrs |= ATTR_DESC;
+        res->attrs |= ATTR_DESC | distinct;
         return res;
     }
 
@@ -183,7 +185,7 @@ obj_p ray_desc(obj_p x) {
             res->type = x->type;
             for (i = 0; i < l; i++)
                 AS_C8(res)[i] = AS_C8(x)[AS_I64(idx)[i]];
-            res->attrs |= ATTR_DESC;
+            res->attrs |= ATTR_DESC | distinct;
             drop_obj(idx);
             return res;
 
@@ -193,7 +195,7 @@ obj_p ray_desc(obj_p x) {
             res = I16(l);
             for (i = 0; i < l; i++)
                 AS_I16(res)[i] = AS_I16(x)[AS_I64(idx)[i]];
-            res->attrs |= ATTR_DESC;
+            res->attrs |= ATTR_DESC | distinct;
             drop_obj(idx);
             return res;
 
@@ -206,7 +208,7 @@ obj_p ray_desc(obj_p x) {
             res->type = x->type;
             for (i = 0; i < l; i++)
                 AS_I32(res)[i] = AS_I32(x)[AS_I64(idx)[i]];
-            res->attrs |= ATTR_DESC;
+            res->attrs |= ATTR_DESC | distinct;
             drop_obj(idx);
             return res;
 
@@ -218,7 +220,7 @@ obj_p ray_desc(obj_p x) {
             l = x->len;
             for (i = 0; i < l; i++)
                 AS_I64(idx)[i] = AS_I64(x)[AS_I64(idx)[i]];
-            idx->attrs |= ATTR_DESC;
+            idx->attrs |= ATTR_DESC | distinct;
             idx->type = x->type;
             return idx;
 
@@ -228,7 +230,7 @@ obj_p ray_desc(obj_p x) {
             res = LIST(l);
             for (i = 0; i < l; i++)
                 AS_LIST(res)[i] = clone_obj(AS_LIST(x)[AS_I64(idx)[i]]);
-            res->attrs |= ATTR_DESC;
+            res->attrs |= ATTR_DESC | distinct;
             drop_obj(idx);
             return res;
 
@@ -238,7 +240,7 @@ obj_p ray_desc(obj_p x) {
             obj_p sorted_vals = at_obj(AS_LIST(x)[1], idx);
 
             res = dict(sorted_keys, sorted_vals);
-            res->attrs |= ATTR_DESC;
+            res->attrs |= ATTR_DESC | distinct;
             drop_obj(idx);
             return res;
         }
