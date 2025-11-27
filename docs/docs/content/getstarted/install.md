@@ -40,35 +40,37 @@ rlwrap ./rayforce -f examples/table.rfl
 ## Requirements
 
 - [Git](https://git-scm.com/) (includes Git Bash)
+- [MSYS2](https://www.msys2.org/) - Provides MinGW-w64 toolchain and make
 - **Choose one:**
-  - [Clang/LLVM](https://llvm.org/) - **Recommended** (install via [Scoop](https://scoop.sh/): `scoop install llvm make`)
-  - [MinGW](http://www.mingw.org/) or [TDM-GCC](https://jmeubank.github.io/tdm-gcc/)
+  - [GCC](https://gcc.gnu.org/) (default, included with MSYS2)
+  - [Clang](https://clang.llvm.org/) (recommended to install via MSYS2: `pacman -S mingw-w64-clang-x86_64-clang`)
 
-## Build with Clang (Recommended)
+## Build with GCC (Default)
 
-**Using Git Bash:**
+**Using Git Bash or MSYS2:**
 ``` sh
 git clone https://github.com/singaraiona/rayforce
 cd rayforce
-make release          # Uses clang by default, creates rayforce.exe
+mingw32-make release          # Uses GCC by default, creates rayforce.exe
 ./rayforce.exe -f examples/table.rfl
 ```
 
-## Build with GCC/MinGW
+## Build with Clang (Alternative)
 
-**Using Git Bash:**
+**Using Git Bash or MSYS2:**
 ``` sh
 git clone https://github.com/singaraiona/rayforce
 cd rayforce
-make release CC=gcc   # Explicitly use GCC
+mingw32-make release CC=clang # Uses Clang with auto-detected lld and compiler-rt
 ./rayforce.exe -f examples/table.rfl
 ```
 
 **Important Notes:**
-- The Makefile automatically detects Clang with MSVC target and uses appropriate linker flags
+- Use `mingw32-make` instead of `make` on Windows
+- The Makefile automatically detects the compiler and configures appropriate linker flags
+- For Clang builds, lld linker and compiler-rt are auto-detected
 - Build creates `rayforce.exe` automatically on Windows
-- **Use Git Bash** for best compatibility (includes Unix tools like `rm`, `cp`)
-- In cmd.exe, some make commands may fail without Git's bin directory in PATH
+- **Recommended:** Install Clang via MSYS2 for better MinGW compatibility
 
 # :simple-macos: MacOS
 

@@ -34,12 +34,35 @@ make release
 
 ## Building
 
+**Linux/macOS:**
 ```bash
+# GCC (default)
 make debug      # Debug build with sanitizers
 make release    # Optimized production build
 make tests      # Run test suite
 make bench      # Run benchmark suite
+
+# Clang (alternative compiler)
+make release CC=clang    # Build with Clang (auto-detects lld and compiler-rt)
+make debug CC=clang      # Debug build with Clang
+make tests CC=clang      # Run tests with Clang
 ```
+
+**Windows:**
+```bash
+# GCC (default)
+mingw32-make debug      # Debug build
+mingw32-make release    # Optimized production build
+mingw32-make tests      # Run test suite
+mingw32-make bench      # Run benchmark suite
+
+# Clang (alternative compiler)
+mingw32-make release CC=clang    # Build with Clang (auto-detects lld and compiler-rt)
+mingw32-make debug CC=clang      # Debug build with Clang
+mingw32-make tests CC=clang      # Run tests with Clang
+```
+
+> **Note:** For Windows, it's recommended to install Clang via MSYS2 for better MinGW compatibility.
 
 ## Documentation
 

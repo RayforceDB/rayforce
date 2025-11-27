@@ -14,7 +14,7 @@ $(info OS="$(OS)")
 # Detect shell environment on Windows
 ifeq ($(OS),Windows_NT)
 # Try to detect if bash is available
-BASH_EXISTS := $(shell bash --version >nul 2>&1 && echo yes || echo no)
+BASH_EXISTS := $(shell bash --version >/dev/null 2>&1 && echo yes || echo no)
 ifeq ($(BASH_EXISTS),yes)
 SHELL := bash
 USE_WINDOWS_COMMANDS := 0
@@ -28,8 +28,9 @@ USE_WINDOWS_COMMANDS := 0
 endif
 
 ifeq ($(OS),Windows_NT)
-# Detect if we're using clang with MSVC target or GCC
-COMPILER_VERSION := $(shell $(CC) --version)
+# Detect compiler type
+COMPILER_VERSION := $(shell $(CC) --version 2>/dev/null)
+IS_CLANG := $(if $(findstring clang,$(COMPILER_VERSION)),1,0)
 IS_CLANG_MSVC := $(if $(findstring windows-msvc,$(COMPILER_VERSION)),1,0)
 
 DEBUG_CFLAGS = -Wall -Wextra -std=$(STD) -g -O0 -DDEBUG
@@ -44,8 +45,16 @@ LIBS = -lws2_32 -lkernel32
 LIBNAME = rayforce.dll
 RELEASE_LDFLAGS = -Xlinker /STACK:8388608
 DEBUG_LDFLAGS = -Xlinker /STACK:8388608
+else ifeq ($(IS_CLANG),1)
+$(info Detected clang with MinGW target)
+# Clang (MSYS2) - use lld and compiler-rt
+LIBS = -lm -lws2_32 -lkernel32
+LIBNAME = rayforce.dll
+CLANG64 = C:/msys64/clang64/bin
+RELEASE_LDFLAGS = --ld-path=$(CLANG64)/ld.lld.exe -Wl,--stack,8388608 -rtlib=compiler-rt
+DEBUG_LDFLAGS = --ld-path=$(CLANG64)/ld.lld.exe -Wl,--stack,8388608 -rtlib=compiler-rt
 else
-# GCC or MinGW-targeted clang - use GNU-style flags
+# GCC - use standard GNU ld
 LIBS = -lm -lws2_32 -lkernel32
 LIBNAME = rayforce.dll
 RELEASE_LDFLAGS = -Wl,--stack,8388608
