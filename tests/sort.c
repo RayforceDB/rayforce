@@ -308,19 +308,19 @@ test_result_t test_rank_xrank() {
     TEST_ASSERT_EQ("(rank [1 2 3 4 5])", "[0 1 2 3 4]");
     TEST_ASSERT_EQ("(rank [5 4 3 2 1])", "[4 3 2 1 0]");
 
-    TEST_ASSERT_EQ("(xrank 3 [30 10 20 40 50 60])", "[1 0 0 1 2 2]");
-    TEST_ASSERT_EQ("(xrank 2 [1 2 3 4])", "[0 0 1 1]");
-    TEST_ASSERT_EQ("(xrank 4 [40 10 30 20])", "[3 0 2 1]");
-    TEST_ASSERT_EQ("(xrank 1 [5 3 1 4 2])", "[0 0 0 0 0]");
+    TEST_ASSERT_EQ("(xrank [30 10 20 40 50 60] 3)", "[1 0 0 1 2 2]");
+    TEST_ASSERT_EQ("(xrank [1 2 3 4] 2)", "[0 0 1 1]");
+    TEST_ASSERT_EQ("(xrank [40 10 30 20] 4)", "[3 0 2 1]");
+    TEST_ASSERT_EQ("(xrank [5 3 1 4 2] 1)", "[0 0 0 0 0]");
 
     TEST_ASSERT_EQ("(rank (til 100000))", "(til 100000)");
     TEST_ASSERT_EQ("(rank (desc (til 100000)))", "(desc (til 100000))");
     TEST_ASSERT_EQ("(rank (% (til 100000) 1000))", "(iasc (iasc (% (til 100000) 1000)))");
 
-    TEST_ASSERT_EQ("(first (xrank 10 (til 100000)))", "0");
-    TEST_ASSERT_EQ("(last (xrank 10 (til 100000)))", "9");
-    TEST_ASSERT_EQ("(count (where (== (xrank 10 (til 100000)) 0)))", "10000");
-    TEST_ASSERT_EQ("(xrank 2000000 (til 1000000))", "(* 2 (til 1000000))");
+    TEST_ASSERT_EQ("(first (xrank (til 100000) 10))", "0");
+    TEST_ASSERT_EQ("(last (xrank (til 100000) 10))", "9");
+    TEST_ASSERT_EQ("(count (where (== (xrank (til 100000) 10) 0)))", "10000");
+    TEST_ASSERT_EQ("(xrank (til 1000000) 2000000)", "(* 2 (til 1000000))");
 
     PASS();
 }

@@ -205,8 +205,10 @@ nav:
       - Iasc: content/order/iasc.md
       - Idesc: content/order/idesc.md
       - Neg: content/order/neg.md
+      - Rank: content/order/rank.md
       - Xasc: content/order/xasc.md
       - Xdesc: content/order/xdesc.md
+      - Xrank: content/order/xrank.md
     - Comparison:
       - Equal: content/cmp/eq.md
       - Not equal: content/cmp/ne.md

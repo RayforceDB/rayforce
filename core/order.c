@@ -595,7 +595,7 @@ obj_p xrank_worker(i64_t len, i64_t offset, void* ctx) {
     return NULL_OBJ;
 }
 
-obj_p ray_xrank(obj_p x, obj_p y) {
+obj_p ray_xrank(obj_p y, obj_p x) {
     i64_t l, n_buckets;
     obj_p perm, res;
 
