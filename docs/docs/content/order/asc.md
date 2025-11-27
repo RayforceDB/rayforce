@@ -8,9 +8,9 @@ Sorts elements in ascending order.
 
 ↪ (asc (list "banana" "apple" "cherry"))
 (
-apple
-banana
-cherry
+  apple
+  banana
+  cherry
 )
 ```
 

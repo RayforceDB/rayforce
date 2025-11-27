@@ -16,10 +16,10 @@ Concatenates two values into a single list or array.
 
 ↪ (concat (list 1 2 "asd") 7)
 (
-1
-2
-asd
-7
+  1
+  2
+  asd
+  7
 )
 ```
 

@@ -21,9 +21,9 @@ Applies a function to each element of a list and returns a new list with the res
 
 ↪ (map (fn [x] (as 'String x)) [1 2 3])
 (
-1
-2
-3
+  1
+  2
+  3
 )
 ```
 

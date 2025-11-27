@@ -10,9 +10,9 @@ Evaluates a string or expression.
 ;; Evaluate a list
 ↪ (set expr (list + 1 2))
 (
-+
-1
-2
+  +
+  1
+  2
 )
 ```
 

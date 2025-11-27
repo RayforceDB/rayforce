@@ -13,9 +13,9 @@ x
 ;; Quote a list
 ↪ (quote (+ 1 2))
 (
-+
-1
-2
+  +
+  1
+  2
 )
 
 ;; Shorthand quote syntax

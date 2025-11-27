@@ -8,9 +8,9 @@ Sorts elements in descending order.
 
 ↪ (desc (list "banana" "apple" "cherry"))
 (
-cherry
-banana
-apple
+  cherry
+  banana
+  apple
 )
 ```
 

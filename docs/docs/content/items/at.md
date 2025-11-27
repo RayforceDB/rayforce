@@ -42,8 +42,8 @@ Returns the element at the specified index or key from a collection.
 
 ↪ (at at_t 'name)
 (
-Alice
-Bob
+  Alice
+  Bob
 )
 
 ↪ (at at_t 'age)

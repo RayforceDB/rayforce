@@ -8,16 +8,16 @@ Creates a list from multiple arguments, folding into a vector if all arguments h
 
 ↪ (enlist 1 2 [3 4])
 (
-1
-2
-[3 4]
+  1
+  2
+  [3 4]
 )
 
 ↪ (enlist 1 2 "asd")
 (
-1
-2
-asd
+  1
+  2
+  asd
 )
 ```
 

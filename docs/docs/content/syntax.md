@@ -142,9 +142,9 @@ Rayfall uses prefix notation where the function comes before its arguments:
 ;; Multiple arguments - Vary function
 ↪ (list 1 2 3)
 (
-1
-2
-3
+  1
+  2
+  3
 )
 ```
 

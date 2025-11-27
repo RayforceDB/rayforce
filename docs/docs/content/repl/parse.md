@@ -6,9 +6,9 @@ Parses a string into an expression without evaluating it.
 ;; Parse a simple expression
 ↪ (parse "(+ 1 2)")
 (
-+
-1
-2
+  +
+  1
+  2
 )
 
 ;; Parse a function definition
@@ -18,9 +18,9 @@ Parses a string into an expression without evaluating it.
 ;; Parse multiple expressions
 ↪ (parse "(set x 10) (+ x 20)")
 (
-do
-(set x 10)
-(+ x 20)
+  do
+  (set x 10)
+  (+ x 20)
 )
 ```
 
