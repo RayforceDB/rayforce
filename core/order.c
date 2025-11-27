@@ -548,7 +548,7 @@ obj_p ray_rank(obj_p x) {
         return res;
     }
 
-    rank_ctx_t ctx = { AS_I64(perm), AS_I64(res) };
+    rank_ctx_t ctx = { AS_I64(perm), AS_I64(res), l };
     pool_map(l, rank_worker, &ctx);
 
     drop_obj(perm);
@@ -605,7 +605,7 @@ obj_p ray_xrank(obj_p y, obj_p x) {
         case -TYPE_I16: n_buckets = x->i16; break;
         case -TYPE_U8:  n_buckets = x->u8;  break;
         default:
-            THROW(ERR_TYPE, "xrank: first arg must be integer");
+            THROW(ERR_TYPE, "xrank: second arg must be integer");
     }
     if (n_buckets <= 0)
         THROW(ERR_TYPE, "xrank: number of buckets must be positive");
