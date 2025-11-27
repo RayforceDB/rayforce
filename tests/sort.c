@@ -324,3 +324,36 @@ test_result_t test_rank_xrank() {
 
     PASS();
 }
+
+test_result_t test_reverse() {
+    // strings (C8)
+    TEST_ASSERT_EQ("(reverse \"hello\")", "\"olleh\"");
+    TEST_ASSERT_EQ("(reverse \"a\")", "\"a\"");
+    TEST_ASSERT_EQ("(reverse \"\")", "\"\"");
+    TEST_ASSERT_EQ("(reverse \"ab\")", "\"ba\"");
+
+    // bytes (U8)
+    TEST_ASSERT_EQ("(reverse [0x01 0x02 0x03])", "[0x03 0x02 0x01]");
+
+    // booleans (B8)
+    TEST_ASSERT_EQ("(reverse [true false true])", "[true false true]");
+
+    // i32
+    TEST_ASSERT_EQ("(reverse [1i 2i 3i])", "[3i 2i 1i]");
+
+    // i64
+    TEST_ASSERT_EQ("(reverse [1 2 3 4 5])", "[5 4 3 2 1]");
+    TEST_ASSERT_EQ("(reverse [])", "[]");
+    TEST_ASSERT_EQ("(reverse [42])", "[42]");
+
+    // f64
+    TEST_ASSERT_EQ("(reverse [1.0 2.0 3.0])", "[3.0 2.0 1.0]");
+
+    // list
+    TEST_ASSERT_EQ("(reverse (list 'a 'b 'c))", "(list 'c 'b 'a)");
+
+    // double reverse = identity
+    TEST_ASSERT_EQ("(reverse (reverse [1 2 3 4 5]))", "[1 2 3 4 5]");
+
+    PASS();
+}

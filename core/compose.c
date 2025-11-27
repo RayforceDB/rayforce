@@ -129,10 +129,10 @@ obj_p ray_reverse(obj_p x) {
         case TYPE_U8:
         case TYPE_B8:
             l = x->len;
-            res = C8(l);
+            res = vector(x->type, l);
 
             for (i = l - 1; i >= 0; i--)
-                AS_C8(res)[l - i] = AS_C8(x)[i];
+                AS_C8(res)[l - i - 1] = AS_C8(x)[i];
             break;
 
         case TYPE_I32:
