@@ -56,15 +56,18 @@ Vectors are homogeneous collections (all elements must be the same type):
 ;; Create a vector of numbers
 ↪ (set numbers [1 2 3 4 5])
 [1 2 3 4 5]
+```
 
-;; Vector operations
-↪ (* numbers 2)  ;; Multiply each element by 2
+Vector operations (they require the `numbers` variable from above in your REPL):
+
+```clj
+(* numbers 2)  ;; Multiply each element by 2
 [2 4 6 8 10]
 
-;; Aggregations
-↪ (avg numbers)
+(avg numbers)
 3.00
-↪ (sum numbers)
+
+(sum numbers)
 15
 ```
 
@@ -119,14 +122,14 @@ Tables are the primary data structure for data analysis:
            avg_salary: (avg salary)
            from: employees
            by: dept})
-┌──────┬─────────────────┬─────────────────────┐
-│ dept │ name            │ avg_salary          │
-├──────┼─────────────────┼─────────────────────┤
-│ IT   │ (Alice Charlie) │ 80000.00            │
-│ HR   │ (Bob)           │ 65000.00            │
-├──────┴─────────────────┴─────────────────────┤
-│ 2 rows (2 shown) 3 columns (3 shown)         │
-└──────────────────────────────────────────────┘
+┌──────┬─────────────────┬─────────────┐
+│ dept │ name            │ avg_salary  │
+├──────┼─────────────────┼─────────────┤
+│ IT   │ (Alice Charlie) │ 80000.00    │
+│ HR   │ (Bob)           │ 65000.00    │
+├──────┴─────────────────┴─────────────┤
+│ 2 rows (2 shown) 3 columns (3 shown) │
+└──────────────────────────────────────┘
 
 ```
 
@@ -136,18 +139,22 @@ Rayforce has built-in support for temporal data:
 
 ```clj
 ;; Get current timestamp
-↪ (set now (timestamp 'local))
+(set now (timestamp 'local))
 2025.03.03D16:41:57.668734712
 
 ;; Extract components
-;; TODO
-↪ (as 'date now)
+;; TODO: conversion functions not working as expected
+(as 'date now)
 2025.03.03
-↪ (as 'time now)
+(as 'time now)
 16:41:57.668
+```
 
-;; Date arithmetic
-↪ (+ 2024.03.15 7)  ;; Add 7 days
+Date arithmetic:
+
+```clj
+;; Add 7 days to a date
+↪ (+ 2024.03.15 7)
 2024.03.22
 ```
 
@@ -164,8 +171,13 @@ Create reusable code with functions:
 ;; Function with multiple arguments
 ↪ (set salary-increase (fn [amount pct]
                          (+ amount (* amount (div pct 100)))))
-↪ (salary-increase 50000 10)  ;; 10% increase
-55000
+```
+
+Now use the function (requires the `salary-increase` definition from above in your REPL):
+
+```clj
+(salary-increase 50000 10)  ;; 10% increase
+55000.00
 
 ;; Function with multiple expressions
 ↪ (set process-data (fn [data]
@@ -185,7 +197,7 @@ Handle errors gracefully with try/catch:
 ↪ (try
      (+ 1 'symbol)
      (fn [x] x))
-"add: unsupported types: 'i64, 'symbol"
+"add: unsupported types: 'i64, 'symbol "
 
 ;; Error handling in functions
 ↪ (set safe-divide (fn [x y]
@@ -199,7 +211,6 @@ Handle errors gracefully with try/catch:
   Error:
   add: unsupported types: 'i64, 'symbol
 )
-↪
 ```
 
 ## Working with Files
@@ -208,10 +219,10 @@ Load and save data:
 
 ```clj
 ;; Save string to file
-↪ (set "calculations.rf" "(+ 1 2)")
+(set "calculations.rf" "(+ 1 2)")
 
 ;; Load and execute code
-↪ (eval (get "calculations.rf"))
+(eval (get "calculations.rf"))
 3
 ```
 
@@ -223,15 +234,15 @@ Use `timeit` to measure performance:
 
 ```clj
 ;; Measure execution time
-↪ (timeit (sum [1 2 3 4 5]))
+(timeit (sum [1 2 3 4 5]))
 0.015  ;; Time in milliseconds
 
-↪ (timeit (set t (load "./examples/table.rfl")))
+(timeit (set t (load "./examples/table.rfl")))
 2544.45
 
-↪ :t 1
+:t 1
 . Timeit is on.
-↪ (select {from: t by: Timestamp p: (first OrderId) s: (sum Price)})
+(select {from: t by: Timestamp p: (first OrderId) s: (sum Price)})
 ┌───────────────────────────────┬──────────────────────────────────────┬──────────────┐
 │ Timestamp                     │ p                                    │ s            │
 ├───────────────────────────────┼──────────────────────────────────────┼──────────────┤
@@ -274,7 +285,7 @@ Use `timeit` to measure performance:
 │ │ •  build table: 0.03 ms
 │ ╰─┤ 131.19 ms
 ╰─┤ 131.21 ms
-↪ :t 0
+:t 0
 . Timeit is off.
 ```
 
@@ -284,10 +295,10 @@ Monitor and manage memory:
 
 ```clj
 ;; Check memory stats
-↪ (memstat)
+(memstat)
 
 ;; Force garbage collection
-↪ (gc)
+(gc)
 ```
 
 ## Next Steps

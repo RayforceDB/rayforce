@@ -54,28 +54,13 @@ foreach expr $expressions {
                 lappend output_lines $trimmed
             }
 
-            # Process the output lines
+            # Process the output lines - preserve multiline structure
             if {[llength $output_lines] > 0} {
-                set first_line [lindex $output_lines 0]
-
-                # Check if multi-line structure
-                if {$first_line eq "(" || $first_line eq "\{" || $first_line eq "\["} {
-                    # Join all lines
-                    set joined [join $output_lines " "]
-                    # Normalize spacing around brackets
-                    regsub -all {\(\s+} $joined "(" joined
-                    regsub -all {\s+\)} $joined ")" joined
-                    regsub -all {\{\s+} $joined "\{" joined
-                    regsub -all {\s+\}} $joined "\}" joined
-                    regsub -all {\[\s+} $joined "\[" joined
-                    regsub -all {\s+\]} $joined "\]" joined
-                    regsub -all {\s+} $joined " " joined
-                    set result $joined
-                } elseif {[llength $output_lines] == 1} {
-                    set result $first_line
+                if {[llength $output_lines] == 1} {
+                    set result [lindex $output_lines 0]
                 } else {
-                    # Multiple lines but not starting with bracket - join with space
-                    set result [join $output_lines " "]
+                    # Preserve multiline output with newlines
+                    set result [join $output_lines "\n"]
                 }
             }
         }

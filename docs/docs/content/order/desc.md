@@ -7,7 +7,11 @@ Sorts elements in descending order.
 [9 6 5 4 3 2 1 1]
 
 ↪ (desc (list "banana" "apple" "cherry"))
-(cherry banana apple)
+(
+cherry
+banana
+apple
+)
 ```
 
 !!! info

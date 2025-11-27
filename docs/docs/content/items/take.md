@@ -25,5 +25,11 @@ If `x` > (count `y`), `y` is treated as circular:
 
 ```clj
 ↪ (take 5 (list 1 'a' "abc"))
-(1 a abc 1 a)
+(
+1
+a
+abc
+1
+a
+)
 ```

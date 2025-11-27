@@ -3,9 +3,9 @@
 Generates random numbers within a specified range.
 
 ```clj
-↪ (rand 5 10)
+(rand 5 10)
 [7 3 6 4 9]
-↪ (rand 5 100)
+(rand 5 100)
 [23 45 67 89 12]
 ```
 

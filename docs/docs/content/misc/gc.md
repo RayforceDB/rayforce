@@ -4,7 +4,7 @@ Triggers manual garbage collection.
 
 ```clj
 ↪ (gc)
-null
+0
 ```
 
 !!! info

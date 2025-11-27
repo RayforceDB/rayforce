@@ -5,16 +5,18 @@ Resolves a symbol to its bound value.
 ```clj
 ;; Resolve a variable
 ↪ (set x 10)
-↪ (resolve 'x)
 10
 
-;; Resolve a function
-↪ (resolve '+)
-<function:+>
+↪ (resolve 'x)
+10
+```
 
-;; Resolve an undefined symbol
-↪ (resolve 'undefined)
-null
+```clj
+;; Resolve a function (returns function reference)
+(resolve '+)
+
+;; Resolve an undefined symbol (returns null)
+(resolve 'undefined)
 ```
 
 !!! info "Syntax"

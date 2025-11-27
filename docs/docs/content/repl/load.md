@@ -4,12 +4,14 @@ Loads and evaluates code from a file.
 
 ```clj
 ;; Load a file
-↪ (load "lib.rf")
-null
+↪ (load "docs/tests/test_lib.rf")
+3
 
 ;; Load with error handling
 ↪ (try (load "missing.rf") {e: "File not found"})
-"File not found"
+{
+e: File not found
+}
 ```
 
 !!! info "Syntax"

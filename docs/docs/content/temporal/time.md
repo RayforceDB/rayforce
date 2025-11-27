@@ -4,28 +4,26 @@ Represents time of day.
 
 ```clj
 ;; Get current time in local timezone
-↪ (time 'local)
-10:30:00
+(time 'local)
+10:30:00.000
 
 ;; Get current time in UTC
-↪ (time 'utc)
-14:30:00
+(time 'utc)
+14:30:00.000
+```
 
-;; Create time from numbers
+```clj
+;; Create time from literal
 ↪ (as 'time 10:30:00)
-10:30:00
+10:30:00.000
 
 ;; Time arithmetic (in milliseconds)
-↪ (+ 10:30:00 3600000)  ;; Add one hour
-11:30:00
+↪ (+ 10:30:00 3600000)
+11:30:00.000
 
 ;; Compare times
 ↪ (< 10:30:00 11:30:00)
 true
-
-;; Extract from timestamp
-↪ (as 'time 2024.03.15T10:30:00)
-10:30:00
 ```
 
 !!! info "Format"

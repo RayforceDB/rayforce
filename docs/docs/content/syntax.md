@@ -139,9 +139,13 @@ Rayfall uses prefix notation where the function comes before its arguments:
 ↪ (avg [1 2 3 4])  ;; Unary function
 2.5
 
-;; Multiple arguments
-↪ (list 1 2 3)     ;; Vary function
-[1 2 3]
+;; Multiple arguments - Vary function
+↪ (list 1 2 3)
+(
+1
+2
+3
+)
 ```
 
 ## Comments
@@ -159,7 +163,7 @@ Rayfall uses prefix notation where the function comes before its arguments:
 ```clj
 ;; Quote - prevents evaluation
 ↪ (quote x)
-'x
+x
 
 ;; Set - assigns value
 ↪ (set x 42)

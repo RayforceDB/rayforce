@@ -3,24 +3,13 @@
 Returns metadata about a value.
 
 ```clj
-↪ (meta [1 2 3])
-{
-  type: Array
-  length: 3
-  element_type: I64
-}
-↪ (meta "hello")
-{
-  type: String
-  length: 5
-}
-↪ (meta (table [a b] [[1 2] [3 4]]))
-{
-  type: Table
-  columns: [a b]
-  rows: 2
-}
+(meta [1 2 3])
+(meta "hello")
+(meta (fn [x] (* x x)))
 ```
+
+!!! warning "Work in Progress"
+    Meta is not yet implemented for all types. Support is being expanded.
 
 !!! info
     - Returns a dictionary containing type information

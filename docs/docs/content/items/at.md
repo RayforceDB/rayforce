@@ -41,7 +41,10 @@ Returns the element at the specified index or key from a collection.
 ↪ (set at_t (table [name age] (list (list "Alice" "Bob") [25 30])))
 
 ↪ (at at_t 'name)
-(Alice Bob)
+(
+Alice
+Bob
+)
 
 ↪ (at at_t 'age)
 [25 30]

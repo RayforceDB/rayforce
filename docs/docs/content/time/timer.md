@@ -4,21 +4,21 @@ Creates and manages recurring timers.
 
 ```clj
 ;; Create a timer that runs every 1000ms (1 second)
-↪ (timer 1000 0 {t: (println "Timer tick:" t)})
-0  ;; Returns timer ID
+↪ (timer 1000 0 (fn [t] (println "Timer tick:" t)))
+0
+```
 
-;; Create a timer that runs 5 times
-↪ (timer 1000 5 {t: (println "Count:" t)})
-1  ;; Returns different timer ID
+```clj
+;; Create a timer that runs 5 times (returns next timer ID)
+(timer 1000 5 (fn [t] (println "Count:" t)))
+1
 
 ;; Remove a timer by ID
-↪ (timer 0)
+(timer 0)
 null
 
 ;; Create infinite timer (runs until removed)
-↪ (timer 5000 0 {t: (do
-                     (println "Background task at:" t)
-                     (gc))})  ;; Run garbage collection every 5 seconds
+(timer 5000 0 (fn [t] (do (println "Background task at:" t) (gc))))
 2
 ```
 

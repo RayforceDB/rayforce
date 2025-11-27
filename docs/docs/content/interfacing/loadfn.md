@@ -44,11 +44,11 @@ make
 Now, you can use the `loadfn` function to load the function from the shared library:
 
 ```clj
-↪ (set f (loadfn "ext/libexample.so" "myfn" 2))
+(set f (loadfn "ext/libexample.so" "myfn" 2))
 @fn
-↪ (f 1 2)
+(f 1 2)
 3
-↪ (f 1 0Ni)
+(f 1 0Ni)
 •• [E005] error: type mismatch
 ╭─[0]─┬ repl:1..1 in function: @anonymous
 │ 1   │ (f 1 0Ni)

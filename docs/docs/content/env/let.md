@@ -5,7 +5,10 @@
 ```clj
 ↪ (do (let a 123) (+ a 1))
 124
-> a
+```
+
+```clj
+a
 •• [E003] error: object evaluation failed
 ╭─[0]─┬ repl:1..1 in function: @anonymous
 │ 1   │ a

@@ -3,7 +3,7 @@
 Returns memory statistics for the current Rayforce process.
 
 ```clj
-↪ (memstat)
+(memstat)
 {
   msys: 67338240
   heap: 67108864

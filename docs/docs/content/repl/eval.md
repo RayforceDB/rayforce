@@ -9,19 +9,11 @@ Evaluates a string or expression.
 
 ;; Evaluate a list
 ↪ (set expr (list + 1 2))
-[+ 1 2]
-↪ (eval expr)
-3
-
-;; Evaluate with variables 
-↪ (set x 10)
-10
-↪ (eval "(+ x 5)")
-15
-
-;; Evaluate multiple expressions
-↪ (eval "(set y 20) (+ x y)")
-30
+(
++
+1
+2
+)
 ```
 
 !!! info "Syntax"

@@ -5,18 +5,23 @@ Parses a string into an expression without evaluating it.
 ```clj
 ;; Parse a simple expression
 ↪ (parse "(+ 1 2)")
-[+ 1 2]
+(
++
+1
+2
+)
 
 ;; Parse a function definition
 ↪ (parse "(fn [x] (* x 2))")
-[fn [x] [* x 2]]
+@(null)
 
 ;; Parse multiple expressions
-↪ (parse "
-   (set x 10)
-   (+ x 20)
-   ")
-[[set x 10] [+ x 20]]
+↪ (parse "(set x 10) (+ x 20)")
+(
+do
+(set x 10)
+(+ x 20)
+)
 ```
 
 !!! info "Syntax"

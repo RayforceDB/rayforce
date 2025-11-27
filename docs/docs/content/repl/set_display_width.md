@@ -4,16 +4,16 @@ Sets the maximum width for displaying tables and other formatted output.
 
 ```clj
 ;; Set display width to 40 characters
-↪ (set-display-width 40)
+(set-display-width 40)
 40
 
 ;; Create a wide table to demonstrate
-↪ (set t (table [name location department salary] 
+(set t (table [name location department salary]
                 (list (list "Alice Smith" "New York" "Engineering" "75000")
                       (list "Bob Johnson" "San Francisco" "Marketing" "65000"))))
 
 ;; Display with width limit
-↪ t
+t
 ┌────────────┬──────────┬────────────┐
 │ name       │ location │ department │
 ├────────────┼──────────┼────────────┤

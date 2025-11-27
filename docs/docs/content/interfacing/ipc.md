@@ -24,9 +24,9 @@ To connect to a port call `hopen` function:
 Now, you can send data to the remote process:
 
 ``` clj
-↪ (write h "(+ 1 2)")
+(write h "(+ 1 2)")
 3
-↪ (write h (list (+ 1 2)))
+(write h (list (+ 1 2)))
 3
 ```
 
@@ -64,7 +64,7 @@ There are 3 types of messages:
 Sync messages are used to send a request and get a response. Sync messages are blocking, so the sender will wait for the response.
 
 ``` clj
-↪ (write h "(+ 1 2)")
+(write h "(+ 1 2)")
 3
 ```
 
@@ -77,7 +77,7 @@ Response messages are used to send a response to a sync message. Response messag
 Async messages are used to send a message without waiting for a response. Async messages are not blocking, so the sender will not wait for the response. To send an async message, use negate for a connection handle with a `write` function:
 
 ``` clj
-↪ (write (neg h) (list (+ 1 2)))
+(write (neg h) (list (+ 1 2)))
 ```
 
 ## :material-protocol: Protocol

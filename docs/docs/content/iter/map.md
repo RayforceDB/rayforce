@@ -20,7 +20,11 @@ Applies a function to each element of a list and returns a new list with the res
 [2 4 6]
 
 ↪ (map (fn [x] (as 'String x)) [1 2 3])
-(1 2 3)
+(
+1
+2
+3
+)
 ```
 
 ### Mapping with operators

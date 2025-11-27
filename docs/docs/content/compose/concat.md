@@ -7,12 +7,20 @@ Concatenates two values into a single list or array.
 ```clj
 ↪ (concat 1 2)
 [1 2]
+
 ↪ (concat 1 [2 3])
 [1 2 3]
+
 ↪ (concat [1 2] 3)
 [1 2 3]
+
 ↪ (concat (list 1 2 "asd") 7)
-(1 2 asd 7)
+(
+1
+2
+asd
+7
+)
 ```
 
 ## Type-Specific Examples
@@ -25,12 +33,16 @@ Concatenates two values into a single list or array.
 ```clj
 ↪ (concat 0x0d 0x0a)
 [0x0d 0x0a]
+
 ↪ (concat 't' "est")
 "test"
+
 ↪ (concat "te" "st")
 "test"
+
 ↪ (concat 1h 2h)
 [1 2]
+
 ↪ (concat 1i 2i)
 [1 2]
 ```

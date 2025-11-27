@@ -4,15 +4,15 @@ Returns command line arguments passed to the script.
 
 ```clj
 ;; When script.rf is run as: rayforce script.rf arg1 arg2
-↪ (args)
+(args)
 ["arg1" "arg2"]
 
 ;; Check if arguments were provided
-↪ (> (count (args)) 0)
+(> (count (args)) 0)
 true
 
 ;; Access specific argument
-↪ (at (args) 0)
+(at (args) 0)
 "arg1"
 ```
 

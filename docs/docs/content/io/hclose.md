@@ -3,5 +3,5 @@
 Closes a handle opened with [hopen](hopen.md).
 
 ```clj
-↪ (hclose h)
+(hclose h)
 ```

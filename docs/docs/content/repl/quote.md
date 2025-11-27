@@ -3,22 +3,24 @@
 Prevents evaluation of an expression.
 
 ```clj
-;; Quote a symbol
-↪ (quote x)
-'x
-
-;; Quote a list
-↪ (quote [+ 1 2])
-[+ 1 2]
-
 ;; Quote prevents evaluation
 ↪ (set x 10)
+10
+
 ↪ (quote x)
-'x  ;; Returns symbol rather than value
+x
+
+;; Quote a list
+↪ (quote (+ 1 2))
+(
++
+1
+2
+)
 
 ;; Shorthand quote syntax
 ↪ 'x
-'x
+x
 ```
 
 !!! info "Syntax"

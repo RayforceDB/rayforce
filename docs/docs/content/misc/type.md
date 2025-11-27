@@ -4,15 +4,15 @@ Returns the type of a value as a symbol.
 
 ```clj
 ↪ (type 42)
-I64
+i64
 ↪ (type "hello")
 String
 ↪ (type [1 2 3])
-Array
+I64
 ↪ (type {a: 1})
 Dict
 ↪ (type (fn [x] x))
-Function
+Lambda
 ```
 
 !!! info
