@@ -1432,22 +1432,20 @@ obj_p term_read(term_p term) {
             autocp_reset_current(term);
             term->input_len = 0;
 
-            // Only reset buffer and add newline if we got a result to evaluate
+            // Reset input buffer regardless of result
+            term->buf_len = 0;
+            term->buf_pos = 0;
+
             if (res != NULL && res != NULL_OBJ) {
-                term->buf_len = 0;
-                term->buf_pos = 0;
+                // Got a complete expression to evaluate
                 term->multiline_len = 0;
                 line_new();
             } else if (res == NULL) {
-                // Unbalanced expression - clear current line buffer and show continuation prompt
-                term->buf_len = 0;
-                term->buf_pos = 0;
+                // Unbalanced expression - show continuation prompt
                 line_new();
                 term_prompt(term);
             } else {
-                // NULL_OBJ means command was processed, reset buffers
-                term->buf_len = 0;
-                term->buf_pos = 0;
+                // Command processed (NULL_OBJ)
                 term->multiline_len = 0;
                 line_new();
             }
