@@ -1253,6 +1253,10 @@ obj_p term_handle_return(term_p term) {
         if (term->multiline_len + 1 < TERM_BUF_SIZE) {
             term->multiline_buf[term->multiline_len++] = '\n';
             term->multiline_buf[term->multiline_len] = '\0';
+        } else {
+            // Buffer overflow: reset multiline buffer and inform user
+            term->multiline_len = 0;
+            printf("\n%sError: Multiline input too long, buffer reset.%s\n", RED, RESET);
         }
         return NULL;  // Signal "not ready to evaluate"
     }
