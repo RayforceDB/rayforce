@@ -1131,7 +1131,8 @@ b8_t term_autocomplete_paren(term_p term) {
 
 nil_t term_handle_tab(term_p term) { term_autocomplete_paren(term); }
 
-// Check if parentheses, brackets, and braces are balanced
+// Check if parentheses, brackets, and braces are balanced,
+// AND that all double-quoted strings are properly closed (no unclosed double-quoted strings).
 // Checks the buffer passed in (either term->buf or term->multiline_buf)
 b8_t term_check_balance(c8_t *buf, i32_t len) {
     i32_t i, depth, in_dquote, escape;
