@@ -1245,6 +1245,10 @@ obj_p term_handle_return(term_p term) {
         memcpy(term->multiline_buf + term->multiline_len, term->buf, term->buf_len);
         term->multiline_len = total_len;
         term->multiline_buf[term->multiline_len] = '\0';
+    } else {
+        // Buffer overflow - handle error and skip further processing
+        fprintf(stderr, "%sError: input too long for multiline buffer.%s\n", RED, RESET);
+        return NULL_OBJ;
     }
 
     // Check if parentheses/brackets are balanced on the complete multiline buffer
