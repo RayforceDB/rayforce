@@ -499,6 +499,7 @@ term_p term_create() {
     memset(term->input, 0, 8);
     term->buf_len = 0;
     term->buf_pos = 0;
+    term->multiline_len = 0;
     term->hist = hist;
     term->autocp_idx.entry = 0;
     term->term_width = 80;
@@ -568,6 +569,7 @@ term_p term_create() {
     memset(term->input, 0, 8);
     term->buf_len = 0;
     term->buf_pos = 0;
+    term->multiline_len = 0;
     term->hist = hist;
     term->autocp_idx.entry = 0;
     term->term_width = 80;
@@ -1129,47 +1131,137 @@ b8_t term_autocomplete_paren(term_p term) {
 
 nil_t term_handle_tab(term_p term) { term_autocomplete_paren(term); }
 
+// Check if parentheses, brackets, and braces are balanced
+// Checks the buffer passed in (either term->buf or term->multiline_buf)
+b8_t term_check_balance(c8_t *buf, i32_t len) {
+    i32_t i, depth, in_dquote, escape;
+    c8_t stack[TERM_BUF_SIZE];
+
+    depth = 0;
+    in_dquote = 0;
+    escape = 0;
+
+    for (i = 0; i < len; i++) {
+        c8_t c = buf[i];
+
+        // Handle escape sequences
+        if (escape) {
+            escape = 0;
+            continue;
+        }
+
+        if (c == '\\') {
+            escape = 1;
+            continue;
+        }
+
+        // Toggle double-quote state
+        if (c == KEYCODE_DQUOTE) {
+            in_dquote = !in_dquote;
+            continue;
+        }
+
+        // Skip characters inside double-quoted strings
+        if (in_dquote)
+            continue;
+
+        // Handle single-quote (symbol literal) - skip the next non-whitespace sequence
+        if (c == KEYCODE_SQUOTE) {
+            // Single quotes in this language start symbol literals, not strings
+            // They don't need balancing, just skip them
+            continue;
+        }
+
+        // Track opening brackets/parens/braces
+        if (c == KEYCODE_LPAREN || c == KEYCODE_LBRACKET || c == KEYCODE_LCURLY) {
+            if (depth >= TERM_BUF_SIZE)
+                return B8_FALSE;  // Stack overflow
+            stack[depth++] = c;
+        }
+        // Track closing brackets/parens/braces
+        else if (c == KEYCODE_RPAREN || c == KEYCODE_RBRACKET || c == KEYCODE_RCURLY) {
+            if (depth == 0)
+                return B8_FALSE;  // More closing than opening
+
+            c8_t expected = opposite_paren(stack[depth - 1]);
+            if (c != expected)
+                return B8_FALSE;  // Mismatched brackets
+
+            depth--;
+        }
+    }
+
+    // Balanced if: no unclosed brackets AND not inside a double-quoted string
+    return (depth == 0 && !in_dquote) ? B8_TRUE : B8_FALSE;
+}
+
 obj_p term_handle_return(term_p term) {
-    i64_t r, exit_code = 0;  // Initialize exit_code to 0
+    i64_t r, exit_code = 0;
     obj_p res = NULL_OBJ;
     b8_t onoff;
+    i32_t total_len;
 
-    if (term->buf_len == 0)
+    if (term->buf_len == 0 && term->multiline_len == 0)
         return NULL_OBJ;
 
     term->buf[term->buf_len] = '\0';
 
-    if (IS_CMD(term, ":q")) {
-        r = i64_from_str(term->buf + 2, term->buf_len - 2, &exit_code);
-        if (r != term->buf_len - 2)
-            exit_code = 0;
-        poll_exit(runtime_get()->poll, exit_code);
-        return NULL;
+    // Handle commands only if not in multi-line mode
+    if (term->multiline_len == 0) {
+        if (IS_CMD(term, ":q")) {
+            r = i64_from_str(term->buf + 2, term->buf_len - 2, &exit_code);
+            if (r != term->buf_len - 2)
+                exit_code = 0;
+            poll_exit(runtime_get()->poll, exit_code);
+            return NULL;
+        }
+
+        if (IS_CMD(term, ":u")) {
+            onoff = (term->buf_len > 2 && term->buf[3] == '1') ? B8_TRUE : B8_FALSE;
+            format_set_use_unicode(onoff);
+            printf("\n%s. Format use unicode: %s.%s", YELLOW, onoff ? "on" : "off", RESET);
+            hist_add(term->hist, term->buf, term->buf_len);
+            return NULL_OBJ;
+        }
+
+        if (IS_CMD(term, ":t")) {
+            onoff = (term->buf_len > 2 && term->buf[3] == '1') ? B8_TRUE : B8_FALSE;
+            timeit_activate(onoff);
+            printf("\n%s. Timeit is %s.%s", YELLOW, onoff ? "on" : "off", RESET);
+            hist_add(term->hist, term->buf, term->buf_len);
+            return NULL_OBJ;
+        }
+
+        if (IS_CMD(term, ":?")) {
+            printf("\n%s. Commands list:%s\n%s%s%s", YELLOW, RESET, GRAY, COMMANDS_LIST, RESET);
+            return NULL_OBJ;
+        }
     }
 
-    if (IS_CMD(term, ":u")) {
-        onoff = (term->buf_len > 2 && term->buf[3] == '1') ? B8_TRUE : B8_FALSE;
-        format_set_use_unicode(onoff);
-        printf("\n%s. Format use unicode: %s.%s", YELLOW, onoff ? "on" : "off", RESET);
-        hist_add(term->hist, term->buf, term->buf_len);
-        return NULL_OBJ;
+    // Append current line to multiline buffer
+    total_len = term->multiline_len + term->buf_len;
+    if (total_len < TERM_BUF_SIZE) {
+        memcpy(term->multiline_buf + term->multiline_len, term->buf, term->buf_len);
+        term->multiline_len = total_len;
+        term->multiline_buf[term->multiline_len] = '\0';
     }
 
-    if (IS_CMD(term, ":t")) {
-        onoff = (term->buf_len > 2 && term->buf[3] == '1') ? B8_TRUE : B8_FALSE;
-        timeit_activate(onoff);
-        printf("\n%s. Timeit is %s.%s", YELLOW, onoff ? "on" : "off", RESET);
-        hist_add(term->hist, term->buf, term->buf_len);
-        return NULL_OBJ;
+    // Check if parentheses/brackets are balanced on the complete multiline buffer
+    if (!term_check_balance(term->multiline_buf, term->multiline_len)) {
+        // Unbalanced - add newline to multiline buffer and continue
+        if (term->multiline_len + 1 < TERM_BUF_SIZE) {
+            term->multiline_buf[term->multiline_len++] = '\n';
+            term->multiline_buf[term->multiline_len] = '\0';
+        }
+        return NULL;  // Signal "not ready to evaluate"
     }
 
-    if (IS_CMD(term, ":?")) {
-        printf("\n%s. Commands list:%s\n%s%s%s", YELLOW, RESET, GRAY, COMMANDS_LIST, RESET);
-        return NULL_OBJ;
-    }
+    // Balanced - create result from multiline buffer
+    res = cstring_from_str(term->multiline_buf, term->multiline_len);
+    hist_add(term->hist, term->multiline_buf, term->multiline_len);
 
-    res = cstring_from_str(term->buf, term->buf_len);
-    hist_add(term->hist, term->buf, term->buf_len);
+    // Reset multiline buffer
+    term->multiline_len = 0;
 
     return res;
 }
@@ -1329,10 +1421,28 @@ obj_p term_read(term_p term) {
         case KEYCODE_RETURN:
             res = term_handle_return(term);
             autocp_reset_current(term);
-            term->buf_len = 0;
-            term->buf_pos = 0;
             term->input_len = 0;
-            line_new();
+
+            // Only reset buffer and add newline if we got a result to evaluate
+            if (res != NULL && res != NULL_OBJ) {
+                term->buf_len = 0;
+                term->buf_pos = 0;
+                term->multiline_len = 0;
+                line_new();
+            } else if (res == NULL) {
+                // Unbalanced expression - clear current line buffer and show continuation prompt
+                term->buf_len = 0;
+                term->buf_pos = 0;
+                line_new();
+                term_prompt(term);
+            } else {
+                // NULL_OBJ means command was processed, reset buffers
+                term->buf_len = 0;
+                term->buf_pos = 0;
+                term->multiline_len = 0;
+                line_new();
+            }
+
             fflush(stdout);
             break;
         case KEYCODE_BACKSPACE:

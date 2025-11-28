@@ -105,6 +105,8 @@ typedef struct term_t {
     i32_t buf_len;
     i32_t buf_pos;
     c8_t buf[TERM_BUF_SIZE];
+    i32_t multiline_len;  // Length of accumulated multi-line input
+    c8_t multiline_buf[TERM_BUF_SIZE];  // Accumulated multi-line input
     autocp_idx_t autocp_idx;
     i32_t autocp_buf_len;
     i32_t autocp_buf_pos;
