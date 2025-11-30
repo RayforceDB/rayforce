@@ -223,6 +223,7 @@ nav:
     - Iter:
       - Apply: content/iter/apply.md
       - Map: content/iter/map.md
+      - Pmap: content/iter/pmap.md
       - Fold: content/iter/fold.md
     - Queries: 
       - Select: content/query/select.md

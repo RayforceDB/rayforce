@@ -53,7 +53,8 @@ Applies a function to each element of a list and returns a new list with the res
 
 ## Notes
 
-- The function is applied to each element individually
+- The function is applied to each element **sequentially**
 - Works with any type of list or vector
 - Commonly used with lambda functions defined with `fn`
 - Returns a new list without modifying the original
+- For parallel execution, use [`pmap`](pmap.md)

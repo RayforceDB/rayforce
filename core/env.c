@@ -233,6 +233,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "println",             TYPE_VARY,     FN_NONE,                   ray_println);
     REGISTER_FN(functions,  "apply",               TYPE_VARY,     FN_NONE,                   ray_apply);
     REGISTER_FN(functions,  "map",                 TYPE_VARY,     FN_NONE,                   ray_map);
+    REGISTER_FN(functions,  "pmap",                TYPE_VARY,     FN_NONE,                   ray_pmap);
     REGISTER_FN(functions,  "map-left",            TYPE_VARY,     FN_NONE,                   ray_map_left);
     REGISTER_FN(functions,  "map-right",           TYPE_VARY,     FN_NONE,                   ray_map_right);
     REGISTER_FN(functions,  "fold",                TYPE_VARY,     FN_NONE,                   ray_fold);

@@ -30,7 +30,7 @@
 #include "error.h"
 #include "pool.h"
 
-obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
+obj_p map_unary_fn_ex(unary_f fn, i64_t attrs, obj_p x, b8_t parallel) {
     i64_t i, l, n;
     obj_p res, item, a, *v, parts;
     pool_p pool;
@@ -45,14 +45,14 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
                 return NULL_OBJ;
 
             v = AS_LIST(x);
-            n = pool_split_by(pool, l, 0);
+            n = parallel ? pool_get_executors_count(pool) : 0;
 
-            if (n > 1) {
+            if (n > 1 && l > 1) {
                 pool_prepare(pool);
 
                 if (attrs & FN_ATOMIC) {
                     for (i = 0; i < l; i++)
-                        pool_add_task(pool, (raw_p)map_unary_fn, 3, fn, attrs, v[i]);
+                        pool_add_task(pool, (raw_p)map_unary_fn_ex, 4, fn, attrs, v[i], parallel);
                 } else {
                     for (i = 0; i < l; i++)
                         pool_add_task(pool, (raw_p)fn, 1, v[i]);
@@ -62,7 +62,7 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
                 return unify_list(&parts);
             }
 
-            item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, v[0]) : fn(v[0]);
+            item = (attrs & FN_ATOMIC) ? map_unary_fn_ex(fn, attrs, v[0], parallel) : fn(v[0]);
 
             if (IS_ERR(item))
                 return item;
@@ -72,7 +72,7 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
             ins_obj(&res, 0, item);
 
             for (i = 1; i < l; i++) {
-                item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, v[i]) : fn(v[i]);
+                item = (attrs & FN_ATOMIC) ? map_unary_fn_ex(fn, attrs, v[i], parallel) : fn(v[i]);
 
                 if (IS_ERR(item)) {
                     res->len = i;
@@ -91,7 +91,7 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
                 return NULL_OBJ;
 
             a = at_idx(x, 0);
-            item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, a) : fn(a);
+            item = (attrs & FN_ATOMIC) ? map_unary_fn_ex(fn, attrs, a, parallel) : fn(a);
             drop_obj(a);
 
             if (IS_ERR(item))
@@ -103,7 +103,7 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
 
             for (i = 1; i < l; i++) {
                 a = at_idx(x, i);
-                item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, a) : fn(a);
+                item = (attrs & FN_ATOMIC) ? map_unary_fn_ex(fn, attrs, a, parallel) : fn(a);
                 drop_obj(a);
 
                 if (IS_ERR(item)) {
@@ -122,7 +122,11 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
     }
 }
 
+obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) { return map_unary_fn_ex(fn, attrs, x, B8_FALSE); }
+obj_p pmap_unary_fn(unary_f fn, i64_t attrs, obj_p x) { return map_unary_fn_ex(fn, attrs, x, B8_TRUE); }
+
 obj_p map_unary(obj_p f, obj_p x) { return map_unary_fn((unary_f)f->i64, f->attrs, x); }
+obj_p pmap_unary(obj_p f, obj_p x) { return pmap_unary_fn((unary_f)f->i64, f->attrs, x); }
 
 obj_p map_binary_left_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
     i64_t i, l;
@@ -429,7 +433,7 @@ obj_p map_lambda_partial(obj_p f, obj_p *lst, i64_t n, i64_t arg) {
     return res;
 }
 
-obj_p map_lambda(obj_p f, obj_p *x, i64_t n) {
+obj_p map_lambda_ex(obj_p f, obj_p *x, i64_t n, b8_t parallel) {
     i64_t i, j, l, executors;
     obj_p v, res;
     pool_p pool;
@@ -440,21 +444,23 @@ obj_p map_lambda(obj_p f, obj_p *x, i64_t n) {
         return NULL_OBJ;
 
     pool = pool_get();
-    executors = pool_split_by(pool, l, 0);
+    executors = parallel ? pool_get_executors_count(pool) : 0;
 
-    if (executors > 1) {
+    if (executors > 1 && l > 1) {
+        obj_p parts;
         pool_prepare(pool);
 
         for (j = 0; j < l; j++)
             pool_add_task(pool, (raw_p)map_lambda_partial, 4, f, x, n, j);
 
-        return pool_run(pool);
+        parts = pool_run(pool);
+        return unify_list(&parts);
     }
 
     for (j = 0; j < n; j++)
         stack_push(at_idx(x[j], 0));
 
-    v = (f->attrs & FN_ATOMIC) ? map_lambda(f, x, n) : call(f, n);
+    v = (f->attrs & FN_ATOMIC) ? map_lambda_ex(f, x, n, parallel) : call(f, n);
 
     for (j = 0; j < n; j++)
         drop_obj(stack_pop());
@@ -470,7 +476,7 @@ obj_p map_lambda(obj_p f, obj_p *x, i64_t n) {
         for (j = 0; j < n; j++)
             stack_push(at_idx(x[j], i));
 
-        v = (f->attrs & FN_ATOMIC) ? map_lambda(f, x, n) : call(f, n);
+        v = (f->attrs & FN_ATOMIC) ? map_lambda_ex(f, x, n, parallel) : call(f, n);
 
         for (j = 0; j < n; j++)
             drop_obj(stack_pop());
@@ -486,6 +492,9 @@ obj_p map_lambda(obj_p f, obj_p *x, i64_t n) {
 
     return res;
 }
+
+obj_p map_lambda(obj_p f, obj_p *x, i64_t n) { return map_lambda_ex(f, x, n, B8_FALSE); }
+obj_p pmap_lambda(obj_p f, obj_p *x, i64_t n) { return map_lambda_ex(f, x, n, B8_TRUE); }
 
 obj_p ray_map(obj_p *x, i64_t n) {
     i64_t l;
@@ -524,6 +533,46 @@ obj_p ray_map(obj_p *x, i64_t n) {
 
         default:
             THROW(ERR_TYPE, "'map': unsupported function type: '%s", type_name(f->type));
+    }
+}
+
+obj_p ray_pmap(obj_p *x, i64_t n) {
+    i64_t l;
+    obj_p f;
+
+    if (n < 2)
+        return LIST(0);
+
+    f = x[0];
+    x++;
+    n--;
+
+    switch (f->type) {
+        case TYPE_UNARY:
+            if (n != 1)
+                THROW(ERR_LENGTH, "'pmap': unary call with wrong arguments count");
+            return pmap_unary(f, x[0]);
+        case TYPE_BINARY:
+            if (n != 2)
+                THROW(ERR_LENGTH, "'pmap': binary call with wrong arguments count");
+            return map_binary(f, x[0], x[1]);
+        case TYPE_VARY:
+            return map_vary(f, x, n);
+        case TYPE_LAMBDA:
+            if (n != AS_LAMBDA(f)->args->len)
+                THROW(ERR_LENGTH, "'pmap': lambda call with wrong arguments count");
+
+            l = ops_rank(x, n);
+            if (l == NULL_I64)
+                THROW(ERR_LENGTH, "'pmap': arguments have different lengths");
+
+            if (l < 1)
+                return vector(x[0]->type, 0);
+
+            return pmap_lambda(f, x, n);
+
+        default:
+            THROW(ERR_TYPE, "'pmap': unsupported function type: '%s", type_name(f->type));
     }
 }
 

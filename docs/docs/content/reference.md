@@ -53,7 +53,7 @@
 
 <tr markdown><td markdown>iter</td>
 <td markdown>
-  [apply](iter/apply.md), [map](iter/map.md), [fold](iter/fold.md)
+  [apply](iter/apply.md), [map](iter/map.md), [pmap](iter/pmap.md), [fold](iter/fold.md)
 </td>
 </tr>
 
