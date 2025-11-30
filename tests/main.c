@@ -37,6 +37,8 @@
 #include "../core/parse.h"
 #include "../core/runtime.h"
 #include "../core/cmp.h"
+#include "../core/pool.h"
+#include "../core/sys.h"
 #include "../core/eval.h"
 
 typedef enum test_status_t { TEST_PASS = 0, TEST_FAIL } test_status_t;
@@ -57,11 +59,16 @@ typedef struct test_entry_t {
 
 // Setup and Teardown functions
 nil_t setup() {
+    sys_info_t si;
 #ifdef STOP_ON_FAIL
     runtime_create(1, NULL);
 #else
     runtime_create(0, NULL);
 #endif
+    // Initialize thread pool for pmap tests
+    si = sys_info(0);
+    if (si.threads > 1)
+        __RUNTIME->pool = pool_create(si.threads - 1);
     // heap_create(0);
 }
 
@@ -190,6 +197,7 @@ test_entry_t tests[] = {
     {"test_rank_xrank", test_rank_xrank},
     {"test_reverse", test_reverse},
     {"test_str_match", test_str_match},
+    {"test_lang_map", test_lang_map},
     {"test_lang_basic", test_lang_basic},
     {"test_lang_math", test_lang_math},
     {"test_lang_take", test_lang_take},
