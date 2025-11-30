@@ -21,6 +21,23 @@
  *   SOFTWARE.
  */
 
+// Map and pmap tests
+test_result_t test_lang_map() {
+    // Basic map
+    TEST_ASSERT_EQ("(map count (list (list \"aaa\" \"bbb\")))", "[2]");
+    TEST_ASSERT_EQ("(map (fn [x] (* x x)) [1 2 3 4 5])", "[1 4 9 16 25]");
+    TEST_ASSERT_EQ("(map (fn [x] (sum (til 100))) (til 5))", "[4950 4950 4950 4950 4950]");
+
+    // Basic pmap - same results as map
+    TEST_ASSERT_EQ("(pmap (fn [x] (* x x)) [1 2 3 4 5])", "[1 4 9 16 25]");
+    TEST_ASSERT_EQ("(pmap (fn [x] (sum (til 100))) (til 5))", "[4950 4950 4950 4950 4950]");
+
+    // pmap performance - should be at least 3x faster than map
+    TEST_ASSERT_EQ("(set work (fn [x] (fold + 0 (til 10000)))) (set tmap (timeit (map work (til 1000)))) (set tpmap (timeit (pmap work (til 1000)))) (> tmap (* 3.0 tpmap))", "true");
+
+    PASS();
+}
+
 test_result_t test_lang_basic() {
     TEST_ASSERT_EQ("null", "null");
     TEST_ASSERT_EQ("0x1a", "0x1a");
@@ -2477,15 +2494,6 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(dev [0Nf -2.0 10.0 11.0 5.0 0Nf])", "5.147815");
 
     TEST_ASSERT_EQ("((fn [x y] (+ x y)) 1 [2.3 4])", "[3.3 5.0]");
-    TEST_ASSERT_EQ("(map count (list (list \"aaa\" \"bbb\")))", "[2]");
-
-    // map vs pmap - both should return same results
-    TEST_ASSERT_EQ("(map (fn [x] (sum (til 100))) (til 5))", "[4950 4950 4950 4950 4950]");
-    TEST_ASSERT_EQ("(pmap (fn [x] (sum (til 100))) (til 5))", "[4950 4950 4950 4950 4950]");
-    TEST_ASSERT_EQ("(map (fn [x] (* x x)) [1 2 3 4 5])", "[1 4 9 16 25]");
-    TEST_ASSERT_EQ("(pmap (fn [x] (* x x)) [1 2 3 4 5])", "[1 4 9 16 25]");
-
-    TEST_ASSERT_EQ("(set work (fn [x] (fold + 0 (til 10000)))) (set tmap (timeit (map work (til 1000)))) (set tpmap (timeit (pmap work (til 1000)))) (> tmap (* 3.0 tpmap))", "true");
 
     PASS();
 }

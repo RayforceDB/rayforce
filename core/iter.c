@@ -29,6 +29,35 @@
 #include "eval.h"
 #include "error.h"
 #include "pool.h"
+#include "compose.h"
+
+// Concatenate list of lists/vectors into single list/vector (flatten one level)
+static obj_p concat_parts(obj_p parts) {
+    i64_t i, n;
+    obj_p res, *v;
+
+    if (parts == NULL || parts->type != TYPE_LIST)
+        return parts;
+
+    n = parts->len;
+    if (n == 0) {
+        drop_obj(parts);
+        return NULL_OBJ;
+    }
+    if (n == 1) {
+        res = clone_obj(AS_LIST(parts)[0]);
+        drop_obj(parts);
+        return res;
+    }
+
+    v = AS_LIST(parts);
+    res = clone_obj(v[0]);
+    for (i = 1; i < n; i++)
+        res = ray_concat(res, v[i]);
+
+    drop_obj(parts);
+    return res;
+}
 
 obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
     i64_t i, l;
@@ -93,8 +122,34 @@ obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
     }
 }
 
+obj_p map_unary_range(unary_f fn, i64_t attrs, obj_p *v, i64_t start, i64_t end) {
+    i64_t i, l = end - start;
+    obj_p res, item;
+
+    if (l == 0)
+        return NULL_OBJ;
+
+    item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, v[start]) : fn(v[start]);
+    if (IS_ERR(item))
+        return item;
+
+    res = (item->type < 0) ? vector(item->type, l) : LIST(l);
+    ins_obj(&res, 0, item);
+
+    for (i = 1; i < l; i++) {
+        item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, v[start + i]) : fn(v[start + i]);
+        if (IS_ERR(item)) {
+            res->len = i;
+            drop_obj(res);
+            return item;
+        }
+        ins_obj(&res, i, item);
+    }
+    return res;
+}
+
 obj_p pmap_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
-    i64_t i, l, n;
+    i64_t i, l, num_chunks, chunk_size;
     obj_p parts, *v;
     pool_p pool;
 
@@ -102,27 +157,29 @@ obj_p pmap_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
         return map_unary_fn(fn, attrs, x);
 
     l = ops_count(x);
-    if (l < 2)
-        return map_unary_fn(fn, attrs, x);
+    if (l == 0)
+        return NULL_OBJ;
 
     pool = pool_get();
-    n = pool_get_executors_count(pool);
-    if (n < 2)
-        return map_unary_fn(fn, attrs, x);
+    if (pool == NULL)
+        return map_unary_fn(fn, attrs, x);  // Fallback when pool not initialized
+    num_chunks = pool_get_executors_count(pool);
+
+    // Limit chunks to number of elements
+    if (num_chunks > l)
+        num_chunks = l;
 
     v = AS_LIST(x);
+    chunk_size = l / num_chunks;
     pool_prepare(pool);
 
-    if (attrs & FN_ATOMIC) {
-        for (i = 0; i < l; i++)
-            pool_add_task(pool, (raw_p)pmap_unary_fn, 3, fn, attrs, v[i]);
-    } else {
-        for (i = 0; i < l; i++)
-            pool_add_task(pool, (raw_p)fn, 1, v[i]);
-    }
+    for (i = 0; i < num_chunks - 1; i++)
+        pool_add_task(pool, (raw_p)map_unary_range, 5, fn, attrs, v, i * chunk_size, (i + 1) * chunk_size);
+    // Last chunk handles remainder
+    pool_add_task(pool, (raw_p)map_unary_range, 5, fn, attrs, v, i * chunk_size, l);
 
     parts = pool_run(pool);
-    return unify_list(&parts);
+    return concat_parts(parts);
 }
 
 obj_p map_unary(obj_p f, obj_p x) { return map_unary_fn((unary_f)f->i64, f->attrs, x); }
@@ -418,17 +475,43 @@ obj_p map_vary_fn(vary_f fn, i64_t attrs, obj_p *x, i64_t n) {
 
 obj_p map_vary(obj_p f, obj_p *x, i64_t n) { return map_vary_fn((vary_f)f->i64, f->attrs, x, n); }
 
-obj_p map_lambda_partial(obj_p f, obj_p *lst, i64_t n, i64_t arg) {
-    i64_t i;
-    obj_p res;
+obj_p map_lambda_range(obj_p f, obj_p *lst, i64_t n, i64_t start, i64_t end) {
+    i64_t i, j, l = end - start;
+    obj_p v, res;
 
-    for (i = 0; i < n; i++)
-        stack_push(at_idx(lst[i], arg));
+    if (l == 0)
+        return NULL_OBJ;
 
-    res = call(f, n);
+    for (j = 0; j < n; j++)
+        stack_push(at_idx(lst[j], start));
 
-    for (i = 0; i < n; i++)
+    v = (f->attrs & FN_ATOMIC) ? map_lambda(f, lst, n) : call(f, n);
+
+    for (j = 0; j < n; j++)
         drop_obj(stack_pop());
+
+    if (IS_ERR(v))
+        return v;
+
+    res = v->type < 0 ? vector(v->type, l) : LIST(l);
+    ins_obj(&res, 0, v);
+
+    for (i = 1; i < l; i++) {
+        for (j = 0; j < n; j++)
+            stack_push(at_idx(lst[j], start + i));
+
+        v = (f->attrs & FN_ATOMIC) ? map_lambda(f, lst, n) : call(f, n);
+
+        for (j = 0; j < n; j++)
+            drop_obj(stack_pop());
+
+        if (IS_ERR(v)) {
+            res->len = i;
+            drop_obj(res);
+            return v;
+        }
+        ins_obj(&res, i, v);
+    }
 
     return res;
 }
@@ -476,7 +559,7 @@ obj_p map_lambda(obj_p f, obj_p *x, i64_t n) {
 }
 
 obj_p pmap_lambda(obj_p f, obj_p *x, i64_t n) {
-    i64_t j, l, executors;
+    i64_t i, l, num_chunks, chunk_size, start, end;
     obj_p parts;
     pool_p pool;
 
@@ -484,20 +567,28 @@ obj_p pmap_lambda(obj_p f, obj_p *x, i64_t n) {
     if (n == 0 || l == 0 || l == NULL_I64)
         return NULL_OBJ;
 
-    if (l < 2)
-        return map_lambda(f, x, n);
-
     pool = pool_get();
-    executors = pool_get_executors_count(pool);
-    if (executors < 2)
-        return map_lambda(f, x, n);
+    if (pool == NULL)
+        return map_lambda(f, x, n);  // Fallback when pool not initialized
+    num_chunks = pool_get_executors_count(pool);
 
+    // Limit chunks to number of elements
+    if (num_chunks > l)
+        num_chunks = l;
+
+    chunk_size = l / num_chunks;
     pool_prepare(pool);
-    for (j = 0; j < l; j++)
-        pool_add_task(pool, (raw_p)map_lambda_partial, 4, f, x, n, j);
+
+    for (i = 0; i < num_chunks - 1; i++) {
+        start = i * chunk_size;
+        end = start + chunk_size;
+        pool_add_task(pool, (raw_p)map_lambda_range, 5, f, x, n, start, end);
+    }
+    // Last chunk handles remainder
+    pool_add_task(pool, (raw_p)map_lambda_range, 5, f, x, n, i * chunk_size, l);
 
     parts = pool_run(pool);
-    return unify_list(&parts);
+    return concat_parts(parts);
 }
 
 obj_p ray_map(obj_p *x, i64_t n) {
