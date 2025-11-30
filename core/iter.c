@@ -30,59 +30,34 @@
 #include "error.h"
 #include "pool.h"
 
-obj_p map_unary_fn_ex(unary_f fn, i64_t attrs, obj_p x, b8_t parallel) {
-    i64_t i, l, n;
-    obj_p res, item, a, *v, parts;
-    pool_p pool;
-
-    pool = pool_get();
+obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
+    i64_t i, l;
+    obj_p res, item, a, *v;
 
     switch (x->type) {
         case TYPE_LIST:
             l = ops_count(x);
-
             if (l == 0)
                 return NULL_OBJ;
 
             v = AS_LIST(x);
-            n = parallel ? pool_get_executors_count(pool) : 0;
-
-            if (n > 1 && l > 1) {
-                pool_prepare(pool);
-
-                if (attrs & FN_ATOMIC) {
-                    for (i = 0; i < l; i++)
-                        pool_add_task(pool, (raw_p)map_unary_fn_ex, 4, fn, attrs, v[i], parallel);
-                } else {
-                    for (i = 0; i < l; i++)
-                        pool_add_task(pool, (raw_p)fn, 1, v[i]);
-                }
-
-                parts = pool_run(pool);
-                return unify_list(&parts);
-            }
-
-            item = (attrs & FN_ATOMIC) ? map_unary_fn_ex(fn, attrs, v[0], parallel) : fn(v[0]);
+            item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, v[0]) : fn(v[0]);
 
             if (IS_ERR(item))
                 return item;
 
             res = (item->type < 0) ? vector(item->type, l) : LIST(l);
-
             ins_obj(&res, 0, item);
 
             for (i = 1; i < l; i++) {
-                item = (attrs & FN_ATOMIC) ? map_unary_fn_ex(fn, attrs, v[i], parallel) : fn(v[i]);
-
+                item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, v[i]) : fn(v[i]);
                 if (IS_ERR(item)) {
                     res->len = i;
                     drop_obj(res);
                     return item;
                 }
-
                 ins_obj(&res, i, item);
             }
-
             return res;
 
         case TYPE_MAPLIST:
@@ -91,30 +66,26 @@ obj_p map_unary_fn_ex(unary_f fn, i64_t attrs, obj_p x, b8_t parallel) {
                 return NULL_OBJ;
 
             a = at_idx(x, 0);
-            item = (attrs & FN_ATOMIC) ? map_unary_fn_ex(fn, attrs, a, parallel) : fn(a);
+            item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, a) : fn(a);
             drop_obj(a);
 
             if (IS_ERR(item))
                 return item;
 
             res = (item->type < 0) ? vector(item->type, l) : LIST(l);
-
             ins_obj(&res, 0, item);
 
             for (i = 1; i < l; i++) {
                 a = at_idx(x, i);
-                item = (attrs & FN_ATOMIC) ? map_unary_fn_ex(fn, attrs, a, parallel) : fn(a);
+                item = (attrs & FN_ATOMIC) ? map_unary_fn(fn, attrs, a) : fn(a);
                 drop_obj(a);
-
                 if (IS_ERR(item)) {
                     res->len = i;
                     drop_obj(res);
                     return item;
                 }
-
                 ins_obj(&res, i, item);
             }
-
             return res;
 
         default:
@@ -122,8 +93,37 @@ obj_p map_unary_fn_ex(unary_f fn, i64_t attrs, obj_p x, b8_t parallel) {
     }
 }
 
-obj_p map_unary_fn(unary_f fn, i64_t attrs, obj_p x) { return map_unary_fn_ex(fn, attrs, x, B8_FALSE); }
-obj_p pmap_unary_fn(unary_f fn, i64_t attrs, obj_p x) { return map_unary_fn_ex(fn, attrs, x, B8_TRUE); }
+obj_p pmap_unary_fn(unary_f fn, i64_t attrs, obj_p x) {
+    i64_t i, l, n;
+    obj_p parts, *v;
+    pool_p pool;
+
+    if (x->type != TYPE_LIST)
+        return map_unary_fn(fn, attrs, x);
+
+    l = ops_count(x);
+    if (l < 2)
+        return map_unary_fn(fn, attrs, x);
+
+    pool = pool_get();
+    n = pool_get_executors_count(pool);
+    if (n < 2)
+        return map_unary_fn(fn, attrs, x);
+
+    v = AS_LIST(x);
+    pool_prepare(pool);
+
+    if (attrs & FN_ATOMIC) {
+        for (i = 0; i < l; i++)
+            pool_add_task(pool, (raw_p)pmap_unary_fn, 3, fn, attrs, v[i]);
+    } else {
+        for (i = 0; i < l; i++)
+            pool_add_task(pool, (raw_p)fn, 1, v[i]);
+    }
+
+    parts = pool_run(pool);
+    return unify_list(&parts);
+}
 
 obj_p map_unary(obj_p f, obj_p x) { return map_unary_fn((unary_f)f->i64, f->attrs, x); }
 obj_p pmap_unary(obj_p f, obj_p x) { return pmap_unary_fn((unary_f)f->i64, f->attrs, x); }
@@ -433,34 +433,18 @@ obj_p map_lambda_partial(obj_p f, obj_p *lst, i64_t n, i64_t arg) {
     return res;
 }
 
-obj_p map_lambda_ex(obj_p f, obj_p *x, i64_t n, b8_t parallel) {
-    i64_t i, j, l, executors;
+obj_p map_lambda(obj_p f, obj_p *x, i64_t n) {
+    i64_t i, j, l;
     obj_p v, res;
-    pool_p pool;
 
     l = ops_rank(x, n);
-
     if (n == 0 || l == 0 || l == NULL_I64)
         return NULL_OBJ;
-
-    pool = pool_get();
-    executors = parallel ? pool_get_executors_count(pool) : 0;
-
-    if (executors > 1 && l > 1) {
-        obj_p parts;
-        pool_prepare(pool);
-
-        for (j = 0; j < l; j++)
-            pool_add_task(pool, (raw_p)map_lambda_partial, 4, f, x, n, j);
-
-        parts = pool_run(pool);
-        return unify_list(&parts);
-    }
 
     for (j = 0; j < n; j++)
         stack_push(at_idx(x[j], 0));
 
-    v = (f->attrs & FN_ATOMIC) ? map_lambda_ex(f, x, n, parallel) : call(f, n);
+    v = (f->attrs & FN_ATOMIC) ? map_lambda(f, x, n) : call(f, n);
 
     for (j = 0; j < n; j++)
         drop_obj(stack_pop());
@@ -469,14 +453,13 @@ obj_p map_lambda_ex(obj_p f, obj_p *x, i64_t n, b8_t parallel) {
         return v;
 
     res = v->type < 0 ? vector(v->type, l) : LIST(l);
-
     ins_obj(&res, 0, v);
 
     for (i = 1; i < l; i++) {
         for (j = 0; j < n; j++)
             stack_push(at_idx(x[j], i));
 
-        v = (f->attrs & FN_ATOMIC) ? map_lambda_ex(f, x, n, parallel) : call(f, n);
+        v = (f->attrs & FN_ATOMIC) ? map_lambda(f, x, n) : call(f, n);
 
         for (j = 0; j < n; j++)
             drop_obj(stack_pop());
@@ -486,15 +469,36 @@ obj_p map_lambda_ex(obj_p f, obj_p *x, i64_t n, b8_t parallel) {
             drop_obj(res);
             return v;
         }
-
         ins_obj(&res, i, v);
     }
 
     return res;
 }
 
-obj_p map_lambda(obj_p f, obj_p *x, i64_t n) { return map_lambda_ex(f, x, n, B8_FALSE); }
-obj_p pmap_lambda(obj_p f, obj_p *x, i64_t n) { return map_lambda_ex(f, x, n, B8_TRUE); }
+obj_p pmap_lambda(obj_p f, obj_p *x, i64_t n) {
+    i64_t j, l, executors;
+    obj_p parts;
+    pool_p pool;
+
+    l = ops_rank(x, n);
+    if (n == 0 || l == 0 || l == NULL_I64)
+        return NULL_OBJ;
+
+    if (l < 2)
+        return map_lambda(f, x, n);
+
+    pool = pool_get();
+    executors = pool_get_executors_count(pool);
+    if (executors < 2)
+        return map_lambda(f, x, n);
+
+    pool_prepare(pool);
+    for (j = 0; j < l; j++)
+        pool_add_task(pool, (raw_p)map_lambda_partial, 4, f, x, n, j);
+
+    parts = pool_run(pool);
+    return unify_list(&parts);
+}
 
 obj_p ray_map(obj_p *x, i64_t n) {
     i64_t l;
