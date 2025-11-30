@@ -181,52 +181,58 @@ runtime_p runtime_create(i32_t argc, str_p argv[]) {
         }
 
     } else {
-        __RUNTIME->poll = NULL;
+        // Embedded mode (argc == 0)
+        // Still create poll for embedded use (connections, I/O plugins, etc.)
+        // but don't auto-create REPL to avoid stealing stdin from host process
         __RUNTIME->sys_info = sys_info(1);
-        // if (__RUNTIME->sys_info.threads > 1)
-        //     __RUNTIME->pool = pool_create(__RUNTIME->sys_info.threads - 1);
+        if (__RUNTIME->sys_info.threads > 1)
+            __RUNTIME->pool = pool_create(__RUNTIME->sys_info.threads - 1);
+
+        __RUNTIME->poll = poll_create();
+        if (__RUNTIME->poll == NULL) {
+            printf("Failed to create poll\n");
+            return NULL;
+        }
     }
 
     return __RUNTIME;
 }
 
 i32_t runtime_run(nil_t) {
-    b8_t repl_enabled = B8_FALSE;
-    b8_t silent_mode = B8_FALSE;
     i64_t port;
     obj_p arg;
 
-    if (__RUNTIME->poll) {
-        arg = runtime_get_arg("repl");
-        if (is_null(arg)) {
-            repl_create(__RUNTIME->poll, B8_FALSE);
-            drop_obj(arg);
-        } else {
-            repl_enabled =
-                (str_cmp(AS_C8(arg), arg->len, "true", 4) == 0) || (str_cmp(AS_C8(arg), arg->len, "1", 1) == 0);
-            silent_mode =
-                (str_cmp(AS_C8(arg), arg->len, "0", 1) == 0) || (str_cmp(AS_C8(arg), arg->len, "false", 5) == 0);
-            drop_obj(arg);
-            if (repl_enabled)
-                repl_create(__RUNTIME->poll, B8_FALSE);
-            else if (silent_mode)
-                repl_create(__RUNTIME->poll, B8_TRUE);
-        }
+    if (!__RUNTIME->poll)
+        return 0;
 
-        arg = runtime_get_arg("port");
-        if (!is_null(arg)) {
-            i64_from_str(AS_C8(arg), arg->len, &port);
-            drop_obj(arg);
-            if (ipc_listen(__RUNTIME->poll, port) == -1) {
-                printf("Failed to listen on port %lld\n", port);
-                return 1;
-            }
-        }
+#ifndef RAYFORCE_EMBEDDED
+    // Only auto-create REPL in standalone mode (not embedded mode)
+    // to avoid stealing stdin from host process
+    b8_t silent_mode = B8_FALSE;
 
-        return poll_run(__RUNTIME->poll);
+    arg = runtime_get_arg("repl");
+    if (is_null(arg)) {
+        repl_create(__RUNTIME->poll, B8_FALSE);
+        drop_obj(arg);
+    } else {
+        silent_mode = (str_cmp(AS_C8(arg), arg->len, "0", 1) == 0) || (str_cmp(AS_C8(arg), arg->len, "false", 5) == 0);
+        drop_obj(arg);
+        repl_create(__RUNTIME->poll, silent_mode);
     }
 
-    return 0;
+    // Port listening for standalone mode
+    arg = runtime_get_arg("port");
+    if (!is_null(arg)) {
+        i64_from_str(AS_C8(arg), arg->len, &port);
+        drop_obj(arg);
+        if (ipc_listen(__RUNTIME->poll, port) == -1) {
+            printf("Failed to listen on port %lld\n", port);
+            return 1;
+        }
+    }
+#endif
+
+    return poll_run(__RUNTIME->poll);
 }
 
 nil_t runtime_destroy(nil_t) {
