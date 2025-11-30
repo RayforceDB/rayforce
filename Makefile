@@ -2,8 +2,6 @@ CC = clang
 STD = c17
 AR = ar
 PROFILER = gprof
-PYTHON = python3.10
-SWIG = swig
 
 ifeq ($(OS),)
 OS := $(shell uname -s | tr "[:upper:]" "[:lower:]")

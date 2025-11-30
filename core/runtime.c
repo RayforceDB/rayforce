@@ -199,15 +199,14 @@ runtime_p runtime_create(i32_t argc, str_p argv[]) {
 }
 
 i32_t runtime_run(nil_t) {
-    i64_t port;
-    obj_p arg;
-
     if (!__RUNTIME->poll)
         return 0;
 
 #ifndef RAYFORCE_EMBEDDED
     // Only auto-create REPL in standalone mode (not embedded mode)
     // to avoid stealing stdin from host process
+    i64_t port;
+    obj_p arg;
     b8_t silent_mode = B8_FALSE;
 
     arg = runtime_get_arg("repl");
