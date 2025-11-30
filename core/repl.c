@@ -45,14 +45,18 @@ option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
     res = NULL_OBJ;
     str = (obj_p)data;
 
-    if (IS_ERR(str))
+    if (IS_ERR(str)) {
         io_write(STDERR_FILENO, 2, str);
-    else if (str != NULL_OBJ) {
+        if (repl->silent)
+            poll_exit(poll, 1);
+    } else if (str != NULL_OBJ) {
         res = ray_eval_str(str, repl->name);
         error = IS_ERR(res);
-        if (error)
+        if (error) {
             io_write(STDERR_FILENO, 2, res);
-        else if (!repl->silent)  // Only print output if not in silent mode
+            if (repl->silent)
+                poll_exit(poll, 1);
+        } else if (!repl->silent)  // Only print output if not in silent mode
             io_write(STDOUT_FILENO, 2, res);
 
         if (!error && !repl->silent)
