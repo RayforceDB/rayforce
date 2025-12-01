@@ -3339,6 +3339,18 @@ test_result_t test_lang_concat() {
     PASS();
 }
 
+test_result_t test_lang_raze() {
+    TEST_ASSERT_EQ("(raze (list [1 2] [3 4]))", "[1 2 3 4]");
+    TEST_ASSERT_EQ("(raze (list [1 2] [3.0 4.0]))", "(list 1 2 3.0 4.0)");
+    TEST_ASSERT_EQ("(raze (list [1 2] (list 3 4)))", "[1 2 3 4]");
+    TEST_ASSERT_EQ("(raze (list (list 1 2) (list 3 4)))", "[1 2 3 4]");
+    TEST_ASSERT_EQ("(raze (list (list 1 2) (list 3.0 4)))", "(list 1 2 3.0 4)");
+    TEST_ASSERT_EQ("(raze (list))", "()");
+    TEST_ASSERT_EQ("(raze (list [1 2 3]))", "[1 2 3]");
+    TEST_ASSERT_EQ("(raze 42)", "42");
+    PASS();
+}
+
 test_result_t test_lang_filter() {
     TEST_ASSERT_EQ("(filter [true false true false] [true true false false])", "[true false]");
     TEST_ASSERT_EQ("(filter [0x12 0x11 0x10] [true false true])", "[0x12 0x10]");

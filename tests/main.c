@@ -210,6 +210,7 @@ test_entry_t tests[] = {
     {"test_serde_different_sizes", test_serde_different_sizes},
     {"test_lang_distinct", test_lang_distinct},
     {"test_lang_concat", test_lang_concat},
+    {"test_lang_raze", test_lang_raze},
     {"test_lang_filter", test_lang_filter},
     {"test_lang_in", test_lang_in},
     {"test_lang_except", test_lang_except},

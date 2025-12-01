@@ -172,6 +172,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "os-get-var",          TYPE_UNARY,    FN_NONE,                   ray_os_get_var);
     REGISTER_FN(functions,  "system",              TYPE_UNARY,    FN_NONE,                   ray_system);
     REGISTER_FN(functions,  "unify",               TYPE_UNARY,    FN_NONE,                   ray_unify);
+    REGISTER_FN(functions,  "raze",                TYPE_UNARY,    FN_NONE,                   ray_raze);
     REGISTER_FN(functions,  "diverse",             TYPE_UNARY,    FN_NONE,                   ray_diverse);
     REGISTER_FN(functions,  "row",                 TYPE_UNARY,    FN_NONE | FN_AGGR,         ray_row);
     

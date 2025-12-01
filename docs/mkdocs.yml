@@ -153,6 +153,7 @@ nav:
       - Group: content/compose/group.md
       - GUID: content/compose/guid.md
       - Rand: content/compose/rand.md
+      - Raze: content/compose/raze.md
       - Reverse: content/compose/reverse.md
       - Til: content/compose/til.md
       - Distinct: content/compose/distinct.md

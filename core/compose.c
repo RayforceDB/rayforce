@@ -35,6 +35,7 @@
 #include "string.h"
 #include "guid.h"
 #include "aggr.h"
+#include "serde.h"
 
 obj_p ray_cast_obj(obj_p x, obj_p y) {
     i8_t type;
@@ -856,6 +857,76 @@ obj_p ray_unify(obj_p x) {
     obj_p res;
 
     res = cow_obj(x);
+    return unify_list(&res);
+}
+
+obj_p ray_raze(obj_p x) {
+    i64_t i, j, n, total, off, elem_size;
+    i8_t type;
+    obj_p res, *v;
+    b8_t all_same_vectors;
+
+    // Not a list → return as-is
+    if (x->type != TYPE_LIST)
+        return clone_obj(x);
+
+    n = x->len;
+    if (n == 0)
+        return NULL_OBJ;
+
+    v = AS_LIST(x);
+
+    // Check if all parts are vectors of the same non-LIST type
+    all_same_vectors = (IS_VECTOR(v[0]) && v[0]->type != TYPE_LIST);
+    type = v[0]->type;
+    total = v[0]->len;
+
+    for (i = 1; i < n && all_same_vectors; i++) {
+        if (v[i]->type != type)
+            all_same_vectors = 0;
+        total += v[i]->len;
+    }
+
+    // Fast path: all vectors of same type → memcpy
+    if (all_same_vectors) {
+        res = vector(type, total);
+        elem_size = size_of_type(type);
+        off = 0;
+        for (i = 0; i < n; i++) {
+            if (v[i]->len > 0) {
+                memcpy(res->raw + off * elem_size, v[i]->raw, v[i]->len * elem_size);
+                off += v[i]->len;
+            }
+        }
+        return res;
+    }
+
+    // Slow path: flatten to LIST of atoms, then unify
+    total = 0;
+    for (i = 0; i < n; i++) {
+        if (v[i]->type == TYPE_LIST)
+            total += v[i]->len;
+        else if (IS_VECTOR(v[i]))
+            total += v[i]->len;
+        else
+            total++;
+    }
+
+    res = LIST(total);
+    off = 0;
+    for (i = 0; i < n; i++) {
+        if (v[i]->type == TYPE_LIST) {
+            for (j = 0; j < v[i]->len; j++)
+                AS_LIST(res)[off++] = clone_obj(AS_LIST(v[i])[j]);
+        } else if (IS_VECTOR(v[i])) {
+            for (j = 0; j < v[i]->len; j++)
+                AS_LIST(res)[off++] = at_idx(v[i], j);
+        } else {
+            AS_LIST(res)[off++] = clone_obj(v[i]);
+        }
+    }
+    res->len = total;
+
     return unify_list(&res);
 }
 
