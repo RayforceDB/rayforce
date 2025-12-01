@@ -109,7 +109,7 @@ profile: app
 
 # Generate test coverage report (requires lcov)
 coverage: CC = gcc
-coverage: CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 --coverage
+coverage: CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 --coverage -fprofile-update=atomic
 coverage: $(TESTS_OBJECTS) coverage-lib
 	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LDFLAGS)
 	lcov --directory . --zerocounters
@@ -120,7 +120,7 @@ coverage: $(TESTS_OBJECTS) coverage-lib
 	genhtml coverage.info --output-directory coverage_report
 	@echo "Coverage report generated in coverage_report/index.html"
 
-coverage-lib: CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 --coverage
+coverage-lib: CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 --coverage -fprofile-update=atomic
 coverage-lib: $(CORE_OBJECTS)
 	$(AR) rc lib$(TARGET).a $(CORE_OBJECTS)
 
