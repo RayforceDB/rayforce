@@ -33,31 +33,12 @@
 
 // Concatenate list of lists/vectors into single list/vector (flatten one level)
 static obj_p concat_parts(obj_p parts) {
-    i64_t i, n;
-    obj_p res, *v;
+    obj_p res;
 
     if (parts == NULL || parts->type != TYPE_LIST)
         return parts;
 
-    n = parts->len;
-    if (n == 0) {
-        drop_obj(parts);
-        return NULL_OBJ;
-    }
-    if (n == 1) {
-        res = clone_obj(AS_LIST(parts)[0]);
-        drop_obj(parts);
-        return res;
-    }
-
-    v = AS_LIST(parts);
-    res = ray_concat(v[0], v[1]);
-    for (i = 2; i < n; i++) {
-        obj_p tmp = ray_concat(res, v[i]);
-        drop_obj(res);
-        res = tmp;
-    }
-
+    res = ray_raze(parts);
     drop_obj(parts);
     return res;
 }
