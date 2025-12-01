@@ -47,6 +47,7 @@ TESTS_OBJECTS = tests/main.o
 BENCH_OBJECTS = bench/main.o
 TARGET = rayforce
 CFLAGS = $(RELEASE_CFLAGS)
+GIT_HASH := $(shell git rev-parse HEAD 2>/dev/null || echo "unknown")
 
 default: debug
 
@@ -69,7 +70,7 @@ bench: $(BENCH_OBJECTS) lib
 	BENCH=$(BENCH) ./$(TARGET).bench
 
 %.o: %.c
-	$(CC) -include core/def.h -c $^ $(CFLAGS) -o $@
+	$(CC) -include core/def.h -c $^ $(CFLAGS) -DGIT_HASH=\"$(GIT_HASH)\" -o $@
 
 lib: CFLAGS = $(RELEASE_CFLAGS)
 lib: $(CORE_OBJECTS)

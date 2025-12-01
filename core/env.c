@@ -264,6 +264,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "set-parted",          TYPE_VARY,     FN_NONE,                   ray_set_parted);
     REGISTER_FN(functions,  "get-parted",          TYPE_VARY,     FN_NONE,                   ray_get_parted);
     REGISTER_FN(functions,  "internals",           TYPE_VARY,     FN_NONE,                   ray_internals);
+    REGISTER_FN(functions,  "sysinfo",             TYPE_VARY,     FN_NONE,                   ray_sysinfo);
 }    
     
 nil_t init_typenames(obj_p typenames)    
@@ -315,7 +316,7 @@ nil_t init_typenames(obj_p typenames)
     REGISTER_TYPE(typenames,    TYPE_VARY,            "Vary");
     REGISTER_TYPE(typenames,    TYPE_LAMBDA,          "Lambda");
     REGISTER_TYPE(typenames,    TYPE_NULL,            "Null");
-    REGISTER_TYPE(typenames,    TYPE_ERR,           "Error");
+    REGISTER_TYPE(typenames,    TYPE_ERR,             "Error");
 }
 // clang-format on
 

@@ -57,17 +57,41 @@ i32_t cpu_cores() {
 }
 
 sys_info_t sys_info(i32_t threads) {
-    sys_info_t info;
+    sys_info_t info = {0};  // Initialize all fields to zero
 
     info.major_version = RAYFORCE_MAJOR_VERSION;
     info.minor_version = RAYFORCE_MINOR_VERSION;
-    strncpy(info.build_date, __DATE__, sizeof(info.build_date));
-    info.build_date[strcspn(info.build_date, "\n")] = 0;  // Remove the newline
+    strncpy(info.build_date, __DATE__, sizeof(info.build_date) - 1);
+    info.build_date[sizeof(info.build_date) - 1] = '\0';
+#ifdef GIT_HASH
+    strncpy(info.git_hash, GIT_HASH, sizeof(info.git_hash) - 1);
+    info.git_hash[sizeof(info.git_hash) - 1] = '\0';
+#else
+    strncpy(info.git_hash, "unknown", sizeof(info.git_hash) - 1);
+    info.git_hash[sizeof(info.git_hash) - 1] = '\0';
+#endif
     info.cores = cpu_cores();
     info.threads = (threads == 0 || threads > info.cores) ? info.cores : threads;
-    strncpy(info.cpu, "Unknown CPU", sizeof(info.cpu));
-    if (getcwd(info.cwd, sizeof(info.cwd)) == NULL)
+    strncpy(info.cpu, "Unknown CPU", sizeof(info.cpu) - 1);
+    info.cpu[sizeof(info.cpu) - 1] = '\0';
+
+#if defined(OS_WINDOWS)
+    strncpy(info.os, "Windows", sizeof(info.os) - 1);
+#elif defined(OS_LINUX)
+    strncpy(info.os, "Linux", sizeof(info.os) - 1);
+#elif defined(OS_MACOS)
+    strncpy(info.os, "macOS", sizeof(info.os) - 1);
+#elif defined(OS_WASM)
+    strncpy(info.os, "WASM", sizeof(info.os) - 1);
+#else
+    strncpy(info.os, "Unknown", sizeof(info.os) - 1);
+#endif
+    info.os[sizeof(info.os) - 1] = '\0';
+
+    if (getcwd(info.cwd, sizeof(info.cwd)) == NULL) {
         printf("Unable to get current working directory\n");
+        info.cwd[0] = '\0';
+    }
 
 #if defined(OS_WINDOWS)
     SYSTEM_INFO si;
@@ -83,30 +107,35 @@ sys_info_t sys_info(i32_t threads) {
     FILE *cpuFile = fopen("/proc/cpuinfo", "r");
     c8_t line[256];
 
-    while (fgets(line, sizeof(line), cpuFile)) {
-        if (strncmp(line, "model name", 10) == 0) {
-            strncpy(info.cpu, strchr(line, ':') + 2, sizeof(info.cpu) - 1);
-            info.cpu[strcspn(info.cpu, "\n")] = 0;  // Remove the newline
-            break;
+    if (cpuFile != NULL) {
+        while (fgets(line, sizeof(line), cpuFile)) {
+            if (strncmp(line, "model name", 10) == 0) {
+                strncpy(info.cpu, strchr(line, ':') + 2, sizeof(info.cpu) - 1);
+                info.cpu[sizeof(info.cpu) - 1] = '\0';  // Ensure null termination
+                info.cpu[strcspn(info.cpu, "\n")] = 0;  // Remove the newline
+                break;
+            }
         }
+        fclose(cpuFile);
     }
-
-    fclose(cpuFile);
 
     FILE *memFile = fopen("/proc/meminfo", "r");
-    while (fgets(line, sizeof(line), memFile)) {
-        if (strncmp(line, "MemTotal:", 9) == 0) {
-            i32_t totalKB;
-            sscanf(strchr(line, ':') + 1, "%d", &totalKB);
-            info.mem = totalKB / 1024;
-            break;
+    if (memFile != NULL) {
+        while (fgets(line, sizeof(line), memFile)) {
+            if (strncmp(line, "MemTotal:", 9) == 0) {
+                i32_t totalKB;
+                sscanf(strchr(line, ':') + 1, "%d", &totalKB);
+                info.mem = totalKB / 1024;
+                break;
+            }
         }
+        fclose(memFile);
     }
-    fclose(memFile);
 
 #elif defined(OS_MACOS)
     size_t len = sizeof(info.cpu);
     sysctlbyname("machdep.cpu.brand_string", &info.cpu, &len, NULL, 0);
+    info.cpu[sizeof(info.cpu) - 1] = '\0';  // Ensure null termination
 
     i64_t memSize;
     len = sizeof(memSize);
@@ -409,4 +438,35 @@ obj_p ray_system(obj_p cmd) {
     }
 
     return res;
+}
+
+obj_p ray_sysinfo(obj_p *x, i64_t n) {
+    UNUSED(x);
+    UNUSED(n);
+    obj_p keys, vals;
+    sys_info_t *info = &runtime_get()->sys_info;
+
+    keys = SYMBOL(9);
+    AS_SYMBOL(keys)[0] = symbols_intern("version", 7);
+    AS_SYMBOL(keys)[1] = symbols_intern("build", 5);
+    AS_SYMBOL(keys)[8] = symbols_intern("hash", 4);
+    AS_SYMBOL(keys)[2] = symbols_intern("cpu", 3);
+    AS_SYMBOL(keys)[3] = symbols_intern("os", 2);
+    AS_SYMBOL(keys)[4] = symbols_intern("cwd", 3);
+    AS_SYMBOL(keys)[5] = symbols_intern("mem", 3);
+    AS_SYMBOL(keys)[6] = symbols_intern("cores", 5);
+    AS_SYMBOL(keys)[7] = symbols_intern("threads", 7);
+
+    vals = LIST(9);
+    AS_LIST(vals)[0] = vn_c8("%d.%d", info->major_version, info->minor_version);
+    AS_LIST(vals)[1] = string_from_str(info->build_date, strlen(info->build_date));
+    AS_LIST(vals)[8] = string_from_str(info->git_hash, strlen(info->git_hash));
+    AS_LIST(vals)[2] = string_from_str(info->cpu, strlen(info->cpu));
+    AS_LIST(vals)[3] = string_from_str(info->os, strlen(info->os));
+    AS_LIST(vals)[4] = string_from_str(info->cwd, strlen(info->cwd));
+    AS_LIST(vals)[5] = i64(info->mem);
+    AS_LIST(vals)[6] = i64(info->cores);
+    AS_LIST(vals)[7] = i64(info->threads);
+
+    return dict(keys, vals);
 }

@@ -30,6 +30,7 @@ typedef struct sys_info_t {
     i32_t major_version;
     i32_t minor_version;
     c8_t build_date[256];
+    c8_t git_hash[64];
     c8_t cpu[256];
     c8_t os[256];
     c8_t cwd[1024];
@@ -47,5 +48,6 @@ obj_p sys_listen(i32_t argc, str_p argv[]);
 obj_p sys_exit(i32_t argc, str_p argv[]);
 obj_p ray_internal_command(obj_p cmd);
 obj_p ray_system(obj_p cmd);
+obj_p ray_sysinfo(obj_p *x, i64_t n);
 
 #endif  // SYS_H
