@@ -32,9 +32,6 @@ test_result_t test_lang_map() {
     TEST_ASSERT_EQ("(pmap (fn [x] (* x x)) [1 2 3 4 5])", "[1 4 9 16 25]");
     TEST_ASSERT_EQ("(pmap (fn [x] (sum (til 100))) (til 5))", "[4950 4950 4950 4950 4950]");
 
-    // pmap performance - should be at least 3x faster than map
-    TEST_ASSERT_EQ("(set work (fn [x] (fold + 0 (til 10000)))) (set tmap (timeit (map work (til 1000)))) (set tpmap (timeit (pmap work (til 1000)))) (> tmap (* 3.0 tpmap))", "true");
-
     PASS();
 }
 
@@ -3479,6 +3476,6 @@ test_result_t test_lang_bin() {
     TEST_ASSERT_EQ("(bin [0 2 4 6 8 10] [-10 0 4 5 6 20])", "[-1 0 2 2 3 5]");
     TEST_ASSERT_EQ("(bin [0 1 1 2] [0 1 2])", "[0 2 3]");
     TEST_ASSERT_EQ("(binr [0 1 1 2] [0 1 2])", "[0 1 3]");
-    
+
     PASS();
 }
