@@ -52,8 +52,11 @@ static obj_p concat_parts(obj_p parts) {
 
     v = AS_LIST(parts);
     res = clone_obj(v[0]);
-    for (i = 1; i < n; i++)
-        res = ray_concat(res, v[i]);
+    for (i = 1; i < n; i++) {
+        obj_p tmp = ray_concat(res, v[i]);
+        drop_obj(res);
+        res = tmp;
+    }
 
     drop_obj(parts);
     return res;

@@ -38,6 +38,7 @@ obj_p lambda(obj_p args, obj_p body, obj_p nfo) {
     obj->mmod = MMOD_INTERNAL;
     obj->type = TYPE_LAMBDA;
     obj->rc = 1;
+    obj->attrs = 0;
 
     f = (lambda_p)obj->raw;
     f->name = NULL_OBJ;
