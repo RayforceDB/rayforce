@@ -493,6 +493,42 @@ obj_p append_list(obj_p* obj, obj_p vals) {
     obj_p res;
 
     switch (MTYPE2((*obj)->type, vals->type)) {
+        case MTYPE2(TYPE_B8, TYPE_B8):
+            size1 = size_of(*obj) - sizeof(struct obj_t);
+            size2 = size_of(vals) - sizeof(struct obj_t);
+            res = resize_obj(obj, (*obj)->len + vals->len);
+            memcpy((*obj)->raw + size1, AS_B8(vals), size2);
+            return res;
+        case MTYPE2(TYPE_U8, TYPE_U8):
+            size1 = size_of(*obj) - sizeof(struct obj_t);
+            size2 = size_of(vals) - sizeof(struct obj_t);
+            res = resize_obj(obj, (*obj)->len + vals->len);
+            memcpy((*obj)->raw + size1, AS_U8(vals), size2);
+            return res;
+        case MTYPE2(TYPE_I16, TYPE_I16):
+            size1 = size_of(*obj) - sizeof(struct obj_t);
+            size2 = size_of(vals) - sizeof(struct obj_t);
+            res = resize_obj(obj, (*obj)->len + vals->len);
+            memcpy((*obj)->raw + size1, AS_I16(vals), size2);
+            return res;
+        case MTYPE2(TYPE_I32, TYPE_I32):
+            size1 = size_of(*obj) - sizeof(struct obj_t);
+            size2 = size_of(vals) - sizeof(struct obj_t);
+            res = resize_obj(obj, (*obj)->len + vals->len);
+            memcpy((*obj)->raw + size1, AS_I32(vals), size2);
+            return res;
+        case MTYPE2(TYPE_DATE, TYPE_DATE):
+            size1 = size_of(*obj) - sizeof(struct obj_t);
+            size2 = size_of(vals) - sizeof(struct obj_t);
+            res = resize_obj(obj, (*obj)->len + vals->len);
+            memcpy((*obj)->raw + size1, AS_DATE(vals), size2);
+            return res;
+        case MTYPE2(TYPE_TIME, TYPE_TIME):
+            size1 = size_of(*obj) - sizeof(struct obj_t);
+            size2 = size_of(vals) - sizeof(struct obj_t);
+            res = resize_obj(obj, (*obj)->len + vals->len);
+            memcpy((*obj)->raw + size1, AS_TIME(vals), size2);
+            return res;
         case MTYPE2(TYPE_I64, TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, TYPE_SYMBOL):
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
@@ -530,7 +566,7 @@ obj_p append_list(obj_p* obj, obj_p vals) {
                 return res;
             }
 
-            THROW(ERR_TYPE, "push_obj: invalid types: '%s, '%s", type_name((*obj)->type), type_name(vals->type));
+            THROW(ERR_TYPE, "append_list: invalid types: '%s, '%s", type_name((*obj)->type), type_name(vals->type));
     }
 }
 

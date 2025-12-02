@@ -375,7 +375,12 @@ insert:
                 for (i = 0; i < l; i++) {
                     col = cow_obj(AS_LIST(AS_LIST(obj)[1])[i]);
                     need_drop = (col != AS_LIST(AS_LIST(obj)[1])[i]);
-                    append_list(&col, AS_LIST(lst)[i]);
+                    res = append_list(&col, AS_LIST(lst)[i]);
+                    if (IS_ERR(res)) {
+                        if (need_drop)
+                            drop_obj(col);
+                        UNCOW_OBJ(obj, val, res);
+                    }
                     if (need_drop)
                         drop_obj(AS_LIST(AS_LIST(obj)[1])[i]);
 

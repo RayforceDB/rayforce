@@ -1,0 +1,5 @@
+(set options (read-csv [I64 Timestamp I64 B8] "../fortitudo/options.csv"))
+(insert 'options (dict [ID Maturity Strike Type] (list 313811 (timestamp 'local) 123 true)))
+(insert 'options (dict [ID Maturity Strike Type] (list 313812 (timestamp 'local) 124 true)))
+(insert 'options (dict [ID Maturity Strike Type] (list 313813 (timestamp 'local) 125 true)))
+(insert 'options (list [313814 313815 313816] (enlist (timestamp 'local) (timestamp 'local) (timestamp 'local)) [126 127 128] [true true true]))
