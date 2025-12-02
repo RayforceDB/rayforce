@@ -22,7 +22,6 @@
  */
 
 #include "guid.h"
-#include "heap.h"
 #include "ops.h"
 
 nil_t guid_generate(guid_t *g) {

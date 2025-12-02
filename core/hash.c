@@ -30,10 +30,7 @@
 #include "rayforce.h"
 #include "heap.h"
 #include "util.h"
-#include "eval.h"
 #include "error.h"
-#include "atomic.h"
-#include "pool.h"
 
 i64_t optimal_hash_table_size(i64_t len, f64_t load_factor) {
     i64_t size = (i64_t)CEILF64(len / load_factor);

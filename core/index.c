@@ -31,8 +31,7 @@
 #include "unary.h"
 #include "string.h"
 #include "pool.h"
-#include "runtime.h"  // for RAY_PAGE_SIZE
-#include "serde.h"    // for size_of_type
+#include "def.h"
 
 const i64_t MAX_RANGE = 1 << 20;
 

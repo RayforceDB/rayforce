@@ -23,7 +23,6 @@
 
 #include "freelist.h"
 #include "heap.h"
-#include "util.h"
 
 freelist_p freelist_create(i64_t size) {
     freelist_p freelist;

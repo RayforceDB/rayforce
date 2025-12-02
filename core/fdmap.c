@@ -24,8 +24,6 @@
 #include "fdmap.h"
 #include "fs.h"
 #include "mmap.h"
-#include "ops.h"
-#include "util.h"
 
 obj_p fdmap_create() {
     obj_p fdmap;

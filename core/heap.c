@@ -30,7 +30,6 @@
 #include "fs.h"
 #include "util.h"
 #include "string.h"
-#include "sys.h"
 #include "os.h"
 #include "log.h"
 

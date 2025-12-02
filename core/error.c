@@ -24,7 +24,6 @@
 #include <stdarg.h>
 #include "error.h"
 #include "heap.h"
-#include "util.h"
 #include "string.h"
 #include "log.h"
 

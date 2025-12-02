@@ -26,12 +26,9 @@
 #include "unary.h"
 #include "binary.h"
 #include "vary.h"
-#include "io.h"
 #include "lambda.h"
-#include "items.h"
 #include "error.h"
 #include "filter.h"
-#include "group.h"
 #include "string.h"
 #include "aggr.h"
 
@@ -292,7 +289,8 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                 case -TYPE_SYMBOL:
                     val = resolve(car->i64);
                     if (val == NULL)
-                        return unwrap(ray_error(ERR_EVAL, "undefined symbol: '%s", str_from_symbol(car->i64)), (i64_t)obj);
+                        return unwrap(ray_error(ERR_EVAL, "undefined symbol: '%s", str_from_symbol(car->i64)),
+                                      (i64_t)obj);
                     car = *val;
                     goto call;
 

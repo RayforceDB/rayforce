@@ -22,17 +22,6 @@
  */
 
 #include "group.h"
-#include "error.h"
-#include "ops.h"
-#include "util.h"
-#include "index.h"
-#include "aggr.h"
-#include "items.h"
-#include "unary.h"
-#include "eval.h"
-#include "string.h"
-#include "hash.h"
-#include "pool.h"
 
 obj_p group_map(obj_p val, obj_p index) {
     i64_t i, l;

@@ -22,12 +22,8 @@
  */
 
 #include "lambda.h"
-#include "string.h"
 #include "heap.h"
 #include "eval.h"
-#include "util.h"
-#include "group.h"
-#include "pool.h"
 #include "iter.h"
 
 obj_p lambda(obj_p args, obj_p body, obj_p nfo) {

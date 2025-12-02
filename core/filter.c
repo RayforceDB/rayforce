@@ -22,9 +22,6 @@
  */
 
 #include "filter.h"
-#include "error.h"
-#include "util.h"
-#include "ops.h"
 
 obj_p filter_map(obj_p val, obj_p index) {
     i64_t i, l;

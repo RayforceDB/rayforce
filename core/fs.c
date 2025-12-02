@@ -25,10 +25,6 @@
 #include <sys/stat.h>
 #include "fs.h"
 #include "string.h"
-#include "util.h"
-#include "heap.h"
-#include "guid.h"
-#include "ops.h"
 
 #if defined(OS_WINDOWS)
 

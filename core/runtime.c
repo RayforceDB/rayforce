@@ -25,7 +25,6 @@
 #include "util.h"
 #include "io.h"
 #include "string.h"
-#include "repl.h"
 #include "ipc.h"
 #include "dynlib.h"
 

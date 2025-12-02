@@ -23,9 +23,7 @@
 
 #include "ipc.h"
 #include "eval.h"
-#include "binary.h"
 #include "symbols.h"
-#include "error.h"
 #include "poll.h"
 #include "string.h"
 #include "util.h"
