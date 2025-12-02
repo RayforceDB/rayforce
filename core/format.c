@@ -953,23 +953,38 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
         // First check the column name
         l = SYMBOL_STRLEN(header[i]);
 
+        // Get the actual column and its length
+        column = AS_LIST(columns)[i];
+        i64_t col_len = ops_count(column);
+
         // Then traverse first n elements of column
         for (j = 0; j < table_height / 2; j++) {
-            column = AS_LIST(columns)[i];
             s = NULL_OBJ;
-            m = raw_fmt_into(&s, 0, 38, column, j);
+            if (j < col_len) {
+                m = raw_fmt_into(&s, 0, 38, column, j);
+            } else {
+                m = str_fmt_into(&s, 3, "NA");
+            }
             formatted_columns[i][j] = s;
             MAXN(l, m);
         }
 
         // Traverse the rest of the column
         for (; j < table_height; j++) {
-            column = AS_LIST(columns)[i];
             s = NULL_OBJ;
-            if (table_height == rows)
-                m = raw_fmt_into(&s, 0, 38, column, j);
-            else {
-                m = raw_fmt_into(&s, 0, 38, column, rows - table_height + j);
+            if (table_height == col_len) {
+                if (j < col_len) {
+                    m = raw_fmt_into(&s, 0, 38, column, j);
+                } else {
+                    m = str_fmt_into(&s, 3, "NA");
+                }
+            } else {
+                i64_t idx = col_len - table_height + j;
+                if (idx >= 0 && idx < col_len) {
+                    m = raw_fmt_into(&s, 0, 38, column, idx);
+                } else {
+                    m = str_fmt_into(&s, 3, "NA");
+                }
             }
             formatted_columns[i][j] = s;
             MAXN(l, m);

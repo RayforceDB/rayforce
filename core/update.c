@@ -318,7 +318,8 @@ insert:
                 for (i = 0; i < l; i++) {
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
                         res = ray_error(ERR_TYPE, "insert: expected '%s' as %lldth element in a values list, got '%s'",
-                                    type_name(-AS_LIST(AS_LIST(obj)[1])[i]->type), i, type_name(AS_LIST(lst)[i]->type));
+                                        type_name(-AS_LIST(AS_LIST(obj)[1])[i]->type), i,
+                                        type_name(AS_LIST(lst)[i]->type));
                         UNCOW_OBJ(obj, val, res);
                     }
                 }
@@ -327,7 +328,12 @@ insert:
                 for (i = 0; i < l; i++) {
                     col = cow_obj(AS_LIST(AS_LIST(obj)[1])[i]);
                     need_drop = (col != AS_LIST(AS_LIST(obj)[1])[i]);
-                    push_obj(&col, clone_obj(AS_LIST(lst)[i]));
+                    res = push_obj(&col, clone_obj(AS_LIST(lst)[i]));
+                    if (IS_ERR(res)) {
+                        if (need_drop)
+                            drop_obj(col);
+                        UNCOW_OBJ(obj, val, res);
+                    }
                     if (need_drop)
                         drop_obj(AS_LIST(AS_LIST(obj)[1])[i]);
                     AS_LIST(AS_LIST(obj)[1])[i] = col;
@@ -344,14 +350,15 @@ insert:
                 for (i = 0; i < l; i++) {
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
                         res = ray_error(ERR_TYPE, "insert: expected '%s' as %lldth element, got '%s'",
-                                    type_name(AS_LIST(AS_LIST(obj)[1])[i]->type), i, type_name(AS_LIST(lst)[i]->type));
+                                        type_name(AS_LIST(AS_LIST(obj)[1])[i]->type), i,
+                                        type_name(AS_LIST(lst)[i]->type));
                         UNCOW_OBJ(obj, val, res);
                     }
 
                     if (AS_LIST(lst)[i]->len != m) {
                         res = ray_error(ERR_LENGTH,
-                                    "insert: expected list of length %lld, as %lldth element in a values, got %lld",
-                                    AS_LIST(AS_LIST(obj)[1])[i]->len, i, n);
+                                        "insert: expected list of length %lld, as %lldth element in a values, got %lld",
+                                        AS_LIST(AS_LIST(obj)[1])[i]->len, i, n);
                         UNCOW_OBJ(obj, val, res);
                     }
                 }
@@ -373,7 +380,7 @@ insert:
         case TYPE_DICT:
             if (AS_LIST(lst)[0]->type != TYPE_SYMBOL) {
                 res = ray_error(ERR_TYPE, "insert: expected 'Symbol as 1st element in a dictionary, got '%s'",
-                            type_name(AS_LIST(lst)[0]->type));
+                                type_name(AS_LIST(lst)[0]->type));
                 UNCOW_OBJ(obj, val, res);
             }
             // Fall through
@@ -450,13 +457,13 @@ upsert:
                 if (!IS_VECTOR(AS_LIST(lst)[i])) {
                     drop_obj(obj);
                     return ray_error(ERR_TYPE, "upsert: expected vector as %lldth element of a list, got '%s'", i,
-                                 type_name(AS_LIST(lst)[i]->type));
+                                     type_name(AS_LIST(lst)[i]->type));
                 }
 
                 if (AS_LIST(lst)[i]->len != ll) {
                     drop_obj(obj);
                     return ray_error(ERR_LENGTH, "upsert: expected vector of length %lld, got %lld", ll,
-                                 AS_LIST(lst)[i]->len);
+                                     AS_LIST(lst)[i]->len);
                 }
             }
 
@@ -491,15 +498,15 @@ upsert:
                     drop_obj(idx);
                     drop_obj(obj);
                     return ray_error(ERR_TYPE, "upsert: expected '%s' as %lldth element, got '%s'",
-                                 type_name(AS_LIST(AS_LIST(obj)[1])[i]->type), i, type_name(AS_LIST(lst)[i]->type));
+                                     type_name(AS_LIST(AS_LIST(obj)[1])[i]->type), i, type_name(AS_LIST(lst)[i]->type));
                 }
 
                 if (AS_LIST(lst)[i]->len != m) {
                     drop_obj(idx);
                     drop_obj(obj);
                     return ray_error(ERR_LENGTH,
-                                 "upsert: expected list of length %lld, as %lldth element in a values, got %lld",
-                                 AS_LIST(AS_LIST(obj)[1])[i]->len, i, n);
+                                     "upsert: expected list of length %lld, as %lldth element in a values, got %lld",
+                                     AS_LIST(AS_LIST(obj)[1])[i]->len, i, n);
                 }
             }
 
@@ -536,7 +543,7 @@ upsert:
             if (AS_LIST(lst)[0]->type != TYPE_SYMBOL) {
                 drop_obj(obj);
                 return ray_error(ERR_TYPE, "upsert: expected 'Symbol as keys in a dictionary, got '%s'",
-                             type_name(AS_LIST(lst)[0]->type));
+                                 type_name(AS_LIST(lst)[0]->type));
             }
 
             l = AS_LIST(lst)[0]->len;
@@ -552,8 +559,8 @@ upsert:
                 if (AS_SYMBOL(AS_LIST(lst)[0])[i] != AS_SYMBOL(AS_LIST(obj)[0])[i]) {
                     drop_obj(obj);
                     return ray_error(ERR_TYPE, "upsert: inconsistent columns: '%s != '%s",
-                                 str_from_symbol(AS_SYMBOL(AS_LIST(lst)[0])[i]),
-                                 str_from_symbol(AS_SYMBOL(AS_LIST(obj)[0])[i]));
+                                     str_from_symbol(AS_SYMBOL(AS_LIST(lst)[0])[i]),
+                                     str_from_symbol(AS_SYMBOL(AS_LIST(obj)[0])[i]));
                 }
             }
 
@@ -572,8 +579,8 @@ upsert:
                 if (AS_SYMBOL(AS_LIST(lst)[0])[i] != AS_SYMBOL(AS_LIST(obj)[0])[i]) {
                     drop_obj(obj);
                     return ray_error(ERR_TYPE, "upsert: inconsistent columns: '%s != '%s",
-                                 str_from_symbol(AS_SYMBOL(AS_LIST(lst)[0])[i]),
-                                 str_from_symbol(AS_SYMBOL(AS_LIST(obj)[0])[i]));
+                                     str_from_symbol(AS_SYMBOL(AS_LIST(lst)[0])[i]),
+                                     str_from_symbol(AS_SYMBOL(AS_LIST(obj)[0])[i]));
                 }
             }
 
@@ -583,7 +590,7 @@ upsert:
         default:
             drop_obj(obj);
             return ray_error(ERR_TYPE, "upsert: unsupported type '%s' in values (forgot to use list?)",
-                         type_name(lst->type));
+                             type_name(lst->type));
     }
 }
 
@@ -636,7 +643,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                     v = at_idx(AS_LIST(vals)[i], m);
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[j], v)) {
                         res = ray_error(ERR_TYPE, "update: expected '%s as %lldth element, got '%s",
-                                    type_name(AS_LIST(AS_LIST(obj)[1])[j]->type), j, type_name(v->type));
+                                        type_name(AS_LIST(AS_LIST(obj)[1])[j]->type), j, type_name(v->type));
                         drop_obj(v);
                         drop_obj(tab);
                         drop_obj(keys);
@@ -647,11 +654,11 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                     }
 
                     if (!__suitable_lengths(AS_LIST(AS_LIST(obj)[1])[j], obj)) {
-                        res =
-                            ray_error(ERR_LENGTH,
-                                  "update: expected '%s of length %lld, as %lldth element in a values, got '%s of %lld",
-                                  type_name(AS_LIST(AS_LIST(obj)[1])[j]->type), AS_LIST(AS_LIST(obj)[1])[j]->len, j,
-                                  type_name(v->type), ops_count(v));
+                        res = ray_error(
+                            ERR_LENGTH,
+                            "update: expected '%s of length %lld, as %lldth element in a values, got '%s of %lld",
+                            type_name(AS_LIST(AS_LIST(obj)[1])[j]->type), AS_LIST(AS_LIST(obj)[1])[j]->len, j,
+                            type_name(v->type), ops_count(v));
                         drop_obj(v);
                         drop_obj(tab);
                         drop_obj(keys);
@@ -724,7 +731,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
             else {
                 if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[j], AS_LIST(vals)[i])) {
                     res = ray_error(ERR_TYPE, "update: expected '%s as %lldth element, got '%s",
-                                type_name(AS_LIST(AS_LIST(obj)[1])[j]->type), j, type_name(AS_LIST(vals)[i]->type));
+                                    type_name(AS_LIST(AS_LIST(obj)[1])[j]->type), j, type_name(AS_LIST(vals)[i]->type));
                     drop_obj(tab);
                     drop_obj(keys);
                     drop_obj(vals);
@@ -733,10 +740,11 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                 }
 
                 if (!__suitable_lengths(AS_LIST(AS_LIST(obj)[1])[j], AS_LIST(vals)[i])) {
-                    res = ray_error(ERR_LENGTH,
-                                "update: expected '%s of length %lld, as %lldth element in a values, got '%s of %lld",
-                                type_name(AS_LIST(AS_LIST(obj)[1])[j]->type), AS_LIST(AS_LIST(obj)[1])[j]->len, j,
-                                type_name(AS_LIST(vals)[i]->type), ops_count(AS_LIST(vals)[i]));
+                    res =
+                        ray_error(ERR_LENGTH,
+                                  "update: expected '%s of length %lld, as %lldth element in a values, got '%s of %lld",
+                                  type_name(AS_LIST(AS_LIST(obj)[1])[j]->type), AS_LIST(AS_LIST(obj)[1])[j]->len, j,
+                                  type_name(AS_LIST(vals)[i]->type), ops_count(AS_LIST(vals)[i]));
                     drop_obj(tab);
                     drop_obj(keys);
                     drop_obj(vals);

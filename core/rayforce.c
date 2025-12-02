@@ -437,6 +437,30 @@ obj_p push_obj(obj_p* obj, obj_p val) {
     }
 
     switch (MTYPE2((*obj)->type, val->type)) {
+        case MTYPE2(TYPE_B8, -TYPE_B8):
+            res = push_raw(obj, &val->b8);
+            drop_obj(val);
+            return res;
+        case MTYPE2(TYPE_U8, -TYPE_U8):
+            res = push_raw(obj, &val->u8);
+            drop_obj(val);
+            return res;
+        case MTYPE2(TYPE_I16, -TYPE_I16):
+            res = push_raw(obj, &val->i16);
+            drop_obj(val);
+            return res;
+        case MTYPE2(TYPE_I32, -TYPE_I32):
+            res = push_raw(obj, &val->i32);
+            drop_obj(val);
+            return res;
+        case MTYPE2(TYPE_DATE, -TYPE_DATE):
+            res = push_raw(obj, &val->i32);
+            drop_obj(val);
+            return res;
+        case MTYPE2(TYPE_TIME, -TYPE_TIME):
+            res = push_raw(obj, &val->i32);
+            drop_obj(val);
+            return res;
         case MTYPE2(TYPE_I64, -TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, -TYPE_SYMBOL):
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
@@ -459,6 +483,7 @@ obj_p push_obj(obj_p* obj, obj_p val) {
             if ((*obj)->type == TYPE_LIST)
                 return push_raw(obj, &val);
 
+            drop_obj(val);
             THROW(ERR_TYPE, "push_obj: invalid types: '%s, '%s", type_name((*obj)->type), type_name(val->type));
     }
 }
