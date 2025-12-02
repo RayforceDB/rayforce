@@ -36,22 +36,29 @@
 #include "aggr.h"
 #include "compose.h"
 
-#define UNCOW_OBJ(o, v, r)            \
-    {                                 \
-        if ((v == NULL) || (*v != o)) \
-            drop_obj(o);              \
-        return r;                     \
+#define UNCOW_OBJ(o, v, orig, r) \
+    {                            \
+        if ((v == NULL)) {       \
+            if (o != orig)       \
+                drop_obj(o);     \
+        } else if (*v != o)      \
+            drop_obj(o);         \
+        return r;                \
     };
 
-obj_p __fetch(obj_p obj, obj_p **val) {
+obj_p __fetch(obj_p obj, obj_p **val, obj_p *original) {
     if (obj->type == -TYPE_SYMBOL) {
         *val = resolve(obj->i64);
         if (*val == NULL)
             THROW(ERR_NOT_FOUND, "fetch: symbol not found");
 
+        *original = **val;
         obj = cow_obj(**val);
-    } else
+    } else {
+        *val = NULL;
+        *original = obj;
         obj = cow_obj(obj);
+    }
 
     return obj;
 }
@@ -293,20 +300,20 @@ obj_p ray_modify(obj_p *x, i64_t n) {
  */
 obj_p ray_insert(obj_p *x, i64_t n) {
     i64_t i, m, l;
-    obj_p lst, col, *val = NULL, obj, res;
+    obj_p lst, col, *val = NULL, obj, res, original;
     b8_t need_drop;
 
     if (n != 2)
         THROW(ERR_LENGTH, "insert: expected 2 arguments, got %lld", n);
 
-    obj = __fetch(x[0], &val);
+    obj = __fetch(x[0], &val, &original);
 
     if (IS_ERR(obj))
         return obj;
 
     if (obj->type != TYPE_TABLE) {
         res = ray_error(ERR_TYPE, "insert: expected 'Table as 1st argument, got '%s", type_name(obj->type));
-        UNCOW_OBJ(obj, val, res);
+        UNCOW_OBJ(obj, val, original, res);
     }
 
     // Check integrity of the table with the new object
@@ -317,7 +324,7 @@ insert:
             l = lst->len;
             if (l != AS_LIST(obj)[0]->len) {
                 res = ray_error(ERR_LENGTH, "insert: expected list of length %lld, got %lld", AS_LIST(obj)[0]->len, l);
-                UNCOW_OBJ(obj, val, res);
+                UNCOW_OBJ(obj, val, original, res);
             }
 
             // There is one record to be inserted
@@ -328,7 +335,7 @@ insert:
                         res = ray_error(ERR_TYPE, "insert: expected '%s' as %lldth element in a values list, got '%s'",
                                         type_name(-AS_LIST(AS_LIST(obj)[1])[i]->type), i,
                                         type_name(AS_LIST(lst)[i]->type));
-                        UNCOW_OBJ(obj, val, res);
+                        UNCOW_OBJ(obj, val, original, res);
                     }
                 }
 
@@ -340,7 +347,7 @@ insert:
                     if (IS_ERR(res)) {
                         if (need_drop)
                             drop_obj(col);
-                        UNCOW_OBJ(obj, val, res);
+                        UNCOW_OBJ(obj, val, original, res);
                     }
                     if (need_drop)
                         drop_obj(AS_LIST(AS_LIST(obj)[1])[i]);
@@ -351,7 +358,7 @@ insert:
                 m = AS_LIST(lst)[0]->len;
                 if (m == 0) {
                     res = ray_error(ERR_LENGTH, "insert: expected non-empty list of records");
-                    UNCOW_OBJ(obj, val, res);
+                    UNCOW_OBJ(obj, val, original, res);
                 }
 
                 // Check all the elements of the list
@@ -360,14 +367,14 @@ insert:
                         res = ray_error(ERR_TYPE, "insert: expected '%s' as %lldth element, got '%s'",
                                         type_name(AS_LIST(AS_LIST(obj)[1])[i]->type), i,
                                         type_name(AS_LIST(lst)[i]->type));
-                        UNCOW_OBJ(obj, val, res);
+                        UNCOW_OBJ(obj, val, original, res);
                     }
 
                     if (AS_LIST(lst)[i]->len != m) {
                         res = ray_error(ERR_LENGTH,
                                         "insert: expected list of length %lld, as %lldth element in a values, got %lld",
                                         AS_LIST(AS_LIST(obj)[1])[i]->len, i, n);
-                        UNCOW_OBJ(obj, val, res);
+                        UNCOW_OBJ(obj, val, original, res);
                     }
                 }
 
@@ -379,7 +386,7 @@ insert:
                     if (IS_ERR(res)) {
                         if (need_drop)
                             drop_obj(col);
-                        UNCOW_OBJ(obj, val, res);
+                        UNCOW_OBJ(obj, val, original, res);
                     }
                     if (need_drop)
                         drop_obj(AS_LIST(AS_LIST(obj)[1])[i]);
@@ -394,7 +401,7 @@ insert:
             if (AS_LIST(lst)[0]->type != TYPE_SYMBOL) {
                 res = ray_error(ERR_TYPE, "insert: expected 'Symbol as 1st element in a dictionary, got '%s'",
                                 type_name(AS_LIST(lst)[0]->type));
-                UNCOW_OBJ(obj, val, res);
+                UNCOW_OBJ(obj, val, original, res);
             }
             // Fall through
         case TYPE_TABLE:
@@ -402,13 +409,13 @@ insert:
             l = AS_LIST(lst)[0]->len;
             if (l != AS_LIST(obj)[0]->len) {
                 res = ray_error(ERR_LENGTH, "insert: expected 'Table with the same number of columns");
-                UNCOW_OBJ(obj, val, res);
+                UNCOW_OBJ(obj, val, original, res);
             }
 
             for (i = 0; i < l; i++) {
                 if (AS_SYMBOL(AS_LIST(lst)[0])[i] != AS_SYMBOL(AS_LIST(obj)[0])[i]) {
                     res = ray_error(ERR_TYPE, "insert: expected 'Table with the same columns");
-                    UNCOW_OBJ(obj, val, res);
+                    UNCOW_OBJ(obj, val, original, res);
                 }
             }
 
@@ -417,7 +424,7 @@ insert:
 
         default:
             res = ray_error(ERR_TYPE, "insert: unsupported type '%s' as 2nd argument", type_name(lst->type));
-            UNCOW_OBJ(obj, val, res);
+            UNCOW_OBJ(obj, val, original, res);
     }
 
     return __commit(x[0], obj, val);
@@ -429,7 +436,7 @@ insert:
 obj_p ray_upsert(obj_p *x, i64_t n) {
     i64_t i, j, m, p, l, ll, keys;
     i64_t row, *rows;
-    obj_p obj, k1, k2, idx, col, lst, *val = NULL, v;
+    obj_p obj, k1, k2, idx, col, lst, *val = NULL, v, original;
 
     if (n != 3)
         THROW(ERR_LENGTH, "upsert: expected 3 arguments, got %lld", n);
@@ -441,7 +448,7 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
     if (keys < 1)
         THROW(ERR_LENGTH, "upsert: expected positive number of keys > 0, got %lld", keys);
 
-    obj = __fetch(x[0], &val);
+    obj = __fetch(x[0], &val, &original);
     if (IS_ERR(obj))
         return obj;
 
@@ -610,7 +617,7 @@ upsert:
 obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p groupby) {
     i64_t i, l, m, n;
     i64_t j, *ids;
-    obj_p prm, obj, *val = NULL, gids, v, col, index, res;
+    obj_p prm, obj, *val = NULL, gids, v, col, index, res, original;
 
     // No filters nor groupings
     if (filters == NULL_OBJ && groupby == NULL_OBJ) {
@@ -622,7 +629,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
     }
     // Groupings
     else if (groupby != NULL_OBJ) {
-        obj = __fetch(tab, &val);
+        obj = __fetch(tab, &val, &original);
         if (IS_ERR(obj)) {
             drop_obj(tab);
             drop_obj(keys);
@@ -663,7 +670,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                         drop_obj(vals);
                         drop_obj(filters);
                         drop_obj(gids);
-                        UNCOW_OBJ(obj, val, res);
+                        UNCOW_OBJ(obj, val, original, res);
                     }
 
                     if (!__suitable_lengths(AS_LIST(AS_LIST(obj)[1])[j], obj)) {
@@ -678,7 +685,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                         drop_obj(vals);
                         drop_obj(filters);
                         drop_obj(gids);
-                        UNCOW_OBJ(obj, val, res);
+                        UNCOW_OBJ(obj, val, original, res);
                     }
 
                     drop_obj(v);
@@ -719,7 +726,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
     }
     // Filters
     else {
-        obj = __fetch(tab, &val);
+        obj = __fetch(tab, &val, &original);
         if (IS_ERR(obj)) {
             drop_obj(tab);
             drop_obj(keys);
@@ -749,7 +756,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                     drop_obj(keys);
                     drop_obj(vals);
                     drop_obj(filters);
-                    UNCOW_OBJ(obj, val, res);
+                    UNCOW_OBJ(obj, val, original, res);
                 }
 
                 // When using filters, allow:
@@ -768,7 +775,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                     drop_obj(keys);
                     drop_obj(vals);
                     drop_obj(filters);
-                    UNCOW_OBJ(obj, val, res);
+                    UNCOW_OBJ(obj, val, original, res);
                 }
             }
         }
