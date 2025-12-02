@@ -84,11 +84,14 @@ obj_p ray_hopen(obj_p *x, i64_t n) {
     // Otherwise, open file
     path = cstring_from_obj(x[0]);
     fd = fs_fopen(AS_C8(path), ATTR_RDWR | ATTR_CREAT | ATTR_APPEND);
+
+    if (fd == -1) {
+        err = sys_error(ERROR_TYPE_SYS, AS_C8(path));
+        drop_obj(path);
+        return err;
+    }
+
     drop_obj(path);
-
-    if (fd == -1)
-        return sys_error(ERROR_TYPE_SYS, AS_C8(path));
-
     return i32((i32_t)fd);
 }
 
