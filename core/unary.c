@@ -54,7 +54,7 @@ obj_p ray_get(obj_p x) {
         case -TYPE_SYMBOL:
             sym = resolve(x->i64);
             if (sym == NULL)
-                return error(ERR_NOT_FOUND, "get: symbol '%s' not found", str_from_symbol(x->i64));
+                return ray_error(ERR_NOT_FOUND, "get: symbol '%s' not found", str_from_symbol(x->i64));
 
             return clone_obj(*sym);
         case TYPE_C8:
@@ -73,7 +73,7 @@ obj_p ray_get(obj_p x) {
             size = fs_fsize(fd);
 
             if (size < ISIZEOF(struct obj_t)) {
-                res = error(ERR_LENGTH, "get: file '%s': invalid size: %d", AS_C8(path), size);
+                res = ray_error(ERR_LENGTH, "get: file '%s': invalid size: %d", AS_C8(path), size);
                 drop_obj(path);
                 fs_fclose(fd);
                 return res;
@@ -98,7 +98,7 @@ obj_p ray_get(obj_p x) {
                 fdmap_add_fd(&fdmap, res, fd, size);
                 runtime_fdmap_push(runtime_get(), res, fdmap);
             } else {
-                res = error(ERR_TYPE, "get: corrupted file: '%.*s", (i32_t)path->len, AS_C8(path));
+                res = ray_error(ERR_TYPE, "get: corrupted file: '%.*s", (i32_t)path->len, AS_C8(path));
                 drop_obj(path);
                 return res;
             }
@@ -130,7 +130,7 @@ obj_p ray_get(obj_p x) {
 
 obj_p ray_resolve(obj_p x) {
     if (x->type != -TYPE_SYMBOL)
-        return error(ERR_TYPE, "resolve: expected symbol, got: '%s'", type_name(x->type));
+        return ray_error(ERR_TYPE, "resolve: expected symbol, got: '%s'", type_name(x->type));
 
     obj_p *res = resolve(x->i64);
 
@@ -139,7 +139,7 @@ obj_p ray_resolve(obj_p x) {
 
 obj_p ray_unicode_format(obj_p x) {
     if (x->type != -TYPE_B8)
-        return error(ERR_TYPE, "graphic_format: expected bool, got: '%s'", type_name(x->type));
+        return ray_error(ERR_TYPE, "graphic_format: expected bool, got: '%s'", type_name(x->type));
 
     format_set_use_unicode(x->b8);
 

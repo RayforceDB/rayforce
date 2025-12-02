@@ -251,7 +251,7 @@ obj_p ray_table(obj_p x, obj_p y) {
             case TYPE_GUID:
                 j = AS_LIST(y)[i]->len;
                 if (cl != 0 && j != cl)
-                    return error(ERR_LENGTH, "table: values must be of the same length");
+                    return ray_error(ERR_LENGTH, "table: values must be of the same length");
 
                 cl = j;
                 break;
@@ -259,17 +259,17 @@ obj_p ray_table(obj_p x, obj_p y) {
                 synergy = B8_FALSE;
                 j = AS_LIST(AS_LIST(y)[i])[1]->len;
                 if (cl != 0 && j != cl)
-                    return error(ERR_LENGTH, "table: values must be of the same length");
+                    return ray_error(ERR_LENGTH, "table: values must be of the same length");
 
                 cl = j;
                 break;
             case TYPE_MAPCOMMON:
                 j = AS_LIST(AS_LIST(y)[i])[0]->len;
                 if (cl != 0 && j != cl)
-                    return error(ERR_LENGTH, "table: values must be of the same length");
+                    return ray_error(ERR_LENGTH, "table: values must be of the same length");
                 break;
             default:
-                return error(ERR_TYPE, "table: unsupported type: '%s' in a values list",
+                return ray_error(ERR_TYPE, "table: unsupported type: '%s' in a values list",
                              type_name(AS_LIST(y)[i]->type));
         }
     }

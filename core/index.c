@@ -2119,7 +2119,7 @@ obj_p index_group_list(obj_p obj, obj_p filter) {
     __index_list_ctx_t ctx;
 
     if (ops_count(obj) == 0)
-        return error(ERR_LENGTH, "group index list: empty source");
+        return ray_error(ERR_LENGTH, "group index list: empty source");
 
     if (ops_count(obj) == 1)
         return index_group(AS_LIST(obj)[0], filter);
