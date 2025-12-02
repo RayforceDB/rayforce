@@ -616,7 +616,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
             if (size == -1) {
                 drop_obj(types);
                 fs_fclose(fd);
-                res = error(ERR_LENGTH, "get: file '%s': invalid size: %d", AS_C8(path), size);
+                res = ray_error(ERR_LENGTH, "get: file '%s': invalid size: %d", AS_C8(path), size);
                 drop_obj(path);
                 return res;
             }
@@ -641,7 +641,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                 drop_obj(types);
                 fs_fclose(fd);
                 mmap_free(buf, size);
-                res = error(ERR_LENGTH, "csv: file '%s': invalid size: %d", AS_C8(path), size);
+                res = ray_error(ERR_LENGTH, "csv: file '%s': invalid size: %d", AS_C8(path), size);
                 drop_obj(path);
                 return res;
             }
@@ -687,7 +687,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                 drop_obj(names);
                 fs_fclose(fd);
                 mmap_free(buf, size);
-                res = error(ERR_LENGTH, "csv: file '%s': invalid header (number of fields is less then csv contains)",
+                res = ray_error(ERR_LENGTH, "csv: file '%s': invalid header (number of fields is less then csv contains)",
                             AS_C8(path));
                 drop_obj(path);
                 return res;

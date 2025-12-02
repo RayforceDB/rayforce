@@ -110,11 +110,11 @@ obj_p raykx_listen(obj_p x) {
     port = x->i64;
 
     if (poll == NULL)
-        return error(ERR_IO, "raykx_listen: poll is NULL");
+        return ray_error(ERR_IO, "raykx_listen: poll is NULL");
 
     fd = sock_listen(port);
     if (fd == -1)
-        return error(ERR_IO, "raykx_listen: failed to listen on port");
+        return ray_error(ERR_IO, "raykx_listen: failed to listen on port");
 
     registry.fd = fd;
     registry.type = SELECTOR_TYPE_SOCKET;
@@ -146,7 +146,7 @@ obj_p raykx_hopen(obj_p addr) {
 
     // Parse address string into sock_addr_t
     if (sock_addr_from_str(AS_C8(addr), addr->len, &sock_addr) == -1) {
-        return error(ERR_IO, "raykx_open: invalid address format");
+        return ray_error(ERR_IO, "raykx_open: invalid address format");
     }
 
     // Open socket connection
@@ -154,15 +154,15 @@ obj_p raykx_hopen(obj_p addr) {
     LOG_DEBUG("Connection opened on fd %lld", fd);
 
     if (fd == -1)
-        return error(ERR_IO, "raykx_open: failed to open connection");
+        return ray_error(ERR_IO, "raykx_open: failed to open connection");
 
     // Send handshake
     if (sock_send(fd, handshake, 2) == -1)
-        return error(ERR_IO, "raykx_open: failed to send handshake");
+        return ray_error(ERR_IO, "raykx_open: failed to send handshake");
 
     // Receive handshake response
     if (sock_recv(fd, handshake, 1) == -1)
-        return error(ERR_IO, "raykx_open: failed to receive handshake");
+        return ray_error(ERR_IO, "raykx_open: failed to receive handshake");
 
     LOG_DEBUG("Handshake response: %d", handshake[0]);
 

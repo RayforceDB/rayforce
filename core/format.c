@@ -66,7 +66,7 @@ static b8_t __USE_UNICODE = B8_TRUE;
 
 obj_p ray_set_fpr(obj_p x) {
     if (x->type != -TYPE_I64)
-        return error(ERR_TYPE, "ray_set_fpr: expected 'i64, got %s", type_name(x->type));
+        return ray_error(ERR_TYPE, "ray_set_fpr: expected 'i64, got %s", type_name(x->type));
 
     if (x->i64 < 0)
         F64_PRECISION = DEFAULT_F64_PRECISION;

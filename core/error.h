@@ -31,6 +31,7 @@
 
 #define AS_ERROR(obj) ((ray_error_p)(AS_C8(obj)))
 
+
 /*
  * Create a new error object and return it
  */
@@ -63,5 +64,6 @@ typedef struct ray_error_t {
 
 obj_p error_obj(i8_t code, obj_p msg);
 obj_p error_str(i8_t code, lit_p msg);
+obj_p ray_error(i8_t code, lit_p fmt, ...);
 
 #endif  // ERROR_H

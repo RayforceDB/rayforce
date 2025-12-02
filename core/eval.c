@@ -292,12 +292,12 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                 case -TYPE_SYMBOL:
                     val = resolve(car->i64);
                     if (val == NULL)
-                        return unwrap(error(ERR_EVAL, "undefined symbol: '%s", str_from_symbol(car->i64)), (i64_t)obj);
+                        return unwrap(ray_error(ERR_EVAL, "undefined symbol: '%s", str_from_symbol(car->i64)), (i64_t)obj);
                     car = *val;
                     goto call;
 
                 default:
-                    return unwrap(error(ERR_EVAL, "'%s is not a function", type_name(car->type)), (i64_t)args[-1]);
+                    return unwrap(ray_error(ERR_EVAL, "'%s is not a function", type_name(car->type)), (i64_t)args[-1]);
             }
         case -TYPE_SYMBOL:
             if (obj->attrs & ATTR_QUOTED)
@@ -305,7 +305,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
 
             val = resolve(obj->i64);
             if (val == NULL)
-                return unwrap(error(ERR_EVAL, "undefined symbol: '%s", str_from_symbol(obj->i64)), (i64_t)obj);
+                return unwrap(ray_error(ERR_EVAL, "undefined symbol: '%s", str_from_symbol(obj->i64)), (i64_t)obj);
             return clone_obj(*val);
         default:
             return clone_obj(obj);

@@ -97,7 +97,7 @@ obj_p remap_group(obj_p *gvals, obj_p cols, obj_p gkeys, obj_p gcols, query_ctx_
 
             return res;
         default:
-            return error(ERR_TYPE, "grouping key mapping(s) must be a symbol(s)");
+            return ray_error(ERR_TYPE, "grouping key mapping(s) must be a symbol(s)");
     }
 }
 
@@ -123,7 +123,7 @@ obj_p get_gkeys(obj_p cols, obj_p obj) {
         case TYPE_DICT:
             x = AS_LIST(obj)[0];
             if (x->type != TYPE_SYMBOL)
-                return error(ERR_TYPE, "grouping key(s) must be a symbol(s)");
+                return ray_error(ERR_TYPE, "grouping key(s) must be a symbol(s)");
 
             if (x->len == 1)
                 return at_idx(AS_LIST(obj)[0], 0);

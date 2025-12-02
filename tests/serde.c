@@ -26,7 +26,7 @@ test_result_t test_serde_different_sizes() {
     i32_t size, size1;
     obj_p x;
 
-    x = error(5, "myerror");
+    x = ray_error(5, "myerror");
 
     size = size_obj(x);
     size1 = ser_raw(buf, x);

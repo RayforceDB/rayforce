@@ -228,7 +228,7 @@ extern obj_p cow_obj(obj_p obj);    // copy-on-write
 extern u32_t rc_obj(obj_p obj);     // get refcount
 
 // Errors
-extern obj_p error(i8_t code, lit_p fmt, ...);  // Creates an error object
+extern obj_p ray_error(i8_t code, lit_p fmt, ...);  // Creates an error object
 
 // Destructors
 extern nil_t drop_obj(obj_p obj);  // Free an object

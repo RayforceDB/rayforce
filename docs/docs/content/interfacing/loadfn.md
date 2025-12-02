@@ -14,7 +14,7 @@ obj_p myfn(obj_p a, obj_p b) {
         return null(0);
 
     if (a->type != -TYPE_I64 || b->type != -TYPE_I64)
-        return error(ERR_TYPE, "Expected two i64 arguments, found: '%s, '%s", type_name(a->type), type_name(b->type));
+        return ray_error(ERR_TYPE, "Expected two i64 arguments, found: '%s, '%s", type_name(a->type), type_name(b->type));
 
     return i64(a->i64 + b->i64);
 }

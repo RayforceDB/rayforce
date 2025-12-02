@@ -1054,7 +1054,7 @@ obj_p at_ids(obj_p obj, i64_t ids[], i64_t len) {
                 return v;
 
             if (v->type != TYPE_SYMBOL)
-                return error(ERR_TYPE, "enum: '%s' is not a 'Symbol'", type_name(v->type));
+                return ray_error(ERR_TYPE, "enum: '%s' is not a 'Symbol'", type_name(v->type));
 
             res = SYMBOL(len);
             for (i = 0; i < len; i++)
@@ -1132,7 +1132,7 @@ obj_p at_ids(obj_p obj, i64_t ids[], i64_t len) {
                 return v;
 
             if (v->type != TYPE_SYMBOL)
-                return error(ERR_TYPE, "enum: '%s' is not a 'Symbol'", type_name(v->type));
+                return ray_error(ERR_TYPE, "enum: '%s' is not a 'Symbol'", type_name(v->type));
 
             res = SYMBOL(len);
             n = AS_LIST(obj)[0]->len;
