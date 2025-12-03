@@ -1,0 +1,70 @@
+;; Example: insert operations
+
+;; Create a test table
+(set t (table [ID Name Value] (list [1 2 3] ['Alice 'Bob 'Charlie] [10.0 20.0 30.0])))
+(show t)
+
+;; Test 1: Insert single record (list of atoms)
+(show "Test 1: Insert single record (list of atoms)")
+(set t (insert t (list 4 'David 40.0)))
+(show t)
+
+;; Test 2: Insert multiple records (list of vectors)
+(show "Test 2: Insert multiple records (list of vectors)")
+(set t (insert t (list [5 6] ['Eve 'Frank] [50.0 60.0])))
+(show t)
+
+;; Test 3: Insert via dict - single record
+(show "Test 3: Insert via dict (single record)")
+(set t (insert t (dict [ID Name Value] (list 7 'Grace 70.0))))
+(show t)
+
+;; Test 4: Insert via dict - multiple records
+(show "Test 4: Insert via dict (multiple records)")
+(set t (insert t (dict [ID Name Value] (list [8 9] ['Henry 'Ivy] [80.0 90.0]))))
+(show t)
+
+;; Test 5: Insert via table
+(show "Test 5: Insert via table")
+(set t (insert t (table [ID Name Value] (list [10 11] ['Jack 'Kate] [100.0 110.0]))))
+(show t)
+
+;; ========== FLEXIBLE COLUMN ORDERING ==========
+
+;; Test 6: Insert with columns in different order
+(show "Test 6: Insert with columns in different order")
+(set t (insert t (dict [Value Name ID] (list 120.0 'Leo 12))))
+(show t)
+
+;; Test 7: Insert with reversed column order
+(show "Test 7: Insert with reversed column order")
+(set t (insert t (dict [Value ID Name] (list 130.0 13 'Mike))))
+(show t)
+
+;; Test 8: Insert partial columns (missing columns get null)
+(show "Test 8: Insert partial columns (missing get null)")
+(set t (insert t (dict [ID Name] (list 14 'Nancy))))
+(show t)
+
+;; Test 9: Insert partial columns in different order
+(show "Test 9: Insert partial columns (different order)")
+(set t (insert t (dict [Name ID] (list 'Oscar 15))))
+(show t)
+
+;; Test 10: Insert multiple records with different column order
+(show "Test 10: Insert multiple with different column order")
+(set t (insert t (dict [Name Value ID] (list ['Pete 'Quinn] [160.0 170.0] [16 17]))))
+(show t)
+
+;; Test 11: Insert via table with different column order
+(show "Test 11: Insert via table (different column order)")
+(set t (insert t (table [Value ID Name] (list [180.0 190.0] [18 19] ['Rose 'Sam]))))
+(show t)
+
+;; Test 12: In-place insert with reordered columns
+(show "Test 12: In-place insert with reordered columns")
+(insert 't (dict [Value Name ID] (list 200.0 'Tom 20)))
+(show t)
+
+(show "All insert tests completed!")
+(exit 0)

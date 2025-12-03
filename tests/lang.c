@@ -2920,6 +2920,88 @@ test_result_t test_lang_update() {
         "t",
         "(table [Group ID Value Total] (list [a a b b] [1 2 3 4] [10.0 20.0 30.0 40.0] [30.0 30.0 70.0 70.0]))");
 
+    // ========== FLEXIBLE COLUMN ORDERING TESTS ==========
+
+    // Test 25: Insert via dict with columns in different order (single record)
+    TEST_ASSERT_EQ(
+        "(set t (table [a b c] (list [1 2] [10 20] [x y])))"
+        "(insert t (dict [c a b] (list 'z 3 30)))",
+        "(table [a b c] (list [1 2 3] [10 20 30] [x y z]))");
+
+    // Test 26: Insert via dict with columns in reversed order (in-place)
+    TEST_ASSERT_EQ(
+        "(set t (table [a b c] (list [1 2] [10 20] [x y])))"
+        "(insert 't (dict [c b a] (list 'z 30 3)))"
+        "t",
+        "(table [a b c] (list [1 2 3] [10 20 30] [x y z]))");
+
+    // Test 27: Insert via dict with partial columns (missing column gets null)
+    TEST_ASSERT_EQ(
+        "(set t (table [a b c] (list [1 2] [10 20] [x y])))"
+        "(insert t (dict [c b] (list 'z 30)))",
+        "(table [a b c] (list [1 2 0Nl] [10 20 30] [x y z]))");
+
+    // Test 28: Insert via dict with partial columns in different order
+    TEST_ASSERT_EQ(
+        "(set t (table [a b c] (list [1 2] [10 20] [x y])))"
+        "(insert t (dict [b a] (list 30 3)))",
+        "(table [a b c] (list [1 2 3] [10 20 30] [x y 0Ns]))");
+
+    // Test 29: Insert multiple records via dict with different column order
+    TEST_ASSERT_EQ(
+        "(set t (table [a b c] (list [1] [10] [x])))"
+        "(insert t (dict [c b a] (list [y z] [20 30] [2 3])))",
+        "(table [a b c] (list [1 2 3] [10 20 30] [x y z]))");
+
+    // Test 30: Insert via table with columns in different order
+    TEST_ASSERT_EQ(
+        "(set t (table [a b c] (list [1] [10] [x])))"
+        "(insert t (table [c a b] (list [y z] [2 3] [20 30])))",
+        "(table [a b c] (list [1 2 3] [10 20 30] [x y z]))");
+
+    // Test 31: Upsert via dict with different column order (new record)
+    TEST_ASSERT_EQ(
+        "(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))"
+        "(upsert t 1 (dict [Value Name ID] (list 30.0 'charlie 3)))",
+        "(table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))");
+
+    // Test 32: Upsert via dict with different column order (update existing)
+    TEST_ASSERT_EQ(
+        "(set t (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0])))"
+        "(upsert t 1 (dict [Value ID Name] (list 25.0 2 'bobby)))",
+        "(table [ID Name Value] (list [1 2 3] [alice bobby charlie] [10.0 25.0 30.0]))");
+
+    // Test 33: Upsert via dict with different column order (in-place)
+    TEST_ASSERT_EQ(
+        "(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))"
+        "(upsert 't 1 (dict [Name Value ID] (list 'charlie 30.0 3)))"
+        "t",
+        "(table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))");
+
+    // Test 34: Upsert multiple records via dict with different column order
+    TEST_ASSERT_EQ(
+        "(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))"
+        "(upsert t 1 (dict [Value ID Name] (list [25.0 30.0] [2 3] [bobby charlie])))",
+        "(table [ID Name Value] (list [1 2 3] [alice bobby charlie] [10.0 25.0 30.0]))");
+
+    // Test 35: Upsert via table with different column order
+    TEST_ASSERT_EQ(
+        "(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))"
+        "(upsert t 1 (table [Name ID Value] (list [charlie david] [3 4] [30.0 40.0])))",
+        "(table [ID Name Value] (list [1 2 3 4] [alice bob charlie david] [10.0 20.0 30.0 40.0]))");
+
+    // Test 36: Insert error - column not found in table
+    TEST_ASSERT_ER(
+        "(set t (table [a b c] (list [1] [10] [x])))"
+        "(insert t (dict [a b d] (list 2 20 'w)))",
+        "not found in table");
+
+    // Test 37: Upsert error - column not found in table
+    TEST_ASSERT_ER(
+        "(set t (table [ID Name Value] (list [1] [alice] [10.0])))"
+        "(upsert t 1 (dict [ID Unknown Value] (list 2 'x 20.0)))",
+        "not found in table");
+
     PASS();
 }
 

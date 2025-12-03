@@ -1,5 +1,3 @@
-;; Test upsert consistency with insert
-
 ;; Create a test table
 (set t (table [ID Name Value] (list [1 2 3] ['Alice 'Bob 'Charlie] [10.0 20.0 30.0])))
 (show t)
@@ -32,6 +30,43 @@
 ;; Test 6: Upsert via table
 (show "Test 6: Upsert via table")
 (set t (upsert t 1 (table [ID Name Value] (list [8 9] ['Henry 'Ivy] [80.0 90.0]))))
+(show t)
+
+;; ========== FLEXIBLE COLUMN ORDERING ==========
+
+;; Test 7: Upsert with columns in different order (new record)
+(show "Test 7: Upsert with different column order (new)")
+(set t (upsert t 1 (dict [Value Name ID] (list 100.0 'Jack 10))))
+(show t)
+
+;; Test 8: Upsert with columns in different order (update existing)
+(show "Test 8: Upsert with different column order (update)")
+(set t (upsert t 1 (dict [Name Value ID] (list 'Bobby2 22.0 2))))
+(show t)
+
+;; Test 9: Upsert with reversed column order
+(show "Test 9: Upsert with reversed column order")
+(set t (upsert t 1 (dict [Value ID Name] (list 110.0 11 'Kate))))
+(show t)
+
+;; Test 10: Upsert multiple records with different column order
+(show "Test 10: Upsert multiple with different column order")
+(set t (upsert t 1 (dict [Name Value ID] (list ['Leo 'Mike] [120.0 130.0] [12 13]))))
+(show t)
+
+;; Test 11: Upsert multiple with mixed insert/update (different column order)
+(show "Test 11: Upsert mixed insert/update (different order)")
+(set t (upsert t 1 (dict [Value ID Name] (list [35.0 140.0] [3 14] ['Charlie2 'Nancy]))))
+(show t)
+
+;; Test 12: Upsert via table with different column order
+(show "Test 12: Upsert via table (different column order)")
+(set t (upsert t 1 (table [Name ID Value] (list ['Oscar 'Pete] [15 16] [150.0 160.0]))))
+(show t)
+
+;; Test 13: In-place upsert with reordered columns
+(show "Test 13: In-place upsert with reordered columns")
+(upsert 't 1 (dict [Value Name ID] (list 170.0 'Quinn 17)))
 (show t)
 
 (show "All upsert tests completed!")
