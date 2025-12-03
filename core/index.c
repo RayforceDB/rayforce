@@ -1584,6 +1584,7 @@ obj_p index_group_distribute_partial(group_radix_part_ctx_p ctx, i64_t* groups, 
                                      i64_t out[], i64_t len, hash_f hash, cmp_f cmp) {
     i64_t i, partition_id, partitions, size, partition;
     i64_t *k, *v, n, idx;
+    u64_t h;
     obj_p ht;
 
     partitions = ctx->partitions;
@@ -1597,7 +1598,9 @@ obj_p index_group_distribute_partial(group_radix_part_ctx_p ctx, i64_t* groups, 
             n = keys[filter[i]];
 
             // determine if the key is ours due to radix partitioning
-            partition_id = n % partitions;
+            // use hash value for partitioning to ensure identical objects go to same partition
+            h = hash(n, NULL);
+            partition_id = h % partitions;
             if (partition_id != partition)
                 continue;
 
@@ -1617,7 +1620,9 @@ obj_p index_group_distribute_partial(group_radix_part_ctx_p ctx, i64_t* groups, 
             n = keys[i];
 
             // determine if the key is ours due to radix partitioning
-            partition_id = n % partitions;
+            // use hash value for partitioning to ensure identical objects go to same partition
+            h = hash(n, NULL);
+            partition_id = h % partitions;
             if (partition_id != partition)
                 continue;
 

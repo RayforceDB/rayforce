@@ -4181,6 +4181,42 @@ test_result_t test_lang_group() {
         "(select {from: t Sum: (sum Value) by: Flag})",
         "(table [Flag Sum] (list [true false] [40 60]))");
 
+    // ========== GROUP BY STRING COLUMN ==========
+    // Tests for grouping by list of strings (TYPE_LIST of TYPE_C8)
+    // This tests the fix for parallel radix partitioning bug where identical strings
+    // at different memory locations were incorrectly counted as different groups
+
+    // Basic group by string list
+    TEST_ASSERT_EQ("(group (list \"apple\" \"banana\" \"apple\" \"cherry\" \"banana\"))",
+                   "{\"apple\":[0 2] \"banana\":[1 4] \"cherry\":[3]}");
+
+    // Select with group by string column
+    TEST_ASSERT_EQ(
+        "(set t (table [Name Value] (list (list \"alice\" \"bob\" \"alice\" \"bob\") [10 20 30 40])))"
+        "(select {from: t Sum: (sum Value) by: Name})",
+        "(table [Name Sum] (list (list \"alice\" \"bob\") [40 60]))");
+
+    // Count by string column
+    TEST_ASSERT_EQ(
+        "(set t (table [City Population] (list (list \"NYC\" \"LA\" \"NYC\" \"LA\" \"NYC\") [100 200 150 250 120])))"
+        "(select {from: t Total: (sum Population) Count: (count Population) by: City})",
+        "(table [City Total Count] (list (list \"NYC\" \"LA\") [370 450] [3 2]))");
+
+    // Group by string with more unique values (to test parallel partitioning)
+    TEST_ASSERT_EQ(
+        "(set t (table [Category Amount] (list "
+        "(list \"cat1\" \"cat2\" \"cat3\" \"cat1\" \"cat2\" \"cat3\" \"cat1\" \"cat2\") "
+        "[10 20 30 40 50 60 70 80])))"
+        "(select {from: t Sum: (sum Amount) by: Category})",
+        "(table [Category Sum] (list (list \"cat1\" \"cat2\" \"cat3\") [120 150 90]))");
+
+    // Update with group by string
+    TEST_ASSERT_EQ(
+        "(set t (table [Type Value] (list (list \"A\" \"B\" \"A\" \"B\") [10 20 30 40])))"
+        "(update {from: 't TypeSum: (sum Value) by: Type})"
+        "t",
+        "(table [Type Value TypeSum] (list (list \"A\" \"B\" \"A\" \"B\") [10 20 30 40] [40 60 40 60]))");
+
     PASS();
 }
 
