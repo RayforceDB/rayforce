@@ -2217,6 +2217,9 @@ obj_p cast_obj(i8_t type, obj_p obj) {
     if (type == obj->type)
         return clone_obj(obj);
 
+    if (IS_VECTOR(obj) && obj->len == 0)
+        return vector(type, 0);
+
     switch (MTYPE2(type, obj->type)) {
         case MTYPE2(-TYPE_B8, -TYPE_I16):
             return b8(obj->i16 != 0);
