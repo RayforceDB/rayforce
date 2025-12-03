@@ -148,7 +148,7 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
         case TYPE_GUID:
             g64v = AS_GUID(obj);
             if (filter)
-                for (i = 0; i < len; i++) {
+                for (i = offset; i < len + offset; i++) {
                     out[i] = hash_index_u64(*(i64_t*)&g64v[filter[i]], out[i]);
                     out[i] = hash_index_u64(*((i64_t*)&g64v[filter[i]] + 1), out[i]);
                 }
@@ -768,7 +768,7 @@ obj_p index_in_i16_i8(i16_t x[], i64_t xl, i8_t y[], i64_t yl) {
     memset(s, 0, range);
 
     for (i = 0; i < yl; i++)
-        val = y[i] - min;
+        s[y[i] - min] = B8_TRUE;
 
     vec = B8(xl);
     r = AS_B8(vec);
@@ -805,7 +805,7 @@ obj_p index_in_i16_i16(i16_t x[], i64_t xl, i16_t y[], i64_t yl) {
     for (i = 0; i < yl; i++)
         s[y[i] - min] = B8_TRUE;
 
-    vec = B8(yl);
+    vec = B8(xl);
     r = AS_B8(vec);
 
     for (i = 0; i < xl; i++)
@@ -2308,6 +2308,8 @@ obj_p index_upsert_obj(obj_p lcols, obj_p rcols, i64_t len) {
 
 i64_t index_bin_u8(u8_t val, u8_t vals[], i64_t ids[], i64_t len) {
     i64_t left, right, mid, idx;
+    if (len == 0)
+        return NULL_I64;
     left = 0, right = len - 1, idx = NULL_I64;
     while (left <= right) {
         mid = left + (right - left) / 2;
@@ -2319,11 +2321,13 @@ i64_t index_bin_u8(u8_t val, u8_t vals[], i64_t ids[], i64_t len) {
         }
     }
 
-    return ids[idx];
+    return (idx == NULL_I64) ? NULL_I64 : ids[idx];
 }
 
 i64_t index_bin_i16(i16_t val, i16_t vals[], i64_t ids[], i64_t len) {
     i64_t left, right, mid, idx;
+    if (len == 0)
+        return NULL_I64;
     left = 0, right = len - 1, idx = NULL_I64;
     while (left <= right) {
         mid = left + (right - left) / 2;
@@ -2335,11 +2339,13 @@ i64_t index_bin_i16(i16_t val, i16_t vals[], i64_t ids[], i64_t len) {
         }
     }
 
-    return ids[idx];
+    return (idx == NULL_I64) ? NULL_I64 : ids[idx];
 }
 
 i64_t index_bin_i32(i32_t val, i32_t vals[], i64_t ids[], i64_t len) {
     i64_t left, right, mid, idx;
+    if (len == 0)
+        return NULL_I64;
     left = 0, right = len - 1, idx = NULL_I64;
     while (left <= right) {
         mid = left + (right - left) / 2;
@@ -2351,10 +2357,13 @@ i64_t index_bin_i32(i32_t val, i32_t vals[], i64_t ids[], i64_t len) {
         }
     }
 
-    return ids[idx];
+    return (idx == NULL_I64) ? NULL_I64 : ids[idx];
 }
+
 i64_t index_bin_i64(i64_t val, i64_t vals[], i64_t ids[], i64_t len) {
     i64_t left, right, mid, idx;
+    if (len == 0)
+        return NULL_I64;
     left = 0, right = len - 1, idx = NULL_I64;
     while (left <= right) {
         mid = left + (right - left) / 2;
@@ -2366,11 +2375,13 @@ i64_t index_bin_i64(i64_t val, i64_t vals[], i64_t ids[], i64_t len) {
         }
     }
 
-    return ids[idx];
+    return (idx == NULL_I64) ? NULL_I64 : ids[idx];
 }
 
 i64_t index_bin_f64(f64_t val, f64_t vals[], i64_t ids[], i64_t len) {
     i64_t left, right, mid, idx;
+    if (len == 0)
+        return NULL_I64;
     left = 0, right = len - 1, idx = NULL_I64;
     while (left <= right) {
         mid = left + (right - left) / 2;
@@ -2382,7 +2393,7 @@ i64_t index_bin_f64(f64_t val, f64_t vals[], i64_t ids[], i64_t len) {
         }
     }
 
-    return ids[idx];
+    return (idx == NULL_I64) ? NULL_I64 : ids[idx];
 }
 
 static obj_p __asof_ids_partial(__index_list_ctx_t* ctx, obj_p lxcol, obj_p rxcol, obj_p ht, i64_t len, i64_t offset,

@@ -3671,6 +3671,25 @@ test_result_t test_lang_in() {
     TEST_ASSERT_EQ("(set l (guid 2)) (in (list (first l)) l)", "(list true)");
     TEST_ASSERT_EQ("(set l (guid 2)) (in (list (first l)) (list l))", "(list false)");
     TEST_ASSERT_EQ("(set l (guid 2)) (in (list (first l)) (list (first l)))", "(list true)");
+
+    // ========== I16 x I8 "IN" TESTS (Bug fix: index_in_i16_i8) ==========
+    // Test i16 values against i8 lookup set
+    TEST_ASSERT_EQ("(in [1h 2h 3h] [1 2])", "[true true false]");             // i16 in i8 range
+    TEST_ASSERT_EQ("(in [100h 50h 25h] [50 100])", "[true true false]");      // i16 values in i8 lookup
+    TEST_ASSERT_EQ("(in [-128h 127h 0h] [-128 0 127])", "[true true true]");  // i8 boundary values
+    TEST_ASSERT_EQ("(in [200h 10h] [10])", "[false true]");                   // value outside i8 range
+
+    // ========== I16 x I16 "IN" TESTS (Bug fix: index_in_i16_i16 wrong size) ==========
+    // Test when x length > y length (was causing buffer overflow)
+    TEST_ASSERT_EQ("(in [1h 2h 3h 4h 5h] [2h 4h])", "[false true false true false]");
+    TEST_ASSERT_EQ("(in [10h 20h 30h 40h 50h 60h] [20h])", "[false true false false false false]");
+    // Test when x length < y length
+    TEST_ASSERT_EQ("(in [1h 2h] [1h 2h 3h 4h 5h])", "[true true]");
+    // Test with equal lengths
+    TEST_ASSERT_EQ("(in [1h 2h 3h] [3h 2h 1h])", "[true true true]");
+    // Test with empty arrays
+    TEST_ASSERT_EQ("(in (list) [1h 2h])", "(list)");
+
     PASS();
 }
 
@@ -3894,6 +3913,35 @@ test_result_t test_lang_joins() {
         "(set quotes (table [Sym Time Bid] (list [x x x] [10:00:00.000 10:00:02.000 10:00:04.000] [99.0 100.5 101.5])))"
         "(asof-join [Sym Time] trades quotes)",
         "(table [Sym Time Price Bid] (list [x x] [10:00:01.000 10:00:03.000] [100.0 101.0] [99.0 100.5]))");
+
+    // ========== ASOF JOIN with single matching symbol ==========
+    TEST_ASSERT_EQ(
+        "(set trades (table [Sym Time Price] (list [a] [10:00:05.000] [50.0])))"
+        "(set quotes (table [Sym Time Bid] (list [a a] [10:00:01.000 10:00:03.000] [48.0 49.0])))"
+        "(asof-join [Sym Time] trades quotes)",
+        "(table [Sym Time Price Bid] (list [a] [10:00:05.000] [50.0] [49.0]))");
+
+    // ========== ASOF JOIN with exact match on boundary ==========
+    TEST_ASSERT_EQ(
+        "(set trades (table [Sym Time Price] (list [a] [10:00:01.000] [50.0])))"
+        "(set quotes (table [Sym Time Bid] (list [a a] [10:00:01.000 10:00:03.000] [48.0 49.0])))"
+        "(asof-join [Sym Time] trades quotes)",
+        "(table [Sym Time Price Bid] (list [a] [10:00:01.000] [50.0] [48.0]))");
+
+    // ========== LEFT JOIN TESTS ==========
+    // Test case where all rows have matches
+    TEST_ASSERT_EQ(
+        "(set t1 (table [ID Name] (list [1 3] [a c])))"
+        "(set t2 (table [ID Value] (list [1 3] [100 300])))"
+        "(left-join [ID] t1 t2)",
+        "(table [ID Name Value] (list [1 3] [a c] [100 300]))");
+
+    // ========== LEFT JOIN with partial matches - verify non-null rows ==========
+    TEST_ASSERT_EQ(
+        "(set t1 (table [ID Name] (list [1 2 3] [a b c])))"
+        "(set t2 (table [ID Value] (list [1 3] [100 300])))"
+        "(count (left-join [ID] t1 t2))",
+        "3");
 
     PASS();
 }
@@ -4233,6 +4281,24 @@ test_result_t test_lang_find() {
     TEST_ASSERT_EQ("(find [10 20 30 40] [20 40])", "[1 3]");
     TEST_ASSERT_EQ("(find ['a 'b 'c 'd] ['c 'a])", "[2 0]");
     TEST_ASSERT_EQ("(find [1 2 3] [4 2 5])", "[0Nl 1 0Nl]");
+
+    // ========== FIND IN EMPTY ARRAY ==========
+    TEST_ASSERT_EQ("(find [] 1)", "0Nl");
+    TEST_ASSERT_EQ("(find [] [1 2 3])", "[]");  // Returns empty when source is empty
+
+    // ========== FIND WITH DIFFERENT TYPE WIDTHS (index_find_i8) ==========
+    TEST_ASSERT_EQ("(find \"abc\" 'b')", "1");
+    TEST_ASSERT_EQ("(find \"abc\" 'z')", "0Nl");
+    TEST_ASSERT_EQ("(find \"\" 'a')", "0Nl");
+
+    // ========== FIND WITH i64 (index_find_i64) ==========
+    TEST_ASSERT_EQ("(find [1000000000 2000000000 3000000000] 2000000000)", "1");
+    TEST_ASSERT_EQ("(find [1000000000 2000000000] 9999999999)", "0Nl");
+
+    // ========== FIND WITH SYMBOLS ==========
+    TEST_ASSERT_EQ("(find ['apple 'banana 'cherry] 'banana)", "1");
+    TEST_ASSERT_EQ("(find ['a] 'a)", "0");
+    TEST_ASSERT_EQ("(find ['a] 'b)", "0Nl");
 
     PASS();
 }
