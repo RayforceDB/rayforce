@@ -3721,3 +3721,483 @@ test_result_t test_lang_timestamp() {
 
     PASS();
 }
+
+// ==================== AGGREGATION TESTS ====================
+test_result_t test_lang_aggregations() {
+    // ========== SUM TESTS ==========
+    TEST_ASSERT_EQ("(sum [1 2 3 4 5])", "15");
+    TEST_ASSERT_EQ("(sum [1.0 2.0 3.0])", "6.0");
+    TEST_ASSERT_EQ("(sum [1i 2i 3i])", "6i");
+    TEST_ASSERT_EQ("(sum [])", "0");
+    TEST_ASSERT_EQ("(sum 5)", "5");  // scalar
+
+    // ========== AVG TESTS ==========
+    TEST_ASSERT_EQ("(avg [1 2 3 4 5])", "3.0");
+    TEST_ASSERT_EQ("(avg [10.0 20.0 30.0])", "20.0");
+    TEST_ASSERT_EQ("(avg [2 4 6 8])", "5.0");
+    TEST_ASSERT_EQ("(avg 10)", "10.0");  // scalar
+
+    // ========== MIN TESTS ==========
+    TEST_ASSERT_EQ("(min [5 2 8 1 9])", "1");
+    TEST_ASSERT_EQ("(min [5.0 2.0 8.0])", "2.0");
+    TEST_ASSERT_EQ("(min [-5 -2 -8])", "-8");
+    TEST_ASSERT_EQ("(min [5i 2i 8i])", "2i");
+    TEST_ASSERT_EQ("(min 42)", "42");  // scalar
+
+    // ========== MAX TESTS ==========
+    TEST_ASSERT_EQ("(max [5 2 8 1 9])", "9");
+    TEST_ASSERT_EQ("(max [5.0 2.0 8.0])", "8.0");
+    TEST_ASSERT_EQ("(max [-5 -2 -8])", "-2");
+    TEST_ASSERT_EQ("(max [5i 2i 8i])", "8i");
+    TEST_ASSERT_EQ("(max 42)", "42");  // scalar
+
+    // ========== COUNT TESTS ==========
+    TEST_ASSERT_EQ("(count [1 2 3 4 5])", "5");
+    TEST_ASSERT_EQ("(count [])", "0");
+    TEST_ASSERT_EQ("(count \"hello\")", "5");
+    TEST_ASSERT_EQ("(count (dict [a b c] [1 2 3]))", "3");
+    TEST_ASSERT_EQ("(count (table [a b] (list [1 2 3] [4 5 6])))", "3");
+    TEST_ASSERT_EQ("(count 5)", "1");  // scalar
+
+    // ========== FIRST TESTS ==========
+    TEST_ASSERT_EQ("(first [1 2 3 4 5])", "1");
+    TEST_ASSERT_EQ("(first \"hello\")", "'h'");
+    TEST_ASSERT_EQ("(first ['a 'b 'c])", "'a");
+    TEST_ASSERT_EQ("(first (table [a b] (list [1 2 3] [4 5 6])))", "{a:1 b:4}");
+
+    // ========== LAST TESTS ==========
+    TEST_ASSERT_EQ("(last [1 2 3 4 5])", "5");
+    TEST_ASSERT_EQ("(last \"hello\")", "'o'");
+    TEST_ASSERT_EQ("(last ['a 'b 'c])", "'c");
+    TEST_ASSERT_EQ("(last (table [a b] (list [1 2 3] [4 5 6])))", "{a:3 b:6}");
+
+    // ========== MED (MEDIAN) TESTS ==========
+    TEST_ASSERT_EQ("(med [1 2 3 4 5])", "3.0");
+    TEST_ASSERT_EQ("(med [1 2 3 4])", "2.5");
+    TEST_ASSERT_EQ("(med [5 1 3 2 4])", "3.0");  // unsorted input
+
+    // ========== DEV (STANDARD DEVIATION) TESTS ==========
+    TEST_ASSERT_EQ("(dev [1 1 1 1])", "0.0");
+    TEST_ASSERT_EQ("(< (- (dev [1 2 3 4 5]) 1.4142) 0.001)", "true");  // approx sqrt(2)
+
+    // ========== AGGREGATIONS ON TABLES WITH GROUPBY ==========
+    TEST_ASSERT_EQ(
+        "(set t (table [Group Value] (list [a a b b] [10 20 30 40])))"
+        "(select {from: t Total: (sum Value) by: Group})",
+        "(table [Group Total] (list [a b] [30 70]))");
+
+    TEST_ASSERT_EQ(
+        "(set t (table [Group Value] (list [a a b b] [10 20 30 40])))"
+        "(select {from: t Avg: (avg Value) by: Group})",
+        "(table [Group Avg] (list [a b] [15.0 35.0]))");
+
+    TEST_ASSERT_EQ(
+        "(set t (table [Group Value] (list [a a b b] [10 20 30 40])))"
+        "(select {from: t Min: (min Value) Max: (max Value) by: Group})",
+        "(table [Group Min Max] (list [a b] [10 30] [20 40]))");
+
+    TEST_ASSERT_EQ(
+        "(set t (table [Group Value] (list [a a a b b] [1 2 3 4 5])))"
+        "(select {from: t Cnt: (count Value) by: Group})",
+        "(table [Group Cnt] (list [a b] [3 2]))");
+
+    PASS();
+}
+
+// ==================== JOIN TESTS ====================
+test_result_t test_lang_joins() {
+    // ========== ASOF JOIN TESTS ==========
+    TEST_ASSERT_EQ(
+        "(set trades (table [Sym Time Price] (list [x x] [10:00:01.000 10:00:03.000] [100.0 101.0])))"
+        "(set quotes (table [Sym Time Bid] (list [x x x] [10:00:00.000 10:00:02.000 10:00:04.000] [99.0 100.5 101.5])))"
+        "(asof-join [Sym Time] trades quotes)",
+        "(table [Sym Time Price Bid] (list [x x] [10:00:01.000 10:00:03.000] [100.0 101.0] [99.0 100.5]))");
+
+    PASS();
+}
+
+// ==================== TEMPORAL TESTS ====================
+test_result_t test_lang_temporal() {
+    // ========== DATE ARITHMETIC ==========
+    TEST_ASSERT_EQ("(+ 2024.01.01 1)", "2024.01.02");
+    TEST_ASSERT_EQ("(+ 2024.01.01 30)", "2024.01.31");
+    TEST_ASSERT_EQ("(+ 2024.01.01 31)", "2024.02.01");
+    TEST_ASSERT_EQ("(- 2024.01.10 5)", "2024.01.05");
+    TEST_ASSERT_EQ("(- 2024.02.01 2024.01.01)", "31");
+
+    // ========== TIME ARITHMETIC ==========
+    TEST_ASSERT_EQ("(+ 10:00:00.000 1000)", "10:00:01.000");
+    TEST_ASSERT_EQ("(+ 10:00:00.000 60000)", "10:01:00.000");
+    TEST_ASSERT_EQ("(+ 10:00:00.000 3600000)", "11:00:00.000");
+    TEST_ASSERT_EQ("(- 10:00:01.000 1000)", "10:00:00.000");
+    TEST_ASSERT_EQ("(- 10:00:01.000 10:00:00.000)", "00:00:01.000");
+
+    // ========== TIMESTAMP ARITHMETIC ==========
+    TEST_ASSERT_EQ("(+ 2024.01.01D10:00:00.000000000 1000000000)", "2024.01.01D10:00:01.000000000");
+    TEST_ASSERT_EQ("(- 2024.01.01D10:00:01.000000000 1000000000)", "2024.01.01D10:00:00.000000000");
+
+    // ========== VECTOR OPERATIONS ==========
+    TEST_ASSERT_EQ("(+ [2024.01.01 2024.01.02] 1)", "[2024.01.02 2024.01.03]");
+    TEST_ASSERT_EQ("(- [2024.01.10 2024.01.20] [2024.01.01 2024.01.10])", "[9 10]");
+
+    PASS();
+}
+
+// ==================== ITERATION TESTS ====================
+test_result_t test_lang_iteration() {
+    // ========== MAP-LEFT TESTS ==========
+    TEST_ASSERT_EQ("(map-left - 10 [1 2 3])", "[9 8 7]");
+    TEST_ASSERT_EQ("(map-left / 100 [2 4 5])", "[50 25 20]");
+
+    // ========== MAP-RIGHT TESTS ==========
+    TEST_ASSERT_EQ("(map-right - [10 20 30] 5)", "[5 15 25]");
+    TEST_ASSERT_EQ("(map-right / [10 20 30] 2)", "[5 10 15]");
+
+    PASS();
+}
+
+// ==================== CONDITIONAL TESTS ====================
+test_result_t test_lang_conditionals() {
+    // ========== BASIC IF TESTS ==========
+    TEST_ASSERT_EQ("(if true 1 2)", "1");
+    TEST_ASSERT_EQ("(if false 1 2)", "2");
+
+    // ========== NESTED IF ==========
+    TEST_ASSERT_EQ("(if true (if true 1 2) 3)", "1");
+    TEST_ASSERT_EQ("(if true (if false 1 2) 3)", "2");
+    TEST_ASSERT_EQ("(if false 1 (if true 2 3))", "2");
+
+    // ========== IF WITH EXPRESSIONS ==========
+    TEST_ASSERT_EQ("(if (> 5 3) (+ 1 1) (- 1 1))", "2");
+    TEST_ASSERT_EQ("(if (< 5 3) (+ 1 1) (- 5 3))", "2");
+    TEST_ASSERT_EQ("(if (== 1 1) \"yes\" \"no\")", "\"yes\"");
+
+    // ========== IF WITH SIDE EFFECTS ==========
+    TEST_ASSERT_EQ("(set y 0) (if true (set y 10) (set y 20)) y", "10");
+    TEST_ASSERT_EQ("(set y 0) (if false (set y 10) (set y 20)) y", "20");
+
+    // ========== CHAINED CONDITIONS ==========
+    TEST_ASSERT_EQ("(set x 5) (if (< x 0) 'neg (if (== x 0) 'zero 'pos))", "'pos");
+    TEST_ASSERT_EQ("(set x -3) (if (< x 0) 'neg (if (== x 0) 'zero 'pos))", "'neg");
+    TEST_ASSERT_EQ("(set x 0) (if (< x 0) 'neg (if (== x 0) 'zero 'pos))", "'zero");
+
+    PASS();
+}
+
+// ==================== DICT TESTS ====================
+test_result_t test_lang_dict() {
+    // ========== DICT CREATION ==========
+    TEST_ASSERT_EQ("(dict [a b c] [1 2 3])", "{a:1 b:2 c:3}");
+    TEST_ASSERT_EQ("(dict [x y] [10.0 20.0])", "{x:10.0 y:20.0}");
+    TEST_ASSERT_EQ("(dict [] [])", "{}");
+
+    // ========== DICT ACCESS ==========
+    TEST_ASSERT_EQ("(set d (dict [a b c] [1 2 3])) (at d 'a)", "1");
+    TEST_ASSERT_EQ("(set d (dict [a b c] [1 2 3])) (at d 'b)", "2");
+    TEST_ASSERT_EQ("(set d (dict [a b c] [1 2 3])) (at d 'c)", "3");
+    TEST_ASSERT_EQ("(set d (dict [a b c] [1 2 3])) (at d 'd)", "0Nl");  // missing key
+
+    // ========== KEY FUNCTION ==========
+    TEST_ASSERT_EQ("(key (dict [a b c] [1 2 3]))", "[a b c]");
+    TEST_ASSERT_EQ("(key (dict [x] [10]))", "[x]");
+    TEST_ASSERT_EQ("(key (table [a b] (list [1 2] [3 4])))", "[a b]");
+
+    // ========== VALUE FUNCTION ==========
+    TEST_ASSERT_EQ("(value (dict [a b c] [1 2 3]))", "[1 2 3]");
+    TEST_ASSERT_EQ("(value (dict [x] [10]))", "[10]");
+    TEST_ASSERT_EQ("(value (table [a b] (list [1 2] [3 4])))", "(list [1 2] [3 4])");
+
+    // ========== NESTED DICT ==========
+    TEST_ASSERT_EQ("(set d (dict [a b] (list 1 (dict [x y] [10 20])))) (at (at d 'b) 'x)", "10");
+
+    // ========== DICT IN TABLE ROW ==========
+    TEST_ASSERT_EQ("(first (table [a b] (list [1 2] [3 4])))", "{a:1 b:3}");
+    TEST_ASSERT_EQ("(at (first (table [a b] (list [1 2] [3 4]))) 'a)", "1");
+
+    PASS();
+}
+
+// ==================== LIST TESTS ====================
+test_result_t test_lang_list() {
+    // ========== LIST CREATION ==========
+    TEST_ASSERT_EQ("(list 1 2 3)", "(list 1 2 3)");
+    TEST_ASSERT_EQ("(list [1 2] [3 4])", "(list [1 2] [3 4])");
+    TEST_ASSERT_EQ("(list 1 \"hello\" 'a)", "(list 1 \"hello\" 'a)");
+
+    // ========== ENLIST ==========
+    TEST_ASSERT_EQ("(enlist 5)", "[5]");
+    TEST_ASSERT_EQ("(enlist 'a)", "['a]");
+    TEST_ASSERT_EQ("(enlist \"hello\")", "(list \"hello\")");
+    TEST_ASSERT_EQ("(enlist [1 2 3])", "(list [1 2 3])");
+
+    // ========== AT (INDEXING) ==========
+    TEST_ASSERT_EQ("(at [10 20 30 40] 0)", "10");
+    TEST_ASSERT_EQ("(at [10 20 30 40] 2)", "30");
+    TEST_ASSERT_EQ("(at [10 20 30 40] 3)", "40");
+    TEST_ASSERT_EQ("(at [10 20 30 40] [0 2])", "[10 30]");  // multiple indices
+    TEST_ASSERT_EQ("(at \"hello\" 1)", "'e'");
+    TEST_ASSERT_EQ("(at \"hello\" [0 4])", "\"ho\"");
+
+    // ========== AT ON TABLES ==========
+    TEST_ASSERT_EQ("(at (table [a b] (list [1 2 3] [4 5 6])) 0)", "{a:1 b:4}");
+    TEST_ASSERT_EQ("(at (table [a b] (list [1 2 3] [4 5 6])) 'a)", "[1 2 3]");
+
+    // ========== TIL ==========
+    TEST_ASSERT_EQ("(til 5)", "[0 1 2 3 4]");
+    TEST_ASSERT_EQ("(til 0)", "[]");
+    TEST_ASSERT_EQ("(til 1)", "[0]");
+
+    // ========== TAKE ==========
+    TEST_ASSERT_EQ("(take 3 [1 2 3 4 5])", "[1 2 3]");
+    TEST_ASSERT_EQ("(take -3 [1 2 3 4 5])", "[3 4 5]");
+    TEST_ASSERT_EQ("(take 7 [1 2 3])", "[1 2 3 1 2 3 1]");  // cyclic
+    TEST_ASSERT_EQ("(take 3 \"hello\")", "\"hel\"");
+
+    PASS();
+}
+
+// ==================== ALTER TESTS ====================
+test_result_t test_lang_alter() {
+    // ========== ALTER SET ON VECTORS ==========
+    TEST_ASSERT_EQ("(set v [1 2 3 4 5]) (alter 'v set 0 100) v", "[100 2 3 4 5]");
+
+    // ========== ALTER CONCAT ON VECTORS ==========
+    TEST_ASSERT_EQ("(set v [1 2 3]) (alter 'v concat 4) v", "[1 2 3 4]");
+
+    PASS();
+}
+
+// ==================== NULL HANDLING TESTS ====================
+test_result_t test_lang_null() {
+    // ========== NIL? TESTS ==========
+    TEST_ASSERT_EQ("(nil? null)", "true");
+    TEST_ASSERT_EQ("(nil? 0Nl)", "true");
+    TEST_ASSERT_EQ("(nil? 0)", "false");
+    TEST_ASSERT_EQ("(nil? 1)", "false");
+    TEST_ASSERT_EQ("(nil? \"\")", "false");
+
+    // ========== NULL PROPAGATION ==========
+    TEST_ASSERT_EQ("(+ 1 0Nl)", "0Nl");
+    TEST_ASSERT_EQ("(* 5 0Nl)", "0Nl");
+    TEST_ASSERT_EQ("(+ [1 2 3] [0Nl 2 3])", "[0Nl 4 6]");
+
+    // ========== NULL COMPARISONS ==========
+    TEST_ASSERT_EQ("(== 0Nl 0Nl)", "true");
+    TEST_ASSERT_EQ("(== null null)", "true");
+
+    // ========== NULL IN TABLES ==========
+    TEST_ASSERT_EQ(
+        "(set t (table [a b] (list [1 0Nl 3] [4 5 6])))"
+        "(at (at t 'a) 1)",
+        "0Nl");
+
+    PASS();
+}
+
+// ==================== SET OPERATIONS TESTS ====================
+test_result_t test_lang_set_ops() {
+    // ========== UNION TESTS ==========
+    TEST_ASSERT_EQ("(union [1 2 3] [3 4 5])", "[1 2 3 4 5]");
+    TEST_ASSERT_EQ("(union [1 2 3] [1 2 3])", "[1 2 3]");
+    TEST_ASSERT_EQ("(union [] [1 2 3])", "[1 2 3]");
+    TEST_ASSERT_EQ("(union [1 2 3] [])", "[1 2 3]");
+    TEST_ASSERT_EQ("(union ['a 'b] ['b 'c])", "[a b c]");
+
+    // ========== SECT (INTERSECTION) TESTS ==========
+    TEST_ASSERT_EQ("(sect [1 2 3 4] [2 4 6])", "[2 4]");
+    TEST_ASSERT_EQ("(sect [1 2 3] [4 5 6])", "[]");
+    TEST_ASSERT_EQ("(sect [1 2 3] [1 2 3])", "[1 2 3]");
+    TEST_ASSERT_EQ("(sect ['a 'b 'c] ['b 'c 'd])", "[b c]");
+
+    // ========== WITHIN TESTS ==========
+    TEST_ASSERT_EQ("(within [5] [1 10])", "[true]");
+    TEST_ASSERT_EQ("(within [0] [1 10])", "[false]");
+    TEST_ASSERT_EQ("(within [11] [1 10])", "[false]");
+    TEST_ASSERT_EQ("(within [5 0 15] [1 10])", "[true false false]");
+
+    PASS();
+}
+
+// ==================== TYPE CASTING TESTS ====================
+test_result_t test_lang_cast() {
+    // ========== STRING/SYMBOL CASTS ==========
+    TEST_ASSERT_EQ("(as 'String 'hello)", "\"hello\"");
+    TEST_ASSERT_EQ("(as 'String 123)", "\"123\"");
+
+    // ========== GUID CASTS ==========
+    TEST_ASSERT_EQ("(type (as 'guid \"d49f18a4-1969-49e8-9b8a-6bb9a4832eea\"))", "'guid");
+
+    PASS();
+}
+
+// ==================== LAMBDA TESTS ====================
+test_result_t test_lang_lambda() {
+    // ========== BASIC LAMBDA ==========
+    TEST_ASSERT_EQ("((fn [x] (+ x 1)) 5)", "6");
+    TEST_ASSERT_EQ("((fn [x y] (+ x y)) 3 4)", "7");
+    TEST_ASSERT_EQ("((fn [] 42))", "42");
+
+    // ========== LAMBDA WITH MULTIPLE ARGS ==========
+    TEST_ASSERT_EQ("((fn [a b c] (+ a (+ b c))) 1 2 3)", "6");
+    TEST_ASSERT_EQ("((fn [x y z] (* x (* y z))) 2 3 4)", "24");
+
+    // ========== STORED LAMBDA ==========
+    TEST_ASSERT_EQ("(set f (fn [x] (* x x))) (f 5)", "25");
+    TEST_ASSERT_EQ("(set add (fn [a b] (+ a b))) (add 10 20)", "30");
+
+    // ========== LAMBDA WITH MAP ==========
+    TEST_ASSERT_EQ("(map (fn [x] (* x 2)) [1 2 3 4 5])", "[2 4 6 8 10]");
+    TEST_ASSERT_EQ("(map (fn [x] (+ x 10)) [0 1 2])", "[10 11 12]");
+
+    // ========== LAMBDA WITH FILTER/WHERE ==========
+    TEST_ASSERT_EQ("(filter [1 2 3 4 5 6] (map (fn [x] (> x 3)) [1 2 3 4 5 6]))", "[4 5 6]");
+
+    // ========== LAMBDA WITH CONDITIONALS ==========
+    TEST_ASSERT_EQ("((fn [x] (if (> x 0) 'pos 'neg)) 5)", "'pos");
+    TEST_ASSERT_EQ("((fn [x] (if (> x 0) 'pos 'neg)) -5)", "'neg");
+
+    // ========== RECURSIVE-STYLE (SELF) ==========
+    TEST_ASSERT_EQ("(set factorial (fn [n] (if (<= n 1) 1 (* n (factorial (- n 1)))))) (factorial 5)", "120");
+
+    PASS();
+}
+
+// ==================== GROUP TESTS ====================
+test_result_t test_lang_group() {
+    // ========== BASIC GROUP ==========
+    TEST_ASSERT_EQ("(group [a a b b c])", "{a:[0 1] b:[2 3] c:[4]}");
+    TEST_ASSERT_EQ("(group [1 1 2 2 3])", "{1:[0 1] 2:[2 3] 3:[4]}");
+    TEST_ASSERT_EQ("(group [true false true false])", "{true:[0 2] false:[1 3]}");
+
+    // ========== GROUP ON EMPTY ==========
+    TEST_ASSERT_EQ("(group [])", "{}");
+
+    // ========== GROUP WITH UNIQUE VALUES ==========
+    TEST_ASSERT_EQ("(group [a b c])", "{a:[0] b:[1] c:[2]}");
+
+    // ========== SELECT WITH BY (GROUPBY) ==========
+    TEST_ASSERT_EQ(
+        "(set t (table [Category Value] (list [a a b b] [10 20 30 40])))"
+        "(select {from: t Sum: (sum Value) by: Category})",
+        "(table [Category Sum] (list [a b] [30 70]))");
+
+    TEST_ASSERT_EQ(
+        "(set t (table [Category Value] (list [a a b b] [10 20 30 40])))"
+        "(select {from: t Count: (count Value) by: Category})",
+        "(table [Category Count] (list [a b] [2 2]))");
+
+    // ========== UPDATE WITH BY ==========
+    TEST_ASSERT_EQ(
+        "(set t (table [Group Value] (list [a a b b] [10 20 30 40])))"
+        "(update {from: 't GroupSum: (sum Value) by: Group})"
+        "t",
+        "(table [Group Value GroupSum] (list [a a b b] [10 20 30 40] [30 30 70 70]))");
+
+    // ========== GROUP BY BOOL ==========
+    TEST_ASSERT_EQ(
+        "(set t (table [Flag Value] (list [true false true false] [10 20 30 40])))"
+        "(select {from: t Sum: (sum Value) by: Flag})",
+        "(table [Flag Sum] (list [true false] [40 60]))");
+
+    PASS();
+}
+
+// ==================== FIND TESTS ====================
+test_result_t test_lang_find() {
+    // ========== FIND IN VECTOR ==========
+    TEST_ASSERT_EQ("(find [10 20 30 40] 30)", "2");
+    TEST_ASSERT_EQ("(find [10 20 30 40] 50)", "0Nl");  // not found
+    TEST_ASSERT_EQ("(find [10 20 30 40] 10)", "0");
+    TEST_ASSERT_EQ("(find ['a 'b 'c] 'b)", "1");
+    TEST_ASSERT_EQ("(find \"hello\" 'l')", "2");
+
+    // ========== FIND MULTIPLE ==========
+    TEST_ASSERT_EQ("(find [10 20 30 40] [20 40])", "[1 3]");
+    TEST_ASSERT_EQ("(find ['a 'b 'c 'd] ['c 'a])", "[2 0]");
+    TEST_ASSERT_EQ("(find [1 2 3] [4 2 5])", "[0Nl 1 0Nl]");
+
+    PASS();
+}
+
+// ==================== RANDOM TESTS ====================
+test_result_t test_lang_rand() {
+    // ========== BASIC RAND ==========
+    TEST_ASSERT_EQ("(count (rand 10 100))", "10");  // 10 random values in [0,100)
+    TEST_ASSERT_EQ("(type (rand 5 100))", "'I64");  // int random
+
+    // ========== VERIFY RANGE ==========
+    TEST_ASSERT_EQ("(and (>= (min (rand 100 10)) 0) (< (max (rand 100 10)) 10))", "true");
+
+    PASS();
+}
+
+// ==================== NEG/NOT/WHERE TESTS ====================
+test_result_t test_lang_unary_ops() {
+    // ========== NEG TESTS ==========
+    TEST_ASSERT_EQ("(neg 5)", "-5");
+    TEST_ASSERT_EQ("(neg -5)", "5");
+    TEST_ASSERT_EQ("(neg [1 -2 3 -4])", "[-1 2 -3 4]");
+    TEST_ASSERT_EQ("(neg 5.0)", "-5.0");
+
+    // ========== NOT TESTS ==========
+    TEST_ASSERT_EQ("(not true)", "false");
+    TEST_ASSERT_EQ("(not false)", "true");
+    TEST_ASSERT_EQ("(not [true false true])", "[false true false]");
+
+    // ========== WHERE TESTS ==========
+    TEST_ASSERT_EQ("(where [true false true false true])", "[0 2 4]");
+    TEST_ASSERT_EQ("(where [false false false])", "[]");
+    TEST_ASSERT_EQ("(where [true true true])", "[0 1 2]");
+    TEST_ASSERT_EQ("(where (> [1 2 3 4 5] 3))", "[3 4]");
+
+    PASS();
+}
+
+// ==================== STRING OPERATIONS TESTS ====================
+test_result_t test_lang_string_ops() {
+    // ========== STRING CONCAT ==========
+    TEST_ASSERT_EQ("(concat \"hel\" \"lo\")", "\"hello\"");
+    TEST_ASSERT_EQ("(concat \"\" \"test\")", "\"test\"");
+    TEST_ASSERT_EQ("(concat \"test\" \"\")", "\"test\"");
+
+    // ========== STRING COUNT ==========
+    TEST_ASSERT_EQ("(count \"hello\")", "5");
+    TEST_ASSERT_EQ("(count \"\")", "0");
+
+    // ========== STRING INDEXING ==========
+    TEST_ASSERT_EQ("(at \"hello\" 0)", "'h'");
+    TEST_ASSERT_EQ("(at \"hello\" 4)", "'o'");
+
+    // ========== STRING TAKE ==========
+    TEST_ASSERT_EQ("(take 3 \"hello\")", "\"hel\"");
+    TEST_ASSERT_EQ("(take -2 \"hello\")", "\"lo\"");
+
+    // ========== STRING FIRST/LAST ==========
+    TEST_ASSERT_EQ("(first \"hello\")", "'h'");
+    TEST_ASSERT_EQ("(last \"hello\")", "'o'");
+
+    PASS();
+}
+
+// ==================== DO/LET TESTS ====================
+test_result_t test_lang_do_let() {
+    // ========== DO TESTS ==========
+    TEST_ASSERT_EQ("(do (set x 1) (set y 2) (+ x y))", "3");
+    TEST_ASSERT_EQ("(do 1 2 3)", "3");  // returns last
+
+    PASS();
+}
+
+// ==================== TRY/RAISE TESTS ====================
+test_result_t test_lang_error() {
+    // ========== TRY WITH SUCCESS ==========
+    TEST_ASSERT_EQ("(try (+ 1 2) (fn [e] 0))", "3");
+
+    // ========== TRY WITH ERROR ==========
+    TEST_ASSERT_EQ("(try (raise \"error\") (fn [e] 99))", "99");
+
+    // ========== NESTED TRY ==========
+    TEST_ASSERT_EQ("(try (try (raise \"inner\") (fn [e] (raise \"outer\"))) (fn [e] 42))", "42");
+
+    PASS();
+}
