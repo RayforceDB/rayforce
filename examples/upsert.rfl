@@ -1,0 +1,38 @@
+;; Test upsert consistency with insert
+
+;; Create a test table
+(set t (table [ID Name Value] (list [1 2 3] ['Alice 'Bob 'Charlie] [10.0 20.0 30.0])))
+(show t)
+
+;; Test 1: Upsert single record (list of atoms) - NEW record
+(show "Test 1: Upsert single record (new)")
+(set t (upsert t 1 (list 4 'David 40.0)))
+(show t)
+
+;; Test 2: Upsert single record (list of atoms) - UPDATE existing
+(show "Test 2: Upsert single record (update existing)")
+(set t (upsert t 1 (list 2 'Bobby 25.0)))
+(show t)
+
+;; Test 3: Upsert multiple records (list of vectors)
+(show "Test 3: Upsert multiple records")
+(set t (upsert t 1 (list [5 6] ['Eve 'Frank] [50.0 60.0])))
+(show t)
+
+;; Test 4: Upsert via dict - single record
+(show "Test 4: Upsert via dict (new)")
+(set t (upsert t 1 (dict [ID Name Value] (list 7 'Grace 70.0))))
+(show t)
+
+;; Test 5: Upsert via dict - update existing
+(show "Test 5: Upsert via dict (update)")
+(set t (upsert t 1 (dict [ID Name Value] (list 3 'Chuck 35.0))))
+(show t)
+
+;; Test 6: Upsert via table
+(show "Test 6: Upsert via table")
+(set t (upsert t 1 (table [ID Name Value] (list [8 9] ['Henry 'Ivy] [80.0 90.0]))))
+(show t)
+
+(show "All upsert tests completed!")
+(exit 0)

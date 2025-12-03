@@ -471,7 +471,68 @@ upsert:
                 return ray_error(ERR_LENGTH, "upsert: expected non-empty list of records");
             }
 
-            // validate the list
+            if (l > p) {
+                drop_obj(obj);
+                return ray_error(ERR_LENGTH, "upsert: list length %lld is greater than table columns %lld", l, p);
+            }
+
+            // Check if this is a single record (atoms) or multiple records (vectors)
+            if (IS_ATOM(AS_LIST(lst)[0])) {
+                // Single record case - validate all elements are atoms or compatible
+                for (i = 0; i < l; i++) {
+                    if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
+                        drop_obj(obj);
+                        return ray_error(ERR_TYPE, "upsert: expected '%s' as %lldth element, got '%s'",
+                                         type_name(-AS_LIST(AS_LIST(obj)[1])[i]->type), i,
+                                         type_name(AS_LIST(lst)[i]->type));
+                    }
+                }
+
+                // Build key for lookup
+                if (keys == 1) {
+                    k1 = at_idx(AS_LIST(obj)[1], 0);
+                    k2 = clone_obj(AS_LIST(lst)[0]);
+                } else {
+                    k1 = ray_take(x[1], AS_LIST(obj)[1]);
+                    k2 = ray_take(x[1], lst);
+                }
+
+                idx = index_upsert_obj(k2, k1, x[1]->i64);
+
+                drop_obj(k1);
+                drop_obj(k2);
+
+                if (IS_ERR(idx)) {
+                    drop_obj(obj);
+                    return idx;
+                }
+
+                row = AS_I64(idx)[0];
+                drop_obj(idx);
+
+                // Process each column
+                for (i = 0; i < p; i++) {
+                    col = cow_obj(AS_LIST(AS_LIST(obj)[1])[i]);
+                    if (col != AS_LIST(AS_LIST(obj)[1])[i]) {
+                        drop_obj(AS_LIST(AS_LIST(obj)[1])[i]);
+                        AS_LIST(AS_LIST(obj)[1])[i] = col;
+                    }
+
+                    // Insert record
+                    if (row == NULL_I64) {
+                        v = (i < l) ? clone_obj(AS_LIST(lst)[i]) : null(AS_LIST(AS_LIST(obj)[1])[i]->type);
+                        push_obj(AS_LIST(AS_LIST(obj)[1]) + i, v);
+                    }
+                    // Update record (skip keys since they match, and only update provided columns)
+                    else if (i >= keys && i < l) {
+                        set_idx(AS_LIST(AS_LIST(obj)[1]) + i, row, clone_obj(AS_LIST(lst)[i]));
+                    }
+                }
+
+                return __commit(x[0], obj, val);
+            }
+
+            // Multiple records case - validate the list contains vectors
             ll = AS_LIST(lst)[0]->len;
             for (i = 0; i < l; i++) {
                 if (!IS_VECTOR(AS_LIST(lst)[i])) {
@@ -485,11 +546,6 @@ upsert:
                     return ray_error(ERR_LENGTH, "upsert: expected vector of length %lld, got %lld", ll,
                                      AS_LIST(lst)[i]->len);
                 }
-            }
-
-            if (l > p) {
-                drop_obj(obj);
-                return ray_error(ERR_LENGTH, "upsert: list length %lld is greater than %lld", l, p);
             }
 
             if (keys == 1) {
@@ -548,7 +604,7 @@ upsert:
                         v = (i < l) ? at_idx(AS_LIST(lst)[i], j) : null(AS_LIST(AS_LIST(obj)[1])[i]->type);
                         push_obj(AS_LIST(AS_LIST(obj)[1]) + i, v);
                     }
-                    // Update record (we can skip the keys since they are matches)
+                    // Update record (we can skip the keys since they are matches, and only update provided columns)
                     else if (i >= keys && i < l) {
                         v = at_idx(AS_LIST(lst)[i], j);
                         set_idx(AS_LIST(AS_LIST(obj)[1]) + i, row, v);
