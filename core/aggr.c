@@ -492,10 +492,14 @@ obj_p aggr_first(obj_p val, obj_p index) {
             filter = index_group_filter(index);
             res = vector(AS_LIST(val)[0]->type, n);
             if (filter == NULL_OBJ) {
-                for (i = 0; i < n; i++)
+                // No filter - iterate over all partitions
+                l = val->len;
+                for (i = 0; i < l; i++)
                     AS_I64(res)[i] = AS_I64(AS_LIST(val)[i])[0];
             } else {
-                for (i = 0, j = 0; i < n; i++) {
+                // With filter - iterate all partitions, only take matching ones
+                l = filter->len;
+                for (i = 0, j = 0; i < l; i++) {
                     if (AS_LIST(filter)[i] != NULL_OBJ)
                         AS_I64(res)[j++] = AS_I64(AS_LIST(val)[i])[0];
                 }
@@ -510,6 +514,33 @@ obj_p aggr_first(obj_p val, obj_p index) {
             return PARTED_MAP(n, val, index, (raw_p)aggr_first_partial, guid, guid,
                               if (memcmp($out[$y], NULL_GUID, sizeof(guid_t)) == 0)
                                   memcpy($out[$y], $in[$x], sizeof(guid_t)));
+        case TYPE_PARTEDENUM:
+            filter = index_group_filter(index);
+            // Get the enum key from the first partition
+            ek = ray_key(AS_LIST(val)[0]);
+            if (IS_ERR(ek))
+                return ek;
+
+            // Create the values vector with size n (number of groups/matching partitions)
+            parts = I64(n);
+
+            if (filter == NULL_OBJ) {
+                // No filter - iterate over all partitions
+                l = val->len;
+                for (i = 0; i < l; i++)
+                    AS_I64(parts)[i] = AS_I64(ENUM_VAL(AS_LIST(val)[i]))[0];
+            } else {
+                // With filter - iterate all partitions, only take matching ones
+                l = filter->len;
+                for (i = 0, j = 0; i < l; i++) {
+                    if (AS_LIST(filter)[i] != NULL_OBJ)
+                        AS_I64(parts)[j++] = AS_I64(ENUM_VAL(AS_LIST(val)[i]))[0];
+                }
+                resize_obj(&parts, j);
+            }
+
+            res = enumerate(ek, parts);
+            return res;
         case TYPE_MAPCOMMON:
             filter = index_group_filter(index);
             if (filter == NULL_OBJ)

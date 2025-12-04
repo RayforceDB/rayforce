@@ -628,6 +628,38 @@ obj_p ray_in(obj_p x, obj_p y) {
                     return b8(0);
             }
 
+            // Handle TYPE_MAPCOMMON (parted column like Date)
+            // Structure: AS_LIST(x)[0] = unique values, AS_LIST(x)[1] = counts per partition
+            if (x->type == TYPE_MAPCOMMON) {
+                obj_p vals = AS_LIST(x)[0];
+                i64_t l = vals->len;
+                obj_p res = LIST(l);
+                res->type = TYPE_PARTEDB8;
+
+                // For each unique value, check if it's in y
+                for (i = 0; i < l; i++) {
+                    obj_p v = at_idx(vals, i);
+                    obj_p match = ray_in(v, y);
+                    drop_obj(v);
+
+                    if (IS_ERR(match)) {
+                        res->len = i;
+                        drop_obj(res);
+                        return match;
+                    }
+
+                    // Convert result to b8(B8_TRUE) or NULL_OBJ for parted boolean
+                    if (match->type == -TYPE_B8 && match->b8) {
+                        AS_LIST(res)[i] = b8(B8_TRUE);
+                    } else {
+                        AS_LIST(res)[i] = NULL_OBJ;
+                    }
+                    drop_obj(match);
+                }
+
+                return res;
+            }
+
             if (x->type == TYPE_LIST) {
                 vec = LIST(x->len);
                 for (i = 0; i < (i64_t)x->len; i++)
@@ -1081,8 +1113,20 @@ obj_p ray_where(obj_p x) {
             res = LIST(l);
             res->type = TYPE_PARTEDI64;
 
-            for (i = 0; i < l; i++)
-                AS_LIST(res)[i] = (AS_LIST(x)[i] == NULL_OBJ) ? NULL_OBJ : i64(1);
+            for (i = 0; i < l; i++) {
+                obj_p elem = AS_LIST(x)[i];
+                if (elem == NULL_OBJ) {
+                    // Partition doesn't match
+                    AS_LIST(res)[i] = NULL_OBJ;
+                } else if (elem->type < 0) {
+                    // Atom (e.g., b8(B8_TRUE)) - entire partition matches
+                    // Use i64(-1) as a marker meaning "take all rows from this partition"
+                    AS_LIST(res)[i] = i64(-1);
+                } else {
+                    // Vector - compute actual indices where value is true
+                    AS_LIST(res)[i] = ops_where(AS_B8(elem), elem->len);
+                }
+            }
 
             return res;
         default:

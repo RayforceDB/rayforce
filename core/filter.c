@@ -22,6 +22,9 @@
  */
 
 #include "filter.h"
+#include "compose.h"
+#include "ops.h"
+#include "items.h"
 
 obj_p filter_map(obj_p val, obj_p index) {
     i64_t i, l;
@@ -45,4 +48,118 @@ obj_p filter_map(obj_p val, obj_p index) {
     }
 }
 
-obj_p filter_collect(obj_p val, obj_p index) { return at_ids(val, AS_I64(index), index->len); }
+obj_p filter_collect(obj_p val, obj_p index) {
+    i64_t i, l, n, total;
+    obj_p idx, v, res, parts;
+
+    // Handle parted indices
+    if (index->type == TYPE_PARTEDI64) {
+        l = index->len;
+
+        // Handle TYPE_MAPCOMMON (virtual column like Date)
+        // Structure: AS_LIST(val)[0] = values, AS_LIST(val)[1] = counts per partition
+        if (val->type == TYPE_MAPCOMMON) {
+            // Count total matching rows
+            total = 0;
+            for (i = 0; i < l; i++) {
+                idx = AS_LIST(index)[i];
+                if (idx != NULL_OBJ) {
+                    if (idx->type == -TYPE_I64 && idx->i64 == -1) {
+                        // Take all rows from partition i
+                        total += AS_I64(AS_LIST(val)[1])[i];
+                    } else if (idx->len > 0) {
+                        // Take specific rows
+                        total += idx->len;
+                    }
+                }
+            }
+
+            // Create result with appropriate type
+            res = vector(AS_LIST(val)[0]->type, total);
+            n = 0;
+            for (i = 0; i < l; i++) {
+                idx = AS_LIST(index)[i];
+                if (idx != NULL_OBJ) {
+                    i64_t count, j;
+                    if (idx->type == -TYPE_I64 && idx->i64 == -1) {
+                        count = AS_I64(AS_LIST(val)[1])[i];
+                    } else if (idx->len > 0) {
+                        count = idx->len;
+                    } else {
+                        continue;
+                    }
+                    // Fill with the partition value
+                    for (j = 0; j < count; j++) {
+                        switch (AS_LIST(val)[0]->type) {
+                            case TYPE_DATE:
+                            case TYPE_I32:
+                                AS_I32(res)[n + j] = AS_I32(AS_LIST(val)[0])[i];
+                                break;
+                            case TYPE_I64:
+                            case TYPE_TIMESTAMP:
+                                AS_I64(res)[n + j] = AS_I64(AS_LIST(val)[0])[i];
+                                break;
+                            default:
+                                // Generic copy for other types
+                                AS_I64(res)[n + j] = AS_I64(AS_LIST(val)[0])[i];
+                                break;
+                        }
+                    }
+                    n += count;
+                }
+            }
+            return res;
+        }
+
+        // Handle parted types (TYPE_PARTED*)
+        // Count matching partitions first to avoid NULL_OBJ entries
+        n = 0;
+        for (i = 0; i < l; i++) {
+            idx = AS_LIST(index)[i];
+            if (idx != NULL_OBJ && !(idx->type == -TYPE_I64 && idx->i64 == -1 && ops_count(AS_LIST(val)[i]) == 0)) {
+                if (idx->type == -TYPE_I64 && idx->i64 == -1) {
+                    n++;  // Marker -1: take all rows from partition
+                } else if (idx->len > 0) {
+                    n++;  // Has indices to select
+                }
+            }
+        }
+
+        parts = LIST(n);
+        n = 0;
+
+        for (i = 0; i < l; i++) {
+            idx = AS_LIST(index)[i];
+            if (idx == NULL_OBJ) {
+                // Partition doesn't match at all - skip
+                continue;
+            } else if (idx->type == -TYPE_I64 && idx->i64 == -1) {
+                // Marker -1 means "take all rows from this partition"
+                v = AS_LIST(val)[i];
+                res = ray_value(v);
+                if (res != NULL_OBJ && ops_count(res) > 0) {
+                    AS_LIST(parts)[n++] = res;
+                } else if (res != NULL_OBJ) {
+                    drop_obj(res);
+                }
+            } else if (idx->len == 0) {
+                // Empty index list - skip
+                continue;
+            } else {
+                // Use index list to select specific rows
+                v = AS_LIST(val)[i];
+                res = at_ids(v, AS_I64(idx), idx->len);
+                if (res != NULL_OBJ && !IS_ERR(res)) {
+                    AS_LIST(parts)[n++] = res;
+                }
+            }
+        }
+
+        parts->len = n;
+        res = ray_raze(parts);
+        drop_obj(parts);
+        return res;
+    }
+
+    return at_ids(val, AS_I64(index), index->len);
+}
