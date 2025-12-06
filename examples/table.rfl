@@ -9,9 +9,3 @@
           (as 'Timestamp (til n)) 
     ))
 )
-
-(select 
-  { from: t
-    by: Symbol
-    m: (sum Price)
-  })
