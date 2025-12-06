@@ -36,31 +36,31 @@
 const i64_t MAX_RANGE = 1 << 20;
 
 u64_t __hash_get(i64_t row, raw_p seed) {
-    __index_find_ctx_t* ctx = (__index_find_ctx_t*)seed;
+    __index_find_ctx_t *ctx = (__index_find_ctx_t *)seed;
     return ctx->hashes[row];
 }
 
 i64_t __cmp_obj(i64_t row1, i64_t row2, raw_p seed) {
-    __index_find_ctx_t* ctx = (__index_find_ctx_t*)seed;
-    return cmp_obj(((obj_p*)ctx->lobj)[row1], ((obj_p*)ctx->robj)[row2]);
+    __index_find_ctx_t *ctx = (__index_find_ctx_t *)seed;
+    return cmp_obj(((obj_p *)ctx->lobj)[row1], ((obj_p *)ctx->robj)[row2]);
 }
 
 i64_t __hash_cmp_guid(i64_t row1, i64_t row2, raw_p seed) {
-    __index_find_ctx_t* ctx = (__index_find_ctx_t*)seed;
-    return memcmp((guid_t*)ctx->lobj + row1, (guid_t*)ctx->robj + row2, sizeof(guid_t));
+    __index_find_ctx_t *ctx = (__index_find_ctx_t *)seed;
+    return memcmp((guid_t *)ctx->lobj + row1, (guid_t *)ctx->robj + row2, sizeof(guid_t));
 }
 
 u64_t __index_list_hash_get(i64_t row, raw_p seed) {
-    __index_list_ctx_t* ctx = (__index_list_ctx_t*)seed;
+    __index_list_ctx_t *ctx = (__index_list_ctx_t *)seed;
     return ctx->hashes[row];
 }
 
 i64_t __index_list_cmp_row(i64_t row1, i64_t row2, raw_p seed) {
     i64_t i, l;
-    __index_list_ctx_t* ctx = (__index_list_ctx_t*)seed;
-    i64_t* filter = ctx->filter;
-    obj_p* lcols = AS_LIST(ctx->lcols);
-    obj_p* rcols = AS_LIST(ctx->rcols);
+    __index_list_ctx_t *ctx = (__index_list_ctx_t *)seed;
+    i64_t *filter = ctx->filter;
+    obj_p *lcols = AS_LIST(ctx->lcols);
+    obj_p *rcols = AS_LIST(ctx->rcols);
 
     l = ctx->lcols->len;
 
@@ -79,12 +79,12 @@ i64_t __index_list_cmp_row(i64_t row1, i64_t row2, raw_p seed) {
 }
 
 obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, i64_t offset, b8_t resolve) {
-    u8_t* u8v;
-    i32_t* i32v;
-    guid_t* g64v;
+    u8_t *u8v;
+    i32_t *i32v;
+    guid_t *g64v;
     i64_t i, *u64v;
     obj_p k, v, *l64v;
-    i64_t* ids;
+    i64_t *ids;
 
     switch (obj->type) {
         case -TYPE_B8:
@@ -101,7 +101,7 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
             out[offset] = hash_index_u64((i64_t)obj->f64, out[offset]);
             break;
         case -TYPE_GUID:
-            out[offset] = hash_index_u64(*(i64_t*)AS_GUID(obj), *((i64_t*)AS_GUID(obj) + 1));
+            out[offset] = hash_index_u64(*(i64_t *)AS_GUID(obj), *((i64_t *)AS_GUID(obj) + 1));
             break;
         case TYPE_B8:
         case TYPE_U8:
@@ -117,7 +117,7 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
         case TYPE_I32:
         case TYPE_DATE:
         case TYPE_TIME:
-            i32v = (i32_t*)AS_I32(obj);
+            i32v = (i32_t *)AS_I32(obj);
             if (filter)
                 for (i = offset; i < len + offset; i++)
                     out[i] = hash_index_u64((i64_t)i32v[filter[i]], out[i]);
@@ -128,7 +128,7 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
-            u64v = (i64_t*)AS_I64(obj);
+            u64v = (i64_t *)AS_I64(obj);
             if (filter)
                 for (i = offset; i < len + offset; i++)
                     out[i] = hash_index_u64(u64v[filter[i]], out[i]);
@@ -137,7 +137,7 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
                     out[i] = hash_index_u64(u64v[i], out[i]);
             break;
         case TYPE_F64:
-            u64v = (i64_t*)AS_F64(obj);
+            u64v = (i64_t *)AS_F64(obj);
             if (filter)
                 for (i = offset; i < len + offset; i++)
                     out[i] = hash_index_u64(u64v[filter[i]], out[i]);
@@ -149,13 +149,13 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
             g64v = AS_GUID(obj);
             if (filter)
                 for (i = offset; i < len + offset; i++) {
-                    out[i] = hash_index_u64(*(i64_t*)&g64v[filter[i]], out[i]);
-                    out[i] = hash_index_u64(*((i64_t*)&g64v[filter[i]] + 1), out[i]);
+                    out[i] = hash_index_u64(*(i64_t *)&g64v[filter[i]], out[i]);
+                    out[i] = hash_index_u64(*((i64_t *)&g64v[filter[i]] + 1), out[i]);
                 }
             else
                 for (i = offset; i < len + offset; i++) {
-                    out[i] = hash_index_u64(*(i64_t*)&g64v[i], out[i]);
-                    out[i] = hash_index_u64(*((i64_t*)&g64v[i] + 1), out[i]);
+                    out[i] = hash_index_u64(*(i64_t *)&g64v[i], out[i]);
+                    out[i] = hash_index_u64(*((i64_t *)&g64v[i] + 1), out[i]);
                 }
             break;
         case TYPE_LIST:
@@ -172,7 +172,7 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
                 k = ray_key(obj);
                 v = ray_get(k);
                 drop_obj(k);
-                u64v = (i64_t*)AS_SYMBOL(v);
+                u64v = (i64_t *)AS_SYMBOL(v);
                 ids = AS_I64(ENUM_VAL(obj));
                 if (filter)
                     for (i = offset; i < len + offset; i++)
@@ -182,7 +182,7 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
                         out[i] = hash_index_u64(u64v[ids[i]], out[i]);
                 drop_obj(v);
             } else {
-                u64v = (i64_t*)AS_I64(ENUM_VAL(obj));
+                u64v = (i64_t *)AS_I64(ENUM_VAL(obj));
                 if (filter)
                     for (i = offset; i < len + offset; i++)
                         out[i] = hash_index_u64(u64v[filter[i]], out[i]);
@@ -253,7 +253,7 @@ nil_t index_hash_obj(obj_p obj, i64_t out[], i64_t filter[], i64_t len, b8_t res
     index_hash_obj_partial(obj, out, filter, len, 0, resolve);
 }
 
-obj_p index_scope_partial_i32(i64_t len, i32_t* values, i64_t* indices, i64_t offset, i64_t* pmin, i64_t* pmax) {
+obj_p index_scope_partial_i32(i64_t len, i32_t *values, i64_t *indices, i64_t offset, i64_t *pmin, i64_t *pmax) {
     i32_t min, max;
     i64_t i, l;
 
@@ -320,7 +320,7 @@ index_scope_t index_scope_i32(i32_t values[], i64_t indices[], i64_t len) {
     return (index_scope_t){min, max, (i64_t)(max - min + 1)};
 }
 
-obj_p index_scope_partial_i64(i64_t len, i64_t* values, i64_t* indices, i64_t offset, i64_t* pmin, i64_t* pmax) {
+obj_p index_scope_partial_i64(i64_t len, i64_t *values, i64_t *indices, i64_t offset, i64_t *pmin, i64_t *pmax) {
     i64_t min, max;
     i64_t i, l;
 
@@ -396,7 +396,7 @@ obj_p index_distinct_i8(i8_t values[], i64_t len) {
     range = 256;
 
     vec = U8(range);
-    out = (i8_t*)AS_U8(vec);
+    out = (i8_t *)AS_U8(vec);
     memset(out, 0, range);
 
     for (i = 0; i < len; i++) {
@@ -446,7 +446,7 @@ obj_p index_distinct_i16(i16_t values[], i64_t len) {
 
 obj_p index_distinct_i32(i32_t values[], i64_t len) {
     i64_t i, j, l;
-    i32_t* out;
+    i32_t *out;
     i64_t p, *keys;
     obj_p vec, set;
     const index_scope_t scope = index_scope_i32(values, NULL, len);
@@ -563,7 +563,7 @@ obj_p index_distinct_guid(guid_t values[], i64_t len) {
     i64_t i, j;
     i64_t p, *out;
     obj_p vec, set;
-    guid_t* g;
+    guid_t *g;
 
     set = ht_oa_create(len, -1);
 
@@ -583,7 +583,7 @@ obj_p index_distinct_guid(guid_t values[], i64_t len) {
     len = AS_LIST(set)[0]->len;
     for (i = 0, j = 0; i < len; i++) {
         if (out[i] != NULL_I64)
-            memcpy(&g[j++], (guid_t*)out[i], sizeof(guid_t));
+            memcpy(&g[j++], (guid_t *)out[i], sizeof(guid_t));
     }
 
     vec->attrs |= ATTR_DISTINCT;
@@ -1323,10 +1323,10 @@ obj_p index_in_guid_guid(guid_t x[], i64_t xl, guid_t y[], i64_t yl) {
     hs = I64(xl);
     ht = ht_oa_create(xl, -1);
 
-    hashes = (i64_t*)AS_I64(hs);
+    hashes = (i64_t *)AS_I64(hs);
 
     for (i = 0; i < xl; i++)
-        hashes[i] = hash_index_u64(*(i64_t*)(x + i), *((i64_t*)(x + i) + 1));
+        hashes[i] = hash_index_u64(*(i64_t *)(x + i), *((i64_t *)(x + i) + 1));
 
     ctx = (__index_find_ctx_t){.lobj = x, .robj = x, .hashes = hashes};
     for (i = 0; i < xl; i++) {
@@ -1336,7 +1336,7 @@ obj_p index_in_guid_guid(guid_t x[], i64_t xl, guid_t y[], i64_t yl) {
     }
 
     for (i = 0; i < yl; i++)
-        hashes[i] = hash_index_u64(*(i64_t*)(y + i), *((i64_t*)(y + i) + 1));
+        hashes[i] = hash_index_u64(*(i64_t *)(y + i), *((i64_t *)(y + i) + 1));
 
     res = B8(yl);
 
@@ -1467,10 +1467,10 @@ obj_p index_find_guid(guid_t x[], i64_t xl, guid_t y[], i64_t yl) {
     res = I64(MAXI64(xl, yl));
     ht = ht_oa_create(MAXI64(xl, yl) * 2, -1);
 
-    hashes = (i64_t*)AS_I64(res);
+    hashes = (i64_t *)AS_I64(res);
 
     for (i = 0; i < xl; i++)
-        hashes[i] = hash_index_u64(*(i64_t*)(x + i), *((i64_t*)(x + i) + 1));
+        hashes[i] = hash_index_u64(*(i64_t *)(x + i), *((i64_t *)(x + i) + 1));
 
     ctx = (__index_find_ctx_t){.lobj = x, .robj = x, .hashes = hashes};
     for (i = 0; i < xl; i++) {
@@ -1480,7 +1480,7 @@ obj_p index_find_guid(guid_t x[], i64_t xl, guid_t y[], i64_t yl) {
     }
 
     for (i = 0; i < yl; i++)
-        hashes[i] = hash_index_u64(*(i64_t*)(y + i), *((i64_t*)(y + i) + 1));
+        hashes[i] = hash_index_u64(*(i64_t *)(y + i), *((i64_t *)(y + i) + 1));
 
     ctx = (__index_find_ctx_t){.lobj = x, .robj = y, .hashes = hashes};
     for (i = 0; i < yl; i++) {
@@ -1504,7 +1504,7 @@ obj_p index_find_obj(obj_p x[], i64_t xl, obj_p y[], i64_t yl) {
     res = I64(MAXI64(xl, yl));
     ht = ht_oa_create(MAXI64(xl, yl) * 2, -1);
 
-    hashes = (i64_t*)AS_I64(res);
+    hashes = (i64_t *)AS_I64(res);
 
     for (i = 0; i < xl; i++)
         hashes[i] = hash_index_u64(hash_index_obj(x[i]), 0xa5b6c7d8e9f01234ull);
@@ -1533,14 +1533,14 @@ obj_p index_find_obj(obj_p x[], i64_t xl, obj_p y[], i64_t yl) {
 
 i64_t index_group_count(obj_p index) { return (i64_t)AS_LIST(index)[1]->i64; }
 
-i64_t* index_group_ids(obj_p index) {
+i64_t *index_group_ids(obj_p index) {
     if (AS_LIST(index)[2] != NULL_OBJ)
         return AS_I64(AS_LIST(index)[2]);
 
     return NULL;
 }
 
-i64_t* index_group_filter_ids(obj_p index) {
+i64_t *index_group_filter_ids(obj_p index) {
     if (AS_LIST(index)[5]->type == TYPE_I64)
         return AS_I64(AS_LIST(index)[5]);
 
@@ -1564,7 +1564,7 @@ i64_t index_group_len(obj_p index) {
 
 index_type_t index_group_type(obj_p index) { return (index_type_t)AS_LIST(index)[0]->i64; }
 
-i64_t* index_group_source(obj_p index) { return AS_I64(AS_LIST(index)[4]); }
+i64_t *index_group_source(obj_p index) { return AS_I64(AS_LIST(index)[4]); }
 
 i64_t index_group_shift(obj_p index) { return AS_LIST(index)[3]->i64; }
 
@@ -1575,85 +1575,94 @@ static obj_p index_group_build(index_type_t tp, i64_t groups_count, obj_p group_
     return vn_list(7, i64(tp), i64(groups_count), group_ids, index_min, source, filter, meta);
 }
 
-typedef struct __group_radix_part_ctx_t {
-    i64_t partitions;
-    i64_t partition;
-}* group_radix_part_ctx_p;
+// Context for chunk-based parallel grouping
+typedef struct __group_chunk_ctx_t {
+    i64_t *keys;
+    i64_t *filter;
+    i64_t *out;
+    i64_t *local_groups;  // per-chunk group count
+    hash_f hash;
+    cmp_f cmp;
+    obj_p *local_hts;  // per-chunk hash tables
+} __group_chunk_ctx_t;
 
-obj_p index_group_distribute_partial(group_radix_part_ctx_p ctx, i64_t* groups, i64_t keys[], i64_t filter[],
-                                     i64_t out[], i64_t len, hash_f hash, cmp_f cmp) {
-    i64_t i, partition_id, partitions, size, partition;
-    i64_t *k, *v, n, idx;
-    u64_t h;
+// Phase 1: Each chunk builds its own local hash table and assigns local group IDs
+obj_p index_group_chunk_local(i64_t len, i64_t offset, __group_chunk_ctx_t *ctx) {
+    i64_t i, idx, n, groups;
+    i64_t *k, *v, *keys, *filter, *out;
     obj_p ht;
+    hash_f hash;
+    cmp_f cmp;
 
-    partitions = ctx->partitions;
-    partition = ctx->partition;
+    keys = ctx->keys;
+    filter = ctx->filter;
+    out = ctx->out;
+    hash = ctx->hash;
+    cmp = ctx->cmp;
 
-    size = (partition + 1 < partitions) ? (len / partitions) : (len - (len / partitions) * partition);
-    ht = ht_oa_create(size, TYPE_I64);
+    ht = ht_oa_create(len, TYPE_I64);
+    groups = 0;
 
     if (filter) {
-        for (i = 0; i < len; i++) {
+        for (i = offset; i < offset + len; i++) {
             n = keys[filter[i]];
-
-            // determine if the key is ours due to radix partitioning
-            // use hash value for partitioning to ensure identical objects go to same partition
-            h = hash(n, NULL);
-            partition_id = h % partitions;
-            if (partition_id != partition)
-                continue;
-
             idx = ht_oa_tab_next_with(&ht, n, hash, cmp, NULL);
             k = AS_I64(AS_LIST(ht)[0]);
             v = AS_I64(AS_LIST(ht)[1]);
 
             if (k[idx] == NULL_I64) {
                 k[idx] = n;
-                v[idx] = __atomic_fetch_add(groups, 1, __ATOMIC_RELAXED);
+                v[idx] = groups++;
             }
 
             out[i] = v[idx];
         }
     } else {
-        for (i = 0; i < len; i++) {
+        for (i = offset; i < offset + len; i++) {
             n = keys[i];
-
-            // determine if the key is ours due to radix partitioning
-            // use hash value for partitioning to ensure identical objects go to same partition
-            h = hash(n, NULL);
-            partition_id = h % partitions;
-            if (partition_id != partition)
-                continue;
-
             idx = ht_oa_tab_next_with(&ht, n, hash, cmp, NULL);
             k = AS_I64(AS_LIST(ht)[0]);
             v = AS_I64(AS_LIST(ht)[1]);
 
             if (k[idx] == NULL_I64) {
                 k[idx] = n;
-                v[idx] = __atomic_fetch_add(groups, 1, __ATOMIC_RELAXED);
+                v[idx] = groups++;
             }
 
             out[i] = v[idx];
         }
     }
 
-    drop_obj(ht);
+    ctx->local_groups[offset > 0 ? 1 : 0] = groups;  // Store in appropriate slot based on chunk
+    ctx->local_hts[offset > 0 ? 1 : 0] = ht;
+
+    return NULL_OBJ;
+}
+
+// Phase 2: Remap local group IDs to global IDs using the merged hash table
+obj_p index_group_chunk_remap(i64_t len, i64_t offset, i64_t *out, i64_t *remap) {
+    i64_t i;
+
+    for (i = offset; i < offset + len; i++)
+        out[i] = remap[out[i]];
 
     return NULL_OBJ;
 }
 
 i64_t index_group_distribute(i64_t keys[], i64_t filter[], i64_t out[], i64_t len, hash_f hash, cmp_f cmp) {
-    i64_t i, parts, groups;
-    i64_t idx, n, *k, *v;
+    i64_t i, j, parts, groups, chunk, last_chunk;
+    i64_t idx, n, *k, *v, *remap;
+    i64_t offsets[32], local_groups[32];  // Support up to 32 chunks
+    obj_p local_hts[32];
     pool_p pool;
-    obj_p ht, res;
+    obj_p ht, merged_ht, res;
+    __group_chunk_ctx_t ctx;
 
     pool = pool_get();
     parts = pool_split_by(pool, len, 0);
     groups = 0;
 
+    // Single-threaded path
     if (parts == 1) {
         ht = ht_oa_create(len, TYPE_I64);
 
@@ -1688,22 +1697,95 @@ i64_t index_group_distribute(i64_t keys[], i64_t filter[], i64_t out[], i64_t le
         }
 
         drop_obj(ht);
-
         return groups;
     }
 
-    struct __group_radix_part_ctx_t ctx[parts];
+    // Limit parts to avoid stack overflow
+    if (parts > 32)
+        parts = 32;
 
-    pool_prepare(pool);
+    // Setup context
+    ctx.keys = keys;
+    ctx.filter = filter;
+    ctx.out = out;
+    ctx.local_groups = local_groups;
+    ctx.hash = hash;
+    ctx.cmp = cmp;
+    ctx.local_hts = local_hts;
+
+    // Initialize
     for (i = 0; i < parts; i++) {
-        ctx[i].partitions = parts;
-        ctx[i].partition = i;
-        pool_add_task(pool, (raw_p)index_group_distribute_partial, 8, &ctx[i], &groups, keys, filter, out, len, hash,
-                      cmp);
+        local_groups[i] = 0;
+        local_hts[i] = NULL_OBJ;
     }
 
+    // Calculate chunk sizes
+    chunk = len / parts;
+    last_chunk = len - chunk * (parts - 1);
+
+    // Phase 1: Build local hash tables in parallel (each chunk gets its own)
+    pool_prepare(pool);
+    for (i = 0; i < parts; i++) {
+        offsets[i] = i * chunk;
+        ctx.local_groups = local_groups + i;
+        ctx.local_hts = local_hts + i;
+
+        if (i < parts - 1)
+            pool_add_task(pool, (raw_p)index_group_chunk_local, 3, chunk, i * chunk, &ctx);
+        else
+            pool_add_task(pool, (raw_p)index_group_chunk_local, 3, last_chunk, i * chunk, &ctx);
+    }
     res = pool_run(pool);
     drop_obj(res);
+
+    // Phase 2: Merge local hash tables sequentially to assign global group IDs
+    // This is O(total_unique_keys) which is typically much smaller than O(n)
+    merged_ht = ht_oa_create(len, TYPE_I64);
+    groups = 0;
+
+    // For each chunk, create a remap array and merge its unique keys
+    for (i = 0; i < parts; i++) {
+        if (local_hts[i] == NULL_OBJ)
+            continue;
+
+        ht = local_hts[i];
+        i64_t ht_len = AS_LIST(ht)[0]->len;
+        i64_t *ht_keys = AS_I64(AS_LIST(ht)[0]);
+        i64_t *ht_vals = AS_I64(AS_LIST(ht)[1]);
+
+        // Create remap array for this chunk's local IDs -> global IDs
+        remap = (i64_t *)heap_alloc(local_groups[i] * sizeof(i64_t));
+
+        for (j = 0; j < ht_len; j++) {
+            if (ht_keys[j] != NULL_I64) {
+                i64_t local_id = ht_vals[j];
+                n = ht_keys[j];
+
+                // Check if this key exists in merged table
+                idx = ht_oa_tab_next_with(&merged_ht, n, hash, cmp, NULL);
+                k = AS_I64(AS_LIST(merged_ht)[0]);
+                v = AS_I64(AS_LIST(merged_ht)[1]);
+
+                if (k[idx] == NULL_I64) {
+                    k[idx] = n;
+                    v[idx] = groups++;
+                }
+
+                remap[local_id] = v[idx];
+            }
+        }
+
+        // Remap this chunk's output values
+        i64_t chunk_start = offsets[i];
+        i64_t chunk_len = (i < parts - 1) ? chunk : last_chunk;
+        for (j = chunk_start; j < chunk_start + chunk_len; j++)
+            out[j] = remap[out[j]];
+
+        heap_free(remap);
+        drop_obj(ht);
+    }
+
+    drop_obj(merged_ht);
 
     return groups;
 }
@@ -1711,7 +1793,7 @@ i64_t index_group_distribute(i64_t keys[], i64_t filter[], i64_t out[], i64_t le
 obj_p index_group_i8(obj_p obj, obj_p filter) {
     i64_t i, j, n, len, range;
     i64_t min, *hk, *hv, *indices;
-    i8_t* values;
+    i8_t *values;
     obj_p keys, vals;
 
     values = AS_I8(obj);
@@ -1876,7 +1958,7 @@ obj_p index_group_f64(obj_p obj, obj_p filter) { return index_group_i64_unscoped
 obj_p index_group_guid(obj_p obj, obj_p filter) {
     i64_t i, j, len;
     i64_t idx, *hk, *hv, *hp, *indices;
-    guid_t* values;
+    guid_t *values;
     obj_p vals, ht;
 
     values = AS_GUID(obj);
@@ -1924,7 +2006,7 @@ obj_p index_group_obj(obj_p obj, obj_p filter) {
     i64_t *out, *indices, *values;
     obj_p vals;
 
-    values = (i64_t*)AS_LIST(obj);
+    values = (i64_t *)AS_LIST(obj);
     indices = is_null(filter) ? NULL : AS_I64(filter);
     len = indices ? filter->len : obj->len;
 
@@ -1992,7 +2074,7 @@ obj_p index_group(obj_p val, obj_p filter) {
 }
 
 obj_p index_group_list_perfect(obj_p obj, obj_p filter) {
-    u8_t* xb;
+    u8_t *xb;
     u64_t i, j, l, len, product;
     i64_t *xi, *xo, *indices;
     obj_p ht, col, res, *values;
@@ -2024,7 +2106,7 @@ obj_p index_group_list_perfect(obj_p obj, obj_p filter) {
         }
     }
 
-    scopes = (index_scope_t*)heap_alloc(l * sizeof(index_scope_t));
+    scopes = (index_scope_t *)heap_alloc(l * sizeof(index_scope_t));
 
     // calculate scopes of each column to check if we can use direct hashing
     for (i = 0; i < l; i++) {
@@ -2105,7 +2187,7 @@ obj_p index_group_list_perfect(obj_p obj, obj_p filter) {
                 }
                 break;
             case TYPE_F64:
-                xi = (i64_t*)AS_F64(col);
+                xi = (i64_t *)AS_F64(col);
                 if (indices) {
                     for (j = 0; j < len; j++)
                         xo[j] += (xi[indices[j]] - scopes[i].min) * multipliers[i];
@@ -2127,11 +2209,50 @@ obj_p index_group_list_perfect(obj_p obj, obj_p filter) {
     return res;
 }
 
+// Context for parallel list grouping
+typedef struct __group_list_chunk_ctx_t {
+    __index_list_ctx_t *list_ctx;
+    i64_t *out;
+    i64_t *hashes;
+    i64_t local_groups;
+    obj_p local_ht;
+} __group_list_chunk_ctx_t;
+
+// Phase 1: Each chunk builds its own local hash table
+obj_p index_group_list_chunk_local(i64_t len, i64_t offset, __group_list_chunk_ctx_t *ctx) {
+    i64_t i, v, groups;
+    i64_t *out;
+    obj_p ht;
+    __index_list_ctx_t *list_ctx;
+
+    out = ctx->out;
+    list_ctx = ctx->list_ctx;
+
+    ht = ht_oa_create(len, TYPE_I64);
+    groups = 0;
+
+    for (i = offset; i < offset + len; i++) {
+        v = ht_oa_tab_insert_with(&ht, i, groups, &__index_list_hash_get, &__index_list_cmp_row, list_ctx);
+        if (v == groups)
+            groups++;
+
+        out[i] = v;
+    }
+
+    ctx->local_groups = groups;
+    ctx->local_ht = ht;
+
+    return NULL_OBJ;
+}
+
 obj_p index_group_list(obj_p obj, obj_p filter) {
-    i64_t i, len;
-    i64_t g, v, *xo, *indices;
-    obj_p res, *values, ht;
+    i64_t i, j, len, parts, chunk, last_chunk, groups;
+    i64_t g, v, *xo, *indices, *remap;
+    obj_p res, *values, ht, poolres;
     __index_list_ctx_t ctx;
+    __group_list_chunk_ctx_t chunk_ctxs[32];
+    i64_t offsets[32];
+    pool_p pool;
 
     if (ops_count(obj) == 0)
         return ray_error(ERR_LENGTH, "group index list: empty source");
@@ -2150,33 +2271,112 @@ obj_p index_group_list(obj_p obj, obj_p filter) {
     indices = is_null(filter) ? NULL : AS_I64(filter);
     len = indices ? filter->len : values[0]->len;
 
-    ht = ht_oa_create(len, TYPE_I64);
-
     res = I64(len);
     xo = AS_I64(res);
 
-    __index_list_precalc_hash(obj, (i64_t*)xo, obj->len, len, indices, B8_FALSE);
+    __index_list_precalc_hash(obj, (i64_t *)xo, obj->len, len, indices, B8_FALSE);
     timeit_tick("group index precalc hash");
 
-    ctx = (__index_list_ctx_t){.lcols = obj, .rcols = obj, .hashes = (i64_t*)xo, .filter = indices};
+    ctx = (__index_list_ctx_t){.lcols = obj, .rcols = obj, .hashes = (i64_t *)xo, .filter = indices};
 
-    // NOTE: We can reuse the same vector for output indices, that is used for hashes, because
-    // it's guaranteed do not rehash the table caus ewe reserved enough space for it
+    pool = pool_get();
+    parts = pool_split_by(pool, len, 0);
 
-    // distribute bins
-    for (i = 0, g = 0; i < len; i++) {
-        v = ht_oa_tab_insert_with(&ht, i, g, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
-        if (v == g)
-            g++;
+    // Single-threaded path
+    if (parts == 1) {
+        ht = ht_oa_create(len, TYPE_I64);
 
-        xo[i] = v;
+        // distribute bins
+        for (i = 0, g = 0; i < len; i++) {
+            v = ht_oa_tab_insert_with(&ht, i, g, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
+            if (v == g)
+                g++;
+
+            xo[i] = v;
+        }
+
+        drop_obj(ht);
+        timeit_tick("group index list");
+
+        return index_group_build(INDEX_TYPE_IDS, g, res, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
+    }
+
+    // Limit parts
+    if (parts > 32)
+        parts = 32;
+
+    // Calculate chunk sizes
+    chunk = len / parts;
+    last_chunk = len - chunk * (parts - 1);
+
+    // Initialize chunk contexts
+    for (i = 0; i < parts; i++) {
+        offsets[i] = i * chunk;
+        chunk_ctxs[i].list_ctx = &ctx;
+        chunk_ctxs[i].out = xo;
+        chunk_ctxs[i].hashes = xo;
+        chunk_ctxs[i].local_groups = 0;
+        chunk_ctxs[i].local_ht = NULL_OBJ;
+    }
+
+    // Phase 1: Build local hash tables in parallel
+    pool_prepare(pool);
+    for (i = 0; i < parts; i++) {
+        if (i < parts - 1)
+            pool_add_task(pool, (raw_p)index_group_list_chunk_local, 3, chunk, i * chunk, &chunk_ctxs[i]);
+        else
+            pool_add_task(pool, (raw_p)index_group_list_chunk_local, 3, last_chunk, i * chunk, &chunk_ctxs[i]);
+    }
+    poolres = pool_run(pool);
+    drop_obj(poolres);
+
+    // Phase 2: Merge local hash tables sequentially
+    // This is O(total_unique_keys) which is typically much smaller than O(n)
+    ht = ht_oa_create(len, TYPE_I64);
+    groups = 0;
+
+    for (i = 0; i < parts; i++) {
+        if (chunk_ctxs[i].local_ht == NULL_OBJ)
+            continue;
+
+        obj_p local_ht = chunk_ctxs[i].local_ht;
+        i64_t ht_len = AS_LIST(local_ht)[0]->len;
+        i64_t *ht_keys = AS_I64(AS_LIST(local_ht)[0]);
+        i64_t *ht_vals = AS_I64(AS_LIST(local_ht)[1]);
+
+        // Create remap array for this chunk's local IDs -> global IDs
+        remap = (i64_t *)heap_alloc(chunk_ctxs[i].local_groups * sizeof(i64_t));
+
+        // For each unique key in this chunk's hash table
+        for (j = 0; j < ht_len; j++) {
+            if (ht_keys[j] != NULL_I64) {
+                i64_t local_id = ht_vals[j];
+                i64_t row_idx = ht_keys[j];  // This stores the row index, not the key itself
+
+                // Try to insert into merged table
+                v = ht_oa_tab_insert_with(&ht, row_idx, groups, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
+                if (v == groups)
+                    groups++;
+
+                remap[local_id] = v;
+            }
+        }
+
+        // Remap this chunk's output values
+        i64_t chunk_start = offsets[i];
+        i64_t chunk_len = (i < parts - 1) ? chunk : last_chunk;
+        for (j = chunk_start; j < chunk_start + chunk_len; j++)
+            xo[j] = remap[xo[j]];
+
+        heap_free(remap);
+        drop_obj(local_ht);
     }
 
     drop_obj(ht);
 
     timeit_tick("group index list");
 
-    return index_group_build(INDEX_TYPE_IDS, g, res, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
+    return index_group_build(INDEX_TYPE_IDS, groups, res, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
 }
 
 obj_p index_left_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
@@ -2196,8 +2396,8 @@ obj_p index_left_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
     hashes = I64(MAXI64(ll, rl));
 
     // Right hashes
-    __index_list_precalc_hash(rcols, (i64_t*)AS_I64(hashes), len, rl, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, rcols, (i64_t*)AS_I64(hashes), NULL};
+    __index_list_precalc_hash(rcols, (i64_t *)AS_I64(hashes), len, rl, NULL, B8_TRUE);
+    ctx = (__index_list_ctx_t){rcols, rcols, (i64_t *)AS_I64(hashes), NULL};
     for (i = 0; i < rl; i++) {
         idx = ht_oa_tab_next_with(&ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
         if (AS_I64(AS_LIST(ht)[0])[idx] == NULL_I64)
@@ -2207,8 +2407,8 @@ obj_p index_left_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
     ids = I64(ll);
 
     // Left hashes
-    __index_list_precalc_hash(lcols, (i64_t*)AS_I64(hashes), len, ll, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, lcols, (i64_t*)AS_I64(hashes), NULL};
+    __index_list_precalc_hash(lcols, (i64_t *)AS_I64(hashes), len, ll, NULL, B8_TRUE);
+    ctx = (__index_list_ctx_t){rcols, lcols, (i64_t *)AS_I64(hashes), NULL};
     for (i = 0; i < ll; ++i) {
         idx = ht_oa_tab_get_with(ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
         if (idx != NULL_I64)
@@ -2242,8 +2442,8 @@ obj_p index_inner_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
     rids = I64(MAXI64(ll, rl));
 
     // Right hashes
-    __index_list_precalc_hash(rcols, (i64_t*)AS_I64(rids), len, rl, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, rcols, (i64_t*)AS_I64(rids), NULL};
+    __index_list_precalc_hash(rcols, (i64_t *)AS_I64(rids), len, rl, NULL, B8_TRUE);
+    ctx = (__index_list_ctx_t){rcols, rcols, (i64_t *)AS_I64(rids), NULL};
     for (i = 0; i < rl; i++) {
         idx = ht_oa_tab_next_with(&ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
         if (AS_I64(AS_LIST(ht)[0])[idx] == NULL_I64)
@@ -2253,8 +2453,8 @@ obj_p index_inner_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
     lids = I64(ll);
 
     // Left hashes
-    __index_list_precalc_hash(lcols, (i64_t*)AS_I64(rids), len, ll, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, lcols, (i64_t*)AS_I64(rids), NULL};
+    __index_list_precalc_hash(lcols, (i64_t *)AS_I64(rids), len, ll, NULL, B8_TRUE);
+    ctx = (__index_list_ctx_t){rcols, lcols, (i64_t *)AS_I64(rids), NULL};
     for (i = 0, j = 0; i < ll; i++) {
         idx = ht_oa_tab_get_with(ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
         if (idx != NULL_I64) {
@@ -2406,7 +2606,7 @@ i64_t index_bin_f64(f64_t val, f64_t vals[], i64_t ids[], i64_t len) {
     return (idx == NULL_I64) ? NULL_I64 : ids[idx];
 }
 
-static obj_p __asof_ids_partial(__index_list_ctx_t* ctx, obj_p lxcol, obj_p rxcol, obj_p ht, i64_t len, i64_t offset,
+static obj_p __asof_ids_partial(__index_list_ctx_t *ctx, obj_p lxcol, obj_p rxcol, obj_p ht, i64_t len, i64_t offset,
                                 obj_p ids) {
     i64_t i, idx, p;
 
@@ -2444,8 +2644,8 @@ obj_p index_asof_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol) {
     hashes = I64(MAXI64(ll, rl));
 
     // Right hashes
-    __index_list_precalc_hash(rcols, (i64_t*)AS_I64(hashes), rcols->len, rl, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, rcols, (i64_t*)AS_I64(hashes), NULL};
+    __index_list_precalc_hash(rcols, (i64_t *)AS_I64(hashes), rcols->len, rl, NULL, B8_TRUE);
+    ctx = (__index_list_ctx_t){rcols, rcols, (i64_t *)AS_I64(hashes), NULL};
     for (i = 0; i < rl; i++) {
         idx = ht_oa_tab_next_with(&ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
         if (AS_I64(AS_LIST(ht)[0])[idx] == NULL_I64) {
@@ -2461,8 +2661,8 @@ obj_p index_asof_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol) {
     ids = I64(ll);
 
     // Left hashes
-    __index_list_precalc_hash(lcols, (i64_t*)AS_I64(hashes), lcols->len, ll, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, lcols, (i64_t*)AS_I64(hashes), NULL};
+    __index_list_precalc_hash(lcols, (i64_t *)AS_I64(hashes), lcols->len, ll, NULL, B8_TRUE);
+    ctx = (__index_list_ctx_t){rcols, lcols, (i64_t *)AS_I64(hashes), NULL};
 
     pool = pool_get();
     n = pool_split_by(pool, ll, 0);
@@ -2501,9 +2701,9 @@ clean:
     return ids;
 }
 
-static obj_p __window_join_fill(__index_list_ctx_t* ctx, obj_p ht, i64_t len, i64_t offset, obj_p out) {
+static obj_p __window_join_fill(__index_list_ctx_t *ctx, obj_p ht, i64_t len, i64_t offset, obj_p out) {
     i64_t i, idx;
-    obj_p* ids;
+    obj_p *ids;
 
     ids = AS_LIST(out);
     len += offset;
@@ -2533,8 +2733,8 @@ obj_p index_window_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol, 
     hashes = I64(MAXI64(ll, rl));
 
     // Right hashes
-    __index_list_precalc_hash(rcols, (i64_t*)AS_I64(hashes), rcols->len, rl, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, rcols, (i64_t*)AS_I64(hashes), NULL};
+    __index_list_precalc_hash(rcols, (i64_t *)AS_I64(hashes), rcols->len, rl, NULL, B8_TRUE);
+    ctx = (__index_list_ctx_t){rcols, rcols, (i64_t *)AS_I64(hashes), NULL};
     for (i = 0; i < rl; i++) {
         idx = ht_oa_tab_next_with(&ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
         if (AS_I64(AS_LIST(ht)[0])[idx] == NULL_I64) {
@@ -2551,8 +2751,8 @@ obj_p index_window_join_obj(obj_p lcols, obj_p lxcol, obj_p rcols, obj_p rxcol, 
     index = LIST(ll);
 
     // Left hashes
-    __index_list_precalc_hash(lcols, (i64_t*)AS_I64(hashes), lcols->len, ll, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, lcols, (i64_t*)AS_I64(hashes), NULL};
+    __index_list_precalc_hash(lcols, (i64_t *)AS_I64(hashes), lcols->len, ll, NULL, B8_TRUE);
+    ctx = (__index_list_ctx_t){rcols, lcols, (i64_t *)AS_I64(hashes), NULL};
 
     pool = pool_get();
     n = pool_split_by(pool, ll, 0);
