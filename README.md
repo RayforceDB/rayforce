@@ -49,7 +49,7 @@ make bench      # Run benchmark suite
 
 ## Python bindings
 
-Rayforce has powerful [Python bindings](https://github.com/singaraiona/raypy) (beta stage, but contributions are welcome)
+Rayforce has powerful [Python bindings](https://github.com/RayforceDB/rayforce-py) (contributions are welcome)
 
 ## Contributing
 
