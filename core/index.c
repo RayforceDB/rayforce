@@ -2478,6 +2478,19 @@ obj_p index_upsert_obj(obj_p lcols, obj_p rcols, i64_t len) {
     __index_list_ctx_t ctx;
 
     if (len == 1) {
+        if (rcols->len == 0) {
+            if (IS_VECTOR(lcols)) {
+                ll = lcols->len;
+                res = I64(ll);
+                for (i = 0; i < ll; i++)
+                    AS_I64(res)[i] = NULL_I64;
+            } else {
+                res = I64(1);
+                AS_I64(res)[0] = NULL_I64;
+            }
+            return res;
+        }
+
         res = ray_find(rcols, lcols);
         if (res->type == -TYPE_I64) {
             idx = res->i64;
@@ -2491,6 +2504,14 @@ obj_p index_upsert_obj(obj_p lcols, obj_p rcols, i64_t len) {
 
     ll = ops_count(AS_LIST(lcols)[0]);
     rl = ops_count(AS_LIST(rcols)[0]);
+
+    if (rl == 0) {
+        res = I64(ll);
+        for (i = 0; i < (u64_t)ll; i++)
+            AS_I64(res)[i] = NULL_I64;
+        return res;
+    }
+
     ht = ht_oa_create(MAXU64(ll, rl), -1);
     res = I64(MAXU64(ll, rl));
 
