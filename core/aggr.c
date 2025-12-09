@@ -833,6 +833,11 @@ obj_p aggr_min_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             AGGR_ITER(index, len, offset, val, res, f64, f64, $out[$y] = INF_F64, $out[$y] = MINF64($out[$y], $in[$x]),
                       $out[$y] = NULL_F64);
             return res;
+        case TYPE_TIME:
+        case TYPE_DATE:
+            AGGR_ITER(index, len, offset, val, res, i32, i32, $out[$y] = INF_I32, $out[$y] = MINI32($out[$y], $in[$x]),
+                      $out[$y] = NULL_I32);
+            return res;
         default:
             THROW(ERR_TYPE, "min: unsupported type: '%s'", type_name(val->type));
     }
@@ -847,12 +852,18 @@ obj_p aggr_min(obj_p val, obj_p index) {
     if (IS_ERR(parts))
         return parts;
     switch (val->type) {
+        case TYPE_TIMESTAMP:
         case TYPE_I64:
             res = AGGR_COLLECT(parts, n, i64, i64, $out[$y] = MINI64($out[$y], $in[$x]));
             drop_obj(parts);
             return res;
         case TYPE_F64:
             res = AGGR_COLLECT(parts, n, f64, f64, $out[$y] = MINF64($out[$y], $in[$x]));
+            drop_obj(parts);
+            return res;
+        case TYPE_TIME:
+        case TYPE_DATE:
+            res = AGGR_COLLECT(parts, n, i32, i32, $out[$y] = MINI32($out[$y], $in[$x]));
             drop_obj(parts);
             return res;
         default:
