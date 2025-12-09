@@ -141,6 +141,16 @@ b8_t ops_eq_idx(obj_p a, i64_t ai, obj_p b, i64_t bi) {
             drop_obj(lv);
             drop_obj(rv);
             return eq;
+        case MTYPE2(TYPE_ENUM, TYPE_SYMBOL):
+            lv = at_idx(a, ai);
+            eq = lv->i64 == AS_I64(b)[bi];
+            drop_obj(lv);
+            return eq;
+        case MTYPE2(TYPE_SYMBOL, TYPE_ENUM):
+            rv = at_idx(b, bi);
+            eq = AS_I64(a)[ai] == rv->i64;
+            drop_obj(rv);
+            return eq;
         case MTYPE2(TYPE_MAPLIST, TYPE_MAPLIST):
             lv = at_idx(a, ai);
             rv = at_idx(b, bi);
