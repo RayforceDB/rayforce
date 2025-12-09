@@ -16,3 +16,4 @@ gmon.out
 __pycache__/
 CLAUDE.md
 .claude/
+.DS_Store
