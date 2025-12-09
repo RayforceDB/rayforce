@@ -4076,6 +4076,15 @@ test_result_t test_lang_joins() {
         "(count (at (window-join1 [Sym Time] intervals trades quotes {bids: Bid}) 'bids))",
         "2");
 
+    // window-join with Enum columns (xasc converts Enum to Symbol)
+    TEST_ASSERT_EQ(
+        "(set sym ['a 'b])"
+        "(set trades (table [s time price] (list (enum 'sym ['a 'a 'b]) [10:00:01.000 10:00:05.000 10:00:03.000] [100 200 150])))"
+        "(set quotes (table [s time bid] (list (enum 'sym ['a 'a 'a 'b 'b]) [10:00:00.000 10:00:02.000 10:00:04.000 10:00:01.000 10:00:04.000] [99 100 101 149 151])))"
+        "(set intervals (map-left + [-2000 2000] (at trades 'time)))"
+        "(at (window-join [s time] intervals trades quotes {minBid: (min bid)}) 'minBid)",
+        "[99 100 149]");
+
     // empty left table
     TEST_ASSERT_EQ(
         "(set t1 (table [id val1] (list (take 0 [1]) (take 0 [1]))))"

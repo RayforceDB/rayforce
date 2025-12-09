@@ -317,6 +317,8 @@ obj_p ray_find(obj_p x, obj_p y) {
         case MTYPE2(TYPE_SYMBOL, TYPE_SYMBOL):
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
             return index_find_i64(AS_I64(x), x->len, AS_I64(y), y->len);
+        case MTYPE2(TYPE_ENUM, TYPE_ENUM):
+            return index_find_i64(AS_I64(ENUM_VAL(x)), x->len, AS_I64(ENUM_VAL(y)), y->len);
         case MTYPE2(TYPE_F64, TYPE_F64):
             return index_find_i64((i64_t *)AS_F64(x), x->len, (i64_t *)AS_F64(y), y->len);
         case MTYPE2(TYPE_GUID, TYPE_GUID):
