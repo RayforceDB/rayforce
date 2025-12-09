@@ -3907,41 +3907,225 @@ test_result_t test_lang_aggregations() {
 
 // ==================== JOIN TESTS ====================
 test_result_t test_lang_joins() {
-    // ========== ASOF JOIN TESTS ==========
+    // asof-join basic
     TEST_ASSERT_EQ(
         "(set trades (table [Sym Time Price] (list [x x] [10:00:01.000 10:00:03.000] [100.0 101.0])))"
         "(set quotes (table [Sym Time Bid] (list [x x x] [10:00:00.000 10:00:02.000 10:00:04.000] [99.0 100.5 101.5])))"
         "(asof-join [Sym Time] trades quotes)",
         "(table [Sym Time Price Bid] (list [x x] [10:00:01.000 10:00:03.000] [100.0 101.0] [99.0 100.5]))");
 
-    // ========== ASOF JOIN with single matching symbol ==========
+    // asof-join single matching symbol
     TEST_ASSERT_EQ(
         "(set trades (table [Sym Time Price] (list [a] [10:00:05.000] [50.0])))"
         "(set quotes (table [Sym Time Bid] (list [a a] [10:00:01.000 10:00:03.000] [48.0 49.0])))"
         "(asof-join [Sym Time] trades quotes)",
         "(table [Sym Time Price Bid] (list [a] [10:00:05.000] [50.0] [49.0]))");
 
-    // ========== ASOF JOIN with exact match on boundary ==========
+    // asof-join with exact match on boundary
     TEST_ASSERT_EQ(
         "(set trades (table [Sym Time Price] (list [a] [10:00:01.000] [50.0])))"
         "(set quotes (table [Sym Time Bid] (list [a a] [10:00:01.000 10:00:03.000] [48.0 49.0])))"
         "(asof-join [Sym Time] trades quotes)",
         "(table [Sym Time Price Bid] (list [a] [10:00:01.000] [50.0] [48.0]))");
 
-    // ========== LEFT JOIN TESTS ==========
-    // Test case where all rows have matches
+    // asof-join with I64 + Timestamp
+    TEST_ASSERT_EQ(
+        "(set aj1 (table [ID Ts Val] (list [1 1 2 2] "
+        "[2024.01.01D10:00:01.000000000 2024.01.01D10:00:05.000000000 2024.01.01D10:00:03.000000000 2024.01.01D10:00:07.000000000] "
+        "[100 200 300 400])))"
+        "(set aj2 (table [ID Ts Ref] (list [1 1 2 2] "
+        "[2024.01.01D10:00:00.000000000 2024.01.01D10:00:04.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:06.000000000] "
+        "[10 20 30 40])))"
+        "(at (asof-join [ID Ts] aj1 aj2) 'Ref)",
+        "[10 20 30 40]");
+
+    // asof-join with Symbol + Date
+    TEST_ASSERT_EQ(
+        "(set orders (table [Cust Date Amount] (list [A A B B] [2024.01.02 2024.01.05 2024.01.03 2024.01.06] [100 200 300 400])))"
+        "(set rates (table [Cust Date Rate] (list [A A B B] [2024.01.01 2024.01.04 2024.01.01 2024.01.05] [0.1 0.15 0.2 0.25])))"
+        "(at (asof-join [Cust Date] orders rates) 'Rate)",
+        "[0.1 0.15 0.2 0.25]");
+
+    // left-join all rows match
     TEST_ASSERT_EQ(
         "(set t1 (table [ID Name] (list [1 3] [a c])))"
         "(set t2 (table [ID Value] (list [1 3] [100 300])))"
         "(left-join [ID] t1 t2)",
         "(table [ID Name Value] (list [1 3] [a c] [100 300]))");
 
-    // ========== LEFT JOIN with partial matches - verify non-null rows ==========
+    // left-join partial matches
     TEST_ASSERT_EQ(
         "(set t1 (table [ID Name] (list [1 2 3] [a b c])))"
         "(set t2 (table [ID Value] (list [1 3] [100 300])))"
         "(count (left-join [ID] t1 t2))",
         "3");
+
+    // left-join by Date
+    TEST_ASSERT_EQ(
+        "(set t1 (table [dt val1] (list [2024.01.01 2024.01.02 2024.01.03] [100 200 300])))"
+        "(set t2 (table [dt val2] (list [2024.01.01 2024.01.03] [1000 3000])))"
+        "(count (left-join [dt] t1 t2))",
+        "3");
+
+    // left-join by Time
+    TEST_ASSERT_EQ(
+        "(set t1 (table [tm val1] (list [10:00:00 10:00:01 10:00:02] [100 200 300])))"
+        "(set t2 (table [tm val2] (list [10:00:00 10:00:02] [1000 3000])))"
+        "(count (left-join [tm] t1 t2))",
+        "3");
+
+    // inner-join basic
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list [1 2 3 4 5] [100 200 300 400 500])))"
+        "(set t2 (table [id val2] (list [1 3 5 6 7] [1000 3000 5000 6000 7000])))"
+        "(count (inner-join [id] t1 t2))",
+        "3");
+
+    // inner-join returns correct right values
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list [1 2 3 4 5] [100 200 300 400 500])))"
+        "(set t2 (table [id val2] (list [1 3 5 6 7] [1000 3000 5000 6000 7000])))"
+        "(at (inner-join [id] t1 t2) 'val2)",
+        "[1000 3000 5000]");
+
+    // inner-join preserves correct left values
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list [1 2 3 4 5] [100 200 300 400 500])))"
+        "(set t2 (table [id val2] (list [1 3 5 6 7] [1000 3000 5000 6000 7000])))"
+        "(at (inner-join [id] t1 t2) 'val1)",
+        "[100 300 500]");
+
+    // inner-join by Date
+    TEST_ASSERT_EQ(
+        "(set t1 (table [dt val1] (list [2024.01.01 2024.01.02 2024.01.03] [100 200 300])))"
+        "(set t2 (table [dt val2] (list [2024.01.01 2024.01.03 2024.01.05] [1000 3000 5000])))"
+        "(count (inner-join [dt] t1 t2))",
+        "2");
+
+    // inner-join by Time
+    TEST_ASSERT_EQ(
+        "(set t1 (table [tm val1] (list [10:00:00 10:00:01 10:00:02] [100 200 300])))"
+        "(set t2 (table [tm val2] (list [10:00:00 10:00:02 10:00:05] [1000 3000 5000])))"
+        "(count (inner-join [tm] t1 t2))",
+        "2");
+
+    // inner-join with no matches
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list [1 2 3] [100 200 300])))"
+        "(set t2 (table [id val2] (list [4 5 6] [400 500 600])))"
+        "(count (inner-join [id] t1 t2))",
+        "0");
+
+    // inner-join with all matches
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list [1 2 3] [100 200 300])))"
+        "(set t2 (table [id val2] (list [1 2 3] [1000 2000 3000])))"
+        "(count (inner-join [id] t1 t2))",
+        "3");
+
+    // inner-join by Symbol
+    TEST_ASSERT_EQ(
+        "(set t1 (table [sym val1] (list [AAPL GOOG MSFT] [100 200 300])))"
+        "(set t2 (table [sym val2] (list [AAPL MSFT TSLA] [1000 3000 5000])))"
+        "(count (inner-join [sym] t1 t2))",
+        "2");
+
+    // inner-join by F64
+    TEST_ASSERT_EQ(
+        "(set t1 (table [price val1] (list [1.0 2.0 3.0] [100 200 300])))"
+        "(set t2 (table [price val2] (list [1.0 3.0 5.0] [1000 3000 5000])))"
+        "(count (inner-join [price] t1 t2))",
+        "2");
+
+    // inner-join multi-key
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id1 id2 val1] (list [1 1 2] [a b a] [100 200 300])))"
+        "(set t2 (table [id1 id2 val2] (list [1 2] [a a] [1000 3000])))"
+        "(count (inner-join [id1 id2] t1 t2))",
+        "2");
+
+    // window-join
+    TEST_ASSERT_EQ(
+        "(set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))"
+        "(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))"
+        "(set intervals (map-left + [-2000 2000] (at trades 'Time)))"
+        "(at (window-join [Sym Time] intervals trades quotes {minBid: (min Bid)}) 'minBid)",
+        "[99 100]");
+
+    // window-join1
+    TEST_ASSERT_EQ(
+        "(set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))"
+        "(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))"
+        "(set intervals (map-left + [-2000 2000] (at trades 'Time)))"
+        "(at (window-join1 [Sym Time] intervals trades quotes {minBid: (min Bid)}) 'minBid)",
+        "[99 101]");
+
+    // window-join with raw column (TYPE_MAPGROUP)
+    TEST_ASSERT_EQ(
+        "(set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))"
+        "(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))"
+        "(set intervals (map-left + [-2000 2000] (at trades 'Time)))"
+        "(count (at (window-join [Sym Time] intervals trades quotes {bids: Bid}) 'bids))",
+        "2");
+
+    // window-join1 with raw column (TYPE_MAPGROUP)
+    TEST_ASSERT_EQ(
+        "(set trades (table [Sym Time Price] (list [a a] [10:00:01.000 10:00:05.000] [100 200])))"
+        "(set quotes (table [Sym Time Bid] (list [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))"
+        "(set intervals (map-left + [-2000 2000] (at trades 'Time)))"
+        "(count (at (window-join1 [Sym Time] intervals trades quotes {bids: Bid}) 'bids))",
+        "2");
+
+    // empty left table
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list (take 0 [1]) (take 0 [1]))))"
+        "(set t2 (table [id val2] (list [1 2 3] [100 200 300])))"
+        "(count (left-join [id] t1 t2))",
+        "0");
+
+    // empty right table
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list [1 2 3] [100 200 300])))"
+        "(set t2 (table [id val2] (list (take 0 [1]) (take 0 [1]))))"
+        "(count (left-join [id] t1 t2))",
+        "3");
+
+    // empty tables for inner-join
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list (take 0 [1]) (take 0 [1]))))"
+        "(set t2 (table [id val2] (list [1 2 3] [100 200 300])))"
+        "(count (inner-join [id] t1 t2))",
+        "0");
+
+    // left-join multi-key
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id1 id2 val1] (list [1 1 2] [a b a] [100 200 300])))"
+        "(set t2 (table [id1 id2 val2] (list [1 2] [a a] [1000 3000])))"
+        "(count (left-join [id1 id2] t1 t2))",
+        "3");
+
+    // inner-join with Timestamp
+    TEST_ASSERT_EQ(
+        "(set t1 (table [ts val1] (list [2024.01.01D10:00:00.000000000 2024.01.01D10:00:01.000000000 2024.01.01D10:00:02.000000000] [100 200 300])))"
+        "(set t2 (table [ts val2] (list [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000] [1000 3000])))"
+        "(count (inner-join [ts] t1 t2))",
+        "2");
+
+    // asof-join no match before returns Null
+    TEST_ASSERT_EQ(
+        "(set trades (table [Sym Time Price] (list [a] [10:00:00.000] [100.0])))"
+        "(set quotes (table [Sym Time Bid] (list [a] [10:00:05.000] [99.0])))"
+        "(count (asof-join [Sym Time] trades quotes))",
+        "1");
+
+    // error: left-join wrong type
+    TEST_ASSERT_ER("(left-join 123 (table [a] (list [1])) (table [a] (list [1])))", "symbol");
+
+    // error: inner-join wrong type
+    TEST_ASSERT_ER("(inner-join [a] [1 2 3] (table [a] (list [1])))", "table");
+
+    // error: asof-join wrong arity
+    TEST_ASSERT_ER("(asof-join [a b])", "asof-join");
 
     PASS();
 }

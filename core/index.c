@@ -1388,6 +1388,75 @@ obj_p index_find_i8(i8_t x[], i64_t xl, i8_t y[], i64_t yl) {
     return vec;
 }
 
+obj_p index_find_i32(i32_t x[], i64_t xl, i32_t y[], i64_t yl) {
+    i64_t i, range;
+    i64_t min, max, val, *d, *r;
+    obj_p vec, dict;
+
+    if (xl == 0)
+        return I64(0);
+
+    const index_scope_t scope_x = index_scope_i32(x, NULL, xl);
+    const index_scope_t scope_y = index_scope_i32(y, NULL, yl);
+
+    min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
+    max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
+
+    vec = I64(yl);
+    r = AS_I64(vec);
+
+    if (min > max) {
+        for (i = 0; i < yl; i++)
+            r[i] = NULL_I64;
+        return vec;
+    }
+
+    range = max - min + 1;
+
+    if (range <= MAX_RANGE) {
+        dict = I64(range);
+        d = AS_I64(dict);
+
+        for (i = 0; i < range; i++)
+            d[i] = NULL_I64;
+
+        for (i = 0; i < xl; i++) {
+            val = x[i] - min;
+            if (val >= 0 && val < (i64_t)range && d[val] == NULL_I64)
+                d[val] = (i64_t)i;
+        }
+
+        for (i = 0; i < yl; i++) {
+            val = y[i] - min;
+            r[i] = (val < 0 || val >= (i64_t)range) ? NULL_I64 : d[val];
+        }
+
+        drop_obj(dict);
+
+        return vec;
+    }
+
+    // otherwise, use a hash table
+    dict = ht_oa_create(xl, TYPE_I32);
+
+    for (i = 0; i < xl; i++) {
+        val = ht_oa_tab_next(&dict, (i64_t)x[i]);
+        if (AS_I64(AS_LIST(dict)[0])[val] == NULL_I64) {
+            AS_I64(AS_LIST(dict)[0])[val] = (i64_t)x[i];
+            AS_I64(AS_LIST(dict)[1])[val] = i;
+        }
+    }
+
+    for (i = 0; i < yl; i++) {
+        val = ht_oa_tab_get(dict, (i64_t)y[i]);
+        r[i] = val == NULL_I64 ? NULL_I64 : AS_I64(AS_LIST(dict)[1])[val];
+    }
+
+    drop_obj(dict);
+
+    return vec;
+}
+
 obj_p index_find_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl) {
     i64_t i, range;
     i64_t min, max, val, *d, *r;
@@ -2425,15 +2494,38 @@ obj_p index_left_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
 
 obj_p index_inner_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
     i64_t i, j, ll, rl;
-    obj_p ht, lids, rids;
+    obj_p ht, lids, rids, find_res;
     i64_t idx;
     __index_list_ctx_t ctx;
 
     if (len == 1) {
-        lids = ray_find(rcols, lcols);
-        if (IS_ERR(lids))
-            return lids;
-        return vn_list(2, clone_obj(lids), lids);
+        // For single key: find matching indices from left in right
+        find_res = ray_find(rcols, lcols);
+        if (IS_ERR(find_res))
+            return find_res;
+
+        // Count matches (non-NULL results)
+        ll = find_res->len;
+        j = 0;
+        for (i = 0; i < ll; i++) {
+            if (AS_I64(find_res)[i] != NULL_I64)
+                j++;
+        }
+
+        // Build result arrays with only matching rows
+        lids = I64(j);
+        rids = I64(j);
+        j = 0;
+        for (i = 0; i < ll; i++) {
+            if (AS_I64(find_res)[i] != NULL_I64) {
+                AS_I64(lids)[j] = i;                    // index in left table
+                AS_I64(rids)[j] = AS_I64(find_res)[i]; // index in right table
+                j++;
+            }
+        }
+
+        drop_obj(find_res);
+        return vn_list(2, lids, rids);
     }
 
     ll = ops_count(AS_LIST(lcols)[0]);
@@ -2639,6 +2731,18 @@ static obj_p __asof_ids_partial(__index_list_ctx_t *ctx, obj_p lxcol, obj_p rxco
                 idx = ht_oa_tab_get_with(ht, i, &__index_list_hash_get, &__index_list_cmp_row, ctx);
                 if (idx != NULL_I64) {
                     p = index_bin_i32(AS_I32(lxcol)[i], AS_I32(rxcol), AS_I64(AS_LIST(AS_LIST(ht)[1])[idx]),
+                                      AS_LIST(AS_LIST(ht)[1])[idx]->len);
+                    AS_I64(ids)[i] = p;
+                } else
+                    AS_I64(ids)[i] = NULL_I64;
+            }
+            break;
+        case TYPE_I64:
+        case TYPE_TIMESTAMP:
+            for (i = offset; i < len + offset; i++) {
+                idx = ht_oa_tab_get_with(ht, i, &__index_list_hash_get, &__index_list_cmp_row, ctx);
+                if (idx != NULL_I64) {
+                    p = index_bin_i64(AS_I64(lxcol)[i], AS_I64(rxcol), AS_I64(AS_LIST(AS_LIST(ht)[1])[idx]),
                                       AS_LIST(AS_LIST(ht)[1])[idx]->len);
                     AS_I64(ids)[i] = p;
                 } else

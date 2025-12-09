@@ -87,6 +87,7 @@ obj_p index_in_i64_i32(i64_t x[], i64_t xl, i32_t y[], i64_t yl);
 obj_p index_in_i64_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl);
 obj_p index_in_guid_guid(guid_t x[], i64_t xl, guid_t y[], i64_t yl);
 obj_p index_find_i8(i8_t x[], i64_t xl, i8_t y[], i64_t yl);
+obj_p index_find_i32(i32_t x[], i64_t xl, i32_t y[], i64_t yl);
 obj_p index_find_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl);
 obj_p index_find_guid(guid_t x[], i64_t xl, guid_t y[], i64_t yl);
 obj_p index_find_obj(obj_p x[], i64_t xl, obj_p y[], i64_t yl);

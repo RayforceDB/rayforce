@@ -309,6 +309,10 @@ obj_p ray_find(obj_p x, obj_p y) {
         case MTYPE2(TYPE_U8, TYPE_U8):
         case MTYPE2(TYPE_C8, TYPE_C8):
             return index_find_i8((i8_t *)AS_U8(x), x->len, (i8_t *)AS_U8(y), y->len);
+        case MTYPE2(TYPE_I32, TYPE_I32):
+        case MTYPE2(TYPE_DATE, TYPE_DATE):
+        case MTYPE2(TYPE_TIME, TYPE_TIME):
+            return index_find_i32(AS_I32(x), x->len, AS_I32(y), y->len);
         case MTYPE2(TYPE_I64, TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, TYPE_SYMBOL):
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
