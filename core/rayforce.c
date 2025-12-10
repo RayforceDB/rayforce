@@ -370,10 +370,17 @@ obj_p resize_obj(obj_p* obj, i64_t len) {
     if (IS_INTERNAL(*obj))
         *obj = (obj_p)heap_realloc(*obj, obj_size);
     else {
+        obj_p old_obj = *obj;
         new_obj = (obj_p)heap_alloc(obj_size);
-        memcpy(new_obj, *obj, sizeof(struct obj_t) + len * elem_size);
-        heap_free(*obj);
+        // Copy only the original content, not the new (larger) size
+        i64_t copy_size = (len < (*obj)->len) ? len : (*obj)->len;
+        memcpy(new_obj, old_obj, sizeof(struct obj_t) + copy_size * elem_size);
+        new_obj->mmod = MMOD_INTERNAL;
+        new_obj->rc = 1;
         *obj = new_obj;
+        // Drop the old external object - this will clean up the fdmap entry
+        // and unmap the memory if rc reaches 0
+        drop_obj(old_obj);
     }
 
     (*obj)->len = len;
