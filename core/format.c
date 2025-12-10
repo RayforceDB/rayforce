@@ -917,10 +917,10 @@ i64_t dict_fmt_into(obj_p *dst, i64_t indent, i64_t limit, b8_t full, obj_p obj)
     return n;
 }
 
-i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
+i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
     i64_t *header, i, j, n, m, l, table_width, table_height, total_width, rows, cols;
-    obj_p s, column, columns = AS_LIST(obj)[1], column_widths, footer,
-                     formatted_columns[TABLE_MAX_WIDTH][TABLE_MAX_HEIGHT] = {{NULL_OBJ}};
+    obj_p s, column, columns = AS_LIST(obj)[1], column_widths, footer;
+    obj_p **formatted_columns;
     str_p p;
     b8_t unicode = __USE_UNICODE;
 
@@ -941,13 +941,24 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
     if (table_width == 0)
         return str_fmt_into(dst, 7, "@table");
 
-    if (table_width > TABLE_MAX_WIDTH)
-        table_width = TABLE_MAX_WIDTH;
-
     rows = ops_count(obj);
     table_height = rows;
-    if (table_height > TABLE_MAX_HEIGHT)
-        table_height = TABLE_MAX_HEIGHT;
+
+    // Apply limits for full == 1 (REPL output)
+    if (full == 1) {
+        if (table_width > TABLE_MAX_WIDTH)
+            table_width = TABLE_MAX_WIDTH;
+        if (table_height > TABLE_MAX_HEIGHT)
+            table_height = TABLE_MAX_HEIGHT;
+    }
+
+    // Allocate formatted_columns dynamically
+    formatted_columns = heap_alloc(table_width * sizeof(obj_p *));
+    for (i = 0; i < table_width; i++) {
+        formatted_columns[i] = heap_alloc(table_height * sizeof(obj_p));
+        for (j = 0; j < table_height; j++)
+            formatted_columns[i][j] = NULL_OBJ;
+    }
 
     column_widths = I64(table_width);
 
@@ -960,34 +971,18 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
         column = AS_LIST(columns)[i];
         i64_t col_len = ops_count(column);
 
-        // Then traverse first n elements of column
-        for (j = 0; j < table_height / 2; j++) {
+        // Traverse first half and last half when limited, all when unlimited
+        for (j = 0; j < table_height; j++) {
             s = NULL_OBJ;
-            if (j < col_len) {
-                m = raw_fmt_into(&s, 0, 38, column, j);
+            i64_t idx = j;
+            // When limited and not showing all rows, show first half and last half
+            if (full == 1 && table_height < rows && j >= table_height / 2) {
+                idx = rows - table_height + j;
+            }
+            if (idx < col_len) {
+                m = raw_fmt_into(&s, 0, 38, column, idx);
             } else {
                 m = str_fmt_into(&s, 3, "NA");
-            }
-            formatted_columns[i][j] = s;
-            MAXN(l, m);
-        }
-
-        // Traverse the rest of the column
-        for (; j < table_height; j++) {
-            s = NULL_OBJ;
-            if (table_height == col_len) {
-                if (j < col_len) {
-                    m = raw_fmt_into(&s, 0, 38, column, j);
-                } else {
-                    m = str_fmt_into(&s, 3, "NA");
-                }
-            } else {
-                i64_t idx = col_len - table_height + j;
-                if (idx >= 0 && idx < col_len) {
-                    m = raw_fmt_into(&s, 0, 38, column, idx);
-                } else {
-                    m = str_fmt_into(&s, 3, "NA");
-                }
             }
             formatted_columns[i][j] = s;
             MAXN(l, m);
@@ -1000,8 +995,10 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
     total_width += table_width - 1;
 
     // calculate width of the footer
-    footer =
-        str_fmt(NO_LIMIT, " %lld rows (%lld shown) %lld columns (%lld shown)", rows, table_height, cols, table_width);
+    if (full == 1 && (table_height < rows || table_width < cols))
+        footer = str_fmt(NO_LIMIT, " %lld rows (%lld shown) %lld columns (%lld shown)", rows, table_height, cols, table_width);
+    else
+        footer = str_fmt(NO_LIMIT, " %lld rows %lld columns", rows, cols);
 
     if (total_width < (i64_t)footer->len) {
         AS_I64(column_widths)[table_width - 1] += (i64_t)footer->len - total_width;
@@ -1016,6 +1013,13 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
         }
     }
 
+    // Check if we have hidden columns
+    b8_t has_hidden_cols = (full == 1 && table_width < cols);
+
+    // Add extra width for hidden columns indicator
+    if (has_hidden_cols)
+        total_width += 4;  // "───┤" or " … │"
+
     // Top border of the table
     n = glyph_fmt_into(dst, GLYPH_TL_CORNER, unicode);
     for (i = 0; i < table_width; i++) {
@@ -1023,8 +1027,16 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
             n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
         if (i < table_width - 1)
             n += glyph_fmt_into(dst, GLYPH_T_TEE, unicode);
+        else if (has_hidden_cols)
+            n += glyph_fmt_into(dst, GLYPH_T_TEE, unicode);
         else
             n += glyph_fmt_into(dst, GLYPH_TR_CORNER, unicode);
+    }
+    if (has_hidden_cols) {
+        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_TR_CORNER, unicode);
     }
 
     // Print table header
@@ -1038,6 +1050,12 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
         n += str_fmt_into_n(dst, NO_LIMIT, m, " ");
         n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
     }
+    if (has_hidden_cols) {
+        n += str_fmt_into(dst, 2, " ");
+        n += glyph_fmt_into(dst, GLYPH_HDOTS, unicode);
+        n += str_fmt_into(dst, 2, " ");
+        n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+    }
 
     // Separator between header and rows
     n += str_fmt_into(dst, 2, "\n");
@@ -1048,8 +1066,16 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
             n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
         if (i < table_width - 1)
             n += glyph_fmt_into(dst, GLYPH_CROSS, unicode);
+        else if (has_hidden_cols)
+            n += glyph_fmt_into(dst, GLYPH_CROSS, unicode);
         else
             n += glyph_fmt_into(dst, GLYPH_R_TEE, unicode);
+    }
+    if (has_hidden_cols) {
+        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_R_TEE, unicode);
     }
 
     // Print table content
@@ -1057,8 +1083,8 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
         n += str_fmt_into(dst, 2, "\n");
         n += str_fmt_into_n(dst, NO_LIMIT, indent, " ");
 
-        // Indicate missing rows
-        if (j == table_height / 2 && table_height != rows) {
+        // Indicate missing rows (only in limited mode)
+        if (full == 1 && j == table_height / 2 && table_height < rows) {
             n += glyph_fmt_into(dst, GLYPH_VDOTS, unicode);
             for (i = 0; i < table_width; i++) {
                 n += str_fmt_into(dst, 2, " ");
@@ -1072,7 +1098,14 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
                 n += str_fmt_into_n(dst, NO_LIMIT, m, " ");
                 n += glyph_fmt_into(dst, GLYPH_VDOTS, unicode);
             }
+            if (has_hidden_cols) {
+                n += str_fmt_into(dst, 2, " ");
+                n += glyph_fmt_into(dst, GLYPH_HDOTS, unicode);
+                n += str_fmt_into(dst, 2, " ");
+                n += glyph_fmt_into(dst, GLYPH_VDOTS, unicode);
+            }
             n += str_fmt_into(dst, 2, "\n");
+            n += str_fmt_into_n(dst, NO_LIMIT, indent, " ");
         }
 
         n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
@@ -1087,6 +1120,12 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
             // Free formatted column
             drop_obj(s);
         }
+        if (has_hidden_cols) {
+            n += str_fmt_into(dst, 2, " ");
+            n += glyph_fmt_into(dst, GLYPH_HDOTS, unicode);
+            n += str_fmt_into(dst, 2, " ");
+            n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+        }
     }
 
     // Bottom border of the table
@@ -1098,8 +1137,16 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
             n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
         if (i < table_width - 1)
             n += glyph_fmt_into(dst, GLYPH_B_TEE, unicode);
+        else if (has_hidden_cols)
+            n += glyph_fmt_into(dst, GLYPH_B_TEE, unicode);
         else
             n += glyph_fmt_into(dst, GLYPH_R_TEE, unicode);
+    }
+    if (has_hidden_cols) {
+        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_R_TEE, unicode);
     }
 
     drop_obj(column_widths);
@@ -1126,6 +1173,11 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
 
     n += glyph_fmt_into(dst, GLYPH_BR_CORNER, unicode);
 
+    // Free formatted_columns
+    for (i = 0; i < table_width; i++)
+        heap_free(formatted_columns[i]);
+    heap_free(formatted_columns);
+
     return n;
 }
 
@@ -1149,7 +1201,7 @@ i64_t lambda_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
     return n;
 }
 
-i64_t obj_fmt_into(obj_p *dst, i64_t indent, i64_t limit, b8_t full, obj_p obj) {
+i64_t obj_fmt_into(obj_p *dst, i64_t indent, i64_t limit, i64_t full, obj_p obj) {
     switch (obj->type) {
         case -TYPE_B8:
             return b8_fmt_into(dst, obj->b8);
@@ -1214,7 +1266,7 @@ i64_t obj_fmt_into(obj_p *dst, i64_t indent, i64_t limit, b8_t full, obj_p obj) 
     }
 }
 
-obj_p obj_fmt(obj_p obj, b8_t full) {
+obj_p obj_fmt(obj_p obj, i64_t full) {
     obj_p dst = NULL_OBJ;
     i64_t limit = MAX_ROW_WIDTH;
 
@@ -1277,7 +1329,7 @@ obj_p obj_fmt_n(obj_p *x, i64_t n) {
 obj_p ray_show(obj_p obj) {
     obj_p dst = NULL_OBJ;
 
-    obj_fmt_into(&dst, 0, NO_LIMIT, B8_TRUE, obj);
+    obj_fmt_into(&dst, 0, NO_LIMIT, 2, obj);  // 2 = full without limits
     printf("%.*s\n", (i32_t)dst->len, AS_C8(dst));
     drop_obj(dst);
 

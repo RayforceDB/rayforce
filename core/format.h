@@ -73,8 +73,9 @@ obj_p str_vfmt(i64_t limit, lit_p fmt, va_list args);
 obj_p obj_stringify(obj_p obj);
 i64_t prompt_fmt_into(obj_p *dst);
 i64_t continuation_prompt_fmt_into(obj_p *dst);
-obj_p obj_fmt(obj_p obj, b8_t full);
-i64_t obj_fmt_into(obj_p *dst, i64_t indent, i64_t limit, b8_t full, obj_p obj);
+// full: 0 = compact, 1 = full with limits, 2 = full without limits (show)
+obj_p obj_fmt(obj_p obj, i64_t full);
+i64_t obj_fmt_into(obj_p *dst, i64_t indent, i64_t limit, i64_t full, obj_p obj);
 i64_t guid_fmt_into(obj_p *dst, guid_t *val);
 obj_p obj_fmt_n(obj_p *obj, i64_t n);
 obj_p ray_show(obj_p obj);
