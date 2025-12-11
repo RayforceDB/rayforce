@@ -13,10 +13,6 @@
     width: 78%;
 }
 
-.admonition.seealso {
-    background-color: #e8f0f5;
-    /* Light navy tint background */
-}
 
 .ray-dense td,
 .ray-dense th {
@@ -40,6 +36,13 @@
     --md-primary-fg-color--light: #0a3a5c;
     --md-primary-fg-color--dark: #021828;
     --md-accent-fg-color: #e9a033;
+    
+    /* Custom variables for graphs and UI elements */
+    --accent-primary: #e9a033;
+    --accent-hover: #f0b85a;
+    --bg-tertiary: #e0e0e0;
+    --text-secondary: #757575;
+    --text-tertiary: #9e9e9e;
 }
 
 :root>* {
@@ -74,9 +77,94 @@
     color: #ffffff;
 }
 
+/* Tab styling */
 .md-tabs {
-    background-color: #0a3a5c;
-    /* Slightly lighter navy */
+    background-color: transparent;
+    border: none;
+    padding: 0.5rem 0;
+    box-shadow: none;
+}
+
+/* Transparent tabs for light mode */
+[data-md-color-scheme="default"] .md-tabs {
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+}
+
+/* Hide tabs on home page */
+body:has(.hero-section) .md-tabs {
+    display: none !important;
+}
+
+.md-tabs__link {
+    font-weight: 500;
+    transition: all 0.2s ease;
+    padding: 0.6rem 1.2rem;
+    margin: 0 0.25rem;
+    border-radius: 8px 8px 0 0;
+    display: inline-block;
+}
+
+.md-tabs__link:hover {
+    opacity: 1;
+    background-color: rgba(233, 160, 51, 0.2);
+}
+
+.md-tabs__link--active {
+    opacity: 1;
+}
+
+/* Bookmark-style tabs for light mode - default (non-home pages) */
+[data-md-color-scheme="default"] .md-tabs__link {
+    color: #4a5568 !important;
+    opacity: 0.9;
+    background-color: transparent;
+}
+
+[data-md-color-scheme="default"] .md-tabs__link:hover {
+    color: #04233b !important;
+    opacity: 1;
+    background-color: rgba(233, 160, 51, 0.1);
+}
+
+/* White tabs only on home page with hero section */
+body:has(.hero-section) [data-md-color-scheme="default"] .md-tabs__link {
+    color: rgba(255, 255, 255, 0.8) !important;
+}
+
+body:has(.hero-section) [data-md-color-scheme="default"] .md-tabs__link:hover {
+    color: rgba(255, 255, 255, 1) !important;
+    background-color: rgba(233, 160, 51, 0.3);
+}
+
+[data-md-color-scheme="default"] .md-tabs__link--active {
+    background-color: #e9a033;
+    color: white !important;
+    font-weight: 700;
+    opacity: 1;
+    box-shadow: 0 -2px 8px rgba(233, 160, 51, 0.2);
+}
+
+/* Bookmark-style tabs for dark mode */
+[data-md-color-scheme="slate"] .md-tabs {
+    background-color: transparent;
+}
+
+[data-md-color-scheme="slate"] .md-tabs__link {
+    color: rgba(255, 255, 255, 0.7) !important;
+}
+
+[data-md-color-scheme="slate"] .md-tabs__link:hover {
+    color: #e9a033 !important;
+    background-color: rgba(233, 160, 51, 0.1);
+}
+
+[data-md-color-scheme="slate"] .md-tabs__link--active {
+    background-color: rgba(233, 160, 51, 0.2);
+    color: #e9a033 !important;
+    font-weight: 700;
+    box-shadow: 0 -2px 8px rgba(233, 160, 51, 0.15);
 }
 
 /* Search box styling */
@@ -105,6 +193,13 @@
     --md-primary-fg-color--light: #f0b85a;
     --md-primary-fg-color--dark: #c98a2a;
     --md-accent-fg-color: #f0b85a;
+    
+    /* Custom variables for graphs and UI elements - Dark mode */
+    --accent-primary: #e9a033;
+    --accent-hover: #f0b85a;
+    --bg-tertiary: rgba(255, 255, 255, 0.15);
+    --text-secondary: rgba(255, 255, 255, 0.7);
+    --text-tertiary: rgba(255, 255, 255, 0.5);
 }
 
 [data-md-color-scheme="slate"] .md-header {
@@ -112,9 +207,6 @@
     /* Darker navy for header in dark mode */
 }
 
-[data-md-color-scheme="slate"] .md-tabs {
-    background-color: #04233b;
-}
 
 /* Global button styling - rounded corners */
 .md-typeset .md-button,
@@ -160,10 +252,465 @@ a.md-button:not(.md-button--primary):hover {
     transform: translateY(-2px);
 }
 
-/* Better admonition styling */
+/* ==================== */
+/* ADMONITION STYLING   */
+/* ==================== */
+
+/* Base admonition styling - Light mode */
 .md-typeset .admonition {
-    border-left: 4px solid var(--md-primary-fg-color);
+    border-left: 4px solid;
     box-shadow: 0 2px 4px rgba(0, 0, 0, .1);
+    border-radius: 4px;
+    background-color: rgba(255, 255, 255, 0.95);
+}
+
+.md-typeset .admonition-title {
+    font-weight: 600;
+    padding: 0.5rem 1rem;
+    margin: 0;
+}
+
+.md-typeset .admonition > .admonition-title::before {
+    margin-right: 0.5rem;
+}
+
+/* Note - Blue/Info */
+.md-typeset .admonition.note,
+.md-typeset details.note {
+    border-color: #2196F3;
+    background-color: rgba(33, 150, 243, 0.1);
+}
+
+.md-typeset .admonition.note > .admonition-title,
+.md-typeset details.note > summary {
+    background-color: rgba(33, 150, 243, 0.15);
+    color: #1565C0;
+}
+
+/* Warning - Amber/Orange */
+.md-typeset .admonition.warning,
+.md-typeset details.warning {
+    border-color: #FF9800;
+    background-color: rgba(255, 152, 0, 0.1);
+}
+
+.md-typeset .admonition.warning > .admonition-title,
+.md-typeset details.warning > summary {
+    background-color: rgba(255, 152, 0, 0.15);
+    color: #E65100;
+}
+
+/* Danger/Error - Red */
+.md-typeset .admonition.danger,
+.md-typeset .admonition.error,
+.md-typeset details.danger,
+.md-typeset details.error {
+    border-color: #F44336;
+    background-color: rgba(244, 67, 54, 0.1);
+}
+
+.md-typeset .admonition.danger > .admonition-title,
+.md-typeset .admonition.error > .admonition-title,
+.md-typeset details.danger > summary,
+.md-typeset details.error > summary {
+    background-color: rgba(244, 67, 54, 0.15);
+    color: #C62828;
+}
+
+/* Tip/Hint - Green */
+.md-typeset .admonition.tip,
+.md-typeset .admonition.hint,
+.md-typeset details.tip,
+.md-typeset details.hint {
+    border-color: #4CAF50;
+    background-color: rgba(76, 175, 80, 0.1);
+}
+
+.md-typeset .admonition.tip > .admonition-title,
+.md-typeset .admonition.hint > .admonition-title,
+.md-typeset details.tip > summary,
+.md-typeset details.hint > summary {
+    background-color: rgba(76, 175, 80, 0.15);
+    color: #2E7D32;
+}
+
+/* Success - Green */
+.md-typeset .admonition.success,
+.md-typeset .admonition.check,
+.md-typeset details.success,
+.md-typeset details.check {
+    border-color: #4CAF50;
+    background-color: rgba(76, 175, 80, 0.1);
+}
+
+.md-typeset .admonition.success > .admonition-title,
+.md-typeset .admonition.check > .admonition-title,
+.md-typeset details.success > summary,
+.md-typeset details.check > summary {
+    background-color: rgba(76, 175, 80, 0.15);
+    color: #2E7D32;
+}
+
+/* Info - Cyan */
+.md-typeset .admonition.info,
+.md-typeset details.info {
+    border-color: #00BCD4;
+    background-color: rgba(0, 188, 212, 0.1);
+}
+
+.md-typeset .admonition.info > .admonition-title,
+.md-typeset details.info > summary {
+    background-color: rgba(0, 188, 212, 0.15);
+    color: #00838F;
+}
+
+/* Abstract/Summary - Purple */
+.md-typeset .admonition.abstract,
+.md-typeset .admonition.summary,
+.md-typeset details.abstract,
+.md-typeset details.summary {
+    border-color: #9C27B0;
+    background-color: rgba(156, 39, 176, 0.1);
+}
+
+.md-typeset .admonition.abstract > .admonition-title,
+.md-typeset .admonition.summary > .admonition-title,
+.md-typeset details.abstract > summary,
+.md-typeset details.summary > summary {
+    background-color: rgba(156, 39, 176, 0.15);
+    color: #6A1B9A;
+}
+
+/* Quote - Gray */
+.md-typeset .admonition.quote,
+.md-typeset details.quote {
+    border-color: #757575;
+    background-color: rgba(117, 117, 117, 0.1);
+}
+
+.md-typeset .admonition.quote > .admonition-title,
+.md-typeset details.quote > summary {
+    background-color: rgba(117, 117, 117, 0.15);
+    color: #424242;
+}
+
+/* Bug - Red */
+.md-typeset .admonition.bug,
+.md-typeset details.bug {
+    border-color: #E91E63;
+    background-color: rgba(233, 30, 99, 0.1);
+}
+
+.md-typeset .admonition.bug > .admonition-title,
+.md-typeset details.bug > summary {
+    background-color: rgba(233, 30, 99, 0.15);
+    color: #AD1457;
+}
+
+/* Question - Blue */
+.md-typeset .admonition.question,
+.md-typeset details.question {
+    border-color: #2196F3;
+    background-color: rgba(33, 150, 243, 0.1);
+}
+
+.md-typeset .admonition.question > .admonition-title,
+.md-typeset details.question > summary {
+    background-color: rgba(33, 150, 243, 0.15);
+    color: #1565C0;
+}
+
+/* Example - Teal */
+.md-typeset .admonition.example,
+.md-typeset details.example {
+    border-color: #009688;
+    background-color: rgba(0, 150, 136, 0.1);
+}
+
+.md-typeset .admonition.example > .admonition-title,
+.md-typeset details.example > summary {
+    background-color: rgba(0, 150, 136, 0.15);
+    color: #00695C;
+}
+
+/* Important - Orange */
+.md-typeset .admonition.important,
+.md-typeset details.important {
+    border-color: #FF9800;
+    background-color: rgba(255, 152, 0, 0.1);
+}
+
+.md-typeset .admonition.important > .admonition-title,
+.md-typeset details.important > summary {
+    background-color: rgba(255, 152, 0, 0.15);
+    color: #E65100;
+}
+
+/* Caution - Orange */
+.md-typeset .admonition.caution,
+.md-typeset details.caution {
+    border-color: #FF9800;
+    background-color: rgba(255, 152, 0, 0.1);
+}
+
+.md-typeset .admonition.caution > .admonition-title,
+.md-typeset details.caution > summary {
+    background-color: rgba(255, 152, 0, 0.15);
+    color: #E65100;
+}
+
+/* Failure/Fail - Red */
+.md-typeset .admonition.failure,
+.md-typeset .admonition.fail,
+.md-typeset details.failure,
+.md-typeset details.fail {
+    border-color: #F44336;
+    background-color: rgba(244, 67, 54, 0.1);
+}
+
+.md-typeset .admonition.failure > .admonition-title,
+.md-typeset .admonition.fail > .admonition-title,
+.md-typeset details.failure > summary,
+.md-typeset details.fail > summary {
+    background-color: rgba(244, 67, 54, 0.15);
+    color: #C62828;
+}
+
+/* See Also - Custom (already exists, but updating) */
+.md-typeset .admonition.seealso,
+.md-typeset details.seealso {
+    border-color: #0a3a5c;
+    background-color: rgba(10, 58, 92, 0.1);
+}
+
+.md-typeset .admonition.seealso > .admonition-title,
+.md-typeset details.seealso > summary {
+    background-color: rgba(10, 58, 92, 0.15);
+    color: #04233b;
+}
+
+/* ==================== */
+/* DARK MODE ADMONITIONS */
+/* ==================== */
+
+[data-md-color-scheme="slate"] .md-typeset .admonition {
+    background-color: rgba(10, 58, 92, 0.3);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+/* Note - Light Blue for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.note,
+[data-md-color-scheme="slate"] .md-typeset details.note {
+    border-color: #64B5F6;
+    background-color: rgba(33, 150, 243, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.note > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.note > summary {
+    background-color: rgba(33, 150, 243, 0.25);
+    color: #90CAF9;
+}
+
+/* Warning - Golden/Amber for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.warning,
+[data-md-color-scheme="slate"] .md-typeset details.warning {
+    border-color: #e9a033;
+    background-color: rgba(233, 160, 51, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.warning > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.warning > summary {
+    background-color: rgba(233, 160, 51, 0.25);
+    color: #f0b85a;
+}
+
+/* Danger/Error - Light Red for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.danger,
+[data-md-color-scheme="slate"] .md-typeset .admonition.error,
+[data-md-color-scheme="slate"] .md-typeset details.danger,
+[data-md-color-scheme="slate"] .md-typeset details.error {
+    border-color: #EF5350;
+    background-color: rgba(244, 67, 54, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.danger > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset .admonition.error > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.danger > summary,
+[data-md-color-scheme="slate"] .md-typeset details.error > summary {
+    background-color: rgba(244, 67, 54, 0.25);
+    color: #FFCDD2;
+}
+
+/* Tip/Hint - Light Green for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.tip,
+[data-md-color-scheme="slate"] .md-typeset .admonition.hint,
+[data-md-color-scheme="slate"] .md-typeset details.tip,
+[data-md-color-scheme="slate"] .md-typeset details.hint {
+    border-color: #81C784;
+    background-color: rgba(76, 175, 80, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.tip > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset .admonition.hint > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.tip > summary,
+[data-md-color-scheme="slate"] .md-typeset details.hint > summary {
+    background-color: rgba(76, 175, 80, 0.25);
+    color: #A5D6A7;
+}
+
+/* Success - Light Green for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.success,
+[data-md-color-scheme="slate"] .md-typeset .admonition.check,
+[data-md-color-scheme="slate"] .md-typeset details.success,
+[data-md-color-scheme="slate"] .md-typeset details.check {
+    border-color: #81C784;
+    background-color: rgba(76, 175, 80, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.success > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset .admonition.check > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.success > summary,
+[data-md-color-scheme="slate"] .md-typeset details.check > summary {
+    background-color: rgba(76, 175, 80, 0.25);
+    color: #A5D6A7;
+}
+
+/* Info - Light Cyan for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.info,
+[data-md-color-scheme="slate"] .md-typeset details.info {
+    border-color: #4DD0E1;
+    background-color: rgba(0, 188, 212, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.info > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.info > summary {
+    background-color: rgba(0, 188, 212, 0.25);
+    color: #80DEEA;
+}
+
+/* Abstract/Summary - Light Purple for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.abstract,
+[data-md-color-scheme="slate"] .md-typeset .admonition.summary,
+[data-md-color-scheme="slate"] .md-typeset details.abstract,
+[data-md-color-scheme="slate"] .md-typeset details.summary {
+    border-color: #BA68C8;
+    background-color: rgba(156, 39, 176, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.abstract > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset .admonition.summary > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.abstract > summary,
+[data-md-color-scheme="slate"] .md-typeset details.summary > summary {
+    background-color: rgba(156, 39, 176, 0.25);
+    color: #CE93D8;
+}
+
+/* Quote - Light Gray for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.quote,
+[data-md-color-scheme="slate"] .md-typeset details.quote {
+    border-color: #9E9E9E;
+    background-color: rgba(117, 117, 117, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.quote > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.quote > summary {
+    background-color: rgba(117, 117, 117, 0.25);
+    color: #BDBDBD;
+}
+
+/* Bug - Light Pink for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.bug,
+[data-md-color-scheme="slate"] .md-typeset details.bug {
+    border-color: #F48FB1;
+    background-color: rgba(233, 30, 99, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.bug > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.bug > summary {
+    background-color: rgba(233, 30, 99, 0.25);
+    color: #F8BBD0;
+}
+
+/* Question - Light Blue for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.question,
+[data-md-color-scheme="slate"] .md-typeset details.question {
+    border-color: #64B5F6;
+    background-color: rgba(33, 150, 243, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.question > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.question > summary {
+    background-color: rgba(33, 150, 243, 0.25);
+    color: #90CAF9;
+}
+
+/* Example - Light Teal for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.example,
+[data-md-color-scheme="slate"] .md-typeset details.example {
+    border-color: #4DB6AC;
+    background-color: rgba(0, 150, 136, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.example > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.example > summary {
+    background-color: rgba(0, 150, 136, 0.25);
+    color: #80CBC4;
+}
+
+/* Important - Golden for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.important,
+[data-md-color-scheme="slate"] .md-typeset details.important {
+    border-color: #e9a033;
+    background-color: rgba(255, 152, 0, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.important > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.important > summary {
+    background-color: rgba(255, 152, 0, 0.25);
+    color: #f0b85a;
+}
+
+/* Caution - Golden for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.caution,
+[data-md-color-scheme="slate"] .md-typeset details.caution {
+    border-color: #e9a033;
+    background-color: rgba(255, 152, 0, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.caution > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.caution > summary {
+    background-color: rgba(255, 152, 0, 0.25);
+    color: #f0b85a;
+}
+
+/* Failure/Fail - Light Red for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.failure,
+[data-md-color-scheme="slate"] .md-typeset .admonition.fail,
+[data-md-color-scheme="slate"] .md-typeset details.failure,
+[data-md-color-scheme="slate"] .md-typeset details.fail {
+    border-color: #EF5350;
+    background-color: rgba(244, 67, 54, 0.2);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.failure > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset .admonition.fail > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.failure > summary,
+[data-md-color-scheme="slate"] .md-typeset details.fail > summary {
+    background-color: rgba(244, 67, 54, 0.25);
+    color: #FFCDD2;
+}
+
+/* See Also - Navy/Golden for dark mode */
+[data-md-color-scheme="slate"] .md-typeset .admonition.seealso,
+[data-md-color-scheme="slate"] .md-typeset details.seealso {
+    border-color: #e9a033;
+    background-color: rgba(10, 58, 92, 0.3);
+}
+
+[data-md-color-scheme="slate"] .md-typeset .admonition.seealso > .admonition-title,
+[data-md-color-scheme="slate"] .md-typeset details.seealso > summary {
+    background-color: rgba(10, 58, 92, 0.4);
+    color: #f0b85a;
 }
 
 /* Navigation refinements */
@@ -757,6 +1304,14 @@ a.md-button:not(.md-button--primary):hover {
 
 .md-footer-copyright a:hover {
     color: #e9a033;
+}
+
+/* Hide previous/next page navigation buttons */
+.md-footer-nav,
+.md-footer-nav__link,
+.md-footer-nav__link--prev,
+.md-footer-nav__link--next {
+    display: none !important;
 }
 
 /* Footer layout */

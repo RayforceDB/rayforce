@@ -10,18 +10,17 @@ theme:
   logo: images/logo_light_full.svg
   favicon: images/favicon.svg
   features:
-    - header.autohide
-    - announce.dismiss
-    # - navigation.tabs
-    - navigation.sections
-    - navigation.top
-    - navigation.indexes
-    - search.suggest
-    - search.highlight
-    - navigation.footer
+    - content.action.edit
+    - content.action.view
+    - content.code.annotate
     - content.code.copy
-    # - content.action.view
-    - toc.follow
+    - content.tooltips
+    - navigation.indexes
+    - navigation.tabs
+    - navigation.top
+    - search.highlight
+    - search.share
+    - search.suggest
 
   palette:
     # Light mode
@@ -41,8 +40,9 @@ theme:
         icon: material/brightness-4
         name: Switch to light mode
   font:
-    text: Roboto
-    code: JetBrains Mono  # Changed to JetBrains Mono for better code readability
+    text: Outfit
+    code: JetBrains Mono
+
   icon:
     logo: material/lumx
 
@@ -116,162 +116,62 @@ extra_javascript:
 # Page tree
 nav:
   - Home: index.md
+
+  - Get Started:
+    - Overview: content/get-started/overview.md
+    - Install: content/get-started/install.md
+    - Benchmarks:
+      - Overview: content/get-started/benchmarks/overview.md
+      - Group By: content/get-started/benchmarks/group-by.md
+      - Inner Join: content/get-started/benchmarks/inner-join.md
+      - Left Join: content/get-started/benchmarks/left-join.md
+      - Window Join: content/get-started/benchmarks/window-join.md
+    - Technical Details: content/get-started/technical-details.md
+    - Contribute: content/get-started/contribute.md
+
   - Documentation:
-    - Getting Started: 
-      - Install: content/getstarted/install.md
-      - Tutorial: content/getstarted/tutorial.md
-    - Benchmarks: 
-      - Compare to other DBs: content/benchmarks/bench.md
-      - Run benchmarks: content/benchmarks/run.md
-    - Reference card: content/reference.md
-    - Syntax: content/syntax.md
-    - Atomic functions: content/atomic.md
-    - Math:
-      - Add: content/math/add.md
-      - Sub: content/math/sub.md
-      - Mul: content/math/mul.md
-      - Div: content/math/div.md
-      - Fdiv: content/math/fdiv.md
-      - Mod: content/math/mod.md
-      - Sum: content/math/sum.md
-      - Avg: content/math/avg.md
-      - Med: content/math/med.md
-      - Dev: content/math/dev.md
-      - Min: content/math/min.md
-      - Max: content/math/max.md
-      - Ceil: content/math/ceil.md
-      - Floor: content/math/floor.md
-      - Round: content/math/round.md
-      - Xbar: content/math/xbar.md
-    - Evaluation Control:
-      - Do: content/control/do.md
-      - If: content/control/if.md
-      - Try: content/control/try.md
-      - Raise: content/control/raise.md
-      - Return: content/control/return.md
-      - Exit: content/control/exit.md
-    - Compose:
-      - Casting: content/compose/as.md
-      - Concat: content/compose/concat.md
-      - Create Dict: content/compose/dict.md
-      - Create Table: content/compose/table.md
-      - Create List: content/compose/list.md
-      - Create Vector: content/compose/enlist.md
-      - Group: content/compose/group.md
-      - GUID: content/compose/guid.md
-      - Rand: content/compose/rand.md
-      - Raze: content/compose/raze.md
-      - Reverse: content/compose/reverse.md
-      - Til: content/compose/til.md
-      - Distinct: content/compose/distinct.md
-    - Env:
-      - Set: content/env/set.md
-      - Let: content/env/let.md
-      - Get env: content/env/env.md
-      - Memstat: content/env/memstat.md
-    - Format:
-      - Format: content/format/format.md
-      - Print: content/format/print.md
-      - Println: content/format/println.md
-      - Show: content/format/show.md
-    - IO:
-      - Get: content/io/get.md
-      - Get Splayed: content/io/get_splayed.md
-      - Set Splayed: content/io/set_splayed.md
-      - Get Parted: content/io/get_parted.md
-      - Set Parted: content/io/set_parted.md
-      - Read CSV: content/io/read_csv.md
-      - Read: content/io/read.md
-      - Write: content/io/write.md
-      - Hopen: content/io/hopen.md
-      - Hclose: content/io/hclose.md
-    - Logic:
-      - And: content/logic/and.md
-      - Or: content/logic/or.md
-      - Not: content/logic/not.md
-      - Like: content/logic/like.md
-      - Nil?: content/logic/isnil.md
-    - Items:
-      - At: content/items/at.md
-      - First: content/items/first.md
-      - Last: content/items/last.md
-      - Take: content/items/take.md
-      - Except: content/items/except.md
-      - Union: content/items/union.md
-      - Sect: content/items/sect.md
-      - In: content/items/in.md
-      - Where: content/items/where.md
-      - Filter: content/items/filter.md
-      - Find: content/items/find.md
-      - Key: content/items/key.md
-      - Value: content/items/value.md
-      - Enum: content/items/enum.md
-      - Within: content/items/within.md
-    - Order:
-      - Asc: content/order/asc.md
-      - Desc: content/order/desc.md
-      - Iasc: content/order/iasc.md
-      - Idesc: content/order/idesc.md
-      - Neg: content/order/neg.md
-      - Rank: content/order/rank.md
-      - Xasc: content/order/xasc.md
-      - Xdesc: content/order/xdesc.md
-      - Xrank: content/order/xrank.md
-    - Comparison:
-      - Equal: content/cmp/eq.md
-      - Not equal: content/cmp/ne.md
-      - Greater than: content/cmp/gt.md
-      - Greater or equal: content/cmp/ge.md
-      - Lower than: content/cmp/lt.md
-      - Lower or equal: content/cmp/le.md
-    - Temporal:
-      - Date: content/temporal/date.md
-      - Time: content/temporal/time.md
-      - Timestamp: content/temporal/timestamp.md
-    - Iter:
-      - Apply: content/iter/apply.md
-      - Map: content/iter/map.md
-      - Pmap: content/iter/pmap.md
-      - Fold: content/iter/fold.md
-    - Queries: 
-      - Select: content/query/select.md
-    - Joins:
-      - Left join: content/join/left_join.md
-      - Inner join: content/join/inner_join.md
-      - Asof join: content/join/asof_join.md
-      - Window join: content/join/window_join.md
-    - Updates:
-      - Alter: content/update/alter.md
-      - Insert: content/update/insert.md
-      - Upsert: content/update/upsert.md
-      - Update: content/update/update.md
-    - REPL:
-      - Parse: content/repl/parse.md
-      - Eval: content/repl/eval.md
-      - Exec: content/repl/exec.md
-      - Load: content/repl/load.md
-      - Args: content/repl/args.md
-      - Commands: content/repl/commands.md
-      - Quote: content/repl/quote.md
-      - Resolve: content/repl/resolve.md
-      - Display width: content/repl/set_display_width.md
-      - FPR: content/repl/set_fpr.md
-      - Use unicode format: content/repl/use_unicode_format.md
-    - Serialization: 
-      - Overall: content/serde/index.md
-      - Serialize: content/serde/ser.md
-      - Deserialize: content/serde/de.md
-    - Misc:
-      - Type: content/misc/type.md
-      - Count: content/misc/count.md
-      - Reference count: content/misc/rc.md
-      - GC: content/misc/gc.md
-      - Meta: content/misc/meta.md
-    - Time:
-      - Timer: content/time/timer.md
-      - Timeit: content/time/timeit.md
-    - Interfacing: 
-      - IPC: content/interfacing/ipc.md
-      - Load function: content/interfacing/loadfn.md
+    - Overview: content/documentation/overview.md
+    - Data Types:
+      - Overview: content/documentation/data-types/overview.md
+      - Integers: content/documentation/data-types/integers.md
+      - Float: content/documentation/data-types/float.md
+      - Temporal: content/documentation/data-types/temporal.md
+      - Symbol: content/documentation/data-types/symbol.md
+      - String: content/documentation/data-types/string.md
+      - Char: content/documentation/data-types/char.md
+      - GUID: content/documentation/data-types/guid.md
+      - Boolean: content/documentation/data-types/boolean.md
+      - Enum: content/documentation/data-types/enum.md
+      - Vector: content/documentation/data-types/vector.md
+      - List: content/documentation/data-types/list.md
+      - Table: content/documentation/data-types/table.md
+      - Dictionary: content/documentation/data-types/dictionary.md
+      - Functions: content/documentation/data-types/functions.md
+      - Other: content/documentation/data-types/other.md
+    - Queries:
+      - Overview: content/documentation/queries/overview.md
+      - Select: content/documentation/queries/select.md
+      - Update: content/documentation/queries/update.md
+      - Insert: content/documentation/queries/insert.md
+      - Upsert: content/documentation/queries/upsert.md
+      - Alter: content/documentation/queries/alter.md
+      - Joins: content/documentation/queries/joins.md
+    - Operations:
+      - Overview: content/documentation/operations/overview.md
+      - Math: content/documentation/operations/math.md
+      - Order: content/documentation/operations/order.md
+      - Logic: content/documentation/operations/logic.md
+      - Iterable: content/documentation/operations/iterable.md
+      - Compose: content/documentation/operations/compose.md
+      - Evaluation Control: content/documentation/operations/evaluation-control.md
+      - IO: content/documentation/operations/IO.md
+    - Environment: content/documentation/environment.md
+    - Format: content/documentation/format.md
+    - Serialization: content/documentation/serialization.md
+    - IPC: content/documentation/IPC.md
+    - REPL: content/documentation/REPL.md
+    - Misc: content/documentation/misc.md
+
   - FAQ: content/faq.md
+
   - License: content/license.md

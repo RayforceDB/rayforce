@@ -22,7 +22,7 @@ The high-performance columnar database engineered for lightning-fast analytics a
 </div>
 
 <div class="hero-buttons">
-<a href="content/getstarted/install.html" class="md-button md-button--primary">Get Started</a>
+<a href="content/get-started/install.html" class="md-button md-button--primary">Get Started</a>
 <a href="https://github.com/singaraiona/rayforce" class="md-button">Get it on GitHub</a>
 </div>
 
@@ -112,7 +112,7 @@ The high-performance columnar database engineered for lightning-fast analytics a
 
 RayforceDB is open source under MIT license. Download, build, and run your first query today.
 
-[Read the Docs](content/getstarted/tutorial.md){ .md-button .md-button--primary }
+[Read the Docs](content/get-started/tutorial.md){ .md-button .md-button--primary }
 [Try Online](wasm/index.html){ .md-button }
 
 </div>
