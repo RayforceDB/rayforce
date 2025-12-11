@@ -75,7 +75,7 @@ Returns a dictionary with the following keys:
 
 ### Meta
 
-Returns metadata about a [:material-table: Table](../data-types/table.md), including column names, types, memory models, and attributes.
+Returns metadata about a [:material-table: Table](data-types/table.md), including column names, types, memory models, and attributes.
 
 ```clj
 ↪ (set t (table [name age] (list (list "Alice" "Bob") [25 30])))

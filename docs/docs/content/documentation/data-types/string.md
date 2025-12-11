@@ -12,4 +12,4 @@ String
 
 Strings are commonly used for storing text data in [:material-table: Tables](./table.md) and for various input/output operations.
 
-### :material-arrow-right: See String usage in [:material-phone-in-talk: IPC](../IPC/overview.md) context
+### :material-arrow-right: See String usage in [:material-phone-in-talk: IPC](../IPC.md) context

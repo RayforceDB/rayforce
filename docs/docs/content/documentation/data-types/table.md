@@ -7,7 +7,7 @@ A Table is an object that consists of columns, forming the core structure for re
 
 ## Structure
 
-**Column headers** are a [:material-vector-line: Vector](./vector.md) of [:simple-scalar: Symbols](../scalars/symbol.md), and they serve as the names of the columns.
+**Column headers** are a [:material-vector-line: Vector](./vector.md) of [:simple-scalar: Symbols](./symbol.md), and they serve as the names of the columns.
 
 **Column values** are [:material-vector-line: Vectors](./vector.md) or [:material-code-array: Lists](./list.md) of any type.
 
@@ -24,6 +24,6 @@ A Table is an object that consists of columns, forming the core structure for re
 └──────────────────────────────────────┘
 ```
 
-Tables can be splayed, parted, loaded, and unloaded from disk. See [:material-pen: IO](../operations/IO/overview.md) for more information.
+Tables can be splayed, parted, loaded, and unloaded from disk. See [:material-pen: IO](../operations/IO.md) for more information.
 
 ### :material-arrow-right: Next: Table [:simple-googlebigquery: Queries](../queries/overview.md)

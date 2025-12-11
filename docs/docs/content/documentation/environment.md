@@ -62,7 +62,7 @@ When given a symbol, returns the value of that variable from the environment. Wh
 
 ### Env
 
-Returns a [:material-code-braces: Dictionary](../data-types/dictionary.md) containing all global variables in the current environment.
+Returns a [:material-code-braces: Dictionary](data-types/dictionary.md) containing all global variables in the current environment.
 
 ```clj
 ↪ (set add (fn [a b] (return (+ a b)) 77))

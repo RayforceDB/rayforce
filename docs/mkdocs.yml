@@ -31,6 +31,7 @@ theme:
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
+
     # Dark mode    
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
@@ -68,8 +69,6 @@ plugins:
   - offline
   - search:
       separator: '[\s\u200b\-_,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
-  # - minify:
-  #     minify_html: true
 
 markdown_extensions:
   - pymdownx.highlight:
@@ -157,7 +156,6 @@ nav:
       - Alter: content/documentation/queries/alter.md
       - Joins: content/documentation/queries/joins.md
     - Operations:
-      - Overview: content/documentation/operations/overview.md
       - Math: content/documentation/operations/math.md
       - Order: content/documentation/operations/order.md
       - Logic: content/documentation/operations/logic.md

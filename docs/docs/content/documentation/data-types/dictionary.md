@@ -7,7 +7,7 @@ Dictionaries are objects that hold information about keys and their correspondin
 
 ## Structure
 
-**Keys** are represented as either a [:material-vector-line: Vector](./vector.md) or a [:material-code-array: List](./list.md) of any [:simple-scalar: Scalar](../scalars/overview.md) type.
+**Keys** are represented as either a [:material-vector-line: Vector](./vector.md) or a [:material-code-array: List](./list.md) of any scalar type.
 
 **Values** are either a [:material-vector-line: Vector](./vector.md) or a [:material-code-array: List](./list.md) of any type.
 

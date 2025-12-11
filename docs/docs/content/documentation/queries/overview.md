@@ -26,6 +26,6 @@ Modifies elements at specific indices in [:material-vector-line: Vectors](../dat
 
 Join operations combine rows from two [:material-table: Tables](../data-types/table.md) based on matching column values:
 
-- **[:material-set-left-right: Left Join](./joins.md#material-set-left-right-left-join)**: Keeps all rows from the left table and matching rows from the right table
-- **[:material-border-inside: Inner Join](./joins.md#material-border-inside-inner-join)**: Keeps only rows where join columns match in both tables
-- **[:material-window-restore: Window Join](./joins.md#material-window-restore-window-join)**: Joins tables based on equality for all join columns except the last one, using time windows for the last column
+- **[:material-set-left-right: Left Join](./joins.md#left-join)**: Keeps all rows from the left table and matching rows from the right table
+- **[:material-border-inside: Inner Join](./joins.md#inner-join)**: Keeps only rows where join columns match in both tables
+- **[:material-window-restore: Window Join](./joins.md#window-join)**: Joins tables based on equality for all join columns except the last one, using time windows for the last column
