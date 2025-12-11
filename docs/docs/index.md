@@ -18,7 +18,7 @@ The high-performance columnar database engineered for lightning-fast analytics a
 [:fontawesome-brands-github:](https://github.com/singaraiona/rayforce "GitHub")
 [:fontawesome-brands-x-twitter:](https://x.com/RayforceDB "X (Twitter)")
 [:fontawesome-brands-reddit:](https://www.reddit.com/r/rayforcedb/ "Reddit")
-[:simple-zulip:](https://rayforcedb.zulipchat.com/#narrow/channel/549008-Discuss "Zulip Chat")
+[:simple-zulip:](https://rayforcedb.zulipchat.com/join/l33sichu4vp7nf77hgdul4om/ "Zulip Chat")
 </div>
 
 <div class="hero-buttons">
