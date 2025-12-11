@@ -158,12 +158,12 @@ obj_p mergesort_generic_obj(obj_p vec, i64_t asc) {
     return indices;
 }
 
-// insertion sort
-nil_t insertion_sort_asc(i64_t array[], i64_t indices[], i64_t left, i64_t right) {
+// insertion sort with direction: asc > 0 for ascending, asc < 0 for descending
+static inline nil_t insertion_sort_i64(i64_t array[], i64_t indices[], i64_t left, i64_t right, i64_t asc) {
     for (i64_t i = left + 1; i <= right; i++) {
         i64_t temp = indices[i];
         i64_t j = i - 1;
-        while (j >= left && array[indices[j]] > array[temp]) {
+        while (j >= left && asc * (array[indices[j]] - array[temp]) > 0) {
             indices[j + 1] = indices[j];
             j--;
         }
@@ -171,16 +171,12 @@ nil_t insertion_sort_asc(i64_t array[], i64_t indices[], i64_t left, i64_t right
     }
 }
 
+nil_t insertion_sort_asc(i64_t array[], i64_t indices[], i64_t left, i64_t right) {
+    insertion_sort_i64(array, indices, left, right, 1);
+}
+
 nil_t insertion_sort_desc(i64_t array[], i64_t indices[], i64_t left, i64_t right) {
-    for (i64_t i = left + 1; i <= right; i++) {
-        i64_t temp = indices[i];
-        i64_t j = i - 1;
-        while (j >= left && array[indices[j]] < array[temp]) {
-            indices[j + 1] = indices[j];
-            j--;
-        }
-        indices[j + 1] = temp;
-    }
+    insertion_sort_i64(array, indices, left, right, -1);
 }
 //
 
@@ -408,7 +404,7 @@ obj_p ray_sort_asc(obj_p vec) {
     if (vec->attrs & ATTR_ASC) {
         indices = I64(len);
         indices->attrs = ATTR_ASC | ATTR_DISTINCT;
-        iota_ctx_t ctx = { AS_I64(indices), len };
+        iota_ctx_t ctx = {AS_I64(indices), len};
         pool_map(len, iota_asc_worker, &ctx);
         return indices;
     }
@@ -416,7 +412,7 @@ obj_p ray_sort_asc(obj_p vec) {
     if (vec->attrs & ATTR_DESC) {
         indices = I64(len);
         indices->attrs = ATTR_DESC | ATTR_DISTINCT;
-        iota_ctx_t ctx = { AS_I64(indices), len };
+        iota_ctx_t ctx = {AS_I64(indices), len};
         pool_map(len, iota_desc_worker, &ctx);
         return indices;
     }
@@ -636,7 +632,7 @@ obj_p ray_sort_desc(obj_p vec) {
     if (vec->attrs & ATTR_DESC) {
         indices = I64(len);
         indices->attrs = ATTR_ASC | ATTR_DISTINCT;
-        iota_ctx_t ctx = { AS_I64(indices), len };
+        iota_ctx_t ctx = {AS_I64(indices), len};
         pool_map(len, iota_asc_worker, &ctx);
         return indices;
     }
@@ -644,7 +640,7 @@ obj_p ray_sort_desc(obj_p vec) {
     if (vec->attrs & ATTR_ASC) {
         indices = I64(len);
         indices->attrs = ATTR_DESC | ATTR_DISTINCT;
-        iota_ctx_t ctx = { AS_I64(indices), len };
+        iota_ctx_t ctx = {AS_I64(indices), len};
         pool_map(len, iota_desc_worker, &ctx);
         return indices;
     }

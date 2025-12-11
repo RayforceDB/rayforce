@@ -117,9 +117,9 @@ i64_t size_obj(obj_p obj) {
             return ISIZEOF(i8_t) + 1 + ISIZEOF(i64_t) + obj->len * ISIZEOF(b8_t);
         case TYPE_U8:
             return ISIZEOF(i8_t) + 1 + ISIZEOF(i64_t) + obj->len * ISIZEOF(u8_t);
-				case TYPE_I32:
-				case TYPE_DATE:
-				case TYPE_TIME:
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
             return ISIZEOF(i8_t) + 1 + ISIZEOF(i64_t) + obj->len * ISIZEOF(i32_t);
         case TYPE_I64:
         case TYPE_TIMESTAMP:
@@ -199,15 +199,6 @@ i64_t ser_raw(u8_t *buf, obj_p obj) {
             memcpy(buf, AS_C8(obj), ISIZEOF(guid_t));
             return ISIZEOF(i8_t) + ISIZEOF(guid_t);
         case TYPE_B8:
-            buf[0] = 0;  // attrs
-            buf++;
-            l = obj->len;
-            memcpy(buf, &l, ISIZEOF(i64_t));
-            buf += ISIZEOF(i64_t);
-            for (i = 0; i < l; i++)
-                buf[i] = AS_B8(obj)[i];
-
-            return ISIZEOF(i8_t) + ISIZEOF(i64_t) + l * ISIZEOF(b8_t) + 1;
         case TYPE_U8:
             buf[0] = 0;  // attrs
             buf++;
@@ -451,9 +442,9 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case TYPE_B8:
         case TYPE_U8:
         case TYPE_C8:
-				case TYPE_I32:
-				case TYPE_DATE:
-				case TYPE_TIME:
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
         case TYPE_I64:
         case TYPE_TIMESTAMP:
         case TYPE_F64:
@@ -475,19 +466,11 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             // Continue with type-specific handling
             switch (type) {
                 case TYPE_B8:
-                    if (*len < l * ISIZEOF(b8_t))
-                        return error_str(ERR_IO, "de_raw: buffer underflow");
-                    obj = B8(l);
-                    if (IS_ERR(obj))
-                        return obj;
-                    memcpy(AS_B8(obj), buf, l * ISIZEOF(b8_t));
-                    buf += l * ISIZEOF(b8_t);
-                    (*len) -= l * ISIZEOF(b8_t);
-                    return obj;
                 case TYPE_U8:
                     if (*len < l * ISIZEOF(u8_t))
                         return error_str(ERR_IO, "de_raw: buffer underflow");
                     obj = U8(l);
+                    obj->type = type;
                     if (IS_ERR(obj))
                         return obj;
                     memcpy(AS_U8(obj), buf, l * ISIZEOF(u8_t));
@@ -504,9 +487,9 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                     buf += l * ISIZEOF(c8_t);
                     (*len) -= l * ISIZEOF(c8_t);
                     return obj;
-								case TYPE_I32:
-								case TYPE_TIME:
-								case TYPE_DATE:
+                case TYPE_I32:
+                case TYPE_TIME:
+                case TYPE_DATE:
                     if (*len < l * ISIZEOF(i32_t))
                         return error_str(ERR_IO, "de_raw: buffer underflow");
                     obj = I32(l);
