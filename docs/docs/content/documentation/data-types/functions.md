@@ -24,7 +24,7 @@ A Lambda is a user-defined function that has the Vary type code `103`.
 )
 ```
 
-To define a lambda, you need to use the keyword `fn` followed by a [:material-vector-line: Vector](./vector.md) of [:simple-scalar: Symbols](../scalars/symbol.md), which represent the function arguments. And then followed by any amount of expressions that has to be evaluated.
+To define a lambda, you need to use the keyword `fn` followed by a [:material-vector-line: Vector](./vector.md) of [:simple-scalar: Symbols](./symbol.md), which represent the function arguments. And then followed by any amount of expressions that has to be evaluated.
 
 Within the function, you can utilize the `let` keyword (as opposed to `set`) to restrict the scope of the variable to the function, and not the whole runtime.
 

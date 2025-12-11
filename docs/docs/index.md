@@ -68,7 +68,7 @@ The high-performance columnar database engineered for lightning-fast analytics a
 
     Intuitive LISP-like syntax flattens the learning curve. Write powerful queries in minutes, not hours.
 
-    [:octicons-arrow-right-24: Learn Syntax](content/syntax.md)
+    [:octicons-arrow-right-24: Learn Syntax](content/documentation/overview.md)
 
 - :material-language-c:{ .lg .middle .feature-icon } **Pure C, Zero Dependencies**
 
@@ -112,7 +112,6 @@ The high-performance columnar database engineered for lightning-fast analytics a
 
 RayforceDB is open source under MIT license. Download, build, and run your first query today.
 
-[Read the Docs](content/get-started/tutorial.md){ .md-button .md-button--primary }
-[Try Online](wasm/index.html){ .md-button }
+[Read the Docs](content/documentation/overview.md){ .md-button .md-button--primary }
 
 </div>

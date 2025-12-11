@@ -12,7 +12,7 @@ symbol
 Symbol
 ```
 
-Symbol can be used to associate a certain value with the variable, using function [`set`](../operations/IO/overview.md)
+Symbol can be used to associate a certain value with the variable, using function [`set`](../environment.md#set)
 ```clj
 ↪ (set t (as 'B8 [true false]))
 [true false]

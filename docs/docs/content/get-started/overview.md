@@ -57,7 +57,7 @@ The <b>ultra-fast</b> columnar database engineered to deliver the <b>best high-s
 </div>
 
 !!! note ""
-    RayforceDB delivers exceptional performance, competing with the fastest databases while maintaining simplicity and efficiency. Our benchmarks are based on the [H2OAI Group By Benchmark](https://h2oai.github.io/db-benchmark/) standard. [View full benchmarks →](content/get-started/benchmarks/overview.md)
+    RayforceDB delivers exceptional performance, competing with the fastest databases while maintaining simplicity and efficiency. Our benchmarks are based on the [H2OAI Group By Benchmark](https://h2oai.github.io/db-benchmark/) standard. [View full benchmarks →](./benchmarks/overview.md)
 
 
 <div class="grid cards" markdown>
@@ -68,7 +68,7 @@ The <b>ultra-fast</b> columnar database engineered to deliver the <b>best high-s
 
     Querying tables <b>has never been</b> this easy to follow...
     
-    [:octicons-arrow-right-24: Syntax](content/documentation/overview.md)
+    [:octicons-arrow-right-24: Syntax](../documentation/overview.md)
 
 - :material-poll:{ .lg .middle } __Columnar storage__
 
