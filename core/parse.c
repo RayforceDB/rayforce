@@ -792,7 +792,7 @@ obj_p parse_vector(parser_t *parser) {
 
         if (tok->type == -TYPE_B8) {
             if (vec->len > 0 && vec->type != TYPE_B8) {
-                err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+                err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
                 drop_obj(vec);
                 drop_obj(tok);
                 return err;
@@ -801,7 +801,7 @@ obj_p parse_vector(parser_t *parser) {
             push_raw(&vec, &tok->b8);
         } else if (tok->type == -TYPE_U8) {
             if (vec->len > 0 && vec->type != TYPE_U8) {
-                err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+                err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
                 drop_obj(vec);
                 drop_obj(tok);
                 return err;
@@ -816,7 +816,7 @@ obj_p parse_vector(parser_t *parser) {
                 v = (f64_t)tok->i16;
                 push_raw(&vec, &v);
             } else {
-                err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+                err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
                 drop_obj(vec);
                 drop_obj(tok);
                 return err;
@@ -826,7 +826,7 @@ obj_p parse_vector(parser_t *parser) {
                 push_raw(&vec, &tok->i32);
                 vec->type = TYPE_I32;
             } else {
-                err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+                err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
                 drop_obj(vec);
                 drop_obj(tok);
                 return err;
@@ -836,7 +836,7 @@ obj_p parse_vector(parser_t *parser) {
                 push_raw(&vec, &tok->i32);
                 vec->type = TYPE_DATE;
             } else {
-                err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+                err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
                 drop_obj(vec);
                 drop_obj(tok);
                 return err;
@@ -846,7 +846,7 @@ obj_p parse_vector(parser_t *parser) {
                 push_raw(&vec, &tok->i32);
                 vec->type = TYPE_TIME;
             } else {
-                err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+                err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
                 drop_obj(vec);
                 drop_obj(tok);
                 return err;
@@ -858,7 +858,7 @@ obj_p parse_vector(parser_t *parser) {
                 v = (f64_t)tok->i64;
                 push_raw(&vec, &v);
             } else {
-                err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+                err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
                 drop_obj(vec);
                 drop_obj(tok);
                 return err;
@@ -873,7 +873,7 @@ obj_p parse_vector(parser_t *parser) {
 
                 push_raw(&vec, &tok->f64);
             } else {
-                err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+                err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
                 drop_obj(vec);
                 drop_obj(tok);
                 return err;
@@ -883,7 +883,7 @@ obj_p parse_vector(parser_t *parser) {
                 vec->type = TYPE_SYMBOL;
                 push_raw(&vec, &tok->i64);
             } else {
-                err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+                err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
                 drop_obj(vec);
                 drop_obj(tok);
                 return err;
@@ -893,13 +893,13 @@ obj_p parse_vector(parser_t *parser) {
                 push_raw(&vec, &tok->i64);
                 vec->type = TYPE_TIMESTAMP;
             } else {
-                err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+                err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
                 drop_obj(vec);
                 drop_obj(tok);
                 return err;
             }
         } else {
-            err = parse_error(parser, (i64_t)tok, str_fmt(-1, "Invalid token in vector"));
+            err = parse_error(parser, (i64_t)tok, str_fmt(-1, ERR_MSG_INVALID_TOKEN));
             drop_obj(vec);
             drop_obj(tok);
             return err;

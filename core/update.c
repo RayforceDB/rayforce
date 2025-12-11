@@ -50,7 +50,7 @@ obj_p __fetch(obj_p obj, obj_p **val, obj_p *original) {
     if (obj->type == -TYPE_SYMBOL) {
         *val = resolve(obj->i64);
         if (*val == NULL)
-            THROW(ERR_NOT_FOUND, "fetch: symbol not found");
+            THROW_S(ERR_NOT_FOUND, "fetch: symbol not found");
 
         *original = **val;
         obj = cow_obj(**val);
@@ -232,7 +232,7 @@ obj_p dot_obj(obj_p obj, obj_p idx) {
         case TYPE_LIST:
             l = idx->len;
             if (l < 2)
-                THROW(ERR_NOT_FOUND, "dot: invalid index len");
+                THROW_S(ERR_NOT_FOUND, "dot: invalid index len");
 
             l--;  // skip last element
 
@@ -240,7 +240,7 @@ obj_p dot_obj(obj_p obj, obj_p idx) {
                 obj = cow_obj(obj);
                 obj = dot_obj(obj, AS_LIST(idx)[i]);
                 if (obj == NULL)
-                    THROW(ERR_NOT_FOUND, "dot: invalid index");
+                    THROW_S(ERR_NOT_FOUND, "dot: invalid index");
             }
 
             return obj;
@@ -248,7 +248,7 @@ obj_p dot_obj(obj_p obj, obj_p idx) {
         default:
             ref = at_obj_ref(cow_obj(obj), idx);
             if (ref == NULL)
-                THROW(ERR_NOT_FOUND, "dot: invalid index");
+                THROW_S(ERR_NOT_FOUND, "dot: invalid index");
             return *ref;
     }
 }
@@ -301,15 +301,15 @@ obj_p ray_alter(obj_p *x, i64_t n) {
     obj_p obj, res, *cur = NULL;
 
     if (n < 3)
-        THROW(ERR_LENGTH, "alter: expected at least 3 arguments");
+        THROW_S(ERR_LENGTH, "alter: expected at least 3 arguments");
 
     if (x[1]->type < TYPE_LAMBDA || x[1]->type > TYPE_VARY)
-        THROW(ERR_TYPE, "alter: expected function as 2nd argument");
+        THROW_S(ERR_TYPE, "alter: expected function as 2nd argument");
 
     if (x[0]->type == -TYPE_SYMBOL) {
         cur = resolve(x[0]->i64);
         if (cur == NULL)
-            THROW(ERR_NOT_FOUND, "alter: undefined symbol");
+            THROW_S(ERR_NOT_FOUND, "alter: undefined symbol");
         obj = cow_obj(*cur);
     } else {
         obj = cow_obj(x[0]);
@@ -358,7 +358,7 @@ obj_p ray_modify(obj_p *x, i64_t n) {
     if (x[0]->type == -TYPE_SYMBOL) {
         cur = resolve(x[0]->i64);
         if (cur == NULL)
-            THROW(ERR_NOT_FOUND, "modify: undefined symbol");
+            THROW_S(ERR_NOT_FOUND, "modify: undefined symbol");
         obj = cow_obj(*cur);
     } else {
         obj = cow_obj(x[0]);
@@ -959,16 +959,16 @@ obj_p ray_update(obj_p obj) {
                   prm, val;
 
     if (obj->type != TYPE_DICT)
-        THROW(ERR_LENGTH, "'update' takes dict of params");
+        THROW_S(ERR_LENGTH, "'update' takes dict of params");
 
     if (AS_LIST(obj)[0]->type != TYPE_SYMBOL)
-        THROW(ERR_LENGTH, "'update' takes dict with symbol keys");
+        THROW_S(ERR_LENGTH, "'update' takes dict with symbol keys");
 
     // Retrive a table
     tabsym = at_sym(obj, "from", 4);
 
     if (is_null(tabsym))
-        THROW(ERR_LENGTH, "'update' expects 'from' param");
+        THROW_S(ERR_LENGTH, "'update' expects 'from' param");
 
     tab = eval(tabsym);
     if (IS_ERR(tab)) {
@@ -988,7 +988,7 @@ obj_p ray_update(obj_p obj) {
     if (tab->type != TYPE_TABLE) {
         drop_obj(tabsym);
         drop_obj(tab);
-        THROW(ERR_TYPE, "'update' from: expects table");
+        THROW_S(ERR_TYPE, "'update' from: expects table");
     }
 
     keys = ray_except(AS_LIST(obj)[0], runtime_get()->env.keywords);
@@ -998,7 +998,7 @@ obj_p ray_update(obj_p obj) {
         drop_obj(tabsym);
         drop_obj(keys);
         drop_obj(tab);
-        THROW(ERR_LENGTH, "'update' expects at least one field to update");
+        THROW_S(ERR_LENGTH, "'update' expects at least one field to update");
     }
 
     // Mount table columns to a local env

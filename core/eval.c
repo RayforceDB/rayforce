@@ -224,7 +224,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                         res = ((vary_f)car->i64)(args, len);
                     else {
                         if (!stack_enough(len))
-                            return unwrap(error_str(ERR_STACK_OVERFLOW, "stack overflow"), (i64_t)obj);
+                            return unwrap(error_str(ERR_STACK_OVERFLOW, ERR_MSG_STACK_OVERFLOW), (i64_t)obj);
 
                         for (i = 0; i < len; i++) {
                             x = eval(args[i]);
@@ -260,7 +260,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                         return unwrap(error_str(ERR_ARITY, "wrong number of arguments"), (i64_t)obj);
 
                     if (!stack_enough(len))
-                        return unwrap(error_str(ERR_STACK_OVERFLOW, "stack overflow"), (i64_t)obj);
+                        return unwrap(error_str(ERR_STACK_OVERFLOW, ERR_MSG_STACK_OVERFLOW), (i64_t)obj);
 
                     for (i = 0; i < len; i++) {
                         x = eval(args[i]);
@@ -405,7 +405,7 @@ obj_p unmount_env(i64_t n) {
 
 obj_p ray_return(obj_p *x, i64_t n) {
     if (__INTERPRETER->cp == 1)
-        THROW(ERR_NOT_SUPPORTED, "return outside of function");
+        THROW_S(ERR_NOT_SUPPORTED, "return outside of function");
 
     if (n == 0)
         stack_push(NULL_OBJ);

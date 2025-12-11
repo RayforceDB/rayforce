@@ -616,7 +616,7 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
             error_desc = "not implemented";
             break;
         case ERR_STACK_OVERFLOW:
-            error_desc = "stack overflow";
+            error_desc = ERR_MSG_STACK_OVERFLOW;
             break;
         case ERR_RAISE:
             error_desc = "raised error";

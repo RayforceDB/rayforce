@@ -48,24 +48,24 @@ obj_p ray_hopen(obj_p *x, i64_t n) {
     obj_p path, msg, err;
 
     if (n == 0)
-        THROW(ERR_LENGTH, "hopen: expected at least 1 argument, got 0");
+        THROW_S(ERR_LENGTH, "hopen: expected at least 1 argument, got 0");
 
     if (n > 2)
         THROW(ERR_LENGTH, "hopen: expected at most 2 arguments, got %lld", n);
 
     if (x[0]->type != TYPE_C8)
-        THROW(ERR_TYPE, "hopen: expected string address");
+        THROW_S(ERR_TYPE, "hopen: expected string address");
 
     if (n == 2) {
         if (x[1]->type != -TYPE_I64)
-            THROW(ERR_TYPE, "hopen: expected i64 timeout");
+            THROW_S(ERR_TYPE, "hopen: expected i64 timeout");
 
         timeout = x[1]->i64;
     }
 
     // Allow only in main thread
     if (!ray_is_main_thread())
-        THROW(ERR_NOT_SUPPORTED, "hopen: expected main thread");
+        THROW_S(ERR_NOT_SUPPORTED, "hopen: expected main thread");
 
     // Open socket
     if (sock_addr_from_str(AS_C8(x[0]), x[0]->len, &addr) != -1) {
@@ -98,7 +98,7 @@ obj_p ray_hopen(obj_p *x, i64_t n) {
 obj_p ray_hclose(obj_p x) {
     // Allow only in main thread
     if (!ray_is_main_thread())
-        THROW(ERR_NOT_SUPPORTED, "hclose: expected main thread");
+        THROW_S(ERR_NOT_SUPPORTED, "hclose: expected main thread");
 
     switch (x->type) {
         case -TYPE_I32:
@@ -108,7 +108,7 @@ obj_p ray_hclose(obj_p x) {
             poll_deregister(runtime_get()->poll, x->i64);
             return NULL_OBJ;
         default:
-            THROW(ERR_TYPE, "hclose: unsupported type: '%s'", type_name(x->type));
+            THROW_TYPE1("hclose", x->type);
     }
 }
 
@@ -203,7 +203,7 @@ obj_p ray_read(obj_p x) {
             drop_obj(s);
             return res;
         default:
-            THROW(ERR_TYPE, "read: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("read", x->type);
     }
 }
 
@@ -235,7 +235,7 @@ obj_p io_write(i64_t fd, u8_t msg_type, obj_p obj) {
 
             // Allow only in main thread
             if (!ray_is_main_thread())
-                THROW(ERR_NOT_SUPPORTED, "write sock: expected main thread");
+                THROW_S(ERR_NOT_SUPPORTED, "write sock: expected main thread");
 
             return ipc_send(runtime_get()->poll, fd, obj, msg_type);
     }
@@ -261,7 +261,7 @@ obj_p ray_write(obj_p x, obj_p y) {
             else
                 return io_write(x->i64, MSG_TYPE_SYNC, y);
         default:
-            THROW(ERR_NOT_IMPLEMENTED, "write: not implemented");
+            THROW_S(ERR_NOT_IMPLEMENTED, "write: not implemented");
     }
 }
 
@@ -357,7 +357,7 @@ obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out) {
             }
             break;
         default:
-            THROW(ERR_TYPE, "csv: unsupported type: '%s", type_name(type));
+            THROW_TYPE1("csv", type);
     }
 
     return NULL_OBJ;
@@ -633,7 +633,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
             if (buf == NULL) {
                 drop_obj(types);
                 fs_fclose(fd);
-                THROW(ERR_IO, "csv: mmap failed");
+                THROW_S(ERR_IO, "csv: mmap failed");
             }
 
             pos = buf;
@@ -741,7 +741,7 @@ obj_p ray_parse(obj_p x) {
     obj_p s, res;
 
     if (!x || x->type != TYPE_C8)
-        THROW(ERR_TYPE, "parse: expected string");
+        THROW_S(ERR_TYPE, "parse: expected string");
 
     s = cstring_from_obj(x);
 
@@ -766,7 +766,7 @@ obj_p ray_load(obj_p x) {
     lit_p fname;
 
     if (!x || x->type != TYPE_C8)
-        THROW(ERR_TYPE, "load: expected string");
+        THROW_S(ERR_TYPE, "load: expected string");
 
     // table expected
     if (x->len > 1 && AS_C8(x)[x->len - 1] == '/') {
@@ -957,7 +957,7 @@ obj_p io_set_table_splayed(obj_p path, obj_p table, obj_p symfile) {
             default:
                 drop_obj(cols);
                 drop_obj(sym);
-                THROW(ERR_TYPE, "set: symfile must be a string");
+                THROW_S(ERR_TYPE, "set: symfile must be a string");
         }
 
         if (IS_ERR(res))

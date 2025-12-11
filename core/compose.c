@@ -43,7 +43,7 @@ obj_p ray_cast_obj(obj_p x, obj_p y) {
     obj_p fmt, msg;
 
     if (x->type != -TYPE_SYMBOL)
-        THROW(ERR_TYPE, "as: first argument must be a symbol");
+        THROW_S(ERR_TYPE, "as: first argument must be a symbol");
 
     type = env_get_type_by_type_name(&runtime_get()->env, x->i64);
 
@@ -176,7 +176,7 @@ obj_p ray_reverse(obj_p x) {
             break;
 
         default:
-            THROW(ERR_TYPE, "reverse: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("reverse", x->type);
     }
 
     res->attrs = (x->attrs & ~(ATTR_ASC | ATTR_DESC)) | ((x->attrs & ATTR_ASC) ? ATTR_DESC : 0) |
@@ -205,7 +205,7 @@ obj_p ray_table(obj_p x, obj_p y) {
 
     if (y->type != TYPE_LIST) {
         if (x->len != 1)
-            return error_str(ERR_LENGTH, "table: keys and values must have the same length");
+            return error_str(ERR_LENGTH, ERR_MSG_TABLE_KV_LEN);
 
         l = LIST(1);
         AS_LIST(l)[0] = clone_obj(y);
@@ -214,7 +214,7 @@ obj_p ray_table(obj_p x, obj_p y) {
 
     if (x->len != y->len && y->len > 0) {
         drop_obj(l);
-        return error_str(ERR_LENGTH, "table: keys and values must have the same length");
+        return error_str(ERR_LENGTH, ERR_MSG_TABLE_KV_LEN);
     }
 
     len = y->len;
@@ -253,7 +253,7 @@ obj_p ray_table(obj_p x, obj_p y) {
             case TYPE_GUID:
                 j = AS_LIST(y)[i]->len;
                 if (cl != 0 && j != cl)
-                    return ray_error(ERR_LENGTH, "table: values must be of the same length");
+                    return ray_error(ERR_LENGTH, ERR_MSG_TABLE_VALUES_LEN);
 
                 cl = j;
                 break;
@@ -261,14 +261,14 @@ obj_p ray_table(obj_p x, obj_p y) {
                 synergy = B8_FALSE;
                 j = AS_LIST(AS_LIST(y)[i])[1]->len;
                 if (cl != 0 && j != cl)
-                    return ray_error(ERR_LENGTH, "table: values must be of the same length");
+                    return ray_error(ERR_LENGTH, ERR_MSG_TABLE_VALUES_LEN);
 
                 cl = j;
                 break;
             case TYPE_MAPCOMMON:
                 j = AS_LIST(AS_LIST(y)[i])[0]->len;
                 if (cl != 0 && j != cl)
-                    return ray_error(ERR_LENGTH, "table: values must be of the same length");
+                    return ray_error(ERR_LENGTH, ERR_MSG_TABLE_VALUES_LEN);
                 break;
             default:
                 return ray_error(ERR_TYPE, "table: unsupported type: '%s' in a values list",
@@ -339,7 +339,7 @@ obj_p ray_guid(obj_p x) {
             return vec;
 
         default:
-            THROW(ERR_TYPE, "guid: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("guid", x->type);
     }
 }
 
@@ -380,7 +380,7 @@ obj_p ray_enum(obj_p x, obj_p y) {
 
             if (!s || s->type != TYPE_SYMBOL) {
                 drop_obj(s);
-                THROW(ERR_TYPE, "enum: expected vector symbol");
+                THROW_S(ERR_TYPE, "enum: expected vector symbol");
             }
 
             v = index_find_i64(AS_I64(s), s->len, AS_I64(y), y->len);
@@ -388,12 +388,12 @@ obj_p ray_enum(obj_p x, obj_p y) {
 
             if (IS_ERR(v)) {
                 drop_obj(v);
-                THROW(ERR_TYPE, "enum: can not be fully indexed");
+                THROW_S(ERR_TYPE, "enum: can not be fully indexed");
             }
 
             return enumerate(clone_obj(x), v);
         default:
-            THROW(ERR_TYPE, "enum: unsupported types: '%s '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("enum", x->type, y->type);
     }
 }
 
@@ -419,7 +419,7 @@ obj_p ray_rand(obj_p x, obj_p y) {
             return vec;
 
         default:
-            THROW(ERR_TYPE, "rand: unsupported types: '%s '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("rand", x->type, y->type);
     }
 }
 
@@ -725,7 +725,7 @@ obj_p ray_concat(obj_p x, obj_p y) {
             if (kx->len != kxy->len || cmp_obj(kx, kxy) != 0) {
                 drop_obj(kx);
                 drop_obj(kxy);
-                THROW(ERR_TYPE, "concat: keys a not compatible");
+                THROW_S(ERR_TYPE, "concat: keys a not compatible");
             }
             iy = ray_find(AS_LIST(y)[0], AS_LIST(x)[0]);
 
@@ -734,7 +734,7 @@ obj_p ray_concat(obj_p x, obj_p y) {
                     drop_obj(kx);
                     drop_obj(kxy);
                     drop_obj(iy);
-                    THROW(ERR_TYPE, "concat: values a not compatible");
+                    THROW_S(ERR_TYPE, "concat: values a not compatible");
                 }
             }
             vec = vector(TYPE_LIST, kx->len);
@@ -791,7 +791,7 @@ obj_p ray_remove(obj_p x, obj_p y) {
             r = cow_obj(x);
             return remove_idx(&r, y->i64);
         default:
-            THROW(ERR_TYPE, "remove: unsupported type: '%s", type_name(y->type));
+            THROW_TYPE1("remove", y->type);
     }
 }
 
@@ -1008,7 +1008,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, u8, y, i64);
                 default:
-                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+                    THROW_TYPE1("cut", y->type);
             }
         case TYPE_I16:
             switch (y->type) {
@@ -1019,7 +1019,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, i16, y, i64);
                 default:
-                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+                    THROW_TYPE1("cut", y->type);
             }
         case TYPE_I32:
         case TYPE_DATE:
@@ -1032,7 +1032,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, i32, y, i64);
                 default:
-                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+                    THROW_TYPE1("cut", y->type);
             }
         case TYPE_I64:
         case TYPE_SYMBOL:
@@ -1045,7 +1045,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, i64, y, i64);
                 default:
-                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+                    THROW_TYPE1("cut", y->type);
             }
         case TYPE_F64:
             switch (y->type) {
@@ -1056,7 +1056,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, f64, y, i64);
                 default:
-                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+                    THROW_TYPE1("cut", y->type);
             }
         case TYPE_GUID:
             switch (y->type) {
@@ -1067,7 +1067,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, guid, y, i64);
                 default:
-                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+                    THROW_TYPE1("cut", y->type);
             }
         case TYPE_LIST:
             switch (y->type) {
@@ -1078,7 +1078,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, list, y, i64);
                 default:
-                    THROW(ERR_TYPE, "cut: unsupported index type: '%s", type_name(y->type));
+                    THROW_TYPE1("cut", y->type);
             }
         default:
             THROW(ERR_TYPE, "cut: unsupported vector type: '%s", type_name(x->type));
@@ -1099,6 +1099,6 @@ obj_p ray_split(obj_p x, obj_p y) {
             if (IS_VECTOR(x))
                 return cut_vector(x, y);
 
-            THROW(ERR_TYPE, "split: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("split", x->type, y->type);
     }
 }

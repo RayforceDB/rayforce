@@ -288,7 +288,7 @@ obj_p map_binary_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
     i8_t xt, yt;
 
     if (!x || !y)
-        THROW(ERR_TYPE, "binary: null argument");
+        THROW_S(ERR_TYPE, "binary: null argument");
 
     xt = x->type;
     yt = y->type;
@@ -297,7 +297,7 @@ obj_p map_binary_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
         l = ops_count(x);
 
         if (l != ops_count(y))
-            return error_str(ERR_LENGTH, "binary: vectors must be of the same length");
+            return error_str(ERR_LENGTH, ERR_MSG_BINARY_VEC_SAME_LEN);
 
         if (l == 0)
             return fn(x, y);
@@ -421,7 +421,7 @@ obj_p map_vary_fn(vary_f fn, i64_t attrs, obj_p *x, i64_t n) {
 
     l = ops_rank(x, n);
     if (l == NULL_I64)
-        THROW(ERR_LENGTH, "vary: arguments have different lengths");
+        THROW_S(ERR_LENGTH, "vary: arguments have different lengths");
 
     for (j = 0; j < n; j++)
         stack_push(at_idx(x[j], 0));
@@ -589,21 +589,21 @@ obj_p ray_map(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(ERR_LENGTH, "'map': unary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_MAP_ARITY);
             return map_unary(f, x[0]);
         case TYPE_BINARY:
             if (n != 2)
-                THROW(ERR_LENGTH, "'map': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_MAP_ARITY);
             return map_binary(f, x[0], x[1]);
         case TYPE_VARY:
             return map_vary(f, x, n);
         case TYPE_LAMBDA:
             if (n != AS_LAMBDA(f)->args->len)
-                THROW(ERR_LENGTH, "'map': lambda call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_MAP_ARITY);
 
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                THROW(ERR_LENGTH, "'map': arguments have different lengths");
+                THROW_S(ERR_LENGTH, ERR_MSG_MAP_LEN);
 
             if (l < 1)
                 return vector(x[0]->type, 0);
@@ -611,7 +611,7 @@ obj_p ray_map(obj_p *x, i64_t n) {
             return map_lambda(f, x, n);
 
         default:
-            THROW(ERR_TYPE, "'map': unsupported function type: '%s", type_name(f->type));
+            THROW_TYPE1("map", f->type);
     }
 }
 
@@ -629,21 +629,21 @@ obj_p ray_pmap(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(ERR_LENGTH, "'pmap': unary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_PMAP_ARITY);
             return pmap_unary(f, x[0]);
         case TYPE_BINARY:
             if (n != 2)
-                THROW(ERR_LENGTH, "'pmap': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_PMAP_ARITY);
             return map_binary(f, x[0], x[1]);
         case TYPE_VARY:
             return map_vary(f, x, n);
         case TYPE_LAMBDA:
             if (n != AS_LAMBDA(f)->args->len)
-                THROW(ERR_LENGTH, "'pmap': lambda call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_PMAP_ARITY);
 
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                THROW(ERR_LENGTH, "'pmap': arguments have different lengths");
+                THROW_S(ERR_LENGTH, ERR_MSG_PMAP_LEN);
 
             if (l < 1)
                 return vector(x[0]->type, 0);
@@ -651,7 +651,7 @@ obj_p ray_pmap(obj_p *x, i64_t n) {
             return pmap_lambda(f, x, n);
 
         default:
-            THROW(ERR_TYPE, "'pmap': unsupported function type: '%s", type_name(f->type));
+            THROW_TYPE1("pmap", f->type);
     }
 }
 
@@ -669,17 +669,17 @@ obj_p ray_map_left(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(ERR_LENGTH, "'map-left': unary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_MAP_L_ARITY);
             return map_unary(f, x[0]);
         case TYPE_BINARY:
             if (n != 2)
-                THROW(ERR_LENGTH, "'map-left': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_MAP_L_ARITY);
             return map_binary_left(f, x[0], x[1]);
         case TYPE_VARY:
             return map_vary(f, x, n);
         case TYPE_LAMBDA:
             if (n != AS_LAMBDA(f)->args->len)
-                THROW(ERR_LENGTH, "'map-left': lambda call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_MAP_L_ARITY);
 
             if (!IS_VECTOR(x[0])) {
                 for (i = 0; i < n; i++)
@@ -738,7 +738,7 @@ obj_p ray_map_left(obj_p *x, i64_t n) {
 
             return res;
         default:
-            THROW(ERR_TYPE, "'map-left': unsupported function type: '%s", type_name(f->type));
+            THROW_TYPE1("map-left", f->type);
     }
 }
 
@@ -756,17 +756,17 @@ obj_p ray_map_right(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(ERR_LENGTH, "'map-right': unary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_MAP_R_ARITY);
             return map_unary(f, x[0]);
         case TYPE_BINARY:
             if (n != 2)
-                THROW(ERR_LENGTH, "'map-right': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_MAP_R_ARITY);
             return map_binary_right(f, x[0], x[1]);
         case TYPE_VARY:
             return map_vary(f, x, n);
         case TYPE_LAMBDA:
             if (n != AS_LAMBDA(f)->args->len)
-                THROW(ERR_LENGTH, "'map-right': lambda call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_MAP_R_ARITY);
 
             if (!IS_VECTOR(x[n - 1])) {
                 for (i = 0; i < n; i++)
@@ -824,7 +824,7 @@ obj_p ray_map_right(obj_p *x, i64_t n) {
 
             return res;
         default:
-            THROW(ERR_TYPE, "'map-right': unsupported function type: '%s", type_name(f->type));
+            THROW_TYPE1("map-right", f->type);
     }
 }
 
@@ -843,11 +843,11 @@ obj_p ray_fold(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(ERR_LENGTH, "'fold': unary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_ARITY);
             return map_unary(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                THROW(ERR_LENGTH, "'fold': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_WRONG_ARGS);
 
             xt = x[0]->type;
             yt = x[1]->type;
@@ -856,7 +856,7 @@ obj_p ray_fold(obj_p *x, i64_t n) {
                 l = ops_count(x[0]);
 
                 if (l != ops_count(x[1]))
-                    return error_str(ERR_LENGTH, "'fold': vectors must be of the same length");
+                    return error_str(ERR_LENGTH, ERR_MSG_FOLD_VEC_SAME_LEN);
 
                 if (l == 0)
                     return LIST(0);
@@ -946,7 +946,7 @@ obj_p ray_fold(obj_p *x, i64_t n) {
 
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                THROW(ERR_LENGTH, "'fold': arguments have different lengths");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_DIFF_LEN);
 
             for (i = 0; i < n; i++)
                 stack_push(at_idx(x[i], 0));
@@ -978,10 +978,10 @@ obj_p ray_fold(obj_p *x, i64_t n) {
         case TYPE_LAMBDA:
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                THROW(ERR_LENGTH, "'fold': arguments have different lengths");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_DIFF_LEN);
 
             if (n != 1 && n != AS_LAMBDA(f)->args->len)
-                THROW(ERR_LENGTH, "'fold': lambda call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_ARITY);
 
             if (n == 1) {
                 l = ops_count(x[0]);
@@ -1028,9 +1028,9 @@ obj_p ray_fold(obj_p *x, i64_t n) {
 
                 return v;
             } else
-                THROW(ERR_LENGTH, "'fold': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_WRONG_ARGS);
         default:
-            THROW(ERR_TYPE, "'fold': unsupported function type: '%s", type_name(f->type));
+            THROW_TYPE1("fold", f->type);
     }
 }
 
@@ -1048,11 +1048,11 @@ obj_p ray_fold_left(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(ERR_LENGTH, "'fold-left': unary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_L_ARITY);
             return unary_call(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                THROW(ERR_LENGTH, "'fold-left': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_L_ARITY);
 
             l = ops_count(x[0]);
             if (l == 0)
@@ -1087,7 +1087,7 @@ obj_p ray_fold_left(obj_p *x, i64_t n) {
             return vary_call(f, x, n);
         case TYPE_LAMBDA:
             if (n < 2 || AS_LAMBDA(f)->args->len != n)
-                THROW(ERR_LENGTH, "'fold-left': lambda call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_L_ARITY);
 
             l = ops_count(x[0]);
             if (l == 0)
@@ -1119,7 +1119,7 @@ obj_p ray_fold_left(obj_p *x, i64_t n) {
 
             return v;
         default:
-            THROW(ERR_TYPE, "'fold-left': unsupported function type: '%s", type_name(f->type));
+            THROW_TYPE1("fold-left", f->type);
     }
 }
 
@@ -1137,11 +1137,11 @@ obj_p ray_fold_right(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(ERR_LENGTH, "'fold-right': unary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_R_ARITY);
             return unary_call(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                THROW(ERR_LENGTH, "'fold-right': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_R_ARITY);
 
             l = ops_count(x[n - 1]);  // Last argument is the one we iterate over
             if (l == 0)
@@ -1164,7 +1164,7 @@ obj_p ray_fold_right(obj_p *x, i64_t n) {
             return vary_call(f, x, n);
         case TYPE_LAMBDA:
             if (n < 2 || AS_LAMBDA(f)->args->len != n)
-                THROW(ERR_LENGTH, "'fold-right': lambda call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_FOLD_R_ARITY);
 
             l = ops_count(x[n - 1]);  // Last argument is the one we iterate over
             if (l == 0)
@@ -1198,7 +1198,7 @@ obj_p ray_fold_right(obj_p *x, i64_t n) {
 
             return v;
         default:
-            THROW(ERR_TYPE, "'fold-right': unsupported function type: '%s", type_name(f->type));
+            THROW_TYPE1("fold-right", f->type);
     }
 }
 
@@ -1217,11 +1217,11 @@ obj_p ray_scan(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(ERR_LENGTH, "'scan': unary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_ARITY);
             return map_unary(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                THROW(ERR_LENGTH, "'scan': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_WRONG_ARGS);
 
             xt = x[0]->type;
             yt = x[1]->type;
@@ -1230,7 +1230,7 @@ obj_p ray_scan(obj_p *x, i64_t n) {
                 l = ops_count(x[0]);
 
                 if (l != ops_count(x[1]))
-                    return error_str(ERR_LENGTH, "'scan': vectors must be of the same length");
+                    return error_str(ERR_LENGTH, ERR_MSG_SCAN_VEC_SAME_LEN);
 
                 if (l == 0)
                     return LIST(0);
@@ -1356,7 +1356,7 @@ obj_p ray_scan(obj_p *x, i64_t n) {
 
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                THROW(ERR_LENGTH, "'scan': arguments have different lengths");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_DIFF_LEN);
 
             for (i = 0; i < n; i++)
                 stack_push(at_idx(x[i], 0));
@@ -1398,10 +1398,10 @@ obj_p ray_scan(obj_p *x, i64_t n) {
         case TYPE_LAMBDA:
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                THROW(ERR_LENGTH, "'scan': arguments have different lengths");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_DIFF_LEN);
 
             if (n != 1 && n != AS_LAMBDA(f)->args->len)
-                THROW(ERR_LENGTH, "'scan': lambda call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_ARITY);
 
             if (n == 1) {
                 l = ops_count(x[0]);
@@ -1466,9 +1466,9 @@ obj_p ray_scan(obj_p *x, i64_t n) {
 
                 return res;
             } else
-                THROW(ERR_LENGTH, "'scan': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_WRONG_ARGS);
         default:
-            THROW(ERR_TYPE, "'scan': unsupported function type: '%s", type_name(f->type));
+            THROW_TYPE1("scan", f->type);
     }
 }
 
@@ -1486,11 +1486,11 @@ obj_p ray_scan_left(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(ERR_LENGTH, "'scan-left': unary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_L_ARITY);
             return unary_call(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                THROW(ERR_LENGTH, "'scan-left': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_L_ARITY);
 
             l = ops_count(x[0]);
             if (l == 0)
@@ -1523,7 +1523,7 @@ obj_p ray_scan_left(obj_p *x, i64_t n) {
             return vary_call(f, x, n);
         case TYPE_LAMBDA:
             if (n < 2 || AS_LAMBDA(f)->args->len != n)
-                THROW(ERR_LENGTH, "'scan-left': lambda call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_L_ARITY);
 
             l = ops_count(x[0]);
             if (l == 0)
@@ -1565,7 +1565,7 @@ obj_p ray_scan_left(obj_p *x, i64_t n) {
 
             return res;
         default:
-            THROW(ERR_TYPE, "'scan-left': unsupported function type: '%s", type_name(f->type));
+            THROW_TYPE1("scan-left", f->type);
     }
 }
 
@@ -1583,11 +1583,11 @@ obj_p ray_scan_right(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(ERR_LENGTH, "'scan-right': unary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_R_ARITY);
             return unary_call(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                THROW(ERR_LENGTH, "'scan-right': binary call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_R_ARITY);
 
             l = ops_count(x[n - 1]);  // Last argument is the one we iterate over
             if (l == 0)
@@ -1620,7 +1620,7 @@ obj_p ray_scan_right(obj_p *x, i64_t n) {
             return vary_call(f, x, n);
         case TYPE_LAMBDA:
             if (n < 2 || AS_LAMBDA(f)->args->len != n)
-                THROW(ERR_LENGTH, "'scan-right': lambda call with wrong arguments count");
+                THROW_S(ERR_LENGTH, ERR_MSG_SCAN_R_ARITY);
 
             l = ops_count(x[n - 1]);  // Last argument is the one we iterate over
             if (l == 0)
@@ -1662,6 +1662,6 @@ obj_p ray_scan_right(obj_p *x, i64_t n) {
 
             return res;
         default:
-            THROW(ERR_TYPE, "'scan-right': unsupported function type: '%s", type_name(f->type));
+            THROW_TYPE1("scan-right", f->type);
     }
 }

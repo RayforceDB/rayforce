@@ -67,269 +67,269 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, i64_t, i64_t, obj_p);
         NULL_OBJ;                                                          \
     })
 
-#define __DECLARE_CMP_FN(op)                                                                                \
-    obj_p ray_##op##_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p res) {                        \
-        i64_t i;                                                                                            \
-        i64_t *xi, *ei, si;                                                                                 \
-        b8_t *out;                                                                                          \
-        obj_p k, sym, e;                                                                                    \
-                                                                                                            \
-        switch (MTYPE2(x->type, y->type)) {                                                                 \
-            case MTYPE2(-TYPE_B8, -TYPE_B8):                                                                \
-                return b8(op##I8(x->b8, y->b8));                                                            \
-            case MTYPE2(-TYPE_U8, -TYPE_U8):                                                                \
-                return b8(op##I8(x->u8, y->u8));                                                            \
-            case MTYPE2(-TYPE_B8, -TYPE_U8):                                                                \
-                return b8(op##I8(x->b8, y->u8));                                                            \
-            case MTYPE2(-TYPE_U8, -TYPE_B8):                                                                \
-                return b8(op##I8(x->u8, y->b8));                                                            \
-            case MTYPE2(-TYPE_C8, -TYPE_C8):                                                                \
-                return b8(op##C8(x->c8, y->c8));                                                            \
-            case MTYPE2(-TYPE_C8, TYPE_C8):                                                                 \
-                return b8(op##STR((lit_p)(&x->c8), 1, AS_C8(y), y->len));                                   \
-            case MTYPE2(TYPE_C8, -TYPE_C8):                                                                 \
-                return b8(op##STR(AS_C8(x), x->len, (lit_p)(&y->c8), 1));                                   \
-            case MTYPE2(TYPE_C8, TYPE_C8):                                                                  \
-                return b8(op##STR(AS_C8(x), x->len, AS_C8(y), y->len));                                     \
-                                                                                                            \
-            case MTYPE2(-TYPE_I16, -TYPE_I16):                                                              \
-                return b8(op##I16(x->i16, y->i16));                                                         \
-            case MTYPE2(-TYPE_I16, -TYPE_I32):                                                              \
-                return b8(op##I32(i16_to_i32(x->i16), y->i32));                                             \
-            case MTYPE2(-TYPE_I16, -TYPE_I64):                                                              \
-                return b8(op##I64(i16_to_i64(x->i16), y->i64));                                             \
-            case MTYPE2(-TYPE_I16, -TYPE_F64):                                                              \
-                return b8(op##F64(i16_to_f64(x->i16), y->f64));                                             \
-            case MTYPE2(-TYPE_I16, TYPE_I16):                                                               \
-                return __CMP_A_V(x, y, i16, i16, i16, op##I16, len, offset, res);                           \
-            case MTYPE2(-TYPE_I16, TYPE_I32):                                                               \
-                return __CMP_A_V(x, y, i16, i32, i32, op##I32, len, offset, res);                           \
-            case MTYPE2(-TYPE_I16, TYPE_I64):                                                               \
-                return __CMP_A_V(x, y, i16, i64, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(-TYPE_I16, TYPE_F64):                                                               \
-                return __CMP_A_V(x, y, i16, f64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_I16, -TYPE_I16):                                                               \
-                return __CMP_V_A(x, y, i16, i16, i16, op##I16, len, offset, res);                           \
-            case MTYPE2(TYPE_I16, -TYPE_I32):                                                               \
-                return __CMP_V_A(x, y, i16, i32, i32, op##I32, len, offset, res);                           \
-            case MTYPE2(TYPE_I16, -TYPE_I64):                                                               \
-                return __CMP_V_A(x, y, i16, i64, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(TYPE_I16, -TYPE_F64):                                                               \
-                return __CMP_V_A(x, y, i16, f64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_I16, TYPE_I16):                                                                \
-                return __CMP_V_V(x, y, i16, i16, i16, op##I16, len, offset, res);                           \
-            case MTYPE2(TYPE_I16, TYPE_I32):                                                                \
-                return __CMP_V_V(x, y, i16, i32, i32, op##I32, len, offset, res);                           \
-            case MTYPE2(TYPE_I16, TYPE_I64):                                                                \
-                return __CMP_V_V(x, y, i16, i64, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(TYPE_I16, TYPE_F64):                                                                \
-                return __CMP_V_V(x, y, i16, f64, f64, op##F64, len, offset, res);                           \
-                                                                                                            \
-            case MTYPE2(-TYPE_I32, -TYPE_I16):                                                              \
-                return b8(op##I32(x->i32, i16_to_i32(y->i16)));                                             \
-            case MTYPE2(-TYPE_I32, -TYPE_I32):                                                              \
-            case MTYPE2(-TYPE_DATE, -TYPE_DATE):                                                            \
-            case MTYPE2(-TYPE_TIME, -TYPE_TIME):                                                            \
-                return b8(op##I32(x->i32, y->i32));                                                         \
-            case MTYPE2(-TYPE_I32, -TYPE_I64):                                                              \
-                return b8(op##I64(i32_to_i64(x->i32), y->i64));                                             \
-            case MTYPE2(-TYPE_I32, -TYPE_F64):                                                              \
-                return b8(op##F64(i32_to_f64(x->i32), y->f64));                                             \
-            case MTYPE2(-TYPE_I32, TYPE_I16):                                                               \
-                return __CMP_A_V(x, y, i32, i16, i32, op##I32, len, offset, res);                           \
-            case MTYPE2(-TYPE_I32, TYPE_I32):                                                               \
-            case MTYPE2(-TYPE_DATE, TYPE_DATE):                                                             \
-            case MTYPE2(-TYPE_TIME, TYPE_TIME):                                                             \
-                return __CMP_A_V(x, y, i32, i32, i32, op##I32, len, offset, res);                           \
-            case MTYPE2(-TYPE_I32, TYPE_I64):                                                               \
-                return __CMP_A_V(x, y, i32, i64, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(-TYPE_I32, TYPE_F64):                                                               \
-                return __CMP_A_V(x, y, i32, f64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_I32, -TYPE_I16):                                                               \
-                return __CMP_V_A(x, y, i32, i16, i32, op##I32, len, offset, res);                           \
-            case MTYPE2(TYPE_I32, -TYPE_I32):                                                               \
-            case MTYPE2(TYPE_DATE, -TYPE_DATE):                                                             \
-            case MTYPE2(TYPE_TIME, -TYPE_TIME):                                                             \
-                return __CMP_V_A(x, y, i32, i32, i32, op##I32, len, offset, res);                           \
-            case MTYPE2(TYPE_I32, -TYPE_I64):                                                               \
-                return __CMP_V_A(x, y, i32, i64, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(TYPE_I32, -TYPE_F64):                                                               \
-                return __CMP_V_A(x, y, i32, f64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_I32, TYPE_I16):                                                                \
-                return __CMP_V_V(x, y, i32, i16, i32, op##I32, len, offset, res);                           \
-            case MTYPE2(TYPE_I32, TYPE_I32):                                                                \
-            case MTYPE2(TYPE_DATE, TYPE_DATE):                                                              \
-            case MTYPE2(TYPE_TIME, TYPE_TIME):                                                              \
-                return __CMP_V_V(x, y, i32, i32, i32, op##I32, len, offset, res);                           \
-            case MTYPE2(TYPE_I32, TYPE_I64):                                                                \
-                return __CMP_V_V(x, y, i32, i64, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(TYPE_I32, TYPE_F64):                                                                \
-                return __CMP_V_V(x, y, i32, f64, f64, op##F64, len, offset, res);                           \
-                                                                                                            \
-            case MTYPE2(-TYPE_I64, -TYPE_I16):                                                              \
-                return b8(op##I64(x->i64, i16_to_i64(y->i16)));                                             \
-            case MTYPE2(-TYPE_I64, -TYPE_I32):                                                              \
-                return b8(op##I64(x->i64, i32_to_i64(y->i32)));                                             \
-            case MTYPE2(-TYPE_I64, -TYPE_I64):                                                              \
-            case MTYPE2(-TYPE_SYMBOL, -TYPE_SYMBOL):                                                        \
-            case MTYPE2(-TYPE_TIMESTAMP, -TYPE_TIMESTAMP):                                                  \
-                return b8(op##I64(x->i64, y->i64));                                                         \
-            case MTYPE2(-TYPE_I64, -TYPE_F64):                                                              \
-                return b8(op##F64(i64_to_f64(x->i64), y->f64));                                             \
-            case MTYPE2(-TYPE_I64, TYPE_I16):                                                               \
-                return __CMP_A_V(x, y, i64, i16, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(-TYPE_I64, TYPE_I32):                                                               \
-                return __CMP_A_V(x, y, i64, i32, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(-TYPE_I64, TYPE_I64):                                                               \
-            case MTYPE2(-TYPE_SYMBOL, TYPE_SYMBOL):                                                         \
-            case MTYPE2(-TYPE_TIMESTAMP, TYPE_TIMESTAMP):                                                   \
-                return __CMP_A_V(x, y, i64, i64, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(-TYPE_I64, TYPE_F64):                                                               \
-                return __CMP_A_V(x, y, i64, f64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_I64, -TYPE_I16):                                                               \
-                return __CMP_V_A(x, y, i64, i16, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(TYPE_I64, -TYPE_I32):                                                               \
-                return __CMP_V_A(x, y, i64, i32, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(TYPE_I64, -TYPE_I64):                                                               \
-            case MTYPE2(TYPE_SYMBOL, -TYPE_SYMBOL):                                                         \
-            case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):                                                   \
-                return __CMP_V_A(x, y, i64, i64, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(TYPE_I64, -TYPE_F64):                                                               \
-                return __CMP_V_A(x, y, i64, f64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_I64, TYPE_I16):                                                                \
-                return __CMP_V_V(x, y, i64, i16, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(TYPE_I64, TYPE_I32):                                                                \
-                return __CMP_V_V(x, y, i64, i32, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(TYPE_I64, TYPE_I64):                                                                \
-            case MTYPE2(TYPE_SYMBOL, TYPE_SYMBOL):                                                          \
-            case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):                                                    \
-                return __CMP_V_V(x, y, i64, i64, i64, op##I64, len, offset, res);                           \
-            case MTYPE2(TYPE_I64, TYPE_F64):                                                                \
-                return __CMP_V_V(x, y, i64, f64, f64, op##F64, len, offset, res);                           \
-                                                                                                            \
-            case MTYPE2(-TYPE_F64, -TYPE_I16):                                                              \
-                return b8(op##F64(x->f64, i16_to_f64(y->i16)));                                             \
-            case MTYPE2(-TYPE_F64, -TYPE_I32):                                                              \
-                return b8(op##F64(x->f64, i32_to_f64(y->i32)));                                             \
-            case MTYPE2(-TYPE_F64, -TYPE_I64):                                                              \
-                return b8(op##F64(x->f64, i64_to_f64(y->i64)));                                             \
-            case MTYPE2(-TYPE_F64, -TYPE_F64):                                                              \
-                return b8(op##F64(x->f64, y->f64));                                                         \
-            case MTYPE2(-TYPE_F64, TYPE_I16):                                                               \
-                return __CMP_A_V(x, y, f64, i16, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(-TYPE_F64, TYPE_I32):                                                               \
-                return __CMP_A_V(x, y, f64, i32, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(-TYPE_F64, TYPE_I64):                                                               \
-                return __CMP_A_V(x, y, f64, i64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(-TYPE_F64, TYPE_F64):                                                               \
-                return __CMP_A_V(x, y, f64, f64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_F64, -TYPE_I16):                                                               \
-                return __CMP_V_A(x, y, f64, i16, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_F64, -TYPE_I32):                                                               \
-                return __CMP_V_A(x, y, f64, i32, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_F64, -TYPE_I64):                                                               \
-                return __CMP_V_A(x, y, f64, i64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_F64, -TYPE_F64):                                                               \
-                return __CMP_V_A(x, y, f64, f64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_F64, TYPE_I16):                                                                \
-                return __CMP_V_V(x, y, f64, i16, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_F64, TYPE_I32):                                                                \
-                return __CMP_V_V(x, y, f64, i32, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_F64, TYPE_I64):                                                                \
-                return __CMP_V_V(x, y, f64, i64, f64, op##F64, len, offset, res);                           \
-            case MTYPE2(TYPE_F64, TYPE_F64):                                                                \
-                return __CMP_V_V(x, y, f64, f64, f64, op##F64, len, offset, res);                           \
-                                                                                                            \
-            case MTYPE2(-TYPE_DATE, -TYPE_TIMESTAMP):                                                       \
-                return b8(op##F64(date_to_timestamp(x->i32), y->i64));                                      \
-            case MTYPE2(-TYPE_DATE, TYPE_TIMESTAMP):                                                        \
-                return __CMP_A_V(x, y, date, timestamp, timestamp, op##I64, len, offset, res);              \
-            case MTYPE2(TYPE_DATE, -TYPE_TIMESTAMP):                                                        \
-                return __CMP_V_A(x, y, date, timestamp, timestamp, op##I64, len, offset, res);              \
-            case MTYPE2(TYPE_DATE, TYPE_TIMESTAMP):                                                         \
-                return __CMP_V_V(x, y, date, timestamp, timestamp, op##I64, len, offset, res);              \
-            case MTYPE2(-TYPE_TIMESTAMP, -TYPE_DATE):                                                       \
-                return b8(op##F64(x->i64, date_to_timestamp(y->i32)));                                      \
-            case MTYPE2(-TYPE_TIMESTAMP, TYPE_DATE):                                                        \
-                return __CMP_A_V(x, y, timestamp, date, timestamp, op##I64, len, offset, res);              \
-            case MTYPE2(TYPE_TIMESTAMP, -TYPE_DATE):                                                        \
-                return __CMP_V_A(x, y, timestamp, date, timestamp, op##I64, len, offset, res);              \
-            case MTYPE2(TYPE_TIMESTAMP, TYPE_DATE):                                                         \
-                return __CMP_V_V(x, y, timestamp, date, timestamp, op##I64, len, offset, res);              \
-                                                                                                            \
-            case MTYPE2(TYPE_ENUM, -TYPE_SYMBOL):                                                           \
-                k = ray_key(x);                                                                             \
-                sym = ray_get(k);                                                                           \
-                drop_obj(k);                                                                                \
-                                                                                                            \
-                e = ENUM_VAL(x);                                                                            \
-                                                                                                            \
-                if (is_null(sym) || sym->type != TYPE_SYMBOL) {                                             \
-                    drop_obj(sym);                                                                          \
-                    THROW(ERR_TYPE, "eq: invalid enum");                                                    \
-                }                                                                                           \
-                                                                                                            \
-                xi = AS_I64(sym);                                                                           \
-                ei = AS_I64(e) + offset;                                                                    \
-                si = y->i64;                                                                                \
-                out = AS_B8(res) + offset;                                                                  \
-                                                                                                            \
-                for (i = 0; i < len; i++)                                                                   \
-                    out[i] = xi[ei[i]] == si;                                                               \
-                                                                                                            \
-                drop_obj(sym);                                                                              \
-                return res;                                                                                 \
-            case MTYPE2(-TYPE_SYMBOL, TYPE_ENUM):                                                           \
-                return ray_##op##_partial(y, x, len, offset, res);                                          \
-            case MTYPE2(TYPE_ENUM, TYPE_SYMBOL):                                                            \
-                k = ray_key(y);                                                                             \
-                sym = ray_get(k);                                                                           \
-                drop_obj(k);                                                                                \
-                                                                                                            \
-                e = ENUM_VAL(y);                                                                            \
-                                                                                                            \
-                if (is_null(sym) || sym->type != TYPE_SYMBOL) {                                             \
-                    drop_obj(sym);                                                                          \
-                    THROW(ERR_TYPE, "eq: invalid enum");                                                    \
-                }                                                                                           \
-                                                                                                            \
-                xi = AS_I64(x);                                                                             \
-                ei = AS_I64(e) + offset;                                                                    \
-                si = sym->i64;                                                                              \
-                out = AS_B8(res) + offset;                                                                  \
-                                                                                                            \
-                for (i = 0; i < len; i++)                                                                   \
-                    out[i] = xi[i] == ei[si];                                                               \
-                                                                                                            \
-                drop_obj(sym);                                                                              \
-                return res;                                                                                 \
-            case MTYPE2(TYPE_SYMBOL, TYPE_ENUM):                                                            \
-                return ray_##op##_partial(y, x, len, offset, res);                                          \
-                                                                                                            \
-            case MTYPE2(-TYPE_GUID, -TYPE_GUID):                                                            \
-                return b8(op##GUID(AS_GUID(x)[0], AS_GUID(y)[0]));                                          \
-            case MTYPE2(-TYPE_GUID, TYPE_GUID):                                                             \
-                out = AS_B8(res) + offset;                                                                  \
-                for (i = 0; i < len; i++)                                                                   \
-                    out[i] = op##GUID(AS_GUID(x)[0], AS_GUID(y)[i]);                                        \
-                return res;                                                                                 \
-            case MTYPE2(TYPE_GUID, -TYPE_GUID):                                                             \
-                out = AS_B8(res) + offset;                                                                  \
-                for (i = 0; i < len; i++)                                                                   \
-                    out[i] = op##GUID(AS_GUID(x)[i], AS_GUID(y)[0]);                                        \
-                return res;                                                                                 \
-            case MTYPE2(TYPE_GUID, TYPE_GUID):                                                              \
-                out = AS_B8(res) + offset;                                                                  \
-                for (i = 0; i < len; i++)                                                                   \
-                    out[i] = op##GUID(AS_GUID(x)[i], AS_GUID(y)[i]);                                        \
-                return res;                                                                                 \
-            case MTYPE2(TYPE_ERR, TYPE_ERR):                                                                \
-                return b8(cmp_obj(x, y) == 0);                                                              \
-            case MTYPE2(TYPE_NULL, TYPE_NULL):                                                              \
-                return b8(B8_TRUE);                                                                         \
-            default:                                                                                        \
-                THROW(ERR_TYPE, "eq: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type)); \
-        }                                                                                                   \
+#define __DECLARE_CMP_FN(op)                                                                   \
+    obj_p ray_##op##_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p res) {           \
+        i64_t i;                                                                               \
+        i64_t *xi, *ei, si;                                                                    \
+        b8_t *out;                                                                             \
+        obj_p k, sym, e;                                                                       \
+                                                                                               \
+        switch (MTYPE2(x->type, y->type)) {                                                    \
+            case MTYPE2(-TYPE_B8, -TYPE_B8):                                                   \
+                return b8(op##I8(x->b8, y->b8));                                               \
+            case MTYPE2(-TYPE_U8, -TYPE_U8):                                                   \
+                return b8(op##I8(x->u8, y->u8));                                               \
+            case MTYPE2(-TYPE_B8, -TYPE_U8):                                                   \
+                return b8(op##I8(x->b8, y->u8));                                               \
+            case MTYPE2(-TYPE_U8, -TYPE_B8):                                                   \
+                return b8(op##I8(x->u8, y->b8));                                               \
+            case MTYPE2(-TYPE_C8, -TYPE_C8):                                                   \
+                return b8(op##C8(x->c8, y->c8));                                               \
+            case MTYPE2(-TYPE_C8, TYPE_C8):                                                    \
+                return b8(op##STR((lit_p)(&x->c8), 1, AS_C8(y), y->len));                      \
+            case MTYPE2(TYPE_C8, -TYPE_C8):                                                    \
+                return b8(op##STR(AS_C8(x), x->len, (lit_p)(&y->c8), 1));                      \
+            case MTYPE2(TYPE_C8, TYPE_C8):                                                     \
+                return b8(op##STR(AS_C8(x), x->len, AS_C8(y), y->len));                        \
+                                                                                               \
+            case MTYPE2(-TYPE_I16, -TYPE_I16):                                                 \
+                return b8(op##I16(x->i16, y->i16));                                            \
+            case MTYPE2(-TYPE_I16, -TYPE_I32):                                                 \
+                return b8(op##I32(i16_to_i32(x->i16), y->i32));                                \
+            case MTYPE2(-TYPE_I16, -TYPE_I64):                                                 \
+                return b8(op##I64(i16_to_i64(x->i16), y->i64));                                \
+            case MTYPE2(-TYPE_I16, -TYPE_F64):                                                 \
+                return b8(op##F64(i16_to_f64(x->i16), y->f64));                                \
+            case MTYPE2(-TYPE_I16, TYPE_I16):                                                  \
+                return __CMP_A_V(x, y, i16, i16, i16, op##I16, len, offset, res);              \
+            case MTYPE2(-TYPE_I16, TYPE_I32):                                                  \
+                return __CMP_A_V(x, y, i16, i32, i32, op##I32, len, offset, res);              \
+            case MTYPE2(-TYPE_I16, TYPE_I64):                                                  \
+                return __CMP_A_V(x, y, i16, i64, i64, op##I64, len, offset, res);              \
+            case MTYPE2(-TYPE_I16, TYPE_F64):                                                  \
+                return __CMP_A_V(x, y, i16, f64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_I16, -TYPE_I16):                                                  \
+                return __CMP_V_A(x, y, i16, i16, i16, op##I16, len, offset, res);              \
+            case MTYPE2(TYPE_I16, -TYPE_I32):                                                  \
+                return __CMP_V_A(x, y, i16, i32, i32, op##I32, len, offset, res);              \
+            case MTYPE2(TYPE_I16, -TYPE_I64):                                                  \
+                return __CMP_V_A(x, y, i16, i64, i64, op##I64, len, offset, res);              \
+            case MTYPE2(TYPE_I16, -TYPE_F64):                                                  \
+                return __CMP_V_A(x, y, i16, f64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_I16, TYPE_I16):                                                   \
+                return __CMP_V_V(x, y, i16, i16, i16, op##I16, len, offset, res);              \
+            case MTYPE2(TYPE_I16, TYPE_I32):                                                   \
+                return __CMP_V_V(x, y, i16, i32, i32, op##I32, len, offset, res);              \
+            case MTYPE2(TYPE_I16, TYPE_I64):                                                   \
+                return __CMP_V_V(x, y, i16, i64, i64, op##I64, len, offset, res);              \
+            case MTYPE2(TYPE_I16, TYPE_F64):                                                   \
+                return __CMP_V_V(x, y, i16, f64, f64, op##F64, len, offset, res);              \
+                                                                                               \
+            case MTYPE2(-TYPE_I32, -TYPE_I16):                                                 \
+                return b8(op##I32(x->i32, i16_to_i32(y->i16)));                                \
+            case MTYPE2(-TYPE_I32, -TYPE_I32):                                                 \
+            case MTYPE2(-TYPE_DATE, -TYPE_DATE):                                               \
+            case MTYPE2(-TYPE_TIME, -TYPE_TIME):                                               \
+                return b8(op##I32(x->i32, y->i32));                                            \
+            case MTYPE2(-TYPE_I32, -TYPE_I64):                                                 \
+                return b8(op##I64(i32_to_i64(x->i32), y->i64));                                \
+            case MTYPE2(-TYPE_I32, -TYPE_F64):                                                 \
+                return b8(op##F64(i32_to_f64(x->i32), y->f64));                                \
+            case MTYPE2(-TYPE_I32, TYPE_I16):                                                  \
+                return __CMP_A_V(x, y, i32, i16, i32, op##I32, len, offset, res);              \
+            case MTYPE2(-TYPE_I32, TYPE_I32):                                                  \
+            case MTYPE2(-TYPE_DATE, TYPE_DATE):                                                \
+            case MTYPE2(-TYPE_TIME, TYPE_TIME):                                                \
+                return __CMP_A_V(x, y, i32, i32, i32, op##I32, len, offset, res);              \
+            case MTYPE2(-TYPE_I32, TYPE_I64):                                                  \
+                return __CMP_A_V(x, y, i32, i64, i64, op##I64, len, offset, res);              \
+            case MTYPE2(-TYPE_I32, TYPE_F64):                                                  \
+                return __CMP_A_V(x, y, i32, f64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_I32, -TYPE_I16):                                                  \
+                return __CMP_V_A(x, y, i32, i16, i32, op##I32, len, offset, res);              \
+            case MTYPE2(TYPE_I32, -TYPE_I32):                                                  \
+            case MTYPE2(TYPE_DATE, -TYPE_DATE):                                                \
+            case MTYPE2(TYPE_TIME, -TYPE_TIME):                                                \
+                return __CMP_V_A(x, y, i32, i32, i32, op##I32, len, offset, res);              \
+            case MTYPE2(TYPE_I32, -TYPE_I64):                                                  \
+                return __CMP_V_A(x, y, i32, i64, i64, op##I64, len, offset, res);              \
+            case MTYPE2(TYPE_I32, -TYPE_F64):                                                  \
+                return __CMP_V_A(x, y, i32, f64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_I32, TYPE_I16):                                                   \
+                return __CMP_V_V(x, y, i32, i16, i32, op##I32, len, offset, res);              \
+            case MTYPE2(TYPE_I32, TYPE_I32):                                                   \
+            case MTYPE2(TYPE_DATE, TYPE_DATE):                                                 \
+            case MTYPE2(TYPE_TIME, TYPE_TIME):                                                 \
+                return __CMP_V_V(x, y, i32, i32, i32, op##I32, len, offset, res);              \
+            case MTYPE2(TYPE_I32, TYPE_I64):                                                   \
+                return __CMP_V_V(x, y, i32, i64, i64, op##I64, len, offset, res);              \
+            case MTYPE2(TYPE_I32, TYPE_F64):                                                   \
+                return __CMP_V_V(x, y, i32, f64, f64, op##F64, len, offset, res);              \
+                                                                                               \
+            case MTYPE2(-TYPE_I64, -TYPE_I16):                                                 \
+                return b8(op##I64(x->i64, i16_to_i64(y->i16)));                                \
+            case MTYPE2(-TYPE_I64, -TYPE_I32):                                                 \
+                return b8(op##I64(x->i64, i32_to_i64(y->i32)));                                \
+            case MTYPE2(-TYPE_I64, -TYPE_I64):                                                 \
+            case MTYPE2(-TYPE_SYMBOL, -TYPE_SYMBOL):                                           \
+            case MTYPE2(-TYPE_TIMESTAMP, -TYPE_TIMESTAMP):                                     \
+                return b8(op##I64(x->i64, y->i64));                                            \
+            case MTYPE2(-TYPE_I64, -TYPE_F64):                                                 \
+                return b8(op##F64(i64_to_f64(x->i64), y->f64));                                \
+            case MTYPE2(-TYPE_I64, TYPE_I16):                                                  \
+                return __CMP_A_V(x, y, i64, i16, i64, op##I64, len, offset, res);              \
+            case MTYPE2(-TYPE_I64, TYPE_I32):                                                  \
+                return __CMP_A_V(x, y, i64, i32, i64, op##I64, len, offset, res);              \
+            case MTYPE2(-TYPE_I64, TYPE_I64):                                                  \
+            case MTYPE2(-TYPE_SYMBOL, TYPE_SYMBOL):                                            \
+            case MTYPE2(-TYPE_TIMESTAMP, TYPE_TIMESTAMP):                                      \
+                return __CMP_A_V(x, y, i64, i64, i64, op##I64, len, offset, res);              \
+            case MTYPE2(-TYPE_I64, TYPE_F64):                                                  \
+                return __CMP_A_V(x, y, i64, f64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_I64, -TYPE_I16):                                                  \
+                return __CMP_V_A(x, y, i64, i16, i64, op##I64, len, offset, res);              \
+            case MTYPE2(TYPE_I64, -TYPE_I32):                                                  \
+                return __CMP_V_A(x, y, i64, i32, i64, op##I64, len, offset, res);              \
+            case MTYPE2(TYPE_I64, -TYPE_I64):                                                  \
+            case MTYPE2(TYPE_SYMBOL, -TYPE_SYMBOL):                                            \
+            case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):                                      \
+                return __CMP_V_A(x, y, i64, i64, i64, op##I64, len, offset, res);              \
+            case MTYPE2(TYPE_I64, -TYPE_F64):                                                  \
+                return __CMP_V_A(x, y, i64, f64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_I64, TYPE_I16):                                                   \
+                return __CMP_V_V(x, y, i64, i16, i64, op##I64, len, offset, res);              \
+            case MTYPE2(TYPE_I64, TYPE_I32):                                                   \
+                return __CMP_V_V(x, y, i64, i32, i64, op##I64, len, offset, res);              \
+            case MTYPE2(TYPE_I64, TYPE_I64):                                                   \
+            case MTYPE2(TYPE_SYMBOL, TYPE_SYMBOL):                                             \
+            case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):                                       \
+                return __CMP_V_V(x, y, i64, i64, i64, op##I64, len, offset, res);              \
+            case MTYPE2(TYPE_I64, TYPE_F64):                                                   \
+                return __CMP_V_V(x, y, i64, f64, f64, op##F64, len, offset, res);              \
+                                                                                               \
+            case MTYPE2(-TYPE_F64, -TYPE_I16):                                                 \
+                return b8(op##F64(x->f64, i16_to_f64(y->i16)));                                \
+            case MTYPE2(-TYPE_F64, -TYPE_I32):                                                 \
+                return b8(op##F64(x->f64, i32_to_f64(y->i32)));                                \
+            case MTYPE2(-TYPE_F64, -TYPE_I64):                                                 \
+                return b8(op##F64(x->f64, i64_to_f64(y->i64)));                                \
+            case MTYPE2(-TYPE_F64, -TYPE_F64):                                                 \
+                return b8(op##F64(x->f64, y->f64));                                            \
+            case MTYPE2(-TYPE_F64, TYPE_I16):                                                  \
+                return __CMP_A_V(x, y, f64, i16, f64, op##F64, len, offset, res);              \
+            case MTYPE2(-TYPE_F64, TYPE_I32):                                                  \
+                return __CMP_A_V(x, y, f64, i32, f64, op##F64, len, offset, res);              \
+            case MTYPE2(-TYPE_F64, TYPE_I64):                                                  \
+                return __CMP_A_V(x, y, f64, i64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(-TYPE_F64, TYPE_F64):                                                  \
+                return __CMP_A_V(x, y, f64, f64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_F64, -TYPE_I16):                                                  \
+                return __CMP_V_A(x, y, f64, i16, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_F64, -TYPE_I32):                                                  \
+                return __CMP_V_A(x, y, f64, i32, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_F64, -TYPE_I64):                                                  \
+                return __CMP_V_A(x, y, f64, i64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_F64, -TYPE_F64):                                                  \
+                return __CMP_V_A(x, y, f64, f64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_F64, TYPE_I16):                                                   \
+                return __CMP_V_V(x, y, f64, i16, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_F64, TYPE_I32):                                                   \
+                return __CMP_V_V(x, y, f64, i32, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_F64, TYPE_I64):                                                   \
+                return __CMP_V_V(x, y, f64, i64, f64, op##F64, len, offset, res);              \
+            case MTYPE2(TYPE_F64, TYPE_F64):                                                   \
+                return __CMP_V_V(x, y, f64, f64, f64, op##F64, len, offset, res);              \
+                                                                                               \
+            case MTYPE2(-TYPE_DATE, -TYPE_TIMESTAMP):                                          \
+                return b8(op##F64(date_to_timestamp(x->i32), y->i64));                         \
+            case MTYPE2(-TYPE_DATE, TYPE_TIMESTAMP):                                           \
+                return __CMP_A_V(x, y, date, timestamp, timestamp, op##I64, len, offset, res); \
+            case MTYPE2(TYPE_DATE, -TYPE_TIMESTAMP):                                           \
+                return __CMP_V_A(x, y, date, timestamp, timestamp, op##I64, len, offset, res); \
+            case MTYPE2(TYPE_DATE, TYPE_TIMESTAMP):                                            \
+                return __CMP_V_V(x, y, date, timestamp, timestamp, op##I64, len, offset, res); \
+            case MTYPE2(-TYPE_TIMESTAMP, -TYPE_DATE):                                          \
+                return b8(op##F64(x->i64, date_to_timestamp(y->i32)));                         \
+            case MTYPE2(-TYPE_TIMESTAMP, TYPE_DATE):                                           \
+                return __CMP_A_V(x, y, timestamp, date, timestamp, op##I64, len, offset, res); \
+            case MTYPE2(TYPE_TIMESTAMP, -TYPE_DATE):                                           \
+                return __CMP_V_A(x, y, timestamp, date, timestamp, op##I64, len, offset, res); \
+            case MTYPE2(TYPE_TIMESTAMP, TYPE_DATE):                                            \
+                return __CMP_V_V(x, y, timestamp, date, timestamp, op##I64, len, offset, res); \
+                                                                                               \
+            case MTYPE2(TYPE_ENUM, -TYPE_SYMBOL):                                              \
+                k = ray_key(x);                                                                \
+                sym = ray_get(k);                                                              \
+                drop_obj(k);                                                                   \
+                                                                                               \
+                e = ENUM_VAL(x);                                                               \
+                                                                                               \
+                if (is_null(sym) || sym->type != TYPE_SYMBOL) {                                \
+                    drop_obj(sym);                                                             \
+                    THROW_S(ERR_TYPE, "eq: invalid enum");                                       \
+                }                                                                              \
+                                                                                               \
+                xi = AS_I64(sym);                                                              \
+                ei = AS_I64(e) + offset;                                                       \
+                si = y->i64;                                                                   \
+                out = AS_B8(res) + offset;                                                     \
+                                                                                               \
+                for (i = 0; i < len; i++)                                                      \
+                    out[i] = xi[ei[i]] == si;                                                  \
+                                                                                               \
+                drop_obj(sym);                                                                 \
+                return res;                                                                    \
+            case MTYPE2(-TYPE_SYMBOL, TYPE_ENUM):                                              \
+                return ray_##op##_partial(y, x, len, offset, res);                             \
+            case MTYPE2(TYPE_ENUM, TYPE_SYMBOL):                                               \
+                k = ray_key(y);                                                                \
+                sym = ray_get(k);                                                              \
+                drop_obj(k);                                                                   \
+                                                                                               \
+                e = ENUM_VAL(y);                                                               \
+                                                                                               \
+                if (is_null(sym) || sym->type != TYPE_SYMBOL) {                                \
+                    drop_obj(sym);                                                             \
+                    THROW_S(ERR_TYPE, "eq: invalid enum");                                       \
+                }                                                                              \
+                                                                                               \
+                xi = AS_I64(x);                                                                \
+                ei = AS_I64(e) + offset;                                                       \
+                si = sym->i64;                                                                 \
+                out = AS_B8(res) + offset;                                                     \
+                                                                                               \
+                for (i = 0; i < len; i++)                                                      \
+                    out[i] = xi[i] == ei[si];                                                  \
+                                                                                               \
+                drop_obj(sym);                                                                 \
+                return res;                                                                    \
+            case MTYPE2(TYPE_SYMBOL, TYPE_ENUM):                                               \
+                return ray_##op##_partial(y, x, len, offset, res);                             \
+                                                                                               \
+            case MTYPE2(-TYPE_GUID, -TYPE_GUID):                                               \
+                return b8(op##GUID(AS_GUID(x)[0], AS_GUID(y)[0]));                             \
+            case MTYPE2(-TYPE_GUID, TYPE_GUID):                                                \
+                out = AS_B8(res) + offset;                                                     \
+                for (i = 0; i < len; i++)                                                      \
+                    out[i] = op##GUID(AS_GUID(x)[0], AS_GUID(y)[i]);                           \
+                return res;                                                                    \
+            case MTYPE2(TYPE_GUID, -TYPE_GUID):                                                \
+                out = AS_B8(res) + offset;                                                     \
+                for (i = 0; i < len; i++)                                                      \
+                    out[i] = op##GUID(AS_GUID(x)[i], AS_GUID(y)[0]);                           \
+                return res;                                                                    \
+            case MTYPE2(TYPE_GUID, TYPE_GUID):                                                 \
+                out = AS_B8(res) + offset;                                                     \
+                for (i = 0; i < len; i++)                                                      \
+                    out[i] = op##GUID(AS_GUID(x)[i], AS_GUID(y)[i]);                           \
+                return res;                                                                    \
+            case MTYPE2(TYPE_ERR, TYPE_ERR):                                                   \
+                return b8(cmp_obj(x, y) == 0);                                                 \
+            case MTYPE2(TYPE_NULL, TYPE_NULL):                                                 \
+                return b8(B8_TRUE);                                                            \
+            default:                                                                           \
+                THROW_TYPE2("eq", x->type, y->type);                                           \
+        }                                                                                      \
     }
 
 obj_p cmp_map(raw_p op, obj_p x, obj_p y) {
@@ -632,7 +632,7 @@ obj_p cmp_map(raw_p op, obj_p x, obj_p y) {
 
     if (IS_VECTOR(x) && IS_VECTOR(y)) {
         if (x->len != y->len)
-            THROW(ERR_LENGTH, "vectors must have the same length");
+            THROW_S(ERR_LENGTH, ERR_MSG_VEC_SAME_LEN);
 
         l = x->len;
     } else if (IS_VECTOR(x))

@@ -191,7 +191,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                             drop_obj(buf);
                             drop_obj(k);
 
-                            THROW(ERR_NOT_SUPPORTED, "set: unsupported type: %s", type_name(y->type));
+                            THROW_TYPE1("set", y->type);
                         }
 
                         AS_I64(k)[i] = size;
@@ -306,11 +306,11 @@ obj_p binary_set(obj_p x, obj_p y) {
                         return clone_obj(x);
                     }
 
-                    THROW(ERR_TYPE, "set: unsupported types: %s %s", type_name(x->type), type_name(y->type));
+                    THROW_TYPE2("set", x->type, y->type);
             }
 
         default:
-            THROW(ERR_TYPE, "set: unsupported types: %s %s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("set", x->type, y->type);
     }
 }
 
@@ -340,6 +340,6 @@ obj_p ray_let(obj_p x, obj_p y) {
             return amend(x, e);
 
         default:
-            THROW(ERR_TYPE, "let: unsupported types: '%s '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("let", x->type, y->type);
     }
 }

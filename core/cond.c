@@ -51,6 +51,6 @@ obj_p ray_cond(obj_p *x, i64_t n) {
             drop_obj(res);
             return eval(x[2]);
         default:
-            THROW(ERR_LENGTH, "cond: invalid number of arguments");
+            THROW_S(ERR_LENGTH, "cond: invalid number of arguments");
     }
 }

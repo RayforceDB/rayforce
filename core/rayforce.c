@@ -254,7 +254,7 @@ obj_p vector(i8_t type, i64_t len) {
     vec = (obj_p)heap_alloc(sizeof(struct obj_t) + data_size);
 
     if (vec == NULL)
-        THROW(ERR_HEAP, "oom");
+        THROW_S(ERR_HEAP, "oom");
 
     vec->mmod = MMOD_INTERNAL;
     vec->order = 0;  // Initialize order field to avoid uninitialized bytes

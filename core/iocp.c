@@ -750,15 +750,15 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
         dwResult = WaitForSingleObject(selector->tx.overlapped.hEvent, INFINITE);
 
         if (dwResult == WAIT_FAILED)
-            THROW(ERR_IO, "ipc_send_sync: error waiting for event");
+            THROW_S(ERR_IO, "ipc_send_sync: error waiting for event");
 
         if (!GetOverlappedResult((HANDLE)selector->fd, &selector->tx.overlapped, &selector->tx.size, B8_FALSE))
-            THROW(ERR_IO, "ipc_send_sync: error getting result");
+            THROW_S(ERR_IO, "ipc_send_sync: error getting result");
     }
 
     if (poll_result == POLL_ERROR) {
         poll_deregister(poll, selector->id);
-        THROW(ERR_IO, "ipc_send_sync: error sending message");
+        THROW_S(ERR_IO, "ipc_send_sync: error sending message");
     }
 
     poll_result = POLL_OK;
@@ -779,17 +779,17 @@ recv:
         dwResult = WaitForSingleObject(selector->rx.overlapped.hEvent, INFINITE);
 
         if (dwResult == WAIT_FAILED)
-            THROW(ERR_IO, "ipc_send_sync: error waiting for event");
+            THROW_S(ERR_IO, "ipc_send_sync: error waiting for event");
 
         if (!GetOverlappedResult((HANDLE)selector->fd, &selector->rx.overlapped, &selector->rx.size, B8_FALSE))
-            THROW(ERR_IO, "ipc_send_sync: error getting result");
+            THROW_S(ERR_IO, "ipc_send_sync: error getting result");
 
         poll_result = _recv(poll, selector);
     }
 
     if (poll_result == POLL_ERROR) {
         poll_deregister(poll, selector->id);
-        THROW(ERR_IO, "ipc_send_sync: error receiving message");
+        THROW_S(ERR_IO, "ipc_send_sync: error receiving message");
     }
 
     // recv until we get response
@@ -822,7 +822,7 @@ obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg) {
     queue_push(selector->tx.queue, (nil_t *)msg);
 
     if (_send(poll, selector) == POLL_ERROR)
-        THROW(ERR_IO, "ipc_send_async: error sending message");
+        THROW_S(ERR_IO, "ipc_send_async: error sending message");
 
     return NULL_OBJ;
 }

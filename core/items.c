@@ -188,7 +188,7 @@ obj_p ray_at(obj_p x, obj_p y) {
 
             if (y->i64 >= (i64_t)v->len) {
                 drop_obj(s);
-                THROW(ERR_INDEX, "at: enum can not be resolved: index out of range");
+                THROW_S(ERR_INDEX, ERR_MSG_ENUM_OUT_OF_RANGE);
             }
 
             if (!s || IS_ERR(s) || s->type != TYPE_SYMBOL) {
@@ -198,7 +198,7 @@ obj_p ray_at(obj_p x, obj_p y) {
 
             if (AS_I64(v)[y->i64] >= (i64_t)s->len) {
                 drop_obj(s);
-                THROW(ERR_INDEX, "at: enum can not be resolved: index out of range");
+                THROW_S(ERR_INDEX, ERR_MSG_ENUM_OUT_OF_RANGE);
             }
 
             res = at_idx(s, AS_I64(v)[y->i64]);
@@ -228,7 +228,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                     if (AS_I64(y)[i] >= (i64_t)n) {
                         drop_obj(s);
                         drop_obj(res);
-                        THROW(ERR_INDEX, "at: enum can not be resolved: index out of range");
+                        THROW_S(ERR_INDEX, ERR_MSG_ENUM_OUT_OF_RANGE);
                     }
 
                     AS_I64(res)[i] = AS_I64(v)[AS_I64(y)[i]];
@@ -245,7 +245,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                 if (AS_I64(v)[i] >= (i64_t)xl) {
                     drop_obj(s);
                     drop_obj(res);
-                    THROW(ERR_INDEX, "at: enum can not be resolved: index out of range");
+                    THROW_S(ERR_INDEX, ERR_MSG_ENUM_OUT_OF_RANGE);
                 }
 
                 AS_SYMBOL(res)[i] = AS_SYMBOL(s)[AS_I64(v)[AS_I64(y)[i]]];
@@ -263,7 +263,7 @@ obj_p ray_at(obj_p x, obj_p y) {
             yl = v->len;
 
             if (y->i64 >= (i64_t)v->len)
-                THROW(ERR_INDEX, "at: anymap can not be resolved: index out of range");
+                THROW_S(ERR_INDEX, "at: anymap can not be resolved: index out of range");
 
             buf = AS_U8(k) + AS_I64(v)[y->i64];
 
@@ -284,7 +284,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                 if (AS_I64(y)[i] >= (i64_t)n) {
                     res->len = i;
                     drop_obj(res);
-                    THROW(ERR_INDEX, "at: anymap can not be resolved: index out of range");
+                    THROW_S(ERR_INDEX, "at: anymap can not be resolved: index out of range");
                 }
 
                 buf = AS_U8(k) + AS_I64(v)[AS_I64(y)[i]];
@@ -329,7 +329,7 @@ obj_p ray_find(obj_p x, obj_p y) {
         case MTYPE2(TYPE_LIST, TYPE_LIST):
             return index_find_obj(AS_LIST(x), x->len, AS_LIST(y), y->len);
         default:
-            THROW(ERR_TYPE, "find: unsupported types: '%s '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("find", x->type, y->type);
     }
 }
 
@@ -390,7 +390,7 @@ obj_p ray_filter(obj_p x, obj_p y) {
             return table(clone_obj(AS_LIST(x)[0]), res);
 
         default:
-            THROW(ERR_TYPE, "filter: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("filter", x->type, y->type);
     }
 }
 
@@ -413,7 +413,7 @@ obj_p ray_take(obj_p x, obj_p y) {
             m = ABSI64((i64_t)x->i32);
             break;
         default:
-            THROW(ERR_TYPE, "take: unsupported types: '%s, %s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("take", x->type, y->type);
     }
 
     switch (y->type) {
@@ -572,7 +572,7 @@ obj_p ray_take(obj_p x, obj_p y) {
             return table(clone_obj(AS_LIST(y)[0]), res);
 
         default:
-            THROW(ERR_TYPE, "take: unsupported types: '%s, %s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("take", x->type, y->type);
     }
 }
 
@@ -682,7 +682,7 @@ obj_p ray_in(obj_p x, obj_p y) {
             if (!IS_VECTOR(x))
                 return b8(find_obj_idx(y, x) != NULL_I64);
 
-            THROW(ERR_TYPE, "in: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("in", x->type, y->type);
     }
 
     return NULL_OBJ;
@@ -732,7 +732,7 @@ obj_p ray_within(obj_p x, obj_p y) {
                 return res;
 
             default:
-                THROW(ERR_TYPE, "within: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+                THROW_TYPE2("within", x->type, y->type);
         }
 
     return NULL_OBJ;
@@ -750,7 +750,7 @@ obj_p ray_sect(obj_p x, obj_p y) {
             return res;
 
         default:
-            THROW(ERR_TYPE, "sect: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("sect", x->type, y->type);
     }
 
     return NULL_OBJ;
@@ -857,7 +857,7 @@ obj_p ray_except(obj_p x, obj_p y) {
                 }
             }
 
-            THROW(ERR_TYPE, "except: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("except", x->type, y->type);
     }
 }
 
@@ -1139,7 +1139,7 @@ obj_p ray_where(obj_p x) {
 
             return res;
         default:
-            THROW(ERR_TYPE, "where: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("where", x->type);
     }
 }
 
@@ -1192,7 +1192,7 @@ static obj_p ray_bin_partial(raw_p a, raw_p b, raw_p c, raw_p d, raw_p e) {
             }
             return NULL_OBJ;
         default:
-            THROW(ERR_TYPE, "ray_bin_partial: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("bin", x->type);
     }
 }
 
@@ -1245,7 +1245,7 @@ static obj_p ray_binr_partial(raw_p a, raw_p b, raw_p c, raw_p d, raw_p e) {
             }
             return NULL_OBJ;
         default:
-            THROW(ERR_TYPE, "ray_binr_partial: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("binr", x->type);
     }
 }
 
@@ -1335,7 +1335,7 @@ obj_p ray_bin(obj_p x, obj_p y) {
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
             return bin_map(ray_bin_partial, x, y);
         default:
-            THROW(ERR_TYPE, "bin: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("bin", x->type, y->type);
     }
 }
 
@@ -1382,6 +1382,6 @@ obj_p ray_binr(obj_p x, obj_p y) {
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
             return bin_map(ray_binr_partial, x, y);
         default:
-            THROW(ERR_TYPE, "binr: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("binr", x->type, y->type);
     }
 }

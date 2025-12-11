@@ -209,7 +209,7 @@ obj_p select_fetch_table(obj_p obj, query_ctx_p ctx) {
     prm = at_sym(obj, "from", 4);
 
     if (is_null(prm))
-        THROW(ERR_LENGTH, "'select' expects 'from' param");
+        THROW_S(ERR_LENGTH, "'select' expects 'from' param");
 
     val = eval(prm);
     drop_obj(prm);
@@ -219,7 +219,7 @@ obj_p select_fetch_table(obj_p obj, query_ctx_p ctx) {
 
     if (val->type != TYPE_TABLE) {
         drop_obj(val);
-        THROW(ERR_TYPE, "'select' from: expects table");
+        THROW_S(ERR_TYPE, "'select' from: expects table");
     }
 
     ctx->tablen = AS_LIST(val)[0]->len;
@@ -554,10 +554,10 @@ obj_p ray_select(obj_p obj) {
     query_ctx_init(&ctx);
 
     if (obj->type != TYPE_DICT)
-        THROW(ERR_LENGTH, "'select' takes dict of params");
+        THROW_S(ERR_LENGTH, "'select' takes dict of params");
 
     if (AS_LIST(obj)[0]->type != TYPE_SYMBOL)
-        THROW(ERR_LENGTH, "'select' takes dict with symbol keys");
+        THROW_S(ERR_LENGTH, "'select' takes dict with symbol keys");
 
     timeit_span_start("select");
 

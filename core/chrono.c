@@ -152,12 +152,12 @@ obj_p ray_timeit(obj_p *x, i64_t n) {
             return f64(ray_clock_elapsed_ms(&start, &end));
         case 2:
             if (x[0]->type != -TYPE_I64)
-                THROW(ERR_TYPE, "timeit: expected 'i64");
+                THROW_S(ERR_TYPE, "timeit: expected 'i64");
 
             l = x[0]->i64;
 
             if (l < 1)
-                THROW(ERR_IO, "timeit: expected 'i64' > 0 as argument");
+                THROW_S(ERR_IO, "timeit: expected 'i64' > 0 as argument");
 
             ray_clock_get_time(&start);
 
@@ -172,7 +172,7 @@ obj_p ray_timeit(obj_p *x, i64_t n) {
 
             return f64(ray_clock_elapsed_ms(&start, &end));
         default:
-            THROW(ERR_IO, "timeit: expected 0 or 1 argument");
+            THROW_S(ERR_IO, "timeit: expected 0 or 1 argument");
     }
 }
 
@@ -353,13 +353,13 @@ obj_p ray_timer(obj_p *x, i64_t n) {
     timers_p timers;
 
     if (n == 0)
-        THROW(ERR_IO, "timer: no arguments provided");
+        THROW_S(ERR_IO, "timer: no arguments provided");
 
     timers = runtime_get()->poll->timers;
 
     if (n == 1) {
         if (x[0]->type != -TYPE_I64)
-            THROW(ERR_TYPE, "timer del: expected 'i64");
+            THROW_S(ERR_TYPE, "timer del: expected 'i64");
 
         timer_del(timers, x[0]->i64);
 
@@ -367,19 +367,19 @@ obj_p ray_timer(obj_p *x, i64_t n) {
     }
 
     if (n != 3)
-        THROW(ERR_IO, "timer add: expected 3 arguments");
+        THROW_S(ERR_IO, "timer add: expected 3 arguments");
 
     if (x[0]->type != -TYPE_I64)
-        THROW(ERR_TYPE, "timer add: expected timeout as 'i64");
+        THROW_S(ERR_TYPE, "timer add: expected timeout as 'i64");
 
     if (x[1]->type != -TYPE_I64)
-        THROW(ERR_TYPE, "timer add: expected number of times as 'i64");
+        THROW_S(ERR_TYPE, "timer add: expected number of times as 'i64");
 
     if (x[2]->type != TYPE_LAMBDA)
-        THROW(ERR_TYPE, "timer add: expected callback as 'Lambda");
+        THROW_S(ERR_TYPE, "timer add: expected callback as 'Lambda");
 
     if (AS_LAMBDA(x[2])->args->len != 1)
-        THROW(ERR_IO, "timer add: callback should take 1 argument");
+        THROW_S(ERR_IO, "timer add: callback should take 1 argument");
 
     timers = runtime_get()->poll->timers;
 

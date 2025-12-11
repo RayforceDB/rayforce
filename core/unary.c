@@ -59,7 +59,7 @@ obj_p ray_get(obj_p x) {
             return clone_obj(*sym);
         case TYPE_C8:
             if (x->len == 0)
-                THROW(ERR_LENGTH, "get: empty string path");
+                THROW_S(ERR_LENGTH, "get: empty string path");
 
             path = cstring_from_obj(x);
             fd = fs_fopen(AS_C8(path), ATTR_RDWR);
@@ -124,7 +124,7 @@ obj_p ray_get(obj_p x) {
             return clone_obj(res);  // increment ref count
 
         default:
-            THROW(ERR_TYPE, "get: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("get", x->type);
     }
 }
 

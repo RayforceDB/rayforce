@@ -278,7 +278,7 @@ obj_p ray_like(obj_p x, obj_p y) {
                 if (!e || e->type != TYPE_C8) {
                     res->len = i;
                     drop_obj(res);
-                    THROW(ERR_TYPE, "like: unsupported types: '%s, %s", type_name(e->type), type_name(y->type));
+                    THROW_TYPE2("like", e->type, y->type);
                 }
 
                 AS_B8(res)[i] = str_match(AS_C8(e), e->len, AS_C8(y), y->len);
@@ -295,7 +295,7 @@ obj_p ray_like(obj_p x, obj_p y) {
                     res->len = i;
                     drop_obj(res);
                     drop_obj(e);
-                    THROW(ERR_TYPE, "like: unsupported types: '%s, '%s", type_name(e->type), type_name(y->type));
+                    THROW_TYPE2("like", e->type, y->type);
                 }
 
                 AS_B8(res)[i] = str_match(AS_C8(e), e->len, AS_C8(y), y->len);
@@ -315,6 +315,6 @@ obj_p ray_like(obj_p x, obj_p y) {
             return res;
 
         default:
-            THROW(ERR_TYPE, "like: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("like", x->type, y->type);
     }
 }

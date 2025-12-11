@@ -2643,8 +2643,8 @@ test_result_t test_lang_take() {
     TEST_ASSERT_EQ("(take -5 (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])))",
                    "(table [a b] (list [4 1 2 3 4] ['d 'a 'b 'c 'd]))");
 
-    TEST_ASSERT_ER("(take 2.0 1.0)", "take: unsupported types: 'f64, f64");
-    TEST_ASSERT_ER("(take 2 take)", "take: unsupported types: 'i64, Binary");
+    TEST_ASSERT_ER("(take 2.0 1.0)", "take: unsupported types: 'f64, 'f64");
+    TEST_ASSERT_ER("(take 2 take)", "take: unsupported types: 'i64, 'Binary");
 
     PASS();
 }

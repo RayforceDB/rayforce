@@ -176,15 +176,15 @@ obj_p sys_set_fpr(i32_t argc, str_p argv[]) {
     i64_t fpr, res;
 
     if (argc != 1)
-        THROW(ERR_LENGTH, "set-fpr: expected 1 argument");
+        THROW_S(ERR_LENGTH, "set-fpr: expected 1 argument");
 
     i64_from_str(argv[0], strlen(argv[0]), &fpr);
     if (fpr < 0)
-        THROW(ERR_LENGTH, "set-fpr: expected a positive integer");
+        THROW_S(ERR_LENGTH, "set-fpr: expected a positive integer");
 
     res = format_set_fpr(fpr);
     if (res != 0)
-        THROW(ERR_LENGTH, "set-fpr: failed to set fpr");
+        THROW_S(ERR_LENGTH, "set-fpr: failed to set fpr");
 
     return i64(res);
 }
@@ -193,15 +193,15 @@ obj_p sys_use_unicode(i32_t argc, str_p argv[]) {
     i64_t res;
 
     if (argc != 1)
-        THROW(ERR_LENGTH, "use-unicode: expected 1 argument");
+        THROW_S(ERR_LENGTH, "use-unicode: expected 1 argument");
 
     i64_from_str(argv[0], strlen(argv[0]), &res);
     if (res < 0)
-        THROW(ERR_LENGTH, "use-unicode: expected a positive integer");
+        THROW_S(ERR_LENGTH, "use-unicode: expected a positive integer");
 
     res = format_set_use_unicode(res);
     if (res != 0)
-        THROW(ERR_LENGTH, "use-unicode: failed to set use unicode");
+        THROW_S(ERR_LENGTH, "use-unicode: failed to set use unicode");
 
     return i64(res);
 }
@@ -210,18 +210,18 @@ obj_p sys_set_display_width(i32_t argc, str_p argv[]) {
     i64_t width, res;
 
     if (argc != 1)
-        THROW(ERR_LENGTH, "set-display-width: expected 1 argument");
+        THROW_S(ERR_LENGTH, "set-display-width: expected 1 argument");
 
     i64_from_str(argv[0], strlen(argv[0]), &width);
     if (width < 0)
-        THROW(ERR_LENGTH, "set-display-width: expected a positive integer");
+        THROW_S(ERR_LENGTH, "set-display-width: expected a positive integer");
 
     if (width < 0)
-        THROW(ERR_LENGTH, "set-display-width: expected a positive integer");
+        THROW_S(ERR_LENGTH, "set-display-width: expected a positive integer");
 
     res = format_set_display_width(width);
     if (res != 0)
-        THROW(ERR_LENGTH, "set-display-width: failed to set display width");
+        THROW_S(ERR_LENGTH, "set-display-width: failed to set display width");
 
     return i64(res);
 }
@@ -230,11 +230,11 @@ obj_p sys_timeit(i32_t argc, str_p argv[]) {
     i64_t res;
 
     if (argc != 1)
-        THROW(ERR_LENGTH, "timeit: expected 1 argument");
+        THROW_S(ERR_LENGTH, "timeit: expected 1 argument");
 
     i64_from_str(argv[0], strlen(argv[0]), &res);
     if (res < 0)
-        THROW(ERR_LENGTH, "timeit: expected a positive integer");
+        THROW_S(ERR_LENGTH, "timeit: expected a positive integer");
 
     timeit_activate(res != 0);
 
@@ -248,15 +248,15 @@ obj_p sys_listen(i32_t argc, str_p argv[]) {
     i64_t l, res = 0;
 
     if (argc != 1)
-        THROW(ERR_LENGTH, "listen: expected 1 argument");
+        THROW_S(ERR_LENGTH, "listen: expected 1 argument");
 
     l = strlen(argv[0]);
     i64_from_str(argv[0], l, &res);
     if (res < 0)
-        THROW(ERR_LENGTH, "listen: expected a positive integer");
+        THROW_S(ERR_LENGTH, "listen: expected a positive integer");
 
     if (res < 0)
-        THROW(ERR_TYPE, "listen: expected integer");
+        THROW_S(ERR_TYPE, "listen: expected integer");
 
     res = ipc_listen(runtime_get()->poll, res);
 
@@ -264,7 +264,7 @@ obj_p sys_listen(i32_t argc, str_p argv[]) {
         return sys_error(ERROR_TYPE_SOCK, "listen");
 
     if (res == -2)
-        THROW(ERR_LENGTH, "listen: already listening");
+        THROW_S(ERR_LENGTH, "listen: already listening");
 
     return i64(res);
 }
@@ -278,7 +278,7 @@ obj_p sys_exit(i32_t argc, str_p argv[]) {
         l = strlen(argv[0]);
         i64_from_str(argv[0], l, &code);
         if (code < 0)
-            THROW(ERR_LENGTH, "exit: expected a positive integer");
+            THROW_S(ERR_LENGTH, "exit: expected a positive integer");
     }
 
     poll_exit(runtime_get()->poll, code);
@@ -336,7 +336,7 @@ obj_p ray_internal_command(obj_p cmd) {
                 for (i = 0; i < remaining_len && current[i] != '"'; i++)
                     ;
                 if (i >= remaining_len) {
-                    THROW(ERR_PARSE, "unmatched quote in command arguments");
+                    THROW_S(ERR_PARSE, "unmatched quote in command arguments");
                 }
 
                 // Null terminate the argument
@@ -388,7 +388,7 @@ obj_p ray_system(obj_p cmd) {
     obj_p c, res;
 
     if (cmd->type != TYPE_C8)
-        THROW(ERR_TYPE, "system: expected a string");
+        THROW_S(ERR_TYPE, "system: expected a string");
 
     // Try internal command first
     res = ray_internal_command(cmd);
@@ -400,7 +400,7 @@ obj_p ray_system(obj_p cmd) {
 
     fp = popen(AS_C8(c), "r");
     if (fp == NULL)
-        THROW(ERR_SYS, "popen failed");
+        THROW_S(ERR_SYS, "popen failed");
 
     res = LIST(0);
 

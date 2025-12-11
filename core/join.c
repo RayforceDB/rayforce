@@ -47,7 +47,7 @@ obj_p select_column(obj_p left_col, obj_p right_col, i64_t ids[], i64_t len) {
     type = is_null(left_col) ? right_col->type : left_col->type;
 
     if (right_col->type != type)
-        THROW(ERR_TYPE, "select_column: incompatible types");
+        THROW_S(ERR_TYPE, "select_column: incompatible types");
 
     res = vector(type, len);
 
@@ -74,7 +74,7 @@ obj_p get_column(obj_p left_col, obj_p right_col, obj_p lids, obj_p rids) {
     type = is_null(left_col) ? right_col->type : left_col->type;
 
     if (right_col->type != type)
-        THROW(ERR_TYPE, "get_column: incompatible types");
+        THROW_S(ERR_TYPE, "get_column: incompatible types");
 
     return at_ids(right_col, AS_I64(rids), rids->len);
 }
@@ -99,7 +99,7 @@ static obj_p __left_join_inner(obj_p ltab, obj_p rtab, obj_p ksyms, obj_p kcols,
 
     if (l == 0) {
         drop_obj(cols);
-        THROW(ERR_LENGTH, "left-join: no columns to join on");
+        THROW_S(ERR_LENGTH, ERR_MSG_LJ_NO_COLS);
     }
 
     // resulting columns
@@ -158,16 +158,16 @@ obj_p ray_left_join(obj_p *x, i64_t n) {
     obj_p k1, k2, idx, res;
 
     if (n != 3)
-        THROW(ERR_LENGTH, "left-join");
+        THROW_S(ERR_LENGTH, "left-join");
 
     if (x[0]->type != TYPE_SYMBOL)
-        THROW(ERR_TYPE, "left-join: first argument must be a symbol vector");
+        THROW_S(ERR_TYPE, ERR_MSG_LJ_ARG1);
 
     if (x[1]->type != TYPE_TABLE)
-        THROW(ERR_TYPE, "left-join: second argument must be a table");
+        THROW_S(ERR_TYPE, ERR_MSG_LJ_ARG2);
 
     if (x[2]->type != TYPE_TABLE)
-        THROW(ERR_TYPE, "left-join: third argument must be a table");
+        THROW_S(ERR_TYPE, ERR_MSG_LJ_ARG3);
 
     if (ops_count(x[1]) == 0 || ops_count(x[2]) == 0)
         return clone_obj(x[1]);
@@ -201,16 +201,16 @@ obj_p ray_inner_join(obj_p *x, i64_t n) {
     obj_p k1, k2, c1, c2, un, col, cols, vals, idx;
 
     if (n != 3)
-        THROW(ERR_LENGTH, "inner-join");
+        THROW_S(ERR_LENGTH, "inner-join");
 
     if (x[0]->type != TYPE_SYMBOL)
-        THROW(ERR_TYPE, "inner-join: first argument must be a symbol vector");
+        THROW_S(ERR_TYPE, ERR_MSG_IJ_ARG1);
 
     if (x[1]->type != TYPE_TABLE)
-        THROW(ERR_TYPE, "inner-join: second argument must be a table");
+        THROW_S(ERR_TYPE, ERR_MSG_IJ_ARG2);
 
     if (x[2]->type != TYPE_TABLE)
-        THROW(ERR_TYPE, "inner-join: third argument must be a table");
+        THROW_S(ERR_TYPE, ERR_MSG_IJ_ARG3);
 
     if (ops_count(x[1]) == 0 || ops_count(x[2]) == 0)
         return clone_obj(x[1]);
@@ -248,7 +248,7 @@ obj_p ray_inner_join(obj_p *x, i64_t n) {
     if (cols->len == 0) {
         drop_obj(idx);
         drop_obj(cols);
-        THROW(ERR_LENGTH, "inner-join: no columns to join on");
+        THROW_S(ERR_LENGTH, ERR_MSG_IJ_NO_COLS);
     }
 
     col = ray_concat(x[0], cols);
@@ -300,16 +300,16 @@ obj_p ray_asof_join(obj_p *x, i64_t n) {
     obj_p idx, v, ajkl, ajkr, keys, lvals, rvals, res;
 
     if (n != 3)
-        THROW(ERR_ARITY, "asof-join");
+        THROW_S(ERR_ARITY, "asof-join");
 
     if (x[0]->type != TYPE_SYMBOL)
-        THROW(ERR_TYPE, "asof-join: first argument must be a symbol vector");
+        THROW_S(ERR_TYPE, ERR_MSG_AJ_ARG1);
 
     if (x[1]->type != TYPE_TABLE)
-        THROW(ERR_TYPE, "asof-join: second argument must be a table");
+        THROW_S(ERR_TYPE, ERR_MSG_AJ_ARG2);
 
     if (x[2]->type != TYPE_TABLE)
-        THROW(ERR_TYPE, "asof-join: third argument must be a table");
+        THROW_S(ERR_TYPE, ERR_MSG_AJ_ARG3);
 
     v = ray_last(x[0]);
     ajkl = ray_at(x[1], v);
@@ -319,13 +319,13 @@ obj_p ray_asof_join(obj_p *x, i64_t n) {
     if (is_null(ajkl) || is_null(ajkr)) {
         drop_obj(ajkl);
         drop_obj(ajkr);
-        THROW(ERR_INDEX, "asof-join: key not found");
+        THROW_S(ERR_INDEX, ERR_MSG_AJ_KEY);
     }
 
     if (ajkl->type != ajkr->type) {
         drop_obj(ajkl);
         drop_obj(ajkr);
-        THROW(ERR_TYPE, "asof-join: incompatible types");
+        THROW_S(ERR_TYPE, ERR_MSG_AJ_TYPES);
     }
 
     keys = cow_obj(x[0]);
@@ -355,22 +355,22 @@ static obj_p __window_join(obj_p *x, i64_t n, i64_t tp) {
     obj_p agrvals, resyms, recols, jtab, rtab;
 
     if (n != 5)
-        THROW(ERR_ARITY, "window-join");
+        THROW_S(ERR_ARITY, "window-join");
 
     if (x[0]->type != TYPE_SYMBOL)
-        THROW(ERR_TYPE, "window-join: first argument must be a symbol vector");
+        THROW_S(ERR_TYPE, ERR_MSG_WJ_ARG1);
 
     if (x[1]->type != TYPE_LIST)
-        THROW(ERR_TYPE, "window-join: second argument must be a windows list");
+        THROW_S(ERR_TYPE, ERR_MSG_WJ_ARG2);
 
     if (x[2]->type != TYPE_TABLE)
-        THROW(ERR_TYPE, "window-join: third argument must be a table");
+        THROW_S(ERR_TYPE, ERR_MSG_WJ_ARG3);
 
     if (x[3]->type != TYPE_TABLE)
-        THROW(ERR_TYPE, "window-join: fourth argument must be a table");
+        THROW_S(ERR_TYPE, ERR_MSG_WJ_ARG4);
 
     if (x[4]->type != TYPE_DICT)
-        THROW(ERR_TYPE, "window-join: fifth argument must be a dict");
+        THROW_S(ERR_TYPE, ERR_MSG_WJ_ARG5);
 
     jtab = ray_xasc(x[3], x[0]);
     if (IS_ERR(jtab))
@@ -384,13 +384,13 @@ static obj_p __window_join(obj_p *x, i64_t n, i64_t tp) {
     if (is_null(wjkl) || is_null(wjkr)) {
         drop_obj(wjkl);
         drop_obj(wjkr);
-        THROW(ERR_INDEX, "window-join: key not found");
+        THROW_S(ERR_INDEX, ERR_MSG_WJ_KEY);
     }
 
     if (wjkl->type != wjkr->type) {
         drop_obj(wjkl);
         drop_obj(wjkr);
-        THROW(ERR_TYPE, "window-join: incompatible types");
+        THROW_S(ERR_TYPE, ERR_MSG_WJ_TYPES);
     }
 
     keys = cow_obj(x[0]);

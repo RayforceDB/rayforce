@@ -46,7 +46,7 @@ obj_p ray_iasc(obj_p x) {
         case TYPE_DICT:
             return ray_sort_asc(x);
         default:
-            THROW(ERR_TYPE, "iasc: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("iasc", x->type);
     }
 }
 
@@ -67,7 +67,7 @@ obj_p ray_idesc(obj_p x) {
         case TYPE_DICT:
             return ray_sort_desc(x);
         default:
-            THROW(ERR_TYPE, "idesc: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("idesc", x->type);
     }
 }
 
@@ -153,7 +153,7 @@ obj_p ray_asc(obj_p x) {
         }
 
         default:
-            THROW(ERR_TYPE, "asc: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("asc", x->type);
     }
 }
 
@@ -239,7 +239,7 @@ obj_p ray_desc(obj_p x) {
         }
 
         default:
-            THROW(ERR_TYPE, "desc: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("desc", x->type);
     }
 }
 
@@ -325,9 +325,9 @@ obj_p ray_xasc(obj_p x, obj_p y) {
             if (y->len == 0)
                 return clone_obj(x);
 
-            THROW(ERR_TYPE, "xasc: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("xasc", x->type, y->type);
         default:
-            THROW(ERR_TYPE, "xasc: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("xasc", x->type, y->type);
     }
 }
 
@@ -413,9 +413,9 @@ obj_p ray_xdesc(obj_p x, obj_p y) {
             if (y->len == 0)
                 return clone_obj(x);
 
-            THROW(ERR_TYPE, "xdesc: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("xdesc", x->type, y->type);
         default:
-            THROW(ERR_TYPE, "xdesc: unsupported types: '%s, '%s", type_name(x->type), type_name(y->type));
+            THROW_TYPE2("xdesc", x->type, y->type);
     }
 }
 
@@ -438,7 +438,7 @@ obj_p ray_not(obj_p x) {
             return res;
 
         default:
-            THROW(ERR_TYPE, "not: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("not", x->type);
     }
 }
 
@@ -492,7 +492,7 @@ obj_p ray_neg(obj_p x) {
             return res;
 
         default:
-            THROW(ERR_TYPE, "neg: unsupported type: '%s", type_name(x->type));
+            THROW_TYPE1("neg", x->type);
     }
 }
 
@@ -532,7 +532,7 @@ obj_p ray_rank(obj_p x) {
         res = I64(l);
         if (IS_ERR(res))
             return res;
-        rank_ctx_t ctx = { NULL, AS_I64(res), l };
+        rank_ctx_t ctx = {NULL, AS_I64(res), l};
         pool_map(l, rank_desc_worker, &ctx);
         return res;
     }
@@ -548,7 +548,7 @@ obj_p ray_rank(obj_p x) {
         return res;
     }
 
-    rank_ctx_t ctx = { AS_I64(perm), AS_I64(res), l };
+    rank_ctx_t ctx = {AS_I64(perm), AS_I64(res), l};
     pool_map(l, rank_worker, &ctx);
 
     drop_obj(perm);
@@ -600,15 +600,23 @@ obj_p ray_xrank(obj_p y, obj_p x) {
     obj_p perm, res;
 
     switch (x->type) {
-        case -TYPE_I64: n_buckets = x->i64; break;
-        case -TYPE_I32: n_buckets = x->i32; break;
-        case -TYPE_I16: n_buckets = x->i16; break;
-        case -TYPE_U8:  n_buckets = x->u8;  break;
+        case -TYPE_I64:
+            n_buckets = x->i64;
+            break;
+        case -TYPE_I32:
+            n_buckets = x->i32;
+            break;
+        case -TYPE_I16:
+            n_buckets = x->i16;
+            break;
+        case -TYPE_U8:
+            n_buckets = x->u8;
+            break;
         default:
-            THROW(ERR_TYPE, "xrank: second arg must be integer");
+            THROW_S(ERR_TYPE, "xrank: second arg must be integer");
     }
     if (n_buckets <= 0)
-        THROW(ERR_TYPE, "xrank: number of buckets must be positive");
+        THROW_S(ERR_TYPE, "xrank: number of buckets must be positive");
 
     l = y->len;
     res = I64(l);
@@ -617,12 +625,12 @@ obj_p ray_xrank(obj_p y, obj_p x) {
 
     // Fast path for sorted vectors
     if (y->attrs & ATTR_ASC) {
-        xrank_asc_ctx_t ctx = { AS_I64(res), n_buckets, l };
+        xrank_asc_ctx_t ctx = {AS_I64(res), n_buckets, l};
         pool_map(l, xrank_asc_worker, &ctx);
         return res;
     }
     if (y->attrs & ATTR_DESC) {
-        xrank_asc_ctx_t ctx = { AS_I64(res), n_buckets, l };
+        xrank_asc_ctx_t ctx = {AS_I64(res), n_buckets, l};
         pool_map(l, xrank_desc_worker, &ctx);
         return res;
     }
@@ -633,7 +641,7 @@ obj_p ray_xrank(obj_p y, obj_p x) {
         return perm;
     }
 
-    xrank_ctx_t ctx = { AS_I64(perm), AS_I64(res), n_buckets, l };
+    xrank_ctx_t ctx = {AS_I64(perm), AS_I64(res), n_buckets, l};
     pool_map(l, xrank_worker, &ctx);
 
     drop_obj(perm);
