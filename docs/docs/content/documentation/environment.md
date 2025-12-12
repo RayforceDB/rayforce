@@ -2,39 +2,48 @@
 
 RayforceDB provides functions for managing variables and the execution environment. These functions enable variable assignment, scoping, and environment introspection.
 
-### Set
+## Variable Assignment
 
-Assigns a value to a variable in the global environment or saves data to disk. Can be used to define new variables, update existing variables, or persist data to files.
+### :material-pencil: Set
+
+Assigns a value to a variable in the global environment or saves data to disk. Can be used to define new variables or update existing variables.
 
 ```clj
-↪ (set x 123)
+(set x 123)
 123
-↪ x
+
+x
 123
-↪ (set "/tmp/v.dat" [1 2 3])
-"/tmp/v.dat"
+
+(set price 150.25)
+150.25
 ```
 
-When the first argument is a symbol, sets a global variable. When the first argument is a string path, saves the value to disk as a serialized object.
+When the first argument is a symbol, sets a global variable.
 
 !!! note ""
     `set` creates or updates global variables that persist across the session. For local variables within functions, use `let` instead.
 
-### Let
+### :material-code-brackets: Let
 
 Creates a local variable scoped to the current block or function. The variable is only available within the scope where it's defined.
 
 ```clj
-↪ (do (let a 123) (+ a 1))
+(do (let a 123) (+ a 1))
 124
-↪ a
-;; Error: undefined symbol 'a
 ```
 
 ```clj
-↪ (set add (fn [a b] (let c (+ a b)) c))
-↪ (add 1 2)
+(set add (fn [a b] (let c (+ a b)) c))
+(add 1 2)
 3
+
+(set calculate-total (fn [price quantity] 
+    (let total (* price quantity))
+    (let tax (* total 0.1))
+    (+ total tax)))
+(calculate-total 150.25 100)
+16527.50
 ```
 
 Unlike `set`, variables created with `let` are not accessible outside their defining scope. This is useful for temporary variables within functions or blocks.
@@ -42,37 +51,38 @@ Unlike `set`, variables created with `let` are not accessible outside their defi
 !!! note ""
     `let` is a special form that restricts variable scope. Use `let` inside functions to avoid polluting the global environment.
 
-### Get
+## Variable Retrieval
+
+### :material-database-search: Get
 
 Retrieves a variable value by symbol or loads a serialized object from disk.
 
 ```clj
-↪ (set a 1)
-↪ (get 'a)
+(set a 1)
+(get 'a)
 1
-↪ (set "/tmp/vec" (til 10))
-↪ (get "/tmp/vec")
-[0 1 2 3 4 5 6 7 8 9]
 ```
 
-When given a symbol, returns the value of that variable from the environment. When given a string path, reads and deserializes a file containing a RayforceDB object.
+When given a symbol, returns the value of that variable from the environment.
 
-!!! note ""
-    `get` searches the environment for variables. If the variable doesn't exist, it returns an error. For file paths, the file must contain a valid serialized RayforceDB object.
+## Environment Introspection
 
-### Env
+### :material-code-braces: Env
 
 Returns a [:material-code-braces: Dictionary](data-types/dictionary.md) containing all global variables in the current environment.
 
 ```clj
-↪ (set add (fn [a b] (return (+ a b)) 77))
-↪ (set a 1)
-↪ (set b [1 2 3 4])
-↪ (env)
-{add: @add, a: 1, b: [1 2 3 4]}
+(set add (fn [a b] (return (+ a b)) 77))
+(set a 1)
+(set b [1 2 3 4])
+(set price 150.25)
+(env)
+{
+    add: @add
+    a: 1
+    b: [1 2 3 4]
+    price: 150.25
+}
 ```
 
-Returns a dictionary mapping variable names (as symbols) to their values. Useful for inspecting the current global state and debugging.
-
-!!! note ""
-    The returned dictionary is a snapshot of the global environment at the time of the call. Modifying the dictionary does not affect the actual environment variables.
+Returns a dictionary mapping variable names (as symbols) to their values.

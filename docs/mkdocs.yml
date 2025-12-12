@@ -158,18 +158,13 @@ nav:
     - Operations:
       - Math: content/documentation/operations/math.md
       - Order: content/documentation/operations/order.md
-      - Logic: content/documentation/operations/logic.md
       - Iterable: content/documentation/operations/iterable.md
+      - Logic: content/documentation/operations/logic.md
       - Compose: content/documentation/operations/compose.md
-      - Evaluation Control: content/documentation/operations/evaluation-control.md
-      - IO: content/documentation/operations/IO.md
-    - Environment: content/documentation/environment.md
-    - Format: content/documentation/format.md
-    - Serialization: content/documentation/serialization.md
     - IPC: content/documentation/IPC.md
+    - Format: content/documentation/format.md
+    - Environment: content/documentation/environment.md
+    - Serialization: content/documentation/serialization.md
     - REPL: content/documentation/REPL.md
-    - Misc: content/documentation/misc.md
-
-  - FAQ: content/faq.md
 
   - License: content/license.md

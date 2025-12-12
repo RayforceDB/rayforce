@@ -1,62 +1,91 @@
 # :material-swap-horizontal: Upsert Query
 
-The `upsert` function updates existing rows or inserts new ones in a [:material-table: Table](../data-types/table.md) based on key column(s). If a row with the same key exists, it is updated. Otherwise, a new row is inserted.
+The `upsert` function updates existing rows or inserts new ones in a [:material-table: Table](../data-types/table.md) based on key column(s). If a row with the same key exists, it is **updated**. Otherwise, a new row is **inserted**.
 
 ```clj
-↪ (upsert table 1 data)
+(set employees (table [id name age] (list [1 2] ['Alice 'Bob] [25 30])))
+
+;; Upsert: id=2 exists, so it's updated; id=3 doesn't exist, so it's inserted
+(set employees (upsert employees 1 (list [2 3] ['Bob-updated 'Charlie] [30 35])))
+
+(select {id: id name: name age: age from: employees})
+┌────┬─────────────┬─────┐
+│ id │ name        │ age │
+├────┼─────────────┼─────┤
+│ 1  │ Alice       │ 25  │
+│ 2  │ Bob-updated │ 30  │
+│ 3  │ Charlie     │ 35  │
+├────┴─────────────┴─────┤
+│ 3 rows (3 shown)       │
+└────────────────────────┘
 ```
+!!! note ""
+    The `upsert` function takes three arguments: the table to upsert into, the number of key columns (starting from the first column), the data to upsert
 
-The `upsert` function takes three arguments: the table to upsert into, the number of key columns, and the data to upsert. The data can be provided as a [:material-code-array: List](../data-types/list.md), [:material-code-braces: Dictionary](../data-types/dictionary.md), or another [:material-table: Table](../data-types/table.md).
+The data can be provided as a [:material-code-array: List](../data-types/list.md), [:material-code-braces: Dictionary](../data-types/dictionary.md), or another [:material-table: Table](../data-types/table.md).
 
-## Key Columns
+## Understanding Key Columns
 
-The first N columns (where N = `key_count`) form the key used to identify rows. If a row with the same key exists, it is updated; otherwise, a new row is inserted.
+The first N columns (where N = number of key columns) form the **key** used to identify rows. The key determines whether a row should be updated or inserted
 
 ```clj
-↪ (set t (table [id name] (list [1 2] (list "Alice" "Bob"))))
+(set employees (table [id name age] (list [1 2] ['Alice 'Bob] [25 30])))
 
-↪ (set t (upsert t 1 (list [2 3] (list "Bob-updated" "Charlie"))))
+(set employees (upsert employees 1 (list [2 3] ['Bob-updated 'Charlie] [30 35])))
 ```
 
 !!! note ""
-    In this example, `id` is the key column (first argument is `1`). Row with `id=2` is updated, and a new row with `id=3` is inserted.
+    In this example, `id` is the key column (key_count = `1`). The row with `id=2` is **updated**, and a new row with `id=3` is **inserted**.
 
-## Upserting Single Row
-
-```clj
-↪ (set t (upsert t 1 (list 4 "David")))
-```
-
-## Upserting Multiple Rows with [:material-vector-line: Vectors](../data-types/vector.md)
+## Upserting a Single Row
 
 ```clj
-↪ (set t (upsert t 1 (list [5 6] (list "Eve" "Frank"))))
+(set employees (upsert employees 1 (list 4 'David 40)))
 ```
 
-## Upserting with [:material-code-braces: Dictionary](../data-types/dictionary.md)
+## Upserting Multiple Rows
+
+Upsert multiple rows using a list of [:material-vector-line: Vectors](../data-types/vector.md):
 
 ```clj
-↪ (set t (upsert t 1 (dict [id name] (list 7 "Grace"))))
+(set employees (upsert employees 1 (list [5 6] ['Eve 'Frank] [28 32])))
 ```
 
-## Upserting with [:material-table: Table](../data-types/table.md)
+## Upserting with Dictionary
+
+Upsert rows using a [:material-code-braces: Dictionary](../data-types/dictionary.md) for clearer column mapping:
 
 ```clj
-↪ (set t (upsert t 1 (table [id name] (list [8 9] (list "Henry" "Ivy")))))
+(set employees (upsert employees 1 (dict [id name age] (list 7 'Grace 29))))
 ```
 
-## In-Place Upsertion with [:simple-scalar: Symbol](../data-types/symbol.md)
+## Upserting from Another Table
 
-To modify the table in place, pass the table name as a quoted [:simple-scalar: Symbol](../data-types/symbol.md):
+Upsert rows from another [:material-table: Table](../data-types/table.md):
 
 ```clj
-↪ (upsert 't 1 (list 11 "Kate"))  ;; Modifies t directly
+(set new_data (table [id name age] (list [8 9] ['Henry 'Ivy] [45 38])))
+
+(set employees (upsert employees 1 new_data))
 ```
 
-!!! warning ""
-    By default, `upsert` returns a new table. To persist changes, either reassign the result or use in-place upsertion with a quoted symbol:
+## In-Place Upsertion
 
-!!! note ""
-    Column types must match the [:material-table: Table's](../data-types/table.md) column types. The key columns must be compatible types for comparison.
+To modify the table in place without reassigning, pass the table name as a quoted [:simple-scalar: Symbol](../data-types/symbol.md):
+
+```clj
+(upsert 'employees 1 (list 11 'Kate 27))
+```
+
+!!! warning "Important: Persisting Changes"
+    By default, `upsert` returns a **new table** and does not modify the original. To persist changes, you have two options:
     
-    If a column name matches a built-in [:material-function: function](../data-types/functions.md) or env var, use `(at table 'column)` to access it.
+    1. **Reassign the result:**
+       ```clj
+       (set employees (upsert employees 1 (list 11 'Kate 27)))
+       ```
+    
+    2. **Use in-place upsertion with quoted symbol:**
+       ```clj
+       (upsert 'employees 1 (list 11 'Kate 27))  ;; Modifies table directly
+       ```

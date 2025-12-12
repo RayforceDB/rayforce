@@ -1,17 +1,33 @@
 # :material-package-variant-closed: Install
 
-As of now, only building from source is available
+Distribution of RayforceDB is currently happening via native installation from <a href="https://github.com/RayforceDB/rayforce">source</a>.
 
-## Requirements
+| Platform                             | Is supported?    | 
+| ------------------------------------ | ---------------- | 
+| :simple-linux: Linux x86_64          | :material-check: | 
+| :simple-apple: MacOS arm64           | :material-check: | 
+| :material-microsoft-windows: Windows | :material-close: `coming soon` |
 
-- [GCC](https://gcc.gnu.org/) - For Linux build
-- [Clang](https://clang.llvm.org/) - For MacOS build
 
-## Installation
+!!! note ""
 
+    For :simple-linux: Linux installation, you will need to install <a href="https://gcc.gnu.org/">GCC</a>.
+    
+    For :simple-apple: MacOS installation, you will need to install <a href="https://clang.llvm.org/">Clang</a>
+
+### Installation process
+
+1. Clone the library from https://github.com/RayforceDB/rayforce
 ```bash
-~ $ git clone https://github.com/RayforceDB/rayforce
-~ $ cd rayforce
+~ $ git clone https://github.com/RayforceDB/rayforce && cd rayforce
+```
+2. Compile the latest version
+```bash
 ~ $ make release
-~ $ rlwrap ./rayforce -f examples/table.rfl
+```
+3. Make your first query
+```clj
+~ $ ./rayforce
+↪ (sum [2 3 4 5 6 7 8 9])
+44
 ```
