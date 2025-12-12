@@ -1,4 +1,4 @@
-# :material-database: Welcome to RayforceDB!
+# <img src="../assets/rayforcedb-emoji-1.svg" alt="icon" style="width: 1.2em; vertical-align: middle; margin-right: 0.3em;"> Welcome to RayforceDB!
 
 The <b>ultra-fast</b> columnar database engineered to deliver the <b>best high-speed performance</b> for your real-time storage solutions.
 
