@@ -10,13 +10,21 @@ endif
 $(info OS="$(OS)")
 
 ifeq ($(OS),Windows_NT)
-DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -DDEBUG
-LIBS = -lm -lws2_32 -lkernel32
+DEBUG_CFLAGS = -Wall -Wextra -std=$(STD) -g -O0 -DDEBUG -D_WINSOCK_DEPRECATED_NO_WARNINGS -D_CRT_SECURE_NO_WARNINGS
+RELEASE_CFLAGS = -Wall -Wextra -std=$(STD) -O3 -DNDEBUG -D_WINSOCK_DEPRECATED_NO_WARNINGS -D_CRT_SECURE_NO_WARNINGS \
+ -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -fno-math-errno
+LIBS = -lws2_32 -lmswsock -lkernel32
+DEBUG_LDFLAGS =
+RELEASE_LDFLAGS =
 LIBNAME = rayforce.dll
+TARGET_EXT = .exe
 endif
 
 ifeq ($(OS),linux)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -march=native -fsigned-char -DDEBUG -m64
+RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
+ -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
+ -flax-vector-conversions -fno-math-errno
 LIBS = -lm -ldl -lpthread
 RELEASE_LDFLAGS = -Wl,--strip-all -Wl,--gc-sections -Wl,--as-needed\
  -Wl,--build-id=none -Wl,--no-eh-frame-hdr -Wl,--no-ld-generated-unwind-info\
@@ -27,14 +35,13 @@ endif
 
 ifeq ($(OS),darwin)
 DEBUG_CFLAGS = -fPIC -Wall -Wextra -Wunused-function -std=$(STD) -g -O0 -march=native -fsigned-char -DDEBUG -m64 -fsanitize=undefined -fsanitize=address
+RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
+ -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
+ -flax-vector-conversions -fno-math-errno
 LIBS = -lm -ldl -lpthread
 LIBNAME = librayforce.dylib
 endif
 
-RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
- -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
- -flax-vector-conversions -fno-math-errno\
- -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables
 CORE_OBJECTS = core/poll.o core/ipc.o core/repl.o core/runtime.o core/sys.o core/os.o core/proc.o core/fs.o core/mmap.o core/serde.o\
  core/temporal.o core/date.o core/time.o core/timestamp.o core/guid.o core/sort.o core/ops.o core/util.o\
  core/string.o core/hash.o core/symbols.o core/format.o core/rayforce.o core/heap.o core/parse.o\

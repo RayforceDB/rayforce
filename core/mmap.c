@@ -22,6 +22,7 @@
  */
 
 #include "mmap.h"
+#include "util.h"
 
 #if defined(OS_WINDOWS)
 
@@ -71,10 +72,14 @@ i64_t mmap_free(raw_p addr, i64_t size) {
 i64_t mmap_sync(raw_p addr, i64_t size) { return FlushViewOfFile(addr, size); }
 
 raw_p mmap_reserve(raw_p addr, i64_t size) {
+    // On Windows, requesting a specific address may fail if it's not available
+    // First try with the hint, then fall back to letting Windows choose
     raw_p ptr = VirtualAlloc(addr, size, MEM_RESERVE, PAGE_NOACCESS);
 
-    if (ptr == NULL)
-        return NULL;
+    if (ptr == NULL) {
+        // Try again with NULL address to let Windows choose
+        ptr = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);
+    }
 
     return ptr;
 }

@@ -22,7 +22,21 @@
  */
 
 #include <stdio.h>
+#if defined(OS_WINDOWS)
+#include <io.h>
+#define read _read
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#endif
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+#else
 #include <unistd.h>
+#endif
 #include "repl.h"
 #include "io.h"
 #include "eval.h"
@@ -113,7 +127,6 @@ option_t repl_read(poll_p poll, selector_p selector) {
 
 repl_p repl_create(poll_p poll, b8_t silent) {
     repl_p repl;
-    struct poll_registry_t registry = ZERO_INIT_STRUCT;
 
     repl = (repl_p)heap_alloc(sizeof(struct repl_t));
     repl->name = string_from_str("repl", 4);
@@ -126,22 +139,32 @@ repl_p repl_create(poll_p poll, b8_t silent) {
         repl->term = NULL;
     }
 
-    registry.fd = STDIN_FILENO;
-    registry.type = SELECTOR_TYPE_STDIN;
-    registry.events = POLL_EVENT_READ | POLL_EVENT_ERROR | POLL_EVENT_HUP;
-    registry.recv_fn = NULL;
-    registry.read_fn = repl_read;
-    registry.close_fn = repl_on_close;
-    registry.error_fn = repl_on_error;
-    registry.data_fn = repl_on_data;
-    registry.data = repl;
+#if defined(OS_WINDOWS)
+    // On Windows, STDIN is handled by iocp.c's StdinThread
+    // The poll_init() function sets up STDIN handling internally
+    repl->id = 0;  // Placeholder ID for Windows
+    UNUSED(poll);
+#else
+    {
+        struct poll_registry_t registry = ZERO_INIT_STRUCT;
+        registry.fd = STDIN_FILENO;
+        registry.type = SELECTOR_TYPE_STDIN;
+        registry.events = POLL_EVENT_READ | POLL_EVENT_ERROR | POLL_EVENT_HUP;
+        registry.recv_fn = NULL;
+        registry.read_fn = repl_read;
+        registry.close_fn = repl_on_close;
+        registry.error_fn = repl_on_error;
+        registry.data_fn = repl_on_data;
+        registry.data = repl;
 
-    repl->id = poll_register(poll, &registry);
+        repl->id = poll_register(poll, &registry);
 
-    if (repl->id == NULL_I64) {
-        repl_destroy(repl);
-        return NULL;
+        if (repl->id == NULL_I64) {
+            repl_destroy(repl);
+            return NULL;
+        }
     }
+#endif
 
     if (!silent)
         term_prompt(repl->term);

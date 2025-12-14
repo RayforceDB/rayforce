@@ -70,17 +70,40 @@ typedef struct poll_buffer_t {
 
 // Platform-specific event definitions and structures
 #if defined(OS_WINDOWS)
-#include <windows.h>
+
+// Windows poll events (not used directly, IOCP handles differently)
 typedef enum poll_events_t {
-    POLL_EVENT_READ = POLLIN,
-    POLL_EVENT_WRITE = POLLOUT,
-    POLL_EVENT_ERROR = POLLERR,
+    POLL_EVENT_READ = 0x01,
+    POLL_EVENT_WRITE = 0x02,
+    POLL_EVENT_ERROR = 0x04,
 } poll_events_t;
+
+// Poll result type for async I/O operations
+typedef enum poll_result_t {
+    POLL_OK = 0,     // Operation pending, waiting for completion
+    POLL_DONE = 1,   // Operation completed successfully
+    POLL_ERROR = -1  // Error occurred
+} poll_result_t;
+
+// Simple queue for Windows async message handling
+typedef struct queue_t {
+    i64_t capacity;
+    i64_t head;
+    i64_t tail;
+    i64_t count;
+    raw_p *data;
+} *queue_p;
+
+queue_p queue_create(i64_t capacity);
+nil_t queue_free(queue_p queue);
+nil_t queue_push(queue_p queue, raw_p item);
+raw_p queue_pop(queue_p queue);
 
 typedef struct selector_t {
     i64_t fd;  // socket fd
     i64_t id;  // selector id
     u8_t version;
+    raw_p data;  // user-defined data
 
     struct {
         b8_t ignore;
@@ -89,7 +112,6 @@ typedef struct selector_t {
         OVERLAPPED overlapped;
         DWORD flags;
         DWORD size;
-        i64_t size;
         u8_t *buf;
         WSABUF wsa_buf;
     } rx;
@@ -99,12 +121,34 @@ typedef struct selector_t {
         OVERLAPPED overlapped;
         DWORD flags;
         DWORD size;
-        i64_t size;
         u8_t *buf;
         WSABUF wsa_buf;
         queue_p queue;  // queue for async messages waiting to be sent
     } tx;
 } *selector_p;
+
+// Forward declare term_p (defined in term.h)
+struct term_t;
+
+typedef struct poll_t {
+    i64_t poll_fd;         // IOCP handle
+    i64_t ipc_fd;          // IPC socket fd
+    i64_t code;            // exit code
+    obj_p replfile;        // REPL file name
+    obj_p ipcfile;         // IPC file name
+    struct term_t *term;   // terminal
+    freelist_p selectors;  // freelist of selectors
+    timers_p timers;       // timers heap
+} *poll_p;
+
+// Registry not used on Windows, but define for API compatibility
+typedef struct poll_registry_t {
+    i64_t fd;
+    selector_type_t type;
+    poll_events_t events;
+    raw_p data;
+} *poll_registry_p;
+
 #else
 #if defined(OS_LINUX)
 #include <sys/epoll.h>
@@ -188,11 +232,21 @@ typedef struct poll_registry_t {
 #endif
 
 // Function declarations
+#if defined(OS_WINDOWS)
+// Windows uses IOCP with different initialization and registration
+poll_p poll_init(i64_t port);
+i64_t poll_listen(poll_p poll, i64_t port);
+i64_t poll_register(poll_p poll, i64_t fd, u8_t version);
+nil_t poll_deregister(poll_p poll, i64_t id);
+#define poll_create() poll_init(0)
+#else
 poll_p poll_create();
-nil_t poll_destroy(poll_p poll);
-i64_t poll_run(poll_p poll);
 i64_t poll_register(poll_p poll, poll_registry_p registry);
 i64_t poll_deregister(poll_p poll, i64_t id);
+#endif
+
+nil_t poll_destroy(poll_p poll);
+i64_t poll_run(poll_p poll);
 selector_p poll_get_selector(poll_p poll, i64_t id);
 poll_buffer_p poll_buf_create(i64_t size);
 nil_t poll_buf_destroy(poll_buffer_p buf);

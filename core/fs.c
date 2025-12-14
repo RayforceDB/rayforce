@@ -23,8 +23,12 @@
 
 #include <stdio.h>
 #include <sys/stat.h>
+#if defined(OS_WINDOWS)
+#include <io.h>  // for _get_osfhandle
+#endif
 #include "fs.h"
 #include "string.h"
+#include "ops.h"  // for NULL_OBJ
 
 #if defined(OS_WINDOWS)
 

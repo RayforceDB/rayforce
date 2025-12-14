@@ -1,6 +1,7 @@
 #ifdef DEBUG
 
 #include <ctype.h>
+#include <time.h>
 #include "log.h"
 #include "def.h"
 #include "os.h"

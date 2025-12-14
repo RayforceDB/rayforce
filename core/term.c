@@ -22,7 +22,21 @@
  */
 
 #include <stdio.h>
+#include "def.h"
+#if defined(OS_WINDOWS)
+#include <io.h>
+#include <conio.h>
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#endif
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#else
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/file.h>
+#endif
 #include "term.h"
 #include "chrono.h"
 #include "heap.h"
@@ -35,12 +49,6 @@
 #include "env.h"
 #include "mmap.h"
 #include "fs.h"
-#if defined(OS_WINDOWS)
-#include <io.h>
-#else
-#include <sys/ioctl.h>
-#include <sys/file.h>
-#endif
 
 #define MAX_PATH_LEN 128
 #define HIST_FILE_PATH ".rayhist.dat"
@@ -197,7 +205,8 @@ hist_p hist_create() {
     // Lock file for reading existing history
 #if defined(OS_WINDOWS)
     OVERLAPPED overlapped = {0};
-    if (!LockFileEx((HANDLE)_get_osfhandle(fd), 0, 0, MAXDWORD, MAXDWORD, &overlapped)) {
+    // On Windows, fs_fopen already returns a HANDLE, not a POSIX fd
+    if (!LockFileEx((HANDLE)fd, 0, 0, MAXDWORD, MAXDWORD, &overlapped)) {
         perror("can't lock history file for reading");
         fs_fclose(fd);
         return NULL;
@@ -217,7 +226,7 @@ hist_p hist_create() {
             perror("can't truncate history file");
 #if defined(OS_WINDOWS)
             OVERLAPPED overlapped_err = {0};
-            UnlockFileEx((HANDLE)_get_osfhandle(fd), 0, MAXDWORD, MAXDWORD, &overlapped_err);
+            UnlockFileEx((HANDLE)fd, 0, MAXDWORD, MAXDWORD, &overlapped_err);
 #else
             flock(fd, LOCK_UN);
 #endif
@@ -234,7 +243,7 @@ hist_p hist_create() {
         perror("can't map history file");
 #if defined(OS_WINDOWS)
         OVERLAPPED overlapped_err = {0};
-        UnlockFileEx((HANDLE)_get_osfhandle(fd), 0, MAXDWORD, MAXDWORD, &overlapped_err);
+        UnlockFileEx((HANDLE)fd, 0, MAXDWORD, MAXDWORD, &overlapped_err);
 #else
         flock(fd, LOCK_UN);
 #endif
@@ -247,7 +256,7 @@ hist_p hist_create() {
         perror("can't allocate memory for history");
 #if defined(OS_WINDOWS)
         OVERLAPPED overlapped_err = {0};
-        UnlockFileEx((HANDLE)_get_osfhandle(fd), 0, MAXDWORD, MAXDWORD, &overlapped_err);
+        UnlockFileEx((HANDLE)fd, 0, MAXDWORD, MAXDWORD, &overlapped_err);
 #else
         flock(fd, LOCK_UN);
 #endif
@@ -273,7 +282,7 @@ hist_p hist_create() {
     // Unlock file after reading
 #if defined(OS_WINDOWS)
     OVERLAPPED overlapped_unlock = {0};
-    UnlockFileEx((HANDLE)_get_osfhandle(fd), 0, MAXDWORD, MAXDWORD, &overlapped_unlock);
+    UnlockFileEx((HANDLE)fd, 0, MAXDWORD, MAXDWORD, &overlapped_unlock);
 #else
     flock(fd, LOCK_UN);
 #endif
@@ -285,7 +294,7 @@ nil_t hist_destroy(hist_p hist) {
     // Lock file exclusively for writing
 #if defined(OS_WINDOWS)
     OVERLAPPED overlapped = {0};
-    if (!LockFileEx((HANDLE)_get_osfhandle(hist->fd), LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped)) {
+    if (!LockFileEx((HANDLE)hist->fd, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped)) {
         perror("can't lock history file for writing");
     }
 #else
@@ -301,7 +310,7 @@ nil_t hist_destroy(hist_p hist) {
     // Unlock file
 #if defined(OS_WINDOWS)
     OVERLAPPED overlapped_unlock = {0};
-    UnlockFileEx((HANDLE)_get_osfhandle(hist->fd), 0, MAXDWORD, MAXDWORD, &overlapped_unlock);
+    UnlockFileEx((HANDLE)hist->fd, 0, MAXDWORD, MAXDWORD, &overlapped_unlock);
 #else
     flock(hist->fd, LOCK_UN);
 #endif

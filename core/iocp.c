@@ -51,11 +51,60 @@
 #include "sys.h"
 #include "chrono.h"
 #include "binary.h"
+#include "ipc.h"
 
 // Link with Ws2_32.lib
 #pragma comment(lib, "Ws2_32.lib")
 // Link with Mswsock.lib
 #pragma comment(lib, "Mswsock.lib")
+
+// ============================================================================
+// Simple circular queue implementation for async message handling
+// ============================================================================
+
+queue_p queue_create(i64_t capacity) {
+    queue_p q = (queue_p)heap_alloc(sizeof(struct queue_t));
+    if (q == NULL)
+        return NULL;
+    q->capacity = capacity;
+    q->head = 0;
+    q->tail = 0;
+    q->count = 0;
+    q->data = (raw_p *)heap_alloc(capacity * sizeof(raw_p));
+    if (q->data == NULL) {
+        heap_free(q);
+        return NULL;
+    }
+    return q;
+}
+
+nil_t queue_free(queue_p queue) {
+    if (queue == NULL)
+        return;
+    if (queue->data != NULL)
+        heap_free(queue->data);
+    heap_free(queue);
+}
+
+nil_t queue_push(queue_p queue, raw_p item) {
+    if (queue == NULL || queue->count >= queue->capacity)
+        return;
+    queue->data[queue->tail] = item;
+    queue->tail = (queue->tail + 1) % queue->capacity;
+    queue->count++;
+}
+
+raw_p queue_pop(queue_p queue) {
+    raw_p item;
+    if (queue == NULL || queue->count == 0)
+        return NULL;
+    item = queue->data[queue->head];
+    queue->head = (queue->head + 1) % queue->capacity;
+    queue->count--;
+    return item;
+}
+
+// ============================================================================
 
 // Global IOCP handle
 HANDLE g_iocp = INVALID_HANDLE_VALUE;
@@ -201,7 +250,7 @@ poll_p poll_init(i64_t port) {
     // Create IOCP
     g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (g_iocp == NULL) {
-        fprintf(stderr, "CreateIoCompletionPort failed: %d\n", GetLastError());
+        fprintf(stderr, "CreateIoCompletionPort failed: %lu\n", GetLastError());
         WSACleanup();
         return NULL;
     }
@@ -235,9 +284,12 @@ poll_p poll_init(i64_t port) {
     __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
     memset(__LISTENER, 0, sizeof(struct listener_t));
 
-    if (poll_accept(poll) == -1) {
-        heap_free(poll);
-        exit_werror();
+    // Only call poll_accept if we have a listening socket
+    if (poll->ipc_fd != -1) {
+        if (poll_accept(poll) == -1) {
+            heap_free(poll);
+            exit_werror();
+        }
     }
 
     __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
@@ -540,17 +592,39 @@ send:
     v = queue_pop(selector->tx.queue);
 
     if (v != NULL) {
+        ipc_header_t *header;
         obj = (obj_p)((i64_t)v & ~(3ll << 61));
         msg_type = (((i64_t)v & (3ll << 61)) >> 61);
-        size = ser_raw(&selector->tx.buf, obj);
-        drop_obj(obj);
-        if (size == -1)
+
+        // Calculate serialization size and allocate buffer
+        size = size_obj(obj);
+        if (size <= 0) {
+            drop_obj(obj);
             return POLL_ERROR;
-        selector->tx.size = size;
+        }
+        selector->tx.buf = heap_alloc(ISIZEOF(struct ipc_header_t) + size);
+        if (selector->tx.buf == NULL) {
+            drop_obj(obj);
+            return POLL_ERROR;
+        }
+
+        // Write header
+        header = (ipc_header_t *)selector->tx.buf;
+        header->prefix = SERDE_PREFIX;
+        header->version = RAYFORCE_VERSION;
+        header->flags = 0x00;
+        header->endian = 0x00;
+        header->msgtype = msg_type;
+        header->size = size;
+
+        // Serialize object after header
+        ser_raw(selector->tx.buf + ISIZEOF(struct ipc_header_t), obj);
+        drop_obj(obj);
+
+        selector->tx.size = ISIZEOF(struct ipc_header_t) + size;
         selector->tx.wsa_buf.buf = (str_p)selector->tx.buf;
         selector->tx.wsa_buf.len = selector->tx.size;
         selector->tx.size = 0;
-        ((ipc_header_t *)selector->tx.buf)->msgtype = msg_type;
         goto send;
     }
 
@@ -559,14 +633,17 @@ send:
 
 obj_p read_obj(selector_p selector) {
     obj_p res;
+    i64_t len;
 
-    res = de_raw(selector->rx.buf, selector->rx.size);
+    // Skip the header and deserialize the payload
+    len = (i64_t)selector->rx.size - ISIZEOF(struct ipc_header_t);
+    res = de_raw(selector->rx.buf + ISIZEOF(struct ipc_header_t), &len);
+
     heap_free(selector->rx.buf);
     selector->rx.buf = NULL;
     selector->rx.size = 0;
     selector->rx.wsa_buf.buf = NULL;
     selector->rx.wsa_buf.len = 0;
-    selector->rx.size = 0;
 
     return res;
 }

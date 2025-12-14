@@ -29,6 +29,37 @@
 #include "util.h"
 #include "log.h"
 
+// Windows uses IOCP implementation in iocp.c for IPC handling
+// This file provides the Unix (epoll/kqueue) implementation
+#if defined(OS_WINDOWS)
+
+// Forward declarations for functions in iocp.c
+obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg);
+obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg);
+
+// Windows stubs - actual implementation is in iocp.c
+i64_t ipc_listen(poll_p poll, i64_t port) {
+    // On Windows, this is handled by poll_init and poll_listen in iocp.c
+    return poll_listen(poll, port);
+}
+
+i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
+    UNUSED(poll);
+    UNUSED(addr);
+    UNUSED(timeout);
+    // Not implemented for Windows - would require IOCP-based client connect
+    return -1;
+}
+
+obj_p ipc_send(poll_p poll, i64_t id, obj_p msg, u8_t msgtype) {
+    if (msgtype == MSG_TYPE_SYNC)
+        return ipc_send_sync(poll, id, msg);
+    else
+        return ipc_send_async(poll, id, msg);
+}
+
+#else  // Unix implementation
+
 // ============================================================================
 // Listener Management
 // ============================================================================
@@ -438,3 +469,5 @@ obj_p ipc_send(poll_p poll, i64_t id, obj_p msg, u8_t msgtype) {
 
     return res;
 }
+
+#endif  // !OS_WINDOWS

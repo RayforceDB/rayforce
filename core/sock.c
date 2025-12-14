@@ -23,8 +23,18 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#if defined(OS_WINDOWS)
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "Ws2_32.lib")
+#else
 #include <fcntl.h>
 #include <netdb.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
 #include "sock.h"
 #include "string.h"
 #include "log.h"
@@ -148,9 +158,9 @@ i64_t sock_accept(i64_t fd) {
     if (acc_fd == INVALID_SOCKET)
         return -1;
     if (sock_set_nonblocking(acc_fd, 1) == SOCKET_ERROR) {
-        code = WSAGetLastError();
+        i32_t wsa_err = WSAGetLastError();
         closesocket(acc_fd);
-        WSASetLastError(code);
+        WSASetLastError(wsa_err);
         return -1;
     }
 
