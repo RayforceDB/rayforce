@@ -14,10 +14,10 @@ DEBUG_CFLAGS = -Wall -Wextra -std=$(STD) -g -O0 -DDEBUG -D_WINSOCK_DEPRECATED_NO
 RELEASE_CFLAGS = -Wall -Wextra -std=$(STD) -O3 -DNDEBUG -D_WINSOCK_DEPRECATED_NO_WARNINGS -D_CRT_SECURE_NO_WARNINGS \
  -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -fno-math-errno
 LIBS = -lws2_32 -lmswsock -lkernel32
-DEBUG_LDFLAGS =
-RELEASE_LDFLAGS =
+DEBUG_LDFLAGS = -fuse-ld=lld
+RELEASE_LDFLAGS = -fuse-ld=lld
 LIBNAME = rayforce.dll
-TARGET_EXT = .exe
+TARGET = rayforce.exe
 endif
 
 ifeq ($(OS),linux)
@@ -31,6 +31,7 @@ RELEASE_LDFLAGS = -Wl,--strip-all -Wl,--gc-sections -Wl,--as-needed\
  -rdynamic
 DEBUG_LDFLAGS = -rdynamic
 LIBNAME = rayforce.so
+TARGET = rayforce
 endif
 
 ifeq ($(OS),darwin)
@@ -40,6 +41,7 @@ RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native
  -flax-vector-conversions -fno-math-errno
 LIBS = -lm -ldl -lpthread
 LIBNAME = librayforce.dylib
+TARGET = rayforce
 endif
 
 CORE_OBJECTS = core/poll.o core/ipc.o core/repl.o core/runtime.o core/sys.o core/os.o core/proc.o core/fs.o core/mmap.o core/serde.o\
@@ -53,7 +55,6 @@ CORE_OBJECTS = core/poll.o core/ipc.o core/repl.o core/runtime.o core/sys.o core
 APP_OBJECTS = app/main.o
 TESTS_OBJECTS = tests/main.o
 BENCH_OBJECTS = bench/main.o
-TARGET = rayforce
 CFLAGS = $(RELEASE_CFLAGS)
 GIT_HASH := $(shell git rev-parse HEAD 2>/dev/null || echo "unknown")
 
@@ -157,6 +158,7 @@ clean:
 	-rm -f $(TARGET).js
 	-rm -f $(TARGET).wasm
 	-rm -f $(TARGET)
+	-rm -f $(TARGET).exe
 	-rm -f tests/*.gcno tests/*.gcda tests/*.gcov
 	-rm -f core/*.gcno core/*.gcda core/*.gcov
 	-rm -f coverage.info
