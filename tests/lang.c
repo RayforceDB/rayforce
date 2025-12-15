@@ -2492,6 +2492,18 @@ test_result_t test_lang_math() {
 
     TEST_ASSERT_EQ("((fn [x y] (+ x y)) 1 [2.3 4])", "[3.3 5.0]");
 
+    // ========== TYPE CONVERSION TESTS (I64 * F64 -> F64) ==========
+    // Test that multiplying integer vector by float scalar returns correct float values
+    // (regression test for buffer reuse type mismatch bug)
+    TEST_ASSERT_EQ("(* [75000 65000 85000] 1.1)", "[82500.0 71500.0 93500.0]");
+    TEST_ASSERT_EQ("(* [100 200 300] 1.5)", "[150.0 300.0 450.0]");
+    TEST_ASSERT_EQ("(* 1.1 [75000 65000 85000])", "[82500.0 71500.0 93500.0]");
+    // Test I32 * F64 -> F64
+    TEST_ASSERT_EQ("(* [75000i 65000i 85000i] 1.1)", "[82500.0 71500.0 93500.0]");
+    // Test division with type conversion
+    TEST_ASSERT_EQ("(/ [100 200 300] 3.0)", "[33 66 100]");
+    TEST_ASSERT_EQ("(% [100 200 300] 3.0)", "[1.0 2.0 0.0]");
+
     PASS();
 }
 
@@ -3001,6 +3013,44 @@ test_result_t test_lang_update() {
         "(set t (table [ID Name Value] (list [1] [alice] [10.0])))"
         "(upsert t 1 (dict [ID Unknown Value] (list 2 'x 20.0)))",
         "not found in table");
+
+    // ========== UPDATE WITH FLOAT MULTIPLICATION TESTS ==========
+    // (regression tests for type mismatch bug when multiplying I64 by F64 in update)
+
+    // Test 38: Update integer column with float multiplication and where clause
+    TEST_ASSERT_EQ(
+        "(set employees (table [name dept salary]"
+        "    (list"
+        "      (list \"Alice\" \"Bob\" \"Charlie\")"
+        "      ['IT 'HR 'IT]"
+        "      [75000 65000 85000])))"
+        "(set employees (update {"
+        "   salary: (* salary 1.1)"
+        "   from: employees"
+        "   where: (> salary 70000)}))"
+        "employees",
+        "(table [name dept salary] (list (list \"Alice\" \"Bob\" \"Charlie\") [IT HR IT] [82500 65000 93500]))");
+
+    // Test 39: Update integer column with float multiplication (all rows - column becomes F64)
+    TEST_ASSERT_EQ(
+        "(set t (table [id val] (list [1 2 3] [100 200 300])))"
+        "(set t (update {val: (* val 1.5) from: t}))"
+        "t",
+        "(table [id val] (list [1 2 3] [150.0 300.0 450.0]))");
+
+    // Test 40: Update integer column with float multiplication and where clause (keeps I64)
+    TEST_ASSERT_EQ(
+        "(set t (table [id val] (list [1 2 3] [100 200 300])))"
+        "(set t (update {val: (* val 1.5) from: t where: (> val 150)}))"
+        "t",
+        "(table [id val] (list [1 2 3] [100 300 450]))");
+
+    // Test 41: Update I32 column with float multiplication and where clause (keeps I32)
+    TEST_ASSERT_EQ(
+        "(set t (table [id val] (list [1i 2i 3i] [100i 200i 300i])))"
+        "(set t (update {val: (* val 1.5) from: t where: (> val 150i)}))"
+        "t",
+        "(table [id val] (list [1i 2i 3i] [100i 300i 450i]))");
 
     PASS();
 }

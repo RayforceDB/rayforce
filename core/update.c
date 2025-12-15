@@ -79,19 +79,31 @@ obj_p __commit(obj_p src, obj_p obj, obj_p *val) {
 }
 
 b8_t __suitable_types(obj_p x, obj_p y) {
-    i8_t yt;
+    i8_t xt, yt;
 
+    xt = x->type;
     if (y->type < 0)
         yt = -y->type;
     else
         yt = y->type;
 
-    if ((x->type != TYPE_LIST) && (x->type != TYPE_MAPLIST) && (x->type != yt) &&
-        (x->type != TYPE_ENUM && yt != TYPE_SYMBOL)) {
-        return B8_FALSE;
-    }
+    // Exact type match
+    if (xt == yt)
+        return B8_TRUE;
 
-    return B8_TRUE;
+    // Allow LIST and MAPLIST to accept any type
+    if (xt == TYPE_LIST || xt == TYPE_MAPLIST)
+        return B8_TRUE;
+
+    // Allow ENUM to accept SYMBOL
+    if (xt == TYPE_ENUM && yt == TYPE_SYMBOL)
+        return B8_TRUE;
+
+    // Allow numeric type conversions (F64 -> I64, F64 -> I32, etc.)
+    if ((xt == TYPE_I64 || xt == TYPE_I32) && yt == TYPE_F64)
+        return B8_TRUE;
+
+    return B8_FALSE;
 }
 
 b8_t __suitable_lengths(obj_p x, obj_p y) {
