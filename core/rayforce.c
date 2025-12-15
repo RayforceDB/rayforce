@@ -2626,6 +2626,21 @@ obj_p cast_obj(i8_t type, obj_p obj) {
             for (i = 0; i < l; i++)
                 AS_F64(res)[i] = (f64_t)AS_I64(obj)[i];
             return res;
+
+        // SYMBOL vector conversion from I64
+        case MTYPE2(TYPE_SYMBOL, TYPE_I64):
+            l = obj->len;
+            res = vector(TYPE_SYMBOL, l);
+            for (i = 0; i < l; i++) {
+                obj_p sym;
+                v = str_fmt(-1, "%lld", AS_I64(obj)[i]);
+                sym = symbol(AS_C8(v), v->len);
+                AS_I64(res)[i] = sym->i64;
+                drop_obj(sym);
+                drop_obj(v);
+            }
+            return res;
+
         case MTYPE2(-TYPE_GUID, TYPE_C8):
             res = guid(NULL);
 
