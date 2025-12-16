@@ -241,6 +241,11 @@ i64_t mmap_sync(raw_p addr, i64_t size) {
 
 raw_p mmap_reserve(raw_p addr, i64_t size) {
     (void)addr;
+    // WASM can't reserve 64GB like native platforms
+    // Allocate a smaller fixed pool for string interning
+    if (size >= (RAY_PAGE_SIZE * 1024ull * 1024ull)) {
+        return malloc(4 * 1024 * 1024);  // 4MB for string pool
+    }
     return malloc(size);
 }
 
