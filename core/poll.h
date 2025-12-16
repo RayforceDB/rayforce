@@ -126,6 +126,16 @@ typedef enum poll_events_t {
     POLL_EVENT_RDHUP = EV_EOF,
     POLL_EVENT_EDGE = 0,
 } poll_events_t;
+#elif defined(OS_WASM)
+// WASM stub - poll is not supported in browser environment
+typedef enum poll_events_t {
+    POLL_EVENT_READ = 1,
+    POLL_EVENT_WRITE = 2,
+    POLL_EVENT_ERROR = 4,
+    POLL_EVENT_HUP = 8,
+    POLL_EVENT_RDHUP = 16,
+    POLL_EVENT_EDGE = 0,
+} poll_events_t;
 #endif
 
 typedef struct selector_t {

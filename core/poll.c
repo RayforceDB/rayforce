@@ -32,8 +32,12 @@
 #elif defined(OS_LINUX)
 #include "epoll.c"
 #elif defined(OS_WASM)
+// WASM provides all poll functions as stubs - no common code needed
 #include "wasm.c"
 #endif
+
+// Common poll functions - not needed for WASM (wasm.c provides stubs)
+#if !defined(OS_WASM)
 
 RAYASSERT(sizeof(struct poll_buffer_t) == 16, poll_h)
 
@@ -146,3 +150,5 @@ nil_t poll_set_usr_fd(i64_t fd) {
     drop_obj(v);
     drop_obj(s);
 }
+
+#endif  // !defined(OS_WASM)

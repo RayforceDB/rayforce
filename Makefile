@@ -30,7 +30,6 @@ LIBS = -lm -ldl -lpthread
 LIBNAME = librayforce.dylib
 endif
 
-# -mavx2 -mfma -mpclmul -mbmi2 -ffast-math 
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
  -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
  -flax-vector-conversions -fno-math-errno
@@ -124,16 +123,6 @@ coverage: $(TESTS_OBJECTS) coverage-lib
 coverage-lib: CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 --coverage -fprofile-update=atomic
 coverage-lib: $(CORE_OBJECTS)
 	$(AR) rc lib$(TARGET).a $(CORE_OBJECTS)
-
-wasm: CFLAGS = -fPIC -Wall -std=c17 -O3 -msimd128 -fassociative-math -ftree-vectorize -fno-math-errno -funsafe-math-optimizations -ffinite-math-only -funroll-loops -DSYS_MALLOC
-wasm: CC = emcc 
-wasm: AR = emar
-wasm: $(APP_OBJECTS) lib
-	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).js $(CORE_OBJECTS) \
-	-s "EXPORTED_FUNCTIONS=['_main', '_version', '_null', '_drop_obj', '_clone_obj', '_eval_str', '_obj_fmt', '_strof_obj']" \
-	-s "EXPORTED_RUNTIME_METHODS=['ccall', 'cwrap', 'FS']" -s ALLOW_MEMORY_GROWTH=1 \
-	--preload-file examples@/examples \
-	-L. -l$(TARGET) $(LIBS)
 
 shared: CFLAGS = $(RELEASE_CFLAGS)
 shared: LDFLAGS = $(RELEASE_LDFLAGS)

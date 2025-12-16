@@ -246,7 +246,41 @@ i64_t fs_dopen(lit_p path) { return fs_dopen_js(path); }
 
 i64_t fs_dclose(i64_t fd) { return closedir((DIR *)fd); }
 
-i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], i64_t len) { return -1; }
+i64_t fs_file_extend(i64_t fd, i64_t size) {
+    if (lseek(fd, size - 1, SEEK_SET) == -1)
+        return -1;
+
+    if (write(fd, "", 1) == -1)
+        return -1;
+
+    return size;
+}
+
+obj_p fs_read_dir(lit_p path) {
+    DIR *dir;
+    struct dirent *ent;
+    obj_p lst = LIST(0);
+
+    if ((dir = opendir(path)) != NULL) {
+        while ((ent = readdir(dir)) != NULL) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                continue;
+
+            push_obj(&lst, string_from_str(ent->d_name, strlen(ent->d_name)));
+        }
+
+        closedir(dir);
+    }
+
+    return lst;
+}
+
+i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], i64_t len) { 
+    (void)fd;
+    (void)buf;
+    (void)len;
+    return -1; 
+}
 
 #else
 

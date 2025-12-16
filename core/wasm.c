@@ -21,54 +21,129 @@
  *   SOFTWARE.
  */
 
-#include <emscripten.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include "format.h"
-#include "util.h"
-#include "string.h"
-#include "poll.h"
+/*
+ * WASM platform-specific implementations.
+ * 
+ * WASM doesn't use poll/epoll/kqueue - it has its own event loop.
+ * This file provides stub implementations for all poll functions.
+ *
+ * Note: The main entry point should be provided by the consuming project
+ * (e.g., rayforce-wasm/src/wasm_main.c), not here.
+ */
+
 #include "heap.h"
 
-#define __ABOUT \
-    "\
-  %s%sRayforceDB: %d.%d %s\n\
-  WASM target\n\
-  Started from: %s\n\
-  Documentation: https://rayforcedb.com/\n\
-  Github: https://github.com/singaraiona/rayforce%s\n"
+// ============================================================================
+// Poll stub implementations - WASM doesn't use poll
+// ============================================================================
 
-// Declare rayforce_ready callback on js side
-EM_JS(nil_t, js_rayforce_ready, (str_p text), { Module.rayforce_ready(UTF8ToC8(text)); });
-
-poll_p poll_init(i64_t port) {
+poll_p poll_create() {
     poll_p poll = (poll_p)heap_alloc(sizeof(struct poll_t));
+    poll->fd = -1;
     poll->code = NULL_I64;
-
+    poll->selectors = NULL;
+    poll->timers = NULL;
     return poll;
 }
 
-nil_t poll_destroy(poll_p poll) { heap_free(poll); }
+nil_t poll_destroy(poll_p poll) { 
+    if (poll) heap_free(poll); 
+}
 
 i64_t poll_run(poll_p poll) {
     UNUSED(poll);
     return 0;
 }
 
-i64_t poll_register(poll_p poll, i64_t fd, u8_t version) {
+i64_t poll_register(poll_p poll, poll_registry_p registry) {
     UNUSED(poll);
-    UNUSED(fd);
-    UNUSED(version);
+    UNUSED(registry);
     return 0;
 }
 
-nil_t poll_deregister(poll_p poll, i64_t id) {
+i64_t poll_deregister(poll_p poll, i64_t id) {
     UNUSED(poll);
     UNUSED(id);
+    return 0;
 }
+
+selector_p poll_get_selector(poll_p poll, i64_t id) {
+    UNUSED(poll);
+    UNUSED(id);
+    return NULL;
+}
+
+poll_buffer_p poll_buf_create(i64_t size) {
+    UNUSED(size);
+    return NULL;
+}
+
+nil_t poll_buf_destroy(poll_buffer_p buf) {
+    UNUSED(buf);
+}
+
+i64_t poll_rx_buf_request(poll_p poll, selector_p selector, i64_t size) {
+    UNUSED(poll);
+    UNUSED(selector);
+    UNUSED(size);
+    return 0;
+}
+
+i64_t poll_rx_buf_extend(poll_p poll, selector_p selector, i64_t size) {
+    UNUSED(poll);
+    UNUSED(selector);
+    UNUSED(size);
+    return 0;
+}
+
+i64_t poll_rx_buf_release(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+    UNUSED(selector);
+    return 0;
+}
+
+i64_t poll_rx_buf_reset(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+    UNUSED(selector);
+    return 0;
+}
+
+i64_t poll_send_buf(poll_p poll, selector_p selector, poll_buffer_p buf) {
+    UNUSED(poll);
+    UNUSED(selector);
+    UNUSED(buf);
+    return 0;
+}
+
+i64_t poll_recv(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+    UNUSED(selector);
+    return 0;
+}
+
+i64_t poll_send(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+    UNUSED(selector);
+    return 0;
+}
+
+option_t poll_block_on(poll_p poll, selector_p selector) {
+    UNUSED(poll);
+    UNUSED(selector);
+    return option_none();
+}
+
+nil_t poll_exit(poll_p poll, i64_t code) {
+    if (poll) poll->code = code;
+}
+
+nil_t poll_set_usr_fd(i64_t fd) {
+    UNUSED(fd);
+}
+
+// ============================================================================
+// IPC stub implementations - WASM doesn't support direct socket IPC
+// ============================================================================
 
 obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
     UNUSED(poll);
@@ -82,51 +157,4 @@ obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg) {
     UNUSED(id);
     UNUSED(msg);
     return NULL_OBJ;
-}
-
-nil_t list_examples(obj_p *dst) {
-    DIR *dir;
-    struct dirent *entry;
-
-    str_fmt_into(dst, -1, "\n  -- Here is the list of examples:\n");
-
-    // Attempt to open the directory
-    dir = opendir("examples/");
-    if (dir == NULL)
-        return;
-
-    // Read each entry in the directory
-    while ((entry = readdir(dir)) != NULL) {
-        if (strncmp(entry->d_name, ".", 1) == 0 || strncmp(entry->d_name, "..", 2) == 0)
-            continue;
-        str_fmt_into(dst, -1, "  |- %s\n", entry->d_name);
-    }
-
-    // Close the directory
-    closedir(dir);
-
-    str_fmt_into(dst, -1, "  -- To try an example, type: (load \"examples/<example_name>)\"\n");
-
-    return;
-}
-
-EMSCRIPTEN_KEEPALIVE str_p strof_obj(obj_p obj) { return AS_C8(obj); }
-
-EMSCRIPTEN_KEEPALIVE i32_t main(i32_t argc, str_p argv[]) {
-    i32_t code;
-    sys_info_t info = sys_info(1);
-    obj_p fmt = NULL_OBJ;
-
-    str_fmt_into(&fmt, -1, __ABOUT, BOLD, YELLOW, info.major_version, info.minor_version, info.build_date, info.cwd,
-                 RESET);
-
-    list_examples(&fmt);
-
-    atexit(runtime_destroy);
-    runtime_create(0, NULL);
-    code = runtime_run();
-    js_rayforce_ready(AS_C8(fmt));
-    drop_obj(fmt);
-
-    return code;
 }

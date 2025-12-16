@@ -94,7 +94,17 @@
 #elif defined(__EMSCRIPTEN__)
 #define OS_WASM
 #define RAY_PAGE_SIZE 65536
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <string.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/time.h>
+#include <errno.h>
+#include <dirent.h>
 #include <emscripten.h>
 #else
 #error "Unsupported platform"
