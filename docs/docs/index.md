@@ -22,8 +22,8 @@ The high-performance columnar database engineered for lightning-fast analytics a
 </div>
 
 <div class="hero-buttons">
-<a href="#ecosystem" class="md-button">Ecosystem</a>
-<a href="content/get-started/overview.html" class="md-button md-button--primary">Get Started</a>
+<a href="https://wasm.rayforcedb.com/" class="md-button md-button--primary" target="_blank">Try it Now</a>
+<a href="content/get-started/overview.html" class="md-button">Get Started</a>
 <a href="https://github.com/singaraiona/rayforce" class="md-button">Get it on GitHub</a>
 </div>
 
@@ -302,9 +302,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
     ---
 
-    Run RayforceDB in the browser. Compile to WASM for universal web deployment and edge computing scenarios.
+    Run RayforceDB directly in your browser. Try the interactive WASM playground with zero installation required.
 
-    [:octicons-arrow-right-24: WASM Bindings](https://github.com/RayforceDB/rayforce-wasm)
+    [:octicons-arrow-right-24: Try Playground](https://wasm.rayforcedb.com/)
 
 - :material-language-c:{ .lg .middle .feature-icon } **C Plugin System**
 
@@ -312,7 +312,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
     Extend functionality with dynamic C plugins. Load custom functions and modules at runtime for maximum flexibility.
 
-    [:octicons-arrow-right-24: Load Function](content/documentation/REPL.html#load-function)
+    [:octicons-arrow-right-24: Load Function](content/documentation/REPL.md#load-function)
 
 </div>
 
