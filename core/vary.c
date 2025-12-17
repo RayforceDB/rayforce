@@ -195,11 +195,6 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
             if (x[1]->type != -TYPE_SYMBOL)
                 THROW(ERR_TYPE, "get parted: expected symbol as 2nd argument, got %s", type_name(x[1]->type));
 
-            // Try to get symfile
-            res = io_get_symfile(x[0]);
-            if (IS_ERR(res))
-                return res;
-
             // Read directories structure
             path = cstring_from_obj(x[0]);
             dir = fs_read_dir(AS_C8(path));
@@ -266,6 +261,23 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
             }
 
             wide = AS_LIST(t1)[1]->len;
+
+            // Load symfile only if there are enum columns and sym is not already resolved
+            if (resolve(SYMBOL_SYM) == NULL) {
+                for (i = 0; i < wide; i++) {
+                    if (AS_LIST(AS_LIST(t1)[1])[i]->type == TYPE_ENUM) {
+                        v = io_get_symfile(x[0]);
+                        if (IS_ERR(v)) {
+                            drop_obj(gcol);
+                            drop_obj(res);
+                            drop_obj(t1);
+                            drop_obj(path);
+                            return v;
+                        }
+                        break;
+                    }
+                }
+            }
 
             if (wide == 0) {
                 drop_obj(gcol);
