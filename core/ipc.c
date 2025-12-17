@@ -28,6 +28,7 @@
 #include "string.h"
 #include "util.h"
 #include "log.h"
+#include "heap.h"
 
 // Windows uses IOCP implementation in iocp.c for IPC handling
 // This file provides the Unix (epoll/kqueue) implementation
@@ -44,11 +45,77 @@ i64_t ipc_listen(poll_p poll, i64_t port) {
 }
 
 i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
-    UNUSED(poll);
-    UNUSED(addr);
-    UNUSED(timeout);
-    // Not implemented for Windows - would require IOCP-based client connect
-    return -1;
+    i64_t fd, id;
+    u8_t buf[2] = {RAYFORCE_VERSION, 0x00};
+    i64_t received = 0;
+
+    fprintf(stderr, "[DEBUG] ipc_open: connecting to %s:%lld\n", addr->ip, addr->port);
+    fflush(stderr);
+
+    // Open a blocking TCP connection
+    fd = sock_open(addr, timeout);
+    if (fd == -1) {
+        fprintf(stderr, "[DEBUG] ipc_open: sock_open failed\n");
+        fflush(stderr);
+        return -1;
+    }
+    fprintf(stderr, "[DEBUG] ipc_open: connected, fd=%lld\n", fd);
+    fflush(stderr);
+
+    // Send handshake (version + null terminator)
+    fprintf(stderr, "[DEBUG] ipc_open: sending handshake\n");
+    fflush(stderr);
+    if (sock_send(fd, buf, 2) == -1) {
+        fprintf(stderr, "[DEBUG] ipc_open: sock_send failed\n");
+        fflush(stderr);
+        sock_close(fd);
+        return -1;
+    }
+    fprintf(stderr, "[DEBUG] ipc_open: handshake sent\n");
+    fflush(stderr);
+
+    // Receive handshake response (version + null terminator)
+    // Server sends 2 bytes, so we need to read until we get both
+    fprintf(stderr, "[DEBUG] ipc_open: waiting for response\n");
+    fflush(stderr);
+    while (received < 2) {
+        i64_t sz = sock_recv(fd, buf + received, 2 - received);
+        fprintf(stderr, "[DEBUG] ipc_open: sock_recv returned %lld\n", sz);
+        fflush(stderr);
+        if (sz <= 0) {
+            fprintf(stderr, "[DEBUG] ipc_open: sock_recv failed or closed\n");
+            fflush(stderr);
+            sock_close(fd);
+            return -1;
+        }
+        received += sz;
+    }
+    fprintf(stderr, "[DEBUG] ipc_open: response received, version=%d\n", buf[0]);
+    fflush(stderr);
+
+    // Validate response - should end with null terminator
+    if (buf[1] != 0x00) {
+        fprintf(stderr, "[DEBUG] ipc_open: invalid response\n");
+        fflush(stderr);
+        sock_close(fd);
+        return -1;
+    }
+
+    // Set socket to non-blocking for IOCP
+    sock_set_nonblocking(fd, B8_TRUE);
+
+    // Register the socket with IOCP - pass the received version
+    id = poll_register(poll, fd, buf[0]);
+    if (id == -1) {
+        fprintf(stderr, "[DEBUG] ipc_open: poll_register failed\n");
+        fflush(stderr);
+        sock_close(fd);
+        return -1;
+    }
+    fprintf(stderr, "[DEBUG] ipc_open: registered, id=%lld\n", id);
+    fflush(stderr);
+
+    return id;
 }
 
 obj_p ipc_send(poll_p poll, i64_t id, obj_p msg, u8_t msgtype) {

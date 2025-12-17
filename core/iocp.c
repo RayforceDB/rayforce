@@ -197,8 +197,16 @@ i64_t poll_accept(poll_p poll) {
     SOCKET sock_fd = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
     b8_t success;
 
-    if (sock_fd == INVALID_SOCKET)
+    fprintf(stderr, "[SERVER poll_accept] Creating accept socket...\n");
+    fflush(stderr);
+
+    if (sock_fd == INVALID_SOCKET) {
+        fprintf(stderr, "[SERVER poll_accept] WSASocket failed: %d\n", WSAGetLastError());
+        fflush(stderr);
         return -1;
+    }
+    fprintf(stderr, "[SERVER poll_accept] Accept socket created: %lld\n", (i64_t)sock_fd);
+    fflush(stderr);
 
     // Ensure the accept socket is associated with the IOCP.
     // CreateIoCompletionPort((HANDLE)sock_fd, (HANDLE)poll->poll_fd, 0, 0);
@@ -212,20 +220,32 @@ i64_t poll_accept(poll_p poll) {
         return -1;
     }
 
+    fprintf(stderr, "[SERVER poll_accept] Calling AcceptEx on listen_fd=%lld accept_fd=%lld\n", 
+            (i64_t)poll->ipc_fd, (i64_t)sock_fd);
+    fflush(stderr);
+    
     success = lpfnAcceptEx(poll->ipc_fd, sock_fd, __LISTENER->buf, 0, sizeof(SOCKADDR_IN) + 16,
                            sizeof(SOCKADDR_IN) + 16, &__LISTENER->dwBytes, &__LISTENER->overlapped);
     if (!success) {
         code = WSAGetLastError();
+        fprintf(stderr, "[SERVER poll_accept] AcceptEx returned FALSE, error=%d\n", code);
+        fflush(stderr);
         if (code != ERROR_IO_PENDING) {
-            code = WSAGetLastError();
             closesocket(sock_fd);
             WSASetLastError(code);
             return -1;
         }
+        fprintf(stderr, "[SERVER poll_accept] AcceptEx pending (ERROR_IO_PENDING)\n");
+        fflush(stderr);
+    } else {
+        fprintf(stderr, "[SERVER poll_accept] AcceptEx returned TRUE (immediate completion)\n");
+        fflush(stderr);
     }
 
     __LISTENER->hAccepted = sock_fd;
 
+    fprintf(stderr, "[SERVER poll_accept] Done, hAccepted=%lld\n", (i64_t)sock_fd);
+    fflush(stderr);
     return (i64_t)sock_fd;
 }
 
@@ -284,12 +304,24 @@ poll_p poll_init(i64_t port) {
     __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
     memset(__LISTENER, 0, sizeof(struct listener_t));
 
+    fprintf(stderr, "[SERVER poll_init] __LISTENER allocated, checking ipc_fd=%lld\n", poll->ipc_fd);
+    fflush(stderr);
+
     // Only call poll_accept if we have a listening socket
     if (poll->ipc_fd != -1) {
+        fprintf(stderr, "[SERVER poll_init] Calling poll_accept\n");
+        fflush(stderr);
         if (poll_accept(poll) == -1) {
+            fprintf(stderr, "[SERVER poll_init] poll_accept failed\n");
+            fflush(stderr);
             heap_free(poll);
             exit_werror();
         }
+        fprintf(stderr, "[SERVER poll_init] poll_accept succeeded\n");
+        fflush(stderr);
+    } else {
+        fprintf(stderr, "[SERVER poll_init] Skipping poll_accept (no listen socket)\n");
+        fflush(stderr);
     }
 
     __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
@@ -348,13 +380,40 @@ i64_t poll_listen(poll_p poll, i64_t port) {
         return -1;
     }
 
-    // Associate the listen socket with the IOCP
-    if (CreateIoCompletionPort((HANDLE)listen_fd, (HANDLE)poll->poll_fd, 0, 0) == NULL) {
+    poll->ipc_fd = listen_fd;
+    fprintf(stderr, "[SERVER poll_listen] Listen socket created: %lld\n", (i64_t)listen_fd);
+    fflush(stderr);
+
+    // Associate the listen socket with the IOCP using ipc_fd as the key
+    fprintf(stderr, "[SERVER poll_listen] Associating listen socket with IOCP, key=%lld\n", (i64_t)poll->ipc_fd);
+    fflush(stderr);
+    if (CreateIoCompletionPort((HANDLE)listen_fd, (HANDLE)poll->poll_fd, (ULONG_PTR)poll->ipc_fd, 0) == NULL) {
+        fprintf(stderr, "[SERVER poll_listen] CreateIoCompletionPort failed: %lu\n", GetLastError());
+        fflush(stderr);
         closesocket(listen_fd);
+        poll->ipc_fd = -1;
+        return -1;
+    }
+    fprintf(stderr, "[SERVER poll_listen] IOCP association successful\n");
+    fflush(stderr);
+
+    // Initialize listener structure if not already done and start accepting
+    if (__LISTENER == NULL) {
+        __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
+        memset(__LISTENER, 0, sizeof(struct listener_t));
+    }
+
+    // Start accepting connections
+    fprintf(stderr, "[SERVER poll_listen] Starting poll_accept\n");
+    fflush(stderr);
+    if (poll_accept(poll) == -1) {
+        fprintf(stderr, "[SERVER poll_listen] poll_accept failed\n");
+        fflush(stderr);
+        closesocket(listen_fd);
+        poll->ipc_fd = -1;
         return -1;
     }
 
-    poll->ipc_fd = listen_fd;
     return listen_fd;
 }
 
@@ -460,15 +519,28 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
     u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
     ipc_header_t *header;
 
+    fprintf(stderr, "[SERVER _recv] version=%d rx.size=%lu wsa_buf.len=%lu\n", 
+            selector->version, (unsigned long)selector->rx.size, (unsigned long)selector->rx.wsa_buf.len);
+    fflush(stderr);
+
     // wait for handshake
     while (selector->version == 0) {
+        fprintf(stderr, "[SERVER _recv] handshake loop: rx.size=%lu\n", (unsigned long)selector->rx.size);
+        fflush(stderr);
+        
         // malformed handshake
         if ((selector->rx.size == 0) ||
-            (selector->rx.wsa_buf.len == sizeof(struct ipc_header_t) && selector->rx.size == 1))
+            (selector->rx.wsa_buf.len == sizeof(struct ipc_header_t) && selector->rx.size == 1)) {
+            fprintf(stderr, "[SERVER _recv] malformed handshake!\n");
+            fflush(stderr);
             return POLL_ERROR;
+        }
 
         // incomplete handshake
         if (selector->rx.wsa_buf.buf[selector->rx.size - 1] != '\0') {
+            fprintf(stderr, "[SERVER _recv] incomplete handshake, last byte=0x%02x\n", 
+                    (unsigned char)selector->rx.wsa_buf.buf[selector->rx.size - 1]);
+            fflush(stderr);
             selector->rx.wsa_buf.len = selector->rx.wsa_buf.len - selector->rx.size;
             if (selector->rx.wsa_buf.len == 0) {
                 size = selector->rx.size;
@@ -485,12 +557,19 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
             continue;
         }
 
+        fprintf(stderr, "[SERVER _recv] handshake complete, extracting version\n");
+        fflush(stderr);
         selector->version = selector->rx.wsa_buf.buf[selector->rx.size - 2];
 
         // malformed version
-        if (selector->version == 0)
+        if (selector->version == 0) {
+            fprintf(stderr, "[SERVER _recv] malformed version (0)\n");
+            fflush(stderr);
             return POLL_ERROR;
+        }
 
+        fprintf(stderr, "[SERVER _recv] version=%d, sending response\n", selector->version);
+        fflush(stderr);
         selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
         selector->rx.wsa_buf.len = sizeof(struct ipc_header_t);
         selector->rx.size = 0;
@@ -499,12 +578,16 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
         size = 0;
         while (size < (i64_t)sizeof(handshake)) {
             sz = sock_send(selector->fd, &handshake[size], sizeof(handshake) - size);
+            fprintf(stderr, "[SERVER _recv] sock_send returned %lld\n", sz);
+            fflush(stderr);
 
             if (sz == -1)
                 return POLL_ERROR;
 
             size += sz;
         }
+        fprintf(stderr, "[SERVER _recv] handshake response sent\n");
+        fflush(stderr);
     }
 
     if (selector->rx.buf == NULL) {
@@ -686,14 +769,33 @@ i64_t poll_run(poll_p poll) {
 
     term_prompt(poll->term);
 
+    fprintf(stderr, "[SERVER] Entering poll loop, ipc_fd=%lld\n", poll->ipc_fd);
+    fflush(stderr);
+
     while (poll->code == NULL_I64) {
         success = GetQueuedCompletionStatusEx(hPollFd, events, MAX_IOCP_RESULTS, &num, INFINITE,
                                               B8_TRUE  // set this to B8_TRUE if you want to return on alertable wait
         );
+        
+        if (!success) {
+            DWORD err = GetLastError();
+            fprintf(stderr, "[SERVER] GetQueuedCompletionStatusEx failed: %lu\n", err);
+            fflush(stderr);
+            if (err == WAIT_IO_COMPLETION) {
+                continue;  // alertable wait interrupted, just continue
+            }
+        }
+        
+        fprintf(stderr, "[SERVER] Got %lu IOCP events, success=%d\n", (unsigned long)num, success);
+        fflush(stderr);
+        
         // Handle IOCP events
         if (success) {
             for (i = 0; i < num; ++i) {
                 key = events[i].lpCompletionKey;
+                fprintf(stderr, "[SERVER] Event %lu: key=%lld (ipc_fd=%lld, STDIN=%llu)\n", 
+                        (unsigned long)i, key, poll->ipc_fd, (unsigned long long)STDIN_WAKER_ID);
+                fflush(stderr);
                 size = events[i].dwNumberOfBytesTransferred;
                 overlapped = events[i].lpOverlapped;
 
@@ -724,14 +826,23 @@ i64_t poll_run(poll_p poll) {
                         break;
 
                     default:
+                        fprintf(stderr, "[SERVER DEBUG] IOCP event: key=%lld ipc_fd=%lld size=%lu\n", 
+                                key, poll->ipc_fd, (unsigned long)size);
+                        fflush(stderr);
                         // Accept new connection
                         if (key == poll->ipc_fd) {
+                            fprintf(stderr, "[SERVER DEBUG] Accept event! hAccepted=%lld\n", (i64_t)__LISTENER->hAccepted);
+                            fflush(stderr);
                             hAccepted = __LISTENER->hAccepted;
 
                             if (hAccepted != INVALID_SOCKET) {
                                 idx = poll_register(poll, hAccepted, 0);
+                                fprintf(stderr, "[SERVER DEBUG] Registered, idx=%lld\n", idx);
+                                fflush(stderr);
                                 selector = (selector_p)freelist_get(poll->selectors, idx - SELECTOR_ID_OFFSET);
                                 poll_result = _recv_initiate(poll, selector);
+                                fprintf(stderr, "[SERVER DEBUG] _recv_initiate returned %lld\n", poll_result);
+                                fflush(stderr);
 
                                 if (poll_result == POLL_ERROR)
                                     poll_deregister(poll, selector->id);
