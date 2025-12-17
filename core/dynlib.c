@@ -31,16 +31,16 @@
 
 #if defined(OS_WINDOWS)
 
-obj_p dynlib_loadfn(str_p path, str_p func, i64_t nargs) {
+obj_p dynlib_loadfn(obj_p path, obj_p func, i64_t nargs) {
     HMODULE handle;
     FARPROC dsym;
     obj_p fn;
 
-    handle = LoadLibrary(path);
+    handle = LoadLibrary(AS_C8(path));
     if (!handle)
         THROW(ERR_SYS, "Failed to load shared library: %d", GetLastError());
 
-    dsym = GetProcAddress(handle, func);
+    dsym = GetProcAddress(handle, AS_C8(func));
     if (!dsym)
         THROW(ERR_SYS, "Failed to load symbol from shared library: %d", GetLastError());
 
@@ -207,7 +207,7 @@ obj_p ray_loadfn(obj_p *args, i64_t n) {
     path = cstring_from_str(AS_C8(args[0]), args[0]->len);
     func = cstring_from_str(AS_C8(args[1]), args[1]->len);
 
-    res = dynlib_loadfn(AS_C8(path), AS_C8(func), args[2]->i64);
+    res = dynlib_loadfn(path, func, args[2]->i64);
 
     drop_obj(path);
     drop_obj(func);
