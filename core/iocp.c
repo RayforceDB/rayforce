@@ -519,8 +519,9 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
     u8_t handshake[2] = {RAYFORCE_VERSION, 0x00};
     ipc_header_t *header;
 
-    fprintf(stderr, "[SERVER _recv] version=%d rx.size=%lu wsa_buf.len=%lu\n", 
-            selector->version, (unsigned long)selector->rx.size, (unsigned long)selector->rx.wsa_buf.len);
+    fprintf(stderr, "[SERVER _recv] version=%d rx.size=%lu wsa_buf.len=%lu rx.header=%d\n", 
+            selector->version, (unsigned long)selector->rx.size, (unsigned long)selector->rx.wsa_buf.len,
+            selector->rx.header);
     fflush(stderr);
 
     // wait for handshake
@@ -592,47 +593,94 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
 
     if (selector->rx.buf == NULL) {
         selector->rx.buf = heap_alloc(sizeof(struct ipc_header_t));
-        selector->rx.size = sizeof(struct ipc_header_t);
+        selector->rx.size = 0;  // No bytes received yet
         selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
-        selector->rx.wsa_buf.len = selector->rx.size;
+        selector->rx.wsa_buf.len = sizeof(struct ipc_header_t);
     }
 
     // read header
+    fprintf(stderr, "[_recv] entering header loop\n");
+    fflush(stderr);
     while (!selector->rx.header) {
         selector->rx.wsa_buf.buf += selector->rx.size;
         selector->rx.wsa_buf.len -= selector->rx.size;
+        fprintf(stderr, "[_recv] header loop: rx.size=%lu wsa_buf.len=%lu\n", 
+                (unsigned long)selector->rx.size, (unsigned long)selector->rx.wsa_buf.len);
+        fflush(stderr);
 
         if (selector->rx.wsa_buf.len != 0) {
+            fprintf(stderr, "[_recv] calling _RECV_OP for header\n");
+            fflush(stderr);
             _RECV_OP(poll, selector);
+            fprintf(stderr, "[_recv] _RECV_OP returned (immediate), continuing\n");
+            fflush(stderr);
             continue;
         }
 
+        fprintf(stderr, "[_recv] header complete, reading header data\n");
+        fflush(stderr);
         header = (ipc_header_t *)selector->rx.buf;
+        fprintf(stderr, "[_recv] header: prefix=0x%x version=%d flags=%d endian=%d msgtype=%d size=%lld\n",
+                header->prefix, header->version, header->flags, header->endian, header->msgtype, header->size);
+        fflush(stderr);
 
         // malformed header
-        if (header->size == 0)
+        if (header->size == 0) {
+            fprintf(stderr, "[_recv] malformed header (size=0)\n");
+            fflush(stderr);
             return POLL_ERROR;
+        }
 
         selector->rx.header = B8_TRUE;
         selector->rx.size = header->size + sizeof(struct ipc_header_t);
         selector->rx.msgtype = header->msgtype;
+        fprintf(stderr, "[_recv] reallocating buffer to %lu bytes\n", (unsigned long)selector->rx.size);
+        fflush(stderr);
         selector->rx.buf = heap_realloc(selector->rx.buf, selector->rx.size);
+        if (selector->rx.buf == NULL) {
+            fprintf(stderr, "[_recv] heap_realloc failed!\n");
+            fflush(stderr);
+            return POLL_ERROR;
+        }
         selector->rx.wsa_buf.buf = (str_p)selector->rx.buf + sizeof(struct ipc_header_t);
         selector->rx.wsa_buf.len = selector->rx.size - sizeof(struct ipc_header_t);
         selector->rx.size = 0;
+        fprintf(stderr, "[_recv] setup for body: wsa_buf.len=%lu total_size=%lu\n", 
+                (unsigned long)selector->rx.wsa_buf.len, 
+                (unsigned long)(selector->rx.wsa_buf.len + sizeof(struct ipc_header_t)));
+        fflush(stderr);
     }
 
+    // Save total message size before body loop modifies rx.size
+    i64_t total_msg_size = selector->rx.wsa_buf.len + sizeof(struct ipc_header_t);
+
     // read body
+    fprintf(stderr, "[_recv] entering body loop, wsa_buf.len=%lu\n", (unsigned long)selector->rx.wsa_buf.len);
+    fflush(stderr);
     while (selector->rx.wsa_buf.len > 0) {
+        fprintf(stderr, "[_recv] body loop: rx.size=%lu wsa_buf.len=%lu wsa_buf.buf=%p\n", 
+                (unsigned long)selector->rx.size, (unsigned long)selector->rx.wsa_buf.len,
+                (void*)selector->rx.wsa_buf.buf);
+        fflush(stderr);
         selector->rx.wsa_buf.buf += selector->rx.size;
         selector->rx.wsa_buf.len -= selector->rx.size;
+        fprintf(stderr, "[_recv] body loop after adjust: wsa_buf.len=%lu\n", (unsigned long)selector->rx.wsa_buf.len);
+        fflush(stderr);
 
         if (selector->rx.wsa_buf.len == 0)
             break;
 
+        fprintf(stderr, "[_recv] calling _RECV_OP for body\n");
+        fflush(stderr);
         _RECV_OP(poll, selector);
+        fprintf(stderr, "[_recv] _RECV_OP returned (immediate) in body loop\n");
+        fflush(stderr);
     }
+    fprintf(stderr, "[_recv] body loop done, restoring rx.size to %lu\n", (unsigned long)total_msg_size);
+    fflush(stderr);
 
+    // Restore rx.size to total message size for read_obj
+    selector->rx.size = total_msg_size;
     selector->rx.header = B8_FALSE;
 
     return POLL_DONE;
@@ -640,9 +688,9 @@ poll_result_t _recv(poll_p poll, selector_p selector) {
 
 poll_result_t _recv_initiate(poll_p poll, selector_p selector) {
     selector->rx.buf = heap_alloc(sizeof(struct ipc_header_t));
-    selector->rx.size = sizeof(struct ipc_header_t);
+    selector->rx.size = 0;  // No bytes received yet
     selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
-    selector->rx.wsa_buf.len = selector->rx.size;
+    selector->rx.wsa_buf.len = sizeof(struct ipc_header_t);
 
     _RECV_OP(poll, selector);
 
@@ -718,9 +766,19 @@ obj_p read_obj(selector_p selector) {
     obj_p res;
     i64_t len;
 
+    fprintf(stderr, "[read_obj] rx.size=%lu rx.buf=%p\n", 
+            (unsigned long)selector->rx.size, (void*)selector->rx.buf);
+    fflush(stderr);
+
     // Skip the header and deserialize the payload
     len = (i64_t)selector->rx.size - ISIZEOF(struct ipc_header_t);
+    fprintf(stderr, "[read_obj] deserializing %lld bytes from %p\n", len, 
+            (void*)(selector->rx.buf + ISIZEOF(struct ipc_header_t)));
+    fflush(stderr);
+    
     res = de_raw(selector->rx.buf + ISIZEOF(struct ipc_header_t), &len);
+    fprintf(stderr, "[read_obj] deserialized, res=%p\n", (void*)res);
+    fflush(stderr);
 
     heap_free(selector->rx.buf);
     selector->rx.buf = NULL;
@@ -728,6 +786,8 @@ obj_p read_obj(selector_p selector) {
     selector->rx.wsa_buf.buf = NULL;
     selector->rx.wsa_buf.len = 0;
 
+    fprintf(stderr, "[read_obj] done\n");
+    fflush(stderr);
     return res;
 }
 
@@ -736,14 +796,29 @@ nil_t process_request(poll_p poll, selector_p selector) {
     poll_result_t poll_result;
 
     res = read_obj(selector);
+    fprintf(stderr, "[process_request] read_obj returned res=%p type=%d\n", (void*)res, res ? res->type : -1);
+    fflush(stderr);
 
-    if (IS_ERR(res) || is_null(res))
+    if (IS_ERR(res) || is_null(res)) {
         v = res;
-    if (res->type == TYPE_C8) {
-        v = ray_eval_str(poll->ipcfile, res);
+    } else if (res->type == TYPE_C8) {
+        fprintf(stderr, "[process_request] evaluating string: len=%lld content='%.*s'\n", 
+                res->len, (int)(res->len < 100 ? res->len : 100), (char*)AS_C8(res));
+        fflush(stderr);
+        v = ray_eval_str(res, poll->ipcfile);  // Fixed: str first, then file
+        if (v && v->type == TYPE_ERR) {
+            obj_p errfmt = obj_fmt(v, B8_FALSE);
+            fprintf(stderr, "[process_request] eval ERROR: %.*s\n", (int)errfmt->len, (char*)AS_C8(errfmt));
+            fflush(stderr);
+            drop_obj(errfmt);
+        } else {
+            fprintf(stderr, "[process_request] eval result: %p type=%d\n", (void*)v, v ? v->type : -1);
+            fflush(stderr);
+        }
         drop_obj(res);
-    } else
+    } else {
         v = eval_obj(res);
+    }
 
     // sync request
     if (selector->rx.msgtype == MSG_TYPE_SYNC) {
@@ -917,20 +992,29 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
     obj_p res;
     DWORD dwResult;
 
+    fprintf(stderr, "[ipc_send_sync] starting, id=%lld\n", id);
+    fflush(stderr);
+
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
         THROW(ERR_IO, "ipc_send_sync: invalid socket fd: %lld", id);
 
     selector = (selector_p)idx;
+    fprintf(stderr, "[ipc_send_sync] selector=%p fd=%lld\n", (void*)selector, selector->fd);
+    fflush(stderr);
 
     queue_push(selector->tx.queue, (nil_t *)((i64_t)msg | ((i64_t)MSG_TYPE_SYNC << 61)));
 
     // set ignore flag to tx
     selector->tx.ignore = B8_TRUE;
 
+    fprintf(stderr, "[ipc_send_sync] starting send loop\n");
+    fflush(stderr);
     while (poll_result == POLL_OK) {
         poll_result = _send(poll, selector);
+        fprintf(stderr, "[ipc_send_sync] _send returned %d\n", poll_result);
+        fflush(stderr);
 
         if (poll_result != POLL_OK)
             break;
@@ -956,9 +1040,9 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
 
     if (selector->rx.buf == NULL) {
         selector->rx.buf = heap_alloc(sizeof(struct ipc_header_t));
-        selector->rx.size = sizeof(struct ipc_header_t);
+        selector->rx.size = 0;  // No bytes received yet
         selector->rx.wsa_buf.buf = (str_p)selector->rx.buf;
-        selector->rx.wsa_buf.len = selector->rx.size;
+        selector->rx.wsa_buf.len = sizeof(struct ipc_header_t);
         poll_result = _recv(poll, selector);
     }
 
@@ -981,9 +1065,15 @@ recv:
     }
 
     // recv until we get response
+    fprintf(stderr, "[ipc_send_sync] checking msgtype=%d\n", selector->rx.msgtype);
+    fflush(stderr);
     switch (selector->rx.msgtype) {
         case MSG_TYPE_RESP:
+            fprintf(stderr, "[ipc_send_sync] calling read_obj\n");
+            fflush(stderr);
             res = read_obj(selector);
+            fprintf(stderr, "[ipc_send_sync] read_obj returned, res=%p\n", (void*)res);
+            fflush(stderr);
             break;
         default:
             poll_result = POLL_OK;
@@ -991,6 +1081,8 @@ recv:
             goto recv;
     }
 
+    fprintf(stderr, "[ipc_send_sync] returning res=%p type=%d\n", (void*)res, res ? res->type : -1);
+    fflush(stderr);
     return res;
 }
 
