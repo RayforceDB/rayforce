@@ -1,4 +1,44 @@
 /* custom.css */
+
+/* ==================== */
+/* STICKY FOOTER LAYOUT */
+/* ==================== */
+
+html, body {
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+.md-container {
+    flex: 1 0 auto;
+    display: flex;
+    flex-direction: column;
+}
+
+.md-main {
+    flex: 1 0 auto;
+}
+
+.md-footer {
+    flex-shrink: 0;
+}
+
+/* Ensure hero section fills viewport exactly */
+body:has(.hero-section) .md-content,
+body:has(.hero-section) .md-content__inner,
+body:has(.hero-section) .md-main__inner,
+body:has(.hero-section) .md-main,
+body:has(.hero-section) .md-container {
+    padding-bottom: 0 !important;
+    margin-bottom: 0 !important;
+}
+
 .flex-container {
     display: flex;
     justify-content: flex-start;
@@ -778,12 +818,17 @@ a.md-button:not(.md-button--primary):hover {
     background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 50%, #ffffff 100%);
     margin: 0;
     margin-top: -1.5rem;
-    padding: 3rem 2rem 0 2rem;
+    padding: 2rem 2rem 0 2rem;
     text-align: center;
     position: relative;
     overflow: visible;
     width: 100vw;
     margin-left: calc(-50vw + 50%);
+    min-height: calc(100vh - var(--md-header-height, 48px) + 1.1rem);
+    min-height: calc(100dvh - var(--md-header-height, 48px) + 1.1rem);
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
 }
 
 /* Remove content padding on home page */
@@ -830,7 +875,8 @@ a.md-button:not(.md-button--primary):hover {
     position: relative;
     z-index: 1;
     max-width: 900px;
-    margin: 0 auto;
+    margin: auto;
+    padding-bottom: 3rem;
 }
 
 .hero-logo {
@@ -1509,11 +1555,11 @@ a.md-button:not(.md-button--primary):hover {
 /* Hero ticker / marquee */
 .hero-ticker {
     position: relative;
-    margin-top: 2rem;
-    margin-bottom: -2rem;
+    margin-top: auto;
+    margin-bottom: 0;
     margin-left: calc(-50vw + 50%);
     width: 100vw;
-    background: #04233b;
+    background: linear-gradient(90deg, #04233b 0%, #0a3a5c 50%, #04233b 100%);
     overflow: hidden;
     padding: 0.5rem 0;
 }

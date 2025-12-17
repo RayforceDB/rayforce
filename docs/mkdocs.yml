@@ -10,8 +10,6 @@ theme:
   logo: images/logo_light_full.svg
   favicon: images/favicon.svg
   features:
-    - content.action.edit
-    - content.action.view
     - content.code.annotate
     - content.code.copy
     - content.tooltips
