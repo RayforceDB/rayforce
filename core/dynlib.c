@@ -207,7 +207,7 @@ obj_p ray_loadfn(obj_p *args, i64_t n) {
     path = cstring_from_str(AS_C8(args[0]), args[0]->len);
     func = cstring_from_str(AS_C8(args[1]), args[1]->len);
 
-    res = dynlib_loadfn(path, func, args[2]->i64);
+    res = dynlib_loadfn(AS_C8(path), AS_C8(func), args[2]->i64);
 
     drop_obj(path);
     drop_obj(func);

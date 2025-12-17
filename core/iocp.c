@@ -123,10 +123,12 @@ typedef struct listener_t {
 typedef struct stdin_thread_ctx_t {
     HANDLE h_cp;
     term_p term;
+    volatile LONG stop;
 } *stdin_thread_ctx_p;
 
 listener_p __LISTENER = NULL;
 stdin_thread_ctx_p __STDIN_THREAD_CTX = NULL;
+HANDLE __STDIN_THREAD_HANDLE = NULL;
 
 #define _RECV_OP(poll, selector)                                                                               \
     {                                                                                                          \
@@ -165,7 +167,16 @@ DWORD WINAPI StdinThread(LPVOID prm) {
     DWORD bytes;
 
     for (;;) {
+        // Check if we should stop before blocking on stdin
+        if (InterlockedCompareExchange(&ctx->stop, 0, 0) != 0)
+            break;
+
         bytes = (DWORD)term_getc(term);
+
+        // Check if we should stop after returning from blocking call
+        if (InterlockedCompareExchange(&ctx->stop, 0, 0) != 0)
+            break;
+
         if (bytes == 0)
             break;
 
@@ -194,7 +205,7 @@ i64_t poll_accept(poll_p poll) {
     LPFN_ACCEPTEX lpfnAcceptEx = NULL;
     GUID GuidAcceptEx = WSAID_ACCEPTEX;
     DWORD dwBytes;
-    SOCKET sock_fd = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+    SOCKET sock_fd = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
     b8_t success;
 
     fprintf(stderr, "[SERVER poll_accept] Creating accept socket...\n");
@@ -299,37 +310,26 @@ poll_p poll_init(i64_t port) {
             poll_destroy(poll);
             return NULL;
         }
-    }
 
-    __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
-    memset(__LISTENER, 0, sizeof(struct listener_t));
+        __LISTENER = (listener_p)heap_alloc(sizeof(struct listener_t));
+        memset(__LISTENER, 0, sizeof(struct listener_t));
 
-    fprintf(stderr, "[SERVER poll_init] __LISTENER allocated, checking ipc_fd=%lld\n", poll->ipc_fd);
-    fflush(stderr);
-
-    // Only call poll_accept if we have a listening socket
-    if (poll->ipc_fd != -1) {
-        fprintf(stderr, "[SERVER poll_init] Calling poll_accept\n");
-        fflush(stderr);
+        // Start accepting connections
         if (poll_accept(poll) == -1) {
-            fprintf(stderr, "[SERVER poll_init] poll_accept failed\n");
-            fflush(stderr);
             heap_free(poll);
             exit_werror();
         }
-        fprintf(stderr, "[SERVER poll_init] poll_accept succeeded\n");
-        fflush(stderr);
-    } else {
-        fprintf(stderr, "[SERVER poll_init] Skipping poll_accept (no listen socket)\n");
-        fflush(stderr);
+
+        // Create stdin thread for REPL input
+
+        __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
+        __STDIN_THREAD_CTX->h_cp = (HANDLE)poll->poll_fd;
+        __STDIN_THREAD_CTX->term = poll->term;
+        __STDIN_THREAD_CTX->stop = 0;
+
+        // Create a thread to read from stdin
+        __STDIN_THREAD_HANDLE = CreateThread(NULL, 0, StdinThread, (LPVOID)__STDIN_THREAD_CTX, 0, NULL);
     }
-
-    __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
-    __STDIN_THREAD_CTX->h_cp = (HANDLE)poll->poll_fd;
-    __STDIN_THREAD_CTX->term = poll->term;
-
-    // Create a thread to read from stdin
-    CreateThread(NULL, 0, StdinThread, (LPVOID)__STDIN_THREAD_CTX, 0, NULL);
 
     return poll;
 }
@@ -352,7 +352,7 @@ i64_t poll_listen(poll_p poll, i64_t port) {
         return -2;
 
     // Create socket
-    listen_fd = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+    listen_fd = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
     if (listen_fd == INVALID_SOCKET)
         return -1;
 
@@ -427,6 +427,30 @@ nil_t poll_destroy(poll_p poll) {
     if (poll == NULL)
         return;
 
+    // Signal stdin thread to stop and wait for it to terminate
+    if (__STDIN_THREAD_HANDLE != NULL && __STDIN_THREAD_CTX != NULL) {
+        DWORD wait_result;
+
+        // Set stop flag
+        InterlockedExchange(&__STDIN_THREAD_CTX->stop, 1);
+
+        // Cancel any pending synchronous I/O on the stdin thread
+        CancelSynchronousIo(__STDIN_THREAD_HANDLE);
+
+        // Wait for the thread to terminate (with timeout)
+        wait_result = WaitForSingleObject(__STDIN_THREAD_HANDLE, 100);
+
+        // If thread didn't exit, forcefully terminate it
+        // (This is necessary because ReadFile on console handles can't be cancelled)
+        if (wait_result == WAIT_TIMEOUT) {
+            TerminateThread(__STDIN_THREAD_HANDLE, 0);
+        }
+
+        // Close thread handle
+        CloseHandle(__STDIN_THREAD_HANDLE);
+        __STDIN_THREAD_HANDLE = NULL;
+    }
+
     if (poll->ipc_fd != -1)
         closesocket((SOCKET)poll->ipc_fd);
 
@@ -454,7 +478,9 @@ nil_t poll_destroy(poll_p poll) {
     heap_free(poll);
 
     heap_free(__LISTENER);
+    __LISTENER = NULL;
     heap_free(__STDIN_THREAD_CTX);
+    __STDIN_THREAD_CTX = NULL;
 }
 
 nil_t poll_deregister(poll_p poll, i64_t id) {

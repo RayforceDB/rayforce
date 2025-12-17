@@ -10,8 +10,9 @@ endif
 $(info OS="$(OS)")
 
 ifeq ($(OS),Windows_NT)
-DEBUG_CFLAGS = -Wall -Wextra -std=$(STD) -g -O0 -DDEBUG -D_WINSOCK_DEPRECATED_NO_WARNINGS -D_CRT_SECURE_NO_WARNINGS
-RELEASE_CFLAGS = -Wall -Wextra -std=$(STD) -O3 -DNDEBUG -D_WINSOCK_DEPRECATED_NO_WARNINGS -D_CRT_SECURE_NO_WARNINGS \
+AR = llvm-ar
+DEBUG_CFLAGS = -Wall -Wextra -std=$(STD) -g -O0 -DDEBUG -D_CRT_SECURE_NO_WARNINGS
+RELEASE_CFLAGS = -Wall -Wextra -std=$(STD) -O3 -DNDEBUG -D_CRT_SECURE_NO_WARNINGS \
  -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -fno-math-errno
 LIBS = -lws2_32 -lmswsock -lkernel32
 DEBUG_LDFLAGS = -fuse-ld=lld
@@ -68,14 +69,14 @@ app: $(APP_OBJECTS) obj
 	$(CC) $(CFLAGS) -o $(TARGET) $(CORE_OBJECTS) $(APP_OBJECTS) $(LIBS) $(LDFLAGS)
 
 tests: -DSTOP_ON_FAIL=$(STOP_ON_FAIL) -DDEBUG
-tests: $(TESTS_OBJECTS) lib
-	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LDFLAGS)
+tests: $(TESTS_OBJECTS) obj
+	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) $(LIBS) $(LDFLAGS)
 	./$(TARGET).test
 
 bench: CC = gcc
 bench: CFLAGS = $(RELEASE_CFLAGS)
-bench: $(BENCH_OBJECTS) lib
-	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).bench $(BENCH_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LDFLAGS)
+bench: $(BENCH_OBJECTS) obj
+	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).bench $(CORE_OBJECTS) $(BENCH_OBJECTS) $(LIBS) $(LDFLAGS)
 	BENCH=$(BENCH) ./$(TARGET).bench
 
 %.o: %.c

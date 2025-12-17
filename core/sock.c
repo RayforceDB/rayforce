@@ -179,7 +179,8 @@ i64_t sock_accept(i64_t fd) {
     struct sockaddr_in addr;
     struct linger linger_opt;
     socklen_t len = sizeof(addr);
-    i64_t acc_fd;
+    SOCKET acc_fd;
+    char ip_str[INET_ADDRSTRLEN];
 
     acc_fd = accept((SOCKET)fd, (struct sockaddr *)&addr, &len);
     if (acc_fd == INVALID_SOCKET)
@@ -195,13 +196,14 @@ i64_t sock_accept(i64_t fd) {
     linger_opt.l_linger = 0;  // Timeout in seconds (0 means terminate immediately)
 
     // Apply the linger option to the accepted socket
-    if (setsockopt(acc_fd, SOL_SOCKET, SO_LINGER, &linger_opt, sizeof(linger_opt)) < 0) {
+    if (setsockopt(acc_fd, SOL_SOCKET, SO_LINGER, (const char *)&linger_opt, sizeof(linger_opt)) < 0) {
         LOG_ERROR("Failed to set SO_LINGER on accepted socket: %s", strerror(errno));
         closesocket(acc_fd);
         return -1;
     }
 
-    LOG_DEBUG("Accepted new connection on fd %lld from %s:%d", acc_fd, inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+    inet_ntop(AF_INET, &addr.sin_addr, ip_str, INET_ADDRSTRLEN);
+    LOG_DEBUG("Accepted new connection on fd %lld from %s:%d", acc_fd, ip_str, ntohs(addr.sin_port));
     return (i64_t)acc_fd;
 }
 
@@ -213,7 +215,7 @@ i64_t sock_listen(i64_t port) {
 
     LOG_INFO("Starting socket listener on port %lld", port);
 
-    fd = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+    fd = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
     if (fd == INVALID_SOCKET)
         return -1;
 
@@ -275,7 +277,7 @@ i64_t sock_send(i64_t fd, u8_t *buf, i64_t size) {
     i64_t sz, total = 0;
 
 send:
-    sz = send(fd, buf + total, size - total, MSG_NOSIGNAL);
+    sz = send(fd, (const char *)(buf + total), size - total, MSG_NOSIGNAL);
     switch (sz) {
         case -1:
             if (errno == EINTR)
