@@ -56,7 +56,7 @@ static u32_t MAX_ROW_WIDTH = DEFAULT_MAX_ROW_WIDTH;
 static u32_t F64_PRECISION = DEFAULT_F64_PRECISION;
 
 const lit_p unicode_glyphs[] = {"│", "─", "┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼",
-                                "↪", "∶", "‾", "•", "╭", "╰", "╮", "╯", "┆", "…", "█"};
+                                "❯", "∶", "‾", "•", "╭", "╰", "╮", "╯", "┆", "…", "█"};
 const lit_p ascii_glyphs[] = {"|", "-", "+", "+", "+", "+", "+", "+", "+", "+", "+",
                               ">", ":", "~", "*", "|", "|", "|", "|", ":", ".", "|"};
 
@@ -73,7 +73,6 @@ obj_p ray_set_fpr(obj_p x) {
 
     return NULL_OBJ;
 }
-
 typedef enum {
     GLYPH_VLINE,
     GLYPH_HLINE,
@@ -921,7 +920,7 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
     i64_t *header, i, j, n, m, l, table_width, table_height, total_width, rows, cols;
     obj_p s, column, columns = AS_LIST(obj)[1], column_widths, footer,
                      formatted_columns[TABLE_MAX_WIDTH][TABLE_MAX_HEIGHT] = {{NULL_OBJ}};
-    str_p p;
+    str_p p, type_names[TABLE_MAX_WIDTH];
     b8_t unicode = __USE_UNICODE;
 
     header = AS_SYMBOL(AS_LIST(obj)[0]);
@@ -951,10 +950,19 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
 
     column_widths = I64(table_width);
 
+    // Pre-compute type names for each column
+    for (i = 0; i < table_width; i++) {
+        column = AS_LIST(columns)[i];
+        type_names[i] = type_name(column->type);
+    }
+
     // Calculate each column maximum width
     for (i = 0; i < table_width; i++) {
         // First check the column name
         l = SYMBOL_STRLEN(header[i]);
+
+        // Also consider type name length
+        MAXN(l, (i64_t)strlen(type_names[i]));
 
         // Get the actual column and its length
         column = AS_LIST(columns)[i];
@@ -1027,15 +1035,34 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, b8_t full, obj_p obj) {
             n += glyph_fmt_into(dst, GLYPH_TR_CORNER, unicode);
     }
 
-    // Print table header
+    // Print table header (column names) - centered
     n += str_fmt_into(dst, 2, "\n");
     n += str_fmt_into_n(dst, NO_LIMIT, indent, " ");
     n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
     for (i = 0; i < table_width; i++) {
         p = str_from_symbol(header[i]);
-        m = AS_I64(column_widths)[i] - SYMBOL_STRLEN(header[i]) - 2;
-        n += str_fmt_into(dst, NO_LIMIT, " %s ", p);
-        n += str_fmt_into_n(dst, NO_LIMIT, m, " ");
+        i64_t name_len = SYMBOL_STRLEN(header[i]);
+        i64_t col_width = AS_I64(column_widths)[i];
+        i64_t left_pad = (col_width - name_len) / 2;
+        i64_t right_pad = col_width - name_len - left_pad;
+        n += str_fmt_into_n(dst, NO_LIMIT, left_pad, " ");
+        n += str_fmt_into(dst, NO_LIMIT, "%s", p);
+        n += str_fmt_into_n(dst, NO_LIMIT, right_pad, " ");
+        n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+    }
+
+    // Print table header (column types) - centered
+    n += str_fmt_into(dst, 2, "\n");
+    n += str_fmt_into_n(dst, NO_LIMIT, indent, " ");
+    n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+    for (i = 0; i < table_width; i++) {
+        i64_t col_width = AS_I64(column_widths)[i];
+        i64_t type_len = strlen(type_names[i]);
+        i64_t left_pad = (col_width - type_len) / 2;
+        i64_t right_pad = col_width - type_len - left_pad;
+        n += str_fmt_into_n(dst, NO_LIMIT, left_pad, " ");
+        n += str_fmt_into(dst, NO_LIMIT, "%s", type_names[i]);
+        n += str_fmt_into_n(dst, NO_LIMIT, right_pad, " ");
         n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
     }
 

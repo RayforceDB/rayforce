@@ -74,6 +74,11 @@ RayforceDB supports several categories of data types. Each category serves a spe
 !!! note ""
     An enumeration of certain values, providing a way to represent a fixed set of named constants.
 
+## [:material-alphabetical-variant: Symbols & Enums In-Depth](./symbols-and-enums.md)
+
+!!! note ""
+    Comprehensive guide explaining symbol interning, why enumerations are essential for storage, how symfiles work, and why shared symfiles are required for parted tables. **Recommended reading for newcomers.**
+
 ## [:material-dots-horizontal: Other](./other.md)
 
 !!! note ""

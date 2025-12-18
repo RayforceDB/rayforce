@@ -95,4 +95,12 @@ The <b>ultra-fast</b> columnar database engineered to deliver the <b>best high-s
 
     [:octicons-arrow-right-24: Contribute](./contribute.md)
 
+- :material-alphabetical-variant:{ .lg .middle } __Symbols & Persistence__
+
+    ---
+
+    Essential guide to understanding symbols, enums, and symfiles — the foundation of efficient data storage
+
+    [:octicons-arrow-right-24: Learn the fundamentals](./symbols-and-enums.md)
+
 </div>
