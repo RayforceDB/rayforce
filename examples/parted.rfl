@@ -20,9 +20,9 @@
     )
 )
 
-(map gen-tab (til 50))
+;; (map gen-tab (til 5))
 
 (println "Done.")
-(exit 0)
+;; (exit 0)
 
 ;; (set t (get-parted "/tmp/db/" 'a))

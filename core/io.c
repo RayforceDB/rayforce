@@ -1249,15 +1249,9 @@ obj_p io_get_table_splayed(obj_p path, obj_p symfile) {
     }
 
     // read symbol data (if any) if sym is not present in current env
-    if (syms_present && resolve(SYMBOL_SYM) == NULL) {
-        v = (symfile->type != TYPE_NULL) ? io_get_symfile(symfile) : io_get_symfile(path);
-
-        if (IS_ERR(v)) {
-            drop_obj(keys);
-            drop_obj(vals);
-            return v;
-        }
-    }
+    // symfile is optional - ignore error if it doesn't exist
+    if (syms_present && resolve(SYMBOL_SYM) == NULL)
+        drop_obj((symfile->type != TYPE_NULL) ? io_get_symfile(symfile) : io_get_symfile(path));
 
     return table(keys, vals);
 }
