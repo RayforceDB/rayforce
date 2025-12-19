@@ -1644,8 +1644,8 @@ test_result_t test_parted_dev_i16() {
 
 test_result_t test_parted_dev_i32() {
     parted_cleanup();
-    // Dev of F64 column (I32 dev may not be supported)
-    TEST_ASSERT_EQ(PARTED_TEST_SETUP_MULTI_TYPE "(count (at (select {from: t by: Date d: (dev F64Col)}) 'd))", "3");
+    // Dev of I32 column
+    TEST_ASSERT_EQ(PARTED_TEST_SETUP_MULTI_TYPE "(count (at (select {from: t by: Date d: (dev I32Col)}) 'd))", "3");
     parted_cleanup();
     PASS();
 }

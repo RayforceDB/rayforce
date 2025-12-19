@@ -2282,6 +2282,222 @@ obj_p aggr_dev_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             }
             return res;
         }
+        case TYPE_I16: {
+            i16_t *in = AS_I16(val);
+
+            switch (index_type) {
+                case INDEX_TYPE_SHIFT:
+                    source = index_group_source(index);
+                    shift = index_group_shift(index);
+                    if (filter != NULL) {
+                        for (i = 0; i < len; ++i) {
+                            x = filter[i + offset];
+                            y = group_ids[source[x] - shift];
+                            if (in[x] != NULL_I16) {
+                                v = (f64_t)in[x];
+                                so[y] += v;
+                                sqo[y] += v * v;
+                                co[y]++;
+                            }
+                        }
+                    } else {
+                        for (i = 0; i < len; ++i) {
+                            x = i + offset;
+                            y = group_ids[source[x] - shift];
+                            if (in[x] != NULL_I16) {
+                                v = (f64_t)in[x];
+                                so[y] += v;
+                                sqo[y] += v * v;
+                                co[y]++;
+                            }
+                        }
+                    }
+                    break;
+                case INDEX_TYPE_IDS:
+                    if (filter != NULL) {
+                        for (i = 0; i < len; ++i) {
+                            x = filter[i + offset];
+                            y = group_ids[i + offset];
+                            if (in[x] != NULL_I16) {
+                                v = (f64_t)in[x];
+                                so[y] += v;
+                                sqo[y] += v * v;
+                                co[y]++;
+                            }
+                        }
+                    } else {
+                        for (i = 0; i < len; ++i) {
+                            x = i + offset;
+                            y = group_ids[x];
+                            if (in[x] != NULL_I16) {
+                                v = (f64_t)in[x];
+                                so[y] += v;
+                                sqo[y] += v * v;
+                                co[y]++;
+                            }
+                        }
+                    }
+                    break;
+                case INDEX_TYPE_PARTEDCOMMON:
+                    for (i = 0; i < len; ++i) {
+                        x = i + offset;
+                        if (in[x] != NULL_I16) {
+                            v = (f64_t)in[x];
+                            so[0] += v;
+                            sqo[0] += v * v;
+                            co[0]++;
+                        }
+                    }
+                    break;
+                case INDEX_TYPE_WINDOW: {
+                    i64_t li, ri, fi, ti, kl, kr, it;
+                    obj_p rn;
+                    it = index_group_meta(index)->i64;
+                    for (i = offset; i < offset + len; ++i) {
+                        y = i;
+                        rn = AS_LIST(AS_LIST(index)[5])[i];
+                        if (rn != NULL_OBJ) {
+                            fi = AS_I64(rn)[0];
+                            ti = AS_I64(rn)[1];
+                            kl = AS_I32(AS_LIST(AS_LIST(index)[4])[0])[i];
+                            kr = AS_I32(AS_LIST(AS_LIST(index)[4])[1])[i];
+                            if (it == 0) {
+                                li = indexr_bin_i32_(kl, AS_I32(AS_LIST(index)[3]), fi, ti - fi + 1);
+                            } else {
+                                li = indexl_bin_i32_(kl, AS_I32(AS_LIST(index)[3]), fi, ti - fi + 1);
+                            }
+                            ri = indexr_bin_i32_(kr, AS_I32(AS_LIST(index)[3]), fi, ti - fi + 1);
+                        }
+                        if (rn == NULL_OBJ || AS_I32(AS_LIST(index)[3])[li] > kr ||
+                            (it == 1 && AS_I32(AS_LIST(index)[3])[ri] < kl)) {
+                            so[y] = NULL_F64;
+                            sqo[y] = NULL_F64;
+                            co[y] = 0;
+                        } else {
+                            for (x = li; x <= ri; ++x) {
+                                if (in[x] != NULL_I16) {
+                                    v = (f64_t)in[x];
+                                    so[y] += v;
+                                    sqo[y] += v * v;
+                                    co[y]++;
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            return res;
+        }
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME: {
+            i32_t *in = AS_I32(val);
+
+            switch (index_type) {
+                case INDEX_TYPE_SHIFT:
+                    source = index_group_source(index);
+                    shift = index_group_shift(index);
+                    if (filter != NULL) {
+                        for (i = 0; i < len; ++i) {
+                            x = filter[i + offset];
+                            y = group_ids[source[x] - shift];
+                            if (in[x] != NULL_I32) {
+                                v = (f64_t)in[x];
+                                so[y] += v;
+                                sqo[y] += v * v;
+                                co[y]++;
+                            }
+                        }
+                    } else {
+                        for (i = 0; i < len; ++i) {
+                            x = i + offset;
+                            y = group_ids[source[x] - shift];
+                            if (in[x] != NULL_I32) {
+                                v = (f64_t)in[x];
+                                so[y] += v;
+                                sqo[y] += v * v;
+                                co[y]++;
+                            }
+                        }
+                    }
+                    break;
+                case INDEX_TYPE_IDS:
+                    if (filter != NULL) {
+                        for (i = 0; i < len; ++i) {
+                            x = filter[i + offset];
+                            y = group_ids[i + offset];
+                            if (in[x] != NULL_I32) {
+                                v = (f64_t)in[x];
+                                so[y] += v;
+                                sqo[y] += v * v;
+                                co[y]++;
+                            }
+                        }
+                    } else {
+                        for (i = 0; i < len; ++i) {
+                            x = i + offset;
+                            y = group_ids[x];
+                            if (in[x] != NULL_I32) {
+                                v = (f64_t)in[x];
+                                so[y] += v;
+                                sqo[y] += v * v;
+                                co[y]++;
+                            }
+                        }
+                    }
+                    break;
+                case INDEX_TYPE_PARTEDCOMMON:
+                    for (i = 0; i < len; ++i) {
+                        x = i + offset;
+                        if (in[x] != NULL_I32) {
+                            v = (f64_t)in[x];
+                            so[0] += v;
+                            sqo[0] += v * v;
+                            co[0]++;
+                        }
+                    }
+                    break;
+                case INDEX_TYPE_WINDOW: {
+                    i64_t li, ri, fi, ti, kl, kr, it;
+                    obj_p rn;
+                    it = index_group_meta(index)->i64;
+                    for (i = offset; i < offset + len; ++i) {
+                        y = i;
+                        rn = AS_LIST(AS_LIST(index)[5])[i];
+                        if (rn != NULL_OBJ) {
+                            fi = AS_I64(rn)[0];
+                            ti = AS_I64(rn)[1];
+                            kl = AS_I32(AS_LIST(AS_LIST(index)[4])[0])[i];
+                            kr = AS_I32(AS_LIST(AS_LIST(index)[4])[1])[i];
+                            if (it == 0) {
+                                li = indexr_bin_i32_(kl, AS_I32(AS_LIST(index)[3]), fi, ti - fi + 1);
+                            } else {
+                                li = indexl_bin_i32_(kl, AS_I32(AS_LIST(index)[3]), fi, ti - fi + 1);
+                            }
+                            ri = indexr_bin_i32_(kr, AS_I32(AS_LIST(index)[3]), fi, ti - fi + 1);
+                        }
+                        if (rn == NULL_OBJ || AS_I32(AS_LIST(index)[3])[li] > kr ||
+                            (it == 1 && AS_I32(AS_LIST(index)[3])[ri] < kl)) {
+                            so[y] = NULL_F64;
+                            sqo[y] = NULL_F64;
+                            co[y] = 0;
+                        } else {
+                            for (x = li; x <= ri; ++x) {
+                                if (in[x] != NULL_I32) {
+                                    v = (f64_t)in[x];
+                                    so[y] += v;
+                                    sqo[y] += v * v;
+                                    co[y]++;
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            return res;
+        }
         default:
             // Clean up the list contents and return error
             drop_obj(sum_obj);
@@ -2437,9 +2653,13 @@ obj_p aggr_dev(obj_p val, obj_p index) {
     n = index_group_count(index);
 
     switch (val->type) {
+        case TYPE_I16:
+        case TYPE_I32:
         case TYPE_I64:
-        case TYPE_TIMESTAMP:
         case TYPE_F64:
+        case TYPE_DATE:
+        case TYPE_TIME:
+        case TYPE_TIMESTAMP:
             parts = aggr_map_dev(val, index);
             if (IS_ERR(parts))
                 return parts;
