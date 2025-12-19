@@ -172,6 +172,7 @@ nil_t on_fail(str_p msg) {
 #include "sort.c"
 #include "lang.c"
 #include "serde.c"
+#include "parted.c"
 
 // Add tests here
 test_entry_t tests[] = {
@@ -238,6 +239,23 @@ test_entry_t tests[] = {
     {"test_lang_do_let", test_lang_do_let},
     {"test_lang_error", test_lang_error},
     {"test_lang_safety", test_lang_safety},
+    // Parted table tests
+    {"test_parted_load", test_parted_load},
+    {"test_parted_select_where_date", test_parted_select_where_date},
+    {"test_parted_select_by_date", test_parted_select_by_date},
+    {"test_parted_select_multiple_aggregates", test_parted_select_multiple_aggregates},
+    {"test_parted_aggregate_by_date", test_parted_aggregate_by_date},
+    {"test_parted_aggregate_where", test_parted_aggregate_where},
+    {"test_parted_aggregate_f64", test_parted_aggregate_f64},
+    {"test_parted_aggregate_i64", test_parted_aggregate_i64},
+    {"test_parted_aggregate_minmax", test_parted_aggregate_minmax},
+    // Extended parted tests with i32/time type
+    {"test_parted_aggregate_time", test_parted_aggregate_time},
+    {"test_parted_aggregate_time_where", test_parted_aggregate_time_where},
+    {"test_parted_aggregate_time_sum", test_parted_aggregate_time_sum},
+    // Extended parted tests with i16 type
+    {"test_parted_aggregate_i16", test_parted_aggregate_i16},
+    {"test_parted_aggregate_i16_sum", test_parted_aggregate_i16_sum},
 };
 // ---
 

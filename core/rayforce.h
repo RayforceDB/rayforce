@@ -135,6 +135,7 @@ typedef u8_t guid_t[16];
 #define NULL_I32 ((i32_t)0x80000000)
 #define NULL_I64 ((i64_t)0x8000000000000000LL)
 #define NULL_F64 ((f64_t)(0 / 0.0))
+#define INF_I16 ((i16_t)0x7FFF)
 #define INF_I32 ((i32_t)0x7FFFFFFF)
 #define INF_I64 ((i64_t)0x7FFFFFFFFFFFFFFFLL)
 #define INF_F64 ((f64_t)(1 / 0.0))

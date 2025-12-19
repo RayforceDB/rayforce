@@ -1206,6 +1206,7 @@ obj_p ray_cnt_partial(obj_p x, i64_t len, i64_t offset) {
 
 obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
     switch (x->type) {
+        case -TYPE_I16:
         case -TYPE_I32:
         case -TYPE_I64:
         case -TYPE_F64:
@@ -1213,6 +1214,8 @@ obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
         case -TYPE_TIME:
         case -TYPE_TIMESTAMP:
             return clone_obj(x);
+        case TYPE_I16:
+            return __UNOP_FOLD(x, i16, i16, FOLD_ADDI16, len, offset, 0);
         case TYPE_I32:
             return __UNOP_FOLD(x, i32, i32, FOLD_ADDI32, len, offset, 0);
         case TYPE_I64:
@@ -1240,6 +1243,7 @@ obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
             drop_obj(collected);
             return res;
         }
+        case TYPE_PARTEDI16:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
         case TYPE_PARTEDTIMESTAMP:
@@ -1258,6 +1262,7 @@ obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
 
 obj_p ray_min_partial(obj_p x, i64_t len, i64_t offset) {
     switch (x->type) {
+        case -TYPE_I16:
         case -TYPE_I32:
         case -TYPE_I64:
         case -TYPE_F64:
@@ -1265,6 +1270,8 @@ obj_p ray_min_partial(obj_p x, i64_t len, i64_t offset) {
         case -TYPE_TIME:
         case -TYPE_TIMESTAMP:
             return clone_obj(x);
+        case TYPE_I16:
+            return __UNOP_FOLD(x, i16, i16, MINI16, len, offset, NULL_I16);
         case TYPE_I32:
             return __UNOP_FOLD(x, i32, i32, MINI32, len, offset, NULL_I32);
         case TYPE_I64:
@@ -1294,6 +1301,7 @@ obj_p ray_min_partial(obj_p x, i64_t len, i64_t offset) {
             drop_obj(collected);
             return res;
         }
+        case TYPE_PARTEDI16:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
         case TYPE_PARTEDTIMESTAMP:
@@ -1312,6 +1320,7 @@ obj_p ray_min_partial(obj_p x, i64_t len, i64_t offset) {
 
 obj_p ray_max_partial(obj_p x, i64_t len, i64_t offset) {
     switch (x->type) {
+        case -TYPE_I16:
         case -TYPE_I32:
         case -TYPE_I64:
         case -TYPE_F64:
@@ -1319,6 +1328,8 @@ obj_p ray_max_partial(obj_p x, i64_t len, i64_t offset) {
         case -TYPE_TIME:
         case -TYPE_TIMESTAMP:
             return clone_obj(x);
+        case TYPE_I16:
+            return __UNOP_FOLD(x, i16, i16, MAXI16, len, offset, NULL_I16);
         case TYPE_I32:
             return __UNOP_FOLD(x, i32, i32, MAXI32, len, offset, NULL_I32);
         case TYPE_I64:
@@ -1348,6 +1359,7 @@ obj_p ray_max_partial(obj_p x, i64_t len, i64_t offset) {
             drop_obj(collected);
             return res;
         }
+        case TYPE_PARTEDI16:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
         case TYPE_PARTEDTIMESTAMP:
