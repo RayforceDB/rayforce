@@ -1244,6 +1244,7 @@ obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
             return res;
         }
         case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
         case TYPE_PARTEDTIMESTAMP:
@@ -1302,6 +1303,7 @@ obj_p ray_min_partial(obj_p x, i64_t len, i64_t offset) {
             return res;
         }
         case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
         case TYPE_PARTEDTIMESTAMP:
@@ -1360,6 +1362,7 @@ obj_p ray_max_partial(obj_p x, i64_t len, i64_t offset) {
             return res;
         }
         case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
         case TYPE_PARTEDTIMESTAMP:

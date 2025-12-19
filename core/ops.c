@@ -194,11 +194,15 @@ i64_t ops_count(obj_p x) {
         case TYPE_PARTEDLIST:
         case TYPE_PARTEDB8:
         case TYPE_PARTEDU8:
+        case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
-        case TYPE_PARTEDENUM:
-        case TYPE_PARTEDTIMESTAMP:
         case TYPE_PARTEDF64:
+        case TYPE_PARTEDDATE:
+        case TYPE_PARTEDTIME:
+        case TYPE_PARTEDTIMESTAMP:
         case TYPE_PARTEDGUID:
+        case TYPE_PARTEDENUM:
             l = x->len;
             for (i = 0, c = 0; i < l; i++)
                 c += ops_count(AS_LIST(x)[i]);

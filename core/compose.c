@@ -959,8 +959,14 @@ obj_p ray_row(obj_p x) {
             drop_obj(collected);
             return res;
         }
+        case TYPE_PARTEDB8:
+        case TYPE_PARTEDU8:
+        case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
+        case TYPE_PARTEDDATE:
+        case TYPE_PARTEDTIME:
         case TYPE_PARTEDTIMESTAMP:
         case TYPE_PARTEDGUID:
         case TYPE_PARTEDENUM:

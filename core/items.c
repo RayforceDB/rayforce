@@ -1047,8 +1047,14 @@ obj_p ray_first(obj_p x) {
             drop_obj(collected);
             return res;
         }
+        case TYPE_PARTEDB8:
+        case TYPE_PARTEDU8:
+        case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
+        case TYPE_PARTEDDATE:
+        case TYPE_PARTEDTIME:
         case TYPE_PARTEDTIMESTAMP:
         case TYPE_PARTEDGUID:
         case TYPE_PARTEDENUM:
@@ -1085,8 +1091,14 @@ obj_p ray_last(obj_p x) {
             drop_obj(collected);
             return res;
         }
+        case TYPE_PARTEDB8:
+        case TYPE_PARTEDU8:
+        case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
+        case TYPE_PARTEDDATE:
+        case TYPE_PARTEDTIME:
         case TYPE_PARTEDTIMESTAMP:
         case TYPE_PARTEDGUID:
         case TYPE_PARTEDENUM:
@@ -1127,6 +1139,8 @@ obj_p ray_value(obj_p x) {
     u8_t *u8ptr, *buf;
     i64_t size;
     i64_t i, j, l, n, sl, xl, *i64ptr;
+    i16_t *i16ptr;
+    i32_t *i32ptr;
     f64_t *f64ptr;
     guid_t *guidptr;
 
@@ -1236,6 +1250,34 @@ obj_p ray_value(obj_p x) {
                 n = AS_LIST(x)[i]->len;
                 memcpy(u8ptr, AS_U8(AS_LIST(x)[i]), n * sizeof(i8_t));
                 u8ptr += n;
+            }
+
+            return res;
+        case TYPE_PARTEDI16:
+            l = x->len;
+            n = ops_count(x);
+            res = vector(TYPE_I16, n);
+            i16ptr = AS_I16(res);
+
+            for (i = 0; i < l; i++) {
+                n = AS_LIST(x)[i]->len;
+                memcpy(i16ptr, AS_I16(AS_LIST(x)[i]), n * sizeof(i16_t));
+                i16ptr += n;
+            }
+
+            return res;
+        case TYPE_PARTEDI32:
+        case TYPE_PARTEDDATE:
+        case TYPE_PARTEDTIME:
+            l = x->len;
+            n = ops_count(x);
+            res = vector(AS_LIST(x)[0]->type, n);
+            i32ptr = AS_I32(res);
+
+            for (i = 0; i < l; i++) {
+                n = AS_LIST(x)[i]->len;
+                memcpy(i32ptr, AS_I32(AS_LIST(x)[i]), n * sizeof(i32_t));
+                i32ptr += n;
             }
 
             return res;

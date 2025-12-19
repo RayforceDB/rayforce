@@ -295,8 +295,12 @@ nil_t init_typenames(obj_p typenames)
     REGISTER_TYPE(typenames,    TYPE_PARTEDLIST,      "PARTEDLIST");
     REGISTER_TYPE(typenames,    TYPE_PARTEDB8,        "PARTEDB8");
     REGISTER_TYPE(typenames,    TYPE_PARTEDU8,        "PARTEDU8");
+    REGISTER_TYPE(typenames,    TYPE_PARTEDI16,       "PARTEDI16");
+    REGISTER_TYPE(typenames,    TYPE_PARTEDI32,       "PARTEDI32");
     REGISTER_TYPE(typenames,    TYPE_PARTEDI64,       "PARTEDI64");
     REGISTER_TYPE(typenames,    TYPE_PARTEDF64,       "PARTEDF64");
+    REGISTER_TYPE(typenames,    TYPE_PARTEDDATE,      "PARTEDDATE");
+    REGISTER_TYPE(typenames,    TYPE_PARTEDTIME,      "PARTEDTIME");
     REGISTER_TYPE(typenames,    TYPE_PARTEDTIMESTAMP, "PARTEDTIMESTAMP");
     REGISTER_TYPE(typenames,    TYPE_PARTEDGUID,      "PARTEDGUID");
     REGISTER_TYPE(typenames,    TYPE_PARTEDENUM,      "PARTEDENUM");

@@ -560,6 +560,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
                 res->len = j;
             }
             return res;
+        case TYPE_PARTEDB8:
         case TYPE_PARTEDU8:
             filter = index_group_filter(index);
             res = vector(AS_LIST(val)[0]->type, n);
@@ -583,9 +584,15 @@ obj_p aggr_first(obj_p val, obj_p index) {
         case TYPE_PARTEDI64:
         case TYPE_PARTEDTIMESTAMP:
             filter = index_group_filter(index);
+            if (n == 1 && filter == NULL_OBJ) {
+                // Global first - return first element of first partition
+                res = vector(AS_LIST(val)[0]->type, 1);
+                AS_I64(res)[0] = AS_I64(AS_LIST(val)[0])[0];
+                return res;
+            }
             res = vector(AS_LIST(val)[0]->type, n);
             if (filter == NULL_OBJ) {
-                // No filter - iterate over all partitions
+                // No filter - one result per partition
                 l = val->len;
                 for (i = 0; i < l; i++)
                     AS_I64(res)[i] = AS_I64(AS_LIST(val)[i])[0];
@@ -609,6 +616,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
                                   memcpy($out[$y], $in[$x], sizeof(guid_t)));
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME:
+        case TYPE_PARTEDI32:
             return PARTED_MAP(n, val, index, (raw_p)aggr_first_partial, i32, i32,
                               if ($out[$y] == NULL_I32) $out[$y] = $in[$x]);
         case TYPE_PARTEDI16:
@@ -810,6 +818,30 @@ obj_p aggr_last(obj_p val, obj_p index) {
                 res->len = j;
             }
             return res;
+        case TYPE_PARTEDB8:
+        case TYPE_PARTEDU8:
+            filter = index_group_filter(index);
+            res = vector(AS_LIST(val)[0]->type, n);
+            if (filter == NULL_OBJ) {
+                // No filter - iterate over all partitions
+                for (i = 0; i < n; i++) {
+                    l = AS_LIST(val)[i]->len;
+                    AS_B8(res)[i] = AS_B8(AS_LIST(val)[i])[l - 1];
+                }
+            } else {
+                // With filter - iterate all partitions, only take matching ones
+                l = filter->len;
+                for (i = 0, j = 0; i < l; i++) {
+                    obj_p fentry = AS_LIST(filter)[i];
+                    if (fentry != NULL_OBJ) {
+                        if ((fentry->type == -TYPE_I64 && fentry->i64 == -1) || fentry->len > 0) {
+                            i64_t pl = AS_LIST(val)[i]->len;
+                            AS_B8(res)[j++] = AS_B8(AS_LIST(val)[i])[pl - 1];
+                        }
+                    }
+                }
+            }
+            return res;
         case TYPE_PARTEDI64:
         case TYPE_PARTEDTIMESTAMP:
             return PARTED_MAP(n, val, index, (raw_p)aggr_last_partial, i64, i64,
@@ -823,6 +855,7 @@ obj_p aggr_last(obj_p val, obj_p index) {
                                   memcpy($out[$y], $in[$x], sizeof(guid_t)));
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME:
+        case TYPE_PARTEDI32:
             return PARTED_MAP(n, val, index, (raw_p)aggr_last_partial, i32, i32,
                               if ($out[$y] == NULL_I32) $out[$y] = $in[$x]);
         case TYPE_PARTEDI16:
@@ -898,6 +931,7 @@ obj_p aggr_sum(obj_p val, obj_p index) {
             return PARTED_MAP(n, val, index, (raw_p)aggr_sum_partial, f64, f64, $out[$y] = ADDF64($out[$y], $in[$x]));
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME:
+        case TYPE_PARTEDI32:
             return PARTED_MAP(n, val, index, (raw_p)aggr_sum_partial, i32, i32, $out[$y] = ADDI32($out[$y], $in[$x]));
         case TYPE_PARTEDI16:
             return PARTED_MAP(n, val, index, (raw_p)aggr_sum_partial, i16, i16, $out[$y] = ADDI16($out[$y], $in[$x]));
@@ -980,6 +1014,7 @@ obj_p aggr_max(obj_p val, obj_p index) {
             return PARTED_MAP(n, val, index, (raw_p)aggr_max_partial, f64, f64, $out[$y] = MAXF64($out[$y], $in[$x]));
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME:
+        case TYPE_PARTEDI32:
             return PARTED_MAP(n, val, index, (raw_p)aggr_max_partial, i32, i32, $out[$y] = MAXI32($out[$y], $in[$x]));
         case TYPE_PARTEDI16:
             return PARTED_MAP(n, val, index, (raw_p)aggr_max_partial, i16, i16, $out[$y] = MAXI16($out[$y], $in[$x]));
@@ -1061,6 +1096,7 @@ obj_p aggr_min(obj_p val, obj_p index) {
             return PARTED_MAP(n, val, index, (raw_p)aggr_min_partial, f64, f64, $out[$y] = MINF64($out[$y], $in[$x]));
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME:
+        case TYPE_PARTEDI32:
             return PARTED_MAP(n, val, index, (raw_p)aggr_min_partial, i32, i32, $out[$y] = MINI32($out[$y], $in[$x]));
         case TYPE_PARTEDI16:
             return PARTED_MAP(n, val, index, (raw_p)aggr_min_partial, i16, i16, $out[$y] = MINI16($out[$y], $in[$x]));
@@ -1139,8 +1175,14 @@ obj_p aggr_count(obj_p val, obj_p index) {
     n = index_group_count(index);
 
     switch (val->type) {
+        case TYPE_PARTEDB8:
+        case TYPE_PARTEDU8:
+        case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
+        case TYPE_PARTEDDATE:
+        case TYPE_PARTEDTIME:
         case TYPE_PARTEDTIMESTAMP:
         case TYPE_PARTEDGUID:
         case TYPE_PARTEDENUM:
