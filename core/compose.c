@@ -55,6 +55,20 @@ obj_p ray_cast_obj(obj_p x, obj_p y) {
         return err;
     }
 
+    // Convert atom type to vector type for parallel cast when source is vector
+    if (IS_VECTOR(y) && type < 0) {
+        i8_t abs_src = y->type;
+        i8_t abs_dst = -type;
+        if ((abs_src == TYPE_I16 || abs_src == TYPE_I32 || abs_src == TYPE_I64 ||
+             abs_src == TYPE_F64 || abs_src == TYPE_U8 || abs_src == TYPE_B8 ||
+             abs_src == TYPE_DATE || abs_src == TYPE_TIME || abs_src == TYPE_TIMESTAMP) &&
+            (abs_dst == TYPE_I16 || abs_dst == TYPE_I32 || abs_dst == TYPE_I64 ||
+             abs_dst == TYPE_F64 || abs_dst == TYPE_U8 || abs_dst == TYPE_B8 ||
+             abs_dst == TYPE_DATE || abs_dst == TYPE_TIME || abs_dst == TYPE_TIMESTAMP)) {
+            type = -type;
+        }
+    }
+
     return cast_obj(type, y);
 }
 

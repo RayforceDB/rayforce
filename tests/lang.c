@@ -4912,6 +4912,20 @@ test_result_t test_lang_cast() {
     TEST_ASSERT_EQ("(as 'F64 (list 1.0 2.0 3.0))", "[1.0 2.0 3.0]");
     TEST_ASSERT_EQ("(as 'B8 (list true false true))", "[true false true]");
 
+    // ========== PARALLEL CAST (large vectors) ==========
+    // i64 -> i32 (large vector triggers parallel processing)
+    TEST_ASSERT_EQ("(sum (as 'I32 (til 100000)))", "704982704i");  // sum of 0..99999 as i32
+    // i64 -> f64
+    TEST_ASSERT_EQ("(sum (as 'F64 (til 100000)))", "4999950000.0");
+    // i32 -> i64
+    TEST_ASSERT_EQ("(sum (as 'I64 (as 'I32 (til 100000))))", "4999950000");
+    // i64 -> i16
+    TEST_ASSERT_EQ("(count (as 'I16 (til 100000)))", "100000");
+    // i64 -> u8
+    TEST_ASSERT_EQ("(count (as 'U8 (til 100000)))", "100000");
+    // f64 -> i64
+    TEST_ASSERT_EQ("(sum (as 'I64 (as 'F64 (til 100000))))", "4999950000");
+
     PASS();
 }
 
