@@ -1191,8 +1191,13 @@ obj_p ray_cnt_partial(obj_p x, i64_t len, i64_t offset) {
             return __UNOP_FOLD(x, i32, i64, CNTI32, len, offset, 0);
         case TYPE_TIMESTAMP:
             return __UNOP_FOLD(x, i64, i64, CNTI64, len, offset, 0);
+        case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
-        case TYPE_PARTEDF64: {
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDDATE:
+        case TYPE_PARTEDTIME:
+        case TYPE_PARTEDTIMESTAMP: {
             obj_p index =
                 vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
             obj_p res = aggr_count(x, index);
@@ -1798,8 +1803,12 @@ obj_p ray_avg(obj_p x) {
             drop_obj(collected);
             return res;
         }
+        case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
+        case TYPE_PARTEDDATE:
+        case TYPE_PARTEDTIME:
         case TYPE_PARTEDTIMESTAMP: {
             // Create minimal index for parted aggregation: group_count=1, filter=NULL
             obj_p index =
@@ -1874,8 +1883,12 @@ obj_p ray_med(obj_p x) {
             drop_obj(collected);
             return res;
         }
+        case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
+        case TYPE_PARTEDDATE:
+        case TYPE_PARTEDTIME:
         case TYPE_PARTEDTIMESTAMP: {
             obj_p index =
                 vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
@@ -1927,8 +1940,12 @@ obj_p ray_dev(obj_p x) {
             drop_obj(collected);
             return res;
         }
+        case TYPE_PARTEDI16:
+        case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
         case TYPE_PARTEDF64:
+        case TYPE_PARTEDDATE:
+        case TYPE_PARTEDTIME:
         case TYPE_PARTEDTIMESTAMP: {
             obj_p index =
                 vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);

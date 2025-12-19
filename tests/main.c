@@ -362,6 +362,43 @@ test_entry_t tests[] = {
     {"test_parted_multi_aggr_filter", test_parted_multi_aggr_filter},
     {"test_parted_multi_aggr_filter_count", test_parted_multi_aggr_filter_count},
     {"test_parted_multi_aggr_filter_min", test_parted_multi_aggr_filter_min},
+    // Average on i16 tests
+    {"test_parted_avg_i16_by_date", test_parted_avg_i16_by_date},
+    {"test_parted_avg_i16_global", test_parted_avg_i16_global},
+    {"test_parted_avg_i16_filter", test_parted_avg_i16_filter},
+    // Average on i32/time tests
+    {"test_parted_avg_time_by_date", test_parted_avg_time_by_date},
+    {"test_parted_avg_time_global", test_parted_avg_time_global},
+    {"test_parted_avg_i32_by_date", test_parted_avg_i32_by_date},
+    {"test_parted_avg_i32_global", test_parted_avg_i32_global},
+    {"test_parted_avg_i32_filter", test_parted_avg_i32_filter},
+    // Complex filter with avg tests
+    {"test_parted_avg_complex_filter", test_parted_avg_complex_filter},
+    {"test_parted_avg_price_filter", test_parted_avg_price_filter},
+    {"test_parted_avg_size_filter", test_parted_avg_size_filter},
+    // Average with multiple aggregates tests
+    {"test_parted_avg_with_other_aggr", test_parted_avg_with_other_aggr},
+    {"test_parted_avg_filter_by_date", test_parted_avg_filter_by_date},
+    // Date column avg tests
+    {"test_parted_avg_date_col", test_parted_avg_date_col},
+    {"test_parted_avg_date_col_by_date", test_parted_avg_date_col_by_date},
+    // I16 column with filters tests
+    {"test_parted_i16_filter_aggr", test_parted_i16_filter_aggr},
+    {"test_parted_i16_global_minmax", test_parted_i16_global_minmax},
+    // I32/time filter tests
+    {"test_parted_time_filter_aggr", test_parted_time_filter_aggr},
+    // Dev (standard deviation) tests
+    {"test_parted_dev_i64", test_parted_dev_i64},
+    {"test_parted_dev_global", test_parted_dev_global},
+    {"test_parted_dev_i16", test_parted_dev_i16},
+    {"test_parted_dev_i32", test_parted_dev_i32},
+    // Med (median) tests
+    {"test_parted_med_i64", test_parted_med_i64},
+    {"test_parted_med_global", test_parted_med_global},
+    // Count tests for parted types
+    {"test_parted_count_i16", test_parted_count_i16},
+    {"test_parted_count_i32", test_parted_count_i32},
+    {"test_parted_count_time", test_parted_count_time},
 };
 // ---
 
