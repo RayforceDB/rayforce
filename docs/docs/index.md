@@ -23,7 +23,7 @@ The high-performance columnar database engineered for lightning-fast analytics a
 
 <div class="hero-buttons">
 <a href="https://wasm.rayforcedb.com/" class="md-button md-button--primary" target="_blank">Try it Now</a>
-<a href="content/get-started/overview.md" class="md-button">Get Started</a>
+<a href="content/get-started/overview/" class="md-button">Get Started</a>
 <a href="https://github.com/singaraiona/rayforce" class="md-button">Get it on GitHub</a>
 </div>
 
