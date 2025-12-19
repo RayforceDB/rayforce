@@ -36,6 +36,7 @@
 #include "guid.h"
 #include "aggr.h"
 #include "serde.h"
+#include "pool.h"
 
 obj_p ray_cast_obj(obj_p x, obj_p y) {
     i8_t type;
@@ -411,8 +412,29 @@ obj_p ray_enum(obj_p x, obj_p y) {
     }
 }
 
+// Context for parallel rand
+typedef struct {
+    i64_t *out;
+    i64_t max_val;
+    u64_t base_seed;
+} rand_ctx_t;
+
+// Worker for parallel rand (pool_map signature)
+static obj_p rand_worker(i64_t len, i64_t offset, void *ctx) {
+    rand_ctx_t *c = ctx;
+    // Derive unique seed from offset
+    u64_t seed = c->base_seed ^ ((u64_t)(offset + 1) * 0x9E3779B97F4A7C15ULL);
+    for (i64_t i = 0; i < len; i++) {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        c->out[offset + i] = seed % c->max_val;
+    }
+    return NULL_OBJ;
+}
+
 obj_p ray_rand(obj_p x, obj_p y) {
-    i64_t i, count;
+    i64_t count;
     obj_p vec;
 
     switch (MTYPE2(x->type, y->type)) {
@@ -427,8 +449,8 @@ obj_p ray_rand(obj_p x, obj_p y) {
 
             vec = I64(count);
 
-            for (i = 0; i < count; i++)
-                AS_I64(vec)[i] = ops_rand_u64() % y->i64;
+            rand_ctx_t ctx = { AS_I64(vec), y->i64, ops_rand_u64() };
+            pool_map(count, rand_worker, &ctx);
 
             return vec;
 
