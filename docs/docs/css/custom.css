@@ -221,6 +221,169 @@ body:has(.hero-section) [data-md-color-scheme="default"] .md-tabs__link:hover {
     background-color: #fafafa;
 }
 
+/* Code blocks with clj syntax - Light mode */
+.highlight.language-clj,
+.highlight code.language-clj,
+.highlight pre.language-clj {
+    background-color: #fafafa;
+    color: #04233b;
+}
+
+.highlight.language-clj code,
+.highlight code.language-clj {
+    color: #04233b;
+    background-color: transparent;
+}
+
+/* Pygments syntax highlighting for clj in light mode */
+.highlight.language-clj .c,
+.highlight.language-clj .c1,
+.highlight.language-clj .cm {
+    /* Comments */
+    color: #6a737d;
+    font-style: italic;
+}
+
+.highlight.language-clj .s,
+.highlight.language-clj .s1,
+.highlight.language-clj .s2 {
+    /* Strings */
+    color: #032f62;
+}
+
+.highlight.language-clj .mi,
+.highlight.language-clj .mf,
+.highlight.language-clj .mh {
+    /* Numbers */
+    color: #e9a033;
+}
+
+.highlight.language-clj .k,
+.highlight.language-clj .kd,
+.highlight.language-clj .kn {
+    /* Keywords */
+    color: #005cc5;
+    font-weight: 500;
+}
+
+.highlight.language-clj .nf,
+.highlight.language-clj .na {
+    /* Functions */
+    color: #005cc5;
+    font-weight: 500;
+}
+
+.highlight.language-clj .nb {
+    /* Built-in functions */
+    color: #005cc5;
+}
+
+.highlight.language-clj .o {
+    /* Operators */
+    color: #04233b;
+}
+
+.highlight.language-clj .p {
+    /* Parentheses */
+    color: #6f42c1;
+}
+
+/* Dark mode code blocks with clj syntax */
+[data-md-color-scheme="slate"] .highlight.language-clj,
+[data-md-color-scheme="slate"] .highlight code.language-clj,
+[data-md-color-scheme="slate"] .highlight pre.language-clj {
+    background-color: #021828;
+    color: #f8f8f2;
+}
+
+[data-md-color-scheme="slate"] .highlight.language-clj code,
+[data-md-color-scheme="slate"] .highlight code.language-clj {
+    color: #f8f8f2;
+    background-color: transparent;
+}
+
+/* Pygments syntax highlighting for clj in dark mode */
+[data-md-color-scheme="slate"] .highlight.language-clj .c,
+[data-md-color-scheme="slate"] .highlight.language-clj .c1,
+[data-md-color-scheme="slate"] .highlight.language-clj .cm {
+    /* Comments */
+    color: #6272a4;
+    font-style: italic;
+}
+
+[data-md-color-scheme="slate"] .highlight.language-clj .s,
+[data-md-color-scheme="slate"] .highlight.language-clj .s1,
+[data-md-color-scheme="slate"] .highlight.language-clj .s2 {
+    /* Strings */
+    color: #f1fa8c;
+}
+
+[data-md-color-scheme="slate"] .highlight.language-clj .mi,
+[data-md-color-scheme="slate"] .highlight.language-clj .mf,
+[data-md-color-scheme="slate"] .highlight.language-clj .mh {
+    /* Numbers */
+    color: #ffb86c;
+}
+
+[data-md-color-scheme="slate"] .highlight.language-clj .k,
+[data-md-color-scheme="slate"] .highlight.language-clj .kd,
+[data-md-color-scheme="slate"] .highlight.language-clj .kn {
+    /* Keywords */
+    color: #50fa7b;
+    font-weight: 500;
+}
+
+[data-md-color-scheme="slate"] .highlight.language-clj .nf,
+[data-md-color-scheme="slate"] .highlight.language-clj .na {
+    /* Functions */
+    color: #8be9fd;
+    font-weight: 500;
+}
+
+[data-md-color-scheme="slate"] .highlight.language-clj .nb {
+    /* Built-in functions */
+    color: #8be9fd;
+}
+
+[data-md-color-scheme="slate"] .highlight.language-clj .o {
+    /* Operators */
+    color: #f8f8f2;
+}
+
+[data-md-color-scheme="slate"] .highlight.language-clj .p {
+    /* Parentheses */
+    color: #bd93f9;
+}
+
+/* Alternative Pygments class names for clj */
+.highlight-source-clj,
+.highlight-source-clojure,
+.highlight-source-lisp {
+    background-color: #fafafa;
+    color: #04233b;
+}
+
+.highlight-source-clj code,
+.highlight-source-clojure code,
+.highlight-source-lisp code {
+    color: #04233b;
+    background-color: transparent;
+}
+
+[data-md-color-scheme="slate"] .highlight-source-clj,
+[data-md-color-scheme="slate"] .highlight-source-clojure,
+[data-md-color-scheme="slate"] .highlight-source-lisp {
+    background-color: #021828;
+    color: #f8f8f2;
+}
+
+[data-md-color-scheme="slate"] .highlight-source-clj code,
+[data-md-color-scheme="slate"] .highlight-source-clojure code,
+[data-md-color-scheme="slate"] .highlight-source-lisp code {
+    color: #f8f8f2;
+    background-color: transparent;
+}
+
 /* Dark mode adjustments */
 [data-md-color-scheme="slate"] {
     --md-default-bg-color: #04233b;
@@ -240,6 +403,83 @@ body:has(.hero-section) [data-md-color-scheme="default"] .md-tabs__link:hover {
     --bg-tertiary: rgba(255, 255, 255, 0.15);
     --text-secondary: rgba(255, 255, 255, 0.7);
     --text-tertiary: rgba(255, 255, 255, 0.5);
+}
+
+/* Dark mode code blocks - ensure visibility */
+[data-md-color-scheme="slate"] .highlight {
+    background-color: #021828;
+    color: #f8f8f2;
+}
+
+[data-md-color-scheme="slate"] .highlight code {
+    color: #f8f8f2;
+    background-color: transparent;
+}
+
+[data-md-color-scheme="slate"] .highlight pre {
+    color: #f8f8f2;
+    background-color: #021828;
+}
+
+/* Standard MkDocs code blocks - ensure proper styling */
+.md-typeset pre {
+    background-color: #fafafa;
+    color: #04233b;
+}
+
+.md-typeset code {
+    background-color: rgba(0, 0, 0, 0.05);
+    color: #04233b;
+}
+
+.md-typeset pre code {
+    background-color: transparent;
+    color: inherit;
+}
+
+/* Dark mode for standard MkDocs code blocks */
+[data-md-color-scheme="slate"] .md-typeset pre {
+    background-color: #021828;
+    color: #f8f8f2;
+}
+
+[data-md-color-scheme="slate"] .md-typeset code {
+    background-color: rgba(255, 255, 255, 0.1);
+    color: #f8f8f2;
+}
+
+[data-md-color-scheme="slate"] .md-typeset pre code {
+    background-color: transparent;
+    color: #f8f8f2;
+}
+
+/* Inline code styling */
+.md-typeset :not(pre) > code {
+    background-color: rgba(0, 0, 0, 0.05);
+    color: #04233b;
+    padding: 0.2em 0.4em;
+    border-radius: 3px;
+}
+
+[data-md-color-scheme="slate"] .md-typeset :not(pre) > code {
+    background-color: rgba(255, 255, 255, 0.15);
+    color: #f8f8f2;
+}
+
+/* Fallback for code blocks without language class */
+.highlight:not([class*="language-"]) {
+    background-color: #fafafa;
+    color: #04233b;
+}
+
+[data-md-color-scheme="slate"] .highlight:not([class*="language-"]) {
+    background-color: #021828;
+    color: #f8f8f2;
+}
+
+[data-md-color-scheme="slate"] .highlight:not([class*="language-"]) code {
+    color: #f8f8f2;
+    background-color: transparent;
 }
 
 [data-md-color-scheme="slate"] .md-header {
