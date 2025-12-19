@@ -164,7 +164,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                             y = aggr_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
                             drop_obj(x);
                             x = y;
-                        } else if (x->type == TYPE_MAPFILTER) {
+                        } else if (!(car->attrs & FN_AGGR) && x->type == TYPE_MAPFILTER) {
                             y = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
                             drop_obj(x);
                             x = y;
@@ -190,7 +190,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                             y = aggr_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
                             drop_obj(x);
                             x = y;
-                        } else if (x->type == TYPE_MAPFILTER) {
+                        } else if (!(car->attrs & FN_AGGR) && x->type == TYPE_MAPFILTER) {
                             y = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
                             drop_obj(x);
                             x = y;
@@ -206,7 +206,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                             z = aggr_collect(AS_LIST(y)[0], AS_LIST(y)[1]);
                             drop_obj(y);
                             y = z;
-                        } else if (y->type == TYPE_MAPFILTER) {
+                        } else if (!(car->attrs & FN_AGGR) && y->type == TYPE_MAPFILTER) {
                             z = filter_collect(AS_LIST(y)[0], AS_LIST(y)[1]);
                             drop_obj(y);
                             y = z;
@@ -235,7 +235,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                                 y = aggr_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
                                 drop_obj(x);
                                 x = y;
-                            } else if (x->type == TYPE_MAPFILTER) {
+                            } else if (!(car->attrs & FN_AGGR) && x->type == TYPE_MAPFILTER) {
                                 y = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
                                 drop_obj(x);
                                 x = y;

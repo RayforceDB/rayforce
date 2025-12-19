@@ -180,23 +180,39 @@ i64_t indexl_bin_i32_(i32_t val, i32_t vals[], i64_t offset, i64_t len) {
         $res;                                                  \
     })
 
-#define PARTED_MAP(groups, val, index, preaggr, incoerse, outcoerse, postaggr)                        \
-    ({                                                                                                \
-        i64_t $$i, $$j, $$l;                                                                          \
-        obj_p $$parts, $$res, $$filter, $$v;                                                          \
-        $$l = val->len;                                                                               \
-        $$filter = index_group_filter(index);                                                         \
-        $$res = __v_##outcoerse(groups);                                                              \
-        for ($$i = 0, $$j = 0; $$i < $$l; $$i++) {                                                    \
-            if ($$filter == NULL_OBJ || AS_LIST($$filter)[$$i] != NULL_OBJ) {                         \
-                $$parts = aggr_map(preaggr, AS_LIST(val)[$$i], AS_LIST(val)[$$i]->type, index);       \
-                $$v = AGGR_COLLECT($$parts, 1, incoerse, outcoerse, postaggr);                        \
-                drop_obj($$parts);                                                                    \
-                memcpy(__AS_##outcoerse($$res) + $$j++, __AS_##incoerse($$v), __SIZE_OF_##outcoerse); \
-                drop_obj($$v);                                                                        \
-            }                                                                                         \
-        }                                                                                             \
-        $$res;                                                                                        \
+#define PARTED_MAP(groups, val, index, preaggr, incoerse, outcoerse, postaggr)                            \
+    ({                                                                                                    \
+        i64_t $$i, $$j, $$l;                                                                              \
+        obj_p $$parts, $$res, $$filter, $$v;                                                              \
+        $$l = val->len;                                                                                   \
+        $$filter = index_group_filter(index);                                                             \
+        $$res = __v_##outcoerse(groups);                                                                  \
+        if (groups == 1 && $$filter == NULL_OBJ) {                                                        \
+            /* Aggregate all partitions into single result */                                             \
+            for ($$i = 0; $$i < $$l; $$i++) {                                                             \
+                $$parts = aggr_map(preaggr, AS_LIST(val)[$$i], AS_LIST(val)[$$i]->type, index);           \
+                $$v = AGGR_COLLECT($$parts, 1, incoerse, outcoerse, postaggr);                            \
+                drop_obj($$parts);                                                                        \
+                {                                                                                         \
+                    outcoerse##_t *$out = __AS_##outcoerse($$res);                                        \
+                    incoerse##_t *$in = __AS_##incoerse($$v);                                             \
+                    i64_t $x = 0, $y = 0;                                                                 \
+                    postaggr;                                                                             \
+                }                                                                                         \
+                drop_obj($$v);                                                                            \
+            }                                                                                             \
+        } else {                                                                                          \
+            for ($$i = 0, $$j = 0; $$i < $$l; $$i++) {                                                    \
+                if ($$filter == NULL_OBJ || AS_LIST($$filter)[$$i] != NULL_OBJ) {                         \
+                    $$parts = aggr_map(preaggr, AS_LIST(val)[$$i], AS_LIST(val)[$$i]->type, index);       \
+                    $$v = AGGR_COLLECT($$parts, 1, incoerse, outcoerse, postaggr);                        \
+                    drop_obj($$parts);                                                                    \
+                    memcpy(__AS_##outcoerse($$res) + $$j++, __AS_##incoerse($$v), __SIZE_OF_##outcoerse); \
+                    drop_obj($$v);                                                                        \
+                }                                                                                         \
+            }                                                                                             \
+        }                                                                                                 \
+        $$res;                                                                                            \
     })
 
 static obj_p aggr_map_other(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
@@ -715,6 +731,17 @@ obj_p aggr_last(obj_p val, obj_p index) {
                 res->len = j;
             }
             return res;
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDTIMESTAMP:
+            return PARTED_MAP(n, val, index, (raw_p)aggr_last_partial, i64, i64,
+                              if ($out[$y] == NULL_I64) $out[$y] = $in[$x]);
+        case TYPE_PARTEDF64:
+            return PARTED_MAP(n, val, index, (raw_p)aggr_last_partial, f64, f64,
+                              if (ISNANF64($out[$y])) $out[$y] = $in[$x]);
+        case TYPE_PARTEDGUID:
+            return PARTED_MAP(n, val, index, (raw_p)aggr_last_partial, guid, guid,
+                              if (memcmp($out[$y], NULL_GUID, sizeof(guid_t)) == 0)
+                                  memcpy($out[$y], $in[$x], sizeof(guid_t)));
         default:
             THROW_TYPE1("last", val->type);
     }
@@ -761,6 +788,7 @@ obj_p aggr_sum(obj_p val, obj_p index) {
             drop_obj(parts);
             return res;
         case TYPE_PARTEDI64:
+        case TYPE_PARTEDTIMESTAMP:
             return PARTED_MAP(n, val, index, (raw_p)aggr_sum_partial, i64, i64, $out[$y] = ADDI64($out[$y], $in[$x]));
         case TYPE_PARTEDF64:
             return PARTED_MAP(n, val, index, (raw_p)aggr_sum_partial, f64, f64, $out[$y] = ADDF64($out[$y], $in[$x]));
@@ -825,6 +853,7 @@ obj_p aggr_max(obj_p val, obj_p index) {
             drop_obj(parts);
             return res;
         case TYPE_PARTEDI64:
+        case TYPE_PARTEDTIMESTAMP:
             return PARTED_MAP(n, val, index, (raw_p)aggr_max_partial, i64, i64, $out[$y] = MAXI64($out[$y], $in[$x]));
         case TYPE_PARTEDF64:
             return PARTED_MAP(n, val, index, (raw_p)aggr_max_partial, f64, f64, $out[$y] = MAXF64($out[$y], $in[$x]));
@@ -862,26 +891,37 @@ obj_p aggr_min(obj_p val, obj_p index) {
     obj_p parts, res;
 
     n = index_group_count(index);
-    parts = aggr_map((raw_p)aggr_min_partial, val, val->type, index);
-    if (IS_ERR(parts))
-        return parts;
+
     switch (val->type) {
         case TYPE_TIMESTAMP:
         case TYPE_I64:
+            parts = aggr_map((raw_p)aggr_min_partial, val, val->type, index);
+            if (IS_ERR(parts))
+                return parts;
             res = AGGR_COLLECT(parts, n, i64, i64, $out[$y] = MINI64($out[$y], $in[$x]));
             drop_obj(parts);
             return res;
         case TYPE_F64:
+            parts = aggr_map((raw_p)aggr_min_partial, val, val->type, index);
+            if (IS_ERR(parts))
+                return parts;
             res = AGGR_COLLECT(parts, n, f64, f64, $out[$y] = MINF64($out[$y], $in[$x]));
             drop_obj(parts);
             return res;
         case TYPE_TIME:
         case TYPE_DATE:
+            parts = aggr_map((raw_p)aggr_min_partial, val, val->type, index);
+            if (IS_ERR(parts))
+                return parts;
             res = AGGR_COLLECT(parts, n, i32, i32, $out[$y] = MINI32($out[$y], $in[$x]));
             drop_obj(parts);
             return res;
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDTIMESTAMP:
+            return PARTED_MAP(n, val, index, (raw_p)aggr_min_partial, i64, i64, $out[$y] = MINI64($out[$y], $in[$x]));
+        case TYPE_PARTEDF64:
+            return PARTED_MAP(n, val, index, (raw_p)aggr_min_partial, f64, f64, $out[$y] = MINF64($out[$y], $in[$x]));
         default:
-            drop_obj(parts);
             THROW_TYPE1("min", val->type);
     }
 }
@@ -950,15 +990,56 @@ obj_p aggr_count_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p a
 }
 
 obj_p aggr_count(obj_p val, obj_p index) {
-    i64_t n;
-    obj_p parts, res;
+    i64_t i, j, n, l;
+    obj_p parts, res, filter;
+
     n = index_group_count(index);
-    parts = aggr_map((raw_p)aggr_count_partial, val, TYPE_I64, index);
-    if (IS_ERR(parts))
-        return parts;
-    res = AGGR_COLLECT(parts, n, i64, i64, $out[$y] += $in[$x]);
-    drop_obj(parts);
-    return res;
+
+    switch (val->type) {
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP:
+        case TYPE_PARTEDGUID:
+        case TYPE_PARTEDENUM:
+        case TYPE_PARTEDLIST: {
+            filter = index_group_filter(index);
+            l = val->len;
+            res = I64(n);
+
+            if (n == 1 && filter == NULL_OBJ) {
+                // Aggregate all partitions into single result
+                i64_t total = 0;
+                for (i = 0; i < l; i++) {
+                    total += ops_count(AS_LIST(val)[i]);
+                }
+                AS_I64(res)[0] = total;
+            } else {
+                for (i = 0, j = 0; i < l; i++) {
+                    if (filter == NULL_OBJ || AS_LIST(filter)[i] != NULL_OBJ) {
+                        obj_p fentry = (filter == NULL_OBJ) ? NULL_OBJ : AS_LIST(filter)[i];
+                        if (fentry != NULL_OBJ && fentry->type == -TYPE_I64 && fentry->i64 == -1) {
+                            // Take all rows from partition
+                            AS_I64(res)[j++] = ops_count(AS_LIST(val)[i]);
+                        } else if (fentry != NULL_OBJ && fentry->len > 0) {
+                            // Take filtered rows
+                            AS_I64(res)[j++] = fentry->len;
+                        } else if (filter == NULL_OBJ) {
+                            AS_I64(res)[j++] = ops_count(AS_LIST(val)[i]);
+                        }
+                    }
+                }
+                res->len = j;
+            }
+            return res;
+        }
+        default:
+            parts = aggr_map((raw_p)aggr_count_partial, val, TYPE_I64, index);
+            if (IS_ERR(parts))
+                return parts;
+            res = AGGR_COLLECT(parts, n, i64, i64, $out[$y] += $in[$x]);
+            drop_obj(parts);
+            return res;
+    }
 }
 
 obj_p aggr_avg_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg5) {
@@ -1375,7 +1456,8 @@ obj_p aggr_avg(obj_p val, obj_p index) {
             return res;
 
         case TYPE_PARTEDI64:
-        case TYPE_PARTEDF64: {
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP: {
             obj_p filter, pparts, ppart;
             f64_t total_sum;
             i64_t total_cnt;
@@ -1385,25 +1467,45 @@ obj_p aggr_avg(obj_p val, obj_p index) {
             res = F64(n);
             fo = AS_F64(res);
 
-            for (i = 0, j = 0; i < l; i++) {
-                if (filter == NULL_OBJ || AS_LIST(filter)[i] != NULL_OBJ) {
+            if (n == 1 && filter == NULL_OBJ) {
+                // Aggregate all partitions into single result
+                total_sum = 0.0;
+                total_cnt = 0;
+                for (i = 0; i < l; i++) {
                     pparts = aggr_map_avg(AS_LIST(val)[i], index);
                     if (IS_ERR(pparts)) {
                         drop_obj(res);
                         return pparts;
                     }
-
-                    // Combine all partial results for this partition
-                    total_sum = 0.0;
-                    total_cnt = 0;
                     for (i64_t k = 0; k < pparts->len; k++) {
                         ppart = AS_LIST(pparts)[k];
                         total_sum += AS_F64(AS_LIST(ppart)[0])[0];
                         total_cnt += AS_I64(AS_LIST(ppart)[1])[0];
                     }
-
-                    fo[j++] = (total_cnt == 0) ? NULL_F64 : total_sum / (f64_t)total_cnt;
                     drop_obj(pparts);
+                }
+                fo[0] = (total_cnt == 0) ? NULL_F64 : total_sum / (f64_t)total_cnt;
+            } else {
+                for (i = 0, j = 0; i < l; i++) {
+                    if (filter == NULL_OBJ || AS_LIST(filter)[i] != NULL_OBJ) {
+                        pparts = aggr_map_avg(AS_LIST(val)[i], index);
+                        if (IS_ERR(pparts)) {
+                            drop_obj(res);
+                            return pparts;
+                        }
+
+                        // Combine all partial results for this partition
+                        total_sum = 0.0;
+                        total_cnt = 0;
+                        for (i64_t k = 0; k < pparts->len; k++) {
+                            ppart = AS_LIST(pparts)[k];
+                            total_sum += AS_F64(AS_LIST(ppart)[0])[0];
+                            total_cnt += AS_I64(AS_LIST(ppart)[1])[0];
+                        }
+
+                        fo[j++] = (total_cnt == 0) ? NULL_F64 : total_sum / (f64_t)total_cnt;
+                        drop_obj(pparts);
+                    }
                 }
             }
             return res;
@@ -1990,7 +2092,8 @@ obj_p aggr_dev(obj_p val, obj_p index) {
             return res;
 
         case TYPE_PARTEDI64:
-        case TYPE_PARTEDF64: {
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP: {
             obj_p filter, pparts, ppart;
             f64_t total_sum, total_sumsq;
             i64_t total_cnt;
@@ -2000,35 +2103,65 @@ obj_p aggr_dev(obj_p val, obj_p index) {
             res = F64(n);
             fo = AS_F64(res);
 
-            for (i = 0, j = 0; i < l; i++) {
-                if (filter == NULL_OBJ || AS_LIST(filter)[i] != NULL_OBJ) {
+            if (n == 1 && filter == NULL_OBJ) {
+                // Aggregate all partitions into single result
+                total_sum = 0.0;
+                total_sumsq = 0.0;
+                total_cnt = 0;
+                for (i = 0; i < l; i++) {
                     pparts = aggr_map_dev(AS_LIST(val)[i], index);
                     if (IS_ERR(pparts)) {
                         drop_obj(res);
                         return pparts;
                     }
-
-                    // Combine all partial results for this partition
-                    total_sum = 0.0;
-                    total_sumsq = 0.0;
-                    total_cnt = 0;
                     for (i64_t k = 0; k < pparts->len; k++) {
                         ppart = AS_LIST(pparts)[k];
                         total_sum += AS_F64(AS_LIST(ppart)[0])[0];
                         total_sumsq += AS_F64(AS_LIST(ppart)[1])[0];
                         total_cnt += AS_I64(AS_LIST(ppart)[2])[0];
                     }
-
-                    if (total_cnt == 0) {
-                        fo[j++] = NULL_F64;
-                    } else if (total_cnt == 1) {
-                        fo[j++] = 0.0;
-                    } else {
-                        mean = total_sum / (f64_t)total_cnt;
-                        variance = total_sumsq / (f64_t)total_cnt - mean * mean;
-                        fo[j++] = (variance < 0.0) ? 0.0 : sqrt(variance);
-                    }
                     drop_obj(pparts);
+                }
+                if (total_cnt == 0) {
+                    fo[0] = NULL_F64;
+                } else if (total_cnt == 1) {
+                    fo[0] = 0.0;
+                } else {
+                    mean = total_sum / (f64_t)total_cnt;
+                    variance = total_sumsq / (f64_t)total_cnt - mean * mean;
+                    fo[0] = (variance < 0.0) ? 0.0 : sqrt(variance);
+                }
+            } else {
+                for (i = 0, j = 0; i < l; i++) {
+                    if (filter == NULL_OBJ || AS_LIST(filter)[i] != NULL_OBJ) {
+                        pparts = aggr_map_dev(AS_LIST(val)[i], index);
+                        if (IS_ERR(pparts)) {
+                            drop_obj(res);
+                            return pparts;
+                        }
+
+                        // Combine all partial results for this partition
+                        total_sum = 0.0;
+                        total_sumsq = 0.0;
+                        total_cnt = 0;
+                        for (i64_t k = 0; k < pparts->len; k++) {
+                            ppart = AS_LIST(pparts)[k];
+                            total_sum += AS_F64(AS_LIST(ppart)[0])[0];
+                            total_sumsq += AS_F64(AS_LIST(ppart)[1])[0];
+                            total_cnt += AS_I64(AS_LIST(ppart)[2])[0];
+                        }
+
+                        if (total_cnt == 0) {
+                            fo[j++] = NULL_F64;
+                        } else if (total_cnt == 1) {
+                            fo[j++] = 0.0;
+                        } else {
+                            mean = total_sum / (f64_t)total_cnt;
+                            variance = total_sumsq / (f64_t)total_cnt - mean * mean;
+                            fo[j++] = (variance < 0.0) ? 0.0 : sqrt(variance);
+                        }
+                        drop_obj(pparts);
+                    }
                 }
             }
             return res;

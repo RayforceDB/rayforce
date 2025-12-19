@@ -36,6 +36,7 @@
 #include "pool.h"
 #include "cmp.h"
 #include "iter.h"
+#include "filter.h"
 
 // Helper for indexing i32-based vectors (I32/DATE/TIME) with i64 indices
 static inline obj_p at_vec_i32_by_i64(obj_p x, obj_p y) {
@@ -1031,6 +1032,33 @@ obj_p ray_first(obj_p x) {
     switch (x->type) {
         case TYPE_MAPGROUP:
             return aggr_first(AS_LIST(x)[0], AS_LIST(x)[1]);
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                obj_p res = aggr_first(val, index);
+                drop_obj(index);
+                return res;
+            }
+            obj_p collected = filter_collect(val, filter);
+            obj_p res = ray_first(collected);
+            drop_obj(collected);
+            return res;
+        }
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP:
+        case TYPE_PARTEDGUID:
+        case TYPE_PARTEDENUM:
+        case TYPE_PARTEDLIST: {
+            obj_p index =
+                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
+            obj_p res = aggr_first(x, index);
+            drop_obj(index);
+            return res;
+        }
         default:
             return at_idx(x, 0);
     }
@@ -1042,6 +1070,33 @@ obj_p ray_last(obj_p x) {
     switch (x->type) {
         case TYPE_MAPGROUP:
             return aggr_last(AS_LIST(x)[0], AS_LIST(x)[1]);
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                obj_p res = aggr_last(val, index);
+                drop_obj(index);
+                return res;
+            }
+            obj_p collected = filter_collect(val, filter);
+            obj_p res = ray_last(collected);
+            drop_obj(collected);
+            return res;
+        }
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP:
+        case TYPE_PARTEDGUID:
+        case TYPE_PARTEDENUM:
+        case TYPE_PARTEDLIST: {
+            obj_p index =
+                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
+            obj_p res = aggr_last(x, index);
+            drop_obj(index);
+            return res;
+        }
         default:
             l = ops_count(x);
             return at_idx(x, l ? l - 1 : l);

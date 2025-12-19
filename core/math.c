@@ -22,6 +22,7 @@
  */
 
 #include <math.h>
+#include "math.h"  // for forward declarations
 #include "util.h"
 #include "ops.h"
 #include "error.h"
@@ -29,7 +30,9 @@
 #include "pool.h"
 #include "order.h"
 #include "runtime.h"
-#include "serde.h"  // for size_of_type
+#include "serde.h"   // for size_of_type
+#include "index.h"   // for INDEX_TYPE_PARTEDCOMMON
+#include "filter.h"  // for filter_collect
 
 #define __UNOP_FOLD(x, lt, ot, op, ln, of, iv)                  \
     ({                                                          \
@@ -1188,6 +1191,14 @@ obj_p ray_cnt_partial(obj_p x, i64_t len, i64_t offset) {
             return __UNOP_FOLD(x, i32, i64, CNTI32, len, offset, 0);
         case TYPE_TIMESTAMP:
             return __UNOP_FOLD(x, i64, i64, CNTI64, len, offset, 0);
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64: {
+            obj_p index =
+                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
+            obj_p res = aggr_count(x, index);
+            drop_obj(index);
+            return res;
+        }
         default:
             THROW_TYPE1("cnt non-null", x->type);
     }
@@ -1212,27 +1223,32 @@ obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
             return __UNOP_FOLD(x, i32, atime, FOLD_ADDI32, len, offset, 0);
         case TYPE_MAPGROUP:
             return aggr_sum(AS_LIST(x)[0], AS_LIST(x)[1]);
-
-            // case TYPE_PARTEDI64:
-            //     l = x->len;
-            //     for (i = 0, isum = 0; i < l; i++) {
-            //         res = ray_sum(AS_LIST(x)[i]);
-            //         isum += (res->i64 == NULL_I64) ? 0 : res->i64;
-            //         drop_obj(res);
-            //     }
-
-            //     return i64(isum);
-
-            // case TYPE_PARTEDF64:
-            //     l = x->len;
-            //     for (i = 0, fsum = 0; i < l; i++) {
-            //         res = ray_sum(AS_LIST(x)[i]);
-            //         fsum += res->f64;
-            //         drop_obj(res);
-            //     }
-
-            //     return f64(fsum);
-
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            // Smart aggregation for parted data with parted filter
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                obj_p res = aggr_sum(val, index);
+                drop_obj(index);
+                return res;
+            }
+            // Fallback: materialize and aggregate
+            obj_p collected = filter_collect(val, filter);
+            obj_p res = ray_sum(collected);
+            drop_obj(collected);
+            return res;
+        }
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP: {
+            obj_p index =
+                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
+            obj_p res = aggr_sum(x, index);
+            drop_obj(index);
+            return res;
+        }
         default:
             THROW_TYPE1("sum", x->type);
     }
@@ -1261,6 +1277,30 @@ obj_p ray_min_partial(obj_p x, i64_t len, i64_t offset) {
             return __UNOP_FOLD(x, i64, timestamp, MINI64, len, offset, NULL_I64);
         case TYPE_MAPGROUP:
             return aggr_min(AS_LIST(x)[0], AS_LIST(x)[1]);
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                obj_p res = aggr_min(val, index);
+                drop_obj(index);
+                return res;
+            }
+            obj_p collected = filter_collect(val, filter);
+            obj_p res = ray_min(collected);
+            drop_obj(collected);
+            return res;
+        }
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP: {
+            obj_p index =
+                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
+            obj_p res = aggr_min(x, index);
+            drop_obj(index);
+            return res;
+        }
         default:
             THROW_TYPE1("min", x->type);
     }
@@ -1289,6 +1329,30 @@ obj_p ray_max_partial(obj_p x, i64_t len, i64_t offset) {
             return __UNOP_FOLD(x, i64, timestamp, MAXI64, len, offset, NULL_I64);
         case TYPE_MAPGROUP:
             return aggr_max(AS_LIST(x)[0], AS_LIST(x)[1]);
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                obj_p res = aggr_max(val, index);
+                drop_obj(index);
+                return res;
+            }
+            obj_p collected = filter_collect(val, filter);
+            obj_p res = ray_max(collected);
+            drop_obj(collected);
+            return res;
+        }
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP: {
+            obj_p index =
+                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
+            obj_p res = aggr_max(x, index);
+            drop_obj(index);
+            return res;
+        }
         default:
             THROW_TYPE1("max", x->type);
     }
@@ -1414,6 +1478,16 @@ obj_p unop_fold(raw_p op, obj_p x) {
     if (IS_ATOM(x)) {
         unop = (obj_p(*)(obj_p))op;
         return unop(x);
+    }
+
+    // Handle parted types directly - they have special handling in partial functions
+    if (x->type >= TYPE_PARTEDLIST && x->type <= TYPE_PARTEDGUID) {
+        return ((obj_p(*)(obj_p, i64_t, i64_t))op)(x, x->len, 0);
+    }
+
+    // Handle MAPFILTER and MAPGROUP directly - they have special handling in partial functions
+    if (x->type == TYPE_MAPFILTER || x->type == TYPE_MAPGROUP) {
+        return ((obj_p(*)(obj_p, i64_t, i64_t))op)(x, x->len, 0);
     }
 
     l = ops_count(x);
@@ -1688,7 +1762,31 @@ obj_p ray_avg(obj_p x) {
             return res;
         case TYPE_MAPGROUP:
             return aggr_avg(AS_LIST(x)[0], AS_LIST(x)[1]);
-
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                res = aggr_avg(val, index);
+                drop_obj(index);
+                return res;
+            }
+            obj_p collected = filter_collect(val, filter);
+            res = ray_avg(collected);
+            drop_obj(collected);
+            return res;
+        }
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP: {
+            // Create minimal index for parted aggregation: group_count=1, filter=NULL
+            obj_p index =
+                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
+            res = aggr_avg(x, index);
+            drop_obj(index);
+            return res;
+        }
         default:
             THROW_TYPE1("avg", x->type);
     }
@@ -1740,7 +1838,30 @@ obj_p ray_med(obj_p x) {
 
         case TYPE_MAPGROUP:
             return aggr_med(AS_LIST(x)[0], AS_LIST(x)[1]);
-
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                obj_p res = aggr_med(val, index);
+                drop_obj(index);
+                return res;
+            }
+            obj_p collected = filter_collect(val, filter);
+            obj_p res = ray_med(collected);
+            drop_obj(collected);
+            return res;
+        }
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP: {
+            obj_p index =
+                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
+            obj_p res = aggr_med(x, index);
+            drop_obj(index);
+            return res;
+        }
         default:
             THROW_TYPE1("med", x->type);
     }
@@ -1770,7 +1891,30 @@ obj_p ray_dev(obj_p x) {
             break;
         case TYPE_MAPGROUP:
             return aggr_dev(AS_LIST(x)[0], AS_LIST(x)[1]);
-
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                obj_p res = aggr_dev(val, index);
+                drop_obj(index);
+                return res;
+            }
+            obj_p collected = filter_collect(val, filter);
+            obj_p res = ray_dev(collected);
+            drop_obj(collected);
+            return res;
+        }
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP: {
+            obj_p index =
+                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
+            obj_p res = aggr_dev(x, index);
+            drop_obj(index);
+            return res;
+        }
         default:
             THROW_TYPE1("dev", x->type);
     }

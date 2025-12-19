@@ -25,6 +25,8 @@
 #include "ops.h"
 #include "runtime.h"
 #include "aggr.h"
+#include "index.h"
+#include "filter.h"
 
 obj_p ray_type(obj_p x) {
     i8_t type;
@@ -41,6 +43,33 @@ obj_p ray_count(obj_p x) {
     switch (x->type) {
         case TYPE_MAPGROUP:
             return aggr_count(AS_LIST(x)[0], AS_LIST(x)[1]);
+        case TYPE_MAPFILTER: {
+            obj_p val = AS_LIST(x)[0];
+            obj_p filter = AS_LIST(x)[1];
+            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
+                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
+                                      clone_obj(filter), NULL_OBJ);
+                obj_p res = aggr_count(val, index);
+                drop_obj(index);
+                return res;
+            }
+            obj_p collected = filter_collect(val, filter);
+            obj_p res = ray_count(collected);
+            drop_obj(collected);
+            return res;
+        }
+        case TYPE_PARTEDI64:
+        case TYPE_PARTEDF64:
+        case TYPE_PARTEDTIMESTAMP:
+        case TYPE_PARTEDGUID:
+        case TYPE_PARTEDENUM:
+        case TYPE_PARTEDLIST: {
+            obj_p index =
+                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
+            obj_p res = aggr_count(x, index);
+            drop_obj(index);
+            return res;
+        }
         default:
             return i64(ops_count(x));
     }
