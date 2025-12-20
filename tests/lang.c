@@ -4789,6 +4789,13 @@ test_result_t test_lang_cast() {
     TEST_ASSERT_EQ("(as 'time \"20:00:00.\")", "20:00:00.000");
     TEST_ASSERT_EQ("(as 'time \"20:00:00.0\")", "20:00:00.000");
 
+    // time literals with 1-3 digit fractional seconds
+    TEST_ASSERT_EQ("10:00:00.1", "10:00:00.001");
+    TEST_ASSERT_EQ("10:00:00.01", "10:00:00.001");
+    TEST_ASSERT_EQ("10:00:00.12", "10:00:00.012");
+    TEST_ASSERT_EQ("10:00:00.011", "10:00:00.011");
+    TEST_ASSERT_EQ("10:00:00.123", "10:00:00.123");
+
     // ========== TIME VECTOR CASTS ==========
     TEST_ASSERT_EQ("(type (as 'TIME [0 1000 2000]))", "'TIME");
     TEST_ASSERT_EQ("(type (as 'TIME [0i 1000i 2000i]))", "'TIME");

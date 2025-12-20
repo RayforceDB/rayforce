@@ -1781,7 +1781,7 @@ static obj_p aggr_map_avg_other(obj_p val, obj_p index) {
 static obj_p aggr_map_avg_parted(obj_p val, obj_p index) {
     pool_p pool = runtime_get()->pool;
     i64_t i, l, n, group_count, group_len, out_len, chunk;
-    obj_p res, sc, f64obj, i64obj, outer;
+    obj_p res, sc, f64obj, i64obj;
     raw_p argv[6];
 
     group_count = index_group_count(index);

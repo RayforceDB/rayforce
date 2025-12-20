@@ -235,11 +235,22 @@ obj_p parse_time(parser_t *parser) {
     if (*current == '.') {
         current++;
 
-        if (is_digit(*current) && is_digit(*(current + 1)) && is_digit(*(current + 2))) {
-            tm.msecs = (*current - '0') * 100 + (*(current + 1) - '0') * 10 + (*(current + 2) - '0');
-            current += 3;
-        } else
+        if (!is_digit(*current))
             return PARSE_ADVANCE;
+
+        // Parse 1-3 digits for milliseconds (no scaling, .1 = 1ms)
+        tm.msecs = (*current - '0');
+        current++;
+
+        if (is_digit(*current)) {
+            tm.msecs = tm.msecs * 10 + (*current - '0');
+            current++;
+
+            if (is_digit(*current)) {
+                tm.msecs = tm.msecs * 10 + (*current - '0');
+                current++;
+            }
+        }
     }
 
     shift(parser, current - parser->current);
