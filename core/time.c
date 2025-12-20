@@ -91,10 +91,17 @@ timestruct_t time_from_str(str_p src, i64_t len) {
         val = val * 10 + digit;
     }
 
-    if (cnt < 3)
-        ts.null = 1;
-
-    ts.msecs = (u16_t)val;
+    switch (cnt) {
+        case 2:
+            ts.secs = (u8_t)val;
+            break;
+        case 3:
+            ts.msecs = (u16_t)val;
+            break;
+        default:
+            ts.null = 1;
+            break;
+    }
 
     return ts;
 }

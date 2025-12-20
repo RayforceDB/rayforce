@@ -4785,6 +4785,9 @@ test_result_t test_lang_cast() {
     TEST_ASSERT_EQ("(type (as 'time 2000.01.01D00:00:00.000000001))", "'time");
     // time <- String
     TEST_ASSERT_EQ("(as 'time \"12:30:45.123\")", "12:30:45.123");
+    TEST_ASSERT_EQ("(as 'time \"20:00:00\")", "20:00:00.000");
+    TEST_ASSERT_EQ("(as 'time \"20:00:00.\")", "20:00:00.000");
+    TEST_ASSERT_EQ("(as 'time \"20:00:00.0\")", "20:00:00.000");
 
     // ========== TIME VECTOR CASTS ==========
     TEST_ASSERT_EQ("(type (as 'TIME [0 1000 2000]))", "'TIME");
