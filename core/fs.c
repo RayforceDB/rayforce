@@ -283,11 +283,11 @@ obj_p fs_read_dir(lit_p path) {
     return lst;
 }
 
-i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], i64_t len) { 
+i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], i64_t len) {
     (void)fd;
     (void)buf;
     (void)len;
-    return -1; 
+    return -1;
 }
 
 #else
@@ -430,12 +430,10 @@ i64_t fs_get_fname_by_fd(i64_t fd, c8_t buf[], i64_t len) {
 
     snprintf(path, sizeof(path), "/proc/self/fd/%lld", fd);
 
-    // Read symbolic link
+    // Read symbolic link - silently fail if fd is invalid (cleanup scenario)
     l = readlink(path, buf, len - 1);
-    if (l == -1) {
-        perror("readlink");
+    if (l == -1)
         return -1;
-    }
 
     buf[l] = '\0';  // Null-terminate the string
 

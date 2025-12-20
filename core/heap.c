@@ -336,16 +336,25 @@ __attribute__((hot)) nil_t heap_free(raw_p ptr) {
     block = RAW2BLOCK(ptr);
     order = block->order;
 
-    // return block to the system and close file if it is backed
+    // Validate block metadata - detect memory corruption or invalid pointers
+    // backed should only be 0 or 1, order should be >= MIN_BLOCK_ORDER for heap blocks
+    if (block->backed != B8_FALSE && block->backed != B8_TRUE) {
+        obj_p obj = (obj_p)ptr;
+        fprintf(stderr, "heap_free: corrupted block header (backed=%d, order=%d) at ptr=%p, type=%d\n", block->backed,
+                block->order, ptr, obj->type);
+        fprintf(stderr, "  This usually indicates a buffer overflow or use-after-free bug.\n");
+        assert(0 && "heap_free: corrupted block header");
+    }
+
+    // Return block to the system and close file if it is file-backed
     if (block->backed) {
         fd = (i64_t)block->pool;
         heap_remove_pool(block, BSIZEOF(order));
-        fs_get_fname_by_fd(fd, filename, sizeof(filename));
-        res = fs_fclose(fd);
-        if (res == -1)
-            perror("can't close backed file");
-
-        fs_fdelete(filename);
+        // Get filename before closing - ignore errors as file may already be gone
+        res = fs_get_fname_by_fd(fd, filename, sizeof(filename));
+        fs_fclose(fd);
+        if (res == 0)
+            fs_fdelete(filename);
 
         return;
     }

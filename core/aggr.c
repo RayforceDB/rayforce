@@ -563,6 +563,20 @@ obj_p aggr_first(obj_p val, obj_p index) {
         case TYPE_PARTEDB8:
         case TYPE_PARTEDU8:
             filter = index_group_filter(index);
+            if (n == 1) {
+                // Global first - return first element of first matching partition
+                res = vector(AS_LIST(val)[0]->type, 1);
+                l = val->len;
+                for (i = 0; i < l; i++) {
+                    obj_p fentry = (filter == NULL_OBJ) ? NULL_OBJ : AS_LIST(filter)[i];
+                    if (filter == NULL_OBJ ||
+                        (fentry != NULL_OBJ && ((fentry->type == -TYPE_I64 && fentry->i64 == -1) || fentry->len > 0))) {
+                        AS_B8(res)[0] = AS_B8(AS_LIST(val)[i])[0];
+                        break;
+                    }
+                }
+                return res;
+            }
             res = vector(AS_LIST(val)[0]->type, n);
             if (filter == NULL_OBJ) {
                 // No filter - iterate over all partitions
@@ -584,10 +598,16 @@ obj_p aggr_first(obj_p val, obj_p index) {
         case TYPE_PARTEDI64:
         case TYPE_PARTEDTIMESTAMP:
             filter = index_group_filter(index);
-            if (n == 1 && filter == NULL_OBJ) {
-                // Global first - return first element of first partition
+            if (n == 1) {
+                // Global first - return first element of first matching partition
                 res = vector(AS_LIST(val)[0]->type, 1);
-                AS_I64(res)[0] = AS_I64(AS_LIST(val)[0])[0];
+                l = val->len;
+                for (i = 0; i < l; i++) {
+                    if (filter == NULL_OBJ || AS_LIST(filter)[i] != NULL_OBJ) {
+                        AS_I64(res)[0] = AS_I64(AS_LIST(val)[i])[0];
+                        break;
+                    }
+                }
                 return res;
             }
             res = vector(AS_LIST(val)[0]->type, n);
@@ -629,6 +649,20 @@ obj_p aggr_first(obj_p val, obj_p index) {
             if (IS_ERR(ek))
                 return ek;
 
+            if (n == 1) {
+                // Global first - return first element of first matching partition
+                parts = I64(1);
+                l = val->len;
+                for (i = 0; i < l; i++) {
+                    if (filter == NULL_OBJ || AS_LIST(filter)[i] != NULL_OBJ) {
+                        AS_I64(parts)[0] = AS_I64(ENUM_VAL(AS_LIST(val)[i]))[0];
+                        break;
+                    }
+                }
+                res = enumerate(ek, parts);
+                return res;
+            }
+
             // Create the values vector with size n (number of groups/matching partitions)
             parts = I64(n);
 
@@ -653,6 +687,19 @@ obj_p aggr_first(obj_p val, obj_p index) {
             filter = index_group_filter(index);
             if (filter == NULL_OBJ)
                 return clone_obj(AS_LIST(val)[0]);
+
+            if (n == 1) {
+                // Global first - return first matching value
+                res = vector(AS_LIST(val)[0]->type, 1);
+                l = filter->len;
+                for (i = 0; i < l; i++) {
+                    if (AS_LIST(filter)[i] != NULL_OBJ) {
+                        AS_DATE(res)[0] = AS_DATE(AS_LIST(val)[0])[i];
+                        break;
+                    }
+                }
+                return res;
+            }
 
             res = vector(AS_LIST(val)[0]->type, n);
             l = filter->len;
@@ -799,6 +846,20 @@ obj_p aggr_last(obj_p val, obj_p index) {
             return res;
         case TYPE_PARTEDLIST:
             filter = index_group_filter(index);
+            if (n == 1) {
+                // Global last - return last element of last matching partition
+                res = LIST(1);
+                l = val->len;
+                for (i = l - 1; i >= 0; i--) {
+                    obj_p fentry = (filter == NULL_OBJ) ? NULL_OBJ : AS_LIST(filter)[i];
+                    if (filter == NULL_OBJ ||
+                        (fentry != NULL_OBJ && ((fentry->type == -TYPE_I64 && fentry->i64 == -1) || fentry->len > 0))) {
+                        AS_LIST(res)[0] = at_idx(AS_LIST(val)[i], -1);
+                        break;
+                    }
+                }
+                return res;
+            }
             res = LIST(n);
             if (filter == NULL_OBJ) {
                 // No filter - iterate over all partitions
@@ -821,6 +882,21 @@ obj_p aggr_last(obj_p val, obj_p index) {
         case TYPE_PARTEDB8:
         case TYPE_PARTEDU8:
             filter = index_group_filter(index);
+            if (n == 1) {
+                // Global last - return last element of last matching partition
+                res = vector(AS_LIST(val)[0]->type, 1);
+                l = val->len;
+                for (i = l - 1; i >= 0; i--) {
+                    obj_p fentry = (filter == NULL_OBJ) ? NULL_OBJ : AS_LIST(filter)[i];
+                    if (filter == NULL_OBJ ||
+                        (fentry != NULL_OBJ && ((fentry->type == -TYPE_I64 && fentry->i64 == -1) || fentry->len > 0))) {
+                        i64_t pl = AS_LIST(val)[i]->len;
+                        AS_B8(res)[0] = AS_B8(AS_LIST(val)[i])[pl - 1];
+                        break;
+                    }
+                }
+                return res;
+            }
             res = vector(AS_LIST(val)[0]->type, n);
             if (filter == NULL_OBJ) {
                 // No filter - iterate over all partitions
@@ -1705,7 +1781,7 @@ static obj_p aggr_map_avg_other(obj_p val, obj_p index) {
 static obj_p aggr_map_avg_parted(obj_p val, obj_p index) {
     pool_p pool = runtime_get()->pool;
     i64_t i, l, n, group_count, group_len, out_len, chunk;
-    obj_p res, sc;
+    obj_p res, sc, f64obj, i64obj, outer;
     raw_p argv[6];
 
     group_count = index_group_count(index);
@@ -1719,7 +1795,9 @@ static obj_p aggr_map_avg_parted(obj_p val, obj_p index) {
         argv[1] = (raw_p)0;
         argv[2] = val;
         argv[3] = index;
-        sc = vn_list(2, F64(out_len), I64(out_len));
+        f64obj = F64(out_len);
+        i64obj = I64(out_len);
+        sc = vn_list(2, f64obj, i64obj);
         argv[4] = (raw_p)sc;
         res = pool_call_task_fn((raw_p)aggr_avg_partial, 5, argv);
         return vn_list(1, res);
@@ -1866,11 +1944,15 @@ obj_p aggr_avg(obj_p val, obj_p index) {
             res = F64(n);
             fo = AS_F64(res);
 
-            if (n == 1 && filter == NULL_OBJ) {
-                // Aggregate all partitions into single result
+            if (n == 1) {
+                // Global aggregation (single result) - accumulate across all matching partitions
                 total_sum = 0.0;
                 total_cnt = 0;
                 for (i = 0; i < l; i++) {
+                    // Skip partitions that don't match the filter
+                    if (filter != NULL_OBJ && AS_LIST(filter)[i] == NULL_OBJ)
+                        continue;
+
                     pparts = aggr_map_avg(AS_LIST(val)[i], index);
                     if (IS_ERR(pparts)) {
                         drop_obj(res);
@@ -1885,6 +1967,7 @@ obj_p aggr_avg(obj_p val, obj_p index) {
                 }
                 fo[0] = (total_cnt == 0) ? NULL_F64 : total_sum / (f64_t)total_cnt;
             } else {
+                // Multiple groups - one result per matching partition
                 for (i = 0, j = 0; i < l; i++) {
                     if (filter == NULL_OBJ || AS_LIST(filter)[i] != NULL_OBJ) {
                         pparts = aggr_map_avg(AS_LIST(val)[i], index);
@@ -2726,12 +2809,16 @@ obj_p aggr_dev(obj_p val, obj_p index) {
             res = F64(n);
             fo = AS_F64(res);
 
-            if (n == 1 && filter == NULL_OBJ) {
-                // Aggregate all partitions into single result
+            if (n == 1) {
+                // Global aggregation (single result) - accumulate across all matching partitions
                 total_sum = 0.0;
                 total_sumsq = 0.0;
                 total_cnt = 0;
                 for (i = 0; i < l; i++) {
+                    // Skip partitions that don't match the filter
+                    if (filter != NULL_OBJ && AS_LIST(filter)[i] == NULL_OBJ)
+                        continue;
+
                     pparts = aggr_map_dev(AS_LIST(val)[i], index);
                     if (IS_ERR(pparts)) {
                         drop_obj(res);
@@ -2755,6 +2842,7 @@ obj_p aggr_dev(obj_p val, obj_p index) {
                     fo[0] = (variance < 0.0) ? 0.0 : sqrt(variance);
                 }
             } else {
+                // Multiple groups - one result per matching partition
                 for (i = 0, j = 0; i < l; i++) {
                     if (filter == NULL_OBJ || AS_LIST(filter)[i] != NULL_OBJ) {
                         pparts = aggr_map_dev(AS_LIST(val)[i], index);
