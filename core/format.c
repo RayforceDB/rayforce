@@ -948,17 +948,17 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
 
     // Check if this is a partitioned table (has columns with TYPE_PARTEDLIST types)
     // Partitioned tables cannot be shown in full, only individual partitions can
-    if (full) {
-        for (i = 0; i < cols; i++) {
-            column = AS_LIST(columns)[i];
-            if (column->type >= TYPE_PARTEDLIST && column->type < TYPE_TABLE) {
-                return str_fmt_into(dst, NO_LIMIT,
-                                    "@parted-table (%lld partitions, %lld columns, %lld rows)\n"
-                                    "Use (first t) or (last t) to access individual partitions",
-                                    column->len, cols, ops_count(column));
-            }
-        }
-    }
+    // if (full) {
+    //     for (i = 0; i < cols; i++) {
+    //         column = AS_LIST(columns)[i];
+    //         if (column->type >= TYPE_PARTEDLIST && column->type < TYPE_TABLE) {
+    //             return str_fmt_into(dst, NO_LIMIT,
+    //                                 "@parted-table (%lld partitions, %lld columns, %lld rows)\n"
+    //                                 "Use (first t) or (last t) to access individual partitions",
+    //                                 column->len, cols, ops_count(column));
+    //         }
+    //     }
+    // }
 
     rows = ops_count(obj);
     table_height = rows;
