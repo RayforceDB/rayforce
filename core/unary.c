@@ -81,6 +81,13 @@ obj_p ray_get(obj_p x) {
 
             res = (obj_p)mmap_file(fd, NULL, size, 0);
 
+            if (res == NULL) {
+                res = ray_error(ERR_IO, "get: failed to map file: '%.*s'", (i32_t)path->len, AS_C8(path));
+                drop_obj(path);
+                fs_fclose(fd);
+                return res;
+            }
+
             if (IS_EXTERNAL_SERIALIZED(res)) {
                 sz = size - ISIZEOF(struct obj_t);
                 v = de_raw((u8_t *)res + ISIZEOF(struct obj_t), &sz);

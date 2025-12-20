@@ -138,14 +138,17 @@ obj_p fs_read_dir(lit_p path) {
     obj_p lst = LIST(0);
     char searchPath[MAX_PATH];
 
-    // Append \* to the path for Windows API
-    snprintf(searchPath, MAX_PATH, "%s\\*", path);
+    // Append /* to the path (Windows accepts forward slashes)
+    snprintf(searchPath, MAX_PATH, "%s/*", path);
 
     hFind = FindFirstFile(searchPath, &findFileData);
     if (hFind == INVALID_HANDLE_VALUE)
-        return NULL_OBJ;
+        return sys_error(ERROR_TYPE_SYS, path);
 
     do {
+        // Skip . and .. entries
+        if (strcmp(findFileData.cFileName, ".") == 0 || strcmp(findFileData.cFileName, "..") == 0)
+            continue;
         push_obj(&lst, string_from_str(findFileData.cFileName, strlen(findFileData.cFileName)));
     } while (FindNextFile(hFind, &findFileData) != 0);
 
