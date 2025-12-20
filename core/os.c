@@ -23,6 +23,7 @@
 
 #include "os.h"
 #include "error.h"
+#include "log.h"
 #include "string.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +37,7 @@
 
 i64_t os_get_var(lit_p name, c8_t buf[], i64_t len) {
     if (!name || !buf || len == 0) {
-        fprintf(stderr, "Invalid arguments.\n");
+        LOG_ERROR("os_get_var: Invalid arguments");
         return -1;
     }
 
@@ -45,7 +46,7 @@ i64_t os_get_var(lit_p name, c8_t buf[], i64_t len) {
     if (result == 0)
         return -1;
     if (result >= len) {
-        fprintf(stderr, "Buffer too small for environment variable '%s'.\n", name);
+        LOG_ERROR("Buffer too small for environment variable '%s'", name);
         return -1;
     }
 #else
@@ -53,7 +54,7 @@ i64_t os_get_var(lit_p name, c8_t buf[], i64_t len) {
     if (!value)
         return -1;
     if (strlen(value) >= (u64_t)len) {
-        fprintf(stderr, "Buffer too small for environment variable '%s'.\n", name);
+        LOG_ERROR("Buffer too small for environment variable '%s'", name);
         return -1;
     }
     strncpy(buf, value, len - 1);

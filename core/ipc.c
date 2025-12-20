@@ -49,54 +49,43 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     u8_t buf[2] = {RAYFORCE_VERSION, 0x00};
     i64_t received = 0;
 
-    fprintf(stderr, "[DEBUG] ipc_open: connecting to %s:%lld\n", addr->ip, addr->port);
-    fflush(stderr);
+    LOG_TRACE("ipc_open: connecting to %s:%lld", addr->ip, addr->port);
 
     // Open a blocking TCP connection
     fd = sock_open(addr, timeout);
     if (fd == -1) {
-        fprintf(stderr, "[DEBUG] ipc_open: sock_open failed\n");
-        fflush(stderr);
+        LOG_DEBUG("ipc_open: sock_open failed");
         return -1;
     }
-    fprintf(stderr, "[DEBUG] ipc_open: connected, fd=%lld\n", fd);
-    fflush(stderr);
+    LOG_TRACE("ipc_open: connected, fd=%lld", fd);
 
     // Send handshake (version + null terminator)
-    fprintf(stderr, "[DEBUG] ipc_open: sending handshake\n");
-    fflush(stderr);
+    LOG_TRACE("ipc_open: sending handshake");
     if (sock_send(fd, buf, 2) == -1) {
-        fprintf(stderr, "[DEBUG] ipc_open: sock_send failed\n");
-        fflush(stderr);
+        LOG_DEBUG("ipc_open: sock_send failed");
         sock_close(fd);
         return -1;
     }
-    fprintf(stderr, "[DEBUG] ipc_open: handshake sent\n");
-    fflush(stderr);
+    LOG_TRACE("ipc_open: handshake sent");
 
     // Receive handshake response (version + null terminator)
     // Server sends 2 bytes, so we need to read until we get both
-    fprintf(stderr, "[DEBUG] ipc_open: waiting for response\n");
-    fflush(stderr);
+    LOG_TRACE("ipc_open: waiting for response");
     while (received < 2) {
         i64_t sz = sock_recv(fd, buf + received, 2 - received);
-        fprintf(stderr, "[DEBUG] ipc_open: sock_recv returned %lld\n", sz);
-        fflush(stderr);
+        LOG_TRACE("ipc_open: sock_recv returned %lld", sz);
         if (sz <= 0) {
-            fprintf(stderr, "[DEBUG] ipc_open: sock_recv failed or closed\n");
-            fflush(stderr);
+            LOG_DEBUG("ipc_open: sock_recv failed or closed");
             sock_close(fd);
             return -1;
         }
         received += sz;
     }
-    fprintf(stderr, "[DEBUG] ipc_open: response received, version=%d\n", buf[0]);
-    fflush(stderr);
+    LOG_TRACE("ipc_open: response received, version=%d", buf[0]);
 
     // Validate response - should end with null terminator
     if (buf[1] != 0x00) {
-        fprintf(stderr, "[DEBUG] ipc_open: invalid response\n");
-        fflush(stderr);
+        LOG_DEBUG("ipc_open: invalid response");
         sock_close(fd);
         return -1;
     }
@@ -107,13 +96,11 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     // Register the socket with IOCP - pass the received version
     id = poll_register(poll, fd, buf[0]);
     if (id == -1) {
-        fprintf(stderr, "[DEBUG] ipc_open: poll_register failed\n");
-        fflush(stderr);
+        LOG_DEBUG("ipc_open: poll_register failed");
         sock_close(fd);
         return -1;
     }
-    fprintf(stderr, "[DEBUG] ipc_open: registered, id=%lld\n", id);
-    fflush(stderr);
+    LOG_TRACE("ipc_open: registered, id=%lld", id);
 
     return id;
 }
@@ -224,7 +211,7 @@ nil_t ipc_call_usr_cb(poll_p poll, selector_p selector, lit_p sym, i64_t len) {
         poll_set_usr_fd(0);
         if (IS_ERR(v)) {
             f = obj_fmt(v, B8_FALSE);
-            fprintf(stderr, "Error in user callback: \n%.*s\n", (i32_t)f->len, AS_C8(f));
+            LOG_ERROR("Error in user callback: %.*s", (i32_t)f->len, AS_C8(f));
             drop_obj(f);
         }
 

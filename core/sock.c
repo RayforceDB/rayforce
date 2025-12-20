@@ -88,8 +88,7 @@ i64_t sock_open(sock_addr_t *addr, i64_t timeout) {
     struct timeval tm;
     char port_str[16];
 
-    fprintf(stderr, "[DEBUG] sock_open: addr=%s port=%lld timeout=%lld\n", addr->ip, addr->port, timeout);
-    fflush(stderr);
+    LOG_DEBUG("sock_open: addr=%s port=%lld timeout=%lld", addr->ip, addr->port, timeout);
 
     // Convert port to string for getaddrinfo
     _snprintf(port_str, sizeof(port_str), "%lld", addr->port);
@@ -103,8 +102,7 @@ i64_t sock_open(sock_addr_t *addr, i64_t timeout) {
 
     // Get address info
     code = getaddrinfo(addr->ip, port_str, &hints, &result);
-    fprintf(stderr, "[DEBUG] sock_open: getaddrinfo returned %d\n", code);
-    fflush(stderr);
+    LOG_DEBUG("sock_open: getaddrinfo returned %d", code);
     if (code != 0) {
         code = WSAGetLastError();
         LOG_ERROR("Failed to resolve hostname %s: %d", addr->ip, code);
@@ -114,19 +112,16 @@ i64_t sock_open(sock_addr_t *addr, i64_t timeout) {
 
     // Try each address until we successfully connect
     for (rp = result; rp != NULL; rp = rp->ai_next) {
-        fprintf(stderr, "[DEBUG] sock_open: trying family=%d socktype=%d protocol=%d\n", 
+        LOG_DEBUG("sock_open: trying family=%d socktype=%d protocol=%d", 
                 rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        fflush(stderr);
         
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd == INVALID_SOCKET) {
             last_error = WSAGetLastError();
-            fprintf(stderr, "[DEBUG] sock_open: socket() failed, error=%d\n", last_error);
-            fflush(stderr);
+            LOG_DEBUG("sock_open: socket() failed, error=%d", last_error);
             continue;
         }
-        fprintf(stderr, "[DEBUG] sock_open: socket created fd=%lld\n", (i64_t)fd);
-        fflush(stderr);
+        LOG_DEBUG("sock_open: socket created fd=%lld", (i64_t)fd);
 
         // Set timeout for connect operation
         if (timeout > 0) {
@@ -134,32 +129,27 @@ i64_t sock_open(sock_addr_t *addr, i64_t timeout) {
             tm.tv_usec = (timeout % 1000) * 1000;
             if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tm, sizeof(tm)) == SOCKET_ERROR) {
                 last_error = WSAGetLastError();
-                fprintf(stderr, "[DEBUG] sock_open: SO_RCVTIMEO failed, error=%d\n", last_error);
-                fflush(stderr);
+                LOG_DEBUG("sock_open: SO_RCVTIMEO failed, error=%d", last_error);
                 closesocket(fd);
                 continue;
             }
             if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tm, sizeof(tm)) == SOCKET_ERROR) {
                 last_error = WSAGetLastError();
-                fprintf(stderr, "[DEBUG] sock_open: SO_SNDTIMEO failed, error=%d\n", last_error);
-                fflush(stderr);
+                LOG_DEBUG("sock_open: SO_SNDTIMEO failed, error=%d", last_error);
                 closesocket(fd);
                 continue;
             }
         }
 
         // Try to connect
-        fprintf(stderr, "[DEBUG] sock_open: connecting...\n");
-        fflush(stderr);
+        LOG_DEBUG("sock_open: connecting...");
         if (connect(fd, rp->ai_addr, rp->ai_addrlen) != SOCKET_ERROR) {
-            fprintf(stderr, "[DEBUG] sock_open: connect succeeded!\n");
-            fflush(stderr);
+            LOG_DEBUG("sock_open: connect succeeded!");
             break;  // Success
         }
 
         last_error = WSAGetLastError();
-        fprintf(stderr, "[DEBUG] sock_open: connect failed, error=%d\n", last_error);
-        fflush(stderr);
+        LOG_DEBUG("sock_open: connect failed, error=%d", last_error);
         closesocket(fd);
         fd = INVALID_SOCKET;
     }

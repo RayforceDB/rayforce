@@ -23,6 +23,7 @@
 
 #include <stdio.h>
 #include "def.h"
+#include "log.h"
 #if defined(OS_WINDOWS)
 #include <io.h>
 #include <conio.h>
@@ -1312,7 +1313,7 @@ obj_p term_handle_return(term_p term) {
         term->multiline_buf[term->multiline_len] = '\0';
     } else {
         // Buffer overflow - handle error and skip further processing
-        fprintf(stderr, "%sError: input too long for multiline buffer.%s\n", RED, RESET);
+        LOG_ERROR("Error: input too long for multiline buffer");
         return NULL_OBJ;
     }
 

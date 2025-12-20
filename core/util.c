@@ -23,6 +23,7 @@
 
 #include <stdarg.h>
 #include "util.h"
+#include "log.h"
 
 #if defined(DEBUG)
 
@@ -83,9 +84,9 @@ nil_t dump_stack(nil_t) {
     strings = backtrace_symbols(array, size);  // Translate addresses to an array of strings
 
     if (strings != NULL) {
-        fprintf(stderr, "Stack trace:\n");
+        LOG_ERROR("Stack trace:");
         for (i = 0; i < size; i++)
-            fprintf(stderr, "%s\n", strings[i]);
+            LOG_ERROR("%s", strings[i]);
         free(strings);  // Free the memory allocated by backtrace_symbols
     }
 }
