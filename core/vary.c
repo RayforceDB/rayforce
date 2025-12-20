@@ -23,6 +23,7 @@
 
 #include <stdio.h>
 #include "eval.h"
+#include "log.h"
 #include "unary.h"
 #include "binary.h"
 #include "vary.h"
@@ -187,37 +188,46 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
     i64_t i, j, l, wide;
     obj_p path, dir, sym, dirs, gcol, ord, t1, t2, eq, fmaps, virtcol, v, keys, vals, res;
 
+    LOG_DEBUG("get_parted: n=%lld", n);
+
     switch (n) {
         case 2:
+            LOG_DEBUG("get_parted: checking args");
             if (x[0]->type != TYPE_C8)
                 THROW(ERR_TYPE, "get parted: expected string as 1st argument, got %s", type_name(x[0]->type));
 
             if (x[1]->type != -TYPE_SYMBOL)
                 THROW(ERR_TYPE, "get parted: expected symbol as 2nd argument, got %s", type_name(x[1]->type));
 
+            LOG_DEBUG("get_parted: loading symfile");
             // Load symfile if present (needed before reading partitions with ENUM columns)
             // Ignore error if symfile doesn't exist - it's optional
             if (resolve(SYMBOL_SYM) == NULL)
                 drop_obj(io_get_symfile(x[0]));
 
+            LOG_DEBUG("get_parted: reading dir");
             // Read directories structure
             path = cstring_from_obj(x[0]);
             dir = fs_read_dir(AS_C8(path));
             drop_obj(path);
 
+            LOG_DEBUG("get_parted: dir read, IS_ERR=%d, dir->len=%lld", IS_ERR(dir), dir ? dir->len : -1);
             if (IS_ERR(dir))
                 return dir;
 
             // Get grouping column (parted by)
+            LOG_DEBUG("get_parted: calling ray_except");
             sym = string_from_str("sym", 3);
             dirs = ray_except(dir, sym);
             drop_obj(sym);
             drop_obj(dir);
 
+            LOG_DEBUG("get_parted: ray_except done, IS_ERR=%d", IS_ERR(dirs));
             if (IS_ERR(dirs))
                 return dirs;
 
             // Try to convert dirs to a parted column (one of numeric datatypes)
+            LOG_DEBUG("get_parted: casting to DATE");
             res = cast_obj(TYPE_DATE, dirs);
 
             if (IS_ERR(res)) {
@@ -226,6 +236,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
             }
 
             // TODO: Sort parted dirs in an ascending order
+            LOG_DEBUG("get_parted: sorting");
             v = cast_obj(TYPE_I64, res);
             ord = ray_iasc(v);
             drop_obj(v);
@@ -236,6 +247,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
                 return ord;
             }
 
+            LOG_DEBUG("get_parted: getting gcol");
             gcol = ray_at(res, ord);
             drop_obj(res);
 
@@ -245,6 +257,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
 
             // Trverse dirs for requested table
             l = res->len;
+            LOG_DEBUG("get_parted: l=%lld", l);
 
             if (l == 0) {
                 drop_obj(gcol);
