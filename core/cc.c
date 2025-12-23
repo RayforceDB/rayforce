@@ -197,6 +197,11 @@ static i64_t cc_expr(cc_ctx_t *cc, obj_p e) {
 
     switch (e->type) {
         case -TYPE_SYMBOL:
+            // Quoted symbols are treated as literal constants (no dereference)
+            if (e->attrs & ATTR_QUOTED) {
+                CC(cc, clone_obj(e));
+                return 0;
+            }
             // Check if it's a function argument
             i = find_raw(cc->args, &e->i64);
             if (i == NULL_I64 || i >= cc->args->len) {
