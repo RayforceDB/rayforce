@@ -335,7 +335,7 @@ obj_p ser_obj(obj_p obj) {
     ipc_header_t *header;
 
     if (size == 0)
-        THROW(E_TYPE);
+        return ray_err(ERR_TYPE);
 
     buf = vector(TYPE_U8, ISIZEOF(struct ipc_header_t) + size);
     header = (ipc_header_t *)AS_U8(buf);
@@ -349,7 +349,7 @@ obj_p ser_obj(obj_p obj) {
 
     if (ser_raw(AS_U8(buf) + ISIZEOF(struct ipc_header_t), obj) == 0) {
         drop_obj(buf);
-        THROW(E_TYPE);
+        return ray_err(ERR_TYPE);
     }
 
     return buf;
@@ -372,21 +372,21 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             return NULL_OBJ;
         case -TYPE_B8:
             if (*len < 1)
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             obj = b8(buf[0]);
             buf++;
             (*len)--;
             return obj;
         case -TYPE_U8:
             if (*len < 1)
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             obj = u8(buf[0]);
             buf++;
             (*len)--;
             return obj;
         case -TYPE_I16:
             if (*len < ISIZEOF(i16_t))
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             obj = i16(0);
             memcpy(&obj->i16, buf, ISIZEOF(i16_t));
             buf += ISIZEOF(i16_t);
@@ -396,7 +396,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case -TYPE_DATE:
         case -TYPE_TIME:
             if (*len < ISIZEOF(i32_t))
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             obj = i32(0);
             memcpy(&obj->i32, buf, ISIZEOF(i32_t));
             buf += ISIZEOF(i32_t);
@@ -406,7 +406,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case -TYPE_I64:
         case -TYPE_TIMESTAMP:
             if (*len < ISIZEOF(i64_t))
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             obj = i64(0);
             memcpy(&obj->i64, buf, ISIZEOF(i64_t));
             buf += ISIZEOF(i64_t);
@@ -415,7 +415,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             return obj;
         case -TYPE_F64:
             if (*len < ISIZEOF(f64_t))
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             obj = f64(0);
             memcpy(&obj->f64, buf, ISIZEOF(f64_t));
             buf += ISIZEOF(f64_t);
@@ -423,10 +423,10 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             return obj;
         case -TYPE_SYMBOL:
             if (*len < 1)
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             l = str_len((str_p)buf, *len);
             if (l >= *len)
-                return ray_err(E_BAD);
+                return ray_err(ERR_BAD);
             i = symbols_intern((str_p)buf, l);
             obj = symboli64(i);
             buf += l + 1;
@@ -434,14 +434,14 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             return obj;
         case -TYPE_C8:
             if (*len < 1)
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             obj = c8(buf[0]);
             buf++;
             (*len)--;
             return obj;
         case -TYPE_GUID:
             if (*len < ISIZEOF(guid_t))
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             obj = guid(buf);
             buf += ISIZEOF(guid_t);
             (*len) -= ISIZEOF(guid_t);
@@ -459,7 +459,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case TYPE_GUID:
         case TYPE_LIST:
             if (*len < ISIZEOF(i64_t))
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
 
             buf++;  // skip attrs
             memcpy(&l, buf, ISIZEOF(i64_t));
@@ -468,14 +468,14 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
 
             // Check for unreasonable length values that might indicate corruption
             if (l > 1000000000)  // 1 billion elements is likely a corrupted value
-                return ray_err(E_BAD);
+                return ray_err(ERR_BAD);
 
             // Continue with type-specific handling
             switch (type) {
                 case TYPE_B8:
                 case TYPE_U8:
                     if (*len < l * ISIZEOF(u8_t))
-                        return ray_err(E_UFLOW);
+                        return ray_err(ERR_UFLOW);
                     obj = U8(l);
                     obj->type = type;
                     if (IS_ERR(obj))
@@ -486,7 +486,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                     return obj;
                 case TYPE_C8:
                     if (*len < l * ISIZEOF(c8_t))
-                        return ray_err(E_UFLOW);
+                        return ray_err(ERR_UFLOW);
                     obj = C8(l);
                     if (IS_ERR(obj))
                         return obj;
@@ -498,7 +498,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                 case TYPE_TIME:
                 case TYPE_DATE:
                     if (*len < l * ISIZEOF(i32_t))
-                        return ray_err(E_UFLOW);
+                        return ray_err(ERR_UFLOW);
                     obj = I32(l);
                     if (IS_ERR(obj))
                         return obj;
@@ -510,7 +510,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                 case TYPE_I64:
                 case TYPE_TIMESTAMP:
                     if (*len < l * ISIZEOF(i64_t))
-                        return ray_err(E_UFLOW);
+                        return ray_err(ERR_UFLOW);
                     obj = I64(l);
                     if (IS_ERR(obj))
                         return obj;
@@ -521,7 +521,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                     return obj;
                 case TYPE_F64:
                     if (*len < l * ISIZEOF(f64_t))
-                        return ray_err(E_UFLOW);
+                        return ray_err(ERR_UFLOW);
                     obj = F64(l);
                     if (IS_ERR(obj))
                         return obj;
@@ -537,13 +537,13 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                         if (*len < 1) {
                             obj->len = i;
                             drop_obj(obj);
-                            return ray_err(E_UFLOW);
+                            return ray_err(ERR_UFLOW);
                         }
                         c = str_len((str_p)buf, *len);
                         if (c >= *len) {
                             obj->len = i;
                             drop_obj(obj);
-                            return ray_err(E_BAD);
+                            return ray_err(ERR_BAD);
                         }
                         id = symbols_intern((str_p)buf, c);
                         AS_SYMBOL(obj)[i] = id;
@@ -553,7 +553,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                     return obj;
                 case TYPE_GUID:
                     if (*len < l * ISIZEOF(guid_t))
-                        return ray_err(E_UFLOW);
+                        return ray_err(ERR_UFLOW);
                     obj = GUID(l);
                     if (IS_ERR(obj))
                         return obj;
@@ -579,7 +579,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                     return obj;
             }
             // Should never reach here
-            return ray_err(E_BAD);
+            return ray_err(ERR_BAD);
 
         case TYPE_TABLE:
         case TYPE_DICT:
@@ -625,14 +625,14 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case TYPE_BINARY:
         case TYPE_VARY:
             if (*len < 1)
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             // Check for null terminator within buffer
             for (i = 0; i < *len; i++) {
                 if (buf[i] == 0)
                     break;
             }
             if (i >= *len)
-                return ray_err(E_BAD);
+                return ray_err(ERR_BAD);
 
             k = env_get_internal_function((str_p)buf);
             buf += i + 1;
@@ -643,7 +643,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case TYPE_ERR: {
             lit_p err_msg;
             if (*len < 9)  // At least 8 bytes for type + 1 for message
-                return ray_err(E_UFLOW);
+                return ray_err(ERR_UFLOW);
             // Skip 8 bytes of type (for legacy format compatibility)
             buf += 8;
             (*len) -= 8;
@@ -655,7 +655,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         }
 
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -669,23 +669,23 @@ obj_p de_obj(obj_p obj) {
 
     // Check if buffer is large enough to contain a header
     if (len < ISIZEOF(struct ipc_header_t))
-        return ray_err(E_BAD);
+        return ray_err(ERR_BAD);
 
     header = (ipc_header_t *)buf;
 
     // Check for valid header prefix
     if (header->prefix != SERDE_PREFIX)
-        return ray_err(E_BAD);
+        return ray_err(ERR_BAD);
 
     if (header->version > RAYFORCE_VERSION)
-        THROW(E_TYPE);
+        return ray_err(ERR_TYPE);
 
     // Check for reasonable size values
     if (header->size > 1000000000)  // 1GB max size
-        return ray_err(E_BAD);
+        return ray_err(ERR_BAD);
 
     if (header->size + ISIZEOF(struct ipc_header_t) != len)
-        return ray_err(E_BAD);
+        return ray_err(ERR_BAD);
 
     len = header->size;
     buf += ISIZEOF(struct ipc_header_t);

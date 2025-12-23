@@ -198,7 +198,7 @@ typedef obj_p (*unary_f)(obj_p);
 typedef obj_p (*binary_f)(obj_p, obj_p);
 typedef obj_p (*vary_f)(obj_p *, i64_t);
 
-// Error type is now a string constant (e.g. E_IO, E_SYS)
+// Error type is now a string constant (e.g. ERR_IO, ERR_SYS)
 typedef lit_p os_ray_error_type_t;
 
 b8_t ops_as_b8(obj_p x);

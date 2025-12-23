@@ -143,7 +143,7 @@ obj_p fs_read_dir(lit_p path) {
 
     hFind = FindFirstFile(searchPath, &findFileData);
     if (hFind == INVALID_HANDLE_VALUE)
-        return sys_error(E_SYS, path);
+        return sys_error(ERR_SYS, path);
 
     do {
         // Skip . and .. entries

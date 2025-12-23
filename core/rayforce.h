@@ -106,32 +106,29 @@ typedef u8_t guid_t[16];
 // Result Constants
 //=============================================================================
 
-#define OK 0
-
-// Error messages (max 7 chars to fit in i64)
-#define E_INIT "init"
-#define E_PARSE "parse"
-#define E_EVAL "eval"
-#define E_TYPE "type"
-#define E_LEN "length"
-#define E_ARITY "arity"
-#define E_INDEX "index"
-#define E_RANGE "range"
-#define E_HEAP "heap"
-#define E_IO "io"
-#define E_SYS "sys"
-#define E_NYI "nyi"
-#define E_STACK "stack"
-#define E_RAISE "raise"
-#define E_UFLOW "uflow"
-#define E_OFLOW "oflow"
-#define E_NFOUND "nfound"
-#define E_OOM "oom"
-#define E_BAD "bad"
-#define E_KEY "key"
-#define E_ARG "arg"
-#define E_JOIN "join"
-#define E_FMT "fmt"
+#define ERR_INIT "init"
+#define ERR_PARSE "parse"
+#define ERR_EVAL "eval"
+#define ERR_TYPE "type"
+#define ERR_LEN "length"
+#define ERR_ARITY "arity"
+#define ERR_INDEX "index"
+#define ERR_RANGE "range"
+#define ERR_HEAP "heap"
+#define ERR_IO "io"
+#define ERR_SYS "sys"
+#define ERR_NYI "nyi"
+#define ERR_STACK "stack"
+#define ERR_RAISE "raise"
+#define ERR_UFLOW "uflow"
+#define ERR_OFLOW "oflow"
+#define ERR_NFOUND "nfound"
+#define ERR_OOM "oom"
+#define ERR_BAD "bad"
+#define ERR_KEY "key"
+#define ERR_ARG "arg"
+#define ERR_JOIN "join"
+#define ERR_FMT "fmt"
 
 //=============================================================================
 // Special Values
@@ -234,8 +231,6 @@ extern obj_p clone_obj(obj_p obj);  // clone_obj
 extern obj_p copy_obj(obj_p obj);   // copy
 extern obj_p cow_obj(obj_p obj);    // copy-on-write
 extern u32_t rc_obj(obj_p obj);     // get refcount
-
-// Errors - see error.h for new API (ray_err, ray_errf, ray_errm)
 
 // Destructors
 extern nil_t drop_obj(obj_p obj);  // Free an object

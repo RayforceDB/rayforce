@@ -192,7 +192,7 @@ DWORD WINAPI StdinThread(LPVOID prm) {
 nil_t exit_werror() {
     obj_p fmt, err;
 
-    err = sys_error(E_IO, "poll_init");
+    err = sys_error(ERR_IO, "poll_init");
     fmt = obj_fmt(err, B8_TRUE);
     printf("%s\n", AS_C8(fmt));
     drop_obj(fmt);
@@ -948,7 +948,7 @@ i64_t poll_run(poll_p poll) {
                 }  // switch
             }  // for
         } else {
-            res = sys_error(E_IO, "poll_init");
+            res = sys_error(ERR_IO, "poll_init");
             fmt = obj_fmt(res, B8_TRUE);
             printf("%s\n", AS_C8(fmt));
             drop_obj(fmt);
@@ -971,7 +971,7 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
-        THROW(E_TYPE);
+        return ray_err(ERR_TYPE);
 
     selector = (selector_p)idx;
     LOG_TRACE("ipc_send_sync: selector=%p fd=%lld", (void*)selector, selector->fd);
@@ -992,15 +992,15 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
         dwResult = WaitForSingleObject(selector->tx.overlapped.hEvent, INFINITE);
 
         if (dwResult == WAIT_FAILED)
-            THROW("ipc_send_sync: error waiting for event");
+            return ray_err("ipc_send_sync: error waiting for event");
 
         if (!GetOverlappedResult((HANDLE)selector->fd, &selector->tx.overlapped, &selector->tx.size, B8_FALSE))
-            THROW("ipc_send_sync: error getting result");
+            return ray_err("ipc_send_sync: error getting result");
     }
 
     if (poll_result == POLL_ERROR) {
         poll_deregister(poll, selector->id);
-        THROW("ipc_send_sync: error sending message");
+        return ray_err("ipc_send_sync: error sending message");
     }
 
     poll_result = POLL_OK;
@@ -1021,17 +1021,17 @@ recv:
         dwResult = WaitForSingleObject(selector->rx.overlapped.hEvent, INFINITE);
 
         if (dwResult == WAIT_FAILED)
-            THROW("ipc_send_sync: error waiting for event");
+            return ray_err("ipc_send_sync: error waiting for event");
 
         if (!GetOverlappedResult((HANDLE)selector->fd, &selector->rx.overlapped, &selector->rx.size, B8_FALSE))
-            THROW("ipc_send_sync: error getting result");
+            return ray_err("ipc_send_sync: error getting result");
 
         poll_result = _recv(poll, selector);
     }
 
     if (poll_result == POLL_ERROR) {
         poll_deregister(poll, selector->id);
-        THROW("ipc_send_sync: error receiving message");
+        return ray_err("ipc_send_sync: error receiving message");
     }
 
     // recv until we get response
@@ -1059,16 +1059,16 @@ obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg) {
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
-        THROW(E_TYPE);
+        return ray_err(ERR_TYPE);
 
     selector = (selector_p)idx;
     if (selector == NULL)
-        THROW(E_TYPE);
+        return ray_err(ERR_TYPE);
 
     queue_push(selector->tx.queue, (nil_t *)msg);
 
     if (_send(poll, selector) == POLL_ERROR)
-        THROW("ipc_send_async: error sending message");
+        return ray_err("ipc_send_async: error sending message");
 
     return NULL_OBJ;
 }

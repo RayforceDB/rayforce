@@ -77,7 +77,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                     fd = fs_fopen(AS_C8(path), ATTR_WRONLY | ATTR_CREAT);
 
                     if (fd == -1) {
-                        res = sys_error(E_SYS, AS_C8(path));
+                        res = sys_error(ERR_SYS, AS_C8(path));
                         drop_obj(path);
                         return res;
                     }
@@ -95,7 +95,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                     drop_obj(buf);
 
                     if (c == -1) {
-                        res = sys_error(E_SYS, AS_C8(path));
+                        res = sys_error(ERR_SYS, AS_C8(path));
                         drop_obj(path);
                         return res;
                     }
@@ -110,7 +110,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                     fd = fs_fopen(AS_C8(path), ATTR_WRONLY | ATTR_CREAT);
 
                     if (fd == -1) {
-                        res = sys_error(E_SYS, AS_C8(path));
+                        res = sys_error(ERR_SYS, AS_C8(path));
                         drop_obj(path);
                         return res;
                     }
@@ -122,7 +122,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                         fs_fclose(fd);
 
                         if (c == -1) {
-                            res = sys_error(E_SYS, AS_C8(path));
+                            res = sys_error(ERR_SYS, AS_C8(path));
                             drop_obj(path);
                             return res;
                         }
@@ -139,7 +139,7 @@ obj_p binary_set(obj_p x, obj_p y) {
 
                     c = fs_fwrite(fd, objbuf, RAY_PAGE_SIZE);
                     if (c == -1) {
-                        res = sys_error(E_SYS, AS_C8(path));
+                        res = sys_error(ERR_SYS, AS_C8(path));
                         fs_fclose(fd);
                         drop_obj(path);
                         return res;
@@ -150,7 +150,7 @@ obj_p binary_set(obj_p x, obj_p y) {
 
                     c = fs_fwrite(fd, objbuf, sizeof(struct obj_t));
                     if (c == -1) {
-                        res = sys_error(E_SYS, AS_C8(path));
+                        res = sys_error(ERR_SYS, AS_C8(path));
                         fs_fclose(fd);
                         drop_obj(path);
                         return res;
@@ -162,7 +162,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                     fs_fclose(fd);
 
                     if (c == -1) {
-                        res = sys_error(E_SYS, AS_C8(path));
+                        res = sys_error(ERR_SYS, AS_C8(path));
                         drop_obj(path);
                         return res;
                     }
@@ -191,7 +191,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                             drop_obj(buf);
                             drop_obj(k);
 
-                            THROW(E_TYPE);
+                            return ray_err(ERR_TYPE);
                         }
 
                         AS_I64(k)[i] = size;
@@ -215,7 +215,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                     fd = fs_fopen(AS_C8(path), ATTR_WRONLY | ATTR_CREAT);
 
                     if (fd == -1) {
-                        res = sys_error(E_SYS, AS_C8(path));
+                        res = sys_error(ERR_SYS, AS_C8(path));
                         drop_obj(path);
                         return res;
                     }
@@ -227,7 +227,7 @@ obj_p binary_set(obj_p x, obj_p y) {
 
                     c = fs_fwrite(fd, objbuf, RAY_PAGE_SIZE);
                     if (c == -1) {
-                        res = sys_error(E_SYS, AS_C8(path));
+                        res = sys_error(ERR_SYS, AS_C8(path));
                         fs_fclose(fd);
                         drop_obj(path);
                         return res;
@@ -238,7 +238,7 @@ obj_p binary_set(obj_p x, obj_p y) {
 
                     c = fs_fwrite(fd, objbuf, sizeof(struct obj_t));
                     if (c == -1) {
-                        res = sys_error(E_SYS, AS_C8(path));
+                        res = sys_error(ERR_SYS, AS_C8(path));
                         fs_fclose(fd);
                         drop_obj(path);
                         return res;
@@ -251,7 +251,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                     fs_fclose(fd);
 
                     if (c == -1) {
-                        res = sys_error(E_SYS, AS_C8(path));
+                        res = sys_error(ERR_SYS, AS_C8(path));
                         drop_obj(path);
                         return res;
                     }
@@ -266,7 +266,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                         fd = fs_fopen(AS_C8(path), ATTR_WRONLY | ATTR_CREAT);
 
                         if (fd == -1) {
-                            res = sys_error(E_SYS, AS_C8(path));
+                            res = sys_error(ERR_SYS, AS_C8(path));
                             drop_obj(path);
                             return res;
                         }
@@ -284,7 +284,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                         // Write the clean header
                         c = fs_fwrite(fd, (str_p)&clean_header, sizeof(struct obj_t));
                         if (c == -1) {
-                            e = sys_error(E_SYS, AS_C8(path));
+                            e = sys_error(ERR_SYS, AS_C8(path));
                             drop_obj(path);
                             fs_fclose(fd);
                             return e;
@@ -294,7 +294,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                         size = y->len * size_of_type(y->type);
                         c = fs_fwrite(fd, AS_C8(y), size);
                         if (c == -1) {
-                            e = sys_error(E_SYS, AS_C8(path));
+                            e = sys_error(ERR_SYS, AS_C8(path));
                             drop_obj(path);
                             fs_fclose(fd);
                             return e;
@@ -306,11 +306,11 @@ obj_p binary_set(obj_p x, obj_p y) {
                         return clone_obj(x);
                     }
 
-                    THROW(E_TYPE);
+                    return ray_err(ERR_TYPE);
             }
 
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -340,6 +340,6 @@ obj_p ray_let(obj_p x, obj_p y) {
             return amend(x, e);
 
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }

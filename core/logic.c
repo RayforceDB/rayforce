@@ -90,6 +90,7 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
     i64_t i, j, c, m, l, chunk;
     obj_p next, res, v;
     pool_p pool = runtime_get()->pool;
+    (void)op_name;
 
     if (n == 0)
         return B8(B8_FALSE);
@@ -120,7 +121,7 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
                 if (l != c) {
                     drop_obj(res);
                     drop_obj(next);
-                    THROW(E_TYPE, "%s: different lengths: '%ld, '%ld", op_name, l, c);
+                    return ray_err(ERR_TYPE);
                 }
 
                 // Perform element-wise operation using the provided function
@@ -195,7 +196,7 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
                 if (l != (i64_t)next->len) {
                     drop_obj(res);
                     drop_obj(next);
-                    THROW(E_TYPE, "%s: different lengths: '%ld, '%ld", op_name, l, (i64_t)next->len);
+                    return ray_err(ERR_TYPE);
                 }
 
                 for (j = 0; j < l; j++) {
@@ -251,8 +252,7 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
             default:
                 drop_obj(res);
                 drop_obj(next);
-                THROW(E_TYPE, "%s: unsupported types: '%s, '%s", op_name, type_name(res->type),
-                      type_name(next->type));
+                return ray_err(ERR_TYPE);
         }
     }
 
@@ -278,7 +278,7 @@ obj_p ray_like(obj_p x, obj_p y) {
                 if (!e || e->type != TYPE_C8) {
                     res->len = i;
                     drop_obj(res);
-                    THROW_TYPE2("like", e->type, y->type);
+                    return ray_err(ERR_TYPE);
                 }
 
                 AS_B8(res)[i] = str_match(AS_C8(e), e->len, AS_C8(y), y->len);
@@ -295,7 +295,7 @@ obj_p ray_like(obj_p x, obj_p y) {
                     res->len = i;
                     drop_obj(res);
                     drop_obj(e);
-                    THROW_TYPE2("like", e->type, y->type);
+                    return ray_err(ERR_TYPE);
                 }
 
                 AS_B8(res)[i] = str_match(AS_C8(e), e->len, AS_C8(y), y->len);
@@ -315,6 +315,6 @@ obj_p ray_like(obj_p x, obj_p y) {
             return res;
 
         default:
-            THROW_TYPE2("like", x->type, y->type);
+            return ray_err(ERR_TYPE);
     }
 }

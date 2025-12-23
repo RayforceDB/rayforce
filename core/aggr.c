@@ -433,7 +433,7 @@ obj_p aggr_first_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p a
             return res;
         default:
             destroy_partial_result(res);
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -497,7 +497,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
                 if (is_null(sym) || sym->type != TYPE_SYMBOL) {
                     drop_obj(sym);
                     drop_obj(res);
-                    return ray_err(E_TYPE);
+                    return ray_err(ERR_TYPE);
                 }
 
                 xe = AS_SYMBOL(sym);
@@ -711,7 +711,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
 
             return res;
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -757,7 +757,7 @@ obj_p aggr_last_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p ar
             return res;
         default:
             destroy_partial_result(res);
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -809,7 +809,7 @@ obj_p aggr_last(obj_p val, obj_p index) {
                 if (is_null(sym) || sym->type != TYPE_SYMBOL) {
                     drop_obj(sym);
                     drop_obj(res);
-                    return ray_err(E_TYPE);
+                    return ray_err(ERR_TYPE);
                 }
 
                 xe = AS_SYMBOL(sym);
@@ -938,7 +938,7 @@ obj_p aggr_last(obj_p val, obj_p index) {
             return PARTED_MAP(n, val, index, (raw_p)aggr_last_partial, i16, i16,
                               if ($out[$y] == NULL_I16) $out[$y] = $in[$x]);
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -967,7 +967,7 @@ obj_p aggr_sum_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             return res;
         default:
             destroy_partial_result(res);
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1012,7 +1012,7 @@ obj_p aggr_sum(obj_p val, obj_p index) {
         case TYPE_PARTEDI16:
             return PARTED_MAP(n, val, index, (raw_p)aggr_sum_partial, i16, i16, $out[$y] = ADDI16($out[$y], $in[$x]));
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1041,7 +1041,7 @@ obj_p aggr_max_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             return res;
         default:
             destroy_partial_result(res);
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1095,7 +1095,7 @@ obj_p aggr_max(obj_p val, obj_p index) {
         case TYPE_PARTEDI16:
             return PARTED_MAP(n, val, index, (raw_p)aggr_max_partial, i16, i16, $out[$y] = MAXI16($out[$y], $in[$x]));
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1123,7 +1123,7 @@ obj_p aggr_min_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
                       $out[$y] = NULL_I32);
             return res;
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1177,7 +1177,7 @@ obj_p aggr_min(obj_p val, obj_p index) {
         case TYPE_PARTEDI16:
             return PARTED_MAP(n, val, index, (raw_p)aggr_min_partial, i16, i16, $out[$y] = MINI16($out[$y], $in[$x]));
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1238,7 +1238,7 @@ obj_p aggr_count_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p a
         default:
             res->len = 0;
             drop_obj(res);
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 
     return res;
@@ -1736,7 +1736,7 @@ obj_p aggr_avg_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             drop_obj(cnts_obj);
             res->len = 0;
             drop_obj(res);
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1994,7 +1994,7 @@ obj_p aggr_avg(obj_p val, obj_p index) {
         }
 
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -2588,7 +2588,7 @@ obj_p aggr_dev_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             drop_obj(cnt_obj);
             res->len = 0;
             drop_obj(res);
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -2879,7 +2879,7 @@ obj_p aggr_dev(obj_p val, obj_p index) {
         }
 
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -2931,7 +2931,7 @@ obj_p aggr_collect(obj_p val, obj_p index) {
             if (v->type != TYPE_SYMBOL) {
                 drop_obj(v);
                 drop_obj(res);
-                return ray_err(E_TYPE);
+                return ray_err(ERR_TYPE);
             }
 
             AGGR_ITER(index, l, 0, val, res, i64, list, , push_raw($out + $y, AS_SYMBOL(v) + $in[$x]), );
@@ -2976,7 +2976,7 @@ obj_p aggr_collect(obj_p val, obj_p index) {
             return res;
         default:
             drop_obj(res);
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 

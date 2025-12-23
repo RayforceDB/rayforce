@@ -104,7 +104,7 @@ option_t repl_read(poll_p poll, selector_p selector) {
 
         if (len <= 0) {
             poll->code = (len < 0) ? 1 : 0;
-            return option_error(sys_error(E_IO, "stdin read failed"));
+            return option_error(sys_error(ERR_IO, "stdin read failed"));
         }
 
         line_buf[len] = '\0';
@@ -114,7 +114,7 @@ option_t repl_read(poll_p poll, selector_p selector) {
 
     if (!term_getc(repl->term)) {
         poll->code = 1;
-        return option_error(sys_error(E_IO, "term_getc failed"));
+        return option_error(sys_error(ERR_IO, "term_getc failed"));
     }
 
     str = term_read(repl->term);

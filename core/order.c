@@ -46,7 +46,7 @@ obj_p ray_iasc(obj_p x) {
         case TYPE_DICT:
             return ray_sort_asc(x);
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -67,7 +67,7 @@ obj_p ray_idesc(obj_p x) {
         case TYPE_DICT:
             return ray_sort_desc(x);
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -153,7 +153,7 @@ obj_p ray_asc(obj_p x) {
         }
 
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -239,7 +239,7 @@ obj_p ray_desc(obj_p x) {
         }
 
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -325,9 +325,9 @@ obj_p ray_xasc(obj_p x, obj_p y) {
             if (y->len == 0)
                 return clone_obj(x);
 
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -413,9 +413,9 @@ obj_p ray_xdesc(obj_p x, obj_p y) {
             if (y->len == 0)
                 return clone_obj(x);
 
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -438,7 +438,7 @@ obj_p ray_not(obj_p x) {
             return res;
 
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -492,7 +492,7 @@ obj_p ray_neg(obj_p x) {
             return res;
 
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -613,10 +613,10 @@ obj_p ray_xrank(obj_p y, obj_p x) {
             n_buckets = x->u8;
             break;
         default:
-            THROW("xrank: second arg must be integer");
+            return ray_err("xrank: second arg must be integer");
     }
     if (n_buckets <= 0)
-        THROW("xrank: number of buckets must be positive");
+        return ray_err("xrank: number of buckets must be positive");
 
     l = y->len;
     res = I64(l);

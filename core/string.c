@@ -24,6 +24,7 @@
 #include "string.h"
 #include "ops.h"
 #include "error.h"
+#include "format.h"
 
 #define IS_DIGIT(c) ((c) >= '0' && (c) <= '9')
 #define IS_SPACE(c) ((c) == ' ' || (c) == '\t' || (c) == '\n' || (c) == '\r')
@@ -605,10 +606,10 @@ obj_p str_split(lit_p str, i64_t str_len, lit_p delim, i64_t delim_len) {
 
     // Input validation
     if (str == NULL || delim == NULL)
-        THROW("str_split: null pointer");
+        return ray_err("str_split: null pointer");
 
     if (delim_len == 0)
-        THROW("str_split: empty delimiter");
+        return ray_err("str_split: empty delimiter");
 
     // Create empty list
     result = LIST(0);

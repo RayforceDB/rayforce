@@ -18,21 +18,10 @@ obj_p ray_get_err(nil_t);
 nil_t ray_set_err(obj_p err);
 nil_t ray_clear_err(nil_t);
 
-// Error macros
-#define ERR(msg) ray_err(msg)
-#define THROW(code, ...) return ray_err(code)
-#define THROW_S(code, msg) return ray_err(msg)
-#define error_str(code, msg) ray_err(msg)
-#define error_obj(code, msg) ray_err(code)
-#define ray_error(code, ...) ray_err(code)
-#define THROW_TYPE1(fn, t) return ray_err(E_TYPE)
-#define THROW_TYPE2(fn, t1, t2) return ray_err(E_TYPE)
-
 #define PANIC(...)                                            \
     do {                                                      \
         fprintf(stderr, "panic %s:%d: ", __FILE__, __LINE__); \
         fprintf(stderr, __VA_ARGS__);                         \
-        fprintf(stderr, "\n");                                \
         exit(1);                                              \
     } while (0)
 

@@ -269,38 +269,8 @@ obj_p ops_where(b8_t *mask, i64_t len) {
     return res;
 }
 
-#if defined(OS_WINDOWS)
-
 obj_p sys_error(os_ray_error_type_t tp, lit_p msg) {
-    obj_p emsg;
-    DWORD dw;
-    LPVOID lpMsgBuf;
-
-    // Check if it's an errno-based error
-    if (tp == ERR_OS) {
-        return ray_err(E_TYPE);
-    }
-
-    // Windows socket or system error
-    if (tp == E_IO) {
-        dw = WSAGetLastError();
-    } else {
-        dw = GetLastError();
-    }
-
-    FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
-                   dw, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&lpMsgBuf, 0, NULL);
-
-    emsg = str_fmt(-1, "%s: %s", msg, lpMsgBuf);
-    LocalFree(lpMsgBuf);
-
-    return ray_err(E_TYPE);
+    (void)tp;
+    (void)msg;
+    return ray_err(ERR_SYS);
 }
-
-#else
-
-obj_p sys_error(os_ray_error_type_t tp, lit_p msg) {
-    return ray_err(E_TYPE);
-}
-
-#endif

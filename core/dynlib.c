@@ -38,11 +38,11 @@ obj_p dynlib_loadfn(obj_p path, obj_p func, i64_t nargs) {
 
     handle = LoadLibrary(AS_C8(path));
     if (!handle)
-        THROW(E_SYS, "Failed to load shared library: %d", GetLastError());
+        return ray_err(ERR_SYS);
 
     dsym = GetProcAddress(handle, AS_C8(func));
     if (!dsym)
-        THROW(E_SYS, "Failed to load symbol from shared library: %d", GetLastError());
+        return ray_err(ERR_SYS);
 
     switch (nargs) {
         case 1:
@@ -158,13 +158,13 @@ obj_p dynlib_loadfn(obj_p path, obj_p func, i64_t nargs) {
 
     dl = dynlib_open(path);
     if (dl == NULL)
-        THROW(E_SYS, "Failed to open shared library: %s", dlerror());
+        return ray_err(ERR_SYS);
 
     handle = dl->handle;
 
     dsym = dlsym(handle, AS_C8(func));
     if (dsym == NULL)
-        THROW(E_SYS, "Failed to load symbol from shared library: %s", dlerror());
+        return ray_err(ERR_SYS);
 
     switch (nargs) {
         case 1:
@@ -190,19 +190,19 @@ obj_p ray_loadfn(obj_p *args, i64_t n) {
     obj_p path, func, res;
 
     if (n != 3)
-        THROW(E_ARITY, "Expected 3 arguments, got %llu", n);
+        return ray_err(ERR_ARITY);
 
     if (!args[0] || !args[1] || !args[2])
-        THROW_S(E_TYPE, "Null is not a valid argument");
+        return ray_err(ERR_TYPE);
 
     if (args[0]->type != TYPE_C8)
-        THROW(E_TYPE, "Expected 'string path, got %s", type_name(args[0]->type));
+        return ray_err(ERR_TYPE);
 
     if (args[1]->type != TYPE_C8)
-        THROW(E_TYPE, "Expected 'string fname, got %s", type_name(args[1]->type));
+        return ray_err(ERR_TYPE);
 
     if (args[2]->type != -TYPE_I64)
-        THROW(E_TYPE, "Expected 'i64 arguments, got %s", type_name(args[2]->type));
+        return ray_err(ERR_TYPE);
 
     path = cstring_from_str(AS_C8(args[0]), args[0]->len);
     func = cstring_from_str(AS_C8(args[1]), args[1]->len);

@@ -250,7 +250,7 @@ static obj_p cc_fn(cc_ctx_t *cc, obj_p *lst, i64_t n) {
     }
 
     if (cc_body(cc, lst, n) == -1) {
-        return ray_err(E_TYPE);
+        return ray_err(ERR_TYPE);
     }
 
 end:

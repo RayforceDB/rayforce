@@ -159,7 +159,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                         return clone_obj(AS_LIST(AS_LIST(x)[1])[j]);
                 }
 
-                THROW(E_INDEX, "at: column '%s' has not found in a table", str_from_symbol(AS_SYMBOL(y)[0]));
+                return ray_err(ERR_INDEX);
             }
 
             cols = vector(TYPE_LIST, yl);
@@ -175,7 +175,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                 if (j == xl) {
                     cols->len = i;
                     drop_obj(cols);
-                    THROW(E_INDEX, "at: column '%s' has not found in a table", str_from_symbol(AS_SYMBOL(y)[i]));
+                    return ray_err(ERR_INDEX);
                 }
             }
 
@@ -189,7 +189,7 @@ obj_p ray_at(obj_p x, obj_p y) {
 
             if (y->i64 >= (i64_t)v->len) {
                 drop_obj(s);
-                THROW_S(E_INDEX, E_RANGE);
+                return ray_err(ERR_INDEX);
             }
 
             if (!s || IS_ERR(s) || s->type != TYPE_SYMBOL) {
@@ -199,7 +199,7 @@ obj_p ray_at(obj_p x, obj_p y) {
 
             if (AS_I64(v)[y->i64] >= (i64_t)s->len) {
                 drop_obj(s);
-                THROW_S(E_INDEX, E_RANGE);
+                return ray_err(ERR_INDEX);
             }
 
             res = at_idx(s, AS_I64(v)[y->i64]);
@@ -229,7 +229,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                     if (AS_I64(y)[i] >= (i64_t)n) {
                         drop_obj(s);
                         drop_obj(res);
-                        THROW_S(E_INDEX, E_RANGE);
+                        return ray_err(ERR_INDEX);
                     }
 
                     AS_I64(res)[i] = AS_I64(v)[AS_I64(y)[i]];
@@ -246,7 +246,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                 if (AS_I64(v)[i] >= (i64_t)xl) {
                     drop_obj(s);
                     drop_obj(res);
-                    THROW_S(E_INDEX, E_RANGE);
+                    return ray_err(ERR_INDEX);
                 }
 
                 AS_SYMBOL(res)[i] = AS_SYMBOL(s)[AS_I64(v)[AS_I64(y)[i]]];
@@ -264,7 +264,7 @@ obj_p ray_at(obj_p x, obj_p y) {
             yl = v->len;
 
             if (y->i64 >= (i64_t)v->len)
-                THROW_S(E_INDEX, "at: anymap can not be resolved: index out of range");
+                return ray_err(ERR_INDEX);
 
             buf = AS_U8(k) + AS_I64(v)[y->i64];
 
@@ -285,7 +285,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                 if (AS_I64(y)[i] >= (i64_t)n) {
                     res->len = i;
                     drop_obj(res);
-                    THROW_S(E_INDEX, "at: anymap can not be resolved: index out of range");
+                    return ray_err(ERR_INDEX);
                 }
 
                 buf = AS_U8(k) + AS_I64(v)[AS_I64(y)[i]];
@@ -330,7 +330,7 @@ obj_p ray_find(obj_p x, obj_p y) {
         case MTYPE2(TYPE_LIST, TYPE_LIST):
             return index_find_obj(AS_LIST(x), x->len, AS_LIST(y), y->len);
         default:
-            THROW_TYPE2("find", x->type, y->type);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -338,7 +338,7 @@ obj_p ray_find(obj_p x, obj_p y) {
 #define __FILTER(x, y, tx, s1, s2, s3)                                                 \
     ({                                                                                 \
         if (x->len != y->len)                                                          \
-            return error_str(E_LEN, E_LEN); \
+            return ray_err(ERR_LEN); \
         l = x->len;                                                                    \
         res = tx(l);                                                                   \
         for (i = 0; i < l; i++)                                                        \
@@ -391,7 +391,7 @@ obj_p ray_filter(obj_p x, obj_p y) {
             return table(clone_obj(AS_LIST(x)[0]), res);
 
         default:
-            THROW_TYPE2("filter", x->type, y->type);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -407,7 +407,7 @@ obj_p ray_take(obj_p from, obj_p count) {
         start = AS_I64(count)[0];
         m = AS_I64(count)[1];
         if (m < 0)
-            THROW(E_LEN, "take: range amount cannot be negative");
+            return ray_err(ERR_LEN);
         f = 0;  // not used for range
     } else {
         start = 0;
@@ -425,7 +425,7 @@ obj_p ray_take(obj_p from, obj_p count) {
                 m = ABSI64((i64_t)count->i32);
                 break;
             default:
-                THROW_TYPE2("take", from->type, count->type);
+                return ray_err(ERR_TYPE);
         }
     }
 
@@ -668,7 +668,7 @@ obj_p ray_take(obj_p from, obj_p count) {
                     } else {
                         res->len = i;
                         drop_obj(res);
-                        THROW(E_INDEX, "anymap value: index out of range: %d", AS_I64(s)[j]);
+                        return ray_err(ERR_INDEX);
                     }
                 }
             } else {
@@ -685,7 +685,7 @@ obj_p ray_take(obj_p from, obj_p count) {
                     } else {
                         res->len = i;
                         drop_obj(res);
-                        THROW(E_INDEX, "anymap value: index out of range: %d", AS_I64(s)[j % l]);
+                        return ray_err(ERR_INDEX);
                     }
                 }
             }
@@ -729,7 +729,7 @@ obj_p ray_take(obj_p from, obj_p count) {
             return table(clone_obj(AS_LIST(from)[0]), res);
 
         default:
-            THROW_TYPE2("take", from->type, count->type);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -839,7 +839,7 @@ obj_p ray_in(obj_p x, obj_p y) {
             if (!IS_VECTOR(x))
                 return b8(find_obj_idx(y, x) != NULL_I64);
 
-            THROW_TYPE2("in", x->type, y->type);
+            return ray_err(ERR_TYPE);
     }
 
     return NULL_OBJ;
@@ -850,7 +850,7 @@ obj_p ray_within(obj_p x, obj_p y) {
     obj_p res;
 
     if (!IS_VECTOR(y) || y->len != 2)
-        return error_str(E_TYPE, E_TYPE);
+        return ray_err(ERR_TYPE);
 
     switch
         MTYPE2(x->type, y->type) {
@@ -889,7 +889,7 @@ obj_p ray_within(obj_p x, obj_p y) {
                 return res;
 
             default:
-                THROW_TYPE2("within", x->type, y->type);
+                return ray_err(ERR_TYPE);
         }
 
     return NULL_OBJ;
@@ -907,7 +907,7 @@ obj_p ray_sect(obj_p x, obj_p y) {
             return res;
 
         default:
-            THROW_TYPE2("sect", x->type, y->type);
+            return ray_err(ERR_TYPE);
     }
 
     return NULL_OBJ;
@@ -1014,7 +1014,7 @@ obj_p ray_except(obj_p x, obj_p y) {
                 }
             }
 
-            THROW_TYPE2("except", x->type, y->type);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1206,7 +1206,7 @@ obj_p ray_value(obj_p x) {
                 } else {
                     res->len = i;
                     drop_obj(res);
-                    THROW(E_INDEX, "anymap value: index out of range: %d", AS_I64(e)[i]);
+                    return ray_err(ERR_INDEX);
                 }
             }
 
@@ -1392,7 +1392,7 @@ obj_p ray_where(obj_p x) {
 
             return res;
         default:
-            THROW_TYPE1("where", x->type);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1445,7 +1445,7 @@ static obj_p ray_bin_partial(raw_p a, raw_p b, raw_p c, raw_p d, raw_p e) {
             }
             return NULL_OBJ;
         default:
-            THROW_TYPE1("bin", x->type);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1498,7 +1498,7 @@ static obj_p ray_binr_partial(raw_p a, raw_p b, raw_p c, raw_p d, raw_p e) {
             }
             return NULL_OBJ;
         default:
-            THROW_TYPE1("binr", x->type);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1592,7 +1592,7 @@ obj_p ray_bin(obj_p x, obj_p y) {
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
             return bin_map(ray_bin_partial, x, y);
         default:
-            THROW_TYPE2("bin", x->type, y->type);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -1639,6 +1639,6 @@ obj_p ray_binr(obj_p x, obj_p y) {
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
             return bin_map(ray_binr_partial, x, y);
         default:
-            THROW_TYPE2("binr", x->type, y->type);
+            return ray_err(ERR_TYPE);
     }
 }

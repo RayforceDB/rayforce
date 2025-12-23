@@ -225,6 +225,7 @@ obj_p unmount_env(i64_t n) {
 nil_t error_add_loc(obj_p err, i64_t id, ctx_t *ctx) {
     obj_p loc, nfo;
     span_t span;
+    (void)err;
 
     if (ctx->fn == NULL_OBJ)
         return;
@@ -250,6 +251,7 @@ nil_t bc_error_add_loc(obj_p err, obj_p fn, i64_t ip) {
     obj_p loc, nfo;
     span_t span;
     lambda_p lambda;
+    (void)err;
 
     if (fn == NULL_OBJ || fn->type != TYPE_LAMBDA)
         return;
@@ -359,7 +361,7 @@ OP_DEREF:
     {
         obj_p *val = resolve(x->i64);
         if (val == NULL) {
-            r = ray_error(E_EVAL, "undefined symbol: '%s", str_from_symbol(x->i64));
+            r = ray_err(ERR_EVAL);
             drop_obj(x);
             bc_error_add_loc(r, vm->fn, ip);
             return r;
@@ -423,7 +425,7 @@ OP_CALFN:
     x = pop();  // lambda function
     if (x->type != TYPE_LAMBDA) {
         drop_obj(x);
-        r = ray_error(E_TYPE, "expected lambda, got %s", type_name(x->type));
+        r = ray_err(ERR_TYPE);
         bc_error_add_loc(r, vm->fn, ip);
         return r;
     }
@@ -459,7 +461,7 @@ OP_CALFD:
         case TYPE_UNARY:
             if (n != 1) {
                 drop_obj(x);
-                r = ray_error(E_ARITY, "unary function requires 1 argument");
+                r = ray_err(ERR_ARITY);
                 bc_error_add_loc(r, vm->fn, ip);
                 return r;
             }
@@ -476,7 +478,7 @@ OP_CALFD:
         case TYPE_BINARY:
             if (n != 2) {
                 drop_obj(x);
-                r = ray_error(E_ARITY, "binary function requires 2 arguments");
+                r = ray_err(ERR_ARITY);
                 bc_error_add_loc(r, vm->fn, ip);
                 return r;
             }
@@ -511,7 +513,7 @@ OP_CALFD:
             goto callfn;
         default:
             drop_obj(x);
-            r = ray_error(E_TYPE, "'%s is not a function", type_name(x->type));
+            r = ray_err(ERR_TYPE);
             bc_error_add_loc(r, vm->fn, ip);
             return r;
     }
@@ -589,7 +591,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
             switch (car->type) {
                 case TYPE_UNARY:
                     if (len != 1)
-                        return unwrap(error_str(E_ARITY, E_ARITY), (i64_t)obj);
+                        return unwrap(ray_err(ERR_ARITY), (i64_t)obj);
                     if (car->attrs & FN_SPECIAL_FORM)
                         res = ((unary_f)car->i64)(args[0]);
                     else {
@@ -614,7 +616,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
 
                 case TYPE_BINARY:
                     if (len != 2)
-                        return unwrap(error_str(E_ARITY, E_ARITY), (i64_t)obj);
+                        return unwrap(ray_err(ERR_ARITY), (i64_t)obj);
                     if (car->attrs & FN_SPECIAL_FORM)
                         res = ((binary_f)car->i64)(args[0], args[1]);
                     else {
@@ -659,7 +661,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                         res = ((vary_f)car->i64)(args, len);
                     else {
                         if (!stack_enough(len))
-                            return unwrap(error_str(E_STACK, E_STACK), (i64_t)obj);
+                            return unwrap(ray_err(ERR_STACK), (i64_t)obj);
 
                         for (i = 0; i < len; i++) {
                             x = eval(args[i]);
@@ -689,10 +691,10 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                 case TYPE_LAMBDA:
                     lambda = AS_LAMBDA(car);
                     if (len != lambda->args->len)
-                        return unwrap(error_str(E_ARITY, E_ARITY), (i64_t)obj);
+                        return unwrap(ray_err(ERR_ARITY), (i64_t)obj);
 
                     if (!stack_enough(len))
-                        return unwrap(error_str(E_STACK, E_STACK), (i64_t)obj);
+                        return unwrap(ray_err(ERR_STACK), (i64_t)obj);
 
                     for (i = 0; i < len; i++) {
                         x = eval(args[i]);
@@ -706,13 +708,12 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                 case -TYPE_SYMBOL:
                     val = resolve(car->i64);
                     if (val == NULL)
-                        return unwrap(ray_error(E_EVAL, "undefined symbol: '%s", str_from_symbol(car->i64)),
-                                      (i64_t)obj);
+                        return unwrap(ray_err(ERR_EVAL), (i64_t)obj);
                     car = *val;
                     goto call;
 
                 default:
-                    return unwrap(ray_error(E_EVAL, "'%s is not a function", type_name(car->type)), (i64_t)args[-1]);
+                    return unwrap(ray_err(ERR_EVAL), (i64_t)args[-1]);
             }
 
         case -TYPE_SYMBOL:
@@ -721,7 +722,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
 
             val = resolve(obj->i64);
             if (val == NULL)
-                return unwrap(ray_error(E_EVAL, "undefined symbol: '%s", str_from_symbol(obj->i64)), (i64_t)obj);
+                return unwrap(ray_err(ERR_EVAL), (i64_t)obj);
             return clone_obj(*val);
 
         default:
@@ -747,10 +748,10 @@ obj_p ray_raise(obj_p obj) {
     obj_p e;
 
     if (obj->type != TYPE_C8)
-        return ray_error(E_TYPE, "raise: expected 'string, got '%s", type_name(obj->type));
+        return ray_err(ERR_TYPE);
 
     // Clone the message since error_obj takes ownership but caller drops the argument
-    e = error_obj(E_RAISE, clone_obj(obj));
+    e = ray_err(ERR_RAISE);
     return e;
 }
 
@@ -759,7 +760,7 @@ obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file) {
     obj_p info, res;
 
     if (str->type != TYPE_C8)
-        return ray_error(E_TYPE, "parse: expected string, got %s", type_name(str->type));
+        return ray_err(ERR_TYPE);
 
     info = nfo(clone_obj(file), clone_obj(str));
     res = parse(AS_C8(str), str->len, info);
@@ -798,7 +799,7 @@ obj_p ray_eval_str(obj_p str, obj_p file) {
     obj_p info;
 
     if (str->type != TYPE_C8)
-        return ray_error(E_TYPE, "eval: expected string, got %s", type_name(str->type));
+        return ray_err(ERR_TYPE);
 
     info = (file != NULL && file != NULL_OBJ) ? nfo(clone_obj(file), clone_obj(str)) : NULL_OBJ;
 
@@ -820,7 +821,7 @@ obj_p try_obj(obj_p obj, obj_p ctch) {
             call_catch:
                 if (AS_LAMBDA(fn)->args->len != 1) {
                     drop_obj(res);
-                    return ray_err(E_ARITY);
+                    return ray_err(ERR_ARITY);
                 }
                 // Push error message as string for catch handler
                 stack_push(str_fmt(-1, "%s", ray_err_msg(res)));

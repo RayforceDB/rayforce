@@ -66,17 +66,17 @@ obj_p ray_apply(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                THROW(E_ARITY);
+                return ray_err(ERR_ARITY);
             return unary_call(f, x[0]);
         case TYPE_BINARY:
             if (n != 2)
-                THROW(E_ARITY);
+                return ray_err(ERR_ARITY);
             return binary_call(f, x[0], x[1]);
         case TYPE_VARY:
             return vary_call(f, x, n);
         case TYPE_LAMBDA:
             if (n != AS_LAMBDA(f)->args->len)
-                THROW(E_ARITY);
+                return ray_err(ERR_ARITY);
 
             for (i = 0; i < n; i++)
                 stack_push(clone_obj(x[i]));
@@ -86,7 +86,7 @@ obj_p ray_apply(obj_p *x, i64_t n) {
                 drop_obj(stack_pop());
             return res;
         default:
-            THROW(E_TYPE);
+            return ray_err(ERR_TYPE);
     }
 }
 
@@ -116,7 +116,7 @@ obj_p ray_print(obj_p *x, i64_t n) {
     obj_p s = obj_fmt_n(x, n);
 
     if (s == NULL_OBJ)
-        return ray_err(E_FMT);
+        return ray_err(ERR_FMT);
 
     printf("%.*s", (i32_t)s->len, AS_C8(s));
     drop_obj(s);
@@ -128,7 +128,7 @@ obj_p ray_println(obj_p *x, i64_t n) {
     obj_p s = obj_fmt_n(x, n);
 
     if (s == NULL_OBJ)
-        return ray_err(E_FMT);
+        return ray_err(ERR_FMT);
 
     printf("%.*s\n", (i32_t)s->len, AS_C8(s));
     drop_obj(s);
@@ -148,17 +148,17 @@ obj_p ray_set_splayed(obj_p *x, i64_t n) {
             return ray_set(x[0], x[1]);
         case 3:
             if (x[0]->type != TYPE_C8)
-                THROW("set: table path must be a string");
+                return ray_err("set: table path must be a string");
 
             if (x[1]->type != TYPE_TABLE)
-                THROW("set: table must be a table");
+                return ray_err("set: table must be a table");
 
             if (x[0]->len < 2 || AS_C8(x[0])[x[0]->len - 1] != '/')
-                THROW("set: table path must be a directory");
+                return ray_err("set: table path must be a directory");
 
             return io_set_table_splayed(x[0], x[1], x[2]);
         default:
-            THROW(E_ARITY);
+            return ray_err(ERR_ARITY);
     }
 }
 
@@ -169,7 +169,7 @@ obj_p ray_get_splayed(obj_p *x, i64_t n) {
         case 2:
             return io_get_table_splayed(x[0], x[1]);
         default:
-            THROW(E_ARITY);
+            return ray_err(ERR_ARITY);
     }
 }
 
@@ -178,7 +178,7 @@ obj_p ray_set_parted(obj_p *x, i64_t n) {
         case 2:
             return ray_set(x[0], x[1]);
         default:
-            THROW(E_ARITY);
+            return ray_err(ERR_ARITY);
     }
 }
 
@@ -190,10 +190,10 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
     switch (n) {
         case 2:
             if (x[0]->type != TYPE_C8)
-                THROW(E_ARITY);
+                return ray_err(ERR_ARITY);
 
             if (x[1]->type != -TYPE_SYMBOL)
-                THROW(E_ARITY);
+                return ray_err(ERR_ARITY);
 
             // Load symfile if present (needed before reading partitions with ENUM columns)
             // Ignore error if symfile doesn't exist - it's optional
@@ -249,7 +249,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
             if (l == 0) {
                 drop_obj(gcol);
                 drop_obj(res);
-                THROW("get parted: empty directory");
+                return ray_err("get parted: empty directory");
             }
 
             // Load schema of the first partition
@@ -272,7 +272,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
                 drop_obj(res);
                 drop_obj(t1);
                 drop_obj(path);
-                THROW("get parted: partition may not have zero columns");
+                return ray_err("get parted: partition may not have zero columns");
             }
 
             // Create maps over columns
@@ -310,7 +310,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
                     drop_obj(t2);
                     drop_obj(path);
                     drop_obj(fmaps);
-                    THROW("get parted: partitions have different wides");
+                    return ray_err("get parted: partitions have different wides");
                 }
 
                 // Partitions must have the same column names
@@ -323,7 +323,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
                     drop_obj(t2);
                     drop_obj(path);
                     drop_obj(fmaps);
-                    THROW("get parted: partitions have different column names");
+                    return ray_err("get parted: partitions have different column names");
                 }
 
                 drop_obj(eq);
@@ -337,7 +337,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
                         drop_obj(t2);
                         drop_obj(path);
                         drop_obj(fmaps);
-                        THROW("get parted: partitions have different column types");
+                        return ray_err("get parted: partitions have different column types");
                     }
                 }
 
@@ -387,6 +387,6 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
             return table(keys, vals);
 
         default:
-            THROW(E_ARITY);
+            return ray_err(ERR_ARITY);
     }
 }
