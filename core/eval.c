@@ -47,6 +47,7 @@ vm_p vm_create(i64_t id, struct pool_t *pool) {
     vm->rp = 0;
     vm->fn = NULL_OBJ;
     vm->env = NULL_OBJ;
+    vm->nfo = NULL_OBJ;
     vm->pool = pool;
     vm->timeit.active = B8_FALSE;
     vm->last_err = NULL_OBJ;
@@ -276,8 +277,36 @@ nil_t bc_error_add_loc(obj_p err, obj_p fn, i64_t ip) {
         push_raw(&vm->last_locs, &loc);
 }
 
+// Add location info for tree-walking eval using vm->nfo
+nil_t eval_error_add_loc(obj_p expr) {
+    obj_p loc, nfo;
+    span_t span;
+    vm_p vm = VM;
+
+    if (vm == NULL || vm->nfo == NULL_OBJ || expr == NULL_OBJ)
+        return;
+
+    nfo = vm->nfo;
+    
+    // Check nfo has proper structure (list with at least 2 elements)
+    if (nfo->type != TYPE_LIST || nfo->len < 2)
+        return;
+
+    span = nfo_get(nfo, (i64_t)expr);
+    if (span.id == 0)
+        return;
+
+    loc = vn_list(4, i64(span.id), clone_obj(AS_LIST(nfo)[0]), NULL_OBJ, clone_obj(AS_LIST(nfo)[1]));
+
+    if (vm->last_locs == NULL_OBJ)
+        vm->last_locs = vn_list(1, loc);
+    else
+        push_raw(&vm->last_locs, &loc);
+}
+
 static inline obj_p unwrap(obj_p obj, i64_t id) {
-    UNUSED(id);
+    if (IS_ERR(obj))
+        eval_error_add_loc((obj_p)id);
     return obj;
 }
 
@@ -771,22 +800,32 @@ obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file) {
 
 obj_p eval_obj(obj_p obj) { return eval(obj); }
 
-obj_p eval_str_w_attr(lit_p str, i64_t len, obj_p nfo) {
+obj_p eval_str_w_attr(lit_p str, i64_t len, obj_p nfo_arg) {
     obj_p parsed, res;
+    vm_p vm = VM;
+    obj_p saved_nfo = vm ? vm->nfo : NULL_OBJ;
 
     timeit_reset();
     timeit_span_start("top-level");
 
-    parsed = parse(str, len, nfo);
+    parsed = parse(str, len, nfo_arg);
     timeit_tick("parse");
 
     if (IS_ERR(parsed)) {
-        drop_obj(nfo);
+        drop_obj(nfo_arg);
         return parsed;
     }
 
+    // Set nfo for error reporting during tree-walking eval
+    if (vm)
+        vm->nfo = nfo_arg;
+
     res = eval(parsed);
     drop_obj(parsed);
+
+    // Restore previous nfo
+    if (vm)
+        vm->nfo = saved_nfo;
 
     timeit_span_end("top-level");
 
@@ -801,7 +840,11 @@ obj_p ray_eval_str(obj_p str, obj_p file) {
     if (str->type != TYPE_C8)
         return ray_err(ERR_TYPE);
 
-    info = (file != NULL && file != NULL_OBJ) ? nfo(clone_obj(file), clone_obj(str)) : NULL_OBJ;
+    // Always create nfo for source tracking; use "repl" if no file provided
+    if (file != NULL && file != NULL_OBJ)
+        info = nfo(clone_obj(file), clone_obj(str));
+    else
+        info = nfo(string_from_str("repl", 4), clone_obj(str));
 
     return eval_str_w_attr(AS_C8(str), str->len, info);
 }

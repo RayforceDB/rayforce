@@ -144,13 +144,4 @@ obj_p ray_resolve(obj_p x) {
     return (res == NULL) ? NULL_OBJ : clone_obj(*res);
 }
 
-obj_p ray_unicode_format(obj_p x) {
-    if (x->type != -TYPE_B8)
-        return ray_err(ERR_TYPE);
-
-    format_set_use_unicode(x->b8);
-
-    return null(0);
-}
-
 obj_p ray_is_null(obj_p x) { return b8(is_null(x)); }

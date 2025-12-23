@@ -31,7 +31,6 @@ obj_p unary_call(obj_p f, obj_p x);
 obj_p ray_get(obj_p x);
 obj_p ray_resolve(obj_p x);
 obj_p ray_time(obj_p x);
-obj_p ray_unicode_format(obj_p x);
 obj_p ray_is_null(obj_p x);
 
 #endif  // UNARY_H

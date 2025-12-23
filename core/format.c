@@ -57,11 +57,6 @@ static u32_t F64_PRECISION = DEFAULT_F64_PRECISION;
 
 const lit_p unicode_glyphs[] = {"│", "─", "┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼",
                                 "❯", "∶", "‾", "•", "╭", "╰", "╮", "╯", "┆", "…", "█"};
-const lit_p ascii_glyphs[] = {"|", "-", "+", "+", "+", "+", "+", "+", "+", "+", "+",
-                              ">", ":", "~", "*", "|", "|", "|", "|", ":", ".", "|"};
-
-static b8_t __USE_UNICODE = B8_TRUE;
-
 obj_p ray_set_fpr(obj_p x) {
     if (x->type != -TYPE_I64)
         return ray_err(ERR_TYPE);
@@ -105,13 +100,11 @@ typedef enum {
     }
 
 i64_t prompt_fmt_into(obj_p *dst) {
-    return (__USE_UNICODE) ? str_fmt_into(dst, NO_LIMIT, "%s%s %s", GREEN, unicode_glyphs[GLYPH_R_ARROW], RESET)
-                           : str_fmt_into(dst, NO_LIMIT, "%s%s %s", GREEN, ascii_glyphs[GLYPH_R_ARROW], RESET);
+    return str_fmt_into(dst, NO_LIMIT, "%s%s %s", GREEN, unicode_glyphs[GLYPH_R_ARROW], RESET);
 }
 
 i64_t continuation_prompt_fmt_into(obj_p *dst) {
-    return (__USE_UNICODE) ? str_fmt_into(dst, NO_LIMIT, "%s%s %s", GRAY, unicode_glyphs[GLYPH_HDOTS], RESET)
-                           : str_fmt_into(dst, NO_LIMIT, "%s.. %s", GRAY, RESET);
+    return str_fmt_into(dst, NO_LIMIT, "%s%s %s", GRAY, unicode_glyphs[GLYPH_HDOTS], RESET);
 }
 
 nil_t debug_str(obj_p str) {
@@ -269,17 +262,7 @@ obj_p str_fmt(i64_t limit, lit_p fmt, ...) {
     return res;
 }
 
-i64_t glyph_fmt_into(obj_p *dst, glyph_t glyph, b8_t unicode) {
-    if (unicode)
-        return str_fmt_into(dst, 4, "%s", unicode_glyphs[glyph]);
-
-    switch (glyph) {
-        case GLYPH_HDOTS:
-            return str_fmt_into(dst, 4, "...");
-        default:
-            return str_fmt_into(dst, 2, "%s", ascii_glyphs[glyph]);
-    }
-}
+i64_t glyph_fmt_into(obj_p *dst, glyph_t glyph) { return str_fmt_into(dst, 4, "%s", unicode_glyphs[glyph]); }
 
 i64_t b8_fmt_into(obj_p *dst, b8_t val) {
     if (val)
@@ -439,113 +422,150 @@ i64_t string_fmt_into(obj_p *dst, i64_t limit, b8_t full, obj_p obj) {
     return n;
 }
 
+// Calculate number of digits for line number formatting
+static i64_t line_num_width(u16_t line) {
+    if (line < 10)
+        return 1;
+    if (line < 100)
+        return 2;
+    if (line < 1000)
+        return 3;
+    if (line < 10000)
+        return 4;
+    return 5;
+}
+
+// Format underline annotation (the ^~~~ part)
+static i64_t fmt_underline(obj_p *dst, i64_t gutter_width, u16_t start_col, u16_t end_col, lit_p msg, i32_t msg_len) {
+    i64_t n = 0;
+    u16_t i, span_len;
+
+    // Empty gutter space
+    n += str_fmt_into(dst, NO_LIMIT, "%s", CYAN);
+    for (i = 0; i < gutter_width; i++)
+        n += str_fmt_into(dst, NO_LIMIT, " ");
+    n += str_fmt_into(dst, NO_LIMIT, " │%s ", RESET);
+
+    // Spaces before the underline
+    for (i = 0; i < start_col; i++)
+        n += str_fmt_into(dst, NO_LIMIT, " ");
+
+    // The underline itself: ^~~~
+    span_len = (end_col > start_col) ? (end_col - start_col) : 1;
+    n += str_fmt_into(dst, NO_LIMIT, "%s^", MAGENTA);
+    for (i = 1; i < span_len; i++)
+        n += str_fmt_into(dst, NO_LIMIT, "~");
+
+    // Message after underline
+    if (msg_len > 0)
+        n += str_fmt_into(dst, NO_LIMIT, " %.*s", msg_len, msg);
+
+    n += str_fmt_into(dst, NO_LIMIT, "%s\n", RESET);
+
+    return n;
+}
+
+// Format multiline span start (just marker at start)
+static i64_t fmt_span_start(obj_p *dst, i64_t gutter_width, u16_t start_col) {
+    i64_t n = 0;
+    u16_t i;
+
+    n += str_fmt_into(dst, NO_LIMIT, "%s", CYAN);
+    for (i = 0; i < gutter_width; i++)
+        n += str_fmt_into(dst, NO_LIMIT, " ");
+    n += str_fmt_into(dst, NO_LIMIT, " │%s ", RESET);
+
+    for (i = 0; i < start_col; i++)
+        n += str_fmt_into(dst, NO_LIMIT, " ");
+
+    n += str_fmt_into(dst, NO_LIMIT, "%s╭─%s\n", MAGENTA, RESET);
+
+    return n;
+}
+
+// Format multiline span end with message
+static i64_t fmt_span_end(obj_p *dst, i64_t gutter_width, u16_t end_col, lit_p msg, i32_t msg_len) {
+    i64_t n = 0;
+    u16_t i;
+
+    n += str_fmt_into(dst, NO_LIMIT, "%s", CYAN);
+    for (i = 0; i < gutter_width; i++)
+        n += str_fmt_into(dst, NO_LIMIT, " ");
+    n += str_fmt_into(dst, NO_LIMIT, " │%s ", RESET);
+
+    n += str_fmt_into(dst, NO_LIMIT, "%s╰", MAGENTA);
+    for (i = 0; i < end_col + 1; i++)
+        n += str_fmt_into(dst, NO_LIMIT, "─");
+    n += str_fmt_into(dst, NO_LIMIT, "^");
+
+    if (msg_len > 0)
+        n += str_fmt_into(dst, NO_LIMIT, " %.*s", msg_len, msg);
+
+    n += str_fmt_into(dst, NO_LIMIT, "%s\n", RESET);
+
+    return n;
+}
+
 i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, i64_t idx, str_p msg, i32_t msg_len) {
-    i64_t n, done = 0;
-    u32_t line_len, fname_len;
-    i32_t frame_len, linecode_len;
-    u16_t line_number = 0, i;
-    lit_p filename, source, function, start, end, lf = "", flname = "repl", fnname = "anonymous";
+    i64_t n = 0;
+    u32_t line_len, fname_len, remaining_len;
+    u16_t line_number = 0, gutter_width;
+    lit_p filename, source, function, start, end;
     obj_p *frame = AS_LIST(obj);
     span_t span = (span_t){0};
-    b8_t unicode = __USE_UNICODE;
+    b8_t done = 0;
 
+    // Extract frame data
     span.id = frame[0]->i64;
     if (frame[1] != NULL_OBJ) {
         filename = AS_C8(frame[1]);
         fname_len = frame[1]->len;
     } else {
-        filename = flname;
-        fname_len = strlen(flname);
+        filename = "<repl>";
+        fname_len = 6;
     }
-    function = (frame[2] != NULL_OBJ) ? str_from_symbol(frame[2]->i64) : fnname;
+    function = (frame[2] != NULL_OBJ) ? str_from_symbol(frame[2]->i64) : "λ";
     source = AS_C8(frame[3]);
-    line_len = frame[3]->len;
+    remaining_len = frame[3]->len;
 
-    n = str_fmt_into(dst, MAX_ERROR_LEN, "%s", CYAN);
-    n += glyph_fmt_into(dst, GLYPH_TL_CURLY, unicode);
-    n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-    n += str_fmt_into(dst, MAX_ERROR_LEN, "%s", RESET);
-    frame_len = n;
-    n += str_fmt_into(dst, MAX_ERROR_LEN, "[%lld]", idx);
-    frame_len = n - frame_len;
-    n += str_fmt_into(dst, MAX_ERROR_LEN, "%s", CYAN);
-    n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-    n += glyph_fmt_into(dst, GLYPH_T_TEE, unicode);
-    n += str_fmt_into(dst, MAX_ERROR_LEN, "%s", RESET);
-    n += str_fmt_into(dst, MAX_ERROR_LEN, " %.*s:%d..%d in function: @%s\n", fname_len, filename, span.start_line + 1,
-                      span.end_line + 1, function);
+    // Calculate gutter width based on max line number
+    gutter_width = line_num_width(span.end_line + 1);
+    if (gutter_width < 2)
+        gutter_width = 2;
 
+    // Frame header: ╭─[filename:line:col]
+    n += str_fmt_into(dst, NO_LIMIT, "   %s╭─%s[%s%.*s%s:%s%d%s:%s%d%s]\n", CYAN, RESET, CYAN, fname_len, filename,
+                      RESET, YELLOW, span.start_line + 1, RESET, YELLOW, span.start_column + 1, RESET);
+
+    // Source lines
     start = source;
-    end = NULL;
 
     for (;;) {
-        end = (str_p)memchr(start, '\n', line_len);
+        end = (str_p)memchr(start, '\n', remaining_len);
 
         if (end == NULL) {
             done = 1;
-            end = source + frame[3]->len - 1;
-            lf = "\n";
+            line_len = remaining_len;
+        } else {
+            line_len = end - start;
         }
 
-        line_len = end - start + 1;
-
+        // Show lines within the span
         if (line_number >= span.start_line && line_number <= span.end_line) {
-            n += str_fmt_into(dst, NO_LIMIT, "%s", CYAN);
-            n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
-            n += str_fmt_into(dst, NO_LIMIT, "%s", RESET);
-            linecode_len = n;
-            n += str_fmt_into(dst, NO_LIMIT, " %d ", line_number + 1);
-            linecode_len = n - linecode_len;
-            n += str_fmt_into(dst, NO_LIMIT, "%s", CYAN);
+            // Line number gutter and source
+            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", CYAN, (int)gutter_width, line_number + 1, RESET, CYAN,
+                              RESET);
+            n += str_fmt_into(dst, NO_LIMIT, "%.*s\n", (int)line_len, start);
 
-            for (i = 0; i < frame_len - 1; i++)
-                n += str_fmt_into(dst, 2, " ");
-
-            n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
-            n += str_fmt_into(dst, NO_LIMIT, "%s %.*s", RESET, line_len, start);
-
+            // Underline for single-line span
             if (span.start_line == span.end_line) {
-                n += str_fmt_into(dst, NO_LIMIT, "%s%s", lf, CYAN);
-                n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
-
-                for (i = 0; i < linecode_len + frame_len - 1; i++)
-                    n += str_fmt_into(dst, 2, " ");
-
-                n += glyph_fmt_into(dst, GLYPH_B_TEE, unicode);
-                n += str_fmt_into(dst, NO_LIMIT, "%s ", RESET);
-                for (i = 0; i < span.start_column; i++)
-                    n += str_fmt_into(dst, 2, " ");
-
-                for (i = span.start_column; i < span.end_column; i++) {
-                    n += str_fmt_into(dst, NO_LIMIT, "%s", TOMATO);
-                    n += glyph_fmt_into(dst, GLYPH_WAVE, unicode);
-                    n += str_fmt_into(dst, NO_LIMIT, "%s", RESET);
-                }
-
-                n += str_fmt_into(dst, NO_LIMIT, "%s", TOMATO);
-                n += glyph_fmt_into(dst, GLYPH_WAVE, unicode);
-                n += str_fmt_into(dst, NO_LIMIT, " %.*s%s\n", msg_len, msg, RESET);
+                n += fmt_underline(dst, gutter_width, span.start_column, span.end_column, msg, msg_len);
             } else {
+                // Multiline span
                 if (line_number == span.start_line) {
-                    n += str_fmt_into(dst, NO_LIMIT, "      %s", CYAN);
-                    n += glyph_fmt_into(dst, GLYPH_COLON, unicode);
-                    n += str_fmt_into(dst, NO_LIMIT, "%s ", RESET);
-                    for (i = 0; i < span.start_column; i++)
-                        n += str_fmt_into(dst, 2, " ");
-
-                    n += str_fmt_into(dst, NO_LIMIT, "%s", TOMATO);
-                    n += glyph_fmt_into(dst, GLYPH_WAVE, unicode);
-                    n += str_fmt_into(dst, NO_LIMIT, "%s\n", RESET);
+                    n += fmt_span_start(dst, gutter_width, span.start_column);
                 } else if (line_number == span.end_line) {
-                    n += str_fmt_into(dst, NO_LIMIT, "%s%s      ", lf, CYAN);
-                    n += glyph_fmt_into(dst, GLYPH_COLON, unicode);
-                    n += str_fmt_into(dst, NO_LIMIT, "%s ", RESET);
-                    for (i = 0; i < span.end_column + 1; i++)
-                        n += str_fmt_into(dst, 2, " ");
-
-                    n += str_fmt_into(dst, NO_LIMIT, "%s", TOMATO);
-                    n += glyph_fmt_into(dst, GLYPH_WAVE, unicode);
-                    n += str_fmt_into(dst, NO_LIMIT, " %.*s%s\n", msg_len, msg, RESET);
+                    n += fmt_span_end(dst, gutter_width, span.end_column, msg, msg_len);
                 }
             }
         }
@@ -554,8 +574,12 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, i64_t idx, str_p msg, i32_t ms
             break;
 
         line_number++;
+        remaining_len -= (end - start + 1);
         start = end + 1;
     }
+
+    // Frame footer with function name and frame index
+    n += str_fmt_into(dst, NO_LIMIT, "   %s╰─%s in %s%s%s [%lld]\n", CYAN, RESET, GREEN, function, RESET, idx);
 
     return n;
 }
@@ -564,41 +588,38 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
     i64_t n;
     i32_t msg_len;
     u16_t i, l, m;
-    lit_p err_type, err_msg;
+    lit_p err_code;
     obj_p locs;
     vm_p vm;
 
     UNUSED(limit);
 
-    // Get error type from raw field (first 8 bytes, null-terminated)
-    err_type = ray_err_msg(obj);
-
-    // Get error message from i64 field (pointer to string)
-    err_msg = ray_err_msg(obj);
-    msg_len = (i32_t)strlen(err_msg);
+    // Get error code (stored in i64 field, max 7 chars)
+    err_code = ray_err_msg(obj);
+    msg_len = (i32_t)strlen(err_code);
 
     // Check for locations in VM's last_locs
     vm = VM;
     locs = (vm && vm->last_locs != NULL_OBJ) ? vm->last_locs : NULL_OBJ;
 
+    // Format header with × marker: "× Error: code"
+    n = str_fmt_into(dst, MAX_ERROR_LEN, "\n  %s×%s %sError%s: %s%s%s\n", TOMATO, RESET, TOMATO, RESET, CYAN, err_code,
+                     RESET);
+
     // Format with locations if available
     if (locs != NULL_OBJ) {
-        n = str_fmt_into(dst, MAX_ERROR_LEN, "%s", TOMATO);
-        n += glyph_fmt_into(dst, GLYPH_ASTERISK, __USE_UNICODE);
-        n += glyph_fmt_into(dst, GLYPH_ASTERISK, __USE_UNICODE);
-        n += str_fmt_into(dst, MAX_ERROR_LEN, " [%s] error%s: %s\n", err_type, RESET, err_msg);
+        n += str_fmt_into(dst, MAX_ERROR_LEN, "\n");
 
         l = locs->len;
         m = l > ERR_STACK_MAX_HEIGHT ? ERR_STACK_MAX_HEIGHT : l;
 
         for (i = 0; i < m; i++) {
-            n += error_frame_fmt_into(dst, AS_LIST(locs)[i], l - i - 1, (str_p)err_msg, msg_len);
-            msg_len = 0;
+            n += error_frame_fmt_into(dst, AS_LIST(locs)[i], l - i - 1, (str_p)err_code, msg_len);
+            msg_len = 0;  // Only show message on first frame
         }
 
         if (l > m) {
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "  ..\n");
-            n += error_frame_fmt_into(dst, AS_LIST(locs)[l - 1], 0, (str_p)err_msg, msg_len);
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "   %s...%s %d more frames\n", GRAY, RESET, l - m);
         }
 
         // Clear locations after formatting
@@ -606,14 +627,7 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
             drop_obj(vm->last_locs);
             vm->last_locs = NULL_OBJ;
         }
-        return n;
     }
-
-    // Format without locations
-    n = str_fmt_into(dst, MAX_ERROR_LEN, "%s", TOMATO);
-    n += glyph_fmt_into(dst, GLYPH_ASTERISK, __USE_UNICODE);
-    n += glyph_fmt_into(dst, GLYPH_ASTERISK, __USE_UNICODE);
-    n += str_fmt_into(dst, MAX_ERROR_LEN, " [%s] error%s: %s\n", err_type, RESET, err_msg);
 
     return n;
 }
@@ -886,7 +900,6 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
     obj_p s, column, columns = AS_LIST(obj)[1], column_widths, footer;
     obj_p formatted_cols, type_names_list;
     str_p p;
-    b8_t unicode = __USE_UNICODE;
     b8_t has_hidden_cols;
 
     header = AS_SYMBOL(AS_LIST(obj)[0]);
@@ -895,7 +908,7 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
     if (!full) {
         n = str_fmt_into(dst, 8, "(table ");
         n += obj_fmt_into(dst, indent, MAX_ROW_WIDTH, B8_FALSE, AS_LIST(obj)[0]);
-        n += glyph_fmt_into(dst, GLYPH_HDOTS, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HDOTS);
         n += str_fmt_into(dst, 2, ")");
 
         return n;
@@ -1018,28 +1031,28 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
         total_width += 4;  // "───┤" or " … │"
 
     // Top border of the table
-    n = glyph_fmt_into(dst, GLYPH_TL_CORNER, unicode);
+    n = glyph_fmt_into(dst, GLYPH_TL_CORNER);
     for (i = 0; i < table_width; i++) {
         for (j = 0; j < AS_I64(column_widths)[i]; j++)
-            n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_HLINE);
         if (i < table_width - 1)
-            n += glyph_fmt_into(dst, GLYPH_T_TEE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_T_TEE);
         else if (has_hidden_cols)
-            n += glyph_fmt_into(dst, GLYPH_T_TEE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_T_TEE);
         else
-            n += glyph_fmt_into(dst, GLYPH_TR_CORNER, unicode);
+            n += glyph_fmt_into(dst, GLYPH_TR_CORNER);
     }
     if (has_hidden_cols) {
-        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-        n += glyph_fmt_into(dst, GLYPH_TR_CORNER, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HLINE);
+        n += glyph_fmt_into(dst, GLYPH_HLINE);
+        n += glyph_fmt_into(dst, GLYPH_HLINE);
+        n += glyph_fmt_into(dst, GLYPH_TR_CORNER);
     }
 
     // Print table header (column names) - centered
     n += str_fmt_into(dst, 2, "\n");
     n += str_fmt_into_n(dst, NO_LIMIT, indent, " ");
-    n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+    n += glyph_fmt_into(dst, GLYPH_VLINE);
     for (i = 0; i < table_width; i++) {
         p = str_from_symbol(header[i]);
         i64_t name_len = SYMBOL_STRLEN(header[i]);
@@ -1049,19 +1062,19 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
         n += str_fmt_into_n(dst, NO_LIMIT, left_pad, " ");
         n += str_fmt_into(dst, NO_LIMIT, "%s", p);
         n += str_fmt_into_n(dst, NO_LIMIT, right_pad, " ");
-        n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_VLINE);
     }
     if (has_hidden_cols) {
         n += str_fmt_into(dst, 2, " ");
-        n += glyph_fmt_into(dst, GLYPH_HDOTS, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HDOTS);
         n += str_fmt_into(dst, 2, " ");
-        n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_VLINE);
     }
 
     // Print table header (column types) - centered
     n += str_fmt_into(dst, 2, "\n");
     n += str_fmt_into_n(dst, NO_LIMIT, indent, " ");
-    n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+    n += glyph_fmt_into(dst, GLYPH_VLINE);
     for (i = 0; i < table_width; i++) {
         i64_t col_width = AS_I64(column_widths)[i];
         obj_p type_str = AS_LIST(type_names_list)[i];
@@ -1071,34 +1084,34 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
         n += str_fmt_into_n(dst, NO_LIMIT, left_pad, " ");
         n += str_fmt_into(dst, NO_LIMIT, "%.*s", (i32_t)type_len, AS_C8(type_str));
         n += str_fmt_into_n(dst, NO_LIMIT, right_pad, " ");
-        n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_VLINE);
     }
     if (has_hidden_cols) {
         n += str_fmt_into(dst, 2, " ");
-        n += glyph_fmt_into(dst, GLYPH_HDOTS, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HDOTS);
         n += str_fmt_into(dst, 2, " ");
-        n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_VLINE);
     }
 
     // Separator between header and rows
     n += str_fmt_into(dst, 2, "\n");
     n += str_fmt_into_n(dst, NO_LIMIT, indent, " ");
-    n += glyph_fmt_into(dst, GLYPH_L_TEE, unicode);
+    n += glyph_fmt_into(dst, GLYPH_L_TEE);
     for (i = 0; i < table_width; i++) {
         for (j = 0; j < AS_I64(column_widths)[i]; j++)
-            n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_HLINE);
         if (i < table_width - 1)
-            n += glyph_fmt_into(dst, GLYPH_CROSS, unicode);
+            n += glyph_fmt_into(dst, GLYPH_CROSS);
         else if (has_hidden_cols)
-            n += glyph_fmt_into(dst, GLYPH_CROSS, unicode);
+            n += glyph_fmt_into(dst, GLYPH_CROSS);
         else
-            n += glyph_fmt_into(dst, GLYPH_R_TEE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_R_TEE);
     }
     if (has_hidden_cols) {
-        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-        n += glyph_fmt_into(dst, GLYPH_R_TEE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HLINE);
+        n += glyph_fmt_into(dst, GLYPH_HLINE);
+        n += glyph_fmt_into(dst, GLYPH_HLINE);
+        n += glyph_fmt_into(dst, GLYPH_R_TEE);
     }
 
     // Print table content
@@ -1108,30 +1121,27 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
 
         // Indicate missing rows (only in REPL mode with limited output)
         if (full == 1 && j == table_height / 2 && table_height != rows) {
-            n += glyph_fmt_into(dst, GLYPH_VDOTS, unicode);
+            n += glyph_fmt_into(dst, GLYPH_VDOTS);
             for (i = 0; i < table_width; i++) {
                 n += str_fmt_into(dst, 2, " ");
                 l = n;
-                n += glyph_fmt_into(dst, GLYPH_HDOTS, unicode);
+                n += glyph_fmt_into(dst, GLYPH_HDOTS);
                 l = n - l;
-                if (unicode)
-                    m = AS_I64(column_widths)[i] - l + 1;
-                else
-                    m = AS_I64(column_widths)[i] - l - 1;
+                m = AS_I64(column_widths)[i] - l + 1;
                 n += str_fmt_into_n(dst, NO_LIMIT, m, " ");
-                n += glyph_fmt_into(dst, GLYPH_VDOTS, unicode);
+                n += glyph_fmt_into(dst, GLYPH_VDOTS);
             }
             if (has_hidden_cols) {
                 n += str_fmt_into(dst, 2, " ");
-                n += glyph_fmt_into(dst, GLYPH_HDOTS, unicode);
+                n += glyph_fmt_into(dst, GLYPH_HDOTS);
                 n += str_fmt_into(dst, 2, " ");
-                n += glyph_fmt_into(dst, GLYPH_VDOTS, unicode);
+                n += glyph_fmt_into(dst, GLYPH_VDOTS);
             }
             n += str_fmt_into(dst, 2, "\n");
             n += str_fmt_into_n(dst, NO_LIMIT, indent, " ");
         }
 
-        n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_VLINE);
 
         for (i = 0; i < table_width; i++) {
             s = AS_LIST(AS_LIST(formatted_cols)[i])[j];
@@ -1139,35 +1149,35 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
             m = AS_I64(column_widths)[i] - s->len - 2;
             n += str_fmt_into(dst, s->len + 3, " %.*s ", (i32_t)s->len, p);
             n += str_fmt_into_n(dst, NO_LIMIT, m, " ");
-            n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_VLINE);
         }
         if (has_hidden_cols) {
             n += str_fmt_into(dst, 2, " ");
-            n += glyph_fmt_into(dst, GLYPH_HDOTS, unicode);
+            n += glyph_fmt_into(dst, GLYPH_HDOTS);
             n += str_fmt_into(dst, 2, " ");
-            n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_VLINE);
         }
     }
 
     // Bottom border of the table
     n += str_fmt_into(dst, 2, "\n");
     n += str_fmt_into_n(dst, NO_LIMIT, indent, " ");
-    n += glyph_fmt_into(dst, GLYPH_L_TEE, unicode);
+    n += glyph_fmt_into(dst, GLYPH_L_TEE);
     for (i = 0; i < table_width; i++) {
         for (j = 0; j < AS_I64(column_widths)[i]; j++)
-            n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_HLINE);
         if (i < table_width - 1)
-            n += glyph_fmt_into(dst, GLYPH_B_TEE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_B_TEE);
         else if (has_hidden_cols)
-            n += glyph_fmt_into(dst, GLYPH_B_TEE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_B_TEE);
         else
-            n += glyph_fmt_into(dst, GLYPH_R_TEE, unicode);
+            n += glyph_fmt_into(dst, GLYPH_R_TEE);
     }
     if (has_hidden_cols) {
-        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-        n += glyph_fmt_into(dst, GLYPH_R_TEE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HLINE);
+        n += glyph_fmt_into(dst, GLYPH_HLINE);
+        n += glyph_fmt_into(dst, GLYPH_HLINE);
+        n += glyph_fmt_into(dst, GLYPH_R_TEE);
     }
 
     drop_obj(column_widths);
@@ -1175,7 +1185,7 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
     // Draw info footer
     n += str_fmt_into(dst, 2, "\n");
     n += str_fmt_into_n(dst, NO_LIMIT, indent, " ");
-    n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+    n += glyph_fmt_into(dst, GLYPH_VLINE);
     m = n;
     n += str_fmt_into(dst, NO_LIMIT, "%.*s", (i32_t)footer->len, AS_C8(footer));
     drop_obj(footer);
@@ -1184,15 +1194,15 @@ i64_t table_fmt_into(obj_p *dst, i64_t indent, i64_t full, obj_p obj) {
     for (i = 0; i < total_width - m; i++)
         n += str_fmt_into(dst, 2, " ");
 
-    n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+    n += glyph_fmt_into(dst, GLYPH_VLINE);
     n += str_fmt_into(dst, 2, "\n");
 
     m = n;
-    n += glyph_fmt_into(dst, GLYPH_BL_CORNER, unicode);
+    n += glyph_fmt_into(dst, GLYPH_BL_CORNER);
     for (i = 0; i < total_width; i++)
-        n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
+        n += glyph_fmt_into(dst, GLYPH_HLINE);
 
-    n += glyph_fmt_into(dst, GLYPH_BR_CORNER, unicode);
+    n += glyph_fmt_into(dst, GLYPH_BR_CORNER);
 
     drop_obj(formatted_cols);
     drop_obj(type_names_list);
@@ -1359,7 +1369,6 @@ i64_t timeit_fmt_into(obj_p *dst, i64_t indent, i64_t *index, timeit_t *timeit) 
     i64_t n;
     i64_t i;
     f64_t elapsed = 0.0;
-    b8_t unicode = __USE_UNICODE;
     timeit_span_t span;
 
     n = 0;
@@ -1370,21 +1379,21 @@ i64_t timeit_fmt_into(obj_p *dst, i64_t indent, i64_t *index, timeit_t *timeit) 
         switch (span.type) {
             case TIMEIT_SPAN_START:
                 for (i = 0; i < indent; i++) {
-                    n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+                    n += glyph_fmt_into(dst, GLYPH_VLINE);
                     n += str_fmt_into(dst, 2, " ");
                 }
-                n += glyph_fmt_into(dst, GLYPH_TL_CURLY, unicode);
+                n += glyph_fmt_into(dst, GLYPH_TL_CURLY);
                 n += str_fmt_into(dst, NO_LIMIT, " %s\n", span.msg);
                 (*index)++;
                 n += timeit_fmt_into(dst, indent + 1, index, timeit);
                 elapsed = ray_clock_elapsed_ms(&span.clock, &timeit->spans[*index].clock);
                 for (i = 0; i < indent; i++) {
-                    n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+                    n += glyph_fmt_into(dst, GLYPH_VLINE);
                     n += str_fmt_into(dst, 2, " ");
                 }
-                n += glyph_fmt_into(dst, GLYPH_BL_CURLY, unicode);
-                n += glyph_fmt_into(dst, GLYPH_HLINE, unicode);
-                n += glyph_fmt_into(dst, GLYPH_R_TEE, unicode);
+                n += glyph_fmt_into(dst, GLYPH_BL_CURLY);
+                n += glyph_fmt_into(dst, GLYPH_HLINE);
+                n += glyph_fmt_into(dst, GLYPH_R_TEE);
                 n += str_fmt_into(dst, NO_LIMIT, " %.*f ms\n", F64_PRECISION, elapsed);
                 (*index)++;
                 break;
@@ -1394,10 +1403,10 @@ i64_t timeit_fmt_into(obj_p *dst, i64_t indent, i64_t *index, timeit_t *timeit) 
                 if (*index > 0)
                     elapsed = ray_clock_elapsed_ms(&timeit->spans[*index - 1].clock, &span.clock);
                 for (i = 0; i < indent; i++) {
-                    n += glyph_fmt_into(dst, GLYPH_VLINE, unicode);
+                    n += glyph_fmt_into(dst, GLYPH_VLINE);
                     n += str_fmt_into(dst, 2, " ");
                 }
-                n += glyph_fmt_into(dst, GLYPH_ASTERISK, unicode);
+                n += glyph_fmt_into(dst, GLYPH_ASTERISK);
                 n += str_fmt_into(dst, NO_LIMIT, "  %s: %.*f ms\n", span.msg, F64_PRECISION, elapsed);
                 (*index)++;
                 break;
@@ -1416,13 +1425,6 @@ obj_p timeit_fmt(nil_t) {
 
     return dst;
 }
-
-i64_t format_set_use_unicode(b8_t use) {
-    __USE_UNICODE = use;
-    return 0;
-}
-
-i64_t format_get_use_unicode() { return __USE_UNICODE; }
 
 i64_t format_set_fpr(i64_t x) {
     F64_PRECISION = x;

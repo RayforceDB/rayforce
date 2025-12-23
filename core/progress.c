@@ -27,10 +27,8 @@
 #include <stdio.h>
 
 #define PROGRESS_BAR_WIDTH 40
-#define PROGRESS_BAR_FILLED_UNICODE "█"
-#define PROGRESS_BAR_FILLED_ASCII "#"
-#define PROGRESS_BAR_EMPTY_UNICODE "░"
-#define PROGRESS_BAR_EMPTY_ASCII "."
+#define PROGRESS_BAR_FILLED "█"
+#define PROGRESS_BAR_EMPTY "░"
 
 nil_t progress_init(progress_p progress, i64_t parts) {
     if (progress == NULL)
@@ -42,12 +40,9 @@ nil_t progress_init(progress_p progress, i64_t parts) {
 
 nil_t progress_tick(progress_p progress, i64_t parts, str_p label) {
     i64_t i, percentage, filled_width;
-    b8_t unicode;
-
     if (progress == NULL)
         return;
 
-    unicode = format_get_use_unicode();
     cursor_move_start();
     line_clear();
 
@@ -61,9 +56,9 @@ nil_t progress_tick(progress_p progress, i64_t parts, str_p label) {
     printf(" ");
     for (i = 0; i < PROGRESS_BAR_WIDTH; i++) {
         if (i < filled_width)
-            unicode ? printf(PROGRESS_BAR_FILLED_UNICODE) : printf(PROGRESS_BAR_FILLED_ASCII);
+            printf(PROGRESS_BAR_FILLED);
         else
-            unicode ? printf(PROGRESS_BAR_EMPTY_UNICODE) : printf(PROGRESS_BAR_EMPTY_ASCII);
+            printf(PROGRESS_BAR_EMPTY);
     }
 
     printf(" %lld/%lld (%lld%%) - %s", progress->completed, progress->parts, percentage, label);

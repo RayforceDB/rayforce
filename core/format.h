@@ -80,8 +80,6 @@ i64_t guid_fmt_into(obj_p *dst, guid_t *val);
 obj_p obj_fmt_n(obj_p *obj, i64_t n);
 obj_p ray_show(obj_p obj);
 obj_p timeit_fmt(nil_t);
-i64_t format_set_use_unicode(b8_t use);   // set use unicode
-i64_t format_get_use_unicode();           // get use unicode
 i64_t format_set_fpr(i64_t x);            // set float precision
 i64_t format_set_display_width(i64_t x);  // set display width
 

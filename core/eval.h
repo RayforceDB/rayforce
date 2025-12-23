@@ -67,6 +67,7 @@ typedef struct ctx_t {
 typedef struct vm_t {
     obj_p fn;                                              // current function pointer
     obj_p env;                                             // current environment frame
+    obj_p nfo;                                             // current source nfo for error reporting
     obj_p last_err;                                        // last error (glibc-like errno)
     obj_p last_locs;                                       // last error locations
     i64_t id;                                              // VM id

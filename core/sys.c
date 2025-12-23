@@ -164,7 +164,6 @@ typedef struct command_entry_t {
 
 // Internal commands list
 command_entry_t commands[] = {
-    COMMAND("use-unicode", sys_use_unicode),
     COMMAND("set-fpr", sys_set_fpr),
     COMMAND("set-display-width", sys_set_display_width),
     COMMAND("timeit", sys_timeit),
@@ -183,23 +182,6 @@ obj_p sys_set_fpr(i32_t argc, str_p argv[]) {
         return ray_err(ERR_TYPE);
 
     res = format_set_fpr(fpr);
-    if (res != 0)
-        return ray_err(ERR_SYS);
-
-    return i64(res);
-}
-
-obj_p sys_use_unicode(i32_t argc, str_p argv[]) {
-    i64_t res;
-
-    if (argc != 1)
-        return ray_err(ERR_ARITY);
-
-    i64_from_str(argv[0], strlen(argv[0]), &res);
-    if (res < 0)
-        return ray_err(ERR_TYPE);
-
-    res = format_set_use_unicode(res);
     if (res != 0)
         return ray_err(ERR_SYS);
 

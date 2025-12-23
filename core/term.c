@@ -57,7 +57,6 @@
 #define COMMANDS_LIST \
     "\
   :?  - Displays help.\n\
-  :u  - Use unicode for graphic formatting: [0|1].\n\
   :t  - Turns on|off measurement of expressions: [0|1].\n\
   :q  - Exits the application: [exit code]."
 
@@ -484,8 +483,7 @@ term_p term_create() {
     // [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
     // Set the console output code page to UTF-8
-    if (!SetConsoleOutputCP(CP_UTF8))
-        format_set_use_unicode(B8_FALSE);  // Disable unicode support
+    SetConsoleOutputCP(CP_UTF8);
 
     // Save the current input mode
     GetConsoleMode(h_stdin, &term->old_stdin_mode);
@@ -1280,14 +1278,6 @@ obj_p term_handle_return(term_p term) {
             if (r != term->buf_len - 2)
                 exit_code = 0;
             poll_exit(runtime_get()->poll, exit_code);
-            return NULL_OBJ;
-        }
-
-        if (IS_CMD(term, ":u")) {
-            onoff = (term->buf_len > 2 && term->buf[3] == '1') ? B8_TRUE : B8_FALSE;
-            format_set_use_unicode(onoff);
-            printf("\n%s. Format use unicode: %s.%s", YELLOW, onoff ? "on" : "off", RESET);
-            hist_add(term->hist, term->buf, term->buf_len);
             return NULL_OBJ;
         }
 
