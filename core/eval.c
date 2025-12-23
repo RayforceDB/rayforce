@@ -461,6 +461,15 @@ OP_CALFN:
         return r;
     }
 callfn:
+    // Compile if not already compiled
+    if (AS_LAMBDA(x)->bc == NULL_OBJ) {
+        r = cc_compile(x);
+        if (IS_ERR(r)) {
+            drop_obj(x);
+            bc_error_add_loc(r, vm->fn, ip);
+            return r;
+        }
+    }
     // Save current context
     rs = &vm->rs[vm->rp++];
     rs->ip = ip;

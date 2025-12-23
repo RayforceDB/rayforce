@@ -119,6 +119,16 @@ static i64_t cc_cond(cc_ctx_t *cc, obj_p *lst, i64_t n) {
     return 0;
 }
 
+// Compile expression as a constant (no dereferencing of symbols)
+// Used for special form arguments that shouldn't be evaluated
+static i64_t cc_const(cc_ctx_t *cc, obj_p e) {
+    CC(cc, clone_obj(e));
+    return 0;
+}
+
+// Check if a binary function is a special form (like set/let)
+static b8_t is_binary_special_form(obj_p fn) { return fn->type == TYPE_BINARY && (fn->attrs & FN_SPECIAL_FORM); }
+
 // Compile function call
 // expr is the original list expression (for debug info)
 static i64_t cc_call(cc_ctx_t *cc, obj_p expr, obj_p *lst, i64_t n) {
@@ -131,6 +141,20 @@ static i64_t cc_call(cc_ctx_t *cc, obj_p expr, obj_p *lst, i64_t n) {
     // Handle special form 'cond'/'if'
     if (is_cond_fn(car)) {
         return cc_cond(cc, lst, n);
+    }
+
+    // Handle binary special forms (set, let, try)
+    // First argument is passed unevaluated, second is evaluated normally
+    if (is_binary_special_form(car) && n == 2) {
+        // First arg: push as constant (no dereference)
+        CE(cc_const(cc, lst[0]));
+        // Second arg: compile normally
+        CE(cc_expr(cc, lst[1]));
+        // Record debug info and emit call
+        DBG(cc, expr);
+        CC(cc, clone_obj(car));
+        OP(cc, OP_CALF2);
+        return 0;
     }
 
     // Compile arguments first (left to right)
