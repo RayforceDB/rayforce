@@ -71,17 +71,25 @@ typedef struct pool_t *pool_p;
 
 typedef enum run_state_t { RUN_STATE_RUNNING = 0, RUN_STATE_STOPPED = 1 } run_state_t;
 
+typedef struct executor_t {
+    i64_t id;
+    struct pool_t *pool;
+    ray_thread_t handle;
+    heap_p heap;
+    vm_p vm;
+} executor_t;
+
 typedef struct pool_t {
-    mutex_t mutex;        // Mutex for condition variable
-    cond_t run;           // Condition variable for run VMs
-    cond_t done;          // Condition variable for signal that VM is done
-    run_state_t state;    // Pool's state
-    i64_t done_count;     // Number of done VMs
-    i64_t vms_count;      // Number of VMs
-    i64_t tasks_count;    // Number of tasks
-    mpmc_p task_queue;    // Pool's task queue
-    mpmc_p result_queue;  // Pool's result queue
-    vm_p vms[];           // Array of VMs
+    mutex_t mutex;           // Mutex for condition variable
+    cond_t run;              // Condition variable for run VMs
+    cond_t done;             // Condition variable for signal that VM is done
+    run_state_t state;       // Pool's state
+    i64_t done_count;        // Number of done VMs
+    i64_t executors_count;   // Number of executors
+    i64_t tasks_count;       // Number of tasks
+    mpmc_p task_queue;       // Pool's task queue
+    mpmc_p result_queue;     // Pool's result queue
+    executor_t executors[];  // Array of executors
 } *pool_p;
 
 pool_p pool_create(i64_t executors_count);

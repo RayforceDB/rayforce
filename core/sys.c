@@ -283,11 +283,7 @@ obj_p sys_exit(i32_t argc, str_p argv[]) {
 
     poll_exit(runtime_get()->poll, code);
 
-    stack_push(NULL_OBJ);
-
-    longjmp(ctx_get()->jmp, 2);
-
-    __builtin_unreachable();
+    return NULL_OBJ;
 }
 
 obj_p ray_internal_command(obj_p cmd) {

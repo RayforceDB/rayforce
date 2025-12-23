@@ -2822,6 +2822,10 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
     u32_t rc;
     i64_t i, l;
 
+    // Never drop NULL_OBJ (static global singleton)
+    if (obj == NULL_OBJ)
+        return;
+
     if (!__RC_SYNC) {
         (obj)->rc -= 1;
         rc = (obj)->rc;
@@ -2888,6 +2892,8 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             drop_obj(AS_LAMBDA(obj)->args);
             drop_obj(AS_LAMBDA(obj)->body);
             drop_obj(AS_LAMBDA(obj)->nfo);
+            drop_obj(AS_LAMBDA(obj)->bc);
+            drop_obj(AS_LAMBDA(obj)->consts);
             heap_free(obj);
             return;
         case TYPE_NULL:

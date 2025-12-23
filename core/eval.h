@@ -24,7 +24,6 @@
 #ifndef EVAL_H
 #define EVAL_H
 
-#include <setjmp.h>
 #include "chrono.h"
 #include "rayforce.h"
 #include "lambda.h"
@@ -35,33 +34,38 @@
 
 #define VM_STACK_SIZE 1024
 
+// Bytecode opcodes
 typedef enum op_type_t {
-    OP_RET = 0,
-    OP_PUSHC,
-    OP_DUP,
-    OP_POP,
-    OP_JMPZ,
-    OP_JMP,
-    OP_DEREF,
-    OP_CALF1,
-    OP_CALF2,
-    OP_CALF0,
-    OP_CALFN,
-    OP_CALFS,
-    OP_CALFD,
+    OP_RET = 0,  // Return from function
+    OP_PUSHC,    // Push constant
+    OP_DUP,      // Duplicate stack value at offset
+    OP_POP,      // Pop and discard
+    OP_JMPZ,     // Jump if zero/false
+    OP_JMP,      // Unconditional jump
+    OP_DEREF,    // Dereference symbol
+    OP_CALF1,    // Call unary function
+    OP_CALF2,    // Call binary function
+    OP_CALF0,    // Call variadic function
+    OP_CALFN,    // Call lambda function
+    OP_CALFS,    // Call self (recursive)
+    OP_CALFD,    // Call dynamic (resolved at runtime)
 } op_type_t;
 
+// Forward declarations
 struct pool_t;
+struct heap_t;
 
+// Return stack frame
 typedef struct ctx_t {
-    obj_p fn;   // (self) function pointer
-    obj_p env;  // current environment frame
+    obj_p fn;   // function pointer
+    obj_p env;  // local environment (for closures, future use)
     i64_t fp;   // frame pointer
     i64_t ip;   // instruction pointer
 } ctx_t;
 
+// Virtual machine state
 typedef struct vm_t {
-    obj_p fn;                                              // (self) function pointer
+    obj_p fn;                                              // current function pointer
     obj_p env;                                             // current environment frame
     i64_t id;                                              // VM id
     i64_t fp;                                              // frame pointer
@@ -69,42 +73,63 @@ typedef struct vm_t {
     i64_t rp;                                              // return stack pointer
     heap_p heap;                                           // heap pointer
     struct pool_t *pool;                                   // pool pointer
+    timeit_t timeit;                                       // Timeit spans
     obj_p ps[VM_STACK_SIZE] __attribute__((aligned(32)));  // program stack
     ctx_t rs[VM_STACK_SIZE] __attribute__((aligned(32)));  // return stack
 } __attribute__((aligned(32))) * vm_p;
 
-// timeit_t timeit;                                       // Timeit spans.
-
 extern __thread vm_p __VM;
 
-vm_p vm_create(i64_t id);
+// VM lifecycle
+vm_p vm_create(i64_t id, struct pool_t *pool);
 nil_t vm_destroy(vm_p vm);
 nil_t vm_set(vm_p vm);
 vm_p vm_current(nil_t);
 
-obj_p call(obj_p obj, i64_t arity);
-obj_p *resolve(i64_t sym);
-obj_p amend(obj_p sym, obj_p val);
-obj_p mount_env(obj_p obj);
-obj_p unmount_env(i64_t n);
-obj_p eval(obj_p obj);
-obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file);
-obj_p ray_eval_str(obj_p str, obj_p file);
-obj_p ray_raise(obj_p obj);
-obj_p ray_return(obj_p *x, i64_t n);
-nil_t error_add_loc(obj_p err, i64_t id, ctx_t *ctx);
+// Access heap through current VM
+#define heap_current() (__VM->heap)
 
-// TODO: replace with correct functions
-obj_p vm_env_get(nil_t);
-nil_t vm_env_set(vm_p vm, obj_p env);
-nil_t vm_env_unset(vm_p vm);
-
+// Stack operations (inlined for performance)
 inline __attribute__((always_inline)) nil_t vm_stack_push(obj_p val) { __VM->ps[__VM->sp++] = val; }
 inline __attribute__((always_inline)) obj_p vm_stack_pop(nil_t) { return __VM->ps[--__VM->sp]; }
 inline __attribute__((always_inline)) obj_p vm_stack_at(i64_t n) { return __VM->ps[__VM->sp - n - 1]; }
 inline __attribute__((always_inline)) obj_p *vm_stack_peek(i64_t n) { return &__VM->ps[__VM->sp - n - 1]; }
+inline __attribute__((always_inline)) b8_t vm_stack_enough(i64_t n) { return __VM->sp + n < VM_STACK_SIZE; }
 
+// Evaluation functions
+obj_p eval(obj_p obj);               // Recursive tree-walking eval
+obj_p vm_eval(obj_p lambda);         // Bytecode interpreter
+obj_p call(obj_p obj, i64_t arity);  // Call a compiled lambda
+
+// Symbol resolution
+obj_p *resolve(i64_t sym);
+obj_p amend(obj_p sym, obj_p val);
+obj_p mount_env(obj_p obj);
+obj_p unmount_env(i64_t n);
+
+// Environment management
+obj_p vm_env_get(nil_t);
+nil_t vm_env_set(vm_p vm, obj_p env);
+nil_t vm_env_unset(vm_p vm);
+
+// Special forms
+obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file);
+obj_p ray_eval_str(obj_p str, obj_p file);
+obj_p ray_raise(obj_p obj);
+obj_p ray_return(obj_p *x, i64_t n);
 obj_p ray_exit(obj_p *x, i64_t n);
+obj_p ray_cond(obj_p *x, i64_t n);
+
+// Error handling
+nil_t error_add_loc(obj_p err, i64_t id, ctx_t *ctx);
+
+// Thread utilities
 b8_t ray_is_main_thread(nil_t);
+
+// Macros for stack operations (for compatibility with existing code)
+#define stack_push(val) vm_stack_push(val)
+#define stack_pop() vm_stack_pop()
+#define stack_peek(n) vm_stack_peek(n)
+#define stack_enough(n) vm_stack_enough(n)
 
 #endif  // EVAL_H

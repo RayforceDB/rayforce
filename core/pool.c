@@ -169,16 +169,15 @@ raw_p executor_run(raw_p arg) {
     task_data_t data;
     i64_t i, tasks_count;
     obj_p res;
-    interpreter_p interpreter;
-    heap_p heap;
+    vm_p vm;
 
     rc_sync_set(B8_TRUE);
 
-    heap = heap_create(executor->id + 1);
-    interpreter = interpreter_create(executor->id + 1);
+    // Create VM (which also creates heap) with pool pointer
+    vm = vm_create(executor->id + 1, executor->pool);
 
-    __atomic_store_n(&executor->heap, heap, __ATOMIC_RELAXED);
-    __atomic_store_n(&executor->interpreter, interpreter, __ATOMIC_RELAXED);
+    __atomic_store_n(&executor->heap, vm->heap, __ATOMIC_RELAXED);
+    __atomic_store_n(&executor->vm, vm, __ATOMIC_RELAXED);
 
     for (;;) {
         mutex_lock(&executor->pool->mutex);
@@ -214,8 +213,7 @@ raw_p executor_run(raw_p arg) {
         }
     }
 
-    interpreter_destroy();
-    heap_destroy();
+    vm_destroy(__VM);
 
     return NULL;
 }
@@ -240,7 +238,7 @@ pool_p pool_create(i64_t executors_count) {
         pool->executors[i].id = i;
         pool->executors[i].pool = pool;
         pool->executors[i].heap = NULL;
-        pool->executors[i].interpreter = NULL;
+        pool->executors[i].vm = NULL;
         pool->executors[i].handle = ray_thread_create(executor_run, &pool->executors[i]);
         if (thread_pin(pool->executors[i].handle, i + 1) != 0)
             printf("Pool create: failed to pin thread %lld\n", i + 1);
@@ -253,7 +251,7 @@ pool_p pool_create(i64_t executors_count) {
 
     // Now ensure that all threads are running
     for (i = 0; i < executors_count; i++) {
-        while (__atomic_load_n(&pool->executors[i].interpreter, __ATOMIC_RELAXED) == NULL)
+        while (__atomic_load_n(&pool->executors[i].vm, __ATOMIC_RELAXED) == NULL)
             backoff_spin(&rounds);
     }
 
@@ -292,7 +290,7 @@ nil_t pool_prepare(pool_p pool) {
     if (pool == NULL)
         PANIC("Pool prepare: pool is NULL");
 
-    env = interpreter_env_get();
+    env = vm_env_get();
 
     mutex_lock(&pool->mutex);
 
@@ -302,7 +300,7 @@ nil_t pool_prepare(pool_p pool) {
     n = pool->executors_count;
     for (i = 0; i < n; i++) {
         heap_borrow(pool->executors[i].heap);
-        interpreter_env_set(pool->executors[i].interpreter, clone_obj(env));
+        vm_env_set(pool->executors[i].vm, clone_obj(env));
     }
 
     mutex_unlock(&pool->mutex);
@@ -417,7 +415,7 @@ obj_p pool_run(pool_p pool) {
     n = pool->executors_count;
     for (i = 0; i < n; i++) {
         heap_merge(pool->executors[i].heap);
-        interpreter_env_unset(pool->executors[i].interpreter);
+        vm_env_unset(pool->executors[i].vm);
     }
 
     rc_sync_set(B8_FALSE);

@@ -80,19 +80,19 @@ f64_t ray_clock_elapsed_ms(ray_clock_t *start, ray_clock_t *end) {
 #endif
 
 nil_t timeit_activate(b8_t active) {
-    timeit_t *timeit = &interpreter_current()->timeit;
+    timeit_t *timeit = &vm_current()->timeit;
     timeit->active = active;
     timeit->n = 0;
 }
 
 nil_t timeit_reset() {
-    timeit_t *timeit = &interpreter_current()->timeit;
+    timeit_t *timeit = &vm_current()->timeit;
     if (timeit->active)
         timeit->n = 0;
 }
 
 nil_t timeit_span_start(lit_p name) {
-    timeit_t *timeit = &interpreter_current()->timeit;
+    timeit_t *timeit = &vm_current()->timeit;
     if (timeit->n < TIMEIT_SPANS_MAX) {
         timeit->spans[timeit->n].type = TIMEIT_SPAN_START;
         timeit->spans[timeit->n].msg = name;
@@ -102,7 +102,7 @@ nil_t timeit_span_start(lit_p name) {
 }
 
 nil_t timeit_span_end(lit_p name) {
-    timeit_t *timeit = &interpreter_current()->timeit;
+    timeit_t *timeit = &vm_current()->timeit;
     if (timeit->n < TIMEIT_SPANS_MAX) {
         timeit->spans[timeit->n].type = TIMEIT_SPAN_END;
         timeit->spans[timeit->n].msg = name;
@@ -112,7 +112,7 @@ nil_t timeit_span_end(lit_p name) {
 }
 
 nil_t timeit_tick(lit_p msg) {
-    timeit_t *timeit = &interpreter_current()->timeit;
+    timeit_t *timeit = &vm_current()->timeit;
     if (timeit->n < TIMEIT_SPANS_MAX) {
         timeit->spans[timeit->n].type = TIMEIT_SPAN_TICK;
         timeit->spans[timeit->n].msg = msg;
@@ -122,7 +122,7 @@ nil_t timeit_tick(lit_p msg) {
 }
 
 nil_t timeit_print(nil_t) {
-    timeit_t *timeit = &interpreter_current()->timeit;
+    timeit_t *timeit = &vm_current()->timeit;
     obj_p fmt;
 
     if (!timeit->active)

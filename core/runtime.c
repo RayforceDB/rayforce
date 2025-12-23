@@ -27,6 +27,8 @@
 #include "string.h"
 #include "ipc.h"
 #include "dynlib.h"
+#include "heap.h"
+#include "eval.h"
 
 // Global runtime reference
 runtime_p __RUNTIME = NULL;
@@ -119,6 +121,9 @@ runtime_p runtime_create(i32_t argc, str_p argv[]) {
     i64_t n;
     obj_p arg, fmt, res;
     symbols_p symbols;
+
+    // Initialize VM for main thread (which also creates heap)
+    vm_create(0, NULL);
 
     symbols = symbols_create();
 
@@ -235,7 +240,8 @@ nil_t runtime_destroy(nil_t) {
     if (__RUNTIME->pool)
         pool_destroy(__RUNTIME->pool);
     heap_unmap(__RUNTIME, sizeof(struct runtime_t));
-    heap_destroy();
+    // Destroy main VM (which also destroys the heap)
+    vm_destroy(__VM);
     __RUNTIME = NULL;
 }
 

@@ -1,5 +1,5 @@
 /*
- *   Copyright (c) 2023 Anton Kundenko <singaraiona@gmail.com>
+ *   Copyright (c) 2024 Anton Kundenko <singaraiona@gmail.com>
  *   All rights reserved.
 
  *   Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -21,23 +21,30 @@
  *   SOFTWARE.
  */
 
-#ifndef LAMBDA_H
-#define LAMBDA_H
+#ifndef CC_H
+#define CC_H
 
 #include "rayforce.h"
+#include "lambda.h"
 
-typedef struct lambda_f {
-    obj_p name;    // name of lambda
-    obj_p args;    // vector of arguments names
-    obj_p body;    // body of lambda (AST, for debugging/introspection)
-    obj_p nfo;     // nfo from cc phase
-    obj_p bc;      // bytecode (U8 vector)
-    obj_p consts;  // constants pool (LIST)
-} *lambda_p;
+#define BC_SIZE 256
 
-#define AS_LAMBDA(o) ((lambda_p)(AS_C8(o)))
+// Compiler context
+typedef struct cc_ctx_t {
+    i64_t ip;       // instruction pointer
+    obj_p bc;       // bytecode buffer (U8 vector)
+    obj_p args;     // arguments (SYMBOL vector)
+    obj_p locals;   // local variables (LIST)
+    obj_p consts;   // constants pool (LIST)
+    i64_t lp;       // locals pointer
+} cc_ctx_t;
 
-obj_p lambda(obj_p args, obj_p body, obj_p nfo);
-obj_p lambda_call(obj_p f, obj_p *x, i64_t n);
+// Compile lambda body to bytecode
+// Takes a lambda object with args and body, fills in bc and consts
+obj_p cc_compile(obj_p lambda);
 
-#endif  // LAMBDA_H
+// Dump bytecode for debugging
+nil_t cc_dump(obj_p lambda);
+
+#endif  // CC_H
+

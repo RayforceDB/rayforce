@@ -25,6 +25,7 @@
 #include "heap.h"
 #include "eval.h"
 #include "iter.h"
+#include "ops.h"
 
 obj_p lambda(obj_p args, obj_p body, obj_p nfo) {
     obj_p obj;
@@ -41,6 +42,8 @@ obj_p lambda(obj_p args, obj_p body, obj_p nfo) {
     f->args = args;
     f->body = body;
     f->nfo = nfo;
+    f->bc = NULL_OBJ;      // Bytecode (compiled on first call)
+    f->consts = NULL_OBJ;  // Constants pool
 
     return obj;
 }

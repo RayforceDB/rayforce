@@ -32,13 +32,11 @@
 #include "string.h"
 #include "os.h"
 #include "log.h"
+#include "eval.h"
 
 #ifndef __EMSCRIPTEN__
 RAYASSERT(sizeof(struct block_t) == (2 * sizeof(struct obj_t)), heap_h);
 #endif
-
-__thread heap_p __HEAP = NULL;
-__thread c8_t HEAP_SWAP[64] = {0};
 
 #define BLOCKSIZE(s) (sizeof(struct obj_t) + (s))
 #define BSIZEOF(o) (1ll << (i64_t)(o))
@@ -48,60 +46,69 @@ __thread c8_t HEAP_SWAP[64] = {0};
 #define RAW2BLOCK(r) ((block_p)((i64_t)(r) - sizeof(struct obj_t)))
 #define DEFAULT_HEAP_SWAP "./"
 
-heap_p heap_create(i64_t id) {
-    LOG_INFO("Creating heap with id %lld", id);
-    __HEAP = (heap_p)mmap_alloc(sizeof(struct heap_t));
+// Access heap through current VM - all heap operations use this macro
+#define __HEAP (__VM->heap)
 
-    if (__HEAP == NULL) {
+heap_p heap_create(i64_t id) {
+    heap_p heap;
+
+    LOG_INFO("Creating heap with id %lld", id);
+    heap = (heap_p)mmap_alloc(sizeof(struct heap_t));
+
+    if (heap == NULL) {
         LOG_ERROR("Failed to allocate heap: %s", strerror(errno));
         exit(1);
     }
 
-    __HEAP->id = id;
-    __HEAP->avail = 0;
-    __HEAP->foreign_blocks = NULL;
+    heap->id = id;
+    heap->avail = 0;
+    heap->foreign_blocks = NULL;
 
-    memset(__HEAP->freelist, 0, sizeof(__HEAP->freelist));
+    memset(heap->freelist, 0, sizeof(heap->freelist));
 
-    if (os_get_var("HEAP_SWAP", HEAP_SWAP, sizeof(HEAP_SWAP)) == -1) {
-        snprintf(HEAP_SWAP, sizeof(HEAP_SWAP), "%s", DEFAULT_HEAP_SWAP);
+    // Initialize swap path from environment or use default
+    if (os_get_var("HEAP_SWAP", heap->swap_path, sizeof(heap->swap_path)) == -1) {
+        snprintf(heap->swap_path, sizeof(heap->swap_path), "%s", DEFAULT_HEAP_SWAP);
     } else {
-        size_t len = strnlen(HEAP_SWAP, sizeof(HEAP_SWAP));
+        size_t len = strnlen(heap->swap_path, sizeof(heap->swap_path));
 
         // Treat empty or truncated values as unset
-        if (len == 0 || len >= sizeof(HEAP_SWAP) - 1) {
-            snprintf(HEAP_SWAP, sizeof(HEAP_SWAP), "%s", DEFAULT_HEAP_SWAP);
-            len = strnlen(HEAP_SWAP, sizeof(HEAP_SWAP));
+        if (len == 0 || len >= sizeof(heap->swap_path) - 1) {
+            snprintf(heap->swap_path, sizeof(heap->swap_path), "%s", DEFAULT_HEAP_SWAP);
+            len = strnlen(heap->swap_path, sizeof(heap->swap_path));
         }
 
-        if (HEAP_SWAP[len - 1] != '/' && len < sizeof(HEAP_SWAP) - 1) {
-            HEAP_SWAP[len++] = '/';
-            HEAP_SWAP[len] = '\0';
+        if (heap->swap_path[len - 1] != '/' && len < sizeof(heap->swap_path) - 1) {
+            heap->swap_path[len++] = '/';
+            heap->swap_path[len] = '\0';
         }
     }
 
-    LOG_DEBUG("Heap created successfully with swap path: %s", HEAP_SWAP);
-    return __HEAP;
+    LOG_DEBUG("Heap created successfully with swap path: %s", heap->swap_path);
+    return heap;
 }
 
-nil_t heap_destroy(nil_t) {
+nil_t heap_destroy(heap_p heap) {
     i64_t i;
     block_p block, next;
+
+    if (heap == NULL)
+        return;
 
     LOG_INFO("Destroying heap");
 
     // Ensure foreign blocks are freed
-    if (__HEAP->foreign_blocks != NULL)
-        LOG_WARN("Heap[%lld]: foreign blocks not freed", __HEAP->id);
+    if (heap->foreign_blocks != NULL)
+        LOG_WARN("Heap[%lld]: foreign blocks not freed", heap->id);
 
     // All the nodes remains are pools, so just munmap them
     for (i = MIN_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
-        block = __HEAP->freelist[i];
+        block = heap->freelist[i];
 
         while (block) {
             next = block->next;
             if (i != block->pool_order) {
-                LOG_ERROR("Heap[%lld]: leak order: %lld block: %p", __HEAP->id, i, block);
+                LOG_ERROR("Heap[%lld]: leak order: %lld block: %p", heap->id, i, block);
                 return;
             }
 
@@ -111,9 +118,8 @@ nil_t heap_destroy(nil_t) {
     }
 
     // munmap heap
-    mmap_free(__HEAP, sizeof(struct heap_t));
+    mmap_free(heap, sizeof(struct heap_t));
 
-    __HEAP = NULL;
     LOG_DEBUG("Heap destroyed successfully");
 }
 
@@ -153,7 +159,7 @@ block_p heap_add_pool(i64_t size) {
     if (block == NULL) {
         // Try to mmap with a file
         id = ops_rand_u64();
-        snprintf(filename, sizeof(filename), "%svec_%llu.dat", HEAP_SWAP, id);
+        snprintf(filename, sizeof(filename), "%svec_%llu.dat", __HEAP->swap_path, id);
         fd = fs_fopen(filename, ATTR_RDWR | ATTR_CREAT);
 
         if (fd == -1) {

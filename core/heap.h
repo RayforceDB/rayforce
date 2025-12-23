@@ -63,11 +63,12 @@ typedef struct heap_t {
     block_p foreign_blocks;                // foreign blocks (to be freed by the owner)
     block_p backed_blocks;                 // backed blocks (to be unmapped)
     memstat_t memstat;
+    c8_t swap_path[64];  // swap directory path
 } *heap_p;
 
 heap_p heap_create(i64_t id);
-nil_t heap_destroy(nil_t);
-heap_p heap_get(nil_t);
+nil_t heap_destroy(heap_p heap);
+heap_p heap_get(nil_t);  // Get current heap via VM
 raw_p heap_mmap(i64_t size);
 raw_p heap_stack(i64_t size);
 raw_p heap_alloc(i64_t size);

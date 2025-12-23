@@ -50,7 +50,7 @@ endif
 CORE_OBJECTS = core/poll.o core/ipc.o core/repl.o core/runtime.o core/sys.o core/os.o core/proc.o core/fs.o core/mmap.o core/serde.o\
  core/temporal.o core/date.o core/time.o core/timestamp.o core/guid.o core/sort.o core/ops.o core/util.o\
  core/string.o core/hash.o core/symbols.o core/format.o core/rayforce.o core/heap.o core/parse.o\
- core/eval.o core/nfo.o core/chrono.o core/env.o core/lambda.o core/unary.o core/binary.o core/vary.o\
+ core/eval.o core/cc.o core/nfo.o core/chrono.o core/env.o core/lambda.o core/unary.o core/binary.o core/vary.o\
  core/sock.o core/error.o core/math.o core/cmp.o core/items.o core/logic.o core/compose.o core/order.o core/io.o\
  core/misc.o core/freelist.o core/update.o core/join.o core/query.o core/cond.o\
  core/iter.o core/dynlib.o core/aggr.o core/index.o core/group.o core/filter.o core/atomic.o\

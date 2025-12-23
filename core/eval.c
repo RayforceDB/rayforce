@@ -31,30 +31,218 @@
 #include "filter.h"
 #include "string.h"
 #include "aggr.h"
+#include "cc.h"
 
 __thread vm_p __VM = NULL;
 
-__thread interpreter_p __INTERPRETER = NULL;
+vm_p vm_create(i64_t id, struct pool_t *pool) {
+    vm_p vm;
 
-nil_t error_add_loc(obj_p err, i64_t id, ctx_p ctx) {
+    // Use raw mmap for VM allocation (can't use heap before VM exists)
+    vm = (vm_p)mmap_alloc(sizeof(struct vm_t));
+    vm->id = id;
+    vm->sp = 0;
+    vm->fp = 0;
+    vm->rp = 0;
+    vm->fn = NULL_OBJ;
+    vm->env = NULL_OBJ;
+    vm->pool = pool;
+    vm->timeit.active = B8_FALSE;
+    memset(vm->ps, 0, sizeof(obj_p) * VM_STACK_SIZE);
+    memset(vm->rs, 0, sizeof(ctx_t) * VM_STACK_SIZE);
+
+    // Set VM first so heap_create can use it
+    __VM = vm;
+
+    // Create heap for this VM
+    vm->heap = heap_create(id);
+
+    return vm;
+}
+
+nil_t vm_destroy(vm_p vm) {
+    // Clear any remaining items on the stack
+    while (vm->sp > 0) {
+        drop_obj(vm->ps[--vm->sp]);
+    }
+
+    // Destroy heap first
+    heap_destroy(vm->heap);
+    vm->heap = NULL;
+
+    // Then destroy VM
+    mmap_free(vm, sizeof(struct vm_t));
+}
+
+nil_t vm_set(vm_p vm) { __VM = vm; }
+
+vm_p vm_current(nil_t) {
+    if (__VM == NULL)
+        vm_create(0, NULL);
+    return __VM;
+}
+
+// ============================================================================
+// Environment Management
+// ============================================================================
+
+obj_p vm_env_get(nil_t) { return vm_current()->env; }
+
+nil_t vm_env_set(vm_p vm, obj_p env) { vm->env = env; }
+
+nil_t vm_env_unset(vm_p vm) {
+    if (vm->env != NULL_OBJ) {
+        drop_obj(vm->env);
+        vm->env = NULL_OBJ;
+    }
+}
+
+// ============================================================================
+// Symbol Resolution
+// ============================================================================
+
+obj_p *resolve(i64_t sym) {
+    i64_t j, *args;
+    obj_p fn, env;
+    i64_t i, l, n;
+    vm_p vm = vm_current();
+
+    fn = vm->fn;
+
+    // Check for self reference
+    extern i64_t symbols_intern(lit_p, i64_t);
+    static i64_t SYMBOL_SELF = 0;
+    if (SYMBOL_SELF == 0)
+        SYMBOL_SELF = symbols_intern("self", 4);
+
+    if (sym == SYMBOL_SELF)
+        return &vm->fn;
+
+    // Search in function arguments (on stack)
+    if (fn != NULL_OBJ && AS_LAMBDA(fn)->args != NULL_OBJ) {
+        l = AS_LAMBDA(fn)->args->len;
+        args = AS_SYMBOL(AS_LAMBDA(fn)->args);
+        for (i = 0; i < l; i++) {
+            if (args[i] == sym)
+                return &vm->ps[vm->fp + i];
+        }
+    }
+
+    // Search in local environment
+    env = vm->env;
+    if (env != NULL_OBJ && env->type == TYPE_DICT) {
+        n = AS_LIST(env)[0]->len;
+        for (i = n; i > 0; i--) {
+            if (AS_SYMBOL(AS_LIST(env)[0])[i - 1] == sym)
+                return &AS_LIST(AS_LIST(env)[1])[i - 1];
+        }
+    }
+
+    // Search in globals
+    j = find_raw(AS_LIST(runtime_get()->env.variables)[0], &sym);
+    if (j == NULL_I64)
+        return NULL;
+
+    return &AS_LIST(AS_LIST(runtime_get()->env.variables)[1])[j];
+}
+
+obj_p amend(obj_p sym, obj_p val) {
+    obj_p *env_slot;
+    vm_p vm = vm_current();
+
+    env_slot = &vm->env;
+
+    if (*env_slot != NULL_OBJ)
+        set_obj(env_slot, sym, clone_obj(val));
+    else {
+        *env_slot = dict(vector(TYPE_SYMBOL, 1), vn_list(1, clone_obj(val)));
+        AS_SYMBOL(AS_LIST(*env_slot)[0])[0] = sym->i64;
+    }
+
+    return val;
+}
+
+obj_p mount_env(obj_p obj) {
+    i64_t i, l1, l2, l;
+    obj_p *env_slot;
+    obj_p keys, vals;
+    vm_p vm = vm_current();
+
+    env_slot = &vm->env;
+
+    if (*env_slot != NULL_OBJ) {
+        l1 = AS_LIST(*env_slot)[0]->len;
+        l2 = AS_LIST(obj)[0]->len;
+        l = l1 + l2;
+        keys = SYMBOL(l);
+        vals = LIST(l);
+
+        for (i = 0; i < l1; i++) {
+            AS_SYMBOL(keys)[i] = AS_SYMBOL(AS_LIST(*env_slot)[0])[i];
+            AS_LIST(vals)[i] = clone_obj(AS_LIST(AS_LIST(*env_slot)[1])[i]);
+        }
+
+        for (i = 0; i < l2; i++) {
+            AS_SYMBOL(keys)[i + l1] = AS_SYMBOL(AS_LIST(obj)[0])[i];
+            AS_LIST(vals)[i + l1] = clone_obj(AS_LIST(AS_LIST(obj)[1])[i]);
+        }
+
+        drop_obj(*env_slot);
+    } else {
+        keys = clone_obj(AS_LIST(obj)[0]);
+        vals = clone_obj(AS_LIST(obj)[1]);
+    }
+
+    *env_slot = dict(keys, vals);
+
+    return NULL_OBJ;
+}
+
+obj_p unmount_env(i64_t n) {
+    obj_p *env_slot;
+    i64_t i, l;
+    vm_p vm = vm_current();
+
+    env_slot = &vm->env;
+
+    if (*env_slot == NULL_OBJ)
+        return NULL_OBJ;
+
+    if (ops_count(*env_slot) == n) {
+        drop_obj(*env_slot);
+        *env_slot = NULL_OBJ;
+    } else {
+        l = AS_LIST(*env_slot)[0]->len;
+        resize_obj(&AS_LIST(*env_slot)[0], l - n);
+
+        for (i = l; i > l - n; i--)
+            drop_obj(AS_LIST(AS_LIST(*env_slot)[1])[i - 1]);
+
+        resize_obj(&AS_LIST(*env_slot)[1], l - n);
+    }
+
+    return NULL_OBJ;
+}
+
+// ============================================================================
+// Error Handling
+// ============================================================================
+
+nil_t error_add_loc(obj_p err, i64_t id, ctx_t *ctx) {
     obj_p loc, nfo;
     span_t span;
 
-    if (ctx->lambda == NULL_OBJ)
+    if (ctx->fn == NULL_OBJ)
         return;
 
-    nfo = AS_LAMBDA(ctx->lambda)->nfo;
+    nfo = AS_LAMBDA(ctx->fn)->nfo;
 
     if (nfo == NULL_OBJ)
         return;
 
     span = nfo_get(nfo, id);
-    loc = vn_list(4,
-                  i64(span.id),                             // span
-                  clone_obj(AS_LIST(nfo)[0]),               // filename
-                  clone_obj(AS_LAMBDA(ctx->lambda)->name),  // function name
-                  clone_obj(AS_LIST(nfo)[1])                // source
-    );
+    loc = vn_list(4, i64(span.id), clone_obj(AS_LIST(nfo)[0]), clone_obj(AS_LAMBDA(ctx->fn)->name),
+                  clone_obj(AS_LIST(nfo)[1]));
 
     if (AS_ERROR(err)->locs == NULL_OBJ)
         AS_ERROR(err)->locs = vn_list(1, loc);
@@ -62,82 +250,288 @@ nil_t error_add_loc(obj_p err, i64_t id, ctx_p ctx) {
         push_raw(&AS_ERROR(err)->locs, &loc);
 }
 
-interpreter_p interpreter_create(i64_t id) {
-    interpreter_p interpreter;
-    obj_p f;
-
-    interpreter = (interpreter_p)heap_mmap(sizeof(struct interpreter_t));
-    interpreter->id = id;
-    interpreter->sp = 0;
-    interpreter->stack = (obj_p *)heap_stack(sizeof(obj_p) * EVAL_STACK_SIZE);
-    interpreter->cp = 0;
-    interpreter->ctxstack = (ctx_p)heap_stack(sizeof(struct ctx_t) * EVAL_STACK_SIZE);
-    interpreter->timeit.active = B8_FALSE;
-    memset(interpreter->ctxstack, 0, sizeof(struct ctx_t) * EVAL_STACK_SIZE);
-
-    __INTERPRETER = interpreter;
-
-    // Directly allocate lambda to avoid using heap_alloc here
-    f = (obj_p)heap_mmap(sizeof(struct obj_t) + sizeof(struct lambda_f));
-    f->mmod = MMOD_INTERNAL;
-    f->type = TYPE_LAMBDA;
-    f->rc = 1;
-
-    AS_LAMBDA(f)->name = NULL_OBJ;
-    AS_LAMBDA(f)->nfo = NULL_OBJ;
-    AS_LAMBDA(f)->args = NULL_OBJ;
-    AS_LAMBDA(f)->body = NULL_OBJ;
-
-    ctx_push(f);
-
-    return interpreter;
+static inline obj_p unwrap(obj_p obj, i64_t id) {
+    UNUSED(id);
+    return obj;
 }
 
-nil_t interpreter_destroy(nil_t) {
-    // cleanup stack (if any)
-    DEBUG_ASSERT(__INTERPRETER->sp == 0, "stack is not empty");
+// ============================================================================
+// Bytecode Interpreter (Computed Goto)
+// ============================================================================
 
-    heap_unmap(__INTERPRETER->stack, EVAL_STACK_SIZE);
-    heap_unmap(__INTERPRETER->ctxstack[0].lambda, sizeof(struct obj_t) + sizeof(struct lambda_f));
-    heap_unmap(__INTERPRETER->ctxstack, sizeof(struct ctx_t) * EVAL_STACK_SIZE);
-    heap_unmap(__INTERPRETER, sizeof(struct interpreter_t));
+__attribute__((hot)) obj_p vm_eval(obj_p fn) {
+    vm_p vm = vm_current();
+    u8_t *bc;
+    obj_p *consts;
+    ctx_t *rs;
+    i64_t ip = 0;
+    i64_t n;
+    obj_p x, y, r, *l;
+
+    // Setup VM for this function
+    vm->fn = fn;
+    vm->fp = vm->sp - AS_LAMBDA(fn)->args->len;
+    bc = AS_U8(AS_LAMBDA(fn)->bc);
+    consts = AS_LIST(AS_LAMBDA(fn)->consts);
+
+    // Computed goto dispatch table
+    static const void *OPS[] = {&&OP_RET,   &&OP_PUSHC, &&OP_DUP,   &&OP_POP,   &&OP_JMPZ,  &&OP_JMP,  &&OP_DEREF,
+                                &&OP_CALF1, &&OP_CALF2, &&OP_CALF0, &&OP_CALFN, &&OP_CALFS, &&OP_CALFD};
+
+#define next() goto *OPS[bc[ip++]]
+#define push(v) (vm->ps[vm->sp++] = (v))
+#define pop() (vm->ps[--vm->sp])
+#define top(n) (&vm->ps[vm->sp - (n)])
+
+    next();
+
+OP_RET:
+    if (vm->rp != 0) {
+        // Return from nested call
+        r = pop();
+        while (vm->sp > vm->fp)
+            drop_obj(pop());
+        rs = &vm->rs[--vm->rp];
+        ip = rs->ip;
+        vm->fp = rs->fp;
+        vm->fn = rs->fn;
+        bc = AS_U8(AS_LAMBDA(vm->fn)->bc);
+        consts = AS_LIST(AS_LAMBDA(vm->fn)->consts);
+        push(r);
+        next();
+    }
+    // Top-level return
+    return pop();
+
+OP_PUSHC:
+    push(clone_obj(consts[bc[ip++]]));
+    next();
+
+OP_DUP:
+    n = bc[ip++];
+    x = vm->ps[vm->fp + n];
+    push(clone_obj(x));
+    next();
+
+OP_POP:
+    drop_obj(pop());
+    next();
+
+OP_JMPZ:
+    n = bc[ip++];
+    x = pop();
+    if (!ops_as_b8(x))
+        ip += n;
+    drop_obj(x);
+    next();
+
+OP_JMP:
+    n = bc[ip++];
+    ip += n;
+    next();
+
+OP_DEREF:
+    x = pop();
+    {
+        obj_p *val = resolve(x->i64);
+        if (val == NULL) {
+            drop_obj(x);
+            return ray_error(ERR_EVAL, "undefined symbol: '%s", str_from_symbol(x->i64));
+        }
+        y = clone_obj(*val);
+    }
+    drop_obj(x);
+    push(y);
+    next();
+
+OP_CALF1:
+    // Function is on stack (pushed last by PUSHC)
+    y = pop();  // function (pushed last)
+    x = pop();  // argument
+    r = unary_call(y, x);
+    drop_obj(x);
+    drop_obj(y);
+    if (IS_ERR(r))
+        return r;
+    push(r);
+    next();
+
+OP_CALF2:
+    r = pop();  // function (pushed last)
+    y = pop();  // second argument
+    x = pop();  // first argument
+    {
+        obj_p res = binary_call(r, x, y);
+        drop_obj(x);
+        drop_obj(y);
+        drop_obj(r);
+        if (IS_ERR(res))
+            return res;
+        push(res);
+    }
+    next();
+
+OP_CALF0:
+    n = bc[ip++];  // arity
+    r = pop();     // function
+    l = top(n);
+    {
+        obj_p res = vary_call(r, l, n);
+        for (i64_t i = 0; i < n; ++i)
+            drop_obj(l[i]);
+        vm->sp -= n;
+        drop_obj(r);
+        if (IS_ERR(res))
+            return res;
+        push(res);
+    }
+    next();
+
+OP_CALFN:
+    x = pop();  // lambda function
+    if (x->type != TYPE_LAMBDA) {
+        drop_obj(x);
+        return ray_error(ERR_TYPE, "expected lambda, got %s", type_name(x->type));
+    }
+callfn:
+    // Save current context
+    rs = &vm->rs[vm->rp++];
+    rs->ip = ip;
+    rs->fp = vm->fp;
+    rs->fn = vm->fn;
+    // Switch to new function
+    vm->fp = vm->sp - AS_LAMBDA(x)->args->len;
+    vm->fn = x;
+    bc = AS_U8(AS_LAMBDA(x)->bc);
+    consts = AS_LIST(AS_LAMBDA(x)->consts);
+    ip = 0;
+    drop_obj(x);  // Safe because it's on the constants pool
+    next();
+
+OP_CALFS:
+    // Self-recursive call
+    rs = &vm->rs[vm->rp++];
+    rs->ip = ip;
+    rs->fp = vm->fp;
+    rs->fn = vm->fn;
+    vm->fp = vm->sp - AS_LAMBDA(vm->fn)->args->len;
+    ip = 0;
+    next();
+
+OP_CALFD:
+    n = bc[ip++];  // arity
+    x = pop();     // function (dynamically resolved)
+    switch (x->type) {
+        case TYPE_UNARY:
+            if (n != 1) {
+                drop_obj(x);
+                return ray_error(ERR_ARITY, "unary function requires 1 argument");
+            }
+            y = pop();
+            r = unary_call(x, y);
+            drop_obj(y);
+            drop_obj(x);
+            if (IS_ERR(r))
+                return r;
+            push(r);
+            break;
+        case TYPE_BINARY:
+            if (n != 2) {
+                drop_obj(x);
+                return ray_error(ERR_ARITY, "binary function requires 2 arguments");
+            }
+            y = pop();
+            r = pop();
+            {
+                obj_p res = binary_call(x, r, y);
+                drop_obj(r);
+                drop_obj(y);
+                drop_obj(x);
+                if (IS_ERR(res))
+                    return res;
+                push(res);
+            }
+            break;
+        case TYPE_VARY:
+            l = top(n);
+            r = vary_call(x, l, n);
+            for (i64_t i = 0; i < n; ++i)
+                drop_obj(l[i]);
+            vm->sp -= n;
+            drop_obj(x);
+            if (IS_ERR(r))
+                return r;
+            push(r);
+            break;
+        case TYPE_LAMBDA:
+            goto callfn;
+        default:
+            drop_obj(x);
+            return ray_error(ERR_TYPE, "'%s is not a function", type_name(x->type));
+    }
+    next();
+
+#undef next
+#undef push
+#undef pop
+#undef top
 }
 
-interpreter_p interpreter_current(nil_t) { return __INTERPRETER; }
+// ============================================================================
+// Lambda Call (Main entry point for calling lambdas)
+// ============================================================================
 
-obj_p call(obj_p obj, i64_t arity) {
-    lambda_p lambda;
-    ctx_p ctx;
+obj_p call(obj_p fn, i64_t arity) {
+    lambda_p lam = AS_LAMBDA(fn);
     obj_p res;
-    i64_t sp;
+    vm_p vm = vm_current();
+    obj_p saved_fn = vm->fn;
+    obj_p saved_env = vm->env;
+    obj_p compiled_fn = fn;
+    b8_t need_drop = B8_FALSE;
+    UNUSED(arity);
 
-    sp = __INTERPRETER->sp - arity;
+    // Compile if not already compiled
+    if (lam->bc == NULL_OBJ) {
+        // Clone the lambda before compiling to avoid modifying the AST
+        // This is necessary because the lambda might be part of the parsed AST
+        // which will be dropped after evaluation
+        compiled_fn = lambda(clone_obj(lam->args), clone_obj(lam->body), clone_obj(lam->nfo));
+        res = cc_compile(compiled_fn);
+        if (IS_ERR(res)) {
+            drop_obj(compiled_fn);
+            return res;
+        }
+        need_drop = B8_TRUE;
+    }
 
-    // local env
-    stack_push(NULL_OBJ);
+    // Execute bytecode
+    // Note: arguments are already on the stack, pushed by caller
+    // Caller is responsible for cleanup after we return
+    res = vm_eval(compiled_fn);
 
-    lambda = AS_LAMBDA(obj);
+    // Restore previous context for tree-walking eval
+    vm->fn = saved_fn;
+    vm->env = saved_env;
 
-    // push context
-    ctx = ctx_push(obj);
-    ctx->sp = sp;
-
-    // jump to eval
-    res = (setjmp(ctx->jmp) == 0) ? eval(lambda->body) : stack_pop();
-
-    // pop context
-    ctx_pop();
-
-    // cleanup local env
-    drop_obj(stack_pop());
+    // Drop the compiled copy if we created one
+    if (need_drop)
+        drop_obj(compiled_fn);
 
     return res;
 }
+
+// ============================================================================
+// Recursive Tree-Walking Evaluator
+// ============================================================================
 
 __attribute__((hot)) obj_p eval(obj_p obj) {
     i64_t len, i;
     obj_p car, *val, *args, x, y, z, res;
     lambda_p lambda;
+
+    // Ensure VM is initialized (lazy init on first eval)
+    vm_current();
 
     switch (obj->type) {
         case TYPE_LIST:
@@ -158,7 +552,6 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                         res = ((unary_f)car->i64)(args[0]);
                     else {
                         x = eval(args[0]);
-
                         if (IS_ERR(x))
                             return x;
 
@@ -175,7 +568,6 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                         res = unary_call(car, x);
                         drop_obj(x);
                     }
-
                     return unwrap(res, (i64_t)obj);
 
                 case TYPE_BINARY:
@@ -218,7 +610,6 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                         drop_obj(x);
                         drop_obj(y);
                     }
-
                     return unwrap(res, (i64_t)obj);
 
                 case TYPE_VARY:
@@ -226,7 +617,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                         res = ((vary_f)car->i64)(args, len);
                     else {
                         if (!stack_enough(len))
-                            return unwrap(error_str(ERR_STACK_OVERFLOW, ERR_MSG_STACK_OVERFLOW), (i64_t)obj);
+                            return unwrap(error_str(ERR_STACK_OVERFLOW, "stack overflow"), (i64_t)obj);
 
                         for (i = 0; i < len; i++) {
                             x = eval(args[i]);
@@ -251,9 +642,6 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                         for (i = 0; i < len; i++)
                             drop_obj(stack_pop());
                     }
-
-                    // Special case for 'do' function (do not unwrap this one to prevent big stack trace for entire
-                    // files)
                     return (car->i64 == (i64_t)ray_do) ? res : unwrap(res, (i64_t)obj);
 
                 case TYPE_LAMBDA:
@@ -262,27 +650,12 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                         return unwrap(error_str(ERR_ARITY, "wrong number of arguments"), (i64_t)obj);
 
                     if (!stack_enough(len))
-                        return unwrap(error_str(ERR_STACK_OVERFLOW, ERR_MSG_STACK_OVERFLOW), (i64_t)obj);
+                        return unwrap(error_str(ERR_STACK_OVERFLOW, "stack overflow"), (i64_t)obj);
 
                     for (i = 0; i < len; i++) {
                         x = eval(args[i]);
                         if (IS_ERR(x))
                             return x;
-
-                        // if (x->type == TYPE_MAPGROUP)
-                        // {
-                        //     attrs = FN_GROUP_MAP;
-                        //     y = aggr_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
-                        //     drop_obj(x);
-                        //     x = y;
-                        // }
-                        // else if (x->type == TYPE_MAPFILTER)
-                        // {
-                        //     y = filter_collect(x);
-                        //     drop_obj(x);
-                        //     x = y;
-                        // }
-
                         stack_push(x);
                     }
 
@@ -299,6 +672,7 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
                 default:
                     return unwrap(ray_error(ERR_EVAL, "'%s is not a function", type_name(car->type)), (i64_t)args[-1]);
             }
+
         case -TYPE_SYMBOL:
             if (obj->attrs & ATTR_QUOTED)
                 return symboli64(obj->i64);
@@ -307,135 +681,35 @@ __attribute__((hot)) obj_p eval(obj_p obj) {
             if (val == NULL)
                 return unwrap(ray_error(ERR_EVAL, "undefined symbol: '%s", str_from_symbol(obj->i64)), (i64_t)obj);
             return clone_obj(*val);
+
         default:
             return clone_obj(obj);
     }
 }
 
-obj_p amend(obj_p sym, obj_p val) {
-    obj_p *env;
-    obj_p lambda;
-    i64_t bp;
-    ctx_p ctx;
-
-    ctx = ctx_get();
-    lambda = ctx->lambda;
-
-    bp = ctx->sp;
-    env = &__INTERPRETER->stack[bp + AS_LAMBDA(lambda)->args->len];
-
-    if (*env != NULL_OBJ)
-        set_obj(env, sym, clone_obj(val));
-    else {
-        *env = dict(vector(TYPE_SYMBOL, 1), vn_list(1, clone_obj(val)));
-        AS_SYMBOL(AS_LIST(*env)[0])[0] = sym->i64;
-    }
-
-    return val;
-}
-
-obj_p mount_env(obj_p obj) {
-    i64_t i, l1, l2, l;
-    obj_p *env;
-    obj_p lambda, keys, vals;
-    i64_t bp;
-    ctx_p ctx;
-
-    ctx = ctx_get();
-    lambda = ctx->lambda;
-
-    bp = ctx->sp;
-    env = &__INTERPRETER->stack[bp + AS_LAMBDA(lambda)->args->len];
-
-    if (*env != NULL_OBJ) {
-        l1 = AS_LIST(*env)[0]->len;
-        l2 = AS_LIST(obj)[0]->len;
-        l = l1 + l2;
-        keys = SYMBOL(l);
-        vals = LIST(l);
-
-        for (i = 0; i < l1; i++) {
-            AS_SYMBOL(keys)[i] = AS_SYMBOL(AS_LIST(*env)[0])[i];
-            AS_LIST(vals)[i] = clone_obj(AS_LIST(AS_LIST(*env)[1])[i]);
-        }
-
-        for (i = 0; i < l2; i++) {
-            AS_SYMBOL(keys)[i + l1] = AS_SYMBOL(AS_LIST(obj)[0])[i];
-            AS_LIST(vals)[i + l1] = clone_obj(AS_LIST(AS_LIST(obj)[1])[i]);
-        }
-
-        drop_obj(*env);
-    } else {
-        keys = clone_obj(AS_LIST(obj)[0]);
-        vals = clone_obj(AS_LIST(obj)[1]);
-    }
-
-    *env = dict(keys, vals);
-
-    return NULL_OBJ;
-}
-
-obj_p unmount_env(i64_t n) {
-    obj_p *env;
-    obj_p lambda;
-    i64_t bp;
-    i64_t i, l;
-    ctx_p ctx;
-
-    ctx = ctx_get();
-    lambda = ctx->lambda;
-
-    bp = ctx->sp;
-    env = &__INTERPRETER->stack[bp + AS_LAMBDA(lambda)->args->len];
-
-    if (ops_count(*env) == n) {
-        drop_obj(*env);
-        *env = NULL_OBJ;
-    } else {
-        l = AS_LIST(*env)[0]->len;
-        resize_obj(&AS_LIST(*env)[0], l - n);
-
-        // free values
-        for (i = l; i > l - n; i--)
-            drop_obj(AS_LIST(AS_LIST(*env)[1])[i - 1]);
-
-        resize_obj(&AS_LIST(*env)[1], l - n);
-    }
-
-    return NULL_OBJ;
-}
+// ============================================================================
+// Special Forms
+// ============================================================================
 
 obj_p ray_return(obj_p *x, i64_t n) {
-    if (__INTERPRETER->cp == 1)
-        THROW_S(ERR_NOT_SUPPORTED, "return outside of function");
-
+    UNUSED(x);
+    UNUSED(n);
+    // Return is now handled via normal bytecode execution
+    // For recursive eval, we just return the value
     if (n == 0)
-        stack_push(NULL_OBJ);
-    else
-        stack_push(clone_obj(x[0]));
-
-    longjmp(ctx_get()->jmp, 1);
-
-    __builtin_unreachable();
+        return NULL_OBJ;
+    return clone_obj(x[0]);
 }
 
 obj_p ray_raise(obj_p obj) {
     obj_p e;
 
     if (obj->type != TYPE_C8)
-        THROW(ERR_TYPE, "raise: expected 'string, got '%s", type_name(obj->type));
+        return ray_error(ERR_TYPE, "raise: expected 'string, got '%s", type_name(obj->type));
 
-    e = error_obj(ERR_RAISE, obj);
-    unwrap(e, (i64_t)obj);
-
-    if (__INTERPRETER->cp == 1)
-        return e;
-
-    stack_push(e);
-
-    longjmp(ctx_get()->jmp, 2);
-
-    __builtin_unreachable();
+    // Clone the message since error_obj takes ownership but caller drops the argument
+    e = error_obj(ERR_RAISE, clone_obj(obj));
+    return e;
 }
 
 obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file) {
@@ -443,7 +717,7 @@ obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file) {
     obj_p info, res;
 
     if (str->type != TYPE_C8)
-        THROW(ERR_TYPE, "parse: expected string, got %s", type_name(str->type));
+        return ray_error(ERR_TYPE, "parse: expected string, got %s", type_name(str->type));
 
     info = nfo(clone_obj(file), clone_obj(str));
     res = parse(AS_C8(str), str->len, info);
@@ -452,32 +726,7 @@ obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file) {
     return res;
 }
 
-obj_p eval_obj(obj_p obj) {
-    obj_p res, fn;
-    ctx_p ctx;
-    i64_t sp;
-
-    fn = lambda(NULL_OBJ, NULL_OBJ, NULL_OBJ);
-
-    sp = __INTERPRETER->sp;
-
-    stack_push(NULL_OBJ);  // null env
-
-    ctx = ctx_push(fn);
-    ctx->sp = sp;
-
-    res = (setjmp(ctx->jmp) == 0) ? eval(obj) : stack_pop();
-
-    // cleanup ctx
-    ctx_pop();
-
-    // cleanup env
-    drop_obj(stack_pop());
-
-    drop_obj(fn);
-
-    return res;
-}
+obj_p eval_obj(obj_p obj) { return eval(obj); }
 
 obj_p eval_str_w_attr(lit_p str, i64_t len, obj_p nfo) {
     obj_p parsed, res;
@@ -493,7 +742,6 @@ obj_p eval_str_w_attr(lit_p str, i64_t len, obj_p nfo) {
         return parsed;
     }
 
-    // res = EVAL_WITH_CTX(eval(parsed), nfo);
     res = eval(parsed);
     drop_obj(parsed);
 
@@ -508,7 +756,7 @@ obj_p ray_eval_str(obj_p str, obj_p file) {
     obj_p info;
 
     if (str->type != TYPE_C8)
-        THROW(ERR_TYPE, "eval: expected string, got %s", type_name(str->type));
+        return ray_error(ERR_TYPE, "eval: expected string, got %s", type_name(str->type));
 
     info = (file != NULL && file != NULL_OBJ) ? nfo(clone_obj(file), clone_obj(str)) : NULL_OBJ;
 
@@ -516,52 +764,28 @@ obj_p ray_eval_str(obj_p str, obj_p file) {
 }
 
 obj_p try_obj(obj_p obj, obj_p ctch) {
-    ctx_p curr_ctx, ctx;
-    b8_t sig = B8_FALSE;
-    volatile obj_p fn, *pfn, res = NULL_OBJ;
+    obj_p res;
 
-    curr_ctx = ctx_get();
-    ctx = ctx_push(curr_ctx->lambda);
-    ctx->sp = curr_ctx->sp;
-    fn = ctch;
+    // Simple try - just evaluate and catch errors
+    res = eval(obj);
 
-    switch (setjmp(ctx->jmp)) {
-        case 0:
-            res = eval(obj);
-            sig = B8_FALSE;
-            break;
-        case 1:
-            res = stack_pop();
-            sig = B8_FALSE;
-            break;
-        case 2:
-        case 3:
-            res = stack_pop();
-            sig = B8_TRUE;
-            break;
-        default:
-            __builtin_unreachable();
-    }
+    if (IS_ERR(res)) {
+        obj_p *pfn;
+        obj_p fn = ctch;
 
-    ctx_pop();
-
-    if (IS_ERR(res) || sig) {
         switch (fn->type) {
             case TYPE_LAMBDA:
-            call:
+            call_catch:
                 if (AS_LAMBDA(fn)->args->len != 1) {
                     drop_obj(res);
-                    THROW(ERR_LENGTH, "catch: expected 1 argument, got %llu", AS_LAMBDA(fn)->args->len);
+                    return ray_error(ERR_LENGTH, "catch: expected 1 argument, got %lld", AS_LAMBDA(fn)->args->len);
                 }
-                if (IS_ERR(res)) {
-                    stack_push(clone_obj(AS_ERROR(res)->msg));
-                    drop_obj(res);
-                } else
-                    stack_push(res);
-
+                stack_push(clone_obj(AS_ERROR(res)->msg));
+                drop_obj(res);
                 res = call(fn, 1);
                 drop_obj(stack_pop());
                 return res;
+
             case -TYPE_SYMBOL:
                 pfn = resolve(fn->i64);
                 if (pfn == NULL) {
@@ -570,10 +794,10 @@ obj_p try_obj(obj_p obj, obj_p ctch) {
                 }
                 fn = *pfn;
                 if (fn->type == TYPE_LAMBDA)
-                    goto call;
-
+                    goto call_catch;
                 drop_obj(res);
                 return eval(*pfn);
+
             default:
                 drop_obj(res);
                 return eval(fn);
@@ -581,67 +805,6 @@ obj_p try_obj(obj_p obj, obj_p ctch) {
     }
 
     return res;
-}
-
-obj_p interpreter_env_get(nil_t) {
-    obj_p lambda, env;
-    i64_t l;
-    ctx_p ctx;
-
-    ctx = ctx_get();
-    lambda = ctx->lambda;
-
-    l = AS_LAMBDA(lambda)->args->len;
-    env = __INTERPRETER->stack[ctx->sp + l];
-
-    return env;
-}
-
-nil_t interpreter_env_set(interpreter_p interpreter, obj_p env) { interpreter->stack[interpreter->sp++] = env; }
-
-nil_t interpreter_env_unset(interpreter_p interpreter) { drop_obj(interpreter->stack[--interpreter->sp]); }
-
-obj_p *resolve(i64_t sym) {
-    i64_t j, bp, *args;
-    obj_p lambda, env;
-    i64_t i, l, n;
-    ctx_p ctx;
-
-    ctx = ctx_get();
-    lambda = ctx->lambda;
-
-    if (sym == SYMBOL_SELF)
-        return &ctx->lambda;
-
-    l = AS_LAMBDA(lambda)->args->len;
-    bp = ctx->sp;
-
-    // search locals
-    env = __INTERPRETER->stack[bp + l];
-
-    if (env != NULL_OBJ) {
-        n = AS_LIST(env)[0]->len;
-
-        // search in a reverse order
-        for (i = n; i > 0; i--) {
-            if (AS_SYMBOL(AS_LIST(env)[0])[i - 1] == sym)
-                return &AS_LIST(AS_LIST(env)[1])[i - 1];
-        }
-    }
-
-    // search args
-    args = AS_SYMBOL(AS_LAMBDA(lambda)->args);
-    for (i = 0; i < l; i++) {
-        if (args[i] == sym)
-            return &__INTERPRETER->stack[bp + i];
-    }
-
-    // search globals
-    j = find_raw(AS_LIST(runtime_get()->env.variables)[0], &sym);
-    if (j == NULL_I64)
-        return NULL;
-
-    return &AS_LIST(AS_LIST(runtime_get()->env.variables)[1])[j];
 }
 
 obj_p ray_exit(obj_p *x, i64_t n) {
@@ -654,18 +817,7 @@ obj_p ray_exit(obj_p *x, i64_t n) {
 
     poll_exit(runtime_get()->poll, code);
 
-    stack_push(NULL_OBJ);
-
-    longjmp(ctx_get()->jmp, 2);
-
-    __builtin_unreachable();
+    return NULL_OBJ;
 }
 
 b8_t ray_is_main_thread(nil_t) { return heap_get()->id == 0; }
-
-inline __attribute__((always_inline)) obj_p unwrap(obj_p obj, i64_t id) {
-    // if (IS_ERR(obj))
-    //     error_add_loc(obj, id, ctx_get());
-
-    return obj;
-}
