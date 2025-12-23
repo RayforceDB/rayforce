@@ -242,6 +242,34 @@ nil_t error_add_loc(obj_p err, i64_t id, ctx_t *ctx) {
         push_raw(&AS_ERROR(err)->locs, &loc);
 }
 
+// Add location info from bytecode debug info
+nil_t bc_error_add_loc(obj_p err, obj_p fn, i64_t ip) {
+    obj_p loc, nfo;
+    span_t span;
+    lambda_p lambda;
+
+    if (fn == NULL_OBJ || fn->type != TYPE_LAMBDA)
+        return;
+
+    lambda = AS_LAMBDA(fn);
+    nfo = lambda->nfo;
+
+    if (nfo == NULL_OBJ)
+        return;
+
+    // Look up span from bytecode debug info
+    span = bc_dbg_get(lambda->dbg, ip);
+    if (span.id == 0)
+        return;
+
+    loc = vn_list(4, i64(span.id), clone_obj(AS_LIST(nfo)[0]), clone_obj(lambda->name), clone_obj(AS_LIST(nfo)[1]));
+
+    if (AS_ERROR(err)->locs == NULL_OBJ)
+        AS_ERROR(err)->locs = vn_list(1, loc);
+    else
+        push_raw(&AS_ERROR(err)->locs, &loc);
+}
+
 static inline obj_p unwrap(obj_p obj, i64_t id) {
     UNUSED(id);
     return obj;
@@ -327,8 +355,10 @@ OP_DEREF:
     {
         obj_p *val = resolve(x->i64);
         if (val == NULL) {
+            r = ray_error(ERR_EVAL, "undefined symbol: '%s", str_from_symbol(x->i64));
             drop_obj(x);
-            return ray_error(ERR_EVAL, "undefined symbol: '%s", str_from_symbol(x->i64));
+            bc_error_add_loc(r, vm->fn, ip);
+            return r;
         }
         y = clone_obj(*val);
     }
@@ -343,8 +373,10 @@ OP_CALF1:
     r = unary_call(y, x);
     drop_obj(x);
     drop_obj(y);
-    if (IS_ERR(r))
+    if (IS_ERR(r)) {
+        bc_error_add_loc(r, vm->fn, ip);
         return r;
+    }
     push(r);
     next();
 
@@ -357,8 +389,10 @@ OP_CALF2:
         drop_obj(x);
         drop_obj(y);
         drop_obj(r);
-        if (IS_ERR(res))
+        if (IS_ERR(res)) {
+            bc_error_add_loc(res, vm->fn, ip);
             return res;
+        }
         push(res);
     }
     next();
@@ -373,8 +407,10 @@ OP_CALF0:
             drop_obj(l[i]);
         vm->sp -= n;
         drop_obj(r);
-        if (IS_ERR(res))
+        if (IS_ERR(res)) {
+            bc_error_add_loc(res, vm->fn, ip);
             return res;
+        }
         push(res);
     }
     next();
@@ -383,7 +419,9 @@ OP_CALFN:
     x = pop();  // lambda function
     if (x->type != TYPE_LAMBDA) {
         drop_obj(x);
-        return ray_error(ERR_TYPE, "expected lambda, got %s", type_name(x->type));
+        r = ray_error(ERR_TYPE, "expected lambda, got %s", type_name(x->type));
+        bc_error_add_loc(r, vm->fn, ip);
+        return r;
     }
 callfn:
     // Save current context
@@ -417,20 +455,26 @@ OP_CALFD:
         case TYPE_UNARY:
             if (n != 1) {
                 drop_obj(x);
-                return ray_error(ERR_ARITY, "unary function requires 1 argument");
+                r = ray_error(ERR_ARITY, "unary function requires 1 argument");
+                bc_error_add_loc(r, vm->fn, ip);
+                return r;
             }
             y = pop();
             r = unary_call(x, y);
             drop_obj(y);
             drop_obj(x);
-            if (IS_ERR(r))
+            if (IS_ERR(r)) {
+                bc_error_add_loc(r, vm->fn, ip);
                 return r;
+            }
             push(r);
             break;
         case TYPE_BINARY:
             if (n != 2) {
                 drop_obj(x);
-                return ray_error(ERR_ARITY, "binary function requires 2 arguments");
+                r = ray_error(ERR_ARITY, "binary function requires 2 arguments");
+                bc_error_add_loc(r, vm->fn, ip);
+                return r;
             }
             y = pop();
             r = pop();
@@ -439,8 +483,10 @@ OP_CALFD:
                 drop_obj(r);
                 drop_obj(y);
                 drop_obj(x);
-                if (IS_ERR(res))
+                if (IS_ERR(res)) {
+                    bc_error_add_loc(res, vm->fn, ip);
                     return res;
+                }
                 push(res);
             }
             break;
@@ -451,15 +497,19 @@ OP_CALFD:
                 drop_obj(l[i]);
             vm->sp -= n;
             drop_obj(x);
-            if (IS_ERR(r))
+            if (IS_ERR(r)) {
+                bc_error_add_loc(r, vm->fn, ip);
                 return r;
+            }
             push(r);
             break;
         case TYPE_LAMBDA:
             goto callfn;
         default:
             drop_obj(x);
-            return ray_error(ERR_TYPE, "'%s is not a function", type_name(x->type));
+            r = ray_error(ERR_TYPE, "'%s is not a function", type_name(x->type));
+            bc_error_add_loc(r, vm->fn, ip);
+            return r;
     }
     next();
 

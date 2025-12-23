@@ -2894,6 +2894,7 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             drop_obj(AS_LAMBDA(obj)->nfo);
             drop_obj(AS_LAMBDA(obj)->bc);
             drop_obj(AS_LAMBDA(obj)->consts);
+            drop_obj(AS_LAMBDA(obj)->dbg);
             heap_free(obj);
             return;
         case TYPE_NULL:

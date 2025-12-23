@@ -44,6 +44,7 @@ obj_p lambda(obj_p args, obj_p body, obj_p nfo) {
     f->nfo = nfo;
     f->bc = NULL_OBJ;      // Bytecode (compiled on first call)
     f->consts = NULL_OBJ;  // Constants pool
+    f->dbg = NULL_OBJ;     // Debug info (bytecode offset -> span)
 
     return obj;
 }

@@ -30,9 +30,10 @@ typedef struct lambda_f {
     obj_p name;    // name of lambda
     obj_p args;    // vector of arguments names
     obj_p body;    // body of lambda (AST, for debugging/introspection)
-    obj_p nfo;     // nfo from cc phase
+    obj_p nfo;     // nfo from parse phase (maps AST node -> span)
     obj_p bc;      // bytecode (U8 vector)
     obj_p consts;  // constants pool (LIST)
+    obj_p dbg;     // debug info (maps bytecode offset -> span)
 } *lambda_p;
 
 #define AS_LAMBDA(o) ((lambda_p)(AS_C8(o)))

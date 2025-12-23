@@ -31,6 +31,29 @@
 #include "format.h"
 #include "cond.h"
 #include "vary.h"
+#include "nfo.h"
+
+// Look up span for a bytecode offset
+// dbg is an I64 vector of pairs: [offset0, span0, offset1, span1, ...]
+// Returns the span for the largest offset <= ip
+span_t bc_dbg_get(obj_p dbg, i64_t ip) {
+    span_t span = {0};
+    i64_t i, n, best_offset = -1;
+
+    if (dbg == NULL_OBJ || dbg->len == 0)
+        return span;
+
+    n = dbg->len;
+    for (i = 0; i < n; i += 2) {
+        i64_t offset = AS_I64(dbg)[i];
+        if (offset <= ip && offset > best_offset) {
+            best_offset = offset;
+            span.id = AS_I64(dbg)[i + 1];
+        }
+    }
+
+    return span;
+}
 
 // clang-format off
 #define OP(ctx, op)   (AS_U8((ctx)->bc)[(ctx)->ip++] = (u8_t)(op))
@@ -38,6 +61,15 @@
 #define CA(ctx, nn)   ({ OP(ctx, OP_DUP); OP(ctx, (nn)); })
 #define CE(f)        { if ((f) == -1) return -1; }
 #define SELF_SYM     (symbols_intern("self", 4))
+// Record debug info: map bytecode offset to span from AST node
+#define DBG(ctx, expr) do { \
+    span_t _span = nfo_get((ctx)->nfo, (i64_t)(expr)); \
+    if (_span.id != 0) { \
+        i64_t _ip = (ctx)->ip; \
+        push_raw(&(ctx)->dbg, &_ip); \
+        push_raw(&(ctx)->dbg, &_span.id); \
+    } \
+} while(0)
 // clang-format on
 
 static i64_t cc_expr(cc_ctx_t *cc, obj_p e);
@@ -90,7 +122,8 @@ static i64_t cc_cond(cc_ctx_t *cc, obj_p *lst, i64_t n) {
 }
 
 // Compile function call
-static i64_t cc_call(cc_ctx_t *cc, obj_p *lst, i64_t n) {
+// expr is the original list expression (for debug info)
+static i64_t cc_call(cc_ctx_t *cc, obj_p expr, obj_p *lst, i64_t n) {
     obj_p car = lst[0];
     i64_t i;
 
@@ -107,16 +140,21 @@ static i64_t cc_call(cc_ctx_t *cc, obj_p *lst, i64_t n) {
         CE(cc_expr(cc, lst[i]));
     }
 
+    // Record debug info before emitting call opcode
+    DBG(cc, expr);
+
     // Now emit call instruction based on function type
     switch (car->type) {
         case TYPE_UNARY:
-            if (n != 1) return -1;
+            if (n != 1)
+                return -1;
             CC(cc, clone_obj(car));
             OP(cc, OP_CALF1);
             break;
 
         case TYPE_BINARY:
-            if (n != 2) return -1;
+            if (n != 2)
+                return -1;
             CC(cc, clone_obj(car));
             OP(cc, OP_CALF2);
             break;
@@ -179,8 +217,8 @@ static i64_t cc_expr(cc_ctx_t *cc, obj_p e) {
                 CC(cc, NULL_OBJ);
                 return 0;
             }
-            // Function call
-            return cc_call(cc, AS_LIST(e), e->len);
+            // Function call - pass expression for debug info
+            return cc_call(cc, e, AS_LIST(e), e->len);
 
         default:
             // Constant - push to constants pool
@@ -194,9 +232,11 @@ static i64_t cc_body(cc_ctx_t *cc, obj_p *lst, i64_t n) {
     i64_t i;
 
     for (i = 0; i < n; ++i) {
-        if (cc_expr(cc, lst[i]) == -1) return -1;
+        if (cc_expr(cc, lst[i]) == -1)
+            return -1;
         // Pop intermediate results (except last)
-        if (i < n - 1) OP(cc, OP_POP);
+        if (i < n - 1)
+            OP(cc, OP_POP);
     }
 
     return 0;
@@ -237,6 +277,8 @@ obj_p cc_compile(obj_p lambda) {
         .args = (fn->args != NULL_OBJ) ? clone_obj(fn->args) : SYMBOL(0),
         .locals = LIST(0),
         .consts = LIST(0),
+        .dbg = I64(0),   // Debug info: pairs of (bytecode offset, span.id)
+        .nfo = fn->nfo,  // Source nfo from parser
         .lp = 0,
     };
 
@@ -271,12 +313,14 @@ obj_p cc_compile(obj_p lambda) {
         drop_obj(cc.args);
         drop_obj(cc.locals);
         drop_obj(cc.consts);
+        drop_obj(cc.dbg);
         return result;
     }
 
-    // Store compiled bytecode and constants in lambda
+    // Store compiled bytecode, constants, and debug info in lambda
     fn->bc = cc.bc;
     fn->consts = cc.consts;
+    fn->dbg = cc.dbg;
 
     // Cleanup
     drop_obj(cc.args);
@@ -356,4 +400,3 @@ nil_t cc_dump(obj_p lambda) {
     }
     printf("=====================\n");
 }
-
