@@ -78,33 +78,22 @@ typedef struct vm_t {
     ctx_t rs[VM_STACK_SIZE] __attribute__((aligned(32)));  // return stack
 } __attribute__((aligned(32))) * vm_p;
 
+// Thread-local VM pointer
+extern __thread vm_p __VM;
+
 // VM lifecycle
 vm_p vm_create(i64_t id, struct pool_t *pool);
 nil_t vm_destroy(vm_p vm);
-nil_t vm_set(vm_p vm);
-vm_p vm_current(nil_t);
 
-// Access heap through current VM
-#define heap_current() (vm_current()->heap)
+// Fast access to current VM - macro for zero overhead
+#define VM (__VM)
 
-// Stack operations (inlined for performance)
-inline __attribute__((always_inline)) nil_t vm_stack_push(obj_p val) {
-    vm_p vm = vm_current();
-    vm->ps[vm->sp++] = val;
-}
-inline __attribute__((always_inline)) obj_p vm_stack_pop(nil_t) {
-    vm_p vm = vm_current();
-    return vm->ps[--vm->sp];
-}
-inline __attribute__((always_inline)) obj_p vm_stack_at(i64_t n) {
-    vm_p vm = vm_current();
-    return vm->ps[vm->sp - n - 1];
-}
-inline __attribute__((always_inline)) obj_p *vm_stack_peek(i64_t n) {
-    vm_p vm = vm_current();
-    return &vm->ps[vm->sp - n - 1];
-}
-inline __attribute__((always_inline)) b8_t vm_stack_enough(i64_t n) { return vm_current()->sp + n < VM_STACK_SIZE; }
+// Stack operations (inlined for performance) - use __VM directly
+inline __attribute__((always_inline)) nil_t vm_stack_push(obj_p val) { __VM->ps[__VM->sp++] = val; }
+inline __attribute__((always_inline)) obj_p vm_stack_pop(nil_t) { return __VM->ps[--__VM->sp]; }
+inline __attribute__((always_inline)) obj_p vm_stack_at(i64_t n) { return __VM->ps[__VM->sp - n - 1]; }
+inline __attribute__((always_inline)) obj_p *vm_stack_peek(i64_t n) { return &__VM->ps[__VM->sp - n - 1]; }
+inline __attribute__((always_inline)) b8_t vm_stack_enough(i64_t n) { return __VM->sp + n < VM_STACK_SIZE; }
 
 // Evaluation functions
 obj_p eval(obj_p obj);               // Recursive tree-walking eval

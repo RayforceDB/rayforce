@@ -213,7 +213,7 @@ raw_p executor_run(raw_p arg) {
         }
     }
 
-    vm_destroy(vm_current());
+    vm_destroy(__VM);
 
     return NULL;
 }

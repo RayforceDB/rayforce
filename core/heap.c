@@ -45,7 +45,6 @@ RAYASSERT(sizeof(struct block_t) == (2 * sizeof(struct obj_t)), heap_h);
 #define BLOCK2RAW(b) ((raw_p)((i64_t)(b) + sizeof(struct obj_t)))
 #define RAW2BLOCK(r) ((block_p)((i64_t)(r) - sizeof(struct obj_t)))
 #define DEFAULT_HEAP_SWAP "./"
-#define HEAP (vm_current()->heap)
 
 heap_p heap_create(i64_t id) {
     heap_p heap;
@@ -123,7 +122,7 @@ nil_t heap_destroy(heap_p heap) {
 
 heap_p heap_get(nil_t) {
     LOG_TRACE("Getting heap instance");
-    return HEAP;
+    return VM->heap;
 }
 
 #ifdef SYS_MALLOC
@@ -271,7 +270,7 @@ raw_p heap_stack(i64_t size) {
 raw_p __attribute__((hot)) heap_alloc(i64_t size) {
     i64_t i, order, block_size;
     block_p block;
-    heap_p heap = HEAP;  // Cache heap pointer to avoid repeated vm_current() calls
+    heap_p heap = HEAP;  // Cache heap pointer to avoid repeated VM calls
 
     if (size == 0 || size > BSIZEOF(MAX_POOL_ORDER))
         return NULL;

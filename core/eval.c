@@ -32,19 +32,12 @@
 #include "string.h"
 #include "aggr.h"
 #include "cc.h"
-#include <pthread.h>
 
-// Thread-local VM storage using POSIX TLS
-static pthread_key_t vm_key;
-static pthread_once_t vm_key_once = PTHREAD_ONCE_INIT;
-
-static nil_t vm_key_create(nil_t) { pthread_key_create(&vm_key, NULL); }
+// Thread-local VM pointer
+__thread vm_p __VM = NULL;
 
 vm_p vm_create(i64_t id, struct pool_t *pool) {
     vm_p vm;
-
-    // Ensure TLS key is created (once per process)
-    pthread_once(&vm_key_once, vm_key_create);
 
     // Use raw mmap for VM allocation (can't use heap before VM exists)
     vm = (vm_p)mmap_alloc(sizeof(struct vm_t));
@@ -60,7 +53,7 @@ vm_p vm_create(i64_t id, struct pool_t *pool) {
     memset(vm->rs, 0, sizeof(ctx_t) * VM_STACK_SIZE);
 
     // Set VM for this thread so heap_create can use it
-    pthread_setspecific(vm_key, vm);
+    __VM = vm;
 
     // Create heap for this VM
     vm->heap = heap_create(id);
@@ -78,22 +71,14 @@ nil_t vm_destroy(vm_p vm) {
     heap_destroy(vm->heap);
     vm->heap = NULL;
 
-    // Clear TLS
-    pthread_setspecific(vm_key, NULL);
+    // Clear thread-local
+    __VM = NULL;
 
     // Then destroy VM
     mmap_free(vm, sizeof(struct vm_t));
 }
 
-nil_t vm_set(vm_p vm) { pthread_setspecific(vm_key, vm); }
-
-vm_p vm_current(nil_t) { return (vm_p)pthread_getspecific(vm_key); }
-
-// ============================================================================
-// Environment Management
-// ============================================================================
-
-obj_p vm_env_get(nil_t) { return vm_current()->env; }
+obj_p vm_env_get(nil_t) { return __VM->env; }
 
 nil_t vm_env_set(vm_p vm, obj_p env) { vm->env = env; }
 
@@ -112,7 +97,7 @@ obj_p *resolve(i64_t sym) {
     i64_t j, *args;
     obj_p fn, env;
     i64_t i, l, n;
-    vm_p vm = vm_current();
+    vm_p vm = VM;
 
     fn = vm->fn;
 
@@ -155,7 +140,7 @@ obj_p *resolve(i64_t sym) {
 
 obj_p amend(obj_p sym, obj_p val) {
     obj_p *env_slot;
-    vm_p vm = vm_current();
+    vm_p vm = VM;
 
     env_slot = &vm->env;
 
@@ -173,7 +158,7 @@ obj_p mount_env(obj_p obj) {
     i64_t i, l1, l2, l;
     obj_p *env_slot;
     obj_p keys, vals;
-    vm_p vm = vm_current();
+    vm_p vm = VM;
 
     env_slot = &vm->env;
 
@@ -208,7 +193,7 @@ obj_p mount_env(obj_p obj) {
 obj_p unmount_env(i64_t n) {
     obj_p *env_slot;
     i64_t i, l;
-    vm_p vm = vm_current();
+    vm_p vm = VM;
 
     env_slot = &vm->env;
 
@@ -267,7 +252,7 @@ static inline obj_p unwrap(obj_p obj, i64_t id) {
 // ============================================================================
 
 __attribute__((hot)) obj_p vm_eval(obj_p fn) {
-    vm_p vm = vm_current();
+    vm_p vm = VM;
     u8_t *bc;
     obj_p *consts;
     ctx_t *rs;
@@ -491,7 +476,7 @@ OP_CALFD:
 obj_p call(obj_p fn, i64_t arity) {
     lambda_p lam = AS_LAMBDA(fn);
     obj_p res;
-    vm_p vm = vm_current();
+    vm_p vm = VM;
     obj_p saved_fn = vm->fn;
     obj_p saved_env = vm->env;
     obj_p compiled_fn = fn;
