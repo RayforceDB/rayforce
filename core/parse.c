@@ -68,7 +68,7 @@ obj_p parse_error(parser_t *parser, i64_t id, lit_p msg) {
 
     err = ray_err(msg);
 
-    // Store location in VM's last_locs (glibc-like error handling)
+    // Store location in VM's trace (glibc-like error handling)
     if (parser->nfo != NULL_OBJ && vm) {
         span = nfo_get(parser->nfo, id);
         loc = vn_list(4, i64(span.id),                        // span
@@ -76,10 +76,10 @@ obj_p parse_error(parser_t *parser, i64_t id, lit_p msg) {
                          NULL_OBJ,                            // function
                          clone_obj(AS_LIST(parser->nfo)[1])   // source
                      );
-        if (vm->last_locs == NULL_OBJ)
-            vm->last_locs = vn_list(1, loc);
+        if (vm->trace == NULL_OBJ)
+            vm->trace = vn_list(1, loc);
         else
-            push_raw(&vm->last_locs, &loc);
+            push_raw(&vm->trace, &loc);
     }
 
     return err;

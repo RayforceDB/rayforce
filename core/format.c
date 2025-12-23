@@ -598,9 +598,9 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
     err_code = ray_err_msg(obj);
     msg_len = (i32_t)strlen(err_code);
 
-    // Check for locations in VM's last_locs
+    // Check for locations in VM's trace
     vm = VM;
-    locs = (vm && vm->last_locs != NULL_OBJ) ? vm->last_locs : NULL_OBJ;
+    locs = (vm && vm->trace != NULL_OBJ) ? vm->trace : NULL_OBJ;
 
     // Format header with × marker: "× Error: code"
     n = str_fmt_into(dst, MAX_ERROR_LEN, "\n  %s×%s %sError%s: %s%s%s\n", TOMATO, RESET, TOMATO, RESET, CYAN, err_code,
@@ -624,8 +624,8 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
 
         // Clear locations after formatting
         if (vm) {
-            drop_obj(vm->last_locs);
-            vm->last_locs = NULL_OBJ;
+            drop_obj(vm->trace);
+            vm->trace = NULL_OBJ;
         }
     }
 

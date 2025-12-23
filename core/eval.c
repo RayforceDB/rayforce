@@ -50,7 +50,7 @@ vm_p vm_create(i64_t id, struct pool_t *pool) {
     vm->nfo = NULL_OBJ;
     vm->pool = pool;
     vm->timeit.active = B8_FALSE;
-    vm->last_locs = NULL_OBJ;
+    vm->trace = NULL_OBJ;
     memset(vm->ps, 0, sizeof(obj_p) * VM_STACK_SIZE);
     memset(vm->rs, 0, sizeof(ctx_t) * VM_STACK_SIZE);
 
@@ -240,10 +240,10 @@ nil_t error_add_loc(obj_p err, i64_t id, ctx_t *ctx) {
     loc = vn_list(4, i64(span.id), clone_obj(AS_LIST(nfo)[0]), clone_obj(AS_LAMBDA(ctx->fn)->name),
                   clone_obj(AS_LIST(nfo)[1]));
 
-    if (vm->last_locs == NULL_OBJ)
-        vm->last_locs = vn_list(1, loc);
+    if (vm->trace == NULL_OBJ)
+        vm->trace = vn_list(1, loc);
     else
-        push_raw(&vm->last_locs, &loc);
+        push_raw(&vm->trace, &loc);
 }
 
 // Add location info from bytecode debug info
@@ -270,10 +270,10 @@ nil_t bc_error_add_loc(obj_p err, obj_p fn, i64_t ip) {
 
     loc = vn_list(4, i64(span.id), clone_obj(AS_LIST(nfo)[0]), clone_obj(lambda->name), clone_obj(AS_LIST(nfo)[1]));
 
-    if (vm->last_locs == NULL_OBJ)
-        vm->last_locs = vn_list(1, loc);
+    if (vm->trace == NULL_OBJ)
+        vm->trace = vn_list(1, loc);
     else
-        push_raw(&vm->last_locs, &loc);
+        push_raw(&vm->trace, &loc);
 }
 
 // Add location info for tree-walking eval using vm->nfo
@@ -297,10 +297,10 @@ nil_t eval_error_add_loc(obj_p expr) {
 
     loc = vn_list(4, i64(span.id), clone_obj(AS_LIST(nfo)[0]), NULL_OBJ, clone_obj(AS_LIST(nfo)[1]));
 
-    if (vm->last_locs == NULL_OBJ)
-        vm->last_locs = vn_list(1, loc);
+    if (vm->trace == NULL_OBJ)
+        vm->trace = vn_list(1, loc);
     else
-        push_raw(&vm->last_locs, &loc);
+        push_raw(&vm->trace, &loc);
 }
 
 static inline obj_p unwrap(obj_p obj, i64_t id) {

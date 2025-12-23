@@ -337,6 +337,9 @@ extern i32_t ray_init(nil_t);
 // Cleanup runtime
 extern nil_t ray_clean(nil_t);
 
+// Error
+extern obj_p ray_err(lit_p msg);
+
 #ifdef __cplusplus
 }
 #endif
