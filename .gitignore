@@ -18,3 +18,4 @@ CLAUDE.md
 .claude/
 .DS_Store
 docs/site/
+.pytest_cache/
