@@ -63,8 +63,8 @@ typedef nil_t (*poll_evts_fn)(struct poll_t *, struct selector_t *);            
 // Buffer structure
 typedef struct poll_buffer_t {
     struct poll_buffer_t *next;
-    u32_t size;
-    u32_t offset;
+    i64_t size;
+    i64_t offset;
     u8_t data[];
 } *poll_buffer_p;
 
