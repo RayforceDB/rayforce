@@ -158,31 +158,48 @@ static const i8_t raykx_type_to_k_table[128] = {
         ISIZEOF(i8_t) + 1 + sizeof(i32_t) + n; \
     })
 
-#define RAYKX_DES_ATOM(b, l, t, r)        \
-    ({                                    \
-        obj_p $o = t(0);                  \
-        memcpy(&$o->t, b, sizeof(t##_t)); \
-        b += sizeof(t##_t);               \
-        (*l) -= sizeof(t##_t);            \
-        $o->type = -TYPE_##r;             \
-        $o;                               \
+#define RAYKX_DES_ATOM(b, l, t, r)                                                   \
+    ({                                                                               \
+        obj_p $o;                                                                    \
+        if ((*l) < (i64_t)sizeof(t##_t)) {                                           \
+            $o = error_str(ERR_IO, "raykx_des_obj: buffer underflow for atom");      \
+        } else {                                                                     \
+            $o = t(0);                                                               \
+            memcpy(&$o->t, b, sizeof(t##_t));                                        \
+            b += sizeof(t##_t);                                                      \
+            (*l) -= sizeof(t##_t);                                                   \
+            $o->type = -TYPE_##r;                                                    \
+        }                                                                            \
+        $o;                                                                          \
     })
 
-#define RAYKX_DES_VEC(b, l, t, r)         \
-    ({                                    \
-        i32_t $n;                         \
-        i64_t $m;                         \
-        obj_p $o;                         \
-        b++;                              \
-        memcpy(&$n, b, sizeof(i32_t));    \
-        b += sizeof(i32_t);               \
-        $o = r($n);                       \
-        $m = $n * ISIZEOF(t##_t);         \
-        memcpy($o->raw, b, $m);           \
-        b += $m;                          \
-        (*l) -= ($m + sizeof(i32_t) + 1); \
-        $o->type = TYPE_##r;              \
-        $o;                               \
+#define RAYKX_DES_VEC(b, l, t, r)                                                    \
+    ({                                                                               \
+        i32_t $n;                                                                    \
+        i64_t $m;                                                                    \
+        obj_p $o;                                                                    \
+        if ((*l) < (i64_t)(1 + sizeof(i32_t))) {                                     \
+            $o = error_str(ERR_IO, "raykx_des_obj: buffer underflow for vec header");\
+        } else {                                                                     \
+            b++;                                                                     \
+            memcpy(&$n, b, sizeof(i32_t));                                           \
+            b += sizeof(i32_t);                                                      \
+            if ($n < 0) {                                                            \
+                $o = error_str(ERR_IO, "raykx_des_obj: negative vector length");     \
+            } else {                                                                 \
+                $m = (i64_t)$n * ISIZEOF(t##_t);                                     \
+                if ((*l) < (i64_t)(1 + sizeof(i32_t)) + $m) {                         \
+                    $o = error_str(ERR_IO, "raykx_des_obj: buffer underflow for vec data"); \
+                } else {                                                             \
+                    $o = r($n);                                                      \
+                    memcpy($o->raw, b, $m);                                          \
+                    b += $m;                                                         \
+                    (*l) -= ($m + sizeof(i32_t) + 1);                                 \
+                    $o->type = TYPE_##r;                                             \
+                }                                                                    \
+            }                                                                        \
+        }                                                                            \
+        $o;                                                                          \
     })
 
 i64_t raykx_ser_obj(u8_t *buf, obj_p obj) {
@@ -326,16 +343,60 @@ obj_p raykx_des_obj(u8_t *buf, i64_t *len) {
             return RAYKX_DES_ATOM(buf, len, i32, I32);
         case -KJ:
             return RAYKX_DES_ATOM(buf, len, i64, I64);
-        case -KZ:
+        case -KP:  // timestamp atom (nanoseconds from 2000.01.01)
+            v = RAYKX_DES_ATOM(buf, len, i64, I64);
+            if (!IS_ERR(v)) v->type = -TYPE_TIMESTAMP;
+            return v;
+        case -KM:  // month atom
+        case -KD:  // date atom
+            v = RAYKX_DES_ATOM(buf, len, i32, I32);
+            if (!IS_ERR(v)) v->type = -TYPE_DATE;
+            return v;
+        case -KN:  // timespan atom (nanoseconds)
+            v = RAYKX_DES_ATOM(buf, len, i64, I64);
+            if (!IS_ERR(v)) v->type = -TYPE_TIMESTAMP;
+            return v;
+        case -KU:  // minute atom
+        case -KV:  // second atom
+        case -KT:  // time atom (milliseconds)
+            v = RAYKX_DES_ATOM(buf, len, i32, I32);
+            if (!IS_ERR(v)) v->type = -TYPE_TIME;
+            return v;
+        case -KZ:  // legacy datetime - skip 8 bytes
+            if (*len < 8) return error_str(ERR_IO, "raykx_des_obj: buffer underflow for datetime");
+            buf += 8;
+            (*len) -= 8;
             return NULL_OBJ;
         case -KS:
-            l = strlen((lit_p)buf);
+            // Find null terminator within remaining buffer
+            l = 0;
+            while (l < *len && buf[l] != '\0') l++;
+            if (l >= *len)
+                return error_str(ERR_IO, "raykx_des_obj: symbol not null-terminated");
             obj = symbol((lit_p)buf, l);
             buf += l + 1;
             (*len) -= l + 1;
             return obj;
+        case -KE:  // real atom (4-byte float) - convert to f64
+            if (*len < 4) return error_str(ERR_IO, "raykx_des_obj: buffer underflow for real atom");
+            {
+                float f;
+                memcpy(&f, buf, sizeof(float));
+                obj = f64((f64_t)f);
+                buf += sizeof(float);
+                (*len) -= sizeof(float);
+            }
+            return obj;
         case -KF:
             return RAYKX_DES_ATOM(buf, len, f64, F64);
+        case -UU:  // GUID atom (16 bytes)
+            if (*len < 16) return error_str(ERR_IO, "raykx_des_obj: buffer underflow for GUID atom");
+            obj = guid(buf);
+            buf += 16;
+            (*len) -= 16;
+            return obj;
+        case KB:  // boolean vector
+            return RAYKX_DES_VEC(buf, len, u8, U8);
         case KC:
             return RAYKX_DES_VEC(buf, len, c8, C8);
         case KG:
@@ -344,22 +405,49 @@ obj_p raykx_des_obj(u8_t *buf, i64_t *len) {
             return RAYKX_DES_VEC(buf, len, i16, I16);
         case KI:
             return RAYKX_DES_VEC(buf, len, i32, I32);
-        case KT:
-            v = RAYKX_DES_VEC(buf, len, i32, I32);
-            v->type = TYPE_TIME;
-            return v;
-        case KD:
-            v = RAYKX_DES_VEC(buf, len, i32, I32);
-            v->type = TYPE_DATE;
-            return v;
-        case KZ:
+        case KP:  // timestamp vector (nanoseconds from 2000.01.01)
             v = RAYKX_DES_VEC(buf, len, i64, I64);
-            v->type = TYPE_TIMESTAMP;
+            if (!IS_ERR(v)) v->type = TYPE_TIMESTAMP;
             return v;
-        case KN:
+        case KM:  // month vector
+        case KD:  // date vector
+            v = RAYKX_DES_VEC(buf, len, i32, I32);
+            if (!IS_ERR(v)) v->type = TYPE_DATE;
+            return v;
+        case KN:  // timespan vector (nanoseconds)
+        case KZ:  // legacy datetime vector
             v = RAYKX_DES_VEC(buf, len, i64, I64);
-            v->type = TYPE_TIMESTAMP;
+            if (!IS_ERR(v)) v->type = TYPE_TIMESTAMP;
             return v;
+        case KU:  // minute vector
+        case KV:  // second vector
+        case KT:  // time vector (milliseconds)
+            v = RAYKX_DES_VEC(buf, len, i32, I32);
+            if (!IS_ERR(v)) v->type = TYPE_TIME;
+            return v;
+        case KE:  // real vector (4-byte floats) - convert to f64
+            if (*len < (i64_t)(1 + sizeof(i32_t)))
+                return error_str(ERR_IO, "raykx_des_obj: buffer underflow for real vector header");
+            {
+                i32_t count;
+                buf++;  // attrs
+                memcpy(&count, buf, sizeof(i32_t));
+                buf += sizeof(i32_t);
+                if (count < 0)
+                    return error_str(ERR_IO, "raykx_des_obj: negative real vector length");
+                i64_t data_size = (i64_t)count * sizeof(float);
+                if (*len < (i64_t)(1 + sizeof(i32_t)) + data_size)
+                    return error_str(ERR_IO, "raykx_des_obj: buffer underflow for real vector data");
+                obj = F64(count);
+                for (i32_t j = 0; j < count; j++) {
+                    float f;
+                    memcpy(&f, buf + j * sizeof(float), sizeof(float));
+                    AS_F64(obj)[j] = (f64_t)f;
+                }
+                buf += data_size;
+                (*len) -= (1 + sizeof(i32_t) + data_size);
+            }
+            return obj;
         case KJ:
             return RAYKX_DES_VEC(buf, len, i64, I64);
         case KF:
@@ -367,14 +455,25 @@ obj_p raykx_des_obj(u8_t *buf, i64_t *len) {
         case UU:
             return RAYKX_DES_VEC(buf, len, guid, GUID);
         case KS:
+            if (*len < (i64_t)(1 + sizeof(i32_t)))
+                return error_str(ERR_IO, "raykx_des_obj: buffer underflow for symbol vector header");
             buf++;  // attrs
             (*len)--;
             memcpy(&l, buf, sizeof(i32_t));
             buf += sizeof(i32_t);
             (*len) -= sizeof(i32_t);
+            if (l < 0)
+                return error_str(ERR_IO, "raykx_des_obj: negative symbol vector length");
             obj = SYMBOL(l);
             for (i = 0; i < l; i++) {
-                n = strlen((lit_p)buf);
+                // Find null terminator within remaining buffer
+                n = 0;
+                while (n < *len && buf[n] != '\0') n++;
+                if (n >= *len) {
+                    obj->len = i;
+                    drop_obj(obj);
+                    return error_str(ERR_IO, "raykx_des_obj: symbol not null-terminated in vector");
+                }
                 id = symbols_intern((lit_p)buf, n);
                 AS_SYMBOL(obj)[i] = id;
                 buf += n + 1;
@@ -388,12 +487,16 @@ obj_p raykx_des_obj(u8_t *buf, i64_t *len) {
                 return k;
             buf += l - *len;
             v = raykx_des_obj(buf, len);
-            if (IS_ERR(v))
+            if (IS_ERR(v)) {
+                drop_obj(k);
                 return v;
+            }
             obj = table(k, v);
             obj->type = TYPE_DICT;
             return obj;
         case XT:
+            if (*len < 2)
+                return error_str(ERR_IO, "raykx_des_obj: buffer underflow for table header");
             buf++;  // attrs
             buf++;  // dict
             (*len) -= 2;
@@ -403,15 +506,21 @@ obj_p raykx_des_obj(u8_t *buf, i64_t *len) {
                 return k;
             buf += l - *len;
             v = raykx_des_obj(buf, len);
-            if (IS_ERR(v))
+            if (IS_ERR(v)) {
+                drop_obj(k);
                 return v;
+            }
             return table(k, v);
         case 0:     // LIST
+            if (*len < (i64_t)(1 + sizeof(i32_t)))
+                return error_str(ERR_IO, "raykx_des_obj: buffer underflow for list header");
             buf++;  // attrs
             (*len)--;
             memcpy(&l, buf, sizeof(i32_t));
             buf += sizeof(i32_t);
             (*len) -= sizeof(i32_t);
+            if (l < 0)
+                return error_str(ERR_IO, "raykx_des_obj: negative list length");
             obj = LIST(l);
             for (i = 0; i < l; i++) {
                 i64_t start_len = *len;

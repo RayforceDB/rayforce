@@ -348,7 +348,13 @@ static option_t raykx_read_msg(poll_p poll, selector_p selector) {
     if (ctx->compressed) {
         u8_t* decompressed;
         i64_t decompressed_size;
-        raykx_decompress(selector->rx.buf->data, len, &decompressed, &decompressed_size);
+        option_t decomp_result = raykx_decompress(selector->rx.buf->data, len, &decompressed, &decompressed_size);
+        if (option_is_error(&decomp_result)) {
+            LOG_ERROR("Failed to decompress message");
+            poll_rx_buf_request(poll, selector, ISIZEOF(struct raykx_header_t));
+            selector->rx.read_fn = raykx_read_header;
+            return decomp_result;
+        }
         res = raykx_des_obj(decompressed, &decompressed_size);
         heap_free(decompressed);
     } else {
