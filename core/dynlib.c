@@ -130,8 +130,7 @@ dynlib_p dynlib_open(obj_p path) {
     LOG_TRACE("dynlib: opening %s", AS_C8(path));
     handle = dlopen(AS_C8(path), RTLD_NOW | RTLD_GLOBAL);
     if (handle == NULL) {
-        lit_p err = dlerror();
-        LOG_ERROR("dynlib: failed to open %s: %s", AS_C8(path), err ? err : "unknown error");
+        LOG_ERROR("dynlib: failed to open %s: %s", AS_C8(path), dlerror());
         return (dynlib_p)ray_err(ERR_SYS);
     }
 
