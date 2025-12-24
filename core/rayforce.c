@@ -2883,7 +2883,6 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
         case TYPE_NULL:
             return;
         case TYPE_ERR:
-            // Error message is embedded in i64, nothing to drop
             heap_free(obj);
             return;
         default:
