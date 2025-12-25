@@ -53,6 +53,7 @@ vm_p vm_create(i32_t id, struct pool_t *pool) {
     vm->nfo = NULL_OBJ;
     vm->trace = NULL_OBJ;
     vm->timeit = NULL;       // Lazy allocated when timing enabled
+    vm->query_ctx = NULL;    // No active query context
     vm->rc_sync = B8_FALSE;  // Single-threaded by default
 
     // Set VM for this thread so heap_create can use it
@@ -143,7 +144,7 @@ static obj_p *resolve_in_env(obj_p fn, i64_t sym, i64_t fp_offset) {
 
 obj_p *resolve(i64_t sym) {
     i64_t j, frame;
-    obj_p fn, env, *result;
+    obj_p fn, *result;
     i64_t i, n;
     vm_p vm = VM;
 
@@ -171,13 +172,15 @@ obj_p *resolve(i64_t sym) {
             return result;
     }
 
-    // Search in vm->env (for query table mounting)
-    env = vm->env;
-    if (env != NULL_OBJ && env->type == TYPE_DICT) {
-        n = AS_LIST(env)[0]->len;
-        for (i = n; i > 0; i--) {
-            if (AS_SYMBOL(AS_LIST(env)[0])[i - 1] == sym)
-                return &AS_LIST(AS_LIST(env)[1])[i - 1];
+    // Search in query context stack (for table column access)
+    for (query_ctx_p ctx = vm->query_ctx; ctx != NULL; ctx = ctx->parent) {
+        if (ctx->table != NULL_OBJ) {
+            obj_p cols = AS_LIST(ctx->table)[0];  // column names (symbol vector)
+            n = cols->len;
+            for (i = 0; i < n; i++) {
+                if (AS_SYMBOL(cols)[i] == sym)
+                    return &AS_LIST(AS_LIST(ctx->table)[1])[i];
+            }
         }
     }
 
@@ -209,68 +212,6 @@ obj_p amend(obj_p sym, obj_p val) {
     }
 
     return val;
-}
-
-obj_p mount_env(obj_p obj) {
-    i64_t i, l1, l2, l;
-    obj_p *env_slot;
-    obj_p keys, vals;
-    vm_p vm = VM;
-
-    env_slot = &vm->env;
-
-    if (*env_slot != NULL_OBJ) {
-        l1 = AS_LIST(*env_slot)[0]->len;
-        l2 = AS_LIST(obj)[0]->len;
-        l = l1 + l2;
-        keys = SYMBOL(l);
-        vals = LIST(l);
-
-        for (i = 0; i < l1; i++) {
-            AS_SYMBOL(keys)[i] = AS_SYMBOL(AS_LIST(*env_slot)[0])[i];
-            AS_LIST(vals)[i] = clone_obj(AS_LIST(AS_LIST(*env_slot)[1])[i]);
-        }
-
-        for (i = 0; i < l2; i++) {
-            AS_SYMBOL(keys)[i + l1] = AS_SYMBOL(AS_LIST(obj)[0])[i];
-            AS_LIST(vals)[i + l1] = clone_obj(AS_LIST(AS_LIST(obj)[1])[i]);
-        }
-
-        drop_obj(*env_slot);
-    } else {
-        keys = clone_obj(AS_LIST(obj)[0]);
-        vals = clone_obj(AS_LIST(obj)[1]);
-    }
-
-    *env_slot = dict(keys, vals);
-
-    return NULL_OBJ;
-}
-
-obj_p unmount_env(i64_t n) {
-    obj_p *env_slot;
-    i64_t i, l;
-    vm_p vm = VM;
-
-    env_slot = &vm->env;
-
-    if (*env_slot == NULL_OBJ)
-        return NULL_OBJ;
-
-    if (ops_count(*env_slot) == n) {
-        drop_obj(*env_slot);
-        *env_slot = NULL_OBJ;
-    } else {
-        l = AS_LIST(*env_slot)[0]->len;
-        resize_obj(&AS_LIST(*env_slot)[0], l - n);
-
-        for (i = l; i > l - n; i--)
-            drop_obj(AS_LIST(AS_LIST(*env_slot)[1])[i - 1]);
-
-        resize_obj(&AS_LIST(*env_slot)[1], l - n);
-    }
-
-    return NULL_OBJ;
 }
 
 // ============================================================================

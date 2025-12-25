@@ -177,6 +177,7 @@ obj_p get_gvals(obj_p obj) {
 }
 
 nil_t query_ctx_init(query_ctx_p ctx) {
+    vm_p vm = VM;
     ctx->tablen = 0;
     ctx->table = NULL_OBJ;
     ctx->take = NULL_OBJ;
@@ -186,12 +187,12 @@ nil_t query_ctx_init(query_ctx_p ctx) {
     ctx->query_fields = NULL_OBJ;
     ctx->query_values = NULL_OBJ;
     ctx->group_index = NULL_OBJ;
-    ctx->parent = runtime_get()->query_ctx;
-    runtime_get()->query_ctx = ctx;
+    ctx->parent = vm->query_ctx;
+    vm->query_ctx = ctx;
 }
 
 nil_t query_ctx_destroy(query_ctx_p ctx) {
-    runtime_get()->query_ctx = ctx->parent;
+    VM->query_ctx = ctx->parent;
 
     drop_obj(ctx->table);
     drop_obj(ctx->take);
@@ -272,7 +273,6 @@ obj_p select_apply_filters(obj_p obj, query_ctx_p ctx) {
 }
 
 obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
-    i64_t tablen;
     obj_p prm, val, gkeys = NULL_OBJ, gvals = NULL_OBJ, groupby = NULL_OBJ, gcol = NULL_OBJ;
 
     prm = at_sym(obj, "by", 2);
@@ -288,10 +288,6 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
             gvals = eval(gkeys);
 
         drop_obj(prm);
-
-        tablen = ctx->tablen;
-        unmount_env(ctx->tablen);
-        ctx->tablen = 0;
 
         if (IS_ERR(groupby)) {
             drop_obj(gkeys);
@@ -313,9 +309,9 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
             return prm;
         }
 
-        mount_env(prm);
-        ctx->tablen = tablen;
-        drop_obj(prm);
+        // Replace table with remapped table for column resolution
+        drop_obj(ctx->table);
+        ctx->table = prm;
 
         if (IS_ERR(gcol)) {
             drop_obj(gkeys);
@@ -328,19 +324,15 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
 
         timeit_span_end("group");
     } else if (ctx->filter != NULL_OBJ) {
-        // Unmount table columns from a local env
-        tablen = ctx->tablen;
-        unmount_env(ctx->tablen);
-        ctx->tablen = 0;
-
+        // Remap filtered table for column resolution
         val = remap_filter(ctx->table, ctx->filter);
 
         if (IS_ERR(val))
             return val;
 
-        mount_env(val);
-        ctx->tablen = tablen;
-        drop_obj(val);
+        // Replace table with filtered table
+        drop_obj(ctx->table);
+        ctx->table = val;
     }
 
     return NULL_OBJ;
@@ -561,13 +553,10 @@ obj_p ray_select(obj_p obj) {
 
     timeit_span_start("select");
 
-    // Fetch table
+    // Fetch table - ctx.table is set, resolve() will find columns via query_ctx
     res = select_fetch_table(obj, &ctx);
     if (IS_ERR(res))
         goto cleanup;
-
-    // Mount table columns to a local env
-    mount_env(ctx.table);
 
     // Apply filters
     res = select_apply_filters(obj, &ctx);
@@ -593,7 +582,6 @@ obj_p ray_select(obj_p obj) {
     res = select_build_table(&ctx);
 
 cleanup:
-    unmount_env(ctx.tablen);
     query_ctx_destroy(&ctx);
     timeit_span_end("select");
 

@@ -32,6 +32,9 @@
 #include "util.h"
 #include "heap.h"
 
+// Forward declaration for query context (defined in query.h)
+struct query_ctx_t;
+
 #define VM_STACK_SIZE 1024
 
 // Bytecode opcodes - grouped by category
@@ -88,10 +91,11 @@ typedef struct vm_t {
     obj_p ps[VM_STACK_SIZE] __attribute__((aligned(64)));  // program stack
     ctx_t rs[VM_STACK_SIZE] __attribute__((aligned(64)));  // return stack
     // === COLD section ===
-    obj_p nfo;         // error source info
-    obj_p trace;       // error stack trace
-    timeit_t *timeit;  // timeit (lazy allocated)
-    b8_t rc_sync;      // use atomic RC (multi-threaded mode)
+    obj_p nfo;                      // error source info
+    obj_p trace;                    // error stack trace
+    timeit_t *timeit;               // timeit (lazy allocated)
+    struct query_ctx_t *query_ctx;  // query context stack (for table column resolution)
+    b8_t rc_sync;                   // use atomic RC (multi-threaded mode)
 } __attribute__((aligned(64))) * vm_p;
 
 // Thread-local VM pointer
@@ -119,8 +123,6 @@ obj_p call(obj_p obj, i64_t arity);  // Call a compiled lambda
 // Symbol resolution
 obj_p *resolve(i64_t sym);
 obj_p amend(obj_p sym, obj_p val);
-obj_p mount_env(obj_p obj);
-obj_p unmount_env(i64_t n);
 
 // Environment management
 obj_p vm_env_get(nil_t);

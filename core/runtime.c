@@ -152,7 +152,6 @@ runtime_p runtime_create(i32_t argc, str_p argv[]) {
     __RUNTIME->env = env_create();
     __RUNTIME->fdmaps = dict(I64(0), LIST(0));
     __RUNTIME->args = NULL_OBJ;
-    __RUNTIME->query_ctx = NULL;
     __RUNTIME->pool = pool;
     __RUNTIME->dynlibs = I64(0);
     __RUNTIME->sys_info = si;

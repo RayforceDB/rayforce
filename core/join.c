@@ -33,6 +33,7 @@
 #include "filter.h"
 #include "aggr.h"
 #include "order.h"
+#include "query.h"
 
 obj_p select_column(obj_p left_col, obj_p right_col, i64_t ids[], i64_t len) {
     i64_t i;
@@ -407,7 +408,11 @@ static obj_p __window_join(obj_p *x, i64_t n, i64_t tp) {
     drop_obj(wjkr);
 
     rtab = group_map(jtab, idx);
-    mount_env(rtab);
+
+    // Use query context for column resolution during aggregation
+    struct query_ctx_t ctx;
+    query_ctx_init(&ctx);
+    ctx.table = rtab;
 
     l = ops_count(x[4]);
     agrvals = LIST(l);
@@ -415,10 +420,13 @@ static obj_p __window_join(obj_p *x, i64_t n, i64_t tp) {
     for (i = 0; i < l; i++) {
         v = eval(AS_LIST(AS_LIST(x[4])[1])[i]);
         if (IS_ERR(v)) {
-            unmount_env(AS_LIST(jtab)[0]->len);
+            ctx.table = NULL_OBJ;
+            query_ctx_destroy(&ctx);
             agrvals->len = i;
             drop_obj(agrvals);
             drop_obj(rtab);
+            drop_obj(jtab);
+            drop_obj(idx);
             return v;
         }
 
@@ -442,16 +450,21 @@ static obj_p __window_join(obj_p *x, i64_t n, i64_t tp) {
         }
 
         if (IS_ERR(v)) {
+            ctx.table = NULL_OBJ;
+            query_ctx_destroy(&ctx);
             agrvals->len = i;
             drop_obj(agrvals);
             drop_obj(rtab);
+            drop_obj(jtab);
+            drop_obj(idx);
             return v;
         }
 
         AS_LIST(agrvals)[i] = v;
     }
 
-    unmount_env(AS_LIST(jtab)[0]->len);
+    ctx.table = NULL_OBJ;
+    query_ctx_destroy(&ctx);
     drop_obj(rtab);
     drop_obj(jtab);
 

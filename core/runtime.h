@@ -45,7 +45,6 @@ typedef struct runtime_t {
     symbols_p symbols;      // vector_symbols pool.
     poll_p poll;            // I/O event loop handle.
     obj_p fdmaps;           // File descriptors mappings.
-    query_ctx_p query_ctx;  // Query context stack.
     pool_p pool;            // Executors pool.
     obj_p dynlibs;          // Dynamic libraries.
 } *runtime_p;

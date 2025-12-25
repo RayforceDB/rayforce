@@ -936,9 +936,10 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
 }
 
 obj_p ray_update(obj_p obj) {
-    i64_t i, keyslen, tablen;
+    i64_t i, keyslen;
     obj_p tabsym, keys = NULL_OBJ, vals = NULL_OBJ, filters = NULL_OBJ, bins = NULL_OBJ, groupby = NULL_OBJ, tab, sym,
-                  prm, val;
+                  prm, val, res;
+    struct query_ctx_t ctx;
 
     if (obj->type != TYPE_DICT)
         return ray_err(ERR_LEN);
@@ -983,9 +984,9 @@ obj_p ray_update(obj_p obj) {
         return ray_err(ERR_LEN);
     }
 
-    // Mount table columns to a local env
-    tablen = AS_LIST(tab)[0]->len;
-    mount_env(tab);
+    // Initialize query context - table columns available via resolve()
+    query_ctx_init(&ctx);
+    ctx.table = tab;
 
     // Apply filters
     prm = at_sym(obj, "where", 5);
@@ -993,17 +994,16 @@ obj_p ray_update(obj_p obj) {
         val = eval(prm);
         drop_obj(prm);
         if (IS_ERR(val)) {
-            drop_obj(tabsym);
-            drop_obj(tab);
-            return val;
+            res = val;
+            goto cleanup;
         }
 
         filters = ray_where(val);
         drop_obj(val);
         if (IS_ERR(filters)) {
-            drop_obj(tabsym);
-            drop_obj(tab);
-            return filters;
+            res = filters;
+            filters = NULL_OBJ;
+            goto cleanup;
         }
     }
 
@@ -1013,12 +1013,10 @@ obj_p ray_update(obj_p obj) {
         groupby = eval(prm);
         drop_obj(prm);
 
-        unmount_env(tablen);
-
         if (IS_ERR(groupby)) {
-            drop_obj(tabsym);
-            drop_obj(tab);
-            return groupby;
+            res = groupby;
+            groupby = NULL_OBJ;
+            goto cleanup;
         }
 
         bins = index_group(groupby, filters);
@@ -1026,22 +1024,21 @@ obj_p ray_update(obj_p obj) {
         drop_obj(bins);
 
         if (IS_ERR(prm)) {
-            drop_obj(tabsym);
-            drop_obj(tab);
-            drop_obj(filters);
-            drop_obj(groupby);
-            return prm;
+            res = prm;
+            goto cleanup;
         }
 
-        mount_env(prm);
-        drop_obj(prm);
+        // Replace table with grouped table for column resolution
+        ctx.table = prm;
     } else if (filters != NULL_OBJ) {
-        // Unmount table columns from a local env
-        unmount_env(tablen);
-        // Create filtermaps over table
+        // Remap filtered table for column resolution
         val = remap_filter(tab, filters);
-        mount_env(val);
-        drop_obj(val);
+        if (IS_ERR(val)) {
+            res = val;
+            goto cleanup;
+        }
+        // Replace table with filtered table (keep original tab for __update_table)
+        ctx.table = val;
     }
 
     // Apply mappings
@@ -1055,13 +1052,8 @@ obj_p ray_update(obj_p obj) {
 
         if (IS_ERR(val)) {
             vals->len = i;
-            drop_obj(tabsym);
-            drop_obj(vals);
-            drop_obj(tab);
-            drop_obj(keys);
-            drop_obj(groupby);
-
-            return val;
+            res = val;
+            goto cleanup;
         }
 
         // Materialize fields
@@ -1081,21 +1073,34 @@ obj_p ray_update(obj_p obj) {
 
         if (IS_ERR(val)) {
             vals->len = i;
-            drop_obj(tabsym);
-            drop_obj(vals);
-            drop_obj(tab);
-            drop_obj(keys);
-            drop_obj(groupby);
-
-            return val;
+            res = val;
+            goto cleanup;
         }
 
         AS_LIST(vals)[i] = val;
     }
 
-    unmount_env(tablen);
+    // Drop remapped table if different from original
+    if (ctx.table != tab)
+        drop_obj(ctx.table);
+    ctx.table = NULL_OBJ;
     drop_obj(tab);
+
+    query_ctx_destroy(&ctx);
 
     // This one will take care of dropping all the arguments
     return __update_table(tabsym, keys, vals, filters, groupby);
+
+cleanup:
+    if (ctx.table != tab && ctx.table != NULL_OBJ)
+        drop_obj(ctx.table);
+    ctx.table = NULL_OBJ;
+    query_ctx_destroy(&ctx);
+    drop_obj(tabsym);
+    drop_obj(tab);
+    drop_obj(keys);
+    drop_obj(vals);
+    drop_obj(filters);
+    drop_obj(groupby);
+    return res;
 }
