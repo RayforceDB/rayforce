@@ -639,20 +639,13 @@ obj_p call(obj_p fn, i64_t arity) {
     obj_p saved_fn = vm->fn;
     i64_t saved_fp = vm->fp;
     obj_p saved_env = vm->env;
-    obj_p compiled_fn = fn;
-    b8_t need_drop = B8_FALSE;
     UNUSED(arity);
 
-    // Compile if not already compiled
+    // Compile on first call - bytecode is cached in the lambda for reuse
     if (lam->bc == NULL_OBJ) {
-        // Clone the lambda before compiling to avoid modifying the AST
-        compiled_fn = lambda(clone_obj(lam->args), clone_obj(lam->body), clone_obj(lam->nfo));
-        res = cc_compile(compiled_fn);
-        if (IS_ERR(res)) {
-            drop_obj(compiled_fn);
+        res = cc_compile(fn);
+        if (IS_ERR(res))
             return res;
-        }
-        need_drop = B8_TRUE;
     }
 
     // Push to return stack - this lets resolve() find parent scope
@@ -663,17 +656,13 @@ obj_p call(obj_p fn, i64_t arity) {
     vm->rp++;
 
     // Execute bytecode
-    res = vm_eval(compiled_fn);
+    res = vm_eval(fn);
 
     // Pop frame and restore context
     vm->rp--;
     vm->fn = saved_fn;
     vm->fp = saved_fp;
     vm->env = saved_env;
-
-    // Drop the compiled copy if we created one
-    if (need_drop)
-        drop_obj(compiled_fn);
 
     return res;
 }
