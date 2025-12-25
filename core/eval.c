@@ -999,6 +999,9 @@ obj_p eval_str_w_attr(lit_p str, i64_t len, obj_p nfo_arg) {
     if (vm)
         vm->nfo = saved_nfo;
 
+    // Drop nfo_arg - we own it and are done with it
+    drop_obj(nfo_arg);
+
     timeit_span_end("top-level");
 
     return res;

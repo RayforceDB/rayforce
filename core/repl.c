@@ -168,8 +168,10 @@ repl_p repl_create(poll_p poll, b8_t silent) {
             return NULL;
         }
     } else {
-        // stdin is not a TTY, skip registration (non-interactive mode)
-        repl->id = 0;
+        // stdin is not a TTY, no point in creating a REPL
+        // Clean up and return NULL to avoid memory leak
+        repl_destroy(repl);
+        return NULL;
     }
 #endif
 
