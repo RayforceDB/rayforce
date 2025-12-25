@@ -159,12 +159,12 @@ static i64_t cc_call(cc_ctx_t *cc, obj_p expr, obj_p *lst, i64_t n) {
     }
 
     // Handle binary special forms (set, let, try)
-    // First argument is passed unevaluated, second is evaluated normally
+    // Both arguments are passed unevaluated - let special form decide
     if (is_binary_special_form(car) && n == 2) {
         // First arg: push as constant (no dereference)
         CE(cc_const(cc, lst[0]));
-        // Second arg: compile normally
-        CE(cc_expr(cc, lst[1]));
+        // Second arg: push as constant (let special form decide)
+        CE(cc_const(cc, lst[1]));
         // Record debug info and emit call
         DBG(cc, expr);
         CC(cc, clone_obj(car));
@@ -245,6 +245,7 @@ static i64_t cc_expr(cc_ctx_t *cc, obj_p e) {
             i = find_raw(cc->args, &e->i64);
             if (i == NULL_I64 || i >= cc->args->len) {
                 // Not a local - push symbol and dereference
+                DBG(cc, e);  // Record debug info for symbol resolution errors
                 CC(cc, clone_obj(e));
                 OP(cc, OP_DEREF);
             } else {

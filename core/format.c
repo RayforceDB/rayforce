@@ -451,7 +451,8 @@ static i64_t fmt_underline(obj_p *dst, i64_t gutter_width, u16_t start_col, u16_
         n += str_fmt_into(dst, NO_LIMIT, " ");
 
     // The underline itself: ^~~~
-    span_len = (end_col > start_col) ? (end_col - start_col) : 1;
+    // span_len is inclusive of both endpoints: end_col - start_col + 1
+    span_len = (end_col >= start_col) ? (end_col - start_col + 1) : 1;
     n += str_fmt_into(dst, NO_LIMIT, "%s^", MAGENTA);
     for (i = 1; i < span_len; i++)
         n += str_fmt_into(dst, NO_LIMIT, "~");

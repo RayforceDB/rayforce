@@ -34,6 +34,7 @@ typedef struct lambda_f {
     obj_p bc;      // bytecode (U8 vector)
     obj_p consts;  // constants pool (LIST)
     obj_p dbg;     // debug info (maps bytecode offset -> span)
+    obj_p env;     // local environment dict (symbols -> values) for resolve()
 } *lambda_p;
 
 #define AS_LAMBDA(o) ((lambda_p)(AS_C8(o)))

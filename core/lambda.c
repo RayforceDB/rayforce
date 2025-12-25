@@ -45,6 +45,7 @@ obj_p lambda(obj_p args, obj_p body, obj_p nfo) {
     f->bc = NULL_OBJ;      // Bytecode (compiled on first call)
     f->consts = NULL_OBJ;  // Constants pool
     f->dbg = NULL_OBJ;     // Debug info (bytecode offset -> span)
+    f->env = NULL_OBJ;     // Local env for resolve() (args + let-bound locals)
 
     return obj;
 }

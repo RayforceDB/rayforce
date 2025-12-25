@@ -104,7 +104,7 @@ nil_t vm_env_unset(vm_p vm) {
 obj_p *resolve(i64_t sym) {
     i64_t j, *args;
     obj_p fn, env;
-    i64_t i, l, n;
+    i64_t i, l, n, frame;
     vm_p vm = VM;
 
     fn = vm->fn;
@@ -118,7 +118,7 @@ obj_p *resolve(i64_t sym) {
     if (sym == SYMBOL_SELF)
         return &vm->fn;
 
-    // Search in function arguments (on stack)
+    // Search in current function arguments (on stack) - fast path for bytecode
     if (fn != NULL_OBJ && AS_LAMBDA(fn)->args != NULL_OBJ) {
         l = AS_LAMBDA(fn)->args->len;
         args = AS_SYMBOL(AS_LAMBDA(fn)->args);
@@ -128,7 +128,46 @@ obj_p *resolve(i64_t sym) {
         }
     }
 
-    // Search in local environment
+    // Search in current lambda's env (let-bound locals)
+    if (fn != NULL_OBJ) {
+        env = AS_LAMBDA(fn)->env;
+        if (env != NULL_OBJ && env->type == TYPE_DICT) {
+            n = AS_LIST(env)[0]->len;
+            for (i = n; i > 0; i--) {
+                if (AS_SYMBOL(AS_LIST(env)[0])[i - 1] == sym)
+                    return &AS_LIST(AS_LIST(env)[1])[i - 1];
+            }
+        }
+    }
+
+    // Walk up return stack - check each parent lambda's args and env
+    for (frame = vm->rp; frame > 0; frame--) {
+        fn = vm->rs[frame - 1].fn;
+        if (fn == NULL_OBJ)
+            continue;
+
+        // Check parent's args (using parent's fp)
+        if (AS_LAMBDA(fn)->args != NULL_OBJ) {
+            l = AS_LAMBDA(fn)->args->len;
+            args = AS_SYMBOL(AS_LAMBDA(fn)->args);
+            for (i = 0; i < l; i++) {
+                if (args[i] == sym)
+                    return &vm->ps[vm->rs[frame - 1].fp + i];
+            }
+        }
+
+        // Check parent's env (let-bound locals)
+        env = AS_LAMBDA(fn)->env;
+        if (env != NULL_OBJ && env->type == TYPE_DICT) {
+            n = AS_LIST(env)[0]->len;
+            for (i = n; i > 0; i--) {
+                if (AS_SYMBOL(AS_LIST(env)[0])[i - 1] == sym)
+                    return &AS_LIST(AS_LIST(env)[1])[i - 1];
+            }
+        }
+    }
+
+    // Search in vm->env (for query table mounting)
     env = vm->env;
     if (env != NULL_OBJ && env->type == TYPE_DICT) {
         n = AS_LIST(env)[0]->len;
@@ -150,7 +189,13 @@ obj_p amend(obj_p sym, obj_p val) {
     obj_p *env_slot;
     vm_p vm = VM;
 
-    env_slot = &vm->env;
+    // Add to current lambda's env (not vm->env)
+    if (vm->fn != NULL_OBJ) {
+        env_slot = &AS_LAMBDA(vm->fn)->env;
+    } else {
+        // Fallback to vm->env if no current lambda
+        env_slot = &vm->env;
+    }
 
     if (*env_slot != NULL_OBJ)
         set_obj(env_slot, sym, clone_obj(val));
@@ -347,11 +392,19 @@ __attribute__((hot)) obj_p vm_eval(obj_p fn) {
 
 OP_RET:
     if (vm->rp != 0) {
-        // Return from nested call
+        rs = &vm->rs[vm->rp - 1];
+        // Check for external call marker (ip == -1)
+        if (rs->ip == -1) {
+            // Return to external caller (call() function)
+            // Don't clean up args - caller (lambda_call) handles that
+            // Just return the result; leave args on stack for caller to pop
+            return pop();
+        }
+        // Return from nested bytecode call
         r = pop();
         while (vm->sp > vm->fp)
             drop_obj(pop());
-        rs = &vm->rs[--vm->rp];
+        vm->rp--;
         ip = rs->ip;
         vm->fp = rs->fp;
         vm->fn = rs->fn;
@@ -396,7 +449,7 @@ OP_DEREF:
     if (val == NULL) {
         r = ray_err(ERR_EVAL);
         drop_obj(x);
-        bc_error_add_loc(r, vm->fn, ip);
+        bc_error_add_loc(r, vm->fn, ip - 1);
         return r;
     }
     y = clone_obj(*val);
@@ -412,7 +465,7 @@ OP_CALF1:
     drop_obj(x);
     drop_obj(y);
     if (IS_ERR(r)) {
-        bc_error_add_loc(r, vm->fn, ip);
+        bc_error_add_loc(r, vm->fn, ip - 1);
         return r;
     }
     push(r);
@@ -427,7 +480,7 @@ OP_CALF2:
     drop_obj(y);
     drop_obj(r);
     if (IS_ERR(res)) {
-        bc_error_add_loc(res, vm->fn, ip);
+        bc_error_add_loc(res, vm->fn, ip - 1);
         return res;
     }
     push(res);
@@ -443,7 +496,7 @@ OP_CALF0:
     vm->sp -= n;
     drop_obj(r);
     if (IS_ERR(res)) {
-        bc_error_add_loc(res, vm->fn, ip);
+        bc_error_add_loc(res, vm->fn, ip - 1);
         return res;
     }
     push(res);
@@ -454,7 +507,7 @@ OP_CALFN:
     if (x->type != TYPE_LAMBDA) {
         drop_obj(x);
         r = ray_err(ERR_TYPE);
-        bc_error_add_loc(r, vm->fn, ip);
+        bc_error_add_loc(r, vm->fn, ip - 1);
         return r;
     }
 callfn:
@@ -463,7 +516,7 @@ callfn:
         r = cc_compile(x);
         if (IS_ERR(r)) {
             drop_obj(x);
-            bc_error_add_loc(r, vm->fn, ip);
+            bc_error_add_loc(r, vm->fn, ip - 1);
             return r;
         }
     }
@@ -499,7 +552,7 @@ OP_CALFD:
             if (n != 1) {
                 drop_obj(x);
                 r = ray_err(ERR_ARITY);
-                bc_error_add_loc(r, vm->fn, ip);
+                bc_error_add_loc(r, vm->fn, ip - 1);
                 return r;
             }
             y = pop();
@@ -507,7 +560,7 @@ OP_CALFD:
             drop_obj(y);
             drop_obj(x);
             if (IS_ERR(r)) {
-                bc_error_add_loc(r, vm->fn, ip);
+                bc_error_add_loc(r, vm->fn, ip - 1);
                 return r;
             }
             push(r);
@@ -516,7 +569,7 @@ OP_CALFD:
             if (n != 2) {
                 drop_obj(x);
                 r = ray_err(ERR_ARITY);
-                bc_error_add_loc(r, vm->fn, ip);
+                bc_error_add_loc(r, vm->fn, ip - 1);
                 return r;
             }
             y = pop();
@@ -526,7 +579,7 @@ OP_CALFD:
             drop_obj(y);
             drop_obj(x);
             if (IS_ERR(res)) {
-                bc_error_add_loc(res, vm->fn, ip);
+                bc_error_add_loc(res, vm->fn, ip - 1);
                 return res;
             }
             push(res);
@@ -539,7 +592,7 @@ OP_CALFD:
             vm->sp -= n;
             drop_obj(x);
             if (IS_ERR(r)) {
-                bc_error_add_loc(r, vm->fn, ip);
+                bc_error_add_loc(r, vm->fn, ip - 1);
                 return r;
             }
             push(r);
@@ -549,7 +602,7 @@ OP_CALFD:
         default:
             drop_obj(x);
             r = ray_err(ERR_TYPE);
-            bc_error_add_loc(r, vm->fn, ip);
+            bc_error_add_loc(r, vm->fn, ip - 1);
             return r;
     }
     next();
@@ -569,6 +622,7 @@ obj_p call(obj_p fn, i64_t arity) {
     obj_p res;
     vm_p vm = VM;
     obj_p saved_fn = vm->fn;
+    i64_t saved_fp = vm->fp;
     obj_p saved_env = vm->env;
     obj_p compiled_fn = fn;
     b8_t need_drop = B8_FALSE;
@@ -577,8 +631,6 @@ obj_p call(obj_p fn, i64_t arity) {
     // Compile if not already compiled
     if (lam->bc == NULL_OBJ) {
         // Clone the lambda before compiling to avoid modifying the AST
-        // This is necessary because the lambda might be part of the parsed AST
-        // which will be dropped after evaluation
         compiled_fn = lambda(clone_obj(lam->args), clone_obj(lam->body), clone_obj(lam->nfo));
         res = cc_compile(compiled_fn);
         if (IS_ERR(res)) {
@@ -588,13 +640,21 @@ obj_p call(obj_p fn, i64_t arity) {
         need_drop = B8_TRUE;
     }
 
+    // Push to return stack - this lets resolve() find parent scope
+    // ip = -1 marks this as an external call (OP_RET will return to vm_eval top level)
+    vm->rs[vm->rp].fn = saved_fn;
+    vm->rs[vm->rp].fp = saved_fp;
+    vm->rs[vm->rp].env = saved_env;
+    vm->rs[vm->rp].ip = -1;  // External call marker
+    vm->rp++;
+
     // Execute bytecode
-    // Note: arguments are already on the stack, pushed by caller
-    // Caller is responsible for cleanup after we return
     res = vm_eval(compiled_fn);
 
-    // Restore previous context for tree-walking eval
+    // Pop frame and restore context
+    vm->rp--;
     vm->fn = saved_fn;
+    vm->fp = saved_fp;
     vm->env = saved_env;
 
     // Drop the compiled copy if we created one

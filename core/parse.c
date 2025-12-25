@@ -1135,7 +1135,12 @@ nil_t skip_whitespaces(parser_t *parser) {
                 parser->current++;
                 parser->column++;
             }
-            parser->current++;
+            // Skip the newline after comment and update line/column
+            if (*parser->current == '\n') {
+                parser->current++;
+                parser->line++;
+                parser->column = 0;
+            }
         } else
             break;
     }

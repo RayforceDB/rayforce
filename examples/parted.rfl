@@ -1,4 +1,4 @@
-(set n 10000000)
+(set n 10)
 (set tabname "a")
 (set dbpath "/tmp/db")
 (set sympath (format "%/sym" dbpath))
@@ -7,7 +7,7 @@
         (let p (format "%/%/%/" dbpath (+ 2024.01.01 x) tabname))
         (println "Creating table: %" p)
         (let t (table [OrderId Symbol Price Size Tape Timestamp] 
-            (list (take (guid 1000000) n)
+            (list (take (guid n) n)
                   (take [AAPL GOOG MSFT IBM AMZN FB BABA] n) 
                   (as 'F64 (+ x (til n))) 
                   (take (+ x (til 3)) n)
@@ -20,7 +20,7 @@
     )
 )
 
-(map gen-tab (til 50))
+(map gen-tab (til 5))
 
 (println "Done.")
 (exit 0)
