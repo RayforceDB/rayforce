@@ -24,13 +24,11 @@
 #include "cc.h"
 #include "eval.h"
 #include "ops.h"
-#include "error.h"
-#include "symbols.h"
 #include "format.h"
 #include "cond.h"
 #include "vary.h"
 #include "nfo.h"
-#include "runtime.h"
+#include "env.h"
 
 // Add location info from compiler context when a compile error occurs
 static nil_t cc_error_add_loc(cc_ctx_t *cc) {

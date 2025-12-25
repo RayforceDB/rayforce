@@ -394,7 +394,7 @@ OP_POP:
 OP_RESOLVE:
     x = pop();
     val = resolve(x->i64);
-    if (val == NULL) {
+    if (UNLIKELY(val == NULL)) {
         r = ray_err(ERR_EVAL);
         drop_obj(x);
         bc_error_add_loc(r, vm->fn, ip - 1);
@@ -412,7 +412,7 @@ OP_CALL1:
     r = unary_call(y, x);
     drop_obj(x);
     drop_obj(y);
-    if (IS_ERR(r)) {
+    if (UNLIKELY(IS_ERR(r))) {
         bc_error_add_loc(r, vm->fn, ip - 1);
         return r;
     }
@@ -427,7 +427,7 @@ OP_CALL2:
     drop_obj(x);
     drop_obj(y);
     drop_obj(r);
-    if (IS_ERR(res)) {
+    if (UNLIKELY(IS_ERR(res))) {
         bc_error_add_loc(res, vm->fn, ip - 1);
         return res;
     }
@@ -443,7 +443,7 @@ OP_CALLN:
         drop_obj(l[i]);
     vm->sp -= n;
     drop_obj(r);
-    if (IS_ERR(res)) {
+    if (UNLIKELY(IS_ERR(res))) {
         bc_error_add_loc(res, vm->fn, ip - 1);
         return res;
     }
@@ -452,7 +452,7 @@ OP_CALLN:
 
 OP_CALLF:
     x = pop();  // lambda function
-    if (x->type != TYPE_LAMBDA) {
+    if (UNLIKELY(x->type != TYPE_LAMBDA)) {
         drop_obj(x);
         r = ray_err(ERR_TYPE);
         bc_error_add_loc(r, vm->fn, ip - 1);
@@ -460,9 +460,9 @@ OP_CALLF:
     }
 callf:
     // Compile if not already compiled
-    if (AS_LAMBDA(x)->bc == NULL_OBJ) {
+    if (UNLIKELY(AS_LAMBDA(x)->bc == NULL_OBJ)) {
         r = cc_compile(x);
-        if (IS_ERR(r)) {
+        if (UNLIKELY(IS_ERR(r))) {
             drop_obj(x);
             bc_error_add_loc(r, vm->fn, ip - 1);
             return r;
@@ -497,7 +497,7 @@ OP_CALLD:
     x = pop();     // function (dynamically resolved)
     switch (x->type) {
         case TYPE_UNARY:
-            if (n != 1) {
+            if (UNLIKELY(n != 1)) {
                 drop_obj(x);
                 r = ray_err(ERR_ARITY);
                 bc_error_add_loc(r, vm->fn, ip - 1);
@@ -507,14 +507,14 @@ OP_CALLD:
             r = unary_call(x, y);
             drop_obj(y);
             drop_obj(x);
-            if (IS_ERR(r)) {
+            if (UNLIKELY(IS_ERR(r))) {
                 bc_error_add_loc(r, vm->fn, ip - 1);
                 return r;
             }
             push(r);
             break;
         case TYPE_BINARY:
-            if (n != 2) {
+            if (UNLIKELY(n != 2)) {
                 drop_obj(x);
                 r = ray_err(ERR_ARITY);
                 bc_error_add_loc(r, vm->fn, ip - 1);
@@ -526,7 +526,7 @@ OP_CALLD:
             drop_obj(r);
             drop_obj(y);
             drop_obj(x);
-            if (IS_ERR(res)) {
+            if (UNLIKELY(IS_ERR(res))) {
                 bc_error_add_loc(res, vm->fn, ip - 1);
                 return res;
             }
@@ -539,7 +539,7 @@ OP_CALLD:
                 drop_obj(l[i]);
             vm->sp -= n;
             drop_obj(x);
-            if (IS_ERR(r)) {
+            if (UNLIKELY(IS_ERR(r))) {
                 bc_error_add_loc(r, vm->fn, ip - 1);
                 return r;
             }

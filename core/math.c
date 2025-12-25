@@ -38,7 +38,7 @@
     ({                                                          \
         __BASE_##lt##_t *__restrict__ $lhs = __AS_##lt(x) + of; \
         __BASE_##lt##_t $out = iv;                              \
-        vfor for (i64_t $i = 0; $i < ln; $i++)                  \
+        for (i64_t $i = 0; $i < ln; $i++)                       \
             $out = op($out, $lhs[$i]);                          \
         ot(lt##_to_##ot($out));                                 \
     })
@@ -47,7 +47,7 @@
     ({                                                  \
         lt##_t *__restrict__ $lhs = __AS_##lt(x) + of;  \
         ot##_t *__restrict__ $out = __AS_##lt(ov) + of; \
-        vfor for (i64_t $i = 0; $i < ln; $i++)          \
+        for (i64_t $i = 0; $i < ln; $i++)               \
             $out[$i] = op($lhs[$i]);                    \
         NULL_OBJ;                                       \
     })
@@ -59,7 +59,7 @@
         __BASE_##lt##_t $x_val = x->__BASE_##lt;                                       \
         $rhs = __AS_##rt(y) + of;                                                      \
         $out = __AS_##ot(ov) + of;                                                     \
-        vfor for (i64_t $i = 0; $i < ln; $i++)                                         \
+        for (i64_t $i = 0; $i < ln; $i++)                                              \
             $out[$i] = mt##_to_##ot(op(lt##_to_##mt($x_val), rt##_to_##mt($rhs[$i]))); \
         NULL_OBJ;                                                                      \
     })
@@ -71,7 +71,7 @@
         __BASE_##rt##_t $y_val = y->__BASE_##rt;                                       \
         $lhs = __AS_##lt(x) + of;                                                      \
         $out = __AS_##ot(ov) + of;                                                     \
-        vfor for (i64_t $i = 0; $i < ln; $i++)                                         \
+        for (i64_t $i = 0; $i < ln; $i++)                                              \
             $out[$i] = mt##_to_##ot(op(lt##_to_##mt($lhs[$i]), rt##_to_##mt($y_val))); \
         NULL_OBJ;                                                                      \
     })
@@ -84,7 +84,7 @@
         $lhs = __AS_##lt(x) + of;                                                        \
         $rhs = __AS_##rt(y) + of;                                                        \
         $out = __AS_##ot(ov) + of;                                                       \
-        vfor for (i64_t $i = 0; $i < ln; $i++)                                           \
+        for (i64_t $i = 0; $i < ln; $i++)                                                \
             $out[$i] = mt##_to_##ot(op(lt##_to_##mt($lhs[$i]), rt##_to_##mt($rhs[$i]))); \
         NULL_OBJ;                                                                        \
     })

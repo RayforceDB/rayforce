@@ -42,16 +42,6 @@
 #define LIKELY(x) __builtin_expect((x), 1)
 #define UNLIKELY(x) __builtin_expect((x), 0)
 
-// Vectorization hint for hot loops - use before for/while loops
-// Example: vfor for (i = 0; i < n; i++) { ... }
-#ifdef __clang__
-#define vfor _Pragma("clang loop vectorize(enable)")
-#elif defined(__GNUC__)
-#define vfor _Pragma("GCC ivdep")
-#else
-#define vfor
-#endif
-
 #ifdef DEBUG
 
 #ifdef __clang__
