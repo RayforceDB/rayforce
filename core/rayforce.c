@@ -2994,6 +2994,6 @@ str_p type_name(i8_t type) { return str_from_symbol(env_get_typename_by_type(&ru
 
 obj_p parse_str(lit_p str) { return parse(str, strlen(str), NULL_OBJ); }
 
-b8_t rc_sync_get() { return VM->rc_sync; }
+i64_t rc_sync_get() { return VM->rc_sync; }
 
-nil_t rc_sync_set(b8_t on) { VM->rc_sync = on; }
+nil_t rc_sync_set(i64_t on) { VM->rc_sync = on; }

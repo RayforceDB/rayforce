@@ -173,7 +173,7 @@ raw_p executor_run(raw_p arg) {
 
     // Create VM (which also creates heap) with pool pointer
     vm = vm_create(executor->id, executor->pool);
-    vm->rc_sync = B8_TRUE;  // Enable atomic RC for worker threads
+    vm->rc_sync = 1;  // Enable atomic RC for worker threads
 
     __atomic_store_n(&executor->heap, vm->heap, __ATOMIC_RELAXED);
     __atomic_store_n(&executor->vm, vm, __ATOMIC_RELAXED);
@@ -300,12 +300,9 @@ pool_p pool_get(nil_t) { return runtime_get()->pool; }
 
 nil_t pool_prepare(pool_p pool) {
     i64_t i, n;
-    obj_p env;
 
     if (pool == NULL)
         PANIC("Pool prepare: pool is NULL");
-
-    env = vm_env_get();
 
     mutex_lock(&pool->mutex);
 
@@ -315,7 +312,6 @@ nil_t pool_prepare(pool_p pool) {
     n = pool->executors_count;
     for (i = 0; i < n; i++) {
         heap_borrow(pool->executors[i].heap);
-        vm_env_set(pool->executors[i].vm, clone_obj(env));
     }
 
     mutex_unlock(&pool->mutex);
@@ -379,7 +375,7 @@ obj_p pool_run(pool_p pool) {
 
     mutex_lock(&pool->mutex);
 
-    rc_sync_set(B8_TRUE);
+    rc_sync_set(1);
 
     tasks_count = pool->tasks_count;
     executors_count = pool->executors_count;
@@ -430,10 +426,9 @@ obj_p pool_run(pool_p pool) {
     n = pool->executors_count;
     for (i = 0; i < n; i++) {
         heap_merge(pool->executors[i].heap);
-        vm_env_unset(pool->executors[i].vm);
     }
 
-    rc_sync_set(B8_FALSE);
+    rc_sync_set(0);
 
     mutex_unlock(&pool->mutex);
 

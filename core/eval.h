@@ -30,7 +30,6 @@
 #include "mmap.h"
 #include "nfo.h"
 #include "util.h"
-#include "heap.h"
 
 // Forward declaration for query context (defined in query.h)
 struct query_ctx_t;
@@ -75,27 +74,26 @@ typedef struct ctx_t {
 
 // Virtual machine state - layout optimized for cache efficiency
 typedef struct vm_t {
-    // === First cache line (64 bytes) - VERY HOT ===
+    // === First cache line (64 bytes) ===
+    // Hottest field first - checked on every clone/drop
+    i64_t rc_sync;  // use atomic RC (multi-threaded mode)
     // Registers (16 bytes) - compact i32 for cache efficiency
     i32_t sp;  // stack pointer (max VM_STACK_SIZE = 1024)
     i32_t fp;  // frame pointer
     i32_t rp;  // return stack pointer
     i32_t id;  // VM id (thread index)
-    // Pointers (32 bytes)
+    // Pointers (40 bytes)
     obj_p fn;             // current function (fn->env has local variables)
-    obj_p env;            // query/dynamic env (table column mounting, NOT for lambda locals)
-    heap_p heap;          // heap pointer
+    struct heap_t *heap;  // heap pointer
     struct pool_t *pool;  // pool pointer
-    // === 48 bytes total - fits in first cache line with room to spare ===
-    // === Stacks - HOT ===
-    obj_p ps[VM_STACK_SIZE] __attribute__((aligned(64)));  // program stack
-    ctx_t rs[VM_STACK_SIZE] __attribute__((aligned(64)));  // return stack
+    obj_p nfo;            // error source info
+    obj_p trace;          // error stack trace
+    // === Stacks ===
+    obj_p ps[VM_STACK_SIZE];  // program stack
+    ctx_t rs[VM_STACK_SIZE];  // return stack
     // === COLD section ===
-    obj_p nfo;                      // error source info
-    obj_p trace;                    // error stack trace
-    timeit_t *timeit;               // timeit (lazy allocated)
     struct query_ctx_t *query_ctx;  // query context stack (for table column resolution)
-    b8_t rc_sync;                   // use atomic RC (multi-threaded mode)
+    timeit_t *timeit;               // timeit (lazy allocated)
 } __attribute__((aligned(64))) * vm_p;
 
 // Thread-local VM pointer
@@ -123,11 +121,6 @@ obj_p call(obj_p obj, i64_t arity);  // Call a compiled lambda
 // Symbol resolution
 obj_p *resolve(i64_t sym);
 obj_p amend(obj_p sym, obj_p val);
-
-// Environment management
-obj_p vm_env_get(nil_t);
-nil_t vm_env_set(vm_p vm, obj_p env);
-nil_t vm_env_unset(vm_p vm);
 
 // Special forms
 obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file);

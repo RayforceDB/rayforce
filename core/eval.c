@@ -47,15 +47,14 @@ vm_p vm_create(i32_t id, struct pool_t *pool) {
     vm->fp = 0;
     vm->rp = 0;
     vm->fn = NULL_OBJ;
-    vm->env = NULL_OBJ;
     vm->id = id;
     vm->pool = pool;
     // Cold fields
     vm->nfo = NULL_OBJ;
     vm->trace = NULL_OBJ;
-    vm->timeit = NULL;       // Lazy allocated when timing enabled
-    vm->query_ctx = NULL;    // No active query context
-    vm->rc_sync = B8_FALSE;  // Single-threaded by default
+    vm->timeit = NULL;     // Lazy allocated when timing enabled
+    vm->query_ctx = NULL;  // No active query context
+    vm->rc_sync = 0;       // Single-threaded by default
 
     // Set VM for this thread so heap_create can use it
     __VM = vm;
@@ -86,17 +85,6 @@ nil_t vm_destroy(vm_p vm) {
 
     // Then destroy VM
     mmap_free(vm, sizeof(struct vm_t));
-}
-
-obj_p vm_env_get(nil_t) { return __VM->env; }
-
-nil_t vm_env_set(vm_p vm, obj_p env) { vm->env = env; }
-
-nil_t vm_env_unset(vm_p vm) {
-    if (vm->env != NULL_OBJ) {
-        drop_obj(vm->env);
-        vm->env = NULL_OBJ;
-    }
 }
 
 // ============================================================================
@@ -191,19 +179,18 @@ obj_p amend(obj_p sym, obj_p val) {
     obj_p *env_slot;
     vm_p vm = VM;
 
-    // Add to current lambda's env (not vm->env)
+    // Add to current lambda's env, or globals if at top level
     if (vm->fn != NULL_OBJ) {
         env_slot = &AS_LAMBDA(vm->fn)->env;
+        if (*env_slot != NULL_OBJ)
+            set_obj(env_slot, sym, clone_obj(val));
+        else {
+            *env_slot = dict(vector(TYPE_SYMBOL, 1), vn_list(1, clone_obj(val)));
+            AS_SYMBOL(AS_LIST(*env_slot)[0])[0] = sym->i64;
+        }
     } else {
-        // Fallback to vm->env if no current lambda
-        env_slot = &vm->env;
-    }
-
-    if (*env_slot != NULL_OBJ)
-        set_obj(env_slot, sym, clone_obj(val));
-    else {
-        *env_slot = dict(vector(TYPE_SYMBOL, 1), vn_list(1, clone_obj(val)));
-        AS_SYMBOL(AS_LIST(*env_slot)[0])[0] = sym->i64;
+        // Top level: add to globals
+        set_obj(&runtime_get()->env.variables, sym, clone_obj(val));
     }
 
     return val;
@@ -638,7 +625,6 @@ obj_p call(obj_p fn, i64_t arity) {
     vm_p vm = VM;
     obj_p saved_fn = vm->fn;
     i64_t saved_fp = vm->fp;
-    obj_p saved_env = vm->env;
     UNUSED(arity);
 
     // Compile on first call - bytecode is cached in the lambda for reuse
@@ -662,7 +648,6 @@ obj_p call(obj_p fn, i64_t arity) {
     vm->rp--;
     vm->fn = saved_fn;
     vm->fp = saved_fp;
-    vm->env = saved_env;
 
     return res;
 }
