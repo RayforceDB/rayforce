@@ -1129,14 +1129,14 @@ nil_t skip_whitespaces(parser_t *parser) {
             }
             parser->current++;
         }
-        // Handle comments
+        // Handle comments (skip to end of line or EOF)
         else if (*parser->current == ';') {
-            while (*parser->current != '\n' && !at_eof(parser)) {
+            while (!at_eof(parser) && *parser->current != '\n') {
                 parser->current++;
                 parser->column++;
             }
-            // Skip the newline after comment and update line/column
-            if (*parser->current == '\n') {
+            // Skip the newline if present (not at EOF)
+            if (!at_eof(parser) && *parser->current == '\n') {
                 parser->current++;
                 parser->line++;
                 parser->column = 0;
@@ -1151,8 +1151,13 @@ obj_p parser_advance(parser_t *parser) {
 
     skip_whitespaces(parser);
 
-    if (at_eof(parser))
-        return to_token(parser);
+    if (at_eof(parser)) {
+        // Return EOF token without dereferencing past end of input
+        tok = c8('\0');
+        tok->type = TYPE_TOKEN;
+        nfo_insert(parser->nfo, (i64_t)tok, span_start(parser));
+        return tok;
+    }
 
     if (*parser->current == '[')
         return parse_vector(parser);
@@ -1223,10 +1228,12 @@ obj_p parse_do(parser_t *parser) {
         }
 
         if (is_at_term(tok)) {
+            // For EOF token ('\0'), don't roll back - we're at end of input
+            if (tok->c8 != '\0') {
+                parser->current--;
+                parser->column--;
+            }
             drop_obj(tok);
-            // roll back one token
-            parser->current--;
-            parser->column--;
             break;
         }
 

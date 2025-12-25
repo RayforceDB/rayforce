@@ -1,4 +1,4 @@
-(set n 10)
+(set n 10000000)
 (set tabname "a")
 (set dbpath "/tmp/db")
 (set sympath (format "%/sym" dbpath))
