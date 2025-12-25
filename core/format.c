@@ -435,79 +435,37 @@ static i64_t line_num_width(u16_t line) {
     return 5;
 }
 
-// Format underline annotation (the ^~~~ part)
+// Format pointer: ▲ pointing up to location, then └─ message
 static i64_t fmt_underline(obj_p *dst, i64_t gutter_width, u16_t start_col, u16_t end_col, lit_p msg, i32_t msg_len) {
     i64_t n = 0;
-    u16_t i, span_len;
+    u16_t i;
+    (void)end_col;
 
-    // Empty gutter space
-    n += str_fmt_into(dst, NO_LIMIT, "%s", CYAN);
+    // Line with ▲ pointing up
+    n += str_fmt_into(dst, NO_LIMIT, "%s", GRAY);
     for (i = 0; i < gutter_width; i++)
         n += str_fmt_into(dst, NO_LIMIT, " ");
     n += str_fmt_into(dst, NO_LIMIT, " │%s ", RESET);
-
-    // Spaces before the underline
     for (i = 0; i < start_col; i++)
         n += str_fmt_into(dst, NO_LIMIT, " ");
+    n += str_fmt_into(dst, NO_LIMIT, "%s▲%s\n", MAGENTA, RESET);
 
-    // The underline itself: ^~~~
-    // span_len is inclusive of both endpoints: end_col - start_col + 1
-    span_len = (end_col >= start_col) ? (end_col - start_col + 1) : 1;
-    n += str_fmt_into(dst, NO_LIMIT, "%s^", MAGENTA);
-    for (i = 1; i < span_len; i++)
-        n += str_fmt_into(dst, NO_LIMIT, "~");
-
-    // Message after underline
-    if (msg_len > 0)
-        n += str_fmt_into(dst, NO_LIMIT, " %.*s", msg_len, msg);
-
-    n += str_fmt_into(dst, NO_LIMIT, "%s\n", RESET);
-
-    return n;
-}
-
-// Format multiline span start (just marker at start)
-static i64_t fmt_span_start(obj_p *dst, i64_t gutter_width, u16_t start_col) {
-    i64_t n = 0;
-    u16_t i;
-
-    n += str_fmt_into(dst, NO_LIMIT, "%s", CYAN);
+    // Line with ╰─ message (rounded to match frame)
+    n += str_fmt_into(dst, NO_LIMIT, "%s", GRAY);
     for (i = 0; i < gutter_width; i++)
         n += str_fmt_into(dst, NO_LIMIT, " ");
     n += str_fmt_into(dst, NO_LIMIT, " │%s ", RESET);
-
     for (i = 0; i < start_col; i++)
         n += str_fmt_into(dst, NO_LIMIT, " ");
-
-    n += str_fmt_into(dst, NO_LIMIT, "%s╭─%s\n", MAGENTA, RESET);
-
-    return n;
-}
-
-// Format multiline span end with message
-static i64_t fmt_span_end(obj_p *dst, i64_t gutter_width, u16_t end_col, lit_p msg, i32_t msg_len) {
-    i64_t n = 0;
-    u16_t i;
-
-    n += str_fmt_into(dst, NO_LIMIT, "%s", CYAN);
-    for (i = 0; i < gutter_width; i++)
-        n += str_fmt_into(dst, NO_LIMIT, " ");
-    n += str_fmt_into(dst, NO_LIMIT, " │%s ", RESET);
-
-    n += str_fmt_into(dst, NO_LIMIT, "%s╰", MAGENTA);
-    for (i = 0; i < end_col + 1; i++)
-        n += str_fmt_into(dst, NO_LIMIT, "─");
-    n += str_fmt_into(dst, NO_LIMIT, "^");
-
+    n += str_fmt_into(dst, NO_LIMIT, "%s╰─%s", MAGENTA, RESET);
     if (msg_len > 0)
-        n += str_fmt_into(dst, NO_LIMIT, " %.*s", msg_len, msg);
-
-    n += str_fmt_into(dst, NO_LIMIT, "%s\n", RESET);
+        n += str_fmt_into(dst, NO_LIMIT, " %s%s%s", TOMATO, msg, RESET);
+    n += str_fmt_into(dst, NO_LIMIT, "\n");
 
     return n;
 }
 
-i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, i64_t idx, str_p msg, i32_t msg_len) {
+i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, str_p msg, i32_t msg_len, b8_t is_first) {
     i64_t n = 0;
     u32_t line_len, fname_len, remaining_len;
     u16_t line_number = 0, gutter_width;
@@ -535,12 +493,26 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, i64_t idx, str_p msg, i32_t ms
         gutter_width = 2;
 
     // Frame header: ╭─[filename:line:col]
-    n += str_fmt_into(dst, NO_LIMIT, "   %s╭─%s[%s%.*s%s:%s%d%s:%s%d%s]\n", CYAN, RESET, CYAN, fname_len, filename,
-                      RESET, YELLOW, span.start_line + 1, RESET, YELLOW, span.start_column + 1, RESET);
+    if (is_first) {
+        // Primary error frame - more prominent header
+        n += str_fmt_into(dst, NO_LIMIT, "   %s╭─%s[%s%.*s%s:%s%d%s:%s%d%s]\n", GRAY, RESET, CYAN, fname_len, filename,
+                          RESET, YELLOW, span.start_line + 1, RESET, YELLOW, span.start_column + 1, RESET);
+    } else {
+        // Secondary frame - dimmer appearance
+        n += str_fmt_into(dst, NO_LIMIT, "   %s╭─%s[%s%.*s%s:%s%d%s:%s%d%s]\n", GRAY, RESET, GRAY, fname_len, filename,
+                          RESET, GRAY, span.start_line + 1, RESET, GRAY, span.start_column + 1, RESET);
+    }
 
-    // Source lines
+    // For multiline spans, we only show first and last lines with vertical dots
+    b8_t is_multiline = (span.start_line != span.end_line);
+    lit_p first_line_start = NULL;
+    u32_t first_line_len = 0;
+    lit_p last_line_start = NULL;
+    u32_t last_line_len = 0;
+    u16_t i;
+
+    // First pass: find the first and last lines of the span
     start = source;
-
     for (;;) {
         end = (str_p)memchr(start, '\n', remaining_len);
 
@@ -551,24 +523,13 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, i64_t idx, str_p msg, i32_t ms
             line_len = end - start;
         }
 
-        // Show lines within the span
-        if (line_number >= span.start_line && line_number <= span.end_line) {
-            // Line number gutter and source
-            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", CYAN, (int)gutter_width, line_number + 1, RESET, CYAN,
-                              RESET);
-            n += str_fmt_into(dst, NO_LIMIT, "%.*s\n", (int)line_len, start);
-
-            // Underline for single-line span
-            if (span.start_line == span.end_line) {
-                n += fmt_underline(dst, gutter_width, span.start_column, span.end_column, msg, msg_len);
-            } else {
-                // Multiline span
-                if (line_number == span.start_line) {
-                    n += fmt_span_start(dst, gutter_width, span.start_column);
-                } else if (line_number == span.end_line) {
-                    n += fmt_span_end(dst, gutter_width, span.end_column, msg, msg_len);
-                }
-            }
+        if (line_number == span.start_line) {
+            first_line_start = start;
+            first_line_len = line_len;
+        }
+        if (line_number == span.end_line) {
+            last_line_start = start;
+            last_line_len = line_len;
         }
 
         if (line_number > span.end_line || done)
@@ -579,8 +540,110 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, i64_t idx, str_p msg, i32_t ms
         start = end + 1;
     }
 
+    // Print first line
+    if (first_line_start) {
+        // Line number gutter
+        if (is_first) {
+            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", CYAN, (int)gutter_width, span.start_line + 1, RESET, GRAY, RESET);
+        } else {
+            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", GRAY, (int)gutter_width, span.start_line + 1, RESET, GRAY, RESET);
+        }
+
+        // For single-line spans, highlight the span portion
+        if (!is_multiline && is_first) {
+            u16_t span_len = (span.end_column >= span.start_column) ? (span.end_column - span.start_column + 1) : 1;
+            u16_t before_len = span.start_column;
+            u16_t after_start = span.start_column + span_len;
+            u16_t after_len = (first_line_len > after_start) ? (first_line_len - after_start) : 0;
+
+            // Before span (dim)
+            if (before_len > 0)
+                n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", GRAY, (int)before_len, first_line_start, RESET);
+            // The span itself (highlighted)
+            n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", TOMATO, (int)span_len, first_line_start + before_len, RESET);
+            // After span (dim)
+            if (after_len > 0)
+                n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", GRAY, (int)after_len, first_line_start + after_start, RESET);
+            n += str_fmt_into(dst, NO_LIMIT, "\n");
+
+            // Simple pointer with message
+            n += fmt_underline(dst, gutter_width, span.start_column, span.end_column, msg, msg_len);
+        } else if (is_first) {
+            n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s\n", WHITE, (int)first_line_len, first_line_start, RESET);
+        } else {
+            // Secondary frame - just highlight the span in color, no arrow
+            u16_t span_len = (span.end_column >= span.start_column) ? (span.end_column - span.start_column + 1) : 1;
+            u16_t before_len = span.start_column;
+            u16_t after_start = span.start_column + span_len;
+            u16_t after_len = (first_line_len > after_start) ? (first_line_len - after_start) : 0;
+
+            // Before span (dim)
+            if (before_len > 0)
+                n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", GRAY, (int)before_len, first_line_start, RESET);
+            // The span itself (highlighted in error color)
+            n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", TOMATO, (int)span_len, first_line_start + before_len, RESET);
+            // After span (dim)
+            if (after_len > 0)
+                n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", GRAY, (int)after_len, first_line_start + after_start, RESET);
+            n += str_fmt_into(dst, NO_LIMIT, "\n");
+        }
+    }
+
+    // For multiline: show dots, last line, then ▲ and └─ message
+    if (is_multiline && last_line_start) {
+        // Show vertical dots
+        for (i = 0; i < gutter_width; i++)
+            n += str_fmt_into(dst, NO_LIMIT, " ");
+        n += str_fmt_into(dst, NO_LIMIT, " %s·%s ", GRAY, RESET);
+        for (i = 0; i < span.start_column; i++)
+            n += str_fmt_into(dst, NO_LIMIT, " ");
+        n += str_fmt_into(dst, NO_LIMIT, "%s·%s\n", MAGENTA, RESET);
+
+        // Show more dots if there are many lines in between
+        if (span.end_line > span.start_line + 2) {
+            for (i = 0; i < gutter_width; i++)
+                n += str_fmt_into(dst, NO_LIMIT, " ");
+            n += str_fmt_into(dst, NO_LIMIT, " %s·%s ", GRAY, RESET);
+            for (i = 0; i < span.start_column; i++)
+                n += str_fmt_into(dst, NO_LIMIT, " ");
+            n += str_fmt_into(dst, NO_LIMIT, "%s·%s\n", MAGENTA, RESET);
+        }
+
+        // Print last line
+        if (is_first) {
+            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", CYAN, (int)gutter_width, span.end_line + 1, RESET, GRAY, RESET);
+            n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s\n", WHITE, (int)last_line_len, last_line_start, RESET);
+        } else {
+            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", GRAY, (int)gutter_width, span.end_line + 1, RESET, GRAY, RESET);
+            n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s\n", GRAY, (int)last_line_len, last_line_start, RESET);
+        }
+
+        // ▲ pointing up to last line
+        for (i = 0; i < gutter_width; i++)
+            n += str_fmt_into(dst, NO_LIMIT, " ");
+        n += str_fmt_into(dst, NO_LIMIT, " %s│%s ", GRAY, RESET);
+        for (i = 0; i < span.start_column; i++)
+            n += str_fmt_into(dst, NO_LIMIT, " ");
+        n += str_fmt_into(dst, NO_LIMIT, "%s▲%s\n", MAGENTA, RESET);
+
+        // ╰─ message (rounded to match frame)
+        for (i = 0; i < gutter_width; i++)
+            n += str_fmt_into(dst, NO_LIMIT, " ");
+        n += str_fmt_into(dst, NO_LIMIT, " %s│%s ", GRAY, RESET);
+        for (i = 0; i < span.start_column; i++)
+            n += str_fmt_into(dst, NO_LIMIT, " ");
+        n += str_fmt_into(dst, NO_LIMIT, "%s╰─%s", MAGENTA, RESET);
+        if (msg_len > 0)
+            n += str_fmt_into(dst, NO_LIMIT, " %s%s%s", TOMATO, msg, RESET);
+        n += str_fmt_into(dst, NO_LIMIT, "\n");
+    }
+
     // Frame footer with function name and frame index
-    n += str_fmt_into(dst, NO_LIMIT, "   %s╰─%s in %s%s%s [%lld]\n", CYAN, RESET, GREEN, function, RESET, idx);
+    if (is_first) {
+        n += str_fmt_into(dst, NO_LIMIT, "   %s╰─%s in %s%s%s\n", GRAY, RESET, GREEN, function, RESET);
+    } else {
+        n += str_fmt_into(dst, NO_LIMIT, "   %s╰─ in %s%s\n", GRAY, function, RESET);
+    }
 
     return n;
 }
@@ -604,7 +667,7 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
     locs = (vm && vm->trace != NULL_OBJ) ? vm->trace : NULL_OBJ;
 
     // Format header with × marker: "× Error: code"
-    n = str_fmt_into(dst, MAX_ERROR_LEN, "\n  %s×%s %sError%s: %s%s%s\n", TOMATO, RESET, TOMATO, RESET, CYAN, err_code,
+    n = str_fmt_into(dst, MAX_ERROR_LEN, "\n  %s×%s %sError%s: %s%s%s\n", TOMATO, RESET, TOMATO, RESET, YELLOW, err_code,
                      RESET);
 
     // Format with locations if available
@@ -615,12 +678,15 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
         m = l > ERR_STACK_MAX_HEIGHT ? ERR_STACK_MAX_HEIGHT : l;
 
         for (i = 0; i < m; i++) {
-            n += error_frame_fmt_into(dst, AS_LIST(locs)[i], l - i - 1, (str_p)err_code, msg_len);
+            n += error_frame_fmt_into(dst, AS_LIST(locs)[i], (str_p)err_code, msg_len, i == 0);
             msg_len = 0;  // Only show message on first frame
+            // Add spacing between frames (except after last)
+            if (i < m - 1)
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "\n");
         }
 
         if (l > m) {
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "   %s...%s %d more frames\n", GRAY, RESET, l - m);
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "\n   %s... %d more frames%s\n", GRAY, l - m, RESET);
         }
 
         // Clear locations after formatting

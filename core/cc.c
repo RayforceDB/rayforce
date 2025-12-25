@@ -30,6 +30,35 @@
 #include "cond.h"
 #include "vary.h"
 #include "nfo.h"
+#include "runtime.h"
+
+// Add location info from compiler context when a compile error occurs
+static nil_t cc_error_add_loc(cc_ctx_t *cc) {
+    obj_p loc, nfo;
+    span_t span;
+    vm_p vm = VM;
+
+    if (cc->nfo == NULL_OBJ || cc->cur_expr == NULL_OBJ)
+        return;
+
+    nfo = cc->nfo;
+
+    // Check nfo has proper structure (list with at least 2 elements)
+    if (nfo->type != TYPE_LIST || nfo->len < 2)
+        return;
+
+    span = nfo_get(nfo, (i64_t)cc->cur_expr);
+    if (span.id == 0)
+        return;
+
+    // Create location: (span.id, filename, fn_name, source)
+    loc = vn_list(4, i64(span.id), clone_obj(AS_LIST(nfo)[0]), NULL_OBJ, clone_obj(AS_LIST(nfo)[1]));
+
+    if (vm->trace == NULL_OBJ)
+        vm->trace = vn_list(1, loc);
+    else
+        push_raw(&vm->trace, &loc);
+}
 
 // Look up span for a bytecode offset
 // dbg is an I64 vector of pairs: [offset0, span0, offset1, span1, ...]
@@ -137,6 +166,9 @@ static b8_t is_unary_special_form(obj_p fn) { return fn->type == TYPE_UNARY && (
 static i64_t cc_call(cc_ctx_t *cc, obj_p expr, obj_p *lst, i64_t n) {
     obj_p car = lst[0];
     i64_t i;
+
+    // Track current expression for error reporting
+    cc->cur_expr = expr;
 
     lst++;
     n--;
@@ -293,6 +325,8 @@ static obj_p cc_fn(cc_ctx_t *cc, obj_p *lst, i64_t n) {
     }
 
     if (cc_body(cc, lst, n) == -1) {
+        // Add location info from the failing expression before returning error
+        cc_error_add_loc(cc);
         return ray_err(ERR_TYPE);
     }
 
@@ -323,6 +357,7 @@ obj_p cc_compile(obj_p lambda) {
         .dbg = I64(0),   // Debug info: pairs of (bytecode offset, span.id)
         .nfo = fn->nfo,  // Source nfo from parser
         .lp = 0,
+        .cur_expr = NULL_OBJ,  // Current expression being compiled
     };
 
     // Prepare body expressions

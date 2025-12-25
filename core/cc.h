@@ -40,6 +40,7 @@ typedef struct cc_ctx_t {
     obj_p dbg;      // debug info: maps bytecode offset -> span (I64 pairs)
     obj_p nfo;      // source nfo from parser (for span lookups)
     i64_t lp;       // locals pointer
+    obj_p cur_expr; // current expression being compiled (for error reporting)
 } cc_ctx_t;
 
 // Look up span for a bytecode offset
