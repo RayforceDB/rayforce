@@ -265,10 +265,14 @@ hist_p hist_create() {
         return NULL;
     }
 
-    // Find the current end of the data in the file
+    // Find the current end of the data in the file and count lines
     pos = 0;
-    while (pos < fsize && hist_data[pos] != '\0')
+    i64_t line_count = 0;
+    while (pos < fsize && hist_data[pos] != '\0') {
+        if (hist_data[pos] == '\n')
+            line_count++;
         pos++;
+    }
 
     hist->fd = fd;
     hist->entries = hist_data;
@@ -278,6 +282,22 @@ hist_p hist_create() {
     hist->index = (pos == 0) ? 0 : pos - 1;
     hist->curr_saved = 0;
     hist->curr_len = 0;
+    
+    // Initialize line tracking
+    hist->line_count = line_count;
+    hist->line_offsets_cap = 1024;  // Initial capacity
+    hist->line_offsets = (i64_t*)heap_mmap(hist->line_offsets_cap * sizeof(i64_t));
+    
+    // Build line offset table from existing history
+    if (hist->line_offsets && pos > 0) {
+        i64_t line_idx = 0;
+        hist->line_offsets[line_idx++] = 0;  // First line starts at 0
+        for (i64_t i = 0; i < pos && line_idx < hist->line_offsets_cap; i++) {
+            if (hist_data[i] == '\n' && i + 1 < pos) {
+                hist->line_offsets[line_idx++] = i + 1;
+            }
+        }
+    }
 
     // Unlock file after reading
 #if defined(OS_WINDOWS)
@@ -314,6 +334,10 @@ nil_t hist_destroy(hist_p hist) {
 #else
     flock(hist->fd, LOCK_UN);
 #endif
+
+    // Free line offsets array
+    if (hist->line_offsets)
+        heap_unmap(hist->line_offsets, hist->line_offsets_cap * sizeof(i64_t));
 
     mmap_free(hist->entries, hist->size);
     fs_fclose(hist->fd);
@@ -352,12 +376,20 @@ nil_t hist_add(hist_p hist, c8_t buf[], i64_t len) {
     if (len + pos + 1 > size)
         return;
 
+    // Track line offset before adding
+    if (hist->line_offsets && hist->line_count < hist->line_offsets_cap) {
+        hist->line_offsets[hist->line_count] = pos;
+    }
+
     // Add the line to the history buffer
     memcpy(hist->entries + pos, buf, len);
     hist->entries[pos + len] = '\n';
     hist->pos += len + 1;
     hist->index = hist->pos - 1;
     hist->search_dir = 1;
+    
+    // Increment line count
+    hist->line_count++;
 }
 
 i64_t hist_prev(hist_p hist, c8_t buf[]) {
@@ -458,6 +490,42 @@ i64_t hist_restore_current(hist_p hist, c8_t buf[]) {
 nil_t hist_reset_current(hist_p hist) {
     hist->curr_saved = 0;
     hist->curr_len = 0;
+}
+
+// Get current line number (for error traces) - returns next line number
+i64_t hist_line_number(hist_p hist) {
+    return hist ? hist->line_count + 1 : 1;  // 1-based line numbers
+}
+
+// Get source for a given line number (returns pointer into mmaped buffer)
+// line is 1-based; returns NULL if line not found
+lit_p hist_get_source(hist_p hist, i64_t line, i64_t *len) {
+    if (!hist || !hist->line_offsets || line < 1 || line > hist->line_count)
+        return NULL;
+    
+    i64_t idx = line - 1;  // Convert to 0-based index
+    i64_t start = hist->line_offsets[idx];
+    i64_t end;
+    
+    // Find end of line (next newline or end of data)
+    if (idx + 1 < hist->line_count) {
+        end = hist->line_offsets[idx + 1] - 1;  // -1 to exclude newline
+    } else {
+        // Last line - search for newline or end
+        end = start;
+        while (end < hist->pos && hist->entries[end] != '\n')
+            end++;
+    }
+    
+    if (len)
+        *len = end - start;
+    
+    return (lit_p)(hist->entries + start);
+}
+
+// Get the line number of the last input
+i64_t term_last_input_line(term_p term) {
+    return term ? term->last_input_line : 1;
 }
 
 #if defined(OS_WINDOWS)
@@ -1322,6 +1390,9 @@ obj_p term_handle_return(term_p term) {
     }
 
     // Balanced - create result from multiline buffer
+    // Capture line number BEFORE hist_add increments it
+    term->last_input_line = hist_line_number(term->hist);
+    
     res = cstring_from_str(term->multiline_buf, term->multiline_len);
     hist_add(term->hist, term->multiline_buf, term->multiline_len);
 

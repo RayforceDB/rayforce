@@ -66,7 +66,8 @@ option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
         if (repl->silent)
             poll_exit(poll, 1);
     } else if (str != NULL_OBJ) {
-        res = ray_eval_str(str, repl->name);
+        i64_t line = repl->term ? term_last_input_line(repl->term) : 0;
+        res = ray_eval_str_line(str, repl->name, line);
         error = IS_ERR(res);
         if (error) {
             io_write(STDERR_FILENO, 2, res);

@@ -226,8 +226,8 @@ nil_t error_add_loc(obj_p err, i64_t id, ctx_t *ctx) {
 
 // Add location info from bytecode debug info
 nil_t bc_error_add_loc(obj_p err, obj_p fn, i64_t ip) {
-    obj_p loc, nfo;
-    span_t span;
+    obj_p loc, nfo, filename, source;
+    span_t span = {0};
     lambda_p lambda;
     (void)err;
 
@@ -237,16 +237,24 @@ nil_t bc_error_add_loc(obj_p err, obj_p fn, i64_t ip) {
     lambda = AS_LAMBDA(fn);
     nfo = lambda->nfo;
 
-    if (nfo == NULL_OBJ)
-        return;
-
     vm_p vm = VM;
-    // Look up span from bytecode debug info
-    span = bc_dbg_get(lambda->dbg, ip);
-    if (span.id == 0)
-        return;
+    
+    // Try to get span from bytecode debug info
+    if (lambda->dbg != NULL_OBJ)
+        span = bc_dbg_get(lambda->dbg, ip);
 
-    loc = vn_list(4, i64(span.id), clone_obj(AS_LIST(nfo)[0]), clone_obj(lambda->name), clone_obj(AS_LIST(nfo)[1]));
+    // Get filename and source from nfo if available
+    if (nfo != NULL_OBJ && nfo->type == TYPE_LIST && nfo->len >= 2) {
+        filename = clone_obj(AS_LIST(nfo)[0]);
+        source = clone_obj(AS_LIST(nfo)[1]);
+    } else {
+        // No nfo - create minimal info with just lambda name
+        filename = string_from_str("<unknown>", 9);
+        source = string_from_str("", 0);
+    }
+    
+    // Create location frame - even without precise span, show the call chain
+    loc = vn_list(4, i64(span.id), filename, clone_obj(lambda->name), source);
 
     if (vm->trace == NULL_OBJ)
         vm->trace = vn_list(1, loc);
@@ -285,6 +293,27 @@ static inline obj_p unwrap(obj_p obj, i64_t id) {
     if (IS_ERR(obj))
         eval_error_add_loc((obj_p)id);
     return obj;
+}
+
+// Unwind return stack on error, adding trace frames for each caller
+static inline obj_p vm_error_unwind(vm_p vm, obj_p err) {
+    ctx_t *rs;
+    while (vm->rp > 0) {
+        rs = &vm->rs[vm->rp - 1];
+        if (rs->ip == -1) {
+            // External call marker - stop unwinding
+            vm->rp--;
+            vm->fn = rs->fn;
+            vm->fp = rs->fp;
+            break;
+        }
+        // Add caller's location to trace
+        bc_error_add_loc(err, rs->fn, rs->ip - 1);
+        vm->rp--;
+        vm->fn = rs->fn;
+        vm->fp = rs->fp;
+    }
+    return err;
 }
 
 // ============================================================================
@@ -351,6 +380,9 @@ OP_RET:
         vm->fn = rs->fn;
         bc = AS_U8(AS_LAMBDA(vm->fn)->bc);
         consts = AS_LIST(AS_LAMBDA(vm->fn)->consts);
+        // Add caller's location to trace if error is propagating
+        if (UNLIKELY(IS_ERR(r)))
+            bc_error_add_loc(r, vm->fn, ip - 1);
         push(r);
         next();
     }
@@ -385,7 +417,7 @@ OP_RESOLVE:
         r = err_value(x->i64);  // symbol not found
         drop_obj(x);
         bc_error_add_loc(r, vm->fn, ip - 1);
-        return r;
+        return vm_error_unwind(vm, r);
     }
     y = clone_obj(*val);
     drop_obj(x);
@@ -401,7 +433,7 @@ OP_CALL1:
     drop_obj(y);
     if (UNLIKELY(IS_ERR(r))) {
         bc_error_add_loc(r, vm->fn, ip - 1);
-        return r;
+        return vm_error_unwind(vm, r);
     }
     push(r);
     next();
@@ -416,7 +448,7 @@ OP_CALL2:
     drop_obj(r);
     if (UNLIKELY(IS_ERR(res))) {
         bc_error_add_loc(res, vm->fn, ip - 1);
-        return res;
+        return vm_error_unwind(vm, res);
     }
     push(res);
     next();
@@ -432,7 +464,7 @@ OP_CALLN:
     drop_obj(r);
     if (UNLIKELY(IS_ERR(res))) {
         bc_error_add_loc(res, vm->fn, ip - 1);
-        return res;
+        return vm_error_unwind(vm, res);
     }
     push(res);
     next();
@@ -444,7 +476,7 @@ OP_CALLF:
         drop_obj(x);
         r = err_type(TYPE_LAMBDA, got, 0);
         bc_error_add_loc(r, vm->fn, ip - 1);
-        return r;
+        return vm_error_unwind(vm, r);
     }
 callf:
     // Compile if not already compiled
@@ -453,7 +485,7 @@ callf:
         if (UNLIKELY(IS_ERR(r))) {
             drop_obj(x);
             bc_error_add_loc(r, vm->fn, ip - 1);
-            return r;
+            return vm_error_unwind(vm, r);
         }
     }
     // Check for stack overflow
@@ -461,7 +493,7 @@ callf:
         drop_obj(x);
         r = err_limit(VM_STACK_SIZE);
         bc_error_add_loc(r, vm->fn, ip - 1);
-        return r;
+        return vm_error_unwind(vm, r);
     }
     // Save current context
     rs = &vm->rs[vm->rp++];
@@ -482,7 +514,7 @@ OP_CALLS:
     if (UNLIKELY(vm->rp >= VM_STACK_SIZE)) {
         r = err_limit(VM_STACK_SIZE);
         bc_error_add_loc(r, vm->fn, ip - 1);
-        return r;
+        return vm_error_unwind(vm, r);
     }
     rs = &vm->rs[vm->rp++];
     rs->ip = ip;
@@ -501,7 +533,7 @@ OP_CALLD:
                 drop_obj(x);
                 r = err_arity(1, n);
                 bc_error_add_loc(r, vm->fn, ip - 1);
-                return r;
+                return vm_error_unwind(vm, r);
             }
             y = pop();
             r = unary_call(x, y);
@@ -509,7 +541,7 @@ OP_CALLD:
             drop_obj(x);
             if (UNLIKELY(IS_ERR(r))) {
                 bc_error_add_loc(r, vm->fn, ip - 1);
-                return r;
+                return vm_error_unwind(vm, r);
             }
             push(r);
             break;
@@ -518,7 +550,7 @@ OP_CALLD:
                 drop_obj(x);
                 r = err_arity(2, n);
                 bc_error_add_loc(r, vm->fn, ip - 1);
-                return r;
+                return vm_error_unwind(vm, r);
             }
             y = pop();
             r = pop();
@@ -528,7 +560,7 @@ OP_CALLD:
             drop_obj(x);
             if (UNLIKELY(IS_ERR(res))) {
                 bc_error_add_loc(res, vm->fn, ip - 1);
-                return res;
+                return vm_error_unwind(vm, res);
             }
             push(res);
             break;
@@ -541,7 +573,7 @@ OP_CALLD:
             drop_obj(x);
             if (UNLIKELY(IS_ERR(r))) {
                 bc_error_add_loc(r, vm->fn, ip - 1);
-                return r;
+                return vm_error_unwind(vm, r);
             }
             push(r);
             break;
@@ -552,7 +584,7 @@ OP_CALLD:
             drop_obj(x);
             r = err_type(TYPE_LAMBDA, got, 0);  // not callable
             bc_error_add_loc(r, vm->fn, ip - 1);
-            return r;
+            return vm_error_unwind(vm, r);
         }
     }
     next();
@@ -939,17 +971,36 @@ obj_p eval_str_w_attr(lit_p str, i64_t len, obj_p nfo_arg) {
 obj_p eval_str(lit_p str) { return eval_str_w_attr(str, strlen(str), NULL_OBJ); }
 
 obj_p ray_eval_str(obj_p str, obj_p file) {
-    obj_p info;
+    return ray_eval_str_line(str, file, 0);
+}
+
+obj_p ray_eval_str_line(obj_p str, obj_p file, i64_t line) {
+    obj_p info, filename;
+    c8_t buf[64];
+    i64_t len;
 
     if (str->type != TYPE_C8)
         return err_type(TYPE_C8, str->type, 0);
 
-    // Always create nfo for source tracking; use "repl" if no file provided
-    if (file != NULL && file != NULL_OBJ)
-        info = nfo(clone_obj(file), clone_obj(str));
-    else
-        info = nfo(string_from_str("repl", 4), clone_obj(str));
+    // Create filename with line number if provided
+    if (file != NULL && file != NULL_OBJ) {
+        if (line > 0) {
+            // Append line number to filename: "repl:42"
+            len = snprintf(buf, 64, "%.*s:%lld", (int)file->len, AS_C8(file), (long long)line);
+            filename = string_from_str(buf, len);
+        } else {
+            filename = clone_obj(file);
+        }
+    } else {
+        if (line > 0) {
+            len = snprintf(buf, 64, "repl:%lld", (long long)line);
+            filename = string_from_str(buf, len);
+        } else {
+            filename = string_from_str("repl", 4);
+        }
+    }
 
+    info = nfo(filename, clone_obj(str));
     return eval_str_w_attr(AS_C8(str), str->len, info);
 }
 

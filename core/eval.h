@@ -125,6 +125,7 @@ obj_p amend(obj_p sym, obj_p val);
 // Special forms
 obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file);
 obj_p ray_eval_str(obj_p str, obj_p file);
+obj_p ray_eval_str_line(obj_p str, obj_p file, i64_t line);
 obj_p ray_raise(obj_p obj);
 obj_p ray_return(obj_p *x, i64_t n);
 obj_p ray_exit(obj_p *x, i64_t n);

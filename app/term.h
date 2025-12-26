@@ -81,6 +81,10 @@ typedef struct hist_t {
     i64_t curr_saved;
     i64_t curr_len;
     c8_t curr[TERM_BUF_SIZE];
+    // Line tracking for error source references
+    i64_t line_count;       // Number of lines in history (1-based for display)
+    i64_t *line_offsets;    // Byte offset of each line start (dynamically allocated)
+    i64_t line_offsets_cap; // Capacity of line_offsets array
 } *hist_p;
 
 typedef struct {
@@ -124,6 +128,7 @@ typedef struct term_t {
     i32_t prompt_len;       // Length of the prompt (for wrapping calculation)
     i32_t last_total_rows;  // Number of rows used in last redraw
     i32_t last_cursor_row;  // Cursor row position from last redraw
+    i64_t last_input_line;  // Line number of last input (for error traces)
 } *term_p;
 
 hist_p hist_create();
@@ -133,6 +138,13 @@ i64_t hist_prev(hist_p hist, c8_t buf[]);
 i64_t hist_next(hist_p hist, c8_t buf[]);
 i64_t hist_save_current(hist_p hist, c8_t buf[], i64_t len);
 i64_t hist_restore_current(hist_p hist, c8_t buf[]);
+
+// Get current line number (for error traces)
+i64_t hist_line_number(hist_p hist);
+// Get source for a given line number (returns pointer into mmaped buffer)
+lit_p hist_get_source(hist_p hist, i64_t line, i64_t *len);
+// Get the line number of the last input (for passing to eval)
+i64_t term_last_input_line(term_p term);
 
 term_p term_create();
 nil_t term_prompt(term_p term);
