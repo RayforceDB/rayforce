@@ -65,7 +65,7 @@ obj_p ray_hopen(obj_p *x, i64_t n) {
 
     // Allow only in main thread
     if (!ray_is_main_thread())
-        return err_nyi();
+        return err_nyi(0);
 
     // Open socket
     if (sock_addr_from_str(AS_C8(x[0]), x[0]->len, &addr) != -1) {
@@ -98,7 +98,7 @@ obj_p ray_hopen(obj_p *x, i64_t n) {
 obj_p ray_hclose(obj_p x) {
     // Allow only in main thread
     if (!ray_is_main_thread())
-        return err_nyi();
+        return err_nyi(0);
 
     switch (x->type) {
         case -TYPE_I32:
@@ -235,7 +235,7 @@ obj_p io_write(i64_t fd, u8_t msg_type, obj_p obj) {
 
             // Allow only in main thread
             if (!ray_is_main_thread())
-                return err_nyi();
+                return err_nyi(0);
 
             return ipc_send(runtime_get()->poll, fd, obj, msg_type);
     }
@@ -261,7 +261,7 @@ obj_p ray_write(obj_p x, obj_p y) {
             else
                 return io_write(x->i64, MSG_TYPE_SYNC, y);
         default:
-            return err_nyi();
+            return err_nyi(0);
     }
 }
 

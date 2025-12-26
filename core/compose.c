@@ -872,6 +872,21 @@ obj_p ray_distinct(obj_p x) {
             res = index_distinct_i64(AS_I64(ENUM_VAL(x)), l);
             res = enumerate(ray_key(x), res);
             return res;
+        case TYPE_PARTEDENUM: {
+            // For parted enum, get the domain (unique symbols) from the first partition
+            // All partitions share the same domain, so we just need to load it once
+            if (x->len == 0)
+                return SYMBOL(0);
+            obj_p first_part = AS_LIST(x)[0];
+            obj_p key = ray_key(first_part);
+            if (IS_ERR(key))
+                return key;
+            obj_p domain = ray_get(key);
+            drop_obj(key);
+            if (IS_ERR(domain))
+                return domain;
+            return domain;
+        }
         case TYPE_LIST:
             l = ops_count(x);
             res = index_distinct_obj(AS_LIST(x), l);
@@ -881,7 +896,7 @@ obj_p ray_distinct(obj_p x) {
             res = index_distinct_guid(AS_GUID(x), l);
             return res;
         default:
-            return err_type(TYPE_LIST, x->type, 0);
+            return err_nyi(x->type);
     }
 }
 

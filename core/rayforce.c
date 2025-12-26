@@ -2967,7 +2967,7 @@ obj_p copy_obj(obj_p obj) {
         case TYPE_DICT:
             return dict(copy_obj(AS_LIST(obj)[0]), copy_obj(AS_LIST(obj)[1]));
         default:
-            return err_nyi();
+            return err_nyi(obj->type);
     }
 }
 

@@ -136,7 +136,14 @@ obj_p err_user(lit_p msg) {
 
 // Simple errors (no context)
 obj_p err_domain(nil_t) { return err_alloc(EC_DOMAIN); }
-obj_p err_nyi(nil_t) { return err_alloc(EC_NYI); }
+
+obj_p err_nyi(i8_t type) {
+    obj_p err = err_alloc(EC_NYI);
+    err_ctx_t *ctx = (err_ctx_t *)&err->i64;
+    ctx->types.actual = type;
+    return err;
+}
+
 obj_p err_parse(nil_t) { return err_alloc(EC_PARSE); }
 
 // ============================================================================

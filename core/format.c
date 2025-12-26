@@ -727,6 +727,14 @@ static i64_t error_ctx_fmt_into_new(obj_p *dst, obj_p err) {
             }
             break;
         }
+        case EC_NYI: {
+            err_types_t t = ctx->types;
+            if (t.actual != 0) {
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s for type %s%s%s\n", GRAY, RESET, YELLOW,
+                                  type_name(t.actual), RESET);
+            }
+            break;
+        }
         default:
             break;
     }

@@ -75,7 +75,7 @@ obj_p err_user(lit_p msg);
 
 // Without context (simple errors)
 obj_p err_domain(nil_t);
-obj_p err_nyi(nil_t);
+obj_p err_nyi(i8_t type);  // Not yet implemented for given type
 obj_p err_parse(nil_t);
 
 // Internal: create error with code only (for deserialization/parsing)
