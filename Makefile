@@ -123,23 +123,6 @@ profile: app
 	./$(TARGET) $(TARGET_ARGS)
 	$(PROFILER) $(TARGET) gmon.out > profile.txt
 
-# Generate test coverage report (requires lcov)
-coverage: CC = gcc
-coverage: CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 --coverage -fprofile-update=atomic
-coverage: $(TESTS_OBJECTS) coverage-lib
-	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) -L. -l$(TARGET) $(LIBS) $(LDFLAGS)
-	lcov --directory . --zerocounters
-	./$(TARGET).test
-	lcov --capture --directory . --output-file coverage.info --ignore-errors unused
-	lcov --remove coverage.info '/usr/*' 'tests/*' --output-file coverage.info --ignore-errors unused
-	lcov --list coverage.info
-	genhtml coverage.info --output-directory coverage_report
-	@echo "Coverage report generated in coverage_report/index.html"
-
-coverage-lib: CFLAGS = -fPIC -Wall -Wextra -std=c17 -g -O0 --coverage -fprofile-update=atomic
-coverage-lib: $(CORE_OBJECTS)
-	$(AR) rc lib$(TARGET).a $(CORE_OBJECTS)
-
 shared: CFLAGS = $(RELEASE_CFLAGS)
 shared: LDFLAGS = $(RELEASE_LDFLAGS)
 shared: $(CORE_OBJECTS)
@@ -165,10 +148,6 @@ clean:
 	-rm -f $(TARGET).wasm
 	-rm -f $(TARGET)
 	-rm -f $(TARGET).exe
-	-rm -f tests/*.gcno tests/*.gcda tests/*.gcov
-	-rm -f core/*.gcno core/*.gcda core/*.gcov
-	-rm -f coverage.info
-	-rm -rf coverage_report/
 	-rm -f .DS_Store # macOS
 	-rm -f core/*.opt.yaml
 	-rm -f app/*.opt.yaml

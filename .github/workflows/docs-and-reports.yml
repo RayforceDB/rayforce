@@ -28,9 +28,6 @@ jobs:
       run: |
         pip install mkdocs-material
         pip install mkdocs-git-revision-date-plugin
-
-    - name: Install lcov
-      run: sudo apt-get update && sudo apt-get install -y lcov
   
     - name: Build documentation
       run: |
@@ -44,7 +41,6 @@ jobs:
     - name: Create Directories for Reports
       run: |
         mkdir -p site/tests_report
-        mkdir -p site/coverage_report
 
     - name: Run Tests
       run: |
@@ -92,15 +88,6 @@ jobs:
           fi
         done
         echo '</table></body></html>' >> site/tests_report/index.html
-
-    - name: Run Coverage
-      run: |
-        make clean
-        make coverage
-  
-    - name: Include Coverage Report in Site
-      run: |
-        cp -r coverage_report/* site/coverage_report/
 
     - name: Setup Pages
       uses: actions/configure-pages@v4
