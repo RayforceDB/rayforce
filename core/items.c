@@ -159,7 +159,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                         return clone_obj(AS_LIST(AS_LIST(x)[1])[j]);
                 }
 
-                return err_index(-1, 0);
+                return err_value(AS_SYMBOL(y)[0]);
             }
 
             cols = vector(TYPE_LIST, yl);
@@ -175,7 +175,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                 if (j == xl) {
                     cols->len = i;
                     drop_obj(cols);
-                    return err_index(-1, 0);
+                    return err_value(AS_SYMBOL(y)[i]);
                 }
             }
 
@@ -189,7 +189,7 @@ obj_p ray_at(obj_p x, obj_p y) {
 
             if (y->i64 >= (i64_t)v->len) {
                 drop_obj(s);
-                return err_index(-1, 0);
+                return err_index(y->i64, v->len);
             }
 
             if (!s || IS_ERR(s) || s->type != TYPE_SYMBOL) {
@@ -199,7 +199,7 @@ obj_p ray_at(obj_p x, obj_p y) {
 
             if (AS_I64(v)[y->i64] >= (i64_t)s->len) {
                 drop_obj(s);
-                return err_index(-1, 0);
+                return err_index(AS_I64(v)[y->i64], s->len);
             }
 
             res = at_idx(s, AS_I64(v)[y->i64]);
@@ -229,7 +229,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                     if (AS_I64(y)[i] >= (i64_t)n) {
                         drop_obj(s);
                         drop_obj(res);
-                        return err_index(-1, 0);
+                        return err_index(AS_I64(y)[i], n);
                     }
 
                     AS_I64(res)[i] = AS_I64(v)[AS_I64(y)[i]];
@@ -246,7 +246,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                 if (AS_I64(v)[i] >= (i64_t)xl) {
                     drop_obj(s);
                     drop_obj(res);
-                    return err_index(-1, 0);
+                    return err_index(AS_I64(v)[i], xl);
                 }
 
                 AS_SYMBOL(res)[i] = AS_SYMBOL(s)[AS_I64(v)[AS_I64(y)[i]]];
@@ -264,7 +264,7 @@ obj_p ray_at(obj_p x, obj_p y) {
             yl = v->len;
 
             if (y->i64 >= (i64_t)v->len)
-                return err_index(-1, 0);
+                return err_index(y->i64, v->len);
 
             buf = AS_U8(k) + AS_I64(v)[y->i64];
 
@@ -285,7 +285,7 @@ obj_p ray_at(obj_p x, obj_p y) {
                 if (AS_I64(y)[i] >= (i64_t)n) {
                     res->len = i;
                     drop_obj(res);
-                    return err_index(-1, 0);
+                    return err_index(AS_I64(y)[i], n);
                 }
 
                 buf = AS_U8(k) + AS_I64(v)[AS_I64(y)[i]];
@@ -335,17 +335,17 @@ obj_p ray_find(obj_p x, obj_p y) {
 }
 
 #define COMMA ,
-#define __FILTER(x, y, tx, s1, s2, s3)                                                 \
-    ({                                                                                 \
-        if (x->len != y->len)                                                          \
-            return err_length(0, 0); \
-        l = x->len;                                                                    \
-        res = tx(l);                                                                   \
-        for (i = 0; i < l; i++)                                                        \
-            if (AS_B8(y)[i])                                                           \
-                s1(AS_##tx(res)[j++] s2(AS_##tx(x)[i]) s3);                            \
-        resize_obj(&res, j);                                                           \
-        return res;                                                                    \
+#define __FILTER(x, y, tx, s1, s2, s3)                      \
+    ({                                                      \
+        if (x->len != y->len)                               \
+            return err_length(0, 0);                        \
+        l = x->len;                                         \
+        res = tx(l);                                        \
+        for (i = 0; i < l; i++)                             \
+            if (AS_B8(y)[i])                                \
+                s1(AS_##tx(res)[j++] s2(AS_##tx(x)[i]) s3); \
+        resize_obj(&res, j);                                \
+        return res;                                         \
     })
 
 obj_p ray_filter(obj_p x, obj_p y) {
@@ -668,7 +668,7 @@ obj_p ray_take(obj_p from, obj_p count) {
                     } else {
                         res->len = i;
                         drop_obj(res);
-                        return err_index(-1, 0);
+                        return err_index(AS_I64(s)[j], n);
                     }
                 }
             } else {
@@ -685,7 +685,7 @@ obj_p ray_take(obj_p from, obj_p count) {
                     } else {
                         res->len = i;
                         drop_obj(res);
-                        return err_index(-1, 0);
+                        return err_index(AS_I64(s)[j % l], n);
                     }
                 }
             }
@@ -1206,7 +1206,7 @@ obj_p ray_value(obj_p x) {
                 } else {
                     res->len = i;
                     drop_obj(res);
-                    return err_index(-1, 0);
+                    return err_index(AS_I64(e)[i], sl);
                 }
             }
 

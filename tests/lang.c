@@ -5170,13 +5170,13 @@ test_result_t test_lang_error() {
 // These tests verify that invalid inputs return proper errors instead of segfaulting
 test_result_t test_lang_safety() {
     // ========== TIL NEGATIVE LENGTH ==========
-    TEST_ASSERT_ER("(til -1)", "index");
-    TEST_ASSERT_ER("(til -100)", "index");
+    TEST_ASSERT_ER("(til -1)", "domain");
+    TEST_ASSERT_ER("(til -100)", "domain");
 
     // ========== RAND NEGATIVE/ZERO ==========
-    TEST_ASSERT_ER("(rand -1 10)", "index");
-    TEST_ASSERT_ER("(rand 5 0)", "index");
-    TEST_ASSERT_ER("(rand 5 -1)", "index");
+    TEST_ASSERT_ER("(rand -1 10)", "domain");
+    TEST_ASSERT_ER("(rand 5 0)", "domain");
+    TEST_ASSERT_ER("(rand 5 -1)", "domain");
 
     // ========== MODIFY WRONG ARITY ==========
     TEST_ASSERT_ER("(do (set v [1 2]) (modify 'v * 2))", "length");

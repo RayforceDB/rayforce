@@ -136,7 +136,7 @@ obj_p ray_til(obj_p x) {
         return err_type(-TYPE_I64, x->type, 0);
 
     if (x->i64 < 0)
-        return err_index(-1, 0);
+        return err_domain();
 
     return __til(x, NULL_OBJ);
 }
@@ -445,10 +445,10 @@ obj_p ray_rand(obj_p x, obj_p y) {
             count = x->i64;
 
             if (count < 0)
-                return err_index(-1, 0);
+                return err_domain();
 
             if (y->i64 <= 0)
-                return err_index(-1, 0);
+                return err_domain();
 
             vec = I64(count);
 
@@ -1030,13 +1030,13 @@ obj_p ray_row(obj_p x) {
         $xl = x->len;                                                                                  \
         $yl = y->len;                                                                                  \
         if ($yl > $xl)                                                                                 \
-            return err_length(0, 0);                        \
+            return err_length($xl, $yl);                                                               \
                                                                                                        \
         $res = LIST($yl);                                                                              \
         $last_id = __AS_##yt(y)[0];                                                                    \
         if ($last_id < 0 || $last_id >= $xl) {                                                         \
             drop_obj($res);                                                                            \
-            return err_index(-1, 0);      \
+            return err_index($last_id, $xl);                                                           \
         }                                                                                              \
                                                                                                        \
         for ($i = 0; $i < $yl; $i++) {                                                                 \
@@ -1044,7 +1044,7 @@ obj_p ray_row(obj_p x) {
             if ($id < $last_id || $id > $xl) {                                                         \
                 $res->len = $i;                                                                        \
                 drop_obj($res);                                                                        \
-                return err_index(-1, 0);       \
+                return err_index($id, $xl);                                                            \
             }                                                                                          \
                                                                                                        \
             if ($id == $last_id)                                                                       \
