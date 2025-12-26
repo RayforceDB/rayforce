@@ -175,15 +175,15 @@ obj_p sys_set_fpr(i32_t argc, str_p argv[]) {
     i64_t fpr, res;
 
     if (argc != 1)
-        return ray_err(ERR_ARITY);
+        return err_new(EC_LENGTH);
 
     i64_from_str(argv[0], strlen(argv[0]), &fpr);
     if (fpr < 0)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     res = format_set_fpr(fpr);
     if (res != 0)
-        return ray_err(ERR_SYS);
+        return err_os();
 
     return i64(res);
 }
@@ -192,18 +192,18 @@ obj_p sys_set_display_width(i32_t argc, str_p argv[]) {
     i64_t width, res;
 
     if (argc != 1)
-        return ray_err(ERR_ARITY);
+        return err_new(EC_LENGTH);
 
     i64_from_str(argv[0], strlen(argv[0]), &width);
     if (width < 0)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (width < 0)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     res = format_set_display_width(width);
     if (res != 0)
-        return ray_err(ERR_SYS);
+        return err_os();
 
     return i64(res);
 }
@@ -212,11 +212,11 @@ obj_p sys_timeit(i32_t argc, str_p argv[]) {
     i64_t res;
 
     if (argc != 1)
-        return ray_err(ERR_ARITY);
+        return err_new(EC_LENGTH);
 
     i64_from_str(argv[0], strlen(argv[0]), &res);
     if (res < 0)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     timeit_activate(res != 0);
 
@@ -230,23 +230,23 @@ obj_p sys_listen(i32_t argc, str_p argv[]) {
     i64_t l, res = 0;
 
     if (argc != 1)
-        return ray_err(ERR_ARITY);
+        return err_new(EC_LENGTH);
 
     l = strlen(argv[0]);
     i64_from_str(argv[0], l, &res);
     if (res < 0)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (res < 0)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     res = ipc_listen(runtime_get()->poll, res);
 
     if (res == -1)
-        return sys_error(ERR_IO);
+        return err_os();
 
     if (res == -2)
-        return ray_err(ERR_SYS);
+        return err_os();
 
     return i64(res);
 }
@@ -260,7 +260,7 @@ obj_p sys_exit(i32_t argc, str_p argv[]) {
         l = strlen(argv[0]);
         i64_from_str(argv[0], l, &code);
         if (code < 0)
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 
     poll_exit(runtime_get()->poll, code);
@@ -314,7 +314,7 @@ obj_p ray_internal_command(obj_p cmd) {
                 for (i = 0; i < remaining_len && current[i] != '"'; i++)
                     ;
                 if (i >= remaining_len) {
-                    return ray_err(ERR_PARSE);
+                    return err_new(EC_PARSE);
                 }
 
                 // Null terminate the argument
@@ -366,7 +366,7 @@ obj_p ray_system(obj_p cmd) {
     obj_p c, res;
 
     if (cmd->type != TYPE_C8)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     // Try internal command first
     res = ray_internal_command(cmd);
@@ -378,7 +378,7 @@ obj_p ray_system(obj_p cmd) {
 
     fp = popen(AS_C8(c), "r");
     if (fp == NULL)
-        return ray_err(ERR_SYS);
+        return err_os();
 
     res = LIST(0);
 
@@ -408,7 +408,7 @@ obj_p ray_system(obj_p cmd) {
     // Check command execution status
     if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
         drop_obj(res);
-        return ray_err(ERR_SYS);
+        return err_os();
     }
 
     return res;

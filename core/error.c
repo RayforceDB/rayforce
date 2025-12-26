@@ -7,9 +7,37 @@
 #include "heap.h"
 #include "string.h"
 #include "def.h"
+#include "util.h"
 
-// Platform-specific errno access (internal helper)
-static i32_t sys_errno(nil_t) {
+// ============================================================================
+// Error Code Names
+// ============================================================================
+static lit_p err_names[] = {
+    "ok",      // EC_OK
+    "type",    // EC_TYPE
+    "length",  // EC_LENGTH
+    "domain",  // EC_DOMAIN
+    "index",   // EC_INDEX
+    "value",   // EC_VALUE
+    "limit",   // EC_LIMIT
+    "os",      // EC_OS
+    "parse",   // EC_PARSE
+    "nyi",     // EC_NYI
+    "",        // EC_USER
+};
+
+_Static_assert(sizeof(err_names) / sizeof(err_names[0]) == EC_MAX, "err_names must match err_code_t");
+
+lit_p err_name(err_code_t code) {
+    if (code >= EC_MAX)
+        return "error";
+    return err_names[code];
+}
+
+// ============================================================================
+// Platform errno
+// ============================================================================
+static i32_t get_errno(nil_t) {
 #ifdef OS_WINDOWS
     return (i32_t)GetLastError();
 #else
@@ -17,222 +45,175 @@ static i32_t sys_errno(nil_t) {
 #endif
 }
 
-// Platform-specific strerror (internal helper)
-static lit_p sys_strerror(i32_t errnum, str_p buf, i64_t buflen) {
-#ifdef OS_WINDOWS
-    if (errnum == 0)
-        errnum = (i32_t)GetLastError();
-    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, errnum,
-                   MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buf, (DWORD)buflen, NULL);
-    // Remove trailing newlines
-    i64_t len = strlen(buf);
-    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
-        buf[--len] = '\0';
-    return buf;
-#else
-    if (errnum == 0)
-        errnum = errno;
-#if defined(_GNU_SOURCE) && !defined(OS_MACOS)
-    // GNU version returns char*
-    return strerror_r(errnum, buf, buflen);
-#else
-    // XSI/POSIX version returns int
-    if (strerror_r(errnum, buf, buflen) == 0)
-        return buf;
-    snprintf(buf, buflen, "Unknown error %d", errnum);
-    return buf;
-#endif
-#endif
-}
+// ============================================================================
+// Error Creation
+// ============================================================================
 
-// Extended error with variable length message stored in raw[] (internal helper)
-static obj_p ray_err_ext(lit_p code, lit_p msg) {
-    i64_t code_len = strlen(code);
-    i64_t msg_len = msg ? strlen(msg) : 0;
-    i64_t total_len = code_len + (msg_len > 0 ? 2 + msg_len : 0);  // "code: msg" or just "code"
-
-    obj_p obj = (obj_p)heap_alloc(sizeof(struct obj_t) + total_len + 1);
-    obj->mmod = MMOD_INTERNAL;
-    obj->type = TYPE_ERR;
-    obj->rc = 1;
-    obj->attrs = ERR_ATTR_EXTENDED;
-    obj->len = total_len;
-
-    str_p dst = (str_p)(obj + 1);
-    memcpy(dst, code, code_len);
-    if (msg_len > 0) {
-        dst[code_len] = ':';
-        dst[code_len + 1] = ' ';
-        memcpy(dst + code_len + 2, msg, msg_len);
-    }
-    dst[total_len] = '\0';
-
-    return obj;
-}
-
-// Error creation - if msg is "sys", capture errno and create extended error
-obj_p ray_err(lit_p msg) {
-    // Check if this is a system error request
-    if (strcmp(msg, ERR_SYS) == 0) {
-        char buf[256];
-        i32_t errnum = sys_errno();
-        if (errnum != 0) {
-            sys_strerror(errnum, buf, sizeof(buf));
-            return ray_err_ext(msg, buf);
-        }
-    }
-
-    // Default: short error stored in i64 (max 7 chars)
+static inline obj_p err_alloc(err_code_t code) {
     obj_p obj = (obj_p)heap_alloc(sizeof(struct obj_t));
     obj->mmod = MMOD_INTERNAL;
     obj->type = TYPE_ERR;
     obj->rc = 1;
-    obj->attrs = ERR_ATTR_SHORT;
-    obj->i64 = 0;
-    strncpy((char *)&obj->i64, msg, 7);
+    obj->attrs = (u8_t)code;
+    obj->i64 = 0;  // Clear context
     return obj;
 }
 
-// Error code names for display (indexed by err_code_t)
-static lit_p err_code_names[] = {
-    "ok",      // EC_OK
-    "type",    // EC_TYPE
-    "length",  // EC_LEN
-    "arity",   // EC_ARITY
-    "index",   // EC_INDEX
-    "range",   // EC_RANGE
-    "key",     // EC_KEY
-    "val",     // EC_VAL
-    "arg",     // EC_ARG
-    "stack",   // EC_STACK
-    "empty",   // EC_EMPTY
-    "nfound",  // EC_NFOUND
-    "io",      // EC_IO
-    "sys",     // EC_SYS
-    "parse",   // EC_PARSE
-    "eval",    // EC_EVAL
-    "oom",     // EC_OOM
-    "nyi",     // EC_NYI
-    "bad",     // EC_BAD
-    "join",    // EC_JOIN
-    "init",    // EC_INIT
-    "uflow",   // EC_UFLOW
-    "oflow",   // EC_OFLOW
-    "raise",   // EC_RAISE
-    "fmt",     // EC_FMT
-    "heap",    // EC_HEAP
-};
+obj_p err_new(err_code_t code) { return err_alloc(code); }
+
+obj_p err_type(i8_t expected, i8_t actual, i64_t field) {
+    obj_p err = err_alloc(EC_TYPE);
+    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
+    ctx->types.expected = expected;
+    ctx->types.actual = actual;
+    ctx->types.field = (i32_t)field;
+    return err;
+}
+
+obj_p err_length(i32_t need, i32_t have) {
+    obj_p err = err_alloc(EC_LENGTH);
+    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
+    ctx->counts.need = need;
+    ctx->counts.have = have;
+    return err;
+}
+
+obj_p err_index(i32_t idx, i32_t len) {
+    obj_p err = err_alloc(EC_INDEX);
+    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
+    ctx->bounds.idx = idx;
+    ctx->bounds.len = len;
+    return err;
+}
+
+obj_p err_value(i64_t sym) {
+    obj_p err = err_alloc(EC_VALUE);
+    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
+    ctx->symbol = sym;
+    return err;
+}
+
+obj_p err_limit(i32_t limit) {
+    obj_p err = err_alloc(EC_LIMIT);
+    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
+    ctx->counts.have = limit;
+    return err;
+}
+
+obj_p err_os(nil_t) {
+    obj_p err = err_alloc(EC_OS);
+    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
+    ctx->errnum = get_errno();
+    return err;
+}
+
+obj_p err_user(lit_p msg) {
+    i64_t len = msg ? strlen(msg) : 0;
+    obj_p obj = (obj_p)heap_alloc(sizeof(struct obj_t) + len + 1);
+    obj->mmod = MMOD_INTERNAL;
+    obj->type = TYPE_ERR;
+    obj->rc = 1;
+    obj->attrs = (u8_t)EC_USER;
+    obj->len = len;
+    obj->i64 = 0;
+    if (len > 0)
+        memcpy((str_p)(obj + 1), msg, len + 1);
+    else
+        ((str_p)(obj + 1))[0] = '\0';
+    return obj;
+}
+
+// ============================================================================
+// Error Decoding
+// ============================================================================
+
+err_code_t err_code(obj_p err) {
+    if (err == NULL_OBJ || err->type != TYPE_ERR)
+        return EC_OK;
+    return (err_code_t)err->attrs;
+}
+
+err_ctx_t* err_ctx(obj_p err) {
+    static err_ctx_t empty = {0};
+    if (err == NULL_OBJ || err->type != TYPE_ERR)
+        return &empty;
+    return (err_ctx_t*)&err->i64;
+}
+
+lit_p err_get_message(obj_p err) {
+    if (err == NULL_OBJ || err->type != TYPE_ERR)
+        return "";
+    if (err_code(err) != EC_USER)
+        return "";
+    if (err->len == 0)
+        return "";
+    return (lit_p)(err + 1);
+}
+
+// ============================================================================
+// String-based API (for deserialization)
+// ============================================================================
+
+obj_p ray_err(lit_p msg) {
+    if (strcmp(msg, "type") == 0)
+        return err_new(EC_TYPE);
+    if (strcmp(msg, "length") == 0)
+        return err_new(EC_LENGTH);
+    if (strcmp(msg, "arity") == 0)
+        return err_new(EC_LENGTH);
+    if (strcmp(msg, "domain") == 0)
+        return err_new(EC_DOMAIN);
+    if (strcmp(msg, "range") == 0)
+        return err_new(EC_DOMAIN);
+    if (strcmp(msg, "index") == 0)
+        return err_new(EC_INDEX);
+    if (strcmp(msg, "value") == 0)
+        return err_new(EC_VALUE);
+    if (strcmp(msg, "nfound") == 0)
+        return err_new(EC_VALUE);
+    if (strcmp(msg, "eval") == 0)
+        return err_new(EC_VALUE);
+    if (strcmp(msg, "key") == 0)
+        return err_new(EC_VALUE);
+    if (strcmp(msg, "limit") == 0)
+        return err_new(EC_LIMIT);
+    if (strcmp(msg, "stack") == 0)
+        return err_new(EC_LIMIT);
+    if (strcmp(msg, "oom") == 0)
+        return err_new(EC_LIMIT);
+    if (strcmp(msg, "heap") == 0)
+        return err_new(EC_LIMIT);
+    if (strcmp(msg, "os") == 0)
+        return err_os();
+    if (strcmp(msg, "sys") == 0)
+        return err_os();
+    if (strcmp(msg, "io") == 0)
+        return err_os();
+    if (strcmp(msg, "parse") == 0)
+        return err_new(EC_PARSE);
+    if (strcmp(msg, "nyi") == 0)
+        return err_new(EC_NYI);
+    if (strcmp(msg, "raise") == 0)
+        return err_user(NULL);
+    if (strcmp(msg, "bad") == 0)
+        return err_new(EC_DOMAIN);
+    if (strcmp(msg, "join") == 0)
+        return err_new(EC_TYPE);
+    if (strcmp(msg, "init") == 0)
+        return err_os();
+    if (strcmp(msg, "empty") == 0)
+        return err_new(EC_DOMAIN);
+
+    return err_user(msg);
+}
 
 lit_p ray_err_msg(obj_p err) {
     if (err == NULL_OBJ || err->type != TYPE_ERR)
         return "";
-    if (err->attrs == ERR_ATTR_EXTENDED)
+
+    err_code_t code = err_code(err);
+    if (code == EC_USER && err->len > 0)
         return (lit_p)(err + 1);
-    if (err->attrs == ERR_ATTR_CONTEXT) {
-        // Context error - code is in first byte of i64
-        u8_t code = (u8_t)(err->i64 & 0xFF);
-        if (code < EC_MAX)
-            return err_code_names[code];
-        return "error";
-    }
-    return (lit_p)&err->i64;
+
+    return err_name(code);
 }
-
-// Get error code from context error
-err_code_t ray_err_code(obj_p err) {
-    if (err == NULL_OBJ || err->type != TYPE_ERR)
-        return EC_OK;
-    if (err->attrs == ERR_ATTR_CONTEXT)
-        return (err_code_t)(err->i64 & 0xFF);
-    return EC_OK;  // Legacy errors don't have numeric codes
-}
-
-// Get context count
-i64_t ray_err_ctx_count(obj_p err) {
-    if (err == NULL_OBJ || err->type != TYPE_ERR || err->attrs != ERR_ATTR_CONTEXT)
-        return 0;
-    return (err->i64 >> 8) & 0xFF;
-}
-
-// Get context entry by index
-err_ctx_t *ray_err_ctx(obj_p err, i64_t idx) {
-    if (err == NULL_OBJ || err->type != TYPE_ERR || err->attrs != ERR_ATTR_CONTEXT)
-        return NULL;
-    i64_t count = (err->i64 >> 8) & 0xFF;
-    if (idx < 0 || idx >= count)
-        return NULL;
-    return ((err_ctx_t *)(err + 1)) + idx;
-}
-
-// Create error with 1 context entry
-obj_p ray_err_ctx1(err_code_t code, ctx_type_t t1, i64_t v1) {
-    obj_p obj = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(err_ctx_t));
-    obj->mmod = MMOD_INTERNAL;
-    obj->type = TYPE_ERR;
-    obj->rc = 1;
-    obj->attrs = ERR_ATTR_CONTEXT;
-    obj->i64 = (i64_t)code | (1LL << 8);  // code + count
-
-    err_ctx_t *ctx = (err_ctx_t *)(obj + 1);
-    ctx->type = t1;
-    ctx->val = v1;
-    memset(ctx->_pad, 0, sizeof(ctx->_pad));
-
-    return obj;
-}
-
-// Create error with 2 context entries
-obj_p ray_err_ctx2(err_code_t code, ctx_type_t t1, i64_t v1, ctx_type_t t2, i64_t v2) {
-    obj_p obj = (obj_p)heap_alloc(sizeof(struct obj_t) + 2 * sizeof(err_ctx_t));
-    obj->mmod = MMOD_INTERNAL;
-    obj->type = TYPE_ERR;
-    obj->rc = 1;
-    obj->attrs = ERR_ATTR_CONTEXT;
-    obj->i64 = (i64_t)code | (2LL << 8);  // code + count
-
-    err_ctx_t *ctx = (err_ctx_t *)(obj + 1);
-    ctx[0].type = t1;
-    ctx[0].val = v1;
-    memset(ctx[0]._pad, 0, sizeof(ctx[0]._pad));
-    ctx[1].type = t2;
-    ctx[1].val = v2;
-    memset(ctx[1]._pad, 0, sizeof(ctx[1]._pad));
-
-    return obj;
-}
-
-// Create error with 3 context entries
-obj_p ray_err_ctx3(err_code_t code, ctx_type_t t1, i64_t v1, ctx_type_t t2, i64_t v2, ctx_type_t t3, i64_t v3) {
-    obj_p obj = (obj_p)heap_alloc(sizeof(struct obj_t) + 3 * sizeof(err_ctx_t));
-    obj->mmod = MMOD_INTERNAL;
-    obj->type = TYPE_ERR;
-    obj->rc = 1;
-    obj->attrs = ERR_ATTR_CONTEXT;
-    obj->i64 = (i64_t)code | (3LL << 8);  // code + count
-
-    err_ctx_t *ctx = (err_ctx_t *)(obj + 1);
-    ctx[0].type = t1;
-    ctx[0].val = v1;
-    memset(ctx[0]._pad, 0, sizeof(ctx[0]._pad));
-    ctx[1].type = t2;
-    ctx[1].val = v2;
-    memset(ctx[1]._pad, 0, sizeof(ctx[1]._pad));
-    ctx[2].type = t3;
-    ctx[2].val = v3;
-    memset(ctx[2]._pad, 0, sizeof(ctx[2]._pad));
-
-    return obj;
-}
-
-// System error - captures current errno/GetLastError
-obj_p sys_error(lit_p code) {
-    char buf[256];
-    i32_t errnum = sys_errno();
-
-    if (errnum == 0)
-        return ray_err(code);
-
-    sys_strerror(errnum, buf, sizeof(buf));
-    return ray_err_ext(code, buf);
-}
-

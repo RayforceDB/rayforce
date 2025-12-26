@@ -98,7 +98,7 @@ obj_p remap_group(obj_p *gvals, obj_p cols, obj_p gkeys, obj_p gcols, query_ctx_
 
             return res;
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 }
 
@@ -124,7 +124,7 @@ obj_p get_gkeys(obj_p cols, obj_p obj) {
         case TYPE_DICT:
             x = AS_LIST(obj)[0];
             if (x->type != TYPE_SYMBOL)
-                return ray_err(ERR_TYPE);
+                return err_new(EC_TYPE);
 
             if (x->len == 1)
                 return at_idx(AS_LIST(obj)[0], 0);
@@ -211,7 +211,7 @@ obj_p select_fetch_table(obj_p obj, query_ctx_p ctx) {
     prm = at_sym(obj, "from", 4);
 
     if (is_null(prm))
-        return ray_err_ctx1(EC_ARG, CTX_FIELD, symbols_intern("from", 4));
+        return err_value(symbols_intern("from", 4));
 
     val = eval(prm);
     drop_obj(prm);
@@ -222,8 +222,7 @@ obj_p select_fetch_table(obj_p obj, query_ctx_p ctx) {
     if (val->type != TYPE_TABLE) {
         i8_t actual_type = val->type;
         drop_obj(val);
-        return ray_err_ctx2(EC_TYPE, CTX_FIELD, symbols_intern("from", 4), CTX_EXPECTED,
-                            ((i64_t)TYPE_TABLE << 8) | (actual_type & 0xFF));
+        return err_type(TYPE_TABLE, actual_type, symbols_intern("from", 4));
     }
 
     ctx->tablen = AS_LIST(val)[0]->len;
@@ -549,10 +548,10 @@ obj_p ray_select(obj_p obj) {
     query_ctx_init(&ctx);
 
     if (obj->type != TYPE_DICT)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (AS_LIST(obj)[0]->type != TYPE_SYMBOL)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     timeit_span_start("select");
 

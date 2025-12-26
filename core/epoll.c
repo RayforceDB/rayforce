@@ -428,13 +428,13 @@ option_t poll_block_on(poll_p poll, selector_p selector) {
         ret = select(selector->fd + 1, &readfds, NULL, NULL, &timeout);
         if (ret == -1) {
             LOG_ERROR("select failed");
-            return option_error(sys_error(ERR_IO));
+            return option_error(err_os());
         }
 
         LOG_TRACE("select returned %lld", ret);
 
         if (ret == 0)
-            return option_error(sys_error(ERR_IO));
+            return option_error(err_os());
 
         // In case we have a low level IO recv function, use it
         if (selector->rx.buf != NULL && selector->rx.recv_fn != NULL) {
@@ -442,7 +442,7 @@ option_t poll_block_on(poll_p poll, selector_p selector) {
 
             if (nbytes == -1) {
                 poll_deregister(poll, selector->id);
-                return option_error(sys_error(ERR_IO));
+                return option_error(err_os());
             }
 
             if (nbytes == 0)

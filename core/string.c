@@ -606,10 +606,10 @@ obj_p str_split(lit_p str, i64_t str_len, lit_p delim, i64_t delim_len) {
 
     // Input validation
     if (str == NULL || delim == NULL)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (delim_len == 0)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     // Create empty list
     result = LIST(0);

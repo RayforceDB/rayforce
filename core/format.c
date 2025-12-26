@@ -59,7 +59,7 @@ const lit_p unicode_glyphs[] = {"│", "─", "┌", "┐", "└", "┘", "├",
                                 "❯", "∶", "‾", "•", "╭", "╰", "╮", "╯", "┆", "…", "█"};
 obj_p ray_set_fpr(obj_p x) {
     if (x->type != -TYPE_I64)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (x->i64 < 0)
         F64_PRECISION = DEFAULT_F64_PRECISION;
@@ -648,51 +648,76 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, str_p msg, i32_t msg_len, b8_t
     return n;
 }
 
-// Format a single context entry
-static i64_t error_ctx_fmt_into(obj_p *dst, err_ctx_t *ctx) {
+// Format error context based on error code
+static i64_t error_ctx_fmt_into_new(obj_p *dst, obj_p err) {
     i64_t n = 0;
-    i64_t expected, actual;
+    err_code_t code = err_code(err);
+    err_ctx_t* ctx = err_ctx(err);
     str_p name;
+    lit_p msg;
 
-    switch (ctx->type) {
-        case CTX_EXPECTED:
-            expected = (ctx->val >> 8) & 0xFF;
-            actual = ctx->val & 0xFF;
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "expected %s%s%s, got %s%s%s",
-                              CYAN, type_name((i8_t)expected), RESET,
-                              YELLOW, type_name((i8_t)actual), RESET);
+    switch (code) {
+        case EC_TYPE: {
+            err_types_t t = ctx->types;
+            if (t.field) {
+                str_p fname = str_from_symbol(t.field);
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s in field '%s%s%s'\n",
+                                  GRAY, RESET, GREEN, fname, RESET);
+            }
+            if (t.expected != 0 || t.actual != 0) {
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%s%s, got %s%s%s\n",
+                                  GRAY, RESET, CYAN, type_name(t.expected), RESET,
+                                  YELLOW, type_name(t.actual), RESET);
+            }
             break;
-        case CTX_ARGUMENT:
-            name = str_from_symbol(ctx->val);
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "in argument %s'%s'%s", GREEN, name, RESET);
+        }
+        case EC_LENGTH: {
+            err_counts_t c = ctx->counts;
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s need %s%d%s, have %s%d%s\n",
+                              GRAY, RESET, CYAN, c.need, RESET, YELLOW, c.have, RESET);
             break;
-        case CTX_FIELD:
-            name = str_from_symbol(ctx->val);
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "in field %s'%s'%s", GREEN, name, RESET);
+        }
+        case EC_INDEX: {
+            err_bounds_t b = ctx->bounds;
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s index %s%d%s not in [0, %s%d%s)\n",
+                              GRAY, RESET, YELLOW, b.idx, RESET, CYAN, b.len, RESET);
             break;
-        case CTX_FUNCTION:
-            name = str_from_symbol(ctx->val);
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "in %s%s%s", GREEN, name, RESET);
+        }
+        case EC_VALUE: {
+            i64_t sym = ctx->symbol;
+            if (sym) {
+                name = str_from_symbol(sym);
+                if (name && name[0]) {
+                    n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s '%s%s%s' not found\n",
+                                      GRAY, RESET, GREEN, name, RESET);
+                }
+            }
             break;
-        case CTX_INDEX:
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "at index %s%lld%s", YELLOW, ctx->val, RESET);
+        }
+        case EC_OS: {
+            i32_t e = ctx->errnum;
+            if (e) {
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n",
+                                  GRAY, RESET, YELLOW, strerror(e), RESET);
+            }
             break;
-        case CTX_KEY:
-            name = str_from_symbol(ctx->val);
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "for key %s'%s'%s", GREEN, name, RESET);
+        }
+        case EC_USER: {
+            msg = err_get_message(err);
+            if (msg && msg[0]) {
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n",
+                                  GRAY, RESET, YELLOW, msg, RESET);
+            }
             break;
-        case CTX_VALUE:
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "value: %s%lld%s", YELLOW, ctx->val, RESET);
+        }
+        case EC_LIMIT: {
+            err_counts_t c = ctx->counts;
+            if (c.have > 0) {
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s limit %s%d%s exceeded\n",
+                                  GRAY, RESET, YELLOW, c.have, RESET);
+            }
             break;
-        case CTX_GOT:
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "got %s%s%s", YELLOW, type_name((i8_t)ctx->val), RESET);
-            break;
-        case CTX_NEED:
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "need %s%lld%s", CYAN, ctx->val, RESET);
-            break;
-        case CTX_HAVE:
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "have %s%lld%s", YELLOW, ctx->val, RESET);
-            break;
+        }
         default:
             break;
     }
@@ -700,40 +725,29 @@ static i64_t error_ctx_fmt_into(obj_p *dst, err_ctx_t *ctx) {
 }
 
 i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
-    i64_t n, ctx_count, i;
+    i64_t n;
     i32_t msg_len;
     u16_t j, l, m;
-    lit_p err_code;
+    lit_p code_name;
     obj_p locs;
     vm_p vm;
-    err_ctx_t *ctx;
 
     UNUSED(limit);
 
-    // Get error code (stored in i64 field, max 7 chars)
-    err_code = ray_err_msg(obj);
-    msg_len = (i32_t)strlen(err_code);
+    // Get error code name
+    code_name = ray_err_msg(obj);
+    msg_len = (i32_t)strlen(code_name);
 
     // Check for locations in VM's trace
     vm = VM;
     locs = (vm && vm->trace != NULL_OBJ) ? vm->trace : NULL_OBJ;
 
-    // Format header with × marker: "× Error: code"
-    n = str_fmt_into(dst, MAX_ERROR_LEN, "\n  %s×%s %sError%s: %s%s%s\n", TOMATO, RESET, TOMATO, RESET, YELLOW, err_code,
+    // Format header: "× Error: code"
+    n = str_fmt_into(dst, MAX_ERROR_LEN, "\n  %s×%s %sError%s: %s%s%s\n", TOMATO, RESET, TOMATO, RESET, YELLOW, code_name,
                      RESET);
 
-    // Format context entries if this is a context error
-    ctx_count = ray_err_ctx_count(obj);
-    if (ctx_count > 0) {
-        for (i = 0; i < ctx_count; i++) {
-            ctx = ray_err_ctx(obj, i);
-            if (ctx) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s ", GRAY, RESET);
-                n += error_ctx_fmt_into(dst, ctx);
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "\n");
-            }
-        }
-    }
+    // Format context (already includes ├─ prefix and newline)
+    n += error_ctx_fmt_into_new(dst, obj);
 
     // Format with locations if available
     if (locs != NULL_OBJ) {
@@ -743,7 +757,7 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
         m = l > ERR_STACK_MAX_HEIGHT ? ERR_STACK_MAX_HEIGHT : l;
 
         for (j = 0; j < m; j++) {
-            n += error_frame_fmt_into(dst, AS_LIST(locs)[j], (str_p)err_code, msg_len, j == 0);
+            n += error_frame_fmt_into(dst, AS_LIST(locs)[j], (str_p)code_name, msg_len, j == 0);
             msg_len = 0;  // Only show message on first frame
             // Add spacing between frames (except after last)
             if (j < m - 1)

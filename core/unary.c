@@ -54,18 +54,18 @@ obj_p ray_get(obj_p x) {
         case -TYPE_SYMBOL:
             sym = resolve(x->i64);
             if (sym == NULL)
-                return ray_err(ERR_TYPE);
+                return err_new(EC_TYPE);
 
             return clone_obj(*sym);
         case TYPE_C8:
             if (x->len == 0)
-                return ray_err(ERR_ARG);
+                return err_new(EC_TYPE);
 
             path = cstring_from_obj(x);
             fd = fs_fopen(AS_C8(path), ATTR_RDWR);
 
             if (fd == -1) {
-                res = sys_error(ERR_SYS);
+                res = err_os();
                 drop_obj(path);
                 return res;
             }
@@ -73,7 +73,7 @@ obj_p ray_get(obj_p x) {
             size = fs_fsize(fd);
 
             if (size < ISIZEOF(struct obj_t)) {
-                res = ray_err(ERR_TYPE);
+                res = err_new(EC_TYPE);
                 drop_obj(path);
                 fs_fclose(fd);
                 return res;
@@ -82,7 +82,7 @@ obj_p ray_get(obj_p x) {
             res = (obj_p)mmap_file(fd, NULL, size, 0);
 
             if (res == NULL) {
-                res = ray_err(ERR_TYPE);
+                res = err_new(EC_TYPE);
                 drop_obj(path);
                 fs_fclose(fd);
                 return res;
@@ -105,7 +105,7 @@ obj_p ray_get(obj_p x) {
                 fdmap_add_fd(&fdmap, res, fd, size);
                 runtime_fdmap_push(runtime_get(), res, fdmap);
             } else {
-                res = ray_err(ERR_TYPE);
+                res = err_new(EC_TYPE);
                 drop_obj(path);
                 return res;
             }
@@ -123,7 +123,7 @@ obj_p ray_get(obj_p x) {
                 if (keys->type != TYPE_U8) {
                     drop_obj(keys);
                     mmap_free(res, size);
-                    return ray_err(ERR_TYPE);
+                    return err_new(EC_TYPE);
                 }
 
                 ((obj_p)((str_p)res - RAY_PAGE_SIZE))->obj = keys;
@@ -131,13 +131,13 @@ obj_p ray_get(obj_p x) {
             return clone_obj(res);  // increment ref count
 
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 }
 
 obj_p ray_resolve(obj_p x) {
     if (x->type != -TYPE_SYMBOL)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     obj_p *res = resolve(x->i64);
 

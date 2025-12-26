@@ -5182,7 +5182,7 @@ test_result_t test_lang_safety() {
     TEST_ASSERT_ER("(do (set v [1 2]) (modify 'v * 2))", "length");
 
     // ========== OUT OF BOUNDS ACCESS ==========
-    TEST_ASSERT_ER("(do (set v [1 2 3]) (alter 'v set -10 0))", "type");
+    TEST_ASSERT_ER("(do (set v [1 2 3]) (alter 'v set -10 0))", "index");
 
     // ========== NULL OPERATIONS ==========
     TEST_ASSERT_ER("(+ null 1)", "type");

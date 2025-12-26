@@ -382,7 +382,7 @@ OP_RESOLVE:
     x = pop();
     val = resolve(x->i64);
     if (UNLIKELY(val == NULL)) {
-        r = ray_err(ERR_EVAL);
+        r = err_value(x->i64);  // symbol not found
         drop_obj(x);
         bc_error_add_loc(r, vm->fn, ip - 1);
         return r;
@@ -440,8 +440,9 @@ OP_CALLN:
 OP_CALLF:
     x = pop();  // lambda function
     if (UNLIKELY(x->type != TYPE_LAMBDA)) {
+        i8_t got = x->type;
         drop_obj(x);
-        r = ray_err(ERR_TYPE);
+        r = err_type(TYPE_LAMBDA, got, 0);
         bc_error_add_loc(r, vm->fn, ip - 1);
         return r;
     }
@@ -458,7 +459,7 @@ callf:
     // Check for stack overflow
     if (UNLIKELY(vm->rp >= VM_STACK_SIZE)) {
         drop_obj(x);
-        r = ray_err(ERR_STACK);
+        r = err_limit(VM_STACK_SIZE);
         bc_error_add_loc(r, vm->fn, ip - 1);
         return r;
     }
@@ -479,7 +480,7 @@ callf:
 OP_CALLS:
     // Self-recursive call - check for stack overflow
     if (UNLIKELY(vm->rp >= VM_STACK_SIZE)) {
-        r = ray_err(ERR_STACK);
+        r = err_limit(VM_STACK_SIZE);
         bc_error_add_loc(r, vm->fn, ip - 1);
         return r;
     }
@@ -498,7 +499,7 @@ OP_CALLD:
         case TYPE_UNARY:
             if (UNLIKELY(n != 1)) {
                 drop_obj(x);
-                r = ray_err(ERR_ARITY);
+                r = err_length(1, n);
                 bc_error_add_loc(r, vm->fn, ip - 1);
                 return r;
             }
@@ -515,7 +516,7 @@ OP_CALLD:
         case TYPE_BINARY:
             if (UNLIKELY(n != 2)) {
                 drop_obj(x);
-                r = ray_err(ERR_ARITY);
+                r = err_length(2, n);
                 bc_error_add_loc(r, vm->fn, ip - 1);
                 return r;
             }
@@ -546,11 +547,13 @@ OP_CALLD:
             break;
         case TYPE_LAMBDA:
             goto callf;
-        default:
+        default: {
+            i8_t got = x->type;
             drop_obj(x);
-            r = ray_err(ERR_TYPE);
+            r = err_type(0, got & 0xFF, 0);  // not callable
             bc_error_add_loc(r, vm->fn, ip - 1);
             return r;
+        }
     }
     next();
 
@@ -744,7 +747,7 @@ static obj_p eval_vary(obj_p fn, obj_p *args, i64_t len, i64_t id) {
     }
 
     if (!vm_stack_enough(len))
-        return unwrap(ray_err(ERR_STACK), id);
+        return unwrap(err_limit(VM_STACK_SIZE), id);
 
     for (i = 0; i < len; i++) {
         x = eval_arg(args[i], is_aggr);
@@ -768,10 +771,10 @@ static obj_p eval_lambda(obj_p fn, obj_p *args, i64_t len, i64_t id) {
     lambda_p lam = AS_LAMBDA(fn);
 
     if (len != lam->args->len)
-        return unwrap(ray_err(ERR_ARITY), id);
+        return unwrap(err_length(lam->args->len, len), id);
 
     if (!vm_stack_enough(len))
-        return unwrap(ray_err(ERR_STACK), id);
+        return unwrap(err_limit(VM_STACK_SIZE), id);
 
     for (i = 0; i < len; i++) {
         x = eval(args[i]);
@@ -796,7 +799,7 @@ static inline obj_p eval_sym(obj_p sym) {
 
     val = resolve(sym->i64);
     if (val == NULL)
-        return unwrap(ray_err(ERR_EVAL), (i64_t)sym);
+        return unwrap(err_value(sym->i64), (i64_t)sym);
 
     return clone_obj(*val);
 }
@@ -819,12 +822,12 @@ dispatch:
     switch (car->type) {
         case TYPE_UNARY:
             if (len != 1)
-                return unwrap(ray_err(ERR_ARITY), id);
+                return unwrap(err_length(1, len), id);
             return eval_unary(car, args, id);
 
         case TYPE_BINARY:
             if (len != 2)
-                return unwrap(ray_err(ERR_ARITY), id);
+                return unwrap(err_length(2, len), id);
             return eval_binary(car, args, id);
 
         case TYPE_VARY:
@@ -836,12 +839,12 @@ dispatch:
         case -TYPE_SYMBOL:
             val = resolve(car->i64);
             if (val == NULL)
-                return unwrap(ray_err(ERR_EVAL), id);
+                return unwrap(err_value(car->i64), id);
             car = *val;
             goto dispatch;
 
         default:
-            return unwrap(ray_err(ERR_EVAL), id);
+            return unwrap(err_type(0, car->type & 0xFF, 0), id);
     }
 }
 
@@ -875,10 +878,10 @@ obj_p ray_raise(obj_p obj) {
     obj_p e;
 
     if (obj->type != TYPE_C8)
-        return ray_err(ERR_TYPE);
+        return err_type(TYPE_C8, obj->type, 0);
 
     // Clone the message since error_obj takes ownership but caller drops the argument
-    e = ray_err(ERR_RAISE);
+    e = err_user(NULL);
     return e;
 }
 
@@ -887,7 +890,7 @@ obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file) {
     obj_p info, res;
 
     if (str->type != TYPE_C8)
-        return ray_err(ERR_TYPE);
+        return err_type(TYPE_C8, str->type, 0);
 
     info = nfo(clone_obj(file), clone_obj(str));
     res = parse(AS_C8(str), str->len, info);
@@ -939,7 +942,7 @@ obj_p ray_eval_str(obj_p str, obj_p file) {
     obj_p info;
 
     if (str->type != TYPE_C8)
-        return ray_err(ERR_TYPE);
+        return err_type(TYPE_C8, str->type, 0);
 
     // Always create nfo for source tracking; use "repl" if no file provided
     if (file != NULL && file != NULL_OBJ)
@@ -965,7 +968,7 @@ obj_p try_obj(obj_p obj, obj_p ctch) {
             call_catch:
                 if (AS_LAMBDA(fn)->args->len != 1) {
                     drop_obj(res);
-                    return ray_err(ERR_ARITY);
+                    return err_length(1, AS_LAMBDA(fn)->args->len);
                 }
                 // Push error message as string for catch handler
                 vm_stack_push(str_fmt(-1, "%s", ray_err_msg(res)));

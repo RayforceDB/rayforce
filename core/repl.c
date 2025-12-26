@@ -105,7 +105,7 @@ option_t repl_read(poll_p poll, selector_p selector) {
 
         if (len <= 0) {
             poll->code = (len < 0) ? 1 : 0;
-            return option_error(sys_error(ERR_IO));
+            return option_error(err_os());
         }
 
         line_buf[len] = '\0';
@@ -115,7 +115,7 @@ option_t repl_read(poll_p poll, selector_p selector) {
 
     if (!term_getc(repl->term)) {
         poll->code = 1;
-        return option_error(sys_error(ERR_IO));
+        return option_error(err_os());
     }
 
     str = term_read(repl->term);

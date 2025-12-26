@@ -89,14 +89,14 @@ obj_p ray_os_get_var(obj_p x) {
     obj_p s;
 
     if (x->type != TYPE_C8)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     s = cstring_from_str(AS_C8(x), x->len);
     res = os_get_var(AS_C8(s), buf, sizeof(buf));
     drop_obj(s);
 
     if (res == -1)
-        return ray_err(ERR_NFOUND);
+        return err_new(EC_VALUE);
 
     return string_from_str(buf, strlen(buf));
 }
@@ -106,7 +106,7 @@ obj_p ray_os_set_var(obj_p x, obj_p y) {
     obj_p sx, sy;
 
     if (x->type != TYPE_C8 || y->type != TYPE_C8)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     sx = cstring_from_str(AS_C8(x), x->len);
     sy = cstring_from_str(AS_C8(y), y->len);
@@ -115,11 +115,11 @@ obj_p ray_os_set_var(obj_p x, obj_p y) {
     drop_obj(sy);
 
     if (res == -1)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
     if (res == -2)
-        return ray_err(ERR_LEN);
+        return err_new(EC_LENGTH);
     if (res == -3)
-        return ray_err(ERR_SYS);
+        return err_os();
 
     return NULL_OBJ;
 }

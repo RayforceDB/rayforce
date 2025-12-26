@@ -48,7 +48,7 @@ obj_p select_column(obj_p left_col, obj_p right_col, i64_t ids[], i64_t len) {
     type = is_null(left_col) ? right_col->type : left_col->type;
 
     if (right_col->type != type)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     res = vector(type, len);
 
@@ -75,7 +75,7 @@ obj_p get_column(obj_p left_col, obj_p right_col, obj_p lids, obj_p rids) {
     type = is_null(left_col) ? right_col->type : left_col->type;
 
     if (right_col->type != type)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     return at_ids(right_col, AS_I64(rids), rids->len);
 }
@@ -100,7 +100,7 @@ static obj_p __left_join_inner(obj_p ltab, obj_p rtab, obj_p ksyms, obj_p kcols,
 
     if (l == 0) {
         drop_obj(cols);
-        return ray_err(ERR_JOIN);
+        return err_new(EC_TYPE);
     }
 
     // resulting columns
@@ -159,16 +159,16 @@ obj_p ray_left_join(obj_p *x, i64_t n) {
     obj_p k1, k2, idx, res;
 
     if (n != 3)
-        return ray_err(ERR_JOIN);
+        return err_new(EC_TYPE);
 
     if (x[0]->type != TYPE_SYMBOL)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (x[1]->type != TYPE_TABLE)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (x[2]->type != TYPE_TABLE)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (ops_count(x[1]) == 0 || ops_count(x[2]) == 0)
         return clone_obj(x[1]);
@@ -202,16 +202,16 @@ obj_p ray_inner_join(obj_p *x, i64_t n) {
     obj_p k1, k2, c1, c2, un, col, cols, vals, idx;
 
     if (n != 3)
-        return ray_err(ERR_JOIN);
+        return err_new(EC_TYPE);
 
     if (x[0]->type != TYPE_SYMBOL)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (x[1]->type != TYPE_TABLE)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (x[2]->type != TYPE_TABLE)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (ops_count(x[1]) == 0 || ops_count(x[2]) == 0)
         return clone_obj(x[1]);
@@ -249,7 +249,7 @@ obj_p ray_inner_join(obj_p *x, i64_t n) {
     if (cols->len == 0) {
         drop_obj(idx);
         drop_obj(cols);
-        return ray_err(ERR_JOIN);
+        return err_new(EC_TYPE);
     }
 
     col = ray_concat(x[0], cols);
@@ -301,16 +301,16 @@ obj_p ray_asof_join(obj_p *x, i64_t n) {
     obj_p idx, v, ajkl, ajkr, keys, lvals, rvals, res;
 
     if (n != 3)
-        return ray_err(ERR_ARITY);
+        return err_new(EC_LENGTH);
 
     if (x[0]->type != TYPE_SYMBOL)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (x[1]->type != TYPE_TABLE)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (x[2]->type != TYPE_TABLE)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     v = ray_last(x[0]);
     ajkl = ray_at(x[1], v);
@@ -320,13 +320,13 @@ obj_p ray_asof_join(obj_p *x, i64_t n) {
     if (is_null(ajkl) || is_null(ajkr)) {
         drop_obj(ajkl);
         drop_obj(ajkr);
-        return ray_err(ERR_KEY);
+        return err_new(EC_VALUE);
     }
 
     if (ajkl->type != ajkr->type) {
         drop_obj(ajkl);
         drop_obj(ajkr);
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
     }
 
     keys = cow_obj(x[0]);
@@ -356,22 +356,22 @@ static obj_p __window_join(obj_p *x, i64_t n, i64_t tp) {
     obj_p agrvals, resyms, recols, jtab, rtab;
 
     if (n != 5)
-        return ray_err(ERR_JOIN);
+        return err_new(EC_TYPE);
 
     if (x[0]->type != TYPE_SYMBOL)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (x[1]->type != TYPE_LIST)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (x[2]->type != TYPE_TABLE)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (x[3]->type != TYPE_TABLE)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     if (x[4]->type != TYPE_DICT)
-        return ray_err(ERR_ARG);
+        return err_new(EC_TYPE);
 
     jtab = ray_xasc(x[3], x[0]);
     if (IS_ERR(jtab))
@@ -385,13 +385,13 @@ static obj_p __window_join(obj_p *x, i64_t n, i64_t tp) {
     if (is_null(wjkl) || is_null(wjkr)) {
         drop_obj(wjkl);
         drop_obj(wjkr);
-        return ray_err(ERR_KEY);
+        return err_new(EC_VALUE);
     }
 
     if (wjkl->type != wjkr->type) {
         drop_obj(wjkl);
         drop_obj(wjkr);
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
     }
 
     keys = cow_obj(x[0]);

@@ -266,7 +266,7 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, i64_t, i64_t, obj_p);
                                                                                                \
                 if (is_null(sym) || sym->type != TYPE_SYMBOL) {                                \
                     drop_obj(sym);                                                             \
-                    return ray_err(ERR_TYPE);                                       \
+                    return err_new(EC_TYPE);                                       \
                 }                                                                              \
                                                                                                \
                 xi = AS_I64(sym);                                                              \
@@ -290,7 +290,7 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, i64_t, i64_t, obj_p);
                                                                                                \
                 if (is_null(sym) || sym->type != TYPE_SYMBOL) {                                \
                     drop_obj(sym);                                                             \
-                    return ray_err(ERR_TYPE);                                       \
+                    return err_new(EC_TYPE);                                       \
                 }                                                                              \
                                                                                                \
                 xi = AS_I64(x);                                                                \
@@ -328,7 +328,7 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, i64_t, i64_t, obj_p);
             case MTYPE2(TYPE_NULL, TYPE_NULL):                                                 \
                 return b8(B8_TRUE);                                                            \
             default:                                                                           \
-                return ray_err(ERR_TYPE);                                           \
+                return err_new(EC_TYPE);                                           \
         }                                                                                      \
     }
 
@@ -632,7 +632,7 @@ obj_p cmp_map(raw_p op, obj_p x, obj_p y) {
 
     if (IS_VECTOR(x) && IS_VECTOR(y)) {
         if (x->len != y->len)
-            return ray_err(ERR_LEN);
+            return err_new(EC_LENGTH);
 
         l = x->len;
     } else if (IS_VECTOR(x))

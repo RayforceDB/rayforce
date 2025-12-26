@@ -28,10 +28,6 @@
 extern "C" {
 #endif
 
-//=============================================================================
-// Type Definitions
-//=============================================================================
-
 // Basic Types
 typedef char i8_t;
 typedef char c8_t;
@@ -49,10 +45,6 @@ typedef unsigned long long u64_t;
 typedef double f64_t;
 typedef void nil_t;
 typedef u8_t guid_t[16];
-
-//=============================================================================
-// Type Constants
-//=============================================================================
 
 // Simple Types
 #define TYPE_LIST 0
@@ -102,40 +94,6 @@ typedef u8_t guid_t[16];
 #define TYPE_NULL 126
 #define TYPE_ERR 127
 
-//=============================================================================
-// Result Constants
-//=============================================================================
-
-#define ERR_INIT "init"
-#define ERR_PARSE "parse"
-#define ERR_EVAL "eval"
-#define ERR_TYPE "type"
-#define ERR_LEN "length"
-#define ERR_EMPTY "empty"
-#define ERR_ARITY "arity"
-#define ERR_INDEX "index"
-#define ERR_RANGE "range"
-#define ERR_IO "io"
-#define ERR_SYS "sys"
-#define ERR_NYI "nyi"
-#define ERR_STACK "stack"
-#define ERR_RAISE "raise"
-#define ERR_UFLOW "uflow"
-#define ERR_OFLOW "oflow"
-#define ERR_NFOUND "nfound"
-#define ERR_BAD "bad"
-#define ERR_KEY "key"
-#define ERR_VAL "val"
-#define ERR_ARG "arg"
-#define ERR_OOM "oom"
-#define ERR_HEAP "heap"
-#define ERR_FMT "fmt"
-#define ERR_JOIN "join"
-
-//=============================================================================
-// Special Values
-//=============================================================================
-
 #define NULL_I16 ((i16_t)0x8000)
 #define NULL_I32 ((i32_t)0x80000000)
 #define NULL_I64 ((i64_t)0x8000000000000000LL)
@@ -149,10 +107,6 @@ typedef u8_t guid_t[16];
 #define B8_FALSE (char)0
 
 static const guid_t NULL_GUID = {0};
-
-//=============================================================================
-// Core Data Structures
-//=============================================================================
 
 // Object (generic type)
 typedef struct obj_t {
@@ -179,10 +133,6 @@ typedef struct obj_t {
 } *obj_p;
 
 typedef obj_p list_t;
-
-//=============================================================================
-// Function Declarations
-//=============================================================================
 
 // Version
 extern u8_t version(nil_t);  // get version as u8_t (major - 5 bits, minor - 3 bits)

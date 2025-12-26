@@ -43,12 +43,12 @@ obj_p ray_cast_obj(obj_p x, obj_p y) {
     i8_t type;
 
     if (x->type != -TYPE_SYMBOL)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     type = env_get_type_by_type_name(&runtime_get()->env, x->i64);
 
     if (type == TYPE_ERR)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     // Convert atom type to vector type for parallel cast when source is vector
     if (IS_VECTOR(y) && type < 0) {
@@ -133,10 +133,10 @@ obj_p __til(obj_p x, obj_p filter) {
 
 obj_p ray_til(obj_p x) {
     if (x->type != -TYPE_I64)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (x->i64 < 0)
-        return ray_err(ERR_INDEX);
+        return err_index(-1, 0);
 
     return __til(x, NULL_OBJ);
 }
@@ -193,7 +193,7 @@ obj_p ray_reverse(obj_p x) {
             break;
 
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 
     res->attrs = (x->attrs & ~(ATTR_ASC | ATTR_DESC)) | ((x->attrs & ATTR_ASC) ? ATTR_DESC : 0) |
@@ -204,10 +204,10 @@ obj_p ray_reverse(obj_p x) {
 
 obj_p ray_dict(obj_p x, obj_p y) {
     if (!IS_VECTOR(x) || !IS_VECTOR(y))
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (ops_count(x) != ops_count(y))
-        return ray_err(ERR_LEN);
+        return err_new(EC_LENGTH);
 
     return dict(clone_obj(x), clone_obj(y));
 }
@@ -218,11 +218,11 @@ obj_p ray_table(obj_p x, obj_p y) {
     obj_p lst, c, l = NULL_OBJ;
 
     if (x->type != TYPE_SYMBOL)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (y->type != TYPE_LIST) {
         if (x->len != 1)
-            return ray_err(ERR_LEN);
+            return err_new(EC_LENGTH);
 
         l = LIST(1);
         AS_LIST(l)[0] = clone_obj(y);
@@ -231,7 +231,7 @@ obj_p ray_table(obj_p x, obj_p y) {
 
     if (x->len != y->len && y->len > 0) {
         drop_obj(l);
-        return ray_err(ERR_LEN);
+        return err_new(EC_LENGTH);
     }
 
     len = y->len;
@@ -270,7 +270,7 @@ obj_p ray_table(obj_p x, obj_p y) {
             case TYPE_GUID:
                 j = AS_LIST(y)[i]->len;
                 if (cl != 0 && j != cl)
-                    return ray_err(ERR_LEN);
+                    return err_new(EC_LENGTH);
 
                 cl = j;
                 break;
@@ -278,17 +278,17 @@ obj_p ray_table(obj_p x, obj_p y) {
                 synergy = B8_FALSE;
                 j = AS_LIST(AS_LIST(y)[i])[1]->len;
                 if (cl != 0 && j != cl)
-                    return ray_err(ERR_LEN);
+                    return err_new(EC_LENGTH);
 
                 cl = j;
                 break;
             case TYPE_MAPCOMMON:
                 j = AS_LIST(AS_LIST(y)[i])[0]->len;
                 if (cl != 0 && j != cl)
-                    return ray_err(ERR_LEN);
+                    return err_new(EC_LENGTH);
                 break;
             default:
-                return ray_err(ERR_TYPE);
+                return err_new(EC_TYPE);
         }
     }
 
@@ -355,7 +355,7 @@ obj_p ray_guid(obj_p x) {
             return vec;
 
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 }
 
@@ -396,7 +396,7 @@ obj_p ray_enum(obj_p x, obj_p y) {
 
             if (!s || s->type != TYPE_SYMBOL) {
                 drop_obj(s);
-                return ray_err(ERR_TYPE);
+                return err_new(EC_TYPE);
             }
 
             v = index_find_i64(AS_I64(s), s->len, AS_I64(y), y->len);
@@ -404,12 +404,12 @@ obj_p ray_enum(obj_p x, obj_p y) {
 
             if (IS_ERR(v)) {
                 drop_obj(v);
-                return ray_err(ERR_TYPE);
+                return err_new(EC_TYPE);
             }
 
             return enumerate(clone_obj(x), v);
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 }
 
@@ -443,10 +443,10 @@ obj_p ray_rand(obj_p x, obj_p y) {
             count = x->i64;
 
             if (count < 0)
-                return ray_err(ERR_INDEX);
+                return err_index(-1, 0);
 
             if (y->i64 <= 0)
-                return ray_err(ERR_INDEX);
+                return err_index(-1, 0);
 
             vec = I64(count);
 
@@ -456,7 +456,7 @@ obj_p ray_rand(obj_p x, obj_p y) {
             return vec;
 
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 }
 
@@ -762,7 +762,7 @@ obj_p ray_concat(obj_p x, obj_p y) {
             if (kx->len != kxy->len || cmp_obj(kx, kxy) != 0) {
                 drop_obj(kx);
                 drop_obj(kxy);
-                return ray_err(ERR_TYPE);
+                return err_new(EC_TYPE);
             }
             iy = ray_find(AS_LIST(y)[0], AS_LIST(x)[0]);
 
@@ -771,7 +771,7 @@ obj_p ray_concat(obj_p x, obj_p y) {
                     drop_obj(kx);
                     drop_obj(kxy);
                     drop_obj(iy);
-                    return ray_err(ERR_TYPE);
+                    return err_new(EC_TYPE);
                 }
             }
             vec = vector(TYPE_LIST, kx->len);
@@ -828,7 +828,7 @@ obj_p ray_remove(obj_p x, obj_p y) {
             r = cow_obj(x);
             return remove_idx(&r, y->i64);
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 }
 
@@ -877,7 +877,7 @@ obj_p ray_distinct(obj_p x) {
             res = index_distinct_guid(AS_GUID(x), l);
             return res;
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 }
 
@@ -1026,13 +1026,13 @@ obj_p ray_row(obj_p x) {
         $xl = x->len;                                                                                  \
         $yl = y->len;                                                                                  \
         if ($yl > $xl)                                                                                 \
-            return ray_err(ERR_LEN);                        \
+            return err_new(EC_LENGTH);                        \
                                                                                                        \
         $res = LIST($yl);                                                                              \
         $last_id = __AS_##yt(y)[0];                                                                    \
         if ($last_id < 0 || $last_id >= $xl) {                                                         \
             drop_obj($res);                                                                            \
-            return ray_err(ERR_INDEX);      \
+            return err_index(-1, 0);      \
         }                                                                                              \
                                                                                                        \
         for ($i = 0; $i < $yl; $i++) {                                                                 \
@@ -1040,7 +1040,7 @@ obj_p ray_row(obj_p x) {
             if ($id < $last_id || $id > $xl) {                                                         \
                 $res->len = $i;                                                                        \
                 drop_obj($res);                                                                        \
-                return ray_err(ERR_INDEX);       \
+                return err_index(-1, 0);       \
             }                                                                                          \
                                                                                                        \
             if ($id == $last_id)                                                                       \
@@ -1078,7 +1078,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, u8, y, i64);
                 default:
-                    return ray_err(ERR_TYPE);
+                    return err_new(EC_TYPE);
             }
         case TYPE_I16:
             switch (y->type) {
@@ -1089,7 +1089,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, i16, y, i64);
                 default:
-                    return ray_err(ERR_TYPE);
+                    return err_new(EC_TYPE);
             }
         case TYPE_I32:
         case TYPE_DATE:
@@ -1102,7 +1102,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, i32, y, i64);
                 default:
-                    return ray_err(ERR_TYPE);
+                    return err_new(EC_TYPE);
             }
         case TYPE_I64:
         case TYPE_SYMBOL:
@@ -1115,7 +1115,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, i64, y, i64);
                 default:
-                    return ray_err(ERR_TYPE);
+                    return err_new(EC_TYPE);
             }
         case TYPE_F64:
             switch (y->type) {
@@ -1126,7 +1126,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, f64, y, i64);
                 default:
-                    return ray_err(ERR_TYPE);
+                    return err_new(EC_TYPE);
             }
         case TYPE_GUID:
             switch (y->type) {
@@ -1137,7 +1137,7 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, guid, y, i64);
                 default:
-                    return ray_err(ERR_TYPE);
+                    return err_new(EC_TYPE);
             }
         case TYPE_LIST:
             switch (y->type) {
@@ -1148,10 +1148,10 @@ obj_p cut_vector(obj_p x, obj_p y) {
                 case TYPE_I64:
                     return CUT_VECTOR(x, list, y, i64);
                 default:
-                    return ray_err(ERR_TYPE);
+                    return err_new(EC_TYPE);
             }
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 }
 
@@ -1169,6 +1169,6 @@ obj_p ray_split(obj_p x, obj_p y) {
             if (IS_VECTOR(x))
                 return cut_vector(x, y);
 
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 }

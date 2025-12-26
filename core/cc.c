@@ -29,6 +29,7 @@
 #include "vary.h"
 #include "nfo.h"
 #include "env.h"
+#include "error.h"
 
 // Add location info from compiler context when a compile error occurs
 static nil_t cc_error_add_loc(cc_ctx_t *cc) {
@@ -350,7 +351,7 @@ static obj_p cc_fn(cc_ctx_t *cc, obj_p *lst, i64_t n) {
     if (cc_body(cc, lst, n) == -1) {
         // Add location info from the failing expression before returning error
         cc_error_add_loc(cc);
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
     }
 
 end:

@@ -38,11 +38,11 @@ obj_p dynlib_loadfn(obj_p path, obj_p func, i64_t nargs) {
 
     handle = LoadLibrary(AS_C8(path));
     if (!handle)
-        return ray_err(ERR_SYS);
+        return err_os();
 
     dsym = GetProcAddress(handle, AS_C8(func));
     if (!dsym)
-        return ray_err(ERR_SYS);
+        return err_os();
 
     switch (nargs) {
         case 1:
@@ -131,7 +131,7 @@ dynlib_p dynlib_open(obj_p path) {
     handle = dlopen(AS_C8(path), RTLD_NOW | RTLD_GLOBAL);
     if (handle == NULL) {
         LOG_ERROR("dynlib: failed to open %s: %s", AS_C8(path), dlerror());
-        return (dynlib_p)ray_err(ERR_SYS);
+        return (dynlib_p)err_os();
     }
 
     dl = (dynlib_p)heap_mmap(sizeof(struct dynlib_t));
@@ -165,7 +165,7 @@ obj_p dynlib_loadfn(obj_p path, obj_p func, i64_t nargs) {
     dsym = dlsym(handle, AS_C8(func));
     if (dsym == NULL) {
         LOG_ERROR("dynlib: symbol not found %s: %s", AS_C8(func), dlerror());
-        return ray_err(ERR_SYS);
+        return err_os();
     }
 
     switch (nargs) {
@@ -192,19 +192,19 @@ obj_p ray_loadfn(obj_p *args, i64_t n) {
     obj_p path, func, res;
 
     if (n != 3)
-        return ray_err(ERR_ARITY);
+        return err_new(EC_LENGTH);
 
     if (!args[0] || !args[1] || !args[2])
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (args[0]->type != TYPE_C8)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (args[1]->type != TYPE_C8)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (args[2]->type != -TYPE_I64)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     path = cstring_from_str(AS_C8(args[0]), args[0]->len);
     func = cstring_from_str(AS_C8(args[1]), args[1]->len);

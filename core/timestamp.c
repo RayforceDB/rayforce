@@ -528,7 +528,7 @@ timestamp_t timestamp_current(lit_p tz) {
 
 obj_p ray_timestamp(obj_p arg) {
     if (arg->type != -TYPE_SYMBOL)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     timestamp_t ts = timestamp_current(str_from_symbol(arg->i64));
 

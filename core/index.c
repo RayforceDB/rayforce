@@ -2114,7 +2114,7 @@ obj_p index_group(obj_p val, obj_p filter) {
             return index_group_build(INDEX_TYPE_PARTEDCOMMON, g, clone_obj(val), i64(NULL_I64), NULL_OBJ,
                                      clone_obj(filter), NULL_OBJ);
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 }
 
@@ -2300,7 +2300,7 @@ obj_p index_group_list(obj_p obj, obj_p filter) {
     pool_p pool;
 
     if (ops_count(obj) == 0)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (ops_count(obj) == 1)
         return index_group(AS_LIST(obj)[0], filter);
@@ -2726,7 +2726,7 @@ static obj_p __asof_ids_partial(__index_list_ctx_t *ctx, obj_p lxcol, obj_p rxco
             }
             break;
         default:
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
     }
 
     return NULL_OBJ;

@@ -163,12 +163,12 @@ obj_p ray_timeit(obj_p *x, i64_t n) {
             return f64(ray_clock_elapsed_ms(&start, &end));
         case 2:
             if (x[0]->type != -TYPE_I64)
-                return ray_err(ERR_TYPE);
+                return err_new(EC_TYPE);
 
             l = x[0]->i64;
 
             if (l < 1)
-                return ray_err(ERR_RANGE);
+                return err_new(EC_DOMAIN);
 
             ray_clock_get_time(&start);
 
@@ -183,7 +183,7 @@ obj_p ray_timeit(obj_p *x, i64_t n) {
 
             return f64(ray_clock_elapsed_ms(&start, &end));
         default:
-            return ray_err(ERR_ARITY);
+            return err_new(EC_LENGTH);
     }
 }
 
@@ -364,13 +364,13 @@ obj_p ray_timer(obj_p *x, i64_t n) {
     timers_p timers;
 
     if (n == 0)
-        return ray_err(ERR_ARITY);
+        return err_new(EC_LENGTH);
 
     timers = runtime_get()->poll->timers;
 
     if (n == 1) {
         if (x[0]->type != -TYPE_I64)
-            return ray_err(ERR_TYPE);
+            return err_new(EC_TYPE);
 
         timer_del(timers, x[0]->i64);
 
@@ -378,19 +378,19 @@ obj_p ray_timer(obj_p *x, i64_t n) {
     }
 
     if (n != 3)
-        return ray_err(ERR_ARITY);
+        return err_new(EC_LENGTH);
 
     if (x[0]->type != -TYPE_I64)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (x[1]->type != -TYPE_I64)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (x[2]->type != TYPE_LAMBDA)
-        return ray_err(ERR_TYPE);
+        return err_new(EC_TYPE);
 
     if (AS_LAMBDA(x[2])->args->len != 1)
-        return ray_err(ERR_ARITY);
+        return err_new(EC_LENGTH);
 
     timers = runtime_get()->poll->timers;
 
