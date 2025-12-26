@@ -22,7 +22,7 @@
  */
 
 #include "progress.h"
-#include "term.h"
+#include "../app/term.h"
 #include "format.h"
 #include <stdio.h>
 

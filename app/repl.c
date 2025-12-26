@@ -38,14 +38,14 @@
 #include <unistd.h>
 #endif
 #include "repl.h"
-#include "io.h"
-#include "eval.h"
 #include "term.h"
-#include "heap.h"
-#include "poll.h"
-#include "string.h"
-#include "log.h"
-#include "error.h"
+#include "../core/io.h"
+#include "../core/eval.h"
+#include "../core/heap.h"
+#include "../core/poll.h"
+#include "../core/string.h"
+#include "../core/log.h"
+#include "../core/error.h"
 
 option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
     UNUSED(poll);
@@ -138,7 +138,7 @@ repl_p repl_create(poll_p poll, b8_t silent) {
     // The poll_init() function sets up STDIN handling internally
     // Use poll->term instead of creating a separate one
     repl->term = poll->term;
-    repl->id = 0;  // Placeholder ID for Windows
+    repl->id = 0;       // Placeholder ID for Windows
     poll->repl = repl;  // Store repl pointer for cleanup
 #else
     // Only create term if not in silent mode

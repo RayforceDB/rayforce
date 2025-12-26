@@ -52,7 +52,7 @@
 #include "chrono.h"
 #include "binary.h"
 #include "ipc.h"
-#include "repl.h"
+#include "../app/repl.h"
 
 // Link with Ws2_32.lib
 #pragma comment(lib, "Ws2_32.lib")

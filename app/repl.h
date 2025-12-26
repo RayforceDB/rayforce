@@ -24,8 +24,8 @@
 #ifndef REPL_H
 #define REPL_H
 
-#include "rayforce.h"
-#include "poll.h"
+#include "../core/rayforce.h"
+#include "../core/poll.h"
 #include "term.h"
 
 typedef struct repl_t {

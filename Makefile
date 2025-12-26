@@ -49,15 +49,16 @@ LIBNAME = librayforce.dylib
 TARGET = rayforce
 endif
 
-CORE_OBJECTS = core/poll.o core/ipc.o core/repl.o core/runtime.o core/sys.o core/os.o core/proc.o core/fs.o core/mmap.o core/serde.o\
+CORE_OBJECTS = core/poll.o core/ipc.o core/runtime.o core/sys.o core/os.o core/proc.o core/fs.o core/mmap.o core/serde.o\
  core/temporal.o core/date.o core/time.o core/timestamp.o core/guid.o core/sort.o core/ops.o core/util.o\
  core/string.o core/hash.o core/symbols.o core/format.o core/rayforce.o core/heap.o core/parse.o\
  core/eval.o core/cc.o core/nfo.o core/chrono.o core/env.o core/lambda.o core/unary.o core/binary.o core/vary.o\
  core/sock.o core/error.o core/math.o core/cmp.o core/items.o core/logic.o core/compose.o core/order.o core/io.o\
  core/misc.o core/freelist.o core/update.o core/join.o core/query.o core/cond.o\
  core/iter.o core/dynlib.o core/aggr.o core/index.o core/group.o core/filter.o core/atomic.o\
- core/thread.o core/pool.o core/progress.o core/term.o core/fdmap.o core/signal.o core/log.o
-APP_OBJECTS = app/main.o
+ core/thread.o core/pool.o core/progress.o core/fdmap.o core/signal.o core/log.o
+APP_COMMON = app/repl.o app/term.o
+APP_OBJECTS = app/main.o $(APP_COMMON)
 TESTS_OBJECTS = tests/main.o
 BENCH_OBJECTS = bench/main.o
 CFLAGS = $(RELEASE_CFLAGS)
@@ -73,14 +74,14 @@ app: $(APP_OBJECTS) obj
 	$(CC) $(CFLAGS) -o $(TARGET) $(CORE_OBJECTS) $(APP_OBJECTS) $(LIBS) $(LDFLAGS)
 
 tests: -DSTOP_ON_FAIL=$(STOP_ON_FAIL) -DDEBUG
-tests: $(TESTS_OBJECTS) obj
-	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(TESTS_OBJECTS) $(LIBS) $(LDFLAGS)
+tests: $(TESTS_OBJECTS) $(APP_COMMON) obj
+	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(APP_COMMON) $(TESTS_OBJECTS) $(LIBS) $(LDFLAGS)
 	./$(TARGET).test
 
 bench: CC = gcc
 bench: CFLAGS = $(RELEASE_CFLAGS)
-bench: $(BENCH_OBJECTS) obj
-	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).bench $(CORE_OBJECTS) $(BENCH_OBJECTS) $(LIBS) $(LDFLAGS)
+bench: $(BENCH_OBJECTS) $(APP_COMMON) obj
+	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).bench $(CORE_OBJECTS) $(APP_COMMON) $(BENCH_OBJECTS) $(LIBS) $(LDFLAGS)
 	BENCH=$(BENCH) ./$(TARGET).bench
 
 %.o: %.c

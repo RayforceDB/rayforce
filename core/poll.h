@@ -32,8 +32,13 @@
 #include "format.h"
 #include "freelist.h"
 #include "chrono.h"
-#include "term.h"
 #include "option.h"
+
+// Forward declarations (defined in app/)
+struct term_t;
+struct repl_t;
+typedef struct term_t *term_p;
+typedef struct repl_t *repl_p;
 
 // Constants
 #define MAX_EVENTS 1024
@@ -127,12 +132,6 @@ typedef struct selector_t {
         queue_p queue;  // queue for async messages waiting to be sent
     } tx;
 } *selector_p;
-
-// Forward declare term_p (defined in term.h)
-struct term_t;
-
-// Forward declare repl_t
-struct repl_t;
 
 typedef struct poll_t {
     i64_t poll_fd;         // IOCP handle

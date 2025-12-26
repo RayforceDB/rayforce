@@ -22,8 +22,8 @@
  */
 
 #include <stdio.h>
-#include "def.h"
-#include "log.h"
+#include "../core/def.h"
+#include "../core/log.h"
 #if defined(OS_WINDOWS)
 #include <io.h>
 #include <conio.h>
@@ -39,17 +39,17 @@
 #include <sys/file.h>
 #endif
 #include "term.h"
-#include "chrono.h"
-#include "heap.h"
-#include "string.h"
-#include "error.h"
-#include "ops.h"
-#include "runtime.h"
-#include "format.h"
-#include "parse.h"
-#include "env.h"
-#include "mmap.h"
-#include "fs.h"
+#include "../core/chrono.h"
+#include "../core/heap.h"
+#include "../core/string.h"
+#include "../core/error.h"
+#include "../core/ops.h"
+#include "../core/runtime.h"
+#include "../core/format.h"
+#include "../core/parse.h"
+#include "../core/env.h"
+#include "../core/mmap.h"
+#include "../core/fs.h"
 
 #define MAX_PATH_LEN 128
 #define HIST_FILE_PATH ".rayhist.dat"
@@ -192,7 +192,7 @@ nil_t term_goto_position(term_p term, i32_t from_pos, i32_t to_pos) {
 
 hist_p hist_create() {
     i64_t pos, fd, fsize;
-    str_p lines;
+    str_p hist_data;
     hist_p hist;
 
     fd = fs_fopen(HIST_FILE_PATH, ATTR_RDWR | ATTR_CREAT);
@@ -238,8 +238,8 @@ hist_p hist_create() {
     }
 
     // Map file to memory with shared mapping so changes persist
-    lines = (str_p)mmap_file_shared(fd, NULL, fsize, 0);
-    if (lines == NULL) {
+    hist_data = (str_p)mmap_file_shared(fd, NULL, fsize, 0);
+    if (hist_data == NULL) {
         perror("can't map history file");
 #if defined(OS_WINDOWS)
         OVERLAPPED overlapped_err = {0};
@@ -261,17 +261,17 @@ hist_p hist_create() {
         flock(fd, LOCK_UN);
 #endif
         fs_fclose(fd);
-        mmap_free(lines, fsize);
+        mmap_free(hist_data, fsize);
         return NULL;
     }
 
     // Find the current end of the data in the file
     pos = 0;
-    while (pos < fsize && lines[pos] != '\0')
+    while (pos < fsize && hist_data[pos] != '\0')
         pos++;
 
     hist->fd = fd;
-    hist->lines = lines;
+    hist->entries = hist_data;
     hist->size = fsize;
     hist->pos = pos;
     hist->search_dir = 1;
@@ -304,7 +304,7 @@ nil_t hist_destroy(hist_p hist) {
 #endif
 
     // Sync history buffer to file
-    if (mmap_sync(hist->lines, hist->size) == -1)
+    if (mmap_sync(hist->entries, hist->size) == -1)
         perror("can't sync history buffer");
 
     // Unlock file
@@ -315,7 +315,7 @@ nil_t hist_destroy(hist_p hist) {
     flock(hist->fd, LOCK_UN);
 #endif
 
-    mmap_free(hist->lines, hist->size);
+    mmap_free(hist->entries, hist->size);
     fs_fclose(hist->fd);
     heap_unmap(hist, sizeof(struct hist_t));
 }
@@ -331,10 +331,10 @@ nil_t hist_add(hist_p hist, c8_t buf[], i64_t len) {
 
     // Find the previous line
     while (index > 0) {
-        if (hist->lines[--index] == '\n') {
+        if (hist->entries[--index] == '\n') {
             last_len = hist->index - index - 1;
             // Check if the line is already in the history buffer
-            if (last_len == len && strncmp(hist->lines + index + 1, buf, len) == 0)
+            if (last_len == len && strncmp(hist->entries + index + 1, buf, len) == 0)
                 return;
 
             break;
@@ -343,7 +343,7 @@ nil_t hist_add(hist_p hist, c8_t buf[], i64_t len) {
 
     if (index == 0) {
         // Check if the line is already in the history buffer
-        if (last_len == len && strncmp(hist->lines, buf, len) == 0)
+        if (last_len == len && strncmp(hist->entries, buf, len) == 0)
             return;
     }
 
@@ -353,8 +353,8 @@ nil_t hist_add(hist_p hist, c8_t buf[], i64_t len) {
         return;
 
     // Add the line to the history buffer
-    memcpy(hist->lines + pos, buf, len);
-    hist->lines[pos + len] = '\n';
+    memcpy(hist->entries + pos, buf, len);
+    hist->entries[pos + len] = '\n';
     hist->pos += len + 1;
     hist->index = hist->pos - 1;
     hist->search_dir = 1;
@@ -370,7 +370,7 @@ i64_t hist_prev(hist_p hist, c8_t buf[]) {
     // Skip current line if search direction was next
     if (hist->search_dir == 0) {
         while (index > 0) {
-            if (hist->lines[--index] == '\n')
+            if (hist->entries[--index] == '\n')
                 break;
         }
 
@@ -380,9 +380,9 @@ i64_t hist_prev(hist_p hist, c8_t buf[]) {
 
     // Find the previous line
     while (index > 0) {
-        if (hist->lines[--index] == '\n') {
+        if (hist->entries[--index] == '\n') {
             len = hist->index - index - 1;
-            strncpy(buf, hist->lines + index + 1, len);
+            strncpy(buf, hist->entries + index + 1, len);
             buf[len] = '\0';
             hist->index = index;
             return len;
@@ -390,7 +390,7 @@ i64_t hist_prev(hist_p hist, c8_t buf[]) {
     }
 
     len = hist->index;
-    strncpy(buf, hist->lines, len);
+    strncpy(buf, hist->entries, len);
     buf[len] = '\0';
     hist->index = index;
     hist->search_dir = 1;
@@ -405,7 +405,7 @@ i64_t hist_next(hist_p hist, c8_t buf[]) {
     // Skip current line if search direction was previous
     if (hist->search_dir == 1) {
         while (index + 1 < hist->pos) {
-            if (hist->lines[++index] == '\n')
+            if (hist->entries[++index] == '\n')
                 break;
         }
 
@@ -415,9 +415,9 @@ i64_t hist_next(hist_p hist, c8_t buf[]) {
 
     // Find the next line
     while (index + 1 < hist->pos) {
-        if (hist->lines[++index] == '\n') {
+        if (hist->entries[++index] == '\n') {
             len = index - hist->index - 1;
-            strncpy(buf, hist->lines + hist->index + 1, len);
+            strncpy(buf, hist->entries + hist->index + 1, len);
             buf[len] = '\0';
             break;
         }

@@ -25,8 +25,8 @@
 #include "../core/runtime.h"
 #include "../core/format.h"
 #include "../core/sys.h"
-#include "../core/repl.h"
 #include "../core/string.h"
+#include "repl.h"
 
 nil_t print_logo(sys_info_t *info) {
     printf(

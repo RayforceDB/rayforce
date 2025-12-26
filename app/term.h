@@ -24,12 +24,19 @@
 #ifndef TERM_H
 #define TERM_H
 
-#include "rayforce.h"
+#include "../core/rayforce.h"
 #if defined(OS_WINDOWS)
-#include "pool.h"
+#include "../core/pool.h"
 #define KEYCODE_RETURN '\r'
 #else
 #include <termios.h>
+// Undefine macros from ncurses term.h that conflict with our code
+#ifdef lines
+#undef lines
+#endif
+#ifdef columns
+#undef columns
+#endif
 #define KEYCODE_RETURN '\n'
 #endif
 #define KEYCODE_BACKSPACE '\b'
@@ -66,7 +73,7 @@
 
 typedef struct hist_t {
     i64_t fd;
-    str_p lines;
+    str_p entries;
     i64_t size;
     i64_t pos;
     i64_t index;
