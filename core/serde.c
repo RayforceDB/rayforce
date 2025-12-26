@@ -151,9 +151,13 @@ i64_t size_obj(obj_p obj) {
             return ISIZEOF(i8_t) + SYMBOL_STRLEN(env_get_internal_id(obj)) + 1;
         case TYPE_NULL:
             return ISIZEOF(i8_t);
-        case TYPE_ERR:
-            // Error type (8 bytes) + message length
-            return ISIZEOF(i8_t) + 8 + strlen(ray_err_msg(obj)) + 1;
+        case TYPE_ERR: {
+            // code (1 byte) + context (8 bytes) + optional message for EC_USER
+            i64_t err_size = ISIZEOF(i8_t) + 1 + 8;
+            if (err_code(obj) == EC_USER)
+                err_size += strlen(err_get_message(obj)) + 1;
+            return err_size;
+        }
         default:
             return 0;
     }
@@ -313,15 +317,18 @@ i64_t ser_raw(u8_t *buf, obj_p obj) {
             c = str_cpy((str_p)buf, env_get_internal_name(obj));
             return ISIZEOF(i8_t) + c + 1;
         case TYPE_ERR: {
-            lit_p err_type = ray_err_msg(obj);
-            lit_p err_msg = ray_err_msg(obj);
-            i64_t msg_len = strlen(err_msg);
-            // Serialize: type (8 bytes, null-padded) + message (null-terminated)
-            memset(buf, 0, 8);
-            memcpy(buf, err_type, strlen(err_type));
-            c = 8;
-            memcpy(buf + c, err_msg, msg_len + 1);
-            c += msg_len + 1;
+            // Serialize: code (1 byte) + context (8 bytes) + optional message
+            err_code_t code = err_code(obj);
+            buf[0] = (u8_t)code;
+            c = 1;
+            memcpy(buf + c, &obj->i64, 8);  // Copy context directly
+            c += 8;
+            if (code == EC_USER) {
+                lit_p msg = err_get_message(obj);
+                i64_t msg_len = strlen(msg);
+                memcpy(buf + c, msg, msg_len + 1);
+                c += msg_len + 1;
+            }
             return ISIZEOF(i8_t) + c;
         }
         default:
@@ -641,17 +648,29 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             return k;
 
         case TYPE_ERR: {
-            lit_p err_msg;
-            if (*len < 9)  // At least 8 bytes for type + 1 for message
+            // Deserialize: code (1 byte) + context (8 bytes) + optional message
+            if (*len < 9)
                 return err_new(EC_DOMAIN);
-            // Skip 8 bytes of type (for legacy format compatibility)
+            err_code_t code = (err_code_t)buf[0];
+            buf++;
+            (*len)--;
+            i64_t ctx_val;
+            memcpy(&ctx_val, buf, 8);
             buf += 8;
             (*len) -= 8;
-            err_msg = (lit_p)buf;
-            i64_t msg_len = strlen(err_msg);
-            buf += msg_len + 1;
-            (*len) -= msg_len + 1;
-            return ray_err(err_msg);
+            
+            if (code == EC_USER) {
+                lit_p msg = (lit_p)buf;
+                i64_t msg_len = strlen(msg);
+                buf += msg_len + 1;
+                (*len) -= msg_len + 1;
+                return err_user(msg);
+            }
+            
+            // Reconstruct error with context
+            obj_p err = err_new(code);
+            err->i64 = ctx_val;
+            return err;
         }
 
         default:
