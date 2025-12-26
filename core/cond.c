@@ -51,6 +51,6 @@ obj_p ray_cond(obj_p *x, i64_t n) {
             drop_obj(res);
             return eval(x[2]);
         default:
-            return err_new(EC_LENGTH);
+            return err_length(0, 0);
     }
 }

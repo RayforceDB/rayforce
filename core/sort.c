@@ -474,7 +474,7 @@ obj_p ray_sort_asc(obj_p vec) {
         case TYPE_DICT:
             return at_obj(AS_LIST(vec)[0], ray_sort_asc(AS_LIST(vec)[1]));
         default:
-            return err_new(EC_TYPE);
+            return err_type(0, 0, 0);
     }
 }
 
@@ -735,7 +735,7 @@ obj_p ray_sort_desc(obj_p vec) {
         case TYPE_DICT:
             return at_obj(AS_LIST(vec)[0], ray_sort_desc(AS_LIST(vec)[1]));
         default:
-            return err_new(EC_TYPE);
+            return err_type(0, 0, 0);
     }
 }
 

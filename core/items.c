@@ -330,7 +330,7 @@ obj_p ray_find(obj_p x, obj_p y) {
         case MTYPE2(TYPE_LIST, TYPE_LIST):
             return index_find_obj(AS_LIST(x), x->len, AS_LIST(y), y->len);
         default:
-            return err_new(EC_TYPE);
+            return err_type(x->type, y->type, 0);
     }
 }
 
@@ -338,7 +338,7 @@ obj_p ray_find(obj_p x, obj_p y) {
 #define __FILTER(x, y, tx, s1, s2, s3)                                                 \
     ({                                                                                 \
         if (x->len != y->len)                                                          \
-            return err_new(EC_LENGTH); \
+            return err_length(0, 0); \
         l = x->len;                                                                    \
         res = tx(l);                                                                   \
         for (i = 0; i < l; i++)                                                        \
@@ -391,7 +391,7 @@ obj_p ray_filter(obj_p x, obj_p y) {
             return table(clone_obj(AS_LIST(x)[0]), res);
 
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LIST, x->type, 0);
     }
 }
 
@@ -407,7 +407,7 @@ obj_p ray_take(obj_p from, obj_p count) {
         start = AS_I64(count)[0];
         m = AS_I64(count)[1];
         if (m < 0)
-            return err_new(EC_LENGTH);
+            return err_length(0, 0);
         f = 0;  // not used for range
     } else {
         start = 0;
@@ -425,7 +425,7 @@ obj_p ray_take(obj_p from, obj_p count) {
                 m = ABSI64((i64_t)count->i32);
                 break;
             default:
-                return err_new(EC_TYPE);
+                return err_type(-TYPE_I64, count->type, 0);
         }
     }
 
@@ -729,7 +729,7 @@ obj_p ray_take(obj_p from, obj_p count) {
             return table(clone_obj(AS_LIST(from)[0]), res);
 
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LIST, from->type, 0);
     }
 }
 
@@ -839,7 +839,7 @@ obj_p ray_in(obj_p x, obj_p y) {
             if (!IS_VECTOR(x))
                 return b8(find_obj_idx(y, x) != NULL_I64);
 
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LIST, x->type, 0);
     }
 
     return NULL_OBJ;
@@ -850,7 +850,7 @@ obj_p ray_within(obj_p x, obj_p y) {
     obj_p res;
 
     if (!IS_VECTOR(y) || y->len != 2)
-        return err_new(EC_TYPE);
+        return err_type(TYPE_LIST, y->type, 0);
 
     switch
         MTYPE2(x->type, y->type) {
@@ -889,7 +889,7 @@ obj_p ray_within(obj_p x, obj_p y) {
                 return res;
 
             default:
-                return err_new(EC_TYPE);
+                return err_type(x->type, y->type, 0);
         }
 
     return NULL_OBJ;
@@ -907,7 +907,7 @@ obj_p ray_sect(obj_p x, obj_p y) {
             return res;
 
         default:
-            return err_new(EC_TYPE);
+            return err_type(x->type, y->type, 0);
     }
 
     return NULL_OBJ;
@@ -1014,7 +1014,7 @@ obj_p ray_except(obj_p x, obj_p y) {
                 }
             }
 
-            return err_new(EC_TYPE);
+            return err_type(x->type, y->type, 0);
     }
 }
 
@@ -1392,7 +1392,7 @@ obj_p ray_where(obj_p x) {
 
             return res;
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_B8, x->type, 0);
     }
 }
 
@@ -1445,7 +1445,7 @@ static obj_p ray_bin_partial(raw_p a, raw_p b, raw_p c, raw_p d, raw_p e) {
             }
             return NULL_OBJ;
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_I64, x->type, 0);
     }
 }
 
@@ -1498,7 +1498,7 @@ static obj_p ray_binr_partial(raw_p a, raw_p b, raw_p c, raw_p d, raw_p e) {
             }
             return NULL_OBJ;
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_I64, x->type, 0);
     }
 }
 
@@ -1592,7 +1592,7 @@ obj_p ray_bin(obj_p x, obj_p y) {
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
             return bin_map(ray_bin_partial, x, y);
         default:
-            return err_new(EC_TYPE);
+            return err_type(x->type, y->type, 0);
     }
 }
 
@@ -1639,6 +1639,6 @@ obj_p ray_binr(obj_p x, obj_p y) {
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
             return bin_map(ray_binr_partial, x, y);
         default:
-            return err_new(EC_TYPE);
+            return err_type(x->type, y->type, 0);
     }
 }

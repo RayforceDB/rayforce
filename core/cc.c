@@ -351,7 +351,7 @@ static obj_p cc_fn(cc_ctx_t *cc, obj_p *lst, i64_t n) {
     if (cc_body(cc, lst, n) == -1) {
         // Add location info from the failing expression before returning error
         cc_error_add_loc(cc);
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
     }
 
 end:

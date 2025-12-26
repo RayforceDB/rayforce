@@ -2487,7 +2487,7 @@ test_result_t test_lang_math() {
     // i16 avg
     TEST_ASSERT_EQ("(avg 5h)", "5.0");
     TEST_ASSERT_EQ("(avg [2h 4h 6h])", "4.0");
-    TEST_ASSERT_EQ("(avg [1h 0Nh 5h])", "3.0");  // NULL skipped in cnt
+    TEST_ASSERT_EQ("(avg [1h 0Nh 5h])", "3.0");         // NULL skipped in cnt
     TEST_ASSERT_EQ("(avg (take 10h 100000))", "10.0");  // large i16 vector
 
     TEST_ASSERT_EQ("(min 0Nf)", "0Nf");
@@ -3749,7 +3749,7 @@ test_result_t test_lang_concat() {
     TEST_ASSERT_ER(
         "(concat (table [D C] (list (+ (til 4) 10) (list \"a\" \"b\" \"c\" \"d\"))) (table [C B A] "
         "(list (list \"A\" \"B\" \"C\" \"D\" \"E\") [100 200 300 400 500] (til 5))))",
-        "type");
+        "value");
     TEST_ASSERT_ER(
         "(concat (table [C A] (list (+ (til 4) 10) (list \"a\" \"b\" \"c\" \"d\"))) (table [C B A] "
         "(list (list \"A\" \"B\" \"C\" \"D\" \"E\") [100 200 300 400 500] (til 5))))",

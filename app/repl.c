@@ -46,6 +46,7 @@
 #include "../core/string.h"
 #include "../core/log.h"
 #include "../core/error.h"
+#include "../core/error.h"
 
 option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
     UNUSED(poll);

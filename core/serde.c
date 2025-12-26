@@ -342,7 +342,7 @@ obj_p ser_obj(obj_p obj) {
     ipc_header_t *header;
 
     if (size == 0)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     buf = vector(TYPE_U8, ISIZEOF(struct ipc_header_t) + size);
     header = (ipc_header_t *)AS_U8(buf);
@@ -356,7 +356,7 @@ obj_p ser_obj(obj_p obj) {
 
     if (ser_raw(AS_U8(buf) + ISIZEOF(struct ipc_header_t), obj) == 0) {
         drop_obj(buf);
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
     }
 
     return buf;
@@ -379,21 +379,21 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             return NULL_OBJ;
         case -TYPE_B8:
             if (*len < 1)
-                return err_new(EC_DOMAIN);
+                return err_domain();
             obj = b8(buf[0]);
             buf++;
             (*len)--;
             return obj;
         case -TYPE_U8:
             if (*len < 1)
-                return err_new(EC_DOMAIN);
+                return err_domain();
             obj = u8(buf[0]);
             buf++;
             (*len)--;
             return obj;
         case -TYPE_I16:
             if (*len < ISIZEOF(i16_t))
-                return err_new(EC_DOMAIN);
+                return err_domain();
             obj = i16(0);
             memcpy(&obj->i16, buf, ISIZEOF(i16_t));
             buf += ISIZEOF(i16_t);
@@ -403,7 +403,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case -TYPE_DATE:
         case -TYPE_TIME:
             if (*len < ISIZEOF(i32_t))
-                return err_new(EC_DOMAIN);
+                return err_domain();
             obj = i32(0);
             memcpy(&obj->i32, buf, ISIZEOF(i32_t));
             buf += ISIZEOF(i32_t);
@@ -413,7 +413,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case -TYPE_I64:
         case -TYPE_TIMESTAMP:
             if (*len < ISIZEOF(i64_t))
-                return err_new(EC_DOMAIN);
+                return err_domain();
             obj = i64(0);
             memcpy(&obj->i64, buf, ISIZEOF(i64_t));
             buf += ISIZEOF(i64_t);
@@ -422,7 +422,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             return obj;
         case -TYPE_F64:
             if (*len < ISIZEOF(f64_t))
-                return err_new(EC_DOMAIN);
+                return err_domain();
             obj = f64(0);
             memcpy(&obj->f64, buf, ISIZEOF(f64_t));
             buf += ISIZEOF(f64_t);
@@ -430,10 +430,10 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             return obj;
         case -TYPE_SYMBOL:
             if (*len < 1)
-                return err_new(EC_DOMAIN);
+                return err_domain();
             l = str_len((str_p)buf, *len);
             if (l >= *len)
-                return err_new(EC_DOMAIN);
+                return err_domain();
             i = symbols_intern((str_p)buf, l);
             obj = symboli64(i);
             buf += l + 1;
@@ -441,14 +441,14 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             return obj;
         case -TYPE_C8:
             if (*len < 1)
-                return err_new(EC_DOMAIN);
+                return err_domain();
             obj = c8(buf[0]);
             buf++;
             (*len)--;
             return obj;
         case -TYPE_GUID:
             if (*len < ISIZEOF(guid_t))
-                return err_new(EC_DOMAIN);
+                return err_domain();
             obj = guid(buf);
             buf += ISIZEOF(guid_t);
             (*len) -= ISIZEOF(guid_t);
@@ -466,7 +466,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case TYPE_GUID:
         case TYPE_LIST:
             if (*len < ISIZEOF(i64_t))
-                return err_new(EC_DOMAIN);
+                return err_domain();
 
             buf++;  // skip attrs
             memcpy(&l, buf, ISIZEOF(i64_t));
@@ -475,14 +475,14 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
 
             // Check for unreasonable length values that might indicate corruption
             if (l > 1000000000)  // 1 billion elements is likely a corrupted value
-                return err_new(EC_DOMAIN);
+                return err_domain();
 
             // Continue with type-specific handling
             switch (type) {
                 case TYPE_B8:
                 case TYPE_U8:
                     if (*len < l * ISIZEOF(u8_t))
-                        return err_new(EC_DOMAIN);
+                        return err_domain();
                     obj = U8(l);
                     obj->type = type;
                     if (IS_ERR(obj))
@@ -493,7 +493,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                     return obj;
                 case TYPE_C8:
                     if (*len < l * ISIZEOF(c8_t))
-                        return err_new(EC_DOMAIN);
+                        return err_domain();
                     obj = C8(l);
                     if (IS_ERR(obj))
                         return obj;
@@ -505,7 +505,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                 case TYPE_TIME:
                 case TYPE_DATE:
                     if (*len < l * ISIZEOF(i32_t))
-                        return err_new(EC_DOMAIN);
+                        return err_domain();
                     obj = I32(l);
                     if (IS_ERR(obj))
                         return obj;
@@ -517,7 +517,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                 case TYPE_I64:
                 case TYPE_TIMESTAMP:
                     if (*len < l * ISIZEOF(i64_t))
-                        return err_new(EC_DOMAIN);
+                        return err_domain();
                     obj = I64(l);
                     if (IS_ERR(obj))
                         return obj;
@@ -528,7 +528,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                     return obj;
                 case TYPE_F64:
                     if (*len < l * ISIZEOF(f64_t))
-                        return err_new(EC_DOMAIN);
+                        return err_domain();
                     obj = F64(l);
                     if (IS_ERR(obj))
                         return obj;
@@ -544,13 +544,13 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                         if (*len < 1) {
                             obj->len = i;
                             drop_obj(obj);
-                            return err_new(EC_DOMAIN);
+                            return err_domain();
                         }
                         c = str_len((str_p)buf, *len);
                         if (c >= *len) {
                             obj->len = i;
                             drop_obj(obj);
-                            return err_new(EC_DOMAIN);
+                            return err_domain();
                         }
                         id = symbols_intern((str_p)buf, c);
                         AS_SYMBOL(obj)[i] = id;
@@ -560,7 +560,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                     return obj;
                 case TYPE_GUID:
                     if (*len < l * ISIZEOF(guid_t))
-                        return err_new(EC_DOMAIN);
+                        return err_domain();
                     obj = GUID(l);
                     if (IS_ERR(obj))
                         return obj;
@@ -586,7 +586,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
                     return obj;
             }
             // Should never reach here
-            return err_new(EC_DOMAIN);
+            return err_domain();
 
         case TYPE_TABLE:
         case TYPE_DICT:
@@ -632,14 +632,14 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case TYPE_BINARY:
         case TYPE_VARY:
             if (*len < 1)
-                return err_new(EC_DOMAIN);
+                return err_domain();
             // Check for null terminator within buffer
             for (i = 0; i < *len; i++) {
                 if (buf[i] == 0)
                     break;
             }
             if (i >= *len)
-                return err_new(EC_DOMAIN);
+                return err_domain();
 
             k = env_get_internal_function((str_p)buf);
             buf += i + 1;
@@ -650,7 +650,7 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
         case TYPE_ERR: {
             // Deserialize: code (1 byte) + context (8 bytes) + optional message
             if (*len < 9)
-                return err_new(EC_DOMAIN);
+                return err_domain();
             err_code_t code = (err_code_t)buf[0];
             buf++;
             (*len)--;
@@ -668,13 +668,13 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             }
             
             // Reconstruct error with context
-            obj_p err = err_new(code);
+            obj_p err = err_raw(code);
             err->i64 = ctx_val;
             return err;
         }
 
         default:
-            return err_new(EC_TYPE);
+            return err_type(0, 0, 0);
     }
 }
 
@@ -688,23 +688,23 @@ obj_p de_obj(obj_p obj) {
 
     // Check if buffer is large enough to contain a header
     if (len < ISIZEOF(struct ipc_header_t))
-        return err_new(EC_DOMAIN);
+        return err_domain();
 
     header = (ipc_header_t *)buf;
 
     // Check for valid header prefix
     if (header->prefix != SERDE_PREFIX)
-        return err_new(EC_DOMAIN);
+        return err_domain();
 
     if (header->version > RAYFORCE_VERSION)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     // Check for reasonable size values
     if (header->size > 1000000000)  // 1GB max size
-        return err_new(EC_DOMAIN);
+        return err_domain();
 
     if (header->size + ISIZEOF(struct ipc_header_t) != len)
-        return err_new(EC_DOMAIN);
+        return err_domain();
 
     len = header->size;
     buf += ISIZEOF(struct ipc_header_t);

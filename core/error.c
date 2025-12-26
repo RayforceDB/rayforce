@@ -62,7 +62,7 @@ static inline obj_p err_alloc(err_code_t code) {
     return obj;
 }
 
-obj_p err_new(err_code_t code) { return err_alloc(code); }
+obj_p err_raw(err_code_t code) { return err_alloc(code); }
 
 obj_p err_type(i8_t expected, i8_t actual, i64_t field) {
     obj_p err = err_alloc(EC_TYPE);
@@ -134,6 +134,11 @@ obj_p err_user(lit_p msg) {
     return obj;
 }
 
+// Simple errors (no context)
+obj_p err_domain(nil_t) { return err_alloc(EC_DOMAIN); }
+obj_p err_nyi(nil_t) { return err_alloc(EC_NYI); }
+obj_p err_parse(nil_t) { return err_alloc(EC_PARSE); }
+
 // ============================================================================
 // Error Decoding
 // ============================================================================
@@ -182,9 +187,6 @@ lit_p ray_err_msg(obj_p err) {
 // Error Info (for IPC serialization)
 // ============================================================================
 
-// Helper to intern a key symbol
-#define K(s) symbols_intern(s, sizeof(s) - 1)
-
 obj_p err_info(obj_p err) {
     if (err == NULL_OBJ || err->type != TYPE_ERR)
         return NULL_OBJ;
@@ -193,39 +195,56 @@ obj_p err_info(obj_p err) {
     err_ctx_t* ctx = err_ctx(err);
     vm_p vm = VM;
     obj_p trace = (vm && vm->trace != NULL_OBJ) ? vm->trace : NULL_OBJ;
+    lit_p s;
 
-    // Build keys and values based on error type
     obj_p keys, vals;
-    i64_t n = 1;  // Always have 'code'
+    i64_t n = 1;
 
     switch (code) {
         case EC_TYPE: {
             err_types_t t = ctx->types;
-            n = t.field ? 4 : 3;  // code, expected, actual, [field]
+            n = t.field ? 4 : 3;
             keys = SYMBOL(n);
             vals = LIST(n);
-            AS_SYMBOL(keys)[0] = K("code");
-            AS_SYMBOL(keys)[1] = K("expected");
-            AS_SYMBOL(keys)[2] = K("actual");
-            AS_LIST(vals)[0] = symboli64(K(err_name(code)));
-            AS_LIST(vals)[1] = symboli64(K(type_name(t.expected)));
-            AS_LIST(vals)[2] = symboli64(K(type_name(t.actual)));
+            ins_sym(&keys, 0, "code");
+            ins_sym(&keys, 1, "expected");
+            ins_sym(&keys, 2, "got");
+            s = err_name(code);
+            AS_LIST(vals)[0] = symbol(s, strlen(s));
+            s = type_name(t.expected);
+            AS_LIST(vals)[1] = symbol(s, strlen(s));
+            s = type_name(t.actual);
+            AS_LIST(vals)[2] = symbol(s, strlen(s));
             if (t.field) {
-                AS_SYMBOL(keys)[3] = K("field");
+                ins_sym(&keys, 3, "field");
                 AS_LIST(vals)[3] = symboli64(t.field);
             }
             break;
         }
-        case EC_ARITY:
+        case EC_ARITY: {
+            err_counts_t c = ctx->counts;
+            n = 3;
+            keys = SYMBOL(n);
+            vals = LIST(n);
+            ins_sym(&keys, 0, "code");
+            ins_sym(&keys, 1, "expected");
+            ins_sym(&keys, 2, "got");
+            s = err_name(code);
+            AS_LIST(vals)[0] = symbol(s, strlen(s));
+            AS_LIST(vals)[1] = i32(c.need);
+            AS_LIST(vals)[2] = i32(c.have);
+            break;
+        }
         case EC_LENGTH: {
             err_counts_t c = ctx->counts;
             n = 3;
             keys = SYMBOL(n);
             vals = LIST(n);
-            AS_SYMBOL(keys)[0] = K("code");
-            AS_SYMBOL(keys)[1] = K("need");
-            AS_SYMBOL(keys)[2] = K("have");
-            AS_LIST(vals)[0] = symboli64(K(err_name(code)));
+            ins_sym(&keys, 0, "code");
+            ins_sym(&keys, 1, "need");
+            ins_sym(&keys, 2, "have");
+            s = err_name(code);
+            AS_LIST(vals)[0] = symbol(s, strlen(s));
             AS_LIST(vals)[1] = i32(c.need);
             AS_LIST(vals)[2] = i32(c.have);
             break;
@@ -235,39 +254,40 @@ obj_p err_info(obj_p err) {
             n = 3;
             keys = SYMBOL(n);
             vals = LIST(n);
-            AS_SYMBOL(keys)[0] = K("code");
-            AS_SYMBOL(keys)[1] = K("index");
-            AS_SYMBOL(keys)[2] = K("length");
-            AS_LIST(vals)[0] = symboli64(K(err_name(code)));
+            ins_sym(&keys, 0, "code");
+            ins_sym(&keys, 1, "index");
+            ins_sym(&keys, 2, "bound");
+            s = err_name(code);
+            AS_LIST(vals)[0] = symbol(s, strlen(s));
             AS_LIST(vals)[1] = i32(b.idx);
             AS_LIST(vals)[2] = i32(b.len);
             break;
         }
         case EC_VALUE: {
-            i64_t sym = ctx->symbol;
-            n = sym ? 2 : 1;
+            i64_t sym_id = ctx->symbol;
+            n = sym_id ? 2 : 1;
             keys = SYMBOL(n);
             vals = LIST(n);
-            AS_SYMBOL(keys)[0] = K("code");
-            AS_LIST(vals)[0] = symboli64(K(err_name(code)));
-            if (sym) {
-                AS_SYMBOL(keys)[1] = K("symbol");
-                AS_LIST(vals)[1] = symboli64(sym);
+            ins_sym(&keys, 0, "code");
+            s = err_name(code);
+            AS_LIST(vals)[0] = symbol(s, strlen(s));
+            if (sym_id) {
+                ins_sym(&keys, 1, "name");
+                AS_LIST(vals)[1] = symboli64(sym_id);
             }
             break;
         }
         case EC_OS: {
             i32_t e = ctx->errnum;
-            n = e ? 3 : 1;
+            n = e ? 2 : 1;
             keys = SYMBOL(n);
             vals = LIST(n);
-            AS_SYMBOL(keys)[0] = K("code");
-            AS_LIST(vals)[0] = symboli64(K(err_name(code)));
+            ins_sym(&keys, 0, "code");
+            s = err_name(code);
+            AS_LIST(vals)[0] = symbol(s, strlen(s));
             if (e) {
-                AS_SYMBOL(keys)[1] = K("errno");
-                AS_SYMBOL(keys)[2] = K("message");
-                AS_LIST(vals)[1] = i32(e);
-                AS_LIST(vals)[2] = vn_c8("%s", strerror(e));
+                ins_sym(&keys, 1, "message");
+                AS_LIST(vals)[1] = vn_c8("%s", strerror(e));
             }
             break;
         }
@@ -276,10 +296,11 @@ obj_p err_info(obj_p err) {
             n = (msg && msg[0]) ? 2 : 1;
             keys = SYMBOL(n);
             vals = LIST(n);
-            AS_SYMBOL(keys)[0] = K("code");
-            AS_LIST(vals)[0] = symboli64(K(err_name(code)));
+            ins_sym(&keys, 0, "code");
+            s = err_name(code);
+            AS_LIST(vals)[0] = symbol(s, strlen(s));
             if (msg && msg[0]) {
-                AS_SYMBOL(keys)[1] = K("message");
+                ins_sym(&keys, 1, "message");
                 AS_LIST(vals)[1] = vn_c8("%s", msg);
             }
             break;
@@ -289,10 +310,11 @@ obj_p err_info(obj_p err) {
             n = c.have ? 2 : 1;
             keys = SYMBOL(n);
             vals = LIST(n);
-            AS_SYMBOL(keys)[0] = K("code");
-            AS_LIST(vals)[0] = symboli64(K(err_name(code)));
+            ins_sym(&keys, 0, "code");
+            s = err_name(code);
+            AS_LIST(vals)[0] = symbol(s, strlen(s));
             if (c.have) {
-                AS_SYMBOL(keys)[1] = K("limit");
+                ins_sym(&keys, 1, "limit");
                 AS_LIST(vals)[1] = i32(c.have);
             }
             break;
@@ -300,27 +322,15 @@ obj_p err_info(obj_p err) {
         default: {
             keys = SYMBOL(1);
             vals = LIST(1);
-            AS_SYMBOL(keys)[0] = K("code");
-            AS_LIST(vals)[0] = symboli64(K(err_name(code)));
+            ins_sym(&keys, 0, "code");
+            s = err_name(code);
+            AS_LIST(vals)[0] = symbol(s, strlen(s));
             break;
         }
     }
 
-    // Add trace if available
-    if (trace != NULL_OBJ && trace->len > 0) {
-        obj_p new_keys = SYMBOL(n + 1);
-        obj_p new_vals = LIST(n + 1);
-        memcpy(AS_SYMBOL(new_keys), AS_SYMBOL(keys), n * sizeof(i64_t));
-        memcpy(AS_LIST(new_vals), AS_LIST(vals), n * sizeof(obj_p));
-        AS_SYMBOL(new_keys)[n] = K("trace");
-        AS_LIST(new_vals)[n] = clone_obj(trace);
-        drop_obj(keys);
-        drop_obj(vals);
-        keys = new_keys;
-        vals = new_vals;
-    }
+    // TODO: Add trace handling later
+    UNUSED(trace);
 
     return dict(keys, vals);
 }
-
-#undef K

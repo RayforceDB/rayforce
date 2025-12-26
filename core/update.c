@@ -50,7 +50,7 @@ obj_p __fetch(obj_p obj, obj_p **val, obj_p *original) {
     if (obj->type == -TYPE_SYMBOL) {
         *val = resolve(obj->i64);
         if (*val == NULL)
-            return err_new(EC_VALUE);
+            return err_value(0);
 
         *original = **val;
         obj = cow_obj(**val);
@@ -158,7 +158,7 @@ obj_p __reorder_columns(obj_p table_cols, obj_p table_vals, obj_p input_cols, ob
     // Check that all input columns exist in the table
     for (i = 0; i < ic; i++) {
         if (__find_symbol_idx(table_cols, icols[i]) == NULL_I64) {
-            return err_new(EC_VALUE);
+            return err_value(0);
         }
     }
 
@@ -244,7 +244,7 @@ obj_p dot_obj(obj_p obj, obj_p idx) {
         case TYPE_LIST:
             l = idx->len;
             if (l < 2)
-                return err_new(EC_VALUE);
+                return err_value(0);
 
             l--;  // skip last element
 
@@ -252,7 +252,7 @@ obj_p dot_obj(obj_p obj, obj_p idx) {
                 obj = cow_obj(obj);
                 obj = dot_obj(obj, AS_LIST(idx)[i]);
                 if (obj == NULL)
-                    return err_new(EC_VALUE);
+                    return err_value(0);
             }
 
             return obj;
@@ -260,7 +260,7 @@ obj_p dot_obj(obj_p obj, obj_p idx) {
         default:
             ref = at_obj_ref(cow_obj(obj), idx);
             if (ref == NULL)
-                return err_new(EC_VALUE);
+                return err_value(0);
             return *ref;
     }
 }
@@ -279,7 +279,7 @@ obj_p __alter(obj_p *obj, obj_p func, obj_p idx, obj_p val) {
 
         p = at_obj_ref(*obj, idx);
         if (p == NULL)
-            return err_new(EC_VALUE);
+            return err_value(0);
         if (IS_ERR(*p))
             return *p;
 
@@ -313,15 +313,15 @@ obj_p ray_alter(obj_p *x, i64_t n) {
     obj_p obj, res, *cur = NULL;
 
     if (n < 3)
-        return err_new(EC_LENGTH);
+        return err_length(0, 0);
 
     if (x[1]->type < TYPE_LAMBDA || x[1]->type > TYPE_VARY)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     if (x[0]->type == -TYPE_SYMBOL) {
         cur = resolve(x[0]->i64);
         if (cur == NULL)
-            return err_new(EC_VALUE);
+            return err_value(0);
         obj = cow_obj(*cur);
     } else {
         obj = cow_obj(x[0]);
@@ -362,15 +362,15 @@ obj_p ray_modify(obj_p *x, i64_t n) {
     cur = NULL;
 
     if (n < 4)
-        return err_new(EC_LENGTH);
+        return err_length(0, 0);
 
     if (x[1]->type < TYPE_LAMBDA || x[1]->type > TYPE_VARY)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     if (x[0]->type == -TYPE_SYMBOL) {
         cur = resolve(x[0]->i64);
         if (cur == NULL)
-            return err_new(EC_VALUE);
+            return err_value(0);
         obj = cow_obj(*cur);
     } else {
         obj = cow_obj(x[0]);
@@ -417,7 +417,7 @@ obj_p ray_insert(obj_p *x, i64_t n) {
     b8_t need_drop, lst_allocated;
 
     if (n != 2)
-        return err_new(EC_LENGTH);
+        return err_length(0, 0);
 
     obj = __fetch(x[0], &val, &original);
 
@@ -425,7 +425,7 @@ obj_p ray_insert(obj_p *x, i64_t n) {
         return obj;
 
     if (obj->type != TYPE_TABLE) {
-        res = err_new(EC_TYPE);
+        res = err_type(0, 0, 0);
         UNCOW_OBJ(obj, val, original, res);
     }
 
@@ -436,14 +436,14 @@ obj_p ray_insert(obj_p *x, i64_t n) {
     // Handle dict/table input: reorder columns to match table order
     if (lst->type == TYPE_DICT || lst->type == TYPE_TABLE) {
         if (lst->type == TYPE_DICT && AS_LIST(lst)[0]->type != TYPE_SYMBOL) {
-            res = err_new(EC_TYPE);
+            res = err_type(0, 0, 0);
             UNCOW_OBJ(obj, val, original, res);
         }
 
         // Check that input doesn't have more columns than table
         l = AS_LIST(lst)[0]->len;
         if (l > AS_LIST(obj)[0]->len) {
-            res = err_new(EC_LENGTH);
+            res = err_length(0, 0);
             UNCOW_OBJ(obj, val, original, res);
         }
 
@@ -462,7 +462,7 @@ obj_p ray_insert(obj_p *x, i64_t n) {
             // With column reordering, we might have fewer columns than the table
             // but not more. The missing columns should be filled with nulls.
             if (l > AS_LIST(obj)[0]->len) {
-                res = err_new(EC_LENGTH);
+                res = err_length(0, 0);
                 INSERT_ERROR(res);
             }
 
@@ -471,7 +471,7 @@ obj_p ray_insert(obj_p *x, i64_t n) {
                 // Check all the elements of the list
                 for (i = 0; i < l; i++) {
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
-                        res = err_new(EC_TYPE);
+                        res = err_type(0, 0, 0);
                         INSERT_ERROR(res);
                     }
                 }
@@ -494,19 +494,19 @@ obj_p ray_insert(obj_p *x, i64_t n) {
                 // There are multiple records to be inserted
                 m = AS_LIST(lst)[0]->len;
                 if (m == 0) {
-                    res = err_new(EC_LENGTH);
+                    res = err_length(0, 0);
                     INSERT_ERROR(res);
                 }
 
                 // Check all the elements of the list
                 for (i = 0; i < l; i++) {
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
-                        res = err_new(EC_TYPE);
+                        res = err_type(0, 0, 0);
                         INSERT_ERROR(res);
                     }
 
                     if (AS_LIST(lst)[i]->len != m) {
-                        res = err_new(EC_LENGTH);
+                        res = err_length(0, 0);
                         INSERT_ERROR(res);
                     }
                 }
@@ -531,7 +531,7 @@ obj_p ray_insert(obj_p *x, i64_t n) {
             break;
 
         default:
-            res = err_new(EC_TYPE);
+            res = err_type(0, 0, 0);
             INSERT_ERROR(res);
     }
 
@@ -560,14 +560,14 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
     b8_t lst_allocated;
 
     if (n != 3)
-        return err_new(EC_LENGTH);
+        return err_length(0, 0);
 
     if (x[1]->type != -TYPE_I64)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     keys = x[1]->i64;
     if (keys < 1)
-        return err_new(EC_LENGTH);
+        return err_length(0, 0);
 
     obj = __fetch(x[0], &val, &original);
     if (IS_ERR(obj))
@@ -575,7 +575,7 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
 
     if (obj->type != TYPE_TABLE) {
         drop_obj(obj);
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
     }
 
     p = AS_LIST(obj)[0]->len;
@@ -587,14 +587,14 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
     if (lst->type == TYPE_DICT || lst->type == TYPE_TABLE) {
         if (lst->type == TYPE_DICT && AS_LIST(lst)[0]->type != TYPE_SYMBOL) {
             drop_obj(obj);
-            return err_new(EC_TYPE);
+            return err_type(0, 0, 0);
         }
 
         // Check that input doesn't have more columns than table
         l = AS_LIST(lst)[0]->len;
         if (l > p) {
             drop_obj(obj);
-            return err_new(EC_LENGTH);
+            return err_length(0, 0);
         }
 
         // Reorder columns to match table order (allows flexible column ordering)
@@ -613,17 +613,17 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
             l = ops_count(lst);
 
             if (l == 0)
-                UPSERT_ERROR(err_new(EC_LENGTH));
+                UPSERT_ERROR(err_length(0, 0));
 
             if (l > p)
-                UPSERT_ERROR(err_new(EC_LENGTH));
+                UPSERT_ERROR(err_length(0, 0));
 
             // Check if this is a single record (atoms) or multiple records (vectors)
             if (IS_ATOM(AS_LIST(lst)[0])) {
                 // Single record case - validate all elements are atoms or compatible
                 for (i = 0; i < l; i++) {
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
-                        UPSERT_ERROR(err_new(EC_TYPE));
+                        UPSERT_ERROR(err_type(0, 0, 0));
                     }
                 }
 
@@ -675,10 +675,10 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
             ll = AS_LIST(lst)[0]->len;
             for (i = 0; i < l; i++) {
                 if (!IS_VECTOR(AS_LIST(lst)[i]))
-                    UPSERT_ERROR(err_new(EC_TYPE));
+                    UPSERT_ERROR(err_type(0, 0, 0));
 
                 if (AS_LIST(lst)[i]->len != ll)
-                    UPSERT_ERROR(err_new(EC_LENGTH));
+                    UPSERT_ERROR(err_length(0, 0));
             }
 
             if (keys == 1) {
@@ -703,12 +703,12 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
             for (i = 0; i < l; i++) {
                 if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
                     drop_obj(idx);
-                    UPSERT_ERROR(err_new(EC_TYPE));
+                    UPSERT_ERROR(err_type(0, 0, 0));
                 }
 
                 if (AS_LIST(lst)[i]->len != m) {
                     drop_obj(idx);
-                    UPSERT_ERROR(err_new(EC_LENGTH));
+                    UPSERT_ERROR(err_length(0, 0));
                 }
             }
 
@@ -745,7 +745,7 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
             return __commit(x[0], obj, val);
 
         default:
-            UPSERT_ERROR(err_new(EC_TYPE));
+            UPSERT_ERROR(err_type(0, 0, 0));
     }
 }
 #undef UPSERT_ERROR
@@ -798,7 +798,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                 for (m = 0; m < n; m++) {
                     v = at_idx(AS_LIST(vals)[i], m);
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[j], v)) {
-                        res = err_new(EC_TYPE);
+                        res = err_type(0, 0, 0);
                         drop_obj(v);
                         drop_obj(tab);
                         drop_obj(keys);
@@ -809,7 +809,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                     }
 
                     if (!__suitable_lengths(AS_LIST(AS_LIST(obj)[1])[j], obj)) {
-                        res = err_new(EC_LENGTH);
+                        res = err_length(0, 0);
                         drop_obj(v);
                         drop_obj(tab);
                         drop_obj(keys);
@@ -881,7 +881,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
             // Check existing column
             else {
                 if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[j], AS_LIST(vals)[i])) {
-                    res = err_new(EC_TYPE);
+                    res = err_type(0, 0, 0);
                     drop_obj(tab);
                     drop_obj(keys);
                     drop_obj(vals);
@@ -896,7 +896,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                 i64_t vals_len = ops_count(AS_LIST(vals)[i]);
                 if (!IS_ATOM(AS_LIST(vals)[i]) && vals_len != filters->len &&
                     vals_len != AS_LIST(AS_LIST(obj)[1])[j]->len) {
-                    res = err_new(EC_LENGTH);
+                    res = err_length(0, 0);
                     drop_obj(tab);
                     drop_obj(keys);
                     drop_obj(vals);
@@ -942,16 +942,16 @@ obj_p ray_update(obj_p obj) {
     struct query_ctx_t ctx;
 
     if (obj->type != TYPE_DICT)
-        return err_new(EC_LENGTH);
+        return err_length(0, 0);
 
     if (AS_LIST(obj)[0]->type != TYPE_SYMBOL)
-        return err_new(EC_LENGTH);
+        return err_length(0, 0);
 
     // Retrive a table
     tabsym = at_sym(obj, "from", 4);
 
     if (is_null(tabsym))
-        return err_new(EC_LENGTH);
+        return err_length(0, 0);
 
     tab = eval(tabsym);
     if (IS_ERR(tab)) {
@@ -971,7 +971,7 @@ obj_p ray_update(obj_p obj) {
     if (tab->type != TYPE_TABLE) {
         drop_obj(tabsym);
         drop_obj(tab);
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
     }
 
     keys = ray_except(AS_LIST(obj)[0], runtime_get()->env.keywords);
@@ -981,7 +981,7 @@ obj_p ray_update(obj_p obj) {
         drop_obj(tabsym);
         drop_obj(keys);
         drop_obj(tab);
-        return err_new(EC_LENGTH);
+        return err_length(0, 0);
     }
 
     // Initialize query context - table columns available via resolve()

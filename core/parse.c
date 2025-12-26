@@ -65,7 +65,7 @@ obj_p parse_error(parser_t *parser, i64_t id, err_code_t code) {
     obj_p err, loc;
     vm_p vm = VM;
 
-    err = err_new(code);
+    err = err_raw(code);
 
     // Store location in VM's trace (glibc-like error handling)
     if (parser->nfo != NULL_OBJ && vm) {

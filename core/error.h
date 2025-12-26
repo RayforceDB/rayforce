@@ -63,15 +63,23 @@ RAY_ASSERT(sizeof(err_ctx_t) == sizeof(i64_t), "err_ctx_t must fit in obj->i64")
 // Error Creation API
 // ============================================================================
 
-obj_p err_new(err_code_t code);
+// With context
 obj_p err_type(i8_t expected, i8_t actual, i64_t field);  // field=0 for none
 obj_p err_arity(i32_t need, i32_t have);                  // function arguments
 obj_p err_length(i32_t need, i32_t have);                 // list lengths
 obj_p err_index(i32_t idx, i32_t len);
-obj_p err_value(i64_t sym);
+obj_p err_value(i64_t sym);  // sym=0 for no context
 obj_p err_limit(i32_t limit);
 obj_p err_os(nil_t);
 obj_p err_user(lit_p msg);
+
+// Without context (simple errors)
+obj_p err_domain(nil_t);
+obj_p err_nyi(nil_t);
+obj_p err_parse(nil_t);
+
+// Internal: create error with code only (for deserialization/parsing)
+obj_p err_raw(err_code_t code);
 
 // ============================================================================
 // Error Decoding API

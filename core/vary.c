@@ -116,7 +116,7 @@ obj_p ray_print(obj_p *x, i64_t n) {
     obj_p s = obj_fmt_n(x, n);
 
     if (s == NULL_OBJ)
-        return err_new(EC_PARSE);
+        return err_parse();
 
     printf("%.*s", (i32_t)s->len, AS_C8(s));
     drop_obj(s);
@@ -128,7 +128,7 @@ obj_p ray_println(obj_p *x, i64_t n) {
     obj_p s = obj_fmt_n(x, n);
 
     if (s == NULL_OBJ)
-        return err_new(EC_PARSE);
+        return err_parse();
 
     printf("%.*s\n", (i32_t)s->len, AS_C8(s));
     drop_obj(s);
@@ -148,17 +148,17 @@ obj_p ray_set_splayed(obj_p *x, i64_t n) {
             return ray_set(x[0], x[1]);
         case 3:
             if (x[0]->type != TYPE_C8)
-                return err_new(EC_TYPE);
+                return err_type(0, 0, 0);
 
             if (x[1]->type != TYPE_TABLE)
-                return err_new(EC_TYPE);
+                return err_type(0, 0, 0);
 
             if (x[0]->len < 2 || AS_C8(x[0])[x[0]->len - 1] != '/')
-                return err_new(EC_TYPE);
+                return err_type(0, 0, 0);
 
             return io_set_table_splayed(x[0], x[1], x[2]);
         default:
-            return err_new(EC_LENGTH);
+            return err_length(0, 0);
     }
 }
 
@@ -169,7 +169,7 @@ obj_p ray_get_splayed(obj_p *x, i64_t n) {
         case 2:
             return io_get_table_splayed(x[0], x[1]);
         default:
-            return err_new(EC_LENGTH);
+            return err_length(0, 0);
     }
 }
 
@@ -178,7 +178,7 @@ obj_p ray_set_parted(obj_p *x, i64_t n) {
         case 2:
             return ray_set(x[0], x[1]);
         default:
-            return err_new(EC_LENGTH);
+            return err_length(0, 0);
     }
 }
 
@@ -190,10 +190,10 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
     switch (n) {
         case 2:
             if (x[0]->type != TYPE_C8)
-                return err_new(EC_LENGTH);
+                return err_length(0, 0);
 
             if (x[1]->type != -TYPE_SYMBOL)
-                return err_new(EC_LENGTH);
+                return err_length(0, 0);
 
             // Load symfile if present (needed before reading partitions with ENUM columns)
             // Ignore error if symfile doesn't exist - it's optional
@@ -249,7 +249,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
             if (l == 0) {
                 drop_obj(gcol);
                 drop_obj(res);
-                return err_new(EC_TYPE);
+                return err_type(0, 0, 0);
             }
 
             // Load schema of the first partition
@@ -272,7 +272,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
                 drop_obj(res);
                 drop_obj(t1);
                 drop_obj(path);
-                return err_new(EC_LENGTH);
+                return err_length(0, 0);
             }
 
             // Create maps over columns
@@ -310,7 +310,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
                     drop_obj(t2);
                     drop_obj(path);
                     drop_obj(fmaps);
-                    return err_new(EC_LENGTH);
+                    return err_length(0, 0);
                 }
 
                 // Partitions must have the same column names
@@ -323,7 +323,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
                     drop_obj(t2);
                     drop_obj(path);
                     drop_obj(fmaps);
-                    return err_new(EC_TYPE);
+                    return err_type(0, 0, 0);
                 }
 
                 drop_obj(eq);
@@ -337,7 +337,7 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
                         drop_obj(t2);
                         drop_obj(path);
                         drop_obj(fmaps);
-                        return err_new(EC_TYPE);
+                        return err_type(0, 0, 0);
                     }
                 }
 
@@ -387,6 +387,6 @@ obj_p ray_get_parted(obj_p *x, i64_t n) {
             return table(keys, vals);
 
         default:
-            return err_new(EC_LENGTH);
+            return err_length(0, 0);
     }
 }

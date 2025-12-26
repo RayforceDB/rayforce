@@ -59,7 +59,7 @@ const lit_p unicode_glyphs[] = {"│", "─", "┌", "┐", "└", "┘", "├",
                                 "❯", "∶", "‾", "•", "╭", "╰", "╮", "╯", "┆", "…", "█"};
 obj_p ray_set_fpr(obj_p x) {
     if (x->type != -TYPE_I64)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     if (x->i64 < 0)
         F64_PRECISION = DEFAULT_F64_PRECISION;
@@ -544,9 +544,11 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, str_p msg, i32_t msg_len, b8_t
     if (first_line_start) {
         // Line number gutter
         if (is_first) {
-            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", CYAN, (int)gutter_width, span.start_line + 1, RESET, GRAY, RESET);
+            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", CYAN, (int)gutter_width, span.start_line + 1, RESET,
+                              GRAY, RESET);
         } else {
-            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", GRAY, (int)gutter_width, span.start_line + 1, RESET, GRAY, RESET);
+            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", GRAY, (int)gutter_width, span.start_line + 1, RESET,
+                              GRAY, RESET);
         }
 
         // For single-line spans, highlight the span portion
@@ -563,7 +565,8 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, str_p msg, i32_t msg_len, b8_t
             n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", TOMATO, (int)span_len, first_line_start + before_len, RESET);
             // After span (dim)
             if (after_len > 0)
-                n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", GRAY, (int)after_len, first_line_start + after_start, RESET);
+                n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", GRAY, (int)after_len, first_line_start + after_start,
+                                  RESET);
             n += str_fmt_into(dst, NO_LIMIT, "\n");
 
             // Simple pointer with message
@@ -584,7 +587,8 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, str_p msg, i32_t msg_len, b8_t
             n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", TOMATO, (int)span_len, first_line_start + before_len, RESET);
             // After span (dim)
             if (after_len > 0)
-                n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", GRAY, (int)after_len, first_line_start + after_start, RESET);
+                n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s", GRAY, (int)after_len, first_line_start + after_start,
+                                  RESET);
             n += str_fmt_into(dst, NO_LIMIT, "\n");
         }
     }
@@ -611,10 +615,12 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, str_p msg, i32_t msg_len, b8_t
 
         // Print last line
         if (is_first) {
-            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", CYAN, (int)gutter_width, span.end_line + 1, RESET, GRAY, RESET);
+            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", CYAN, (int)gutter_width, span.end_line + 1, RESET, GRAY,
+                              RESET);
             n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s\n", WHITE, (int)last_line_len, last_line_start, RESET);
         } else {
-            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", GRAY, (int)gutter_width, span.end_line + 1, RESET, GRAY, RESET);
+            n += str_fmt_into(dst, NO_LIMIT, "%s%*d%s %s│%s ", GRAY, (int)gutter_width, span.end_line + 1, RESET, GRAY,
+                              RESET);
             n += str_fmt_into(dst, NO_LIMIT, "%s%.*s%s\n", GRAY, (int)last_line_len, last_line_start, RESET);
         }
 
@@ -652,7 +658,7 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, str_p msg, i32_t msg_len, b8_t
 static i64_t error_ctx_fmt_into_new(obj_p *dst, obj_p err) {
     i64_t n = 0;
     err_code_t code = err_code(err);
-    err_ctx_t* ctx = err_ctx(err);
+    err_ctx_t *ctx = err_ctx(err);
     str_p name;
     lit_p msg;
 
@@ -661,33 +667,31 @@ static i64_t error_ctx_fmt_into_new(obj_p *dst, obj_p err) {
             err_types_t t = ctx->types;
             if (t.field) {
                 str_p fname = str_from_symbol(t.field);
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s in field '%s%s%s'\n",
-                                  GRAY, RESET, GREEN, fname, RESET);
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s in field '%s%s%s'\n", GRAY, RESET, GREEN, fname,
+                                  RESET);
             }
             if (t.expected != 0 || t.actual != 0) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%s%s, got %s%s%s\n",
-                                  GRAY, RESET, CYAN, type_name(t.expected), RESET,
-                                  YELLOW, type_name(t.actual), RESET);
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%s%s, got %s%s%s\n", GRAY, RESET, CYAN,
+                                  type_name(t.expected), RESET, YELLOW, type_name(t.actual), RESET);
             }
             break;
         }
         case EC_ARITY: {
             err_counts_t c = ctx->counts;
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%d%s argument%s, got %s%d%s\n",
-                              GRAY, RESET, CYAN, c.need, RESET, c.need == 1 ? "" : "s",
-                              YELLOW, c.have, RESET);
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%d%s argument%s, got %s%d%s\n", GRAY, RESET,
+                              CYAN, c.need, RESET, c.need == 1 ? "" : "s", YELLOW, c.have, RESET);
             break;
         }
         case EC_LENGTH: {
             err_counts_t c = ctx->counts;
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s need %s%d%s, have %s%d%s\n",
-                              GRAY, RESET, CYAN, c.need, RESET, YELLOW, c.have, RESET);
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s need %s%d%s, have %s%d%s\n", GRAY, RESET, CYAN, c.need,
+                              RESET, YELLOW, c.have, RESET);
             break;
         }
         case EC_INDEX: {
             err_bounds_t b = ctx->bounds;
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s index %s%d%s not in [0, %s%d%s)\n",
-                              GRAY, RESET, YELLOW, b.idx, RESET, CYAN, b.len, RESET);
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s index %s%d%s not in [0, %s%d%s)\n", GRAY, RESET, YELLOW,
+                              b.idx, RESET, CYAN, b.len, RESET);
             break;
         }
         case EC_VALUE: {
@@ -695,8 +699,8 @@ static i64_t error_ctx_fmt_into_new(obj_p *dst, obj_p err) {
             if (sym) {
                 name = str_from_symbol(sym);
                 if (name && name[0]) {
-                    n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s '%s%s%s' not found\n",
-                                      GRAY, RESET, GREEN, name, RESET);
+                    n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s '%s%s%s' not found\n", GRAY, RESET, GREEN, name,
+                                      RESET);
                 }
             }
             break;
@@ -704,24 +708,22 @@ static i64_t error_ctx_fmt_into_new(obj_p *dst, obj_p err) {
         case EC_OS: {
             i32_t e = ctx->errnum;
             if (e) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n",
-                                  GRAY, RESET, YELLOW, strerror(e), RESET);
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n", GRAY, RESET, YELLOW, strerror(e), RESET);
             }
             break;
         }
         case EC_USER: {
             msg = err_get_message(err);
             if (msg && msg[0]) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n",
-                                  GRAY, RESET, YELLOW, msg, RESET);
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n", GRAY, RESET, YELLOW, msg, RESET);
             }
             break;
         }
         case EC_LIMIT: {
             err_counts_t c = ctx->counts;
             if (c.have > 0) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s limit %s%d%s exceeded\n",
-                                  GRAY, RESET, YELLOW, c.have, RESET);
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s limit %s%d%s exceeded\n", GRAY, RESET, YELLOW, c.have,
+                                  RESET);
             }
             break;
         }
@@ -750,8 +752,8 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
     locs = (vm && vm->trace != NULL_OBJ) ? vm->trace : NULL_OBJ;
 
     // Format header: "× Error: code"
-    n = str_fmt_into(dst, MAX_ERROR_LEN, "\n  %s×%s %sError%s: %s%s%s\n", TOMATO, RESET, TOMATO, RESET, YELLOW, code_name,
-                     RESET);
+    n = str_fmt_into(dst, MAX_ERROR_LEN, "\n  %s×%s %sError%s: %s%s%s\n", TOMATO, RESET, TOMATO, RESET, YELLOW,
+                     code_name, RESET);
 
     // Format context (already includes ├─ prefix and newline)
     n += error_ctx_fmt_into_new(dst, obj);

@@ -191,7 +191,7 @@ obj_p binary_set(obj_p x, obj_p y) {
                             drop_obj(buf);
                             drop_obj(k);
 
-                            return err_new(EC_TYPE);
+                            return err_type(0, 0, 0);
                         }
 
                         AS_I64(k)[i] = size;
@@ -306,11 +306,11 @@ obj_p binary_set(obj_p x, obj_p y) {
                         return clone_obj(x);
                     }
 
-                    return err_new(EC_TYPE);
+                    return err_type(0, 0, 0);
             }
 
         default:
-            return err_new(EC_TYPE);
+            return err_type(0, 0, 0);
     }
 }
 
@@ -340,6 +340,6 @@ obj_p ray_let(obj_p x, obj_p y) {
             return amend(x, e);
 
         default:
-            return err_new(EC_TYPE);
+            return err_type(0, 0, 0);
     }
 }

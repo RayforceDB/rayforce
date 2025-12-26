@@ -192,19 +192,19 @@ obj_p ray_loadfn(obj_p *args, i64_t n) {
     obj_p path, func, res;
 
     if (n != 3)
-        return err_new(EC_LENGTH);
+        return err_length(0, 0);
 
     if (!args[0] || !args[1] || !args[2])
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     if (args[0]->type != TYPE_C8)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     if (args[1]->type != TYPE_C8)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     if (args[2]->type != -TYPE_I64)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     path = cstring_from_str(AS_C8(args[0]), args[0]->len);
     func = cstring_from_str(AS_C8(args[1]), args[1]->len);

@@ -293,7 +293,7 @@ obj_p map_binary_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
     i8_t xt, yt;
 
     if (!x || !y)
-        return err_new(EC_TYPE);
+        return err_type(TYPE_LIST, x ? y->type : 0, 0);
 
     xt = x->type;
     yt = y->type;
@@ -610,7 +610,7 @@ obj_p ray_map(obj_p *x, i64_t n) {
 
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                return err_new(EC_LENGTH);  // ranks don't match
+                return err_length(0, 0);  // ranks don't match
 
             if (l < 1)
                 return vector(x[0]->type, 0);
@@ -618,7 +618,7 @@ obj_p ray_map(obj_p *x, i64_t n) {
             return map_lambda(f, x, n);
 
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LAMBDA, f->type, 0);
     }
 }
 
@@ -658,7 +658,7 @@ obj_p ray_pmap(obj_p *x, i64_t n) {
             return pmap_lambda(f, x, n);
 
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LAMBDA, f->type, 0);
     }
 }
 
@@ -745,7 +745,7 @@ obj_p ray_map_left(obj_p *x, i64_t n) {
 
             return res;
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LAMBDA, f->type, 0);
     }
 }
 
@@ -831,7 +831,7 @@ obj_p ray_map_right(obj_p *x, i64_t n) {
 
             return res;
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LAMBDA, f->type, 0);
     }
 }
 
@@ -1037,7 +1037,7 @@ obj_p ray_fold(obj_p *x, i64_t n) {
             } else
                 return err_arity(1, n);
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LAMBDA, f->type, 0);
     }
 }
 
@@ -1126,7 +1126,7 @@ obj_p ray_fold_left(obj_p *x, i64_t n) {
 
             return v;
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LAMBDA, f->type, 0);
     }
 }
 
@@ -1205,7 +1205,7 @@ obj_p ray_fold_right(obj_p *x, i64_t n) {
 
             return v;
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LAMBDA, f->type, 0);
     }
 }
 
@@ -1475,7 +1475,7 @@ obj_p ray_scan(obj_p *x, i64_t n) {
             } else
                 return err_arity(1, n);
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LAMBDA, f->type, 0);
     }
 }
 
@@ -1572,7 +1572,7 @@ obj_p ray_scan_left(obj_p *x, i64_t n) {
 
             return res;
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LAMBDA, f->type, 0);
     }
 }
 
@@ -1669,6 +1669,6 @@ obj_p ray_scan_right(obj_p *x, i64_t n) {
 
             return res;
         default:
-            return err_new(EC_TYPE);
+            return err_type(TYPE_LAMBDA, f->type, 0);
     }
 }

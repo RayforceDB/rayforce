@@ -971,7 +971,7 @@ obj_p ipc_send_sync(poll_p poll, i64_t id, obj_p msg) {
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     selector = (selector_p)idx;
     LOG_TRACE("ipc_send_sync: selector=%p fd=%lld", (void*)selector, selector->fd);
@@ -1059,11 +1059,11 @@ obj_p ipc_send_async(poll_p poll, i64_t id, obj_p msg) {
     idx = freelist_get(poll->selectors, id - SELECTOR_ID_OFFSET);
 
     if (idx == NULL_I64)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     selector = (selector_p)idx;
     if (selector == NULL)
-        return err_new(EC_TYPE);
+        return err_type(0, 0, 0);
 
     queue_push(selector->tx.queue, (nil_t *)msg);
 
