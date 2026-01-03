@@ -192,7 +192,7 @@ runtime_p runtime_create(i32_t argc, str_p argv[]) {
         // REPL creation is controlled by RAYFORCE_NO_REPL flag
         __RUNTIME->sys_info = sys_info(1);
         if (__RUNTIME->sys_info.threads > 1)
-            __RUNTIME->pool = pool_create(__RUNTIME->sys_info.threads - 1);
+            __RUNTIME->pool = pool_create(__RUNTIME->sys_info.threads);
 
         __RUNTIME->poll = poll_create();
         if (__RUNTIME->poll == NULL) {

@@ -449,19 +449,19 @@ i64_t pool_split_by(pool_p pool, i64_t input_len, i64_t groups_len) {
         return 1;
     else if (rc_sync_get())
         return 1;
-    else if (input_len <= pool->executors_count + 1)
+    else if (input_len <= pool->executors_count)
         return 1;
     else if (groups_len >= GROUP_SPLIT_THRESHOLD)
         return 1;
     else
-        return pool->executors_count + 1;
+        return pool->executors_count;
 }
 
 i64_t pool_get_executors_count(pool_p pool) {
     if (pool == NULL)
         return 1;
     else
-        return pool->executors_count + 1;
+        return pool->executors_count;
 }
 
 // Calculate page-aligned chunk size for parallel operations
