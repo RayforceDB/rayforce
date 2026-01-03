@@ -31,6 +31,12 @@
 // Maximum range for counting sort - configurable constant
 #define COUNTING_SORT_MAX_RANGE 1000000
 
+// Parallel sort thresholds
+#define PARALLEL_SORT_THRESHOLD_U8 (16 * RAY_PAGE_SIZE)
+
+// U8 counting sort constants
+#define U8_RANGE 256
+
 typedef struct {
     i64_t* out;
     i64_t len;
@@ -178,13 +184,118 @@ nil_t insertion_sort_asc(i64_t array[], i64_t indices[], i64_t left, i64_t right
 nil_t insertion_sort_desc(i64_t array[], i64_t indices[], i64_t left, i64_t right) {
     insertion_sort_i64(array, indices, left, right, -1);
 }
-//
+
+// ============================================================================
+// Parallel Counting Sort for U8
+// ============================================================================
+
+typedef struct {
+    u8_t* data;
+    i64_t chunk_size;
+    i64_t* histograms;
+} histogram_u8_ctx_t;
+
+typedef struct {
+    u8_t* data;
+    i64_t chunk_size;
+    i64_t* positions;
+    i64_t* out;
+} scatter_u8_ctx_t;
+
+static obj_p histogram_u8_worker(i64_t len, i64_t offset, void* ctx) {
+    histogram_u8_ctx_t* c = ctx;
+    i64_t worker_id = offset / c->chunk_size;
+    u8_t* data = c->data + offset;
+    i64_t* hist = c->histograms + worker_id * U8_RANGE;
+
+    memset(hist, 0, U8_RANGE * sizeof(i64_t));
+    for (i64_t i = 0; i < len; i++)
+        hist[data[i]]++;
+
+    return NULL_OBJ;
+}
+
+static obj_p scatter_u8_worker(i64_t len, i64_t offset, void* ctx) {
+    scatter_u8_ctx_t* c = ctx;
+    i64_t worker_id = offset / c->chunk_size;
+    u8_t* data = c->data + offset;
+    i64_t* pos = c->positions + worker_id * U8_RANGE;
+    i64_t* out = c->out;
+
+    for (i64_t i = 0; i < len; i++)
+        out[pos[data[i]]++] = offset + i;
+
+    return NULL_OBJ;
+}
+
+static obj_p parallel_counting_sort_u8(obj_p vec, i64_t asc) {
+    i64_t len = vec->len;
+    u8_t* data = AS_U8(vec);
+
+    pool_p pool = pool_get();
+    i64_t n = pool_split_by(pool, len, 0);
+    i64_t chunk_size = len / n;
+
+    // Allocate histograms
+    obj_p hist_obj = I64(n * U8_RANGE);
+    if (IS_ERR(hist_obj)) return hist_obj;
+    i64_t* histograms = AS_I64(hist_obj);
+
+    // Allocate output early (overlaps with histogram computation)
+    obj_p indices = I64(len);
+    if (IS_ERR(indices)) {
+        drop_obj(hist_obj);
+        return indices;
+    }
+
+    // Phase 1: parallel histogram
+    histogram_u8_ctx_t hist_ctx = {data, chunk_size, histograms};
+    pool_map(len, histogram_u8_worker, &hist_ctx);
+
+    // Phase 2: merge and compute positions
+    i64_t global_counts[U8_RANGE] = {0};
+    for (i64_t w = 0; w < n; w++)
+        for (i64_t b = 0; b < U8_RANGE; b++)
+            global_counts[b] += histograms[w * U8_RANGE + b];
+
+    i64_t prefix[U8_RANGE];
+    if (asc > 0) {
+        prefix[0] = 0;
+        for (i64_t b = 1; b < U8_RANGE; b++)
+            prefix[b] = prefix[b-1] + global_counts[b-1];
+    } else {
+        prefix[U8_RANGE-1] = 0;
+        for (i64_t b = U8_RANGE - 2; b >= 0; b--)
+            prefix[b] = prefix[b+1] + global_counts[b+1];
+    }
+
+    // Compute per-worker positions
+    for (i64_t b = 0; b < U8_RANGE; b++) {
+        i64_t pos = prefix[b];
+        for (i64_t w = 0; w < n; w++) {
+            i64_t cnt = histograms[w * U8_RANGE + b];
+            histograms[w * U8_RANGE + b] = pos;
+            pos += cnt;
+        }
+    }
+
+    // Phase 3: parallel scatter
+    scatter_u8_ctx_t scatter_ctx = {data, chunk_size, histograms, AS_I64(indices)};
+    pool_map(len, scatter_u8_worker, &scatter_ctx);
+
+    drop_obj(hist_obj);
+    return indices;
+}
 
 obj_p ray_sort_asc_u8(obj_p vec) {
     i64_t i, len = vec->len;
+    u8_t* iv = AS_U8(vec);
+
+    if (len >= PARALLEL_SORT_THRESHOLD_U8)
+        return parallel_counting_sort_u8(vec, 1);
+
     obj_p indices = I64(len);
     i64_t* ov = AS_I64(indices);
-    u8_t* iv = AS_U8(vec);
 
     u64_t pos[257] = {0};
 
@@ -480,9 +591,13 @@ obj_p ray_sort_asc(obj_p vec) {
 
 obj_p ray_sort_desc_u8(obj_p vec) {
     i64_t i, len = vec->len;
+    u8_t* iv = AS_U8(vec);
+
+    if (len >= PARALLEL_SORT_THRESHOLD_U8)
+        return parallel_counting_sort_u8(vec, -1);
+
     obj_p indices = I64(len);
     i64_t* ov = AS_I64(indices);
-    u8_t* iv = AS_U8(vec);
 
     u64_t pos[257] = {0};
 
