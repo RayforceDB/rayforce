@@ -33,6 +33,8 @@
 
 // Parallel sort thresholds
 #define PARALLEL_SORT_THRESHOLD_U8 (16 * RAY_PAGE_SIZE)
+#define PARALLEL_SORT_THRESHOLD_I16 (500 * 1024)
+#define RADIX2_THRESHOLD_I16 (100 * 1024)
 
 // U8 counting sort constants
 #define U8_RANGE 256
@@ -287,6 +289,188 @@ static obj_p parallel_counting_sort_u8(obj_p vec, i64_t asc) {
     return indices;
 }
 
+// ============================================================================
+// Parallel Counting Sort for I16 (fixed 65536 range)
+// ============================================================================
+
+#define I16_BUCKETS 65536
+
+typedef struct {
+    i16_t* data;
+    i64_t chunk_size;
+    i64_t* histograms;  // n_workers * I16_BUCKETS + null_count at end
+} histogram_i16_ctx_t;
+
+typedef struct {
+    i16_t* data;
+    i64_t chunk_size;
+    i64_t* positions;
+    i64_t* out;
+    i64_t* null_positions;
+    i64_t null_offset;
+    i64_t asc;
+} scatter_i16_ctx_t;
+
+// Histogram worker: builds histogram + counts nulls
+// Bucket index: XOR with 0x8000 to convert signed order to unsigned order
+// -32768 -> 0, -32767 -> 1, ..., -1 -> 32767, 0 -> 32768, ..., 32767 -> 65535
+#define I16_TO_BUCKET(val) ((u16_t)((val) ^ 0x8000))
+
+static obj_p histogram_i16_worker(i64_t len, i64_t offset, void* ctx) {
+    histogram_i16_ctx_t* c = ctx;
+    i64_t worker_id = offset / c->chunk_size;
+    i16_t* data = c->data + offset;
+    i64_t* hist = c->histograms + worker_id * (I16_BUCKETS + 1);
+    i64_t null_count = 0;
+
+    memset(hist, 0, I16_BUCKETS * sizeof(i64_t));
+
+    for (i64_t i = 0; i < len; i++) {
+        i16_t val = data[i];
+        if (val == NULL_I16)
+            null_count++;
+        else
+            hist[I16_TO_BUCKET(val)]++;
+    }
+    hist[I16_BUCKETS] = null_count;  // store null count at end
+
+    return NULL_OBJ;
+}
+
+// Scatter worker: handles NULLs
+static obj_p scatter_i16_worker(i64_t len, i64_t offset, void* ctx) {
+    scatter_i16_ctx_t* c = ctx;
+    i64_t worker_id = offset / c->chunk_size;
+    i16_t* data = c->data + offset;
+    i64_t* pos = c->positions + worker_id * I16_BUCKETS;
+    i64_t null_pos = c->null_positions[worker_id];
+
+    if (c->asc > 0) {
+        for (i64_t i = 0; i < len; i++) {
+            i16_t val = data[i];
+            if (val == NULL_I16)
+                c->out[null_pos++] = offset + i;
+            else
+                c->out[c->null_offset + pos[I16_TO_BUCKET(val)]++] = offset + i;
+        }
+    } else {
+        for (i64_t i = 0; i < len; i++) {
+            i16_t val = data[i];
+            if (val == NULL_I16)
+                c->out[c->null_offset + null_pos++] = offset + i;
+            else
+                c->out[pos[I16_TO_BUCKET(val)]++] = offset + i;
+        }
+    }
+
+    return NULL_OBJ;
+}
+
+// Parallel counting sort for i16 - like i32 but with fixed 65536 range
+static obj_p parallel_counting_sort_i16(obj_p vec, i64_t asc) {
+    i64_t len = vec->len;
+    i16_t* data = AS_I16(vec);
+
+    pool_p pool = pool_get();
+    i64_t n = pool_split_by(pool, len, 0);
+    i64_t chunk_size = len / n;
+
+    // Allocate histograms: n workers * (65536 buckets + 1 for null_count)
+    obj_p hist_obj = I64(n * (I16_BUCKETS + 1));
+    if (IS_ERR(hist_obj)) return hist_obj;
+    i64_t* histograms = AS_I64(hist_obj);
+
+    // Allocate output early (overlaps with histogram computation)
+    obj_p indices = I64(len);
+    if (IS_ERR(indices)) {
+        drop_obj(hist_obj);
+        return indices;
+    }
+
+    // Phase 1: parallel histogram
+    histogram_i16_ctx_t hist_ctx = {data, chunk_size, histograms};
+    pool_map(len, histogram_i16_worker, &hist_ctx);
+
+    // Phase 2: merge histograms and compute prefix sum
+    obj_p counts_obj = I64(I16_BUCKETS);
+    if (IS_ERR(counts_obj)) {
+        drop_obj(hist_obj);
+        drop_obj(indices);
+        return counts_obj;
+    }
+    i64_t* global_counts = AS_I64(counts_obj);
+
+    // Merge all worker histograms
+    memset(global_counts, 0, I16_BUCKETS * sizeof(i64_t));
+    i64_t total_null_count = 0;
+    for (i64_t w = 0; w < n; w++) {
+        i64_t* worker_hist = histograms + w * (I16_BUCKETS + 1);
+        for (i64_t b = 0; b < I16_BUCKETS; b++)
+            global_counts[b] += worker_hist[b];
+        total_null_count += worker_hist[I16_BUCKETS];
+    }
+
+    i64_t non_null_count = len - total_null_count;
+
+    // Compute prefix sum
+    obj_p prefix_obj = I64(I16_BUCKETS);
+    if (IS_ERR(prefix_obj)) {
+        drop_obj(hist_obj);
+        drop_obj(counts_obj);
+        drop_obj(indices);
+        return prefix_obj;
+    }
+    i64_t* prefix = AS_I64(prefix_obj);
+
+    if (asc > 0) {
+        prefix[0] = 0;
+        for (i64_t b = 1; b < I16_BUCKETS; b++)
+            prefix[b] = prefix[b-1] + global_counts[b-1];
+    } else {
+        prefix[I16_BUCKETS-1] = 0;
+        for (i64_t b = I16_BUCKETS - 2; b >= 0; b--)
+            prefix[b] = prefix[b+1] + global_counts[b+1];
+    }
+
+    // Compute per-worker positions
+    for (i64_t b = 0; b < I16_BUCKETS; b++) {
+        i64_t pos = prefix[b];
+        for (i64_t w = 0; w < n; w++) {
+            i64_t* worker_hist = histograms + w * (I16_BUCKETS + 1);
+            i64_t cnt = worker_hist[b];
+            worker_hist[b] = pos;
+            pos += cnt;
+        }
+    }
+
+    drop_obj(counts_obj);
+    drop_obj(prefix_obj);
+
+    // Compute per-worker null positions
+    obj_p null_pos_obj = I64(n);
+    if (IS_ERR(null_pos_obj)) {
+        drop_obj(hist_obj);
+        drop_obj(indices);
+        return null_pos_obj;
+    }
+    i64_t* null_positions = AS_I64(null_pos_obj);
+
+    i64_t null_offset_acc = 0;
+    for (i64_t w = 0; w < n; w++) {
+        null_positions[w] = null_offset_acc;
+        null_offset_acc += histograms[w * (I16_BUCKETS + 1) + I16_BUCKETS];
+    }
+
+    // Phase 3: parallel scatter
+    i64_t null_offset = asc > 0 ? total_null_count : non_null_count;
+    scatter_i16_ctx_t scatter_ctx = {data, chunk_size, histograms, AS_I64(indices), null_positions, null_offset, asc};
+    pool_map(len, scatter_i16_worker, &scatter_ctx);
+
+    drop_obj(hist_obj);
+    drop_obj(null_pos_obj);
+    return indices;
+}
+
 obj_p ray_sort_asc_u8(obj_p vec) {
     i64_t i, len = vec->len;
     u8_t* iv = AS_U8(vec);
@@ -313,23 +497,62 @@ obj_p ray_sort_asc_u8(obj_p vec) {
 
 obj_p ray_sort_asc_i16(obj_p vec) {
     i64_t i, len = vec->len;
-    obj_p indices = I64(len);
-    i64_t* ov = AS_I64(indices);
     i16_t* iv = AS_I16(vec);
 
-    u64_t pos[65537] = {0};
+    if (len >= PARALLEL_SORT_THRESHOLD_I16)
+        return parallel_counting_sort_i16(vec, 1);
+
+    // Medium arrays: 1-pass counting sort (65536 buckets)
+    if (len >= RADIX2_THRESHOLD_I16) {
+        obj_p indices = I64(len);
+        i64_t* ov = AS_I64(indices);
+
+        u64_t pos[65537] = {0};
+
+        for (i = 0; i < len; i++)
+            pos[iv[i] + 32769]++;
+
+        for (i = 2; i <= 65536; i++)
+            pos[i] += pos[i - 1];
+
+        for (i = 0; i < len; i++)
+            ov[pos[iv[i] + 32768]++] = i;
+
+        return indices;
+    }
+
+    // Small arrays: 2-pass radix sort (256 buckets)
+    obj_p temp = I64(len);
+    i64_t* ti = AS_I64(temp);
+
+    u64_t pos1[257] = {0};
+    u64_t pos2[257] = {0};
 
     for (i = 0; i < len; i++) {
-        pos[iv[i] + 32769]++;
+        u16_t t = (u16_t)(iv[i] ^ 0x8000);
+        pos1[(t & 0xff) + 1]++;
+        pos2[(t >> 8) + 1]++;
     }
-    for (i = 2; i <= 65536; i++) {
-        pos[i] += pos[i - 1];
+
+    for (i = 2; i <= 256; i++) {
+        pos1[i] += pos1[i - 1];
+        pos2[i] += pos2[i - 1];
+    }
+
+    obj_p indices = I64(len);
+    i64_t* ov = AS_I64(indices);
+
+    for (i = 0; i < len; i++) {
+        u16_t t = (u16_t)(iv[i] ^ 0x8000);
+        ti[pos1[t & 0xff]++] = i;
     }
 
     for (i = 0; i < len; i++) {
-        ov[pos[iv[i] + 32768]++] = i;
+        u16_t t = (u16_t)(iv[ti[i]] ^ 0x8000);
+        ov[pos2[t >> 8]++] = ti[i];
     }
 
+    drop_obj(temp);
     return indices;
 }
 
@@ -615,21 +838,61 @@ obj_p ray_sort_desc_u8(obj_p vec) {
 
 obj_p ray_sort_desc_i16(obj_p vec) {
     i64_t i, len = vec->len;
-    obj_p indices = I64(len);
-    i64_t* ov = AS_I64(indices);
     i16_t* iv = AS_I16(vec);
 
-    u64_t pos[65537] = {0};
+    if (len >= PARALLEL_SORT_THRESHOLD_I16)
+        return parallel_counting_sort_i16(vec, -1);
 
-    for (i = 0; i < len; i++)
-        pos[(u16_t)(iv[i] + 32768)]++;
+    // Medium arrays: 1-pass counting sort (65536 buckets)
+    if (len >= RADIX2_THRESHOLD_I16) {
+        obj_p indices = I64(len);
+        i64_t* ov = AS_I64(indices);
 
-    for (i = 65534; i >= 0; i--)
-        pos[i] += pos[i + 1];
+        u64_t pos[65537] = {0};
 
-    for (i = 0; i < len; i++)
-        ov[pos[(u64_t)(iv[i] + 32769)]++] = i;
+        for (i = 0; i < len; i++)
+            pos[(u16_t)(iv[i] + 32768)]++;
 
+        for (i = 65534; i >= 0; i--)
+            pos[i] += pos[i + 1];
+
+        for (i = 0; i < len; i++)
+            ov[pos[(u64_t)(iv[i] + 32769)]++] = i;
+
+        return indices;
+    }
+
+    // Small arrays: 2-pass radix sort (256 buckets)
+    obj_p indices = I64(len);
+    obj_p temp = I64(len);
+    i64_t* ov = AS_I64(indices);
+    i64_t* ti = AS_I64(temp);
+
+    u64_t pos1[257] = {0};
+    u64_t pos2[257] = {0};
+
+    for (i = 0; i < len; i++) {
+        u16_t t = (u16_t)(iv[i] ^ 0x8000);
+        pos1[t & 0xff]++;
+        pos2[t >> 8]++;
+    }
+
+    for (i = 254; i >= 0; i--) {
+        pos1[i] += pos1[i + 1];
+        pos2[i] += pos2[i + 1];
+    }
+
+    for (i = 0; i < len; i++) {
+        u16_t t = (u16_t)(iv[i] ^ 0x8000);
+        ti[pos1[(t & 0xff) + 1]++] = i;
+    }
+
+    for (i = 0; i < len; i++) {
+        u16_t t = (u16_t)(iv[ti[i]] ^ 0x8000);
+        ov[pos2[(t >> 8) + 1]++] = ti[i];
+    }
+
+    drop_obj(temp);
     return indices;
 }
 
