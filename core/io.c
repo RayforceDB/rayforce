@@ -531,7 +531,7 @@ obj_p io_read_csv(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t tot
     return NULL_OBJ;  // Success
 }
 
-static i64_t symbol_from_str_trimmed(str_p src, i64_t len) {
+i64_t io_symbol_from_str_trimmed(str_p src, i64_t len) {
     c8_t buf[256];  // Stack buffer for common case
     c8_t *trimmed;
     i64_t i, j = 0;
@@ -681,7 +681,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                         pos--;
                 }
 
-                AS_SYMBOL(names)[i] = symbol_from_str_trimmed(prev, pos - prev);
+                AS_SYMBOL(names)[i] = io_symbol_from_str_trimmed(prev, pos - prev);
                 pos++;
                 len -= (pos - prev);
             }

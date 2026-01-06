@@ -1464,8 +1464,8 @@ obj_p set_ids(obj_p* obj, i64_t ids[], i64_t len, obj_p vals) {
             drop_obj(vals);
             return *obj;
         case MTYPE2(TYPE_I64, -TYPE_I64):
-        case MTYPE2(TYPE_SYMBOL, -TYPE_I64):
-        case MTYPE2(TYPE_TIMESTAMP, -TYPE_I64):
+        case MTYPE2(TYPE_SYMBOL, -TYPE_SYMBOL):
+        case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
             for (i = 0; i < len; i++)
                 AS_I64(*obj)[ids[i]] = vals->i64;
             drop_obj(vals);
@@ -1513,8 +1513,8 @@ obj_p set_ids(obj_p* obj, i64_t ids[], i64_t len, obj_p vals) {
             drop_obj(vals);
             return *obj;
         case MTYPE2(TYPE_I64, TYPE_I64):
-        case MTYPE2(TYPE_SYMBOL, TYPE_I64):
-        case MTYPE2(TYPE_TIMESTAMP, TYPE_I64):
+        case MTYPE2(TYPE_SYMBOL, TYPE_SYMBOL):
+        case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
             for (i = 0; i < len; i++)
                 AS_I64(*obj)[ids[i]] = AS_I64(vals)[i];
             drop_obj(vals);
