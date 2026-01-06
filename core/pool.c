@@ -311,7 +311,7 @@ nil_t pool_prepare(pool_p pool) {
     pool->done_count = 0;
 
     n = pool->executors_count;
-    for (i = 0; i < n; i++) {
+    for (i = 1; i < n; i++) {  // Skip executor[0] (main thread) - no self-borrow
         heap_borrow(pool->executors[i].heap);
     }
 
@@ -425,7 +425,7 @@ obj_p pool_run(pool_p pool) {
 
     // merge heaps
     n = pool->executors_count;
-    for (i = 0; i < n; i++) {
+    for (i = 1; i < n; i++) {  // Skip executor[0] (main thread) - no self-merge
         heap_merge(pool->executors[i].heap);
     }
 

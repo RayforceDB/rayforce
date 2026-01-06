@@ -31,6 +31,10 @@
 #define MAX_BLOCK_ORDER 25  // 2^25 = 32MB
 #define MAX_POOL_ORDER 38   // 2^38 = 256GB
 
+// Small object cache (slab) for sizes 32, 64, 128, 256 bytes
+#define SLAB_CACHE_SIZE 32
+#define SLAB_ORDERS 4  // orders 5, 6, 7, 8
+
 // Memory modes
 #define MMOD_INTERNAL 0xff
 #define MMOD_EXTERNAL_SIMPLE 0xfd
@@ -56,10 +60,17 @@ typedef struct block_t {
     struct block_t *next;
 } *block_p;
 
+// Small object slab cache for fast alloc/free of common sizes
+typedef struct slab_cache_t {
+    block_p stack[SLAB_CACHE_SIZE];  // LIFO stack of freed blocks
+    i64_t count;                      // current stack depth
+} slab_cache_t;
+
 typedef struct heap_t {
     i64_t id;
     block_p freelist[MAX_POOL_ORDER + 2];  // free list of blocks by order
     i64_t avail;                           // mask of available blocks by order
+    slab_cache_t slabs[SLAB_ORDERS];       // small object caches for orders 6-9
     block_p foreign_blocks;                // foreign blocks (to be freed by the owner)
     block_p backed_blocks;                 // backed blocks (to be unmapped)
     memstat_t memstat;
