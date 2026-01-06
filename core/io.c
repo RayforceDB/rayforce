@@ -460,7 +460,7 @@ obj_p parse_csv_range(i8_t types[], i64_t num_types, str_p buf, i64_t size, i64_
     return NULL_OBJ;  // Success
 }
 
-obj_p parse_csv_lines(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t total_lines, obj_p cols, c8_t sep) {
+obj_p io_read_csv(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t total_lines, obj_p cols, c8_t sep) {
     obj_p err, res = NULL_OBJ;
     i64_t i, l, batch_size, num_batches, lines_per_batch, start_line, end_line, lines_in_batch;
     str_p batch_start, batch_end;
@@ -708,7 +708,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
             }
 
             // parse lines
-            res = parse_csv_lines((i8_t *)AS_U8(types), l, line, size, lines, cols, sep);
+            res = io_read_csv((i8_t *)AS_U8(types), l, line, size, lines, cols, sep);
 
             drop_obj(types);
             fs_fclose(fd);
