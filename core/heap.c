@@ -498,6 +498,21 @@ nil_t heap_borrow(heap_p heap) {
         }
     }
 
+    // Borrow medium blocks (orders 20-24: 1MB-16MB) for common allocations
+    for (i = 20; i < MAX_BLOCK_ORDER; i++) {
+        // Only borrow if source has 2+ blocks at this order
+        if (h->freelist[i] == NULL || h->freelist[i]->next == NULL)
+            continue;
+
+        heap->freelist[i] = h->freelist[i];
+        h->freelist[i] = h->freelist[i]->next;
+        h->freelist[i]->prev = NULL;
+
+        heap->freelist[i]->next = NULL;
+        heap->freelist[i]->prev = NULL;
+        heap->avail |= BSIZEOF(i);
+    }
+
     // Borrow large pool blocks (>=32MB) for big allocations
     for (i = MAX_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
         // Only borrow if source has freelist[i] with >1 node and it's a full pool
@@ -542,25 +557,23 @@ nil_t heap_merge(heap_p heap) {
     }
     heap->foreign_blocks = NULL;
 
-    // Merge freelists: find tail, link to main head
+    // Merge freelists: O(1) prepend by finding tail, linking to main head
     for (i = MIN_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
-        block = heap->freelist[i];
-        last = NULL;
+        if (heap->freelist[i] == NULL)
+            continue;
 
-        while (block != NULL) {
-            last = block;
-            block = block->next;
-        }
+        // Find tail of worker's freelist
+        last = heap->freelist[i];
+        while (last->next != NULL)
+            last = last->next;
 
-        if (last != NULL) {
-            last->next = h->freelist[i];
+        // Link: worker_tail -> main_head, main_head = worker_head
+        last->next = h->freelist[i];
+        if (h->freelist[i] != NULL)
+            h->freelist[i]->prev = last;
 
-            if (h->freelist[i] != NULL)
-                h->freelist[i]->prev = last;
-
-            h->freelist[i] = heap->freelist[i];
-            heap->freelist[i] = NULL;
-        }
+        h->freelist[i] = heap->freelist[i];
+        heap->freelist[i] = NULL;
     }
 
     h->avail |= heap->avail;
