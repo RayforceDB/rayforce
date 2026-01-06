@@ -711,7 +711,7 @@ static i64_t error_ctx_fmt_into_new(obj_p *dst, obj_p err) {
             break;
         }
         case EC_VALUE: {
-            i32_t sym = err_get_symbol(err);
+            i64_t sym = err_get_symbol(err);
             if (sym) {
                 name = str_from_symbol(sym);
                 if (name && name[0]) {

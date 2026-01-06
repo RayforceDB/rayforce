@@ -121,8 +121,7 @@ obj_p err_domain(u8_t arg, u8_t field) {
 
 obj_p err_value(i64_t sym) {
     obj_p err = err_alloc(EC_VALUE);
-    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
-    ctx_set_i32(ctx, (i32_t)sym);
+    err->i64 = sym;  // Store full 64-bit symbol pointer directly
     return err;
 }
 
@@ -343,7 +342,7 @@ obj_p err_info(obj_p err) {
             break;
         }
         case EC_VALUE: {
-            i32_t sym_id = err_get_symbol(err);
+            i64_t sym_id = err_get_symbol(err);
             n = sym_id ? 2 : 1;
             keys = SYMBOL(n);
             vals = LIST(n);

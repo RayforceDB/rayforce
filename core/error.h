@@ -32,13 +32,13 @@ typedef enum {
 // ============================================================================
 // Type Classes for err_type() - use in 'expected' field (104-124 range unused)
 // ============================================================================
-#define TCLASS_NUMERIC    104   // I8,I16,I32,I64,F32,F64
-#define TCLASS_INTEGER    105   // I8,I16,I32,I64
-#define TCLASS_FLOAT      106   // F32,F64
-#define TCLASS_TEMPORAL   107   // DATE,TIME,TIMESTAMP,TIMESPAN
-#define TCLASS_COLLECTION 108   // LIST,DICT,TABLE
-#define TCLASS_CALLABLE   109   // LAMBDA,UNARY,BINARY,VARY
-#define TCLASS_ANY        110   // any type
+#define TCLASS_NUMERIC 104     // I8,I16,I32,I64,F32,F64
+#define TCLASS_INTEGER 105     // I8,I16,I32,I64
+#define TCLASS_FLOAT 106       // F32,F64
+#define TCLASS_TEMPORAL 107    // DATE,TIME,TIMESTAMP,TIMESPAN
+#define TCLASS_COLLECTION 108  // LIST,DICT,TABLE
+#define TCLASS_CALLABLE 109    // LAMBDA,UNARY,BINARY,VARY
+#define TCLASS_ANY 110         // any type
 
 #define IS_TCLASS(t) ((t) >= 104 && (t) <= 110)
 
@@ -51,20 +51,20 @@ typedef enum {
 //   EC_LENGTH: arg, arg2, field, field2, v1=need, v2=have
 //   EC_INDEX:  arg, field, v1=idx, v2=len
 //   EC_DOMAIN: arg, field
-//   EC_VALUE:  v1-v4 = symbol id (as i32)
+//   EC_VALUE:  i64 = symbol id (full 64-bit pointer)
 //   EC_LIMIT:  v1-v2 = limit (as i16)
 //   EC_OS:     v1-v4 = errno (as i32)
 //   EC_NYI:    v1 = type
 // ============================================================================
 typedef struct {
-    u8_t arg;       // argument index (1-based, 0 = none)
-    u8_t arg2;      // second argument (for mismatches between args, 1-based)
-    u8_t field;     // field index in arg (1-based, 0 = none)
-    u8_t field2;    // field in arg2 / subfield (1-based, 0 = none)
-    i8_t v1;        // expected type / need / idx / type
-    i8_t v2;        // actual type / have / len
-    i8_t v3;        // extra value (high byte for larger values)
-    i8_t v4;        // extra value / flags
+    u8_t arg;     // argument index (1-based, 0 = none)
+    u8_t arg2;    // second argument (for mismatches between args, 1-based)
+    u8_t field;   // field index in arg (1-based, 0 = none)
+    u8_t field2;  // field in arg2 / subfield (1-based, 0 = none)
+    i8_t v1;      // expected type / need / idx / type
+    i8_t v2;      // actual type / have / len
+    i8_t v3;      // extra value (high byte for larger values)
+    i8_t v4;      // extra value / flags
 } err_ctx_t;
 
 RAY_ASSERT(sizeof(err_ctx_t) == sizeof(i64_t), "err_ctx_t must fit in obj->i64");
@@ -131,15 +131,14 @@ static inline i8_t err_get_v2(obj_p err) { return err_ctx(err)->v2; }
 static inline i8_t err_get_v3(obj_p err) { return err_ctx(err)->v3; }
 static inline i8_t err_get_v4(obj_p err) { return err_ctx(err)->v4; }
 
-// For EC_VALUE: symbol stored across v1-v4 as i32
-static inline i32_t err_get_symbol(obj_p err) {
-    err_ctx_t* ctx = err_ctx(err);
-    return (i32_t)(((u8_t)ctx->v1) | ((u8_t)ctx->v2 << 8) | 
-                   ((u8_t)ctx->v3 << 16) | ((u8_t)ctx->v4 << 24));
-}
+// For EC_VALUE: symbol stored directly in i64
+static inline i64_t err_get_symbol(obj_p err) { return err->i64; }
 
 // For EC_OS: errno stored across v1-v4 as i32
-static inline i32_t err_get_errno(obj_p err) { return err_get_symbol(err); }
+static inline i32_t err_get_errno(obj_p err) {
+    err_ctx_t* ctx = err_ctx(err);
+    return (i32_t)(((u8_t)ctx->v1) | ((u8_t)ctx->v2 << 8) | ((u8_t)ctx->v3 << 16) | ((u8_t)ctx->v4 << 24));
+}
 
 // User error message (stored after obj header)
 lit_p err_get_message(obj_p err);
