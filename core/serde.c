@@ -155,7 +155,7 @@ i64_t size_obj(obj_p obj) {
             // code (1 byte) + context (8 bytes) + optional message for EC_USER
             i64_t err_size = ISIZEOF(i8_t) + 1 + 8;
             if (err_code(obj) == EC_USER)
-                err_size += strlen(err_get_message(obj)) + 1;
+                err_size += strlen(err_msg(obj)) + 1;
             return err_size;
         }
         default:
@@ -324,9 +324,9 @@ i64_t ser_raw(u8_t *buf, obj_p obj) {
             memcpy(buf + c, &obj->i64, 8);  // Copy context directly
             c += 8;
             if (code == EC_USER) {
-                lit_p msg = err_get_message(obj);
-                i64_t msg_len = strlen(msg);
-                memcpy(buf + c, msg, msg_len + 1);
+                lit_p m = err_msg(obj);
+                i64_t msg_len = strlen(m);
+                memcpy(buf + c, m, msg_len + 1);
                 c += msg_len + 1;
             }
             return ISIZEOF(i8_t) + c;

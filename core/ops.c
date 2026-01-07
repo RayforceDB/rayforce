@@ -31,7 +31,10 @@
 __thread i64_t __RND_SEED__ = 0;
 
 // Initialize the Global null object
-struct obj_t __NULL_OBJECT = {.mmod = MMOD_INTERNAL, .order = 0, .type = TYPE_NULL, .attrs = 0, .rc = 0, .len = 0};
+struct obj_t __NULL_OBJ = {.mmod = MMOD_INTERNAL, .order = 0, .type = TYPE_NULL, .attrs = 0, .rc = 0, .len = 0};
+
+// Initialize the Global error object (static sentinel for all errors)
+struct obj_t __ERR_OBJ = {.mmod = MMOD_INTERNAL, .order = 0, .type = TYPE_ERR, .attrs = 0, .rc = 0, .len = 0};
 
 /*
  * Treat obj as a b8
@@ -268,4 +271,3 @@ obj_p ops_where(b8_t *mask, i64_t len) {
 
     return res;
 }
-

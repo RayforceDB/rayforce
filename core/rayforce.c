@@ -293,6 +293,8 @@ obj_p vn_list(i64_t len, ...) {
     va_list args;
 
     l = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(obj_p) * len);
+    if (UNLIKELY(l == NULL))
+        return NULL;
     l->mmod = MMOD_INTERNAL;
     l->type = TYPE_LIST;
     l->rc = 1;
@@ -313,6 +315,8 @@ obj_p dict(obj_p keys, obj_p vals) {
     obj_p d;
 
     d = vn_list(2, keys, vals);
+    if (UNLIKELY(d == NULL))
+        return NULL;
     d->type = TYPE_DICT;
 
     return d;
@@ -322,6 +326,8 @@ obj_p table(obj_p keys, obj_p vals) {
     obj_p t;
 
     t = vn_list(2, keys, vals);
+    if (UNLIKELY(t == NULL))
+        return NULL;
     t->type = TYPE_TABLE;
 
     return t;
@@ -2841,8 +2847,8 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
     u32_t rc;
     i64_t i, l;
 
-    // Never drop NULL_OBJ (static global singleton)
-    if (obj == NULL_OBJ)
+    // Never drop NULL_OBJ or ERR_OBJ (static global singletons)
+    if (obj == NULL_OBJ || obj == ERR_OBJ)
         return;
 
     if (LIKELY(!VM->rc_sync)) {
@@ -2917,9 +2923,8 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             heap_free(obj);
             return;
         case TYPE_NULL:
-            return;
         case TYPE_ERR:
-            heap_free(obj);
+            // Static singletons - never free
             return;
         default:
             if (IS_EXTERNAL_SIMPLE(obj))

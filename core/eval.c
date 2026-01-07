@@ -1022,7 +1022,7 @@ obj_p try_obj(obj_p obj, obj_p ctch) {
                     return err_arity(1, AS_LAMBDA(fn)->args->len, 0);
                 }
                 // Push error message as string for catch handler
-                vm_stack_push(str_fmt(-1, "%s", ray_err_msg(res)));
+                vm_stack_push(str_fmt(-1, "%s", err_msg(res)));
                 drop_obj(res);
                 res = call(fn, 1);
                 drop_obj(vm_stack_pop());

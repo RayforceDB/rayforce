@@ -657,103 +657,62 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, str_p msg, i32_t msg_len, b8_t
 // Format error context based on error code
 static i64_t error_ctx_fmt_into_new(obj_p *dst, obj_p err) {
     i64_t n = 0;
-    err_code_t code = err_code(err);
-    err_ctx_t *ctx = err_ctx(err);
+    err_t *e = &VM->err;
     str_p name;
-    lit_p msg;
 
-    // Print positional context if present
-    if (ctx->arg || ctx->field) {
-        if (ctx->arg && ctx->field)
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s arg %s%d%s, field %s%d%s\n", GRAY, RESET, 
-                              CYAN, ctx->arg, RESET, GREEN, ctx->field, RESET);
-        else if (ctx->arg2)
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s args %s%d%s and %s%d%s\n", GRAY, RESET,
-                              CYAN, ctx->arg, RESET, CYAN, ctx->arg2, RESET);
-        else if (ctx->arg)
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s arg %s%d%s\n", GRAY, RESET, CYAN, ctx->arg, RESET);
-        else
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s field %s%d%s\n", GRAY, RESET, GREEN, ctx->field, RESET);
-    }
+    UNUSED(err);
 
-    switch (code) {
-        case EC_TYPE: {
-            if (ctx->v1 != 0 || ctx->v2 != 0) {
-                lit_p expected_name;
-                switch ((u8_t)ctx->v1) {
-                    case TCLASS_NUMERIC:    expected_name = "numeric"; break;
-                    case TCLASS_INTEGER:    expected_name = "integer"; break;
-                    case TCLASS_FLOAT:      expected_name = "float"; break;
-                    case TCLASS_TEMPORAL:   expected_name = "temporal"; break;
-                    case TCLASS_COLLECTION: expected_name = "collection"; break;
-                    case TCLASS_CALLABLE:   expected_name = "callable"; break;
-                    case TCLASS_ANY:        expected_name = "any"; break;
-                    default:                expected_name = type_name(ctx->v1); break;
-                }
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%s%s, got %s%s%s\n", GRAY, RESET, CYAN,
-                                  expected_name, RESET, YELLOW, type_name(ctx->v2), RESET);
-            }
+    switch (e->code) {
+        case EC_TYPE:
+            if (e->type.arg)
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s arg %s%d%s\n", GRAY, RESET, CYAN, e->type.arg, RESET);
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%s%s, got %s%s%s\n", GRAY, RESET, CYAN,
+                              type_name(e->type.expected), RESET, YELLOW, type_name(e->type.actual), RESET);
             break;
-        }
-        case EC_ARITY: {
+
+        case EC_ARITY:
             n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%d%s argument%s, got %s%d%s\n", GRAY, RESET,
-                              CYAN, ctx->v1, RESET, ctx->v1 == 1 ? "" : "s", YELLOW, ctx->v2, RESET);
+                              CYAN, e->arity.need, RESET, e->arity.need == 1 ? "" : "s", YELLOW, e->arity.have, RESET);
             break;
-        }
-        case EC_LENGTH: {
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s need %s%d%s, have %s%d%s\n", GRAY, RESET, CYAN, ctx->v1,
-                              RESET, YELLOW, ctx->v2, RESET);
+
+        case EC_LENGTH:
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s need %s%d%s, have %s%d%s\n", GRAY, RESET, CYAN, 
+                              e->length.need, RESET, YELLOW, e->length.have, RESET);
             break;
-        }
-        case EC_INDEX: {
+
+        case EC_INDEX:
             n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s index %s%d%s not in [%s0 %d%s]\n", GRAY, RESET, YELLOW,
-                              ctx->v1, RESET, CYAN, ctx->v2 > 0 ? ctx->v2 - 1 : 0, RESET);
+                              e->index.idx, RESET, CYAN, e->index.len > 0 ? e->index.len - 1 : 0, RESET);
             break;
-        }
-        case EC_VALUE: {
-            i64_t sym = err_get_symbol(err);
-            if (sym) {
-                name = str_from_symbol(sym);
-                if (name && name[0]) {
-                    n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s '%s%s%s' not found\n", GRAY, RESET, GREEN, name,
-                                      RESET);
-                }
+
+        case EC_VALUE:
+            if (e->value.sym) {
+                name = str_from_symbol(e->value.sym);
+                if (name && name[0])
+                    n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s '%s%s%s' not found\n", GRAY, RESET, GREEN, name, RESET);
             }
             break;
-        }
-        case EC_OS: {
-            i32_t e = err_get_errno(err);
-            if (e) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n", GRAY, RESET, YELLOW, strerror(e), RESET);
-            }
+
+        case EC_OS:
+            if (e->os.no)
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n", GRAY, RESET, YELLOW, strerror(e->os.no), RESET);
             break;
-        }
-        case EC_USER: {
-            msg = err_get_message(err);
-            if (msg && msg[0]) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n", GRAY, RESET, YELLOW, msg, RESET);
-            }
+
+        case EC_USER:
+            if (e->user.msg[0])
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n", GRAY, RESET, YELLOW, e->user.msg, RESET);
             break;
-        }
-        case EC_LIMIT: {
-            i16_t limit = (i16_t)(((u8_t)ctx->v1) | ((u8_t)ctx->v2 << 8));
-            if (limit > 0) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s limit %s%d%s exceeded\n", GRAY, RESET, YELLOW, limit,
-                                  RESET);
-            }
+
+        case EC_LIMIT:
+            if (e->limit.val > 0)
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s limit %s%d%s exceeded\n", GRAY, RESET, YELLOW, e->limit.val, RESET);
             break;
-        }
-        case EC_NYI: {
-            if (ctx->v1 != 0) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s for type %s%s%s\n", GRAY, RESET, YELLOW,
-                                  type_name(ctx->v1), RESET);
-            }
+
+        case EC_NYI:
+            if (e->nyi.type)
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s for type %s%s%s\n", GRAY, RESET, YELLOW, type_name(e->nyi.type), RESET);
             break;
-        }
-        case EC_DOMAIN: {
-            // Position already printed above
-            break;
-        }
+
         default:
             break;
     }
@@ -771,7 +730,7 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
     UNUSED(limit);
 
     // Get error code name
-    code_name = ray_err_msg(obj);
+    code_name = err_msg(obj);
     msg_len = (i32_t)strlen(code_name);
 
     // Check for locations in VM's trace

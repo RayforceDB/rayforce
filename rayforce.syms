@@ -35,7 +35,7 @@
     str_from_symbol;
     __VM;
     __RUNTIME;
-    __NULL_OBJECT;
+    __NULL_OBJ;
     obj_fmt;
     str_fmt;
     str_fmt_into;
