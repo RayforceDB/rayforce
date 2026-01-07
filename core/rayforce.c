@@ -1400,6 +1400,21 @@ obj_p set_idx(obj_p* obj, i64_t idx, obj_p val) {
     (*obj)->attrs &= ~(ATTR_ASC | ATTR_DESC | ATTR_DISTINCT);
 
     switch (MTYPE2((*obj)->type, val->type)) {
+        case MTYPE2(TYPE_B8, -TYPE_B8):
+        case MTYPE2(TYPE_U8, -TYPE_U8):
+            AS_U8(*obj)[idx] = val->u8;
+            drop_obj(val);
+            return *obj;
+        case MTYPE2(TYPE_I16, -TYPE_I16):
+            AS_I16(*obj)[idx] = val->i16;
+            drop_obj(val);
+            return *obj;
+        case MTYPE2(TYPE_I32, -TYPE_I32):
+        case MTYPE2(TYPE_DATE, -TYPE_DATE):
+        case MTYPE2(TYPE_TIME, -TYPE_TIME):
+            AS_I32(*obj)[idx] = val->i32;
+            drop_obj(val);
+            return *obj;
         case MTYPE2(TYPE_I64, -TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, -TYPE_SYMBOL):
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
@@ -1778,8 +1793,14 @@ obj_p set_obj(obj_p* obj, obj_p idx, obj_p val) {
 
     // dispatch:
     switch (MTYPE2((*obj)->type, idx->type)) {
+        case MTYPE2(TYPE_B8, -TYPE_I64):
+        case MTYPE2(TYPE_U8, -TYPE_I64):
+        case MTYPE2(TYPE_I16, -TYPE_I64):
+        case MTYPE2(TYPE_I32, -TYPE_I64):
         case MTYPE2(TYPE_I64, -TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, -TYPE_I64):
+        case MTYPE2(TYPE_DATE, -TYPE_I64):
+        case MTYPE2(TYPE_TIME, -TYPE_I64):
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_I64):
         case MTYPE2(TYPE_F64, -TYPE_I64):
         case MTYPE2(TYPE_C8, -TYPE_I64):
@@ -1790,8 +1811,14 @@ obj_p set_obj(obj_p* obj, obj_p idx, obj_p val) {
                 return err_index(idx->i64, (*obj)->len);
             }
             return set_idx(obj, idx->i64, val);
+        case MTYPE2(TYPE_B8, TYPE_I64):
+        case MTYPE2(TYPE_U8, TYPE_I64):
+        case MTYPE2(TYPE_I16, TYPE_I64):
+        case MTYPE2(TYPE_I32, TYPE_I64):
         case MTYPE2(TYPE_I64, TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, TYPE_I64):
+        case MTYPE2(TYPE_DATE, TYPE_I64):
+        case MTYPE2(TYPE_TIME, TYPE_I64):
         case MTYPE2(TYPE_TIMESTAMP, TYPE_I64):
         case MTYPE2(TYPE_F64, TYPE_I64):
         case MTYPE2(TYPE_C8, TYPE_I64):
