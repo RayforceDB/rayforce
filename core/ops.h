@@ -246,6 +246,7 @@ static inline f64_t i64_to_f64(i64_t x) { return (x == NULL_I64) ? NULL_F64 : (f
 static inline i32_t i64_to_date(i64_t x) { return (x == NULL_I64) ? NULL_I32 : (i32_t)x; }
 static inline i32_t i64_to_time(i64_t x) { return (x == NULL_I64) ? NULL_I32 : (i32_t)x; }
 static inline i64_t i64_to_timestamp(i64_t x) { return x; }
+static inline i16_t f64_to_i16(f64_t x) { return ISNANF64(x) ? NULL_I16 : (i16_t)x; }
 static inline i32_t f64_to_i32(f64_t x) { return ISNANF64(x) ? NULL_I32 : (i32_t)x; }
 static inline i64_t f64_to_i64(f64_t x) { return ISNANF64(x) ? NULL_I64 : (i64_t)x; }
 static inline f64_t f64_to_f64(f64_t x) { return x; }

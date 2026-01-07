@@ -4836,8 +4836,8 @@ test_result_t test_lang_cast() {
     TEST_ASSERT_EQ("(as 'symbol false)", "'0");
     TEST_ASSERT_EQ("(as 'symbol true)", "'1");
     // symbol <- u8
-    TEST_ASSERT_EQ("(as 'symbol 0x00)", "'0");
-    TEST_ASSERT_EQ("(as 'symbol 0xFF)", "'255");
+    TEST_ASSERT_EQ("(as 'symbol 0x00)", "'0x00");
+    TEST_ASSERT_EQ("(as 'symbol 0xFF)", "'0xff");
     // symbol <- i16
     TEST_ASSERT_EQ("(as 'symbol 42h)", "'42");
     TEST_ASSERT_EQ("(as 'symbol -100h)", "'-100");
@@ -4936,6 +4936,43 @@ test_result_t test_lang_cast() {
     TEST_ASSERT_EQ("(count (as 'U8 (til 100000)))", "100000");
     // f64 -> i64
     TEST_ASSERT_EQ("(sum (as 'I64 (as 'F64 (til 100000))))", "4999950000");
+
+    // ========== NULL PRESERVATION IN CASTS ==========
+    // Atom NULL casts - integer types
+    TEST_ASSERT_EQ("(as 'i32 0Nl)", "0Ni");
+    TEST_ASSERT_EQ("(as 'i16 0Nl)", "0Nh");
+    TEST_ASSERT_EQ("(as 'i64 0Ni)", "0Nl");
+    TEST_ASSERT_EQ("(as 'i64 0Nh)", "0Nl");
+    TEST_ASSERT_EQ("(as 'i32 0Nh)", "0Ni");
+    TEST_ASSERT_EQ("(as 'i16 0Ni)", "0Nh");
+    // Atom NULL casts - f64
+    TEST_ASSERT_EQ("(as 'f64 0Nl)", "0Nf");
+    TEST_ASSERT_EQ("(as 'f64 0Ni)", "0Nf");
+    TEST_ASSERT_EQ("(as 'f64 0Nh)", "0Nf");
+    TEST_ASSERT_EQ("(as 'i64 0Nf)", "0Nl");
+    TEST_ASSERT_EQ("(as 'i32 0Nf)", "0Ni");
+    TEST_ASSERT_EQ("(as 'i16 0Nf)", "0Nh");
+    // Atom NULL casts - temporal types
+    TEST_ASSERT_EQ("(as 'date 0Nl)", "0Nd");
+    TEST_ASSERT_EQ("(as 'time 0Nl)", "0Nt");
+    TEST_ASSERT_EQ("(as 'timestamp 0Ni)", "0Np");
+    TEST_ASSERT_EQ("(as 'i64 0Nd)", "0Nl");
+    TEST_ASSERT_EQ("(as 'i64 0Nt)", "0Nl");
+    TEST_ASSERT_EQ("(as 'i32 0Np)", "0Ni");
+    TEST_ASSERT_EQ("(as 'f64 0Nd)", "0Nf");
+    TEST_ASSERT_EQ("(as 'f64 0Nt)", "0Nf");
+    TEST_ASSERT_EQ("(as 'f64 0Np)", "0Nf");
+    // Chained atom NULL casts
+    TEST_ASSERT_EQ("(as 'i32 (as 'i16 0Nl))", "0Ni");
+    TEST_ASSERT_EQ("(as 'i64 (as 'i32 (as 'i16 0Nl)))", "0Nl");
+    TEST_ASSERT_EQ("(as 'f64 (as 'i32 0Nl))", "0Nf");
+    // Vector NULL casts
+    TEST_ASSERT_EQ("(as 'I32 [1l 2l 0Nl 3l])", "[1i 2i 0Ni 3i]");
+    TEST_ASSERT_EQ("(as 'I16 [1l 2l 0Nl 3l])", "[1h 2h 0Nh 3h]");
+    TEST_ASSERT_EQ("(as 'I64 [1i 2i 0Ni 3i])", "[1 2 0Nl 3]");
+    TEST_ASSERT_EQ("(as 'I64 [1h 2h 0Nh 3h])", "[1 2 0Nl 3]");
+    TEST_ASSERT_EQ("(as 'I32 [1h 2h 0Nh 3h])", "[1i 2i 0Ni 3i]");
+    TEST_ASSERT_EQ("(as 'I16 [1i 2i 0Ni 3i])", "[1h 2h 0Nh 3h]");
 
     PASS();
 }
