@@ -33,6 +33,13 @@
 #include "os.h"
 #include "log.h"
 #include "eval.h"
+#include "error.h"
+
+// Slab cache helpers
+#define SLAB_ORDER_MIN MIN_BLOCK_ORDER
+#define SLAB_ORDER_MAX (MIN_BLOCK_ORDER + SLAB_ORDERS - 1)
+#define IS_SLAB_ORDER(o) ((o) >= SLAB_ORDER_MIN && (o) <= SLAB_ORDER_MAX)
+#define SLAB_INDEX(o) ((o) - SLAB_ORDER_MIN)
 
 #ifndef __EMSCRIPTEN__
 RAY_ASSERT(sizeof(struct block_t) == (2 * sizeof(struct obj_t)), "block_t must be 2x obj_t");
@@ -62,6 +69,7 @@ heap_p heap_create(i64_t id) {
     heap->foreign_blocks = NULL;
 
     memset(heap->freelist, 0, sizeof(heap->freelist));
+    memset(heap->slabs, 0, sizeof(heap->slabs));
 
     // Initialize swap path from environment or use default
     if (os_get_var("HEAP_SWAP", heap->swap_path, sizeof(heap->swap_path)) == -1) {
@@ -85,40 +93,8 @@ heap_p heap_create(i64_t id) {
     return heap;
 }
 
-nil_t heap_destroy(heap_p heap) {
-    i64_t i;
-    block_p block, next;
-
-    if (heap == NULL)
-        return;
-
-    LOG_INFO("Destroying heap");
-
-    // Ensure foreign blocks are freed
-    if (heap->foreign_blocks != NULL)
-        LOG_WARN("Heap[%lld]: foreign blocks not freed", heap->id);
-
-    // All the nodes remains are pools, so just munmap them
-    for (i = MIN_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
-        block = heap->freelist[i];
-
-        while (block) {
-            next = block->next;
-            if (i != block->pool_order) {
-                LOG_ERROR("Heap[%lld]: leak order: %lld block: %p", heap->id, i, block);
-                return;
-            }
-
-            mmap_free(block, BSIZEOF(i));
-            block = next;
-        }
-    }
-
-    // munmap heap
-    mmap_free(heap, sizeof(struct heap_t));
-
-    LOG_DEBUG("Heap destroyed successfully");
-}
+// Defined after #ifdef blocks to use heap_flush_slabs
+nil_t heap_destroy(heap_p heap);
 
 heap_p heap_get(nil_t) {
     LOG_TRACE("Getting heap instance");
@@ -126,6 +102,8 @@ heap_p heap_get(nil_t) {
 }
 
 #ifdef SYS_MALLOC
+
+static nil_t heap_flush_slabs(heap_p heap) { UNUSED(heap); }  // No-op for system malloc
 
 raw_p heap_alloc(i64_t size) { return malloc(size); }
 raw_p heap_mmap(i64_t size) { return mmap_alloc(size); }
@@ -161,13 +139,13 @@ block_p heap_add_pool(i64_t size) {
         fd = fs_fopen(filename, ATTR_RDWR | ATTR_CREAT);
 
         if (fd == -1) {
-            perror("can't create mmap backed file");
+            perror("mmap:create");
             return NULL;
         }
 
         // Set initial file size if the file
         if (fs_file_extend(fd, size) == -1) {
-            perror("can't truncate mmap backed file");
+            perror("mmap:trunc");
             fs_fclose(fd);
             return NULL;
         }
@@ -176,7 +154,7 @@ block_p heap_add_pool(i64_t size) {
 
         if (block == NULL) {
             fs_fclose(fd);
-            perror("can't mmap file");
+            perror("mmap:map");
             return NULL;
         }
 
@@ -244,6 +222,20 @@ inline __attribute__((always_inline)) nil_t heap_split_block(heap_p heap, block_
     }
 }
 
+// Flush slab caches back to freelists for coalescing
+static nil_t heap_flush_slabs(heap_p heap) {
+    i64_t i;
+    block_p block;
+
+    for (i = 0; i < SLAB_ORDERS; i++) {
+        while (heap->slabs[i].count > 0) {
+            block = heap->slabs[i].stack[--heap->slabs[i].count];
+            // heap_insert_block will set used=0
+            heap_insert_block(heap, block, SLAB_ORDER_MIN + i);
+        }
+    }
+}
+
 raw_p heap_mmap(i64_t size) {
     raw_p ptr = mmap_alloc(size);
 
@@ -272,7 +264,7 @@ raw_p __attribute__((hot)) heap_alloc(i64_t size) {
     block_p block;
     heap_p heap = VM->heap;  // Cache heap pointer to avoid repeated VM calls
 
-    if (size == 0 || size > BSIZEOF(MAX_POOL_ORDER))
+    if (UNLIKELY(size == 0 || size > BSIZEOF(MAX_POOL_ORDER)))
         return NULL;
 
     block_size = BLOCKSIZE(size);
@@ -280,18 +272,31 @@ raw_p __attribute__((hot)) heap_alloc(i64_t size) {
     // calculate minimal order for this size
     order = ORDEROF(block_size);
 
+    // Fast path: check slab cache for small allocations
+    if (LIKELY(IS_SLAB_ORDER(order))) {
+        i64_t idx = SLAB_INDEX(order);
+        if (LIKELY(heap->slabs[idx].count > 0)) {
+            block = heap->slabs[idx].stack[--heap->slabs[idx].count];
+            // Note: block->order, pool_order, and backed should already be valid
+            // from when the block was first allocated. Just update used and heap_id.
+            block->used = 1;
+            block->heap_id = heap->id;
+            return BLOCK2RAW(block);
+        }
+    }
+
     // find least order block that fits
     i = (AVAIL_MASK << order) & heap->avail;
 
     // no free block found for this size, so mmap it directly if it is bigger than pool size or
     // add a new pool and split as well
-    if (i == 0) {
+    if (UNLIKELY(i == 0)) {
         if (order >= MAX_BLOCK_ORDER) {
             LOG_TRACE("Adding pool of size %lld requested size %lld", BSIZEOF(order), size);
             size = BSIZEOF(order);
             block = heap_add_pool(size);
 
-            if (block == NULL)
+            if (UNLIKELY(block == NULL))
                 return NULL;
 
             block->order = order;
@@ -305,7 +310,7 @@ raw_p __attribute__((hot)) heap_alloc(i64_t size) {
 
         block = heap_add_pool(BSIZEOF(MAX_BLOCK_ORDER));
 
-        if (block == NULL)
+        if (UNLIKELY(block == NULL))
             return NULL;
 
         i = MAX_BLOCK_ORDER;
@@ -339,24 +344,26 @@ __attribute__((hot)) nil_t heap_free(raw_p ptr) {
     c8_t filename[64];
     heap_p heap = VM->heap;  // Cache heap pointer
 
-    if (ptr == NULL || ptr == NULL_OBJ)
+    if (UNLIKELY(ptr == NULL || ptr == NULL_OBJ))
         return;
 
     block = RAW2BLOCK(ptr);
     order = block->order;
 
     // Validate block metadata - detect memory corruption or invalid pointers
-    // backed should only be 0 or 1, order should be >= MIN_BLOCK_ORDER for heap blocks
-    if (block->backed != B8_FALSE && block->backed != B8_TRUE) {
+    // backed should only be 0 or 1, order should be in valid range
+    if (UNLIKELY(block->backed != B8_FALSE && block->backed != B8_TRUE)) {
         obj_p obj = (obj_p)ptr;
-        fprintf(stderr, "heap_free: corrupted block header (backed=%d, order=%d) at ptr=%p, type=%d\n", block->backed,
-                block->order, ptr, obj->type);
-        fprintf(stderr, "  This usually indicates a buffer overflow or use-after-free bug.\n");
-        assert(0 && "heap_free: corrupted block header");
+        PANIC("block: b=%d o=%d p=%p t=%d", block->backed, block->order, ptr, obj->type);
     }
 
+    // Validate order is in valid range (detect corruption or external objects)
+    // External/mmap'd objects shouldn't be freed via heap_free
+    if (UNLIKELY(order < MIN_BLOCK_ORDER || order > MAX_POOL_ORDER))
+        return;
+
     // Return block to the system and close file if it is file-backed
-    if (block->backed) {
+    if (UNLIKELY(block->backed)) {
         fd = (i64_t)block->pool;
         heap_remove_pool(block, BSIZEOF(order));
         // Get filename before closing - ignore errors as file may already be gone
@@ -368,7 +375,17 @@ __attribute__((hot)) nil_t heap_free(raw_p ptr) {
         return;
     }
 
-    if (heap->id != 0 && block->heap_id != heap->id) {
+    // Fast path: push to slab cache for small blocks (same heap only)
+    if (heap != NULL && order >= MIN_BLOCK_ORDER && IS_SLAB_ORDER(order) &&
+        (heap->id == 0 || block->heap_id == heap->id)) {
+        i64_t idx = SLAB_INDEX(order);
+        if (heap->slabs[idx].count < SLAB_CACHE_SIZE) {
+            heap->slabs[idx].stack[heap->slabs[idx].count++] = block;
+            return;
+        }
+    }
+
+    if (UNLIKELY(heap->id != 0 && block->heap_id != heap->id)) {
         block->next = heap->foreign_blocks;
         heap->foreign_blocks = block;
         return;
@@ -379,8 +396,9 @@ __attribute__((hot)) nil_t heap_free(raw_p ptr) {
         if (block->pool_order == order)
             return heap_insert_block(heap, block, order);
 
-        // calculate buddy
+        // calculate buddy and prefetch its metadata
         buddy = BUDDYOF(block, order);
+        __builtin_prefetch(buddy, 0, 1);  // read, low temporal locality
 
         // buddy is used, or buddy is of different order, so we can't merge
         if (buddy->used || buddy->order != order)
@@ -445,6 +463,9 @@ i64_t heap_gc(nil_t) {
     block_p block, next;
     heap_p h = VM->heap;  // Cache heap pointer
 
+    // Flush slab caches to allow coalescing
+    heap_flush_slabs(h);
+
     for (i = MAX_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
         block = h->freelist[i];
         size = BSIZEOF(i);
@@ -466,12 +487,35 @@ i64_t heap_gc(nil_t) {
 }
 
 nil_t heap_borrow(heap_p heap) {
-    i64_t i;
+    i64_t i, j, half;
     heap_p h = VM->heap;  // Cache heap pointer (source heap)
 
+    // Transfer half of slab cache entries to worker (improves small object alloc)
+    for (i = 0; i < SLAB_ORDERS; i++) {
+        half = h->slabs[i].count / 2;
+        for (j = 0; j < half; j++) {
+            heap->slabs[i].stack[heap->slabs[i].count++] = h->slabs[i].stack[--h->slabs[i].count];
+        }
+    }
+
+    // Borrow medium blocks (orders 20-24: 1MB-16MB) for common allocations
+    for (i = 20; i < MAX_BLOCK_ORDER; i++) {
+        // Only borrow if source has 2+ blocks at this order
+        if (h->freelist[i] == NULL || h->freelist[i]->next == NULL)
+            continue;
+
+        heap->freelist[i] = h->freelist[i];
+        h->freelist[i] = h->freelist[i]->next;
+        h->freelist[i]->prev = NULL;
+
+        heap->freelist[i]->next = NULL;
+        heap->freelist[i]->prev = NULL;
+        heap->avail |= BSIZEOF(i);
+    }
+
+    // Borrow large pool blocks (>=32MB) for big allocations
     for (i = MAX_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
-        // Only borrow if the source heap has a freelist[i] and it has more than one node and it is the pool (not a
-        // splitted block)
+        // Only borrow if source has freelist[i] with >1 node and it's a full pool
         if (h->freelist[i] == NULL || h->freelist[i]->next == NULL || h->freelist[i]->pool_order != i)
             continue;
 
@@ -487,39 +531,49 @@ nil_t heap_borrow(heap_p heap) {
 
 nil_t heap_merge(heap_p heap) {
     i64_t i;
-    block_p block, last;
+    block_p block, next, last;
     heap_p h = VM->heap;  // Cache heap pointer (destination heap)
 
-    // First traverse foreign blocks and free them
-    block = heap->foreign_blocks;
-    while (block != NULL) {
-        last = block;
-        block = block->next;
-        last->heap_id = h->id;
-        heap_free(BLOCK2RAW(last));
+    // Transfer slab caches back to main heap (if room), else flush to freelist
+    for (i = 0; i < SLAB_ORDERS; i++) {
+        // Transfer as many as fit into main's slab cache
+        while (heap->slabs[i].count > 0 && h->slabs[i].count < SLAB_CACHE_SIZE) {
+            h->slabs[i].stack[h->slabs[i].count++] = heap->slabs[i].stack[--heap->slabs[i].count];
+        }
+        // Flush remaining to main heap's freelist
+        while (heap->slabs[i].count > 0) {
+            block = heap->slabs[i].stack[--heap->slabs[i].count];
+            heap_insert_block(h, block, SLAB_ORDER_MIN + i);
+        }
     }
 
+    // Return foreign blocks via normal free path (includes coalescing)
+    block = heap->foreign_blocks;
+    while (block != NULL) {
+        next = block->next;
+        block->heap_id = h->id;
+        heap_free(BLOCK2RAW(block));
+        block = next;
+    }
     heap->foreign_blocks = NULL;
 
+    // Merge freelists: O(1) prepend by finding tail, linking to main head
     for (i = MIN_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
-        block = heap->freelist[i];
-        last = NULL;
+        if (heap->freelist[i] == NULL)
+            continue;
 
-        while (block != NULL) {
-            last = block;
-            block = block->next;
-        }
+        // Find tail of worker's freelist
+        last = heap->freelist[i];
+        while (last->next != NULL)
+            last = last->next;
 
-        if (last != NULL) {
-            last->next = h->freelist[i];
+        // Link: worker_tail -> main_head, main_head = worker_head
+        last->next = h->freelist[i];
+        if (h->freelist[i] != NULL)
+            h->freelist[i]->prev = last;
 
-            if (h->freelist[i] != NULL)
-                h->freelist[i]->prev = last;
-
-            h->freelist[i] = heap->freelist[i];
-
-            heap->freelist[i] = NULL;
-        }
+        h->freelist[i] = heap->freelist[i];
+        heap->freelist[i] = NULL;
     }
 
     h->avail |= heap->avail;
@@ -562,3 +616,42 @@ nil_t heap_print_blocks(heap_p heap) {
 }
 
 #endif
+
+// heap_destroy defined after #ifdef blocks to use heap_flush_slabs
+nil_t heap_destroy(heap_p heap) {
+    i64_t i;
+    block_p block, next;
+
+    if (heap == NULL)
+        return;
+
+    LOG_INFO("Destroying heap");
+
+    // Flush slab caches first
+    heap_flush_slabs(heap);
+
+    // Ensure foreign blocks are freed
+    if (heap->foreign_blocks != NULL)
+        LOG_WARN("Heap[%lld]: foreign blocks not freed", heap->id);
+
+    // All the nodes remains are pools, so just munmap them
+    for (i = MIN_BLOCK_ORDER; i <= MAX_POOL_ORDER; i++) {
+        block = heap->freelist[i];
+
+        while (block) {
+            next = block->next;
+            if (i != block->pool_order) {
+                LOG_ERROR("Heap[%lld]: leak order: %lld block: %p", heap->id, i, block);
+                return;
+            }
+
+            mmap_free(block, BSIZEOF(i));
+            block = next;
+        }
+    }
+
+    // munmap heap
+    mmap_free(heap, sizeof(struct heap_t));
+
+    LOG_DEBUG("Heap destroyed successfully");
+}

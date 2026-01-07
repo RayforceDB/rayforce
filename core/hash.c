@@ -291,7 +291,7 @@ u64_t hash_index_obj(obj_p obj) {
                 hash = hash_index_u64((u64_t)AS_F64(obj)[i], hash);
             return hash;
         default:
-            PANIC("hash: unsupported type: %d", obj->type);
+            PANIC("type: %d", obj->type);
     }
 }
 

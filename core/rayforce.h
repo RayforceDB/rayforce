@@ -207,6 +207,7 @@ extern nil_t drop_raw(raw_p ptr);  // Free a raw pointer
 // Checkers
 extern b8_t is_null(obj_p obj);
 extern str_p type_name(i8_t tp);
+// IS_ERR: check if obj is the static error singleton (context in VM)
 #define IS_ERR(obj) ((obj)->type == TYPE_ERR)
 #define IS_ATOM(obj) ((obj)->type < 0)
 #define IS_VECTOR(obj) ((obj)->type >= 0 && (obj)->type <= TYPE_ENUM)

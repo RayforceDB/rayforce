@@ -46,7 +46,7 @@ obj_p ray_iasc(obj_p x) {
         case TYPE_DICT:
             return ray_sort_asc(x);
         default:
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
     }
 }
 
@@ -67,7 +67,7 @@ obj_p ray_idesc(obj_p x) {
         case TYPE_DICT:
             return ray_sort_desc(x);
         default:
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
     }
 }
 
@@ -153,7 +153,7 @@ obj_p ray_asc(obj_p x) {
         }
 
         default:
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
     }
 }
 
@@ -239,7 +239,7 @@ obj_p ray_desc(obj_p x) {
         }
 
         default:
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
     }
 }
 
@@ -325,9 +325,9 @@ obj_p ray_xasc(obj_p x, obj_p y) {
             if (y->len == 0)
                 return clone_obj(x);
 
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
         default:
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
     }
 }
 
@@ -413,9 +413,9 @@ obj_p ray_xdesc(obj_p x, obj_p y) {
             if (y->len == 0)
                 return clone_obj(x);
 
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
         default:
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
     }
 }
 
@@ -438,7 +438,7 @@ obj_p ray_not(obj_p x) {
             return res;
 
         default:
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
     }
 }
 
@@ -492,7 +492,7 @@ obj_p ray_neg(obj_p x) {
             return res;
 
         default:
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
     }
 }
 
@@ -613,10 +613,10 @@ obj_p ray_xrank(obj_p y, obj_p x) {
             n_buckets = x->u8;
             break;
         default:
-            return err_type(0, 0, 0);
+            return err_type(0, 0, 0, 0);
     }
     if (n_buckets <= 0)
-        return err_domain();
+        return err_domain(0, 0);
 
     l = y->len;
     res = I64(l);

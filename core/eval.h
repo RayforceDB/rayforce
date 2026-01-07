@@ -30,6 +30,7 @@
 #include "mmap.h"
 #include "nfo.h"
 #include "util.h"
+#include "error.h"
 
 // Forward declaration for query context (defined in query.h)
 struct query_ctx_t;
@@ -83,17 +84,18 @@ typedef struct vm_t {
     i32_t rp;  // return stack pointer
     i32_t id;  // VM id (thread index)
     // Pointers (40 bytes)
-    obj_p fn;             // current function (fn->env has local variables)
-    struct heap_t *heap;  // heap pointer
-    struct pool_t *pool;  // pool pointer
-    obj_p nfo;            // error source info
-    obj_p trace;          // error stack trace
+    obj_p fn;                       // current function (fn->env has local variables)
+    struct heap_t *heap;            // heap pointer
+    struct pool_t *pool;            // pool pointer
+    struct query_ctx_t *query_ctx;  // query context stack (for table column resolution)
+    timeit_t *timeit;               // timeit (lazy allocated)
     // === Stacks ===
     obj_p ps[VM_STACK_SIZE];  // program stack
     ctx_t rs[VM_STACK_SIZE];  // return stack
     // === COLD section ===
-    struct query_ctx_t *query_ctx;  // query context stack (for table column resolution)
-    timeit_t *timeit;               // timeit (lazy allocated)
+    obj_p nfo;    // error source info
+    obj_p trace;  // error stack trace
+    err_t err;    // last error context (no allocation)
 } __attribute__((aligned(64))) * vm_p;
 
 // Thread-local VM pointer

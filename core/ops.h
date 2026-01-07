@@ -29,9 +29,14 @@
 #include "string.h"
 
 // Global null object to be referenced by all null objects.
-extern struct obj_t __NULL_OBJECT;
+extern struct obj_t __NULL_OBJ;
 // Return reference to the global null object.
-#define NULL_OBJ (&__NULL_OBJECT)
+#define NULL_OBJ (&__NULL_OBJ)
+
+// Global error object (static sentinel - context stored in VM)
+extern struct obj_t __ERR_OBJ;
+// Return reference to the global error object.
+#define ERR_OBJ (&__ERR_OBJ)
 
 // Function's attributes
 #define FN_NONE 0

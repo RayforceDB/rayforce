@@ -46,7 +46,7 @@ nil_t log_internal(log_level_t level, lit_p file, i32_t line, lit_p func, lit_p 
 #define LOG_DEBUG_OBJ(fmt, obj, ...) LOG_WITH_OBJ(LOG_LEVEL_DEBUG, fmt, obj, ##__VA_ARGS__)
 #define LOG_INFO_OBJ(fmt, obj, ...) LOG_WITH_OBJ(LOG_LEVEL_INFO, fmt, obj, ##__VA_ARGS__)
 #define LOG_WARN_OBJ(fmt, obj, ...) LOG_WITH_OBJ(LOG_LEVEL_WARN, fmt, obj, ##__VA_ARGS__)
-#define LOG_ERROR_OBJ(fmt, obj, ...) LOG_WITH_OBJ(LOG_LEVEL_ERROR, fmt, obj, ##__VA_ARGS__)
+#define LOG_ERR_OBJ(fmt, obj, ...) LOG_WITH_OBJ(LOG_LEVEL_ERROR, fmt, obj, ##__VA_ARGS__)
 
 #else
 
@@ -63,7 +63,7 @@ typedef i32_t log_level_t;
 #define LOG_DEBUG_OBJ(fmt, obj, ...) ((nil_t)0)
 #define LOG_INFO_OBJ(fmt, obj, ...) ((nil_t)0)
 #define LOG_WARN_OBJ(fmt, obj, ...) ((nil_t)0)
-#define LOG_ERROR_OBJ(fmt, obj, ...) ((nil_t)0)
+#define LOG_ERR_OBJ(fmt, obj, ...) ((nil_t)0)
 
 #endif
 

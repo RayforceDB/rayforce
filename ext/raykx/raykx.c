@@ -103,7 +103,7 @@ obj_p raykx_listen(obj_p x) {
     struct poll_registry_t registry = ZERO_INIT_STRUCT;
 
     if (x->type != -TYPE_I64)
-        return err_type(-TYPE_I64, x->type, 0);
+        return err_type(-TYPE_I64, x->type, 0, 0);
 
     port = x->i64;
 
@@ -196,7 +196,7 @@ obj_p raykx_hopen(obj_p addr) {
 
 obj_p raykx_hclose(obj_p fd) {
     if (fd->type != -TYPE_I64)
-        return err_type(-TYPE_I64, fd->type, 0);
+        return err_type(-TYPE_I64, fd->type, 0, 0);
 
     poll_deregister(runtime_get()->poll, fd->i64);
 

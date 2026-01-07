@@ -48,17 +48,17 @@ obj_p ray_hopen(obj_p *x, i64_t n) {
     obj_p path, msg, err;
 
     if (n == 0)
-        return err_length(0, 0);
+        return err_length(0, 0, 0, 0, 0, 0);
 
     if (n > 2)
-        return err_arity(2, n);
+        return err_arity(2, n, 0);
 
     if (x[0]->type != TYPE_C8)
-        return err_type(TYPE_C8, x[0]->type, 0);
+        return err_type(TYPE_C8, x[0]->type, 0, 0);
 
     if (n == 2) {
         if (x[1]->type != -TYPE_I64)
-            return err_type(-TYPE_I64, x[1]->type, 0);
+            return err_type(-TYPE_I64, x[1]->type, 0, 0);
 
         timeout = x[1]->i64;
     }
@@ -108,7 +108,7 @@ obj_p ray_hclose(obj_p x) {
             poll_deregister(runtime_get()->poll, x->i64);
             return NULL_OBJ;
         default:
-            return err_type(-TYPE_I64, x->type, 0);
+            return err_type(-TYPE_I64, x->type, 0, 0);
     }
 }
 
@@ -125,11 +125,11 @@ obj_p ray_read(obj_p x) {
             size = fs_fsize(fd);
 
             if (size < 1)
-                return err_length(0, 0);
+                return err_length(0, 0, 0, 0, 0, 0);
 
             // Check for reasonable file size
             if (size > 1000000000)  // 1GB max size
-                return err_length(0, 0);
+                return err_length(0, 0, 0, 0, 0, 0);
 
             map = (u8_t *)mmap_file(fd, NULL, size, 0);
 
@@ -203,7 +203,7 @@ obj_p ray_read(obj_p x) {
             drop_obj(s);
             return res;
         default:
-            return err_type(TYPE_C8, x->type, 0);
+            return err_type(TYPE_C8, x->type, 0, 0);
     }
 }
 
@@ -357,7 +357,7 @@ obj_p parse_csv_field(i8_t type, str_p start, str_p end, i64_t row, obj_p out) {
             }
             break;
         default:
-            return err_type(TYPE_LIST, type, 0);
+            return err_type(TYPE_LIST, type, 0, 0);
     }
 
     return NULL_OBJ;
@@ -387,7 +387,7 @@ obj_p parse_csv_line(i8_t types[], i64_t cnt, str_p start, str_p end, i64_t row,
             pos = (str_p)memchr(prev, '"', len - 1);
 
             if (pos == NULL)
-                return err_length(0, 0);
+                return err_length(0, 0, 0, 0, 0, 0);
 
             res = parse_csv_field(types[i], prev, pos, row, AS_LIST(cols)[i]);
             pos += 2;  // skip quote and comma
@@ -410,7 +410,7 @@ obj_p parse_csv_line(i8_t types[], i64_t cnt, str_p start, str_p end, i64_t row,
         pos = (str_p)memchr(pos, sep, len);
         if (pos == NULL) {
             if (i < cnt - 1)
-                return err_length(0, 0);
+                return err_length(0, 0, 0, 0, 0, 0);
             pos = end;
         }
 
@@ -460,7 +460,7 @@ obj_p parse_csv_range(i8_t types[], i64_t num_types, str_p buf, i64_t size, i64_
     return NULL_OBJ;  // Success
 }
 
-obj_p parse_csv_lines(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t total_lines, obj_p cols, c8_t sep) {
+obj_p io_read_csv(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t total_lines, obj_p cols, c8_t sep) {
     obj_p err, res = NULL_OBJ;
     i64_t i, l, batch_size, num_batches, lines_per_batch, start_line, end_line, lines_in_batch;
     str_p batch_start, batch_end;
@@ -531,7 +531,7 @@ obj_p parse_csv_lines(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t
     return NULL_OBJ;  // Success
 }
 
-static i64_t symbol_from_str_trimmed(str_p src, i64_t len) {
+i64_t io_symbol_from_str_trimmed(str_p src, i64_t len) {
     c8_t buf[256];  // Stack buffer for common case
     c8_t *trimmed;
     i64_t i, j = 0;
@@ -580,17 +580,17 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
         case 3:
             if (n == 3) {
                 if (x[2]->type != -TYPE_C8)
-                    return err_type(-TYPE_C8, x[2]->type, 0);
+                    return err_type(-TYPE_C8, x[2]->type, 0, 0);
 
                 sep = x[2]->u8;
             }
             // expect vector of types as 1st arg:
             if (x[0]->type != TYPE_SYMBOL)
-                return err_type(TYPE_SYMBOL, x[0]->type, 0);
+                return err_type(TYPE_SYMBOL, x[0]->type, 0, 0);
 
             // expect string as 2nd arg:
             if (x[1]->type != TYPE_C8)
-                return err_type(TYPE_C8, x[1]->type, 0);
+                return err_type(TYPE_C8, x[1]->type, 0, 0);
 
             // check that all symbols are valid typenames and convert them to types
             l = x[0]->len;
@@ -624,7 +624,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                 drop_obj(types);
                 fs_fclose(fd);
                 drop_obj(path);
-                return err_length(0, 0);
+                return err_length(0, 0, 0, 0, 0, 0);
             }
 
             buf = (str_p)mmap_file(fd, NULL, size, 0);
@@ -648,7 +648,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                 fs_fclose(fd);
                 mmap_free(buf, size);
                 drop_obj(path);
-                return err_length(0, 0);
+                return err_length(0, 0, 0, 0, 0, 0);
             }
 
             // Adjust for the file not ending with a newline
@@ -672,7 +672,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                         drop_obj(names);
                         fs_fclose(fd);
                         mmap_free(buf, size);
-                        return err_length(0, 0);
+                        return err_length(0, 0, 0, 0, 0, 0);
                     }
 
                     pos = prev + len;
@@ -681,7 +681,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                         pos--;
                 }
 
-                AS_SYMBOL(names)[i] = symbol_from_str_trimmed(prev, pos - prev);
+                AS_SYMBOL(names)[i] = io_symbol_from_str_trimmed(prev, pos - prev);
                 pos++;
                 len -= (pos - prev);
             }
@@ -692,7 +692,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                 fs_fclose(fd);
                 mmap_free(buf, size);
                 drop_obj(path);
-                return err_length(0, 0);
+                return err_length(0, 0, 0, 0, 0, 0);
             }
 
             // exclude header
@@ -708,7 +708,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
             }
 
             // parse lines
-            res = parse_csv_lines((i8_t *)AS_U8(types), l, line, size, lines, cols, sep);
+            res = io_read_csv((i8_t *)AS_U8(types), l, line, size, lines, cols, sep);
 
             drop_obj(types);
             fs_fclose(fd);
@@ -727,7 +727,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
 
             return table(names, cols);
         default:
-            return err_length(0, 0);
+            return err_arity(3, n, 0);
     }
 }
 
@@ -842,18 +842,18 @@ obj_p ray_write_csv(obj_p *x, i64_t n) {
         case 3:
             if (n == 3) {
                 if (x[2]->type != -TYPE_C8)
-                    return err_type(-TYPE_C8, x[2]->type, 0);
+                    return err_type(-TYPE_C8, x[2]->type, 0, 0);
 
                 sep = x[2]->c8;
             }
 
             // expect string as 1st arg:
             if (x[0]->type != TYPE_C8)
-                return err_type(TYPE_C8, x[0]->type, 0);
+                return err_type(TYPE_C8, x[0]->type, 0, 0);
 
             // expect table as 2nd arg:
             if (x[1]->type != TYPE_TABLE)
-                return err_type(TYPE_TABLE, x[1]->type, 0);
+                return err_type(TYPE_TABLE, x[1]->type, 0, 0);
 
             table = x[1];
             names = AS_LIST(table)[0];
@@ -861,7 +861,7 @@ obj_p ray_write_csv(obj_p *x, i64_t n) {
             l = names->len;
 
             if (l == 0)
-                return err_length(0, 0);
+                return err_length(0, 0, 0, 0, 0, 0);
 
             rows = ops_count(table);
 
@@ -912,7 +912,7 @@ obj_p ray_write_csv(obj_p *x, i64_t n) {
 
             return NULL_OBJ;
         default:
-            return err_length(0, 0);
+            return err_arity(3, n, 0);
     }
 }
 
@@ -920,7 +920,7 @@ obj_p ray_parse(obj_p x) {
     obj_p s, res;
 
     if (!x || x->type != TYPE_C8)
-        return err_type(TYPE_C8, x ? x->type : 0, 0);
+        return err_type(TYPE_C8, x ? x->type : 0, 0, 0);
 
     s = cstring_from_obj(x);
 
@@ -945,7 +945,7 @@ obj_p ray_load(obj_p x) {
     lit_p fname;
 
     if (!x || x->type != TYPE_C8)
-        return err_type(TYPE_C8, x ? x->type : 0, 0);
+        return err_type(TYPE_C8, x ? x->type : 0, 0, 0);
 
     // table expected
     if (x->len > 1 && AS_C8(x)[x->len - 1] == '/') {
@@ -1136,7 +1136,7 @@ obj_p io_set_table_splayed(obj_p path, obj_p table, obj_p symfile) {
             default:
                 drop_obj(cols);
                 drop_obj(sym);
-                return err_type(TYPE_C8, symfile->type, 0);
+                return err_type(TYPE_C8, symfile->type, 0, 0);
         }
 
         if (IS_ERR(res))
@@ -1213,7 +1213,7 @@ obj_p io_get_table_splayed(obj_p path, obj_p symfile) {
     if (keys->type != TYPE_SYMBOL) {
         i8_t actual = keys->type;
         drop_obj(keys);
-        return err_type(TYPE_SYMBOL, actual, 0);
+        return err_type(TYPE_SYMBOL, actual, 0, 0);
     }
 
     l = keys->len;

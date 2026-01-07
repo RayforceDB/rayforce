@@ -99,8 +99,19 @@ raw_p mmap_stack(i64_t size) {
 
 raw_p mmap_alloc(i64_t size) {
     raw_p ptr;
+    int flags = MAP_ANONYMOUS | MAP_SHARED | MAP_NONBLOCK | MAP_POPULATE;
 
-    ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED | MAP_NONBLOCK | MAP_POPULATE, -1, 0);
+    // Try huge pages for large allocations (>= 2MB) - reduces TLB misses
+#ifdef MAP_HUGETLB
+    if (size >= (2 << 20)) {
+        ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, flags | MAP_HUGETLB, -1, 0);
+        if (ptr != MAP_FAILED)
+            return ptr;
+        // Fall back to regular pages if huge pages unavailable
+    }
+#endif
+
+    ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, flags, -1, 0);
 
     if (ptr == MAP_FAILED)
         return NULL;

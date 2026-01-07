@@ -31,6 +31,13 @@
 #define MAX_BLOCK_ORDER 25  // 2^25 = 32MB
 #define MAX_POOL_ORDER 38   // 2^38 = 256GB
 
+// Small object cache (slab) for sizes 32, 64, 128, 256, 512 bytes
+#define SLAB_CACHE_SIZE 64
+#define SLAB_ORDERS 5  // orders 5, 6, 7, 8, 9
+
+// Cache line size (typically 64 bytes on x86/ARM)
+#define CACHE_LINE_SIZE 64
+
 // Memory modes
 #define MMOD_INTERNAL 0xff
 #define MMOD_EXTERNAL_SIMPLE 0xfd
@@ -56,14 +63,30 @@ typedef struct block_t {
     struct block_t *next;
 } *block_p;
 
+// Small object slab cache for fast alloc/free of common sizes
+// count is FIRST - checked before stack access, avoids cache miss
+typedef struct slab_cache_t {
+    i64_t count;                     // current stack depth (check first!)
+    block_p stack[SLAB_CACHE_SIZE];  // LIFO stack of freed blocks
+} slab_cache_t;
+
 typedef struct heap_t {
-    i64_t id;
+    // ===== Cache line 1: hottest fields (allocation fast path) =====
+    i64_t avail;               // 8B - bitmask checked every alloc
+    i64_t id;                  // 8B - heap identity checked in free
+    block_p foreign_blocks;    // 8B - checked in worker free path
+    block_p backed_blocks;     // 8B - file-backed blocks
+    i64_t _pad_cacheline1[4];  // 32B - pad to 64B cache line
+
+    // ===== Slab caches (count field is first in each - fast path check) =====
+    slab_cache_t slabs[SLAB_ORDERS];  // small object caches for orders 5-9
+
+    // ===== Freelists (accessed for non-slab allocations) =====
     block_p freelist[MAX_POOL_ORDER + 2];  // free list of blocks by order
-    i64_t avail;                           // mask of available blocks by order
-    block_p foreign_blocks;                // foreign blocks (to be freed by the owner)
-    block_p backed_blocks;                 // backed blocks (to be unmapped)
-    memstat_t memstat;
-    c8_t swap_path[64];  // swap directory path
+
+    // ===== Cold fields (rarely accessed) =====
+    memstat_t memstat;   // statistics
+    c8_t swap_path[64];  // swap directory path (init only)
 } *heap_p;
 
 heap_p heap_create(i64_t id);

@@ -30,6 +30,7 @@
 #include "heap.h"
 #include "eval.h"
 #include "string.h"
+#include "log.h"
 
 #define DEFAULT_MPMC_SIZE 2048
 #define POOL_SPLIT_THRESHOLD (RAY_PAGE_SIZE * 4)
@@ -243,7 +244,7 @@ pool_p pool_create(i64_t thread_count) {
     pool->executors[0].handle = thread_self();
 
     if (thread_pin(thread_self(), 0) != 0)
-        printf("Pool create: failed to pin main thread\n");
+        LOG_WARN("failed to pin main thread");
 
     // Create worker threads for executor[1..n-1]
     mutex_lock(&pool->mutex);
@@ -254,7 +255,7 @@ pool_p pool_create(i64_t thread_count) {
         pool->executors[i].vm = NULL;
         pool->executors[i].handle = ray_thread_create(executor_run, &pool->executors[i]);
         if (thread_pin(pool->executors[i].handle, i) != 0)
-            printf("Pool create: failed to pin thread %lld\n", i);
+            LOG_WARN("failed to pin thread %lld", i);
     }
     mutex_unlock(&pool->mutex);
 
@@ -280,7 +281,7 @@ nil_t pool_destroy(pool_p pool) {
     // Join worker threads (executor[1..n-1]), not main thread
     for (i = 1; i < n; i++) {
         if (thread_join(pool->executors[i].handle) != 0)
-            printf("Pool destroy: failed to join thread %lld\n", i);
+            LOG_WARN("failed to join thread %lld", i);
     }
 
     mutex_destroy(&pool->mutex);
@@ -302,7 +303,7 @@ nil_t pool_prepare(pool_p pool) {
     i64_t i, n;
 
     if (pool == NULL)
-        PANIC("Pool prepare: pool is NULL");
+        PANIC("pool is NULL");
 
     mutex_lock(&pool->mutex);
 
@@ -310,7 +311,7 @@ nil_t pool_prepare(pool_p pool) {
     pool->done_count = 0;
 
     n = pool->executors_count;
-    for (i = 0; i < n; i++) {
+    for (i = 1; i < n; i++) {  // Skip executor[0] (main thread) - no self-borrow
         heap_borrow(pool->executors[i].heap);
     }
 
@@ -324,7 +325,7 @@ nil_t pool_add_task(pool_p pool, raw_p fn, i64_t argc, ...) {
     mpmc_p queue;
 
     if (pool == NULL)
-        PANIC("Pool add task: pool is NULL");
+        PANIC("pool is NULL");
 
     mutex_lock(&pool->mutex);
 
@@ -353,7 +354,7 @@ nil_t pool_add_task(pool_p pool, raw_p fn, i64_t argc, ...) {
         }
 
         if (mpmc_push(queue, data) == -1)
-            PANIC("Pool add task: oom");
+            PANIC("oom");
 
         mpmc_destroy(pool->task_queue);
         pool->task_queue = queue;
@@ -371,7 +372,7 @@ obj_p pool_run(pool_p pool) {
     task_data_t data;
 
     if (pool == NULL)
-        PANIC("Pool run: pool is NULL");
+        PANIC("pool is NULL");
 
     mutex_lock(&pool->mutex);
 
@@ -417,14 +418,14 @@ obj_p pool_run(pool_p pool) {
     for (i = 0; i < tasks_count; i++) {
         data = mpmc_pop(pool->result_queue);
         if (data.id < 0 || data.id >= (i64_t)tasks_count)
-            PANIC("Pool run: corrupted data: %lld\n", data.id);
+            PANIC("corrupted: %lld", data.id);
 
         ins_obj(&res, data.id, data.result);
     }
 
     // merge heaps
     n = pool->executors_count;
-    for (i = 0; i < n; i++) {
+    for (i = 1; i < n; i++) {  // Skip executor[0] (main thread) - no self-merge
         heap_merge(pool->executors[i].heap);
     }
 

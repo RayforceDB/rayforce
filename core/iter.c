@@ -293,7 +293,7 @@ obj_p map_binary_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
     i8_t xt, yt;
 
     if (!x || !y)
-        return err_type(TYPE_LIST, x ? y->type : 0, 0);
+        return err_type(TYPE_LIST, x ? y->type : 0, 0, 0);
 
     xt = x->type;
     yt = y->type;
@@ -302,7 +302,7 @@ obj_p map_binary_fn(binary_f fn, i64_t attrs, obj_p x, obj_p y) {
         l = ops_count(x);
 
         if (l != ops_count(y))
-            return err_length(l, ops_count(y));
+            return err_length(l, ops_count(y), 0, 0, 0, 0);
 
         if (l == 0)
             return fn(x, y);
@@ -426,7 +426,7 @@ obj_p map_vary_fn(vary_f fn, i64_t attrs, obj_p *x, i64_t n) {
 
     l = ops_rank(x, n);
     if (l == NULL_I64)
-        return err_arity(1, n);
+        return err_arity(1, n, 0);
 
     for (j = 0; j < n; j++)
         vm_stack_push(at_idx(x[j], 0));
@@ -596,21 +596,21 @@ obj_p ray_map(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return map_unary(f, x[0]);
         case TYPE_BINARY:
             if (n != 2)
-                return err_arity(2, n);
+                return err_arity(2, n, 0);
             return map_binary(f, x[0], x[1]);
         case TYPE_VARY:
             return map_vary(f, x, n);
         case TYPE_LAMBDA:
             if (n != AS_LAMBDA(f)->args->len)
-                return err_arity(AS_LAMBDA(f)->args->len, n);
+                return err_arity(AS_LAMBDA(f)->args->len, n, 0);
 
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                return err_length(0, 0);  // ranks don't match
+                return err_length(0, 0, 0, 0, 0, 0);  // ranks don't match
 
             if (l < 1)
                 return vector(x[0]->type, 0);
@@ -618,7 +618,7 @@ obj_p ray_map(obj_p *x, i64_t n) {
             return map_lambda(f, x, n);
 
         default:
-            return err_type(TYPE_LAMBDA, f->type, 0);
+            return err_type(TYPE_LAMBDA, f->type, 0, 0);
     }
 }
 
@@ -636,21 +636,21 @@ obj_p ray_pmap(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return pmap_unary(f, x[0]);
         case TYPE_BINARY:
             if (n != 2)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return map_binary(f, x[0], x[1]);
         case TYPE_VARY:
             return map_vary(f, x, n);
         case TYPE_LAMBDA:
             if (n != AS_LAMBDA(f)->args->len)
-                return err_arity(1, n);
+                return err_arity(AS_LAMBDA(f)->args->len, n, 0);
 
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                return err_arity(1, n);
+                return err_arity(AS_LAMBDA(f)->args->len, n, 0);
 
             if (l < 1)
                 return vector(x[0]->type, 0);
@@ -658,7 +658,7 @@ obj_p ray_pmap(obj_p *x, i64_t n) {
             return pmap_lambda(f, x, n);
 
         default:
-            return err_type(TYPE_LAMBDA, f->type, 0);
+            return err_type(TYPE_LAMBDA, f->type, 0, 0);
     }
 }
 
@@ -676,17 +676,17 @@ obj_p ray_map_left(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return map_unary(f, x[0]);
         case TYPE_BINARY:
             if (n != 2)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return map_binary_left(f, x[0], x[1]);
         case TYPE_VARY:
             return map_vary(f, x, n);
         case TYPE_LAMBDA:
             if (n != AS_LAMBDA(f)->args->len)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             if (!IS_VECTOR(x[0])) {
                 for (i = 0; i < n; i++)
@@ -745,7 +745,7 @@ obj_p ray_map_left(obj_p *x, i64_t n) {
 
             return res;
         default:
-            return err_type(TYPE_LAMBDA, f->type, 0);
+            return err_type(TYPE_LAMBDA, f->type, 0, 0);
     }
 }
 
@@ -763,17 +763,17 @@ obj_p ray_map_right(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return map_unary(f, x[0]);
         case TYPE_BINARY:
             if (n != 2)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return map_binary_right(f, x[0], x[1]);
         case TYPE_VARY:
             return map_vary(f, x, n);
         case TYPE_LAMBDA:
             if (n != AS_LAMBDA(f)->args->len)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             if (!IS_VECTOR(x[n - 1])) {
                 for (i = 0; i < n; i++)
@@ -831,7 +831,7 @@ obj_p ray_map_right(obj_p *x, i64_t n) {
 
             return res;
         default:
-            return err_type(TYPE_LAMBDA, f->type, 0);
+            return err_type(TYPE_LAMBDA, f->type, 0, 0);
     }
 }
 
@@ -850,11 +850,11 @@ obj_p ray_fold(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return map_unary(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             xt = x[0]->type;
             yt = x[1]->type;
@@ -863,7 +863,7 @@ obj_p ray_fold(obj_p *x, i64_t n) {
                 l = ops_count(x[0]);
 
                 if (l != ops_count(x[1]))
-                    return err_arity(1, n);
+                    return err_arity(1, n, 0);
 
                 if (l == 0)
                     return LIST(0);
@@ -953,7 +953,7 @@ obj_p ray_fold(obj_p *x, i64_t n) {
 
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             for (i = 0; i < n; i++)
                 vm_stack_push(at_idx(x[i], 0));
@@ -985,10 +985,10 @@ obj_p ray_fold(obj_p *x, i64_t n) {
         case TYPE_LAMBDA:
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             if (n != 1 && n != AS_LAMBDA(f)->args->len)
-                return err_arity(1, n);
+                return err_arity(AS_LAMBDA(f)->args->len, n, 0);
 
             if (n == 1) {
                 l = ops_count(x[0]);
@@ -1035,9 +1035,9 @@ obj_p ray_fold(obj_p *x, i64_t n) {
 
                 return v;
             } else
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
         default:
-            return err_type(TYPE_LAMBDA, f->type, 0);
+            return err_type(TYPE_LAMBDA, f->type, 0, 0);
     }
 }
 
@@ -1055,11 +1055,11 @@ obj_p ray_fold_left(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return unary_call(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             l = ops_count(x[0]);
             if (l == 0)
@@ -1094,7 +1094,7 @@ obj_p ray_fold_left(obj_p *x, i64_t n) {
             return vary_call(f, x, n);
         case TYPE_LAMBDA:
             if (n < 2 || AS_LAMBDA(f)->args->len != n)
-                return err_arity(1, n);
+                return err_arity(AS_LAMBDA(f)->args->len, n, 0);
 
             l = ops_count(x[0]);
             if (l == 0)
@@ -1126,7 +1126,7 @@ obj_p ray_fold_left(obj_p *x, i64_t n) {
 
             return v;
         default:
-            return err_type(TYPE_LAMBDA, f->type, 0);
+            return err_type(TYPE_LAMBDA, f->type, 0, 0);
     }
 }
 
@@ -1144,11 +1144,11 @@ obj_p ray_fold_right(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return unary_call(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             l = ops_count(x[n - 1]);  // Last argument is the one we iterate over
             if (l == 0)
@@ -1171,7 +1171,7 @@ obj_p ray_fold_right(obj_p *x, i64_t n) {
             return vary_call(f, x, n);
         case TYPE_LAMBDA:
             if (n < 2 || AS_LAMBDA(f)->args->len != n)
-                return err_arity(1, n);
+                return err_arity(AS_LAMBDA(f)->args->len, n, 0);
 
             l = ops_count(x[n - 1]);  // Last argument is the one we iterate over
             if (l == 0)
@@ -1205,7 +1205,7 @@ obj_p ray_fold_right(obj_p *x, i64_t n) {
 
             return v;
         default:
-            return err_type(TYPE_LAMBDA, f->type, 0);
+            return err_type(TYPE_LAMBDA, f->type, 0, 0);
     }
 }
 
@@ -1224,11 +1224,11 @@ obj_p ray_scan(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return map_unary(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             xt = x[0]->type;
             yt = x[1]->type;
@@ -1237,7 +1237,7 @@ obj_p ray_scan(obj_p *x, i64_t n) {
                 l = ops_count(x[0]);
 
                 if (l != ops_count(x[1]))
-                    return err_arity(1, n);
+                    return err_arity(1, n, 0);
 
                 if (l == 0)
                     return LIST(0);
@@ -1363,7 +1363,7 @@ obj_p ray_scan(obj_p *x, i64_t n) {
 
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             for (i = 0; i < n; i++)
                 vm_stack_push(at_idx(x[i], 0));
@@ -1405,10 +1405,10 @@ obj_p ray_scan(obj_p *x, i64_t n) {
         case TYPE_LAMBDA:
             l = ops_rank(x, n);
             if (l == NULL_I64)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             if (n != 1 && n != AS_LAMBDA(f)->args->len)
-                return err_arity(1, n);
+                return err_arity(AS_LAMBDA(f)->args->len, n, 0);
 
             if (n == 1) {
                 l = ops_count(x[0]);
@@ -1473,9 +1473,9 @@ obj_p ray_scan(obj_p *x, i64_t n) {
 
                 return res;
             } else
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
         default:
-            return err_type(TYPE_LAMBDA, f->type, 0);
+            return err_type(TYPE_LAMBDA, f->type, 0, 0);
     }
 }
 
@@ -1493,11 +1493,11 @@ obj_p ray_scan_left(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return unary_call(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             l = ops_count(x[0]);
             if (l == 0)
@@ -1530,7 +1530,7 @@ obj_p ray_scan_left(obj_p *x, i64_t n) {
             return vary_call(f, x, n);
         case TYPE_LAMBDA:
             if (n < 2 || AS_LAMBDA(f)->args->len != n)
-                return err_arity(1, n);
+                return err_arity(AS_LAMBDA(f)->args->len, n, 0);
 
             l = ops_count(x[0]);
             if (l == 0)
@@ -1572,7 +1572,7 @@ obj_p ray_scan_left(obj_p *x, i64_t n) {
 
             return res;
         default:
-            return err_type(TYPE_LAMBDA, f->type, 0);
+            return err_type(TYPE_LAMBDA, f->type, 0, 0);
     }
 }
 
@@ -1590,11 +1590,11 @@ obj_p ray_scan_right(obj_p *x, i64_t n) {
     switch (f->type) {
         case TYPE_UNARY:
             if (n != 1)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
             return unary_call(f, x[0]);
         case TYPE_BINARY:
             if (n < 2)
-                return err_arity(1, n);
+                return err_arity(1, n, 0);
 
             l = ops_count(x[n - 1]);  // Last argument is the one we iterate over
             if (l == 0)
@@ -1627,7 +1627,7 @@ obj_p ray_scan_right(obj_p *x, i64_t n) {
             return vary_call(f, x, n);
         case TYPE_LAMBDA:
             if (n < 2 || AS_LAMBDA(f)->args->len != n)
-                return err_arity(1, n);
+                return err_arity(AS_LAMBDA(f)->args->len, n, 0);
 
             l = ops_count(x[n - 1]);  // Last argument is the one we iterate over
             if (l == 0)
@@ -1669,6 +1669,6 @@ obj_p ray_scan_right(obj_p *x, i64_t n) {
 
             return res;
         default:
-            return err_type(TYPE_LAMBDA, f->type, 0);
+            return err_type(TYPE_LAMBDA, f->type, 0, 0);
     }
 }

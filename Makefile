@@ -26,7 +26,8 @@ DEBUG_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -g -O0 -march=native -fsigned-cha
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
  -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
  -flax-vector-conversions -fno-math-errno -fomit-frame-pointer -fno-stack-protector\
- -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables
+ -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables\
+ -fmacro-prefix-map=$(PWD)/=
 LIBS = -lm -ldl -lpthread
 RELEASE_LDFLAGS = -Wl,--strip-all -Wl,--gc-sections -Wl,--as-needed\
  -Wl,--build-id=none -Wl,--no-eh-frame-hdr -Wl,--no-ld-generated-unwind-info\
@@ -41,7 +42,8 @@ DEBUG_CFLAGS = -fPIC -Wall -Wextra -Wunused-function -std=$(STD) -g -O0 -march=n
 RELEASE_CFLAGS = -fPIC -Wall -Wextra -std=$(STD) -O3 -fsigned-char -march=native\
  -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -m64\
  -flax-vector-conversions -fno-math-errno -fomit-frame-pointer -fno-stack-protector\
- -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables
+ -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables\
+ -fmacro-prefix-map=$(PWD)/=
 LIBS = -lm -ldl -lpthread
 RELEASE_LDFLAGS = -Wl,-dead_strip -Wl,-export_dynamic
 DEBUG_LDFLAGS = -Wl,-export_dynamic

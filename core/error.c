@@ -4,13 +4,12 @@
  */
 
 #include "error.h"
-#include "heap.h"
+#include "eval.h"
 #include "string.h"
 #include "util.h"
-#include "eval.h"
 
 // ============================================================================
-// Error Code Names
+// Error Names (like sys_errlist)
 // ============================================================================
 static lit_p err_names[] = {
     "ok",      // EC_OK
@@ -27,13 +26,9 @@ static lit_p err_names[] = {
     "",        // EC_USER
 };
 
-RAY_ASSERT(sizeof(err_names) / sizeof(err_names[0]) == EC_MAX, "err_names must match err_code_t");
+RAY_ASSERT(sizeof(err_names) / sizeof(err_names[0]) == EC_MAX, "err_names size mismatch");
 
-lit_p err_name(err_code_t code) {
-    if (code >= EC_MAX)
-        return "error";
-    return err_names[code];
-}
+lit_p err_name(err_code_t code) { return (code < EC_MAX) ? err_names[code] : "error"; }
 
 // ============================================================================
 // Platform errno
@@ -47,295 +42,253 @@ static i32_t get_errno(nil_t) {
 }
 
 // ============================================================================
-// Error Creation
+// Error Creation - Set VM->err, return ERR_OBJ
 // ============================================================================
 
-static inline obj_p err_alloc(err_code_t code) {
-    obj_p obj = (obj_p)heap_alloc(sizeof(struct obj_t));
-    obj->mmod = MMOD_INTERNAL;
-    obj->type = TYPE_ERR;
-    obj->rc = 1;
-    obj->attrs = (u8_t)code;
-    obj->i64 = 0;  // Clear context
-    return obj;
+obj_p err_raw(err_code_t code) {
+    VM->err.code = (u8_t)code;
+    return ERR_OBJ;
 }
 
-obj_p err_raw(err_code_t code) { return err_alloc(code); }
-
-obj_p err_type(i8_t expected, i8_t actual, i64_t field) {
-    obj_p err = err_alloc(EC_TYPE);
-    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
-    ctx->types.expected = expected;
-    ctx->types.actual = actual;
-    ctx->types.field = (i32_t)field;
-    return err;
+obj_p err_type(i8_t expected, i8_t actual, u8_t arg, u8_t field) {
+    err_t *e = &VM->err;
+    e->code = EC_TYPE;
+    e->type.expected = expected;
+    e->type.actual = actual;
+    e->type.arg = arg;
+    e->type.field = field;
+    return ERR_OBJ;
 }
 
-obj_p err_arity(i32_t need, i32_t have) {
-    obj_p err = err_alloc(EC_ARITY);
-    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
-    ctx->counts.need = need;
-    ctx->counts.have = have;
-    return err;
+obj_p err_arity(i8_t need, i8_t have, u8_t arg) {
+    err_t *e = &VM->err;
+    e->code = EC_ARITY;
+    e->arity.need = need;
+    e->arity.have = have;
+    e->arity.arg = arg;
+    return ERR_OBJ;
 }
 
-obj_p err_length(i32_t need, i32_t have) {
-    obj_p err = err_alloc(EC_LENGTH);
-    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
-    ctx->counts.need = need;
-    ctx->counts.have = have;
-    return err;
+obj_p err_length(i8_t need, i8_t have, u8_t arg, u8_t arg2, u8_t field, u8_t field2) {
+    err_t *e = &VM->err;
+    e->code = EC_LENGTH;
+    e->length.need = need;
+    e->length.have = have;
+    e->length.arg = arg;
+    e->length.arg2 = arg2;
+    e->length.field = field;
+    e->length.field2 = field2;
+    return ERR_OBJ;
 }
 
-obj_p err_index(i32_t idx, i32_t len) {
-    obj_p err = err_alloc(EC_INDEX);
-    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
-    ctx->bounds.idx = idx;
-    ctx->bounds.len = len;
-    return err;
+obj_p err_index(i8_t idx, i8_t len, u8_t arg, u8_t field) {
+    err_t *e = &VM->err;
+    e->code = EC_INDEX;
+    e->index.idx = idx;
+    e->index.len = len;
+    e->index.arg = arg;
+    e->index.field = field;
+    return ERR_OBJ;
+}
+
+obj_p err_domain(u8_t arg, u8_t field) {
+    err_t *e = &VM->err;
+    e->code = EC_DOMAIN;
+    e->domain.arg = arg;
+    e->domain.field = field;
+    return ERR_OBJ;
 }
 
 obj_p err_value(i64_t sym) {
-    obj_p err = err_alloc(EC_VALUE);
-    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
-    ctx->symbol = sym;
-    return err;
+    err_t *e = &VM->err;
+    e->code = EC_VALUE;
+    e->value.sym = sym;
+    return ERR_OBJ;
 }
 
 obj_p err_limit(i32_t limit) {
-    obj_p err = err_alloc(EC_LIMIT);
-    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
-    ctx->counts.have = limit;
-    return err;
+    err_t *e = &VM->err;
+    e->code = EC_LIMIT;
+    e->limit.val = limit;
+    return ERR_OBJ;
 }
 
 obj_p err_os(nil_t) {
-    obj_p err = err_alloc(EC_OS);
-    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
-    ctx->errnum = get_errno();
-    return err;
+    err_t *e = &VM->err;
+    e->code = EC_OS;
+    e->os.no = get_errno();
+    return ERR_OBJ;
 }
 
 obj_p err_user(lit_p msg) {
-    i64_t len = msg ? strlen(msg) : 0;
-    obj_p obj = (obj_p)heap_alloc(sizeof(struct obj_t) + len + 1);
-    obj->mmod = MMOD_INTERNAL;
-    obj->type = TYPE_ERR;
-    obj->rc = 1;
-    obj->attrs = (u8_t)EC_USER;
-    obj->len = len;
-    obj->i64 = 0;
-    if (len > 0)
-        memcpy((str_p)(obj + 1), msg, len + 1);
-    else
-        ((str_p)(obj + 1))[0] = '\0';
-    return obj;
+    err_t *e = &VM->err;
+    e->code = EC_USER;
+    if (msg) {
+        strncpy(e->user.msg, msg, ERR_MSG_SIZE - 1);
+        e->user.msg[ERR_MSG_SIZE - 1] = '\0';
+    } else {
+        e->user.msg[0] = '\0';
+    }
+    return ERR_OBJ;
 }
-
-// Simple errors (no context)
-obj_p err_domain(nil_t) { return err_alloc(EC_DOMAIN); }
 
 obj_p err_nyi(i8_t type) {
-    obj_p err = err_alloc(EC_NYI);
-    err_ctx_t* ctx = (err_ctx_t*)&err->i64;
-    ctx->types.actual = type;
-    return err;
+    err_t *e = &VM->err;
+    e->code = EC_NYI;
+    e->nyi.type = type;
+    return ERR_OBJ;
 }
 
-obj_p err_parse(nil_t) { return err_alloc(EC_PARSE); }
-
-// ============================================================================
-// Error Decoding
-// ============================================================================
+obj_p err_parse(nil_t) {
+    VM->err.code = EC_PARSE;
+    return ERR_OBJ;
+}
 
 err_code_t err_code(obj_p err) {
     if (err == NULL_OBJ || err->type != TYPE_ERR)
         return EC_OK;
-    return (err_code_t)err->attrs;
+    return (err_code_t)VM->err.code;
 }
 
-err_ctx_t* err_ctx(obj_p err) {
-    static err_ctx_t empty = {0};
-    if (err == NULL_OBJ || err->type != TYPE_ERR)
-        return &empty;
-    return (err_ctx_t*)&err->i64;
-}
-
-lit_p err_get_message(obj_p err) {
-    if (err == NULL_OBJ || err->type != TYPE_ERR)
-        return "";
-    if (err_code(err) != EC_USER)
-        return "";
-    if (err->len == 0)
-        return "";
-    return (lit_p)(err + 1);
-}
-
-// ============================================================================
-// String-based API (for deserialization)
-// ============================================================================
-
-obj_p ray_err(lit_p msg) { return err_user(msg); }
-
-lit_p ray_err_msg(obj_p err) {
+lit_p err_msg(obj_p err) {
     if (err == NULL_OBJ || err->type != TYPE_ERR)
         return "";
 
-    err_code_t code = err_code(err);
-    if (code == EC_USER && err->len > 0)
-        return (lit_p)(err + 1);
-
-    return err_name(code);
+    err_t *e = &VM->err;
+    switch (e->code) {
+        case EC_USER:
+            return e->user.msg[0] ? e->user.msg : "";
+        case EC_OS:
+            return strerror(e->os.no);
+        default:
+            return err_name((err_code_t)e->code);
+    }
 }
-
-// ============================================================================
-// Error Info (for IPC serialization)
-// ============================================================================
 
 obj_p err_info(obj_p err) {
     if (err == NULL_OBJ || err->type != TYPE_ERR)
         return NULL_OBJ;
 
-    err_code_t code = err_code(err);
-    err_ctx_t* ctx = err_ctx(err);
-    vm_p vm = VM;
-    obj_p trace = (vm && vm->trace != NULL_OBJ) ? vm->trace : NULL_OBJ;
+    err_t *e = &VM->err;
+    obj_p keys, vals;
     lit_p s;
 
-    obj_p keys, vals;
-    i64_t n = 1;
-
-    switch (code) {
-        case EC_TYPE: {
-            err_types_t t = ctx->types;
-            n = t.field ? 4 : 3;
-            keys = SYMBOL(n);
-            vals = LIST(n);
+    switch (e->code) {
+        case EC_TYPE:
+            keys = SYMBOL(3);
+            vals = LIST(3);
             ins_sym(&keys, 0, "code");
             ins_sym(&keys, 1, "expected");
             ins_sym(&keys, 2, "got");
-            s = err_name(code);
+            s = err_name(EC_TYPE);
             AS_LIST(vals)[0] = symbol(s, strlen(s));
-            s = type_name(t.expected);
+            s = type_name(e->type.expected);
             AS_LIST(vals)[1] = symbol(s, strlen(s));
-            s = type_name(t.actual);
+            s = type_name(e->type.actual);
             AS_LIST(vals)[2] = symbol(s, strlen(s));
-            if (n == 4) {
-                ins_sym(&keys, 3, "field");
-                AS_LIST(vals)[3] = symboli64(t.field);
-            }
             break;
-        }
-        case EC_ARITY: {
-            err_counts_t c = ctx->counts;
-            n = 3;
-            keys = SYMBOL(n);
-            vals = LIST(n);
+
+        case EC_ARITY:
+            keys = SYMBOL(3);
+            vals = LIST(3);
             ins_sym(&keys, 0, "code");
             ins_sym(&keys, 1, "expected");
             ins_sym(&keys, 2, "got");
-            s = err_name(code);
+            s = err_name(EC_ARITY);
             AS_LIST(vals)[0] = symbol(s, strlen(s));
-            AS_LIST(vals)[1] = i32(c.need);
-            AS_LIST(vals)[2] = i32(c.have);
+            AS_LIST(vals)[1] = i32(e->arity.need);
+            AS_LIST(vals)[2] = i32(e->arity.have);
             break;
-        }
-        case EC_LENGTH: {
-            err_counts_t c = ctx->counts;
-            n = 3;
-            keys = SYMBOL(n);
-            vals = LIST(n);
+
+        case EC_LENGTH:
+            keys = SYMBOL(3);
+            vals = LIST(3);
             ins_sym(&keys, 0, "code");
             ins_sym(&keys, 1, "need");
             ins_sym(&keys, 2, "have");
-            s = err_name(code);
+            s = err_name(EC_LENGTH);
             AS_LIST(vals)[0] = symbol(s, strlen(s));
-            AS_LIST(vals)[1] = i32(c.need);
-            AS_LIST(vals)[2] = i32(c.have);
+            AS_LIST(vals)[1] = i32(e->length.need);
+            AS_LIST(vals)[2] = i32(e->length.have);
             break;
-        }
-        case EC_INDEX: {
-            err_bounds_t b = ctx->bounds;
-            n = 3;
-            keys = SYMBOL(n);
-            vals = LIST(n);
+
+        case EC_INDEX:
+            keys = SYMBOL(3);
+            vals = LIST(3);
             ins_sym(&keys, 0, "code");
             ins_sym(&keys, 1, "index");
             ins_sym(&keys, 2, "bound");
-            s = err_name(code);
+            s = err_name(EC_INDEX);
             AS_LIST(vals)[0] = symbol(s, strlen(s));
-            AS_LIST(vals)[1] = i32(b.idx);
-            AS_LIST(vals)[2] = i32(b.len);
+            AS_LIST(vals)[1] = i32(e->index.idx);
+            AS_LIST(vals)[2] = i32(e->index.len);
             break;
-        }
-        case EC_VALUE: {
-            i64_t sym_id = ctx->symbol;
-            n = sym_id ? 2 : 1;
-            keys = SYMBOL(n);
-            vals = LIST(n);
+
+        case EC_VALUE:
+            keys = SYMBOL(e->value.sym ? 2 : 1);
+            vals = LIST(e->value.sym ? 2 : 1);
             ins_sym(&keys, 0, "code");
-            s = err_name(code);
+            s = err_name(EC_VALUE);
             AS_LIST(vals)[0] = symbol(s, strlen(s));
-            if (n == 2) {
+            if (e->value.sym) {
                 ins_sym(&keys, 1, "name");
-                AS_LIST(vals)[1] = symboli64(sym_id);
+                AS_LIST(vals)[1] = symboli64(e->value.sym);
             }
             break;
-        }
-        case EC_OS: {
-            i32_t e = ctx->errnum;
-            n = e ? 2 : 1;
-            keys = SYMBOL(n);
-            vals = LIST(n);
+
+        case EC_OS:
+            keys = SYMBOL(2);
+            vals = LIST(2);
             ins_sym(&keys, 0, "code");
-            s = err_name(code);
+            ins_sym(&keys, 1, "message");
+            s = err_name(EC_OS);
             AS_LIST(vals)[0] = symbol(s, strlen(s));
-            if (n == 2) {
+            AS_LIST(vals)[1] = vn_c8("%s", strerror(e->os.no));
+            break;
+
+        case EC_USER:
+            keys = SYMBOL(e->user.msg[0] ? 2 : 1);
+            vals = LIST(e->user.msg[0] ? 2 : 1);
+            ins_sym(&keys, 0, "code");
+            s = err_name(EC_USER);
+            AS_LIST(vals)[0] = symbol(s, strlen(s));
+            if (e->user.msg[0]) {
                 ins_sym(&keys, 1, "message");
-                AS_LIST(vals)[1] = vn_c8("%s", strerror(e));
+                AS_LIST(vals)[1] = vn_c8("%s", e->user.msg);
             }
             break;
-        }
-        case EC_USER: {
-            lit_p msg = err_get_message(err);
-            n = (msg && msg[0]) ? 2 : 1;
-            keys = SYMBOL(n);
-            vals = LIST(n);
+
+        case EC_LIMIT:
+            keys = SYMBOL(2);
+            vals = LIST(2);
             ins_sym(&keys, 0, "code");
-            s = err_name(code);
+            ins_sym(&keys, 1, "limit");
+            s = err_name(EC_LIMIT);
             AS_LIST(vals)[0] = symbol(s, strlen(s));
-            if (n == 2) {
-                ins_sym(&keys, 1, "message");
-                AS_LIST(vals)[1] = vn_c8("%s", msg);
-            }
+            AS_LIST(vals)[1] = i32(e->limit.val);
             break;
-        }
-        case EC_LIMIT: {
-            err_counts_t c = ctx->counts;
-            n = c.have ? 2 : 1;
-            keys = SYMBOL(n);
-            vals = LIST(n);
+
+        case EC_NYI:
+            keys = SYMBOL(2);
+            vals = LIST(2);
             ins_sym(&keys, 0, "code");
-            s = err_name(code);
+            ins_sym(&keys, 1, "type");
+            s = err_name(EC_NYI);
             AS_LIST(vals)[0] = symbol(s, strlen(s));
-            if (n == 2) {
-                ins_sym(&keys, 1, "limit");
-                AS_LIST(vals)[1] = i32(c.have);
-            }
+            s = type_name(e->nyi.type);
+            AS_LIST(vals)[1] = symbol(s, strlen(s));
             break;
-        }
-        default: {
+
+        default:
             keys = SYMBOL(1);
             vals = LIST(1);
             ins_sym(&keys, 0, "code");
-            s = err_name(code);
+            s = err_name((err_code_t)e->code);
             AS_LIST(vals)[0] = symbol(s, strlen(s));
             break;
-        }
     }
-
-    // TODO: Add trace handling later
-    UNUSED(trace);
 
     return dict(keys, vals);
 }
+
+obj_p ray_err(lit_p msg) { return err_user(msg); }

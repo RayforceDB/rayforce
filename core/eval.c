@@ -474,7 +474,7 @@ OP_CALLF:
     if (UNLIKELY(x->type != TYPE_LAMBDA)) {
         i8_t got = x->type;
         drop_obj(x);
-        r = err_type(TYPE_LAMBDA, got, 0);
+        r = err_type(TYPE_LAMBDA, got, 0, 0);
         bc_error_add_loc(r, vm->fn, ip - 1);
         return vm_error_unwind(vm, r);
     }
@@ -531,7 +531,7 @@ OP_CALLD:
         case TYPE_UNARY:
             if (UNLIKELY(n != 1)) {
                 drop_obj(x);
-                r = err_arity(1, n);
+                r = err_arity(1, n, 0);
                 bc_error_add_loc(r, vm->fn, ip - 1);
                 return vm_error_unwind(vm, r);
             }
@@ -548,7 +548,7 @@ OP_CALLD:
         case TYPE_BINARY:
             if (UNLIKELY(n != 2)) {
                 drop_obj(x);
-                r = err_arity(2, n);
+                r = err_arity(2, n, 0);
                 bc_error_add_loc(r, vm->fn, ip - 1);
                 return vm_error_unwind(vm, r);
             }
@@ -582,7 +582,7 @@ OP_CALLD:
         default: {
             i8_t got = x->type;
             drop_obj(x);
-            r = err_type(TYPE_LAMBDA, got, 0);  // not callable
+            r = err_type(TYPE_LAMBDA, got, 0, 0);  // not callable
             bc_error_add_loc(r, vm->fn, ip - 1);
             return vm_error_unwind(vm, r);
         }
@@ -803,7 +803,7 @@ static obj_p eval_lambda(obj_p fn, obj_p *args, i64_t len, i64_t id) {
     lambda_p lam = AS_LAMBDA(fn);
 
     if (len != lam->args->len)
-        return unwrap(err_length(lam->args->len, len), id);
+        return unwrap(err_length(lam->args->len, len, 0, 0, 0, 0), id);
 
     if (!vm_stack_enough(len))
         return unwrap(err_limit(VM_STACK_SIZE), id);
@@ -854,12 +854,12 @@ dispatch:
     switch (car->type) {
         case TYPE_UNARY:
             if (len != 1)
-                return unwrap(err_length(1, len), id);
+                return unwrap(err_arity(1, len, 0), id);
             return eval_unary(car, args, id);
 
         case TYPE_BINARY:
             if (len != 2)
-                return unwrap(err_length(2, len), id);
+                return unwrap(err_arity(2, len, 0), id);
             return eval_binary(car, args, id);
 
         case TYPE_VARY:
@@ -876,7 +876,7 @@ dispatch:
             goto dispatch;
 
         default:
-            return unwrap(err_type(TYPE_LAMBDA, car->type, 0), id);  // not callable
+            return unwrap(err_type(TYPE_LAMBDA, car->type, 0, 0), id);  // not callable
     }
 }
 
@@ -910,7 +910,7 @@ obj_p ray_raise(obj_p obj) {
     obj_p e;
 
     if (obj->type != TYPE_C8)
-        return err_type(TYPE_C8, obj->type, 0);
+        return err_type(TYPE_C8, obj->type, 0, 0);
 
     // Clone the message since error_obj takes ownership but caller drops the argument
     e = err_user(NULL);
@@ -922,7 +922,7 @@ obj_p ray_parse_str(i64_t fd, obj_p str, obj_p file) {
     obj_p info, res;
 
     if (str->type != TYPE_C8)
-        return err_type(TYPE_C8, str->type, 0);
+        return err_type(TYPE_C8, str->type, 0, 0);
 
     info = nfo(clone_obj(file), clone_obj(str));
     res = parse(AS_C8(str), str->len, info);
@@ -980,7 +980,7 @@ obj_p ray_eval_str_line(obj_p str, obj_p file, i64_t line) {
     i64_t len;
 
     if (str->type != TYPE_C8)
-        return err_type(TYPE_C8, str->type, 0);
+        return err_type(TYPE_C8, str->type, 0, 0);
 
     // Create filename with line number if provided
     if (file != NULL && file != NULL_OBJ) {
@@ -1019,10 +1019,10 @@ obj_p try_obj(obj_p obj, obj_p ctch) {
             call_catch:
                 if (AS_LAMBDA(fn)->args->len != 1) {
                     drop_obj(res);
-                    return err_arity(1, AS_LAMBDA(fn)->args->len);
+                    return err_arity(1, AS_LAMBDA(fn)->args->len, 0);
                 }
                 // Push error message as string for catch handler
-                vm_stack_push(str_fmt(-1, "%s", ray_err_msg(res)));
+                vm_stack_push(str_fmt(-1, "%s", err_msg(res)));
                 drop_obj(res);
                 res = call(fn, 1);
                 drop_obj(vm_stack_pop());

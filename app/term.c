@@ -198,7 +198,7 @@ hist_p hist_create() {
     fd = fs_fopen(HIST_FILE_PATH, ATTR_RDWR | ATTR_CREAT);
 
     if (fd == -1) {
-        perror("can't open history file");
+        perror("hist:open");
         return NULL;
     }
 
@@ -207,13 +207,13 @@ hist_p hist_create() {
     OVERLAPPED overlapped = {0};
     // On Windows, fs_fopen already returns a HANDLE, not a POSIX fd
     if (!LockFileEx((HANDLE)fd, 0, 0, MAXDWORD, MAXDWORD, &overlapped)) {
-        perror("can't lock history file for reading");
+        perror("hist:lock");
         fs_fclose(fd);
         return NULL;
     }
 #else
     if (flock(fd, LOCK_SH) == -1) {
-        perror("can't lock history file for reading");
+        perror("hist:lock");
         fs_fclose(fd);
         return NULL;
     }
@@ -223,7 +223,7 @@ hist_p hist_create() {
     if (fsize == 0) {
         // Set initial file size if the file is empty
         if (fs_file_extend(fd, HIST_SIZE) == -1) {
-            perror("can't truncate history file");
+            perror("hist:trunc");
 #if defined(OS_WINDOWS)
             OVERLAPPED overlapped_err = {0};
             UnlockFileEx((HANDLE)fd, 0, MAXDWORD, MAXDWORD, &overlapped_err);
@@ -240,7 +240,7 @@ hist_p hist_create() {
     // Map file to memory with shared mapping so changes persist
     hist_data = (str_p)mmap_file_shared(fd, NULL, fsize, 0);
     if (hist_data == NULL) {
-        perror("can't map history file");
+        perror("hist:mmap");
 #if defined(OS_WINDOWS)
         OVERLAPPED overlapped_err = {0};
         UnlockFileEx((HANDLE)fd, 0, MAXDWORD, MAXDWORD, &overlapped_err);
@@ -253,7 +253,7 @@ hist_p hist_create() {
 
     hist = (hist_p)heap_mmap(sizeof(struct hist_t));
     if (hist == NULL) {
-        perror("can't allocate memory for history");
+        perror("hist:alloc");
 #if defined(OS_WINDOWS)
         OVERLAPPED overlapped_err = {0};
         UnlockFileEx((HANDLE)fd, 0, MAXDWORD, MAXDWORD, &overlapped_err);
@@ -315,17 +315,17 @@ nil_t hist_destroy(hist_p hist) {
 #if defined(OS_WINDOWS)
     OVERLAPPED overlapped = {0};
     if (!LockFileEx((HANDLE)hist->fd, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped)) {
-        perror("can't lock history file for writing");
+        perror("hist:lock");
     }
 #else
     if (flock(hist->fd, LOCK_EX) == -1) {
-        perror("can't lock history file for writing");
+        perror("hist:lock");
     }
 #endif
 
     // Sync history buffer to file
     if (mmap_sync(hist->entries, hist->size) == -1)
-        perror("can't sync history buffer");
+        perror("hist:sync");
 
     // Unlock file
 #if defined(OS_WINDOWS)
@@ -540,7 +540,7 @@ term_p term_create() {
 
     hist = hist_create();
     if (hist == NULL)
-        PANIC("can't create history");
+        PANIC("hist:create");
 
     term = (term_p)heap_mmap(sizeof(struct term_t));
 
@@ -624,7 +624,7 @@ term_p term_create() {
 
     hist = hist_create();
     if (hist == NULL)
-        PANIC("can't create history");
+        PANIC("hist:create");
 
     term = (term_p)heap_mmap(sizeof(struct term_t));
 

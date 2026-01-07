@@ -3188,6 +3188,57 @@ test_result_t test_lang_update() {
         "t",
         "(table [id val] (list [1i 2i 3i] [100i 300i 450i]))");
 
+    // ========== SYMBOL/TIMESTAMP UPDATE TESTS (regression for set_ids type handling) ==========
+
+    // Test 42: Update symbol column with symbol atom value and where clause
+    TEST_ASSERT_EQ(
+        "(set t (table [id name age] (list [1 2 3] ['alice 'bob 'charlie] [10 20 30])))"
+        "(update {name: 'baba from: 't where: (== age 10)})"
+        "t",
+        "(table [id name age] (list [1 2 3] [baba bob charlie] [10 20 30]))");
+
+    // Test 43: Update symbol column with symbol atom value (multiple rows match)
+    TEST_ASSERT_EQ(
+        "(set t (table [id name age] (list [1 2 3] ['alice 'bob 'charlie] [10 20 10])))"
+        "(update {name: 'updated from: 't where: (== age 10)})"
+        "t",
+        "(table [id name age] (list [1 2 3] [updated bob updated] [10 20 10]))");
+
+    // Test 44: Update symbol column without where clause (all rows)
+    TEST_ASSERT_EQ(
+        "(set t (table [id name] (list [1 2 3] ['x 'y 'z])))"
+        "(update {name: 'same from: 't})"
+        "t",
+        "(table [id name] (list [1 2 3] [same same same]))");
+
+    // Test 45: Update timestamp column with timestamp atom value and where clause
+    TEST_ASSERT_EQ(
+        "(set t (table [id ts val] (list [1 2 3] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0] [10 20 30])))"
+        "(update {ts: 2025.06.15D12:30:00.0 from: 't where: (== val 20)})"
+        "t",
+        "(table [id ts val] (list [1 2 3] [2024.01.01D00:00:00.000000000 2025.06.15D12:30:00.000000000 2024.01.03D00:00:00.000000000] [10 20 30]))");
+
+    // Test 46: Update timestamp column with timestamp atom value (multiple rows match)
+    TEST_ASSERT_EQ(
+        "(set t (table [id ts val] (list [1 2 3] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0] [10 20 10])))"
+        "(update {ts: 2099.12.31D23:59:59.0 from: 't where: (== val 10)})"
+        "t",
+        "(table [id ts val] (list [1 2 3] [2099.12.31D23:59:59.000000000 2024.01.02D00:00:00.000000000 2099.12.31D23:59:59.000000000] [10 20 10]))");
+
+    // Test 47: Update timestamp column without where clause (all rows)
+    TEST_ASSERT_EQ(
+        "(set t (table [id ts] (list [1 2 3] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0])))"
+        "(update {ts: 2000.01.01D00:00:00.0 from: 't})"
+        "t",
+        "(table [id ts] (list [1 2 3] [2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000000]))");
+
+    // Test 48: Update both symbol and timestamp columns in same update
+    TEST_ASSERT_EQ(
+        "(set t (table [id name ts] (list [1 2] ['alice 'bob] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0])))"
+        "(update {name: 'updated ts: 2025.01.01D00:00:00.0 from: 't where: (== id 1)})"
+        "t",
+        "(table [id name ts] (list [1 2] [updated bob] [2025.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000]))");
+
     PASS();
 }
 
@@ -5216,7 +5267,7 @@ test_result_t test_lang_safety() {
     TEST_ASSERT_ER("(rand 5 -1)", "domain");
 
     // ========== MODIFY WRONG ARITY ==========
-    TEST_ASSERT_ER("(do (set v [1 2]) (modify 'v * 2))", "length");
+    TEST_ASSERT_ER("(do (set v [1 2]) (modify 'v * 2))", "arity");
 
     // ========== OUT OF BOUNDS ACCESS ==========
     TEST_ASSERT_ER("(do (set v [1 2 3]) (alter 'v set -10 0))", "index");

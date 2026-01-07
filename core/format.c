@@ -59,7 +59,7 @@ const lit_p unicode_glyphs[] = {"│", "─", "┌", "┐", "└", "┘", "├",
                                 "❯", "∶", "‾", "•", "╭", "╰", "╮", "╯", "┆", "…", "█"};
 obj_p ray_set_fpr(obj_p x) {
     if (x->type != -TYPE_I64)
-        return err_type(0, 0, 0);
+        return err_type(0, 0, 0, 0);
 
     if (x->i64 < 0)
         F64_PRECISION = DEFAULT_F64_PRECISION;
@@ -657,84 +657,62 @@ i64_t error_frame_fmt_into(obj_p *dst, obj_p obj, str_p msg, i32_t msg_len, b8_t
 // Format error context based on error code
 static i64_t error_ctx_fmt_into_new(obj_p *dst, obj_p err) {
     i64_t n = 0;
-    err_code_t code = err_code(err);
-    err_ctx_t *ctx = err_ctx(err);
+    err_t *e = &VM->err;
     str_p name;
-    lit_p msg;
 
-    switch (code) {
-        case EC_TYPE: {
-            err_types_t t = ctx->types;
-            if (t.field) {
-                str_p fname = str_from_symbol(t.field);
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s in field '%s%s%s'\n", GRAY, RESET, GREEN, fname,
-                                  RESET);
-            }
-            if (t.expected != 0 || t.actual != 0) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%s%s, got %s%s%s\n", GRAY, RESET, CYAN,
-                                  type_name(t.expected), RESET, YELLOW, type_name(t.actual), RESET);
-            }
+    UNUSED(err);
+
+    switch (e->code) {
+        case EC_TYPE:
+            if (e->type.arg)
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s arg %s%d%s\n", GRAY, RESET, CYAN, e->type.arg, RESET);
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%s%s, got %s%s%s\n", GRAY, RESET, CYAN,
+                              type_name(e->type.expected), RESET, YELLOW, type_name(e->type.actual), RESET);
             break;
-        }
-        case EC_ARITY: {
-            err_counts_t c = ctx->counts;
+
+        case EC_ARITY:
             n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s expected %s%d%s argument%s, got %s%d%s\n", GRAY, RESET,
-                              CYAN, c.need, RESET, c.need == 1 ? "" : "s", YELLOW, c.have, RESET);
+                              CYAN, e->arity.need, RESET, e->arity.need == 1 ? "" : "s", YELLOW, e->arity.have, RESET);
             break;
-        }
-        case EC_LENGTH: {
-            err_counts_t c = ctx->counts;
-            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s need %s%d%s, have %s%d%s\n", GRAY, RESET, CYAN, c.need,
-                              RESET, YELLOW, c.have, RESET);
+
+        case EC_LENGTH:
+            n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s need %s%d%s, have %s%d%s\n", GRAY, RESET, CYAN, 
+                              e->length.need, RESET, YELLOW, e->length.have, RESET);
             break;
-        }
-        case EC_INDEX: {
-            err_bounds_t b = ctx->bounds;
+
+        case EC_INDEX:
             n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s index %s%d%s not in [%s0 %d%s]\n", GRAY, RESET, YELLOW,
-                              b.idx, RESET, CYAN, b.len > 0 ? b.len - 1 : 0, RESET);
+                              e->index.idx, RESET, CYAN, e->index.len > 0 ? e->index.len - 1 : 0, RESET);
             break;
-        }
-        case EC_VALUE: {
-            i64_t sym = ctx->symbol;
-            if (sym) {
-                name = str_from_symbol(sym);
-                if (name && name[0]) {
-                    n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s '%s%s%s' not found\n", GRAY, RESET, GREEN, name,
-                                      RESET);
-                }
+
+        case EC_VALUE:
+            if (e->value.sym) {
+                name = str_from_symbol(e->value.sym);
+                if (name && name[0])
+                    n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s '%s%s%s' not found\n", GRAY, RESET, GREEN, name, RESET);
             }
             break;
-        }
-        case EC_OS: {
-            i32_t e = ctx->errnum;
-            if (e) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n", GRAY, RESET, YELLOW, strerror(e), RESET);
-            }
+
+        case EC_OS:
+            if (e->os.no)
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n", GRAY, RESET, YELLOW, strerror(e->os.no), RESET);
             break;
-        }
-        case EC_USER: {
-            msg = err_get_message(err);
-            if (msg && msg[0]) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n", GRAY, RESET, YELLOW, msg, RESET);
-            }
+
+        case EC_USER:
+            if (e->user.msg[0])
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s %s%s%s\n", GRAY, RESET, YELLOW, e->user.msg, RESET);
             break;
-        }
-        case EC_LIMIT: {
-            err_counts_t c = ctx->counts;
-            if (c.have > 0) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s limit %s%d%s exceeded\n", GRAY, RESET, YELLOW, c.have,
-                                  RESET);
-            }
+
+        case EC_LIMIT:
+            if (e->limit.val > 0)
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s limit %s%d%s exceeded\n", GRAY, RESET, YELLOW, e->limit.val, RESET);
             break;
-        }
-        case EC_NYI: {
-            err_types_t t = ctx->types;
-            if (t.actual != 0) {
-                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s for type %s%s%s\n", GRAY, RESET, YELLOW,
-                                  type_name(t.actual), RESET);
-            }
+
+        case EC_NYI:
+            if (e->nyi.type)
+                n += str_fmt_into(dst, MAX_ERROR_LEN, "    %s├─%s for type %s%s%s\n", GRAY, RESET, YELLOW, type_name(e->nyi.type), RESET);
             break;
-        }
+
         default:
             break;
     }
@@ -752,7 +730,7 @@ i64_t error_fmt_into(obj_p *dst, i64_t limit, obj_p obj) {
     UNUSED(limit);
 
     // Get error code name
-    code_name = ray_err_msg(obj);
+    code_name = err_msg(obj);
     msg_len = (i32_t)strlen(code_name);
 
     // Check for locations in VM's trace
