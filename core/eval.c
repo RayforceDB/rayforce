@@ -825,15 +825,19 @@ static obj_p eval_lambda(obj_p fn, obj_p *args, i64_t len, i64_t id) {
 // Evaluate symbol lookup
 static inline obj_p eval_sym(obj_p sym) {
     obj_p *val;
+    vm_p vm = VM;
 
     if (sym->attrs & ATTR_QUOTED)
         return symboli64(sym->i64);
 
     val = resolve(sym->i64);
-    if (val == NULL)
-        return unwrap(err_value(sym->i64), (i64_t)sym);
+    if (val != NULL)
+        return clone_obj(*val);
+    
+    if (vm != NULL && vm->query_ctx != NULL)
+        return symboli64(sym->i64);
 
-    return clone_obj(*val);
+    return unwrap(err_value(sym->i64), (i64_t)sym);
 }
 
 // Evaluate list (function call)
