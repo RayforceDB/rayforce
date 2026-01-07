@@ -1396,6 +1396,9 @@ obj_p set_idx(obj_p* obj, i64_t idx, obj_p val) {
         return err_index(idx, (*obj)->len);
     }
 
+    // Clear sort/distinct attrs on modification
+    (*obj)->attrs &= ~(ATTR_ASC | ATTR_DESC | ATTR_DISTINCT);
+
     switch (MTYPE2((*obj)->type, val->type)) {
         case MTYPE2(TYPE_I64, -TYPE_I64):
         case MTYPE2(TYPE_SYMBOL, -TYPE_SYMBOL):
@@ -1430,6 +1433,10 @@ obj_p set_idx(obj_p* obj, i64_t idx, obj_p val) {
 
 obj_p set_ids(obj_p* obj, i64_t ids[], i64_t len, obj_p vals) {
     i64_t i;
+
+    // Clear sort/distinct attrs on modification
+    (*obj)->attrs &= ~(ATTR_ASC | ATTR_DESC | ATTR_DISTINCT);
+
     switch (MTYPE2((*obj)->type, vals->type)) {
         case MTYPE2(TYPE_C8, -TYPE_C8):
             for (i = 0; i < len; i++)
