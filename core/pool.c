@@ -218,10 +218,156 @@ raw_p executor_run(raw_p arg) {
     return NULL;
 }
 
+// ============================================================================
+// CPU Topology - build optimal CPU mapping for thread pinning
+// ============================================================================
+
+#if defined(OS_LINUX)
+
+#define MAX_CPUS 256
+
+typedef struct {
+    i64_t cpu_id;
+    i64_t core_id;      // physical core (first sibling CPU id)
+    i64_t smt_index;    // 0 = first thread, 1 = second thread, etc.
+} cpu_info_t;
+
+// Parse "0,12" or "0-2,12-14" format, return first CPU as core_id
+static i64_t parse_siblings(const char* str, i64_t cpu_id, i64_t* smt_index) {
+    i64_t first_cpu = -1;
+    i64_t idx = 0;
+    const char* p = str;
+
+    while (*p) {
+        i64_t num = 0;
+        while (*p >= '0' && *p <= '9') {
+            num = num * 10 + (*p - '0');
+            p++;
+        }
+        if (first_cpu < 0) first_cpu = num;
+        if (num == cpu_id) {
+            *smt_index = idx;
+            return first_cpu;
+        }
+        idx++;
+        // Skip '-N' ranges
+        if (*p == '-') {
+            p++;
+            i64_t range_end = 0;
+            while (*p >= '0' && *p <= '9') {
+                range_end = range_end * 10 + (*p - '0');
+                p++;
+            }
+            for (i64_t r = num + 1; r <= range_end; r++) {
+                if (r == cpu_id) {
+                    *smt_index = idx;
+                    return first_cpu;
+                }
+                idx++;
+            }
+        }
+        if (*p == ',') p++;
+    }
+    *smt_index = 0;
+    return cpu_id;  // fallback: CPU is its own core
+}
+
+// Build CPU mapping: cpu_map[worker_id] = cpu_id
+// Order: core0_t0, core0_t1, core1_t0, core1_t1, ...
+static void build_cpu_topology(i64_t* cpu_map, i64_t count) {
+    cpu_info_t cpus[MAX_CPUS];
+    i64_t num_cpus = 0;
+    char path[128];
+    char buf[256];
+
+    // Read topology for each CPU
+    for (i64_t cpu = 0; cpu < MAX_CPUS && num_cpus < count; cpu++) {
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%lld/topology/thread_siblings_list", cpu);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+
+        if (fgets(buf, sizeof(buf), f)) {
+            buf[strcspn(buf, "\n")] = 0;
+            cpus[num_cpus].cpu_id = cpu;
+            cpus[num_cpus].core_id = parse_siblings(buf, cpu, &cpus[num_cpus].smt_index);
+            num_cpus++;
+        }
+        fclose(f);
+    }
+
+    // Sort by (smt_index, core_id) to get: all thread0s first, then all thread1s
+    for (i64_t i = 0; i < num_cpus - 1; i++) {
+        for (i64_t j = i + 1; j < num_cpus; j++) {
+            int swap = 0;
+            if (cpus[i].smt_index > cpus[j].smt_index) swap = 1;
+            else if (cpus[i].smt_index == cpus[j].smt_index &&
+                     cpus[i].core_id > cpus[j].core_id) swap = 1;
+            if (swap) {
+                cpu_info_t tmp = cpus[i];
+                cpus[i] = cpus[j];
+                cpus[j] = tmp;
+            }
+        }
+    }
+
+    // Now interleave: take one from each SMT level alternately per core
+    // Result: core0_t0, core0_t1, core1_t0, core1_t1, ...
+    i64_t max_smt = 0;
+    for (i64_t i = 0; i < num_cpus; i++)
+        if (cpus[i].smt_index > max_smt) max_smt = cpus[i].smt_index;
+
+    i64_t physical_cores = num_cpus / (max_smt + 1);
+    if (physical_cores == 0) physical_cores = num_cpus;
+
+    i64_t out_idx = 0;
+    for (i64_t core = 0; core < physical_cores && out_idx < count; core++) {
+        for (i64_t smt = 0; smt <= max_smt && out_idx < count; smt++) {
+            // Find CPU with this core_id and smt_index
+            for (i64_t i = 0; i < num_cpus; i++) {
+                // core_id is the first CPU of the physical core
+                // We need to match by position in sorted order
+                if (cpus[i].smt_index == smt) {
+                    // Count how many cores we've seen at this SMT level
+                    i64_t core_count = 0;
+                    for (i64_t k = 0; k < i; k++)
+                        if (cpus[k].smt_index == smt) core_count++;
+                    if (core_count == core) {
+                        cpu_map[out_idx++] = cpus[i].cpu_id;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fill remaining with sequential if topology read failed
+    for (i64_t i = out_idx; i < count; i++)
+        cpu_map[i] = i;
+
+    LOG_INFO("CPU topology: %lld physical cores, SMT x%lld", physical_cores, max_smt + 1);
+}
+
+#else
+
+static void build_cpu_topology(i64_t* cpu_map, i64_t count) {
+    // Fallback: sequential mapping
+    for (i64_t i = 0; i < count; i++)
+        cpu_map[i] = i;
+}
+
+#endif
+
+// ============================================================================
+
 pool_p pool_create(i64_t thread_count) {
     i64_t i, rounds = 0;
     pool_p pool;
     vm_p vm;
+    i64_t cpu_map[MAX_CPUS];
+
+    // Build optimal CPU mapping based on topology
+    build_cpu_topology(cpu_map, thread_count);
 
     // thread_count includes main thread, so we allocate for all
     pool = (pool_p)heap_mmap(sizeof(struct pool_t) + (sizeof(executor_t) * thread_count));
@@ -243,8 +389,8 @@ pool_p pool_create(i64_t thread_count) {
     pool->executors[0].heap = vm->heap;
     pool->executors[0].handle = thread_self();
 
-    if (thread_pin(thread_self(), 0) != 0)
-        LOG_WARN("failed to pin main thread");
+    if (thread_pin(thread_self(), cpu_map[0]) != 0)
+        LOG_WARN("failed to pin main thread to CPU %lld", cpu_map[0]);
 
     // Create worker threads for executor[1..n-1]
     mutex_lock(&pool->mutex);
@@ -254,8 +400,8 @@ pool_p pool_create(i64_t thread_count) {
         pool->executors[i].heap = NULL;
         pool->executors[i].vm = NULL;
         pool->executors[i].handle = ray_thread_create(executor_run, &pool->executors[i]);
-        if (thread_pin(pool->executors[i].handle, i) != 0)
-            LOG_WARN("failed to pin thread %lld", i);
+        if (thread_pin(pool->executors[i].handle, cpu_map[i]) != 0)
+            LOG_WARN("failed to pin thread %lld to CPU %lld", i, cpu_map[i]);
     }
     mutex_unlock(&pool->mutex);
 
