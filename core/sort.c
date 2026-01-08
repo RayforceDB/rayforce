@@ -30,16 +30,11 @@
 #include "index.h"
 #include "chrono.h"
 
-// Maximum range for counting sort - configurable constant
-#define COUNTING_SORT_MAX_RANGE 1000000
-
 // Sort thresholds
 #define SMALL_VEC_THRESHOLD (128 * 1024)
-#define PARALLEL_SORT_THRESHOLD_U8 (16 * RAY_PAGE_SIZE)
 #define PARALLEL_COUNTING_SORT_THRESHOLD (512 * 1024)
 #define PARALLEL_RADIX_SORT_THRESHOLD (768 * 1024)
-#define COUNTING_SORT_MAX_RANGE_I32 (512 * 1024)
-#define COUNTING_SORT_MAX_RANGE_I64 (512 * 1024)
+#define COUNTING_SORT_MAX_RANGE (512 * 1024)
 
 // U8 counting sort constants
 #define U8_RANGE 256
@@ -480,7 +475,7 @@ obj_p ray_sort_asc_u8(obj_p vec) {
     i64_t i, len = vec->len;
     u8_t* iv = AS_U8(vec);
 
-    if (len >= PARALLEL_SORT_THRESHOLD_U8)
+    if (len >= SMALL_VEC_THRESHOLD)
         return parallel_counting_sort_u8(vec, 1);
 
     obj_p indices = I64(len);
@@ -561,11 +556,12 @@ obj_p ray_sort_asc_i16(obj_p vec) {
     return indices;
 }
 
-// Counting sort for i32 with known min and range (ascending)
-static obj_p counting_sort_asc_i32(obj_p vec, i64_t min_val, i64_t range, i64_t null_count) {
+
+static obj_p counting_sort_i32(obj_p vec, i64_t min_val, i64_t range, i64_t null_count, i64_t asc) {
     i64_t i, len = vec->len;
     i32_t* iv = AS_I32(vec);
-    i64_t null_idx = 0;
+    i64_t null_idx = asc ? 0 : len - null_count;
+    i64_t max_val = min_val + range - 1;
 
     obj_p pos_obj = I64(range + 1);
     u64_t* pos = (u64_t*)AS_I64(pos_obj);
@@ -576,65 +572,33 @@ static obj_p counting_sort_asc_i32(obj_p vec, i64_t min_val, i64_t range, i64_t 
 
     // Count occurrences (skip NULLs)
     for (i = 0; i < len; i++) {
-        if (iv[i] != NULL_I32)
-            pos[iv[i] - min_val + 1]++;
-    }
-
-    // Prefix sum (offset by null_count - NULLs go first in ascending)
-    pos[0] = null_count;
-    for (i = 1; i <= range; i++)
-        pos[i] += pos[i - 1];
-
-    // Scatter (NULLs to beginning, others after)
-    for (i = 0; i < len; i++) {
-        if (iv[i] == NULL_I32)
-            ov[null_idx++] = i;
-        else
-            ov[pos[iv[i] - min_val]++] = i;
-    }
-
-    drop_obj(pos_obj);
-    return indices;
-}
-
-// Counting sort for i32 with known min and range (descending)
-static obj_p counting_sort_desc_i32(obj_p vec, i64_t min_val, i64_t range, i64_t null_count) {
-    i64_t i, len = vec->len;
-    i32_t* iv = AS_I32(vec);
-    i64_t null_idx = len - null_count;
-    i64_t max_val = min_val + range - 1;
-
-    obj_p pos_obj = I64(range + 1);
-    u64_t* pos = (u64_t*)AS_I64(pos_obj);
-    memset(pos, 0, (range + 1) * sizeof(u64_t));
-
-    obj_p indices = I64(len);
-    i64_t* ov = AS_I64(indices);
-
-    // Count occurrences (reversed: max goes to bucket 0, min to bucket range-1)
-    for (i = 0; i < len; i++) {
-        if (iv[i] != NULL_I32)
-            pos[max_val - iv[i] + 1]++;
+        if (iv[i] != NULL_I32) {
+            i64_t bucket = asc ? (iv[i] - min_val) : (max_val - iv[i]);
+            pos[bucket + 1]++;
+        }
     }
 
     // Prefix sum
+    if (asc) pos[0] = null_count;
     for (i = 1; i <= range; i++)
         pos[i] += pos[i - 1];
 
-    // Scatter (NULLs to end, others before)
+    // Scatter
     for (i = 0; i < len; i++) {
         if (iv[i] == NULL_I32)
             ov[null_idx++] = i;
-        else
-            ov[pos[max_val - iv[i]]++] = i;
+        else {
+            i64_t bucket = asc ? (iv[i] - min_val) : (max_val - iv[i]);
+            ov[pos[bucket]++] = i;
+        }
     }
 
     drop_obj(pos_obj);
     return indices;
 }
 
-// Radix sort 8-bit for i32 (4 passes, ascending)
-static obj_p radix8_sort_asc_i32(obj_p vec) {
+// Radix sort 8-bit for i32 (4 passes)
+static obj_p radix8_sort_i32(obj_p vec, i64_t asc) {
     i64_t i, len = vec->len;
     i32_t* iv = AS_I32(vec);
     obj_p temp1 = I64(len);
@@ -642,29 +606,30 @@ static obj_p radix8_sort_asc_i32(obj_p vec) {
     i64_t* t1 = AS_I64(temp1);
     i64_t* t2 = AS_I64(temp2);
     u64_t pos[257];
+    u32_t mask = asc ? 0 : 255;
 
     // Pass 1: bits 0-7
     memset(pos, 0, sizeof(pos));
     for (i = 0; i < len; i++) {
         u32_t v = (u32_t)iv[i] ^ 0x80000000;
-        pos[(v & 0xff) + 1]++;
+        pos[(mask ^ (v & 0xff)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u32_t v = (u32_t)iv[i] ^ 0x80000000;
-        t1[pos[v & 0xff]++] = i;
+        t1[pos[mask ^ (v & 0xff)]++] = i;
     }
 
     // Pass 2: bits 8-15
     memset(pos, 0, sizeof(pos));
     for (i = 0; i < len; i++) {
         u32_t v = (u32_t)iv[t1[i]] ^ 0x80000000;
-        pos[((v >> 8) & 0xff) + 1]++;
+        pos[(mask ^ ((v >> 8) & 0xff)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u32_t v = (u32_t)iv[t1[i]] ^ 0x80000000;
-        t2[pos[(v >> 8) & 0xff]++] = t1[i];
+        t2[pos[mask ^ ((v >> 8) & 0xff)]++] = t1[i];
     }
 
     // Pass 3: bits 16-23
@@ -674,24 +639,24 @@ static obj_p radix8_sort_asc_i32(obj_p vec) {
 
     for (i = 0; i < len; i++) {
         u32_t v = (u32_t)iv[t2[i]] ^ 0x80000000;
-        pos[((v >> 16) & 0xff) + 1]++;
+        pos[(mask ^ ((v >> 16) & 0xff)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u32_t v = (u32_t)iv[t2[i]] ^ 0x80000000;
-        t1[pos[(v >> 16) & 0xff]++] = t2[i];
+        t1[pos[mask ^ ((v >> 16) & 0xff)]++] = t2[i];
     }
 
     // Pass 4: bits 24-31
     memset(pos, 0, sizeof(pos));
     for (i = 0; i < len; i++) {
         u32_t v = (u32_t)iv[t1[i]] ^ 0x80000000;
-        pos[(v >> 24) + 1]++;
+        pos[(mask ^ (v >> 24)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u32_t v = (u32_t)iv[t1[i]] ^ 0x80000000;
-        ov[pos[v >> 24]++] = t1[i];
+        ov[pos[mask ^ (v >> 24)]++] = t1[i];
     }
 
     drop_obj(temp1);
@@ -699,79 +664,13 @@ static obj_p radix8_sort_asc_i32(obj_p vec) {
     return indices;
 }
 
-// Radix sort 8-bit for i32 (4 passes, descending)
-static obj_p radix8_sort_desc_i32(obj_p vec) {
-    i64_t i, len = vec->len;
-    i32_t* iv = AS_I32(vec);
-    obj_p temp1 = I64(len);
-    obj_p temp2 = I64(len);
-    i64_t* t1 = AS_I64(temp1);
-    i64_t* t2 = AS_I64(temp2);
-
-    u64_t pos[257];
-
-    // Pass 1: bits 0-7 (descending: 255-x)
-    memset(pos, 0, sizeof(pos));
-    for (i = 0; i < len; i++) {
-        u32_t v = (u32_t)iv[i] ^ 0x80000000;
-        pos[(255 - (v & 0xff)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u32_t v = (u32_t)iv[i] ^ 0x80000000;
-        t1[pos[255 - (v & 0xff)]++] = i;
-    }
-
-    // Pass 2: bits 8-15
-    memset(pos, 0, sizeof(pos));
-    for (i = 0; i < len; i++) {
-        u32_t v = (u32_t)iv[t1[i]] ^ 0x80000000;
-        pos[(255 - ((v >> 8) & 0xff)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u32_t v = (u32_t)iv[t1[i]] ^ 0x80000000;
-        t2[pos[255 - ((v >> 8) & 0xff)]++] = t1[i];
-    }
-
-    // Pass 3: bits 16-23
-    memset(pos, 0, sizeof(pos));
-    obj_p indices = I64(len);
-    i64_t* ov = AS_I64(indices);
-
-    for (i = 0; i < len; i++) {
-        u32_t v = (u32_t)iv[t2[i]] ^ 0x80000000;
-        pos[(255 - ((v >> 16) & 0xff)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u32_t v = (u32_t)iv[t2[i]] ^ 0x80000000;
-        t1[pos[255 - ((v >> 16) & 0xff)]++] = t2[i];
-    }
-
-    // Pass 4: bits 24-31
-    memset(pos, 0, sizeof(pos));
-    for (i = 0; i < len; i++) {
-        u32_t v = (u32_t)iv[t1[i]] ^ 0x80000000;
-        pos[(255 - (v >> 24)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u32_t v = (u32_t)iv[t1[i]] ^ 0x80000000;
-        ov[pos[255 - (v >> 24)]++] = t1[i];
-    }
-
-    drop_obj(temp1);
-    drop_obj(temp2);
-    return indices;
-}
-
-// Radix sort 16-bit for i32 (2 passes, ascending) - current implementation
-static obj_p radix16_sort_asc_i32(obj_p vec) {
+// Radix sort 16-bit for i32 (2 passes)
+static obj_p radix16_sort_i32(obj_p vec, i64_t asc) {
     i64_t i, t, len = vec->len;
     obj_p temp = I64(len);
     i32_t* iv = AS_I32(vec);
     i64_t* ti = AS_I64(temp);
+    u32_t mask = asc ? 0 : 65535;
 
     obj_p pos1_obj = I64(65537);
     obj_p pos2_obj = I64(65537);
@@ -782,49 +681,8 @@ static obj_p radix16_sort_asc_i32(obj_p vec) {
 
     for (i = 0; i < len; i++) {
         t = (u32_t)iv[i] ^ 0x80000000;
-        pos1[(t & 0xffff) + 1]++;
-        pos2[(t >> 16) + 1]++;
-    }
-    for (i = 2; i <= 65536; i++) {
-        pos1[i] += pos1[i - 1];
-        pos2[i] += pos2[i - 1];
-    }
-    obj_p indices = I64(len);
-    i64_t* ov = AS_I64(indices);
-
-    for (i = 0; i < len; i++) {
-        t = (u32_t)iv[i];
-        ti[pos1[iv[i] & 0xffff]++] = i;
-    }
-    for (i = 0; i < len; i++) {
-        t = (u32_t)iv[ti[i]] ^ 0x80000000;
-        ov[pos2[t >> 16]++] = ti[i];
-    }
-
-    drop_obj(pos1_obj);
-    drop_obj(pos2_obj);
-    drop_obj(temp);
-    return indices;
-}
-
-// Radix sort 16-bit for i32 (2 passes, descending)
-static obj_p radix16_sort_desc_i32(obj_p vec) {
-    i64_t i, t, len = vec->len;
-    obj_p temp = I64(len);
-    i32_t* iv = AS_I32(vec);
-    i64_t* ti = AS_I64(temp);
-
-    obj_p pos1_obj = I64(65537);
-    obj_p pos2_obj = I64(65537);
-    u64_t* pos1 = (u64_t*)AS_I64(pos1_obj);
-    u64_t* pos2 = (u64_t*)AS_I64(pos2_obj);
-    memset(pos1, 0, 65537 * sizeof(u64_t));
-    memset(pos2, 0, 65537 * sizeof(u64_t));
-
-    for (i = 0; i < len; i++) {
-        t = (u32_t)iv[i] ^ 0x80000000;
-        pos1[(65535 - (t & 0xffff)) + 1]++;
-        pos2[(65535 - (t >> 16)) + 1]++;
+        pos1[(mask ^ (t & 0xffff)) + 1]++;
+        pos2[(mask ^ (t >> 16)) + 1]++;
     }
     for (i = 2; i <= 65536; i++) {
         pos1[i] += pos1[i - 1];
@@ -835,11 +693,11 @@ static obj_p radix16_sort_desc_i32(obj_p vec) {
 
     for (i = 0; i < len; i++) {
         t = (u32_t)iv[i] ^ 0x80000000;
-        ti[pos1[65535 - (t & 0xffff)]++] = i;
+        ti[pos1[mask ^ (t & 0xffff)]++] = i;
     }
     for (i = 0; i < len; i++) {
         t = (u32_t)iv[ti[i]] ^ 0x80000000;
-        ov[pos2[65535 - (t >> 16)]++] = ti[i];
+        ov[pos2[mask ^ (t >> 16)]++] = ti[i];
     }
 
     drop_obj(pos1_obj);
@@ -1210,18 +1068,18 @@ obj_p ray_sort_asc_i32(obj_p vec) {
     index_scope_t scope = index_scope_i32(AS_I32(vec), NULL, len);
 
     if (len < SMALL_VEC_THRESHOLD) {
-        if (scope.range <= COUNTING_SORT_MAX_RANGE_I32)
-            return counting_sort_asc_i32(vec, scope.min, scope.range, scope.null_count);
+        if (scope.range <= COUNTING_SORT_MAX_RANGE)
+            return counting_sort_i32(vec, scope.min, scope.range, scope.null_count, 1);
         else
-            return radix8_sort_asc_i32(vec);
+            return radix8_sort_i32(vec, 1);
     }
 
     i64_t n_workers = pool_get_executors_count(pool_get());
-    if (scope.range <= COUNTING_SORT_MAX_RANGE_I32 || scope.range <= len / n_workers) {
+    if (scope.range <= COUNTING_SORT_MAX_RANGE || scope.range <= len / n_workers) {
         return parallel_counting_sort_i32(vec, scope.min, scope.range, 1);
     } else {
         if (len < PARALLEL_RADIX_SORT_THRESHOLD)
-            return radix16_sort_asc_i32(vec);
+            return radix16_sort_i32(vec, 1);
         else
             return parallel_radix16_sort_i32(vec, 1);
     }
@@ -1231,7 +1089,7 @@ obj_p ray_sort_asc_i32(obj_p vec) {
 // I64 Counting Sort (with scope parameters)
 // ============================================================================
 
-static obj_p counting_sort_asc_i64(obj_p vec, i64_t min_val, i64_t range, i64_t null_count) {
+static obj_p counting_sort_i64(obj_p vec, i64_t min_val, i64_t range, i64_t null_count, i64_t asc) {
     i64_t len = vec->len;
     i64_t* data = AS_I64(vec);
     i64_t non_null_count = len - null_count;
@@ -1248,11 +1106,20 @@ static obj_p counting_sort_asc_i64(obj_p vec, i64_t min_val, i64_t range, i64_t 
     }
 
     // Compute prefix sum
-    i64_t acc = null_count;  // NULLs go first in ascending
-    for (i64_t b = 0; b < range; b++) {
-        i64_t cnt = counts[b];
-        counts[b] = acc;
-        acc += cnt;
+    if (asc) {
+        i64_t acc = null_count;  // NULLs go first in ascending
+        for (i64_t b = 0; b < range; b++) {
+            i64_t cnt = counts[b];
+            counts[b] = acc;
+            acc += cnt;
+        }
+    } else {
+        i64_t acc = 0;
+        for (i64_t b = range - 1; b >= 0; b--) {
+            i64_t cnt = counts[b];
+            counts[b] = acc;
+            acc += cnt;
+        }
     }
 
     obj_p indices = I64(len);
@@ -1262,52 +1129,8 @@ static obj_p counting_sort_asc_i64(obj_p vec, i64_t min_val, i64_t range, i64_t 
     }
     i64_t* result = AS_I64(indices);
 
-    // Place NULLs first
-    i64_t null_pos = 0;
-    for (i64_t i = 0; i < len; i++) {
-        if (data[i] == NULL_I64)
-            result[null_pos++] = i;
-        else
-            result[counts[data[i] - min_val]++] = i;
-    }
-
-    drop_obj(counts_obj);
-    return indices;
-}
-
-static obj_p counting_sort_desc_i64(obj_p vec, i64_t min_val, i64_t range, i64_t null_count) {
-    i64_t len = vec->len;
-    i64_t* data = AS_I64(vec);
-    i64_t non_null_count = len - null_count;
-
-    obj_p counts_obj = I64(range);
-    if (IS_ERR(counts_obj)) return counts_obj;
-    i64_t* counts = AS_I64(counts_obj);
-    memset(counts, 0, range * sizeof(i64_t));
-
-    // Count occurrences (skip NULLs)
-    for (i64_t i = 0; i < len; i++) {
-        if (data[i] != NULL_I64)
-            counts[data[i] - min_val]++;
-    }
-
-    // Compute prefix sum (descending)
-    i64_t acc = 0;
-    for (i64_t b = range - 1; b >= 0; b--) {
-        i64_t cnt = counts[b];
-        counts[b] = acc;
-        acc += cnt;
-    }
-
-    obj_p indices = I64(len);
-    if (IS_ERR(indices)) {
-        drop_obj(counts_obj);
-        return indices;
-    }
-    i64_t* result = AS_I64(indices);
-
-    // Place values (NULLs go last in descending)
-    i64_t null_pos = non_null_count;
+    // Place NULLs and values
+    i64_t null_pos = asc ? 0 : non_null_count;
     for (i64_t i = 0; i < len; i++) {
         if (data[i] == NULL_I64)
             result[null_pos++] = i;
@@ -1323,7 +1146,7 @@ static obj_p counting_sort_desc_i64(obj_p vec, i64_t min_val, i64_t range, i64_t
 // I64 Radix Sort 8-bit (8 passes, for small vectors)
 // ============================================================================
 
-static obj_p radix8_sort_asc_i64(obj_p vec) {
+static obj_p radix8_sort_i64(obj_p vec, i64_t asc) {
     i64_t i, len = vec->len;
     i64_t* iv = AS_I64(vec);
     obj_p temp1 = I64(len);
@@ -1331,89 +1154,90 @@ static obj_p radix8_sort_asc_i64(obj_p vec) {
     i64_t* t1 = AS_I64(temp1);
     i64_t* t2 = AS_I64(temp2);
     u64_t pos[257];
+    u64_t mask = asc ? 0 : 255;
 
     // Pass 1: bits 0-7
     memset(pos, 0, sizeof(pos));
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[i] ^ 0x8000000000000000ULL;
-        pos[(v & 0xff) + 1]++;
+        pos[(mask ^ (v & 0xff)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[i] ^ 0x8000000000000000ULL;
-        t1[pos[v & 0xff]++] = i;
+        t1[pos[mask ^ (v & 0xff)]++] = i;
     }
 
     // Pass 2: bits 8-15
     memset(pos, 0, sizeof(pos));
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        pos[((v >> 8) & 0xff) + 1]++;
+        pos[(mask ^ ((v >> 8) & 0xff)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        t2[pos[(v >> 8) & 0xff]++] = t1[i];
+        t2[pos[mask ^ ((v >> 8) & 0xff)]++] = t1[i];
     }
 
     // Pass 3: bits 16-23
     memset(pos, 0, sizeof(pos));
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        pos[((v >> 16) & 0xff) + 1]++;
+        pos[(mask ^ ((v >> 16) & 0xff)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        t1[pos[(v >> 16) & 0xff]++] = t2[i];
+        t1[pos[mask ^ ((v >> 16) & 0xff)]++] = t2[i];
     }
 
     // Pass 4: bits 24-31
     memset(pos, 0, sizeof(pos));
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        pos[((v >> 24) & 0xff) + 1]++;
+        pos[(mask ^ ((v >> 24) & 0xff)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        t2[pos[(v >> 24) & 0xff]++] = t1[i];
+        t2[pos[mask ^ ((v >> 24) & 0xff)]++] = t1[i];
     }
 
     // Pass 5: bits 32-39
     memset(pos, 0, sizeof(pos));
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        pos[((v >> 32) & 0xff) + 1]++;
+        pos[(mask ^ ((v >> 32) & 0xff)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        t1[pos[(v >> 32) & 0xff]++] = t2[i];
+        t1[pos[mask ^ ((v >> 32) & 0xff)]++] = t2[i];
     }
 
     // Pass 6: bits 40-47
     memset(pos, 0, sizeof(pos));
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        pos[((v >> 40) & 0xff) + 1]++;
+        pos[(mask ^ ((v >> 40) & 0xff)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        t2[pos[(v >> 40) & 0xff]++] = t1[i];
+        t2[pos[mask ^ ((v >> 40) & 0xff)]++] = t1[i];
     }
 
     // Pass 7: bits 48-55
     memset(pos, 0, sizeof(pos));
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        pos[((v >> 48) & 0xff) + 1]++;
+        pos[(mask ^ ((v >> 48) & 0xff)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        t1[pos[(v >> 48) & 0xff]++] = t2[i];
+        t1[pos[mask ^ ((v >> 48) & 0xff)]++] = t2[i];
     }
 
     // Pass 8: bits 56-63
@@ -1422,124 +1246,12 @@ static obj_p radix8_sort_asc_i64(obj_p vec) {
     i64_t* ov = AS_I64(indices);
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        pos[(v >> 56) + 1]++;
+        pos[(mask ^ (v >> 56)) + 1]++;
     }
     for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
     for (i = 0; i < len; i++) {
         u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        ov[pos[v >> 56]++] = t1[i];
-    }
-
-    drop_obj(temp1);
-    drop_obj(temp2);
-    return indices;
-}
-
-static obj_p radix8_sort_desc_i64(obj_p vec) {
-    i64_t i, len = vec->len;
-    i64_t* iv = AS_I64(vec);
-    obj_p temp1 = I64(len);
-    obj_p temp2 = I64(len);
-    i64_t* t1 = AS_I64(temp1);
-    i64_t* t2 = AS_I64(temp2);
-    u64_t pos[257];
-
-    // Pass 1: bits 0-7 (descending)
-    memset(pos, 0, sizeof(pos));
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[i] ^ 0x8000000000000000ULL;
-        pos[(255 - (v & 0xff)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[i] ^ 0x8000000000000000ULL;
-        t1[pos[255 - (v & 0xff)]++] = i;
-    }
-
-    // Pass 2: bits 8-15
-    memset(pos, 0, sizeof(pos));
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        pos[(255 - ((v >> 8) & 0xff)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        t2[pos[255 - ((v >> 8) & 0xff)]++] = t1[i];
-    }
-
-    // Pass 3: bits 16-23
-    memset(pos, 0, sizeof(pos));
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        pos[(255 - ((v >> 16) & 0xff)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        t1[pos[255 - ((v >> 16) & 0xff)]++] = t2[i];
-    }
-
-    // Pass 4: bits 24-31
-    memset(pos, 0, sizeof(pos));
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        pos[(255 - ((v >> 24) & 0xff)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        t2[pos[255 - ((v >> 24) & 0xff)]++] = t1[i];
-    }
-
-    // Pass 5: bits 32-39
-    memset(pos, 0, sizeof(pos));
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        pos[(255 - ((v >> 32) & 0xff)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        t1[pos[255 - ((v >> 32) & 0xff)]++] = t2[i];
-    }
-
-    // Pass 6: bits 40-47
-    memset(pos, 0, sizeof(pos));
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        pos[(255 - ((v >> 40) & 0xff)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        t2[pos[255 - ((v >> 40) & 0xff)]++] = t1[i];
-    }
-
-    // Pass 7: bits 48-55
-    memset(pos, 0, sizeof(pos));
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        pos[(255 - ((v >> 48) & 0xff)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t2[i]] ^ 0x8000000000000000ULL;
-        t1[pos[255 - ((v >> 48) & 0xff)]++] = t2[i];
-    }
-
-    // Pass 8: bits 56-63
-    memset(pos, 0, sizeof(pos));
-    obj_p indices = I64(len);
-    i64_t* ov = AS_I64(indices);
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        pos[(255 - (v >> 56)) + 1]++;
-    }
-    for (i = 2; i <= 256; i++) pos[i] += pos[i - 1];
-    for (i = 0; i < len; i++) {
-        u64_t v = (u64_t)iv[t1[i]] ^ 0x8000000000000000ULL;
-        ov[pos[255 - (v >> 56)]++] = t1[i];
+        ov[pos[mask ^ (v >> 56)]++] = t1[i];
     }
 
     drop_obj(temp1);
@@ -1551,13 +1263,14 @@ static obj_p radix8_sort_desc_i64(obj_p vec) {
 // I64 Radix Sort 16-bit (4 passes, for medium vectors)
 // ============================================================================
 
-static obj_p radix16_sort_asc_i64(obj_p vec) {
+static obj_p radix16_sort_i64(obj_p vec, i64_t asc) {
     i64_t i, len = vec->len;
     obj_p indices = I64(len);
     obj_p temp = I64(len);
     i64_t* ov = AS_I64(indices);
     i64_t* iv = AS_I64(vec);
     i64_t* t = AS_I64(temp);
+    u64_t mask = asc ? 0 : 65535;
 
     // Single histogram allocation for better cache locality
     obj_p hist_obj = I64(65537 * 4);
@@ -1574,10 +1287,10 @@ static obj_p radix16_sort_asc_i64(obj_p vec) {
         if (i + PREFETCH_DIST < len)
             __builtin_prefetch(&iv[i + PREFETCH_DIST], 0, 0);
         u64_t u = iv[i] ^ 0x8000000000000000ULL;
-        pos1[(u & 0xffff) + 1]++;
-        pos2[((u >> 16) & 0xffff) + 1]++;
-        pos3[((u >> 32) & 0xffff) + 1]++;
-        pos4[(u >> 48) + 1]++;
+        pos1[(mask ^ (u & 0xffff)) + 1]++;
+        pos2[(mask ^ ((u >> 16) & 0xffff)) + 1]++;
+        pos3[(mask ^ ((u >> 32) & 0xffff)) + 1]++;
+        pos4[(mask ^ (u >> 48)) + 1]++;
     }
 
     // Calculate cumulative positions
@@ -1591,7 +1304,7 @@ static obj_p radix16_sort_asc_i64(obj_p vec) {
     // Pass 1: sort by least significant 16 bits
     for (i = 0; i < len; i++) {
         u64_t u = iv[i] ^ 0x8000000000000000ULL;
-        t[pos1[u & 0xffff]++] = i;
+        t[pos1[mask ^ (u & 0xffff)]++] = i;
     }
 
     // Pass 2: sort by second 16-bit chunk (with prefetch for indirect access)
@@ -1599,7 +1312,7 @@ static obj_p radix16_sort_asc_i64(obj_p vec) {
         if (i + PREFETCH_DIST < len)
             __builtin_prefetch(&iv[t[i + PREFETCH_DIST]], 0, 0);
         u64_t u = iv[t[i]] ^ 0x8000000000000000ULL;
-        ov[pos2[(u >> 16) & 0xffff]++] = t[i];
+        ov[pos2[mask ^ ((u >> 16) & 0xffff)]++] = t[i];
     }
 
     // Pass 3: sort by third 16-bit chunk (with prefetch)
@@ -1607,7 +1320,7 @@ static obj_p radix16_sort_asc_i64(obj_p vec) {
         if (i + PREFETCH_DIST < len)
             __builtin_prefetch(&iv[ov[i + PREFETCH_DIST]], 0, 0);
         u64_t u = iv[ov[i]] ^ 0x8000000000000000ULL;
-        t[pos3[(u >> 32) & 0xffff]++] = ov[i];
+        t[pos3[mask ^ ((u >> 32) & 0xffff)]++] = ov[i];
     }
 
     // Pass 4: sort by most significant 16 bits (with prefetch)
@@ -1615,79 +1328,7 @@ static obj_p radix16_sort_asc_i64(obj_p vec) {
         if (i + PREFETCH_DIST < len)
             __builtin_prefetch(&iv[t[i + PREFETCH_DIST]], 0, 0);
         u64_t u = iv[t[i]] ^ 0x8000000000000000ULL;
-        ov[pos4[u >> 48]++] = t[i];
-    }
-    #undef PREFETCH_DIST
-
-    drop_obj(hist_obj);
-    drop_obj(temp);
-    return indices;
-}
-
-static obj_p radix16_sort_desc_i64(obj_p vec) {
-    i64_t i, len = vec->len;
-    obj_p indices = I64(len);
-    obj_p temp = I64(len);
-    i64_t* ov = AS_I64(indices);
-    i64_t* iv = AS_I64(vec);
-    i64_t* t = AS_I64(temp);
-
-    // Single histogram allocation for better cache locality
-    obj_p hist_obj = I64(65537 * 4);
-    u64_t* hist = (u64_t*)AS_I64(hist_obj);
-    u64_t* pos1 = hist;
-    u64_t* pos2 = hist + 65537;
-    u64_t* pos3 = hist + 65537 * 2;
-    u64_t* pos4 = hist + 65537 * 3;
-    memset(hist, 0, 65537 * 4 * sizeof(u64_t));
-
-    // Count occurrences with prefetching (descending order)
-    #define PREFETCH_DIST 16
-    for (i = 0; i < len; i++) {
-        if (i + PREFETCH_DIST < len)
-            __builtin_prefetch(&iv[i + PREFETCH_DIST], 0, 0);
-        u64_t u = iv[i] ^ 0x8000000000000000ULL;
-        pos1[(65535 - (u & 0xffff)) + 1]++;
-        pos2[(65535 - ((u >> 16) & 0xffff)) + 1]++;
-        pos3[(65535 - ((u >> 32) & 0xffff)) + 1]++;
-        pos4[(65535 - (u >> 48)) + 1]++;
-    }
-
-    for (i = 2; i <= 65536; i++) {
-        pos1[i] += pos1[i - 1];
-        pos2[i] += pos2[i - 1];
-        pos3[i] += pos3[i - 1];
-        pos4[i] += pos4[i - 1];
-    }
-
-    // Pass 1
-    for (i = 0; i < len; i++) {
-        u64_t u = iv[i] ^ 0x8000000000000000ULL;
-        t[pos1[65535 - (u & 0xffff)]++] = i;
-    }
-
-    // Pass 2 (with prefetch)
-    for (i = 0; i < len; i++) {
-        if (i + PREFETCH_DIST < len)
-            __builtin_prefetch(&iv[t[i + PREFETCH_DIST]], 0, 0);
-        u64_t u = iv[t[i]] ^ 0x8000000000000000ULL;
-        ov[pos2[65535 - ((u >> 16) & 0xffff)]++] = t[i];
-    }
-
-    // Pass 3 (with prefetch)
-    for (i = 0; i < len; i++) {
-        if (i + PREFETCH_DIST < len)
-            __builtin_prefetch(&iv[ov[i + PREFETCH_DIST]], 0, 0);
-        u64_t u = iv[ov[i]] ^ 0x8000000000000000ULL;
-        t[pos3[65535 - ((u >> 32) & 0xffff)]++] = ov[i];
-    }
-
-    // Pass 4 (with prefetch)
-    for (i = 0; i < len; i++) {
-        if (i + PREFETCH_DIST < len)
-            __builtin_prefetch(&iv[t[i + PREFETCH_DIST]], 0, 0);
-        u64_t u = iv[t[i]] ^ 0x8000000000000000ULL;
-        ov[pos4[65535 - (u >> 48)]++] = t[i];
+        ov[pos4[mask ^ (u >> 48)]++] = t[i];
     }
     #undef PREFETCH_DIST
 
@@ -2050,18 +1691,18 @@ obj_p ray_sort_asc_i64(obj_p vec) {
     index_scope_t scope = index_scope_i64(AS_I64(vec), NULL, len);
 
     if (len < SMALL_VEC_THRESHOLD) {
-        if (scope.range <= COUNTING_SORT_MAX_RANGE_I64)
-            return counting_sort_asc_i64(vec, scope.min, scope.range, scope.null_count);
+        if (scope.range <= COUNTING_SORT_MAX_RANGE)
+            return counting_sort_i64(vec, scope.min, scope.range, scope.null_count, 1);
         else
-            return radix8_sort_asc_i64(vec);
+            return radix8_sort_i64(vec, 1);
     }
 
     i64_t n_workers = pool_get_executors_count(pool_get());
-    if (scope.range <= COUNTING_SORT_MAX_RANGE_I64 || scope.range <= len / n_workers) {
+    if (scope.range <= COUNTING_SORT_MAX_RANGE || scope.range <= len / n_workers) {
         return parallel_counting_sort_i64(vec, scope.min, scope.range, 1);
     } else {
-        if (len < PARALLEL_RADIX_SORT_THRESHOLD)
-            return radix16_sort_asc_i64(vec);
+        if (len < PARALLEL_RADIX_SORT_THRESHOLD * 2)
+            return radix16_sort_i64(vec, 1);
         else
             return parallel_radix16_sort_i64(vec, 1);
     }
@@ -2200,7 +1841,7 @@ obj_p ray_sort_desc_u8(obj_p vec) {
     i64_t i, len = vec->len;
     u8_t* iv = AS_U8(vec);
 
-    if (len >= PARALLEL_SORT_THRESHOLD_U8)
+    if (len >= SMALL_VEC_THRESHOLD)
         return parallel_counting_sort_u8(vec, -1);
 
     obj_p indices = I64(len);
@@ -2285,18 +1926,18 @@ obj_p ray_sort_desc_i32(obj_p vec) {
     index_scope_t scope = index_scope_i32(AS_I32(vec), NULL, len);
 
     if (len < SMALL_VEC_THRESHOLD) {
-        if (scope.range <= COUNTING_SORT_MAX_RANGE_I32)
-            return counting_sort_desc_i32(vec, scope.min, scope.range, scope.null_count);
+        if (scope.range <= COUNTING_SORT_MAX_RANGE)
+            return counting_sort_i32(vec, scope.min, scope.range, scope.null_count, 0);
         else
-            return radix8_sort_desc_i32(vec);
+            return radix8_sort_i32(vec, 0);
     }
 
     i64_t n_workers = pool_get_executors_count(pool_get());
-    if (scope.range <= COUNTING_SORT_MAX_RANGE_I32 || scope.range <= len / n_workers) {
+    if (scope.range <= COUNTING_SORT_MAX_RANGE || scope.range <= len / n_workers) {
         return parallel_counting_sort_i32(vec, scope.min, scope.range, 0);
     } else {
         if (len < PARALLEL_RADIX_SORT_THRESHOLD)
-            return radix16_sort_desc_i32(vec);
+            return radix16_sort_i32(vec, 0);
         else
             return parallel_radix16_sort_i32(vec, 0);
     }
@@ -2307,18 +1948,18 @@ obj_p ray_sort_desc_i64(obj_p vec) {
     index_scope_t scope = index_scope_i64(AS_I64(vec), NULL, len);
 
     if (len < SMALL_VEC_THRESHOLD) {
-        if (scope.range <= COUNTING_SORT_MAX_RANGE_I64)
-            return counting_sort_desc_i64(vec, scope.min, scope.range, scope.null_count);
+        if (scope.range <= COUNTING_SORT_MAX_RANGE)
+            return counting_sort_i64(vec, scope.min, scope.range, scope.null_count, 0);
         else
-            return radix8_sort_desc_i64(vec);
+            return radix8_sort_i64(vec, 0);
     }
 
     i64_t n_workers = pool_get_executors_count(pool_get());
-    if (scope.range <= COUNTING_SORT_MAX_RANGE_I64 || scope.range <= len / n_workers) {
+    if (scope.range <= COUNTING_SORT_MAX_RANGE || scope.range <= len / n_workers) {
         return parallel_counting_sort_i64(vec, scope.min, scope.range, 0);
     } else {
-        if (len < PARALLEL_RADIX_SORT_THRESHOLD)
-            return radix16_sort_desc_i64(vec);
+        if (len < PARALLEL_RADIX_SORT_THRESHOLD * 2)
+            return radix16_sort_i64(vec, 0);
         else
             return parallel_radix16_sort_i64(vec, 0);
     }
@@ -2501,8 +2142,8 @@ static void binary_insertion_sort_numeric(i64_t* indices, i64_t* data, i64_t len
     }
 }
 
-// General counting sort for integer vectors when range is reasonable
-static obj_p counting_sort_i64(obj_p vec, i64_t asc) {
+// General counting sort for symbol vectors when range is reasonable
+static obj_p counting_sort_symbols(obj_p vec, i64_t asc) {
     i64_t len = vec->len;
     if (len == 0)
         return I64(0);
@@ -2617,12 +2258,12 @@ static obj_p optimized_sort(obj_p vec, i64_t asc) {
         }
     }
 
-    // For larger arrays: try counting sort first for integer types
+    // For larger arrays: try counting sort first for symbol types
     switch (vec->type) {
         case TYPE_I64:
         case TYPE_TIME:
         case TYPE_SYMBOL:
-            res = counting_sort_i64(vec, asc);
+            res = counting_sort_symbols(vec, asc);
             if (res)
                 return res;
             break;
