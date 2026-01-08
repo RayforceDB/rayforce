@@ -34,6 +34,7 @@
 #include "def.h"
 
 const i64_t MAX_RANGE = 1 << 20;
+const i64_t INDEX_SCOPE_PARALLEL_THRESHOLD = 128 * 1024;
 
 u64_t __hash_get(i64_t row, raw_p seed) {
     __index_find_ctx_t *ctx = (__index_find_ctx_t *)seed;
@@ -220,6 +221,8 @@ nil_t __index_list_precalc_hash(obj_p cols, i64_t out[], i64_t ncols, i64_t nrow
     pool = pool_get();
     chunks = pool_split_by(pool, nrows, 0);
     base_chunk = pool_chunk_aligned(nrows, chunks, sizeof(i64_t));
+    // Recalculate chunks to ensure (chunks-1)*base_chunk < nrows
+    chunks = (nrows + base_chunk - 1) / base_chunk;
 
     // init hashes
     for (i = 0; i < nrows; i++)
@@ -247,126 +250,204 @@ nil_t index_hash_obj(obj_p obj, i64_t out[], i64_t filter[], i64_t len, b8_t res
     index_hash_obj_partial(obj, out, filter, len, 0, resolve);
 }
 
-obj_p index_scope_partial_i32(i64_t len, i32_t *values, i64_t *indices, i64_t offset, i64_t *pmin, i64_t *pmax) {
-    i32_t min, max;
-    i64_t i, l;
+obj_p index_scope_partial_i32(i64_t len, i32_t *values, i64_t *indices, i64_t offset, i64_t *pmin, i64_t *pmax,
+                              i64_t *pnull_count) {
+    i32_t min, max, val;
+    i64_t i, l, null_count = 0;
+    b8_t has_value = B8_FALSE;
 
     l = len + offset;
 
     if (indices) {
-        min = max = values[indices[offset]];
         for (i = offset; i < l; i++) {
-            min = values[indices[i]] < min ? values[indices[i]] : min;
-            max = values[indices[i]] > max ? values[indices[i]] : max;
+            val = values[indices[i]];
+            if (val == NULL_I32) {
+                null_count++;
+                continue;
+            }
+            if (!has_value) {
+                min = max = val;
+                has_value = B8_TRUE;
+            } else {
+                min = val < min ? val : min;
+                max = val > max ? val : max;
+            }
         }
     } else {
-        min = max = values[offset];
         for (i = offset; i < l; i++) {
-            min = values[i] < min ? values[i] : min;
-            max = values[i] > max ? values[i] : max;
+            val = values[i];
+            if (val == NULL_I32) {
+                null_count++;
+                continue;
+            }
+            if (!has_value) {
+                min = max = val;
+                has_value = B8_TRUE;
+            } else {
+                min = val < min ? val : min;
+                max = val > max ? val : max;
+            }
         }
     }
 
-    *pmin = min;
-    *pmax = max;
+    if (has_value) {
+        *pmin = min;
+        *pmax = max;
+    } else {
+        *pmin = NULL_I64;
+        *pmax = NULL_I64;
+    }
+    *pnull_count = null_count;
 
     return NULL_OBJ;
 }
 
 index_scope_t index_scope_i32(i32_t values[], i64_t indices[], i64_t len) {
     i64_t i, chunks, base_chunk;
-    i64_t min, max;
+    i64_t min, max, null_count, total_null_count = 0;
     pool_p pool = pool_get();
     obj_p v;
 
     if (len == 0)
-        return (index_scope_t){NULL_I64, NULL_I64, 0};
+        return (index_scope_t){NULL_I64, NULL_I64, 0, 0};
 
-    chunks = pool_split_by(pool, len, 0);
+    chunks = len < INDEX_SCOPE_PARALLEL_THRESHOLD ? 1 : pool_split_by(pool, len, 0);
     base_chunk = pool_chunk_aligned(len, chunks, sizeof(i32_t));
+    chunks = (len + base_chunk - 1) / base_chunk;
 
-    if (chunks == 1)
-        index_scope_partial_i32(len, values, indices, 0, &min, &max);
-    else {
+    if (chunks == 1) {
+        index_scope_partial_i32(len, values, indices, 0, &min, &max, &null_count);
+        total_null_count = null_count;
+    } else {
         i64_t mins[chunks];
         i64_t maxs[chunks];
+        i64_t null_counts[chunks];
         pool_prepare(pool);
         for (i = 0; i < chunks - 1; i++)
-            pool_add_task(pool, (raw_p)index_scope_partial_i32, 6, base_chunk, values, indices, i * base_chunk,
-                          &mins[i], &maxs[i]);
-        pool_add_task(pool, (raw_p)index_scope_partial_i32, 6, len - (chunks - 1) * base_chunk, values, indices,
-                      (chunks - 1) * base_chunk, &mins[chunks - 1], &maxs[chunks - 1]);
+            pool_add_task(pool, (raw_p)index_scope_partial_i32, 7, base_chunk, values, indices, i * base_chunk,
+                          &mins[i], &maxs[i], &null_counts[i]);
+        pool_add_task(pool, (raw_p)index_scope_partial_i32, 7, len - (chunks - 1) * base_chunk, values, indices,
+                      (chunks - 1) * base_chunk, &mins[chunks - 1], &maxs[chunks - 1], &null_counts[chunks - 1]);
         v = pool_run(pool);
         drop_obj(v);
-        min = max = mins[0];
+        min = NULL_I64;
+        max = NULL_I64;
         for (i = 0; i < chunks; i++) {
-            min = mins[i] < min ? mins[i] : min;
-            max = maxs[i] > max ? maxs[i] : max;
+            total_null_count += null_counts[i];
+            if (mins[i] != NULL_I64) {
+                if (min == NULL_I64) {
+                    min = mins[i];
+                    max = maxs[i];
+                } else {
+                    min = mins[i] < min ? mins[i] : min;
+                    max = maxs[i] > max ? maxs[i] : max;
+                }
+            }
         }
     }
-    timeit_tick("index scope");
-    return (index_scope_t){min, max, (i64_t)(max - min + 1)};
+    if (max == NULL_I64)
+        return (index_scope_t){NULL_I64, NULL_I64, 0, total_null_count};
+    return (index_scope_t){min, max, (i64_t)(max - min + 1), total_null_count};
 }
 
-obj_p index_scope_partial_i64(i64_t len, i64_t *values, i64_t *indices, i64_t offset, i64_t *pmin, i64_t *pmax) {
-    i64_t min, max;
-    i64_t i, l;
+obj_p index_scope_partial_i64(i64_t len, i64_t *values, i64_t *indices, i64_t offset, i64_t *pmin, i64_t *pmax,
+                              i64_t *pnull_count) {
+    i64_t min, max, val;
+    i64_t i, l, null_count = 0;
+    b8_t has_value = B8_FALSE;
 
     l = len + offset;
 
     if (indices) {
-        min = max = values[indices[offset]];
         for (i = offset; i < l; i++) {
-            min = values[indices[i]] < min ? values[indices[i]] : min;
-            max = values[indices[i]] > max ? values[indices[i]] : max;
+            val = values[indices[i]];
+            if (val == NULL_I64) {
+                null_count++;
+                continue;
+            }
+            if (!has_value) {
+                min = max = val;
+                has_value = B8_TRUE;
+            } else {
+                min = val < min ? val : min;
+                max = val > max ? val : max;
+            }
         }
     } else {
-        min = max = values[offset];
         for (i = offset; i < l; i++) {
-            min = values[i] < min ? values[i] : min;
-            max = values[i] > max ? values[i] : max;
+            val = values[i];
+            if (val == NULL_I64) {
+                null_count++;
+                continue;
+            }
+            if (!has_value) {
+                min = max = val;
+                has_value = B8_TRUE;
+            } else {
+                min = val < min ? val : min;
+                max = val > max ? val : max;
+            }
         }
     }
 
-    *pmin = min;
-    *pmax = max;
+    if (has_value) {
+        *pmin = min;
+        *pmax = max;
+    } else {
+        *pmin = NULL_I64;
+        *pmax = NULL_I64;
+    }
+    *pnull_count = null_count;
 
     return NULL_OBJ;
 }
 
 index_scope_t index_scope_i64(i64_t values[], i64_t indices[], i64_t len) {
     i64_t i, chunks, base_chunk;
-    i64_t min, max;
+    i64_t min, max, null_count, total_null_count = 0;
     pool_p pool = pool_get();
     obj_p v;
 
     if (len == 0)
-        return (index_scope_t){NULL_I64, NULL_I64, 0};
+        return (index_scope_t){NULL_I64, NULL_I64, 0, 0};
 
-    chunks = pool_split_by(pool, len, 0);
+    chunks = len < INDEX_SCOPE_PARALLEL_THRESHOLD ? 1 : pool_split_by(pool, len, 0);
     base_chunk = pool_chunk_aligned(len, chunks, sizeof(i64_t));
+    chunks = (len + base_chunk - 1) / base_chunk;
 
-    if (chunks == 1)
-        index_scope_partial_i64(len, values, indices, 0, &min, &max);
-    else {
+    if (chunks == 1) {
+        index_scope_partial_i64(len, values, indices, 0, &min, &max, &null_count);
+        total_null_count = null_count;
+    } else {
         i64_t mins[chunks];
         i64_t maxs[chunks];
+        i64_t null_counts[chunks];
         pool_prepare(pool);
         for (i = 0; i < chunks - 1; i++)
-            pool_add_task(pool, (raw_p)index_scope_partial_i64, 6, base_chunk, values, indices, i * base_chunk,
-                          &mins[i], &maxs[i]);
-        pool_add_task(pool, (raw_p)index_scope_partial_i64, 6, len - (chunks - 1) * base_chunk, values, indices,
-                      (chunks - 1) * base_chunk, &mins[chunks - 1], &maxs[chunks - 1]);
+            pool_add_task(pool, (raw_p)index_scope_partial_i64, 7, base_chunk, values, indices, i * base_chunk,
+                          &mins[i], &maxs[i], &null_counts[i]);
+        pool_add_task(pool, (raw_p)index_scope_partial_i64, 7, len - (chunks - 1) * base_chunk, values, indices,
+                      (chunks - 1) * base_chunk, &mins[chunks - 1], &maxs[chunks - 1], &null_counts[chunks - 1]);
         v = pool_run(pool);
         drop_obj(v);
-        min = max = mins[0];
+        min = NULL_I64;
+        max = NULL_I64;
         for (i = 0; i < chunks; i++) {
-            min = mins[i] < min ? mins[i] : min;
-            max = maxs[i] > max ? maxs[i] : max;
+            total_null_count += null_counts[i];
+            if (mins[i] != NULL_I64) {
+                if (min == NULL_I64) {
+                    min = mins[i];
+                    max = maxs[i];
+                } else {
+                    min = mins[i] < min ? mins[i] : min;
+                    max = maxs[i] > max ? maxs[i] : max;
+                }
+            }
         }
     }
-    timeit_tick("index scope");
-    return (index_scope_t){min, max, (i64_t)(max - min + 1)};
+    if (max == NULL_I64)
+        return (index_scope_t){NULL_I64, NULL_I64, 0, total_null_count};
+    return (index_scope_t){min, max, (i64_t)(max - min + 1), total_null_count};
 }
 
 obj_p index_distinct_i8(i8_t values[], i64_t len) {
@@ -433,13 +514,22 @@ obj_p index_distinct_i32(i32_t values[], i64_t len) {
     obj_p vec, set;
     const index_scope_t scope = index_scope_i32(values, NULL, len);
 
+    // Handle case when all values are NULL
+    if (scope.range == 0) {
+        vec = I32(0);
+        vec->attrs |= ATTR_DISTINCT;
+        return vec;
+    }
+
     if (scope.range <= len || scope.range <= MAX_RANGE) {
         vec = I32(scope.range);
         out = AS_I32(vec);
         memset(out, 0, sizeof(i32_t) * scope.range);
 
-        for (i = 0; i < len; i++)
-            out[values[i] - scope.min] = 1;
+        for (i = 0; i < len; i++) {
+            if (values[i] != NULL_I32)
+                out[values[i] - scope.min] = 1;
+        }
 
         // compact values
         for (i = 0, j = 0; i < scope.range; i++) {
@@ -489,15 +579,23 @@ obj_p index_distinct_i64(i64_t values[], i64_t len) {
     obj_p vec, set;
     const index_scope_t scope = index_scope_i64(values, NULL, len);
 
+    // Handle case when all values are NULL
+    if (scope.range == 0) {
+        vec = I64(0);
+        vec->attrs |= ATTR_DISTINCT;
+        return vec;
+    }
+
     // use open addressing if range is small
     if (scope.range <= len || scope.range <= MAX_RANGE) {
         vec = I64(scope.range);
         out = AS_I64(vec);
         memset(out, 0, sizeof(i64_t) * scope.range);
 
-        for (i = 0; i < len; i++)
-            // TODO need bench // if (out[values[i] - scope.min] == 0)
-            out[values[i] - scope.min] = 1;
+        for (i = 0; i < len; i++) {
+            if (values[i] != NULL_I64)
+                out[values[i] - scope.min] = 1;
+        }
 
         // compact keys
         for (i = 0, j = 0; i < scope.range; i++) {
@@ -959,14 +1057,26 @@ obj_p index_in_i32_i32(i32_t x[], i64_t xl, i32_t y[], i64_t yl) {
     const index_scope_t scope_x = index_scope_i32(x, NULL, xl);
     const index_scope_t scope_y = index_scope_i32(y, NULL, yl);
 
-    min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
-    max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
+    // Check if y contains any NULLs
+    b8_t y_has_null = scope_y.null_count > 0;
 
     vec = B8(xl);
     r = AS_B8(vec);
 
+    // Handle case when all values in x or y are NULL
+    if (scope_x.range == 0 || scope_y.range == 0) {
+        for (i = 0; i < xl; i++)
+            r[i] = (x[i] == NULL_I32 && y_has_null) ? B8_TRUE : B8_FALSE;
+        return vec;
+    }
+
+    min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
+    max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
+
     if (min > max) {
-        memset(r, 0, xl);
+        // No overlapping non-NULL values, but NULLs might still match
+        for (i = 0; i < xl; i++)
+            r[i] = (x[i] == NULL_I32 && y_has_null) ? B8_TRUE : B8_FALSE;
         return vec;
     }
 
@@ -978,17 +1088,23 @@ obj_p index_in_i32_i32(i32_t x[], i64_t xl, i32_t y[], i64_t yl) {
         memset(s, 0, range);
 
         for (i = 0; i < yl; i++) {
-            val = y[i] - min;
-            if (val >= 0 && val < (i64_t)range)
-                s[val] = B8_TRUE;
+            if (y[i] != NULL_I32) {
+                val = y[i] - min;
+                if (val >= 0 && val < (i64_t)range)
+                    s[val] = B8_TRUE;
+            }
         }
 
         for (i = 0; i < xl; i++) {
-            val = x[i] - min;
-            if (val >= 0 && val < (i64_t)range)
-                r[i] = s[val];
-            else
-                r[i] = B8_FALSE;
+            if (x[i] == NULL_I32) {
+                r[i] = y_has_null ? B8_TRUE : B8_FALSE;
+            } else {
+                val = x[i] - min;
+                if (val >= 0 && val < (i64_t)range)
+                    r[i] = s[val];
+                else
+                    r[i] = B8_FALSE;
+            }
         }
 
         drop_obj(set);
@@ -1000,13 +1116,19 @@ obj_p index_in_i32_i32(i32_t x[], i64_t xl, i32_t y[], i64_t yl) {
     set = ht_oa_create(xl, -1);
 
     for (i = 0; i < yl; i++) {
-        val = ht_oa_tab_next(&set, (i64_t)y[i]);
-        AS_I64(AS_LIST(set)[0])[val] = (i64_t)y[i];
+        if (y[i] != NULL_I32) {
+            val = ht_oa_tab_next(&set, (i64_t)y[i]);
+            AS_I64(AS_LIST(set)[0])[val] = (i64_t)y[i];
+        }
     }
 
     for (i = 0; i < xl; i++) {
-        val = ht_oa_tab_get(set, (i64_t)x[i]);
-        r[i] = val != NULL_I64;
+        if (x[i] == NULL_I32) {
+            r[i] = y_has_null ? B8_TRUE : B8_FALSE;
+        } else {
+            val = ht_oa_tab_get(set, (i64_t)x[i]);
+            r[i] = val != NULL_I64;
+        }
     }
 
     drop_obj(set);
@@ -1026,14 +1148,25 @@ obj_p index_in_i32_i64(i32_t x[], i64_t xl, i64_t y[], i64_t yl) {
     const index_scope_t scope_x = index_scope_i32(x, NULL, xl);
     const index_scope_t scope_y = index_scope_i64(y, NULL, yl);
 
-    min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
-    max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
+    // Check if y contains any NULLs (NULL_I32 in x matches NULL_I64 in y)
+    b8_t y_has_null = scope_y.null_count > 0;
 
     vec = B8(xl);
     r = AS_B8(vec);
 
+    // Handle case when all values in x or y are NULL
+    if (scope_x.range == 0 || scope_y.range == 0) {
+        for (i = 0; i < xl; i++)
+            r[i] = (x[i] == NULL_I32 && y_has_null) ? B8_TRUE : B8_FALSE;
+        return vec;
+    }
+
+    min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
+    max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
+
     if (min > max) {
-        memset(r, 0, xl);
+        for (i = 0; i < xl; i++)
+            r[i] = (x[i] == NULL_I32 && y_has_null) ? B8_TRUE : B8_FALSE;
         return vec;
     }
 
@@ -1045,17 +1178,23 @@ obj_p index_in_i32_i64(i32_t x[], i64_t xl, i64_t y[], i64_t yl) {
         memset(s, 0, range);
 
         for (i = 0; i < yl; i++) {
-            val = y[i] - min;
-            if (val >= 0 && val < (i64_t)range)
-                s[val] = B8_TRUE;
+            if (y[i] != NULL_I64) {
+                val = y[i] - min;
+                if (val >= 0 && val < (i64_t)range)
+                    s[val] = B8_TRUE;
+            }
         }
 
         for (i = 0; i < xl; i++) {
-            val = x[i] - min;
-            if (val >= 0 && val < (i64_t)range)
-                r[i] = s[val];
-            else
-                r[i] = B8_FALSE;
+            if (x[i] == NULL_I32) {
+                r[i] = y_has_null ? B8_TRUE : B8_FALSE;
+            } else {
+                val = x[i] - min;
+                if (val >= 0 && val < (i64_t)range)
+                    r[i] = s[val];
+                else
+                    r[i] = B8_FALSE;
+            }
         }
 
         drop_obj(set);
@@ -1066,14 +1205,18 @@ obj_p index_in_i32_i64(i32_t x[], i64_t xl, i64_t y[], i64_t yl) {
     // otherwise, use a hash table
     set = ht_oa_create(xl, -1);
 
-    for (i = 0; i < yl; i++)
-        if (y[i] == NULL_I64)
-            AS_I64(AS_LIST(set)[0])[ht_oa_tab_next(&set, (i64_t)NULL_I32)] = (i64_t)NULL_I32;
-        else if (y[i] > (i64_t)NULL_I32 && y[i] <= (i64_t)INF_I32)
+    for (i = 0; i < yl; i++) {
+        if (y[i] != NULL_I64 && y[i] > (i64_t)NULL_I32 && y[i] <= (i64_t)INF_I32)
             AS_I64(AS_LIST(set)[0])[ht_oa_tab_next(&set, y[i])] = y[i];
+    }
 
-    for (i = 0; i < xl; i++)
-        r[i] = ht_oa_tab_get(set, (i64_t)x[i]) != NULL_I64;
+    for (i = 0; i < xl; i++) {
+        if (x[i] == NULL_I32) {
+            r[i] = y_has_null ? B8_TRUE : B8_FALSE;
+        } else {
+            r[i] = ht_oa_tab_get(set, (i64_t)x[i]) != NULL_I64;
+        }
+    }
 
     drop_obj(set);
 
@@ -1167,14 +1310,25 @@ obj_p index_in_i64_i32(i64_t x[], i64_t xl, i32_t y[], i64_t yl) {
     const index_scope_t scope_x = index_scope_i64(x, NULL, xl);
     const index_scope_t scope_y = index_scope_i32(y, NULL, yl);
 
-    min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
-    max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
+    // Check if y contains any NULLs (NULL_I64 in x matches NULL_I32 in y)
+    b8_t y_has_null = scope_y.null_count > 0;
 
     vec = B8(xl);
     r = AS_B8(vec);
 
+    // Handle case when all values in x or y are NULL
+    if (scope_x.range == 0 || scope_y.range == 0) {
+        for (i = 0; i < xl; i++)
+            r[i] = (x[i] == NULL_I64 && y_has_null) ? B8_TRUE : B8_FALSE;
+        return vec;
+    }
+
+    min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
+    max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
+
     if (min > max) {
-        memset(r, 0, xl);
+        for (i = 0; i < xl; i++)
+            r[i] = (x[i] == NULL_I64 && y_has_null) ? B8_TRUE : B8_FALSE;
         return vec;
     }
 
@@ -1186,17 +1340,23 @@ obj_p index_in_i64_i32(i64_t x[], i64_t xl, i32_t y[], i64_t yl) {
         memset(s, 0, range);
 
         for (i = 0; i < yl; i++) {
-            val = y[i] - min;
-            if (val >= 0 && val < (i64_t)range)
-                s[val] = B8_TRUE;
+            if (y[i] != NULL_I32) {
+                val = y[i] - min;
+                if (val >= 0 && val < (i64_t)range)
+                    s[val] = B8_TRUE;
+            }
         }
 
         for (i = 0; i < xl; i++) {
-            val = x[i] - min;
-            if (val >= 0 && val < (i64_t)range)
-                r[i] = s[val];
-            else
-                r[i] = B8_FALSE;
+            if (x[i] == NULL_I64) {
+                r[i] = y_has_null ? B8_TRUE : B8_FALSE;
+            } else {
+                val = x[i] - min;
+                if (val >= 0 && val < (i64_t)range)
+                    r[i] = s[val];
+                else
+                    r[i] = B8_FALSE;
+            }
         }
 
         drop_obj(set);
@@ -1207,16 +1367,20 @@ obj_p index_in_i64_i32(i64_t x[], i64_t xl, i32_t y[], i64_t yl) {
     // otherwise, use a hash table
     set = ht_oa_create(xl, -1);
 
-    for (i = 0; i < yl; i++)
-        AS_I64(AS_LIST(set)[0])[ht_oa_tab_next(&set, (i64_t)y[i])] = (i64_t)y[i];
+    for (i = 0; i < yl; i++) {
+        if (y[i] != NULL_I32)
+            AS_I64(AS_LIST(set)[0])[ht_oa_tab_next(&set, (i64_t)y[i])] = (i64_t)y[i];
+    }
 
-    for (i = 0; i < xl; i++)
-        if (x[i] == NULL_I64)
-            r[i] = ht_oa_tab_get(set, (i64_t)NULL_I32) != NULL_I64;
-        else if (x[i] > (i64_t)NULL_I32 && x[i] <= (i64_t)INF_I32)
+    for (i = 0; i < xl; i++) {
+        if (x[i] == NULL_I64) {
+            r[i] = y_has_null ? B8_TRUE : B8_FALSE;
+        } else if (x[i] > (i64_t)NULL_I32 && x[i] <= (i64_t)INF_I32) {
             r[i] = ht_oa_tab_get(set, x[i]) != NULL_I64;
-        else
+        } else {
             r[i] = B8_FALSE;
+        }
+    }
 
     drop_obj(set);
 
@@ -1228,7 +1392,6 @@ obj_p index_in_i64_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl) {
     i64_t val, min, max;
     obj_p vec, set;
     i8_t *s, *r;
-    b8_t nl = B8_FALSE;
 
     if (xl == 0)
         return B8(0);
@@ -1236,14 +1399,25 @@ obj_p index_in_i64_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl) {
     const index_scope_t scope_x = index_scope_i64(x, NULL, xl);
     const index_scope_t scope_y = index_scope_i64(y, NULL, yl);
 
-    min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
-    max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
+    // Check if y contains any NULLs
+    b8_t y_has_null = scope_y.null_count > 0;
 
     vec = B8(xl);
     r = AS_B8(vec);
 
+    // Handle case when all values in x or y are NULL
+    if (scope_x.range == 0 || scope_y.range == 0) {
+        for (i = 0; i < xl; i++)
+            r[i] = (x[i] == NULL_I64 && y_has_null) ? B8_TRUE : B8_FALSE;
+        return vec;
+    }
+
+    min = (scope_x.min > scope_y.min) ? scope_x.min : scope_y.min;
+    max = (scope_x.max < scope_y.max) ? scope_x.max : scope_y.max;
+
     if (min > max) {
-        memset(r, 0, xl);
+        for (i = 0; i < xl; i++)
+            r[i] = (x[i] == NULL_I64 && y_has_null) ? B8_TRUE : B8_FALSE;
         return vec;
     }
 
@@ -1257,17 +1431,23 @@ obj_p index_in_i64_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl) {
         memset(s, 0, range);
 
         for (i = 0; i < yl; i++) {
-            val = y[i] - min;
-            if (val >= 0 && val < (i64_t)range)
-                s[val] = B8_TRUE;
+            if (y[i] != NULL_I64) {
+                val = y[i] - min;
+                if (val >= 0 && val < (i64_t)range)
+                    s[val] = B8_TRUE;
+            }
         }
 
         for (i = 0; i < xl; i++) {
-            val = x[i] - min;
-            if (val >= 0 && val < (i64_t)range)
-                r[i] = s[val];
-            else
-                r[i] = B8_FALSE;
+            if (x[i] == NULL_I64) {
+                r[i] = y_has_null ? B8_TRUE : B8_FALSE;
+            } else {
+                val = x[i] - min;
+                if (val >= 0 && val < (i64_t)range)
+                    r[i] = s[val];
+                else
+                    r[i] = B8_FALSE;
+            }
         }
 
         drop_obj(set);
@@ -1278,17 +1458,18 @@ obj_p index_in_i64_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl) {
     // otherwise, use a hash table
     set = ht_oa_create(xl, -1);
 
-    for (i = 0; i < yl; i++)
-        if (y[i] == NULL_I64)
-            nl = B8_TRUE;
-        else
+    for (i = 0; i < yl; i++) {
+        if (y[i] != NULL_I64)
             AS_I64(AS_LIST(set)[0])[ht_oa_tab_next(&set, y[i])] = y[i];
+    }
 
-    for (i = 0; i < xl; i++)
-        if (x[i] == NULL_I64)
-            r[i] = nl;
-        else
+    for (i = 0; i < xl; i++) {
+        if (x[i] == NULL_I64) {
+            r[i] = y_has_null ? B8_TRUE : B8_FALSE;
+        } else {
             r[i] = ht_oa_tab_get(set, x[i]) != NULL_I64;
+        }
+    }
 
     drop_obj(set);
 
@@ -1965,6 +2146,8 @@ obj_p index_group_i64_scoped(obj_p obj, obj_p filter, const index_scope_t scope)
         pool = pool_get();
         chunks = pool_split_by(pool, len, 0);
         base_chunk = pool_chunk_aligned(len, chunks, sizeof(i64_t));
+        // Recalculate chunks to ensure (chunks-1)*base_chunk < len
+        chunks = (len + base_chunk - 1) / base_chunk;
         if (chunks == 1)
             index_group_i64_scoped_partial(values, indices, hk, len, 0, scope.min, hv);
         else {
@@ -2176,7 +2359,7 @@ obj_p index_group_list_perfect(obj_p obj, obj_p filter) {
     }
 
     // Precompute multipliers for each column
-    for (i = 0, product = 1, scope = (index_scope_t){0, 0, 0}; i < l; i++) {
+    for (i = 0, product = 1, scope = (index_scope_t){0, 0, 0, 0}; i < l; i++) {
         if (ULLONG_MAX / product < (u64_t)scopes[i].range) {
             heap_free(scopes);
             return NULL_OBJ;  // Overflow would occur

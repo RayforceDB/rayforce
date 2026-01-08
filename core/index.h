@@ -52,7 +52,11 @@ typedef struct index_scope_t {
     i64_t min;
     i64_t max;
     i64_t range;
+    i64_t null_count;
 } index_scope_t;
+
+index_scope_t index_scope_i32(i32_t values[], i64_t indices[], i64_t len);
+index_scope_t index_scope_i64(i64_t values[], i64_t indices[], i64_t len);
 
 i64_t index_group_count(obj_p index);
 i64_t index_group_len(obj_p index);
