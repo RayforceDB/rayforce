@@ -109,23 +109,22 @@ obj_p remap_group(obj_p *gvals, obj_p cols, obj_p gkeys, obj_p gcols, query_ctx_
 
             if (first_ids != NULL) {
                 // Direct indexing using first_ids
-                obj_p actual_ids;
+                i64_t *ids_to_use;
+                obj_p actual_ids = NULL_OBJ;
                 if (filter_ids != NULL) {
                     // Need to apply filter - create temp indices array once
                     actual_ids = I64(n);
                     i64_t *ti = AS_I64(actual_ids);
                     for (i = 0; i < n; i++)
                         ti[i] = filter_ids[first_ids[i]];
+                    ids_to_use = ti;
                 } else {
-                    actual_ids = NULL_OBJ;
+                    ids_to_use = first_ids;
                 }
 
+                // Extract all columns - at_ids is already parallel internally
                 for (i = 0; i < l; i++) {
-                    if (filter_ids != NULL) {
-                        v = at_ids(AS_LIST(cols)[i], AS_I64(actual_ids), n);
-                    } else {
-                        v = at_ids(AS_LIST(cols)[i], first_ids, n);
-                    }
+                    v = at_ids(AS_LIST(cols)[i], ids_to_use, n);
 
                     if (IS_ERR(v)) {
                         lst->len = i;

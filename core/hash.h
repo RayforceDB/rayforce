@@ -136,8 +136,9 @@ static inline void hash_index_i64_batch(u64_t *out, const u64_t *vals, i64_t len
     }
 
     // Handle remainder with scalar
+    // NOTE: hash_index_u64(h, k) takes seed h first, value k second - same as vec4
     for (; i < len; i++) {
-        out[i] = hash_index_u64(vals[i], out[i]);
+        out[i] = hash_index_u64(out[i], vals[i]);
     }
 }
 

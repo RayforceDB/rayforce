@@ -198,6 +198,9 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
             break;
         case TYPE_ENUM:
             if (resolve) {
+                // NOTE: ray_key/ray_get must be called BEFORE parallel execution starts
+                // because they access global state. The caller should ensure this is
+                // called from a single thread, or the symbol array should be pre-resolved.
                 k = ray_key(obj);
                 v = ray_get(k);
                 drop_obj(k);
@@ -241,6 +244,31 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
     return NULL_OBJ;
 }
 
+// Context for combined multi-column hash computation
+typedef struct __hash_cols_ctx_t {
+    obj_p cols;
+    i64_t ncols;
+    i64_t *out;
+    i64_t *filter;
+    b8_t resolve;
+} __hash_cols_ctx_t;
+
+// Hash all columns for a chunk of rows in one pass
+obj_p __hash_cols_partial(i64_t len, i64_t offset, __hash_cols_ctx_t *ctx) {
+    i64_t i, c;
+    i64_t *out = ctx->out;
+    
+    // Initialize this chunk's hashes
+    for (i = offset; i < offset + len; i++)
+        out[i] = U64_HASH_SEED;
+    
+    // Hash all columns for this chunk
+    for (c = 0; c < ctx->ncols; c++)
+        index_hash_obj_partial(AS_LIST(ctx->cols)[c], out, ctx->filter, len, offset, ctx->resolve);
+    
+    return NULL_OBJ;
+}
+
 nil_t __index_list_precalc_hash(obj_p cols, i64_t out[], i64_t ncols, i64_t nrows, i64_t filter[], b8_t resolve) {
     i64_t i, j, chunks, base_chunk;
     pool_p pool;
@@ -250,26 +278,34 @@ nil_t __index_list_precalc_hash(obj_p cols, i64_t out[], i64_t ncols, i64_t nrow
     chunks = pool_split_by(pool, nrows, 0);
     base_chunk = pool_chunk_aligned(nrows, chunks, sizeof(i64_t));
 
-    // init hashes
+    // Initialize hashes
     for (i = 0; i < nrows; i++)
         out[i] = U64_HASH_SEED;
 
-    // calculate hashes
+    // Single-threaded path
     if (chunks == 1) {
         for (i = 0; i < ncols; i++)
             index_hash_obj_partial(AS_LIST(cols)[i], out, filter, nrows, 0, resolve);
-    } else {
-        for (i = 0; i < ncols; i++) {
-            pool_prepare(pool);
-            for (j = 0; j < chunks - 1; j++)
-                pool_add_task(pool, (raw_p)index_hash_obj_partial, 6, AS_LIST(cols)[i], out, filter, base_chunk,
-                              j * base_chunk, resolve);
-            pool_add_task(pool, (raw_p)index_hash_obj_partial, 6, AS_LIST(cols)[i], out, filter,
-                          nrows - (chunks - 1) * base_chunk, (chunks - 1) * base_chunk, resolve);
-            v = pool_run(pool);
-            drop_obj(v);
-        }
+        return;
     }
+    
+    // When resolve=true (joins with Enum), process FULLY sequentially
+    // because ray_get/ray_key aren't thread-safe even within a single column
+    if (resolve) {
+        for (i = 0; i < ncols; i++)
+            index_hash_obj_partial(AS_LIST(cols)[i], out, filter, nrows, 0, resolve);
+        return;
+    }
+    
+    // Multi-threaded: process all columns per chunk (better cache locality, fewer syncs)
+    __hash_cols_ctx_t ctx = {cols, ncols, out, filter, resolve};
+    
+    pool_prepare(pool);
+    for (j = 0; j < chunks - 1; j++)
+        pool_add_task(pool, (raw_p)__hash_cols_partial, 3, base_chunk, j * base_chunk, &ctx);
+    pool_add_task(pool, (raw_p)__hash_cols_partial, 3, nrows - (chunks - 1) * base_chunk, (chunks - 1) * base_chunk, &ctx);
+    v = pool_run(pool);
+    drop_obj(v);
 }
 
 nil_t index_hash_obj(obj_p obj, i64_t out[], i64_t filter[], i64_t len, b8_t resolve) {
@@ -2429,7 +2465,7 @@ obj_p index_group_list_chunk_local(i64_t len, i64_t offset, __group_list_chunk_c
 // ============== RADIX PARTITIONED GROUPING ==============
 // Much faster for high-cardinality grouping (many unique groups)
 
-#define RADIX_BITS 8
+#define RADIX_BITS 10
 #define RADIX_PARTITIONS (1 << RADIX_BITS)
 #define RADIX_MASK (RADIX_PARTITIONS - 1)
 
@@ -2662,8 +2698,15 @@ obj_p index_group_list_radix(obj_p obj, obj_p filter, i64_t *hashes, i64_t len) 
     }
     total_groups = group_offsets[RADIX_PARTITIONS];
 
-    // Remap local group IDs to global IDs
-    for (i = 0; i < len; i++) {
+    // Remap local group IDs to global IDs - unrolled for better ILP
+    i64_t len4 = len & ~3;
+    for (i = 0; i < len4; i += 4) {
+        xo[i]     += group_offsets[hashes[i]     & RADIX_MASK];
+        xo[i + 1] += group_offsets[hashes[i + 1] & RADIX_MASK];
+        xo[i + 2] += group_offsets[hashes[i + 2] & RADIX_MASK];
+        xo[i + 3] += group_offsets[hashes[i + 3] & RADIX_MASK];
+    }
+    for (; i < len; i++) {
         xo[i] += group_offsets[hashes[i] & RADIX_MASK];
     }
     
@@ -2671,12 +2714,9 @@ obj_p index_group_list_radix(obj_p obj, obj_p filter, i64_t *hashes, i64_t len) 
     obj_p firsts = I64(total_groups);
     i64_t *firsts_arr = AS_I64(firsts);
     for (p = 0; p < RADIX_PARTITIONS; p++) {
-        i64_t src_base = partition_first_base[p];
-        i64_t dst_base = group_offsets[p];
-        i64_t cnt = partition_groups[p];
-        for (i = 0; i < cnt; i++) {
-            firsts_arr[dst_base + i] = first_ids[src_base + i];
-        }
+        memcpy(firsts_arr + group_offsets[p], 
+               first_ids + partition_first_base[p], 
+               partition_groups[p] * sizeof(i64_t));
     }
     timeit_tick("radix remap");
 
