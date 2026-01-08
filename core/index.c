@@ -2442,6 +2442,8 @@ typedef struct __radix_partition_ctx_t {
     i64_t *partition_counts;   // Count per partition
     i64_t *group_ids;          // Output group IDs
     i64_t *partition_groups;   // Group count per partition (for offset calculation)
+    i64_t *first_ids;          // First row index for each group (global array)
+    i64_t *partition_first_base;  // Base offset into first_ids for each partition
 } __radix_partition_ctx_t;
 
 // Process a single partition - completely independent, no locks needed
@@ -2451,6 +2453,8 @@ obj_p radix_group_partition(i64_t partition_id, __radix_partition_ctx_t *ctx) {
     i64_t i, v, groups = 0;
     i64_t *indices = ctx->partition_indices;
     i64_t *group_ids = ctx->group_ids;
+    i64_t *first_ids = ctx->first_ids;
+    i64_t first_base = ctx->partition_first_base[partition_id];
     __index_list_ctx_t *list_ctx = ctx->list_ctx;
     obj_p ht;
 
@@ -2465,13 +2469,53 @@ obj_p radix_group_partition(i64_t partition_id, __radix_partition_ctx_t *ctx) {
     for (i = start; i < start + count; i++) {
         i64_t row_idx = indices[i];
         v = ht_oa_tab_insert_with(&ht, row_idx, groups, &__index_list_hash_get, &__index_list_cmp_row, list_ctx);
-        if (v == groups)
+        if (v == groups) {
+            // New group - record first row
+            first_ids[first_base + groups] = row_idx;
             groups++;
+        }
         group_ids[row_idx] = v;  // Store local group ID (will be remapped later)
     }
 
     drop_obj(ht);
     ctx->partition_groups[partition_id] = groups;
+    return NULL_OBJ;
+}
+
+// Context for parallel histogram
+typedef struct __histogram_ctx_t {
+    i64_t *hashes;
+    i64_t *local_counts;  // Per-thread histogram
+} __histogram_ctx_t;
+
+obj_p radix_histogram_partial(i64_t len, i64_t offset, __histogram_ctx_t *ctx) {
+    i64_t i;
+    i64_t *hashes = ctx->hashes;
+    i64_t *counts = ctx->local_counts;
+    
+    for (i = offset; i < offset + len; i++) {
+        counts[hashes[i] & RADIX_MASK]++;
+    }
+    return NULL_OBJ;
+}
+
+// Context for parallel scatter (no atomics - uses pre-computed offsets)
+typedef struct __scatter_ctx_t {
+    i64_t *hashes;
+    i64_t *partition_indices;
+    i64_t *thread_offsets;  // Pre-computed write position for this thread
+} __scatter_ctx_t;
+
+obj_p radix_scatter_partial(i64_t len, i64_t offset, __scatter_ctx_t *ctx) {
+    i64_t i, partition_id;
+    i64_t *hashes = ctx->hashes;
+    i64_t *indices = ctx->partition_indices;
+    i64_t *write_pos = ctx->thread_offsets;  // Thread-local copy
+    
+    for (i = offset; i < offset + len; i++) {
+        partition_id = hashes[i] & RADIX_MASK;
+        indices[write_pos[partition_id]++] = i;
+    }
     return NULL_OBJ;
 }
 
@@ -2483,10 +2527,14 @@ obj_p index_group_list_radix(obj_p obj, obj_p filter, i64_t *hashes, i64_t len) 
     __index_list_ctx_t list_ctx;
     __radix_partition_ctx_t radix_ctx;
     pool_p pool;
-    i64_t parts;
+    i64_t parts, chunk;
 
     values = AS_LIST(obj);
     indices = is_null(filter) ? NULL : AS_I64(filter);
+
+    pool = pool_get();
+    parts = pool_get_executors_count(pool);
+    if (parts > 32) parts = 32;
 
     // Allocate arrays
     i64_t *partition_counts = (i64_t *)heap_alloc(RADIX_PARTITIONS * sizeof(i64_t));
@@ -2497,12 +2545,33 @@ obj_p index_group_list_radix(obj_p obj, obj_p filter, i64_t *hashes, i64_t len) 
     res = I64(len);
     xo = AS_I64(res);
 
-    // Phase 1: Build histogram (count per partition)
-    memset(partition_counts, 0, RADIX_PARTITIONS * sizeof(i64_t));
-    for (i = 0; i < len; i++) {
-        partition_id = hashes[i] & RADIX_MASK;
-        partition_counts[partition_id]++;
+    // Phase 1: Build histogram in parallel
+    // Each thread builds local histogram, then merge
+    i64_t *local_histograms = (i64_t *)heap_alloc(parts * RADIX_PARTITIONS * sizeof(i64_t));
+    memset(local_histograms, 0, parts * RADIX_PARTITIONS * sizeof(i64_t));
+    
+    __histogram_ctx_t hist_ctxs[32];
+    chunk = len / parts;
+    
+    pool_prepare(pool);
+    for (i = 0; i < parts; i++) {
+        hist_ctxs[i].hashes = hashes;
+        hist_ctxs[i].local_counts = local_histograms + i * RADIX_PARTITIONS;
+        i64_t start = i * chunk;
+        i64_t this_len = (i == parts - 1) ? (len - start) : chunk;
+        pool_add_task(pool, (raw_p)radix_histogram_partial, 3, this_len, start, &hist_ctxs[i]);
     }
+    poolres = pool_run(pool);
+    drop_obj(poolres);
+    
+    // Merge histograms
+    memset(partition_counts, 0, RADIX_PARTITIONS * sizeof(i64_t));
+    for (i = 0; i < parts; i++) {
+        for (p = 0; p < RADIX_PARTITIONS; p++) {
+            partition_counts[p] += local_histograms[i * RADIX_PARTITIONS + p];
+        }
+    }
+    heap_free(local_histograms);
 
     // Phase 2: Compute prefix sums for offsets
     partition_offsets[0] = 0;
@@ -2510,19 +2579,60 @@ obj_p index_group_list_radix(obj_p obj, obj_p filter, i64_t *hashes, i64_t len) 
         partition_offsets[p + 1] = partition_offsets[p] + partition_counts[p];
     }
 
-    // Phase 3: Scatter row indices into partitions
-    // Reset counts to use as write cursors
-    i64_t *write_pos = (i64_t *)heap_alloc(RADIX_PARTITIONS * sizeof(i64_t));
-    memcpy(write_pos, partition_offsets, RADIX_PARTITIONS * sizeof(i64_t));
-
-    for (i = 0; i < len; i++) {
-        partition_id = hashes[i] & RADIX_MASK;
-        partition_indices[write_pos[partition_id]++] = i;
+    // Phase 3: Parallel scatter (no atomics)
+    // Compute per-thread write offsets using the per-thread histograms
+    // Thread i writes after all threads < i for each partition
+    i64_t *thread_write_offsets = (i64_t *)heap_alloc(parts * RADIX_PARTITIONS * sizeof(i64_t));
+    
+    // Rebuild per-thread histograms (we freed them, so redo quickly)
+    i64_t *thread_counts = (i64_t *)heap_alloc(parts * RADIX_PARTITIONS * sizeof(i64_t));
+    memset(thread_counts, 0, parts * RADIX_PARTITIONS * sizeof(i64_t));
+    
+    for (i = 0; i < parts; i++) {
+        i64_t start = i * chunk;
+        i64_t end = (i == parts - 1) ? len : start + chunk;
+        for (i64_t j = start; j < end; j++) {
+            thread_counts[i * RADIX_PARTITIONS + (hashes[j] & RADIX_MASK)]++;
+        }
     }
-    heap_free(write_pos);
+    
+    // Compute exclusive prefix sum per partition across threads
+    for (p = 0; p < RADIX_PARTITIONS; p++) {
+        i64_t offset = partition_offsets[p];
+        for (i = 0; i < parts; i++) {
+            thread_write_offsets[i * RADIX_PARTITIONS + p] = offset;
+            offset += thread_counts[i * RADIX_PARTITIONS + p];
+        }
+    }
+    heap_free(thread_counts);
+    
+    // Now each thread scatters to its pre-computed positions
+    __scatter_ctx_t scatter_ctxs[32];
+    pool_prepare(pool);
+    for (i = 0; i < parts; i++) {
+        scatter_ctxs[i].hashes = hashes;
+        scatter_ctxs[i].partition_indices = partition_indices;
+        scatter_ctxs[i].thread_offsets = thread_write_offsets + i * RADIX_PARTITIONS;
+        i64_t start = i * chunk;
+        i64_t this_len = (i == parts - 1) ? (len - start) : chunk;
+        pool_add_task(pool, (raw_p)radix_scatter_partial, 3, this_len, start, &scatter_ctxs[i]);
+    }
+    poolres = pool_run(pool);
+    drop_obj(poolres);
+    heap_free(thread_write_offsets);
     timeit_tick("radix partition");
 
     // Phase 4: Group each partition independently (fully parallel!)
+    // Allocate first_ids array (worst case: len groups)
+    i64_t *first_ids = (i64_t *)heap_alloc(len * sizeof(i64_t));
+    i64_t *partition_first_base = (i64_t *)heap_alloc((RADIX_PARTITIONS + 1) * sizeof(i64_t));
+    
+    // Compute base offset for each partition's first_ids (using partition_counts as upper bound)
+    partition_first_base[0] = 0;
+    for (p = 0; p < RADIX_PARTITIONS; p++) {
+        partition_first_base[p + 1] = partition_first_base[p] + partition_counts[p];
+    }
+
     list_ctx = (__index_list_ctx_t){.lcols = obj, .rcols = obj, .hashes = hashes, .filter = indices};
 
     radix_ctx.list_ctx = &list_ctx;
@@ -2532,11 +2642,8 @@ obj_p index_group_list_radix(obj_p obj, obj_p filter, i64_t *hashes, i64_t len) 
     radix_ctx.partition_counts = partition_counts;
     radix_ctx.group_ids = xo;
     radix_ctx.partition_groups = partition_groups;
-
-    pool = pool_get();
-    parts = pool_get_executors_count(pool);
-    if (parts > RADIX_PARTITIONS)
-        parts = RADIX_PARTITIONS;
+    radix_ctx.first_ids = first_ids;
+    radix_ctx.partition_first_base = partition_first_base;
 
     pool_prepare(pool);
     for (p = 0; p < RADIX_PARTITIONS; p++) {
@@ -2557,8 +2664,19 @@ obj_p index_group_list_radix(obj_p obj, obj_p filter, i64_t *hashes, i64_t len) 
 
     // Remap local group IDs to global IDs
     for (i = 0; i < len; i++) {
-        partition_id = hashes[i] & RADIX_MASK;
-        xo[i] += group_offsets[partition_id];
+        xo[i] += group_offsets[hashes[i] & RADIX_MASK];
+    }
+    
+    // Compact first_ids from partitioned layout to sequential layout
+    obj_p firsts = I64(total_groups);
+    i64_t *firsts_arr = AS_I64(firsts);
+    for (p = 0; p < RADIX_PARTITIONS; p++) {
+        i64_t src_base = partition_first_base[p];
+        i64_t dst_base = group_offsets[p];
+        i64_t cnt = partition_groups[p];
+        for (i = 0; i < cnt; i++) {
+            firsts_arr[dst_base + i] = first_ids[src_base + i];
+        }
     }
     timeit_tick("radix remap");
 
@@ -2567,9 +2685,11 @@ obj_p index_group_list_radix(obj_p obj, obj_p filter, i64_t *hashes, i64_t len) 
     heap_free(partition_offsets);
     heap_free(partition_groups);
     heap_free(partition_indices);
+    heap_free(partition_first_base);
+    heap_free(first_ids);
     heap_free(hashes);
 
-    return index_group_build(INDEX_TYPE_IDS, total_groups, res, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
+    return index_group_build(INDEX_TYPE_IDS, total_groups, res, i64(NULL_I64), NULL_OBJ, clone_obj(filter), firsts);
 }
 
 obj_p index_group_list(obj_p obj, obj_p filter) {
