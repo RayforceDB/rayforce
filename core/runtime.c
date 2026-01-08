@@ -33,7 +33,7 @@
 runtime_p __RUNTIME = NULL;
 
 nil_t usage(nil_t) {
-    printf("%s%s%s", BOLD, YELLOW, "Usage: rayforce [-f file] [-p port] [-t timeit] [-c cores] [-r repl] [file]\n");
+    printf("%s%s%s", BOLD, YELLOW, "Usage: rayforce [-f file] [-p port] [-t timeit] [-c cores] [-i] [file]\n");
     exit(EXIT_FAILURE);
 }
 
@@ -72,11 +72,10 @@ obj_p parse_cmdline(i32_t argc, str_p argv[]) {
                 push_sym(&keys, "timeit");
                 str = string_from_str(argv[opt], strlen(argv[opt]));
                 push_obj(&vals, str);
-            } else if (!user_defined && (strcmp(flag, "r") == 0 || strcmp(flag, "repl") == 0)) {
-                if (++opt >= argc)
-                    usage();
-                push_sym(&keys, "repl");
-                str = string_from_str(argv[opt], strlen(argv[opt]));
+            } else if (!user_defined && (strcmp(flag, "i") == 0 || strcmp(flag, "interactive") == 0)) {
+                // -i/--interactive is a boolean flag, no value needed
+                push_sym(&keys, "interactive");
+                str = string_from_str("1", 1);
                 push_obj(&vals, str);
             } else if (!user_defined && (strcmp(flag, "-") == 0)) {
                 user_defined = B8_TRUE;
@@ -118,7 +117,7 @@ obj_p parse_cmdline(i32_t argc, str_p argv[]) {
 
 runtime_p runtime_create(i32_t argc, str_p argv[]) {
     i64_t i, n;
-    obj_p arg, fmt, res;
+    obj_p arg;
     symbols_p symbols;
     sys_info_t si;
 
@@ -171,19 +170,6 @@ runtime_p runtime_create(i32_t argc, str_p argv[]) {
             i64_from_str(AS_C8(arg), arg->len, &n);
             drop_obj(arg);
             timeit_activate(n);
-        }
-
-        // load file
-        arg = runtime_get_arg("file");
-        if (!is_null(arg)) {
-            res = ray_load(arg);
-            drop_obj(arg);
-            if (IS_ERR(res)) {
-                fmt = obj_fmt(res, B8_TRUE);
-                printf("%.*s\n", (i32_t)fmt->len, AS_C8(fmt));
-                drop_obj(fmt);
-            }
-            drop_obj(res);
         }
 
     } else {

@@ -39,14 +39,14 @@
  * Runtime structure.
  */
 typedef struct runtime_t {
-    obj_p args;             // Command line arguments.
-    sys_info_t sys_info;    // System information.
-    env_t env;              // Environment.
-    symbols_p symbols;      // vector_symbols pool.
-    poll_p poll;            // I/O event loop handle.
-    obj_p fdmaps;           // File descriptors mappings.
-    pool_p pool;            // Executors pool.
-    obj_p dynlibs;          // Dynamic libraries.
+    obj_p args;           // Command line arguments.
+    sys_info_t sys_info;  // System information.
+    env_t env;            // Environment.
+    symbols_p symbols;    // vector_symbols pool.
+    poll_p poll;          // I/O event loop handle.
+    obj_p fdmaps;         // File descriptors mappings.
+    pool_p pool;          // Executors pool.
+    obj_p dynlibs;        // Dynamic libraries.
 } *runtime_p;
 
 extern runtime_p __RUNTIME;

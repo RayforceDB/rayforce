@@ -46,7 +46,6 @@
 #include "../core/string.h"
 #include "../core/log.h"
 #include "../core/error.h"
-#include "../core/error.h"
 
 option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
     UNUSED(poll);
@@ -63,20 +62,16 @@ option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
 
     if (IS_ERR(str)) {
         io_write(STDERR_FILENO, 2, str);
-        if (repl->silent)
-            poll_exit(poll, 1);
     } else if (str != NULL_OBJ) {
         i64_t line = repl->term ? term_last_input_line(repl->term) : 0;
         res = ray_eval_str_line(str, repl->name, line);
         error = IS_ERR(res);
-        if (error) {
+        if (error)
             io_write(STDERR_FILENO, 2, res);
-            if (repl->silent)
-                poll_exit(poll, 1);
-        } else if (!repl->silent)  // Only print output if not in silent mode
+        else
             io_write(STDOUT_FILENO, 2, res);
 
-        if (!error && !repl->silent)
+        if (!error)
             timeit_print();
     }
 
@@ -85,7 +80,7 @@ option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
 
     // Only show regular prompt if not in multiline mode and not exiting
     // (continuation prompt is already shown by term_read when in multiline mode)
-    if (!repl->silent && repl->term->multiline_len == 0 && poll->code == NULL_I64)
+    if (repl->term->multiline_len == 0 && poll->code == NULL_I64)
         term_prompt(repl->term);
 
     return option_none();
@@ -94,26 +89,10 @@ option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
 option_t repl_read(poll_p poll, selector_p selector) {
     obj_p str;
     repl_p repl;
-    c8_t line_buf[TERM_BUF_SIZE];
-    i64_t len;
 
     LOG_TRACE("repl_read");
 
     repl = (repl_p)selector->data;
-
-    if (repl->silent) {
-        // In silent mode, just read entire lines directly
-        len = read(STDIN_FILENO, line_buf, TERM_BUF_SIZE - 1);
-
-        if (len <= 0) {
-            poll->code = (len < 0) ? 1 : 0;
-            return option_error(err_os());
-        }
-
-        line_buf[len] = '\0';
-        str = string_from_str(line_buf, len);
-        return option_some(str);
-    }
 
     if (!term_getc(repl->term)) {
         poll->code = 1;
@@ -128,12 +107,11 @@ option_t repl_read(poll_p poll, selector_p selector) {
     return option_some(str);
 }
 
-repl_p repl_create(poll_p poll, b8_t silent) {
+repl_p repl_create(poll_p poll) {
     repl_p repl;
 
     repl = (repl_p)heap_alloc(sizeof(struct repl_t));
     repl->name = string_from_str("repl", 4);
-    repl->silent = silent;
 
 #if defined(OS_WINDOWS)
     // On Windows, STDIN is handled by iocp.c's StdinThread
@@ -143,15 +121,10 @@ repl_p repl_create(poll_p poll, b8_t silent) {
     repl->id = 0;       // Placeholder ID for Windows
     poll->repl = repl;  // Store repl pointer for cleanup
 #else
-    // Only create term if not in silent mode
-    if (!silent) {
-        repl->term = term_create();
-    } else {
-        repl->term = NULL;
-    }
-
     // Only register stdin if it's a TTY (epoll doesn't work on regular files/pipes)
     if (isatty(STDIN_FILENO)) {
+        repl->term = term_create();
+
         struct poll_registry_t registry = ZERO_INIT_STRUCT;
         registry.fd = STDIN_FILENO;
         registry.type = SELECTOR_TYPE_STDIN;
@@ -169,11 +142,14 @@ repl_p repl_create(poll_p poll, b8_t silent) {
             repl_destroy(repl);
             return NULL;
         }
-    } else if (silent) {
-        // Piped input in silent mode - read and eval synchronously
+    } else {
+        // Piped input - read and eval synchronously, then exit (oneshot mode, like Python)
         c8_t buf[TERM_BUF_SIZE];
         i64_t len;
         obj_p str, res, fmt;
+        b8_t has_error = B8_FALSE;
+
+        repl->term = NULL;
 
         while ((len = read(STDIN_FILENO, buf, TERM_BUF_SIZE - 1)) > 0) {
             buf[len] = '\0';
@@ -185,21 +161,20 @@ repl_p repl_create(poll_p poll, b8_t silent) {
                 fmt = obj_fmt(res, B8_TRUE);
                 printf("%.*s\n", (i32_t)fmt->len, AS_C8(fmt));
                 drop_obj(fmt);
+                has_error = B8_TRUE;
             }
             drop_obj(res);
         }
 
-        repl_destroy(repl);
-        return NULL;
-    } else {
-        // stdin is not a TTY and not silent mode - no interactive REPL possible
+        // Signal to exit immediately after piped input processing
+        poll->code = has_error ? 1 : 0;
+
         repl_destroy(repl);
         return NULL;
     }
 #endif
 
-    if (!silent)
-        term_prompt(repl->term);
+    term_prompt(repl->term);
 
     return repl;
 }
