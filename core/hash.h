@@ -27,6 +27,11 @@
 #include "rayforce.h"
 #include "ops.h"
 
+// GCC/Clang vector extensions - portable SIMD
+// Compiler generates optimal code for target (AVX2, NEON, SVE, etc.)
+typedef u64_t v4u64 __attribute__((vector_size(32)));  // 4 x u64 = 256 bits
+typedef u64_t v2u64 __attribute__((vector_size(16)));  // 2 x u64 = 128 bits
+
 #define U64_HASH_SEED 0x9ddfea08eb382d69ull
 
 // Single threaded open addressing hash table
@@ -89,6 +94,51 @@ inline __attribute__((always_inline)) u64_t hash_index_u64(u64_t h, u64_t k) {
     b *= s;
 
     return b;
+}
+
+// Vectorized hash computation using GCC/Clang vector extensions
+// Processes 4 values at once - compiler generates optimal SIMD for target
+static inline __attribute__((always_inline)) void hash_index_u64_vec4(u64_t *out, const u64_t *vals) {
+    const v4u64 seed = {U64_HASH_SEED, U64_HASH_SEED, U64_HASH_SEED, U64_HASH_SEED};
+
+    v4u64 h, k, a, b, k_rot;
+
+    // Load 4 values
+    __builtin_memcpy(&h, out, sizeof(v4u64));
+    __builtin_memcpy(&k, vals, sizeof(v4u64));
+
+    // a = (h ^ k) * s
+    a = (h ^ k) * seed;
+    // a ^= (a >> 47)
+    a ^= (a >> 47);
+
+    // k_rot = ROTI64(k, 31) = (k << 31) | (k >> 33)
+    k_rot = (k << 31) | (k >> 33);
+
+    // b = (k_rot ^ a) * s
+    b = (k_rot ^ a) * seed;
+    // b ^= (b >> 47)
+    b ^= (b >> 47);
+    // b *= s
+    b *= seed;
+
+    // Store result
+    __builtin_memcpy(out, &b, sizeof(v4u64));
+}
+
+// Batch hash computation - uses vector extensions
+static inline void hash_index_i64_batch(u64_t *out, const u64_t *vals, i64_t len) {
+    i64_t i = 0;
+
+    // Process 4 elements at a time with vector ops
+    for (; i + 4 <= len; i += 4) {
+        hash_index_u64_vec4(out + i, vals + i);
+    }
+
+    // Handle remainder with scalar
+    for (; i < len; i++) {
+        out[i] = hash_index_u64(vals[i], out[i]);
+    }
 }
 
 #endif  // HASH_H

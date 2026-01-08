@@ -55,24 +55,50 @@ u64_t __index_list_hash_get(i64_t row, raw_p seed) {
     return ctx->hashes[row];
 }
 
+// Optimized row comparison - inlines common i64 case to avoid function call overhead
 i64_t __index_list_cmp_row(i64_t row1, i64_t row2, raw_p seed) {
-    i64_t i, l;
+    i64_t i, l, r1, r2;
     __index_list_ctx_t *ctx = (__index_list_ctx_t *)seed;
     i64_t *filter = ctx->filter;
     obj_p *lcols = AS_LIST(ctx->lcols);
     obj_p *rcols = AS_LIST(ctx->rcols);
+    obj_p lc, rc;
 
     l = ctx->lcols->len;
+    r1 = filter ? filter[row1] : row1;
+    r2 = filter ? filter[row2] : row2;
 
-    if (filter) {
-        for (i = 0; i < l; i++) {
-            if (ops_eq_idx(lcols[i], filter[row1], rcols[i], filter[row2]) == 0)
-                return 1;
+    // Fast path: check if all columns are i64-like types for direct comparison
+    for (i = 0; i < l; i++) {
+        lc = lcols[i];
+        rc = rcols[i];
+        
+        // Inline comparison for common i64 types (avoid ops_eq_idx call overhead)
+        switch (lc->type) {
+            case TYPE_I64:
+            case TYPE_SYMBOL:
+            case TYPE_TIMESTAMP:
+                if (AS_I64(lc)[r1] != AS_I64(rc)[r2])
+                    return 1;
+                break;
+            case TYPE_I32:
+            case TYPE_DATE:
+            case TYPE_TIME:
+                if (AS_I32(lc)[r1] != AS_I32(rc)[r2])
+                    return 1;
+                break;
+            case TYPE_U8:
+            case TYPE_B8:
+            case TYPE_C8:
+                if (AS_U8(lc)[r1] != AS_U8(rc)[r2])
+                    return 1;
+                break;
+            default:
+                // Fall back to generic comparison for other types
+                if (ops_eq_idx(lc, r1, rc, r2) == 0)
+                    return 1;
+                break;
         }
-    } else {
-        for (i = 0; i < l; i++)
-            if (ops_eq_idx(lcols[i], row1, rcols[i], row2) == 0)
-                return 1;
     }
 
     return 0;
@@ -118,23 +144,26 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
         case TYPE_DATE:
         case TYPE_TIME:
             i32v = (i32_t *)AS_I32(obj);
-            if (filter)
+            if (filter) {
                 for (i = offset; i < len + offset; i++)
                     out[i] = hash_index_u64((i64_t)i32v[filter[i]], out[i]);
-            else
+            } else {
+                // Scalar loop - i32 to i64 conversion doesn't benefit much from SIMD
                 for (i = offset; i < len + offset; i++)
                     out[i] = hash_index_u64((i64_t)i32v[i], out[i]);
+            }
             break;
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
             u64v = (i64_t *)AS_I64(obj);
-            if (filter)
+            if (filter) {
                 for (i = offset; i < len + offset; i++)
                     out[i] = hash_index_u64(u64v[filter[i]], out[i]);
-            else
-                for (i = offset; i < len + offset; i++)
-                    out[i] = hash_index_u64(u64v[i], out[i]);
+            } else {
+                // Use best available SIMD (AVX2/NEON) or scalar fallback
+                hash_index_i64_batch(out + offset, u64v + offset, len);
+            }
             break;
         case TYPE_F64:
             u64v = (i64_t *)AS_F64(obj);
