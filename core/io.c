@@ -42,6 +42,96 @@
 #include "ipc.h"
 #include "parse.h"
 
+// SIMD vector types for newline scanning (32 bytes = 256 bits)
+typedef u8_t v32u8 __attribute__((vector_size(32)));
+
+// Helper to grow offsets array
+static i64_t *grow_offsets(i64_t *offsets, i64_t *capacity, i64_t line_count) {
+    i64_t new_capacity = *capacity * 2;
+    i64_t *new_offsets = (i64_t *)heap_mmap(new_capacity * sizeof(i64_t));
+    if (new_offsets == NULL)
+        return NULL;
+    memcpy(new_offsets, offsets, line_count * sizeof(i64_t));
+    heap_unmap(offsets, *capacity * sizeof(i64_t));
+    *capacity = new_capacity;
+    return new_offsets;
+}
+
+// Build line offset index in single pass with SIMD acceleration
+// Returns number of lines, allocates line_offsets_out array
+// line_offsets[i] = byte offset where line i starts (line 0 is first data line after header)
+i64_t io_build_line_index(str_p buf, i64_t size, i64_t **line_offsets_out) {
+    i64_t capacity = 1024;  // Initial capacity
+    i64_t line_count = 0;
+    i64_t *offsets;
+    i64_t pos = 0;
+
+    offsets = (i64_t *)heap_mmap(capacity * sizeof(i64_t));
+    if (offsets == NULL)
+        return -1;
+
+    // First line starts at offset 0
+    offsets[line_count++] = 0;
+
+    // SIMD newline scanning - process 32 bytes at a time
+    v32u8 newline_vec = (v32u8){'\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n',
+                                 '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n',
+                                 '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n',
+                                 '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n'};
+
+    // Process aligned chunks of 32 bytes
+    while (pos + 32 <= size) {
+        // Load 32 bytes (unaligned load is fine on modern CPUs)
+        v32u8 chunk;
+        memcpy(&chunk, buf + pos, 32);
+
+        // Compare with newline - result is 0xFF where match, 0x00 elsewhere
+        v32u8 cmp = (chunk == newline_vec);
+
+        // Extract comparison result as bitmask (one bit per byte)
+        // GCC/Clang generate movmskb on x86, equivalent on ARM
+        u32_t mask = 0;
+        for (int i = 0; i < 32; i++) {
+            if (((u8_t *)&cmp)[i])
+                mask |= (1u << i);
+        }
+
+        // Process each newline found in this chunk
+        while (mask) {
+            int bit = __builtin_ctz(mask);  // Find lowest set bit
+            i64_t newline_pos = pos + bit;
+
+            // Grow array if needed
+            if (line_count >= capacity) {
+                offsets = grow_offsets(offsets, &capacity, line_count);
+                if (offsets == NULL)
+                    return -1;
+            }
+
+            offsets[line_count++] = newline_pos + 1;  // Store offset of next line
+            mask &= mask - 1;  // Clear lowest set bit
+        }
+
+        pos += 32;
+    }
+
+    // Handle remaining bytes with scalar code
+    while (pos < size) {
+        if (buf[pos] == '\n') {
+            if (line_count >= capacity) {
+                offsets = grow_offsets(offsets, &capacity, line_count);
+                if (offsets == NULL)
+                    return -1;
+            }
+            offsets[line_count++] = pos + 1;
+        }
+        pos++;
+    }
+
+    *line_offsets_out = offsets;
+    return line_count - 1;  // Number of actual lines (excluding the sentinel offset)
+}
+
 obj_p ray_hopen(obj_p *x, i64_t n) {
     i64_t fd, id, timeout = 0;
     sock_addr_t addr;
@@ -442,8 +532,8 @@ obj_p parse_csv_range(i8_t types[], i64_t num_types, str_p buf, i64_t size, i64_
     for (i = 0, prev = buf; i < lines; i++) {
         line_end = (str_p)memchr(prev, '\n', buf + size - prev);
         if (line_end == NULL) {
-            line_end = prev + size;  // Handle last line without newline
-            if (line_end > buf && *(line_end - 1) == '\r')
+            line_end = buf + size;  // Handle last line without newline
+            if (line_end > prev && *(line_end - 1) == '\r')
                 line_end--;  // Handle carriage return
         }
 
@@ -468,7 +558,8 @@ obj_p parse_csv_range(i8_t types[], i64_t num_types, str_p buf, i64_t size, i64_
     return NULL_OBJ;  // Success
 }
 
-obj_p io_read_csv(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t total_lines, obj_p cols, c8_t sep) {
+obj_p io_read_csv(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t total_lines, i64_t *line_offsets,
+                  obj_p cols, c8_t sep) {
     obj_p err, res = NULL_OBJ;
     i64_t i, l, batch_size, num_batches, lines_per_batch, start_line, end_line, lines_in_batch;
     str_p batch_start, batch_end;
@@ -498,25 +589,13 @@ obj_p io_read_csv(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t tot
             end_line = total_lines;
         lines_in_batch = end_line - start_line;
 
-        // Now calculate the actual buffer positions for start_line and end_line
-        batch_start = buf;
-        for (i = 0; i < start_line && batch_start < (buf + size); ++i)
-            batch_start = (str_p)memchr(batch_start, '\n', size - (batch_start - buf)) + 1;
+        // O(1) batch boundary lookup using line offset index
+        batch_start = buf + line_offsets[start_line];
+        batch_end = buf + line_offsets[end_line];  // end_line offset points to start of next batch
 
-        batch_end = batch_start;
-        for (i = 0; i < lines_in_batch && batch_end < (buf + size); ++i) {
-            batch_end = (str_p)memchr(batch_end, '\n', size - (batch_end - buf));
-            if (batch_end == NULL) {
-                batch_end = buf + size;  // Handle the last line in the buffer
-                break;
-            } else {
-                ++batch_end;  // Move past the newline to include the full line
-            }
-        }
-
-        // Handle cases where lines are fewer than expected or parsing issues
-        if (batch_start == NULL || batch_end == NULL || batch_start >= batch_end)
-            break;
+        // Handle edge case for last batch
+        if (end_line >= total_lines)
+            batch_end = buf + size;
 
         batch_size = batch_end - batch_start;
         pool_add_task(pool, (raw_p)parse_csv_range, 8, types, num_types, batch_start, batch_size, lines_in_batch,
@@ -577,7 +656,8 @@ i64_t io_symbol_from_str_trimmed(str_p src, i64_t len) {
 
 obj_p ray_read_csv(obj_p *x, i64_t n) {
     i64_t fd, size;
-    i64_t i, l, len, lines;
+    i64_t i, l, len, lines, line_index_capacity;
+    i64_t *line_offsets = NULL;
     str_p buf, prev, pos, line;
     obj_p types, names, cols, path, res;
     i8_t type;
@@ -643,15 +723,10 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                 return err_os();
             }
 
-            pos = buf;
-            lines = 0;
+            // Build line offset index in single pass (replaces separate line counting + batch scanning)
+            lines = io_build_line_index(buf, size, &line_offsets);
 
-            while ((pos = (str_p)memchr(pos, '\n', buf + size - pos))) {
-                ++lines;
-                ++pos;  // Move past the newline character
-            }
-
-            if (lines == 0) {
+            if (lines <= 0 || line_offsets == NULL) {
                 drop_obj(types);
                 fs_fclose(fd);
                 mmap_free(buf, size);
@@ -659,14 +734,17 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                 return err_length(0, 0, 0, 0, 0, 0);
             }
 
-            // Adjust for the file not ending with a newline
-            if (size > 0 && buf[size - 1] != '\n')
-                ++lines;
+            // Calculate capacity for cleanup (next power of 2 >= lines+1)
+            line_index_capacity = 1024;
+            while (line_index_capacity < lines + 2)
+                line_index_capacity *= 2;
 
-            // parse header
-            pos = (str_p)memchr(buf, '\n', size);
+            // parse header (line 0)
+            pos = buf + line_offsets[1];  // End of header line
+            if (pos > buf && *(pos - 1) == '\n')
+                pos--;
             len = pos - buf;
-            line = pos + 1;
+            line = buf + line_offsets[1];  // Start of data (first line after header)
 
             names = SYMBOL(l);
             pos = buf;
@@ -680,6 +758,7 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                         drop_obj(names);
                         fs_fclose(fd);
                         mmap_free(buf, size);
+                        heap_unmap(line_offsets, line_index_capacity * sizeof(i64_t));
                         return err_length(0, 0, 0, 0, 0, 0);
                     }
 
@@ -700,11 +779,21 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                 fs_fclose(fd);
                 mmap_free(buf, size);
                 drop_obj(path);
+                heap_unmap(line_offsets, line_index_capacity * sizeof(i64_t));
                 return err_length(0, 0, 0, 0, 0, 0);
             }
 
-            // exclude header
+            // exclude header from line count
             lines--;
+
+            // Adjust line_offsets to be relative to data start (skip header)
+            // Shift offsets so index 0 = first data line
+            {
+                i64_t data_start = line_offsets[1];  // Save before modification
+                for (i = 0; i <= lines; i++) {
+                    line_offsets[i] = line_offsets[i + 1] - data_start;
+                }
+            }
 
             // allocate columns
             cols = LIST(l);
@@ -715,13 +804,15 @@ obj_p ray_read_csv(obj_p *x, i64_t n) {
                     AS_LIST(cols)[i] = vector(AS_C8(types)[i], lines);
             }
 
-            // parse lines
-            res = io_read_csv((i8_t *)AS_U8(types), l, line, size, lines, cols, sep);
+            // parse lines using O(1) batch boundary lookups
+            res = io_read_csv((i8_t *)AS_U8(types), l, line, size - (line - buf), lines, line_offsets, cols, sep);
 
+            // Cleanup
             drop_obj(types);
             fs_fclose(fd);
             mmap_free(buf, size);
             drop_obj(path);
+            heap_unmap(line_offsets, line_index_capacity * sizeof(i64_t));
 
             if (!is_null(res)) {
                 drop_obj(names);

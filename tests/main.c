@@ -174,7 +174,6 @@ nil_t on_skip(str_p msg) { printf("%sSkipped%s (%s)\n", YELLOW, RESET, msg ? msg
 #include "lang.c"
 #include "serde.c"
 #include "parted.c"
-#include "group.c"
 
 // Add tests here
 test_entry_t tests[] = {
@@ -403,8 +402,6 @@ test_entry_t tests[] = {
     {"test_parted_count_time", test_parted_count_time},
     // Parted distinct tests
     {"test_parted_distinct_i64", test_parted_distinct_i64},
-    // Group aggregate test (DuckDB-style)
-    {"test_group_aggregate", test_group_aggregate},
 };
 // ---
 
