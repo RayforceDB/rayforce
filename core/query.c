@@ -38,132 +38,7 @@
 
 obj_p remap_filter(obj_p tab, obj_p index) { return filter_map(tab, index); }
 
-obj_p remap_group(obj_p *gvals, obj_p cols, obj_p gkeys, obj_p gcols, query_ctx_p ctx) {
-    i64_t i, l, n, *first_ids, *filter_ids;
-    obj_p index, v, lst, res, src_col;
-
-    switch (gkeys->type) {
-        case -TYPE_SYMBOL:
-            index = index_group(cols, ctx->filter);
-            timeit_tick("build index");
-
-            if (IS_ERR(index))
-                return index;
-
-            ctx->group_index = clone_obj(index);
-
-            res = group_map(ctx->table, index);
-
-            // Fast path: use precomputed first indices if available
-            first_ids = index_group_first_ids(index);
-            filter_ids = index_group_filter_ids(index);
-            n = index_group_count(index);
-            src_col = (gcols == NULL_OBJ) ? cols : gcols;
-
-            if (first_ids != NULL) {
-                // Direct indexing using first_ids
-                if (filter_ids != NULL) {
-                    // Need to apply filter first - create temp indices array
-                    obj_p temp_ids = I64(n);
-                    i64_t *ti = AS_I64(temp_ids);
-                    for (i = 0; i < n; i++)
-                        ti[i] = filter_ids[first_ids[i]];
-                    v = at_ids(src_col, ti, n);
-                    drop_obj(temp_ids);
-                } else {
-                    v = at_ids(src_col, first_ids, n);
-                }
-            } else {
-                // Fallback to aggr_first
-                v = aggr_first(src_col, index);
-            }
-
-            if (IS_ERR(v)) {
-                drop_obj(index);
-                drop_obj(res);
-                return v;
-            }
-
-            *gvals = v;
-            drop_obj(index);
-
-            timeit_tick("extract group columns");
-
-            return res;
-        case TYPE_SYMBOL:
-            index = index_group_list(cols, ctx->filter);
-            timeit_tick("build compound index");
-
-            if (IS_ERR(index))
-                return index;
-
-            res = group_map(ctx->table, index);
-
-            l = cols->len;
-            lst = LIST(l);
-
-            // Fast path: use precomputed first indices if available
-            first_ids = index_group_first_ids(index);
-            filter_ids = index_group_filter_ids(index);
-            n = index_group_count(index);
-
-            if (first_ids != NULL) {
-                // Direct indexing using first_ids
-                i64_t *ids_to_use;
-                obj_p actual_ids = NULL_OBJ;
-                if (filter_ids != NULL) {
-                    // Need to apply filter - create temp indices array once
-                    actual_ids = I64(n);
-                    i64_t *ti = AS_I64(actual_ids);
-                    for (i = 0; i < n; i++)
-                        ti[i] = filter_ids[first_ids[i]];
-                    ids_to_use = ti;
-                } else {
-                    ids_to_use = first_ids;
-                }
-
-                // Extract all columns - at_ids is already parallel internally
-                for (i = 0; i < l; i++) {
-                    v = at_ids(AS_LIST(cols)[i], ids_to_use, n);
-
-                    if (IS_ERR(v)) {
-                        lst->len = i;
-                        drop_obj(res);
-                        drop_obj(index);
-                        if (!is_null(actual_ids)) drop_obj(actual_ids);
-                        return v;
-                    }
-
-                    AS_LIST(lst)[i] = v;
-                }
-
-                if (!is_null(actual_ids)) drop_obj(actual_ids);
-            } else {
-                // Fallback to aggr_first
-                for (i = 0; i < l; i++) {
-                    v = aggr_first(AS_LIST(cols)[i], index);
-
-                    if (IS_ERR(v)) {
-                        lst->len = i;
-                        drop_obj(res);
-                        drop_obj(index);
-                        return v;
-                    }
-
-                    AS_LIST(lst)[i] = v;
-                }
-            }
-
-            *gvals = lst;
-            drop_obj(index);
-
-            timeit_tick("extract group columns");
-
-            return res;
-        default:
-            return err_type(0, 0, 0, 0);
-    }
-}
+obj_p remap_group(query_ctx_p ctx) { return group_map(ctx->table, NULL_OBJ); }
 
 obj_p get_gkeys(obj_p cols, obj_p obj) {
     i64_t i, l;
@@ -242,15 +117,9 @@ obj_p get_gvals(obj_p obj) {
 
 nil_t query_ctx_init(query_ctx_p ctx) {
     vm_p vm = VM;
-    ctx->tablen = 0;
     ctx->table = NULL_OBJ;
     ctx->take = NULL_OBJ;
     ctx->filter = NULL_OBJ;
-    ctx->group_fields = NULL_OBJ;
-    ctx->group_values = NULL_OBJ;
-    ctx->query_fields = NULL_OBJ;
-    ctx->query_values = NULL_OBJ;
-    ctx->group_index = NULL_OBJ;
     ctx->parent = vm->query_ctx;
     vm->query_ctx = ctx;
 }
@@ -261,11 +130,6 @@ nil_t query_ctx_destroy(query_ctx_p ctx) {
     drop_obj(ctx->table);
     drop_obj(ctx->take);
     drop_obj(ctx->filter);
-    drop_obj(ctx->group_fields);
-    drop_obj(ctx->group_values);
-    drop_obj(ctx->query_fields);
-    drop_obj(ctx->query_values);
-    drop_obj(ctx->group_index);
 }
 
 obj_p select_fetch_table(obj_p obj, query_ctx_p ctx) {
@@ -285,10 +149,9 @@ obj_p select_fetch_table(obj_p obj, query_ctx_p ctx) {
     if (val->type != TYPE_TABLE) {
         i8_t actual_type = val->type;
         drop_obj(val);
-        return err_type(TYPE_TABLE, actual_type, 1, 0);  // arg 1 = from:
+        return err_type(TYPE_TABLE, actual_type, 0, symbols_intern("from", 4));
     }
 
-    ctx->tablen = AS_LIST(val)[0]->len;
     ctx->table = val;
 
     prm = at_sym(obj, "take", 4);
@@ -363,7 +226,7 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
 
         timeit_tick("get keys");
 
-        prm = remap_group(&gcol, groupby, gkeys, gvals, ctx);
+        prm = remap_group(ctx);
 
         drop_obj(gvals);
         drop_obj(groupby);
@@ -383,9 +246,6 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
             timeit_span_end("group");
             return gcol;
         }
-
-        ctx->group_fields = gkeys;
-        ctx->group_values = gcol;
 
         timeit_span_end("group");
     } else if (ctx->filter != NULL_OBJ) {
@@ -458,150 +318,14 @@ obj_p select_apply_mappings(obj_p obj, query_ctx_p ctx) {
             AS_LIST(res)[i] = val;
         }
 
-        ctx->query_fields = keys;
-        ctx->query_values = res;
-
         timeit_tick("apply mappings");
 
-        return NULL_OBJ;
+        return table(keys, res);
     }
 
     drop_obj(keys);
 
     return NULL_OBJ;
-}
-
-obj_p select_collect_fields(query_ctx_p ctx) {
-    i64_t i, l;
-    obj_p prm, sym, val, keys, res;
-
-    // Already collected by mappings
-    if (!is_null(ctx->query_fields))
-        return NULL_OBJ;
-
-    // Groupings
-    if (!is_null(ctx->group_fields)) {
-        keys = ray_except(AS_LIST(ctx->table)[0], ctx->group_fields);
-        l = keys->len;
-        res = LIST(l);
-
-        for (i = 0; i < l; i++) {
-            sym = at_idx(keys, i);
-            prm = ray_get(sym);
-            drop_obj(sym);
-
-            if (IS_ERR(prm)) {
-                res->len = i;
-                drop_obj(res);
-                drop_obj(keys);
-                return prm;
-            }
-
-            val = aggr_first(AS_LIST(prm)[0], AS_LIST(prm)[1]);
-            drop_obj(prm);
-
-            if (IS_ERR(val)) {
-                res->len = i;
-                drop_obj(res);
-                drop_obj(keys);
-                return val;
-            }
-
-            AS_LIST(res)[i] = val;
-        }
-
-        ctx->query_fields = keys;
-        ctx->query_values = res;
-
-        timeit_tick("collect fields");
-
-        return NULL_OBJ;
-    }
-
-    keys = clone_obj(AS_LIST(ctx->table)[0]);
-    l = keys->len;
-    res = LIST(l);
-
-    for (i = 0; i < l; i++) {
-        sym = at_idx(keys, i);
-        prm = ray_get(sym);
-        drop_obj(sym);
-
-        switch (prm->type) {
-            case TYPE_MAPFILTER:
-                val = filter_collect(AS_LIST(prm)[0], AS_LIST(prm)[1]);
-                drop_obj(prm);
-                break;
-            default:
-                val = ray_value(prm);
-                drop_obj(prm);
-                break;
-        }
-
-        if (IS_ERR(val)) {
-            res->len = i;
-            drop_obj(res);
-            drop_obj(keys);
-            return val;
-        }
-
-        AS_LIST(res)[i] = val;
-    }
-
-    ctx->query_fields = keys;
-    ctx->query_values = res;
-
-    timeit_tick("collect fields");
-
-    return NULL_OBJ;
-}
-
-obj_p select_build_table(query_ctx_p ctx) {
-    i64_t i, l, m;
-    obj_p take, res, keys, vals;
-
-    switch (ctx->group_fields->type) {
-        case -TYPE_SYMBOL:  // Grouped by one column
-            keys = ray_concat(ctx->group_fields, ctx->query_fields);
-            l = ctx->query_values->len;
-            vals = LIST(l + 1);
-            AS_LIST(vals)[0] = clone_obj(ctx->group_values);
-
-            for (i = 0; i < l; i++)
-                AS_LIST(vals)[i + 1] = clone_obj(AS_LIST(ctx->query_values)[i]);
-
-            break;
-        case TYPE_SYMBOL:  // Grouped by multiple columns
-            keys = ray_concat(ctx->group_fields, ctx->query_fields);
-            l = ctx->group_values->len;
-            m = ctx->query_values->len;
-            vals = LIST(l + m);
-
-            for (i = 0; i < l; i++)
-                AS_LIST(vals)[i] = clone_obj(AS_LIST(ctx->group_values)[i]);
-
-            for (i = 0; i < m; i++)
-                AS_LIST(vals)[i + l] = clone_obj(AS_LIST(ctx->query_values)[i]);
-
-            break;
-        default:
-            keys = clone_obj(ctx->query_fields);
-            vals = clone_obj(ctx->query_values);
-    }
-
-    res = ray_table(keys, vals);
-    drop_obj(keys);
-    drop_obj(vals);
-
-    if (ctx->take != NULL_OBJ) {
-        take = ray_take(res, ctx->take);
-        drop_obj(res);
-        res = take;
-    }
-
-    timeit_tick("build table");
-
-    return res;
 }
 
 obj_p ray_select(obj_p obj) {
@@ -637,14 +361,6 @@ obj_p ray_select(obj_p obj) {
     res = select_apply_mappings(obj, &ctx);
     if (IS_ERR(res))
         goto cleanup;
-
-    // Collect fields
-    res = select_collect_fields(&ctx);
-    if (IS_ERR(res))
-        goto cleanup;
-
-    // Build result table
-    res = select_build_table(&ctx);
 
 cleanup:
     query_ctx_destroy(&ctx);

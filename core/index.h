@@ -38,14 +38,14 @@ typedef enum index_type_t {
 typedef struct __index_list_ctx_t {
     obj_p lcols;
     obj_p rcols;
-    i64_t *hashes;
-    i64_t *filter;
+    i64_t* hashes;
+    i64_t* filter;
 } __index_list_ctx_t;
 
 typedef struct __index_find_ctx_t {
     raw_p lobj;
     raw_p robj;
-    i64_t *hashes;
+    i64_t* hashes;
 } __index_find_ctx_t;
 
 typedef struct index_scope_t {
@@ -54,16 +54,6 @@ typedef struct index_scope_t {
     i64_t range;
 } index_scope_t;
 
-i64_t index_group_count(obj_p index);
-i64_t index_group_len(obj_p index);
-index_type_t index_group_type(obj_p index);
-i64_t *index_group_source(obj_p index);
-i64_t *index_group_ids(obj_p index);
-i64_t *index_group_filter_ids(obj_p index);
-obj_p index_group_filter(obj_p index);
-i64_t index_group_shift(obj_p index);
-obj_p index_group_meta(obj_p index);
-i64_t *index_group_first_ids(obj_p index);
 obj_p index_distinct_i8(i8_t values[], i64_t len);
 obj_p index_distinct_i16(i16_t values[], i64_t len);
 obj_p index_distinct_i32(i32_t values[], i64_t len);
@@ -92,8 +82,6 @@ obj_p index_find_i32(i32_t x[], i64_t xl, i32_t y[], i64_t yl);
 obj_p index_find_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl);
 obj_p index_find_guid(guid_t x[], i64_t xl, guid_t y[], i64_t yl);
 obj_p index_find_obj(obj_p x[], i64_t xl, obj_p y[], i64_t yl);
-obj_p index_group(obj_p val, obj_p filter);
-obj_p index_group_list(obj_p obj, obj_p filter);
 obj_p index_left_join_obj(obj_p lcols, obj_p rcols, i64_t len);
 obj_p index_inner_join_obj(obj_p lcols, obj_p rcols, i64_t len);
 i64_t index_bin_u8(u8_t val, u8_t vals[], i64_t ids[], i64_t len);

@@ -83,7 +83,7 @@ obj_p ray_til_partial(i64_t len, i64_t offset, i64_t filter[], i64_t out[]) {
 
 obj_p __til(obj_p x, obj_p filter) {
     i64_t i, l, n, chunk, offset;
-    i64_t *ids = NULL;
+    i64_t* ids = NULL;
     obj_p v, vec;
     pool_p pool;
 
@@ -343,7 +343,7 @@ obj_p ray_table(obj_p x, obj_p y) {
 obj_p ray_guid(obj_p x) {
     i64_t i, count;
     obj_p vec;
-    guid_t *g;
+    guid_t* g;
 
     switch (x->type) {
         case -TYPE_I64:
@@ -361,7 +361,7 @@ obj_p ray_guid(obj_p x) {
     }
 }
 
-obj_p ray_list(obj_p *x, i64_t n) {
+obj_p ray_list(obj_p* x, i64_t n) {
     i64_t i;
     obj_p lst = LIST(n);
 
@@ -371,7 +371,7 @@ obj_p ray_list(obj_p *x, i64_t n) {
     return lst;
 }
 
-obj_p ray_enlist(obj_p *x, i64_t n) {
+obj_p ray_enlist(obj_p* x, i64_t n) {
     i64_t i;
     obj_p lst;
 
@@ -417,14 +417,14 @@ obj_p ray_enum(obj_p x, obj_p y) {
 
 // Context for parallel rand
 typedef struct {
-    i64_t *out;
+    i64_t* out;
     i64_t max_val;
     u64_t base_seed;
 } rand_ctx_t;
 
 // Worker for parallel rand (pool_map signature)
-static obj_p rand_worker(i64_t len, i64_t offset, void *ctx) {
-    rand_ctx_t *c = ctx;
+static obj_p rand_worker(i64_t len, i64_t offset, void* ctx) {
+    rand_ctx_t* c = ctx;
     // Derive unique seed from offset
     u64_t seed = c->base_seed ^ ((u64_t)(offset + 1) * 0x9E3779B97F4A7C15ULL);
     for (i64_t i = 0; i < len; i++) {
@@ -845,7 +845,7 @@ obj_p ray_distinct(obj_p x) {
         case TYPE_U8:
         case TYPE_C8:
             l = ops_count(x);
-            res = index_distinct_i8((i8_t *)AS_U8(x), l);
+            res = index_distinct_i8((i8_t*)AS_U8(x), l);
             res->type = x->type;
             return res;
         case TYPE_I16:
@@ -884,7 +884,7 @@ obj_p ray_distinct(obj_p x) {
             res = LIST(dl);
             for (i64_t i = 0; i < dl; i++) {
                 i64_t offset = AS_I64(distinct_idx)[i];
-                u8_t *buf = AS_U8(key) + offset;
+                u8_t* buf = AS_U8(key) + offset;
                 i64_t size = sl;
                 AS_LIST(res)[i] = de_raw(buf, &size);
             }
@@ -926,7 +926,7 @@ obj_p ray_distinct(obj_p x) {
             }
             if (combined == NULL_OBJ)
                 return U8(0);
-            res = index_distinct_i8((i8_t *)AS_U8(combined), combined->len);
+            res = index_distinct_i8((i8_t*)AS_U8(combined), combined->len);
             res->type = x->type - TYPE_PARTEDLIST;
             drop_obj(combined);
             return res;
@@ -1019,7 +1019,8 @@ obj_p ray_distinct(obj_p x) {
                     obj_p part = AS_LIST(x)[i];
                     obj_p part_values = ray_value(part);
                     if (IS_ERR(part_values)) {
-                        if (expanded != NULL_OBJ) drop_obj(expanded);
+                        if (expanded != NULL_OBJ)
+                            drop_obj(expanded);
                         return part_values;
                     }
                     if (expanded == NULL_OBJ)
@@ -1066,17 +1067,6 @@ obj_p ray_distinct(obj_p x) {
         default:
             return err_nyi(x->type);
     }
-}
-
-obj_p ray_group(obj_p x) {
-    obj_p k, v, index;
-
-    index = index_group(x, NULL_OBJ);
-    v = aggr_row(x, index);
-    k = aggr_first(x, index);
-    drop_obj(index);
-
-    return dict(k, v);
 }
 
 obj_p ray_diverse(obj_p x) {
@@ -1213,13 +1203,13 @@ obj_p ray_row(obj_p x) {
         $xl = x->len;                                                                                  \
         $yl = y->len;                                                                                  \
         if ($yl > $xl)                                                                                 \
-            return err_length($xl, $yl, 0, 0, 0, 0);                                                               \
+            return err_length($xl, $yl, 0, 0, 0, 0);                                                   \
                                                                                                        \
         $res = LIST($yl);                                                                              \
         $last_id = __AS_##yt(y)[0];                                                                    \
         if ($last_id < 0 || $last_id >= $xl) {                                                         \
             drop_obj($res);                                                                            \
-            return err_index($last_id, $xl, 0, 0);                                                           \
+            return err_index($last_id, $xl, 0, 0);                                                     \
         }                                                                                              \
                                                                                                        \
         for ($i = 0; $i < $yl; $i++) {                                                                 \
@@ -1227,7 +1217,7 @@ obj_p ray_row(obj_p x) {
             if ($id < $last_id || $id > $xl) {                                                         \
                 $res->len = $i;                                                                        \
                 drop_obj($res);                                                                        \
-                return err_index($id, $xl, 0, 0);                                                            \
+                return err_index($id, $xl, 0, 0);                                                      \
             }                                                                                          \
                                                                                                        \
             if ($id == $last_id)                                                                       \

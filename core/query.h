@@ -27,24 +27,18 @@
 #include "rayforce.h"
 
 typedef struct query_ctx_t {
-    i64_t tablen;
     obj_p take;
     obj_p table;
     obj_p filter;
-    obj_p group_index;
-    obj_p group_fields;
-    obj_p group_values;
-    obj_p query_fields;
-    obj_p query_values;
-    struct query_ctx_t *parent;
-} *query_ctx_p;
+    struct query_ctx_t* parent;
+}* query_ctx_p;
 
 nil_t query_ctx_init(query_ctx_p ctx);
 nil_t query_ctx_destroy(query_ctx_p ctx);
 
 obj_p get_fields(obj_p obj);
 obj_p remap_filter(obj_p x, obj_p y);
-obj_p remap_group(obj_p *gvals, obj_p cols, obj_p gkeys, obj_p gcols, query_ctx_p ctx);
+obj_p remap_group(query_ctx_p ctx);
 obj_p ray_select(obj_p obj);
 
 #endif  // QUERY_H
