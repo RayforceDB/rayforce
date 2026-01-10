@@ -26,6 +26,10 @@
 
 #include "rayforce.h"
 
+// ============================================================================
+// Aggregation API (called from TYPE_MAPGROUP dispatch)
+// ============================================================================
+
 obj_p aggr_sum(obj_p val, obj_p index);
 obj_p aggr_first(obj_p val, obj_p index);
 obj_p aggr_last(obj_p val, obj_p index);

@@ -120,6 +120,7 @@ nil_t query_ctx_init(query_ctx_p ctx) {
     ctx->table = NULL_OBJ;
     ctx->take = NULL_OBJ;
     ctx->filter = NULL_OBJ;
+    ctx->groupby = NULL_OBJ;
     ctx->parent = vm->query_ctx;
     vm->query_ctx = ctx;
 }
@@ -130,6 +131,7 @@ nil_t query_ctx_destroy(query_ctx_p ctx) {
     drop_obj(ctx->table);
     drop_obj(ctx->take);
     drop_obj(ctx->filter);
+    drop_obj(ctx->groupby);
 }
 
 obj_p select_fetch_table(obj_p obj, query_ctx_p ctx) {
@@ -225,6 +227,15 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
         }
 
         timeit_tick("get keys");
+
+        // Store key columns for fused hash-aggregate
+        // groupby is either a single column or a list of columns
+        if (groupby->type == TYPE_LIST) {
+            ctx->groupby = clone_obj(groupby);
+        } else {
+            ctx->groupby = LIST(1);
+            AS_LIST(ctx->groupby)[0] = clone_obj(groupby);
+        }
 
         prm = remap_group(ctx);
 

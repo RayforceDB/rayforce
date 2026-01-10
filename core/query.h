@@ -30,6 +30,7 @@ typedef struct query_ctx_t {
     obj_p take;
     obj_p table;
     obj_p filter;
+    obj_p groupby;  // List of key columns for group-by (NULL_OBJ if no grouping)
     struct query_ctx_t* parent;
 }* query_ctx_p;
 
