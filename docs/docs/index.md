@@ -7,55 +7,64 @@ hide:
 <div class="hero-section" markdown>
 <div class="hero-content" markdown>
 
-![RayforceDB](images/logo_dark_full.svg){ .hero-logo .light-only }
-![RayforceDB](images/logo_light_full.svg){ .hero-logo .dark-only }
+<div class="scroll-fade-in">
+<img src="images/logo_dark_full.svg" alt="RayforceDB" class="hero-logo light-only">
+<img src="images/logo_light_full.svg" alt="RayforceDB" class="hero-logo dark-only">
+</div>
 
-# Your data is about to get **faster**
+# Your data is **about to get faster** {.scroll-fade-in}
 
-The high-performance columnar database engineered for lightning-fast analytics and seamless data operations.
+<div class="hero-description scroll-fade-in">
+  RayforceDB is a high-performance columnar vector database written in pure C. Combines columnar storage with SIMD vectorization for lightning-fast analytics on time-series and big data workloads.
+</div>
 
-<div class="hero-socials" markdown>
+
+<div class="hero-buttons scroll-fade-in">
+<a href="content/get-started/overview.html" class="md-button md-button--primary">Get Started
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<line x1="5" y1="12" x2="19" y2="12"></line>
+<polyline points="12 5 19 12 12 19"></polyline>
+</svg>
+</a>
+<a href="https://wasm.rayforcedb.com/" class="md-button" target="_blank">Try It Now</a>
+</div>
+
+<div class="hero-socials scroll-fade-in" markdown>
 [:fontawesome-brands-github:](https://github.com/singaraiona/rayforce "GitHub")
 [:fontawesome-brands-x-twitter:](https://x.com/RayforceDB "X (Twitter)")
 [:fontawesome-brands-reddit:](https://www.reddit.com/r/rayforcedb/ "Reddit")
 [:simple-zulip:](https://rayforcedb.zulipchat.com/join/l33sichu4vp7nf77hgdul4om/ "Zulip Chat")
 </div>
 
-<div class="hero-buttons">
-<a href="https://wasm.rayforcedb.com/" class="md-button md-button--primary" target="_blank">Try it Now</a>
-<a href="content/get-started/overview.html" class="md-button">Get Started</a>
-<a href="https://github.com/singaraiona/rayforce" class="md-button">Get it on GitHub</a>
 </div>
 
-</div>
-
-<div class="hero-ticker">
+<div class="hero-ticker scroll-fade-in">
 <div class="hero-ticker__content">
-<span>⚡ Blazing Fast</span>
-<span>📊 Columnar Storage</span>
-<span>🔧 Zero Dependencies</span>
-<span>☁️ Cloud Native</span>
-<span>🧠 In-Process Embedding</span>
-<span>🚀 Sub-millisecond Queries</span>
-<span>💾 Under 1MB Binary</span>
-<span>🔓 MIT License</span>
-<span>⚡ Blazing Fast</span>
-<span>📊 Columnar Storage</span>
-<span>🔧 Zero Dependencies</span>
-<span>☁️ Cloud Native</span>
-<span>🧠 In-Process Embedding</span>
-<span>🚀 Sub-millisecond Queries</span>
-<span>💾 Under 1MB Binary</span>
-<span>🔓 MIT License</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M11,21H13V19H11M13,17V15H11V17M12,1A10,10 0 0,0 2,11H4C4,6.03 8.03,2 13,2A9,9 0 0,1 22,11C22,16.03 17.97,20 13,20H12V17H13A7,7 0 0,0 20,11A7,7 0 0,0 13,4A7,7 0 0,0 6,11H8A5,5 0 0,1 13,6A5,5 0 0,1 18,11A5,5 0 0,1 13,16H11V13H13A3,3 0 0,0 16,11A3,3 0 0,0 13,8A3,3 0 0,0 10,11H12V1Z"/></svg> Blazing Fast</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M4,5H8V2H10V22H8V18H4V15H8V9H4M14,5V2H16V22H14V18H11V15H14V9H11V6H14V5Z"/></svg> Columnar Storage</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M22.7,19L13.6,9.9C14.5,7.6 14,4.9 12.1,3C10.1,1 7.1,0.6 4.7,1.7L9,6L6,9L1.6,4.7C0.4,7.1 0.9,10.1 2.9,12.1C4.8,14 7.5,14.5 9.8,13.6L18.9,22.7C19.3,23.1 19.9,23.1 20.3,22.7L22.6,20.4C23.1,20 23.1,19.3 22.7,19Z"/></svg> Zero Dependencies</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M19.36,10.04C21.95,10.22 24,12.36 24,15A5,5 0 0,1 19,20H6A6,6 0 0,1 0,14C0,10.91 2.34,8.36 5.35,8.04C6.6,5.64 9.11,4 12,4C15.64,4 18.67,6.59 19.36,10.04Z"/></svg> Cloud Native</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M12,4A1,1 0 0,0 11,5V11A1,1 0 0,0 12,12A1,1 0 0,0 13,11V5A1,1 0 0,0 12,4M2,13H22V15H2V13M12,16A2,2 0 0,1 14,18V20A2,2 0 0,1 12,22A2,2 0 0,1 10,20V18A2,2 0 0,1 12,16Z"/></svg> In-Process Embedding</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M2.81,14.12L5.64,11.29L8.17,10.79C11.39,6.41 17.55,4.22 19.78,4.22C19.78,6.45 17.59,12.61 13.21,15.83L12.71,18.36L9.88,21.19C9.5,21.57 8.91,21.57 8.53,21.19L2.81,15.47C2.43,15.09 2.43,14.5 2.81,14.12M5.64,16.95L7.05,18.36L4.93,20.5L7.05,17.89L5.64,16.95M4.93,3.5L7.05,5.64L4.93,7.78L7.05,6.36L4.93,3.5Z"/></svg> Sub-millisecond Queries</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M6,2C4.89,2 4,2.89 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2H6M13,3.5L18.5,9H13V3.5Z"/></svg> Under 1MB Binary</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M18,8A2,2 0 0,1 20,10V20A2,2 0 0,1 18,22H6A2,2 0 0,1 4,20V10A2,2 0 0,1 6,8H7V6A5,5 0 0,1 12,1A5,5 0 0,1 17,6V8H18M12,3A3,3 0 0,0 9,6V8H15V6A3,3 0 0,0 12,3Z"/></svg> MIT License</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M11,21H13V19H11M13,17V15H11V17M12,1A10,10 0 0,0 2,11H4C4,6.03 8.03,2 13,2A9,9 0 0,1 22,11C22,16.03 17.97,20 13,20H12V17H13A7,7 0 0,0 20,11A7,7 0 0,0 13,4A7,7 0 0,0 6,11H8A5,5 0 0,1 13,6A5,5 0 0,1 18,11A5,5 0 0,1 13,16H11V13H13A3,3 0 0,0 16,11A3,3 0 0,0 13,8A3,3 0 0,0 10,11H12V1Z"/></svg> Blazing Fast</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M4,5H8V2H10V22H8V18H4V15H8V9H4M14,5V2H16V22H14V18H11V15H14V9H11V6H14V5Z"/></svg> Columnar Storage</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M22.7,19L13.6,9.9C14.5,7.6 14,4.9 12.1,3C10.1,1 7.1,0.6 4.7,1.7L9,6L6,9L1.6,4.7C0.4,7.1 0.9,10.1 2.9,12.1C4.8,14 7.5,14.5 9.8,13.6L18.9,22.7C19.3,23.1 19.9,23.1 20.3,22.7L22.6,20.4C23.1,20 23.1,19.3 22.7,19Z"/></svg> Zero Dependencies</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M19.36,10.04C21.95,10.22 24,12.36 24,15A5,5 0 0,1 19,20H6A6,6 0 0,1 0,14C0,10.91 2.34,8.36 5.35,8.04C6.6,5.64 9.11,4 12,4C15.64,4 18.67,6.59 19.36,10.04Z"/></svg> Cloud Native</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M12,2A3,3 0 0,1 15,5V11A3,3 0 0,1 12,14A3,3 0 0,1 9,11V5A3,3 0 0,1 12,2M12,4A1,1 0 0,0 11,5V11A1,1 0 0,0 12,12A1,1 0 0,0 13,11V5A1,1 0 0,0 12,4M2,13H22V15H2V13M12,16A2,2 0 0,1 14,18V20A2,2 0 0,1 12,22A2,2 0 0,1 10,20V18A2,2 0 0,1 12,16Z"/></svg> In-Process Embedding</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M2.81,14.12L5.64,11.29L8.17,10.79C11.39,6.41 17.55,4.22 19.78,4.22C19.78,6.45 17.59,12.61 13.21,15.83L12.71,18.36L9.88,21.19C9.5,21.57 8.91,21.57 8.53,21.19L2.81,15.47C2.43,15.09 2.43,14.5 2.81,14.12M5.64,16.95L7.05,18.36L4.93,20.5L7.05,17.89L5.64,16.95M4.93,3.5L7.05,5.64L4.93,7.78L7.05,6.36L4.93,3.5Z"/></svg> Sub-millisecond Queries</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M6,2C4.89,2 4,2.89 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2H6M13,3.5L18.5,9H13V3.5Z"/></svg> Under 1MB Binary</span>
+<span><svg class="ticker-icon" viewBox="0 0 24 24"><path fill="currentColor" d="M18,8A2,2 0 0,1 20,10V20A2,2 0 0,1 18,22H6A2,2 0 0,1 4,20V10A2,2 0 0,1 6,8H7V6A5,5 0 0,1 12,1A5,5 0 0,1 17,6V8H18M12,3A3,3 0 0,0 9,6V8H15V6A3,3 0 0,0 12,3Z"/></svg> MIT License</span>
 </div>
 </div>
 </div>
 
 <div class="features-section" markdown>
 
-## Think fast. **Build faster.**
+## Think fast. **Build faster.** {.scroll-fade-in}
 
-<div class="grid cards" markdown>
+<div class="grid cards scroll-fade-in" markdown>
 
 - :material-lightning-bolt:{ .lg .middle .feature-icon } **Blazing Fast**
 
@@ -101,12 +110,12 @@ The high-performance columnar database engineered for lightning-fast analytics a
 
 <div class="code-demo-section">
 
-<div class="code-demo-header">
+<div class="code-demo-header scroll-fade-in">
 <h2>Expressive. <strong>Readable.</strong> Fast.</h2>
 <p>Rayfall combines the power of array programming with the clarity of Lisp syntax.</p>
 </div>
 
-<div class="code-tabs">
+<div class="code-tabs scroll-fade-in">
 <div class="code-tab-list">
 <button class="code-tab active" data-tab="select">Select</button>
 <button class="code-tab" data-tab="insert">Insert</button>
@@ -281,12 +290,84 @@ document.addEventListener('DOMContentLoaded', function() {
   });
 });
 </script>
+
+<style>
+/* Scroll fade-in animation styles */
+.scroll-fade-in {
+  opacity: 0;
+  transform: translateY(30px);
+  transition: opacity 0.8s ease-out, transform 0.8s ease-out;
+}
+
+.scroll-fade-in.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Logo container and ticker - visible by default, animate on load */
+.hero-content > .scroll-fade-in:first-child,
+.hero-ticker.scroll-fade-in {
+  opacity: 1 !important;
+  transform: translateY(0) !important;
+  transition-delay: 0s !important;
+}
+
+.hero-content > .scroll-fade-in:first-child img {
+  opacity: 1 !important;
+}
+
+/* Stagger delays for hero section elements */
+.hero-content > h1.scroll-fade-in,
+.hero-content > .hero-description.scroll-fade-in {
+  transition-delay: 0.2s;
+}
+
+.hero-content > .hero-buttons.scroll-fade-in {
+  transition-delay: 0.3s;
+}
+
+.hero-content > .hero-socials.scroll-fade-in {
+  transition-delay: 0.4s;
+}
+</style>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  // Intersection Observer for scroll animations
+  const observerOptions = {
+    threshold: 0.1,
+    rootMargin: '0px 0px -50px 0px'
+  };
+
+  const observer = new IntersectionObserver(function(entries) {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+        // Optional: unobserve after animation to improve performance
+        // observer.unobserve(entry.target);
+      }
+    });
+  }, observerOptions);
+
+  // Observe all elements with scroll-fade-in class except logo and ticker
+  document.querySelectorAll('.scroll-fade-in').forEach(el => {
+    // Skip the logo container and ticker - they're always visible
+    if (!el.matches('.hero-content > .scroll-fade-in:first-child') && 
+        !el.matches('.hero-ticker.scroll-fade-in')) {
+      observer.observe(el);
+    } else {
+      // Logo and ticker are always visible, mark them as visible
+      el.classList.add('visible');
+    }
+  });
+});
+</script>
 </div>
 
 
 <div id="ecosystem" class="features-section" markdown>
 
-## Integrate with your **Stack**
+## Integrate with your **Stack** {.scroll-fade-in}
 
 <div class="grid cards" markdown>
 
@@ -319,7 +400,7 @@ document.addEventListener('DOMContentLoaded', function() {
 </div>
 
 
-<div class="cta-section" markdown>
+<div class="cta-section scroll-fade-in" markdown>
 
 ## Get started in **minutes**
 

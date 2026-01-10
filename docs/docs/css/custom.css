@@ -1058,7 +1058,7 @@ a.md-button:not(.md-button--primary):hover {
     background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 50%, #ffffff 100%);
     margin: 0;
     margin-top: -1.5rem;
-    padding: 2rem 2rem 0 2rem;
+    padding: 1.5rem 2rem 0 2rem;
     text-align: center;
     position: relative;
     overflow: visible;
@@ -1088,27 +1088,65 @@ a.md-button:not(.md-button--primary):hover {
     left: 0;
     right: 0;
     bottom: 0;
-    background:
-        radial-gradient(circle at 20% 80%, rgba(233, 160, 51, 0.15) 0%, transparent 50%),
-        radial-gradient(circle at 80% 20%, rgba(4, 35, 59, 0.05) 0%, transparent 50%);
+    background: 
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(233, 160, 51, 0.15), transparent),
+        radial-gradient(ellipse 60% 40% at 80% 80%, rgba(4, 35, 59, 0.1), transparent),
+        radial-gradient(ellipse 40% 30% at 10% 60%, rgba(233, 160, 51, 0.08), transparent);
     pointer-events: none;
 }
 
+.hero-section::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-image: 
+        linear-gradient(rgba(4, 35, 59, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(4, 35, 59, 0.03) 1px, transparent 1px);
+    background-size: 60px 60px;
+    mask-image: radial-gradient(ellipse at center, black 30%, transparent 70%);
+    -webkit-mask-image: radial-gradient(ellipse at center, black 30%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+}
+
 /* Light/dark logo switching */
-.light-only {
-    display: inline-block;
+.light-only,
+img.light-only,
+.hero-logo.light-only,
+img.hero-logo.light-only,
+.hero-section img.hero-logo.light-only,
+.hero-content img.hero-logo.light-only {
+    display: block !important;
 }
 
-.dark-only {
-    display: none;
+.dark-only,
+img.dark-only,
+.hero-logo.dark-only,
+img.hero-logo.dark-only,
+.hero-section img.hero-logo.dark-only,
+.hero-content img.hero-logo.dark-only {
+    display: none !important;
 }
 
-[data-md-color-scheme="slate"] .light-only {
-    display: none;
+[data-md-color-scheme="slate"] .light-only,
+[data-md-color-scheme="slate"] img.light-only,
+[data-md-color-scheme="slate"] .hero-logo.light-only,
+[data-md-color-scheme="slate"] img.hero-logo.light-only,
+[data-md-color-scheme="slate"] .hero-section img.hero-logo.light-only,
+[data-md-color-scheme="slate"] .hero-content img.hero-logo.light-only {
+    display: none !important;
 }
 
-[data-md-color-scheme="slate"] .dark-only {
-    display: inline-block;
+[data-md-color-scheme="slate"] .dark-only,
+[data-md-color-scheme="slate"] img.dark-only,
+[data-md-color-scheme="slate"] .hero-logo.dark-only,
+[data-md-color-scheme="slate"] img.hero-logo.dark-only,
+[data-md-color-scheme="slate"] .hero-section img.hero-logo.dark-only,
+[data-md-color-scheme="slate"] .hero-content img.hero-logo.dark-only {
+    display: block !important;
 }
 
 .hero-content {
@@ -1116,21 +1154,24 @@ a.md-button:not(.md-button--primary):hover {
     z-index: 1;
     max-width: 900px;
     margin: auto;
-    padding-bottom: 3rem;
+    padding-bottom: 1rem;
 }
 
-.hero-logo {
-    max-width: 400px;
-    width: 100%;
-    height: auto;
-    margin-bottom: 1.5rem;
+.hero-logo,
+.hero-section img.hero-logo,
+.hero-content img.hero-logo {
+    display: block !important;
+    max-width: 750px !important;
+    width: 100% !important;
+    height: auto !important;
+    margin: 32px auto 32px !important;
 }
 
 .hero-section h1 {
     color: #04233b !important;
     font-size: 2.8rem;
     font-weight: 300;
-    margin: 0 0 1.5rem 0;
+    margin: 0 0 1rem 0;
     line-height: 1.2;
     border: none;
 }
@@ -1148,12 +1189,13 @@ a.md-button:not(.md-button--primary):hover {
     font-weight: 700;
 }
 
-.hero-section p {
-    color: #555;
-    font-size: 1.25rem;
-    max-width: 600px;
-    margin: 0 auto 2.5rem auto;
-    line-height: 1.6;
+.hero-section p,
+.hero-description {
+    color: #495057;
+    font-size: 1rem;
+    max-width: 640px;
+    margin: 0 auto 2rem;
+    line-height: 1.7;
 }
 
 .hero-btn {
@@ -1162,6 +1204,15 @@ a.md-button:not(.md-button--primary):hover {
     font-size: 1rem;
     border-radius: 50px;
     transition: all 0.3s ease;
+}
+
+.hero-section .md-button,
+.hero-section a.md-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 28px;
+    font-weight: 600;
 }
 
 .hero-section .md-button--primary {
@@ -1175,7 +1226,7 @@ a.md-button:not(.md-button--primary):hover {
     border-color: #e9a033;
     color: #04233b;
     transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(233, 160, 51, 0.4);
+    box-shadow: 0 8px 24px rgba(233, 160, 51, 0.4);
 }
 
 .hero-section .md-button:not(.md-button--primary) {
@@ -1197,7 +1248,7 @@ a.md-button:not(.md-button--primary):hover {
     justify-content: center;
     align-items: center;
     gap: 1.2rem;
-    margin: 1.5rem 0;
+    margin: 1.5rem 0 0.5rem 0;
 }
 
 .hero-socials p {
@@ -1232,7 +1283,7 @@ a.md-button:not(.md-button--primary):hover {
     display: flex;
     justify-content: center;
     align-items: center;
-    gap: 0.5rem;
+    gap: 16px;
     flex-wrap: wrap;
 }
 
@@ -1756,17 +1807,25 @@ a.md-button:not(.md-button--primary):hover {
 }
 
 [data-md-color-scheme="slate"] .hero-section::before {
-    background:
-        radial-gradient(circle at 20% 80%, rgba(233, 160, 51, 0.1) 0%, transparent 50%),
-        radial-gradient(circle at 80% 20%, rgba(233, 160, 51, 0.08) 0%, transparent 50%);
+    background: 
+        radial-gradient(ellipse 80% 50% at 50% -20%, rgba(233, 160, 51, 0.2), transparent),
+        radial-gradient(ellipse 60% 40% at 80% 80%, rgba(233, 160, 51, 0.1), transparent),
+        radial-gradient(ellipse 40% 30% at 10% 60%, rgba(10, 58, 92, 0.5), transparent);
+}
+
+[data-md-color-scheme="slate"] .hero-section::after {
+    background-image: 
+        linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
 }
 
 [data-md-color-scheme="slate"] .hero-section h1 {
     color: #ffffff !important;
 }
 
-[data-md-color-scheme="slate"] .hero-section p {
-    color: rgba(255, 255, 255, 0.85);
+[data-md-color-scheme="slate"] .hero-section p,
+[data-md-color-scheme="slate"] .hero-description {
+    color: rgba(255, 255, 255, 0.8);
 }
 
 [data-md-color-scheme="slate"] .hero-section .md-button--primary {
@@ -1778,7 +1837,7 @@ a.md-button:not(.md-button--primary):hover {
 [data-md-color-scheme="slate"] .hero-section .md-button--primary:hover {
     background-color: #f0b85a;
     border-color: #f0b85a;
-    box-shadow: 0 4px 12px rgba(233, 160, 51, 0.4);
+    box-shadow: 0 8px 24px rgba(233, 160, 51, 0.4);
 }
 
 [data-md-color-scheme="slate"] .hero-section .md-button:not(.md-button--primary) {
@@ -1798,10 +1857,13 @@ a.md-button:not(.md-button--primary):hover {
     margin-top: auto;
     margin-bottom: 0;
     margin-left: calc(-50vw + 50%);
+    margin-right: calc(-50vw + 50%);
     width: 100vw;
+
     background: linear-gradient(90deg, #04233b 0%, #0a3a5c 50%, #04233b 100%);
     overflow: hidden;
     padding: 0.5rem 0;
+    box-sizing: border-box;
 }
 
 .hero-ticker__content {
@@ -1817,6 +1879,29 @@ a.md-button:not(.md-button--primary):hover {
     font-size: 0.8rem;
     font-weight: 500;
     letter-spacing: 0.3px;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding-right: 1.5rem;
+    position: center;
+}
+
+.hero-ticker__content span:not(:last-child)::after {
+    content: '';
+    position: absolute;
+    right: 0.75rem;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 1px;
+    height: 60%;
+    background-color: rgba(255, 255, 255, 0.3);
+}
+
+.hero-ticker__content .ticker-icon {
+    width: 1rem;
+    height: 1rem;
+    flex-shrink: 0;
+    fill: currentColor;
 }
 
 @keyframes ticker {
@@ -1982,7 +2067,7 @@ a.md-button:not(.md-button--primary):hover {
 
 @media screen and (max-width: 768px) {
     .hero-section {
-        padding: 3rem 1rem 4rem 1rem;
+        padding: 1.5rem 1rem 0 1rem;
     }
 
     .hero-section h1 {
@@ -1993,8 +2078,11 @@ a.md-button:not(.md-button--primary):hover {
         font-size: 1.1rem;
     }
 
-    .hero-logo {
-        max-width: 280px;
+    .hero-logo,
+    .hero-section img.hero-logo,
+    .hero-content img.hero-logo {
+        max-width: 320px !important;
+        margin-bottom: 24px !important;
     }
 
     .hero-btn {
