@@ -77,9 +77,6 @@ typedef struct executor_t {
     ray_thread_t handle;
     heap_p heap;
     vm_p vm;
-    i32_t event_fd;      // Per-worker event for lightweight wake-up
-    i64_t task_start;    // Start index of assigned tasks
-    i64_t task_end;      // End index (exclusive) of assigned tasks
 } executor_t;
 
 typedef struct pool_t {
@@ -90,9 +87,8 @@ typedef struct pool_t {
     i64_t done_count;        // Number of done VMs
     i64_t executors_count;   // Number of executors
     i64_t tasks_count;       // Number of tasks
-    i64_t tasks_capacity;    // Capacity of tasks array
-    task_data_t *tasks;      // Direct task array (workers read by index, no queue contention)
-    obj_p *results;          // Direct result array (avoids result queue contention)
+    mpmc_p task_queue;       // Pool's task queue
+    mpmc_p result_queue;     // Pool's result queue
     executor_t executors[];  // Array of executors
 } *pool_p;
 

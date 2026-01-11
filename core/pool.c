@@ -167,8 +167,8 @@ obj_p pool_call_task_fn(raw_p fn, i64_t argc, raw_p argv[]) {
 
 raw_p executor_run(raw_p arg) {
     executor_t *executor = (executor_t *)arg;
-    task_data_t *task;
-    i64_t i, task_start, task_end, processed;
+    task_data_t data;
+    i64_t i, tasks_count;
     obj_p res;
     vm_p vm;
 
@@ -180,33 +180,34 @@ raw_p executor_run(raw_p arg) {
     __atomic_store_n(&executor->vm, vm, __ATOMIC_RELAXED);
 
     for (;;) {
-        // Wait for work using lightweight eventfd (no mutex needed)
-        event_wait(executor->event_fd);
+        mutex_lock(&executor->pool->mutex);
+        cond_wait(&executor->pool->run, &executor->pool->mutex);
 
-        // Memory barrier: ensure we see all writes from the signaling thread
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-
-        // Check if pool is being destroyed
-        if (executor->pool->state == RUN_STATE_STOPPED)
+        if (executor->pool->state == RUN_STATE_STOPPED) {
+            mutex_unlock(&executor->pool->mutex);
             break;
-
-        // Read assigned task range (set by pool_run before signaling)
-        task_start = executor->task_start;
-        task_end = executor->task_end;
-
-        // Process assigned tasks directly from array (no queue contention)
-        processed = 0;
-        for (i = task_start; i < task_end; i++) {
-            task = &executor->pool->tasks[i];
-            res = pool_call_task_fn(task->fn, task->argc, task->argv);
-            __atomic_store_n(&executor->pool->results[task->id], res, __ATOMIC_RELEASE);
-            processed++;
         }
 
-        if (processed > 0) {
-            // Atomic increment of done_count + signal main thread
-            __atomic_fetch_add(&executor->pool->done_count, processed, __ATOMIC_RELEASE);
+        tasks_count = executor->pool->tasks_count;
+        mutex_unlock(&executor->pool->mutex);
+
+        // process tasks
+        for (i = 0; i < tasks_count; i++) {
+            data = mpmc_pop(executor->pool->task_queue);
+
+            // Nothing to do
+            if (data.id == -1)
+                break;
+
+            // execute task
+            res = pool_call_task_fn(data.fn, data.argc, data.argv);
+            data.result = res;
+            mpmc_push(executor->pool->result_queue, data);
+        }
+
+        if (i > 0) {
             mutex_lock(&executor->pool->mutex);
+            executor->pool->done_count += i;
             cond_signal(&executor->pool->done);
             mutex_unlock(&executor->pool->mutex);
         }
@@ -227,9 +228,8 @@ pool_p pool_create(i64_t thread_count) {
     pool->executors_count = thread_count;
     pool->done_count = 0;
     pool->tasks_count = 0;
-    pool->tasks_capacity = DEFAULT_MPMC_SIZE;
-    pool->tasks = (task_data_t *)heap_mmap(pool->tasks_capacity * sizeof(task_data_t));
-    pool->results = NULL;  // Allocated per-run
+    pool->task_queue = mpmc_create(DEFAULT_MPMC_SIZE);
+    pool->result_queue = mpmc_create(DEFAULT_MPMC_SIZE);
     pool->state = RUN_STATE_RUNNING;
     pool->mutex = mutex_create();
     pool->run = cond_create();
@@ -238,7 +238,6 @@ pool_p pool_create(i64_t thread_count) {
     // Executor[0] is the main thread - create VM directly here
     pool->executors[0].id = 0;
     pool->executors[0].pool = pool;
-    pool->executors[0].event_fd = -1;  // Main thread doesn't need event_fd
     vm = vm_create(0, pool);
     pool->executors[0].vm = vm;
     pool->executors[0].heap = vm->heap;
@@ -254,7 +253,6 @@ pool_p pool_create(i64_t thread_count) {
         pool->executors[i].pool = pool;
         pool->executors[i].heap = NULL;
         pool->executors[i].vm = NULL;
-        pool->executors[i].event_fd = event_create();  // Per-worker event for wake-up
         pool->executors[i].handle = ray_thread_create(executor_run, &pool->executors[i]);
         if (thread_pin(pool->executors[i].handle, i) != 0)
             LOG_WARN("failed to pin thread %lld", i);
@@ -273,17 +271,12 @@ pool_p pool_create(i64_t thread_count) {
 nil_t pool_destroy(pool_p pool) {
     i64_t i, n;
 
-    n = pool->executors_count;
-
-    // Signal stop state
     mutex_lock(&pool->mutex);
     pool->state = RUN_STATE_STOPPED;
+    cond_broadcast(&pool->run);
     mutex_unlock(&pool->mutex);
 
-    // Wake all workers using eventfd (they'll see RUN_STATE_STOPPED and exit)
-    for (i = 1; i < n; i++) {
-        event_signal(pool->executors[i].event_fd);
-    }
+    n = pool->executors_count;
 
     // Join worker threads (executor[1..n-1]), not main thread
     for (i = 1; i < n; i++) {
@@ -291,15 +284,11 @@ nil_t pool_destroy(pool_p pool) {
             LOG_WARN("failed to join thread %lld", i);
     }
 
-    // Destroy event fds
-    for (i = 1; i < n; i++) {
-        event_destroy(pool->executors[i].event_fd);
-    }
-
     mutex_destroy(&pool->mutex);
     cond_destroy(&pool->run);
     cond_destroy(&pool->done);
-    heap_unmap(pool->tasks, pool->tasks_capacity * sizeof(task_data_t));
+    mpmc_destroy(pool->task_queue);
+    mpmc_destroy(pool->result_queue);
 
     // Destroy main thread's VM (executor[0]) last - after all heap operations
     vm_destroy(pool->executors[0].vm);
@@ -324,49 +313,63 @@ nil_t pool_prepare(pool_p pool) {
     n = pool->executors_count;
     for (i = 1; i < n; i++) {  // Skip executor[0] (main thread) - no self-borrow
         heap_borrow(pool->executors[i].heap);
-        event_clear(pool->executors[i].event_fd);  // Clear any stale signals
     }
 
     mutex_unlock(&pool->mutex);
 }
 
 nil_t pool_add_task(pool_p pool, raw_p fn, i64_t argc, ...) {
-    i64_t i, idx;
+    i64_t i, size;
     va_list args;
-    task_data_t *new_tasks;
+    task_data_t data, old_data;
+    mpmc_p queue;
 
     if (pool == NULL)
         PANIC("pool is NULL");
 
     mutex_lock(&pool->mutex);
 
-    // Grow tasks array if needed
-    if (pool->tasks_count >= pool->tasks_capacity) {
-        i64_t new_capacity = pool->tasks_capacity * 2;
-        new_tasks = (task_data_t *)heap_mmap(new_capacity * sizeof(task_data_t));
-        memcpy(new_tasks, pool->tasks, pool->tasks_count * sizeof(task_data_t));
-        heap_unmap(pool->tasks, pool->tasks_capacity * sizeof(task_data_t));
-        pool->tasks = new_tasks;
-        pool->tasks_capacity = new_capacity;
-    }
-
-    idx = pool->tasks_count++;
-    pool->tasks[idx].id = idx;
-    pool->tasks[idx].fn = fn;
-    pool->tasks[idx].argc = argc;
+    data.id = pool->tasks_count++;
+    data.fn = fn;
+    data.argc = argc;
 
     va_start(args, argc);
+
     for (i = 0; i < argc; i++)
-        pool->tasks[idx].argv[i] = va_arg(args, raw_p);
+        data.argv[i] = va_arg(args, raw_p);
+
     va_end(args);
+
+    if (mpmc_push(pool->task_queue, data) == -1)  // queue is full
+    {
+        size = pool->tasks_count * 2;
+        // Grow task queue
+        queue = mpmc_create(size);
+
+        for (;;) {
+            old_data = mpmc_pop(pool->task_queue);
+            if (old_data.id == -1)
+                break;
+            mpmc_push(queue, old_data);
+        }
+
+        if (mpmc_push(queue, data) == -1)
+            PANIC("oom");
+
+        mpmc_destroy(pool->task_queue);
+        pool->task_queue = queue;
+        // Grow result queue
+        mpmc_destroy(pool->result_queue);
+        pool->result_queue = mpmc_create(size);
+    }
 
     mutex_unlock(&pool->mutex);
 }
 
 obj_p pool_run(pool_p pool) {
-    i64_t i, n, tasks_count, executors_count, workers_needed, chunk, main_processed;
-    obj_p e, res, result;
-    task_data_t *task;
+    i64_t i, n, tasks_count, executors_count;
+    obj_p e, res;
+    task_data_t data;
 
     if (pool == NULL)
         PANIC("pool is NULL");
@@ -378,63 +381,47 @@ obj_p pool_run(pool_p pool) {
     tasks_count = pool->tasks_count;
     executors_count = pool->executors_count;
 
-    // Allocate direct results array (workers write directly, avoiding result queue)
-    pool->results = (obj_p *)heap_alloc(tasks_count * sizeof(obj_p));
-    for (i = 0; i < tasks_count; i++)
-        pool->results[i] = NULL_OBJ;
-
-    // Distribute tasks evenly among workers (including main thread)
-    // This eliminates queue contention - each worker has its own range
-    workers_needed = MINI64(tasks_count, executors_count);
-    chunk = tasks_count / workers_needed;
-    
-    // Assign task ranges to workers (executor[1..n-1])
-    for (i = 1; i < workers_needed; i++) {
-        pool->executors[i].task_start = i * chunk;
-        pool->executors[i].task_end = (i == workers_needed - 1) ? tasks_count : (i + 1) * chunk;
-    }
-    
-    // Main thread (executor[0]) takes the first chunk
-    pool->executors[0].task_start = 0;
-    pool->executors[0].task_end = (workers_needed > 1) ? chunk : tasks_count;
-
-    // Memory barrier: ensure task ranges and results array are visible
-    __atomic_thread_fence(__ATOMIC_RELEASE);
+    // wake up needed executors
+    if (executors_count < tasks_count) {
+        for (i = 0; i < executors_count; i++)
+            cond_signal(&pool->run);
+    } else
+        cond_broadcast(&pool->run);
 
     mutex_unlock(&pool->mutex);
 
-    // Wake up needed workers using lightweight eventfd
-    for (i = 1; i < workers_needed; i++)
-        event_signal(pool->executors[i].event_fd);
+    // process tasks on self too
+    for (i = 0; i < tasks_count; i++) {
+        data = mpmc_pop(pool->task_queue);
 
-    // Process main thread's assigned tasks (no queue, direct array access)
-    main_processed = 0;
-    for (i = pool->executors[0].task_start; i < pool->executors[0].task_end; i++) {
-        task = &pool->tasks[i];
-        result = pool_call_task_fn(task->fn, task->argc, task->argv);
-        __atomic_store_n(&pool->results[task->id], result, __ATOMIC_RELEASE);
-        main_processed++;
+        // Nothing to do
+        if (data.id == -1)
+            break;
+
+        // execute task
+        res = pool_call_task_fn(data.fn, data.argc, data.argv);
+        data.result = res;
+        mpmc_push(pool->result_queue, data);
     }
-
-    // Add main thread's contribution to done_count
-    __atomic_fetch_add(&pool->done_count, main_processed, __ATOMIC_RELEASE);
 
     mutex_lock(&pool->mutex);
 
+    pool->done_count += i;
+
     // wait for all tasks to be done
-    while (__atomic_load_n(&pool->done_count, __ATOMIC_ACQUIRE) < tasks_count)
+    while (pool->done_count < tasks_count)
         cond_wait(&pool->done, &pool->mutex);
 
-    // Collect results directly from array (no queue overhead)
+    // collect results
     res = LIST(tasks_count);
-    for (i = 0; i < tasks_count; i++) {
-        result = __atomic_load_n(&pool->results[i], __ATOMIC_ACQUIRE);
-        AS_LIST(res)[i] = result;
-    }
 
-    // Free results array
-    heap_free(pool->results);
-    pool->results = NULL;
+    for (i = 0; i < tasks_count; i++) {
+        data = mpmc_pop(pool->result_queue);
+        if (data.id < 0 || data.id >= (i64_t)tasks_count)
+            PANIC("corrupted: %lld", data.id);
+
+        ins_obj(&res, data.id, data.result);
+    }
 
     // merge heaps
     n = pool->executors_count;
