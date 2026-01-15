@@ -3991,6 +3991,34 @@ test_result_t test_lang_and() {
     PASS();
 }
 
+// Test that logic operations don't corrupt shared input data (copy-on-write)
+test_result_t test_lang_logic_cow() {
+    // Test that 'and' doesn't corrupt a shared vector
+    TEST_ASSERT_EQ("(do (set v [true false true]) (set r (and v [false true true])) (list v r))",
+                   "(list [true false true] [false false true])");
+
+    // Test that 'or' doesn't corrupt a shared vector
+    TEST_ASSERT_EQ("(do (set v [true false true]) (set r (or v [false true false])) (list v r))",
+                   "(list [true false true] [true true true])");
+
+    // Test with scalar-vector combination (swap case: scalar first)
+    TEST_ASSERT_EQ("(do (set v [true false true]) (set r (and false v)) (list v r))",
+                   "(list [true false true] [false false false])");
+
+    TEST_ASSERT_EQ("(do (set v [false false false]) (set r (or true v)) (list v r))",
+                   "(list [false false false] [true true true])");
+
+    // Test multiple uses of same vector in different logic operations
+    TEST_ASSERT_EQ("(do (set v [true false true false]) (set r1 (and v [true true false false])) (set r2 (or v [false false true true])) (list v r1 r2))",
+                   "(list [true false true false] [true false false false] [true false true true])");
+
+    // Test scalar atoms don't get corrupted
+    TEST_ASSERT_EQ("(do (set a true) (set r (and a false)) (list a r))", "(list true false)");
+    TEST_ASSERT_EQ("(do (set a false) (set r (or a true)) (list a r))", "(list false true)");
+
+    PASS();
+}
+
 test_result_t test_lang_bin() {
     TEST_ASSERT_EQ("(bin [1 2 3 4 5] 3)", "2");
     TEST_ASSERT_EQ("(bin [0 2 4 6 8 10] 5)", "2");

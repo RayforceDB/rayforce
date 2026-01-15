@@ -218,6 +218,7 @@ test_entry_t tests[] = {
     {"test_lang_except", test_lang_except},
     {"test_lang_or", test_lang_or},
     {"test_lang_and", test_lang_and},
+    {"test_lang_logic_cow", test_lang_logic_cow},
     {"test_lang_bin", test_lang_bin},
     {"test_lang_timestamp", test_lang_timestamp},
     {"test_lang_aggregations", test_lang_aggregations},

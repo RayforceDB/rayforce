@@ -186,8 +186,10 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
                 break;
 
             case MTYPE2(-TYPE_B8, TYPE_B8):
+                // Swap so vector is in res, scalar in next
+                // Must cow_obj the vector (next) before modifying it
                 v = res;
-                res = next;
+                res = cow_obj(next);
                 next = v;
                 goto va;
 
@@ -223,6 +225,8 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
 
                     // Both b8(TRUE): and=TRUE, or=TRUE
                     if (a->type == -TYPE_B8 && b->type == -TYPE_B8) {
+                        a = cow_obj(a);
+                        AS_LIST(res)[j] = a;
                         op_func(&a->b8, &b->b8, (raw_p)1, (raw_p)0, (raw_p)1);
                         if (!a->b8) {
                             drop_obj(a);
@@ -233,6 +237,7 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
 
                     // b8(TRUE) with B8 vector: result is vector
                     if (a->type == -TYPE_B8) {
+                        b = cow_obj(b);
                         op_func(AS_B8(b), &a->b8, (raw_p)b->len, (raw_p)0, (raw_p)0);
                         drop_obj(a);
                         AS_LIST(res)[j] = b;
@@ -240,11 +245,15 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
                         continue;
                     }
                     if (b->type == -TYPE_B8) {
+                        a = cow_obj(a);
+                        AS_LIST(res)[j] = a;
                         op_func(AS_B8(a), &b->b8, (raw_p)a->len, (raw_p)0, (raw_p)0);
                         continue;
                     }
 
                     // Both B8 vectors: element-wise
+                    a = cow_obj(a);
+                    AS_LIST(res)[j] = a;
                     op_func(AS_B8(a), AS_B8(b), (raw_p)a->len, (raw_p)0, (raw_p)1);
                 }
 
