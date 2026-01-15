@@ -756,9 +756,17 @@ obj_p cmp_map(raw_p op, obj_p x, obj_p y) {
 __DECLARE_CMP_FN(EQ)
 __DECLARE_CMP_FN(NE)
 __DECLARE_CMP_FN(LT)
-__DECLARE_CMP_FN(GT)
 __DECLARE_CMP_FN(LE)
-__DECLARE_CMP_FN(GE)
+
+// GT is LT with swapped arguments: gt(x,y) == lt(y,x)
+obj_p ray_GT_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p res) {
+    return ray_LT_partial(y, x, len, offset, res);
+}
+
+// GE is LE with swapped arguments: ge(x,y) == le(y,x)
+obj_p ray_GE_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p res) {
+    return ray_LE_partial(y, x, len, offset, res);
+}
 
 obj_p ray_eq(obj_p x, obj_p y) { return cmp_map(ray_EQ_partial, x, y); }
 obj_p ray_ne(obj_p x, obj_p y) { return cmp_map(ray_NE_partial, x, y); }
