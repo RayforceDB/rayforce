@@ -298,14 +298,14 @@ i64_t i16_fmt_into(obj_p* dst, i16_t val) {
     if (val == NULL_I16)
         return str_fmt_into(dst, 4, "%s", LIT_NULL_I16);
 
-    return str_fmt_into(dst, NO_LIMIT, "%d", val);
+    return str_fmt_into(dst, NO_LIMIT, "%dh", val);
 }
 
 i64_t i32_fmt_into(obj_p* dst, i32_t val) {
     if (val == NULL_I32)
         return str_fmt_into(dst, 4, "%s", LIT_NULL_I32);
 
-    return str_fmt_into(dst, NO_LIMIT, "%d", val);
+    return str_fmt_into(dst, NO_LIMIT, "%di", val);
 }
 
 i64_t i64_fmt_into(obj_p* dst, i64_t val) {

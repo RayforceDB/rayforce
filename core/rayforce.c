@@ -2550,6 +2550,21 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(-TYPE_F64, TYPE_C8):
             f64_from_str(AS_C8(obj), obj->len, &num_f64);
             return f64(num_f64);
+
+        // Numeric atom to string conversions (without type suffix)
+        case MTYPE2(TYPE_C8, -TYPE_I16):
+            v = str_fmt(-1, "%d", (int)obj->i16);
+            v->len = strlen(AS_C8(v));
+            return v;
+        case MTYPE2(TYPE_C8, -TYPE_I32):
+            v = str_fmt(-1, "%d", (int)obj->i32);
+            v->len = strlen(AS_C8(v));
+            return v;
+        case MTYPE2(TYPE_C8, -TYPE_I64):
+            v = str_fmt(-1, "%lld", obj->i64);
+            v->len = strlen(AS_C8(v));
+            return v;
+
         case MTYPE2(TYPE_TABLE, TYPE_DICT):
             return table(clone_obj(AS_LIST(obj)[0]), clone_obj(AS_LIST(obj)[1]));
         case MTYPE2(TYPE_DICT, TYPE_TABLE):

@@ -178,18 +178,18 @@ test_result_t test_parted_aggregate_time() {
     // Results are returned as integers (milliseconds since midnight)
     // 09:30:00 = 34200000ms, 09:31:40 = 34300000ms, etc.
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_TIME "(at (select {from: t by: Date f: (first Time)}) 'f)",
-                   "[34200000 34300000 34400000 34500000 34600000]");
+                   "[34200000i 34300000i 34400000i 34500000i 34600000i]");
 
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_TIME "(at (select {from: t by: Date l: (last Time)}) 'l)",
-                   "[34299000 34399000 34499000 34599000 34699000]");
+                   "[34299000i 34399000i 34499000i 34599000i 34699000i]");
 
     // Min should be same as first (time increases within partition)
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_TIME "(at (select {from: t by: Date mn: (min Time)}) 'mn)",
-                   "[34200000 34300000 34400000 34500000 34600000]");
+                   "[34200000i 34300000i 34400000i 34500000i 34600000i]");
 
     // Max should be same as last
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_TIME "(at (select {from: t by: Date mx: (max Time)}) 'mx)",
-                   "[34299000 34399000 34499000 34599000 34699000]");
+                   "[34299000i 34399000i 34499000i 34599000i 34699000i]");
     parted_cleanup();
     PASS();
 }
@@ -200,10 +200,10 @@ test_result_t test_parted_aggregate_time_where() {
     // Filter to single partition and aggregate
     // 09:30:00.000 = 34200000ms, 09:31:39.000 = 34299000ms
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_TIME "(at (select {from: t where: (== Date 2024.01.01) f: (first Time)}) 'f)",
-                   "[34200000]");
+                   "[34200000i]");
 
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_TIME "(at (select {from: t where: (== Date 2024.01.01) l: (last Time)}) 'l)",
-                   "[34299000]");
+                   "[34299000i]");
 
     // Filter to multiple partitions
     TEST_ASSERT_EQ(
@@ -251,16 +251,16 @@ test_result_t test_parted_aggregate_i16() {
     parted_cleanup();
     // Test i16 aggregation - Qty = day + (til n) % 5
     // First values per day: day + 0 = 0, 1, 2, 3, 4
-    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t by: Date f: (first Qty)}) 'f)", "[0 1 2 3 4]");
+    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t by: Date f: (first Qty)}) 'f)", "[0h 1h 2h 3h 4h]");
 
     // Last values per day: day + 99 % 5 = day + 4 = 4, 5, 6, 7, 8
-    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t by: Date l: (last Qty)}) 'l)", "[4 5 6 7 8]");
+    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t by: Date l: (last Qty)}) 'l)", "[4h 5h 6h 7h 8h]");
 
     // Min per day: day + 0 = 0, 1, 2, 3, 4
-    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t by: Date mn: (min Qty)}) 'mn)", "[0 1 2 3 4]");
+    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t by: Date mn: (min Qty)}) 'mn)", "[0h 1h 2h 3h 4h]");
 
     // Max per day: day + 4 = 4, 5, 6, 7, 8
-    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t by: Date mx: (max Qty)}) 'mx)", "[4 5 6 7 8]");
+    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t by: Date mx: (max Qty)}) 'mx)", "[4h 5h 6h 7h 8h]");
     parted_cleanup();
     PASS();
 }
@@ -271,7 +271,7 @@ test_result_t test_parted_aggregate_i16_sum() {
     // Qty = day + (til 100) % 5, sum per day = 100*day + (0+1+2+3+4)*20 = 100*day + 200
     // Day 0: 200, Day 1: 300, Day 2: 400, Day 3: 500, Day 4: 600
     // Check individual sums first
-    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t by: Date s: (sum Qty)}) 's)", "[200 300 400 500 600]");
+    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t by: Date s: (sum Qty)}) 's)", "[200h 300h 400h 500h 600h]");
     parted_cleanup();
     PASS();
 }
@@ -1123,7 +1123,7 @@ test_result_t test_parted_multi_type_by_date() {
     // Day 0: sum = 0+1+2+3+4 * 4 = 40
     // Day 1: sum = 1+2+3+4+5 * 4 = 60
     // Day 2: sum = 2+3+4+5+6 * 4 = 80
-    TEST_ASSERT_EQ(PARTED_TEST_SETUP_MULTI_TYPE "(at (select {from: t by: Date s: (sum I16Col)}) 's)", "[40 60 80]");
+    TEST_ASSERT_EQ(PARTED_TEST_SETUP_MULTI_TYPE "(at (select {from: t by: Date s: (sum I16Col)}) 's)", "[40h 60h 80h]");
     parted_cleanup();
     PASS();
 }
@@ -1578,11 +1578,11 @@ test_result_t test_parted_i16_filter_aggr() {
     parted_cleanup();
     // I16 aggregation with date filter
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t s: (sum Qty) where: (== Date 2024.01.03)}) 's)",
-                   "[400]");
+                   "[400h]");
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t mn: (min Qty) where: (== Date 2024.01.03)}) 'mn)",
-                   "[2]");
+                   "[2h]");
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t mx: (max Qty) where: (== Date 2024.01.03)}) 'mx)",
-                   "[6]");
+                   "[6h]");
     parted_cleanup();
     PASS();
 }
@@ -1593,8 +1593,8 @@ test_result_t test_parted_i16_global_minmax() {
     // Qty = day + (til 100) % 5
     // Min = 0 (day 0, offset 0)
     // Max = 8 (day 4, offset 4)
-    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t mn: (min Qty)}) 'mn)", "[0]");
-    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t mx: (max Qty)}) 'mx)", "[8]");
+    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t mn: (min Qty)}) 'mn)", "[0h]");
+    TEST_ASSERT_EQ(PARTED_TEST_SETUP_I16 "(at (select {from: t mx: (max Qty)}) 'mx)", "[8h]");
     parted_cleanup();
     PASS();
 }

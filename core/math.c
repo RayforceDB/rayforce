@@ -163,6 +163,21 @@ static obj_p add_I16_u8(i16_t x_val, u8_t* __restrict__ rhs, i16_t* __restrict__
     return NULL_OBJ;
 }
 
+static obj_p add_I16_date(i16_t x_val, i32_t* __restrict__ rhs, i32_t* __restrict__ out, i64_t len) {
+    VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI32(i16_to_i32(x_val), rhs[i]);
+    return NULL_OBJ;
+}
+
+static obj_p add_I16_time(i16_t x_val, i32_t* __restrict__ rhs, i32_t* __restrict__ out, i64_t len) {
+    VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI32(i16_to_i32(x_val), rhs[i]);
+    return NULL_OBJ;
+}
+
+static obj_p add_I16_timestamp(i16_t x_val, i64_t* __restrict__ rhs, i64_t* __restrict__ out, i64_t len) {
+    VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI64(i16_to_i64(x_val), rhs[i]);
+    return NULL_OBJ;
+}
+
 // ADD A_V temporal
 static obj_p add_DATE_i32(i32_t x_val, i32_t* __restrict__ rhs, i32_t* __restrict__ out, i64_t len) {
     VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI32(x_val, rhs[i]);
@@ -184,6 +199,11 @@ static obj_p add_DATE_i64(i32_t x_val, i64_t* __restrict__ rhs, i32_t* __restric
     return NULL_OBJ;
 }
 
+static obj_p add_DATE_i16(i32_t x_val, i16_t* __restrict__ rhs, i32_t* __restrict__ out, i64_t len) {
+    VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI32(x_val, i16_to_i32(rhs[i]));
+    return NULL_OBJ;
+}
+
 static obj_p add_DATE_time(i32_t x_val, i32_t* __restrict__ rhs, i64_t* __restrict__ out, i64_t len) {
     VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI64(date_to_timestamp(x_val), time_to_timestamp(rhs[i]));
     return NULL_OBJ;
@@ -196,6 +216,11 @@ static obj_p add_TIME_i32(i32_t x_val, i32_t* __restrict__ rhs, i32_t* __restric
 
 static obj_p add_TIME_i64(i32_t x_val, i64_t* __restrict__ rhs, i32_t* __restrict__ out, i64_t len) {
     VFOR(i64_t i = 0; i < len; i++) out[i] = i64_to_i32(ADDI64(i32_to_i64(x_val), rhs[i]));
+    return NULL_OBJ;
+}
+
+static obj_p add_TIME_i16(i32_t x_val, i16_t* __restrict__ rhs, i32_t* __restrict__ out, i64_t len) {
+    VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI32(x_val, i16_to_i32(rhs[i]));
     return NULL_OBJ;
 }
 
@@ -216,6 +241,11 @@ static obj_p add_TIMESTAMP_i32(i64_t x_val, i32_t* __restrict__ rhs, i64_t* __re
 
 static obj_p add_TIMESTAMP_i64(i64_t x_val, i64_t* __restrict__ rhs, i64_t* __restrict__ out, i64_t len) {
     VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI64(x_val, rhs[i]);
+    return NULL_OBJ;
+}
+
+static obj_p add_TIMESTAMP_i16(i64_t x_val, i16_t* __restrict__ rhs, i64_t* __restrict__ out, i64_t len) {
+    VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI64(x_val, i16_to_i64(rhs[i]));
     return NULL_OBJ;
 }
 
@@ -315,6 +345,21 @@ static obj_p add_u8_i16(u8_t* __restrict__ lhs, i16_t* __restrict__ rhs, i16_t* 
 
 static obj_p add_i16_i16(i16_t* __restrict__ lhs, i16_t* __restrict__ rhs, i16_t* __restrict__ out, i64_t len) {
     VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI16(lhs[i], rhs[i]);
+    return NULL_OBJ;
+}
+
+static obj_p add_i16_date(i16_t* __restrict__ lhs, i32_t* __restrict__ rhs, i32_t* __restrict__ out, i64_t len) {
+    VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI32(i16_to_i32(lhs[i]), rhs[i]);
+    return NULL_OBJ;
+}
+
+static obj_p add_i16_time(i16_t* __restrict__ lhs, i32_t* __restrict__ rhs, i32_t* __restrict__ out, i64_t len) {
+    VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI32(i16_to_i32(lhs[i]), rhs[i]);
+    return NULL_OBJ;
+}
+
+static obj_p add_i16_timestamp(i16_t* __restrict__ lhs, i64_t* __restrict__ rhs, i64_t* __restrict__ out, i64_t len) {
+    VFOR(i64_t i = 0; i < len; i++) out[i] = ADDI64(i16_to_i64(lhs[i]), rhs[i]);
     return NULL_OBJ;
 }
 
@@ -2722,6 +2767,15 @@ i8_t infer_math_type(obj_p x, obj_p y) {
         case MTYPE2(TYPE_I16, TYPE_F64):
         case MTYPE2(TYPE_F64, TYPE_I16):
             return TYPE_F64;
+        case MTYPE2(TYPE_I16, TYPE_DATE):
+        case MTYPE2(TYPE_DATE, TYPE_I16):
+            return TYPE_DATE;
+        case MTYPE2(TYPE_I16, TYPE_TIME):
+        case MTYPE2(TYPE_TIME, TYPE_I16):
+            return TYPE_TIME;
+        case MTYPE2(TYPE_I16, TYPE_TIMESTAMP):
+        case MTYPE2(TYPE_TIMESTAMP, TYPE_I16):
+            return TYPE_TIMESTAMP;
         case MTYPE2(TYPE_I32, TYPE_I32):
         case MTYPE2(TYPE_DATE, TYPE_DATE):
             return TYPE_I32;
@@ -2964,14 +3018,17 @@ obj_p ray_add_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I32, TYPE_DATE):
             return add_DATE_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
         case MTYPE2(TYPE_DATE, -TYPE_I32):
+        case MTYPE2(TYPE_I32, -TYPE_DATE):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_TIME):
             return add_TIME_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
         case MTYPE2(TYPE_TIME, -TYPE_I32):
+        case MTYPE2(TYPE_I32, -TYPE_TIME):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_TIMESTAMP):
             return add_I32_i64(x->i32, AS_I64(y) + offset, AS_I64(out) + offset, len);
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_I32):
+        case MTYPE2(TYPE_I32, -TYPE_TIMESTAMP):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_U8):
             return add_I32_u8(x->i32, AS_U8(y) + offset, AS_I32(out) + offset, len);
@@ -2997,14 +3054,17 @@ obj_p ray_add_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I64, TYPE_DATE):
             return add_I64_date(x->i64, AS_I32(y) + offset, AS_I32(out) + offset, len);
         case MTYPE2(TYPE_DATE, -TYPE_I64):
+        case MTYPE2(TYPE_I64, -TYPE_DATE):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_TIME):
             return add_I64_time(x->i64, AS_I32(y) + offset, AS_I32(out) + offset, len);
         case MTYPE2(TYPE_TIME, -TYPE_I64):
+        case MTYPE2(TYPE_I64, -TYPE_TIME):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_TIMESTAMP):
             return add_I64_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_I64):
+        case MTYPE2(TYPE_I64, -TYPE_TIMESTAMP):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_U8):
             return add_I64_u8(x->i64, AS_U8(y) + offset, AS_I64(out) + offset, len);
@@ -3075,6 +3135,18 @@ obj_p ray_add_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
             return add_I16_u8(x->i16, AS_U8(y) + offset, AS_I16(out) + offset, len);
         case MTYPE2(TYPE_U8, -TYPE_I16):
             return ray_add_partial(y, x, len, offset, out);
+        case MTYPE2(-TYPE_I16, TYPE_DATE):
+            return add_I16_date(x->i16, AS_I32(y) + offset, AS_I32(out) + offset, len);
+        case MTYPE2(TYPE_DATE, -TYPE_I16):
+            return ray_add_partial(y, x, len, offset, out);
+        case MTYPE2(-TYPE_I16, TYPE_TIME):
+            return add_I16_time(x->i16, AS_I32(y) + offset, AS_I32(out) + offset, len);
+        case MTYPE2(TYPE_TIME, -TYPE_I16):
+            return ray_add_partial(y, x, len, offset, out);
+        case MTYPE2(-TYPE_I16, TYPE_TIMESTAMP):
+            return add_I16_timestamp(x->i16, AS_I64(y) + offset, AS_I64(out) + offset, len);
+        case MTYPE2(TYPE_TIMESTAMP, -TYPE_I16):
+            return ray_add_partial(y, x, len, offset, out);
 
         // Temporal atom-vector
         case MTYPE2(-TYPE_DATE, TYPE_I32):
@@ -3106,6 +3178,18 @@ obj_p ray_add_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
             return add_TIMESTAMP_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_TIME):
             return add_TIMESTAMP_time(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+        case MTYPE2(-TYPE_DATE, TYPE_I16):
+            return add_DATE_i16(x->i32, AS_I16(y) + offset, AS_I32(out) + offset, len);
+        case MTYPE2(TYPE_I16, -TYPE_DATE):
+            return ray_add_partial(y, x, len, offset, out);
+        case MTYPE2(-TYPE_TIME, TYPE_I16):
+            return add_TIME_i16(x->i32, AS_I16(y) + offset, AS_I32(out) + offset, len);
+        case MTYPE2(TYPE_I16, -TYPE_TIME):
+            return ray_add_partial(y, x, len, offset, out);
+        case MTYPE2(-TYPE_TIMESTAMP, TYPE_I16):
+            return add_TIMESTAMP_i16(x->i64, AS_I16(y) + offset, AS_I64(out) + offset, len);
+        case MTYPE2(TYPE_I16, -TYPE_TIMESTAMP):
+            return ray_add_partial(y, x, len, offset, out);
 
         // Vector-Vector symmetric
         case MTYPE2(TYPE_B8, TYPE_I64):
@@ -3189,6 +3273,18 @@ obj_p ray_add_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I16, TYPE_I16):
             return add_i16_i16(AS_I16(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+        case MTYPE2(TYPE_I16, TYPE_DATE):
+            return add_i16_date(AS_I16(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+        case MTYPE2(TYPE_DATE, TYPE_I16):
+            return ray_add_partial(y, x, len, offset, out);
+        case MTYPE2(TYPE_I16, TYPE_TIME):
+            return add_i16_time(AS_I16(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+        case MTYPE2(TYPE_TIME, TYPE_I16):
+            return ray_add_partial(y, x, len, offset, out);
+        case MTYPE2(TYPE_I16, TYPE_TIMESTAMP):
+            return add_i16_timestamp(AS_I16(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+        case MTYPE2(TYPE_TIMESTAMP, TYPE_I16):
+            return ray_add_partial(y, x, len, offset, out);
 
         // Temporal vector-vector
         case MTYPE2(TYPE_DATE, TYPE_TIME):
