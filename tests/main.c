@@ -125,21 +125,15 @@ nil_t on_skip(str_p msg) { printf("%sSkipped%s (%s)\n", YELLOW, RESET, msg ? msg
     {                                                                                                                  \
         obj_p le = eval_str(lhs);                                                                                      \
         obj_p lns = obj_fmt(le, B8_TRUE);                                                                              \
-        if (IS_ERR(le)) {                                                                                              \
-            drop_obj(lns);                                                                                             \
-            drop_obj(le);                                                                                              \
-            SKIP("error in eval");                                                                                     \
-        } else {                                                                                                       \
-            obj_p re = eval_str(rhs);                                                                                  \
-            obj_p rns = obj_fmt(re, B8_TRUE);                                                                          \
-            obj_p fmt = str_fmt(-1, "Expected %s, got %s\n -- at: %s:%d", AS_C8(rns), AS_C8(lns), __FILE__, __LINE__); \
-            TEST_ASSERT(str_cmp(AS_C8(lns), lns->len, AS_C8(rns), rns->len) == 0, AS_C8(fmt));                         \
-            drop_obj(fmt);                                                                                             \
-            drop_obj(re);                                                                                              \
-            drop_obj(le);                                                                                              \
-            drop_obj(lns);                                                                                             \
-            drop_obj(rns);                                                                                             \
-        }                                                                                                              \
+        obj_p re = eval_str(rhs);                                                                                      \
+        obj_p rns = obj_fmt(re, B8_TRUE);                                                                              \
+        obj_p fmt = str_fmt(-1, "Expected %s, got %s\n -- at: %s:%d", AS_C8(rns), AS_C8(lns), __FILE__, __LINE__);     \
+        TEST_ASSERT(str_cmp(AS_C8(lns), lns->len, AS_C8(rns), rns->len) == 0, AS_C8(fmt));                             \
+        drop_obj(fmt);                                                                                                 \
+        drop_obj(re);                                                                                                  \
+        drop_obj(le);                                                                                                  \
+        drop_obj(lns);                                                                                                 \
+        drop_obj(rns);                                                                                                 \
     }
 
 #define TEST_ASSERT_ER(lhs, rhs)                                                                                \

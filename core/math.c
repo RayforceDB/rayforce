@@ -3171,6 +3171,7 @@ obj_p ray_add_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_TIME, TYPE_TIMESTAMP):
             return add_TIME_timestamp(x->i32, AS_I64(y) + offset, AS_I64(out) + offset, len);
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIME):
+        case MTYPE2(TYPE_TIME, -TYPE_TIMESTAMP):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_I32):
             return add_TIMESTAMP_i32(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
@@ -3766,8 +3767,12 @@ obj_p ray_mul_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
 
         case MTYPE2(-TYPE_TIME, TYPE_I32):
             return mul_TIME_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+        case MTYPE2(TYPE_I32, -TYPE_TIME):
+            return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_TIME, TYPE_I64):
             return mul_TIME_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+        case MTYPE2(TYPE_I64, -TYPE_TIME):
+            return ray_mul_partial(y, x, len, offset, out);
 
         case MTYPE2(-TYPE_U8, TYPE_U8):
             return mul_U8_u8(x->u8, AS_U8(y) + offset, AS_U8(out) + offset, len);

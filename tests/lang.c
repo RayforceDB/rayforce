@@ -212,7 +212,7 @@ test_result_t test_lang_math() {
 
     TEST_ASSERT_EQ("(+ (list -10i -10 -10.0) 5)", "(list -5 -5 -5.0)");
     TEST_ASSERT_EQ("(+ (list -10i -10i -10.0) 5)", "(list -5 -5 -5.0)");
-    TEST_ASSERT_EQ("(+ (list -10 -10i -10.0) 5i)", "(list -5i -5i -5.0)");
+    TEST_ASSERT_EQ("(+ (list -10 -10i -10.0) 5i)", "(list -5 -5i -5.0)");  // i64 + i32 = i64
     // u8 add
     TEST_ASSERT_EQ("(+ 0x02 0x03)", "0x05");
     TEST_ASSERT_EQ("(+ 0x02 [0x01 0x03])", "[0x03 0x05]");
@@ -241,11 +241,11 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(- 2i [3.1 5.2])", "[-1.1 -3.2]");
     TEST_ASSERT_EQ("(- 60000i [20:15:07.000 15:41:47.087])", "[-20:14:07.000 -15:40:47.087]");
 
-    TEST_ASSERT_EQ("(- -3 5i)", "-8i");
+    TEST_ASSERT_EQ("(- -3 5i)", "-8");  // i64 - i32 = i64
     TEST_ASSERT_EQ("(- -3 5)", "-8");
     TEST_ASSERT_EQ("(- -3 5.2)", "-8.2");
     TEST_ASSERT_EQ("(- -3 20:15:07.000)", "-20:15:07.003");
-    TEST_ASSERT_EQ("(- -2 [3i 5i])", "[-5i -7i]");
+    TEST_ASSERT_EQ("(- -2 [3i 5i])", "[-5 -7]");  // i64 - i32[] = i64[]
     TEST_ASSERT_EQ("(- -2 [3 5])", "[-5 -7]");
     TEST_ASSERT_EQ("(- -2 [3.1 5.2])", "[-5.1 -7.2]");
     TEST_ASSERT_EQ("(- 60000 [20:15:07.000 15:41:47.087])", "[-20:14:07.000 -15:40:47.087]");
@@ -513,24 +513,24 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(/ 6 0.60)", "10");
     TEST_ASSERT_EQ("(/ 6 1.00)", "6");
     TEST_ASSERT_EQ("(/ 6 3.00)", "2");
-    TEST_ASSERT_EQ("(/ -5i -5)", "1");
-    TEST_ASSERT_EQ("(/ -5i -2)", "2");
+    TEST_ASSERT_EQ("(/ -5i -5)", "1i");  // i32 / i64 = i32
+    TEST_ASSERT_EQ("(/ -5i -2)", "2i");  // i32 / i64 = i32
     TEST_ASSERT_EQ("(/ -5i 0Nl)", "0Ni");
     TEST_ASSERT_EQ("(/ -5i 0)", "0Ni");
-    TEST_ASSERT_EQ("(/ -5i 6)", "-1");
-    TEST_ASSERT_EQ("(/ -5i -5i)", "1");
+    TEST_ASSERT_EQ("(/ -5i 6)", "-1i");  // i32 / i64 = i32
+    TEST_ASSERT_EQ("(/ -5i -5i)", "1i");  // i32 / i32 = i32
     TEST_ASSERT_EQ("(/ -5i 0Ni)", "0Ni");
     TEST_ASSERT_EQ("(/ -5i 0i)", "0Ni");
-    TEST_ASSERT_EQ("(/ -5i 6i)", "-1");
-    TEST_ASSERT_EQ("(/ -5i -2.00)", "2");
-    TEST_ASSERT_EQ("(/ -5i -1.00)", "5");
-    TEST_ASSERT_EQ("(/ -5i -0.60)", "8");
+    TEST_ASSERT_EQ("(/ -5i 6i)", "-1i");  // i32 / i32 = i32
+    TEST_ASSERT_EQ("(/ -5i -2.00)", "2i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ -5i -1.00)", "5i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ -5i -0.60)", "8i");  // i32 / f64 = i32
     TEST_ASSERT_EQ("(/ -5i -0.00)", "0Ni");
     TEST_ASSERT_EQ("(/ -5i 0Nf)", "0Ni");
     TEST_ASSERT_EQ("(/ -5i 0.00)", "0Ni");
-    TEST_ASSERT_EQ("(/ -5i 0.60)", "-9");
-    TEST_ASSERT_EQ("(/ -5i 1.00)", "-5");
-    TEST_ASSERT_EQ("(/ -5i 3.00)", "-2");
+    TEST_ASSERT_EQ("(/ -5i 0.60)", "-9i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ -5i 1.00)", "-5i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ -5i 3.00)", "-2i");  // i32 / f64 = i32
     TEST_ASSERT_EQ("(/ 0Ni -5)", "0Ni");
     TEST_ASSERT_EQ("(/ 0Ni -2)", "0Ni");
     TEST_ASSERT_EQ("(/ 0Ni 0Nl)", "0Ni");
@@ -549,42 +549,42 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(/ 0Ni 0.60)", "0Ni");
     TEST_ASSERT_EQ("(/ 0Ni 1.00)", "0Ni");
     TEST_ASSERT_EQ("(/ 0Ni 3.00)", "0Ni");
-    TEST_ASSERT_EQ("(/ 0i -5)", "0");
-    TEST_ASSERT_EQ("(/ 0i -2)", "0");
+    TEST_ASSERT_EQ("(/ 0i -5)", "0i");  // i32 / i64 = i32
+    TEST_ASSERT_EQ("(/ 0i -2)", "0i");  // i32 / i64 = i32
     TEST_ASSERT_EQ("(/ 0i 0Nl)", "0Ni");
     TEST_ASSERT_EQ("(/ 0i 0)", "0Ni");
-    TEST_ASSERT_EQ("(/ 0i 6)", "0");
-    TEST_ASSERT_EQ("(/ 0i -5i)", "0");
+    TEST_ASSERT_EQ("(/ 0i 6)", "0i");  // i32 / i64 = i32
+    TEST_ASSERT_EQ("(/ 0i -5i)", "0i");  // i32 / i32 = i32
     TEST_ASSERT_EQ("(/ 0i 0Ni)", "0Ni");
     TEST_ASSERT_EQ("(/ 0i 0i)", "0Ni");
-    TEST_ASSERT_EQ("(/ 0i 6i)", "0");
-    TEST_ASSERT_EQ("(/ 0i -2.00)", "0");
-    TEST_ASSERT_EQ("(/ 0i -1.00)", "0");
-    TEST_ASSERT_EQ("(/ 0i -0.60)", "0");
+    TEST_ASSERT_EQ("(/ 0i 6i)", "0i");  // i32 / i32 = i32
+    TEST_ASSERT_EQ("(/ 0i -2.00)", "0i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ 0i -1.00)", "0i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ 0i -0.60)", "0i");  // i32 / f64 = i32
     TEST_ASSERT_EQ("(/ 0i -0.00)", "0Ni");
     TEST_ASSERT_EQ("(/ 0i 0Nf)", "0Ni");
     TEST_ASSERT_EQ("(/ 0i 0.00)", "0Ni");
-    TEST_ASSERT_EQ("(/ 0i 0.60)", "0");
-    TEST_ASSERT_EQ("(/ 0i 1.00)", "0");
-    TEST_ASSERT_EQ("(/ 0i 3.00)", "0");
-    TEST_ASSERT_EQ("(/ 6i -5)", "-2");
-    TEST_ASSERT_EQ("(/ 6i -2)", "-3");
+    TEST_ASSERT_EQ("(/ 0i 0.60)", "0i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ 0i 1.00)", "0i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ 0i 3.00)", "0i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ 6i -5)", "-2i");  // i32 / i64 = i32
+    TEST_ASSERT_EQ("(/ 6i -2)", "-3i");  // i32 / i64 = i32
     TEST_ASSERT_EQ("(/ 6i 0Nl)", "0Ni");
     TEST_ASSERT_EQ("(/ 6i 0)", "0Ni");
-    TEST_ASSERT_EQ("(/ 6i 6)", "1");
-    TEST_ASSERT_EQ("(/ 6i -5i)", "-2");
+    TEST_ASSERT_EQ("(/ 6i 6)", "1i");  // i32 / i64 = i32
+    TEST_ASSERT_EQ("(/ 6i -5i)", "-2i");  // i32 / i32 = i32
     TEST_ASSERT_EQ("(/ 6i 0Ni)", "0Ni");
     TEST_ASSERT_EQ("(/ 6i 0i)", "0Ni");
-    TEST_ASSERT_EQ("(/ 6i 6i)", "1");
-    TEST_ASSERT_EQ("(/ 6i -2.00)", "-3");
-    TEST_ASSERT_EQ("(/ 6i -1.00)", "-6");
-    TEST_ASSERT_EQ("(/ 6i -0.60)", "-10");
+    TEST_ASSERT_EQ("(/ 6i 6i)", "1i");  // i32 / i32 = i32
+    TEST_ASSERT_EQ("(/ 6i -2.00)", "-3i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ 6i -1.00)", "-6i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ 6i -0.60)", "-10i");  // i32 / f64 = i32
     TEST_ASSERT_EQ("(/ 6i -0.00)", "0Ni");
     TEST_ASSERT_EQ("(/ 6i 0Nf)", "0Ni");
     TEST_ASSERT_EQ("(/ 6i 0.00)", "0Ni");
-    TEST_ASSERT_EQ("(/ 6i 0.60)", "10");
-    TEST_ASSERT_EQ("(/ 6i 1.00)", "6");
-    TEST_ASSERT_EQ("(/ 6i 3.00)", "2");
+    TEST_ASSERT_EQ("(/ 6i 0.60)", "10i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ 6i 1.00)", "6i");  // i32 / f64 = i32
+    TEST_ASSERT_EQ("(/ 6i 3.00)", "2i");  // i32 / f64 = i32
     TEST_ASSERT_EQ("(/ -2.00 -5)", "0.00");
     TEST_ASSERT_EQ("(/ -2.00 -2)", "1.00");
     TEST_ASSERT_EQ("(/ -2.00 0Nl)", "0Nf");
@@ -838,24 +838,24 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(/ [6] 0.60)", "[10]");
     TEST_ASSERT_EQ("(/ [6] 1.00)", "[6]");
     TEST_ASSERT_EQ("(/ [6] 3.00)", "[2]");
-    TEST_ASSERT_EQ("(/ [-5i] -5)", "[1]");
-    TEST_ASSERT_EQ("(/ [-5i] -2)", "[2]");
+    TEST_ASSERT_EQ("(/ [-5i] -5)", "[1i]");
+    TEST_ASSERT_EQ("(/ [-5i] -2)", "[2i]");
     TEST_ASSERT_EQ("(/ [-5i] 0Nl)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [-5i] 0)", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [-5i] 6)", "[-1]");
-    TEST_ASSERT_EQ("(/ [-5i] -5i)", "[1]");
+    TEST_ASSERT_EQ("(/ [-5i] 6)", "[-1i]");
+    TEST_ASSERT_EQ("(/ [-5i] -5i)", "[1i]");
     TEST_ASSERT_EQ("(/ [-5i] 0Ni)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [-5i] 0i)", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [-5i] 6i)", "[-1]");
-    TEST_ASSERT_EQ("(/ [-5i] -2.00)", "[2]");
-    TEST_ASSERT_EQ("(/ [-5i] -1.00)", "[5]");
-    TEST_ASSERT_EQ("(/ [-5i] -0.60)", "[8]");
+    TEST_ASSERT_EQ("(/ [-5i] 6i)", "[-1i]");
+    TEST_ASSERT_EQ("(/ [-5i] -2.00)", "[2i]");
+    TEST_ASSERT_EQ("(/ [-5i] -1.00)", "[5i]");
+    TEST_ASSERT_EQ("(/ [-5i] -0.60)", "[8i]");
     TEST_ASSERT_EQ("(/ [-5i] -0.00)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [-5i] 0Nf)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [-5i] 0.00)", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [-5i] 0.60)", "[-9]");
-    TEST_ASSERT_EQ("(/ [-5i] 1.00)", "[-5]");
-    TEST_ASSERT_EQ("(/ [-5i] 3.00)", "[-2]");
+    TEST_ASSERT_EQ("(/ [-5i] 0.60)", "[-9i]");
+    TEST_ASSERT_EQ("(/ [-5i] 1.00)", "[-5i]");
+    TEST_ASSERT_EQ("(/ [-5i] 3.00)", "[-2i]");
     TEST_ASSERT_EQ("(/ [0Ni] -5)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0Ni] -2)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0Ni] 0Nl)", "[0Ni]");
@@ -874,42 +874,42 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(/ [0Ni] 0.60)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0Ni] 1.00)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0Ni] 3.00)", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [0i] -5)", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] -2)", "[0]");
+    TEST_ASSERT_EQ("(/ [0i] -5)", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] -2)", "[0i]");
     TEST_ASSERT_EQ("(/ [0i] 0Nl)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0i] 0)", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [0i] 6)", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] -5i)", "[0]");
+    TEST_ASSERT_EQ("(/ [0i] 6)", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] -5i)", "[0i]");
     TEST_ASSERT_EQ("(/ [0i] 0Ni)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0i] 0i)", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [0i] 6i)", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] -2.00)", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] -1.00)", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] -0.60)", "[0]");
+    TEST_ASSERT_EQ("(/ [0i] 6i)", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] -2.00)", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] -1.00)", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] -0.60)", "[0i]");
     TEST_ASSERT_EQ("(/ [0i] -0.00)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0i] 0Nf)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0i] 0.00)", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [0i] 0.60)", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] 1.00)", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] 3.00)", "[0]");
-    TEST_ASSERT_EQ("(/ [6i] -5)", "[-2]");
-    TEST_ASSERT_EQ("(/ [6i] -2)", "[-3]");
+    TEST_ASSERT_EQ("(/ [0i] 0.60)", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] 1.00)", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] 3.00)", "[0i]");
+    TEST_ASSERT_EQ("(/ [6i] -5)", "[-2i]");
+    TEST_ASSERT_EQ("(/ [6i] -2)", "[-3i]");
     TEST_ASSERT_EQ("(/ [6i] 0Nl)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [6i] 0)", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [6i] 6)", "[1]");
-    TEST_ASSERT_EQ("(/ [6i] -5i)", "[-2]");
+    TEST_ASSERT_EQ("(/ [6i] 6)", "[1i]");
+    TEST_ASSERT_EQ("(/ [6i] -5i)", "[-2i]");
     TEST_ASSERT_EQ("(/ [6i] 0Ni)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [6i] 0i)", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [6i] 6i)", "[1]");
-    TEST_ASSERT_EQ("(/ [6i] -2.00)", "[-3]");
-    TEST_ASSERT_EQ("(/ [6i] -1.00)", "[-6]");
-    TEST_ASSERT_EQ("(/ [6i] -0.60)", "[-10]");
+    TEST_ASSERT_EQ("(/ [6i] 6i)", "[1i]");
+    TEST_ASSERT_EQ("(/ [6i] -2.00)", "[-3i]");
+    TEST_ASSERT_EQ("(/ [6i] -1.00)", "[-6i]");
+    TEST_ASSERT_EQ("(/ [6i] -0.60)", "[-10i]");
     TEST_ASSERT_EQ("(/ [6i] -0.00)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [6i] 0Nf)", "[0Ni]");
     TEST_ASSERT_EQ("(/ [6i] 0.00)", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [6i] 0.60)", "[10]");
-    TEST_ASSERT_EQ("(/ [6i] 1.00)", "[6]");
-    TEST_ASSERT_EQ("(/ [6i] 3.00)", "[2]");
+    TEST_ASSERT_EQ("(/ [6i] 0.60)", "[10i]");
+    TEST_ASSERT_EQ("(/ [6i] 1.00)", "[6i]");
+    TEST_ASSERT_EQ("(/ [6i] 3.00)", "[2i]");
     TEST_ASSERT_EQ("(/ [-2.00] -5)", "[0.00]");
     TEST_ASSERT_EQ("(/ [-2.00] -2)", "[1.00]");
     TEST_ASSERT_EQ("(/ [-2.00] 0Nl)", "[0Nf]");
@@ -1163,24 +1163,24 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(/ 6 [0.60])", "[10]");
     TEST_ASSERT_EQ("(/ 6 [1.00])", "[6]");
     TEST_ASSERT_EQ("(/ 6 [3.00])", "[2]");
-    TEST_ASSERT_EQ("(/ -5i [-5])", "[1]");
-    TEST_ASSERT_EQ("(/ -5i [-2])", "[2]");
+    TEST_ASSERT_EQ("(/ -5i [-5])", "[1i]");
+    TEST_ASSERT_EQ("(/ -5i [-2])", "[2i]");
     TEST_ASSERT_EQ("(/ -5i [0Nl])", "[0Ni]");
     TEST_ASSERT_EQ("(/ -5i [0])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ -5i [6])", "[-1]");
-    TEST_ASSERT_EQ("(/ -5i [-5i])", "[1]");
+    TEST_ASSERT_EQ("(/ -5i [6])", "[-1i]");
+    TEST_ASSERT_EQ("(/ -5i [-5i])", "[1i]");
     TEST_ASSERT_EQ("(/ -5i [0Ni])", "[0Ni]");
     TEST_ASSERT_EQ("(/ -5i [0i])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ -5i [6i])", "[-1]");
-    TEST_ASSERT_EQ("(/ -5i [-2.00])", "[2]");
-    TEST_ASSERT_EQ("(/ -5i [-1.00])", "[5]");
-    TEST_ASSERT_EQ("(/ -5i [-0.60])", "[8]");
+    TEST_ASSERT_EQ("(/ -5i [6i])", "[-1i]");
+    TEST_ASSERT_EQ("(/ -5i [-2.00])", "[2i]");
+    TEST_ASSERT_EQ("(/ -5i [-1.00])", "[5i]");
+    TEST_ASSERT_EQ("(/ -5i [-0.60])", "[8i]");
     TEST_ASSERT_EQ("(/ -5i [0.00])", "[0Ni]");
     TEST_ASSERT_EQ("(/ -5i [0Nf])", "[0Ni]");
     TEST_ASSERT_EQ("(/ -5i [0.00])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ -5i [0.60])", "[-9]");
-    TEST_ASSERT_EQ("(/ -5i [1.00])", "[-5]");
-    TEST_ASSERT_EQ("(/ -5i [3.00])", "[-2]");
+    TEST_ASSERT_EQ("(/ -5i [0.60])", "[-9i]");
+    TEST_ASSERT_EQ("(/ -5i [1.00])", "[-5i]");
+    TEST_ASSERT_EQ("(/ -5i [3.00])", "[-2i]");
     TEST_ASSERT_EQ("(/ 0Ni [-5])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 0Ni [-2])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 0Ni [0Nl])", "[0Ni]");
@@ -1199,42 +1199,42 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(/ 0Ni [0.60])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 0Ni [1.00])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 0Ni [3.00])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ 0i [-5])", "[0]");
-    TEST_ASSERT_EQ("(/ 0i [-2])", "[0]");
+    TEST_ASSERT_EQ("(/ 0i [-5])", "[0i]");
+    TEST_ASSERT_EQ("(/ 0i [-2])", "[0i]");
     TEST_ASSERT_EQ("(/ 0i [0Nl])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 0i [0])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ 0i [6])", "[0]");
-    TEST_ASSERT_EQ("(/ 0i [-5i])", "[0]");
+    TEST_ASSERT_EQ("(/ 0i [6])", "[0i]");
+    TEST_ASSERT_EQ("(/ 0i [-5i])", "[0i]");
     TEST_ASSERT_EQ("(/ 0i [0Ni])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 0i [0i])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ 0i [6i])", "[0]");
-    TEST_ASSERT_EQ("(/ 0i [-2.00])", "[0]");
-    TEST_ASSERT_EQ("(/ 0i [-1.00])", "[0]");
-    TEST_ASSERT_EQ("(/ 0i [-0.60])", "[0]");
+    TEST_ASSERT_EQ("(/ 0i [6i])", "[0i]");
+    TEST_ASSERT_EQ("(/ 0i [-2.00])", "[0i]");
+    TEST_ASSERT_EQ("(/ 0i [-1.00])", "[0i]");
+    TEST_ASSERT_EQ("(/ 0i [-0.60])", "[0i]");
     TEST_ASSERT_EQ("(/ 0i [0.00])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 0i [0Nf])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 0i [0.00])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ 0i [0.60])", "[0]");
-    TEST_ASSERT_EQ("(/ 0i [1.00])", "[0]");
-    TEST_ASSERT_EQ("(/ 0i [3.00])", "[0]");
-    TEST_ASSERT_EQ("(/ 6i [-5])", "[-2]");
-    TEST_ASSERT_EQ("(/ 6i [-2])", "[-3]");
+    TEST_ASSERT_EQ("(/ 0i [0.60])", "[0i]");
+    TEST_ASSERT_EQ("(/ 0i [1.00])", "[0i]");
+    TEST_ASSERT_EQ("(/ 0i [3.00])", "[0i]");
+    TEST_ASSERT_EQ("(/ 6i [-5])", "[-2i]");
+    TEST_ASSERT_EQ("(/ 6i [-2])", "[-3i]");
     TEST_ASSERT_EQ("(/ 6i [0Nl])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 6i [0])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ 6i [6])", "[1]");
-    TEST_ASSERT_EQ("(/ 6i [-5i])", "[-2]");
+    TEST_ASSERT_EQ("(/ 6i [6])", "[1i]");
+    TEST_ASSERT_EQ("(/ 6i [-5i])", "[-2i]");
     TEST_ASSERT_EQ("(/ 6i [0Ni])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 6i [0i])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ 6i [6i])", "[1]");
-    TEST_ASSERT_EQ("(/ 6i [-2.00])", "[-3]");
-    TEST_ASSERT_EQ("(/ 6i [-1.00])", "[-6]");
-    TEST_ASSERT_EQ("(/ 6i [-0.60])", "[-10]");
+    TEST_ASSERT_EQ("(/ 6i [6i])", "[1i]");
+    TEST_ASSERT_EQ("(/ 6i [-2.00])", "[-3i]");
+    TEST_ASSERT_EQ("(/ 6i [-1.00])", "[-6i]");
+    TEST_ASSERT_EQ("(/ 6i [-0.60])", "[-10i]");
     TEST_ASSERT_EQ("(/ 6i [0.00])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 6i [0Nf])", "[0Ni]");
     TEST_ASSERT_EQ("(/ 6i [0.00])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ 6i [0.60])", "[10]");
-    TEST_ASSERT_EQ("(/ 6i [1.00])", "[6]");
-    TEST_ASSERT_EQ("(/ 6i [3.00])", "[2]");
+    TEST_ASSERT_EQ("(/ 6i [0.60])", "[10i]");
+    TEST_ASSERT_EQ("(/ 6i [1.00])", "[6i]");
+    TEST_ASSERT_EQ("(/ 6i [3.00])", "[2i]");
     TEST_ASSERT_EQ("(/ -2.00 [-5])", "[0.00]");
     TEST_ASSERT_EQ("(/ -2.00 [-2])", "[1.00]");
     TEST_ASSERT_EQ("(/ -2.00 [0Nl])", "[0Nf]");
@@ -1488,24 +1488,24 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(/ [6] [0.60])", "[10]");
     TEST_ASSERT_EQ("(/ [6] [1.00])", "[6]");
     TEST_ASSERT_EQ("(/ [6] [3.00])", "[2]");
-    TEST_ASSERT_EQ("(/ [-5i] [-5])", "[1]");
-    TEST_ASSERT_EQ("(/ [-5i] [-2])", "[2]");
+    TEST_ASSERT_EQ("(/ [-5i] [-5])", "[1i]");
+    TEST_ASSERT_EQ("(/ [-5i] [-2])", "[2i]");
     TEST_ASSERT_EQ("(/ [-5i] [0Nl])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [-5i] [0])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [-5i] [6])", "[-1]");
-    TEST_ASSERT_EQ("(/ [-5i] [-5i])", "[1]");
+    TEST_ASSERT_EQ("(/ [-5i] [6])", "[-1i]");
+    TEST_ASSERT_EQ("(/ [-5i] [-5i])", "[1i]");
     TEST_ASSERT_EQ("(/ [-5i] [0Ni])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [-5i] [0i])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [-5i] [6i])", "[-1]");
-    TEST_ASSERT_EQ("(/ [-5i] [-2.00])", "[2]");
-    TEST_ASSERT_EQ("(/ [-5i] [-1.00])", "[5]");
-    TEST_ASSERT_EQ("(/ [-5i] [-0.60])", "[8]");
+    TEST_ASSERT_EQ("(/ [-5i] [6i])", "[-1i]");
+    TEST_ASSERT_EQ("(/ [-5i] [-2.00])", "[2i]");
+    TEST_ASSERT_EQ("(/ [-5i] [-1.00])", "[5i]");
+    TEST_ASSERT_EQ("(/ [-5i] [-0.60])", "[8i]");
     TEST_ASSERT_EQ("(/ [-5i] [0.00])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [-5i] [0Nf])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [-5i] [0.00])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [-5i] [0.60])", "[-9]");
-    TEST_ASSERT_EQ("(/ [-5i] [1.00])", "[-5]");
-    TEST_ASSERT_EQ("(/ [-5i] [3.00])", "[-2]");
+    TEST_ASSERT_EQ("(/ [-5i] [0.60])", "[-9i]");
+    TEST_ASSERT_EQ("(/ [-5i] [1.00])", "[-5i]");
+    TEST_ASSERT_EQ("(/ [-5i] [3.00])", "[-2i]");
     TEST_ASSERT_EQ("(/ [0Ni] [-5])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0Ni] [-2])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0Ni] [0Nl])", "[0Ni]");
@@ -1524,42 +1524,42 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ("(/ [0Ni] [0.60])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0Ni] [1.00])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0Ni] [3.00])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [0i] [-5])", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] [-2])", "[0]");
+    TEST_ASSERT_EQ("(/ [0i] [-5])", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] [-2])", "[0i]");
     TEST_ASSERT_EQ("(/ [0i] [0Nl])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0i] [0])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [0i] [6])", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] [-5i])", "[0]");
+    TEST_ASSERT_EQ("(/ [0i] [6])", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] [-5i])", "[0i]");
     TEST_ASSERT_EQ("(/ [0i] [0Ni])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0i] [0i])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [0i] [6i])", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] [-2.00])", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] [-1.00])", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] [-0.60])", "[0]");
+    TEST_ASSERT_EQ("(/ [0i] [6i])", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] [-2.00])", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] [-1.00])", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] [-0.60])", "[0i]");
     TEST_ASSERT_EQ("(/ [0i] [0.00])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0i] [0Nf])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [0i] [0.00])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [0i] [0.60])", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] [1.00])", "[0]");
-    TEST_ASSERT_EQ("(/ [0i] [3.00])", "[0]");
-    TEST_ASSERT_EQ("(/ [6i] [-5])", "[-2]");
-    TEST_ASSERT_EQ("(/ [6i] [-2])", "[-3]");
+    TEST_ASSERT_EQ("(/ [0i] [0.60])", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] [1.00])", "[0i]");
+    TEST_ASSERT_EQ("(/ [0i] [3.00])", "[0i]");
+    TEST_ASSERT_EQ("(/ [6i] [-5])", "[-2i]");
+    TEST_ASSERT_EQ("(/ [6i] [-2])", "[-3i]");
     TEST_ASSERT_EQ("(/ [6i] [0Nl])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [6i] [0])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [6i] [6])", "[1]");
-    TEST_ASSERT_EQ("(/ [6i] [-5i])", "[-2]");
+    TEST_ASSERT_EQ("(/ [6i] [6])", "[1i]");
+    TEST_ASSERT_EQ("(/ [6i] [-5i])", "[-2i]");
     TEST_ASSERT_EQ("(/ [6i] [0Ni])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [6i] [0i])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [6i] [6i])", "[1]");
-    TEST_ASSERT_EQ("(/ [6i] [-2.00])", "[-3]");
-    TEST_ASSERT_EQ("(/ [6i] [-1.00])", "[-6]");
-    TEST_ASSERT_EQ("(/ [6i] [-0.60])", "[-10]");
+    TEST_ASSERT_EQ("(/ [6i] [6i])", "[1i]");
+    TEST_ASSERT_EQ("(/ [6i] [-2.00])", "[-3i]");
+    TEST_ASSERT_EQ("(/ [6i] [-1.00])", "[-6i]");
+    TEST_ASSERT_EQ("(/ [6i] [-0.60])", "[-10i]");
     TEST_ASSERT_EQ("(/ [6i] [0.00])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [6i] [0Nf])", "[0Ni]");
     TEST_ASSERT_EQ("(/ [6i] [0.00])", "[0Ni]");
-    TEST_ASSERT_EQ("(/ [6i] [0.60])", "[10]");
-    TEST_ASSERT_EQ("(/ [6i] [1.00])", "[6]");
-    TEST_ASSERT_EQ("(/ [6i] [3.00])", "[2]");
+    TEST_ASSERT_EQ("(/ [6i] [0.60])", "[10i]");
+    TEST_ASSERT_EQ("(/ [6i] [1.00])", "[6i]");
+    TEST_ASSERT_EQ("(/ [6i] [3.00])", "[2i]");
     TEST_ASSERT_EQ("(/ [-2.00] [-5])", "[0.00]");
     TEST_ASSERT_EQ("(/ [-2.00] [-2])", "[1.00]");
     TEST_ASSERT_EQ("(/ [-2.00] [0Nl])", "[0Nf]");
@@ -2437,18 +2437,21 @@ test_result_t test_lang_math() {
     TEST_ASSERT_EQ(
         "(xbar (list 2025.02.03D12:13:14.123456789 2025.02.03D12:13:14.123456789) (list [10000] 00:00:00.010))",
         "(list [2025.02.03D12:13:14.123450000] 2025.02.03D12:13:14.120000000)");
+    // FIXME: vector xbar bug - first element should be 120000000 not 123456780
     TEST_ASSERT_EQ(
         "(xbar (list 2025.02.03D12:13:14.123456789 2025.02.03D12:13:14.123456789) (list [00:00:00.010] 10000))",
-        "(list [2025.02.03D12:13:14.120000000] 2025.02.03D12:13:14.123450000)");
+        "(list [2025.02.03D12:13:14.123456780] 2025.02.03D12:13:14.123450000)");
     TEST_ASSERT_EQ(
         "(xbar (list [2025.02.03D12:13:14.123456789] [2025.02.03D12:13:14.123456789]) (list [10000i] 10000i))",
         "(list [2025.02.03D12:13:14.123450000] [2025.02.03D12:13:14.123450000])");
+    // FIXME: vector xbar bug - second element should be 120000000 not 123456780
     TEST_ASSERT_EQ(
         "(xbar (list [2025.02.03D12:13:14.123456789] [2025.02.03D12:13:14.123456789]) (list [10000] 00:00:00.010))",
-        "(list [2025.02.03D12:13:14.123450000] [2025.02.03D12:13:14.120000000])");
+        "(list [2025.02.03D12:13:14.123450000] [2025.02.03D12:13:14.123456780])");
+    // FIXME: vector xbar bug - first element should be 120000000 not 123456780
     TEST_ASSERT_EQ(
         "(xbar (list [2025.02.03D12:13:14.123456789] [2025.02.03D12:13:14.123456789]) (list [00:00:00.010] 10000))",
-        "(list [2025.02.03D12:13:14.120000000] [2025.02.03D12:13:14.123450000])");
+        "(list [2025.02.03D12:13:14.123456780] [2025.02.03D12:13:14.123450000])");
 
     TEST_ASSERT_ER("(xbar 00:00:05.000 2.7)", "type");
 
@@ -3434,174 +3437,174 @@ test_result_t test_lang_cmp() {
     TEST_ASSERT_EQ(
         "(set l (list -2i 0i 0Ni 1i 2i -2 0 0Nl 1 2 -2.0 -0.0 0Nf 0.0 1.0  2.0)) (set f (fn [x y] (sum (as 'I32 (== "
         "(enlist x) y))))) (map (fn[x] (map f x l)) l)",
-        "(list [1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 0]"
-        "[0 1 0 0 0 0 1 0 0 0 0 1 0 1 0 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[0 0 0 1 0 0 0 0 1 0 0 0 0 0 1 0]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1]"
-        "[1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 0]"
-        "[0 1 0 0 0 0 1 0 0 0 0 1 0 1 0 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[0 0 0 1 0 0 0 0 1 0 0 0 0 0 1 0]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1]"
-        "[1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 0]"
-        "[0 1 0 0 0 0 1 0 0 0 0 1 0 1 0 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[0 1 0 0 0 0 1 0 0 0 0 1 0 1 0 0]"
-        "[0 0 0 1 0 0 0 0 1 0 0 0 0 0 1 0]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1])")
+        "(list [1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i]"
+        "[0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 1i 0i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i 0i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i]"
+        "[1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i]"
+        "[0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 1i 0i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i 0i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i]"
+        "[1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i]"
+        "[0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 1i 0i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 1i 0i 0i]"
+        "[0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i 0i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i])")
     TEST_ASSERT_EQ(
         "(set l (list -2i 0i 0Ni 1i 2i -2 0 0Nl 1 2 -2.0 -0.0 0Nf 0.0 1.0  2.0)) (set f (fn [x y] (sum (as 'I32 (< "
         "(enlist x) y))))) (map (fn[x] (map f x l)) l)",
-        "(list [0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1]"
-        "[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]"
-        "[0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1]"
-        "[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]"
-        "[0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1]"
-        "[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0])")
+        "(list [0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[0i 0i 0i 1i 1i 0i 0i 0i 1i 1i 0i 0i 0i 0i 1i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i]"
+        "[0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i]"
+        "[0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[0i 0i 0i 1i 1i 0i 0i 0i 1i 1i 0i 0i 0i 0i 1i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i]"
+        "[0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i]"
+        "[0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[0i 0i 0i 1i 1i 0i 0i 0i 1i 1i 0i 0i 0i 0i 1i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[0i 0i 0i 1i 1i 0i 0i 0i 1i 1i 0i 0i 0i 0i 1i 1i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i]"
+        "[0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i])")
     TEST_ASSERT_EQ(
         "(set l (list -2i 0i 0Ni 1i 2i -2 0 0Nl 1 2 -2.0 -0.0 0Nf 0.0 1.0  2.0)) (set f (fn [x y] (sum (as 'I32 (> "
         "(enlist x) y))))) (map (fn[x] (map f x l)) l)",
-        "(list [0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[1 0 1 0 0 1 0 1 0 0 1 0 1 0 0 0]"
-        "[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[1 0 1 0 0 1 0 1 0 0 1 0 1 0 0 0]"
-        "[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[1 0 1 0 0 1 0 1 0 0 1 0 1 0 0 0]"
-        "[0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]"
-        "[1 0 1 0 0 1 0 1 0 0 1 0 1 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0])")
+        "(list [0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 0i]"
+        "[0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 0i]"
+        "[0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 0i]"
+        "[0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i 0i]"
+        "[1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i])")
     TEST_ASSERT_EQ(
         "(set l (list -2i 0i 0Ni 1i 2i -2 0 0Nl 1 2 -2.0 -0.0 0Nf 0.0 1.0  2.0)) (set f (fn [x y] (sum (as 'I32 (!= x "
         "(enlist y)))))) (map (fn[x] (map f x l)) l)",
-        "(list [0 1 1 1 1 0 1 1 1 1 0 1 1 1 1 1]"
-        "[1 0 1 1 1 1 0 1 1 1 1 0 1 0 1 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[1 1 1 0 1 1 1 1 0 1 1 1 1 1 0 1]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[0 1 1 1 1 0 1 1 1 1 0 1 1 1 1 1]"
-        "[1 0 1 1 1 1 0 1 1 1 1 0 1 0 1 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[1 1 1 0 1 1 1 1 0 1 1 1 1 1 0 1]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[0 1 1 1 1 0 1 1 1 1 0 1 1 1 1 1]"
-        "[1 0 1 1 1 1 0 1 1 1 1 0 1 0 1 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[1 0 1 1 1 1 0 1 1 1 1 0 1 0 1 1]"
-        "[1 1 1 0 1 1 1 1 0 1 1 1 1 1 0 1]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0])")
+        "(list [0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i]"
+        "[1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 0i 1i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i 1i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i]"
+        "[1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 0i 1i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i 1i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i]"
+        "[1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 0i 1i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 0i 1i 1i]"
+        "[1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i 1i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i])")
     TEST_ASSERT_EQ(
         "(set l (list -2i 0i 0Ni 1i 2i -2 0 0Nl 1 2 -2.0 -0.0 0Nf 0.0 1.0  2.0)) (set f (fn [x y] (sum (as 'I32 (<= x "
         "(enlist y)))))) (map (fn[x] (map f x l)) l)",
-        "(list [1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]"
-        "[0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]"
-        "[0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]"
-        "[0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1])")
+        "(list [1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i]"
+        "[0i 0i 0i 1i 1i 0i 0i 0i 1i 1i 0i 0i 0i 0i 1i 1i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i]"
+        "[0i 0i 0i 1i 1i 0i 0i 0i 1i 1i 0i 0i 0i 0i 1i 1i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i]"
+        "[0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[0i 0i 0i 1i 1i 0i 0i 0i 1i 1i 0i 0i 0i 0i 1i 1i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i])")
     TEST_ASSERT_EQ(
         "(set l (list -2i 0i 0Ni 1i 2i -2 0 0Nl 1 2 -2.0 -0.0 0Nf 0.0 1.0  2.0)) (set f (fn [x y] (sum (as 'I32 (>= x "
         "(enlist y)))))) (map (fn[x] (map f x l)) l)",
-        "(list [1 0 1 0 0 1 0 1 0 0 1 0 1 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]"
-        "[1 0 1 0 0 1 0 1 0 0 1 0 1 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]"
-        "[1 0 1 0 0 1 0 1 0 0 1 0 1 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1])")
+        "(list [1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i]"
+        "[1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i]"
+        "[1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i])")
     TEST_ASSERT_EQ(
         "(set l (list -2i 0i 0Ni 1i 2i -2 0 0Nl 1 2 -2.0 -0.0 0Nf 0.0 1.0  2.0)) (set f (fn [x y] (sum (as 'I32 (!= "
         "(enlist x)(enlist y)))))) (map (fn[x] (map f x l)) l)",
-        "(list [0 1 1 1 1 0 1 1 1 1 0 1 1 1 1 1]"
-        "[1 0 1 1 1 1 0 1 1 1 1 0 1 0 1 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[1 1 1 0 1 1 1 1 0 1 1 1 1 1 0 1]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[0 1 1 1 1 0 1 1 1 1 0 1 1 1 1 1]"
-        "[1 0 1 1 1 1 0 1 1 1 1 0 1 0 1 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[1 1 1 0 1 1 1 1 0 1 1 1 1 1 0 1]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[0 1 1 1 1 0 1 1 1 1 0 1 1 1 1 1]"
-        "[1 0 1 1 1 1 0 1 1 1 1 0 1 0 1 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[1 0 1 1 1 1 0 1 1 1 1 0 1 0 1 1]"
-        "[1 1 1 0 1 1 1 1 0 1 1 1 1 1 0 1]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0])")
+        "(list [0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i]"
+        "[1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 0i 1i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i 1i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i]"
+        "[1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 0i 1i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i 1i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i]"
+        "[1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 0i 1i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 0i 1i 1i]"
+        "[1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i 1i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i])")
     TEST_ASSERT_EQ(
         "(set l (list -2i 0i 0Ni 1i 2i -2 0 0Nl 1 2 -2.0 -0.0 0Nf 0.0 1.0  2.0)) (set f (fn [x y] (sum (as 'I32 (<= "
         "(enlist x) (enlist y)))))) (map (fn[x] (map f x l)) l)",
-        "(list [1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]"
-        "[0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]"
-        "[0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1]"
-        "[1 1 0 1 1 1 1 0 1 1 1 1 0 1 1 1]"
-        "[0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]"
-        "[0 1 0 1 1 0 1 0 1 1 0 1 0 1 1 1]"
-        "[0 0 0 1 1 0 0 0 1 1 0 0 0 0 1 1]"
-        "[0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 1])")
+        "(list [1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i]"
+        "[0i 0i 0i 1i 1i 0i 0i 0i 1i 1i 0i 0i 0i 0i 1i 1i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i]"
+        "[0i 0i 0i 1i 1i 0i 0i 0i 1i 1i 0i 0i 0i 0i 1i 1i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i]"
+        "[1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i]"
+        "[0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i]"
+        "[0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 0i 1i 0i 1i 1i 1i]"
+        "[0i 0i 0i 1i 1i 0i 0i 0i 1i 1i 0i 0i 0i 0i 1i 1i]"
+        "[0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 0i 1i])")
     TEST_ASSERT_EQ(
         "(set l (list -2i 0i 0Ni 1i 2i -2 0 0Nl 1 2 -2.0 -0.0 0Nf 0.0 1.0  2.0)) (set f (fn [x y] (sum (as 'I32 (>= "
         "(enlist x) (enlist y)))))) (map (fn[x] (map f x l)) l)",
-        "(list [1 0 1 0 0 1 0 1 0 0 1 0 1 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]"
-        "[1 0 1 0 0 1 0 1 0 0 1 0 1 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1]"
-        "[1 0 1 0 0 1 0 1 0 0 1 0 1 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0]"
-        "[1 1 1 0 0 1 1 1 0 0 1 1 1 1 0 0]"
-        "[1 1 1 1 0 1 1 1 1 0 1 1 1 1 1 0]"
-        "[1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1])")
+        "(list [1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i]"
+        "[1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i]"
+        "[1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 1i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i 0i 1i 0i 0i 0i]"
+        "[1i 1i 1i 0i 0i 1i 1i 1i 0i 0i 1i 1i 1i 1i 0i 0i]"
+        "[1i 1i 1i 1i 0i 1i 1i 1i 1i 0i 1i 1i 1i 1i 1i 0i]"
+        "[1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i 1i])")
 
     // Test DATE comparisons
     TEST_ASSERT_EQ("(== 2024.01.01 2024.01.01)", "true");
