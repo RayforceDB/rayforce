@@ -40,8 +40,9 @@
 #define UNLIKELY(x) __builtin_expect((x), 0)
 
 // Vectorized for loop - enables vectorization even with -Os
+// assume_safety tells compiler to skip runtime pointer aliasing checks
 #ifdef __clang__
-#define VFOR _Pragma("clang loop vectorize(enable)") for
+#define VFOR _Pragma("clang loop vectorize(assume_safety)") for
 #else
 #define VFOR _Pragma("GCC ivdep") for
 #endif
