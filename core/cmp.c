@@ -32,39 +32,39 @@
 
 typedef obj_p (*ray_cmp_f)(obj_p, obj_p, i64_t, i64_t, obj_p);
 
-#define __CMP_A_V(x, y, lt, rt, mt, op, ln, of, ov)                              \
-    ({                                                                           \
-        __BASE_##rt##_t *$rhs;                                                   \
-        b8_t *$out;                                                              \
-        $rhs = __AS_##rt(y) + of;                                                \
-        $out = AS_B8(ov) + of;                                                   \
-        for (i64_t $i = 0; $i < ln; $i++)                                        \
-            $out[$i] = op(lt##_to_##mt(x->__BASE_##lt), rt##_to_##mt($rhs[$i])); \
-        NULL_OBJ;                                                                \
+#define __CMP_A_V(x, y, lt, rt, mt, op, ln, of, ov)                                \
+    ({                                                                             \
+        __BASE_##rt##_t *$rhs;                                                     \
+        b8_t *$out;                                                                \
+        $rhs = __AS_##rt(y) + of;                                                  \
+        $out = AS_B8(ov) + of;                                                     \
+        VFOR(i64_t $i = 0; $i < ln; $i++)                                          \
+            $out[$i] = op(lt##_to_##mt(x->__BASE_##lt), rt##_to_##mt($rhs[$i]));   \
+        NULL_OBJ;                                                                  \
     })
 
-#define __CMP_V_A(x, y, lt, rt, mt, op, ln, of, ov)                              \
-    ({                                                                           \
-        __BASE_##lt##_t *$lhs;                                                   \
-        b8_t *$out;                                                              \
-        $lhs = __AS_##lt(x) + of;                                                \
-        $out = AS_B8(ov) + of;                                                   \
-        for (i64_t $i = 0; $i < ln; $i++)                                        \
-            $out[$i] = op(lt##_to_##mt($lhs[$i]), rt##_to_##mt(y->__BASE_##rt)); \
-        NULL_OBJ;                                                                \
+#define __CMP_V_A(x, y, lt, rt, mt, op, ln, of, ov)                                \
+    ({                                                                             \
+        __BASE_##lt##_t *$lhs;                                                     \
+        b8_t *$out;                                                                \
+        $lhs = __AS_##lt(x) + of;                                                  \
+        $out = AS_B8(ov) + of;                                                     \
+        VFOR(i64_t $i = 0; $i < ln; $i++)                                          \
+            $out[$i] = op(lt##_to_##mt($lhs[$i]), rt##_to_##mt(y->__BASE_##rt));   \
+        NULL_OBJ;                                                                  \
     })
 
-#define __CMP_V_V(x, y, lt, rt, mt, op, ln, of, ov)                        \
-    ({                                                                     \
-        __BASE_##lt##_t *$lhs;                                             \
-        __BASE_##rt##_t *$rhs;                                             \
-        b8_t *$out;                                                        \
-        $lhs = __AS_##lt(x) + of;                                          \
-        $rhs = __AS_##rt(y) + of;                                          \
-        $out = AS_B8(ov) + of;                                             \
-        for (i64_t $i = 0; $i < ln; $i++)                                  \
-            $out[$i] = op(lt##_to_##mt($lhs[$i]), rt##_to_##mt($rhs[$i])); \
-        NULL_OBJ;                                                          \
+#define __CMP_V_V(x, y, lt, rt, mt, op, ln, of, ov)                          \
+    ({                                                                       \
+        __BASE_##lt##_t *$lhs;                                               \
+        __BASE_##rt##_t *$rhs;                                               \
+        b8_t *$out;                                                          \
+        $lhs = __AS_##lt(x) + of;                                            \
+        $rhs = __AS_##rt(y) + of;                                            \
+        $out = AS_B8(ov) + of;                                               \
+        VFOR(i64_t $i = 0; $i < ln; $i++)                                    \
+            $out[$i] = op(lt##_to_##mt($lhs[$i]), rt##_to_##mt($rhs[$i]));   \
+        NULL_OBJ;                                                            \
     })
 
 #define __DECLARE_CMP_FN(op)                                                                   \
