@@ -460,7 +460,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
                     for (i = 0; i < n; i++)
                         out[i] = in[filter_ids[first_ids[i]]];
                 } else {
-                    for (i = 0; i < n; i++)
+                    VFOR(i = 0; i < n; i++)
                         out[i] = in[first_ids[i]];
                 }
                 res->type = val->type;
@@ -474,7 +474,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
                     for (i = 0; i < n; i++)
                         out[i] = in[filter_ids[first_ids[i]]];
                 } else {
-                    for (i = 0; i < n; i++)
+                    VFOR(i = 0; i < n; i++)
                         out[i] = in[first_ids[i]];
                 }
                 res->type = val->type;
@@ -490,7 +490,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
                     for (i = 0; i < n; i++)
                         out[i] = in[filter_ids[first_ids[i]]];
                 } else {
-                    for (i = 0; i < n; i++)
+                    VFOR(i = 0; i < n; i++)
                         out[i] = in[first_ids[i]];
                 }
                 res->type = val->type;
@@ -506,7 +506,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
                     for (i = 0; i < n; i++)
                         out[i] = in[filter_ids[first_ids[i]]];
                 } else {
-                    for (i = 0; i < n; i++)
+                    VFOR(i = 0; i < n; i++)
                         out[i] = in[first_ids[i]];
                 }
                 res->type = val->type;
@@ -520,7 +520,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
                     for (i = 0; i < n; i++)
                         out[i] = in[filter_ids[first_ids[i]]];
                 } else {
-                    for (i = 0; i < n; i++)
+                    VFOR(i = 0; i < n; i++)
                         out[i] = in[first_ids[i]];
                 }
                 // Convert enum indices to symbol values

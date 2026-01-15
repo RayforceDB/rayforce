@@ -1977,7 +1977,7 @@ obj_p index_group_i64_unscoped(obj_p obj, obj_p filter) {
 }
 
 obj_p fill_null_i64(i64_t *arr, i64_t len, i64_t offset) {
-    for (i64_t i = offset; i < offset + len; i++)
+    VFOR(i64_t i = offset; i < offset + len; i++)
         arr[i] = NULL_I64;
     return NULL_OBJ;
 }
@@ -1992,7 +1992,7 @@ obj_p index_group_i64_scoped_partial(i64_t input[], i64_t filter[], i64_t group_
         for (i = offset; i < l; i++)
             out[i] = group_ids[input[filter[i]] - min];
     } else {
-        for (i = offset; i < l; i++)
+        VFOR(i = offset; i < l; i++)
             out[i] = group_ids[input[i] - min];
     }
 
