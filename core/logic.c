@@ -100,6 +100,8 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
     if (IS_ERR(res) || n == 1)
         return res;
 
+    res = cow_obj(res);
+
     // Process remaining expressions
     for (i = 1; i < n; i++) {
         next = eval(x[i]);
