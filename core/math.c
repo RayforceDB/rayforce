@@ -52,42 +52,1874 @@
         NULL_OBJ;                                       \
     })
 
-#define __BINOP_A_V(x, y, lt, rt, ot, mt, op, ln, of, ov)                              \
-    ({                                                                                 \
-        __BASE_##rt##_t *__restrict__ $rhs;                                            \
-        __BASE_##ot##_t *__restrict__ $out;                                            \
-        __BASE_##lt##_t $x_val = x->__BASE_##lt;                                       \
-        $rhs = __AS_##rt(y) + of;                                                      \
-        $out = __AS_##ot(ov) + of;                                                     \
-        for (i64_t $i = 0; $i < ln; $i++)                                              \
-            $out[$i] = mt##_to_##ot(op(lt##_to_##mt($x_val), rt##_to_##mt($rhs[$i]))); \
-        NULL_OBJ;                                                                      \
-    })
+// ============================================================================
+// ADD loop functions - Atom-Vector
+// ============================================================================
 
-#define __BINOP_V_A(x, y, lt, rt, ot, mt, op, ln, of, ov)                              \
-    ({                                                                                 \
-        __BASE_##lt##_t *__restrict__ $lhs;                                            \
-        __BASE_##ot##_t *__restrict__ $out;                                            \
-        __BASE_##rt##_t $y_val = y->__BASE_##rt;                                       \
-        $lhs = __AS_##lt(x) + of;                                                      \
-        $out = __AS_##ot(ov) + of;                                                     \
-        for (i64_t $i = 0; $i < ln; $i++)                                              \
-            $out[$i] = mt##_to_##ot(op(lt##_to_##mt($lhs[$i]), rt##_to_##mt($y_val))); \
-        NULL_OBJ;                                                                      \
-    })
+static void add_I32_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(x_val, rhs[i]);
+}
 
-#define __BINOP_V_V(x, y, lt, rt, ot, mt, op, ln, of, ov)                                \
-    ({                                                                                   \
-        __BASE_##lt##_t *__restrict__ $lhs;                                              \
-        __BASE_##rt##_t *__restrict__ $rhs;                                              \
-        __BASE_##ot##_t *__restrict__ $out;                                              \
-        $lhs = __AS_##lt(x) + of;                                                        \
-        $rhs = __AS_##rt(y) + of;                                                        \
-        $out = __AS_##ot(ov) + of;                                                       \
-        for (i64_t $i = 0; $i < ln; $i++)                                                \
-            $out[$i] = mt##_to_##ot(op(lt##_to_##mt($lhs[$i]), rt##_to_##mt($rhs[$i]))); \
-        NULL_OBJ;                                                                        \
-    })
+static void add_I32_i64(i32_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(i32_to_i64(x_val), rhs[i]);
+}
+
+static void add_I32_f64(i32_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(i32_to_f64(x_val), rhs[i]);
+}
+
+static void add_I32_u8(i32_t x_val, u8_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(x_val, u8_to_i32(rhs[i]));
+}
+
+static void add_I32_i16(i32_t x_val, i16_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(x_val, i16_to_i32(rhs[i]));
+}
+
+static void add_I64_i32(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(x_val, i32_to_i64(rhs[i]));
+}
+
+static void add_I64_i64(i64_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(x_val, rhs[i]);
+}
+
+static void add_I64_f64(i64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(i64_to_f64(x_val), rhs[i]);
+}
+
+static void add_I64_u8(i64_t x_val, u8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(x_val, u8_to_i64(rhs[i]));
+}
+
+static void add_I64_i16(i64_t x_val, i16_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(x_val, i16_to_i64(rhs[i]));
+}
+
+static void add_F64_i32(f64_t x_val, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(x_val, i32_to_f64(rhs[i]));
+}
+
+static void add_F64_i64(f64_t x_val, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(x_val, i64_to_f64(rhs[i]));
+}
+
+static void add_F64_f64(f64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(x_val, rhs[i]);
+}
+
+static void add_F64_u8(f64_t x_val, u8_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(x_val, u8_to_f64(rhs[i]));
+}
+
+static void add_F64_i16(f64_t x_val, i16_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(x_val, i16_to_f64(rhs[i]));
+}
+
+static void add_U8_u8(u8_t x_val, u8_t *__restrict__ rhs, u8_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDU8(x_val, rhs[i]);
+}
+
+static void add_U8_i32(u8_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(u8_to_i32(x_val), rhs[i]);
+}
+
+static void add_U8_i64(u8_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(u8_to_i64(x_val), rhs[i]);
+}
+
+static void add_U8_f64(u8_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(u8_to_f64(x_val), rhs[i]);
+}
+
+static void add_U8_i16(u8_t x_val, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI16(u8_to_i16(x_val), rhs[i]);
+}
+
+static void add_I16_i16(i16_t x_val, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI16(x_val, rhs[i]);
+}
+
+static void add_I16_i32(i16_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(i16_to_i32(x_val), rhs[i]);
+}
+
+static void add_I16_i64(i16_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(i16_to_i64(x_val), rhs[i]);
+}
+
+static void add_I16_f64(i16_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(i16_to_f64(x_val), rhs[i]);
+}
+
+static void add_I16_u8(i16_t x_val, u8_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI16(x_val, u8_to_i16(rhs[i]));
+}
+
+// ADD A_V temporal
+static void add_DATE_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(x_val, rhs[i]);
+}
+
+static void add_I64_date(i64_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(i64_to_i32(x_val), rhs[i]);
+}
+
+static void add_I64_time(i64_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(i64_to_i32(x_val), rhs[i]);
+}
+
+static void add_DATE_i64(i32_t x_val, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(x_val, i64_to_i32(rhs[i]));
+}
+
+static void add_DATE_time(i32_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(date_to_timestamp(x_val), time_to_timestamp(rhs[i]));
+}
+
+static void add_TIME_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(x_val, rhs[i]);
+}
+
+static void add_TIME_i64(i32_t x_val, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(ADDI64(i32_to_i64(x_val), rhs[i]));
+}
+
+static void add_TIME_date(i32_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(time_to_timestamp(x_val), date_to_timestamp(rhs[i]));
+}
+
+static void add_TIME_timestamp(i32_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(time_to_timestamp(x_val), rhs[i]);
+}
+
+static void add_TIMESTAMP_i32(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(x_val, i32_to_i64(rhs[i]));
+}
+
+static void add_TIMESTAMP_i64(i64_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(x_val, rhs[i]);
+}
+
+static void add_TIMESTAMP_time(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(x_val, time_to_timestamp(rhs[i]));
+}
+
+// ============================================================================
+// ADD loop functions - Vector-Vector
+// ============================================================================
+
+static void add_b8_i64(b8_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(b8_to_i64(lhs[i]), rhs[i]);
+}
+
+static void add_i32_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(lhs[i], rhs[i]);
+}
+
+static void add_i32_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(i32_to_i64(lhs[i]), rhs[i]);
+}
+
+static void add_i32_f64(i32_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(i32_to_f64(lhs[i]), rhs[i]);
+}
+
+static void add_i32_u8(i32_t *__restrict__ lhs, u8_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(lhs[i], u8_to_i32(rhs[i]));
+}
+
+static void add_i32_i16(i32_t *__restrict__ lhs, i16_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(lhs[i], i16_to_i32(rhs[i]));
+}
+
+static void add_i64_i64(i64_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(lhs[i], rhs[i]);
+}
+
+static void add_i64_f64(i64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(i64_to_f64(lhs[i]), rhs[i]);
+}
+
+static void add_i64_date(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(i64_to_i32(lhs[i]), rhs[i]);
+}
+
+static void add_i64_time(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(i64_to_i32(lhs[i]), rhs[i]);
+}
+
+static void add_i64_u8(i64_t *__restrict__ lhs, u8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(lhs[i], u8_to_i64(rhs[i]));
+}
+
+static void add_i64_i16(i64_t *__restrict__ lhs, i16_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(lhs[i], i16_to_i64(rhs[i]));
+}
+
+static void add_f64_f64(f64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(lhs[i], rhs[i]);
+}
+
+static void add_f64_u8(f64_t *__restrict__ lhs, u8_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(lhs[i], u8_to_f64(rhs[i]));
+}
+
+static void add_f64_i16(f64_t *__restrict__ lhs, i16_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDF64(lhs[i], i16_to_f64(rhs[i]));
+}
+
+static void add_u8_u8(u8_t *__restrict__ lhs, u8_t *__restrict__ rhs, u8_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDU8(lhs[i], rhs[i]);
+}
+
+static void add_u8_i16(u8_t *__restrict__ lhs, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI16(u8_to_i16(lhs[i]), rhs[i]);
+}
+
+static void add_i16_i16(i16_t *__restrict__ lhs, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI16(lhs[i], rhs[i]);
+}
+
+// ADD V_V temporal
+static void add_date_time(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(date_to_timestamp(lhs[i]), time_to_timestamp(rhs[i]));
+}
+
+static void add_time_time(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI32(lhs[i], rhs[i]);
+}
+
+static void add_time_timestamp(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = ADDI64(time_to_timestamp(lhs[i]), rhs[i]);
+}
+
+// ============================================================================
+// SUB loop functions - Atom-Vector
+// ============================================================================
+
+static void sub_I32_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(x_val, rhs[i]);
+}
+
+static void sub_I32_i64(i32_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(i32_to_i64(x_val), rhs[i]);
+}
+
+static void sub_I32_f64(i32_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(i32_to_f64(x_val), rhs[i]);
+}
+
+static void sub_I32_time(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(x_val, rhs[i]);
+}
+
+static void sub_I32_u8(i32_t x_val, u8_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(x_val, u8_to_i32(rhs[i]));
+}
+
+static void sub_I32_i16(i32_t x_val, i16_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(x_val, i16_to_i32(rhs[i]));
+}
+
+static void sub_I64_i32(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(x_val, i32_to_i64(rhs[i]));
+}
+
+static void sub_I64_i64(i64_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(x_val, rhs[i]);
+}
+
+static void sub_I64_f64(i64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(i64_to_f64(x_val), rhs[i]);
+}
+
+static void sub_I64_time(i64_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(i64_to_i32(x_val), rhs[i]);
+}
+
+static void sub_I64_u8(i64_t x_val, u8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(x_val, u8_to_i64(rhs[i]));
+}
+
+static void sub_I64_i16(i64_t x_val, i16_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(x_val, i16_to_i64(rhs[i]));
+}
+
+static void sub_F64_i32(f64_t x_val, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(x_val, i32_to_f64(rhs[i]));
+}
+
+static void sub_F64_i64(f64_t x_val, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(x_val, i64_to_f64(rhs[i]));
+}
+
+static void sub_F64_f64(f64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(x_val, rhs[i]);
+}
+
+static void sub_F64_u8(f64_t x_val, u8_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(x_val, u8_to_f64(rhs[i]));
+}
+
+static void sub_F64_i16(f64_t x_val, i16_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(x_val, i16_to_f64(rhs[i]));
+}
+
+static void sub_U8_u8(u8_t x_val, u8_t *__restrict__ rhs, u8_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBU8(x_val, rhs[i]);
+}
+
+static void sub_U8_i16(u8_t x_val, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI16(u8_to_i16(x_val), rhs[i]);
+}
+
+static void sub_U8_i32(u8_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(u8_to_i32(x_val), rhs[i]);
+}
+
+static void sub_U8_i64(u8_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(u8_to_i64(x_val), rhs[i]);
+}
+
+static void sub_U8_f64(u8_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(u8_to_f64(x_val), rhs[i]);
+}
+
+static void sub_I16_i16(i16_t x_val, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI16(x_val, rhs[i]);
+}
+
+static void sub_I16_u8(i16_t x_val, u8_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI16(x_val, u8_to_i16(rhs[i]));
+}
+
+static void sub_I16_i32(i16_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(i16_to_i32(x_val), rhs[i]);
+}
+
+static void sub_I16_i64(i16_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(i16_to_i64(x_val), rhs[i]);
+}
+
+static void sub_I16_f64(i16_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(i16_to_f64(x_val), rhs[i]);
+}
+
+// SUB A_V temporal
+static void sub_DATE_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(x_val, rhs[i]);
+}
+
+static void sub_DATE_i64(i32_t x_val, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(x_val, i64_to_i32(rhs[i]));
+}
+
+static void sub_DATE_date(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(x_val, rhs[i]);
+}
+
+static void sub_DATE_time(i32_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(date_to_timestamp(x_val), time_to_timestamp(rhs[i]));
+}
+
+static void sub_TIME_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(x_val, rhs[i]);
+}
+
+static void sub_TIME_i64(i32_t x_val, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(x_val, i64_to_i32(rhs[i]));
+}
+
+static void sub_TIMESTAMP_i32(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(x_val, i32_to_i64(rhs[i]));
+}
+
+static void sub_TIMESTAMP_i64(i64_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(x_val, rhs[i]);
+}
+
+static void sub_TIMESTAMP_time(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(x_val, time_to_timestamp(rhs[i]));
+}
+
+static void sub_TIMESTAMP_timestamp(i64_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(x_val, rhs[i]);
+}
+
+// ============================================================================
+// SUB loop functions - Vector-Atom
+// ============================================================================
+
+static void sub_i32_I32(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], y_val);
+}
+
+static void sub_i32_I64(i32_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(i32_to_i64(lhs[i]), y_val);
+}
+
+static void sub_i32_F64(i32_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(i32_to_f64(lhs[i]), y_val);
+}
+
+static void sub_i32_TIME(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], y_val);
+}
+
+static void sub_i32_U8(i32_t *__restrict__ lhs, u8_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], u8_to_i32(y_val));
+}
+
+static void sub_i32_I16(i32_t *__restrict__ lhs, i16_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], i16_to_i32(y_val));
+}
+
+static void sub_i64_I64(i64_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], y_val);
+}
+
+static void sub_i64_F64(i64_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(i64_to_f64(lhs[i]), y_val);
+}
+
+static void sub_i64_TIME(i64_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(i64_to_i32(lhs[i]), y_val);
+}
+
+static void sub_i64_U8(i64_t *__restrict__ lhs, u8_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], u8_to_i64(y_val));
+}
+
+static void sub_i64_I16(i64_t *__restrict__ lhs, i16_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], i16_to_i64(y_val));
+}
+
+static void sub_f64_I32(f64_t *__restrict__ lhs, i32_t y_val, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(lhs[i], i32_to_f64(y_val));
+}
+
+static void sub_f64_I64(f64_t *__restrict__ lhs, i64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(lhs[i], i64_to_f64(y_val));
+}
+
+static void sub_f64_F64(f64_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(lhs[i], y_val);
+}
+
+static void sub_f64_U8(f64_t *__restrict__ lhs, u8_t y_val, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(lhs[i], u8_to_f64(y_val));
+}
+
+static void sub_f64_I16(f64_t *__restrict__ lhs, i16_t y_val, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(lhs[i], i16_to_f64(y_val));
+}
+
+static void sub_u8_U8(u8_t *__restrict__ lhs, u8_t y_val, u8_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBU8(lhs[i], y_val);
+}
+
+static void sub_u8_I32(u8_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(u8_to_i32(lhs[i]), y_val);
+}
+
+static void sub_u8_I64(u8_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(u8_to_i64(lhs[i]), y_val);
+}
+
+static void sub_u8_F64(u8_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(u8_to_f64(lhs[i]), y_val);
+}
+
+static void sub_u8_I16(u8_t *__restrict__ lhs, i16_t y_val, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI16(u8_to_i16(lhs[i]), y_val);
+}
+
+static void sub_i16_I16(i16_t *__restrict__ lhs, i16_t y_val, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI16(lhs[i], y_val);
+}
+
+static void sub_i16_I32(i16_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(i16_to_i32(lhs[i]), y_val);
+}
+
+static void sub_i16_I64(i16_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(i16_to_i64(lhs[i]), y_val);
+}
+
+static void sub_i16_F64(i16_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(i16_to_f64(lhs[i]), y_val);
+}
+
+static void sub_i16_U8(i16_t *__restrict__ lhs, u8_t y_val, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI16(lhs[i], u8_to_i16(y_val));
+}
+
+// SUB V_A temporal
+static void sub_date_I32(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], y_val);
+}
+
+static void sub_date_I64(i32_t *__restrict__ lhs, i64_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], i64_to_i32(y_val));
+}
+
+static void sub_date_DATE(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], y_val);
+}
+
+static void sub_date_TIME(i32_t *__restrict__ lhs, i32_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(date_to_timestamp(lhs[i]), time_to_timestamp(y_val));
+}
+
+static void sub_time_I32(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], y_val);
+}
+
+static void sub_time_I64(i32_t *__restrict__ lhs, i64_t y_val, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], i64_to_i32(y_val));
+}
+
+static void sub_timestamp_I32(i64_t *__restrict__ lhs, i32_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], i32_to_i64(y_val));
+}
+
+static void sub_timestamp_I64(i64_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], y_val);
+}
+
+static void sub_timestamp_TIME(i64_t *__restrict__ lhs, i32_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], time_to_timestamp(y_val));
+}
+
+static void sub_timestamp_TIMESTAMP(i64_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], y_val);
+}
+
+// ============================================================================
+// SUB loop functions - Vector-Vector
+// ============================================================================
+
+static void sub_i32_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], rhs[i]);
+}
+
+static void sub_i32_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(i32_to_i64(lhs[i]), rhs[i]);
+}
+
+static void sub_i32_f64(i32_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(i32_to_f64(lhs[i]), rhs[i]);
+}
+
+static void sub_i32_time(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], rhs[i]);
+}
+
+static void sub_i32_u8(i32_t *__restrict__ lhs, u8_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], u8_to_i32(rhs[i]));
+}
+
+static void sub_i32_i16(i32_t *__restrict__ lhs, i16_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], i16_to_i32(rhs[i]));
+}
+
+static void sub_i64_i32(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], i32_to_i64(rhs[i]));
+}
+
+static void sub_i64_i64(i64_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], rhs[i]);
+}
+
+static void sub_i64_f64(i64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(i64_to_f64(lhs[i]), rhs[i]);
+}
+
+static void sub_i64_time(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(i64_to_i32(lhs[i]), rhs[i]);
+}
+
+static void sub_i64_u8(i64_t *__restrict__ lhs, u8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], u8_to_i64(rhs[i]));
+}
+
+static void sub_i64_i16(i64_t *__restrict__ lhs, i16_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], i16_to_i64(rhs[i]));
+}
+
+static void sub_f64_i32(f64_t *__restrict__ lhs, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(lhs[i], i32_to_f64(rhs[i]));
+}
+
+static void sub_f64_i64(f64_t *__restrict__ lhs, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(lhs[i], i64_to_f64(rhs[i]));
+}
+
+static void sub_f64_f64(f64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(lhs[i], rhs[i]);
+}
+
+static void sub_f64_u8(f64_t *__restrict__ lhs, u8_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(lhs[i], u8_to_f64(rhs[i]));
+}
+
+static void sub_f64_i16(f64_t *__restrict__ lhs, i16_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(lhs[i], i16_to_f64(rhs[i]));
+}
+
+static void sub_u8_u8(u8_t *__restrict__ lhs, u8_t *__restrict__ rhs, u8_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBU8(lhs[i], rhs[i]);
+}
+
+static void sub_u8_i16(u8_t *__restrict__ lhs, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI16(u8_to_i16(lhs[i]), rhs[i]);
+}
+
+static void sub_u8_i32(u8_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(u8_to_i32(lhs[i]), rhs[i]);
+}
+
+static void sub_u8_i64(u8_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(u8_to_i64(lhs[i]), rhs[i]);
+}
+
+static void sub_u8_f64(u8_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(u8_to_f64(lhs[i]), rhs[i]);
+}
+
+static void sub_i16_i16(i16_t *__restrict__ lhs, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI16(lhs[i], rhs[i]);
+}
+
+static void sub_i16_u8(i16_t *__restrict__ lhs, u8_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI16(lhs[i], u8_to_i16(rhs[i]));
+}
+
+static void sub_i16_i32(i16_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(i16_to_i32(lhs[i]), rhs[i]);
+}
+
+static void sub_i16_i64(i16_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(i16_to_i64(lhs[i]), rhs[i]);
+}
+
+static void sub_i16_f64(i16_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBF64(i16_to_f64(lhs[i]), rhs[i]);
+}
+
+// SUB V_V temporal
+static void sub_date_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], rhs[i]);
+}
+
+static void sub_date_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], i64_to_i32(rhs[i]));
+}
+
+static void sub_date_date(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], rhs[i]);
+}
+
+static void sub_date_time(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(date_to_timestamp(lhs[i]), time_to_timestamp(rhs[i]));
+}
+
+static void sub_time_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], rhs[i]);
+}
+
+static void sub_time_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI32(lhs[i], i64_to_i32(rhs[i]));
+}
+
+static void sub_timestamp_i32(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], i32_to_i64(rhs[i]));
+}
+
+static void sub_timestamp_i64(i64_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], rhs[i]);
+}
+
+static void sub_timestamp_time(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], time_to_timestamp(rhs[i]));
+}
+
+static void sub_timestamp_timestamp(i64_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = SUBI64(lhs[i], rhs[i]);
+}
+
+// ============================================================================
+// MUL loop functions - Atom-Vector (MUL is commutative, uses swap pattern)
+// ============================================================================
+
+static void mul_I32_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(x_val, rhs[i]);
+}
+
+static void mul_I32_i64(i32_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(i32_to_i64(x_val), rhs[i]);
+}
+
+static void mul_I32_f64(i32_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(i32_to_f64(x_val), rhs[i]);
+}
+
+static void mul_I32_time(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(x_val, rhs[i]);
+}
+
+static void mul_I32_u8(i32_t x_val, u8_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(x_val, u8_to_i32(rhs[i]));
+}
+
+static void mul_I32_i16(i32_t x_val, i16_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(x_val, i16_to_i32(rhs[i]));
+}
+
+static void mul_I64_i32(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(x_val, i32_to_i64(rhs[i]));
+}
+
+static void mul_I64_i64(i64_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(x_val, rhs[i]);
+}
+
+static void mul_I64_f64(i64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(i64_to_f64(x_val), rhs[i]);
+}
+
+static void mul_I64_time(i64_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(i64_to_i32(x_val), rhs[i]);
+}
+
+static void mul_I64_u8(i64_t x_val, u8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(x_val, u8_to_i64(rhs[i]));
+}
+
+static void mul_I64_i16(i64_t x_val, i16_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(x_val, i16_to_i64(rhs[i]));
+}
+
+static void mul_F64_i32(f64_t x_val, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(x_val, i32_to_f64(rhs[i]));
+}
+
+static void mul_F64_i64(f64_t x_val, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(x_val, i64_to_f64(rhs[i]));
+}
+
+static void mul_F64_f64(f64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(x_val, rhs[i]);
+}
+
+static void mul_F64_u8(f64_t x_val, u8_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(x_val, u8_to_f64(rhs[i]));
+}
+
+static void mul_F64_i16(f64_t x_val, i16_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(x_val, i16_to_f64(rhs[i]));
+}
+
+static void mul_TIME_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(x_val, rhs[i]);
+}
+
+static void mul_TIME_i64(i32_t x_val, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(x_val, i64_to_i32(rhs[i]));
+}
+
+static void mul_U8_u8(u8_t x_val, u8_t *__restrict__ rhs, u8_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULU8(x_val, rhs[i]);
+}
+
+static void mul_U8_i32(u8_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(u8_to_i32(x_val), rhs[i]);
+}
+
+static void mul_U8_i64(u8_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(u8_to_i64(x_val), rhs[i]);
+}
+
+static void mul_U8_f64(u8_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(u8_to_f64(x_val), rhs[i]);
+}
+
+static void mul_U8_i16(u8_t x_val, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI16(u8_to_i16(x_val), rhs[i]);
+}
+
+static void mul_I16_i16(i16_t x_val, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI16(x_val, rhs[i]);
+}
+
+static void mul_I16_i32(i16_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(i16_to_i32(x_val), rhs[i]);
+}
+
+static void mul_I16_i64(i16_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(i16_to_i64(x_val), rhs[i]);
+}
+
+static void mul_I16_f64(i16_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(i16_to_f64(x_val), rhs[i]);
+}
+
+static void mul_I16_u8(i16_t x_val, u8_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI16(x_val, u8_to_i16(rhs[i]));
+}
+
+// ============================================================================
+// MUL loop functions - Vector-Vector
+// ============================================================================
+
+static void mul_b8_i64(b8_t *__restrict__ lhs, i64_t *__restrict__ rhs, b8_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = i64_to_b8(MULI64(b8_to_i64(lhs[i]), rhs[i]));
+}
+
+static void mul_i64_b8(i64_t *__restrict__ lhs, b8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(lhs[i], b8_to_i64(rhs[i]));
+}
+
+static void mul_i32_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(lhs[i], rhs[i]);
+}
+
+static void mul_i32_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(i32_to_i64(lhs[i]), rhs[i]);
+}
+
+static void mul_i32_f64(i32_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(i32_to_f64(lhs[i]), rhs[i]);
+}
+
+static void mul_i32_time(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(lhs[i], rhs[i]);
+}
+
+static void mul_i32_u8(i32_t *__restrict__ lhs, u8_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(lhs[i], u8_to_i32(rhs[i]));
+}
+
+static void mul_i32_i16(i32_t *__restrict__ lhs, i16_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(lhs[i], i16_to_i32(rhs[i]));
+}
+
+static void mul_i64_i64(i64_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(lhs[i], rhs[i]);
+}
+
+static void mul_i64_f64(i64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(i64_to_f64(lhs[i]), rhs[i]);
+}
+
+static void mul_i64_time(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI32(i64_to_i32(lhs[i]), rhs[i]);
+}
+
+static void mul_i64_u8(i64_t *__restrict__ lhs, u8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(lhs[i], u8_to_i64(rhs[i]));
+}
+
+static void mul_i64_i16(i64_t *__restrict__ lhs, i16_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI64(lhs[i], i16_to_i64(rhs[i]));
+}
+
+static void mul_f64_f64(f64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(lhs[i], rhs[i]);
+}
+
+static void mul_f64_u8(f64_t *__restrict__ lhs, u8_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(lhs[i], u8_to_f64(rhs[i]));
+}
+
+static void mul_f64_i16(f64_t *__restrict__ lhs, i16_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULF64(lhs[i], i16_to_f64(rhs[i]));
+}
+
+static void mul_u8_u8(u8_t *__restrict__ lhs, u8_t *__restrict__ rhs, u8_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULU8(lhs[i], rhs[i]);
+}
+
+static void mul_u8_i16(u8_t *__restrict__ lhs, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI16(u8_to_i16(lhs[i]), rhs[i]);
+}
+
+static void mul_i16_i16(i16_t *__restrict__ lhs, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    VFOR (i64_t i = 0; i < len; i++) out[i] = MULI16(lhs[i], rhs[i]);
+}
+
+// ============================================================================
+// DIV loop functions - Atom-Vector (DIV is non-commutative)
+// ============================================================================
+
+static void div_I32_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(x_val, rhs[i]);
+}
+
+static void div_I32_i64(i32_t x_val, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(DIVI64(i32_to_i64(x_val), rhs[i]));
+}
+
+static void div_I32_f64(i32_t x_val, f64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = f64_to_i32(DIVF64(i32_to_f64(x_val), rhs[i]));
+}
+
+static void div_I32_u8(i32_t x_val, u8_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(x_val, u8_to_i32(rhs[i]));
+}
+
+static void div_I32_i16(i32_t x_val, i16_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(x_val, i16_to_i32(rhs[i]));
+}
+
+static void div_I64_i32(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(x_val, i32_to_i64(rhs[i]));
+}
+
+static void div_I64_i64(i64_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(x_val, rhs[i]);
+}
+
+static void div_I64_f64(i64_t x_val, f64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = f64_to_i64(DIVF64(i64_to_f64(x_val), rhs[i]));
+}
+
+static void div_I64_u8(i64_t x_val, u8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(x_val, u8_to_i64(rhs[i]));
+}
+
+static void div_I64_i16(i64_t x_val, i16_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(x_val, i16_to_i64(rhs[i]));
+}
+
+static void div_F64_i32(f64_t x_val, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(x_val, i32_to_f64(rhs[i]));
+}
+
+static void div_F64_i64(f64_t x_val, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(x_val, i64_to_f64(rhs[i]));
+}
+
+static void div_F64_f64(f64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(x_val, rhs[i]);
+}
+
+static void div_F64_u8(f64_t x_val, u8_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(x_val, u8_to_f64(rhs[i]));
+}
+
+static void div_F64_i16(f64_t x_val, i16_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(x_val, i16_to_f64(rhs[i]));
+}
+
+static void div_TIME_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(x_val, rhs[i]);
+}
+
+static void div_TIME_i64(i32_t x_val, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(x_val, i64_to_i32(rhs[i]));
+}
+
+static void div_TIME_f64(i32_t x_val, f64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = f64_to_i32(DIVF64(i32_to_f64(x_val), rhs[i]));
+}
+
+static void div_U8_u8(u8_t x_val, u8_t *__restrict__ rhs, u8_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVU8(x_val, rhs[i]);
+}
+
+static void div_U8_i16(u8_t x_val, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI16(u8_to_i16(x_val), rhs[i]);
+}
+
+static void div_U8_i32(u8_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(u8_to_i32(x_val), rhs[i]);
+}
+
+static void div_U8_i64(u8_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(u8_to_i64(x_val), rhs[i]);
+}
+
+static void div_U8_f64(u8_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(u8_to_f64(x_val), rhs[i]);
+}
+
+static void div_I16_i16(i16_t x_val, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI16(x_val, rhs[i]);
+}
+
+static void div_I16_u8(i16_t x_val, u8_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI16(x_val, u8_to_i16(rhs[i]));
+}
+
+static void div_I16_i32(i16_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(i16_to_i32(x_val), rhs[i]);
+}
+
+static void div_I16_i64(i16_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(i16_to_i64(x_val), rhs[i]);
+}
+
+static void div_I16_f64(i16_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(i16_to_f64(x_val), rhs[i]);
+}
+
+// ============================================================================
+// DIV loop functions - Vector-Atom (DIV is non-commutative)
+// ============================================================================
+
+static void div_i32_I32(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(lhs[i], y_val);
+}
+
+static void div_i32_I64(i32_t *__restrict__ lhs, i64_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(DIVI64(i32_to_i64(lhs[i]), y_val));
+}
+
+static void div_i32_F64(i32_t *__restrict__ lhs, f64_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = f64_to_i32(DIVF64(i32_to_f64(lhs[i]), y_val));
+}
+
+static void div_i32_U8(i32_t *__restrict__ lhs, u8_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(lhs[i], u8_to_i32(y_val));
+}
+
+static void div_i32_I16(i32_t *__restrict__ lhs, i16_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(lhs[i], i16_to_i32(y_val));
+}
+
+static void div_i64_I32(i64_t *__restrict__ lhs, i32_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(lhs[i], i32_to_i64(y_val));
+}
+
+static void div_i64_I64(i64_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(lhs[i], y_val);
+}
+
+static void div_i64_F64(i64_t *__restrict__ lhs, f64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = f64_to_i64(DIVF64(i64_to_f64(lhs[i]), y_val));
+}
+
+static void div_i64_U8(i64_t *__restrict__ lhs, u8_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(lhs[i], u8_to_i64(y_val));
+}
+
+static void div_i64_I16(i64_t *__restrict__ lhs, i16_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(lhs[i], i16_to_i64(y_val));
+}
+
+static void div_f64_I32(f64_t *__restrict__ lhs, i32_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(lhs[i], i32_to_f64(y_val));
+}
+
+static void div_f64_I64(f64_t *__restrict__ lhs, i64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(lhs[i], i64_to_f64(y_val));
+}
+
+static void div_f64_F64(f64_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(lhs[i], y_val);
+}
+
+static void div_f64_U8(f64_t *__restrict__ lhs, u8_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(lhs[i], u8_to_f64(y_val));
+}
+
+static void div_f64_I16(f64_t *__restrict__ lhs, i16_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(lhs[i], i16_to_f64(y_val));
+}
+
+static void div_time_I32(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(lhs[i], y_val);
+}
+
+static void div_time_I64(i32_t *__restrict__ lhs, i64_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(DIVI64(i32_to_i64(lhs[i]), y_val));
+}
+
+static void div_time_F64(i32_t *__restrict__ lhs, f64_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = f64_to_i32(DIVF64(i32_to_f64(lhs[i]), y_val));
+}
+
+static void div_u8_U8(u8_t *__restrict__ lhs, u8_t y_val, u8_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVU8(lhs[i], y_val);
+}
+
+static void div_u8_I32(u8_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(u8_to_i32(lhs[i]), y_val);
+}
+
+static void div_u8_I64(u8_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(u8_to_i64(lhs[i]), y_val);
+}
+
+static void div_u8_F64(u8_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(u8_to_f64(lhs[i]), y_val);
+}
+
+static void div_u8_I16(u8_t *__restrict__ lhs, i16_t y_val, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI16(u8_to_i16(lhs[i]), y_val);
+}
+
+static void div_i16_I16(i16_t *__restrict__ lhs, i16_t y_val, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI16(lhs[i], y_val);
+}
+
+static void div_i16_I32(i16_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(i16_to_i32(lhs[i]), y_val);
+}
+
+static void div_i16_I64(i16_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(i16_to_i64(lhs[i]), y_val);
+}
+
+static void div_i16_F64(i16_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(i16_to_f64(lhs[i]), y_val);
+}
+
+static void div_i16_U8(i16_t *__restrict__ lhs, u8_t y_val, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI16(lhs[i], u8_to_i16(y_val));
+}
+
+// ============================================================================
+// DIV loop functions - Vector-Vector
+// ============================================================================
+
+static void div_i32_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(lhs[i], rhs[i]);
+}
+
+static void div_i32_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(DIVI64(i32_to_i64(lhs[i]), rhs[i]));
+}
+
+static void div_i32_f64(i32_t *__restrict__ lhs, f64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = f64_to_i32(DIVF64(i32_to_f64(lhs[i]), rhs[i]));
+}
+
+static void div_i32_u8(i32_t *__restrict__ lhs, u8_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(lhs[i], u8_to_i32(rhs[i]));
+}
+
+static void div_i32_i16(i32_t *__restrict__ lhs, i16_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(lhs[i], i16_to_i32(rhs[i]));
+}
+
+static void div_i64_i32(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(lhs[i], i32_to_i64(rhs[i]));
+}
+
+static void div_i64_i64(i64_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(lhs[i], rhs[i]);
+}
+
+static void div_i64_f64(i64_t *__restrict__ lhs, f64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = f64_to_i64(DIVF64(i64_to_f64(lhs[i]), rhs[i]));
+}
+
+static void div_i64_u8(i64_t *__restrict__ lhs, u8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(lhs[i], u8_to_i64(rhs[i]));
+}
+
+static void div_i64_i16(i64_t *__restrict__ lhs, i16_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(lhs[i], i16_to_i64(rhs[i]));
+}
+
+static void div_f64_i32(f64_t *__restrict__ lhs, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(lhs[i], i32_to_f64(rhs[i]));
+}
+
+static void div_f64_i64(f64_t *__restrict__ lhs, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(lhs[i], i64_to_f64(rhs[i]));
+}
+
+static void div_f64_f64(f64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(lhs[i], rhs[i]);
+}
+
+static void div_f64_u8(f64_t *__restrict__ lhs, u8_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(lhs[i], u8_to_f64(rhs[i]));
+}
+
+static void div_f64_i16(f64_t *__restrict__ lhs, i16_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(lhs[i], i16_to_f64(rhs[i]));
+}
+
+static void div_time_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(lhs[i], rhs[i]);
+}
+
+static void div_time_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(DIVI64(i32_to_i64(lhs[i]), rhs[i]));
+}
+
+static void div_time_f64(i32_t *__restrict__ lhs, f64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = f64_to_i32(DIVF64(i32_to_f64(lhs[i]), rhs[i]));
+}
+
+static void div_u8_u8(u8_t *__restrict__ lhs, u8_t *__restrict__ rhs, u8_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVU8(lhs[i], rhs[i]);
+}
+
+static void div_u8_i16(u8_t *__restrict__ lhs, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI16(u8_to_i16(lhs[i]), rhs[i]);
+}
+
+static void div_u8_i32(u8_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(u8_to_i32(lhs[i]), rhs[i]);
+}
+
+static void div_u8_i64(u8_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(u8_to_i64(lhs[i]), rhs[i]);
+}
+
+static void div_u8_f64(u8_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(u8_to_f64(lhs[i]), rhs[i]);
+}
+
+static void div_i16_i16(i16_t *__restrict__ lhs, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI16(lhs[i], rhs[i]);
+}
+
+static void div_i16_u8(i16_t *__restrict__ lhs, u8_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI16(lhs[i], u8_to_i16(rhs[i]));
+}
+
+static void div_i16_i32(i16_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI32(i16_to_i32(lhs[i]), rhs[i]);
+}
+
+static void div_i16_i64(i16_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVI64(i16_to_i64(lhs[i]), rhs[i]);
+}
+
+static void div_i16_f64(i16_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = DIVF64(i16_to_f64(lhs[i]), rhs[i]);
+}
+
+// ============================================================================
+// FDIV loop functions (Atom-Vector)
+// ============================================================================
+
+static void fdiv_I32_i32(i32_t x_val, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(i32_to_i64(x_val), i32_to_i64(rhs[i]));
+}
+
+static void fdiv_I32_i64(i32_t x_val, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(i32_to_i64(x_val), rhs[i]);
+}
+
+static void fdiv_I32_f64(i32_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(i32_to_f64(x_val), rhs[i]);
+}
+
+static void fdiv_I64_i32(i64_t x_val, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(x_val, i32_to_i64(rhs[i]));
+}
+
+static void fdiv_I64_i64(i64_t x_val, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(x_val, rhs[i]);
+}
+
+static void fdiv_I64_f64(i64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(x_val, rhs[i]);
+}
+
+static void fdiv_F64_i32(f64_t x_val, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(x_val, i32_to_f64(rhs[i]));
+}
+
+static void fdiv_F64_i64(f64_t x_val, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(x_val, i64_to_f64(rhs[i]));
+}
+
+static void fdiv_F64_f64(f64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(x_val, rhs[i]);
+}
+
+// ============================================================================
+// FDIV loop functions (Vector-Atom)
+// ============================================================================
+
+static void fdiv_i32_I32(i32_t *__restrict__ lhs, i32_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(i32_to_i64(lhs[i]), i32_to_i64(y_val));
+}
+
+static void fdiv_i32_I64(i32_t *__restrict__ lhs, i64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(i32_to_i64(lhs[i]), y_val);
+}
+
+static void fdiv_i32_F64(i32_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(i32_to_f64(lhs[i]), y_val);
+}
+
+static void fdiv_i64_I32(i64_t *__restrict__ lhs, i32_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(lhs[i], i32_to_i64(y_val));
+}
+
+static void fdiv_i64_I64(i64_t *__restrict__ lhs, i64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(lhs[i], y_val);
+}
+
+static void fdiv_i64_F64(i64_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(lhs[i], y_val);
+}
+
+static void fdiv_f64_I32(f64_t *__restrict__ lhs, i32_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(lhs[i], i32_to_f64(y_val));
+}
+
+static void fdiv_f64_I64(f64_t *__restrict__ lhs, i64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(lhs[i], i64_to_f64(y_val));
+}
+
+static void fdiv_f64_F64(f64_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(lhs[i], y_val);
+}
+
+// ============================================================================
+// FDIV loop functions (Vector-Vector)
+// ============================================================================
+
+static void fdiv_i32_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(i32_to_i64(lhs[i]), i32_to_i64(rhs[i]));
+}
+
+static void fdiv_i32_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(i32_to_i64(lhs[i]), rhs[i]);
+}
+
+static void fdiv_i32_f64(i32_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(i32_to_f64(lhs[i]), rhs[i]);
+}
+
+static void fdiv_i64_i32(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(lhs[i], i32_to_i64(rhs[i]));
+}
+
+static void fdiv_i64_i64(i64_t *__restrict__ lhs, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(lhs[i], rhs[i]);
+}
+
+static void fdiv_i64_f64(i64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVI64(lhs[i], rhs[i]);
+}
+
+static void fdiv_f64_i32(f64_t *__restrict__ lhs, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(lhs[i], i32_to_f64(rhs[i]));
+}
+
+static void fdiv_f64_i64(f64_t *__restrict__ lhs, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(lhs[i], i64_to_f64(rhs[i]));
+}
+
+static void fdiv_f64_f64(f64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = FDIVF64(lhs[i], rhs[i]);
+}
+
+// ============================================================================
+// MOD loop functions (Atom-Vector)
+// ============================================================================
+
+static void mod_I32_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(x_val, rhs[i]);
+}
+
+static void mod_I32_i64(i32_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(i32_to_i64(x_val), rhs[i]);
+}
+
+static void mod_I32_f64(i32_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(i32_to_f64(x_val), rhs[i]);
+}
+
+static void mod_I32_u8(i32_t x_val, u8_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(x_val, u8_to_i32(rhs[i]));
+}
+
+static void mod_I32_i16(i32_t x_val, i16_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(x_val, i16_to_i32(rhs[i]));
+}
+
+static void mod_I64_i32(i64_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(MODI64(x_val, i32_to_i64(rhs[i])));
+}
+
+static void mod_I64_i64(i64_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(x_val, rhs[i]);
+}
+
+static void mod_I64_f64(i64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(i64_to_f64(x_val), rhs[i]);
+}
+
+static void mod_I64_u8(i64_t x_val, u8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(x_val, u8_to_i64(rhs[i]));
+}
+
+static void mod_I64_i16(i64_t x_val, i16_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(x_val, i16_to_i64(rhs[i]));
+}
+
+static void mod_F64_i32(f64_t x_val, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(x_val, i32_to_f64(rhs[i]));
+}
+
+static void mod_F64_i64(f64_t x_val, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(x_val, i64_to_f64(rhs[i]));
+}
+
+static void mod_F64_f64(f64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(x_val, rhs[i]);
+}
+
+static void mod_U8_u8(u8_t x_val, u8_t *__restrict__ rhs, u8_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODU8(x_val, rhs[i]);
+}
+
+static void mod_U8_i16(u8_t x_val, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI16(u8_to_i16(x_val), rhs[i]);
+}
+
+static void mod_U8_i32(u8_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(u8_to_i32(x_val), rhs[i]);
+}
+
+static void mod_U8_i64(u8_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(u8_to_i64(x_val), rhs[i]);
+}
+
+static void mod_I16_i16(i16_t x_val, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI16(x_val, rhs[i]);
+}
+
+static void mod_I16_u8(i16_t x_val, u8_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI16(x_val, u8_to_i16(rhs[i]));
+}
+
+static void mod_I16_i32(i16_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(i16_to_i32(x_val), rhs[i]);
+}
+
+static void mod_I16_i64(i16_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(i16_to_i64(x_val), rhs[i]);
+}
+
+static void mod_TIME_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(x_val, rhs[i]);
+}
+
+static void mod_TIME_i64(i32_t x_val, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(x_val, i64_to_i32(rhs[i]));
+}
+
+// ============================================================================
+// MOD loop functions (Vector-Atom)
+// ============================================================================
+
+static void mod_i32_I32(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(lhs[i], y_val);
+}
+
+static void mod_i32_I64(i32_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(i32_to_i64(lhs[i]), y_val);
+}
+
+static void mod_i32_F64(i32_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(i32_to_f64(lhs[i]), y_val);
+}
+
+static void mod_i32_U8(i32_t *__restrict__ lhs, u8_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(lhs[i], u8_to_i32(y_val));
+}
+
+static void mod_i32_I16(i32_t *__restrict__ lhs, i16_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(lhs[i], i16_to_i32(y_val));
+}
+
+static void mod_i64_I32(i64_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(MODI64(lhs[i], i32_to_i64(y_val)));
+}
+
+static void mod_i64_I64(i64_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(lhs[i], y_val);
+}
+
+static void mod_i64_F64(i64_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(i64_to_f64(lhs[i]), y_val);
+}
+
+static void mod_i64_U8(i64_t *__restrict__ lhs, u8_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(lhs[i], u8_to_i64(y_val));
+}
+
+static void mod_i64_I16(i64_t *__restrict__ lhs, i16_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(lhs[i], i16_to_i64(y_val));
+}
+
+static void mod_f64_I32(f64_t *__restrict__ lhs, i32_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(lhs[i], i32_to_f64(y_val));
+}
+
+static void mod_f64_I64(f64_t *__restrict__ lhs, i64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(lhs[i], i64_to_f64(y_val));
+}
+
+static void mod_f64_F64(f64_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(lhs[i], y_val);
+}
+
+static void mod_u8_U8(u8_t *__restrict__ lhs, u8_t y_val, u8_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODU8(lhs[i], y_val);
+}
+
+static void mod_u8_I16(u8_t *__restrict__ lhs, i16_t y_val, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI16(u8_to_i16(lhs[i]), y_val);
+}
+
+static void mod_u8_I32(u8_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(u8_to_i32(lhs[i]), y_val);
+}
+
+static void mod_u8_I64(u8_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(u8_to_i64(lhs[i]), y_val);
+}
+
+static void mod_i16_I16(i16_t *__restrict__ lhs, i16_t y_val, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI16(lhs[i], y_val);
+}
+
+static void mod_i16_I32(i16_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(i16_to_i32(lhs[i]), y_val);
+}
+
+static void mod_i16_I64(i16_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(i16_to_i64(lhs[i]), y_val);
+}
+
+static void mod_i16_U8(i16_t *__restrict__ lhs, u8_t y_val, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI16(lhs[i], u8_to_i16(y_val));
+}
+
+static void mod_time_I32(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(lhs[i], y_val);
+}
+
+static void mod_time_I64(i32_t *__restrict__ lhs, i64_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(MODI64(i32_to_i64(lhs[i]), y_val));
+}
+
+// ============================================================================
+// MOD loop functions (Vector-Vector)
+// ============================================================================
+
+static void mod_i32_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(lhs[i], rhs[i]);
+}
+
+static void mod_i32_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(i32_to_i64(lhs[i]), rhs[i]);
+}
+
+static void mod_i32_f64(i32_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(i32_to_f64(lhs[i]), rhs[i]);
+}
+
+static void mod_i32_u8(i32_t *__restrict__ lhs, u8_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(lhs[i], u8_to_i32(rhs[i]));
+}
+
+static void mod_i32_i16(i32_t *__restrict__ lhs, i16_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(lhs[i], i16_to_i32(rhs[i]));
+}
+
+static void mod_i64_i32(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(MODI64(lhs[i], i32_to_i64(rhs[i])));
+}
+
+static void mod_i64_i64(i64_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(lhs[i], rhs[i]);
+}
+
+static void mod_i64_f64(i64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(i64_to_f64(lhs[i]), rhs[i]);
+}
+
+static void mod_i64_u8(i64_t *__restrict__ lhs, u8_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(lhs[i], u8_to_i64(rhs[i]));
+}
+
+static void mod_i64_i16(i64_t *__restrict__ lhs, i16_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(lhs[i], i16_to_i64(rhs[i]));
+}
+
+static void mod_f64_i32(f64_t *__restrict__ lhs, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(lhs[i], i32_to_f64(rhs[i]));
+}
+
+static void mod_f64_i64(f64_t *__restrict__ lhs, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(lhs[i], i64_to_f64(rhs[i]));
+}
+
+static void mod_f64_f64(f64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODF64(lhs[i], rhs[i]);
+}
+
+static void mod_u8_u8(u8_t *__restrict__ lhs, u8_t *__restrict__ rhs, u8_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODU8(lhs[i], rhs[i]);
+}
+
+static void mod_u8_i16(u8_t *__restrict__ lhs, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI16(u8_to_i16(lhs[i]), rhs[i]);
+}
+
+static void mod_u8_i32(u8_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(u8_to_i32(lhs[i]), rhs[i]);
+}
+
+static void mod_u8_i64(u8_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(u8_to_i64(lhs[i]), rhs[i]);
+}
+
+static void mod_i16_i16(i16_t *__restrict__ lhs, i16_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI16(lhs[i], rhs[i]);
+}
+
+static void mod_i16_u8(i16_t *__restrict__ lhs, u8_t *__restrict__ rhs, i16_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI16(lhs[i], u8_to_i16(rhs[i]));
+}
+
+static void mod_i16_i32(i16_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(i16_to_i32(lhs[i]), rhs[i]);
+}
+
+static void mod_i16_i64(i16_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI64(i16_to_i64(lhs[i]), rhs[i]);
+}
+
+static void mod_time_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = MODI32(lhs[i], rhs[i]);
+}
+
+static void mod_time_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(MODI64(i32_to_i64(lhs[i]), rhs[i]));
+}
+
+// ============================================================================
+// XBAR loop functions (Atom-Vector)
+// ============================================================================
+
+static void xbar_I32_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(x_val, rhs[i]);
+}
+
+static void xbar_I32_i64(i32_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(i32_to_i64(x_val), rhs[i]);
+}
+
+static void xbar_I32_f64(i32_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(i32_to_f64(x_val), rhs[i]);
+}
+
+static void xbar_I64_i32(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(x_val, i32_to_i64(rhs[i]));
+}
+
+static void xbar_I64_i64(i64_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(x_val, rhs[i]);
+}
+
+static void xbar_I64_f64(i64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(i64_to_f64(x_val), rhs[i]);
+}
+
+static void xbar_F64_i32(f64_t x_val, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(x_val, i32_to_f64(rhs[i]));
+}
+
+static void xbar_F64_i64(f64_t x_val, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(x_val, i64_to_f64(rhs[i]));
+}
+
+static void xbar_F64_f64(f64_t x_val, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(x_val, rhs[i]);
+}
+
+static void xbar_DATE_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(x_val, rhs[i]);
+}
+
+static void xbar_DATE_i64(i32_t x_val, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(XBARI64(i32_to_i64(x_val), rhs[i]));
+}
+
+static void xbar_TIME_i32(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(x_val, rhs[i]);
+}
+
+static void xbar_TIME_i64(i32_t x_val, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(XBARI64(i32_to_i64(x_val), rhs[i]));
+}
+
+static void xbar_TIME_time(i32_t x_val, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(x_val, rhs[i]);
+}
+
+static void xbar_TIMESTAMP_i32(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(x_val, i32_to_i64(rhs[i]));
+}
+
+static void xbar_TIMESTAMP_i64(i64_t x_val, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(x_val, rhs[i]);
+}
+
+static void xbar_TIMESTAMP_time(i64_t x_val, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(x_val, i32_to_i64(rhs[i]));
+}
+
+// ============================================================================
+// XBAR loop functions (Vector-Atom)
+// ============================================================================
+
+static void xbar_i32_I32(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(lhs[i], y_val);
+}
+
+static void xbar_i32_I64(i32_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(i32_to_i64(lhs[i]), y_val);
+}
+
+static void xbar_i32_F64(i32_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(i32_to_f64(lhs[i]), y_val);
+}
+
+static void xbar_i64_I32(i64_t *__restrict__ lhs, i32_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(lhs[i], i32_to_i64(y_val));
+}
+
+static void xbar_i64_I64(i64_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(lhs[i], y_val);
+}
+
+static void xbar_i64_F64(i64_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(i64_to_f64(lhs[i]), y_val);
+}
+
+static void xbar_f64_I32(f64_t *__restrict__ lhs, i32_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(lhs[i], i32_to_f64(y_val));
+}
+
+static void xbar_f64_I64(f64_t *__restrict__ lhs, i64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(lhs[i], i64_to_f64(y_val));
+}
+
+static void xbar_f64_F64(f64_t *__restrict__ lhs, f64_t y_val, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(lhs[i], y_val);
+}
+
+static void xbar_date_I32(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(lhs[i], y_val);
+}
+
+static void xbar_date_I64(i32_t *__restrict__ lhs, i64_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(XBARI64(i32_to_i64(lhs[i]), y_val));
+}
+
+static void xbar_time_I32(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(lhs[i], y_val);
+}
+
+static void xbar_time_I64(i32_t *__restrict__ lhs, i64_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(XBARI64(i32_to_i64(lhs[i]), y_val));
+}
+
+static void xbar_time_TIME(i32_t *__restrict__ lhs, i32_t y_val, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(lhs[i], y_val);
+}
+
+static void xbar_timestamp_I32(i64_t *__restrict__ lhs, i32_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(lhs[i], i32_to_i64(y_val));
+}
+
+static void xbar_timestamp_I64(i64_t *__restrict__ lhs, i64_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(lhs[i], y_val);
+}
+
+static void xbar_timestamp_TIME(i64_t *__restrict__ lhs, i32_t y_val, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(lhs[i], i32_to_i64(y_val));
+}
+
+// ============================================================================
+// XBAR loop functions (Vector-Vector)
+// ============================================================================
+
+static void xbar_i32_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(lhs[i], rhs[i]);
+}
+
+static void xbar_i32_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(i32_to_i64(lhs[i]), rhs[i]);
+}
+
+static void xbar_i32_f64(i32_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(i32_to_f64(lhs[i]), rhs[i]);
+}
+
+static void xbar_i64_i32(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(lhs[i], i32_to_i64(rhs[i]));
+}
+
+static void xbar_i64_i64(i64_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(lhs[i], rhs[i]);
+}
+
+static void xbar_i64_f64(i64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(i64_to_f64(lhs[i]), rhs[i]);
+}
+
+static void xbar_f64_i32(f64_t *__restrict__ lhs, i32_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(lhs[i], i32_to_f64(rhs[i]));
+}
+
+static void xbar_f64_i64(f64_t *__restrict__ lhs, i64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(lhs[i], i64_to_f64(rhs[i]));
+}
+
+static void xbar_f64_f64(f64_t *__restrict__ lhs, f64_t *__restrict__ rhs, f64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARF64(lhs[i], rhs[i]);
+}
+
+static void xbar_date_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(lhs[i], rhs[i]);
+}
+
+static void xbar_date_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(XBARI64(i32_to_i64(lhs[i]), rhs[i]));
+}
+
+static void xbar_time_i32(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(lhs[i], rhs[i]);
+}
+
+static void xbar_time_i64(i32_t *__restrict__ lhs, i64_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = i64_to_i32(XBARI64(i32_to_i64(lhs[i]), rhs[i]));
+}
+
+static void xbar_time_time(i32_t *__restrict__ lhs, i32_t *__restrict__ rhs, i32_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI32(lhs[i], rhs[i]);
+}
+
+static void xbar_timestamp_i32(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(lhs[i], i32_to_i64(rhs[i]));
+}
+
+static void xbar_timestamp_i64(i64_t *__restrict__ lhs, i64_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(lhs[i], rhs[i]);
+}
+
+static void xbar_timestamp_time(i64_t *__restrict__ lhs, i32_t *__restrict__ rhs, i64_t *__restrict__ out, i64_t len) {
+    for (i64_t i = 0; i < len; i++) out[i] = XBARI64(lhs[i], i32_to_i64(rhs[i]));
+}
 
 i8_t infer_math_type(obj_p x, obj_p y) {
     switch (MTYPE2(ABSI8(x->type), ABSI8(y->type))) {
@@ -344,255 +2176,321 @@ obj_p ray_add_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
 
         // Atom-Vector: canonical form is A_V, redirect V_A
         case MTYPE2(-TYPE_I32, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, i32, i32, ADDI32, len, offset, out);
+            add_I32_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, i64, i64, ADDI64, len, offset, out);
+            add_I32_i64(x->i32, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_F64):
-            return __BINOP_A_V(x, y, i32, f64, f64, f64, ADDF64, len, offset, out);
+            add_I32_f64(x->i32, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_DATE):
-            return __BINOP_A_V(x, y, i32, i32, date, date, ADDI32, len, offset, out);
+            add_DATE_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, -TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_TIME):
-            return __BINOP_A_V(x, y, i32, i32, time, time, ADDI32, len, offset, out);
+            add_TIME_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_TIMESTAMP):
-            return __BINOP_A_V(x, y, i32, i64, timestamp, timestamp, ADDI64, len, offset, out);
+            add_I32_i64(x->i32, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_U8):
-            return __BINOP_A_V(x, y, i32, u8, i32, i32, ADDI32, len, offset, out);
+            add_I32_u8(x->i32, AS_U8(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_I16):
-            return __BINOP_A_V(x, y, i32, i16, i32, i32, ADDI32, len, offset, out);
+            add_I32_i16(x->i32, AS_I16(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
 
         case MTYPE2(-TYPE_I64, TYPE_I32):
-            return __BINOP_A_V(x, y, i64, i32, i64, i64, ADDI64, len, offset, out);
+            add_I64_i32(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_I64):
-            return __BINOP_A_V(x, y, i64, i64, i64, i64, ADDI64, len, offset, out);
+            add_I64_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_F64):
-            return __BINOP_A_V(x, y, i64, f64, f64, f64, ADDF64, len, offset, out);
+            add_I64_f64(x->i64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_DATE):
-            return __BINOP_A_V(x, y, i64, i32, date, date, ADDI32, len, offset, out);
+            add_I64_date(x->i64, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, -TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_TIME):
-            return __BINOP_A_V(x, y, i64, i32, time, time, ADDI32, len, offset, out);
+            add_I64_time(x->i64, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_TIMESTAMP):
-            return __BINOP_A_V(x, y, i64, i64, timestamp, timestamp, ADDI64, len, offset, out);
+            add_I64_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_U8):
-            return __BINOP_A_V(x, y, i64, u8, i64, i64, ADDI64, len, offset, out);
+            add_I64_u8(x->i64, AS_U8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_I16):
-            return __BINOP_A_V(x, y, i64, i16, i64, i64, ADDI64, len, offset, out);
+            add_I64_i16(x->i64, AS_I16(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
 
         case MTYPE2(-TYPE_F64, TYPE_I32):
-            return __BINOP_A_V(x, y, f64, i32, f64, f64, ADDF64, len, offset, out);
+            add_F64_i32(x->f64, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_F64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_F64, TYPE_I64):
-            return __BINOP_A_V(x, y, f64, i64, f64, f64, ADDF64, len, offset, out);
+            add_F64_i64(x->f64, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_F64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_F64, TYPE_F64):
-            return __BINOP_A_V(x, y, f64, f64, f64, f64, ADDF64, len, offset, out);
+            add_F64_f64(x->f64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_F64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_F64, TYPE_U8):
-            return __BINOP_A_V(x, y, f64, u8, f64, f64, ADDF64, len, offset, out);
+            add_F64_u8(x->f64, AS_U8(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_F64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_F64, TYPE_I16):
-            return __BINOP_A_V(x, y, f64, i16, f64, f64, ADDF64, len, offset, out);
+            add_F64_i16(x->f64, AS_I16(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_F64):
             return ray_add_partial(y, x, len, offset, out);
 
         case MTYPE2(-TYPE_U8, TYPE_U8):
-            return __BINOP_A_V(x, y, u8, u8, u8, u8, ADDU8, len, offset, out);
+            add_U8_u8(x->u8, AS_U8(y) + offset, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_U8):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_U8, TYPE_I32):
-            return __BINOP_A_V(x, y, u8, i32, i32, i32, ADDI32, len, offset, out);
+            add_U8_i32(x->u8, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_U8):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_U8, TYPE_I64):
-            return __BINOP_A_V(x, y, u8, i64, i64, i64, ADDI64, len, offset, out);
+            add_U8_i64(x->u8, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_U8):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_U8, TYPE_F64):
-            return __BINOP_A_V(x, y, u8, f64, f64, f64, ADDF64, len, offset, out);
+            add_U8_f64(x->u8, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_U8):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_U8, TYPE_I16):
-            return __BINOP_A_V(x, y, u8, i16, i16, i16, ADDI16, len, offset, out);
+            add_U8_i16(x->u8, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_U8):
             return ray_add_partial(y, x, len, offset, out);
 
         case MTYPE2(-TYPE_I16, TYPE_I16):
-            return __BINOP_A_V(x, y, i16, i16, i16, i16, ADDI16, len, offset, out);
+            add_I16_i16(x->i16, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I16):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I16, TYPE_I32):
-            return __BINOP_A_V(x, y, i16, i32, i32, i32, ADDI32, len, offset, out);
+            add_I16_i32(x->i16, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I16):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I16, TYPE_I64):
-            return __BINOP_A_V(x, y, i16, i64, i64, i64, ADDI64, len, offset, out);
+            add_I16_i64(x->i16, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I16):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I16, TYPE_F64):
-            return __BINOP_A_V(x, y, i16, f64, f64, f64, ADDF64, len, offset, out);
+            add_I16_f64(x->i16, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_U8):
-            return __BINOP_A_V(x, y, i16, u8, i16, i16, ADDI16, len, offset, out);
+            add_I16_u8(x->i16, AS_U8(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I16):
             return ray_add_partial(y, x, len, offset, out);
 
         // Temporal atom-vector
         case MTYPE2(-TYPE_DATE, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, date, date, ADDI32, len, offset, out);
+            add_DATE_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_DATE, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, date, date, ADDI32, len, offset, out);
+            add_DATE_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_DATE, TYPE_TIME):
-            return __BINOP_A_V(x, y, date, time, timestamp, timestamp, ADDI64, len, offset, out);
+            add_DATE_time(x->i32, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_DATE):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_TIME, TYPE_I32):
         case MTYPE2(-TYPE_TIME, TYPE_TIME):
-            return __BINOP_A_V(x, y, i32, i32, time, time, ADDI32, len, offset, out);
+            add_TIME_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_TIME):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_TIME, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, time, time, ADDI32, len, offset, out);
+            add_TIME_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIME, TYPE_DATE):
-            return __BINOP_A_V(x, y, time, date, timestamp, timestamp, ADDI64, len, offset, out);
+            add_TIME_date(x->i32, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, -TYPE_TIME):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_TIME, TYPE_TIMESTAMP):
-            return __BINOP_A_V(x, y, time, timestamp, timestamp, timestamp, ADDI64, len, offset, out);
+            add_TIME_timestamp(x->i32, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIME):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_I32):
-            return __BINOP_A_V(x, y, i64, i32, timestamp, timestamp, ADDI64, len, offset, out);
+            add_TIMESTAMP_i32(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_I64):
-            return __BINOP_A_V(x, y, i64, i64, timestamp, timestamp, ADDI64, len, offset, out);
+            add_TIMESTAMP_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_TIME):
-            return __BINOP_A_V(x, y, i64, time, timestamp, timestamp, ADDI64, len, offset, out);
+            add_TIMESTAMP_time(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         // Vector-Vector symmetric
         case MTYPE2(TYPE_B8, TYPE_I64):
-            return __BINOP_V_V(x, y, b8, i64, i64, i64, ADDI64, len, offset, out);
+            add_b8_i64(AS_B8(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_B8):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_I32):
-            return __BINOP_V_V(x, y, i32, i32, i32, i32, ADDI32, len, offset, out);
+            add_i32_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, i64, i64, ADDI64, len, offset, out);
+            add_i32_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_F64):
-            return __BINOP_V_V(x, y, i32, f64, f64, f64, ADDF64, len, offset, out);
+            add_i32_f64(AS_I32(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_DATE):
-            return __BINOP_V_V(x, y, i32, i32, date, date, ADDI32, len, offset, out);
+            add_i32_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_TIME):
-            return __BINOP_V_V(x, y, i32, i32, time, time, ADDI32, len, offset, out);
+            add_i32_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_TIMESTAMP):
-            return __BINOP_V_V(x, y, i32, i64, timestamp, timestamp, ADDI64, len, offset, out);
+            add_i32_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_U8):
-            return __BINOP_V_V(x, y, i32, u8, i32, i32, ADDI32, len, offset, out);
+            add_i32_u8(AS_I32(x) + offset, AS_U8(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_I16):
-            return __BINOP_V_V(x, y, i32, i16, i32, i32, ADDI32, len, offset, out);
+            add_i32_i16(AS_I32(x) + offset, AS_I16(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I32):
             return ray_add_partial(y, x, len, offset, out);
 
         case MTYPE2(TYPE_I64, TYPE_I64):
-            return __BINOP_V_V(x, y, i64, i64, i64, i64, ADDI64, len, offset, out);
+            add_i64_i64(AS_I64(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_F64):
-            return __BINOP_V_V(x, y, i64, f64, f64, f64, ADDF64, len, offset, out);
+            add_i64_f64(AS_I64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I64, TYPE_DATE):
-            return __BINOP_V_V(x, y, i64, i32, date, date, ADDI32, len, offset, out);
+            add_i64_date(AS_I64(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I64, TYPE_TIME):
-            return __BINOP_V_V(x, y, i64, i32, time, time, ADDI32, len, offset, out);
+            add_i64_time(AS_I64(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I64, TYPE_TIMESTAMP):
-            return __BINOP_V_V(x, y, i64, i64, timestamp, timestamp, ADDI64, len, offset, out);
+            add_i64_i64(AS_I64(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I64, TYPE_U8):
-            return __BINOP_V_V(x, y, i64, u8, i64, i64, ADDI64, len, offset, out);
+            add_i64_u8(AS_I64(x) + offset, AS_U8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I64, TYPE_I16):
-            return __BINOP_V_V(x, y, i64, i16, i64, i64, ADDI64, len, offset, out);
+            add_i64_i16(AS_I64(x) + offset, AS_I16(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I64):
             return ray_add_partial(y, x, len, offset, out);
 
         case MTYPE2(TYPE_F64, TYPE_F64):
-            return __BINOP_V_V(x, y, f64, f64, f64, f64, ADDF64, len, offset, out);
+            add_f64_f64(AS_F64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_U8):
-            return __BINOP_V_V(x, y, f64, u8, f64, f64, ADDF64, len, offset, out);
+            add_f64_u8(AS_F64(x) + offset, AS_U8(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_F64):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_F64, TYPE_I16):
-            return __BINOP_V_V(x, y, f64, i16, f64, f64, ADDF64, len, offset, out);
+            add_f64_i16(AS_F64(x) + offset, AS_I16(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_F64):
             return ray_add_partial(y, x, len, offset, out);
 
         case MTYPE2(TYPE_U8, TYPE_U8):
-            return __BINOP_V_V(x, y, u8, u8, u8, u8, ADDU8, len, offset, out);
+            add_u8_u8(AS_U8(x) + offset, AS_U8(y) + offset, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I16):
-            return __BINOP_V_V(x, y, u8, i16, i16, i16, ADDI16, len, offset, out);
+            add_u8_i16(AS_U8(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_U8):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I16, TYPE_I16):
-            return __BINOP_V_V(x, y, i16, i16, i16, i16, ADDI16, len, offset, out);
+            add_i16_i16(AS_I16(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
 
         // Temporal vector-vector
         case MTYPE2(TYPE_DATE, TYPE_TIME):
-            return __BINOP_V_V(x, y, date, time, timestamp, timestamp, ADDI64, len, offset, out);
+            add_date_time(AS_I32(x) + offset, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_DATE):
             return ray_add_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_TIME, TYPE_TIME):
-            return __BINOP_V_V(x, y, i32, i32, time, time, ADDI32, len, offset, out);
+            add_time_time(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_TIMESTAMP):
-            return __BINOP_V_V(x, y, time, timestamp, timestamp, timestamp, ADDI64, len, offset, out);
+            add_time_timestamp(AS_I32(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIME):
             return ray_add_partial(y, x, len, offset, out);
 
@@ -612,13 +2510,17 @@ obj_p ray_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I32, -TYPE_TIME):
             return atime(SUBI32(x->i32, y->i32));
         case MTYPE2(-TYPE_I32, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, i32, i32, SUBI32, len, offset, out);
+            sub_I32_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, i64, i64, SUBI64, len, offset, out);
+            sub_I32_i64(x->i32, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_F64):
-            return __BINOP_A_V(x, y, i32, f64, f64, f64, SUBF64, len, offset, out);
+            sub_I32_f64(x->i32, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_TIME):
-            return __BINOP_A_V(x, y, i32, i32, time, time, SUBI32, len, offset, out);
+            sub_I32_time(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I64, -TYPE_I32):
             return i64(SUBI64(x->i64, i32_to_i64(y->i32)));
@@ -629,13 +2531,17 @@ obj_p ray_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I64, -TYPE_TIME):
             return atime(SUBI32(i64_to_i32(x->i64), y->i32));
         case MTYPE2(-TYPE_I64, TYPE_I32):
-            return __BINOP_A_V(x, y, i64, i32, i64, i64, SUBI64, len, offset, out);
+            sub_I64_i32(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_I64):
-            return __BINOP_A_V(x, y, i64, i64, i64, i64, SUBI64, len, offset, out);
+            sub_I64_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_F64):
-            return __BINOP_A_V(x, y, i64, f64, f64, f64, SUBF64, len, offset, out);
+            sub_I64_f64(x->i64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_TIME):
-            return __BINOP_A_V(x, y, i64, i32, time, time, SUBI32, len, offset, out);
+            sub_I64_time(x->i64, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_F64, -TYPE_I32):
             return f64(SUBF64(x->f64, i32_to_f64(y->i32)));
@@ -644,11 +2550,14 @@ obj_p ray_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_F64, -TYPE_F64):
             return f64(SUBF64(x->f64, y->f64));
         case MTYPE2(-TYPE_F64, TYPE_I32):
-            return __BINOP_A_V(x, y, f64, i32, f64, f64, SUBF64, len, offset, out);
+            sub_F64_i32(x->f64, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_I64):
-            return __BINOP_A_V(x, y, f64, i64, f64, f64, SUBF64, len, offset, out);
+            sub_F64_i64(x->f64, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_F64):
-            return __BINOP_A_V(x, y, f64, f64, f64, f64, SUBF64, len, offset, out);
+            sub_F64_f64(x->f64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_DATE, -TYPE_I32):
             return adate(SUBI32(x->i32, y->i32));
@@ -659,13 +2568,17 @@ obj_p ray_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_DATE, -TYPE_TIME):
             return timestamp(SUBI64(date_to_timestamp(x->i32), time_to_timestamp(y->i32)));
         case MTYPE2(-TYPE_DATE, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, date, date, SUBI32, len, offset, out);
+            sub_DATE_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_DATE, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, date, date, SUBI32, len, offset, out);
+            sub_DATE_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_DATE, TYPE_DATE):
-            return __BINOP_A_V(x, y, i32, i32, i32, i32, SUBI32, len, offset, out);
+            sub_DATE_date(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_DATE, TYPE_TIME):
-            return __BINOP_A_V(x, y, date, time, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_DATE_time(x->i32, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_TIME, -TYPE_I32):
         case MTYPE2(-TYPE_TIME, -TYPE_TIME):
@@ -674,9 +2587,11 @@ obj_p ray_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
             return atime(SUBI32(x->i32, i64_to_i32(y->i64)));
         case MTYPE2(-TYPE_TIME, TYPE_I32):
         case MTYPE2(-TYPE_TIME, TYPE_TIME):
-            return __BINOP_A_V(x, y, i32, i32, time, time, SUBI32, len, offset, out);
+            sub_TIME_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIME, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, time, time, SUBI32, len, offset, out);
+            sub_TIME_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_TIMESTAMP, -TYPE_I32):
             return timestamp(SUBI64(x->i64, i32_to_i64(y->i32)));
@@ -687,104 +2602,149 @@ obj_p ray_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
             return i64(SUBI64(x->i64, y->i64));
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_I32):
-            return __BINOP_A_V(x, y, i64, i32, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_TIMESTAMP_i32(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_I64):
-            return __BINOP_A_V(x, y, i64, i64, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_TIMESTAMP_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_TIME):
-            return __BINOP_A_V(x, y, i64, time, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_TIMESTAMP_time(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_TIMESTAMP):
-            return __BINOP_A_V(x, y, i64, i64, i64, i64, SUBI64, len, offset, out);
+            sub_TIMESTAMP_timestamp(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_I32, -TYPE_I32):
-            return __BINOP_V_A(x, y, i32, i32, i32, i32, SUBI32, len, offset, out);
+            sub_i32_I32(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I64):
-            return __BINOP_V_A(x, y, i32, i64, i64, i64, SUBI64, len, offset, out);
+            sub_i32_I64(AS_I32(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_F64):
-            return __BINOP_V_A(x, y, i32, f64, f64, f64, SUBF64, len, offset, out);
+            sub_i32_F64(AS_I32(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_TIME):
-            return __BINOP_V_A(x, y, i32, i32, time, time, SUBI32, len, offset, out);
+            sub_i32_TIME(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I32):
-            return __BINOP_V_V(x, y, i32, i32, i32, i32, SUBI32, len, offset, out);
+            sub_i32_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, i64, i64, SUBI64, len, offset, out);
+            sub_i32_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_F64):
-            return __BINOP_V_V(x, y, i32, f64, f64, f64, SUBF64, len, offset, out);
+            sub_i32_f64(AS_I32(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_TIME):
-            return __BINOP_V_V(x, y, i32, i32, time, time, SUBI32, len, offset, out);
+            sub_i32_time(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_I64, -TYPE_I32):
         case MTYPE2(TYPE_I64, -TYPE_I64):
-            return __BINOP_V_A(x, y, i64, i64, i64, i64, SUBI64, len, offset, out);
+            sub_i64_I64(AS_I64(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_F64):
-            return __BINOP_V_A(x, y, i64, f64, f64, f64, SUBF64, len, offset, out);
+            sub_i64_F64(AS_I64(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_TIME):
-            return __BINOP_V_A(x, y, i64, i32, time, time, SUBI32, len, offset, out);
+            sub_i64_TIME(AS_I64(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I32):
-            return __BINOP_V_V(x, y, i64, i32, i64, i64, SUBI64, len, offset, out);
+            sub_i64_i32(AS_I64(x) + offset, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I64):
-            return __BINOP_V_V(x, y, i64, i64, i64, i64, SUBI64, len, offset, out);
+            sub_i64_i64(AS_I64(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_F64):
-            return __BINOP_V_V(x, y, i64, f64, f64, f64, SUBF64, len, offset, out);
+            sub_i64_f64(AS_I64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_TIME):
-            return __BINOP_V_V(x, y, i64, i32, time, time, SUBI32, len, offset, out);
+            sub_i64_time(AS_I64(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_F64, -TYPE_I32):
-            return __BINOP_V_A(x, y, f64, i32, f64, f64, SUBF64, len, offset, out);
+            sub_f64_I32(AS_F64(x) + offset, y->i32, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I64):
-            return __BINOP_V_A(x, y, f64, i64, f64, f64, SUBF64, len, offset, out);
+            sub_f64_I64(AS_F64(x) + offset, y->i64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_F64):
-            return __BINOP_V_A(x, y, f64, f64, f64, f64, SUBF64, len, offset, out);
+            sub_f64_F64(AS_F64(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I32):
-            return __BINOP_V_V(x, y, f64, i32, f64, f64, SUBF64, len, offset, out);
+            sub_f64_i32(AS_F64(x) + offset, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I64):
-            return __BINOP_V_V(x, y, f64, i64, f64, f64, SUBF64, len, offset, out);
+            sub_f64_i64(AS_F64(x) + offset, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_F64):
-            return __BINOP_V_V(x, y, f64, f64, f64, f64, SUBF64, len, offset, out);
+            sub_f64_f64(AS_F64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_DATE, -TYPE_I32):
-            return __BINOP_V_A(x, y, i32, i32, date, date, SUBI32, len, offset, out);
+            sub_date_I32(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, -TYPE_I64):
-            return __BINOP_V_A(x, y, i32, i64, date, date, SUBI32, len, offset, out);
+            sub_date_I64(AS_I32(x) + offset, y->i64, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, -TYPE_DATE):
-            return __BINOP_V_A(x, y, i32, i32, i32, i32, SUBI32, len, offset, out);
+            sub_date_DATE(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, -TYPE_TIME):
-            return __BINOP_V_A(x, y, date, time, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_date_TIME(AS_I32(x) + offset, y->i32, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, TYPE_I32):
-            return __BINOP_V_V(x, y, i32, i32, date, date, SUBI32, len, offset, out);
+            sub_date_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, date, date, SUBI32, len, offset, out);
+            sub_date_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, TYPE_DATE):
-            return __BINOP_V_V(x, y, i32, i32, i32, i32, SUBI32, len, offset, out);
+            sub_date_date(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, TYPE_TIME):
-            return __BINOP_V_V(x, y, date, time, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_date_time(AS_I32(x) + offset, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_TIME, -TYPE_I32):
         case MTYPE2(TYPE_TIME, -TYPE_TIME):
-            return __BINOP_V_A(x, y, i32, i32, time, time, SUBI32, len, offset, out);
+            sub_time_I32(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I64):
-            return __BINOP_V_A(x, y, i32, i64, time, time, SUBI32, len, offset, out);
+            sub_time_I64(AS_I32(x) + offset, y->i64, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I32):
         case MTYPE2(TYPE_TIME, TYPE_TIME):
-            return __BINOP_V_V(x, y, i32, i32, time, time, SUBI32, len, offset, out);
+            sub_time_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, time, time, SUBI32, len, offset, out);
+            sub_time_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_I32):
-            return __BINOP_V_A(x, y, i64, i32, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_timestamp_I32(AS_I64(x) + offset, y->i32, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_I64):
-            return __BINOP_V_A(x, y, i64, i64, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_timestamp_I64(AS_I64(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIME):
-            return __BINOP_V_A(x, y, timestamp, time, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_timestamp_TIME(AS_I64(x) + offset, y->i32, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIMESTAMP):
-            return __BINOP_V_A(x, y, i64, i64, i64, i64, SUBI64, len, offset, out);
+            sub_timestamp_TIMESTAMP(AS_I64(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, TYPE_I32):
-            return __BINOP_V_V(x, y, i64, i32, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_timestamp_i32(AS_I64(x) + offset, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, TYPE_I64):
-            return __BINOP_V_V(x, y, i64, i64, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_timestamp_i64(AS_I64(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIME):
-            return __BINOP_V_V(x, y, i64, time, timestamp, timestamp, SUBI64, len, offset, out);
+            sub_timestamp_time(AS_I64(x) + offset, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIMESTAMP):
-            return __BINOP_V_V(x, y, i64, i64, i64, i64, SUBI64, len, offset, out);
+            sub_timestamp_timestamp(AS_I64(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_U8, -TYPE_U8):
             return u8(SUBU8(x->u8, y->u8));
@@ -797,35 +2757,50 @@ obj_p ray_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_U8, -TYPE_I16):
             return i16(SUBI16(u8_to_i16(x->u8), y->i16));
         case MTYPE2(-TYPE_U8, TYPE_U8):
-            return __BINOP_A_V(x, y, u8, u8, u8, u8, SUBU8, len, offset, out);
+            sub_U8_u8(x->u8, AS_U8(y) + offset, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_I16):
-            return __BINOP_A_V(x, y, u8, i16, i16, i16, SUBI16, len, offset, out);
+            sub_U8_i16(x->u8, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_I32):
-            return __BINOP_A_V(x, y, u8, i32, i32, i32, SUBI32, len, offset, out);
+            sub_U8_i32(x->u8, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_I64):
-            return __BINOP_A_V(x, y, u8, i64, i64, i64, SUBI64, len, offset, out);
+            sub_U8_i64(x->u8, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_F64):
-            return __BINOP_A_V(x, y, u8, f64, f64, f64, SUBF64, len, offset, out);
+            sub_U8_f64(x->u8, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_U8):
-            return __BINOP_V_A(x, y, u8, u8, u8, u8, SUBU8, len, offset, out);
+            sub_u8_U8(AS_U8(x) + offset, y->u8, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I32):
-            return __BINOP_V_A(x, y, u8, i32, i32, i32, SUBI32, len, offset, out);
+            sub_u8_I32(AS_U8(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I64):
-            return __BINOP_V_A(x, y, u8, i64, i64, i64, SUBI64, len, offset, out);
+            sub_u8_I64(AS_U8(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_F64):
-            return __BINOP_V_A(x, y, u8, f64, f64, f64, SUBF64, len, offset, out);
+            sub_u8_F64(AS_U8(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I16):
-            return __BINOP_V_A(x, y, u8, i16, i16, i16, SUBI16, len, offset, out);
+            sub_u8_I16(AS_U8(x) + offset, y->i16, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_U8):
-            return __BINOP_V_V(x, y, u8, u8, u8, u8, SUBU8, len, offset, out);
+            sub_u8_u8(AS_U8(x) + offset, AS_U8(y) + offset, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I16):
-            return __BINOP_V_V(x, y, u8, i16, i16, i16, SUBI16, len, offset, out);
+            sub_u8_i16(AS_U8(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I32):
-            return __BINOP_V_V(x, y, u8, i32, i32, i32, SUBI32, len, offset, out);
+            sub_u8_i32(AS_U8(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I64):
-            return __BINOP_V_V(x, y, u8, i64, i64, i64, SUBI64, len, offset, out);
+            sub_u8_i64(AS_U8(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_F64):
-            return __BINOP_V_V(x, y, u8, f64, f64, f64, SUBF64, len, offset, out);
+            sub_u8_f64(AS_U8(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I16, -TYPE_I16):
             return i16(SUBI16(x->i16, y->i16));
@@ -838,86 +2813,119 @@ obj_p ray_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I16, -TYPE_U8):
             return i16(SUBI16(x->i16, u8_to_i16(y->u8)));
         case MTYPE2(-TYPE_I16, TYPE_I16):
-            return __BINOP_A_V(x, y, i16, i16, i16, i16, SUBI16, len, offset, out);
+            sub_I16_i16(x->i16, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_U8):
-            return __BINOP_A_V(x, y, i16, u8, i16, i16, SUBI16, len, offset, out);
+            sub_I16_u8(x->i16, AS_U8(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_I32):
-            return __BINOP_A_V(x, y, i16, i32, i32, i32, SUBI32, len, offset, out);
+            sub_I16_i32(x->i16, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_I64):
-            return __BINOP_A_V(x, y, i16, i64, i64, i64, SUBI64, len, offset, out);
+            sub_I16_i64(x->i16, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_F64):
-            return __BINOP_A_V(x, y, i16, f64, f64, f64, SUBF64, len, offset, out);
+            sub_I16_f64(x->i16, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I16):
-            return __BINOP_V_A(x, y, i16, i16, i16, i16, SUBI16, len, offset, out);
+            sub_i16_I16(AS_I16(x) + offset, y->i16, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I32):
-            return __BINOP_V_A(x, y, i16, i32, i32, i32, SUBI32, len, offset, out);
+            sub_i16_I32(AS_I16(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I64):
-            return __BINOP_V_A(x, y, i16, i64, i64, i64, SUBI64, len, offset, out);
+            sub_i16_I64(AS_I16(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_F64):
-            return __BINOP_V_A(x, y, i16, f64, f64, f64, SUBF64, len, offset, out);
+            sub_i16_F64(AS_I16(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_U8):
-            return __BINOP_V_A(x, y, i16, u8, i16, i16, SUBI16, len, offset, out);
+            sub_i16_U8(AS_I16(x) + offset, y->u8, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I16):
-            return __BINOP_V_V(x, y, i16, i16, i16, i16, SUBI16, len, offset, out);
+            sub_i16_i16(AS_I16(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_U8):
-            return __BINOP_V_V(x, y, i16, u8, i16, i16, SUBI16, len, offset, out);
+            sub_i16_u8(AS_I16(x) + offset, AS_U8(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I32):
-            return __BINOP_V_V(x, y, i16, i32, i32, i32, SUBI32, len, offset, out);
+            sub_i16_i32(AS_I16(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I64):
-            return __BINOP_V_V(x, y, i16, i64, i64, i64, SUBI64, len, offset, out);
+            sub_i16_i64(AS_I16(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_F64):
-            return __BINOP_V_V(x, y, i16, f64, f64, f64, SUBF64, len, offset, out);
+            sub_i16_f64(AS_I16(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I32, -TYPE_U8):
             return i32(SUBI32(x->i32, u8_to_i32(y->u8)));
         case MTYPE2(-TYPE_I32, -TYPE_I16):
             return i32(SUBI32(x->i32, i16_to_i32(y->i16)));
         case MTYPE2(-TYPE_I32, TYPE_U8):
-            return __BINOP_A_V(x, y, i32, u8, i32, i32, SUBI32, len, offset, out);
+            sub_I32_u8(x->i32, AS_U8(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_I16):
-            return __BINOP_A_V(x, y, i32, i16, i32, i32, SUBI32, len, offset, out);
+            sub_I32_i16(x->i32, AS_I16(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_U8):
-            return __BINOP_V_A(x, y, i32, u8, i32, i32, SUBI32, len, offset, out);
+            sub_i32_U8(AS_I32(x) + offset, y->u8, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I16):
-            return __BINOP_V_A(x, y, i32, i16, i32, i32, SUBI32, len, offset, out);
+            sub_i32_I16(AS_I32(x) + offset, y->i16, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_U8):
-            return __BINOP_V_V(x, y, i32, u8, i32, i32, SUBI32, len, offset, out);
+            sub_i32_u8(AS_I32(x) + offset, AS_U8(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I16):
-            return __BINOP_V_V(x, y, i32, i16, i32, i32, SUBI32, len, offset, out);
+            sub_i32_i16(AS_I32(x) + offset, AS_I16(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I64, -TYPE_U8):
             return i64(SUBI64(x->i64, u8_to_i64(y->u8)));
         case MTYPE2(-TYPE_I64, -TYPE_I16):
             return i64(SUBI64(x->i64, i16_to_i64(y->i16)));
         case MTYPE2(-TYPE_I64, TYPE_U8):
-            return __BINOP_A_V(x, y, i64, u8, i64, i64, SUBI64, len, offset, out);
+            sub_I64_u8(x->i64, AS_U8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_I16):
-            return __BINOP_A_V(x, y, i64, i16, i64, i64, SUBI64, len, offset, out);
+            sub_I64_i16(x->i64, AS_I16(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_U8):
-            return __BINOP_V_A(x, y, i64, u8, i64, i64, SUBI64, len, offset, out);
+            sub_i64_U8(AS_I64(x) + offset, y->u8, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I16):
-            return __BINOP_V_A(x, y, i64, i16, i64, i64, SUBI64, len, offset, out);
+            sub_i64_I16(AS_I64(x) + offset, y->i16, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_U8):
-            return __BINOP_V_V(x, y, i64, u8, i64, i64, SUBI64, len, offset, out);
+            sub_i64_u8(AS_I64(x) + offset, AS_U8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I16):
-            return __BINOP_V_V(x, y, i64, i16, i64, i64, SUBI64, len, offset, out);
+            sub_i64_i16(AS_I64(x) + offset, AS_I16(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_F64, -TYPE_U8):
             return f64(SUBF64(x->f64, u8_to_f64(y->u8)));
         case MTYPE2(-TYPE_F64, -TYPE_I16):
             return f64(SUBF64(x->f64, i16_to_f64(y->i16)));
         case MTYPE2(-TYPE_F64, TYPE_U8):
-            return __BINOP_A_V(x, y, f64, u8, f64, f64, SUBF64, len, offset, out);
+            sub_F64_u8(x->f64, AS_U8(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_I16):
-            return __BINOP_A_V(x, y, f64, i16, f64, f64, SUBF64, len, offset, out);
+            sub_F64_i16(x->f64, AS_I16(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_U8):
-            return __BINOP_V_A(x, y, f64, u8, f64, f64, SUBF64, len, offset, out);
+            sub_f64_U8(AS_F64(x) + offset, y->u8, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I16):
-            return __BINOP_V_A(x, y, f64, i16, f64, f64, SUBF64, len, offset, out);
+            sub_f64_I16(AS_F64(x) + offset, y->i16, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_U8):
-            return __BINOP_V_V(x, y, f64, u8, f64, f64, SUBF64, len, offset, out);
+            sub_f64_u8(AS_F64(x) + offset, AS_U8(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I16):
-            return __BINOP_V_V(x, y, f64, i16, f64, f64, SUBF64, len, offset, out);
+            sub_f64_i16(AS_F64(x) + offset, AS_I16(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         default:
             return err_type(x->type, y->type, 0, 0);
@@ -992,187 +3000,235 @@ obj_p ray_mul_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
 
         // Atom-Vector: canonical form is A_V, redirect V_A
         case MTYPE2(-TYPE_I32, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, i32, i32, MULI32, len, offset, out);
+            mul_I32_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, i64, i64, MULI64, len, offset, out);
+            mul_I32_i64(x->i32, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_F64):
-            return __BINOP_A_V(x, y, i32, f64, f64, f64, MULF64, len, offset, out);
+            mul_I32_f64(x->i32, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_TIME):
-            return __BINOP_A_V(x, y, i32, time, time, time, MULI32, len, offset, out);
+            mul_I32_time(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_U8):
-            return __BINOP_A_V(x, y, i32, u8, i32, i32, MULI32, len, offset, out);
+            mul_I32_u8(x->i32, AS_U8(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I32, TYPE_I16):
-            return __BINOP_A_V(x, y, i32, i16, i32, i32, MULI32, len, offset, out);
+            mul_I32_i16(x->i32, AS_I16(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
 
         case MTYPE2(-TYPE_I64, TYPE_I32):
-            return __BINOP_A_V(x, y, i64, i32, i64, i64, MULI64, len, offset, out);
+            mul_I64_i32(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_I64):
-            return __BINOP_A_V(x, y, i64, i64, i64, i64, MULI64, len, offset, out);
+            mul_I64_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_F64):
-            return __BINOP_A_V(x, y, i64, f64, f64, f64, MULF64, len, offset, out);
+            mul_I64_f64(x->i64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_TIME):
-            return __BINOP_A_V(x, y, i64, time, time, time, MULI32, len, offset, out);
+            mul_I64_time(x->i64, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_U8):
-            return __BINOP_A_V(x, y, i64, u8, i64, i64, MULI64, len, offset, out);
+            mul_I64_u8(x->i64, AS_U8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I64, TYPE_I16):
-            return __BINOP_A_V(x, y, i64, i16, i64, i64, MULI64, len, offset, out);
+            mul_I64_i16(x->i64, AS_I16(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I64):
             return ray_mul_partial(y, x, len, offset, out);
 
         case MTYPE2(-TYPE_F64, TYPE_I32):
-            return __BINOP_A_V(x, y, f64, i32, f64, f64, MULF64, len, offset, out);
+            mul_F64_i32(x->f64, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_F64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_F64, TYPE_I64):
-            return __BINOP_A_V(x, y, f64, i64, f64, f64, MULF64, len, offset, out);
+            mul_F64_i64(x->f64, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_F64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_F64, TYPE_F64):
-            return __BINOP_A_V(x, y, f64, f64, f64, f64, MULF64, len, offset, out);
+            mul_F64_f64(x->f64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_F64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_F64, TYPE_U8):
-            return __BINOP_A_V(x, y, f64, u8, f64, f64, MULF64, len, offset, out);
+            mul_F64_u8(x->f64, AS_U8(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_F64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_F64, TYPE_I16):
-            return __BINOP_A_V(x, y, f64, i16, f64, f64, MULF64, len, offset, out);
+            mul_F64_i16(x->f64, AS_I16(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_F64):
             return ray_mul_partial(y, x, len, offset, out);
 
         case MTYPE2(-TYPE_TIME, TYPE_I32):
-            return __BINOP_A_V(x, y, time, i32, time, time, MULI32, len, offset, out);
+            mul_TIME_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIME, TYPE_I64):
-            return __BINOP_A_V(x, y, time, i64, time, time, MULI32, len, offset, out);
+            mul_TIME_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_U8, TYPE_U8):
-            return __BINOP_A_V(x, y, u8, u8, u8, u8, MULU8, len, offset, out);
+            mul_U8_u8(x->u8, AS_U8(y) + offset, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_U8):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_U8, TYPE_I32):
-            return __BINOP_A_V(x, y, u8, i32, i32, i32, MULI32, len, offset, out);
+            mul_U8_i32(x->u8, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_U8):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_U8, TYPE_I64):
-            return __BINOP_A_V(x, y, u8, i64, i64, i64, MULI64, len, offset, out);
+            mul_U8_i64(x->u8, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_U8):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_U8, TYPE_F64):
-            return __BINOP_A_V(x, y, u8, f64, f64, f64, MULF64, len, offset, out);
+            mul_U8_f64(x->u8, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_U8):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_U8, TYPE_I16):
-            return __BINOP_A_V(x, y, u8, i16, i16, i16, MULI16, len, offset, out);
+            mul_U8_i16(x->u8, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_U8):
             return ray_mul_partial(y, x, len, offset, out);
 
         case MTYPE2(-TYPE_I16, TYPE_I16):
-            return __BINOP_A_V(x, y, i16, i16, i16, i16, MULI16, len, offset, out);
+            mul_I16_i16(x->i16, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I16):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I16, TYPE_I32):
-            return __BINOP_A_V(x, y, i16, i32, i32, i32, MULI32, len, offset, out);
+            mul_I16_i32(x->i16, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I16):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I16, TYPE_I64):
-            return __BINOP_A_V(x, y, i16, i64, i64, i64, MULI64, len, offset, out);
+            mul_I16_i64(x->i16, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I16):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(-TYPE_I16, TYPE_F64):
-            return __BINOP_A_V(x, y, i16, f64, f64, f64, MULF64, len, offset, out);
+            mul_I16_f64(x->i16, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_U8):
-            return __BINOP_A_V(x, y, i16, u8, i16, i16, MULI16, len, offset, out);
+            mul_I16_u8(x->i16, AS_U8(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I16):
             return ray_mul_partial(y, x, len, offset, out);
 
         // Vector-Vector symmetric
         case MTYPE2(TYPE_B8, TYPE_I64):
-            return __BINOP_V_V(x, y, b8, i64, b8, i64, MULI64, len, offset, out);
+            mul_b8_i64(AS_B8(x) + offset, AS_I64(y) + offset, AS_B8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_B8):
-            return __BINOP_V_V(x, y, i64, b8, i64, i64, MULI64, len, offset, out);
+            mul_i64_b8(AS_I64(x) + offset, AS_B8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I32):
-            return __BINOP_V_V(x, y, i32, i32, i32, i32, MULI32, len, offset, out);
+            mul_i32_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, i64, i64, MULI64, len, offset, out);
+            mul_i32_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_F64):
-            return __BINOP_V_V(x, y, i32, f64, f64, f64, MULF64, len, offset, out);
+            mul_i32_f64(AS_I32(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_TIME):
-            return __BINOP_V_V(x, y, i32, time, time, time, MULI32, len, offset, out);
+            mul_i32_time(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_U8):
-            return __BINOP_V_V(x, y, i32, u8, i32, i32, MULI32, len, offset, out);
+            mul_i32_u8(AS_I32(x) + offset, AS_U8(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I32, TYPE_I16):
-            return __BINOP_V_V(x, y, i32, i16, i32, i32, MULI32, len, offset, out);
+            mul_i32_i16(AS_I32(x) + offset, AS_I16(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I32):
             return ray_mul_partial(y, x, len, offset, out);
 
         case MTYPE2(TYPE_I64, TYPE_I64):
-            return __BINOP_V_V(x, y, i64, i64, i64, i64, MULI64, len, offset, out);
+            mul_i64_i64(AS_I64(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_F64):
-            return __BINOP_V_V(x, y, i64, f64, f64, f64, MULF64, len, offset, out);
+            mul_i64_f64(AS_I64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I64, TYPE_TIME):
-            return __BINOP_V_V(x, y, i64, i32, time, time, MULI32, len, offset, out);
+            mul_i64_time(AS_I64(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I64, TYPE_U8):
-            return __BINOP_V_V(x, y, i64, u8, i64, i64, MULI64, len, offset, out);
+            mul_i64_u8(AS_I64(x) + offset, AS_U8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I64, TYPE_I16):
-            return __BINOP_V_V(x, y, i64, i16, i64, i64, MULI64, len, offset, out);
+            mul_i64_i16(AS_I64(x) + offset, AS_I16(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I64):
             return ray_mul_partial(y, x, len, offset, out);
 
         case MTYPE2(TYPE_F64, TYPE_F64):
-            return __BINOP_V_V(x, y, f64, f64, f64, f64, MULF64, len, offset, out);
+            mul_f64_f64(AS_F64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_U8):
-            return __BINOP_V_V(x, y, f64, u8, f64, f64, MULF64, len, offset, out);
+            mul_f64_u8(AS_F64(x) + offset, AS_U8(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_F64):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_F64, TYPE_I16):
-            return __BINOP_V_V(x, y, f64, i16, f64, f64, MULF64, len, offset, out);
+            mul_f64_i16(AS_F64(x) + offset, AS_I16(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_F64):
             return ray_mul_partial(y, x, len, offset, out);
 
         case MTYPE2(TYPE_U8, TYPE_U8):
-            return __BINOP_V_V(x, y, u8, u8, u8, u8, MULU8, len, offset, out);
+            mul_u8_u8(AS_U8(x) + offset, AS_U8(y) + offset, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I16):
-            return __BINOP_V_V(x, y, u8, i16, i16, i16, MULI16, len, offset, out);
+            mul_u8_i16(AS_U8(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_U8):
             return ray_mul_partial(y, x, len, offset, out);
         case MTYPE2(TYPE_I16, TYPE_I16):
-            return __BINOP_V_V(x, y, i16, i16, i16, i16, MULI16, len, offset, out);
+            mul_i16_i16(AS_I16(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
 
         default:
             return err_type(x->type, y->type, 0, 0);
@@ -1188,11 +3244,14 @@ obj_p ray_div_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I32, -TYPE_F64):
             return i32(f64_to_i32(DIVF64(i32_to_f64(x->i32), y->f64)));
         case MTYPE2(-TYPE_I32, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, i32, i32, DIVI32, len, offset, out);
+            div_I32_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, i32, i64, DIVI64, len, offset, out);
+            div_I32_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_F64):
-            return __BINOP_A_V(x, y, i32, f64, i32, f64, DIVF64, len, offset, out);
+            div_I32_f64(x->i32, AS_F64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I64, -TYPE_I32):
             return i64(DIVI64(x->i64, i32_to_i64(y->i32)));
@@ -1201,11 +3260,14 @@ obj_p ray_div_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I64, -TYPE_F64):
             return i64(f64_to_i64(DIVF64(i64_to_f64(x->i64), y->f64)));
         case MTYPE2(-TYPE_I64, TYPE_I32):
-            return __BINOP_A_V(x, y, i64, i32, i64, i64, DIVI64, len, offset, out);
+            div_I64_i32(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_I64):
-            return __BINOP_A_V(x, y, i64, i64, i64, i64, DIVI64, len, offset, out);
+            div_I64_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_F64):
-            return __BINOP_A_V(x, y, i64, f64, i64, f64, DIVF64, len, offset, out);
+            div_I64_f64(x->i64, AS_F64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_F64, -TYPE_I32):
             return f64(DIVF64(x->f64, i32_to_f64(y->i32)));
@@ -1214,50 +3276,71 @@ obj_p ray_div_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_F64, -TYPE_F64):
             return f64(DIVF64(x->f64, y->f64));
         case MTYPE2(-TYPE_F64, TYPE_I32):
-            return __BINOP_A_V(x, y, f64, i32, f64, f64, DIVF64, len, offset, out);
+            div_F64_i32(x->f64, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_I64):
-            return __BINOP_A_V(x, y, f64, i64, f64, f64, DIVF64, len, offset, out);
+            div_F64_i64(x->f64, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_F64):
-            return __BINOP_A_V(x, y, f64, f64, f64, f64, DIVF64, len, offset, out);
+            div_F64_f64(x->f64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_I32, -TYPE_I32):
-            return __BINOP_V_A(x, y, i32, i32, i32, i32, DIVI32, len, offset, out);
+            div_i32_I32(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I64):
-            return __BINOP_V_A(x, y, i32, i64, i32, i64, DIVI64, len, offset, out);
+            div_i32_I64(AS_I32(x) + offset, y->i64, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_F64):
-            return __BINOP_V_A(x, y, i32, f64, i32, f64, DIVF64, len, offset, out);
+            div_i32_F64(AS_I32(x) + offset, y->f64, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I32):
-            return __BINOP_V_V(x, y, i32, i32, i32, i32, DIVI32, len, offset, out);
+            div_i32_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, i32, i64, DIVI64, len, offset, out);
+            div_i32_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_F64):
-            return __BINOP_V_V(x, y, i32, f64, i32, f64, DIVF64, len, offset, out);
+            div_i32_f64(AS_I32(x) + offset, AS_F64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_I64, -TYPE_I32):
-            return __BINOP_V_A(x, y, i64, i32, i64, i64, DIVI64, len, offset, out);
+            div_i64_I32(AS_I64(x) + offset, y->i32, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I64):
-            return __BINOP_V_A(x, y, i64, i64, i64, i64, DIVI64, len, offset, out);
+            div_i64_I64(AS_I64(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_F64):
-            return __BINOP_V_A(x, y, i64, f64, i64, f64, DIVF64, len, offset, out);
+            div_i64_F64(AS_I64(x) + offset, y->f64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I32):
-            return __BINOP_V_V(x, y, i64, i32, i64, i64, DIVI64, len, offset, out);
+            div_i64_i32(AS_I64(x) + offset, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I64):
-            return __BINOP_V_V(x, y, i64, i64, i64, i64, DIVI64, len, offset, out);
+            div_i64_i64(AS_I64(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_F64):
-            return __BINOP_V_V(x, y, i64, f64, i64, f64, DIVF64, len, offset, out);
+            div_i64_f64(AS_I64(x) + offset, AS_F64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_F64, -TYPE_I32):
-            return __BINOP_V_A(x, y, f64, i32, f64, f64, DIVF64, len, offset, out);
+            div_f64_I32(AS_F64(x) + offset, y->i32, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I64):
-            return __BINOP_V_A(x, y, f64, i64, f64, f64, DIVF64, len, offset, out);
+            div_f64_I64(AS_F64(x) + offset, y->i64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_F64):
-            return __BINOP_V_A(x, y, f64, f64, f64, f64, DIVF64, len, offset, out);
+            div_f64_F64(AS_F64(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I32):
-            return __BINOP_V_V(x, y, f64, i32, f64, f64, DIVF64, len, offset, out);
+            div_f64_i32(AS_F64(x) + offset, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I64):
-            return __BINOP_V_V(x, y, f64, i64, f64, f64, DIVF64, len, offset, out);
+            div_f64_i64(AS_F64(x) + offset, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_F64):
-            return __BINOP_V_V(x, y, f64, f64, f64, f64, DIVF64, len, offset, out);
+            div_f64_f64(AS_F64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_TIME, -TYPE_I32):
             return atime(DIVI32(x->i32, y->i32));
@@ -1266,23 +3349,32 @@ obj_p ray_div_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_TIME, -TYPE_F64):
             return atime(f64_to_i32(DIVF64(i32_to_f64(x->i32), y->f64)));
         case MTYPE2(-TYPE_TIME, TYPE_I32):
-            return __BINOP_A_V(x, y, time, i32, time, time, DIVI32, len, offset, out);
+            div_TIME_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIME, TYPE_I64):
-            return __BINOP_A_V(x, y, time, i64, time, time, DIVI32, len, offset, out);
+            div_TIME_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIME, TYPE_F64):
-            return __BINOP_A_V(x, y, time, f64, time, f64, DIVF64, len, offset, out);
+            div_TIME_f64(x->i32, AS_F64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I32):
-            return __BINOP_V_A(x, y, time, i32, time, time, DIVI32, len, offset, out);
+            div_time_I32(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I64):
-            return __BINOP_V_A(x, y, time, i64, time, i64, DIVI64, len, offset, out);
+            div_time_I64(AS_I32(x) + offset, y->i64, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_F64):
-            return __BINOP_V_A(x, y, time, f64, time, f64, DIVF64, len, offset, out);
+            div_time_F64(AS_I32(x) + offset, y->f64, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I32):
-            return __BINOP_V_V(x, y, time, i32, time, time, DIVI32, len, offset, out);
+            div_time_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I64):
-            return __BINOP_V_V(x, y, time, i64, time, i64, DIVI64, len, offset, out);
+            div_time_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_F64):
-            return __BINOP_V_V(x, y, time, f64, time, f64, DIVF64, len, offset, out);
+            div_time_f64(AS_I32(x) + offset, AS_F64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_U8, -TYPE_U8):
             return u8(DIVU8(x->u8, y->u8));
@@ -1295,35 +3387,50 @@ obj_p ray_div_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_U8, -TYPE_I16):
             return i16(DIVI16(u8_to_i16(x->u8), y->i16));
         case MTYPE2(-TYPE_U8, TYPE_U8):
-            return __BINOP_A_V(x, y, u8, u8, u8, u8, DIVU8, len, offset, out);
+            div_U8_u8(x->u8, AS_U8(y) + offset, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_I16):
-            return __BINOP_A_V(x, y, u8, i16, i16, i16, DIVI16, len, offset, out);
+            div_U8_i16(x->u8, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_I32):
-            return __BINOP_A_V(x, y, u8, i32, i32, i32, DIVI32, len, offset, out);
+            div_U8_i32(x->u8, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_I64):
-            return __BINOP_A_V(x, y, u8, i64, i64, i64, DIVI64, len, offset, out);
+            div_U8_i64(x->u8, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_F64):
-            return __BINOP_A_V(x, y, u8, f64, f64, f64, DIVF64, len, offset, out);
+            div_U8_f64(x->u8, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_U8):
-            return __BINOP_V_A(x, y, u8, u8, u8, u8, DIVU8, len, offset, out);
+            div_u8_U8(AS_U8(x) + offset, y->u8, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I32):
-            return __BINOP_V_A(x, y, u8, i32, i32, i32, DIVI32, len, offset, out);
+            div_u8_I32(AS_U8(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I64):
-            return __BINOP_V_A(x, y, u8, i64, i64, i64, DIVI64, len, offset, out);
+            div_u8_I64(AS_U8(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_F64):
-            return __BINOP_V_A(x, y, u8, f64, f64, f64, DIVF64, len, offset, out);
+            div_u8_F64(AS_U8(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I16):
-            return __BINOP_V_A(x, y, u8, i16, i16, i16, DIVI16, len, offset, out);
+            div_u8_I16(AS_U8(x) + offset, y->i16, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_U8):
-            return __BINOP_V_V(x, y, u8, u8, u8, u8, DIVU8, len, offset, out);
+            div_u8_u8(AS_U8(x) + offset, AS_U8(y) + offset, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I16):
-            return __BINOP_V_V(x, y, u8, i16, i16, i16, DIVI16, len, offset, out);
+            div_u8_i16(AS_U8(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I32):
-            return __BINOP_V_V(x, y, u8, i32, i32, i32, DIVI32, len, offset, out);
+            div_u8_i32(AS_U8(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I64):
-            return __BINOP_V_V(x, y, u8, i64, i64, i64, DIVI64, len, offset, out);
+            div_u8_i64(AS_U8(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_F64):
-            return __BINOP_V_V(x, y, u8, f64, f64, f64, DIVF64, len, offset, out);
+            div_u8_f64(AS_U8(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I16, -TYPE_I16):
             return i16(DIVI16(x->i16, y->i16));
@@ -1336,86 +3443,119 @@ obj_p ray_div_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I16, -TYPE_U8):
             return i16(DIVI16(x->i16, u8_to_i16(y->u8)));
         case MTYPE2(-TYPE_I16, TYPE_I16):
-            return __BINOP_A_V(x, y, i16, i16, i16, i16, DIVI16, len, offset, out);
+            div_I16_i16(x->i16, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_U8):
-            return __BINOP_A_V(x, y, i16, u8, i16, i16, DIVI16, len, offset, out);
+            div_I16_u8(x->i16, AS_U8(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_I32):
-            return __BINOP_A_V(x, y, i16, i32, i32, i32, DIVI32, len, offset, out);
+            div_I16_i32(x->i16, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_I64):
-            return __BINOP_A_V(x, y, i16, i64, i64, i64, DIVI64, len, offset, out);
+            div_I16_i64(x->i16, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_F64):
-            return __BINOP_A_V(x, y, i16, f64, f64, f64, DIVF64, len, offset, out);
+            div_I16_f64(x->i16, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I16):
-            return __BINOP_V_A(x, y, i16, i16, i16, i16, DIVI16, len, offset, out);
+            div_i16_I16(AS_I16(x) + offset, y->i16, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I32):
-            return __BINOP_V_A(x, y, i16, i32, i32, i32, DIVI32, len, offset, out);
+            div_i16_I32(AS_I16(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I64):
-            return __BINOP_V_A(x, y, i16, i64, i64, i64, DIVI64, len, offset, out);
+            div_i16_I64(AS_I16(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_F64):
-            return __BINOP_V_A(x, y, i16, f64, f64, f64, DIVF64, len, offset, out);
+            div_i16_F64(AS_I16(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_U8):
-            return __BINOP_V_A(x, y, i16, u8, i16, i16, DIVI16, len, offset, out);
+            div_i16_U8(AS_I16(x) + offset, y->u8, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I16):
-            return __BINOP_V_V(x, y, i16, i16, i16, i16, DIVI16, len, offset, out);
+            div_i16_i16(AS_I16(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_U8):
-            return __BINOP_V_V(x, y, i16, u8, i16, i16, DIVI16, len, offset, out);
+            div_i16_u8(AS_I16(x) + offset, AS_U8(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I32):
-            return __BINOP_V_V(x, y, i16, i32, i32, i32, DIVI32, len, offset, out);
+            div_i16_i32(AS_I16(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I64):
-            return __BINOP_V_V(x, y, i16, i64, i64, i64, DIVI64, len, offset, out);
+            div_i16_i64(AS_I16(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_F64):
-            return __BINOP_V_V(x, y, i16, f64, f64, f64, DIVF64, len, offset, out);
+            div_i16_f64(AS_I16(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I32, -TYPE_U8):
             return i32(DIVI32(x->i32, u8_to_i32(y->u8)));
         case MTYPE2(-TYPE_I32, -TYPE_I16):
             return i32(DIVI32(x->i32, i16_to_i32(y->i16)));
         case MTYPE2(-TYPE_I32, TYPE_U8):
-            return __BINOP_A_V(x, y, i32, u8, i32, i32, DIVI32, len, offset, out);
+            div_I32_u8(x->i32, AS_U8(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_I16):
-            return __BINOP_A_V(x, y, i32, i16, i32, i32, DIVI32, len, offset, out);
+            div_I32_i16(x->i32, AS_I16(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_U8):
-            return __BINOP_V_A(x, y, i32, u8, i32, i32, DIVI32, len, offset, out);
+            div_i32_U8(AS_I32(x) + offset, y->u8, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I16):
-            return __BINOP_V_A(x, y, i32, i16, i32, i32, DIVI32, len, offset, out);
+            div_i32_I16(AS_I32(x) + offset, y->i16, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_U8):
-            return __BINOP_V_V(x, y, i32, u8, i32, i32, DIVI32, len, offset, out);
+            div_i32_u8(AS_I32(x) + offset, AS_U8(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I16):
-            return __BINOP_V_V(x, y, i32, i16, i32, i32, DIVI32, len, offset, out);
+            div_i32_i16(AS_I32(x) + offset, AS_I16(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I64, -TYPE_U8):
             return i64(DIVI64(x->i64, u8_to_i64(y->u8)));
         case MTYPE2(-TYPE_I64, -TYPE_I16):
             return i64(DIVI64(x->i64, i16_to_i64(y->i16)));
         case MTYPE2(-TYPE_I64, TYPE_U8):
-            return __BINOP_A_V(x, y, i64, u8, i64, i64, DIVI64, len, offset, out);
+            div_I64_u8(x->i64, AS_U8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_I16):
-            return __BINOP_A_V(x, y, i64, i16, i64, i64, DIVI64, len, offset, out);
+            div_I64_i16(x->i64, AS_I16(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_U8):
-            return __BINOP_V_A(x, y, i64, u8, i64, i64, DIVI64, len, offset, out);
+            div_i64_U8(AS_I64(x) + offset, y->u8, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I16):
-            return __BINOP_V_A(x, y, i64, i16, i64, i64, DIVI64, len, offset, out);
+            div_i64_I16(AS_I64(x) + offset, y->i16, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_U8):
-            return __BINOP_V_V(x, y, i64, u8, i64, i64, DIVI64, len, offset, out);
+            div_i64_u8(AS_I64(x) + offset, AS_U8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I16):
-            return __BINOP_V_V(x, y, i64, i16, i64, i64, DIVI64, len, offset, out);
+            div_i64_i16(AS_I64(x) + offset, AS_I16(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_F64, -TYPE_U8):
             return f64(DIVF64(x->f64, u8_to_f64(y->u8)));
         case MTYPE2(-TYPE_F64, -TYPE_I16):
             return f64(DIVF64(x->f64, i16_to_f64(y->i16)));
         case MTYPE2(-TYPE_F64, TYPE_U8):
-            return __BINOP_A_V(x, y, f64, u8, f64, f64, DIVF64, len, offset, out);
+            div_F64_u8(x->f64, AS_U8(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_I16):
-            return __BINOP_A_V(x, y, f64, i16, f64, f64, DIVF64, len, offset, out);
+            div_F64_i16(x->f64, AS_I16(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_U8):
-            return __BINOP_V_A(x, y, f64, u8, f64, f64, DIVF64, len, offset, out);
+            div_f64_U8(AS_F64(x) + offset, y->u8, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I16):
-            return __BINOP_V_A(x, y, f64, i16, f64, f64, DIVF64, len, offset, out);
+            div_f64_I16(AS_F64(x) + offset, y->i16, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_U8):
-            return __BINOP_V_V(x, y, f64, u8, f64, f64, DIVF64, len, offset, out);
+            div_f64_u8(AS_F64(x) + offset, AS_U8(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I16):
-            return __BINOP_V_V(x, y, f64, i16, f64, f64, DIVF64, len, offset, out);
+            div_f64_i16(AS_F64(x) + offset, AS_I16(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         default:
             return err_type(x->type, y->type, 0, 0);
@@ -1431,11 +3571,14 @@ obj_p ray_fdiv_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I32, -TYPE_F64):
             return f64(FDIVF64(i32_to_f64(x->i32), y->f64));
         case MTYPE2(-TYPE_I32, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, f64, f64, FDIVI64, len, offset, out);
+            fdiv_I32_i32(x->i32, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, f64, f64, FDIVI64, len, offset, out);
+            fdiv_I32_i64(x->i32, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_F64):
-            return __BINOP_A_V(x, y, i32, f64, f64, f64, FDIVF64, len, offset, out);
+            fdiv_I32_f64(x->i32, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I64, -TYPE_I32):
             return f64(FDIVI64(x->i64, i32_to_i64(y->i32)));
@@ -1444,11 +3587,14 @@ obj_p ray_fdiv_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I64, -TYPE_F64):
             return f64(FDIVI64(x->i64, y->f64));
         case MTYPE2(-TYPE_I64, TYPE_I32):
-            return __BINOP_A_V(x, y, i64, i32, f64, f64, FDIVI64, len, offset, out);
+            fdiv_I64_i32(x->i64, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_I64):
-            return __BINOP_A_V(x, y, i64, i64, f64, f64, FDIVI64, len, offset, out);
+            fdiv_I64_i64(x->i64, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_F64):
-            return __BINOP_A_V(x, y, i64, f64, f64, f64, FDIVI64, len, offset, out);
+            fdiv_I64_f64(x->i64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_F64, -TYPE_I32):
             return f64(FDIVF64(x->f64, i32_to_f64(y->i32)));
@@ -1457,50 +3603,71 @@ obj_p ray_fdiv_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_F64, -TYPE_F64):
             return f64(FDIVF64(x->f64, y->f64));
         case MTYPE2(-TYPE_F64, TYPE_I32):
-            return __BINOP_A_V(x, y, f64, i32, f64, f64, FDIVF64, len, offset, out);
+            fdiv_F64_i32(x->f64, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_I64):
-            return __BINOP_A_V(x, y, f64, i64, f64, f64, FDIVF64, len, offset, out);
+            fdiv_F64_i64(x->f64, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_F64):
-            return __BINOP_A_V(x, y, f64, f64, f64, f64, FDIVF64, len, offset, out);
+            fdiv_F64_f64(x->f64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_I32, -TYPE_I32):
-            return __BINOP_V_A(x, y, i32, i32, f64, f64, FDIVI64, len, offset, out);
+            fdiv_i32_I32(AS_I32(x) + offset, y->i32, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I64):
-            return __BINOP_V_A(x, y, i32, i64, f64, f64, FDIVI64, len, offset, out);
+            fdiv_i32_I64(AS_I32(x) + offset, y->i64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_F64):
-            return __BINOP_V_A(x, y, i32, f64, f64, f64, FDIVF64, len, offset, out);
+            fdiv_i32_F64(AS_I32(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I32):
-            return __BINOP_V_V(x, y, i32, i32, f64, f64, FDIVI64, len, offset, out);
+            fdiv_i32_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, f64, f64, FDIVI64, len, offset, out);
+            fdiv_i32_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_F64):
-            return __BINOP_V_V(x, y, i32, f64, f64, f64, FDIVF64, len, offset, out);
+            fdiv_i32_f64(AS_I32(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_I64, -TYPE_I32):
-            return __BINOP_V_A(x, y, i64, i32, f64, f64, FDIVI64, len, offset, out);
+            fdiv_i64_I32(AS_I64(x) + offset, y->i32, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I64):
-            return __BINOP_V_A(x, y, i64, i64, f64, f64, FDIVI64, len, offset, out);
+            fdiv_i64_I64(AS_I64(x) + offset, y->i64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_F64):
-            return __BINOP_V_A(x, y, i64, f64, f64, f64, FDIVI64, len, offset, out);
+            fdiv_i64_F64(AS_I64(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I32):
-            return __BINOP_V_V(x, y, i64, i32, f64, f64, FDIVI64, len, offset, out);
+            fdiv_i64_i32(AS_I64(x) + offset, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I64):
-            return __BINOP_V_V(x, y, i64, i64, f64, f64, FDIVI64, len, offset, out);
+            fdiv_i64_i64(AS_I64(x) + offset, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_F64):
-            return __BINOP_V_V(x, y, i64, f64, f64, f64, FDIVI64, len, offset, out);
+            fdiv_i64_f64(AS_I64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_F64, -TYPE_I32):
-            return __BINOP_V_A(x, y, f64, i32, f64, f64, FDIVF64, len, offset, out);
+            fdiv_f64_I32(AS_F64(x) + offset, y->i32, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I64):
-            return __BINOP_V_A(x, y, f64, i64, f64, f64, FDIVF64, len, offset, out);
+            fdiv_f64_I64(AS_F64(x) + offset, y->i64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_F64):
-            return __BINOP_V_A(x, y, f64, f64, f64, f64, FDIVF64, len, offset, out);
+            fdiv_f64_F64(AS_F64(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I32):
-            return __BINOP_V_V(x, y, f64, i32, f64, f64, FDIVF64, len, offset, out);
+            fdiv_f64_i32(AS_F64(x) + offset, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I64):
-            return __BINOP_V_V(x, y, f64, i64, f64, f64, FDIVF64, len, offset, out);
+            fdiv_f64_i64(AS_F64(x) + offset, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_F64):
-            return __BINOP_V_V(x, y, f64, f64, f64, f64, FDIVF64, len, offset, out);
+            fdiv_f64_f64(AS_F64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         default:
             return err_type(x->type, y->type, 0, 0);
     }
@@ -1515,11 +3682,14 @@ obj_p ray_mod_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I32, -TYPE_F64):
             return f64(MODF64(i32_to_f64(x->i32), y->f64));
         case MTYPE2(-TYPE_I32, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, i32, i32, MODI32, len, offset, out);
+            mod_I32_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, i64, i64, MODI64, len, offset, out);
+            mod_I32_i64(x->i32, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_F64):
-            return __BINOP_A_V(x, y, i32, f64, f64, f64, MODF64, len, offset, out);
+            mod_I32_f64(x->i32, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I64, -TYPE_I32):
             return i32(i64_to_i32(MODI64(x->i64, i32_to_i64(y->i32))));
@@ -1528,11 +3698,14 @@ obj_p ray_mod_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I64, -TYPE_F64):
             return f64(MODF64(i64_to_f64(x->i64), y->f64));
         case MTYPE2(-TYPE_I64, TYPE_I32):
-            return __BINOP_A_V(x, y, i64, i32, i32, i64, MODI64, len, offset, out);
+            mod_I64_i32(x->i64, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_I64):
-            return __BINOP_A_V(x, y, i64, i64, i64, i64, MODI64, len, offset, out);
+            mod_I64_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_F64):
-            return __BINOP_A_V(x, y, i64, f64, f64, f64, MODF64, len, offset, out);
+            mod_I64_f64(x->i64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_F64, -TYPE_I32):
             return f64(MODF64(x->f64, i32_to_f64(y->i32)));
@@ -1541,67 +3714,94 @@ obj_p ray_mod_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_F64, -TYPE_F64):
             return f64(MODF64(x->f64, y->f64));
         case MTYPE2(-TYPE_F64, TYPE_I32):
-            return __BINOP_A_V(x, y, f64, i32, f64, f64, MODF64, len, offset, out);
+            mod_F64_i32(x->f64, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_I64):
-            return __BINOP_A_V(x, y, f64, i64, f64, f64, MODF64, len, offset, out);
+            mod_F64_i64(x->f64, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_F64):
-            return __BINOP_A_V(x, y, f64, f64, f64, f64, MODF64, len, offset, out);
+            mod_F64_f64(x->f64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_I32, -TYPE_I32):
-            return __BINOP_V_A(x, y, i32, i32, i32, i32, MODI32, len, offset, out);
+            mod_i32_I32(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I64):
-            return __BINOP_V_A(x, y, i32, i64, i64, i64, MODI64, len, offset, out);
+            mod_i32_I64(AS_I32(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_F64):
-            return __BINOP_V_A(x, y, i32, f64, f64, f64, MODF64, len, offset, out);
+            mod_i32_F64(AS_I32(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I32):
-            return __BINOP_V_V(x, y, i32, i32, i32, i32, MODI32, len, offset, out);
+            mod_i32_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, i64, i64, MODI64, len, offset, out);
+            mod_i32_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_F64):
-            return __BINOP_V_V(x, y, i32, f64, f64, f64, MODF64, len, offset, out);
+            mod_i32_f64(AS_I32(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_I64, -TYPE_I32):
-            return __BINOP_V_A(x, y, i64, i32, i32, i64, MODI64, len, offset, out);
+            mod_i64_I32(AS_I64(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I64):
-            return __BINOP_V_A(x, y, i64, i64, i64, i64, MODI64, len, offset, out);
+            mod_i64_I64(AS_I64(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_F64):
-            return __BINOP_V_A(x, y, i64, f64, f64, f64, MODF64, len, offset, out);
+            mod_i64_F64(AS_I64(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I32):
-            return __BINOP_V_V(x, y, i64, i32, i32, i64, MODI64, len, offset, out);
+            mod_i64_i32(AS_I64(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I64):
-            return __BINOP_V_V(x, y, i64, i64, i64, i64, MODI64, len, offset, out);
+            mod_i64_i64(AS_I64(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_F64):
-            return __BINOP_V_V(x, y, i64, f64, f64, f64, MODF64, len, offset, out);
+            mod_i64_f64(AS_I64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(TYPE_F64, -TYPE_I32):
-            return __BINOP_V_A(x, y, f64, i32, f64, f64, MODF64, len, offset, out);
+            mod_f64_I32(AS_F64(x) + offset, y->i32, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I64):
-            return __BINOP_V_A(x, y, f64, i64, f64, f64, MODF64, len, offset, out);
+            mod_f64_I64(AS_F64(x) + offset, y->i64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_F64):
-            return __BINOP_V_A(x, y, f64, f64, f64, f64, MODF64, len, offset, out);
+            mod_f64_F64(AS_F64(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I32):
-            return __BINOP_V_V(x, y, f64, i32, f64, f64, MODF64, len, offset, out);
+            mod_f64_i32(AS_F64(x) + offset, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I64):
-            return __BINOP_V_V(x, y, f64, i64, f64, f64, MODF64, len, offset, out);
+            mod_f64_i64(AS_F64(x) + offset, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_F64):
-            return __BINOP_V_V(x, y, f64, f64, f64, f64, MODF64, len, offset, out);
+            mod_f64_f64(AS_F64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_TIME, -TYPE_I32):
             return atime(MODI32(x->i32, y->i32));
         case MTYPE2(-TYPE_TIME, -TYPE_I64):
             return atime(MODI32(x->i32, i64_to_i32(y->i64)));
         case MTYPE2(-TYPE_TIME, TYPE_I32):
-            return __BINOP_A_V(x, y, time, i32, time, time, MODI32, len, offset, out);
+            mod_TIME_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIME, TYPE_I64):
-            return __BINOP_A_V(x, y, time, i64, time, time, MODI32, len, offset, out);
+            mod_TIME_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I32):
-            return __BINOP_V_A(x, y, time, i32, time, time, MODI32, len, offset, out);
+            mod_time_I32(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I64):
-            return __BINOP_V_A(x, y, time, i64, time, i64, MODI64, len, offset, out);
+            mod_time_I64(AS_I32(x) + offset, y->i64, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I32):
-            return __BINOP_V_V(x, y, time, i32, time, time, MODI32, len, offset, out);
+            mod_time_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I64):
-            return __BINOP_V_V(x, y, time, i64, time, i64, MODI64, len, offset, out);
+            mod_time_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_U8, -TYPE_U8):
             return u8(MODU8(x->u8, y->u8));
@@ -1612,29 +3812,41 @@ obj_p ray_mod_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_U8, -TYPE_I16):
             return i16(MODI16(u8_to_i16(x->u8), y->i16));
         case MTYPE2(-TYPE_U8, TYPE_U8):
-            return __BINOP_A_V(x, y, u8, u8, u8, u8, MODU8, len, offset, out);
+            mod_U8_u8(x->u8, AS_U8(y) + offset, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_I16):
-            return __BINOP_A_V(x, y, u8, i16, i16, i16, MODI16, len, offset, out);
+            mod_U8_i16(x->u8, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_I32):
-            return __BINOP_A_V(x, y, u8, i32, i32, i32, MODI32, len, offset, out);
+            mod_U8_i32(x->u8, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_U8, TYPE_I64):
-            return __BINOP_A_V(x, y, u8, i64, i64, i64, MODI64, len, offset, out);
+            mod_U8_i64(x->u8, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_U8):
-            return __BINOP_V_A(x, y, u8, u8, u8, u8, MODU8, len, offset, out);
+            mod_u8_U8(AS_U8(x) + offset, y->u8, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I32):
-            return __BINOP_V_A(x, y, u8, i32, i32, i32, MODI32, len, offset, out);
+            mod_u8_I32(AS_U8(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I64):
-            return __BINOP_V_A(x, y, u8, i64, i64, i64, MODI64, len, offset, out);
+            mod_u8_I64(AS_U8(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, -TYPE_I16):
-            return __BINOP_V_A(x, y, u8, i16, i16, i16, MODI16, len, offset, out);
+            mod_u8_I16(AS_U8(x) + offset, y->i16, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_U8):
-            return __BINOP_V_V(x, y, u8, u8, u8, u8, MODU8, len, offset, out);
+            mod_u8_u8(AS_U8(x) + offset, AS_U8(y) + offset, AS_U8(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I16):
-            return __BINOP_V_V(x, y, u8, i16, i16, i16, MODI16, len, offset, out);
+            mod_u8_i16(AS_U8(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I32):
-            return __BINOP_V_V(x, y, u8, i32, i32, i32, MODI32, len, offset, out);
+            mod_u8_i32(AS_U8(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_U8, TYPE_I64):
-            return __BINOP_V_V(x, y, u8, i64, i64, i64, MODI64, len, offset, out);
+            mod_u8_i64(AS_U8(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I16, -TYPE_I16):
             return i16(MODI16(x->i16, y->i16));
@@ -1645,63 +3857,87 @@ obj_p ray_mod_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I16, -TYPE_U8):
             return i16(MODI16(x->i16, u8_to_i16(y->u8)));
         case MTYPE2(-TYPE_I16, TYPE_I16):
-            return __BINOP_A_V(x, y, i16, i16, i16, i16, MODI16, len, offset, out);
+            mod_I16_i16(x->i16, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_U8):
-            return __BINOP_A_V(x, y, i16, u8, i16, i16, MODI16, len, offset, out);
+            mod_I16_u8(x->i16, AS_U8(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_I32):
-            return __BINOP_A_V(x, y, i16, i32, i32, i32, MODI32, len, offset, out);
+            mod_I16_i32(x->i16, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I16, TYPE_I64):
-            return __BINOP_A_V(x, y, i16, i64, i64, i64, MODI64, len, offset, out);
+            mod_I16_i64(x->i16, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I16):
-            return __BINOP_V_A(x, y, i16, i16, i16, i16, MODI16, len, offset, out);
+            mod_i16_I16(AS_I16(x) + offset, y->i16, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I32):
-            return __BINOP_V_A(x, y, i16, i32, i32, i32, MODI32, len, offset, out);
+            mod_i16_I32(AS_I16(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_I64):
-            return __BINOP_V_A(x, y, i16, i64, i64, i64, MODI64, len, offset, out);
+            mod_i16_I64(AS_I16(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, -TYPE_U8):
-            return __BINOP_V_A(x, y, i16, u8, i16, i16, MODI16, len, offset, out);
+            mod_i16_U8(AS_I16(x) + offset, y->u8, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I16):
-            return __BINOP_V_V(x, y, i16, i16, i16, i16, MODI16, len, offset, out);
+            mod_i16_i16(AS_I16(x) + offset, AS_I16(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_U8):
-            return __BINOP_V_V(x, y, i16, u8, i16, i16, MODI16, len, offset, out);
+            mod_i16_u8(AS_I16(x) + offset, AS_U8(y) + offset, AS_I16(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I32):
-            return __BINOP_V_V(x, y, i16, i32, i32, i32, MODI32, len, offset, out);
+            mod_i16_i32(AS_I16(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I16, TYPE_I64):
-            return __BINOP_V_V(x, y, i16, i64, i64, i64, MODI64, len, offset, out);
+            mod_i16_i64(AS_I16(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I32, -TYPE_U8):
             return i32(MODI32(x->i32, u8_to_i32(y->u8)));
         case MTYPE2(-TYPE_I32, -TYPE_I16):
             return i32(MODI32(x->i32, i16_to_i32(y->i16)));
         case MTYPE2(-TYPE_I32, TYPE_U8):
-            return __BINOP_A_V(x, y, i32, u8, i32, i32, MODI32, len, offset, out);
+            mod_I32_u8(x->i32, AS_U8(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_I16):
-            return __BINOP_A_V(x, y, i32, i16, i32, i32, MODI32, len, offset, out);
+            mod_I32_i16(x->i32, AS_I16(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_U8):
-            return __BINOP_V_A(x, y, i32, u8, i32, i32, MODI32, len, offset, out);
+            mod_i32_U8(AS_I32(x) + offset, y->u8, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I16):
-            return __BINOP_V_A(x, y, i32, i16, i32, i32, MODI32, len, offset, out);
+            mod_i32_I16(AS_I32(x) + offset, y->i16, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_U8):
-            return __BINOP_V_V(x, y, i32, u8, i32, i32, MODI32, len, offset, out);
+            mod_i32_u8(AS_I32(x) + offset, AS_U8(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I16):
-            return __BINOP_V_V(x, y, i32, i16, i32, i32, MODI32, len, offset, out);
+            mod_i32_i16(AS_I32(x) + offset, AS_I16(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I64, -TYPE_U8):
             return i64(MODI64(x->i64, u8_to_i64(y->u8)));
         case MTYPE2(-TYPE_I64, -TYPE_I16):
             return i64(MODI64(x->i64, i16_to_i64(y->i16)));
         case MTYPE2(-TYPE_I64, TYPE_U8):
-            return __BINOP_A_V(x, y, i64, u8, i64, i64, MODI64, len, offset, out);
+            mod_I64_u8(x->i64, AS_U8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_I16):
-            return __BINOP_A_V(x, y, i64, i16, i64, i64, MODI64, len, offset, out);
+            mod_I64_i16(x->i64, AS_I16(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_U8):
-            return __BINOP_V_A(x, y, i64, u8, i64, i64, MODI64, len, offset, out);
+            mod_i64_U8(AS_I64(x) + offset, y->u8, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I16):
-            return __BINOP_V_A(x, y, i64, i16, i64, i64, MODI64, len, offset, out);
+            mod_i64_I16(AS_I64(x) + offset, y->i16, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_U8):
-            return __BINOP_V_V(x, y, i64, u8, i64, i64, MODI64, len, offset, out);
+            mod_i64_u8(AS_I64(x) + offset, AS_U8(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I16):
-            return __BINOP_V_V(x, y, i64, i16, i64, i64, MODI64, len, offset, out);
+            mod_i64_i16(AS_I64(x) + offset, AS_I16(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         default:
             return err_type(x->type, y->type, 0, 0);
@@ -1717,23 +3953,32 @@ obj_p ray_xbar_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I32, -TYPE_F64):
             return f64(XBARF64(i32_to_f64(x->i32), y->f64));
         case MTYPE2(-TYPE_I32, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, i32, i32, XBARI32, len, offset, out);
+            xbar_I32_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, i64, i64, XBARI64, len, offset, out);
+            xbar_I32_i64(x->i32, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I32, TYPE_F64):
-            return __BINOP_A_V(x, y, i32, f64, f64, f64, XBARF64, len, offset, out);
+            xbar_I32_f64(x->i32, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I32):
-            return __BINOP_V_A(x, y, i32, i32, i32, i32, XBARI32, len, offset, out);
+            xbar_i32_I32(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_I64):
-            return __BINOP_V_A(x, y, i32, i64, i64, i64, XBARI64, len, offset, out);
+            xbar_i32_I64(AS_I32(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, -TYPE_F64):
-            return __BINOP_V_A(x, y, i32, f64, f64, f64, XBARF64, len, offset, out);
+            xbar_i32_F64(AS_I32(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I32):
-            return __BINOP_V_V(x, y, i32, i32, i32, i32, XBARI32, len, offset, out);
+            xbar_i32_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, i64, i64, XBARI64, len, offset, out);
+            xbar_i32_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I32, TYPE_F64):
-            return __BINOP_V_V(x, y, i32, f64, f64, f64, XBARF64, len, offset, out);
+            xbar_i32_f64(AS_I32(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_I64, -TYPE_I32):
             return i64(XBARI64(x->i64, i32_to_i64(y->i32)));
@@ -1742,23 +3987,32 @@ obj_p ray_xbar_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_I64, -TYPE_F64):
             return f64(XBARF64(i64_to_f64(x->i64), y->f64));
         case MTYPE2(-TYPE_I64, TYPE_I32):
-            return __BINOP_A_V(x, y, i64, i32, i64, i64, XBARI64, len, offset, out);
+            xbar_I64_i32(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_I64):
-            return __BINOP_A_V(x, y, i64, i64, i64, i64, XBARI64, len, offset, out);
+            xbar_I64_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_I64, TYPE_F64):
-            return __BINOP_A_V(x, y, i64, f64, f64, f64, XBARF64, len, offset, out);
+            xbar_I64_f64(x->i64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I32):
-            return __BINOP_V_A(x, y, i64, i32, i64, i64, XBARI64, len, offset, out);
+            xbar_i64_I32(AS_I64(x) + offset, y->i32, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_I64):
-            return __BINOP_V_A(x, y, i64, i64, i64, i64, XBARI64, len, offset, out);
+            xbar_i64_I64(AS_I64(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, -TYPE_F64):
-            return __BINOP_V_A(x, y, i64, f64, f64, f64, XBARF64, len, offset, out);
+            xbar_i64_F64(AS_I64(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I32):
-            return __BINOP_V_V(x, y, i64, i32, i64, i64, XBARI64, len, offset, out);
+            xbar_i64_i32(AS_I64(x) + offset, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_I64):
-            return __BINOP_V_V(x, y, i64, i64, i64, i64, XBARI64, len, offset, out);
+            xbar_i64_i64(AS_I64(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_I64, TYPE_F64):
-            return __BINOP_V_V(x, y, i64, f64, f64, f64, XBARF64, len, offset, out);
+            xbar_i64_f64(AS_I64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_F64, -TYPE_I32):
             return f64(XBARF64(x->f64, i32_to_f64(y->i32)));
@@ -1767,40 +4021,55 @@ obj_p ray_xbar_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_F64, -TYPE_F64):
             return f64(XBARF64(x->f64, y->f64));
         case MTYPE2(-TYPE_F64, TYPE_I32):
-            return __BINOP_A_V(x, y, f64, i32, f64, f64, XBARF64, len, offset, out);
+            xbar_F64_i32(x->f64, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_I64):
-            return __BINOP_A_V(x, y, f64, i64, f64, f64, XBARF64, len, offset, out);
+            xbar_F64_i64(x->f64, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_F64, TYPE_F64):
-            return __BINOP_A_V(x, y, f64, f64, f64, f64, XBARF64, len, offset, out);
+            xbar_F64_f64(x->f64, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I32):
-            return __BINOP_V_A(x, y, f64, i32, f64, f64, XBARF64, len, offset, out);
+            xbar_f64_I32(AS_F64(x) + offset, y->i32, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_I64):
-            return __BINOP_V_A(x, y, f64, i64, f64, f64, XBARF64, len, offset, out);
+            xbar_f64_I64(AS_F64(x) + offset, y->i64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, -TYPE_F64):
-            return __BINOP_V_A(x, y, f64, f64, f64, f64, XBARF64, len, offset, out);
+            xbar_f64_F64(AS_F64(x) + offset, y->f64, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I32):
-            return __BINOP_V_V(x, y, f64, i32, f64, f64, XBARF64, len, offset, out);
+            xbar_f64_i32(AS_F64(x) + offset, AS_I32(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_I64):
-            return __BINOP_V_V(x, y, f64, i64, f64, f64, XBARF64, len, offset, out);
+            xbar_f64_i64(AS_F64(x) + offset, AS_I64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_F64, TYPE_F64):
-            return __BINOP_V_V(x, y, f64, f64, f64, f64, XBARF64, len, offset, out);
+            xbar_f64_f64(AS_F64(x) + offset, AS_F64(y) + offset, AS_F64(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_DATE, -TYPE_I32):
             return adate(XBARI32(x->i32, y->i32));
         case MTYPE2(-TYPE_DATE, -TYPE_I64):
             return adate(i64_to_i32(XBARI64(i32_to_i64(x->i32), y->i64)));
         case MTYPE2(-TYPE_DATE, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, date, i32, XBARI32, len, offset, out);
+            xbar_DATE_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_DATE, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, date, i64, XBARI64, len, offset, out);
+            xbar_DATE_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, -TYPE_I32):
-            return __BINOP_V_A(x, y, i32, i32, date, i32, XBARI32, len, offset, out);
+            xbar_date_I32(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, -TYPE_I64):
-            return __BINOP_V_A(x, y, i32, i64, date, i64, XBARI64, len, offset, out);
+            xbar_date_I64(AS_I32(x) + offset, y->i64, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, TYPE_I32):
-            return __BINOP_V_V(x, y, i32, i32, date, i32, XBARI32, len, offset, out);
+            xbar_date_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_DATE, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, date, i64, XBARI64, len, offset, out);
+            xbar_date_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_TIME, -TYPE_I32):
             return atime(XBARI32(x->i32, y->i32));
@@ -1809,23 +4078,32 @@ obj_p ray_xbar_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_TIME, -TYPE_TIME):
             return atime(XBARI32(x->i32, y->i32));
         case MTYPE2(-TYPE_TIME, TYPE_I32):
-            return __BINOP_A_V(x, y, i32, i32, time, i32, XBARI32, len, offset, out);
+            xbar_TIME_i32(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIME, TYPE_I64):
-            return __BINOP_A_V(x, y, i32, i64, time, i64, XBARI64, len, offset, out);
+            xbar_TIME_i64(x->i32, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIME, TYPE_TIME):
-            return __BINOP_A_V(x, y, i32, i32, time, i32, XBARI32, len, offset, out);
+            xbar_TIME_time(x->i32, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I32):
-            return __BINOP_V_A(x, y, i32, i32, time, i32, XBARI32, len, offset, out);
+            xbar_time_I32(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_I64):
-            return __BINOP_V_A(x, y, i32, i64, time, i64, XBARI64, len, offset, out);
+            xbar_time_I64(AS_I32(x) + offset, y->i64, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, -TYPE_TIME):
-            return __BINOP_V_A(x, y, i32, i32, time, i32, XBARI32, len, offset, out);
+            xbar_time_TIME(AS_I32(x) + offset, y->i32, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I32):
-            return __BINOP_V_V(x, y, i32, i32, time, i32, XBARI32, len, offset, out);
+            xbar_time_i32(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_I64):
-            return __BINOP_V_V(x, y, i32, i64, time, i64, XBARI64, len, offset, out);
+            xbar_time_i64(AS_I32(x) + offset, AS_I64(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIME, TYPE_TIME):
-            return __BINOP_V_V(x, y, i32, i32, time, i32, XBARI32, len, offset, out);
+            xbar_time_time(AS_I32(x) + offset, AS_I32(y) + offset, AS_I32(out) + offset, len);
+            return NULL_OBJ;
 
         case MTYPE2(-TYPE_TIMESTAMP, -TYPE_I32):
             return timestamp(XBARI64(x->i64, i32_to_i64(y->i32)));
@@ -1834,23 +4112,32 @@ obj_p ray_xbar_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p out) {
         case MTYPE2(-TYPE_TIMESTAMP, -TYPE_TIME):
             return timestamp(XBARI32(x->i64, timestamp_to_i64(time_to_timestamp(y->i32))));
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_I32):
-            return __BINOP_A_V(x, y, i64, i32, timestamp, timestamp, XBARI64, len, offset, out);
+            xbar_TIMESTAMP_i32(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_I64):
-            return __BINOP_A_V(x, y, i64, i64, timestamp, timestamp, XBARI64, len, offset, out);
+            xbar_TIMESTAMP_i64(x->i64, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(-TYPE_TIMESTAMP, TYPE_TIME):
-            return __BINOP_A_V(x, y, i64, time, timestamp, timestamp, XBARI64, len, offset, out);
+            xbar_TIMESTAMP_time(x->i64, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_I32):
-            return __BINOP_V_A(x, y, i64, i32, timestamp, timestamp, XBARI64, len, offset, out);
+            xbar_timestamp_I32(AS_I64(x) + offset, y->i32, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_I64):
-            return __BINOP_V_A(x, y, i64, i64, timestamp, timestamp, XBARI64, len, offset, out);
+            xbar_timestamp_I64(AS_I64(x) + offset, y->i64, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, -TYPE_TIME):
-            return __BINOP_V_A(x, y, i64, time, timestamp, timestamp, XBARI64, len, offset, out);
+            xbar_timestamp_TIME(AS_I64(x) + offset, y->i32, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, TYPE_I32):
-            return __BINOP_V_V(x, y, i64, i32, timestamp, timestamp, XBARI64, len, offset, out);
+            xbar_timestamp_i32(AS_I64(x) + offset, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, TYPE_I64):
-            return __BINOP_V_V(x, y, i64, i64, timestamp, timestamp, XBARI64, len, offset, out);
+            xbar_timestamp_i64(AS_I64(x) + offset, AS_I64(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
         case MTYPE2(TYPE_TIMESTAMP, TYPE_TIME):
-            return __BINOP_V_V(x, y, i64, time, timestamp, timestamp, XBARI64, len, offset, out);
+            xbar_timestamp_time(AS_I64(x) + offset, AS_I32(y) + offset, AS_I64(out) + offset, len);
+            return NULL_OBJ;
 
         default:
             return err_type(x->type, y->type, 0, 0);
@@ -1926,14 +4213,14 @@ obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
         case TYPE_U8: {
             u8_t *lhs = AS_U8(x) + offset;
             i64_t out = 0;
-            for (i64_t i = 0; i < len; i++)
+            VFOR (i64_t i = 0; i < len; i++)
                 out += lhs[i];
             return i64(out);
         }
         case TYPE_I16: {
             i16_t *lhs = AS_I16(x) + offset;
             i64_t out = 0;
-            for (i64_t i = 0; i < len; i++)
+            VFOR (i64_t i = 0; i < len; i++)
                 out = FOLD_ADDI64(out, i16_to_i64(lhs[i]));
             return i64(out);
         }
@@ -2197,7 +4484,7 @@ obj_p ray_sq_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset) {
         case TYPE_U8: {
             u8_t *lhs = __AS_u8(x) + offset;
             f64_t out = 0.0;
-            for (i64_t i = 0; i < len; i++) {
+            VFOR (i64_t i = 0; i < len; i++) {
                 f64_t t = ((f64_t)lhs[i]) - y->f64;
                 out += t * t;
             }
@@ -2206,7 +4493,7 @@ obj_p ray_sq_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset) {
         case TYPE_I16: {
             i16_t *lhs = __AS_i16(x) + offset;
             f64_t out = 0.0;
-            for (i64_t i = 0; i < len; i++)
+            VFOR (i64_t i = 0; i < len; i++)
                 if (lhs[i] != NULL_I16) {
                     f64_t t = ((f64_t)lhs[i]) - y->f64;
                     out += t * t;
@@ -2218,7 +4505,7 @@ obj_p ray_sq_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset) {
         case TYPE_TIME: {
             i32_t *lhs = __AS_i32(x) + offset;
             f64_t out = 0.0;
-            for (i64_t i = 0; i < len; i++)
+            VFOR (i64_t i = 0; i < len; i++)
                 if (lhs[i] != NULL_I32) {
                     f64_t t = ((f64_t)lhs[i]) - y->f64;
                     out += t * t;
@@ -2229,7 +4516,7 @@ obj_p ray_sq_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset) {
         case TYPE_TIMESTAMP: {
             i64_t *lhs = __AS_i64(x) + offset;
             f64_t out = 0.0;
-            for (i64_t i = 0; i < len; i++)
+            VFOR (i64_t i = 0; i < len; i++)
                 if (lhs[i] != NULL_I64) {
                     f64_t t = ((f64_t)lhs[i]) - y->f64;
                     out += t * t;
@@ -2239,7 +4526,7 @@ obj_p ray_sq_sub_partial(obj_p x, obj_p y, i64_t len, i64_t offset) {
         default: {
             f64_t *lhs = __AS_f64(x) + offset;
             f64_t out = 0.0;
-            for (i64_t i = 0; i < len; i++)
+            VFOR (i64_t i = 0; i < len; i++)
                 if (!ISNANF64(lhs[i])) {
                     f64_t t = ((f64_t)lhs[i]) - y->f64;
                     out += t * t;

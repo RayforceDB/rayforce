@@ -39,6 +39,13 @@
 #define LIKELY(x) __builtin_expect((x), 1)
 #define UNLIKELY(x) __builtin_expect((x), 0)
 
+// Vectorized for loop - enables vectorization even with -Os
+#ifdef __clang__
+#define VFOR _Pragma("clang loop vectorize(enable)") for
+#else
+#define VFOR _Pragma("GCC ivdep") for
+#endif
+
 #ifdef DEBUG
 
 #ifdef __clang__
