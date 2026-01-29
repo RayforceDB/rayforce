@@ -914,7 +914,6 @@ static obj_p optimized_sort(obj_p vec, i64_t asc) {
     switch (vec->type) {
         case TYPE_I64:
         case TYPE_TIME:
-        case TYPE_SYMBOL:
             res = counting_sort_i64(vec, asc);
             if (res)
                 return res;
