@@ -51,6 +51,7 @@
 #include "vary.h"
 #include "os.h"
 #include "proc.h"
+#include "pivot.h"
 
 i64_t SYMBOL_FN;
 i64_t SYMBOL_SELF;
@@ -256,6 +257,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "asof-join",           TYPE_VARY,     FN_NONE,                   ray_asof_join);
     REGISTER_FN(functions,  "window-join",         TYPE_VARY,     FN_NONE,                   ray_window_join);
     REGISTER_FN(functions,  "window-join1",        TYPE_VARY,     FN_NONE,                   ray_window_join1);
+    REGISTER_FN(functions,  "pivot",               TYPE_VARY,     FN_NONE,                   ray_pivot);
     REGISTER_FN(functions,  "if",                  TYPE_VARY,     FN_NONE | FN_SPECIAL_FORM, ray_cond);
     REGISTER_FN(functions,  "return",              TYPE_VARY,     FN_NONE,                   ray_return);
     REGISTER_FN(functions,  "hopen",               TYPE_VARY,     FN_NONE,                   ray_hopen);

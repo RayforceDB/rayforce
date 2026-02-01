@@ -183,6 +183,7 @@ nil_t on_skip(str_p msg) { printf("%sSkipped%s (%s)\n", YELLOW, RESET, msg ? msg
 #include "serde.c"
 #include "parted.c"
 #include "ext.c"
+#include "pivot.c"
 
 // Add tests here
 test_entry_t tests[] = {
@@ -410,6 +411,22 @@ test_entry_t tests[] = {
     {"test_parted_count_i32", test_parted_count_i32},
     {"test_parted_count_time", test_parted_count_time},
     {"test_external", test_external},
+    // Pivot tests
+    {"test_pivot_basic_sum", test_pivot_basic_sum},
+    {"test_pivot_count", test_pivot_count},
+    {"test_pivot_avg", test_pivot_avg},
+    {"test_pivot_min", test_pivot_min},
+    {"test_pivot_max", test_pivot_max},
+    {"test_pivot_first", test_pivot_first},
+    {"test_pivot_last", test_pivot_last},
+    {"test_pivot_med", test_pivot_med},
+    {"test_pivot_multi_index", test_pivot_multi_index},
+    {"test_pivot_index_values", test_pivot_index_values},
+    {"test_pivot_multiple_columns", test_pivot_multiple_columns},
+    {"test_pivot_float_values", test_pivot_float_values},
+    {"test_pivot_errors", test_pivot_errors},
+    {"test_pivot_large", test_pivot_large},
+    {"test_pivot_symbol_columns", test_pivot_symbol_columns},
 };
 // ---
 

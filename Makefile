@@ -60,7 +60,7 @@ CORE_OBJECTS = core/poll.o core/ipc.o core/runtime.o core/sys.o core/os.o core/p
  core/sock.o core/error.o core/math.o core/cmp.o core/items.o core/logic.o core/compose.o core/order.o core/io.o\
  core/misc.o core/freelist.o core/update.o core/join.o core/query.o core/cond.o\
  core/iter.o core/dynlib.o core/aggr.o core/index.o core/group.o core/filter.o core/atomic.o\
- core/thread.o core/pool.o core/progress.o core/fdmap.o core/signal.o core/log.o
+ core/thread.o core/pool.o core/progress.o core/fdmap.o core/signal.o core/log.o core/pivot.o
 APP_COMMON = app/repl.o app/term.o
 APP_OBJECTS = app/main.o $(APP_COMMON)
 TESTS_OBJECTS = tests/main.o
