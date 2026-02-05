@@ -229,7 +229,8 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     selector_p selector;
     struct poll_registry_t registry = ZERO_INIT_STRUCT;
     ipc_ctx_p ctx;
-    u8_t buf[2] = {RAYFORCE_VERSION, 0x00};
+    u8_t handshake[258]; // max creds (255) + null + version
+    i64_t handshake_len;
 
     LOG_DEBUG("Opening connection to %s:%lld", addr->ip, addr->port);
 
@@ -239,10 +240,25 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     if (fd == -1)
         return -1;
 
-    if (sock_send(fd, buf, 2) == -1)
+    // Build handshake: [version][creds\0] or [version\0] if no creds
+    // Server reads until \0, then responds with version
+    if (addr->creds_len > 0) {
+        handshake[0] = RAYFORCE_VERSION;
+        memcpy(&handshake[1], addr->creds, addr->creds_len);
+        handshake[1 + addr->creds_len] = '\0';
+        handshake_len = 2 + addr->creds_len;
+        LOG_DEBUG("Sending handshake with credentials (len=%lld)", addr->creds_len);
+    } else {
+        handshake[0] = RAYFORCE_VERSION;
+        handshake[1] = '\0';
+        handshake_len = 2;
+        LOG_DEBUG("Sending handshake without credentials");
+    }
+
+    if (sock_send(fd, handshake, handshake_len) == -1)
         return -1;
 
-    if (sock_recv(fd, buf, 1) == -1)
+    if (sock_recv(fd, handshake, 1) == -1)
         return -1;
 
     LOG_TRACE("Setting socket to non-blocking mode");

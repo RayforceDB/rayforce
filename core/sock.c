@@ -41,14 +41,18 @@
 #include "ops.h"
 
 i64_t sock_addr_from_str(str_p str, i64_t len, sock_addr_t *addr) {
-    i64_t r;
-    str_p tok;
+    i64_t r, port_len;
+    str_p tok, port_end;
 
     // Check for NULL pointers
     if (str == NULL || addr == NULL)
         return -1;
 
-    // Get host part
+    // Initialize creds to empty
+    addr->creds[0] = '\0';
+    addr->creds_len = 0;
+
+    // Get host part (first colon)
     tok = (str_p)memchr(str, ':', len);
     if (tok == NULL)
         return -1;
@@ -60,12 +64,34 @@ i64_t sock_addr_from_str(str_p str, i64_t len, sock_addr_t *addr) {
     addr->ip[tok - str] = '\0';
     tok++;
 
-    // Get port part
+    // Calculate remaining length after host:
     len -= tok - str;
-    r = i64_from_str(tok, len, &addr->port);
 
-    if (r != len)
+    // Find next colon (if any) to separate port from credentials
+    port_end = (str_p)memchr(tok, ':', len);
+    if (port_end != NULL) {
+        // Format: host:port:creds
+        port_len = port_end - tok;
+    } else {
+        // Format: host:port (no creds)
+        port_len = len;
+    }
+
+    // Parse port
+    r = i64_from_str(tok, port_len, &addr->port);
+    if (r != port_len)
         return -1;
+
+    // Extract credentials if present
+    if (port_end != NULL) {
+        port_end++; // skip the colon
+        i64_t creds_len = len - port_len - 1;
+        if (creds_len > 0 && creds_len < ISIZEOF(addr->creds)) {
+            memcpy(addr->creds, port_end, creds_len);
+            addr->creds[creds_len] = '\0';
+            addr->creds_len = creds_len;
+        }
+    }
 
     return 0;
 }
