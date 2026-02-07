@@ -1033,16 +1033,7 @@ obj_p ray_first(obj_p x) {
         case TYPE_MAPGROUP:
             return aggr_first(AS_LIST(x)[0], AS_LIST(x)[1]);
         case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                obj_p res = aggr_first(val, index);
-                drop_obj(index);
-                return res;
-            }
-            obj_p collected = filter_collect(val, filter);
+            obj_p collected = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
             obj_p res = ray_first(collected);
             drop_obj(collected);
             return res;
@@ -1059,11 +1050,9 @@ obj_p ray_first(obj_p x) {
         case TYPE_PARTEDGUID:
         case TYPE_PARTEDENUM:
         case TYPE_PARTEDLIST: {
-            obj_p index =
-                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
-            obj_p res = aggr_first(x, index);
-            drop_obj(index);
-            return res;
+            if (x->len > 0 && AS_LIST(x)[0]->len > 0)
+                return at_idx(AS_LIST(x)[0], 0);
+            return err_domain(0, 0);
         }
         default:
             return at_idx(x, 0);
@@ -1077,16 +1066,7 @@ obj_p ray_last(obj_p x) {
         case TYPE_MAPGROUP:
             return aggr_last(AS_LIST(x)[0], AS_LIST(x)[1]);
         case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                obj_p res = aggr_last(val, index);
-                drop_obj(index);
-                return res;
-            }
-            obj_p collected = filter_collect(val, filter);
+            obj_p collected = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
             obj_p res = ray_last(collected);
             drop_obj(collected);
             return res;
@@ -1103,11 +1083,10 @@ obj_p ray_last(obj_p x) {
         case TYPE_PARTEDGUID:
         case TYPE_PARTEDENUM:
         case TYPE_PARTEDLIST: {
-            obj_p index =
-                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
-            obj_p res = aggr_last(x, index);
-            drop_obj(index);
-            return res;
+            i64_t last = x->len - 1;
+            if (last >= 0 && AS_LIST(x)[last]->len > 0)
+                return at_idx(AS_LIST(x)[last], AS_LIST(x)[last]->len - 1);
+            return err_domain(0, 0);
         }
         default:
             l = ops_count(x);

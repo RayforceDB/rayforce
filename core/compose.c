@@ -38,6 +38,8 @@
 #include "serde.h"
 #include "pool.h"
 #include "filter.h"
+#include "query.h"
+#include "eval.h"
 
 obj_p ray_cast_obj(obj_p x, obj_p y) {
     i8_t type;
@@ -1069,6 +1071,31 @@ obj_p ray_distinct(obj_p x) {
     }
 }
 
+obj_p ray_group(obj_p x) {
+    obj_p k, v;
+    struct query_ctx_t grp_ctx;
+
+    query_ctx_init(&grp_ctx);
+    grp_ctx.groupby = LIST(1);
+    AS_LIST(grp_ctx.groupby)[0] = clone_obj(x);
+
+    v = aggr_row(x, NULL_OBJ);
+    if (IS_ERR(v)) {
+        query_ctx_destroy(&grp_ctx);
+        return v;
+    }
+
+    k = aggr_first(x, NULL_OBJ);
+    if (IS_ERR(k)) {
+        drop_obj(v);
+        query_ctx_destroy(&grp_ctx);
+        return k;
+    }
+
+    query_ctx_destroy(&grp_ctx);
+    return dict(k, v);
+}
+
 obj_p ray_diverse(obj_p x) {
     obj_p res;
 
@@ -1158,16 +1185,7 @@ obj_p ray_row(obj_p x) {
         case TYPE_MAPGROUP:
             return aggr_row(AS_LIST(x)[0], AS_LIST(x)[1]);
         case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                obj_p res = aggr_row(val, index);
-                drop_obj(index);
-                return res;
-            }
-            obj_p collected = filter_collect(val, filter);
+            obj_p collected = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
             obj_p res = ray_row(collected);
             drop_obj(collected);
             return res;
@@ -1184,10 +1202,9 @@ obj_p ray_row(obj_p x) {
         case TYPE_PARTEDGUID:
         case TYPE_PARTEDENUM:
         case TYPE_PARTEDLIST: {
-            obj_p index =
-                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
-            obj_p res = aggr_row(x, index);
-            drop_obj(index);
+            obj_p flat = ray_value(x);
+            obj_p res = ray_row(flat);
+            drop_obj(flat);
             return res;
         }
         default:

@@ -30,6 +30,17 @@
       "os_info": "Rayforce 0.1 (Apr 17 2025)",
       "cpu_info": "Apple M3 Max",
       "git_commit": ""
+    },
+    {
+      "script": "q7",
+      "min_time": 6.139,
+      "max_time": 14.182,
+      "avg_time": 6.775,
+      "expected_time": 100.000,
+      "timestamp": "2026-02-06 20:14:37",
+      "os_info": "Rayforce 0.1 (Feb  6 2026)",
+      "cpu_info": "Intel(R) Core(TM) i7-14700",
+      "git_commit": "cf9dbf587c9749ed63407c9707f63cd344014342"
     }
   ]
 }

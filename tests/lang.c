@@ -4146,6 +4146,7 @@ test_result_t test_lang_aggregations() {
 // ==================== JOIN TESTS ====================
 test_result_t test_lang_joins() {
     // asof-join basic
+
     TEST_ASSERT_EQ(
         "(set trades (table [Sym Time Price] (list [x x] [10:00:01.000 10:00:03.000] [100.0 101.0])))"
         "(set quotes (table [Sym Time Bid] (list [x x x] [10:00:00.000 10:00:02.000 10:00:04.000] [99.0 100.5 101.5])))"
@@ -4153,6 +4154,7 @@ test_result_t test_lang_joins() {
         "(table [Sym Time Price Bid] (list [x x] [10:00:01.000 10:00:03.000] [100.0 101.0] [99.0 100.5]))");
 
     // asof-join single matching symbol
+
     TEST_ASSERT_EQ(
         "(set trades (table [Sym Time Price] (list [a] [10:00:05.000] [50.0])))"
         "(set quotes (table [Sym Time Bid] (list [a a] [10:00:01.000 10:00:03.000] [48.0 49.0])))"
@@ -4160,11 +4162,13 @@ test_result_t test_lang_joins() {
         "(table [Sym Time Price Bid] (list [a] [10:00:05.000] [50.0] [49.0]))");
 
     // asof-join with exact match on boundary
+
     TEST_ASSERT_EQ(
         "(set trades (table [Sym Time Price] (list [a] [10:00:01.000] [50.0])))"
         "(set quotes (table [Sym Time Bid] (list [a a] [10:00:01.000 10:00:03.000] [48.0 49.0])))"
         "(asof-join [Sym Time] trades quotes)",
         "(table [Sym Time Price Bid] (list [a] [10:00:01.000] [50.0] [48.0]))");
+
 
     // asof-join with I64 + Timestamp
     TEST_ASSERT_EQ(
@@ -4179,6 +4183,7 @@ test_result_t test_lang_joins() {
         "(at (asof-join [ID Ts] aj1 aj2) 'Ref)",
         "[10 20 30 40]");
 
+
     // asof-join with Symbol + Date
     TEST_ASSERT_EQ(
         "(set orders (table [Cust Date Amount] (list [A A B B] [2024.01.02 2024.01.05 2024.01.03 2024.01.06] [100 200 "
@@ -4187,6 +4192,7 @@ test_result_t test_lang_joins() {
         "0.2 0.25])))"
         "(at (asof-join [Cust Date] orders rates) 'Rate)",
         "[0.1 0.15 0.2 0.25]");
+
 
     // left-join all rows match
     TEST_ASSERT_EQ(
@@ -4215,6 +4221,7 @@ test_result_t test_lang_joins() {
         "(set t2 (table [tm val2] (list [10:00:00 10:00:02] [1000 3000])))"
         "(count (left-join [tm] t1 t2))",
         "3");
+
 
     // inner-join basic
     TEST_ASSERT_EQ(
@@ -4285,6 +4292,7 @@ test_result_t test_lang_joins() {
         "(set t2 (table [id1 id2 val2] (list [1 2] [a a] [1000 3000])))"
         "(count (inner-join [id1 id2] t1 t2))",
         "2");
+
 
     // window-join
     TEST_ASSERT_EQ(

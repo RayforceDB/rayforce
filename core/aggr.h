@@ -42,4 +42,28 @@ obj_p aggr_dev(obj_p val, obj_p index);
 obj_p aggr_collect(obj_p val, obj_p index);
 obj_p aggr_row(obj_p val, obj_p index);
 
+// ============================================================================
+// Fused aggregation (DuckDB-style single-pass)
+// ============================================================================
+
+enum {
+    AGGR_ID_SUM = 0, AGGR_ID_COUNT, AGGR_ID_FIRST, AGGR_ID_LAST,
+    AGGR_ID_AVG, AGGR_ID_MAX, AGGR_ID_MIN, AGGR_ID_MED, AGGR_ID_DEV
+};
+
+typedef struct {
+    i8_t func_id;      // AGGR_ID_*
+    i64_t col_idx;     // Column index in table
+} fused_plan_t;
+
+// Forward-declare query_ctx_t to avoid circular include
+struct query_ctx_t;
+
+// Identify aggregate function by function pointer; returns AGGR_ID_* or -1
+i8_t aggr_identify_func(obj_p fn);
+
+// One-pass fused aggregation: populates ctx->ngroups, first_rows, last_rows,
+// and writes result vectors into results[0..nplan-1].
+nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t nplan, obj_p *results);
+
 #endif  // AGGR_H

@@ -131,6 +131,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "til",                 TYPE_UNARY,    FN_NONE,                   ray_til);
     REGISTER_FN(functions,  "reverse",             TYPE_UNARY,    FN_NONE,                   ray_reverse);
     REGISTER_FN(functions,  "distinct",            TYPE_UNARY,    FN_NONE,                   ray_distinct);
+    REGISTER_FN(functions,  "group",              TYPE_UNARY,    FN_NONE,                   ray_group);
     REGISTER_FN(functions,  "sum",                 TYPE_UNARY,    FN_ATOMIC | FN_AGGR,       ray_sum);
     REGISTER_FN(functions,  "avg",                 TYPE_UNARY,    FN_ATOMIC | FN_AGGR,       ray_avg);
     REGISTER_FN(functions,  "med",                 TYPE_UNARY,    FN_ATOMIC | FN_AGGR,       ray_med);

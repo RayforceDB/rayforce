@@ -31,7 +31,7 @@
 #include "order.h"
 #include "runtime.h"
 #include "serde.h"   // for size_of_type
-#include "index.h"   // for INDEX_TYPE_PARTEDCOMMON
+#include "items.h"   // for ray_value
 #include "filter.h"  // for filter_collect
 
 #define __UNOP_FOLD(x, lt, ot, op, ln, of, iv)                  \
@@ -1823,11 +1823,14 @@ obj_p ray_cnt_partial(obj_p x, i64_t len, i64_t offset) {
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME:
         case TYPE_PARTEDTIMESTAMP: {
-            obj_p index =
-                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
-            obj_p res = aggr_count(x, index);
-            drop_obj(index);
-            return res;
+            i64_t j, nparts = x->len, total = 0;
+            for (j = 0; j < nparts; j++) {
+                obj_p cnt = ray_cnt_partial(AS_LIST(x)[j], AS_LIST(x)[j]->len, 0);
+                if (IS_ERR(cnt)) return cnt;
+                total += cnt->i64;
+                drop_obj(cnt);
+            }
+            return i64(total);
         }
         default:
             return err_type(TYPE_LIST, x->type, 0, 0);
@@ -1872,18 +1875,7 @@ obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
         case TYPE_MAPGROUP:
             return aggr_sum(AS_LIST(x)[0], AS_LIST(x)[1]);
         case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            // Smart aggregation for parted data with parted filter
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                obj_p res = aggr_sum(val, index);
-                drop_obj(index);
-                return res;
-            }
-            // Fallback: materialize and aggregate
-            obj_p collected = filter_collect(val, filter);
+            obj_p collected = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
             obj_p res = ray_sum(collected);
             drop_obj(collected);
             return res;
@@ -1895,11 +1887,19 @@ obj_p ray_sum_partial(obj_p x, i64_t len, i64_t offset) {
         case TYPE_PARTEDTIMESTAMP:
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME: {
-            obj_p index =
-                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
-            obj_p res = aggr_sum(x, index);
-            drop_obj(index);
-            return res;
+            i64_t j, nparts = x->len;
+            obj_p acc, pres, combined;
+            if (nparts == 0) return i64(0);
+            acc = ray_sum_partial(AS_LIST(x)[0], AS_LIST(x)[0]->len, 0);
+            for (j = 1; j < nparts; j++) {
+                pres = ray_sum_partial(AS_LIST(x)[j], AS_LIST(x)[j]->len, 0);
+                if (IS_ERR(pres)) { drop_obj(acc); return pres; }
+                combined = ray_add(acc, pres);
+                drop_obj(acc);
+                drop_obj(pres);
+                acc = combined;
+            }
+            return acc;
         }
         default:
             return err_type(TYPE_LIST, x->type, 0, 0);
@@ -1943,16 +1943,7 @@ obj_p ray_min_partial(obj_p x, i64_t len, i64_t offset) {
         case TYPE_MAPGROUP:
             return aggr_min(AS_LIST(x)[0], AS_LIST(x)[1]);
         case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                obj_p res = aggr_min(val, index);
-                drop_obj(index);
-                return res;
-            }
-            obj_p collected = filter_collect(val, filter);
+            obj_p collected = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
             obj_p res = ray_min(collected);
             drop_obj(collected);
             return res;
@@ -1964,10 +1955,23 @@ obj_p ray_min_partial(obj_p x, i64_t len, i64_t offset) {
         case TYPE_PARTEDTIMESTAMP:
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME: {
-            obj_p index =
-                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
-            obj_p res = aggr_min(x, index);
-            drop_obj(index);
+            i64_t j, nparts = x->len;
+            i8_t btype = x->type - TYPE_PARTEDLIST;
+            obj_p temp, pmin, res;
+            if (nparts == 0) return err_domain(0, 0);
+            if (nparts == 1) return ray_min_partial(AS_LIST(x)[0], AS_LIST(x)[0]->len, 0);
+            temp = vector(btype, nparts);
+            for (j = 0; j < nparts; j++) {
+                pmin = ray_min_partial(AS_LIST(x)[j], AS_LIST(x)[j]->len, 0);
+                if (IS_ERR(pmin)) { temp->len = j; drop_obj(temp); return pmin; }
+                if (btype == TYPE_I64 || btype == TYPE_TIMESTAMP) AS_I64(temp)[j] = pmin->i64;
+                else if (btype == TYPE_I32 || btype == TYPE_DATE || btype == TYPE_TIME) AS_I32(temp)[j] = pmin->i32;
+                else if (btype == TYPE_I16) AS_I16(temp)[j] = pmin->i16;
+                else if (btype == TYPE_F64) AS_F64(temp)[j] = pmin->f64;
+                drop_obj(pmin);
+            }
+            res = ray_min_partial(temp, nparts, 0);
+            drop_obj(temp);
             return res;
         }
         default:
@@ -2012,16 +2016,7 @@ obj_p ray_max_partial(obj_p x, i64_t len, i64_t offset) {
         case TYPE_MAPGROUP:
             return aggr_max(AS_LIST(x)[0], AS_LIST(x)[1]);
         case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                obj_p res = aggr_max(val, index);
-                drop_obj(index);
-                return res;
-            }
-            obj_p collected = filter_collect(val, filter);
+            obj_p collected = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
             obj_p res = ray_max(collected);
             drop_obj(collected);
             return res;
@@ -2033,10 +2028,23 @@ obj_p ray_max_partial(obj_p x, i64_t len, i64_t offset) {
         case TYPE_PARTEDTIMESTAMP:
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME: {
-            obj_p index =
-                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
-            obj_p res = aggr_max(x, index);
-            drop_obj(index);
+            i64_t j, nparts = x->len;
+            i8_t btype = x->type - TYPE_PARTEDLIST;
+            obj_p temp, pmax, res;
+            if (nparts == 0) return err_domain(0, 0);
+            if (nparts == 1) return ray_max_partial(AS_LIST(x)[0], AS_LIST(x)[0]->len, 0);
+            temp = vector(btype, nparts);
+            for (j = 0; j < nparts; j++) {
+                pmax = ray_max_partial(AS_LIST(x)[j], AS_LIST(x)[j]->len, 0);
+                if (IS_ERR(pmax)) { temp->len = j; drop_obj(temp); return pmax; }
+                if (btype == TYPE_I64 || btype == TYPE_TIMESTAMP) AS_I64(temp)[j] = pmax->i64;
+                else if (btype == TYPE_I32 || btype == TYPE_DATE || btype == TYPE_TIME) AS_I32(temp)[j] = pmax->i32;
+                else if (btype == TYPE_I16) AS_I16(temp)[j] = pmax->i16;
+                else if (btype == TYPE_F64) AS_F64(temp)[j] = pmax->f64;
+                drop_obj(pmax);
+            }
+            res = ray_max_partial(temp, nparts, 0);
+            drop_obj(temp);
             return res;
         }
         default:
@@ -2492,16 +2500,7 @@ obj_p ray_avg(obj_p x) {
         case TYPE_MAPGROUP:
             return aggr_avg(AS_LIST(x)[0], AS_LIST(x)[1]);
         case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                res = aggr_avg(val, index);
-                drop_obj(index);
-                return res;
-            }
-            obj_p collected = filter_collect(val, filter);
+            obj_p collected = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
             res = ray_avg(collected);
             drop_obj(collected);
             return res;
@@ -2513,11 +2512,9 @@ obj_p ray_avg(obj_p x) {
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME:
         case TYPE_PARTEDTIMESTAMP: {
-            // Create minimal index for parted aggregation: group_count=1, filter=NULL
-            obj_p index =
-                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
-            res = aggr_avg(x, index);
-            drop_obj(index);
+            obj_p flat = ray_value(x);
+            res = ray_avg(flat);
+            drop_obj(flat);
             return res;
         }
         default:
@@ -2527,15 +2524,26 @@ obj_p ray_avg(obj_p x) {
 
 // TODO: Refactoring with out sort and with parallel execution
 obj_p ray_med(obj_p x) {
-    i64_t l = ray_cnt(x)->i64;
+    // Handle lazy types before ray_cnt (which can't handle MAPGROUP with NULL_OBJ index)
+    if (x->type == TYPE_MAPGROUP)
+        return aggr_med(AS_LIST(x)[0], AS_LIST(x)[1]);
+    if (x->type == TYPE_MAPFILTER) {
+        obj_p collected = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
+        obj_p res = ray_med(collected);
+        drop_obj(collected);
+        return res;
+    }
+
+    obj_p cnt_obj = ray_cnt(x);
+    i64_t l = cnt_obj->i64;
+    drop_obj(cnt_obj);
+
     if (l == 0)
         return f64(NULL_F64);
 
-    // i32_t *xi32sort;
     i64_t *xisort;
     u8_t *xu8sort;
     i16_t *xi16sort;
-    // f64_t *xfsort, med;
     f64_t med;
     obj_p sort;
 
@@ -2565,48 +2573,12 @@ obj_p ray_med(obj_p x) {
             drop_obj(sort);
             return f64(med);
 
-            // TODO
-            // case TYPE_I32:
-            //     sort = ray_asc(x);
-            //     xi32sort = AS_I32(sort);
-            //     med = (f64_t)((l % 2 == 0) ? (xi32sort[l / 2 - 1] + xi32sort[l / 2]) / 2.0 : xi32sort[l / 2]);
-            //     drop_obj(sort);
-
-            //     return f64(med);
-
         case TYPE_I64:
             sort = ray_asc(x);
             xisort = AS_I64(sort);
             med = (f64_t)((l % 2 == 0) ? (xisort[l / 2 - 1] + xisort[l / 2]) / 2.0 : xisort[l / 2]);
             drop_obj(sort);
-
             return f64(med);
-            // TODO
-            // case TYPE_F64:
-            //     sort = ray_asc(x);
-            //     xfsort = AS_F64(sort);
-            //     med = (l % 2 == 0) ? (xfsort[l / 2 - 1] + xfsort[l / 2]) / 2.0 : xfsort[l / 2];
-            //     drop_obj(sort);
-
-            //     return f64(med);
-
-        case TYPE_MAPGROUP:
-            return aggr_med(AS_LIST(x)[0], AS_LIST(x)[1]);
-        case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                obj_p res = aggr_med(val, index);
-                drop_obj(index);
-                return res;
-            }
-            obj_p collected = filter_collect(val, filter);
-            obj_p res = ray_med(collected);
-            drop_obj(collected);
-            return res;
-        }
         case TYPE_PARTEDI16:
         case TYPE_PARTEDI32:
         case TYPE_PARTEDI64:
@@ -2614,10 +2586,9 @@ obj_p ray_med(obj_p x) {
         case TYPE_PARTEDDATE:
         case TYPE_PARTEDTIME:
         case TYPE_PARTEDTIMESTAMP: {
-            obj_p index =
-                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
-            obj_p res = aggr_med(x, index);
-            drop_obj(index);
+            obj_p flat = ray_value(x);
+            obj_p res = ray_med(flat);
+            drop_obj(flat);
             return res;
         }
         default:
@@ -2626,6 +2597,22 @@ obj_p ray_med(obj_p x) {
 }
 
 obj_p ray_dev(obj_p x) {
+    // Handle lazy types before ray_cnt (which can't handle MAPGROUP with NULL_OBJ index)
+    if (x->type == TYPE_MAPGROUP)
+        return aggr_dev(AS_LIST(x)[0], AS_LIST(x)[1]);
+    if (x->type == TYPE_MAPFILTER) {
+        obj_p collected = filter_collect(AS_LIST(x)[0], AS_LIST(x)[1]);
+        obj_p res = ray_dev(collected);
+        drop_obj(collected);
+        return res;
+    }
+    if (x->type >= TYPE_PARTEDLIST) {
+        obj_p flat = ray_value(x);
+        obj_p res = ray_dev(flat);
+        drop_obj(flat);
+        return res;
+    }
+
     obj_p cnt_obj = ray_cnt(x);
     i64_t l = cnt_obj->i64;
     drop_obj(cnt_obj);
@@ -2662,36 +2649,6 @@ obj_p ray_dev(obj_p x) {
             favg = (sum_obj->f64) / (f64_t)l;
             drop_obj(sum_obj);
             break;
-        case TYPE_MAPGROUP:
-            return aggr_dev(AS_LIST(x)[0], AS_LIST(x)[1]);
-        case TYPE_MAPFILTER: {
-            obj_p val = AS_LIST(x)[0];
-            obj_p filter = AS_LIST(x)[1];
-            if (val->type >= TYPE_PARTEDLIST && val->type <= TYPE_PARTEDGUID && filter->type == TYPE_PARTEDI64) {
-                obj_p index = vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ,
-                                      clone_obj(filter), NULL_OBJ);
-                obj_p res = aggr_dev(val, index);
-                drop_obj(index);
-                return res;
-            }
-            obj_p collected = filter_collect(val, filter);
-            obj_p res = ray_dev(collected);
-            drop_obj(collected);
-            return res;
-        }
-        case TYPE_PARTEDI16:
-        case TYPE_PARTEDI32:
-        case TYPE_PARTEDI64:
-        case TYPE_PARTEDF64:
-        case TYPE_PARTEDDATE:
-        case TYPE_PARTEDTIME:
-        case TYPE_PARTEDTIMESTAMP: {
-            obj_p index =
-                vn_list(7, i64(INDEX_TYPE_PARTEDCOMMON), i64(1), NULL_OBJ, i64(NULL_I64), NULL_OBJ, NULL_OBJ, NULL_OBJ);
-            obj_p res = aggr_dev(x, index);
-            drop_obj(index);
-            return res;
-        }
         default:
             return err_type(TYPE_LIST, x->type, 0, 0);
     }

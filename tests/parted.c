@@ -23,7 +23,16 @@
 
 // Parted table tests - create, load, and query parted data
 
-static nil_t parted_cleanup() { system("rm -rf /tmp/rayforce_test_parted"); }
+static nil_t parted_cleanup() {
+    drop_obj(eval_str("(set t null)"));
+    drop_obj(eval_str("(set s null)"));
+    drop_obj(eval_str("(set p null)"));
+    drop_obj(eval_str("(set dbpath null)"));
+    drop_obj(eval_str("(set sympath null)"));
+    drop_obj(eval_str("(set gen-partition null)"));
+    drop_obj(eval_str("(set n null)"));
+    system("rm -rf /tmp/rayforce_test_parted");
+}
 
 // Helper macro to create a parted table for testing
 // 5 partitions (days), 100 rows each
@@ -183,11 +192,9 @@ test_result_t test_parted_aggregate_time() {
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_TIME "(at (select {from: t by: Date l: (last Time)}) 'l)",
                    "[34299000 34399000 34499000 34599000 34699000]");
 
-    // Min should be same as first (time increases within partition)
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_TIME "(at (select {from: t by: Date mn: (min Time)}) 'mn)",
                    "[34200000 34300000 34400000 34500000 34600000]");
 
-    // Max should be same as last
     TEST_ASSERT_EQ(PARTED_TEST_SETUP_TIME "(at (select {from: t by: Date mx: (max Time)}) 'mx)",
                    "[34299000 34399000 34499000 34599000 34699000]");
     parted_cleanup();
