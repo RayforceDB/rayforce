@@ -29,88 +29,31 @@
 #include "compose.h"
 #include "join.h"
 #include "aggr.h"
-#include "index.h"
+#include "query.h"
 #include "symbols.h"
 #include "ops.h"
 #include "cmp.h"
-#include "vary.h"
 #include "unary.h"
 #include "math.h"
-#include "items.h"
 #include "misc.h"
 
 typedef obj_p (*aggr_fn)(obj_p val, obj_p index);
 
-static b8_t is_function(obj_p obj) {
-    return obj->type == TYPE_UNARY || obj->type == TYPE_BINARY || obj->type == TYPE_VARY || obj->type == TYPE_LAMBDA;
-}
-
-static aggr_fn get_optimized_aggr(obj_p func) {
+static aggr_fn get_aggr_func(obj_p func) {
     if (func->type != TYPE_UNARY)
         return NULL;
 
     unary_f fn = (unary_f)func->i64;
-    if (fn == ray_sum)
-        return aggr_sum;
-    if (fn == ray_avg)
-        return aggr_avg;
-    if (fn == ray_min)
-        return aggr_min;
-    if (fn == ray_max)
-        return aggr_max;
-    if (fn == ray_med)
-        return aggr_med;
-    if (fn == ray_count)
-        return aggr_count;
-    if (fn == ray_first)
-        return aggr_first;
-    if (fn == ray_last)
-        return aggr_last;
+    if (fn == ray_sum)   return aggr_sum;
+    if (fn == ray_avg)   return aggr_avg;
+    if (fn == ray_min)   return aggr_min;
+    if (fn == ray_max)   return aggr_max;
+    if (fn == ray_med)   return aggr_med;
+    if (fn == ray_count) return aggr_count;
+    if (fn == ray_first) return aggr_first;
+    if (fn == ray_last)  return aggr_last;
 
     return NULL;
-}
-
-static obj_p apply_aggr_func_slow(obj_p func, obj_p val, obj_p group_idx) {
-    i64_t i, n;
-    obj_p collected, res, v, args[2];
-
-    collected = aggr_collect(val, group_idx);
-    if (IS_ERR(collected))
-        return collected;
-
-    n = collected->len;
-    res = LIST(n);
-
-    for (i = 0; i < n; i++) {
-        args[0] = func;
-        args[1] = AS_LIST(collected)[i];
-        v = ray_apply(args, 2);
-
-        if (IS_ERR(v)) {
-            res->len = i;
-            drop_obj(res);
-            drop_obj(collected);
-            return v;
-        }
-
-        AS_LIST(res)[i] = v;
-    }
-
-    drop_obj(collected);
-
-    obj_p unified = ray_unify(res);
-    drop_obj(res);
-
-    return unified;
-}
-
-// fast path for built-ins, slow path for custom functions
-static obj_p apply_aggr_func(obj_p func, obj_p val, obj_p group_idx) {
-    aggr_fn optimized = get_optimized_aggr(func);
-    if (optimized != NULL)
-        return optimized(val, group_idx);
-
-    return apply_aggr_func_slow(func, val, group_idx);
 }
 
 static i64_t pivot_val_to_symbol(obj_p pivot_val, i64_t fallback_idx) {
@@ -155,27 +98,33 @@ obj_p ray_pivot(obj_p* x, i64_t n) {
     if (values->type != -TYPE_SYMBOL)
         return err_type(-TYPE_SYMBOL, values->type, 4, 0);
 
-    if (!is_function(aggfunc))
-        return err_type(TYPE_LAMBDA, aggfunc->type, 5, 0);
+    aggr_fn agg_func = get_aggr_func(aggfunc);
+    if (agg_func == NULL) {
+        b8_t is_fn = (aggfunc->type == TYPE_UNARY || aggfunc->type == TYPE_BINARY ||
+                      aggfunc->type == TYPE_VARY || aggfunc->type == TYPE_LAMBDA);
+        return is_fn ? err_domain(5, 0) : err_type(TYPE_LAMBDA, aggfunc->type, 5, 0);
+    }
+
+    b8_t single_index = (index->type == -TYPE_SYMBOL);
 
     obj_p pivot_col = ray_at(tab, columns);
     if (IS_ERR(pivot_col))
         return pivot_col;
 
     obj_p unique_vals = ray_distinct(pivot_col);
-    drop_obj(pivot_col);
-
-    if (IS_ERR(unique_vals))
+    if (IS_ERR(unique_vals)) {
+        drop_obj(pivot_col);
         return unique_vals;
+    }
 
     i64_t num_pivots = unique_vals->len;
     if (num_pivots == 0) {
         drop_obj(unique_vals);
+        drop_obj(pivot_col);
         return err_domain(3, 0);
     }
 
     obj_p index_syms;
-    b8_t single_index = (index->type == -TYPE_SYMBOL);
     if (single_index) {
         index_syms = vector(TYPE_SYMBOL, 1);
         AS_SYMBOL(index_syms)[0] = index->i64;
@@ -183,103 +132,91 @@ obj_p ray_pivot(obj_p* x, i64_t n) {
         index_syms = clone_obj(index);
     }
 
-    // Get value column and index data
     obj_p val_col = ray_at(tab, values);
     if (IS_ERR(val_col)) {
         drop_obj(unique_vals);
+        drop_obj(pivot_col);
         drop_obj(index_syms);
         return val_col;
     }
 
-    obj_p index_data = ray_at(tab, index_syms);
-    if (IS_ERR(index_data)) {
+    // Fetch index columns: single returns vector, multi returns LIST
+    obj_p index_raw = ray_at(tab, index_syms);
+    if (IS_ERR(index_raw)) {
         drop_obj(unique_vals);
+        drop_obj(pivot_col);
         drop_obj(index_syms);
         drop_obj(val_col);
-        return index_data;
+        return index_raw;
     }
 
-    pivot_col = ray_at(tab, columns);
-    if (IS_ERR(pivot_col)) {
-        drop_obj(unique_vals);
-        drop_obj(index_syms);
-        drop_obj(val_col);
-        drop_obj(index_data);
-        return pivot_col;
-    }
-
-    obj_p unique_index;
+    // Normalize: always work with LIST of key column vectors
+    obj_p key_cols;
     if (single_index) {
-        unique_index = ray_distinct(index_data);
+        key_cols = LIST(1);
+        AS_LIST(key_cols)[0] = index_raw;
     } else {
-        obj_p group_idx = index_group_list(index_data, NULL_OBJ);
-        if (IS_ERR(group_idx)) {
+        key_cols = index_raw;
+    }
+    i64_t nkeys = key_cols->len;
+
+    // Build base result table with ALL unique index combinations
+    obj_p result;
+    if (single_index) {
+        obj_p unique_idx = ray_distinct(AS_LIST(key_cols)[0]);
+        if (IS_ERR(unique_idx)) {
             drop_obj(unique_vals);
+            drop_obj(pivot_col);
             drop_obj(index_syms);
             drop_obj(val_col);
-            drop_obj(index_data);
-            drop_obj(pivot_col);
-            return group_idx;
+            drop_obj(key_cols);
+            return unique_idx;
         }
-        i64_t ncols = index_data->len;
-        unique_index = LIST(ncols);
-        for (i64_t j = 0; j < ncols; j++) {
-            obj_p col = aggr_first(AS_LIST(index_data)[j], group_idx);
-            if (IS_ERR(col)) {
-                unique_index->len = j;
-                drop_obj(unique_index);
-                drop_obj(group_idx);
+        result = table(clone_obj(index_syms), vn_list(1, unique_idx));
+    } else {
+        // Use query_ctx + aggr_first to get unique composite keys
+        struct query_ctx_t base_ctx;
+        query_ctx_init(&base_ctx);
+        base_ctx.groupby = clone_obj(key_cols);
+
+        obj_p base_vals = LIST(nkeys);
+        for (i64_t k = 0; k < nkeys; k++) {
+            obj_p gk = aggr_first(AS_LIST(key_cols)[k], NULL_OBJ);
+            if (IS_ERR(gk)) {
+                base_vals->len = k;
+                drop_obj(base_vals);
+                query_ctx_destroy(&base_ctx);
                 drop_obj(unique_vals);
+                drop_obj(pivot_col);
                 drop_obj(index_syms);
                 drop_obj(val_col);
-                drop_obj(index_data);
-                drop_obj(pivot_col);
-                return col;
+                drop_obj(key_cols);
+                return gk;
             }
-            AS_LIST(unique_index)[j] = col;
+            AS_LIST(base_vals)[k] = gk;
         }
-        drop_obj(group_idx);
+        query_ctx_destroy(&base_ctx);
+        result = table(clone_obj(index_syms), base_vals);
     }
-
-    if (IS_ERR(unique_index)) {
-        drop_obj(unique_vals);
-        drop_obj(index_syms);
-        drop_obj(val_col);
-        drop_obj(index_data);
-        drop_obj(pivot_col);
-        return unique_index;
-    }
-
-    obj_p base_keys = clone_obj(index_syms);
-    obj_p base_vals;
-    if (single_index) {
-        base_vals = vn_list(1, clone_obj(unique_index));
-    } else {
-        i64_t ncols = unique_index->len;
-        base_vals = LIST(ncols);
-        for (i64_t j = 0; j < ncols; j++) {
-            AS_LIST(base_vals)[j] = clone_obj(AS_LIST(unique_index)[j]);
-        }
-    }
-    obj_p result = table(base_keys, base_vals);
-    drop_obj(unique_index);
 
     if (IS_ERR(result)) {
         drop_obj(unique_vals);
+        drop_obj(pivot_col);
         drop_obj(index_syms);
         drop_obj(val_col);
-        drop_obj(index_data);
-        drop_obj(pivot_col);
+        drop_obj(key_cols);
         return result;
     }
 
     for (i64_t i = 0; i < num_pivots; i++) {
         obj_p pivot_val = at_idx(unique_vals, i);
 
-        // filter mask: pivot_col == pivot_val
+        // Filter: pivot_col == pivot_val
         obj_p mask = ray_eq(pivot_col, pivot_val);
         if (IS_ERR(mask)) {
             drop_obj(pivot_val);
+            drop_obj(result);
+            result = mask;
             goto cleanup;
         }
 
@@ -299,133 +236,120 @@ obj_p ray_pivot(obj_p* x, i64_t n) {
             continue;
         }
 
-        obj_p filtered_index;
-        if (single_index) {
-            filtered_index = at_ids(index_data, AS_I64(filter_idx), filter_idx->len);
-        } else {
-            i64_t ncols = index_data->len;
-            filtered_index = LIST(ncols);
-            for (i64_t j = 0; j < ncols; j++) {
-                obj_p col = at_ids(AS_LIST(index_data)[j], AS_I64(filter_idx), filter_idx->len);
-                if (IS_ERR(col)) {
-                    filtered_index->len = j;
-                    drop_obj(filtered_index);
-                    drop_obj(filter_idx);
-                    drop_obj(pivot_val);
-                    drop_obj(result);
-                    result = col;
-                    goto cleanup;
-                }
-                AS_LIST(filtered_index)[j] = col;
-            }
-        }
+        i64_t nfiltered = filter_idx->len;
+        i64_t *fids = AS_I64(filter_idx);
 
-        if (IS_ERR(filtered_index)) {
+        // Extract filtered value column
+        obj_p fval = at_ids(val_col, fids, nfiltered);
+        if (IS_ERR(fval)) {
             drop_obj(filter_idx);
             drop_obj(pivot_val);
             drop_obj(result);
-            result = filtered_index;
+            result = fval;
             goto cleanup;
         }
 
-        obj_p filtered_val = at_ids(val_col, AS_I64(filter_idx), filter_idx->len);
+        // Extract filtered key columns
+        obj_p fkeys = LIST(nkeys);
+        for (i64_t k = 0; k < nkeys; k++) {
+            obj_p fk = at_ids(AS_LIST(key_cols)[k], fids, nfiltered);
+            if (IS_ERR(fk)) {
+                fkeys->len = k;
+                drop_obj(fkeys);
+                drop_obj(fval);
+                drop_obj(filter_idx);
+                drop_obj(pivot_val);
+                drop_obj(result);
+                result = fk;
+                goto cleanup;
+            }
+            AS_LIST(fkeys)[k] = fk;
+        }
         drop_obj(filter_idx);
 
-        if (IS_ERR(filtered_val)) {
-            drop_obj(filtered_index);
-            drop_obj(pivot_val);
-            drop_obj(result);
-            result = filtered_val;
-            goto cleanup;
-        }
+        // Set up query context for group-by aggregation
+        struct query_ctx_t pctx;
+        query_ctx_init(&pctx);
+        pctx.groupby = clone_obj(fkeys);
 
-        obj_p group_idx =
-            single_index ? index_group(filtered_index, NULL_OBJ) : index_group_list(filtered_index, NULL_OBJ);
-
-        if (IS_ERR(group_idx)) {
-            drop_obj(filtered_index);
-            drop_obj(filtered_val);
-            drop_obj(pivot_val);
-            drop_obj(result);
-            result = group_idx;
-            goto cleanup;
-        }
-
-        obj_p agg_result = apply_aggr_func(aggfunc, filtered_val, group_idx);
-        drop_obj(filtered_val);
+        // Run aggregation — reads VM->query_ctx->groupby for grouping keys
+        obj_p agg_result = agg_func(fval, NULL_OBJ);
 
         if (IS_ERR(agg_result)) {
-            drop_obj(group_idx);
-            drop_obj(filtered_index);
+            query_ctx_destroy(&pctx);
+            drop_obj(fkeys);
+            drop_obj(fval);
             drop_obj(pivot_val);
             drop_obj(result);
             result = agg_result;
             goto cleanup;
         }
 
-        obj_p group_keys;
+        // Get unique key values per group (same ordering as agg_result)
+        obj_p group_key_vals;
         if (single_index) {
-            group_keys = aggr_first(filtered_index, group_idx);
+            group_key_vals = aggr_first(AS_LIST(fkeys)[0], NULL_OBJ);
+            if (IS_ERR(group_key_vals)) {
+                drop_obj(agg_result);
+                query_ctx_destroy(&pctx);
+                drop_obj(fkeys);
+                drop_obj(fval);
+                drop_obj(pivot_val);
+                drop_obj(result);
+                result = group_key_vals;
+                goto cleanup;
+            }
         } else {
-            i64_t ncols = filtered_index->len;
-            group_keys = LIST(ncols);
-            for (i64_t j = 0; j < ncols; j++) {
-                obj_p col = aggr_first(AS_LIST(filtered_index)[j], group_idx);
-                if (IS_ERR(col)) {
-                    group_keys->len = j;
-                    drop_obj(group_keys);
-                    drop_obj(group_idx);
+            group_key_vals = LIST(nkeys);
+            for (i64_t k = 0; k < nkeys; k++) {
+                obj_p gk = aggr_first(AS_LIST(fkeys)[k], NULL_OBJ);
+                if (IS_ERR(gk)) {
+                    group_key_vals->len = k;
+                    drop_obj(group_key_vals);
                     drop_obj(agg_result);
-                    drop_obj(filtered_index);
+                    query_ctx_destroy(&pctx);
+                    drop_obj(fkeys);
+                    drop_obj(fval);
                     drop_obj(pivot_val);
                     drop_obj(result);
-                    result = col;
+                    result = gk;
                     goto cleanup;
                 }
-                AS_LIST(group_keys)[j] = col;
+                AS_LIST(group_key_vals)[k] = gk;
             }
         }
 
-        drop_obj(group_idx);
-        drop_obj(filtered_index);
-
-        if (IS_ERR(group_keys)) {
-            drop_obj(agg_result);
-            drop_obj(pivot_val);
-            drop_obj(result);
-            result = group_keys;
-            goto cleanup;
-        }
+        query_ctx_destroy(&pctx);
+        drop_obj(fkeys);
+        drop_obj(fval);
 
         i64_t pivot_name = pivot_val_to_symbol(pivot_val, i);
         drop_obj(pivot_val);
 
+        // Build mini-table: [key_cols..., agg_result]
         obj_p tbl_keys, tbl_vals;
         if (single_index) {
             tbl_keys = SYMBOL(2);
             AS_SYMBOL(tbl_keys)[0] = index->i64;
             AS_SYMBOL(tbl_keys)[1] = pivot_name;
-            tbl_vals = vn_list(2, group_keys, agg_result);
+            tbl_vals = vn_list(2, group_key_vals, agg_result);
         } else {
-            i64_t ncols = index_syms->len;
-            tbl_keys = SYMBOL(ncols + 1);
-            for (i64_t j = 0; j < ncols; j++)
-                AS_SYMBOL(tbl_keys)[j] = AS_SYMBOL(index_syms)[j];
-            AS_SYMBOL(tbl_keys)[ncols] = pivot_name;
+            tbl_keys = SYMBOL(nkeys + 1);
+            for (i64_t k = 0; k < nkeys; k++)
+                AS_SYMBOL(tbl_keys)[k] = AS_SYMBOL(index)[k];
+            AS_SYMBOL(tbl_keys)[nkeys] = pivot_name;
 
-            tbl_vals = LIST(ncols + 1);
-            for (i64_t j = 0; j < ncols; j++)
-                AS_LIST(tbl_vals)[j] = clone_obj(AS_LIST(group_keys)[j]);
-            AS_LIST(tbl_vals)[ncols] = clone_obj(agg_result);
-            drop_obj(group_keys);
+            tbl_vals = LIST(nkeys + 1);
+            for (i64_t k = 0; k < nkeys; k++)
+                AS_LIST(tbl_vals)[k] = clone_obj(AS_LIST(group_key_vals)[k]);
+            AS_LIST(tbl_vals)[nkeys] = clone_obj(agg_result);
+            drop_obj(group_key_vals);
             drop_obj(agg_result);
         }
 
         obj_p pivot_table = table(tbl_keys, tbl_vals);
 
         if (IS_ERR(pivot_table)) {
-            drop_obj(tbl_keys);
-            drop_obj(tbl_vals);
             drop_obj(result);
             result = pivot_table;
             goto cleanup;
@@ -448,10 +372,10 @@ obj_p ray_pivot(obj_p* x, i64_t n) {
 
 cleanup:
     drop_obj(unique_vals);
-    drop_obj(index_syms);
-    drop_obj(val_col);
-    drop_obj(index_data);
     drop_obj(pivot_col);
+    drop_obj(val_col);
+    drop_obj(key_cols);
+    drop_obj(index_syms);
 
     return result;
 }
