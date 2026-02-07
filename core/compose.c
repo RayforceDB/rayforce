@@ -32,7 +32,7 @@
 #include "guid.h"
 #include "index.h"
 #include "error.h"
-#include "string.h"
+#include "str.h"
 #include "guid.h"
 #include "aggr.h"
 #include "serde.h"

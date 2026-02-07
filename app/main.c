@@ -25,7 +25,7 @@
 #include "../core/runtime.h"
 #include "../core/format.h"
 #include "../core/sys.h"
-#include "../core/string.h"
+#include "../core/str.h"
 #include "../core/io.h"
 #include "../core/chrono.h"
 #include "repl.h"
@@ -57,7 +57,7 @@ i32_t main(i32_t argc, str_p argv[]) {
     i32_t code = -1;
     sys_info_t *info;
     runtime_p runtime;
-    obj_p interactive_arg, file_arg, res, fmt;
+    obj_p interactive_arg, port_arg, file_arg, res, fmt;
     b8_t interactive = B8_FALSE;
     b8_t has_file = B8_FALSE;
     b8_t file_error = B8_FALSE;
@@ -70,6 +70,12 @@ i32_t main(i32_t argc, str_p argv[]) {
     interactive_arg = runtime_get_arg("interactive");
     interactive = !is_null(interactive_arg);
     drop_obj(interactive_arg);
+
+    // Check if port is specified (-p/--port) — implies server mode
+    port_arg = runtime_get_arg("port");
+    if (!is_null(port_arg))
+        interactive = B8_TRUE;
+    drop_obj(port_arg);
 
     // Check if a file was provided
     file_arg = runtime_get_arg("file");
@@ -104,10 +110,15 @@ i32_t main(i32_t argc, str_p argv[]) {
     }
 
     // Create REPL for interactive mode (handles both TTY and piped input)
+    repl_p repl = NULL;
     if (runtime->poll)
-        repl_create(runtime->poll);
+        repl = repl_create(runtime->poll);
 
     code = runtime_run();
+
+    if (repl)
+        repl_destroy(repl);
+
     runtime_destroy();
 
     return code;

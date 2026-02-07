@@ -71,5 +71,6 @@ obj_p env_set(env_t *env, obj_p key, obj_p val);
 obj_p ray_env(obj_p *x, i64_t n);
 obj_p ray_memstat(obj_p *x, i64_t n);
 obj_p ray_internals(obj_p *x, i64_t n);
+obj_p ray_del(obj_p x);
 
 #endif  // ENV_H

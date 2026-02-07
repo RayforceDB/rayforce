@@ -134,6 +134,8 @@ static const i8_t raykx_type_to_k_table[128] = {
     [TYPE_ERR] = -128,      // Error
 };
 
+#define RAYKX_K_ENUM 20
+
 #define RAYKX_TYPE_TO_K(t) (raykx_type_to_k_table[(t < 0 ? -t : t)] * (t < 0 ? -1 : 1))
 
 #define RAYKX_SER_ATOM(b, o, t)          \
@@ -500,9 +502,108 @@ obj_p raykx_des_obj(u8_t *buf, i64_t *len) {
                 drop_obj(k);
                 return v;
             }
+            if (k->type == TYPE_TABLE && v->type == TYPE_TABLE) {
+                obj_p kcols = AS_LIST(k)[0];
+                obj_p kdata = AS_LIST(k)[1];
+                obj_p vcols = AS_LIST(v)[0];
+                obj_p vdata = AS_LIST(v)[1];
+
+                if (kcols->type == TYPE_SYMBOL && vcols->type == TYPE_SYMBOL) {
+                    i64_t klen = kcols->len;
+                    i64_t vlen = vcols->len;
+                    obj_p cols = SYMBOL(klen + vlen);
+                    obj_p data = LIST(klen + vlen);
+
+                    for (i = 0; i < klen; i++) {
+                        AS_SYMBOL(cols)[i] = AS_SYMBOL(kcols)[i];
+                        AS_LIST(data)[i] = clone_obj(AS_LIST(kdata)[i]);
+                    }
+                    for (i = 0; i < vlen; i++) {
+                        AS_SYMBOL(cols)[klen + i] = AS_SYMBOL(vcols)[i];
+                        AS_LIST(data)[klen + i] = clone_obj(AS_LIST(vdata)[i]);
+                    }
+
+                    drop_obj(k);
+                    drop_obj(v);
+                    return table(cols, data);
+                }
+            }
             obj = table(k, v);
             obj->type = TYPE_DICT;
             return obj;
+        case RAYKX_K_ENUM: {
+            // Enum: attrs + key(symbol) + values(int vector)
+            if (*len < 1)
+                return ray_err("raykx_des_obj: buffer underflow for enum header");
+            buf++;  // attrs
+            (*len)--;
+            l = *len;
+            k = raykx_des_obj(buf, len);
+            if (IS_ERR(k))
+                return k;
+            buf += l - *len;
+            l = *len;
+            v = raykx_des_obj(buf, len);
+            if (IS_ERR(v)) {
+                drop_obj(k);
+                return v;
+            }
+            buf += l - *len;
+
+            // Normalize key to symbol atom
+            if (k->type == TYPE_SYMBOL && k->len == 1) {
+                i64_t kid = AS_SYMBOL(k)[0];
+                obj_p atom = symbol(str_from_symbol(kid), symbol_strlen(kid));
+                drop_obj(k);
+                k = atom;
+            }
+            if (k->type != -TYPE_SYMBOL) {
+                drop_obj(k);
+                drop_obj(v);
+                return ray_err("raykx_des_obj: enum key must be symbol");
+            }
+
+            // Normalize values to I64 vector
+            if (v->type == TYPE_I32 || v->type == TYPE_DATE || v->type == TYPE_TIME) {
+                obj_p i64v = I64(v->len);
+                for (i = 0; i < v->len; i++)
+                    AS_I64(i64v)[i] = (i64_t)AS_I32(v)[i];
+                drop_obj(v);
+                v = i64v;
+            } else if (v->type == TYPE_I16) {
+                obj_p i64v = I64(v->len);
+                for (i = 0; i < v->len; i++)
+                    AS_I64(i64v)[i] = (i64_t)AS_I16(v)[i];
+                drop_obj(v);
+                v = i64v;
+            } else if (v->type == TYPE_U8) {
+                obj_p i64v = I64(v->len);
+                for (i = 0; i < v->len; i++)
+                    AS_I64(i64v)[i] = (i64_t)AS_U8(v)[i];
+                drop_obj(v);
+                v = i64v;
+            } else if (v->type == -TYPE_I32) {
+                obj_p i64v = I64(1);
+                AS_I64(i64v)[0] = (i64_t)v->i32;
+                drop_obj(v);
+                v = i64v;
+            } else if (v->type == -TYPE_I64) {
+                obj_p i64v = I64(1);
+                AS_I64(i64v)[0] = v->i64;
+                drop_obj(v);
+                v = i64v;
+            } else if (v->type != TYPE_I64) {
+                drop_obj(k);
+                drop_obj(v);
+                return ray_err("raykx_des_obj: enum values must be integer vector");
+            }
+
+            obj = LIST(2);
+            AS_LIST(obj)[0] = k;
+            AS_LIST(obj)[1] = v;
+            obj->type = TYPE_ENUM;
+            return obj;
+        }
         case XT:
             if (*len < 2)
                 return ray_err( "raykx_des_obj: buffer underflow for table header");

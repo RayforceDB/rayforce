@@ -22,7 +22,7 @@
  */
 
 #include "sort.h"
-#include "string.h"
+#include "str.h"
 #include "ops.h"
 #include "error.h"
 #include "symbols.h"
@@ -474,7 +474,7 @@ obj_p ray_sort_asc(obj_p vec) {
         case TYPE_DICT:
             return at_obj(AS_LIST(vec)[0], ray_sort_asc(AS_LIST(vec)[1]));
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, vec->type, 0, 0);
     }
 }
 
@@ -735,7 +735,7 @@ obj_p ray_sort_desc(obj_p vec) {
         case TYPE_DICT:
             return at_obj(AS_LIST(vec)[0], ray_sort_desc(AS_LIST(vec)[1]));
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, vec->type, 0, 0);
     }
 }
 
@@ -914,7 +914,6 @@ static obj_p optimized_sort(obj_p vec, i64_t asc) {
     switch (vec->type) {
         case TYPE_I64:
         case TYPE_TIME:
-        case TYPE_SYMBOL:
             res = counting_sort_i64(vec, asc);
             if (res)
                 return res;

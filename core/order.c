@@ -26,7 +26,7 @@
 #include "sort.h"
 #include "error.h"
 #include "compose.h"
-#include "string.h"
+#include "str.h"
 #include "pool.h"
 
 obj_p ray_iasc(obj_p x) {
@@ -46,7 +46,7 @@ obj_p ray_iasc(obj_p x) {
         case TYPE_DICT:
             return ray_sort_asc(x);
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, x->type, 0, 0);
     }
 }
 
@@ -67,7 +67,7 @@ obj_p ray_idesc(obj_p x) {
         case TYPE_DICT:
             return ray_sort_desc(x);
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, x->type, 0, 0);
     }
 }
 
@@ -153,7 +153,7 @@ obj_p ray_asc(obj_p x) {
         }
 
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, x->type, 0, 0);
     }
 }
 
@@ -239,7 +239,7 @@ obj_p ray_desc(obj_p x) {
         }
 
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, x->type, 0, 0);
     }
 }
 
@@ -271,7 +271,7 @@ obj_p ray_xasc(obj_p x, obj_p y) {
                 return clone_obj(x);
             }
 
-            i64_t nrow = AS_LIST(AS_LIST(x)[1])[0]->len;
+            i64_t nrow = ops_count(AS_LIST(AS_LIST(x)[1])[0]);
             obj_p idx = I64(nrow);
             i64_t* indices = AS_I64(idx);
             for (i64_t i = 0; i < nrow; i++)
@@ -325,9 +325,9 @@ obj_p ray_xasc(obj_p x, obj_p y) {
             if (y->len == 0)
                 return clone_obj(x);
 
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_SYMBOL, y->type, 2, 0);
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(x->type, y->type, 0, 0);
     }
 }
 
@@ -359,7 +359,7 @@ obj_p ray_xdesc(obj_p x, obj_p y) {
                 return clone_obj(x);
             }
 
-            i64_t nrow = AS_LIST(AS_LIST(x)[1])[0]->len;
+            i64_t nrow = ops_count(AS_LIST(AS_LIST(x)[1])[0]);
             obj_p idx = I64(nrow);
             i64_t* indices = AS_I64(idx);
             for (i64_t i = 0; i < nrow; i++)
@@ -413,9 +413,9 @@ obj_p ray_xdesc(obj_p x, obj_p y) {
             if (y->len == 0)
                 return clone_obj(x);
 
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_SYMBOL, y->type, 2, 0);
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(x->type, y->type, 0, 0);
     }
 }
 
@@ -438,7 +438,7 @@ obj_p ray_not(obj_p x) {
             return res;
 
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_B8, x->type, 0, 0);
     }
 }
 
@@ -492,7 +492,7 @@ obj_p ray_neg(obj_p x) {
             return res;
 
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, x->type, 0, 0);
     }
 }
 
@@ -613,7 +613,7 @@ obj_p ray_xrank(obj_p y, obj_p x) {
             n_buckets = x->u8;
             break;
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(-TYPE_I64, x->type, 0, 0);
     }
     if (n_buckets <= 0)
         return err_domain(0, 0);

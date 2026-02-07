@@ -42,7 +42,6 @@ nil_t fdmap_add_fd(obj_p *fdmap, obj_p obj, i64_t fd, i64_t size) {
     AS_I64(v)[1] = fd;
     AS_I64(v)[2] = size;
     AS_LIST(*fdmap)[0] = v;
-    // push_obj(fdmap, v);
 }
 
 nil_t fdmap_destroy(obj_p fdmap) {

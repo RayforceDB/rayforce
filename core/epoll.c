@@ -333,6 +333,20 @@ i64_t poll_run(poll_p poll) {
                 break;
             }
 
+            // Check if this is a waker event (by checking magic number)
+            {
+                poll_waker_p waker = (poll_waker_p)ev.data.ptr;
+                if (waker != NULL && waker->magic == POLL_WAKER_MAGIC) {
+                    u64_t val;
+                    // Drain the eventfd
+                    read(waker->eventfd, &val, sizeof(val));
+                    LOG_TRACE("Waker event received, calling callback");
+                    if (waker->callback != NULL)
+                        waker->callback(waker->data);
+                    continue;
+                }
+            }
+
             selector = (selector_p)ev.data.ptr;
 
             // error or hang up
@@ -464,4 +478,66 @@ option_t poll_block_on(poll_p poll, selector_p selector) {
     LOG_DEBUG("empty buffer");
 
     return option_none();
+}
+
+// ============================================================================
+// Poll Waker - Linux implementation using eventfd
+// ============================================================================
+
+poll_waker_p poll_waker_create(poll_p poll, poll_waker_fn callback, raw_p data) {
+    poll_waker_p waker;
+    struct epoll_event ev;
+
+    LOG_DEBUG("Creating poll waker");
+
+    waker = (poll_waker_p)heap_alloc(sizeof(struct poll_waker_t));
+    waker->magic = POLL_WAKER_MAGIC;
+    waker->poll = poll;
+    waker->callback = callback;
+    waker->data = data;
+
+    // Create eventfd for this waker
+    waker->eventfd = eventfd(0, EFD_NONBLOCK);
+    if (waker->eventfd == -1) {
+        LOG_ERROR("Failed to create eventfd for waker");
+        perror("eventfd");
+        heap_free(waker);
+        return NULL;
+    }
+
+    // Add eventfd to epoll with waker pointer as data
+    ev.events = EPOLLIN;
+    ev.data.ptr = waker;
+    if (epoll_ctl(poll->fd, EPOLL_CTL_ADD, waker->eventfd, &ev) == -1) {
+        LOG_ERROR("Failed to add waker eventfd to epoll");
+        perror("epoll_ctl: waker eventfd");
+        close(waker->eventfd);
+        heap_free(waker);
+        return NULL;
+    }
+
+    LOG_DEBUG("Poll waker created with eventfd %d", waker->eventfd);
+
+    return waker;
+}
+
+nil_t poll_waker_wake(poll_waker_p waker) {
+    u64_t val = 1;
+    i32_t res;
+
+    LOG_TRACE("Waking poll via eventfd %d", waker->eventfd);
+
+    res = write(waker->eventfd, &val, sizeof(val));
+    if (res == -1 && errno != EAGAIN) {
+        LOG_ERROR("Failed to write to waker eventfd");
+        perror("write: waker eventfd");
+    }
+}
+
+nil_t poll_waker_destroy(poll_waker_p waker) {
+    LOG_DEBUG("Destroying poll waker");
+
+    epoll_ctl(waker->poll->fd, EPOLL_CTL_DEL, waker->eventfd, NULL);
+    close(waker->eventfd);
+    heap_free(waker);
 }

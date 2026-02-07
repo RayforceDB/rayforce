@@ -26,7 +26,7 @@
 #include <limits.h>
 #include "parse.h"
 #include "rayforce.h"
-#include "string.h"
+#include "str.h"
 #include "nfo.h"
 #include "ops.h"
 #include "date.h"

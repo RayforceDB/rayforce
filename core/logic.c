@@ -24,7 +24,7 @@
 #include "logic.h"
 #include "ops.h"
 #include "error.h"
-#include "string.h"
+#include "str.h"
 #include "eval.h"
 #include "runtime.h"
 
@@ -100,6 +100,8 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
     if (IS_ERR(res) || n == 1)
         return res;
 
+    res = cow_obj(res);
+
     // Process remaining expressions
     for (i = 1; i < n; i++) {
         next = eval(x[i]);
@@ -121,7 +123,7 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
                 if (l != c) {
                     drop_obj(res);
                     drop_obj(next);
-                    return err_type(0, 0, 0, 0);
+                    return err_length(l, c, 0, 0, 0, 0);
                 }
 
                 // Perform element-wise operation using the provided function
@@ -196,7 +198,7 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
                 if (l != (i64_t)next->len) {
                     drop_obj(res);
                     drop_obj(next);
-                    return err_type(0, 0, 0, 0);
+                    return err_length(l, next->len, 0, 0, 0, 0);
                 }
 
                 for (j = 0; j < l; j++) {
@@ -249,10 +251,13 @@ static obj_p logic_map(obj_p *x, i64_t n, lit_p op_name, logic_op_f op_func) {
                 drop_obj(next);
                 break;
 
-            default:
+            default: {
+                i8_t res_type = res->type;
+                i8_t next_type = next->type;
                 drop_obj(res);
                 drop_obj(next);
-                return err_type(0, 0, 0, 0);
+                return err_type(res_type, next_type, 0, 0);
+            }
         }
     }
 
@@ -278,7 +283,7 @@ obj_p ray_like(obj_p x, obj_p y) {
                 if (!e || e->type != TYPE_C8) {
                     res->len = i;
                     drop_obj(res);
-                    return err_type(0, 0, 0, 0);
+                    return err_type(TYPE_C8, e ? e->type : 0, 0, 0);
                 }
 
                 AS_B8(res)[i] = str_match(AS_C8(e), e->len, AS_C8(y), y->len);
@@ -292,10 +297,11 @@ obj_p ray_like(obj_p x, obj_p y) {
             for (i = 0; i < l; i++) {
                 e = at_idx(x, i);
                 if (e == NULL_OBJ || e->type != TYPE_C8) {
+                    i8_t e_type = e ? e->type : 0;
                     res->len = i;
                     drop_obj(res);
                     drop_obj(e);
-                    return err_type(0, 0, 0, 0);
+                    return err_type(TYPE_C8, e_type, 0, 0);
                 }
 
                 AS_B8(res)[i] = str_match(AS_C8(e), e->len, AS_C8(y), y->len);
@@ -315,6 +321,6 @@ obj_p ray_like(obj_p x, obj_p y) {
             return res;
 
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(x->type, y->type, 0, 0);
     }
 }

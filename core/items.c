@@ -32,7 +32,7 @@
 #include "error.h"
 #include "aggr.h"
 #include "index.h"
-#include "string.h"
+#include "str.h"
 #include "pool.h"
 #include "cmp.h"
 #include "iter.h"
@@ -69,6 +69,16 @@ static inline obj_p at_vec_f64_by_i64(obj_p x, obj_p y) {
         AS_F64(res)[i] = (idx < 0 || idx >= (i64_t)xl) ? NULL_F64 : AS_F64(x)[idx];
     }
     return res;
+}
+
+static obj_p take_null_vec(i8_t type, i64_t len) {
+    if (type == TYPE_C8) {
+        obj_p res = C8(len);
+        memset(res->raw, 0, len);
+        return res;
+    }
+
+    return nullv(type, len);
 }
 
 obj_p ray_at(obj_p x, obj_p y) {
@@ -434,6 +444,8 @@ obj_p ray_take(obj_p from, obj_p count) {
         case TYPE_U8:
         case TYPE_C8:
             l = from->len;
+            if (!is_range && l == 0)
+                return take_null_vec(from->type, m);
             if (is_range) {
                 if (start < 0)
                     start = l + start;
@@ -463,6 +475,8 @@ obj_p ray_take(obj_p from, obj_p count) {
 
         case TYPE_I16:
             l = from->len;
+            if (!is_range && l == 0)
+                return take_null_vec(from->type, m);
             if (is_range) {
                 if (start < 0)
                     start = l + start;
@@ -492,6 +506,8 @@ obj_p ray_take(obj_p from, obj_p count) {
         case TYPE_DATE:
         case TYPE_TIME:
             l = from->len;
+            if (!is_range && l == 0)
+                return take_null_vec(from->type, m);
             if (is_range) {
                 if (start < 0)
                     start = l + start;
@@ -524,6 +540,8 @@ obj_p ray_take(obj_p from, obj_p count) {
         case TYPE_TIMESTAMP:
         case TYPE_F64:
             l = from->len;
+            if (!is_range && l == 0)
+                return take_null_vec(from->type, m);
             if (is_range) {
                 if (start < 0)
                     start = l + start;
@@ -554,6 +572,8 @@ obj_p ray_take(obj_p from, obj_p count) {
 
         case TYPE_GUID:
             l = from->len;
+            if (!is_range && l == 0)
+                return take_null_vec(from->type, m);
             if (is_range) {
                 if (start < 0)
                     start = l + start;
@@ -581,8 +601,15 @@ obj_p ray_take(obj_p from, obj_p count) {
 
         case TYPE_DICT:
             l = AS_LIST(from)[0]->len;
-            obj_p keys_res = vector(AS_LIST(from)[0]->type, 0);
-            obj_p vals_res = vector(AS_LIST(from)[1]->type, 0);
+            obj_p keys_res;
+            obj_p vals_res;
+            if (!is_range && l == 0) {
+                keys_res = take_null_vec(AS_LIST(from)[0]->type, m);
+                vals_res = take_null_vec(AS_LIST(from)[1]->type, m);
+                return dict(keys_res, vals_res);
+            }
+            keys_res = vector(AS_LIST(from)[0]->type, 0);
+            vals_res = vector(AS_LIST(from)[1]->type, 0);
             if (is_range) {
                 if (start < 0)
                     start = l + start;
@@ -609,6 +636,15 @@ obj_p ray_take(obj_p from, obj_p count) {
             s = ray_get(k);
             v = ENUM_VAL(from);
             l = v->len;
+            if (!is_range && l == 0) {
+                res = take_null_vec(v->type, m);
+                drop_obj(s);
+                if (s->type != TYPE_SYMBOL) {
+                    drop_obj(k);
+                    return res;
+                }
+                return enumerate(k, res);
+            }
             if (is_range) {
                 if (start < 0)
                     start = l + start;
@@ -640,6 +676,8 @@ obj_p ray_take(obj_p from, obj_p count) {
             s = MAPLIST_VAL(from);
             n = k->len;
             l = s->len;
+            if (!is_range && l == 0)
+                return take_null_vec(TYPE_LIST, m);
             if (is_range) {
                 if (start < 0)
                     start = l + start;
@@ -693,6 +731,8 @@ obj_p ray_take(obj_p from, obj_p count) {
 
         case TYPE_LIST:
             l = from->len;
+            if (!is_range && l == 0)
+                return take_null_vec(TYPE_LIST, m);
             if (is_range) {
                 if (start < 0)
                     start = l + start;

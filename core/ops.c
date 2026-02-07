@@ -23,7 +23,7 @@
 
 #include <time.h>
 #include "ops.h"
-#include "string.h"
+#include "str.h"
 #include "util.h"
 #include "heap.h"
 #include "error.h"

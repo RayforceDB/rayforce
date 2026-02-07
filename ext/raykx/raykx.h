@@ -26,6 +26,12 @@
 
 #include "../../core/rayforce.h"
 
+#ifdef _WIN32
+#define RAYKX_EXPORT __declspec(dllexport)
+#else
+#define RAYKX_EXPORT
+#endif
+
 // KDB+ IPC Protocol Constants
 #define KDB_MSG_ASYN 0
 #define KDB_MSG_SYNC 1
@@ -48,8 +54,9 @@ typedef struct raykx_header_t {
     u32_t size;
 } *raykx_header_p;
 
-obj_p raykx_hopen(obj_p addr);
-obj_p raykx_hclose(obj_p fd);
-obj_p raykx_send(obj_p fd, obj_p msg);
+RAYKX_EXPORT obj_p raykx_listen(obj_p x);
+RAYKX_EXPORT obj_p raykx_hopen(obj_p addr);
+RAYKX_EXPORT obj_p raykx_hclose(obj_p fd);
+RAYKX_EXPORT obj_p raykx_send(obj_p fd, obj_p msg);
 
 #endif  // RAYKX_H

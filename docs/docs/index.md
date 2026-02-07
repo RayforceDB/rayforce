@@ -7,55 +7,70 @@ hide:
 <div class="hero-section" markdown>
 <div class="hero-content" markdown>
 
-![RayforceDB](images/logo_dark_full.svg){ .hero-logo .light-only }
-![RayforceDB](images/logo_light_full.svg){ .hero-logo .dark-only }
+<div class="scroll-fade-in">
+<img src="images/logo_dark_full.svg" alt="RayforceDB" class="hero-logo light-only">
+<img src="images/logo_light_full.svg" alt="RayforceDB" class="hero-logo dark-only">
+</div>
 
-# Your data is about to get **faster**
+# Your data is **about to get faster** {.scroll-fade-in}
 
-The high-performance columnar database engineered for lightning-fast analytics and seamless data operations.
+<div class="hero-description scroll-fade-in">
+  RayforceDB is a high-performance columnar vector database written in pure C. Combines columnar storage with SIMD vectorization for lightning-fast analytics on time-series and big data workloads.
+</div>
 
-<div class="hero-socials" markdown>
+
+<div class="hero-buttons scroll-fade-in">
+<a href="content/get-started/overview.html" class="md-button md-button--primary">Get Started
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<line x1="5" y1="12" x2="19" y2="12"></line>
+<polyline points="12 5 19 12 12 19"></polyline>
+</svg>
+</a>
+<a href="https://wasm.rayforcedb.com/" class="md-button" target="_blank">Try It Now</a>
+</div>
+
+<div class="hero-socials scroll-fade-in" markdown>
 [:fontawesome-brands-github:](https://github.com/singaraiona/rayforce "GitHub")
 [:fontawesome-brands-x-twitter:](https://x.com/RayforceDB "X (Twitter)")
 [:fontawesome-brands-reddit:](https://www.reddit.com/r/rayforcedb/ "Reddit")
 [:simple-zulip:](https://rayforcedb.zulipchat.com/join/l33sichu4vp7nf77hgdul4om/ "Zulip Chat")
 </div>
 
-<div class="hero-buttons">
-<a href="https://wasm.rayforcedb.com/" class="md-button md-button--primary" target="_blank">Try it Now</a>
-<a href="content/get-started/overview.html" class="md-button">Get Started</a>
-<a href="https://github.com/singaraiona/rayforce" class="md-button">Get it on GitHub</a>
 </div>
 
+<div class="hero-ribbon">
+<div class="ribbon-particles"></div>
+<div class="ribbon-wave"></div>
+<div class="ribbon-track">
+<div class="ribbon-content">
+<span class="ribbon-item"><span class="ribbon-icon">&#9889;</span> Sub-ms Queries</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#9638;</span> Columnar Storage</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#128230;</span> Under 1MB</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#128295;</span> Zero Dependencies</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#9729;</span> Cloud Native</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#123;&#125;</span> In-Process</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#9654;</span> SIMD Vectorized</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#128274;</span> MIT License</span>
 </div>
-
-<div class="hero-ticker">
-<div class="hero-ticker__content">
-<span>⚡ Blazing Fast</span>
-<span>📊 Columnar Storage</span>
-<span>🔧 Zero Dependencies</span>
-<span>☁️ Cloud Native</span>
-<span>🧠 In-Process Embedding</span>
-<span>🚀 Sub-millisecond Queries</span>
-<span>💾 Under 1MB Binary</span>
-<span>🔓 MIT License</span>
-<span>⚡ Blazing Fast</span>
-<span>📊 Columnar Storage</span>
-<span>🔧 Zero Dependencies</span>
-<span>☁️ Cloud Native</span>
-<span>🧠 In-Process Embedding</span>
-<span>🚀 Sub-millisecond Queries</span>
-<span>💾 Under 1MB Binary</span>
-<span>🔓 MIT License</span>
+<div class="ribbon-content" aria-hidden="true">
+<span class="ribbon-item"><span class="ribbon-icon">&#9889;</span> Sub-ms Queries</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#9638;</span> Columnar Storage</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#128230;</span> Under 1MB</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#128295;</span> Zero Dependencies</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#9729;</span> Cloud Native</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#123;&#125;</span> In-Process</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#9654;</span> SIMD Vectorized</span>
+<span class="ribbon-item"><span class="ribbon-icon">&#128274;</span> MIT License</span>
+</div>
 </div>
 </div>
 </div>
 
 <div class="features-section" markdown>
 
-## Think fast. **Build faster.**
+## Think fast. **Build faster.** {.scroll-fade-in}
 
-<div class="grid cards" markdown>
+<div class="grid cards scroll-fade-in" markdown>
 
 - :material-lightning-bolt:{ .lg .middle .feature-icon } **Blazing Fast**
 
@@ -101,12 +116,12 @@ The high-performance columnar database engineered for lightning-fast analytics a
 
 <div class="code-demo-section">
 
-<div class="code-demo-header">
+<div class="code-demo-header scroll-fade-in">
 <h2>Expressive. <strong>Readable.</strong> Fast.</h2>
 <p>Rayfall combines the power of array programming with the clarity of Lisp syntax.</p>
 </div>
 
-<div class="code-tabs">
+<div class="code-tabs scroll-fade-in">
 <div class="code-tab-list">
 <button class="code-tab active" data-tab="select">Select</button>
 <button class="code-tab" data-tab="insert">Insert</button>
@@ -281,12 +296,84 @@ document.addEventListener('DOMContentLoaded', function() {
   });
 });
 </script>
+
+<style>
+/* Scroll fade-in animation styles */
+.scroll-fade-in {
+  opacity: 0;
+  transform: translateY(30px);
+  transition: opacity 0.8s ease-out, transform 0.8s ease-out;
+}
+
+.scroll-fade-in.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Logo container and ticker - visible by default, animate on load */
+.hero-content > .scroll-fade-in:first-child,
+.hero-ticker.scroll-fade-in {
+  opacity: 1 !important;
+  transform: translateY(0) !important;
+  transition-delay: 0s !important;
+}
+
+.hero-content > .scroll-fade-in:first-child img {
+  opacity: 1 !important;
+}
+
+/* Stagger delays for hero section elements */
+.hero-content > h1.scroll-fade-in,
+.hero-content > .hero-description.scroll-fade-in {
+  transition-delay: 0.2s;
+}
+
+.hero-content > .hero-buttons.scroll-fade-in {
+  transition-delay: 0.3s;
+}
+
+.hero-content > .hero-socials.scroll-fade-in {
+  transition-delay: 0.4s;
+}
+</style>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  // Intersection Observer for scroll animations
+  const observerOptions = {
+    threshold: 0.1,
+    rootMargin: '0px 0px -50px 0px'
+  };
+
+  const observer = new IntersectionObserver(function(entries) {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+        // Optional: unobserve after animation to improve performance
+        // observer.unobserve(entry.target);
+      }
+    });
+  }, observerOptions);
+
+  // Observe all elements with scroll-fade-in class except logo and ticker
+  document.querySelectorAll('.scroll-fade-in').forEach(el => {
+    // Skip the logo container and ticker - they're always visible
+    if (!el.matches('.hero-content > .scroll-fade-in:first-child') && 
+        !el.matches('.hero-ticker.scroll-fade-in')) {
+      observer.observe(el);
+    } else {
+      // Logo and ticker are always visible, mark them as visible
+      el.classList.add('visible');
+    }
+  });
+});
+</script>
 </div>
 
 
 <div id="ecosystem" class="features-section" markdown>
 
-## Integrate with your **Stack**
+## Integrate with your **Stack** {.scroll-fade-in}
 
 <div class="grid cards" markdown>
 
@@ -319,7 +406,7 @@ document.addEventListener('DOMContentLoaded', function() {
 </div>
 
 
-<div class="cta-section" markdown>
+<div class="cta-section scroll-fade-in" markdown>
 
 ## Get started in **minutes**
 

@@ -41,7 +41,7 @@
 #include "term.h"
 #include "../core/chrono.h"
 #include "../core/heap.h"
-#include "../core/string.h"
+#include "../core/str.h"
 #include "../core/error.h"
 #include "../core/ops.h"
 #include "../core/runtime.h"
@@ -64,37 +64,16 @@
 #define IS_ESC(t, e) ((t)->input_len == (i32_t)strlen(e) && strncmp((t)->input, e, strlen(e)) == 0)
 #define PROGRESS_BAR_WIDTH 40
 
-nil_t cursor_move_start() { printf("\r"); }
-
-nil_t cursor_move_left(i32_t i) {
-    if (i > 0)
-        printf("\033[%dD", i);
-}
-
-nil_t cursor_move_right(i32_t i) {
-    if (i > 0)
-        printf("\033[%dC", i);
-}
-
-nil_t cursor_move_up(i32_t i) {
-    if (i > 0)
-        printf("\033[%dA", i);
-}
-
-nil_t cursor_move_down(i32_t i) {
-    if (i > 0)
-        printf("\033[%dB", i);
-}
-
+nil_t cursor_move_start() { putchar('\r'); }
+nil_t cursor_move_left(i32_t n) { if (n > 0) printf("\033[%dD", n); }
+nil_t cursor_move_right(i32_t n) { if (n > 0) printf("\033[%dC", n); }
+nil_t cursor_move_up(i32_t n) { if (n > 0) printf("\033[%dA", n); }
+nil_t cursor_move_down(i32_t n) { if (n > 0) printf("\033[%dB", n); }
 nil_t line_clear() { printf("\r\033[K"); }
-
 nil_t line_clear_below() { printf("\033[J"); }
-
-nil_t line_new() { printf("\n"); }
-
-nil_t cursor_hide() { printf("\e[?25l"); }
-
-nil_t cursor_show() { printf("\e[?25h"); }
+nil_t line_new() { putchar('\n'); }
+nil_t cursor_hide() { printf("\033[?25l"); }
+nil_t cursor_show() { printf("\033[?25h"); }
 
 // Get terminal size
 nil_t term_get_size(term_p term) {
@@ -682,28 +661,19 @@ i64_t term_getc(term_p term) {
 
 #endif
 
-nil_t term_prompt(term_p term) {
+static nil_t term_show_prompt(term_p term, b8_t continuation) {
     obj_p prompt = NULL_OBJ;
-
-    prompt_fmt_into(&prompt);
+    continuation ? continuation_prompt_fmt_into(&prompt) : prompt_fmt_into(&prompt);
     term->prompt_len = term_visual_width(AS_C8(prompt), (i32_t)prompt->len);
     printf("%.*s", (i32_t)prompt->len, AS_C8(prompt));
     fflush(stdout);
     drop_obj(prompt);
-
-    // Refresh terminal size on each prompt (handles window resize)
-    term_get_size(term);
+    if (!continuation)
+        term_get_size(term);
 }
 
-nil_t term_continuation_prompt(term_p term) {
-    obj_p prompt = NULL_OBJ;
-
-    continuation_prompt_fmt_into(&prompt);
-    term->prompt_len = term_visual_width(AS_C8(prompt), (i32_t)prompt->len);
-    printf("%.*s", (i32_t)prompt->len, AS_C8(prompt));
-    fflush(stdout);
-    drop_obj(prompt);
-}
+nil_t term_prompt(term_p term) { term_show_prompt(term, B8_FALSE); }
+nil_t term_continuation_prompt(term_p term) { term_show_prompt(term, B8_TRUE); }
 
 i64_t term_redraw_into(term_p term, obj_p *dst) {
     i64_t i, j, l, n, c;
@@ -1370,8 +1340,9 @@ obj_p term_handle_return(term_p term) {
         term->multiline_len = total_len;
         term->multiline_buf[term->multiline_len] = '\0';
     } else {
-        // Buffer overflow - handle error and skip further processing
-        LOG_ERROR("Error: input too long for multiline buffer");
+        // Buffer overflow - reset and inform user
+        term->multiline_len = 0;
+        printf("\n%sError: input too long for multiline buffer%s\n", RED, RESET);
         return NULL_OBJ;
     }
 
@@ -1539,117 +1510,106 @@ obj_p term_handle_symbol(term_p term) {
     return NULL;
 }
 
-nil_t term_handle_ctrl_u(term_p term) {
-    // Move cursor to start of line
-    cursor_move_left(term->buf_pos);
-    // Clear the entire line
-    line_clear();
-    // Reset buffer position and length
-    term->buf_pos = 0;
-    term->buf_len = 0;
+static nil_t term_reset_line(term_p term, b8_t reset_multiline) {
+    if (reset_multiline) {
+        term->multiline_len = 0;
+        term->multiline_buf[0] = '\0';
+    }
+    term->buf_pos = term->buf_len = 0;
     term->buf[0] = '\0';
-    // Reset history state
     hist_reset_current(term->hist);
-    // Redraw the prompt
+}
+
+nil_t term_handle_ctrl_u(term_p term) {
+    cursor_move_left(term->buf_pos);
+    line_clear();
+    term_reset_line(term, B8_FALSE);
+    term_prompt(term);
+}
+
+nil_t term_handle_ctrl_c(term_p term) {
+    term_reset_line(term, B8_TRUE);
+    printf("^C\n");
     term_prompt(term);
 }
 
 obj_p term_read(term_p term) {
     obj_p res = NULL;
+    c8_t key;
 
 #if defined(OS_WINDOWS)
     mutex_lock(&term->lock);
 #endif
 
-    switch (term->input[0]) {
+    key = term->input[0];
+
+    switch (key) {
         case KEYCODE_RETURN:
             res = term_handle_return(term);
             autocp_reset_current(term);
-            term->input_len = 0;
-
-            // Reset input buffer regardless of result
-            term->buf_len = 0;
-            term->buf_pos = 0;
-
-            if (res != NULL && res != NULL_OBJ) {
-                // Got a complete expression to evaluate
-                term->multiline_len = 0;
-                line_new();
-            } else if (res == NULL) {
-                // Unbalanced expression - show continuation prompt
+            term->buf_len = term->buf_pos = 0;
+            if (res == NULL) {
                 line_new();
                 term_continuation_prompt(term);
             } else {
-                // Command processed (NULL_OBJ)
-                term->multiline_len = 0;
+                if (res != NULL_OBJ)
+                    term->multiline_len = 0;
                 line_new();
             }
-
             fflush(stdout);
             break;
         case KEYCODE_BACKSPACE:
         case KEYCODE_DELETE:
             autocp_reset_current(term);
             term_handle_backspace(term);
-            term->input_len = 0;
             break;
         case KEYCODE_TAB:
             term_handle_tab(term);
-            term->input_len = 0;
             break;
         case KEYCODE_CTRL_U:
-        case KEYCODE_CTRL_C:
             autocp_reset_current(term);
             term_handle_ctrl_u(term);
-            term->input_len = 0;
+            break;
+        case KEYCODE_CTRL_C:
+            autocp_reset_current(term);
+            term_handle_ctrl_c(term);
             break;
         case KEYCODE_CTRL_A:
             term_goto_position(term, term->buf_pos, 0);
-            fflush(stdout);
             term->buf_pos = 0;
-            term->input_len = 0;
+            fflush(stdout);
             break;
-
         case KEYCODE_CTRL_B:
             if (term->buf_pos) {
                 term_goto_position(term, term->buf_pos, term->buf_pos - 1);
                 term->buf_pos--;
                 fflush(stdout);
             }
-            term->input_len = 0;
             break;
-
         case KEYCODE_CTRL_D:
-            if (term->buf_pos == 0 && term->buf_len == 0) {
+            if (term->buf_pos == 0 && term->buf_len == 0)
                 poll_exit(runtime_get()->poll, 0);
-            } else {
+            else {
                 term_handle_delete_char(term);
                 term_redraw(term);
             }
-            term->input_len = 0;
             break;
-
         case KEYCODE_CTRL_E:
             term_goto_position(term, term->buf_pos, term->buf_len);
-            fflush(stdout);
             term->buf_pos = term->buf_len;
-            term->input_len = 0;
+            fflush(stdout);
             break;
-
         case KEYCODE_CTRL_F:
             if (term->buf_pos < term->buf_len) {
                 term_goto_position(term, term->buf_pos, term->buf_pos + 1);
                 term->buf_pos++;
                 fflush(stdout);
             }
-            term->input_len = 0;
             break;
-
         case KEYCODE_CTRL_K:
             while (term->buf_pos < term->buf_len)
                 term_handle_delete_char(term);
             term_redraw(term);
-            term->input_len = 0;
             break;
         case KEYCODE_CTRL_N:
             hist_save_current(term->hist, term->buf, term->buf_len);
@@ -1662,27 +1622,25 @@ obj_p term_read(term_p term) {
             if (term->buf_len < 0)
                 term->buf_len = term->buf_pos = 0;
             term_redraw(term);
-            term->input_len = 0;
             break;
         case KEYCODE_CTRL_W:
             autocp_reset_current(term);
             while (term->buf_pos > 0 && is_alphanum(term->buf[term->buf_pos - 1]))
                 term_handle_backspace(term);
-            term->input_len = 0;
             break;
         case KEYCODE_ESCAPE:
             res = term_handle_escape(term);
-            break;
+            goto done;
         default:
             autocp_reset_current(term);
             res = term_handle_symbol(term);
-            term->input_len = 0;
             break;
     }
+    term->input_len = 0;
 
+done:
 #if defined(OS_WINDOWS)
     mutex_unlock(&term->lock);
 #endif
-
     return res;
 }

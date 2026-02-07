@@ -23,9 +23,10 @@
 
 #include "serde.h"
 #include "symbols.h"
-#include "string.h"
+#include "str.h"
 #include "lambda.h"
 #include "env.h"
+#include "eval.h"
 #include "error.h"
 
 i64_t size_of_type(i8_t type) {
@@ -152,11 +153,8 @@ i64_t size_obj(obj_p obj) {
         case TYPE_NULL:
             return ISIZEOF(i8_t);
         case TYPE_ERR: {
-            // code (1 byte) + context (8 bytes) + optional message for EC_USER
-            i64_t err_size = ISIZEOF(i8_t) + 1 + 8;
-            if (err_code(obj) == EC_USER)
-                err_size += strlen(err_msg(obj)) + 1;
-            return err_size;
+            // type (1 byte) + err_t struct
+            return ISIZEOF(i8_t) + ISIZEOF(err_t);
         }
         default:
             return 0;
@@ -317,19 +315,9 @@ i64_t ser_raw(u8_t *buf, obj_p obj) {
             c = str_cpy((str_p)buf, env_get_internal_name(obj));
             return ISIZEOF(i8_t) + c + 1;
         case TYPE_ERR: {
-            // Serialize: code (1 byte) + context (8 bytes) + optional message
-            err_code_t code = err_code(obj);
-            buf[0] = (u8_t)code;
-            c = 1;
-            memcpy(buf + c, &obj->i64, 8);  // Copy context directly
-            c += 8;
-            if (code == EC_USER) {
-                lit_p m = err_msg(obj);
-                i64_t msg_len = strlen(m);
-                memcpy(buf + c, m, msg_len + 1);
-                c += msg_len + 1;
-            }
-            return ISIZEOF(i8_t) + c;
+            // Serialize: full err_t from VM
+            memcpy(buf, &VM->err, ISIZEOF(err_t));
+            return ISIZEOF(i8_t) + ISIZEOF(err_t);
         }
         default:
             return 0;
@@ -342,7 +330,7 @@ obj_p ser_obj(obj_p obj) {
     ipc_header_t *header;
 
     if (size == 0)
-        return err_type(0, 0, 0, 0);
+        return err_domain(1, 0);
 
     buf = vector(TYPE_U8, ISIZEOF(struct ipc_header_t) + size);
     header = (ipc_header_t *)AS_U8(buf);
@@ -356,7 +344,7 @@ obj_p ser_obj(obj_p obj) {
 
     if (ser_raw(AS_U8(buf) + ISIZEOF(struct ipc_header_t), obj) == 0) {
         drop_obj(buf);
-        return err_type(0, 0, 0, 0);
+        return err_domain(1, 0);
     }
 
     return buf;
@@ -648,33 +636,17 @@ obj_p de_raw(u8_t *buf, i64_t *len) {
             return k;
 
         case TYPE_ERR: {
-            // Deserialize: code (1 byte) + context (8 bytes) + optional message
-            if (*len < 9)
+            // Deserialize: restore full err_t into VM
+            if (*len < ISIZEOF(err_t))
                 return err_domain(0, 0);
-            err_code_t code = (err_code_t)buf[0];
-            buf++;
-            (*len)--;
-            i64_t ctx_val;
-            memcpy(&ctx_val, buf, 8);
-            buf += 8;
-            (*len) -= 8;
-            
-            if (code == EC_USER) {
-                lit_p msg = (lit_p)buf;
-                i64_t msg_len = strlen(msg);
-                buf += msg_len + 1;
-                (*len) -= msg_len + 1;
-                return err_user(msg);
-            }
-            
-            // Reconstruct error with context
-            obj_p err = err_raw(code);
-            err->i64 = ctx_val;
-            return err;
+            memcpy(&VM->err, buf, ISIZEOF(err_t));
+            buf += ISIZEOF(err_t);
+            (*len) -= ISIZEOF(err_t);
+            return ERR_OBJ;
         }
 
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, type, 0, 0);
     }
 }
 
@@ -697,7 +669,7 @@ obj_p de_obj(obj_p obj) {
         return err_domain(0, 0);
 
     if (header->version > RAYFORCE_VERSION)
-        return err_type(0, 0, 0, 0);
+        return err_domain(0, 0);
 
     // Check for reasonable size values
     if (header->size > 1000000000)  // 1GB max size

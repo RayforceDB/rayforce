@@ -29,11 +29,67 @@
 #include "mmap.h"
 #include "fs.h"
 #include "util.h"
-#include "string.h"
+#include "str.h"
 #include "os.h"
 #include "log.h"
 #include "eval.h"
 #include "error.h"
+
+// Global heap ID bitmap (u16 range)
+#define HEAP_ID_WORDS 1024  // 1024 * 64 = 65536 IDs
+#define HEAP_ID_BITS (HEAP_ID_WORDS * 64ull)
+static u64_t __heap_id_bitmap[HEAP_ID_WORDS];
+static u64_t __heap_id_cursor = 0;
+
+static i64_t heap_id_acquire(nil_t) {
+    u64_t start = __atomic_fetch_add(&__heap_id_cursor, 1, __ATOMIC_RELAXED);
+    for (u64_t off = 0; off < HEAP_ID_WORDS; off++) {
+        u64_t idx = (start + off) % HEAP_ID_WORDS;
+        u64_t word = __atomic_load_n(&__heap_id_bitmap[idx], __ATOMIC_RELAXED);
+        if (~word == 0ull)
+            continue;
+
+        for (;;) {
+            u64_t free_bits = ~word;
+            if (free_bits == 0ull)
+                break;
+
+            u64_t bit = (u64_t)__builtin_ctzll(free_bits);
+            u64_t mask = 1ull << bit;
+            u64_t new_word = word | mask;
+
+            if (__atomic_compare_exchange_n(&__heap_id_bitmap[idx], &word, new_word, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                return (i64_t)(idx * 64ull + bit);
+            }
+
+            if (~word == 0ull)
+                break;
+        }
+    }
+
+    return -1;
+}
+
+static nil_t heap_id_release(i64_t id) {
+    if (id < 0 || id >= (i64_t)HEAP_ID_BITS)
+        return;
+
+    u64_t idx = (u64_t)id >> 6;
+    u64_t bit = (u64_t)id & 63ull;
+    u64_t mask = ~(1ull << bit);
+    __atomic_fetch_and(&__heap_id_bitmap[idx], mask, __ATOMIC_RELEASE);
+}
+
+// Pending merge queue head (lock-free LIFO)
+heap_p __heap_pending_merge = NULL;
+
+i64_t heap_next_id(nil_t) {
+    i64_t id = heap_id_acquire();
+    if (UNLIKELY(id < 0))
+        PANIC("heap id pool exhausted");
+    return id;
+}
 
 // Slab cache helpers
 #define SLAB_ORDER_MIN MIN_BLOCK_ORDER
@@ -103,7 +159,7 @@ heap_p heap_get(nil_t) {
 
 #ifdef SYS_MALLOC
 
-static nil_t heap_flush_slabs(heap_p heap) { UNUSED(heap); }  // No-op for system malloc
+nil_t heap_flush_slabs(heap_p heap) { UNUSED(heap); }  // No-op for system malloc
 
 raw_p heap_alloc(i64_t size) { return malloc(size); }
 raw_p heap_mmap(i64_t size) { return mmap_alloc(size); }
@@ -117,6 +173,9 @@ nil_t heap_unmap(raw_p ptr, i64_t size) { mmap_free(ptr, size); }
 i64_t heap_gc(nil_t) { return 0; }
 nil_t heap_borrow(heap_p heap) { UNUSED(heap); }
 nil_t heap_merge(heap_p heap) { UNUSED(heap); }
+nil_t heap_flush_foreign(heap_p heap) { UNUSED(heap); }
+nil_t heap_push_pending(heap_p heap) { UNUSED(heap); }
+nil_t heap_drain_pending(nil_t) {}
 memstat_t heap_memstat(nil_t) { return (memstat_t){0}; }
 
 #else
@@ -223,7 +282,7 @@ inline __attribute__((always_inline)) nil_t heap_split_block(heap_p heap, block_
 }
 
 // Flush slab caches back to freelists for coalescing
-static nil_t heap_flush_slabs(heap_p heap) {
+nil_t heap_flush_slabs(heap_p heap) {
     i64_t i;
     block_p block;
 
@@ -291,6 +350,14 @@ raw_p __attribute__((hot)) heap_alloc(i64_t size) {
     // no free block found for this size, so mmap it directly if it is bigger than pool size or
     // add a new pool and split as well
     if (UNLIKELY(i == 0)) {
+        // Try reclaiming memory from pending heaps and foreign blocks before mmap
+        heap_drain_pending();
+        heap_flush_foreign(heap);
+        i = (AVAIL_MASK << order) & heap->avail;
+
+        if (i != 0)
+            goto found;
+
         if (order >= MAX_BLOCK_ORDER) {
             LOG_TRACE("Adding pool of size %lld requested size %lld", BSIZEOF(order), size);
             size = BSIZEOF(order);
@@ -315,8 +382,10 @@ raw_p __attribute__((hot)) heap_alloc(i64_t size) {
 
         i = MAX_BLOCK_ORDER;
         heap_insert_block(heap, block, i);
-    } else
+    } else {
+found:
         i = __builtin_ctzll(i);
+    }
 
     // remove the block out of list
     block = heap->freelist[i];
@@ -377,7 +446,7 @@ __attribute__((hot)) nil_t heap_free(raw_p ptr) {
 
     // Fast path: push to slab cache for small blocks (same heap only)
     if (heap != NULL && order >= MIN_BLOCK_ORDER && IS_SLAB_ORDER(order) &&
-        (heap->id == 0 || block->heap_id == heap->id)) {
+        (block->heap_id == heap->id)) {
         i64_t idx = SLAB_INDEX(order);
         if (heap->slabs[idx].count < SLAB_CACHE_SIZE) {
             heap->slabs[idx].stack[heap->slabs[idx].count++] = block;
@@ -385,7 +454,7 @@ __attribute__((hot)) nil_t heap_free(raw_p ptr) {
         }
     }
 
-    if (UNLIKELY(heap->id != 0 && block->heap_id != heap->id)) {
+    if (UNLIKELY(block->heap_id != heap->id)) {
         block->next = heap->foreign_blocks;
         heap->foreign_blocks = block;
         return;
@@ -430,7 +499,7 @@ __attribute__((hot)) raw_p heap_realloc(raw_p ptr, i64_t new_size) {
         return ptr;
 
     // grow or block is not in the same heap
-    if (order > block->order || (heap->id != 0 && block->heap_id != heap->id) || block->backed) {
+    if (order > block->order || (block->heap_id != heap->id) || block->backed) {
         new_ptr = heap_alloc(new_size);
 
         if (new_ptr == NULL) {
@@ -462,6 +531,12 @@ i64_t heap_gc(nil_t) {
     i64_t i, size, total = 0;
     block_p block, next;
     heap_p h = VM->heap;  // Cache heap pointer
+
+    // Drain pending heaps from destroyed custom threads
+    heap_drain_pending();
+
+    // Flush foreign blocks into own freelist
+    heap_flush_foreign(h);
 
     // Flush slab caches to allow coalescing
     heap_flush_slabs(h);
@@ -615,15 +690,50 @@ nil_t heap_print_blocks(heap_p heap) {
     }
 }
 
+nil_t heap_flush_foreign(heap_p heap) {
+    block_p block, next;
+
+    block = heap->foreign_blocks;
+    while (block != NULL) {
+        next = block->next;
+        block->heap_id = heap->id;
+        heap_insert_block(heap, block, block->order);
+        block = next;
+    }
+    heap->foreign_blocks = NULL;
+}
+
+nil_t heap_push_pending(heap_p heap) {
+    heap->pending_next = __atomic_load_n(&__heap_pending_merge, __ATOMIC_RELAXED);
+    while (!__atomic_compare_exchange_n(&__heap_pending_merge, &heap->pending_next, heap,
+                                        1, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+        ;
+}
+
+nil_t heap_drain_pending(nil_t) {
+    heap_p pending, next;
+
+    pending = __atomic_exchange_n(&__heap_pending_merge, NULL, __ATOMIC_ACQUIRE);
+    while (pending) {
+        next = pending->pending_next;
+        heap_merge(pending);
+        heap_destroy(pending);
+        pending = next;
+    }
+}
+
 #endif
 
 // heap_destroy defined after #ifdef blocks to use heap_flush_slabs
 nil_t heap_destroy(heap_p heap) {
     i64_t i;
     block_p block, next;
+    i64_t heap_id;
 
     if (heap == NULL)
         return;
+
+    heap_id = heap->id;
 
     LOG_INFO("Destroying heap");
 
@@ -652,6 +762,8 @@ nil_t heap_destroy(heap_p heap) {
 
     // munmap heap
     mmap_free(heap, sizeof(struct heap_t));
+
+    heap_id_release(heap_id);
 
     LOG_DEBUG("Heap destroyed successfully");
 }

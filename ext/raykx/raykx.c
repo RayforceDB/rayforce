@@ -23,19 +23,331 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include "../../core/def.h"
 #include "../../core/rayforce.h"
 #include "../../core/poll.h"
 #include "../../core/sock.h"
 #include "../../core/error.h"
 #include "../../core/log.h"
-#include "../../core/string.h"
+#include "../../core/str.h"
 #include "../../core/runtime.h"
+#include "../../core/vary.h"
 #include "raykx.h"
 #include "serde.h"
+
+// ============================================================================
+// Windows Implementation - Uses blocking sockets for simplicity
+// ============================================================================
+#if defined(OS_WINDOWS)
+
+// Connection context for Windows
+typedef struct raykx_conn_t {
+    i64_t fd;           // socket file descriptor
+    obj_p name;         // connection name
+    u8_t msgtype;       // last message type
+    u8_t compressed;    // compression flag
+} *raykx_conn_p;
+
+// Simple connection storage (up to 256 connections)
+#define MAX_CONNECTIONS 256
+static raykx_conn_p connections[MAX_CONNECTIONS] = {0};
+
+static i64_t find_free_slot(void) {
+    for (i64_t i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connections[i] == NULL)
+            return i;
+    }
+    return -1;
+}
+
+static option_t raykx_decompress(const u8_t* compressed, i64_t compressed_size, u8_t** decompressed,
+                                 i64_t* decompressed_size) {
+    if (compressed_size < (i64_t)sizeof(u32_t))
+        return option_error(err_os());
+
+    i64_t i = 0;
+    i64_t n = 0;
+    i64_t f = 0;
+    i64_t s = 0;
+    i64_t p = 0;
+    i64_t d = 4;  // Skip the header size
+
+    const u32_t* header_size = (const u32_t*)compressed;
+    i64_t len = (i64_t)(*header_size - sizeof(struct raykx_header_t));
+
+    if (len == 0)
+        return option_error(err_os());
+
+    u32_t buffer[256] = {0};
+    u8_t* result = (u8_t*)heap_alloc(len);
+    if (result == NULL)
+        return option_error(err_limit(0));
+
+    while (s < len) {
+        if (i == 0) {
+            f = compressed[d];
+            d++;
+            i = 1;
+        }
+        if (f & i) {
+            i64_t r = buffer[compressed[d]];
+            d++;
+            result[s] = result[r];
+            s++;
+            r++;
+            result[s] = result[r];
+            s++;
+            r++;
+            n = compressed[d];
+            d++;
+            for (i64_t m = 0; m < n; m++) {
+                result[s + m] = result[r + m];
+            }
+        } else {
+            result[s] = compressed[d];
+            s++;
+            d++;
+        }
+        while (p < s - 1) {
+            i64_t pp = p;
+            p++;
+            buffer[result[pp] ^ result[p]] = pp;
+        }
+        if (f & i) {
+            s += n;
+            p = s;
+        }
+        i *= 2;
+        if (i == 256) {
+            i = 0;
+        }
+    }
+
+    *decompressed = result;
+    *decompressed_size = len;
+    return option_none();
+}
+
+// Blocking receive helper
+static i64_t recv_all(i64_t fd, u8_t *buf, i64_t size) {
+    i64_t total = 0;
+    while (total < size) {
+        i64_t n = recv((SOCKET)fd, (char*)(buf + total), (int)(size - total), 0);
+        if (n <= 0) {
+            if (n == 0) return -1;  // connection closed
+            i32_t err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS) {
+                Sleep(1);  // Small delay for non-blocking
+                continue;
+            }
+            return -1;
+        }
+        total += n;
+    }
+    return total;
+}
+
+// Blocking send helper
+static i64_t send_all(i64_t fd, u8_t *buf, i64_t size) {
+    i64_t total = 0;
+    while (total < size) {
+        i64_t n = send((SOCKET)fd, (const char*)(buf + total), (int)(size - total), 0);
+        if (n <= 0) {
+            if (n == 0) return -1;
+            i32_t err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS) {
+                Sleep(1);
+                continue;
+            }
+            return -1;
+        }
+        total += n;
+    }
+    return total;
+}
+
+obj_p raykx_listen(obj_p x) {
+    UNUSED(x);
+    // Server mode not yet supported on Windows
+    LOG_ERROR("raykx_listen not supported on Windows");
+    return err_os();
+}
+
+obj_p raykx_hopen(obj_p addr) {
+    i64_t fd, slot;
+    raykx_conn_p conn;
+    u8_t handshake[2] = {0x03, 0x00};  // KDB+ handshake
+    sock_addr_t sock_addr;
+
+    LOG_DEBUG("Opening KDB+ connection to %.*s", (i32_t)addr->len, AS_C8(addr));
+
+    // Find a free slot
+    slot = find_free_slot();
+    if (slot == -1) {
+        LOG_ERROR("No free connection slots");
+        return err_limit(0);
+    }
+
+    // Parse address string into sock_addr_t
+    if (sock_addr_from_str(AS_C8(addr), addr->len, &sock_addr) == -1) {
+        return err_os();
+    }
+
+    // Open socket connection (blocking)
+    fd = sock_open(&sock_addr, 5000);
+    LOG_DEBUG("Connection opened on fd %lld", fd);
+
+    if (fd == -1)
+        return err_os();
+
+    // Send handshake
+    if (send_all(fd, handshake, 2) == -1) {
+        sock_close(fd);
+        return err_os();
+    }
+
+    // Receive handshake response
+    if (recv_all(fd, handshake, 1) == -1) {
+        sock_close(fd);
+        return err_os();
+    }
+
+    LOG_DEBUG("Handshake response: %d", handshake[0]);
+
+    // Create connection context
+    conn = (raykx_conn_p)heap_alloc(sizeof(struct raykx_conn_t));
+    conn->fd = fd;
+    conn->name = string_from_str("raykx", 6);
+    conn->msgtype = KDB_MSG_SYNC;
+    conn->compressed = 0;
+
+    connections[slot] = conn;
+
+    return i64(slot);
+}
+
+obj_p raykx_hclose(obj_p handle) {
+    i64_t slot;
+    raykx_conn_p conn;
+
+    if (handle->type != -TYPE_I64)
+        return err_type(-TYPE_I64, handle->type, 0, 0);
+
+    slot = handle->i64;
+    if (slot < 0 || slot >= MAX_CONNECTIONS || connections[slot] == NULL) {
+        return err_domain(0, 0);
+    }
+
+    conn = connections[slot];
+    sock_close(conn->fd);
+    drop_obj(conn->name);
+    heap_free(conn);
+    connections[slot] = NULL;
+
+    return null(0);
+}
+
+obj_p raykx_send(obj_p handle, obj_p msg) {
+    i64_t slot, size;
+    raykx_conn_p conn;
+    u8_t *buf;
+    struct raykx_header_t header;
+    obj_p res;
+
+    if (handle->type != -TYPE_I64)
+        return err_type(-TYPE_I64, handle->type, 0, 0);
+
+    slot = handle->i64;
+    if (slot < 0 || slot >= MAX_CONNECTIONS || connections[slot] == NULL) {
+        return err_domain(0, 0);
+    }
+
+    conn = connections[slot];
+
+    LOG_DEBUG("Starting KDB+ send on slot %lld", slot);
+
+    // Serialize message
+    size = raykx_size_obj(msg);
+    LOG_TRACE("Serialized message size: %lld", size);
+
+    // Allocate buffer for header + message
+    buf = (u8_t*)heap_alloc(sizeof(struct raykx_header_t) + size);
+    if (buf == NULL) {
+        return err_limit(0);
+    }
+
+    // Serialize the message after header
+    size = raykx_ser_obj(buf + sizeof(struct raykx_header_t), msg);
+    if (size < 0) {
+        heap_free(buf);
+        return err_os();
+    }
+
+    // Set up header
+    header.endianness = 1;
+    header.msgtype = KDB_MSG_SYNC;
+    header.compressed = 0;
+    header.reserved = 0;
+    header.size = (u32_t)(size + sizeof(struct raykx_header_t));
+
+    memcpy(buf, &header, sizeof(struct raykx_header_t));
+
+    LOG_TRACE("Sending message: size=%u", header.size);
+
+    // Send message
+    if (send_all(conn->fd, buf, header.size) == -1) {
+        heap_free(buf);
+        return err_os();
+    }
+    heap_free(buf);
+
+    // Receive response header
+    if (recv_all(conn->fd, (u8_t*)&header, sizeof(struct raykx_header_t)) == -1) {
+        return err_os();
+    }
+
+    LOG_TRACE("Response header: size=%u, msgtype=%d, compressed=%d",
+              header.size, header.msgtype, header.compressed);
+
+    conn->msgtype = header.msgtype;
+    conn->compressed = header.compressed;
+
+    // Receive response body
+    size = header.size - sizeof(struct raykx_header_t);
+    buf = (u8_t*)heap_alloc(size);
+    if (buf == NULL) {
+        return err_limit(0);
+    }
+
+    if (recv_all(conn->fd, buf, size) == -1) {
+        heap_free(buf);
+        return err_os();
+    }
+
+    // Deserialize response
+    if (conn->compressed) {
+        u8_t* decompressed;
+        i64_t decompressed_size;
+        option_t decomp_result = raykx_decompress(buf, size, &decompressed, &decompressed_size);
+        if (option_is_error(&decomp_result)) {
+            heap_free(buf);
+            return option_take(&decomp_result);
+        }
+        res = raykx_des_obj(decompressed, &decompressed_size);
+        heap_free(decompressed);
+    } else {
+        res = raykx_des_obj(buf, &size);
+    }
+
+    heap_free(buf);
+
+    LOG_DEBUG("KDB+ send completed");
+
+    return res;
+}
+
+#else
+// Non-Windows implementation using poll callbacks
 
 // Forward declarations
 static option_t raykx_read_handshake(poll_p poll, selector_p selector);
@@ -182,6 +494,7 @@ obj_p raykx_hopen(obj_p addr) {
     registry.read_fn = raykx_read_header;
     registry.close_fn = raykx_on_close;
     registry.error_fn = raykx_on_error;
+    registry.data_fn = raykx_on_data;
     registry.data = ctx;
 
     LOG_DEBUG("Registering connection in poll registry");
@@ -418,6 +731,23 @@ obj_p raykx_process_msg(poll_p poll, selector_p selector, obj_p msg) {
         LOG_TRACE("Evaluating string message: %.*s", (i32_t)msg->len, AS_C8(msg));
         res = ray_eval_str(msg, ctx->name);
         drop_obj(msg);
+    } else if (msg->type == TYPE_LIST && msg->len > 0) {
+        // KDB+ apply semantics: resolve car, apply to rest as values
+        obj_p *elems = AS_LIST(msg);
+        i64_t n = msg->len;
+        obj_p args[n];
+        args[0] = eval(elems[0]);
+        if (IS_ERR(args[0])) {
+            drop_obj(msg);
+            return args[0];
+        }
+        for (i64_t i = 1; i < n; i++)
+            args[i] = clone_obj(elems[i]);
+        res = ray_apply(args, n);
+        drop_obj(args[0]);
+        for (i64_t i = 1; i < n; i++)
+            drop_obj(args[i]);
+        drop_obj(msg);
     } else {
         LOG_TRACE("Evaluating object message");
         res = eval_obj(msg);
@@ -440,7 +770,9 @@ option_t raykx_on_data(poll_p poll, selector_p selector, raw_p data) {
     ctx = (raykx_ctx_p)selector->data;
     res = (obj_p)data;
 
+    poll_set_usr_fd(selector->id);
     v = raykx_process_msg(poll, selector, res);
+    poll_set_usr_fd(0);
 
     // Send a response if the message is a synchronous request
     if (ctx->msgtype == KDB_MSG_SYNC)
@@ -551,3 +883,5 @@ obj_p raykx_send(obj_p fd, obj_p msg) {
 
     return res;
 }
+
+#endif  // OS_WINDOWS

@@ -34,7 +34,7 @@
 #include "date.h"
 #include "time.h"
 #include "timestamp.h"
-#include "string.h"
+#include "str.h"
 #include "unary.h"
 #include "binary.h"
 #include "compose.h"

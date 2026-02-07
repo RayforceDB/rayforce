@@ -28,7 +28,7 @@
 #include <io.h>  // for _get_osfhandle
 #endif
 #include "fs.h"
-#include "string.h"
+#include "str.h"
 #include "ops.h"  // for NULL_OBJ
 #include "error.h"
 

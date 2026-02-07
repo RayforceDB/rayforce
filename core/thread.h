@@ -78,11 +78,4 @@ nil_t thread_exit(raw_p res);
 ray_thread_t thread_self();
 i32_t thread_pin(ray_thread_t thread, i64_t core);
 
-// Lightweight event signaling (eventfd on Linux, fallback to pipe elsewhere)
-i32_t event_create(void);
-nil_t event_destroy(i32_t fd);
-i32_t event_signal(i32_t fd);
-i32_t event_wait(i32_t fd);
-i32_t event_clear(i32_t fd);
-
 #endif  // THREAD_H

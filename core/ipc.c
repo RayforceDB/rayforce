@@ -23,9 +23,10 @@
 
 #include "ipc.h"
 #include "eval.h"
+#include "vary.h"
 #include "symbols.h"
 #include "poll.h"
-#include "string.h"
+#include "str.h"
 #include "util.h"
 #include "log.h"
 #include "heap.h"
@@ -95,7 +96,7 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     sock_set_nonblocking(fd, B8_TRUE);
 
     // Register the socket with IOCP - pass the received version
-    id = poll_register(poll, fd, buf[0]);
+    id = poll_register_fd(poll, fd, buf[0]);
     if (id == -1) {
         LOG_DEBUG("ipc_open: poll_register failed");
         sock_close(fd);
@@ -228,7 +229,8 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     selector_p selector;
     struct poll_registry_t registry = ZERO_INIT_STRUCT;
     ipc_ctx_p ctx;
-    u8_t buf[2] = {RAYFORCE_VERSION, 0x00};
+    u8_t handshake[258]; // max creds (255) + null + version
+    i64_t handshake_len;
 
     LOG_DEBUG("Opening connection to %s:%lld", addr->ip, addr->port);
 
@@ -238,10 +240,25 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     if (fd == -1)
         return -1;
 
-    if (sock_send(fd, buf, 2) == -1)
+    // Build handshake: [version][creds\0] or [version\0] if no creds
+    // Server reads until \0, then responds with version
+    if (addr->creds_len > 0) {
+        handshake[0] = RAYFORCE_VERSION;
+        memcpy(&handshake[1], addr->creds, addr->creds_len);
+        handshake[1 + addr->creds_len] = '\0';
+        handshake_len = 2 + addr->creds_len;
+        LOG_DEBUG("Sending handshake with credentials (len=%lld)", addr->creds_len);
+    } else {
+        handshake[0] = RAYFORCE_VERSION;
+        handshake[1] = '\0';
+        handshake_len = 2;
+        LOG_DEBUG("Sending handshake without credentials");
+    }
+
+    if (sock_send(fd, handshake, handshake_len) == -1)
         return -1;
 
-    if (sock_recv(fd, buf, 1) == -1)
+    if (sock_recv(fd, handshake, 1) == -1)
         return -1;
 
     LOG_TRACE("Setting socket to non-blocking mode");
@@ -257,6 +274,7 @@ i64_t ipc_open(poll_p poll, sock_addr_t *addr, i64_t timeout) {
     registry.recv_fn = sock_recv;
     registry.send_fn = sock_send;
     registry.read_fn = ipc_read_header;
+    registry.data_fn = ipc_on_data;
     registry.close_fn = ipc_on_close;
     registry.error_fn = ipc_on_error;
     registry.data = ctx;
@@ -382,6 +400,23 @@ obj_p ipc_process_msg(poll_p poll, selector_p selector, obj_p msg) {
     else if (msg->type == TYPE_C8) {
         LOG_TRACE("Evaluating string message: %.*s", (i32_t)msg->len, AS_C8(msg));
         res = ray_eval_str(msg, ctx->name);
+        drop_obj(msg);
+    } else if (msg->type == TYPE_LIST && msg->len > 0) {
+        // IPC apply semantics (like kdb+): resolve car, apply to rest as values
+        obj_p *elems = AS_LIST(msg);
+        i64_t n = msg->len;
+        obj_p args[n];
+        args[0] = eval(elems[0]);
+        if (IS_ERR(args[0])) {
+            drop_obj(msg);
+            return args[0];
+        }
+        for (i64_t i = 1; i < n; i++)
+            args[i] = clone_obj(elems[i]);
+        res = ray_apply(args, n);
+        drop_obj(args[0]);
+        for (i64_t i = 1; i < n; i++)
+            drop_obj(args[i]);
         drop_obj(msg);
     } else {
         LOG_TRACE("Evaluating object message");

@@ -29,7 +29,7 @@
 #include "lambda.h"
 #include "error.h"
 #include "filter.h"
-#include "string.h"
+#include "str.h"
 #include "aggr.h"
 #include "cc.h"
 #include "env.h"
@@ -578,6 +578,15 @@ OP_CALLD:
             push(r);
             break;
         case TYPE_LAMBDA:
+            if (UNLIKELY(n != AS_LAMBDA(x)->args->len)) {
+                i64_t expected = AS_LAMBDA(x)->args->len;
+                for (i64_t i = 0; i < n; ++i)
+                    drop_obj(pop());
+                drop_obj(x);
+                r = err_arity(expected, n, 0);
+                bc_error_add_loc(r, vm->fn, ip - 1);
+                return vm_error_unwind(vm, r);
+            }
             goto callf;
         default: {
             i8_t got = x->type;
@@ -686,15 +695,19 @@ obj_p call(obj_p fn, i64_t arity) {
     vm->rs[vm->rp].fn = saved_fn;
     vm->rs[vm->rp].fp = saved_fp;
     vm->rs[vm->rp].ip = -1;  // External call marker
+    i64_t saved_rp = vm->rp;
     vm->rp++;
 
     // Execute bytecode
     res = vm_eval(fn);
 
     // Pop frame and restore context
-    vm->rp--;
-    vm->fn = saved_fn;
-    vm->fp = saved_fp;
+    // Only pop if vm_error_unwind hasn't already unwound past our frame
+    if (vm->rp > saved_rp) {
+        vm->rp--;
+        vm->fn = saved_fn;
+        vm->fp = saved_fp;
+    }
 
     return res;
 }
@@ -783,8 +796,12 @@ static obj_p eval_vary(obj_p fn, obj_p *args, i64_t len, i64_t id) {
 
     for (i = 0; i < len; i++) {
         x = eval_arg(args[i], is_aggr);
-        if (IS_ERR(x))
+        if (IS_ERR(x)) {
+            // Clean up already-pushed args before returning error
+            while (i-- > 0)
+                drop_obj(vm_stack_pop());
             return x;
+        }
         vm_stack_push(x);
     }
 
@@ -810,12 +827,18 @@ static obj_p eval_lambda(obj_p fn, obj_p *args, i64_t len, i64_t id) {
 
     for (i = 0; i < len; i++) {
         x = eval(args[i]);
-        if (IS_ERR(x))
+        if (IS_ERR(x)) {
+            while (i-- > 0)
+                drop_obj(vm_stack_pop());
             return x;
+        }
         // Materialize lazy values (MAPGROUP/MAPFILTER) for lambda arguments
         x = collect_lazy(x);
-        if (IS_ERR(x))
+        if (IS_ERR(x)) {
+            while (i-- > 0)
+                drop_obj(vm_stack_pop());
             return x;
+        }
         vm_stack_push(x);
     }
 
@@ -838,8 +861,9 @@ static inline obj_p eval_sym(obj_p sym) {
 
 // Evaluate list (function call)
 static obj_p eval_list(obj_p obj) {
-    obj_p car, *val, *args;
+    obj_p car, *val, *args, res;
     i64_t len, id;
+    b8_t drop_car = B8_FALSE;
 
     if (obj->len == 0)
         return NULL_OBJ;
@@ -850,32 +874,57 @@ static obj_p eval_list(obj_p obj) {
     args++;
     id = (i64_t)obj;
 
+    if (car->type == TYPE_LIST) {
+        car = eval(car);
+        if (IS_ERR(car))
+            return car;
+        drop_car = B8_TRUE;
+    }
+
 dispatch:
     switch (car->type) {
         case TYPE_UNARY:
             if (len != 1)
                 return unwrap(err_arity(1, len, 0), id);
-            return eval_unary(car, args, id);
+            res = eval_unary(car, args, id);
+            if (drop_car)
+                drop_obj(car);
+            return res;
 
         case TYPE_BINARY:
             if (len != 2)
                 return unwrap(err_arity(2, len, 0), id);
-            return eval_binary(car, args, id);
+            res = eval_binary(car, args, id);
+            if (drop_car)
+                drop_obj(car);
+            return res;
 
         case TYPE_VARY:
-            return eval_vary(car, args, len, id);
+            res = eval_vary(car, args, len, id);
+            if (drop_car)
+                drop_obj(car);
+            return res;
 
         case TYPE_LAMBDA:
-            return eval_lambda(car, args, len, id);
+            res = eval_lambda(car, args, len, id);
+            if (drop_car)
+                drop_obj(car);
+            return res;
 
         case -TYPE_SYMBOL:
             val = resolve(car->i64);
+            if (drop_car) {
+                drop_obj(car);
+                drop_car = B8_FALSE;
+            }
             if (val == NULL)
                 return unwrap(err_value(car->i64), id);
             car = *val;
             goto dispatch;
 
         default:
+            if (drop_car)
+                drop_obj(car);
             return unwrap(err_type(TYPE_LAMBDA, car->type, 0, 0), id);  // not callable
     }
 }

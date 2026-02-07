@@ -41,7 +41,7 @@
 #include "query.h"
 #include "time.h"
 #include "runtime.h"
-#include "string.h"
+#include "str.h"
 #include "chrono.h"
 #include "date.h"
 #include "timestamp.h"
@@ -51,6 +51,7 @@
 #include "vary.h"
 #include "os.h"
 #include "proc.h"
+#include "pivot.h"
 
 i64_t SYMBOL_FN;
 i64_t SYMBOL_SELF;
@@ -175,7 +176,8 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "raze",                TYPE_UNARY,    FN_NONE,                   ray_raze);
     REGISTER_FN(functions,  "diverse",             TYPE_UNARY,    FN_NONE,                   ray_diverse);
     REGISTER_FN(functions,  "row",                 TYPE_UNARY,    FN_NONE | FN_AGGR,         ray_row);
-    
+    REGISTER_FN(functions,  "del",                 TYPE_UNARY,    FN_NONE | FN_SPECIAL_FORM, ray_del);
+
     // Binary           
     REGISTER_FN(functions,  "try",                 TYPE_BINARY,   FN_NONE | FN_SPECIAL_FORM, try_obj);
     REGISTER_FN(functions,  "set",                 TYPE_BINARY,   FN_NONE | FN_SPECIAL_FORM, ray_set);
@@ -255,6 +257,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "asof-join",           TYPE_VARY,     FN_NONE,                   ray_asof_join);
     REGISTER_FN(functions,  "window-join",         TYPE_VARY,     FN_NONE,                   ray_window_join);
     REGISTER_FN(functions,  "window-join1",        TYPE_VARY,     FN_NONE,                   ray_window_join1);
+    REGISTER_FN(functions,  "pivot",               TYPE_VARY,     FN_NONE,                   ray_pivot);
     REGISTER_FN(functions,  "if",                  TYPE_VARY,     FN_NONE | FN_SPECIAL_FORM, ray_cond);
     REGISTER_FN(functions,  "return",              TYPE_VARY,     FN_NONE,                   ray_return);
     REGISTER_FN(functions,  "hopen",               TYPE_VARY,     FN_NONE,                   ray_hopen);
@@ -550,4 +553,28 @@ obj_p ray_internals(obj_p* x, i64_t n) {
     UNUSED(x);
     UNUSED(n);
     return clone_obj(runtime_get()->env.internals);
+}
+
+obj_p ray_del(obj_p x) {
+    i64_t i;
+    obj_p vars;
+
+    if (x->type != -TYPE_SYMBOL)
+        return err_type(-TYPE_SYMBOL, x->type, 0, 0);
+
+    // Check if protected function
+    i = find_raw(AS_LIST(runtime_get()->env.functions)[0], &x->i64);
+    if (i != NULL_I64)
+        return err_domain(0, 0);
+
+    // Find in variables
+    vars = runtime_get()->env.variables;
+    i = find_raw(AS_LIST(vars)[0], &x->i64);
+    if (i == NULL_I64)
+        return err_domain(0, 0);
+
+    // Remove from dict
+    remove_obj(&runtime_get()->env.variables, x);
+
+    return NULL_OBJ;
 }

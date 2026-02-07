@@ -29,11 +29,11 @@
 #include "heap.h"
 #include "items.h"
 #include "lambda.h"
-#include "mmap.h"
+#include "dynlib.h"
 #include "ops.h"
 #include "runtime.h"
 #include "serde.h"
-#include "string.h"
+#include "str.h"
 #include "unary.h"
 #include "util.h"
 #include "fdmap.h"
@@ -349,6 +349,22 @@ obj_p anymap(obj_p sym, obj_p vec) {
     e->type = TYPE_MAPLIST;
 
     return e;
+}
+
+obj_p external(raw_p ptr, nil_t (*drop)(raw_p)) {
+    obj_p o;
+
+    o = (obj_p)heap_alloc(sizeof(struct obj_t) + sizeof(struct ext_t));
+    o->type = TYPE_EXT;
+    o->mmod = MMOD_INTERNAL;
+    o->rc = 1;
+    o->len = 0;
+    o->attrs = 0;
+    ext_p ext = (ext_p)AS_C8(o);
+    ext->ptr = ptr;
+    ext->drop = drop;
+
+    return o;
 }
 
 obj_p resize_obj(obj_p* obj, i64_t len) {
@@ -1746,6 +1762,8 @@ obj_p set_dict_obj(obj_p* obj, obj_p idx, obj_p val) {
             }
             // Key found, update it
             else {
+                // COW the values list if shared (e.g. by (value dict))
+                AS_LIST(*obj)[1] = cow_obj(AS_LIST(*obj)[1]);
                 res = set_idx(&AS_LIST(*obj)[1], i, val);
                 if (IS_ERR(res))
                     return res;
@@ -2842,10 +2860,12 @@ obj_p __attribute__((hot)) clone_obj(obj_p obj) {
 }
 
 nil_t __attribute__((hot)) drop_obj(obj_p obj) {
-    DEBUG_ASSERT(is_valid(obj), "invalid object type: %d", obj->type);
+    if (UNLIKELY((u64_t)obj < 0x1000000 || ((u64_t)obj & 7)))
+        return;
 
     u32_t rc;
     i64_t i, l;
+    ext_p ext;
 
     // Never drop NULL_OBJ or ERR_OBJ (static global singletons)
     if (obj == NULL_OBJ || obj == ERR_OBJ)
@@ -2881,9 +2901,10 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             for (i = 0; i < l; i++)
                 drop_obj(AS_LIST(obj)[i]);
 
-            if (IS_EXTERNAL_SIMPLE(obj))
-                mmap_free(obj, size_of(obj));
-            else
+            if (IS_EXTERNAL_SIMPLE(obj)) {
+                // Use fdmap to properly unmap file and close handle
+                drop_obj(runtime_fdmap_pop(runtime_get(), obj));
+            } else
                 heap_free(obj);
             return;
         case TYPE_MAPFD:
@@ -2892,8 +2913,7 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             return;
         case TYPE_ENUM:
             if (IS_EXTERNAL_COMPOUND(obj)) {
-                runtime_fdmap_pop(runtime_get(), obj);
-                // mmap_free((str_p)obj - RAY_PAGE_SIZE, size_of(obj) + RAY_PAGE_SIZE);
+                drop_obj(runtime_fdmap_pop(runtime_get(), obj));
             } else {
                 drop_obj(AS_LIST(obj)[0]);
                 drop_obj(AS_LIST(obj)[1]);
@@ -2901,10 +2921,8 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
             }
             return;
         case TYPE_MAPLIST:
-            runtime_fdmap_pop(runtime_get(), MAPLIST_KEY(obj));
-            runtime_fdmap_pop(runtime_get(), obj);
-            // mmap_free(MAPLIST_KEY(obj), size_of(obj));
-            // mmap_free((str_p)obj - RAY_PAGE_SIZE, size_of(obj) + RAY_PAGE_SIZE);
+            drop_obj(runtime_fdmap_pop(runtime_get(), MAPLIST_KEY(obj)));
+            drop_obj(runtime_fdmap_pop(runtime_get(), obj));
             return;
         case TYPE_TABLE:
         case TYPE_DICT:
@@ -2926,12 +2944,17 @@ nil_t __attribute__((hot)) drop_obj(obj_p obj) {
         case TYPE_ERR:
             // Static singletons - never free
             return;
+        case TYPE_EXT:
+            ext = (ext_p)AS_C8(obj);
+            ext->drop(ext->ptr);
+            heap_free(obj);
+            return;
         default:
-            if (IS_EXTERNAL_SIMPLE(obj))
-                runtime_fdmap_pop(runtime_get(), obj);
-            else if (IS_EXTERNAL_COMPOUND(obj)) {
-                runtime_fdmap_pop(runtime_get(), MAPLIST_KEY(obj));
-                runtime_fdmap_pop(runtime_get(), obj);
+            if (IS_EXTERNAL_SIMPLE(obj)) {
+                drop_obj(runtime_fdmap_pop(runtime_get(), obj));
+            } else if (IS_EXTERNAL_COMPOUND(obj)) {
+                drop_obj(runtime_fdmap_pop(runtime_get(), MAPLIST_KEY(obj)));
+                drop_obj(runtime_fdmap_pop(runtime_get(), obj));
             } else
                 heap_free(obj);
 
@@ -2946,6 +2969,8 @@ obj_p copy_obj(obj_p obj) {
     obj_p res;
 
     switch (obj->type) {
+        case TYPE_NULL:
+            return NULL_OBJ;
         case -TYPE_B8:
             return b8(obj->b8);
         case -TYPE_C8:
@@ -2973,6 +2998,8 @@ obj_p copy_obj(obj_p obj) {
         case TYPE_C8:
         case TYPE_I16:
         case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
