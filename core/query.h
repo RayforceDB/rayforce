@@ -40,9 +40,11 @@ typedef struct query_ctx_t {
     obj_p groupby;      // List of key columns for group-by (NULL_OBJ if no grouping)
     obj_p group_keys;   // Key column names (symbols) for result table assembly
     obj_p orig_table;   // Pre-filter table (for value column access without materialization)
+    obj_p filter_bool;  // Boolean vector from filter eval (for fused-filter path)
     i64_t ngroups;      // Number of distinct groups (0 = not fused)
     i64_t *first_rows;  // [ngroups] first row index per group
     i64_t *last_rows;   // [ngroups] last row index per group
+    obj_p prebuilt_keys; // LIST of pre-built key vectors (perfect hash key reconstruction)
     fused_result_t fused[MAX_FUSED];
     i64_t nfused;       // Number of pre-computed fused results
     struct query_ctx_t* parent;

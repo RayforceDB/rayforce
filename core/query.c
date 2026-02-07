@@ -68,23 +68,41 @@ typedef struct {
     obj_p op_fn;       // Binary operation function object
 } deferred_op_t;
 
-// Check if an expression is (aggr_fn col_sym) and add it to the plan.
+// Check if an expression is (aggr_fn col_sym) or (aggr_fn expr) and add it to the plan.
 // Returns the plan index on success, -1 on failure.
 static i64_t try_add_aggr_to_plan(obj_p expr, obj_p table, fused_plan_t *plan, i64_t *nplan) {
     if (expr->type == TYPE_LIST && expr->len == 2) {
         obj_p fn_obj = AS_LIST(expr)[0];
-        obj_p arg_sym = AS_LIST(expr)[1];
+        obj_p arg = AS_LIST(expr)[1];
         if ((fn_obj->type == TYPE_UNARY || fn_obj->type == TYPE_BINARY || fn_obj->type == TYPE_VARY)
-            && (fn_obj->attrs & FN_AGGR)
-            && arg_sym->type == -TYPE_SYMBOL) {
+            && (fn_obj->attrs & FN_AGGR)) {
             i8_t func_id = aggr_identify_func(fn_obj);
-            i64_t col_idx = find_col_idx(table, arg_sym->i64);
-            if (func_id >= 0 && col_idx >= 0 && func_id != AGGR_ID_MED) {
-                i64_t idx = *nplan;
-                plan[idx].func_id = func_id;
-                plan[idx].col_idx = col_idx;
-                (*nplan)++;
-                return idx;
+            if (func_id >= 0 && func_id != AGGR_ID_MED) {
+                // Pattern A: (aggr col_sym) — direct column reference
+                if (arg->type == -TYPE_SYMBOL) {
+                    i64_t col_idx = find_col_idx(table, arg->i64);
+                    if (col_idx >= 0) {
+                        i64_t idx = *nplan;
+                        plan[idx].func_id = func_id;
+                        plan[idx].col_idx = col_idx;
+                        plan[idx].col_ptr = NULL;
+                        (*nplan)++;
+                        return idx;
+                    }
+                }
+                // Pattern B: (aggr expr) — pre-evaluate expression as virtual column
+                else {
+                    obj_p vcol = eval(arg);
+                    if (!IS_ERR(vcol) && vcol->type >= TYPE_B8 && vcol->type <= TYPE_F64) {
+                        i64_t idx = *nplan;
+                        plan[idx].func_id = func_id;
+                        plan[idx].col_idx = -1;
+                        plan[idx].col_ptr = vcol;  // Ownership transferred to plan
+                        (*nplan)++;
+                        return idx;
+                    }
+                    if (!IS_ERR(vcol)) drop_obj(vcol);
+                }
             }
         }
     }
@@ -163,6 +181,7 @@ static b8_t try_fused_aggregate(obj_p obj, query_ctx_p ctx) {
             if (col_idx >= 0) {
                 plan[nplan].func_id = AGGR_ID_FIRST;
                 plan[nplan].col_idx = col_idx;
+                plan[nplan].col_ptr = NULL;
                 syms[nplan] = sym_id;
                 nplan++;
                 matched = B8_TRUE;
@@ -172,6 +191,9 @@ static b8_t try_fused_aggregate(obj_p obj, query_ctx_p ctx) {
         drop_obj(expr);
 
         if (!matched) {
+            // Clean up any virtual columns already allocated
+            for (i64_t j = 0; j < nplan; j++)
+                if (plan[j].col_ptr != NULL) drop_obj(plan[j].col_ptr);
             drop_obj(map_keys);
             return B8_FALSE;  // Can't fuse this mapping — fall back
         }
@@ -182,6 +204,10 @@ static b8_t try_fused_aggregate(obj_p obj, query_ctx_p ctx) {
     // Run fused aggregation
     obj_p results[MAX_FUSED];
     aggr_fused_compute((struct query_ctx_t *)ctx, plan, nplan, results);
+
+    // Free virtual columns (pre-evaluated expressions)
+    for (i64_t i = 0; i < nplan; i++)
+        if (plan[i].col_ptr != NULL) { drop_obj(plan[i].col_ptr); plan[i].col_ptr = NULL; }
 
     // Apply deferred binary operations element-wise
     obj_p deferred_results[MAX_FUSED];
@@ -295,9 +321,11 @@ nil_t query_ctx_init(query_ctx_p ctx) {
     ctx->groupby = NULL_OBJ;
     ctx->group_keys = NULL_OBJ;
     ctx->orig_table = NULL_OBJ;
+    ctx->filter_bool = NULL_OBJ;
     ctx->ngroups = 0;
     ctx->first_rows = NULL;
     ctx->last_rows = NULL;
+    ctx->prebuilt_keys = NULL_OBJ;
     ctx->nfused = 0;
     ctx->parent = vm->query_ctx;
     vm->query_ctx = ctx;
@@ -312,6 +340,8 @@ nil_t query_ctx_destroy(query_ctx_p ctx) {
     drop_obj(ctx->groupby);
     drop_obj(ctx->group_keys);
     drop_obj(ctx->orig_table);
+    drop_obj(ctx->filter_bool);
+    drop_obj(ctx->prebuilt_keys);
 
     if (ctx->first_rows) heap_free(ctx->first_rows);
     if (ctx->last_rows) heap_free(ctx->last_rows);
@@ -372,14 +402,22 @@ obj_p select_apply_filters(obj_p obj, query_ctx_p ctx) {
         if (IS_ERR(val))
             return val;
 
-        fil = ray_where(val);
-        timeit_tick("find indices");
-        drop_obj(val);
+        if (val->type == TYPE_B8) {
+            // Store boolean vector for fused-filter aggregation path.
+            // Defer ray_where — only build indices lazily if fallback needs them.
+            ctx->filter_bool = clone_obj(val);
+            drop_obj(val);
+        } else {
+            // Non-boolean filter (parted, etc.) — must build indices now
+            fil = ray_where(val);
+            timeit_tick("find indices");
+            drop_obj(val);
 
-        if (IS_ERR(fil))
-            return fil;
+            if (IS_ERR(fil))
+                return fil;
 
-        ctx->filter = fil;
+            ctx->filter = fil;
+        }
     }
 
     timeit_span_end("filters");
@@ -571,20 +609,20 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
         }
 
         // If filter is set, apply it before grouping
-        if (ctx->filter != NULL_OBJ) {
+        if (ctx->filter_bool != NULL_OBJ && ctx->filter_bool->type == TYPE_B8) {
+            // Boolean-fused path: keys stay unfiltered.
+            // aggr_fused_compute will use filter_bool to skip non-matching rows.
+            // No key filtering, no orig_table, no index needed.
+        } else if (ctx->filter != NULL_OBJ) {
+            // Index-based path: filter key columns through fids
             i64_t nf = ctx->filter->len;
             i64_t* fids = AS_I64(ctx->filter);
-
-            // Filter key columns in ctx->groupby
             i64_t nk = ctx->groupby->len;
             for (i64_t fk = 0; fk < nk; fk++) {
                 obj_p filtered = at_ids(AS_LIST(ctx->groupby)[fk], fids, nf);
                 drop_obj(AS_LIST(ctx->groupby)[fk]);
                 AS_LIST(ctx->groupby)[fk] = filtered;
             }
-
-            // Save original table — fused path accesses value columns via filter indices
-            // Key assembly uses first_rows (original row indices) to index into orig_table
             ctx->orig_table = clone_obj(ctx->table);
         }
 
@@ -597,7 +635,31 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
         // Try fused aggregation (DuckDB-style one-pass)
         if (!try_fused_aggregate(obj, ctx)) {
             // Fused failed — materialize filtered table for fallback path
-            if (ctx->orig_table != NULL_OBJ && ctx->filter != NULL_OBJ) {
+            if (ctx->filter_bool != NULL_OBJ && ctx->filter_bool->type == TYPE_B8
+                && ctx->orig_table == NULL_OBJ) {
+                // Boolean path failed — lazily build filter indices now
+                obj_p fil = ray_where(ctx->filter_bool);
+                if (IS_ERR(fil)) { timeit_span_end("group"); return fil; }
+                ctx->filter = fil;
+                i64_t nf = fil->len;
+                i64_t *fids = AS_I64(fil);
+                i64_t nk = ctx->groupby->len;
+                for (i64_t fk = 0; fk < nk; fk++) {
+                    obj_p filtered = at_ids(AS_LIST(ctx->groupby)[fk], fids, nf);
+                    drop_obj(AS_LIST(ctx->groupby)[fk]);
+                    AS_LIST(ctx->groupby)[fk] = filtered;
+                }
+                // Also materialize table values for fallback
+                obj_p tab_keys_f = AS_LIST(ctx->table)[0];
+                obj_p tab_vals_f = AS_LIST(ctx->table)[1];
+                i64_t nc = tab_keys_f->len;
+                obj_p fvals = LIST(nc);
+                for (i64_t fi = 0; fi < nc; fi++)
+                    AS_LIST(fvals)[fi] = at_ids(AS_LIST(tab_vals_f)[fi], fids, nf);
+                obj_p new_keys = clone_obj(tab_keys_f);
+                drop_obj(ctx->table);
+                ctx->table = table(new_keys, fvals);
+            } else if (ctx->orig_table != NULL_OBJ && ctx->filter != NULL_OBJ) {
                 i64_t nf = ctx->filter->len;
                 i64_t *fids = AS_I64(ctx->filter);
                 obj_p tab_keys_f = AS_LIST(ctx->table)[0];
@@ -628,8 +690,14 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
         }
 
         timeit_span_end("group");
-    } else if (ctx->filter != NULL_OBJ) {
+    } else if (ctx->filter != NULL_OBJ || ctx->filter_bool != NULL_OBJ) {
         // Remap filtered table for column resolution
+        if (ctx->filter == NULL_OBJ && ctx->filter_bool != NULL_OBJ) {
+            // Lazily build filter indices from boolean vector
+            obj_p fil = ray_where(ctx->filter_bool);
+            if (IS_ERR(fil)) return fil;
+            ctx->filter = fil;
+        }
         val = remap_filter(ctx->table, ctx->filter);
 
         if (IS_ERR(val))
@@ -790,7 +858,7 @@ obj_p ray_select(obj_p obj) {
     // Helper: materialize a column in grouped context
     #define MAT_COL(col) \
         (ctx.ngroups > 0 ? at_ids((col), ctx.first_rows, ctx.ngroups) \
-         : ctx.orig_table != NULL_OBJ ? vector((col)->type, 0) \
+         : (ctx.orig_table != NULL_OBJ || ctx.filter_bool != NULL_OBJ) ? vector((col)->type, 0) \
          : (col)->type == TYPE_MAPGROUP ? aggr_collect(AS_LIST(col)[0], AS_LIST(col)[1]) \
          : ray_value(col))
 
@@ -812,8 +880,13 @@ obj_p ray_select(obj_p obj) {
                 i64_t key_sym = GKEY_SYM(ctx.group_keys, ki);
                 for (ci = 0; ci < ncols; ci++) {
                     if (AS_I64(tab_keys)[ci] == key_sym) {
-                        obj_p col = AS_LIST(tab_vals)[ci];
-                        obj_p mat = MAT_COL(col);
+                        obj_p mat;
+                        if (ctx.prebuilt_keys != NULL_OBJ && ki < ctx.prebuilt_keys->len)
+                            mat = clone_obj(AS_LIST(ctx.prebuilt_keys)[ki]);
+                        else {
+                            obj_p col = AS_LIST(tab_vals)[ci];
+                            mat = MAT_COL(col);
+                        }
                         if (IS_ERR(mat)) {
                             rvals->len = ri;
                             drop_obj(rvals);
@@ -871,8 +944,13 @@ obj_p ray_select(obj_p obj) {
                 i64_t ci;
                 for (ci = 0; ci < ncols; ci++) {
                     if (AS_I64(tab_keys)[ci] == key_sym) {
-                        obj_p col = AS_LIST(tab_vals)[ci];
-                        obj_p mat = MAT_COL(col);
+                        obj_p mat;
+                        if (ctx.prebuilt_keys != NULL_OBJ && ki < ctx.prebuilt_keys->len)
+                            mat = clone_obj(AS_LIST(ctx.prebuilt_keys)[ki]);
+                        else {
+                            obj_p col = AS_LIST(tab_vals)[ci];
+                            mat = MAT_COL(col);
+                        }
                         if (IS_ERR(mat)) {
                             rvals->len = ri;
                             drop_obj(rvals);

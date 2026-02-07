@@ -53,7 +53,8 @@ enum {
 
 typedef struct {
     i8_t func_id;      // AGGR_ID_*
-    i64_t col_idx;     // Column index in table
+    i64_t col_idx;     // Column index in table (-1 if using col_ptr)
+    obj_p col_ptr;     // Pre-evaluated virtual column (NULL = use col_idx)
 } fused_plan_t;
 
 // Forward-declare query_ctx_t to avoid circular include
