@@ -41,7 +41,7 @@
 // Constants
 // ============================================================================
 
-#define PERFECT_HASH_THRESHOLD 65536   // Use perfect hash if range <= 64K
+#define PERFECT_HASH_THRESHOLD 262144  // Use perfect hash if range <= 256K
 #define INITIAL_HT_CAPACITY 4096       // Initial hash table capacity
 #define HT_LOAD_FACTOR 0.7             // Resize when load > 70%
 
@@ -2047,10 +2047,11 @@ static nil_t fused_extract_results(
 
 // Parallel fused aggregation context (perfect hash path)
 typedef struct {
-    i64_t *kv;                  // Key values (shared, read-only)
+    i64_t *kv;                  // Key values (shared, read-only) — NULL for multi-key inline
     i64_t mn;                   // Min key value (offset for direct indexing)
     i64_t range;                // Key range
-    obj_p tab_vals;             // Table values (shared, read-only)
+    obj_p tab_vals;             // Table values for aggregation (shared, read-only)
+    i64_t *fids;                // Filter indices (NULL if no filter)
     fused_plan_t *plan;         // Aggregation plan (shared, read-only)
     i64_t nplan;                // Number of plan entries
     i64_t chunk_size;           // Rows per worker
@@ -2058,6 +2059,11 @@ typedef struct {
     i64_t **worker_counts;      // Per-worker group counts
     i64_t **worker_first;       // Per-worker first rows
     i64_t **worker_last;        // Per-worker last rows
+    // Multi-key inline composite: compute gid on-the-fly instead of pre-computing ckv
+    i64_t nkeys_inline;         // 0 = use kv[], >0 = compute composite key inline
+    i64_t **key_ptrs;           // [nkeys] pointers to key value arrays
+    i64_t *mins;                // [nkeys] per-key minimums
+    i64_t *strides;             // [nkeys] per-key strides
 } parallel_fused_ctx_t;
 
 // Worker: process a chunk of rows using perfect hash direct indexing
@@ -2067,6 +2073,7 @@ static obj_p parallel_fused_worker(i64_t len, i64_t offset, raw_p ctx_ptr) {
     i64_t end = offset + len;
     i64_t mn = ctx->mn;
     i64_t *kv = ctx->kv;
+    i64_t *fids = ctx->fids;
     i64_t *pcounts = ctx->worker_counts[chunk_idx];
     i64_t *pfirst = ctx->worker_first[chunk_idx];
     i64_t *plast = ctx->worker_last[chunk_idx];
@@ -2076,14 +2083,27 @@ static obj_p parallel_fused_worker(i64_t len, i64_t offset, raw_p ctx_ptr) {
     obj_p tab_vals = ctx->tab_vals;
     i64_t i, p, gid;
 
+    // Multi-key inline: compute composite key on-the-fly
+    i64_t nki = ctx->nkeys_inline;
+    i64_t **kptrs = ctx->key_ptrs;
+    i64_t *kmins = ctx->mins;
+    i64_t *kstrides = ctx->strides;
+
     for (i = offset; i < end; i++) {
-        gid = kv[i] - mn;
-        if (pfirst[gid] < 0) pfirst[gid] = i;
-        plast[gid] = i;
+        if (nki > 0) {
+            gid = 0;
+            for (i64_t k = 0; k < nki; k++)
+                gid += (kptrs[k][i] - kmins[k]) * kstrides[k];
+        } else {
+            gid = kv[i] - mn;
+        }
+        i64_t row = fids ? fids[i] : i;
+        if (pfirst[gid] < 0) pfirst[gid] = row;
+        plast[gid] = row;
         pcounts[gid]++;
         for (p = 0; p < nplan; p++) {
             obj_p col = AS_LIST(tab_vals)[plan[p].col_idx];
-            FUSED_ACCUM_STEP(plan[p].func_id, gid, col, i, accum[p]);
+            FUSED_ACCUM_STEP(plan[p].func_id, gid, col, row, accum[p]);
         }
     }
 
@@ -2094,8 +2114,14 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
     query_ctx_p qctx = (query_ctx_p)ctx;
     obj_p keys = qctx->groupby;
     i64_t nkeys = keys->len;
-    obj_p tab_vals = AS_LIST(qctx->table)[1];
-    i64_t nrows = tab_vals->len > 0 ? AS_LIST(tab_vals)[0]->len : 0;
+
+    // Use orig_table for value columns when filter skipped materialization
+    obj_p val_table = (qctx->orig_table != NULL_OBJ) ? qctx->orig_table : qctx->table;
+    obj_p tab_vals = AS_LIST(val_table)[1];
+    i64_t *fids = (qctx->orig_table != NULL_OBJ && qctx->filter != NULL_OBJ) ? AS_I64(qctx->filter) : NULL;
+
+    // nrows = number of filtered rows (from key column length)
+    i64_t nrows = (nkeys > 0 && AS_LIST(keys)[0]->len > 0) ? AS_LIST(keys)[0]->len : 0;
     i64_t p, i, gid;
 
     if (nrows == 0) {
@@ -2134,9 +2160,14 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                     pctx.mn = mn;
                     pctx.range = range;
                     pctx.tab_vals = tab_vals;
+                    pctx.fids = fids;
                     pctx.plan = plan;
                     pctx.nplan = nplan;
                     pctx.chunk_size = chunk_size;
+                    pctx.nkeys_inline = 0;
+                    pctx.key_ptrs = NULL;
+                    pctx.mins = NULL;
+                    pctx.strides = NULL;
                     pctx.worker_acc = (fused_accum_t **)heap_alloc(nworkers * sizeof(fused_accum_t *));
                     pctx.worker_counts = (i64_t **)heap_alloc(nworkers * sizeof(i64_t *));
                     pctx.worker_first = (i64_t **)heap_alloc(nworkers * sizeof(i64_t *));
@@ -2265,12 +2296,13 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
 
                 for (i = 0; i < nrows; i++) {
                     gid = kv[i] - mn;
-                    if (pfirst[gid] < 0) pfirst[gid] = i;
-                    plast[gid] = i;
+                    i64_t row = fids ? fids[i] : i;
+                    if (pfirst[gid] < 0) pfirst[gid] = row;
+                    plast[gid] = row;
                     pcounts[gid]++;
                     for (p = 0; p < nplan; p++) {
                         obj_p col = AS_LIST(tab_vals)[plan[p].col_idx];
-                        FUSED_ACCUM_STEP(plan[p].func_id, gid, col, i, accum[p]);
+                        FUSED_ACCUM_STEP(plan[p].func_id, gid, col, row, accum[p]);
                     }
                 }
 
@@ -2302,6 +2334,215 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
         }
     }
 
+    // Multi-key perfect hash: composite index when all keys are i64/symbol with small product range
+    if (nkeys > 1 && nkeys <= 16) {
+        i64_t mins[16], ranges[16], strides[16];
+        i64_t composite_range = 1;
+        b8_t all_hashable = B8_TRUE;
+
+        for (i64_t k = 0; k < nkeys; k++) {
+            obj_p kc = AS_LIST(keys)[k];
+            if (kc->type != TYPE_I64 && kc->type != TYPE_SYMBOL) { all_hashable = B8_FALSE; break; }
+            i64_t *kv = AS_I64(kc);
+            i64_t mn = kv[0], mx = kv[0];
+            for (i = 1; i < nrows; i++) {
+                if (kv[i] < mn) mn = kv[i];
+                if (kv[i] > mx) mx = kv[i];
+            }
+            mins[k] = mn;
+            ranges[k] = mx - mn + 1;
+            if (ranges[k] <= 0) { all_hashable = B8_FALSE; break; }
+            composite_range *= ranges[k];
+            if (composite_range > PERFECT_HASH_THRESHOLD) { all_hashable = B8_FALSE; break; }
+        }
+
+        if (all_hashable) {
+            // Compute strides (row-major: last key varies fastest)
+            strides[nkeys - 1] = 1;
+            for (i64_t k = nkeys - 2; k >= 0; k--)
+                strides[k] = strides[k + 1] * ranges[k + 1];
+
+            // Prepare key pointers for inline composite key computation
+            i64_t *key_ptrs[16];
+            for (i64_t k = 0; k < nkeys; k++)
+                key_ptrs[k] = AS_I64(AS_LIST(keys)[k]);
+
+            i64_t range = composite_range;
+
+            // Parallel path
+            pool_p pool = pool_get();
+            i64_t nworkers = pool_split_by(pool, nrows, 0);
+            if (nworkers > MAX_AGG_WORKERS) nworkers = MAX_AGG_WORKERS;
+
+            if (nworkers > 1 && nrows >= PARALLEL_AGG_THRESHOLD) {
+                i64_t chunk_size = pool_chunk_aligned(nrows, nworkers, sizeof(i64_t));
+
+                parallel_fused_ctx_t pctx;
+                pctx.kv = NULL;
+                pctx.mn = 0;
+                pctx.range = range;
+                pctx.tab_vals = tab_vals;
+                pctx.fids = fids;
+                pctx.plan = plan;
+                pctx.nplan = nplan;
+                pctx.chunk_size = chunk_size;
+                pctx.nkeys_inline = nkeys;
+                pctx.key_ptrs = key_ptrs;
+                pctx.mins = mins;
+                pctx.strides = strides;
+                pctx.worker_acc = (fused_accum_t **)heap_alloc(nworkers * sizeof(fused_accum_t *));
+                pctx.worker_counts = (i64_t **)heap_alloc(nworkers * sizeof(i64_t *));
+                pctx.worker_first = (i64_t **)heap_alloc(nworkers * sizeof(i64_t *));
+                pctx.worker_last = (i64_t **)heap_alloc(nworkers * sizeof(i64_t *));
+
+                for (i = 0; i < nworkers; i++) {
+                    pctx.worker_acc[i] = fused_alloc_accum(tab_vals, plan, nplan, range);
+                    pctx.worker_counts[i] = (i64_t *)heap_alloc(range * sizeof(i64_t));
+                    pctx.worker_first[i] = (i64_t *)heap_alloc(range * sizeof(i64_t));
+                    pctx.worker_last[i] = (i64_t *)heap_alloc(range * sizeof(i64_t));
+                    for (i64_t j = 0; j < range; j++) {
+                        pctx.worker_counts[i][j] = 0;
+                        pctx.worker_first[i][j] = -1;
+                        pctx.worker_last[i][j] = -1;
+                    }
+                }
+
+                pool_prepare(pool);
+                i64_t offset = 0;
+                for (i = 0; i < nworkers - 1; i++) {
+                    pool_add_task(pool, (raw_p)parallel_fused_worker, 3, chunk_size, offset, &pctx);
+                    offset += chunk_size;
+                }
+                pool_add_task(pool, (raw_p)parallel_fused_worker, 3, nrows - offset, offset, &pctx);
+
+                obj_p pres = pool_run(pool);
+                drop_obj(pres);
+
+                i64_t *pcounts = pctx.worker_counts[0];
+                i64_t *pfirst = pctx.worker_first[0];
+                i64_t *plast = pctx.worker_last[0];
+                fused_accum_t *accum = pctx.worker_acc[0];
+
+                for (i64_t w = 1; w < nworkers; w++) {
+                    for (i64_t s = 0; s < range; s++) {
+                        pcounts[s] += pctx.worker_counts[w][s];
+                        if (pctx.worker_first[w][s] >= 0) {
+                            if (pfirst[s] < 0 || pctx.worker_first[w][s] < pfirst[s])
+                                pfirst[s] = pctx.worker_first[w][s];
+                        }
+                        if (pctx.worker_last[w][s] >= 0) {
+                            if (pctx.worker_last[w][s] > plast[s])
+                                plast[s] = pctx.worker_last[w][s];
+                        }
+                    }
+                    for (p = 0; p < nplan; p++) {
+                        i8_t func = plan[p].func_id;
+                        fused_accum_t *wa = &pctx.worker_acc[w][p];
+                        fused_accum_t *ma = &accum[p];
+                        for (i64_t s = 0; s < range; s++) {
+                            switch (func) {
+                            case AGGR_ID_SUM: case AGGR_ID_COUNT:
+                                if (ma->i64_acc && wa->i64_acc) ma->i64_acc[s] += wa->i64_acc[s];
+                                if (ma->f64_acc && wa->f64_acc) ma->f64_acc[s] += wa->f64_acc[s];
+                                break;
+                            case AGGR_ID_MAX:
+                                if (ma->i64_acc && wa->i64_acc && wa->i64_acc[s] > ma->i64_acc[s]) ma->i64_acc[s] = wa->i64_acc[s];
+                                if (ma->f64_acc && wa->f64_acc && wa->f64_acc[s] > ma->f64_acc[s]) ma->f64_acc[s] = wa->f64_acc[s];
+                                break;
+                            case AGGR_ID_MIN:
+                                if (ma->i64_acc && wa->i64_acc && wa->i64_acc[s] < ma->i64_acc[s]) ma->i64_acc[s] = wa->i64_acc[s];
+                                if (ma->f64_acc && wa->f64_acc && wa->f64_acc[s] < ma->f64_acc[s]) ma->f64_acc[s] = wa->f64_acc[s];
+                                break;
+                            case AGGR_ID_AVG: case AGGR_ID_DEV:
+                                if (ma->f64_acc && wa->f64_acc) ma->f64_acc[s] += wa->f64_acc[s];
+                                if (ma->f64_aux && wa->f64_aux) ma->f64_aux[s] += wa->f64_aux[s];
+                                if (ma->counts && wa->counts) ma->counts[s] += wa->counts[s];
+                                break;
+                            default: break;
+                            }
+                        }
+                    }
+                    heap_free(pctx.worker_counts[w]);
+                    heap_free(pctx.worker_first[w]);
+                    heap_free(pctx.worker_last[w]);
+                    fused_free_accum(pctx.worker_acc[w], nplan);
+                }
+
+                i64_t ng = 0;
+                for (i = 0; i < range; i++)
+                    if (pcounts[i] > 0) ng++;
+
+                qctx->ngroups = ng;
+                qctx->first_rows = (i64_t *)heap_alloc(ng * sizeof(i64_t));
+                qctx->last_rows = (i64_t *)heap_alloc(ng * sizeof(i64_t));
+                i64_t gi = 0;
+                for (i = 0; i < range; i++) {
+                    if (pcounts[i] > 0) {
+                        qctx->first_rows[gi] = pfirst[i];
+                        qctx->last_rows[gi] = plast[i];
+                        gi++;
+                    }
+                }
+
+                fused_extract_results(tab_vals, plan, nplan, accum,
+                                      pcounts, range, ng,
+                                      qctx->first_rows, qctx->last_rows, results);
+
+                heap_free(pcounts); heap_free(pfirst); heap_free(plast);
+                fused_free_accum(accum, nplan);
+                heap_free(pctx.worker_acc); heap_free(pctx.worker_counts);
+                heap_free(pctx.worker_first); heap_free(pctx.worker_last);
+                return;
+            }
+
+            // Sequential multi-key perfect hash path
+            i64_t *pcounts = (i64_t *)heap_alloc(range * sizeof(i64_t));
+            i64_t *pfirst = (i64_t *)heap_alloc(range * sizeof(i64_t));
+            i64_t *plast = (i64_t *)heap_alloc(range * sizeof(i64_t));
+            for (i = 0; i < range; i++) { pcounts[i] = 0; pfirst[i] = -1; plast[i] = -1; }
+
+            fused_accum_t *accum = fused_alloc_accum(tab_vals, plan, nplan, range);
+
+            for (i = 0; i < nrows; i++) {
+                gid = 0;
+                for (i64_t k = 0; k < nkeys; k++)
+                    gid += (key_ptrs[k][i] - mins[k]) * strides[k];
+                i64_t row = fids ? fids[i] : i;
+                if (pfirst[gid] < 0) pfirst[gid] = row;
+                plast[gid] = row;
+                pcounts[gid]++;
+                for (p = 0; p < nplan; p++) {
+                    obj_p col = AS_LIST(tab_vals)[plan[p].col_idx];
+                    FUSED_ACCUM_STEP(plan[p].func_id, gid, col, row, accum[p]);
+                }
+            }
+
+            i64_t ng = 0;
+            for (i = 0; i < range; i++)
+                if (pcounts[i] > 0) ng++;
+
+            qctx->ngroups = ng;
+            qctx->first_rows = (i64_t *)heap_alloc(ng * sizeof(i64_t));
+            qctx->last_rows = (i64_t *)heap_alloc(ng * sizeof(i64_t));
+            i64_t gi = 0;
+            for (i = 0; i < range; i++) {
+                if (pcounts[i] > 0) {
+                    qctx->first_rows[gi] = pfirst[i];
+                    qctx->last_rows[gi] = plast[i];
+                    gi++;
+                }
+            }
+
+            fused_extract_results(tab_vals, plan, nplan, accum,
+                                  pcounts, range, ng,
+                                  qctx->first_rows, qctx->last_rows, results);
+
+            heap_free(pcounts); heap_free(pfirst); heap_free(plast);
+            fused_free_accum(accum, nplan);
+            return;
+        }
+    }
+
     // General hash path: arbitrary keys
     local_agg_t agg;
     i64_t max_groups = nrows / 10 + 1024;
@@ -2312,14 +2553,23 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
         u64_t h = compute_composite_hash(keys, nkeys, i);
         gid = local_agg_find_or_create(&agg, keys, nkeys, i, h);
         if (UNLIKELY(gid < 0)) continue;
+        i64_t row = fids ? fids[i] : i;
         for (p = 0; p < nplan; p++) {
             obj_p col = AS_LIST(tab_vals)[plan[p].col_idx];
-            FUSED_ACCUM_STEP(plan[p].func_id, gid, col, i, accum[p]);
+            FUSED_ACCUM_STEP(plan[p].func_id, gid, col, row, accum[p]);
         }
     }
 
     i64_t ng = agg.count;
     qctx->ngroups = ng;
+
+    // Convert first_rows/last_rows to original row indices when filter active
+    if (fids) {
+        for (i = 0; i < ng; i++) {
+            agg.first_rows[i] = fids[agg.first_rows[i]];
+            agg.last_rows[i] = fids[agg.last_rows[i]];
+        }
+    }
     qctx->first_rows = agg.first_rows;
     qctx->last_rows = agg.last_rows;
     agg.first_rows = NULL;

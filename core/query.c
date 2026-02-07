@@ -28,6 +28,7 @@
 #include "items.h"
 #include "compose.h"
 #include "error.h"
+#include "iter.h"
 #include "aggr.h"
 #include "heap.h"
 #include "math.h"
@@ -59,6 +60,37 @@ static i64_t find_col_idx(obj_p table, i64_t sym) {
 
 // Try to pre-scan all mapping expressions and run fused aggregation.
 // Returns B8_TRUE on success (all mappings handled), B8_FALSE to fall back.
+// Deferred binary operation over two aggregate results
+typedef struct {
+    i64_t out_sym;     // Output symbol ID
+    i64_t plan_a;      // First operand plan index
+    i64_t plan_b;      // Second operand plan index
+    obj_p op_fn;       // Binary operation function object
+} deferred_op_t;
+
+// Check if an expression is (aggr_fn col_sym) and add it to the plan.
+// Returns the plan index on success, -1 on failure.
+static i64_t try_add_aggr_to_plan(obj_p expr, obj_p table, fused_plan_t *plan, i64_t *nplan) {
+    if (expr->type == TYPE_LIST && expr->len == 2) {
+        obj_p fn_obj = AS_LIST(expr)[0];
+        obj_p arg_sym = AS_LIST(expr)[1];
+        if ((fn_obj->type == TYPE_UNARY || fn_obj->type == TYPE_BINARY || fn_obj->type == TYPE_VARY)
+            && (fn_obj->attrs & FN_AGGR)
+            && arg_sym->type == -TYPE_SYMBOL) {
+            i8_t func_id = aggr_identify_func(fn_obj);
+            i64_t col_idx = find_col_idx(table, arg_sym->i64);
+            if (func_id >= 0 && col_idx >= 0 && func_id != AGGR_ID_MED) {
+                i64_t idx = *nplan;
+                plan[idx].func_id = func_id;
+                plan[idx].col_idx = col_idx;
+                (*nplan)++;
+                return idx;
+            }
+        }
+    }
+    return -1;
+}
+
 static b8_t try_fused_aggregate(obj_p obj, query_ctx_p ctx) {
     obj_p map_keys = ray_except(AS_LIST(obj)[0], runtime_get()->env.keywords);
     i64_t nmaps = map_keys->len;
@@ -77,7 +109,11 @@ static b8_t try_fused_aggregate(obj_p obj, query_ctx_p ctx) {
     i64_t syms[MAX_FUSED];
     i64_t nplan = 0;
 
-    if (nmaps > MAX_FUSED) {
+    // Deferred binary ops: (op (aggr col1) (aggr col2))
+    deferred_op_t deferred[MAX_FUSED];
+    i64_t ndeferred = 0;
+
+    if (nmaps > MAX_FUSED / 2) {
         drop_obj(map_keys);
         return B8_FALSE;
     }
@@ -91,26 +127,37 @@ static b8_t try_fused_aggregate(obj_p obj, query_ctx_p ctx) {
         b8_t matched = B8_FALSE;
 
         // Pattern 1: (aggr_fn col_sym) — e.g., (sum Price)
-        // fn is already resolved to TYPE_UNARY/BINARY/VARY function object
         if (expr->type == TYPE_LIST && expr->len == 2) {
+            i64_t idx = try_add_aggr_to_plan(expr, ctx->table, plan, &nplan);
+            if (idx >= 0) {
+                syms[idx] = sym_id;
+                matched = B8_TRUE;
+            }
+        }
+        // Pattern 2: (binary_op (aggr col1) (aggr col2)) — e.g., (- (max v1) (min v2))
+        else if (expr->type == TYPE_LIST && expr->len == 3) {
             obj_p fn_obj = AS_LIST(expr)[0];
-            obj_p arg_sym = AS_LIST(expr)[1];
+            obj_p arg_a = AS_LIST(expr)[1];
+            obj_p arg_b = AS_LIST(expr)[2];
 
-            if ((fn_obj->type == TYPE_UNARY || fn_obj->type == TYPE_BINARY || fn_obj->type == TYPE_VARY)
-                && (fn_obj->attrs & FN_AGGR)
-                && arg_sym->type == -TYPE_SYMBOL) {
-                i8_t func_id = aggr_identify_func(fn_obj);
-                i64_t col_idx = find_col_idx(ctx->table, arg_sym->i64);
-                if (func_id >= 0 && col_idx >= 0 && func_id != AGGR_ID_MED) {
-                    plan[nplan].func_id = func_id;
-                    plan[nplan].col_idx = col_idx;
-                    syms[nplan] = sym_id;
-                    nplan++;
-                    matched = B8_TRUE;
+            if (fn_obj->type == TYPE_BINARY && !(fn_obj->attrs & FN_AGGR)) {
+                i64_t idx_a = try_add_aggr_to_plan(arg_a, ctx->table, plan, &nplan);
+                if (idx_a >= 0) {
+                    syms[idx_a] = -1;  // Internal — not directly exposed
+                    i64_t idx_b = try_add_aggr_to_plan(arg_b, ctx->table, plan, &nplan);
+                    if (idx_b >= 0) {
+                        syms[idx_b] = -1;  // Internal
+                        deferred[ndeferred].out_sym = sym_id;
+                        deferred[ndeferred].plan_a = idx_a;
+                        deferred[ndeferred].plan_b = idx_b;
+                        deferred[ndeferred].op_fn = fn_obj;
+                        ndeferred++;
+                        matched = B8_TRUE;
+                    }
                 }
             }
         }
-        // Pattern 2: bare column symbol — implicit first
+        // Pattern 3: bare column symbol — implicit first
         else if (expr->type == -TYPE_SYMBOL) {
             i64_t col_idx = find_col_idx(ctx->table, expr->i64);
             if (col_idx >= 0) {
@@ -136,12 +183,31 @@ static b8_t try_fused_aggregate(obj_p obj, query_ctx_p ctx) {
     obj_p results[MAX_FUSED];
     aggr_fused_compute((struct query_ctx_t *)ctx, plan, nplan, results);
 
-    // Store results in ctx
-    ctx->nfused = nplan;
-    for (i64_t i = 0; i < nplan; i++) {
-        ctx->fused[i].sym = syms[i];
-        ctx->fused[i].result = results[i];
+    // Apply deferred binary operations element-wise
+    obj_p deferred_results[MAX_FUSED];
+    for (i64_t d = 0; d < ndeferred; d++) {
+        obj_p ra = results[deferred[d].plan_a];
+        obj_p rb = results[deferred[d].plan_b];
+        deferred_results[d] = map_binary(deferred[d].op_fn, ra, rb);
     }
+
+    // Store results in ctx: direct aggregates first, then deferred ops
+    i64_t nfused = 0;
+    for (i64_t i = 0; i < nplan; i++) {
+        if (syms[i] != -1) {
+            ctx->fused[nfused].sym = syms[i];
+            ctx->fused[nfused].result = results[i];
+            nfused++;
+        } else {
+            drop_obj(results[i]);
+        }
+    }
+    for (i64_t d = 0; d < ndeferred; d++) {
+        ctx->fused[nfused].sym = deferred[d].out_sym;
+        ctx->fused[nfused].result = deferred_results[d];
+        nfused++;
+    }
+    ctx->nfused = nfused;
 
     return B8_TRUE;
 }
@@ -228,6 +294,7 @@ nil_t query_ctx_init(query_ctx_p ctx) {
     ctx->filter = NULL_OBJ;
     ctx->groupby = NULL_OBJ;
     ctx->group_keys = NULL_OBJ;
+    ctx->orig_table = NULL_OBJ;
     ctx->ngroups = 0;
     ctx->first_rows = NULL;
     ctx->last_rows = NULL;
@@ -244,6 +311,7 @@ nil_t query_ctx_destroy(query_ctx_p ctx) {
     drop_obj(ctx->filter);
     drop_obj(ctx->groupby);
     drop_obj(ctx->group_keys);
+    drop_obj(ctx->orig_table);
 
     if (ctx->first_rows) heap_free(ctx->first_rows);
     if (ctx->last_rows) heap_free(ctx->last_rows);
@@ -515,16 +583,9 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
                 AS_LIST(ctx->groupby)[fk] = filtered;
             }
 
-            // Filter the table columns for group_map
-            obj_p tab_keys_f = AS_LIST(ctx->table)[0];
-            obj_p tab_vals_f = AS_LIST(ctx->table)[1];
-            i64_t nc = tab_keys_f->len;
-            obj_p fvals = LIST(nc);
-            for (i64_t fi = 0; fi < nc; fi++)
-                AS_LIST(fvals)[fi] = at_ids(AS_LIST(tab_vals_f)[fi], fids, nf);
-            val = table(clone_obj(tab_keys_f), fvals);
-            drop_obj(ctx->table);
-            ctx->table = val;
+            // Save original table — fused path accesses value columns via filter indices
+            // Key assembly uses first_rows (original row indices) to index into orig_table
+            ctx->orig_table = clone_obj(ctx->table);
         }
 
         drop_obj(gvals);
@@ -535,6 +596,19 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
 
         // Try fused aggregation (DuckDB-style one-pass)
         if (!try_fused_aggregate(obj, ctx)) {
+            // Fused failed — materialize filtered table for fallback path
+            if (ctx->orig_table != NULL_OBJ && ctx->filter != NULL_OBJ) {
+                i64_t nf = ctx->filter->len;
+                i64_t *fids = AS_I64(ctx->filter);
+                obj_p tab_keys_f = AS_LIST(ctx->table)[0];
+                obj_p tab_vals_f = AS_LIST(ctx->table)[1];
+                i64_t nc = tab_keys_f->len;
+                obj_p fvals = LIST(nc);
+                for (i64_t fi = 0; fi < nc; fi++)
+                    AS_LIST(fvals)[fi] = at_ids(AS_LIST(tab_vals_f)[fi], fids, nf);
+                drop_obj(ctx->table);
+                ctx->table = table(clone_obj(tab_keys_f), fvals);
+            }
             // Fallback: old path with group_map
             prm = remap_group(ctx);
 
@@ -716,6 +790,7 @@ obj_p ray_select(obj_p obj) {
     // Helper: materialize a column in grouped context
     #define MAT_COL(col) \
         (ctx.ngroups > 0 ? at_ids((col), ctx.first_rows, ctx.ngroups) \
+         : ctx.orig_table != NULL_OBJ ? vector((col)->type, 0) \
          : (col)->type == TYPE_MAPGROUP ? aggr_collect(AS_LIST(col)[0], AS_LIST(col)[1]) \
          : ray_value(col))
 

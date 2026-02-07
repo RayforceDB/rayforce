@@ -39,6 +39,7 @@ typedef struct query_ctx_t {
     obj_p filter;
     obj_p groupby;      // List of key columns for group-by (NULL_OBJ if no grouping)
     obj_p group_keys;   // Key column names (symbols) for result table assembly
+    obj_p orig_table;   // Pre-filter table (for value column access without materialization)
     i64_t ngroups;      // Number of distinct groups (0 = not fused)
     i64_t *first_rows;  // [ngroups] first row index per group
     i64_t *last_rows;   // [ngroups] last row index per group
