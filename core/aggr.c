@@ -841,7 +841,7 @@ obj_p aggr_sum(obj_p val, obj_p index) {
         for (i = 0; i < nrows; i++) {
             u64_t h = compute_composite_hash(keys, nkeys, i);
             i64_t gid = local_agg_find_or_create(&lagg, keys, nkeys, i, h);
-            if (gid >= 0)
+            if (gid >= 0 && vals32[i] != NULL_I32)
                 lagg.sums_i64[gid] += (i64_t)vals32[i];
         }
         obj_p res = vector(TYPE_I64, lagg.count);
@@ -859,7 +859,7 @@ obj_p aggr_sum(obj_p val, obj_p index) {
         for (i = 0; i < nrows; i++) {
             u64_t h = compute_composite_hash(keys, nkeys, i);
             i64_t gid = local_agg_find_or_create(&lagg, keys, nkeys, i, h);
-            if (gid >= 0)
+            if (gid >= 0 && vals16[i] != NULL_I16)
                 lagg.sums_i64[gid] += (i64_t)vals16[i];
         }
         obj_p res = vector(TYPE_I64, lagg.count);
@@ -2574,13 +2574,8 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                 if (nworkers > 1 && nrows >= PARALLEL_AGG_THRESHOLD) {
                     i64_t chunk_size = pool_chunk_aligned(nrows, nworkers, sizeof(i64_t));
 
-                    // Check if any plan entry needs FIRST/LAST row tracking
-                    b8_t needs_first_last = B8_FALSE;
-                    for (p = 0; p < nplan; p++) {
-                        if (plan[p].func_id == AGGR_ID_FIRST || plan[p].func_id == AGGR_ID_LAST) {
-                            needs_first_last = B8_TRUE; break;
-                        }
-                    }
+                    // Always track first/last rows — needed for MAT_COL non-key materialization
+                    b8_t needs_first_last = B8_TRUE;
 
                     // Allocate per-worker state
                     parallel_fused_ctx_t pctx;
@@ -2709,8 +2704,8 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
 
                     qctx->ngroups = ng;
 
-                    if (needs_first_last) {
-                        // Use first/last row indices for key extraction
+                    {
+                        // Build first/last row indices (needed for non-key col materialization)
                         i64_t *pfirst = pctx.worker_first[0];
                         i64_t *plast = pctx.worker_last[0];
                         qctx->first_rows = (i64_t *)heap_alloc(ng * sizeof(i64_t));
@@ -2724,10 +2719,9 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                             }
                         }
                         heap_free(pfirst); heap_free(plast);
-                    } else {
-                        // Build key vector directly from slot IDs (no first_rows needed)
+                        // Also build prebuilt keys for efficient key reconstruction
                         obj_p kcol = vector(key_col->type, ng);
-                        i64_t gi = 0;
+                        gi = 0;
                         for (i = 0; i < range; i++)
                             if (pcounts[i] > 0) AS_I64(kcol)[gi++] = i + mn;
                         qctx->prebuilt_keys = LIST(1);
