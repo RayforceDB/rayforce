@@ -1,0 +1,2 @@
+;; --iterations=10 --expected-time=120
+(select {v1: (sum v1) v2: (sum v2) v3: (sum v3) from: t where: (and (>= v1 2) (<= v2 8)) by: id3})

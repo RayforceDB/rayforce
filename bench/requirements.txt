@@ -1,0 +1,14 @@
+# Rayforce Benchmark Framework Dependencies
+# Core
+pyyaml>=6.0
+pandas>=2.0.0
+
+# Database adapters
+duckdb>=0.10.0
+polars>=1.0.0
+
+# Optional: System metrics
+psutil>=5.9.0
+
+# Optional: Development
+pytest>=7.0.0

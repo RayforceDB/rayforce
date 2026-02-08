@@ -20,3 +20,6 @@ CLAUDE.md
 docs/site/
 .pytest_cache/
 libraykx.dylib
+bench/datasets
+bench/results.json
+bench/config.local.yaml

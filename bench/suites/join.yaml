@@ -1,0 +1,38 @@
+# H2OAI Join Benchmark Suite
+#
+# Based on: https://h2oai.github.io/db-benchmark
+# Aligned with Rayforce benchmark conventions
+
+name: join
+description: H2OAI Join Benchmark - left join and inner join
+version: "1.0.0"
+
+# Dataset reference
+dataset: h2oai_join_1e7
+
+# Default execution parameters
+warmup: 3
+iterations: 10
+cache_mode: warm
+
+# Benchmark tasks
+tasks:
+  - id: left_join
+    description: "Q1: Left join on id1, id2"
+    params:
+      left_table: x
+      right_table: y
+
+  - id: inner_join
+    description: "Q2: Inner join on id1, id2"
+    params:
+      left_table: x
+      right_table: y
+
+# Metadata
+metadata:
+  source: "H2OAI db-benchmark"
+  url: "https://h2oai.github.io/db-benchmark"
+  reference_datasets:
+    - "J1_1e7_NA_0_0.csv"
+    - "J1_1e7_1e7_0_0.csv"

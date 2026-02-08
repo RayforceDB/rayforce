@@ -1,0 +1,31 @@
+# Example Benchmark Suite
+#
+# A minimal suite for testing the framework with example data.
+# Run: python run_bench.py --suite suites/example.yaml --dataset datasets/example_groupby
+
+name: example
+description: Example benchmark for testing the framework
+version: "1.0.0"
+
+dataset: example_groupby
+
+# Quick execution for testing
+warmup: 1
+iterations: 3
+cache_mode: warm
+
+tasks:
+  - id: groupby_q1
+    description: "Q1: sum(v1) by id1"
+    params: {}
+
+  - id: groupby_q2
+    description: "Q2: sum(v1) by id1, id2"
+    params: {}
+
+  - id: groupby_q3
+    description: "Q3: sum(v1), avg(v3) by id3"
+    params: {}
+
+metadata:
+  purpose: Framework testing

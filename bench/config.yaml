@@ -1,0 +1,51 @@
+# Rayforce Benchmark Framework Configuration
+#
+# Copy this file to config.local.yaml for local overrides (gitignored)
+# Environment variables override config values: RAYFORCE_BINARY, KDB_BINARY, etc.
+
+# Rayforce configuration
+rayforce:
+  # Path to rayforce binary (or set RAYFORCE_BINARY env var)
+  binary: "./rayforce"
+  # Use IPC mode instead of subprocess (requires running server)
+  use_ipc: false
+  # IPC connection settings (when use_ipc: true)
+  host: "localhost"
+  port: 5110
+
+# KDB+/q configuration
+kdb:
+  # Path to q binary (or set KDB_BINARY env var)
+  binary: "q"
+  # Use IPC mode instead of subprocess
+  use_ipc: false
+  # IPC connection settings
+  host: "localhost"
+  port: 5000
+
+# DuckDB configuration
+duckdb:
+  # Memory limit (e.g., "4GB", null = unlimited)
+  memory_limit: null
+
+# QuestDB configuration
+questdb:
+  # PostgreSQL wire protocol host
+  host: "localhost"
+  # PostgreSQL wire protocol port
+  port: 8812
+  # Database name
+  database: "qdb"
+  # Username
+  user: "admin"
+  # Password
+  password: "quest"
+
+# General settings
+general:
+  # Default report output directory
+  reports_dir: "reports"
+  # Default datasets directory
+  datasets_dir: "datasets"
+  # Verbose output
+  verbose: true

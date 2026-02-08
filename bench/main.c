@@ -668,7 +668,7 @@ int main(int argc, char* argv[]) {
     // Update only the results that were run
     if (specific_tests) {
         // For each result we just ran
-        for (int i = 1; i < results.result_count; i++) {
+        for (int i = 0; i < results.result_count; i++) {
             // Find matching previous result
             bench_result_t* previous = NULL;
             for (int j = 0; j < previous_results.result_count; j++) {
@@ -698,7 +698,7 @@ int main(int argc, char* argv[]) {
     if (results.result_count > 0) {
         // If running specific tests, only update those tests in the previous results
         if (specific_tests) {
-            for (int i = 1; i < results.result_count; i++) {
+            for (int i = 0; i < results.result_count; i++) {
                 for (int j = 0; j < previous_results.result_count; j++) {
                     if (strcmp(results.results[i].script_name, previous_results.results[j].script_name) == 0) {
                         previous_results.results[j] = results.results[i];

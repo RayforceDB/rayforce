@@ -1,0 +1,44 @@
+# 10M Dataset Benchmark Suite
+#
+# Fewer iterations for large dataset benchmarks
+
+name: groupby_10m
+description: Group-by benchmark for 10M+ row datasets
+version: "1.0.0"
+
+dataset: G1_10m
+
+warmup: 1
+iterations: 3
+cache_mode: warm
+
+tasks:
+  - id: groupby_q1
+    description: "Q1: sum(v1) by id1"
+
+  - id: groupby_q2
+    description: "Q2: sum(v1) by id1, id2"
+
+  - id: groupby_q3
+    description: "Q3: sum(v1), avg(v3) by id3"
+
+  - id: groupby_q4
+    description: "Q4: avg(v1), avg(v2), avg(v3) by id4"
+
+  - id: groupby_q5
+    description: "Q5: sum(v1), sum(v2), sum(v3) by id6"
+
+  - id: groupby_q6
+    description: "Q6: max(v1) - min(v2) by id3"
+
+  - id: groupby_q7
+    description: "Q7: sum(v3), count by id1-id6 (wide group by)"
+
+  - id: groupby_q8
+    description: "Q8: filter(v1>=3) then sum(v3) by id2 (range filter)"
+
+  - id: groupby_q9
+    description: "Q9: filter(v1>=2 AND v2<=8) then sum(v1,v2,v3) by id3"
+
+  - id: groupby_q10
+    description: "Q10: filter(v3>0) then sum(v1), sum(v2) by id1-id4"

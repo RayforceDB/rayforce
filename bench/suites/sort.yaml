@@ -1,0 +1,56 @@
+# Sort Benchmark Suite
+#
+# Tests sort performance on various column types and cardinalities
+
+name: sort
+description: Sort benchmark - single and multi-column sorting
+version: "1.0.0"
+
+# Dataset reference (uses H2OAI groupby dataset)
+dataset: G1_1e7_1e2_0_0
+
+# Default execution parameters
+warmup: 3
+iterations: 10
+cache_mode: warm
+
+# Benchmark tasks
+tasks:
+  - id: sort_single
+    description: "Q1: Sort by single low-cardinality column (id1)"
+    params:
+      column: id1
+      descending: false
+
+  - id: sort_single
+    description: "Q2: Sort by single high-cardinality column (id3)"
+    params:
+      column: id3
+      descending: false
+
+  - id: sort_single
+    description: "Q3: Sort by integer column (id4)"
+    params:
+      column: id4
+      descending: false
+
+  - id: sort_single
+    description: "Q4: Sort by float column descending (v3)"
+    params:
+      column: v3
+      descending: true
+
+  - id: sort_multi
+    description: "Q5: Sort by two columns (id1, id2)"
+    params:
+      columns: ["id1", "id2"]
+
+  - id: sort_multi
+    description: "Q6: Sort by three columns (id1, id2, id3)"
+    params:
+      columns: ["id1", "id2", "id3"]
+
+# Metadata
+metadata:
+  source: "Custom sort benchmark"
+  reference_dataset: "G1_1e7_1e2_0_0.csv"

@@ -1,0 +1,2 @@
+;; --iterations=3 --expected-time=1394
+(select {v3: (sum v3) cnt: (count v3) from: t by: {id1: id1 id2: id2 id3: id3 id4: id4 id5: id5 id6: id6}})

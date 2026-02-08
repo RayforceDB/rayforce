@@ -1,0 +1,26 @@
+# Example Join Benchmark Suite
+#
+# Tests join queries on the small example dataset
+
+name: example_join
+description: Join benchmark on example data (1000 rows)
+version: "1.0.0"
+
+dataset: example_join
+
+warmup: 2
+iterations: 5
+cache_mode: warm
+
+tasks:
+  - id: left_join
+    description: "Q1: Left join on id1, id2"
+    params:
+      left_table: x
+      right_table: y
+
+  - id: inner_join
+    description: "Q2: Inner join on id1, id2"
+    params:
+      left_table: x
+      right_table: y

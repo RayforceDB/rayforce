@@ -1,0 +1,2 @@
+;; --iterations=10 --expected-time=74
+(select {v1: (sum v1) from: t by: {id1: id1 id2: id2}})

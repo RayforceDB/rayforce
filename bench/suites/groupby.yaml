@@ -1,0 +1,58 @@
+# H2OAI Group By Benchmark Suite
+#
+# Based on: https://h2oai.github.io/db-benchmark
+# Aligned with Rayforce benchmark conventions from docs/get-started/benchmarks/
+
+name: groupby
+description: H2OAI Group By Benchmark - 7 standard queries
+version: "1.0.0"
+
+# Dataset reference (relative to datasets/ directory)
+dataset: h2oai_groupby_1e7
+
+# Default execution parameters (can be overridden per-task)
+warmup: 3          # Warmup iterations (not measured)
+iterations: 10     # Measured iterations
+cache_mode: warm   # "warm" or "cold"
+
+# Benchmark tasks
+tasks:
+  - id: groupby_q1
+    description: "Q1: sum(v1) by id1"
+    params: {}
+    # Expected results for validation (optional)
+    # expected_rows: 100
+    # expected_checksum: null
+
+  - id: groupby_q2
+    description: "Q2: sum(v1) by id1, id2"
+    params: {}
+
+  - id: groupby_q3
+    description: "Q3: sum(v1), avg(v3) by id3"
+    params: {}
+
+  - id: groupby_q4
+    description: "Q4: avg(v1), avg(v2), avg(v3) by id4"
+    params: {}
+
+  - id: groupby_q5
+    description: "Q5: sum(v1), sum(v2), sum(v3) by id6"
+    params: {}
+
+  - id: groupby_q6
+    description: "Q6: max(v1) - min(v2) by id3"
+    params: {}
+
+  - id: groupby_q7
+    description: "Q7: sum(v3), count by id1-id6 (wide group by)"
+    params: {}
+    # This query is typically slower - allow more warmup
+    warmup: 5
+    iterations: 5
+
+# Metadata for reproducibility
+metadata:
+  source: "H2OAI db-benchmark"
+  url: "https://h2oai.github.io/db-benchmark"
+  reference_dataset: "G1_1e7_1e2_0_0.csv"

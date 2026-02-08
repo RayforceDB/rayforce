@@ -1,0 +1,1 @@
+(set t (read-csv [SYMBOL SYMBOL SYMBOL I64 I64 I64 I64 I64 F64] "bench/datasets/G1_1e7_1e2_0_0/G1_1e7_1e2_0_0.csv"))

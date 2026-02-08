@@ -1,0 +1,2 @@
+;; --iterations=10 --expected-time=118
+(select {v1: (sum v1) v3: (avg v3) from: t by: id3})

@@ -1,0 +1,2 @@
+;; --iterations=10 --expected-time=104
+(select {range_v1_v2: (- (max v1) (min v2)) from: t by: id3})

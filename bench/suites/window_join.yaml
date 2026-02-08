@@ -1,0 +1,35 @@
+# Window Join Benchmark Suite
+#
+# Tests window join (wj1) performance - time-series joins with aggregations
+# Based on: https://code.kx.com/q/ref/wj/
+
+name: window_join
+description: Window join benchmark - time-series joins within windows
+version: "1.0.0"
+
+# Dataset reference
+dataset: window_join_10m
+
+# Default execution parameters
+warmup: 2
+iterations: 5
+cache_mode: warm
+
+# Benchmark tasks
+tasks:
+  - id: window_join
+    description: "Q1: Window join (+/- 10 seconds) - min(Bid), max(Ask)"
+    params:
+      trades_table: trades
+      quotes_table: quotes
+      keys: ["Sym", "Ts"]
+      window_ms: 10000
+
+# Metadata
+metadata:
+  source: "Custom window join benchmark"
+  url: "https://code.kx.com/q/ref/wj/"
+  description: |
+    Window join (wj1) is a fundamental time-series operation that joins
+    trades with quotes within a time window, computing aggregations like
+    min(Bid) and max(Ask) for each trade timestamp.

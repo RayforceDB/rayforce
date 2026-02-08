@@ -1,0 +1,2 @@
+;; --iterations=10 --expected-time=100
+(select {v3: (sum v3) from: t where: (>= v1 3) by: id2})
