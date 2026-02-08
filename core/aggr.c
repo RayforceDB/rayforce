@@ -328,6 +328,38 @@ static nil_t local_agg_destroy(local_agg_t *agg) {
     heap_free(agg->group_hashes);
 }
 
+// Grow per-group arrays when capacity is exhausted
+static nil_t local_agg_grow_groups(local_agg_t *agg) {
+    i64_t old_max = agg->max_groups;
+    i64_t new_max = old_max * 2;
+    i64_t i;
+
+    agg->sums_i64 = (i64_t *)heap_realloc(agg->sums_i64, new_max * sizeof(i64_t));
+    agg->sums_f64 = (f64_t *)heap_realloc(agg->sums_f64, new_max * sizeof(f64_t));
+    agg->counts = (i64_t *)heap_realloc(agg->counts, new_max * sizeof(i64_t));
+    agg->mins_i64 = (i64_t *)heap_realloc(agg->mins_i64, new_max * sizeof(i64_t));
+    agg->maxs_i64 = (i64_t *)heap_realloc(agg->maxs_i64, new_max * sizeof(i64_t));
+    agg->mins_f64 = (f64_t *)heap_realloc(agg->mins_f64, new_max * sizeof(f64_t));
+    agg->maxs_f64 = (f64_t *)heap_realloc(agg->maxs_f64, new_max * sizeof(f64_t));
+    agg->first_rows = (i64_t *)heap_realloc(agg->first_rows, new_max * sizeof(i64_t));
+    agg->last_rows = (i64_t *)heap_realloc(agg->last_rows, new_max * sizeof(i64_t));
+    agg->group_hashes = (u64_t *)heap_realloc(agg->group_hashes, new_max * sizeof(u64_t));
+
+    for (i = old_max; i < new_max; i++) {
+        agg->sums_i64[i] = 0;
+        agg->sums_f64[i] = 0.0;
+        agg->counts[i] = 0;
+        agg->mins_i64[i] = AGG_I64_MAX;
+        agg->maxs_i64[i] = AGG_I64_MIN;
+        agg->mins_f64[i] = AGG_F64_MAX;
+        agg->maxs_f64[i] = -AGG_F64_MAX;
+        agg->first_rows[i] = -1;
+        agg->last_rows[i] = -1;
+    }
+
+    agg->max_groups = new_max;
+}
+
 // Resize hash table when load factor exceeded
 static nil_t local_agg_resize(local_agg_t *agg) {
     i64_t i, new_capacity, new_mask, idx;
@@ -382,9 +414,7 @@ static inline i64_t local_agg_find_or_create(local_agg_t *agg, obj_p keys, i64_t
         if (entry->group_id == AGG_ENTRY_EMPTY) {
             // New group
             if (agg->count >= agg->max_groups) {
-                // Need to grow groups arrays - for simplicity, just fail
-                // In production, would reallocate
-                return -1;
+                local_agg_grow_groups(agg);
             }
 
             // Check load factor
@@ -1940,6 +1970,34 @@ static fused_accum_t *fused_alloc_accum(obj_p tab_vals, fused_plan_t *plan, i64_
     return accum;
 }
 
+// Grow fused accum arrays from old_cap to new_cap, preserving existing data
+static nil_t fused_grow_accum(fused_accum_t *accum, fused_plan_t *plan, i64_t nplan,
+                              i64_t old_cap, i64_t new_cap) {
+    for (i64_t p = 0; p < nplan; p++) {
+        i8_t func = plan[p].func_id;
+        if (accum[p].i64_acc) {
+            accum[p].i64_acc = (i64_t *)heap_realloc(accum[p].i64_acc, new_cap * sizeof(i64_t));
+            i64_t init = (func == AGGR_ID_MIN) ? AGG_I64_MAX
+                       : (func == AGGR_ID_MAX) ? AGG_I64_MIN : 0;
+            for (i64_t i = old_cap; i < new_cap; i++) accum[p].i64_acc[i] = init;
+        }
+        if (accum[p].f64_acc) {
+            accum[p].f64_acc = (f64_t *)heap_realloc(accum[p].f64_acc, new_cap * sizeof(f64_t));
+            f64_t finit = (func == AGGR_ID_MIN) ? AGG_F64_MAX
+                        : (func == AGGR_ID_MAX) ? -AGG_F64_MAX : 0.0;
+            for (i64_t i = old_cap; i < new_cap; i++) accum[p].f64_acc[i] = finit;
+        }
+        if (accum[p].f64_aux) {
+            accum[p].f64_aux = (f64_t *)heap_realloc(accum[p].f64_aux, new_cap * sizeof(f64_t));
+            for (i64_t i = old_cap; i < new_cap; i++) accum[p].f64_aux[i] = 0.0;
+        }
+        if (accum[p].counts) {
+            accum[p].counts = (i64_t *)heap_realloc(accum[p].counts, new_cap * sizeof(i64_t));
+            for (i64_t i = old_cap; i < new_cap; i++) accum[p].counts[i] = 0;
+        }
+    }
+}
+
 static nil_t fused_free_accum(fused_accum_t *accum, i64_t nplan) {
     for (i64_t p = 0; p < nplan; p++) {
         if (accum[p].i64_acc) heap_free(accum[p].i64_acc);
@@ -2438,6 +2496,7 @@ static obj_p parallel_fused_hash_worker(i64_t len, i64_t offset, raw_p ctx_ptr) 
     i64_t *fids = ctx->fids;
     i64_t end = offset + len;
     i64_t i, p, gid;
+    i64_t accum_cap = agg->max_groups;
 
     // Pre-resolve column pointers
     obj_p cols[MAX_FUSED];
@@ -2448,7 +2507,10 @@ static obj_p parallel_fused_hash_worker(i64_t len, i64_t offset, raw_p ctx_ptr) 
         if (fbool && !fbool[i]) continue;
         u64_t h = compute_composite_hash(ctx->keys, ctx->nkeys, i);
         gid = local_agg_find_or_create(agg, ctx->keys, ctx->nkeys, i, h);
-        if (UNLIKELY(gid < 0)) continue;
+        if (UNLIKELY(gid >= accum_cap)) {
+            fused_grow_accum(accum, plan, nplan, accum_cap, agg->max_groups);
+            accum_cap = agg->max_groups;
+        }
         i64_t row = fids ? fids[i] : i;
         for (p = 0; p < nplan; p++)
             FUSED_ACCUM_STEP(plan[p].func_id, gid, cols[p], row, accum[p]);
@@ -2777,6 +2839,7 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                     for (i64_t k = 0; k < nkeys; k++) {
                         ranges[k] = maxs[k] - mins[k] + 1;
                         if (ranges[k] <= 0) { all_hashable = B8_FALSE; break; }
+                        if (ranges[k] > PERFECT_HASH_THRESHOLD / composite_range) { all_hashable = B8_FALSE; break; }
                         composite_range *= ranges[k];
                         if (composite_range > PERFECT_HASH_THRESHOLD) { all_hashable = B8_FALSE; break; }
                     }
@@ -2792,6 +2855,7 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                         mins[k] = mn;
                         ranges[k] = mx - mn + 1;
                         if (ranges[k] <= 0) { all_hashable = B8_FALSE; break; }
+                        if (ranges[k] > PERFECT_HASH_THRESHOLD / composite_range) { all_hashable = B8_FALSE; break; }
                         composite_range *= ranges[k];
                         if (composite_range > PERFECT_HASH_THRESHOLD) { all_hashable = B8_FALSE; break; }
                     }
@@ -3199,9 +3263,9 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
 
         // Sequential fallback
         local_agg_t agg;
-        i64_t max_groups = nrows / 10 + 1024;
-        local_agg_init(&agg, INITIAL_HT_CAPACITY, max_groups);
-        fused_accum_t *accum = fused_alloc_accum(tab_vals, plan, nplan, max_groups);
+        i64_t accum_cap = nrows / 10 + 1024;
+        local_agg_init(&agg, INITIAL_HT_CAPACITY, accum_cap);
+        fused_accum_t *accum = fused_alloc_accum(tab_vals, plan, nplan, accum_cap);
 
         obj_p gcols[MAX_FUSED];
         for (p = 0; p < nplan; p++)
@@ -3211,7 +3275,10 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
             if (fbool && !fbool[i]) continue;
             u64_t h = compute_composite_hash(keys, nkeys, i);
             gid = local_agg_find_or_create(&agg, keys, nkeys, i, h);
-            if (UNLIKELY(gid < 0)) continue;
+            if (UNLIKELY(gid >= accum_cap)) {
+                fused_grow_accum(accum, plan, nplan, accum_cap, agg.max_groups);
+                accum_cap = agg.max_groups;
+            }
             i64_t row = fids ? fids[i] : i;
             for (p = 0; p < nplan; p++)
                 FUSED_ACCUM_STEP(plan[p].func_id, gid, gcols[p], row, accum[p]);

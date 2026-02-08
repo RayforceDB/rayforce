@@ -155,7 +155,8 @@ static b8_t try_fused_aggregate(obj_p obj, query_ctx_p ctx) {
             obj_p arg_a = AS_LIST(expr)[1];
             obj_p arg_b = AS_LIST(expr)[2];
 
-            if (fn_obj->type == TYPE_BINARY && !(fn_obj->attrs & FN_AGGR)) {
+            if (fn_obj->type == TYPE_BINARY && !(fn_obj->attrs & FN_AGGR)
+                && nplan + 2 <= MAX_FUSED && ndeferred < MAX_FUSED) {
                 i64_t idx_a = try_add_aggr_to_plan(arg_a, ctx->table, plan, &nplan);
                 if (idx_a >= 0) {
                     syms[idx_a] = -1;  // Internal — not directly exposed
@@ -208,10 +209,20 @@ static b8_t try_fused_aggregate(obj_p obj, query_ctx_p ctx) {
 
     // Apply deferred binary operations element-wise
     obj_p deferred_results[MAX_FUSED];
+    b8_t deferred_err = B8_FALSE;
     for (i64_t d = 0; d < ndeferred; d++) {
         obj_p ra = results[deferred[d].plan_a];
         obj_p rb = results[deferred[d].plan_b];
         deferred_results[d] = map_binary(deferred[d].op_fn, ra, rb);
+        if (IS_ERR(deferred_results[d])) deferred_err = B8_TRUE;
+    }
+
+    if (deferred_err) {
+        // Clean up all results and deferred results, return B8_FALSE to fall back
+        for (i64_t i = 0; i < nplan; i++) drop_obj(results[i]);
+        for (i64_t d = 0; d < ndeferred; d++)
+            if (!IS_ERR(deferred_results[d])) drop_obj(deferred_results[d]);
+        return B8_FALSE;
     }
 
     // Store results in ctx: direct aggregates first, then deferred ops
@@ -667,6 +678,16 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
                     AS_LIST(fvals)[fi] = at_ids(AS_LIST(tab_vals_f)[fi], fids, nf);
                 drop_obj(ctx->table);
                 ctx->table = table(clone_obj(tab_keys_f), fvals);
+            }
+            // Filter fully applied — clear stale state so MAT_COL uses
+            // group_map's MAPGROUP columns instead of empty-vector shortcut
+            if (ctx->filter_bool != NULL_OBJ) {
+                drop_obj(ctx->filter_bool);
+                ctx->filter_bool = NULL_OBJ;
+            }
+            if (ctx->orig_table != NULL_OBJ) {
+                drop_obj(ctx->orig_table);
+                ctx->orig_table = NULL_OBJ;
             }
             // Fallback: old path with group_map
             prm = group_map(ctx->table, NULL_OBJ);
