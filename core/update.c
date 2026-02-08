@@ -316,7 +316,7 @@ obj_p ray_alter(obj_p *x, i64_t n) {
         return err_arity(3, n, 0);
 
     if (x[1]->type < TYPE_LAMBDA || x[1]->type > TYPE_VARY)
-        return err_type(0, 0, 0, 0);
+        return err_type(TYPE_LAMBDA, x[1]->type, 2, 0);
 
     if (x[0]->type == -TYPE_SYMBOL) {
         cur = resolve(x[0]->i64);
@@ -365,7 +365,7 @@ obj_p ray_modify(obj_p *x, i64_t n) {
         return err_arity(4, n, 0);
 
     if (x[1]->type < TYPE_LAMBDA || x[1]->type > TYPE_VARY)
-        return err_type(0, 0, 0, 0);
+        return err_type(TYPE_LAMBDA, x[1]->type, 2, 0);
 
     if (x[0]->type == -TYPE_SYMBOL) {
         cur = resolve(x[0]->i64);
@@ -425,7 +425,7 @@ obj_p ray_insert(obj_p *x, i64_t n) {
         return obj;
 
     if (obj->type != TYPE_TABLE) {
-        res = err_type(0, 0, 0, 0);
+        res = err_type(TYPE_TABLE, obj->type, 1, 0);
         UNCOW_OBJ(obj, val, original, res);
     }
 
@@ -436,7 +436,7 @@ obj_p ray_insert(obj_p *x, i64_t n) {
     // Handle dict/table input: reorder columns to match table order
     if (lst->type == TYPE_DICT || lst->type == TYPE_TABLE) {
         if (lst->type == TYPE_DICT && AS_LIST(lst)[0]->type != TYPE_SYMBOL) {
-            res = err_type(0, 0, 0, 0);
+            res = err_type(TYPE_SYMBOL, AS_LIST(lst)[0]->type, 2, 0);
             UNCOW_OBJ(obj, val, original, res);
         }
 
@@ -471,7 +471,7 @@ obj_p ray_insert(obj_p *x, i64_t n) {
                 // Check all the elements of the list
                 for (i = 0; i < l; i++) {
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
-                        res = err_type(0, 0, 0, 0);
+                        res = err_type(AS_LIST(AS_LIST(obj)[1])[i]->type, AS_LIST(lst)[i]->type, 2, 0);
                         INSERT_ERROR(res);
                     }
                 }
@@ -501,7 +501,7 @@ obj_p ray_insert(obj_p *x, i64_t n) {
                 // Check all the elements of the list
                 for (i = 0; i < l; i++) {
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
-                        res = err_type(0, 0, 0, 0);
+                        res = err_type(AS_LIST(AS_LIST(obj)[1])[i]->type, AS_LIST(lst)[i]->type, 2, 0);
                         INSERT_ERROR(res);
                     }
 
@@ -531,7 +531,7 @@ obj_p ray_insert(obj_p *x, i64_t n) {
             break;
 
         default:
-            res = err_type(0, 0, 0, 0);
+            res = err_type(TYPE_LIST, lst->type, 2, 0);
             INSERT_ERROR(res);
     }
 
@@ -575,7 +575,7 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
 
     if (obj->type != TYPE_TABLE) {
         drop_obj(obj);
-        return err_type(0, 0, 0, 0);
+        return err_type(TYPE_TABLE, obj->type, 1, 0);
     }
 
     p = AS_LIST(obj)[0]->len;
@@ -587,7 +587,7 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
     if (lst->type == TYPE_DICT || lst->type == TYPE_TABLE) {
         if (lst->type == TYPE_DICT && AS_LIST(lst)[0]->type != TYPE_SYMBOL) {
             drop_obj(obj);
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_SYMBOL, AS_LIST(lst)[0]->type, 3, 0);
         }
 
         // Check that input doesn't have more columns than table
@@ -623,7 +623,7 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
                 // Single record case - validate all elements are atoms or compatible
                 for (i = 0; i < l; i++) {
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
-                        UPSERT_ERROR(err_type(0, 0, 0, 0));
+                        UPSERT_ERROR(err_type(AS_LIST(AS_LIST(obj)[1])[i]->type, AS_LIST(lst)[i]->type, 3, 0));
                     }
                 }
 
@@ -675,7 +675,7 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
             ll = AS_LIST(lst)[0]->len;
             for (i = 0; i < l; i++) {
                 if (!IS_VECTOR(AS_LIST(lst)[i]))
-                    UPSERT_ERROR(err_type(0, 0, 0, 0));
+                    UPSERT_ERROR(err_type(TYPE_LIST, AS_LIST(lst)[i]->type, 3, 0));
 
                 if (AS_LIST(lst)[i]->len != ll)
                     UPSERT_ERROR(err_length(0, 0, 0, 0, 0, 0));
@@ -703,7 +703,7 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
             for (i = 0; i < l; i++) {
                 if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[i], AS_LIST(lst)[i])) {
                     drop_obj(idx);
-                    UPSERT_ERROR(err_type(0, 0, 0, 0));
+                    UPSERT_ERROR(err_type(AS_LIST(AS_LIST(obj)[1])[i]->type, AS_LIST(lst)[i]->type, 3, 0));
                 }
 
                 if (AS_LIST(lst)[i]->len != m) {
@@ -745,7 +745,7 @@ obj_p ray_upsert(obj_p *x, i64_t n) {
             return __commit(x[0], obj, val);
 
         default:
-            UPSERT_ERROR(err_type(0, 0, 0, 0));
+            UPSERT_ERROR(err_type(TYPE_LIST, lst->type, 3, 0));
     }
 }
 #undef UPSERT_ERROR
@@ -798,7 +798,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
                 for (m = 0; m < n; m++) {
                     v = at_idx(AS_LIST(vals)[i], m);
                     if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[j], v)) {
-                        res = err_type(0, 0, 0, 0);
+                        res = err_type(AS_LIST(AS_LIST(obj)[1])[j]->type, v->type, 0, 0);
                         drop_obj(v);
                         drop_obj(tab);
                         drop_obj(keys);
@@ -881,7 +881,7 @@ obj_p __update_table(obj_p tab, obj_p keys, obj_p vals, obj_p filters, obj_p gro
             // Check existing column
             else {
                 if (!__suitable_types(AS_LIST(AS_LIST(obj)[1])[j], AS_LIST(vals)[i])) {
-                    res = err_type(0, 0, 0, 0);
+                    res = err_type(AS_LIST(AS_LIST(obj)[1])[j]->type, AS_LIST(vals)[i]->type, 0, 0);
                     drop_obj(tab);
                     drop_obj(keys);
                     drop_obj(vals);
@@ -971,7 +971,7 @@ obj_p ray_update(obj_p obj) {
     if (tab->type != TYPE_TABLE) {
         drop_obj(tabsym);
         drop_obj(tab);
-        return err_type(0, 0, 0, 0);
+        return err_type(TYPE_TABLE, tab->type, 0, 0);
     }
 
     keys = ray_except(AS_LIST(obj)[0], runtime_get()->env.keywords);

@@ -21,8 +21,8 @@
  *   SOFTWARE.
  */
 
-#ifndef STRING_H
-#define STRING_H
+#ifndef STR_H
+#define STR_H
 
 #include <string.h>
 #include <stdarg.h>
@@ -49,4 +49,4 @@ u64_t str_hash(lit_p str, i64_t len);
 obj_p vn_vc8(lit_p fmt, va_list args);
 obj_p str_split(lit_p str, i64_t str_len, lit_p delim, i64_t delim_len);
 
-#endif  // STRING_H
+#endif  // STR_H

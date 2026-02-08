@@ -66,6 +66,9 @@ raw_p mmap_file_shared(i64_t fd, raw_p addr, i64_t size, i64_t offset) {
 
 i64_t mmap_free(raw_p addr, i64_t size) {
     UNUSED(size);
+    // Try UnmapViewOfFile first (for file mappings), then VirtualFree (for VirtualAlloc'd memory)
+    if (UnmapViewOfFile(addr))
+        return 1;
     return VirtualFree(addr, 0, MEM_RELEASE);
 }
 
@@ -245,6 +248,12 @@ raw_p mmap_file_shared(i64_t fd, raw_p addr, i64_t size, i64_t offset) {
 }
 
 i64_t mmap_free(raw_p addr, i64_t size) {
+    (void)size;
+    free(addr);
+    return 0;
+}
+
+i64_t mmap_file_unmap(raw_p addr, i64_t size) {
     (void)size;
     free(addr);
     return 0;

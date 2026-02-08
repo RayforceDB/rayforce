@@ -34,7 +34,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include "poll.h"
-#include "string.h"
+#include "str.h"
 #include "hash.h"
 #include "format.h"
 #include "util.h"
@@ -326,6 +326,20 @@ i64_t poll_run(poll_p poll) {
                 break;
             }
 
+            // Check if this is a waker event (by checking magic number)
+            {
+                poll_waker_p waker = (poll_waker_p)ev.udata;
+                if (waker != NULL && waker->magic == POLL_WAKER_MAGIC) {
+                    u8_t val;
+                    // Drain the pipe
+                    while (read(waker->pipe[0], &val, sizeof(val)) > 0) {}
+                    LOG_TRACE("Waker event received, calling callback");
+                    if (waker->callback != NULL)
+                        waker->callback(waker->data);
+                    continue;
+                }
+            }
+
             selector = (selector_p)ev.udata;
 
             // error or hang up
@@ -525,4 +539,73 @@ option_t poll_block_on(poll_p poll, selector_p selector) {
 
     LOG_DEBUG("empty buffer");
     return option_none();
+}
+
+// ============================================================================
+// Poll Waker - macOS implementation using pipe
+// ============================================================================
+
+poll_waker_p poll_waker_create(poll_p poll, poll_waker_fn callback, raw_p data) {
+    poll_waker_p waker;
+    struct kevent ev;
+
+    LOG_DEBUG("Creating poll waker");
+
+    waker = (poll_waker_p)heap_alloc(sizeof(struct poll_waker_t));
+    waker->magic = POLL_WAKER_MAGIC;
+    waker->poll = poll;
+    waker->callback = callback;
+    waker->data = data;
+
+    // Create pipe for this waker
+    if (pipe(waker->pipe) == -1) {
+        LOG_ERROR("Failed to create pipe for waker");
+        perror("pipe");
+        heap_free(waker);
+        return NULL;
+    }
+
+    // Make read end non-blocking
+    fcntl(waker->pipe[0], F_SETFL, O_NONBLOCK);
+
+    // Add pipe read end to kqueue with waker pointer as udata
+    EV_SET(&ev, waker->pipe[0], EVFILT_READ, EV_ADD, 0, 0, waker);
+    if (kevent(poll->fd, &ev, 1, NULL, 0, NULL) == -1) {
+        LOG_ERROR("Failed to add waker pipe to kqueue");
+        perror("kevent: waker pipe");
+        close(waker->pipe[0]);
+        close(waker->pipe[1]);
+        heap_free(waker);
+        return NULL;
+    }
+
+    LOG_DEBUG("Poll waker created with pipe [%d, %d]", waker->pipe[0], waker->pipe[1]);
+
+    return waker;
+}
+
+nil_t poll_waker_wake(poll_waker_p waker) {
+    u8_t val = 1;
+    i32_t res;
+
+    LOG_TRACE("Waking poll via pipe %d", waker->pipe[1]);
+
+    res = write(waker->pipe[1], &val, sizeof(val));
+    if (res == -1 && errno != EAGAIN) {
+        LOG_ERROR("Failed to write to waker pipe");
+        perror("write: waker pipe");
+    }
+}
+
+nil_t poll_waker_destroy(poll_waker_p waker) {
+    struct kevent ev;
+
+    LOG_DEBUG("Destroying poll waker");
+
+    EV_SET(&ev, waker->pipe[0], EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    kevent(waker->poll->fd, &ev, 1, NULL, 0, NULL);
+
+    close(waker->pipe[0]);
+    close(waker->pipe[1]);
+    heap_free(waker);
 }

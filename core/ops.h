@@ -26,7 +26,7 @@
 
 #include "rayforce.h"
 #include "temporal.h"
-#include "string.h"
+#include "str.h"
 
 // Global null object to be referenced by all null objects.
 extern struct obj_t __NULL_OBJ;
@@ -74,6 +74,7 @@ extern struct obj_t __ERR_OBJ;
 #define ALIGN8(x) ((str_p)(((i64_t)x + 7) & ~7))
 #define MTYPE2(x, y) ((u8_t)(x) | ((u8_t)(y) << 8))
 #define EQI8(x, y) ((x) == (y))
+#define EQU8(x, y) ((x) == (y))
 #define EQC8(x, y) ((x) == (y))
 #define EQI16(x, y) ((x) == (y))
 #define EQI32(x, y) ((x) == (y))
@@ -82,6 +83,7 @@ extern struct obj_t __ERR_OBJ;
 #define EQGUID(x, y) (memcmp((x), (y), sizeof(guid_t)) == 0)
 #define EQSTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) == 0)
 #define NEI8(x, y) ((x) != (y))
+#define NEU8(x, y) ((x) != (y))
 #define NEC8(x, y) ((x) != (y))
 #define NEI16(x, y) ((x) != (y))
 #define NEI32(x, y) ((x) != (y))
@@ -90,6 +92,7 @@ extern struct obj_t __ERR_OBJ;
 #define NEGUID(x, y) (memcmp((x), (y), sizeof(guid_t)) != 0)
 #define NESTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) != 0)
 #define LTI8(x, y) ((x) < (y))
+#define LTU8(x, y) ((x) < (y))
 #define LTC8(x, y) ((x) < (y))
 #define LTI16(x, y) ((x) < (y))
 #define LTI32(x, y) ((x) < (y))
@@ -98,6 +101,7 @@ extern struct obj_t __ERR_OBJ;
 #define LTGUID(x, y) (memcmp((x), (y), sizeof(guid_t)) < 0)
 #define LTSTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) < 0)
 #define GTI8(x, y) ((x) > (y))
+#define GTU8(x, y) ((x) > (y))
 #define GTC8(x, y) ((x) > (y))
 #define GTI16(x, y) ((x) > (y))
 #define GTI32(x, y) ((x) > (y))
@@ -106,6 +110,7 @@ extern struct obj_t __ERR_OBJ;
 #define GTGUID(x, y) (memcmp((x), (y), sizeof(guid_t)) > 0)
 #define GTSTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) > 0)
 #define LEI8(x, y) ((x) <= (y))
+#define LEU8(x, y) ((x) <= (y))
 #define LEC8(x, y) ((x) <= (y))
 #define LEI16(x, y) ((x) <= (y))
 #define LEI32(x, y) ((x) <= (y))
@@ -114,6 +119,7 @@ extern struct obj_t __ERR_OBJ;
 #define LEGUID(x, y) (!GTGUID((x), (y)))
 #define LESTR(x, xl, y, yl) (str_cmp((x), (xl), (y), (yl)) <= 0)
 #define GEI8(x, y) ((x) >= (y))
+#define GEU8(x, y) ((x) >= (y))
 #define GEC8(x, y) ((x) >= (y))
 #define GEI16(x, y) ((x) >= (y))
 #define GEI32(x, y) ((x) >= (y))
@@ -215,9 +221,18 @@ obj_p index_find_i64(i64_t x[], i64_t xl, i64_t y[], i64_t yl);
 obj_p ops_where(b8_t *mask, i64_t n);
 
 // Binary ops/coersions
-static inline u8_t b8_to_b8(b8_t x) { return x; }
-static inline i64_t b8_to_i64(i64_t x) { return x != 0 && x != NULL_I64; }
+// B8 conversions (boolean - no NULL handling needed)
+static inline b8_t b8_to_b8(b8_t x) { return x; }
+static inline u8_t b8_to_u8(b8_t x) { return (u8_t)x; }
+static inline i16_t b8_to_i16(b8_t x) { return (i16_t)x; }
+static inline i32_t b8_to_i32(b8_t x) { return (i32_t)x; }
+static inline i64_t b8_to_i64(b8_t x) { return (i64_t)x; }
+static inline f64_t b8_to_f64(b8_t x) { return (f64_t)x; }
+static inline b8_t u8_to_b8(u8_t x) { return x != 0; }
+static inline b8_t i16_to_b8(i16_t x) { return x != 0 && x != NULL_I16; }
+static inline b8_t i32_to_b8(i32_t x) { return x != 0 && x != NULL_I32; }
 static inline b8_t i64_to_b8(i64_t x) { return x != 0 && x != NULL_I64; }
+static inline b8_t f64_to_b8(f64_t x) { return x != 0.0 && !ISNANF64(x); }
 
 // U8 conversions (no NULL - unsigned byte)
 static inline u8_t u8_to_u8(u8_t x) { return x; }
@@ -225,6 +240,10 @@ static inline i16_t u8_to_i16(u8_t x) { return (i16_t)x; }
 static inline i32_t u8_to_i32(u8_t x) { return (i32_t)x; }
 static inline i64_t u8_to_i64(u8_t x) { return (i64_t)x; }
 static inline f64_t u8_to_f64(u8_t x) { return (f64_t)x; }
+static inline u8_t i16_to_u8(i16_t x) { return (x == NULL_I16) ? 0 : (u8_t)x; }
+static inline u8_t i32_to_u8(i32_t x) { return (x == NULL_I32) ? 0 : (u8_t)x; }
+static inline u8_t i64_to_u8(i64_t x) { return (x == NULL_I64) ? 0 : (u8_t)x; }
+static inline u8_t f64_to_u8(f64_t x) { return ISNANF64(x) ? 0 : (u8_t)x; }
 
 static inline i16_t i16_to_i16(i16_t x) { return x; }
 static inline i32_t i16_to_i32(i16_t x) { return (x == NULL_I16) ? NULL_I32 : (i32_t)x; }

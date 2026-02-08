@@ -9,14 +9,16 @@ endif
 
 $(info OS="$(OS)")
 
-ifeq ($(OS),Windows_NT)
+# Windows detection (native Windows_NT, MSYS2 MinGW, or MSYS)
+IS_WINDOWS := $(filter Windows_NT,$(OS))$(findstring mingw,$(OS))$(findstring msys,$(OS))
+ifneq (,$(IS_WINDOWS))
 AR = llvm-ar
 DEBUG_CFLAGS = -Wall -Wextra -std=$(STD) -g -O0 -DDEBUG -D_CRT_SECURE_NO_WARNINGS
 RELEASE_CFLAGS = -Wall -Wextra -std=$(STD) -O3 -DNDEBUG -D_CRT_SECURE_NO_WARNINGS \
  -fassociative-math -ftree-vectorize -funsafe-math-optimizations -funroll-loops -fno-math-errno
 LIBS = -lws2_32 -lmswsock -lkernel32
-DEBUG_LDFLAGS = -fuse-ld=lld
-RELEASE_LDFLAGS = -fuse-ld=lld
+DEBUG_LDFLAGS = -fuse-ld=lld -Wl,/DEF:rayforce.def -Wl,/IMPLIB:rayforce.lib
+RELEASE_LDFLAGS = -fuse-ld=lld -Wl,/DEF:rayforce.def -Wl,/IMPLIB:rayforce.lib
 LIBNAME = rayforce.dll
 TARGET = rayforce.exe
 endif
@@ -58,7 +60,7 @@ CORE_OBJECTS = core/poll.o core/ipc.o core/runtime.o core/sys.o core/os.o core/p
  core/sock.o core/error.o core/math.o core/cmp.o core/items.o core/logic.o core/compose.o core/order.o core/io.o\
  core/misc.o core/freelist.o core/update.o core/join.o core/query.o core/cond.o\
  core/iter.o core/dynlib.o core/aggr.o core/index.o core/group.o core/filter.o core/atomic.o\
- core/thread.o core/pool.o core/progress.o core/fdmap.o core/signal.o core/log.o
+ core/thread.o core/pool.o core/ctx.o core/progress.o core/fdmap.o core/signal.o core/log.o core/pivot.o
 APP_COMMON = app/repl.o app/term.o
 APP_OBJECTS = app/main.o $(APP_COMMON)
 TESTS_OBJECTS = tests/main.o
@@ -76,6 +78,7 @@ app: $(APP_OBJECTS) obj
 	$(CC) $(CFLAGS) -o $(TARGET) $(CORE_OBJECTS) $(APP_OBJECTS) $(LIBS) $(LDFLAGS)
 
 tests: -DSTOP_ON_FAIL=$(STOP_ON_FAIL) -DDEBUG
+tests: LDFLAGS = $(DEBUG_LDFLAGS)
 tests: $(TESTS_OBJECTS) $(APP_COMMON) obj
 	$(CC) -include core/def.h $(CFLAGS) -o $(TARGET).test $(CORE_OBJECTS) $(APP_COMMON) $(TESTS_OBJECTS) $(LIBS) $(LDFLAGS)
 	./$(TARGET).test
@@ -146,6 +149,7 @@ clean:
 	-rm -rf *.so
 	-rm -rf *.dylib
 	-rm -rf *.dll
+	-rm -f rayforce.lib
 	-rm -f $(TARGET).js
 	-rm -f $(TARGET).wasm
 	-rm -f $(TARGET)

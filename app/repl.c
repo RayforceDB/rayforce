@@ -24,6 +24,8 @@
 #include <stdio.h>
 #if defined(OS_WINDOWS)
 #include <io.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #define read _read
 #ifndef STDIN_FILENO
 #define STDIN_FILENO 0
@@ -43,10 +45,91 @@
 #include "../core/eval.h"
 #include "../core/heap.h"
 #include "../core/poll.h"
-#include "../core/string.h"
+#include "../core/str.h"
 #include "../core/log.h"
 #include "../core/error.h"
-#include "../core/error.h"
+
+#if defined(OS_WINDOWS)
+// Stdin thread context and globals (owned by repl on Windows)
+typedef struct stdin_thread_ctx_t {
+    HANDLE h_cp;
+    term_p term;
+    volatile LONG stop;
+} *stdin_thread_ctx_p;
+
+static stdin_thread_ctx_p __STDIN_THREAD_CTX = NULL;
+static HANDLE __STDIN_THREAD_HANDLE = NULL;
+
+static DWORD WINAPI StdinThread(LPVOID prm) {
+    stdin_thread_ctx_p ctx = (stdin_thread_ctx_p)prm;
+    term_p term = ctx->term;
+    HANDLE h_cp = ctx->h_cp;
+    DWORD bytes;
+
+    for (;;) {
+        if (InterlockedCompareExchange(&ctx->stop, 0, 0) != 0)
+            break;
+
+        bytes = (DWORD)term_getc(term);
+
+        if (InterlockedCompareExchange(&ctx->stop, 0, 0) != 0)
+            break;
+
+        if (bytes == 0)
+            break;
+
+        PostQueuedCompletionStatus(h_cp, bytes, STDIN_WAKER_ID, NULL);
+    }
+
+    PostQueuedCompletionStatus(h_cp, 0, STDIN_WAKER_ID, NULL);
+    return 0;
+}
+
+static nil_t repl_stdin_handler(poll_p poll, raw_p data) {
+    repl_p repl = (repl_p)data;
+    b8_t error;
+    obj_p str, res;
+
+    str = term_read(repl->term);
+    if (str != NULL) {
+        if (IS_ERR(str))
+            io_write(STDERR_FILENO, 2, str);
+        else if (str != NULL_OBJ) {
+            i64_t line = repl->term ? term_last_input_line(repl->term) : 0;
+            res = ray_eval_str_line(str, repl->name, line);
+            drop_obj(str);
+            error = IS_ERR(res);
+            if (error)
+                io_write(STDERR_FILENO, 2, res);
+            else
+                io_write(STDOUT_FILENO, 2, res);
+            drop_obj(res);
+            if (!error)
+                timeit_print();
+        }
+
+        if (repl->term->multiline_len == 0 && poll->code == NULL_I64)
+            term_prompt(repl->term);
+    }
+}
+
+static nil_t repl_stop_stdin_thread(nil_t) {
+    if (__STDIN_THREAD_HANDLE != NULL && __STDIN_THREAD_CTX != NULL) {
+        DWORD wait_result;
+        InterlockedExchange(&__STDIN_THREAD_CTX->stop, 1);
+        CancelSynchronousIo(__STDIN_THREAD_HANDLE);
+        wait_result = WaitForSingleObject(__STDIN_THREAD_HANDLE, 100);
+        if (wait_result == WAIT_TIMEOUT)
+            TerminateThread(__STDIN_THREAD_HANDLE, 0);
+        CloseHandle(__STDIN_THREAD_HANDLE);
+        __STDIN_THREAD_HANDLE = NULL;
+    }
+    if (__STDIN_THREAD_CTX) {
+        heap_free(__STDIN_THREAD_CTX);
+        __STDIN_THREAD_CTX = NULL;
+    }
+}
+#endif
 
 option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
     UNUSED(poll);
@@ -63,20 +146,16 @@ option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
 
     if (IS_ERR(str)) {
         io_write(STDERR_FILENO, 2, str);
-        if (repl->silent)
-            poll_exit(poll, 1);
     } else if (str != NULL_OBJ) {
         i64_t line = repl->term ? term_last_input_line(repl->term) : 0;
         res = ray_eval_str_line(str, repl->name, line);
         error = IS_ERR(res);
-        if (error) {
+        if (error)
             io_write(STDERR_FILENO, 2, res);
-            if (repl->silent)
-                poll_exit(poll, 1);
-        } else if (!repl->silent)  // Only print output if not in silent mode
+        else
             io_write(STDOUT_FILENO, 2, res);
 
-        if (!error && !repl->silent)
+        if (!error)
             timeit_print();
     }
 
@@ -85,7 +164,7 @@ option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
 
     // Only show regular prompt if not in multiline mode and not exiting
     // (continuation prompt is already shown by term_read when in multiline mode)
-    if (!repl->silent && repl->term->multiline_len == 0 && poll->code == NULL_I64)
+    if (repl->term->multiline_len == 0 && poll->code == NULL_I64)
         term_prompt(repl->term);
 
     return option_none();
@@ -94,26 +173,10 @@ option_t repl_on_data(poll_p poll, selector_p selector, raw_p data) {
 option_t repl_read(poll_p poll, selector_p selector) {
     obj_p str;
     repl_p repl;
-    c8_t line_buf[TERM_BUF_SIZE];
-    i64_t len;
 
     LOG_TRACE("repl_read");
 
     repl = (repl_p)selector->data;
-
-    if (repl->silent) {
-        // In silent mode, just read entire lines directly
-        len = read(STDIN_FILENO, line_buf, TERM_BUF_SIZE - 1);
-
-        if (len <= 0) {
-            poll->code = (len < 0) ? 1 : 0;
-            return option_error(err_os());
-        }
-
-        line_buf[len] = '\0';
-        str = string_from_str(line_buf, len);
-        return option_some(str);
-    }
 
     if (!term_getc(repl->term)) {
         poll->code = 1;
@@ -128,37 +191,41 @@ option_t repl_read(poll_p poll, selector_p selector) {
     return option_some(str);
 }
 
-repl_p repl_create(poll_p poll, b8_t silent) {
+repl_p repl_create(poll_p poll) {
     repl_p repl;
 
     repl = (repl_p)heap_alloc(sizeof(struct repl_t));
     repl->name = string_from_str("repl", 4);
-    repl->silent = silent;
 
 #if defined(OS_WINDOWS)
-    // On Windows, STDIN is handled by iocp.c's StdinThread
-    // The poll_init() function sets up STDIN handling internally
-    // Use poll->term instead of creating a separate one
-    repl->term = poll->term;
-    repl->id = 0;       // Placeholder ID for Windows
-    poll->repl = repl;  // Store repl pointer for cleanup
-#else
-    // Only create term if not in silent mode
-    if (!silent) {
-        repl->term = term_create();
-    } else {
-        repl->term = NULL;
-    }
+    // On Windows, repl owns the terminal and stdin thread
+    repl->term = term_create();
+    repl->id = 0;
 
+    if (repl->term != NULL) {
+        // Register stdin callback with poll
+        poll_set_stdin(poll, repl_stdin_handler, repl);
+
+        // Create stdin thread to post IOCP events on keypress
+        __STDIN_THREAD_CTX = (stdin_thread_ctx_p)heap_alloc(sizeof(struct stdin_thread_ctx_t));
+        __STDIN_THREAD_CTX->h_cp = (HANDLE)poll->poll_fd;
+        __STDIN_THREAD_CTX->term = repl->term;
+        __STDIN_THREAD_CTX->stop = 0;
+        __STDIN_THREAD_HANDLE = CreateThread(NULL, 0, StdinThread, (LPVOID)__STDIN_THREAD_CTX, 0, NULL);
+    }
+#else
     // Only register stdin if it's a TTY (epoll doesn't work on regular files/pipes)
     if (isatty(STDIN_FILENO)) {
+        repl->term = term_create();
+
         struct poll_registry_t registry = ZERO_INIT_STRUCT;
         registry.fd = STDIN_FILENO;
         registry.type = SELECTOR_TYPE_STDIN;
         registry.events = POLL_EVENT_READ | POLL_EVENT_ERROR | POLL_EVENT_HUP;
         registry.recv_fn = NULL;
         registry.read_fn = repl_read;
-        registry.close_fn = repl_on_close;
+        // epoll poll_destroy already calls close_fn on shutdown; main owns repl lifetime
+        registry.close_fn = NULL;
         registry.error_fn = repl_on_error;
         registry.data_fn = repl_on_data;
         registry.data = repl;
@@ -169,11 +236,14 @@ repl_p repl_create(poll_p poll, b8_t silent) {
             repl_destroy(repl);
             return NULL;
         }
-    } else if (silent) {
-        // Piped input in silent mode - read and eval synchronously
+    } else {
+        // Piped input - read and eval synchronously, then exit (oneshot mode, like Python)
         c8_t buf[TERM_BUF_SIZE];
         i64_t len;
         obj_p str, res, fmt;
+        b8_t has_error = B8_FALSE;
+
+        repl->term = NULL;
 
         while ((len = read(STDIN_FILENO, buf, TERM_BUF_SIZE - 1)) > 0) {
             buf[len] = '\0';
@@ -185,32 +255,32 @@ repl_p repl_create(poll_p poll, b8_t silent) {
                 fmt = obj_fmt(res, B8_TRUE);
                 printf("%.*s\n", (i32_t)fmt->len, AS_C8(fmt));
                 drop_obj(fmt);
+                has_error = B8_TRUE;
             }
             drop_obj(res);
         }
 
-        repl_destroy(repl);
-        return NULL;
-    } else {
-        // stdin is not a TTY and not silent mode - no interactive REPL possible
+        // Print timing info and signal to exit
+        timeit_print();
+        poll->code = has_error ? 1 : 0;
+
         repl_destroy(repl);
         return NULL;
     }
 #endif
 
-    if (!silent)
-        term_prompt(repl->term);
+    term_prompt(repl->term);
 
     return repl;
 }
 
 nil_t repl_destroy(repl_p repl) {
+#if defined(OS_WINDOWS)
+    repl_stop_stdin_thread();
+#endif
     drop_obj(repl->name);
-#if !defined(OS_WINDOWS)
-    // On Windows, term is shared with poll->term, so don't destroy here
     if (repl->term)
         term_destroy(repl->term);
-#endif
     heap_free(repl);
 }
 

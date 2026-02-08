@@ -5,7 +5,7 @@
 
 #include "error.h"
 #include "eval.h"
-#include "string.h"
+#include "str.h"
 #include "util.h"
 
 // ============================================================================

@@ -23,7 +23,7 @@
 
 #include <stdio.h>
 #include "error.h"
-#include "string.h"
+#include "str.h"
 #include "dynlib.h"
 #include "heap.h"
 #include "runtime.h"
@@ -195,16 +195,16 @@ obj_p ray_loadfn(obj_p *args, i64_t n) {
         return err_arity(3, n, 0);
 
     if (!args[0] || !args[1] || !args[2])
-        return err_type(0, 0, 0, 0);
+        return err_domain(0, 0);
 
     if (args[0]->type != TYPE_C8)
-        return err_type(0, 0, 0, 0);
+        return err_type(TYPE_C8, args[0]->type, 1, 0);
 
     if (args[1]->type != TYPE_C8)
-        return err_type(0, 0, 0, 0);
+        return err_type(TYPE_C8, args[1]->type, 2, 0);
 
     if (args[2]->type != -TYPE_I64)
-        return err_type(0, 0, 0, 0);
+        return err_type(-TYPE_I64, args[2]->type, 3, 0);
 
     path = cstring_from_str(AS_C8(args[0]), args[0]->len);
     func = cstring_from_str(AS_C8(args[1]), args[1]->len);

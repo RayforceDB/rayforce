@@ -1,7 +1,15 @@
-(set .kx.listen (loadfn "ext/raykx/libraykx.so" "raykx_listen" 1))
-(set .kx.hopen (loadfn "ext/raykx/libraykx.so" "raykx_hopen" 1))
-(set .kx.hclose (loadfn "ext/raykx/libraykx.so" "raykx_hclose" 1))
-(set .kx.send (loadfn "ext/raykx/libraykx.so" "raykx_send" 2))
+;; Cross-platform library loading for raykx
+(set .kx.libpath
+    (if (== (at (sysinfo) 'os) "Windows")
+        "ext/raykx/raykx.dll"
+        (if (== (at (sysinfo) 'os) "macOS")
+            "ext/raykx/libraykx.dylib"
+            "ext/raykx/libraykx.so")))
 
-;; (set h (.kx.hopen "proxtab.ax.ath:6650"))
-(set h (.kx.hopen "127.0.0.1:5101"))
+(set .kx.listen (loadfn .kx.libpath "raykx_listen" 1))
+(set .kx.hopen (loadfn .kx.libpath "raykx_hopen" 1))
+(set .kx.hclose (loadfn .kx.libpath "raykx_hclose" 1))
+(set .kx.send (loadfn .kx.libpath "raykx_send" 2))
+
+;; Example usage:
+;; (set h (.kx.hopen "127.0.0.1:5101"))

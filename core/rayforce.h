@@ -88,6 +88,7 @@ typedef u8_t guid_t[16];
 #define TYPE_UNARY 101
 #define TYPE_BINARY 102
 #define TYPE_VARY 103
+#define TYPE_EXT 124
 #define TYPE_TOKEN 125
 
 // Special Types
@@ -138,28 +139,29 @@ typedef obj_p list_t;
 extern u8_t version(nil_t);  // get version as u8_t (major - 5 bits, minor - 3 bits)
 
 // Constructors
-extern obj_p null(i8_t type);                  // create null atom of type
-extern obj_p nullv(i8_t type, i64_t len);      // create null list of type and length
-extern obj_p atom(i8_t type);                  // create atom of type
-extern obj_p vn_list(i64_t len, ...);          // create list from values
-extern obj_p vector(i8_t type, i64_t len);     // create vector of type
-extern obj_p vn_symbol(i64_t len, ...);        // create vector symbols from strings
-extern obj_p b8(b8_t val);                     // bool atom
-extern obj_p u8(u8_t val);                     // byte atom
-extern obj_p c8(c8_t c);                       // char
-extern obj_p i16(i16_t val);                   // i16 atom
-extern obj_p i32(i32_t val);                   // i32 atom
-extern obj_p i64(i64_t val);                   // i64 atom
-extern obj_p f64(f64_t val);                   // f64 atom
-extern obj_p symbol(lit_p ptr, i64_t len);     // symbol
-extern obj_p symboli64(i64_t id);              // symbol from i64
-extern obj_p adate(i32_t val);                 // date
-extern obj_p atime(i32_t val);                 // time
-extern obj_p timestamp(i64_t val);             // timestamp
-extern obj_p guid(const guid_t buf);           // GUID
-extern obj_p vn_c8(lit_p fmt, ...);            // string from format
-extern obj_p enumerate(obj_p sym, obj_p vec);  // enum
-extern obj_p anymap(obj_p sym, obj_p vec);     // anymap
+extern obj_p null(i8_t type);                            // create null atom of type
+extern obj_p nullv(i8_t type, i64_t len);                // create null list of type and length
+extern obj_p atom(i8_t type);                            // create atom of type
+extern obj_p vn_list(i64_t len, ...);                    // create list from values
+extern obj_p vector(i8_t type, i64_t len);               // create vector of type
+extern obj_p vn_symbol(i64_t len, ...);                  // create vector symbols from strings
+extern obj_p b8(b8_t val);                               // bool atom
+extern obj_p u8(u8_t val);                               // byte atom
+extern obj_p c8(c8_t c);                                 // char
+extern obj_p i16(i16_t val);                             // i16 atom
+extern obj_p i32(i32_t val);                             // i32 atom
+extern obj_p i64(i64_t val);                             // i64 atom
+extern obj_p f64(f64_t val);                             // f64 atom
+extern obj_p symbol(lit_p ptr, i64_t len);               // symbol
+extern obj_p symboli64(i64_t id);                        // symbol from i64
+extern obj_p adate(i32_t val);                           // date
+extern obj_p atime(i32_t val);                           // time
+extern obj_p timestamp(i64_t val);                       // timestamp
+extern obj_p guid(const guid_t buf);                     // GUID
+extern obj_p vn_c8(lit_p fmt, ...);                      // string from format
+extern obj_p enumerate(obj_p sym, obj_p vec);            // enum
+extern obj_p anymap(obj_p sym, obj_p vec);               // anymap
+extern obj_p external(raw_p ptr, nil_t (*drop)(raw_p));  // external
 
 #define B8(len) (vector(TYPE_B8, len))                // bool vector
 #define U8(len) (vector(TYPE_U8, len))                // byte vector
@@ -290,6 +292,11 @@ extern nil_t ray_clean(nil_t);
 
 // Error
 extern obj_p ray_err(lit_p msg);
+
+// Custom thread context — call ON the custom thread
+typedef struct ray_ctx_t *ray_ctx_p;
+extern ray_ctx_p ray_ctx_create(nil_t);
+extern nil_t ray_ctx_destroy(ray_ctx_p ctx);
 
 #ifdef __cplusplus
 }

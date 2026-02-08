@@ -41,7 +41,7 @@
 #include "query.h"
 #include "time.h"
 #include "runtime.h"
-#include "string.h"
+#include "str.h"
 #include "chrono.h"
 #include "date.h"
 #include "timestamp.h"
@@ -51,6 +51,7 @@
 #include "vary.h"
 #include "os.h"
 #include "proc.h"
+#include "pivot.h"
 
 i64_t SYMBOL_FN;
 i64_t SYMBOL_SELF;
@@ -175,7 +176,8 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "raze",                TYPE_UNARY,    FN_NONE,                   ray_raze);
     REGISTER_FN(functions,  "diverse",             TYPE_UNARY,    FN_NONE,                   ray_diverse);
     REGISTER_FN(functions,  "row",                 TYPE_UNARY,    FN_NONE | FN_AGGR,         ray_row);
-    
+    REGISTER_FN(functions,  "del",                 TYPE_UNARY,    FN_NONE | FN_SPECIAL_FORM, ray_del);
+
     // Binary           
     REGISTER_FN(functions,  "try",                 TYPE_BINARY,   FN_NONE | FN_SPECIAL_FORM, try_obj);
     REGISTER_FN(functions,  "set",                 TYPE_BINARY,   FN_NONE | FN_SPECIAL_FORM, ray_set);
@@ -255,6 +257,7 @@ nil_t init_functions(obj_p functions)
     REGISTER_FN(functions,  "asof-join",           TYPE_VARY,     FN_NONE,                   ray_asof_join);
     REGISTER_FN(functions,  "window-join",         TYPE_VARY,     FN_NONE,                   ray_window_join);
     REGISTER_FN(functions,  "window-join1",        TYPE_VARY,     FN_NONE,                   ray_window_join1);
+    REGISTER_FN(functions,  "pivot",               TYPE_VARY,     FN_NONE,                   ray_pivot);
     REGISTER_FN(functions,  "if",                  TYPE_VARY,     FN_NONE | FN_SPECIAL_FORM, ray_cond);
     REGISTER_FN(functions,  "return",              TYPE_VARY,     FN_NONE,                   ray_return);
     REGISTER_FN(functions,  "hopen",               TYPE_VARY,     FN_NONE,                   ray_hopen);
@@ -483,14 +486,14 @@ str_p env_get_internal_entry_name(lit_p name, i64_t len, obj_p entries, i64_t *i
     if (exact) {
         for (i = 0; i < l; i++) {
             nm = str_from_symbol(names[i]);
-            n = SYMBOL_STRLEN(names[i]);
+            n = symbol_strlen(names[i]);
             if (n == len && strncmp(name, nm, len) == 0)
                 return nm;
         }
     } else {
         for (i = *index; i < l; i++) {
             nm = str_from_symbol(names[i]);
-            n = SYMBOL_STRLEN(names[i]);
+            n = symbol_strlen(names[i]);
             if (len < n && strncmp(name, nm, len) == 0) {
                 *index = i + 1;
                 return nm;
@@ -521,7 +524,7 @@ str_p env_get_global_name(lit_p name, i64_t len, i64_t *index, i64_t *sbidx) {
 
     for (i = *index; i < l; i++) {
         nm = str_from_symbol(names[i]);
-        n = SYMBOL_STRLEN(names[i]);
+        n = symbol_strlen(names[i]);
         if (len < n && strncmp(name, nm, len) == 0) {
             *index = i + 1;
             return nm;
@@ -532,7 +535,7 @@ str_p env_get_global_name(lit_p name, i64_t len, i64_t *index, i64_t *sbidx) {
             m = AS_LIST(vals[i])[0]->len;
             for (j = *sbidx; j < m; j++) {
                 nm = str_from_symbol(cols[j]);
-                n = SYMBOL_STRLEN(cols[j]);
+                n = symbol_strlen(cols[j]);
                 if (len < n && strncmp(name, nm, len) == 0) {
                     *sbidx = j + 1;
                     return nm;
@@ -550,4 +553,28 @@ obj_p ray_internals(obj_p *x, i64_t n) {
     UNUSED(x);
     UNUSED(n);
     return clone_obj(runtime_get()->env.internals);
+}
+
+obj_p ray_del(obj_p x) {
+    i64_t i;
+    obj_p vars;
+
+    if (x->type != -TYPE_SYMBOL)
+        return err_type(-TYPE_SYMBOL, x->type, 0, 0);
+
+    // Check if protected function
+    i = find_raw(AS_LIST(runtime_get()->env.functions)[0], &x->i64);
+    if (i != NULL_I64)
+        return err_domain(0, 0);
+
+    // Find in variables
+    vars = runtime_get()->env.variables;
+    i = find_raw(AS_LIST(vars)[0], &x->i64);
+    if (i == NULL_I64)
+        return err_domain(0, 0);
+
+    // Remove from dict
+    remove_obj(&runtime_get()->env.variables, x);
+
+    return NULL_OBJ;
 }

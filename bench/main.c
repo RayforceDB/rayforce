@@ -42,7 +42,7 @@
 #include "../core/eval.h"
 #include "../core/hash.h"
 #include "../core/symbols.h"
-#include "../core/string.h"
+#include "../core/str.h"
 #include "../core/util.h"
 #include "../core/parse.h"
 #include "../core/runtime.h"

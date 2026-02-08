@@ -29,10 +29,12 @@
     eval;
     eval_str;
     parse;
+    err_*;
     heap_alloc;
     heap_free;
     symbols_intern;
     str_from_symbol;
+    symbol_strlen;
     __VM;
     __RUNTIME;
     __NULL_OBJ;
@@ -43,4 +45,5 @@
     poll_*;
     sock_*;
     log_*;
+    ray_ctx_*;
 };

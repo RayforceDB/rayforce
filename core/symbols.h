@@ -30,10 +30,17 @@
 #define SYMBOLS_HT_SIZE RAY_PAGE_SIZE * 1024
 #define STRING_NODE_SIZE RAY_PAGE_SIZE
 #define STRING_POOL_SIZE (RAY_PAGE_SIZE * 1024ull * 1024ull)
-#define SYMBOL_STRLEN(x) ((x == NULL_I64) ? 0 : *((u32_t *)(x - sizeof(u32_t))))
+#define SYMBOLS_MAX_COUNT (1024ull * 1024ull * 16ull)  // Max 16M unique symbols
+
+// Get string length from compact symbol ID (defined in symbols.c)
+i64_t symbol_strlen(i64_t compact_id);
+
+// Backward compatibility macro
+#define SYMBOL_STRLEN(id) symbol_strlen(id)
 
 typedef struct symbol_t {
     lit_p str;
+    i64_t compact_id;   // Sequential ID (0, 1, 2, ...)
     struct symbol_t *next;
 } *symbol_p;
 
@@ -44,6 +51,7 @@ typedef struct symbols_t {
     str_p string_pool;  // string pool
     str_p string_node;  // string pool current node
     str_p string_curr;  // string pool cursor
+    str_p *strings;     // compact_id -> string pointer array
 } *symbols_p;
 
 i64_t symbols_intern(lit_p s, i64_t len);

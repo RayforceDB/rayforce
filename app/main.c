@@ -25,8 +25,19 @@
 #include "../core/runtime.h"
 #include "../core/format.h"
 #include "../core/sys.h"
-#include "../core/string.h"
+#include "../core/str.h"
+#include "../core/io.h"
+#include "../core/chrono.h"
 #include "repl.h"
+#if defined(OS_WINDOWS)
+#include <io.h>
+#define isatty _isatty
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#endif
+#else
+#include <unistd.h>
+#endif
 
 nil_t print_logo(sys_info_t *info) {
     printf(
@@ -46,32 +57,68 @@ i32_t main(i32_t argc, str_p argv[]) {
     i32_t code = -1;
     sys_info_t *info;
     runtime_p runtime;
-    obj_p repl_arg;
-    b8_t silent_mode = B8_FALSE;
+    obj_p interactive_arg, port_arg, file_arg, res, fmt;
+    b8_t interactive = B8_FALSE;
+    b8_t has_file = B8_FALSE;
+    b8_t file_error = B8_FALSE;
 
     runtime = runtime_create(argc, argv);
     if (runtime == NULL)
         return -1;
 
-    // Check if silent mode is enabled (repl flag is "0" or "false")
-    repl_arg = runtime_get_arg("repl");
-    if (!is_null(repl_arg)) {
-        silent_mode = (str_cmp(AS_C8(repl_arg), repl_arg->len, "0", 1) == 0) ||
-                      (str_cmp(AS_C8(repl_arg), repl_arg->len, "false", 5) == 0);
-        drop_obj(repl_arg);
+    // Check if interactive mode is explicitly requested (-i/--interactive)
+    interactive_arg = runtime_get_arg("interactive");
+    interactive = !is_null(interactive_arg);
+    drop_obj(interactive_arg);
+
+    // Check if port is specified (-p/--port) — implies server mode
+    port_arg = runtime_get_arg("port");
+    if (!is_null(port_arg))
+        interactive = B8_TRUE;
+    drop_obj(port_arg);
+
+    // Check if a file was provided
+    file_arg = runtime_get_arg("file");
+    has_file = !is_null(file_arg);
+
+    // Load startup script if specified
+    if (has_file) {
+        res = ray_load(file_arg);
+        drop_obj(file_arg);
+        if (IS_ERR(res)) {
+            fmt = obj_fmt(res, B8_TRUE);
+            printf("%.*s\n", (i32_t)fmt->len, AS_C8(fmt));
+            drop_obj(fmt);
+            file_error = B8_TRUE;
+        }
+        drop_obj(res);
+
+        // Oneshot mode: file without -i flag = execute and exit (like Python)
+        if (!interactive) {
+            timeit_print();
+            code = file_error ? 1 : 0;
+            runtime_destroy();
+            return code;
+        }
     }
 
-    // Only print logo if not in silent mode
-    if (!silent_mode) {
+    // Interactive mode: no file, or file with -i flag
+    // Only show logo and REPL if stdin is a TTY (not piped input)
+    if (isatty(STDIN_FILENO)) {
         info = &runtime_get()->sys_info;
         print_logo(info);
     }
 
-    // Create REPL for standalone app
+    // Create REPL for interactive mode (handles both TTY and piped input)
+    repl_p repl = NULL;
     if (runtime->poll)
-        repl_create(runtime->poll, silent_mode);
+        repl = repl_create(runtime->poll);
 
     code = runtime_run();
+
+    if (repl)
+        repl_destroy(repl);
+
     runtime_destroy();
 
     return code;

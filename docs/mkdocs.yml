@@ -154,6 +154,7 @@ nav:
       - Upsert: content/documentation/queries/upsert.md
       - Alter: content/documentation/queries/alter.md
       - Joins: content/documentation/queries/joins.md
+      - Pivot: content/documentation/queries/pivot.md
     - Operations:
       - Math: content/documentation/operations/math.md
       - Order: content/documentation/operations/order.md

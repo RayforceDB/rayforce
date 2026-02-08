@@ -40,7 +40,9 @@ obj_p io_get_symfile(obj_p path);
 obj_p io_set_table(obj_p path, obj_p table);
 obj_p io_set_table_splayed(obj_p path, obj_p table, obj_p symfile);
 obj_p io_get_table_splayed(obj_p path, obj_p symfile);
-obj_p io_read_csv(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t total_lines, obj_p cols, c8_t sep);
+obj_p io_read_csv(i8_t *types, i64_t num_types, str_p buf, i64_t size, i64_t total_lines, i64_t *line_offsets,
+                  obj_p cols, c8_t sep);
 i64_t io_symbol_from_str_trimmed(str_p src, i64_t len);
+i64_t io_build_line_index(str_p buf, i64_t size, i64_t **line_offsets_out);
 
 #endif  // IO_H

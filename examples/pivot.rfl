@@ -1,0 +1,47 @@
+(set n 100000)
+
+(set trades (table [Date Symbol Sector Side Price Quantity]
+    (list
+        (+ 2024.01.01 (take (til 30) n))
+        (take [AAPL GOOG MSFT AMZN META NVDA TSLA] n)
+        (take [Tech Tech Tech Retail Tech Tech Auto] n)
+        (take [Buy Sell Short] n)
+        (+ (+ (take [150 280 420 185 510 890 245] n) (take (til 37) n)) (* 3 (take (til 13) n)))
+        (* (* 100 (+ 1 (take (til 11) n))) (take [1 2 1 3 1 2 4 1 2 1 5 2 1] n))
+    ))
+)
+
+(println trades)
+
+(println "1. Total Quantity by Symbol and Side")
+(println (pivot trades 'Symbol 'Side 'Quantity sum))
+
+(println "2. Average Price by Symbol and Side")
+(println (pivot trades 'Symbol 'Side 'Price avg))
+
+(println "3. Trade Count by Sector and Side")
+(println (pivot trades 'Sector 'Side 'Quantity count))
+
+(println "4. Min Price by Symbol and Side")
+(println (pivot trades 'Symbol 'Side 'Price min))
+
+(println "5. Max Price by Symbol and Side")
+(println (pivot trades 'Symbol 'Side 'Price max))
+
+(println "6. Multi-index: Quantity by Date+Symbol and Side")
+(println (pivot trades [Date Symbol] 'Side 'Quantity sum))
+
+(println "7. Multi-index: Avg Price by Sector+Symbol and Side")
+(println (pivot trades [Sector Symbol] 'Side 'Price avg))
+
+(println "8. First Price by Symbol and Side")
+(println (pivot trades 'Symbol 'Side 'Price first))
+
+(println "9. Last Quantity by Symbol and Side")
+(println (pivot trades 'Symbol 'Side 'Quantity last))
+
+(println "10. Median Price by Sector and Side")
+(println (pivot trades 'Sector 'Side 'Price med))
+
+(println "11. Custom aggregation: Sum of squares")
+(println (pivot trades 'Symbol 'Side 'Quantity (fn [x] (sum (* x x)))))

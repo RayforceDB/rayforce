@@ -5,7 +5,7 @@
 #include "log.h"
 #include "def.h"
 #include "os.h"
-#include "string.h"
+#include "str.h"
 #include "format.h"
 #include "mmap.h"
 

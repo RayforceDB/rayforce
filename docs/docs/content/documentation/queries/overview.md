@@ -30,6 +30,11 @@ RayforceDB provides powerful query operations for working with [:material-table:
 !!! note ""
     Modifies elements at specific indices in [:material-vector-line: Vectors](../data-types/vector.md), [:material-code-array: Lists](../data-types/list.md), or [:material-table: Tables](../data-types/table.md) using [:material-function: functions](../data-types/functions.md).
 
+### [:material-table-pivot: Pivot](./pivot.md)
+
+!!! note ""
+    Transforms data from long format to wide format by rotating unique values from one column into multiple columns. Supports aggregation functions including `sum`, `count`, `avg`, `min`, `max`, `first`, `last`, and `med`.
+
 ### [:material-table-network: Joins](./joins.md)
 
 !!! note ""

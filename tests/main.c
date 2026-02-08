@@ -32,7 +32,7 @@
 #include "../core/eval.h"
 #include "../core/hash.h"
 #include "../core/symbols.h"
-#include "../core/string.h"
+#include "../core/str.h"
 #include "../core/util.h"
 #include "../core/parse.h"
 #include "../core/runtime.h"
@@ -40,7 +40,6 @@
 #include "../core/pool.h"
 #include "../core/sys.h"
 #include "../core/eval.h"
-#include "../core/error.h"
 
 typedef enum test_status_t { TEST_PASS = 0, TEST_FAIL, TEST_SKIP } test_status_t;
 
@@ -60,16 +59,22 @@ typedef struct test_entry_t {
 
 // Setup and Teardown functions
 nil_t setup() {
+    sys_info_t si;
 #ifdef STOP_ON_FAIL
     runtime_create(1, NULL);
 #else
     runtime_create(0, NULL);
 #endif
-    // Pool is now created inside runtime_create with all threads
+    // Initialize thread pool for pmap tests
+    si = sys_info(0);
+    if (si.threads > 1)
+        __RUNTIME->pool = pool_create(si.threads - 1);
+    // heap_create(0);
 }
 
 nil_t teardown() {
     runtime_destroy();
+    // heap_destroy();
 }
 
 #define PASS() \
@@ -126,19 +131,22 @@ nil_t on_skip(str_p msg) { printf("%sSkipped%s (%s)\n", YELLOW, RESET, msg ? msg
         obj_p le = eval_str(lhs);                                                                                      \
         obj_p lns = obj_fmt(le, B8_TRUE);                                                                              \
         if (IS_ERR(le)) {                                                                                              \
-            drop_obj(lns);                                                                                             \
+            obj_p fmt = str_fmt(-1, "Input error: %s\n -- at: %s:%d", AS_C8(lns), __FILE__, __LINE__);                 \
             drop_obj(le);                                                                                              \
-            SKIP("error in eval");                                                                                     \
+            drop_obj(lns);                                                                                             \
+            FAIL(AS_C8(fmt));                                                                                          \
         } else {                                                                                                       \
             obj_p re = eval_str(rhs);                                                                                  \
             obj_p rns = obj_fmt(re, B8_TRUE);                                                                          \
             obj_p fmt = str_fmt(-1, "Expected %s, got %s\n -- at: %s:%d", AS_C8(rns), AS_C8(lns), __FILE__, __LINE__); \
-            TEST_ASSERT(str_cmp(AS_C8(lns), lns->len, AS_C8(rns), rns->len) == 0, AS_C8(fmt));                         \
-            drop_obj(fmt);                                                                                             \
+            b8_t pass = str_cmp(AS_C8(lns), lns->len, AS_C8(rns), rns->len) == 0;                                      \
             drop_obj(re);                                                                                              \
             drop_obj(le);                                                                                              \
             drop_obj(lns);                                                                                             \
             drop_obj(rns);                                                                                             \
+            if (!pass)                                                                                                 \
+                FAIL(AS_C8(fmt));                                                                                      \
+            drop_obj(fmt);                                                                                             \
         }                                                                                                              \
     }
 
@@ -148,17 +156,17 @@ nil_t on_skip(str_p msg) { printf("%sSkipped%s (%s)\n", YELLOW, RESET, msg ? msg
         obj_p lns = obj_fmt(le, B8_TRUE);                                                                       \
         if (!IS_ERR(le)) {                                                                                      \
             obj_p fmt = str_fmt(-1, "Expected error: %s\n -- at: %s:%d", AS_C8(lns), __FILE__, __LINE__);       \
-            TEST_ASSERT(0, AS_C8(lns));                                                                         \
             drop_obj(lns);                                                                                      \
-            drop_obj(fmt);                                                                                      \
             drop_obj(le);                                                                                       \
+            FAIL(AS_C8(fmt));                                                                                   \
         } else {                                                                                                \
             lit_p err_text = AS_C8(lns);                                                                        \
             if (err_text == NULL || strstr(err_text, rhs) == NULL) {                                            \
                 obj_p fmt =                                                                                     \
                     str_fmt(-1, "Expect \"%s\", in: \"%s\"\n -- at: %s:%d", rhs, err_text, __FILE__, __LINE__); \
-                TEST_ASSERT(0, AS_C8(fmt));                                                                     \
-                drop_obj(fmt);                                                                                  \
+                drop_obj(le);                                                                                   \
+                drop_obj(lns);                                                                                  \
+                FAIL(AS_C8(fmt));                                                                               \
             }                                                                                                   \
             drop_obj(le);                                                                                       \
             drop_obj(lns);                                                                                      \
@@ -174,6 +182,8 @@ nil_t on_skip(str_p msg) { printf("%sSkipped%s (%s)\n", YELLOW, RESET, msg ? msg
 #include "lang.c"
 #include "serde.c"
 #include "parted.c"
+#include "ext.c"
+#include "pivot.c"
 
 // Add tests here
 test_entry_t tests[] = {
@@ -400,8 +410,23 @@ test_entry_t tests[] = {
     {"test_parted_count_i16", test_parted_count_i16},
     {"test_parted_count_i32", test_parted_count_i32},
     {"test_parted_count_time", test_parted_count_time},
-    // Parted distinct tests
-    {"test_parted_distinct_i64", test_parted_distinct_i64},
+    {"test_external", test_external},
+    // Pivot tests
+    {"test_pivot_basic_sum", test_pivot_basic_sum},
+    {"test_pivot_count", test_pivot_count},
+    {"test_pivot_avg", test_pivot_avg},
+    {"test_pivot_min", test_pivot_min},
+    {"test_pivot_max", test_pivot_max},
+    {"test_pivot_first", test_pivot_first},
+    {"test_pivot_last", test_pivot_last},
+    {"test_pivot_med", test_pivot_med},
+    {"test_pivot_multi_index", test_pivot_multi_index},
+    {"test_pivot_index_values", test_pivot_index_values},
+    {"test_pivot_multiple_columns", test_pivot_multiple_columns},
+    {"test_pivot_float_values", test_pivot_float_values},
+    {"test_pivot_errors", test_pivot_errors},
+    {"test_pivot_large", test_pivot_large},
+    {"test_pivot_symbol_columns", test_pivot_symbol_columns},
 };
 // ---
 
@@ -417,7 +442,8 @@ i32_t main() {
 
     i32_t num_failed = num_tests - num_passed - num_skipped;
     if (num_failed > 0)
-        printf("%sPassed%s %d/%d tests (%d skipped, %d failed).\n", YELLOW, RESET, num_passed, num_tests, num_skipped, num_failed);
+        printf("%sPassed%s %d/%d tests (%d skipped, %d failed).\n", YELLOW, RESET, num_passed, num_tests, num_skipped,
+               num_failed);
     else if (num_skipped > 0)
         printf("%sAll tests passed!%s (%d skipped)\n", GREEN, RESET, num_skipped);
     else

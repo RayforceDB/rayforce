@@ -25,7 +25,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
-#include "string.h"
+#include "str.h"
 #include "hash.h"
 #include "rayforce.h"
 #include "heap.h"

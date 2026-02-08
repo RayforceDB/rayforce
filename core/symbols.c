@@ -25,7 +25,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
-#include "string.h"
+#include "str.h"
 #include "symbols.h"
 #include "rayforce.h"
 #include "heap.h"
@@ -78,7 +78,7 @@ str_p string_intern(symbols_p symbols, lit_p str, i64_t len) {
 }
 
 i64_t symbols_intern(lit_p str, i64_t len) {
-    i64_t l, index, rounds = 0;
+    i64_t l, index, rounds = 0, compact_id;
     str_p intr;
     symbols_p symbols = runtime_get()->symbols;
     symbol_p new_bucket, current_bucket, b, *syms;
@@ -99,9 +99,9 @@ load:
     }
 
     while (b != NULL) {
-        l = SYMBOL_STRLEN((i64_t)b->str);
+        l = *((u32_t *)(b->str - sizeof(u32_t)));  // Get string length directly
         if (str_cmp(b->str, l, str, len) == 0)
-            return (i64_t)b->str;
+            return b->compact_id;  // Return compact ID instead of pointer
 
         b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE);
     }
@@ -115,13 +115,22 @@ load:
     b = current_bucket;
 
     while (b != NULL) {
-        l = SYMBOL_STRLEN((i64_t)b->str);
+        l = *((u32_t *)(b->str - sizeof(u32_t)));  // Get string length directly
         if (str_cmp(b->str, l, str, len) == 0) {
             __atomic_store_n(&syms[index], current_bucket, __ATOMIC_RELEASE);
-            return (i64_t)b->str;
+            return b->compact_id;  // Return compact ID instead of pointer
         }
 
         b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE);
+    }
+
+    // Allocate new compact ID atomically
+    compact_id = __atomic_fetch_add(&symbols->count, 1, __ATOMIC_RELAXED);
+    
+    if (compact_id >= (i64_t)SYMBOLS_MAX_COUNT) {
+        // Too many symbols - this is a fatal error
+        fprintf(stderr, "Error: exceeded maximum symbol count (%llu)\n", (unsigned long long)SYMBOLS_MAX_COUNT);
+        exit(1);
     }
 
     new_bucket = (symbol_p)heap_alloc(sizeof(struct symbol_t));
@@ -130,12 +139,15 @@ load:
 
     intr = string_intern(symbols, str, len);
     new_bucket->str = intr;
+    new_bucket->compact_id = compact_id;
     new_bucket->next = current_bucket;
 
-    __atomic_store_n(&syms[index], new_bucket, __ATOMIC_RELEASE);
-    __atomic_fetch_add(&symbols->count, 1, __ATOMIC_RELAXED);
+    // Store string pointer in the lookup array
+    symbols->strings[compact_id] = intr;
 
-    return (i64_t)intr;
+    __atomic_store_n(&syms[index], new_bucket, __ATOMIC_RELEASE);
+
+    return compact_id;
 }
 
 symbols_p symbols_create(nil_t) {
@@ -166,6 +178,13 @@ symbols_p symbols_create(nil_t) {
     symbols->string_curr = symbols->string_pool;
     symbols->string_node = symbols->string_pool + STRING_NODE_SIZE;
 
+    // Allocate compact_id -> string pointer lookup array
+    symbols->strings = (str_p *)heap_mmap(SYMBOLS_MAX_COUNT * sizeof(str_p));
+    if (symbols->strings == NULL) {
+        perror("symbols->strings mmap");
+        exit(1);
+    }
+
     if (mmap_commit(symbols->string_pool, STRING_NODE_SIZE) == -1) {
         perror("string_pool mmap_commit");
         exit(1);
@@ -189,11 +208,23 @@ nil_t symbols_destroy(symbols_p symbols) {
     }
 
     mmap_free(symbols->syms, symbols->size * sizeof(symbol_p));
+    mmap_free(symbols->strings, SYMBOLS_MAX_COUNT * sizeof(str_p));
     mmap_free(symbols->string_pool, STRING_POOL_SIZE);
     heap_unmap(symbols, sizeof(struct symbols_t));
 }
 
-str_p str_from_symbol(i64_t key) { return (key == NULL_I64) ? (str_p) "" : (str_p)key; }
+str_p str_from_symbol(i64_t compact_id) {
+    if (compact_id == NULL_I64)
+        return (str_p)"";
+    return runtime_get()->symbols->strings[compact_id];
+}
+
+i64_t symbol_strlen(i64_t compact_id) {
+    if (compact_id == NULL_I64)
+        return 0;
+    str_p s = runtime_get()->symbols->strings[compact_id];
+    return *((u32_t *)(s - sizeof(u32_t)));
+}
 
 i64_t symbols_count(symbols_p symbols) { return symbols->count; }
 

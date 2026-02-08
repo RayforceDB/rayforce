@@ -30,7 +30,7 @@
 #include "util.h"
 #include "items.h"
 #include "unary.h"
-#include "string.h"
+#include "str.h"
 #include "runtime.h"
 #include "index.h"
 #include "pool.h"
@@ -269,7 +269,8 @@ static obj_p aggr_map_other(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
     group_len = index_group_len(index);
     out_len = group_count;
 
-    n = pool_split_by(pool, group_len, group_count);
+    // Memory-aware split: considers groups × type_size per thread
+    n = pool_split_by_mem(pool, group_len, group_count, size_of_type(outype));
 
     if (n == 1) {
         argv[0] = (raw_p)group_len;
@@ -295,15 +296,15 @@ static obj_p aggr_map_other(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
 
 static obj_p aggr_map_parted(raw_p aggr, obj_p val, i8_t outype, obj_p index) {
     pool_p pool = runtime_get()->pool;
-    i64_t i, l, n, group_count, group_len, out_len, chunk;
+    i64_t i, l, n, group_len, out_len, chunk;
     obj_p res;
     raw_p argv[6];
 
-    group_count = index_group_count(index);
     group_len = val->len;
     out_len = 1;
 
-    n = pool_split_by(pool, group_len, group_count);
+    // For parted, out_len=1 per thread, so memory is minimal
+    n = pool_split_by_mem(pool, group_len, out_len, size_of_type(outype));
 
     if (n == 1) {
         argv[0] = (raw_p)group_len;
@@ -439,11 +440,144 @@ obj_p aggr_first_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p a
 
 obj_p aggr_first(obj_p val, obj_p index) {
     i64_t i, j, n, l;
-    i64_t *xo, *xe;
+    i64_t *xo, *xe, *first_ids, *filter_ids;
     obj_p parts, res, ek, filter, sym;
 
     n = index_group_count(index);
 
+    // Fast path: if first indices are precomputed, use them directly
+    first_ids = index_group_first_ids(index);
+    filter_ids = index_group_filter_ids(index);
+    if (first_ids != NULL) {
+        switch (val->type) {
+            case TYPE_U8:
+            case TYPE_B8:
+            case TYPE_C8: {
+                u8_t *in = AS_U8(val);
+                res = U8(n);
+                u8_t *out = AS_U8(res);
+                if (filter_ids) {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[filter_ids[first_ids[i]]];
+                } else {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[first_ids[i]];
+                }
+                res->type = val->type;
+                return res;
+            }
+            case TYPE_I16: {
+                i16_t *in = AS_I16(val);
+                res = I16(n);
+                i16_t *out = AS_I16(res);
+                if (filter_ids) {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[filter_ids[first_ids[i]]];
+                } else {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[first_ids[i]];
+                }
+                res->type = val->type;
+                return res;
+            }
+            case TYPE_I32:
+            case TYPE_DATE:
+            case TYPE_TIME: {
+                i32_t *in = AS_I32(val);
+                res = I32(n);
+                i32_t *out = AS_I32(res);
+                if (filter_ids) {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[filter_ids[first_ids[i]]];
+                } else {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[first_ids[i]];
+                }
+                res->type = val->type;
+                return res;
+            }
+            case TYPE_I64:
+            case TYPE_SYMBOL:
+            case TYPE_TIMESTAMP: {
+                i64_t *in = AS_I64(val);
+                res = I64(n);
+                i64_t *out = AS_I64(res);
+                if (filter_ids) {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[filter_ids[first_ids[i]]];
+                } else {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[first_ids[i]];
+                }
+                res->type = val->type;
+                return res;
+            }
+            case TYPE_ENUM: {
+                i64_t *in = AS_I64(val);
+                res = I64(n);
+                i64_t *out = AS_I64(res);
+                if (filter_ids) {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[filter_ids[first_ids[i]]];
+                } else {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[first_ids[i]];
+                }
+                // Convert enum indices to symbol values
+                ek = ray_key(val);
+                sym = ray_get(ek);
+                drop_obj(ek);
+                if (IS_ERR(sym)) {
+                    drop_obj(res);
+                    return sym;
+                }
+                if (is_null(sym) || sym->type != TYPE_SYMBOL) {
+                    i8_t sym_type = sym ? sym->type : 0;
+                    drop_obj(sym);
+                    drop_obj(res);
+                    return err_type(TYPE_SYMBOL, sym_type, 0, 0);
+                }
+                xe = AS_SYMBOL(sym);
+                xo = AS_SYMBOL(res);
+                for (i = 0; i < n; i++)
+                    xo[i] = xe[xo[i]];
+                drop_obj(sym);
+                res->type = TYPE_SYMBOL;
+                return res;
+            }
+            case TYPE_F64: {
+                f64_t *in = AS_F64(val);
+                res = F64(n);
+                f64_t *out = AS_F64(res);
+                if (filter_ids) {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[filter_ids[first_ids[i]]];
+                } else {
+                    for (i = 0; i < n; i++)
+                        out[i] = in[first_ids[i]];
+                }
+                return res;
+            }
+            case TYPE_GUID: {
+                guid_t *in = AS_GUID(val);
+                res = GUID(n);
+                guid_t *out = AS_GUID(res);
+                if (filter_ids) {
+                    for (i = 0; i < n; i++)
+                        memcpy(out[i], in[filter_ids[first_ids[i]]], sizeof(guid_t));
+                } else {
+                    for (i = 0; i < n; i++)
+                        memcpy(out[i], in[first_ids[i]], sizeof(guid_t));
+                }
+                return res;
+            }
+            default:
+                // Fall through to slow path for other types
+                break;
+        }
+    }
+
+    // Slow path: iterate through all rows
     switch (val->type) {
         case TYPE_U8:
         case TYPE_B8:
@@ -495,9 +629,10 @@ obj_p aggr_first(obj_p val, obj_p index) {
                 }
 
                 if (is_null(sym) || sym->type != TYPE_SYMBOL) {
+                    i8_t sym_type = sym ? sym->type : 0;
                     drop_obj(sym);
                     drop_obj(res);
-                    return err_type(0, 0, 0, 0);
+                    return err_type(TYPE_SYMBOL, sym_type, 0, 0);
                 }
 
                 xe = AS_SYMBOL(sym);
@@ -711,7 +846,7 @@ obj_p aggr_first(obj_p val, obj_p index) {
 
             return res;
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, val->type, 0, 0);
     }
 }
 
@@ -757,7 +892,7 @@ obj_p aggr_last_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p ar
             return res;
         default:
             destroy_partial_result(res);
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, val->type, 0, 0);
     }
 }
 
@@ -807,9 +942,10 @@ obj_p aggr_last(obj_p val, obj_p index) {
                 }
 
                 if (is_null(sym) || sym->type != TYPE_SYMBOL) {
+                    i8_t sym_type = sym ? sym->type : 0;
                     drop_obj(sym);
                     drop_obj(res);
-                    return err_type(0, 0, 0, 0);
+                    return err_type(TYPE_SYMBOL, sym_type, 0, 0);
                 }
 
                 xe = AS_SYMBOL(sym);
@@ -938,7 +1074,7 @@ obj_p aggr_last(obj_p val, obj_p index) {
             return PARTED_MAP(n, val, index, (raw_p)aggr_last_partial, i16, i16,
                               if ($out[$y] == NULL_I16) $out[$y] = $in[$x]);
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, val->type, 0, 0);
     }
 }
 
@@ -967,7 +1103,7 @@ obj_p aggr_sum_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             return res;
         default:
             destroy_partial_result(res);
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, val->type, 0, 0);
     }
 }
 
@@ -1012,7 +1148,7 @@ obj_p aggr_sum(obj_p val, obj_p index) {
         case TYPE_PARTEDI16:
             return PARTED_MAP(n, val, index, (raw_p)aggr_sum_partial, i16, i16, $out[$y] = ADDI16($out[$y], $in[$x]));
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, val->type, 0, 0);
     }
 }
 
@@ -1041,7 +1177,7 @@ obj_p aggr_max_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             return res;
         default:
             destroy_partial_result(res);
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, val->type, 0, 0);
     }
 }
 
@@ -1095,7 +1231,7 @@ obj_p aggr_max(obj_p val, obj_p index) {
         case TYPE_PARTEDI16:
             return PARTED_MAP(n, val, index, (raw_p)aggr_max_partial, i16, i16, $out[$y] = MAXI16($out[$y], $in[$x]));
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, val->type, 0, 0);
     }
 }
 
@@ -1123,7 +1259,7 @@ obj_p aggr_min_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
                       $out[$y] = NULL_I32);
             return res;
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, val->type, 0, 0);
     }
 }
 
@@ -1177,7 +1313,7 @@ obj_p aggr_min(obj_p val, obj_p index) {
         case TYPE_PARTEDI16:
             return PARTED_MAP(n, val, index, (raw_p)aggr_min_partial, i16, i16, $out[$y] = MINI16($out[$y], $in[$x]));
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, val->type, 0, 0);
     }
 }
 
@@ -1238,7 +1374,7 @@ obj_p aggr_count_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p a
         default:
             res->len = 0;
             drop_obj(res);
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, val->type, 0, 0);
     }
 
     return res;
@@ -1736,7 +1872,7 @@ obj_p aggr_avg_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             drop_obj(cnts_obj);
             res->len = 0;
             drop_obj(res);
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, val->type, 0, 0);
     }
 }
 
@@ -1750,7 +1886,8 @@ static obj_p aggr_map_avg_other(obj_p val, obj_p index) {
     group_len = index_group_len(index);
     out_len = group_count;
 
-    n = pool_split_by(pool, group_len, group_count);
+    // avg needs F64 + I64 per group (sum and count)
+    n = pool_split_by_mem(pool, group_len, group_count, sizeof(f64_t) + sizeof(i64_t));
 
     if (n == 1) {
         argv[0] = (raw_p)group_len;
@@ -1780,15 +1917,15 @@ static obj_p aggr_map_avg_other(obj_p val, obj_p index) {
 
 static obj_p aggr_map_avg_parted(obj_p val, obj_p index) {
     pool_p pool = runtime_get()->pool;
-    i64_t i, l, n, group_count, group_len, out_len, chunk;
+    i64_t i, l, n, group_len, out_len, chunk;
     obj_p res, sc, f64obj, i64obj;
     raw_p argv[6];
 
-    group_count = index_group_count(index);
     group_len = val->len;
     out_len = 1;
 
-    n = pool_split_by(pool, group_len, group_count);
+    // For parted, out_len=1, minimal memory
+    n = pool_split_by_mem(pool, group_len, out_len, sizeof(f64_t) + sizeof(i64_t));
 
     if (n == 1) {
         argv[0] = (raw_p)group_len;
@@ -1994,7 +2131,7 @@ obj_p aggr_avg(obj_p val, obj_p index) {
         }
 
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, val->type, 0, 0);
     }
 }
 
@@ -2588,7 +2725,7 @@ obj_p aggr_dev_partial(raw_p arg1, raw_p arg2, raw_p arg3, raw_p arg4, raw_p arg
             drop_obj(cnt_obj);
             res->len = 0;
             drop_obj(res);
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, val->type, 0, 0);
     }
 }
 
@@ -2602,7 +2739,8 @@ static obj_p aggr_map_dev_other(obj_p val, obj_p index) {
     group_len = index_group_len(index);
     out_len = group_count;
 
-    n = pool_split_by(pool, group_len, group_count);
+    // dev needs F64 (sum) + F64 (sum_sq) + I64 (count) per group
+    n = pool_split_by_mem(pool, group_len, group_count, 2 * sizeof(f64_t) + sizeof(i64_t));
 
     if (n == 1) {
         argv[0] = (raw_p)group_len;
@@ -2632,15 +2770,15 @@ static obj_p aggr_map_dev_other(obj_p val, obj_p index) {
 
 static obj_p aggr_map_dev_parted(obj_p val, obj_p index) {
     pool_p pool = runtime_get()->pool;
-    i64_t i, l, n, group_count, group_len, out_len, chunk;
+    i64_t i, l, n, group_len, out_len, chunk;
     obj_p res, sc;
     raw_p argv[6];
 
-    group_count = index_group_count(index);
     group_len = val->len;
     out_len = 1;
 
-    n = pool_split_by(pool, group_len, group_count);
+    // For parted, out_len=1, minimal memory
+    n = pool_split_by_mem(pool, group_len, out_len, 2 * sizeof(f64_t) + sizeof(i64_t));
 
     if (n == 1) {
         argv[0] = (raw_p)group_len;
@@ -2879,7 +3017,7 @@ obj_p aggr_dev(obj_p val, obj_p index) {
         }
 
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, val->type, 0, 0);
     }
 }
 
@@ -2929,9 +3067,10 @@ obj_p aggr_collect(obj_p val, obj_p index) {
                 return v;
 
             if (v->type != TYPE_SYMBOL) {
+                i8_t v_type = v->type;
                 drop_obj(v);
                 drop_obj(res);
-                return err_type(0, 0, 0, 0);
+                return err_type(TYPE_SYMBOL, v_type, 0, 0);
             }
 
             AGGR_ITER(index, l, 0, val, res, i64, list, , push_raw($out + $y, AS_SYMBOL(v) + $in[$x]), );
@@ -2955,15 +3094,13 @@ obj_p aggr_collect(obj_p val, obj_p index) {
         case TYPE_PARTEDGUID:
         case TYPE_PARTEDENUM:
         case TYPE_PARTEDLIST:
-            // For parted types with INDEX_TYPE_PARTEDCOMMON, each partition is a group
-            // Collect all values from matching partitions
+            // For parted types with INDEX_TYPE_PARTEDCOMMON
             drop_obj(res);
             filter = index_group_filter(index);
             res = LIST(n);
             if (filter == NULL_OBJ) {
-                // No filter - each partition is a group
-                for (i = 0; i < (i64_t)val->len; i++)
-                    AS_LIST(res)[i] = ray_value(AS_LIST(val)[i]);
+                // No filter - global aggregation: flatten all partitions into one list
+                AS_LIST(res)[0] = ray_value(val);
             } else {
                 // With filter - only include matching partitions
                 l = filter->len;
@@ -2976,7 +3113,7 @@ obj_p aggr_collect(obj_p val, obj_p index) {
             return res;
         default:
             drop_obj(res);
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, val->type, 0, 0);
     }
 }
 

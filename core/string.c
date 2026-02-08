@@ -21,13 +21,57 @@
  *   SOFTWARE.
  */
 
-#include "string.h"
+#include "str.h"
 #include "ops.h"
 #include "error.h"
 #include "format.h"
 
 #define IS_DIGIT(c) ((c) >= '0' && (c) <= '9')
 #define IS_SPACE(c) ((c) == ' ' || (c) == '\t' || (c) == '\n' || (c) == '\r')
+
+// SWAR (SIMD Within A Register) fast integer parsing
+// Parse 8 ASCII digits in parallel using 64-bit arithmetic
+// NOTE: Requires little-endian architecture (x86, ARM, etc.)
+
+// Check if all 8 bytes are ASCII digits ('0'-'9')
+static inline b8_t is_8_digits(const u8_t *s) {
+    // Simple byte-by-byte check - more reliable across platforms
+    for (int i = 0; i < 8; i++) {
+        if (s[i] < '0' || s[i] > '9')
+            return 0;
+    }
+    return 1;
+}
+
+// Parse exactly 8 ASCII digits into an integer
+// Using simple multiplication - compiler will optimize well
+static inline u64_t parse_8_digits(const u8_t *s) {
+    return (u64_t)(s[0] - '0') * 10000000ull +
+           (u64_t)(s[1] - '0') * 1000000ull +
+           (u64_t)(s[2] - '0') * 100000ull +
+           (u64_t)(s[3] - '0') * 10000ull +
+           (u64_t)(s[4] - '0') * 1000ull +
+           (u64_t)(s[5] - '0') * 100ull +
+           (u64_t)(s[6] - '0') * 10ull +
+           (u64_t)(s[7] - '0');
+}
+
+// Check if 4 bytes are ASCII digits
+static inline b8_t is_4_digits(const u8_t *s) {
+    for (int i = 0; i < 4; i++) {
+        if (s[i] < '0' || s[i] > '9')
+            return 0;
+    }
+    return 1;
+}
+
+// Parse exactly 4 ASCII digits
+static inline u32_t parse_4_digits(const u8_t *s) {
+    return (u32_t)(s[0] - '0') * 1000u +
+           (u32_t)(s[1] - '0') * 100u +
+           (u32_t)(s[2] - '0') * 10u +
+           (u32_t)(s[3] - '0');
+}
 
 // Creates new obj_p string from a C string.
 obj_p string_from_str(lit_p str, i64_t len) {
@@ -102,7 +146,8 @@ i64_t u8_from_str(lit_p str, i64_t len, u8_t *dst) {
 }
 
 i64_t i32_from_str(lit_p str, i64_t len, i32_t *dst) {
-    i32_t i, n, result, sign;
+    i64_t i, n;
+    i32_t result, sign;
 
     i = 0;
     result = 0;
@@ -116,13 +161,42 @@ i64_t i32_from_str(lit_p str, i64_t len, i32_t *dst) {
         i++;
 
     // Handle optional sign
-    if (str[i] == '-') {
+    if (i < len && str[i] == '-') {
         sign = -1;
         i++;
     }
 
-    // Parse the digits
     n = i;
+
+    // Fast path: try to parse 8 digits at once (for 8+ digit numbers)
+    if (len - i >= 8 && is_8_digits((const u8_t *)(str + i))) {
+        result = (i32_t)parse_8_digits((const u8_t *)(str + i));
+        i += 8;
+        // Parse any remaining digits
+        while (i < len && IS_DIGIT(str[i])) {
+            result = result * 10 + (str[i] - '0');
+            i++;
+        }
+        *dst = result * sign;
+        return i;
+    }
+
+    // Medium path: try 4 digits at once
+    if (len - i >= 4 && is_4_digits((const u8_t *)(str + i))) {
+        result = (i32_t)parse_4_digits((const u8_t *)(str + i));
+        i += 4;
+        // Parse remaining digits
+        while (i < len && IS_DIGIT(str[i])) {
+            result = result * 10 + (str[i] - '0');
+            i++;
+        }
+        if (i > n) {
+            *dst = result * sign;
+            return i;
+        }
+    }
+
+    // Slow path: digit by digit
     while (i < len && IS_DIGIT(str[i])) {
         result = result * 10 + (str[i] - '0');
         i++;
@@ -137,7 +211,8 @@ i64_t i32_from_str(lit_p str, i64_t len, i32_t *dst) {
 }
 
 i64_t i64_from_str(lit_p src, i64_t len, i64_t *dst) {
-    i64_t i, n, result, sign, old;
+    i64_t i, n, sign;
+    u64_t result, old;
 
     result = 0;
     sign = 1;
@@ -162,20 +237,35 @@ i64_t i64_from_str(lit_p src, i64_t len, i64_t *dst) {
     }
 
     src += i;
+    n = 0;
 
-    // Parse the digits
-    for (n = 0; n < len && IS_DIGIT(src[n]); n++) {
+    // Fast path: parse 8 digits at a time (only if we won't overflow)
+    // Max safe value before multiply by 100000000: ~92 quadrillion / 100M = ~922 billion
+    // So only use fast path for first 8 digits
+    if (n + 8 <= len && len <= 18 && is_8_digits((const u8_t *)(src + n))) {
+        result = parse_8_digits((const u8_t *)(src + n));
+        n += 8;
+        // Continue with fast path if we have exactly 8 more digits and first chunk is small
+        if (n + 8 <= len && result < 922337203ull && is_8_digits((const u8_t *)(src + n))) {
+            result = result * 100000000ull + parse_8_digits((const u8_t *)(src + n));
+            n += 8;
+        }
+    }
+
+    // Parse remaining digits with overflow check
+    while (n < len && IS_DIGIT(src[n])) {
         old = result;
         result = result * 10 + (src[n] - '0');
-        if (result < old)
+        if (result < old)  // Overflow
             return 0;
+        n++;
     }
 
     // If we didn't parse any digits, return 0
     if (n == 0)
         return 0;
 
-    *dst = result * sign;
+    *dst = (i64_t)result * sign;
 
     return i + n;
 }
@@ -184,6 +274,7 @@ i64_t f64_from_str(lit_p str, i64_t len, f64_t *dst) {
     i32_t sign, frac_digits, exp_sign, exp;
     i64_t i, start, exp_start;
     f64_t int_part, frac_part, multiplier, divisor, val;
+    u64_t int_val;
 
     i = 0;
 
@@ -201,11 +292,29 @@ i64_t f64_from_str(lit_p str, i64_t len, f64_t *dst) {
         i++;
     }
 
-    // Integer part
-    int_part = 0;
+    // Integer part - use fast parsing for up to 15 digits (fits in f64 without precision loss)
+    int_val = 0;
     start = i;
-    while (i < len && IS_DIGIT(str[i])) {
-        int_part = int_part * 10 + (str[i++] - '0');
+    
+    // Fast path: parse 8 digits at a time (only for numbers that fit)
+    if (i + 8 <= len && is_8_digits((const u8_t *)(str + i))) {
+        int_val = parse_8_digits((const u8_t *)(str + i));
+        i += 8;
+        // Parse up to 7 more digits (total 15 for f64 precision)
+        while (i < len && IS_DIGIT(str[i]) && (i - start) < 15) {
+            int_val = int_val * 10 + (str[i++] - '0');
+        }
+        // If more digits remain, use f64 accumulation to handle overflow gracefully
+        int_part = (f64_t)int_val;
+        while (i < len && IS_DIGIT(str[i])) {
+            int_part = int_part * 10 + (str[i++] - '0');
+        }
+    } else {
+        // Scalar path - use f64 from start to handle any size
+        int_part = 0;
+        while (i < len && IS_DIGIT(str[i])) {
+            int_part = int_part * 10 + (str[i++] - '0');
+        }
     }
 
     // Fractional part
@@ -606,10 +715,10 @@ obj_p str_split(lit_p str, i64_t str_len, lit_p delim, i64_t delim_len) {
 
     // Input validation
     if (str == NULL || delim == NULL)
-        return err_type(0, 0, 0, 0);
+        return err_domain(0, 0);
 
     if (delim_len == 0)
-        return err_type(0, 0, 0, 0);
+        return err_domain(0, 0);
 
     // Create empty list
     result = LIST(0);

@@ -26,7 +26,7 @@
 #include "timestamp.h"
 #include "util.h"
 #include "error.h"
-#include "string.h"
+#include "str.h"
 #include "parse.h"
 #include "temporal.h"
 
@@ -528,7 +528,7 @@ timestamp_t timestamp_current(lit_p tz) {
 
 obj_p ray_timestamp(obj_p arg) {
     if (arg->type != -TYPE_SYMBOL)
-        return err_type(0, 0, 0, 0);
+        return err_type(-TYPE_SYMBOL, arg->type, 1, 0);
 
     timestamp_t ts = timestamp_current(str_from_symbol(arg->i64));
 

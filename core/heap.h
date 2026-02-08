@@ -85,8 +85,9 @@ typedef struct heap_t {
     block_p freelist[MAX_POOL_ORDER + 2];  // free list of blocks by order
 
     // ===== Cold fields (rarely accessed) =====
-    memstat_t memstat;   // statistics
-    c8_t swap_path[64];  // swap directory path (init only)
+    memstat_t memstat;           // statistics
+    c8_t swap_path[64];          // swap directory path (init only)
+    struct heap_t *pending_next; // link for pending-merge LIFO queue
 } *heap_p;
 
 heap_p heap_create(i64_t id);
@@ -103,5 +104,19 @@ nil_t heap_borrow(heap_p heap);
 nil_t heap_merge(heap_p heap);
 memstat_t heap_memstat(nil_t);
 nil_t heap_print_blocks(heap_p heap);
+
+// Global atomic heap ID counter
+i64_t heap_next_id(nil_t);
+
+// Flush slab caches back to freelists
+nil_t heap_flush_slabs(heap_p heap);
+
+// Foreign block flush — reclaim cross-heap freed blocks into own freelist
+nil_t heap_flush_foreign(heap_p heap);
+
+// Pending merge queue — lock-free LIFO for deferred heap merges
+extern heap_p __heap_pending_merge;
+nil_t heap_push_pending(heap_p heap);
+nil_t heap_drain_pending(nil_t);
 
 #endif  // HEAP_H

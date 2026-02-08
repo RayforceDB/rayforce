@@ -29,7 +29,7 @@
 #include "error.h"
 #include "items.h"
 #include "unary.h"
-#include "string.h"
+#include "str.h"
 #include "pool.h"
 #include "def.h"
 
@@ -56,24 +56,50 @@ u64_t __index_list_hash_get(i64_t row, raw_p seed) {
     return ctx->hashes[row];
 }
 
+// Optimized row comparison - inlines common i64 case to avoid function call overhead
 i64_t __index_list_cmp_row(i64_t row1, i64_t row2, raw_p seed) {
-    i64_t i, l;
+    i64_t i, l, r1, r2;
     __index_list_ctx_t *ctx = (__index_list_ctx_t *)seed;
     i64_t *filter = ctx->filter;
     obj_p *lcols = AS_LIST(ctx->lcols);
     obj_p *rcols = AS_LIST(ctx->rcols);
+    obj_p lc, rc;
 
     l = ctx->lcols->len;
+    r1 = filter ? filter[row1] : row1;
+    r2 = filter ? filter[row2] : row2;
 
-    if (filter) {
-        for (i = 0; i < l; i++) {
-            if (ops_eq_idx(lcols[i], filter[row1], rcols[i], filter[row2]) == 0)
-                return 1;
+    // Fast path: check if all columns are i64-like types for direct comparison
+    for (i = 0; i < l; i++) {
+        lc = lcols[i];
+        rc = rcols[i];
+        
+        // Inline comparison for common i64 types (avoid ops_eq_idx call overhead)
+        switch (lc->type) {
+            case TYPE_I64:
+            case TYPE_SYMBOL:
+            case TYPE_TIMESTAMP:
+                if (AS_I64(lc)[r1] != AS_I64(rc)[r2])
+                    return 1;
+                break;
+            case TYPE_I32:
+            case TYPE_DATE:
+            case TYPE_TIME:
+                if (AS_I32(lc)[r1] != AS_I32(rc)[r2])
+                    return 1;
+                break;
+            case TYPE_U8:
+            case TYPE_B8:
+            case TYPE_C8:
+                if (AS_U8(lc)[r1] != AS_U8(rc)[r2])
+                    return 1;
+                break;
+            default:
+                // Fall back to generic comparison for other types
+                if (ops_eq_idx(lc, r1, rc, r2) == 0)
+                    return 1;
+                break;
         }
-    } else {
-        for (i = 0; i < l; i++)
-            if (ops_eq_idx(lcols[i], row1, rcols[i], row2) == 0)
-                return 1;
     }
 
     return 0;
@@ -119,23 +145,26 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
         case TYPE_DATE:
         case TYPE_TIME:
             i32v = (i32_t *)AS_I32(obj);
-            if (filter)
+            if (filter) {
                 for (i = offset; i < len + offset; i++)
                     out[i] = hash_index_u64((i64_t)i32v[filter[i]], out[i]);
-            else
+            } else {
+                // Scalar loop - i32 to i64 conversion doesn't benefit much from SIMD
                 for (i = offset; i < len + offset; i++)
                     out[i] = hash_index_u64((i64_t)i32v[i], out[i]);
+            }
             break;
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
             u64v = (i64_t *)AS_I64(obj);
-            if (filter)
+            if (filter) {
                 for (i = offset; i < len + offset; i++)
                     out[i] = hash_index_u64(u64v[filter[i]], out[i]);
-            else
-                for (i = offset; i < len + offset; i++)
-                    out[i] = hash_index_u64(u64v[i], out[i]);
+            } else {
+                // Use best available SIMD (AVX2/NEON) or scalar fallback
+                hash_index_i64_batch((u64_t *)(out + offset), (const u64_t *)(u64v + offset), len);
+            }
             break;
         case TYPE_F64:
             u64v = (i64_t *)AS_F64(obj);
@@ -170,6 +199,9 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
             break;
         case TYPE_ENUM:
             if (resolve) {
+                // NOTE: ray_key/ray_get must be called BEFORE parallel execution starts
+                // because they access global state. The caller should ensure this is
+                // called from a single thread, or the symbol array should be pre-resolved.
                 k = ray_key(obj);
                 v = ray_get(k);
                 drop_obj(k);
@@ -213,6 +245,31 @@ obj_p index_hash_obj_partial(obj_p obj, i64_t out[], i64_t filter[], i64_t len, 
     return NULL_OBJ;
 }
 
+// Context for combined multi-column hash computation
+typedef struct __hash_cols_ctx_t {
+    obj_p cols;
+    i64_t ncols;
+    i64_t *out;
+    i64_t *filter;
+    b8_t resolve;
+} __hash_cols_ctx_t;
+
+// Hash all columns for a chunk of rows in one pass
+obj_p __hash_cols_partial(i64_t len, i64_t offset, __hash_cols_ctx_t *ctx) {
+    i64_t i, c;
+    i64_t *out = ctx->out;
+    
+    // Initialize this chunk's hashes
+    for (i = offset; i < offset + len; i++)
+        out[i] = U64_HASH_SEED;
+    
+    // Hash all columns for this chunk
+    for (c = 0; c < ctx->ncols; c++)
+        index_hash_obj_partial(AS_LIST(ctx->cols)[c], out, ctx->filter, len, offset, ctx->resolve);
+    
+    return NULL_OBJ;
+}
+
 nil_t __index_list_precalc_hash(obj_p cols, i64_t out[], i64_t ncols, i64_t nrows, i64_t filter[], b8_t resolve) {
     i64_t i, j, chunks, base_chunk;
     pool_p pool;
@@ -224,26 +281,34 @@ nil_t __index_list_precalc_hash(obj_p cols, i64_t out[], i64_t ncols, i64_t nrow
     // Recalculate chunks to ensure (chunks-1)*base_chunk < nrows
     chunks = (nrows + base_chunk - 1) / base_chunk;
 
-    // init hashes
+    // Initialize hashes
     for (i = 0; i < nrows; i++)
         out[i] = U64_HASH_SEED;
 
-    // calculate hashes
+    // Single-threaded path
     if (chunks == 1) {
         for (i = 0; i < ncols; i++)
             index_hash_obj_partial(AS_LIST(cols)[i], out, filter, nrows, 0, resolve);
-    } else {
-        for (i = 0; i < ncols; i++) {
-            pool_prepare(pool);
-            for (j = 0; j < chunks - 1; j++)
-                pool_add_task(pool, (raw_p)index_hash_obj_partial, 6, AS_LIST(cols)[i], out, filter, base_chunk,
-                              j * base_chunk, resolve);
-            pool_add_task(pool, (raw_p)index_hash_obj_partial, 6, AS_LIST(cols)[i], out, filter,
-                          nrows - (chunks - 1) * base_chunk, (chunks - 1) * base_chunk, resolve);
-            v = pool_run(pool);
-            drop_obj(v);
-        }
+        return;
     }
+    
+    // When resolve=true (joins with Enum), process FULLY sequentially
+    // because ray_get/ray_key aren't thread-safe even within a single column
+    if (resolve) {
+        for (i = 0; i < ncols; i++)
+            index_hash_obj_partial(AS_LIST(cols)[i], out, filter, nrows, 0, resolve);
+        return;
+    }
+    
+    // Multi-threaded: process all columns per chunk (better cache locality, fewer syncs)
+    __hash_cols_ctx_t ctx = {cols, ncols, out, filter, resolve};
+    
+    pool_prepare(pool);
+    for (j = 0; j < chunks - 1; j++)
+        pool_add_task(pool, (raw_p)__hash_cols_partial, 3, base_chunk, j * base_chunk, &ctx);
+    pool_add_task(pool, (raw_p)__hash_cols_partial, 3, nrows - (chunks - 1) * base_chunk, (chunks - 1) * base_chunk, &ctx);
+    v = pool_run(pool);
+    drop_obj(v);
 }
 
 nil_t index_hash_obj(obj_p obj, i64_t out[], i64_t filter[], i64_t len, b8_t resolve) {
@@ -1802,6 +1867,13 @@ i64_t index_group_shift(obj_p index) { return AS_LIST(index)[3]->i64; }
 
 obj_p index_group_meta(obj_p index) { return AS_LIST(index)[6]; }
 
+i64_t *index_group_first_ids(obj_p index) {
+    obj_p meta = AS_LIST(index)[6];
+    if (is_null(meta) || meta->type != TYPE_I64)
+        return NULL;
+    return AS_I64(meta);
+}
+
 static obj_p index_group_build(index_type_t tp, i64_t groups_count, obj_p group_ids, obj_p index_min, obj_p source,
                                obj_p filter, obj_p meta) {
     return vn_list(7, i64(tp), i64(groups_count), group_ids, index_min, source, filter, meta);
@@ -1815,7 +1887,8 @@ typedef struct __group_chunk_ctx_t {
     i64_t *local_groups;  // per-chunk group count
     hash_f hash;
     cmp_f cmp;
-    obj_p *local_hts;  // per-chunk hash tables
+    obj_p *local_hts;   // per-chunk hash tables
+    i64_t chunk_size;   // size of each chunk (for computing chunk index)
 } __group_chunk_ctx_t;
 
 // Phase 1: Each chunk builds its own local hash table and assigns local group IDs
@@ -1865,8 +1938,9 @@ obj_p index_group_chunk_local(i64_t len, i64_t offset, __group_chunk_ctx_t *ctx)
         }
     }
 
-    ctx->local_groups[offset > 0 ? 1 : 0] = groups;  // Store in appropriate slot based on chunk
-    ctx->local_hts[offset > 0 ? 1 : 0] = ht;
+    i64_t chunk_idx = offset / ctx->chunk_size;
+    ctx->local_groups[chunk_idx] = groups;
+    ctx->local_hts[chunk_idx] = ht;
 
     return NULL_OBJ;
 }
@@ -1936,6 +2010,10 @@ i64_t index_group_distribute(i64_t keys[], i64_t filter[], i64_t out[], i64_t le
     if (parts > 32)
         parts = 32;
 
+    // Calculate chunk sizes
+    chunk = len / parts;
+    last_chunk = len - chunk * (parts - 1);
+
     // Setup context
     ctx.keys = keys;
     ctx.filter = filter;
@@ -1944,29 +2022,20 @@ i64_t index_group_distribute(i64_t keys[], i64_t filter[], i64_t out[], i64_t le
     ctx.hash = hash;
     ctx.cmp = cmp;
     ctx.local_hts = local_hts;
+    ctx.chunk_size = chunk;
 
     // Initialize
     for (i = 0; i < parts; i++) {
         local_groups[i] = 0;
         local_hts[i] = NULL_OBJ;
+        offsets[i] = i * chunk;
     }
-
-    // Calculate chunk sizes
-    chunk = len / parts;
-    last_chunk = len - chunk * (parts - 1);
 
     // Phase 1: Build local hash tables in parallel (each chunk gets its own)
     pool_prepare(pool);
-    for (i = 0; i < parts; i++) {
-        offsets[i] = i * chunk;
-        ctx.local_groups = local_groups + i;
-        ctx.local_hts = local_hts + i;
-
-        if (i < parts - 1)
-            pool_add_task(pool, (raw_p)index_group_chunk_local, 3, chunk, i * chunk, &ctx);
-        else
-            pool_add_task(pool, (raw_p)index_group_chunk_local, 3, last_chunk, i * chunk, &ctx);
-    }
+    for (i = 0; i < parts - 1; i++)
+        pool_add_task(pool, (raw_p)index_group_chunk_local, 3, chunk, i * chunk, &ctx);
+    pool_add_task(pool, (raw_p)index_group_chunk_local, 3, last_chunk, (parts - 1) * chunk, &ctx);
     res = pool_run(pool);
     drop_obj(res);
 
@@ -2068,6 +2137,58 @@ obj_p index_group_i8(obj_p obj, obj_p filter) {
     return index_group_build(INDEX_TYPE_IDS, j, vals, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
 }
 
+obj_p index_group_i16(obj_p obj, obj_p filter) {
+    i64_t i, len, total, g;
+    i64_t *out, *indices, *keys;
+    i16_t *values;
+    obj_p vals, key_obj;
+
+    total = obj->len;
+    values = AS_I16(obj);
+    indices = is_null(filter) ? NULL : AS_I64(filter);
+    len = indices ? filter->len : total;
+
+    key_obj = I64(total);
+    keys = AS_I64(key_obj);
+    for (i = 0; i < total; i++)
+        keys[i] = (i64_t)values[i];
+
+    vals = I64(len);
+    out = AS_I64(vals);
+
+    g = index_group_distribute(keys, indices, out, len, &hash_fnv1a, &hash_cmp_i64);
+
+    drop_obj(key_obj);
+
+    return index_group_build(INDEX_TYPE_IDS, g, vals, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
+}
+
+obj_p index_group_i32(obj_p obj, obj_p filter) {
+    i64_t i, len, total, g;
+    i64_t *out, *indices, *keys;
+    i32_t *values;
+    obj_p vals, key_obj;
+
+    total = obj->len;
+    values = AS_I32(obj);
+    indices = is_null(filter) ? NULL : AS_I64(filter);
+    len = indices ? filter->len : total;
+
+    key_obj = I64(total);
+    keys = AS_I64(key_obj);
+    for (i = 0; i < total; i++)
+        keys[i] = (i64_t)values[i];
+
+    vals = I64(len);
+    out = AS_I64(vals);
+
+    g = index_group_distribute(keys, indices, out, len, &hash_fnv1a, &hash_cmp_i64);
+
+    drop_obj(key_obj);
+
+    return index_group_build(INDEX_TYPE_IDS, g, vals, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
+}
+
 obj_p index_group_i64_unscoped(obj_p obj, obj_p filter) {
     i64_t len;
     i64_t *out, *values, *indices, g;
@@ -2086,6 +2207,12 @@ obj_p index_group_i64_unscoped(obj_p obj, obj_p filter) {
     timeit_tick("index group unscoped");
 
     return index_group_build(INDEX_TYPE_IDS, g, vals, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
+}
+
+obj_p fill_null_i64(i64_t *arr, i64_t len, i64_t offset) {
+    for (i64_t i = offset; i < offset + len; i++)
+        arr[i] = NULL_I64;
+    return NULL_OBJ;
 }
 
 obj_p index_group_i64_scoped_partial(i64_t input[], i64_t filter[], i64_t group_ids[], i64_t len, i64_t offset,
@@ -2107,8 +2234,8 @@ obj_p index_group_i64_scoped_partial(i64_t input[], i64_t filter[], i64_t group_
 
 obj_p index_group_i64_scoped(obj_p obj, obj_p filter, const index_scope_t scope) {
     i64_t i, n, len, groups, chunks, base_chunk;
-    i64_t *hk, *hv, *values, *indices;
-    obj_p keys, vals, v;
+    i64_t *hk, *hv, *hf, *values, *indices;
+    obj_p keys, vals, firsts, v;
     pool_p pool;
 
     values = AS_I64(obj);
@@ -2119,28 +2246,60 @@ obj_p index_group_i64_scoped(obj_p obj, obj_p filter, const index_scope_t scope)
     if (scope.range <= len) {
         keys = I64(scope.range);
         hk = AS_I64(keys);
-        for (i = 0; i < scope.range; i++)
-            hk[i] = NULL_I64;
+        // Initialize keys array in parallel
+        pool = pool_get();
+        chunks = pool_split_by(pool, scope.range, 0);
+        if (chunks == 1) {
+            for (i = 0; i < scope.range; i++)
+                hk[i] = NULL_I64;
+        } else {
+            base_chunk = pool_chunk_aligned(scope.range, chunks, sizeof(i64_t));
+            pool_prepare(pool);
+            for (i = 0; i < chunks - 1; i++)
+                pool_add_task(pool, (raw_p)fill_null_i64, 3, hk, base_chunk, i * base_chunk);
+            pool_add_task(pool, (raw_p)fill_null_i64, 3, hk, scope.range - (chunks - 1) * base_chunk,
+                          (chunks - 1) * base_chunk);
+            v = pool_run(pool);
+            drop_obj(v);
+        }
+
+        // Pre-allocate firsts array (we'll resize if needed, but usually groups < scope.range)
+        firsts = I64(len);  // Worst case: every row is a new group
+        hf = AS_I64(firsts);
+
         if (indices) {
             for (i = 0, groups = 0; i < len; i++) {
                 n = values[indices[i]] - scope.min;
-                if (hk[n] == NULL_I64)
-                    hk[n] = groups++;
+                if (hk[n] == NULL_I64) {
+                    hk[n] = groups;
+                    hf[groups] = i;  // Track first row index directly by group ID
+                    groups++;
+                }
             }
         } else {
             for (i = 0, groups = 0; i < len; i++) {
                 n = values[i] - scope.min;
-                if (hk[n] == NULL_I64)
-                    hk[n] = groups++;
+                if (hk[n] == NULL_I64) {
+                    hk[n] = groups;
+                    hf[groups] = i;  // Track first row index directly by group ID
+                    groups++;
+                }
             }
         }
-        //  do not compute group indices as they can be obtained from the keys
+
+        // Resize firsts to actual number of groups
+        resize_obj(&firsts, groups);
+        hf = AS_I64(firsts);
+
+        // For small scope.range, use SHIFT (no group_ids array needed)
+        // For large scope.range, use IDS (better cache locality in aggregation)
         if (scope.range <= INDEX_SCOPE_LIMIT) {
             timeit_tick("index group scoped perfect simple");
             return index_group_build(INDEX_TYPE_SHIFT, groups, keys, i64(scope.min), clone_obj(obj), clone_obj(filter),
-                                     NULL_OBJ);
+                                     firsts);
         }
 
+        // Build group_ids array for better aggregation performance
         vals = I64(len);
         hv = AS_I64(vals);
         pool = pool_get();
@@ -2162,7 +2321,7 @@ obj_p index_group_i64_scoped(obj_p obj, obj_p filter, const index_scope_t scope)
         }
         drop_obj(keys);
         timeit_tick("index group scoped perfect");
-        return index_group_build(INDEX_TYPE_IDS, groups, vals, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
+        return index_group_build(INDEX_TYPE_IDS, groups, vals, i64(NULL_I64), NULL_OBJ, clone_obj(filter), firsts);
     }
     return index_group_i64_unscoped(obj, filter);
 }
@@ -2255,6 +2414,12 @@ obj_p index_group(obj_p val, obj_p filter) {
         case TYPE_U8:
         case TYPE_C8:
             return index_group_i8(val, filter);
+        case TYPE_I16:
+            return index_group_i16(val, filter);
+        case TYPE_I32:
+        case TYPE_DATE:
+        case TYPE_TIME:
+            return index_group_i32(val, filter);
         case TYPE_I64:
         case TYPE_SYMBOL:
         case TYPE_TIMESTAMP:
@@ -2297,19 +2462,102 @@ obj_p index_group(obj_p val, obj_p filter) {
             return index_group_build(INDEX_TYPE_PARTEDCOMMON, g, clone_obj(val), i64(NULL_I64), NULL_OBJ,
                                      clone_obj(filter), NULL_OBJ);
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_LIST, val->type, 0, 0);
     }
 }
 
+// Context for parallel combined key computation
+typedef struct __perfect_hash_ctx_t {
+    obj_p *values;
+    i64_t *indices;
+    i64_t *out;
+    index_scope_t *scopes;
+    i64_t *multipliers;
+    i64_t ncols;
+} __perfect_hash_ctx_t;
+
+obj_p index_group_list_perfect_partial(i64_t len, i64_t offset, __perfect_hash_ctx_t *ctx) {
+    i64_t j, c, ncols;
+    i64_t *out, *indices, *multipliers;
+    obj_p *values, col;
+    index_scope_t *scopes;
+
+    out = ctx->out;
+    indices = ctx->indices;
+    values = ctx->values;
+    scopes = ctx->scopes;
+    multipliers = ctx->multipliers;
+    ncols = ctx->ncols;
+
+    // Process all columns in a single pass for better cache efficiency
+    if (indices) {
+        for (j = offset; j < offset + len; j++) {
+            i64_t key = 0;
+            i64_t row = indices[j];
+            for (c = 0; c < ncols; c++) {
+                col = values[c];
+                switch (col->type) {
+                    case TYPE_B8:
+                    case TYPE_U8:
+                    case TYPE_C8:
+                        key += (AS_U8(col)[row] - scopes[c].min) * multipliers[c];
+                        break;
+                    case TYPE_I64:
+                    case TYPE_SYMBOL:
+                    case TYPE_TIMESTAMP:
+                        key += (AS_I64(col)[row] - scopes[c].min) * multipliers[c];
+                        break;
+                    case TYPE_ENUM:
+                        key += (AS_I64(ENUM_VAL(col))[row] - scopes[c].min) * multipliers[c];
+                        break;
+                    default:
+                        break;
+                }
+            }
+            out[j] = key;
+        }
+    } else {
+        for (j = offset; j < offset + len; j++) {
+            i64_t key = 0;
+            for (c = 0; c < ncols; c++) {
+                col = values[c];
+                switch (col->type) {
+                    case TYPE_B8:
+                    case TYPE_U8:
+                    case TYPE_C8:
+                        key += (AS_U8(col)[j] - scopes[c].min) * multipliers[c];
+                        break;
+                    case TYPE_I64:
+                    case TYPE_SYMBOL:
+                    case TYPE_TIMESTAMP:
+                        key += (AS_I64(col)[j] - scopes[c].min) * multipliers[c];
+                        break;
+                    case TYPE_ENUM:
+                        key += (AS_I64(ENUM_VAL(col))[j] - scopes[c].min) * multipliers[c];
+                        break;
+                    default:
+                        break;
+                }
+            }
+            out[j] = key;
+        }
+    }
+
+    return NULL_OBJ;
+}
+
 obj_p index_group_list_perfect(obj_p obj, obj_p filter) {
-    u8_t *xb;
-    u64_t i, j, l, len, product;
-    i64_t *xi, *xo, *indices;
-    obj_p ht, col, res, *values;
+    u64_t i, l, len, product;
+    i64_t *xo, *indices;
+    obj_p ht, res, *values, v;
     index_scope_t *scopes, scope;
+    pool_p pool;
+    i64_t chunks, base_chunk;
+    __perfect_hash_ctx_t ctx;
 
     l = obj->len;
     i64_t multipliers[l];
+    UNUSED(v);  // May be unused in single-threaded path
 
     if (l == 0)
         return NULL_OBJ;
@@ -2353,81 +2601,60 @@ obj_p index_group_list_perfect(obj_p obj, obj_p filter) {
                 scopes[i] = index_scope_i64(AS_I64(values[i]), indices, len);
                 break;
             default:
-                // because we already checked the types, this should never happen
                 __builtin_unreachable();
         }
     }
 
     // Precompute multipliers for each column
+    // Use signed max to avoid overflow in scope.range (which is i64_t)
     for (i = 0, product = 1, scope = (index_scope_t){0, 0, 0, 0}; i < l; i++) {
-        if (ULLONG_MAX / product < (u64_t)scopes[i].range) {
+        // Check for overflow - product must stay within signed i64 range
+        if (product > (u64_t)LLONG_MAX / (u64_t)scopes[i].range) {
             heap_free(scopes);
             return NULL_OBJ;  // Overflow would occur
         }
 
-        scope.max += (scopes[i].max - scopes[i].min) * product;
-
         multipliers[i] = product;
         product *= scopes[i].range;
+
+        // Also check that scope.max won't overflow
+        u64_t delta = (u64_t)(scopes[i].max - scopes[i].min) * (u64_t)multipliers[i];
+        if ((u64_t)scope.max > (u64_t)LLONG_MAX - delta) {
+            heap_free(scopes);
+            return NULL_OBJ;  // scope.max would overflow
+        }
+        scope.max += delta;
     }
 
     scope.range = scope.max + 1;
 
     ht = I64(len);
     xo = AS_I64(ht);
-    memset(xo, 0, len * sizeof(i64_t));
 
-    for (i = 0; i < l; i++) {
-        col = values[i];
-        switch (col->type) {
-            case TYPE_B8:
-            case TYPE_U8:
-            case TYPE_C8:
-                xb = AS_U8(col);
-                if (indices) {
-                    for (j = 0; j < len; j++)
-                        xo[j] += (xb[indices[j]] - scopes[i].min) * multipliers[i];
-                } else {
-                    for (j = 0; j < len; j++)
-                        xo[j] += (xb[j] - scopes[i].min) * multipliers[i];
-                }
-                break;
-            case TYPE_I64:
-            case TYPE_SYMBOL:
-            case TYPE_TIMESTAMP:
-                xi = AS_I64(col);
-                if (indices) {
-                    for (j = 0; j < len; j++)
-                        xo[j] += (xi[indices[j]] - scopes[i].min) * multipliers[i];
-                } else {
-                    for (j = 0; j < len; j++)
-                        xo[j] += (xi[j] - scopes[i].min) * multipliers[i];
-                }
-                break;
-            case TYPE_ENUM:
-                xi = AS_I64(ENUM_VAL(col));
-                if (indices) {
-                    for (j = 0; j < len; j++)
-                        xo[j] += (xi[indices[j]] - scopes[i].min) * multipliers[i];
-                } else {
-                    for (j = 0; j < len; j++)
-                        xo[j] += (xi[j] - scopes[i].min) * multipliers[i];
-                }
-                break;
-            case TYPE_F64:
-                xi = (i64_t *)AS_F64(col);
-                if (indices) {
-                    for (j = 0; j < len; j++)
-                        xo[j] += (xi[indices[j]] - scopes[i].min) * multipliers[i];
-                } else {
-                    for (j = 0; j < len; j++)
-                        xo[j] += (xi[j] - scopes[i].min) * multipliers[i];
-                }
-                break;
-            default:
-                // because we already checked the types, this should never happen
-                __builtin_unreachable();
-        }
+    // Parallel combined key computation - single pass over all columns
+    ctx = (__perfect_hash_ctx_t){
+        .values = values,
+        .indices = indices,
+        .out = xo,
+        .scopes = scopes,
+        .multipliers = multipliers,
+        .ncols = l
+    };
+
+    pool = pool_get();
+    chunks = pool_split_by(pool, len, 0);
+    base_chunk = pool_chunk_aligned(len, chunks, sizeof(i64_t));
+
+    if (chunks == 1) {
+        index_group_list_perfect_partial(len, 0, &ctx);
+    } else {
+        pool_prepare(pool);
+        for (i = 0; i < (u64_t)(chunks - 1); i++)
+            pool_add_task(pool, (raw_p)index_group_list_perfect_partial, 3, base_chunk, i * base_chunk, &ctx);
+        pool_add_task(pool, (raw_p)index_group_list_perfect_partial, 3, len - (chunks - 1) * base_chunk,
+                      (chunks - 1) * base_chunk, &ctx);
+        v = pool_run(pool);
+        drop_obj(v);
     }
 
     heap_free(scopes);
@@ -2473,17 +2700,284 @@ obj_p index_group_list_chunk_local(i64_t len, i64_t offset, __group_list_chunk_c
     return NULL_OBJ;
 }
 
+// ============== RADIX PARTITIONED GROUPING ==============
+// Much faster for high-cardinality grouping (many unique groups)
+
+#define RADIX_BITS 10
+#define RADIX_PARTITIONS (1 << RADIX_BITS)
+#define RADIX_MASK (RADIX_PARTITIONS - 1)
+
+// Context for radix partition grouping
+typedef struct __radix_partition_ctx_t {
+    __index_list_ctx_t *list_ctx;
+    i64_t *hashes;
+    i64_t *partition_indices;  // Row indices sorted by partition
+    i64_t *partition_offsets;  // Start offset of each partition
+    i64_t *partition_counts;   // Count per partition
+    i64_t *group_ids;          // Output group IDs
+    i64_t *partition_groups;   // Group count per partition (for offset calculation)
+    i64_t *first_ids;          // First row index for each group (global array)
+    i64_t *partition_first_base;  // Base offset into first_ids for each partition
+} __radix_partition_ctx_t;
+
+// Process a single partition - completely independent, no locks needed
+obj_p radix_group_partition(i64_t partition_id, __radix_partition_ctx_t *ctx) {
+    i64_t start = ctx->partition_offsets[partition_id];
+    i64_t count = ctx->partition_counts[partition_id];
+    i64_t i, v, groups = 0;
+    i64_t *indices = ctx->partition_indices;
+    i64_t *group_ids = ctx->group_ids;
+    i64_t *first_ids = ctx->first_ids;
+    i64_t first_base = ctx->partition_first_base[partition_id];
+    __index_list_ctx_t *list_ctx = ctx->list_ctx;
+    obj_p ht;
+
+    if (count == 0) {
+        ctx->partition_groups[partition_id] = 0;
+        return NULL_OBJ;
+    }
+
+    // Create hash table sized for this partition
+    ht = ht_oa_create(count, TYPE_I64);
+
+    for (i = start; i < start + count; i++) {
+        i64_t row_idx = indices[i];
+        v = ht_oa_tab_insert_with(&ht, row_idx, groups, &__index_list_hash_get, &__index_list_cmp_row, list_ctx);
+        if (v == groups) {
+            // New group - record first row
+            first_ids[first_base + groups] = row_idx;
+            groups++;
+        }
+        group_ids[row_idx] = v;  // Store local group ID (will be remapped later)
+    }
+
+    drop_obj(ht);
+    ctx->partition_groups[partition_id] = groups;
+    return NULL_OBJ;
+}
+
+// Context for parallel histogram
+typedef struct __histogram_ctx_t {
+    i64_t *hashes;
+    i64_t *local_counts;  // Per-thread histogram
+} __histogram_ctx_t;
+
+obj_p radix_histogram_partial(i64_t len, i64_t offset, __histogram_ctx_t *ctx) {
+    i64_t i;
+    i64_t *hashes = ctx->hashes;
+    i64_t *counts = ctx->local_counts;
+    
+    for (i = offset; i < offset + len; i++) {
+        counts[hashes[i] & RADIX_MASK]++;
+    }
+    return NULL_OBJ;
+}
+
+// Context for parallel scatter (no atomics - uses pre-computed offsets)
+typedef struct __scatter_ctx_t {
+    i64_t *hashes;
+    i64_t *partition_indices;
+    i64_t *thread_offsets;  // Pre-computed write position for this thread
+} __scatter_ctx_t;
+
+obj_p radix_scatter_partial(i64_t len, i64_t offset, __scatter_ctx_t *ctx) {
+    i64_t i, partition_id;
+    i64_t *hashes = ctx->hashes;
+    i64_t *indices = ctx->partition_indices;
+    i64_t *write_pos = ctx->thread_offsets;  // Thread-local copy
+    
+    for (i = offset; i < offset + len; i++) {
+        partition_id = hashes[i] & RADIX_MASK;
+        indices[write_pos[partition_id]++] = i;
+    }
+    return NULL_OBJ;
+}
+
+// Radix-partitioned grouping - eliminates sequential merge bottleneck
+obj_p index_group_list_radix(obj_p obj, obj_p filter, i64_t *hashes, i64_t len) {
+    i64_t i, p, total_groups;
+    i64_t *indices, *xo;
+    obj_p res, poolres;
+    __index_list_ctx_t list_ctx;
+    __radix_partition_ctx_t radix_ctx;
+    pool_p pool;
+    i64_t parts, chunk;
+
+    indices = is_null(filter) ? NULL : AS_I64(filter);
+
+    pool = pool_get();
+    parts = pool_get_executors_count(pool);
+    if (parts > 32) parts = 32;
+
+    // Allocate arrays
+    i64_t *partition_counts = (i64_t *)heap_alloc(RADIX_PARTITIONS * sizeof(i64_t));
+    i64_t *partition_offsets = (i64_t *)heap_alloc((RADIX_PARTITIONS + 1) * sizeof(i64_t));
+    i64_t *partition_groups = (i64_t *)heap_alloc(RADIX_PARTITIONS * sizeof(i64_t));
+    i64_t *partition_indices = (i64_t *)heap_alloc(len * sizeof(i64_t));
+
+    res = I64(len);
+    xo = AS_I64(res);
+
+    // Phase 1: Build histogram in parallel
+    // Each thread builds local histogram, then merge
+    i64_t *local_histograms = (i64_t *)heap_alloc(parts * RADIX_PARTITIONS * sizeof(i64_t));
+    memset(local_histograms, 0, parts * RADIX_PARTITIONS * sizeof(i64_t));
+    
+    __histogram_ctx_t hist_ctxs[32];
+    chunk = len / parts;
+    
+    pool_prepare(pool);
+    for (i = 0; i < parts; i++) {
+        hist_ctxs[i].hashes = hashes;
+        hist_ctxs[i].local_counts = local_histograms + i * RADIX_PARTITIONS;
+        i64_t start = i * chunk;
+        i64_t this_len = (i == parts - 1) ? (len - start) : chunk;
+        pool_add_task(pool, (raw_p)radix_histogram_partial, 3, this_len, start, &hist_ctxs[i]);
+    }
+    poolres = pool_run(pool);
+    drop_obj(poolres);
+    
+    // Merge histograms
+    memset(partition_counts, 0, RADIX_PARTITIONS * sizeof(i64_t));
+    for (i = 0; i < parts; i++) {
+        for (p = 0; p < RADIX_PARTITIONS; p++) {
+            partition_counts[p] += local_histograms[i * RADIX_PARTITIONS + p];
+        }
+    }
+    heap_free(local_histograms);
+
+    // Phase 2: Compute prefix sums for offsets
+    partition_offsets[0] = 0;
+    for (p = 0; p < RADIX_PARTITIONS; p++) {
+        partition_offsets[p + 1] = partition_offsets[p] + partition_counts[p];
+    }
+
+    // Phase 3: Parallel scatter (no atomics)
+    // Compute per-thread write offsets using the per-thread histograms
+    // Thread i writes after all threads < i for each partition
+    i64_t *thread_write_offsets = (i64_t *)heap_alloc(parts * RADIX_PARTITIONS * sizeof(i64_t));
+    
+    // Rebuild per-thread histograms (we freed them, so redo quickly)
+    i64_t *thread_counts = (i64_t *)heap_alloc(parts * RADIX_PARTITIONS * sizeof(i64_t));
+    memset(thread_counts, 0, parts * RADIX_PARTITIONS * sizeof(i64_t));
+    
+    for (i = 0; i < parts; i++) {
+        i64_t start = i * chunk;
+        i64_t end = (i == parts - 1) ? len : start + chunk;
+        for (i64_t j = start; j < end; j++) {
+            thread_counts[i * RADIX_PARTITIONS + (hashes[j] & RADIX_MASK)]++;
+        }
+    }
+    
+    // Compute exclusive prefix sum per partition across threads
+    for (p = 0; p < RADIX_PARTITIONS; p++) {
+        i64_t offset = partition_offsets[p];
+        for (i = 0; i < parts; i++) {
+            thread_write_offsets[i * RADIX_PARTITIONS + p] = offset;
+            offset += thread_counts[i * RADIX_PARTITIONS + p];
+        }
+    }
+    heap_free(thread_counts);
+    
+    // Now each thread scatters to its pre-computed positions
+    __scatter_ctx_t scatter_ctxs[32];
+    pool_prepare(pool);
+    for (i = 0; i < parts; i++) {
+        scatter_ctxs[i].hashes = hashes;
+        scatter_ctxs[i].partition_indices = partition_indices;
+        scatter_ctxs[i].thread_offsets = thread_write_offsets + i * RADIX_PARTITIONS;
+        i64_t start = i * chunk;
+        i64_t this_len = (i == parts - 1) ? (len - start) : chunk;
+        pool_add_task(pool, (raw_p)radix_scatter_partial, 3, this_len, start, &scatter_ctxs[i]);
+    }
+    poolres = pool_run(pool);
+    drop_obj(poolres);
+    heap_free(thread_write_offsets);
+    timeit_tick("radix partition");
+
+    // Phase 4: Group each partition independently (fully parallel!)
+    // Allocate first_ids array (worst case: len groups)
+    i64_t *first_ids = (i64_t *)heap_alloc(len * sizeof(i64_t));
+    i64_t *partition_first_base = (i64_t *)heap_alloc((RADIX_PARTITIONS + 1) * sizeof(i64_t));
+    
+    // Compute base offset for each partition's first_ids (using partition_counts as upper bound)
+    partition_first_base[0] = 0;
+    for (p = 0; p < RADIX_PARTITIONS; p++) {
+        partition_first_base[p + 1] = partition_first_base[p] + partition_counts[p];
+    }
+
+    list_ctx = (__index_list_ctx_t){.lcols = obj, .rcols = obj, .hashes = hashes, .filter = indices};
+
+    radix_ctx.list_ctx = &list_ctx;
+    radix_ctx.hashes = hashes;
+    radix_ctx.partition_indices = partition_indices;
+    radix_ctx.partition_offsets = partition_offsets;
+    radix_ctx.partition_counts = partition_counts;
+    radix_ctx.group_ids = xo;
+    radix_ctx.partition_groups = partition_groups;
+    radix_ctx.first_ids = first_ids;
+    radix_ctx.partition_first_base = partition_first_base;
+
+    pool_prepare(pool);
+    for (p = 0; p < RADIX_PARTITIONS; p++) {
+        pool_add_task(pool, (raw_p)radix_group_partition, 2, p, &radix_ctx);
+    }
+    poolres = pool_run(pool);
+    drop_obj(poolres);
+    timeit_tick("radix group partitions");
+
+    // Phase 5: Compute global group IDs by adding partition offsets
+    // First compute the offset for each partition
+    i64_t *group_offsets = partition_offsets;  // Reuse array
+    group_offsets[0] = 0;
+    for (p = 0; p < RADIX_PARTITIONS; p++) {
+        group_offsets[p + 1] = group_offsets[p] + partition_groups[p];
+    }
+    total_groups = group_offsets[RADIX_PARTITIONS];
+
+    // Remap local group IDs to global IDs - unrolled for better ILP
+    i64_t len4 = len & ~3;
+    for (i = 0; i < len4; i += 4) {
+        xo[i]     += group_offsets[hashes[i]     & RADIX_MASK];
+        xo[i + 1] += group_offsets[hashes[i + 1] & RADIX_MASK];
+        xo[i + 2] += group_offsets[hashes[i + 2] & RADIX_MASK];
+        xo[i + 3] += group_offsets[hashes[i + 3] & RADIX_MASK];
+    }
+    for (; i < len; i++) {
+        xo[i] += group_offsets[hashes[i] & RADIX_MASK];
+    }
+    
+    // Compact first_ids from partitioned layout to sequential layout
+    obj_p firsts = I64(total_groups);
+    i64_t *firsts_arr = AS_I64(firsts);
+    for (p = 0; p < RADIX_PARTITIONS; p++) {
+        memcpy(firsts_arr + group_offsets[p], 
+               first_ids + partition_first_base[p], 
+               partition_groups[p] * sizeof(i64_t));
+    }
+    timeit_tick("radix remap");
+
+    // Cleanup
+    heap_free(partition_counts);
+    heap_free(partition_offsets);
+    heap_free(partition_groups);
+    heap_free(partition_indices);
+    heap_free(partition_first_base);
+    heap_free(first_ids);
+    heap_free(hashes);
+
+    return index_group_build(INDEX_TYPE_IDS, total_groups, res, i64(NULL_I64), NULL_OBJ, clone_obj(filter), firsts);
+}
+
 obj_p index_group_list(obj_p obj, obj_p filter) {
-    i64_t i, j, len, parts, chunk, last_chunk, groups;
-    i64_t g, v, *xo, *indices, *remap;
-    obj_p res, *values, ht, poolres;
+    i64_t i, len, parts;
+    i64_t g, v, *xo, *indices;
+    obj_p res, *values, ht;
     __index_list_ctx_t ctx;
-    __group_list_chunk_ctx_t chunk_ctxs[32];
-    i64_t offsets[32];
     pool_p pool;
 
     if (ops_count(obj) == 0)
-        return err_type(0, 0, 0, 0);
+        return err_length(1, 0, 0, 0, 0, 0);
 
     if (ops_count(obj) == 1)
         return index_group(AS_LIST(obj)[0], filter);
@@ -2499,19 +2993,19 @@ obj_p index_group_list(obj_p obj, obj_p filter) {
     indices = is_null(filter) ? NULL : AS_I64(filter);
     len = indices ? filter->len : values[0]->len;
 
-    res = I64(len);
-    xo = AS_I64(res);
-
-    __index_list_precalc_hash(obj, (i64_t *)xo, obj->len, len, indices, B8_FALSE);
-    timeit_tick("group index precalc hash");
-
-    ctx = (__index_list_ctx_t){.lcols = obj, .rcols = obj, .hashes = (i64_t *)xo, .filter = indices};
-
     pool = pool_get();
     parts = pool_split_by(pool, len, 0);
 
-    // Single-threaded path
+    res = I64(len);
+    xo = AS_I64(res);
+
+    // Single-threaded path - can reuse xo for hashes (overwritten sequentially)
     if (parts == 1) {
+        __index_list_precalc_hash(obj, (i64_t *)xo, obj->len, len, indices, B8_FALSE);
+        timeit_tick("group index precalc hash");
+
+        ctx = (__index_list_ctx_t){.lcols = obj, .rcols = obj, .hashes = (i64_t *)xo, .filter = indices};
+
         ht = ht_oa_create(len, TYPE_I64);
 
         // distribute bins
@@ -2528,6 +3022,25 @@ obj_p index_group_list(obj_p obj, obj_p filter) {
 
         return index_group_build(INDEX_TYPE_IDS, g, res, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
     }
+
+    // Multi-threaded path - use radix partitioning for better parallelism
+    i64_t *hashes = (i64_t *)heap_alloc(len * sizeof(i64_t));
+    __index_list_precalc_hash(obj, hashes, obj->len, len, indices, B8_FALSE);
+    timeit_tick("group index precalc hash");
+
+    // Use radix partitioning - eliminates sequential merge bottleneck
+    drop_obj(res);  // radix function creates its own
+    return index_group_list_radix(obj, filter, hashes, len);
+
+    // Old chunk-based approach (kept for reference)
+    #if 0
+    i64_t j, chunk, last_chunk, groups;
+    i64_t *remap;
+    obj_p poolres;
+    __group_list_chunk_ctx_t chunk_ctxs[32];
+    i64_t offsets[32];
+    
+    ctx = (__index_list_ctx_t){.lcols = obj, .rcols = obj, .hashes = hashes, .filter = indices};
 
     // Limit parts
     if (parts > 32)
@@ -2573,10 +3086,12 @@ obj_p index_group_list(obj_p obj, obj_p filter) {
         i64_t *ht_vals = AS_I64(AS_LIST(local_ht)[1]);
 
         // Create remap array for this chunk's local IDs -> global IDs
-        remap = (i64_t *)heap_alloc(chunk_ctxs[i].local_groups * sizeof(i64_t));
+        i64_t local_count = chunk_ctxs[i].local_groups;
+        i64_t found = 0;
+        remap = (i64_t *)heap_alloc(local_count * sizeof(i64_t));
 
-        // For each unique key in this chunk's hash table
-        for (j = 0; j < ht_len; j++) {
+        // For each unique key in this chunk's hash table (early exit when all found)
+        for (j = 0; j < ht_len && found < local_count; j++) {
             if (ht_keys[j] != NULL_I64) {
                 i64_t local_id = ht_vals[j];
                 i64_t row_idx = ht_keys[j];  // This stores the row index, not the key itself
@@ -2587,6 +3102,7 @@ obj_p index_group_list(obj_p obj, obj_p filter) {
                     groups++;
 
                 remap[local_id] = v;
+                found++;
             }
         }
 
@@ -2601,10 +3117,11 @@ obj_p index_group_list(obj_p obj, obj_p filter) {
     }
 
     drop_obj(ht);
-
+    heap_free(hashes);  // Free the separate hashes array
     timeit_tick("group index list");
 
     return index_group_build(INDEX_TYPE_IDS, groups, res, i64(NULL_I64), NULL_OBJ, clone_obj(filter), NULL_OBJ);
+    #endif  // Old chunk-based approach
 }
 
 obj_p index_left_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
@@ -2909,7 +3426,7 @@ static obj_p __asof_ids_partial(__index_list_ctx_t *ctx, obj_p lxcol, obj_p rxco
             }
             break;
         default:
-            return err_type(0, 0, 0, 0);
+            return err_type(TYPE_I64, lxcol->type, 0, 0);
     }
 
     return NULL_OBJ;

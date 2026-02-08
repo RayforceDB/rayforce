@@ -163,7 +163,7 @@ obj_p ray_timeit(obj_p *x, i64_t n) {
             return f64(ray_clock_elapsed_ms(&start, &end));
         case 2:
             if (x[0]->type != -TYPE_I64)
-                return err_type(0, 0, 0, 0);
+                return err_type(-TYPE_I64, x[0]->type, 1, 0);
 
             l = x[0]->i64;
 

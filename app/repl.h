@@ -32,10 +32,9 @@ typedef struct repl_t {
     i64_t id;
     obj_p name;
     term_p term;
-    b8_t silent;
 } *repl_p;
 
-repl_p repl_create(poll_p poll, b8_t silent);
+repl_p repl_create(poll_p poll);
 nil_t repl_destroy(repl_p repl);
 
 nil_t repl_on_open(poll_p poll, selector_p selector);

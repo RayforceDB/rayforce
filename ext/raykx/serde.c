@@ -51,7 +51,7 @@ i64_t raykx_size_obj(obj_p obj) {
         case -TYPE_F64:
             return ISIZEOF(i8_t) + ISIZEOF(f64_t);
         case -TYPE_SYMBOL:
-            return ISIZEOF(i8_t) + SYMBOL_STRLEN(obj->i64) + 1;
+            return ISIZEOF(i8_t) + symbol_strlen(obj->i64) + 1;
         case -TYPE_C8:
             return ISIZEOF(i8_t) + ISIZEOF(c8_t);
         case -TYPE_GUID:
@@ -79,7 +79,7 @@ i64_t raykx_size_obj(obj_p obj) {
             l = obj->len;
             size = ISIZEOF(i8_t) + 1 + ISIZEOF(u32_t);
             for (i = 0; i < l; i++)
-                size += SYMBOL_STRLEN(AS_SYMBOL(obj)[i]) + 1;
+                size += symbol_strlen(AS_SYMBOL(obj)[i]) + 1;
             return size;
         case TYPE_LIST:
             l = obj->len;
@@ -133,6 +133,8 @@ static const i8_t raykx_type_to_k_table[128] = {
     [TYPE_NULL] = 0,        // Null
     [TYPE_ERR] = -128,      // Error
 };
+
+#define RAYKX_K_ENUM 20
 
 #define RAYKX_TYPE_TO_K(t) (raykx_type_to_k_table[(t < 0 ? -t : t)] * (t < 0 ? -1 : 1))
 
@@ -227,7 +229,7 @@ i64_t raykx_ser_obj(u8_t *buf, obj_p obj) {
             return RAYKX_SER_ATOM(b, obj, f64);
         case -TYPE_SYMBOL:
             str = str_from_symbol(obj->i64);
-            l = SYMBOL_STRLEN(obj->i64) + 1;
+            l = symbol_strlen(obj->i64) + 1;
             memcpy(buf, str, l);
             return ISIZEOF(i8_t) + l;
         case -TYPE_GUID:
@@ -257,7 +259,7 @@ i64_t raykx_ser_obj(u8_t *buf, obj_p obj) {
             b = buf;
             for (i = 0, n = 0; i < obj->len; i++) {
                 str = str_from_symbol(AS_SYMBOL(obj)[i]);
-                n = SYMBOL_STRLEN(AS_SYMBOL(obj)[i]) + 1;
+                n = symbol_strlen(AS_SYMBOL(obj)[i]) + 1;
                 memcpy(b, str, n);
                 b += n;
             }
@@ -500,9 +502,108 @@ obj_p raykx_des_obj(u8_t *buf, i64_t *len) {
                 drop_obj(k);
                 return v;
             }
+            if (k->type == TYPE_TABLE && v->type == TYPE_TABLE) {
+                obj_p kcols = AS_LIST(k)[0];
+                obj_p kdata = AS_LIST(k)[1];
+                obj_p vcols = AS_LIST(v)[0];
+                obj_p vdata = AS_LIST(v)[1];
+
+                if (kcols->type == TYPE_SYMBOL && vcols->type == TYPE_SYMBOL) {
+                    i64_t klen = kcols->len;
+                    i64_t vlen = vcols->len;
+                    obj_p cols = SYMBOL(klen + vlen);
+                    obj_p data = LIST(klen + vlen);
+
+                    for (i = 0; i < klen; i++) {
+                        AS_SYMBOL(cols)[i] = AS_SYMBOL(kcols)[i];
+                        AS_LIST(data)[i] = clone_obj(AS_LIST(kdata)[i]);
+                    }
+                    for (i = 0; i < vlen; i++) {
+                        AS_SYMBOL(cols)[klen + i] = AS_SYMBOL(vcols)[i];
+                        AS_LIST(data)[klen + i] = clone_obj(AS_LIST(vdata)[i]);
+                    }
+
+                    drop_obj(k);
+                    drop_obj(v);
+                    return table(cols, data);
+                }
+            }
             obj = table(k, v);
             obj->type = TYPE_DICT;
             return obj;
+        case RAYKX_K_ENUM: {
+            // Enum: attrs + key(symbol) + values(int vector)
+            if (*len < 1)
+                return ray_err("raykx_des_obj: buffer underflow for enum header");
+            buf++;  // attrs
+            (*len)--;
+            l = *len;
+            k = raykx_des_obj(buf, len);
+            if (IS_ERR(k))
+                return k;
+            buf += l - *len;
+            l = *len;
+            v = raykx_des_obj(buf, len);
+            if (IS_ERR(v)) {
+                drop_obj(k);
+                return v;
+            }
+            buf += l - *len;
+
+            // Normalize key to symbol atom
+            if (k->type == TYPE_SYMBOL && k->len == 1) {
+                i64_t kid = AS_SYMBOL(k)[0];
+                obj_p atom = symbol(str_from_symbol(kid), symbol_strlen(kid));
+                drop_obj(k);
+                k = atom;
+            }
+            if (k->type != -TYPE_SYMBOL) {
+                drop_obj(k);
+                drop_obj(v);
+                return ray_err("raykx_des_obj: enum key must be symbol");
+            }
+
+            // Normalize values to I64 vector
+            if (v->type == TYPE_I32 || v->type == TYPE_DATE || v->type == TYPE_TIME) {
+                obj_p i64v = I64(v->len);
+                for (i = 0; i < v->len; i++)
+                    AS_I64(i64v)[i] = (i64_t)AS_I32(v)[i];
+                drop_obj(v);
+                v = i64v;
+            } else if (v->type == TYPE_I16) {
+                obj_p i64v = I64(v->len);
+                for (i = 0; i < v->len; i++)
+                    AS_I64(i64v)[i] = (i64_t)AS_I16(v)[i];
+                drop_obj(v);
+                v = i64v;
+            } else if (v->type == TYPE_U8) {
+                obj_p i64v = I64(v->len);
+                for (i = 0; i < v->len; i++)
+                    AS_I64(i64v)[i] = (i64_t)AS_U8(v)[i];
+                drop_obj(v);
+                v = i64v;
+            } else if (v->type == -TYPE_I32) {
+                obj_p i64v = I64(1);
+                AS_I64(i64v)[0] = (i64_t)v->i32;
+                drop_obj(v);
+                v = i64v;
+            } else if (v->type == -TYPE_I64) {
+                obj_p i64v = I64(1);
+                AS_I64(i64v)[0] = v->i64;
+                drop_obj(v);
+                v = i64v;
+            } else if (v->type != TYPE_I64) {
+                drop_obj(k);
+                drop_obj(v);
+                return ray_err("raykx_des_obj: enum values must be integer vector");
+            }
+
+            obj = LIST(2);
+            AS_LIST(obj)[0] = k;
+            AS_LIST(obj)[1] = v;
+            obj->type = TYPE_ENUM;
+            return obj;
+        }
         case XT:
             if (*len < 2)
                 return ray_err( "raykx_des_obj: buffer underflow for table header");

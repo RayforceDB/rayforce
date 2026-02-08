@@ -67,6 +67,7 @@ i64_t *index_group_filter_ids(obj_p index);
 obj_p index_group_filter(obj_p index);
 i64_t index_group_shift(obj_p index);
 obj_p index_group_meta(obj_p index);
+i64_t *index_group_first_ids(obj_p index);
 obj_p index_distinct_i8(i8_t values[], i64_t len);
 obj_p index_distinct_i16(i16_t values[], i64_t len);
 obj_p index_distinct_i32(i32_t values[], i64_t len);
