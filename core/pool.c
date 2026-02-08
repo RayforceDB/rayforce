@@ -318,6 +318,17 @@ nil_t pool_prepare(pool_p pool) {
     mutex_unlock(&pool->mutex);
 }
 
+// Lightweight prepare: skip heap_borrow (for read-only workers that don't allocate)
+nil_t pool_prepare_light(pool_p pool) {
+    if (pool == NULL)
+        PANIC("pool is NULL");
+
+    mutex_lock(&pool->mutex);
+    pool->tasks_count = 0;
+    pool->done_count = 0;
+    mutex_unlock(&pool->mutex);
+}
+
 nil_t pool_add_task(pool_p pool, raw_p fn, i64_t argc, ...) {
     i64_t i, size;
     va_list args;
@@ -443,6 +454,63 @@ obj_p pool_run(pool_p pool) {
     }
 
     return res;
+}
+
+// Lightweight run: skip heap_merge and result collection (for read-only workers)
+obj_p pool_run_light(pool_p pool) {
+    i64_t i, tasks_count, executors_count;
+    obj_p res;
+    task_data_t data;
+
+    if (pool == NULL)
+        PANIC("pool is NULL");
+
+    mutex_lock(&pool->mutex);
+
+    rc_sync_set(1);
+
+    tasks_count = pool->tasks_count;
+    executors_count = pool->executors_count;
+
+    if (executors_count < tasks_count) {
+        for (i = 0; i < executors_count; i++)
+            cond_signal(&pool->run);
+    } else
+        cond_broadcast(&pool->run);
+
+    mutex_unlock(&pool->mutex);
+
+    // process tasks on self too
+    for (i = 0; i < tasks_count; i++) {
+        data = mpmc_pop(pool->task_queue);
+        if (data.id == -1)
+            break;
+        res = pool_call_task_fn(data.fn, data.argc, data.argv);
+        data.result = res;
+        mpmc_push(pool->result_queue, data);
+    }
+
+    mutex_lock(&pool->mutex);
+
+    pool->done_count += i;
+
+    // wait for all tasks to be done
+    while (pool->done_count < tasks_count)
+        cond_wait(&pool->done, &pool->mutex);
+
+    // drain result queue (discard results)
+    for (i = 0; i < tasks_count; i++) {
+        data = mpmc_pop(pool->result_queue);
+        (void)data;
+    }
+
+    // Skip heap_merge — workers didn't allocate
+
+    rc_sync_set(0);
+
+    mutex_unlock(&pool->mutex);
+
+    return NULL_OBJ;
 }
 
 // Memory-aware parallel split decision

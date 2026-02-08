@@ -43,7 +43,7 @@ obj_p aggr_collect(obj_p val, obj_p index);
 obj_p aggr_row(obj_p val, obj_p index);
 
 // ============================================================================
-// Fused aggregation (DuckDB-style single-pass)
+// Fused aggregation (single-pass)
 // ============================================================================
 
 enum {

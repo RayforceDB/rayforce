@@ -36,6 +36,17 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#include <time.h>
+
+#ifdef DEBUG
+#define PH_PHASE_START(name) struct timespec _ph_ts_##name; clock_gettime(CLOCK_MONOTONIC, &_ph_ts_##name);
+#define PH_PHASE_END(name) { struct timespec _ph_te; clock_gettime(CLOCK_MONOTONIC, &_ph_te); \
+    double _ph_ms = (_ph_te.tv_sec - _ph_ts_##name.tv_sec)*1e3 + (_ph_te.tv_nsec - _ph_ts_##name.tv_nsec)/1e6; \
+    fprintf(stderr, "  ph " #name ": %.2fms\n", _ph_ms); }
+#else
+#define PH_PHASE_START(name) ((void)0);
+#define PH_PHASE_END(name) ((void)0);
+#endif
 
 // ============================================================================
 // Constants
@@ -1795,7 +1806,7 @@ obj_p aggr_row(obj_p val, obj_p index) {
 }
 
 // ============================================================================
-// Fused aggregation (DuckDB-style single-pass)
+// Fused aggregation (single-pass)
 // ============================================================================
 
 i8_t aggr_identify_func(obj_p fn) {
@@ -2076,6 +2087,14 @@ typedef struct {
     i64_t *worker_maxs;
 } parallel_minmax_ctx_t;
 
+typedef struct {
+    i64_t nkeys;
+    i64_t *key_data[16];
+    i64_t chunk_size;
+    i64_t (*worker_mins)[16];   // [nworkers][nkeys]
+    i64_t (*worker_maxs)[16];   // [nworkers][nkeys]
+} parallel_multikey_minmax_ctx_t;
+
 static obj_p parallel_minmax_worker(i64_t len, i64_t offset, raw_p ctx_ptr) {
     parallel_minmax_ctx_t *ctx = (parallel_minmax_ctx_t *)ctx_ptr;
     i64_t chunk_idx = offset / ctx->chunk_size;
@@ -2108,7 +2127,7 @@ static i64_t parallel_minmax_scan(pool_p pool, i64_t *kv, i64_t nrows, i64_t *ou
     mmctx.worker_mins = wmins;
     mmctx.worker_maxs = wmaxs;
 
-    pool_prepare(pool);
+    pool_prepare_light(pool);
     i64_t offset = 0, i;
     for (i = 0; i < nworkers - 1; i++) {
         pool_add_task(pool, (raw_p)parallel_minmax_worker, 3, chunk_size, offset, &mmctx);
@@ -2116,8 +2135,7 @@ static i64_t parallel_minmax_scan(pool_p pool, i64_t *kv, i64_t nrows, i64_t *ou
     }
     pool_add_task(pool, (raw_p)parallel_minmax_worker, 3, nrows - offset, offset, &mmctx);
 
-    obj_p res = pool_run(pool);
-    drop_obj(res);
+    pool_run_light(pool);
 
     i64_t mn = wmins[0], mx = wmaxs[0];
     for (i = 1; i < nworkers; i++) {
@@ -2126,6 +2144,67 @@ static i64_t parallel_minmax_scan(pool_p pool, i64_t *kv, i64_t nrows, i64_t *ou
     }
     *out_mn = mn;
     *out_mx = mx;
+    return 0;
+}
+
+// Worker: scan min/max for all keys in a single pass
+static obj_p parallel_multikey_minmax_worker(i64_t len, i64_t offset, raw_p ctx_ptr) {
+    parallel_multikey_minmax_ctx_t *ctx = (parallel_multikey_minmax_ctx_t *)ctx_ptr;
+    i64_t chunk_idx = offset / ctx->chunk_size;
+    i64_t end = offset + len;
+    i64_t nk = ctx->nkeys;
+    for (i64_t k = 0; k < nk; k++) {
+        i64_t *kd = ctx->key_data[k];
+        i64_t mn = kd[offset], mx = kd[offset];
+        for (i64_t r = offset + 1; r < end; r++) {
+            if (kd[r] < mn) mn = kd[r];
+            if (kd[r] > mx) mx = kd[r];
+        }
+        ctx->worker_mins[chunk_idx][k] = mn;
+        ctx->worker_maxs[chunk_idx][k] = mx;
+    }
+    return NULL_OBJ;
+}
+
+// Helper: parallel min/max scan for multiple keys in a single pool dispatch
+static i64_t parallel_multikey_minmax_scan(pool_p pool, i64_t nkeys, i64_t *key_data[],
+                                           i64_t nrows, i64_t *out_mins, i64_t *out_maxs) {
+    i64_t nworkers = pool_split_by(pool, nrows, 0);
+    if (nworkers > MAX_AGG_WORKERS) nworkers = MAX_AGG_WORKERS;
+    if (nworkers <= 1 || nrows < PARALLEL_AGG_THRESHOLD)
+        return -1;
+
+    i64_t chunk_size = pool_chunk_aligned(nrows, nworkers, sizeof(i64_t));
+    i64_t wmins[MAX_AGG_WORKERS][16], wmaxs[MAX_AGG_WORKERS][16];
+
+    parallel_multikey_minmax_ctx_t mmctx;
+    mmctx.nkeys = nkeys;
+    mmctx.chunk_size = chunk_size;
+    mmctx.worker_mins = wmins;
+    mmctx.worker_maxs = wmaxs;
+    for (i64_t k = 0; k < nkeys; k++)
+        mmctx.key_data[k] = key_data[k];
+
+    pool_prepare_light(pool);
+    i64_t offset = 0, i;
+    for (i = 0; i < nworkers - 1; i++) {
+        pool_add_task(pool, (raw_p)parallel_multikey_minmax_worker, 3, chunk_size, offset, &mmctx);
+        offset += chunk_size;
+    }
+    pool_add_task(pool, (raw_p)parallel_multikey_minmax_worker, 3, nrows - offset, offset, &mmctx);
+
+    pool_run_light(pool);
+
+    // Reduce per-worker results
+    for (i64_t k = 0; k < nkeys; k++) {
+        i64_t mn = wmins[0][k], mx = wmaxs[0][k];
+        for (i = 1; i < nworkers; i++) {
+            if (wmins[i][k] < mn) mn = wmins[i][k];
+            if (wmaxs[i][k] > mx) mx = wmaxs[i][k];
+        }
+        out_mins[k] = mn;
+        out_maxs[k] = mx;
+    }
     return 0;
 }
 
@@ -2413,6 +2492,7 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
             i64_t *kv = AS_I64(key_col);
             i64_t mn, mx;
             // Try parallel min/max scan first
+            PH_PHASE_START(minmax);
             pool_p pool = pool_get();
             if (parallel_minmax_scan(pool, kv, nrows, &mn, &mx) != 0) {
                 mn = kv[0]; mx = kv[0];
@@ -2421,6 +2501,7 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                     if (kv[i] > mx) mx = kv[i];
                 }
             }
+            PH_PHASE_END(minmax);
             i64_t range = mx - mn + 1;
 
             if (range > 0 && range <= PERFECT_HASH_THRESHOLD) {
@@ -2475,6 +2556,7 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                     }
 
                     // Submit tasks
+                    PH_PHASE_START(agg);
                     pool_prepare(pool);
                     i64_t offset = 0;
                     for (i = 0; i < nworkers - 1; i++) {
@@ -2485,7 +2567,9 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
 
                     obj_p pres = pool_run(pool);
                     drop_obj(pres);
+                    PH_PHASE_END(agg);
 
+                    PH_PHASE_START(merge);
                     // Merge: combine per-worker accumulators
                     i64_t *pcounts = pctx.worker_counts[0];
                     fused_accum_t *accum = pctx.worker_acc[0];
@@ -2507,38 +2591,42 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                                 }
                             }
                         }
-                        // Merge accumulators per plan entry
+                        // Merge accumulators per plan entry (switch hoisted outside inner loop)
                         for (p = 0; p < nplan; p++) {
-                            i8_t func = plan[p].func_id;
                             fused_accum_t *wa = &pctx.worker_acc[w][p];
                             fused_accum_t *ma = &accum[p];
-                            for (i64_t s = 0; s < range; s++) {
-                                switch (func) {
-                                case AGGR_ID_SUM:
-                                case AGGR_ID_COUNT:
-                                    if (ma->i64_acc && wa->i64_acc) ma->i64_acc[s] += wa->i64_acc[s];
-                                    if (ma->f64_acc && wa->f64_acc) ma->f64_acc[s] += wa->f64_acc[s];
-                                    break;
-                                case AGGR_ID_MAX:
-                                    if (ma->i64_acc && wa->i64_acc && wa->i64_acc[s] > ma->i64_acc[s])
-                                        ma->i64_acc[s] = wa->i64_acc[s];
-                                    if (ma->f64_acc && wa->f64_acc && wa->f64_acc[s] > ma->f64_acc[s])
-                                        ma->f64_acc[s] = wa->f64_acc[s];
-                                    break;
-                                case AGGR_ID_MIN:
-                                    if (ma->i64_acc && wa->i64_acc && wa->i64_acc[s] < ma->i64_acc[s])
-                                        ma->i64_acc[s] = wa->i64_acc[s];
-                                    if (ma->f64_acc && wa->f64_acc && wa->f64_acc[s] < ma->f64_acc[s])
-                                        ma->f64_acc[s] = wa->f64_acc[s];
-                                    break;
-                                case AGGR_ID_AVG:
-                                case AGGR_ID_DEV:
-                                    if (ma->f64_acc && wa->f64_acc) ma->f64_acc[s] += wa->f64_acc[s];
-                                    if (ma->f64_aux && wa->f64_aux) ma->f64_aux[s] += wa->f64_aux[s];
-                                    if (ma->counts && wa->counts) ma->counts[s] += wa->counts[s];
-                                    break;
-                                default: break;
-                                }
+                            switch (plan[p].func_id) {
+                            case AGGR_ID_SUM: case AGGR_ID_COUNT:
+                                if (ma->i64_acc && wa->i64_acc)
+                                    for (i64_t s = 0; s < range; s++) ma->i64_acc[s] += wa->i64_acc[s];
+                                if (ma->f64_acc && wa->f64_acc)
+                                    for (i64_t s = 0; s < range; s++) ma->f64_acc[s] += wa->f64_acc[s];
+                                break;
+                            case AGGR_ID_MAX:
+                                if (ma->i64_acc && wa->i64_acc)
+                                    for (i64_t s = 0; s < range; s++)
+                                        if (wa->i64_acc[s] > ma->i64_acc[s]) ma->i64_acc[s] = wa->i64_acc[s];
+                                if (ma->f64_acc && wa->f64_acc)
+                                    for (i64_t s = 0; s < range; s++)
+                                        if (wa->f64_acc[s] > ma->f64_acc[s]) ma->f64_acc[s] = wa->f64_acc[s];
+                                break;
+                            case AGGR_ID_MIN:
+                                if (ma->i64_acc && wa->i64_acc)
+                                    for (i64_t s = 0; s < range; s++)
+                                        if (wa->i64_acc[s] < ma->i64_acc[s]) ma->i64_acc[s] = wa->i64_acc[s];
+                                if (ma->f64_acc && wa->f64_acc)
+                                    for (i64_t s = 0; s < range; s++)
+                                        if (wa->f64_acc[s] < ma->f64_acc[s]) ma->f64_acc[s] = wa->f64_acc[s];
+                                break;
+                            case AGGR_ID_AVG: case AGGR_ID_DEV:
+                                if (ma->f64_acc && wa->f64_acc)
+                                    for (i64_t s = 0; s < range; s++) ma->f64_acc[s] += wa->f64_acc[s];
+                                if (ma->f64_aux && wa->f64_aux)
+                                    for (i64_t s = 0; s < range; s++) ma->f64_aux[s] += wa->f64_aux[s];
+                                if (ma->counts && wa->counts)
+                                    for (i64_t s = 0; s < range; s++) ma->counts[s] += wa->counts[s];
+                                break;
+                            default: break;
                             }
                         }
                         // Free worker w's state
@@ -2550,6 +2638,8 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                         fused_free_accum(pctx.worker_acc[w], nplan);
                     }
 
+                    PH_PHASE_END(merge);
+                    PH_PHASE_START(extract);
                     // Compact non-empty groups
                     i64_t ng = 0;
                     for (i = 0; i < range; i++)
@@ -2592,6 +2682,7 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                     heap_free(pctx.worker_counts);
                     if (pctx.worker_first) heap_free(pctx.worker_first);
                     if (pctx.worker_last) heap_free(pctx.worker_last);
+                    PH_PHASE_END(extract);
                     return;
                 }
 
@@ -2672,6 +2763,7 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
             key_data[k] = AS_I64(kc);
         }
 
+        PH_PHASE_START(mk_minmax);
         if (all_hashable) {
             // Parallel multi-key min/max: scan all keys in one pass per worker
             pool_p mpool = pool_get();
@@ -2679,21 +2771,30 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
             if (nw > MAX_AGG_WORKERS) nw = MAX_AGG_WORKERS;
 
             if (nw > 1 && nrows >= PARALLEL_AGG_THRESHOLD) {
-                // Use per-key parallel_minmax_scan — nkeys pool dispatches (nkeys is 2-6)
-                for (i64_t k = 0; k < nkeys; k++) {
-                    i64_t mn, mx;
-                    if (parallel_minmax_scan(mpool, key_data[k], nrows, &mn, &mx) != 0) {
-                        mn = key_data[k][0]; mx = key_data[k][0];
-                        for (i = 1; i < nrows; i++) {
-                            if (key_data[k][i] < mn) mn = key_data[k][i];
-                            if (key_data[k][i] > mx) mx = key_data[k][i];
-                        }
+                // Single pool dispatch scans all keys' min/max in one pass
+                i64_t maxs[16];
+                if (parallel_multikey_minmax_scan(mpool, nkeys, key_data, nrows, mins, maxs) == 0) {
+                    for (i64_t k = 0; k < nkeys; k++) {
+                        ranges[k] = maxs[k] - mins[k] + 1;
+                        if (ranges[k] <= 0) { all_hashable = B8_FALSE; break; }
+                        composite_range *= ranges[k];
+                        if (composite_range > PERFECT_HASH_THRESHOLD) { all_hashable = B8_FALSE; break; }
                     }
-                    mins[k] = mn;
-                    ranges[k] = mx - mn + 1;
-                    if (ranges[k] <= 0) { all_hashable = B8_FALSE; break; }
-                    composite_range *= ranges[k];
-                    if (composite_range > PERFECT_HASH_THRESHOLD) { all_hashable = B8_FALSE; break; }
+                } else {
+                    // Fallback: sequential scan
+                    for (i64_t k = 0; k < nkeys; k++) {
+                        i64_t *kv = key_data[k];
+                        i64_t mn = kv[0], mx = kv[0];
+                        for (i = 1; i < nrows; i++) {
+                            if (kv[i] < mn) mn = kv[i];
+                            if (kv[i] > mx) mx = kv[i];
+                        }
+                        mins[k] = mn;
+                        ranges[k] = mx - mn + 1;
+                        if (ranges[k] <= 0) { all_hashable = B8_FALSE; break; }
+                        composite_range *= ranges[k];
+                        if (composite_range > PERFECT_HASH_THRESHOLD) { all_hashable = B8_FALSE; break; }
+                    }
                 }
             } else {
                 // Sequential fallback for small tables
@@ -2713,6 +2814,7 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
             }
         }
 
+        PH_PHASE_END(mk_minmax);
         if (all_hashable) {
             // Compute strides (row-major: last key varies fastest)
             strides[nkeys - 1] = 1;
@@ -2775,6 +2877,7 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                     }
                 }
 
+                PH_PHASE_START(mk_agg);
                 pool_prepare(pool);
                 i64_t offset = 0;
                 for (i = 0; i < nworkers - 1; i++) {
@@ -2785,6 +2888,7 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
 
                 obj_p pres = pool_run(pool);
                 drop_obj(pres);
+                PH_PHASE_END(mk_agg);
 
                 i64_t *pcounts = pctx.worker_counts[0];
                 fused_accum_t *accum = pctx.worker_acc[0];
@@ -2807,30 +2911,40 @@ nil_t aggr_fused_compute(struct query_ctx_t *ctx, fused_plan_t *plan, i64_t npla
                         }
                     }
                     for (p = 0; p < nplan; p++) {
-                        i8_t func = plan[p].func_id;
                         fused_accum_t *wa = &pctx.worker_acc[w][p];
                         fused_accum_t *ma = &accum[p];
-                        for (i64_t s = 0; s < range; s++) {
-                            switch (func) {
-                            case AGGR_ID_SUM: case AGGR_ID_COUNT:
-                                if (ma->i64_acc && wa->i64_acc) ma->i64_acc[s] += wa->i64_acc[s];
-                                if (ma->f64_acc && wa->f64_acc) ma->f64_acc[s] += wa->f64_acc[s];
-                                break;
-                            case AGGR_ID_MAX:
-                                if (ma->i64_acc && wa->i64_acc && wa->i64_acc[s] > ma->i64_acc[s]) ma->i64_acc[s] = wa->i64_acc[s];
-                                if (ma->f64_acc && wa->f64_acc && wa->f64_acc[s] > ma->f64_acc[s]) ma->f64_acc[s] = wa->f64_acc[s];
-                                break;
-                            case AGGR_ID_MIN:
-                                if (ma->i64_acc && wa->i64_acc && wa->i64_acc[s] < ma->i64_acc[s]) ma->i64_acc[s] = wa->i64_acc[s];
-                                if (ma->f64_acc && wa->f64_acc && wa->f64_acc[s] < ma->f64_acc[s]) ma->f64_acc[s] = wa->f64_acc[s];
-                                break;
-                            case AGGR_ID_AVG: case AGGR_ID_DEV:
-                                if (ma->f64_acc && wa->f64_acc) ma->f64_acc[s] += wa->f64_acc[s];
-                                if (ma->f64_aux && wa->f64_aux) ma->f64_aux[s] += wa->f64_aux[s];
-                                if (ma->counts && wa->counts) ma->counts[s] += wa->counts[s];
-                                break;
-                            default: break;
-                            }
+                        switch (plan[p].func_id) {
+                        case AGGR_ID_SUM: case AGGR_ID_COUNT:
+                            if (ma->i64_acc && wa->i64_acc)
+                                for (i64_t s = 0; s < range; s++) ma->i64_acc[s] += wa->i64_acc[s];
+                            if (ma->f64_acc && wa->f64_acc)
+                                for (i64_t s = 0; s < range; s++) ma->f64_acc[s] += wa->f64_acc[s];
+                            break;
+                        case AGGR_ID_MAX:
+                            if (ma->i64_acc && wa->i64_acc)
+                                for (i64_t s = 0; s < range; s++)
+                                    if (wa->i64_acc[s] > ma->i64_acc[s]) ma->i64_acc[s] = wa->i64_acc[s];
+                            if (ma->f64_acc && wa->f64_acc)
+                                for (i64_t s = 0; s < range; s++)
+                                    if (wa->f64_acc[s] > ma->f64_acc[s]) ma->f64_acc[s] = wa->f64_acc[s];
+                            break;
+                        case AGGR_ID_MIN:
+                            if (ma->i64_acc && wa->i64_acc)
+                                for (i64_t s = 0; s < range; s++)
+                                    if (wa->i64_acc[s] < ma->i64_acc[s]) ma->i64_acc[s] = wa->i64_acc[s];
+                            if (ma->f64_acc && wa->f64_acc)
+                                for (i64_t s = 0; s < range; s++)
+                                    if (wa->f64_acc[s] < ma->f64_acc[s]) ma->f64_acc[s] = wa->f64_acc[s];
+                            break;
+                        case AGGR_ID_AVG: case AGGR_ID_DEV:
+                            if (ma->f64_acc && wa->f64_acc)
+                                for (i64_t s = 0; s < range; s++) ma->f64_acc[s] += wa->f64_acc[s];
+                            if (ma->f64_aux && wa->f64_aux)
+                                for (i64_t s = 0; s < range; s++) ma->f64_aux[s] += wa->f64_aux[s];
+                            if (ma->counts && wa->counts)
+                                for (i64_t s = 0; s < range; s++) ma->counts[s] += wa->counts[s];
+                            break;
+                        default: break;
                         }
                     }
                     heap_free(pctx.worker_counts[w]);

@@ -54,8 +54,6 @@ nil_t query_ctx_init(query_ctx_p ctx);
 nil_t query_ctx_destroy(query_ctx_p ctx);
 
 obj_p get_fields(obj_p obj);
-obj_p remap_filter(obj_p x, obj_p y);
-obj_p remap_group(query_ctx_p ctx);
 obj_p ray_select(obj_p obj);
 
 #endif  // QUERY_H

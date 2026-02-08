@@ -1092,7 +1092,7 @@ obj_p ray_update(obj_p obj) {
         ctx.table = prm;
     } else if (filters != NULL_OBJ) {
         // Remap filtered table for column resolution
-        val = remap_filter(tab, filters);
+        val = filter_map(tab, filters);
         if (IS_ERR(val)) {
             res = val;
             goto cleanup;

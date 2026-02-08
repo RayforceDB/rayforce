@@ -40,9 +40,6 @@
 #include "runtime.h"
 #include "symbols.h"
 
-obj_p remap_filter(obj_p tab, obj_p index) { return filter_map(tab, index); }
-
-obj_p remap_group(query_ctx_p ctx) { return group_map(ctx->table, NULL_OBJ); }
 
 // ============================================================================
 // Fused aggregation: pre-scan mappings and compute all aggregates in one pass
@@ -632,7 +629,7 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
         // Store key column names for result table assembly
         ctx->group_keys = gkeys;
 
-        // Try fused aggregation (DuckDB-style one-pass)
+        // Try fused aggregation (single-pass)
         if (!try_fused_aggregate(obj, ctx)) {
             // Fused failed — materialize filtered table for fallback path
             if (ctx->filter_bool != NULL_OBJ && ctx->filter_bool->type == TYPE_B8
@@ -672,7 +669,7 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
                 ctx->table = table(clone_obj(tab_keys_f), fvals);
             }
             // Fallback: old path with group_map
-            prm = remap_group(ctx);
+            prm = group_map(ctx->table, NULL_OBJ);
 
             if (IS_ERR(prm)) {
                 timeit_span_end("group");
@@ -698,7 +695,7 @@ obj_p select_apply_groupings(obj_p obj, query_ctx_p ctx) {
             if (IS_ERR(fil)) return fil;
             ctx->filter = fil;
         }
-        val = remap_filter(ctx->table, ctx->filter);
+        val = filter_map(ctx->table, ctx->filter);
 
         if (IS_ERR(val))
             return val;
