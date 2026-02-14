@@ -34,7 +34,7 @@
 runtime_p __RUNTIME = NULL;
 
 nil_t usage(nil_t) {
-    printf("%s%s%s", BOLD, YELLOW, "Usage: rayforce [-f file] [-p port] [-t timeit] [-c cores] [-i] [file]\n");
+    printf("%s%s%s", BOLD, YELLOW, "Usage: rayforce [-f file] [-p port] [-t timeit] [-c cores] [-i] [-r 0|1 REPL mode] [file]\n");
     exit(EXIT_FAILURE);
 }
 
@@ -71,6 +71,12 @@ obj_p parse_cmdline(i32_t argc, str_p argv[]) {
                 if (++opt >= argc)
                     usage();
                 push_sym(&keys, "timeit");
+                str = string_from_str(argv[opt], strlen(argv[opt]));
+                push_obj(&vals, str);
+            } else if (!user_defined && (strcmp(flag, "r") == 0 || strcmp(flag, "repl") == 0)) {
+                if (++opt >= argc)
+                    usage();
+                push_sym(&keys, "repl");
                 str = string_from_str(argv[opt], strlen(argv[opt]));
                 push_obj(&vals, str);
             } else if (!user_defined && (strcmp(flag, "i") == 0 || strcmp(flag, "interactive") == 0)) {

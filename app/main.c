@@ -57,10 +57,11 @@ i32_t main(i32_t argc, str_p argv[]) {
     i32_t code = -1;
     sys_info_t *info;
     runtime_p runtime;
-    obj_p interactive_arg, port_arg, file_arg, res, fmt;
+    obj_p interactive_arg, port_arg, file_arg, repl_arg, res, fmt;
     b8_t interactive = B8_FALSE;
     b8_t has_file = B8_FALSE;
     b8_t file_error = B8_FALSE;
+    b8_t repl_disabled = B8_FALSE;
 
     runtime = runtime_create(argc, argv);
     if (runtime == NULL)
@@ -70,6 +71,14 @@ i32_t main(i32_t argc, str_p argv[]) {
     interactive_arg = runtime_get_arg("interactive");
     interactive = !is_null(interactive_arg);
     drop_obj(interactive_arg);
+
+    // Check if REPL is explicitly disabled (-r 0)
+    repl_arg = runtime_get_arg("repl");
+    if (!is_null(repl_arg)) {
+        if (repl_arg->len == 1 && AS_C8(repl_arg)[0] == '0')
+            repl_disabled = B8_TRUE;
+    }
+    drop_obj(repl_arg);
 
     // Check if port is specified (-p/--port) — implies server mode
     port_arg = runtime_get_arg("port");
@@ -104,14 +113,16 @@ i32_t main(i32_t argc, str_p argv[]) {
 
     // Interactive mode: no file, or file with -i flag
     // Only show logo and REPL if stdin is a TTY (not piped input)
-    if (isatty(STDIN_FILENO)) {
+    if (!repl_disabled && isatty(STDIN_FILENO)) {
         info = &runtime_get()->sys_info;
         print_logo(info);
     }
 
     // Create REPL for interactive mode (handles both TTY and piped input)
+    // When REPL is disabled (-r 0), skip entirely — daemon/server mode:
+    // the event loop runs with only the port listener, no stdin interaction.
     repl_p repl = NULL;
-    if (runtime->poll)
+    if (!repl_disabled && runtime->poll)
         repl = repl_create(runtime->poll);
 
     code = runtime_run();
