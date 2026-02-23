@@ -867,6 +867,10 @@ obj_p ray_distinct(obj_p x) {
             res = index_distinct_i64(AS_I64(x), l);
             res->type = x->type;
             return res;
+        case TYPE_F64:
+            l = x->len;
+            res = index_distinct_f64(AS_F64(x), l);
+            return res;
         case TYPE_ENUM:
             l = ops_count(x);
             res = index_distinct_i64(AS_I64(ENUM_VAL(x)), l);
@@ -988,6 +992,24 @@ obj_p ray_distinct(obj_p x) {
                 return I64(0);
             res = index_distinct_i64(AS_I64(combined), combined->len);
             res->type = x->type - TYPE_PARTEDLIST;
+            drop_obj(combined);
+            return res;
+        }
+        case TYPE_PARTEDF64: {
+            obj_p combined = NULL_OBJ;
+            for (i64_t i = 0; i < x->len; i++) {
+                obj_p part = AS_LIST(x)[i];
+                if (combined == NULL_OBJ)
+                    combined = clone_obj(part);
+                else {
+                    obj_p tmp = ray_concat(combined, part);
+                    drop_obj(combined);
+                    combined = tmp;
+                }
+            }
+            if (combined == NULL_OBJ)
+                return F64(0);
+            res = index_distinct_f64(AS_F64(combined), combined->len);
             drop_obj(combined);
             return res;
         }

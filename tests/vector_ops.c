@@ -180,6 +180,10 @@ test_result_t test_vec_distinct() {
     TEST_ASSERT_EQ("(distinct (list [3i 3i] 2i [3i 3i] 2i))", "(list 2i [3i 3i])");
     // String distinct
     TEST_ASSERT_EQ("(distinct \"aabbcc\")", "\"abc\"");
+    // F64 distinct
+    TEST_ASSERT_EQ("(distinct [1.0 2.0 1.0 3.0])", "[1.0 2.0 3.0]");
+    TEST_ASSERT_EQ("(distinct [1.5 1.5 1.5])", "[1.5]");
+    TEST_ASSERT_EQ("(distinct [0.0 -0.0 1.0])", "[0.0 1.0]");
 
     PASS();
 }

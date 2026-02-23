@@ -606,6 +606,45 @@ obj_p index_distinct_i64(i64_t values[], i64_t len) {
     return vec;
 }
 
+obj_p index_distinct_f64(f64_t values[], i64_t len) {
+    i64_t i, j = 0;
+    i64_t p, *out;
+    obj_p vec, set;
+    f64_t *fout;
+
+    set = ht_oa_create(len, -1);
+
+    for (i = 0; i < len; i++) {
+        if (ISNANF64(values[i]))
+            continue;
+        // Normalize -0.0 to +0.0 so bit patterns match
+        f64_t v = values[i] == 0.0 ? 0.0 : values[i];
+        i64_t key;
+        memcpy(&key, &v, sizeof(f64_t));
+        p = ht_oa_tab_next(&set, key);
+        out = AS_I64(AS_LIST(set)[0]);
+        if (out[p] == NULL_I64) {
+            out[p] = key;
+            j++;
+        }
+    }
+
+    vec = F64(j);
+    fout = AS_F64(vec);
+
+    out = AS_I64(AS_LIST(set)[0]);
+    len = AS_LIST(set)[0]->len;
+
+    for (i = 0, j = 0; i < len; i++) {
+        if (out[i] != NULL_I64)
+            memcpy(&fout[j++], &out[i], sizeof(f64_t));
+    }
+
+    drop_obj(set);
+    vec->attrs |= ATTR_DISTINCT;
+    return vec;
+}
+
 obj_p index_distinct_guid(guid_t values[], i64_t len) {
     i64_t i, j;
     i64_t p, *out;

@@ -2483,8 +2483,9 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(-TYPE_DATE, -TYPE_TIME):
             return adate(obj->i32);
         case MTYPE2(-TYPE_DATE, -TYPE_I64):
-        case MTYPE2(-TYPE_DATE, -TYPE_TIMESTAMP):
             return adate((i32_t)obj->i64);
+        case MTYPE2(-TYPE_DATE, -TYPE_TIMESTAMP):
+            return adate((i32_t)(obj->i64 / NANOS_FROM_DAY));
         case MTYPE2(-TYPE_DATE, -TYPE_F64):
             return adate((i32_t)obj->f64);
 
@@ -2499,8 +2500,9 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(-TYPE_TIME, -TYPE_DATE):
             return atime(obj->i32);
         case MTYPE2(-TYPE_TIME, -TYPE_I64):
-        case MTYPE2(-TYPE_TIME, -TYPE_TIMESTAMP):
             return atime((i32_t)obj->i64);
+        case MTYPE2(-TYPE_TIME, -TYPE_TIMESTAMP):
+            return atime((i32_t)((obj->i64 % NANOS_FROM_DAY) / NANOS_FROM_MILLIS));
         case MTYPE2(-TYPE_TIME, -TYPE_F64):
             return atime((i32_t)obj->f64);
 
@@ -2512,9 +2514,11 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(-TYPE_TIMESTAMP, -TYPE_I16):
             return timestamp((i64_t)obj->i16);
         case MTYPE2(-TYPE_TIMESTAMP, -TYPE_I32):
-        case MTYPE2(-TYPE_TIMESTAMP, -TYPE_DATE):
-        case MTYPE2(-TYPE_TIMESTAMP, -TYPE_TIME):
             return timestamp((i64_t)obj->i32);
+        case MTYPE2(-TYPE_TIMESTAMP, -TYPE_DATE):
+            return timestamp((i64_t)obj->i32 * NANOS_FROM_DAY);
+        case MTYPE2(-TYPE_TIMESTAMP, -TYPE_TIME):
+            return timestamp((i64_t)obj->i32 * NANOS_FROM_MILLIS);
         case MTYPE2(-TYPE_TIMESTAMP, -TYPE_I64):
             return timestamp(obj->i64);
         case MTYPE2(-TYPE_TIMESTAMP, -TYPE_F64):
@@ -2683,13 +2687,23 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(TYPE_I32, TYPE_I64):
         case MTYPE2(TYPE_I32, TYPE_TIMESTAMP):
         case MTYPE2(TYPE_DATE, TYPE_I64):
-        case MTYPE2(TYPE_DATE, TYPE_TIMESTAMP):
         case MTYPE2(TYPE_TIME, TYPE_I64):
-        case MTYPE2(TYPE_TIME, TYPE_TIMESTAMP):
             l = obj->len;
             res = vector(type, l);
             for (i = 0; i < l; i++)
                 AS_I32(res)[i] = (i32_t)AS_I64(obj)[i];
+            return res;
+        case MTYPE2(TYPE_DATE, TYPE_TIMESTAMP):
+            l = obj->len;
+            res = vector(TYPE_DATE, l);
+            for (i = 0; i < l; i++)
+                AS_I32(res)[i] = (i32_t)(AS_I64(obj)[i] / NANOS_FROM_DAY);
+            return res;
+        case MTYPE2(TYPE_TIME, TYPE_TIMESTAMP):
+            l = obj->len;
+            res = vector(TYPE_TIME, l);
+            for (i = 0; i < l; i++)
+                AS_I32(res)[i] = (i32_t)((AS_I64(obj)[i] % NANOS_FROM_DAY) / NANOS_FROM_MILLIS);
             return res;
         case MTYPE2(TYPE_I32, TYPE_DATE):
         case MTYPE2(TYPE_I32, TYPE_TIME):
@@ -2732,12 +2746,22 @@ obj_p cast_obj(i8_t type, obj_p obj) {
         case MTYPE2(TYPE_I64, TYPE_DATE):
         case MTYPE2(TYPE_I64, TYPE_TIME):
         case MTYPE2(TYPE_TIMESTAMP, TYPE_I32):
-        case MTYPE2(TYPE_TIMESTAMP, TYPE_DATE):
-        case MTYPE2(TYPE_TIMESTAMP, TYPE_TIME):
             l = obj->len;
             res = vector(type, l);
             for (i = 0; i < l; i++)
                 AS_I64(res)[i] = (i64_t)AS_I32(obj)[i];
+            return res;
+        case MTYPE2(TYPE_TIMESTAMP, TYPE_DATE):
+            l = obj->len;
+            res = vector(TYPE_TIMESTAMP, l);
+            for (i = 0; i < l; i++)
+                AS_I64(res)[i] = (i64_t)AS_I32(obj)[i] * NANOS_FROM_DAY;
+            return res;
+        case MTYPE2(TYPE_TIMESTAMP, TYPE_TIME):
+            l = obj->len;
+            res = vector(TYPE_TIMESTAMP, l);
+            for (i = 0; i < l; i++)
+                AS_I64(res)[i] = (i64_t)AS_I32(obj)[i] * NANOS_FROM_MILLIS;
             return res;
         case MTYPE2(TYPE_I64, TYPE_F64):
         case MTYPE2(TYPE_TIMESTAMP, TYPE_F64):

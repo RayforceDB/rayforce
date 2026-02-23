@@ -68,6 +68,7 @@ obj_p index_distinct_i8(i8_t values[], i64_t len);
 obj_p index_distinct_i16(i16_t values[], i64_t len);
 obj_p index_distinct_i32(i32_t values[], i64_t len);
 obj_p index_distinct_i64(i64_t values[], i64_t len);
+obj_p index_distinct_f64(f64_t values[], i64_t len);
 obj_p index_distinct_guid(guid_t values[], i64_t len);
 obj_p index_distinct_obj(obj_p values[], i64_t len);
 obj_p index_in_i8_i8(i8_t x[], i64_t xl, i8_t y[], i64_t yl);

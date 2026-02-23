@@ -494,6 +494,33 @@ test_result_t test_cast_identity_roundtrip() {
     // Roundtrip: timestamp -> i64 -> timestamp
     TEST_ASSERT_EQ("(as 'timestamp (as 'i64 2024.01.01D12:30:45.123456789))", "2024.01.01D12:30:45.123456789");
 
+    // Timestamp -> date: extract date part
+    TEST_ASSERT_EQ("(as 'date 2024.06.15D10:30:00.000000000)", "2024.06.15");
+    TEST_ASSERT_EQ("(as 'date 2000.01.01D00:00:00.000000000)", "2000.01.01");
+
+    // Timestamp -> time: extract time part
+    TEST_ASSERT_EQ("(as 'time 2024.06.15D10:30:00.000000000)", "10:30:00.000");
+    TEST_ASSERT_EQ("(as 'time 2024.06.15D23:59:59.999000000)", "23:59:59.999");
+
+    // Date -> timestamp: date at midnight
+    TEST_ASSERT_EQ("(as 'timestamp 2024.06.15)", "2024.06.15D00:00:00.000000000");
+    TEST_ASSERT_EQ("(as 'timestamp 2000.01.01)", "2000.01.01D00:00:00.000000000");
+
+    // Time -> timestamp: epoch date + time
+    TEST_ASSERT_EQ("(as 'timestamp 10:30:00.000)", "2000.01.01D10:30:00.000000000");
+
+    // Roundtrip: timestamp -> date -> timestamp (loses time part)
+    TEST_ASSERT_EQ("(as 'timestamp (as 'date 2024.06.15D10:30:00.000000000))", "2024.06.15D00:00:00.000000000");
+
+    // Vector: timestamp -> date
+    TEST_ASSERT_EQ("(as 'date [2024.06.15D10:30:00.000000000 2024.12.25D23:59:59.000000000])", "[2024.06.15 2024.12.25]");
+
+    // Vector: date -> timestamp
+    TEST_ASSERT_EQ("(as 'timestamp [2024.06.15 2024.12.25])", "[2024.06.15D00:00:00.000000000 2024.12.25D00:00:00.000000000]");
+
+    // Vector: timestamp -> time
+    TEST_ASSERT_EQ("(as 'time [2024.06.15D10:30:00.000000000 2024.12.25D23:59:59.999000000])", "[10:30:00.000 23:59:59.999]");
+
     PASS();
 }
 

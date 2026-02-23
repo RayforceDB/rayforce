@@ -67,6 +67,41 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, i64_t, i64_t, obj_p);
         NULL_OBJ;                                                          \
     })
 
+// Indirection wrappers: force macro expansion before token-pasting in __CMP_*
+#define __CMP_A_V_X(x, y, lt, rt, mt, op, ln, of, ov) __CMP_A_V(x, y, lt, rt, mt, op, ln, of, ov)
+#define __CMP_V_A_X(x, y, lt, rt, mt, op, ln, of, ov) __CMP_V_A(x, y, lt, rt, mt, op, ln, of, ov)
+#define __CMP_V_V_X(x, y, lt, rt, mt, op, ln, of, ov) __CMP_V_V(x, y, lt, rt, mt, op, ln, of, ov)
+
+// Date↔Timestamp: EQ/NE truncate timestamp to date; LT/GT/LE/GE promote date to timestamp
+#define __DT_CMP_EQ(dt, ts) EQI32(dt, timestamp_to_date(ts))
+#define __DT_CMP_NE(dt, ts) NEI32(dt, timestamp_to_date(ts))
+#define __DT_CMP_LT(dt, ts) LTI64(date_to_timestamp(dt), ts)
+#define __DT_CMP_GT(dt, ts) GTI64(date_to_timestamp(dt), ts)
+#define __DT_CMP_LE(dt, ts) LEI64(date_to_timestamp(dt), ts)
+#define __DT_CMP_GE(dt, ts) GEI64(date_to_timestamp(dt), ts)
+
+#define __TD_CMP_EQ(ts, dt) EQI32(timestamp_to_date(ts), dt)
+#define __TD_CMP_NE(ts, dt) NEI32(timestamp_to_date(ts), dt)
+#define __TD_CMP_LT(ts, dt) LTI64(ts, date_to_timestamp(dt))
+#define __TD_CMP_GT(ts, dt) GTI64(ts, date_to_timestamp(dt))
+#define __TD_CMP_LE(ts, dt) LEI64(ts, date_to_timestamp(dt))
+#define __TD_CMP_GE(ts, dt) GEI64(ts, date_to_timestamp(dt))
+
+// Vector comparison target type and op, per operator
+#define __DT_MT_EQ date
+#define __DT_MT_NE date
+#define __DT_MT_LT timestamp
+#define __DT_MT_GT timestamp
+#define __DT_MT_LE timestamp
+#define __DT_MT_GE timestamp
+
+#define __DT_OP_EQ EQI32
+#define __DT_OP_NE NEI32
+#define __DT_OP_LT LTI64
+#define __DT_OP_GT GTI64
+#define __DT_OP_LE LEI64
+#define __DT_OP_GE GEI64
+
 #define __DECLARE_CMP_FN(op)                                                                   \
     obj_p ray_##op##_partial(obj_p x, obj_p y, i64_t len, i64_t offset, obj_p res) {           \
         i64_t i;                                                                               \
@@ -394,22 +429,22 @@ typedef obj_p (*ray_cmp_f)(obj_p, obj_p, i64_t, i64_t, obj_p);
             case MTYPE2(TYPE_F64, TYPE_F64):                                                   \
                 return __CMP_V_V(x, y, f64, f64, f64, op##F64, len, offset, res);              \
                                                                                                \
-            case MTYPE2(-TYPE_DATE, -TYPE_TIMESTAMP):                                          \
-                return b8(op##F64(date_to_timestamp(x->i32), y->i64));                         \
-            case MTYPE2(-TYPE_DATE, TYPE_TIMESTAMP):                                           \
-                return __CMP_A_V(x, y, date, timestamp, timestamp, op##I64, len, offset, res); \
-            case MTYPE2(TYPE_DATE, -TYPE_TIMESTAMP):                                           \
-                return __CMP_V_A(x, y, date, timestamp, timestamp, op##I64, len, offset, res); \
-            case MTYPE2(TYPE_DATE, TYPE_TIMESTAMP):                                            \
-                return __CMP_V_V(x, y, date, timestamp, timestamp, op##I64, len, offset, res); \
-            case MTYPE2(-TYPE_TIMESTAMP, -TYPE_DATE):                                          \
-                return b8(op##F64(x->i64, date_to_timestamp(y->i32)));                         \
-            case MTYPE2(-TYPE_TIMESTAMP, TYPE_DATE):                                           \
-                return __CMP_A_V(x, y, timestamp, date, timestamp, op##I64, len, offset, res); \
-            case MTYPE2(TYPE_TIMESTAMP, -TYPE_DATE):                                           \
-                return __CMP_V_A(x, y, timestamp, date, timestamp, op##I64, len, offset, res); \
-            case MTYPE2(TYPE_TIMESTAMP, TYPE_DATE):                                            \
-                return __CMP_V_V(x, y, timestamp, date, timestamp, op##I64, len, offset, res); \
+            case MTYPE2(-TYPE_DATE, -TYPE_TIMESTAMP):                                                            \
+                return b8(__DT_CMP_##op(x->i32, y->i64));                                                    \
+            case MTYPE2(-TYPE_DATE, TYPE_TIMESTAMP):                                                         \
+                return __CMP_A_V_X(x, y, date, timestamp, __DT_MT_##op, __DT_OP_##op, len, offset, res);    \
+            case MTYPE2(TYPE_DATE, -TYPE_TIMESTAMP):                                                         \
+                return __CMP_V_A_X(x, y, date, timestamp, __DT_MT_##op, __DT_OP_##op, len, offset, res);    \
+            case MTYPE2(TYPE_DATE, TYPE_TIMESTAMP):                                                          \
+                return __CMP_V_V_X(x, y, date, timestamp, __DT_MT_##op, __DT_OP_##op, len, offset, res);    \
+            case MTYPE2(-TYPE_TIMESTAMP, -TYPE_DATE):                                                        \
+                return b8(__TD_CMP_##op(x->i64, y->i32));                                                    \
+            case MTYPE2(-TYPE_TIMESTAMP, TYPE_DATE):                                                         \
+                return __CMP_A_V_X(x, y, timestamp, date, __DT_MT_##op, __DT_OP_##op, len, offset, res);    \
+            case MTYPE2(TYPE_TIMESTAMP, -TYPE_DATE):                                                         \
+                return __CMP_V_A_X(x, y, timestamp, date, __DT_MT_##op, __DT_OP_##op, len, offset, res);    \
+            case MTYPE2(TYPE_TIMESTAMP, TYPE_DATE):                                                          \
+                return __CMP_V_V_X(x, y, timestamp, date, __DT_MT_##op, __DT_OP_##op, len, offset, res);    \
                                                                                                \
             case MTYPE2(TYPE_ENUM, -TYPE_SYMBOL):                                              \
                 k = ray_key(x);                                                                \

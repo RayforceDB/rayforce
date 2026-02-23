@@ -621,9 +621,20 @@ test_result_t test_cmp_temporal() {
     TEST_ASSERT_EQ("(< [2024.01.01D10:00:00.000000000] [2024.01.01D10:00:01.000000000])", "[true]");
 
     // Cross-temporal comparisons (date vs timestamp)
+    // LT/GT: date promoted to midnight timestamp (precise ordering)
     TEST_ASSERT_EQ("(< 2024.01.01 2024.01.01D10:00:00.000000000)", "true");
     TEST_ASSERT_EQ("(> 2024.01.01D10:00:00.000000000 2024.01.01)", "true");
     TEST_ASSERT_EQ("(< [2024.01.01] [2024.01.01D10:00:00.000000000])", "[true]");
+    // EQ/NE: timestamp truncated to date (same-day semantics)
+    TEST_ASSERT_EQ("(== 2024.01.01D10:30:00.000000000 2024.01.01)", "true");
+    TEST_ASSERT_EQ("(== 2024.01.01D23:59:59.999999999 2024.01.01)", "true");
+    TEST_ASSERT_EQ("(== 2024.01.01D00:00:00.000000000 2024.01.01)", "true");
+    TEST_ASSERT_EQ("(== 2024.01.02D00:00:00.000000000 2024.01.01)", "false");
+    TEST_ASSERT_EQ("(!= 2024.01.01D10:30:00.000000000 2024.01.02)", "true");
+    TEST_ASSERT_EQ("(== 2024.01.01 2024.01.01D10:30:00.000000000)", "true");
+    // Vector: timestamp column filtered by date
+    TEST_ASSERT_EQ("(== [2024.01.01D10:00:00.000000000 2024.01.02D05:00:00.000000000] 2024.01.01)", "[true false]");
+    TEST_ASSERT_EQ("(== 2024.01.01 [2024.01.01D10:00:00.000000000 2024.01.02D05:00:00.000000000])", "[true false]");
 
     PASS();
 }
