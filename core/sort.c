@@ -31,7 +31,7 @@
 #include "chrono.h"
 
 // Sort thresholds
-#define SMALL_VEC_THRESHOLD (128 * 1024)
+#define SMALL_VEC_THRESHOLD (64 * 1024)
 #define PARALLEL_COUNTING_SORT_THRESHOLD (512 * 1024)
 #define PARALLEL_RADIX_SORT_THRESHOLD (768 * 1024)
 #define COUNTING_SORT_MAX_RANGE (512 * 1024)
@@ -1063,6 +1063,164 @@ static obj_p parallel_radix16_sort_i32(obj_p vec, i64_t asc) {
     return indices;
 }
 
+// ============================================================================
+// Parallel Radix Sort 8-bit for I32 (4 passes, cache-friendly)
+// Keys (u32) travel with indices — all scatter reads are sequential.
+// NULL_I32 (0x80000000) maps to 0 after XOR encoding → sorts first in ASC.
+// ============================================================================
+
+typedef struct {
+    i32_t* data;
+    u32_t* keys;
+    i64_t* idx;
+    u32_t* keys_b;
+    i64_t* idx_b;
+} radix8_init_i32_ctx_t;
+
+typedef struct {
+    u32_t* keys;
+    i64_t  chunk_size;
+    i64_t* histograms;
+    i64_t  shift;
+} radix8_hist_i32_ctx_t;
+
+typedef struct {
+    u32_t* keys_in;
+    i64_t* idx_in;
+    i64_t  chunk_size;
+    i64_t* positions;
+    u32_t* keys_out;
+    i64_t* idx_out;
+    i64_t  shift;
+    i64_t  asc;
+} radix8_scatter_i32_ctx_t;
+
+static obj_p radix8_init_i32_worker(i64_t len, i64_t offset, void* ctx) {
+    radix8_init_i32_ctx_t* c = ctx;
+    i32_t* data = c->data + offset;
+    u32_t* keys = c->keys + offset;
+    i64_t* idx  = c->idx  + offset;
+    for (i64_t i = 0; i < len; i++) {
+        keys[i] = (u32_t)data[i] ^ 0x80000000u;
+        idx[i]  = offset + i;
+    }
+    // Touch destination pages to pre-fault (1 write per 4KB page)
+    u32_t* kb = c->keys_b + offset;
+    i64_t* ib = c->idx_b  + offset;
+    for (i64_t i = 0; i < len; i += 1024) kb[i] = 0;
+    for (i64_t i = 0; i < len; i += 512)  ib[i] = 0;
+    return NULL_OBJ;
+}
+
+static obj_p radix8_hist_i32_worker(i64_t len, i64_t offset, void* ctx) {
+    radix8_hist_i32_ctx_t* c = ctx;
+    i64_t worker_id = offset / c->chunk_size;
+    i64_t* hist = c->histograms + worker_id * 256;
+    u32_t* keys = c->keys + offset;
+    memset(hist, 0, 256 * sizeof(i64_t));
+    for (i64_t i = 0; i < len; i++)
+        hist[(keys[i] >> c->shift) & 0xff]++;
+    return NULL_OBJ;
+}
+
+static obj_p radix8_scatter_i32_worker(i64_t len, i64_t offset, void* ctx) {
+    radix8_scatter_i32_ctx_t* c = ctx;
+    i64_t worker_id = offset / c->chunk_size;
+    i64_t* pos  = c->positions + worker_id * 256;
+    u32_t* kin  = c->keys_in + offset;
+    i64_t* iin  = c->idx_in  + offset;
+    if (c->asc > 0) {
+        for (i64_t i = 0; i < len; i++) {
+            i64_t p = pos[(kin[i] >> c->shift) & 0xff]++;
+            c->keys_out[p] = kin[i];
+            c->idx_out[p]  = iin[i];
+        }
+    } else {
+        for (i64_t i = 0; i < len; i++) {
+            i64_t p = pos[255 - ((kin[i] >> c->shift) & 0xff)]++;
+            c->keys_out[p] = kin[i];
+            c->idx_out[p]  = iin[i];
+        }
+    }
+    return NULL_OBJ;
+}
+
+static obj_p parallel_radix8_sort_i32(obj_p vec, i64_t asc) {
+    i64_t len = vec->len;
+    i32_t* data = AS_I32(vec);
+
+    pool_p pool = pool_get();
+    i64_t n = pool_split_by(pool, len, 0);
+    i64_t chunk_size = len / n;
+
+    // 2 × u32 key bufs (I32) + 2 × i64 idx bufs + histograms
+    obj_p ka = I32(len);
+    if (IS_ERR(ka)) return ka;
+    obj_p kb = I32(len);
+    if (IS_ERR(kb)) { drop_obj(ka); return kb; }
+    obj_p ia = I64(len);
+    if (IS_ERR(ia)) { drop_obj(ka); drop_obj(kb); return ia; }
+    obj_p ib = I64(len);
+    if (IS_ERR(ib)) { drop_obj(ka); drop_obj(kb); drop_obj(ia); return ib; }
+    obj_p hist_obj = I64(n * 256);
+    if (IS_ERR(hist_obj)) { drop_obj(ka); drop_obj(kb); drop_obj(ia); drop_obj(ib); return hist_obj; }
+    i64_t* histograms = AS_I64(hist_obj);
+
+    // Encode data → keys_a, iota → idx_a in one parallel pass
+    radix8_init_i32_ctx_t init_ctx = {data, (u32_t*)AS_I32(ka), AS_I64(ia), (u32_t*)AS_I32(kb), AS_I64(ib)};
+    pool_map(len, radix8_init_i32_worker, &init_ctx);
+
+    i64_t prefix[257];
+    u32_t* kbufs[2] = {(u32_t*)AS_I32(ka), (u32_t*)AS_I32(kb)};
+    i64_t* ibufs[2] = {AS_I64(ia), AS_I64(ib)};
+    i64_t cur = 0;
+
+    for (i64_t pass = 0; pass < 4; pass++) {
+        i64_t shift = pass * 8;
+        i64_t dst = 1 - cur;
+
+        radix8_hist_i32_ctx_t hctx = {kbufs[cur], chunk_size, histograms, shift};
+        pool_map(len, radix8_hist_i32_worker, &hctx);
+
+        memset(prefix, 0, 257 * sizeof(i64_t));
+        for (i64_t w = 0; w < n; w++) {
+            i64_t* wh = histograms + w * 256;
+            for (i64_t b = 0; b < 256; b++)
+                prefix[b + 1] += wh[b];
+        }
+
+        // Byte-skip: all values share this byte → no reorder needed
+        i64_t non_empty = 0;
+        for (i64_t b = 0; b < 256; b++)
+            non_empty += (prefix[b + 1] != 0);
+        if (non_empty <= 1) continue;
+
+        for (i64_t b = 1; b <= 256; b++)
+            prefix[b] += prefix[b - 1];
+
+        for (i64_t b = 0; b < 256; b++) {
+            i64_t pos = prefix[b];
+            for (i64_t w = 0; w < n; w++) {
+                i64_t* wh = histograms + w * 256;
+                i64_t cnt = wh[b];
+                wh[b] = pos;
+                pos += cnt;
+            }
+        }
+
+        radix8_scatter_i32_ctx_t sctx = {kbufs[cur], ibufs[cur], chunk_size, histograms, kbufs[dst], ibufs[dst], shift, asc};
+        pool_map(len, radix8_scatter_i32_worker, &sctx);
+        cur = dst;
+    }
+
+    drop_obj(hist_obj);
+    obj_p result = (cur == 0) ? ia : ib;
+    drop_obj(ka);
+    drop_obj(kb);
+    drop_obj(cur == 0 ? ib : ia);
+    return result;
+}
+
 obj_p ray_sort_asc_i32(obj_p vec) {
     i64_t len = vec->len;
     index_scope_t scope = index_scope_i32(AS_I32(vec), NULL, len);
@@ -1078,10 +1236,7 @@ obj_p ray_sort_asc_i32(obj_p vec) {
     if (scope.range <= COUNTING_SORT_MAX_RANGE || scope.range <= len / n_workers) {
         return parallel_counting_sort_i32(vec, scope.min, scope.range, 1);
     } else {
-        if (len < PARALLEL_RADIX_SORT_THRESHOLD)
-            return radix16_sort_i32(vec, 1);
-        else
-            return parallel_radix16_sort_i32(vec, 1);
+        return parallel_radix8_sort_i32(vec, 1);
     }
 }
 
@@ -1664,6 +1819,165 @@ static obj_p parallel_radix16_sort_i64(obj_p vec, i64_t asc) {
     return indices;
 }
 
+// ============================================================================
+// Parallel Radix Sort 8-bit for I64 (8 passes, cache-friendly)
+// Uses 256-bucket histograms per worker (fits in L1 cache).
+// Byte-skip optimization: skip passes where all elements share the same byte.
+// NULL_I64 (0x8000000000000000) maps to 0 after XOR encoding → sorts first in ASC.
+// ============================================================================
+
+typedef struct {
+    i64_t* data;
+    u64_t* keys;
+    i64_t* idx;
+    u64_t* keys_b;
+    i64_t* idx_b;
+} radix8_init_i64_ctx_t;
+
+typedef struct {
+    u64_t* keys;
+    i64_t  chunk_size;
+    i64_t* histograms;
+    i64_t  shift;
+} radix8_hist_i64_ctx_t;
+
+typedef struct {
+    u64_t* keys_in;
+    i64_t* idx_in;
+    i64_t  chunk_size;
+    i64_t* positions;
+    u64_t* keys_out;
+    i64_t* idx_out;
+    i64_t  shift;
+    i64_t  asc;
+} radix8_scatter_i64_ctx_t;
+
+static obj_p radix8_init_i64_worker(i64_t len, i64_t offset, void* ctx) {
+    radix8_init_i64_ctx_t* c = ctx;
+    i64_t* data = c->data + offset;
+    u64_t* keys = c->keys + offset;
+    i64_t* idx  = c->idx  + offset;
+    for (i64_t i = 0; i < len; i++) {
+        keys[i] = (u64_t)data[i] ^ 0x8000000000000000ULL;
+        idx[i]  = offset + i;
+    }
+    // Touch destination pages to pre-fault (1 write per 4KB page)
+    u64_t* kb = c->keys_b + offset;
+    i64_t* ib = c->idx_b  + offset;
+    for (i64_t i = 0; i < len; i += 512) kb[i] = 0;
+    for (i64_t i = 0; i < len; i += 512) ib[i] = 0;
+    return NULL_OBJ;
+}
+
+static obj_p radix8_hist_i64_worker(i64_t len, i64_t offset, void* ctx) {
+    radix8_hist_i64_ctx_t* c = ctx;
+    i64_t worker_id = offset / c->chunk_size;
+    i64_t* hist = c->histograms + worker_id * 256;
+    u64_t* keys = c->keys + offset;
+    memset(hist, 0, 256 * sizeof(i64_t));
+    for (i64_t i = 0; i < len; i++)
+        hist[(keys[i] >> c->shift) & 0xff]++;
+    return NULL_OBJ;
+}
+
+static obj_p radix8_scatter_i64_worker(i64_t len, i64_t offset, void* ctx) {
+    radix8_scatter_i64_ctx_t* c = ctx;
+    i64_t worker_id = offset / c->chunk_size;
+    i64_t* pos  = c->positions + worker_id * 256;
+    u64_t* kin  = c->keys_in + offset;
+    i64_t* iin  = c->idx_in  + offset;
+    if (c->asc > 0) {
+        for (i64_t i = 0; i < len; i++) {
+            i64_t p = pos[(kin[i] >> c->shift) & 0xff]++;
+            c->keys_out[p] = kin[i];
+            c->idx_out[p]  = iin[i];
+        }
+    } else {
+        for (i64_t i = 0; i < len; i++) {
+            i64_t p = pos[255 - ((kin[i] >> c->shift) & 0xff)]++;
+            c->keys_out[p] = kin[i];
+            c->idx_out[p]  = iin[i];
+        }
+    }
+    return NULL_OBJ;
+}
+
+static obj_p parallel_radix8_sort_i64(obj_p vec, i64_t asc) {
+    i64_t len = vec->len;
+    i64_t* data = AS_I64(vec);
+
+    pool_p pool = pool_get();
+    i64_t n = pool_split_by(pool, len, 0);
+    i64_t chunk_size = len / n;
+
+    // 2 × u64 key bufs + 2 × i64 idx bufs + histograms
+    obj_p ka = I64(len);
+    if (IS_ERR(ka)) return ka;
+    obj_p kb = I64(len);
+    if (IS_ERR(kb)) { drop_obj(ka); return kb; }
+    obj_p ia = I64(len);
+    if (IS_ERR(ia)) { drop_obj(ka); drop_obj(kb); return ia; }
+    obj_p ib = I64(len);
+    if (IS_ERR(ib)) { drop_obj(ka); drop_obj(kb); drop_obj(ia); return ib; }
+    obj_p hist_obj = I64(n * 256);
+    if (IS_ERR(hist_obj)) { drop_obj(ka); drop_obj(kb); drop_obj(ia); drop_obj(ib); return hist_obj; }
+    i64_t* histograms = AS_I64(hist_obj);
+
+    // Encode data → keys_a, iota → idx_a in one parallel pass
+    radix8_init_i64_ctx_t init_ctx = {data, (u64_t*)AS_I64(ka), AS_I64(ia), (u64_t*)AS_I64(kb), AS_I64(ib)};
+    pool_map(len, radix8_init_i64_worker, &init_ctx);
+
+    i64_t prefix[257];
+    u64_t* kbufs[2] = {(u64_t*)AS_I64(ka), (u64_t*)AS_I64(kb)};
+    i64_t* ibufs[2] = {AS_I64(ia), AS_I64(ib)};
+    i64_t cur = 0;
+
+    for (i64_t pass = 0; pass < 8; pass++) {
+        i64_t shift = pass * 8;
+        i64_t dst = 1 - cur;
+
+        radix8_hist_i64_ctx_t hctx = {kbufs[cur], chunk_size, histograms, shift};
+        pool_map(len, radix8_hist_i64_worker, &hctx);
+
+        memset(prefix, 0, 257 * sizeof(i64_t));
+        for (i64_t w = 0; w < n; w++) {
+            i64_t* wh = histograms + w * 256;
+            for (i64_t b = 0; b < 256; b++)
+                prefix[b + 1] += wh[b];
+        }
+
+        // Byte-skip: all values share this byte → no reorder needed
+        i64_t non_empty = 0;
+        for (i64_t b = 0; b < 256; b++)
+            non_empty += (prefix[b + 1] != 0);
+        if (non_empty <= 1) continue;
+
+        for (i64_t b = 1; b <= 256; b++)
+            prefix[b] += prefix[b - 1];
+
+        for (i64_t b = 0; b < 256; b++) {
+            i64_t pos = prefix[b];
+            for (i64_t w = 0; w < n; w++) {
+                i64_t* wh = histograms + w * 256;
+                i64_t cnt = wh[b];
+                wh[b] = pos;
+                pos += cnt;
+            }
+        }
+
+        radix8_scatter_i64_ctx_t sctx = {kbufs[cur], ibufs[cur], chunk_size, histograms, kbufs[dst], ibufs[dst], shift, asc};
+        pool_map(len, radix8_scatter_i64_worker, &sctx);
+        cur = dst;
+    }
+
+    drop_obj(hist_obj);
+    obj_p result = (cur == 0) ? ia : ib;
+    drop_obj(ka);
+    drop_obj(kb);
+    drop_obj(cur == 0 ? ib : ia);
+    return result;
+}
+
 // Helper inline function to convert f64 to sortable u64
 static inline u64_t f64_to_sortable_u64(f64_t value) {
     union {
@@ -1701,10 +2015,7 @@ obj_p ray_sort_asc_i64(obj_p vec) {
     if (scope.range <= COUNTING_SORT_MAX_RANGE || scope.range <= len / n_workers) {
         return parallel_counting_sort_i64(vec, scope.min, scope.range, 1);
     } else {
-        if (len < PARALLEL_RADIX_SORT_THRESHOLD * 2)
-            return radix16_sort_i64(vec, 1);
-        else
-            return parallel_radix16_sort_i64(vec, 1);
+        return parallel_radix8_sort_i64(vec, 1);
     }
 }
 
@@ -1936,10 +2247,7 @@ obj_p ray_sort_desc_i32(obj_p vec) {
     if (scope.range <= COUNTING_SORT_MAX_RANGE || scope.range <= len / n_workers) {
         return parallel_counting_sort_i32(vec, scope.min, scope.range, 0);
     } else {
-        if (len < PARALLEL_RADIX_SORT_THRESHOLD)
-            return radix16_sort_i32(vec, 0);
-        else
-            return parallel_radix16_sort_i32(vec, 0);
+        return parallel_radix8_sort_i32(vec, 0);
     }
 }
 
@@ -1958,10 +2266,7 @@ obj_p ray_sort_desc_i64(obj_p vec) {
     if (scope.range <= COUNTING_SORT_MAX_RANGE || scope.range <= len / n_workers) {
         return parallel_counting_sort_i64(vec, scope.min, scope.range, 0);
     } else {
-        if (len < PARALLEL_RADIX_SORT_THRESHOLD * 2)
-            return radix16_sort_i64(vec, 0);
-        else
-            return parallel_radix16_sort_i64(vec, 0);
+        return parallel_radix8_sort_i64(vec, 0);
     }
 }
 
