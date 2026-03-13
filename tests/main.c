@@ -261,6 +261,7 @@ test_entry_t tests[] = {
     {"test_lang_do_let", test_lang_do_let},
     {"test_lang_error", test_lang_error},
     {"test_lang_safety", test_lang_safety},
+    {"test_lang_read_csv", test_lang_read_csv},
     // Parted table tests
     {"test_parted_load", test_parted_load},
     {"test_parted_select_where_date", test_parted_select_where_date},
@@ -455,6 +456,7 @@ test_entry_t tests[] = {
     {"test_string_list_ops", test_string_list_ops},
     {"test_string_where_in", test_string_where_in},
     {"test_string_combined", test_string_combined},
+    {"test_symbols_intern_large", test_symbols_intern_large},
     // Vector operation tests
     {"test_vec_til", test_vec_til},
     {"test_vec_take", test_vec_take},

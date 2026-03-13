@@ -147,7 +147,7 @@ load:
         raw_p node = __atomic_load_n(&symbols->strings_node, __ATOMIC_ACQUIRE);
         i64_t rounds2 = 0;
 
-        while (slot_end > node) {
+        while ((i64_t)node == NULL_I64 || slot_end > node) {
             if ((i64_t)node == NULL_I64) {
                 backoff_spin(&rounds2);
                 node = __atomic_load_n(&symbols->strings_node, __ATOMIC_ACQUIRE);

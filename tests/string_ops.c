@@ -432,3 +432,28 @@ test_result_t test_string_combined() {
 
     PASS();
 }
+
+// ==================== SYMBOL INTERN LARGE ====================
+test_result_t test_symbols_intern_large() {
+    symbols_p symbols = runtime_get()->symbols;
+    i64_t i, id;
+    char buf[32];
+
+    for (i = 0; i < 20000; i++) {
+        i64_t len = snprintf(buf, sizeof(buf), "sym_%lld", (long long)i);
+        id = symbols_intern(buf, len);
+        TEST_ASSERT(id != NULL_I64, "symbols_intern returned NULL_I64");
+    }
+
+    TEST_ASSERT(symbols_count(symbols) >= 20000, "expected >= 20000 symbols");
+
+    for (i = 0; i < 20000; i++) {
+        i64_t len = snprintf(buf, sizeof(buf), "sym_%lld", (long long)i);
+        id = symbols_intern(buf, len);
+        str_p s = str_from_symbol(id);
+        TEST_ASSERT(s != NULL, "str_from_symbol returned NULL");
+        TEST_ASSERT(str_cmp(s, len, buf, len) == 0, "symbol string mismatch");
+    }
+
+    PASS();
+}
