@@ -5286,7 +5286,7 @@ test_result_t test_lang_read_csv() {
     i64_t i;
     FILE *f;
 
-    f = fopen("/tmp/rf_test_syms.csv", "w");
+    f = fopen("rf_test_syms.csv", "w");
     TEST_ASSERT(f != NULL, "failed to create temp CSV");
     fprintf(f, "id,sym\n");
     for (i = 0; i < 20000; i++)
@@ -5294,9 +5294,9 @@ test_result_t test_lang_read_csv() {
     fclose(f);
 
     TEST_ASSERT_EQ(
-        "(count (read-csv [I64 SYMBOL] \"/tmp/rf_test_syms.csv\"))",
+        "(count (read-csv [I64 SYMBOL] \"rf_test_syms.csv\"))",
         "20000");
 
-    remove("/tmp/rf_test_syms.csv");
+    remove("rf_test_syms.csv");
     PASS();
 }
