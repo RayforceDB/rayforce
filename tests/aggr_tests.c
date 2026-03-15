@@ -283,6 +283,31 @@ test_result_t test_aggr_median() {
     // All same values
     TEST_ASSERT_EQ("(med [5 5 5 5 5])", "5.0");
 
+    // F64 odd length
+    TEST_ASSERT_EQ("(med [1.0 2.0 3.0 4.0 5.0])", "3.0");
+    TEST_ASSERT_EQ("(med [5.0 1.0 3.0 2.0 4.0])", "3.0");
+    TEST_ASSERT_EQ("(med [100.5 200.5 300.5])", "200.5");
+
+    // F64 even length
+    TEST_ASSERT_EQ("(med [1.0 2.0 3.0 4.0])", "2.5");
+    TEST_ASSERT_EQ("(med [10.0 20.0 30.0 40.0])", "25.0");
+
+    // F64 single element
+    TEST_ASSERT_EQ("(med [42.5])", "42.5");
+
+    // F64 two elements
+    TEST_ASSERT_EQ("(med [1.5 3.5])", "2.5");
+
+    // F64 negative values
+    TEST_ASSERT_EQ("(med [-5.0 -3.0 -1.0 1.0 3.0])", "-1.0");
+    TEST_ASSERT_EQ("(med [-10.0 0.0 10.0])", "0.0");
+
+    // F64 all same values
+    TEST_ASSERT_EQ("(med [5.5 5.5 5.5 5.5 5.5])", "5.5");
+
+    // F64 scalar
+    TEST_ASSERT_EQ("(med 3.14)", "3.14");
+
     PASS();
 }
 

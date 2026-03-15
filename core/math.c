@@ -2650,11 +2650,10 @@ obj_p ray_med(obj_p x) {
     if (l == 0)
         return f64(NULL_F64);
 
-    // i32_t *xi32sort;
     i64_t *xisort;
     u8_t *xu8sort;
     i16_t *xi16sort;
-    // f64_t *xfsort, med;
+    f64_t *xfsort;
     f64_t med;
     obj_p sort;
 
@@ -2700,14 +2699,13 @@ obj_p ray_med(obj_p x) {
             drop_obj(sort);
 
             return f64(med);
-            // TODO
-            // case TYPE_F64:
-            //     sort = ray_asc(x);
-            //     xfsort = AS_F64(sort);
-            //     med = (l % 2 == 0) ? (xfsort[l / 2 - 1] + xfsort[l / 2]) / 2.0 : xfsort[l / 2];
-            //     drop_obj(sort);
 
-            //     return f64(med);
+        case TYPE_F64:
+            sort = ray_asc(x);
+            xfsort = AS_F64(sort);
+            med = (l % 2 == 0) ? (xfsort[l / 2 - 1] + xfsort[l / 2]) / 2.0 : xfsort[l / 2];
+            drop_obj(sort);
+            return f64(med);
 
         case TYPE_PARTEDI16:
         case TYPE_PARTEDI32:
