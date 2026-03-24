@@ -522,3 +522,82 @@ test_result_t test_join_larger_tables() {
 
     PASS();
 }
+
+// ==================== JOIN PARALLEL (>16K rows) ====================
+test_result_t test_join_parallel() {
+    // Inner join with 20K rows — exceeds POOL_SPLIT_THRESHOLD, triggers pool_map
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list (til 20000) (til 20000))))"
+        "(set t2 (table [id val2] (list (til 10000) (* 2 (til 10000)))))"
+        "(count (inner-join [id] t1 t2))",
+        "10000");
+
+    // Left join parallel — all left rows preserved
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list (til 20000) (til 20000))))"
+        "(set t2 (table [id val2] (list (til 10000) (* 2 (til 10000)))))"
+        "(count (left-join [id] t1 t2))",
+        "20000");
+
+    // Verify correctness of parallel inner join values
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list (til 20000) (til 20000))))"
+        "(set t2 (table [id val2] (list (til 10000) (* 2 (til 10000)))))"
+        "(sum (at (inner-join [id] t1 t2) 'val1))",
+        "49995000");
+
+    // Multi-key parallel inner join (2 keys, >16K rows)
+    TEST_ASSERT_EQ(
+        "(set t1 (table [k1 k2 val1] (list (take (til 100) 20000) (take (til 200) 20000) (til 20000))))"
+        "(set t2 (table [k1 k2 val2] (list (take (til 100) 20000) (take (til 200) 20000) (* 3 (til 20000)))))"
+        "(count (inner-join [k1 k2] t1 t2))",
+        "20000");
+
+    // Multi-key parallel left join
+    TEST_ASSERT_EQ(
+        "(set t1 (table [k1 k2 val1] (list (take (til 100) 20000) (take (til 200) 20000) (til 20000))))"
+        "(set t2 (table [k1 k2 val2] (list (take (til 50) 10000) (take (til 200) 10000) (* 3 (til 10000)))))"
+        "(count (left-join [k1 k2] t1 t2))",
+        "20000");
+
+    // Verify inner join right values (sum of val2 from right table)
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list (til 20000) (til 20000))))"
+        "(set t2 (table [id val2] (list (til 10000) (* 2 (til 10000)))))"
+        "(sum (at (inner-join [id] t1 t2) 'val2))",
+        "99990000");
+
+    // Verify left join — left values always preserved (sum of val1)
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list (til 20000) (til 20000))))"
+        "(set t2 (table [id val2] (list (til 10000) (* 2 (til 10000)))))"
+        "(sum (at (left-join [id] t1 t2) 'val1))",
+        "199990000");
+
+    // Verify left join — right values correct for matched rows
+    // val2 = 2*id for ids 0..9999, should be filled from right; rest from left (val1)
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id val1] (list (til 20000) (til 20000))))"
+        "(set t2 (table [id val2] (list (til 10000) (* 2 (til 10000)))))"
+        "(sum (at (left-join [id] t1 t2) 'val2))",
+        "99990000");
+
+    // Multi-key parallel inner join — verify values
+    // 2 keys (id, k) both unique per row, so inner join = exact match
+    // sum(val2) for matched rows = sum(2 * 0..9999) = 2 * 49995000 = 99990000
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id k val1] (list (til 20000) (* 10 (til 20000)) (til 20000))))"
+        "(set t2 (table [id k val2] (list (til 10000) (* 10 (til 10000)) (* 2 (til 10000)))))"
+        "(sum (at (inner-join [id k] t1 t2) 'val2))",
+        "99990000");
+
+    // Multi-key parallel left join — verify left values preserved
+    // sum(val1) = sum(0..19999) = 199990000
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id k val1] (list (til 20000) (* 10 (til 20000)) (til 20000))))"
+        "(set t2 (table [id k val2] (list (til 10000) (* 10 (til 10000)) (* 2 (til 10000)))))"
+        "(sum (at (left-join [id k] t1 t2) 'val1))",
+        "199990000");
+
+    PASS();
+}

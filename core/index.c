@@ -3005,63 +3005,159 @@ obj_p index_group_list(obj_p obj, obj_p filter) {
     #endif  // Old chunk-based approach
 }
 
-obj_p index_left_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
-    i64_t i, ll, rl;
-    obj_p ht, ids, hashes;
-    i64_t idx;
-    __index_list_ctx_t ctx;
+// --- Parallel join: flat chained HT (no per-bucket alloc) ---
+// heads[bucket] -> first row index (or JHT_EMPTY)
+// next[row]     -> next row in chain (or JHT_EMPTY)
+// Parallel build uses atomic CAS on heads; next[] is per-row (no contention).
 
-    // one column join
+typedef struct __jht_t {
+    obj_p heads;
+    obj_p next;
+    i64_t cap;       // number of buckets (power of 2)
+    i64_t mask;      // cap - 1
+} __jht_t;
+
+static __jht_t __jht_create(i64_t nrows) {
+    __jht_t jht;
+    i64_t cap = 1;
+    while (cap < nrows * 2) cap <<= 1;
+    jht.cap = cap;
+    jht.mask = cap - 1;
+    jht.heads = I64(cap);
+    jht.next = I64(nrows);
+    for (i64_t i = 0; i < cap; i++) AS_I64(jht.heads)[i] = NULL_I64;
+    return jht;
+}
+
+static nil_t __jht_destroy(__jht_t *jht) {
+    drop_obj(jht->heads);
+    drop_obj(jht->next);
+}
+
+typedef struct __join_build_ctx_t {
+    __jht_t *jht;
+    __index_list_ctx_t list_ctx;
+} __join_build_ctx_t;
+
+static obj_p __join_build_chunk(i64_t len, i64_t offset, void *raw_ctx) {
+    __join_build_ctx_t *ctx = (__join_build_ctx_t *)raw_ctx;
+    __jht_t *jht = ctx->jht;
+    i64_t i, row, cur;
+    i64_t *heads = AS_I64(jht->heads);
+    i64_t *next = AS_I64(jht->next);
+
+    for (i = offset; i < offset + len; i++) {
+        row = i;
+        u64_t h = __index_list_hash_get(i, &ctx->list_ctx);
+        i64_t bucket = h & jht->mask;
+
+        for (;;) {
+            cur = __atomic_load_n(&heads[bucket], __ATOMIC_ACQUIRE);
+
+            // Check if key already exists in chain (dedup — first-wins)
+            i64_t walk = cur;
+            b8_t found = B8_FALSE;
+            while (walk != NULL_I64) {
+                if (__index_list_cmp_row(walk, i, &ctx->list_ctx) == 0) {
+                    found = B8_TRUE;
+                    break;
+                }
+                walk = next[walk];
+            }
+            if (found) break;
+
+            next[row] = cur;
+            if (__atomic_compare_exchange_n(&heads[bucket], &cur, row,
+                                            1, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                break;
+        }
+    }
+    return NULL_OBJ;
+}
+
+static inline i64_t __jht_probe(__jht_t *jht, i64_t left_row, __index_list_ctx_t *ctx) {
+    u64_t h = __index_list_hash_get(left_row, ctx);
+    i64_t bucket = h & jht->mask;
+    i64_t *heads = AS_I64(jht->heads);
+    i64_t *next = AS_I64(jht->next);
+    i64_t walk = __atomic_load_n(&heads[bucket], __ATOMIC_RELAXED);
+
+    while (walk != NULL_I64) {
+        if (__index_list_cmp_row(walk, left_row, ctx) == 0)
+            return walk;
+        walk = next[walk];
+    }
+    return NULL_I64;
+}
+
+typedef struct __join_probe_ctx_t {
+    __jht_t *jht;
+    __index_list_ctx_t list_ctx;
+    i64_t *match_rids;
+} __join_probe_ctx_t;
+
+static obj_p __join_probe_chunk(i64_t len, i64_t offset, void *raw_ctx) {
+    __join_probe_ctx_t *ctx = (__join_probe_ctx_t *)raw_ctx;
+    __jht_t *jht = ctx->jht;
+    i64_t i, end = offset + len;
+    i64_t *match_rids = ctx->match_rids;
+
+    for (i = offset; i < end; i++) {
+        if (i + 8 < end) {
+            u64_t ph = __index_list_hash_get(i + 8, &ctx->list_ctx) & jht->mask;
+            __builtin_prefetch(&jht->heads[ph], 0, 0);
+        }
+        match_rids[i] = __jht_probe(jht, i, &ctx->list_ctx);
+    }
+    return NULL_OBJ;
+}
+
+obj_p index_left_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
+    i64_t ll, rl;
+
     if (len == 1)
         return ray_find(rcols, lcols);
 
-    // multiple columns join
     ll = ops_count(AS_LIST(lcols)[0]);
     rl = ops_count(AS_LIST(rcols)[0]);
-    ht = ht_oa_create(rl, -1);
-    hashes = I64(MAXI64(ll, rl));
 
-    // Right hashes
-    __index_list_precalc_hash(rcols, (i64_t *)AS_I64(hashes), len, rl, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, rcols, (i64_t *)AS_I64(hashes), NULL};
-    for (i = 0; i < rl; i++) {
-        idx = ht_oa_tab_next_with(&ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
-        if (AS_I64(AS_LIST(ht)[0])[idx] == NULL_I64)
-            AS_I64(AS_LIST(ht)[0])[idx] = i;
-    }
+    obj_p rhashes = I64(rl);
+    __index_list_precalc_hash(rcols, AS_I64(rhashes), len, rl, NULL, B8_TRUE);
 
-    ids = I64(ll);
+    __jht_t jht = __jht_create(rl);
+    __join_build_ctx_t build_ctx = {
+        .jht = &jht,
+        .list_ctx = {rcols, rcols, AS_I64(rhashes), NULL}
+    };
+    pool_map(rl, __join_build_chunk, &build_ctx);
+    drop_obj(rhashes);
 
-    // Left hashes
-    __index_list_precalc_hash(lcols, (i64_t *)AS_I64(hashes), len, ll, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, lcols, (i64_t *)AS_I64(hashes), NULL};
-    for (i = 0; i < ll; ++i) {
-        idx = ht_oa_tab_get_with(ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
-        if (idx != NULL_I64)
-            AS_I64(ids)[i] = AS_I64(AS_LIST(ht)[0])[idx];
-        else
-            AS_I64(ids)[i] = NULL_I64;
-    }
+    obj_p lhashes = I64(ll);
+    __index_list_precalc_hash(lcols, AS_I64(lhashes), len, ll, NULL, B8_TRUE);
 
-    drop_obj(hashes);
-    drop_obj(ht);
+    obj_p ids = I64(ll);
+    __join_probe_ctx_t probe_ctx = {
+        .jht = &jht,
+        .list_ctx = {rcols, lcols, AS_I64(lhashes), NULL},
+        .match_rids = AS_I64(ids)
+    };
+    pool_map(ll, __join_probe_chunk, &probe_ctx);
+
+    drop_obj(lhashes);
+    __jht_destroy(&jht);
 
     return ids;
 }
 
 obj_p index_inner_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
     i64_t i, j, ll, rl;
-    obj_p ht, lids, rids, find_res;
-    i64_t idx;
-    __index_list_ctx_t ctx;
+    obj_p lids, rids, find_res;
 
     if (len == 1) {
-        // For single key: find matching indices from left in right
         find_res = ray_find(rcols, lcols);
         if (IS_ERR(find_res))
             return find_res;
 
-        // Count matches (non-NULL results)
         ll = find_res->len;
         j = 0;
         for (i = 0; i < ll; i++) {
@@ -3069,14 +3165,13 @@ obj_p index_inner_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
                 j++;
         }
 
-        // Build result arrays with only matching rows
         lids = I64(j);
         rids = I64(j);
         j = 0;
         for (i = 0; i < ll; i++) {
             if (AS_I64(find_res)[i] != NULL_I64) {
-                AS_I64(lids)[j] = i;                    // index in left table
-                AS_I64(rids)[j] = AS_I64(find_res)[i];  // index in right table
+                AS_I64(lids)[j] = i;
+                AS_I64(rids)[j] = AS_I64(find_res)[i];
                 j++;
             }
         }
@@ -3087,35 +3182,51 @@ obj_p index_inner_join_obj(obj_p lcols, obj_p rcols, i64_t len) {
 
     ll = ops_count(AS_LIST(lcols)[0]);
     rl = ops_count(AS_LIST(rcols)[0]);
-    ht = ht_oa_create(rl, -1);
-    rids = I64(MAXI64(ll, rl));
 
-    // Right hashes
-    __index_list_precalc_hash(rcols, (i64_t *)AS_I64(rids), len, rl, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, rcols, (i64_t *)AS_I64(rids), NULL};
-    for (i = 0; i < rl; i++) {
-        idx = ht_oa_tab_next_with(&ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
-        if (AS_I64(AS_LIST(ht)[0])[idx] == NULL_I64)
-            AS_I64(AS_LIST(ht)[0])[idx] = i;
+    obj_p rhashes = I64(rl);
+    __index_list_precalc_hash(rcols, AS_I64(rhashes), len, rl, NULL, B8_TRUE);
+
+    __jht_t jht = __jht_create(rl);
+    __join_build_ctx_t build_ctx = {
+        .jht = &jht,
+        .list_ctx = {rcols, rcols, AS_I64(rhashes), NULL}
+    };
+    pool_map(rl, __join_build_chunk, &build_ctx);
+    drop_obj(rhashes);
+
+    obj_p lhashes = I64(ll);
+    __index_list_precalc_hash(lcols, AS_I64(lhashes), len, ll, NULL, B8_TRUE);
+
+    obj_p match = I64(ll);
+    __join_probe_ctx_t probe_ctx = {
+        .jht = &jht,
+        .list_ctx = {rcols, lcols, AS_I64(lhashes), NULL},
+        .match_rids = AS_I64(match)
+    };
+    pool_map(ll, __join_probe_chunk, &probe_ctx);
+
+    drop_obj(lhashes);
+    __jht_destroy(&jht);
+
+    i64_t *match_rids = AS_I64(match);
+    j = 0;
+    for (i = 0; i < ll; i++) {
+        if (match_rids[i] != NULL_I64)
+            j++;
     }
 
-    lids = I64(ll);
-
-    // Left hashes
-    __index_list_precalc_hash(lcols, (i64_t *)AS_I64(rids), len, ll, NULL, B8_TRUE);
-    ctx = (__index_list_ctx_t){rcols, lcols, (i64_t *)AS_I64(rids), NULL};
-    for (i = 0, j = 0; i < ll; i++) {
-        idx = ht_oa_tab_get_with(ht, i, &__index_list_hash_get, &__index_list_cmp_row, &ctx);
-        if (idx != NULL_I64) {
-            AS_I64(rids)[j] = AS_I64(AS_LIST(ht)[0])[idx];
-            AS_I64(lids)[j++] = i;
+    lids = I64(j);
+    rids = I64(j);
+    j = 0;
+    for (i = 0; i < ll; i++) {
+        if (match_rids[i] != NULL_I64) {
+            AS_I64(lids)[j] = i;
+            AS_I64(rids)[j] = match_rids[i];
+            j++;
         }
     }
 
-    drop_obj(ht);
-
-    resize_obj(&lids, j);
-    resize_obj(&rids, j);
+    drop_obj(match);
 
     return vn_list(2, lids, rids);
 }

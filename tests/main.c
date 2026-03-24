@@ -576,6 +576,7 @@ test_entry_t tests[] = {
     {"test_join_errors", test_join_errors},
     {"test_join_column_order", test_join_column_order},
     {"test_join_larger_tables", test_join_larger_tables},
+    {"test_join_parallel", test_join_parallel},
     // Table & query tests
     {"test_table_creation", test_table_creation},
     {"test_table_metadata", test_table_metadata},
