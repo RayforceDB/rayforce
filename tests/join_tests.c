@@ -101,6 +101,76 @@ test_result_t test_join_left_basic() {
     PASS();
 }
 
+// ==================== LEFT JOIN SHARED COLUMN TYPES ====================
+test_result_t test_join_left_shared_column_types() {
+    // Shared I64 column, partial match — exercises select_column I64 branch
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id shared] (list [1 2 3] [10 20 30])))"
+        "(set t2 (table [id shared] (list [1 3] [100 300])))"
+        "(at (left-join [id] t1 t2) 'shared)",
+        "[100 20 300]");
+
+    // Shared F64 column, partial match
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id shared] (list [1 2 3] [1.1 2.2 3.3])))"
+        "(set t2 (table [id shared] (list [1 3] [10.1 30.3])))"
+        "(at (left-join [id] t1 t2) 'shared)",
+        "[10.1 2.2 30.3]");
+
+    // Shared Symbol column, partial match
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id shared] (list [1 2 3] [aaa bbb ccc])))"
+        "(set t2 (table [id shared] (list [1 3] [xxx zzz])))"
+        "(at (left-join [id] t1 t2) 'shared)",
+        "[xxx bbb zzz]");
+
+    // Shared Date column, partial match
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id shared] (list [1 2 3] [2024.01.01 2024.01.02 2024.01.03])))"
+        "(set t2 (table [id shared] (list [1 3] [2025.06.01 2025.06.03])))"
+        "(at (left-join [id] t1 t2) 'shared)",
+        "[2025.06.01 2024.01.02 2025.06.03]");
+
+    // Shared Time column, partial match
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id shared] (list [1 2 3] [10:00:00.000 10:00:01.000 10:00:02.000])))"
+        "(set t2 (table [id shared] (list [1 3] [20:00:00.000 20:00:02.000])))"
+        "(at (left-join [id] t1 t2) 'shared)",
+        "[20:00:00.000 10:00:01.000 20:00:02.000]");
+
+    // Shared Timestamp column, partial match
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id shared] (list [1 2 3] "
+        "[2024.01.01D10:00:00.000000000 2024.01.01D10:00:01.000000000 2024.01.01D10:00:02.000000000])))"
+        "(set t2 (table [id shared] (list [1 3] "
+        "[2025.06.01D20:00:00.000000000 2025.06.01D20:00:02.000000000])))"
+        "(at (left-join [id] t1 t2) 'shared)",
+        "[2025.06.01D20:00:00.000000000 2024.01.01D10:00:01.000000000 2025.06.01D20:00:02.000000000]");
+
+    // Shared B8 column, partial match
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id shared] (list [1 2 3] [true false true])))"
+        "(set t2 (table [id shared] (list [1 3] [false true])))"
+        "(at (left-join [id] t1 t2) 'shared)",
+        "[false false true]");
+
+    // Shared GUID column, partial match
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id shared] (list [1 2 3] (guid 3))))"
+        "(set t2 (table [id shared] (list [1 3] (guid 2))))"
+        "(count (left-join [id] t1 t2))",
+        "3");
+
+    // Shared I16 column (cast via as), partial match
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id shared] (list [1 2 3] (as 'I16 [10 20 30]))))"
+        "(set t2 (table [id shared] (list [1 3] (as 'I16 [100 300]))))"
+        "(at (left-join [id] t1 t2) 'shared)",
+        "[100 20 300]");
+
+    PASS();
+}
+
 // ==================== JOIN ON SINGLE KEY TYPES ====================
 test_result_t test_join_single_key_types() {
     // Join on I32 key
@@ -574,8 +644,7 @@ test_result_t test_join_parallel() {
         "(sum (at (left-join [id] t1 t2) 'val1))",
         "199990000");
 
-    // Verify left join — right values correct for matched rows
-    // val2 = 2*id for ids 0..9999, should be filled from right; rest from left (val1)
+    // Left join — right-only column sum
     TEST_ASSERT_EQ(
         "(set t1 (table [id val1] (list (til 20000) (til 20000))))"
         "(set t2 (table [id val2] (list (til 10000) (* 2 (til 10000)))))"
@@ -598,6 +667,41 @@ test_result_t test_join_parallel() {
         "(set t2 (table [id k val2] (list (til 10000) (* 10 (til 10000)) (* 2 (til 10000)))))"
         "(sum (at (left-join [id k] t1 t2) 'val1))",
         "199990000");
+
+    // Left join, right-only column with partial match (multi-key)
+    // t1 has no val2 column. t2 has val2. Rows (3,a) and (4,a) are unmatched.
+    // val2 for unmatched rows must be null-filled, not crash.
+    TEST_ASSERT_EQ(
+        "(set t1 (table [k1 k2] (list [1 2 3 4] [a a a a])))"
+        "(set t2 (table [k1 k2 val2] (list [1 2] [a a] [100 200])))"
+        "(count (left-join [k1 k2] t1 t2))",
+        "4");
+
+    TEST_ASSERT_EQ(
+        "(set t1 (table [k1 k2] (list [1 2 3 4] [a a a a])))"
+        "(set t2 (table [k1 k2 val2] (list [1 2] [a a] [100 200])))"
+        "(at (left-join [k1 k2] t1 t2) 'val2)",
+        "[100 200 0Nl 0Nl]");
+
+    // Left join, right-only column, >16K rows, half unmatched
+    TEST_ASSERT_EQ(
+        "(set t1 (table [id k] (list (til 20000) (* 10 (til 20000)))))"
+        "(set t2 (table [id k val2] (list (til 10000) (* 10 (til 10000)) (* 2 (til 10000)))))"
+        "(count (left-join [id k] t1 t2))",
+        "20000");
+
+    // Multi-key join with duplicate composite keys in right table
+    TEST_ASSERT_EQ(
+        "(set t1 (table [k1 k2 val1] (list [1 1 2 2] [a b a b] [10 20 30 40])))"
+        "(set t2 (table [k1 k2 val2] (list [1 1 2] [a a b] [100 101 200])))"
+        "(count (inner-join [k1 k2] t1 t2))",
+        "2");
+
+    TEST_ASSERT_EQ(
+        "(set t1 (table [k1 k2 val1] (list [1 1 2 2] [a b a b] [10 20 30 40])))"
+        "(set t2 (table [k1 k2 val2] (list [1 1 2] [a a b] [100 101 200])))"
+        "(count (left-join [k1 k2] t1 t2))",
+        "4");
 
     PASS();
 }

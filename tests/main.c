@@ -564,6 +564,7 @@ test_entry_t tests[] = {
     // Join tests
     {"test_join_inner_basic", test_join_inner_basic},
     {"test_join_left_basic", test_join_left_basic},
+    {"test_join_left_shared_column_types", test_join_left_shared_column_types},
     {"test_join_single_key_types", test_join_single_key_types},
     {"test_join_multi_key", test_join_multi_key},
     {"test_join_empty_tables", test_join_empty_tables},

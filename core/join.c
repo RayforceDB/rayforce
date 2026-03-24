@@ -36,115 +36,78 @@
 #include "query.h"
 
 obj_p select_column(obj_p left_col, obj_p right_col, i64_t ids[], i64_t len) {
-    i64_t i, idx;
+    i64_t i;
     i8_t type;
     obj_p res;
+    b8_t has_left = !is_null(left_col);
 
-    // there is no such column in the right table
     if (is_null(right_col))
         return clone_obj(left_col);
 
-    // Column exists only in right table — all ids are valid, use at_ids fast path
-    if (is_null(left_col))
-        return at_ids(right_col, ids, len);
+    type = has_left ? left_col->type : right_col->type;
 
-    type = left_col->type;
-
-    if (right_col->type != type)
+    if (has_left && right_col->type != type)
         return err_type(type, right_col->type, 0, 0);
 
     res = vector(type, len);
 
+    #define MERGE_LOOP(T, AS, NULL_VAL) {                                      \
+        T *ro = AS(right_col), *out = AS(res);                                \
+        if (has_left) {                                                       \
+            T *lo = AS(left_col);                                             \
+            for (i = 0; i < len; i++) out[i] = (ids[i] != NULL_I64) ? ro[ids[i]] : lo[i]; \
+        } else {                                                              \
+            for (i = 0; i < len; i++) out[i] = (ids[i] != NULL_I64) ? ro[ids[i]] : NULL_VAL; \
+        }                                                                     \
+        break;                                                                \
+    }
+
     switch (type) {
         case TYPE_B8:
         case TYPE_U8:
-        case TYPE_C8: {
-            u8_t *lo = AS_U8(left_col);
-            u8_t *ro = AS_U8(right_col);
-            u8_t *out = AS_U8(res);
-            for (i = 0; i < len; i++) {
-                idx = ids[i];
-                out[i] = (idx != NULL_I64) ? ro[idx] : lo[i];
-            }
-            break;
-        }
-        case TYPE_I16: {
-            i16_t *lo = AS_I16(left_col);
-            i16_t *ro = AS_I16(right_col);
-            i16_t *out = AS_I16(res);
-            for (i = 0; i < len; i++) {
-                idx = ids[i];
-                out[i] = (idx != NULL_I64) ? ro[idx] : lo[i];
-            }
-            break;
-        }
+        case TYPE_C8:    MERGE_LOOP(u8_t, AS_U8, 0)
+        case TYPE_I16:   MERGE_LOOP(i16_t, AS_I16, NULL_I16)
         case TYPE_I32:
         case TYPE_DATE:
-        case TYPE_TIME: {
-            i32_t *lo = AS_I32(left_col);
-            i32_t *ro = AS_I32(right_col);
-            i32_t *out = AS_I32(res);
-            for (i = 0; i < len; i++) {
-                idx = ids[i];
-                out[i] = (idx != NULL_I64) ? ro[idx] : lo[i];
-            }
-            break;
-        }
+        case TYPE_TIME:  MERGE_LOOP(i32_t, AS_I32, NULL_I32)
         case TYPE_I64:
         case TYPE_SYMBOL:
-        case TYPE_TIMESTAMP: {
-            i64_t *lo = AS_I64(left_col);
-            i64_t *ro = AS_I64(right_col);
-            i64_t *out = AS_I64(res);
-            for (i = 0; i < len; i++) {
-                idx = ids[i];
-                out[i] = (idx != NULL_I64) ? ro[idx] : lo[i];
-            }
-            break;
-        }
-        case TYPE_F64: {
-            f64_t *lo = AS_F64(left_col);
-            f64_t *ro = AS_F64(right_col);
-            f64_t *out = AS_F64(res);
-            for (i = 0; i < len; i++) {
-                idx = ids[i];
-                out[i] = (idx != NULL_I64) ? ro[idx] : lo[i];
-            }
-            break;
-        }
+        case TYPE_TIMESTAMP: MERGE_LOOP(i64_t, AS_I64, NULL_I64)
+        case TYPE_F64:   MERGE_LOOP(f64_t, AS_F64, NULL_F64)
         case TYPE_GUID: {
-            guid_t *lo = AS_GUID(left_col);
-            guid_t *ro = AS_GUID(right_col);
-            guid_t *out = AS_GUID(res);
-            for (i = 0; i < len; i++) {
-                idx = ids[i];
-                memcpy(out[i], (idx != NULL_I64) ? ro[idx] : lo[i], sizeof(guid_t));
+            guid_t *ro = AS_GUID(right_col), *out = AS_GUID(res);
+            guid_t null_guid = {0};
+            if (has_left) {
+                guid_t *lo = AS_GUID(left_col);
+                for (i = 0; i < len; i++) memcpy(out[i], (ids[i] != NULL_I64) ? ro[ids[i]] : lo[i], sizeof(guid_t));
+            } else {
+                for (i = 0; i < len; i++) memcpy(out[i], (ids[i] != NULL_I64) ? ro[ids[i]] : null_guid, sizeof(guid_t));
             }
             break;
         }
         case TYPE_LIST: {
-            obj_p *lo = AS_LIST(left_col);
-            obj_p *ro = AS_LIST(right_col);
-            obj_p *out = AS_LIST(res);
-            for (i = 0; i < len; i++) {
-                idx = ids[i];
-                out[i] = clone_obj((idx != NULL_I64) ? ro[idx] : lo[i]);
+            obj_p *ro = AS_LIST(right_col), *out = AS_LIST(res);
+            if (has_left) {
+                obj_p *lo = AS_LIST(left_col);
+                for (i = 0; i < len; i++) out[i] = clone_obj((ids[i] != NULL_I64) ? ro[ids[i]] : lo[i]);
+            } else {
+                for (i = 0; i < len; i++) out[i] = (ids[i] != NULL_I64) ? clone_obj(ro[ids[i]]) : NULL_OBJ;
             }
             break;
         }
         default: {
-            obj_p v;
-            for (i = 0; i < len; i++) {
-                idx = ids[i];
-                if (idx != NULL_I64)
-                    v = at_idx(right_col, idx);
-                else
-                    v = at_idx(left_col, i);
-                ins_obj(&res, i, v);
+            if (has_left) {
+                for (i = 0; i < len; i++)
+                    ins_obj(&res, i, (ids[i] != NULL_I64) ? at_idx(right_col, ids[i]) : at_idx(left_col, i));
+            } else {
+                for (i = 0; i < len; i++)
+                    ins_obj(&res, i, (ids[i] != NULL_I64) ? at_idx(right_col, ids[i]) : NULL_OBJ);
             }
             break;
         }
     }
+
+    #undef MERGE_LOOP
 
     return res;
 }

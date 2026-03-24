@@ -3105,7 +3105,7 @@ static obj_p __join_probe_chunk(i64_t len, i64_t offset, void *raw_ctx) {
     for (i = offset; i < end; i++) {
         if (i + 8 < end) {
             u64_t ph = __index_list_hash_get(i + 8, &ctx->list_ctx) & jht->mask;
-            __builtin_prefetch(&jht->heads[ph], 0, 0);
+            __builtin_prefetch(&AS_I64(jht->heads)[ph], 0, 0);
         }
         match_rids[i] = __jht_probe(jht, i, &ctx->list_ctx);
     }
