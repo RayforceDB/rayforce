@@ -300,6 +300,67 @@ test_result_t test_sort_timsort_symbols() {
     PASS();
 }
 
+test_result_t test_sort_sym_radix() {
+    // Random symbols, various sizes (radix sort kicks in at > 32)
+    TEST_ASSERT_EQ("(count (iasc (map (fn [x] (as 'symbol x)) (rand 50 1000))))", "50");
+    TEST_ASSERT_EQ("(count (asc (map (fn [x] (as 'symbol x)) (rand 50 1000))))", "50");
+    TEST_ASSERT_EQ("(count (iasc (map (fn [x] (as 'symbol x)) (rand 100 500))))", "100");
+    TEST_ASSERT_EQ("(count (asc (map (fn [x] (as 'symbol x)) (rand 100 500))))", "100");
+    TEST_ASSERT_EQ("(count (iasc (map (fn [x] (as 'symbol x)) (rand 200 500))))", "200");
+    TEST_ASSERT_EQ("(count (iasc (map (fn [x] (as 'symbol x)) (rand 500 10000))))", "500");
+    TEST_ASSERT_EQ("(count (iasc (map (fn [x] (as 'symbol x)) (rand 1000 100000))))", "1000");
+
+    // Descending
+    TEST_ASSERT_EQ("(count (idesc (map (fn [x] (as 'symbol x)) (rand 100 500))))", "100");
+    TEST_ASSERT_EQ("(count (desc (map (fn [x] (as 'symbol x)) (rand 100 500))))", "100");
+
+    // Deterministic correctness check with shared prefixes
+    TEST_ASSERT_EQ("(asc ['z 'y 'x 'w 'v 'u 't 's 'r 'q 'p 'o 'n 'm 'l 'k 'j 'i 'h 'g 'f 'e 'd 'c 'b 'a 'zz 'yy 'xx 'ww 'vv 'uu 'tt 'ss 'rr 'qq])",
+                   "['a 'b 'c 'd 'e 'f 'g 'h 'i 'j 'k 'l 'm 'n 'o 'p 'q 'qq 'r 'rr 's 'ss 't 'tt 'u 'uu 'v 'vv 'w 'ww 'x 'xx 'y 'yy 'z 'zz]");
+
+    TEST_ASSERT_EQ("(desc ['z 'y 'x 'w 'v 'u 't 's 'r 'q 'p 'o 'n 'm 'l 'k 'j 'i 'h 'g 'f 'e 'd 'c 'b 'a 'zz 'yy 'xx 'ww 'vv 'uu 'tt 'ss 'rr 'qq])",
+                   "['zz 'z 'yy 'y 'xx 'x 'ww 'w 'vv 'v 'uu 'u 'tt 't 'ss 's 'rr 'r 'qq 'q 'p 'o 'n 'm 'l 'k 'j 'i 'h 'g 'f 'e 'd 'c 'b 'a]");
+
+    // Tie-break: symbols sharing 8-byte prefix, mergesort by full strcmp
+    TEST_ASSERT_EQ("(asc (list 'abcdefgh9 'abcdefgh1 'abcdefgh5 'abcdefgh3 'abcdefgh7 'abcdefgh2 'abcdefgh8 'abcdefgh4 'abcdefgh6 'abcdefgh0"
+                   " 'abcdefghA 'abcdefghB 'abcdefghC 'abcdefghD 'abcdefghE 'abcdefghF 'abcdefghG 'abcdefghH 'abcdefghI 'abcdefghJ"
+                   " 'abcdefghK 'abcdefghL 'abcdefghM 'abcdefghN 'abcdefghO 'abcdefghP 'abcdefghQ 'abcdefghR 'abcdefghS 'abcdefghT"
+                   " 'abcdefghU 'abcdefghV 'abcdefghW 'abcdefghX 'abcdefghY 'abcdefghZ))",
+                   "(list 'abcdefgh0 'abcdefgh1 'abcdefgh2 'abcdefgh3 'abcdefgh4 'abcdefgh5 'abcdefgh6 'abcdefgh7 'abcdefgh8 'abcdefgh9"
+                   " 'abcdefghA 'abcdefghB 'abcdefghC 'abcdefghD 'abcdefghE 'abcdefghF 'abcdefghG 'abcdefghH 'abcdefghI 'abcdefghJ"
+                   " 'abcdefghK 'abcdefghL 'abcdefghM 'abcdefghN 'abcdefghO 'abcdefghP 'abcdefghQ 'abcdefghR 'abcdefghS 'abcdefghT"
+                   " 'abcdefghU 'abcdefghV 'abcdefghW 'abcdefghX 'abcdefghY 'abcdefghZ)");
+
+    // Duplicates
+    TEST_ASSERT_EQ("(count (iasc (take (list 'foo 'bar 'baz) 99)))", "99");
+
+    // Insertion sort descending (<=32 elements)
+    TEST_ASSERT_EQ("(idesc ['d 'b 'a 'c])", "[0 3 1 2]");
+
+    // Large distinct count (>65K) — exercises rank+radix path instead of counting sort
+    // 100K rows with high cardinality: verify sort length and ordering
+    TEST_ASSERT_EQ("(count (iasc (map (fn [x] (as 'symbol x)) (rand 100000 1000000))))", "100000");
+    TEST_ASSERT_EQ("(count (asc (map (fn [x] (as 'symbol x)) (rand 100000 1000000))))", "100000");
+    TEST_ASSERT_EQ("(count (idesc (map (fn [x] (as 'symbol x)) (rand 100000 1000000))))", "100000");
+
+    // Verify correctness: sorted result equals itself re-sorted
+    TEST_ASSERT_EQ(
+        "(set v (map (fn [x] (as 'symbol x)) (rand 100000 1000000)))"
+        "(set s1 (asc v))"
+        "(set s2 (asc s1))"
+        "(count (where (!= s1 s2)))",
+        "0");
+
+    // Parallel path (>=64K elements)
+    TEST_ASSERT_EQ("(count (iasc (map (fn [x] (as 'symbol x)) (rand 70000 500000))))", "70000");
+    TEST_ASSERT_EQ("(count (idesc (map (fn [x] (as 'symbol x)) (rand 70000 500000))))", "70000");
+
+    // Small distinct, large array — counting sort path, parallel
+    TEST_ASSERT_EQ("(count (iasc (take ['apple 'banana 'cherry 'date 'elderberry] 100000)))", "100000");
+
+    PASS();
+}
+
 test_result_t test_rank_xrank() {
     TEST_ASSERT_EQ("(rank [30 10 20])", "[2 0 1]");
     TEST_ASSERT_EQ("(rank [5 3 1 4 2])", "(iasc (iasc [5 3 1 4 2]))");

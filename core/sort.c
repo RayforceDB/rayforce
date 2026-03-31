@@ -29,6 +29,7 @@
 #include "pool.h"
 #include "index.h"
 #include "chrono.h"
+#include "runtime.h"
 
 // Sort thresholds
 #define SMALL_VEC_THRESHOLD (64 * 1024)
@@ -2447,6 +2448,450 @@ static void binary_insertion_sort_numeric(i64_t* indices, i64_t* data, i64_t len
     }
 }
 
+// ============================================================================
+// Symbol Sort: always rank-mapping, no prefix-key fallback
+// ============================================================================
+
+#define SYM_COUNTING_THRESHOLD 65535
+
+static int sym_id_cmp(const void* a, const void* b) {
+    return strcmp(str_from_symbol(*(const i64_t*)a), str_from_symbol(*(const i64_t*)b));
+}
+
+// Scan column data: find max_id, count distinct
+static i64_t sym_scan_column(i64_t* data, i64_t len, i64_t* max_id_out) {
+    i64_t max_id = 0;
+    for (i64_t i = 0; i < len; i++) {
+        if (data[i] != NULL_I64 && data[i] > max_id)
+            max_id = data[i];
+    }
+    *max_id_out = max_id;
+
+    i64_t alloc = max_id + 1;
+    u8_t* present = calloc(alloc, 1);
+    i64_t n_distinct = 0;
+    for (i64_t i = 0; i < len; i++) {
+        if (data[i] != NULL_I64 && !present[data[i]]) {
+            present[data[i]] = 1;
+            n_distinct++;
+        }
+    }
+    free(present);
+    return n_distinct;
+}
+
+// Parallel scan: each worker finds local max_id and marks present IDs
+typedef struct {
+    i64_t* data;
+    u8_t*  present;
+    i64_t  alloc;
+    i64_t* local_max;
+    i64_t  chunk_size;
+} sym_scan_ctx_t;
+
+static obj_p sym_scan_worker(i64_t len, i64_t offset, void* raw_ctx) {
+    sym_scan_ctx_t* c = raw_ctx;
+    i64_t* data = c->data + offset;
+    i64_t worker = offset / c->chunk_size;
+    i64_t local_max = 0;
+    for (i64_t i = 0; i < len; i++) {
+        if (data[i] != NULL_I64 && data[i] > local_max)
+            local_max = data[i];
+    }
+    c->local_max[worker] = local_max;
+    return NULL_OBJ;
+}
+
+static obj_p sym_scan_mark_worker(i64_t len, i64_t offset, void* raw_ctx) {
+    sym_scan_ctx_t* c = raw_ctx;
+    i64_t* data = c->data + offset;
+    u8_t* present = c->present;
+    for (i64_t i = 0; i < len; i++) {
+        if (data[i] != NULL_I64)
+            present[data[i]] = 1;
+    }
+    return NULL_OBJ;
+}
+
+static i64_t sym_scan_column_parallel(i64_t* data, i64_t len, i64_t* max_id_out) {
+    pool_p pool = pool_get();
+    i64_t n = pool_split_by(pool, len, 0);
+    i64_t chunk_size = len / n;
+
+    i64_t* local_max = calloc(n, sizeof(i64_t));
+    sym_scan_ctx_t ctx = {data, NULL, 0, local_max, chunk_size};
+    pool_map(len, sym_scan_worker, &ctx);
+
+    i64_t max_id = 0;
+    for (i64_t i = 0; i < n; i++)
+        if (local_max[i] > max_id) max_id = local_max[i];
+    free(local_max);
+    *max_id_out = max_id;
+
+    i64_t alloc = max_id + 1;
+    u8_t* present = calloc(alloc, 1);
+    ctx.present = present;
+    ctx.alloc = alloc;
+    pool_map(len, sym_scan_mark_worker, &ctx);
+
+    i64_t n_distinct = 0;
+    for (i64_t i = 0; i < alloc; i++)
+        if (present[i]) n_distinct++;
+    free(present);
+    return n_distinct;
+}
+
+// Build rank mapping: collect distinct IDs, qsort by strcmp, assign dense ranks
+static u32_t* sym_build_rank(i64_t* data, i64_t len, i64_t max_id, i64_t n_distinct) {
+    i64_t alloc = max_id + 1;
+    u8_t* present = calloc(alloc, 1);
+    for (i64_t i = 0; i < len; i++)
+        if (data[i] != NULL_I64) present[data[i]] = 1;
+
+    i64_t* ids = malloc(n_distinct * sizeof(i64_t));
+    i64_t k = 0;
+    for (i64_t i = 0; i < alloc; i++)
+        if (present[i]) ids[k++] = i;
+    free(present);
+
+    qsort(ids, n_distinct, sizeof(i64_t), sym_id_cmp);
+
+    u32_t* rank = calloc(alloc, sizeof(u32_t));
+    for (i64_t i = 0; i < n_distinct; i++)
+        rank[ids[i]] = (u32_t)(i + 1);
+    free(ids);
+
+    return rank;
+}
+
+// --- Sequential counting sort on rank values ---
+static obj_p counting_sort_sym_rank(i64_t* data, i64_t len, u32_t* rank, i64_t n_distinct, i64_t asc) {
+    i64_t n_buckets = n_distinct + 1;  // 0=NULL, 1..n_distinct=ranks
+    i64_t* counts = calloc(n_buckets, sizeof(i64_t));
+
+    for (i64_t i = 0; i < len; i++) {
+        i64_t r = (data[i] == NULL_I64) ? 0 : rank[data[i]];
+        counts[r]++;
+    }
+
+    if (asc > 0) {
+        i64_t sum = 0;
+        for (i64_t b = 0; b < n_buckets; b++) {
+            i64_t c = counts[b];
+            counts[b] = sum;
+            sum += c;
+        }
+    } else {
+        i64_t sum = 0;
+        for (i64_t b = n_buckets - 1; b >= 0; b--) {
+            i64_t c = counts[b];
+            counts[b] = sum;
+            sum += c;
+        }
+    }
+
+    obj_p result = I64(len);
+    if (IS_ERR(result)) { free(counts); return result; }
+    i64_t* idx = AS_I64(result);
+
+    for (i64_t i = 0; i < len; i++) {
+        i64_t r = (data[i] == NULL_I64) ? 0 : rank[data[i]];
+        idx[counts[r]++] = i;
+    }
+
+    free(counts);
+    return result;
+}
+
+// --- Parallel counting sort on rank values ---
+typedef struct {
+    i64_t* data;
+    u32_t* rank;
+    i64_t  n_buckets;
+    i64_t  chunk_size;
+    i64_t* histograms;
+} sym_rank_hist_ctx_t;
+
+static obj_p sym_rank_hist_worker(i64_t len, i64_t offset, void* ctx) {
+    sym_rank_hist_ctx_t* c = ctx;
+    i64_t worker = offset / c->chunk_size;
+    i64_t* hist = c->histograms + worker * c->n_buckets;
+    i64_t* data = c->data + offset;
+    u32_t* rank = c->rank;
+    memset(hist, 0, c->n_buckets * sizeof(i64_t));
+    for (i64_t i = 0; i < len; i++) {
+        i64_t r = (data[i] == NULL_I64) ? 0 : rank[data[i]];
+        hist[r]++;
+    }
+    return NULL_OBJ;
+}
+
+typedef struct {
+    i64_t* data;
+    u32_t* rank;
+    i64_t  chunk_size;
+    i64_t  pos_stride;
+    i64_t* positions;
+    i64_t* out;
+} sym_rank_scatter_ctx_t;
+
+static obj_p sym_rank_scatter_worker(i64_t len, i64_t offset, void* ctx) {
+    sym_rank_scatter_ctx_t* c = ctx;
+    i64_t worker = offset / c->chunk_size;
+    i64_t* pos = c->positions + worker * c->pos_stride;
+    i64_t* data = c->data + offset;
+    u32_t* rank = c->rank;
+    i64_t* out = c->out;
+    for (i64_t i = 0; i < len; i++) {
+        i64_t r = (data[i] == NULL_I64) ? 0 : rank[data[i]];
+        out[pos[r]++] = offset + i;
+    }
+    return NULL_OBJ;
+}
+
+static obj_p parallel_counting_sort_sym_rank(i64_t* data, i64_t len, u32_t* rank, i64_t n_distinct, i64_t asc) {
+    i64_t n_buckets = n_distinct + 1;
+
+    pool_p pool = pool_get();
+    i64_t n = pool_split_by(pool, len, 0);
+    i64_t chunk_size = len / n;
+
+    obj_p hist_obj = I64(n * n_buckets);
+    if (IS_ERR(hist_obj)) return hist_obj;
+    i64_t* histograms = AS_I64(hist_obj);
+
+    sym_rank_hist_ctx_t hctx = {data, rank, n_buckets, chunk_size, histograms};
+    pool_map(len, sym_rank_hist_worker, &hctx);
+
+    i64_t pos_stride = n_buckets;
+    obj_p pos_obj = I64(n * pos_stride);
+    if (IS_ERR(pos_obj)) { drop_obj(hist_obj); return pos_obj; }
+    i64_t* positions = AS_I64(pos_obj);
+
+    if (asc > 0) {
+        i64_t sum = 0;
+        for (i64_t b = 0; b < n_buckets; b++) {
+            for (i64_t w = 0; w < n; w++) {
+                i64_t* wh = histograms + w * n_buckets;
+                i64_t cnt = wh[b];
+                positions[w * pos_stride + b] = sum;
+                sum += cnt;
+            }
+        }
+    } else {
+        i64_t sum = 0;
+        for (i64_t b = n_buckets - 1; b >= 0; b--) {
+            for (i64_t w = 0; w < n; w++) {
+                i64_t* wh = histograms + w * n_buckets;
+                i64_t cnt = wh[b];
+                positions[w * pos_stride + b] = sum;
+                sum += cnt;
+            }
+        }
+    }
+
+    obj_p result = I64(len);
+    if (IS_ERR(result)) { drop_obj(hist_obj); drop_obj(pos_obj); return result; }
+
+    sym_rank_scatter_ctx_t sctx = {data, rank, chunk_size, pos_stride, positions, AS_I64(result)};
+    pool_map(len, sym_rank_scatter_worker, &sctx);
+
+    drop_obj(hist_obj);
+    drop_obj(pos_obj);
+    return result;
+}
+
+// --- Sequential radix sort on rank values (for large dictionaries, small arrays) ---
+static obj_p sequential_radix_sort_sym_rank(i64_t* data, i64_t len, u32_t* rank, i64_t n_distinct, i64_t asc) {
+    i64_t n_passes = (n_distinct <= 0xFF) ? 1 : (n_distinct <= 0xFFFF) ? 2 : 3;
+
+    obj_p ia = I64(len);
+    if (IS_ERR(ia)) return ia;
+    obj_p ib = I64(len);
+    if (IS_ERR(ib)) { drop_obj(ia); return ib; }
+
+    i64_t* idx_a = AS_I64(ia);
+    i64_t* idx_b = AS_I64(ib);
+    i64_t* ibufs[2] = {idx_a, idx_b};
+
+    // Map data to rank keys
+    u32_t* keys = malloc(len * sizeof(u32_t));
+    for (i64_t i = 0; i < len; i++) {
+        keys[i] = (data[i] == NULL_I64) ? 0 : rank[data[i]];
+        idx_a[i] = i;
+    }
+
+    i64_t hist[256];
+    i64_t prefix[257];
+    i64_t cur = 0;
+
+    for (i64_t pass = 0; pass < n_passes; pass++) {
+        i64_t shift = pass * 8;
+        i64_t dst = 1 - cur;
+
+        memset(hist, 0, 256 * sizeof(i64_t));
+        for (i64_t i = 0; i < len; i++)
+            hist[(keys[ibufs[cur][i]] >> shift) & 0xff]++;
+
+        i64_t non_empty = 0;
+        for (i64_t b = 0; b < 256; b++)
+            non_empty += (hist[b] != 0);
+        if (non_empty <= 1) continue;
+
+        prefix[0] = 0;
+        for (i64_t b = 0; b < 256; b++)
+            prefix[b + 1] = prefix[b] + hist[b];
+
+        for (i64_t i = 0; i < len; i++) {
+            i64_t b = (keys[ibufs[cur][i]] >> shift) & 0xff;
+            ibufs[dst][prefix[b]++] = ibufs[cur][i];
+        }
+        cur = dst;
+    }
+
+    free(keys);
+    obj_p result = (cur == 0) ? ia : ib;
+    drop_obj(cur == 0 ? ib : ia);
+
+    if (asc < 0) {
+        i64_t* idx = AS_I64(result);
+        for (i64_t i = 0, j = len - 1; i < j; i++, j--) {
+            i64_t tmp = idx[i];
+            idx[i] = idx[j];
+            idx[j] = tmp;
+        }
+    }
+
+    return result;
+}
+
+// --- Parallel radix sort on rank values (for large dictionaries, large arrays) ---
+static obj_p parallel_radix_sort_sym_rank(i64_t* data, i64_t len, u32_t* rank, i64_t n_distinct, i64_t asc) {
+    i64_t n_passes = (n_distinct <= 0xFF) ? 1 : (n_distinct <= 0xFFFF) ? 2 : 3;
+
+    pool_p pool = pool_get();
+    i64_t n = pool_split_by(pool, len, 0);
+    i64_t chunk_size = len / n;
+
+    obj_p ia = I64(len);
+    if (IS_ERR(ia)) return ia;
+    obj_p ib = I64(len);
+    if (IS_ERR(ib)) { drop_obj(ia); return ib; }
+    obj_p ka = I64(len);
+    if (IS_ERR(ka)) { drop_obj(ia); drop_obj(ib); return ka; }
+    obj_p kb = I64(len);
+    if (IS_ERR(kb)) { drop_obj(ia); drop_obj(ib); drop_obj(ka); return kb; }
+    obj_p hist_obj = I64(n * 256);
+    if (IS_ERR(hist_obj)) { drop_obj(ia); drop_obj(ib); drop_obj(ka); drop_obj(kb); return hist_obj; }
+    i64_t* histograms = AS_I64(hist_obj);
+
+    // Init: map data to rank keys (reuse u64 key buffers for u32 rank stored as u64)
+    u64_t* keys_a = (u64_t*)AS_I64(ka);
+    i64_t* idx_a = AS_I64(ia);
+    for (i64_t i = 0; i < len; i++) {
+        keys_a[i] = (data[i] == NULL_I64) ? 0 : rank[data[i]];
+        idx_a[i] = i;
+    }
+
+    i64_t prefix[257];
+    u64_t* kbufs[2] = {(u64_t*)AS_I64(ka), (u64_t*)AS_I64(kb)};
+    i64_t* ibufs[2] = {AS_I64(ia), AS_I64(ib)};
+    i64_t cur = 0;
+
+    for (i64_t pass = 0; pass < n_passes; pass++) {
+        i64_t shift = pass * 8;
+        i64_t dst = 1 - cur;
+
+        radix8_hist_i64_ctx_t hctx = {kbufs[cur], chunk_size, histograms, shift};
+        pool_map(len, radix8_hist_i64_worker, &hctx);
+
+        memset(prefix, 0, 257 * sizeof(i64_t));
+        for (i64_t w = 0; w < n; w++) {
+            i64_t* wh = histograms + w * 256;
+            for (i64_t b = 0; b < 256; b++)
+                prefix[b + 1] += wh[b];
+        }
+
+        i64_t non_empty = 0;
+        for (i64_t b = 0; b < 256; b++)
+            non_empty += (prefix[b + 1] != 0);
+        if (non_empty <= 1) continue;
+
+        for (i64_t b = 1; b <= 256; b++)
+            prefix[b] += prefix[b - 1];
+
+        for (i64_t b = 0; b < 256; b++) {
+            i64_t pos = prefix[b];
+            for (i64_t w = 0; w < n; w++) {
+                i64_t* wh = histograms + w * 256;
+                i64_t cnt = wh[b];
+                wh[b] = pos;
+                pos += cnt;
+            }
+        }
+
+        radix8_scatter_i64_ctx_t sctx = {kbufs[cur], ibufs[cur], chunk_size, histograms, kbufs[dst], ibufs[dst], shift, 1};
+        pool_map(len, radix8_scatter_i64_worker, &sctx);
+        cur = dst;
+    }
+
+    drop_obj(hist_obj);
+    drop_obj(ka);
+    drop_obj(kb);
+    obj_p result = (cur == 0) ? ia : ib;
+    drop_obj(cur == 0 ? ib : ia);
+
+    if (asc < 0) {
+        i64_t* idx = AS_I64(result);
+        for (i64_t i = 0, j = len - 1; i < j; i++, j--) {
+            i64_t tmp = idx[i];
+            idx[i] = idx[j];
+            idx[j] = tmp;
+        }
+    }
+
+    return result;
+}
+
+// --- Entry points ---
+static obj_p sequential_sort_sym(obj_p vec, i64_t asc) {
+    i64_t len = vec->len;
+    i64_t* data = AS_I64(vec);
+
+    i64_t max_id;
+    i64_t n_distinct = sym_scan_column(data, len, &max_id);
+
+    u32_t* rank = sym_build_rank(data, len, max_id, n_distinct);
+
+    obj_p result;
+    if (n_distinct <= SYM_COUNTING_THRESHOLD)
+        result = counting_sort_sym_rank(data, len, rank, n_distinct, asc);
+    else
+        result = sequential_radix_sort_sym_rank(data, len, rank, n_distinct, asc);
+
+    free(rank);
+    return result;
+}
+
+static obj_p parallel_sort_sym(obj_p vec, i64_t asc) {
+    i64_t len = vec->len;
+    i64_t* data = AS_I64(vec);
+
+    i64_t max_id;
+    i64_t n_distinct = sym_scan_column_parallel(data, len, &max_id);
+
+    u32_t* rank = sym_build_rank(data, len, max_id, n_distinct);
+
+    obj_p result;
+    if (n_distinct <= SYM_COUNTING_THRESHOLD)
+        result = parallel_counting_sort_sym_rank(data, len, rank, n_distinct, asc);
+    else
+        result = parallel_radix_sort_sym_rank(data, len, rank, n_distinct, asc);
+
+    free(rank);
+    return result;
+}
+
 // Optimized sort dispatcher
 static obj_p optimized_sort(obj_p vec, i64_t asc) {
     obj_p res;
@@ -2489,11 +2934,15 @@ static obj_p optimized_sort(obj_p vec, i64_t asc) {
             }
             break;
         }
+        case TYPE_SYMBOL:
+            if (len >= SMALL_VEC_THRESHOLD)
+                return parallel_sort_sym(vec, asc);
+            return sequential_sort_sym(vec, asc);
         default:
             break;
     }
 
-    // Fall back to merge sort for larger arrays
+    // Fallback for types/sizes not handled above
     return mergesort_generic_obj(vec, asc);
 }
 
