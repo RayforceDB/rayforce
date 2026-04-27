@@ -1710,7 +1710,12 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
  * Stack-based VM executor (computed goto, frame-based)
  * ══════════════════════════════════════════ */
 
-static _Thread_local ray_vm_t *__VM = NULL;
+/* Shared thread-local with runtime.c (declared extern in core/runtime.h).
+ * Defining it locally here would shadow runtime.c's symbol, leaving
+ * ray_error_msg() reading a NULL pointer on any thread that ran an eval
+ * without going through ray_runtime_create — which is every tokio worker
+ * thread in ray-exomem. */
+extern _Thread_local ray_vm_t *__VM;
 
 static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
     /* Computed goto dispatch table */

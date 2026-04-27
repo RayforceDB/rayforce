@@ -37,6 +37,10 @@
 #include <string.h>
 #include <stdio.h>
 
+/* From core/runtime.h — avoiding the include because it pulls in a ray_vm_t
+ * typedef that conflicts with the one in lang/eval.h. */
+extern const char* ray_error_msg(void);
+
 /* ========================================================================
  * Program lifecycle
  * ======================================================================== */
@@ -4174,8 +4178,21 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
     }
 
     if (dl_eval(prog) != 0) {
+        /* Preserve any inner-error detail that ray_error() stashed in the
+         * thread-local error buffer before dl_eval freed the offending
+         * object. Without this, callers see a generic "evaluation failed". */
+        char prev[256];
+        const char* p = ray_error_msg();
+        prev[0] = '\0';
+        if (p && *p) {
+            strncpy(prev, p, sizeof(prev) - 1);
+            prev[sizeof(prev) - 1] = '\0';
+        }
         dl_program_free(prog);
         ray_release(db);
+        if (prev[0]) {
+            return ray_error("domain", "query: evaluation failed: %s", prev);
+        }
         return ray_error("domain", "query: evaluation failed");
     }
 
