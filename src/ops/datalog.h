@@ -115,6 +115,13 @@ typedef struct {
     int     arity;                  /* number of argument positions */
     int     vars[DL_MAX_ARITY];    /* variable indices (DL_CONST for constants) */
     int64_t const_vals[DL_MAX_ARITY]; /* constant values (I64/SYM) */
+    int8_t  const_types[DL_MAX_ARITY]; /* ray type tag per body slot when
+                                         * vars[i]==DL_CONST: RAY_I64 / RAY_SYM /
+                                         * RAY_STR / RAY_F64. 0 when vars[i] is
+                                         * a variable. Used by the row-equality
+                                         * helper to dispatch tag-aware compares
+                                         * against DATOM-encoded I64 columns
+                                         * (see dl_col_eq_row). */
     int     cmp_op;                /* comparison operator (for DL_CMP) */
     int     cmp_lhs;               /* left variable index (for DL_CMP) */
     int     cmp_rhs;               /* right variable index or DL_CONST */
@@ -265,8 +272,18 @@ int dl_rule_add_atom(dl_rule_t* rule, const char* pred, int arity);
 /* Set a body atom argument to a variable */
 void dl_body_set_var(dl_rule_t* rule, int body_idx, int pos, int var_idx);
 
-/* Set a body atom argument to a constant */
+/* Set a body atom argument to a constant. Defaults the type tag to RAY_I64;
+ * use dl_body_set_const_typed when the literal's source ray type matters
+ * (RAY_STR / RAY_SYM body literals must record their type so the row-
+ * equality helper can compare them against DATOM-encoded I64 columns). */
 void dl_body_set_const(dl_rule_t* rule, int body_idx, int pos, int64_t val);
+
+/* Set a body atom argument to a typed constant. `ray_type` is the source
+ * ray type of the literal (RAY_I64 / RAY_SYM / RAY_STR / RAY_F64), used at
+ * filter time to decide whether a tagged-payload compare is needed when
+ * the column is RAY_I64 with DATOM-encoded entries. */
+void dl_body_set_const_typed(dl_rule_t* rule, int body_idx, int pos,
+                             int64_t val, int8_t ray_type);
 
 /* Add a negated body atom. Returns body literal index. */
 int dl_rule_add_neg(dl_rule_t* rule, const char* pred, int arity);

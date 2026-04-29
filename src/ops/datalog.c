@@ -323,11 +323,20 @@ void dl_body_set_var(dl_rule_t* rule, int body_idx, int pos, int var_idx) {
     if (var_idx + 1 > rule->n_vars) rule->n_vars = var_idx + 1;
 }
 
-void dl_body_set_const(dl_rule_t* rule, int body_idx, int pos, int64_t val) {
+void dl_body_set_const_typed(dl_rule_t* rule, int body_idx, int pos,
+                             int64_t val, int8_t ray_type) {
     if (body_idx < 0 || body_idx >= rule->n_body) return;
     if (pos < 0 || pos >= rule->body[body_idx].arity) return;
     rule->body[body_idx].vars[pos] = DL_CONST;
     rule->body[body_idx].const_vals[pos] = val;
+    rule->body[body_idx].const_types[pos] = ray_type;
+}
+
+void dl_body_set_const(dl_rule_t* rule, int body_idx, int pos, int64_t val) {
+    /* Default the type tag to RAY_I64 — callers that care about
+     * RAY_SYM / RAY_STR literals (and thus DATOM-tag-aware compares
+     * against I64 columns) should call dl_body_set_const_typed. */
+    dl_body_set_const_typed(rule, body_idx, pos, val, RAY_I64);
 }
 
 int dl_rule_add_neg(dl_rule_t* rule, const char* pred, int arity) {
@@ -956,19 +965,51 @@ static ray_t* dl_antijoin_tables(ray_t* left, ray_t* right,
     return result;
 }
 
-/* Helper: filter a table to rows where column col_idx == value */
+/* Helper: filter a table to rows where column col_idx == value.
+ * `const_type` is the source ray type of the body literal (RAY_STR /
+ * RAY_SYM / RAY_I64 / RAY_F64) so the row-equality helper can dispatch
+ * a tag-aware compare for DATOM-encoded I64 columns — see
+ * dl_col_eq_row below. */
 /* Row-at-index read helper: read an I64 from either a RAY_I64 column
  * or from a RAY_SYM column (of any adaptive width) as a sym ID.  Other
  * types aren't supported by the constant-filter path and cause the
- * caller to pass through the input table unchanged. */
-static bool dl_col_eq_row(ray_t* col, int64_t row, int64_t value) {
-    if (col->type == RAY_I64) return ((int64_t*)ray_data(col))[row] == value;
+ * caller to pass through the input table unchanged.
+ *
+ * RAY_I64 columns may hold either plain integers or DATOM-tagged sym
+ * IDs (`(0x4000... | sym_id)` for STR, `(0x2000... | sym_id)` for SYM)
+ * deposited by an EAV frontend. The body literal's source ray type
+ * (`const_type`) is the only signal we have for which encoding the
+ * caller intended: a `"foo"` literal interns as a plain sym ID but
+ * targets a STR-tagged cell; a `'foo` literal interns plain and
+ * targets a SYM-tagged cell. We always try the direct compare first
+ * (plain-int columns and same-tag columns hit this path) and fall
+ * back to a payload compare when the cell carries the matching tag —
+ * so a body literal can pin both an untagged RAY_SYM column built
+ * from a rule head and a DATOM-tagged RAY_I64 column built from EAV
+ * storage without the frontend having to know which is which. */
+static bool dl_col_eq_row(ray_t* col, int64_t row, int64_t value,
+                          int8_t const_type) {
+    if (col->type == RAY_I64) {
+        int64_t cell = ((int64_t*)ray_data(col))[row];
+        if (cell == value) return true;
+        int64_t cell_tag = cell & (int64_t)0x6000000000000000;
+        if (cell_tag == 0) return false;  /* plain int column */
+        int64_t cell_payload = cell & (int64_t)0x1FFFFFFFFFFFFFFF;
+        if (const_type == RAY_STR &&
+            cell_tag == (int64_t)0x4000000000000000)
+            return cell_payload == value;
+        if (const_type == RAY_SYM &&
+            cell_tag == (int64_t)0x2000000000000000)
+            return cell_payload == value;
+        return false;
+    }
     if (col->type == RAY_SYM)
         return ray_read_sym(ray_data(col), row, col->type, col->attrs) == value;
     return false;
 }
 
-static ray_t* dl_filter_eq(ray_t* tbl, int col_idx, int64_t value) {
+static ray_t* dl_filter_eq(ray_t* tbl, int col_idx, int64_t value,
+                           int8_t const_type) {
     /* Contract: always return an owned reference (rc bumped) so the
      * caller can release uniformly.  Every pass-through must therefore
      * retain — else the caller's `ray_release(body_tbl); body_tbl =
@@ -992,7 +1033,7 @@ static ray_t* dl_filter_eq(ray_t* tbl, int col_idx, int64_t value) {
     /* Count matching rows — type-aware read for RAY_SYM adaptive width. */
     int64_t count = 0;
     for (int64_t r = 0; r < nrows; r++)
-        if (dl_col_eq_row(col, r, value)) count++;
+        if (dl_col_eq_row(col, r, value, const_type)) count++;
 
     if (count == nrows) { ray_retain(tbl); return tbl; }
 
@@ -1019,7 +1060,7 @@ static ray_t* dl_filter_eq(ray_t* tbl, int col_idx, int64_t value) {
         uint8_t* dst_b = (uint8_t*)ray_data(dst);
         int64_t j = 0;
         for (int64_t r = 0; r < nrows; r++) {
-            if (dl_col_eq_row(col, r, value)) {
+            if (dl_col_eq_row(col, r, value, const_type)) {
                 memcpy(dst_b + (size_t)j * esz,
                        src_b + (size_t)r * esz,
                        (size_t)esz);
@@ -1261,7 +1302,8 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
         /* Apply constant filters */
         for (int c = 0; c < body->arity; c++) {
             if (body->vars[c] == DL_CONST) {
-                ray_t* filtered = dl_filter_eq(body_tbl, c, body->const_vals[c]);
+                ray_t* filtered = dl_filter_eq(body_tbl, c, body->const_vals[c],
+                                                body->const_types[c]);
                 ray_release(body_tbl);
                 if (!filtered) {
                     /* Treat as genuine failure — dl_filter_eq returns an
@@ -1422,7 +1464,8 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
             ray_retain(neg_tbl);
             for (int c = 0; c < body->arity; c++) {
                 if (body->vars[c] == DL_CONST) {
-                    ray_t* filtered = dl_filter_eq(neg_tbl, c, body->const_vals[c]);
+                    ray_t* filtered = dl_filter_eq(neg_tbl, c, body->const_vals[c],
+                                                    body->const_types[c]);
                     ray_release(neg_tbl);
                     if (!filtered) {
                         ray_release(accum);
@@ -3521,7 +3564,7 @@ static ray_t* dl_set_body_pos(dl_rule_t* rule, int bidx, int pos,
         return NULL;
     }
     if (node->type == -RAY_I64) {
-        dl_body_set_const(rule, bidx, pos, node->i64);
+        dl_body_set_const_typed(rule, bidx, pos, node->i64, RAY_I64);
         return NULL;
     }
     if (node->type == -RAY_SYM) {
@@ -3532,16 +3575,17 @@ static ray_t* dl_set_body_pos(dl_rule_t* rule, int bidx, int pos,
             vars->syms[vi] = -1 - vi;
             dl_body_set_var(rule, bidx, pos, vi);
         } else {
-            dl_body_set_const(rule, bidx, pos, node->i64);
+            dl_body_set_const_typed(rule, bidx, pos, node->i64, RAY_SYM);
         }
         return NULL;
     }
     if (node->type == -RAY_STR) {
         /* Quoted string literal in body: intern as sym so it compares
-         * equal to other sym-interned constants.  Mirrors the head
-         * parser convention. */
+         * equal to other sym-interned constants. Record the source type
+         * as RAY_STR so the row-equality helper can also try a tagged-
+         * payload compare against DATOM-encoded I64 columns. */
         int64_t sym = ray_sym_intern(ray_str_ptr(node), ray_str_len(node));
-        dl_body_set_const(rule, bidx, pos, sym);
+        dl_body_set_const_typed(rule, bidx, pos, sym, RAY_STR);
         return NULL;
     }
     /* For other forms (e.g., (quote x)), evaluate to get constant */
@@ -3549,9 +3593,9 @@ static ray_t* dl_set_body_pos(dl_rule_t* rule, int bidx, int pos,
     if (!val || RAY_IS_ERR(val))
         return val ? val : ray_error("type", "rule: cannot evaluate constant in body");
     if (val->type == -RAY_I64) {
-        dl_body_set_const(rule, bidx, pos, val->i64);
+        dl_body_set_const_typed(rule, bidx, pos, val->i64, RAY_I64);
     } else if (val->type == -RAY_SYM) {
-        dl_body_set_const(rule, bidx, pos, val->i64);
+        dl_body_set_const_typed(rule, bidx, pos, val->i64, RAY_SYM);
     } else {
         ray_release(val);
         return ray_error("type", "rule: unsupported constant type in body");
