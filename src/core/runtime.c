@@ -24,6 +24,7 @@
 #include "runtime.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
+#include "table/sym.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -355,6 +356,38 @@ bool ray_mem_pressure(void) {
     ray_mem_stats_t st;
     ray_mem_stats(&st);
     return (int64_t)(st.bytes_allocated + st.direct_bytes) > __RUNTIME->mem_budget;
+}
+
+int8_t ray_obj_type(ray_t* v) {
+    return v ? v->type : 0;
+}
+
+uint8_t ray_obj_attrs(ray_t* v) {
+    return v ? v->attrs : 0;
+}
+
+int64_t ray_vec_get_i64(ray_t* vec, int64_t idx) {
+    if (!vec || idx < 0 || idx >= vec->len) return 0;
+    if (vec->type == RAY_I64 || vec->type == RAY_DATE || vec->type == RAY_TIME || vec->type == RAY_TIMESTAMP) {
+        return ((const int64_t*)ray_data(vec))[idx];
+    }
+    if (vec->type == RAY_I32) return ((const int32_t*)ray_data(vec))[idx];
+    if (vec->type == RAY_I16) return ((const int16_t*)ray_data(vec))[idx];
+    if (vec->type == RAY_U8 || vec->type == RAY_BOOL) return ((const uint8_t*)ray_data(vec))[idx];
+    return 0;
+}
+
+double ray_vec_get_f64(ray_t* vec, int64_t idx) {
+    if (!vec || idx < 0 || idx >= vec->len) return 0.0;
+    if (vec->type == RAY_F64) return ((const double*)ray_data(vec))[idx];
+    if (vec->type == RAY_F32) return ((const float*)ray_data(vec))[idx];
+    return 0.0;
+}
+
+int64_t ray_vec_get_sym_id(ray_t* vec, int64_t idx) {
+    if (!vec || idx < 0 || idx >= vec->len) return 0;
+    if (vec->type != RAY_SYM) return 0;
+    return ray_read_sym(ray_data(vec), idx, vec->type, vec->attrs);
 }
 
 void ray_runtime_destroy(ray_runtime_t* rt) {

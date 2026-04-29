@@ -205,6 +205,14 @@ static inline void* ray_data_fn(ray_t* v) {
 #define ray_slice_data(v) ray_data_fn(v)  /* alias — ray_data is always slice-safe */
 #define ray_data(v)       ray_data_fn(v)
 
+/* ===== Introspection helpers (FFI-safe access for foreign consumers) ===== */
+
+int8_t   ray_obj_type(ray_t* v);
+uint8_t  ray_obj_attrs(ray_t* v);
+int64_t  ray_vec_get_i64(ray_t* vec, int64_t idx);
+double   ray_vec_get_f64(ray_t* vec, int64_t idx);
+int64_t  ray_vec_get_sym_id(ray_t* vec, int64_t idx);
+
 /* ===== Memory Allocator API ===== */
 
 ray_t*    ray_alloc(size_t data_size);
