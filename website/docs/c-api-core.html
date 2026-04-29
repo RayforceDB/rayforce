@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Core C API — Rayforce Documentation</title>
+  <meta name="description" content="Rayforce Core C API reference: lifecycle, memory, atoms, vectors, string vectors, lists, tables, and error handling.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link active">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Core C API</span>
+      </div>
+
+      <h1>Core C API Reference</h1>
+      <p class="page-subtitle">Lifecycle, memory management, atoms, vectors, string vectors, lists, tables, and error handling. All functions are declared in <code>include/rayforce.h</code>.</p>
+
+      <div class="info-box">
+        <strong>Single header.</strong> Include <code>&lt;rayforce.h&gt;</code> to access the entire public API. Link against <code>librayforce.a</code> (static) or <code>librayforce.so</code> (shared). No external dependencies.
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="lifecycle">Lifecycle</h2>
+      <p>Every program must initialize the heap allocator and symbol table before using any other API. Destroy them in reverse order when done.</p>
+
+      <h3 id="ray-heap-init">ray_heap_init</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_heap_init</span>
+        </div>
+        <div class="fn-desc">Initializes the thread-local buddy allocator, slab cache, and memory subsystem. Must be called once per thread before any allocation. The main thread must call this before any other Rayforce function.</div>
+        <div class="fn-example">
+<span class="hl-type">void</span> <span class="hl-fn">ray_heap_init</span>(<span class="hl-type">void</span>);
+        </div>
+      </div>
+
+      <h3 id="ray-heap-destroy">ray_heap_destroy</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_heap_destroy</span>
+        </div>
+        <div class="fn-desc">Tears down the thread-local heap, releasing all buddy blocks and slab caches back to the OS. Call once per thread at shutdown, after releasing all <code>ray_t</code> objects.</div>
+        <div class="fn-example">
+<span class="hl-type">void</span> <span class="hl-fn">ray_heap_destroy</span>(<span class="hl-type">void</span>);
+        </div>
+      </div>
+
+      <h3 id="ray-sym-init">ray_sym_init</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_sym_init</span>
+        </div>
+        <div class="fn-desc">Initializes the global symbol intern table. Must be called after <code>ray_heap_init()</code> and before interning any symbols, loading CSV files, or creating tables with symbol columns. Returns <code>RAY_OK</code> on success.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_err_t</span> <span class="hl-fn">ray_sym_init</span>(<span class="hl-type">void</span>);
+        </div>
+      </div>
+
+      <h3 id="ray-sym-destroy">ray_sym_destroy</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_sym_destroy</span>
+        </div>
+        <div class="fn-desc">Frees the global symbol intern table and its arena-backed storage. Call at shutdown, before <code>ray_heap_destroy()</code>.</div>
+        <div class="fn-example">
+<span class="hl-type">void</span> <span class="hl-fn">ray_sym_destroy</span>(<span class="hl-type">void</span>);
+        </div>
+      </div>
+
+      <h4>Typical lifecycle pattern</h4>
+      <pre><code><span class="hl-kw">#include</span> <span class="hl-str">&lt;rayforce.h&gt;</span>
+
+<span class="hl-type">int</span> <span class="hl-fn">main</span>(<span class="hl-type">void</span>) {
+    <span class="hl-fn">ray_heap_init</span>();
+    <span class="hl-fn">ray_sym_init</span>();
+
+    <span class="hl-comment">/* ... use Rayforce API ... */</span>
+
+    <span class="hl-fn">ray_sym_destroy</span>();
+    <span class="hl-fn">ray_heap_destroy</span>();
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="memory">Memory Management</h2>
+      <p>Rayforce uses its own buddy allocator with slab cache. Never use <code>malloc</code>/<code>free</code> for <code>ray_t</code> objects. All objects use COW (copy-on-write) ref counting for safe sharing.</p>
+
+      <h3 id="ray-alloc">ray_alloc</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_alloc</span>
+        </div>
+        <div class="fn-desc">Allocates a <code>ray_t</code> block with at least <code>data_size</code> bytes of data space (beyond the 32-byte header). Uses the slab cache for common sizes, buddy allocator for larger blocks. The returned block has <code>rc = 1</code>. Returns <code>NULL</code> on OOM.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_alloc</span>(<span class="hl-type">size_t</span> data_size);
+        </div>
+      </div>
+
+      <h3 id="ray-free">ray_free</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_free</span>
+        </div>
+        <div class="fn-desc">Returns a <code>ray_t</code> block to the allocator. Supports cross-thread free: blocks freed from a non-owning thread are enqueued to a lock-free LIFO and reclaimed when the owning heap flushes foreign blocks. Do not call directly on shared objects &mdash; use <code>ray_release()</code> instead.</div>
+        <div class="fn-example">
+<span class="hl-type">void</span> <span class="hl-fn">ray_free</span>(<span class="hl-type">ray_t</span>* v);
+        </div>
+      </div>
+
+      <h3 id="ray-retain">ray_retain</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_retain</span>
+        </div>
+        <div class="fn-desc">Increments the reference count of a <code>ray_t</code> object. Call when storing an additional reference to an object (e.g., adding a column to a table while keeping the original pointer).</div>
+        <div class="fn-example">
+<span class="hl-type">void</span> <span class="hl-fn">ray_retain</span>(<span class="hl-type">ray_t</span>* v);
+        </div>
+      </div>
+
+      <h3 id="ray-release">ray_release</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_release</span>
+        </div>
+        <div class="fn-desc">Decrements the reference count. When <code>rc</code> reaches zero, the object and any owned children are freed. This is the primary way to dispose of <code>ray_t</code> objects. Safe to call on <code>NULL</code>.</div>
+        <div class="fn-example">
+<span class="hl-type">void</span> <span class="hl-fn">ray_release</span>(<span class="hl-type">ray_t</span>* v);
+        </div>
+      </div>
+
+      <h3 id="ray-cow">ray_cow</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_cow</span>
+        </div>
+        <div class="fn-desc">Copy-on-write: if <code>v</code> is the sole owner (<code>rc == 1</code>), returns <code>v</code> unchanged. Otherwise, creates a deep copy and returns it with <code>rc = 1</code>. The original is not modified. After <code>ray_cow()</code>, if the returned pointer differs from the original, the caller must release it on error paths.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_cow</span>(<span class="hl-type">ray_t</span>* v);
+        </div>
+      </div>
+
+      <h4>COW pattern</h4>
+      <pre><code><span class="hl-type">ray_t</span>* original = <span class="hl-fn">ray_vec_new</span>(<span class="hl-num">RAY_I64</span>, <span class="hl-num">100</span>);
+<span class="hl-fn">ray_retain</span>(original);  <span class="hl-comment">/* rc = 2: shared */</span>
+
+<span class="hl-type">ray_t</span>* writable = <span class="hl-fn">ray_cow</span>(original);
+<span class="hl-comment">/* writable != original (copy was made because rc > 1) */</span>
+<span class="hl-comment">/* Now safe to mutate writable without affecting original */</span>
+
+<span class="hl-comment">/* On error paths, release the copy: */</span>
+<span class="hl-kw">if</span> (writable != original) <span class="hl-fn">ray_release</span>(writable);</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="atoms">Atom Constructors</h2>
+      <p>Atoms are scalar values stored in the <code>ray_t</code> header (no trailing data). Each constructor returns a heap-allocated <code>ray_t*</code> with <code>rc = 1</code> and a negative <code>type</code> field indicating an atom.</p>
+
+      <h3 id="ray-bool">ray_bool</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_bool</span>
+        </div>
+        <div class="fn-desc">Creates a boolean atom. The value is stored in the <code>b8</code> field of the header.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_bool</span>(<span class="hl-type">bool</span> val);
+        </div>
+      </div>
+
+      <h3 id="ray-u8">ray_u8</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_u8</span>
+        </div>
+        <div class="fn-desc">Creates an unsigned 8-bit integer atom.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_u8</span>(<span class="hl-type">uint8_t</span> val);
+        </div>
+      </div>
+
+      <h3 id="ray-i16">ray_i16</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_i16</span>
+        </div>
+        <div class="fn-desc">Creates a signed 16-bit integer atom.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_i16</span>(<span class="hl-type">int16_t</span> val);
+        </div>
+      </div>
+
+      <h3 id="ray-i32">ray_i32</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_i32</span>
+        </div>
+        <div class="fn-desc">Creates a signed 32-bit integer atom.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_i32</span>(<span class="hl-type">int32_t</span> val);
+        </div>
+      </div>
+
+      <h3 id="ray-i64">ray_i64</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_i64</span>
+        </div>
+        <div class="fn-desc">Creates a signed 64-bit integer atom. Also used for symbol IDs, dates, times, and timestamps internally.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_i64</span>(<span class="hl-type">int64_t</span> val);
+        </div>
+      </div>
+
+      <h3 id="ray-f64">ray_f64</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_f64</span>
+        </div>
+        <div class="fn-desc">Creates a 64-bit floating-point atom.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_f64</span>(<span class="hl-type">double</span> val);
+        </div>
+      </div>
+
+      <h3 id="ray-str-atom">ray_str</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_str</span>
+        </div>
+        <div class="fn-desc">Creates a string atom. Strings of 7 bytes or fewer are stored inline (SSO in the header). Longer strings allocate a child block. The string is copied; the caller retains ownership of <code>s</code>.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_str</span>(<span class="hl-kw">const</span> <span class="hl-type">char</span>* s, <span class="hl-type">size_t</span> len);
+        </div>
+      </div>
+
+      <h3 id="ray-sym-atom">ray_sym</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_sym</span>
+        </div>
+        <div class="fn-desc">Creates a symbol atom from an intern table ID. Use <code>ray_sym_intern()</code> to get the ID first. The symbol references the global intern table; the atom itself stores only the integer ID.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_sym</span>(<span class="hl-type">int64_t</span> id);
+
+<span class="hl-comment">/* Usage: */</span>
+<span class="hl-type">int64_t</span> id = <span class="hl-fn">ray_sym_intern</span>(<span class="hl-str">"hello"</span>, <span class="hl-num">5</span>);
+<span class="hl-type">ray_t</span>* s = <span class="hl-fn">ray_sym</span>(id);
+        </div>
+      </div>
+
+      <h3 id="ray-date">ray_date</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_date</span>
+        </div>
+        <div class="fn-desc">Creates a date atom. The value is an integer representing days since epoch (2000-01-01).</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_date</span>(<span class="hl-type">int64_t</span> val);
+        </div>
+      </div>
+
+      <h3 id="ray-time">ray_time</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_time</span>
+        </div>
+        <div class="fn-desc">Creates a time atom. The value is nanoseconds since midnight.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_time</span>(<span class="hl-type">int64_t</span> val);
+        </div>
+      </div>
+
+      <h3 id="ray-timestamp">ray_timestamp</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_timestamp</span>
+        </div>
+        <div class="fn-desc">Creates a timestamp atom. The value is nanoseconds since epoch.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_timestamp</span>(<span class="hl-type">int64_t</span> val);
+        </div>
+      </div>
+
+      <h3 id="ray-guid">ray_guid</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_guid</span>
+        </div>
+        <div class="fn-desc">Creates a 128-bit GUID atom from a 16-byte array.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_guid</span>(<span class="hl-kw">const</span> <span class="hl-type">uint8_t</span>* bytes);
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="vectors">Vector API</h2>
+      <p>Vectors are the fundamental columnar container. Each vector has a typed element array following the 32-byte header. All vector operations process data in 1024-element morsels.</p>
+
+      <h3 id="ray-vec-new">ray_vec_new</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_vec_new</span>
+        </div>
+        <div class="fn-desc">Creates an empty vector with the given element type and initial capacity. The vector length is 0; capacity determines pre-allocated space to avoid reallocation during appends.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_vec_new</span>(<span class="hl-type">int8_t</span> type, <span class="hl-type">int64_t</span> capacity);
+
+<span class="hl-comment">/* Create a 64-bit integer vector with room for 1000 elements */</span>
+<span class="hl-type">ray_t</span>* v = <span class="hl-fn">ray_vec_new</span>(<span class="hl-num">RAY_I64</span>, <span class="hl-num">1000</span>);
+        </div>
+      </div>
+
+      <h3 id="ray-vec-append">ray_vec_append</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_vec_append</span>
+        </div>
+        <div class="fn-desc">Appends a single element to the end of the vector. The <code>elem</code> pointer must point to a value of the correct type and size. May reallocate if capacity is exceeded, returning a new pointer. The old pointer may be invalidated.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_vec_append</span>(<span class="hl-type">ray_t</span>* vec, <span class="hl-kw">const</span> <span class="hl-type">void</span>* elem);
+
+<span class="hl-type">int64_t</span> val = <span class="hl-num">42</span>;
+v = <span class="hl-fn">ray_vec_append</span>(v, &amp;val);  <span class="hl-comment">/* always reassign! */</span>
+        </div>
+      </div>
+
+      <h3 id="ray-vec-set">ray_vec_set</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_vec_set</span>
+        </div>
+        <div class="fn-desc">Sets the element at index <code>idx</code>. The index must be in range <code>[0, len)</code>. Uses COW internally: if the vector is shared (<code>rc &gt; 1</code>), a copy is made first. Returns the (possibly new) vector pointer.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_vec_set</span>(<span class="hl-type">ray_t</span>* vec, <span class="hl-type">int64_t</span> idx, <span class="hl-kw">const</span> <span class="hl-type">void</span>* elem);
+        </div>
+      </div>
+
+      <h3 id="ray-vec-get">ray_vec_get</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_vec_get</span>
+        </div>
+        <div class="fn-desc">Returns a pointer to the element at index <code>idx</code>. The returned pointer is valid until the vector is reallocated or freed. Returns <code>NULL</code> if <code>idx</code> is out of range.</div>
+        <div class="fn-example">
+<span class="hl-type">void</span>* <span class="hl-fn">ray_vec_get</span>(<span class="hl-type">ray_t</span>* vec, <span class="hl-type">int64_t</span> idx);
+
+<span class="hl-type">int64_t</span>* p = (<span class="hl-type">int64_t</span>*)<span class="hl-fn">ray_vec_get</span>(v, <span class="hl-num">0</span>);
+<span class="hl-kw">if</span> (p) printf(<span class="hl-str">"%lld\n"</span>, *p);
+        </div>
+      </div>
+
+      <h3 id="ray-vec-slice">ray_vec_slice</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_vec_slice</span>
+        </div>
+        <div class="fn-desc">Creates a zero-copy slice referencing the original vector's data from <code>offset</code> to <code>offset + len</code>. The slice retains the parent (incrementing its <code>rc</code>), so the parent must not be freed while the slice exists. Mutations require COW.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_vec_slice</span>(<span class="hl-type">ray_t</span>* vec, <span class="hl-type">int64_t</span> offset, <span class="hl-type">int64_t</span> len);
+
+<span class="hl-comment">/* Zero-copy view of elements [10..20) */</span>
+<span class="hl-type">ray_t</span>* s = <span class="hl-fn">ray_vec_slice</span>(v, <span class="hl-num">10</span>, <span class="hl-num">10</span>);
+        </div>
+      </div>
+
+      <h3 id="ray-vec-concat">ray_vec_concat</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_vec_concat</span>
+        </div>
+        <div class="fn-desc">Creates a new vector containing all elements of <code>a</code> followed by all elements of <code>b</code>. Both vectors must have the same type. Returns a new vector with <code>rc = 1</code>.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_vec_concat</span>(<span class="hl-type">ray_t</span>* a, <span class="hl-type">ray_t</span>* b);
+        </div>
+      </div>
+
+      <h3 id="ray-vec-from-raw">ray_vec_from_raw</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_vec_from_raw</span>
+        </div>
+        <div class="fn-desc">Creates a vector by copying <code>count</code> elements from a raw C array. The data is copied; the caller retains ownership of the source array.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_vec_from_raw</span>(<span class="hl-type">int8_t</span> type, <span class="hl-kw">const</span> <span class="hl-type">void</span>* data, <span class="hl-type">int64_t</span> count);
+
+<span class="hl-type">int64_t</span> vals[] = {<span class="hl-num">10</span>, <span class="hl-num">20</span>, <span class="hl-num">30</span>};
+<span class="hl-type">ray_t</span>* v = <span class="hl-fn">ray_vec_from_raw</span>(<span class="hl-num">RAY_I64</span>, vals, <span class="hl-num">3</span>);
+        </div>
+      </div>
+
+      <h4>Null bitmap operations</h4>
+      <pre><code><span class="hl-comment">/* Set element at index 5 as null */</span>
+<span class="hl-fn">ray_vec_set_null</span>(vec, <span class="hl-num">5</span>, <span class="hl-bool">true</span>);
+
+<span class="hl-comment">/* Check if element is null */</span>
+<span class="hl-kw">if</span> (<span class="hl-fn">ray_vec_is_null</span>(vec, <span class="hl-num">5</span>)) { <span class="hl-comment">/* ... */</span> }
+
+<span class="hl-comment">/* Checked version returns RAY_ERR_RANGE on out-of-bounds */</span>
+<span class="hl-type">ray_err_t</span> err = <span class="hl-fn">ray_vec_set_null_checked</span>(vec, idx, <span class="hl-bool">true</span>);</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="string-vectors">String Vector API</h2>
+      <p>RAY_STR vectors have a specialized API because elements are variable-length. These functions handle the SSO/pool layout transparently.</p>
+
+      <h3 id="ray-str-vec-append">ray_str_vec_append</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_str_vec_append</span>
+        </div>
+        <div class="fn-desc">Appends a string to a RAY_STR vector. Strings of 12 bytes or fewer are stored inline; longer strings are written to the per-vector pool. May reallocate the vector and/or pool. Always reassign the return value.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_str_vec_append</span>(<span class="hl-type">ray_t</span>* vec, <span class="hl-kw">const</span> <span class="hl-type">char</span>* s, <span class="hl-type">size_t</span> len);
+
+<span class="hl-type">ray_t</span>* v = <span class="hl-fn">ray_vec_new</span>(<span class="hl-num">RAY_STR</span>, <span class="hl-num">100</span>);
+v = <span class="hl-fn">ray_str_vec_append</span>(v, <span class="hl-str">"hello"</span>, <span class="hl-num">5</span>);
+v = <span class="hl-fn">ray_str_vec_append</span>(v, <span class="hl-str">"a longer string here"</span>, <span class="hl-num">20</span>);
+        </div>
+      </div>
+
+      <h3 id="ray-str-vec-get">ray_str_vec_get</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_str_vec_get</span>
+        </div>
+        <div class="fn-desc">Returns a pointer to the string data at index <code>idx</code> and writes the length to <code>*out_len</code>. The returned pointer is valid until the vector is modified. Returns <code>NULL</code> if the element is null or index is out of range. The string is not null-terminated.</div>
+        <div class="fn-example">
+<span class="hl-kw">const</span> <span class="hl-type">char</span>* <span class="hl-fn">ray_str_vec_get</span>(<span class="hl-type">ray_t</span>* vec, <span class="hl-type">int64_t</span> idx, <span class="hl-type">size_t</span>* out_len);
+
+<span class="hl-type">size_t</span> len;
+<span class="hl-kw">const</span> <span class="hl-type">char</span>* s = <span class="hl-fn">ray_str_vec_get</span>(v, <span class="hl-num">0</span>, &amp;len);
+<span class="hl-kw">if</span> (s) printf(<span class="hl-str">"%.*s\n"</span>, (<span class="hl-type">int</span>)len, s);
+        </div>
+      </div>
+
+      <h3 id="ray-str-vec-set">ray_str_vec_set</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_str_vec_set</span>
+        </div>
+        <div class="fn-desc">Replaces the string at index <code>idx</code>. Uses COW if the vector is shared. The old pool data is not reclaimed immediately; use <code>ray_str_vec_compact()</code> to reclaim unused pool space.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_str_vec_set</span>(<span class="hl-type">ray_t</span>* vec, <span class="hl-type">int64_t</span> idx, <span class="hl-kw">const</span> <span class="hl-type">char</span>* s, <span class="hl-type">size_t</span> len);
+        </div>
+      </div>
+
+      <h3 id="ray-str-vec-compact">ray_str_vec_compact</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_str_vec_compact</span>
+        </div>
+        <div class="fn-desc">Rebuilds the string pool, removing unreferenced data and compacting live strings. Use after many <code>ray_str_vec_set()</code> calls that leave dead pool entries.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_str_vec_compact</span>(<span class="hl-type">ray_t</span>* vec);
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="lists">List API</h2>
+      <p>Lists are heterogeneous containers holding <code>ray_t*</code> pointers. Used for table column lists, function argument lists, and mixed-type collections.</p>
+
+      <h3 id="ray-list-new">ray_list_new</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_list_new</span>
+        </div>
+        <div class="fn-desc">Creates an empty list with initial capacity for <code>capacity</code> items.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_list_new</span>(<span class="hl-type">int64_t</span> capacity);
+        </div>
+      </div>
+
+      <h3 id="ray-list-append">ray_list_append</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_list_append</span>
+        </div>
+        <div class="fn-desc">Appends an item to the list. The item is retained (rc incremented). May reallocate, so always reassign the return value.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_list_append</span>(<span class="hl-type">ray_t</span>* list, <span class="hl-type">ray_t</span>* item);
+        </div>
+      </div>
+
+      <h3 id="ray-list-get">ray_list_get</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_list_get</span>
+        </div>
+        <div class="fn-desc">Returns the item at index <code>idx</code>. Does not increment the reference count. Returns <code>NULL</code> if out of range.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_list_get</span>(<span class="hl-type">ray_t</span>* list, <span class="hl-type">int64_t</span> idx);
+        </div>
+      </div>
+
+      <h3 id="ray-list-set">ray_list_set</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_list_set</span>
+        </div>
+        <div class="fn-desc">Replaces the item at index <code>idx</code>. The old item is released and the new item is retained.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_list_set</span>(<span class="hl-type">ray_t</span>* list, <span class="hl-type">int64_t</span> idx, <span class="hl-type">ray_t</span>* item);
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="tables">Table API</h2>
+      <p>Tables are the primary data structure: a list of named columns (vectors) with a shared row count. Column names are symbol IDs from the global intern table.</p>
+
+      <h3 id="ray-table-new">ray_table_new</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_table_new</span>
+        </div>
+        <div class="fn-desc">Creates an empty table with capacity for <code>ncols</code> columns. Columns are added with <code>ray_table_add_col()</code>.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_table_new</span>(<span class="hl-type">int64_t</span> ncols);
+        </div>
+      </div>
+
+      <h3 id="ray-table-add-col">ray_table_add_col</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_table_add_col</span>
+        </div>
+        <div class="fn-desc">Adds a named column to the table. The <code>name_id</code> is a symbol ID (from <code>ray_sym_intern()</code>). The column vector is retained. Returns the table pointer (may reallocate).</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_table_add_col</span>(<span class="hl-type">ray_t</span>* tbl, <span class="hl-type">int64_t</span> name_id, <span class="hl-type">ray_t</span>* col_vec);
+
+<span class="hl-type">int64_t</span> name = <span class="hl-fn">ray_sym_intern</span>(<span class="hl-str">"price"</span>, <span class="hl-num">5</span>);
+tbl = <span class="hl-fn">ray_table_add_col</span>(tbl, name, price_vec);
+        </div>
+      </div>
+
+      <h3 id="ray-table-get-col">ray_table_get_col</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_table_get_col</span>
+        </div>
+        <div class="fn-desc">Looks up a column by symbol ID. Returns the column vector or <code>NULL</code> if not found. Does not increment the reference count.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_table_get_col</span>(<span class="hl-type">ray_t</span>* tbl, <span class="hl-type">int64_t</span> name_id);
+        </div>
+      </div>
+
+      <h3 id="ray-table-ncols">ray_table_ncols</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_table_ncols</span>
+        </div>
+        <div class="fn-desc">Returns the number of columns in the table.</div>
+        <div class="fn-example">
+<span class="hl-type">int64_t</span> <span class="hl-fn">ray_table_ncols</span>(<span class="hl-type">ray_t</span>* tbl);
+        </div>
+      </div>
+
+      <h3 id="ray-table-nrows">ray_table_nrows</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_table_nrows</span>
+        </div>
+        <div class="fn-desc">Returns the number of rows (length of the first column). Returns 0 if the table has no columns.</div>
+        <div class="fn-example">
+<span class="hl-type">int64_t</span> <span class="hl-fn">ray_table_nrows</span>(<span class="hl-type">ray_t</span>* tbl);
+        </div>
+      </div>
+
+      <h4>Complete table example</h4>
+      <pre><code><span class="hl-fn">ray_heap_init</span>();
+<span class="hl-fn">ray_sym_init</span>();
+
+<span class="hl-comment">/* Create a 3-column table */</span>
+<span class="hl-type">ray_t</span>* ids    = <span class="hl-fn">ray_vec_from_raw</span>(<span class="hl-num">RAY_I64</span>, (<span class="hl-type">int64_t</span>[]){<span class="hl-num">1</span>, <span class="hl-num">2</span>, <span class="hl-num">3</span>}, <span class="hl-num">3</span>);
+<span class="hl-type">ray_t</span>* prices = <span class="hl-fn">ray_vec_from_raw</span>(<span class="hl-num">RAY_F64</span>, (<span class="hl-type">double</span>[]){<span class="hl-num">9.99</span>, <span class="hl-num">19.99</span>, <span class="hl-num">29.99</span>}, <span class="hl-num">3</span>);
+
+<span class="hl-type">ray_t</span>* names = <span class="hl-fn">ray_vec_new</span>(<span class="hl-num">RAY_STR</span>, <span class="hl-num">3</span>);
+names = <span class="hl-fn">ray_str_vec_append</span>(names, <span class="hl-str">"Widget"</span>, <span class="hl-num">6</span>);
+names = <span class="hl-fn">ray_str_vec_append</span>(names, <span class="hl-str">"Gadget"</span>, <span class="hl-num">6</span>);
+names = <span class="hl-fn">ray_str_vec_append</span>(names, <span class="hl-str">"Doohickey"</span>, <span class="hl-num">9</span>);
+
+<span class="hl-type">ray_t</span>* tbl = <span class="hl-fn">ray_table_new</span>(<span class="hl-num">3</span>);
+tbl = <span class="hl-fn">ray_table_add_col</span>(tbl, <span class="hl-fn">ray_sym_intern</span>(<span class="hl-str">"id"</span>, <span class="hl-num">2</span>), ids);
+tbl = <span class="hl-fn">ray_table_add_col</span>(tbl, <span class="hl-fn">ray_sym_intern</span>(<span class="hl-str">"price"</span>, <span class="hl-num">5</span>), prices);
+tbl = <span class="hl-fn">ray_table_add_col</span>(tbl, <span class="hl-fn">ray_sym_intern</span>(<span class="hl-str">"name"</span>, <span class="hl-num">4</span>), names);
+
+printf(<span class="hl-str">"cols: %lld, rows: %lld\n"</span>,
+       <span class="hl-fn">ray_table_ncols</span>(tbl), <span class="hl-fn">ray_table_nrows</span>(tbl));
+<span class="hl-comment">/* Output: cols: 3, rows: 3 */</span>
+
+<span class="hl-fn">ray_release</span>(ids);
+<span class="hl-fn">ray_release</span>(prices);
+<span class="hl-fn">ray_release</span>(names);
+<span class="hl-fn">ray_release</span>(tbl);
+
+<span class="hl-fn">ray_sym_destroy</span>();
+<span class="hl-fn">ray_heap_destroy</span>();</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="errors">Error Handling</h2>
+      <p>Rayforce uses two error mechanisms: <code>ray_err_t</code> enum return codes for non-pointer functions, and error objects (<code>RAY_ERROR</code>) for pointer-returning functions.</p>
+
+      <h3 id="ray-error">ray_error</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_error</span>
+        </div>
+        <div class="fn-desc">Creates an error object with an 8-byte packed ASCII code and a formatted message. The error object is a <code>ray_t</code> with <code>type == RAY_ERROR</code>. Use <code>RAY_IS_ERR()</code> to test return values.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_error</span>(<span class="hl-kw">const</span> <span class="hl-type">char</span>* code, <span class="hl-kw">const</span> <span class="hl-type">char</span>* fmt, ...);
+
+<span class="hl-comment">/* Create a type error */</span>
+<span class="hl-kw">return</span> <span class="hl-fn">ray_error</span>(<span class="hl-str">"type"</span>, <span class="hl-str">"expected I64, got F64"</span>);
+        </div>
+      </div>
+
+      <h3 id="ray-is-err">RAY_IS_ERR</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">RAY_IS_ERR(p)</span>
+          <span class="fn-type">macro</span>
+        </div>
+        <div class="fn-desc">Tests whether a <code>ray_t*</code> is an error object. Safe to call on <code>NULL</code>. Returns <code>true</code> if <code>p</code> is non-null and has <code>type == RAY_ERROR</code>.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* result = <span class="hl-fn">ray_execute</span>(g, root);
+<span class="hl-kw">if</span> (<span class="hl-fn">RAY_IS_ERR</span>(result)) {
+    printf(<span class="hl-str">"Error: %s\n"</span>, <span class="hl-fn">ray_err_code</span>(result));
+    <span class="hl-fn">ray_release</span>(result);
+    <span class="hl-kw">return</span> <span class="hl-num">1</span>;
+}
+        </div>
+      </div>
+
+      <h4>Error codes</h4>
+      <table>
+        <thead>
+          <tr>
+            <th>Code</th>
+            <th>Enum</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>RAY_OK</code></td><td>0</td><td>Success</td></tr>
+          <tr><td><code>RAY_ERR_OOM</code></td><td>1</td><td>Out of memory</td></tr>
+          <tr><td><code>RAY_ERR_TYPE</code></td><td>2</td><td>Type mismatch</td></tr>
+          <tr><td><code>RAY_ERR_RANGE</code></td><td>3</td><td>Index out of range</td></tr>
+          <tr><td><code>RAY_ERR_LENGTH</code></td><td>4</td><td>Length mismatch</td></tr>
+          <tr><td><code>RAY_ERR_RANK</code></td><td>5</td><td>Rank error</td></tr>
+          <tr><td><code>RAY_ERR_DOMAIN</code></td><td>6</td><td>Domain error (invalid value)</td></tr>
+          <tr><td><code>RAY_ERR_NYI</code></td><td>7</td><td>Not yet implemented</td></tr>
+          <tr><td><code>RAY_ERR_IO</code></td><td>8</td><td>I/O error</td></tr>
+          <tr><td><code>RAY_ERR_SCHEMA</code></td><td>9</td><td>Schema mismatch</td></tr>
+          <tr><td><code>RAY_ERR_CORRUPT</code></td><td>10</td><td>Data corruption</td></tr>
+          <tr><td><code>RAY_ERR_CANCEL</code></td><td>11</td><td>Operation cancelled</td></tr>
+          <tr><td><code>RAY_ERR_PARSE</code></td><td>12</td><td>Parse error</td></tr>
+          <tr><td><code>RAY_ERR_NAME</code></td><td>13</td><td>Name not found</td></tr>
+          <tr><td><code>RAY_ERR_LIMIT</code></td><td>14</td><td>Limit exceeded</td></tr>
+        </tbody>
+      </table>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="architecture-memory.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Memory Model</span></a>
+        <a href="c-api-dag.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">DAG &amp; Execution C API</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

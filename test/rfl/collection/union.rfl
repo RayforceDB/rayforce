@@ -1,0 +1,36 @@
+;; Invariants for `union` — distinct set combination.
+;; Current rayforce keeps A's duplicates and appends only new-from-B elements.
+;; Treat it as a weak "contains all and no extras beyond A" relation.
+
+(union [1 2 3] [3 4 5]) -- [1 2 3 4 5]
+(union [] [1 2]) -- [1 2]
+(union [1 2] []) -- [1 2]
+(union [1 2 3] [1 2 3]) -- [1 2 3]
+
+;; every element of A is in union(A,B)
+(set A [10 20 30])
+(set B [40 50])
+(count A) -- (sum (in A (union A B)))
+
+;; every element of B is in union(A,B)
+(count B) -- (sum (in B (union A B)))
+
+;; count is between distinct(A ++ B) and count(A) + count(B)
+1 -- (as 'I64 (>= (count (union A B)) (count (distinct (concat A B)))))
+1 -- (as 'I64 (<= (count (union A B)) (+ (count A) (count B))))
+
+;; ────────────── per-type — exercises type switch in ray_union_fn ──────────────
+(union ['a 'b] ['b 'c])              -- ['a 'b 'c]
+(union [1.0 2.0 3.0] [3.0 4.0])      -- [1.0 2.0 3.0 4.0]
+(union [1h 2h 3h] [3h 4h])           -- [1h 2h 3h 4h]
+(union [1i 2i] [2i 3i])              -- [1i 2i 3i]
+(union ["a" "b"] ["b" "c"])          -- ["a" "b" "c"]
+(union [2024.01.01 2024.01.02] [2024.01.02 2024.01.03]) -- [2024.01.01 2024.01.02 2024.01.03]
+(union [true false] [false])         -- [true false]
+
+;; ────────────── boxed-list path: (list ...) instead of [...] ──────────────
+;; Triggers the heterogeneous-list branch in ray_union_fn that the
+;; vec-path doesn't reach.
+(union (list 1 'a "x") (list 'a 2 "y")) -- (list 1 'a "x" 2 "y")
+(union (list 1 2 3) (list 1 2 3))       -- (list 1 2 3)
+(union (list) (list 1 2))               -- (list 1 2)

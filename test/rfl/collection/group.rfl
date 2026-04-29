@@ -1,0 +1,148 @@
+;; Invariants for `group` — dict from distinct value to list of indices.
+
+;; concrete: [1 2 1 3 2] yields buckets of sizes [2, 2, 1]
+(set G (group [1 2 1 3 2]))
+(count (key G)) -- 3
+(count (value G)) -- 3
+(at (value G) 0) -- [0 2]
+(at (value G) 1) -- [1 4]
+(at (value G) 2) -- [3]
+
+;; sum of bucket-lengths == count of input
+(set V (rand 100 10))
+(count V) -- (sum (map count (value (group V))))
+
+;; number of buckets equals number of distinct values
+(count (distinct V)) -- (count (key (group V)))
+
+;; ---- Regression tests ported from test_lang_rf.inc::test_rf_group ----
+;; Ported from test_lang_rf.inc::test_rf_group.
+
+;; ========== BASIC GROUP ==========
+(group [a a b b c]) -- {a:[0 1] b:[2 3] c:[4]}
+(group [1 1 2 2 3]) -- {1:[0 1] 2:[2 3] 3:[4]}
+(group [true false true false]) -- {true:[0 2] false:[1 3]}
+;; ========== GROUP ON EMPTY ==========
+(group []) -- {}
+;; ========== GROUP WITH UNIQUE VALUES ==========
+(group [a b c]) -- {a:[0] b:[1] c:[2]}
+;; ========== SELECT WITH BY (GROUPBY) ==========
+(set t (table [Category Value] (list [a a b b] [10 20 30 40])))(select {from: t Sum: (sum Value) by: Category}) -- (table [Category Sum] (list [a b] [30 70]))
+(set t (table [Category Value] (list [a a b b] [10 20 30 40])))(select {from: t Count: (count Value) by: Category}) -- (table [Category Count] (list [a b] [2 2]))
+;; ========== UPDATE WITH BY ==========
+(set t (table [Group Value] (list [a a b b] [10 20 30 40])))(update {from: 't GroupSum: (sum Value) by: Group})t -- (table [Group Value GroupSum] (list [a a b b] [10 20 30 40] [30 30 70 70]))
+;; ========== GROUP BY BOOL ==========
+(set t (table [Flag Value] (list [true false true false] [10 20 30 40])))(select {from: t Sum: (sum Value) by: Flag}) -- (table [Flag Sum] (list [true false] [40 60]))
+;; ========== GROUP BY GUID — DAG wide-key path ==========
+;; Before the row-indirection fix in the HT layout, RAY_GUID keys
+;; were unsupported in the DAG group path (nyi) and fell back to
+;; the O(N²) eval-level scanner.  Now 16-byte keys pack a source
+;; row index into the 8-byte slot and probe/rehash/scatter read
+;; the real bytes via the source column.  Verify:
+;;   1. correctness: count of groups, sum per group
+;;   2. round-trip: the output guid column equals the distinct
+;;      guids from the source
+;;   3. many-distinct case: 1000 distinct guids, each row unique
+(set gs2 (take (guid 2) 10))(set tg (table [G V] (list gs2 (as 'F64 (til 10)))))(count (select {from: tg by: G s: (sum V)})) -- 2
+(sum (at (select {from: tg by: G s: (sum V)}) 's)) -- 45.0
+(set tg3 (table [G V] (list (take (guid 3) 30) (as 'F64 (til 30)))))(set rg3 (select {from: tg3 by: G s: (sum V)}))(count rg3) -- 3
+(sum (at rg3 's)) -- 435.0
+;; 0+1+...+29
+;; 1000-distinct case: hash table grows multiple times, exercises
+;; rehash of wide keys.
+(set tg4 (table [G V] (list (guid 1000) (as 'F64 (til 1000)))))(count (select {from: tg4 by: G s: (sum V)})) -- 1000
+;; Non-agg expression by GUID: the post-DAG non-agg scatter can't
+;; pack 16 bytes into its 8-byte KEY_READ slot, so query.c must
+;; route GUID+non_agg back to the eval-level grouper.  Pure-agg
+;; queries still get the parallel DAG path.
+(set tg5 (table [G V] (list (take (guid 2) 6) (as 'F64 (til 6)))))(count (select {from: tg5 by: G x: (+ V 100)})) -- 2
+(set tg6 (table [G V] (list (take (guid 2) 6) (as 'F64 (til 6)))))(count (select {from: tg6 by: G})) -- 2
+;; Mixed agg + non-agg still resolves via eval path.
+(set tg7 (table [G V] (list (take (guid 2) 6) (as 'F64 (til 6)))))(count (select {from: tg7 by: G s: (sum V) x: (+ V 100)})) -- 2
+;; Regression: the emitted GUID key column must contain the actual
+;; source guid bytes, not a byte-counter or whatever ray_alloc
+;; happened to leave in the output buffer.  Previously the
+;; sequential_fallback small-n path wrote GUID keys through
+;; write_col_i64, which has no RAY_GUID branch — small queries
+;; silently produced garbage guids that displayed as
+;; "00010203-0405-0607-0809-0a0b0c0d0e0f" etc.
+(set gs8 (guid 3))(set tg8 (table [G V] (list gs8 (as 'F64 (til 3)))))(set rg8 (select {from: tg8 by: G s: (sum V)}))(count rg8) -- 3
+;; Each result guid must equal one of the source guids.  Verify by
+;; sum-testing the equality bitmap: every row in the join should
+;; match exactly one source row.
+(set gs9 (guid 4))(set tg9 (table [G V] (list gs9 (as 'F64 (til 4)))))(set rg9 (select {from: tg9 by: G s: (sum V)}))(sum (as 'I64 (== (asc (at rg9 'G)) (asc gs9)))) -- 4
+;; Also verify at a scale that forces the parallel DAG phase-3
+;; scatter path (not the small-n sequential_fallback).
+(set gs10 (guid 100))(set tg10 (table [G V] (list gs10 (as 'F64 (til 100)))))(set rg10 (select {from: tg10 by: G s: (sum V)}))(sum (as 'I64 (== (asc (at rg10 'G)) (asc gs10)))) -- 100
+;; Dict-form by-clause: {o: OrderId b: Symbol} should produce a
+;; multi-key group-by with result columns renamed to the dict
+;; keys.  Previously errored with "domain" because the parser
+;; emitted a RAY_LIST with DICT attrs and query.c had no branch
+;; for that shape.
+;; Cycle lengths: guids=2, syms=3, rows=6 → 6 distinct (G,S) combos
+;; (each pair appears exactly once), giving 6 groups.  Sum per
+;; group is just the Price value at that row.
+(set gsD (take (guid 2) 6))(set tD (table [G S V] (list gsD (take [A B C] 6) (as 'F64 (til 6)))))(set rD (select {from: tD by: {o: G b: S} s: (sum V)}))(count rD) -- 6
+;; Output columns must be named o, b, s — accessible via the
+;; dict keys, not the source col names.  Accessing the source
+;; col G must now fail because the column was renamed to o.
+(count (at rD 'o)) -- 6
+(count (at rD 'b)) -- 6
+(count (at rD 's)) -- 6
+;; Total of the per-combo sums equals total of the source values
+;; (0+1+2+3+4+5 = 15).
+(sum (at rD 's)) -- 15.0
+;; Trailing sort clause must be able to reference the dict-form
+;; alias (the rename has to happen BEFORE apply_sort_take, or
+;; the sort looks up a non-existent column and errors with nyi).
+(set gsE (take (guid 3) 9))(set tE (table [G V] (list gsE (as 'F64 (til 9)))))(set rE (select {from: tE by: {o: G} s: (sum V) asc: s}))(at (at rE 's) 0) -- 9.0
+;; smallest group sum first
+(at (at rE 's) 2) -- 15.0
+;; Dict-form vals can be arbitrary expressions, not just bare
+;; symbol references.  The canonical example is xbar-bucket
+;; time grouping: (select {by: {bucket: (xbar Ts 100)} ...}).
+(set tX (table [Ts V] (list [100 110 205 310 400 500] [1 2 3 4 5 6])))(set rX (select {from: tX by: {bucket: (xbar Ts 100)} s: (sum V)}))(count rX) -- 5
+(at (at rX 'bucket) 0) -- 100
+(at (at rX 'bucket) 4) -- 500
+(at (at rX 's) 0) -- 3
+;; 1 + 2
+(at (at rX 's) 1) -- 3
+;; 3    (only one row in bucket 200)
+(at (at rX 's) 2) -- 4
+;; 4
+(at (at rX 's) 3) -- 5
+;; 5
+(at (at rX 's) 4) -- 6
+;; 6
+;; Shadow protection: a dict alias that already exists as an
+;; input column would cause ray_table_add_col to append a
+;; second column with the same name; ray_table_get_col finds
+;; the original and the group-by would silently scan the
+;; wrong data.  Reject with a clear domain error.
+(set tSh (table [o G V] (list [1 2 3] [a a b] [10 20 30])))(select {from: tSh by: {o: G} s: (sum V)}) !- domain
+;; Trivial self-alias {X: X} is a no-op rename onto the column
+;; that's already there — allowed and produces the expected
+;; group-by on the existing column.
+(set tTS (table [G V] (list [a a b] [1 2 3])))(set rTS (select {from: tTS by: {G: G} s: (sum V)}))(count rTS) -- 2
+(at (at rTS 's) 0) -- 3
+;; a: 1+2
+(at (at rTS 's) 1) -- 3
+;; b: 3
+;; Duplicate dict keys: {g: A g: B} previously appended two cols
+;; both named g and silently grouped on A twice, dropping B.
+;; Reject with a domain error.
+(set tDup (table [A B V] (list [a a b b] [x y x y] [1 2 3 4])))(select {from: tDup by: {g: A g: B} s: (sum V)}) !- domain
+;; ========== GROUP BY STRING COLUMN ==========
+;; Tests for grouping by list of strings (TYPE_LIST of TYPE_C8)
+;; This tests the fix for parallel radix partitioning bug where identical strings
+;; at different memory locations were incorrectly counted as different groups
+;; Basic group by string list
+(group (list "apple" "banana" "apple" "cherry" "banana")) -- {"apple":[0 2] "banana":[1 4] "cherry":[3]}
+;; Select with group by string column
+(set t (table [Name Value] (list (list "alice" "bob" "alice" "bob") [10 20 30 40])))(select {from: t Sum: (sum Value) by: Name}) -- (table [Name Sum] (list (list "alice" "bob") [40 60]))
+;; Count by string column
+(set t (table [City Population] (list (list "NYC" "LA" "NYC" "LA" "NYC") [100 200 150 250 120])))(select {from: t Total: (sum Population) Count: (count Population) by: City}) -- (table [City Total Count] (list (list "NYC" "LA") [370 450] [3 2]))
+;; Group by string with more unique values (to test parallel partitioning)
+(set t (table [Category Amount] (list (list "cat1" "cat2" "cat3" "cat1" "cat2" "cat3" "cat1" "cat2") [10 20 30 40 50 60 70 80])))(select {from: t Sum: (sum Amount) by: Category}) -- (table [Category Sum] (list (list "cat1" "cat2" "cat3") [120 150 90]))
+;; Update with group by string
+(set t (table [Type Value] (list (list "A" "B" "A" "B") [10 20 30 40])))(update {from: 't TypeSum: (sum Value) by: Type})t -- (table [Type Value TypeSum] (list (list "A" "B" "A" "B") [10 20 30 40] [40 60 40 60]))

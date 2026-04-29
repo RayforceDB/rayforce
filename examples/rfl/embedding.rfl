@@ -1,0 +1,54 @@
+;; Embedding / vector-similarity / HNSW demo.
+;;
+;; A column of embeddings is a RAY_LIST of RAY_F32 vectors.  Distance
+;; builtins follow pgvector naming: cos-dist, l2-dist, inner-prod.
+
+;; Build a 5-row column of 3-dim vectors.
+(set vecs (list [1.0 0.0 0.0]
+                [0.0 1.0 0.0]
+                [0.0 0.0 1.0]
+                [1.0 1.0 0.0]
+                [1.0 0.0 1.0]))
+
+(println "== Direct metrics ==")
+(println "cos-dist  [1 0 0] vs [0 1 0] =" (cos-dist  [1.0 0.0 0.0] [0.0 1.0 0.0]))
+(println "l2-dist   [0 0]   vs [3 4]   =" (l2-dist   [0.0 0.0] [3.0 4.0]))
+(println "inner-prod [1 2 3] vs [4 5 6]=" (inner-prod [1.0 2.0 3.0] [4.0 5.0 6.0]))
+(println "norm      [3 4]             =" (norm      [3.0 4.0]))
+
+(println "")
+(println "== Exact KNN (brute-force) ==")
+(show (knn vecs [1.0 0.0 0.0] 3 'cosine))
+(show (knn vecs [1.0 0.0 0.0] 3 'l2))
+(show (knn vecs [1.0 0.0 0.0] 3 'ip))
+
+(println "")
+(println "== HNSW index — build, info, ann ==")
+(set idx (hnsw-build vecs 'l2 8 100))
+(println "hnsw-info:" (hnsw-info idx))
+(show (ann idx [1.0 0.0 0.0] 3))
+
+(println "")
+(println "== Persistence round-trip ==")
+(hnsw-save idx "/tmp/ray_example_idx")
+(hnsw-free idx)
+(set idx2 (hnsw-load "/tmp/ray_example_idx"))
+(println "reloaded metric:" (at (hnsw-info idx2) 'metric))
+(show (ann idx2 [1.0 0.0 0.0] 3))
+
+(println "")
+(println "== Filter-aware ANN in select (Phase 2) ==")
+(set docs (table [id score emb]
+    (list (til 5)
+          [0.9 0.2 0.8 0.1 0.7]
+          vecs)))
+(println "-- exact knn, no filter --")
+(show (select {from: docs nearest: (knn emb [1.0 0.0 0.0]) take: 3}))
+(println "-- with where filter --")
+(show (select {from: docs where: (> score 0.5)
+               nearest: (knn emb [1.0 0.0 0.0]) take: 3}))
+(println "-- ann with where filter --")
+(show (select {from: docs where: (> score 0.5)
+               nearest: (ann idx2 [1.0 0.0 0.0]) take: 3}))
+
+(hnsw-free idx2)

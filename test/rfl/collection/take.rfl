@@ -1,0 +1,142 @@
+;; Invariants for `take` — (take V N) takes first N (cyclic if N > count).
+
+(take [1 2 3 4 5] 3) -- [1 2 3]
+(take [1 2 3] 0) -- []
+(take [1 2] 5) -- [1 2 1 2 1]
+
+;; produces exactly N elements
+(set V (til 10))
+(count (take V 3)) -- 3
+(count (take V 7)) -- 7
+(count (take V 15)) -- 15
+
+;; take 0 is always empty
+(count (take V 0)) -- 0
+
+;; ---- Regression tests ported from test_lang_rf.inc::test_rf_take ----
+;; Ported from test_lang_rf.inc::test_rf_take.
+
+(take false 0h) -- []
+(type (take false 0i)) -- 'B8
+(take true 2) -- [true true]
+(take [false false true true] 3) -- [false false true]
+(take [false false true true] -3) -- [false true true]
+(take [false false true true] 5) -- [false false true true false]
+(take [false false true true] -5) -- [true false false true true]
+(take [0x00] 0h) -- []
+(type (take 0x00 0i)) -- 'U8
+(take 0x01 2) -- [0x01 0x01]
+(take [0x00 0x01 0x02 0x03] 3) -- [0x00 0x01 0x02]
+(take [0x00 0x01 0x02 0x03] -3) -- [0x01 0x02 0x03]
+(take [0x00 0x01 0x02 0x03] 5) -- [0x00 0x01 0x02 0x03 0x00]
+(take [0x00 0x01 0x02 0x03] -5) -- [0x03 0x00 0x01 0x02 0x03]
+(take "abcd" 0h) -- ""
+(type (take "abcd" 0i)) -- 'str
+(take 'a' 2) -- "aa"
+(take "abcd" 3) -- "abc"
+(take "abcd" -3) -- "bcd"
+(take "abcd" 5) -- "abcda"
+(take "abcd" -5) -- "dabcd"
+(take 1h 0h) -- []
+(type (take 1h 0i)) -- 'I16
+(take 1h 2) -- [1h 1h]
+(take [0h 1h 2h 3h] 3) -- [0h 1h 2h]
+(take [0h 1h 2h 3h] -3) -- [1h 2h 3h]
+(take [0h 1h 2h 3h] 5) -- [0h 1h 2h 3h 0h]
+(take [0h 1h 2h 3h] -5) -- [3h 0h 1h 2h 3h]
+(take 1i 0h) -- []
+(type (take 1i 0i)) -- 'I32
+(take 1i 2) -- [1i 1i]
+(take [0i 1i 2i 3i] 3) -- [0i 1i 2i]
+(take [0i 1i 2i 3i] -3) -- [1i 2i 3i]
+(take [0i 1i 2i 3i] 5) -- [0i 1i 2i 3i 0i]
+(take [0i 1i 2i 3i] -5) -- [3i 0i 1i 2i 3i]
+(take 2025.05.01 0) -- []
+(type (take 2025.05.01 0)) -- 'DATE
+(take 2025.05.01 2) -- [2025.05.01 2025.05.01]
+(take [2025.05.01 2025.05.02 2025.05.03 2025.05.04] 3) -- [2025.05.01 2025.05.02 2025.05.03]
+(take [2025.05.01 2025.05.02 2025.05.03 2025.05.04] -3) -- [2025.05.02 2025.05.03 2025.05.04]
+(take [2025.05.01 2025.05.02 2025.05.03 2025.05.04] 5) -- [2025.05.01 2025.05.02 2025.05.03 2025.05.04 2025.05.01]
+(take [2025.05.01 2025.05.02 2025.05.03 2025.05.04] -5) -- [2025.05.04 2025.05.01 2025.05.02 2025.05.03 2025.05.04]
+(take 00:00:01.000 0) -- []
+(type (take 00:00:01.000 0)) -- 'TIME
+(take 00:00:01.000 2) -- [00:00:01.000 00:00:01.000]
+(take [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000] 3) -- [00:00:01.000 00:00:02.000 00:00:03.000]
+(take [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000] -3) -- [00:00:02.000 00:00:03.000 00:00:04.000]
+(take [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000] 5) -- [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000 00:00:01.000]
+(take [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000] -5) -- [00:00:04.000 00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000]
+(take 1 0h) -- []
+(type (take 1 0i)) -- 'I64
+(take 1 2) -- [1 1]
+(take [0 1 2 3] 3) -- [0 1 2]
+(take [0 1 2 3] -3) -- [1 2 3]
+(take [0 1 2 3] 5) -- [0 1 2 3 0]
+(take [0 1 2 3] -5) -- [3 0 1 2 3]
+(take 'a 0h) -- []
+(type (take 'a 0i)) -- 'SYM
+(take 'a 2) -- ['a 'a]
+(take ['a 'b 'c 'd] 3) -- ['a 'b 'c]
+(take ['a 'b 'c 'd] -3) -- ['b 'c 'd]
+(take ['a 'b 'c 'd] 5) -- ['a 'b 'c 'd 'a]
+(take ['a 'b 'c 'd] -5) -- ['d 'a 'b 'c 'd]
+(take 2025.05.01D00:00:01.000000000 0h) -- []
+(type (take 2025.05.01D00:00:01.000000000 0i)) -- 'TIMESTAMP
+(take 2025.05.01D00:00:01.000000000 2) -- [2025.05.01D00:00:01.000000000 2025.05.01D00:00:01.000000000]
+(take [2025.05.01D01:02:03.040000000 2025.05.02D01:02:03.040000000 2025.05.03D01:02:03.040000000 2025.05.04D01:02:03.040000000] 3) -- [2025.05.01D01:02:03.040000000 2025.05.02D01:02:03.040000000 2025.05.03D01:02:03.040000000]
+(take [2025.05.01D01:02:03.040000000 2025.05.02D01:02:03.040000000 2025.05.03D01:02:03.040000000 2025.05.04D01:02:03.040000000] -3) -- [2025.05.02D01:02:03.040000000 2025.05.03D01:02:03.040000000 2025.05.04D01:02:03.040000000]
+(take [2025.05.01D01:02:03.040000000 2025.05.02D01:02:03.040000000 2025.05.03D01:02:03.040000000 2025.05.04D01:02:03.040000000] 5) -- [2025.05.01D01:02:03.040000000 2025.05.02D01:02:03.040000000 2025.05.03D01:02:03.040000000 2025.05.04D01:02:03.040000000 2025.05.01D01:02:03.040000000]
+(take [2025.05.01D01:02:03.040000000 2025.05.02D01:02:03.040000000 2025.05.03D01:02:03.040000000 2025.05.04D01:02:03.040000000] -5) -- [2025.05.04D01:02:03.040000000 2025.05.01D01:02:03.040000000 2025.05.02D01:02:03.040000000 2025.05.03D01:02:03.040000000 2025.05.04D01:02:03.040000000]
+(take 1.0 0h) -- []
+(type (take 1.0 0i)) -- 'F64
+(take 1.0 2) -- [1.0 1.0]
+(take [0.0 1.0 2.0 3.0] 3) -- [0.0 1.0 2.0]
+(take [0.0 1.0 2.0 3.0] -3) -- [1.0 2.0 3.0]
+(take [0.0 1.0 2.0 3.0] 5) -- [0.0 1.0 2.0 3.0 0.0]
+(take [0.0 1.0 2.0 3.0] -5) -- [3.0 0.0 1.0 2.0 3.0]
+(take (guid 1) 0h) -- []
+(type (take (guid 1) 0i)) -- 'GUID
+(take (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea") 2) -- [d49f18a4-1969-49e8-9b8a-6bb9a4832eea d49f18a4-1969-49e8-9b8a-6bb9a4832eea]
+(set l (guid 4)) (take l 4) -- l
+(set l (guid 4)) (take l -4) -- l
+(set l (guid 4)) (first (take l 5)) -- (first l)
+(set l (guid 4)) (first (take l -5)) -- (last l)
+;; enum tests removed — teide uses symbols directly, no enum type
+(take (list 1h 2i 3 "4") 0h) -- (list )
+(type (take (list 1h 2i 3 "4") 0i)) -- 'LIST
+(take (list 1h 2i 3 "4") 3) -- (list 1h 2i 3)
+(take (list 1h 2i 3 "4") -3) -- (list 2i 3 "4")
+(take (list 1h 2i 3 "4") 5) -- (list 1h 2i 3 "4" 1h)
+(take (list 1h 2i 3 "4") -5) -- (list "4" 1h 2i 3 "4")
+(take (dict ['a 'b 'c 'd] [1 2 3 4]) 0h) -- {}
+(type (take (dict ['a 'b 'c 'd] [1 2 3 4]) 0i)) -- 'DICT
+(take (dict ['a 'b 'c 'd] [1 2 3 4]) 3) -- (dict ['a 'b 'c] [1 2 3])
+(take (dict ['a 'b 'c 'd] [1 2 3 4]) -3) -- (dict ['b 'c 'd] [2 3 4])
+(take (dict ['a 'b 'c 'd] [1 2 3 4]) 5) -- (dict ['a 'b 'c 'd 'a] [1 2 3 4 1])
+(take (dict ['a 'b 'c 'd] [1 2 3 4]) -5) -- (dict ['d 'a 'b 'c 'd] [4 1 2 3 4])
+(take (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])) 0h) -- (table [a b] (list (as 'I64 []) (as 'SYMBOL [])))
+(type (take (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])) 0i)) -- 'TABLE
+(take (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])) 3) -- (table [a b] (list [1 2 3] ['a 'b 'c]))
+(take (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])) -3) -- (table [a b] (list [2 3 4] ['b 'c 'd]))
+(take (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])) 5) -- (table [a b] (list [1 2 3 4 1] ['a 'b 'c 'd 'a]))
+(take (table [a b] (list [1 2 3 4] ['a 'b 'c 'd])) -5) -- (table [a b] (list [4 1 2 3 4] ['d 'a 'b 'c 'd]))
+(take 1.0 2.0) !- type
+(take take 2) !- type
+;; Range take tests [start amount]
+(take [1 2 3 4 5] [1 2]) -- [2 3]
+(take [1 2 3 4 5] [0 3]) -- [1 2 3]
+(take [1 2 3 4 5] [2 10]) -- [3 4 5]
+;; amount exceeds length
+(take [1 2 3 4 5] [-2 2]) -- [4 5]
+;; negative start
+(take [1 2 3 4 5] [-3 2]) -- [3 4]
+;; negative start
+(take [1 2 3 4 5] [10 2]) -- []
+;; start beyond length
+(take "hello" [1 3]) -- "ell"
+(take "hello" [-2 2]) -- "lo"
+(take ['a 'b 'c 'd] [1 2]) -- ['b 'c]
+(take [1.0 2.0 3.0 4.0] [1 2]) -- [2.0 3.0]
+(take (list 1 "a" 'b) [1 2]) -- (list "a" 'b)
+(take (dict ['a 'b 'c 'd] [1 2 3 4]) [1 2]) -- (dict ['b 'c] [2 3])
+(take (table [a b] (list [1 2 3 4] ['x 'y 'z 'w])) [1 2]) -- (table [a b] (list [2 3] ['y 'z]))
+(take [1 2 3] [1 -2]) !- length

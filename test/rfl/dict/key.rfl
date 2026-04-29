@@ -1,0 +1,7 @@
+;; Invariants for `key` — dict keys.
+
+(key (dict [a b c] [1 2 3])) -- [a b c]
+
+;; count of keys == count of dict
+(set D (dict [x y z w] [10 20 30 40]))
+(count (key D)) -- (count D)

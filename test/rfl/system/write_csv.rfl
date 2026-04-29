@@ -1,0 +1,99 @@
+;; Ported from test_lang_rf.inc::test_rf_write_csv.
+
+;; Round-trip: every column type, plus nulls, plus sliced/sorted
+;; views.  Each case writes to a temp file, reads the raw bytes
+;; back, and asserts on the exact content (commas / empty fields
+;; matter).  (.csv.read foo) is exercised separately in the round-
+;; trip blocks where it adds type-recovery coverage.
+;; --- 1. Primary types (no nulls) ---
+;; Before the fix, RAY_STR and RAY_GUID silently produced empty
+;; fields because the dispatch switch had no branches for them.
+(set tA (table [i f s g str b d] (list [1 2] (as 'F64 [1.5 2.5]) [aa bb] (guid 2) (list "hi" "bye") [true false] (as 'DATE [7305 7306]))))(.csv.write tA "rf_test_write_a.csv") -- 0
+;; Row 1: int, float, sym, guid (first of the two), str, bool, date.
+;; split "\n" leaves a trailing empty field after the final newline,
+;; so header + 2 data rows + "" = 4 entries.
+(set raw (read "rf_test_write_a.csv"))(set lines (split raw "\n"))(count lines) -- 4
+(at lines 0) -- "i,f,s,g,str,b,d"
+;; Content assertions via field-split. Check structural invariants
+;; we control without depending on specific guid bytes.
+(count (split (at lines 1) ",")) -- 7
+(at (split (at lines 1) ",") 0) -- "1"
+(at (split (at lines 1) ",") 1) -- "1.5"
+(at (split (at lines 1) ",") 2) -- "aa"
+(count (at (split (at lines 1) ",") 3)) -- 36
+;; guid xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+(at (split (at lines 1) ",") 4) -- "hi"
+(at (split (at lines 1) ",") 5) -- "true"
+(at (split (at lines 1) ",") 6) -- "2020-01-01"
+;; --- 2. Nulls produce empty fields, not garbage ---
+;; Before the fix, null i64 wrote 0 and null sym wrote a phantom
+;; intern-table value that depended on session state.
+(set tB (table [i s] (list [1 0Nl 3] [aa 0Ns cc])))(.csv.write tB "rf_test_write_b.csv") -- 0
+(set linesB (split (read "rf_test_write_b.csv") "\n"))(count linesB) -- 5
+;; header + 3 rows + trailing ""
+(at linesB 0) -- "i,s"
+(at linesB 1) -- "1,aa"
+(at linesB 2) -- ","
+;; empty i and empty s
+(at linesB 3) -- "3,cc"
+;; --- 3. Sliced / sorted views write the view's rows, not the
+;; source's rows.  Before the fix, the dispatch loop did
+;; ray_data(col)[r] and ignored slice_offset, so a sorted view
+;; produced the source's first N rows in source order.
+(set src (table [a b] (list [10 20 30 40 50] [aa bb cc dd ee])))(set v (xdesc src 'a))(.csv.write v "rf_test_write_c.csv") -- 0
+(set linesC (split (read "rf_test_write_c.csv") "\n"))(at linesC 0) -- "a,b"
+(at linesC 1) -- "50,ee"
+(at linesC 2) -- "40,dd"
+(at linesC 3) -- "30,cc"
+(at linesC 4) -- "20,bb"
+(at linesC 5) -- "10,aa"
+;; --- 4. Quote-escaping of strings with commas and quotes.
+;; (Embedded newlines are also escaped, but the assertion machinery
+;; can't easily probe for a literal LF inside a quoted cell — the
+;; round-trip cases below cover value recovery.)
+(set tD (table [k v] (list [1 2] (list "has,comma" "has\"quote"))))(.csv.write tD "rf_test_write_d.csv") -- 0
+;; Full-byte assertion. The whole file should be exactly this
+;; byte sequence — any escape bug shows up immediately.
+(read "rf_test_write_d.csv") -- "k,v\n1,\"has,comma\"\n2,\"has\"\"quote\"\n"
+;; --- 5. Round-trip via .csv.read recovers numeric column values.
+;; (SYMBOL columns are displayed correctly by `show` but extracting
+;; them via `(at tbl 'col)` currently returns garbage intern IDs —
+;; that's a separate .csv.read bug tracked outside this test.)
+(set tE (table [i f] (list [1 2 3] (as 'F64 [1.25 2.5 3.75]))))(.csv.write tE "rf_test_write_e.csv") -- 0
+(set rt (.csv.read [I64 F64] "rf_test_write_e.csv"))(count rt) -- 3
+(at (at rt 'i) 0) -- 1
+(at (at rt 'i) 1) -- 2
+(at (at rt 'i) 2) -- 3
+(at (at rt 'f) 0) -- 1.25
+(at (at rt 'f) 1) -- 2.5
+(at (at rt 'f) 2) -- 3.75
+;; --- 6. Empty path is rejected instead of creating "" or crashing.
+(.csv.write tE "") !- type
+;; --- 6b. Null-row round-trip (gh#6 example 1).
+;; Empty lines in the data section ARE null rows, including the line
+;; immediately after the header. Previously the header-end scanner
+;; consumed a run of newlines and silently dropped the first null row,
+;; reordering the data.
+(.csv.write (table [v] (list [0Nl 2 0Nl])) "rf_test_write_nulls.csv") -- 0
+(set rtn (.csv.read [I64] "rf_test_write_nulls.csv"))(count rtn) -- 3
+(at (at rtn 'v) 0) -- 0Nl
+(at (at rtn 'v) 1) -- 2
+(at (at rtn 'v) 2) -- 0Nl
+;; --- 6c. Null atom display (gh#6 example 3).
+;; println of a null-valued scalar must render the typed null literal,
+;; not raw zero.
+(format "%" 0Nl) -- "0Nl"
+(format "%" 0Ni) -- "0Ni"
+;; --- 7. Temporal round-trip via .csv.read.
+;; RAY_TIMESTAMP is stored as nanoseconds since 2000-01-01, and the
+;; CSV emitter writes 9 fractional digits.  .csv.read's fast_time_ns
+;; parser must match, otherwise a load-after-save silently rescales
+;; timestamps by 1000x.
+(set tT (table [d tm ts] (list (as 'DATE [7305]) (as 'TIME [3723000]) (as 'TIMESTAMP [86400000000000]))))(.csv.write tT "rf_test_write_t.csv") -- 0
+(set rt (.csv.read [DATE TIME TIMESTAMP] "rf_test_write_t.csv"))(at (at rt 'd) 0) -- 2020.01.01
+(at (at rt 'tm) 0) -- 01:02:03.000
+;; Raw underlying ns value preserved: 86.4e12 ns = exactly 1 day.
+(as 'I64 (at (at rt 'ts) 0)) -- 86400000000000
+;; Sub-second precision: 9 digits on write must round-trip.
+(set tT2 (table [ts] (list (as 'TIMESTAMP [123456789]))))(.csv.write tT2 "rf_test_write_t2.csv") -- 0
+(set rt2 (.csv.read [TIMESTAMP] "rf_test_write_t2.csv"))(as 'I64 (at (at rt2 'ts) 0)) -- 123456789

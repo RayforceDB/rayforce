@@ -1,0 +1,14 @@
+;; Invariants for `min`.
+
+(min [3 1 2]) -- 1
+(min [5]) -- 5
+(min [-1 -5 0]) -- -5
+
+;; min(v) <= every element of v
+(set V (rand 100 10000))
+(count V) -- (sum (<= (min V) V))
+
+;; min of concat is min of mins
+(set A (rand 50 10000))
+(set B (rand 50 10000))
+(min (concat A B)) -- (min (list (min A) (min B)))

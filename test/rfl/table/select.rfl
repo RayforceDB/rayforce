@@ -1,0 +1,117 @@
+;; Invariants for `select` — table query with where / by / take / asc / desc.
+;;
+;; Tests are organised by clause, then by combinations.  Two fixtures are
+;; used: a 10-row "trades" table for basics + projection + a single-key
+;; group-by, and a 15-row "trades-15" table for systematic clause coverage
+;; with sym/price/size/tms/d.
+
+;; ────────────── 10-row fixture ──────────────
+(set trades (table [sym price size] (list ['AAPL 'GOOG 'MSFT 'AAPL 'GOOG 'MSFT 'AAPL 'GOOG 'MSFT 'AAPL] [150.0 2800.0 310.0 151.5 2795.0 309.0 152.0 2810.0 311.0 150.5] [100 50 200 150 40 250 120 60 180 90])))
+
+;; ── basics
+(count trades) -- 10
+(count (select {from: trades})) -- 10
+(count (select {from: trades where: (== sym 'AAPL)})) -- 4
+(count (select {from: trades where: (> price 200)})) -- 6
+(sum (at trades 'price)) -- 9939.0
+(sum (at trades 'size)) -- 1240
+(max (at trades 'price)) -- 2810.0
+(min (at trades 'size)) -- 40
+(count (distinct (at trades 'sym))) -- 3
+
+;; ── projection: derived columns retain row count + arithmetic semantics
+(sum (at (select {notional: (* price size) from: trades}) 'notional)) -- 685140.0
+(sum (at (select {ps: (+ price size) from: trades}) 'ps)) -- 11179.0
+
+;; ── single-key group-by on the 10-row fixture
+(count (select {s: (sum size) from: trades by: sym})) -- 3
+(sum (at (select {s: (sum size) from: trades by: sym}) 's)) -- 1240
+(sum (at (select {s: (sum size) from: trades by: sym where: (== sym 'AAPL)}) 's)) -- 460
+
+;; ────────────── 15-row fixture (sym, price, size, tms, d) ──────────────
+(set trades-15 (table [sym price size tms d] (list ['AAPL 'GOOG 'MSFT 'AAPL 'GOOG 'MSFT 'AAPL 'GOOG 'MSFT 'AMZN 'TSLA 'AAPL 'GOOG 'MSFT 'TSLA] [150.0 2800.0 310.0 151.5 2795.0 309.0 152.0 2810.0 311.0 3300.0 700.0 150.5 2805.0 312.0 702.5] [100 50 200 150 40 250 120 60 180 75 90 110 55 190 95] [09:30:15.000 09:30:15.100 09:30:15.200 09:30:15.300 09:30:15.400 09:30:15.500 09:30:15.600 09:30:15.700 09:30:15.800 09:30:15.900 09:30:16.000 09:30:16.100 09:30:16.200 09:30:16.300 09:30:16.400] [2024.01.15 2024.01.15 2024.01.15 2024.01.15 2024.01.15 2024.01.16 2024.01.16 2024.01.16 2024.01.16 2024.01.16 2024.01.17 2024.01.17 2024.01.17 2024.01.17 2024.01.17])))
+
+;; ── where: simple comparisons against scalars
+(count (select {from: trades-15 where: (== sym 'AAPL)})) -- 4
+(count (select {from: trades-15 where: (!= sym 'MSFT)})) -- 11
+(count (select {from: trades-15 where: (> price 200.0)})) -- 11
+(count (select {from: trades-15 where: (< size 100)})) -- 7
+(count (select {from: trades-15 where: (>= size 100)})) -- 8
+(count (select {from: trades-15 where: (<= price 2000.0)})) -- 10
+
+;; ── where: compound and / or / not
+(count (select {from: trades-15 where: (and (> price 500.0) (< size 200))})) -- 7
+(count (select {from: trades-15 where: (or (== sym 'AMZN) (== sym 'TSLA))})) -- 3
+(count (select {from: trades-15 where: (not (== sym 'AAPL))})) -- 11
+(count (select {from: trades-15 where: (and (> size 50) (or (== sym 'AAPL) (== sym 'GOOG)))})) -- 6
+
+;; ── projection: total invariants under arithmetic columns
+(sum (at (select {notional: (* price size) from: trades-15}) 'notional)) -- 1278942.5
+(sum (at (select {ps: (+ price size) from: trades-15}) 'ps)) -- 19523.5
+(count (select {t: sym from: trades-15})) -- 15
+
+;; ── sort: asc / desc preserve totals; first-row equals min/max
+(sum (at (select {from: trades-15 asc: price}) 'price)) -- 17758.5
+(sum (at (select {from: trades-15 desc: price}) 'price)) -- 17758.5
+(first (at (select {from: trades-15 asc: size}) 'size)) -- 40
+(first (at (select {from: trades-15 desc: size}) 'size)) -- 250
+(count (select {from: trades-15 asc: tms})) -- 15
+
+;; ── take: clamping behavior
+(count (select {from: trades-15 take: 5})) -- 5
+(count (select {from: trades-15 take: 0})) -- 0
+(count (select {from: trades-15 take: 15})) -- 15
+
+;; ── edge cases: all-pass / none-pass / single-row / by-distinct-time
+(count (select {from: trades-15 where: (> size -1)})) -- 15
+(count (select {from: trades-15 where: (> size 999999)})) -- 0
+(count (select {from: trades-15 where: (== size 200)})) -- 1
+(count (select {s: (sum size) from: trades-15 by: tms})) -- 15
+(count (select {s: (sum size) from: trades-15 by: d})) -- 3
+
+;; ── group-by clause coverage on the 15-row fixture
+(count (select {s: (sum size) from: trades-15 by: sym})) -- 5
+(sum (at (select {s: (sum size) from: trades-15 by: sym}) 's)) -- 1765
+(sum (at (select {p: (sum price) from: trades-15 by: sym}) 'p)) -- 17758.5
+(sum (at (select {s: (sum size) from: trades-15 by: sym where: (== sym 'AAPL)}) 's)) -- 480
+(sum (at (select {c: (count size) from: trades-15 by: sym}) 'c)) -- 15
+
+;; ── combo: where + by + projection / asc + take / no-match
+(count (select {from: trades-15 where: (> price 500.0) asc: price take: 3})) -- 3
+(count (select {s: (sum size) from: trades-15 by: sym asc: sym})) -- 5
+(count (select {from: trades-15 where: (== sym 'NOPE) by: sym})) -- 0
+(first (at (select {p: (avg price) from: trades-15 by: sym where: (== sym 'GOOG)}) 'p)) -- 2802.5
+
+;; ────────────── multi-key group-by + multi-aggregator fixture ──────────────
+(set trades-mk (table [sym sector side qty price] (list ['AAPL 'AAPL 'AAPL 'GOOG 'GOOG 'MSFT 'MSFT 'MSFT 'AMZN 'AMZN 'WMT 'WMT 'TSLA 'TSLA] ['Tech 'Tech 'Tech 'Tech 'Tech 'Tech 'Tech 'Tech 'Retail 'Retail 'Retail 'Retail 'Auto 'Auto] ['Buy 'Sell 'Buy 'Buy 'Sell 'Buy 'Sell 'Buy 'Buy 'Sell 'Buy 'Sell 'Buy 'Sell] [100 50 75 40 60 200 80 100 75 25 150 90 90 30] [150.0 151.0 149.5 2800.0 2795.0 310.0 311.0 309.0 3300.0 3305.0 180.0 181.0 700.0 705.0])))
+
+;; ── single key
+(count (select {s: (sum qty) from: trades-mk by: sym})) -- 6
+(sum (at (select {s: (sum qty) from: trades-mk by: sym}) 's)) -- 1165
+(sum (at (select {p: (sum price) from: trades-mk by: sym}) 'p)) -- 15346.5
+(sum (at (select {c: (count qty) from: trades-mk by: sym}) 'c)) -- 14
+
+;; ── two-key
+(count (select {s: (sum qty) from: trades-mk by: [sector side]})) -- 6
+(sum (at (select {s: (sum qty) from: trades-mk by: [sector side]}) 's)) -- 1165
+(sum (at (select {s: (sum qty) from: trades-mk by: [sector side] where: (and (== sector 'Tech) (== side 'Buy))}) 's)) -- 515
+
+;; ── three-key
+(count (select {s: (sum qty) from: trades-mk by: [sym sector side]})) -- 12
+(sum (at (select {s: (sum qty) from: trades-mk by: [sym sector side]}) 's)) -- 1165
+
+;; ── int key (non-symbol grouping)
+(count (select {s: (sum price) from: trades-mk by: qty})) -- 11
+(sum (at (select {s: (sum price) from: trades-mk by: qty}) 's)) -- 15346.5
+
+;; ── filter-then-group preserves filtered totals
+(count (select {s: (sum qty) from: trades-mk by: sym where: (== side 'Buy)})) -- 6
+(sum (at (select {s: (sum qty) from: trades-mk by: sym where: (== side 'Buy)}) 's)) -- 830
+
+;; ── multi-aggregator on a single group (AAPL)
+(set aapl (select {s: (sum qty) c: (count qty) mx: (max price) mn: (min price) av: (avg price) from: trades-mk by: sym where: (== sym 'AAPL)}))
+(first (at aapl 's))  -- 225
+(first (at aapl 'c))  -- 3
+(first (at aapl 'mx)) -- 151.0
+(first (at aapl 'mn)) -- 149.5
+(first (at aapl 'av)) -- 150.16666666666666

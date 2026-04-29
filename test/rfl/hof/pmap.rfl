@@ -1,0 +1,11 @@
+;; Invariants for `pmap` — parallel map; same semantics as map.
+
+(pmap (fn [x] (* x x)) [1 2 3 4 5]) -- [1 4 9 16 25]
+(pmap (fn [x] x) [10 20 30]) -- [10 20 30]
+
+;; pmap and map produce identical results
+(set V (rand 200 1000))
+(map (fn [x] (+ x 1)) V) -- (pmap (fn [x] (+ x 1)) V)
+
+;; count preserved
+(count V) -- (count (pmap (fn [x] (* x 2)) V))

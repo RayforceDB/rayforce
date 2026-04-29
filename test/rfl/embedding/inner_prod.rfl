@@ -1,0 +1,11 @@
+;; Invariants for `inner-prod` (dot product).
+
+(inner-prod [1.0 2.0 3.0] [4.0 5.0 6.0]) -- 32.0
+(inner-prod [1.0 0.0] [0.0 1.0]) -- 0.0
+(inner-prod [0.0 0.0] [5.0 7.0]) -- 0.0
+
+;; symmetric
+(inner-prod [1.0 2.0 3.0] [4.0 5.0 6.0]) -- (inner-prod [4.0 5.0 6.0] [1.0 2.0 3.0])
+
+;; self inner product = |v|^2 (related to norm)
+(inner-prod [3.0 4.0] [3.0 4.0]) -- 25.0

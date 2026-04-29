@@ -1,0 +1,21 @@
+;; Invariants for `time` — time literal type.
+
+(type 12:30:45.000) -- 'time
+
+;; extractors
+(hh 12:30:45.000) -- 12
+(minute 12:30:45.000) -- 30
+(ss 12:30:45.000) -- 45
+
+;; with sub-second precision the integer extractors still drop ms
+(hh 12:30:45.123)     -- 12
+(minute 12:30:45.123) -- 30
+(ss 12:30:45.123)     -- 45
+
+;; midnight / end-of-day boundaries
+(hh 00:00:00.000) -- 0
+(hh 23:59:59.999) -- 23
+
+;; ordering
+(< 09:00:00.000 10:00:00.000) -- true
+(== 12:30:45.000 12:30:45.000) -- true

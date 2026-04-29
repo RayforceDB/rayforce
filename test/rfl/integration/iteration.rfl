@@ -1,0 +1,8 @@
+;; Ported from test_lang_rf.inc::test_rf_iteration.
+
+;; ========== MAP-LEFT TESTS ==========
+(map-left - 10 [1 2 3]) -- [9 8 7]
+(map-left / 100 [2 4 5]) -- [50 25 20]
+;; ========== MAP-RIGHT TESTS ==========
+(map-right - [10 20 30] 5) -- [5 15 25]
+(map-right / [10 20 30] 2) -- [5 10 15]

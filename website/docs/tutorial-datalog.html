@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Datalog Tutorial — Rayforce Documentation</title>
+  <meta name="description" content="Step-by-step tutorial: assert facts, query patterns, define rules, recursive queries, negation, and the pull API with Rayfall.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link active">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Datalog Tutorial</span>
+      </div>
+
+      <h1>Datalog Tutorial</h1>
+      <p class="page-subtitle">A hands-on walkthrough: assert facts, query patterns, define recursive rules, use negation, and pull entity attributes &mdash; all from the Rayfall REPL.</p>
+
+      <p>This tutorial assumes you have already <a href="quick-start.html">built Rayforce</a> and can start the REPL with <code>./rayforce</code>. Every example below can be pasted directly into the REPL.</p>
+
+      <!-- Section 1 -->
+      <h2 id="what-is-datalog">1. What is Datalog?</h2>
+      <p>Datalog is a declarative query language based on pattern matching over facts. Instead of writing imperative loops, you declare <em>what</em> you want to find and the engine figures out <em>how</em>. Rayforce implements Datalog natively with semi-naive evaluation and stratified negation, operating directly over an entity-attribute-value (EAV) triple store.</p>
+
+      <!-- Section 2 -->
+      <h2 id="asserting-facts">2. Asserting Facts</h2>
+      <p>All data lives in an EAV triple store created with <code>datoms</code>. Each fact is a triple: <strong>entity</strong> (integer ID), <strong>attribute</strong> (symbol), and <strong>value</strong> (integer or symbol). Use <code>assert-fact</code> to add triples:</p>
+      <pre><code><span class="hl-comment">; Create an empty triple store</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">datoms</span>))
+
+<span class="hl-comment">; Add employees: entity ID, attribute, value</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">100</span> <span class="hl-sym">'name</span> <span class="hl-sym">'Alice</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">100</span> <span class="hl-sym">'dept</span> <span class="hl-sym">'Engineering</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">101</span> <span class="hl-sym">'name</span> <span class="hl-sym">'Bob</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">101</span> <span class="hl-sym">'dept</span> <span class="hl-sym">'Sales</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">102</span> <span class="hl-sym">'name</span> <span class="hl-sym">'Carol</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">102</span> <span class="hl-sym">'dept</span> <span class="hl-sym">'Engineering</span>))
+
+<span class="hl-comment">; Reporting relationships (value is an entity ID)</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">100</span> <span class="hl-sym">'boss</span> <span class="hl-num">101</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">102</span> <span class="hl-sym">'boss</span> <span class="hl-num">100</span>))</code></pre>
+      <p>Each <code>assert-fact</code> returns a new table (the store is immutable). View the raw triples by evaluating <code>db</code>:</p>
+      <pre><code>db</code></pre>
+      <pre><code>┌─────┬──────┬────────────────────────┐
+│  e  │  a   │           v            │
+│ i64 │ sym  │          i64           │
+├─────┼──────┼────────────────────────┤
+│ 100 │ name │ ...                    │
+│ 100 │ dept │ ...                    │
+│ 101 │ name │ ...                    │
+│ 101 │ dept │ ...                    │
+│ 102 │ name │ ...                    │
+│ 102 │ dept │ ...                    │
+│ 100 │ boss │ 101                    │
+│ 102 │ boss │ 100                    │
+├─────┴──────┴────────────────────────┤
+│ 8 rows (8 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p><strong>Note:</strong> Symbol values (like <code>'Alice</code>, <code>'Engineering</code>) are stored as intern IDs in the <code>v</code> column. Integer values (like the <code>boss</code> entity references) appear directly. This is an implementation detail &mdash; the query engine handles the mapping transparently.</p>
+
+      <!-- Section 3 -->
+      <h2 id="querying-facts">3. Querying Facts</h2>
+      <p>Use <code>query</code> with <code>find</code>/<code>where</code> clauses to pattern-match over the triple store. Variables start with <code>?</code>. The <code>eav</code> predicate matches entity-attribute-value triples:</p>
+
+      <h3>Find all employees</h3>
+      <pre><code>(<span class="hl-fn">query</span> db (<span class="hl-kw">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?name</span>) (<span class="hl-kw">where</span> (<span class="hl-fn">eav</span> <span class="hl-sym">?e</span> <span class="hl-sym">'name</span> <span class="hl-sym">?name</span>)))</code></pre>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?e  │             ?name             │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 100 │ ...                           │
+│ 101 │ ...                           │
+│ 102 │ ...                           │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>The query finds every entity <code>?e</code> that has a <code>name</code> attribute. The <code>?name</code> column contains the intern IDs for the symbol values.</p>
+
+      <h3>Find employees in Engineering</h3>
+      <p>Add a second pattern to filter by department. Constants (like <code>'Engineering</code>) constrain the match:</p>
+      <pre><code>(<span class="hl-fn">query</span> db
+  (<span class="hl-kw">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?name</span>)
+  (<span class="hl-kw">where</span>
+    (<span class="hl-fn">eav</span> <span class="hl-sym">?e</span> <span class="hl-sym">'dept</span> <span class="hl-sym">'Engineering</span>)
+    (<span class="hl-fn">eav</span> <span class="hl-sym">?e</span> <span class="hl-sym">'name</span> <span class="hl-sym">?name</span>)))</code></pre>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?e  │             ?name             │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 100 │ ...                           │
+│ 102 │ ...                           │
+├─────┴───────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Only Alice (100) and Carol (102) are returned &mdash; Bob is in Sales.</p>
+
+      <h3>Find who reports to whom</h3>
+      <p>Query the <code>boss</code> attribute to find reporting relationships. Since <code>boss</code> stores integer entity IDs, the values are directly readable:</p>
+      <pre><code>(<span class="hl-fn">query</span> db
+  (<span class="hl-kw">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?boss</span>)
+  (<span class="hl-kw">where</span> (<span class="hl-fn">eav</span> <span class="hl-sym">?e</span> <span class="hl-sym">'boss</span> <span class="hl-sym">?boss</span>)))</code></pre>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?e  │             ?boss             │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 100 │ 101                           │
+│ 102 │ 100                           │
+├─────┴───────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Alice (100) reports to Bob (101), and Carol (102) reports to Alice (100).</p>
+
+      <!-- Section 4 -->
+      <h2 id="defining-rules">4. Defining Rules</h2>
+      <p>Rules create derived relations from existing facts. Use <code>rule</code> to define a named relation with a head and one or more body clauses:</p>
+      <pre><code><span class="hl-comment">; "manages" means someone is your direct boss</span>
+(<span class="hl-fn">rule</span> (<span class="hl-sym">manages</span> <span class="hl-sym">?mgr</span> <span class="hl-sym">?sub</span>)
+  (<span class="hl-fn">eav</span> <span class="hl-sym">?sub</span> <span class="hl-sym">'boss</span> <span class="hl-sym">?mgr</span>))</code></pre>
+      <p>This says: <code>?mgr</code> manages <code>?sub</code> if <code>?sub</code> has a <code>boss</code> attribute pointing to <code>?mgr</code>. Query it like any other predicate:</p>
+      <pre><code>(<span class="hl-fn">query</span> db
+  (<span class="hl-kw">find</span> <span class="hl-sym">?mgr</span> <span class="hl-sym">?sub</span>)
+  (<span class="hl-kw">where</span> (<span class="hl-fn">manages</span> <span class="hl-sym">?mgr</span> <span class="hl-sym">?sub</span>)))</code></pre>
+      <pre><code>┌──────┬──────────────────────────────┐
+│ ?mgr │             ?sub             │
+│ i64  │             i64              │
+├──────┼──────────────────────────────┤
+│ 100  │ 102                          │
+│ 101  │ 100                          │
+├──────┴──────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Rules persist across queries in the same session. Define them once, use them in any subsequent <code>query</code> call.</p>
+
+      <!-- Section 5 -->
+      <h2 id="recursive-queries">5. Recursive Queries</h2>
+      <p>Datalog supports recursion natively. Define a transitive closure of the <code>boss</code> relationship with two rules &mdash; a base case and a recursive step:</p>
+      <pre><code><span class="hl-comment">; Base case: direct report</span>
+(<span class="hl-fn">rule</span> (<span class="hl-sym">chain</span> <span class="hl-sym">?top</span> <span class="hl-sym">?sub</span>)
+  (<span class="hl-fn">eav</span> <span class="hl-sym">?sub</span> <span class="hl-sym">'boss</span> <span class="hl-sym">?top</span>))
+
+<span class="hl-comment">; Recursive step: indirect report</span>
+(<span class="hl-fn">rule</span> (<span class="hl-sym">chain</span> <span class="hl-sym">?top</span> <span class="hl-sym">?sub</span>)
+  (<span class="hl-fn">eav</span> <span class="hl-sym">?sub</span> <span class="hl-sym">'boss</span> <span class="hl-sym">?mid</span>)
+  (<span class="hl-fn">chain</span> <span class="hl-sym">?top</span> <span class="hl-sym">?mid</span>))</code></pre>
+      <p>Now find everyone who reports to Bob (101), directly or indirectly:</p>
+      <pre><code>(<span class="hl-fn">query</span> db
+  (<span class="hl-kw">find</span> <span class="hl-sym">?sub</span>)
+  (<span class="hl-kw">where</span> (<span class="hl-fn">chain</span> <span class="hl-num">101</span> <span class="hl-sym">?sub</span>)))</code></pre>
+      <pre><code>┌─────────────────────────────────────┐
+│                ?sub                 │
+│                 i64                 │
+├─────────────────────────────────────┤
+│ 100                                 │
+│ 102                                 │
+├─────────────────────────────────────┤
+│ 2 rows (2 shown) 1 columns (1 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Alice (100) reports directly to Bob, and Carol (102) reports to Alice &mdash; so both are in Bob's reporting chain. The engine evaluates to a fixpoint using semi-naive evaluation, adding new tuples each iteration until no more can be derived.</p>
+
+      <!-- Section 6 -->
+      <h2 id="negation">6. Negation</h2>
+      <p>Use <code>not</code> to exclude matching patterns. Find all employees who are NOT in Sales:</p>
+      <pre><code>(<span class="hl-fn">query</span> db
+  (<span class="hl-kw">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?name</span>)
+  (<span class="hl-kw">where</span>
+    (<span class="hl-fn">eav</span> <span class="hl-sym">?e</span> <span class="hl-sym">'name</span> <span class="hl-sym">?name</span>)
+    (<span class="hl-fn">not</span> (<span class="hl-fn">eav</span> <span class="hl-sym">?e</span> <span class="hl-sym">'dept</span> <span class="hl-sym">'Sales</span>))))</code></pre>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?e  │             ?name             │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 100 │ ...                           │
+│ 102 │ ...                           │
+├─────┴───────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Bob (101) is excluded because he is in Sales. Negation is stratified &mdash; the engine ensures negated predicates are fully evaluated before being used, preventing circular reasoning.</p>
+
+      <!-- Section 7 -->
+      <h2 id="pull-api">7. The Pull API</h2>
+      <p>Use <code>pull</code> to retrieve all attributes of an entity as a dictionary:</p>
+      <pre><code>(<span class="hl-fn">pull</span> db <span class="hl-num">100</span>)</code></pre>
+      <pre><code>{name:... dept:... boss:101}</code></pre>
+      <p>The result is a dict mapping attribute names to values. You can also pull a specific subset of attributes:</p>
+      <pre><code>(<span class="hl-fn">pull</span> db <span class="hl-num">100</span> [<span class="hl-sym">'name</span> <span class="hl-sym">'dept</span>])</code></pre>
+      <pre><code>{name:... dept:...}</code></pre>
+      <p>Symbol values appear as intern IDs in the dict. Integer values (like the <code>boss</code> reference) appear directly.</p>
+
+      <p>You can also use <code>scan-eav</code> for attribute-level lookups. Given an attribute, it returns an <code>[e v]</code> table:</p>
+      <pre><code>(<span class="hl-fn">scan-eav</span> db <span class="hl-sym">'name</span>)</code></pre>
+      <pre><code>┌─────┬───────────────────────────────┐
+│  e  │               v               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 100 │ ...                           │
+│ 101 │ ...                           │
+│ 102 │ ...                           │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Given an entity and attribute, <code>scan-eav</code> returns the single value:</p>
+      <pre><code>(<span class="hl-fn">scan-eav</span> db <span class="hl-num">100</span> <span class="hl-sym">'boss</span>)</code></pre>
+      <pre><code>101</code></pre>
+
+      <!-- Section 8 -->
+      <h2 id="complete-example">8. Complete Example: Org Chart</h2>
+      <p>Build a full org chart, define rules for reporting chains and department heads, then query the structure:</p>
+      <pre><code><span class="hl-comment">; Build the org chart</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">datoms</span>))
+
+<span class="hl-comment">; CEO</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">100</span> <span class="hl-sym">'name</span>  <span class="hl-sym">'Alice</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">100</span> <span class="hl-sym">'title</span> <span class="hl-sym">'CEO</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">100</span> <span class="hl-sym">'dept</span>  <span class="hl-sym">'Executive</span>))
+
+<span class="hl-comment">; Engineering VP</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">101</span> <span class="hl-sym">'name</span>  <span class="hl-sym">'Bob</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">101</span> <span class="hl-sym">'title</span> <span class="hl-sym">'VP</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">101</span> <span class="hl-sym">'dept</span>  <span class="hl-sym">'Engineering</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">101</span> <span class="hl-sym">'boss</span>  <span class="hl-num">100</span>))
+
+<span class="hl-comment">; Engineering Lead</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">102</span> <span class="hl-sym">'name</span>  <span class="hl-sym">'Carol</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">102</span> <span class="hl-sym">'title</span> <span class="hl-sym">'Lead</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">102</span> <span class="hl-sym">'dept</span>  <span class="hl-sym">'Engineering</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">102</span> <span class="hl-sym">'boss</span>  <span class="hl-num">101</span>))
+
+<span class="hl-comment">; Developer</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">103</span> <span class="hl-sym">'name</span>  <span class="hl-sym">'Dave</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">103</span> <span class="hl-sym">'title</span> <span class="hl-sym">'Dev</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">103</span> <span class="hl-sym">'dept</span>  <span class="hl-sym">'Engineering</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">103</span> <span class="hl-sym">'boss</span>  <span class="hl-num">102</span>))
+
+<span class="hl-comment">; Sales VP</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">104</span> <span class="hl-sym">'name</span>  <span class="hl-sym">'Eve</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">104</span> <span class="hl-sym">'title</span> <span class="hl-sym">'VP</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">104</span> <span class="hl-sym">'dept</span>  <span class="hl-sym">'Sales</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">104</span> <span class="hl-sym">'boss</span>  <span class="hl-num">100</span>))
+
+<span class="hl-comment">; Sales Rep</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">105</span> <span class="hl-sym">'name</span>  <span class="hl-sym">'Frank</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">105</span> <span class="hl-sym">'title</span> <span class="hl-sym">'Rep</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">105</span> <span class="hl-sym">'dept</span>  <span class="hl-sym">'Sales</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">105</span> <span class="hl-sym">'boss</span>  <span class="hl-num">104</span>))</code></pre>
+
+      <p>Define the reporting chain (transitive closure):</p>
+      <pre><code>(<span class="hl-fn">rule</span> (<span class="hl-sym">chain</span> <span class="hl-sym">?top</span> <span class="hl-sym">?sub</span>)
+  (<span class="hl-fn">eav</span> <span class="hl-sym">?sub</span> <span class="hl-sym">'boss</span> <span class="hl-sym">?top</span>))
+
+(<span class="hl-fn">rule</span> (<span class="hl-sym">chain</span> <span class="hl-sym">?top</span> <span class="hl-sym">?sub</span>)
+  (<span class="hl-fn">eav</span> <span class="hl-sym">?sub</span> <span class="hl-sym">'boss</span> <span class="hl-sym">?mid</span>)
+  (<span class="hl-fn">chain</span> <span class="hl-sym">?top</span> <span class="hl-sym">?mid</span>))</code></pre>
+
+      <p>Query everyone who reports to the CEO (100):</p>
+      <pre><code>(<span class="hl-fn">query</span> db
+  (<span class="hl-kw">find</span> <span class="hl-sym">?sub</span>)
+  (<span class="hl-kw">where</span> (<span class="hl-fn">chain</span> <span class="hl-num">100</span> <span class="hl-sym">?sub</span>)))</code></pre>
+      <pre><code>┌─────────────────────────────────────┐
+│                ?sub                 │
+│                 i64                 │
+├─────────────────────────────────────┤
+│ 101                                 │
+│ 102                                 │
+│ 103                                 │
+│ 104                                 │
+│ 105                                 │
+├─────────────────────────────────────┤
+│ 5 rows (5 shown) 1 columns (1 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>All five employees report to Alice (the CEO), directly or through the chain.</p>
+
+      <p>Define a rule for department heads (employees with title VP):</p>
+      <pre><code>(<span class="hl-fn">rule</span> (<span class="hl-sym">dept_head</span> <span class="hl-sym">?e</span> <span class="hl-sym">?d</span>)
+  (<span class="hl-fn">eav</span> <span class="hl-sym">?e</span> <span class="hl-sym">'dept</span> <span class="hl-sym">?d</span>)
+  (<span class="hl-fn">eav</span> <span class="hl-sym">?e</span> <span class="hl-sym">'title</span> <span class="hl-sym">'VP</span>))
+
+(<span class="hl-fn">query</span> db
+  (<span class="hl-kw">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?d</span>)
+  (<span class="hl-kw">where</span> (<span class="hl-fn">dept_head</span> <span class="hl-sym">?e</span> <span class="hl-sym">?d</span>)))</code></pre>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?e  │              ?d               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 101 │ ...                           │
+│ 104 │ ...                           │
+├─────┴───────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Bob (101, Engineering VP) and Eve (104, Sales VP) are identified as department heads.</p>
+
+      <p>Pull the full profile of a department head:</p>
+      <pre><code>(<span class="hl-fn">pull</span> db <span class="hl-num">101</span>)</code></pre>
+      <pre><code>{name:... title:... dept:... boss:100}</code></pre>
+
+      <h2 id="next-steps">Next Steps</h2>
+      <ul>
+        <li><a href="datalog.html"><strong>Datalog Rules &amp; Queries</strong></a> &mdash; Full reference for the Datalog engine: predicates, stratification, and the programmatic API</li>
+        <li><a href="guide-datalog.html"><strong>Building a Knowledge Base</strong></a> &mdash; Patterns for modeling domain knowledge with EAV triples</li>
+        <li><a href="tutorial.html"><strong>Getting Started Tutorial</strong></a> &mdash; Tables, filtering, grouping, joins, and CSV I/O</li>
+        <li><a href="rayfall-functions.html"><strong>Functions Reference</strong></a> &mdash; Complete list of all built-in functions</li>
+      </ul>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="tutorial-graph.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Graph Queries Tutorial</span></a>
+        <a href="tutorial-storage.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Data Loading &amp; Storage Tutorial</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

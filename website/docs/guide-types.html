@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Type Casting &amp; Coercion — Rayforce Documentation</title>
+  <meta name="description" content="Explicit type casting with as, implicit coercion rules, string/date/time conversions, null semantics, symbol vs string, and GUID types in Rayfall.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link active">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Type Casting &amp; Coercion</span>
+      </div>
+
+      <h1>Type Casting &amp; Coercion</h1>
+      <p class="page-subtitle">Explicit type conversion with <code>as</code>, implicit coercion rules, string and temporal parsing, null propagation, and choosing between symbols and strings.</p>
+
+      <!-- TOC -->
+      <div class="info-box">
+        <strong>On this page:</strong>
+        <ol>
+          <li><a href="#as-function">The <code>as</code> Function</a></li>
+          <li><a href="#type-function">The <code>type</code> Function</a></li>
+          <li><a href="#implicit-coercion">Implicit Coercion Rules</a></li>
+          <li><a href="#string-conversions">String &#8596; Type Conversions</a></li>
+          <li><a href="#null-semantics">Null Semantics in Casting</a></li>
+          <li><a href="#sym-vs-str">Symbol vs String</a></li>
+          <li><a href="#date-time">Date/Time Types</a></li>
+          <li><a href="#guid">GUID Type</a></li>
+          <li><a href="#sym-name">sym-name Function</a></li>
+          <li><a href="#practical-examples">Practical Examples</a></li>
+        </ol>
+      </div>
+
+      <!-- 1. The as Function -->
+      <h2 id="as-function">1. The <code>as</code> Function</h2>
+      <p>The <code>as</code> function performs explicit type conversion. It takes a type symbol and a value, returning the value cast to that type.</p>
+      <pre><code>(<span class="hl-fn">as</span> <span class="hl-sym">'type-symbol</span> <span class="hl-sym">value</span>)</code></pre>
+
+      <p><strong>Supported type symbols:</strong></p>
+      <table>
+        <thead><tr><th>Symbol</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>'i16</code></td><td>16-bit integer</td><td>Short integer</td></tr>
+          <tr><td><code>'i32</code></td><td>32-bit integer</td><td>Standard integer</td></tr>
+          <tr><td><code>'i64</code></td><td>64-bit integer</td><td>Long integer (default)</td></tr>
+          <tr><td><code>'u8</code></td><td>unsigned 8-bit</td><td>Byte values</td></tr>
+          <tr><td><code>'f64</code></td><td>64-bit float</td><td>Double precision (default)</td></tr>
+          <tr><td><code>'b8</code></td><td>Boolean</td><td>true / false</td></tr>
+          <tr><td><code>'str</code></td><td>String</td><td>Variable-length text</td></tr>
+          <tr><td><code>'sym</code></td><td>Symbol</td><td>Dictionary-encoded string</td></tr>
+          <tr><td><code>'date</code></td><td>Date</td><td>Days since 2000-01-01</td></tr>
+          <tr><td><code>'time</code></td><td>Time</td><td>Nanoseconds since midnight</td></tr>
+          <tr><td><code>'timestamp</code></td><td>Timestamp</td><td>Nanoseconds since 2000-01-01T00:00:00</td></tr>
+          <tr><td><code>'guid</code></td><td>GUID</td><td>16-byte unique identifier</td></tr>
+        </tbody>
+      </table>
+
+      <p><strong>Numeric casts:</strong></p>
+      <pre><code><span class="hl-comment">; Integer to float</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'f64</span> <span class="hl-num">42</span>)          <span class="hl-comment">; 42.0</span>
+
+<span class="hl-comment">; Float to integer (truncates)</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'i64</span> <span class="hl-num">3.14</span>)        <span class="hl-comment">; 3</span>
+
+<span class="hl-comment">; Narrow to wide integer</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'i16</span> <span class="hl-num">100</span>)         <span class="hl-comment">; 100i16</span></code></pre>
+
+      <p><strong>Boolean casts:</strong></p>
+      <pre><code><span class="hl-comment">; Integer to boolean</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'b8</span> <span class="hl-num">1</span>)          <span class="hl-comment">; true</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'b8</span> <span class="hl-num">0</span>)          <span class="hl-comment">; false</span>
+
+<span class="hl-comment">; Boolean to integer</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'i64</span> true)        <span class="hl-comment">; 1</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'i64</span> false)       <span class="hl-comment">; 0</span></code></pre>
+
+      <p><strong>String and symbol casts:</strong></p>
+      <pre><code><span class="hl-comment">; String to symbol</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'sym</span> <span class="hl-str">"hello"</span>)    <span class="hl-comment">; 'hello</span>
+
+<span class="hl-comment">; Symbol to string</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'str</span> <span class="hl-sym">'hello</span>)     <span class="hl-comment">; "hello"</span></code></pre>
+
+      <p><strong>Temporal casts from strings:</strong></p>
+      <pre><code><span class="hl-comment">; Parse date from ISO string</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'date</span> <span class="hl-str">"2024.01.15"</span>)         <span class="hl-comment">; 2024.01.15</span>
+
+<span class="hl-comment">; Parse time from string</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'time</span> <span class="hl-str">"12:30:00"</span>)           <span class="hl-comment">; 12:30:00.000</span>
+
+<span class="hl-comment">; Parse timestamp</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'timestamp</span> <span class="hl-str">"2024-01-15T12:30:00.000"</span>)  <span class="hl-comment">; 2024.01.15T12:30:00.000</span></code></pre>
+
+      <p><strong>Vector casts:</strong> <code>as</code> maps element-wise over vectors.</p>
+      <pre><code><span class="hl-comment">; Cast an integer vector to float</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'f64</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])     <span class="hl-comment">; [1.0 2.0 3.0]</span>
+
+<span class="hl-comment">; Cast a float vector to integer</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'i64</span> [<span class="hl-num">1.5</span> <span class="hl-num">2.7</span> <span class="hl-num">3.9</span>])  <span class="hl-comment">; [1 2 3]</span></code></pre>
+
+      <!-- 2. type Function -->
+      <h2 id="type-function">2. The <code>type</code> Function</h2>
+      <p>The <code>type</code> function returns the type name of a value as a symbol. For vectors, it returns the element type.</p>
+      <pre><code>(<span class="hl-fn">type</span> <span class="hl-num">42</span>)                <span class="hl-comment">; 'i64</span>
+(<span class="hl-fn">type</span> <span class="hl-num">3.14</span>)              <span class="hl-comment">; 'f64</span>
+(<span class="hl-fn">type</span> <span class="hl-str">"hello"</span>)           <span class="hl-comment">; 'str</span>
+(<span class="hl-fn">type</span> <span class="hl-sym">'hello</span>)            <span class="hl-comment">; 'symbol</span>
+(<span class="hl-fn">type</span> true)               <span class="hl-comment">; 'b8</span>
+(<span class="hl-fn">type</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])           <span class="hl-comment">; 'I64  (uppercase = vector type)</span>
+(<span class="hl-fn">type</span> [<span class="hl-num">1.0</span> <span class="hl-num">2.0</span>])         <span class="hl-comment">; 'F64</span>
+(<span class="hl-fn">type</span> <span class="hl-num">2024.01.15</span>)        <span class="hl-comment">; 'date</span>
+(<span class="hl-fn">type</span> <span class="hl-num">12:30:00.000</span>)      <span class="hl-comment">; 'time</span></code></pre>
+      <div class="info-box">
+        <strong>Note:</strong> <code>type</code> returns lowercase for atoms (<code>'i64</code>, <code>'f64</code>, <code>'symbol</code>, <code>'b8</code>) and uppercase for vectors (<code>'I64</code>, <code>'F64</code>, <code>'SYMBOL</code>). The cast function <code>as</code> accepts both <code>'sym</code> and <code>'symbol</code>.
+      </div>
+      <p>For tables, <code>type</code> returns <code>'TABLE</code>:</p>
+      <pre><code>(<span class="hl-fn">type</span> (<span class="hl-fn">table</span> [<span class="hl-sym">a</span>] (<span class="hl-fn">list</span> [<span class="hl-num">1</span>])))  <span class="hl-comment">; 'TABLE</span></code></pre>
+      <p>Use <code>type</code> to branch on value types at runtime or to validate input before casting.</p>
+
+      <!-- 3. Implicit Coercion Rules -->
+      <h2 id="implicit-coercion">3. Implicit Coercion Rules</h2>
+      <p>Rayfall performs automatic type promotion in certain contexts. These coercions happen silently &mdash; no explicit <code>as</code> needed.</p>
+
+      <div class="info-box">
+        <strong>Coercion rules:</strong>
+        <ul>
+          <li><strong>i64 + f64 &rarr; f64:</strong> Arithmetic between integers and floats promotes to float.</li>
+          <li><strong>bool &rarr; i64:</strong> Booleans coerce to 1/0 in arithmetic contexts.</li>
+          <li><strong>i64 &rarr; bool:</strong> In boolean contexts (if, cond), 0 is false, non-zero is true.</li>
+          <li><strong>Narrower &rarr; wider:</strong> Comparisons across numeric types promote the narrower operand.</li>
+          <li><strong>No string coercion:</strong> Strings never implicitly convert to numbers. Use <code>as</code> explicitly.</li>
+        </ul>
+      </div>
+
+      <pre><code><span class="hl-comment">; Integer + float promotes to float</span>
+(<span class="hl-fn">+</span> <span class="hl-num">1</span> <span class="hl-num">2.0</span>)               <span class="hl-comment">; 3.0</span>
+(<span class="hl-fn">*</span> <span class="hl-num">3</span> <span class="hl-num">1.5</span>)               <span class="hl-comment">; 4.5</span>
+
+<span class="hl-comment">; Boolean in arithmetic</span>
+(<span class="hl-fn">+</span> <span class="hl-num">10</span> true)              <span class="hl-comment">; 11</span>
+(<span class="hl-fn">sum</span> [true false true])   <span class="hl-comment">; 2</span>
+
+<span class="hl-comment">; Boolean context</span>
+(<span class="hl-kw">if</span> <span class="hl-num">42</span> <span class="hl-str">"yes"</span> <span class="hl-str">"no"</span>)      <span class="hl-comment">; "yes"</span>
+(<span class="hl-kw">if</span> <span class="hl-num">0</span> <span class="hl-str">"yes"</span> <span class="hl-str">"no"</span>)       <span class="hl-comment">; "no"</span>
+
+<span class="hl-comment">; Cross-type comparison</span>
+(<span class="hl-fn">&gt;</span> <span class="hl-num">5</span> <span class="hl-num">3.0</span>)               <span class="hl-comment">; true  (i64 promoted to f64)</span>
+
+<span class="hl-comment">; String + number: ERROR (no implicit coercion)</span>
+<span class="hl-comment">; (+ "42" 1)  ; type error — use (+ (as 'i64 "42") 1)</span></code></pre>
+
+      <!-- 4. String Conversions -->
+      <h2 id="string-conversions">4. String &#8596; Type Conversions</h2>
+      <p>Strings can be parsed into numeric, temporal, and symbol types with <code>as</code>. Conversely, any value can be cast to a string.</p>
+
+      <pre><code><span class="hl-comment">; Parse integers and floats from strings</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'i64</span> <span class="hl-str">"42"</span>)          <span class="hl-comment">; 42</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'f64</span> <span class="hl-str">"3.14"</span>)        <span class="hl-comment">; 3.14</span>
+
+<span class="hl-comment">; Number to string</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'str</span> <span class="hl-num">42</span>)            <span class="hl-comment">; "42"</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'str</span> <span class="hl-num">3.14</span>)          <span class="hl-comment">; "3.14"</span>
+
+<span class="hl-comment">; Parse date from ISO string (YYYY-MM-DD)</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'date</span> <span class="hl-str">"2024.01.15"</span>)          <span class="hl-comment">; 2024.01.15</span>
+
+<span class="hl-comment">; Parse time (HH:MM:SS.mmm)</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'time</span> <span class="hl-str">"12:30:00.000"</span>)        <span class="hl-comment">; 12:30:00.000</span>
+
+<span class="hl-comment">; Parse timestamp (ISO 8601)</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'timestamp</span> <span class="hl-str">"2024-01-15T12:30:00.000"</span>)  <span class="hl-comment">; 2024.01.15T12:30:00.000</span>
+
+<span class="hl-comment">; Boolean to/from string</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'str</span> true)           <span class="hl-comment">; "true"</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'b8</span> <span class="hl-str">"true"</span>)       <span class="hl-comment">; true  (non-empty string → true)</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'b8</span> <span class="hl-str">""</span>)           <span class="hl-comment">; false (empty string → false)</span></code></pre>
+
+      <!-- 5. Null Semantics -->
+      <h2 id="null-semantics">5. Null Semantics in Casting</h2>
+      <p>Null values propagate through casts. A typed null in one type becomes a typed null in the target type. Invalid string parses raise a domain error.</p>
+
+      <pre><code><span class="hl-comment">; Casting a typed null produces a typed null</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'f64</span> <span class="hl-num">0Ni</span>)           <span class="hl-comment">; 0Nf  (null i32 → null f64)</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'i64</span> <span class="hl-num">0Nf</span>)           <span class="hl-comment">; 0Nl  (null f64 → null i64)</span>
+
+<span class="hl-comment">; Null to string</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'str</span> <span class="hl-num">0Ni</span>)           <span class="hl-comment">; null string</span>
+
+<span class="hl-comment">; Invalid string parse → domain error</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'i64</span> <span class="hl-str">"not-a-number"</span>)  <span class="hl-comment">; error: domain</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'date</span> <span class="hl-str">"bad-date"</span>)     <span class="hl-comment">; error: domain</span></code></pre>
+
+      <div class="info-box">
+        <strong>Null literals by type:</strong>
+        <ul>
+          <li><code>0Ni</code> &mdash; null i32</li>
+          <li><code>0Nl</code> &mdash; null i64</li>
+          <li><code>0Nh</code> &mdash; null i16</li>
+          <li><code>0Ns</code> &mdash; null sym</li>
+          <li><code>0Nf</code> &mdash; null f64</li>
+          <li><code>0Nd</code> &mdash; null date</li>
+          <li><code>0Nt</code> &mdash; null time</li>
+          <li><code>0Np</code> &mdash; null timestamp</li>
+        </ul>
+        <p>Use <code>nil?</code> to test for null values: <code>(nil? 0Ni)</code> returns <code>true</code>.</p>
+      </div>
+
+      <pre><code><span class="hl-comment">; Null propagation through arithmetic</span>
+(<span class="hl-fn">+</span> <span class="hl-num">0Ni</span> <span class="hl-num">10</span>)              <span class="hl-comment">; 0Ni  (null propagates)</span>
+(<span class="hl-fn">*</span> <span class="hl-num">0Nf</span> <span class="hl-num">2.0</span>)             <span class="hl-comment">; 0Nf</span>
+
+<span class="hl-comment">; Null in vectors — null bitmap elements stay null</span>
+(<span class="hl-fn">+</span> [<span class="hl-num">1</span> 0Ni <span class="hl-num">3</span>] <span class="hl-num">10</span>)          <span class="hl-comment">; [11 0Ni 13]</span></code></pre>
+
+      <!-- 6. Symbol vs String -->
+      <h2 id="sym-vs-str">6. Symbol vs String</h2>
+      <p>Rayforce has two string representations with different performance characteristics. Choosing the right one matters for large datasets.</p>
+
+      <table>
+        <thead><tr><th>Feature</th><th>RAY_SYM (<code>'sym</code>)</th><th>RAY_STR (<code>'str</code>)</th></tr></thead>
+        <tbody>
+          <tr><td>Storage</td><td>Dictionary-encoded (integer indices into global intern table)</td><td>Variable-length (inline for 12 bytes or fewer, pooled for longer)</td></tr>
+          <tr><td>Comparison</td><td>Integer comparison (fast)</td><td>Byte comparison with 4-byte prefix rejection</td></tr>
+          <tr><td>Best for</td><td>Categorical data with repeated values (status, country, product)</td><td>Unique or freeform text (names, descriptions, URLs)</td></tr>
+          <tr><td>Group-by speed</td><td>Very fast (integer hashing)</td><td>Slower (string hashing)</td></tr>
+          <tr><td>Memory</td><td>Low for high-repeat columns (one copy per unique value)</td><td>Proportional to total text length</td></tr>
+        </tbody>
+      </table>
+
+      <pre><code><span class="hl-comment">; Creating symbol and string values</span>
+(<span class="hl-kw">set</span> s <span class="hl-sym">'Active</span>)         <span class="hl-comment">; symbol literal</span>
+(<span class="hl-kw">set</span> t <span class="hl-str">"hello world"</span>)   <span class="hl-comment">; string literal</span>
+
+<span class="hl-comment">; Converting between them</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'sym</span> <span class="hl-str">"Active"</span>)     <span class="hl-comment">; 'Active</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'str</span> <span class="hl-sym">'Active</span>)      <span class="hl-comment">; "Active"</span>
+
+<span class="hl-comment">; Symbol vectors (common in tables)</span>
+(<span class="hl-kw">set</span> statuses [<span class="hl-sym">'Active</span> <span class="hl-sym">'Inactive</span> <span class="hl-sym">'Active</span> <span class="hl-sym">'Pending</span>])
+(<span class="hl-fn">type</span> statuses)          <span class="hl-comment">; 'SYMBOL  (uppercase = vector)</span></code></pre>
+
+      <div class="info-box">
+        <strong>Rule of thumb:</strong> Use <code>'sym</code> for columns where you expect many repeated values (status codes, categories, tickers). Use <code>'str</code> for freeform text (descriptions, addresses, log messages).
+      </div>
+
+      <!-- 7. Date/Time Types -->
+      <h2 id="date-time">7. Date/Time Types</h2>
+      <p>Rayforce has three temporal types, all stored as integers internally:</p>
+
+      <table>
+        <thead><tr><th>Type</th><th>Internal</th><th>Epoch</th><th>Literal Format</th></tr></thead>
+        <tbody>
+          <tr><td><code>date</code></td><td>i32</td><td>Days since 2000-01-01</td><td><code>2024.01.15</code></td></tr>
+          <tr><td><code>time</code></td><td>i64</td><td>Nanoseconds since midnight</td><td><code>12:30:00.000</code></td></tr>
+          <tr><td><code>timestamp</code></td><td>i64</td><td>Nanoseconds since 2000-01-01T00:00:00</td><td><code>2024.01.15T12:30:00.000</code></td></tr>
+        </tbody>
+      </table>
+
+      <p><strong>Date arithmetic:</strong></p>
+      <pre><code><span class="hl-comment">; Add days to a date</span>
+(<span class="hl-fn">+</span> <span class="hl-num">2024.01.15</span> <span class="hl-num">1</span>)        <span class="hl-comment">; 2024.01.16</span>
+(<span class="hl-fn">+</span> <span class="hl-num">2024.01.15</span> <span class="hl-num">30</span>)       <span class="hl-comment">; 2024.02.14</span>
+
+<span class="hl-comment">; Subtract dates to get days between</span>
+(<span class="hl-fn">-</span> <span class="hl-num">2024.01.15</span> <span class="hl-num">2024.01.01</span>)  <span class="hl-comment">; 14</span>
+
+<span class="hl-comment">; Create a date range</span>
+(<span class="hl-fn">+</span> <span class="hl-num">2024.01.01</span> (<span class="hl-fn">til</span> <span class="hl-num">7</span>))   <span class="hl-comment">; [2024.01.01 2024.01.02 ... 2024.01.07]</span></code></pre>
+
+      <p><strong>Casting between temporal types:</strong></p>
+      <pre><code><span class="hl-comment">; Date to timestamp (midnight)</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'timestamp</span> <span class="hl-num">2024.01.15</span>)  <span class="hl-comment">; 2024.01.15T00:00:00.000</span>
+
+<span class="hl-comment">; Timestamp to date (strips time)</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'date</span> <span class="hl-num">2024.01.15T12:30:00.000</span>)  <span class="hl-comment">; 2024.01.15</span>
+
+<span class="hl-comment">; Date to integer (days since epoch)</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'i64</span> <span class="hl-num">2024.01.15</span>)      <span class="hl-comment">; 8780</span></code></pre>
+
+      <!-- 8. GUID -->
+      <h2 id="guid">8. GUID Type</h2>
+      <p>GUIDs are 16-byte unique identifiers displayed as hex strings. They are useful for primary keys, correlation IDs, and distributed systems.</p>
+
+      <pre><code><span class="hl-comment">; Generate a random GUID</span>
+(<span class="hl-fn">guid</span> <span class="hl-num">0</span>)
+<span class="hl-comment">; 8c6b8861-81dc-8e36-22a0-c5b1e9c0484e  (random each time)</span>
+
+<span class="hl-comment">; GUIDs support equality comparison</span>
+(<span class="hl-kw">set</span> g (<span class="hl-fn">guid</span> <span class="hl-num">0</span>))
+(<span class="hl-fn">==</span> g g)                  <span class="hl-comment">; true</span>
+
+<span class="hl-comment">; Type check</span>
+(<span class="hl-fn">type</span> (<span class="hl-fn">guid</span> <span class="hl-num">0</span>))           <span class="hl-comment">; 'guid</span></code></pre>
+
+      <!-- 9. sym-name -->
+      <h2 id="sym-name">9. <code>sym-name</code> Function</h2>
+      <p>The <code>sym-name</code> function resolves integer symbol IDs into symbols. Given a symbol atom, it returns the symbol unchanged. Given an i64 (a raw sym table index), it returns the corresponding symbol.</p>
+
+      <pre><code>(<span class="hl-fn">sym-name</span> <span class="hl-sym">'hello</span>)        <span class="hl-comment">; 'hello  (passthrough)</span>
+(<span class="hl-fn">sym-name</span> <span class="hl-num">0</span>)              <span class="hl-comment">; resolves sym ID 0 to its symbol</span>
+
+<span class="hl-comment">; Useful for building dynamic strings from symbols</span>
+<span class="hl-comment">;; To get a string from a symbol, use cast:</span>
+(<span class="hl-fn">as</span> <span class="hl-sym">'str</span> <span class="hl-sym">'hello</span>)          <span class="hl-comment">; "hello"</span></code></pre>
+
+      <!-- 10. Practical Examples -->
+      <h2 id="practical-examples">10. Practical Examples</h2>
+
+      <h3>CSV Type Fixing</h3>
+      <p>After loading a CSV, columns often arrive as strings. Cast them to proper types:</p>
+      <pre><code><span class="hl-comment">; Load CSV (all columns as strings by default)</span>
+(<span class="hl-kw">set</span> raw (<span class="hl-fn">.csv.read</span> <span class="hl-str">"trades.csv"</span>))
+
+<span class="hl-comment">; Cast columns to proper types</span>
+(<span class="hl-kw">set</span> trades
+  (<span class="hl-kw">update</span> {<span class="hl-sym">from:</span> raw
+    <span class="hl-sym">cols:</span> {<span class="hl-sym">price:</span>  (<span class="hl-fn">as</span> <span class="hl-sym">'f64</span> price)
+           <span class="hl-sym">qty:</span>    (<span class="hl-fn">as</span> <span class="hl-sym">'i64</span> qty)
+           <span class="hl-sym">date:</span>   (<span class="hl-fn">as</span> <span class="hl-sym">'date</span> date)
+           <span class="hl-sym">sym:</span>    (<span class="hl-fn">as</span> <span class="hl-sym">'sym</span> sym)}}))</code></pre>
+
+      <h3>Date Arithmetic for Analytics</h3>
+      <pre><code><span class="hl-comment">; Find records in the last 30 days</span>
+(<span class="hl-kw">set</span> today <span class="hl-num">2024.03.15</span>)
+(<span class="hl-kw">set</span> cutoff (<span class="hl-fn">-</span> today <span class="hl-num">30</span>))
+
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;=</span> <span class="hl-sym">date</span> cutoff)})</code></pre>
+
+      <h3>Building Typed Vectors</h3>
+      <pre><code><span class="hl-comment">; Build a date vector from strings</span>
+(<span class="hl-kw">set</span> dates (<span class="hl-fn">as</span> <span class="hl-sym">'date</span> [<span class="hl-str">"2024.01.01"</span> <span class="hl-str">"2024.02.01"</span> <span class="hl-str">"2024.03.01"</span>]))
+<span class="hl-comment">; [2024.01.01 2024.02.01 2024.03.01]</span>
+
+<span class="hl-comment">; Build a symbol vector from strings</span>
+(<span class="hl-kw">set</span> categories (<span class="hl-fn">as</span> <span class="hl-sym">'sym</span> [<span class="hl-str">"A"</span> <span class="hl-str">"B"</span> <span class="hl-str">"A"</span> <span class="hl-str">"C"</span>]))
+<span class="hl-comment">; ['A 'B 'A 'C]</span></code></pre>
+
+      <h3>Type-Safe Table Construction</h3>
+      <pre><code><span class="hl-comment">; Construct a well-typed table</span>
+(<span class="hl-kw">set</span> orders (<span class="hl-fn">table</span>
+  [<span class="hl-sym">id</span> <span class="hl-sym">product</span> <span class="hl-sym">price</span> <span class="hl-sym">date</span>]
+  (<span class="hl-fn">list</span>
+    [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>]
+    [<span class="hl-sym">'Widget</span> <span class="hl-sym">'Gadget</span> <span class="hl-sym">'Widget</span>]
+    [<span class="hl-num">9.99</span> <span class="hl-num">24.50</span> <span class="hl-num">9.99</span>]
+    (<span class="hl-fn">+</span> <span class="hl-num">2024.01.01</span> [<span class="hl-num">0</span> <span class="hl-num">1</span> <span class="hl-num">2</span>]))))
+
+<span class="hl-comment">; Verify column types</span>
+(<span class="hl-fn">meta</span> orders)
+<span class="hl-comment">; Shows: id (i64), product (sym), price (f64), date (date)</span></code></pre>
+
+      <h2 id="next-steps">Next Steps</h2>
+      <ul>
+        <li><a href="data-types.html"><strong>Data Types</strong></a> &mdash; Full reference for all Rayforce types</li>
+        <li><a href="operations-math.html"><strong>Math Operations</strong></a> &mdash; Arithmetic, aggregation, and rounding functions</li>
+        <li><a href="operations-string.html"><strong>String Operations</strong></a> &mdash; upper, lower, trim, substr, replace, concat, like</li>
+        <li><a href="queries-select.html"><strong>Select Queries</strong></a> &mdash; Filtering, grouping, and projecting with select</li>
+      </ul>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="guide-memory.html" class="docs-nav-link prev"><span class="docs-nav-dir">&larr; Previous</span><span class="docs-nav-title">Memory &amp; Monitoring</span></a>
+        <a href="architecture-pipeline.html" class="docs-nav-link next"><span class="docs-nav-dir">Next &rarr;</span><span class="docs-nav-title">Pipeline &amp; Optimizer</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

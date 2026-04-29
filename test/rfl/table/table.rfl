@@ -1,0 +1,12 @@
+;; Invariants for `table`.
+
+(set T (table [a b c] (list [1 2 3] [10 20 30] ['x 'y 'z])))
+(count T) -- 3
+(type T) -- 'TABLE
+
+;; key T gives the column-name list (sym vector)
+(key T) -- [a b c]
+
+;; column access via at-sym
+(at T 'a) -- [1 2 3]
+(at T 'b) -- [10 20 30]

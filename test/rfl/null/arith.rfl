@@ -1,0 +1,19 @@
+;; Null propagation through arithmetic.
+
+;; Atom + null → null
+(nil? (+ 0N 5)) -- true
+(nil? (- 0N 5)) -- true
+(nil? (* 0N 5)) -- true
+
+;; Vector with one null → result has null at that position
+(sum (map nil? (+ [1 2 0N 4] 10))) -- 1
+(sum (map nil? (* [1 2 0N 4] 2))) -- 1
+
+;; Element-wise vec+vec — null in either side propagates per element
+(sum (map nil? (+ [1 0N 3] [10 20 30]))) -- 1
+(sum (map nil? (+ [1 2 3] [0N 20 30]))) -- 1
+(sum (map nil? (+ [1 0N 3] [0N 20 30]))) -- 2
+
+;; Type-promoted arithmetic preserves null (i64+f64 → f64-null)
+(nil? (+ 0Nl 1.0)) -- true
+(sum (map nil? (+ [1 0Nl 3] 1.5))) -- 1

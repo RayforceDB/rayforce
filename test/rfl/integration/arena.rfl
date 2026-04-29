@@ -1,0 +1,25 @@
+;; Heavy-allocation churn — 100 000-element vectors in tight succession.
+;; Tests that the arena/buddy allocator holds up under pressure and that
+;; .sys.gc doesn't corrupt working state.
+
+(set N 100000)
+
+;; closed-form: sum 0..99999 = 99999 * 100000 / 2
+(sum (til N)) -- 4999950000
+
+;; linearity at 100k: sum(2*v) == 2*sum(v)
+(sum (* 2 (til N))) -- (* 2 (sum (til N)))
+
+;; concat-distributive: sum(v ++ v) == 2*sum(v)
+(sum (concat (til N) (til N))) -- (* 2 (sum (til N)))
+
+;; count survives an atomic op at 100k
+(count (+ (til N) 7)) -- 100000
+
+;; ────────────── gc doesn't perturb computation ──────────────
+;; Compute, gc, recompute — must be identical.
+(set S1 (sum (til 100000)))
+(.sys.gc)
+(set S2 (sum (til 100000)))
+S1 -- S2
+S1 -- 4999950000

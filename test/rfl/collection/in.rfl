@@ -1,0 +1,86 @@
+;; Invariants for `in` — membership test.
+
+(in 2 [1 2 3]) -- true
+(in 5 [1 2 3]) -- false
+(in [1 5 2] [1 2 3]) -- [true false true]
+
+;; every element of a vector is in itself
+(set V [3 1 4 1 5 9 2 6])
+(count V) -- (sum (in V V))
+
+;; concat-monotonic: if x in v, x in (concat v w)
+(set V2 [10 20 30])
+(set W [40 50])
+(count V2) -- (sum (in V2 (concat V2 W)))
+
+;; ---- Regression tests ported from test_lang_rf.inc::test_rf_in ----
+;; Ported from test_lang_rf.inc::test_rf_in.
+
+(in 2 2) -- true
+(in false [true false]) -- true
+(in 0x12 [0x12 0x11 0x10]) -- true
+(in 'e' "test") -- [true]
+(in "asd" "asd") -- [true true true]
+(in "asd" 'a') -- [true false false]
+(in 1h [2h 3h]) -- false
+(in 2h [2 3]) -- true
+(in 1i [1i 0Ni 2i]) -- true
+(in 2012.12.12 [2012.12.12 2012.12.13]) -- true
+(in 10:00:00.000 [10:00:00.000 20:10:10.500]) -- true
+(in 1 [0Nl]) -- false
+(in 'a ['a 'b 'c 'dd]) -- true
+(in 2024.01.01D10:00:00.000000000 []) -- false
+(in 1.0 [1.0 2.0 3.0]) -- true
+(in (guid 2) []) -- [false false]
+(in 2 (list '3' 2)) -- true
+(in 3 [1i 0Ni 2i]) -- false
+(in [true false] [false]) -- [false true]
+(in [0x00 0x01] [0x02 0x00]) -- [true false]
+(in "test" "post") -- [true false true true]
+(in [3h 2h 5h 0Nh] [1h 0Nh 2h 3h]) -- [true true false true]
+(in [3 2 5 0Nl -32768] [1h 0Nh 2h 3h]) -- [true true false true false]
+(in [3i 2i 5i 0Ni -32768i] [1h 0Nh 2h 3h]) -- [true true false true false]
+(in [3i 2i 5i 0Ni] [1i 0Ni 2i 3i]) -- [true true false true]
+(in [3h 2h 5h 0Nh] [1i 0Ni 2i 3i]) -- [true true false true]
+(in [3h 2h 5h 0Nh] [1 0Nl 2 3]) -- [true true false true]
+(in [3 2 5 0Nl -2147483648] [1i 0Ni 2i 3i]) -- [true true false true false]
+(in [3i 2i 0Ni] [1 0Nl 2 3]) -- [true true true]
+(in [3 2 5 0Nl] [1 0Nl 2 3]) -- [true true false true]
+(in (list 3h 2i 5 0Nl) [1 0Nl 2 3]) -- (list true true false true)
+(in [0 1 0Nl] 0Nl) -- [false false true]
+(in [3] (list 3i 2 5)) -- [true]
+(in 'a' (list "iu" "asd")) -- [false]
+(in 'a' (list "iu" "asd" 'a')) -- [true]
+(in "asd" (list "iu" "asd")) -- [false false false]
+(in "asd" (list 'd' "asd")) -- [false false true]
+(in (list "asd") (list "iu" "asd")) -- (list [false false false])
+;;(list true);
+(in (list "asd" "iu") "asd") -- (list [true true true] [false false])
+;;(list false false);
+(set l (guid 2)) (in l l) -- [true true]
+(set l (guid 2)) (in (first l) l) -- true
+(set l (guid 2)) (in l (first l)) -- [true false]
+(set l (guid 2)) (in (first l) (list (first l))) -- true
+(set l (guid 2)) (in (list (first l)) l) -- (list true)
+(set l (guid 2)) (in (list (first l)) (list l)) -- (list false)
+(set l (guid 2)) (in (list (first l)) (list (first l))) -- (list true)
+;; ========== I16 x I8 "IN" TESTS (Bug fix: index_in_i16_i8) ==========
+;; Test i16 values against i8 lookup set
+(in [1h 2h 3h] [1 2]) -- [true true false]
+;; i16 in i8 range
+(in [100h 50h 25h] [50 100]) -- [true true false]
+;; i16 values in i8 lookup
+(in [-128h 127h 0h] [-128 0 127]) -- [true true true]
+;; i8 boundary values
+(in [200h 10h] [10]) -- [false true]
+;; value outside i8 range
+;; ========== I16 x I16 "IN" TESTS (Bug fix: index_in_i16_i16 wrong size) ==========
+;; Test when x length > y length (was causing buffer overflow)
+(in [1h 2h 3h 4h 5h] [2h 4h]) -- [false true false true false]
+(in [10h 20h 30h 40h 50h 60h] [20h]) -- [false true false false false false]
+;; Test when x length < y length
+(in [1h 2h] [1h 2h 3h 4h 5h]) -- [true true]
+;; Test with equal lengths
+(in [1h 2h 3h] [3h 2h 1h]) -- [true true true]
+;; Test with empty arrays
+(in (list) [1h 2h]) -- (list)

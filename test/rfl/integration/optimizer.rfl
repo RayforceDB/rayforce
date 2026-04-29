@@ -1,0 +1,54 @@
+;; Integration tests targeting the query optimizer:
+;; const-fold, filter-reorder, predicate pushdown, selection-bitmap edges.
+;; Each test asserts that the optimized output equals what a hand-rolled
+;; non-optimized form produces.
+
+;; ────────────── filter reorder: and-conjoined predicates commute ──────────────
+;; The optimizer is free to reorder `(and p q)` for selectivity.  The
+;; result must be identical to either order's hand-rolled equivalent.
+(set T (table [sym price size] (list ['AAPL 'GOOG 'MSFT 'AAPL 'GOOG] [150.0 2800.0 310.0 151.5 2795.0] [100 50 200 150 40])))
+(set R1 (select {from: T where: (and (== sym 'AAPL) (> price 150))}))
+(set R2 (select {from: T where: (and (> price 150) (== sym 'AAPL))}))
+(count R1) -- (count R2)
+(sum (at R1 'price)) -- (sum (at R2 'price))
+(sum (at R1 'size))  -- (sum (at R2 'size))
+
+;; nested-select chain (filter, then filter again) must equal the single
+;; conjoined form
+(set R3 (select {from: (select {from: T where: (== sym 'AAPL)}) where: (> price 150)}))
+(count R3) -- (count R1)
+
+;; ────────────── predicate pushdown across group-by ──────────────
+;; (select s: agg from: t by: k where: pred) must equal manually
+;; filtering then grouping.
+(set Tg (table [g v] (list [1 1 2 2 2 3] [10 20 30 40 50 60])))
+
+(set Pre (select {s: (sum v) from: Tg by: g where: (> v 20)}))
+(set Manual (select {s: (sum v) from: (select {from: Tg where: (> v 20)}) by: g}))
+
+(count Pre) -- (count Manual)
+(sum (at Pre 's)) -- (sum (at Manual 's))
+;; oracle: filter v>20 keeps {30,40,50,60}; group 2 sums 120, group 3 sums 60.
+(sum (at Pre 's)) -- 180
+
+;; ────────────── selection bitmap: all-pass / none-pass / single-row ──────────────
+(set Ts (table [a b] (list [1 2 3 4 5] [10 20 30 40 50])))
+
+;; all-pass — selection bitmap is all-ones; row count = source row count
+(count (select {from: Ts where: (> a 0)})) -- 5
+(sum (at (select {from: Ts where: (> a 0)}) 'b)) -- 150
+
+;; none-pass — bitmap is all-zeros; row count = 0
+(count (select {from: Ts where: (> a 1000)})) -- 0
+(sum (at (select {from: Ts where: (> a 1000)}) 'b)) -- 0
+
+;; conjoined narrows: 2 < a < 5 keeps rows {3, 4}
+(count (select {from: Ts where: (and (> a 2) (< a 5))})) -- 2
+(sum (at (select {from: Ts where: (and (> a 2) (< a 5))}) 'b)) -- 70
+
+;; nested-select equivalent must match
+(count (select {from: (select {from: Ts where: (> a 2)}) where: (< a 5)})) -- 2
+
+;; single-row (==-keyed lookup)
+(count (select {from: Ts where: (== a 3)})) -- 1
+(sum (at (select {from: Ts where: (== a 3)}) 'b)) -- 30

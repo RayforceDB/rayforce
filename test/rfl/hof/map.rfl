@@ -1,0 +1,29 @@
+;; Invariants for `map` — apply a function to each element.
+
+(map (fn [x] (* x x)) [1 2 3 4 5]) -- [1 4 9 16 25]
+(map (fn [x] (+ x 10)) [0 1 2]) -- [10 11 12]
+
+;; count preserved
+(set V (rand 100 100))
+(count V) -- (count (map (fn [x] (+ x 1)) V))
+
+;; identity map is identity
+(count V) -- (sum (== (map (fn [x] x) V) V))
+
+;; builtin verbs as fn arguments
+(map neg [1 2 3]) -- [-1 -2 -3]
+(map abs [-1 2 -3]) -- [1 2 3]
+
+;; map on empty
+(count (map neg ())) -- 0
+
+;; ---- Regression tests ported from test_lang_rf.inc::test_rf_map ----
+;; Ported from test_lang_rf.inc::test_rf_map.
+
+;; Basic map
+(map count (list (list "aaa" "bbb"))) -- [2]
+(map (fn [x] (* x x)) [1 2 3 4 5]) -- [1 4 9 16 25]
+(map (fn [x] (sum (til 100))) (til 5)) -- [4950 4950 4950 4950 4950]
+;; Basic pmap - same results as map
+(pmap (fn [x] (* x x)) [1 2 3 4 5]) -- [1 4 9 16 25]
+(pmap (fn [x] (sum (til 100))) (til 5)) -- [4950 4950 4950 4950 4950]

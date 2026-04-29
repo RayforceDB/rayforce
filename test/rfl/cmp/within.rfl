@@ -1,0 +1,10 @@
+;; Invariants for `within` — (within v [lo hi]) checks lo <= x <= hi.
+
+(within [1 5 10] [3 7]) -- [false true false]
+
+;; all elements in their own range
+(set V (rand 256 1000))
+(count V) -- (sum (within V [0 999]))
+
+;; values outside range are false
+(count [1 2 3]) -- (sum (not (within [1 2 3] [10 20])))

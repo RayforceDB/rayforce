@@ -1,0 +1,206 @@
+;; Cross-type workout: a single 200-row, 11-column table touched by
+;; aggregation / sort / select / group-by / join / pivot / cast / csv /
+;; splayed paths.  One fixture, broad coverage — designed to exercise
+;; type switches in many .c files at once.
+;;
+;; Columns:
+;;   id     I64  — 0..199
+;;   i16c   I16  — 0..99 cycled (200%100)
+;;   i32c   I32  — 0..199 (mod 1000)
+;;   f64c   F64  — 0.0, 0.5, 1.0, … 99.5
+;;   sym    SYM  — AAPL/GOOG/MSFT/AMZN/TSLA cycling
+;;   str    STR  — alpha/beta/gamma/delta cycling
+;;   bool   B8   — true/false alternating
+;;   dt     DATE — three days cycling
+;;   tm     TIME — three times cycling
+;;   price  F64  — 100.0..149.0 cycled (50-cycle)
+;;   qty    I64  — -50..149 (signed, % 200)
+
+(set N 200)
+(set T (table [id i16c i32c f64c sym str bool dt tm price qty] (list (til N) (as 'I16 (% (til N) 100)) (as 'I32 (% (til N) 1000)) (as 'F64 (* 0.5 (til N))) (take ['AAPL 'GOOG 'MSFT 'AMZN 'TSLA] N) (take ["alpha" "beta" "gamma" "delta"] N) (take [true false] N) (take [2024.01.01 2024.01.02 2024.01.03] N) (take [09:30:00.000 10:00:00.000 11:30:00.000] N) (as 'F64 (+ 100.0 (% (til N) 50))) (- (% (til N) 200) 50))))
+
+;; ════════════════════ INSPECTION ════════════════════
+(count T)              -- 200
+(count (key T))        -- 11
+(at (meta T) 'type)    -- 'TABLE
+(at (meta T) 'len)     -- 11
+(type (at T 'id))      -- 'I64
+(type (at T 'i16c))    -- 'I16
+(type (at T 'i32c))    -- 'I32
+(type (at T 'f64c))    -- 'F64
+(type (at T 'sym))     -- 'SYM
+(type (at T 'str))     -- 'STR
+(type (at T 'bool))    -- 'B8
+(type (at T 'dt))      -- 'DATE
+(type (at T 'tm))      -- 'TIME
+
+;; ════════════════════ AGGREGATIONS PER COLUMN ════════════════════
+;; sum/count/avg/min/max/first/last/dev across each numeric column —
+;; routes through agg.c kernels per type.
+
+(sum (at T 'id))        -- 19900
+(count (at T 'id))      -- 200
+(min (at T 'id))        -- 0
+(max (at T 'id))        -- 199
+(first (at T 'id))      -- 0
+(last (at T 'id))       -- 199
+
+(avg (at T 'i16c))      -- 49.5
+(min (at T 'i16c))      -- 0h
+(max (at T 'i16c))      -- 99h
+
+(sum (at T 'i32c))      -- 19900
+(min (at T 'i32c))      -- 0i
+(max (at T 'i32c))      -- 199i
+
+(sum (at T 'f64c))      -- 9950.0
+(max (at T 'f64c))      -- 99.5
+(min (at T 'f64c))      -- 0.0
+
+(min (at T 'price))     -- 100.0
+(max (at T 'price))     -- 149.0
+
+(min (at T 'qty))       -- -50
+(max (at T 'qty))       -- 149
+
+;; non-numeric aggregations (first/last/min/max for SYM/STR/DATE/TIME)
+(first (at T 'sym))     -- 'AAPL
+(last (at T 'sym))      -- 'TSLA
+(first (at T 'str))     -- "alpha"
+(last (at T 'str))      -- "delta"
+;; first/last preserve type for DATE/TIME/TIMESTAMP/BOOL (was widening to i64)
+(first (at T 'dt))         -- 2024.01.01
+(type (first (at T 'dt)))  -- 'date
+(first (at T 'tm))         -- 09:30:00.000
+(type (first (at T 'tm)))  -- 'time
+(last (at T 'bool))        -- false
+(type (last (at T 'bool))) -- 'b8
+
+;; ════════════════════ COMPARISON ON COLUMNS ════════════════════
+(count (select {from: T where: (== sym 'AAPL)})) -- 40
+(count (select {from: T where: (!= sym 'TSLA)})) -- 160
+(count (select {from: T where: (> price 130.0)})) -- 76
+(count (select {from: T where: (<= price 110.0)})) -- 44
+(count (select {from: T where: (and (> qty 0) (< qty 100))})) -- 99
+(count (select {from: T where: (or (== sym 'AAPL) (== sym 'GOOG))})) -- 80
+(count (select {from: T where: (not (== bool true))})) -- 100
+
+;; ════════════════════ SORT ════════════════════
+;; whole-vec sort returns a fresh vec
+(at (asc (at T 'id)) 0)              -- 0
+(at (desc (at T 'id)) 0)             -- 199
+(at (asc (at T 'sym)) 0)             -- 'AAPL
+(at (desc (at T 'sym)) 0)            -- 'TSLA
+(at (asc (at T 'price)) 0)           -- 100.0
+(at (desc (at T 'price)) 0)          -- 149.0
+(count (rank (at T 'id)))            -- 200
+
+;; xasc/xdesc on the table reorder rows
+(at (at (xasc T 'qty) 'qty) 0)       -- -50
+(at (at (xdesc T 'qty) 'qty) 0)      -- 149
+(at (at (xasc T 'sym) 'sym) 0)       -- 'AAPL
+(at (at (xasc T 'price) 'price) 0)   -- 100.0
+
+;; ════════════════════ COLLECTION OPS ════════════════════
+(count (distinct (at T 'sym)))       -- 5
+(count (distinct (at T 'str)))       -- 4
+(count (distinct (at T 'bool)))      -- 2
+(count (distinct (at T 'dt)))        -- 3
+(count (distinct (at T 'i16c)))      -- 100
+
+(count (reverse (at T 'id)))         -- 200
+(at (reverse (at T 'id)) 0)          -- 199
+
+(count (take (at T 'id) 50))         -- 50
+(count (take (at T 'id) -50))        -- 50
+
+(count (concat (at T 'sym) (at T 'sym))) -- 400
+
+(count (in ['AAPL 'GOOG] (distinct (at T 'sym)))) -- 2
+
+;; ════════════════════ GROUP-BY (every key type) ════════════════════
+(count (select {c: (count id) from: T by: sym}))   -- 5
+(count (select {c: (count id) from: T by: str}))   -- 4
+(count (select {c: (count id) from: T by: bool}))  -- 2
+(count (select {c: (count id) from: T by: dt}))    -- 3
+(count (select {c: (count id) from: T by: i16c}))  -- 100
+
+;; aggregator combinations after grouping
+(sum (at (select {s: (sum qty) from: T by: sym}) 's))   -- (sum (at T 'qty))
+(sum (at (select {c: (count id) from: T by: sym}) 'c)) -- 200
+
+;; multi-key group-by
+(count (select {c: (count id) from: T by: [sym bool]})) -- 10
+(count (select {c: (count id) from: T by: [sym dt]}))   -- 15
+
+;; ════════════════════ DERIVED COLUMNS (DAG executor) ════════════════════
+;; integer + integer derived col — exact
+;; sum(id) + sum(qty) = 19900 + 9900 = 29800
+(sum (at (select {x: (+ id qty) from: T}) 'x))    -- 29800
+;; price >= 100 always; qty < 100 in 150 rows (i=0..149) → those match
+;; the rest (i=150..199) have qty=price, so > is false there.
+(count (select {from: T where: (> price qty)})) -- 150
+;; both id and qty are i64; result is i64
+(type (at (select {x: (- id qty) from: T}) 'x))   -- 'I64
+
+;; ════════════════════ JOINS ════════════════════
+(set Lookup (table [sym sector] (list ['AAPL 'GOOG 'MSFT 'AMZN 'TSLA] ['tech 'tech 'tech 'retail 'auto])))
+(count (inner-join [sym] T Lookup))               -- 200
+(count (left-join  [sym] T Lookup))               -- 200
+(count (anti-join  [sym] T (table [sym] (list ['AAPL 'GOOG])))) -- 120
+
+;; only AAPL and GOOG match the partial-coverage lookup
+(set Partial (table [sym info] (list ['AAPL 'GOOG] ['x 'y])))
+(count (inner-join [sym] T Partial)) -- 80
+
+;; ════════════════════ PIVOT ════════════════════
+;; sym × bool — 5 rows × 2 boolean columns
+(count (pivot T 'sym 'bool 'qty sum))            -- 5
+(count (pivot T 'sym 'bool 'qty count))          -- 5
+(count (pivot T 'sym 'bool 'price avg))          -- 5
+
+;; ════════════════════ CAST ACROSS COLUMN TYPES ════════════════════
+(type (as 'I64 (at T 'i16c)))                 -- 'I64
+(type (as 'F64 (at T 'i32c)))                 -- 'F64
+(type (as 'I32 (at T 'id)))                   -- 'I32
+(type (as 'I16 (at T 'i32c)))                 -- 'I16
+(type (as 'B8  (at T 'i16c)))                 -- 'B8
+
+(sum (as 'I64 (at T 'i16c))) -- (sum (at T 'i16c))
+(sum (as 'F64 (at T 'id))) -- 19900.0
+
+;; ════════════════════ UPDATE / INSERT (functional + in-place) ════════════════════
+(set Tu (update {from: 'T total: (* price qty)}))
+(count (key T))                 -- 12
+;; price * qty produces f64 (price is f64); large floats format as "1.27e+06"
+;; Just check the column exists and is f64.
+(type (at T 'total))            -- 'F64
+
+;; modify a column functionally
+(set Tm (modify T 'qty (fn [x] (* x 2))))
+(sum (at Tm 'qty))              -- (* 2 (sum (at T 'qty)))
+
+;; insert/upsert on a small simple table (full T has too many type
+;; constraints to insert one heterogeneous row)
+(set Tsmall (table [k v] (list [1 2 3] [10 20 30])))
+(count (insert Tsmall (list 4 40))) -- 4
+(count (upsert Tsmall 1 (list 2 99))) -- 3
+
+;; ════════════════════ CSV ROUND-TRIP ════════════════════
+(.csv.write T "/tmp/cross_type_workout.csv")
+(set R (.csv.read "/tmp/cross_type_workout.csv"))
+(count R)                        -- 200
+(count (key R))                  -- 12
+(sum (at R 'id))                 -- 19900
+(sum (at R 'i16c))               -- 9900
+
+;; ════════════════════ SPLAYED ROUND-TRIP ════════════════════
+;; Drop SYM column for splayed round-trip — there's an outstanding
+;; "corrupt" path with SYM that's tracked separately.  Use only
+;; numeric columns here.
+(set Tplain (table [id price qty] (list (at T 'id) (at T 'price) (at T 'qty))))
+(set-splayed "/tmp/cross_type_workout_splayed/" Tplain)
+(set Sp (get-splayed "/tmp/cross_type_workout_splayed/"))
+(count Sp)                       -- 200
+(sum (at Sp 'id))                -- 19900
+(sum (at Sp 'qty))               -- 9900

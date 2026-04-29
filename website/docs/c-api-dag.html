@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DAG &amp; Execution C API — Rayforce Documentation</title>
+  <meta name="description" content="Rayforce DAG construction, optimizer, executor, graph traversal, and storage C API reference with complete code examples.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link active">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>DAG &amp; Execution</span>
+      </div>
+
+      <h1>DAG &amp; Execution C API</h1>
+      <p class="page-subtitle">Build lazy operation DAGs, optimize with multi-pass rewriting, and execute as fused morsel-driven bytecode. Plus graph traversal, CSR storage, and columnar I/O.</p>
+
+      <div class="info-box">
+        <strong>Lazy evaluation.</strong> All <code>ray_*</code> DAG functions return <code>ray_op_t*</code> nodes. Nothing executes until you call <code>ray_execute(g, root)</code>. This allows the optimizer to rewrite the entire plan before any data flows.
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="dag-construction">DAG Construction</h2>
+
+      <h3 id="ray-graph-new">ray_graph_new</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_graph_new</span>
+        </div>
+        <div class="fn-desc">Creates a new operation graph bound to a source table. Column scans (<code>ray_scan</code>) resolve column names against this table. The table is retained.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_graph_t</span>* <span class="hl-fn">ray_graph_new</span>(<span class="hl-type">ray_t</span>* tbl);
+        </div>
+      </div>
+
+      <h3 id="ray-graph-free">ray_graph_free</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_graph_free</span>
+        </div>
+        <div class="fn-desc">Frees the operation graph and all its nodes. Does not release the bound table or results &mdash; the caller must release those separately.</div>
+        <div class="fn-example">
+<span class="hl-type">void</span> <span class="hl-fn">ray_graph_free</span>(<span class="hl-type">ray_graph_t</span>* g);
+        </div>
+      </div>
+
+      <h3 id="source-ops">Source Operations</h3>
+      <p>Source operations produce data from tables, constants, or external vectors.</p>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_scan</span>
+        </div>
+        <div class="fn-desc">Scans a named column from the bound table. The name is interned into the symbol table. Returns an <code>OP_SCAN</code> node.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_scan</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-kw">const</span> <span class="hl-type">char</span>* col_name);
+        </div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_const_i64 / ray_const_f64 / ray_const_bool / ray_const_str</span>
+        </div>
+        <div class="fn-desc">Create constant scalar nodes. These broadcast to match vector lengths during execution.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_const_i64</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">int64_t</span> val);
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_const_f64</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">double</span> val);
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_const_bool</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">bool</span> val);
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_const_str</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-kw">const</span> <span class="hl-type">char</span>* s, <span class="hl-type">size_t</span> len);
+        </div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_const_vec / ray_const_table</span>
+        </div>
+        <div class="fn-desc">Inject a pre-built vector or table into the DAG. Useful for multi-table joins.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_const_vec</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_t</span>* vec);
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_const_table</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_t</span>* table);
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="unary-ops">Unary Operations</h2>
+      <p>Element-wise unary operations. These are fuseable &mdash; the optimizer merges chains of unary/binary ops into single morsel passes.</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Opcode</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ray_neg(g, a)</code></td><td><code>OP_NEG</code></td><td>Arithmetic negation</td></tr>
+          <tr><td><code>ray_abs(g, a)</code></td><td><code>OP_ABS</code></td><td>Absolute value</td></tr>
+          <tr><td><code>ray_not(g, a)</code></td><td><code>OP_NOT</code></td><td>Logical NOT</td></tr>
+          <tr><td><code>ray_sqrt_op(g, a)</code></td><td><code>OP_SQRT</code></td><td>Square root</td></tr>
+          <tr><td><code>ray_log_op(g, a)</code></td><td><code>OP_LOG</code></td><td>Natural logarithm</td></tr>
+          <tr><td><code>ray_exp_op(g, a)</code></td><td><code>OP_EXP</code></td><td>Exponential (e^x)</td></tr>
+          <tr><td><code>ray_ceil_op(g, a)</code></td><td><code>OP_CEIL</code></td><td>Ceiling</td></tr>
+          <tr><td><code>ray_floor_op(g, a)</code></td><td><code>OP_FLOOR</code></td><td>Floor</td></tr>
+          <tr><td><code>ray_isnull(g, a)</code></td><td><code>OP_ISNULL</code></td><td>Returns BOOL: true if null</td></tr>
+          <tr><td><code>ray_upper(g, a)</code></td><td><code>OP_UPPER</code></td><td>Uppercase string</td></tr>
+          <tr><td><code>ray_lower(g, a)</code></td><td><code>OP_LOWER</code></td><td>Lowercase string</td></tr>
+          <tr><td><code>ray_strlen(g, a)</code></td><td><code>OP_STRLEN</code></td><td>String byte length</td></tr>
+          <tr><td><code>ray_trim_op(g, a)</code></td><td><code>OP_TRIM</code></td><td>Strip whitespace</td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="ray-cast">ray_cast</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_cast</span>
+        </div>
+        <div class="fn-desc">Type cast. Converts the input to <code>target_type</code> (e.g., <code>RAY_F64</code>, <code>RAY_I64</code>).</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_cast</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* a, <span class="hl-type">int8_t</span> target_type);
+
+<span class="hl-comment">/* Cast I64 column to F64 */</span>
+<span class="hl-type">ray_op_t</span>* price_f = <span class="hl-fn">ray_cast</span>(g, <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"price"</span>), <span class="hl-num">RAY_F64</span>);
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="binary-ops">Binary Operations</h2>
+      <p>Element-wise binary operations. All are fuseable into morsel passes.</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Opcode</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ray_add(g, a, b)</code></td><td><code>OP_ADD</code></td><td>Addition</td></tr>
+          <tr><td><code>ray_sub(g, a, b)</code></td><td><code>OP_SUB</code></td><td>Subtraction</td></tr>
+          <tr><td><code>ray_mul(g, a, b)</code></td><td><code>OP_MUL</code></td><td>Multiplication</td></tr>
+          <tr><td><code>ray_div(g, a, b)</code></td><td><code>OP_DIV</code></td><td>Division</td></tr>
+          <tr><td><code>ray_mod(g, a, b)</code></td><td><code>OP_MOD</code></td><td>Modulo</td></tr>
+          <tr><td><code>ray_eq(g, a, b)</code></td><td><code>OP_EQ</code></td><td>Equal</td></tr>
+          <tr><td><code>ray_ne(g, a, b)</code></td><td><code>OP_NE</code></td><td>Not equal</td></tr>
+          <tr><td><code>ray_lt(g, a, b)</code></td><td><code>OP_LT</code></td><td>Less than</td></tr>
+          <tr><td><code>ray_le(g, a, b)</code></td><td><code>OP_LE</code></td><td>Less than or equal</td></tr>
+          <tr><td><code>ray_gt(g, a, b)</code></td><td><code>OP_GT</code></td><td>Greater than</td></tr>
+          <tr><td><code>ray_ge(g, a, b)</code></td><td><code>OP_GE</code></td><td>Greater than or equal</td></tr>
+          <tr><td><code>ray_and(g, a, b)</code></td><td><code>OP_AND</code></td><td>Logical AND</td></tr>
+          <tr><td><code>ray_or(g, a, b)</code></td><td><code>OP_OR</code></td><td>Logical OR</td></tr>
+          <tr><td><code>ray_like(g, a, b)</code></td><td><code>OP_LIKE</code></td><td>SQL LIKE (case-sensitive)</td></tr>
+          <tr><td><code>ray_ilike(g, a, b)</code></td><td><code>OP_ILIKE</code></td><td>SQL LIKE (case-insensitive)</td></tr>
+          <tr><td><code>ray_min2(g, a, b)</code></td><td><code>OP_MIN2</code></td><td>Element-wise minimum</td></tr>
+          <tr><td><code>ray_max2(g, a, b)</code></td><td><code>OP_MAX2</code></td><td>Element-wise maximum</td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="ray-if">ray_if</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_if</span>
+        </div>
+        <div class="fn-desc">Ternary conditional: for each element, returns <code>then_val</code> where <code>cond</code> is true, <code>else_val</code> otherwise.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_if</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* cond,
+               <span class="hl-type">ray_op_t</span>* then_val, <span class="hl-type">ray_op_t</span>* else_val);
+        </div>
+      </div>
+
+      <h3 id="string-binary">String binary/ternary ops</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_substr / ray_replace / ray_concat</span>
+        </div>
+        <div class="fn-desc">DAG nodes for string operations. <code>ray_concat</code> accepts an array of N inputs.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_substr</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* str,
+                    <span class="hl-type">ray_op_t</span>* start, <span class="hl-type">ray_op_t</span>* len);
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_replace</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* str,
+                     <span class="hl-type">ray_op_t</span>* from, <span class="hl-type">ray_op_t</span>* to);
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_concat</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>** args, <span class="hl-type">int</span> n);
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="aggregations">Aggregation Operations</h2>
+      <p>Reduction operations that collapse a column to a single value (or per-group values when combined with <code>ray_group</code>).</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Opcode</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ray_sum(g, a)</code></td><td><code>OP_SUM</code></td><td>Sum of values</td></tr>
+          <tr><td><code>ray_prod(g, a)</code></td><td><code>OP_PROD</code></td><td>Product of values</td></tr>
+          <tr><td><code>ray_count(g, a)</code></td><td><code>OP_COUNT</code></td><td>Count of non-null values</td></tr>
+          <tr><td><code>ray_avg(g, a)</code></td><td><code>OP_AVG</code></td><td>Average (mean)</td></tr>
+          <tr><td><code>ray_min_op(g, a)</code></td><td><code>OP_MIN</code></td><td>Minimum value</td></tr>
+          <tr><td><code>ray_max_op(g, a)</code></td><td><code>OP_MAX</code></td><td>Maximum value</td></tr>
+          <tr><td><code>ray_first(g, a)</code></td><td><code>OP_FIRST</code></td><td>First non-null value</td></tr>
+          <tr><td><code>ray_last(g, a)</code></td><td><code>OP_LAST</code></td><td>Last non-null value</td></tr>
+          <tr><td><code>ray_count_distinct(g, a)</code></td><td><code>OP_COUNT_DISTINCT</code></td><td>Count of distinct values</td></tr>
+          <tr><td><code>ray_stddev(g, a)</code></td><td><code>OP_STDDEV</code></td><td>Sample standard deviation</td></tr>
+          <tr><td><code>ray_stddev_pop(g, a)</code></td><td><code>OP_STDDEV_POP</code></td><td>Population standard deviation</td></tr>
+          <tr><td><code>ray_var(g, a)</code></td><td><code>OP_VAR</code></td><td>Sample variance</td></tr>
+          <tr><td><code>ray_var_pop(g, a)</code></td><td><code>OP_VAR_POP</code></td><td>Population variance</td></tr>
+        </tbody>
+      </table>
+
+      <!-- ============================================================ -->
+      <h2 id="structural">Structural Operations</h2>
+      <p>Pipeline breakers that reshape data: filtering, sorting, grouping, joining, and projecting.</p>
+
+      <h3 id="ray-filter">ray_filter</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_filter</span>
+        </div>
+        <div class="fn-desc">Lazily filters a column by a boolean predicate. The predicate must produce a BOOL vector. Rows where the predicate is false (or null) are excluded.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_filter</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* input,
+                    <span class="hl-type">ray_op_t</span>* predicate);
+        </div>
+      </div>
+
+      <h3 id="ray-sort-op">ray_sort_op</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_sort_op</span>
+        </div>
+        <div class="fn-desc">Multi-column sort. Pass arrays of key nodes, sort directions (1=descending), and null ordering (1=nulls first). Uses parallel radix sort for numerics, merge sort for strings.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_sort_op</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* table_node,
+                    <span class="hl-type">ray_op_t</span>** keys, <span class="hl-type">uint8_t</span>* descs,
+                    <span class="hl-type">uint8_t</span>* nulls_first, <span class="hl-type">uint8_t</span> n_cols);
+        </div>
+      </div>
+
+      <h3 id="ray-group">ray_group</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_group</span>
+        </div>
+        <div class="fn-desc">Group-by with aggregation. Groups by <code>n_keys</code> key columns, applying <code>n_aggs</code> aggregate operations (specified as <code>OP_SUM</code>, <code>OP_COUNT</code>, etc.) to the corresponding input columns.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_group</span>(<span class="hl-type">ray_graph_t</span>* g,
+                   <span class="hl-type">ray_op_t</span>** keys, <span class="hl-type">uint8_t</span> n_keys,
+                   <span class="hl-type">uint16_t</span>* agg_ops, <span class="hl-type">ray_op_t</span>** agg_ins,
+                   <span class="hl-type">uint8_t</span> n_aggs);
+        </div>
+      </div>
+
+      <h3 id="ray-distinct">ray_distinct</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_distinct</span>
+        </div>
+        <div class="fn-desc">Returns distinct rows based on the given key columns.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_distinct</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>** keys, <span class="hl-type">uint8_t</span> n_keys);
+        </div>
+      </div>
+
+      <h3 id="ray-join">ray_join</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_join</span>
+        </div>
+        <div class="fn-desc">Hash join between two tables on matching key columns. Join types: 0=inner, 1=left outer, 2=full outer. Uses radix-partitioned hash join with adaptive radix bits (2..14) to fit L2 cache.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_join</span>(<span class="hl-type">ray_graph_t</span>* g,
+                  <span class="hl-type">ray_op_t</span>* left_table, <span class="hl-type">ray_op_t</span>** left_keys,
+                  <span class="hl-type">ray_op_t</span>* right_table, <span class="hl-type">ray_op_t</span>** right_keys,
+                  <span class="hl-type">uint8_t</span> n_keys, <span class="hl-type">uint8_t</span> join_type);
+        </div>
+      </div>
+
+      <h3 id="ray-asof-join">ray_asof_join</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_asof_join</span>
+        </div>
+        <div class="fn-desc">As-of join for time-series alignment. Matches each left row to the most recent right row with a time key &le; the left's time key, optionally partitioned by equality keys.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_asof_join</span>(<span class="hl-type">ray_graph_t</span>* g,
+                       <span class="hl-type">ray_op_t</span>* left_table, <span class="hl-type">ray_op_t</span>* right_table,
+                       <span class="hl-type">ray_op_t</span>* time_key,
+                       <span class="hl-type">ray_op_t</span>** eq_keys, <span class="hl-type">uint8_t</span> n_eq_keys,
+                       <span class="hl-type">uint8_t</span> join_type);
+        </div>
+      </div>
+
+      <h3 id="ray-window-op">ray_window_op</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_window_op</span>
+        </div>
+        <div class="fn-desc">Window functions with partition keys, order keys, frame specification, and multiple function kinds (ROW_NUMBER, RANK, DENSE_RANK, NTILE, SUM, AVG, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE).</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_window_op</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* table_node,
+    <span class="hl-type">ray_op_t</span>** part_keys, <span class="hl-type">uint8_t</span> n_part,
+    <span class="hl-type">ray_op_t</span>** order_keys, <span class="hl-type">uint8_t</span>* order_descs, <span class="hl-type">uint8_t</span> n_order,
+    <span class="hl-type">uint8_t</span>* func_kinds, <span class="hl-type">ray_op_t</span>** func_inputs,
+    <span class="hl-type">int64_t</span>* func_params, <span class="hl-type">uint8_t</span> n_funcs,
+    <span class="hl-type">uint8_t</span> frame_type, <span class="hl-type">uint8_t</span> frame_start,
+    <span class="hl-type">uint8_t</span> frame_end,
+    <span class="hl-type">int64_t</span> frame_start_n, <span class="hl-type">int64_t</span> frame_end_n);
+        </div>
+      </div>
+
+      <h3 id="ray-head-tail">ray_head / ray_tail / ray_select</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_head / ray_tail / ray_select</span>
+        </div>
+        <div class="fn-desc"><code>ray_head</code> returns the first N rows, <code>ray_tail</code> returns the last N rows. <code>ray_select</code> projects specific columns from a table node.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_head</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* input, <span class="hl-type">int64_t</span> n);
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_tail</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* input, <span class="hl-type">int64_t</span> n);
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_select</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* input,
+                    <span class="hl-type">ray_op_t</span>** cols, <span class="hl-type">uint8_t</span> n_cols);
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="graph-ops">Graph Operations</h2>
+      <p>Graph traversal operations work on CSR edge indices (<code>ray_rel_t</code>). See <a href="#csr">CSR / Relationship API</a> below to build the index.</p>
+
+      <h3 id="ray-expand">ray_expand</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_expand</span>
+        </div>
+        <div class="fn-desc">1-hop neighbor expansion. For each source node, outputs all neighbors from the CSR index. Direction: 0=forward, 1=reverse, 2=both.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_expand</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* src_nodes,
+                    <span class="hl-type">ray_rel_t</span>* rel, <span class="hl-type">uint8_t</span> direction);
+        </div>
+      </div>
+
+      <h3 id="ray-var-expand">ray_var_expand</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_var_expand</span>
+        </div>
+        <div class="fn-desc">Variable-length BFS traversal from start nodes through <code>min_depth</code> to <code>max_depth</code> hops. With <code>track_path=true</code>, outputs the full path for each reached node.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_var_expand</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* start_nodes,
+                        <span class="hl-type">ray_rel_t</span>* rel, <span class="hl-type">uint8_t</span> direction,
+                        <span class="hl-type">uint8_t</span> min_depth, <span class="hl-type">uint8_t</span> max_depth,
+                        <span class="hl-type">bool</span> track_path);
+        </div>
+      </div>
+
+      <h3 id="ray-shortest-path">ray_shortest_path</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_shortest_path</span>
+        </div>
+        <div class="fn-desc">BFS shortest path between source and destination nodes, up to <code>max_depth</code> hops.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_shortest_path</span>(<span class="hl-type">ray_graph_t</span>* g,
+    <span class="hl-type">ray_op_t</span>* src, <span class="hl-type">ray_op_t</span>* dst,
+    <span class="hl-type">ray_rel_t</span>* rel, <span class="hl-type">uint8_t</span> max_depth);
+        </div>
+      </div>
+
+      <h3 id="ray-wco-join">ray_wco_join</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_wco_join</span>
+        </div>
+        <div class="fn-desc">Worst-case optimal join via Leapfrog Triejoin. Enumerates multi-way patterns (triangles, k-cliques) over multiple relationships without materializing intermediate cross-products.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_wco_join</span>(<span class="hl-type">ray_graph_t</span>* g,
+                      <span class="hl-type">ray_rel_t</span>** rels, <span class="hl-type">uint8_t</span> n_rels,
+                      <span class="hl-type">uint8_t</span> n_vars);
+        </div>
+      </div>
+
+      <h3>Additional Graph Algorithms</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Algorithm</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ray_pagerank(g, rel, max_iter, damping)</code></td><td>Iterative PageRank</td></tr>
+          <tr><td><code>ray_connected_comp(g, rel)</code></td><td>Connected components (label propagation)</td></tr>
+          <tr><td><code>ray_dijkstra(g, src, dst, rel, weight_col, max_depth)</code></td><td>Weighted shortest path</td></tr>
+          <tr><td><code>ray_louvain(g, rel, max_iter)</code></td><td>Louvain community detection</td></tr>
+          <tr><td><code>ray_degree_cent(g, rel)</code></td><td>Degree centrality</td></tr>
+          <tr><td><code>ray_topsort(g, rel)</code></td><td>Topological sort (Kahn's)</td></tr>
+          <tr><td><code>ray_dfs(g, src, rel, max_depth)</code></td><td>Depth-first search</td></tr>
+          <tr><td><code>ray_astar(g, src, dst, rel, weight, lat, lon, props, max_depth)</code></td><td>A* shortest path</td></tr>
+          <tr><td><code>ray_k_shortest(g, src, dst, rel, weight_col, k)</code></td><td>Yen's k-shortest paths</td></tr>
+          <tr><td><code>ray_cluster_coeff(g, rel)</code></td><td>Clustering coefficients</td></tr>
+          <tr><td><code>ray_random_walk(g, src, rel, walk_length)</code></td><td>Random walk traversal</td></tr>
+          <tr><td><code>ray_betweenness(g, rel, sample_size)</code></td><td>Betweenness centrality (Brandes)</td></tr>
+          <tr><td><code>ray_closeness(g, rel, sample_size)</code></td><td>Closeness centrality</td></tr>
+          <tr><td><code>ray_mst(g, rel, weight_col)</code></td><td>Minimum spanning forest (Kruskal)</td></tr>
+        </tbody>
+      </table>
+
+      <!-- ============================================================ -->
+      <h2 id="optimizer-executor">Optimizer &amp; Executor</h2>
+
+      <h3 id="ray-optimize">ray_optimize</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_optimize</span>
+        </div>
+        <div class="fn-desc">Runs the multi-pass optimizer on the DAG rooted at <code>root</code>: type inference, constant folding, sideways information passing, factorize, predicate pushdown, filter reorder, projection pushdown, partition pruning, fusion, dead code elimination. Returns the optimized root node (may differ from input).</div>
+        <div class="fn-example">
+<span class="hl-type">ray_op_t</span>* <span class="hl-fn">ray_optimize</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* root);
+        </div>
+      </div>
+
+      <h3 id="ray-execute">ray_execute</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_execute</span>
+        </div>
+        <div class="fn-desc">Executes the DAG from the given root node. Processes data in 1024-element morsels through fused bytecode pipelines. Returns a <code>ray_t*</code> result (vector or table). Returns an error object on failure &mdash; check with <code>RAY_IS_ERR()</code>. The caller owns the result and must release it.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">ray_execute</span>(<span class="hl-type">ray_graph_t</span>* g, <span class="hl-type">ray_op_t</span>* root);
+
+<span class="hl-type">ray_t</span>* result = <span class="hl-fn">ray_execute</span>(g, <span class="hl-fn">ray_optimize</span>(g, root));
+<span class="hl-kw">if</span> (<span class="hl-fn">RAY_IS_ERR</span>(result)) {
+    <span class="hl-comment">/* handle error */</span>
+    <span class="hl-fn">ray_release</span>(result);
+}
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="csr">CSR / Relationship API</h2>
+      <p>Build, save, load, and query double-indexed CSR edge indices for graph traversal.</p>
+
+      <h3 id="ray-rel-build">ray_rel_build</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_rel_build</span>
+        </div>
+        <div class="fn-desc">Builds a CSR relationship from a table with a foreign-key column. Creates forward index only. Set <code>sort_targets=true</code> for sorted adjacency lists (required for WCO join).</div>
+        <div class="fn-example">
+<span class="hl-type">ray_rel_t</span>* <span class="hl-fn">ray_rel_build</span>(<span class="hl-type">ray_t</span>* from_table, <span class="hl-kw">const</span> <span class="hl-type">char</span>* fk_col,
+                         <span class="hl-type">int64_t</span> n_target_nodes, <span class="hl-type">bool</span> sort_targets);
+        </div>
+      </div>
+
+      <h3 id="ray-rel-from-edges">ray_rel_from_edges</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_rel_from_edges</span>
+        </div>
+        <div class="fn-desc">Builds a double-indexed CSR (forward + reverse) from an edge table with <code>src_col</code> and <code>dst_col</code>. Specify the number of source and destination nodes explicitly.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_rel_t</span>* <span class="hl-fn">ray_rel_from_edges</span>(<span class="hl-type">ray_t</span>* edge_table,
+    <span class="hl-kw">const</span> <span class="hl-type">char</span>* src_col, <span class="hl-kw">const</span> <span class="hl-type">char</span>* dst_col,
+    <span class="hl-type">int64_t</span> n_src_nodes, <span class="hl-type">int64_t</span> n_dst_nodes,
+    <span class="hl-type">bool</span> sort_targets);
+        </div>
+      </div>
+
+      <h3 id="ray-rel-io">ray_rel_save / ray_rel_load / ray_rel_mmap</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_rel_save / ray_rel_load / ray_rel_mmap</span>
+        </div>
+        <div class="fn-desc">Persist and load CSR indices as column files in a directory. <code>ray_rel_mmap</code> memory-maps the files for zero-copy access.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_err_t</span>  <span class="hl-fn">ray_rel_save</span>(<span class="hl-type">ray_rel_t</span>* rel, <span class="hl-kw">const</span> <span class="hl-type">char</span>* dir);
+<span class="hl-type">ray_rel_t</span>* <span class="hl-fn">ray_rel_load</span>(<span class="hl-kw">const</span> <span class="hl-type">char</span>* dir);
+<span class="hl-type">ray_rel_t</span>* <span class="hl-fn">ray_rel_mmap</span>(<span class="hl-kw">const</span> <span class="hl-type">char</span>* dir);
+        </div>
+      </div>
+
+      <h3 id="ray-rel-free">ray_rel_free</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_rel_free</span>
+        </div>
+        <div class="fn-desc">Frees a relationship and both its CSR indices (offsets, targets, rowmap vectors).</div>
+        <div class="fn-example">
+<span class="hl-type">void</span> <span class="hl-fn">ray_rel_free</span>(<span class="hl-type">ray_rel_t</span>* rel);
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="storage">Storage API</h2>
+      <p>Columnar file I/O for vectors, splayed tables, and CSV.</p>
+
+      <h3 id="ray-col-io">Column I/O</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_col_save / ray_col_load / ray_col_mmap</span>
+        </div>
+        <div class="fn-desc">Save a vector to a column file, load it back, or memory-map it for zero-copy reads. The file format includes type, length, null bitmap, and element data.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_err_t</span> <span class="hl-fn">ray_col_save</span>(<span class="hl-type">ray_t</span>* vec, <span class="hl-kw">const</span> <span class="hl-type">char</span>* path);
+<span class="hl-type">ray_t</span>*    <span class="hl-fn">ray_col_load</span>(<span class="hl-kw">const</span> <span class="hl-type">char</span>* path);
+<span class="hl-type">ray_t</span>*    <span class="hl-fn">ray_col_mmap</span>(<span class="hl-kw">const</span> <span class="hl-type">char</span>* path);
+        </div>
+      </div>
+
+      <h3 id="ray-splay">Splayed Tables</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_splay_save / ray_splay_load</span>
+        </div>
+        <div class="fn-desc">Save a table as a directory of column files (one per column) plus a symbol table. Load reconstructs the table from the directory.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_err_t</span> <span class="hl-fn">ray_splay_save</span>(<span class="hl-type">ray_t</span>* tbl, <span class="hl-kw">const</span> <span class="hl-type">char</span>* dir,
+                        <span class="hl-kw">const</span> <span class="hl-type">char</span>* sym_path);
+<span class="hl-type">ray_t</span>*    <span class="hl-fn">ray_splay_load</span>(<span class="hl-kw">const</span> <span class="hl-type">char</span>* dir,
+                        <span class="hl-kw">const</span> <span class="hl-type">char</span>* sym_path);
+        </div>
+      </div>
+
+      <h3 id="ray-csv">CSV I/O</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">ray_read_csv / ray_read_csv_opts / ray_write_csv</span>
+        </div>
+        <div class="fn-desc"><code>ray_read_csv</code> loads a CSV file with automatic type inference, parallel parsing, and null handling. <code>ray_read_csv_opts</code> allows custom delimiter, header flag, and null string. <code>ray_write_csv</code> writes a table to CSV.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>*    <span class="hl-fn">ray_read_csv</span>(<span class="hl-kw">const</span> <span class="hl-type">char</span>* path);
+<span class="hl-type">ray_t</span>*    <span class="hl-fn">ray_read_csv_opts</span>(<span class="hl-kw">const</span> <span class="hl-type">char</span>* path,
+              <span class="hl-type">char</span> delimiter, <span class="hl-type">bool</span> header,
+              <span class="hl-kw">const</span> <span class="hl-type">char</span>* null_str);
+<span class="hl-type">ray_err_t</span> <span class="hl-fn">ray_write_csv</span>(<span class="hl-type">ray_t</span>* table, <span class="hl-kw">const</span> <span class="hl-type">char</span>* path);
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="datalog">Datalog API</h2>
+      <p>Build, stratify, and evaluate Datalog programs over Rayforce tables. Include <code>"datalog/datalog.h"</code> for all Datalog types and functions.</p>
+
+      <h3 id="dl-program-new">dl_program_new / dl_program_free</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">dl_program_new / dl_program_free</span>
+        </div>
+        <div class="fn-desc">Create a new empty Datalog program, or free one and release all owned tables.</div>
+        <div class="fn-example">
+<span class="hl-type">dl_program_t</span>* <span class="hl-fn">dl_program_new</span>(<span class="hl-type">void</span>);
+<span class="hl-type">void</span> <span class="hl-fn">dl_program_free</span>(<span class="hl-type">dl_program_t</span>* prog);
+        </div>
+      </div>
+
+      <h3 id="dl-add-edb">dl_add_edb</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">dl_add_edb</span>
+        </div>
+        <div class="fn-desc">Register an extensional (base fact) relation backed by an existing columnar table. Column names are auto-generated as <code>"{name}__c0"</code>, <code>"{name}__c1"</code>, &hellip; (prefixed with the relation name to avoid collisions in joins). Returns the relation index.</div>
+        <div class="fn-example">
+<span class="hl-type">int</span> <span class="hl-fn">dl_add_edb</span>(<span class="hl-type">dl_program_t</span>* prog, <span class="hl-kw">const</span> <span class="hl-type">char</span>* name,
+              <span class="hl-type">ray_t</span>* table, <span class="hl-type">int</span> arity);
+        </div>
+      </div>
+
+      <h3 id="dl-add-rule">dl_add_rule</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">dl_add_rule</span>
+        </div>
+        <div class="fn-desc">Add a rule to the program. The rule struct is copied. Returns the rule index. Use the rule builder helpers (<code>dl_rule_init</code>, <code>dl_rule_add_atom</code>, etc.) to construct rules.</div>
+        <div class="fn-example">
+<span class="hl-type">int</span> <span class="hl-fn">dl_add_rule</span>(<span class="hl-type">dl_program_t</span>* prog, <span class="hl-kw">const</span> <span class="hl-type">dl_rule_t</span>* rule);
+        </div>
+      </div>
+
+      <h3 id="dl-stratify">dl_stratify</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">dl_stratify</span>
+        </div>
+        <div class="fn-desc">Compute stratification (topological sort of the negation dependency graph). Returns 0 on success, &minus;1 if the program has an unstratifiable negation cycle.</div>
+        <div class="fn-example">
+<span class="hl-type">int</span> <span class="hl-fn">dl_stratify</span>(<span class="hl-type">dl_program_t</span>* prog);
+        </div>
+      </div>
+
+      <h3 id="dl-eval">dl_eval</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">dl_eval</span>
+        </div>
+        <div class="fn-desc">Evaluate the program to fixpoint using semi-naive evaluation. Returns 0 on success, &minus;1 on error. After evaluation, derived relations are populated and queryable.</div>
+        <div class="fn-example">
+<span class="hl-type">int</span> <span class="hl-fn">dl_eval</span>(<span class="hl-type">dl_program_t</span>* prog);
+        </div>
+      </div>
+
+      <h3 id="dl-query">dl_query</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">dl_query</span>
+        </div>
+        <div class="fn-desc">Query the result of a derived relation after evaluation. Returns the backing <code>ray_t*</code> table. The caller does <strong>not</strong> own the result &mdash; do not release it.</div>
+        <div class="fn-example">
+<span class="hl-type">ray_t</span>* <span class="hl-fn">dl_query</span>(<span class="hl-type">dl_program_t</span>* prog, <span class="hl-kw">const</span> <span class="hl-type">char</span>* pred_name);
+        </div>
+      </div>
+
+      <h3 id="dl-rule-builder">Rule Builder Helpers</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">dl_rule_init / dl_rule_add_atom / dl_body_set_var / dl_body_set_const</span>
+        </div>
+        <div class="fn-desc">Build rules programmatically: initialize a rule with a head predicate, add positive body atoms, and bind arguments to variables or constants.</div>
+        <div class="fn-example">
+<span class="hl-type">void</span> <span class="hl-fn">dl_rule_init</span>(<span class="hl-type">dl_rule_t</span>* rule, <span class="hl-kw">const</span> <span class="hl-type">char</span>* head_pred, <span class="hl-type">int</span> head_arity);
+<span class="hl-type">void</span> <span class="hl-fn">dl_rule_head_var</span>(<span class="hl-type">dl_rule_t</span>* rule, <span class="hl-type">int</span> pos, <span class="hl-type">int</span> var_idx);
+<span class="hl-type">int</span>  <span class="hl-fn">dl_rule_add_atom</span>(<span class="hl-type">dl_rule_t</span>* rule, <span class="hl-kw">const</span> <span class="hl-type">char</span>* pred, <span class="hl-type">int</span> arity);
+<span class="hl-type">void</span> <span class="hl-fn">dl_body_set_var</span>(<span class="hl-type">dl_rule_t</span>* rule, <span class="hl-type">int</span> body_idx, <span class="hl-type">int</span> pos, <span class="hl-type">int</span> var_idx);
+<span class="hl-type">void</span> <span class="hl-fn">dl_body_set_const</span>(<span class="hl-type">dl_rule_t</span>* rule, <span class="hl-type">int</span> body_idx, <span class="hl-type">int</span> pos, <span class="hl-type">int64_t</span> val);
+<span class="hl-type">int</span>  <span class="hl-fn">dl_rule_add_neg</span>(<span class="hl-type">dl_rule_t</span>* rule, <span class="hl-kw">const</span> <span class="hl-type">char</span>* pred, <span class="hl-type">int</span> arity);
+<span class="hl-type">int</span>  <span class="hl-fn">dl_rule_add_cmp_const</span>(<span class="hl-type">dl_rule_t</span>* rule, <span class="hl-type">int</span> cmp_op,
+                            <span class="hl-type">int</span> lhs_var, <span class="hl-type">int64_t</span> rhs_val);
+        </div>
+      </div>
+
+      <h4>Datalog example: transitive closure</h4>
+      <pre><code><span class="hl-kw">#include</span> <span class="hl-str">&lt;rayforce.h&gt;</span>
+<span class="hl-kw">#include</span> <span class="hl-str">"ops/ops.h"</span>
+<span class="hl-kw">#include</span> <span class="hl-str">"mem/heap.h"</span>
+<span class="hl-kw">#include</span> <span class="hl-str">"datalog/datalog.h"</span>
+
+<span class="hl-type">int</span> <span class="hl-fn">main</span>(<span class="hl-type">void</span>) {
+    <span class="hl-fn">ray_heap_init</span>();
+    <span class="hl-fn">ray_sym_init</span>();
+
+    <span class="hl-comment">/* Build edge table: 0-&gt;1, 1-&gt;2, 2-&gt;3 */</span>
+    <span class="hl-type">ray_t</span>* c0 = <span class="hl-fn">ray_vec_from_raw</span>(<span class="hl-num">RAY_I64</span>, (<span class="hl-type">int64_t</span>[]){<span class="hl-num">0</span>,<span class="hl-num">1</span>,<span class="hl-num">2</span>}, <span class="hl-num">3</span>);
+    <span class="hl-type">ray_t</span>* c1 = <span class="hl-fn">ray_vec_from_raw</span>(<span class="hl-num">RAY_I64</span>, (<span class="hl-type">int64_t</span>[]){<span class="hl-num">1</span>,<span class="hl-num">2</span>,<span class="hl-num">3</span>}, <span class="hl-num">3</span>);
+    <span class="hl-type">ray_t</span>* edges = <span class="hl-fn">ray_table_new</span>(<span class="hl-num">2</span>);
+    edges = <span class="hl-fn">ray_table_add_col</span>(edges, <span class="hl-fn">ray_sym_intern</span>(<span class="hl-str">"c0"</span>, <span class="hl-num">2</span>), c0);
+    edges = <span class="hl-fn">ray_table_add_col</span>(edges, <span class="hl-fn">ray_sym_intern</span>(<span class="hl-str">"c1"</span>, <span class="hl-num">2</span>), c1);
+
+    <span class="hl-comment">/* Create Datalog program */</span>
+    <span class="hl-type">dl_program_t</span>* prog = <span class="hl-fn">dl_program_new</span>();
+    <span class="hl-fn">dl_add_edb</span>(prog, <span class="hl-str">"edge"</span>, edges, <span class="hl-num">2</span>);
+
+    <span class="hl-comment">/* Rule 1: reach(X, Y) :- edge(X, Y). */</span>
+    <span class="hl-type">dl_rule_t</span> r1;
+    <span class="hl-fn">dl_rule_init</span>(&amp;r1, <span class="hl-str">"reach"</span>, <span class="hl-num">2</span>);
+    <span class="hl-fn">dl_rule_head_var</span>(&amp;r1, <span class="hl-num">0</span>, <span class="hl-num">0</span>);  <span class="hl-comment">/* X */</span>
+    <span class="hl-fn">dl_rule_head_var</span>(&amp;r1, <span class="hl-num">1</span>, <span class="hl-num">1</span>);  <span class="hl-comment">/* Y */</span>
+    <span class="hl-type">int</span> b = <span class="hl-fn">dl_rule_add_atom</span>(&amp;r1, <span class="hl-str">"edge"</span>, <span class="hl-num">2</span>);
+    <span class="hl-fn">dl_body_set_var</span>(&amp;r1, b, <span class="hl-num">0</span>, <span class="hl-num">0</span>);
+    <span class="hl-fn">dl_body_set_var</span>(&amp;r1, b, <span class="hl-num">1</span>, <span class="hl-num">1</span>);
+    r1.n_vars = <span class="hl-num">2</span>;
+    <span class="hl-fn">dl_add_rule</span>(prog, &amp;r1);
+
+    <span class="hl-comment">/* Rule 2: reach(X, Z) :- reach(X, Y), edge(Y, Z). */</span>
+    <span class="hl-type">dl_rule_t</span> r2;
+    <span class="hl-fn">dl_rule_init</span>(&amp;r2, <span class="hl-str">"reach"</span>, <span class="hl-num">2</span>);
+    <span class="hl-fn">dl_rule_head_var</span>(&amp;r2, <span class="hl-num">0</span>, <span class="hl-num">0</span>);  <span class="hl-comment">/* X */</span>
+    <span class="hl-fn">dl_rule_head_var</span>(&amp;r2, <span class="hl-num">1</span>, <span class="hl-num">2</span>);  <span class="hl-comment">/* Z */</span>
+    <span class="hl-type">int</span> b1 = <span class="hl-fn">dl_rule_add_atom</span>(&amp;r2, <span class="hl-str">"reach"</span>, <span class="hl-num">2</span>);
+    <span class="hl-fn">dl_body_set_var</span>(&amp;r2, b1, <span class="hl-num">0</span>, <span class="hl-num">0</span>);
+    <span class="hl-fn">dl_body_set_var</span>(&amp;r2, b1, <span class="hl-num">1</span>, <span class="hl-num">1</span>);
+    <span class="hl-type">int</span> b2 = <span class="hl-fn">dl_rule_add_atom</span>(&amp;r2, <span class="hl-str">"edge"</span>, <span class="hl-num">2</span>);
+    <span class="hl-fn">dl_body_set_var</span>(&amp;r2, b2, <span class="hl-num">0</span>, <span class="hl-num">1</span>);
+    <span class="hl-fn">dl_body_set_var</span>(&amp;r2, b2, <span class="hl-num">1</span>, <span class="hl-num">2</span>);
+    r2.n_vars = <span class="hl-num">3</span>;
+    <span class="hl-fn">dl_add_rule</span>(prog, &amp;r2);
+
+    <span class="hl-comment">/* Stratify, evaluate, query */</span>
+    <span class="hl-fn">dl_stratify</span>(prog);
+    <span class="hl-fn">dl_eval</span>(prog);
+    <span class="hl-type">ray_t</span>* result = <span class="hl-fn">dl_query</span>(prog, <span class="hl-str">"reach"</span>);
+    <span class="hl-comment">/* result is a table with columns reach__c0, reach__c1:
+     *   0 | 1
+     *   1 | 2
+     *   2 | 3
+     *   0 | 2
+     *   1 | 3
+     *   0 | 3  */</span>
+
+    <span class="hl-fn">dl_program_free</span>(prog);
+    <span class="hl-fn">ray_release</span>(c0);
+    <span class="hl-fn">ray_release</span>(c1);
+    <span class="hl-fn">ray_release</span>(edges);
+    <span class="hl-fn">ray_sym_destroy</span>();
+    <span class="hl-fn">ray_heap_destroy</span>();
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="examples">Complete Examples</h2>
+
+      <h3 id="ex-filter-group">Example 1: Filter + Group + Sum</h3>
+      <pre><code><span class="hl-kw">#include</span> <span class="hl-str">&lt;rayforce.h&gt;</span>
+
+<span class="hl-type">int</span> <span class="hl-fn">main</span>(<span class="hl-type">void</span>) {
+    <span class="hl-fn">ray_heap_init</span>();
+    <span class="hl-fn">ray_sym_init</span>();
+
+    <span class="hl-type">ray_t</span>* trades = <span class="hl-fn">ray_read_csv</span>(<span class="hl-str">"trades.csv"</span>);
+
+    <span class="hl-comment">/* Build the operation DAG — nothing executes yet */</span>
+    <span class="hl-type">ray_graph_t</span>* g = <span class="hl-fn">ray_graph_new</span>(trades);
+
+    <span class="hl-comment">/* Filter: keep only rows where flag == 0 */</span>
+    <span class="hl-type">ray_op_t</span>* flag = <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"flag"</span>);
+    <span class="hl-type">ray_op_t</span>* pred = <span class="hl-fn">ray_eq</span>(g, flag, <span class="hl-fn">ray_const_i64</span>(g, <span class="hl-num">0</span>));
+
+    <span class="hl-type">ray_op_t</span>* region = <span class="hl-fn">ray_filter</span>(g, <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"region"</span>), pred);
+    <span class="hl-type">ray_op_t</span>* amount = <span class="hl-fn">ray_filter</span>(g, <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"amount"</span>), pred);
+
+    <span class="hl-comment">/* Group by region, sum amounts */</span>
+    <span class="hl-type">ray_op_t</span>* keys[]    = { region };
+    <span class="hl-type">uint16_t</span> agg_ops[] = { <span class="hl-num">OP_SUM</span> };
+    <span class="hl-type">ray_op_t</span>* agg_ins[] = { amount };
+    <span class="hl-type">ray_op_t</span>* grp = <span class="hl-fn">ray_group</span>(g, keys, <span class="hl-num">1</span>, agg_ops, agg_ins, <span class="hl-num">1</span>);
+
+    <span class="hl-comment">/* Optimize (10 passes) and execute */</span>
+    <span class="hl-type">ray_t</span>* result = <span class="hl-fn">ray_execute</span>(g, <span class="hl-fn">ray_optimize</span>(g, grp));
+
+    <span class="hl-kw">if</span> (result && !<span class="hl-fn">RAY_IS_ERR</span>(result)) <span class="hl-fn">ray_release</span>(result);
+    <span class="hl-fn">ray_graph_free</span>(g);
+    <span class="hl-fn">ray_release</span>(trades);
+    <span class="hl-fn">ray_sym_destroy</span>();
+    <span class="hl-fn">ray_heap_destroy</span>();
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+
+      <h3 id="ex-bfs">Example 2: Graph BFS Traversal</h3>
+      <pre><code><span class="hl-kw">#include</span> <span class="hl-str">&lt;rayforce.h&gt;</span>
+
+<span class="hl-type">int</span> <span class="hl-fn">main</span>(<span class="hl-type">void</span>) {
+    <span class="hl-fn">ray_heap_init</span>();
+    <span class="hl-fn">ray_sym_init</span>();
+
+    <span class="hl-comment">/* Build a directed graph: 0->1, 0->2, 1->2, 1->3, 2->3, 3->0 */</span>
+    <span class="hl-type">ray_t</span>* src = <span class="hl-fn">ray_vec_from_raw</span>(<span class="hl-num">RAY_I64</span>,
+                    (<span class="hl-type">int64_t</span>[]){<span class="hl-num">0</span>,<span class="hl-num">0</span>,<span class="hl-num">1</span>,<span class="hl-num">1</span>,<span class="hl-num">2</span>,<span class="hl-num">3</span>}, <span class="hl-num">6</span>);
+    <span class="hl-type">ray_t</span>* dst = <span class="hl-fn">ray_vec_from_raw</span>(<span class="hl-num">RAY_I64</span>,
+                    (<span class="hl-type">int64_t</span>[]){<span class="hl-num">1</span>,<span class="hl-num">2</span>,<span class="hl-num">2</span>,<span class="hl-num">3</span>,<span class="hl-num">3</span>,<span class="hl-num">0</span>}, <span class="hl-num">6</span>);
+
+    <span class="hl-type">ray_t</span>* edges = <span class="hl-fn">ray_table_new</span>(<span class="hl-num">2</span>);
+    edges = <span class="hl-fn">ray_table_add_col</span>(edges,
+                <span class="hl-fn">ray_sym_intern</span>(<span class="hl-str">"src"</span>, <span class="hl-num">3</span>), src);
+    edges = <span class="hl-fn">ray_table_add_col</span>(edges,
+                <span class="hl-fn">ray_sym_intern</span>(<span class="hl-str">"dst"</span>, <span class="hl-num">3</span>), dst);
+    <span class="hl-fn">ray_release</span>(src);
+    <span class="hl-fn">ray_release</span>(dst);
+
+    <span class="hl-comment">/* Double-indexed CSR (forward + reverse) */</span>
+    <span class="hl-type">ray_rel_t</span>* rel = <span class="hl-fn">ray_rel_from_edges</span>(edges,
+                        <span class="hl-str">"src"</span>, <span class="hl-str">"dst"</span>, <span class="hl-num">4</span>, <span class="hl-num">4</span>, <span class="hl-bool">true</span>);
+
+    <span class="hl-comment">/* Start at node 0, BFS 1..3 hops forward */</span>
+    <span class="hl-type">ray_t</span>* start = <span class="hl-fn">ray_vec_from_raw</span>(<span class="hl-num">RAY_I64</span>,
+                        (<span class="hl-type">int64_t</span>[]){<span class="hl-num">0</span>}, <span class="hl-num">1</span>);
+    <span class="hl-type">ray_t</span>* nodes = <span class="hl-fn">ray_table_new</span>(<span class="hl-num">1</span>);
+    nodes = <span class="hl-fn">ray_table_add_col</span>(nodes,
+                <span class="hl-fn">ray_sym_intern</span>(<span class="hl-str">"id"</span>, <span class="hl-num">2</span>), start);
+    <span class="hl-fn">ray_release</span>(start);
+
+    <span class="hl-type">ray_graph_t</span>* g = <span class="hl-fn">ray_graph_new</span>(nodes);
+    <span class="hl-type">ray_op_t</span>* reach = <span class="hl-fn">ray_var_expand</span>(g,
+        <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"id"</span>), rel, <span class="hl-num">0</span>, <span class="hl-num">1</span>, <span class="hl-num">3</span>, <span class="hl-bool">false</span>);
+
+    <span class="hl-type">ray_t</span>* result = <span class="hl-fn">ray_execute</span>(g, <span class="hl-fn">ray_optimize</span>(g, reach));
+
+    <span class="hl-comment">/*  src | dst | depth
+     *  ----|-----|------
+     *    0 |   1 |     1
+     *    0 |   2 |     1
+     *    0 |   3 |     2  */</span>
+
+    <span class="hl-kw">if</span> (result && !<span class="hl-fn">RAY_IS_ERR</span>(result)) <span class="hl-fn">ray_release</span>(result);
+    <span class="hl-fn">ray_graph_free</span>(g);
+    <span class="hl-fn">ray_rel_free</span>(rel);
+    <span class="hl-fn">ray_release</span>(edges);
+    <span class="hl-fn">ray_release</span>(nodes);
+    <span class="hl-fn">ray_sym_destroy</span>();
+    <span class="hl-fn">ray_heap_destroy</span>();
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+
+      <h3 id="ex-join">Example 3: Join Two Tables</h3>
+      <pre><code><span class="hl-kw">#include</span> <span class="hl-str">&lt;rayforce.h&gt;</span>
+
+<span class="hl-type">int</span> <span class="hl-fn">main</span>(<span class="hl-type">void</span>) {
+    <span class="hl-fn">ray_heap_init</span>();
+    <span class="hl-fn">ray_sym_init</span>();
+
+    <span class="hl-type">ray_t</span>* orders = <span class="hl-fn">ray_read_csv</span>(<span class="hl-str">"orders.csv"</span>);
+    <span class="hl-type">ray_t</span>* custs  = <span class="hl-fn">ray_read_csv</span>(<span class="hl-str">"customers.csv"</span>);
+
+    <span class="hl-type">ray_graph_t</span>* g = <span class="hl-fn">ray_graph_new</span>(orders);
+
+    <span class="hl-comment">/* Inject both tables into the DAG */</span>
+    <span class="hl-type">ray_op_t</span>* lo = <span class="hl-fn">ray_const_table</span>(g, orders);
+    <span class="hl-type">ray_op_t</span>* ro = <span class="hl-fn">ray_const_table</span>(g, custs);
+
+    <span class="hl-comment">/* Inner join on customer_id */</span>
+    <span class="hl-type">ray_op_t</span>* lk[] = { <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"customer_id"</span>) };
+    <span class="hl-type">ray_op_t</span>* rk[] = { <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"customer_id"</span>) };
+    <span class="hl-type">ray_op_t</span>* joined = <span class="hl-fn">ray_join</span>(g, lo, lk, ro, rk, <span class="hl-num">1</span>, <span class="hl-num">0</span>);
+
+    <span class="hl-type">ray_t</span>* result = <span class="hl-fn">ray_execute</span>(g, <span class="hl-fn">ray_optimize</span>(g, joined));
+
+    <span class="hl-comment">/*  customer_id | amount | name
+     *  ------------|--------|--------
+     *            1 |    250 | Alice
+     *            2 |    180 | Bob
+     *            2 |    340 | Bob
+     *            3 |    120 | Charlie  */</span>
+
+    <span class="hl-kw">if</span> (result && !<span class="hl-fn">RAY_IS_ERR</span>(result)) <span class="hl-fn">ray_release</span>(result);
+    <span class="hl-fn">ray_graph_free</span>(g);
+    <span class="hl-fn">ray_release</span>(orders);
+    <span class="hl-fn">ray_release</span>(custs);
+    <span class="hl-fn">ray_sym_destroy</span>();
+    <span class="hl-fn">ray_heap_destroy</span>();
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="c-api-core.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Core C API Reference</span></a>
+        
+      </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

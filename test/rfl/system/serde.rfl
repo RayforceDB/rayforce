@@ -1,0 +1,28 @@
+;; Ported from test_lang_rf.inc::test_rf_serde.
+
+(de (ser null)) -- null
+;; Typed null atoms must survive a serialize/deserialize roundtrip.
+;; Regression for (de (ser 0Nl)) -> 0 and friends.
+(de (ser 0Nl)) -- 0Nl
+(de (ser 0Nf)) -- 0Nf
+(de (ser 0Ni)) -- 0Ni
+(de (ser 0Nh)) -- 0Nh
+;; 0Nb isn't a parseable literal in Rayfall yet — covered at the C
+;; level by test_store.c:/serde_typed_null_atoms.
+;; Non-null atoms still roundtrip cleanly.
+(de (ser 42)) -- 42
+(de (ser 3.14)) -- 3.14
+(de (ser 'hello)) -- 'hello
+(de (ser "world")) -- "world"
+(de (ser true)) -- true
+
+;; ────────────── homogeneous vectors round-trip ──────────────
+(de (ser [1 2 3]))     -- [1 2 3]
+(de (ser [1.5 2.5]))   -- [1.5 2.5]
+(de (ser ["a" "b"]))   -- ["a" "b"]
+(de (ser ['a 'b]))     -- ['a 'b]
+
+;; ────────────── vectors with embedded nulls ──────────────
+;; Both the value bits AND the null mask must survive serialize/deser.
+(count (de (ser [1 0N 3]))) -- 3
+(sum (de (ser [1 0N 3])))   -- 4

@@ -1,0 +1,31 @@
+;; Sort behaviour with nulls.
+
+;; asc: nulls sort first
+(at (asc [3 0N 1 2]) 0) -- 0Nl
+(at (asc [3 0N 1 2]) 1) -- 1
+
+;; desc: nulls sort last
+(at (desc [3 0N 1 2]) 3) -- 0Nl
+(at (desc [3 0N 1 2]) 0) -- 3
+
+;; Length preserved
+(count (asc [3 0N 1 0N])) -- 4
+(count (desc [3 0N 1 0N])) -- 4
+
+;; iasc/idesc treat nulls consistently — at-projection roundtrips
+(set V [3 0N 1 2])
+(at V (iasc V)) -- (asc V)
+(at V (idesc V)) -- (desc V)
+
+;; ────────────── xasc/xdesc on tables with null key columns ──────────────
+;; Same convention: null keys sort first under xasc, count preserved.
+(set Tn (table [k v] (list [2 0Nl 1 0Nl 3] [10 20 30 40 50])))
+(at (at (xasc Tn 'k) 'k) 0)               -- 0Nl
+(sum (as 'I64 (== (at (xasc Tn 'k) 'k) 0Nl))) -- 2
+(count (xasc Tn 'k))                       -- 5
+
+;; ────────────── take with nulls — negative count slices from tail ──────────────
+;; (take v -5) keeps the last 5; null count must reflect what was kept.
+(set Vt [0Nl 3 1 0Nl 2 5 0Nl 4])
+(sum (as 'I64 (== (take Vt 5) 0Nl)))   -- 2
+(sum (as 'I64 (== (take Vt -5) 0Nl)))  -- 2

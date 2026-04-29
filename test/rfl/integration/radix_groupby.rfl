@@ -1,0 +1,40 @@
+;; Large group-by triggers the radix-partitioned parallel path
+;; (ops/group.c::radix_phase1_fn / phase2_fn / phase3_fn).  The
+;; sequential hash-table path handles small inputs; once nrows crosses
+;; RAY_PARALLEL_THRESHOLD (64 * 1024 = 65536) the executor switches
+;; to radix.  A 100k-row table with mixed key cardinality exercises
+;; both phases.
+
+;; ────────────── 100k rows, 1000 distinct keys ──────────────
+(set N 100000)
+(set Tbig (table [g v] (list (% (til N) 1000) (til N))))
+
+;; row count + group count
+(count Tbig) -- 100000
+(count (select {c: (count v) from: Tbig by: g})) -- 1000
+
+;; sum of all v equals N*(N-1)/2 — 100000*99999/2
+(sum (at (select {s: (sum v) from: Tbig by: g}) 's)) -- 4999950000
+
+;; min / max via group-by
+;; group g sees 100 v's: g, 1000+g, 2000+g, …, 99000+g.
+;; sum = 100*g + 1000*(0+1+…+99) = 100*g + 4950000.
+;; min sum = g=0 → 4950000; max sum = g=999 → 100*999 + 4950000 = 5049900.
+(min (at (select {s: (sum v) from: Tbig by: g}) 's)) -- 4950000
+(max (at (select {s: (sum v) from: Tbig by: g}) 's)) -- 5049900
+
+;; ────────────── multi-aggregator on the same large table ──────────────
+(set Magg (select {c: (count v) s: (sum v) m: (max v) n: (min v) av: (avg v) from: Tbig by: g}))
+(count Magg) -- 1000
+;; total count across groups equals total rows
+(sum (at Magg 'c)) -- 100000
+
+;; ────────────── multi-key group-by on 100k ──────────────
+(set Tmk (table [k1 k2 v] (list (% (til N) 50) (% (til N) 7) (til N))))
+(count (select {c: (count v) from: Tmk by: [k1 k2]})) -- 350
+
+;; ────────────── 200k rows for a deeper radix dispatch ──────────────
+(set N2 200000)
+(set Tx (table [g v] (list (% (til N2) 5000) (til N2))))
+(count (select {c: (count v) from: Tx by: g})) -- 5000
+(sum (at (select {s: (sum v) from: Tx by: g}) 's)) -- 19999900000

@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>REPL Reference — Rayforce Documentation</title>
+  <meta name="description" content="Rayforce REPL reference: commands, profiling, keyboard shortcuts, multi-line input, syntax highlighting, and script mode.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link active">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>REPL Reference</span>
+      </div>
+
+      <h1>REPL Reference</h1>
+      <p class="page-subtitle">Commands, profiling, keyboard shortcuts, and script mode for the Rayfall REPL.</p>
+
+      <h2>Starting the REPL</h2>
+      <p>The <code>rayforce</code> binary operates in three modes depending on how it is invoked:</p>
+      <pre><code><span class="hl-comment"># Interactive mode &mdash; full line editing, highlighting, completion</span>
+./rayforce
+
+<span class="hl-comment"># Run a script file</span>
+./rayforce script.rfl
+
+<span class="hl-comment"># Pipe mode &mdash; reads from stdin, no colour output</span>
+echo '(+ 1 2)' | ./rayforce</code></pre>
+      <p>Interactive mode is detected automatically when stdin is a terminal. On startup the REPL prints a banner with the version, CPU, memory, and core count, then shows the <code>&#x2023;</code> prompt.</p>
+
+      <h2>REPL Commands</h2>
+      <p>All commands start with <code>:</code> and are handled before expression evaluation.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Command</th>
+            <th>Alias</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>:?</code></td><td><code>:help</code></td><td>Display the command list.</td></tr>
+          <tr><td><code>:t</code></td><td><code>:timeit</code></td><td>Toggle profiling on/off.</td></tr>
+          <tr><td><code>:env</code></td><td></td><td>List all defined variables with their types.</td></tr>
+          <tr><td><code>:clear</code></td><td></td><td>Clear the screen.</td></tr>
+          <tr><td><code>:q</code></td><td><code>:quit</code></td><td>Exit the REPL.</td></tr>
+        </tbody>
+      </table>
+      <p>You can also exit with <code>\\</code>, <code>exit</code>, or <strong>Ctrl-D</strong> on an empty line.</p>
+
+      <h2>Profiling with :t</h2>
+      <p>Toggle profiling with <code>:t</code>. When active, every evaluation emits a nested span tree showing where time was spent:</p>
+      <pre><code>&#x2023; :t
+. Timeit is on.
+&#x2023; (+ 1 2)
+3
+&#x256D; top-level
+&#x2502; &#x2736;  parse: 0.016 ms
+&#x2502; &#x2736;  eval: 0.004 ms
+&#x2570;&#x2500;&#x2524; 0.025 ms
+&#x2023; :t
+. Timeit is off.</code></pre>
+      <p>Spans nest automatically. The DAG executor reports sub-spans for optimizer passes (type inference, fusion, predicate pushdown) and per-morsel execution when applicable. A progress bar appears for long-running operations.</p>
+      <p>For one-off measurement, use the <code>timeit</code> builtin which returns elapsed time in milliseconds:</p>
+      <pre><code>(<span class="hl-fn">timeit</span> (+ <span class="hl-num">1</span> <span class="hl-num">2</span>))
+<span class="hl-comment">;; =&gt; 0.003</span></code></pre>
+
+      <h2>Multi-Line Input</h2>
+      <p>The REPL auto-detects incomplete expressions by tracking unmatched brackets <code>( [ {</code>. When the current input has unmatched openers, pressing Enter starts a continuation line instead of evaluating:</p>
+      <pre><code><span class="hl-comment">&#x2023;</span> (set double
+    (fn [x]
+      (* x 2)))
+<span class="hl-comment">; evaluated after the closing ) balances all openers</span></code></pre>
+      <p>The parser is aware of string literals and <code>;</code> comments, so brackets inside strings or comments do not affect the count.</p>
+
+      <h2>Keyboard Shortcuts</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Up</strong> / <strong>Ctrl-P</strong></td><td>Previous history entry</td></tr>
+          <tr><td><strong>Down</strong> / <strong>Ctrl-N</strong></td><td>Next history entry</td></tr>
+          <tr><td><strong>Left</strong> / <strong>Right</strong></td><td>Move cursor (Right at end of line accepts ghost text)</td></tr>
+          <tr><td><strong>Home</strong> / <strong>Ctrl-A</strong></td><td>Move to start of line</td></tr>
+          <tr><td><strong>End</strong> / <strong>Ctrl-E</strong></td><td>Move to end of line</td></tr>
+          <tr><td><strong>Tab</strong></td><td>Autocomplete (cycles through candidates)</td></tr>
+          <tr><td><strong>Ctrl-R</strong></td><td>Reverse incremental history search</td></tr>
+          <tr><td><strong>Ctrl-K</strong></td><td>Kill from cursor to end of line</td></tr>
+          <tr><td><strong>Ctrl-U</strong></td><td>Kill entire line</td></tr>
+          <tr><td><strong>Ctrl-W</strong></td><td>Delete word backward</td></tr>
+          <tr><td><strong>Delete</strong></td><td>Delete character at cursor</td></tr>
+          <tr><td><strong>Backspace</strong></td><td>Delete character before cursor</td></tr>
+          <tr><td><strong>Ctrl-C</strong></td><td>Cancel current input (interrupts running evaluation)</td></tr>
+          <tr><td><strong>Ctrl-D</strong></td><td>Exit on empty line, otherwise delete character at cursor</td></tr>
+          <tr><td><strong>Esc</strong></td><td>Cancel tab-completion cycling</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Syntax Highlighting</h2>
+      <p>The REPL highlights input in real time as you type:</p>
+      <ul>
+        <li><strong>Keywords</strong> and special forms (<code>set</code>, <code>fn</code>, <code>select</code>, <code>if</code>, ...)</li>
+        <li><strong>Strings</strong> in double quotes</li>
+        <li><strong>Numbers</strong> (integers and floats)</li>
+        <li><strong>Comments</strong> starting with <code>;</code></li>
+        <li><strong>Bracket matching</strong> &mdash; the bracket under the cursor and its partner are highlighted. Unmatched brackets are visually distinct.</li>
+      </ul>
+      <p>Highlighting is stripped from the final submitted text so it does not interfere with parsing.</p>
+
+      <h2>Autocomplete</h2>
+      <p>Press <strong>Tab</strong> to complete the current token. Candidates are drawn from four sources:</p>
+      <ul>
+        <li>Built-in function names</li>
+        <li>Global environment bindings (variables you have defined)</li>
+        <li>The global symbol table</li>
+        <li>Words from history entries</li>
+      </ul>
+      <p>Press <strong>Tab</strong> repeatedly to cycle through matches. Press <strong>Esc</strong> to cancel.</p>
+
+      <h2>Script Mode</h2>
+      <p>Pass a <code>.rfl</code> file path to run it non-interactively:</p>
+      <pre><code>./rayforce analysis.rfl</code></pre>
+      <p>The entire file is read into memory and evaluated as a single Rayfall program via <code>ray_eval_str()</code>. The last expression's value is printed to stdout. If evaluation produces an error, it is printed to stderr and the process exits with code <strong>1</strong>; otherwise the exit code is <strong>0</strong>.</p>
+      <p>Pipe mode works the same way but reads from stdin line by line, evaluating each balanced expression as it arrives.</p>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="control-flow.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Control Flow &amp; Error Handling</span></a>
+        <a href="data-types.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Scalar Data Types</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

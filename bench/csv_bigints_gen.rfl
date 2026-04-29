@@ -1,0 +1,10 @@
+;; Big-integer CSV: 10M rows × 4 cols, all 16-digit ints. Hits SWAR fast path.
+(set n 10000000)
+(set base 1234567890123456)
+(set t (table [a b c d]
+    (list (+ base (til n))
+          (+ (* 2 base) (til n))
+          (+ (* 3 base) (til n))
+          (+ (* 4 base) (til n)))))
+(.csv.write t "/tmp/bigints_bench.csv")
+(println "wrote /tmp/bigints_bench.csv (% rows)" n)

@@ -1,0 +1,75 @@
+;; Round-trip invariants for `.csv.write` + `.csv.read` (no schema arg).
+;; The schema-less form auto-infers column types from the first data row;
+;; this test pins down the inference rules: ints → I64, mixed-precision
+;; floats → F64, integer-valued floats collapse to I64, strings → SYM.
+;;
+;; Tests use unique /tmp/ paths and depend on a clean /tmp.
+
+;; ────────────── int round-trip ──────────────
+(set Tint (table [a b] (list [1 2 3 4 5] [10 20 30 40 50])))
+(.csv.write Tint "/tmp/rfl_csv_int.csv")
+(set Rint (.csv.read "/tmp/rfl_csv_int.csv"))
+(count Rint) -- 5
+(sum (at Rint 'a)) -- 15
+(sum (at Rint 'b)) -- 150
+(type (at Rint 'a)) -- 'I64
+(key Rint) -- (key Tint)
+
+;; ────────────── float round-trip with non-integer values ──────────────
+(set Tflt (table [x y] (list [1.5 2.5 3.14] [10.1 20.2 30.3])))
+(.csv.write Tflt "/tmp/rfl_csv_float.csv")
+(set Rflt (.csv.read "/tmp/rfl_csv_float.csv"))
+(count Rflt) -- 3
+(type (at Rflt 'x)) -- 'F64
+(first (at Rflt 'x)) -- 1.5
+(at (at Rflt 'x) 1) -- 2.5
+
+;; integer-valued floats collapse to I64 on read (documented inference)
+(set Tiv (table [x] (list [10.0 20.0 30.0])))
+(.csv.write Tiv "/tmp/rfl_csv_ivfloat.csv")
+(set Riv (.csv.read "/tmp/rfl_csv_ivfloat.csv"))
+(count Riv) -- 3
+(sum (at Riv 'x)) -- 60
+(type (at Riv 'x)) -- 'I64
+
+;; ────────────── string round-trip — string column inferred as SYM ──────────────
+(set Tstr (table [name score] (list ["Alice" "Bob" "Charlie"] [10 20 30])))
+(.csv.write Tstr "/tmp/rfl_csv_str.csv")
+(set Rstr (.csv.read "/tmp/rfl_csv_str.csv"))
+(count Rstr) -- 3
+(type (at Rstr 'name)) -- 'SYM
+(sum (at Rstr 'score)) -- 60
+(first (at Rstr 'name)) -- 'Alice
+
+;; ────────────── multi-column mixed types ──────────────
+(set Tmix (table [id name qty price] (list [1 2 3 4 5] ["AAPL" "GOOG" "MSFT" "AAPL" "GOOG"] [100 50 200 150 40] [150.5 2800.0 310.25 151.5 2795.75])))
+(.csv.write Tmix "/tmp/rfl_csv_mixed.csv")
+(set Rmix (.csv.read "/tmp/rfl_csv_mixed.csv"))
+(count Rmix) -- 5
+(sum (at Rmix 'id)) -- 15
+(sum (at Rmix 'qty)) -- 540
+(type (at Rmix 'price)) -- 'F64
+(sum (at Rmix 'price)) -- 6208.0
+(type (at Rmix 'name)) -- 'SYM
+(key Rmix) -- (key Tmix)
+
+;; ────────────── morsel-boundary sizes ──────────────
+(set T1 (table [a] (list [42])))
+(.csv.write T1 "/tmp/rfl_csv_one.csv")
+(set R1 (.csv.read "/tmp/rfl_csv_one.csv"))
+(count R1) -- 1
+(first (at R1 'a)) -- 42
+
+;; exactly 1024 rows — morsel boundary
+(set T1024 (table [n] (list (til 1024))))
+(.csv.write T1024 "/tmp/rfl_csv_1024.csv")
+(set R1024 (.csv.read "/tmp/rfl_csv_1024.csv"))
+(count R1024) -- 1024
+(sum (at R1024 'n)) -- 523776
+
+;; 1100 rows — crosses morsel boundary mid-stream
+(set T1100 (table [n] (list (til 1100))))
+(.csv.write T1100 "/tmp/rfl_csv_1100.csv")
+(set R1100 (.csv.read "/tmp/rfl_csv_1100.csv"))
+(count R1100) -- 1100
+(sum (at R1100 'n)) -- 604450

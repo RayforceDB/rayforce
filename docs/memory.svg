@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 570" font-family="'Inter','Helvetica Neue',Arial,sans-serif" font-size="12">
+  <defs>
+    <linearGradient id="mbg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0e1b24"/>
+      <stop offset="100%" stop-color="#162a36"/>
+    </linearGradient>
+    <linearGradient id="heap" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a3040"/>
+      <stop offset="100%" stop-color="#162a36"/>
+    </linearGradient>
+    <linearGradient id="pool" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e3648"/>
+      <stop offset="100%" stop-color="#1a3040"/>
+    </linearGradient>
+    <linearGradient id="slab" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a3040"/>
+      <stop offset="100%" stop-color="#162a36"/>
+    </linearGradient>
+    <linearGradient id="tla" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a3040"/>
+      <stop offset="100%" stop-color="#162a36"/>
+    </linearGradient>
+    <linearGradient id="block" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e3648"/>
+      <stop offset="100%" stop-color="#1a3040"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="600" height="570" rx="12" fill="url(#mbg)"/>
+
+  <!-- Heap container -->
+  <rect x="30" y="20" width="540" height="180" rx="10" fill="url(#heap)" stroke="#3a5261" stroke-width="1"/>
+  <text x="300" y="44" text-anchor="middle" fill="#8ba8b8" font-size="14" font-weight="700" letter-spacing="0.5">Heap (td_heap_t)</text>
+  <line x1="60" y1="52" x2="540" y2="52" stroke="#2a3e4b" stroke-width="1"/>
+
+  <!-- Pools -->
+  <rect x="56" y="64" width="110" height="60" rx="6" fill="url(#pool)" stroke="#3a5261" stroke-width="1"/>
+  <text x="111" y="84" text-anchor="middle" fill="#dce8ee" font-size="11" font-weight="600">Pool 0</text>
+  <text x="111" y="100" text-anchor="middle" fill="#6b8a9e" font-size="10">1 MB region</text>
+  <text x="111" y="114" text-anchor="middle" fill="#3a5261" font-size="9">mmap'd</text>
+
+  <rect x="182" y="64" width="110" height="60" rx="6" fill="url(#pool)" stroke="#3a5261" stroke-width="1"/>
+  <text x="237" y="84" text-anchor="middle" fill="#dce8ee" font-size="11" font-weight="600">Pool 1</text>
+  <text x="237" y="100" text-anchor="middle" fill="#6b8a9e" font-size="10">1 MB region</text>
+  <text x="237" y="114" text-anchor="middle" fill="#3a5261" font-size="9">mmap'd</text>
+
+  <text x="326" y="98" text-anchor="middle" fill="#3a5261" font-size="16">...</text>
+
+  <rect x="362" y="64" width="110" height="60" rx="6" fill="url(#pool)" stroke="#3a5261" stroke-width="1"/>
+  <text x="417" y="84" text-anchor="middle" fill="#dce8ee" font-size="11" font-weight="600">Pool N</text>
+  <text x="417" y="100" text-anchor="middle" fill="#6b8a9e" font-size="10">1 MB region</text>
+  <text x="417" y="114" text-anchor="middle" fill="#3a5261" font-size="9">mmap'd</text>
+
+  <!-- Free lists -->
+  <text x="60" y="150" fill="#6b8a9e" font-size="11">Free lists:</text>
+  <g font-size="10">
+    <rect x="140" y="138" width="60" height="18" rx="4" fill="#0e1b24" stroke="#3a5261" stroke-width="0.5"/>
+    <text x="170" y="151" text-anchor="middle" fill="#8ba8b8">ord 6</text>
+    <rect x="208" y="138" width="60" height="18" rx="4" fill="#0e1b24" stroke="#3a5261" stroke-width="0.5"/>
+    <text x="238" y="151" text-anchor="middle" fill="#8ba8b8">ord 7</text>
+    <rect x="276" y="138" width="60" height="18" rx="4" fill="#0e1b24" stroke="#3a5261" stroke-width="0.5"/>
+    <text x="306" y="151" text-anchor="middle" fill="#8ba8b8">ord 8</text>
+    <text x="350" y="151" text-anchor="middle" fill="#3a5261">...</text>
+    <rect x="374" y="138" width="64" height="18" rx="4" fill="#0e1b24" stroke="#3a5261" stroke-width="0.5"/>
+    <text x="406" y="151" text-anchor="middle" fill="#8ba8b8">ord 30</text>
+  </g>
+  <text x="140" y="172" fill="#3a5261" font-size="9">64 B</text>
+  <text x="438" y="172" fill="#3a5261" font-size="9" text-anchor="end">1 GB</text>
+  <text x="60" y="190" fill="#3a5261" font-size="10">Buddy split/coalesce on alloc/free</text>
+
+  <!-- Arrows down -->
+  <line x1="155" y1="200" x2="155" y2="230" stroke="#3a5261" stroke-width="1.5"/>
+  <polygon points="155,236 150,228 160,228" fill="#3a5261"/>
+  <line x1="430" y1="200" x2="430" y2="230" stroke="#3a5261" stroke-width="1.5"/>
+  <polygon points="430,236 425,228 435,228" fill="#3a5261"/>
+
+  <!-- Slab Cache -->
+  <rect x="30" y="240" width="250" height="130" rx="10" fill="url(#slab)" stroke="#3a5261" stroke-width="1"/>
+  <text x="155" y="264" text-anchor="middle" fill="#4b6777" font-size="13" font-weight="700" letter-spacing="0.5">Slab Cache</text>
+  <line x1="50" y1="272" x2="260" y2="272" stroke="#2a3e4b" stroke-width="1"/>
+  <g fill="#dce8ee" font-size="11">
+    <text x="50" y="292">Orders 0..4</text>
+    <text x="50" y="312">Fast path ~90% allocs</text>
+    <text x="50" y="332">Object size 32..512 B</text>
+    <text x="50" y="352">Per-CPU free lists</text>
+  </g>
+
+  <!-- Thread-Local Arena -->
+  <rect x="310" y="240" width="260" height="130" rx="10" fill="url(#tla)" stroke="#3a5261" stroke-width="1"/>
+  <text x="440" y="264" text-anchor="middle" fill="#4b6777" font-size="13" font-weight="700" letter-spacing="0.5">Thread-Local Arena</text>
+  <line x1="330" y1="272" x2="550" y2="272" stroke="#2a3e4b" stroke-width="1"/>
+  <g fill="#dce8ee" font-size="11">
+    <text x="330" y="292">Lock-free alloc</text>
+    <text x="330" y="312">Deferred free</text>
+    <text x="330" y="332">Cross-thread reclaim</text>
+    <text x="330" y="352">COW ref counting</text>
+  </g>
+
+  <!-- td_t block layout -->
+  <text x="300" y="408" text-anchor="middle" fill="#6b8a9e" font-size="13" font-weight="600">td_t block layout (32 B, 32-byte aligned)</text>
+
+  <!-- Block diagram -->
+  <g transform="translate(50, 420)">
+    <!-- Row 1: nullmap -->
+    <rect x="0" y="0" width="500" height="30" rx="5" fill="url(#block)" stroke="#6b8a9e" stroke-width="1"/>
+    <text x="210" y="20" text-anchor="middle" fill="#8ba8b8" font-size="11" font-weight="600">nullmap / slice_parent / ext_nullmap</text>
+    <text x="475" y="20" text-anchor="middle" fill="#3a5261" font-size="9">16 B</text>
+
+    <!-- Row 2: metadata -->
+    <rect x="0" y="36" width="74" height="30" rx="5" fill="url(#block)" stroke="#4b6777" stroke-width="1"/>
+    <text x="37" y="56" text-anchor="middle" fill="#8ba8b8" font-size="10" font-family="'JetBrains Mono','SF Mono',monospace">mmod</text>
+
+    <rect x="80" y="36" width="74" height="30" rx="5" fill="url(#block)" stroke="#4b6777" stroke-width="1"/>
+    <text x="117" y="56" text-anchor="middle" fill="#8ba8b8" font-size="10" font-family="'JetBrains Mono','SF Mono',monospace">order</text>
+
+    <rect x="160" y="36" width="74" height="30" rx="5" fill="url(#block)" stroke="#6b8a9e" stroke-width="1"/>
+    <text x="197" y="56" text-anchor="middle" fill="#dce8ee" font-size="10" font-family="'JetBrains Mono','SF Mono',monospace">type</text>
+
+    <rect x="240" y="36" width="74" height="30" rx="5" fill="url(#block)" stroke="#4b6777" stroke-width="1"/>
+    <text x="277" y="56" text-anchor="middle" fill="#8ba8b8" font-size="10" font-family="'JetBrains Mono','SF Mono',monospace">attrs</text>
+
+    <rect x="320" y="36" width="180" height="30" rx="5" fill="url(#block)" stroke="#4b6777" stroke-width="1"/>
+    <text x="385" y="56" text-anchor="middle" fill="#8ba8b8" font-size="10">rc (atomic u32)</text>
+    <text x="475" y="56" text-anchor="middle" fill="#3a5261" font-size="9">8 B</text>
+
+    <!-- Row 3: value -->
+    <rect x="0" y="72" width="500" height="30" rx="5" fill="url(#block)" stroke="#6b8a9e" stroke-width="1"/>
+    <text x="210" y="92" text-anchor="middle" fill="#8ba8b8" font-size="11" font-weight="600">value: i64 / f64 / len / sso / obj*</text>
+    <text x="475" y="92" text-anchor="middle" fill="#3a5261" font-size="9">8 B</text>
+
+    <!-- Row 4: data -->
+    <rect x="0" y="108" width="500" height="30" rx="5" fill="#0e1b24" stroke="#3a5261" stroke-width="1" stroke-dasharray="4,3"/>
+    <text x="250" y="128" text-anchor="middle" fill="#6b8a9e" font-size="10">data[] (flexible array, 2^order - 32 bytes)</text>
+  </g>
+</svg>

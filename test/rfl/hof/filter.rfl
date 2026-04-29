@@ -1,0 +1,39 @@
+;; Invariants for `filter` — (filter V mask) keeps V[i] where mask[i].
+
+(filter [1 2 3 4 5] [false false false true true]) -- [4 5]
+(filter [10 20 30] [true false true]) -- [10 30]
+
+;; all-true → identity
+(set V (rand 50 100))
+(set T (take [true] (count V)))
+(count V) -- (count (filter V T))
+
+;; all-false → empty
+(set F (take [false] (count V)))
+(count (filter V F)) -- 0
+
+;; result count equals mask-true count
+(set M [true false true true false])
+(set W [10 20 30 40 50])
+(count (filter W M)) -- (sum M)
+
+;; ---- Regression tests ported from test_lang_rf.inc::test_rf_filter ----
+;; Ported from test_lang_rf.inc::test_rf_filter.
+
+(filter [true false true false] [true true false false]) -- [true false]
+(filter [0x12 0x11 0x10] [true false true]) -- [0x12 0x10]
+(filter "test" [true false true false]) -- "ts"
+(filter [1h 2h 3h] [false true false]) -- [2h]
+(filter [1i 0Ni 2i] [false true true]) -- [0Ni 2i]
+(filter [2012.12.12 2012.12.13] [true false]) -- [2012.12.12]
+(filter [10:00:00.000] [true]) -- [10:00:00.000]
+(filter [1 0Nl 2] [true true true]) -- [1 0Nl 2]
+(filter ['a 'b 'c 'dd] [true false false true]) -- ['a 'dd]
+(filter [2024.01.01D10:00:00.000000000] [true]) -- [2024.01.01D10:00:00.000000000]
+(filter [1.0 2.0 3.0] [true false true]) -- [1.0 3.0]
+(filter (guid 2) [false false]) -- []
+(filter (take (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea") 2) [false true]) -- [d49f18a4-1969-49e8-9b8a-6bb9a4832eea]
+(filter (list [3i 0Ni] 2i [3i 3i] 2i) [true true false false]) -- (list [3i 0Ni] 2i)
+(first (filter (table [a b] (list [1 2 3] (list 'a 'b 'c))) [false true true])) -- {a:2 b:'b}
+(filter [1i 0Ni 2i] [true true]) !- length
+(filter [true false] [1 2]) !- type

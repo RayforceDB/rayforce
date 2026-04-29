@@ -1,0 +1,8 @@
+;; Invariants for `var` (variance).
+
+(var [5 5 5 5 5]) -- 0.0
+(var [1 1 1]) -- 0.0
+
+;; non-negative
+(set V (rand 100 1000))
+1 -- (as 'I64 (>= (var V) 0.0))

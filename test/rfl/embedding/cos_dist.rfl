@@ -1,0 +1,16 @@
+;; Invariants for `cos-dist` (cosine distance).
+
+;; identical integer-coord vectors: distance exactly 0
+(cos-dist [1.0 0.0] [1.0 0.0]) -- 0.0
+
+;; near-zero tolerance for unit-diagonal identical
+1 -- (as 'I64 (< (abs (cos-dist [1.0 1.0] [1.0 1.0])) 0.0001))
+
+;; orthogonal: cos = 0, distance = 1
+(cos-dist [1.0 0.0] [0.0 1.0]) -- 1.0
+
+;; opposite: cos = -1, distance = 2
+(cos-dist [1.0 0.0] [-1.0 0.0]) -- 2.0
+
+;; length mismatch errors
+(cos-dist [1.0 2.0 3.0] [1.0 2.0]) !- length

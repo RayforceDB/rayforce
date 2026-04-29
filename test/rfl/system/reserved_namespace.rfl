@@ -1,0 +1,98 @@
+;; Ported from test_lang_rf.inc::test_rf_reserved_namespace.
+
+;; Positive: each migrated utility builtin resolves to a callable
+;; and the call path works.  (Rayfall reports function `type` as
+;; `'?` regardless of arity — so we exercise by calling, which is
+;; what actually matters here.)
+;; .sys.gc returns 0 on success — doubles as a binding-exists probe.
+;; Registered as variadic so both (.sys.gc) and (.sys.gc 0) work;
+;; other .sys.* info builtins follow the same convention.
+(.sys.gc) -- 0
+(.sys.gc 0) -- 0
+(count (.sys.info)) -- 3
+(count (.sys.mem)) -- 5
+(count (.sys.build)) -- 2
+;; The namespace roots themselves are real dicts — typing just
+;; `.sys` at the REPL returns a dict with every `.sys.*` entry
+;; accessible via dict key.  This replaces the earlier "flat sym
+;; with leading-dot magic" bookkeeping.
+(type .sys) -- 'DICT
+(type .os) -- 'DICT
+(type .ipc) -- 'DICT
+(type .csv) -- 'DICT
+(count .sys) -- 5
+;; gc, exec, build, mem, info
+(count .os) -- 2
+;; getenv, setenv
+(count .ipc) -- 3
+;; open, close, send
+(count .csv) -- 2
+;; read, write
+;; REPL completion + syntax highlighting go through
+;; ray_env_lookup_prefix scanning flat g_env keys.  The namespace
+;; dicts alone don't satisfy that path, so every reserved builtin
+;; is ALSO bound flat under its fully-qualified name.  This probes
+;; the same path via `resolve`, which returns the sym if no binding
+;; exists and the function object otherwise — we just check the
+;; binding is present.
+(nil? (resolve '.sys.gc)) -- false
+(nil? (resolve '.sys.info)) -- false
+(nil? (resolve '.os.getenv)) -- false
+(nil? (resolve '.csv.read)) -- false
+;; OS env round-trip: set a key, read it back.
+(.os.setenv "RAYF_NS_TEST" "hello")
+(.os.getenv "RAYF_NS_TEST") -- "hello"
+;; The remaining builtins are harder to call without side effects;
+;; `nil?` proves the binding resolves to a non-null callable.
+(nil? .sys.exec) -- false
+(nil? .sys.info) -- false
+(nil? .sys.mem) -- false
+(nil? .sys.build) -- false
+(nil? .ipc.open) -- false
+(nil? .ipc.close) -- false
+(nil? .ipc.send) -- false
+(nil? .csv.read) -- false
+(nil? .csv.write) -- false
+;; Old names must NOT resolve — we committed to no backward compat.
+gc !- name
+getenv !- name
+system !- name
+sysinfo !- name
+memstat !- name
+internals !- name
+read-csv !- name
+;; Negative: writes to `.*` are refused with `reserve`.
+(set .os.foo 1) !- reserve
+(set .sys.gc 0) !- reserve
+;; can't even overwrite
+(set .made.up.ns 42) !- reserve
+;; arbitrary .* root
+;; Shadowing guards: the reserved namespace must stay intact across
+;; all binding paths, not just global `set`.  `let` is a local-scope
+;; binder; `fn` parameters are compile-time slot assignments —
+;; either route would otherwise let a user temporarily overwrite
+;; .sys.gc inside a lambda body.
+(let .sys.gc 99) !- reserve
+(let .os.getenv "bogus") !- reserve
+((fn [.sys.gc] .sys.gc) 7) !- reserve
+(set _ (fn [.os.getenv] 1)) !- reserve
+;; `let` inside a compiled lambda body: the bytecode path stores a
+;; local into a slot table (OP_STOREENV) without going through
+;; ray_env_set_local, so the guard also lives in compile.c's let
+;; special-form handler.
+(set _compiled_let_shadow (fn [x] (let .sys.gc 99) .sys.gc))
+(_compiled_let_shadow 1) !- reserve
+(set _compiled_call_shadow (fn [x] (let .sys.gc 99) (.sys.gc 0)))
+(_compiled_call_shadow 1) !- reserve
+;; `(del name)` is a separate path — it goes through ray_env_set
+;; with NULL but previously discarded the return code, so
+;; `(del .sys.gc)` appeared to succeed while leaving the builtin
+;; intact (a lie).  Must now surface the `reserve` error.
+(del .sys.gc) !- reserve
+(del .os.getenv) !- reserve
+;; Built-in still resolves after the blocked shadow attempts.
+(.sys.gc 0) -- 0
+(nil? .os.getenv) -- false
+;; User-level dotted writes under a non-`.` root still work.
+(set myns.x 1)
+myns.x -- 1

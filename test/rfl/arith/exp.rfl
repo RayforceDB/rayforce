@@ -1,0 +1,17 @@
+;; Invariants for `exp`.
+
+;; concrete
+(exp 0.0) -- 1.0
+
+;; exp(log(x)) == x  for x > 0
+(set A (div (+ (rand 256 10000) 1) 100))
+(count A) -- (sum (< (abs (- (exp (log A)) A)) 0.001))
+
+;; exp is strictly positive
+(set B (div (- (rand 256 1000) 500) 100))
+(count B) -- (sum (> (exp B) 0.0))
+
+;; exp(a+b) == exp(a)*exp(b)
+(set X (div (- (rand 128 400) 200) 100))
+(set Y (div (- (rand 128 400) 200) 100))
+(count X) -- (sum (< (abs (- (exp (+ X Y)) (* (exp X) (exp Y)))) 0.001))

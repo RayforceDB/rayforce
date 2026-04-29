@@ -1,0 +1,66 @@
+;; Direct EAV-table operations: assert-fact / retract-fact / scan-eav.
+;; Bypass the rule/query machinery — test the raw triple store.
+;; Pre-existing coverage: ray_assert_fact_fn was used; ray_retract_fact_fn
+;; and ray_scan_eav_fn were 0% — this file walks both.
+
+;; ────────────── retract-fact ──────────────
+;; assert one fact, retract it, verify it's gone via query.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'age 30))
+(count (query Db (find ?n) (where (?e :age ?n)))) -- 1
+
+(set Db (retract-fact Db 1 'age 30))
+(count (query Db (find ?n) (where (?e :age ?n)))) -- 0
+
+;; retract one of several facts — only the matching triple is removed.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'age 30))
+(set Db (assert-fact Db 2 'age 25))
+(set Db (assert-fact Db 3 'age 40))
+(count (query Db (find ?n) (where (?e :age ?n)))) -- 3
+
+(set Db (retract-fact Db 2 'age 25))
+(count (query Db (find ?n) (where (?e :age ?n)))) -- 2
+
+;; retract a non-existent triple is a no-op (does not error)
+(set Db (retract-fact Db 99 'age 999))
+(count (query Db (find ?n) (where (?e :age ?n)))) -- 2
+
+;; retract leaves other attributes on the same entity untouched
+(set Db (datoms))
+(set Db (assert-fact Db 1 'age 30))
+(set Db (assert-fact Db 1 'name 100))
+(set Db (retract-fact Db 1 'age 30))
+;; age gone, name remains
+(count (query Db (find ?n) (where (?e :age ?n)))) -- 0
+(count (query Db (find ?n) (where (?e :name ?n)))) -- 1
+
+;; ────────────── scan-eav: 2-arg form (filter by attribute) ──────────────
+;; Returns the rows of the datoms table where attr matches.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'age 30))
+(set Db (assert-fact Db 2 'age 25))
+(set Db (assert-fact Db 3 'age 40))
+(set Db (assert-fact Db 1 'name 100))
+
+;; 3 rows match :age, 1 row matches :name
+(count (scan-eav Db 'age))  -- 3
+(count (scan-eav Db 'name)) -- 1
+;; non-existent attribute → empty result, not error
+(count (scan-eav Db 'missing)) -- 0
+
+;; ────────────── scan-eav: 3-arg form (entity + attribute lookup) ──────────────
+;; Returns the single value at (e, a).
+(scan-eav Db 1 'age)  -- 30
+(scan-eav Db 2 'age)  -- 25
+(scan-eav Db 1 'name) -- 100
+
+;; ────────────── round-trip through assert/retract ──────────────
+;; Re-add a retracted fact; query must see it again.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'age 30))
+(set Db (retract-fact Db 1 'age 30))
+(count (query Db (find ?n) (where (?e :age ?n)))) -- 0
+(set Db (assert-fact Db 1 'age 30))
+(count (query Db (find ?n) (where (?e :age ?n)))) -- 1
+(scan-eav Db 1 'age) -- 30

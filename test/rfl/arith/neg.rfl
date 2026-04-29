@@ -1,0 +1,108 @@
+;; Invariants for `neg` (unary negation).
+
+;; involution:  (neg (neg a)) == a
+(set A (- (rand 256 200000) 100000))
+(count A) -- (sum (== (neg (neg A)) A))
+
+;; additive inverse:  (+ a (neg a)) == 0
+(count A) -- (sum (== (+ A (neg A)) 0))
+
+;; distributes over +:  (neg (+ a b)) == (+ (neg a) (neg b))
+(set B (- (rand 256 200000) 100000))
+(count A) -- (sum (== (neg (+ A B)) (+ (neg A) (neg B))))
+
+;; concrete
+(neg 5)  -- -5
+(neg 0)  -- 0
+(neg -3) -- 3
+
+;; null atoms propagate through neg
+(nil? (neg 0N))  -- true
+(nil? (neg 0Ni)) -- true
+
+;; ──────────────────────────────────────────────────────────────────
+;; Vec + cross-type
+;; ──────────────────────────────────────────────────────────────────
+
+(neg [1 2 3])       -- [-1 -2 -3]
+(neg [1.0 2.0 3.0]) -- [-1.0 -2.0 -3.0]
+(neg 5.0)           -- -5.0
+(type (neg 5))      -- 'i64
+(type (neg 5.0))    -- 'f64
+
+;; involution per-type (vec)
+(neg (neg [1 2 3]))         -- [1 2 3]
+(neg (neg [1.0 2.0 3.0]))   -- [1.0 2.0 3.0]
+
+;; ──────────────────────────────────────────────────────────────────
+;; Morsel boundary
+;; ──────────────────────────────────────────────────────────────────
+
+(set V (til 1024))
+(neg (neg V)) -- V
+(sum (+ V (neg V))) -- 0
+
+;; ──────────────────────────────────────────────────────────────────
+;; Narrow ints preserve type on negation (same convention as +/-/*).
+;; ──────────────────────────────────────────────────────────────────
+
+(neg 5h) -- -5h
+(neg 5i) -- -5i
+(neg -5h) -- 5h
+(neg -5i) -- 5i
+(neg [1h 2h 3h]) -- [-1h -2h -3h]
+(neg [1i 2i 3i]) -- [-1i -2i -3i]
+
+;; type is preserved
+(type (neg 5h))         -- 'i16
+(type (neg 5i))         -- 'i32
+(type (neg [1h 2h]))    -- 'I16
+(type (neg [1i 2i]))    -- 'I32
+
+;; null propagation across narrow types
+(nil? (neg 0Nh)) -- true
+(nil? (neg 0Ni)) -- true
+
+;; ──────────────────────────────────────────────────────────────────
+;; INT_MIN: -INT_MIN doesn't fit in the same signed width (overflow).
+;; Per k/q convention neg surfaces this as a typed null of the same
+;; width — type preserved, no UB, detectable via `nil?`.
+;; ──────────────────────────────────────────────────────────────────
+
+;; (- (neg 32767h) 1h) = -32768h = INT16_MIN; (neg INT16_MIN) → 0Nh
+(nil? (neg (- (neg 32767h) 1h)))           -- true
+(type (neg (- (neg 32767h) 1h)))           -- 'i16
+
+(nil? (neg (- (neg 2147483647i) 1i)))      -- true
+(type (neg (- (neg 2147483647i) 1i)))      -- 'i32
+
+(nil? (neg (- (neg 9223372036854775807) 1))) -- true
+(type (neg (- (neg 9223372036854775807) 1))) -- 'i64
+
+;; values adjacent to INT_MIN that DON'T overflow — neg works normally
+(neg 32767h)               -- -32767h
+(neg 2147483647i)          -- -2147483647i
+(neg 9223372036854775807)  -- -9223372036854775807
+
+;; ──────────────────────────────────────────────────────────────────
+;; DAG (fused expression) path — same INT64_MIN → typed null contract
+;; through `(select {x: (neg col) from: t})`.  Without the post-pass
+;; in expr_eval_full, the unsigned-wrap loop returned INT64_MIN as a
+;; bare value and the result lacked HAS_NULLS — silent overflow.
+;;
+;; Vec literal `[...]` only accepts atom literals, so we build the
+;; INT64_MIN-bearing column via `concat` of a typed atom.
+;; ──────────────────────────────────────────────────────────────────
+
+(set Vn (concat -9223372036854775808 (concat -5 (concat 5 0))))
+(set Tn (table [v] (list Vn)))
+(set Rn (select {x: (neg v) from: Tn}))
+(nil? (at (at Rn 'x) 0)) -- true       ;; INT64_MIN row → null
+(at (at Rn 'x) 1)        -- 5
+(at (at Rn 'x) 2)        -- -5
+(at (at Rn 'x) 3)        -- 0
+
+;; vector eval-path (no fused DAG) — `(neg col)` directly over a vec
+;; goes through atomic_map_unary → ray_neg_fn per element.
+(nil? (at (neg Vn) 0)) -- true
+(at (neg Vn) 1)        -- 5

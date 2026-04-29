@@ -1,0 +1,116 @@
+;; Regression: pin down type-promotion rules for every arithmetic op.
+;; Each assertion locks in the current behavior so an accidental change
+;; (e.g. someone widening `+` to i64 unconditionally) breaks loudly.
+;;
+;; Documented rules:
+;;   1. Same-width binary +/-/*/// preserve type.
+;;        (+ 5h 3h) → i16,  (+ 5i 3i) → i32,  (+ 5 3) → i64,  (+ 5.0 3.0) → f64
+;;   2. Cross-width binary: wider wins.
+;;        (+ i16 i32) → i32,  (+ i16 i64) → i64,  (+ i16 f64) → f64
+;;   3. Comparison ops always return bool.
+;;   4. Unary neg / floor / ceil preserve type.
+;;   5. Unary abs preserves type (same as neg/floor/ceil).
+;;   6. Math fns (round, sqrt, log, exp) always produce f64.
+
+;; ── (1) Same-width preservation: + - * /
+(type (+ 5h 3h)) -- 'i16
+(type (- 5h 3h)) -- 'i16
+(type (* 5h 3h)) -- 'i16
+(type (/ 6h 3h)) -- 'i16
+(type (+ 5i 3i)) -- 'i32
+(type (- 5i 3i)) -- 'i32
+(type (* 5i 3i)) -- 'i32
+(type (/ 6i 3i)) -- 'i32
+(type (+ 5 3))   -- 'i64
+(type (- 5 3))   -- 'i64
+(type (* 5 3))   -- 'i64
+(type (/ 6 3))   -- 'i64
+(type (+ 5.0 3.0)) -- 'f64
+(type (- 5.0 3.0)) -- 'f64
+(type (* 5.0 3.0)) -- 'f64
+(type (/ 6.0 3.0)) -- 'f64
+
+;; vector form mirrors atomic
+(type (+ [1h 2h] [3h 4h])) -- 'I16
+(type (+ [1i 2i] [3i 4i])) -- 'I32
+(type (+ [1 2] [3 4]))     -- 'I64
+(type (+ [1.0 2.0] [3.0 4.0])) -- 'F64
+
+;; ── (2) Cross-width: wider wins
+(type (+ 5h 3i))   -- 'i32
+(type (+ 5h 3))    -- 'i64
+(type (+ 5i 3))    -- 'i64
+(type (+ 5h 3.0))  -- 'f64
+(type (+ 5i 3.0))  -- 'f64
+(type (+ 5 3.0))   -- 'f64
+
+(type (+ [1h 2h] [3i 4i])) -- 'I32
+(type (+ [1h 2h] [3 4]))   -- 'I64
+(type (+ [1h 2h] [3.0 4.0])) -- 'F64
+(type (+ [1i 2i] [3.0 4.0])) -- 'F64
+
+;; ── (3) Comparison always → bool
+(type (== 5h 3h)) -- 'b8
+(type (!= 5h 3h)) -- 'b8
+(type (> 5h 3h))  -- 'b8
+(type (< 5h 3h))  -- 'b8
+(type (>= 5h 3h)) -- 'b8
+(type (<= 5h 3h)) -- 'b8
+
+(type (== 5h 3))   -- 'b8
+(type (== 5h 3.0)) -- 'b8
+
+(type (== [1h 2h] [3h 4h])) -- 'B8
+
+;; ── (4) Unary preserve type: neg, floor, ceil
+(type (neg 5h))   -- 'i16
+(type (neg 5i))   -- 'i32
+(type (neg 5))    -- 'i64
+(type (neg 5.0))  -- 'f64
+(type (neg [1h 2h])) -- 'I16
+(type (neg [1i 2i])) -- 'I32
+
+(type (floor 5h))  -- 'i16
+(type (floor 5i))  -- 'i32
+(type (floor 5))   -- 'i64
+(type (floor 5.0)) -- 'f64
+
+(type (ceil 5h))  -- 'i16
+(type (ceil 5i))  -- 'i32
+(type (ceil 5))   -- 'i64
+(type (ceil 5.0)) -- 'f64
+
+;; ── (5) abs preserves type (same convention as neg/floor/ceil)
+(type (abs 5h))   -- 'i16
+(type (abs 5i))   -- 'i32
+(type (abs 5))    -- 'i64
+(type (abs 5.0))  -- 'f64
+(type (abs [1h -2h])) -- 'I16
+(type (abs [1i -2i])) -- 'I32
+
+;; ── (6) Math fns always → f64
+(type (round 5h)) -- 'f64
+(type (round 5i)) -- 'f64
+(type (round 5))  -- 'f64
+(type (round 5.0)) -- 'f64
+
+(type (sqrt 5h)) -- 'f64
+(type (sqrt 5i)) -- 'f64
+(type (sqrt 5))  -- 'f64
+(type (sqrt 5.0)) -- 'f64
+
+(type (log 5h)) -- 'f64
+(type (log 5i)) -- 'f64
+(type (log 5))  -- 'f64
+(type (log 5.0)) -- 'f64
+
+(type (exp 5h)) -- 'f64
+(type (exp 5i)) -- 'f64
+(type (exp 5))  -- 'f64
+(type (exp 5.0)) -- 'f64
+
+;; ── Mod (%) preserves type same as +/-/*
+(type (% 7h 3h)) -- 'i16
+(type (% 7i 3i)) -- 'i32
+(type (% 7 3))   -- 'i64
+(type (% 7.0 3.0)) -- 'f64

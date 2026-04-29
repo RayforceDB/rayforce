@@ -1,0 +1,16 @@
+;; Aggregation behaviour: nulls are skipped (databases-style), counts include them.
+
+;; sum is identity over all-null
+(sum (as 'I64 [])) -- 0
+
+;; count(v) doesn't depend on values
+(count [1 2 3 4 5]) -- 5
+(count [0N 0N 0N 0N 0N]) -- 5
+
+;; avg counts only non-null elements in its denominator
+(avg [10 20 0N 40]) -- 23.333333333333332
+(avg [0N 0N 5]) -- 5.0
+
+;; first/last skip leading/trailing nulls
+(first [0N 0N 7 8]) -- 7
+(last [7 8 0N 0N]) -- 8

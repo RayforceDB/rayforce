@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Select &amp; Update — Rayforce Documentation</title>
+  <meta name="description" content="Select, update, insert, upsert, and delete queries in Rayfall. Projection, filtering, group-by aggregation, and column mutation.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link active">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Select &amp; Update</span>
+      </div>
+
+      <h1>Select, Update, Insert &amp; Upsert</h1>
+      <p class="page-subtitle">Query, mutate, and manage table data with Rayfall's declarative query syntax. All query forms compile to a fused DAG for morsel-driven parallel execution.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="select">Select</h2>
+      <p>The <code>select</code> form is the primary way to query tables. It supports projection, filtering, computed columns, and group-by aggregation through a single dictionary argument.</p>
+
+      <h3 id="select-basic">Basic Projection</h3>
+      <p>Select all columns from a table (identity query):</p>
+      <pre><code><span class="hl-comment">; Create a sample table</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">sym</span> <span class="hl-sym">price</span> <span class="hl-sym">volume</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span> <span class="hl-str">MSFT</span>] [<span class="hl-num">150</span> <span class="hl-num">280</span> <span class="hl-num">420</span>] [<span class="hl-num">500</span> <span class="hl-num">400</span> <span class="hl-num">900</span>])))
+
+<span class="hl-comment">; Select all rows and columns</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t})
+<span class="hl-comment">; sym  price volume</span>
+<span class="hl-comment">; ---  ----- ------</span>
+<span class="hl-comment">; AAPL   150    500</span>
+<span class="hl-comment">; GOOG   280    400</span>
+<span class="hl-comment">; MSFT   420    900</span></code></pre>
+
+      <p>Select specific columns with computed expressions:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">sym:</span> sym <span class="hl-sym">notional:</span> (<span class="hl-fn">*</span> price volume)})
+<span class="hl-comment">; sym  notional</span>
+<span class="hl-comment">; ---  --------</span>
+<span class="hl-comment">; AAPL    75000</span>
+<span class="hl-comment">; GOOG   112000</span>
+<span class="hl-comment">; MSFT   378000</span></code></pre>
+
+      <h3 id="select-filter">Filtering with <code>where:</code></h3>
+      <p>The <code>where:</code> clause accepts any predicate expression. Predicates are pushed down through the DAG for early elimination of rows:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> price <span class="hl-num">200</span>)})
+<span class="hl-comment">; sym  price volume</span>
+<span class="hl-comment">; ---  ----- ------</span>
+<span class="hl-comment">; GOOG   280    400</span>
+<span class="hl-comment">; MSFT   420    900</span></code></pre>
+
+      <p>Combine multiple conditions:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">where:</span> (<span class="hl-fn">and</span> (<span class="hl-fn">&gt;</span> price <span class="hl-num">100</span>) (<span class="hl-fn">&lt;</span> volume <span class="hl-num">600</span>))})
+<span class="hl-comment">; sym  price volume</span>
+<span class="hl-comment">; ---  ----- ------</span>
+<span class="hl-comment">; AAPL   150    500</span>
+<span class="hl-comment">; GOOG   280    400</span></code></pre>
+
+      <h3 id="select-groupby">Group-by Aggregation</h3>
+      <p>The <code>by:</code> clause groups rows by one or more key columns. Aggregation functions are specified as additional key-value pairs in the query dict:</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">sym</span> <span class="hl-sym">side</span> <span class="hl-sym">price</span> <span class="hl-sym">qty</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-str">AAPL</span> <span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span> <span class="hl-str">GOOG</span> <span class="hl-str">AAPL</span>]
+          [<span class="hl-str">Buy</span> <span class="hl-str">Sell</span> <span class="hl-str">Buy</span> <span class="hl-str">Buy</span> <span class="hl-str">Buy</span>]
+          [<span class="hl-num">150</span> <span class="hl-num">152</span> <span class="hl-num">280</span> <span class="hl-num">282</span> <span class="hl-num">149</span>]
+          [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span> <span class="hl-num">75</span> <span class="hl-num">300</span>])))
+
+<span class="hl-comment">; Group by sym, aggregate price and qty</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">by:</span> sym
+         <span class="hl-sym">avg_price:</span> (<span class="hl-fn">avg</span> price)
+         <span class="hl-sym">total_qty:</span> (<span class="hl-fn">sum</span> qty)
+         <span class="hl-sym">n:</span> (<span class="hl-fn">count</span> price)})
+<span class="hl-comment">; sym  avg_price total_qty  n</span>
+<span class="hl-comment">; ---  --------- ---------  -</span>
+<span class="hl-comment">; AAPL    150.33       600  3</span>
+<span class="hl-comment">; GOOG     281.0       125  2</span></code></pre>
+
+      <p>Group by multiple keys:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">by:</span> [sym side]
+         <span class="hl-sym">total:</span> (<span class="hl-fn">sum</span> qty)})
+<span class="hl-comment">; sym  side total</span>
+<span class="hl-comment">; ---  ---- -----</span>
+<span class="hl-comment">; AAPL Buy    400</span>
+<span class="hl-comment">; AAPL Sell   200</span>
+<span class="hl-comment">; GOOG Buy    125</span></code></pre>
+
+      <h3 id="select-where-by">Filter + Group-by</h3>
+      <p>Filter first, then group by. Chain two <code>select</code> calls for correct results:</p>
+      <pre><code><span class="hl-comment">; Step 1: filter to Buy rows only</span>
+(<span class="hl-kw">set</span> buys (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">where:</span> (<span class="hl-fn">==</span> side <span class="hl-str">"Buy"</span>)}))
+
+<span class="hl-comment">; Step 2: group and aggregate</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> buys <span class="hl-sym">by:</span> sym
+         <span class="hl-sym">buy_qty:</span> (<span class="hl-fn">sum</span> qty)})
+<span class="hl-comment">; sym  buy_qty</span>
+<span class="hl-comment">; ---  -------</span>
+<span class="hl-comment">; AAPL     400</span>
+<span class="hl-comment">; GOOG     125</span></code></pre>
+
+      <h3 id="select-sort">Sorting with <code>asc:</code> and <code>desc:</code></h3>
+      <p>Sort the result by one or more columns. Use <code>asc:</code> for ascending and <code>desc:</code> for descending order:</p>
+      <pre><code><span class="hl-comment">; Sort by price ascending</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">asc:</span> <span class="hl-sym">price</span>})
+
+<span class="hl-comment">; Sort by price descending</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">desc:</span> <span class="hl-sym">price</span>})</code></pre>
+
+      <p>Sort by multiple columns by passing a symbol vector:</p>
+      <pre><code><span class="hl-comment">; Sort by sym ascending, then price ascending</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">asc:</span> [<span class="hl-sym">sym</span> <span class="hl-sym">price</span>]})</code></pre>
+
+      <p>Mix ascending and descending with separate clauses. Sort priority follows the order of clauses in the dictionary:</p>
+      <pre><code><span class="hl-comment">; Primary: sym ascending. Secondary: price descending.</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">asc:</span> <span class="hl-sym">sym</span> <span class="hl-sym">desc:</span> <span class="hl-sym">price</span>})</code></pre>
+
+      <h3 id="select-take">Limiting Rows with <code>take:</code></h3>
+      <p>Limit the number of rows in the result. Positive values take from the beginning, negative from the end:</p>
+      <pre><code><span class="hl-comment">; First 5 rows</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">take:</span> <span class="hl-num">5</span>})
+
+<span class="hl-comment">; Last 3 rows</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">take:</span> <span class="hl-num">-3</span>})</code></pre>
+
+      <p>For a range slice, pass a two-element vector <code>[start count]</code>:</p>
+      <pre><code><span class="hl-comment">; Skip 10 rows, then take 5</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">take:</span> [<span class="hl-num">10</span> <span class="hl-num">5</span>]})</code></pre>
+
+      <h3 id="select-combined">Combining Clauses</h3>
+      <p>All clauses can be combined. They apply in this order: <code>where:</code> &rarr; <code>by:</code> / projection &rarr; <code>asc:</code>/<code>desc:</code> &rarr; <code>take:</code></p>
+      <pre><code><span class="hl-comment">; Filter, sort, and limit in one query</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> price <span class="hl-num">100</span>) <span class="hl-sym">desc:</span> <span class="hl-sym">price</span> <span class="hl-sym">take:</span> <span class="hl-num">10</span>})
+<span class="hl-comment">; Top 10 most expensive trades above $100</span></code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="update">Update</h2>
+      <p>The <code>update</code> form modifies columns in-place on a quoted table variable. It supports the same <code>where:</code> and <code>by:</code> clauses as <code>select</code>.</p>
+
+      <h3 id="update-basic">Column Mutation</h3>
+      <p>Update one or more columns with a new expression. The table is modified in-place when the first argument is a quoted symbol:</p>
+      <pre><code>(<span class="hl-kw">set</span> tab (<span class="hl-fn">table</span> [<span class="hl-sym">sym</span> <span class="hl-sym">price</span> <span class="hl-sym">volume</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span> <span class="hl-str">MSFT</span>] [<span class="hl-num">102</span> <span class="hl-num">203</span> <span class="hl-num">99</span>] [<span class="hl-num">500</span> <span class="hl-num">400</span> <span class="hl-num">900</span>])))
+
+<span class="hl-comment">; Increment volume by 1</span>
+(<span class="hl-kw">update</span> {<span class="hl-sym">volume:</span> (<span class="hl-fn">+</span> <span class="hl-num">1</span> volume) <span class="hl-sym">from:</span> <span class="hl-str">'tab</span>})
+<span class="hl-comment">; sym  price volume</span>
+<span class="hl-comment">; ---  ----- ------</span>
+<span class="hl-comment">; AAPL   102    501</span>
+<span class="hl-comment">; GOOG   203    401</span>
+<span class="hl-comment">; MSFT    99    901</span></code></pre>
+
+      <h3 id="update-where">Conditional Update</h3>
+      <p>Apply updates only to rows matching a predicate:</p>
+      <pre><code><span class="hl-comment">; Apply a custom function to price where volume == 901</span>
+(<span class="hl-kw">update</span> {<span class="hl-sym">price:</span> ((<span class="hl-kw">fn</span> [x] (<span class="hl-fn">+</span> x <span class="hl-num">11</span>)) price) <span class="hl-sym">from:</span> <span class="hl-str">'tab</span> <span class="hl-sym">where:</span> (<span class="hl-fn">==</span> volume <span class="hl-num">901</span>)})
+<span class="hl-comment">; sym  price volume</span>
+<span class="hl-comment">; ---  ----- ------</span>
+<span class="hl-comment">; AAPL   102    501</span>
+<span class="hl-comment">; GOOG   203    401</span>
+<span class="hl-comment">; MSFT   110    901</span></code></pre>
+
+      <p>Set a column to a constant for matching rows:</p>
+      <pre><code>(<span class="hl-kw">update</span> {<span class="hl-sym">price:</span> <span class="hl-num">0</span> <span class="hl-sym">from:</span> <span class="hl-str">'tab</span> <span class="hl-sym">where:</span> (<span class="hl-fn">==</span> volume <span class="hl-num">901</span>)})</code></pre>
+
+      <h3 id="update-by">Update with Group-by</h3>
+      <p>Combine <code>where:</code> and <code>by:</code> for grouped conditional updates:</p>
+      <pre><code>(<span class="hl-kw">update</span> {<span class="hl-sym">price:</span> <span class="hl-num">0</span> <span class="hl-sym">from:</span> <span class="hl-str">'tab</span> <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> volume <span class="hl-num">400</span>)})</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="insert">Insert</h2>
+      <p>The <code>insert</code> function appends rows to a table. It accepts rows as a list of atoms, a list of vectors, a dictionary, or another table. Column order is flexible &mdash; missing columns receive null values.</p>
+
+      <h3 id="insert-list">Insert from List</h3>
+      <pre><code>(<span class="hl-kw">set</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">ID</span> <span class="hl-sym">Name</span> <span class="hl-sym">Value</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-str">'Alice</span> <span class="hl-str">'Bob</span> <span class="hl-str">'Charlie</span>] [<span class="hl-num">10.0</span> <span class="hl-num">20.0</span> <span class="hl-num">30.0</span>])))
+
+<span class="hl-comment">; Insert a single record</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">insert</span> t (<span class="hl-fn">list</span> <span class="hl-num">4</span> <span class="hl-str">'David</span> <span class="hl-num">40.0</span>)))
+
+<span class="hl-comment">; Insert multiple records (list of vectors)</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">insert</span> t (<span class="hl-fn">list</span> [<span class="hl-num">5</span> <span class="hl-num">6</span>] [<span class="hl-str">'Eve</span> <span class="hl-str">'Frank</span>] [<span class="hl-num">50.0</span> <span class="hl-num">60.0</span>])))</code></pre>
+
+      <h3 id="insert-dict">Insert from Dictionary</h3>
+      <p>Dictionaries allow columns in any order. Missing columns are filled with null:</p>
+      <pre><code><span class="hl-comment">; Columns in different order</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">insert</span> t (<span class="hl-fn">dict</span> [<span class="hl-sym">Value</span> <span class="hl-sym">Name</span> <span class="hl-sym">ID</span>] (<span class="hl-fn">list</span> <span class="hl-num">120.0</span> <span class="hl-str">'Leo</span> <span class="hl-num">12</span>))))
+
+<span class="hl-comment">; Partial columns &mdash; Value will be null</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">insert</span> t (<span class="hl-fn">dict</span> [<span class="hl-sym">ID</span> <span class="hl-sym">Name</span>] (<span class="hl-fn">list</span> <span class="hl-num">14</span> <span class="hl-str">'Nancy</span>))))</code></pre>
+
+      <h3 id="insert-table">Insert from Table</h3>
+      <pre><code><span class="hl-comment">; Append another table (column order can differ)</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">insert</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">Value</span> <span class="hl-sym">ID</span> <span class="hl-sym">Name</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-num">180.0</span> <span class="hl-num">190.0</span>] [<span class="hl-num">18</span> <span class="hl-num">19</span>] [<span class="hl-str">'Rose</span> <span class="hl-str">'Sam</span>]))))</code></pre>
+
+      <h3 id="insert-inplace">In-place Insert</h3>
+      <p>Pass a quoted table symbol for in-place mutation:</p>
+      <pre><code><span class="hl-comment">; Mutate table in-place (no set needed)</span>
+(<span class="hl-fn">insert</span> <span class="hl-str">'t</span> (<span class="hl-fn">dict</span> [<span class="hl-sym">Value</span> <span class="hl-sym">Name</span> <span class="hl-sym">ID</span>] (<span class="hl-fn">list</span> <span class="hl-num">200.0</span> <span class="hl-str">'Tom</span> <span class="hl-num">20</span>)))</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="upsert">Upsert</h2>
+      <p>The <code>upsert</code> function inserts new rows or updates existing ones based on a key column index. The second argument is the 0-based column index used as the match key.</p>
+
+      <h3 id="upsert-new">Insert New Rows</h3>
+      <pre><code>(<span class="hl-kw">set</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">ID</span> <span class="hl-sym">Name</span> <span class="hl-sym">Value</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-str">'Alice</span> <span class="hl-str">'Bob</span> <span class="hl-str">'Charlie</span>] [<span class="hl-num">10.0</span> <span class="hl-num">20.0</span> <span class="hl-num">30.0</span>])))
+
+<span class="hl-comment">; Upsert on column 1 (ID). ID=4 is new, so insert.</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">upsert</span> t <span class="hl-num">1</span> (<span class="hl-fn">list</span> <span class="hl-num">4</span> <span class="hl-str">'David</span> <span class="hl-num">40.0</span>)))</code></pre>
+
+      <h3 id="upsert-update">Update Existing Rows</h3>
+      <pre><code><span class="hl-comment">; ID=2 exists &mdash; update in place</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">upsert</span> t <span class="hl-num">1</span> (<span class="hl-fn">list</span> <span class="hl-num">2</span> <span class="hl-str">'Bobby</span> <span class="hl-num">25.0</span>)))
+<span class="hl-comment">; ID Name    Value</span>
+<span class="hl-comment">; -- ----    -----</span>
+<span class="hl-comment">;  1 Alice    10.0</span>
+<span class="hl-comment">;  2 Bobby    25.0  &larr; updated</span>
+<span class="hl-comment">;  3 Charlie  30.0</span>
+<span class="hl-comment">;  4 David    40.0</span></code></pre>
+
+      <h3 id="upsert-dict">Upsert from Dictionary</h3>
+      <p>Like <code>insert</code>, columns can be in any order:</p>
+      <pre><code><span class="hl-comment">; Columns reordered &mdash; upsert matches on ID</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">upsert</span> t <span class="hl-num">1</span> (<span class="hl-fn">dict</span> [<span class="hl-sym">Name</span> <span class="hl-sym">Value</span> <span class="hl-sym">ID</span>] (<span class="hl-fn">list</span> <span class="hl-str">'Bobby2</span> <span class="hl-num">22.0</span> <span class="hl-num">2</span>))))
+
+<span class="hl-comment">; Mixed insert + update in one call</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">upsert</span> t <span class="hl-num">1</span> (<span class="hl-fn">dict</span> [<span class="hl-sym">Value</span> <span class="hl-sym">ID</span> <span class="hl-sym">Name</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-num">35.0</span> <span class="hl-num">140.0</span>] [<span class="hl-num">3</span> <span class="hl-num">14</span>] [<span class="hl-str">'Charlie2</span> <span class="hl-str">'Nancy</span>]))))</code></pre>
+
+      <h3 id="upsert-inplace">In-place Upsert</h3>
+      <pre><code>(<span class="hl-fn">upsert</span> <span class="hl-str">'t</span> <span class="hl-num">1</span> (<span class="hl-fn">dict</span> [<span class="hl-sym">Value</span> <span class="hl-sym">Name</span> <span class="hl-sym">ID</span>] (<span class="hl-fn">list</span> <span class="hl-num">170.0</span> <span class="hl-str">'Quinn</span> <span class="hl-num">17</span>)))</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="delete">Delete Rows</h2>
+      <p>To remove rows matching a predicate, use <code>select</code> with the inverse condition:</p>
+      <pre><code>(<span class="hl-kw">set</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">x</span> <span class="hl-sym">y</span>] (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>] [<span class="hl-str">A</span> <span class="hl-str">B</span> <span class="hl-str">C</span> <span class="hl-str">D</span>])))
+
+<span class="hl-comment">; Remove rows where x &gt; 2 by keeping rows where x &lt;= 2</span>
+(<span class="hl-kw">set</span> t (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> t <span class="hl-sym">where:</span> (<span class="hl-fn">&lt;=</span> x <span class="hl-num">2</span>)}))
+<span class="hl-comment">; x y</span>
+<span class="hl-comment">; - -</span>
+<span class="hl-comment">; 1 A</span>
+<span class="hl-comment">; 2 B</span></code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="reference">Quick Reference</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Form</th>
+            <th>Syntax</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>select</code></td>
+            <td><code>(select {from: t col: expr where: pred by: key asc: col desc: col take: n})</code></td>
+            <td>Query with projection, filtering, grouping, sorting, and limiting</td>
+          </tr>
+          <tr>
+            <td><code>update</code></td>
+            <td><code>(update {col: expr from: 't where: pred})</code></td>
+            <td>In-place column mutation</td>
+          </tr>
+          <tr>
+            <td><code>insert</code></td>
+            <td><code>(insert t rows)</code> or <code>(insert 't rows)</code></td>
+            <td>Append rows (list, dict, or table)</td>
+          </tr>
+          <tr>
+            <td><code>upsert</code></td>
+            <td><code>(upsert t key-idx rows)</code></td>
+            <td>Insert or update by key column</td>
+          </tr>
+          <tr>
+            <td><em>delete rows</em></td>
+            <td><code>(select {from: t where: (not pred)})</code></td>
+            <td>Remove matching rows via inverse filter</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="info-box">
+        <strong>Execution model.</strong> All <code>select</code> and <code>update</code> queries compile to a lazy DAG. The optimizer applies predicate pushdown, filter reordering, operator fusion, and dead-code elimination before the fused morsel-driven executor processes data in 1024-element chunks.
+      </div>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="data-types-collections.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Collections</span></a>
+        <a href="queries-joins.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Joins</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

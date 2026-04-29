@@ -1,0 +1,89 @@
+;; Invariants for `like` — glob-style pattern match.
+
+(like "hello" "hello") -- true
+(like "hello" "world") -- false
+(like "hello" "h*") -- true
+(like "hello" "*o") -- true
+(like "hello" "*") -- true
+(like "hello" "h?llo") -- true
+
+;; ────────────── extended literal / wildcard coverage ──────────────
+(like "hello world" "hello*") -- true
+(like "hello world" "*world") -- true
+(like "foobar" "*oo*") -- true
+(like "cat" "c?t") -- true
+(like "cat" "c??t") -- false
+
+;; like is anchored, not a substring search — "ell" does NOT match "hello"
+(like "hello" "ell") -- false
+
+;; ────────────── empty operands ──────────────
+(like "" "") -- true
+(like "" "x") -- false
+(like "x" "") -- false
+(like "" "*") -- true
+
+;; ────────────── SQL meta-chars are LITERAL post-consolidation ──────────────
+;; Pre-consolidation the DAG path treated `%` and `_` as SQL wildcards.
+;; After unifying on glob in src/ops/glob.[ch], they're literal bytes.
+(like "100%" "100%") -- true    ;; literal '%' matches itself
+(like "abc"  "%")    -- false   ;; '%' is no longer "any chars"
+(like "a_b"  "a_b")  -- true    ;; literal '_' matches itself
+(like "ab"   "a_b")  -- false   ;; '_' is no longer "single char"
+
+;; ────────────── escaping metacharacters via [ ... ] ──────────────
+;; No backslash escape: wrap the metachar in a one-element class to
+;; match it literally.  Documented in src/ops/glob.h.
+(like "abc*"      "abc[*]")        -- true   ;; literal '*'
+(like "what?"     "what[?]")       -- true   ;; literal '?'
+(like "[error]"   "[[]error[]]")   -- true   ;; literal '[' and ']'
+(like "a-z"       "a[-]z")         -- true   ;; literal '-' (sole char in class)
+(like "100%"      "100[%]")        -- true   ;; literal '%' (also a literal byte
+                                              ;; on its own, but [%] proves the
+                                              ;; class-wrap idiom works)
+
+;; ────────────── universal-star metamorphic invariants ──────────────
+;; `*` matches anything, including punctuation / digits / mixed bytes.
+(like "abc" "*") -- true
+(like "xyz 123 !@#" "*") -- true
+
+;; idempotence: text matches itself when the pattern has no meta-chars
+(like "plain text" "plain text") -- true
+(like "foo bar" "foo bar") -- true
+
+;; literal prefix/suffix combined with one star
+(like "hello world" "hello *") -- true
+(like "hello world" "* world") -- true
+
+;; ────────────── character class [abc] / [a-z] / [!abc] ──────────────
+(like "cat" "[cb]at") -- true
+(like "bat" "[cb]at") -- true
+(like "rat" "[cb]at") -- false
+
+;; ranges
+(like "a" "[a-z]") -- true
+(like "Z" "[a-z]") -- false
+(like "5" "[0-9]") -- true
+
+;; negated class
+(like "x" "[!abc]") -- true
+(like "a" "[!abc]") -- false
+
+;; class alongside other meta
+(like "hello" "[hH]ello") -- true
+(like "Hello" "[hH]ello") -- true
+
+;; ────────────── catastrophic-backtracking guard ──────────────
+;; Pre-fix the recursive eval-path matcher took >5s for 16 stars.
+;; The iterative replacement is O(n*m) — finishes in microseconds even
+;; for adversarial 20-star patterns over an a-only string.
+(like "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b") -- false
+
+;; ────────────── eval ≡ DAG: same pattern via select-where ──────────────
+;; Pre-fix, eval-path used glob */?/[abc] but the DAG path for
+;; (select where: (like col pat)) used SQL %/_ — divergent semantics.
+;; Now both paths share src/ops/glob.[ch].
+(set Tlike (table [s] (list ["hello" "world" "hi" "help"])))
+(count (select {from: Tlike where: (like s "h*")})) -- 3
+(count (select {from: Tlike where: (like s "h?llo")})) -- 1
+(count (select {from: Tlike where: (like s "[hw]*")})) -- 4

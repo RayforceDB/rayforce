@@ -1,0 +1,16 @@
+;; Invariants for `desc` (descending sort).
+
+(desc [3 1 2]) -- [3 2 1]
+(desc []) -- []
+
+;; reverse of asc
+(set V (rand 200 10000))
+(desc V) -- (reverse (asc V))
+
+;; sorted descending: neighbours obey >=
+(set S (desc V))
+(set N (- (count S) 1))
+N -- (sum (>= (at S (til N)) (at S (+ 1 (til N)))))
+
+(first (desc V)) -- (max V)
+(last (desc V)) -- (min V)

@@ -1,0 +1,81 @@
+;; Invariants for `abs` (absolute value).
+
+;; non-negative
+(set A (- (rand 256 200000) 100000))
+(count A) -- (sum (>= (abs A) 0))
+
+;; idempotent
+(count A) -- (sum (== (abs (abs A)) (abs A)))
+
+;; |x| == |-x|
+(count A) -- (sum (== (abs A) (abs (neg A))))
+
+;; abs dominates
+(count A) -- (sum (>= (abs A) A))
+(count A) -- (sum (>= (abs A) (neg A)))
+
+;; concrete
+(abs -5) -- 5
+(abs 5)  -- 5
+(abs 0)  -- 0
+
+;; null atoms propagate through abs
+(nil? (abs 0N))  -- true
+(nil? (abs 0Ni)) -- true
+
+;; ──────────────────────────────────────────────────────────────────
+;; Vec + type preservation — abs keeps narrow-int type (same as neg)
+;; ──────────────────────────────────────────────────────────────────
+
+(abs [1 -2 3 -4])     -- [1 2 3 4]
+(abs [-1.5 2.5 -3.5]) -- [1.5 2.5 3.5]
+(abs -5.0)            -- 5.0
+(type (abs -5))       -- 'i64
+(type (abs -5.0))     -- 'f64
+(type (abs -5h))      -- 'i16
+(type (abs -5i))      -- 'i32
+(type (abs [-1h 2h])) -- 'I16
+(type (abs [-1i 2i])) -- 'I32
+
+;; INT_MIN edge: |INT_MIN| doesn't fit in the same width — abs
+;; returns a typed null of the same width (k/q convention).  Stops
+;; the broken `(abs -32768h) → -32768h` (negative result from abs!)
+;; behaviour and avoids signed-overflow UB.
+
+;; (- (neg 32767h) 1h) = -32768h = INT16_MIN; (abs INT16_MIN) → 0Nh
+(nil? (abs (- (neg 32767h) 1h)))           -- true
+(type (abs (- (neg 32767h) 1h)))           -- 'i16
+
+(nil? (abs (- (neg 2147483647i) 1i)))      -- true
+(type (abs (- (neg 2147483647i) 1i)))      -- 'i32
+
+(nil? (abs (- (neg 9223372036854775807) 1))) -- true
+(type (abs (- (neg 9223372036854775807) 1))) -- 'i64
+
+;; values adjacent to INT_MIN that fit — abs works normally
+(abs -32767h)              -- 32767h
+(abs -2147483647i)         -- 2147483647i
+(abs -9223372036854775807) -- 9223372036854775807
+
+;; ──────────────────────────────────────────────────────────────────
+;; DAG (fused expression) path — `(select {x: (abs col) from: t})`
+;; over a column containing INT64_MIN must surface that row as typed
+;; null, not as a negative value (the broken "abs returns INT_MIN"
+;; case Anton flagged on PR #8).
+;;
+;; Vec literal `[...]` only accepts atom literals, so we build the
+;; INT64_MIN-bearing column via `concat` of a typed atom.
+;; ──────────────────────────────────────────────────────────────────
+
+(set Va (concat -9223372036854775808 (concat -5 (concat 5 0))))
+(set Ta (table [v] (list Va)))
+(set Ra (select {x: (abs v) from: Ta}))
+(nil? (at (at Ra 'x) 0)) -- true       ;; INT64_MIN row → null
+(at (at Ra 'x) 1)        -- 5
+(at (at Ra 'x) 2)        -- 5
+(at (at Ra 'x) 3)        -- 0
+
+;; vector eval-path (no fused DAG) — goes through ray_abs_fn per element.
+(nil? (at (abs Va) 0)) -- true
+(at (abs Va) 1)        -- 5
+(at (abs Va) 2)        -- 5

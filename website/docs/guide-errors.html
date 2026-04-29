@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Error Handling — Rayforce Documentation</title>
+  <meta name="description" content="Error handling patterns in Rayfall: try/raise, error recovery, null propagation, and defensive programming.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link active">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Error Handling</span>
+      </div>
+
+      <h1>Error Handling</h1>
+      <p class="page-subtitle">Catching errors with try/raise, understanding error types, null propagation, and writing defensive Rayfall code.</p>
+
+      <p>Rayfall provides structured error handling through <code>try</code> and <code>raise</code>, three distinct null representations for missing data, and consistent error propagation rules. This guide covers every pattern you need for robust Rayfall programs.</p>
+
+      <!-- 1. try/raise Basics -->
+      <h2 id="try-raise">1. try/raise Basics</h2>
+      <p>The <code>try</code> special form evaluates an expression and, if it produces an error, calls a handler function with the error value. The <code>raise</code> function creates an error explicitly.</p>
+
+      <h3>Basic Syntax</h3>
+      <pre><code>(<span class="hl-kw">try</span> <em>expr</em> <em>handler</em>)</code></pre>
+      <ul>
+        <li><strong>expr</strong> &mdash; the expression to evaluate</li>
+        <li><strong>handler</strong> &mdash; a function that receives the error value if <code>expr</code> fails</li>
+      </ul>
+      <p>Both arguments are passed unevaluated (<code>try</code> is a special form). The handler is only evaluated and called if <code>expr</code> produces an error.</p>
+
+      <h3>Catching Division by Zero</h3>
+      <pre><code>(<span class="hl-kw">try</span>
+  (<span class="hl-fn">/</span> <span class="hl-num">10</span> <span class="hl-num">0</span>)
+  (<span class="hl-kw">fn</span> [err] (<span class="hl-fn">println</span> <span class="hl-str">"caught:"</span> err)))
+<span class="hl-comment">; caught: 0</span></code></pre>
+      <p>When an error occurs without an explicit <code>raise</code>, the handler receives a default value of <code>0</code>.</p>
+
+      <h3>Raising Custom Errors</h3>
+      <pre><code>(<span class="hl-kw">try</span>
+  (<span class="hl-fn">raise</span> <span class="hl-str">"invalid input"</span>)
+  (<span class="hl-kw">fn</span> [err] (<span class="hl-fn">println</span> <span class="hl-str">"error:"</span> err)))
+<span class="hl-comment">; error: "invalid input"</span></code></pre>
+      <p>With <code>raise</code>, the handler receives the exact value you raised &mdash; a string, number, or any Rayfall object.</p>
+
+      <h3>Returning a Default Value</h3>
+      <pre><code>(<span class="hl-kw">try</span>
+  (<span class="hl-fn">/</span> <span class="hl-num">10</span> <span class="hl-num">0</span>)
+  (<span class="hl-kw">fn</span> [e] <span class="hl-num">-1</span>))
+<span class="hl-comment">; => -1</span></code></pre>
+      <p>The result of <code>try</code> is either the successful result of <code>expr</code> or the return value of the handler. This makes <code>try</code> an expression you can embed anywhere.</p>
+
+      <h3>Raising Structured Errors</h3>
+      <pre><code><span class="hl-comment">;; raise any value, not just strings</span>
+(<span class="hl-kw">try</span>
+  (<span class="hl-fn">raise</span> <span class="hl-num">42</span>)
+  (<span class="hl-kw">fn</span> [e] (<span class="hl-fn">+</span> e <span class="hl-num">8</span>)))
+<span class="hl-comment">; => 50</span></code></pre>
+      <p>You can raise any Rayfall value. The handler receives it directly, so you can raise numbers, vectors, or even tables if you want structured error information.</p>
+
+      <h3>When No Error Occurs</h3>
+      <pre><code>(<span class="hl-kw">try</span>
+  (<span class="hl-fn">+</span> <span class="hl-num">2</span> <span class="hl-num">3</span>)
+  (<span class="hl-kw">fn</span> [e] <span class="hl-num">0</span>))
+<span class="hl-comment">; => 5</span></code></pre>
+      <p>If the expression succeeds, the handler is never called and the result passes through unchanged.</p>
+
+      <!-- 2. Error Types -->
+      <h2 id="error-types">2. Error Types</h2>
+      <p>Rayfall produces several categories of runtime errors. Understanding these helps you write better handlers.</p>
+
+      <h3>Type Errors</h3>
+      <p>Occur when an operation receives the wrong argument type:</p>
+      <pre><code>(<span class="hl-fn">+</span> <span class="hl-num">1</span> <span class="hl-str">"hello"</span>)
+<span class="hl-comment">; error: type</span></code></pre>
+      <p>Arithmetic, comparison, and most builtins check argument types and produce type errors for mismatches.</p>
+
+      <h3>Arity Errors</h3>
+      <p>Occur when a function receives the wrong number of arguments:</p>
+      <pre><code>(<span class="hl-fn">+</span> <span class="hl-num">1</span>)
+<span class="hl-comment">; error: arity — + expects 2 arguments</span></code></pre>
+
+      <h3>Domain Errors</h3>
+      <p>Occur when arguments have valid types but invalid values:</p>
+      <pre><code>(<span class="hl-fn">/</span> <span class="hl-num">10</span> <span class="hl-num">0</span>)
+<span class="hl-comment">; error: domain — division by zero</span>
+
+(<span class="hl-fn">take</span> <span class="hl-num">100</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])
+<span class="hl-comment">; takes as many as available (no error for over-take)</span></code></pre>
+
+      <h3>User-Raised Errors</h3>
+      <p>Any error you create with <code>raise</code>:</p>
+      <pre><code>(<span class="hl-fn">raise</span> <span class="hl-str">"custom error message"</span>)
+<span class="hl-comment">; error: domain</span></code></pre>
+      <p>Internally, <code>raise</code> stores your value and triggers a domain error. The <code>try</code> handler receives the stored value.</p>
+
+      <h3>Access Errors (Restricted Mode)</h3>
+      <p>In restricted evaluation mode (used for IPC), certain functions are blocked:</p>
+      <pre><code><span class="hl-comment">; on a restricted server connection:</span>
+(<span class="hl-fn">.sys.exec</span> <span class="hl-str">"rm -rf /"</span>)
+<span class="hl-comment">; error: access — restricted</span></code></pre>
+
+      <h3>How Errors Display in the REPL</h3>
+      <p>Unhandled errors print with a category prefix:</p>
+      <pre><code>rf&gt; (<span class="hl-fn">/</span> <span class="hl-num">1</span> <span class="hl-num">0</span>)
+<span class="hl-comment">error: domain</span>
+
+rf&gt; (<span class="hl-fn">+</span> <span class="hl-num">1</span> <span class="hl-str">"x"</span>)
+<span class="hl-comment">error: type</span></code></pre>
+      <p>Errors are terminal &mdash; an unhandled error stops evaluation of the current expression and returns to the REPL prompt.</p>
+
+      <!-- 3. Null Propagation -->
+      <h2 id="null-propagation">3. Null Propagation</h2>
+      <p>Missing data is a first-class concept in Rayforce. There are three distinct null forms, each with different behavior.</p>
+
+      <h3>The Three Null Forms</h3>
+
+      <div class="info-box">
+        <strong>Quick reference:</strong>
+        <ul>
+          <li><strong>RAY_NULL_OBJ</strong> &mdash; the void return value (from <code>println</code>, <code>show</code>)</li>
+          <li><strong>Typed nulls</strong> &mdash; <code>0Ni</code> (int), <code>0Nf</code> (float), <code>0Nd</code> (date) &mdash; missing values in data</li>
+          <li><strong>Null bitmaps</strong> &mdash; per-element null flags on vectors</li>
+        </ul>
+      </div>
+
+      <h3>Typed Null Literals</h3>
+      <p>Typed nulls represent missing data within a specific type. They look like values but carry a null flag:</p>
+      <pre><code><span class="hl-comment">;; Typed null literals</span>
+0Ni   <span class="hl-comment">; null integer</span>
+0Nf   <span class="hl-comment">; null float</span>
+0Nd   <span class="hl-comment">; null date</span></code></pre>
+
+      <h3>Null Propagation Through Arithmetic</h3>
+      <p>Typed nulls propagate through arithmetic &mdash; any operation involving a typed null produces a typed null:</p>
+      <pre><code>(<span class="hl-fn">+</span> <span class="hl-num">1</span> 0Ni)
+<span class="hl-comment">; => 0Nl (promoted to i64 null because 1 is i64)</span>
+
+(<span class="hl-fn">*</span> <span class="hl-num">3.14</span> 0Nf)
+<span class="hl-comment">; => 0Nf</span>
+
+(<span class="hl-fn">+</span> 0Ni 0Ni)
+<span class="hl-comment">; => 0Ni</span></code></pre>
+      <p>This is the standard SQL/database behavior: null in, null out. It prevents silent corruption of calculations with missing data.</p>
+
+      <h3>RAY_NULL_OBJ (Void Return)</h3>
+      <p>Some operations like <code>println</code> and <code>show</code> return a void null. This is different from typed nulls &mdash; using it in arithmetic produces a type error, not propagation:</p>
+      <pre><code>(<span class="hl-kw">set</span> x (<span class="hl-fn">println</span> <span class="hl-str">"hello"</span>))
+<span class="hl-comment">; hello</span>
+(<span class="hl-fn">+</span> x <span class="hl-num">1</span>)
+<span class="hl-comment">; error: type</span></code></pre>
+
+      <h3>Nulls in Vectors</h3>
+      <p>Vectors track null elements via a compact bitmap. Null elements propagate through vectorized operations:</p>
+      <pre><code>(<span class="hl-kw">set</span> v [<span class="hl-num">1</span> 0Ni <span class="hl-num">3</span> <span class="hl-num">4</span> 0Ni])
+(<span class="hl-fn">+</span> v <span class="hl-num">10</span>)
+<span class="hl-comment">; => [11 0Ni 13 14 0Ni]</span></code></pre>
+
+      <h3>All Nulls Are Falsy</h3>
+      <p>Every null form &mdash; void null, typed nulls, and null vector elements &mdash; evaluates to false in conditional contexts:</p>
+      <pre><code>(<span class="hl-kw">if</span> 0Ni <span class="hl-str">"truthy"</span> <span class="hl-str">"falsy"</span>)
+<span class="hl-comment">; => "falsy"</span>
+
+(<span class="hl-kw">if</span> 0Nf <span class="hl-str">"truthy"</span> <span class="hl-str">"falsy"</span>)
+<span class="hl-comment">; => "falsy"</span></code></pre>
+
+      <h3>Testing for Null with nil?</h3>
+      <p>The <code>nil?</code> function detects all null forms:</p>
+      <pre><code>(<span class="hl-fn">nil?</span> 0Ni)
+<span class="hl-comment">; => 1</span>
+
+(<span class="hl-fn">nil?</span> <span class="hl-num">42</span>)
+<span class="hl-comment">; => 0</span>
+
+(<span class="hl-fn">nil?</span> (<span class="hl-fn">println</span> <span class="hl-str">"x"</span>))
+<span class="hl-comment">; x</span>
+<span class="hl-comment">; => 1</span></code></pre>
+      <p><code>nil?</code> is one of the few functions that safely handles the void null without producing a type error.</p>
+
+      <h3>Null Propagation in Arithmetic</h3>
+      <p>Arithmetic with typed nulls propagates the null through:</p>
+      <pre><code>(<span class="hl-fn">+</span> [<span class="hl-num">1</span> 0Ni <span class="hl-num">3</span>] [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span>])
+<span class="hl-comment">; => [11 0Ni 33]  — null element stays null</span>
+
+(<span class="hl-fn">sum</span> [<span class="hl-num">1</span> 0Ni <span class="hl-num">3</span>])
+<span class="hl-comment">; => 4  — aggregates skip nulls</span></code></pre>
+
+      <!-- 4. Defensive Patterns -->
+      <h2 id="defensive-patterns">4. Defensive Patterns</h2>
+      <p>Practical patterns for writing Rayfall code that handles edge cases gracefully.</p>
+
+      <h3>Check for Null Before Operating</h3>
+      <pre><code>(<span class="hl-kw">set</span> val 0Ni)  <span class="hl-comment">; could be a result from a lookup</span>
+(<span class="hl-kw">if</span> (<span class="hl-fn">nil?</span> val)
+  <span class="hl-num">0</span>
+  (<span class="hl-fn">*</span> val <span class="hl-num">2</span>))
+<span class="hl-comment">; returns 0 for null, otherwise doubles the value</span></code></pre>
+
+      <h3>Default Value Pattern</h3>
+      <pre><code><span class="hl-comment">;; define a "default" helper</span>
+(<span class="hl-kw">set</span> with-default (<span class="hl-kw">fn</span> [x d]
+  (<span class="hl-kw">if</span> (<span class="hl-fn">nil?</span> x) d x)))
+
+(with-default 0Ni <span class="hl-num">-1</span>)
+<span class="hl-comment">; => -1</span>
+
+(with-default <span class="hl-num">42</span> <span class="hl-num">-1</span>)
+<span class="hl-comment">; => 42</span></code></pre>
+
+      <h3>Safe Division</h3>
+      <pre><code>(<span class="hl-kw">set</span> safe-div (<span class="hl-kw">fn</span> [a b]
+  (<span class="hl-kw">if</span> (<span class="hl-fn">==</span> b <span class="hl-num">0</span>)
+    0Nf
+    (<span class="hl-fn">/</span> a b))))
+
+(safe-div <span class="hl-num">10</span> <span class="hl-num">3</span>)
+<span class="hl-comment">; => 3.333...</span>
+
+(safe-div <span class="hl-num">10</span> <span class="hl-num">0</span>)
+<span class="hl-comment">; => 0Nf</span></code></pre>
+
+      <h3>Guard with try for File I/O</h3>
+      <pre><code><span class="hl-comment">;; safely load a CSV, return empty table on failure</span>
+(<span class="hl-kw">set</span> data
+  (<span class="hl-kw">try</span>
+    (<span class="hl-fn">.csv.read</span> <span class="hl-str">"data.csv"</span>)
+    (<span class="hl-kw">fn</span> [e]
+      (<span class="hl-fn">println</span> <span class="hl-str">"failed to load:"</span> e)
+      (<span class="hl-fn">table</span> [<span class="hl-sym">x</span>] (<span class="hl-fn">list</span> [])))))
+<span class="hl-comment">; if file missing: prints error, returns empty table</span></code></pre>
+
+      <h3>Validate Table Columns Before Querying</h3>
+      <pre><code><span class="hl-comment">;; check that required columns exist</span>
+(<span class="hl-kw">set</span> validate-cols (<span class="hl-kw">fn</span> [tbl required]
+  (<span class="hl-kw">set</span> have (<span class="hl-fn">key</span> tbl))
+  (<span class="hl-fn">map</span> (<span class="hl-kw">fn</span> [c]
+    (<span class="hl-kw">if</span> (<span class="hl-fn">nil?</span> (<span class="hl-fn">find</span> have c))
+      (<span class="hl-fn">raise</span> (<span class="hl-fn">format</span> <span class="hl-str">"missing column: {}"</span> c))))
+    required)))
+
+<span class="hl-comment">;; use it before a query</span>
+(<span class="hl-kw">try</span>
+  (<span class="hl-kw">do</span>
+    (validate-cols trades [<span class="hl-sym">'sym</span> <span class="hl-sym">'price</span> <span class="hl-sym">'qty</span>])
+    (<span class="hl-fn">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">by:</span> {<span class="hl-sym">sym:</span> sym} <span class="hl-sym">cols:</span> {<span class="hl-sym">total:</span> (<span class="hl-fn">sum</span> qty)}}))
+  (<span class="hl-kw">fn</span> [e] (<span class="hl-fn">println</span> <span class="hl-str">"validation failed:"</span> e)))</code></pre>
+
+      <!-- 5. Error Recovery in Pipelines -->
+      <h2 id="pipeline-errors">5. Error Recovery in Pipelines</h2>
+      <p>When building data pipelines, errors in one stage should not always halt the entire computation.</p>
+
+      <h3>Errors in select/update</h3>
+      <p>If a computed column expression fails inside <code>select</code>, the entire select produces an error. Wrap the select in <code>try</code> to recover:</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">sym</span> <span class="hl-sym">price</span> <span class="hl-sym">qty</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span>]
+        [<span class="hl-num">150.5</span> <span class="hl-num">2800.0</span> <span class="hl-num">310.0</span>]
+        [<span class="hl-num">100</span> <span class="hl-num">50</span> <span class="hl-num">75</span>])))
+
+<span class="hl-comment">;; safe query wrapper</span>
+(<span class="hl-kw">set</span> safe-query (<span class="hl-kw">fn</span> [q]
+  (<span class="hl-kw">try</span> q
+    (<span class="hl-kw">fn</span> [e]
+      (<span class="hl-fn">println</span> <span class="hl-str">"query failed:"</span> e)
+      <span class="hl-num">0Ni</span>))))</code></pre>
+
+      <h3>Processing Rows with Error Tolerance</h3>
+      <pre><code><span class="hl-comment">;; process each row, collecting errors separately</span>
+(<span class="hl-kw">set</span> results
+  (<span class="hl-fn">map</span> (<span class="hl-kw">fn</span> [row]
+    (<span class="hl-kw">try</span>
+      (<span class="hl-fn">/</span> (<span class="hl-fn">get</span> row <span class="hl-sym">revenue</span>) (<span class="hl-fn">get</span> row <span class="hl-sym">shares</span>))
+      (<span class="hl-kw">fn</span> [e] 0Nf)))
+    rows))
+<span class="hl-comment">; failed rows get 0Nf, successful rows get the result</span></code></pre>
+
+      <h3>Chaining try for Multi-Step Pipelines</h3>
+      <pre><code><span class="hl-comment">;; load -> transform -> aggregate, with recovery at each step</span>
+(<span class="hl-kw">set</span> result
+  (<span class="hl-kw">try</span>
+    (<span class="hl-kw">do</span>
+      (<span class="hl-kw">set</span> raw (<span class="hl-fn">.csv.read</span> <span class="hl-str">"input.csv"</span>))
+      (<span class="hl-kw">set</span> clean (<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: raw <span class="hl-sym">where</span>: (<span class="hl-fn">></span> <span class="hl-sym">price</span> <span class="hl-num">0</span>)}))
+      (<span class="hl-fn">select</span> {<span class="hl-sym">from:</span> clean <span class="hl-sym">by:</span> {<span class="hl-sym">sym:</span> sym} <span class="hl-sym">cols:</span> {<span class="hl-sym">p:</span> (<span class="hl-fn">avg</span> price)}}))
+    (<span class="hl-kw">fn</span> [e]
+      (<span class="hl-fn">println</span> <span class="hl-str">"pipeline failed:"</span> e)
+      0Ni)))</code></pre>
+
+      <h3>Nested try for Granular Recovery</h3>
+      <pre><code><span class="hl-comment">;; inner try catches load failure, outer catches query failure</span>
+(<span class="hl-kw">try</span>
+  (<span class="hl-kw">do</span>
+    (<span class="hl-kw">set</span> data
+      (<span class="hl-kw">try</span>
+        (<span class="hl-fn">.csv.read</span> <span class="hl-str">"primary.csv"</span>)
+        (<span class="hl-kw">fn</span> [e]
+          (<span class="hl-fn">println</span> <span class="hl-str">"primary failed, trying backup"</span>)
+          (<span class="hl-fn">.csv.read</span> <span class="hl-str">"backup.csv"</span>))))
+    (<span class="hl-fn">select</span> {<span class="hl-sym">from:</span> data <span class="hl-sym">by:</span> {<span class="hl-sym">sym:</span> sym} <span class="hl-sym">cols:</span> {<span class="hl-sym">total:</span> (<span class="hl-fn">sum</span> qty)}}))
+  (<span class="hl-kw">fn</span> [e] (<span class="hl-fn">println</span> <span class="hl-str">"all attempts failed:"</span> e)))</code></pre>
+
+      <!-- 6. Summary Table -->
+      <h2 id="summary">6. Quick Reference</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Pattern</th>
+            <th>Syntax</th>
+            <th>Behavior</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Catch errors</td>
+            <td><code>(try expr handler)</code></td>
+            <td>Calls handler with error value on failure</td>
+          </tr>
+          <tr>
+            <td>Raise error</td>
+            <td><code>(raise value)</code></td>
+            <td>Triggers error, value passed to nearest try handler</td>
+          </tr>
+          <tr>
+            <td>Test for null</td>
+            <td><code>(nil? x)</code></td>
+            <td>Returns 1 for any null form, 0 otherwise</td>
+          </tr>
+          <tr>
+            <td>Typed null int</td>
+            <td><code>0Ni</code></td>
+            <td>Propagates through arithmetic</td>
+          </tr>
+          <tr>
+            <td>Typed null float</td>
+            <td><code>0Nf</code></td>
+            <td>Propagates through arithmetic</td>
+          </tr>
+          <tr>
+            <td>Typed null date</td>
+            <td><code>0Nd</code></td>
+            <td>Propagates through date operations</td>
+          </tr>
+          <tr>
+            <td>Null in if</td>
+            <td><code>(if 0Ni ...)</code></td>
+            <td>All nulls are falsy</td>
+          </tr>
+          <tr>
+            <td>Default value</td>
+            <td><code>(if (nil? x) d x)</code></td>
+            <td>Substitute default for missing data</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="next-steps">Next Steps</h2>
+      <ul>
+        <li><a href="control-flow.html"><strong>Control Flow</strong></a> &mdash; if/do/fn and other control structures</li>
+        <li><a href="data-types.html"><strong>Data Types</strong></a> &mdash; Full type reference including null representations</li>
+        <li><a href="guide-memory.html"><strong>Memory &amp; Monitoring</strong></a> &mdash; Understanding memory budgets and GC</li>
+        <li><a href="queries-select.html"><strong>Select Queries</strong></a> &mdash; Building queries with select/update</li>
+      </ul>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="guide-ipc.html" class="docs-nav-link prev"><span class="docs-nav-dir">&larr; Previous</span><span class="docs-nav-title">IPC Guide</span></a>
+        <a href="guide-memory.html" class="docs-nav-link next"><span class="docs-nav-dir">Next &rarr;</span><span class="docs-nav-title">Memory &amp; Monitoring</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

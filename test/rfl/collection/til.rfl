@@ -1,0 +1,22 @@
+;; Invariants for `til`.
+
+(til 0) -- []
+(til 1) -- [0]
+(til 5) -- [0 1 2 3 4]
+
+;; count
+(count (til 100)) -- 100
+
+;; strictly increasing: V[i+1] - V[i] == 1
+(set V (til 100))
+(set N (- (count V) 1))
+N -- (sum (== 1 (- (at V (+ 1 (til N))) (at V (til N)))))
+
+;; first/last
+(first (til 50)) -- 0
+(last (til 50)) -- 49
+
+;; ========== DOMAIN ERRORS ==========
+;; til of a negative count is rejected as a domain error
+(til -1)   !- domain
+(til -100) !- domain

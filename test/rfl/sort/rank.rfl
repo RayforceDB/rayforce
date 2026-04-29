@@ -1,0 +1,26 @@
+;; Invariants for `rank` — rank of each element in the sorted order.
+
+(rank [30 10 20]) -- [2 0 1]
+
+;; range is 0..n-1
+(set V (rand 100 10000))
+(asc (rank V)) -- (til (count V))
+
+;; concrete
+(rank [1 2 3 4 5]) -- [0 1 2 3 4]
+(rank [5 4 3 2 1]) -- [4 3 2 1 0]
+
+;; sum of ranks is n*(n-1)/2
+(set V [30 10 40 20])
+(sum (rank V)) -- 6
+
+;; rank of min is 0, max is n-1
+(at (rank V) 1) -- 0
+(at (rank V) 2) -- 3
+
+;; (at v (iasc v)) == (asc v)
+(set V (rand 100 10000))
+(at V (iasc V)) -- (asc V)
+
+;; floats
+(rank [3.14 1.41 2.71]) -- [2 0 1]

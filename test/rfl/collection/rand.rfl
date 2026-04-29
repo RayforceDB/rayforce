@@ -1,0 +1,16 @@
+;; Ported from test_lang_rf.inc::test_rf_rand.
+
+;; ========== BASIC RAND ==========
+(count (rand 10 100)) -- 10
+;; 10 random values in [0,100);
+(type (rand 5 100)) -- 'I64
+;; int random
+;; ========== VERIFY RANGE ==========
+(and (>= (min (rand 100 10)) 0) (< (max (rand 100 10)) 10)) -- true
+
+;; ========== ZERO COUNT IS EMPTY (NOT AN ERROR) ==========
+(rand 0 10) -- []
+
+;; ========== DOMAIN ERRORS ==========
+;; non-positive upper bound is rejected as a domain error
+(rand 5 0) !- domain

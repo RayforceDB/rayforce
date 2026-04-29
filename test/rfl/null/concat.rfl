@@ -1,0 +1,10 @@
+;; concat preserves null bitmaps.
+
+(sum (map nil? (concat [1 0N 3] [4 5 6]))) -- 1
+(sum (map nil? (concat [1 2 3] [0N 5 6]))) -- 1
+(sum (map nil? (concat [0N 0N] [1 2]))) -- 2
+
+;; First-half / second-half nulls land at correct positions
+(nil? (at (concat [1 0N 3] [4 0N 6]) 1)) -- true
+(nil? (at (concat [1 0N 3] [4 0N 6]) 4)) -- true
+(nil? (at (concat [1 0N 3] [4 0N 6]) 0)) -- false

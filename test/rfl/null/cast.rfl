@@ -1,0 +1,13 @@
+;; Cast preserves null bitmaps across width changes.
+
+(sum (map nil? (as 'F64 [1 0N 3]))) -- 1
+(sum (map nil? (as 'I32 [1 0N 3]))) -- 1
+(sum (map nil? (as 'I16 [1 0N 3]))) -- 1
+(sum (map nil? (as 'B8  [1 0N 3]))) -- 1
+
+;; Non-null values survive cast
+(at (as 'F64 [1 0N 3]) 0) -- 1.0
+(at (as 'F64 [1 0N 3]) 2) -- 3.0
+
+;; Roundtrip i64 → f64 → i64 preserves nulls
+(sum (map nil? (as 'I64 (as 'F64 [1 0N 3])))) -- 1

@@ -1,0 +1,6 @@
+;; Ported from test_lang_rf.inc::test_rf_do_let.
+
+;; ========== DO TESTS ==========
+(do (set x 1) (set y 2) (+ x y)) -- 3
+(do 1 2 3) -- 3
+;; returns last

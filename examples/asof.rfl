@@ -1,9 +1,0 @@
-;; (set quotes (table [Sym Ts Bid Ask] (list [AAPL AAPL AAPL MSFT] [09:59:55 10:00:03 10:00:07 10:00:02] [189.9 190 190.05 410.1] [190.1 190.2 190.25 410.3])))
-;; (set trades (table [Sym Ts Qty Price] (list [AAPL AAPL MSFT] [10:00:01 10:00:05 10:00:04] [100 250 200] [190.05 190.1 410.25])))
-
-;; (asof-join [Sym Ts] trades quotes)
-;; (window-join [Sym Ts] windows trades quotes {a:(avg Ask)})
-
-(set n 10000000)
-(set quotes (table [Sym Ts Bid Ask] (list (take (as 'SYMBOL (map-right as 'C8 (til 18000))) n) (as 'TIME (* 1000 (til n))) (as 'F64 (til n)) (as 'F64 (til n)))))
-(set trades (table [Sym Ts Qty Price] (list (take (as 'SYMBOL (map-right as 'C8 (til 8000))) n) (as 'TIME (+ 2 (* 1000 (til n)))) (til n) (as 'F64 (til n)))))

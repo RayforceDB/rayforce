@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pipeline &amp; Optimizer — Rayforce Documentation</title>
+  <meta name="description" content="Rayforce DAG pipeline architecture: lazy graph construction, multi-pass optimizer, morsel-driven fused execution, and parallel dispatch.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link active">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Pipeline &amp; Optimizer</span>
+      </div>
+
+      <h1>Pipeline &amp; Optimizer</h1>
+      <p class="page-subtitle">The three-phase execution model: lazy DAG construction, multi-pass optimization, and morsel-driven fused execution.</p>
+
+      <!-- ====== OVERVIEW ====== -->
+      <h2>Three-Phase Pipeline</h2>
+      <p>Every Rayforce query goes through three phases:</p>
+      <ol>
+        <li><strong>Build</strong> &mdash; Construct a lazy DAG of operations using the C API or Rayfall <code>select</code>/<code>update</code> builtins. No data is processed at this stage.</li>
+        <li><strong>Optimize</strong> &mdash; Transform the DAG through multiple optimization passes that rewrite, reorder, and fuse operations.</li>
+        <li><strong>Execute</strong> &mdash; Walk the optimized DAG and process data in 1024-element morsels using fused bytecode with computed-goto dispatch.</li>
+      </ol>
+
+      <pre><code><span class="hl-comment">/* Phase 1: Build the DAG (lazy, no data movement) */</span>
+<span class="hl-type">ray_graph_t</span>* g    = <span class="hl-fn">ray_graph_new</span>(table);
+<span class="hl-type">ray_op_t</span>*    x    = <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"x"</span>);
+<span class="hl-type">ray_op_t</span>*    y    = <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"y"</span>);
+<span class="hl-type">ray_op_t</span>*    sum  = <span class="hl-fn">ray_add</span>(g, x, y);
+<span class="hl-type">ray_op_t</span>*    pred = <span class="hl-fn">ray_gt</span>(g, sum, <span class="hl-fn">ray_const_i64</span>(g, <span class="hl-num">100</span>));
+<span class="hl-type">ray_op_t</span>*    filt = <span class="hl-fn">ray_filter</span>(g, sum, pred);
+
+<span class="hl-comment">/* Phase 2 + 3: Optimize and execute (called internally) */</span>
+<span class="hl-type">ray_t</span>* result = <span class="hl-fn">ray_execute</span>(g, filt);
+
+<span class="hl-fn">ray_graph_free</span>(g);</code></pre>
+
+      <!-- ====== DAG NODES ====== -->
+      <h2>DAG Node Structure</h2>
+
+      <h3>ray_op_t &mdash; Base Node (32 bytes)</h3>
+      <p>Every operation in the DAG is represented by a 32-byte <code>ray_op_t</code> that fits in a single cache line:</p>
+      <pre><code><span class="hl-kw">typedef struct</span> <span class="hl-type">ray_op</span> {
+    <span class="hl-type">uint16_t</span>       opcode;     <span class="hl-comment">/* OP_ADD, OP_SCAN, OP_FILTER, etc.  */</span>
+    <span class="hl-type">uint8_t</span>        arity;      <span class="hl-comment">/* 0, 1, or 2                        */</span>
+    <span class="hl-type">uint8_t</span>        flags;      <span class="hl-comment">/* OP_FLAG_FUSED, OP_FLAG_DEAD       */</span>
+    <span class="hl-type">int8_t</span>         out_type;   <span class="hl-comment">/* inferred output type               */</span>
+    <span class="hl-type">uint8_t</span>        pad[<span class="hl-num">3</span>];
+    <span class="hl-type">uint32_t</span>       id;         <span class="hl-comment">/* unique node ID                    */</span>
+    <span class="hl-type">uint32_t</span>       est_rows;   <span class="hl-comment">/* estimated row count                */</span>
+    <span class="hl-kw">struct</span> <span class="hl-type">ray_op</span>*  inputs[<span class="hl-num">2</span>];  <span class="hl-comment">/* NULL if unused                    */</span>
+} <span class="hl-type">ray_op_t</span>;</code></pre>
+
+      <p>Key design decisions:</p>
+      <ul>
+        <li><strong>32-byte alignment</strong> &mdash; nodes are allocated from a contiguous array in the <code>ray_graph_t</code>, keeping the DAG hot in L1 cache during optimization walks.</li>
+        <li><strong>At most 2 inputs</strong> &mdash; binary operations use both; unary ops use <code>inputs[0]</code> only; sources have both NULL.</li>
+        <li><strong>Flags</strong> &mdash; <code>OP_FLAG_FUSED</code> marks nodes absorbed by fusion; <code>OP_FLAG_DEAD</code> marks nodes removed by DCE.</li>
+        <li><strong>est_rows</strong> &mdash; populated by the type inference pass and used by filter reorder and join planning.</li>
+      </ul>
+
+      <h3>ray_op_ext_t &mdash; Extended Node</h3>
+      <p>Operations that need more state (GROUP, SORT, JOIN, WINDOW, PIVOT, and all graph ops) use an extended node that embeds <code>ray_op_t</code> as its first field, followed by a union of operation-specific data:</p>
+      <ul>
+        <li><strong>GROUP</strong>: key columns, aggregation ops and inputs, key/agg counts</li>
+        <li><strong>SORT</strong>: column array, descending flags, nulls-first flags</li>
+        <li><strong>JOIN</strong>: left/right key columns, join type (inner/left/full)</li>
+        <li><strong>WINDOW</strong>: partition keys, order keys, function kinds, frame specification</li>
+        <li><strong>PIVOT</strong>: index columns, pivot column, value column, aggregation op</li>
+        <li><strong>Graph ops</strong>: relationship pointer, SIP selection bitmap, direction, depth limits, damping factor, weight column, coordinate columns</li>
+        <li><strong>WCO</strong>: relationship array, variable count</li>
+        <li><strong>Vector similarity</strong>: query vector, dimension, k, ef_search (HNSW)</li>
+      </ul>
+
+      <h3>ray_graph_t &mdash; Operation Graph</h3>
+      <pre><code><span class="hl-kw">typedef struct</span> <span class="hl-type">ray_graph</span> {
+    <span class="hl-type">ray_op_t</span>*       nodes;       <span class="hl-comment">/* contiguous array of op nodes       */</span>
+    <span class="hl-type">uint32_t</span>       node_count;  <span class="hl-comment">/* number of nodes                   */</span>
+    <span class="hl-type">uint32_t</span>       node_cap;    <span class="hl-comment">/* allocated capacity                */</span>
+    <span class="hl-type">ray_t</span>*          table;       <span class="hl-comment">/* bound table (column source)       */</span>
+    <span class="hl-type">ray_t</span>**         tables;      <span class="hl-comment">/* multi-table registry               */</span>
+    <span class="hl-type">uint16_t</span>       n_tables;    <span class="hl-comment">/* number of registered tables        */</span>
+    <span class="hl-type">ray_op_ext_t</span>**  ext_nodes;   <span class="hl-comment">/* tracked extended nodes for cleanup */</span>
+    <span class="hl-type">uint32_t</span>       ext_count;
+    <span class="hl-type">uint32_t</span>       ext_cap;
+    <span class="hl-type">ray_t</span>*          selection;   <span class="hl-comment">/* RAY_SEL bitmap (lazy filter)       */</span>
+} <span class="hl-type">ray_graph_t</span>;</code></pre>
+
+      <!-- ====== OPTIMIZER ====== -->
+      <h2>Optimizer Passes</h2>
+      <p>The optimizer runs multiple passes in a fixed order. Each pass walks the DAG and rewrites it in-place.</p>
+
+      <h3>1. Type Inference</h3>
+      <p>Bottom-up pass that propagates types from leaf nodes (SCAN, CONST) through the DAG. Determines the <code>out_type</code> of every node and populates <code>est_rows</code> estimates. This information drives all subsequent passes.</p>
+
+      <h3>2. Constant Folding</h3>
+      <p>Evaluates operations on constant inputs at optimization time. For example, <code>ray_add(const(2), const(3))</code> is replaced with <code>const(5)</code>. Applies to all element-wise arithmetic, comparisons, and logical operations.</p>
+
+      <h3>3. Sideways Information Passing (SIP)</h3>
+      <p>Propagates selection bitmaps backward through <code>OP_EXPAND</code> chains. When a filter follows a graph expansion, SIP creates a <code>RAY_SEL</code> bitmap on the source side that allows the executor to skip source nodes whose neighbors would all fail the downstream filter. See <a href="graph-algorithms.html#sip">SIP Optimization</a> for details.</p>
+
+      <h3>4. Factorize</h3>
+      <p>Marks multi-hop graph expansions for factorized execution. Sets the <code>factorized</code> flag on EXPAND/VAR_EXPAND nodes, enabling output as <code>ray_fvec_t</code> / <code>ray_ftable_t</code> instead of flat vectors. Avoids cross-product materialization in multi-join graph patterns.</p>
+
+      <h3>5. Predicate Pushdown</h3>
+      <p>Pushes filter predicates as close to the data source as possible. A filter above a join is split into components that can be evaluated on individual join inputs, reducing the number of rows entering the join. Filters above scans are pushed directly onto the scan, eliminating rows before any computation.</p>
+
+      <h3>6. Filter Reorder</h3>
+      <p>When multiple filter predicates are chained, reorders them by estimated selectivity (most selective first). Uses the <code>est_rows</code> from type inference to estimate selectivity. More selective filters run first, reducing the number of rows processed by subsequent filters.</p>
+
+      <h3>7. Projection Pushdown</h3>
+      <p>Identifies which columns are actually needed by the query and pushes projection below joins and group-by operations. Columns that are never referenced after a certain point are dropped early, reducing memory bandwidth and intermediate result sizes.</p>
+
+      <h3>8. Partition Pruning</h3>
+      <p>For partitioned tables, analyzes filter predicates to determine which partitions can be skipped entirely. A predicate like <code>date &gt; '2024-01-01'</code> on a date-partitioned table eliminates all partition directories before that date without scanning them. The pruning pass produces a <code>seg_mask</code> bitmap that the executor uses during <a href="architecture-offloading.html">block offloading</a> to skip pruned segments entirely.</p>
+
+      <h3>9. Fusion</h3>
+      <p>The most impactful optimization. Merges chains of element-wise operations (arithmetic, comparisons, logical ops, string ops) into a single fused pass. A chain like <code>SCAN &rarr; ADD &rarr; MUL &rarr; GT &rarr; FILTER</code> becomes a single bytecode program that processes each morsel in one pass without materializing intermediate vectors.</p>
+
+      <div class="info-box">
+        <strong>Fusion boundaries.</strong> Pipeline breakers (GROUP, SORT, JOIN, WINDOW, graph ops) cannot be fused. They materialize their inputs and produce new vectors for the downstream fused chain.
+      </div>
+
+      <p>Fused nodes are marked with <code>OP_FLAG_FUSED</code>. The lead node (the last in the chain) consumes all fused predecessors and executes them as inlined bytecode.</p>
+
+      <h3>10. Dead Code Elimination (DCE)</h3>
+      <p>Removes nodes marked <code>OP_FLAG_DEAD</code> or <code>OP_FLAG_FUSED</code> (absorbed by fusion) that have no live consumers. Cleans up the DAG after all other passes.</p>
+
+      <!-- ====== EXECUTION ====== -->
+      <h2>Morsel-Driven Execution</h2>
+
+      <h3>Morsel Processing</h3>
+      <p>All vector processing in Rayforce is chunked into <strong>morsels</strong> of 1024 elements (<code>RAY_MORSEL_ELEMS</code>). This constant is tuned to fit in L1 cache across all supported architectures.</p>
+
+      <pre><code><span class="hl-kw">typedef struct</span> {
+    <span class="hl-type">ray_t</span>*    vec;          <span class="hl-comment">/* source vector                     */</span>
+    <span class="hl-type">int64_t</span>  offset;       <span class="hl-comment">/* current position (element index)  */</span>
+    <span class="hl-type">int64_t</span>  len;          <span class="hl-comment">/* total length of vector            */</span>
+    <span class="hl-type">uint32_t</span> elem_size;    <span class="hl-comment">/* bytes per element                 */</span>
+    <span class="hl-type">int64_t</span>  morsel_len;   <span class="hl-comment">/* elements in current morsel        */</span>
+    <span class="hl-type">void</span>*    morsel_ptr;   <span class="hl-comment">/* pointer to current morsel data    */</span>
+    <span class="hl-type">uint8_t</span>* null_bits;    <span class="hl-comment">/* current morsel null bitmap        */</span>
+} <span class="hl-type">ray_morsel_t</span>;</code></pre>
+
+      <p>The morsel iterator API:</p>
+      <pre><code><span class="hl-fn">ray_morsel_init</span>(&amp;m, vec);             <span class="hl-comment">/* initialize iterator       */</span>
+<span class="hl-kw">while</span> (<span class="hl-fn">ray_morsel_next</span>(&amp;m)) {         <span class="hl-comment">/* advance to next morsel    */</span>
+    <span class="hl-comment">/* process m.morsel_ptr[0..m.morsel_len) */</span>
+}</code></pre>
+
+      <h3>Computed-Goto Dispatch</h3>
+      <p>Fused operation chains compile to a bytecode program that the executor runs using computed-goto dispatch (GCC/Clang <code>__attribute__((computed_goto))</code>). Each opcode is a label in a jump table, eliminating branch prediction overhead from a traditional switch/case loop. The executor processes one morsel at a time through the entire fused chain before advancing.</p>
+
+      <h3>Register Slots</h3>
+      <p>During execution, intermediate morsel results are stored in register slots on the executor's pipeline (<code>ray_pipe_t</code>). Each fused node reads from and writes to specific register slots, avoiding heap allocation for intermediate results within a morsel.</p>
+
+      <pre><code><span class="hl-kw">typedef struct</span> <span class="hl-type">ray_pipe</span> {
+    <span class="hl-type">ray_op_t</span>*          op;            <span class="hl-comment">/* operation node                */</span>
+    <span class="hl-kw">struct</span> <span class="hl-type">ray_pipe</span>*   inputs[<span class="hl-num">2</span>];     <span class="hl-comment">/* upstream pipes                */</span>
+    <span class="hl-type">ray_morsel_t</span>       state;         <span class="hl-comment">/* current morsel state          */</span>
+    <span class="hl-type">ray_t</span>*             materialized;  <span class="hl-comment">/* materialized intermediate     */</span>
+    <span class="hl-type">int</span>               spill_fd;      <span class="hl-comment">/* spill file descriptor (-1)    */</span>
+} <span class="hl-type">ray_pipe_t</span>;</code></pre>
+
+      <!-- ====== SELECTION ====== -->
+      <h2>Selection Bitmaps</h2>
+      <p>Filters in Rayforce produce <code>RAY_SEL</code> bitmaps instead of materializing filtered vectors. A selection bitmap is a compact bit-vector with per-morsel metadata that enables three-tier processing:</p>
+
+      <table>
+        <thead><tr><th>Segment Flag</th><th>Meaning</th><th>Processing</th></tr></thead>
+        <tbody>
+          <tr><td><code>RAY_SEL_NONE (0)</code></td><td>All bits zero</td><td>Skip entire morsel &mdash; zero cost</td></tr>
+          <tr><td><code>RAY_SEL_ALL (1)</code></td><td>All bits one</td><td>Process without bitmap check</td></tr>
+          <tr><td><code>RAY_SEL_MIX (2)</code></td><td>Mixed bits</td><td>Check per-row bitmap</td></tr>
+        </tbody>
+      </table>
+
+      <p>The selection bitmap layout in memory:</p>
+      <pre><code><span class="hl-comment">/* RAY_SEL block layout (at ray_data offset 0): */</span>
+<span class="hl-type">ray_sel_meta_t</span>  meta;          <span class="hl-comment">/* total_pass, n_segs (16 bytes) */</span>
+<span class="hl-type">uint8_t</span>        seg_flags[];   <span class="hl-comment">/* NONE/ALL/MIX per morsel       */</span>
+<span class="hl-type">uint16_t</span>       seg_popcnt[];  <span class="hl-comment">/* passing row count per morsel   */</span>
+<span class="hl-type">uint64_t</span>       bits[];        <span class="hl-comment">/* 1024 rows / 64 bits = 16 words per morsel */</span></code></pre>
+
+      <p>This three-tier scheme means that fully-passing or fully-failing morsels (which are common in practice) incur no per-row overhead. Only the <code>MIX</code> segments require bitmap checking.</p>
+
+      <!-- ====== PARALLELISM ====== -->
+      <h2>Parallelism</h2>
+
+      <h3>Thread Pool</h3>
+      <p>Rayforce uses a global thread pool (<code>ray_pool_t</code>) for parallel execution. Queries with more than <code>RAY_PARALLEL_THRESHOLD</code> (64 * 1024 = 65,536) elements are dispatched across worker threads. Each thread processes <code>RAY_DISPATCH_MORSELS</code> (8) morsels at a time to amortize scheduling overhead.</p>
+
+      <h3>Radix-Partitioned Hash Join</h3>
+      <p>Hash joins use adaptive radix partitioning to ensure each partition's hash table fits in L2 cache. The number of radix bits adapts between <code>RAY_JOIN_MIN_RADIX</code> (2, producing 4 partitions) and <code>RAY_JOIN_MAX_RADIX</code> (14, producing 16K partitions) based on input size, targeting a per-partition working set of <code>RAY_JOIN_L2_TARGET</code> (256 KB).</p>
+
+      <p>The join pipeline:</p>
+      <ol>
+        <li><strong>Partition</strong> &mdash; Radix-partition both inputs by hash key bits</li>
+        <li><strong>Build</strong> &mdash; Build per-partition hash tables (each fits in L2)</li>
+        <li><strong>Probe</strong> &mdash; Probe partitions in parallel across worker threads</li>
+      </ol>
+
+      <h3>Per-Thread Heaps</h3>
+      <p>Each worker thread has its own heap (<code>heap_id</code> in the pool header). Vectors allocated during parallel execution are tagged with their owning heap via the pool they reside in. Cross-heap frees are deferred to a lock-free LIFO and reclaimed when the owning heap flushes. See <a href="architecture-memory.html">Memory Model</a> for details.</p>
+
+      <!-- ====== FULL EXAMPLE ====== -->
+      <h2>Full Pipeline Example</h2>
+      <p>A complete example showing all three phases for a filtered aggregation query:</p>
+      <pre><code><span class="hl-comment">/* Table: trades with columns price (F64), qty (I64), sym (SYM) */</span>
+<span class="hl-type">ray_graph_t</span>* g = <span class="hl-fn">ray_graph_new</span>(trades);
+
+<span class="hl-comment">/* Phase 1: Build DAG */</span>
+<span class="hl-type">ray_op_t</span>* price = <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"price"</span>);
+<span class="hl-type">ray_op_t</span>* qty   = <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"qty"</span>);
+<span class="hl-type">ray_op_t</span>* sym   = <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"sym"</span>);
+
+<span class="hl-comment">/* Compute notional = price * qty */</span>
+<span class="hl-type">ray_op_t</span>* notional = <span class="hl-fn">ray_mul</span>(g, price, qty);
+
+<span class="hl-comment">/* Filter: price > 50.0 */</span>
+<span class="hl-type">ray_op_t</span>* pred = <span class="hl-fn">ray_gt</span>(g, price, <span class="hl-fn">ray_const_f64</span>(g, <span class="hl-num">50.0</span>));
+<span class="hl-type">ray_op_t</span>* filt = <span class="hl-fn">ray_filter</span>(g, notional, pred);
+
+<span class="hl-comment">/* Group by sym, sum notional */</span>
+<span class="hl-type">ray_op_t</span>* keys[] = {sym};
+<span class="hl-type">uint16_t</span> agg_ops[] = {<span class="hl-num">OP_SUM</span>};
+<span class="hl-type">ray_op_t</span>* agg_ins[] = {filt};
+<span class="hl-type">ray_op_t</span>* grouped = <span class="hl-fn">ray_group</span>(g, keys, <span class="hl-num">1</span>, agg_ops, agg_ins, <span class="hl-num">1</span>);
+
+<span class="hl-comment">/* Phase 2+3: Optimize and execute */</span>
+<span class="hl-type">ray_t</span>* result = <span class="hl-fn">ray_execute</span>(g, grouped);
+
+<span class="hl-comment">/*
+ * What the optimizer does:
+ *  1. Type inference: price=F64, qty=I64, notional=F64, pred=BOOL
+ *  2. Constant folding: const 50.0 stays (already constant)
+ *  3. Predicate pushdown: filter moves below the multiply
+ *  4. Fusion: SCAN(price) -> GT(const) -> FILTER fused into one pass
+ *  5. DCE: removes any dead intermediate nodes
+ */</span>
+
+<span class="hl-fn">ray_graph_free</span>(g);</code></pre>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="guide-storage.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Data Persistence Guide</span></a>
+        <a href="architecture-memory.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Memory Model</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

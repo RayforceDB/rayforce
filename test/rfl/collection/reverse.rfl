@@ -1,0 +1,36 @@
+;; Invariants for `reverse` on i64 vectors.
+
+;; length-preservation
+(set V (rand 256 10000))
+(count V) -- (count (reverse V))
+
+;; involution
+(set V (rand 256 10000))
+(count V) -- (sum (== (reverse (reverse V)) V))
+
+;; first element of reverse is last of input — falsifies identity-reverse.
+(set V (- (rand 256 200000) 100000))
+(at (reverse V) 0) -- (at V (- (count V) 1))
+(at (reverse V) (- (count V) 1)) -- (at V 0)
+
+;; concrete: reverse([1 2 3 4 5]) == [5 4 3 2 1]
+(reverse [1 2 3 4 5]) -- [5 4 3 2 1]
+
+;; ────────────── per-type — exercises type switch in ray_reverse_fn ──────────────
+(reverse [1.0 2.0 3.0])      -- [3.0 2.0 1.0]
+(reverse [1h 2h 3h])         -- [3h 2h 1h]
+(reverse [1i 2i 3i])         -- [3i 2i 1i]
+(reverse [0x01 0x02 0x03])   -- [0x03 0x02 0x01]
+(reverse [true false true])  -- [true false true]
+(reverse ['a 'b 'c])         -- ['c 'b 'a]
+(reverse ["aa" "bb" "cc"])   -- ["cc" "bb" "aa"]
+(reverse [2024.01.01 2024.01.02 2024.01.03]) -- [2024.01.03 2024.01.02 2024.01.01]
+(reverse [12:30:45.000 11:00:00.000])        -- [11:00:00.000 12:30:45.000]
+
+;; null-bearing reverse preserves null mask
+(reverse [1 0N 3]) -- [3 0Nl 1]
+
+;; single element
+(reverse [42])    -- [42]
+(reverse ['x])    -- ['x]
+(reverse ["one"]) -- ["one"]

@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Graph Algorithms — Rayforce Documentation</title>
+  <meta name="description" content="Graph algorithm opcodes in Rayforce: traversal, shortest path, centrality, community detection, similarity, and worst-case optimal joins.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link active">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Graph Algorithms</span>
+      </div>
+
+      <h1>Graph Algorithms</h1>
+      <p class="page-subtitle">Graph opcodes covering traversal, shortest paths, centrality, community detection, similarity search, optimal joins, and spanning trees &mdash; all integrated into the DAG pipeline.</p>
+
+      <p>Graph algorithms are available through the C API. Many graph queries can also be expressed in Rayfall using the Datalog engine &mdash; see the <a href="tutorial-graph.html">Graph Queries Tutorial</a>.</p>
+
+      <div class="info-box">
+        <strong>All graph algorithms</strong> operate on <code>ray_rel_t</code> relationships built from CSR storage. See <a href="graph-storage.html">Graph Storage</a> for how to build and persist relationships.
+      </div>
+
+      <!-- ====== TRAVERSAL ====== -->
+      <h2 id="traversal">Traversal</h2>
+
+      <h3>OP_EXPAND &mdash; 1-Hop Neighbor Expansion</h3>
+      <p>Expands each input node to its direct neighbors in the CSR. The fundamental building block for all graph queries.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_EXPAND (80)</code></td></tr>
+          <tr><td>Complexity</td><td>O(d) per node, where d = average degree</td></tr>
+          <tr><td>Use case</td><td>Neighbor lookup, 1-hop reachability, join-like expansions</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-comment">/* C API */</span>
+<span class="hl-type">ray_op_t</span>* nbrs = <span class="hl-fn">ray_expand</span>(g, src_nodes, rel, <span class="hl-num">0</span>);  <span class="hl-comment">/* direction: 0=fwd */</span></code></pre>
+
+      <h4>Rayfall</h4>
+      <p>In Rayfall, 1-hop expansion is a Datalog query with a single pattern. Pin the source entity to query its direct neighbors:</p>
+      <pre><code><span class="hl-comment">; Build a graph</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">datoms</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">0</span> <span class="hl-sym">'edge</span> <span class="hl-num">1</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">0</span> <span class="hl-sym">'edge</span> <span class="hl-num">2</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'edge</span> <span class="hl-num">2</span>))
+
+<span class="hl-comment">; 1-hop neighbors of node 0</span>
+(<span class="hl-fn">query</span> db (<span class="hl-kw">find</span> ?target)
+  (<span class="hl-kw">where</span> (<span class="hl-num">0</span> <span class="hl-sym">:edge</span> ?target)))
+<span class="hl-comment">; => ?target: 1, 2</span></code></pre>
+
+      <h3>OP_VAR_EXPAND &mdash; Variable-Length BFS/DFS</h3>
+      <p>Expands nodes through multiple hops with configurable minimum and maximum depth. Uses BFS by default. Optionally tracks the full path for each discovered node.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_VAR_EXPAND (81)</code></td></tr>
+          <tr><td>Complexity</td><td>O(V + E) within the explored subgraph</td></tr>
+          <tr><td>Use case</td><td>Multi-hop reachability, friends-of-friends, transitive closure</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-comment">/* BFS from start_nodes, depth 1..3, tracking paths */</span>
+<span class="hl-type">ray_op_t</span>* reachable = <span class="hl-fn">ray_var_expand</span>(g, start_nodes, rel,
+    <span class="hl-num">0</span>,    <span class="hl-comment">/* direction: forward */</span>
+    <span class="hl-num">1</span>,    <span class="hl-comment">/* min_depth */</span>
+    <span class="hl-num">3</span>,    <span class="hl-comment">/* max_depth */</span>
+    <span class="hl-bool">true</span>  <span class="hl-comment">/* track_path */</span>
+);</code></pre>
+
+      <h4>Rayfall</h4>
+      <p>Recursive Datalog rules express variable-length reachability. The <code>path</code> rule computes transitive closure &mdash; equivalent to BFS over all reachable nodes:</p>
+      <pre><code><span class="hl-comment">; Base case: direct edge</span>
+(<span class="hl-kw">rule</span> (<span class="hl-fn">path</span> ?x ?y) (?x <span class="hl-sym">:edge</span> ?y))
+<span class="hl-comment">; Recursive case: follow chains</span>
+(<span class="hl-kw">rule</span> (<span class="hl-fn">path</span> ?x ?z) (?x <span class="hl-sym">:edge</span> ?y) (path ?y ?z))
+
+<span class="hl-comment">; All nodes reachable from node 0</span>
+(<span class="hl-fn">query</span> db (<span class="hl-kw">find</span> ?y) (<span class="hl-kw">where</span> (path <span class="hl-num">0</span> ?y)))
+<span class="hl-comment">; => all transitively reachable nodes</span></code></pre>
+
+      <h3>OP_DFS &mdash; Depth-First Search</h3>
+      <p>Explicit depth-first traversal from a source node, returning nodes in DFS visit order.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_DFS (94)</code></td></tr>
+          <tr><td>Complexity</td><td>O(V + E) within explored subgraph</td></tr>
+          <tr><td>Use case</td><td>Topological processing, cycle detection, graph exploration</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* dfs_order = <span class="hl-fn">ray_dfs</span>(g, src_node, rel, <span class="hl-num">10</span>); <span class="hl-comment">/* max depth 10 */</span></code></pre>
+
+      <h3>OP_RANDOM_WALK &mdash; Random Walk</h3>
+      <p>Performs random walks from source nodes, selecting a uniformly random neighbor at each step. Used for node2vec-style embeddings and sampling.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_RANDOM_WALK (98)</code></td></tr>
+          <tr><td>Complexity</td><td>O(L) per walk, where L = walk_length</td></tr>
+          <tr><td>Use case</td><td>Graph sampling, node2vec, DeepWalk embeddings</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* walk = <span class="hl-fn">ray_random_walk</span>(g, src_node, rel, <span class="hl-num">80</span>); <span class="hl-comment">/* 80-step walk */</span></code></pre>
+
+      <!-- ====== SHORTEST PATH ====== -->
+      <h2 id="shortest-path">Shortest Path</h2>
+
+      <h3>OP_SHORTEST_PATH &mdash; BFS Shortest Path</h3>
+      <p>Finds the shortest unweighted path between two nodes using bidirectional BFS.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_SHORTEST_PATH (82)</code></td></tr>
+          <tr><td>Complexity</td><td>O(V + E)</td></tr>
+          <tr><td>Use case</td><td>Hop distance, unweighted routing, social distance</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* path = <span class="hl-fn">ray_shortest_path</span>(g, src, dst, rel, <span class="hl-num">20</span>); <span class="hl-comment">/* max depth 20 */</span></code></pre>
+
+      <h4>Rayfall</h4>
+      <p>Datalog reachability rules find all paths between two nodes. Pin both source and destination to check connectivity:</p>
+      <pre><code><span class="hl-comment">; Reuse the path rule from above</span>
+(<span class="hl-kw">rule</span> (<span class="hl-fn">path</span> ?x ?y) (?x <span class="hl-sym">:edge</span> ?y))
+(<span class="hl-kw">rule</span> (<span class="hl-fn">path</span> ?x ?z) (?x <span class="hl-sym">:edge</span> ?y) (path ?y ?z))
+
+<span class="hl-comment">; Is node 4 reachable from node 0?</span>
+(<span class="hl-fn">query</span> db (<span class="hl-kw">find</span> ?y) (<span class="hl-kw">where</span> (path <span class="hl-num">0</span> ?y)))
+<span class="hl-comment">; => includes 4 if reachable</span></code></pre>
+      <div class="info-box">
+        <strong>Note:</strong> Datalog computes reachability (whether a path exists), not the actual shortest hop sequence. For weighted shortest paths or explicit path reconstruction, use the C API (<code>ray_shortest_path</code>, <code>ray_dijkstra</code>).
+      </div>
+
+      <h3>OP_DIJKSTRA &mdash; Weighted Shortest Path</h3>
+      <p>Dijkstra's algorithm for weighted shortest paths. Reads edge weights from a property column on the relationship.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_DIJKSTRA (86)</code></td></tr>
+          <tr><td>Complexity</td><td>O((V + E) log V) with binary heap</td></tr>
+          <tr><td>Use case</td><td>Weighted routing, cost-optimal paths, network flow</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* path = <span class="hl-fn">ray_dijkstra</span>(g, src, dst, rel,
+    <span class="hl-str">"weight"</span>,  <span class="hl-comment">/* edge weight column name */</span>
+    <span class="hl-num">255</span>        <span class="hl-comment">/* max depth */</span>
+);</code></pre>
+
+      <h3>OP_ASTAR &mdash; A* Shortest Path</h3>
+      <p>A* search with a coordinate-based heuristic (Haversine distance). Requires node property columns for latitude and longitude.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_ASTAR (95)</code></td></tr>
+          <tr><td>Complexity</td><td>O((V + E) log V), typically faster than Dijkstra with a good heuristic</td></tr>
+          <tr><td>Use case</td><td>Geospatial routing, map navigation, spatial networks</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* path = <span class="hl-fn">ray_astar</span>(g, src, dst, rel,
+    <span class="hl-str">"distance"</span>,   <span class="hl-comment">/* weight column */</span>
+    <span class="hl-str">"lat"</span>,         <span class="hl-comment">/* latitude column */</span>
+    <span class="hl-str">"lon"</span>,         <span class="hl-comment">/* longitude column */</span>
+    node_props,    <span class="hl-comment">/* node property table with lat/lon */</span>
+    <span class="hl-num">255</span>            <span class="hl-comment">/* max depth */</span>
+);</code></pre>
+
+      <h3>OP_K_SHORTEST &mdash; Yen's k-Shortest Paths</h3>
+      <p>Finds the k shortest paths between two nodes using Yen's algorithm. Each successive path is the shortest path that differs from all previously found paths.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_K_SHORTEST (96)</code></td></tr>
+          <tr><td>Complexity</td><td>O(kV(V + E) log V)</td></tr>
+          <tr><td>Use case</td><td>Route alternatives, network resilience, diverse path discovery</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* paths = <span class="hl-fn">ray_k_shortest</span>(g, src, dst, rel,
+    <span class="hl-str">"weight"</span>,  <span class="hl-comment">/* edge weight column */</span>
+    <span class="hl-num">5</span>          <span class="hl-comment">/* k = 5 shortest paths */</span>
+);</code></pre>
+
+      <!-- ====== CENTRALITY ====== -->
+      <h2 id="centrality">Centrality</h2>
+
+      <h3>OP_PAGERANK &mdash; PageRank</h3>
+      <p>Iterative PageRank computation. Converges after <code>max_iter</code> iterations or when residuals fall below an internal threshold.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_PAGERANK (84)</code></td></tr>
+          <tr><td>Complexity</td><td>O(I * (V + E)), where I = iterations</td></tr>
+          <tr><td>Use case</td><td>Node importance ranking, influence analysis, link analysis</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* pr = <span class="hl-fn">ray_pagerank</span>(g, rel,
+    <span class="hl-num">100</span>,   <span class="hl-comment">/* max iterations */</span>
+    <span class="hl-num">0.85</span>   <span class="hl-comment">/* damping factor */</span>
+);</code></pre>
+
+      <div class="info-box">
+        <strong>C API only.</strong> PageRank is an iterative numerical algorithm that operates directly on CSR arrays. It is not available as a Rayfall builtin. Use the <a href="#centrality">C API</a> shown above.
+      </div>
+
+      <h3>OP_DEGREE_CENT &mdash; Degree Centrality</h3>
+      <p>Computes degree centrality for all nodes (normalized degree count).</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_DEGREE_CENT (92)</code></td></tr>
+          <tr><td>Complexity</td><td>O(V)</td></tr>
+          <tr><td>Use case</td><td>Hub identification, connectivity analysis</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* dc = <span class="hl-fn">ray_degree_cent</span>(g, rel);</code></pre>
+
+      <h3>OP_BETWEENNESS &mdash; Betweenness Centrality (Brandes)</h3>
+      <p>Brandes' algorithm for betweenness centrality. Supports approximate computation via sampling to reduce cost on large graphs.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_BETWEENNESS (99)</code></td></tr>
+          <tr><td>Complexity</td><td>O(VE) exact, O(SE) sampled (S = sample_size)</td></tr>
+          <tr><td>Use case</td><td>Bridge detection, information flow bottlenecks</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* bc = <span class="hl-fn">ray_betweenness</span>(g, rel, <span class="hl-num">0</span>);   <span class="hl-comment">/* 0 = exact (all nodes) */</span>
+<span class="hl-type">ray_op_t</span>* bc_approx = <span class="hl-fn">ray_betweenness</span>(g, rel, <span class="hl-num">100</span>); <span class="hl-comment">/* sample 100 sources */</span></code></pre>
+
+      <h3>OP_CLOSENESS &mdash; Closeness Centrality</h3>
+      <p>Closeness centrality measures how close a node is to all other reachable nodes. Supports sampling for large graphs.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_CLOSENESS (100)</code></td></tr>
+          <tr><td>Complexity</td><td>O(VE) exact, O(SE) sampled</td></tr>
+          <tr><td>Use case</td><td>Network accessibility, facility placement</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* cc = <span class="hl-fn">ray_closeness</span>(g, rel, <span class="hl-num">0</span>); <span class="hl-comment">/* exact */</span></code></pre>
+
+      <!-- ====== COMMUNITY ====== -->
+      <h2 id="community">Community Detection</h2>
+
+      <h3>OP_LOUVAIN &mdash; Louvain Community Detection</h3>
+      <p>Modularity-based community detection using the Louvain method. Iteratively merges communities to maximize modularity.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_LOUVAIN (87)</code></td></tr>
+          <tr><td>Complexity</td><td>O(V + E) per iteration, typically converges in a few passes</td></tr>
+          <tr><td>Use case</td><td>Community discovery, social clusters, network partitioning</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* communities = <span class="hl-fn">ray_louvain</span>(g, rel, <span class="hl-num">50</span>); <span class="hl-comment">/* max 50 iterations */</span></code></pre>
+
+      <h3>OP_CONNECTED_COMP &mdash; Connected Components</h3>
+      <p>Finds connected components using label propagation. Each node receives a component ID.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_CONNECTED_COMP (85)</code></td></tr>
+          <tr><td>Complexity</td><td>O(V + E)</td></tr>
+          <tr><td>Use case</td><td>Graph partitioning, isolated subgraph detection, data lineage</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* comp = <span class="hl-fn">ray_connected_comp</span>(g, rel);</code></pre>
+
+      <h3>OP_CLUSTER_COEFF &mdash; Clustering Coefficients</h3>
+      <p>Computes the local clustering coefficient for each node: the fraction of its neighbors that are also connected to each other.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_CLUSTER_COEFF (97)</code></td></tr>
+          <tr><td>Complexity</td><td>O(V * d^2) where d = average degree</td></tr>
+          <tr><td>Use case</td><td>Network density, small-world analysis, triadic closure</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* cc = <span class="hl-fn">ray_cluster_coeff</span>(g, rel);</code></pre>
+
+      <!-- ====== OPTIMAL JOINS ====== -->
+      <h2 id="optimal-joins">Worst-Case Optimal Joins</h2>
+
+      <h3>OP_WCO_JOIN &mdash; Leapfrog TrieJoin</h3>
+      <p>Worst-case optimal join using Leapfrog TrieJoin (LFTJ). Finds triangles, k-cliques, and arbitrary pattern matches in the graph without materializing intermediate cross-products. Requires sorted adjacency lists in the CSR.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_WCO_JOIN (83)</code></td></tr>
+          <tr><td>Complexity</td><td>O(E^{3/2}) for triangle listing (worst-case optimal)</td></tr>
+          <tr><td>Use case</td><td>Triangle counting, k-clique enumeration, pattern matching, motif detection</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-comment">/* Find all triangles: nodes (a,b,c) where a->b, b->c, a->c */</span>
+<span class="hl-type">ray_rel_t</span>* rels[] = {rel, rel, rel};
+<span class="hl-type">ray_op_t</span>* triangles = <span class="hl-fn">ray_wco_join</span>(g,
+    rels,   <span class="hl-comment">/* 3 relationships (can be same or different) */</span>
+    <span class="hl-num">3</span>,      <span class="hl-comment">/* n_rels */</span>
+    <span class="hl-num">3</span>       <span class="hl-comment">/* n_vars (a, b, c) */</span>
+);</code></pre>
+
+      <div class="info-box">
+        <strong>Sorted CSR required.</strong> LFTJ relies on binary search within sorted adjacency lists. Always build relationships with <code>sort_targets = true</code> when using <code>OP_WCO_JOIN</code>.
+      </div>
+
+      <!-- ====== SPANNING ====== -->
+      <h2 id="spanning">Spanning Trees</h2>
+
+      <h3>OP_MST &mdash; Minimum Spanning Tree (Kruskal)</h3>
+      <p>Computes the minimum spanning forest using Kruskal's algorithm with union-find. Returns the MST edges as a table.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_MST (101)</code></td></tr>
+          <tr><td>Complexity</td><td>O(E log E)</td></tr>
+          <tr><td>Use case</td><td>Network backbone, minimal wiring, clustering via MST cuts</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* mst = <span class="hl-fn">ray_mst</span>(g, rel, <span class="hl-str">"weight"</span>);</code></pre>
+
+      <!-- ====== SIMILARITY ====== -->
+      <h2 id="similarity">Vector Similarity</h2>
+
+      <h3>OP_COSINE_SIM &mdash; Cosine Similarity</h3>
+      <p>Computes cosine similarity between a query vector and each row of an embedding column.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_COSINE_SIM (88)</code></td></tr>
+          <tr><td>Complexity</td><td>O(N * D) where N = rows, D = dimension</td></tr>
+          <tr><td>Use case</td><td>Semantic search, recommendation, duplicate detection</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">float</span> query[<span class="hl-num">128</span>] = { <span class="hl-comment">/* ... */</span> };
+<span class="hl-type">ray_op_t</span>* sim = <span class="hl-fn">ray_cosine_sim</span>(g, emb_col, query, <span class="hl-num">128</span>);</code></pre>
+
+      <h3>OP_EUCLIDEAN_DIST &mdash; Euclidean Distance</h3>
+      <p>Computes Euclidean (L2) distance between a query vector and each row of an embedding column.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_EUCLIDEAN_DIST (89)</code></td></tr>
+          <tr><td>Complexity</td><td>O(N * D)</td></tr>
+          <tr><td>Use case</td><td>Spatial queries, clustering, anomaly detection</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* dist = <span class="hl-fn">ray_euclidean_dist</span>(g, emb_col, query, <span class="hl-num">128</span>);</code></pre>
+
+      <h3>OP_KNN &mdash; Brute-Force K Nearest Neighbors</h3>
+      <p>Finds the K nearest neighbors by exhaustive comparison. Returns the top-K rows sorted by distance.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_KNN (90)</code></td></tr>
+          <tr><td>Complexity</td><td>O(N * D + N log K)</td></tr>
+          <tr><td>Use case</td><td>Exact nearest neighbor search on small to medium datasets</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* neighbors = <span class="hl-fn">ray_knn</span>(g, emb_col, query, <span class="hl-num">128</span>, <span class="hl-num">10</span>); <span class="hl-comment">/* top-10 */</span></code></pre>
+
+      <h3>OP_HNSW_KNN &mdash; HNSW Approximate KNN</h3>
+      <p>Approximate K nearest neighbors using a pre-built HNSW (Hierarchical Navigable Small World) index. Orders of magnitude faster than brute-force for large datasets.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_HNSW_KNN (91)</code></td></tr>
+          <tr><td>Complexity</td><td>O(D * log N) approximate</td></tr>
+          <tr><td>Use case</td><td>Large-scale semantic search, real-time recommendation, RAG retrieval</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* neighbors = <span class="hl-fn">ray_hnsw_knn</span>(g, hnsw_idx,
+    query, <span class="hl-num">128</span>,   <span class="hl-comment">/* query vector + dimension */</span>
+    <span class="hl-num">10</span>,            <span class="hl-comment">/* k */</span>
+    <span class="hl-num">200</span>            <span class="hl-comment">/* ef_search (beam width, higher = more accurate) */</span>
+);</code></pre>
+
+      <div class="info-box">
+        <strong>C API only.</strong> HNSW index construction and approximate KNN search operate on raw float arrays and are not available as Rayfall builtins. Use the <a href="#similarity">C API</a> shown above for vector similarity workloads.
+      </div>
+
+      <!-- ====== ORDERING ====== -->
+      <h2 id="ordering">Ordering</h2>
+
+      <h3>OP_TOPSORT &mdash; Topological Sort (Kahn's)</h3>
+      <p>Produces a topological ordering of a directed acyclic graph using Kahn's algorithm. Returns an error if cycles are detected.</p>
+      <table>
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Opcode</td><td><code>OP_TOPSORT (93)</code></td></tr>
+          <tr><td>Complexity</td><td>O(V + E)</td></tr>
+          <tr><td>Use case</td><td>Task scheduling, dependency resolution, build systems</td></tr>
+        </tbody>
+      </table>
+      <pre><code><span class="hl-type">ray_op_t</span>* order = <span class="hl-fn">ray_topsort</span>(g, rel);</code></pre>
+
+      <!-- ====== SIP ====== -->
+      <h2 id="sip">SIP Optimization</h2>
+      <p><strong>Sideways Information Passing (SIP)</strong> is an optimizer pass that propagates selection bitmaps (<code>RAY_SEL</code>) backward through <code>OP_EXPAND</code> chains. When a filter is applied after a graph expansion, SIP pushes the filter condition back to the source side of the expansion, allowing the executor to skip entire source nodes whose neighbors would all be filtered out.</p>
+
+      <p>This optimization is automatic. The optimizer detects EXPAND chains and propagates <code>sip_sel</code> bitmaps into the graph operation's extended node. During execution, the EXPAND opcode checks each source node against the SIP bitmap and skips it entirely if no neighbors can pass the downstream filter.</p>
+
+      <pre><code><span class="hl-comment">/* Without SIP: expand all 1M source nodes, then filter */</span>
+<span class="hl-comment">/* With SIP: skip source nodes that can't produce passing results */</span>
+
+<span class="hl-type">ray_op_t</span>* nbrs   = <span class="hl-fn">ray_expand</span>(g, src_nodes, rel, <span class="hl-num">0</span>);
+<span class="hl-type">ray_op_t</span>* pred   = <span class="hl-fn">ray_lt</span>(g, nbrs, <span class="hl-fn">ray_const_i64</span>(g, <span class="hl-num">1000</span>));
+<span class="hl-type">ray_op_t</span>* result = <span class="hl-fn">ray_filter</span>(g, nbrs, pred);
+<span class="hl-comment">/* Optimizer automatically injects SIP bitmap on the EXPAND node */</span></code></pre>
+
+      <!-- ====== FACTORIZED ====== -->
+      <h2 id="factorized">Factorized Execution</h2>
+      <p>Multi-hop graph expansions can produce enormous intermediate results (the cross-product of all paths). Rayforce avoids materializing these cross-products using <strong>factorized vectors</strong> (<code>ray_fvec_t</code>) and <strong>factorized tables</strong> (<code>ray_ftable_t</code>).</p>
+
+      <pre><code><span class="hl-comment">/* Factorized vector: represents a column without materializing all rows */</span>
+<span class="hl-kw">typedef struct</span> <span class="hl-type">ray_fvec</span> {
+    <span class="hl-type">ray_t</span>*    vec;            <span class="hl-comment">/* underlying ray_t vector           */</span>
+    <span class="hl-type">int64_t</span>  cur_idx;        <span class="hl-comment">/* >= 0: single value at index       */</span>
+                             <span class="hl-comment">/* -1: full vector active            */</span>
+    <span class="hl-type">int64_t</span>  cardinality;    <span class="hl-comment">/* how many rows this represents     */</span>
+} <span class="hl-type">ray_fvec_t</span>;
+
+<span class="hl-comment">/* Factorized table: accumulation buffer for WCO joins */</span>
+<span class="hl-kw">typedef struct</span> <span class="hl-type">ray_ftable</span> {
+    <span class="hl-type">ray_fvec_t</span>*  columns;     <span class="hl-comment">/* array of factorized vectors       */</span>
+    <span class="hl-type">uint16_t</span>    n_cols;
+    <span class="hl-type">int64_t</span>     n_tuples;    <span class="hl-comment">/* factorized tuple count            */</span>
+    <span class="hl-type">ray_t</span>*       semijoin;    <span class="hl-comment">/* RAY_SEL bitmap of qualifying keys */</span>
+} <span class="hl-type">ray_ftable_t</span>;</code></pre>
+
+      <p>When <code>factorized = 1</code> is set on a graph op's extended node, the executor emits factorized output instead of flat vectors. The factorized representation keeps each expansion level as a separate vector with a cardinality multiplier, deferring materialization until the final result is needed (via <code>ray_ftable_materialize</code>).</p>
+
+      <h2>Algorithm Summary</h2>
+      <table>
+        <thead>
+          <tr><th>Category</th><th>Opcode</th><th>Algorithm</th><th>Complexity</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Traversal</td><td><code>OP_EXPAND</code></td><td>1-hop CSR lookup</td><td>O(d)</td></tr>
+          <tr><td>Traversal</td><td><code>OP_VAR_EXPAND</code></td><td>BFS/DFS variable-length</td><td>O(V+E)</td></tr>
+          <tr><td>Traversal</td><td><code>OP_DFS</code></td><td>Depth-first search</td><td>O(V+E)</td></tr>
+          <tr><td>Traversal</td><td><code>OP_RANDOM_WALK</code></td><td>Random walk</td><td>O(L)</td></tr>
+          <tr><td>Shortest path</td><td><code>OP_SHORTEST_PATH</code></td><td>BFS</td><td>O(V+E)</td></tr>
+          <tr><td>Shortest path</td><td><code>OP_DIJKSTRA</code></td><td>Dijkstra (binary heap)</td><td>O((V+E) log V)</td></tr>
+          <tr><td>Shortest path</td><td><code>OP_ASTAR</code></td><td>A* with Haversine</td><td>O((V+E) log V)</td></tr>
+          <tr><td>Shortest path</td><td><code>OP_K_SHORTEST</code></td><td>Yen's algorithm</td><td>O(kV(V+E) log V)</td></tr>
+          <tr><td>Centrality</td><td><code>OP_PAGERANK</code></td><td>Iterative PageRank</td><td>O(I(V+E))</td></tr>
+          <tr><td>Centrality</td><td><code>OP_DEGREE_CENT</code></td><td>Degree centrality</td><td>O(V)</td></tr>
+          <tr><td>Centrality</td><td><code>OP_BETWEENNESS</code></td><td>Brandes</td><td>O(VE)</td></tr>
+          <tr><td>Centrality</td><td><code>OP_CLOSENESS</code></td><td>Closeness centrality</td><td>O(VE)</td></tr>
+          <tr><td>Community</td><td><code>OP_LOUVAIN</code></td><td>Louvain modularity</td><td>O(V+E)</td></tr>
+          <tr><td>Community</td><td><code>OP_CONNECTED_COMP</code></td><td>Label propagation</td><td>O(V+E)</td></tr>
+          <tr><td>Community</td><td><code>OP_CLUSTER_COEFF</code></td><td>Local clustering</td><td>O(V*d^2)</td></tr>
+          <tr><td>Optimal join</td><td><code>OP_WCO_JOIN</code></td><td>Leapfrog TrieJoin</td><td>O(E^{3/2})</td></tr>
+          <tr><td>Spanning</td><td><code>OP_MST</code></td><td>Kruskal</td><td>O(E log E)</td></tr>
+          <tr><td>Similarity</td><td><code>OP_COSINE_SIM</code></td><td>Cosine similarity</td><td>O(ND)</td></tr>
+          <tr><td>Similarity</td><td><code>OP_EUCLIDEAN_DIST</code></td><td>L2 distance</td><td>O(ND)</td></tr>
+          <tr><td>Similarity</td><td><code>OP_KNN</code></td><td>Brute-force KNN</td><td>O(ND + N log K)</td></tr>
+          <tr><td>Similarity</td><td><code>OP_HNSW_KNN</code></td><td>HNSW approximate KNN</td><td>O(D log N)</td></tr>
+          <tr><td>Ordering</td><td><code>OP_TOPSORT</code></td><td>Kahn's topological sort</td><td>O(V+E)</td></tr>
+        </tbody>
+      </table>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="graph-storage.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Graph Storage</span></a>
+        <a href="guide-analytics.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Analytics Cookbook</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

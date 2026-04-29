@@ -1,0 +1,7 @@
+;; Invariants for `value` — dict values.
+
+(value (dict [a b c] [1 2 3])) -- [1 2 3]
+
+;; count of values == count of dict
+(set D (dict [x y z] [100 200 300]))
+(count (value D)) -- (count D)

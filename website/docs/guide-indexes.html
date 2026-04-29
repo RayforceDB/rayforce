@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Indexes Guide &mdash; Rayforce Documentation</title>
+  <meta name="description" content="When to build an index, how to choose between zone / hash / sort / bloom / HNSW / linked columns / partition pruning, worked workflows, and lifecycle gotchas.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">VECTOR SEARCH</div>
+        <a href="vector-search.html" class="sidebar-link">Vector Search &amp; HNSW</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATALOG</div>
+        <a href="datalog.html" class="sidebar-link">Datalog</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">IPC</div>
+        <a href="ipc.html" class="sidebar-link">IPC Protocol</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link active">Indexes Guide</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Indexes Guide</span>
+      </div>
+
+      <h1>Indexes Guide</h1>
+      <p class="page-subtitle">When to build an index, how to choose between the kinds, end-to-end workflows, and the lifecycle traps that bite first-time users.</p>
+
+      <p>This guide is the procedural companion to <a href="indexes-overview.html">Indexes Overview</a> (the map of what exists) and <a href="queries-indexes.html">Accelerator Indexes</a> (the per-function reference). Read those first if you haven't; this page assumes you know <em>what</em> the kinds are and focuses on <em>when</em> and <em>how</em>.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="when">1. When to bother building an index</h2>
+      <p>Rayforce's hot path already scans columnar data fast: each operator processes 1024-element morsels, and full-column work is cache-friendly and SIMD-amenable out of the box. An index pays off only when the build cost is amortized across many queries that exploit it.</p>
+      <p>Three rules of thumb to start with. Note: <code>.idx.*</code> indexes are <em>built</em> today, but the executor does not yet consult them &mdash; observable per-query speedups arrive once the optimizer routing pass lands. Until then, the rules below describe when an index will <em>structurally</em> help, not what's faster right now. <a href="indexes-overview.html#status">Status of each index kind</a>.</p>
+      <ul>
+        <li><strong>One-shot scans:</strong> don't build an index. The build is itself a full pass; you'd pay it twice for a single query, with no payoff today and no payoff after routing lands either.</li>
+        <li><strong>Repeated point lookups against the same column:</strong> a hash index is what the routing pass will consult to take <code>=</code> / <code>in</code> / <code>find</code> from O(n) to O(1) average. Build it now if you're staging for that &mdash; just don't expect the speedup until routing lands.</li>
+        <li><strong>Range or sorted-output queries against a stable column:</strong> a sort index gives the routing pass an O(log n) binary-search path instead of a full filter. Same caveat &mdash; structural fit, not yet observable.</li>
+      </ul>
+      <!-- TODO(user-contribution): replace these three rules of thumb with
+           the ones you actually use. A grounded heuristic from your own
+           workloads ("I build a hash index when the same column gets
+           hit > N times in a session", or "I rebuild after CSV reload but
+           never inside a streaming loop") is far more useful here than
+           generic phrasings. -->
+
+      <p>A useful lower bound: if you are not planning to run at least a handful of queries against the indexed column before mutating it, the index loses on round-trip cost.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="choose">2. Choosing an accelerator kind</h2>
+      <p>The four <code>.idx.*</code> kinds occupy the same per-column slot today &mdash; you pick one. <strong>Important framing:</strong> the four subsections below describe the query shape each kind is <em>structurally suited</em> to accelerate. None of them is consulted by query operators today &mdash; <code>filter</code> / <code>in</code> / <code>find</code> / <code>distinct</code> still scan linearly, and the SIP pass does not consume bloom. Treat the &ldquo;suited for&rdquo; phrasings as a guide to which kind to build now in preparation for the routing pass; the observable speedup arrives with that pass, not with the build.</p>
+
+      <h3>Equality probes &mdash; <code>.idx.hash</code></h3>
+      <p>Structurally suited to &ldquo;does this value exist in the column&rdquo; / &ldquo;which row(s) hold this value&rdquo; queries. Build cost O(n); space O(n). Handles duplicates via chained open-addressing &mdash; equally happy on a unique-key column or one with heavy repetition. Today: built and inspectable; not yet consulted by any query.</p>
+
+      <h3>Range queries / sorted access &mdash; <code>.idx.sort</code></h3>
+      <p>Structurally suited to &ldquo;values between A and B&rdquo;, &ldquo;top-N&rdquo;, and ordered-output queries. Build cost O(n log n); space O(n) for the row-id permutation. The original column stays in original order &mdash; the sort lives in the permutation, not the values. Today: built and inspectable; not yet consulted by any query.</p>
+
+      <h3>Whole-column / segment pruning &mdash; <code>.idx.zone</code></h3>
+      <p>Structurally suited to filter predicates that may fall outside the column's value range. Cheap to build, cheap to keep &mdash; effectively three numbers (min, max, null count) per column. Conceptually a column-level analogue of the optimizer's separate <a href="architecture-pipeline.html">partition-pruning pass</a>; the two are not yet integrated. Today: built and inspectable; not yet consulted by any query.</p>
+
+      <h3>Membership rejection &mdash; <code>.idx.bloom</code></h3>
+      <p>Structurally suited to cheap &ldquo;definitely not in this set&rdquo; rejection, accepting some false positives that fall back to the real check. The 64-bit default is sized for small-to-mid columns; build cost O(n &middot; k) with k = 3 hashes. Once consumed by the SIP pass, it would serve as a sideways-information-passing bitmap into a join's probe side &mdash; that integration is not yet wired. Today: built and inspectable; not yet consulted by any query.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="workflow-analytics">3. Workflow: hot column, repeated lookups</h2>
+      <p>The most common use of <code>.idx.hash</code>. You have a column that gets queried many times during a session, the values are stable for that session, and each probe today is a linear scan.</p>
+
+      <pre><code><span class="hl-comment">; Build column.</span>
+(<span class="hl-kw">set</span> v (* <span class="hl-num">7</span> (<span class="hl-fn">til</span> <span class="hl-num">1000</span>)))   <span class="hl-comment">; 0, 7, 14, ..., 6993</span>
+
+<span class="hl-comment">; Attach the hash index once.  This builds the structure but does not</span>
+<span class="hl-comment">; yet change query latency — (in) still scans linearly today.  The</span>
+<span class="hl-comment">; build is preparation for the upcoming optimizer routing pass.</span>
+(<span class="hl-kw">set</span> v (<span class="hl-fn">.idx.hash</span> v))
+(<span class="hl-fn">.idx.has?</span> v)                  <span class="hl-comment">; ⇒ true</span>
+(<span class="hl-fn">.idx.info</span> v)                  <span class="hl-comment">; ⇒ {kind:hash length:1000 ...}  (inspect the structure)</span>
+
+<span class="hl-comment">; Membership probes return the right answer either way.</span>
+(<span class="hl-fn">in</span> <span class="hl-num">700</span>  v)                    <span class="hl-comment">; ⇒ true   (700 = 7 × 100)</span>
+(<span class="hl-fn">in</span> <span class="hl-num">701</span>  v)                    <span class="hl-comment">; ⇒ false  (not a multiple of 7)</span>
+
+<span class="hl-comment">; Explicit drop — only needed if you want to release the structure early.</span>
+<span class="hl-comment">; If you're about to mutate, you can skip this: the in-place mutators</span>
+<span class="hl-comment">; (insert 'v ...) / (alter 'v ...) drop the index automatically.</span>
+(<span class="hl-kw">set</span> v (<span class="hl-fn">.idx.drop</span> v))
+(<span class="hl-fn">.idx.has?</span> v)                  <span class="hl-comment">; ⇒ false</span></code></pre>
+
+      <p><code>.idx.drop</code> is for <em>explicit release of the structure</em> &mdash; you call it when you want the per-index memory back before the column itself goes out of scope. You do <strong>not</strong> need to call it before a mutation (the in-place mutators <code>(insert 'v val)</code>, <code>(alter 'v set i val)</code>, and <code>(alter 'v concat vals)</code> all drop any attached index transparently as part of the write path) and you do <strong>not</strong> need it to switch to a different kind: calling another <code>.idx.*</code> attach on a column that already has one drops the existing kind first as part of the attach.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="workflow-ann">4. Workflow: ANN over embeddings</h2>
+      <p>HNSW is the only kind today that is both built and consulted at query time. For cosine-similarity nearest-neighbor over a list of float vectors:</p>
+
+      <pre><code><span class="hl-comment">; A list of three 4-dimensional embeddings.</span>
+(<span class="hl-kw">set</span> vecs (<span class="hl-fn">list</span>
+  [<span class="hl-num">0.1</span> <span class="hl-num">0.2</span> <span class="hl-num">0.3</span> <span class="hl-num">0.4</span>]
+  [<span class="hl-num">0.9</span> <span class="hl-num">0.8</span> <span class="hl-num">0.7</span> <span class="hl-num">0.6</span>]
+  [<span class="hl-num">0.5</span> <span class="hl-num">0.5</span> <span class="hl-num">0.5</span> <span class="hl-num">0.5</span>]))
+
+<span class="hl-comment">; Build the index.  metric ∈ {cosine, l2, ip}.</span>
+(<span class="hl-kw">set</span> h (<span class="hl-fn">hnsw-build</span> vecs <span class="hl-sym">'cosine</span> <span class="hl-num">16</span> <span class="hl-num">200</span>))
+
+<span class="hl-comment">; Query: top-2 nearest neighbors of [0.1 0.2 0.3 0.4].</span>
+(<span class="hl-fn">ann</span> h [<span class="hl-num">0.1</span> <span class="hl-num">0.2</span> <span class="hl-num">0.3</span> <span class="hl-num">0.4</span>] <span class="hl-num">2</span> <span class="hl-num">50</span>)
+<span class="hl-comment">; ⇒ table { _rowid: I64, _dist: F64 } sorted ascending by _dist</span>
+
+<span class="hl-comment">; Optional: release early if you want the memory back before scope exit.</span>
+<span class="hl-comment">; Otherwise, the handle auto-frees when refcounting drops it.</span>
+(<span class="hl-fn">hnsw-free</span> h)</code></pre>
+
+      <p>For one-off queries, brute-force <code>(knn vecs query k)</code> needs no index and is fine on small vector sets. Switch to HNSW once you have many queries against the same vector set.</p>
+
+      <p>See <a href="vector-search.html">Vector Search &amp; HNSW</a> for the full reference, including persistence (<code>hnsw-save</code> / <code>hnsw-load</code>) and metric trade-offs.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="workflow-link">5. Workflow: cross-table reference via linked columns</h2>
+      <p>A <em>linked column</em> stores row-id references into another table; dereferencing follows the link and pulls the target row at query time. Useful when you have a large fact column whose values are dictionary-style references into a smaller dimension table.</p>
+      <p>The full surface and worked examples live on the <a href="queries-links.html">Linked Columns</a> page. From an indexing perspective, the link <em>is</em> the cross-table index: there is no separate structure to build, query, or invalidate. With parted facts, the link points at a non-parted dim &mdash; per-segment <code>HAS_LINK</code> is preserved through <code>ray_read_parted</code> and segment streaming, so deref works inside streamed queries without extra plumbing. Parted-target dims are rejected at attach time; see <a href="queries-links.html#parted">Linked Columns: Parted-Table Interaction</a>.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="workflow-parted">6. Workflow: partition pruning on parted tables</h2>
+      <p>For very large datasets, partition by the discriminator that filter predicates target most often:</p>
+      <ul>
+        <li><strong>Date partitioning</strong> &mdash; the canonical choice for time-series. Filters of the form <code>where: (&gt; Date 2024.01.01)</code> let the optimizer load only the matching partition directories.</li>
+        <li><strong>Integer partitioning</strong> &mdash; for bucketed numeric data (e.g. user-id ranges, region codes).</li>
+        <li><strong>Symbol partitioning</strong> &mdash; for categorical data with stable, low-cardinality discriminators.</li>
+      </ul>
+      <p>The directory layout drives partition selection &mdash; see <a href="guide-storage.html#partitioned-tables">Storage Guide: partitioned tables</a> for the on-disk shape and <a href="architecture-offloading.html">Block Offloading</a> for how the optimizer streams across partitions without loading them all at once.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="lifecycle">7. Lifecycle gotchas</h2>
+      <p>Five things that bite first-time users.</p>
+      <ul>
+        <li><strong>Mutation drops the index.</strong> The quoted-symbol forms <code>(insert 'v val)</code> and <code>(alter 'v set i val)</code> / <code>(alter 'v concat vals)</code> mutate <code>v</code> in place and invalidate the attached structure. The mutator paths handle the drop transparently &mdash; there's no error, just a silently un-indexed column afterward. Rebuild explicitly after the write. The non-quoted form <code>(insert v val)</code> returns a fresh value and leaves the original (still indexed) untouched.</li>
+        <li><strong>Slices can't carry an index.</strong> Internally, slicing a column produces a fresh slice header without <code>RAY_ATTR_HAS_INDEX</code>; <code>(.idx.*)</code> attach refuses to operate on a slice (&ldquo;cannot index a slice; materialize first&rdquo;). The Rayfall surface for slices today is C-API-only &mdash; this is mostly relevant when calling Rayforce from your own C code.</li>
+        <li><strong>One slot per column, one kind at a time.</strong> Calling <code>.idx.hash</code> on a column that already has <code>.idx.zone</code> drops the zone first. Multiple coexisting kinds per column is a v2 feature.</li>
+        <li><strong>No persistence for <code>.idx.*</code>.</strong> The on-disk column format never carries an index; <code>ray_col_save</code> serializes a clean column. Rebuild after a load. HNSW handles can be persisted explicitly with <code>hnsw-save</code> / <code>hnsw-load</code>.</li>
+        <li><strong>Numeric only (v1).</strong> Internally <code>.idx.*</code> accept boolean and numeric element types through <code>RAY_TIMESTAMP</code>. From Rayfall, integer / float / date / time / timestamp vectors are the practical reach. Symbol or string columns are explicitly rejected with <code>error: nyi: only numeric vectors supported in v1</code> &mdash; their nullmap-union layout collides with the <code>sym_dict</code> / <code>str_pool</code> pointers and the displacement sweep is pending.</li>
+      </ul>
+
+      <!-- ============================================================ -->
+      <h2 id="perf">8. Performance characteristics</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Kind</th>
+            <th>Build cost</th>
+            <th>Space</th>
+            <th>Query cost (structural)</th>
+            <th>Used by today</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>.idx.zone</code></td>
+            <td>O(n) one pass</td>
+            <td>O(1) &mdash; min/max/null-count</td>
+            <td>O(1) range check</td>
+            <td>Inspectable via <code>.idx.info</code> only</td>
+          </tr>
+          <tr>
+            <td><code>.idx.hash</code></td>
+            <td>O(n) one pass</td>
+            <td>O(n) &mdash; table + chain</td>
+            <td>O(1) average; chain-walk on collisions</td>
+            <td>Inspectable via <code>.idx.info</code> only</td>
+          </tr>
+          <tr>
+            <td><code>.idx.sort</code></td>
+            <td>O(n log n)</td>
+            <td>O(n) &mdash; row-id permutation</td>
+            <td>O(log n) binary search</td>
+            <td>Inspectable via <code>.idx.info</code> only</td>
+          </tr>
+          <tr>
+            <td><code>.idx.bloom</code></td>
+            <td>O(n &middot; k), k = 3</td>
+            <td>O(m) bits, m default 64</td>
+            <td>O(k) probe with false-positive rate</td>
+            <td>Inspectable via <code>.idx.info</code> only</td>
+          </tr>
+          <tr>
+            <td>HNSW</td>
+            <td>O(n log n) typical</td>
+            <td>O(n &middot; M) graph edges</td>
+            <td>O(log n) approximate</td>
+            <td><strong>Consulted directly</strong> by <code>(ann)</code></td>
+          </tr>
+          <tr>
+            <td>Linked column</td>
+            <td>O(n) one-time bind</td>
+            <td>O(n) row-id vector</td>
+            <td>O(1) deref</td>
+            <td><strong>Consulted directly</strong> on column dereference</td>
+          </tr>
+          <tr>
+            <td>Partition pruning</td>
+            <td>None &mdash; layout-driven</td>
+            <td>None</td>
+            <td>O(p) partition count</td>
+            <td><strong>Optimizer pass</strong> rewrites filters to skip non-matching partitions</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>The query column above is the cost the structure <em>enables</em>. The four <code>.idx.*</code> kinds build correctly today, but the executor does not yet rewrite <code>filter</code> / <code>in</code> / <code>find</code> / <code>distinct</code> to consult them &mdash; queries scan linearly until that routing pass lands. HNSW and linked columns are consulted as soon as you call <code>(ann)</code> or dereference the link; partition pruning is the only one that goes through an optimizer pass. Plan accordingly: build a <code>.idx.*</code> for repeated queries, but expect the observable speedup to arrive with the routing pass, not before.</p>
+
+      <!-- TODO(user-contribution): a 5–10 line benchmark snippet from a
+           workload you've actually run grounds the abstract O(n) numbers
+           above. e.g.: column size, query count, before-vs-after times for
+           hash-attached vs. linear-scan, run on the local machine. Feel
+           free to use one of the examples/rfl/*.rfl benchmarks as the
+           backbone. -->
+
+      <!-- ============================================================ -->
+      <h2 id="next">Next steps</h2>
+      <ul>
+        <li><a href="indexes-overview.html"><strong>Indexes Overview</strong></a> &mdash; the full landscape and decision matrix.</li>
+        <li><a href="queries-indexes.html"><strong>Accelerator Indexes</strong></a> &mdash; per-function reference for <code>.idx.*</code>.</li>
+        <li><a href="vector-search.html"><strong>Vector Search &amp; HNSW</strong></a> &mdash; ANN reference, persistence, metrics.</li>
+        <li><a href="queries-links.html"><strong>Linked Columns</strong></a> &mdash; cross-table references.</li>
+        <li><a href="guide-storage.html"><strong>Storage Guide</strong></a> &mdash; partitioned-table layout and recommended directory shapes.</li>
+      </ul>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="queries-indexes.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Accelerator Indexes</span></a>
+        <a href="guide-storage.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Storage Guide</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

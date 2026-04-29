@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Advanced Analytics Tutorial — Rayforce Documentation</title>
+  <meta name="description" content="Step-by-step tutorial: time-bucketed aggregation, running totals, top-N queries, pivots, ASOF joins, and multi-step pipelines with Rayfall.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link active">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Advanced Analytics Tutorial</span>
+      </div>
+
+      <h1>Advanced Analytics Tutorial</h1>
+      <p class="page-subtitle">Time-bucketed aggregation, running totals, top-N queries, pivoting, ASOF joins, and multi-step pipelines &mdash; all from the Rayfall REPL.</p>
+
+      <p>This tutorial builds on the <a href="tutorial.html">Getting Started Tutorial</a>. You should already be comfortable creating tables, filtering, grouping, and sorting. Start the REPL with <code>./rayforce</code> and follow along.</p>
+
+      <p>We will reuse a single trade dataset throughout. Create it now:</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Time</span> <span class="hl-sym">Symbol</span> <span class="hl-sym">Price</span> <span class="hl-sym">Qty</span>]
+  (<span class="hl-fn">list</span>
+    [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span> <span class="hl-num">5</span> <span class="hl-num">6</span> <span class="hl-num">7</span> <span class="hl-num">8</span> <span class="hl-num">9</span> <span class="hl-num">10</span> <span class="hl-num">11</span> <span class="hl-num">12</span>]
+    [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span>]
+    [<span class="hl-num">150.0</span> <span class="hl-num">280.0</span> <span class="hl-num">420.0</span> <span class="hl-num">155.0</span> <span class="hl-num">275.0</span> <span class="hl-num">415.0</span> <span class="hl-num">160.0</span> <span class="hl-num">285.0</span> <span class="hl-num">410.0</span> <span class="hl-num">165.0</span> <span class="hl-num">290.0</span> <span class="hl-num">425.0</span>]
+    [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span> <span class="hl-num">300</span> <span class="hl-num">150</span> <span class="hl-num">75</span> <span class="hl-num">120</span> <span class="hl-num">180</span> <span class="hl-num">60</span> <span class="hl-num">250</span> <span class="hl-num">160</span> <span class="hl-num">80</span>])))</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Time &#9474; Symbol &#9474; Price &#9474;      Qty      &#9474;
+&#9474; i64  &#9474;  sym   &#9474;  f64  &#9474;      i64      &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 1    &#9474; AAPL   &#9474; 150.0 &#9474; 100           &#9474;
+&#9474; 2    &#9474; GOOG   &#9474; 280.0 &#9474; 200           &#9474;
+&#9474; 3    &#9474; MSFT   &#9474; 420.0 &#9474; 50            &#9474;
+&#9474; ...  &#9474; ...    &#9474; ...   &#9474; ...           &#9474;
+&#9474; 12   &#9474; MSFT   &#9474; 425.0 &#9474; 80            &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 12 rows                                  &#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+
+      <!-- Section 1 -->
+      <h2 id="time-bucketed">1. Time-Bucketed Aggregation</h2>
+      <p>Use <code>xbar</code> inside a <code>select</code> <code>by:</code> clause to bucket a numeric column into fixed-width intervals. <code>(xbar Time 4)</code> rounds each <code>Time</code> value down to the nearest multiple of 4, creating time buckets.</p>
+      <p>Build 4-unit OHLCV bars (open, high, low, close, volume) from the trade data:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades
+         <span class="hl-sym">by:</span> (<span class="hl-fn">xbar</span> <span class="hl-sym">Time</span> <span class="hl-num">4</span>)
+         <span class="hl-sym">open:</span>  (<span class="hl-fn">first</span> <span class="hl-sym">Price</span>)
+         <span class="hl-sym">high:</span>  (<span class="hl-fn">max</span> <span class="hl-sym">Price</span>)
+         <span class="hl-sym">low:</span>   (<span class="hl-fn">min</span> <span class="hl-sym">Price</span>)
+         <span class="hl-sym">close:</span> (<span class="hl-fn">last</span> <span class="hl-sym">Price</span>)
+         <span class="hl-sym">vol:</span>   (<span class="hl-fn">sum</span> <span class="hl-sym">Qty</span>)})</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474;  +  &#9474; open  &#9474; high  &#9474;  low  &#9474; close &#9474; vol &#9474;
+&#9474; i64 &#9474;  f64  &#9474;  f64  &#9474;  f64  &#9474;  f64  &#9474; i64 &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 0   &#9474; 150.0 &#9474; 420.0 &#9474; 150.0 &#9474; 420.0 &#9474; 350 &#9474;
+&#9474; 4   &#9474; 155.0 &#9474; 415.0 &#9474; 155.0 &#9474; 285.0 &#9474; 645 &#9474;
+&#9474; 8   &#9474; 410.0 &#9474; 410.0 &#9474; 165.0 &#9474; 290.0 &#9474; 650 &#9474;
+&#9474; 12  &#9474; 425.0 &#9474; 425.0 &#9474; 425.0 &#9474; 425.0 &#9474; 80  &#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>The bucket column is named <code>+</code> (the computed grouping expression). Each row represents one time bucket with its OHLCV values. Change the bucket width by adjusting the second argument to <code>xbar</code>.</p>
+
+      <!-- Section 2 -->
+      <h2 id="running-totals">2. Running Totals</h2>
+      <p>Use <code>scan</code> to compute a cumulative reduction over a vector. <code>(scan f v)</code> applies <code>f</code> pairwise across <code>v</code>, carrying the accumulator forward.</p>
+      <pre><code><span class="hl-comment">; Cumulative sum of quantities</span>
+(<span class="hl-fn">scan</span> <span class="hl-fn">+</span> [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span> <span class="hl-num">40</span> <span class="hl-num">50</span>])</code></pre>
+      <pre><code>[10 30 60 100 150]</code></pre>
+      <p>Use it to track running volume from a list of order quantities:</p>
+      <pre><code>(<span class="hl-kw">set</span> quantities [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span> <span class="hl-num">300</span> <span class="hl-num">150</span>])
+
+<span class="hl-comment">; Running total: 100, 300, 350, 650, 800</span>
+(<span class="hl-fn">scan</span> <span class="hl-fn">+</span> quantities)</code></pre>
+      <pre><code>[100 300 350 650 800]</code></pre>
+      <p><code>scan</code> works with any binary function: use <code>*</code> for running products, or a custom lambda for running maximums:</p>
+      <pre><code><span class="hl-comment">; Running maximum via lambda</span>
+(<span class="hl-fn">scan</span> (<span class="hl-kw">fn</span> [a b] (<span class="hl-fn">if</span> (<span class="hl-fn">&gt;</span> a b) a b)) [<span class="hl-num">3</span> <span class="hl-num">1</span> <span class="hl-num">4</span> <span class="hl-num">1</span> <span class="hl-num">5</span> <span class="hl-num">9</span> <span class="hl-num">2</span>])</code></pre>
+      <pre><code>[3 3 4 4 5 9 9]</code></pre>
+
+      <!-- Section 3 -->
+      <h2 id="top-n">3. Top-N Queries</h2>
+      <p>Combine <code>xdesc</code> (sort descending) with <code>take</code> to extract the top N rows. First, aggregate by product, then rank:</p>
+      <pre><code>(<span class="hl-kw">set</span> products (<span class="hl-fn">table</span> [<span class="hl-sym">Product</span> <span class="hl-sym">Revenue</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">A</span> <span class="hl-sym">B</span> <span class="hl-sym">C</span> <span class="hl-sym">D</span> <span class="hl-sym">E</span> <span class="hl-sym">A</span> <span class="hl-sym">B</span> <span class="hl-sym">C</span>]
+        [<span class="hl-num">500</span> <span class="hl-num">300</span> <span class="hl-num">800</span> <span class="hl-num">200</span> <span class="hl-num">600</span> <span class="hl-num">400</span> <span class="hl-num">350</span> <span class="hl-num">750</span>])))
+
+<span class="hl-comment">; Sort by Revenue descending, take top 3</span>
+(<span class="hl-fn">take</span> (<span class="hl-fn">xdesc</span> products <span class="hl-sym">'Revenue</span>) <span class="hl-num">3</span>)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Product &#9474;          Revenue           &#9474;
+&#9474;   sym   &#9474;            i64             &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; C       &#9474; 800                       &#9474;
+&#9474; C       &#9474; 750                       &#9474;
+&#9474; E       &#9474; 600                       &#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>For top-N by group, first aggregate with <code>select ... by:</code>, then sort and take:</p>
+      <pre><code><span class="hl-comment">; Top 2 symbols by total quantity from the trades table</span>
+(<span class="hl-kw">set</span> by_sym (<span class="hl-fn">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">by:</span> <span class="hl-sym">Symbol</span>
+                     <span class="hl-sym">total:</span> (<span class="hl-fn">sum</span> <span class="hl-sym">Qty</span>)}))
+(<span class="hl-fn">take</span> (<span class="hl-fn">xdesc</span> by_sym <span class="hl-sym">'total</span>) <span class="hl-num">2</span>)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474;            total             &#9474;
+&#9474;  sym   &#9474;             i64              &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; AAPL   &#9474; 770                         &#9474;
+&#9474; GOOG   &#9474; 690                         &#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+
+      <!-- Section 4 -->
+      <h2 id="pivoting">4. Pivoting</h2>
+      <p>Use <code>pivot</code> to cross-tabulate data. Arguments: table, row key, column key, value column, aggregation function.</p>
+      <pre><code>(<span class="hl-kw">set</span> sales (<span class="hl-fn">table</span> [<span class="hl-sym">Product</span> <span class="hl-sym">Region</span> <span class="hl-sym">Revenue</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">A</span> <span class="hl-sym">A</span> <span class="hl-sym">B</span> <span class="hl-sym">B</span> <span class="hl-sym">A</span> <span class="hl-sym">B</span>]
+        [<span class="hl-sym">East</span> <span class="hl-sym">West</span> <span class="hl-sym">East</span> <span class="hl-sym">West</span> <span class="hl-sym">East</span> <span class="hl-sym">West</span>]
+        [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">150</span> <span class="hl-num">250</span> <span class="hl-num">300</span> <span class="hl-num">175</span>])))
+
+(<span class="hl-fn">pivot</span> sales <span class="hl-sym">'Product</span> <span class="hl-sym">'Region</span> <span class="hl-sym">'Revenue</span> <span class="hl-fn">sum</span>)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Product &#9474; East &#9474;        West        &#9474;
+&#9474;   sym   &#9474; i64  &#9474;        i64         &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; A       &#9474; 400  &#9474; 200                &#9474;
+&#9474; B       &#9474; 150  &#9474; 425                &#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>The distinct values of <code>Region</code> become column headers. You can use any aggregation function: <code>sum</code>, <code>avg</code>, <code>count</code>, <code>min</code>, <code>max</code>, <code>first</code>, <code>last</code>, or <code>med</code>.</p>
+
+      <!-- Section 5 -->
+      <h2 id="asof-join">5. ASOF Joins</h2>
+      <p>An ASOF join matches each left row to the most recent right row where the time key is less than or equal to the left's time, within the same equality partition. This is the standard way to do point-in-time lookups.</p>
+      <p>The syntax is <code>(asof-join [eqKey... timeKey] leftTable rightTable)</code>. The last element of the key vector is the time column; all preceding elements are equality columns.</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Time</span> <span class="hl-sym">Symbol</span> <span class="hl-sym">Price</span> <span class="hl-sym">Qty</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-num">10</span> <span class="hl-num">15</span> <span class="hl-num">20</span> <span class="hl-num">25</span> <span class="hl-num">30</span>]
+        [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">AAPL</span>]
+        [<span class="hl-num">150.0</span> <span class="hl-num">280.0</span> <span class="hl-num">151.0</span> <span class="hl-num">279.0</span> <span class="hl-num">152.0</span>]
+        [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">150</span> <span class="hl-num">300</span> <span class="hl-num">120</span>])))
+
+(<span class="hl-kw">set</span> quotes (<span class="hl-fn">table</span> [<span class="hl-sym">Time</span> <span class="hl-sym">Symbol</span> <span class="hl-sym">Bid</span> <span class="hl-sym">Ask</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-num">8</span> <span class="hl-num">12</span> <span class="hl-num">14</span> <span class="hl-num">18</span> <span class="hl-num">22</span>]
+        [<span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">AAPL</span>]
+        [<span class="hl-num">149.0</span> <span class="hl-num">150.0</span> <span class="hl-num">279.0</span> <span class="hl-num">278.0</span> <span class="hl-num">151.0</span>]
+        [<span class="hl-num">150.0</span> <span class="hl-num">151.0</span> <span class="hl-num">280.0</span> <span class="hl-num">279.0</span> <span class="hl-num">152.0</span>])))
+
+<span class="hl-comment">; Match each trade to the latest quote for the same symbol</span>
+(<span class="hl-fn">asof-join</span> [<span class="hl-sym">Symbol</span> <span class="hl-sym">Time</span>] trades quotes)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Time &#9474; Symbol &#9474; Price &#9474; Qty &#9474;  Bid  &#9474;  Ask  &#9474;
+&#9474; i64  &#9474;  sym   &#9474;  f64  &#9474; i64 &#9474;  f64  &#9474;  f64  &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 10   &#9474; AAPL   &#9474; 150.0 &#9474; 100 &#9474; 149.0 &#9474; 150.0 &#9474;
+&#9474; 15   &#9474; GOOG   &#9474; 280.0 &#9474; 200 &#9474; 279.0 &#9474; 280.0 &#9474;
+&#9474; 20   &#9474; AAPL   &#9474; 151.0 &#9474; 150 &#9474; 150.0 &#9474; 151.0 &#9474;
+&#9474; 25   &#9474; GOOG   &#9474; 279.0 &#9474; 300 &#9474; 278.0 &#9474; 279.0 &#9474;
+&#9474; 30   &#9474; AAPL   &#9474; 152.0 &#9474; 120 &#9474; 151.0 &#9474; 152.0 &#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>Each trade row now carries the <code>Bid</code> and <code>Ask</code> from the most recent quote for the same <code>Symbol</code> at or before the trade's <code>Time</code>. For example, the AAPL trade at time 20 picks up the quote from time 12 (Bid 150.0), not the one from time 22 (which is in the future).</p>
+
+      <!-- Section 6 -->
+      <h2 id="window-join">6. Window Joins</h2>
+      <p>A window join is similar to an ASOF join but allows you to match each left row against right rows within a time window partitioned by equality keys. Use <code>window-join</code> with the form <code>(window-join leftTable rightTable [eqKeys] 'timeCol)</code>:</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Time</span> <span class="hl-sym">Symbol</span> <span class="hl-sym">Price</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span> <span class="hl-num">40</span> <span class="hl-num">50</span>]
+        [<span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">AAPL</span>]
+        [<span class="hl-num">150.0</span> <span class="hl-num">151.0</span> <span class="hl-num">280.0</span> <span class="hl-num">279.0</span> <span class="hl-num">152.0</span>])))
+
+(<span class="hl-kw">set</span> quotes (<span class="hl-fn">table</span> [<span class="hl-sym">Time</span> <span class="hl-sym">Symbol</span> <span class="hl-sym">Bid</span> <span class="hl-sym">Ask</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-num">5</span> <span class="hl-num">8</span> <span class="hl-num">15</span> <span class="hl-num">18</span> <span class="hl-num">22</span> <span class="hl-num">25</span> <span class="hl-num">35</span> <span class="hl-num">45</span>]
+        [<span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">AAPL</span>]
+        [<span class="hl-num">149.0</span> <span class="hl-num">149.5</span> <span class="hl-num">278.0</span> <span class="hl-num">279.0</span> <span class="hl-num">150.5</span> <span class="hl-num">279.5</span> <span class="hl-num">278.5</span> <span class="hl-num">151.0</span>]
+        [<span class="hl-num">150.0</span> <span class="hl-num">150.5</span> <span class="hl-num">279.0</span> <span class="hl-num">280.0</span> <span class="hl-num">151.5</span> <span class="hl-num">280.5</span> <span class="hl-num">279.5</span> <span class="hl-num">152.0</span>])))
+
+<span class="hl-comment">; Join each trade to the latest quote for the same symbol</span>
+(<span class="hl-fn">window-join</span> trades quotes [<span class="hl-sym">'Symbol</span>] <span class="hl-sym">'Time</span>)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Time &#9474; Symbol &#9474; Price &#9474;  Bid  &#9474;  Ask  &#9474;
+&#9474; i64  &#9474;  sym   &#9474;  f64  &#9474;  f64  &#9474;  f64  &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 10   &#9474; AAPL   &#9474; 150.0 &#9474; 149.5 &#9474; 150.5 &#9474;
+&#9474; 20   &#9474; AAPL   &#9474; 151.0 &#9474; 149.5 &#9474; 150.5 &#9474;
+&#9474; 30   &#9474; GOOG   &#9474; 280.0 &#9474; 279.5 &#9474; 280.5 &#9474;
+&#9474; 40   &#9474; GOOG   &#9474; 279.0 &#9474; 278.5 &#9474; 279.5 &#9474;
+&#9474; 50   &#9474; AAPL   &#9474; 152.0 &#9474; 151.0 &#9474; 152.0 &#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>The <code>window-join</code> matches each trade to the closest preceding quote for the same <code>Symbol</code>, partitioned by the equality keys in the vector. The <code>'Time</code> argument specifies the temporal ordering column.</p>
+
+      <!-- Section 7 -->
+      <h2 id="pipeline">7. Multi-Step Pipeline</h2>
+      <p>Combine multiple techniques into a single analysis. Starting from the original trade data: aggregate by symbol, compute revenue, rank by revenue, and pivot quantity by symbol and time bucket.</p>
+      <pre><code><span class="hl-comment">; Recreate the base trade table</span>
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Hour</span> <span class="hl-sym">Symbol</span> <span class="hl-sym">Price</span> <span class="hl-sym">Qty</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-num">9</span> <span class="hl-num">9</span> <span class="hl-num">9</span> <span class="hl-num">10</span> <span class="hl-num">10</span> <span class="hl-num">10</span> <span class="hl-num">11</span> <span class="hl-num">11</span> <span class="hl-num">11</span>]
+        [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span>]
+        [<span class="hl-num">150.0</span> <span class="hl-num">280.0</span> <span class="hl-num">420.0</span> <span class="hl-num">155.0</span> <span class="hl-num">275.0</span> <span class="hl-num">415.0</span> <span class="hl-num">160.0</span> <span class="hl-num">285.0</span> <span class="hl-num">410.0</span>]
+        [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span> <span class="hl-num">300</span> <span class="hl-num">150</span> <span class="hl-num">75</span> <span class="hl-num">120</span> <span class="hl-num">180</span> <span class="hl-num">60</span>])))</code></pre>
+      <p><strong>Step 1: Revenue by symbol.</strong> Group by <code>Symbol</code>, compute total revenue:</p>
+      <pre><code>(<span class="hl-kw">set</span> summary (<span class="hl-fn">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">by:</span> <span class="hl-sym">Symbol</span>
+                        <span class="hl-sym">revenue:</span> (<span class="hl-fn">sum</span> (<span class="hl-fn">*</span> <span class="hl-sym">Price</span> <span class="hl-sym">Qty</span>))}))</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474;          revenue            &#9474;
+&#9474;  sym   &#9474;            f64              &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; AAPL   &#9474; 80700.0                    &#9474;
+&#9474; GOOG   &#9474; 148550.0                   &#9474;
+&#9474; MSFT   &#9474; 76725.0                    &#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+
+      <p><strong>Step 2: Top 2 symbols by revenue.</strong></p>
+      <pre><code>(<span class="hl-fn">take</span> (<span class="hl-fn">xdesc</span> summary <span class="hl-sym">'revenue</span>) <span class="hl-num">2</span>)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474;          revenue            &#9474;
+&#9474;  sym   &#9474;            f64              &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; GOOG   &#9474; 148550.0                   &#9474;
+&#9474; AAPL   &#9474; 80700.0                    &#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+
+      <p><strong>Step 3: Pivot quantity by symbol and hour.</strong></p>
+      <pre><code>(<span class="hl-fn">pivot</span> trades <span class="hl-sym">'Symbol</span> <span class="hl-sym">'Hour</span> <span class="hl-sym">'Qty</span> <span class="hl-fn">sum</span>)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474;  9  &#9474; 10  &#9474;       11       &#9474;
+&#9474;  sym   &#9474; i64 &#9474; i64 &#9474;      i64       &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; AAPL   &#9474; 100 &#9474; 300 &#9474; 120            &#9474;
+&#9474; GOOG   &#9474; 200 &#9474; 150 &#9474; 180            &#9474;
+&#9474; MSFT   &#9474; 50  &#9474; 75  &#9474; 60             &#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>The pivot shows how each symbol's trading volume is distributed across the three hours. AAPL volume concentrates in hour 10, while GOOG is strongest in hours 9 and 11.</p>
+
+      <h2 id="next-steps">Next Steps</h2>
+      <ul>
+        <li><a href="tutorial-graph.html"><strong>Graph Queries Tutorial</strong></a> &mdash; Model a social network, traverse paths, and detect communities</li>
+        <li><a href="guide-analytics.html"><strong>Analytics Cookbook</strong></a> &mdash; More analytics patterns and recipes</li>
+        <li><a href="queries-joins.html"><strong>Joins Reference</strong></a> &mdash; Full details on inner, left, ASOF, and window joins</li>
+        <li><a href="rayfall-functions.html"><strong>Functions Reference</strong></a> &mdash; Complete list of all built-in functions</li>
+      </ul>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="tutorial-storage.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Data Loading &amp; Storage Tutorial</span></a>
+        <a href="rayfall-syntax.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Syntax &amp; Types</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

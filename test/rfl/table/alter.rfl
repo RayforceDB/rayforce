@@ -1,0 +1,24 @@
+;; Ported from test_lang_rf.inc::test_rf_alter.
+
+;; ========== ALTER SET ON VECTORS ==========
+(set v [1 2 3 4 5]) (alter 'v set 0 100) v -- [100 2 3 4 5]
+;; ========== ALTER CONCAT ON VECTORS ==========
+(set v [1 2 3]) (alter 'v concat 4) v -- [1 2 3 4]
+
+;; ========== ALTER SET ON LISTS (boxed heterogeneous) ==========
+(set L (list 1 'a "x" 3.14)) (alter 'L set 1 'changed) L -- (list 1 'changed "x" 3.14)
+(set L (list 10 20 30 40 50)) (alter 'L set [0 2 4] 99) L -- (list 99 20 99 40 99)
+
+;; ========== ALTER CONCAT ON LISTS ==========
+(set L (list 1 'a "x")) (alter 'L concat 99) L -- (list 1 'a "x" 99)
+
+;; ========== ALTER REMOVE — list-only (atom or vec of indices) ==========
+(set L (list 10 20 30 40 50)) (alter 'L remove 2) L -- (list 10 20 40 50)
+(set L (list 10 20 30 40 50)) (alter 'L remove [1 3]) L -- (list 10 30 50)
+(set L (list 'a 'b 'c)) (alter 'L remove 0) L -- (list 'b 'c)
+
+;; ========== ALTER SET — different vec types (exercises store_typed_elem dispatch) ==========
+(set v [1.0 2.0 3.0]) (alter 'v set 1 9.9) v -- [1.0 9.9 3.0]
+(set v [1h 2h 3h]) (alter 'v set 0 99h) v -- [99h 2h 3h]
+(set v ['a 'b 'c]) (alter 'v set 1 'X) v -- ['a 'X 'c]
+(set v [true false true]) (alter 'v set 0 false) v -- [false false true]

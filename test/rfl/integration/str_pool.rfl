@@ -1,0 +1,44 @@
+;; Rayforce's RAY_STR has a 12-byte SSO boundary: strings ≤ 12 bytes are
+;; stored inline in the 16-byte ray_str_t; longer strings live in a
+;; per-vector pool with a 4-byte prefix for fast comparison rejection.
+;; These tests pin down behaviour around the boundary.
+
+;; ────────────── count is independent of representation ──────────────
+(count "")             -- 0
+(count "x")            -- 1
+(count "abcdefghijk")  -- 11
+(count "abcdefghijkl") -- 12
+(count "abcdefghijklm") -- 13
+(count "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") -- 100
+
+;; ────────────── equality across representations ──────────────
+(== "abc" "abc") -- true
+(!= "abc" "abd") -- true
+(== "abcdefghijklm" "abcdefghijklm") -- true
+;; inline string is never equal to a strictly-longer pool string
+(!= "abcdefghijkl" "abcdefghijklm") -- true
+
+;; ────────────── concat across the boundary ──────────────
+;; 12 + 1 = 13 → result lands in the pool
+(count (concat "abcdefghijkl" "x")) -- 13
+(concat "abcdefghijkl" "x") -- "abcdefghijklx"
+
+;; concat fits within inline (3 + 3 = 6)
+(concat "abc" "def") -- "abcdef"
+(count (concat "abc" "def")) -- 6
+
+;; concat pool + inline / pool + pool retains length
+(concat "abcdefghijklm" "!") -- "abcdefghijklm!"
+(count (concat "abcdefghijklm" "!")) -- 14
+
+;; concat with empty operand
+(concat "" "abc") -- "abc"
+(concat "abc" "") -- "abc"
+(concat "" "") -- ""
+
+;; ────────────── like across the boundary ──────────────
+(like "abcdef" "abc*")              -- true
+(like "abcdefghijklmnop" "abcdef*") -- true
+(like "abcdefghijklmnop" "*ghij*")  -- true
+(like "" "")                        -- true
+(like "" "x")                       -- false

@@ -1,0 +1,25 @@
+;; Invariants for `hnsw-build` / `ann` / `hnsw-info` / `hnsw-free`.
+;; HNSW approximate nearest-neighbour index over a list of float vectors.
+;; The index is opaque; queries return a table with `_rowid` and `_dist`.
+
+;; Five vectors, exact-match query at row 0.
+(set V (list [1.0 0.0 0.0] [0.9 0.1 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.5 0.5 0.0]))
+(set Idx (hnsw-build V 'l2 8 100))
+
+;; ────────────── hnsw-info exposes build parameters ──────────────
+(at (hnsw-info Idx) 'nrows)  -- 5
+(at (hnsw-info Idx) 'dim)    -- 3
+(at (hnsw-info Idx) 'metric) -- 'l2
+(at (hnsw-info Idx) 'M)      -- 8
+(at (hnsw-info Idx) 'efc)    -- 100
+
+;; ────────────── exact-match top-1 ──────────────
+;; Querying with the same vector as row 0 must return row 0 with dist 0.
+(first (at (ann Idx [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(first (at (ann Idx [1.0 0.0 0.0] 1) '_dist))  -- 0.0
+
+;; ────────────── top-k respects requested count and orders by distance ──────────────
+(count (ann Idx [1.0 0.0 0.0] 3)) -- 3
+(<= (first (at (ann Idx [1.0 0.0 0.0] 3) '_dist)) (last (at (ann Idx [1.0 0.0 0.0] 3) '_dist))) -- true
+
+(hnsw-free Idx)

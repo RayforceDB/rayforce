@@ -1,0 +1,20 @@
+;; Ported from test_lang_rf.inc::test_rf_conditionals.
+
+;; ========== BASIC IF TESTS ==========
+(if true 1 2) -- 1
+(if false 1 2) -- 2
+;; ========== NESTED IF ==========
+(if true (if true 1 2) 3) -- 1
+(if true (if false 1 2) 3) -- 2
+(if false 1 (if true 2 3)) -- 2
+;; ========== IF WITH EXPRESSIONS ==========
+(if (> 5 3) (+ 1 1) (- 1 1)) -- 2
+(if (< 5 3) (+ 1 1) (- 5 3)) -- 2
+(if (== 1 1) "yes" "no") -- "yes"
+;; ========== IF WITH SIDE EFFECTS ==========
+(set y 0) (if true (set y 10) (set y 20)) y -- 10
+(set y 0) (if false (set y 10) (set y 20)) y -- 20
+;; ========== CHAINED CONDITIONS ==========
+(set x 5) (if (< x 0) 'neg (if (== x 0) 'zero 'pos)) -- 'pos
+(set x -3) (if (< x 0) 'neg (if (== x 0) 'zero 'pos)) -- 'neg
+(set x 0) (if (< x 0) 'neg (if (== x 0) 'zero 'pos)) -- 'zero

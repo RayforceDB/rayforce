@@ -1,0 +1,12 @@
+;; Invariants for `norm` (L2 norm).
+
+(norm [3.0 4.0]) -- 5.0
+(norm [0.0 0.0]) -- 0.0
+(norm [1.0]) -- 1.0
+(norm [1.0 2.0 2.0]) -- 3.0
+
+;; non-negative
+1 -- (as 'I64 (>= (norm [1.0 -2.0 3.0]) 0.0))
+
+;; scale-homogeneous: norm(k*v) == |k|*norm(v)
+1 -- (as 'I64 (< (abs (- (norm [3.0 4.0]) 5.0)) 0.0001))

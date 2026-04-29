@@ -1,0 +1,23 @@
+;; Invariants for `sqrt`.
+
+;; concrete
+(sqrt 4.0) -- 2.0
+(sqrt 0.0) -- 0.0
+(sqrt 1.0) -- 1.0
+(sqrt 9.0) -- 3.0
+(sqrt 25.0) -- 5.0
+
+;; sqrt of a negative produces IEEE NaN (still f64, not nil) — NaN is
+;; the only float that is not equal to itself.
+(type (sqrt -1.0)) -- 'f64
+(nil? (sqrt -1.0)) -- false
+(!= (sqrt -1.0) (sqrt -1.0)) -- true
+
+;; roundtrip: (sqrt x)^2 ≈ x  for x >= 0
+(set A (as 'F64 (rand 256 1000)))
+(count A) -- (sum (< (abs (- (* (sqrt A) (sqrt A)) A)) 0.001))
+
+;; sqrt is monotonically non-decreasing: a <= b → sqrt(a) <= sqrt(b)
+;; (vector version: sort A, verify sqrt preserves order)
+(set S (asc A))
+(count S) -- (sum (== (sqrt S) (asc (sqrt A))))

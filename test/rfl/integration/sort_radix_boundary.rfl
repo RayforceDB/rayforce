@@ -1,0 +1,87 @@
+;; Radix-threshold boundary: at N=4097 (just over 2^12 = 4096) sort
+;; switches from one strategy to another internally.  Pin the exit
+;; values for every supported type so a refactor of either strategy
+;; surfaces immediately.
+;;
+;; "(at (take s -1) 0)" idiom = last element of the sorted vector.
+;; (Anton's harness evaluates each statement independently; `set`
+;; persists across lines.)
+
+(set N 4097)
+
+;; ────────────── i64 sort (asc / desc, positive + negative) ──────────────
+(set V (take [9 1 5 3 7 2 8 4 6 0] N))
+(at (asc V) 0)              -- 0
+(at (take (asc V) -1) 0)    -- 9
+(at (desc V) 0)             -- 9
+(at (take (desc V) -1) 0)   -- 0
+
+(set Vn (take [-9 -1 -5 -3 -7 -2 -8 -4 -6 0] N))
+(at (asc Vn) 0)             -- -9
+(at (take (asc Vn) -1) 0)   -- 0
+
+;; ────────────── f64 sort ──────────────
+(set Vf (take [9.9 1.1 5.5 3.3 7.7 2.2 8.8 4.4 6.6 0.0] N))
+(at (asc Vf) 0)             -- 0.0
+(at (take (asc Vf) -1) 0)   -- 9.9
+(at (desc Vf) 0)            -- 9.9
+
+;; f64 with NaN keeps the row count
+(set Vnan (take [0Nf 3.0 1.0 0Nf 2.0] N))
+(count (asc Vnan)) -- 4097
+
+;; ────────────── SYM sort (lexicographic) ──────────────
+(set Vs (take ['ZZZ 'AAA 'MMM 'BBB 'QQQ] N))
+(at (asc Vs) 0)             -- 'AAA
+(at (take (asc Vs) -1) 0)   -- 'ZZZ
+(at (desc Vs) 0)            -- 'ZZZ
+
+;; ────────────── STR sort ──────────────
+(set Vstr (take ["zebra" "apple" "mango" "banana" "cherry"] N))
+(at (asc Vstr) 0)           -- "apple"
+(at (take (asc Vstr) -1) 0) -- "zebra"
+(at (desc Vstr) 0)          -- "zebra"
+
+;; ────────────── BOOL / DATE / TIMESTAMP ──────────────
+(set Vb (take [true false true false true] N))
+(at (asc Vb) 0)             -- false
+(at (take (asc Vb) -1) 0)   -- true
+
+(set Vd (take [2024.01.05 2024.01.01 2024.01.03 2024.01.02 2024.01.04] N))
+(at (asc Vd) 0)             -- 2024.01.01
+(at (take (asc Vd) -1) 0)   -- 2024.01.05
+
+(set Vt (take (as 'TIMESTAMP [5 1 3 2 4]) N))
+(at (asc Vt) 0)             -- (as 'TIMESTAMP 1)
+(at (take (asc Vt) -1) 0)   -- (as 'TIMESTAMP 5)
+
+;; i64 with nulls — null sorts first under asc, count preserved
+(set Vnull (take [0Nl 3 1 0Nl 2] N))
+(at (asc Vnull) 0)          -- 0Nl
+(count (asc Vnull))         -- 4097
+
+;; ────────────── iasc / idesc — index permutations ──────────────
+(count (iasc (take [5 3 1 4 2] N)))   -- 4097
+(count (idesc (take [5 3 1 4 2] N)))  -- 4097
+
+;; ────────────── xasc / xdesc — table sort ──────────────
+(set T (table [k v] (list (take [5 3 1 4 2] N) (til N))))
+(at (at (xasc T 'k) 'k) 0)              -- 1
+(at (at (xasc T 'k) 'k) (- N 1))        -- 5
+(at (at (xdesc T 'k) 'k) 0)             -- 5
+(at (at (xdesc T 'k) 'k) (- N 1))       -- 1
+
+;; ────────────── select asc/desc + group-by + distinct + rank ──────────────
+(set T2 (table [a b] (list (take [5 3 1 4 2] N) (til N))))
+(at (at (select {from: T2 asc: a}) 'a) 0)   -- 1
+(at (at (select {from: T2 desc: a}) 'a) 0)  -- 5
+
+;; group-by + sort: 10 distinct keys (% N 10), key 0 sorts first
+(set Tg (table [g v] (list (% (til N) 10) (til N))))
+(at (at (xasc (select {s: (sum v) from: Tg by: g}) 'g) 'g) 0) -- 0
+
+;; distinct over 10-cycle pattern => 10 unique values
+(count (distinct (take [1 2 3 4 5 6 7 8 9 0] N))) -- 10
+
+;; rank preserves length
+(count (rank (take [5 3 1 4 2] N))) -- 4097

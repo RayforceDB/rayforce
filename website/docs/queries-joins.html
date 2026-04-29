@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Joins — Rayforce Documentation</title>
+  <meta name="description" content="Inner join, left join, as-of join, and window join in Rayfall. Equi-joins, time-series alignment, and DAG-compiled radix-partitioned hash joins.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link active">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Joins</span>
+      </div>
+
+      <h1>Joins</h1>
+      <p class="page-subtitle">Equi-joins, left outer joins, as-of joins for time-series alignment, and window joins with aggregation. All join types compile to the DAG and execute via radix-partitioned hash join.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="inner-join">Inner Join</h2>
+      <p>The <code>inner-join</code> function performs an equi-join on one or more key columns. Only rows with matching keys in both tables appear in the result.</p>
+
+      <h3>Signature</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(inner-join [keys] left right)</span>
+        </div>
+        <div class="fn-desc">Join two tables on shared key columns. Returns a table with all columns from both sides (key columns appear once).</div>
+      </div>
+
+      <h3>Examples</h3>
+      <pre><code>(<span class="hl-kw">set</span> orders (<span class="hl-fn">table</span> [<span class="hl-sym">id</span> <span class="hl-sym">sym</span> <span class="hl-sym">qty</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>] [<span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span> <span class="hl-str">MSFT</span> <span class="hl-str">AAPL</span>] [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span> <span class="hl-num">150</span>])))
+
+(<span class="hl-kw">set</span> prices (<span class="hl-fn">table</span> [<span class="hl-sym">sym</span> <span class="hl-sym">price</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span> <span class="hl-str">TSLA</span>] [<span class="hl-num">150</span> <span class="hl-num">280</span> <span class="hl-num">245</span>])))
+
+<span class="hl-comment">; Join on sym &mdash; MSFT and TSLA have no match, so they are excluded</span>
+(<span class="hl-fn">inner-join</span> [<span class="hl-sym">sym</span>] orders prices)
+<span class="hl-comment">; id sym  qty price</span>
+<span class="hl-comment">; -- ---  --- -----</span>
+<span class="hl-comment">;  1 AAPL 100   150</span>
+<span class="hl-comment">;  2 GOOG 200   280</span>
+<span class="hl-comment">;  4 AAPL 150   150</span></code></pre>
+
+      <p>Join on multiple keys:</p>
+      <pre><code>(<span class="hl-kw">set</span> x (<span class="hl-fn">table</span> [<span class="hl-sym">a</span> <span class="hl-sym">b</span> <span class="hl-sym">c</span>]
+    (<span class="hl-fn">list</span> (<span class="hl-fn">take</span> (<span class="hl-fn">list</span> <span class="hl-str">"aa"</span> <span class="hl-str">"bb"</span> <span class="hl-str">"cc"</span>) <span class="hl-num">10</span>)
+          (<span class="hl-fn">take</span> [<span class="hl-str">I</span> <span class="hl-str">J</span> <span class="hl-str">K</span>] <span class="hl-num">10</span>)
+          (<span class="hl-fn">til</span> <span class="hl-num">10</span>))))
+
+(<span class="hl-kw">set</span> y (<span class="hl-fn">table</span> [<span class="hl-sym">a</span> <span class="hl-sym">b</span> <span class="hl-sym">d</span>]
+    (<span class="hl-fn">list</span> (<span class="hl-fn">take</span> (<span class="hl-fn">list</span> <span class="hl-str">"aa"</span> <span class="hl-str">"bb"</span>) <span class="hl-num">10</span>)
+          (<span class="hl-fn">take</span> [<span class="hl-str">I</span> <span class="hl-str">J</span> <span class="hl-str">K</span>] <span class="hl-num">10</span>)
+          (<span class="hl-fn">til</span> <span class="hl-num">10</span>))))
+
+<span class="hl-comment">; Join on both [a b]</span>
+(<span class="hl-fn">inner-join</span> [<span class="hl-sym">a</span> <span class="hl-sym">b</span>] x y)</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="left-join">Left Join</h2>
+      <p>The <code>left-join</code> function keeps all rows from the left table. Unmatched rows have null in the right-side columns.</p>
+
+      <h3>Signature</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(left-join [keys] left right)</span>
+        </div>
+        <div class="fn-desc">Left outer join. All left rows are preserved; unmatched right columns are null.</div>
+      </div>
+
+      <h3>Examples</h3>
+      <pre><code>(<span class="hl-fn">left-join</span> [<span class="hl-sym">sym</span>] orders prices)
+<span class="hl-comment">; id sym  qty price</span>
+<span class="hl-comment">; -- ---  --- -----</span>
+<span class="hl-comment">;  1 AAPL 100   150</span>
+<span class="hl-comment">;  2 GOOG 200   280</span>
+<span class="hl-comment">;  3 MSFT  50     0</span>  <span class="hl-comment">&larr; 0 (no MSFT in prices)</span>
+<span class="hl-comment">;  4 AAPL 150   150</span></code></pre>
+
+      <p>Left join on multiple keys:</p>
+      <pre><code>(<span class="hl-fn">left-join</span> [<span class="hl-sym">a</span> <span class="hl-sym">b</span>] x y)</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="asof-join">As-of Join</h2>
+      <p>The <code>asof-join</code> function is designed for time-series data. For each row in the left table, it finds the most recent matching row in the right table where the time column is less than or equal to the left's time value. Key columns must match exactly; the last column in the key list is the temporal column.</p>
+
+      <h3>Signature</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(asof-join [keys time-col] left right)</span>
+        </div>
+        <div class="fn-desc">As-of join for time-series alignment. The last key is the temporal column; preceding keys are exact-match. For each left row, returns the most recent right row where <code>right.time &lt;= left.time</code>.</div>
+      </div>
+
+      <h3>Examples</h3>
+      <pre><code><span class="hl-comment">; Trades and quotes for time-series alignment</span>
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span> <span class="hl-sym">Price</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-str">AAPL</span> <span class="hl-str">AAPL</span> <span class="hl-str">MSFT</span>]
+          [<span class="hl-num">10:00:01</span> <span class="hl-num">10:00:05</span> <span class="hl-num">10:00:04</span>]
+          [<span class="hl-num">190.05</span> <span class="hl-num">190.1</span> <span class="hl-num">410.25</span>])))
+
+(<span class="hl-kw">set</span> quotes (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span> <span class="hl-sym">Bid</span> <span class="hl-sym">Ask</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-str">AAPL</span> <span class="hl-str">AAPL</span> <span class="hl-str">AAPL</span> <span class="hl-str">MSFT</span>]
+          [<span class="hl-num">09:59:55</span> <span class="hl-num">10:00:03</span> <span class="hl-num">10:00:07</span> <span class="hl-num">10:00:02</span>]
+          [<span class="hl-num">189.9</span> <span class="hl-num">190</span> <span class="hl-num">190.05</span> <span class="hl-num">410.1</span>]
+          [<span class="hl-num">190.1</span> <span class="hl-num">190.2</span> <span class="hl-num">190.25</span> <span class="hl-num">410.3</span>])))
+
+<span class="hl-comment">; As-of join: for each trade, find prevailing quote</span>
+(<span class="hl-fn">asof-join</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span>] trades quotes)
+<span class="hl-comment">; Sym  Ts       Price  Bid   Ask</span>
+<span class="hl-comment">; ---  --------  ----- ----- -----</span>
+<span class="hl-comment">; AAPL 10:00:01 190.05 189.9 190.1   &larr; quote from 09:59:55</span>
+<span class="hl-comment">; AAPL 10:00:05  190.1 190   190.2   &larr; quote from 10:00:03</span>
+<span class="hl-comment">; MSFT 10:00:04 410.25 410.1 410.3   &larr; quote from 10:00:02</span></code></pre>
+
+      <h3>Large-scale Usage</h3>
+      <pre><code><span class="hl-comment">; 10 million row as-of join</span>
+(<span class="hl-kw">set</span> n <span class="hl-num">10000000</span>)
+(<span class="hl-kw">set</span> tsym (<span class="hl-fn">take</span> (<span class="hl-fn">concat</span> (<span class="hl-fn">take</span> <span class="hl-str">'AAPL</span> <span class="hl-num">99</span>) (<span class="hl-fn">take</span> <span class="hl-str">'MSFT</span> <span class="hl-num">1</span>)) n))
+(<span class="hl-kw">set</span> ttime (<span class="hl-fn">+</span> <span class="hl-num">09:00:00</span> (<span class="hl-fn">as</span> <span class="hl-str">'TIME</span> (<span class="hl-fn">/</span> (<span class="hl-fn">*</span> (<span class="hl-fn">til</span> n) <span class="hl-num">3</span>) <span class="hl-num">10</span>))))
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span> <span class="hl-sym">Price</span>] (<span class="hl-fn">list</span> tsym ttime (<span class="hl-fn">+</span> <span class="hl-num">10</span> (<span class="hl-fn">til</span> n)))))
+<span class="hl-comment">; ... build quotes similarly ...</span>
+(<span class="hl-fn">asof-join</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span>] trades quotes)</code></pre>
+
+      <h3>Null-key semantics</h3>
+      <p>As-of-join treats <strong>NULL keys as never matching</strong>:</p>
+      <ul>
+        <li>A left row with a null in any equality key or in the time column is kept in the output (left-outer behaviour) but the right-side columns are explicitly null.</li>
+        <li>A right row with a null in any equality key or time column is skipped entirely during the merge walk — it cannot become the best match for any left row.</li>
+        <li>Right-side columns for unmatched rows are filled with null (null bit set on the destination vector), distinguishable from genuine zero values via <code>(nil? x)</code>.</li>
+      </ul>
+      <p>This means a null time in the left table is never silently treated as time zero, and two null sym keys on opposite sides do not merge into a spurious match.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="window-join">Window Join</h2>
+      <p>The <code>window-join</code> function extends the as-of join with a time window. For each left row, it finds all right rows within a time interval and applies aggregation functions to the matched rows.</p>
+
+      <h3>Signature</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(window-join [keys time-col] intervals left right {col: (agg expr) ...})</span>
+        </div>
+        <div class="fn-desc">Window join with per-row time intervals. <code>intervals</code> is a list of two vectors <code>[lo hi]</code> defining the time window for each left row. Aggregation functions are applied to all right rows falling within each window.</div>
+      </div>
+
+      <h3>Examples</h3>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Time</span> <span class="hl-sym">Price</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span>]
+          [<span class="hl-num">12:00:01</span> <span class="hl-num">12:00:04</span> <span class="hl-num">12:00:06</span>]
+          [<span class="hl-num">89.17</span> <span class="hl-num">70.5</span> <span class="hl-num">80.54</span>])))
+
+(<span class="hl-kw">set</span> quotes (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Time</span> <span class="hl-sym">Size</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span>]
+          [<span class="hl-num">12:00:00</span> <span class="hl-num">12:00:01</span> <span class="hl-num">12:00:02</span> <span class="hl-num">12:00:03</span> <span class="hl-num">12:00:04</span>
+           <span class="hl-num">12:00:05</span> <span class="hl-num">12:00:06</span> <span class="hl-num">12:00:07</span> <span class="hl-num">12:00:08</span> <span class="hl-num">12:00:09</span>]
+          [<span class="hl-num">928</span> <span class="hl-num">528</span> <span class="hl-num">648</span> <span class="hl-num">914</span> <span class="hl-num">918</span> <span class="hl-num">626</span> <span class="hl-num">577</span> <span class="hl-num">817</span> <span class="hl-num">620</span> <span class="hl-num">698</span>])))
+
+<span class="hl-comment">; Build per-row intervals: [lo, hi] for each trade</span>
+(<span class="hl-kw">set</span> intervals (<span class="hl-fn">map-left</span> <span class="hl-fn">+</span> [<span class="hl-num">-1000</span> <span class="hl-num">1000</span>] (<span class="hl-fn">at</span> trades <span class="hl-str">'Time</span>)))
+
+<span class="hl-comment">; Window join: min bid and max ask within each window</span>
+(<span class="hl-fn">window-join</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Time</span>] intervals trades quotes
+    {<span class="hl-sym">size_min:</span> (<span class="hl-fn">min</span> Size) <span class="hl-sym">size_max:</span> (<span class="hl-fn">max</span> Size)})</code></pre>
+
+      <h3>Large-scale Window Join</h3>
+      <pre><code>(<span class="hl-kw">set</span> n <span class="hl-num">100000</span>)
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span> <span class="hl-sym">Price</span>]
+    (<span class="hl-fn">list</span> tsym ttime (<span class="hl-fn">+</span> <span class="hl-num">10</span> (<span class="hl-fn">til</span> n)))))
+(<span class="hl-kw">set</span> quotes (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span> <span class="hl-sym">Bid</span> <span class="hl-sym">Ask</span>]
+    (<span class="hl-fn">list</span> bsym btime bid ask)))
+
+<span class="hl-comment">; Build intervals from the trades timestamp</span>
+(<span class="hl-kw">set</span> intervals (<span class="hl-fn">map-left</span> <span class="hl-fn">+</span> [<span class="hl-num">-1000</span> <span class="hl-num">1000</span>] (<span class="hl-fn">at</span> trades <span class="hl-str">'Ts</span>)))
+
+(<span class="hl-fn">window-join</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span>] intervals trades quotes
+    {<span class="hl-sym">bid:</span> (<span class="hl-fn">min</span> Bid) <span class="hl-sym">ask:</span> (<span class="hl-fn">max</span> Ask)})</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="dag-execution">How Joins Compile to the DAG</h2>
+      <p>All join operations compile to the Rayforce execution DAG. The optimizer and executor handle the details:</p>
+
+      <ol>
+        <li><strong>DAG construction</strong> &mdash; <code>inner-join</code> and <code>left-join</code> emit <code>OP_JOIN</code> nodes with join type flags. <code>asof-join</code> emits <code>OP_ASOF_JOIN</code>. <code>window-join</code> emits <code>OP_WINDOW_JOIN</code>.</li>
+        <li><strong>Optimizer</strong> &mdash; Predicate pushdown moves filters before the join when possible. Type inference propagates column types through join boundaries. SIP (Sideways Information Passing) can prune the build side using selection bitmaps.</li>
+        <li><strong>Execution</strong> &mdash; Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. As-of and window joins use sorted merge with binary search on the temporal column.</li>
+      </ol>
+
+      <div class="info-box">
+        <strong>Performance note.</strong> For large joins, ensure key columns use efficient types. Symbol columns (<code>RAY_SYM</code>) are dictionary-encoded integers and join fastest. String columns (<code>RAY_STR</code>) work but require hash comparison of variable-length data.
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="reference">Quick Reference</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Syntax</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>inner-join</code></td>
+            <td><code>(inner-join [keys] left right)</code></td>
+            <td>Equi-join; only matching rows</td>
+          </tr>
+          <tr>
+            <td><code>left-join</code></td>
+            <td><code>(left-join [keys] left right)</code></td>
+            <td>Left outer join; all left rows preserved</td>
+          </tr>
+          <tr>
+            <td><code>asof-join</code></td>
+            <td><code>(asof-join [keys time-col] left right)</code></td>
+            <td>Time-series alignment; most recent match</td>
+          </tr>
+          <tr>
+            <td><code>window-join</code></td>
+            <td><code>(window-join [keys tc] intervals left right {aggs})</code></td>
+            <td>Window aggregation over time intervals</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="queries-select.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Select, Update, Insert &amp; Upsert</span></a>
+        <a href="queries-links.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Linked Columns</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

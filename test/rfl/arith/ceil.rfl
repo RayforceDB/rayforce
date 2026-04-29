@@ -1,0 +1,32 @@
+;; Invariants for `ceil`.
+
+;; ceil(x) >= x
+(set A (div (- (rand 256 10000) 5000) 100))
+(count A) -- (sum (>= (ceil A) A))
+
+;; ceil(x) - x is in [0, 1)
+(set D (- (ceil A) A))
+(count A) -- (sum (and (>= D 0.0) (< D 1.0)))
+
+;; idempotent
+(count A) -- (sum (== (ceil (ceil A)) (ceil A)))
+
+;; concrete
+(ceil 3.2)  -- 4.0
+(ceil 3.0)  -- 3.0
+(ceil -3.7) -- -3.0
+
+;; ──────────────────────────────────────────────────────────────────
+;; Integer input — identity
+;; ──────────────────────────────────────────────────────────────────
+
+(ceil 5)  -- 5
+(ceil 5h) -- 5
+(ceil 5i) -- 5
+
+;; vec — float input, float result
+(ceil [1.2 2.8 -0.5 -1.5]) -- [2.0 3.0 0.0 -1.0]
+
+;; metamorphic vs floor:  ceil(x) == -floor(-x)
+(ceil 1.5)  -- (neg (floor (neg 1.5)))
+(ceil -0.5) -- (neg (floor (neg -0.5)))

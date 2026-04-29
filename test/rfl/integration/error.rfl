@@ -1,0 +1,8 @@
+;; Ported from test_lang_rf.inc::test_rf_error.
+
+;; ========== TRY WITH SUCCESS ==========
+(try (+ 1 2) (fn [e] 0)) -- 3
+;; ========== TRY WITH ERROR ==========
+(try (raise "error") (fn [e] 99)) -- 99
+;; ========== NESTED TRY ==========
+(try (try (raise "inner") (fn [e] (raise "outer"))) (fn [e] 42)) -- 42

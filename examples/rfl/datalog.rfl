@@ -1,0 +1,97 @@
+; Datalog Example
+; Demonstrates: datoms, assert-fact, retract-fact, rules, queries,
+; negation, fixpoint (transitive closure), pull, sym-name,
+; constant values, and wildcard patterns
+
+; ── 1. EAV storage ──────────────────────────────────────
+(set db (datoms))
+(set db (assert-fact db 1 'name 'Alice))
+(set db (assert-fact db 1 'dept 'Engineering))
+(set db (assert-fact db 1 'salary 80000))
+(set db (assert-fact db 2 'name 'Bob))
+(set db (assert-fact db 2 'dept 'Sales))
+(set db (assert-fact db 2 'salary 60000))
+(set db (assert-fact db 3 'name 'Charlie))
+(set db (assert-fact db 3 'dept 'Engineering))
+(set db (assert-fact db 3 'salary 90000))
+
+; ── 2. Simple query ─────────────────────────────────────
+(println "--- All names ---")
+(set r (query db (find ?e ?n) (where (?e :name ?n))))
+(show r)
+
+; ── 3. Join query ───────────────────────────────────────
+(println "--- Name + Department ---")
+(set r (query db (find ?n ?d) (where (?e :name ?n) (?e :dept ?d))))
+(show r)
+
+; ── 4. Constant value pattern ───────────────────────────
+(println "--- Engineers only (constant pattern) ---")
+(set r (query db (find ?e ?n) (where (?e :name ?n) (?e :dept 'Engineering))))
+(show r)
+
+; ── 5. Wildcard pattern ─────────────────────────────────
+(println "--- Entities with any dept (wildcard _) ---")
+(set r (query db (find ?e) (where (?e :dept _))))
+(show r)
+
+; ── 6. Rule: define "employee" relation ─────────────────
+(rule (employee ?e ?n ?d)
+  (?e :name ?n)
+  (?e :dept ?d))
+
+(println "--- Employees (via rule) ---")
+(set r (query db (find ?n ?d) (where (employee ?e ?n ?d))))
+(show r)
+
+; ── 7. Negation ─────────────────────────────────────────
+(set db (assert-fact db 1 'manager 'true))
+(set db (assert-fact db 3 'manager 'true))
+
+(println "--- Non-managers (negation) ---")
+(set r (query db (find ?e ?n) (where (?e :name ?n) (not (?e :manager ?m)))))
+(show r)
+
+; ── 8. Transitive closure (recursive rules + fixpoint) ──
+(set gdb (datoms))
+(set gdb (assert-fact gdb 1 'edge 2))
+(set gdb (assert-fact gdb 2 'edge 3))
+(set gdb (assert-fact gdb 3 'edge 4))
+
+(rule (reachable ?x ?y) (?x :edge ?y))
+(rule (reachable ?x ?z) (?x :edge ?y) (reachable ?y ?z))
+
+(println "--- Reachable pairs (transitive closure) ---")
+(set r (query gdb (find ?x ?y) (where (reachable ?x ?y))))
+(show r)
+
+; ── 9. Pull queries ─────────────────────────────────────
+(println "--- Pull entity 1 (all attributes) ---")
+(println (pull db 1))
+
+(println "--- Pull entity 2 (name + salary only) ---")
+(println (pull db 2 [name salary]))
+
+; ── 10. sym-name: readable output ───────────────────────
+(println "--- sym-name: convert intern IDs ---")
+(set p (pull db 1))
+(set name-id (get p 1))
+(println name-id)
+(println (sym-name name-id))
+
+; ── 11. retract-fact ────────────────────────────────────
+(println "--- Before retract ---")
+(set r (query db (find ?e ?n) (where (?e :name ?n))))
+(show r)
+
+(set db (retract-fact db 2 'name 'Bob))
+(println "--- After retract (Bob removed) ---")
+(set r (query db (find ?e ?n) (where (?e :name ?n))))
+(show r)
+
+; ── 12. Scan-eav: low-level attribute lookup ────────────
+(println "--- All salaries (scan-eav) ---")
+(show (scan-eav db 'salary))
+
+(println "--- Entity 3 salary ---")
+(println (scan-eav db 3 'salary))

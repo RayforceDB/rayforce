@@ -1,0 +1,22 @@
+;; Invariants for `raze` — flatten one level.
+
+(raze (list [1 2] [3 4] [5])) -- [1 2 3 4 5]
+(raze (list [])) -- []
+
+;; total count equals sum of inner counts
+(set A [1 2 3])
+(set B [4 5])
+(set C [6 7 8 9])
+(count (raze (list A B C))) -- (+ (count A) (+ (count B) (count C)))
+
+;; ---- Regression tests ported from test_lang_rf.inc::test_rf_raze ----
+;; Ported from test_lang_rf.inc::test_rf_raze.
+
+(raze (list [1 2] [3 4])) -- [1 2 3 4]
+(raze (list [1 2] [3.0 4.0])) -- (list 1 2 3.0 4.0)
+(raze (list [1 2] (list 3 4))) -- [1 2 3 4]
+(raze (list (list 1 2) (list 3 4))) -- [1 2 3 4]
+(raze (list (list 1 2) (list 3.0 4))) -- (list 1 2 3.0 4)
+(raze (list)) -- ()
+(raze (list [1 2 3])) -- [1 2 3]
+(raze 42) -- 42

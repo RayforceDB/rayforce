@@ -1,0 +1,67 @@
+;; Ported from test_lang_rf.inc::test_rf_literals.
+
+;; Test basic character literals
+'a' -- 'a'
+'z' -- 'z'
+'0' -- '0'
+'9' -- '9'
+;; Test standard escape sequences in character literals
+'\n' -- '\n'
+'\r' -- '\r'
+'\t' -- '\t'
+'\\' -- '\\'
+'\'' -- '\''
+;; Test octal escape sequences in character literals
+'\001' -- '\001'
+;; SOH (Start of Heading);
+'\002' -- '\002'
+;; STX (Start of Text);
+'\003' -- '\003'
+;; ETX (End of Text);
+'\007' -- '\007'
+;; BEL (Bell);
+'\010' -- '\010'
+;; BS (Backspace);
+'\011' -- '\011'
+;; HT (Horizontal Tab) - same as '\t'
+'\012' -- '\012'
+;; LF (Line Feed) - same as '\n'
+'\015' -- '\015'
+;; CR (Carriage Return) - same as '\r'
+'\032' -- '\032'
+;; SUB (Substitute);
+;; Test empty quoted symbol (single quote)
+' -- 0Ns
+;; Empty quoted symbol should be parsed as a null symbol
+;; Test basic string literals
+"Hello, World!" -- "Hello, World!"
+"" -- ""
+;; Empty string
+"123" -- "123"
+;; Test standard escape sequences in string literals
+"Hello\nWorld" -- "Hello\nWorld"
+"Hello\rWorld" -- "Hello\rWorld"
+"Hello\tWorld" -- "Hello\tWorld"
+"Hello\\World" -- "Hello\\World"
+"Hello\"World" -- "Hello\"World"
+;; Test octal escape sequences in string literals
+"Hello\001World" -- "Hello\001World"
+;; SOH
+"Hello\002World" -- "Hello\002World"
+;; STX
+"Hello\003World" -- "Hello\003World"
+;; ETX
+"Hello\007World" -- "Hello\007World"
+;; BEL
+"Hello\010World" -- "Hello\010World"
+;; BS
+"Hello\011World" -- "Hello\011World"
+;; HT
+"Hello\012World" -- "Hello\012World"
+;; LF
+"Hello\015World" -- "Hello\015World"
+;; CR
+;; Test FIX protocol message with octal escapes
+"8=FIX.4.2\0019=006035=A49=CL156=TR34=152=20" -- "8=FIX.4.2\0019=006035=A49=CL156=TR34=152=20"
+;; Test mixed escape sequences
+"Mixed\001\n\t\015Escapes" -- "Mixed\001\n\t\015Escapes"

@@ -1,0 +1,27 @@
+;; Invariants for `meta` — describes any object as a {type, len?} dict.
+;; Atoms get only :type; containers (vectors, tables, dicts) also expose
+;; :len.  For tables, :len is the column count (not the row count).
+
+;; ────────────── tables ──────────────
+(set T (table [a b c] (list [1 2] [1.0 2.0] ['x 'y])))
+(type (meta T)) -- 'DICT
+(at (meta T) 'type) -- 'TABLE
+(at (meta T) 'len) -- 3
+
+;; ────────────── atoms — :type only, no :len ──────────────
+(at (meta 42) 'type)         -- 'i64
+(at (meta 3.14) 'type)       -- 'f64
+(at (meta "x") 'type)        -- 'str
+(at (meta 'foo) 'type)       -- 'sym
+(at (meta true) 'type)       -- 'b8
+(at (meta 2024.01.15) 'type) -- 'date
+
+;; ────────────── vectors — :type + :len ──────────────
+(at (meta [1 2 3]) 'type)    -- 'I64
+(at (meta [1 2 3]) 'len)     -- 3
+(at (meta [1.0 2.0]) 'type)  -- 'F64
+(at (meta ["a" "b"]) 'type)  -- 'STR
+(at (meta ['a 'b]) 'type)    -- 'SYM
+
+;; ────────────── dict ──────────────
+(at (meta (dict ['x 'y 'z] [1 2 3])) 'type) -- 'DICT

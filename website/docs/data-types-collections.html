@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Collections — Rayforce Documentation</title>
+  <meta name="description" content="Vectors, lists, tables, dictionaries, and selection bitmaps in Rayforce. Morsel iteration, COW semantics, null handling, and partitioned storage.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link active">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Collections</span>
+      </div>
+
+      <h1>Collections</h1>
+      <p class="page-subtitle">Vectors, lists, tables, dictionaries, and selection bitmaps &mdash; the compound data structures that organize scalar values into queryable datasets.</p>
+
+      <h2 id="vectors">Vectors</h2>
+      <p>Vectors are the fundamental columnar data structure in Rayforce. A vector is a typed, contiguous array of scalar elements &mdash; every element shares the same type. Vectors are the columns inside tables and the operands in every DAG operation.</p>
+
+      <pre><code><span class="hl-comment">; I64 vector (integer literals)</span>
+<span class="hl-comment">ray&gt;</span> [<span class="hl-num">1 2 3 4 5</span>]
+[1 2 3 4 5]
+
+<span class="hl-comment">; F64 vector (float literals)</span>
+<span class="hl-comment">ray&gt;</span> [<span class="hl-num">1.0 2.5 3.14</span>]
+[1.0 2.5 3.14]
+
+<span class="hl-comment">; SYM vector (unquoted identifiers)</span>
+<span class="hl-comment">ray&gt;</span> [<span class="hl-sym">AAPL GOOG MSFT</span>]
+[AAPL GOOG MSFT]
+
+<span class="hl-comment">; BOOL vector</span>
+<span class="hl-comment">ray&gt;</span> [<span class="hl-bool">true false true</span>]
+[true false true]</code></pre>
+
+      <h3 id="morsel-iteration">Morsel Iteration</h3>
+      <p>All vector processing in Rayforce happens in <strong>morsels</strong> &mdash; fixed-size chunks of 1024 elements. The executor never processes an entire column at once. Instead, it iterates morsel by morsel, which keeps data in L1/L2 cache and enables pipeline parallelism.</p>
+
+      <pre><code><span class="hl-comment">// C API: morsel iteration</span>
+<span class="hl-type">ray_morsel_t</span> m;
+<span class="hl-fn">ray_morsel_init</span>(&m, vec);
+
+<span class="hl-kw">while</span> (<span class="hl-fn">ray_morsel_next</span>(&m)) {
+    <span class="hl-comment">// m.base   — pointer to element data for this morsel</span>
+    <span class="hl-comment">// m.count  — number of elements (up to 1024)</span>
+    <span class="hl-comment">// m.selection — RAY_SEL bitmap (NULL = all pass)</span>
+    <span class="hl-fn">process_morsel</span>(&m);
+}</code></pre>
+
+      <div class="info-box">
+        <strong>Why 1024?</strong> A morsel of 1024 int64 elements is 8 KB &mdash; fits comfortably in L1 cache on modern CPUs. This size was chosen to balance cache utilization against morsel scheduling overhead.
+      </div>
+
+      <h3 id="null-handling">Null Handling</h3>
+      <p>Nulls are tracked via a per-vector bitmap, not sentinel values in the data array. This means operations can use fast SIMD loops on the data and only check the null bitmap when needed.</p>
+
+      <pre><code><span class="hl-comment">// C API: null bitmap</span>
+<span class="hl-fn">ray_vec_set_null</span>(vec, <span class="hl-num">3</span>, <span class="hl-bool">true</span>);   <span class="hl-comment">// mark index 3 as null</span>
+<span class="hl-fn">ray_vec_is_null</span>(vec, <span class="hl-num">3</span>);           <span class="hl-comment">// returns true</span>
+<span class="hl-fn">ray_vec_is_null</span>(vec, <span class="hl-num">0</span>);           <span class="hl-comment">// returns false</span></code></pre>
+
+      <p>The bitmap is stored inline in the first 16 bytes of the <code>ray_t</code> header for vectors with up to 128 elements. Larger vectors use an external bitmap allocation (flagged with <code>RAY_ATTR_NULLMAP_EXT</code>). The <code>RAY_ATTR_HAS_NULLS</code> flag on the vector indicates whether any nulls exist at all &mdash; when clear, the bitmap is never checked.</p>
+
+      <h3 id="cow-semantics">COW Semantics</h3>
+      <p>Vectors use copy-on-write (COW) reference counting. Multiple consumers can share the same vector via <code>ray_retain()</code>. Mutation goes through <code>ray_cow()</code>, which returns the same pointer if the reference count is 1, or a fresh copy if shared.</p>
+
+      <pre><code><span class="hl-comment">// C API: COW pattern</span>
+<span class="hl-fn">ray_retain</span>(vec);           <span class="hl-comment">// rc: 1 → 2 (shared)</span>
+
+<span class="hl-type">ray_t</span>* writable = <span class="hl-fn">ray_cow</span>(vec);
+<span class="hl-kw">if</span> (writable != vec) {
+    <span class="hl-comment">// Got a fresh copy — vec is still shared</span>
+    <span class="hl-comment">// Must release writable on error paths</span>
+}
+<span class="hl-comment">// Safe to mutate writable</span></code></pre>
+
+      <h3 id="vector-operations">Vector Operations</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>C Function</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ray_vec_new(type, cap)</code></td><td>Allocate an empty vector with capacity</td></tr>
+          <tr><td><code>ray_vec_append(vec, elem)</code></td><td>Append one element (may reallocate)</td></tr>
+          <tr><td><code>ray_vec_set(vec, idx, elem)</code></td><td>Set element at index</td></tr>
+          <tr><td><code>ray_vec_get(vec, idx)</code></td><td>Get pointer to element at index</td></tr>
+          <tr><td><code>ray_vec_slice(vec, off, len)</code></td><td>Zero-copy slice (shares data)</td></tr>
+          <tr><td><code>ray_vec_concat(a, b)</code></td><td>Concatenate two vectors</td></tr>
+          <tr><td><code>ray_vec_from_raw(type, data, n)</code></td><td>Create from existing data array</td></tr>
+          <tr><td><code>ray_str_vec_append(vec, s, len)</code></td><td>Append a string to RAY_STR vector</td></tr>
+          <tr><td><code>ray_str_vec_get(vec, idx, &len)</code></td><td>Get string at index</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="lists">Lists</h2>
+      <p>Lists are boxed, heterogeneous containers. Each element is a <code>ray_t*</code> pointer to any Rayforce object. Lists are the backbone of table column storage: a table's columns are held in a list.</p>
+
+      <pre><code><span class="hl-comment">; Create a list of mixed vectors</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">list</span> [<span class="hl-num">1 2 3</span>] [<span class="hl-sym">A B C</span>])
+([1 2 3] [A B C])
+
+<span class="hl-comment">; Lists can hold any type</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">list</span> <span class="hl-num">42</span> <span class="hl-str">"hello"</span> [<span class="hl-num">1 2</span>])
+(42 "hello" [1 2])</code></pre>
+
+      <pre><code><span class="hl-comment">// C API: list operations</span>
+<span class="hl-type">ray_t</span>* lst = <span class="hl-fn">ray_list_new</span>(<span class="hl-num">4</span>);          <span class="hl-comment">// initial capacity 4</span>
+lst = <span class="hl-fn">ray_list_append</span>(lst, vec1);      <span class="hl-comment">// append element</span>
+lst = <span class="hl-fn">ray_list_append</span>(lst, vec2);
+<span class="hl-type">ray_t</span>* item = <span class="hl-fn">ray_list_get</span>(lst, <span class="hl-num">0</span>);    <span class="hl-comment">// get by index</span>
+lst = <span class="hl-fn">ray_list_set</span>(lst, <span class="hl-num">0</span>, new_item);  <span class="hl-comment">// replace at index</span></code></pre>
+
+      <p>Lists have <code>type = RAY_LIST</code> (0) and store pointers in their <code>data[]</code> array. The <code>len</code> field tracks the number of elements.</p>
+
+      <h2 id="tables">Tables</h2>
+      <p>A table is a collection of named column vectors, all the same length. Tables are the primary data structure for analytical queries &mdash; the target of <code>select</code>, <code>update</code>, joins, and aggregations.</p>
+
+      <pre><code><span class="hl-comment">; Create a table with column names and data</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-kw">set</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">sym price qty</span>] (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL GOOG MSFT</span>] [<span class="hl-num">150.0 140.0 380.0</span>] [<span class="hl-num">100 200 50</span>])))
+sym  price  qty
+-----------------
+AAPL 150.0  100
+GOOG 140.0  200
+MSFT 380.0   50
+
+<span class="hl-comment">; Query with select</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>t <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> price <span class="hl-num">145.0</span>)})
+sym  price  qty
+-----------------
+AAPL 150.0  100
+MSFT 380.0   50</code></pre>
+
+      <h3>Internal Structure</h3>
+      <p>A table is a <code>ray_t</code> with <code>type = RAY_TABLE</code> (98). Internally it contains:</p>
+      <ul>
+        <li><strong>Schema</strong> &mdash; an I64 vector of symbol IDs, one per column name</li>
+        <li><strong>Columns</strong> &mdash; a list of typed vectors, one per column</li>
+      </ul>
+
+      <pre><code><span class="hl-comment">// C API: table construction</span>
+<span class="hl-type">ray_t</span>* tbl = <span class="hl-fn">ray_table_new</span>(<span class="hl-num">3</span>);               <span class="hl-comment">// 3 columns</span>
+<span class="hl-fn">ray_table_add_col</span>(tbl, sym_id, col_vec);      <span class="hl-comment">// add named column</span>
+
+<span class="hl-comment">// Access</span>
+<span class="hl-type">ray_t</span>* col = <span class="hl-fn">ray_table_get_col</span>(tbl, sym_id); <span class="hl-comment">// by name (symbol ID)</span>
+<span class="hl-type">ray_t</span>* col = <span class="hl-fn">ray_table_get_col_idx</span>(tbl, <span class="hl-num">0</span>);  <span class="hl-comment">// by position</span>
+<span class="hl-type">int64_t</span> nr = <span class="hl-fn">ray_table_nrows</span>(tbl);           <span class="hl-comment">// row count</span>
+<span class="hl-type">int64_t</span> nc = <span class="hl-fn">ray_table_ncols</span>(tbl);           <span class="hl-comment">// column count</span>
+<span class="hl-type">ray_t</span>* sch = <span class="hl-fn">ray_table_schema</span>(tbl);          <span class="hl-comment">// I64 vec of col name IDs</span></code></pre>
+
+      <h3>Column Name Management</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>C Function</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ray_table_col_name(tbl, idx)</code></td><td>Get symbol ID of column at index</td></tr>
+          <tr><td><code>ray_table_set_col_name(tbl, idx, id)</code></td><td>Rename column at index</td></tr>
+          <tr><td><code>ray_table_schema(tbl)</code></td><td>Get the full schema as an I64 vector</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="dictionaries">Dictionaries</h2>
+      <p>Dictionaries share the same physical layout as tables — a 2-pointer block (<code>type = RAY_DICT</code>, <code>len = 2</code>) holding a <em>keys</em> container and a <em>vals</em> container.  Pair count is <code>keys-&gt;len</code>; the helpers <code>ray_dict_keys</code> / <code>ray_dict_vals</code> / <code>ray_dict_len</code> / <code>ray_dict_get</code> / <code>ray_dict_upsert</code> / <code>ray_dict_remove</code> wrap the layout.</p>
+
+      <p>Supported <em>keys</em> shapes:</p>
+      <ul>
+        <li>A typed vector — any of <code>RAY_SYM</code>, <code>RAY_BOOL</code>, <code>RAY_U8</code>, <code>RAY_I16</code>, <code>RAY_I32</code>, <code>RAY_I64</code>, <code>RAY_F32</code>, <code>RAY_F64</code>, <code>RAY_DATE</code>, <code>RAY_TIME</code>, <code>RAY_TIMESTAMP</code>, <code>RAY_STR</code>, <code>RAY_GUID</code>.  Lookup is value-equality; the keys' null bitmap is honored so <code>0Nl</code> doesn't collide with a real <code>0</code>.</li>
+        <li>A <code>RAY_LIST</code> of boxed atoms — used for heterogeneous keys (the only shape that can hold both <code>'sym</code> and <code>"str"</code> keys in the same dict).  Lookup falls back to <code>atom_eq</code>.</li>
+      </ul>
+
+      <p>Supported <em>vals</em> shapes:</p>
+      <ul>
+        <li>A typed vector when every value shares one atom type (the form <code>group</code> emits — its index columns happen to all be <code>RAY_I64</code> vectors held inside a <code>RAY_LIST</code>; see below).</li>
+        <li>A <code>RAY_LIST</code> when values are heterogeneous, are themselves containers (vectors / dicts / tables / functions), or need to stay unevaluated.  Dict literals always use this shape because the parser leaves expression values unevaluated until probed.</li>
+      </ul>
+
+      <p>The <code>{…}</code> literal is the convenient surface but is narrower than the API.  The parser only emits two key shapes:</p>
+      <ul>
+        <li>Bareword keys → <code>RAY_SYM</code> vec.  Identifier characters (letters, digits, <code>_</code>, <code>-</code>) are <em>all</em> interned as symbols — so <code>{1: "a"}</code> looks like an integer-keyed dict but actually stores the symbol named <code>"1"</code>, and <code>(at d 1)</code> with an <code>i64</code> atom will <em>miss</em>.</li>
+        <li>Quoted-string keys → <code>RAY_STR</code> vec.  A mix of bareword and quoted keys in the same literal falls back to a <code>RAY_LIST</code> of boxed atoms.</li>
+      </ul>
+      <p>To build a dict whose keys are real <code>RAY_I64</code> / <code>RAY_GUID</code> / temporal values — i.e. ones a numeric or temporal lookup atom will actually match — use <code>(dict keys vals)</code> with an explicitly typed keys vector or call <code>ray_dict_new</code> from C.</p>
+
+      <pre><code><span class="hl-comment">; Dictionary literal (curly braces)</span>
+<span class="hl-comment">ray&gt;</span> {<span class="hl-sym">name:</span> <span class="hl-str">"Alice"</span> <span class="hl-sym">age:</span> <span class="hl-num">30</span> <span class="hl-sym">active:</span> <span class="hl-bool">true</span>}
+{name: "Alice" age: 30 active: true}
+
+<span class="hl-comment">; Access by key</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-kw">set</span> d {<span class="hl-sym">x:</span> <span class="hl-num">10</span> <span class="hl-sym">y:</span> <span class="hl-num">20</span>})
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">get</span> d <span class="hl-sym">'x</span>)
+10</code></pre>
+
+      <p>Dictionaries are used extensively in Rayfall for passing named arguments to query forms like <code>select</code> and <code>update</code>:</p>
+
+      <pre><code><span class="hl-comment">; The select argument is a dictionary</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>t <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> x <span class="hl-num">1</span>) <span class="hl-sym">cols:</span> {<span class="hl-sym">x:</span>x <span class="hl-sym">x2:</span> (<span class="hl-fn">*</span> x x)}})</code></pre>
+
+      <h2 id="selections">Selection Bitmaps (RAY_SEL)</h2>
+      <p>A selection bitmap is a lazy filter representation used internally by the query optimizer and executor. Instead of materializing filtered rows into a new vector, Rayforce tracks which rows pass the filter as a compact bitmap.</p>
+
+      <h3>Segment Flags</h3>
+      <p>Selections are organized in segments matching the morsel size (1024 elements). Each segment carries a flag that enables fast short-circuiting:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Flag</th>
+            <th>Constant</th>
+            <th>Meaning</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>NONE</strong></td>
+            <td><code>RAY_SEL_NONE</code> (0)</td>
+            <td>All bits zero &mdash; skip entire morsel, no rows pass</td>
+          </tr>
+          <tr>
+            <td><strong>ALL</strong></td>
+            <td><code>RAY_SEL_ALL</code> (1)</td>
+            <td>All bits one &mdash; process without checking bitmap</td>
+          </tr>
+          <tr>
+            <td><strong>MIX</strong></td>
+            <td><code>RAY_SEL_MIX</code> (2)</td>
+            <td>Mixed bits &mdash; must check bitmap per row</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="info-box">
+        <strong>Why lazy?</strong> Selection bitmaps avoid materializing intermediate results during predicate evaluation. The optimizer can push selections backward through <code>OP_EXPAND</code> chains (sideways information passing) and compose multiple predicates by ANDing bitmaps &mdash; all without copying data.
+      </div>
+
+      <h3>Block Layout</h3>
+      <p>A <code>RAY_SEL</code> object has <code>type = 14</code> and a variable-size layout in its <code>data[]</code> region:</p>
+      <ul>
+        <li><strong>Segment flags</strong> &mdash; one <code>uint8_t</code> per morsel (NONE/ALL/MIX)</li>
+        <li><strong>Segment popcounts</strong> &mdash; one <code>int32_t</code> per morsel (number of set bits)</li>
+        <li><strong>Bit arrays</strong> &mdash; 16 <code>uint64_t</code> words per morsel (1024 bits)</li>
+      </ul>
+
+      <pre><code><span class="hl-comment">// C API: bitmap manipulation</span>
+<span class="hl-fn">RAY_SEL_BIT_TEST</span>(bits, row);   <span class="hl-comment">// test if row passes</span>
+<span class="hl-fn">RAY_SEL_BIT_SET</span>(bits, row);    <span class="hl-comment">// mark row as passing</span>
+<span class="hl-fn">RAY_SEL_BIT_CLR</span>(bits, row);    <span class="hl-comment">// mark row as filtered</span>
+
+<span class="hl-comment">// Convert a BOOL vector to a selection bitmap</span>
+<span class="hl-type">ray_t</span>* sel = <span class="hl-fn">ray_sel_from_pred</span>(bool_vec);</code></pre>
+
+      <h2 id="parted-types">Partitioned Columns</h2>
+      <p>Partitioned tables split data across multiple segments (typically by date). Each column in a partitioned table uses a <strong>parted type</strong> that wraps multiple memory-mapped vector segments into a single logical column.</p>
+
+      <h3>Type Encoding</h3>
+      <p>Parted types are encoded as <code>RAY_PARTED_BASE + base_type</code>. For example, a partitioned I64 column has type <code>32 + 5 = 37</code>. The base type is recovered with <code>RAY_PARTED_BASETYPE(t)</code>.</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Constant</th>
+            <th>Value</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>RAY_PARTED_BASE</code></td><td>32</td><td>Base offset for parted types</td></tr>
+          <tr><td><code>RAY_MAPCOMMON</code></td><td>64</td><td>Virtual partition column (e.g., date)</td></tr>
+        </tbody>
+      </table>
+
+      <h3>MAPCOMMON</h3>
+      <p>When loading a date-partitioned table, Rayforce creates a virtual <code>RAY_MAPCOMMON</code> column. This column does not store actual data &mdash; it derives values from the partition directory names (e.g., <code>2024.01.15/</code>). Each row in a partition shares the same date value, so the MAPCOMMON column can represent millions of rows with zero per-row storage.</p>
+
+      <pre><code><span class="hl-comment">// C API: load a date-partitioned table</span>
+<span class="hl-type">ray_t</span>* trades = <span class="hl-fn">ray_part_load</span>(<span class="hl-str">"db"</span>, <span class="hl-str">"trades"</span>);
+
+<span class="hl-comment">// The 'date' column is MAPCOMMON — derived from directory names</span>
+<span class="hl-comment">// Queries that filter on date trigger partition pruning</span></code></pre>
+
+      <div class="info-box">
+        <strong>Partition pruning:</strong> The optimizer recognizes filters on MAPCOMMON columns and eliminates entire partitions from the scan &mdash; skipping their memory-mapped segments entirely. A query filtering on a single date in a year of data reads only 1/365th of the files.
+      </div>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="data-types.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Scalar Data Types</span></a>
+        <a href="queries-select.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Select, Update, Insert &amp; Upsert</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

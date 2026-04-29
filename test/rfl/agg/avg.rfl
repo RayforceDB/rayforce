@@ -1,0 +1,13 @@
+;; Invariants for `avg`.
+
+(avg [10 20 30]) -- 20.0
+(avg [1 1 1 1 1]) -- 1.0
+
+;; bounded: min <= avg <= max
+(set V (rand 100 1000))
+1 -- (as 'I64 (<= (min V) (avg V)))
+1 -- (as 'I64 (<= (avg V) (max V)))
+
+;; constant vector: avg == that constant
+(set K 42)
+(avg (take (enlist K) 50)) -- 42.0

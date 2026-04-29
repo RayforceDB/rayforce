@@ -1,0 +1,10 @@
+;; Invariants for `stddev_pop` (population std-dev).
+
+(stddev_pop [5 5 5 5 5]) -- 0.0
+
+;; non-negative
+(set V (rand 100 1000))
+1 -- (as 'I64 (>= (stddev_pop V) 0.0))
+
+;; dev == stddev_pop  (both use population divisor)
+1 -- (as 'I64 (< (abs (- (dev V) (stddev_pop V))) 0.0001))

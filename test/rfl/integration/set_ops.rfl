@@ -1,0 +1,18 @@
+;; Ported from test_lang_rf.inc::test_rf_set_ops.
+
+;; ========== UNION TESTS ==========
+(union [1 2 3] [3 4 5]) -- [1 2 3 4 5]
+(union [1 2 3] [1 2 3]) -- [1 2 3]
+(union [] [1 2 3]) -- [1 2 3]
+(union [1 2 3] []) -- [1 2 3]
+(union ['a 'b] ['b 'c]) -- [a b c]
+;; ========== SECT (INTERSECTION) TESTS ==========
+(sect [1 2 3 4] [2 4 6]) -- [2 4]
+(sect [1 2 3] [4 5 6]) -- []
+(sect [1 2 3] [1 2 3]) -- [1 2 3]
+(sect ['a 'b 'c] ['b 'c 'd]) -- [b c]
+;; ========== WITHIN TESTS ==========
+(within [5] [1 10]) -- [true]
+(within [0] [1 10]) -- [false]
+(within [11] [1 10]) -- [false]
+(within [5 0 15] [1 10]) -- [true false false]

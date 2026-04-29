@@ -1,0 +1,11 @@
+;; Invariants for `l2-dist` (Euclidean distance).
+
+(l2-dist [0.0 0.0] [0.0 0.0]) -- 0.0
+(l2-dist [0.0 0.0] [3.0 4.0]) -- 5.0
+(l2-dist [1.0 2.0 3.0] [1.0 2.0 3.0]) -- 0.0
+
+;; symmetric
+(l2-dist [1.0 2.0] [3.0 5.0]) -- (l2-dist [3.0 5.0] [1.0 2.0])
+
+;; non-negative
+1 -- (as 'I64 (>= (l2-dist [1.0 2.0] [5.0 7.0]) 0.0))

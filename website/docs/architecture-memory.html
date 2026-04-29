@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Memory Model — Rayforce Documentation</title>
+  <meta name="description" content="Rayforce memory architecture: ray_t 32-byte block layout, buddy allocator, slab cache, thread-local heaps, arena allocator, and COW ref counting.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link active">Memory Model</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Memory Model</span>
+      </div>
+
+      <h1>Memory Model</h1>
+      <p class="page-subtitle">The ray_t 32-byte block header, buddy allocator, slab cache, thread-local heaps, arena allocator, and copy-on-write ref counting.</p>
+
+      <div class="info-box">
+        <strong>No system allocator.</strong> Rayforce never calls <code>malloc</code>, <code>calloc</code>, <code>realloc</code>, or <code>free</code>. All allocation goes through <code>ray_alloc</code> / <code>ray_free</code> (general) or <code>ray_arena_alloc</code> (bulk short-lived). Only allocator internals may use <code>ray_sys_alloc</code> / <code>ray_sys_free</code>.
+      </div>
+
+      <!-- ====== RAY_T ====== -->
+      <h2>The ray_t Block Header</h2>
+      <p>Every object in Rayforce &mdash; atoms, vectors, lists, tables &mdash; begins with a 32-byte <code>ray_t</code> header. Data follows immediately at byte 32 via a flexible array member (<code>data[]</code>).</p>
+
+      <pre><code><span class="hl-kw">typedef union</span> <span class="hl-type">ray_t</span> {
+    <span class="hl-comment">/* Allocated: object header */</span>
+    <span class="hl-kw">struct</span> {
+        <span class="hl-comment">/* Bytes 0-15: nullable bitmask / slice / ext nullmap */</span>
+        <span class="hl-kw">union</span> {
+            <span class="hl-type">uint8_t</span>  nullmap[<span class="hl-num">16</span>];
+            <span class="hl-kw">struct</span> { <span class="hl-type">ray_t</span>* slice_parent; <span class="hl-type">int64_t</span> slice_offset; };
+            <span class="hl-kw">struct</span> { <span class="hl-type">ray_t</span>* ext_nullmap;  <span class="hl-type">ray_t</span>* sym_dict; };
+            <span class="hl-kw">struct</span> { <span class="hl-type">ray_t</span>* str_ext_null; <span class="hl-type">ray_t</span>* str_pool; };
+        };
+        <span class="hl-comment">/* Bytes 16-31: metadata + value */</span>
+        <span class="hl-type">uint8_t</span>  mmod;       <span class="hl-comment">/* 0=heap, 1=file-mmap              */</span>
+        <span class="hl-type">uint8_t</span>  order;      <span class="hl-comment">/* block order (size = 2^order)     */</span>
+        <span class="hl-type">int8_t</span>   type;       <span class="hl-comment">/* negative=atom, positive=vector   */</span>
+        <span class="hl-type">uint8_t</span>  attrs;      <span class="hl-comment">/* attribute flags                  */</span>
+        <span class="hl-type">uint32_t</span> rc;         <span class="hl-comment">/* reference count (0=free)         */</span>
+        <span class="hl-kw">union</span> {
+            <span class="hl-type">int64_t</span>  i64;    <span class="hl-comment">/* I64/SYMBOL/DATE/TIME atom        */</span>
+            <span class="hl-type">double</span>   f64;    <span class="hl-comment">/* F64 atom                         */</span>
+            <span class="hl-type">ray_t</span>*   obj;    <span class="hl-comment">/* pointer to child                 */</span>
+            <span class="hl-kw">struct</span> { <span class="hl-type">uint8_t</span> slen; <span class="hl-type">char</span> sdata[<span class="hl-num">7</span>]; }; <span class="hl-comment">/* SSO string */</span>
+            <span class="hl-type">int64_t</span>  len;    <span class="hl-comment">/* vector element count             */</span>
+        };
+        <span class="hl-type">uint8_t</span>  data[];     <span class="hl-comment">/* element data (flexible array)    */</span>
+    };
+    <span class="hl-comment">/* Free: buddy allocator block */</span>
+    <span class="hl-kw">struct</span> {
+        <span class="hl-type">ray_t</span>* fl_prev;
+        <span class="hl-type">ray_t</span>* fl_next;
+    };
+} <span class="hl-type">ray_t</span>;</code></pre>
+
+      <h3>Field Details</h3>
+      <table>
+        <thead><tr><th>Bytes</th><th>Field</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td>0-15</td><td><code>nullmap[16]</code></td><td>Inline null bitmap for vectors with up to 128 elements. For longer vectors, <code>ext_nullmap</code> points to a separate bitmap vector. For <code>RAY_SYM</code> columns, <code>sym_dict</code> points to the dictionary. For <code>RAY_STR</code> columns, <code>str_pool</code> points to the string pool. For slices, stores parent pointer and offset.</td></tr>
+          <tr><td>16</td><td><code>mmod</code></td><td>Memory mode: 0 = heap-allocated, 1 = file memory-mapped</td></tr>
+          <tr><td>17</td><td><code>order</code></td><td>Buddy allocator block order. Block size = 2^order bytes. Range: 6..30 (64 bytes to 1 GB).</td></tr>
+          <tr><td>18</td><td><code>type</code></td><td>Signed byte: negative = atom, 0 = LIST, 1-13 = vector types (BOOL through STR), 98 = TABLE, 99 = DICT, 100-103 = function types, 127 = ERROR</td></tr>
+          <tr><td>19</td><td><code>attrs</code></td><td>Attribute flags: <code>RAY_ATTR_ARENA</code> (arena-allocated, retain/release are no-ops), slice flag, sorted flag</td></tr>
+          <tr><td>20-23</td><td><code>rc</code></td><td>Reference count. 0 = free block. Incremented by <code>ray_retain</code>, decremented by <code>ray_release</code>.</td></tr>
+          <tr><td>24-31</td><td><code>i64 / f64 / len</code></td><td>For atoms: the value itself (up to 8 bytes, or 7-byte SSO string). For vectors: element count. For lists/tables: child count.</td></tr>
+          <tr><td>32+</td><td><code>data[]</code></td><td>Element array. Layout depends on type: contiguous typed elements for vectors, <code>ray_t*</code> pointers for lists/tables.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="info-box">
+        <strong>Dual-use union.</strong> When a block is free, bytes 0-15 are reused as <code>fl_prev</code>/<code>fl_next</code> free-list pointers. The buddy allocator chains free blocks through these fields without any additional bookkeeping memory.
+      </div>
+
+      <!-- ====== BUDDY ====== -->
+      <h2 id="buddy-allocator">Buddy Allocator</h2>
+      <p>The primary allocator uses a classic buddy system with order-based free lists. Block sizes are powers of two, ranging from order 6 (64 bytes, enough for a <code>ray_t</code> header + 32 bytes of data) to order 30 (1 GB).</p>
+
+      <h3>Allocation</h3>
+      <ol>
+        <li>Compute the minimum order that fits the requested size + 32-byte header</li>
+        <li>Search the free list for that order</li>
+        <li>If empty, try the next larger order and split the block, placing the unused half on the lower-order free list</li>
+        <li>Repeat until a block is found or allocation fails</li>
+      </ol>
+
+      <h3>Deallocation</h3>
+      <ol>
+        <li>Check if the buddy block (the other half of the parent) is also free</li>
+        <li>If so, remove the buddy from its free list and coalesce both halves into a single block of order+1</li>
+        <li>Repeat coalescing until the buddy is not free or maximum order is reached</li>
+        <li>Place the final block on the appropriate free list</li>
+      </ol>
+
+      <p>Constants governing the allocator:</p>
+      <pre><code><span class="hl-kw">#define</span> <span class="hl-num">RAY_ORDER_MIN</span>  <span class="hl-num">6</span>   <span class="hl-comment">/* minimum block: 64 bytes  */</span>
+<span class="hl-kw">#define</span> <span class="hl-num">RAY_ORDER_MAX</span>  <span class="hl-num">30</span>  <span class="hl-comment">/* maximum block: 1 GB      */</span></code></pre>
+
+      <h3>File-Backed Pool Fallback</h3>
+      <p>Pools are normally backed by anonymous <code>mmap</code> &mdash; fast, lazy-committed by the kernel, bounded by RAM + swap. When the OS refuses an anon allocation (typically because RAM + swap can&rsquo;t cover the requested chunk right now), the buddy allocator falls back to a <strong>file-backed</strong> mmap pointed at a tempfile in the heap&rsquo;s configured swap directory. Dirty pages flush to the backing file on page-out, so fresh in-memory allocations &mdash; including a single huge vector like <code>(til 10000000000)</code> &mdash; can grow beyond physical RAM as long as the swap filesystem has room.</p>
+
+      <p>The fallback is transparent to every <code>ray_alloc</code> caller. Pages never written stay as holes in the sparse backing file, so the over-allocate-and-trim alignment trick costs zero real disk space; only the pages you actually touch consume disk pages. On heap teardown the fd is closed and the tempfile is unlinked, so the swap directory doesn&rsquo;t accumulate orphans.</p>
+
+      <ul>
+        <li><strong>Configurable swap directory.</strong> Set <code>RAY_HEAP_SWAP</code> to override the default (<code>./</code>). Trailing slash is added automatically. The directory must exist and be writable by the running process.</li>
+        <li><strong>Tempfile naming.</strong> Format is <code>rayheap_&lt;pid&gt;_&lt;heap_id&gt;_&lt;counter&gt;.dat</code>. Files are opened <code>O_EXCL</code> so no clashes between concurrent processes; the counter is per-process atomic so no clashes within a process.</li>
+        <li><strong>POSIX only today.</strong> The fallback path uses <code>open</code> / <code>ftruncate</code> / <code>mmap MAP_SHARED</code> / <code>munmap</code> / <code>unlink</code>. Windows pools currently take only the anonymous <code>VirtualAlloc</code> path.</li>
+        <li><strong>Distinct from block offloading.</strong> Block offloading (see <a href="architecture-offloading.html">Block Offloading</a>) streams pre-existing parted-table data through queries one segment at a time. The file-backed pool fallback handles fresh anonymous allocations that exceed RAM. Both let workloads exceed RAM, but at different layers and for different shapes of work.</li>
+      </ul>
+
+      <!-- ====== SLAB ====== -->
+      <h2>Slab Cache</h2>
+      <p>For the most common allocation sizes, a slab cache provides O(1) allocation and deallocation by maintaining per-order stacks of pre-split blocks.</p>
+
+      <pre><code><span class="hl-kw">#define</span> <span class="hl-num">RAY_SLAB_CACHE_SIZE</span>  <span class="hl-num">64</span>   <span class="hl-comment">/* max blocks cached per order */</span>
+<span class="hl-kw">#define</span> <span class="hl-num">RAY_SLAB_ORDERS</span>      <span class="hl-num">5</span>    <span class="hl-comment">/* orders 6..10 (64B to 1KB)  */</span></code></pre>
+
+      <p>The slab cache covers orders 6 through 10 (64 bytes to 1 KB), which account for the vast majority of allocations: scalar atoms, short vectors, list nodes, and string pool chunks. When a slab is empty, it refills from the buddy allocator. When full, freed blocks fall through to buddy deallocation.</p>
+
+      <!-- ====== HEAPS ====== -->
+      <h2>Thread-Local Heaps</h2>
+      <p>Each thread has its own heap, identified by a <code>heap_id</code> (u16). Heap IDs are allocated from an atomic bitmap, ensuring no two threads share a heap.</p>
+
+      <h3>Why Per-Thread Heaps?</h3>
+      <p>The buddy allocator's free lists are not thread-safe by design. Rather than adding locks (which would destroy performance for the most common allocation path), each thread operates on its own set of free lists. This eliminates all contention on the fast path.</p>
+
+      <h3>Cross-Heap Free</h3>
+      <p>When thread A allocates a block and thread B needs to free it (common in parallel query execution), the free is deferred:</p>
+      <ol>
+        <li>Thread B pushes the block onto a <strong>lock-free LIFO</strong> (compare-and-swap linked list) associated with thread A's heap</li>
+        <li>Thread A periodically calls <code>ray_heap_flush_foreign()</code> to drain this LIFO and coalesce the blocks into its own free lists</li>
+      </ol>
+
+      <p>The handoff API:</p>
+      <pre><code><span class="hl-fn">ray_heap_push_pending</span>(block);    <span class="hl-comment">/* enqueue to owning heap's LIFO   */</span>
+<span class="hl-fn">ray_heap_drain_pending</span>();         <span class="hl-comment">/* drain LIFO into local free lists */</span>
+<span class="hl-fn">ray_heap_flush_foreign</span>();        <span class="hl-comment">/* reclaim all foreign-freed blocks */</span></code></pre>
+
+      <p>This design means the common case (thread-local alloc/free) is completely lock-free, and the uncommon case (cross-thread free) uses a single atomic CAS per block.</p>
+
+      <!-- ====== ARENA ====== -->
+      <h2>Arena Allocator</h2>
+      <p>For bulk short-lived allocations (e.g., the symbol intern table, temporary parse trees), Rayforce provides an arena (bump) allocator.</p>
+
+      <pre><code><span class="hl-comment">/* Create an arena */</span>
+<span class="hl-type">ray_arena_t</span> arena;
+<span class="hl-fn">ray_arena_init</span>(&amp;arena);
+
+<span class="hl-comment">/* Allocate from the arena (bump pointer, no individual free) */</span>
+<span class="hl-type">void</span>* ptr = <span class="hl-fn">ray_arena_alloc</span>(&amp;arena, size);
+
+<span class="hl-comment">/* Reset (reuse memory without returning to OS) */</span>
+<span class="hl-fn">ray_arena_reset</span>(&amp;arena);
+
+<span class="hl-comment">/* Destroy (return all memory) */</span>
+<span class="hl-fn">ray_arena_destroy</span>(&amp;arena);</code></pre>
+
+      <p>Blocks allocated from an arena carry the <code>RAY_ATTR_ARENA</code> flag in their <code>attrs</code> field. This flag makes <code>ray_retain</code> and <code>ray_release</code> no-ops, since arena blocks are freed all at once when the arena is destroyed. This eliminates reference counting overhead for temporary objects.</p>
+
+      <h3>Use Cases</h3>
+      <ul>
+        <li><strong>Symbol intern table</strong> &mdash; String atoms are arena-allocated since they live for the duration of the process</li>
+        <li><strong>Parse trees</strong> &mdash; Rayfall parser allocates AST nodes from a per-parse arena, freed after compilation</li>
+        <li><strong>Temporary buffers</strong> &mdash; Intermediate hash tables, sort buffers, and other transient structures</li>
+      </ul>
+
+      <!-- ====== COW ====== -->
+      <h2>COW Ref Counting</h2>
+      <p>Rayforce uses <strong>copy-on-write (COW)</strong> semantics to allow safe sharing of data between multiple consumers without copying.</p>
+
+      <h3>API</h3>
+      <table>
+        <thead><tr><th>Function</th><th>Behavior</th></tr></thead>
+        <tbody>
+          <tr><td><code>ray_retain(v)</code></td><td>Increment reference count. If <code>RAY_ATTR_ARENA</code> is set, this is a no-op.</td></tr>
+          <tr><td><code>ray_release(v)</code></td><td>Decrement reference count. If it reaches zero, free the block (and recursively release children for lists/tables). No-op for arena blocks.</td></tr>
+          <tr><td><code>ray_cow(v)</code></td><td>If <code>rc > 1</code>, allocate a new block and copy the data, returning the new block (caller owns it). If <code>rc == 1</code>, return the same block (caller already has exclusive ownership).</td></tr>
+        </tbody>
+      </table>
+
+      <h3>COW Cleanup Pattern</h3>
+      <p>After <code>ray_cow</code> returns a new copy, all error paths must release it to prevent leaks. The standard pattern uses <code>goto fail</code>:</p>
+      <pre><code><span class="hl-type">ray_t</span>* original = vec;
+vec = <span class="hl-fn">ray_cow</span>(vec);
+<span class="hl-kw">if</span> (<span class="hl-fn">RAY_IS_ERR</span>(vec)) <span class="hl-kw">return</span> vec;
+
+<span class="hl-comment">/* ... mutate vec ... */</span>
+<span class="hl-kw">if</span> (error_condition) <span class="hl-kw">goto</span> fail;
+
+<span class="hl-kw">return</span> vec;
+
+fail:
+    <span class="hl-kw">if</span> (vec != original) <span class="hl-fn">ray_release</span>(vec);
+    <span class="hl-kw">return</span> <span class="hl-fn">RAY_ERR_PTR</span>(err);</code></pre>
+
+      <h3>How COW Enables Zero-Copy Operations</h3>
+      <ul>
+        <li><strong>Slices</strong> &mdash; <code>ray_vec_slice</code> creates a new header pointing into the parent's data, incrementing the parent's refcount. No data is copied.</li>
+        <li><strong>Table projections</strong> &mdash; Selecting a subset of columns creates new table headers that share the underlying column vectors via retain.</li>
+        <li><strong>CSR sharing</strong> &mdash; Multiple graph queries can share the same CSR vectors. Mutations (e.g., adding edges) trigger COW only on the modified vector.</li>
+        <li><strong>DAG intermediates</strong> &mdash; When a DAG node's output feeds multiple consumers, the vector is shared via retain rather than copied.</li>
+      </ul>
+
+      <!-- ====== ALLOCATION API ====== -->
+      <h2>Allocation API Summary</h2>
+      <table>
+        <thead><tr><th>Function</th><th>Purpose</th><th>Thread Safety</th></tr></thead>
+        <tbody>
+          <tr><td><code>ray_alloc(size)</code></td><td>General allocation (buddy + slab)</td><td>Thread-local (no locks)</td></tr>
+          <tr><td><code>ray_free(v)</code></td><td>General deallocation (may defer cross-heap)</td><td>Lock-free CAS for cross-heap</td></tr>
+          <tr><td><code>ray_retain(v)</code></td><td>Increment ref count</td><td>Atomic increment</td></tr>
+          <tr><td><code>ray_release(v)</code></td><td>Decrement ref count, free at zero</td><td>Atomic decrement + free</td></tr>
+          <tr><td><code>ray_cow(v)</code></td><td>Copy-on-write (copy if shared)</td><td>Safe (reads rc atomically)</td></tr>
+          <tr><td><code>ray_arena_alloc(a, size)</code></td><td>Bump allocation from arena</td><td>Not thread-safe (per-arena)</td></tr>
+          <tr><td><code>ray_arena_reset(a)</code></td><td>Reset arena (reuse memory)</td><td>Not thread-safe</td></tr>
+          <tr><td><code>ray_arena_destroy(a)</code></td><td>Free all arena memory</td><td>Not thread-safe</td></tr>
+          <tr><td><code>ray_sys_alloc(size)</code></td><td>System allocator (mmap/VirtualAlloc)</td><td>Thread-safe (OS-level)</td></tr>
+          <tr><td><code>ray_sys_free(ptr, size)</code></td><td>System deallocator (munmap/VirtualFree)</td><td>Thread-safe (OS-level)</td></tr>
+        </tbody>
+      </table>
+
+      <!-- ====== MEMORY LAYOUT ====== -->
+      <h2>Memory Layout Visualization</h2>
+      <p>A complete picture of how a vector looks in memory:</p>
+      <pre><code><span class="hl-comment">/* ray_t* vec = ray_vec_new(RAY_I64, 4); with values [10, 20, 30, 40] */</span>
+
+Offset  Field          Value
+------  -----          -----
+ 0      nullmap[16]    00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+16      mmod           0 <span class="hl-comment">(heap)</span>
+17      order          7 <span class="hl-comment">(block = 128 bytes = 32 header + 96 data)</span>
+18      type           5 <span class="hl-comment">(RAY_I64)</span>
+19      attrs          0
+20      rc             1 <span class="hl-comment">(one reference)</span>
+24      len            4 <span class="hl-comment">(4 elements)</span>
+32      data[0]        10 <span class="hl-comment">(int64_t)</span>
+40      data[1]        20
+48      data[2]        30
+56      data[3]        40</code></pre>
+
+      <p>For a vector with nulls, the <code>nullmap</code> bits at offset 0 indicate which elements are null (bit 0 = element 0, etc.). Vectors with more than 128 elements use <code>ext_nullmap</code> to point to a separate bitmap vector.</p>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="architecture-pipeline.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Pipeline &amp; Optimizer</span></a>
+        <a href="architecture-offloading.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Block Offloading</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

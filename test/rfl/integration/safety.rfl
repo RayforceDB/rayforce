@@ -1,0 +1,25 @@
+;; Ported from test_lang_rf.inc::test_rf_safety.
+
+;; ========== TIL NEGATIVE LENGTH ==========
+(til -1) !- domain
+(til -100) !- domain
+;; ========== RAND NEGATIVE/ZERO ==========
+(rand -1 10) !- domain
+(rand 5 0) !- domain
+(rand 5 -1) !- domain
+;; ========== MODIFY WRONG ARITY ==========
+;; modify expects (table, col-sym, fn); calling with 1 arg triggers the arity check.
+(modify 'v) !- arity
+;; ========== OUT OF BOUNDS ACCESS ==========
+(do (set v [1 2 3]) (alter 'v set -10 0)) !- index
+;; ========== NULL OPERATIONS ==========
+(+ null 1) !- type
+(sum null) !- type
+;; ========== VALID EDGE CASES (should not crash) ==========
+(til 0) -- []
+(rand 0 10) -- []
+(at [] 0) -- 0Nl
+(first []) -- 0Nl
+(last []) -- 0Nl
+(/ 1 0) -- 0Nl
+(group []) -- {}

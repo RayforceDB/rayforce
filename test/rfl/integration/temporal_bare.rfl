@@ -1,0 +1,28 @@
+;; Ported from test_lang_rf.inc::test_rf_temporal_bare.
+
+;; DATE atom: 2024-03-15
+(yyyy 2024.03.15) -- 2024
+(mm 2024.03.15) -- 3
+(dd 2024.03.15) -- 15
+;; 2024-03-15 was a Friday (ISO DOW 5) and the 75th day of the year.
+(dow 2024.03.15) -- 5
+(doy 2024.03.15) -- 75
+;; TIME atom: 12:34:56
+(hh 12:34:56) -- 12
+(minute 12:34:56) -- 34
+(ss 12:34:56) -- 56
+;; Null input propagates to null output; the null-sentinel bit
+;; pattern must NOT decode to a bogus calendar value (regression for
+;; earlier "2000 year"/random-year bugs on null dates).
+(yyyy 0Nd) -- 0Nl
+(ss 0Nt) -- 0Nl
+;; TIMESTAMP literal 2024.03.15D12:34:56.000 — regression for the
+;; unit-mismatch bug where ray_temporal_extract treated RAY_TIMESTAMP
+;; as microseconds while the runtime stores it as nanoseconds,
+;; producing e.g. `(yyyy ts)` = 26204 on this input.
+(yyyy 2024.03.15D12:34:56.000) -- 2024
+(mm 2024.03.15D12:34:56.000) -- 3
+(dd 2024.03.15D12:34:56.000) -- 15
+(hh 2024.03.15D12:34:56.000) -- 12
+(minute 2024.03.15D12:34:56.000) -- 34
+(ss 2024.03.15D12:34:56.000) -- 56

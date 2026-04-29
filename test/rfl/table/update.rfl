@@ -1,0 +1,138 @@
+;; Ported from test_lang_rf.inc::test_rf_update.
+
+;; ========== INSERT TESTS ==========
+;; Test 1: Insert single record via list of atoms (immediate - returns new table)
+(set t (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0])))(insert t (list 4 'david 40.0)) -- (table [ID Name Value] (list [1 2 3 4] [alice bob charlie david] [10.0 20.0 30.0 40.0]))
+;; Verify original table unchanged (immediate mode)
+t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 2: Insert single record in-place (modifying variable)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(insert 't (list 3 'charlie 30.0))t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 3: Insert multiple records via list of vectors (immediate)
+(set t (table [ID Name Value] (list [1] [alice] [10.0])))(insert t (list [2 3] [bob charlie] [20.0 30.0])) -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 4: Insert multiple records via list of vectors in-place
+(set t (table [ID Name Value] (list [1] [alice] [10.0])))(insert 't (list [2 3] [bob charlie] [20.0 30.0]))t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 5: Insert via dict (single record, immediate)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(insert t (dict [ID Name Value] (list 3 'charlie 30.0))) -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 6: Insert via dict in-place
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(insert 't (dict [ID Name Value] (list 3 'charlie 30.0)))t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 7: Insert via table (immediate)
+(set t (table [ID Name Value] (list [1] [alice] [10.0])))(insert t (table [ID Name Value] (list [2 3] [bob charlie] [20.0 30.0]))) -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 8: Insert via table in-place
+(set t (table [ID Name Value] (list [1] [alice] [10.0])))(insert 't (table [ID Name Value] (list [2 3] [bob charlie] [20.0 30.0])))t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; ========== UPSERT TESTS ==========
+;; Test 9: Upsert single record (new) via list of atoms (immediate)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (list 3 'charlie 30.0)) -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Verify original table unchanged (immediate mode)
+t -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
+;; Test 10: Upsert single record (update existing) via list of atoms (immediate)
+(set t (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0])))(upsert t 1 (list 2 'bobby 25.0)) -- (table [ID Name Value] (list [1 2 3] [alice bobby charlie] [10.0 25.0 30.0]))
+;; Test 11: Upsert single record in-place (new record)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert 't 1 (list 3 'charlie 30.0))t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 12: Upsert single record in-place (update existing)
+(set t (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0])))(upsert 't 1 (list 2 'bobby 25.0))t -- (table [ID Name Value] (list [1 2 3] [alice bobby charlie] [10.0 25.0 30.0]))
+;; Test 13: Upsert multiple records via list of vectors (immediate)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (list [3 4] [charlie david] [30.0 40.0])) -- (table [ID Name Value] (list [1 2 3 4] [alice bob charlie david] [10.0 20.0 30.0 40.0]))
+;; Test 14: Upsert multiple records with mixed insert/update (immediate)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (list [2 3] [bobby charlie] [25.0 30.0])) -- (table [ID Name Value] (list [1 2 3] [alice bobby charlie] [10.0 25.0 30.0]))
+;; Test 15: Upsert multiple records in-place
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert 't 1 (list [2 3] [bobby charlie] [25.0 30.0]))t -- (table [ID Name Value] (list [1 2 3] [alice bobby charlie] [10.0 25.0 30.0]))
+;; Test 16: Upsert via dict (immediate, new record)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (dict [ID Name Value] (list 3 'charlie 30.0))) -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 17: Upsert via dict (immediate, update existing)
+(set t (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0])))(upsert t 1 (dict [ID Name Value] (list 2 'bobby 25.0))) -- (table [ID Name Value] (list [1 2 3] [alice bobby charlie] [10.0 25.0 30.0]))
+;; Test 18: Upsert via dict in-place
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert 't 1 (dict [ID Name Value] (list 3 'charlie 30.0)))t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 19: Upsert via table (immediate)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (table [ID Name Value] (list [3 4] [charlie david] [30.0 40.0]))) -- (table [ID Name Value] (list [1 2 3 4] [alice bob charlie david] [10.0 20.0 30.0 40.0]))
+;; Test 20: Upsert via table in-place
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert 't 1 (table [ID Name Value] (list [2 3] [bobby charlie] [25.0 30.0])))t -- (table [ID Name Value] (list [1 2 3] [alice bobby charlie] [10.0 25.0 30.0]))
+;; Test 21: Upsert with composite key (2 key columns)
+(set t (table [K1 K2 Value] (list [1 1 2] [1 2 1] [10.0 20.0 30.0])))(upsert t 2 (list [1 3] [2 1] [25.0 40.0])) -- (table [K1 K2 Value] (list [1 1 2 3] [1 2 1 1] [10.0 25.0 30.0 40.0]))
+;; ========== UPDATE TESTS ==========
+;; Test 22: Basic update with no filter
+(set t (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0])))(update {from: 't NewCol: 100})t -- (table [ID Name Value NewCol] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0] [100 100 100]))
+;; Test 23: Update with filter
+(set t (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0])))(update {from: 't Value: 99.0 where: (== ID 2)})t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 99.0 30.0]))
+;; Test 24: Update with groupby
+(set t (table [Group ID Value] (list [a a b b] [1 2 3 4] [10.0 20.0 30.0 40.0])))(update {from: 't Total: (sum Value) by: Group})t -- (table [Group ID Value Total] (list [a a b b] [1 2 3 4] [10.0 20.0 30.0 40.0] [30.0 30.0 70.0 70.0]))
+;; ========== FLEXIBLE COLUMN ORDERING TESTS ==========
+;; Test 25: Insert via dict with columns in different order (single record)
+(set t (table [a b c] (list [1 2] [10 20] [x y])))(insert t (dict [c a b] (list 'z 3 30))) -- (table [a b c] (list [1 2 3] [10 20 30] [x y z]))
+;; Test 26: Insert via dict with columns in reversed order (in-place)
+(set t (table [a b c] (list [1 2] [10 20] [x y])))(insert 't (dict [c b a] (list 'z 30 3)))t -- (table [a b c] (list [1 2 3] [10 20 30] [x y z]))
+;; Test 27: Insert via dict with partial columns (missing column gets null)
+(set t (table [a b c] (list [1 2] [10 20] [x y])))(insert t (dict [c b] (list 'z 30))) -- (table [a b c] (list [1 2 0Nl] [10 20 30] [x y z]))
+;; Test 28: Insert via dict with partial columns in different order
+(set t (table [a b c] (list [1 2] [10 20] [x y])))(insert t (dict [b a] (list 30 3))) -- (table [a b c] (list [1 2 3] [10 20 30] [x y 0Ns]))
+;; Test 29: Insert multiple records via dict with different column order
+(set t (table [a b c] (list [1] [10] [x])))(insert t (dict [c b a] (list [y z] [20 30] [2 3]))) -- (table [a b c] (list [1 2 3] [10 20 30] [x y z]))
+;; Test 30: Insert via table with columns in different order
+(set t (table [a b c] (list [1] [10] [x])))(insert t (table [c a b] (list [y z] [2 3] [20 30]))) -- (table [a b c] (list [1 2 3] [10 20 30] [x y z]))
+;; Test 31: Upsert via dict with different column order (new record)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (dict [Value Name ID] (list 30.0 'charlie 3))) -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 32: Upsert via dict with different column order (update existing)
+(set t (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0])))(upsert t 1 (dict [Value ID Name] (list 25.0 2 'bobby))) -- (table [ID Name Value] (list [1 2 3] [alice bobby charlie] [10.0 25.0 30.0]))
+;; Test 33: Upsert via dict with different column order (in-place)
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert 't 1 (dict [Name Value ID] (list 'charlie 30.0 3)))t -- (table [ID Name Value] (list [1 2 3] [alice bob charlie] [10.0 20.0 30.0]))
+;; Test 34: Upsert multiple records via dict with different column order
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (dict [Value ID Name] (list [25.0 30.0] [2 3] [bobby charlie]))) -- (table [ID Name Value] (list [1 2 3] [alice bobby charlie] [10.0 25.0 30.0]))
+;; Test 35: Upsert via table with different column order
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (table [Name ID Value] (list [charlie david] [3 4] [30.0 40.0]))) -- (table [ID Name Value] (list [1 2 3 4] [alice bob charlie david] [10.0 20.0 30.0 40.0]))
+;; Test 36: Insert error - column not found in table
+(set t (table [a b c] (list [1] [10] [x])))(insert t (dict [a b d] (list 2 20 'w))) !- value
+;; Test 37: Upsert error - column not found in table
+(set t (table [ID Name Value] (list [1] [alice] [10.0])))(upsert t 1 (dict [ID Unknown Value] (list 2 'x 20.0))) !- value
+;; Symmetric: dict has extra key not in table — upsert must reject, not silently drop it.
+(set t (table [ID Name Value] (list [1] [alice] [10.0])))(upsert t 1 (dict [ID Name Value Extra] (list 2 'bob 20.0 'x))) !- value
+;; Table-payload extras must be rejected — silently dropping user-provided columns is a footgun.
+(set t (table [ID Name Value] (list [1] [alice] [10.0])))(upsert t 1 (table [ID Name Value Extra] (list [2] [bob] [20.0] ['x]))) !- value
+;; Table-payload partial updates are intentionally SUPPORTED (missing target cols → null-fill).
+;; This must not error — the second row of the result has null Name.
+(set t (table [ID Name Value] (list [1] [alice] [10.0])))(upsert t 1 (table [ID Value] (list [2] [20.0]))) -- (table [ID Name Value] (list [1 2] [alice 0Ns] [10.0 20.0]))
+;; Partial updates MUST include the key column(s) — otherwise the match/insert
+;; logic would dereference a null-filled key and segfault.
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (table [Name Value] (list [charlie] [30.0]))) !- value
+;; Zero-row payloads are a no-op regardless of schema (restore pre-existing behavior
+;; — rejecting an empty partial payload for missing key columns would break callers
+;; that build up upserts unconditionally and may pass empty batches).
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (table [ID Name Value] (list (as 'I64 []) (as 'SYM []) (as 'F64 [])))) -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
+(set t (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0])))(upsert t 1 (table [Name Value] (list (as 'SYM []) (as 'F64 [])))) -- (table [ID Name Value] (list [1 2] [alice bob] [10.0 20.0]))
+;; Duplicate column names in payload mustn't slip through a mere presence check.
+;; row has two 'a' columns, target has one — gather would silently drop the second 'a'.
+(set t (table [a b] (list [1] [10])))(upsert t 1 (table [a a b] (list [2] [3] [20]))) !- value
+;; Symmetric: target has duplicate 'a' columns + source has single 'a' — ambiguous target slot.
+(set t (table [a a b] (list [1] [2] [10])))(upsert t 1 (table [a b] (list [3] [20]))) !- value
+;; Equal-multiplicity duplicates: counts match but name-keyed gather can't disambiguate positions.
+(set t (table [a a b] (list [1] [2] [10])))(upsert t 1 (table [a a b] (list [3] [4] [20]))) !- value
+;; Same rule for DICT payload: dict with duplicate keys is ambiguous — upsert rejects.
+(set t (table [a b] (list [1] [10])))(upsert t 1 (dict [a a b] (list 3 4 20))) !- value
+;; And: target table has duplicate 'a' columns + dict has unique 'a' — wiring is ambiguous.
+(set t (table [a a b] (list [1] [2] [10])))(upsert t 1 (dict [a b] (list 3 20))) !- value
+;; Equal-multiplicity duplicates via DICT: table has two 'a's, dict lists 'a' twice —
+;; even with matching counts, name-keyed gather would wire both target 'a's to the first dict 'a'.
+(set t (table [a a b] (list [1] [2] [10])))(upsert t 1 (dict [a a b] (list 3 4 20))) !- value
+;; ========== UPDATE WITH FLOAT MULTIPLICATION TESTS ==========
+;; (regression tests for type mismatch bug when multiplying I64 by F64 in update)
+;; Test 38: Update integer column with float multiplication and where clause
+(set employees (table [name dept salary] (list (list "Alice" "Bob" "Charlie") ['IT 'HR 'IT] [75000 65000 85000])))(set employees (update { salary: (* salary 1.1) from: employees where: (> salary 70000)}))employees -- (table [name dept salary] (list (list "Alice" "Bob" "Charlie") [IT HR IT] [82500 65000 93500]))
+;; Test 39: Update integer column with float multiplication (all rows - column becomes F64)
+(set t (table [id val] (list [1 2 3] [100 200 300])))(set t (update {val: (* val 1.5) from: t}))t -- (table [id val] (list [1 2 3] [150.0 300.0 450.0]))
+;; Test 40: Update integer column with float multiplication and where clause (keeps I64)
+(set t (table [id val] (list [1 2 3] [100 200 300])))(set t (update {val: (* val 1.5) from: t where: (> val 150)}))t -- (table [id val] (list [1 2 3] [100 300 450]))
+;; Test 41: Update I32 column with float multiplication and where clause (keeps I32)
+(set t (table [id val] (list [1i 2i 3i] [100i 200i 300i])))(set t (update {val: (* val 1.5) from: t where: (> val 150i)}))t -- (table [id val] (list [1i 2i 3i] [100i 300i 450i]))
+;; ========== SYMBOL/TIMESTAMP UPDATE TESTS (regression for set_ids type handling) ==========
+;; Test 42: Update symbol column with symbol atom value and where clause
+(set t (table [id name age] (list [1 2 3] ['alice 'bob 'charlie] [10 20 30])))(update {name: 'baba from: 't where: (== age 10)})t -- (table [id name age] (list [1 2 3] [baba bob charlie] [10 20 30]))
+;; Test 43: Update symbol column with symbol atom value (multiple rows match)
+(set t (table [id name age] (list [1 2 3] ['alice 'bob 'charlie] [10 20 10])))(update {name: 'updated from: 't where: (== age 10)})t -- (table [id name age] (list [1 2 3] [updated bob updated] [10 20 10]))
+;; Test 44: Update symbol column without where clause (all rows)
+(set t (table [id name] (list [1 2 3] ['x 'y 'z])))(update {name: 'same from: 't})t -- (table [id name] (list [1 2 3] [same same same]))
+;; Test 45: Update timestamp column with timestamp atom value and where clause
+(set t (table [id ts val] (list [1 2 3] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0] [10 20 30])))(update {ts: 2025.06.15D12:30:00.0 from: 't where: (== val 20)})t -- (table [id ts val] (list [1 2 3] [2024.01.01D00:00:00.000000000 2025.06.15D12:30:00.000000000 2024.01.03D00:00:00.000000000] [10 20 30]))
+;; Test 46: Update timestamp column with timestamp atom value (multiple rows match)
+(set t (table [id ts val] (list [1 2 3] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0] [10 20 10])))(update {ts: 2099.12.31D23:59:59.0 from: 't where: (== val 10)})t -- (table [id ts val] (list [1 2 3] [2099.12.31D23:59:59.000000000 2024.01.02D00:00:00.000000000 2099.12.31D23:59:59.000000000] [10 20 10]))
+;; Test 47: Update timestamp column without where clause (all rows)
+(set t (table [id ts] (list [1 2 3] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0 2024.01.03D00:00:00.0])))(update {ts: 2000.01.01D00:00:00.0 from: 't})t -- (table [id ts] (list [1 2 3] [2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000000 2000.01.01D00:00:00.000000000]))
+;; Test 48: Update both symbol and timestamp columns in same update
+(set t (table [id name ts] (list [1 2] ['alice 'bob] [2024.01.01D00:00:00.0 2024.01.02D00:00:00.0])))(update {name: 'updated ts: 2025.01.01D00:00:00.0 from: 't where: (== id 1)})t -- (table [id name ts] (list [1 2] [updated bob] [2025.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000]))

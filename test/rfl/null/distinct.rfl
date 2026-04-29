@@ -1,0 +1,8 @@
+;; distinct preserves at most one null and otherwise unique values.
+
+(distinct [1 0N 2 0N 1]) -- [0Nl 1 2]
+(count (distinct [0N 0N 0N])) -- 1
+(nil? (at (distinct [0N 0N 0N]) 0)) -- true
+
+;; Idempotent under nulls
+(count (distinct (distinct [1 0N 2 0N]))) -- (count (distinct [1 0N 2 0N]))

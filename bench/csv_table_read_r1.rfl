@@ -1,0 +1,5 @@
+;; Read /tmp/table_bench.csv via rayforce1 (read-csv).
+;; rayforce1 uses C8 instead of STR for character columns.
+
+(set t (read-csv [GUID SYMBOL F64 I64 C8 TIMESTAMP] "/tmp/table_bench.csv"))
+(println "rows: %" (count t))

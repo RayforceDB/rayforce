@@ -1,0 +1,52 @@
+;; Morsel-boundary stress: 1023 / 1024 / 1025, then 2047 / 2048 / 2049.
+;; Rayforce executes vector ops in morsels of 1024.  The interesting
+;; failure mode is running state across morsel boundaries — sum,
+;; count, scan, fold all need to carry partial results forward.
+
+;; ────────────── single-morsel boundary ──────────────
+(set V1023 (til 1023))
+(set V1024 (til 1024))
+(set V1025 (til 1025))
+
+;; closed-form sums: sum of 0..n-1 == n*(n-1)/2
+(sum V1023) -- 522753
+(sum V1024) -- 523776
+(sum V1025) -- 524800
+
+;; count preservation under atomic ops
+(count (+ V1023 1)) -- 1023
+(count (+ V1024 1)) -- 1024
+(count (+ V1025 1)) -- 1025
+(count (* V1023 2)) -- 1023
+(count (* V1024 2)) -- 1024
+(count (* V1025 2)) -- 1025
+
+;; permutation invariance: sum is symmetric under reverse
+(sum V1024) -- (sum (reverse V1024))
+(sum V1025) -- (sum (reverse V1025))
+
+;; first/last around the boundary
+(first V1024) -- 0
+(last V1024) -- 1023
+(first V1025) -- 0
+(last V1025) -- 1024
+
+;; ────────────── two-morsel boundary ──────────────
+;; 2047 (just under), 2048 (exact two morsels), 2049 (overflow into a
+;; third morsel of one element).  Running state across morsels is what
+;; we exercise here.
+(set V2047 (til 2047))
+(set V2048 (til 2048))
+(set V2049 (til 2049))
+
+(sum V2047) -- 2094081
+(sum V2048) -- 2096128
+(sum V2049) -- 2098176
+
+(count (+ V2047 7)) -- 2047
+(count (+ V2048 7)) -- 2048
+(count (+ V2049 7)) -- 2049
+
+;; linearity across the boundary
+(sum (* 3 V2048)) -- (* 3 (sum V2048))
+(sum (* 3 V2049)) -- (* 3 (sum V2049))

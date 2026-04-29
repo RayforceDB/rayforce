@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Analytics Cookbook — Rayforce Documentation</title>
+  <meta name="description" content="Common analytics patterns with Rayfall: time-series aggregation, top-N queries, running totals, pivots, ASOF joins, and window joins.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link active">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Analytics Cookbook</span>
+      </div>
+
+      <h1>Analytics Cookbook</h1>
+      <p class="page-subtitle">Practical recipes for common analytics tasks: time-series, top-N, running totals, pivots, ASOF joins, window joins, and CSV workflows.</p>
+
+      <!-- 1. Time-series -->
+      <h2 id="time-series">1. Time-Series Aggregation</h2>
+      <p><strong>Problem:</strong> Given daily sales records, compute the total amount per day.</p>
+      <pre><code>(<span class="hl-kw">set</span> sales (<span class="hl-fn">table</span> [<span class="hl-sym">Date</span> <span class="hl-sym">Product</span> <span class="hl-sym">Amount</span>]
+  (<span class="hl-fn">list</span>
+    (<span class="hl-fn">+</span> <span class="hl-num">2024.01.01</span> [<span class="hl-num">0</span> <span class="hl-num">0</span> <span class="hl-num">1</span> <span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">2</span>])
+    [<span class="hl-sym">Widget</span> <span class="hl-sym">Gadget</span> <span class="hl-sym">Widget</span> <span class="hl-sym">Gadget</span> <span class="hl-sym">Widget</span> <span class="hl-sym">Gadget</span>]
+    [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">150</span> <span class="hl-num">300</span> <span class="hl-num">120</span> <span class="hl-num">180</span>])))</code></pre>
+      <pre><code>┌────────────┬─────────┬──────────────┐
+│    Date    │ Product │    Amount    │
+│    date    │   sym   │     i64      │
+├────────────┼─────────┼──────────────┤
+│ 2024.01.01 │ Widget  │ 100          │
+│ 2024.01.01 │ Gadget  │ 200          │
+│ 2024.01.02 │ Widget  │ 150          │
+│ 2024.01.02 │ Gadget  │ 300          │
+│ 2024.01.03 │ Widget  │ 120          │
+│ 2024.01.03 │ Gadget  │ 180          │
+├────────────┴─────────┴──────────────┤
+│ 6 rows (6 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <pre><code><span class="hl-comment">; Group by Date, sum Amount</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>sales <span class="hl-sym">by:</span> <span class="hl-sym">Date</span> <span class="hl-sym">total:</span> (<span class="hl-fn">sum</span> <span class="hl-sym">Amount</span>)})</code></pre>
+      <pre><code>┌────────────┬────────────────────────┐
+│    Date    │         total          │
+│    date    │          i64           │
+├────────────┼────────────────────────┤
+│ 2024.01.01 │ 300                    │
+│ 2024.01.02 │ 450                    │
+│ 2024.01.03 │ 300                    │
+├────────────┴────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Date arithmetic uses the format <code>YYYY.MM.DD</code>. Adding an integer vector to a date produces a date vector offset by that many days.</p>
+
+      <!-- 2. Top-N -->
+      <h2 id="top-n">2. Top-N Queries</h2>
+      <p><strong>Problem:</strong> Find the top 3 products by revenue.</p>
+      <pre><code>(<span class="hl-kw">set</span> products (<span class="hl-fn">table</span> [<span class="hl-sym">Name</span> <span class="hl-sym">Revenue</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">Alpha</span> <span class="hl-sym">Beta</span> <span class="hl-sym">Gamma</span> <span class="hl-sym">Delta</span> <span class="hl-sym">Epsilon</span> <span class="hl-sym">Zeta</span> <span class="hl-sym">Eta</span>]
+        [<span class="hl-num">500</span> <span class="hl-num">1200</span> <span class="hl-num">300</span> <span class="hl-num">800</span> <span class="hl-num">950</span> <span class="hl-num">150</span> <span class="hl-num">700</span>])))</code></pre>
+      <pre><code>┌─────────┬───────────────────────────┐
+│  Name   │          Revenue          │
+│   sym   │            i64            │
+├─────────┼───────────────────────────┤
+│ Alpha   │ 500                       │
+│ Beta    │ 1200                      │
+│ Gamma   │ 300                       │
+│ Delta   │ 800                       │
+│ Epsilon │ 950                       │
+│ Zeta    │ 150                       │
+│ Eta     │ 700                       │
+├─────────┴───────────────────────────┤
+│ 7 rows (7 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <pre><code><span class="hl-comment">; Sort descending, then filter to keep top 3</span>
+(<span class="hl-kw">set</span> sorted (<span class="hl-fn">xdesc</span> products <span class="hl-sym">'Revenue</span>))
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>sorted <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> <span class="hl-sym">Revenue</span> <span class="hl-num">700</span>)})</code></pre>
+      <pre><code>┌─────────┬───────────────────────────┐
+│  Name   │          Revenue          │
+│   sym   │            i64            │
+├─────────┼───────────────────────────┤
+│ Beta    │ 1200                      │
+│ Epsilon │ 950                       │
+│ Delta   │ 800                       │
+├─────────┴───────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>The pattern is: sort descending with <code>xdesc</code>, then filter with a threshold. For dynamic top-N where you don't know the cutoff value in advance, sort and filter by rank.</p>
+
+      <!-- 3. Running totals -->
+      <h2 id="running-totals">3. Running Totals</h2>
+      <p><strong>Problem:</strong> Compute a cumulative sum over a vector of values.</p>
+      <pre><code><span class="hl-comment">; scan applies a function cumulatively</span>
+(<span class="hl-fn">scan</span> <span class="hl-fn">+</span> [<span class="hl-num">3</span> <span class="hl-num">1</span> <span class="hl-num">4</span> <span class="hl-num">1</span> <span class="hl-num">5</span> <span class="hl-num">9</span> <span class="hl-num">2</span> <span class="hl-num">6</span>])</code></pre>
+      <pre><code>[3 4 8 9 14 23 25 31]</code></pre>
+
+      <pre><code><span class="hl-comment">; Running product</span>
+(<span class="hl-fn">scan</span> <span class="hl-fn">*</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span> <span class="hl-num">5</span>])</code></pre>
+      <pre><code>[1 2 6 24 120]</code></pre>
+
+      <p>The <code>scan</code> function takes a binary function and a vector, returning a vector of the same length where each element is the cumulative application of the function. The related <code>fold</code> function returns only the final accumulated value.</p>
+
+      <!-- 4. Pivoting -->
+      <h2 id="pivot">4. Pivoting (Cross-Tabulation)</h2>
+      <p><strong>Problem:</strong> Cross-tabulate sales by region and product.</p>
+      <pre><code>(<span class="hl-kw">set</span> data (<span class="hl-fn">table</span> [<span class="hl-sym">Region</span> <span class="hl-sym">Product</span> <span class="hl-sym">Sales</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">East</span> <span class="hl-sym">East</span> <span class="hl-sym">West</span> <span class="hl-sym">West</span> <span class="hl-sym">East</span> <span class="hl-sym">West</span>]
+        [<span class="hl-sym">Widget</span> <span class="hl-sym">Gadget</span> <span class="hl-sym">Widget</span> <span class="hl-sym">Gadget</span> <span class="hl-sym">Widget</span> <span class="hl-sym">Gadget</span>]
+        [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">150</span> <span class="hl-num">300</span> <span class="hl-num">120</span> <span class="hl-num">180</span>])))</code></pre>
+      <pre><code>┌────────┬─────────┬──────────────────┐
+│ Region │ Product │      Sales       │
+│  sym   │   sym   │       i64        │
+├────────┼─────────┼──────────────────┤
+│ East   │ Widget  │ 100              │
+│ East   │ Gadget  │ 200              │
+│ West   │ Widget  │ 150              │
+│ West   │ Gadget  │ 300              │
+│ East   │ Widget  │ 120              │
+│ West   │ Gadget  │ 180              │
+├────────┴─────────┴──────────────────┤
+│ 6 rows (6 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <pre><code><span class="hl-comment">; Pivot: rows=Region, cols=Product, values=Sales, agg=sum</span>
+(<span class="hl-fn">pivot</span> data <span class="hl-sym">'Region</span> <span class="hl-sym">'Product</span> <span class="hl-sym">'Sales</span> <span class="hl-fn">sum</span>)</code></pre>
+      <pre><code>┌────────┬────────┬───────────────────┐
+│ Region │ Widget │      Gadget       │
+│  sym   │  i64   │        i64        │
+├────────┼────────┼───────────────────┤
+│ East   │ 220    │ 200               │
+│ West   │ 150    │ 480               │
+├────────┴────────┴───────────────────┤
+│ 2 rows (2 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>The distinct values of the column key (<code>Product</code>) become the new column headers. Use any aggregation function: <code>sum</code>, <code>avg</code>, <code>count</code>, <code>min</code>, <code>max</code>, <code>first</code>, <code>last</code>, <code>med</code>, or a custom lambda like <code>(fn [x] (sum (* x x)))</code>.</p>
+
+      <!-- 5. ASOF joins -->
+      <h2 id="asof-join">5. ASOF Joins</h2>
+      <p><strong>Problem:</strong> Match each trade to the most recent quote at or before the trade time.</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span> <span class="hl-sym">Price</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span>]
+        [<span class="hl-num">09:30:00</span> <span class="hl-num">09:31:00</span> <span class="hl-num">09:30:30</span>]
+        [<span class="hl-num">150</span> <span class="hl-num">151</span> <span class="hl-num">280</span>])))
+
+(<span class="hl-kw">set</span> quotes (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span> <span class="hl-sym">Bid</span> <span class="hl-sym">Ask</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">GOOG</span>]
+        [<span class="hl-num">09:29:50</span> <span class="hl-num">09:30:10</span> <span class="hl-num">09:31:05</span> <span class="hl-num">09:30:00</span> <span class="hl-num">09:30:20</span> <span class="hl-num">09:31:00</span>]
+        [<span class="hl-num">149</span> <span class="hl-num">150</span> <span class="hl-num">151</span> <span class="hl-num">279</span> <span class="hl-num">280</span> <span class="hl-num">281</span>]
+        [<span class="hl-num">151</span> <span class="hl-num">152</span> <span class="hl-num">153</span> <span class="hl-num">281</span> <span class="hl-num">282</span> <span class="hl-num">283</span>])))</code></pre>
+
+      <pre><code><span class="hl-comment">; ASOF join: match on Sym, find latest Ts &lt;= trade Ts</span>
+(<span class="hl-fn">asof-join</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Ts</span>] trades quotes)</code></pre>
+      <pre><code>┌──────┬──────────────┬───────┬─────┬─────┐
+│ Sym  │      Ts      │ Price │ Bid │ Ask │
+│ sym  │     time     │  i64  │ i64 │ i64 │
+├──────┼──────────────┼───────┼─────┼─────┤
+│ AAPL │ 09:30:00.000 │ 150   │ 149 │ 151 │
+│ AAPL │ 09:31:00.000 │ 151   │ 150 │ 152 │
+│ GOOG │ 09:30:30.000 │ 280   │ 280 │ 282 │
+├──────┴──────────────┴───────┴─────┴─────┤
+│ 3 rows (3 shown) 5 columns (5 shown)    │
+└─────────────────────────────────────────┘</code></pre>
+      <p>The key list <code>[Sym Ts]</code> specifies equality columns followed by the time column (last). For each left row, the join finds the right row with matching <code>Sym</code> and the largest <code>Ts</code> that does not exceed the left <code>Ts</code>.</p>
+
+      <!-- 6. Window joins -->
+      <h2 id="window-join">6. Window Joins</h2>
+      <p><strong>Problem:</strong> For each trade, aggregate quote data within a time window around the trade time.</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Time</span> <span class="hl-sym">Price</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span>]
+        [<span class="hl-num">12:00:01</span> <span class="hl-num">12:00:04</span> <span class="hl-num">12:00:06</span>]
+        [<span class="hl-num">89.17</span> <span class="hl-num">70.5</span> <span class="hl-num">80.54</span>])))
+
+(<span class="hl-kw">set</span> quotes (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Time</span> <span class="hl-sym">Size</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span>]
+        [<span class="hl-num">12:00:00</span> <span class="hl-num">12:00:01</span> <span class="hl-num">12:00:02</span> <span class="hl-num">12:00:03</span> <span class="hl-num">12:00:04</span> <span class="hl-num">12:00:05</span> <span class="hl-num">12:00:06</span> <span class="hl-num">12:00:07</span> <span class="hl-num">12:00:08</span> <span class="hl-num">12:00:09</span>]
+        [<span class="hl-num">928</span> <span class="hl-num">528</span> <span class="hl-num">648</span> <span class="hl-num">914</span> <span class="hl-num">918</span> <span class="hl-num">626</span> <span class="hl-num">577</span> <span class="hl-num">817</span> <span class="hl-num">620</span> <span class="hl-num">698</span>])))
+
+<span class="hl-comment">; Simple window join: match on [Sym], join by Time</span>
+(<span class="hl-fn">window-join</span> trades quotes [<span class="hl-sym">Sym</span>] <span class="hl-sym">'Time</span>)</code></pre>
+      <pre><code>┌──────┬──────────────┬───────┬───────┐
+│ Sym  │     Time     │ Price │ Size  │
+│ sym  │     time     │  f64  │  i64  │
+├──────┼──────────────┼───────┼───────┤
+│ AAPL │ 12:00:01.000 │ 89.17 │ 528   │
+│ AAPL │ 12:00:04.000 │ 70.5  │ 918   │
+│ AAPL │ 12:00:06.000 │ 80.54 │ 577   │
+├──────┴──────────────┴───────┴───────┤
+│ 3 rows (3 shown) 4 columns (4 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>The <code>window-join</code> function matches rows from the right table within a time window around each left row. The equality keys (<code>[Sym]</code>) filter candidates, and the time column (<code>'Time</code>) determines the window range.</p>
+
+      <!-- 7. CSV workflow -->
+      <h2 id="csv-workflow">7. Working with CSV</h2>
+      <p><strong>Problem:</strong> Load a CSV, transform the data, and save the result.</p>
+      <pre><code><span class="hl-comment">; Create sample data</span>
+(<span class="hl-kw">set</span> data (<span class="hl-fn">table</span> [<span class="hl-sym">Name</span> <span class="hl-sym">Score</span> <span class="hl-sym">Grade</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">Alice</span> <span class="hl-sym">Bob</span> <span class="hl-sym">Charlie</span>]
+        [<span class="hl-num">95</span> <span class="hl-num">87</span> <span class="hl-num">92</span>]
+        [<span class="hl-sym">A</span> <span class="hl-sym">B</span> <span class="hl-sym">A</span>])))
+
+<span class="hl-comment">; Save to CSV</span>
+(<span class="hl-fn">.csv.write</span> data <span class="hl-str">"/tmp/grades.csv"</span>)
+
+<span class="hl-comment">; Load it back</span>
+(<span class="hl-fn">.csv.read</span> <span class="hl-str">"/tmp/grades.csv"</span>)</code></pre>
+      <pre><code>┌─────────┬───────┬───────────────────┐
+│  Name   │ Score │       Grade       │
+│   sym   │  i64  │        sym        │
+├─────────┼───────┼───────────────────┤
+│ Alice   │ 95    │ A                 │
+│ Bob     │ 87    │ B                 │
+│ Charlie │ 92    │ A                 │
+├─────────┴───────┴───────────────────┤
+│ 3 rows (3 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>A typical workflow: <code>.csv.read</code> to load, <code>select</code> to filter and transform, <code>.csv.write</code> to save results. The CSV reader uses parallel parsing and automatic type inference for fast loading of large files.</p>
+
+      <!-- 8. Complex Aggregation with fold -->
+      <h2 id="fold-aggregation">8. Complex Aggregation with <code>fold</code></h2>
+      <p><strong>Problem:</strong> Compute a weighted average where each value has a different weight.</p>
+      <pre><code><span class="hl-comment">; Weighted average: sum(w*p) / sum(w)</span>
+(<span class="hl-kw">set</span> w [<span class="hl-num">2</span> <span class="hl-num">4</span> <span class="hl-num">4</span>])
+(<span class="hl-kw">set</span> p [<span class="hl-num">10.0</span> <span class="hl-num">20.0</span> <span class="hl-num">30.0</span>])
+(<span class="hl-fn">/</span> (<span class="hl-fn">fold</span> <span class="hl-fn">+</span> <span class="hl-num">0.0</span> (<span class="hl-fn">*</span> w p)) (<span class="hl-fn">fold</span> <span class="hl-fn">+</span> <span class="hl-num">0.0</span> w))</code></pre>
+      <pre><code>22.0</code></pre>
+      <p>The <code>fold</code> function takes a binary function, an initial accumulator, and a vector. It reduces the vector to a single value by applying the function left-to-right. Unlike <code>scan</code> which returns all intermediate results, <code>fold</code> returns only the final result.</p>
+
+      <pre><code><span class="hl-comment">; Sum of squares using fold with a custom function</span>
+(<span class="hl-fn">fold</span> (<span class="hl-kw">fn</span> [a b] (<span class="hl-fn">+</span> a (<span class="hl-fn">*</span> b b))) <span class="hl-num">0</span> [<span class="hl-num">3</span> <span class="hl-num">4</span> <span class="hl-num">5</span>])</code></pre>
+      <pre><code>50</code></pre>
+      <p>Here the lambda squares each element and adds it to the running total: 9 + 16 + 25 = 50. Any binary function works with <code>fold</code>, including builtins like <code>+</code>, <code>*</code>, <code>min</code>, <code>max</code>.</p>
+
+      <!-- 9. Null Handling in Aggregations -->
+      <h2 id="null-handling">9. Null Handling in Aggregations</h2>
+      <p><strong>Problem:</strong> What happens when your data contains null values?</p>
+      <pre><code><span class="hl-comment">; Create a vector with null entries (0Nl = null i64)</span>
+(<span class="hl-kw">set</span> v [<span class="hl-num">10</span> <span class="hl-num">0Nl</span> <span class="hl-num">30</span> <span class="hl-num">0Nl</span> <span class="hl-num">50</span>])
+(<span class="hl-fn">sum</span> v)    <span class="hl-comment">; 90  — nulls skipped</span>
+(<span class="hl-fn">avg</span> v)    <span class="hl-comment">; 30.0 — average of non-null values (90 / 3)</span>
+(<span class="hl-fn">min</span> v)    <span class="hl-comment">; 10</span>
+(<span class="hl-fn">max</span> v)    <span class="hl-comment">; 50</span>
+(<span class="hl-fn">count</span> v)  <span class="hl-comment">; 5 — total length including nulls</span></code></pre>
+      <p>All built-in aggregation functions (<code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code>, <code>med</code>) skip null values automatically. The <code>count</code> function returns the total vector length including nulls.</p>
+
+      <p>Use <code>nil?</code> to check for null values:</p>
+      <pre><code>(<span class="hl-fn">nil?</span> <span class="hl-num">0Nl</span>)            <span class="hl-comment">; true</span>
+(<span class="hl-fn">nil?</span> <span class="hl-num">42</span>)             <span class="hl-comment">; false</span>
+(<span class="hl-fn">map</span> <span class="hl-fn">nil?</span> (<span class="hl-fn">list</span> <span class="hl-num">10</span> <span class="hl-num">0Nl</span> <span class="hl-num">30</span>))  <span class="hl-comment">; [false true false]</span></code></pre>
+      <p>Null literals are type-suffixed: <code>0Nl</code> (i64), <code>0Nf</code> (f64), <code>0Ns</code> (sym), <code>0Nd</code> (date), <code>0Nt</code> (time), <code>0Np</code> (timestamp).</p>
+
+      <!-- 10. Performance Tips -->
+      <h2 id="performance-tips">10. Performance Tips</h2>
+      <div class="info-box">
+        <strong>Tips for fast analytics queries:</strong>
+        <ul>
+          <li><strong>Prefer <code>select</code> with <code>by:</code></strong> over manual group-then-map. The <code>select</code> pipeline fuses grouping and aggregation into a single pass, avoiding intermediate materialization.</li>
+          <li><strong>Use <code>xbar</code> for time bucketing</strong> to bin timestamps into fixed intervals (e.g., 5-minute bars). This avoids materializing group keys and is faster than building date groups by hand.</li>
+          <li><strong>Use <code>pmap</code> for embarrassingly parallel work.</strong> It distributes a function across list elements using worker threads. Ideal for independent per-group transformations:
+            <pre style="margin:0.5em 0 0"><code>(<span class="hl-fn">pmap</span> (<span class="hl-kw">fn</span> [x] (<span class="hl-fn">*</span> x x)) (<span class="hl-fn">list</span> <span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span> <span class="hl-num">5</span>))</code></pre>
+            <pre style="margin:0 0 0"><code>[1 4 9 16 25]</code></pre>
+          </li>
+        </ul>
+      </div>
+
+      <h2 id="next-steps">Next Steps</h2>
+      <ul>
+        <li><a href="guide-storage.html"><strong>Data Persistence</strong></a> &mdash; Columnar files, splayed tables, partitioned storage</li>
+        <li><a href="queries-joins.html"><strong>Joins Reference</strong></a> &mdash; Detailed join semantics and options</li>
+        <li><a href="queries-pivot.html"><strong>Pivot &amp; Window Reference</strong></a> &mdash; All pivot options and window functions</li>
+        <li><a href="operations-math.html"><strong>Math &amp; Aggregation</strong></a> &mdash; Complete list of math and aggregation functions</li>
+      </ul>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="graph-algorithms.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Graph Algorithms</span></a>
+        <a href="guide-datalog.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Building a Knowledge Base with Datalog</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

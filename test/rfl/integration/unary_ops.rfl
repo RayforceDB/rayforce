@@ -1,0 +1,16 @@
+;; Ported from test_lang_rf.inc::test_rf_unary_ops.
+
+;; ========== NEG TESTS ==========
+(neg 5) -- -5
+(neg -5) -- 5
+(neg [1 -2 3 -4]) -- [-1 2 -3 4]
+(neg 5.0) -- -5.0
+;; ========== NOT TESTS ==========
+(not true) -- false
+(not false) -- true
+(not [true false true]) -- [false true false]
+;; ========== WHERE TESTS ==========
+(where [true false true false true]) -- [0 2 4]
+(where [false false false]) -- []
+(where [true true true]) -- [0 1 2]
+(where (> [1 2 3 4 5] 3)) -- [3 4]

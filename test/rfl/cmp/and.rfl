@@ -1,0 +1,51 @@
+;; Invariants for `and`.
+
+;; identity: (and a true) == a  and  (and true a) == a
+(and true true) -- true
+(and true false) -- false
+(and false true) -- false
+(and false false) -- false
+
+;; absorbing: (and a false) == false
+(set B [true false true false])
+(count B) -- (sum (== (and B false) [false false false false]))
+
+;; commutative
+(set X [true true false false])
+(set Y [true false true false])
+(count X) -- (sum (== (and X Y) (and Y X)))
+
+;; ---- Regression tests ported from test_lang_rf.inc::test_rf_and ----
+;; Ported from test_lang_rf.inc::test_rf_and.
+
+(and true false) -- false
+(and false true) -- false
+(and false false) -- false
+(and true true) -- true
+(and [true false true] [false true false]) -- [false false false]
+(and [true false true] [false true false] [true false true]) -- [false false false]
+(and [true false true] true) -- [true false true]
+
+;; ── variadic fold: (and a b c) == (and (and a b) c) ──
+(and true true true) -- true
+(and true true false) -- false
+(and true true true true true) -- true
+(and true true true true false) -- false
+
+;; ── arity boundaries ──
+(and)        !- arity
+(and true)   !- arity
+
+;; ── short-circuit semantics (matches v1 FN_SPECIAL_FORM) ──
+;; PR #8 dropped FN_SPECIAL_FORM, breaking v1's contract.  Restored:
+;; subsequent args are NOT evaluated once the result is determined.
+;; If short-circuit were broken, `undefined-name` would surface as
+;; `error: name` and these tests would fail.
+(and false undefined-name)            -- false
+(and false true undefined-name)       -- false
+(and true  false undefined-name)      -- false
+(and true  true  false undefined-name) -- false
+
+;; Short-circuit must NOT trigger when the result is still undetermined —
+;; full chain runs with all-truthy args.
+(and true true 1) -- true

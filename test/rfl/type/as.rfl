@@ -1,0 +1,422 @@
+;; Invariants for `as` (cast).
+
+(as 'i64 3.7) -- 3
+(as 'f64 5) -- 5.0
+(as 'str 42) -- "42"
+
+;; cast vec to different numeric type
+(as 'F64 [1 2 3]) -- [1.0 2.0 3.0]
+(as 'I64 [1.5 2.5 3.5]) -- [1 2 3]
+
+;; string parse
+(as 'i64 "42") -- 42
+(as 'f64 "3.14") -- 3.14
+
+;; cast-to-same-type is identity (via as symbol)
+(as 'i64 42) -- 42
+
+;; ---- Regression tests ported from test_lang_rf.inc::test_rf_cast ----
+;; Ported from test_lang_rf.inc::test_rf_cast.
+
+;; ========== B8 (BOOLEAN) ATOM CASTS ==========
+;; b8 <- u8 (atom to atom - use lowercase)
+(as 'b8 0x00) -- false
+(as 'b8 0x01) -- true
+(as 'b8 0xFF) -- true
+;; b8 <- i16
+(as 'b8 0h) -- false
+(as 'b8 1h) -- true
+(as 'b8 -1h) -- true
+;; b8 <- i32
+(as 'b8 0i) -- false
+(as 'b8 1i) -- true
+(as 'b8 -1i) -- true
+;; b8 <- i64
+(as 'b8 0) -- false
+(as 'b8 1) -- true
+(as 'b8 -1) -- true
+;; b8 <- f64
+(as 'b8 0.0) -- false
+(as 'b8 1.0) -- true
+(as 'b8 -1.5) -- true
+;; b8 <- date (2000.01.01 is epoch/day 0, so it's false; 2000.01.02 is day 1, so true)
+(as 'b8 2000.01.01) -- false
+(as 'b8 2000.01.02) -- true
+;; b8 <- time (00:00:00.000 is 0ms, so false; 00:00:01.000 is 1000ms, so true)
+(as 'b8 00:00:00.000) -- false
+(as 'b8 00:00:01.000) -- true
+;; b8 <- timestamp (epoch is 0, so false; 1 nanosecond after is true)
+(as 'b8 2000.01.01D00:00:00.000000000) -- false
+(as 'b8 2000.01.01D00:00:00.000000001) -- true
+;; b8 <- String (empty string returns empty vector due to early check)
+(as 'b8 "a") -- true
+(as 'b8 "hello") -- true
+;; ========== B8 VECTOR CASTS ==========
+(as 'B8 [0h 1h 2h]) -- [false true true]
+(as 'B8 [0i 1i -1i]) -- [false true true]
+(as 'B8 [0 1 -1]) -- [false true true]
+(as 'B8 [0.0 1.0 -1.5]) -- [false true true]
+;; ========== U8 (BYTE) ATOM CASTS ==========
+;; u8 <- b8
+(as 'u8 false) -- 0x00
+(as 'u8 true) -- 0x01
+;; u8 <- i16
+(as 'u8 0h) -- 0x00
+(as 'u8 255h) -- 0xFF
+;; u8 <- i32
+(as 'u8 0i) -- 0x00
+(as 'u8 255i) -- 0xFF
+;; u8 <- i64
+(as 'u8 0) -- 0x00
+(as 'u8 255) -- 0xFF
+;; u8 <- f64
+(as 'u8 0.0) -- 0x00
+(as 'u8 255.9) -- 0xFF
+;; u8 <- String
+(as 'u8 "42") -- 0x2A
+;; ========== U8 VECTOR CASTS ==========
+(as 'U8 [0h 1h 255h]) -- [0x00 0x01 0xFF]
+(as 'U8 [0i 1i 255i]) -- [0x00 0x01 0xFF]
+(as 'U8 [0 1 255]) -- [0x00 0x01 0xFF]
+(as 'U8 [0.0 1.0 255.0]) -- [0x00 0x01 0xFF]
+;; ========== I16 (SHORT) ATOM CASTS ==========
+;; i16 <- b8
+(as 'i16 false) -- 0h
+(as 'i16 true) -- 1h
+;; i16 <- u8
+(as 'i16 0x00) -- 0h
+(as 'i16 0xFF) -- 255h
+;; i16 <- i32
+(as 'i16 0i) -- 0h
+(as 'i16 100i) -- 100h
+;; i16 <- i64
+(as 'i16 0) -- 0h
+(as 'i16 100) -- 100h
+;; i16 <- f64
+(as 'i16 0.0) -- 0h
+(as 'i16 100.9) -- 100h
+;; i16 <- date
+(type (as 'i16 2000.01.01)) -- 'i16
+;; i16 <- time
+(type (as 'i16 00:00:01.000)) -- 'i16
+;; i16 <- timestamp
+(type (as 'i16 2000.01.01D00:00:00.000000001)) -- 'i16
+;; i16 <- String
+(as 'i16 "42") -- 42h
+(as 'i16 "-100") -- -100h
+;; ========== I16 VECTOR CASTS ==========
+(as 'I16 [false true]) -- [0h 1h]
+(as 'I16 [0x00 0xFF]) -- [0h 255h]
+(as 'I16 [0i 100i -100i]) -- [0h 100h -100h]
+(as 'I16 [0 100 -100]) -- [0h 100h -100h]
+(as 'I16 [0.0 100.9 -100.9]) -- [0h 100h -100h]
+;; ========== I32 (INT) ATOM CASTS ==========
+;; i32 <- b8
+(as 'i32 false) -- 0i
+(as 'i32 true) -- 1i
+;; i32 <- u8
+(as 'i32 0x00) -- 0i
+(as 'i32 0xFF) -- 255i
+;; i32 <- i16
+(as 'i32 0h) -- 0i
+(as 'i32 -100h) -- -100i
+;; i32 <- i64
+(as 'i32 0) -- 0i
+(as 'i32 1000000) -- 1000000i
+;; i32 <- f64
+(as 'i32 0.0) -- 0i
+(as 'i32 100.9) -- 100i
+(as 'i32 -100.9) -- -100i
+;; i32 <- date
+(type (as 'i32 2000.01.01)) -- 'i32
+;; i32 <- time
+(type (as 'i32 00:00:01.000)) -- 'i32
+;; i32 <- timestamp
+(type (as 'i32 2000.01.01D00:00:00.000000001)) -- 'i32
+;; i32 <- String
+(as 'i32 "42") -- 42i
+(as 'i32 "-1000000") -- -1000000i
+;; ========== I32 VECTOR CASTS ==========
+(as 'I32 [false true]) -- [0i 1i]
+(as 'I32 [0x00 0xFF]) -- [0i 255i]
+(as 'I32 [0h 100h -100h]) -- [0i 100i -100i]
+(as 'I32 [0 100 -100]) -- [0i 100i -100i]
+(as 'I32 [0.0 100.9 -100.9]) -- [0i 100i -100i]
+;; ========== I64 (LONG) ATOM CASTS ==========
+;; i64 <- b8
+(as 'i64 false) -- 0
+(as 'i64 true) -- 1
+;; i64 <- u8
+(as 'i64 0x00) -- 0
+(as 'i64 0xFF) -- 255
+;; i64 <- i16
+(as 'i64 0h) -- 0
+(as 'i64 -100h) -- -100
+;; i64 <- i32
+(as 'i64 0i) -- 0
+(as 'i64 -1000000i) -- -1000000
+;; i64 <- f64
+(as 'i64 0.0) -- 0
+(as 'i64 100.9) -- 100
+;; i64 <- date
+(type (as 'i64 2000.01.01)) -- 'i64
+;; i64 <- time
+(type (as 'i64 00:00:01.000)) -- 'i64
+;; i64 <- timestamp
+(type (as 'i64 2000.01.01D00:00:00.000000001)) -- 'i64
+;; i64 <- String
+(as 'i64 "42") -- 42
+(as 'i64 "-9999999999") -- -9999999999
+;; ========== I64 VECTOR CASTS ==========
+(as 'I64 [false true]) -- [0 1]
+(as 'I64 [0x00 0xFF]) -- [0 255]
+(as 'I64 [0h 100h -100h]) -- [0 100 -100]
+(as 'I64 [0i 100i -100i]) -- [0 100 -100]
+(as 'I64 [0.0 100.9 -100.9]) -- [0 100 -100]
+;; ========== F64 (FLOAT) ATOM CASTS ==========
+;; f64 <- b8
+(as 'f64 false) -- 0.00
+(as 'f64 true) -- 1.00
+;; f64 <- u8
+(as 'f64 0x00) -- 0.00
+(as 'f64 0xFF) -- 255.00
+;; f64 <- i16
+(as 'f64 0h) -- 0.00
+(as 'f64 -100h) -- -100.00
+;; f64 <- i32
+(as 'f64 0i) -- 0.00
+(as 'f64 1000000i) -- 1000000.00
+;; f64 <- i64
+(as 'f64 0) -- 0.00
+(as 'f64 1000000) -- 1000000.00
+;; f64 <- date
+(type (as 'f64 2000.01.01)) -- 'f64
+;; f64 <- time
+(type (as 'f64 00:00:01.000)) -- 'f64
+;; f64 <- timestamp
+(type (as 'f64 2000.01.01D00:00:00.000000001)) -- 'f64
+;; f64 <- String
+(as 'f64 "42.5") -- 42.50
+(as 'f64 "-100.25") -- -100.25
+;; ========== F64 VECTOR CASTS ==========
+(as 'F64 [false true]) -- [0.0 1.0]
+(as 'F64 [0x00 0xFF]) -- [0.0 255.0]
+(as 'F64 [0h 100h]) -- [0.0 100.0]
+(as 'F64 [0i 100i]) -- [0.0 100.0]
+(as 'F64 [0 100]) -- [0.0 100.0]
+;; ========== DATE ATOM CASTS ==========
+;; date <- b8
+(type (as 'date false)) -- 'date
+(type (as 'date true)) -- 'date
+;; date <- u8
+(type (as 'date 0x00)) -- 'date
+;; date <- i16
+(type (as 'date 0h)) -- 'date
+;; date <- i32
+(type (as 'date 0i)) -- 'date
+(as 'date 0i) -- 2000.01.01
+;; date <- i64
+(type (as 'date 0)) -- 'date
+(as 'date 0) -- 2000.01.01
+;; date <- f64
+(type (as 'date 0.0)) -- 'date
+;; date <- time (value copy)
+(type (as 'date 00:00:01.000)) -- 'date
+;; date <- timestamp
+(type (as 'date 2000.01.01D00:00:00.000000001)) -- 'date
+;; date <- String
+(as 'date "2024.03.20") -- 2024.03.20
+;; ========== DATE VECTOR CASTS ==========
+(type (as 'DATE [0 1 2])) -- 'DATE
+(type (as 'DATE [0i 1i 2i])) -- 'DATE
+(type (as 'DATE [0h 1h 2h])) -- 'DATE
+(type (as 'DATE [0.0 1.0 2.0])) -- 'DATE
+;; ========== TIME ATOM CASTS ==========
+;; time <- b8
+(type (as 'time false)) -- 'time
+(type (as 'time true)) -- 'time
+;; time <- u8
+(type (as 'time 0x00)) -- 'time
+;; time <- i16
+(type (as 'time 0h)) -- 'time
+;; time <- i32
+(type (as 'time 0i)) -- 'time
+(as 'time 0i) -- 00:00:00.000
+;; time <- i64
+(type (as 'time 0)) -- 'time
+(as 'time 1000) -- 00:00:01.000
+;; time <- f64
+(type (as 'time 0.0)) -- 'time
+;; time <- date (value copy)
+(type (as 'time 2000.01.01)) -- 'time
+;; time <- timestamp
+(type (as 'time 2000.01.01D00:00:00.000000001)) -- 'time
+;; time <- String
+(as 'time "12:30:45.123") -- 12:30:45.123
+(as 'time "20:00:00") -- 20:00:00.000
+(as 'time "20:00:00.") -- 20:00:00.000
+(as 'time "20:00:00.0") -- 20:00:00.000
+;; time literals with 1-3 digit fractional seconds
+10:00:00.1 -- 10:00:00.001
+10:00:00.01 -- 10:00:00.001
+10:00:00.12 -- 10:00:00.012
+10:00:00.011 -- 10:00:00.011
+10:00:00.123 -- 10:00:00.123
+;; ========== TIME VECTOR CASTS ==========
+(type (as 'TIME [0 1000 2000])) -- 'TIME
+(type (as 'TIME [0i 1000i 2000i])) -- 'TIME
+(type (as 'TIME [0h 1h 2h])) -- 'TIME
+(type (as 'TIME [0.0 1000.0 2000.0])) -- 'TIME
+;; ========== TIMESTAMP ATOM CASTS ==========
+;; timestamp <- b8
+(type (as 'timestamp false)) -- 'timestamp
+(type (as 'timestamp true)) -- 'timestamp
+;; timestamp <- u8
+(type (as 'timestamp 0x00)) -- 'timestamp
+;; timestamp <- i16
+(type (as 'timestamp 0h)) -- 'timestamp
+;; timestamp <- i32
+(type (as 'timestamp 0i)) -- 'timestamp
+;; timestamp <- i64
+(type (as 'timestamp 0)) -- 'timestamp
+(as 'timestamp 0) -- 2000.01.01D00:00:00.000000000
+;; timestamp <- f64
+(type (as 'timestamp 0.0)) -- 'timestamp
+;; timestamp <- date
+(type (as 'timestamp 2000.01.01)) -- 'timestamp
+;; timestamp <- time
+(type (as 'timestamp 00:00:01.000)) -- 'timestamp
+;; timestamp <- String
+(as 'timestamp "2024.03.20D12:30:45.123456789") -- 2024.03.20D12:30:45.123456789
+;; ========== TIMESTAMP VECTOR CASTS ==========
+(type (as 'TIMESTAMP [0 1 2])) -- 'TIMESTAMP
+(type (as 'TIMESTAMP [0i 1i 2i])) -- 'TIMESTAMP
+(type (as 'TIMESTAMP [0h 1h 2h])) -- 'TIMESTAMP
+(type (as 'TIMESTAMP [0.0 1.0 2.0])) -- 'TIMESTAMP
+;; ========== SYMBOL ATOM CASTS ==========
+;; symbol <- b8
+(as 'symbol false) -- '0
+(as 'symbol true) -- '1
+;; symbol <- u8
+(as 'symbol 0x00) -- '0
+(as 'symbol 0xFF) -- '255
+;; symbol <- i16
+(as 'symbol 42h) -- '42
+(as 'symbol -100h) -- '-100
+;; symbol <- i32
+(as 'symbol 42i) -- '42
+(as 'symbol -1000000i) -- '-1000000
+;; symbol <- i64
+(as 'symbol 42) -- '42
+(as 'symbol -9999999999) -- '-9999999999
+;; symbol <- f64
+(type (as 'symbol 42.5)) -- 'sym
+;; symbol <- date
+(type (as 'symbol 2024.03.20)) -- 'sym
+;; symbol <- time
+(type (as 'symbol 12:30:45.123)) -- 'sym
+;; symbol <- timestamp
+(type (as 'symbol 2024.03.20D12:30:45.123456789)) -- 'sym
+;; symbol <- guid
+(type (as 'symbol (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea"))) -- 'sym
+;; symbol <- String
+(as 'symbol "hello") -- 'hello
+;; ========== SYMBOL VECTOR CASTS ==========
+;; SYMBOL <- I64
+(type (as 'SYMBOL (til 5))) -- 'SYM
+(as 'SYMBOL [0 1 2]) -- [0 1 2]
+(as 'SYMBOL [42 -100 999]) -- [42 -100 999]
+(count (as 'SYMBOL (til 1000))) -- 1000
+;; ========== STRING/CHAR CASTS ==========
+(as 'STR 'hello) -- "hello"
+(as 'STR 123) -- "123"
+(as 'STR 123i) -- "123"
+(as 'STR 123h) -- "123"
+(as 'STR 123.45) -- "123.45"
+(as 'STR true) -- "true"
+(as 'STR false) -- "false"
+(as 'STR 2024.03.20) -- "2024.03.20"
+(as 'STR 12:30:45.123) -- "12:30:45.123"
+;; ========== GUID CASTS ==========
+(type (as 'guid "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) -- 'guid
+;; ========== IDENTITY CASTS (same type) ==========
+(as 'b8 true) -- true
+(as 'u8 0xFF) -- 0xFF
+(as 'i16 100h) -- 100h
+(as 'i32 100i) -- 100i
+(as 'i64 100) -- 100
+(as 'f64 100.5) -- 100.50
+(as 'date 2024.03.20) -- 2024.03.20
+(as 'time 12:30:45.123) -- 12:30:45.123
+(as 'symbol 'hello) -- 'hello
+;; ========== EMPTY VECTOR CASTS ==========
+(type (as 'B8 [])) -- 'B8
+(type (as 'U8 [])) -- 'U8
+(type (as 'I16 [])) -- 'I16
+(type (as 'I32 [])) -- 'I32
+(type (as 'I64 [])) -- 'I64
+(type (as 'F64 [])) -- 'F64
+(type (as 'DATE [])) -- 'DATE
+(type (as 'TIME [])) -- 'TIME
+(type (as 'TIMESTAMP [])) -- 'TIMESTAMP
+;; ========== TABLE/DICT CASTS ==========
+(type (as 'TABLE {a: [1 2 3] b: [4 5 6]})) -- 'TABLE
+(type (as 'DICT (as 'TABLE {a: [1 2 3] b: [4 5 6]}))) -- 'DICT
+;; ========== LIST TO VECTOR CASTS ==========
+(as 'I64 (list 1 2 3)) -- [1 2 3]
+(as 'I32 (list 1i 2i 3i)) -- [1i 2i 3i]
+(as 'F64 (list 1.0 2.0 3.0)) -- [1.0 2.0 3.0]
+(as 'B8 (list true false true)) -- [true false true]
+;; ========== STRING → NUMERIC, EDGE VALUES ==========
+;; integer-valued floats from strings
+(as 'f64 "0.0") -- 0.0
+(as 'f64 "100") -- 100.0
+
+;; INT16/INT32 boundary parses — negative-extreme literals can't be written
+;; (parser tokenises positive then negates), so verify via i64 round-trip.
+(as 'i64 (as 'i16 "-32768")) -- -32768
+(as 'i64 (as 'i16 "32767")) -- 32767
+(as 'i64 (as 'i32 "-2147483648")) -- -2147483648
+(as 'i64 (as 'i32 "2147483647")) -- 2147483647
+
+;; ========== NULL PRESERVATION ACROSS CASTS ==========
+;; Casting any null returns null of target type, never sentinel/INT_MIN.
+(nil? (as 'i64 0Nh)) -- true
+(nil? (as 'i64 0Ni)) -- true
+(nil? (as 'i32 0N))  -- true
+(nil? (as 'i16 0N))  -- true
+(nil? (as 'f64 0N))  -- true
+(nil? (as 'i64 0Nf)) -- true
+(nil? (as 'i32 0Nf)) -- true
+(nil? (as 'i16 0Nf)) -- true
+(nil? (as 'i64 0Nd)) -- true
+
+;; ========== TEMPORAL OFFSET SEMANTICS ==========
+;; DATE is days since 2000.01.01, TIME is ms since midnight.
+(as 'i64 2000.01.01) -- 0
+(as 'i64 2000.01.02) -- 1
+(as 'i64 1999.12.31) -- -1
+(as 'i64 00:00:00.000) -- 0
+(as 'i64 00:00:01.000) -- 1000
+(as 'i64 01:00:00.000) -- 3600000
+(as 'i64 23:59:59.999) -- 86399999
+
+;; integer → DATE/TIME round-trip
+(as 'date 0) -- 2000.01.01
+(as 'date 1) -- 2000.01.02
+(as 'time 1000) -- 00:00:01.000
+
+;; ========== PARALLEL CAST (large vectors) ==========
+;; i64 -> i32 (large vector triggers parallel processing)
+(sum (as 'I32 (til 100000))) -- 4999950000
+;; sum of i32 vec → i64 result (no truncation)
+;; i64 -> f64
+(sum (as 'F64 (til 100000))) -- 4999950000.0
+;; i32 -> i64
+(sum (as 'I64 (as 'I32 (til 100000)))) -- 4999950000
+;; i64 -> i16
+(count (as 'I16 (til 100000))) -- 100000
+;; i64 -> u8
+(count (as 'U8 (til 100000))) -- 100000
+;; f64 -> i64
+(sum (as 'I64 (as 'F64 (til 100000)))) -- 4999950000

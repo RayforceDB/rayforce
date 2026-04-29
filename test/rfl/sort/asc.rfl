@@ -1,0 +1,60 @@
+;; Invariants for `asc` (ascending sort).
+
+(asc [3 1 2]) -- [1 2 3]
+(asc [5]) -- [5]
+(asc []) -- []
+
+;; length preserved
+(set V (rand 200 10000))
+(count V) -- (count (asc V))
+
+;; sorted: neighbours obey <=
+(set S (asc V))
+(set N (- (count S) 1))
+N -- (sum (<= (at S (til N)) (at S (+ 1 (til N)))))
+
+;; multiset invariant: sum preserved
+(sum V) -- (sum (asc V))
+
+;; first/last
+(first (asc V)) -- (min V)
+(last (asc V)) -- (max V)
+
+;; idempotent
+(asc (asc V)) -- (asc V)
+
+;; ──────────────────────────────────────────────────────────────────
+;; Float / negatives / mixed
+;; ──────────────────────────────────────────────────────────────────
+
+(asc [3.14 1.41 2.71]) -- [1.41 2.71 3.14]
+(asc [-1 -3 -2]) -- [-3 -2 -1]
+
+;; ──────────────────────────────────────────────────────────────────
+;; Morsel boundaries — 1023 / 1024 / 1025 reversed
+;; ──────────────────────────────────────────────────────────────────
+
+(set V1 (reverse (til 1023)))
+(count (asc V1)) -- 1023
+(sum (asc V1))   -- 522753
+(first (asc V1)) -- 0
+(last (asc V1))  -- 1022
+
+(set V2 (reverse (til 1024)))
+(count (asc V2)) -- 1024
+(sum (asc V2))   -- 523776
+(first (asc V2)) -- 0
+(last (asc V2))  -- 1023
+
+(set V3 (reverse (til 1025)))
+(count (asc V3)) -- 1025
+(sum (asc V3))   -- 524800
+(first (asc V3)) -- 0
+(last (asc V3))  -- 1024
+
+;; ──────────────────────────────────────────────────────────────────
+;; Idempotence and asc + reverse == desc
+;; ──────────────────────────────────────────────────────────────────
+
+(asc (asc V2)) -- (asc V2)
+(reverse (asc V2)) -- (desc V2)

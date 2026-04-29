@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: debug
+          - os: ubuntu-latest
+            target: release
+          - os: macos-latest
+            target: debug
+          - os: macos-latest
+            target: release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (${{ matrix.target }})
+        run: make ${{ matrix.target }}
+
+      - name: Test
+        run: make test

@@ -1,0 +1,36 @@
+;; Invariants for `<=`.
+
+;; reflexive: (<= a a) is true
+(set A (- (rand 256 200000) 100000))
+(count A) -- (sum (<= A A))
+
+;; (<= a b) == (or (< a b) (== a b))
+(set B (- (rand 256 200000) 100000))
+(count A) -- (sum (== (<= A B) (or (< A B) (== A B))))
+
+;; concrete
+(<= 1 2) -- true
+(<= 2 1) -- false
+(<= 3 3) -- true
+
+;; cross-types
+(<= 5h 5h)   -- true
+(<= 3i 5i)   -- true
+(<= 2.5 2.5) -- true
+
+;; STR / DATE
+(<= "a" "b") -- true
+(<= "x" "x") -- true
+(<= 2024.01.15 2024.06.01) -- true
+
+;; vec
+(<= [1 5 5] [2 2 5]) -- [true false true]
+
+;; ──────────────────────────────────────────────────────────────────
+;; SYM ordering: reflexive, lexicographic.
+;; ──────────────────────────────────────────────────────────────────
+
+(<= 'a 'a) -- true
+(<= 'a 'b) -- true
+(<= 'b 'a) -- false
+(<= ['a 'b 'c] 'b) -- [true true false]

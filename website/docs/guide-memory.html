@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Memory &amp; Monitoring — Rayforce Documentation</title>
+  <meta name="description" content="Memory management, garbage collection, profiling, and monitoring tools in Rayforce: .sys.mem, gc, .sys.info, timeit, progress bars, and practical patterns.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link active">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Memory &amp; Monitoring</span>
+      </div>
+
+      <h1>Memory &amp; Monitoring</h1>
+      <p class="page-subtitle">Understand Rayforce's memory model, inspect allocator statistics, trigger garbage collection, and profile query performance from the REPL.</p>
+
+      <!-- 1. Memory Architecture Overview -->
+      <h2 id="memory-architecture">1. Memory Architecture Overview</h2>
+      <p>Rayforce uses a custom memory subsystem &mdash; no calls to <code>malloc</code> or <code>free</code> ever reach the C library. Every allocation flows through one of these layers:</p>
+      <ul>
+        <li><strong>Buddy allocator with thread-local heaps</strong> &mdash; Each VM thread gets its own heap (identified by a <code>heap_id</code>). Allocations are fast, lock-free within a thread. Cross-heap frees are deferred to a lock-free queue and reclaimed lazily.</li>
+        <li><strong>Slab cache</strong> &mdash; Small allocations (common for atoms and short vectors) are served from pre-sized slab pools, avoiding buddy-tree overhead.</li>
+        <li><strong>COW ref counting</strong> &mdash; Vectors use copy-on-write semantics via <code>ray_retain</code>/<code>ray_release</code>. Shared vectors are only copied when mutated.</li>
+        <li><strong>Arena allocator</strong> &mdash; For bulk short-lived blocks (e.g., intermediate query results). Arena objects carry an <code>RAY_ATTR_ARENA</code> flag that makes retain/release no-ops. The entire arena is freed at once when work completes.</li>
+        <li><strong>Memory budget</strong> &mdash; Auto-detected at initialization as 80% of physical RAM (via <code>sysconf</code> on POSIX, <code>GlobalMemoryStatusEx</code> on Windows). Queries that approach the budget may trigger spilling or offloading.</li>
+      </ul>
+      <p>For a deep dive into the allocator internals, see <a href="architecture-memory.html">Memory Model</a>.</p>
+
+      <!-- 2. .sys.mem -->
+      <h2 id=".sys.mem">2. The <code>.sys.mem</code> Function</h2>
+      <p>Call <code>(.sys.mem 0)</code> to get a snapshot of the current heap&rsquo;s allocation statistics. It returns a dictionary with the following fields:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Field</th>
+            <th>Type</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>alloc-count</code></td>
+            <td>i64</td>
+            <td>Total number of allocations performed since init</td>
+          </tr>
+          <tr>
+            <td><code>bytes-allocated</code></td>
+            <td>i64</td>
+            <td>Bytes currently allocated (live objects)</td>
+          </tr>
+          <tr>
+            <td><code>peak-bytes</code></td>
+            <td>i64</td>
+            <td>High-water mark of bytes-allocated</td>
+          </tr>
+          <tr>
+            <td><code>slab-hits</code></td>
+            <td>i64</td>
+            <td>Number of allocations served from the slab cache</td>
+          </tr>
+          <tr>
+            <td><code>sys-current</code></td>
+            <td>i64</td>
+            <td>Bytes currently mapped from the OS (mmap/VirtualAlloc)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Basic Usage</h3>
+      <pre><code><span class="hl-comment">;; Check current memory stats</span>
+(<span class="hl-fn">.sys.mem</span>)</code></pre>
+      <pre><code>alloc-count     | 14523
+bytes-allocated | 2621440
+peak-bytes      | 5242880
+slab-hits       | 9870
+sys-current     | 8388608</code></pre>
+
+      <h3>Checking Memory Before and After an Operation</h3>
+      <pre><code><span class="hl-comment">;; Snapshot before</span>
+(<span class="hl-kw">set</span> before (<span class="hl-fn">.sys.mem</span>))
+
+<span class="hl-comment">;; Load a large CSV</span>
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">.csv.read</span> <span class="hl-str">"trades-10M.csv"</span>))
+
+<span class="hl-comment">;; Snapshot after</span>
+(<span class="hl-kw">set</span> after (<span class="hl-fn">.sys.mem</span>))
+
+<span class="hl-comment">;; See how much memory the load consumed</span>
+(<span class="hl-fn">-</span> (after <span class="hl-sym">'bytes-allocated</span>) (before <span class="hl-sym">'bytes-allocated</span>))</code></pre>
+      <pre><code>838860800</code></pre>
+      <p>In this example, loading 10 million rows consumed roughly 800 MB of heap memory.</p>
+
+      <!-- 3. .sys.gc -->
+      <h2 id="gc">3. The <code>.sys.gc</code> Function</h2>
+      <p>Call <code>(.sys.gc 0)</code> to signal that the runtime should reclaim unused memory. Currently this is a lightweight hook that returns <code>0</code> &mdash; Rayforce uses deterministic ref counting and eager page release via <code>madvise</code> during buddy coalescing, so most memory is reclaimed automatically when references are dropped.</p>
+
+      <pre><code>(<span class="hl-fn">.sys.gc</span>)  <span class="hl-comment">; 0</span></code></pre>
+
+      <div class="info-box">
+        <strong>Note:</strong> Because Rayforce uses deterministic ref counting (not tracing GC), memory is freed immediately when the last reference is released. The buddy allocator coalesces blocks and releases pages back to the OS automatically. <code>(.sys.gc 0)</code> exists as a hook for future use.
+      </div>
+
+      <!-- 4. .sys.info -->
+      <h2 id=".sys.info">4. The <code>.sys.info</code> Function</h2>
+      <p>Call <code>(.sys.info 0)</code> to see system-level information about the Rayforce runtime:</p>
+      <pre><code>(<span class="hl-fn">.sys.info</span>)</code></pre>
+      <pre><code>cores     | 16
+page-size | 4096
+total-mem | 16777216000</code></pre>
+      <table>
+        <thead>
+          <tr>
+            <th>Field</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>cores</code></td>
+            <td>Number of logical CPU cores available</td>
+          </tr>
+          <tr>
+            <td><code>page-size</code></td>
+            <td>OS page size in bytes</td>
+          </tr>
+          <tr>
+            <td><code>total-mem</code></td>
+            <td>Total physical RAM in bytes</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="info-box">
+        <strong>Note:</strong> On Windows, only <code>cores</code> is currently reported.
+      </div>
+
+      <!-- 5. Progress Monitoring -->
+      <h2 id="progress">5. Progress Monitoring</h2>
+      <p>Long-running queries display a progress bar automatically in the REPL. The bar appears after approximately 2 seconds of execution and shows real-time feedback.</p>
+
+      <h3>Progress Bar Format</h3>
+      <pre><code>[████████░░░░░░░░]  52% · group: hash · 3.2s · 1.2G/12.8G</code></pre>
+      <p>The bar displays:</p>
+      <ul>
+        <li><strong>Percentage</strong> &mdash; Estimated completion based on rows processed</li>
+        <li><strong>Operation name</strong> &mdash; The current phase (e.g., <code>group: hash</code>, <code>sort: merge</code>, <code>join: probe</code>)</li>
+        <li><strong>Elapsed time</strong> &mdash; Wall-clock time since query start</li>
+        <li><strong>Memory usage</strong> &mdash; Current heap usage vs. the memory budget</li>
+      </ul>
+
+      <h3>Example Session</h3>
+      <pre><code><span class="hl-comment">;; This query processes 50 million rows -- progress bar appears automatically</span>
+(<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: trades
+         <span class="hl-sym">by</span>: {<span class="hl-sym">sym</span>: sym}
+         <span class="hl-sym">cols</span>: {<span class="hl-sym">total</span>: (<span class="hl-fn">sum</span> price)
+                <span class="hl-sym">n</span>: (<span class="hl-fn">count</span> price)
+                <span class="hl-sym">hi</span>: (<span class="hl-fn">max</span> price)}})</code></pre>
+      <pre><code>[████████████████]  100% · group: merge · 4.1s · 3.8G/12.8G
+┌──────┬───────────────┬──────────┬──────────┐
+│  sym │     total     │    n     │    hi    │
+│  sym │      f64      │   i64    │   f64    │
+├──────┼───────────────┼──────────┼──────────┤
+│ AAPL │ 8825431692.50 │ 50120832 │   502.39 │
+│ GOOG │ 6129847201.75 │ 49879168 │   501.97 │
+├──────┴───────────────┴──────────┴──────────┤
+│ 2 rows                        4 columns    │
+└────────────────────────────────────────────┘</code></pre>
+      <p>The progress bar is cleared automatically when the query completes and the result is displayed. In non-interactive mode (file execution), progress output is suppressed.</p>
+
+      <!-- 6. timeit -->
+      <h2 id="timeit">6. The <code>timeit</code> Function</h2>
+      <p>Wrap any expression in <code>(timeit ...)</code> to measure its execution time. It evaluates the expression, discards the result, and <strong>returns the elapsed time in milliseconds</strong> as an f64 value.</p>
+
+      <pre><code><span class="hl-comment">;; Time a simple vector operation</span>
+(<span class="hl-fn">timeit</span> (<span class="hl-fn">sum</span> (<span class="hl-fn">til</span> <span class="hl-num">10000000</span>)))</code></pre>
+      <pre><code>12.4</code></pre>
+
+      <pre><code><span class="hl-comment">;; Time a grouped aggregation</span>
+(<span class="hl-fn">timeit</span> (<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: trades
+                 <span class="hl-sym">by</span>: {<span class="hl-sym">sym</span>: sym}
+                 <span class="hl-sym">cols</span>: {<span class="hl-sym">n</span>: (<span class="hl-fn">count</span> price)}}))</code></pre>
+      <pre><code>291.0</code></pre>
+
+      <div class="info-box">
+        <strong>Note:</strong> <code>timeit</code> returns only the elapsed milliseconds &mdash; it does not return the expression&rsquo;s result. To see the result and the timing, evaluate the expression separately and use <code>timeit</code> for benchmarking.
+      </div>
+
+      <!-- 7. :timeit REPL Command -->
+      <h2 id="repl-timeit">7. Profiling with <code>:t</code></h2>
+      <p>The REPL command <code>:t</code> (or <code>:timeit</code>) toggles profiling mode. When active, every expression displays a detailed timing span tree showing where time was spent.</p>
+
+      <h3>Example Session</h3>
+      <pre><code><span class="hl-comment">;; Toggle profiling on</span>
+:t</code></pre>
+      <pre><code>. Timeit is on.</code></pre>
+      <pre><code><span class="hl-comment">;; Now every expression shows timing spans</span>
+(<span class="hl-fn">sum</span> (<span class="hl-fn">til</span> <span class="hl-num">1000000</span>))</code></pre>
+      <pre><code>499999500000
+── top-level ─────────── 1.8ms</code></pre>
+      <pre><code><span class="hl-comment">;; Toggle profiling off</span>
+:t</code></pre>
+      <pre><code>. Timeit is off.</code></pre>
+      <p>This is the fastest way to identify slow expressions in an interactive session. Combine it with <code>.sys.mem</code> snapshots to see both time and memory costs.</p>
+
+      <!-- 8. Memory Budget and Pressure -->
+      <h2 id="memory-budget">8. Memory Budget and Pressure</h2>
+      <p>Rayforce auto-detects the memory budget at startup as 80% of physical RAM. This budget governs when the runtime begins applying back-pressure to avoid exhausting system memory.</p>
+
+      <h3>Checking the Budget</h3>
+      <pre><code><span class="hl-comment">;; The total-mem field shows total physical RAM</span>
+(<span class="hl-fn">.sys.info</span>)</code></pre>
+      <pre><code>cores     | 16
+page-size | 4096
+total-mem | 16777216000</code></pre>
+      <p>On this machine with 16 GB of RAM, the memory budget (80%) is approximately 12.5 GB.</p>
+
+      <h3>How Pressure Works</h3>
+      <p>When heap usage exceeds the memory budget:</p>
+      <ul>
+        <li>The executor may switch to streaming/morsel-at-a-time processing for large intermediate results</li>
+        <li>Block offloading can spill cold data to disk (see <a href="architecture-offloading.html">Block Offloading</a>)</li>
+        <li>The progress bar shows current memory relative to the budget so you can see pressure building</li>
+      </ul>
+      <p>You can monitor pressure by comparing <code>bytes-allocated</code> from <code>(.sys.mem 0)</code> against <code>total-mem</code> from <code>(.sys.info 0)</code>:</p>
+      <pre><code><span class="hl-comment">;; Calculate memory pressure as a percentage</span>
+(<span class="hl-kw">set</span> stats (<span class="hl-fn">.sys.mem</span>))
+(<span class="hl-kw">set</span> info (<span class="hl-fn">.sys.info</span>))
+(<span class="hl-fn">*</span> <span class="hl-num">100.0</span> (<span class="hl-fn">/</span> (stats <span class="hl-sym">bytes-allocated</span>) (info <span class="hl-sym">total-mem</span>)))</code></pre>
+      <pre><code>29.4</code></pre>
+      <p>This shows 29.4% of the budget is in use &mdash; plenty of headroom.</p>
+
+      <!-- 9. Practical Patterns -->
+      <h2 id="practical-patterns">9. Practical Patterns</h2>
+
+      <h3>Pattern 1: Monitor Memory During CSV Loading</h3>
+      <pre><code><span class="hl-comment">;; Check baseline</span>
+(<span class="hl-kw">set</span> m0 (<span class="hl-fn">.sys.mem</span>))
+
+<span class="hl-comment">;; Load data</span>
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">.csv.read</span> <span class="hl-str">"trades-50M.csv"</span>))
+
+<span class="hl-comment">;; Check cost</span>
+(<span class="hl-kw">set</span> m1 (<span class="hl-fn">.sys.mem</span>))
+(<span class="hl-fn">println</span> (<span class="hl-fn">format</span> <span class="hl-str">"Loaded: {} bytes, peak: {} bytes"</span>
+  (<span class="hl-fn">-</span> (m1 <span class="hl-sym">bytes-allocated</span>) (m0 <span class="hl-sym">bytes-allocated</span>))
+  (m1 <span class="hl-sym">peak-bytes</span>)))</code></pre>
+      <pre><code>Loaded: 4194304000 bytes, peak: 4831838208 bytes</code></pre>
+
+      <h3>Pattern 2: GC Between Independent Queries</h3>
+      <pre><code><span class="hl-comment">;; First analysis pass</span>
+(<span class="hl-kw">set</span> result1 (<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: trades
+                       <span class="hl-sym">by</span>: {<span class="hl-sym">date</span>: date}
+                       <span class="hl-sym">cols</span>: {<span class="hl-sym">vol</span>: (<span class="hl-fn">sum</span> qty)}})
+(<span class="hl-fn">.csv.write</span> result1 <span class="hl-str">"daily-volume.csv"</span>)
+(<span class="hl-kw">set</span> result1 <span class="hl-num">0</span>)
+
+<span class="hl-comment">;; Free intermediates before the next heavy query</span>
+(<span class="hl-fn">.sys.gc</span>)
+
+<span class="hl-comment">;; Second analysis pass with maximum headroom</span>
+(<span class="hl-kw">set</span> result2 (<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: trades
+                       <span class="hl-sym">by</span>: {<span class="hl-sym">sym</span>: sym}
+                       <span class="hl-sym">cols</span>: {<span class="hl-sym">vwap</span>: (<span class="hl-fn">/</span> (<span class="hl-fn">sum</span> (<span class="hl-fn">*</span> price qty)) (<span class="hl-fn">sum</span> qty))}}))</code></pre>
+
+      <h3>Pattern 3: Profile a Slow Query</h3>
+      <pre><code><span class="hl-comment">;; Enable REPL profiling</span>
+:timeit
+
+<span class="hl-comment">;; Break the query into parts to find the bottleneck</span>
+(<span class="hl-kw">set</span> filtered (<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: trades <span class="hl-sym">where</span>: (<span class="hl-fn">&gt;</span> price <span class="hl-num">100.0</span>)}))</code></pre>
+      <pre><code>elapsed: 42.1ms</code></pre>
+      <pre><code>(<span class="hl-kw">set</span> grouped (<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: filtered
+                        <span class="hl-sym">by</span>: {<span class="hl-sym">sym</span>: sym}
+                        <span class="hl-sym">cols</span>: {<span class="hl-sym">avg_price</span>: (<span class="hl-fn">avg</span> price)
+                               <span class="hl-sym">n</span>: (<span class="hl-fn">count</span> price)}}))</code></pre>
+      <pre><code>elapsed: 203.7ms</code></pre>
+      <pre><code>(<span class="hl-kw">set</span> sorted (<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: grouped <span class="hl-sym">by</span>: {<span class="hl-sym">n</span>: (<span class="hl-fn">desc</span> n)}}))</code></pre>
+      <pre><code>elapsed: 0.8ms</code></pre>
+      <pre><code><span class="hl-comment">;; The group-by at 204ms is the bottleneck, not the filter (42ms) or sort (&lt;1ms)</span>
+:timeit</code></pre>
+
+      <h3>Pattern 4: Check Peak Memory After a Join</h3>
+      <pre><code><span class="hl-comment">;; Reset peak tracking with .sys.gc</span>
+(<span class="hl-fn">.sys.gc</span>)
+(<span class="hl-kw">set</span> before-peak ((.sys.mem 0) <span class="hl-sym">peak-bytes</span>))
+
+<span class="hl-comment">;; Run a memory-intensive join</span>
+(<span class="hl-kw">set</span> joined (<span class="hl-fn">select</span> {<span class="hl-sym">from</span>: trades <span class="hl-sym">join</span>: quotes <span class="hl-sym">on</span>: [<span class="hl-sym">sym</span> <span class="hl-sym">time</span>]}))
+
+<span class="hl-comment">;; Check the peak</span>
+(<span class="hl-kw">set</span> after-peak ((.sys.mem 0) <span class="hl-sym">peak-bytes</span>))
+(<span class="hl-fn">println</span> (<span class="hl-fn">format</span> <span class="hl-str">"Join peak overhead: {} bytes"</span>
+  (<span class="hl-fn">-</span> after-peak before-peak)))</code></pre>
+      <pre><code>Join peak overhead: 1073741824 bytes</code></pre>
+      <p>This tells you the join needed about 1 GB of temporary memory beyond what was already allocated.</p>
+
+      <h2 id="summary">Summary</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Tool</th>
+            <th>What It Does</th>
+            <th>When to Use</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>(.sys.mem 0)</code></td>
+            <td>Returns heap allocation statistics</td>
+            <td>Monitor memory usage, detect leaks</td>
+          </tr>
+          <tr>
+            <td><code>(.sys.gc 0)</code></td>
+            <td>Flushes caches, releases pages</td>
+            <td>Between heavy queries, before benchmarks</td>
+          </tr>
+          <tr>
+            <td><code>(.sys.info 0)</code></td>
+            <td>Shows system and runtime info</td>
+            <td>Check budget, CPU count, OS details</td>
+          </tr>
+          <tr>
+            <td><code>(timeit expr)</code></td>
+            <td>Measures execution time of one expression</td>
+            <td>Benchmark a specific operation</td>
+          </tr>
+          <tr>
+            <td><code>:timeit</code></td>
+            <td>Toggles profiling for all REPL expressions</td>
+            <td>Interactive performance exploration</td>
+          </tr>
+          <tr>
+            <td>Progress bar</td>
+            <td>Automatic during long queries</td>
+            <td>Visual feedback on query progress</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="next-steps">Next Steps</h2>
+      <ul>
+        <li><a href="architecture-memory.html"><strong>Memory Model</strong></a> &mdash; Deep dive into the buddy allocator, arenas, COW, and per-VM heaps</li>
+        <li><a href="architecture-offloading.html"><strong>Block Offloading</strong></a> &mdash; How Rayforce handles datasets larger than RAM</li>
+        <li><a href="architecture-pipeline.html"><strong>Pipeline &amp; Optimizer</strong></a> &mdash; How queries are planned, optimized, and executed</li>
+        <li><a href="repl.html"><strong>REPL Reference</strong></a> &mdash; All REPL commands and configuration</li>
+      </ul>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="guide-errors.html" class="docs-nav-link prev"><span class="docs-nav-dir">&larr; Previous</span><span class="docs-nav-title">Error Handling</span></a>
+        <a href="guide-types.html" class="docs-nav-link next"><span class="docs-nav-dir">Next &rarr;</span><span class="docs-nav-title">Type Casting</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

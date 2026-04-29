@@ -1,0 +1,26 @@
+;; Ported from test_lang_rf.inc::test_rf_null.
+
+;; ========== NIL? TESTS ==========
+(nil? null) -- true
+(nil? 0Nl) -- true
+(nil? 0) -- false
+(nil? 1) -- false
+(nil? "") -- false
+;; nil? distinguishes typed nulls from zero-valued atoms across types
+(nil? 0Ni)   -- true
+(nil? 0Nf)   -- true
+(nil? 5)     -- false
+(nil? 3.14)  -- false
+(nil? false) -- false
+;; ========== NULL PROPAGATION ==========
+(+ 1 0Nl) -- 0Nl
+(* 5 0Nl) -- 0Nl
+(+ [1 2 3] [0Nl 2 3]) -- [0Nl 4 6]
+;; ========== NULL COMPARISONS ==========
+(== 0Nl 0Nl) -- true
+(== null null) -- true
+;; ========== NULL IN TABLES ==========
+(set t (table [a b] (list [1 0Nl 3] [4 5 6])))(at (at t 'a) 1) -- 0Nl
+;; ========== INT64_MIN IS A VALID VALUE (not a sentinel) ==========
+(+ 0 -9223372036854775807) -- -9223372036854775807
+(- 0 9223372036854775807) -- -9223372036854775807

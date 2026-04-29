@@ -1,0 +1,12 @@
+;; Numeric-heavy CSV: 10M rows × 6 columns, all I64/F64.  Used to isolate
+;; the impact of the SWAR i64/f64 parsers from string-pipeline overhead.
+(set n 10000000)
+(set t (table [a b c d e f]
+    (list (til n)
+          (+ 100 (til n))
+          (+ 200 (til n))
+          (as 'F64 (til n))
+          (as 'F64 (+ 0.5 (til n)))
+          (as 'F64 (+ 0.25 (til n))))))
+(.csv.write t "/tmp/numeric_bench.csv")
+(println "wrote /tmp/numeric_bench.csv (% rows)" n)

@@ -1,0 +1,57 @@
+;; Invariants for `==`.
+
+;; reflexive:  (== a a) is true for every element
+(set A (- (rand 256 200000) 100000))
+(count A) -- (sum (== A A))
+
+;; symmetric:  (== a b) == (== b a)
+(set A (- (rand 256 200000) 100000))
+(set B (- (rand 256 200000) 100000))
+(count A) -- (sum (== (== A B) (== B A)))
+
+;; ──────────────────────────────────────────────────────────────────
+;; Concrete — atom + vec across all comparable types
+;; ──────────────────────────────────────────────────────────────────
+
+;; reflexive concrete
+(== 5 5)         -- true
+(== -5 -5)       -- true
+(== 0 0)         -- true
+(== 3.14 3.14)   -- true
+(== "hello" "hello") -- true
+(== "" "")       -- true
+(== true true)   -- true
+(== false false) -- true
+
+;; non-equal
+(== 3 4) -- false
+(== "a" "b") -- false
+
+;; symmetric
+(== 3 5) -- (== 5 3)
+
+;; vec element-wise
+(== [1 2 3] [1 2 3]) -- [true true true]
+(== [1 2 3] [1 5 3]) -- [true false true]
+
+;; cross-width numeric promotion
+(== 5h 5)   -- true
+(== 5i 5)   -- true
+(== 5 5.0)  -- true
+
+;; sym
+(== 'foo 'foo) -- true
+(== 'foo 'bar) -- false
+(== ['a 'b] ['a 'b]) -- [true true]
+
+;; date
+(== 2024.01.15 2024.01.15) -- true
+(== 2024.01.15 2024.06.01) -- false
+
+;; ──────────────────────────────────────────────────────────────────
+;; Morsel boundary
+;; ──────────────────────────────────────────────────────────────────
+
+(set V (til 1024))
+(sum (== V V)) -- 1024
+(sum (== V 0)) -- 1

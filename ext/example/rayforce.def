@@ -1,6 +1,0 @@
-EXPORTS
-    is_null
-    type_name
-    error
-    null
-    i64

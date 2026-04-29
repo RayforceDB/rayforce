@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Functions Reference — Rayforce Documentation</title>
+  <meta name="description" content="Complete reference for all 120+ Rayfall built-in functions: arithmetic, comparison, aggregation, higher-order, collection, sorting, table, query, join, I/O, string, temporal, type, and system operations.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link active">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Functions Reference</span>
+      </div>
+
+      <h1>Functions Reference</h1>
+      <p class="page-subtitle">Complete reference for all Rayfall built-in functions. Each entry shows the function name, arity type (unary/binary/variadic), flags, description, and example usage.</p>
+
+      <div class="info-box">
+        <strong>Legend:</strong> Functions marked <strong>atomic</strong> auto-map element-wise over vectors. Functions marked <strong>aggr</strong> reduce vectors to scalars. Functions marked <strong>special</strong> receive unevaluated arguments.
+      </div>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="arithmetic">Arithmetic</h2>
+      <p>All arithmetic operators are <strong>atomic</strong> &mdash; they auto-map over vectors and broadcast scalars.</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>+</code></td><td>binary</td><td>Addition</td><td><code>(+ 3 4)</code> &rarr; <code>7</code></td></tr>
+          <tr><td><code>-</code></td><td>binary</td><td>Subtraction</td><td><code>(- 10 3)</code> &rarr; <code>7</code></td></tr>
+          <tr><td><code>*</code></td><td>binary</td><td>Multiplication</td><td><code>(* 3 4)</code> &rarr; <code>12</code></td></tr>
+          <tr><td><code>/</code></td><td>binary</td><td>Integer division (floor)</td><td><code>(/ 7 2)</code> &rarr; <code>3</code></td></tr>
+          <tr><td><code>%</code></td><td>binary</td><td>Modulo</td><td><code>(% 7 3)</code> &rarr; <code>1</code></td></tr>
+          <tr><td><code>div</code></td><td>binary</td><td>Float division (always f64)</td><td><code>(div 7 2)</code> &rarr; <code>3.5</code></td></tr>
+          <tr><td><code>neg</code></td><td>unary</td><td>Negate</td><td><code>(neg 5)</code> &rarr; <code>-5</code></td></tr>
+          <tr><td><code>round</code></td><td>unary</td><td>Round to nearest integer</td><td><code>(round 3.7)</code> &rarr; <code>4.0</code></td></tr>
+          <tr><td><code>floor</code></td><td>unary</td><td>Floor (round down)</td><td><code>(floor 3.7)</code> &rarr; <code>3.0</code></td></tr>
+          <tr><td><code>ceil</code></td><td>unary</td><td>Ceiling (round up)</td><td><code>(ceil 3.2)</code> &rarr; <code>4.0</code></td></tr>
+          <tr><td><code>xbar</code></td><td>binary</td><td>Round down to nearest multiple (bucketing)</td><td><code>(xbar [3 7 12] 5)</code> &rarr; <code>[0 5 10]</code></td></tr>
+        </tbody>
+      </table>
+
+      <p>Vector examples:</p>
+      <pre><code>(<span class="hl-fn">+</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span>])   <span class="hl-comment">; [11 22 33]</span>
+(<span class="hl-fn">*</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] <span class="hl-num">10</span>)            <span class="hl-comment">; [10 20 30]  scalar broadcast</span>
+(<span class="hl-fn">neg</span> [<span class="hl-num">1</span> <span class="hl-num">-2</span> <span class="hl-num">3</span>])             <span class="hl-comment">; [-1 2 -3]</span>
+(<span class="hl-fn">xbar</span> [<span class="hl-num">3</span> <span class="hl-num">15</span> <span class="hl-num">27</span>] <span class="hl-num">10</span>)      <span class="hl-comment">; [0 10 20]</span></code></pre>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="comparison">Comparison</h2>
+      <p>All comparison operators are <strong>atomic</strong> and return boolean results.</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>&gt;</code></td><td>binary</td><td>Greater than</td><td><code>(&gt; 5 3)</code> &rarr; <code>true</code></td></tr>
+          <tr><td><code>&lt;</code></td><td>binary</td><td>Less than</td><td><code>(&lt; 3 5)</code> &rarr; <code>true</code></td></tr>
+          <tr><td><code>&gt;=</code></td><td>binary</td><td>Greater than or equal</td><td><code>(&gt;= 5 5)</code> &rarr; <code>true</code></td></tr>
+          <tr><td><code>&lt;=</code></td><td>binary</td><td>Less than or equal</td><td><code>(&lt;= 3 5)</code> &rarr; <code>true</code></td></tr>
+          <tr><td><code>==</code></td><td>binary</td><td>Equal</td><td><code>(== 3 3)</code> &rarr; <code>true</code></td></tr>
+          <tr><td><code>!=</code></td><td>binary</td><td>Not equal</td><td><code>(!= 3 4)</code> &rarr; <code>true</code></td></tr>
+          <tr><td><code>within</code></td><td>binary</td><td>Check which vector elements fall within a range</td><td><code>(within [1 5 10] [3 7])</code> &rarr; <code>[false true false]</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="logic">Logic</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>and</code></td><td>binary</td><td>Logical AND</td><td><code>(and true false)</code> &rarr; <code>false</code></td></tr>
+          <tr><td><code>or</code></td><td>binary</td><td>Logical OR</td><td><code>(or true false)</code> &rarr; <code>true</code></td></tr>
+          <tr><td><code>not</code></td><td>unary</td><td>Logical NOT</td><td><code>(not true)</code> &rarr; <code>false</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="aggregation">Aggregation</h2>
+      <p>Aggregation functions are marked <strong>aggr</strong> and reduce vectors to scalar values. Used in <code>select</code> with <code>by:</code> for group-by aggregation.</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>sum</code></td><td>unary, aggr</td><td>Sum of all elements</td><td><code>(sum [1 2 3])</code> &rarr; <code>6</code></td></tr>
+          <tr><td><code>count</code></td><td>unary, aggr</td><td>Count of elements</td><td><code>(count [1 2 3])</code> &rarr; <code>3</code></td></tr>
+          <tr><td><code>avg</code></td><td>unary, aggr</td><td>Arithmetic mean</td><td><code>(avg [1 2 3])</code> &rarr; <code>2.0</code></td></tr>
+          <tr><td><code>min</code></td><td>unary, aggr</td><td>Minimum value</td><td><code>(min [3 1 2])</code> &rarr; <code>1</code></td></tr>
+          <tr><td><code>max</code></td><td>unary, aggr</td><td>Maximum value</td><td><code>(max [3 1 2])</code> &rarr; <code>3</code></td></tr>
+          <tr><td><code>med</code></td><td>unary, aggr</td><td>Median value</td><td><code>(med [1 3 2])</code> &rarr; <code>2</code></td></tr>
+          <tr><td><code>dev</code></td><td>unary, aggr</td><td>Standard deviation</td><td><code>(dev [1 2 3])</code> &rarr; <code>0.816...</code></td></tr>
+          <tr><td><code>first</code></td><td>unary</td><td>First element of vector</td><td><code>(first [10 20 30])</code> &rarr; <code>10</code></td></tr>
+          <tr><td><code>last</code></td><td>unary</td><td>Last element of vector</td><td><code>(last [10 20 30])</code> &rarr; <code>30</code></td></tr>
+        </tbody>
+      </table>
+
+      <pre><code><span class="hl-comment">; Group-by aggregation example</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades
+         <span class="hl-sym">by:</span>   {<span class="hl-sym">sym:</span> sym}
+         <span class="hl-sym">cols:</span> {<span class="hl-sym">hi:</span> (<span class="hl-fn">max</span> price) <span class="hl-sym">lo:</span> (<span class="hl-fn">min</span> price) <span class="hl-sym">n:</span> (<span class="hl-fn">count</span> price)}})</code></pre>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="higher-order">Higher-Order Functions</h2>
+      <p>Functions that take other functions as arguments.</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>map</code></td><td>variadic</td><td>Apply function to each element</td><td><code>(map (fn [x] (* x 2)) [1 2 3])</code> &rarr; <code>[2 4 6]</code></td></tr>
+          <tr><td><code>pmap</code></td><td>variadic</td><td>Parallel map (multi-threaded)</td><td><code>(pmap (fn [x] (* x x)) [1 2 3])</code> &rarr; <code>[1 4 9]</code></td></tr>
+          <tr><td><code>filter</code></td><td>binary</td><td>Keep elements where boolean mask is true</td><td><code>(filter [1 2 3 4] (&gt; [1 2 3 4] 2))</code> &rarr; <code>[3 4]</code></td></tr>
+          <tr><td><code>fold</code></td><td>variadic</td><td>Reduce with function and initial value</td><td><code>(fold + 0 [1 2 3])</code> &rarr; <code>6</code></td></tr>
+          <tr><td><code>fold-left</code></td><td>variadic</td><td>Left-associative fold</td><td><code>(fold-left - 10 [1 2 3])</code> &rarr; <code>4</code></td></tr>
+          <tr><td><code>fold-right</code></td><td>variadic</td><td>Right-associative fold</td><td><code>(fold-right - 10 [1 2 3])</code> &rarr; <code>-8</code></td></tr>
+          <tr><td><code>scan</code></td><td>variadic</td><td>Running fold (returns all intermediate results)</td><td><code>(scan + (enlist 1 2 3))</code> &rarr; <code>[1 3 6]</code></td></tr>
+          <tr><td><code>scan-left</code></td><td>variadic</td><td>Left-to-right running fold</td><td><code>(scan-left + (enlist 1 2 3))</code> &rarr; <code>[1 3 6]</code></td></tr>
+          <tr><td><code>scan-right</code></td><td>variadic</td><td>Right-to-left running fold</td><td><code>(scan-right + (enlist 1 2 3))</code> &rarr; <code>[6 5 3]</code></td></tr>
+          <tr><td><code>apply</code></td><td>variadic</td><td>Zip-apply function pairwise over two lists</td><td><code>(apply + (enlist 1 2) (enlist 3 4))</code> &rarr; <code>[4 6]</code></td></tr>
+          <tr><td><code>map-left</code></td><td>variadic</td><td>Map with left argument fixed</td><td><code>(map-left + 10 [1 2 3])</code> &rarr; <code>[11 12 13]</code></td></tr>
+          <tr><td><code>map-right</code></td><td>variadic</td><td>Map with right argument fixed</td><td><code>(map-right - [10 20 30] 5)</code> &rarr; <code>[5 15 25]</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="collection">Collection Operations</h2>
+      <p>Operations on vectors as collections.</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>distinct</code></td><td>unary</td><td>Remove duplicates</td><td><code>(distinct [1 2 2 3])</code> &rarr; <code>[1 2 3]</code></td></tr>
+          <tr><td><code>in</code></td><td>binary</td><td>Membership test (element in vector)</td><td><code>(in 2 [1 2 3])</code> &rarr; <code>true</code></td></tr>
+          <tr><td><code>except</code></td><td>binary</td><td>Set difference</td><td><code>(except [1 2 3] [2])</code> &rarr; <code>[1 3]</code></td></tr>
+          <tr><td><code>union</code></td><td>binary</td><td>Set union</td><td><code>(union [1 2] [2 3])</code> &rarr; <code>[1 2 3]</code></td></tr>
+          <tr><td><code>sect</code></td><td>binary</td><td>Set intersection</td><td><code>(sect [1 2 3] [2 3 4])</code> &rarr; <code>[2 3]</code></td></tr>
+          <tr><td><code>take</code></td><td>binary</td><td>Take first/last N elements</td><td><code>(take [10 20 30] 2)</code> &rarr; <code>[10 20]</code></td></tr>
+          <tr><td><code>at</code></td><td>binary</td><td>Index into vector</td><td><code>(at [10 20 30] 1)</code> &rarr; <code>20</code></td></tr>
+          <tr><td><code>find</code></td><td>binary</td><td>Find index of value</td><td><code>(find [10 20 30] 20)</code> &rarr; <code>1</code></td></tr>
+          <tr><td><code>reverse</code></td><td>unary</td><td>Reverse order</td><td><code>(reverse [1 2 3])</code> &rarr; <code>[3 2 1]</code></td></tr>
+          <tr><td><code>til</code></td><td>unary</td><td>Range [0..n)</td><td><code>(til 5)</code> &rarr; <code>[0 1 2 3 4]</code></td></tr>
+          <tr><td><code>enlist</code></td><td>variadic</td><td>Wrap value(s) in a vector</td><td><code>(enlist 1 2 3)</code> &rarr; <code>[1 2 3]</code></td></tr>
+          <tr><td><code>concat</code></td><td>binary</td><td>Concatenate two vectors</td><td><code>(concat [1 2] [3 4])</code> &rarr; <code>[1 2 3 4]</code></td></tr>
+          <tr><td><code>raze</code></td><td>unary</td><td>Flatten a list of vectors into one</td><td><code>(raze (list [1 2] [3 4]))</code> &rarr; <code>[1 2 3 4]</code></td></tr>
+          <tr><td><code>where</code></td><td>unary</td><td>Indices where boolean vector is true</td><td><code>(where [true false true])</code> &rarr; <code>[0 2]</code></td></tr>
+          <tr><td><code>group</code></td><td>unary</td><td>Group indices by value</td><td><code>(group [A B A])</code> &rarr; dict of groups</td></tr>
+          <tr><td><code>diverse</code></td><td>unary</td><td>Check if all elements are unique</td><td><code>(diverse [1 2 3])</code> &rarr; <code>true</code></td></tr>
+          <tr><td><code>rand</code></td><td>binary</td><td>N random values from range or vector</td><td><code>(rand 3 100)</code> &rarr; 3 random ints 0..99</td></tr>
+          <tr><td><code>bin</code></td><td>binary</td><td>Binary search (left boundary)</td><td><code>(bin [10 20 30] 25)</code> &rarr; <code>1</code></td></tr>
+          <tr><td><code>binr</code></td><td>binary</td><td>Binary search (right boundary)</td><td><code>(binr [10 20 30] 25)</code> &rarr; <code>2</code></td></tr>
+          <tr><td><code>unify</code></td><td>binary</td><td>Merge two tables/dicts, second takes precedence</td><td><code>(unify d1 d2)</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="sorting">Sorting &amp; Ordering</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>asc</code></td><td>unary</td><td>Sort ascending</td><td><code>(asc [3 1 2])</code> &rarr; <code>[1 2 3]</code></td></tr>
+          <tr><td><code>desc</code></td><td>unary</td><td>Sort descending</td><td><code>(desc [3 1 2])</code> &rarr; <code>[3 2 1]</code></td></tr>
+          <tr><td><code>iasc</code></td><td>unary</td><td>Indices that would sort ascending</td><td><code>(iasc [30 10 20])</code> &rarr; <code>[1 2 0]</code></td></tr>
+          <tr><td><code>idesc</code></td><td>unary</td><td>Indices that would sort descending</td><td><code>(idesc [30 10 20])</code> &rarr; <code>[0 2 1]</code></td></tr>
+          <tr><td><code>rank</code></td><td>unary</td><td>Rank of each element</td><td><code>(rank [30 10 20])</code> &rarr; <code>[2 0 1]</code></td></tr>
+          <tr><td><code>xasc</code></td><td>binary</td><td>Sort table ascending by column(s)</td><td><code>(xasc 'price trades)</code></td></tr>
+          <tr><td><code>xdesc</code></td><td>binary</td><td>Sort table descending by column(s)</td><td><code>(xdesc 'price trades)</code></td></tr>
+          <tr><td><code>xrank</code></td><td>binary</td><td>Assign rank buckets (quantiles)</td><td><code>(xrank 4 [10 20 30 40])</code> &rarr; <code>[0 1 2 3]</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="table-ops">Table Operations</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>list</code></td><td>variadic</td><td>Create a list from vectors</td><td><code>(list [1 2] [A B])</code></td></tr>
+          <tr><td><code>table</code></td><td>binary</td><td>Create table from column names + list of vectors</td><td><code>(table [x y] (list [1 2] [A B]))</code></td></tr>
+          <tr><td><code>key</code></td><td>unary</td><td>Get column names (table) or keys (dict)</td><td><code>(key trades)</code> &rarr; <code>[sym price size]</code></td></tr>
+          <tr><td><code>value</code></td><td>unary</td><td>Get column data (table) or values (dict)</td><td><code>(value trades)</code></td></tr>
+          <tr><td><code>dict</code></td><td>binary</td><td>Create dictionary from keys and values</td><td><code>(dict [a b] [1 2])</code></td></tr>
+          <tr><td><code>get</code></td><td>binary</td><td>Lookup key in dict/table</td><td><code>(get d 'a)</code> &rarr; <code>1</code></td></tr>
+          <tr><td><code>remove</code></td><td>binary</td><td>Remove key from dict</td><td><code>(remove d 'a)</code></td></tr>
+          <tr><td><code>row</code></td><td>binary</td><td>Extract single row from table as dict</td><td><code>(row trades 0)</code></td></tr>
+          <tr><td><code>meta</code></td><td>unary</td><td>Get metadata (column types, lengths)</td><td><code>(meta trades)</code></td></tr>
+          <tr><td><code>alter</code></td><td>variadic, special</td><td>In-place mutation of table column</td><td><code>(alter trades 'price (* price 1.1))</code></td></tr>
+          <tr><td><code>del</code></td><td>variadic, special</td><td>Delete columns or rows from table</td><td><code>(del trades 'temp_col)</code></td></tr>
+          <tr><td><code>modify</code></td><td>variadic</td><td>Functional table update (returns new table)</td><td><code>(modify trades 'price (fn [p] (* p 1.1)))</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="query">Query Operations</h2>
+      <p>These are <strong>special forms</strong> that bridge to the Rayforce DAG executor.</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>select</code></td><td>variadic, special</td><td>Query table with optional filter, projection, grouping, and aggregation</td></tr>
+          <tr><td><code>update</code></td><td>variadic, special</td><td>Add or modify columns in a table</td></tr>
+          <tr><td><code>insert</code></td><td>variadic, special</td><td>Append a row to a table, append to a vector/list, or insert at position(s)</td></tr>
+          <tr><td><code>upsert</code></td><td>variadic, special</td><td>Insert or update rows (by key)</td></tr>
+        </tbody>
+      </table>
+
+      <pre><code><span class="hl-comment">; Select with filter and projection</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades
+         <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> price <span class="hl-num">100</span>)
+         <span class="hl-sym">cols:</span> {<span class="hl-sym">sym:</span> sym <span class="hl-sym">notional:</span> (<span class="hl-fn">*</span> price size)}})
+
+<span class="hl-comment">; Group-by with multiple aggregates</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades
+         <span class="hl-sym">by:</span>   {<span class="hl-sym">sym:</span> sym}
+         <span class="hl-sym">cols:</span> {<span class="hl-sym">vwap:</span> (<span class="hl-fn">/</span> (<span class="hl-fn">sum</span> (<span class="hl-fn">*</span> price size)) (<span class="hl-fn">sum</span> size))
+                <span class="hl-sym">count:</span> (<span class="hl-fn">count</span> price)}})
+
+<span class="hl-comment">; Update: add a column</span>
+(<span class="hl-kw">update</span> {<span class="hl-sym">from:</span> trades
+          <span class="hl-sym">cols:</span> {<span class="hl-sym">notional:</span> (<span class="hl-fn">*</span> price size)}})</code></pre>
+
+      <p><code>insert</code> overloads on arity. With two arguments it appends; with three arguments it inserts at a position (or positions) given by the second argument. The first argument is a quoted symbol for in-place mutation, e.g. <code>'v</code>, or any expression that evaluates to a table/vector/list.</p>
+
+      <pre><code><span class="hl-comment">; Append a row to a table</span>
+(<span class="hl-kw">insert</span> <span class="hl-sym">'trades</span> (<span class="hl-fn">list</span> <span class="hl-sym">'AAPL</span> <span class="hl-num">150.0</span> <span class="hl-num">100</span>))
+
+<span class="hl-comment">; Vector / list operations</span>
+(<span class="hl-kw">def</span> v (<span class="hl-fn">til</span> <span class="hl-num">5</span>))               <span class="hl-comment">; [0 1 2 3 4]</span>
+(<span class="hl-kw">insert</span> <span class="hl-sym">'v</span> <span class="hl-num">99</span>)                  <span class="hl-comment">; append:    [0 1 2 3 4 99]</span>
+(<span class="hl-kw">insert</span> <span class="hl-sym">'v</span> <span class="hl-num">0</span> <span class="hl-num">-1</span>)                <span class="hl-comment">; head:      [-1 0 1 2 3 4 99]</span>
+(<span class="hl-kw">insert</span> <span class="hl-sym">'v</span> <span class="hl-num">3</span> [<span class="hl-num">100</span> <span class="hl-num">200</span>])         <span class="hl-comment">; splice:    [-1 0 1 100 200 2 3 4 99]</span>
+(<span class="hl-kw">insert</span> <span class="hl-sym">'v</span> [<span class="hl-num">0</span> <span class="hl-num">3</span>] <span class="hl-num">77</span>)             <span class="hl-comment">; broadcast 77 at pre-positions 0 and 3</span>
+(<span class="hl-kw">insert</span> <span class="hl-sym">'v</span> [<span class="hl-num">1</span> <span class="hl-num">3</span>] [<span class="hl-num">10</span> <span class="hl-num">30</span>])         <span class="hl-comment">; parallel: 10 at pos 1, 30 at pos 3</span></code></pre>
+
+      <p>Indices are <em>pre-insertion</em> positions in <code>[0, count]</code>; <code>idx == count</code> is equivalent to append. Vector positional inserts of a same-typed vector splice that vector in. List positional inserts always add the value as a single slot &mdash; use <code>concat</code> to splice. Multi-insert is stable on duplicate indices, preserving input order. Typed-null atoms (<code>0Nl</code>, <code>0Nf</code>, &hellip;) carry their null flag through &mdash; the inserted slot is marked null, not zero.</p>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="joins">Joins</h2>
+      <p>Rayforce supports four join types, all with time-series-aware semantics.</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>left-join</code></td><td>variadic</td><td>Left join on matching columns. Unmatched rows filled with nulls.</td></tr>
+          <tr><td><code>inner-join</code></td><td>variadic</td><td>Inner join &mdash; only matching rows.</td></tr>
+          <tr><td><code>window-join</code></td><td>variadic, special</td><td>Join with time window constraint. Match rows within a time range.</td></tr>
+          <tr><td><code>asof-join</code></td><td>variadic</td><td>As-of join &mdash; match the most recent preceding value.</td></tr>
+        </tbody>
+      </table>
+
+      <pre><code><span class="hl-comment">; Left join two tables on the sym column</span>
+(<span class="hl-fn">left-join</span> trades quotes <span class="hl-sym">'sym</span>)
+
+<span class="hl-comment">; Inner join</span>
+(<span class="hl-fn">inner-join</span> orders products <span class="hl-sym">'product_id</span>)
+
+<span class="hl-comment">; Window join: match trades to quotes within 1-second window</span>
+(<span class="hl-kw">window-join</span> {<span class="hl-sym">left:</span> trades  <span class="hl-sym">right:</span> quotes
+              <span class="hl-sym">on:</span> [<span class="hl-sym">sym</span>]  <span class="hl-sym">window:</span> [<span class="hl-num">-1000</span> <span class="hl-num">0</span>]
+              <span class="hl-sym">cols:</span> {<span class="hl-sym">avg_bid:</span> (<span class="hl-fn">avg</span> bid)}})
+
+<span class="hl-comment">; As-of join: find most recent quote for each trade</span>
+(<span class="hl-fn">asof-join</span> trades quotes <span class="hl-sym">'sym</span>)</code></pre>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="pivot">Pivot &amp; Window</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>pivot</code></td><td>variadic</td><td>Pivot table &mdash; reshape long to wide format</td><td><code>(pivot trades 'sym 'date 'price)</code></td></tr>
+          <tr><td><code>xbar</code></td><td>binary, atomic</td><td>Bucket values (time bucketing for OHLC bars)</td><td><code>(xbar [3 7 12] 5)</code> &rarr; <code>[0 5 10]</code></td></tr>
+          <tr><td><code>xrank</code></td><td>binary</td><td>Assign N rank buckets (quantile ranking)</td><td><code>(xrank 4 [10 20 30 40])</code></td></tr>
+        </tbody>
+      </table>
+
+      <pre><code><span class="hl-comment">; OHLC bars: bucket trades by 5-minute intervals</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades
+         <span class="hl-sym">by:</span>   {<span class="hl-sym">sym:</span> sym  <span class="hl-sym">bucket:</span> (<span class="hl-fn">xbar</span> time <span class="hl-num">300000</span>)}
+         <span class="hl-sym">cols:</span> {<span class="hl-sym">open:</span> (<span class="hl-fn">first</span> price)
+                <span class="hl-sym">high:</span> (<span class="hl-fn">max</span> price)
+                <span class="hl-sym">low:</span>  (<span class="hl-fn">min</span> price)
+                <span class="hl-sym">close:</span> (<span class="hl-fn">last</span> price)
+                <span class="hl-sym">vol:</span>  (<span class="hl-fn">sum</span> size)}})</code></pre>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="string-ops">String Operations</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>split</code></td><td>binary</td><td>Split string by delimiter</td><td><code>(split "a,b,c" ",")</code> &rarr; <code>["a" "b" "c"]</code></td></tr>
+          <tr><td><code>like</code></td><td>binary</td><td>Glob pattern match: <code>*</code> any, <code>?</code> one, <code>[abc]</code>/<code>[a-z]</code>/<code>[!abc]</code> char class</td><td><code>(like "hello" "hel*")</code> &rarr; <code>true</code></td></tr>
+          <tr><td><code>concat</code></td><td>binary</td><td>Concatenate two strings or vectors</td><td><code>(concat "hello" " world")</code> &rarr; <code>"hello world"</code></td></tr>
+          <tr><td><code>format</code></td><td>variadic</td><td>Format values as string (% is placeholder)</td><td><code>(format "x=%" 42)</code> &rarr; <code>"x=42"</code></td></tr>
+        </tbody>
+      </table>
+
+      <div class="info-box">
+        <strong>Note:</strong> The executor supports additional string opcodes (STRLEN, UPPER, LOWER, TRIM, SUBSTR, REPLACE, CONCAT) at the DAG level. All string transformations propagate nulls: null input rows produce null output rows.
+      </div>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="temporal">Date &amp; Time</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>date</code></td><td>unary</td><td>Current date or extract date from timestamp</td><td><code>(date 0)</code> &rarr; today's date</td></tr>
+          <tr><td><code>time</code></td><td>unary</td><td>Current time or extract time from timestamp</td><td><code>(time 0)</code> &rarr; current time</td></tr>
+          <tr><td><code>timestamp</code></td><td>unary</td><td>Current timestamp (nanosecond precision)</td><td><code>(timestamp 0)</code></td></tr>
+        </tbody>
+      </table>
+
+      <h3 id="temporal-extract">Calendar/Clock Field Extraction</h3>
+      <p>Unary functions that pull a single calendar or clock field out of a DATE / TIME / TIMESTAMP atom or vector. Null input rows propagate to null output rows (the null sentinel bit pattern is <em>not</em> decoded as a bogus year / second). The same set of fields is reachable via dotted access on a temporal value (e.g. <code>ts.yyyy</code> — see <a href="rayfall-syntax.html#dotted-namespaces">Dotted Namespaces</a>).</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Range</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>yyyy</code></td><td>year</td><td><code>(yyyy 2024.03.15)</code> &rarr; <code>2024</code></td></tr>
+          <tr><td><code>mm</code></td><td>1..12</td><td><code>(mm 2024.03.15)</code> &rarr; <code>3</code></td></tr>
+          <tr><td><code>dd</code></td><td>1..31</td><td><code>(dd 2024.03.15)</code> &rarr; <code>15</code></td></tr>
+          <tr><td><code>hh</code></td><td>0..23</td><td><code>(hh 12:34:56)</code> &rarr; <code>12</code></td></tr>
+          <tr><td><code>minute</code></td><td>0..59</td><td><code>(minute 12:34:56)</code> &rarr; <code>34</code></td></tr>
+          <tr><td><code>ss</code></td><td>0..59</td><td><code>(ss 12:34:56)</code> &rarr; <code>56</code></td></tr>
+          <tr><td><code>dow</code></td><td>1..7 (Mon=1)</td><td><code>(dow 2024.03.15)</code> &rarr; <code>5</code></td></tr>
+          <tr><td><code>doy</code></td><td>1..366</td><td><code>(doy 2024.03.15)</code> &rarr; <code>75</code></td></tr>
+        </tbody>
+      </table>
+
+      <p><code>mm</code> is unambiguously MONTH; the minute spelling stays long-form because a two-letter token can't serve both meanings in a uniform dotted walk. Two dotted-only truncations exist: <code>.date</code> drops the time-of-day component (keeps the day), and <code>.time</code> drops the date component (keeps the microseconds within the day).</p>
+
+      <p>Cross-temporal comparisons are supported: dates, times, and timestamps are all converted to nanoseconds internally for comparison operations.</p>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="type-ops">Type Operations</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>type</code></td><td>unary</td><td>Get type name of a value</td><td><code>(type 42)</code> &rarr; <code>i64</code></td></tr>
+          <tr><td><code>as</code></td><td>binary</td><td>Cast value to another type</td><td><code>(as 'i64 "42")</code> &rarr; <code>42</code></td></tr>
+          <tr><td><code>nil?</code></td><td>unary</td><td>Test if value is null</td><td><code>(nil? x)</code></td></tr>
+          <tr><td><code>rc</code></td><td>unary</td><td>Reference count of an object</td><td><code>(rc x)</code> &rarr; <code>1</code></td></tr>
+          <tr><td><code>guid</code></td><td>unary</td><td>Generate N GUIDs (0 for one)</td><td><code>(guid 0)</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="io">I/O &amp; File Operations</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>println</code></td><td>variadic</td><td>Print values with newline</td><td><code>(println "hello" 42)</code></td></tr>
+          <tr><td><code>print</code></td><td>unary</td><td>Print value without newline</td><td><code>(print "hello")</code></td></tr>
+          <tr><td><code>show</code></td><td>variadic</td><td>Pretty-print a value (tables formatted)</td><td><code>(show trades)</code></td></tr>
+          <tr><td><code>format</code></td><td>variadic</td><td>Format value to string (% is placeholder)</td><td><code>(format "val=%" 42)</code> &rarr; <code>"val=42"</code></td></tr>
+          <tr><td><code>.csv.read</code></td><td>variadic</td><td>Load CSV file into table</td><td><code>(.csv.read "data.csv")</code></td></tr>
+          <tr><td><code>.csv.write</code></td><td>variadic</td><td>Write table to CSV file</td><td><code>(.csv.write trades "out.csv")</code></td></tr>
+          <tr><td><code>read</code></td><td>unary</td><td>Read file contents as string</td><td><code>(read "file.txt")</code></td></tr>
+          <tr><td><code>write</code></td><td>binary</td><td>Write string to file</td><td><code>(write "file.txt" "content")</code></td></tr>
+          <tr><td><code>load</code></td><td>unary</td><td>Load and evaluate a Rayfall script</td><td><code>(load "lib.rfl")</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="control">Control Flow</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>set</code></td><td>binary, special</td><td>Bind value to global variable</td><td><code>(set x 42)</code></td></tr>
+          <tr><td><code>let</code></td><td>binary, special</td><td>Bind value to local variable</td><td><code>(let y (+ x 1))</code></td></tr>
+          <tr><td><code>if</code></td><td>variadic, special</td><td>Conditional (if/then/else)</td><td><code>(if (&gt; x 0) "pos" "neg")</code></td></tr>
+          <tr><td><code>do</code></td><td>variadic, special</td><td>Sequential execution, returns last</td><td><code>(do (set x 1) (set y 2) (+ x y))</code></td></tr>
+          <tr><td><code>fn</code></td><td>variadic, special</td><td>Create lambda function</td><td><code>(fn [x] (* x x))</code></td></tr>
+          <tr><td><code>try</code></td><td>binary, special</td><td>Error handling (expr handler)</td><td><code>(try (/ 1 0) (fn [e] 0))</code></td></tr>
+          <tr><td><code>raise</code></td><td>unary</td><td>Throw an error</td><td><code>(raise "bad input")</code></td></tr>
+          <tr><td><code>return</code></td><td>unary</td><td>Early return from function</td><td><code>(return 42)</code></td></tr>
+          <tr><td><code>quote</code></td><td>variadic, special</td><td>Return argument unevaluated</td><td><code>(quote (+ 1 2))</code> &rarr; <code>(+ 1 2)</code></td></tr>
+          <tr><td><code>resolve</code></td><td>variadic, special</td><td>Resolve a symbol in current scope</td><td><code>(resolve 'x)</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="system">System &amp; Utility</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>eval</code></td><td>unary</td><td>Evaluate a parsed expression</td><td><code>(eval (parse "(+ 1 2)"))</code> &rarr; <code>3</code></td></tr>
+          <tr><td><code>parse</code></td><td>unary</td><td>Parse string into Rayfall expression</td><td><code>(parse "(+ 1 2)")</code></td></tr>
+          <tr><td><code>.sys.gc</code></td><td>variadic</td><td>Trigger garbage collection, returns <code>0</code></td><td><code>(.sys.gc)</code></td></tr>
+          <tr><td><code>.sys.exec</code></td><td>unary</td><td>Execute shell command, return exit code</td><td><code>(.sys.exec "ls -la")</code></td></tr>
+          <tr><td><code>.os.getenv</code></td><td>unary</td><td>Get environment variable</td><td><code>(.os.getenv "HOME")</code></td></tr>
+          <tr><td><code>.os.setenv</code></td><td>binary</td><td>Set environment variable</td><td><code>(.os.setenv "KEY" "value")</code></td></tr>
+          <tr><td><code>exit</code></td><td>unary</td><td>Exit with status code</td><td><code>(exit 0)</code></td></tr>
+          <tr><td><code>timeit</code></td><td>variadic, special</td><td>Benchmark an expression</td><td><code>(timeit (sum (til 1000000)))</code></td></tr>
+          <tr><td><code>timer</code></td><td>unary</td><td>High-resolution monotonic nanosecond clock</td><td><code>(timer 0)</code></td></tr>
+          <tr><td><code>args</code></td><td>unary</td><td>Command-line arguments</td><td><code>(args 0)</code></td></tr>
+          <tr><td><code>env</code></td><td>unary</td><td>List all global environment bindings</td><td><code>(env 0)</code></td></tr>
+          <tr><td><code>.sys.build</code></td><td>variadic</td><td>Build metadata: <code>version</code> + <code>build-date</code></td><td><code>(.sys.build)</code></td></tr>
+          <tr><td><code>.sys.mem</code></td><td>variadic</td><td>Memory allocator statistics (alloc/peak/slab)</td><td><code>(.sys.mem)</code></td></tr>
+          <tr><td><code>.sys.info</code></td><td>variadic</td><td>System information (cores, page size, memory)</td><td><code>(.sys.info)</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="serialization">Serialization &amp; Storage</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>ser</code></td><td>unary</td><td>Serialize value to binary format</td><td><code>(ser [1 2 3])</code></td></tr>
+          <tr><td><code>de</code></td><td>unary</td><td>Deserialize from binary format</td><td><code>(de bytes)</code></td></tr>
+          <tr><td><code>set-splayed</code></td><td>variadic</td><td>Save table as splayed columns to directory</td><td><code>(set-splayed "db/trades" trades)</code></td></tr>
+          <tr><td><code>get-splayed</code></td><td>variadic</td><td>Load splayed table from directory</td><td><code>(get-splayed "db/trades")</code></td></tr>
+          <tr><td><code>get-parted</code></td><td>variadic</td><td>Load partitioned table by name from root directory</td><td><code>(get-parted "db" 'trades)</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="eav">EAV (Entity-Attribute-Value)</h2>
+      <p>Built-in support for triple stores. The EAV table has three columns: <code>e</code> (entity, i64), <code>a</code> (attribute, sym), <code>v</code> (value, i64).</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>datoms</code></td><td>nullary</td><td>Create empty EAV table</td><td><code>(datoms)</code></td></tr>
+          <tr><td><code>assert-fact</code></td><td>variadic</td><td>Append triple to datoms</td><td><code>(assert-fact db 1 'name 100)</code></td></tr>
+          <tr><td><code>retract-fact</code></td><td>variadic</td><td>Remove triple from datoms</td><td><code>(retract-fact db 1 'name 100)</code></td></tr>
+          <tr><td><code>scan-eav</code></td><td>binary</td><td>Query EAV by attribute</td><td><code>(scan-eav db 'name)</code></td></tr>
+          <tr><td><code>pull</code></td><td>binary</td><td>Entity-centric retrieval (returns dict)</td><td><code>(pull db 1)</code> &rarr; <code>{name:100 age:30}</code></td></tr>
+          <tr><td><code>sym-name</code></td><td>unary</td><td>Convert sym intern ID to symbol string</td><td><code>(sym-name 0)</code></td></tr>
+        </tbody>
+      </table>
+
+      <pre><code><span class="hl-comment">; Build an EAV store</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">datoms</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'name</span> <span class="hl-num">100</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'age</span> <span class="hl-num">30</span>))
+(<span class="hl-fn">pull</span> db <span class="hl-num">1</span>)              <span class="hl-comment">; {name:100 age:30}</span>
+(<span class="hl-fn">scan-eav</span> db <span class="hl-sym">'name</span>)     <span class="hl-comment">; table of (e, v) pairs where a='name</span></code></pre>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="table-set-ops">Table Set Operations</h2>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>union-all</code></td><td>binary</td><td>Concatenate two tables (all rows)</td><td><code>(union-all t1 t2)</code></td></tr>
+          <tr><td><code>table-distinct</code></td><td>unary</td><td>Remove duplicate rows from table</td><td><code>(table-distinct t)</code></td></tr>
+          <tr><td><code>antijoin</code></td><td>variadic</td><td>Anti-semi-join: rows in left not in right</td><td><code>(antijoin t1 t2 [x])</code></td></tr>
+        </tbody>
+      </table>
+
+      <pre><code><span class="hl-comment">; Table concatenation and deduplication</span>
+(<span class="hl-kw">set</span> t1 (<span class="hl-fn">table</span> [<span class="hl-sym">x</span>] (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span>])))
+(<span class="hl-kw">set</span> t2 (<span class="hl-fn">table</span> [<span class="hl-sym">x</span>] (<span class="hl-fn">list</span> [<span class="hl-num">2</span> <span class="hl-num">3</span>])))
+(<span class="hl-fn">union-all</span> t1 t2)          <span class="hl-comment">; 4 rows: 1 2 2 3</span>
+(<span class="hl-fn">table-distinct</span> (<span class="hl-fn">union-all</span> t1 t2))  <span class="hl-comment">; 3 rows: 1 2 3</span>
+(<span class="hl-fn">antijoin</span> t1 t2 [<span class="hl-sym">x</span>])     <span class="hl-comment">; 1 row: 1</span></code></pre>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="datalog">Datalog</h2>
+      <p>Datalog rules and queries integrate with the EAV store. Rules use the <code>(?entity :attribute ?value)</code> pattern to match triples.</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>rule</code></td><td>variadic, special</td><td>Define Datalog rule</td><td><code>(rule (path ?x ?y) (?x :edge ?y))</code></td></tr>
+          <tr><td><code>query</code></td><td>variadic, special</td><td>Compile and execute Datalog query</td><td><code>(query db (find ?x ?y) (where (path ?x ?y)))</code></td></tr>
+          <tr><td><code>not</code></td><td>special (in Datalog WHERE)</td><td>Stratified negation in WHERE clause</td><td><code>(not (?y :edge 3))</code></td></tr>
+        </tbody>
+      </table>
+
+      <pre><code><span class="hl-comment">; Define rules and query</span>
+(<span class="hl-kw">rule</span> (<span class="hl-fn">path</span> ?x ?y) (?x :edge ?y))
+(<span class="hl-kw">rule</span> (<span class="hl-fn">path</span> ?x ?z) (?x :edge ?y) (path ?y ?z))
+
+(<span class="hl-kw">set</span> db (<span class="hl-fn">datoms</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'edge</span> <span class="hl-num">2</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">2</span> <span class="hl-sym">'edge</span> <span class="hl-num">3</span>))
+(<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> ?x ?y) (<span class="hl-fn">where</span> (path ?x ?y)))
+<span class="hl-comment">; returns table: (1,2) (1,3) (2,3)</span></code></pre>
+
+      <!-- ════════════════════════════════════════ -->
+      <h2 id="datalog-program">Datalog Program API</h2>
+      <p>Low-level API for building and evaluating Datalog programs directly, bypassing the EAV store.</p>
+
+      <table>
+        <thead><tr><th>Function</th><th>Type</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>dl-program</code></td><td>nullary</td><td>Create Datalog program</td><td><code>(dl-program)</code></td></tr>
+          <tr><td><code>dl-add-edb</code></td><td>variadic</td><td>Register base relation (table + arity)</td><td><code>(dl-add-edb prog 'edge tbl 2)</code></td></tr>
+          <tr><td><code>dl-stratify</code></td><td>unary</td><td>Compute strata for the program</td><td><code>(dl-stratify prog)</code></td></tr>
+          <tr><td><code>dl-eval</code></td><td>unary</td><td>Evaluate program to fixpoint</td><td><code>(dl-eval prog)</code></td></tr>
+          <tr><td><code>dl-query</code></td><td>binary</td><td>Query a derived or base relation</td><td><code>(dl-query prog 'edge)</code></td></tr>
+          <tr><td><code>dl-provenance</code></td><td>binary</td><td>Get derivation tracking (if available)</td><td><code>(dl-provenance prog 'rel)</code></td></tr>
+        </tbody>
+      </table>
+
+      <pre><code><span class="hl-comment">; Low-level Datalog program</span>
+(<span class="hl-kw">set</span> prog (<span class="hl-fn">dl-program</span>))
+(<span class="hl-kw">set</span> edges (<span class="hl-fn">table</span> [<span class="hl-sym">x</span> <span class="hl-sym">y</span>] (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>])))
+(<span class="hl-fn">dl-add-edb</span> prog <span class="hl-sym">'edge</span> edges <span class="hl-num">2</span>)
+(<span class="hl-fn">dl-stratify</span> prog)
+(<span class="hl-fn">dl-eval</span> prog)
+(<span class="hl-fn">dl-query</span> prog <span class="hl-sym">'edge</span>)  <span class="hl-comment">; returns the edge table</span></code></pre>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="rayfall-syntax.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Syntax &amp; Types</span></a>
+        <a href="operations-math.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Math, Comparison, Aggregation &amp; Iteration</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

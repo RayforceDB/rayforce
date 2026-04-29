@@ -1,0 +1,7 @@
+;; asc on date / timestamp vectors.
+
+(asc [2024.06.15 2024.01.01 2024.03.10]) -- [2024.01.01 2024.03.10 2024.06.15]
+
+;; reverse(asc) == desc
+(set D [2024.06.15 2024.01.01 2024.03.10])
+(reverse (asc D)) -- (desc D)

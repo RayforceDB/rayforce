@@ -1,0 +1,10 @@
+;; Invariants for `idesc` — indexes that would sort descending.
+
+(idesc [30 10 20]) -- [0 2 1]
+
+;; indices yield descending values
+(set V (rand 200 10000))
+(at V (idesc V)) -- (desc V)
+
+;; is a permutation of (til n)
+(asc (idesc V)) -- (til (count V))

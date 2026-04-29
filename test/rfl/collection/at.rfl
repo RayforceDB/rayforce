@@ -1,0 +1,14 @@
+;; Invariants for `at` (index access).
+
+(at [10 20 30] 0) -- 10
+(at [10 20 30] 2) -- 30
+
+;; vector of indices returns vector of elements
+(at [10 20 30 40 50] [0 2 4]) -- [10 30 50]
+
+;; at 0 == first
+(set V (rand 50 1000))
+(at V 0) -- (first V)
+
+;; at (n-1) == last
+(at V (- (count V) 1)) -- (last V)

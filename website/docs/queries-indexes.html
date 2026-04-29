@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Accelerator Indexes — Rayforce Documentation</title>
+  <meta name="description" content="Per-column accelerator indexes — zone, hash, sort, bloom — attach to numeric vectors and survive copy semantics. Built and inspectable today; query-side consumers (filter / in / find / distinct / SIP) land with the upcoming optimizer routing pass.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA MODEL</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link active">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">VECTOR SEARCH</div>
+        <a href="vector-search.html" class="sidebar-link">Vector Search &amp; HNSW</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATALOG</div>
+        <a href="datalog.html" class="sidebar-link">Datalog</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">IPC</div>
+        <a href="ipc.html" class="sidebar-link">IPC Protocol</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Accelerator Indexes</span>
+      </div>
+
+      <h1>Accelerator Indexes</h1>
+      <p class="page-subtitle">Per-column accelerator structures &mdash; <code>zone</code>, <code>hash</code>, <code>sort</code>, <code>bloom</code> &mdash; attached directly to numeric vectors.  Build once at user request; survive copy / refcount semantics; ride alongside the column through the pipeline.</p>
+
+      <div class="info-box">
+        <strong>v1 status.</strong> The four index kinds, their build kernels, and the <code>(.idx.*)</code> Rayfall surface are shipped.  <em>Optimizer integration</em> &mdash; rewriting <code>filter (= col const)</code>, <code>in</code>, <code>find</code>, <code>distinct</code>, and join build sides to consult the index instead of a linear scan &mdash; is not yet wired.  Today's value is the index-as-data-structure: build it, inspect it, share it across views.  Auto-routed fast paths land in a follow-up.
+      </div>
+
+      <p>This page is the <strong>reference</strong> for the <code>.idx.*</code> family. For the broader index landscape (HNSW, linked columns, partition pruning, CSR), see <a href="indexes-overview.html">Indexes Overview</a>. For decision walk-throughs and worked workflows, see the <a href="guide-indexes.html">Indexes Guide</a>.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="decide">Quick Pick</h2>
+      <p>Match the shape of your <em>query</em>, not the shape of the data. The <strong>Will enable</strong> column describes the cost the structure unlocks <em>once optimizer routing lands</em> &mdash; today none of these kinds is consulted by <code>filter</code> / <code>in</code> / <code>find</code> / <code>distinct</code> / SIP, so the table below is for forward-planning, not a list of wins you'll see today.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Query shape</th>
+            <th>Kind</th>
+            <th>Will enable (after routing)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Constant predicate may fall outside the column's value range</td>
+            <td><code>.idx.zone</code></td>
+            <td>O(1) range-check before any scan</td>
+          </tr>
+          <tr>
+            <td>Repeated <code>=</code> / <code>in</code> / <code>find</code> / <code>distinct</code></td>
+            <td><code>.idx.hash</code></td>
+            <td>O(1) lookup; chained on duplicates</td>
+          </tr>
+          <tr>
+            <td>Range queries, sorted output, top-N</td>
+            <td><code>.idx.sort</code></td>
+            <td>O(log n) binary search via row-id permutation</td>
+          </tr>
+          <tr>
+            <td>Cheap probabilistic membership rejection</td>
+            <td><code>.idx.bloom</code></td>
+            <td>O(k) probe; small footprint, no false negatives</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- ============================================================ -->
+      <h2 id="overview">Why Per-Column Indexes</h2>
+      <p>Rayforce's hot path is morsel-driven columnar execution &mdash; every operator scans 1024-element chunks of contiguous values.  That's already fast for full-column work, but it's still O(n) for needle-in-haystack queries: <code>filter (= col 42)</code> visits every row even when only one matches, <code>(in col big-set)</code> rebuilds a fresh hash table per call, <code>(find col k)</code> linear-scans.</p>
+      <p>An <strong>accelerator index</strong> is a precomputed data structure attached to the column itself.  The user pays the build cost once; once the optimizer routing pass lands, subsequent queries against that column will read the index instead of the raw values. Today the four kinds below all build correctly and are inspectable through <code>(.idx.info)</code>, but no query operator consults them &mdash; <code>filter</code> / <code>in</code> / <code>find</code> / <code>distinct</code> / SIP all still scan linearly.  The structures described below are <em>what each kind will enable</em>, not what they accelerate today:</p>
+      <ul>
+        <li><code>zone</code> &mdash; min/max plus null count (~32 bytes per column).  Will let the optimizer prune whole columns / segments when a constant predicate falls outside the range.</li>
+        <li><code>hash</code> &mdash; chained open-addressing table.  Will support O(1) eq / in / find / distinct; stays useful for non-unique columns via the chain.</li>
+        <li><code>sort</code> &mdash; ascending row-id permutation.  Will support binary search for range predicates and <code>limit</code> queries; pre-grouped distinct.</li>
+        <li><code>bloom</code> &mdash; m-bit probabilistic membership filter (k=3 hashes).  Cheap, small, no false negatives &mdash; will be wired for SIP into joins and quick rejection of <code>in</code> probes.</li>
+      </ul>
+
+      <!-- ============================================================ -->
+      <h2 id="construct">Constructing an Index</h2>
+      <p>Each kind has a one-arg attach builtin.  Attaching is idempotent &mdash; if a different kind is already attached, it's dropped first; mutation invalidates and clears it implicitly.</p>
+
+      <h3>Signature</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(.idx.zone v)   (.idx.hash v)   (.idx.sort v)   (.idx.bloom v)</span>
+        </div>
+        <div class="fn-desc">Attach an index of the named kind to a numeric vector <code>v</code>.  Returns the column with the new index attached (the underlying values are unchanged).  Type errors out for non-numeric columns &mdash; <code>RAY_BOOL</code>, <code>RAY_U8</code>, <code>RAY_I16</code>, <code>RAY_I32</code>, <code>RAY_I64</code>, <code>RAY_F32</code>, <code>RAY_F64</code>, <code>RAY_DATE</code>, <code>RAY_TIME</code>, <code>RAY_TIMESTAMP</code>.  <code>RAY_SYM</code> / <code>RAY_STR</code> targets are deferred to v2.</div>
+      </div>
+
+      <h3>Examples</h3>
+      <pre><code>(<span class="hl-kw">set</span> v [<span class="hl-num">5</span> <span class="hl-num">1</span> <span class="hl-num">9</span> <span class="hl-num">3</span> <span class="hl-num">7</span>])
+
+<span class="hl-comment">; Zonemap: min, max, null count.</span>
+(<span class="hl-kw">set</span> vz (<span class="hl-fn">.idx.zone</span> v))
+(<span class="hl-fn">.idx.info</span> vz)
+<span class="hl-comment">; ⇒ {kind:zone length:5 parent_type:5 saved_attrs:0 min:1 max:9 n_nulls:0}</span>
+
+<span class="hl-comment">; Hash: chained table with the linked-list of duplicates.</span>
+(<span class="hl-kw">set</span> vh (<span class="hl-fn">.idx.hash</span> v))
+(<span class="hl-fn">.idx.info</span> vh)
+<span class="hl-comment">; ⇒ {kind:hash length:5 parent_type:5 saved_attrs:0 capacity:16 n_keys:5}</span>
+
+<span class="hl-comment">; Sort: ascending row-id permutation.</span>
+(<span class="hl-kw">set</span> vs (<span class="hl-fn">.idx.sort</span> v))
+(<span class="hl-fn">.idx.info</span> vs)
+<span class="hl-comment">; ⇒ {kind:sort length:5 parent_type:5 saved_attrs:0 perm_len:5}</span>
+
+<span class="hl-comment">; Bloom: m bits, k hashes, n_keys non-null rows added.</span>
+(<span class="hl-kw">set</span> vb (<span class="hl-fn">.idx.bloom</span> v))
+(<span class="hl-fn">.idx.info</span> vb)
+<span class="hl-comment">; ⇒ {kind:bloom length:5 parent_type:5 saved_attrs:0 m_bits:64 k:3 n_keys:5}</span></code></pre>
+
+      <p>Indexed columns participate in normal operations transparently.  <code>(sum vh)</code>, <code>(at vz 0)</code>, <code>(count vb)</code> all work identically to the un-indexed source.  Whatever was true of <code>v</code> &mdash; nullability, slicing, arithmetic &mdash; is true of every <code>vz</code>, <code>vh</code>, <code>vs</code>, <code>vb</code>.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="introspection">Introspection &amp; Lifecycle</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Returns</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>(.idx.has? v)</code></td>
+            <td>boolean</td>
+            <td>True iff any index kind is currently attached.</td>
+          </tr>
+          <tr>
+            <td><code>(.idx.info v)</code></td>
+            <td>dict or null</td>
+            <td>Per-kind metadata: kind, length, parent_type, saved_attrs, plus kind-specific stats (min/max, capacity, perm_len, m_bits / k / n_keys).  Null when no index is attached.</td>
+          </tr>
+          <tr>
+            <td><code>(.idx.drop v)</code></td>
+            <td>v with index removed</td>
+            <td>Detaches whichever kind is attached; restores the underlying nullmap state byte-for-byte.  No-op if no index is attached.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Mutation Drops the Index</h3>
+      <p>The Rayfall in-place mutators &mdash; <code>(insert 'v val)</code> for append and <code>(alter 'v set i val)</code> / <code>(alter 'v concat val)</code> for set / append &mdash; invalidate the attached index.  The mutator paths drop the index transparently, restore the original nullmap bytes, and proceed with the write.  Subsequent <code>(.idx.has?)</code> calls return false; reattach the index after the write if you want the structure available again (today it's still only inspectable through <code>(.idx.info)</code>; query consumers land with the routing pass).</p>
+
+      <pre><code>(<span class="hl-kw">set</span> v [<span class="hl-num">5</span> <span class="hl-num">1</span> <span class="hl-num">9</span> <span class="hl-num">3</span> <span class="hl-num">7</span>])
+(<span class="hl-kw">set</span> vz (<span class="hl-fn">.idx.zone</span> v))
+(<span class="hl-fn">.idx.has?</span> vz)              <span class="hl-comment">; ⇒ true</span>
+(<span class="hl-fn">alter</span> <span class="hl-sym">'vz</span> <span class="hl-sym">set</span> <span class="hl-num">0</span> <span class="hl-num">100</span>)
+(<span class="hl-fn">.idx.has?</span> vz)              <span class="hl-comment">; ⇒ false</span></code></pre>
+
+      <h3>Coexistence with Linked Columns</h3>
+      <p>An accelerator index uses bytes 0&ndash;7 of the column's <a href="https://github.com/RayforceDB/rayforce2/blob/master/include/rayforce.h">nullmap union</a>; a <a href="queries-links.html">linked column</a> uses bytes 8&ndash;15.  The two flags &mdash; <code>RAY_ATTR_HAS_INDEX = 0x08</code> and <code>RAY_ATTR_HAS_LINK = 0x04</code> &mdash; are independent and a column can carry both.  Dereferencing through a link still works on an indexed column; dropping the index leaves the link intact and vice versa.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="workflows">Common Workflows</h2>
+
+      <h3>Hot column, repeated point lookups</h3>
+      <pre><code>(<span class="hl-kw">set</span> v (* <span class="hl-num">7</span> (<span class="hl-fn">til</span> <span class="hl-num">1000</span>)))   <span class="hl-comment">; 0, 7, 14, ..., 6993</span>
+(<span class="hl-kw">set</span> v (<span class="hl-fn">.idx.hash</span> v))
+(<span class="hl-fn">in</span> <span class="hl-num">700</span> v)                   <span class="hl-comment">; ⇒ true   (700 = 7 × 100)</span>
+(<span class="hl-fn">in</span> <span class="hl-num">701</span> v)                   <span class="hl-comment">; ⇒ false</span>
+(<span class="hl-kw">set</span> v (<span class="hl-fn">.idx.drop</span> v))         <span class="hl-comment">; optional early release; mutators auto-drop</span></code></pre>
+
+      <h3>Range scans on a stable column</h3>
+      <pre><code>(<span class="hl-kw">set</span> prices [<span class="hl-num">102</span> <span class="hl-num">98</span> <span class="hl-num">105</span> <span class="hl-num">101</span> <span class="hl-num">99</span> <span class="hl-num">103</span>])
+(<span class="hl-kw">set</span> prices (<span class="hl-fn">.idx.sort</span> prices))
+(<span class="hl-fn">.idx.info</span> prices)
+<span class="hl-comment">; ⇒ {kind:sort length:6 parent_type:5 saved_attrs:0 perm_len:6}</span></code></pre>
+      <p>The original column is unchanged; the sort lives in a row-id permutation alongside it. Once the optimizer routing pass lands, range queries against this column will be able to read that permutation instead of full-scanning &mdash; today it's just inspectable structure (<code>(.idx.info)</code>), and range queries still scan linearly.</p>
+
+      <h3>Whole-column pruning</h3>
+      <pre><code>(<span class="hl-kw">set</span> ages [<span class="hl-num">21</span> <span class="hl-num">34</span> <span class="hl-num">29</span> <span class="hl-num">42</span> <span class="hl-num">37</span>])
+(<span class="hl-kw">set</span> ages (<span class="hl-fn">.idx.zone</span> ages))
+(<span class="hl-fn">.idx.info</span> ages)
+<span class="hl-comment">; ⇒ {kind:zone length:5 parent_type:5 saved_attrs:0 min:21 max:42 n_nulls:0}</span></code></pre>
+      <p>A predicate like <code>(= ages 17)</code> falls outside <code>[21, 42]</code>; once optimizer routing lands, the executor will prune the column without scanning. Today the zone is inspectable via <code>.idx.info</code>.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="performance">Performance Characteristics</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Kind</th>
+            <th>Build</th>
+            <th>Space</th>
+            <th>Query</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>.idx.zone</code></td>
+            <td>O(n) one pass</td>
+            <td>O(1) &mdash; min, max, n_nulls</td>
+            <td>O(1) range check</td>
+          </tr>
+          <tr>
+            <td><code>.idx.hash</code></td>
+            <td>O(n)</td>
+            <td>O(n) table + chain</td>
+            <td>O(1) average; chain-walk on collisions</td>
+          </tr>
+          <tr>
+            <td><code>.idx.sort</code></td>
+            <td>O(n log n)</td>
+            <td>O(n) row-id permutation</td>
+            <td>O(log n) binary search</td>
+          </tr>
+          <tr>
+            <td><code>.idx.bloom</code></td>
+            <td>O(n &middot; k), k = 3</td>
+            <td>O(m) bits, m = 64 default</td>
+            <td>O(k) probe with false-positive rate</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>Zone, hash, and bloom build in a single pass over the column; sort needs O(n log n) for the underlying ordering. Space is bounded by the column length, with bloom the only kind that doesn't scale with <em>n</em>. The query columns above describe the cost the structure <em>enables</em> &mdash; until optimizer routing lands, the executor still scans linearly for <code>filter</code> / <code>in</code> / <code>find</code> / <code>distinct</code>. See <a href="#caveats">Caveats</a> for the exact wired/unwired surface today.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="storage">Storage and Lifetime</h2>
+      <p>An accelerator index is a child <code>ray_t*</code> of type <code>RAY_INDEX</code> whose <code>data[]</code> payload holds a <code>ray_index_t</code> struct &mdash; the kind tag, kind-specific child references (the hash table + chain vec, the sort permutation vec, the bloom bit vec), and a 16-byte snapshot of the parent's pre-attach nullmap union.  When the index is attached, the parent's nullmap union holds an owning pointer to the index ray_t.  Detach memcpy's the snapshot back; refcounting handles shared cases (a COW-shared index is cloned-on-detach so neither holder's view breaks).</p>
+
+      <p>This design has three useful properties:</p>
+      <ul>
+        <li><strong>Free for non-indexed columns.</strong>  Vectors without <code>RAY_ATTR_HAS_INDEX</code> set pay no extra cost &mdash; the same 16 bytes that hold the index pointer hold the original inline nullmap or external pointer, which they would have anyway.</li>
+        <li><strong>Survives copies and slices.</strong>  <code>ray_alloc_copy</code> retains the index along with the parent; slicing creates a fresh slice header that doesn't itself carry <code>HAS_INDEX</code>, so the slice is index-free until you attach one to it.  The parent and any other holder still see the original index.</li>
+        <li><strong>Dropped, not orphaned, on mutation.</strong>  Indexes are transient by design.  Persistence is intentionally not supported (use <code>(.col.link)</code> for persistent column metadata) &mdash; <code>ray_col_save</code> serializes a clean column with no index, the on-disk format never carries the bit.</li>
+      </ul>
+
+      <!-- ============================================================ -->
+      <h2 id="caveats">Caveats and Limits</h2>
+      <ul>
+        <li><strong>Numeric types only (v1).</strong>  The four kinds accept <code>RAY_BOOL</code>, <code>RAY_U8</code>, <code>RAY_I16</code>, <code>RAY_I32</code>, <code>RAY_I64</code>, <code>RAY_F32</code>, <code>RAY_F64</code>, <code>RAY_DATE</code>, <code>RAY_TIME</code>, <code>RAY_TIMESTAMP</code>.  <code>RAY_SYM</code> / <code>RAY_STR</code> are not yet supported &mdash; their nullmap-union byte 8&ndash;15 collisions with the <code>sym_dict</code> / <code>str_pool</code> pointers haven't been swept.</li>
+        <li><strong>One slot per column.</strong>  A column carries at most one index kind at a time.  Calling a different kind's attach replaces the existing one.  Multiple indexes per column are deferred &mdash; the slot can point to a list-of-indexes in v2 if real workloads want both eq and range fast paths.</li>
+        <li><strong>In-memory only.</strong>  Indexes do not persist across <code>ray_col_save</code> / <code>ray_col_load</code>; users rebuild explicitly after a load.  Unlike the HNSW handle (see <a href="vector-search.html">Vector Search</a>), which has dedicated <code>hnsw-save</code> / <code>hnsw-load</code> builtins for explicit persistence, <code>.idx.*</code> has no on-disk format at all &mdash; rebuild is the only option.</li>
+        <li><strong>No optimizer routing yet.</strong>  Building a hash index doesn't currently make <code>filter (= col const)</code> faster &mdash; the executor still scans linearly.  Wire-up of consumer paths is the next phase.  Until then, indexes are inspectable metadata you can build and query via <code>(.idx.info)</code>; they don't auto-accelerate queries.</li>
+      </ul>
+
+      <!-- ============================================================ -->
+      <h2 id="reference">Quick Reference</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Syntax</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>.idx.zone</code></td>
+            <td><code>(.idx.zone v)</code></td>
+            <td>Attach a min/max + null-count zonemap</td>
+          </tr>
+          <tr>
+            <td><code>.idx.hash</code></td>
+            <td><code>(.idx.hash v)</code></td>
+            <td>Attach a chained hash table for eq lookups</td>
+          </tr>
+          <tr>
+            <td><code>.idx.sort</code></td>
+            <td><code>(.idx.sort v)</code></td>
+            <td>Attach an ascending row-id permutation</td>
+          </tr>
+          <tr>
+            <td><code>.idx.bloom</code></td>
+            <td><code>(.idx.bloom v)</code></td>
+            <td>Attach an <em>m</em>-bit Bloom filter</td>
+          </tr>
+          <tr>
+            <td><code>.idx.drop</code></td>
+            <td><code>(.idx.drop v)</code></td>
+            <td>Remove any attached index</td>
+          </tr>
+          <tr>
+            <td><code>.idx.has?</code></td>
+            <td><code>(.idx.has? v)</code></td>
+            <td>True iff <code>v</code> carries an index</td>
+          </tr>
+          <tr>
+            <td><code>.idx.info</code></td>
+            <td><code>(.idx.info v)</code></td>
+            <td>Dict of kind + length + per-kind stats, or null</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="indexes-overview.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Indexes Overview</span></a>
+        <a href="queries-pivot.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Pivot Tables &amp; Window Functions</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+;; asc on string vectors — lexicographic order.
+
+(asc ["banana" "apple" "cherry"]) -- ["apple" "banana" "cherry"]
+(asc ["zebra" "alpha" "monkey"]) -- ["alpha" "monkey" "zebra"]
+(asc [""]) -- [""]
+(asc ["a" ""]) -- ["" "a"]
+
+;; asc on sym vectors
+(asc ['c 'a 'b]) -- ['a 'b 'c]

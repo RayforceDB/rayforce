@@ -1,0 +1,20 @@
+;; Copy-on-write semantics: two names bound to the "same" value see
+;; identical content, but a derived operation must produce a new value
+;; without mutating any aliasing name.  If COW were broken,
+;; (reverse y) would also reverse x.
+
+(set X [1 2 3])
+(set Y X)
+(sum (== X Y)) -- 3
+
+;; reverse leaves the source aliases intact
+(set Z (reverse Y))
+X -- [1 2 3]
+
+;; asc on a different vector doesn't touch X
+(set Z (asc [3 1 2]))
+X -- [1 2 3]
+
+;; concat returns a new vec; original unchanged
+(set Z (concat X [4 5]))
+X -- [1 2 3]

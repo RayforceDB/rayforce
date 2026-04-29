@@ -1,0 +1,2 @@
+(set t (read-csv [I64 I64 I64 F64 F64 F64] "/tmp/numeric_bench.csv"))
+(println "rows: %" (count t))

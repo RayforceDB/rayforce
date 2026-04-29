@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Indexes Overview &mdash; Rayforce Documentation</title>
+  <meta name="description" content="The full landscape of index-like structures in Rayforce: per-column accelerators, HNSW vector indexes, linked columns, partition pruning, and CSR graph indices. When to reach for each.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link active">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">VECTOR SEARCH</div>
+        <a href="vector-search.html" class="sidebar-link">Vector Search &amp; HNSW</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATALOG</div>
+        <a href="datalog.html" class="sidebar-link">Datalog</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">IPC</div>
+        <a href="ipc.html" class="sidebar-link">IPC Protocol</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Indexes Overview</span>
+      </div>
+
+      <h1>Indexes Overview</h1>
+      <p class="page-subtitle">A map of every index-like structure Rayforce ships &mdash; per-column accelerators, vector ANN indexes, linked columns, partition pruning, and graph indices. One mental model, then a decision matrix that points you at the right tool.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="model">What an &ldquo;index&rdquo; means in Rayforce</h2>
+      <p>An <strong>index</strong> in Rayforce is a precomputed, optional structure that <em>rides alongside</em> the data it's built for. It is not a separate database object: it lives on the column or table it indexes, survives copy / refcount semantics, and travels with the data through the query pipeline. Whether queries actually <em>consult</em> that structure varies by kind &mdash; HNSW, linked columns, partition pruning, and CSR are read by their query paths today; the four <code>.idx.*</code> accelerators are built and inspectable but not yet consumed by any operator. See the <a href="#status">status section</a> below.</p>
+      <p>Three properties hold for every kind of index documented on this page:</p>
+      <ul>
+        <li><strong>Opt-in.</strong> Indexes are built explicitly when you decide the build cost is worth it. The system never builds one behind your back.</li>
+        <li><strong>Mutation-aware.</strong> Mutating the underlying data drops or invalidates the index by design &mdash; a stale index is a wrong-answer bug, so the runtime refuses to keep one. Rebuild after a write.</li>
+        <li><strong>Transient by default.</strong> Per-column accelerators live in memory only; HNSW handles can be persisted to disk explicitly. The on-disk file format for ordinary tables never carries an index. After loading, rebuild whatever you want indexed.</li>
+      </ul>
+
+      <!-- ============================================================ -->
+      <h2 id="kinds">The five index-like structures</h2>
+
+      <h3>1. Per-column accelerators &mdash; <code>.idx.zone</code> / <code>.idx.hash</code> / <code>.idx.sort</code> / <code>.idx.bloom</code></h3>
+      <p>Attach one of four kinds to a numeric vector. Each kind builds a structure suited to a different query shape: hash for equality lookups, sort for binary search and ordered access, zone for column-level min/max/null pruning, bloom for cheap probabilistic membership rejection. All four occupy the same per-column slot &mdash; one kind at a time today.</p>
+      <p><strong>Today's status:</strong> all four <em>build correctly</em> and are <em>inspectable</em> via <code>(.idx.info)</code>, but no query operator consults them. Building one does not change <code>filter</code> / <code>in</code> / <code>find</code> / <code>distinct</code> / SIP behavior; the optimizer routing pass that wires the consumers up is the next phase. See the <a href="#status">status section</a> below.</p>
+      <p><strong>Surface:</strong> <code>(.idx.zone v)</code>, <code>(.idx.hash v)</code>, <code>(.idx.sort v)</code>, <code>(.idx.bloom v)</code>, <code>(.idx.drop v)</code>, <code>(.idx.has? v)</code>, <code>(.idx.info v)</code>. Numeric only in v1 (<code>RAY_BOOL</code> through <code>RAY_TIMESTAMP</code> at the C level; integer / float / date / time / timestamp vectors are the practical reach from Rayfall); <code>RAY_SYM</code> / <code>RAY_STR</code> are deferred.</p>
+      <p><strong>See:</strong> <a href="queries-indexes.html">Accelerator Indexes (reference)</a> &middot; <a href="guide-indexes.html#choose">Indexes Guide: choosing a kind</a>.</p>
+
+      <h3>2. Vector ANN index &mdash; HNSW</h3>
+      <p>Hierarchical Navigable Small World multi-layer proximity graph for approximate nearest neighbor search over float embedding vectors. Three distance metrics &mdash; cosine, L2, inner product. Built once with <code>hnsw-build</code>, queried with <code>ann</code>, optionally persisted to a directory with <code>hnsw-save</code> / <code>hnsw-load</code>.</p>
+      <p><strong>Surface:</strong> <code>(hnsw-build col [metric] [M] [ef_c])</code>, <code>(ann handle query k [ef_search])</code>, <code>(knn col query k [metric])</code>, <code>(hnsw-save handle dir)</code>, <code>(hnsw-load dir)</code>, <code>(hnsw-free handle)</code>, <code>(hnsw-info handle)</code>. Brute-force <code>knn</code> needs no index and exists alongside.</p>
+      <p><strong>See:</strong> <a href="vector-search.html">Vector Search &amp; HNSW</a> &middot; <a href="guide-indexes.html#workflow-ann">Indexes Guide: ANN workflow</a>.</p>
+
+      <h3>3. Linked columns</h3>
+      <p>A column whose values are row-id references into another table. Functions as a row-level index: dereferencing follows the link and resolves the target row at query time, similar in spirit to a foreign-key relationship but maintained at the column level.</p>
+      <p><strong>Surface:</strong> <code>(.col.link col target-table)</code>, <code>(.col.unlink col)</code>, <code>(.col.link? col)</code>, <code>(.col.target col)</code>.</p>
+      <p><strong>Parted-table interaction:</strong> a parted fact can carry a linked column targeting a non-parted dim (in-memory or splayed); per-segment <code>HAS_LINK</code> is preserved through <code>ray_read_parted</code> and segment streaming. Targets with any parted column are rejected at attach time. See <a href="queries-links.html#parted">Linked Columns: Parted-Table Interaction</a>.</p>
+      <p><strong>See:</strong> <a href="queries-links.html">Linked Columns</a>.</p>
+
+      <h3>4. Partition pruning</h3>
+      <p>A storage layout, not a column-level index, but it functions as a coarse zone-map at the table level: the partition discriminator (date, integer, or symbol) selects whole sub-tables to load. Filters that target the partition column let the optimizer skip entire partitions before any scan begins.</p>
+      <p><strong>Surface:</strong> implicit &mdash; the directory layout under your database root drives partition selection. The C API loader (<code>ray_part_load</code>) infers the partition type (<code>date</code> / <code>int</code> / <code>sym</code>) from the directory names.</p>
+      <p><strong>See:</strong> <a href="storage.html">Columnar Storage</a> &middot; <a href="guide-storage.html#partitioned-tables">Storage Guide: partitioned tables</a> &middot; <a href="architecture-offloading.html">Block Offloading</a>.</p>
+
+      <h3>5. CSR graph index</h3>
+      <p>A double-indexed Compressed Sparse Row adjacency structure (forward + reverse) attached to graph relationships. Used transparently by every graph opcode &mdash; <code>OP_EXPAND</code>, <code>OP_VAR_EXPAND</code>, <code>OP_SHORTEST_PATH</code>, <code>OP_WCO_JOIN</code> &mdash; and by Leapfrog Triejoin for worst-case optimal joins.</p>
+      <p><strong>Surface:</strong> none directly &mdash; the CSR is built when a relationship is loaded and consulted automatically by graph queries. There is no <code>(.csr.*)</code> Rayfall surface today.</p>
+      <p><strong>See:</strong> <a href="graph-storage.html">Graph Storage</a> &middot; <a href="graph-algorithms.html">Graph Algorithms</a>.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="pick">Pick the right kind</h2>
+      <p>Match the shape of your query to the structure that fits it. Read the <strong>Active today</strong> column carefully &mdash; the four <code>.idx.*</code> kinds are <em>built and inspectable</em> today but no query operator consults them yet, so they don't change observable query latency until the optimizer routing pass lands. HNSW, linked columns, partition pruning, and CSR are all consumed by their respective query paths today.</p>
+      <!-- TODO(user-contribution): refine the "Want to..." phrasings below
+           with framings that map your real queries onto the right kind. The
+           wording here is what every reader uses to decide which tool to
+           reach for, so your domain knowledge of common shapes ("filter on
+           a date column", "prune symbol partitions before a join", etc.)
+           is more useful here than my generic phrasings. Replace any row
+           that doesn't match how you think about your data. -->
+      <table>
+        <thead>
+          <tr>
+            <th>Want to&hellip;</th>
+            <th>Structure</th>
+            <th>Active today?</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Skip whole columns or segments where a predicate constant lies outside the value range</td>
+            <td><code>.idx.zone</code> &mdash; min/max plus null count</td>
+            <td>No &mdash; structure built; <code>.idx.info</code> only</td>
+          </tr>
+          <tr>
+            <td>Make repeated <code>=</code> / <code>in</code> / <code>find</code> / <code>distinct</code> over a numeric column O(1) instead of O(n)</td>
+            <td><code>.idx.hash</code> &mdash; chained open-addressing table</td>
+            <td>No &mdash; structure built; <code>.idx.info</code> only</td>
+          </tr>
+          <tr>
+            <td>Binary-search a numeric column for ranges, sorted scans, or <code>limit</code> queries</td>
+            <td><code>.idx.sort</code> &mdash; ascending row-id permutation</td>
+            <td>No &mdash; structure built; <code>.idx.info</code> only</td>
+          </tr>
+          <tr>
+            <td>Cheaply reject &ldquo;definitely not in this set&rdquo; probes &mdash; e.g. for SIP into a join</td>
+            <td><code>.idx.bloom</code> &mdash; m-bit probabilistic filter</td>
+            <td>No &mdash; structure built; <code>.idx.info</code> only (the SIP pass does not yet consult bloom)</td>
+          </tr>
+          <tr>
+            <td>Find the k nearest neighbors of an embedding vector by cosine, L2, or inner product</td>
+            <td>HNSW &mdash; <code>(hnsw-build)</code> + <code>(ann)</code></td>
+            <td>Yes &mdash; <code>(ann)</code> consults the index</td>
+          </tr>
+          <tr>
+            <td>Resolve a cross-table reference at query time without a materialized join</td>
+            <td>Linked column &mdash; <code>(.col.link)</code></td>
+            <td>Yes &mdash; column dereference resolves through the link</td>
+          </tr>
+          <tr>
+            <td>Skip whole sub-tables in a parted dataset based on the partition discriminator</td>
+            <td>Partition pruning &mdash; date / int / sym partitioning</td>
+            <td>Yes &mdash; optimizer pass rewrites filters</td>
+          </tr>
+          <tr>
+            <td>Traverse a graph &mdash; BFS, shortest path, betweenness, MST</td>
+            <td>CSR &mdash; transparent under graph opcodes</td>
+            <td>Yes &mdash; every graph opcode reads CSR directly</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- ============================================================ -->
+      <h2 id="status">What's wired today, what's not</h2>
+      <p>Rayforce is honest about phasing. The structures above all <em>build</em> correctly; integration with the optimizer is staged.</p>
+      <ul>
+        <li><strong>Per-column accelerators</strong> &mdash; build kernels and the <code>(.idx.*)</code> surface are shipped and tested. Auto-routing &mdash; rewriting <code>filter (= col const)</code>, <code>in</code>, <code>find</code>, <code>distinct</code>, and join build sides to consult the index instead of a linear scan &mdash; is the next phase. Until then, treat indexes as inspectable metadata; they don't yet auto-accelerate queries. See <a href="queries-indexes.html#caveats">caveats</a>.</li>
+        <li><strong>HNSW</strong> &mdash; fully wired. <code>(ann)</code> consults the index immediately.</li>
+        <li><strong>Linked columns</strong> &mdash; fully wired. Dereference resolves through the link at query time.</li>
+        <li><strong>Partition pruning</strong> &mdash; the optimizer's pruning pass skips partitions whose discriminator falls outside a filter predicate's range. See <a href="architecture-pipeline.html">Pipeline &amp; Optimizer</a>.</li>
+        <li><strong>CSR</strong> &mdash; fully wired and used by every graph opcode.</li>
+      </ul>
+
+      <!-- ============================================================ -->
+      <h2 id="next">Where to go next</h2>
+      <ul>
+        <li><a href="guide-indexes.html"><strong>Indexes Guide</strong></a> &mdash; procedural walk-through: when to build, how to choose, common workflows, lifecycle gotchas.</li>
+        <li><a href="queries-indexes.html"><strong>Accelerator Indexes</strong></a> &mdash; full reference for the <code>.idx.*</code> family.</li>
+        <li><a href="vector-search.html"><strong>Vector Search &amp; HNSW</strong></a> &mdash; ANN reference and worked examples.</li>
+        <li><a href="queries-links.html"><strong>Linked Columns</strong></a> &mdash; cross-table reference reference.</li>
+        <li><a href="storage.html"><strong>Columnar Storage</strong></a> &mdash; partitioning and on-disk layout.</li>
+      </ul>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="queries-links.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Linked Columns</span></a>
+        <a href="queries-indexes.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Accelerator Indexes</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

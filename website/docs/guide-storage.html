@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Data Persistence Guide — Rayforce Documentation</title>
+  <meta name="description" content="How to save and load data in Rayforce: CSV I/O, columnar files, splayed tables, partitioned storage, and memory-mapped access.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link active">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Data Persistence</span>
+      </div>
+
+      <h1>Data Persistence Guide</h1>
+      <p class="page-subtitle">How to save and load data: CSV files, columnar storage, splayed tables, partitioned tables, and memory-mapped I/O.</p>
+
+      <p>Rayforce provides multiple storage layers, from simple CSV for interchange to high-performance columnar files for production workloads. CSV I/O is available from Rayfall; the columnar storage layers are currently accessible through the C API.</p>
+
+      <!-- 1. CSV -->
+      <h2 id="csv-io">1. CSV I/O</h2>
+      <p>The simplest way to persist and exchange data. Available directly from Rayfall.</p>
+
+      <h3>Reading CSV</h3>
+      <pre><code>(<span class="hl-kw">set</span> data (<span class="hl-fn">.csv.read</span> <span class="hl-str">"path/to/data.csv"</span>))</code></pre>
+      <p>The reader:</p>
+      <ul>
+        <li>Treats the first row as column headers</li>
+        <li>Infers column types automatically: <code>i64</code>, <code>f64</code>, <code>date</code>, <code>time</code>, <code>timestamp</code>, <code>sym</code></li>
+        <li>Uses parallel parsing for large files</li>
+        <li>Handles null values (empty cells)</li>
+      </ul>
+
+      <h3>Writing CSV</h3>
+      <pre><code>(<span class="hl-fn">.csv.write</span> table <span class="hl-str">"path/to/output.csv"</span>)</code></pre>
+
+      <h3>Example: Round-Trip</h3>
+      <pre><code>(<span class="hl-kw">set</span> data (<span class="hl-fn">table</span> [<span class="hl-sym">Name</span> <span class="hl-sym">Score</span> <span class="hl-sym">Grade</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">Alice</span> <span class="hl-sym">Bob</span> <span class="hl-sym">Charlie</span>]
+        [<span class="hl-num">95</span> <span class="hl-num">87</span> <span class="hl-num">92</span>]
+        [<span class="hl-sym">A</span> <span class="hl-sym">B</span> <span class="hl-sym">A</span>])))
+
+(<span class="hl-fn">.csv.write</span> data <span class="hl-str">"/tmp/grades.csv"</span>)
+(<span class="hl-fn">.csv.read</span> <span class="hl-str">"/tmp/grades.csv"</span>)</code></pre>
+      <pre><code>┌─────────┬───────┬───────────────────┐
+│  Name   │ Score │       Grade       │
+│   sym   │  i64  │        sym        │
+├─────────┼───────┼───────────────────┤
+│ Alice   │ 95    │ A                 │
+│ Bob     │ 87    │ B                 │
+│ Charlie │ 92    │ A                 │
+├─────────┴───────┴───────────────────┤
+│ 3 rows (3 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p><strong>Note:</strong> Float values without a fractional part (e.g., 150.0) will be read back as integers. The CSV reader always infers the narrowest matching type.</p>
+
+      <!-- 2. Symbol Table -->
+      <h2 id="symbol-table">2. Symbol Table Persistence</h2>
+      <p>Rayforce maintains a global symbol intern table for <code>sym</code> columns. When saving and loading columnar data, the symbol table must be persisted alongside it so that symbol IDs remain meaningful.</p>
+      <p>The C API provides:</p>
+      <pre><code><span class="hl-comment">// Save the global symbol table to a file</span>
+ray_err_t ray_sym_save(<span class="hl-kw">const</span> <span class="hl-kw">char</span>* path);
+
+<span class="hl-comment">// Load symbols from a file (merges with the current table)</span>
+ray_err_t ray_sym_load(<span class="hl-kw">const</span> <span class="hl-kw">char</span>* path);</code></pre>
+      <p>The symbol file uses an append-only format: new symbols are appended on save, and loading merges them into the running table. File locking (<code>flock</code> on POSIX, <code>LockFileEx</code> on Windows) ensures safe concurrent access.</p>
+      <p>In typical usage, you do not call these directly &mdash; the splayed and partitioned table functions handle symbol persistence automatically.</p>
+
+      <!-- 3. Columnar files -->
+      <h2 id="columnar-files">3. Columnar Files</h2>
+      <div class="info-box">
+        <strong>C API only.</strong> The functions below are in internal headers (<code>src/store/col.h</code>, <code>src/store/splay.h</code>, <code>src/store/part.h</code>). Compile with <code>-Isrc</code> and include the specific header. These are not yet exposed as Rayfall builtins.
+      </div>
+      <p>A <strong>column file</strong> stores a single vector (column) in Rayforce&rsquo;s native binary format. This is the building block for all higher-level storage.</p>
+      <pre><code><span class="hl-comment">// Save a vector to a column file</span>
+ray_err_t ray_col_save(ray_t* vec, <span class="hl-kw">const</span> <span class="hl-kw">char</span>* path);
+
+<span class="hl-comment">// Load a vector from a column file</span>
+ray_t* ray_col_load(<span class="hl-kw">const</span> <span class="hl-kw">char</span>* path);
+
+<span class="hl-comment">// Memory-map a column file (zero-copy, read-only)</span>
+ray_t* ray_col_mmap(<span class="hl-kw">const</span> <span class="hl-kw">char</span>* path);</code></pre>
+      <p>The file format is compact: a header with type and length, followed by the raw element data. For string columns (<code>RAY_STR</code>), the pool data is written after the element array.</p>
+      <p>The difference between <code>ray_col_load</code> and <code>ray_col_mmap</code>:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Memory</th>
+            <th>Access</th>
+            <th>Use case</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>ray_col_load</code></td>
+            <td>Copies data into heap</td>
+            <td>Read/write</td>
+            <td>Data you will modify</td>
+          </tr>
+          <tr>
+            <td><code>ray_col_mmap</code></td>
+            <td>Maps file directly</td>
+            <td>Read-only</td>
+            <td>Large data, zero startup cost</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- 4. Splayed tables -->
+      <h2 id="splayed-tables">4. Splayed Tables</h2>
+      <p>A <strong>splayed table</strong> stores each column as a separate file inside a directory. This allows loading individual columns on demand instead of the entire table.</p>
+      <pre><code><span class="hl-comment">// Save a table as a splayed directory</span>
+ray_err_t ray_splay_save(ray_t* tbl, <span class="hl-kw">const</span> <span class="hl-kw">char</span>* dir,
+                         <span class="hl-kw">const</span> <span class="hl-kw">char</span>* sym_path);
+
+<span class="hl-comment">// Load a splayed table from a directory</span>
+ray_t* ray_splay_load(<span class="hl-kw">const</span> <span class="hl-kw">char</span>* dir,
+                      <span class="hl-kw">const</span> <span class="hl-kw">char</span>* sym_path);</code></pre>
+      <p>The directory layout looks like:</p>
+      <pre><code>trades/
+  .d            <span class="hl-comment"># schema (column name symbol IDs)</span>
+  Symbol        <span class="hl-comment"># sym column</span>
+  Price         <span class="hl-comment"># f64 column</span>
+  Qty           <span class="hl-comment"># i64 column</span></code></pre>
+      <p>Pass a <code>sym_path</code> to automatically save/load the symbol table alongside the data. Pass <code>NULL</code> if you manage symbols separately.</p>
+
+      <!-- 5. Partitioned tables -->
+      <h2 id="partitioned-tables">5. Partitioned Tables</h2>
+      <p>For very large datasets, Rayforce supports <strong>date-partitioned</strong> storage. Each partition is a splayed table inside a date-named subdirectory.</p>
+      <pre><code><span class="hl-comment">// Load a partitioned table</span>
+ray_t* ray_part_load(<span class="hl-kw">const</span> <span class="hl-kw">char</span>* db_root,
+                     <span class="hl-kw">const</span> <span class="hl-kw">char</span>* table_name);</code></pre>
+      <p>Expected directory layout:</p>
+      <pre><code>db/
+  sym                  <span class="hl-comment"># shared symbol table</span>
+  2024.01.01/
+    trades/
+      Symbol
+      Price
+      Qty
+  2024.01.02/
+    trades/
+      Symbol
+      Price
+      Qty
+  ...</code></pre>
+      <p>The loader:</p>
+      <ol>
+        <li>Loads the shared <code>sym</code> file from <code>db_root</code></li>
+        <li>Discovers date directories (sorted numerically)</li>
+        <li>Loads each partition as a splayed table</li>
+        <li>Adds a virtual <code>Date</code> column from the directory name</li>
+        <li>Concatenates all partitions into a single table</li>
+      </ol>
+      <p>This is the recommended layout for time-series data that grows continuously. New partitions can be added without rewriting existing data.</p>
+
+      <p>For datasets larger than available RAM, Rayforce can process partitioned tables one segment at a time using <strong>block offloading</strong> &mdash; streaming through partitions without loading them all at once. The optimizer&rsquo;s partition pruning pass can skip entire partitions that don&rsquo;t match filter predicates. See <a href="architecture-offloading.html">Block Offloading</a> for details.</p>
+
+      <!-- 6. Mmap -->
+      <h2 id="mmap">6. Memory-Mapped I/O</h2>
+      <p>Memory-mapped I/O (<code>mmap</code>) lets Rayforce access on-disk data without copying it into memory. The operating system pages data in on demand as it is accessed.</p>
+
+      <h3>Benefits</h3>
+      <ul>
+        <li><strong>Zero startup cost</strong> &mdash; opening a 10 GB file is instant; only accessed pages are loaded</li>
+        <li><strong>Shared memory</strong> &mdash; multiple processes can mmap the same file without duplicating data in RAM</li>
+        <li><strong>OS-managed caching</strong> &mdash; the kernel manages which pages stay in memory vs. on disk</li>
+      </ul>
+
+      <h3>Trade-offs</h3>
+      <ul>
+        <li><strong>Read-only</strong> &mdash; mmap vectors cannot be modified (COW will copy if you try)</li>
+        <li><strong>Random I/O</strong> &mdash; if access patterns are truly random across a large file, performance can be worse than sequential reads</li>
+      </ul>
+
+      <h3>Usage</h3>
+      <p>Use <code>ray_col_mmap</code> for individual columns:</p>
+      <pre><code>ray_t* prices = ray_col_mmap(<span class="hl-str">"db/2024.01.01/trades/Price"</span>);</code></pre>
+      <p>Splayed table loading can also use mmap internally. For most analytics workloads &mdash; scans, filters, aggregations &mdash; mmap provides the best combination of startup time and throughput.</p>
+
+      <h2 id="choosing">Choosing a Storage Layer</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Layer</th>
+            <th>Interface</th>
+            <th>Best for</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>CSV</td>
+            <td>Rayfall</td>
+            <td>Data interchange, small datasets, prototyping</td>
+          </tr>
+          <tr>
+            <td>Columnar</td>
+            <td>C API</td>
+            <td>Single-vector persistence, embedding in applications</td>
+          </tr>
+          <tr>
+            <td>Splayed tables</td>
+            <td>C API</td>
+            <td>Multi-column tables, column-selective loading</td>
+          </tr>
+          <tr>
+            <td>Partitioned tables</td>
+            <td>C API</td>
+            <td>Large time-series, append-only growth, date-range queries</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="next-steps">Next Steps</h2>
+      <ul>
+        <li><a href="storage.html"><strong>Storage Reference</strong></a> &mdash; Detailed file format specifications and API reference</li>
+        <li><a href="c-api-core.html"><strong>Core C API</strong></a> &mdash; Working with <code>ray_t</code> objects, vectors, and tables in C</li>
+        <li><a href="architecture-memory.html"><strong>Memory Model</strong></a> &mdash; Buddy allocator, arenas, COW, and per-VM heaps</li>
+        <li><a href="tutorial.html"><strong>Getting Started Tutorial</strong></a> &mdash; Hands-on introduction to Rayfall</li>
+      </ul>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="datalog.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Datalog: Rules &amp; Queries</span></a>
+        <a href="architecture-pipeline.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Pipeline &amp; Optimizer</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

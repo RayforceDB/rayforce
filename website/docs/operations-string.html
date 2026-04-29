@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>String Operations — Rayforce Documentation</title>
+  <meta name="description" content="Complete reference for Rayforce string operations: concat, upper, lower, strlen, substr, replace, trim, like, ilike, split, format. RAY_SYM vs RAY_STR internals.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link active">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>String Operations</span>
+      </div>
+
+      <h1>String Operations</h1>
+      <p class="page-subtitle">Complete reference for string manipulation in Rayforce &mdash; from basic transforms to pattern matching, covering both RAY_SYM and RAY_STR column types.</p>
+
+      <h2 id="string-types">RAY_SYM vs RAY_STR</h2>
+      <p>Rayforce provides two distinct string column representations, each optimized for different workloads. Choosing the right type is critical for performance.</p>
+
+      <h3 id="ray-sym">RAY_SYM &mdash; Dictionary-Encoded Symbols</h3>
+      <p><code>RAY_SYM</code> columns store strings as integer indices into a global intern table. Ideal for <strong>low-cardinality</strong> categorical data (country codes, status flags, product categories).</p>
+      <ul>
+        <li><strong>Adaptive-width indices</strong> &mdash; 8, 16, 32, or 64-bit integers depending on dictionary size</li>
+        <li><strong>Equality comparison</strong> is a single integer compare &mdash; O(1)</li>
+        <li><strong>Group-by</strong> on SYM columns uses direct index lookup instead of hashing</li>
+        <li><strong>Memory efficient</strong> &mdash; each row stores only 1&ndash;8 bytes regardless of string length</li>
+        <li><strong>Global intern table</strong> &mdash; symbols are shared across all columns and tables</li>
+      </ul>
+      <pre><code><span class="hl-comment">; Create a table with a SYM column (default for short repeated strings in CSV)</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-kw">set</span> t (<span class="hl-fn">.csv.read</span> <span class="hl-str">"trades.csv"</span>))
+<span class="hl-comment">; region column is automatically SYM — only 4 unique values across 1M rows</span></code></pre>
+
+      <h3 id="ray-str">RAY_STR &mdash; Variable-Length Strings</h3>
+      <p><code>RAY_STR</code> columns store variable-length strings with a hybrid inline/pool layout. Best for <strong>high-cardinality</strong> or <strong>unique</strong> text data (names, descriptions, URLs).</p>
+      <ul>
+        <li><strong>SSO (Small String Optimization)</strong> &mdash; strings of 12 bytes or fewer are stored inline in the 16-byte <code>ray_str_t</code> element, requiring zero indirection</li>
+        <li><strong>Pool storage</strong> &mdash; strings longer than 12 bytes are written to a per-vector pool; the element stores a 4-byte offset and 4-byte length, plus a <strong>4-byte prefix</strong> copied inline for fast comparison rejection</li>
+        <li><strong>Fast comparison rejection</strong> &mdash; the 4-byte prefix allows most unequal comparisons to short-circuit without following the pool pointer</li>
+        <li><strong>Per-vector pool</strong> &mdash; each RAY_STR vector has its own pool; <code>col_propagate_str_pool()</code> shares pools between source and destination during execution</li>
+      </ul>
+      <pre><code><span class="hl-comment">; STR columns are used for unique/high-cardinality text</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-kw">set</span> names (<span class="hl-fn">vec-str</span> [<span class="hl-str">"Alice"</span> <span class="hl-str">"Bob"</span> <span class="hl-str">"Charlie"</span>]))
+<span class="hl-comment">; "Alice" (5 bytes) → stored inline (SSO)</span>
+<span class="hl-comment">; "A longer description here" (26 bytes) → stored in pool with 4-byte prefix</span></code></pre>
+
+      <div class="info-box">
+        <strong>When to use which?</strong> Use <code>RAY_SYM</code> for columns with fewer than ~65K unique values (status codes, categories, tickers). Use <code>RAY_STR</code> for free-text, names, addresses, or any column where most values are unique. The CSV reader auto-detects: columns with a high repeat ratio become SYM, others become STR.
+      </div>
+
+      <h2 id="null-propagation">Null Propagation</h2>
+      <p>All string operations in Rayforce follow strict null propagation semantics:</p>
+      <ul>
+        <li><strong>Null input produces null output</strong> &mdash; if any required input row is null, the output row is null</li>
+        <li><strong>CONCAT is null if any argument is null</strong></li>
+        <li>Null propagation applies uniformly to both RAY_SYM and RAY_STR columns</li>
+        <li>Null bitmaps are carried through the execution pipeline per morsel (1024 elements)</li>
+      </ul>
+      <p>In the C API DAG, null propagation is handled automatically per morsel. String transformation opcodes (STRLEN, UPPER/LOWER/TRIM, SUBSTR, REPLACE, CONCAT) propagate nulls: null input rows produce null output rows. CONCAT is null if any argument is null.</p>
+
+      <h2 id="string-functions">String Functions</h2>
+
+      <div class="info-box">
+        <strong>DAG-only operations.</strong> The following string operations are available in the C API DAG but are <strong>not</strong> currently exposed as Rayfall builtins: <code>upper</code>, <code>lower</code>, <code>strlen</code>, <code>trim</code>, <code>substr</code>, <code>replace</code>, <code>ilike</code>. They can be used through the C API's DAG opcodes (see table below).
+      </div>
+
+      <h3 id="concat">concat</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(concat a b)</span>
+          <span class="fn-type">binary</span>
+        </div>
+        <div class="fn-desc">Concatenates two string arguments. Works on string atoms and vectors element-wise.</div>
+        <div class="fn-example">
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">concat</span> <span class="hl-str">"hello"</span> <span class="hl-str">" world"</span>)
+"hello world"
+        </div>
+      </div>
+
+      <h3 id="like">like</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(like str pattern)</span>
+          <span class="fn-type">binary &middot; element-wise</span>
+        </div>
+        <div class="fn-desc">Case-sensitive glob pattern matching. Returns a boolean (or boolean vector for vector input). Supports <code>*</code> (match any sequence of characters) and <code>?</code> (match any single character). Works on both RAY_SYM and RAY_STR columns.</div>
+        <div class="fn-example">
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">like</span> <span class="hl-str">"hello world"</span> <span class="hl-str">"*world"</span>)
+true
+
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">like</span> <span class="hl-str">"hello world"</span> <span class="hl-str">"hello*"</span>)
+true
+
+<span class="hl-comment">ray&gt;</span> (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>t <span class="hl-sym">where:</span> (<span class="hl-fn">like</span> name <span class="hl-str">"A*"</span>)})
+<span class="hl-comment">; Returns all rows where name starts with "A"</span>
+        </div>
+      </div>
+
+      <h3 id="split">split</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(split str delimiter)</span>
+          <span class="fn-type">binary &middot; element-wise</span>
+        </div>
+        <div class="fn-desc">Splits each string element by the given delimiter and returns a list of string vectors. Each element in the result is a vector of the split parts. Null input produces null output.</div>
+        <div class="fn-example">
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">split</span> <span class="hl-str">"a,b,c"</span> <span class="hl-str">","</span>)
+["a" "b" "c"]
+
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">split</span> <span class="hl-str">"hello world"</span> <span class="hl-str">" "</span>)
+["hello" "world"]
+        </div>
+      </div>
+
+      <h3 id="format">format</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(format fmt ...args)</span>
+          <span class="fn-type">variadic</span>
+        </div>
+        <div class="fn-desc">Formats values into a string using a format template. Each <code>%</code> placeholder is replaced with the next stringified argument in order. Useful for building display strings or log messages.</div>
+        <div class="fn-example">
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">format</span> <span class="hl-str">"Hello, %!"</span> <span class="hl-str">"world"</span>)
+"Hello, world!"
+
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">format</span> <span class="hl-str">"% + % = %"</span> <span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>)
+"1 + 2 = 3"
+        </div>
+      </div>
+
+      <h2 id="dag-string-ops">String Operations in the DAG</h2>
+      <p>When using the C API, string operations are available as DAG opcodes. These are fused into morsel-driven execution alongside arithmetic and comparison operations.</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Opcode</th>
+            <th>C API</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>OP_UPPER</code></td><td><code>ray_upper(g, a)</code></td><td>Uppercase transform</td></tr>
+          <tr><td><code>OP_LOWER</code></td><td><code>ray_lower(g, a)</code></td><td>Lowercase transform</td></tr>
+          <tr><td><code>OP_STRLEN</code></td><td><code>ray_strlen(g, a)</code></td><td>String byte length</td></tr>
+          <tr><td><code>OP_TRIM</code></td><td><code>ray_trim_op(g, a)</code></td><td>Strip leading/trailing whitespace</td></tr>
+          <tr><td><code>OP_SUBSTR</code></td><td><code>ray_substr(g, str, start, len)</code></td><td>Extract substring by position</td></tr>
+          <tr><td><code>OP_REPLACE</code></td><td><code>ray_replace(g, str, from, to)</code></td><td>Replace all occurrences</td></tr>
+          <tr><td><code>OP_CONCAT</code></td><td><code>ray_concat(g, args, n)</code></td><td>Concatenate N strings</td></tr>
+          <tr><td><code>OP_LIKE</code></td><td><code>ray_like(g, input, pattern)</code></td><td>Case-sensitive glob pattern match (<code>*</code>/<code>?</code> wildcards)</td></tr>
+          <tr><td><code>OP_ILIKE</code></td><td><code>ray_ilike(g, input, pattern)</code></td><td>Case-insensitive glob pattern match</td></tr>
+        </tbody>
+      </table>
+
+      <h3>C API Example</h3>
+      <pre><code><span class="hl-comment">/* Filter rows where upper(name) LIKE "A*" and compute strlen */</span>
+<span class="hl-type">ray_graph_t</span>* g = <span class="hl-fn">ray_graph_new</span>(table);
+
+<span class="hl-type">ray_op_t</span>* name    = <span class="hl-fn">ray_scan</span>(g, <span class="hl-str">"name"</span>);
+<span class="hl-type">ray_op_t</span>* up_name = <span class="hl-fn">ray_upper</span>(g, name);
+<span class="hl-type">ray_op_t</span>* pattern = <span class="hl-fn">ray_const_str</span>(g, <span class="hl-str">"A*"</span>, <span class="hl-num">2</span>);
+<span class="hl-type">ray_op_t</span>* pred    = <span class="hl-fn">ray_like</span>(g, up_name, pattern);
+
+<span class="hl-type">ray_op_t</span>* filt_name = <span class="hl-fn">ray_filter</span>(g, name, pred);
+<span class="hl-type">ray_op_t</span>* name_len  = <span class="hl-fn">ray_strlen</span>(g, filt_name);
+
+<span class="hl-comment">/* Execute — upper, like, filter, strlen all fused into one morsel pass */</span>
+<span class="hl-type">ray_t</span>* result = <span class="hl-fn">ray_execute</span>(g, <span class="hl-fn">ray_optimize</span>(g, name_len));</code></pre>
+
+      <h2 id="internals">String Pool Internals</h2>
+      <p>Understanding the internal layout helps explain performance characteristics of string operations.</p>
+
+      <h3>ray_str_t Element Layout (16 bytes)</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Bytes</th>
+            <th>Inline (SSO)</th>
+            <th>Pool Reference</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>0&ndash;3</td><td>String data [0..3]</td><td>4-byte prefix (first 4 bytes of string)</td></tr>
+          <tr><td>4&ndash;7</td><td>String data [4..7]</td><td>Pool offset (uint32_t)</td></tr>
+          <tr><td>8&ndash;11</td><td>String data [8..11]</td><td>String length (uint32_t)</td></tr>
+          <tr><td>12&ndash;15</td><td>Length + flag</td><td>Length + flag (high bit = 1 for pool)</td></tr>
+        </tbody>
+      </table>
+
+      <div class="info-box">
+        <strong>SSO threshold:</strong> Strings of 12 bytes or fewer are stored entirely within the 16-byte element &mdash; no heap allocation, no pointer chase. The majority of real-world strings (tickers, codes, short names) benefit from this optimization. Access via <code>ray_str_vec_get()</code> returns a pointer to the inline data or pool data transparently.
+      </div>
+
+      <h3>Hash and Comparison</h3>
+      <p>String hashing uses <code>ray_str_t_hash()</code> which operates directly on the element bytes. Comparison via <code>ray_str_t_cmp()</code> / <code>ray_str_t_eq()</code> first compares the 4-byte prefix for fast rejection, then falls through to a full byte comparison only when prefixes match. This makes hash joins and group-by on string columns significantly faster than naive approaches.</p>
+
+      <h3>Dictionary-Encoded Symbol Width</h3>
+      <p><code>RAY_SYM</code> columns use adaptive-width integer indices to minimize memory:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Dictionary Size</th>
+            <th>Index Width</th>
+            <th>Bytes per Row</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>&le; 255</td><td>8-bit</td><td>1</td></tr>
+          <tr><td>&le; 65,535</td><td>16-bit</td><td>2</td></tr>
+          <tr><td>&le; 4,294,967,295</td><td>32-bit</td><td>4</td></tr>
+          <tr><td>Larger</td><td>64-bit</td><td>8</td></tr>
+        </tbody>
+      </table>
+      <p>Width is set at column creation via <code>ray_sym_vec_new(sym_width, capacity)</code> where <code>sym_width</code> is 1, 2, 4, or 8. The CSV reader picks the narrowest width that fits the observed cardinality.</p>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="operations-math.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Math, Comparison, Aggregation &amp; Iteration</span></a>
+        <a href="control-flow.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Control Flow &amp; Error Handling</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

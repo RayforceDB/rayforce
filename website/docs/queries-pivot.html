@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pivot &amp; Window — Rayforce Documentation</title>
+  <meta name="description" content="Pivot tables and window functions in Rayfall. Single-pass hash aggregation, multi-index pivots, and window-based computations.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link active">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Pivot &amp; Window</span>
+      </div>
+
+      <h1>Pivot Tables &amp; Window Functions</h1>
+      <p class="page-subtitle">Reshape data with pivot tables for wide-format aggregation, and compute rolling or windowed calculations over ordered data.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="pivot">Pivot</h2>
+      <p>The <code>pivot</code> function reshapes long-format data into wide format. It groups by an index column, spreads a pivot column's distinct values into new columns, and fills each cell with an aggregated value.</p>
+
+      <h3>Signature</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(pivot table index pivot_col value_col agg_fn)</span>
+        </div>
+        <div class="fn-desc">
+          Pivot a table to wide format.<br>
+          <strong>table</strong> &mdash; source table<br>
+          <strong>index</strong> &mdash; row index column (symbol or vector of symbols for multi-index)<br>
+          <strong>pivot_col</strong> &mdash; column whose distinct values become new column headers<br>
+          <strong>value_col</strong> &mdash; column to aggregate<br>
+          <strong>agg_fn</strong> &mdash; aggregation function (<code>sum</code>, <code>avg</code>, <code>count</code>, <code>min</code>, <code>max</code>, <code>first</code>, <code>last</code>, <code>med</code>, or a custom lambda)
+        </div>
+      </div>
+
+      <h3>Basic Pivot</h3>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Symbol</span> <span class="hl-sym">Side</span> <span class="hl-sym">Price</span> <span class="hl-sym">Quantity</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-str">AAPL</span> <span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span> <span class="hl-str">GOOG</span> <span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span>]
+          [<span class="hl-str">Buy</span> <span class="hl-str">Sell</span> <span class="hl-str">Buy</span> <span class="hl-str">Sell</span> <span class="hl-str">Buy</span> <span class="hl-str">Buy</span>]
+          [<span class="hl-num">150</span> <span class="hl-num">152</span> <span class="hl-num">280</span> <span class="hl-num">282</span> <span class="hl-num">149</span> <span class="hl-num">278</span>]
+          [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span> <span class="hl-num">75</span> <span class="hl-num">300</span> <span class="hl-num">60</span>])))
+
+<span class="hl-comment">; Total Quantity by Symbol and Side</span>
+(<span class="hl-fn">pivot</span> trades <span class="hl-str">'Symbol</span> <span class="hl-str">'Side</span> <span class="hl-str">'Quantity</span> sum)
+<span class="hl-comment">; Symbol  Buy  Sell</span>
+<span class="hl-comment">; ------  ---  ----</span>
+<span class="hl-comment">; AAPL    400   200</span>
+<span class="hl-comment">; GOOG    110    75</span></code></pre>
+
+      <h3>Different Aggregations</h3>
+      <pre><code><span class="hl-comment">; Average Price by Symbol and Side</span>
+(<span class="hl-fn">pivot</span> trades <span class="hl-str">'Symbol</span> <span class="hl-str">'Side</span> <span class="hl-str">'Price</span> avg)
+<span class="hl-comment">; Symbol   Buy   Sell</span>
+<span class="hl-comment">; ------  -----  -----</span>
+<span class="hl-comment">; AAPL    149.5  152.0</span>
+<span class="hl-comment">; GOOG    279.0  282.0</span>
+
+<span class="hl-comment">; Trade Count by Symbol and Side</span>
+(<span class="hl-fn">pivot</span> trades <span class="hl-str">'Symbol</span> <span class="hl-str">'Side</span> <span class="hl-str">'Quantity</span> count)
+<span class="hl-comment">; Symbol  Buy  Sell</span>
+<span class="hl-comment">; ------  ---  ----</span>
+<span class="hl-comment">; AAPL      2     1</span>
+<span class="hl-comment">; GOOG      2     1</span>
+
+<span class="hl-comment">; Min/Max Price</span>
+(<span class="hl-fn">pivot</span> trades <span class="hl-str">'Symbol</span> <span class="hl-str">'Side</span> <span class="hl-str">'Price</span> min)
+(<span class="hl-fn">pivot</span> trades <span class="hl-str">'Symbol</span> <span class="hl-str">'Side</span> <span class="hl-str">'Price</span> max)
+
+<span class="hl-comment">; First/Last Price</span>
+(<span class="hl-fn">pivot</span> trades <span class="hl-str">'Symbol</span> <span class="hl-str">'Side</span> <span class="hl-str">'Price</span> first)
+(<span class="hl-fn">pivot</span> trades <span class="hl-str">'Symbol</span> <span class="hl-str">'Side</span> <span class="hl-str">'Price</span> last)
+
+<span class="hl-comment">; Median Price</span>
+(<span class="hl-fn">pivot</span> trades <span class="hl-str">'Symbol</span> <span class="hl-str">'Side</span> <span class="hl-str">'Price</span> med)</code></pre>
+
+      <h3 id="pivot-custom">Custom Aggregation</h3>
+      <p>Pass a lambda for custom aggregation logic:</p>
+      <pre><code><span class="hl-comment">; Sum of squares</span>
+(<span class="hl-fn">pivot</span> trades <span class="hl-str">'Symbol</span> <span class="hl-str">'Side</span> <span class="hl-str">'Quantity</span> (<span class="hl-kw">fn</span> [x] (<span class="hl-fn">sum</span> (<span class="hl-fn">*</span> x x))))</code></pre>
+
+      <h3 id="pivot-multi">Multi-index Pivot</h3>
+      <p>Pass a vector of column symbols as the index to create a multi-level row grouping:</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Date</span> <span class="hl-sym">Symbol</span> <span class="hl-sym">Sector</span> <span class="hl-sym">Side</span> <span class="hl-sym">Price</span> <span class="hl-sym">Quantity</span>]
+    (<span class="hl-fn">list</span>
+        (<span class="hl-fn">+</span> <span class="hl-num">2024.01.01</span> (<span class="hl-fn">take</span> (<span class="hl-fn">til</span> <span class="hl-num">30</span>) n))
+        (<span class="hl-fn">take</span> [<span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span> <span class="hl-str">MSFT</span> <span class="hl-str">AMZN</span>] n)
+        (<span class="hl-fn">take</span> [<span class="hl-str">Tech</span> <span class="hl-str">Tech</span> <span class="hl-str">Tech</span> <span class="hl-str">Retail</span>] n)
+        (<span class="hl-fn">take</span> [<span class="hl-str">Buy</span> <span class="hl-str">Sell</span> <span class="hl-str">Short</span>] n)
+        (<span class="hl-fn">+</span> <span class="hl-num">150</span> (<span class="hl-fn">til</span> n))
+        (<span class="hl-fn">*</span> <span class="hl-num">100</span> (<span class="hl-fn">+</span> <span class="hl-num">1</span> (<span class="hl-fn">til</span> n))))))
+
+<span class="hl-comment">; Multi-index: Quantity by [Date Symbol] and Side</span>
+(<span class="hl-fn">pivot</span> trades [<span class="hl-sym">Date</span> <span class="hl-sym">Symbol</span>] <span class="hl-str">'Side</span> <span class="hl-str">'Quantity</span> sum)
+
+<span class="hl-comment">; Multi-index: Avg Price by [Sector Symbol] and Side</span>
+(<span class="hl-fn">pivot</span> trades [<span class="hl-sym">Sector</span> <span class="hl-sym">Symbol</span>] <span class="hl-str">'Side</span> <span class="hl-str">'Price</span> avg)</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="pivot-impl">OP_PIVOT DAG Implementation</h2>
+      <p>Pivot compiles to a single <code>OP_PIVOT</code> node in the execution DAG. The implementation uses a single-pass parallel hash aggregation:</p>
+      <ol>
+        <li><strong>Phase 1: Discover pivot values</strong> &mdash; Scan the pivot column to collect its distinct values. These become the output column names.</li>
+        <li><strong>Phase 2: Hash aggregation</strong> &mdash; For each morsel, hash the (index, pivot_value) composite key and route the value to the corresponding accumulator. Each output column has its own aggregation state array.</li>
+        <li><strong>Phase 3: Materialize</strong> &mdash; Build the result table with the index column(s) as rows and one column per distinct pivot value, filled with the aggregated results.</li>
+      </ol>
+      <div class="info-box">
+        <strong>Single-pass design.</strong> Unlike the naive approach of grouping then reshaping, <code>OP_PIVOT</code> performs aggregation and reshaping in one pass. This avoids materializing the grouped intermediate table and reduces memory pressure for large datasets.
+      </div>
+
+      <h3>Supported Aggregations</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>sum</code></td><td>Sum of values</td></tr>
+          <tr><td><code>avg</code></td><td>Arithmetic mean</td></tr>
+          <tr><td><code>count</code></td><td>Number of values</td></tr>
+          <tr><td><code>min</code></td><td>Minimum value</td></tr>
+          <tr><td><code>max</code></td><td>Maximum value</td></tr>
+          <tr><td><code>first</code></td><td>First value in group</td></tr>
+          <tr><td><code>last</code></td><td>Last value in group</td></tr>
+          <tr><td><code>med</code></td><td>Median value</td></tr>
+          <tr><td><code>dev</code></td><td>Standard deviation</td></tr>
+          <tr><td><code>(fn [x] ...)</code></td><td>Custom lambda aggregation</td></tr>
+        </tbody>
+      </table>
+
+      <!-- ============================================================ -->
+      <h2 id="window-functions">Window Functions</h2>
+      <p>Window functions compute values across a set of related rows without collapsing the result. In Rayfall, windowed computations are expressed through <code>select</code> with rolling or cumulative expressions.</p>
+
+      <h3>Rolling Computations</h3>
+      <p>Running computations like cumulative sums and moving averages can be computed using <code>scan</code> directly on column vectors:</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Sym</span> <span class="hl-sym">Time</span> <span class="hl-sym">Price</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-str">x</span> <span class="hl-str">x</span> <span class="hl-str">x</span>]
+          [<span class="hl-num">12:00:01</span> <span class="hl-num">12:00:04</span> <span class="hl-num">12:00:06</span>]
+          [<span class="hl-num">89.17</span> <span class="hl-num">70.5</span> <span class="hl-num">80.54</span>])))
+
+<span class="hl-comment">; Cumulative sum on the Price column</span>
+(<span class="hl-fn">scan</span> <span class="hl-fn">+</span> (<span class="hl-fn">at</span> trades <span class="hl-str">'Price</span>))
+<span class="hl-comment">; [89.17 159.67 240.21]</span></code></pre>
+
+      <h3>Rank and Order</h3>
+      <pre><code><span class="hl-comment">; Rank prices — double iasc gives dense rank</span>
+(<span class="hl-kw">set</span> prices [<span class="hl-num">89.17</span> <span class="hl-num">70.5</span> <span class="hl-num">80.54</span>])
+(<span class="hl-fn">iasc</span> (<span class="hl-fn">iasc</span> prices))
+<span class="hl-comment">; [2 0 1]</span></code></pre>
+
+      <h3>Grouped Aggregation</h3>
+      <p>Use <code>by:</code> with aggregate expressions for per-group computations:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades
+         <span class="hl-sym">by:</span> Sym
+         <span class="hl-sym">total_price:</span> (<span class="hl-fn">sum</span> Price)
+         <span class="hl-sym">min_price:</span> (<span class="hl-fn">min</span> Price)
+         <span class="hl-sym">max_price:</span> (<span class="hl-fn">max</span> Price)})
+<span class="hl-comment">; Sym  total_price min_price max_price</span>
+<span class="hl-comment">; ---  ----------- --------- ---------</span>
+<span class="hl-comment">; x         240.21      70.5     89.17</span></code></pre>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="queries-indexes.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Accelerator Indexes</span></a>
+        <a href="storage.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Storage</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

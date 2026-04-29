@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Getting Started Tutorial — Rayforce Documentation</title>
+  <meta name="description" content="Step-by-step tutorial: create tables, filter, group, sort, join, pivot, and load CSV files with Rayfall.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link active">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Getting Started Tutorial</span>
+      </div>
+
+      <h1>Getting Started Tutorial</h1>
+      <p class="page-subtitle">A hands-on walkthrough: build tables, query data, join, pivot, and work with CSV files &mdash; all from the Rayfall REPL.</p>
+
+      <p>This tutorial assumes you have already <a href="quick-start.html">built Rayforce</a> and can start the REPL with <code>./rayforce</code>. Every example below shows the exact input and output you will see.</p>
+
+      <!-- Step 1 -->
+      <h2 id="create-table">1. Your First Table</h2>
+      <p>Create a table of stock trades with three columns: <code>Symbol</code> (sym), <code>Price</code> (float), and <code>Qty</code> (integer). Column names are given as a vector of symbols, and column data as a <code>list</code> of vectors:</p>
+      <pre><code><span class="hl-comment">; Create a trades table</span>
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Symbol</span> <span class="hl-sym">Price</span> <span class="hl-sym">Qty</span>]
+  (<span class="hl-fn">list</span>
+    [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span>]
+    [<span class="hl-num">150.0</span> <span class="hl-num">280.0</span> <span class="hl-num">420.0</span> <span class="hl-num">155.0</span> <span class="hl-num">275.0</span> <span class="hl-num">415.0</span>]
+    [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span> <span class="hl-num">300</span> <span class="hl-num">150</span> <span class="hl-num">75</span>])))</code></pre>
+      <p>Output:</p>
+      <pre><code>┌────────┬───────┬────────────────────┐
+│ Symbol │ Price │        Qty         │
+│  sym   │  f64  │        i64         │
+├────────┼───────┼────────────────────┤
+│ AAPL   │ 150.0 │ 100                │
+│ GOOG   │ 280.0 │ 200                │
+│ MSFT   │ 420.0 │ 50                 │
+│ AAPL   │ 155.0 │ 300                │
+│ GOOG   │ 275.0 │ 150                │
+│ MSFT   │ 415.0 │ 75                 │
+├────────┴───────┴────────────────────┤
+│ 6 rows (6 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Each column has an inferred type shown on the second header row: <code>sym</code> for symbols, <code>f64</code> for 64-bit floats, and <code>i64</code> for 64-bit integers.</p>
+
+      <!-- Step 2 -->
+      <h2 id="filtering">2. Filtering Rows</h2>
+      <p>Use <code>select</code> with a <code>where:</code> clause to filter rows. Find all trades where the price exceeds 200:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>trades <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> <span class="hl-sym">Price</span> <span class="hl-num">200.0</span>)})</code></pre>
+      <pre><code>┌────────┬───────┬────────────────────┐
+│ Symbol │ Price │        Qty         │
+│  sym   │  f64  │        i64         │
+├────────┼───────┼────────────────────┤
+│ GOOG   │ 280.0 │ 200                │
+│ MSFT   │ 420.0 │ 50                 │
+│ GOOG   │ 275.0 │ 150                │
+│ MSFT   │ 415.0 │ 75                 │
+├────────┴───────┴────────────────────┤
+│ 4 rows (4 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>The <code>where:</code> expression is evaluated element-wise across the <code>Price</code> column, producing a boolean mask that selects matching rows.</p>
+
+      <!-- Step 3 -->
+      <h2 id="grouping">3. Grouping and Aggregation</h2>
+      <p>Group by <code>Symbol</code> and compute aggregates. The <code>by:</code> clause names the grouping column; additional key-value pairs define computed columns:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>trades <span class="hl-sym">by:</span> <span class="hl-sym">Symbol</span>
+         <span class="hl-sym">total:</span> (<span class="hl-fn">sum</span> <span class="hl-sym">Qty</span>)
+         <span class="hl-sym">avg_price:</span> (<span class="hl-fn">avg</span> <span class="hl-sym">Price</span>)})</code></pre>
+      <pre><code>┌────────┬───────┬────────────────────┐
+│ Symbol │ total │     avg_price      │
+│  sym   │  i64  │        f64         │
+├────────┼───────┼────────────────────┤
+│ AAPL   │ 400   │ 152.5              │
+│ GOOG   │ 350   │ 277.5              │
+│ MSFT   │ 125   │ 417.5              │
+├────────┴───────┴────────────────────┤
+│ 3 rows (3 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Available aggregation functions include <code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>first</code>, <code>last</code>, and <code>med</code> (median).</p>
+
+      <!-- Step 4 -->
+      <h2 id="sorting">4. Sorting</h2>
+      <p>Sort a table by one or more columns using <code>xasc</code> (ascending) or <code>xdesc</code> (descending):</p>
+      <pre><code><span class="hl-comment">; Sort by Price, lowest first</span>
+(<span class="hl-fn">xasc</span> trades <span class="hl-sym">'Price</span>)</code></pre>
+      <pre><code>┌────────┬───────┬────────────────────┐
+│ Symbol │ Price │        Qty         │
+│  sym   │  f64  │        i64         │
+├────────┼───────┼────────────────────┤
+│ AAPL   │ 150.0 │ 100                │
+│ AAPL   │ 155.0 │ 300                │
+│ GOOG   │ 275.0 │ 150                │
+│ GOOG   │ 280.0 │ 200                │
+│ MSFT   │ 415.0 │ 75                 │
+│ MSFT   │ 420.0 │ 50                 │
+├────────┴───────┴────────────────────┤
+│ 6 rows (6 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <pre><code><span class="hl-comment">; Sort by Price, highest first</span>
+(<span class="hl-fn">xdesc</span> trades <span class="hl-sym">'Price</span>)</code></pre>
+      <pre><code>┌────────┬───────┬────────────────────┐
+│ Symbol │ Price │        Qty         │
+│  sym   │  f64  │        i64         │
+├────────┼───────┼────────────────────┤
+│ MSFT   │ 420.0 │ 50                 │
+│ MSFT   │ 415.0 │ 75                 │
+│ GOOG   │ 280.0 │ 200                │
+│ GOOG   │ 275.0 │ 150                │
+│ AAPL   │ 155.0 │ 300                │
+│ AAPL   │ 150.0 │ 100                │
+├────────┴───────┴────────────────────┤
+│ 6 rows (6 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>For sorting plain vectors (not tables), use <code>asc</code> and <code>desc</code>. To get the sort permutation indices without reordering, use <code>iasc</code> and <code>idesc</code>.</p>
+
+      <!-- Step 5 -->
+      <h2 id="joining">5. Joining Tables</h2>
+      <p>Create two tables and join them on a shared key column:</p>
+      <pre><code><span class="hl-comment">; Orders table</span>
+(<span class="hl-kw">set</span> orders (<span class="hl-fn">table</span> [<span class="hl-sym">Id</span> <span class="hl-sym">Symbol</span> <span class="hl-sym">Qty</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>]
+        [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">MSFT</span>]
+        [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">150</span> <span class="hl-num">50</span>])))
+
+<span class="hl-comment">; Price reference table</span>
+(<span class="hl-kw">set</span> prices (<span class="hl-fn">table</span> [<span class="hl-sym">Symbol</span> <span class="hl-sym">Price</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span>]
+        [<span class="hl-num">150.0</span> <span class="hl-num">280.0</span> <span class="hl-num">420.0</span>])))
+
+<span class="hl-comment">; Inner join on Symbol</span>
+(<span class="hl-fn">inner-join</span> [<span class="hl-sym">Symbol</span>] orders prices)</code></pre>
+      <pre><code>┌─────┬────────┬─────┬────────────────┐
+│ Id  │ Symbol │ Qty │     Price      │
+│ i64 │  sym   │ i64 │      f64       │
+├─────┼────────┼─────┼────────────────┤
+│ 1   │ AAPL   │ 100 │ 150.0          │
+│ 2   │ GOOG   │ 200 │ 280.0          │
+│ 3   │ AAPL   │ 150 │ 150.0          │
+│ 4   │ MSFT   │ 50  │ 420.0          │
+├─────┴────────┴─────┴────────────────┤
+│ 4 rows (4 shown) 4 columns (4 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Rayforce also supports <code>left-join</code> (keeps all left rows, fills missing right columns with defaults) and <code>asof-join</code> (matches the nearest key &mdash; covered in the <a href="guide-analytics.html#asof-join">Analytics Cookbook</a>).</p>
+
+      <!-- Step 6 -->
+      <h2 id="pivoting">6. Pivoting</h2>
+      <p>Cross-tabulate data with <code>pivot</code>. The arguments are: table, row key, column key, value column, and aggregation function:</p>
+      <pre><code><span class="hl-comment">; Trades with a Side column</span>
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Symbol</span> <span class="hl-sym">Side</span> <span class="hl-sym">Qty</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span> <span class="hl-sym">MSFT</span>]
+        [<span class="hl-sym">Buy</span> <span class="hl-sym">Sell</span> <span class="hl-sym">Buy</span> <span class="hl-sym">Sell</span> <span class="hl-sym">Buy</span> <span class="hl-sym">Sell</span>]
+        [<span class="hl-num">100</span> <span class="hl-num">50</span> <span class="hl-num">200</span> <span class="hl-num">150</span> <span class="hl-num">75</span> <span class="hl-num">25</span>])))
+
+<span class="hl-comment">; Total Qty by Symbol and Side</span>
+(<span class="hl-fn">pivot</span> trades <span class="hl-sym">'Symbol</span> <span class="hl-sym">'Side</span> <span class="hl-sym">'Qty</span> <span class="hl-fn">sum</span>)</code></pre>
+      <pre><code>┌────────┬─────┬──────────────────────┐
+│ Symbol │ Buy │         Sell         │
+│  sym   │ i64 │         i64          │
+├────────┼─────┼──────────────────────┤
+│ AAPL   │ 100 │ 50                   │
+│ GOOG   │ 200 │ 150                  │
+│ MSFT   │ 75  │ 25                   │
+├────────┴─────┴──────────────────────┤
+│ 3 rows (3 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>The distinct values of <code>Side</code> become column headers. You can use any aggregation function: <code>sum</code>, <code>avg</code>, <code>count</code>, <code>min</code>, <code>max</code>, <code>first</code>, <code>last</code>, <code>med</code>, or even a custom lambda.</p>
+
+      <!-- Step 7 -->
+      <h2 id="loading-csv">7. Loading CSV Files</h2>
+      <p>Load a CSV file with automatic type inference and parallel parsing:</p>
+      <pre><code>(<span class="hl-kw">set</span> data (<span class="hl-fn">.csv.read</span> <span class="hl-str">"trades.csv"</span>))</code></pre>
+      <p>The first row is treated as column headers. Types are inferred from the data: integers, floats, dates, times, timestamps, and symbols are all detected automatically.</p>
+
+      <!-- Step 8 -->
+      <h2 id="saving-csv">8. Saving Results to CSV</h2>
+      <p>Write any table to a CSV file with <code>.csv.write</code>:</p>
+      <pre><code>(<span class="hl-kw">set</span> data (<span class="hl-fn">table</span> [<span class="hl-sym">Symbol</span> <span class="hl-sym">Price</span> <span class="hl-sym">Qty</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span>]
+        [<span class="hl-num">150.0</span> <span class="hl-num">280.0</span> <span class="hl-num">420.0</span>]
+        [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span>])))
+
+<span class="hl-comment">; Save to CSV</span>
+(<span class="hl-fn">.csv.write</span> data <span class="hl-str">"/tmp/trades.csv"</span>)
+
+<span class="hl-comment">; Load it back to verify</span>
+(<span class="hl-fn">.csv.read</span> <span class="hl-str">"/tmp/trades.csv"</span>)</code></pre>
+      <pre><code>┌────────┬───────┬────────────────────┐
+│ Symbol │ Price │        Qty         │
+│  sym   │  i64  │        i64         │
+├────────┼───────┼────────────────────┤
+│ AAPL   │ 150   │ 100                │
+│ GOOG   │ 280   │ 200                │
+│ MSFT   │ 420   │ 50                 │
+├────────┴───────┴────────────────────┤
+│ 3 rows (3 shown) 3 columns (3 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>Note that <code>f64</code> values written to CSV are read back as <code>i64</code> when they have no fractional part (150.0 becomes 150). This is expected &mdash; the CSV reader infers the narrowest type that fits.</p>
+
+      <h2 id="next-steps">Next Steps</h2>
+      <ul>
+        <li><a href="guide-analytics.html"><strong>Analytics Cookbook</strong></a> &mdash; Common analytics patterns: time-series, top-N, pivots, ASOF joins</li>
+        <li><a href="guide-datalog.html"><strong>Building a Knowledge Base</strong></a> &mdash; Datalog rules, recursive queries, and entity-attribute-value storage</li>
+        <li><a href="guide-storage.html"><strong>Data Persistence</strong></a> &mdash; CSV, columnar files, splayed tables, and partitioned storage</li>
+        <li><a href="rayfall-functions.html"><strong>Functions Reference</strong></a> &mdash; Complete list of all built-in functions</li>
+      </ul>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="quick-start.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Quick Start</span></a>
+        <a href="tutorial-graph.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Graph Queries Tutorial</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

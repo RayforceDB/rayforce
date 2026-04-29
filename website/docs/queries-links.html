@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Linked Columns — Rayforce Documentation</title>
+  <meta name="description" content="Linked columns store row indices into another table for O(1) field access. Replaces hash-probe foreign keys with a single array lookup per row.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA MODEL</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link active">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">VECTOR SEARCH</div>
+        <a href="vector-search.html" class="sidebar-link">Vector Search &amp; HNSW</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATALOG</div>
+        <a href="datalog.html" class="sidebar-link">Datalog</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">IPC</div>
+        <a href="ipc.html" class="sidebar-link">IPC Protocol</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Linked Columns</span>
+      </div>
+
+      <h1>Linked Columns</h1>
+      <p class="page-subtitle">An integer column whose values are row indices into another table.  Field access through the link compiles to a single array indirection per row &mdash; no hash probe, no comparison.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="overview">Why Linked Columns</h2>
+      <p>The standard way to relate two tables is a foreign-key column: each row holds a key value (a sym, a string) that <em>matches</em> the primary key of another table.  Resolving such a key at query time requires a hash lookup against the target's keyed column &mdash; one hash + comparison per row.</p>
+      <p>A <strong>linked column</strong> stores <em>row indices</em> instead of key values.  At construction time you pre-compute, for each row, the position of its match in the target table.  Resolution at query time becomes a single <code>target[link[i]]</code> array access &mdash; an O(1) indirection with no hashing.</p>
+      <p>This is the same trade made by enumerated columns in column-store databases that support them: lose the flexibility of carrying user-visible keys, gain O(1) deref on the hot path.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="construct">Linking a Column in a Table</h2>
+      <p>The realistic shape: you have two tables and want a foreign-key-style relationship between them.  Build a row-id column on the dependent side, attach the link, and stash it back into the table.  All subsequent queries through that table automatically dereference through the link.</p>
+
+      <h3>Signature</h3>
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(.col.link target int-vec)</span>
+        </div>
+        <div class="fn-desc">Attach the column as a link to the table named by <code>target</code> (a sym).  Validates that <code>target</code> resolves to a <code>RAY_TABLE</code> in the current environment and that the input is a numeric int column.  Returns a new column with <code>HAS_LINK</code> set; the underlying integer values are unchanged.</div>
+      </div>
+
+      <h3>Worked Example: orders → customers</h3>
+      <p>Two tables: <code>customers</code> with <code>id</code>, <code>name</code>, <code>city</code>; <code>orders</code> with <code>oid</code>, <code>qty</code>, and a <code>cust</code> column holding row indices into <code>customers</code>.</p>
+
+      <pre><code><span class="hl-comment">; Set up the target ('customers' must be bound in env before linking).</span>
+(<span class="hl-kw">set</span> customers (<span class="hl-fn">table</span> [<span class="hl-sym">id</span> <span class="hl-sym">name</span> <span class="hl-sym">city</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">300</span>]
+          (<span class="hl-fn">list</span> <span class="hl-sym">'alice</span> <span class="hl-sym">'bob</span> <span class="hl-sym">'carol</span>)
+          (<span class="hl-fn">list</span> <span class="hl-str">"NYC"</span> <span class="hl-str">"LA"</span> <span class="hl-str">"SF"</span>))))
+
+<span class="hl-comment">; Build orders with a 'cust' column that holds row indices into customers.</span>
+<span class="hl-comment">; Each row says "this order belongs to customers[cust]".</span>
+(<span class="hl-kw">set</span> orders (<span class="hl-fn">table</span> [<span class="hl-sym">oid</span> <span class="hl-sym">qty</span> <span class="hl-sym">cust</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-num">10</span> <span class="hl-num">11</span> <span class="hl-num">12</span> <span class="hl-num">13</span>]
+          [<span class="hl-num">5</span>  <span class="hl-num">2</span>  <span class="hl-num">7</span>  <span class="hl-num">3</span>]
+          [<span class="hl-num">0</span>  <span class="hl-num">2</span>  <span class="hl-num">1</span>  <span class="hl-num">0</span>])))
+
+<span class="hl-comment">; Tag the cust column as a link.  In-place update via the dict form;</span>
+<span class="hl-comment">; from: 'orders means "modify the table bound to this symbol", and the</span>
+<span class="hl-comment">; right-hand side `cust` resolves to the existing column inside update.</span>
+(<span class="hl-fn">update</span> {<span class="hl-sym">from:</span> <span class="hl-sym">'orders</span> <span class="hl-sym">cust:</span> (<span class="hl-fn">.col.link</span> <span class="hl-sym">'customers</span> <span class="hl-sym">cust</span>)})</code></pre>
+
+      <p><code>orders.cust</code> still reads as a column of integers <code>[0 2 1 0]</code> &mdash; the link is invisible to anything that doesn't ask for it.  But field-walks across the link now work transparently.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="deref">Querying Through the Link</h2>
+      <p>Dotted-field access on a linked column resolves through the link automatically.  No special syntax: <code>orders.cust.name</code> walks the existing dotted-name resolver, produces a column the same length as <code>orders.cust</code>, with values gathered from <code>customers.name</code> at the row indices.</p>
+
+      <pre><code>orders.cust.name       <span class="hl-comment">; ⇒ [alice carol bob alice]</span>
+orders.cust.city       <span class="hl-comment">; ⇒ ["NYC" "SF" "LA" "NYC"]</span>
+orders.cust.id         <span class="hl-comment">; ⇒ [100 300 200 100]</span></code></pre>
+
+      <p>You can pre-compute the dereferenced values and pipe them through the rest of the query:</p>
+
+      <pre><code><span class="hl-comment">; Pre-resolve customer names per order, then use as a regular column.</span>
+(<span class="hl-kw">set</span> names <span class="hl-sym">orders.cust.name</span>)
+(<span class="hl-fn">count</span> names)              <span class="hl-comment">; ⇒ 4</span>
+(<span class="hl-fn">distinct</span> names)           <span class="hl-comment">; ⇒ [alice carol bob]</span></code></pre>
+
+      <p>Each dotted-field deref allocates one fresh column and gathers values once.  The cost is one allocation + <em>n</em> indirect reads, regardless of target field type &mdash; no hash probe, no string comparison.  Compared to expressing the same query as an <code>inner-join</code> on the customer ID, the linked-column form skips the hash-table build entirely.</p>
+
+      <div class="info-box">
+        <strong>Dotted access inside <code>select</code> / <code>update</code> clauses is not yet supported.</strong>  Using <code>cust.name</code> directly in a projection (<code>(select {from: orders n: cust.name})</code>), a <code>by:</code> clause, or a <code>where:</code> predicate currently errors out at compile time.  Today's workflow is to resolve the linked column at the top level &mdash; <code>(set names orders.cust.name)</code> &mdash; and pass the bound name into the query: <code>(select {from: orders n: names})</code> works, as does <code>(select {from: orders qty: (sum qty) by: names})</code>.  Wiring dotted-deref through the query compiler is a follow-up.
+      </div>
+
+      <h3>Null Propagation</h3>
+      <p>Two sources of nulls in the result:</p>
+      <ul>
+        <li>If <code>linked[i]</code> is itself null (the row-id column has a null bit at row <code>i</code>), the result row is null.</li>
+        <li>If <code>linked[i]</code> is in range but the target's row at that index is null, the result row is null.</li>
+        <li>Out-of-range row IDs (<code>rid &lt; 0</code> or <code>rid &gt;= target.len</code>) silently become null in the result.  This matches the prior column-store convention &mdash; safer than erroring out mid-query.</li>
+      </ul>
+
+      <h3>Bind to a Local Then Aggregate</h3>
+      <p>To run aggregations against a derived field, resolve the dotted access at the top level, bind the result, and pass it to ordinary collection / aggregate operators:</p>
+
+      <pre><code>(<span class="hl-kw">set</span> cities <span class="hl-sym">orders.cust.city</span>)   <span class="hl-comment">; ⇒ ["NYC" "SF" "LA" "NYC"]</span>
+(<span class="hl-fn">distinct</span> cities)              <span class="hl-comment">; ⇒ ["NYC" "SF" "LA"]</span>
+(<span class="hl-fn">count</span> cities)                 <span class="hl-comment">; ⇒ 4</span></code></pre>
+
+      <p>The group-by-via-<code>select</code> form (<code>(select {from: orders qty: (sum qty) by: cust.city})</code>) is not yet supported &mdash; the select compiler doesn't currently recognise dotted-path column expressions inside <code>where</code> / <code>by</code> / projection clauses.  Until that lands, materialise through a temp.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="introspection">Introspection</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Returns</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>(.col.link? v)</code></td>
+            <td>boolean</td>
+            <td>True iff the column has <code>HAS_LINK</code> set.</td>
+          </tr>
+          <tr>
+            <td><code>(.col.target v)</code></td>
+            <td>sym or null</td>
+            <td>The target table sym, or null when no link is attached.</td>
+          </tr>
+          <tr>
+            <td><code>(.col.unlink v)</code></td>
+            <td>v with link removed</td>
+            <td>Drops <code>HAS_LINK</code>.  Underlying int values are preserved.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- ============================================================ -->
+      <h2 id="storage">Storage and Persistence</h2>
+      <p>A linked column is internally a regular <code>RAY_I32</code> or <code>RAY_I64</code> vector with the <code>RAY_ATTR_HAS_LINK = 0x04</code> attribute bit set.  The target table sym ID is stored at bytes 8&ndash;15 of the column's nullmap union.  The link is preserved across in-place mutation, and the bit is orthogonal to <code>RAY_ATTR_HAS_INDEX</code> &mdash; a column can simultaneously carry a link and a hash / sort / zone / bloom <a href="https://github.com/RayforceDB/rayforce2/blob/master/src/ops/idxop.h">accelerator index</a>.</p>
+
+      <p>Slices of a linked column inherit the link transparently.  The slice's own attribute byte does not carry <code>HAS_LINK</code> &mdash; that bit lives only on the parent &mdash; but <code>(.col.link? slice)</code>, <code>(.col.target slice)</code>, and dotted-field access on the slice all read through to the parent's link.  Both the row-id values and the link target are sourced from the parent at deref time.</p>
+
+      <p>On disk, linked columns serialize via <code>ray_col_save</code> into a normal column file plus a <code>.link</code> sidecar that holds the target sym name in plain text.  Sym IDs are process-local, so the sidecar is the only durable identity for the link.  Both <code>ray_col_load</code> (buddy-copy) and <code>ray_col_mmap</code> (zero-copy / splayed-table mmap mode) re-attach the link on load.  Saving an unlinked column removes any stale sidecar.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="parted">Parted-Table Interaction</h2>
+      <p>Linked columns work with <a href="storage.html">parted (partitioned) tables</a> in one direction only: a parted <strong>fact</strong> table may carry a linked column that points at a <em>non-parted</em> dim table (in-memory or splayed). The reverse &mdash; a link whose target is itself parted &mdash; is rejected with <code>error: nyi: target table has a parted column</code>. Today's deref math (<code>target_col[linkcol[i]]</code>) is straight indexing with no notion of which segment a global rowid lives in; pointing a link at a parted target would need a partition-locator pass that v1 doesn't provide.</p>
+      <p>The check fires at <strong>two points</strong>: at attach time (<code>(.col.link 'parted_dim ...)</code> errors immediately) and at deref time (when the linked sym was bound to a non-parted table at attach but later rebound to a parted one, or when a link reattached from a <code>.link</code> sidecar resolves to a parted target). Without the deref-time check, lazy rebinds and disk-loaded links would slip past the attach guard and produce a silent wrong-answer bug.</p>
+
+      <h3>Supported shape</h3>
+      <ul>
+        <li>Many parted segments (e.g. <code>2024.01.01/facts/</code>, <code>2024.01.02/facts/</code>) all hold their own copy of the link sidecar pointing to the same dim sym name.</li>
+        <li><code>ray_read_splayed</code> (used internally by <code>ray_read_parted</code>) re-attaches <code>HAS_LINK</code> on every per-segment column via <code>try_load_link_sidecar</code>; the per-VM-segment vectors that come out the other end carry <code>HAS_LINK</code> + <code>link_target</code> exactly as a non-parted load would.</li>
+        <li>Segment streaming (<code>build_segment_table</code>) extracts <code>segs[seg_idx]</code> by retain, so each per-segment view in the streamed flat table inherits the link without any extra plumbing.  Deref against the (unchanging, non-parted) dim is the standard <code>ray_link_deref</code> path.</li>
+      </ul>
+
+      <h3>Why not parted dims?</h3>
+      <p>Two design forks would need to be settled before parted-target links could ship: (1) global rowids (link payload offsets into the conceptual concatenation of all dim partitions, requiring an O(log p) partition-locator search per deref), or (2) per-partition rowids (the link is local to its own partition; the dim must be partitioned the same way as the fact). Both have legitimate use cases &mdash; the design is deferred until a real workload picks one. For now, keep dim tables unpartitioned (a small splayed directory or in-memory table fits all common workloads), or fall back to a regular hash join inside the streamed query.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="caveats">Caveats and Limits</h2>
+      <ul>
+        <li><strong>Integer types only.</strong>  <code>RAY_I32</code> and <code>RAY_I64</code> are the only valid carriers.  Attaching to <code>RAY_BOOL</code>, <code>RAY_STR</code>, or any float/temporal type returns a type error &mdash; those types either don't have enough range to address realistic tables or alias the bytes 8&ndash;15 nullmap slot for their own metadata (<code>str_pool</code>, <code>sym_dict</code>).</li>
+        <li><strong>Lazy resolution.</strong>  The target sym is looked up against the global environment at deref time.  If you rebind the target table (e.g. <code>(set customers ...)</code>) the link automatically follows.  If the target sym is rebound to something that's not a table, the dotted-walk surfaces <code>error: name: 'orders.cust.field' undefined</code> &mdash; the link does not silently no-op.</li>
+        <li><strong>No bounds check at attach time.</strong>  <code>(.col.link)</code> trusts that every row id fits in the target's row count.  Out-of-range values surface as null in the deref result, not at construction.</li>
+        <li><strong>One-hop deref only (v1).</strong>  Single-step deref works through any number of dotted segments AS LONG AS only one of them crosses a link &mdash; <code>orders.cust.name</code> works because <code>cust</code> is the only linked segment.  Chains of multiple linked columns &mdash; <code>orders.cust.addr_id.street</code> when both <code>cust</code> and <code>addr_id</code> are linked &mdash; do not work today: <code>ray_link_deref</code> returns a plain int column without propagating <code>HAS_LINK</code>, so subsequent dotted segments error out as <em>undefined</em>.  Fused chain-deref is planned.</li>
+        <li><strong>Non-parted dim only.</strong>  Link targets must be regular (non-parted) tables; attaching to a target that has any <code>RAY_PARTED</code> column fails with <code>error: nyi: link: target table has a parted column</code>.  Parted facts can still carry links &mdash; just point them at non-parted dim tables.  See <a href="#parted">Parted-Table Interaction</a> above.</li>
+      </ul>
+
+      <!-- ============================================================ -->
+      <h2 id="reference">Quick Reference</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Syntax</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>.col.link</code></td>
+            <td><code>(.col.link target int-vec)</code></td>
+            <td>Attach a link to a target table</td>
+          </tr>
+          <tr>
+            <td><code>.col.unlink</code></td>
+            <td><code>(.col.unlink v)</code></td>
+            <td>Remove the link, return the underlying int column</td>
+          </tr>
+          <tr>
+            <td><code>.col.link?</code></td>
+            <td><code>(.col.link? v)</code></td>
+            <td>True iff <code>v</code> carries a link</td>
+          </tr>
+          <tr>
+            <td><code>.col.target</code></td>
+            <td><code>(.col.target v)</code></td>
+            <td>Returns the target sym, or null</td>
+          </tr>
+          <tr>
+            <td><code>linked.field</code></td>
+            <td>dotted access</td>
+            <td>Dereference the link, gathering target.field at each row</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="queries-joins.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Joins</span></a>
+        <a href="queries-indexes.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Accelerator Indexes</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

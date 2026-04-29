@@ -1,0 +1,61 @@
+;; Invariants for `>`.
+
+;; irreflexive
+(set A (- (rand 256 200000) 100000))
+(count A) -- (sum (not (> A A)))
+
+;; dual of <:  (> a b) == (< b a)
+(set B (- (rand 256 200000) 100000))
+(count A) -- (sum (== (> A B) (< B A)))
+
+;; concrete
+(> 2 1)  -- true
+(> 1 2)  -- false
+(> 3 3)  -- false
+(> -1 -5) -- true
+
+;; ──────────────────────────────────────────────────────────────────
+;; Across types
+;; ──────────────────────────────────────────────────────────────────
+
+(> 7h 5h) -- true
+(> 7i 5i) -- true
+(> 2.5 1.5) -- true
+
+;; STR — lex order
+(> "b" "a")  -- true
+(> "aa" "a") -- true
+(> "x" "x")  -- false
+
+;; DATE
+(> 2024.06.01 2024.01.15) -- true
+
+;; vec
+(> [1 5 3] [2 2 2]) -- [false true true]
+(> [1 5 10] 5)      -- [false false true]
+
+;; ──────────────────────────────────────────────────────────────────
+;; SYM ordering: lexicographic compare via interned text.
+;; ──────────────────────────────────────────────────────────────────
+
+;; atom — basic ordering
+(> 'b 'a) -- true
+(> 'a 'b) -- false
+(> 'a 'a) -- false
+
+;; longer prefix is greater (shorter is "less" on prefix tie)
+(> 'foobar 'foo) -- true
+(> 'foo 'foobar) -- false
+
+;; broadcast: vec > atom
+(> ['a 'b 'c] 'a) -- [false true true]
+(> 'b ['a 'b 'c]) -- [true false false]
+
+;; vec/vec pairwise
+(> ['b 'b 'b] ['a 'b 'c]) -- [true false false]
+
+;; mixed inline (≤ 12 bytes) and pooled (> 12 bytes) — exercises SSO.
+;; Note: hyphens in symbols would be parsed as ops, so use underscore.
+;; 's' > 'l' so 'short > 'longer_…
+(> 'short 'longer_than_twelve_bytes_symbol) -- true
+(> 'longer_than_twelve_bytes_symbol 'short) -- false

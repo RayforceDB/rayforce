@@ -1,0 +1,7 @@
+;; Invariants for `stddev` (sample standard deviation).
+
+(stddev [5 5 5 5 5]) -- 0.0
+
+;; non-negative
+(set V (rand 100 1000))
+1 -- (as 'I64 (>= (stddev V) 0.0))

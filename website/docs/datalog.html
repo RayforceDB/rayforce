@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Datalog: Rules &amp; Queries — Rayforce Documentation</title>
+  <meta name="description" content="Datalog in Rayforce: rule-based declarative queries, EAV triple storage, negation, recursive rules with fixpoint evaluation, pull queries, and sym-name.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link active">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Datalog</span>
+      </div>
+
+      <h1>Datalog: Rules &amp; Queries</h1>
+      <p class="page-subtitle">Declare WHAT you want, not HOW to compute it. Rayforce's Datalog layer compiles rules and queries down to the same DAG-based vectorized executor that powers <code>select</code> and <code>update</code>.</p>
+
+      <!-- ── 1. What is Datalog? ─────────────────── -->
+      <h2 id="what-is-datalog">What is Datalog?</h2>
+      <p>Datalog is a <strong>rule-based declarative query language</strong>. You define facts and rules, then ask questions. The engine figures out all possible answers automatically by applying rules until no new facts can be derived.</p>
+      <p>Unlike SQL, Datalog handles <strong>recursive queries</strong> naturally &mdash; transitive closure, reachability, and graph traversal are first-class operations, not awkward CTEs bolted on as an afterthought.</p>
+      <div class="info-box">
+        <strong>Key idea:</strong> You declare logical relationships. Rayforce compiles them into the same vectorized, morsel-parallel execution pipeline used by the rest of the engine. No interpretation overhead &mdash; rules become DAG nodes.
+      </div>
+
+      <!-- ── 2. EAV Triple Storage ───────────────── -->
+      <h2 id="eav-storage">EAV Triple Storage</h2>
+      <p>Datalog in Rayforce uses <strong>Entity-Attribute-Value (EAV)</strong> triples as its storage model. Every fact is a triple <code>(entity, attribute, value)</code> stored in a columnar datoms table.</p>
+
+      <h3>Creating a datoms database</h3>
+      <p>Use <code>(datoms)</code> to create an empty EAV database, then <code>(assert-fact db entity attribute value)</code> to add triples:</p>
+      <pre><code><span class="hl-comment">;; Create an empty EAV database</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">datoms</span>))
+
+<span class="hl-comment">;; Assert facts: entity 1 has name, dept, salary</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'name</span> <span class="hl-sym">'Alice</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'dept</span> <span class="hl-sym">'Engineering</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'salary</span> <span class="hl-num">80000</span>))</code></pre>
+
+      <p>Each call to <code>assert-fact</code> returns a new database with the triple added. The underlying storage is a three-column table <code>[e, a, v]</code> backed by Rayforce's columnar vectors.</p>
+
+      <h3>Scanning by attribute</h3>
+      <p>Use <code>(scan-eav db attribute)</code> to query all entities with a given attribute, or <code>(scan-eav db entity attribute)</code> to get a specific value:</p>
+      <pre><code><span class="hl-comment">;; All salaries: returns a table of [entity, value]</span>
+(<span class="hl-fn">show</span> (<span class="hl-fn">scan-eav</span> db <span class="hl-sym">'salary</span>))
+
+<span class="hl-comment">;; Specific entity's salary: returns the scalar value</span>
+(<span class="hl-fn">println</span> (<span class="hl-fn">scan-eav</span> db <span class="hl-num">3</span> <span class="hl-sym">'salary</span>))  <span class="hl-comment">;; =&gt; 90000</span></code></pre>
+
+      <p><strong>Verified output</strong> (from <code>scan-eav db 'salary</code>):</p>
+      <pre><code>All salaries:
+┌─────┬───────────────────────────────┐
+│  e  │               v               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 80000                         │
+│ 2   │ 60000                         │
+│ 3   │ 90000                         │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+Entity 3 salary:
+90000</code></pre>
+
+      <!-- ── 3. Rules ────────────────────────────── -->
+      <h2 id="rules">Rules</h2>
+      <p>Rules define derived relations. A rule has a <strong>head</strong> (the relation being defined) and a <strong>body</strong> (the conditions that must hold):</p>
+      <pre><code>(<span class="hl-kw">rule</span> (<span class="hl-fn">head</span> <span class="hl-sym">?vars</span>...)
+  <span class="hl-comment">;; body clauses — all must be satisfied</span>
+  (<span class="hl-sym">?e</span> <span class="hl-op">:attr</span> <span class="hl-sym">?v</span>)
+  (<span class="hl-sym">?e</span> <span class="hl-op">:other-attr</span> <span class="hl-sym">?w</span>))</code></pre>
+
+      <p>Variables start with <code>?</code>. When the same variable appears in multiple clauses, it acts as a <strong>join condition</strong> &mdash; the values must be equal.</p>
+
+      <h3>Simple rule example</h3>
+      <pre><code><span class="hl-comment">;; Define "employee" as entities with both name and dept</span>
+(<span class="hl-kw">rule</span> (<span class="hl-fn">employee</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span> <span class="hl-sym">?d</span>)
+  (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>)
+  (<span class="hl-sym">?e</span> <span class="hl-op">:dept</span> <span class="hl-sym">?d</span>))
+
+<span class="hl-comment">;; Query using the rule</span>
+(<span class="hl-fn">show</span> (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?n</span> <span class="hl-sym">?d</span>) (<span class="hl-fn">where</span> (<span class="hl-fn">employee</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span> <span class="hl-sym">?d</span>))))</code></pre>
+
+      <p>This rule says: "an employee is any entity <code>?e</code> that has both a <code>:name</code> attribute (bound to <code>?n</code>) and a <code>:dept</code> attribute (bound to <code>?d</code>)." The shared variable <code>?e</code> across the two clauses produces a join on entity ID.</p>
+
+      <p><strong>Verified output</strong>:</p>
+      <pre><code>Employees (via rule):
+┌─────┬───────────────────────────────┐
+│ ?n  │              ?d               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 158 │ 161                           │
+│ 159 │ 162                           │
+├─────┴───────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <h3>OR semantics with multiple clauses</h3>
+      <p>Define multiple rules with the <strong>same head</strong> to express disjunction (OR). Each rule clause contributes its own set of results, and they are combined:</p>
+      <pre><code><span class="hl-comment">;; Two ways to be "reachable"</span>
+(<span class="hl-kw">rule</span> (<span class="hl-fn">reachable</span> <span class="hl-sym">?x</span> <span class="hl-sym">?y</span>) (<span class="hl-sym">?x</span> <span class="hl-op">:edge</span> <span class="hl-sym">?y</span>))              <span class="hl-comment">;; base: direct edge</span>
+(<span class="hl-kw">rule</span> (<span class="hl-fn">reachable</span> <span class="hl-sym">?x</span> <span class="hl-sym">?z</span>) (<span class="hl-sym">?x</span> <span class="hl-op">:edge</span> <span class="hl-sym">?y</span>) (<span class="hl-fn">reachable</span> <span class="hl-sym">?y</span> <span class="hl-sym">?z</span>))  <span class="hl-comment">;; recursive</span></code></pre>
+
+      <!-- ── 4. Queries ──────────────────────────── -->
+      <h2 id="queries">Queries</h2>
+      <p>Queries retrieve data from the datoms database using pattern matching. The syntax is:</p>
+      <pre><code>(<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?vars</span>...) (<span class="hl-fn">where</span> <span class="hl-sym">clauses</span>...))</code></pre>
+
+      <p>The <code>find</code> clause specifies which variables to return. The <code>where</code> clause contains triple patterns and rule invocations that constrain the results.</p>
+
+      <h3>Simple pattern query</h3>
+      <pre><code><span class="hl-comment">;; Find all entities and their names</span>
+(<span class="hl-fn">show</span> (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>))))</code></pre>
+      <p><strong>Verified output</strong>:</p>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?e  │              ?n               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 158                           │
+│ 2   │ 159                           │
+│ 3   │ 160                           │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+      <p>The <code>?n</code> column contains symbol intern IDs. Use <code>(sym-name id)</code> to convert them to readable names (see <a href="#sym-name">sym-name</a> below).</p>
+
+      <h3>Join query</h3>
+      <p>When multiple patterns share a variable, Rayforce compiles them into a join:</p>
+      <pre><code><span class="hl-comment">;; Find name + department (join on entity ?e)</span>
+(<span class="hl-fn">show</span> (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?n</span> <span class="hl-sym">?d</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>) (<span class="hl-sym">?e</span> <span class="hl-op">:dept</span> <span class="hl-sym">?d</span>))))</code></pre>
+      <p><strong>Verified output</strong>:</p>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?n  │              ?d               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 158 │ 162                           │
+│ 159 │ 163                           │
+│ 160 │ 162                           │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <h3>Constant value patterns</h3>
+      <p>Use a literal value instead of a variable to filter by a specific attribute value:</p>
+      <pre><code><span class="hl-comment">;; Only entities in the Engineering department</span>
+(<span class="hl-fn">show</span> (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>) (<span class="hl-sym">?e</span> <span class="hl-op">:dept</span> <span class="hl-sym">'Engineering</span>))))</code></pre>
+      <p><strong>Verified output</strong> (filters to entities 1 and 3):</p>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?e  │              ?n               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 158                           │
+│ 3   │ 160                           │
+├─────┴───────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <h3>Wildcard patterns</h3>
+      <p>Use <code>_</code> to match any value without binding it to a variable:</p>
+      <pre><code><span class="hl-comment">;; All entities that have any dept attribute</span>
+(<span class="hl-fn">show</span> (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:dept</span> _))))</code></pre>
+      <p><strong>Verified output</strong>:</p>
+      <pre><code>┌─────────────────────────────────────┐
+│                 ?e                  │
+│                 i64                 │
+├─────────────────────────────────────┤
+│ 1                                   │
+│ 2                                   │
+│ 3                                   │
+├─────────────────────────────────────┤
+│ 3 rows (3 shown) 1 columns (1 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <h3>How queries compile to the DAG</h3>
+      <p>Under the hood, each query compiles to Rayforce's DAG execution pipeline:</p>
+      <ul>
+        <li>Each triple pattern <code>(?e :attr ?v)</code> becomes a <code>ray_scan</code> + <code>ray_filter</code> on the datoms table</li>
+        <li>Shared variables across patterns become <code>ray_join</code> operations</li>
+        <li>The <code>find</code> clause becomes a final projection selecting the requested columns</li>
+        <li>The optimizer applies predicate pushdown, filter reorder, and fusion &mdash; the same passes used for <code>select</code></li>
+      </ul>
+
+      <!-- ── 5. Negation ────────────────────────── -->
+      <h2 id="negation">Negation</h2>
+      <p>Use <code>(not (pattern))</code> in a <code>where</code> clause to exclude entities matching a pattern. Negation compiles to <code>OP_ANTIJOIN</code> &mdash; keeping rows from the positive clauses that have no match in the negated pattern.</p>
+
+      <pre><code><span class="hl-comment">;; Mark some employees as managers</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'manager</span> <span class="hl-sym">'true</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">3</span> <span class="hl-sym">'manager</span> <span class="hl-sym">'true</span>))
+
+<span class="hl-comment">;; Find employees who are NOT managers</span>
+(<span class="hl-fn">show</span> (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span>)
+  (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>)
+         (<span class="hl-kw">not</span> (<span class="hl-sym">?e</span> <span class="hl-op">:manager</span> <span class="hl-sym">?m</span>)))))</code></pre>
+
+      <p><strong>Verified output</strong> (only Bob, entity 2, is not a manager):</p>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?e  │              ?n               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 2   │ 159                           │
+├─────┴───────────────────────────────┤
+│ 1 rows (1 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <p>The negated pattern must share at least one variable with a positive clause (here <code>?e</code>) so the antijoin knows which column to match on.</p>
+
+      <!-- ── 6. Recursive Rules & Fixpoint ────── -->
+      <h2 id="recursive-rules">Recursive Rules &amp; Fixpoint</h2>
+      <p>The real power of Datalog is <strong>recursive rules</strong>. Define a rule that references itself, and the engine automatically computes the transitive closure by iterating until no new facts are produced (the "fixpoint").</p>
+
+      <h3>Transitive closure example</h3>
+      <pre><code><span class="hl-comment">;; Build a directed graph: 1-&gt;2-&gt;3-&gt;4</span>
+(<span class="hl-kw">set</span> gdb (<span class="hl-fn">datoms</span>))
+(<span class="hl-kw">set</span> gdb (<span class="hl-fn">assert-fact</span> gdb <span class="hl-num">1</span> <span class="hl-sym">'edge</span> <span class="hl-num">2</span>))
+(<span class="hl-kw">set</span> gdb (<span class="hl-fn">assert-fact</span> gdb <span class="hl-num">2</span> <span class="hl-sym">'edge</span> <span class="hl-num">3</span>))
+(<span class="hl-kw">set</span> gdb (<span class="hl-fn">assert-fact</span> gdb <span class="hl-num">3</span> <span class="hl-sym">'edge</span> <span class="hl-num">4</span>))
+
+<span class="hl-comment">;; Base case: direct edge</span>
+(<span class="hl-kw">rule</span> (<span class="hl-fn">reachable</span> <span class="hl-sym">?x</span> <span class="hl-sym">?y</span>) (<span class="hl-sym">?x</span> <span class="hl-op">:edge</span> <span class="hl-sym">?y</span>))
+
+<span class="hl-comment">;; Recursive case: edge + reachability</span>
+(<span class="hl-kw">rule</span> (<span class="hl-fn">reachable</span> <span class="hl-sym">?x</span> <span class="hl-sym">?z</span>) (<span class="hl-sym">?x</span> <span class="hl-op">:edge</span> <span class="hl-sym">?y</span>) (<span class="hl-fn">reachable</span> <span class="hl-sym">?y</span> <span class="hl-sym">?z</span>))
+
+<span class="hl-comment">;; Query: all reachable pairs</span>
+(<span class="hl-fn">show</span> (<span class="hl-kw">query</span> gdb (<span class="hl-fn">find</span> <span class="hl-sym">?x</span> <span class="hl-sym">?y</span>) (<span class="hl-fn">where</span> (<span class="hl-fn">reachable</span> <span class="hl-sym">?x</span> <span class="hl-sym">?y</span>))))</code></pre>
+
+      <p><strong>Verified output</strong> (6 reachable pairs from 3 edges: direct + transitive):</p>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?x  │              ?y               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 2                             │
+│ 1   │ 3                             │
+│ 2   │ 3                             │
+│ 2   │ 4                             │
+│ 3   │ 4                             │
+│ 1   │ 4                             │
+├─────┴───────────────────────────────┤
+│ 6 rows (6 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <h3>Semi-naive evaluation</h3>
+      <p>Rayforce uses <strong>semi-naive evaluation</strong> for fixpoint computation, which is significantly faster than naive re-evaluation:</p>
+      <ol>
+        <li><strong>Base pass:</strong> Apply all non-recursive rule clauses to produce initial facts</li>
+        <li><strong>Delta iteration:</strong> In each round, only use <em>newly derived</em> facts (the "delta") as input to rule bodies</li>
+        <li><strong>Antijoin:</strong> Remove facts already known from the delta to keep only truly new derivations</li>
+        <li><strong>Terminate:</strong> When the delta is empty, the fixpoint has been reached</li>
+      </ol>
+      <p>Each iteration compiles to a fresh DAG and calls <code>ray_execute</code>. The antijoin step uses <code>ray_antijoin</code> to efficiently filter out previously known facts.</p>
+
+      <!-- ── 7. Stratification ──────────────────── -->
+      <h2 id="stratification">Stratification</h2>
+      <p>When rules use negation, evaluation order matters. A negated predicate must be fully computed before it can be used in an antijoin. Rayforce handles this automatically.</p>
+      <p>The engine builds a <strong>dependency graph</strong> among predicates, detects which ones depend on negated versions of others, and partitions them into <strong>strata</strong> (layers). Each stratum is evaluated to fixpoint before the next begins.</p>
+      <ul>
+        <li>Strata are computed via topological sort on the dependency graph</li>
+        <li>If a negation cycle is detected (predicate A negates B, and B negates A), the engine rejects the program with an "unstratifiable" error</li>
+        <li>No user action is needed &mdash; stratification is handled internally during <code>query</code> evaluation</li>
+      </ul>
+
+      <!-- ── 8. Pull Queries ─────────────────────── -->
+      <h2 id="pull-queries">Pull Queries</h2>
+      <p>Pull queries provide <strong>entity-centric retrieval</strong> &mdash; given an entity ID, return all (or selected) attributes as a dictionary:</p>
+
+      <pre><code><span class="hl-comment">;; Pull all attributes for entity 1</span>
+(<span class="hl-fn">println</span> (<span class="hl-fn">pull</span> db <span class="hl-num">1</span>))
+
+<span class="hl-comment">;; Pull only specific attributes</span>
+(<span class="hl-fn">println</span> (<span class="hl-fn">pull</span> db <span class="hl-num">2</span> [<span class="hl-sym">name</span> <span class="hl-sym">salary</span>]))</code></pre>
+
+      <p><strong>Verified output</strong>:</p>
+      <pre><code>Pull all attributes for entity 1:
+['name 158 'dept 160 'salary 80000]
+Pull name + salary for entity 2:
+['name 162 'salary 60000]</code></pre>
+
+      <p>Pull returns a dictionary (key-value list). Symbol attribute values appear as intern IDs &mdash; use <code>(sym-name id)</code> to convert them to readable names.</p>
+
+      <!-- ── 9. sym-name ─────────────────────────── -->
+      <h2 id="sym-name">sym-name</h2>
+      <p>EAV queries and pull results store symbol values as integer intern IDs for efficient joining and comparison. Use <code>(sym-name id)</code> to convert an intern ID back to a readable symbol atom.</p>
+
+      <pre><code><span class="hl-comment">;; Get the intern ID from a pull result</span>
+(<span class="hl-kw">set</span> p (<span class="hl-fn">pull</span> db <span class="hl-num">1</span>))
+(<span class="hl-kw">set</span> name-id (<span class="hl-fn">get</span> p <span class="hl-num">1</span>))    <span class="hl-comment">;; value at index 1 in the dict</span>
+(<span class="hl-fn">println</span> name-id)            <span class="hl-comment">;; =&gt; 158 (intern ID)</span>
+(<span class="hl-fn">println</span> (<span class="hl-fn">sym-name</span> name-id)) <span class="hl-comment">;; =&gt; 'Alice</span></code></pre>
+
+      <p><strong>Verified output</strong>:</p>
+      <pre><code>['name 158 'dept 160]
+158
+'Alice</code></pre>
+
+      <p><code>sym-name</code> accepts both scalar i64 values and i64 vectors. On a vector, it returns a SYM vector with each ID resolved. This is useful for converting entire columns of intern IDs to readable names.</p>
+
+      <!-- ── 10. Programmatic API ────────────────── -->
+      <h2 id="programmatic-api">Programmatic API</h2>
+      <p>For advanced use cases, Rayforce provides a programmatic Datalog API that gives fine-grained control over the evaluation process:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>(dl-program)</code></td>
+            <td>Create a new empty Datalog program</td>
+          </tr>
+          <tr>
+            <td><code>(dl-add-edb prog 'name table arity)</code></td>
+            <td>Register an extensional database (base facts) table</td>
+          </tr>
+          <tr>
+            <td><code>(dl-stratify prog)</code></td>
+            <td>Compute evaluation strata for the program</td>
+          </tr>
+          <tr>
+            <td><code>(dl-eval prog)</code></td>
+            <td>Evaluate the program to fixpoint</td>
+          </tr>
+          <tr>
+            <td><code>(dl-query prog 'pred)</code></td>
+            <td>Retrieve the result table for a predicate</td>
+          </tr>
+          <tr>
+            <td><code>(dl-provenance prog 'pred)</code></td>
+            <td>Get provenance information for derived facts</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Example</h3>
+      <pre><code><span class="hl-comment">;; Create a program and register base facts</span>
+(<span class="hl-kw">set</span> prog (<span class="hl-fn">dl-program</span>))
+(<span class="hl-kw">set</span> edges (<span class="hl-fn">table</span> [<span class="hl-sym">'from</span> <span class="hl-sym">'to</span>] (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>])))
+(<span class="hl-fn">dl-add-edb</span> prog <span class="hl-sym">'edge</span> edges <span class="hl-num">2</span>)
+
+<span class="hl-comment">;; Stratify and evaluate</span>
+(<span class="hl-fn">dl-stratify</span> prog)
+(<span class="hl-fn">dl-eval</span> prog)
+
+<span class="hl-comment">;; Query results</span>
+(<span class="hl-fn">show</span> (<span class="hl-fn">dl-query</span> prog <span class="hl-sym">'edge</span>))</code></pre>
+
+      <p><strong>Verified output</strong>:</p>
+      <pre><code>┌──────────┬──────────────────────────┐
+│ edge__c0 │         edge__c1         │
+│   i64    │           i64            │
+├──────────┼──────────────────────────┤
+│ 1        │ 2                        │
+│ 2        │ 3                        │
+│ 3        │ 4                        │
+├──────────┴──────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <!-- ── 11. retract-fact ────────────────────── -->
+      <h2 id="retract-fact">retract-fact</h2>
+      <p>Use <code>(retract-fact db entity attr value)</code> to remove a triple from the datoms database:</p>
+
+      <pre><code><span class="hl-comment">;; Remove Bob's name fact</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">retract-fact</span> db <span class="hl-num">2</span> <span class="hl-sym">'name</span> <span class="hl-sym">'Bob</span>))
+
+<span class="hl-comment">;; Verify: only Alice and Charlie remain</span>
+(<span class="hl-fn">show</span> (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>))))</code></pre>
+
+      <p><strong>Verified output</strong> (2 rows after retraction):</p>
+      <pre><code>┌─────┬───────────────────────────────┐
+│ ?e  │              ?n               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 158                           │
+│ 3   │ 164                           │
+├─────┴───────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <!-- ── 12. How Datalog Maps to Rayforce ────── -->
+      <h2 id="mapping">How Datalog Maps to Rayforce</h2>
+      <p>Every Datalog concept compiles down to existing Rayforce DAG operations. The Datalog layer is purely a compilation frontend &mdash; the engine does all the heavy lifting.</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Datalog Concept</th>
+            <th>Rayforce Operation</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Triple pattern <code>(?e :attr ?v)</code></td>
+            <td><code>ray_scan</code> + <code>ray_filter</code></td>
+            <td>Indexed column scan filtered by attribute</td>
+          </tr>
+          <tr>
+            <td>Shared variable (join)</td>
+            <td><code>ray_join</code></td>
+            <td>Hash join on shared variable column</td>
+          </tr>
+          <tr>
+            <td>Constant value <code>(?e :dept 'Engineering)</code></td>
+            <td><code>ray_filter</code></td>
+            <td>Equality filter on the value column</td>
+          </tr>
+          <tr>
+            <td>Wildcard <code>(?e :dept _)</code></td>
+            <td><code>ray_scan</code></td>
+            <td>Attribute scan without value constraint</td>
+          </tr>
+          <tr>
+            <td>Negation <code>(not ...)</code></td>
+            <td><code>ray_antijoin</code></td>
+            <td>Keep rows not present in another result</td>
+          </tr>
+          <tr>
+            <td>OR rules (same head)</td>
+            <td><code>union-all</code> + <code>distinct</code></td>
+            <td>Combine results and deduplicate</td>
+          </tr>
+          <tr>
+            <td>Fixpoint (recursion)</td>
+            <td>Loop with <code>ray_execute</code></td>
+            <td>Iterate until delta is empty</td>
+          </tr>
+          <tr>
+            <td>Stratification</td>
+            <td>Topological sort</td>
+            <td>Compute evaluation order from dependency graph</td>
+          </tr>
+          <tr>
+            <td><code>(find ?a ?n)</code></td>
+            <td>Projection</td>
+            <td>Select output columns from the result</td>
+          </tr>
+          <tr>
+            <td><code>(pull db entity)</code></td>
+            <td><code>ray_scan</code> on EAV index</td>
+            <td>Entity attribute scan and collection</td>
+          </tr>
+          <tr>
+            <td>Rule invocation</td>
+            <td>Subgraph expansion</td>
+            <td>Inline the rule's compiled DAG as a subplan</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="info-box">
+        <strong>Performance:</strong> Because Datalog compiles to the same DAG as <code>select</code>/<code>update</code>, queries benefit from all optimizer passes: predicate pushdown, filter reorder, fusion, and morsel-parallel execution with SIMD.
+      </div>
+
+      <!-- ── 13. Complete Example ──────────────────── -->
+      <h2 id="complete-example">Complete Example</h2>
+      <p>The following example demonstrates the full Datalog workflow: EAV storage, queries with constants and wildcards, rules, negation, transitive closure, pull queries, sym-name, and retract-fact. This is the content of <code>examples/rfl/datalog.rfl</code>.</p>
+
+      <h3>Source</h3>
+      <pre><code><span class="hl-comment">; Datalog Example</span>
+<span class="hl-comment">; Demonstrates: datoms, assert-fact, retract-fact, rules, queries,</span>
+<span class="hl-comment">; negation, fixpoint (transitive closure), pull, sym-name,</span>
+<span class="hl-comment">; constant values, and wildcard patterns</span>
+
+<span class="hl-comment">; -- 1. EAV storage --</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">datoms</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'name</span> <span class="hl-sym">'Alice</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'dept</span> <span class="hl-sym">'Engineering</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'salary</span> <span class="hl-num">80000</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">2</span> <span class="hl-sym">'name</span> <span class="hl-sym">'Bob</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">2</span> <span class="hl-sym">'dept</span> <span class="hl-sym">'Sales</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">2</span> <span class="hl-sym">'salary</span> <span class="hl-num">60000</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">3</span> <span class="hl-sym">'name</span> <span class="hl-sym">'Charlie</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">3</span> <span class="hl-sym">'dept</span> <span class="hl-sym">'Engineering</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">3</span> <span class="hl-sym">'salary</span> <span class="hl-num">90000</span>))
+
+<span class="hl-comment">; -- 2. Simple query --</span>
+(<span class="hl-fn">println</span> <span class="hl-str">"--- All names ---"</span>)
+(<span class="hl-kw">set</span> r (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>))))
+(<span class="hl-fn">show</span> r)
+
+<span class="hl-comment">; -- 3. Join query --</span>
+(<span class="hl-fn">println</span> <span class="hl-str">"--- Name + Department ---"</span>)
+(<span class="hl-kw">set</span> r (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?n</span> <span class="hl-sym">?d</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>) (<span class="hl-sym">?e</span> <span class="hl-op">:dept</span> <span class="hl-sym">?d</span>))))
+(<span class="hl-fn">show</span> r)
+
+<span class="hl-comment">; -- 4. Constant value pattern --</span>
+(<span class="hl-fn">println</span> <span class="hl-str">"--- Engineers only (constant pattern) ---"</span>)
+(<span class="hl-kw">set</span> r (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>) (<span class="hl-sym">?e</span> <span class="hl-op">:dept</span> <span class="hl-sym">'Engineering</span>))))
+(<span class="hl-fn">show</span> r)
+
+<span class="hl-comment">; -- 5. Wildcard pattern --</span>
+(<span class="hl-fn">println</span> <span class="hl-str">"--- Entities with any dept (wildcard _) ---"</span>)
+(<span class="hl-kw">set</span> r (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:dept</span> _))))
+(<span class="hl-fn">show</span> r)
+
+<span class="hl-comment">; -- 6. Rule: define "employee" relation --</span>
+(<span class="hl-kw">rule</span> (<span class="hl-fn">employee</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span> <span class="hl-sym">?d</span>)
+  (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>)
+  (<span class="hl-sym">?e</span> <span class="hl-op">:dept</span> <span class="hl-sym">?d</span>))
+
+(<span class="hl-fn">println</span> <span class="hl-str">"--- Employees (via rule) ---"</span>)
+(<span class="hl-kw">set</span> r (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?n</span> <span class="hl-sym">?d</span>) (<span class="hl-fn">where</span> (<span class="hl-fn">employee</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span> <span class="hl-sym">?d</span>))))
+(<span class="hl-fn">show</span> r)
+
+<span class="hl-comment">; -- 7. Negation --</span>
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">1</span> <span class="hl-sym">'manager</span> <span class="hl-sym">'true</span>))
+(<span class="hl-kw">set</span> db (<span class="hl-fn">assert-fact</span> db <span class="hl-num">3</span> <span class="hl-sym">'manager</span> <span class="hl-sym">'true</span>))
+
+(<span class="hl-fn">println</span> <span class="hl-str">"--- Non-managers (negation) ---"</span>)
+(<span class="hl-kw">set</span> r (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>) (<span class="hl-kw">not</span> (<span class="hl-sym">?e</span> <span class="hl-op">:manager</span> <span class="hl-sym">?m</span>)))))
+(<span class="hl-fn">show</span> r)
+
+<span class="hl-comment">; -- 8. Transitive closure (recursive rules + fixpoint) --</span>
+(<span class="hl-kw">set</span> gdb (<span class="hl-fn">datoms</span>))
+(<span class="hl-kw">set</span> gdb (<span class="hl-fn">assert-fact</span> gdb <span class="hl-num">1</span> <span class="hl-sym">'edge</span> <span class="hl-num">2</span>))
+(<span class="hl-kw">set</span> gdb (<span class="hl-fn">assert-fact</span> gdb <span class="hl-num">2</span> <span class="hl-sym">'edge</span> <span class="hl-num">3</span>))
+(<span class="hl-kw">set</span> gdb (<span class="hl-fn">assert-fact</span> gdb <span class="hl-num">3</span> <span class="hl-sym">'edge</span> <span class="hl-num">4</span>))
+
+(<span class="hl-kw">rule</span> (<span class="hl-fn">reachable</span> <span class="hl-sym">?x</span> <span class="hl-sym">?y</span>) (<span class="hl-sym">?x</span> <span class="hl-op">:edge</span> <span class="hl-sym">?y</span>))
+(<span class="hl-kw">rule</span> (<span class="hl-fn">reachable</span> <span class="hl-sym">?x</span> <span class="hl-sym">?z</span>) (<span class="hl-sym">?x</span> <span class="hl-op">:edge</span> <span class="hl-sym">?y</span>) (<span class="hl-fn">reachable</span> <span class="hl-sym">?y</span> <span class="hl-sym">?z</span>))
+
+(<span class="hl-fn">println</span> <span class="hl-str">"--- Reachable pairs (transitive closure) ---"</span>)
+(<span class="hl-kw">set</span> r (<span class="hl-kw">query</span> gdb (<span class="hl-fn">find</span> <span class="hl-sym">?x</span> <span class="hl-sym">?y</span>) (<span class="hl-fn">where</span> (<span class="hl-fn">reachable</span> <span class="hl-sym">?x</span> <span class="hl-sym">?y</span>))))
+(<span class="hl-fn">show</span> r)
+
+<span class="hl-comment">; -- 9. Pull queries --</span>
+(<span class="hl-fn">println</span> <span class="hl-str">"--- Pull entity 1 (all attributes) ---"</span>)
+(<span class="hl-fn">println</span> (<span class="hl-fn">pull</span> db <span class="hl-num">1</span>))
+
+(<span class="hl-fn">println</span> <span class="hl-str">"--- Pull entity 2 (name + salary only) ---"</span>)
+(<span class="hl-fn">println</span> (<span class="hl-fn">pull</span> db <span class="hl-num">2</span> [<span class="hl-sym">name</span> <span class="hl-sym">salary</span>]))
+
+<span class="hl-comment">; -- 10. sym-name: readable output --</span>
+(<span class="hl-fn">println</span> <span class="hl-str">"--- sym-name: convert intern IDs ---"</span>)
+(<span class="hl-kw">set</span> p (<span class="hl-fn">pull</span> db <span class="hl-num">1</span>))
+(<span class="hl-kw">set</span> name-id (<span class="hl-fn">get</span> p <span class="hl-num">1</span>))
+(<span class="hl-fn">println</span> name-id)
+(<span class="hl-fn">println</span> (<span class="hl-fn">sym-name</span> name-id))
+
+<span class="hl-comment">; -- 11. retract-fact --</span>
+(<span class="hl-fn">println</span> <span class="hl-str">"--- Before retract ---"</span>)
+(<span class="hl-kw">set</span> r (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>))))
+(<span class="hl-fn">show</span> r)
+
+(<span class="hl-kw">set</span> db (<span class="hl-fn">retract-fact</span> db <span class="hl-num">2</span> <span class="hl-sym">'name</span> <span class="hl-sym">'Bob</span>))
+(<span class="hl-fn">println</span> <span class="hl-str">"--- After retract (Bob removed) ---"</span>)
+(<span class="hl-kw">set</span> r (<span class="hl-kw">query</span> db (<span class="hl-fn">find</span> <span class="hl-sym">?e</span> <span class="hl-sym">?n</span>) (<span class="hl-fn">where</span> (<span class="hl-sym">?e</span> <span class="hl-op">:name</span> <span class="hl-sym">?n</span>))))
+(<span class="hl-fn">show</span> r)
+
+<span class="hl-comment">; -- 12. Scan-eav: low-level attribute lookup --</span>
+(<span class="hl-fn">println</span> <span class="hl-str">"--- All salaries (scan-eav) ---"</span>)
+(<span class="hl-fn">show</span> (<span class="hl-fn">scan-eav</span> db <span class="hl-sym">'salary</span>))
+
+(<span class="hl-fn">println</span> <span class="hl-str">"--- Entity 3 salary ---"</span>)
+(<span class="hl-fn">println</span> (<span class="hl-fn">scan-eav</span> db <span class="hl-num">3</span> <span class="hl-sym">'salary</span>))</code></pre>
+
+      <h3>Output</h3>
+      <p>Running <code>./rayforce examples/rfl/datalog.rfl</code> produces:</p>
+      <pre><code>--- All names ---
+┌─────┬───────────────────────────────┐
+│ ?e  │              ?n               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 158                           │
+│ 2   │ 162                           │
+│ 3   │ 164                           │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+--- Name + Department ---
+┌─────┬───────────────────────────────┐
+│ ?n  │              ?d               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 158 │ 160                           │
+│ 162 │ 163                           │
+│ 164 │ 160                           │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+--- Engineers only (constant pattern) ---
+┌─────┬───────────────────────────────┐
+│ ?e  │              ?n               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 158                           │
+│ 3   │ 164                           │
+├─────┴───────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+--- Entities with any dept (wildcard _) ---
+┌─────────────────────────────────────┐
+│                 ?e                  │
+│                 i64                 │
+├─────────────────────────────────────┤
+│ 1                                   │
+│ 2                                   │
+│ 3                                   │
+├─────────────────────────────────────┤
+│ 3 rows (3 shown) 1 columns (1 shown)│
+└─────────────────────────────────────┘
+--- Employees (via rule) ---
+┌─────┬───────────────────────────────┐
+│ ?n  │              ?d               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 158 │ 160                           │
+│ 162 │ 163                           │
+│ 164 │ 160                           │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+--- Non-managers (negation) ---
+┌─────┬───────────────────────────────┐
+│ ?e  │              ?n               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 2   │ 162                           │
+├─────┴───────────────────────────────┤
+│ 1 rows (1 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+--- Reachable pairs (transitive closure) ---
+┌─────┬───────────────────────────────┐
+│ ?x  │              ?y               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 2                             │
+│ 1   │ 3                             │
+│ 2   │ 3                             │
+│ 2   │ 4                             │
+│ 3   │ 4                             │
+│ 1   │ 4                             │
+├─────┴───────────────────────────────┤
+│ 6 rows (6 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+--- Pull entity 1 (all attributes) ---
+[&#x27;name 158 &#x27;dept 160 &#x27;salary 80000 &#x27;manager 172]
+--- Pull entity 2 (name + salary only) ---
+[&#x27;name 162 &#x27;salary 60000]
+--- sym-name: convert intern IDs ---
+158
+&#x27;Alice
+--- Before retract ---
+┌─────┬───────────────────────────────┐
+│ ?e  │              ?n               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 158                           │
+│ 2   │ 162                           │
+│ 3   │ 164                           │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+--- After retract (Bob removed) ---
+┌─────┬───────────────────────────────┐
+│ ?e  │              ?n               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 158                           │
+│ 3   │ 164                           │
+├─────┴───────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+--- All salaries (scan-eav) ---
+┌─────┬───────────────────────────────┐
+│  e  │               v               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 80000                         │
+│ 2   │ 60000                         │
+│ 3   │ 90000                         │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+--- Entity 3 salary ---
+9
+</code></pre>
+
+      <div class="info-box">
+        <strong>Note:</strong> Symbol intern IDs (like 158 for <code>'Alice</code>) are assigned at runtime and may differ between sessions. The row counts and structure are stable. Use <code>(sym-name id)</code> to convert any intern ID back to its readable symbol name.
+      </div>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="guide-datalog.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Building a Knowledge Base with Datalog</span></a>
+        <a href="guide-storage.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Data Persistence Guide</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Math &amp; Aggregation — Rayforce Documentation</title>
+  <meta name="description" content="Arithmetic, comparison, logic, aggregation, ordering, generation, and higher-order operations in Rayfall.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link active">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Math &amp; Aggregation</span>
+      </div>
+
+      <h1>Math, Comparison, Aggregation &amp; Iteration</h1>
+      <p class="page-subtitle">All numeric, logical, aggregation, ordering, generation, and higher-order operations available in Rayfall. Operations marked <code>FN_ATOMIC</code> auto-map over vectors element-wise.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="arithmetic">Arithmetic</h2>
+      <p>All arithmetic operations are atomic &mdash; they work on scalars and auto-map element-wise over vectors.</p>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(+ a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Addition. Works on integers, floats, dates, and times.</div>
+        <div class="fn-example">(<span class="hl-fn">+</span> <span class="hl-num">3</span> <span class="hl-num">4</span>)  <span class="hl-comment">; 7</span><br>(<span class="hl-fn">+</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] <span class="hl-num">10</span>)  <span class="hl-comment">; [11 12 13]</span><br>(<span class="hl-fn">+</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span>])  <span class="hl-comment">; [11 22 33]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(- a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Subtraction.</div>
+        <div class="fn-example">(<span class="hl-fn">-</span> <span class="hl-num">10</span> <span class="hl-num">3</span>)  <span class="hl-comment">; 7</span><br>(<span class="hl-fn">-</span> [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span>] <span class="hl-num">5</span>)  <span class="hl-comment">; [5 15 25]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(* a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Multiplication.</div>
+        <div class="fn-example">(<span class="hl-fn">*</span> <span class="hl-num">3</span> <span class="hl-num">4</span>)  <span class="hl-comment">; 12</span><br>(<span class="hl-fn">*</span> [<span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>] [<span class="hl-num">10</span> <span class="hl-num">10</span> <span class="hl-num">10</span>])  <span class="hl-comment">; [20 30 40]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(/ a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Division. Integer division for integer arguments, float division otherwise.</div>
+        <div class="fn-example">(<span class="hl-fn">/</span> <span class="hl-num">10</span> <span class="hl-num">3</span>)  <span class="hl-comment">; 3</span><br>(<span class="hl-fn">/</span> <span class="hl-num">10.0</span> <span class="hl-num">3</span>)  <span class="hl-comment">; 3.0</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(% a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Modulo (remainder).</div>
+        <div class="fn-example">(<span class="hl-fn">%</span> <span class="hl-num">10</span> <span class="hl-num">3</span>)  <span class="hl-comment">; 1</span><br>(<span class="hl-fn">%</span> [<span class="hl-num">10</span> <span class="hl-num">11</span> <span class="hl-num">12</span>] <span class="hl-num">3</span>)  <span class="hl-comment">; [1 2 0]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(neg x)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Negate a number.</div>
+        <div class="fn-example">(<span class="hl-fn">neg</span> <span class="hl-num">5</span>)  <span class="hl-comment">; -5</span><br>(<span class="hl-fn">neg</span> [<span class="hl-num">1</span> <span class="hl-num">-2</span> <span class="hl-num">3</span>])  <span class="hl-comment">; [-1 2 -3]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(round x)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Round to nearest integer.</div>
+        <div class="fn-example">(<span class="hl-fn">round</span> <span class="hl-num">3.7</span>)  <span class="hl-comment">; 4.0</span><br>(<span class="hl-fn">round</span> [<span class="hl-num">1.2</span> <span class="hl-num">2.5</span> <span class="hl-num">3.8</span>])  <span class="hl-comment">; [1.0 3.0 4.0]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(floor x)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Round down to nearest integer.</div>
+        <div class="fn-example">(<span class="hl-fn">floor</span> <span class="hl-num">3.9</span>)  <span class="hl-comment">; 3.0</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(ceil x)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Round up to nearest integer.</div>
+        <div class="fn-example">(<span class="hl-fn">ceil</span> <span class="hl-num">3.1</span>)  <span class="hl-comment">; 4.0</span></div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="comparison">Comparison</h2>
+      <p>All comparison operations are atomic and return boolean values (or boolean vectors).</p>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(== a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Equal. Works on all types including strings and symbols.</div>
+        <div class="fn-example">(<span class="hl-fn">==</span> <span class="hl-num">3</span> <span class="hl-num">3</span>)  <span class="hl-comment">; true</span><br>(<span class="hl-fn">==</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] <span class="hl-num">2</span>)  <span class="hl-comment">; [false true false]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(!= a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Not equal.</div>
+        <div class="fn-example">(<span class="hl-fn">!=</span> <span class="hl-num">3</span> <span class="hl-num">4</span>)  <span class="hl-comment">; true</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(&lt; a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Less than.</div>
+        <div class="fn-example">(<span class="hl-fn">&lt;</span> <span class="hl-num">3</span> <span class="hl-num">5</span>)  <span class="hl-comment">; true</span><br>(<span class="hl-fn">&lt;</span> [<span class="hl-num">1</span> <span class="hl-num">5</span> <span class="hl-num">3</span>] <span class="hl-num">4</span>)  <span class="hl-comment">; [true false true]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(&lt;= a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Less than or equal.</div>
+        <div class="fn-example">(<span class="hl-fn">&lt;=</span> <span class="hl-num">3</span> <span class="hl-num">3</span>)  <span class="hl-comment">; true</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(&gt; a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Greater than.</div>
+        <div class="fn-example">(<span class="hl-fn">&gt;</span> <span class="hl-num">5</span> <span class="hl-num">3</span>)  <span class="hl-comment">; true</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(&gt;= a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Greater than or equal.</div>
+        <div class="fn-example">(<span class="hl-fn">&gt;=</span> <span class="hl-num">5</span> <span class="hl-num">5</span>)  <span class="hl-comment">; true</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(within vec [lo hi])</span>
+        </div>
+        <div class="fn-desc">Check if each element of a vector is within a range (inclusive). The second argument is a 2-element vector <code>[lo hi]</code>.</div>
+        <div class="fn-example">(<span class="hl-fn">within</span> [<span class="hl-num">1</span> <span class="hl-num">5</span> <span class="hl-num">9</span>] [<span class="hl-num">3</span> <span class="hl-num">7</span>])  <span class="hl-comment">; [false true false]</span></div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="logic">Logic</h2>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(and a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Logical AND. Works on booleans and boolean vectors.</div>
+        <div class="fn-example">(<span class="hl-fn">and</span> (<span class="hl-fn">&gt;</span> x <span class="hl-num">0</span>) (<span class="hl-fn">&lt;</span> x <span class="hl-num">10</span>))</div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(or a b)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Logical OR.</div>
+        <div class="fn-example">(<span class="hl-fn">or</span> (<span class="hl-fn">==</span> x <span class="hl-num">0</span>) (<span class="hl-fn">==</span> x <span class="hl-num">10</span>))</div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(not x)</span>
+          <span class="fn-type">atomic</span>
+        </div>
+        <div class="fn-desc">Logical NOT. Flips boolean values.</div>
+        <div class="fn-example">(<span class="hl-fn">not</span> true)  <span class="hl-comment">; false</span><br>(<span class="hl-fn">not</span> [true false true])  <span class="hl-comment">; [false true false]</span></div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="aggregation">Aggregation</h2>
+      <p>Aggregation functions reduce a vector to a single scalar. They carry the <code>FN_AGGR</code> flag and are recognized by the <code>select</code>/<code>update</code> query planner for group-by operations.</p>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(sum x)</span>
+          <span class="fn-type">aggregate</span>
+        </div>
+        <div class="fn-desc">Sum of all elements.</div>
+        <div class="fn-example">(<span class="hl-fn">sum</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>])  <span class="hl-comment">; 10</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(count x)</span>
+          <span class="fn-type">aggregate</span>
+        </div>
+        <div class="fn-desc">Number of elements. Counts non-null values.</div>
+        <div class="fn-example">(<span class="hl-fn">count</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])  <span class="hl-comment">; 3</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(avg x)</span>
+          <span class="fn-type">aggregate</span>
+        </div>
+        <div class="fn-desc">Arithmetic mean.</div>
+        <div class="fn-example">(<span class="hl-fn">avg</span> [<span class="hl-num">2</span> <span class="hl-num">4</span> <span class="hl-num">6</span>])  <span class="hl-comment">; 4.0</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(min x)</span>
+          <span class="fn-type">aggregate</span>
+        </div>
+        <div class="fn-desc">Minimum value.</div>
+        <div class="fn-example">(<span class="hl-fn">min</span> [<span class="hl-num">5</span> <span class="hl-num">1</span> <span class="hl-num">9</span>])  <span class="hl-comment">; 1</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(max x)</span>
+          <span class="fn-type">aggregate</span>
+        </div>
+        <div class="fn-desc">Maximum value.</div>
+        <div class="fn-example">(<span class="hl-fn">max</span> [<span class="hl-num">5</span> <span class="hl-num">1</span> <span class="hl-num">9</span>])  <span class="hl-comment">; 9</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(med x)</span>
+          <span class="fn-type">aggregate</span>
+        </div>
+        <div class="fn-desc">Median value.</div>
+        <div class="fn-example">(<span class="hl-fn">med</span> [<span class="hl-num">1</span> <span class="hl-num">3</span> <span class="hl-num">5</span> <span class="hl-num">7</span> <span class="hl-num">9</span>])  <span class="hl-comment">; 5.0</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(dev x)</span>
+          <span class="fn-type">aggregate</span>
+        </div>
+        <div class="fn-desc">Standard deviation.</div>
+        <div class="fn-example">(<span class="hl-fn">dev</span> [<span class="hl-num">2</span> <span class="hl-num">4</span> <span class="hl-num">4</span> <span class="hl-num">4</span> <span class="hl-num">5</span> <span class="hl-num">5</span> <span class="hl-num">7</span> <span class="hl-num">9</span>])  <span class="hl-comment">; 2.0</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(first x)</span>
+          <span class="fn-type">aggregate</span>
+        </div>
+        <div class="fn-desc">First element of a vector.</div>
+        <div class="fn-example">(<span class="hl-fn">first</span> [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span>])  <span class="hl-comment">; 10</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(last x)</span>
+          <span class="fn-type">aggregate</span>
+        </div>
+        <div class="fn-desc">Last element of a vector.</div>
+        <div class="fn-example">(<span class="hl-fn">last</span> [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span>])  <span class="hl-comment">; 30</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(distinct x)</span>
+          <span class="fn-type">aggregate</span>
+        </div>
+        <div class="fn-desc">Unique elements of a vector.</div>
+        <div class="fn-example">(<span class="hl-fn">distinct</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">1</span>])  <span class="hl-comment">; [1 2 3]</span></div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="ordering">Ordering</h2>
+      <p>Sorting and ranking operations for vectors and tables.</p>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(asc x)</span>
+        </div>
+        <div class="fn-desc">Sort a vector in ascending order.</div>
+        <div class="fn-example">(<span class="hl-fn">asc</span> [<span class="hl-num">3</span> <span class="hl-num">1</span> <span class="hl-num">2</span>])  <span class="hl-comment">; [1 2 3]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(desc x)</span>
+        </div>
+        <div class="fn-desc">Sort a vector in descending order.</div>
+        <div class="fn-example">(<span class="hl-fn">desc</span> [<span class="hl-num">3</span> <span class="hl-num">1</span> <span class="hl-num">2</span>])  <span class="hl-comment">; [3 2 1]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(iasc x)</span>
+        </div>
+        <div class="fn-desc">Return indices that would sort the vector ascending (grade up).</div>
+        <div class="fn-example">(<span class="hl-fn">iasc</span> [<span class="hl-num">30</span> <span class="hl-num">10</span> <span class="hl-num">20</span>])  <span class="hl-comment">; [1 2 0]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(idesc x)</span>
+        </div>
+        <div class="fn-desc">Return indices that would sort the vector descending (grade down).</div>
+        <div class="fn-example">(<span class="hl-fn">idesc</span> [<span class="hl-num">30</span> <span class="hl-num">10</span> <span class="hl-num">20</span>])  <span class="hl-comment">; [0 2 1]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(xasc col table)</span>
+        </div>
+        <div class="fn-desc">Sort a table ascending by the named column.</div>
+        <div class="fn-example">(<span class="hl-fn">xasc</span> <span class="hl-str">'price</span> trades)</div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(xdesc col table)</span>
+        </div>
+        <div class="fn-desc">Sort a table descending by the named column.</div>
+        <div class="fn-example">(<span class="hl-fn">xdesc</span> <span class="hl-str">'price</span> trades)</div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(xrank n x)</span>
+        </div>
+        <div class="fn-desc">Assign each element to one of <code>n</code> equal-sized buckets (quantile rank).</div>
+        <div class="fn-example">(<span class="hl-fn">xrank</span> <span class="hl-num">4</span> [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span> <span class="hl-num">40</span> <span class="hl-num">50</span> <span class="hl-num">60</span> <span class="hl-num">70</span> <span class="hl-num">80</span>])  <span class="hl-comment">; [0 0 1 1 2 2 3 3]</span></div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="generation">Generation</h2>
+      <p>Functions for creating, reshaping, and searching vectors.</p>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(til n)</span>
+        </div>
+        <div class="fn-desc">Generate integers from 0 to n-1.</div>
+        <div class="fn-example">(<span class="hl-fn">til</span> <span class="hl-num">5</span>)  <span class="hl-comment">; [0 1 2 3 4]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(take x n)</span>
+        </div>
+        <div class="fn-desc">Take the first <code>n</code> elements from a vector, or repeat/cycle <code>x</code> to length <code>n</code>.</div>
+        <div class="fn-example">(<span class="hl-fn">take</span> [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span> <span class="hl-num">40</span>] <span class="hl-num">3</span>)  <span class="hl-comment">; [10 20 30]</span><br>(<span class="hl-fn">take</span> [<span class="hl-str">A</span> <span class="hl-str">B</span>] <span class="hl-num">5</span>)  <span class="hl-comment">; [A B A B A]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(reverse x)</span>
+        </div>
+        <div class="fn-desc">Reverse a vector.</div>
+        <div class="fn-example">(<span class="hl-fn">reverse</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])  <span class="hl-comment">; [3 2 1]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(where x)</span>
+        </div>
+        <div class="fn-desc">Return indices where the boolean vector is true.</div>
+        <div class="fn-example">(<span class="hl-fn">where</span> [false true false true])  <span class="hl-comment">; [1 3]</span><br>(<span class="hl-fn">where</span> (<span class="hl-fn">&gt;</span> [<span class="hl-num">10</span> <span class="hl-num">5</span> <span class="hl-num">20</span>] <span class="hl-num">8</span>))  <span class="hl-comment">; [0 2]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(find x val)</span>
+        </div>
+        <div class="fn-desc">Find the index of the first occurrence of <code>val</code> in vector <code>x</code>.</div>
+        <div class="fn-example">(<span class="hl-fn">find</span> [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span>] <span class="hl-num">20</span>)  <span class="hl-comment">; 1</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(xbar x n)</span>
+        </div>
+        <div class="fn-desc">Round each element down to the nearest multiple of <code>n</code> (bucketing).</div>
+        <div class="fn-example">(<span class="hl-fn">xbar</span> [<span class="hl-num">3</span> <span class="hl-num">7</span> <span class="hl-num">12</span> <span class="hl-num">18</span>] <span class="hl-num">5</span>)  <span class="hl-comment">; [0 5 10 15]</span></div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="higher-order">Higher-order Functions</h2>
+      <p>Functions that take other functions as arguments for flexible iteration patterns.</p>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(map f x)</span>
+        </div>
+        <div class="fn-desc">Apply function <code>f</code> to each element of <code>x</code>. Returns a list of results.</div>
+        <div class="fn-example">(<span class="hl-fn">map</span> (<span class="hl-kw">fn</span> [x] (<span class="hl-fn">*</span> x x)) [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])  <span class="hl-comment">; [1 4 9]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(fold f init x)</span>
+        </div>
+        <div class="fn-desc">Left fold. Accumulate over <code>x</code> starting from <code>init</code> using binary function <code>f</code>.</div>
+        <div class="fn-example">(<span class="hl-fn">fold</span> <span class="hl-fn">+</span> <span class="hl-num">0</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>])  <span class="hl-comment">; 10</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(scan f x)</span>
+        </div>
+        <div class="fn-desc">Running fold (prefix scan). Returns a vector of intermediate accumulation results.</div>
+        <div class="fn-example">(<span class="hl-fn">scan</span> <span class="hl-fn">+</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>])  <span class="hl-comment">; [1 3 6 10]</span><br>(<span class="hl-fn">scan</span> <span class="hl-fn">*</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>])  <span class="hl-comment">; [1 2 6 24]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(apply f ...args)</span>
+        </div>
+        <div class="fn-desc">Apply function <code>f</code> to the given arguments.</div>
+        <div class="fn-example">(<span class="hl-fn">apply</span> <span class="hl-fn">+</span> <span class="hl-num">1</span> <span class="hl-num">2</span>)  <span class="hl-comment">; 3</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(filter vec mask)</span>
+        </div>
+        <div class="fn-desc">Keep elements of <code>vec</code> where the boolean <code>mask</code> is true.</div>
+        <div class="fn-example">(<span class="hl-fn">filter</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>] (<span class="hl-fn">&gt;</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>] <span class="hl-num">2</span>))  <span class="hl-comment">; [3 4]</span></div>
+      </div>
+
+      <div class="fn-card">
+        <div class="fn-card-header">
+          <span class="fn-name">(pmap f x)</span>
+        </div>
+        <div class="fn-desc">Parallel map. Like <code>map</code> but distributes work across threads for large inputs.</div>
+        <div class="fn-example">(<span class="hl-fn">pmap</span> (<span class="hl-kw">fn</span> [x] (<span class="hl-fn">*</span> x x)) (<span class="hl-fn">til</span> <span class="hl-num">1000000</span>))</div>
+      </div>
+
+      <!-- ============================================================ -->
+      <h2 id="reference">Quick Reference Table</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Functions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Arithmetic</strong></td>
+            <td><code>+</code> <code>-</code> <code>*</code> <code>/</code> <code>%</code> <code>neg</code> <code>round</code> <code>floor</code> <code>ceil</code></td>
+          </tr>
+          <tr>
+            <td><strong>Comparison</strong></td>
+            <td><code>==</code> <code>!=</code> <code>&lt;</code> <code>&lt;=</code> <code>&gt;</code> <code>&gt;=</code> <code>within</code></td>
+          </tr>
+          <tr>
+            <td><strong>Logic</strong></td>
+            <td><code>and</code> <code>or</code> <code>not</code></td>
+          </tr>
+          <tr>
+            <td><strong>Aggregation</strong></td>
+            <td><code>sum</code> <code>count</code> <code>avg</code> <code>min</code> <code>max</code> <code>med</code> <code>dev</code> <code>first</code> <code>last</code> <code>distinct</code></td>
+          </tr>
+          <tr>
+            <td><strong>Ordering</strong></td>
+            <td><code>asc</code> <code>desc</code> <code>iasc</code> <code>idesc</code> <code>xasc</code> <code>xdesc</code> <code>xrank</code></td>
+          </tr>
+          <tr>
+            <td><strong>Generation</strong></td>
+            <td><code>til</code> <code>take</code> <code>reverse</code> <code>where</code> <code>find</code> <code>xbar</code></td>
+          </tr>
+          <tr>
+            <td><strong>Higher-order</strong></td>
+            <td><code>map</code> <code>fold</code> <code>scan</code> <code>apply</code> <code>filter</code> <code>pmap</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="info-box">
+        <strong>Auto-mapping.</strong> All operations tagged <code>FN_ATOMIC</code> (arithmetic, comparison, logic) automatically map over vectors element-wise. You do not need explicit <code>map</code> calls for these &mdash; <code>(+ [1 2 3] 10)</code> works directly.
+      </div>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="rayfall-functions.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Functions Reference</span></a>
+        <a href="operations-string.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">String Operations</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

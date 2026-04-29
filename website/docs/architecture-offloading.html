@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Block Offloading — Rayforce Documentation</title>
+  <meta name="description" content="How Rayforce executes queries larger than available RAM by streaming partition segments through the executor on demand.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link active">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Block Offloading</span>
+      </div>
+
+      <h1>Block Offloading</h1>
+      <p class="page-subtitle">How Rayforce processes tables larger than available RAM by streaming partition segments through the executor on demand.</p>
+
+      <!-- ====== OVERVIEW ====== -->
+      <h2 id="overview">Overview</h2>
+      <p>When a partitioned table is too large to fit in memory, Rayforce can process it one partition at a time. Instead of loading all partitions and concatenating them into a flat table, the executor <strong>streams</strong> through partition segments &mdash; loading each segment, running the full query pipeline on it, merging the partial result, and releasing the segment before moving to the next.</p>
+
+      <p>This happens transparently inside <code>ray_execute</code>. The same DAG, the same optimizer passes, and the same morsel-driven inner loops are used. The only difference is how data flows into the executor: one segment at a time rather than all at once.</p>
+
+      <div class="info-box">
+        <strong>Zero overhead for in-memory tables.</strong> Block offloading only activates for tables opened with <code>ray_read_parted</code>. Regular (non-parted) tables take the existing direct-execution path with no additional checks in the hot loop.
+      </div>
+
+      <!-- ====== HOW IT WORKS ====== -->
+      <h2 id="how-it-works">How It Works</h2>
+      <p>The streaming execution path has four stages:</p>
+
+      <h3>1. Detection</h3>
+      <p>When <code>ray_execute</code> is called, it inspects the bound table. If the table contains parted columns (created by <code>ray_read_parted</code>), and the DAG only contains <strong>streamable operations</strong>, the streaming path is activated.</p>
+      <p>Streamable operations are those whose results can be correctly concatenated across segments:</p>
+      <ul>
+        <li><strong>Element-wise ops</strong> &mdash; arithmetic, comparisons, logical, cast, isnull</li>
+        <li><strong>String ops</strong> &mdash; upper, lower, trim, substr, replace, concat, like</li>
+        <li><strong>Temporal ops</strong> &mdash; extract, date_trunc</li>
+        <li><strong>Structure ops</strong> &mdash; filter, select (projection), alias</li>
+      </ul>
+      <p>DAGs containing joins, group-by, sort, window functions, or graph operations fall back to the flat-materialization path, which loads all segments into memory first.</p>
+
+      <h3>2. Segment Table Construction</h3>
+      <p>For each active partition segment, Rayforce builds a flat temporary table containing just that segment&rsquo;s columns. Parted columns resolve to the segment&rsquo;s mmap&rsquo;d vector. The <code>MAPCOMMON</code> (partition key) column is materialized by broadcasting the partition key value across all rows in that segment.</p>
+      <p>The executor&rsquo;s <code>g-&gt;table</code> pointer is temporarily swapped to this segment table. All downstream operators &mdash; scans, filters, expressions &mdash; see regular flat columns and work exactly as they do for in-memory tables.</p>
+
+      <h3>3. Execution and Merge</h3>
+      <p>The full DAG is executed on each segment table using the standard morsel-driven pipeline. Each segment produces a partial result (a filtered/projected table). Partial results are merged by concatenating columns across segments.</p>
+      <p>Between segments, the executor:</p>
+      <ul>
+        <li>Releases the previous segment table (the mmap&rsquo;d pages return to the OS)</li>
+        <li>Checks the cancellation flag &mdash; queries can be cancelled between segments</li>
+        <li>Proceeds to the next active (non-pruned) segment</li>
+      </ul>
+
+      <h3>4. Result Assembly</h3>
+      <p>After all segments are processed, the merged accumulator is the final result. If all segments were pruned (no partitions match the filter), Rayforce executes the DAG on an empty table to produce a result with the correct schema and zero rows.</p>
+
+      <!-- ====== PARTITION PRUNING ====== -->
+      <h2 id="partition-pruning">Partition Pruning</h2>
+      <p>The optimizer&rsquo;s partition pruning pass can skip entire partitions that cannot contain matching rows. When a filter predicate compares the partition column against a constant, the optimizer evaluates that comparison against each partition key and produces a <strong>segment mask</strong> &mdash; a bitmap where each bit indicates whether a partition is active.</p>
+
+      <p>Supported predicates:</p>
+      <table>
+        <thead><tr><th>Operator</th><th>Example</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>==</code></td><td><code>date == 2024.06.15</code></td><td>Only one partition loaded</td></tr>
+          <tr><td><code>!=</code></td><td><code>date != 2024.01.01</code></td><td>Skip one partition</td></tr>
+          <tr><td><code>&gt;</code>, <code>&gt;=</code></td><td><code>date &gt;= 2024.06.01</code></td><td>Skip earlier partitions</td></tr>
+          <tr><td><code>&lt;</code>, <code>&lt;=</code></td><td><code>date &lt; 2024.03.01</code></td><td>Skip later partitions</td></tr>
+        </tbody>
+      </table>
+
+      <p>Multiple filter predicates on the partition column are combined with AND &mdash; each narrows the set of active partitions further.</p>
+
+      <div class="info-box">
+        <strong>Pruning applies to all partition types.</strong> Date-partitioned (<code>YYYY.MM.DD</code>), integer-partitioned, and symbol-partitioned tables all support pruning. Symbol partition keys in <code>MAPCOMMON</code> are stored as 64-bit intern IDs (the key_values vector is always <code>RAY_SYM_W64</code>), and SYM atom constants also carry the intern ID, so equality comparisons work correctly.
+      </div>
+
+      <!-- ====== MEMORY BUDGET ====== -->
+      <h2 id="memory-budget">Memory Budget</h2>
+      <p>Rayforce auto-detects available physical RAM at startup and sets a memory budget to 80% of it. This budget provides a baseline for future memory-aware scheduling.</p>
+
+      <pre><code><span class="hl-comment">/* Query the memory budget (bytes) */</span>
+<span class="hl-type">int64_t</span> budget = <span class="hl-fn">ray_mem_budget</span>();
+
+<span class="hl-comment">/* Check if calling thread's heap usage exceeds the budget */</span>
+<span class="hl-type">bool</span> pressure = <span class="hl-fn">ray_mem_pressure</span>();</code></pre>
+
+      <div class="info-box">
+        <strong>Thread-local stats only.</strong> <code>ray_mem_pressure()</code> reads the calling thread&rsquo;s heap statistics (<code>ray_tl_stats</code>), not the sum of all threads. In a parallel query, worker thread allocations are not reflected. This will be improved in a future release with a global memory tracking mechanism. Currently, <code>ray_mem_pressure()</code> is not used in the segment streaming hot path &mdash; it exists as infrastructure for future memory-driven scheduling.
+      </div>
+
+      <p>Detection is platform-aware:</p>
+      <ul>
+        <li><strong>Linux / macOS</strong> &mdash; <code>sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE)</code></li>
+        <li><strong>Windows</strong> &mdash; <code>GlobalMemoryStatusEx</code></li>
+      </ul>
+
+      <p>If detection fails (e.g., in some container environments), a conservative 4 GB fallback is used.</p>
+
+      <h3>Two Layers for Working Past RAM</h3>
+      <p>Block offloading is the <strong>query-side</strong> mechanism for processing parted-table data that doesn&rsquo;t fit in memory: each segment streams through the executor and the next segment evicts the previous one&rsquo;s mmap'd pages. It&rsquo;s the right answer when the data already lives on disk in partition shape.</p>
+      <p>The complementary <strong>allocator-side</strong> mechanism is the <a href="architecture-memory.html#buddy-allocator">file-backed pool fallback</a>: when an anonymous mmap refuses a fresh pool (RAM + swap can&rsquo;t cover the request), the buddy allocator transparently spills the pool to a tempfile in the configured swap directory. That covers the case of fresh in-memory allocations &mdash; e.g. <code>(til 10000000000)</code> &mdash; that have no on-disk parted source to stream from.</p>
+
+      <!-- ====== EXAMPLE ====== -->
+      <h2 id="example">End-to-End Example</h2>
+      <p>Consider a partitioned table of trade data with daily partitions spanning a year (365 partitions, each with millions of rows). A query that filters by date and aggregates by symbol:</p>
+
+      <pre><code><span class="hl-comment">; Load the partitioned table (zero-copy, segments stay on disk)</span>
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">read-parted</span> <span class="hl-str">"db"</span> <span class="hl-str">"trades"</span>))
+
+<span class="hl-comment">; Filter by date and select columns</span>
+(<span class="hl-fn">select</span> trades
+  (<span class="hl-kw">where</span> (&gt;= date 2024.06.01))
+  [sym price])</code></pre>
+
+      <p>What happens internally:</p>
+      <ol>
+        <li><strong>Load</strong> &mdash; <code>ray_read_parted</code> creates a table with mmap&rsquo;d parted columns. No data is read from disk yet.</li>
+        <li><strong>Optimize</strong> &mdash; Partition pruning evaluates <code>date &gt;= 2024.06.01</code> against the 365 partition keys. Partitions before June are skipped (roughly 150 partitions pruned).</li>
+        <li><strong>Stream</strong> &mdash; For each of the ~215 remaining partitions:
+          <ul>
+            <li>The segment&rsquo;s columns are mmap&rsquo;d (pages fault in on access)</li>
+            <li>The filter + projection runs through the morsel pipeline</li>
+            <li>The partial result is merged into the accumulator</li>
+            <li>The segment is unmapped (pages return to OS)</li>
+          </ul>
+        </li>
+        <li><strong>Result</strong> &mdash; The final table contains all matching rows from the active partitions. At no point was more than one partition&rsquo;s data resident in memory.</li>
+      </ol>
+
+      <!-- ====== STREAMABLE OPS ====== -->
+      <h2 id="streamable-ops">Streamable Operations Reference</h2>
+      <p>The following operations are safe for segment streaming. All other operations trigger fallback to flat materialization.</p>
+
+      <table>
+        <thead><tr><th>Category</th><th>Operations</th></tr></thead>
+        <tbody>
+          <tr><td>Data access</td><td><code>OP_SCAN</code></td></tr>
+          <tr><td>Unary element-wise</td><td><code>NEG</code>, <code>ABS</code>, <code>NOT</code>, <code>SQRT</code>, <code>LOG</code>, <code>EXP</code>, <code>CEIL</code>, <code>FLOOR</code>, <code>ISNULL</code>, <code>CAST</code></td></tr>
+          <tr><td>Binary element-wise</td><td><code>ADD</code>, <code>SUB</code>, <code>MUL</code>, <code>DIV</code>, <code>MOD</code>, <code>MIN2</code>, <code>MAX2</code></td></tr>
+          <tr><td>Comparison</td><td><code>EQ</code>, <code>NE</code>, <code>LT</code>, <code>LE</code>, <code>GT</code>, <code>GE</code></td></tr>
+          <tr><td>Logical</td><td><code>AND</code>, <code>OR</code>, <code>IF</code></td></tr>
+          <tr><td>String</td><td><code>LIKE</code>, <code>ILIKE</code>, <code>UPPER</code>, <code>LOWER</code>, <code>STRLEN</code>, <code>SUBSTR</code>, <code>REPLACE</code>, <code>TRIM</code>, <code>CONCAT</code></td></tr>
+          <tr><td>Temporal</td><td><code>EXTRACT</code>, <code>DATE_TRUNC</code></td></tr>
+          <tr><td>Structure</td><td><code>FILTER</code>, <code>SELECT</code>, <code>ALIAS</code>, <code>MATERIALIZE</code></td></tr>
+        </tbody>
+      </table>
+
+      <p>When adding new element-wise operations to Rayforce, they must be added to the <code>op_streamable()</code> whitelist in <code>exec.c</code> to participate in segment streaming.</p>
+
+      <!-- ====== LIMITATIONS ====== -->
+      <h2 id="limitations">Current Limitations</h2>
+      <ul>
+        <li><strong>No streaming for aggregations, sorts, or joins</strong> &mdash; these operations require seeing all data at once (or specialized merge logic). They fall back to loading all partitions into memory. This will be addressed in a future release with operator-aware merge functions.</li>
+        <li><strong>Pruning requires literal constants</strong> &mdash; the partition pruning pass only handles comparisons against literal values (e.g., <code>date &gt; 2024.01.01</code>), not computed expressions (e.g., <code>date &gt; (today - 30)</code>).</li>
+        <li><strong>Single partition column</strong> &mdash; pruning works on the single partition key inferred from directory names. Multi-column partition keys are not supported.</li>
+        <li><strong>Thread-local memory pressure</strong> &mdash; <code>ray_mem_pressure()</code> only reads the calling thread&rsquo;s heap statistics, not the global total across all worker threads. It is not currently used in the streaming hot path.</li>
+        <li><strong>Container memory detection</strong> &mdash; on Linux, <code>sysconf(_SC_PHYS_PAGES)</code> reports host physical RAM, not the container&rsquo;s cgroup memory limit. A future release will read <code>/sys/fs/cgroup/memory.max</code> when available.</li>
+      </ul>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="architecture-memory.html" class="docs-nav-link prev"><span class="docs-nav-dir">&larr; Previous</span><span class="docs-nav-title">Memory Model</span></a>
+        <a href="c-api-core.html" class="docs-nav-link next"><span class="docs-nav-dir">Next &rarr;</span><span class="docs-nav-title">Core C API Reference</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

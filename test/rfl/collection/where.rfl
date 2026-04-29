@@ -1,0 +1,9 @@
+;; Invariants for `where` — positions of true values / repetition counts.
+
+(where [true false true false true]) -- [0 2 4]
+(where [false false false]) -- []
+(where [true true true]) -- [0 1 2]
+
+;; as a selection by bool mask
+(set V [10 20 30 40 50])
+(at V (where [true false true false true])) -- [10 30 50]

@@ -1,0 +1,27 @@
+;; Invariants for `last`.
+
+(last [10 20 30]) -- 30
+(last [42]) -- 42
+
+;; last(v) == at(v, count-1)
+(set V (rand 256 10000))
+(last V) -- (at V (- (count V) 1))
+
+;; last(reverse v) == first v
+(first V) -- (last (reverse V))
+
+;; ────────────── type preservation (regression for last on DATE/BOOL) ──────────────
+(last [1.0 2.0 3.0])              -- 3.0
+(type (last [1h 2h 3h]))          -- 'i16
+(type (last [1i 2i 3i]))          -- 'i32
+(last ['a 'b 'c])                 -- 'c
+(type (last ['a 'b 'c]))          -- 'sym
+(last ["aa" "bb"])                -- "bb"
+(last [true false])               -- false
+(type (last [true false]))        -- 'b8
+(last [2024.01.01 2024.01.02])    -- 2024.01.02
+(type (last [2024.01.01 2024.01.02])) -- 'date
+(last [09:30:00.000 10:00:00.000]) -- 10:00:00.000
+(type (last [09:30:00.000 10:00:00.000])) -- 'time
+(type (last (as 'TIMESTAMP [1 2]))) -- 'timestamp
+(type (last [0x01 0xff]))         -- 'u8

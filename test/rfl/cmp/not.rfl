@@ -1,0 +1,11 @@
+;; Invariants for `not`.
+
+(not true) -- false
+(not false) -- true
+
+;; involution
+(set B [true false true false true])
+(count B) -- (sum (== (not (not B)) B))
+
+;; not X XOR X is always false (complementary)
+(count B) -- (sum (!= B (not B)))

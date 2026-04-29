@@ -1,0 +1,17 @@
+;; Invariants for `xbar` — bucket: (xbar VEC step) rounds each elem down
+;; to the nearest multiple of step.
+
+;; concrete
+(xbar [3 7 12] 5) -- [0 5 10]
+(xbar [0 1 4 5 9] 5) -- [0 0 0 5 5]
+
+;; result element <= input element
+(set V (rand 256 10000))
+(count V) -- (sum (<= (xbar V 10) V))
+
+;; result divisible by step
+(count V) -- (sum (== 0 (% (xbar V 10) 10)))
+
+;; distance to bucket in [0, step)
+(set D (- V (xbar V 10)))
+(count V) -- (sum (and (>= D 0) (< D 10)))

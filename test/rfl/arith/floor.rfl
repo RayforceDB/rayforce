@@ -1,0 +1,31 @@
+;; Invariants for `floor`.
+
+;; floor(x) <= x
+(set A (div (- (rand 256 10000) 5000) 100))
+(count A) -- (sum (<= (floor A) A))
+
+;; x - floor(x) is in [0, 1)
+(set D (- A (floor A)))
+(count A) -- (sum (and (>= D 0.0) (< D 1.0)))
+
+;; idempotent
+(count A) -- (sum (== (floor (floor A)) (floor A)))
+
+;; concrete
+(floor 3.7)  -- 3.0
+(floor 3.0)  -- 3.0
+(floor -3.2) -- -4.0
+
+;; ──────────────────────────────────────────────────────────────────
+;; Integer input — identity
+;; ──────────────────────────────────────────────────────────────────
+
+(floor 5)  -- 5
+(floor 5h) -- 5
+(floor 5i) -- 5
+
+;; vec — float input, float result
+(floor [1.2 2.8 -0.5 -1.5]) -- [1.0 2.0 -1.0 -2.0]
+
+;; relation to ceil — floor <= ceil
+(<= (floor 1.5) (ceil 1.5)) -- true

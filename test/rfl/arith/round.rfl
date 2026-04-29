@@ -1,0 +1,29 @@
+;; Invariants for `round` (round to nearest integer).
+
+;; round(x) is floor(x) or ceil(x)
+(set A (div (- (rand 256 10000) 5000) 100))
+(count A) -- (sum (or (== (round A) (floor A)) (== (round A) (ceil A))))
+
+;; concrete — half-away-from-zero / banker's, depending on impl
+(round 3.5)  -- 4.0
+(round 3.4)  -- 3.0
+(round 3.6)  -- 4.0
+(round 3.0)  -- 3.0
+(round -3.4) -- -3.0
+
+;; ──────────────────────────────────────────────────────────────────
+;; Integer input — round always returns f64
+;; ──────────────────────────────────────────────────────────────────
+
+(round 5)  -- 5.0
+(round 5h) -- 5.0
+(round 5i) -- 5.0
+(type (round 5)) -- 'f64
+
+;; vec — also f64 result
+(round [1.2 2.7 -1.5]) -- [1.0 3.0 -2.0]
+
+;; bounded between floor and ceil for arbitrary input
+(set X 1.7)
+(>= (round X) (floor X)) -- true
+(<= (round X) (ceil X))  -- true

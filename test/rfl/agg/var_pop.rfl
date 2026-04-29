@@ -1,0 +1,6 @@
+;; Invariants for `var_pop` (population variance).
+
+(var_pop [5 5 5 5 5]) -- 0.0
+
+(set V (rand 100 1000))
+1 -- (as 'I64 (>= (var_pop V) 0.0))

@@ -1,0 +1,53 @@
+;; Round-trip invariants for `set-splayed` / `get-splayed` — write a
+;; table to a directory as one file per column, then read it back.
+;;
+;; Tests use unique /tmp/ paths because the overwrite path is a known
+;; bug (`error: corrupt`); these only exercise the fresh-write path.
+;; Stale data from prior runs would also flip these to "corrupt", so
+;; CI environments should clean /tmp/rfl_splayed_* between runs.
+
+;; ────────────── small table ──────────────
+(set T-Small (table [a b] (list [1 2 3 4 5] [10.0 20.0 30.0 40.0 50.0])))
+(set-splayed "/tmp/rfl_splayed_small/" T-Small)
+(set R-Small (get-splayed "/tmp/rfl_splayed_small/"))
+
+(count R-Small) -- 5
+(sum (at R-Small 'a)) -- 15
+(sum (at R-Small 'b)) -- 150.0
+
+;; column names survive the round trip (key returns the SYM vec)
+(key R-Small) -- (key T-Small)
+
+;; column values match exactly
+(at R-Small 'a) -- (at T-Small 'a)
+(at R-Small 'b) -- (at T-Small 'b)
+
+;; ────────────── morsel-boundary table (1024 rows) ──────────────
+(set T-1024 (table [n] (list (til 1024))))
+(set-splayed "/tmp/rfl_splayed_1024/" T-1024)
+(set R-1024 (get-splayed "/tmp/rfl_splayed_1024/"))
+
+(count R-1024) -- 1024
+;; sum of til 1024 = 1023*1024/2
+(sum (at R-1024 'n)) -- 523776
+
+;; ────────────── nested directory creation (mkdir -p) ──────────────
+;; set-splayed used to fail with "io" on nested paths because ray_mkdir
+;; only created one level.  Required for partitioned tables where the
+;; date dir doesn't pre-exist:  /db_root/2024.01.01/t/
+(set T-Nested (table [id val] (list [1 2 3] [10.0 20.0 30.0])))
+(set-splayed "/tmp/rfl_splayed_nested/2024.01.01/t/" T-Nested)
+(count (get-splayed "/tmp/rfl_splayed_nested/2024.01.01/t/")) -- 3
+
+;; ────────────── get-parted: 2-partition reconstruction ──────────────
+;; Pre-fix: get-parted required a /<root>/sym file (which set-splayed
+;; doesn't write for symbol-less tables) and unconditionally errored.
+(set T-P0 (table [id val] (list [0 1 2 3 4] [0.0 1.0 2.0 3.0 4.0])))
+(set T-P1 (table [id val] (list [100 101 102 103 104] [10.0 11.0 12.0 13.0 14.0])))
+(set-splayed "/tmp/rfl_parted/2024.01.01/t/" T-P0)
+(set-splayed "/tmp/rfl_parted/2024.01.02/t/" T-P1)
+
+;; total row count across partitions
+(count (get-parted "/tmp/rfl_parted/" 't)) -- 10
+;; column count = 1 partition-key + 2 data columns
+(count (key (get-parted "/tmp/rfl_parted/" 't))) -- 3

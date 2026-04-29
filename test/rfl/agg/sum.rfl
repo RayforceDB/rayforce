@@ -1,0 +1,26 @@
+;; Invariants for `sum` on i64 vectors.
+
+;; concat-distributive:  (sum (concat u v)) == (+ (sum u) (sum v))
+(set U (- (rand 128 40000) 20000))
+(set V (- (rand 128 40000) 20000))
+(sum (concat U V)) -- (+ (sum U) (sum V))
+
+;; concrete known value
+(sum [1 2 3 4 5 6 7 8 9 10]) -- 55
+
+;; linearity: scales with constant — falsifies sum ≡ 0.
+(set V (- (rand 100 2000) 1000))
+(* 3 (sum V)) -- (sum (* 3 V))
+
+;; ────────────── error: sum is not defined for the null sentinel ──────────────
+;; (sum null) refers to RAY_NULL_OBJ, not a typed-null atom; it isn't
+;; reduceable and must surface as a type error.
+(sum null) !- type
+
+;; ────────────── null skipping (null_policy: skip_nulls) ──────────────
+;; Rayforce aggregations skip typed-null elements.  Vector literals
+;; reject mixing nulls and values across types, so use (list ...) which
+;; produces a heterogeneous list that sum handles.
+(sum (list 1 0Ni 3 0Ni 5)) -- 9
+(sum (list 0Ni 0Ni 0Ni))   -- 0
+(sum (list))               -- 0

@@ -1,0 +1,15 @@
+;; Invariants for `type` — introspection returning a sym.
+
+(type 42) -- 'i64
+(type 3.14) -- 'f64
+(type true) -- 'b8
+(type "hello") -- 'str
+(type 2024.06.15) -- 'date
+(type 'abc) -- 'sym
+(type [1 2 3]) -- 'I64
+(type [1.0 2.0 3.0]) -- 'F64
+(type [true false]) -- 'B8
+(type null) -- 'null
+
+;; type returns a sym
+(type (type 42)) -- 'sym

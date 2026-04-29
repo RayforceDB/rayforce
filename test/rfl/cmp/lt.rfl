@@ -1,0 +1,45 @@
+;; Invariants for `<`.
+
+;; irreflexive: (< a a) is false
+(set A (- (rand 256 200000) 100000))
+(count A) -- (sum (not (< A A)))
+
+;; antisymmetric: (< a b) and (< b a) can't both hold
+(set B (- (rand 256 200000) 100000))
+(count A) -- (sum (not (and (< A B) (< B A))))
+
+;; trichotomy: exactly one of <, >, == holds
+(count A) -- (sum (+ (+ (as 'I64 (< A B)) (as 'I64 (> A B))) (as 'I64 (== A B))))
+
+;; concrete
+(< 1 2) -- true
+(< 2 1) -- false
+(< 3 3) -- false
+(< -5 -1) -- true
+
+;; cross-types
+(< 3h 5h) -- true
+(< 3i 5i) -- true
+(< 1.5 2.5) -- true
+
+;; STR
+(< "a" "b") -- true
+
+;; DATE
+(< 2024.01.15 2024.06.01) -- true
+
+;; vec
+(< [1 5 3] [2 2 2]) -- [true false false]
+(< [1 5 10] 5)      -- [true false false]
+
+;; ──────────────────────────────────────────────────────────────────
+;; SYM ordering: lexicographic compare via interned text.
+;; ──────────────────────────────────────────────────────────────────
+
+(< 'a 'b) -- true
+(< 'b 'a) -- false
+(< 'a 'a) -- false
+(< 'foo 'foobar) -- true
+(< 'foobar 'foo) -- false
+(< ['a 'b 'c] 'b) -- [true false false]
+(< ['a 'b] ['b 'a]) -- [true false]

@@ -1,0 +1,43 @@
+;; Invariants for `>=`.
+
+;; reflexive
+(set A (- (rand 256 200000) 100000))
+(count A) -- (sum (>= A A))
+
+;; dual of <=
+(set B (- (rand 256 200000) 100000))
+(count A) -- (sum (== (>= A B) (<= B A)))
+
+;; >= equivalent to (or > ==)
+(count A) -- (sum (== (>= A B) (or (> A B) (== A B))))
+
+;; concrete
+(>= 2 1)  -- true
+(>= 1 2)  -- false
+(>= 3 3)  -- true
+(>= -1 -5) -- true
+
+;; cross-types
+(>= 5h 5h) -- true
+(>= 7i 5i) -- true
+(>= 2.5 2.5) -- true
+
+;; STR
+(>= "x" "x") -- true
+(>= "b" "a") -- true
+
+;; DATE
+(>= 2024.01.15 2024.01.15) -- true
+(>= 2024.06.01 2024.01.15) -- true
+
+;; vec
+(>= [1 5 5] [2 2 5]) -- [false true true]
+
+;; ──────────────────────────────────────────────────────────────────
+;; SYM ordering: reflexive, lexicographic.
+;; ──────────────────────────────────────────────────────────────────
+
+(>= 'a 'a) -- true
+(>= 'b 'a) -- true
+(>= 'a 'b) -- false
+(>= ['a 'b 'c] 'b) -- [false true true]

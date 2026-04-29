@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rayforce — Columnar Analytics and Graph Traversal in One Pipeline</title>
+  <meta name="description" content="Pure C17 zero-dependency embeddable engine where columnar analytics and graph operations share a single operation DAG, pass through a multi-pass optimizer, and execute as fused morsel-driven bytecode.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+
+  <!-- Nav -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="#" class="nav-brand">
+        <img src="assets/logo-light-full.svg" alt="Rayforce" height="20">
+      </a>
+      <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">
+        <span></span><span></span><span></span>
+      </button>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#architecture">Architecture</a>
+        <a href="docs/index.html">Docs</a>
+        <a href="about.html">About</a>
+        <a href="https://github.com/RayforceDB/rayforce2" class="nav-cta" target="_blank" rel="noopener">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub &rarr;
+        </a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="hero-bg">
+      <div class="hero-gradient"></div>
+      <div class="hero-grid-lines"></div>
+    </div>
+    <div class="container">
+      <div class="hero-content">
+        <div class="hero-eyebrow">PURE C17 &middot; ZERO DEPS &middot; GRAPH + ANALYTICS</div>
+        <h1>Columnar analytics and<br>graph traversal in <span class="highlight">one pipeline</span></h1>
+        <p class="hero-desc">Rayforce is a zero-dependency embeddable engine where columnar analytics and graph operations share a single operation DAG, pass through a multi-pass optimizer, and execute as fused morsel-driven bytecode. Pure C17. No malloc.</p>
+        <div class="hero-actions">
+          <a href="docs/quick-start.html" class="btn-hero">
+            Get Started
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </a>
+          <a href="https://github.com/RayforceDB/rayforce2" class="btn-hero-ghost" target="_blank" rel="noopener">View on GitHub</a>
+        </div>
+      </div>
+
+      <div class="hero-numbers">
+        <div class="hero-number">
+          <span class="num-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+          </span>
+          <span class="num-title">Single Header</span>
+          <span class="num-label">include/rayforce.h &mdash; one file, full API</span>
+        </div>
+        <div class="hero-number">
+          <span class="num-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+          </span>
+          <span class="num-title">Multi-Pass Optimizer</span>
+          <span class="num-label">SIP, factorize, predicate pushdown, fusion, DCE</span>
+        </div>
+        <div class="hero-number">
+          <span class="num-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+          </span>
+          <span class="num-title">Graph Algorithms</span>
+          <span class="num-label">PageRank, Dijkstra, A*, Louvain, LFTJ &mdash; in the same pipeline</span>
+        </div>
+        <div class="hero-number">
+          <span class="num-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          </span>
+          <span class="num-title">Rayfall Language</span>
+          <span class="num-label">Lisp-like query language with REPL and rich builtins</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Why -->
+  <section id="why" class="why-section">
+    <div class="container">
+      <div class="why-header">
+        <span class="section-tag">THE PROBLEM</span>
+        <h2>Analytics and graphs shouldn't need <span class="text-gradient">separate tools</span></h2>
+      </div>
+
+      <div class="why-grid">
+        <div class="why-card why-card-large">
+          <div class="why-card-label">THE RAYFORCE WAY</div>
+          <ul class="why-list why-list-solution">
+            <li>Single pipeline for analytics + graph</li>
+            <li>One optimizer understands both</li>
+            <li>Fused execution &mdash; no serialization overhead</li>
+            <li>Zero dependencies &mdash; embed in any C project</li>
+          </ul>
+        </div>
+
+        <div class="why-card">
+          <div class="why-card-label why-card-label-dim">TODAY'S APPROACH</div>
+          <ul class="why-list why-list-problem">
+            <li>Pandas/Polars for analytics + NetworkX for graphs</li>
+            <li>Two query languages, two data models</li>
+            <li>Serialize between tools on every step</li>
+            <li>Heavy Python dependencies for simple ops</li>
+          </ul>
+        </div>
+
+        <div class="why-card why-card-small">
+          <div class="why-card-label">MULTI-PASS OPTIMIZER</div>
+          <p class="why-card-desc">Type inference, constant folding, sideways information passing, factorize, predicate pushdown, filter reorder, fusion, and DCE &mdash; all in one pass over the DAG before a single element is touched.</p>
+        </div>
+
+        <div class="why-card why-card-small">
+          <div class="why-card-label">MORSEL EXECUTION</div>
+          <p class="why-card-desc">1024-element morsel-driven bytecode. Element-wise ops fuse into single-pass pipelines. Thread-local arenas keep allocation off the critical path.</p>
+        </div>
+
+        <div class="why-card why-card-small">
+          <div class="why-card-label">CSR GRAPH ENGINE</div>
+          <p class="why-card-desc">Double-indexed compressed sparse rows. Forward + reverse indices, mmap-friendly persistence, and algorithms from BFS to worst-case optimal joins.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section id="features" class="features-section">
+    <div class="container">
+      <span class="section-tag">WHAT YOU GET</span>
+      <h2 class="features-title">Six pillars, one engine</h2>
+      <p class="features-subtitle">Everything you need for columnar analytics, graph traversal, and an interactive query language in a single embeddable library.</p>
+
+      <div class="features-grid">
+        <div class="feature-card">
+          <div class="feature-card-header">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+            <h3>Fused Execution</h3>
+          </div>
+          <p>Morsel-driven bytecode over 1024-element chunks. Element-wise ops fused into single-pass pipelines that stay L1-resident.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-card-header">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+            <h3>Graph Engine</h3>
+          </div>
+          <p>Double-indexed CSR storage. BFS, Dijkstra, A*, PageRank, Louvain, LFTJ &mdash; all in the same DAG.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-card-header">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+            <h3>Rayfall Language</h3>
+          </div>
+          <p>Lisp-like query REPL with rich builtins. Lambdas compile lazily to bytecode. <code>select</code>/<code>update</code> bridge to the DAG optimizer.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-card-header">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+            <h3>Multi-Pass Optimizer</h3>
+          </div>
+          <p>Type inference &rarr; constant folding &rarr; SIP &rarr; factorize &rarr; predicate pushdown &rarr; filter reorder &rarr; fusion &rarr; DCE.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-card-header">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+            <h3>Custom Allocator</h3>
+          </div>
+          <p>Buddy allocator with slab cache. Thread-local arenas, lock-free allocation, COW ref counting. No malloc.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-card-header">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg>
+            <h3>Zero Dependencies</h3>
+          </div>
+          <p>Pure C17, single public header. Builds with <code>make</code>. ~16K lines of engine code. Embeds into any C/C++ project.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Architecture -->
+  <section id="architecture" class="arch-section">
+    <div class="container">
+      <span class="section-tag">ARCHITECTURE</span>
+      <h2 class="arch-title">Build, optimize, execute</h2>
+      <p class="arch-subtitle">Data flows from lazy DAG construction through a multi-pass optimizer into fused morsel-driven bytecode execution.</p>
+
+      <div class="arch-diagram">
+        <svg class="arch-svg" viewBox="0 0 800 180" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <filter id="glow">
+              <feGaussianBlur stdDeviation="3" result="blur"/>
+              <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
+
+          <!-- Source nodes -->
+          <rect x="10" y="15" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
+          <text x="70" y="38" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">CSV / Tables</text>
+          <rect x="10" y="63" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
+          <text x="70" y="86" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">CSR Graphs</text>
+          <rect x="10" y="111" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
+          <text x="70" y="134" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">Rayfall</text>
+          <text x="70" y="166" text-anchor="middle" fill="rgba(255,255,255,0.25)" font-family="Oswald, sans-serif" font-size="9" font-weight="600" letter-spacing="0.12em">SOURCES</text>
+
+          <!-- Left connection paths -->
+          <path d="M130,33 C185,33 185,60 240,60" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
+          <path d="M130,81 C185,81 185,90 240,90" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
+          <path d="M130,129 C185,129 185,120 240,120" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
+
+          <!-- Animated dots - left -->
+          <circle r="3" fill="#f5a623" filter="url(#glow)">
+            <animateMotion dur="2.4s" repeatCount="indefinite" path="M130,33 C185,33 185,60 240,60"/>
+          </circle>
+          <circle r="3" fill="#f5a623" filter="url(#glow)">
+            <animateMotion dur="2.8s" repeatCount="indefinite" path="M130,81 C185,81 185,90 240,90" begin="0.9s"/>
+          </circle>
+          <circle r="3" fill="#f5a623" filter="url(#glow)">
+            <animateMotion dur="2.6s" repeatCount="indefinite" path="M130,129 C185,129 185,120 240,120" begin="1.7s"/>
+          </circle>
+
+          <!-- Rayforce core -->
+          <rect class="arch-core-rect" x="240" y="10" width="320" height="160" rx="14" fill="rgba(153,119,50,0.2)" stroke="rgba(245,166,35,0.4)" stroke-width="1.5"/>
+          <text x="400" y="34" text-anchor="middle" fill="rgba(245,166,35,0.8)" font-family="Oswald, sans-serif" font-size="11" font-weight="700" letter-spacing="0.12em">RAYFORCE ENGINE</text>
+
+          <!-- Pipeline pills row -->
+          <rect x="258" y="46" width="72" height="28" rx="6" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
+          <text x="294" y="64" text-anchor="middle" fill="#e2e8f0" font-family="'JetBrains Mono', monospace" font-size="11">scan</text>
+          <rect x="338" y="46" width="72" height="28" rx="6" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
+          <text x="374" y="64" text-anchor="middle" fill="#e2e8f0" font-family="'JetBrains Mono', monospace" font-size="11">filter</text>
+          <rect x="418" y="46" width="72" height="28" rx="6" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
+          <text x="454" y="64" text-anchor="middle" fill="#e2e8f0" font-family="'JetBrains Mono', monospace" font-size="11">group</text>
+          <rect x="498" y="46" width="52" height="28" rx="6" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
+          <text x="524" y="64" text-anchor="middle" fill="#e2e8f0" font-family="'JetBrains Mono', monospace" font-size="11">join</text>
+
+          <!-- Optimizer row -->
+          <rect x="258" y="84" width="92" height="26" rx="6" fill="rgba(255,255,255,0.03)"/>
+          <text x="304" y="101" text-anchor="middle" fill="rgba(226,232,240,0.45)" font-family="'JetBrains Mono', monospace" font-size="10">optimizer</text>
+          <rect x="358" y="84" width="78" height="26" rx="6" fill="rgba(255,255,255,0.03)"/>
+          <text x="397" y="101" text-anchor="middle" fill="rgba(226,232,240,0.45)" font-family="'JetBrains Mono', monospace" font-size="10">fusion</text>
+          <rect x="444" y="84" width="98" height="26" rx="6" fill="rgba(255,255,255,0.03)"/>
+          <text x="493" y="101" text-anchor="middle" fill="rgba(226,232,240,0.45)" font-family="'JetBrains Mono', monospace" font-size="10">bytecode</text>
+
+          <!-- Engine row -->
+          <text x="400" y="128" text-anchor="middle" fill="rgba(255,255,255,0.2)" font-family="Oswald, sans-serif" font-size="9" font-weight="600" letter-spacing="0.08em">EXECUTION</text>
+          <rect x="258" y="135" width="98" height="24" rx="6" fill="rgba(255,255,255,0.03)"/>
+          <text x="307" y="151" text-anchor="middle" fill="rgba(226,232,240,0.4)" font-family="'JetBrains Mono', monospace" font-size="10">morsel 1024</text>
+          <rect x="364" y="135" width="88" height="24" rx="6" fill="rgba(255,255,255,0.03)"/>
+          <text x="408" y="151" text-anchor="middle" fill="rgba(226,232,240,0.4)" font-family="'JetBrains Mono', monospace" font-size="10">graph ops</text>
+          <rect x="460" y="135" width="80" height="24" rx="6" fill="rgba(255,255,255,0.03)"/>
+          <text x="500" y="151" text-anchor="middle" fill="rgba(226,232,240,0.4)" font-family="'JetBrains Mono', monospace" font-size="10">LFTJ</text>
+
+          <!-- Right connection paths -->
+          <path d="M560,60 C615,60 615,33 670,33" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
+          <path d="M560,90 C615,90 615,81 670,81" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
+          <path d="M560,120 C615,120 615,129 670,129" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
+
+          <!-- Animated dots - right -->
+          <circle r="3" fill="#f5a623" filter="url(#glow)">
+            <animateMotion dur="2.4s" repeatCount="indefinite" path="M560,60 C615,60 615,33 670,33" begin="1.2s"/>
+          </circle>
+          <circle r="3" fill="#f5a623" filter="url(#glow)">
+            <animateMotion dur="2.8s" repeatCount="indefinite" path="M560,90 C615,90 615,81 670,81" begin="0.4s"/>
+          </circle>
+          <circle r="3" fill="#f5a623" filter="url(#glow)">
+            <animateMotion dur="2.6s" repeatCount="indefinite" path="M560,120 C615,120 615,129 670,129" begin="2.1s"/>
+          </circle>
+
+          <!-- Output nodes -->
+          <rect x="670" y="15" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
+          <text x="730" y="38" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">DataFrames</text>
+          <rect x="670" y="63" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
+          <text x="730" y="86" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">Paths</text>
+          <rect x="670" y="111" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
+          <text x="730" y="134" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">Aggregates</text>
+          <text x="730" y="166" text-anchor="middle" fill="rgba(255,255,255,0.25)" font-family="Oswald, sans-serif" font-size="9" font-weight="600" letter-spacing="0.12em">RESULTS</text>
+        </svg>
+      </div>
+
+      <p class="arch-caption">Lazy DAG nodes &#8594; <strong>multi-pass optimizer</strong> (type inference, SIP, factorize, predicate pushdown, fusion, DCE) &#8594; <strong>fused morsel-driven executor</strong> with register-slot bytecode. Graph algorithms run in the same pipeline &mdash; no serialization between analytics and traversal.</p>
+    </div>
+  </section>
+
+  <!-- Live Demo -->
+  <section id="demo" class="demo-section">
+    <div class="container">
+      <span class="section-tag">SEE IT IN ACTION</span>
+      <h2 class="demo-title">From zero to query in seconds</h2>
+      <p class="demo-subtitle">Start the REPL, build tables, aggregate, and pivot &mdash; all in one session.</p>
+
+      <div class="demo-terminal">
+        <div class="terminal-header">
+          <span class="dot red"></span>
+          <span class="dot yellow"></span>
+          <span class="dot green"></span>
+          <span class="terminal-title">terminal</span>
+        </div>
+        <div class="terminal-body" id="terminal-output"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="cta-section">
+    <div class="container">
+      <div class="cta-content">
+        <h2>Start building in<br>30 seconds</h2>
+        <div class="cta-terminal">
+          <div class="terminal-header">
+            <span class="dot red"></span>
+            <span class="dot yellow"></span>
+            <span class="dot green"></span>
+          </div>
+          <pre class="cta-terminal-body"><code><span class="t-cmd">$</span> make &amp;&amp; ./rayforce
+<span class="t-cmd">&#8227;</span> (pivot t 'Symbol 'Side 'Qty sum)</code></pre>
+        </div>
+        <div class="cta-buttons">
+          <a href="docs/quick-start.html" class="btn-hero">
+            Get Started
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </a>
+          <a href="https://github.com/RayforceDB/rayforce2" class="btn-hero-ghost" target="_blank" rel="noopener">View on GitHub</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-inner">
+        <div class="footer-brand">
+          <img src="assets/logo-light-full.svg" alt="Rayforce" height="28">
+        </div>
+        <div class="footer-links">
+          <a href="https://github.com/RayforceDB/rayforce2" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://x.com/RayforceDB" target="_blank" rel="noopener">X / Twitter</a>
+          <a href="https://www.reddit.com/r/rayforcedb/" target="_blank" rel="noopener">Reddit</a>
+          <a href="https://rayforcedb.zulipchat.com/join/l33sichu4vp7nf77hgdul4om/" target="_blank" rel="noopener">Zulip Chat</a>
+          <a href="https://www.linkedin.com/in/anton-kundenko-a22a3667" target="_blank" rel="noopener">LinkedIn</a>
+          <a href="docs/index.html">Docs</a>
+          <a href="https://github.com/RayforceDB/rayforce2/blob/master/LICENSE" target="_blank" rel="noopener">MIT License</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Scroll-to-top -->
+  <button class="scroll-top" aria-label="Scroll to top">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 15l-6-6-6 6"/></svg>
+  </button>
+
+  <script src="script.js"></script>
+</body>
+</html>

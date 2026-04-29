@@ -1,0 +1,55 @@
+;; Ported from test_lang_rf.inc::test_rf_query.
+
+(set t (table [sym price volume tape] (list [apl vod god] [102 99 203] [500 400 900] (list "A""B""C")))) -- (table [sym price volume tape] (list [apl vod god] [102 99 203] [500 400 900] (list "A""B""C")))
+(at t 'sym) -- [apl vod god]
+(at t 'price) -- [102 99 203]
+(at t 'volume) -- [500 400 900]
+(at t 'tape) -- (list "A""B""C")
+(set n 10)(set gds (take (guid 3) n))(set t (table [OrderId Symbol Price Size Tape Timestamp](list gds(take [apll good msfk ibmd amznt fbad baba] n)(as 'F64 (til n))(take (+ 1 (til 3)) n)(map (fn [x] (as 'STR x)) (take (til 10) n))(as 'TIMESTAMP (til n)))))null -- null
+(select {from: t by: Symbol}) -- (table [Symbol OrderId Price Size Tape Timestamp](list [apll good msfk ibmd amznt fbad baba](at gds (til 7)) [0 1 2 3 4 5 6.0] [1 2 3 1 2 3 1](list "0""1""2""3""4""5""6")(at (at t 'Timestamp) (til 7))))
+(select {from: t by: Symbol where: (== Price 3)}) -- (table [Symbol OrderId Price Size Tape Timestamp](list [ibmd] (at gds 3) [3.00] [1] (list "3") [2000.01.01D00:00:00.000000003]))
+(select {from: t by: Symbol where: (== Price 99)}) -- (table [Symbol OrderId Price Size Tape Timestamp](list (as 'SYMBOL []) (as 'GUID []) (as 'F64 []) (as 'I64 []) (list) (as 'TIMESTAMP [])))
+(select {s: (sum Price) from: t by: Symbol}) -- (table [Symbol s](list [apll good msfk ibmd amznt fbad baba][7.00 9.00 11.00 3.00 4.00 5.00 6.00]))
+;; by: (xbar Ts 10000) groups rows into 10-second buckets; the Ts
+;; key column surfaces the bucket start (09:00:00, 09:00:10), not
+;; an arbitrary first-of-group raw value.  The prior expectation
+;; encoded a bug where the key column read from the source Ts at
+;; the first-of-group row index instead of the computed key.
+(set trades (table [Sym Ts Price] (list [a b a] [09:00:01.000 09:00:05.000 09:00:11.000] [10 20 30])))(select {from: trades by: (xbar Ts 10000)}) -- (table [Ts Sym Price] (list [09:00:00.000 09:00:10.000] [a a] [10 30]))
+;; --- Null group keys (gh#6): a null key must form its own group
+;;     distinct from real 0, and the output key column must carry
+;;     the null bit (displayed as 0Nl). ---
+(set tn (table [g v] (list [1 0Nl 2] [10 20 30])))(select {s: (sum v) from: tn by: g}) -- (table [g s] (list [1 0Nl 2] [10 20 30]))
+;; Null and real 0 must NOT merge, and two nulls must group together.
+(set tn2 (table [g v] (list [1 0Nl 0 0Nl 2] [10 20 100 200 30])))(select {s: (sum v) from: tn2 by: g}) -- (table [g s] (list [1 0Nl 0 2] [10 220 100 30]))
+;; --- Pivot with GUID index column. Pivot's phase2 dedupe must
+;;     resolve wide keys (GUID stores a source row index in its
+;;     slot) through key_data rather than memcmp-ing row indices,
+;;     otherwise two rows sharing the same GUID would emit as
+;;     distinct output rows and the column would carry row indices
+;;     instead of the actual GUID bytes. ---
+(set gpt (table [g p v] (list (as 'GUID (list "d49f18a4-1969-49e8-9b8a-6bb9a4832eea" "d49f18a4-1969-49e8-9b8a-6bb9a4832eea" "7e42b82b-51c7-4468-a477-375bd5006e60")) ['a 'b 'a] [10 20 30])))(count (pivot gpt ['g] 'p 'v sum)) -- 2
+;; Duplicate GUID *pivot-column* values must merge into one output
+;; column AND each source row must land in the correct column. The
+;; grp_pv lookup originally compared raw row-index slots; rows sharing
+;; the same GUID at different source positions missed the match and
+;; fell back to column 0, silently routing values to the wrong cell.
+;; The data below puts GUID_B first (so GUID_A is pv column 1) and
+;; has an i=2 row under the duplicate GUID_A: its value must sum into
+;; the GUID_A column, not GUID_B.
+(set gpt2 (table [i p v] (list [1 1 2] (as 'GUID (list "7e42b82b-51c7-4468-a477-375bd5006e60" "d49f18a4-1969-49e8-9b8a-6bb9a4832eea" "d49f18a4-1969-49e8-9b8a-6bb9a4832eea")) [30 10 20])))(set rpt2 (pivot gpt2 ['i] 'p 'v sum))(sum (first (at rpt2 [d49f18a4-1969-49e8-9b8a-6bb9a4832eea]))) -- 30
+;; Test and with select - this exposes the parallel processing bug
+(set t (table ['a 'b 'c] (list (take [false true] 25001) (take [true false] 25001) (take 1 25001)))) (count (select {c: c from: t where: (and a b)})) -- 0
+;; --- Group-by RAY_GUID. Pre-fix, ray_group_fn returned ray_i64 atoms
+;;     for the group keys and select_fn's store_typed_elem interpreted
+;;     the i64 bits as a ray_t*, SIGSEGV-ing. Now the GUID branch emits
+;;     proper ray_guid atoms. Also exercises ray_group_fn's max_groups
+;;     growth past the historical 1024 cap. ---
+;; Small guid count-by: two distinct guids (duplicated), expect two groups.
+(set gs4 (take (guid 2) 4))(set tg (table [g v] (list gs4 [10 20 30 40])))(count (select {c: (count v) from: tg by: g})) -- 2
+;; Sum aggregation by guid: 10 + 30 = 40, 20 + 40 = 60 for the two groups.
+(set grp (select {s: (sum v) from: tg by: g}))(sum (at grp 's)) -- 100
+;; Growth past 1024: 1500 distinct guids, each appearing once.
+;; Pre-fix ray_group_fn had a hardcoded max_groups=1024 and returned
+;; "limit" for this case.
+(set tbig (table [g v] (list (guid 1500) (til 1500))))(count (select {c: (count v) from: tbig by: g})) -- 1500

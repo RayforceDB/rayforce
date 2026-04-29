@@ -1,0 +1,37 @@
+;; fold-right and scan-right — right-associative variants of fold/scan.
+;; Both functions had 0% coverage before (collection.c::ray_fold_right_fn,
+;; ::ray_scan_right_fn).
+
+;; ────────────── fold-right ──────────────
+;; (fold-right f seed v) = f(v[0], f(v[1], …, f(v[n-1], seed)…))
+;; For + with 0 it equals (fold + 0 v) since + is associative.
+(fold-right + 0 [1 2 3 4 5]) -- 15
+(fold-right + 0 []) -- 0
+(fold-right * 1 [1 2 3 4]) -- 24
+
+;; non-associative ops show fold-right vs fold-left difference
+;; fold-left:  ((-(0,1) - 2) - 3) - 4 = -10
+;; fold-right: 1 - (2 - (3 - (4 - 0))) = -2
+(fold + 0 [1 2 3 4]) -- 10
+(fold-right - 0 [1 2 3 4]) -- -2
+
+;; lambda — fold-right shape:  f(1, f(2, f(3, 0)))
+;;   f(3,0)=3,  f(2,3)=32,  f(1,32)=321
+(fold-right (fn [a b] (+ a (* b 10))) 0 [1 2 3]) -- 321
+
+;; ────────────── scan-right ──────────────
+;; (scan-right f v) = running fold from right; result has same length as v.
+;; (scan-right + [1 2 3]) = [6 5 3]   ;; suffix sums
+(scan-right + [1 2 3]) -- [6 5 3]
+(scan-right + [1 2 3 4 5]) -- [15 14 12 9 5]
+(scan-right * [1 2 3 4]) -- [24 24 12 4]
+
+;; count preserved
+(set V (rand 50 100))
+(count V) -- (count (scan-right + V))
+
+;; first element of scan-right equals fold over entire vec
+(first (scan-right + [1 2 3 4 5])) -- (sum [1 2 3 4 5])
+
+;; last element is the input's last element (single-step from rightmost)
+(last (scan-right + [1 2 3 4 5])) -- 5

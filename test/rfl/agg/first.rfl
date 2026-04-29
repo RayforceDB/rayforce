@@ -1,0 +1,33 @@
+;; Invariants for `first`.
+
+(first [10 20 30]) -- 10
+(first [42]) -- 42
+
+;; first(v) == at(v, 0)
+(set V (rand 256 10000))
+(first V) -- (at V 0)
+
+;; prepend check via concat
+(first (concat [7] [1 2 3])) -- 7
+
+;; ────────────── type preservation across all element types ──────────────
+;; Pre-fix: first on DATE/TIME/TIMESTAMP/BOOL columns dropped the type
+;; and returned the raw int representation (8766, 34200000, etc.).
+(first [1.0 2.0 3.0])              -- 1.0
+(type (first [1.0 2.0 3.0]))       -- 'f64
+(first [1h 2h 3h])                 -- 1h
+(type (first [1h 2h 3h]))          -- 'i16
+(first [1i 2i 3i])                 -- 1i
+(type (first [1i 2i 3i]))          -- 'i32
+(first ['a 'b 'c])                 -- 'a
+(type (first ['a 'b 'c]))          -- 'sym
+(first ["aa" "bb"])                -- "aa"
+(type (first ["aa" "bb"]))         -- 'str
+(first [true false])               -- true
+(type (first [true false]))        -- 'b8
+(first [2024.01.01 2024.01.02])    -- 2024.01.01
+(type (first [2024.01.01 2024.01.02])) -- 'date
+(first [09:30:00.000 10:00:00.000]) -- 09:30:00.000
+(type (first [09:30:00.000 10:00:00.000])) -- 'time
+(type (first (as 'TIMESTAMP [1 2]))) -- 'timestamp
+(type (first [0x01 0x02 0xff]))    -- 'u8

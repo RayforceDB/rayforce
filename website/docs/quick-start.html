@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quick Start — Rayforce Documentation</title>
+  <meta name="description" content="Get started with Rayforce in under 5 minutes. Build from source, start the REPL, create tables, and run queries.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link active">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Quick Start</span>
+      </div>
+
+      <h1>Quick Start</h1>
+      <p class="page-subtitle">Build Rayforce from source, start the Rayfall REPL, and run your first query in under 5 minutes.</p>
+
+      <h2>Prerequisites</h2>
+      <p>Rayforce is a pure C17 library with zero external dependencies. You need:</p>
+      <ul>
+        <li>A <strong>C17-compatible compiler</strong> &mdash; GCC 7+ or Clang 6+</li>
+        <li><strong>GNU Make</strong></li>
+        <li><strong>POSIX environment</strong> (Linux, macOS, WSL)</li>
+      </ul>
+
+      <h2>Build from Source</h2>
+      <p>Clone the repository and build:</p>
+      <pre><code>git clone https://github.com/RayforceDB/rayforce2.git
+cd rayforce2</code></pre>
+
+      <h3>Debug Build (default)</h3>
+      <p>The default build enables AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) for maximum safety during development:</p>
+      <pre><code>make</code></pre>
+
+      <h3>Release Build</h3>
+      <p>Optimized build with <code>-O3</code> and no sanitizers:</p>
+      <pre><code>make release</code></pre>
+
+      <h3>Run Tests</h3>
+      <p>Rayforce ships with a comprehensive test suite covering every subsystem:</p>
+      <pre><code><span class="hl-comment"># Run all tests</span>
+make test
+
+<span class="hl-comment"># Run a single test suite</span>
+./rayforce.test --suite /vec
+
+<span class="hl-comment"># Run tests matching a pattern</span>
+./rayforce.test --suite /lang</code></pre>
+
+      <h2>Start the REPL</h2>
+      <p>The Rayfall REPL provides an interactive environment with syntax highlighting, bracket matching, tab completion, and multi-line input:</p>
+      <pre><code>./rayforce</code></pre>
+      <p>You will see the <code>‣</code> prompt (a green triangle bullet):</p>
+      <pre><code><span class="hl-comment">‣</span></code></pre>
+
+      <h2>Your First Table</h2>
+      <p>Create a table with two columns using the <code>table</code> function. Column names are symbols (quoted identifiers), and column data are vectors:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">set</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">x</span> <span class="hl-sym">y</span>] (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-str">A</span> <span class="hl-str">B</span> <span class="hl-str">C</span>])))
+┌─────┬───────────────────────────────┐
+│  x  │               y               │
+│ i64 │              sym              │
+├─────┼───────────────────────────────┤
+│ 1   │ A                             │
+│ 2   │ B                             │
+│ 3   │ C                             │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <h2>Your First Query</h2>
+      <p>Use <code>select</code> to query the table. The <code>where:</code> clause filters rows, and you can project specific columns:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>t <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> <span class="hl-sym">x</span> <span class="hl-num">1</span>)})
+┌─────┬───────────────────────────────┐
+│  x  │               y               │
+│ i64 │              sym              │
+├─────┼───────────────────────────────┤
+│ 2   │ B                             │
+│ 3   │ C                             │
+├─────┴───────────────────────────────┤
+│ 2 rows (2 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <p>Add computed columns and aggregations:</p>
+      <pre><code><span class="hl-comment">; Select with a computed column</span>
+<span class="hl-comment">‣</span> (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>t <span class="hl-sym">x:</span>x <span class="hl-sym">x2:</span> (<span class="hl-fn">*</span> x x)})
+┌─────┬───────────────────────────────┐
+│  x  │              x2               │
+│ i64 │              i64              │
+├─────┼───────────────────────────────┤
+│ 1   │ 1                             │
+│ 2   │ 4                             │
+│ 3   │ 9                             │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘
+
+<span class="hl-comment">; Group by and aggregate</span>
+<span class="hl-comment">‣</span> (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>t <span class="hl-sym">by:</span> y <span class="hl-sym">total:</span> (<span class="hl-fn">sum</span> x)})
+┌─────┬───────────────────────────────┐
+│  y  │             total             │
+│ sym │              i64              │
+├─────┼───────────────────────────────┤
+│ A   │ 1                             │
+│ B   │ 2                             │
+│ C   │ 3                             │
+├─────┴───────────────────────────────┤
+│ 3 rows (3 shown) 2 columns (2 shown)│
+└─────────────────────────────────────┘</code></pre>
+
+      <h2>Load a CSV File</h2>
+      <p>Load data from CSV files with automatic type inference, parallel parsing, and null handling:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">set</span> data (<span class="hl-fn">.csv.read</span> <span class="hl-str">"trades.csv"</span>))
+<span class="hl-comment">‣</span> (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>data <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> price <span class="hl-num">100</span>)})</code></pre>
+
+      <h2>Run a Script</h2>
+      <p>Rayfall scripts use the <code>.rfl</code> extension. Run them directly from the command line:</p>
+      <pre><code><span class="hl-comment"># Run an example script</span>
+./rayforce examples/rfl/pivot.rfl
+
+<span class="hl-comment"># Run your own script</span>
+./rayforce my-analysis.rfl</code></pre>
+
+      <h2>REPL Commands</h2>
+      <p>The REPL supports several built-in commands:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Command</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>:help</code></td><td>Show available commands</td></tr>
+          <tr><td><code>:timeit expr</code></td><td>Benchmark an expression</td></tr>
+          <tr><td><code>:env</code></td><td>List all global bindings</td></tr>
+          <tr><td><code>:clear</code></td><td>Clear the screen</td></tr>
+          <tr><td><code>:quit</code></td><td>Exit the REPL</td></tr>
+        </tbody>
+      </table>
+
+      <h2>What's Next</h2>
+      <ul>
+        <li><a href="rayfall-syntax.html"><strong>Syntax &amp; Types</strong></a> &mdash; Learn the full Rayfall language</li>
+        <li><a href="rayfall-functions.html"><strong>Functions Reference</strong></a> &mdash; Browse all 120+ built-in functions</li>
+        <li><a href="rayfall-functions.html#joins"><strong>Joins</strong></a> &mdash; Left joins, inner joins, window joins, and as-of joins</li>
+      </ul>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        
+        <a href="tutorial.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Getting Started Tutorial</span></a>
+      </div>
+        <a href="tutorial.html" class="docs-nav-link next">
+          <span class="docs-nav-label">Next</span>
+          <span class="docs-nav-title">Tutorial &rarr;</span>
+        </a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

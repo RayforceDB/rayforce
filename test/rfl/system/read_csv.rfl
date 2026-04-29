@@ -1,0 +1,19 @@
+;; Ported from test_lang_rf.inc::test_rf_read_csv.
+;; Rayfall's str-pool hits "error: limit" when raze/fold accumulates
+;; ~1000 strings, so we shell out via .sys.exec to write the 20k-row
+;; fixture — the test target is the CSV reader, not the fixture writer.
+;;
+;; Each .sys.exec is asserted to return 0 so a stale CSV left behind
+;; by an interrupted run can't false-pass the count assertion.
+
+;; scrub any leftover fixture from a previous run (rm -f is no-op if absent)
+(.sys.exec "rm -f rf_test_syms.csv") -- 0
+
+;; write fresh fixture — exit code checked so silent write failure
+;; (awk missing, disk full, etc.) can't leave the count reading an
+;; older file.
+(.sys.exec "awk 'BEGIN{print \"id,sym\"; for(i=0;i<20000;i++) printf(\"%d,s%d\\n\",i,i)}' > rf_test_syms.csv") -- 0
+
+(count (.csv.read [I64 SYMBOL] "rf_test_syms.csv")) -- 20000
+
+(.sys.exec "rm -f rf_test_syms.csv") -- 0

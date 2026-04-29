@@ -1,0 +1,15 @@
+;; Invariants for `sect` — set intersection.
+
+(sect [1 2 3 4] [3 4 5 6]) -- [3 4]
+(sect [1 2 3] []) -- []
+(sect [] [1 2]) -- []
+
+;; elements of sect are in both inputs
+(set A [1 2 3 4 5])
+(set B [3 4 5 6 7])
+(set S (sect A B))
+(count S) -- (sum (in S A))
+(count S) -- (sum (in S B))
+
+;; idempotent
+(sect [1 2 3] [1 2 3]) -- [1 2 3]

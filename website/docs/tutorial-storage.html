@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Data Loading &amp; Storage Tutorial — Rayforce Documentation</title>
+  <meta name="description" content="Tutorial: load CSV files, explore data, filter, serialize, use splayed tables, and export results with Rayfall.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link active">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Data Loading &amp; Storage</span>
+      </div>
+
+      <h1>Data Loading &amp; Storage Tutorial</h1>
+      <p class="page-subtitle">Read CSV files, explore and filter data, serialize tables to binary, persist with splayed storage, and export results &mdash; all from the Rayfall REPL.</p>
+
+      <p>This tutorial assumes you have <a href="quick-start.html">built Rayforce</a> and can start the REPL with <code>./rayforce</code>. We use <code>/tmp/rayforce-test/</code> as the working directory for all file operations.</p>
+
+      <!-- Step 1 -->
+      <h2 id="reading-csv">1. Reading CSV Files</h2>
+      <p>Create a CSV file on disk, then load it with <code>.csv.read</code>. The first row is treated as column headers, and types are inferred automatically:</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">.csv.read</span> <span class="hl-str">"/tmp/rayforce-test/trades.csv"</span>))
+trades</code></pre>
+      <p>Assuming <code>trades.csv</code> contains:</p>
+      <pre><code>Symbol,Price,Qty
+AAPL,150.5,100
+GOOG,280.0,200
+MSFT,420.0,50
+AAPL,155.0,300
+GOOG,275.5,150</code></pre>
+      <p>Output:</p>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474; Price &#9474;        Qty         &#9474;
+&#9474;  sym   &#9474;  f64  &#9474;        i64         &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; AAPL   &#9474; 150.5 &#9474; 100                &#9474;
+&#9474; GOOG   &#9474; 280.0 &#9474; 200                &#9474;
+&#9474; MSFT   &#9474; 420.0 &#9474; 50                 &#9474;
+&#9474; AAPL   &#9474; 155.0 &#9474; 300                &#9474;
+&#9474; GOOG   &#9474; 275.5 &#9474; 150                &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 5 rows (5 shown) 3 columns (3 shown)&#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>String-like columns (e.g. ticker symbols, names) are loaded as <code>sym</code> (dictionary-encoded symbols). Numeric columns are inferred as <code>i64</code> or <code>f64</code> depending on whether any value has a decimal point.</p>
+
+      <p>You can also create tables in-memory and skip CSV entirely:</p>
+      <pre><code>(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Symbol</span> <span class="hl-sym">Price</span> <span class="hl-sym">Qty</span>]
+  (<span class="hl-fn">list</span>
+    [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span>]
+    [<span class="hl-num">150.5</span> <span class="hl-num">280.0</span> <span class="hl-num">420.0</span> <span class="hl-num">155.0</span> <span class="hl-num">275.5</span>]
+    [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span> <span class="hl-num">300</span> <span class="hl-num">150</span>])))</code></pre>
+
+      <!-- Step 2 -->
+      <h2 id="exploring-data">2. Exploring Data</h2>
+      <p>Use <code>count</code>, <code>type</code>, and <code>show</code> to inspect a loaded table:</p>
+      <pre><code>(<span class="hl-fn">count</span> trades)</code></pre>
+      <pre><code>5</code></pre>
+
+      <pre><code>(<span class="hl-fn">type</span> trades)</code></pre>
+      <pre><code>TABLE</code></pre>
+
+      <p><code>show</code> limits the display to the first <em>n</em> rows &mdash; useful for large datasets:</p>
+      <pre><code>(<span class="hl-fn">show</span> trades <span class="hl-num">3</span>)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474; Price &#9474;        Qty         &#9474;
+&#9474;  sym   &#9474;  f64  &#9474;        i64         &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; AAPL   &#9474; 150.5 &#9474; 100                &#9474;
+&#9474; GOOG   &#9474; 280.0 &#9474; 200                &#9474;
+&#9474; MSFT   &#9474; 420.0 &#9474; 50                 &#9474;
+&#9474; AAPL   &#9474; 155.0 &#9474; 300                &#9474;
+&#9474; GOOG   &#9474; 275.5 &#9474; 150                &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 5 rows (5 shown) 3 columns (3 shown)&#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+
+      <!-- Step 3 -->
+      <h2 id="filtering">3. Filtering Rows</h2>
+      <p>Use <code>select</code> with a <code>where:</code> clause to filter rows. Find all trades where the price exceeds 200:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>trades <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> <span class="hl-sym">Price</span> <span class="hl-num">200.0</span>)})</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474; Price &#9474;        Qty         &#9474;
+&#9474;  sym   &#9474;  f64  &#9474;        i64         &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; GOOG   &#9474; 280.0 &#9474; 200                &#9474;
+&#9474; MSFT   &#9474; 420.0 &#9474; 50                 &#9474;
+&#9474; GOOG   &#9474; 275.5 &#9474; 150                &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 3 rows (3 shown) 3 columns (3 shown)&#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+
+      <!-- Step 4 -->
+      <h2 id="aggregation">4. Grouping and Aggregation</h2>
+      <p>Group by a column and compute aggregates with <code>by:</code>:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>trades <span class="hl-sym">by:</span> <span class="hl-sym">Symbol</span>
+         <span class="hl-sym">total_qty:</span> (<span class="hl-fn">sum</span> <span class="hl-sym">Qty</span>)
+         <span class="hl-sym">avg_price:</span> (<span class="hl-fn">avg</span> <span class="hl-sym">Price</span>)})</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474; total_qty &#9474;   avg_price    &#9474;
+&#9474;  sym   &#9474;    i64    &#9474;      f64       &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; AAPL   &#9474; 400       &#9474; 152.75         &#9474;
+&#9474; GOOG   &#9474; 350       &#9474; 277.75         &#9474;
+&#9474; MSFT   &#9474; 50        &#9474; 420.0          &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 3 rows (3 shown) 3 columns (3 shown)&#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>Available aggregation functions: <code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>first</code>, <code>last</code>, <code>med</code>.</p>
+
+      <!-- Step 5 -->
+      <h2 id="serialization">5. Binary Serialization</h2>
+      <p>Use <code>ser</code> to serialize any Rayforce object to a compact binary format (a U8 byte vector), and <code>de</code> to deserialize it back. This is useful for caching, IPC, or storing intermediate results:</p>
+      <pre><code>(<span class="hl-kw">set</span> bytes (<span class="hl-fn">ser</span> trades))
+(<span class="hl-fn">count</span> bytes)</code></pre>
+      <pre><code>197</code></pre>
+      <p>The entire table is encoded in 197 bytes. Deserialize with <code>de</code>:</p>
+      <pre><code>(<span class="hl-kw">set</span> restored (<span class="hl-fn">de</span> bytes))
+restored</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474; Price &#9474;        Qty         &#9474;
+&#9474;  sym   &#9474;  f64  &#9474;        i64         &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; AAPL   &#9474; 150.5 &#9474; 100                &#9474;
+&#9474; GOOG   &#9474; 280.0 &#9474; 200                &#9474;
+&#9474; MSFT   &#9474; 420.0 &#9474; 50                 &#9474;
+&#9474; AAPL   &#9474; 155.0 &#9474; 300                &#9474;
+&#9474; GOOG   &#9474; 275.5 &#9474; 150                &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 5 rows (5 shown) 3 columns (3 shown)&#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>The deserialized table is identical to the original &mdash; all types, column names, and values are preserved.</p>
+
+      <!-- Step 6 -->
+      <h2 id="splayed-tables">6. Splayed Tables</h2>
+      <p>Splayed tables store each column as a separate file on disk. This is Rayforce's native columnar format &mdash; faster than CSV and preserving exact types. Use <code>set-splayed</code> to save and <code>get-splayed</code> to load:</p>
+      <pre><code>(<span class="hl-fn">set-splayed</span> <span class="hl-str">"/tmp/rayforce-test/trades_db"</span> trades)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474; Price &#9474;        Qty         &#9474;
+&#9474;  sym   &#9474;  f64  &#9474;        i64         &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; AAPL   &#9474; 150.5 &#9474; 100                &#9474;
+&#9474; GOOG   &#9474; 280.0 &#9474; 200                &#9474;
+&#9474; MSFT   &#9474; 420.0 &#9474; 50                 &#9474;
+&#9474; AAPL   &#9474; 155.0 &#9474; 300                &#9474;
+&#9474; GOOG   &#9474; 275.5 &#9474; 150                &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 5 rows (5 shown) 3 columns (3 shown)&#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>On disk, this creates one file per column plus a symbol table:</p>
+      <pre><code>/tmp/rayforce-test/trades_db/
+  Symbol    Price    Qty    sym    sym.lk</code></pre>
+      <p>Load it back in a new session (or the same one) with <code>get-splayed</code>:</p>
+      <pre><code>(<span class="hl-kw">set</span> loaded (<span class="hl-fn">get-splayed</span> <span class="hl-str">"/tmp/rayforce-test/trades_db"</span>))
+loaded</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474; Price &#9474;        Qty         &#9474;
+&#9474;  sym   &#9474;  f64  &#9474;        i64         &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; AAPL   &#9474; 150.5 &#9474; 100                &#9474;
+&#9474; GOOG   &#9474; 280.0 &#9474; 200                &#9474;
+&#9474; MSFT   &#9474; 420.0 &#9474; 50                 &#9474;
+&#9474; AAPL   &#9474; 155.0 &#9474; 300                &#9474;
+&#9474; GOOG   &#9474; 275.5 &#9474; 150                &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 5 rows (5 shown) 3 columns (3 shown)&#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>All types are preserved exactly &mdash; <code>f64</code> stays <code>f64</code>, <code>sym</code> stays <code>sym</code>. No type inference needed on reload.</p>
+
+      <!-- Step 7 -->
+      <h2 id="writing-csv">7. Writing CSV</h2>
+      <p>Export any table to CSV with <code>.csv.write</code>. The return value <code>0</code> indicates success:</p>
+      <pre><code>(<span class="hl-kw">set</span> big (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>trades <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> <span class="hl-sym">Price</span> <span class="hl-num">200.0</span>)}))
+(<span class="hl-fn">.csv.write</span> big <span class="hl-str">"/tmp/rayforce-test/big_trades.csv"</span>)</code></pre>
+      <pre><code>0</code></pre>
+      <p>Verify by reading it back:</p>
+      <pre><code>(<span class="hl-fn">.csv.read</span> <span class="hl-str">"/tmp/rayforce-test/big_trades.csv"</span>)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474; Price &#9474;        Qty         &#9474;
+&#9474;  sym   &#9474;  f64  &#9474;        i64         &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; GOOG   &#9474; 280.0 &#9474; 200                &#9474;
+&#9474; MSFT   &#9474; 420.0 &#9474; 50                 &#9474;
+&#9474; GOOG   &#9474; 275.5 &#9474; 150                &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 3 rows (3 shown) 3 columns (3 shown)&#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+      <p>Note: float values written without a fractional part (e.g. <code>280.0</code>) may be read back as <code>i64</code> since the CSV reader infers the narrowest fitting type. Use splayed tables when exact type preservation matters.</p>
+
+      <!-- Step 8 -->
+      <h2 id="complete-example">8. Complete Example</h2>
+      <p>End-to-end workflow: create data, save as CSV, reload, filter, serialize, deserialize, and verify:</p>
+      <pre><code><span class="hl-comment">; 1. Create a table</span>
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">Symbol</span> <span class="hl-sym">Price</span> <span class="hl-sym">Qty</span>]
+  (<span class="hl-fn">list</span>
+    [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span>]
+    [<span class="hl-num">150.5</span> <span class="hl-num">280.0</span> <span class="hl-num">420.0</span> <span class="hl-num">155.0</span> <span class="hl-num">275.5</span>]
+    [<span class="hl-num">100</span> <span class="hl-num">200</span> <span class="hl-num">50</span> <span class="hl-num">300</span> <span class="hl-num">150</span>])))
+
+<span class="hl-comment">; 2. Save to CSV</span>
+(<span class="hl-fn">.csv.write</span> trades <span class="hl-str">"/tmp/rayforce-test/trades.csv"</span>)
+
+<span class="hl-comment">; 3. Reload from CSV</span>
+(<span class="hl-kw">set</span> loaded (<span class="hl-fn">.csv.read</span> <span class="hl-str">"/tmp/rayforce-test/trades.csv"</span>))
+
+<span class="hl-comment">; 4. Filter: only trades above 200</span>
+(<span class="hl-kw">set</span> big (<span class="hl-kw">select</span> {<span class="hl-sym">from:</span>loaded <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> <span class="hl-sym">Price</span> <span class="hl-num">200.0</span>)}))
+
+<span class="hl-comment">; 5. Serialize to binary</span>
+(<span class="hl-kw">set</span> bytes (<span class="hl-fn">ser</span> big))
+
+<span class="hl-comment">; 6. Deserialize and verify</span>
+(<span class="hl-kw">set</span> restored (<span class="hl-fn">de</span> bytes))
+(<span class="hl-fn">count</span> restored)
+
+<span class="hl-comment">; 7. Save as splayed table for fast reload</span>
+(<span class="hl-fn">set-splayed</span> <span class="hl-str">"/tmp/rayforce-test/big_db"</span> big)
+
+<span class="hl-comment">; 8. Load splayed table back</span>
+(<span class="hl-fn">get-splayed</span> <span class="hl-str">"/tmp/rayforce-test/big_db"</span>)</code></pre>
+      <pre><code>&#9484;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9516;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+&#9474; Symbol &#9474; Price &#9474;        Qty         &#9474;
+&#9474;  sym   &#9474;  f64  &#9474;        i64         &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9532;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; GOOG   &#9474; 280.0 &#9474; 200                &#9474;
+&#9474; MSFT   &#9474; 420.0 &#9474; 50                 &#9474;
+&#9474; GOOG   &#9474; 275.5 &#9474; 150                &#9474;
+&#9500;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9524;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9508;
+&#9474; 3 rows (3 shown) 3 columns (3 shown)&#9474;
+&#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9496;</code></pre>
+
+      <h2 id="format-comparison">Storage Format Comparison</h2>
+      <table>
+        <thead>
+          <tr><th>Format</th><th>Function</th><th>Preserves Types</th><th>Best For</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>CSV</td><td><code>.csv.read</code> / <code>.csv.write</code></td><td>No (re-inferred on load)</td><td>Interoperability, human-readable data</td></tr>
+          <tr><td>Binary</td><td><code>ser</code> / <code>de</code></td><td>Yes</td><td>Caching, IPC, embedding in messages</td></tr>
+          <tr><td>Splayed</td><td><code>set-splayed</code> / <code>get-splayed</code></td><td>Yes</td><td>Persistent storage, fast reload, mmap</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="next-steps">Next Steps</h2>
+      <ul>
+        <li><a href="tutorial.html"><strong>Getting Started Tutorial</strong></a> &mdash; Tables, filtering, joins, pivots, and sorting</li>
+        <li><a href="guide-storage.html"><strong>Data Persistence</strong></a> &mdash; Partitioned storage and advanced file I/O</li>
+        <li><a href="guide-analytics.html"><strong>Analytics Cookbook</strong></a> &mdash; Time-series, top-N, ASOF joins</li>
+        <li><a href="rayfall-functions.html"><strong>Functions Reference</strong></a> &mdash; Complete list of all built-in functions</li>
+      </ul>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="tutorial-datalog.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Datalog Tutorial</span></a>
+        <a href="tutorial-analytics.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Advanced Analytics Tutorial</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

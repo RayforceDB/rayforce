@@ -1,0 +1,13 @@
+;; like glob patterns — beyond the basic `*` and `?`.
+
+(like "foobar" "foo*") -- true
+(like "foobar" "*bar") -- true
+(like "foobar" "*oo*") -- true
+(like "foobar" "f?obar") -- true
+(like "foobar" "f??bar") -- true
+(like "foobar" "f???bar") -- false
+(like "" "*") -- true
+(like "" "?") -- false
+(like "abc" "abc") -- true
+(like "abc" "abcd") -- false
+(like "abcd" "abc") -- false

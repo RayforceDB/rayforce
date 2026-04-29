@@ -1,0 +1,98 @@
+;; DAG executor binary ops — exercise expr.c::expr_exec_binary across
+;; types and operator families.  Derived columns in (select {x: (op a b) ...})
+;; route through the DAG, unlike top-level (op a b) which goes through
+;; the eval-time atomic kernel.
+
+;; ────────────── int arithmetic ──────────────
+(set Ti (table [a b] (list [1 2 3 4 5] [10 20 30 40 50])))
+
+(sum (at (select {x: (+ a b) from: Ti}) 'x)) -- 165
+(sum (at (select {x: (- b a) from: Ti}) 'x)) -- 135
+(sum (at (select {x: (* a b) from: Ti}) 'x)) -- 550
+;; DAG promotes int/int division to f64 (unlike eval-path floor div)
+(sum (at (select {x: (/ b a) from: Ti}) 'x)) -- 50.0
+(sum (at (select {x: (% b a) from: Ti}) 'x)) -- 0
+
+;; with scalar broadcast on RHS
+(sum (at (select {x: (* a 10) from: Ti}) 'x)) -- 150
+(sum (at (select {x: (+ a 100) from: Ti}) 'x)) -- 515
+
+;; ────────────── float arithmetic ──────────────
+(set Tf (table [a b] (list [1.0 2.0 3.0 4.0] [0.5 1.5 2.5 3.5])))
+
+;; (1.0+0.5) + (2.0+1.5) + (3.0+2.5) + (4.0+3.5) = 18.0
+(sum (at (select {x: (+ a b) from: Tf}) 'x)) -- 18.0
+;; (1*0.5)+(2*1.5)+(3*2.5)+(4*3.5) = 0.5+3+7.5+14 = 25.0
+(sum (at (select {x: (* a b) from: Tf}) 'x)) -- 25.0
+;; (1-0.5)+(2-1.5)+(3-2.5)+(4-3.5) = 4 * 0.5 = 2.0
+(sum (at (select {x: (- a b) from: Tf}) 'x)) -- 2.0
+
+;; ────────────── narrow-int arithmetic (i16/i32) ──────────────
+;; FOUND DURING THIS SESSION: DAG path WIDENS narrow-int arithmetic to
+;; i64, while the eval-path kernel preserves type:
+;;   eval: (+ 5h 3h) → 8h   (i16)
+;;   DAG : (select x: (+ a b) from: t-with-I16-cols) → I64 column
+;; Pinning the current DAG behaviour so a future fix surfaces here.
+(set Th (table [a b] (list (as 'I16 [1 2 3 4]) (as 'I16 [10 20 30 40]))))
+(sum (at (select {x: (+ a b) from: Th}) 'x)) -- 110
+(type (at (select {x: (+ a b) from: Th}) 'x)) -- 'I64
+
+(set Tj (table [a b] (list (as 'I32 [1 2 3]) (as 'I32 [100 200 300]))))
+(sum (at (select {x: (* a b) from: Tj}) 'x)) -- 1400
+(type (at (select {x: (* a b) from: Tj}) 'x)) -- 'I64
+
+;; ────────────── comparison: bool result vector ──────────────
+(set Tc (table [a b] (list [1 2 3 4 5] [3 3 3 3 3])))
+(sum (as 'I64 (at (select {x: (> a b) from: Tc}) 'x))) -- 2
+(sum (as 'I64 (at (select {x: (< a b) from: Tc}) 'x))) -- 2
+(sum (as 'I64 (at (select {x: (== a b) from: Tc}) 'x))) -- 1
+(sum (as 'I64 (at (select {x: (!= a b) from: Tc}) 'x))) -- 4
+(sum (as 'I64 (at (select {x: (>= a b) from: Tc}) 'x))) -- 3
+(sum (as 'I64 (at (select {x: (<= a b) from: Tc}) 'x))) -- 3
+
+;; ────────────── compound where: AND / OR with derived comparisons ──────────────
+(set Tw (table [a b] (list [1 2 3 4 5 6 7 8] [10 20 30 40 50 60 70 80])))
+(count (select {from: Tw where: (and (> a 2) (< b 60))})) -- 3
+(count (select {from: Tw where: (or  (== a 1) (== a 8))})) -- 2
+
+;; ────────────── filter with comparison reuses bool col downstream ──────────────
+;; (select x: (* a b) where: (> a 4) from: t) — DAG fuses filter + arithmetic
+;; rows with a in {5,6,7,8}; products 250+360+490+640 = 1740
+(sum (at (select {x: (* a b) from: Tw where: (> a 4)}) 'x)) -- 1740
+
+;; ────────────── float comparison (NaN-aware DAG path) ──────────────
+(set Tnan (table [a b] (list [1.0 2.0 0Nf 3.0] [1.0 2.0 2.0 0Nf])))
+(sum (as 'I64 (at (select {x: (== a b) from: Tnan}) 'x))) -- 2
+(sum (as 'I64 (at (select {x: (!= a b) from: Tnan}) 'x))) -- 2
+
+;; ────────────── variadic AND/OR in WHERE — DAG auto-folds ──────────────
+;; PR #8 turned `and`/`or` into eval-time variadic, dropping their
+;; binary OP_AND/OP_OR opcode registration.  `compile_expr_dag` still
+;; recognises 2-arg forms via `resolve_binary_dag` but n>=4 used to
+;; bail out with "WHERE predicate not supported by DAG compiler" —
+;; outright correctness regression, not the silent perf cliff Anton
+;; flagged.  query.c now folds variadic AND/OR into a balanced binary
+;; tree before lowering, so 3+, 4+, ... -arg forms compile to the same
+;; fused-expr execution as the hand-nested equivalent.
+(set Tand (table [a b c d] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100] [100 200 300 400 500 600 700 800 900 1000] [0 1 0 1 0 1 0 1 0 1])))
+
+;; 3-arg AND in WHERE — same result as nested (and (and ...) ...)
+(count (select {from: Tand where: (and (> a 2) (> b 20) (> c 200))})) -- 8
+(count (select {from: Tand where: (and (and (> a 2) (> b 20)) (> c 200))})) -- 8
+
+;; 4-arg AND in WHERE — same result as nested
+(count (select {from: Tand where: (and (> a 2) (> b 20) (> c 200) (== d 1))})) -- 4
+(count (select {from: Tand where: (and (and (and (> a 2) (> b 20)) (> c 200)) (== d 1))})) -- 4
+
+;; 3-arg OR in WHERE
+(count (select {from: Tand where: (or (== a 1) (== a 5) (== a 10))})) -- 3
+
+;; 5-arg OR in WHERE — every odd index
+(count (select {from: Tand where: (or (== a 1) (== a 3) (== a 5) (== a 7) (== a 9))})) -- 5
+
+;; nested AND/OR mix — `(and (or ...) (or ...))`
+(count (select {from: Tand where: (and (or (== a 1) (== a 3) (== a 5)) (or (== d 0) (== d 1)))})) -- 3
+
+;; correctness pin: variadic `and` must agree with composing two selects
+;; (fold semantics is real conjunction).
+(count (select {from: Tand where: (and (> a 2) (> b 20) (> c 200))})) -- (count (select {from: (select {from: Tand where: (and (> a 2) (> b 20))}) where: (> c 200)}))

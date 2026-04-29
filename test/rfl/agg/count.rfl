@@ -1,0 +1,14 @@
+;; Invariants for `count`.
+
+(count [1 2 3]) -- 3
+(count []) -- 0
+(count "hello") -- 5
+(count 42) -- 1
+
+;; concat additive: count(a ++ b) == count(a) + count(b)
+(set A (rand 50 1000))
+(set B (rand 80 1000))
+(count (concat A B)) -- (+ (count A) (count B))
+
+;; til n has count n
+(count (til 123)) -- 123

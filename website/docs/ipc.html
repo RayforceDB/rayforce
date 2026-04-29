@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IPC &amp; Serialization — Rayforce Documentation</title>
+  <meta name="description" content="Rayforce binary serialization format: serialize and deserialize any ray_t object with ser/de builtins. Wire format reference and supported types.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link active">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>IPC &amp; Serialization</span>
+      </div>
+
+      <h1>IPC &amp; Serialization</h1>
+      <p class="page-subtitle">TCP client-server IPC with binary serialization, delta compression, and sync/async messaging.</p>
+
+      <div class="info-box">
+        <strong>New to IPC?</strong> Start with the <a href="guide-ipc.html">IPC Guide</a> for a hands-on walkthrough of server setup, remote queries, authentication, and multi-process patterns. This page is a technical reference.
+      </div>
+
+      <h2>Overview</h2>
+      <p>Rayforce provides a complete IPC system for client-server communication. A server listens on a TCP port, accepts connections, and evaluates queries sent by clients. The wire format uses the same compact binary serialization for all Rayforce types, with automatic delta/RLE compression for large payloads.</p>
+
+      <h2 id="server-mode">Server Mode</h2>
+      <p>Start Rayforce as an IPC server with the <code>-p</code> flag:</p>
+      <pre><code><span class="hl-comment"># Start server on port 5000</span>
+./rayforce -p 5000
+
+<span class="hl-comment"># Run a script first, then serve</span>
+./rayforce -p 5000 init.rfl
+
+<span class="hl-comment"># Server with authentication required</span>
+./rayforce -p 5000 -u mypassword
+
+<span class="hl-comment"># Server with authentication + read-only restriction</span>
+./rayforce -p 5000 -U mypassword</code></pre>
+
+      <p>The server runs in the same thread as the REPL. IPC connections are processed between REPL inputs. When piped input is exhausted, the server continues running until interrupted.</p>
+
+      <h2 id="handshake">Handshake</h2>
+      <p>Every IPC connection opens with a 2-byte exchange before any framed payload flows: <code>{ wire_version, auth_flag }</code>. The client sends its <code>RAY_SERDE_WIRE_VERSION</code> and a zero; the server replies with its own wire version and <code>0x01</code> if password auth is required, <code>0x00</code> otherwise. Either side will drop the connection if the peer's first byte doesn't match — this is what prevents a new peer from ever writing a newer-format payload to a peer that couldn't parse it.</p>
+
+      <h2 id="authentication">Authentication</h2>
+      <p>The <code>-u</code> and <code>-U</code> flags enable password authentication for IPC connections. Clients must provide valid credentials during the handshake or the connection is rejected.</p>
+
+      <h3>-u (password required)</h3>
+      <pre><code><span class="hl-comment"># Server: require password</span>
+./rayforce -p 5000 -u secret123
+
+<span class="hl-comment"># Client: connect with credentials</span>
+(<span class="hl-kw">set</span> h (<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000:admin:secret123"</span>))
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(+ 1 2)"</span>)
+<span class="hl-comment">;; =&gt; 3</span></code></pre>
+
+      <p>All clients must authenticate. The username field is transmitted but not validated &mdash; only the password is checked.</p>
+
+      <h3>-U (password + restricted mode)</h3>
+      <pre><code><span class="hl-comment"># Server: require password, restrict IPC to read-only</span>
+./rayforce -p 5000 -U secret123</code></pre>
+
+      <p>In restricted mode, specific builtins that write files, mutate state, or control the server process are blocked for IPC connections. Queries, aggregations, and read-only operations are allowed. The following builtins are blocked:</p>
+
+      <table>
+        <thead>
+          <tr><th>Category</th><th>Blocked Builtins</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Mutation</td><td><code>set</code>, <code>del</code>, <code>update</code>, <code>insert</code>, <code>upsert</code>, <code>modify</code></td></tr>
+          <tr><td>File writes</td><td><code>write</code>, <code>.csv.write</code>, <code>load</code>, <code>set-splayed</code></td></tr>
+          <tr><td>File reads</td><td><code>read</code>, <code>.csv.read</code></td></tr>
+          <tr><td>System</td><td><code>.sys.exec</code>, <code>.os.getenv</code>, <code>.os.setenv</code>, <code>exit</code></td></tr>
+          <tr><td>IPC chaining</td><td><code>.ipc.open</code>, <code>.ipc.close</code>, <code>.ipc.send</code></td></tr>
+        </tbody>
+      </table>
+
+      <div class="info-box">
+        <strong>Scope.</strong> Restricted mode blocks the builtins listed above. It does not provide full sandboxing &mdash; <code>select</code>, <code>get-splayed</code>, <code>get-parted</code>, and other read operations on already-loaded data or splayed tables remain available.
+      </div>
+
+      <p>Attempting a restricted operation returns an <code>"access"</code> error:</p>
+      <pre><code><span class="hl-comment">;; On a -U server:</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(set x 42)"</span>)
+<span class="hl-comment">;; =&gt; error: access — restricted</span>
+
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(+ 1 2)"</span>)
+<span class="hl-comment">;; =&gt; 3  (queries still work)</span></code></pre>
+
+      <div class="info-box">
+        <strong>Security note.</strong> Restriction applies to all dispatch paths including higher-order functions. <code>(map .sys.exec ["echo hi"])</code> is also blocked in restricted mode.
+      </div>
+
+      <h2 id="client-builtins">Client Builtins</h2>
+      <p>Connect to a running server and send queries from Rayfall:</p>
+
+      <h3>.ipc.open</h3>
+      <pre><code><span class="hl-comment">;; Connect to a server (no auth)</span>
+(<span class="hl-kw">set</span> h (<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000"</span>))
+<span class="hl-comment">;; =&gt; 0  (connection handle)</span>
+
+<span class="hl-comment">;; Connect with credentials (when server uses -u or -U)</span>
+(<span class="hl-kw">set</span> h (<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000:admin:secret123"</span>))
+<span class="hl-comment">;; =&gt; 0  (connection handle)</span></code></pre>
+      <p>The format is <code>"host:port"</code> for unauthenticated connections, or <code>"host:port:user:password"</code> when the server requires authentication. If the server requires auth and no credentials are provided, <code>.ipc.open</code> returns an <code>"access"</code> error.</p>
+
+      <h3>.ipc.send</h3>
+      <p><code>.ipc.send</code> sends any serializable value to the server and returns the result. The server&rsquo;s behavior depends on the payload type:</p>
+
+      <table>
+        <thead>
+          <tr><th>Payload type</th><th>Server behavior</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>String</td><td>Parsed as Rayfall code and evaluated; result returned</td></tr>
+          <tr><td>Any other value</td><td>Evaluated directly (identity for data, execution for expressions); result returned</td></tr>
+        </tbody>
+      </table>
+
+      <h4>String queries</h4>
+      <pre><code><span class="hl-comment">;; Arithmetic — server parses and evaluates the string</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(+ 1 2)"</span>)
+<span class="hl-comment">;; =&gt; 3</span>
+
+<span class="hl-comment">;; Look up a server-side variable</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"trades"</span>)
+<span class="hl-comment">;; =&gt; &lt;table&gt;</span>
+
+<span class="hl-comment">;; Remote select with filter, sort, limit</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(select {from: trades where: (&gt; price 100) desc: 'price take: 10})"</span>)
+<span class="hl-comment">;; =&gt; top 10 most expensive trades</span>
+
+<span class="hl-comment">;; Aggregation by group</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(select {from: trades by: sym total: (sum qty) avg_px: (avg price)})"</span>)
+<span class="hl-comment">;; =&gt; per-symbol totals</span></code></pre>
+
+      <h4>Expression payloads</h4>
+      <p>Non-string values are evaluated directly on the server via <code>ray_eval</code>. Construct executable expressions as lists with builtin function objects as heads. Dict literals are self-evaluating, so column references and expressions inside them are preserved unevaluated until the server processes them:</p>
+
+      <pre><code><span class="hl-comment">;; Arithmetic</span>
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> + <span class="hl-num">1</span> <span class="hl-num">2</span>))
+<span class="hl-comment">;; =&gt; 3</span>
+
+<span class="hl-comment">;; Select with filter — dict stays unevaluated, select resolves columns</span>
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> select {<span class="hl-sym">from:</span> trades <span class="hl-sym">where:</span> (&gt; price <span class="hl-num">200</span>)}))
+<span class="hl-comment">;; =&gt; filtered trades table</span>
+
+<span class="hl-comment">;; Aggregation by group</span>
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> select {<span class="hl-sym">from:</span> trades <span class="hl-sym">by:</span> sym <span class="hl-sym">total:</span> (sum qty)}))
+
+<span class="hl-comment">;; Map a lambda over server-side data</span>
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> map (<span class="hl-kw">fn</span> [x] (* x <span class="hl-num">2</span>)) (<span class="hl-fn">list</span> til <span class="hl-num">10</span>)))
+<span class="hl-comment">;; =&gt; [0 2 4 6 8 10 12 14 16 18]</span></code></pre>
+
+      <p>For dynamic queries, substitute values into the dict at construction time:</p>
+      <pre><code>(<span class="hl-kw">set</span> threshold <span class="hl-num">200</span>)
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> select {<span class="hl-sym">from:</span> trades <span class="hl-sym">where:</span> (<span class="hl-fn">list</span> &gt; (quote price) threshold)}))
+<span class="hl-comment">;; =&gt; trades where price &gt; 200</span></code></pre>
+
+      <h3>.ipc.close</h3>
+      <pre><code><span class="hl-comment">;; Close the connection</span>
+(<span class="hl-fn">.ipc.close</span> h)</code></pre>
+
+      <div class="info-box">
+        <strong>Message types.</strong> <code>.ipc.send</code> uses synchronous messaging &mdash; it blocks until the server returns a result. Asynchronous (fire-and-forget) messaging is available via the C API (<code>ray_ipc_send_async</code>).
+      </div>
+
+      <h2>Serialization with <code>ser</code></h2>
+      <p>The <code>ser</code> builtin converts any value to a binary buffer (a <code>U8</code> vector). Pass it any Rayforce value &mdash; atom, vector, list, or table:</p>
+
+      <pre><code><span class="hl-comment">;; Serialize an integer</span>
+(<span class="hl-fn">ser</span> <span class="hl-num">42</span>)
+<span class="hl-comment">;; =&gt; [0xfa 0xde 0xfa 0xce 0x02 0x00 0x00 0x00 ..]</span>
+
+<span class="hl-comment">;; Serialize a vector</span>
+(<span class="hl-fn">ser</span> (<span class="hl-fn">til</span> <span class="hl-num">10</span>))
+
+<span class="hl-comment">;; Serialize a string</span>
+(<span class="hl-fn">ser</span> <span class="hl-str">"hello"</span>)
+
+<span class="hl-comment">;; Serialize a table</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">x</span> <span class="hl-sym">y</span>] (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-sym">'A</span> <span class="hl-sym">'B</span> <span class="hl-sym">'C</span>])))
+(<span class="hl-fn">ser</span> t)</code></pre>
+
+      <p>The result is always a <code>U8</code> byte vector containing the IPC header followed by the serialized payload.</p>
+
+      <h2>Deserialization with <code>de</code></h2>
+      <p>The <code>de</code> builtin reconstructs a value from its binary representation. Compose it with <code>ser</code> for a perfect round-trip:</p>
+
+      <pre><code><span class="hl-comment">;; Round-trip an integer</span>
+(<span class="hl-fn">de</span> (<span class="hl-fn">ser</span> <span class="hl-num">42</span>))
+<span class="hl-comment">;; =&gt; 42</span>
+
+<span class="hl-comment">;; Round-trip a vector</span>
+(<span class="hl-fn">de</span> (<span class="hl-fn">ser</span> (<span class="hl-fn">til</span> <span class="hl-num">10</span>)))
+<span class="hl-comment">;; =&gt; [0 1 2 3 4 5 6 7 8 9]</span>
+
+<span class="hl-comment">;; Round-trip a string</span>
+(<span class="hl-fn">de</span> (<span class="hl-fn">ser</span> <span class="hl-str">"hello"</span>))
+<span class="hl-comment">;; =&gt; "hello"</span>
+
+<span class="hl-comment">;; Round-trip a float</span>
+(<span class="hl-fn">de</span> (<span class="hl-fn">ser</span> <span class="hl-num">3.14</span>))
+<span class="hl-comment">;; =&gt; 3.14</span>
+
+<span class="hl-comment">;; Round-trip a boolean</span>
+(<span class="hl-fn">de</span> (<span class="hl-fn">ser</span> <span class="hl-num">1b</span>))
+<span class="hl-comment">;; =&gt; 1</span>
+
+<span class="hl-comment">;; Round-trip a list of mixed types</span>
+(<span class="hl-fn">de</span> (<span class="hl-fn">ser</span> (<span class="hl-fn">list</span> <span class="hl-num">1</span> <span class="hl-str">"two"</span> <span class="hl-num">3.0</span>)))
+<span class="hl-comment">;; =&gt; (1 "two" 3.0)</span>
+
+<span class="hl-comment">;; Round-trip a table</span>
+(<span class="hl-kw">set</span> t (<span class="hl-fn">table</span> [<span class="hl-sym">x</span> <span class="hl-sym">y</span>] (<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-sym">'A</span> <span class="hl-sym">'B</span> <span class="hl-sym">'C</span>])))
+(<span class="hl-fn">de</span> (<span class="hl-fn">ser</span> t))
+<span class="hl-comment">;; =&gt; the same 3-row table with columns x (i64) and y (sym)</span></code></pre>
+
+      <h2>Wire Format</h2>
+      <p>Every serialized payload begins with a 16-byte <code>ray_ipc_header_t</code> header, followed by the serialized object bytes. The header layout:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Offset</th>
+            <th>Size</th>
+            <th>Field</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>0</td><td>4 bytes</td><td><code>prefix</code></td><td>Magic bytes <code>0xcefadefa</code> &mdash; identifies Rayforce binary data</td></tr>
+          <tr><td>4</td><td>1 byte</td><td><code>version</code></td><td>Wire-format version (<code>RAY_SERDE_WIRE_VERSION</code>, currently <code>3</code>). Decoupled from <code>RAY_VERSION_MAJOR</code>. A receiver that sees a different byte here rejects the payload with a <code>version</code> error instead of attempting to parse it.</td></tr>
+          <tr><td>5</td><td>1 byte</td><td><code>flags</code></td><td>Bit 0: compressed (0 = no, 1 = yes)</td></tr>
+          <tr><td>6</td><td>1 byte</td><td><code>endian</code></td><td>Endianness: <code>0</code> = little-endian</td></tr>
+          <tr><td>7</td><td>1 byte</td><td><code>msgtype</code></td><td>Message type: <code>0</code> = async, <code>1</code> = sync, <code>2</code> = response</td></tr>
+          <tr><td>8</td><td>8 bytes</td><td><code>size</code></td><td>Payload size in bytes (<code>int64</code>)</td></tr>
+        </tbody>
+      </table>
+
+      <p>The corresponding C struct:</p>
+      <pre><code><span class="hl-kw">typedef struct</span> ray_ipc_header_t {
+    uint32_t prefix;     <span class="hl-comment">/* RAY_SERDE_PREFIX (0xcefadefa) */</span>
+    uint8_t  version;    <span class="hl-comment">/* RAY_SERDE_WIRE_VERSION (currently 3) */</span>
+    uint8_t  flags;      <span class="hl-comment">/* 0 */</span>
+    uint8_t  endian;     <span class="hl-comment">/* 0 = little-endian */</span>
+    uint8_t  msgtype;    <span class="hl-comment">/* 0 = async, 1 = sync, 2 = response */</span>
+    int64_t  size;       <span class="hl-comment">/* payload size in bytes */</span>
+} ray_ipc_header_t;</code></pre>
+      <p>The header is exactly 16 bytes, enforced by a compile-time static assertion.</p>
+
+      <h3 id="wire-version-history">Wire-version history</h3>
+      <ul>
+        <li><strong>v2</strong> &mdash; atoms serialized as <code>type(1) + value-bytes</code>. Typed-null atoms (<code>0Nl</code>, <code>0Nf</code>, &hellip;) lost their null bit on round-trip.</li>
+        <li><strong>v3</strong> (current) &mdash; atoms serialized as <code>type(1) + flags(1) + value-bytes</code>. Bit 0 of <code>flags</code> carries the typed-null marker; <code>(de (ser 0Nl))</code> now returns <code>0Nl</code>. The <a href="#handshake">handshake byte</a> advertises the same version so peers speaking different wire versions are closed before any payload is exchanged.</li>
+      </ul>
+      <p>Because the version field is checked symmetrically on send and receive, a v3 peer will refuse to connect to a v2 peer (and vice versa) rather than silently mis-parsing.</p>
+
+      <h2 id="compression">Compression</h2>
+      <p>Payloads larger than 2,000 bytes are automatically compressed using delta + RLE encoding. This works especially well for sorted columnar data (long runs of identical delta bytes).</p>
+      <ul>
+        <li><strong>Delta encoding</strong> &mdash; each byte is replaced by the difference from the previous byte</li>
+        <li><strong>RLE</strong> &mdash; runs of identical bytes are stored as (count, value) pairs</li>
+        <li><strong>Threshold</strong> &mdash; payloads &le; 2,000 bytes are sent uncompressed</li>
+        <li><strong>Transparent</strong> &mdash; compression is automatic; the <code>flags</code> header byte signals whether the payload is compressed</li>
+      </ul>
+      <p>If compression doesn&rsquo;t reduce the payload size, the data is sent uncompressed.</p>
+
+      <h2>Supported Types</h2>
+      <p>All core Rayforce types serialize and deserialize faithfully:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Category</th>
+            <th>Types</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Integer atoms</td><td><code>i64</code>, <code>bool</code></td></tr>
+          <tr><td>Float atoms</td><td><code>f64</code></td></tr>
+          <tr><td>String atoms</td><td><code>str</code>, <code>sym</code></td></tr>
+          <tr><td>Temporal atoms</td><td><code>date</code>, <code>time</code>, <code>timestamp</code></td></tr>
+          <tr><td>Other atoms</td><td><code>guid</code>, <code>null</code></td></tr>
+          <tr><td>Vectors</td><td>All typed vectors (<code>I64</code>, <code>F64</code>, <code>BOOL</code>, <code>STR</code>, <code>SYM</code>, <code>DATE</code>, <code>TIME</code>, <code>TS</code>, <code>GUID</code>), including null bitmaps</td></tr>
+          <tr><td>Collections</td><td><code>list</code> (heterogeneous, nested), <code>dict</code></td></tr>
+          <tr><td>Tables</td><td><code>table</code> (column names + column vectors)</td></tr>
+        </tbody>
+      </table>
+
+      <h2>C API</h2>
+      <p>The serialization functions are declared in <code>src/store/serde.h</code>:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ray_ser(obj)</code></td><td>Serialize <code>obj</code> to a <code>U8</code> vector with IPC header</td></tr>
+          <tr><td><code>ray_de(bytes)</code></td><td>Deserialize from a <code>U8</code> vector, validates IPC header</td></tr>
+          <tr><td><code>ray_serde_size(obj)</code></td><td>Calculate serialized size (excluding header)</td></tr>
+          <tr><td><code>ray_ser_raw(buf, obj)</code></td><td>Serialize into a caller-provided buffer (no header)</td></tr>
+          <tr><td><code>ray_de_raw(buf, len)</code></td><td>Deserialize from raw buffer, updates <code>len</code> with bytes consumed</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="use-cases">Use Cases</h2>
+      <ul>
+        <li><strong>Remote queries</strong> &mdash; run analytics on a server-side dataset from a client REPL</li>
+        <li><strong>Multi-process architecture</strong> &mdash; one server process owns the data, multiple clients query it</li>
+        <li><strong>In-memory data exchange</strong> &mdash; <code>ser</code> / <code>de</code> round-trip any Rayforce value through a compact byte vector</li>
+        <li><strong>Table persistence</strong> &mdash; for saving tables to disk, use splayed/partitioned storage (see <a href="guide-storage.html">Storage Guide</a>)</li>
+      </ul>
+
+      <h2 id="limitations">Limitations</h2>
+      <ul>
+        <li><strong>No streaming</strong> &mdash; the entire object is serialized at once; there is no chunked or incremental mode</li>
+        <li><strong>Single-threaded server</strong> &mdash; the server processes queries sequentially on the main thread. Long-running queries block other clients.</li>
+        <li><strong>Plaintext transport</strong> &mdash; data travels unencrypted over TCP. Use on trusted networks or tunnel through SSH for security.</li>
+        <li><strong>Shared secret only</strong> &mdash; authentication uses a single password for all clients (<code>-u</code>/<code>-U</code>). There is no per-user access control.</li>
+      </ul>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="storage.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Storage</span></a>
+        <a href="graph-storage.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Graph Storage</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

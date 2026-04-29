@@ -1,0 +1,8 @@
+;; Invariants for `doy` — day-of-year.
+
+(doy 2024.01.01) -- 1
+(doy 2024.12.31) -- 366
+
+;; range 1..366
+(set D [2024.01.15 2024.06.30 2024.11.20])
+(count D) -- (sum (and (>= (doy D) 1) (<= (doy D) 366)))

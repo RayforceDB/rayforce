@@ -1,0 +1,158 @@
+;; Invariants for `+`.
+
+;; commutativity:  (+ a b) == (+ b a)
+(set A (- (rand 256 200000) 100000))
+(set B (- (rand 256 200000) 100000))
+(count A) -- (sum (== (+ A B) (+ B A)))
+
+;; associativity:  (+ (+ a b) c) == (+ a (+ b c)) — narrow range to avoid overflow
+(set A (- (rand 256 60000) 30000))
+(set B (- (rand 256 60000) 30000))
+(set C (- (rand 256 60000) 30000))
+(count A) -- (sum (== (+ (+ A B) C) (+ A (+ B C))))
+
+;; identity (right):  (+ a 0) == a
+(set A (- (rand 256 200000) 100000))
+(count A) -- (sum (== (+ A 0) A))
+
+;; identity (left):  (+ 0 a) == a
+(set A (- (rand 256 200000) 100000))
+(count A) -- (sum (== (+ 0 A) A))
+
+;; ──────────────────────────────────────────────────────────────────
+;; Mixed numeric — atom/vec/broadcast/coercion
+;; ──────────────────────────────────────────────────────────────────
+
+;; int+int atom
+(+ 3 4) -- 7
+
+;; int+int vec
+(+ [1 2 3] [10 20 30]) -- [11 22 33]
+
+;; int+int broadcast
+(+ [1 2 3] 10) -- [11 12 13]
+
+;; neg + pos
+(+ -5 3) -- -2
+
+;; neg vec + atom
+(+ [-1 -2 -3] 1) -- [0 -1 -2]
+
+;; float+float atom
+(+ 1.5 2.5) -- 4.0
+
+;; int+float coerce atom
+(+ 1 2.5) -- 3.5
+
+;; int_vec + float atom
+(+ [1 2 3] 0.5) -- [1.5 2.5 3.5]
+
+;; int_vec + float_vec
+(+ [1 2 3] [0.5 0.5 0.5]) -- [1.5 2.5 3.5]
+
+;; ──────────────────────────────────────────────────────────────────
+;; Type sweep — each width, result type, widening
+;; ──────────────────────────────────────────────────────────────────
+
+;; + I16 atom value
+(+ 1h 2h) -- 3
+
+;; + I32 atom value
+(+ 1i 2i) -- 3
+
+;; + I16 atom type preserves
+(type (+ 1h 2h)) -- 'i16
+
+;; + I32 atom type preserves
+(type (+ 1i 2i)) -- 'i32
+
+;; + I16+I32 widens to I32
+(type (+ 1h 2i)) -- 'i32
+
+;; + I32+I64 widens to I64
+(type (+ 1i 2)) -- 'i64
+
+;; + I64+F64 widens to F64
+(type (+ 1 2.0)) -- 'f64
+
+;; + I16 vec element-wise
+(+ [1h 2h 3h] [1h 2h 3h]) -- [2 4 6]
+
+;; + I32 vec element-wise
+(+ [1i 2i 3i] [1i 2i 3i]) -- [2 4 6]
+
+;; + F64 vec element-wise
+(+ [1.0 2.0 3.0] [1.0 2.0 3.0]) -- [2.0 4.0 6.0]
+
+;; + I16 vec type preserves
+(type (+ [1h 2h] [1h 2h])) -- 'I16
+
+;; + I32 vec type preserves
+(type (+ [1i 2i] [1i 2i])) -- 'I32
+
+;; + atom-vec broadcast I16
+(+ 10h [1h 2h 3h]) -- [11 12 13]
+
+;; + atom-vec broadcast F64
+(+ 10.0 [1.0 2.0 3.0]) -- [11.0 12.0 13.0]
+
+;; ──────────────────────────────────────────────────────────────────
+;; Null propagation — typed null atoms propagate through +
+;; ──────────────────────────────────────────────────────────────────
+
+;; + int null propagates
+(nil? (+ 0Ni 5)) -- true
+
+;; + rhs int null propagates
+(nil? (+ 5 0Ni)) -- true
+
+;; + f64 null propagates
+(nil? (+ 0Nf 5.0)) -- true
+
+;; ──────────────────────────────────────────────────────────────────
+;; Type errors
+;; ──────────────────────────────────────────────────────────────────
+
+(+ null 1)          !- type
+(+ "abc" 1)         !- type
+(+ 0Nf 2024.03.20)  !- type
+
+;; ──────────────────────────────────────────────────────────────────
+;; Morsel boundaries — 1023 / 1024 / 1025
+;; ──────────────────────────────────────────────────────────────────
+
+;; identity + 0 preserves vec at 1023
+(set V (til 1023))
+(+ V 0) -- V
+
+;; sum after +0 preserved at 1023
+(sum (+ V 0)) -- (sum V)
+
+;; vec+vec at 1023 doubles sum
+(sum (+ V V)) -- (* 2 (sum V))
+
+;; identity at 1024
+(set V (til 1024))
+(+ V 0) -- V
+(sum (+ V V)) -- (* 2 (sum V))
+
+;; last element at morsel 1024
+(last (+ V 1)) -- 1024
+
+;; identity at 1025
+(set V (til 1025))
+(+ V 0) -- V
+(sum (+ V V)) -- (* 2 (sum V))
+
+;; last element at morsel 1025
+(last (+ V 1)) -- 1025
+
+;; ──────────────────────────────────────────────────────────────────
+;; Arity — binary verb: too few or too many args raises `arity`.
+;; (Pre-fix: extras were silently dropped — `(+ 1 2 3)` returned 3.)
+;; ──────────────────────────────────────────────────────────────────
+
+(+)             !- arity
+(+ 1)           !- arity
+(+ 1 2 3)       !- arity
+(+ 1 2 3 4 5)   !- arity

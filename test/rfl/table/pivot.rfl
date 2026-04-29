@@ -1,0 +1,108 @@
+;; Invariants for `pivot` — wide-table reshape across one (or more) row
+;; keys, one pivot key, and one value column with an aggregator.
+
+(set trades (table [sym side qty] (list ['AAPL 'GOOG 'AAPL 'MSFT 'AAPL 'GOOG] ['Buy 'Sell 'Sell 'Buy 'Buy 'Buy] [100 50 75 200 50 30])))
+
+;; ────────────── pivot with sum aggregator ──────────────
+(set Pivot-Sum (pivot trades 'sym 'side 'qty sum))
+
+;; row count is the number of distinct row-keys
+(count Pivot-Sum) -- 3
+
+;; per-side sums match what a hand group-by would produce
+(sum (at Pivot-Sum 'Buy))  -- 380
+(sum (at Pivot-Sum 'Sell)) -- 125
+
+;; total across pivoted columns equals total across the source value col
+(+ (sum (at Pivot-Sum 'Buy)) (sum (at Pivot-Sum 'Sell))) -- (sum (at trades 'qty))
+
+;; ────────────── pivot with count aggregator ──────────────
+(set Pivot-Count (pivot trades 'sym 'side 'qty count))
+
+(count Pivot-Count) -- 3
+
+;; total cells == total source rows
+(+ (sum (at Pivot-Count 'Buy)) (sum (at Pivot-Count 'Sell))) -- (count trades)
+
+;; ────────────── pivot with avg / min / max aggregators ──────────────
+;; Each aggregator hits a separate combine path in ray_pivot_fn.
+(set tk (table [k1 k2 v] (list ['A 'A 'B 'B 'A] ['x 'y 'x 'y 'y] [1 2 3 4 5])))
+
+(set Pavg (pivot tk 'k1 'k2 'v avg))
+(count Pavg) -- 2
+(at (at Pavg 'x) 0) -- 1.0
+(at (at Pavg 'y) 0) -- 3.5
+(at (at Pavg 'x) 1) -- 3.0
+(at (at Pavg 'y) 1) -- 4.0
+
+(set Pmin (pivot tk 'k1 'k2 'v min))
+(count Pmin) -- 2
+(at (at Pmin 'x) 0) -- 1
+(at (at Pmin 'y) 0) -- 2
+
+(set Pmax (pivot tk 'k1 'k2 'v max))
+(count Pmax) -- 2
+(at (at Pmax 'x) 0) -- 1
+(at (at Pmax 'y) 1) -- 4
+
+;; ────────────── pivot with f64 value column ──────────────
+(set tf (table [k1 k2 v] (list ['A 'A 'B] ['x 'y 'x] [1.5 2.5 3.5])))
+(set Pf (pivot tf 'k1 'k2 'v sum))
+(at (at Pf 'x) 0) -- 1.5
+(at (at Pf 'y) 0) -- 2.5
+(at (at Pf 'x) 1) -- 3.5
+
+;; ────────────── pivot with vector row-key (multi-key) ──────────────
+(set tm (table [r c v] (list [1 1 2 2] ['x 'y 'x 'y] [10 20 30 40])))
+(set Pm (pivot tm ['r] 'c 'v sum))
+(count Pm) -- 2
+(at (at Pm 'x) 0) -- 10
+(at (at Pm 'y) 0) -- 20
+(at (at Pm 'x) 1) -- 30
+
+;; ────────────── union-all: row-wise concat of two same-schema tables ──────────────
+;; Was 0%-covered before; the C-API was reachable from REPL but had no
+;; .rfl tests.
+(set Tu1 (table [a b] (list [1 2 3] [10 20 30])))
+(set Tu2 (table [a b] (list [4 5]   [40 50])))
+(count (union-all Tu1 Tu2))      -- 5
+(sum (at (union-all Tu1 Tu2) 'a)) -- 15
+(sum (at (union-all Tu1 Tu2) 'b)) -- 150
+(at (at (union-all Tu1 Tu2) 'a) 0) -- 1
+(at (at (union-all Tu1 Tu2) 'a) 4) -- 5
+;; empty + non-empty edges
+(set Tu0 (select {from: Tu1 where: (> a 100)}))   ;; 0 rows, same schema
+(count (union-all Tu0 Tu1)) -- 3
+(count (union-all Tu1 Tu0)) -- 3
+
+;; ────────────── pivot with TWO row keys (vector form) ──────────────
+(set T2k (table [a b c v] (list ['X 'X 'Y 'Y 'X 'Y] [1 2 1 2 1 2] ['p 'q 'p 'q 'q 'p] [10 20 30 40 50 60])))
+(set P2k (pivot T2k ['a 'b] 'c 'v sum))
+(count P2k) -- 4
+(count (key P2k)) -- 4
+(at (at P2k 'p) 0) -- 10
+(at (at P2k 'q) 0) -- 50
+(at (at P2k 'p) 3) -- 60
+(at (at P2k 'q) 3) -- 40
+
+;; ────────────── pivot with I64 row key ──────────────
+(set Ti (table [k c v] (list [1 1 2 2 3] ['x 'y 'x 'y 'x] [10 20 30 40 50])))
+(set Pi (pivot Ti 'k 'c 'v sum))
+(count Pi) -- 3
+(at (at Pi 'x) 0) -- 10
+(at (at Pi 'y) 1) -- 40
+(at (at Pi 'x) 2) -- 50
+
+;; ────────────── pivot with DATE row key ──────────────
+(set Td (table [d c v] (list [2024.01.01 2024.01.01 2024.01.02 2024.01.02] ['x 'y 'x 'y] [10 20 30 40])))
+(set Pd (pivot Td 'd 'c 'v sum))
+(count Pd) -- 2
+(at (at Pd 'x) 0) -- 10
+(at (at Pd 'y) 1) -- 40
+
+;; ────────────── pivot count vs sum on missing cells ──────────────
+(set Ts (table [r c v] (list ['A 'A 'B] ['x 'y 'x] [1 2 3])))
+(set Pcs (pivot Ts 'r 'c 'v sum))
+(at (at Pcs 'y) 1) -- 0
+(set Pcc (pivot Ts 'r 'c 'v count))
+(at (at Pcc 'y) 1) -- 0

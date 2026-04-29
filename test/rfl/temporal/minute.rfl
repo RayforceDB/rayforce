@@ -1,0 +1,9 @@
+;; Invariants for `minute` — extract minute-of-hour.
+
+(minute 12:30:45.000) -- 30
+(minute 12:00:00.000) -- 0
+(minute 12:59:00.000) -- 59
+
+;; range: 0..59
+(set T [12:00:00.000 12:30:00.000 12:59:00.000])
+(count T) -- (sum (and (>= (minute T) 0) (<= (minute T) 59)))

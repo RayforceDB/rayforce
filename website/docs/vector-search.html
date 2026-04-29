@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vector Search — Rayforce Documentation</title>
+  <meta name="description" content="Vector similarity search, embeddings, and HNSW indexing in Rayforce. Cosine / L2 / inner-product metrics, brute-force KNN, approximate nearest-neighbour (ANN) with filter-aware iterative scan.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+        <a href="vector-search.html" class="sidebar-link active">Vector Search</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+        <a href="index.html" class="sidebar-link">Docs Home</a>
+      </div>
+    </nav>
+
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Vector Search</span>
+      </div>
+
+      <h1>Vector Search</h1>
+      <p class="page-subtitle">Embedding similarity, brute-force KNN, and HNSW-accelerated approximate nearest-neighbour search — composable with Rayfall's <code>select</code> for filter-aware retrieval.</p>
+
+      <!-- ============================================================ -->
+      <h2 id="model">Data Model</h2>
+      <p>An embedding column is a <code>RAY_LIST</code> whose entries are numeric vectors (preferably <code>RAY_F32</code>) of the same length <code>D</code>. Tables hold embeddings alongside any other column types — integers, strings, dates, symbols — and all columns project correctly through nearest-neighbour queries.</p>
+      <pre><code>(<span class="hl-kw">set</span> docs (<span class="hl-fn">table</span> [<span class="hl-sym">id</span> <span class="hl-sym">title</span> <span class="hl-sym">score</span> <span class="hl-sym">emb</span>]
+    (<span class="hl-fn">list</span> [<span class="hl-num">0</span> <span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span>]
+          (<span class="hl-fn">list</span> <span class="hl-str">"alpha"</span> <span class="hl-str">"beta"</span> <span class="hl-str">"gamma"</span> <span class="hl-str">"delta"</span> <span class="hl-str">"epsilon"</span>)
+          [<span class="hl-num">0.9</span> <span class="hl-num">0.2</span> <span class="hl-num">0.8</span> <span class="hl-num">0.1</span> <span class="hl-num">0.7</span>]
+          (<span class="hl-fn">list</span> [<span class="hl-num">1.0</span> <span class="hl-num">0.0</span> <span class="hl-num">0.0</span>] [<span class="hl-num">0.0</span> <span class="hl-num">1.0</span> <span class="hl-num">0.0</span>]
+                [<span class="hl-num">0.0</span> <span class="hl-num">0.0</span> <span class="hl-num">1.0</span>] [<span class="hl-num">1.0</span> <span class="hl-num">1.0</span> <span class="hl-num">0.0</span>]
+                [<span class="hl-num">1.0</span> <span class="hl-num">0.0</span> <span class="hl-num">1.0</span>]))))</code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="metrics">Direct Distance &amp; Similarity</h2>
+      <p>Four direct builtins. All accept either <em>two vectors</em> (returning a scalar) or <em>a LIST-of-vectors plus a query vector</em> (returning a vector of per-row results).</p>
+      <table>
+        <thead><tr><th>Function</th><th>Returns</th><th>Range</th></tr></thead>
+        <tbody>
+          <tr><td><code>(cos-dist a b)</code></td><td>cosine distance <code>1 − cos(a, b)</code></td><td><code>[0, 2]</code> — lower = closer</td></tr>
+          <tr><td><code>(l2-dist a b)</code></td><td>euclidean distance <code>||a − b||₂</code></td><td><code>[0, ∞)</code> — lower = closer</td></tr>
+          <tr><td><code>(inner-prod a b)</code></td><td>dot product <code>∑ aᵢ·bᵢ</code></td><td>any real</td></tr>
+          <tr><td><code>(norm x)</code></td><td>L2 norm <code>||x||₂</code></td><td><code>[0, ∞)</code></td></tr>
+        </tbody>
+      </table>
+      <pre><code>(<span class="hl-fn">cos-dist</span> [<span class="hl-num">1.0</span> <span class="hl-num">0.0</span>] [<span class="hl-num">0.0</span> <span class="hl-num">1.0</span>])         <span class="hl-comment">; → 1.0 (orthogonal)</span>
+(<span class="hl-fn">l2-dist</span>  [<span class="hl-num">0.0</span> <span class="hl-num">0.0</span>] [<span class="hl-num">3.0</span> <span class="hl-num">4.0</span>])         <span class="hl-comment">; → 5.0</span>
+(<span class="hl-fn">inner-prod</span> [<span class="hl-num">1.0</span> <span class="hl-num">2.0</span>] [<span class="hl-num">3.0</span> <span class="hl-num">4.0</span>])      <span class="hl-comment">; → 11.0</span>
+(<span class="hl-fn">norm</span>    [<span class="hl-num">3.0</span> <span class="hl-num">4.0</span>])                 <span class="hl-comment">; → 5.0</span></code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="knn">Brute-force K-Nearest-Neighbours</h2>
+      <p><code>(knn col query k [metric])</code> scans a full LIST column and returns the top-K rows as a table with <code>_rowid</code> and <code>_dist</code> columns (ascending by distance). The metric defaults to <code>'cosine</code>; also supports <code>'l2</code> and <code>'ip</code> (inner-product, sorted by <code>−dot</code> so lower = closer matches the other metrics).</p>
+      <pre><code>(<span class="hl-fn">knn</span> (<span class="hl-fn">at</span> docs <span class="hl-sym">'emb</span>) [<span class="hl-num">1.0</span> <span class="hl-num">0.0</span> <span class="hl-num">0.0</span>] <span class="hl-num">3</span> <span class="hl-sym">'cosine</span>)
+<span class="hl-comment">; ┌────────┬───────┐</span>
+<span class="hl-comment">; │ _rowid │ _dist │</span>
+<span class="hl-comment">; │  I64   │  F64  │</span>
+<span class="hl-comment">; ├────────┼───────┤</span>
+<span class="hl-comment">; │ 0      │ 0.0   │</span>
+<span class="hl-comment">; │ 4      │ 0.29  │</span>
+<span class="hl-comment">; │ 3      │ 0.29  │</span>
+<span class="hl-comment">; └────────┴───────┘</span></code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="hnsw">HNSW Indexes</h2>
+      <p>Build a hierarchical navigable small-world graph over an embedding column for sub-linear nearest-neighbour queries. All three metrics are indexed natively and the chosen metric persists through save/load.</p>
+      <h3 id="hnsw-build">Building</h3>
+      <pre><code><span class="hl-comment">; (hnsw-build col [metric] [M] [ef_construction])</span>
+(<span class="hl-kw">set</span> idx (<span class="hl-fn">hnsw-build</span> (<span class="hl-fn">at</span> docs <span class="hl-sym">'emb</span>) <span class="hl-sym">'cosine</span> <span class="hl-num">16</span> <span class="hl-num">100</span>))</code></pre>
+      <p>Defaults: <code>metric='cosine</code>, <code>M=16</code>, <code>ef_construction=200</code>. The returned handle is an atom tagged <code>RAY_ATTR_HNSW</code>; the underlying <code>ray_hnsw_t*</code> is rc-managed — rebinding, scope exit, and process teardown all release the index automatically.</p>
+
+      <h3 id="hnsw-query">Querying</h3>
+      <pre><code><span class="hl-comment">; (ann handle query k [ef_search])</span>
+(<span class="hl-fn">ann</span> idx [<span class="hl-num">1.0</span> <span class="hl-num">0.0</span> <span class="hl-num">0.0</span>] <span class="hl-num">3</span>)
+<span class="hl-comment">; ┌────────┬───────┐</span>
+<span class="hl-comment">; │ _rowid │ _dist │</span>
+<span class="hl-comment">; ├────────┼───────┤</span>
+<span class="hl-comment">; │ 0      │ 0.0   │</span>
+<span class="hl-comment">; │ 4      │ 0.29  │</span>
+<span class="hl-comment">; │ 3      │ 0.29  │</span>
+<span class="hl-comment">; └────────┴───────┘</span></code></pre>
+
+      <h3 id="hnsw-lifecycle">Persistence &amp; Lifecycle</h3>
+      <pre><code>(<span class="hl-fn">hnsw-save</span> idx <span class="hl-str">"/var/index/docs"</span>)
+(<span class="hl-kw">set</span> idx2 (<span class="hl-fn">hnsw-load</span> <span class="hl-str">"/var/index/docs"</span>))
+(<span class="hl-fn">hnsw-info</span> idx2)     <span class="hl-comment">; dict: {nrows dim metric nlayers M efc}</span>
+(<span class="hl-fn">hnsw-free</span> idx2)     <span class="hl-comment">; optional — rc-managed, will free on scope exit too</span></code></pre>
+
+      <!-- ============================================================ -->
+      <h2 id="nearest">Filter-Aware ANN via <code>select … nearest</code></h2>
+      <p>The <code>select</code> form accepts a <code>nearest:</code> clause that composes WHERE filtering with HNSW-backed (or brute-force) top-K retrieval in one query. The filter predicate is pushed into HNSW's beam search as an iterative scan — rejected candidates are still traversed for graph connectivity but don't consume result slots.</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> docs
+         <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> score <span class="hl-num">0.5</span>)
+         <span class="hl-sym">nearest:</span> (<span class="hl-fn">ann</span> idx [<span class="hl-num">1.0</span> <span class="hl-num">0.0</span> <span class="hl-num">0.0</span>])
+         <span class="hl-sym">take:</span> <span class="hl-num">10</span>})
+<span class="hl-comment">; Returns top-10 rows of `docs` whose score &gt; 0.5, ordered by cosine</span>
+<span class="hl-comment">; distance to the query.  The implicit projection returns source</span>
+<span class="hl-comment">; columns only; to include _dist, name it in the output projection.</span></code></pre>
+      <p>Brute-force variant on a column reference (no pre-built index needed):</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> docs
+         <span class="hl-sym">nearest:</span> (<span class="hl-fn">knn</span> emb [<span class="hl-num">1.0</span> <span class="hl-num">0.0</span> <span class="hl-num">0.0</span>])
+         <span class="hl-sym">take:</span> <span class="hl-num">3</span>})</code></pre>
+
+      <h3 id="nearest-projection">Projection &amp; <code>_dist</code></h3>
+      <p>The rerank step emits a synthetic <code>_dist</code> column, but it is <strong>not</strong> included in the default output — <code>(select {from: t nearest: …})</code> returns the source schema exactly, preserving shape compatibility with <code>(select {from: t})</code>. To include the distance, reference <code>_dist</code> in an explicit projection:</p>
+      <pre><code>(<span class="hl-kw">select</span> {<span class="hl-sym">id:</span> id <span class="hl-sym">title:</span> title <span class="hl-sym">d:</span> _dist
+         <span class="hl-sym">from:</span> docs
+         <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> score <span class="hl-num">0.5</span>)
+         <span class="hl-sym">nearest:</span> (<span class="hl-fn">ann</span> idx [<span class="hl-num">1.0</span> <span class="hl-num">0.0</span> <span class="hl-num">0.0</span>])
+         <span class="hl-sym">take:</span> <span class="hl-num">5</span>})</code></pre>
+
+      <h3 id="nearest-metric">Metric Symbols</h3>
+      <p>Accepted by <code>hnsw-build</code>, <code>knn</code>, and the <code>nearest</code> clause:</p>
+      <ul>
+        <li><code>'cosine</code> — <code>1 − cos(a, b)</code>, lower = closer (default)</li>
+        <li><code>'l2</code> — euclidean distance, lower = closer</li>
+        <li><code>'ip</code> — negated inner product, lower = closer</li>
+      </ul>
+
+      <!-- ============================================================ -->
+      <h2 id="reference">Reference</h2>
+      <table>
+        <thead><tr><th>Name</th><th>Arity</th><th>Signature</th></tr></thead>
+        <tbody>
+          <tr><td><code>cos-dist</code></td><td>2</td><td><code>(cos-dist a b)</code> — cosine distance; vec×vec → atom, LIST×vec → vector</td></tr>
+          <tr><td><code>l2-dist</code></td><td>2</td><td><code>(l2-dist a b)</code> — euclidean distance</td></tr>
+          <tr><td><code>inner-prod</code></td><td>2</td><td><code>(inner-prod a b)</code> — positive dot product</td></tr>
+          <tr><td><code>norm</code></td><td>1</td><td><code>(norm x)</code> — L2 norm; scalar if vec, per-row vector if LIST</td></tr>
+          <tr><td><code>knn</code></td><td>3–4</td><td><code>(knn col query k [metric])</code> — brute-force top-K</td></tr>
+          <tr><td><code>hnsw-build</code></td><td>1–4</td><td><code>(hnsw-build col [metric] [M] [ef_c])</code> — build index</td></tr>
+          <tr><td><code>ann</code></td><td>3–4</td><td><code>(ann handle query k [ef_s])</code> — approximate top-K via HNSW</td></tr>
+          <tr><td><code>hnsw-save</code></td><td>2</td><td><code>(hnsw-save handle path)</code> — persist index to directory</td></tr>
+          <tr><td><code>hnsw-load</code></td><td>1</td><td><code>(hnsw-load path)</code> — restore index from directory</td></tr>
+          <tr><td><code>hnsw-free</code></td><td>1</td><td><code>(hnsw-free handle)</code> — explicit release (rc-managed, optional)</td></tr>
+          <tr><td><code>hnsw-info</code></td><td>1</td><td><code>(hnsw-info handle)</code> — dict of <code>{nrows dim metric nlayers M efc}</code></td></tr>
+        </tbody>
+      </table>
+
+      <!-- ============================================================ -->
+      <h2 id="notes">Design Notes</h2>
+      <ul>
+        <li><strong>Distance convention.</strong> All metrics encode as "lower = closer" for consistent sort ordering. Direct math builtins (<code>cos-sim</code>-style semantics) aren't provided separately — compute <code>(- 1.0 (cos-dist a b))</code> if needed.</li>
+        <li><strong>Handle lifecycle.</strong> HNSW handles are rc-managed through Rayforce's ownership semantics: a deep clone is produced on <code>ray_cow</code>, ownership transfers via detach on realloc, and the underlying index is freed when the last reference drops. <code>(hnsw-free h)</code> is idempotent and not required for correctness.</li>
+        <li><strong>Iterative scan bounds.</strong> Filter-aware ANN pushes the predicate into the beam but remains locality-bounded by HNSW's graph reachability from the query's entry point. For pathologically selective filters on clustered data, results may be fewer than K; multi-entry restart is future work.</li>
+        <li><strong>Allocation-failure contract.</strong> All HNSW search entry points return a distinct sentinel (<code>-1</code>) on allocation failure — every caller surfaces this as <code>ray_error("oom", …)</code> rather than a silently-empty result.</li>
+      </ul>
+
+      <div class="docs-nav-footer">
+        <a href="queries-pivot.html" class="docs-nav-link prev">
+          <span class="docs-nav-label">Previous</span>
+          <span class="docs-nav-title">&larr; Pivot</span>
+        </a>
+        <a href="graph-storage.html" class="docs-nav-link next">
+          <span class="docs-nav-label">Next</span>
+          <span class="docs-nav-title">Graph Storage &rarr;</span>
+        </a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

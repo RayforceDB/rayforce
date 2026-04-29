@@ -1,0 +1,57 @@
+;; Invariants for `/` (integer division, floor).
+
+;; identity: (/ a 1) == a
+(set A (- (rand 256 200000) 100000))
+(count A) -- (sum (== (/ A 1) A))
+
+;; (/ (* a b) b) == a  for non-zero b
+(set A (- (rand 256 200) 100))
+(set B (+ (rand 256 10) 1))
+(count A) -- (sum (== (/ (* A B) B) A))
+
+;; floor semantic: 7/2 == 3
+(/ 7 2) -- 3
+(/ 10 3) -- 3
+
+;; floor with negative — toward -inf, not toward 0
+(/ -10 3)  -- -4
+(/ 10 -3)  -- -4
+(/ -10 -3) -- 3
+
+;; divide-by-zero yields typed null
+(/ 5 0)  -- 0Nl
+(/ 10 0) -- 0Nl
+
+;; floats — Rayforce folds IEEE +Inf / NaN outcomes back to typed null
+(nil? (/ 1.0 0.0)) -- true
+(nil? (/ 0.0 0.0)) -- true
+(nil? (div 1.0 0.0)) -- true
+(nil? (div 0.0 0.0)) -- true
+
+;; const-fold of div-by-zero must agree with the runtime path
+;; (regression for the optimizer doing the fold at compile time)
+(set X 1.0)
+(nil? (/ X 0.0)) -- true
+(nil? (div X 0.0)) -- true
+(== (nil? (/ 1 0)) (nil? (/ X 0))) -- true
+(== (nil? (/ 1.0 0.0)) (nil? (/ X 0.0))) -- true
+
+;; ──────────────────────────────────────────────────────────────────
+;; Type sweep — narrow ints / float / cross-width
+;; ──────────────────────────────────────────────────────────────────
+
+(/ 6h 2h) -- 3
+(type (/ 6h 2h)) -- 'i16
+(/ 6i 2i) -- 3
+(type (/ 6i 2i)) -- 'i32
+(/ 10.0 4.0) -- 2.0
+(type (/ 6.0 2.0)) -- 'f64
+(/ [12 15 18] 3) -- [4 5 6]
+
+;; ──────────────────────────────────────────────────────────────────
+;; Null propagation
+;; ──────────────────────────────────────────────────────────────────
+
+(nil? (/ 0Ni 5))   -- true
+(nil? (/ 5 0Ni))   -- true
+(nil? (/ 0Nf 5.0)) -- true

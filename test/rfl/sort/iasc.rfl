@@ -1,0 +1,22 @@
+;; Invariants for `iasc` — indexes that would sort ascending.
+
+(iasc [30 10 20]) -- [1 2 0]
+(iasc [5]) -- [0]
+(iasc [1 2 3]) -- [0 1 2]
+(iasc [3 2 1]) -- [2 1 0]
+
+;; indices sort to ascending values
+(set V (rand 200 10000))
+(at V (iasc V)) -- (asc V)
+
+;; is a permutation of (til n)
+(asc (iasc V)) -- (til (count V))
+
+;; stable: ties preserve source order
+(iasc [2 1 2 1]) -- [1 3 0 2]
+
+;; floats
+(iasc [3.14 1.41 2.71]) -- [1 2 0]
+
+;; negatives
+(iasc [-1 -3 -2]) -- [1 2 0]

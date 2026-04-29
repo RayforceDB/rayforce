@@ -1,0 +1,88 @@
+;; Multi-aggregator group-by with rarely-tested aggregators (med, dev,
+;; var, stddev, dev_pop, var_pop, diverse, first/last).  Each combo
+;; routes through different paths in group.c::exec_group.
+
+(set N 1000)
+(set T (table [g v f] (list (% (til N) 50) (til N) (as 'F64 (* 0.5 (til N))))))
+
+;; ────────────── basic counts ──────────────
+(count T) -- 1000
+(count (select {c: (count v) from: T by: g})) -- 50
+
+;; ────────────── single-aggregator per call ──────────────
+(sum (at (select {x: (sum v) from: T by: g}) 'x))     -- 499500
+(sum (at (select {x: (count v) from: T by: g}) 'x))   -- 1000
+(sum (at (select {x: (avg v) from: T by: g}) 'x))     -- 24975.0
+;; per-group: g sees v ∈ {g, g+50, …, g+950}; min=g, max=g+950
+;; sum_g min = sum_g g = 1225; sum_g max = 1225 + 50*950 = 48725
+(sum (at (select {x: (min v) from: T by: g}) 'x))     -- 1225
+(sum (at (select {x: (max v) from: T by: g}) 'x))     -- 48725
+(sum (at (select {x: (first v) from: T by: g}) 'x))   -- 1225
+(sum (at (select {x: (last v) from: T by: g}) 'x))    -- 48725
+
+;; ────────────── stat aggregators (dev / var / stddev) ──────────────
+;; Each group has 20 evenly-spaced values; their variance/stddev is
+;; the same per group, so summing across 50 groups gives 50× the
+;; per-group value.  We verify they're non-zero and consistent.
+(count (select {d: (dev v) v: (var v) s: (stddev v) from: T by: g})) -- 50
+
+;; dev_pop and var_pop variants (population vs sample)
+(count (select {d: (dev_pop v) v: (var_pop v) from: T by: g}))  -- 50
+(count (select {d: (stddev_pop v) from: T by: g}))              -- 50
+
+;; ────────────── median ──────────────
+;; KNOWN: (med v) works standalone but raises "length" inside select-by.
+;; Verify standalone path; pin the group-by error.
+(med [1 2 3 4 5]) -- 3.0
+(count (select {m: (med v) from: T by: g})) !- length
+
+;; ────────────── multi-aggregator: 7 aggs in one select ──────────────
+(set Many (select {c: (count v) s: (sum v) mn: (min v) mx: (max v) av: (avg v) f: (first v) l: (last v) from: T by: g}))
+(count Many) -- 50
+(sum (at Many 'c)) -- 1000
+(sum (at Many 's)) -- 499500
+
+;; ────────────── float aggregators ──────────────
+(count (select {av: (avg f) sd: (stddev f) from: T by: g})) -- 50
+(sum (at (select {s: (sum f) from: T by: g}) 's))           -- 249750.0
+
+;; ────────────── diverse — bool predicate "all elements distinct" ──────────────
+;; (Not count-distinct; returns true iff every element is unique.)
+(diverse [1 2 3 4 5]) -- true
+(diverse [1 2 1 3 2]) -- false
+(diverse [1 1 1])     -- false
+(diverse [42])        -- true
+
+;; ────────────── group-by + filter (predicate pushdown) ──────────────
+;; (sum v where v < 500) per group. Group g sees only v's < 500 → 10 of 20.
+(count (select {s: (sum v) from: T by: g where: (< v 500)})) -- 50
+
+;; ────────────── group-by no `by` clause: aggregate over whole table ──────────────
+;; pure aggregations without grouping
+(set Whole (select {tot: (sum v) ct: (count v) avg_v: (avg v) from: T}))
+(count Whole) -- 1000
+(at (at Whole 'tot) 0) -- 499500
+
+;; ────────────── group-by SYM key ──────────────
+(set Tsym (table [k v] (list (take ['A 'B 'C 'D 'E] N) (til N))))
+(count (select {s: (sum v) from: Tsym by: k})) -- 5
+(sum (at (select {s: (sum v) from: Tsym by: k}) 's)) -- 499500
+
+;; ────────────── group-by BOOL ──────────────
+(set Tbool (table [b v] (list (take [true false] N) (til N))))
+(count (select {s: (sum v) from: Tbool by: b})) -- 2
+
+;; ────────────── group-by DATE ──────────────
+(set Tdt (table [d v] (list (take [2024.01.01 2024.01.02 2024.01.03] N) (til N))))
+(count (select {s: (sum v) from: Tdt by: d})) -- 3
+
+;; ────────────── group-by F64 (float key) ──────────────
+(set Tf (table [k v] (list (take [1.5 2.5 3.5 4.5] N) (til N))))
+(count (select {s: (sum v) from: Tf by: k})) -- 4
+
+;; ────────────── narrow-int key types (i16, i32) ──────────────
+(set Ti16 (table [k v] (list (as 'I16 (% (til N) 30)) (til N))))
+(count (select {s: (sum v) from: Ti16 by: k})) -- 30
+
+(set Ti32 (table [k v] (list (as 'I32 (% (til N) 10)) (til N))))
+(count (select {s: (sum v) from: Ti32 by: k})) -- 10

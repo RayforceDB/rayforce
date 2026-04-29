@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Syntax &amp; Types — Rayforce Documentation</title>
+  <meta name="description" content="Rayfall language syntax reference: atoms, vectors, lists, tables, function calls, quoting, and the complete type system.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link active">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Syntax &amp; Types</span>
+      </div>
+
+      <h1>Syntax &amp; Types</h1>
+      <p class="page-subtitle">Rayfall is a Lisp-like query language with prefix notation, rich scalar types, columnar vectors, and first-class tables. The parser produces <code>ray_t</code> objects directly with no separate AST.</p>
+
+      <!-- ── Atoms ── -->
+      <h2 id="atoms">Atoms</h2>
+      <p>Atoms are scalar values. Rayfall supports a wide range of types, each with a distinct literal syntax.</p>
+
+      <h3>Integers</h3>
+      <p>64-bit signed integers by default. Suffixed variants available for narrower types.</p>
+      <pre><code><span class="hl-num">42</span>          <span class="hl-comment">; i64 (default)</span>
+<span class="hl-num">-17</span>         <span class="hl-comment">; negative</span>
+<span class="hl-num">0</span>           <span class="hl-comment">; zero</span>
+<span class="hl-num">1000000</span>     <span class="hl-comment">; no separators needed</span></code></pre>
+
+      <h3>Floats</h3>
+      <p>64-bit IEEE 754 double-precision floating point.</p>
+      <pre><code><span class="hl-num">3.14</span>        <span class="hl-comment">; standard float</span>
+<span class="hl-num">-0.5</span>        <span class="hl-comment">; negative float</span>
+<span class="hl-num">1e6</span>         <span class="hl-comment">; scientific notation</span>
+<span class="hl-num">2.5e-3</span>      <span class="hl-comment">; small value</span></code></pre>
+
+      <h3>Booleans</h3>
+      <pre><code><span class="hl-bool">true</span>        <span class="hl-comment">; boolean true (1b)</span>
+<span class="hl-bool">false</span>       <span class="hl-comment">; boolean false (0b)</span></code></pre>
+
+      <h3>Symbols</h3>
+      <p>Symbols are interned identifiers used for column names, dictionary keys, and categorical data. Prefix with a single quote to create a literal symbol.</p>
+      <pre><code><span class="hl-sym">'AAPL</span>       <span class="hl-comment">; symbol atom</span>
+<span class="hl-sym">'price</span>      <span class="hl-comment">; used as column reference</span>
+<span class="hl-sym">'hello</span>      <span class="hl-comment">; any alphanumeric + hyphens</span></code></pre>
+
+      <h3>Strings</h3>
+      <p>Double-quoted character sequences. Two internal representations: short strings (up to 12 bytes) stored inline, longer strings in a per-vector pool.</p>
+      <pre><code><span class="hl-str">"hello"</span>             <span class="hl-comment">; inline short string</span>
+<span class="hl-str">"hello world!"</span>      <span class="hl-comment">; still inline (12 bytes)</span>
+<span class="hl-str">"a longer string"</span>   <span class="hl-comment">; pool-allocated</span></code></pre>
+
+      <h3>Dates</h3>
+      <p>Date literals use dot-separated year.month.day format. Stored as days since 2000-01-01 (i32).</p>
+      <pre><code><span class="hl-num">2024.01.15</span>  <span class="hl-comment">; January 15, 2024</span>
+<span class="hl-num">2023.12.31</span>  <span class="hl-comment">; December 31, 2023</span></code></pre>
+
+      <h3>Times</h3>
+      <p>Time-of-day literals in HH:MM:SS.mmm format. Stored as milliseconds since midnight (i32).</p>
+      <pre><code><span class="hl-num">09:30:00.000</span>  <span class="hl-comment">; 9:30 AM</span>
+<span class="hl-num">14:15:30.500</span>  <span class="hl-comment">; 2:15:30.5 PM</span></code></pre>
+
+      <h3>Timestamps</h3>
+      <p>Full date+time with nanosecond precision. Stored as nanoseconds since 2000-01-01 (i64). Literal form uses <code>D</code> as the date/time separator and requires a fractional-seconds suffix:</p>
+      <pre><code><span class="hl-num">2024.01.15D09:30:00.000</span>            <span class="hl-comment">; date + time (ms)</span>
+<span class="hl-num">2024.01.15D09:30:00.000000000</span>      <span class="hl-comment">; date + time (ns)</span></code></pre>
+
+      <h3>GUIDs</h3>
+      <p>128-bit globally unique identifiers.</p>
+      <pre><code>(<span class="hl-fn">guid</span> <span class="hl-num">0</span>)   <span class="hl-comment">; generate a new GUID</span></code></pre>
+
+      <h3>Null Values</h3>
+      <p>Nulls are tracked via a per-element bitmap, not sentinel values. Typed null literals create atoms with the null bit set:</p>
+      <pre><code><span class="hl-num">0Nl</span>   <span class="hl-comment">; i64 null</span>
+<span class="hl-num">0Ni</span>   <span class="hl-comment">; i32 null</span>
+<span class="hl-num">0Nf</span>   <span class="hl-comment">; f64 null</span>
+<span class="hl-num">0Nd</span>   <span class="hl-comment">; date null</span>
+<span class="hl-num">0Nt</span>   <span class="hl-comment">; time null</span>
+<span class="hl-num">0Np</span>   <span class="hl-comment">; timestamp null</span>
+<span class="hl-num">0Ns</span>   <span class="hl-comment">; symbol null</span>
+(<span class="hl-fn">nil?</span> x)   <span class="hl-comment">; true if x is null</span></code></pre>
+
+      <!-- ── Vectors ── -->
+      <h2 id="vectors">Vectors</h2>
+      <p>Vectors are homogeneous, typed, columnar arrays. Created with square brackets. The type is inferred from the first element.</p>
+      <pre><code>[<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span> <span class="hl-num">5</span>]         <span class="hl-comment">; i64 vector</span>
+[<span class="hl-num">1.5</span> <span class="hl-num">2.7</span> <span class="hl-num">3.9</span>]       <span class="hl-comment">; f64 vector</span>
+[<span class="hl-bool">true</span> <span class="hl-bool">false</span> <span class="hl-bool">true</span>]   <span class="hl-comment">; boolean vector</span>
+[<span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span> <span class="hl-str">MSFT</span>]    <span class="hl-comment">; symbol vector</span>
+[<span class="hl-str">"hello"</span> <span class="hl-str">"world"</span>]   <span class="hl-comment">; string vector</span></code></pre>
+
+      <p>Vector operations are morsel-driven, processing 1024 elements at a time for cache efficiency.</p>
+
+      <h3>Vector Arithmetic</h3>
+      <p>All arithmetic operators auto-map over vectors (marked <code>FN_ATOMIC</code>):</p>
+      <pre><code>(<span class="hl-fn">+</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-num">10</span> <span class="hl-num">20</span> <span class="hl-num">30</span>])   <span class="hl-comment">; [11 22 33]</span>
+(<span class="hl-fn">*</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] <span class="hl-num">10</span>)            <span class="hl-comment">; [10 20 30] — scalar broadcast</span></code></pre>
+
+      <!-- ── Lists ── -->
+      <h2 id="lists">Lists</h2>
+      <p>Lists are heterogeneous collections of vectors. Created with the <code>list</code> function. Used as the data component of tables.</p>
+      <pre><code>(<span class="hl-fn">list</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>] [<span class="hl-str">A</span> <span class="hl-str">B</span> <span class="hl-str">C</span>])   <span class="hl-comment">; list of two vectors</span></code></pre>
+
+      <!-- ── Tables ── -->
+      <h2 id="tables">Tables</h2>
+      <p>Tables are the core data structure in Rayforce. A table is a vector of column names paired with a list of column vectors. All column vectors must have the same length.</p>
+      <pre><code><span class="hl-comment">; Create a table with explicit column names</span>
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span>
+  [<span class="hl-sym">sym</span> <span class="hl-sym">price</span> <span class="hl-sym">size</span>]
+  (<span class="hl-fn">list</span>
+    [<span class="hl-str">AAPL</span> <span class="hl-str">GOOG</span> <span class="hl-str">MSFT</span>]
+    [<span class="hl-num">150.5</span> <span class="hl-num">2800.0</span> <span class="hl-num">300.2</span>]
+    [<span class="hl-num">100</span> <span class="hl-num">50</span> <span class="hl-num">200</span>])))
+
+<span class="hl-comment">; Access column names</span>
+(<span class="hl-fn">key</span> trades)     <span class="hl-comment">; [sym price size]</span>
+
+<span class="hl-comment">; Access column data</span>
+(<span class="hl-fn">value</span> trades)   <span class="hl-comment">; list of 3 vectors</span></code></pre>
+
+      <!-- ── Dictionaries ── -->
+      <h2 id="dictionaries">Dictionaries</h2>
+      <p>Dictionaries map keys to values. Created with the <code>dict</code> function or with <code>{key: value}</code> syntax in query contexts.</p>
+      <pre><code>(<span class="hl-kw">set</span> d (<span class="hl-fn">dict</span> [<span class="hl-sym">a</span> <span class="hl-sym">b</span> <span class="hl-sym">c</span>] [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>]))
+(<span class="hl-fn">get</span> d <span class="hl-sym">'a</span>)    <span class="hl-comment">; 1</span>
+(<span class="hl-fn">key</span> d)       <span class="hl-comment">; [a b c]</span>
+(<span class="hl-fn">value</span> d)     <span class="hl-comment">; [1 2 3]</span></code></pre>
+
+      <!-- ── Function Calls ── -->
+      <h2 id="function-calls">Function Calls</h2>
+      <p>Rayfall uses prefix (Polish) notation. Every expression is either an atom or a parenthesized list where the first element is the function:</p>
+      <pre><code>(<span class="hl-fn">+</span> <span class="hl-num">1</span> <span class="hl-num">2</span>)           <span class="hl-comment">; 3</span>
+(<span class="hl-fn">*</span> (<span class="hl-fn">+</span> <span class="hl-num">1</span> <span class="hl-num">2</span>) <span class="hl-num">3</span>)     <span class="hl-comment">; 9 — nested</span>
+(<span class="hl-fn">sum</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])     <span class="hl-comment">; 6</span>
+(<span class="hl-fn">count</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])   <span class="hl-comment">; 3</span></code></pre>
+
+      <h3>Function Types</h3>
+      <p>Built-in functions fall into three arity categories:</p>
+      <table>
+        <thead>
+          <tr><th>Type</th><th>Arguments</th><th>Examples</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Unary</strong></td><td>Exactly 1</td><td><code>sum</code>, <code>count</code>, <code>not</code>, <code>neg</code>, <code>type</code></td></tr>
+          <tr><td><strong>Binary</strong></td><td>Exactly 2</td><td><code>+</code>, <code>-</code>, <code>set</code>, <code>take</code>, <code>at</code></td></tr>
+          <tr><td><strong>Variadic</strong></td><td>1 or more</td><td><code>if</code>, <code>do</code>, <code>fn</code>, <code>select</code>, <code>list</code></td></tr>
+        </tbody>
+      </table>
+
+      <h3>Function Flags</h3>
+      <table>
+        <thead>
+          <tr><th>Flag</th><th>Behavior</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>FN_ATOMIC</code></td><td>Auto-maps element-wise over vectors. <code>(+ [1 2] [3 4])</code> yields <code>[4 6]</code>.</td></tr>
+          <tr><td><code>FN_AGGR</code></td><td>Aggregation function. Reduces a vector to a scalar. <code>(sum [1 2 3])</code> yields <code>6</code>.</td></tr>
+          <tr><td><code>FN_SPECIAL_FORM</code></td><td>Arguments are not evaluated before being passed. Used by <code>set</code>, <code>if</code>, <code>fn</code>, <code>select</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <!-- ── Quoting ── -->
+      <h2 id="quoting">Quoting</h2>
+      <p>The single quote <code>'</code> prevents evaluation, creating a symbol atom. Useful for column references and dictionary keys:</p>
+      <pre><code><span class="hl-sym">'price</span>            <span class="hl-comment">; symbol, not a variable lookup</span>
+(<span class="hl-fn">quote</span> (<span class="hl-fn">+</span> <span class="hl-num">1</span> <span class="hl-num">2</span>))   <span class="hl-comment">; returns the unevaluated list (+ 1 2)</span></code></pre>
+
+      <!-- ── Comments ── -->
+      <h2 id="comments">Comments</h2>
+      <p>Line comments start with a semicolon and extend to the end of the line:</p>
+      <pre><code><span class="hl-comment">; This is a comment</span>
+(<span class="hl-fn">+</span> <span class="hl-num">1</span> <span class="hl-num">2</span>)  <span class="hl-comment">; inline comment</span></code></pre>
+
+      <!-- ── Control Flow ── -->
+      <h2 id="control-flow">Control Flow</h2>
+
+      <h3>Conditional: <code>if</code></h3>
+      <p>Evaluates the condition and returns the true or false branch. Supports <code>if/then/else</code> chaining:</p>
+      <pre><code>(<span class="hl-kw">if</span> (<span class="hl-fn">&gt;</span> x <span class="hl-num">0</span>) <span class="hl-str">"positive"</span> <span class="hl-str">"non-positive"</span>)
+
+<span class="hl-comment">; Multi-branch</span>
+(<span class="hl-kw">if</span> (<span class="hl-fn">&gt;</span> x <span class="hl-num">100</span>) <span class="hl-str">"high"</span>
+    (<span class="hl-fn">&gt;</span> x <span class="hl-num">50</span>)  <span class="hl-str">"mid"</span>
+              <span class="hl-str">"low"</span>)</code></pre>
+
+      <h3>Sequential Execution: <code>do</code></h3>
+      <p>Evaluates multiple expressions in order, returning the last result:</p>
+      <pre><code>(<span class="hl-kw">do</span>
+  (<span class="hl-kw">set</span> x <span class="hl-num">10</span>)
+  (<span class="hl-kw">set</span> y <span class="hl-num">20</span>)
+  (<span class="hl-fn">+</span> x y))    <span class="hl-comment">; 30</span></code></pre>
+
+      <h3>Variable Binding: <code>set</code> and <code>let</code></h3>
+      <pre><code>(<span class="hl-kw">set</span> x <span class="hl-num">42</span>)        <span class="hl-comment">; global binding</span>
+(<span class="hl-kw">let</span> y (<span class="hl-fn">+</span> x <span class="hl-num">1</span>))   <span class="hl-comment">; local binding</span></code></pre>
+
+      <h3 id="dotted-namespaces">Dotted Namespaces</h3>
+      <p>A symbol whose name contains one or more <code>.</code> is a <em>dotted</em> symbol — it names a path through nested dictionaries rather than a single global binding. <code>set</code> auto-creates the intermediate dicts on write, and read/delete traverse them with copy-on-write semantics so other references to the enclosing dict see their old value.</p>
+      <pre><code><span class="hl-comment">; Write a nested namespace — intermediate dicts are created automatically</span>
+(<span class="hl-kw">set</span> math.pi <span class="hl-num">3.14159</span>)
+(<span class="hl-kw">set</span> math.e  <span class="hl-num">2.71828</span>)
+(<span class="hl-kw">set</span> cfg.db.host <span class="hl-str">"localhost"</span>)
+(<span class="hl-kw">set</span> cfg.db.port <span class="hl-num">5432</span>)
+
+<span class="hl-comment">; Read walks the path segment by segment</span>
+math.pi          <span class="hl-comment">; 3.14159</span>
+cfg.db.host      <span class="hl-comment">; "localhost"</span>
+
+<span class="hl-comment">; Deleting a leaf cascades: cfg.db becomes empty, then cfg.db is itself removed</span>
+(<span class="hl-fn">del</span> cfg.db.host)
+(<span class="hl-fn">del</span> cfg.db.port)
+cfg.db           <span class="hl-comment">; error — cleaned up after last leaf went away</span></code></pre>
+
+      <p>When a dotted path lands on a <strong>temporal</strong> value (DATE / TIME / TIMESTAMP atom or vector), the trailing segment dispatches through the temporal extraction API instead of looking for a dict key. This lets you reach calendar fields uniformly:</p>
+      <pre><code>(<span class="hl-kw">set</span> d <span class="hl-num">2024.03.15</span>)
+d.yyyy           <span class="hl-comment">; 2024</span>
+d.mm             <span class="hl-comment">; 3</span>
+d.dd             <span class="hl-comment">; 15</span>
+d.dow            <span class="hl-comment">; 5   (ISO: Mon=1..Sun=7)</span>
+
+<span class="hl-comment">; Vector of dates — the whole column is lifted</span>
+(<span class="hl-kw">set</span> ds [<span class="hl-num">2024.01.01</span> <span class="hl-num">2024.06.15</span> <span class="hl-num">2024.12.31</span>])
+ds.yyyy          <span class="hl-comment">; [2024 2024 2024]</span>
+ds.doy           <span class="hl-comment">; [1 167 366]</span>
+
+<span class="hl-comment">; Inside a table, col.yyyy resolves against the column vector</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">by:</span> Ts.date})   <span class="hl-comment">; group by day</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades <span class="hl-sym">by:</span> Ts.hh})     <span class="hl-comment">; group by hour of day</span></code></pre>
+
+      <p>Recognised temporal segments: <code>yyyy</code>, <code>mm</code>, <code>dd</code>, <code>hh</code>, <code>minute</code>, <code>ss</code>, <code>dow</code>, <code>doy</code>, plus the two truncations <code>date</code> (drop time-of-day) and <code>time</code> (drop date). Null input rows propagate to null output rows — the null sentinel bit pattern is not decoded as a bogus calendar value.</p>
+
+      <h3 id="reserved-namespace">Reserved <code>.*</code> Namespace</h3>
+      <p>Symbols whose name starts with <code>.</code> are a reserved system namespace populated at startup by builtin registration. Typing one of these at the REPL returns the namespace dict for introspection:</p>
+      <pre><code>.sys     <span class="hl-comment">; {gc:&lt;.sys.gc&gt; exec:&lt;.sys.exec&gt; info:&lt;.sys.info&gt; mem:&lt;.sys.mem&gt; build:&lt;.sys.build&gt;}</span>
+.os      <span class="hl-comment">; {getenv:&lt;.os.getenv&gt; setenv:&lt;.os.setenv&gt;}</span>
+.ipc     <span class="hl-comment">; {open:&lt;.ipc.open&gt; close:&lt;.ipc.close&gt; send:&lt;.ipc.send&gt;}</span>
+.csv     <span class="hl-comment">; {read:&lt;.csv.read&gt; write:&lt;.csv.write&gt;}</span></code></pre>
+      <p>Every <code>.</code>-prefixed name is protected: <code>set</code>, <code>let</code>, lambda parameters, and <code>del</code> all refuse such names with <code>error: reserve</code>. This keeps user code from shadowing the builtin surface, regardless of where it's bound.</p>
+      <pre><code>(<span class="hl-kw">set</span> .os.foo <span class="hl-num">1</span>)        <span class="hl-comment">; error: reserve</span>
+(<span class="hl-kw">let</span> .sys.gc <span class="hl-num">99</span>)       <span class="hl-comment">; error: reserve</span>
+((<span class="hl-kw">fn</span> [.sys.gc] .sys.gc) <span class="hl-num">7</span>)  <span class="hl-comment">; error: reserve (lambda parameter name)</span>
+(<span class="hl-fn">del</span> .sys.gc)          <span class="hl-comment">; error: reserve: cannot delete reserved binding</span></code></pre>
+
+      <h3>Error Handling: <code>try</code> / <code>raise</code></h3>
+      <pre><code>(<span class="hl-kw">try</span>
+  (<span class="hl-fn">raise</span> <span class="hl-str">"oops"</span>)     <span class="hl-comment">; throws an error</span>
+  (<span class="hl-kw">fn</span> [e] <span class="hl-str">"caught"</span>)) <span class="hl-comment">; handler receives error → "caught"</span>
+
+(<span class="hl-fn">raise</span> <span class="hl-str">"custom error"</span>) <span class="hl-comment">; throw an error</span></code></pre>
+
+      <!-- ── Lambdas ── -->
+      <h2 id="lambdas">Lambdas &amp; the VM</h2>
+      <p>User-defined functions are created with <code>fn</code>. Lambdas compile lazily to bytecode and run in a stack-based computed-goto VM (<code>ray_vm_t</code>) with a 1024-slot program stack and return stack.</p>
+      <pre><code><span class="hl-comment">; Named function</span>
+(<span class="hl-kw">set</span> square (<span class="hl-kw">fn</span> [x] (<span class="hl-fn">*</span> x x)))
+(<span class="hl-fn">square</span> <span class="hl-num">5</span>)    <span class="hl-comment">; 25</span>
+
+<span class="hl-comment">; Multi-expression body</span>
+(<span class="hl-kw">set</span> clamp (<span class="hl-kw">fn</span> [x lo hi]
+  (<span class="hl-kw">if</span> (<span class="hl-fn">&lt;</span> x lo) lo
+      (<span class="hl-fn">&gt;</span> x hi) hi
+              x)))
+
+<span class="hl-comment">; Anonymous lambda passed to map</span>
+(<span class="hl-fn">map</span> (<span class="hl-kw">fn</span> [x] (<span class="hl-fn">*</span> x <span class="hl-num">2</span>)) [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span>])   <span class="hl-comment">; [2 4 6]</span></code></pre>
+
+      <p>The VM supports trap frames for <code>try</code>/<code>raise</code> error handling, ensuring exceptions unwind cleanly through compiled code.</p>
+
+      <!-- ── Select & Update ── -->
+      <h2 id="select-update">Select &amp; Update</h2>
+      <p>The <code>select</code> and <code>update</code> builtins bridge to the Rayforce DAG executor. They accept a dictionary of options:</p>
+
+      <h3>select</h3>
+      <pre><code><span class="hl-comment">; Basic filter</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades  <span class="hl-sym">where:</span> (<span class="hl-fn">&gt;</span> price <span class="hl-num">100</span>)})
+
+<span class="hl-comment">; Project specific columns with expressions</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades
+         <span class="hl-sym">cols:</span> {<span class="hl-sym">sym:</span> sym  <span class="hl-sym">notional:</span> (<span class="hl-fn">*</span> price size)}})
+
+<span class="hl-comment">; Group by with aggregation</span>
+(<span class="hl-kw">select</span> {<span class="hl-sym">from:</span> trades
+         <span class="hl-sym">by:</span>   {<span class="hl-sym">sym:</span> sym}
+         <span class="hl-sym">cols:</span> {<span class="hl-sym">avg_price:</span> (<span class="hl-fn">avg</span> price)
+                <span class="hl-sym">total_size:</span> (<span class="hl-fn">sum</span> size)}})</code></pre>
+
+      <h3>update</h3>
+      <pre><code><span class="hl-comment">; Add a computed column</span>
+(<span class="hl-kw">update</span> {<span class="hl-sym">from:</span> trades
+          <span class="hl-sym">cols:</span> {<span class="hl-sym">notional:</span> (<span class="hl-fn">*</span> price size)}})</code></pre>
+
+      <h3>insert / upsert</h3>
+      <pre><code><span class="hl-comment">; Insert new rows</span>
+(<span class="hl-kw">insert</span> {<span class="hl-sym">into:</span> trades
+          <span class="hl-sym">values:</span> (<span class="hl-fn">table</span> [sym price size]
+                    (<span class="hl-fn">list</span> [<span class="hl-str">TSLA</span>] [<span class="hl-num">250.0</span>] [<span class="hl-num">300</span>]))})</code></pre>
+
+      <!-- ── C API ── -->
+      <h2 id="c-api">C API</h2>
+      <p>Rayforce exposes a single public header: <code>include/rayforce.h</code>. The core abstraction is <code>ray_t</code> &mdash; a 32-byte block header. Every object (atom, vector, list, table) is a <code>ray_t</code> with data following at byte 32.</p>
+
+      <h3>Key Types</h3>
+      <table>
+        <thead>
+          <tr><th>Type</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ray_t</code></td><td>32-byte universal block header for all objects</td></tr>
+          <tr><td><code>ray_err_t</code></td><td>Error code return type</td></tr>
+          <tr><td><code>ray_str_t</code></td><td>16-byte string element (inline or pooled)</td></tr>
+          <tr><td><code>ray_csr_t</code></td><td>CSR graph edge storage</td></tr>
+          <tr><td><code>ray_rel_t</code></td><td>Graph relationship (forward + reverse CSR)</td></tr>
+          <tr><td><code>ray_arena_t</code></td><td>Bump allocator for bulk allocations</td></tr>
+          <tr><td><code>ray_vm_t</code></td><td>Bytecode VM for compiled lambdas</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Error Handling</h3>
+      <pre><code><span class="hl-type">ray_t</span>* result = ray_eval_str(<span class="hl-str">"(+ 1 2)"</span>);
+<span class="hl-kw">if</span> (RAY_IS_ERR(result)) {
+    <span class="hl-comment">// handle error</span>
+}
+<span class="hl-comment">// RAY_ERR_PTR() to create error pointers</span></code></pre>
+
+      <h3>Memory Management</h3>
+      <p>Never use <code>malloc</code>/<code>free</code>. Use the Rayforce allocator:</p>
+      <pre><code><span class="hl-type">ray_t</span>* obj = ray_alloc(size);    <span class="hl-comment">// general allocation</span>
+ray_release(obj);                 <span class="hl-comment">// decrement refcount, free if zero</span>
+ray_retain(obj);                  <span class="hl-comment">// increment refcount</span>
+<span class="hl-type">ray_t</span>* copy = ray_cow(obj);      <span class="hl-comment">// copy-on-write</span></code></pre>
+
+      <!-- ── DAG & Execution ── -->
+      <h2 id="dag-execution">DAG &amp; Execution</h2>
+      <p>The execution pipeline builds a lazy DAG, optimizes it, then executes with fused morsel-driven processing:</p>
+      <pre><code><span class="hl-comment">// 1. Build lazy DAG</span>
+<span class="hl-type">ray_t</span>* g = ray_graph_new(df);
+<span class="hl-type">ray_t</span>* filtered = ray_filter(g, predicate);
+<span class="hl-type">ray_t</span>* projected = ray_project(g, filtered, cols);
+
+<span class="hl-comment">// 2. Execute (optimizer runs automatically)</span>
+<span class="hl-type">ray_t</span>* result = ray_execute(g, projected);</code></pre>
+
+      <h3>Optimizer Passes</h3>
+      <ol>
+        <li><strong>Type inference</strong> &mdash; propagate types through the DAG</li>
+        <li><strong>Constant folding</strong> &mdash; evaluate compile-time-known expressions</li>
+        <li><strong>SIP</strong> (Sideways Information Passing) &mdash; propagate selection bitmaps backward through expand chains</li>
+        <li><strong>Factorize</strong> &mdash; avoid materializing cross-products with factorized vectors</li>
+        <li><strong>Predicate pushdown</strong> &mdash; move filters closer to data sources</li>
+        <li><strong>Filter reorder</strong> &mdash; cheapest filters first</li>
+        <li><strong>Fusion</strong> &mdash; merge adjacent operations into single morsel loops</li>
+        <li><strong>DCE</strong> (Dead Code Elimination) &mdash; remove unused DAG nodes</li>
+      </ol>
+
+      <!-- ── Graph Engine ── -->
+      <h2 id="graph-engine">CSR Storage</h2>
+      <p>Rayforce stores graph edges in double-indexed Compressed Sparse Row (CSR) format: one forward index (source to destination) and one reverse index (destination to source). Both indices are built simultaneously.</p>
+      <pre><code><span class="hl-comment">// Build CSR from edge list</span>
+<span class="hl-type">ray_csr_t</span> csr;
+ray_csr_build(&amp;csr, src_ids, dst_ids, n_edges);
+
+<span class="hl-comment">// Persist to disk</span>
+ray_csr_save(&amp;csr, <span class="hl-str">"edges"</span>);
+
+<span class="hl-comment">// Memory-map for zero-copy access</span>
+ray_csr_mmap(&amp;csr, <span class="hl-str">"edges"</span>);</code></pre>
+
+      <h2 id="graph-algorithms">Graph Algorithms</h2>
+      <p>Available as DAG opcodes, all integrated into the same morsel-driven pipeline:</p>
+      <table>
+        <thead>
+          <tr><th>Opcode</th><th>Algorithm</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>OP_EXPAND</code></td><td>1-Hop Expand</td><td>Follow edges one step from source nodes</td></tr>
+          <tr><td><code>OP_VAR_EXPAND</code></td><td>BFS</td><td>Variable-length path expansion (breadth-first)</td></tr>
+          <tr><td><code>OP_SHORTEST_PATH</code></td><td>Shortest Path</td><td>Single-source shortest paths</td></tr>
+          <tr><td><code>OP_ASTAR</code></td><td>A*</td><td>Heuristic-guided shortest path</td></tr>
+          <tr><td><code>OP_K_SHORTEST</code></td><td>Yen's K-Shortest</td><td>K shortest loopless paths</td></tr>
+          <tr><td><code>OP_WCO_JOIN</code></td><td>LFTJ</td><td>Worst-case optimal join (Leapfrog Triejoin)</td></tr>
+          <tr><td><code>OP_BETWEENNESS</code></td><td>Brandes</td><td>Betweenness centrality</td></tr>
+          <tr><td><code>OP_CLOSENESS</code></td><td>Closeness</td><td>Closeness centrality</td></tr>
+          <tr><td><code>OP_CLUSTER_COEFF</code></td><td>Clustering</td><td>Local clustering coefficients</td></tr>
+          <tr><td><code>OP_RANDOM_WALK</code></td><td>Random Walk</td><td>Random walks on graph</td></tr>
+          <tr><td><code>OP_MST</code></td><td>Kruskal</td><td>Minimum spanning tree</td></tr>
+        </tbody>
+      </table>
+
+      <!-- ── Pipeline & Optimizer ── -->
+      <h2 id="pipeline">Pipeline &amp; Optimizer</h2>
+      <p>The full execution pipeline:</p>
+      <pre><code>Rayfall source
+  |  parse (ASCII dispatch table, recursive descent)
+  v
+ray_t objects (no separate AST)
+  |  ray_eval() / bytecode VM
+  v
+Lazy DAG construction
+  |  ray_graph_new() -> ray_scan/ray_add/ray_filter/...
+  v
+Optimizer (8 passes)
+  |  type inference -> constant fold -> SIP -> factorize
+  |  -> predicate pushdown -> filter reorder -> fusion -> DCE
+  v
+Fused morsel-driven executor
+  |  bytecode over register slots, 1024 elements per morsel
+  v
+Result (ray_t)</code></pre>
+
+      <!-- ── Memory Model ── -->
+      <h2 id="memory-model">Memory Model</h2>
+      <ul>
+        <li><strong>Buddy allocator</strong> with thread-local arenas for contention-free allocation</li>
+        <li><strong>Slab cache</strong> for small, frequently-allocated objects</li>
+        <li><strong>COW ref counting</strong> &mdash; <code>ray_cow()</code> returns a private copy only when the refcount exceeds 1</li>
+        <li><strong>Arena (bump) allocator</strong> (<code>ray_arena_t</code>) for bulk short-lived allocations; blocks carry <code>RAY_ATTR_ARENA</code>, making retain/release no-ops</li>
+        <li><strong>Per-VM heaps</strong> &mdash; each heap carries a <code>heap_id</code> (u16); cross-heap frees enqueue to a lock-free LIFO, reclaimed via <code>ray_heap_flush_foreign()</code></li>
+      </ul>
+
+      <!-- ── Storage ── -->
+      <h2 id="storage">Files &amp; Partitions</h2>
+      <ul>
+        <li><strong>Column files</strong> &mdash; native binary format for vectors and CSR graphs, supports mmap</li>
+        <li><strong>Sym table</strong> &mdash; global string intern table, arena-backed, append-only persistence with file locking</li>
+        <li><strong>CSV loader</strong> &mdash; mmap-based, parallel parse, automatic type inference, null handling, sym merge</li>
+        <li><strong>File I/O</strong> &mdash; cross-platform locking (flock/LockFileEx), fsync, atomic rename</li>
+      </ul>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="tutorial-analytics.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">Advanced Analytics Tutorial</span></a>
+        <a href="rayfall-functions.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Functions Reference</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

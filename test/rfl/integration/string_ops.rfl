@@ -1,0 +1,18 @@
+;; Ported from test_lang_rf.inc::test_rf_string_ops.
+
+;; ========== STRING CONCAT ==========
+(concat "hel" "lo") -- "hello"
+(concat "" "test") -- "test"
+(concat "test" "") -- "test"
+;; ========== STRING COUNT ==========
+(count "hello") -- 5
+(count "") -- 0
+;; ========== STRING INDEXING ==========
+(at "hello" 0) -- 'h'
+(at "hello" 4) -- 'o'
+;; ========== STRING TAKE ==========
+(take "hello" 3) -- "hel"
+(take "hello" -2) -- "lo"
+;; ========== STRING FIRST/LAST ==========
+(first "hello") -- 'h'
+(last "hello") -- 'o'

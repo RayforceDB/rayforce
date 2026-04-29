@@ -1,0 +1,9 @@
+;; Invariants for `dd` — extract day-of-month.
+
+(dd 2024.06.15) -- 15
+(dd 2024.01.01) -- 1
+(dd 2024.01.31) -- 31
+
+;; range: 1..31
+(set D [2024.01.15 2024.06.30 2024.02.29])
+(count D) -- (sum (and (>= (dd D) 1) (<= (dd D) 31)))

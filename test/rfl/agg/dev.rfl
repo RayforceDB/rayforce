@@ -1,0 +1,9 @@
+;; Invariants for `dev` (standard deviation).
+
+;; constant vector → dev == 0
+(dev [5 5 5 5 5]) -- 0.0
+(dev [1 1 1]) -- 0.0
+
+;; non-negative
+(set V (rand 100 1000))
+1 -- (as 'I64 (>= (dev V) 0.0))

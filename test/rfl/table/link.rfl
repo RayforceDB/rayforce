@@ -1,0 +1,74 @@
+;; Linked columns — (.col.link target int-vec) + dotted deref.
+
+;; alter set on an indexed column must drop the attached index
+;; (the alter set path bypasses ray_vec_set's mutation guard, so the
+;; idxop layer needs an explicit drop).
+(set tv [5 1 9 3 7])
+(set tvi (.idx.zone tv))
+(.idx.has? tvi)         -- true
+(alter 'tvi set 0 100)
+(.idx.has? tvi)         -- false
+
+;; A FAILED alter set (out-of-range / wrong-type idx) must NOT drop
+;; the index — the column data is unchanged, so the index stays valid.
+(set tv2 [5 1 9 3 7])
+(set tv2i (.idx.zone tv2))
+(.idx.has? tv2i)        -- true
+(alter 'tv2i set 99 100) !- index
+(.idx.has? tv2i)        -- true
+(alter 'tv2i set "bad" 100) !- type
+(.idx.has? tv2i)        -- true
+
+;; alter set on a vec shared between multiple env bindings must NOT
+;; mutate or under-retain the other holders.  Pre-fix, ray_cow's
+;; release would over-decrement the borrowed env ref and either
+;; leak (rc>1 path, copy not released on error) or UAF (env's other
+;; binding stale-pointer).  Pin the visible-state contract: the
+;; non-mutated binding sees the original values, the mutated one
+;; sees the new values.
+(set sv [5 1 9 3 7])
+(set sa sv)
+(set sb sv)
+(alter 'sa set 0 100)
+sa                       -- [100 1 9 3 7]
+sb                       -- [5 1 9 3 7]
+sv                       -- [5 1 9 3 7]
+
+(set custs (table [id age name] (list [100 200 300] [18 25 42] (list 'alice 'bob 'carol))))
+
+;; Build the link from raw row ids.
+(set rids [2 0 1 2])
+(set linked (.col.link 'custs rids))
+
+;; Introspection round-trips.
+(.col.link? linked)        -- true
+(.col.target linked)       -- 'custs
+(.col.link? rids)          -- false
+
+;; Deref through each column type — int, sym.
+linked.id                  -- [300 100 200 300]
+linked.age                 -- [42 18 25 42]
+linked.name                -- (list 'carol 'alice 'bob 'carol)
+
+;; Detach restores a plain int column.
+(set unlinked (.col.unlink linked))
+(.col.link? unlinked)      -- false
+
+;; Reject a target that doesn't name a table.
+(.col.link 'no_such_table rids) !- name
+
+;; Reject non-int link columns.
+(.col.link 'custs [1.5 2.5]) !- type
+
+;; Coexistence with an accelerator index — the index hangs off the
+;; linked column; deref still resolves correctly.
+(set both (.idx.zone linked))
+(.idx.has? both)           -- true
+(.col.link? both)          -- true
+both.age                   -- [42 18 25 42]
+
+;; Drop the index — link survives.
+(set link_only (.idx.drop both))
+(.idx.has? link_only)      -- false
+(.col.link? link_only)     -- true
+link_only.age              -- [42 18 25 42]

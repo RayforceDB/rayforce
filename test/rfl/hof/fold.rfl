@@ -1,0 +1,25 @@
+;; Invariants for `fold`.
+
+(fold + 0 [1 2 3 4 5]) -- 15
+(fold + 0 []) -- 0
+(fold * 1 [1 2 3 4]) -- 24
+
+;; fold is sum for +/0
+(set V (rand 50 1000))
+(sum V) -- (fold + 0 V)
+
+;; fold without seed
+(fold + [1 2 3 4 5]) -- 15
+(fold * [1 2 3 4]) -- 24
+
+;; fold with seed accumulates from seed
+(fold + 10 [1 2 3 4 5]) -- 25
+
+;; lambda
+(fold (fn [a b] (+ a b)) [1 2 3]) -- 6
+
+;; empty + seed → seed
+(fold + 42 ()) -- 42
+
+;; floats
+(fold + [1.5 2.5 3.0]) -- 7.0

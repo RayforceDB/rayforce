@@ -1,0 +1,47 @@
+;; Invariants for `modify` — functional column update on a table.
+;; (modify tbl col-name fn) returns a new table with the named column
+;; transformed by fn; the source table is left untouched (functional).
+
+(set T (table [a b] (list [1 2 3 4 5] [10.0 20.0 30.0 40.0 50.0])))
+
+;; row count preserved
+(set T2 (modify T 'a (fn [x] (* x 10))))
+(count T2) -- 5
+
+;; the named column is transformed
+(sum (at T2 'a)) -- 150
+
+;; non-named columns are passed through unchanged
+(sum (at T2 'b)) -- (sum (at T 'b))
+
+;; source table is untouched
+(sum (at T 'a)) -- 15
+
+;; modifying b with a float-returning fn updates only b
+(set T3 (modify T 'b (fn [x] (+ x 1.0))))
+(sum (at T3 'b)) -- 155.0
+(sum (at T3 'a)) -- 15
+
+;; chained modifies compose
+(set T4 (modify (modify T 'a (fn [x] (neg x))) 'b (fn [x] (* x 2.0))))
+(sum (at T4 'a)) -- -15
+(sum (at T4 'b)) -- 300.0
+
+;; ──────────────────────────────────────────────────────────────────
+;; Builtin atomic functions are accepted directly (parity with `map`).
+;; modify used to require a (fn …) wrapper; this is the regression.
+;; ──────────────────────────────────────────────────────────────────
+
+(set Tn (table [a] (list [-3 -1 2 4])))
+
+;; same result as the lambda-wrapped form
+(at (modify Tn 'a neg) 'a) -- (at (modify Tn 'a (fn [x] (neg x))) 'a)
+(at (modify Tn 'a abs) 'a) -- [3 1 2 4]
+
+;; chain of builtins: abs then neg
+(sum (at (modify (modify Tn 'a abs) 'a neg) 'a)) -- -10
+
+;; floor / ceil on float column
+(set Tf (table [v] (list [1.7 2.3 -0.5])))
+(at (modify Tf 'v floor) 'v) -- [1.0 2.0 -1.0]
+(at (modify Tf 'v ceil) 'v)  -- [2.0 3.0 0.0]

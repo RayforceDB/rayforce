@@ -1,0 +1,11 @@
+(if (nil? (resolve 'n)) (set n 10000000))
+
+(set t (table [OrderId Symbol Price Size Tape Timestamp] 
+    (list (take (guid 1000000) n)
+          (take [AAPL GOOG MSFT IBM AMZN FB BABA] n) 
+          (as 'F64 (til n)) 
+          (take (+ 1 (til 3)) n)
+          (take (as 'STR (til 10)) n)
+          (as 'TIMESTAMP (til n)) 
+    ))
+)

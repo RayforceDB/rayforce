@@ -1,0 +1,27 @@
+;; Aggregation behaviour over vectors containing nulls.
+
+;; sum SKIPS nulls — sum of [1 2 0N 4] is 7, not "null".
+;; All-null and empty inputs both yield identity 0.
+(sum [1 2 0N 4]) -- 7
+(sum [0N 0N 0N]) -- 0
+(sum (as 'I64 [])) -- 0
+
+;; count counts ALL elements including nulls.
+(count [1 2 0N 4]) -- 4
+(count [0N 0N 0N]) -- 3
+
+;; avg uses non-null divisor: (1+2+4) / 3
+(avg [1 2 0N 4]) -- 2.3333333333333335
+
+;; min/max skip nulls
+(min [3 0N 1 2]) -- 1
+(max [0N 1 5 3]) -- 5
+
+;; first/last skip nulls
+(first [0N 0N 7 8]) -- 7
+(last [7 8 0N 0N]) -- 8
+
+;; Edge: avg over all-null returns null (no non-null divisor).
+;; sum over all-null yields identity 0, so it is NOT null.
+(nil? (sum [0N 0N 0N])) -- false
+(nil? (avg [0N 0N])) -- true

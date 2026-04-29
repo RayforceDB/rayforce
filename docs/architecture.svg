@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 580 720" font-family="'Inter','Helvetica Neue',Arial,sans-serif" font-size="12">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0e1b24"/>
+      <stop offset="100%" stop-color="#162a36"/>
+    </linearGradient>
+    <linearGradient id="box-dag" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a3040"/>
+      <stop offset="100%" stop-color="#162a36"/>
+    </linearGradient>
+    <linearGradient id="box-opt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a3040"/>
+      <stop offset="100%" stop-color="#162a36"/>
+    </linearGradient>
+    <linearGradient id="box-exec" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a3040"/>
+      <stop offset="100%" stop-color="#162a36"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="580" height="720" rx="12" fill="url(#bg)"/>
+
+  <!-- User Code -->
+  <text x="290" y="36" text-anchor="middle" fill="#6b8a9e" font-size="13" font-weight="600">User Code</text>
+
+  <!-- Arrow down -->
+  <line x1="290" y1="46" x2="290" y2="66" stroke="#3a5261" stroke-width="1.5"/>
+  <polygon points="290,72 285,64 295,64" fill="#3a5261"/>
+  <text x="282" y="60" text-anchor="end" fill="#8ba8b8" font-size="9" font-family="'JetBrains Mono','SF Mono',monospace">td_graph_new(tbl)</text>
+
+  <!-- Lazy DAG Box -->
+  <rect x="50" y="78" width="480" height="150" rx="10" fill="url(#box-dag)" stroke="#3a5261" stroke-width="1"/>
+  <text x="290" y="102" text-anchor="middle" fill="#8ba8b8" font-size="14" font-weight="700" letter-spacing="0.5">Lazy DAG</text>
+  <line x1="80" y1="112" x2="500" y2="112" stroke="#2a3e4b" stroke-width="1"/>
+
+  <g fill="#dce8ee" font-size="11" font-family="'JetBrains Mono','SF Mono',monospace">
+    <text x="90" y="134">td_scan</text>       <text x="230" y="134">td_filter</text>     <text x="380" y="134">td_group</text>
+    <text x="90" y="154">td_join</text>        <text x="230" y="154">td_expand</text>     <text x="380" y="154">td_sort_op</text>
+    <text x="90" y="174">td_window_op</text>   <text x="230" y="174">td_wco_join</text>   <text x="380" y="174">td_asof_join</text>
+    <text x="90" y="194">td_add</text>         <text x="230" y="194">td_eq</text>         <text x="380" y="194">td_like</text>
+  </g>
+  <text x="290" y="219" text-anchor="middle" fill="#3a5261" font-size="10">40+ operators — no execution yet</text>
+
+  <!-- Arrow down -->
+  <line x1="290" y1="228" x2="290" y2="252" stroke="#3a5261" stroke-width="1.5"/>
+  <polygon points="290,258 285,250 295,250" fill="#3a5261"/>
+  <text x="282" y="246" text-anchor="end" fill="#8ba8b8" font-size="9" font-family="'JetBrains Mono','SF Mono',monospace">td_optimize(g, root)</text>
+
+  <!-- Optimizer Box -->
+  <rect x="40" y="264" width="500" height="200" rx="10" fill="url(#box-opt)" stroke="#3a5261" stroke-width="1"/>
+  <text x="290" y="288" text-anchor="middle" fill="#4b6777" font-size="14" font-weight="700" letter-spacing="0.5">Optimizer</text>
+  <text x="290" y="304" text-anchor="middle" fill="#3a5261" font-size="10">10 passes, bottom-up then top-down</text>
+  <line x1="70" y1="312" x2="510" y2="312" stroke="#2a3e4b" stroke-width="1"/>
+
+  <g font-size="11">
+    <text x="80" y="334" fill="#4b6777">1.</text>   <text x="102" y="334" fill="#dce8ee">Type inference</text>
+    <text x="310" y="334" fill="#4b6777">2.</text>   <text x="336" y="334" fill="#dce8ee">Constant folding</text>
+    <text x="80" y="356" fill="#4b6777">3.</text>    <text x="102" y="356" fill="#dce8ee">SIP</text>
+    <text x="310" y="356" fill="#4b6777">4.</text>   <text x="336" y="356" fill="#dce8ee">Factorize</text>
+    <text x="80" y="378" fill="#4b6777">5.</text>    <text x="102" y="378" fill="#dce8ee">Predicate pushdown</text>
+    <text x="310" y="378" fill="#4b6777">6.</text>   <text x="336" y="378" fill="#dce8ee">Filter reorder</text>
+    <text x="80" y="400" fill="#4b6777">7.</text>    <text x="102" y="400" fill="#dce8ee">Projection pushdown</text>
+    <text x="310" y="400" fill="#4b6777">8.</text>   <text x="336" y="400" fill="#dce8ee">Partition pruning</text>
+    <text x="80" y="422" fill="#4b6777">9.</text>    <text x="102" y="422" fill="#dce8ee">Fusion</text>
+    <text x="310" y="422" fill="#4b6777">10.</text>  <text x="340" y="422" fill="#dce8ee">Dead code elim</text>
+  </g>
+  <text x="290" y="454" text-anchor="middle" fill="#3a5261" font-size="10">sideways info passing + graph-aware rewriting</text>
+
+  <!-- Arrow down -->
+  <line x1="290" y1="464" x2="290" y2="488" stroke="#3a5261" stroke-width="1.5"/>
+  <polygon points="290,494 285,486 295,486" fill="#3a5261"/>
+  <text x="282" y="482" text-anchor="end" fill="#8ba8b8" font-size="9" font-family="'JetBrains Mono','SF Mono',monospace">td_execute(g, root)</text>
+
+  <!-- Executor Box -->
+  <rect x="40" y="500" width="500" height="140" rx="10" fill="url(#box-exec)" stroke="#3a5261" stroke-width="1"/>
+  <text x="290" y="524" text-anchor="middle" fill="#6b8a9e" font-size="14" font-weight="700" letter-spacing="0.5">Fused Morsel Executor</text>
+  <line x1="70" y1="534" x2="510" y2="534" stroke="#2a3e4b" stroke-width="1"/>
+
+  <g fill="#dce8ee" font-size="11">
+    <text x="80" y="556">Bytecode over register slots</text>
+    <text x="80" y="576">1024-element morsels (L1 resident)</text>
+    <text x="80" y="596">Radix-partitioned hash joins (L2)</text>
+    <text x="80" y="616">Parallel thread pool dispatch</text>
+  </g>
+  <text x="290" y="632" text-anchor="middle" fill="#3a5261" font-size="10">element-wise ops fused into single morsel pass</text>
+
+  <!-- Arrow down -->
+  <line x1="290" y1="640" x2="290" y2="670" stroke="#3a5261" stroke-width="1.5"/>
+  <polygon points="290,676 285,668 295,668" fill="#3a5261"/>
+
+  <!-- Result -->
+  <rect x="190" y="680" width="200" height="32" rx="8" fill="#1a3040" stroke="#4b6777" stroke-width="1.5"/>
+  <text x="290" y="701" text-anchor="middle" fill="#8ba8b8" font-size="13" font-weight="600" font-family="'JetBrains Mono','SF Mono',monospace">td_t* result</text>
+</svg>

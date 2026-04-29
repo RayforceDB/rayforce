@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IPC Guide — Rayforce Documentation</title>
+  <meta name="description" content="Rayforce IPC guide: client-server architecture, remote queries, authentication, multi-process patterns, and the C API for inter-process communication.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link active">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>IPC Guide</span>
+      </div>
+
+      <h1>IPC Guide</h1>
+      <p class="page-subtitle">Client-server communication: starting a server, connecting from clients, remote queries, authentication, multi-process patterns, and the C API.</p>
+
+      <p>Rayforce includes a built-in IPC layer that turns any Rayforce process into a query server. Clients connect over TCP, send queries or data, and receive serialized results back. This guide walks through the full workflow from starting a server to building multi-process architectures.</p>
+
+      <!-- 1. Getting Started -->
+      <h2 id="getting-started">1. Getting Started</h2>
+      <p>The fastest way to try IPC: start a server in one terminal and connect from another.</p>
+
+      <h3>Start a Server</h3>
+      <p>The <code>-p</code> flag starts Rayforce in server mode, listening on the given port:</p>
+      <pre><code>./rayforce -p <span class="hl-num">5000</span></code></pre>
+      <p>The server starts, prints a listening message, and waits for connections. It also runs a REPL, so you can interact with it directly.</p>
+
+      <h3>Connect from a Client</h3>
+      <p>In a second terminal, start a regular Rayforce REPL and open a connection:</p>
+      <pre><code><span class="hl-comment">;; Open a handle to the server</span>
+(<span class="hl-kw">set</span> h (<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000"</span>))</code></pre>
+      <p>The <code>.ipc.open</code> function returns a connection handle. Use <code>.ipc.send</code> to send a query string to the server, which parses, evaluates, and returns the result:</p>
+      <pre><code><span class="hl-comment">;; Send a query, get the result back</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(+ 1 2)"</span>)
+<span class="hl-comment">;; => 3</span></code></pre>
+      <p>When you are done, close the connection:</p>
+      <pre><code>(<span class="hl-fn">.ipc.close</span> h)</code></pre>
+
+      <!-- 2. Loading Data on the Server -->
+      <h2 id="loading-data">2. Loading Data on the Server</h2>
+      <p>A server is most useful when it holds data that clients query remotely. Use an init script to load data at startup.</p>
+
+      <h3>Start with an Init Script</h3>
+      <pre><code>./rayforce -p <span class="hl-num">5000</span> init.rfl</code></pre>
+      <p>The server executes <code>init.rfl</code> before accepting connections. A typical init script creates tables:</p>
+      <pre><code><span class="hl-comment">;; init.rfl — load data into the server</span>
+(<span class="hl-kw">set</span> trades (<span class="hl-fn">table</span> [<span class="hl-sym">sym</span> <span class="hl-sym">price</span> <span class="hl-sym">qty</span> <span class="hl-sym">time</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">AAPL</span> <span class="hl-sym">MSFT</span> <span class="hl-sym">GOOG</span>]
+        [<span class="hl-num">150.5</span> <span class="hl-num">2800.0</span> <span class="hl-num">151.2</span> <span class="hl-num">310.0</span> <span class="hl-num">2795.0</span>]
+        [<span class="hl-num">100</span> <span class="hl-num">50</span> <span class="hl-num">200</span> <span class="hl-num">75</span> <span class="hl-num">120</span>]
+        [<span class="hl-num">09:30:00</span> <span class="hl-num">09:30:01</span> <span class="hl-num">09:30:05</span> <span class="hl-num">09:30:10</span> <span class="hl-num">09:30:12</span>])))
+
+(<span class="hl-kw">set</span> quotes (<span class="hl-fn">table</span> [<span class="hl-sym">sym</span> <span class="hl-sym">bid</span> <span class="hl-sym">ask</span>]
+  (<span class="hl-fn">list</span> [<span class="hl-sym">AAPL</span> <span class="hl-sym">GOOG</span> <span class="hl-sym">MSFT</span>]
+        [<span class="hl-num">150.0</span> <span class="hl-num">2790.0</span> <span class="hl-num">309.5</span>]
+        [<span class="hl-num">150.5</span> <span class="hl-num">2800.0</span> <span class="hl-num">310.5</span>])))
+
+(<span class="hl-fn">println</span> <span class="hl-str">"Loaded trades and quotes"</span>)</code></pre>
+
+      <h3>Query from a Client</h3>
+      <p>Once the server has data, clients can query it remotely:</p>
+      <pre><code>(<span class="hl-kw">set</span> h (<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000"</span>))
+
+<span class="hl-comment">;; Query the remote trades table</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"trades"</span>)
+<span class="hl-comment">;; => the full trades table is returned</span>
+
+<span class="hl-comment">;; Run a filtered query</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(select {from: trades where: (= sym 'AAPL)})"</span>)
+
+(<span class="hl-fn">.ipc.close</span> h)</code></pre>
+
+      <!-- 3. Remote Queries -->
+      <h2 id="remote-queries">3. Remote Queries</h2>
+      <p>The server evaluates any valid Rayfall expression sent as a string. This means you can run filters, aggregations, joins, and any other operation remotely.</p>
+
+      <h3>Filtered Queries</h3>
+      <pre><code><span class="hl-comment">;; All trades where price exceeds 100</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(select {from: trades where: (> price 100)})"</span>)</code></pre>
+
+      <h3>Aggregations</h3>
+      <pre><code><span class="hl-comment">;; Total quantity traded</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(select {from: trades total: (sum qty)})"</span>)
+
+<span class="hl-comment">;; Volume-weighted average price by symbol</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(select {from: trades by: sym vwap: (% (sum (* price qty)) (sum qty))})"</span>)</code></pre>
+
+      <h3>Joins</h3>
+      <pre><code><span class="hl-comment">;; Join trades with quotes on sym</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(select {from: (left-join trades quotes 'sym)})"</span>)</code></pre>
+
+      <div class="info-box">
+        <strong>Tip:</strong> The query string is parsed and evaluated entirely on the server. Only the final result is serialized and sent back to the client. This means large intermediate results never cross the network.
+      </div>
+
+      <!-- 4. Dynamic Queries -->
+      <h2 id="sending-objects">4. Dynamic Queries &amp; Expression Payloads</h2>
+      <p><code>.ipc.send</code> accepts any serializable value, not just strings. The server behavior depends on what you send:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Payload type</th>
+            <th>Server behavior</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>String</td><td>Parsed as Rayfall code and evaluated</td></tr>
+          <tr><td>List with function head</td><td>Evaluated as a function call &mdash; no parsing needed</td></tr>
+          <tr><td>Data (vector, table, atom)</td><td>Evaluated as identity &mdash; returned as-is</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Expression payloads</h3>
+      <p>Instead of strings, construct the query as a list. Builtins resolve to function objects &mdash; use them directly as the list head. Dict literals are self-evaluating, so column references inside them are preserved for server-side resolution:</p>
+
+      <pre><code><span class="hl-comment">;; Arithmetic</span>
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> + <span class="hl-num">1</span> <span class="hl-num">2</span>))
+<span class="hl-comment">;; =&gt; 3</span>
+
+<span class="hl-comment">;; Select with filter — dict is self-evaluating, select resolves columns</span>
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> select {<span class="hl-sym">from:</span> trades <span class="hl-sym">where:</span> (&gt; price <span class="hl-num">200</span>)}))
+<span class="hl-comment">;; =&gt; filtered trades table</span>
+
+<span class="hl-comment">;; Aggregation by group</span>
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> select {<span class="hl-sym">from:</span> trades <span class="hl-sym">by:</span> sym <span class="hl-sym">total:</span> (sum qty)}))
+
+<span class="hl-comment">;; Map a lambda over server-side data</span>
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> map (<span class="hl-kw">fn</span> [x] (* x <span class="hl-num">2</span>)) (<span class="hl-fn">list</span> til <span class="hl-num">10</span>)))
+<span class="hl-comment">;; =&gt; [0 2 4 6 8 10 12 14 16 18]</span></code></pre>
+
+      <p>For dynamic queries, substitute runtime values into the expression:</p>
+      <pre><code><span class="hl-comment">;; Dynamic filter threshold</span>
+(<span class="hl-kw">set</span> threshold <span class="hl-num">200</span>)
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> select {<span class="hl-sym">from:</span> trades <span class="hl-sym">where:</span> (<span class="hl-fn">list</span> &gt; (quote price) threshold)}))
+
+<span class="hl-comment">;; Dynamic grouping</span>
+(<span class="hl-kw">set</span> group-col <span class="hl-sym">'sym</span>)
+(<span class="hl-fn">.ipc.send</span> h (<span class="hl-fn">list</span> select {<span class="hl-sym">from:</span> trades <span class="hl-sym">by:</span> group-col <span class="hl-sym">total:</span> (<span class="hl-fn">list</span> sum (quote qty))}))</code></pre>
+
+      <div class="info-box">
+        <strong>How it works.</strong> Dict literals are self-evaluating &mdash; <code>{from: trades where: (&gt; price 200)}</code> preserves its contents as data. When the server evaluates the list, <code>select</code> resolves <code>trades</code> and <code>price</code> in the table context. Use <code>(list ...)</code> inside the dict when you need to splice runtime values into an expression.
+      </div>
+
+      <!-- 5. Authentication -->
+      <h2 id="authentication">5. Authentication</h2>
+      <p>Rayforce supports password-based authentication with an optional read-only restriction.</p>
+
+      <h3>Password Authentication</h3>
+      <p>Start the server with <code>-u</code> to require a password from all clients:</p>
+      <pre><code>./rayforce -p <span class="hl-num">5000</span> -u secretpass</code></pre>
+      <p>Clients must supply the password when connecting:</p>
+      <pre><code>(<span class="hl-kw">set</span> h (<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000:user:secretpass"</span>))</code></pre>
+      <p>The connection string format is <code>host:port:user:password</code>. The username is transmitted but not validated on the server &mdash; only the password is checked.</p>
+
+      <h3>Read-Only Mode</h3>
+      <p>Use <code>-U</code> instead of <code>-u</code> to enable authentication with read-only restrictions:</p>
+      <pre><code>./rayforce -p <span class="hl-num">5000</span> -U secretpass</code></pre>
+      <p>In read-only mode, clients can run queries and read data, but mutating operations (<code>set</code>, <code>insert</code>, <code>upsert</code>, <code>update</code>, file writes, system commands) are blocked. The server returns an error if a restricted builtin is called.</p>
+
+      <div class="info-box">
+        <strong>Reference:</strong> See the <a href="ipc.html">IPC &amp; Serialization</a> reference page for the full list of restricted builtins in read-only mode.
+      </div>
+
+      <!-- 6. Multi-Process Architecture -->
+      <h2 id="multi-process">6. Multi-Process Architecture</h2>
+      <p>A common pattern is one data server with multiple query clients. Each client connects independently and runs queries against the shared data.</p>
+
+      <h3>Example: Trade Analytics System</h3>
+
+      <p><strong>Terminal 1 &mdash; Data server:</strong></p>
+      <pre><code><span class="hl-comment"># Start the server with trade data</span>
+./rayforce -p <span class="hl-num">5000</span> init.rfl
+<span class="hl-comment"># Server output: "Loaded trades and quotes"</span>
+<span class="hl-comment"># Server is now listening on port 5000</span></code></pre>
+
+      <p><strong>Terminal 2 &mdash; Analytics client:</strong></p>
+      <pre><code>./rayforce
+
+<span class="hl-comment">;; Connect to the data server</span>
+(<span class="hl-kw">set</span> h (<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000"</span>))
+
+<span class="hl-comment">;; Run aggregations</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(select {from: trades by: sym avg_price: (avg price) total_qty: (sum qty)})"</span>)
+
+<span class="hl-comment">;; Find the most active symbol</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(select {from: trades by: sym n: (count) desc: 'n take: 1})"</span>)</code></pre>
+
+      <p><strong>Terminal 3 &mdash; Monitoring client:</strong></p>
+      <pre><code>./rayforce
+
+(<span class="hl-kw">set</span> h (<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000"</span>))
+
+<span class="hl-comment">;; Check current row count</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(count trades)"</span>)
+<span class="hl-comment">;; => 5</span>
+
+<span class="hl-comment">;; Check table schema</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(meta trades)"</span>)</code></pre>
+
+      <div class="info-box">
+        <strong>Note:</strong> The server is single-threaded. Client queries are processed sequentially in the order they arrive. For CPU-intensive workloads, consider partitioning data across multiple server processes.
+      </div>
+
+      <!-- 7. Error Handling -->
+      <h2 id="error-handling">7. Error Handling</h2>
+      <p>Several categories of errors can occur during IPC operations.</p>
+
+      <h3>Connection Refused</h3>
+      <p>If the server is not running or the port is wrong, <code>.ipc.open</code> returns an error:</p>
+      <pre><code>(<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:9999"</span>)
+<span class="hl-comment">;; => error: connection refused</span></code></pre>
+
+      <h3>Authentication Errors</h3>
+      <p>Connecting without credentials to a password-protected server, or supplying the wrong password:</p>
+      <pre><code><span class="hl-comment">;; No credentials — server requires auth</span>
+(<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000"</span>)
+<span class="hl-comment">;; => error: authentication required</span>
+
+<span class="hl-comment">;; Wrong password</span>
+(<span class="hl-fn">.ipc.open</span> <span class="hl-str">"127.0.0.1:5000:user:wrongpass"</span>)
+<span class="hl-comment">;; => error: authentication failed</span></code></pre>
+
+      <h3>Read-Only Restriction</h3>
+      <p>When connected to a <code>-U</code> server, mutating operations are rejected:</p>
+      <pre><code><span class="hl-comment">;; Trying to set a variable on a read-only server</span>
+(<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(set x 42)"</span>)
+<span class="hl-comment">;; => error: restricted in read-only mode</span></code></pre>
+
+      <h3>Network Errors</h3>
+      <p>If the server shuts down or the network drops while a query is in flight, <code>.ipc.send</code> returns an error. Use <code>try</code> to handle errors gracefully:</p>
+      <pre><code>(<span class="hl-fn">try</span>
+  (<span class="hl-fn">println</span> <span class="hl-str">"Trade count:"</span> (<span class="hl-fn">.ipc.send</span> h <span class="hl-str">"(count trades)"</span>))
+  (<span class="hl-kw">fn</span> [e] (<span class="hl-fn">println</span> <span class="hl-str">"Query failed:"</span> e)))</code></pre>
+
+      <!-- 8. C API -->
+      <h2 id="c-api">8. C API</h2>
+      <p>The IPC layer is also accessible from C, enabling you to embed Rayforce clients in applications.</p>
+
+      <h3>Functions</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Function</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>ray_ipc_connect(host, port, user, password)</code></td>
+            <td>Open a TCP connection. Returns a handle. Pass <code>NULL</code> for user/password if no auth.</td>
+          </tr>
+          <tr>
+            <td><code>ray_ipc_send(handle, msg)</code></td>
+            <td>Synchronous send: serialize <code>msg</code>, send, wait for response, return deserialized result.</td>
+          </tr>
+          <tr>
+            <td><code>ray_ipc_send_async(handle, msg)</code></td>
+            <td>Fire-and-forget send: serialize and send <code>msg</code> without waiting for a response.</td>
+          </tr>
+          <tr>
+            <td><code>ray_ipc_close(handle)</code></td>
+            <td>Close the connection and free the handle.</td>
+          </tr>
+          <tr>
+            <td><code>ray_ipc_listen(poll, port)</code></td>
+            <td>Register a server socket on the given poll loop. Used internally by <code>-p</code> mode.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Example: C Client</h3>
+      <pre><code><span class="hl-kw">#include</span> <span class="hl-str">&lt;rayforce.h&gt;</span>
+<span class="hl-kw">#include</span> <span class="hl-str">"core/ipc.h"</span>
+
+<span class="hl-kw">int</span> main(<span class="hl-kw">int</span> argc, <span class="hl-kw">char</span>** argv) {
+    ray_runtime_t* rt = ray_runtime_create(argc, argv);
+
+    <span class="hl-comment">// Connect to a running server (returns handle or negative error)</span>
+    int64_t h = ray_ipc_connect(<span class="hl-str">"127.0.0.1"</span>, <span class="hl-num">5000</span>, NULL, NULL);
+    <span class="hl-kw">if</span> (h &lt; <span class="hl-num">0</span>) { printf(<span class="hl-str">"Connection failed\n"</span>); <span class="hl-kw">return</span> <span class="hl-num">1</span>; }
+
+    <span class="hl-comment">// Send a query string</span>
+    ray_t* query = ray_str(<span class="hl-str">"(+ 1 2)"</span>, <span class="hl-num">7</span>);
+    ray_t* result = ray_ipc_send(h, query);
+    ray_release(query);
+
+    <span class="hl-kw">if</span> (!RAY_IS_ERR(result)) {
+        printf(<span class="hl-str">"Result: %lld\n"</span>, result-&gt;i64);
+        ray_release(result);
+    }
+
+    ray_ipc_close(h);
+    ray_runtime_destroy(rt);
+    <span class="hl-kw">return</span> <span class="hl-num">0</span>;
+}</code></pre>
+
+      <div class="info-box">
+        <strong>Async sends</strong> are useful for logging or fire-and-forget inserts where you do not need the server's response. Use <code>ray_ipc_send_async</code> to avoid blocking on the round-trip.
+      </div>
+
+      <h2 id="next-steps">Next Steps</h2>
+      <ul>
+        <li><a href="ipc.html"><strong>IPC &amp; Serialization Reference</strong></a> &mdash; Wire format specification and full API details</li>
+        <li><a href="guide-storage.html"><strong>Storage Guide</strong></a> &mdash; Persisting data with CSV, columnar files, and partitioned tables</li>
+        <li><a href="c-api-core.html"><strong>Core C API</strong></a> &mdash; Working with <code>ray_t</code> objects, vectors, and tables in C</li>
+        <li><a href="tutorial.html"><strong>Getting Started Tutorial</strong></a> &mdash; Hands-on introduction to Rayfall</li>
+      </ul>
+
+      <!-- Prev/Next -->
+      <div class="docs-nav-footer">
+        <a href="guide-storage.html" class="docs-nav-link prev"><span class="docs-nav-dir">&larr; Previous</span><span class="docs-nav-title">Storage Guide</span></a>
+        <a href="architecture-pipeline.html" class="docs-nav-link next"><span class="docs-nav-dir">Next &rarr;</span><span class="docs-nav-title">Pipeline &amp; Optimizer</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

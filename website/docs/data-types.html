@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Data Types — Rayforce Documentation</title>
+  <meta name="description" content="Complete reference for all Rayforce scalar data types: booleans, integers, floats, dates, times, symbols, strings, and GUIDs.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link active">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Scalar Types</span>
+      </div>
+
+      <h1>Scalar Data Types</h1>
+      <p class="page-subtitle">Every value in Rayforce has a type. Scalars are the atomic building blocks &mdash; integers, floats, dates, strings, and more. Vectors are typed arrays of these scalars.</p>
+
+      <h2 id="type-table">Type Reference</h2>
+      <p>All scalar types, their internal constants, storage sizes, and Rayfall literal syntax:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Constant</th>
+            <th>Value</th>
+            <th>Size</th>
+            <th>Null Literal</th>
+            <th>Rayfall Literal</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Boolean</strong></td>
+            <td><code>RAY_BOOL</code></td>
+            <td>1</td>
+            <td>1 byte</td>
+            <td>Null bitmap</td>
+            <td><code><span class="hl-bool">true</span></code> / <code><span class="hl-bool">false</span></code></td>
+          </tr>
+          <tr>
+            <td><strong>Unsigned byte</strong></td>
+            <td><code>RAY_U8</code></td>
+            <td>2</td>
+            <td>1 byte</td>
+            <td>Null bitmap</td>
+            <td><code><span class="hl-num">0x42</span></code></td>
+          </tr>
+          <tr>
+            <td><strong>Short integer</strong></td>
+            <td><code>RAY_I16</code></td>
+            <td>3</td>
+            <td>2 bytes</td>
+            <td>Null bitmap</td>
+            <td>Small integers</td>
+          </tr>
+          <tr>
+            <td><strong>Integer</strong></td>
+            <td><code>RAY_I32</code></td>
+            <td>4</td>
+            <td>4 bytes</td>
+            <td><code>0Ni</code></td>
+            <td><code><span class="hl-num">42i</span></code></td>
+          </tr>
+          <tr>
+            <td><strong>Long integer</strong></td>
+            <td><code>RAY_I64</code></td>
+            <td>5</td>
+            <td>8 bytes</td>
+            <td><code>0Nl</code></td>
+            <td><code><span class="hl-num">42</span></code></td>
+          </tr>
+          <tr>
+            <td><strong>Single float</strong></td>
+            <td><code>RAY_F32</code></td>
+            <td>6</td>
+            <td>4 bytes</td>
+            <td>Null bitmap</td>
+            <td>&mdash;</td>
+          </tr>
+          <tr>
+            <td><strong>Double float</strong></td>
+            <td><code>RAY_F64</code></td>
+            <td>7</td>
+            <td>8 bytes</td>
+            <td><code>0Nf</code></td>
+            <td><code><span class="hl-num">3.14</span></code></td>
+          </tr>
+          <tr>
+            <td><strong>Date</strong></td>
+            <td><code>RAY_DATE</code></td>
+            <td>8</td>
+            <td>4 bytes</td>
+            <td><code>0Nd</code></td>
+            <td><code><span class="hl-num">2024.01.15</span></code></td>
+          </tr>
+          <tr>
+            <td><strong>Time</strong></td>
+            <td><code>RAY_TIME</code></td>
+            <td>9</td>
+            <td>4 bytes</td>
+            <td><code>0Nt</code></td>
+            <td><code><span class="hl-num">09:30:00.000</span></code></td>
+          </tr>
+          <tr>
+            <td><strong>Timestamp</strong></td>
+            <td><code>RAY_TIMESTAMP</code></td>
+            <td>10</td>
+            <td>8 bytes</td>
+            <td><code>0Np</code></td>
+            <td><code><span class="hl-num">2024.01.15D09:30:00.000000000</span></code></td>
+          </tr>
+          <tr>
+            <td><strong>GUID</strong></td>
+            <td><code>RAY_GUID</code></td>
+            <td>11</td>
+            <td>16 bytes</td>
+            <td>Null bitmap</td>
+            <td>UUID format</td>
+          </tr>
+          <tr>
+            <td><strong>Symbol</strong></td>
+            <td><code>RAY_SYM</code></td>
+            <td>12</td>
+            <td>Adaptive (8/16/32/64-bit)</td>
+            <td><code>0Ns</code></td>
+            <td><code><span class="hl-sym">'AAPL</span></code>, <code>[<span class="hl-sym">AAPL GOOG</span>]</code></td>
+          </tr>
+          <tr>
+            <td><strong>String</strong></td>
+            <td><code>RAY_STR</code></td>
+            <td>13</td>
+            <td>16 bytes per element</td>
+            <td>Null flag in bitmap</td>
+            <td><code><span class="hl-str">"hello"</span></code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="info-box">
+        <strong>Null handling:</strong> Nulls are tracked via a per-element bitmap, not sentinel values in the data array. Typed null literals parseable in source (<code>0Nh</code>, <code>0Ni</code>, <code>0Nl</code>, <code>0Nf</code>, <code>0Nd</code>, <code>0Nt</code>, <code>0Np</code>, <code>0Ns</code>) create atoms of the correct type with the null bit set &mdash; the value field is zeroed.  Types without a parseable literal (BOOL/U8/F32/STR/GUID) still render as their canonical null form (<code>0Nb</code>/<code>0Nu</code>/<code>0Ne</code>/<code>0Nc</code>/<code>0Ng</code>) when the bitmap flags them.  Use <code>nil?</code> to test for null.
+      </div>
+
+      <div class="info-box">
+        <strong>Note:</strong> RAY_SYM and RAY_STR are both string types but serve different purposes. Symbols are dictionary-encoded (interned integers) &mdash; ideal for categorical data with repeated values like stock tickers or country codes. Strings are variable-length and stored inline or in a pool &mdash; ideal for free-form text.
+      </div>
+
+      <h2 id="atoms-vectors">Atoms vs Vectors</h2>
+      <p>Every <code>ray_t</code> object has a <code>type</code> field (a signed 8-bit integer). The sign distinguishes atoms from vectors:</p>
+
+      <ul>
+        <li><strong>Negative type</strong> &mdash; atom (scalar). A single value stored directly in the 32-byte header. For example, <code>-RAY_I64</code> (-5) is a 64-bit integer atom.</li>
+        <li><strong>Positive type</strong> &mdash; vector. A typed array of elements stored in the <code>data[]</code> flexible array member following the header.</li>
+        <li><strong>Zero</strong> &mdash; <code>RAY_LIST</code>. A boxed heterogeneous container of <code>ray_t*</code> pointers.</li>
+      </ul>
+
+      <pre><code><span class="hl-comment">; Atom: single value, negative type internally</span>
+<span class="hl-comment">ray&gt;</span> <span class="hl-num">42</span>
+42
+
+<span class="hl-comment">; Vector: typed array, positive type internally</span>
+<span class="hl-comment">ray&gt;</span> [<span class="hl-num">1 2 3</span>]
+[1 2 3]
+
+<span class="hl-comment">; Check with meta</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">meta</span> <span class="hl-num">42</span>)
+{type:i64}
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">meta</span> [<span class="hl-num">1 2 3</span>])
+{type:I64 len:3}</code></pre>
+
+      <h2 id="ray-t-header">The ray_t Header</h2>
+      <p>Every Rayforce object begins with a 32-byte <code>ray_t</code> header. This is the fundamental building block &mdash; atoms, vectors, lists, tables, and functions all start with this structure.</p>
+
+      <h3>Byte Layout</h3>
+      <pre><code><span class="hl-comment">/*
+ * ray_t — 32-byte block header (union)
+ *
+ * Bytes  0-15:  Overlay zone (usage depends on type)
+ *   Vectors:    nullmap[16]  — inline null bitmap (up to 128 elements)
+ *   Slices:     slice_parent + slice_offset
+ *   SYM vecs:   ext_nullmap  + sym_dict
+ *   STR vecs:   str_ext_null + str_pool
+ *
+ * Bytes 16-19:  Metadata
+ *   [16] mmod   — 0=heap, 1=file-mmap
+ *   [17] order  — buddy block order (size = 2^order)
+ *   [18] type   — negative=atom, positive=vector, 0=LIST
+ *   [19] attrs  — attribute flags (SLICE, HAS_NULLS, ARENA, etc.)
+ *
+ * Bytes 20-23:  rc — reference count (0=free)
+ *
+ * Bytes 24-31:  Value / length
+ *   Atoms:      b8, u8, i16, i32, i64, f64, obj, sdata[7]
+ *   Vectors:    len (element count)
+ *
+ * Byte  32+:    data[] — element storage (flexible array member)
+ */</span></code></pre>
+
+      <h3>Attribute Flags</h3>
+      <p>The <code>attrs</code> byte carries bit flags that modify behavior:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Flag</th>
+            <th>Bit</th>
+            <th>Meaning</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>RAY_ATTR_SLICE</code></td>
+            <td><code>0x10</code></td>
+            <td>Vector is a zero-copy slice of a parent</td>
+          </tr>
+          <tr>
+            <td><code>RAY_ATTR_NULLMAP_EXT</code></td>
+            <td><code>0x20</code></td>
+            <td>Null bitmap stored in external allocation</td>
+          </tr>
+          <tr>
+            <td><code>RAY_ATTR_NAME</code></td>
+            <td><code>0x20</code></td>
+            <td>Symbol atom is a variable name reference</td>
+          </tr>
+          <tr>
+            <td><code>RAY_ATTR_HAS_NULLS</code></td>
+            <td><code>0x40</code></td>
+            <td>Vector contains null values (check bitmap)</td>
+          </tr>
+          <tr>
+            <td><code>RAY_ATTR_ARENA</code></td>
+            <td><code>0x80</code></td>
+            <td>Arena-allocated; retain/release are no-ops</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="type-casting">Type Casting</h2>
+      <p>The <code>as</code> function converts between types. Pass the target type as a symbol and the value to cast:</p>
+
+      <pre><code><span class="hl-comment">; Integer vector to float</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">as</span> <span class="hl-sym">'F64</span> [<span class="hl-num">1 2 3</span>])
+[1.0 2.0 3.0]
+
+<span class="hl-comment">; Integer to string</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">as</span> <span class="hl-sym">'STR</span> <span class="hl-num">42</span>)
+"42"
+
+<span class="hl-comment">; Float to integer (truncates)</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">as</span> <span class="hl-sym">'I64</span> [<span class="hl-num">1.5 2.7 3.9</span>])
+[1 2 3]
+
+<span class="hl-comment">; Date from string</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">as</span> <span class="hl-sym">'DATE</span> <span class="hl-str">"2024.01.15"</span>)
+2024.01.15</code></pre>
+
+      <h3>Supported Casts</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>From</th>
+            <th>To</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Any numeric</td><td>Any numeric</td><td>Widening is lossless; narrowing truncates</td></tr>
+          <tr><td>BOOL</td><td>I64, F64</td><td><code>true</code> &rarr; 1, <code>false</code> &rarr; 0</td></tr>
+          <tr><td>I64, F64</td><td>BOOL</td><td>Non-zero &rarr; <code>true</code></td></tr>
+          <tr><td>Any scalar</td><td>STR</td><td>Formatted string representation</td></tr>
+          <tr><td>STR</td><td>I64, F64, DATE, TIME, TIMESTAMP</td><td>Parsed from standard format</td></tr>
+          <tr><td>SYM</td><td>STR</td><td>Resolves interned string</td></tr>
+          <tr><td>STR</td><td>SYM</td><td>Interns the string</td></tr>
+          <tr><td>DATE</td><td>TIMESTAMP</td><td>Midnight on that date</td></tr>
+          <tr><td>TIMESTAMP</td><td>DATE</td><td>Truncates to day</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="temporal-types">Temporal Types</h2>
+      <p>Rayforce has three temporal types with different precision and epoch conventions:</p>
+
+      <h3>RAY_DATE</h3>
+      <p>Stored as a 32-bit signed integer counting <strong>days since 2000.01.01</strong>. This gives a range of roughly 5.8 million years in either direction.</p>
+      <pre><code><span class="hl-comment">ray&gt;</span> <span class="hl-num">2024.01.15</span>
+2024.01.15
+
+<span class="hl-comment">; Arithmetic works in days</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">+</span> <span class="hl-num">2024.01.15</span> <span class="hl-num">30</span>)
+2024.02.14</code></pre>
+
+      <h3>RAY_TIME</h3>
+      <p>Stored as a 32-bit signed integer counting <strong>milliseconds since midnight</strong>. Range covers a full day (0 to 86,399,999 ms).</p>
+      <pre><code><span class="hl-comment">ray&gt;</span> <span class="hl-num">09:30:00.000</span>
+09:30:00.000
+
+<span class="hl-comment">; Arithmetic works in milliseconds</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">+</span> <span class="hl-num">09:30:00.000</span> <span class="hl-num">60000</span>)
+09:31:00.000</code></pre>
+
+      <h3>RAY_TIMESTAMP</h3>
+      <p>Stored as a 64-bit signed integer counting <strong>nanoseconds since 2000-01-01</strong> (the Rayforce epoch — matches the CSV loader.s parser and the runtime.s arithmetic lifts). Nanosecond precision covers roughly the range 1707 &ndash; 2292.</p>
+      <pre><code><span class="hl-comment">ray&gt;</span> <span class="hl-num">2024.01.15D09:30:00.000000000</span>
+2024.01.15D09:30:00.000000000</code></pre>
+
+      <h2 id="sym-type">Symbols (RAY_SYM)</h2>
+      <p>Symbols are dictionary-encoded strings. Each unique string is interned once in a global symbol table and assigned an integer ID. Vectors of symbols store only these compact IDs, making them extremely space-efficient for categorical data.</p>
+
+      <h3>Adaptive Width</h3>
+      <p>Symbol vectors automatically choose the narrowest integer width needed:</p>
+      <ul>
+        <li><strong>8-bit</strong> &mdash; up to 255 unique symbols</li>
+        <li><strong>16-bit</strong> &mdash; up to 65,535 unique symbols</li>
+        <li><strong>32-bit</strong> &mdash; up to ~4 billion unique symbols</li>
+        <li><strong>64-bit</strong> &mdash; unlimited</li>
+      </ul>
+
+      <pre><code><span class="hl-comment">; Symbol literal (tick prefix)</span>
+<span class="hl-comment">ray&gt;</span> <span class="hl-sym">'AAPL</span>
+'AAPL
+
+<span class="hl-comment">; Symbol vector (auto-detected from unquoted identifiers)</span>
+<span class="hl-comment">ray&gt;</span> [<span class="hl-sym">AAPL GOOG MSFT AAPL GOOG</span>]
+[AAPL GOOG MSFT AAPL GOOG]</code></pre>
+
+      <h2 id="str-type">Strings (RAY_STR)</h2>
+      <p>Variable-length strings use a 16-byte <code>ray_str_t</code> element per row. Short strings (12 bytes or fewer) are stored inline. Longer strings are stored in a per-vector pool with a 4-byte prefix cached inline for fast comparison rejection.</p>
+
+      <h3>Inline vs Pool Storage</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>String Length</th>
+            <th>Storage</th>
+            <th>Access</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>0 &ndash; 12 bytes</td>
+            <td>Inline in <code>ray_str_t</code></td>
+            <td>Direct, no indirection</td>
+          </tr>
+          <tr>
+            <td>13+ bytes</td>
+            <td>Per-vector pool</td>
+            <td>4-byte prefix inline + pool offset</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <pre><code><span class="hl-comment">; Short string (stored inline)</span>
+<span class="hl-comment">ray&gt;</span> <span class="hl-str">"hello"</span>
+"hello"
+
+<span class="hl-comment">; String vector</span>
+<span class="hl-comment">ray&gt;</span> (<span class="hl-fn">list</span> <span class="hl-str">"short"</span> <span class="hl-str">"a longer string here"</span>)</code></pre>
+
+      <h2 id="c-api-types">C API</h2>
+      <p>Atom constructors return a <code>ray_t*</code> with the value stored directly in the header:</p>
+
+      <pre><code><span class="hl-comment">// Atom constructors</span>
+<span class="hl-type">ray_t</span>* b = <span class="hl-fn">ray_bool</span>(<span class="hl-bool">true</span>);
+<span class="hl-type">ray_t</span>* n = <span class="hl-fn">ray_i64</span>(<span class="hl-num">42</span>);
+<span class="hl-type">ray_t</span>* f = <span class="hl-fn">ray_f64</span>(<span class="hl-num">3.14</span>);
+<span class="hl-type">ray_t</span>* d = <span class="hl-fn">ray_date</span>(<span class="hl-num">8780</span>);    <span class="hl-comment">// days since 2000.01.01</span>
+<span class="hl-type">ray_t</span>* s = <span class="hl-fn">ray_str</span>(<span class="hl-str">"hello"</span>, <span class="hl-num">5</span>);
+<span class="hl-type">ray_t</span>* y = <span class="hl-fn">ray_sym</span>(sym_id);   <span class="hl-comment">// interned symbol ID</span>
+
+<span class="hl-comment">// Type inspection</span>
+<span class="hl-fn">ray_type</span>(n);       <span class="hl-comment">// -RAY_I64  (negative = atom)</span>
+<span class="hl-fn">ray_is_atom</span>(n);    <span class="hl-comment">// true</span>
+<span class="hl-fn">ray_is_vec</span>(n);     <span class="hl-comment">// false</span></code></pre>
+
+      <p>Vector constructors allocate a header plus contiguous element storage:</p>
+
+      <pre><code><span class="hl-comment">// Create typed vectors</span>
+<span class="hl-type">ray_t</span>* v = <span class="hl-fn">ray_vec_new</span>(RAY_I64, <span class="hl-num">1024</span>);
+v = <span class="hl-fn">ray_vec_append</span>(v, &(<span class="hl-type">int64_t</span>){<span class="hl-num">42</span>});
+
+<span class="hl-comment">// From raw data</span>
+<span class="hl-type">int64_t</span> data[] = {<span class="hl-num">1</span>, <span class="hl-num">2</span>, <span class="hl-num">3</span>};
+<span class="hl-type">ray_t</span>* v2 = <span class="hl-fn">ray_vec_from_raw</span>(RAY_I64, data, <span class="hl-num">3</span>);
+
+<span class="hl-comment">// Adaptive-width symbol vector</span>
+<span class="hl-type">ray_t</span>* sv = <span class="hl-fn">ray_sym_vec_new</span>(<span class="hl-num">1</span>, <span class="hl-num">1024</span>);  <span class="hl-comment">// 8-bit width</span>
+
+<span class="hl-comment">// String vector</span>
+<span class="hl-type">ray_t</span>* strs = <span class="hl-fn">ray_vec_new</span>(RAY_STR, <span class="hl-num">64</span>);
+strs = <span class="hl-fn">ray_str_vec_append</span>(strs, <span class="hl-str">"hello"</span>, <span class="hl-num">5</span>);</code></pre>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="repl.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">REPL Reference</span></a>
+        <a href="data-types-collections.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">Collections</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

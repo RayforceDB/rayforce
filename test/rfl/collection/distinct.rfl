@@ -1,0 +1,211 @@
+;; Invariants for `distinct` on i64 vectors.
+
+;; idempotent
+(set V (rand 256 16))
+(count (distinct V)) -- (count (distinct (distinct V)))
+
+;; dedup: duplicating v does not change distinct's cardinality — falsifies identity-distinct.
+(set V (rand 256 16))
+(count (distinct V)) -- (count (distinct (concat V V)))
+
+;; concrete: distinct([1 1 2 2 3]) has count 3
+(count (distinct [1 1 2 2 3])) -- 3
+
+;; ---- Regression tests ported from test_lang_rf.inc::test_rf_distinct ----
+;; Ported from test_lang_rf.inc::test_rf_distinct.
+
+(distinct [true true]) -- [true]
+(distinct [0x12 0x12 0x10]) -- [0x10 0x12]
+(distinct "test") -- "est"
+(distinct "") -- ""
+(distinct [1h 2h 2h]) -- [1 2]
+(count (distinct [1i 0Ni 1i])) -- 2
+;; nulls preserved — 2 distinct values
+(nil? (at (distinct [1i 0Ni 1i]) 0)) -- true
+;; null is first
+(distinct [2012.12.12 2012.12.12]) -- [2012.12.12]
+(distinct [10:00:00.000 20:10:10.500 10:00:00.000]) -- [10:00:00.000 20:10:10.500]
+(distinct [1 1 1 2 3 4 2 3 4 2 3 4]) -- [1 2 3 4]
+(distinct [2024.01.01D10:00:00.000000000 2024.01.01D10:00:00.000000000]) -- [2024.01.01D10:00:00.000000000]
+(distinct ['a 'b 'ab 'aa 'a 'aa]) -- ['a 'b 'ab 'aa]
+(set l (guid 2)) (set l (concat l l)) (count (distinct l)) -- 2
+(distinct (list [3i 3i] 2i [3i 3i] 2i)) -- (list 2i [3i 3i])
+;; ========== NULL BITMAP PROPAGATION ==========
+;; distinct preserves one null
+(distinct [1 0Nl 2 0Nl 1]) -- [0Nl 1 2]
+;; concat preserves null bitmaps
+(nil? (at (concat [1 0Nl 3] [0Nl 5 6]) 1)) -- true
+(nil? (at (concat [1 0Nl 3] [0Nl 5 6]) 3)) -- true
+(nil? (at (concat [1 0Nl 3] [0Nl 5 6]) 0)) -- false
+(nil? (at (concat [1 0Nl 3] [0Nl 5 6]) 4)) -- false
+;; cast preserves null bitmaps
+(nil? (at (as 'F64 [1 0Nl 3]) 1)) -- true
+(nil? (at (as 'I32 [1 0Nl 3]) 1)) -- true
+(at (as 'F64 [1 0Nl 3]) 0) -- 1.0
+(at (as 'F64 [1 0Nl 3]) 2) -- 3.0
+;; cast to I16/U8/BOOL preserves nulls
+(nil? (at (as 'I16 [1 0Nl 3]) 1)) -- true
+(nil? (at (as 'U8 [1 0Nl 3]) 1)) -- true
+;; cast non-null values survive
+(at (as 'I32 [10 0Nl 30]) 0) -- 10i
+(at (as 'I32 [10 0Nl 30]) 2) -- 30i
+;; concat: all-null + non-null
+(nil? (at (concat [0Nl 0Nl] [1 2]) 0)) -- true
+(nil? (at (concat [0Nl 0Nl] [1 2]) 1)) -- true
+(at (concat [0Nl 0Nl] [1 2]) 2) -- 1
+;; distinct: all nulls → one null
+(count (distinct [0Nl 0Nl 0Nl])) -- 1
+(nil? (at (distinct [0Nl 0Nl 0Nl]) 0)) -- true
+;; distinct: no nulls unchanged
+(distinct [3 1 2 1]) -- [1 2 3]
+;; cast from list preserves nulls
+(nil? (at (as 'I64 (list 1 0Nl 3)) 1)) -- true
+(at (as 'I64 (list 1 0Nl 3)) 0) -- 1
+;; xasc preserves null bitmaps
+(set st (xasc (table [a b] (list [1 0Nl 2] [10 20 30])) 'a)) (nil? (at (at st 'a) 0)) -- true
+(at (at st 'b) 0) -- 20
+;; null row's b value gathered correctly
+(at (at st 'a) 1) -- 1
+(at (at st 'a) 2) -- 2
+;; xasc/xdesc with multi-column nulls
+(set mt (table [a b c] (list [3 0Nl 1] [30 0Nl 10] [300 0Nl 100]))) (nil? (at (at (xasc mt 'a) 'a) 0)) -- true
+(nil? (at (at (xasc mt 'a) 'b) 0)) -- true
+(nil? (at (at (xasc mt 'a) 'c) 0)) -- true
+(at (at (xasc mt 'a) 'a) 1) -- 1
+(at (at (xasc mt 'a) 'b) 1) -- 10
+(at (at (xasc mt 'a) 'c) 1) -- 100
+;; xdesc with nulls
+(nil? (at (at (xdesc mt 'a) 'a) 2)) -- true
+(at (at (xdesc mt 'a) 'a) 0) -- 3
+;; multi-key sort with nulls
+(set mk (table [x y z] (list [1 1 0Nl 2] [20 10 0Nl 30] [200 100 0Nl 300]))) (nil? (at (at (xasc mk ['x 'y]) 'x) 0)) -- true
+(nil? (at (at (xasc mk ['x 'y]) 'z) 0)) -- true
+(at (at (xasc mk ['x 'y]) 'y) 1) -- 10
+(at (at (xasc mk ['x 'y]) 'y) 2) -- 20
+;; --- Multi-key sort with overflowing bit budget / wide keys.
+;;     Same fix (rank-then-compose fallback) is exercised by two
+;;     complementary tiers of tests:
+;;
+;;     Tier A (tiny n):  nrows <= 64.  The radix block is skipped
+;;     entirely and the merge-sort path runs with sort_cmp,
+;;     exercising the comparator's per-type branches (including
+;;     the new RAY_GUID memcmp branch).
+;;
+;;     Tier B (n > 64):  enters the radix block, hits the composite
+;;     overflow / has_wide_key gate, and exercises the rank-then-
+;;     compose fallback proper.  Without Tier B the rank-fallback
+;;     branch would never run under test. ---
+;; ---- Tier A: merge-sort / small-n coverage ---- */
+;; sym + f64, 4 rows: merge sort via sort_cmp's RAY_SYM+RAY_F64 branches.
+(set srka (table [s p] (list [bb aa bb aa] (as 'F64 [2.0 1.0 1.0 2.0]))))(at (at (xasc srka ['s 'p]) 's) 0) -- 'aa
+(at (at (xasc srka ['s 'p]) 'p) 0) -- 1.0
+(at (at (xasc srka ['s 'p]) 'p) 1) -- 2.0
+(at (at (xasc srka ['s 'p]) 's) 2) -- 'bb
+(at (at (xdesc srka ['s 'p]) 's) 0) -- 'bb
+(at (at (xdesc srka ['s 'p]) 'p) 0) -- 2.0
+;; RAY_GUID small-n: merge sort via sort_cmp's new RAY_GUID branch.
+;; Before the fix this returned 0 for every guid pair and produced
+;; an arbitrary order; verify against single-key (asc gs).
+(set gsa (guid 4)) (set srkb (table [g p] (list gsa (as 'F64 [4.0 3.0 2.0 1.0]))))(sum (as 'I64 (== (at (xasc srkb ['g 'p]) 'g) (asc gsa)))) -- 4
+;; ---- Tier B: rank-then-compose fallback (nrows > 64) ----
+;; sort_indices_ex gates the entire radix block on `nrows > 64`;
+;; below that threshold the fallback is never reached. Tables below
+;; deliberately have >= 99 rows. ---
+;; sym + f64 at 100 rows. Uses 0 as one of the prices: 0.0's
+;; sign-flip encoding is INT64_MIN, so the encoded range from 0.0
+;; to any normal value spans ~63 bits; combined with 3 bits for sym
+;; that overflows the 64-bit composite budget and triggers the
+;; rank-then-compose fallback.
+;; s cycles [aa bb] (period 2), p cycles (as 'F64 [0 1 2]) (period
+;; 3), LCM=6. 100/6 = 16 cycles + 4. Sorted groups:
+;;   (aa,0) x17, (aa,1) x16, (aa,2) x17,
+;;   (bb,0) x17, (bb,1) x17, (bb,2) x16
+(set rk (table [s p] (list (take [aa bb] 100) (as 'F64 (take [0 1 2] 100)))))(set rks (xasc rk ['s 'p]))(count rks) -- 100
+(at (at rks 's) 0) -- 'aa
+(at (at rks 'p) 0) -- 0.0
+(at (at rks 's) 16) -- 'aa
+(at (at rks 'p) 16) -- 0.0
+(at (at rks 's) 17) -- 'aa
+(at (at rks 'p) 17) -- 1.0
+(at (at rks 's) 32) -- 'aa
+(at (at rks 'p) 32) -- 1.0
+(at (at rks 's) 33) -- 'aa
+(at (at rks 'p) 33) -- 2.0
+(at (at rks 's) 49) -- 'aa
+(at (at rks 'p) 49) -- 2.0
+(at (at rks 's) 50) -- 'bb
+(at (at rks 'p) 50) -- 0.0
+(at (at rks 's) 99) -- 'bb
+(at (at rks 'p) 99) -- 2.0
+;; xdesc reverses both key orders.
+(set rksd (xdesc rk ['s 'p]))(at (at rksd 's) 0) -- 'bb
+(at (at rksd 'p) 0) -- 2.0
+(at (at rksd 's) 99) -- 'aa
+(at (at rksd 'p) 99) -- 0.0
+;; f64 + i64 at 100 rows. Includes 0 cast to f64 so the encoded
+;; f64 range spans ~63 bits, blowing the composite budget (63 + 2).
+;; p cycles (as 'F64 [3 0 2]), s cycles [2 1 3]; both period 3, so
+;; 100/3 = 33 cycles + 1. Each (p,s) combo: (3.0,2), (0.0,1),
+;; (2.0,3) repeated.  The extra element (position 99) lands on
+;; cycle index 0 -> (3.0,2) appearing 34 times, the others 33 each.
+(set rk2 (table [p s] (list (as 'F64 (take [3 0 2] 100)) (take [2 1 3] 100))))(set rk2s (xasc rk2 ['p 's]))(count rk2s) -- 100
+;; Sort order:
+;;   (0.0, 1) x 33 -> 0..32
+;;   (2.0, 3) x 33 -> 33..65
+;;   (3.0, 2) x 34 -> 66..99
+(at (at rk2s 'p) 0) -- 0.0
+(at (at rk2s 's) 0) -- 1
+(at (at rk2s 'p) 32) -- 0.0
+(at (at rk2s 's) 32) -- 1
+(at (at rk2s 'p) 33) -- 2.0
+(at (at rk2s 's) 33) -- 3
+(at (at rk2s 'p) 65) -- 2.0
+(at (at rk2s 's) 65) -- 3
+(at (at rk2s 'p) 66) -- 3.0
+(at (at rk2s 's) 66) -- 2
+(at (at rk2s 'p) 99) -- 3.0
+(at (at rk2s 's) 99) -- 2
+;; Nulls propagate through rank fallback at scale: tied nulls must
+;; share a rank so the secondary key decides ordering among them.
+;; 99 rows, cycled [0Ns 0Ns aa] and (as 'F64 [1 2 0]). Prices
+;; include 0.0 so the encoded f64 range forces the composite
+;; budget to overflow -> rank fallback runs -> null rank collapsing
+;; is exercised. Pairs: (null,1.0), (null,2.0), (aa,0.0).
+;; After asc sort with default nulls-first: 66 null rows first
+;; (33 with p=1.0, 33 with p=2.0), then 33 aa rows with p=0.0.
+(set rk3 (table [s p] (list (take [0Ns 0Ns aa] 99) (as 'F64 (take [1 2 0] 99)))))(set rk3s (xasc rk3 ['s 'p]))(count rk3s) -- 99
+(nil? (at (at rk3s 's) 0)) -- true
+(at (at rk3s 'p) 0) -- 1.0
+(nil? (at (at rk3s 's) 32)) -- true
+(at (at rk3s 'p) 32) -- 1.0
+(nil? (at (at rk3s 's) 33)) -- true
+(at (at rk3s 'p) 33) -- 2.0
+(nil? (at (at rk3s 's) 65)) -- true
+(at (at rk3s 'p) 65) -- 2.0
+(at (at rk3s 's) 66) -- 'aa
+(at (at rk3s 'p) 66) -- 0.0
+(at (at rk3s 's) 98) -- 'aa
+;; RAY_STR multi-key. 100 rows, three distinct strings, three
+;; distinct prices.  Pre-fix, has_wide_key didn't exist and RAY_STR
+;; wasn't in can_radix, so this would fall into merge sort; now it
+;; takes the rank fallback via the recursive single-key RAY_STR
+;; MSD byte-radix.
+(set rk4 (table [t p] (list (map (fn [x] (as 'STR x)) (take [cc aa bb] 100)) (as 'F64 (take [3.0 1.0 2.0] 100)))))(set rk4s (xasc rk4 ['t 'p]))(count rk4s) -- 100
+;; aa x 33 (positions 0..32), bb x 33 (33..65), cc x 34 (66..99)
+(at (at rk4s 't) 0) -- "aa"
+(at (at rk4s 't) 32) -- "aa"
+(at (at rk4s 't) 33) -- "bb"
+(at (at rk4s 't) 65) -- "bb"
+(at (at rk4s 't) 66) -- "cc"
+(at (at rk4s 't) 99) -- "cc"
+;; RAY_GUID multi-key. 100 rows built by taking 5 distinct guids and
+;; cycling them 20 times.  has_wide_key routing kicks in, the
+;; recursive single-key sub-sort on guid goes through merge sort
+;; with the new sort_cmp memcmp branch.  Verify the multi-key sort
+;; produces the same guid ordering as the single-key asc sort over
+;; the same guids — if sort_cmp returned 0 for all guid pairs (the
+;; pre-fix symptom) the equality check would fail.
+(set gs (take (guid 5) 100))(set rk5 (table [g p] (list gs (as 'F64 (til 100)))))(set rk5s (xasc rk5 ['g 'p]))(count rk5s) -- 100
+(sum (as 'I64 (== (at rk5s 'g) (asc gs)))) -- 100
+;; desc also works end to end
+(count (xdesc rk5 ['g 'p])) -- 100

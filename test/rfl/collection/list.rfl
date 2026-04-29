@@ -1,0 +1,32 @@
+;; Ported from test_lang_rf.inc::test_rf_list.
+
+;; ========== LIST CREATION ==========
+(list 1 2 3) -- (list 1 2 3)
+(list [1 2] [3 4]) -- (list [1 2] [3 4])
+(list 1 "hello" 'a) -- (list 1 "hello" 'a)
+;; ========== ENLIST ==========
+(enlist 5) -- [5]
+(enlist 'a) -- ['a]
+(enlist "hello") -- (list "hello")
+(enlist [1 2 3]) -- (list [1 2 3])
+;; ========== AT (INDEXING) ==========
+(at [10 20 30 40] 0) -- 10
+(at [10 20 30 40] 2) -- 30
+(at [10 20 30 40] 3) -- 40
+(at [10 20 30 40] [0 2]) -- [10 30]
+;; multiple indices
+(at "hello" 1) -- 'e'
+(at "hello" [0 4]) -- "ho"
+;; ========== AT ON TABLES ==========
+(at (table [a b] (list [1 2 3] [4 5 6])) 0) -- {a:1 b:4}
+(at (table [a b] (list [1 2 3] [4 5 6])) 'a) -- [1 2 3]
+;; ========== TIL ==========
+(til 5) -- [0 1 2 3 4]
+(til 0) -- []
+(til 1) -- [0]
+;; ========== TAKE ==========
+(take [1 2 3 4 5] 3) -- [1 2 3]
+(take [1 2 3 4 5] -3) -- [3 4 5]
+(take [1 2 3] 7) -- [1 2 3 1 2 3 1]
+;; cyclic
+(take "hello" 3) -- "hel"

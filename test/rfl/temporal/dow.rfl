@@ -1,0 +1,5 @@
+;; Invariants for `dow` — day-of-week.
+
+;; range 0..6
+(set D [2024.01.01 2024.06.15 2024.12.31 1970.01.01])
+(count D) -- (sum (and (>= (dow D) 0) (<= (dow D) 6)))

@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Documentation — Rayforce</title>
+  <meta name="description" content="Rayforce documentation — guides, reference, and architecture for the zero-dependency columnar dataframe library with native graph engine.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+        <a href="vector-search.html" class="sidebar-link">Vector Search</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <span>Documentation</span>
+      </div>
+
+      <h1>Documentation</h1>
+      <p class="page-subtitle">Everything you need to build, query, and analyze with Rayforce — the pure C17 zero-dependency columnar dataframe library with a native graph engine.</p>
+
+      <h2>Getting Started</h2>
+      <p><a href="quick-start.html"><strong>Quick Start</strong></a> &mdash; Install prerequisites, build from source, start the REPL, create your first table, and run your first query in under 5 minutes.</p>
+
+      <h2>Rayfall Language</h2>
+      <p><a href="rayfall-syntax.html"><strong>Syntax &amp; Types</strong></a> &mdash; Complete reference for the Rayfall language: atoms (integers, floats, booleans, symbols, strings, dates, times, timestamps, GUIDs), vectors, lists, tables, dictionaries, function calls, quoting, and comments.</p>
+      <p><a href="rayfall-functions.html"><strong>Functions Reference</strong></a> &mdash; All 170+ built-in functions organized by category: arithmetic, comparison, logic, aggregation, higher-order, collection, sorting, table, query, join, I/O, string, temporal, type, and system operations.</p>
+
+      <h2>Queries</h2>
+      <p><a href="rayfall-syntax.html#select-update"><strong>Select &amp; Update</strong></a> &mdash; The <code>select</code> and <code>update</code> query verbs with filtering, grouping, column expressions, and aggregation. Bridges directly to the Rayforce DAG executor.</p>
+      <p><a href="rayfall-functions.html#joins"><strong>Joins</strong></a> &mdash; Left joins, inner joins, window joins, and as-of joins. Time-windowed matching for event data.</p>
+      <p><a href="queries-links.html"><strong>Linked Columns</strong></a> &mdash; Integer columns that store row indices into another table for O(1) field access. Replaces hash-probe foreign keys with a single array indirection per row.</p>
+      <p><a href="rayfall-functions.html#pivot"><strong>Pivot &amp; Window</strong></a> &mdash; Pivot tables for reshaping data, <code>xbar</code> for bucketing, and <code>xrank</code> for ranking within groups.</p>
+      <p><a href="vector-search.html"><strong>Vector Search</strong></a> &mdash; Embeddings, cosine/L2/inner-product metrics, brute-force KNN, HNSW-accelerated ANN, and filter-aware retrieval via <code>select ... nearest ... take</code>.</p>
+
+      <h2>Indexes &amp; Acceleration</h2>
+      <p><a href="indexes-overview.html"><strong>Indexes Overview</strong></a> &mdash; The full landscape of index-like structures Rayforce ships: per-column accelerators, HNSW vector indexes, linked columns, partition pruning, CSR graph indices. Mental model plus a decision matrix that points you at the right tool.</p>
+      <p><a href="queries-indexes.html"><strong>Accelerator Indexes</strong></a> &mdash; Per-column <code>.idx.zone</code> / <code>.idx.hash</code> / <code>.idx.sort</code> / <code>.idx.bloom</code> structures. Build once at user request, ride alongside the column through the pipeline, drop on mutation.</p>
+      <p><a href="guide-indexes.html"><strong>Indexes Guide</strong></a> &mdash; When to bother building one, how to choose between the kinds, worked workflows for analytics / ANN / cross-table / parted-table queries, and the lifecycle traps.</p>
+
+      <h2>Operations</h2>
+      <p><a href="rayfall-functions.html#arithmetic"><strong>Math &amp; Aggregation</strong></a> &mdash; Arithmetic operators (<code>+</code> <code>-</code> <code>*</code> <code>/</code> <code>%</code>), rounding, aggregates (<code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code>, <code>med</code>, <code>dev</code>, <code>count</code>), and statistical functions.</p>
+      <p><a href="operations-string.html"><strong>String Operations</strong></a> &mdash; String splitting, pattern matching with <code>like</code>, concatenation, and format.</p>
+
+      <h2>C API</h2>
+      <p><a href="c-api-core.html"><strong>Core API</strong></a> &mdash; The <code>ray_t</code> abstraction, vector operations, table construction, and the single public header <code>include/rayforce.h</code>.</p>
+      <p><a href="c-api-dag.html"><strong>DAG &amp; Execution</strong></a> &mdash; Build lazy DAGs with <code>ray_graph_new()</code>, chain operations, and execute with the fused morsel-driven executor.</p>
+
+      <h2>Graph Engine</h2>
+      <p><a href="graph-storage.html"><strong>CSR Storage</strong></a> &mdash; Double-indexed CSR (forward + reverse) edge indices, columnar file persistence, and mmap support.</p>
+      <p><a href="graph-algorithms.html"><strong>Algorithms</strong></a> &mdash; 1-hop expand, BFS variable-length paths, shortest paths, A*, Yen's K-shortest, betweenness/closeness centrality, clustering coefficients, random walks, MST, and worst-case optimal joins (LFTJ).</p>
+
+      <h2>Architecture</h2>
+      <p><a href="architecture-pipeline.html"><strong>Pipeline &amp; Optimizer</strong></a> &mdash; The lazy DAG execution pipeline: type inference, constant folding, sideways information passing, factorize, predicate pushdown, filter reorder, fusion, and dead code elimination.</p>
+      <p><a href="architecture-memory.html"><strong>Memory Model</strong></a> &mdash; Buddy allocator with thread-local arenas, slab cache, COW ref counting, arena (bump) allocator, per-VM heaps with lock-free cross-heap reclamation.</p>
+
+      <h2>Storage</h2>
+      <p><a href="rayfall-syntax.html#storage"><strong>Files &amp; Partitions</strong></a> &mdash; Cross-platform file I/O with locking, atomic rename, sym intern table persistence, and CSV loading with parallel parse.</p>
+
+      <h2>Guides</h2>
+      <p><a href="guide-errors.html"><strong>Error Handling</strong></a> &mdash; <code>try</code>/<code>raise</code> patterns, null propagation, defensive programming, and error recovery in pipelines.</p>
+      <p><a href="guide-memory.html"><strong>Memory &amp; Monitoring</strong></a> &mdash; <code>.sys.mem</code>, <code>.sys.gc</code>, <code>.sys.info</code>, progress bar, <code>timeit</code> profiling, and memory budget management.</p>
+      <p><a href="guide-types.html"><strong>Type Casting</strong></a> &mdash; The <code>as</code> function, implicit coercion rules, null semantics, symbol vs string, date/time arithmetic, and GUID generation.</p>
+
+      <h2>Reference</h2>
+      <p><a href="reference.html"><strong>All Functions</strong></a> &mdash; Complete alphabetical reference for all 170+ Rayfall built-in functions with signatures, descriptions, and examples.</p>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <div></div>
+        <a href="quick-start.html" class="docs-nav-link next">
+          <span class="docs-nav-label">Next</span>
+          <span class="docs-nav-title">Quick Start &rarr;</span>
+        </a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

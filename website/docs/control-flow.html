@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Control Flow &amp; Error Handling &mdash; Rayforce Documentation</title>
+  <meta name="description" content="Rayfall control flow, error handling, lambda functions, null semantics, and higher-order functions reference.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Oswald:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <!-- Top Bar -->
+  <div class="docs-topbar">
+    <div class="docs-topbar-left">
+      <button class="docs-sidebar-toggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <a href="../" class="docs-brand">
+        <img src="../assets/favicon.svg" alt="Rayforce" width="22" height="22">
+        Rayforce
+      </a>
+      <a href="../">&larr; Back to home</a>
+    </div>
+    <a href="https://github.com/RayforceDB/rayforce2" class="nav-github" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+
+  <div class="docs-layout">
+    <!-- Sidebar -->
+    <nav class="docs-sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GETTING STARTED</div>
+        <a href="quick-start.html" class="sidebar-link">Quick Start</a>
+        <a href="tutorial.html" class="sidebar-link">Tutorial</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">TUTORIALS</div>
+        <a href="tutorial-graph.html" class="sidebar-link">Graph Queries</a>
+        <a href="tutorial-datalog.html" class="sidebar-link">Datalog</a>
+        <a href="tutorial-storage.html" class="sidebar-link">Data Loading</a>
+        <a href="tutorial-analytics.html" class="sidebar-link">Advanced Analytics</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">RAYFALL LANGUAGE</div>
+        <a href="rayfall-syntax.html" class="sidebar-link">Syntax</a>
+        <a href="rayfall-functions.html" class="sidebar-link">Functions Reference</a>
+        <a href="operations-math.html" class="sidebar-link">Math Operations</a>
+        <a href="operations-string.html" class="sidebar-link">String Operations</a>
+        <a href="control-flow.html" class="sidebar-link active">Control Flow</a>
+        <a href="repl.html" class="sidebar-link">REPL Reference</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">DATA &amp; TYPES</div>
+        <a href="data-types.html" class="sidebar-link">Data Types</a>
+        <a href="data-types-collections.html" class="sidebar-link">Collections</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">QUERIES</div>
+        <a href="queries-select.html" class="sidebar-link">Select Queries</a>
+        <a href="queries-joins.html" class="sidebar-link">Joins</a>
+        <a href="queries-links.html" class="sidebar-link">Linked Columns</a>
+        <a href="indexes-overview.html" class="sidebar-link">Indexes Overview</a>
+        <a href="queries-indexes.html" class="sidebar-link">Accelerator Indexes</a>
+        <a href="queries-pivot.html" class="sidebar-link">Pivot</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">STORAGE</div>
+        <a href="storage.html" class="sidebar-link">Columnar Storage</a>
+        <a href="ipc.html" class="sidebar-link">IPC &amp; Serialization</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GRAPH ENGINE</div>
+        <a href="graph-storage.html" class="sidebar-link">Graph Storage</a>
+        <a href="graph-algorithms.html" class="sidebar-link">Graph Algorithms</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">GUIDES</div>
+        <a href="guide-indexes.html" class="sidebar-link">Indexes Guide</a>
+        <a href="guide-analytics.html" class="sidebar-link">Analytics Guide</a>
+        <a href="guide-datalog.html" class="sidebar-link">Datalog Guide</a>
+        <a href="datalog.html" class="sidebar-link">Datalog Reference</a>
+        <a href="guide-storage.html" class="sidebar-link">Storage Guide</a>
+        <a href="guide-ipc.html" class="sidebar-link">IPC Guide</a>
+        <a href="guide-errors.html" class="sidebar-link">Error Handling</a>
+        <a href="guide-memory.html" class="sidebar-link">Memory &amp; Monitoring</a>
+        <a href="guide-types.html" class="sidebar-link">Type Casting</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">ARCHITECTURE</div>
+        <a href="architecture-pipeline.html" class="sidebar-link">Pipeline &amp; Optimizer</a>
+        <a href="architecture-memory.html" class="sidebar-link">Memory Model</a>
+        <a href="architecture-offloading.html" class="sidebar-link">Block Offloading</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">C API</div>
+        <a href="c-api-core.html" class="sidebar-link">Core API</a>
+        <a href="c-api-dag.html" class="sidebar-link">DAG API</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-section-label">REFERENCE</div>
+        <a href="reference.html" class="sidebar-link">All Functions</a>
+      </div>
+    </nav>
+
+    <!-- Content -->
+    <main class="docs-content">
+      <div class="breadcrumb">
+        <a href="../">Rayforce</a>
+        <span class="sep">/</span>
+        <a href="index.html">Docs</a>
+        <span class="sep">/</span>
+        <span>Control Flow &amp; Error Handling</span>
+      </div>
+
+      <h1>Control Flow &amp; Error Handling</h1>
+      <p class="page-subtitle">Conditionals, variable binding, lambdas, error handling, null semantics, and higher-order functions in Rayfall.</p>
+
+      <h2>Conditionals: if</h2>
+      <p>The <code>if</code> special form evaluates a condition and returns the corresponding branch:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">if</span> (<span class="hl-fn">&gt;</span> <span class="hl-num">5</span> <span class="hl-num">0</span>) <span class="hl-str">"positive"</span> <span class="hl-str">"non-positive"</span>)
+"positive"</code></pre>
+      <p>Without an else branch, <code>if</code> returns <code>0</code>:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">if</span> <span class="hl-num">0</span> <span class="hl-str">"yes"</span>)
+0</code></pre>
+
+      <h2>Sequential Evaluation: do</h2>
+      <p><code>do</code> evaluates expressions in order and returns the last result. <code>let</code> bindings inside <code>do</code> are scoped to that block:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">do</span>
+    (<span class="hl-kw">set</span> x <span class="hl-num">10</span>)
+    (<span class="hl-kw">set</span> y <span class="hl-num">20</span>)
+    (<span class="hl-fn">+</span> x y))
+30</code></pre>
+
+      <h2>Variable Binding: set and let</h2>
+      <p><code>set</code> creates a global binding. <code>let</code> creates a local binding scoped to the enclosing <code>do</code>:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">set</span> x <span class="hl-num">42</span>)
+42
+
+<span class="hl-comment">‣</span> (<span class="hl-kw">do</span> (<span class="hl-kw">let</span> y <span class="hl-num">10</span>) y)
+10</code></pre>
+      <p>The variable <code>y</code> is not visible outside the <code>do</code> block.</p>
+
+      <h2>Lambda Functions: fn</h2>
+      <p>Create anonymous functions with <code>fn</code>. Parameters are listed in square brackets:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">set</span> add1 (<span class="hl-kw">fn</span> [x] (<span class="hl-fn">+</span> x <span class="hl-num">1</span>)))
+<span class="hl-comment">‣</span> (add1 <span class="hl-num">5</span>)
+6</code></pre>
+      <p>Recursive lambdas use <code>self</code> to refer to the enclosing function:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">set</span> fib (<span class="hl-kw">fn</span> [n] (<span class="hl-kw">if</span> (<span class="hl-fn">&lt;=</span> n <span class="hl-num">1</span>) n (<span class="hl-fn">+</span> (<span class="hl-kw">self</span> (<span class="hl-fn">-</span> n <span class="hl-num">1</span>)) (<span class="hl-kw">self</span> (<span class="hl-fn">-</span> n <span class="hl-num">2</span>))))))
+<span class="hl-comment">‣</span> (fib <span class="hl-num">10</span>)
+55</code></pre>
+
+      <h2>Error Handling: try / raise</h2>
+      <p><code>raise</code> throws an error with an arbitrary value. <code>try</code> catches it and passes the value to a handler function:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">try</span> (<span class="hl-kw">raise</span> <span class="hl-num">42</span>) (<span class="hl-kw">fn</span> [e] e))
+42
+
+<span class="hl-comment">‣</span> (<span class="hl-kw">try</span> (<span class="hl-kw">raise</span> <span class="hl-num">42</span>) (<span class="hl-kw">fn</span> [e] (<span class="hl-fn">+</span> e <span class="hl-num">1</span>)))
+43
+
+<span class="hl-comment">‣</span> (<span class="hl-kw">try</span> (<span class="hl-kw">raise</span> <span class="hl-str">"boom"</span>) (<span class="hl-kw">fn</span> [e] <span class="hl-str">"caught"</span>))
+"caught"</code></pre>
+      <p>If no error is raised, <code>try</code> returns the result of the body expression normally. Works inside lambdas compiled to bytecode.</p>
+
+      <h2>Early Return: return</h2>
+      <p><code>return</code> exits a lambda early with the given value:</p>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-kw">set</span> f (<span class="hl-kw">fn</span> [x] (<span class="hl-kw">if</span> (<span class="hl-fn">&lt;</span> x <span class="hl-num">0</span>) (<span class="hl-kw">return</span> <span class="hl-num">-1</span>) (<span class="hl-fn">+</span> x <span class="hl-num">1</span>))))
+<span class="hl-comment">‣</span> (f <span class="hl-num">-5</span>)
+-1
+<span class="hl-comment">‣</span> (f <span class="hl-num">5</span>)
+6</code></pre>
+
+      <h2>Null Semantics</h2>
+      <p>Nulls are tracked via a per-element bitmap, not sentinel values. Typed null literals create atoms with the null bit set:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Literal</th>
+            <th>Type</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td><code>0Nl</code></td><td>i64 null</td></tr>
+          <tr><td><code>0Nf</code></td><td>f64 null</td></tr>
+          <tr><td><code>0Ni</code></td><td>i32 null</td></tr>
+          <tr><td><code>0Nd</code></td><td>date null</td></tr>
+          <tr><td><code>0Nt</code></td><td>time null</td></tr>
+          <tr><td><code>0Np</code></td><td>timestamp null</td></tr>
+          <tr><td><code>0Ns</code></td><td>symbol null</td></tr>
+        </tbody>
+      </table>
+
+      <p>Null rules:</p>
+      <ul>
+        <li><code>nil?</code> checks for null: <code>(nil? 0Nl)</code> &rarr; <code>true</code></li>
+        <li>All null forms are falsy in <code>if</code></li>
+        <li>All null forms are equal via <code>==</code>: <code>(== 0Nl 0Nl)</code> &rarr; <code>true</code></li>
+        <li>Typed nulls propagate through arithmetic: <code>(+ 0Nl 1)</code> &rarr; <code>0Nl</code></li>
+        <li><code>println</code> and <code>show</code> return null (not printed in the REPL)</li>
+      </ul>
+      <pre><code><span class="hl-comment">‣</span> (<span class="hl-fn">nil?</span> <span class="hl-num">0Nl</span>)
+true
+
+<span class="hl-comment">‣</span> (<span class="hl-fn">+</span> <span class="hl-num">0Nl</span> <span class="hl-num">1</span>)
+0Nl
+
+<span class="hl-comment">‣</span> (<span class="hl-fn">nil?</span> (<span class="hl-fn">println</span> <span class="hl-str">"hello"</span>))
+hello
+true</code></pre>
+
+      <h2>Higher-Order Functions</h2>
+      <p>Lambdas are auto-mapped over vectors when called directly. Use <code>map</code> for explicit element-wise application, <code>fold</code> for reductions, and <code>scan</code> for running accumulations:</p>
+      <pre><code><span class="hl-comment">;; map applies a function to each element</span>
+<span class="hl-comment">‣</span> (<span class="hl-fn">map</span> (<span class="hl-kw">fn</span> [x] (<span class="hl-fn">*</span> x x)) [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span> <span class="hl-num">5</span>])
+[1 4 9 16 25]
+
+<span class="hl-comment">;; lambdas auto-map over vectors</span>
+<span class="hl-comment">‣</span> ((<span class="hl-kw">fn</span> [x] (<span class="hl-fn">*</span> x x)) (<span class="hl-fn">til</span> <span class="hl-num">5</span>))
+[0 1 4 9 16]
+
+<span class="hl-comment">;; fold reduces a vector with a binary function</span>
+<span class="hl-comment">‣</span> (<span class="hl-fn">fold</span> <span class="hl-fn">+</span> <span class="hl-num">0</span> (<span class="hl-fn">til</span> <span class="hl-num">10</span>))
+45
+
+<span class="hl-comment">;; scan produces running accumulations</span>
+<span class="hl-comment">‣</span> (<span class="hl-fn">scan</span> <span class="hl-fn">+</span> [<span class="hl-num">1</span> <span class="hl-num">2</span> <span class="hl-num">3</span> <span class="hl-num">4</span> <span class="hl-num">5</span>])
+[1 3 6 10 15]
+
+<span class="hl-comment">;; where returns indices matching a condition</span>
+<span class="hl-comment">‣</span> (<span class="hl-fn">where</span> (<span class="hl-fn">&gt;</span> (<span class="hl-fn">til</span> <span class="hl-num">10</span>) <span class="hl-num">3</span>))
+[4 5 6 7 8 9]</code></pre>
+
+      <!-- Prev/Next -->
+            <div class="docs-nav-footer">
+        <a href="operations-string.html" class="docs-nav-link prev"><span class="docs-nav-dir">← Previous</span><span class="docs-nav-title">String Operations</span></a>
+        <a href="repl.html" class="docs-nav-link next"><span class="docs-nav-dir">Next →</span><span class="docs-nav-title">REPL Reference</span></a>
+      </div>
+    </main>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>

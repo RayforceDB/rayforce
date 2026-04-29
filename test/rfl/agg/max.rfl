@@ -1,0 +1,17 @@
+;; Invariants for `max`.
+
+(max [3 1 2]) -- 3
+(max [5]) -- 5
+(max [-1 -5 0]) -- 0
+
+;; max(v) >= every element of v
+(set V (rand 100 10000))
+(count V) -- (sum (>= (max V) V))
+
+;; max of concat is max of maxes
+(set A (rand 50 10000))
+(set B (rand 50 10000))
+(max (concat A B)) -- (max (list (max A) (max B)))
+
+;; max >= min
+1 -- (as 'I64 (>= (max V) (min V)))

@@ -1,0 +1,13 @@
+;; Invariants for `log` (natural logarithm).
+
+;; concrete
+(log 1.0) -- 0.0
+
+;; log(exp(x)) == x
+(set B (div (- (rand 256 1000) 500) 100))
+(count B) -- (sum (< (abs (- (log (exp B)) B)) 0.0001))
+
+;; log(a*b) == log(a) + log(b)   for a, b > 0
+(set A (div (+ (rand 128 10000) 1) 100))
+(set B2 (div (+ (rand 128 10000) 1) 100))
+(count A) -- (sum (< (abs (- (log (* A B2)) (+ (log A) (log B2)))) 0.001))

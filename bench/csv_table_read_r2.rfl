@@ -1,0 +1,5 @@
+;; Read /tmp/table_bench.csv via rayforce2 (.csv.read).
+;; Schema mirrors examples/rfl/table.rfl.  Outer `time` measures wall-clock.
+
+(set t (.csv.read [GUID SYMBOL F64 I64 STR TIMESTAMP] "/tmp/table_bench.csv"))
+(println "rows: %" (count t))

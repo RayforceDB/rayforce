@@ -1,0 +1,11 @@
+;; Invariants for `med` (median — returns f64).
+
+(med [3 1 2]) -- 2.0
+(med [1]) -- 1.0
+(med [1 2 3 4 5]) -- 3.0
+(med [1 2 3 4]) -- 2.5
+
+;; min <= med <= max  (cast result to compare across types)
+(set V (rand 101 10000))
+1 -- (as 'I64 (<= (as 'F64 (min V)) (med V)))
+1 -- (as 'I64 (<= (med V) (as 'F64 (max V))))

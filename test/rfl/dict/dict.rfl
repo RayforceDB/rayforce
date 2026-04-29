@@ -1,0 +1,34 @@
+;; Invariants for `dict`.
+
+(set D (dict [a b c] [1 2 3]))
+(type D) -- 'DICT
+(count D) -- 3
+(key D) -- [a b c]
+(value D) -- [1 2 3]
+
+;; ---- Regression tests ported from test_lang_rf.inc::test_rf_dict ----
+;; Ported from test_lang_rf.inc::test_rf_dict.
+
+;; ========== DICT CREATION ==========
+(dict [a b c] [1 2 3]) -- {a:1 b:2 c:3}
+(dict [x y] [10.0 20.0]) -- {x:10.0 y:20.0}
+(dict [] []) -- {}
+;; ========== DICT ACCESS ==========
+(set d (dict [a b c] [1 2 3])) (at d 'a) -- 1
+(set d (dict [a b c] [1 2 3])) (at d 'b) -- 2
+(set d (dict [a b c] [1 2 3])) (at d 'c) -- 3
+(set d (dict [a b c] [1 2 3])) (at d 'd) -- 0Nl
+;; missing key
+;; ========== KEY FUNCTION ==========
+(key (dict [a b c] [1 2 3])) -- [a b c]
+(key (dict [x] [10])) -- [x]
+(key (table [a b] (list [1 2] [3 4]))) -- [a b]
+;; ========== VALUE FUNCTION ==========
+(value (dict [a b c] [1 2 3])) -- [1 2 3]
+(value (dict [x] [10])) -- [10]
+(value (table [a b] (list [1 2] [3 4]))) -- (list [1 2] [3 4])
+;; ========== NESTED DICT ==========
+(set d (dict [a b] (list 1 (dict [x y] [10 20])))) (at (at d 'b) 'x) -- 10
+;; ========== DICT IN TABLE ROW ==========
+(first (table [a b] (list [1 2] [3 4]))) -- {a:1 b:3}
+(at (first (table [a b] (list [1 2] [3 4]))) 'a) -- 1
