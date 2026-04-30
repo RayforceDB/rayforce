@@ -1,0 +1,95 @@
+;; Differential IPC oracle.
+;;
+;; Spawns a fresh `./rayforce -p PORT` process as an IPC server, then
+;; for each curated expression evaluates it twice — locally and over
+;; the wire via `.ipc.send` — and asserts both sides format-equal via
+;; the harness `--` line operator.
+;;
+;; The point is coverage: round-trips exercise src/core/{ipc,sock,
+;; epoll,poll}.c and src/store/serde.c, paths the rest of the rfl
+;; suite never touches because everything else evaluates in-process.
+;;
+;; Server lifecycle is shell-driven through `.sys.exec`:
+;;   * pre-flight  — `pkill -f 'rayforce -p 19999'` clears stragglers
+;;                   from a prior crashed run; rc is ignored.
+;;   * spawn       — `./rayforce -p 19999 </dev/null &`. Closing stdin
+;;                   makes the REPL hit EOF and fall through to the
+;;                   pure server loop (`run_piped` -> `ray_poll_run`).
+;;   * readiness   — bash `/dev/tcp` probe with up to 30 retries at
+;;                   100 ms each, asserted == 0; if the server fails
+;;                   to come up the test fails fast with a clear
+;;                   `find_top_sep` mismatch instead of hanging.
+;;   * teardown    — `(.ipc.send h "(exit 0)")` so the server's
+;;                   atexit handlers fire (LLVM source-based
+;;                   instrumentation flushes profraw only on a clean
+;;                   exit — SIGTERM/SIGKILL would silently lose the
+;;                   server's coverage data).  A best-effort `pkill`
+;;                   afterwards mops up if the IPC roundtrip failed.
+;;
+;; Port choice (19999) is fixed and unprivileged.  Two `make test`
+;; invocations on the same machine will collide, but that is not a
+;; pattern we support — `make test` is sequential by design.
+
+;; ── lifecycle: spawn server ────────────────────────────────────────
+(.sys.exec "pkill -TERM -f 'rayforce -p 19999' 2>/dev/null; true")
+(.sys.exec "./rayforce -p 19999 </dev/null >/dev/null 2>&1 &")
+(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19999) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; Open one client handle and reuse it across all cases.  A fresh
+;; handle per case would also exercise accept/handshake/teardown
+;; paths but slows the test ~30×; we keep the connection live and
+;; cover those paths once at the boundaries.
+(set h (.ipc.open "127.0.0.1:19999"))
+(>= h 0) -- true
+
+;; ── arithmetic atoms ───────────────────────────────────────────────
+(+ 3 4)              -- (.ipc.send h "(+ 3 4)")
+(- 10 3)             -- (.ipc.send h "(- 10 3)")
+(* 6 7)              -- (.ipc.send h "(* 6 7)")
+(+ 0.0 -0.0)         -- (.ipc.send h "(+ 0.0 -0.0)")
+(sqrt 4.0)           -- (.ipc.send h "(sqrt 4.0)")
+
+;; ── vectors (small) ────────────────────────────────────────────────
+(+ [1 2 3] 10)       -- (.ipc.send h "(+ [1 2 3] 10)")
+(sum [1 2 3 4 5])    -- (.ipc.send h "(sum [1 2 3 4 5])")
+(reverse [1 2 3])    -- (.ipc.send h "(reverse [1 2 3])")
+(max [3 1 4 1 5 9])  -- (.ipc.send h "(max [3 1 4 1 5 9])")
+(min [3 1 4])        -- (.ipc.send h "(min [3 1 4])")
+(asc [3 1 2])        -- (.ipc.send h "(asc [3 1 2])")
+
+;; ── type queries ───────────────────────────────────────────────────
+(type 1)             -- (.ipc.send h "(type 1)")
+(type 1.0)           -- (.ipc.send h "(type 1.0)")
+(type 'foo)          -- (.ipc.send h "(type 'foo)")
+(type "x")           -- (.ipc.send h "(type \"x\")")
+
+;; ── comparison + null ──────────────────────────────────────────────
+(== 'AAPL 'AAPL)     -- (.ipc.send h "(== 'AAPL 'AAPL)")
+(nil? 0N)            -- (.ipc.send h "(nil? 0N)")
+(nil? 5)             -- (.ipc.send h "(nil? 5)")
+
+;; ── string ops ─────────────────────────────────────────────────────
+(like "hello" "h*")  -- (.ipc.send h "(like \"hello\" \"h*\")")
+
+;; ── compression boundary ───────────────────────────────────────────
+;; RAY_IPC_COMPRESS_THRESHOLD = 2000 bytes (src/core/ipc.h).  An i64
+;; vector of length 1000 is 8 KB serialised, so the response payload
+;; goes through ray_ipc_compress / ray_ipc_decompress — coverage that
+;; the small-payload cases above cannot reach.
+(count (til 10000))  -- (.ipc.send h "(count (til 10000))")
+(sum (til 1000))     -- (.ipc.send h "(sum (til 1000))")
+
+;; ── teardown ───────────────────────────────────────────────────────
+;; Ask the server to exit cleanly so its atexit handlers fire (and,
+;; under `make coverage`, the profile runtime flushes its profraw to
+;; disk).  Wrapped in `try` because the server tears the connection
+;; down before it can send a response, which `.ipc.send` reports as
+;; an `io` error — that is the expected outcome here, not a failure.
+(try (.ipc.send h "(exit 0)") (fn [e] 0))
+(.ipc.close h)
+
+;; Mop-up: if the clean exit above somehow didn't take, give the
+;; server a little time, then kill anything still bound to the test
+;; port.  Always succeeds (`true` at the end) — teardown must never
+;; fail the test.
+(.sys.exec "sleep 0.1; pkill -KILL -f 'rayforce -p 19999' 2>/dev/null; true")
