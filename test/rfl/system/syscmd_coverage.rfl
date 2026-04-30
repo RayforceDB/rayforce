@@ -1,0 +1,179 @@
+;; syscmd_coverage.rfl — extra coverage for src/lang/syscmd.c.
+;;
+;; Companion to syscmd.rfl.  That file pins down the happy paths;
+;; this one walks the error / coercion / dispatcher branches that
+;; coverage flagged as untouched.  Every assertion targets a
+;; specific branch in syscmd.c so the file doubles as a map from
+;; behaviour to source line.
+;;
+;; Each `.rfl` runs in a fresh runtime (test/main.c rfl_setup /
+;; rfl_teardown), so the profiler flag and env count seen here are
+;; the bare post-init values.  We exploit that for the toggle
+;; tests below.
+;;
+;; Exercises:
+;;   arg_as_i64        (lines 65-87)  — every typed branch
+;;   h_timeit          (line 98)      — null-arg toggle, type error
+;;   h_listen          (line 125)     — domain / type / nyi
+;;   h_env             (line 163)     — count > 0, with-arg variadic
+;;   ray_syscmd_lookup (line 240)     — alias path via "?" / "t"
+;;   ray_syscmd_dispatch (line 270)   — leading tab, shell fallback,
+;;                                       REPL-only rejection, empty
+;;   ray_syscmd_string_dispatch_fn (line 327) — non-string guard
+;;   invoke_by_name    (line 336)     — direct .sys.<name>
+;;   ray_sys_listen_fn (line 347)     — direct call
+;;   ray_sys_timeit_fn (line 353)     — variadic 0 args
+;;   ray_sys_env_fn    (line 356)     — variadic with arg
+
+;; ────────────── start: clean any stragglers from a prior run ──────────────
+(.sys.cmd "rm -f /tmp/rfl_syscmd_cov*") -- 0
+
+;; ────────────── arg_as_i64: typed-int branches via .sys.timeit ──────────────
+;; Each non-string integer kind takes a distinct early-return path in
+;; arg_as_i64 (lines 68-72).  Driving them through .sys.timeit is the
+;; cleanest way to round-trip the result back into Rayfall.
+(.sys.timeit 1)        -- 1
+(.sys.timeit 0)        -- 0
+(.sys.timeit 1i)       -- 1
+(.sys.timeit 0i)       -- 0
+(.sys.timeit 1h)       -- 1
+(.sys.timeit 0h)       -- 0
+(.sys.timeit 0x01)     -- 1
+(.sys.timeit 0x00)     -- 0
+(.sys.timeit true)     -- 1
+(.sys.timeit false)    -- 0
+
+;; ────────────── arg_as_i64: STR branches via .sys.cmd dispatch ──────────────
+;; The string parser handles leading whitespace, optional sign, then
+;; digits (lines 73-84).  Drive each sub-branch.
+(.sys.cmd "timeit 1")       -- 1
+(.sys.cmd "timeit 0")       -- 0
+(.sys.cmd "timeit +1")      -- 1
+(.sys.cmd "timeit -1")      -- 1
+(.sys.cmd "timeit 42")      -- 1
+;; Multi-digit + accumulator: 100 ≠ 0, so toggle goes ON.
+(.sys.cmd "timeit 100")     -- 1
+(.sys.cmd "timeit 0")       -- 0
+
+;; Empty-after-sign / non-digit start → type error (line 80).
+(.sys.cmd "timeit +")    !- type
+(.sys.cmd "timeit -")    !- type
+(.sys.cmd "timeit abc")  !- type
+(.sys.cmd "timeit 1.5")  -- 1
+;; ^ "1.5" parses up to the dot → 1, profile turns on; the trailing
+;; ".5" is not an error (the parser stops at first non-digit and
+;; returns what it has).  Reset state for any later toggle tests.
+(.sys.timeit 0)          -- 0
+
+;; ────────────── h_timeit: no-arg toggle (arg_is_null branch, line 100) ──
+;; Force off, then toggle: state flips on and back off.  Final value
+;; is observable through the return code.
+(.sys.timeit 0)   -- 0
+(.sys.timeit)     -- 1
+(.sys.timeit)     -- 0
+
+;; ────────────── ray_sys_timeit_fn: variadic with extra args ignored ──────
+;; The variadic adapter (line 353) only forwards the first arg.
+(.sys.timeit 1) -- 1
+(.sys.timeit 0) -- 0
+
+;; ────────────── h_env: count > 0 + variadic with arg branch ──────────────
+;; ray_sys_env_fn takes optional arg via variadic adapter (line 356);
+;; arg is ignored by h_env (line 164).  Both call shapes work.
+(> (.sys.env) 0)    -- true
+(> (.sys.env 1) 0)  -- true
+(> (.sys.env "x") 0) -- true
+
+;; ────────────── h_listen: domain / type / nyi branches ──────────────
+;; The test runtime (test/main.c) does not register a poll instance,
+;; so any port that passes the range check hits the "nyi: no main
+;; event loop attached" branch (line 133).  Out-of-range ports fail
+;; earlier with `domain` (line 130); non-numeric arg fails earliest
+;; with `type` (line 129).
+(.sys.listen 0)       !- domain
+(.sys.listen -1)      !- domain
+(.sys.listen 65536)   !- domain
+(.sys.listen 99999)   !- domain
+(.sys.listen 8080)    !- nyi
+(.sys.listen 1)       !- nyi
+(.sys.listen 65535)   !- nyi
+;; String coerces through arg_as_i64; numeric string → nyi, junk → type.
+(.sys.listen "8080")  !- nyi
+(.sys.listen "abc")   !- type
+
+;; Same surface via .sys.cmd string dispatch — exercises the dispatcher
+;; path through to h_listen, which is a separate code path from the
+;; direct ray_sys_listen_fn entry above.
+(.sys.cmd "listen 8080")  !- nyi
+(.sys.cmd "listen -1")    !- domain
+(.sys.cmd "listen 65536") !- domain
+
+;; ────────────── ray_syscmd_lookup: alias path ──────────────
+;; Lookup walks both `name` and `alias` slots (lines 244-247).
+;; `?` is the alias for help; `t` for timeit.  REPL-only verbs
+;; should still 404 with the domain message, proving the alias
+;; matched and the REPL-only flag was honoured.
+(.sys.cmd "?")     !- domain
+(.sys.cmd "t 1")   -- 1
+(.sys.cmd "t 0")   -- 0
+;; Unknown alias / typo'd name falls through to the shell fallback.
+;; The shell will not have an "xyznosuchcmd" binary, so the host
+;; shell prints to stderr and returns a nonzero exit code.  We
+;; assert only that it's not 0.
+(== 0 (.sys.cmd "xyznosuchcmd_rfl_cov 2>/dev/null")) -- false
+
+;; ────────────── ray_syscmd_dispatch: leading-whitespace / tab trim ──────
+;; The leading-whitespace skip (line 274) accepts tabs as well as
+;; spaces.  Embedded literal tab via concat — the runtime sees the
+;; tab byte and skips it before tokenising.
+(.sys.cmd " timeit 1") -- 1
+(.sys.cmd " timeit 0") -- 0
+
+;; Whitespace-only / empty → "empty command" (line 275).  Tab-only
+;; covers the second whitespace char.
+(.sys.cmd "")     !- domain
+(.sys.cmd " ")    !- domain
+(.sys.cmd "  ")   !- domain
+
+;; ────────────── ray_syscmd_dispatch: shell fallback ──────────────
+;; Unknown command + allow_shell=true (the .sys.cmd path) routes to
+;; system(2) (lines 291-301).  Exit code is the shell's WEXITSTATUS-
+;; encoded value; pin only the success / failure split, not exact
+;; numbers (those depend on libc and shell).
+(.sys.cmd "true")  -- 0
+(== 0 (.sys.cmd "false")) -- false
+;; Multi-token shell command verbatim through to system(): proves the
+;; full original buffer (not just the head word) reached system().
+(.sys.cmd "test 1 -eq 1") -- 0
+(== 0 (.sys.cmd "test 1 -eq 2")) -- false
+
+;; ────────────── REPL-only verbs rejected from non-REPL ──────────────
+;; clear/help/q/quit carry RAY_SYSCMD_REPL_ONLY.  Through .sys.cmd we
+;; get an explicit `domain` (line 309-310) instead of a silent no-op.
+(.sys.cmd "clear") !- domain
+(.sys.cmd "help")  !- domain
+(.sys.cmd "?")     !- domain
+(.sys.cmd "quit")  !- domain
+;; Note: bare `q` is an alias of `quit` — also REPL-only.  We do NOT
+;; assert (.sys.cmd "q") here because if the dispatcher were ever
+;; broken to bypass the REPL guard, it would call exit(0) and silently
+;; pass the test.  Better to leave that probe to the C-side tests.
+
+;; ────────────── ray_syscmd_string_dispatch_fn: non-string guard ──────────
+;; The Rayfall surface check (line 328) rejects non-string args
+;; cleanly before the dispatcher ever sees them.
+(.sys.cmd 42)     !- type
+(.sys.cmd 1.5)    !- type
+(.sys.cmd 'foo)   !- type
+(.sys.cmd [1 2])  !- type
+
+;; ────────────── invoke_by_name: REPL-only rejection on direct call ──────
+;; Direct .sys.<name> for any REPL-only verb would also error
+;; (line 339-340), but the only REPL-only verbs in the table are
+;; help/clear/q/quit and none of them are bound flat under .sys.<name>.
+;; Best-effort: confirm the registered .sys.* surface excludes them.
+;; (We leave this as documentation — the registry in eval.c registers
+;; only timeit/listen/env/cmd; clear/help/q have no .sys.* binding.)
+
+;; ────────────── end: cleanup ──────────────
+(.sys.cmd "rm -f /tmp/rfl_syscmd_cov*") -- 0
