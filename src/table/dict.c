@@ -486,6 +486,24 @@ ray_t* ray_dict_upsert(ray_t* d, ray_t* key_atom, ray_t* val) {
         vals = lst;
     }
 
+    /* Empty-target adoption: if the dict is empty its keys-vec type was
+     * defaulted at construction (e.g. RAY_I64 for `(dict [] [])` from an
+     * empty `[]` literal — parse.c:514) and may not match the incoming
+     * key atom's type.  Replace the placeholder keys vec with one of the
+     * correct type so the type-dispatch below succeeds.  Without this,
+     * `(concat (dict [] []) (dict [a b] [1 2]))` errors "type". */
+    if (keys->len == 0 && keys->type != -key_atom->type
+        && !(keys->type == RAY_SYM && key_atom->type == -RAY_SYM)) {
+        int8_t kt = (int8_t)-key_atom->type;
+        ray_t* nk = (kt == RAY_SYM)
+            ? ray_sym_vec_new(RAY_SYM_W64, 0)
+            : ray_vec_new(kt, 0);
+        if (!nk || RAY_IS_ERR(nk)) { ray_release(d); return nk ? nk : ray_error("oom", NULL); }
+        ray_release(keys);
+        slots[0] = nk;
+        keys = nk;
+    }
+
     /* Append key — helper consumes `keys`, returns owned (possibly new) ref. */
     ray_t* new_keys = NULL;
     if (keys->type == RAY_SYM) {
@@ -554,7 +572,9 @@ ray_t* ray_dict_remove(ray_t* d, ray_t* key_atom) {
     /* Drop key element by slicing (build a smaller vec without idx). */
     int64_t n = keys->len;
     ray_t* new_keys = NULL;
-    if (keys->type == RAY_SYM) {
+    if (keys->type == RAY_LIST) {
+        new_keys = ray_list_new(n - 1);
+    } else if (keys->type == RAY_SYM) {
         new_keys = ray_sym_vec_new(keys->attrs & RAY_SYM_W_MASK, n - 1);
     } else if (keys->type == RAY_STR) {
         new_keys = ray_vec_new(RAY_STR, n - 1);
@@ -564,7 +584,15 @@ ray_t* ray_dict_remove(ray_t* d, ray_t* key_atom) {
     if (!new_keys || RAY_IS_ERR(new_keys)) { ray_release(d); return new_keys ? new_keys : ray_error("oom", NULL); }
 
     /* Copy keys[0..idx-1] then keys[idx+1..n-1] into new_keys. */
-    if (keys->type == RAY_STR) {
+    if (keys->type == RAY_LIST) {
+        ray_t** ks = (ray_t**)ray_data(keys);
+        for (int64_t i = 0; i < n; i++) {
+            if (i == idx) continue;
+            ray_t* nk = ray_list_append(new_keys, ks[i]);
+            if (!nk || RAY_IS_ERR(nk)) { ray_release(new_keys); ray_release(d); return nk ? nk : ray_error("oom", NULL); }
+            new_keys = nk;
+        }
+    } else if (keys->type == RAY_STR) {
         for (int64_t i = 0; i < n; i++) {
             if (i == idx) continue;
             size_t slen = 0;

@@ -131,13 +131,17 @@
 ;; Non-existent STR key — find_idx returns -1, remove returns d unchanged.
 (count (remove Dstr "missing")) -- 3
 
-;; LIST-keyed remove (Dh = {a: 1 "b": 2}) — keys->type == RAY_LIST falls
-;; to the generic else-branch in ray_dict_remove (line 562) which calls
-;; ray_vec_new(RAY_LIST, …).  ray_vec_new rejects type <= 0 (vec.c L178)
-;; so the operation surfaces as a type error.  This is a latent gap
-;; (no LIST-keys path in remove) — flagged in the bug summary.  Lock
-;; the observed behaviour so a future fix can intentionally update it:
-(remove Dh 'a) !- type
+;; LIST-keyed remove (Dh = {a: 1 "b": 2}) — keys->type == RAY_LIST routes
+;; through the dedicated LIST branch in ray_dict_remove which builds a new
+;; RAY_LIST without the matched index.  Removing 'a leaves just {"b": 2}.
+(count (remove Dh 'a)) -- 1
+(at (remove Dh 'a) "b") -- 2
+(at (remove Dh 'a) 'a) -- 0Nl
+;; Removing the str-keyed pair leaves just {a: 1}.
+(count (remove Dh "b")) -- 1
+(at (remove Dh "b") 'a) -- 1
+;; Removing a missing key leaves the dict unchanged.
+(count (remove Dh 'zzz)) -- 2
 
 ;; ========== ray_dict_get ON NON-DICT ==========
 ;; `at` on a non-dict bypasses ray_dict_find_idx; the dict path is only
@@ -190,11 +194,11 @@
 (concat (dict [] []) (dict [] [])) -- {}
 ;; Right-empty: bn=0 loop short-circuits, retained left dict returned.
 (concat (dict [a] [1]) (dict [] [])) -- (dict [a] [1])
-;; Left-empty has I64 keys (parser default for `[]`), so concat-driven
-;; upsert hits the keys-type vs key-atom-type mismatch (line 509-512 in
-;; ray_dict_upsert) and returns a type error.  Verifies the negative
-;; branch.
-(concat (dict [] []) (dict [a b] [1 2])) !- type
+;; Left-empty has I64 keys (parser default for `[]`), but the empty-target
+;; adoption branch in ray_dict_upsert replaces the placeholder keys vec
+;; with one matching the incoming key atoms' type, so the concat resolves
+;; to the right-hand dict's contents.
+(concat (dict [] []) (dict [a b] [1 2])) -- (dict [a b] [1 2])
 
 ;; ========== DICT FROM TABLE-ROW (ray_dict_new via ray_at_fn) ==========
 ;; Table row access materialises a SYM-keyed, LIST-valued dict.
