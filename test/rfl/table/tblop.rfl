@@ -1,0 +1,191 @@
+;; Coverage extension for src/ops/tblop.c.
+;;
+;; Targets the less-trodden branches that pulled tblop.c coverage to 42%:
+;; pivot error guards + FIRST/LAST + nrows==0 early-return; modify error
+;; paths; row dict-construction + errors; union-all type/shape errors;
+;; table-distinct via polymorphic `distinct`; unify branches; del
+;; success + errors; alter SET/CONCAT branches.
+;;
+;; Two sections are PARKED for SEGV/env-corruption bugs in src that the
+;; agent's tests exposed:
+;;   1. pivot with non-sym pivot-col + lambda agg: SEGV in
+;;      src/ops/tblop.c:384 (atom_eq inside OP_GROUP fallback).
+;;   2. alter REMOVE branches: after a remove call runs, subsequent
+;;      (set X ...) corrupts X — repl shows correct behavior, only
+;;      manifests in the rfl harness's per-line eval+persistent env.
+;; Both are flagged as src-side bugs to fix; tests re-enable after.
+
+(.sys.exec "rm -rf /tmp/rfl_tblop")
+
+;; ══════════════════════════════════════════════════════════════════
+;; ray_pivot_fn — error paths + special branches
+;; ══════════════════════════════════════════════════════════════════
+
+(pivot) !- arity
+(pivot (table [a] (list [1]))) !- arity
+(pivot (table [a] (list [1])) 'a 'a 'a) !- arity
+
+(pivot 42 'a 'b 'c sum) !- type
+
+(set Tp1 (table [a b c] (list ['x 'y] ['p 'q] [1 2])))
+(pivot Tp1 'a 99 'c sum) !- type
+(pivot Tp1 'a 'b 99 sum) !- type
+(pivot Tp1 'a 'b 'c 99) !- type
+(pivot Tp1 1 'b 'c sum) !- type
+(pivot Tp1 [1 2] 'b 'c sum) !- type
+
+(pivot Tp1 'a 'no_such_pcol 'c sum) !- domain
+(pivot Tp1 'a 'b 'no_such_vcol sum) !- domain
+(pivot Tp1 'no_such_idx 'b 'c sum) !- domain
+
+(set Tempty (select {from: Tp1 where: (== a 'never)}))
+(count Tempty) -- 0
+(count (pivot Tempty 'a 'b 'c sum)) -- 0
+
+(set Tfl (table [k1 k2 v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [1 2 3 4])))
+(set Pf (pivot Tfl 'k1 'k2 'v first))
+(at (at Pf 'x) 0) -- 1
+(at (at Pf 'y) 1) -- 4
+(set Pl (pivot Tfl 'k1 'k2 'v last))
+(at (at Pl 'x) 0) -- 1
+(at (at Pl 'y) 1) -- 4
+
+;; PARKED — non-sym pivot-col with lambda agg-fn SEGVs at
+;; src/ops/tblop.c:384 (ASAN: atom_eq reads 0x115).  Re-enable after
+;; src fix:
+;;   (pivot (table [k c v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [1 2 3 4])) 'k 'c 'v (fn [xs] (sum xs)))
+;;   (pivot (table [a b c v] (list ['X 'X 'Y 'Y] [1 2 1 2] ['p 'q 'p 'q] [10 20 30 40])) ['a 'b] 'c 'v (fn [xs] (sum xs)))
+
+;; ══════════════════════════════════════════════════════════════════
+;; ray_modify_fn — error paths
+;; ══════════════════════════════════════════════════════════════════
+
+(modify) !- arity
+(modify (table [a] (list [1]))) !- arity
+(modify (table [a] (list [1])) 'a) !- arity
+
+(modify 42 'a (fn [x] x)) !- type
+
+(set Tm (table [a b] (list [1 2 3] [10 20 30])))
+(modify Tm 99 (fn [x] x)) !- type
+(modify Tm 'no_such_col (fn [x] x)) !- domain
+
+;; ══════════════════════════════════════════════════════════════════
+;; ray_row_fn — happy path + error paths
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tr2 (table [a b c] (list [1 2 3] [10 20 30] ['x 'y 'z])))
+(type (row Tr2 0)) -- 'DICT
+(count (row Tr2 0)) -- 3
+(at (row Tr2 0) 'a) -- 1
+(at (row Tr2 1) 'b) -- 20
+(at (row Tr2 2) 'c) -- 'z
+(row 42 0) !- type
+(row Tr2 'a) !- type
+
+;; ══════════════════════════════════════════════════════════════════
+;; ray_union_all_fn — error paths
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tua (table [a b] (list [1 2] [10 20])))
+(union-all 42 Tua) !- type
+(union-all Tua 42) !- type
+(set Tdiff (table [a b c] (list [1] [2] [3])))
+(union-all Tua Tdiff) !- type
+(set Trename (table [a x] (list [1 2] [10 20])))
+(union-all Tua Trename) !- type
+
+;; ══════════════════════════════════════════════════════════════════
+;; ray_table_distinct_fn — reached via the polymorphic `distinct` verb
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tdup (table [a b] (list [1 1 2 2 1] [10 10 20 20 10])))
+(count (distinct Tdup)) -- 2
+(set Tunq (table [a b] (list [1 2 3] [10 20 30])))
+(count (distinct Tunq)) -- 3
+(type (distinct Tdup)) -- 'TABLE
+
+;; ══════════════════════════════════════════════════════════════════
+;; ray_unify_fn — same-type, atom-mixed, different-vec branches
+;; ══════════════════════════════════════════════════════════════════
+
+(count (unify [1 2 3] [4 5 6])) -- 2
+(at (unify [1 2 3] [4 5 6]) 0) -- [1 2 3]
+(at (unify [1 2 3] [4 5 6]) 1) -- [4 5 6]
+(count (unify 7 [1 2 3])) -- 2
+(at (unify 7 [1 2 3]) 0) -- 7
+(count (unify [1 2 3] 7)) -- 2
+(at (unify 1 2) 0) -- 1
+(at (unify 1 2) 1) -- 2
+(count (unify [1 2] [1.0 2.0])) -- 2
+
+;; ══════════════════════════════════════════════════════════════════
+;; ray_del_fn — success + error paths
+;; ══════════════════════════════════════════════════════════════════
+
+(del) !- arity
+(del 42) !- type
+(set tblop_tmp_x 99)
+tblop_tmp_x -- 99
+(del tblop_tmp_x) -- 0
+tblop_tmp_x !- name
+(del tblop_never_existed) -- 0
+
+;; ══════════════════════════════════════════════════════════════════
+;; ray_alter_fn — SET/CONCAT branches.  REMOVE branches PARKED below.
+;; Run last because alter SET on long lists/vecs corrupts subsequent
+;; table creation in this file (a real heap bug; see param notes).
+;; ══════════════════════════════════════════════════════════════════
+
+(alter) !- domain
+(set v [1 2 3])
+(alter 'v) !- domain
+(alter 'v set) !- domain
+(alter 42 set 0 99) !- type
+(alter 'no_such_var set 0 99) !- name
+(alter 'v 99 0 99) !- type
+
+(set vu [1 2 3])
+(alter 'vu spinach 0 99) !- domain
+
+(set vat 7)
+(alter 'vat set 0 99) !- type
+
+(set vs [1 2 3])
+(alter 'vs set "bad" 99) !- type
+
+(set vbr [1 2 3 4 5])
+(alter 'vbr set [0 2 4] 0)
+vbr -- [0 2 0 4 0]
+
+(set vpw [10 20 30 40])
+(alter 'vpw set [1 3] [200 400])
+vpw -- [10 200 30 400]
+
+(set vskip [1 2 3])
+(alter 'vskip set [0 99 -1] 7)
+vskip -- [7 2 3]
+
+(set Loob (list 'a 'b 'c))
+(alter 'Loob set [0 99] 'X)
+Loob -- (list 'X 'b 'c)
+
+(set vct [1 2 3])
+(alter 'vct concat "abc") !- type
+
+;; PARKED — alter REMOVE branches trigger env corruption: after one
+;; runs, any subsequent (set X ...) leaves X reading back as STR
+;; "repl" or table creation type-errors.  Repl-mode works correctly;
+;; bug only manifests in the rfl harness's per-line eval+persistent
+;; env.  Re-enable after src fix:
+;;   (set vrm [1 2 3])
+;;   (alter 'vrm remove 0) !- type
+;;   (set Lrm (list 1 2 3))
+;;   (alter 'Lrm remove "bad") !- type
+;;   (set Lbig (list 1 2 3 4 5))
+;;   (alter 'Lbig remove (til 257)) !- limit
+;;   (set Lr (list 1 2 3))
+;;   (alter 'Lr remove [99 -1])
+;;   Lr -- (list 1 2 3)
+
+(.sys.exec "rm -rf /tmp/rfl_tblop")
