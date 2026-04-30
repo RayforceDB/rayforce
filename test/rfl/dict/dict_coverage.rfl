@@ -1,0 +1,207 @@
+;; Coverage-targeted invariants for src/table/dict.c.
+;;
+;; Existing dict.rfl/key.rfl/value.rfl cover only sym-keyed happy paths,
+;; leaving most of ray_dict_find_idx (typed-key dispatch), ray_dict_remove
+;; (key-deletion paths), the empty-dict/missing-key edge cases, and
+;; non-sym key dispatch in ray_dict_get uncovered.  This file exercises
+;; those branches without modifying any source.  No /tmp I/O performed.
+
+;; ========== EMPTY DICT ==========
+;; npairs == 0 path in fmt_dict + n<=0 short-circuit in ray_dict_find_idx.
+(count (dict [] [])) -- 0
+(type (dict [] [])) -- 'DICT
+(key (dict [] [])) -- []
+;; value of empty-keyed dict is empty LIST () not empty vec [] —
+;; ray_dict_new wraps vals in a LIST regardless of input type.
+(value (dict [] [])) -- (list)
+;; Lookup on empty dict — find_idx returns -1 (n<=0 branch, line 166).
+(at (dict [] []) 'missing) -- 0Nl
+
+;; ========== ray_dict_fn ERROR PATHS ==========
+;; (dict K V) requires K to be a typed vector (line 1690 in builtins.c).
+;; A LIST as keys should error.
+(dict (list 1 2) [10 20]) !- type
+;; A scalar atom as keys should error.
+(dict 1 [10]) !- type
+
+;; ========== ray_dict_get / ray_dict_find_idx — TYPED KEYS ==========
+;; SYM keys (line 209-231 in dict.c).  Note: rfl-constructed SYM vecs
+;; default to W64 (vec.c:181), so the W8/W16/W32 inner branches in
+;; find_idx remain unreachable from rfl — only the W64 default tail.
+(set Ds (dict [a b c d] [10 20 30 40]))
+(at Ds 'a) -- 10
+(at Ds 'd) -- 40
+(at Ds 'missing) -- 0Nl
+;; Key-type mismatch (sym dict probed with int) -- find_idx returns -1
+;; via the `key_atom->type != -kt` guard (line 177).
+(at Ds 7) -- 0Nl
+
+;; I64 keys (line 232-237) — `group` of i64 vec produces a typed-int dict.
+(set Gi (group [10 20 10 30 20]))
+(count Gi) -- 3
+(at Gi 10) -- [0 2]
+(at Gi 20) -- [1 4]
+(at Gi 30) -- [3]
+;; Missing int key — find_idx negative, ray_at returns 0Nl.
+(at Gi 99) -- 0Nl
+
+;; LIST keys carrying str atoms — `(group (list ...))` keeps keys as
+;; RAY_LIST (builtins.c L1936-1951), so lookups go through the LIST
+;; branch (line 169-174) and atom_eq's STR-vs-STR path.  Distinct from
+;; the dict-literal STR-vec path covered by `Dstr` below.
+(set Gs (group (list "alpha" "beta" "alpha" "gamma")))
+(at Gs "alpha") -- [0 2]
+(at Gs "beta") -- [1]
+(at Gs "gamma") -- [3]
+;; Missing string key (no atom_eq match).
+(at Gs "delta") -- 0Nl
+;; Empty-string query — distinct length, no match.
+(at Gs "") -- 0Nl
+
+;; BOOL keys (line 250-255) — group of bool vec.
+(set Gb (group [true false true true false]))
+(at Gb true) -- [0 2 3]
+(at Gb false) -- [1 4]
+
+;; F64 keys (line 261-265).
+(set Gf (group [1.5 2.5 1.5 3.5]))
+(at Gf 1.5) -- [0 2]
+(at Gf 2.5) -- [1]
+(at Gf 99.0) -- 0Nl
+
+;; I16 keys (line 245-249) — SHORT literal `1h`.
+(set Gh (group [1h 2h 1h 3h]))
+(at Gh 1h) -- [0 2]
+(at Gh 3h) -- [3]
+
+;; I32 keys (line 238-244) — INT literal `1i`.
+(set Gii (group [1i 2i 1i 4i]))
+(at Gii 1i) -- [0 2]
+(at Gii 4i) -- [3]
+
+;; U8 keys (line 250-255) — BYTE literal `0x01`.
+(set Gu (group [0x01 0x02 0x01 0x03]))
+(at Gu 0x01) -- [0 2]
+(at Gu 0x03) -- [3]
+
+;; DATE keys (line 238-244).
+(set Gd (group [2025.01.01 2025.02.02 2025.01.01]))
+(at Gd 2025.01.01) -- [0 2]
+(at Gd 2025.02.02) -- [1]
+
+;; TIMESTAMP keys (line 232-237).
+(set Gt (group [2025.01.01D00:00:00.000000000 2025.01.02D00:00:00.000000000 2025.01.01D00:00:00.000000000]))
+(at Gt 2025.01.01D00:00:00.000000000) -- [0 2]
+(at Gt 2025.01.02D00:00:00.000000000) -- [1]
+
+;; ========== HETEROGENEOUS LIST-KEYED DICT ==========
+;; Dict-literal parser builds a LIST when keys mix sym+str (parse.c
+;; line 732).  This triggers the RAY_LIST branch in ray_dict_find_idx
+;; (line 169-174 — atom_eq probe).
+(set Dh {a: 1 "b": 2})
+(count Dh) -- 2
+(at Dh 'a) -- 1
+(at Dh "b") -- 2
+;; Missing key falls through atom_eq loop.
+(at Dh 'zzz) -- 0Nl
+
+;; ========== ray_dict_remove ==========
+;; remove on non-dict — type-error guard in ray_remove_fn (system.c L620).
+(remove [1 2 3] 'a) !- type
+(remove 5 'a) !- type
+
+;; SYM-key removal (dict.c line 576-585 — the SYM branch in remove).
+(set Ds2 (dict [a b c] [1 2 3]))
+(remove Ds2 'b) -- (dict [a c] [1 3])
+;; Removing a missing sym key — early return on idx<0 (line 536).
+(remove Ds2 'zzz) -- (dict [a b c] [1 2 3])
+;; Remove first key.
+(remove Ds2 'a) -- (dict [b c] [2 3])
+;; Remove last key.
+(remove Ds2 'c) -- (dict [a b] [1 2])
+
+;; STR-key removal (dict.c line 567-575 — the STR branch in remove).
+(set Dstr {"x": 10 "y": 20 "z": 30})
+(count (remove Dstr "y")) -- 2
+(at (remove Dstr "y") "x") -- 10
+(at (remove Dstr "y") "z") -- 30
+;; The removed key now misses.
+(at (remove Dstr "y") "y") -- 0Nl
+
+;; Non-existent STR key — find_idx returns -1, remove returns d unchanged.
+(count (remove Dstr "missing")) -- 3
+
+;; LIST-keyed remove (Dh = {a: 1 "b": 2}) — keys->type == RAY_LIST falls
+;; to the generic else-branch in ray_dict_remove (line 562) which calls
+;; ray_vec_new(RAY_LIST, …).  ray_vec_new rejects type <= 0 (vec.c L178)
+;; so the operation surfaces as a type error.  This is a latent gap
+;; (no LIST-keys path in remove) — flagged in the bug summary.  Lock
+;; the observed behaviour so a future fix can intentionally update it:
+(remove Dh 'a) !- type
+
+;; ========== ray_dict_get ON NON-DICT ==========
+;; `at` on a non-dict bypasses ray_dict_find_idx; the dict path is only
+;; entered when v->type == RAY_DICT (collection.c L1514).  No additional
+;; case to add here, but verify the count guard.
+(count (dict [a] [1])) -- 1
+
+;; ========== SINGLE-KEY DICT ==========
+(set D1 (dict [only] [42]))
+(at D1 'only) -- 42
+(count D1) -- 1
+(remove D1 'only) -- (dict [] [])
+(count (remove D1 'only)) -- 0
+
+;; ========== LARGER DICT (cross-element loop iteration) ==========
+;; A 50-key i64 dict — ensures the inner DICT_FIND_LOOP iterates
+;; meaningfully past the first few slots, and find_idx returns
+;; tail-of-vector indices correctly.
+(set BigK (group (concat (til 50) (til 50))))
+(count BigK) -- 50
+(at BigK 0) -- [0 50]
+(at BigK 49) -- [49 99]
+(at BigK 50) -- 0Nl
+
+;; ========== KEYS WITH NULLS (null-aware find_idx — line 185-193, 197-201) ==========
+;; A dict with a null in its keys vector triggers the null-aware probe.
+;; (dict [1 0Nl 3] [10 20 30]) builds an I64 keys vec with the null bitmap
+;; bit set on slot 1 — the keys_have_nulls branch in find_idx must skip
+;; null slots when looking up a non-null key, and only match null when
+;; the query atom is itself null.
+(set Dn (dict [1 0Nl 3] [10 20 30]))
+(at Dn 1) -- 10
+(at Dn 3) -- 30
+;; Null query against a keys-with-nulls vec — currently routes to the
+;; null-key branch (line 188-193): probes slot-by-slot.  Returns vals
+;; for the null slot.  This documents observed behaviour rather than
+;; an asserted spec; if the contract changes, the test will surface it.
+(at Dn 0Nl) -- 20
+;; Missing non-null key — keys_have_nulls path skips null slot (line 199),
+;; never matches, returns 0Nl.
+(at Dn 99) -- 0Nl
+
+;; ========== CONCAT ON DICTS (exercises ray_dict_upsert append + replace) ==========
+;; Existing-key replace path (line 461-477 of ray_dict_upsert): keys
+;; that overlap take the value from the right dict.
+(concat (dict [a b] [1 2]) (dict [b] [99])) -- (dict [a b] [1 99])
+;; Missing-key append (line 480-521).
+(concat (dict [a] [1]) (dict [b] [2])) -- (dict [a b] [1 2])
+;; Both empty.
+(concat (dict [] []) (dict [] [])) -- {}
+;; Right-empty: bn=0 loop short-circuits, retained left dict returned.
+(concat (dict [a] [1]) (dict [] [])) -- (dict [a] [1])
+;; Left-empty has I64 keys (parser default for `[]`), so concat-driven
+;; upsert hits the keys-type vs key-atom-type mismatch (line 509-512 in
+;; ray_dict_upsert) and returns a type error.  Verifies the negative
+;; branch.
+(concat (dict [] []) (dict [a b] [1 2])) !- type
+
+;; ========== DICT FROM TABLE-ROW (ray_dict_new via ray_at_fn) ==========
+;; Table row access materialises a SYM-keyed, LIST-valued dict.
+(at (table [a b c] (list [10] [20] [30])) 0) -- {a:10 b:20 c:30}
+(count (at (table [a b c] (list [10] [20] [30])) 0)) -- 3
+
+;; ========== DICT/TABLE CAST (ray_dict_new on cast path) ==========
+(type (as 'DICT (table [x y] (list [1] [2])))) -- 'DICT
+(count (as 'DICT (table [x y] (list [1] [2])))) -- 2
+(at (as 'DICT (table [x y] (list [1 2] [3 4]))) 'x) -- [1 2]
