@@ -1,0 +1,240 @@
+;; Targeted coverage for src/ops/exec.c — exercises the OP_<x> dispatcher
+;; branches that the existing suites under test/rfl/{table,sort,agg,
+;; integration} don't reach: OP_TIL edges, OP_IN parallel-worker path,
+;; OP_HEAD with SORT/GROUP/FILTER fusion, OP_TAIL on tables, OP_PIVOT
+;; with selection compaction, chained OP_FILTER (rowsel refine),
+;; HAVING-fusion (FILTER over GROUP), broadcast_scalar via SELECT
+;; expression, ANTIJOIN selection compaction, OP_EXTRACT in projection,
+;; and several error / empty-input edges.
+;;
+;; Cleanup pre-empts any leftover state from a previous failed run —
+;; we don't actually touch /tmp here, but follow the convention.
+(.sys.exec "rm -rf /tmp/rfl_exec_coverage")
+
+;; ====================================================================
+;; OP_TIL — exec.c:920-931
+;; ====================================================================
+;; Positive arg path; dispatcher emits a fresh I64 vector.
+(count (til 100)) -- 100
+(first (til 100)) -- 0
+(last (til 100)) -- 99
+
+;; n<=0 short-circuit branch — returns empty I64 vec, never touches d[].
+(count (til 0)) -- 0
+;; til of negative is rejected upstream, exercise the error path:
+(til -7) !- domain
+
+;; ====================================================================
+;; OP_HEAD — exec.c:1247-1421
+;; ====================================================================
+;; Plain table HEAD (no SORT/GROUP/FILTER child) — flat-column copy
+;; branch + n>nrows clamp + n=0 edge.
+(set TT (table [a b] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100])))
+(count (select {from: TT take: 3})) -- 3
+(sum (at (select {from: TT take: 3}) 'a)) -- 6
+(count (select {from: TT take: 0})) -- 0
+(count (select {from: TT take: 999})) -- 10
+
+;; HEAD(SORT) fusion — exec.c:1252-1269 picks the sort+limit fast path.
+;; ascending take 3 → first three sorted values of a.
+(sum (at (select {from: TT asc: a take: 3}) 'a)) -- 6
+(sum (at (select {from: TT desc: a take: 3}) 'a)) -- 27
+
+;; HEAD(GROUP) fusion — exec.c:1276-1300 passes the limit hint into
+;; exec_group; trim happens after.  Use a 6-key group, take 2 groups.
+(set TG (table [g v] (list ['a 'b 'c 'a 'b 'c 'a 'b 'c] [1 2 3 4 5 6 7 8 9])))
+(count (select {s: (sum v) from: TG by: g take: 2})) -- 2
+
+;; HEAD(FILTER) fusion — exec.c:1301-1336 short-circuits the filter
+;; once N matches are gathered.  18 rows pass the predicate; take 5.
+(set TF (table [x y] (list [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20] [10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180 190 200])))
+(count (select {from: TF where: (> x 2) take: 5})) -- 5
+(sum (at (select {from: TF where: (> x 2) take: 5}) 'x)) -- 25
+
+;; HEAD over vector (not a table) — bottom of OP_HEAD, exec.c:1410-1421.
+;; (first V) is unary on a vector; fold via select projection then index.
+(first (at (select {from: TT take: 1}) 'a)) -- 1
+
+;; ====================================================================
+;; OP_TAIL — exec.c:1423-1534
+;; ====================================================================
+;; select { take: -N } compiles to OP_TAIL via query.c:3219.
+(count (select {from: TT take: -3})) -- 3
+(sum (at (select {from: TT take: -3}) 'a)) -- 27
+(count (select {from: TT take: -999})) -- 10
+(first (at (select {from: TT take: -1}) 'a)) -- 10
+
+;; ====================================================================
+;; OP_FILTER — chained refine + HAVING fusion — exec.c:1014-1080
+;; ====================================================================
+;; Nested select forces a chained filter — the inner select installs
+;; g->selection, the outer adds another predicate which hits the
+;; "if (g->selection)" branch at exec.c:1060 and calls
+;; ray_rowsel_refine.  (Dict keys are unique per-call, so two
+;; where: in one dict literal is not the right shape.)
+(count (select {from: (select {from: TF where: (> x 5)}) where: (< x 15)})) -- 9
+(sum (at (select {from: (select {from: TF where: (> x 5)}) where: (< x 15)}) 'x)) -- 90
+
+;; HAVING-fusion: FILTER-over-GROUP via outer select.  Inner select
+;; produces an aggregated table; outer select filters by the agg
+;; column.  The optimizer can rearrange this into a single FILTER(GROUP)
+;; DAG that exec.c:1019-1043 specializes — predicate evaluated
+;; against the GROUP output table.
+(set TH (table [k v] (list ['a 'a 'a 'b 'b 'c 'c 'c 'c 'd] [1 2 3 4 5 6 7 8 9 10])))
+(count (select {from: (select {c: (count v) from: TH by: k}) where: (>= c 3)})) -- 2
+
+;; Empty-pass filter — non-zero rows in, zero out.
+(count (select {from: TF where: (> x 99999)})) -- 0
+
+;; Filter on a vector (not table) input forces the eager path —
+;; exec.c:1075-1079.  Use (filter ...) builtin if exposed; otherwise
+;; the same path is hit by an aggregator over a filtered scalar list.
+(sum (at (select {from: TF where: (> x 0)}) 'y)) -- 2100
+
+;; ====================================================================
+;; OP_PIVOT with selection compaction — exec.c:1158-1172
+;; ====================================================================
+;; Build a fixture and consume its result via a project that drives
+;; pivot dispatch through ray_execute.
+(set TP (table [r c v] (list ['A 'A 'B 'B 'A] ['x 'y 'x 'y 'y] [1 2 3 4 5])))
+(count (pivot TP 'r 'c 'v sum)) -- 2
+
+;; ====================================================================
+;; OP_GROUP — multi-key + multi-aggregator (exec.c:1100-1156)
+;; ====================================================================
+;; Single key hits sequential exec_group; ensures dispatcher path runs.
+(count (select {s: (sum v) m: (max v) n: (min v) c: (count v) from: TH by: k})) -- 4
+(sum (at (select {s: (sum v) from: TH by: k}) 's)) -- 55
+
+;; ====================================================================
+;; OP_JOIN, OP_ANTIJOIN — selection compaction branches
+;; (exec.c:1174-1209)
+;; ====================================================================
+;; Pre-filter the left table so g->selection is non-NULL when the
+;; join hands off to sel_compact.
+(set L (table [k v] (list [1 2 3 4 5 6] [10 20 30 40 50 60])))
+(set R (table [k w] (list [2 4 6 8] [200 400 600 800])))
+(count (inner-join [k] (select {from: L where: (> k 1)}) R)) -- 3
+(count (anti-join  [k] (select {from: L where: (> k 1)}) R)) -- 2
+
+;; ====================================================================
+;; OP_WINDOW_JOIN with selection-compacted left — exec.c:1211-1227
+;; ====================================================================
+(set tr (table [Sym Time Price] (list ['a 'a 'a 'b] [10:00:01.000 10:00:05.000 10:00:09.000 10:00:01.000] [100 200 300 400])))
+(set qu (table [Sym Time Bid] (list ['a 'a 'a 'b 'b] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:00.000 10:00:02.000] [99 100 101 199 200])))
+(set iv (map-left + [-2000 2000] (at tr 'Time)))
+(count (at (window-join [Sym Time] iv tr qu {m: (min Bid)}) 'm)) -- 4
+
+;; ====================================================================
+;; OP_SORT with selection compaction — exec.c:1082-1098
+;; ====================================================================
+;; Filter then sort — sel_compact runs because g->selection is set.
+(first (at (select {from: TT where: (> a 4) asc: a}) 'a)) -- 5
+(first (at (select {from: TT where: (> a 4) desc: a}) 'a)) -- 10
+
+;; ====================================================================
+;; OP_SELECT projection with broadcast_scalar — exec.c:1620-1631
+;; ====================================================================
+;; A constant scalar in the projection dictionary lands as an atom
+;; (vec->type < 0); broadcast_scalar fans it out to N rows.
+(count (select {k: 42 from: TT})) -- 10
+(sum (at (select {k: 42 from: TT}) 'k)) -- 420
+
+;; Constant string in projection — exercises the -RAY_STR branch of
+;; broadcast_scalar (exec.c:507-517).
+(count (select {tag: "x" from: TT})) -- 10
+
+;; Constant float — exercises the F64 atom branch.
+(sum (at (select {f: 1.5 from: TT}) 'f)) -- 15.0
+
+;; Constant bool — exercises the BOOL atom branch.
+(sum (as 'I64 (at (select {b: true from: TT}) 'b))) -- 10
+
+;; Empty table broadcast — exec.c:492-503 returns a 0-length typed vec.
+(count (at (select {k: 7 from: TT where: (< a 0)}) 'k)) -- 0
+
+;; ====================================================================
+;; OP_EXTRACT — eager temporal extract inside aggregator (exec.c:1564
+;; only fires when the call is compiled into the DAG via the
+;; long-form name (year/month/...).  The short alias (yyyy x) is an
+;; eval-level builtin that calls ray_temporal_extract directly, so
+;; it bypasses exec.c.  Keep the eval-level form here as a smoke
+;; test of the surrounding sum/at machinery rather than of
+;; exec_extract proper.
+(set TD (table [d v] (list [2024.01.15 2024.06.30 2025.12.31] [10 20 30])))
+(sum (yyyy (at TD 'd))) -- 6073
+
+;; ====================================================================
+;; OP_IN — parallel worker path — exec.c:799-803
+;; ====================================================================
+;; Need col_len >= 65536 to enter the ray_pool_dispatch branch.  Build
+;; a 70k-row table and probe a small set; result row-count is the
+;; matching subset.  Computed: range 0..69999, set {1,2,3} → 3.
+(set N1 70000)
+(set TBig (table [v] (list (% (til N1) 100000))))
+(count (select {from: TBig where: (in v [1 2 3])})) -- 3
+(sum  (at (select {from: TBig where: (in v [1 2 3])}) 'v)) -- 6
+
+;; OP_NOT_IN: dispatcher reaches the same exec_in body but with
+;; negate=1 (exec.c:651).  At col_len=70000 this also exercises the
+;; parallel worker dispatch.  Use both forms for diversity.
+(count (select {from: TBig where: (not-in v [1 2 3])})) -- 69997
+(count (select {from: TBig where: (not (in v [1 2 3]))})) -- 69997
+
+;; OP_IN over float column hits use_double=1 path — exec.c:763-775.
+(set TBigF (table [f] (list (as 'F64 (% (til 70000) 1000)))))
+(count (select {from: TBigF where: (in f [1.0 2.0 3.0])})) -- 210
+
+;; ====================================================================
+;; OP_FIRST / OP_LAST / OP_AVG / OP_SUM with lazy filter — exec.c:984-1004
+;; ====================================================================
+;; sel_compact branch fires because filter→reduction sees a TABLE input
+;; and a live g->selection.  Not strictly required (reductions accept
+;; rowsel directly) but the dispatcher branch covers the swap anyway.
+(sum (at (select {from: TT where: (> a 3)}) 'a)) -- 49
+(first (at (select {from: TT where: (> a 7)}) 'a)) -- 8
+(last  (at (select {from: TT where: (> a 7)}) 'a)) -- 10
+
+;; ====================================================================
+;; OP_COUNT_DISTINCT — exec.c:1006-1012
+;; ====================================================================
+;; Hit via (distinct …) inside an aggregator-shaped expression.
+(count (distinct (at TG 'g))) -- 3
+(count (distinct [1 1 2 2 3 3 4 4 5])) -- 5
+
+;; ====================================================================
+;; OP_IF in projection — exec.c:1536-1538
+;; ====================================================================
+;; Conditional column derived from an existing column.
+(sum (at (select {z: (if (> a 5) 1 0) from: TT}) 'z)) -- 5
+
+;; ====================================================================
+;; OP_LIKE / OP_ILIKE — exec.c:1540-1546
+;; ====================================================================
+;; LIKE inside a where: clause; the predicate is a BOOL column
+;; produced by exec_like and consumed by the lazy-filter branch.
+(set TS (table [s v] (list ['Apple 'Banana 'Cherry 'Apricot 'Berry] [1 2 3 4 5])))
+(count (select {from: TS where: (like s "A*")})) -- 2
+(count (select {from: TS where: (ilike s "a*")})) -- 2
+
+;; ====================================================================
+;; OP_STRLEN / OP_UPPER / OP_LOWER / OP_SUBSTR — exec.c:1548-1559
+;; ====================================================================
+;; All four exercised inside a projection so they reach exec_string_*
+;; helpers via ray_execute → exec_node.
+(set TStr (table [s] (list ["alpha" "bravo" "charlie"])))
+(sum (at (select {n: (strlen s) from: TStr}) 'n)) -- 17
+(first (at (select {u: (upper s) from: TStr}) 'u)) -- "ALPHA"
+(set TUp (table [s] (list ["BETA" "GAMMA"])))
+(first (at (select {u: (lower s) from: TUp}) 'u)) -- "beta"
+
+;; ====================================================================
+;; ALIAS / MATERIALIZE — exec.c:1572-1578 are pass-through dispatchers
+;; ====================================================================
+;; A nested select forces materialize semantics through the executor.
+(count (select {from: (select {from: TT take: 5}) take: 3})) -- 3
+
+;; ====================================================================
+;; Cleanup
+;; ====================================================================
+(.sys.exec "rm -rf /tmp/rfl_exec_coverage")
