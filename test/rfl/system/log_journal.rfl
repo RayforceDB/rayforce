@@ -229,7 +229,11 @@
 ;; tighter because UTC-second timestamps in the rolled name can collide
 ;; if multiple rolls happen in the same second (subsequent stage H
 ;; rolls again via snapshot — both can land on the same name).
-(.sys.exec "[ $(find /tmp -maxdepth 1 -name 'rfl_log_inproc.*.log' | wc -l) -ge 1 ]") -- 0
+;; Use a bash glob (expanded by /bin/sh) rather than find — `find /tmp`
+;; on macOS resolves through the /tmp -> /private/tmp symlink and BSD-find
+;; quirks make the count unreliable.  `ls /pattern.log >/dev/null 2>&1`
+;; returns 0 iff the shell expanded at least one match.
+(.sys.exec "ls /tmp/rfl_log_inproc.*.log >/dev/null 2>&1") -- 0
 ;; Fresh .log post-roll exists (open for append always creates it).
 (.sys.exec "test -f /tmp/rfl_log_inproc.log") -- 0
 ;; A write into the post-roll fresh log proves the journal stayed open.
@@ -246,7 +250,8 @@
 ;; the active log too, but if the previous roll happened within the
 ;; same UTC second the rename collides on the existing archive name —
 ;; the count can therefore stay at 1 even though both rolls "happened".
-(.sys.exec "[ $(find /tmp -maxdepth 1 -name 'rfl_log_inproc.*.log' | wc -l) -ge 1 ]") -- 0
+;; Bash glob (not find) for the same macOS-portability reason as stage G.
+(.sys.exec "ls /tmp/rfl_log_inproc.*.log >/dev/null 2>&1") -- 0
 (nil? (.log.close)) -- true
 
 ;; ── stage I: badtail — truncate a complete log mid-frame, replay ───
