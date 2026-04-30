@@ -1,0 +1,102 @@
+;; Coverage extension for src/ops/dump.c.
+;;
+;; Scope note: src/ops/dump.c is the *query plan* dumper, not the value
+;; formatter (the format/println/show verbs live in src/lang/format.c
+;; and src/lang/eval.c).  dump.c contains:
+;;
+;;   1. ray_opcode_name(opcode) — switch returning the textual name.
+;;   2. type_name(t)            — static helper for dump_node.
+;;   3. find_ext / dump_node    — static helpers for ray_graph_dump.
+;;   4. ray_graph_dump(g, root, FILE*) — pretty-prints a query plan.
+;;
+;; Of these, only ray_opcode_name is reachable from .rfl: src/ops/exec.c
+;; line ~838 calls it for every "heavy" pipeline opcode (FILTER, SORT,
+;; GROUP, JOIN, WINDOW_JOIN, SELECT, HEAD, TAIL, WINDOW, PIVOT, plus
+;; OP_EXPAND..OP_KNN_RERANK).  Each heavy-op evaluation hits one switch
+;; arm.  ray_graph_dump / dump_node / find_ext / type_name have no
+;; rfl-side entry point and can only be reached from C-level tests.
+;;
+;; All assertions are deterministic — no rand on the LHS, no timestamps,
+;; no filesystem state.
+
+;; ────────────── shared fixture ──────────────
+(set t (table [k v] (list ['a 'b 'a 'b 'c 'c] [10 20 30 40 50 60])))
+
+;; ──────────── OP_FILTER (heavy) ────────────
+;; `where` clause inside select compiles to OP_FILTER on the table.
+;; Standalone (filter V mask) on a vector also drives the same name lookup.
+(count (filter [10 20 30 40 50 60] [false false true true true true])) -- 4
+(count (select {from: t where: (> v 20)})) -- 4
+(sum (at (select {from: t where: (== k 'a)}) 'v)) -- 40
+(count (select {from: t where: (and (> v 10) (< v 60))})) -- 4
+
+;; ──────────── OP_SORT (heavy) ────────────
+;; `select {asc:}` / `select {desc:}` compiles to OP_SORT through the
+;; query graph (xasc/xdesc/asc/desc don't go through ray_execute, only
+;; the select-side asc:/desc: clause does).
+(at (select {from: t asc: v}) 'v)  -- [10 20 30 40 50 60]
+(at (select {from: t desc: v}) 'v) -- [60 50 40 30 20 10]
+(at (select {from: t asc: k}) 'v)  -- [10 30 20 40 50 60]
+
+;; ──────────── OP_GROUP (heavy) ────────────
+;; `select ... by k` compiles to OP_GROUP.
+(count (select {s: (sum v) from: t by: k})) -- 3
+(sum (at (select {s: (sum v) from: t by: k}) 's)) -- 210
+(at (select {n: (count v) from: t by: k}) 'n) -- [2 2 2]
+
+;; ──────────── OP_HEAD / OP_TAIL (heavy) ────────────
+;; `select {take: N}` builds HEAD (positive N) or TAIL (negative N) in
+;; the query graph (the bare `take` builtin is a vector primitive and
+;; does not go through ray_execute).
+(count (select {from: t take: 3}))  -- 3
+(count (select {from: t take: -2})) -- 2
+(at (select {from: t take: 2}) 'v)  -- [10 20]
+(at (select {from: t take: -2}) 'v) -- [50 60]
+
+;; ──────────── OP_SELECT (heavy) ────────────
+;; Bare `select {from: t}` and projections both compile to OP_SELECT.
+(count (select {from: t})) -- 6
+(at (select {from: t y: (* v 2)}) 'y) -- [20 40 60 80 100 120]
+(at (select {from: t y: (+ v 1)}) 'y) -- [11 21 31 41 51 61]
+;; SELECT preceded by FILTER — exercises both arms in one pipeline.
+(at (select {from: t where: (> v 25) y: (+ v 0)}) 'y) -- [30 40 50 60]
+
+;; ──────────── OP_JOIN (heavy) — INNER + LEFT ────────────
+(set t1 (table [k v1] (list [1 2 3] [10 20 30])))
+(set t2 (table [k v2] (list [1 3 4] [100 300 400])))
+(count (inner-join [k] t1 t2)) -- 2
+(at (inner-join [k] t1 t2) 'v2) -- [100 300]
+(count (left-join [k] t1 t2))  -- 3
+;; JOIN over symbol keys
+(set ts1 (table [s v] (list ['a 'b 'c] [1 2 3])))
+(set ts2 (table [s w] (list ['a 'c 'd] [10 30 40])))
+(count (inner-join [s] ts1 ts2)) -- 2
+
+;; ──────────── OP_WINDOW_JOIN (heavy) ────────────
+;; window-join + window-join1 both compile to OP_WINDOW_JOIN.
+(set tr (table [s tm p] (list ['a 'a] [10:00:01.000 10:00:05.000] [100 200])))
+(set qt (table [s tm b] (list ['a 'a 'a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))
+(set iv (map-left + [-2000 2000] (at tr 'tm)))
+(at (window-join [s tm] iv tr qt {mb: (min b)}) 'mb) -- [99 101]
+(at (window-join1 [s tm] iv tr qt {mb: (min b)}) 'mb) -- [99 101]
+
+;; ──────────── OP_PIVOT (heavy) ────────────
+;; pivot builds OP_PIVOT.
+(set tp (table [r c v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [1 2 3 4])))
+(count (pivot tp 'r 'c 'v sum)) -- 2
+(at (at (pivot tp 'r 'c 'v sum) 'x) 0) -- 1
+(at (at (pivot tp 'r 'c 'v sum) 'y) 1) -- 4
+;; alternative aggregators hit the same OP_PIVOT name path
+(count (pivot tp 'r 'c 'v count)) -- 2
+(count (pivot tp 'r 'c 'v max))   -- 2
+(count (pivot tp 'r 'c 'v min))   -- 2
+(count (pivot tp 'r 'c 'v avg))   -- 2
+
+;; ──────────── chained heavy pipeline ────────────
+;; FILTER -> GROUP -> SORT all in one select — exercises ray_opcode_name
+;; multiple times in a single ray_execute walk.
+(sum (at (select {s: (sum v) from: t where: (!= k 'c) by: k asc: s}) 's)) -- 100
+
+;; ──────────── error path: heavy verb with bad arg ────────────
+;; Errors propagate from the lang-side dispatch; bad mask type fails type-check.
+(filter [true false] [1 2]) !- type
