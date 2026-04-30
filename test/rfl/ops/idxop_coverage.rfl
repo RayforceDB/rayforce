@@ -1,0 +1,311 @@
+;; Coverage workout for src/ops/idxop.c -- the per-vector accelerator
+;; index layer (zone / hash / sort / bloom).  Existing rfl coverage is
+;; limited to the zone+has?+drop path on i64 in test/rfl/table/link.rfl;
+;; this file walks every kind across every supported numeric type, the
+;; round-trip lifecycle (build / drop / rebuild / overwrite), the meta
+;; surface (.idx.info, .idx.has?), and the documented error paths from
+;; prepare_attach (non-vec, non-numeric, list).
+;;
+;; Public surface (registered in src/lang/eval.c:2381-2387):
+;;   .idx.zone v   -> v with zone   index attached
+;;   .idx.hash v   -> v with hash   index attached
+;;   .idx.sort v   -> v with sort   index attached
+;;   .idx.bloom v  -> v with bloom  index attached
+;;   .idx.drop v   -> v with index removed (no-op if none)
+;;   .idx.has? v   -> b8 (true iff HAS_INDEX is set and index != NULL)
+;;   .idx.info v   -> dict of kind/length/... or null when no index
+
+;; ────────────── cleanup (no on-disk state, but spec mandates) ──────────────
+(.sys.exec "rm -rf /tmp/rfl_idxop*")
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ZONE -- min/max/n_nulls (zone_scan_int / zone_scan_float)
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; ── i64 path: es=8 in zone_scan_int (idxop.c:240-266) ──
+(set vi64 [5 1 9 3 7])
+(set zi64 (.idx.zone vi64))
+(.idx.has? zi64) -- true
+(at (.idx.info zi64) 'kind) -- 'zone
+(at (.idx.info zi64) 'length) -- 5
+(at (.idx.info zi64) 'min) -- 1
+(at (.idx.info zi64) 'max) -- 9
+(at (.idx.info zi64) 'n_nulls) -- 0
+
+;; ── i64 with inline nulls: any_value=true, n_nulls counted ──
+(set vi64n [5 0Nl 9 0Nl 7])
+(set zi64n (.idx.zone vi64n))
+(at (.idx.info zi64n) 'min) -- 5
+(at (.idx.info zi64n) 'max) -- 9
+(at (.idx.info zi64n) 'n_nulls) -- 2
+
+;; ── i64 all-nulls: any_value=false branch (idxop.c:261) zeroes min/max ──
+(set vi64z [0Nl 0Nl 0Nl])
+(set zi64z (.idx.zone vi64z))
+(at (.idx.info zi64z) 'min) -- 0
+(at (.idx.info zi64z) 'max) -- 0
+(at (.idx.info zi64z) 'n_nulls) -- 3
+
+;; ── empty vector: n=0, any_value=false ──
+(set ve [])
+(set ze (.idx.zone ve))
+(at (.idx.info ze) 'length) -- 0
+(at (.idx.info ze) 'min) -- 0
+(at (.idx.info ze) 'max) -- 0
+(at (.idx.info ze) 'n_nulls) -- 0
+
+;; ── i32 path: es=4 in zone_scan_int (idxop.c:253) ──
+(set vi32 (as 'I32 [10 -3 50 0]))
+(set zi32 (.idx.zone vi32))
+(at (.idx.info zi32) 'min) -- -3
+(at (.idx.info zi32) 'max) -- 50
+
+;; ── i16 path: es=2 in zone_scan_int (idxop.c:252) ──
+(set vi16 (as 'I16 [100 -200 300 0]))
+(set zi16 (.idx.zone vi16))
+(at (.idx.info zi16) 'min) -- -200
+(at (.idx.info zi16) 'max) -- 300
+
+;; ── u8 path: es=1 in zone_scan_int (idxop.c:251) ──
+(set vu8 (as 'U8 [10 1 50 5]))
+(set zu8 (.idx.zone vu8))
+(at (.idx.info zu8) 'min) -- 1
+(at (.idx.info zu8) 'max) -- 50
+
+;; ── bool path: es=1 in zone_scan_int + RAY_BOOL switch arm ──
+(set vb [true false true true])
+(set zb (.idx.zone vb))
+(at (.idx.info zb) 'min) -- 0
+(at (.idx.info zb) 'max) -- 1
+
+;; ── f64 path: zone_scan_float es=8 (idxop.c:268-293) ──
+(set vf64 [1.5 -2.5 3.14 0.0])
+(set zf64 (.idx.zone vf64))
+(at (.idx.info zf64) 'min) -- -2.5
+(at (.idx.info zf64) 'max) -- 3.14
+
+;; F32 zone-scan branch (idxop.c:278) skipped — `(as 'F32 ...)` errors
+;; with "domain"; F32 isn't an exposed cast target.  Coverage via direct
+;; C call would be needed to hit the es=4 float path.
+
+;; ── date path: routes to zone_scan_int es=4 (idxop.c:300-301) ──
+(set vd [2024.01.15 2024.06.30 2024.02.29])
+(set zd (.idx.zone vd))
+(.idx.has? zd) -- true
+(at (.idx.info zd) 'kind) -- 'zone
+
+;; ── timestamp path: routes to zone_scan_int es=8 (idxop.c:302-304) ──
+(set vts (as 'TIMESTAMP [5 1 3 2 4]))
+(set zts (.idx.zone vts))
+(.idx.has? zts) -- true
+(at (.idx.info zts) 'min) -- 1
+(at (.idx.info zts) 'max) -- 5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; HASH -- chained open-addressing build (idxop.c:403-453)
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; ── small i64: capacity rounds to power-of-two >= max(8, 2n) ──
+(set hi64 (.idx.hash [10 20 30 40 50]))
+(.idx.has? hi64) -- true
+(at (.idx.info hi64) 'kind) -- 'hash
+(at (.idx.info hi64) 'n_keys) -- 5
+(at (.idx.info hi64) 'capacity) -- 16
+
+;; ── empty: capacity floors at 8, chain stays len=0 (idxop.c:417 special-case) ──
+(set hempty (.idx.hash []))
+(at (.idx.info hempty) 'kind) -- 'hash
+(at (.idx.info hempty) 'n_keys) -- 0
+(at (.idx.info hempty) 'capacity) -- 8
+
+;; ── n=2 (n < 4 branch): next_pow2(8) = 8 (idxop.c:409) ──
+(set h2 (.idx.hash [42 99]))
+(at (.idx.info h2) 'capacity) -- 8
+
+;; ── duplicates: every row enters the chain, n_keys counts non-null rows ──
+(set hdup (.idx.hash [7 7 7 7]))
+(at (.idx.info hdup) 'n_keys) -- 4
+
+;; ── nulls excluded from n_keys (idxop.c:432) ──
+(set hwithn (.idx.hash [1 0Nl 2 0Nl 3]))
+(at (.idx.info hwithn) 'n_keys) -- 3
+
+;; ── f64 hash: numeric_key_word float branch + canonicalisation ──
+(set hf (.idx.hash [1.5 2.5 3.5 1.5]))
+(at (.idx.info hf) 'n_keys) -- 4
+(at (.idx.info hf) 'kind) -- 'hash
+
+;; ── large vec, crosses default morsel boundary (>256 rows) ──
+;; til 300 -> i64 [0..299]; n=300, cap = next_pow2(600) = 1024
+(set hbig (.idx.hash (til 300)))
+(at (.idx.info hbig) 'n_keys) -- 300
+(at (.idx.info hbig) 'capacity) -- 1024
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; SORT -- ascending permutation (idxop.c:462-479)
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set si (.idx.sort [50 10 30 20 40]))
+(.idx.has? si) -- true
+(at (.idx.info si) 'kind) -- 'sort
+(at (.idx.info si) 'perm_len) -- 5
+(at (.idx.info si) 'length) -- 5
+
+(set sf (.idx.sort [3.14 1.5 -2.5 0.0]))
+(at (.idx.info sf) 'kind) -- 'sort
+(at (.idx.info sf) 'perm_len) -- 4
+
+;; sort on empty -- ray_sort_indices with len=0 returns an empty I64
+(set sempty (.idx.sort []))
+(at (.idx.info sempty) 'perm_len) -- 0
+
+;; sort over morsel boundary
+(set sbig (.idx.sort (til 300)))
+(at (.idx.info sbig) 'perm_len) -- 300
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; BLOOM -- 3-hash filter, bits sized to next_pow2(8 * n_set) (idxop.c:489-537)
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; n_set < 8 -> target_bits=64 floor (idxop.c:499-501)
+(set bs (.idx.bloom [1 2 3]))
+(.idx.has? bs) -- true
+(at (.idx.info bs) 'kind) -- 'bloom
+(at (.idx.info bs) 'n_keys) -- 3
+(at (.idx.info bs) 'k) -- 3
+(at (.idx.info bs) 'm_bits) -- 64
+
+;; n_set=10, 8*10=80, next_pow2(80)=128
+(set bm (.idx.bloom (til 10)))
+(at (.idx.info bm) 'n_keys) -- 10
+(at (.idx.info bm) 'm_bits) -- 128
+
+;; bloom over a float column -- exercises numeric_key_word float path
+(set bf (.idx.bloom [1.5 2.5 3.5 4.5 5.5 6.5 7.5 8.5 9.5 10.5]))
+(at (.idx.info bf) 'n_keys) -- 10
+(at (.idx.info bf) 'k) -- 3
+
+;; bloom with all-null vec: n_set=0 -> 64-bit floor, n_keys=0
+(set bz (.idx.bloom [0Nl 0Nl 0Nl]))
+(at (.idx.info bz) 'n_keys) -- 0
+(at (.idx.info bz) 'm_bits) -- 64
+
+;; bloom over morsel boundary
+(set bbig (.idx.bloom (til 300)))
+(at (.idx.info bbig) 'n_keys) -- 300
+;; 8*300=2400, next_pow2(2400)=4096
+(at (.idx.info bbig) 'm_bits) -- 4096
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; LIFECYCLE -- drop / rebuild / overwrite
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; drop returns vector without HAS_INDEX (idxop.c:549-592)
+(set lv [1 2 3 4 5])
+(set lvi (.idx.zone lv))
+(.idx.has? lvi) -- true
+(set lvd (.idx.drop lvi))
+(.idx.has? lvd) -- false
+;; .idx.info on a vec without index returns null (idxop.c:630)
+(nil? (.idx.info lvd)) -- true
+
+;; drop on a vec that has no index is a no-op (idxop.c:552 early return)
+(set plain [1 2 3])
+(.idx.has? plain) -- false
+(set plain-d (.idx.drop plain))
+(.idx.has? plain-d) -- false
+
+;; double-drop is idempotent
+(set dd1 (.idx.drop (.idx.drop (.idx.zone [9 8 7]))))
+(.idx.has? dd1) -- false
+
+;; rebuild: zone -> drop -> hash -> drop -> sort -> drop -> bloom
+(set rv [11 22 33 44])
+(set rvz (.idx.zone rv))
+(at (.idx.info rvz) 'kind) -- 'zone
+(set rvz2 (.idx.drop rvz))
+(set rvh (.idx.hash rvz2))
+(at (.idx.info rvh) 'kind) -- 'hash
+(set rvh2 (.idx.drop rvh))
+(set rvs (.idx.sort rvh2))
+(at (.idx.info rvs) 'kind) -- 'sort
+(set rvs2 (.idx.drop rvs))
+(set rvb (.idx.bloom rvs2))
+(at (.idx.info rvb) 'kind) -- 'bloom
+
+;; build over an already-indexed vec drops + rebuilds (idxop.c:361-365)
+(set ov [3 1 4 1 5 9 2 6])
+(set ovz (.idx.zone ov))
+(at (.idx.info ovz) 'kind) -- 'zone
+;; second .idx.hash on the same vec rebuilds: zone first dropped then hash attached
+(set ovh (.idx.hash ovz))
+(at (.idx.info ovh) 'kind) -- 'hash
+(at (.idx.info ovh) 'n_keys) -- 8
+
+;; ── original binding semantics: .idx.* returns COW'd ref; old name unaffected
+;; vis a vis index attachment because the old binding holds the pre-COW pointer ──
+(set base [7 8 9])
+(.idx.has? base) -- false
+(set baseI (.idx.zone base))
+(.idx.has? baseI) -- true
+(.idx.has? base) -- false
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; ERROR PATHS (prepare_attach / drop_fn) -- idxop.c:353-374
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; ── non-numeric vec: sym vector hits numeric_elem_size==0 -> "nyi" ──
+(.idx.zone ['AAPL 'GOOG 'MSFT]) !- nyi
+(.idx.hash ['a 'b 'c]) !- nyi
+(.idx.sort ['x 'y]) !- nyi
+(.idx.bloom ['p 'q]) !- nyi
+
+;; ── string vec also unsupported in v1 ──
+(.idx.zone ["alpha" "beta"]) !- nyi
+(.idx.hash ["a" "b"]) !- nyi
+
+;; ── non-vector input (atom): ray_is_vec -> false -> "type" error ──
+(.idx.zone 42) !- type
+(.idx.hash 3.14) !- type
+(.idx.sort 'sym) !- type
+(.idx.bloom "x") !- type
+
+;; ── heterogeneous list: not a typed vec -> type error ──
+(.idx.zone (list 1 'sym 1.5)) !- type
+(.idx.hash (list 1 "two")) !- type
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; INTROSPECTION shape -- ray_index_info dict surface (idxop.c:629-697)
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; zone info exposes parent_type and saved_attrs (idxop.c:643-646)
+(set ii (.idx.info (.idx.zone [1 2 3])))
+(at ii 'kind) -- 'zone
+(at ii 'length) -- 3
+;; parent_type for RAY_I64 is its enum value; we don't pin the exact int,
+;; just that the field exists and is non-negative
+(>= (at ii 'parent_type) 0) -- true
+(>= (at ii 'saved_attrs) 0) -- true
+
+;; hash info exposes capacity & n_keys (idxop.c:668-672)
+(set hi (.idx.info (.idx.hash [1 2 3 4])))
+(at hi 'kind) -- 'hash
+(>= (at hi 'capacity) 8) -- true
+
+;; sort info has perm_len (idxop.c:674-677)
+(set sii (.idx.info (.idx.sort [3 1 2])))
+(at sii 'kind) -- 'sort
+(at sii 'perm_len) -- 3
+
+;; bloom info has m_bits / k / n_keys (idxop.c:679-685)
+(set bii (.idx.info (.idx.bloom [1 2 3])))
+(at bii 'kind) -- 'bloom
+(at bii 'k) -- 3
+(>= (at bii 'm_bits) 64) -- true
+
+;; .idx.has? on non-indexed atom returns false (no HAS_INDEX bit)
+(.idx.has? 42) -- false
+(.idx.has? "abc") -- false
+
+;; ────────────── cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_idxop*")
