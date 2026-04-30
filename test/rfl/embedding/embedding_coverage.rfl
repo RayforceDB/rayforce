@@ -1,0 +1,152 @@
+;; Coverage probe for src/ops/embedding.c — drives branches that the
+;; per-builtin tests (cos_dist.rfl, l2_dist.rfl, inner_prod.rfl,
+;; norm.rfl, hnsw.rfl) leave untouched.
+;;
+;; Specifically:
+;;   - LIST x query branch of cos-dist / l2-dist / inner-prod (vec_binary_metric)
+;;   - LIST branch of norm
+;;   - the entire ray_knn_fn (cosine / l2 / ip metrics, error paths,
+;;     empty-column shortcut)
+;;   - hnsw-build / ann / hnsw-info / hnsw-free under cosine and ip
+;;     metrics (existing test only exercises l2)
+;;   - hnsw-save / hnsw-load round trip
+;;   - hnsw-free idempotency (second call must error, not double-free)
+
+;; ────────────── pre-flight: scrub any leftover save dirs ──────────────
+(.sys.exec "rm -rf /tmp/rfl_embcov_idx /tmp/rfl_embcov_idx_*")
+
+;; ────────────── LIST x query distance fan-out ──────────────
+;; vec_binary_metric: a is RAY_LIST, b is numeric vec → F64 vector,
+;; one score per row.  Smoke-tests the LIST validation, query_to_doubles,
+;; and per-row row_score dispatch for all three metric kinds.
+(set Col (list [1.0 0.0 0.0] [0.0 1.0 0.0] [-1.0 0.0 0.0]))
+
+;; cos-dist: identical → 0, orthogonal → 1, opposite → 2.
+(at (cos-dist Col [1.0 0.0 0.0]) 0)  -- 0.0
+(at (cos-dist Col [1.0 0.0 0.0]) 1)  -- 1.0
+(at (cos-dist Col [1.0 0.0 0.0]) 2)  -- 2.0
+(count (cos-dist Col [1.0 0.0 0.0])) -- 3
+
+;; query x LIST symmetry — exercises the (b is LIST) swap branch.
+(at (cos-dist [1.0 0.0 0.0] Col) 0)  -- 0.0
+(at (cos-dist [1.0 0.0 0.0] Col) 2)  -- 2.0
+
+;; l2-dist over LIST — distances 0, sqrt(2), 2.
+(at (l2-dist Col [1.0 0.0 0.0]) 0)   -- 0.0
+(at (l2-dist Col [1.0 0.0 0.0]) 2)   -- 2.0
+1 -- (as 'I64 (< (abs (- (at (l2-dist Col [1.0 0.0 0.0]) 1) 1.41421356)) 0.0001))
+
+;; inner-prod over LIST — 1, 0, -1.
+(at (inner-prod Col [1.0 0.0 0.0]) 0) -- 1.0
+(at (inner-prod Col [1.0 0.0 0.0]) 1) -- 0.0
+(at (inner-prod Col [1.0 0.0 0.0]) 2) -- -1.0
+
+;; LIST x query length mismatch flagged.
+(cos-dist Col [1.0 0.0]) !- length
+
+;; ────────────── norm over LIST ──────────────
+;; Drives the LIST branch of ray_norm_fn (lines ~498-516).
+(count (norm Col)) -- 3
+(at (norm Col) 0)  -- 1.0
+(at (norm Col) 1)  -- 1.0
+(at (norm Col) 2)  -- 1.0
+
+;; norm with non-numeric input → type error
+(norm 'foo) !- type
+
+;; ────────────── ray_knn_fn — exact KNN via brute force ──────────────
+;; Default metric is cosine.  Row 0 should win against [1.0 0.0 0.0].
+(set V (list [1.0 0.0 0.0] [0.9 0.1 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.5 0.5 0.0]))
+(first (at (knn V [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(first (at (knn V [1.0 0.0 0.0] 1) '_dist))  -- 0.0
+
+;; k > nrows is clamped, not an error.
+(count (knn V [1.0 0.0 0.0] 99)) -- 5
+
+;; Result is sorted ascending by distance.
+(<= (first (at (knn V [1.0 0.0 0.0] 3) '_dist)) (last (at (knn V [1.0 0.0 0.0] 3) '_dist))) -- true
+
+;; Explicit metric symbols hit each switch arm.
+(first (at (knn V [1.0 0.0 0.0] 1 'cosine) '_rowid)) -- 0
+(first (at (knn V [1.0 0.0 0.0] 1 'l2)     '_rowid)) -- 0
+(first (at (knn V [1.0 0.0 0.0] 1 'ip)     '_rowid)) -- 0
+
+;; L2: identical → distance 0.
+(first (at (knn V [1.0 0.0 0.0] 1 'l2) '_dist)) -- 0.0
+
+;; Error paths in ray_knn_fn.
+(knn V [1.0 0.0 0.0])                  !- rank
+(knn 5 [1.0 0.0 0.0] 1)                !- type
+(knn V 5 1)                            !- type
+(knn V [1.0 0.0 0.0] 1.0)              !- type
+(knn V [1.0 0.0 0.0] 1 'bogus)         !- domain
+(knn V [1.0 0.0] 1)                    !- length
+(knn V [1.0 0.0 0.0] 0)                !- domain
+(knn V [1.0 0.0 0.0] -3)               !- domain
+
+;; ────────────── hnsw-build under cosine and ip ──────────────
+;; Existing hnsw.rfl only exercises 'l2.  Cover the other two metric
+;; branches in parse_metric_sym + the cosine path in ray_hnsw_search.
+(set IdxCos (hnsw-build V 'cosine))
+(at (hnsw-info IdxCos) 'metric) -- 'cosine
+(at (hnsw-info IdxCos) 'nrows)  -- 5
+(at (hnsw-info IdxCos) 'dim)    -- 3
+(first (at (ann IdxCos [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(hnsw-free IdxCos)
+
+(set IdxIp (hnsw-build V 'ip 16 64))
+(at (hnsw-info IdxIp) 'metric) -- 'ip
+(at (hnsw-info IdxIp) 'M)      -- 16
+(at (hnsw-info IdxIp) 'efc)    -- 64
+(count (ann IdxIp [1.0 0.0 0.0] 2)) -- 2
+
+;; ann with explicit ef_s argument exercises the n == 4 branch.
+(count (ann IdxIp [1.0 0.0 0.0] 2 100)) -- 2
+
+;; ann argument validation.
+(ann IdxIp [1.0 0.0 0.0])         !- rank
+(ann 5    [1.0 0.0 0.0] 1)        !- type
+(ann IdxIp 5            1)        !- type
+(ann IdxIp [1.0 0.0 0.0] 1.0)     !- type
+(ann IdxIp [1.0 0.0]    1)        !- length
+(ann IdxIp [1.0 0.0 0.0] 0)       !- domain
+
+;; hnsw-build error paths.
+(hnsw-build)                  !- rank
+(hnsw-build 5)                !- type
+(hnsw-build V 'bogus)         !- domain
+(hnsw-build V 'l2 1.0)        !- type
+(hnsw-build V 'l2 8 "no")     !- type
+
+;; ────────────── hnsw-save / hnsw-load round trip ──────────────
+;; Persists the IP-metric index, frees the in-memory copy, reloads,
+;; and confirms metadata + a query still resolve.  Drives ray_hnsw_save_fn
+;; (lines 806-819) and ray_hnsw_load_fn (lines 822-835).
+(.sys.exec "mkdir -p /tmp/rfl_embcov_idx")
+(hnsw-save IdxIp "/tmp/rfl_embcov_idx")
+(hnsw-free IdxIp)
+
+(set Loaded (hnsw-load "/tmp/rfl_embcov_idx"))
+(at (hnsw-info Loaded) 'metric) -- 'ip
+(at (hnsw-info Loaded) 'nrows)  -- 5
+(at (hnsw-info Loaded) 'dim)    -- 3
+(count (ann Loaded [1.0 0.0 0.0] 3)) -- 3
+
+;; hnsw-save / hnsw-load argument validation.
+(hnsw-save 5 "/tmp/rfl_embcov_idx") !- type
+(hnsw-save Loaded 5)                !- type
+(hnsw-save Loaded "")               !- domain
+(hnsw-load 5)                       !- type
+(hnsw-load "")                      !- domain
+(hnsw-load "/tmp/rfl_embcov_idx_does_not_exist") !- io
+
+;; ────────────── hnsw-free idempotency contract ──────────────
+;; First free clears RAY_ATTR_HNSW; the second call must see a plain
+;; I64, fail hnsw_unwrap, and surface a type error rather than
+;; double-freeing the underlying index.
+(hnsw-free Loaded)
+(hnsw-free Loaded) !- type
+(hnsw-free 5)      !- type
+
+;; ────────────── teardown ──────────────
+(.sys.exec "rm -rf /tmp/rfl_embcov_idx /tmp/rfl_embcov_idx_*")
