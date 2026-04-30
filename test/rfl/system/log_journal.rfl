@@ -123,3 +123,149 @@
 ;; ── teardown ────────────────────────────────────────────────────────
 (.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_journal' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_journal*")
+
+;; ════════════════════════════════════════════════════════════════════
+;; In-process verb coverage — drive the .log.* wrappers in
+;; src/ops/journal.c directly (no subprocess), so every error branch
+;; executes under the test runtime's coverage instrumentation.
+;; The phases above only cover paths the live IPC dispatch reaches;
+;; the wrappers' type/rank/domain guards plus the .log.replay /
+;; .log.validate verbs (which the server doesn't auto-invoke) need
+;; direct calls.
+;;
+;; Base path: /tmp/rfl_log_inproc — distinct from /tmp/rftest_journal
+;; above so a half-dead subprocess from the phase-4 corruption test
+;; can't pollute these in-process cases.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ── pre-cleanup: stale state breaks subsequent runs (known harness bug) ─
+(.sys.exec "rm -rf /tmp/rfl_log_inproc /tmp/rfl_log_inproc.log /tmp/rfl_log_inproc.qdb /tmp/rfl_log_inproc.*.log /tmp/rfl_log_inproc_other.log /tmp/rfl_log_inproc_other.qdb")
+
+;; ── stage A: no journal open — domain + no-op paths ────────────────
+;; .log.roll / .log.snapshot must error when no journal is active.
+(.log.roll)     !- domain
+(.log.snapshot) !- domain
+;; .log.write returns RAY_NULL_OBJ (no-op) when no journal is open.
+(nil? (.log.write 42)) -- true
+;; .log.sync / .log.close are no-ops on a closed journal — succeed silently.
+(nil? (.log.sync))  -- true
+(nil? (.log.close)) -- true
+
+;; ── stage B: type / rank / domain guards on .log.open ──────────────
+;; Wrong argument count triggers the rank guard.
+(.log.open) !- rank
+(.log.open 'async) !- rank
+(.log.open 'async "/tmp/rfl_log_inproc" "extra") !- rank
+;; First arg must be a sym, not int / string / list.
+(.log.open 5 "/tmp/rfl_log_inproc") !- type
+(.log.open "async" "/tmp/rfl_log_inproc") !- type
+;; Unknown sym keyword falls through to the domain guard.
+(.log.open 'bogus "/tmp/rfl_log_inproc") !- domain
+;; Second arg must be a string.
+(.log.open 'async 5) !- type
+(.log.open 'async 'async) !- type
+
+;; ── stage C: type guards on .log.replay / .log.validate ────────────
+(.log.replay 5)   !- type
+(.log.replay 'x)  !- type
+(.log.validate 5) !- type
+
+;; ── stage D: io errors on missing files ────────────────────────────
+;; A missing log file must surface as an io error from both verbs.
+(.sys.exec "rm -f /tmp/rfl_log_inproc_does_not_exist.log") -- 0
+(.log.replay   "/tmp/rfl_log_inproc_does_not_exist.log") !- io
+(.log.validate "/tmp/rfl_log_inproc_does_not_exist.log") !- io
+
+;; ── stage E: happy path — open async, write, sync, validate, close ─
+;; Open in-process journal under our own base.
+(nil? (.log.open 'async "/tmp/rfl_log_inproc")) -- true
+;; Each successful .log.write returns null; assert that.
+;; Payloads are self-evaluating values only.  Replay deserializes each
+;; frame and runs eval on it; a string payload would be evaluated as
+;; Rayfall *source* (eval_one routes -RAY_STR → ray_eval_str), which
+;; would parse "hello" as an unbound name and warn.  Integers, floats,
+;; and integer-vector literals all evaluate to themselves and replay
+;; cleanly.
+(nil? (.log.write 1))            -- true
+(nil? (.log.write 42))           -- true
+(nil? (.log.write [1 2 3 4 5]))  -- true
+;; .log.sync on an async journal flushes + fsyncs — returns null.
+(nil? (.log.sync)) -- true
+;; The on-disk log file must be non-empty after three writes.
+(.sys.exec "test -s /tmp/rfl_log_inproc.log") -- 0
+;; .log.validate parses without evaluating; chunks ≥ 3, valid_bytes > 0.
+(set vA (.log.validate "/tmp/rfl_log_inproc.log"))
+(>= (first vA) 3) -- true
+(>  (last  vA) 0) -- true
+;; .log.close releases the journal; subsequent state-modifying verbs
+;; revert to no-journal-open behaviour.
+(nil? (.log.close)) -- true
+(.log.roll)     !- domain
+(.log.snapshot) !- domain
+(nil? (.log.write 99)) -- true
+
+;; ── stage F: replay the file we just wrote (single-shot) ───────────
+;; Replay returns the chunk count.  The three .log.write entries
+;; above each serialised an integer / string / vector literal whose
+;; eval is itself — no side effects, so replay is safe.
+(set repA (.log.replay "/tmp/rfl_log_inproc.log"))
+(>= repA 3) -- true
+
+;; ── stage G: sync mode + roll ──────────────────────────────────────
+;; Re-open under `sync mode (RAY_JOURNAL_SYNC).  We wipe the existing
+;; .log first so the journal layer doesn't auto-replay on open and
+;; print "log: replayed N entries..." to stderr, polluting `make test`
+;; output.  Auto-replay-on-open is covered by phase 2/3 above where
+;; the subprocess server runs with its stderr redirected to /dev/null.
+(.sys.exec "rm -f /tmp/rfl_log_inproc.log")
+(nil? (.log.open 'sync "/tmp/rfl_log_inproc")) -- true
+;; See stage E comment — only self-evaluating payloads.
+(nil? (.log.write 999)) -- true
+(nil? (.log.sync)) -- true
+;; .log.roll renames /tmp/rfl_log_inproc.log → /tmp/rfl_log_inproc.<UTC>.log
+;; and opens a fresh empty .log for append.  Returns null on success.
+(nil? (.log.roll)) -- true
+;; At least one rolled archive must exist now.  We don't pin the count
+;; tighter because UTC-second timestamps in the rolled name can collide
+;; if multiple rolls happen in the same second (subsequent stage H
+;; rolls again via snapshot — both can land on the same name).
+(.sys.exec "[ $(find /tmp -maxdepth 1 -name 'rfl_log_inproc.*.log' | wc -l) -ge 1 ]") -- 0
+;; Fresh .log post-roll exists (open for append always creates it).
+(.sys.exec "test -f /tmp/rfl_log_inproc.log") -- 0
+;; A write into the post-roll fresh log proves the journal stayed open.
+(nil? (.log.write 777)) -- true
+
+;; ── stage H: snapshot collapses live env into .qdb, rolls log ──────
+;; Snapshot serialises every user binding; pre-seed something so the
+;; .qdb has user content (not strictly required for the verb to pass,
+;; but makes the file-size assertion meaningful).
+(set snap_marker 1234)
+(nil? (.log.snapshot)) -- true
+(.sys.exec "test -s /tmp/rfl_log_inproc.qdb") -- 0
+;; At least one archive still exists after snapshot.  Snapshot rolls
+;; the active log too, but if the previous roll happened within the
+;; same UTC second the rename collides on the existing archive name —
+;; the count can therefore stay at 1 even though both rolls "happened".
+(.sys.exec "[ $(find /tmp -maxdepth 1 -name 'rfl_log_inproc.*.log' | wc -l) -ge 1 ]") -- 0
+(nil? (.log.close)) -- true
+
+;; ── stage I: badtail — truncate a complete log mid-frame, replay ───
+;; Build a small log under a fresh base, close it, then `truncate
+;; -s -4` to leave the trailing frame's payload short of the size
+;; declared by its header.  .log.replay must surface this as a
+;; "badtail" error (not silently accept the prefix).
+(.sys.exec "rm -f /tmp/rfl_log_inproc_other.log /tmp/rfl_log_inproc_other.qdb")
+(nil? (.log.open 'async "/tmp/rfl_log_inproc_other")) -- true
+(nil? (.log.write 11)) -- true
+(nil? (.log.write 22)) -- true
+(nil? (.log.write 33)) -- true
+(nil? (.log.close)) -- true
+;; Validate first — the clean file should give chunks=3, valid_bytes>0.
+(set vB (.log.validate "/tmp/rfl_log_inproc_other.log"))
+(>= (first vB) 3) -- true
+;; Now corrupt the tail; replay must report badtail.
+(.sys.exec "truncate -s -4 /tmp/rfl_log_inproc_other.log") -- 0
+(.log.replay "/tmp/rfl_log_inproc_other.log") !- badtail
+
+;; ── stage J: final teardown ────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_log_inproc /tmp/rfl_log_inproc.log /tmp/rfl_log_inproc.qdb /tmp/rfl_log_inproc.*.log /tmp/rfl_log_inproc_other.log /tmp/rfl_log_inproc_other.qdb")
