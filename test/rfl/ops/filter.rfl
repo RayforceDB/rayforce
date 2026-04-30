@@ -1,0 +1,190 @@
+;; Coverage tests for src/ops/filter.c — exec_filter, exec_filter_seq,
+;; exec_filter_vec, exec_filter_parted_vec, exec_filter_head, sel_compact.
+;;
+;; The standalone `(filter v mask)` builtin lives in src/ops/collection.c
+;; (ray_filter_fn) and does NOT route through src/ops/filter.c.  The
+;; functions in filter.c are reached only via the operation-graph
+;; executor: select-where, select-where-take, HAVING (filter on group
+;; result), and the lazy-selection compaction at every boundary op.
+;;
+;; RAY_MORSEL_ELEMS = 1024.  RAY_PARALLEL_THRESHOLD = 64*1024 = 65536.
+;; Tests around 1023/1024/1025 exercise the morsel boundary; >65536
+;; exercises the parallel-gather path; ≤65536 the sequential path.
+
+;; ────────────── 1. small fixture: select-where on flat columns ──────────────
+;; The standard sel_compact + lazy-selection pipeline is hit on every
+;; boundary op (count/sum/at) after a filter.
+
+(set T (table [i d f s b] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100] [1.5 2.5 3.5 4.5 5.5 6.5 7.5 8.5 9.5 10.5] ['a 'b 'c 'a 'b 'c 'a 'b 'c 'a] [true false true false true false true false true false])))
+
+;; mixed-pass predicate over each numeric column type
+(count (select {from: T where: (> i 5)})) -- 5
+(sum (at (select {from: T where: (> i 5)}) 'd)) -- 400
+(sum (at (select {from: T where: (> d 50)}) 'i)) -- 40
+(sum (at (select {from: T where: (> f 5.5)}) 'i)) -- 40
+(count (select {from: T where: (== s 'a)})) -- 4
+(count (select {from: T where: (!= s 'c)})) -- 7
+(count (select {from: T where: (== b true)})) -- 5
+
+;; all-pass / none-pass — sel_compact's pass_count==nrows / pass_count==0 paths
+(count (select {from: T where: (> i 0)})) -- 10
+(sum (at (select {from: T where: (> i 0)}) 'i)) -- 55
+(count (select {from: T where: (> i 999)})) -- 0
+(sum (at (select {from: T where: (> i 999)}) 'i)) -- 0
+(sum (at (select {from: T where: (> i 999)}) 'f)) -- 0.0
+
+;; single-row predicate
+(count (select {from: T where: (== i 7)})) -- 1
+(first (at (select {from: T where: (== i 7)}) 'd)) -- 70
+(first (at (select {from: T where: (== i 7)}) 's)) -- 'a
+
+;; AND / OR / NOT composites
+(count (select {from: T where: (and (> i 3) (< i 8))})) -- 4
+(count (select {from: T where: (or (== s 'a) (== s 'b))})) -- 7
+(count (select {from: T where: (not (== s 'c))})) -- 7
+(count (select {from: T where: (and (== s 'a) (> i 5))})) -- 2
+(count (select {from: T where: (or (and (> i 7) (< i 10)) (== i 1))})) -- 3
+
+;; nested select (chained filter) — second sel_compact reads first's output
+(count (select {from: (select {from: T where: (> i 3)}) where: (< i 8)})) -- 4
+(sum (at (select {from: (select {from: T where: (> i 3)}) where: (< i 8)}) 'd)) -- 220
+
+;; ────────────── 2. STR column in select-where (sel_compact STR path) ──────────────
+(set Tstr (table [k s] (list [1 2 3 4 5] (list "alpha" "beta" "gamma" "delta" "epsilon"))))
+(count (select {from: Tstr where: (> k 2)})) -- 3
+(count (select {from: Tstr where: (< k 3)})) -- 2
+(count (select {from: Tstr where: (> k 999)})) -- 0
+(count (select {from: Tstr where: (> k 0)})) -- 5
+
+;; ────────────── 3. morsel-boundary sizes: 1023 / 1024 / 1025 ──────────────
+;; sel_compact walks segments of RAY_MORSEL_ELEMS=1024 rows.  These three
+;; sizes hit the partial-last-segment / exact-boundary / one-row-overflow
+;; cases independently.
+
+(set N1023 1023)
+(set T1023 (table [i] (list (til N1023))))
+(count (select {from: T1023 where: (> i 0)})) -- 1022
+(count (select {from: T1023 where: (>= i 0)})) -- 1023
+(count (select {from: T1023 where: (> i 99999)})) -- 0
+(sum (at (select {from: T1023 where: (>= i 0)}) 'i)) -- 522753
+(count (select {from: T1023 where: (and (>= i 100) (< i 200))})) -- 100
+
+(set N1024 1024)
+(set T1024 (table [i] (list (til N1024))))
+(count (select {from: T1024 where: (> i 0)})) -- 1023
+(count (select {from: T1024 where: (>= i 0)})) -- 1024
+(count (select {from: T1024 where: (> i 99999)})) -- 0
+(sum (at (select {from: T1024 where: (>= i 0)}) 'i)) -- 523776
+(count (select {from: T1024 where: (and (>= i 100) (< i 200))})) -- 100
+
+(set N1025 1025)
+(set T1025 (table [i] (list (til N1025))))
+(count (select {from: T1025 where: (> i 0)})) -- 1024
+(count (select {from: T1025 where: (>= i 0)})) -- 1025
+(count (select {from: T1025 where: (> i 99999)})) -- 0
+(sum (at (select {from: T1025 where: (>= i 0)}) 'i)) -- 524800
+(count (select {from: T1025 where: (and (>= i 100) (< i 200))})) -- 100
+
+;; alternating predicate across the boundary — RAY_SEL_MIX in every segment
+(count (select {from: T1025 where: (== (% i 2) 0)})) -- 513
+(count (select {from: T1024 where: (== (% i 2) 0)})) -- 512
+
+;; ────────────── 4. select-where-take — exec_filter_head ──────────────
+;; Exec.c line 1301 routes HEAD(FILTER) into exec_filter_head, which is
+;; otherwise unreachable.  Hits the early-termination scan and the
+;; per-column gather inside the head executor.
+
+(count (select {from: T where: (> i 0) take: 3})) -- 3
+(count (select {from: T where: (> i 0) take: 100})) -- 10
+(count (select {from: T where: (> i 999) take: 5})) -- 0
+(count (select {from: T where: (> i 5) take: 2})) -- 2
+(sum (at (select {from: T where: (> i 5) take: 2}) 'i)) -- 13
+(first (at (select {from: T where: (== s 'a) take: 1}) 'i)) -- 1
+(count (select {from: T1025 where: (>= i 0) take: 1})) -- 1
+(count (select {from: T1025 where: (>= i 0) take: 1024})) -- 1024
+(count (select {from: T1025 where: (>= i 0) take: 1025})) -- 1025
+;; take larger than nrows: clamped to nrows
+(count (select {from: T where: (> i 0) take: 99999})) -- 10
+;; take 0 — empty result
+(count (select {from: T where: (> i 0) take: 0})) -- 0
+
+;; ────────────── 5. HAVING — exec_filter on group result ──────────────
+;; FILTER(GROUP) is the ONE place a non-trivial input table reaches
+;; exec_filter eagerly (rather than via lazy selection).  Triggers
+;; exec_filter_seq (small) → exec_filter_vec on each aggregated col.
+
+(set Tg (table [g v] (list ['a 'a 'a 'b 'b 'c] [1 2 3 10 20 100])))
+
+;; Per-group sums: a=6, b=30, c=100.
+(count (select {from: (select {s: (sum v) from: Tg by: g}) where: (> s 10)})) -- 2
+(sum (at (select {from: (select {s: (sum v) from: Tg by: g}) where: (> s 10)}) 's)) -- 130
+(count (select {from: (select {s: (sum v) from: Tg by: g}) where: (== s 6)})) -- 1
+(first (at (select {from: (select {s: (sum v) from: Tg by: g}) where: (== s 6)}) 'g)) -- 'a
+(count (select {from: (select {c: (count v) from: Tg by: g}) where: (>= c 2)})) -- 2
+
+;; ────────────── 6. wider columns with multiple types ──────────────
+;; Extra select-where ensures sel_compact's per-column gather works for
+;; every column type in one shot — i64, f64, sym, bool together.
+
+(set T2 (table [i f s b] (list [1 2 3 4 5 6 7 8] [10.0 20.0 30.0 40.0 50.0 60.0 70.0 80.0] ['x 'y 'x 'y 'x 'y 'x 'y] [true false true false true false true false])))
+(count (select {from: T2 where: (> i 4)})) -- 4
+(sum (at (select {from: T2 where: (> i 4)}) 'i)) -- 26
+(sum (at (select {from: T2 where: (> i 4)}) 'f)) -- 260.0
+(count (select {from: T2 where: (and (== s 'x) (== b true))})) -- 4
+(count (select {from: T2 where: (and (== s 'x) (== b false))})) -- 0
+(count (select {from: T2 where: (or (== s 'x) (== b true))})) -- 4
+
+;; ────────────── 7. parallel-gather path: nrows > RAY_PARALLEL_THRESHOLD ──────────────
+;; RAY_PARALLEL_THRESHOLD = 64 * 1024 = 65536.  A 70000-row table forces
+;; exec_filter (when reached eagerly) onto the parallel multi-column
+;; gather path.  We exercise this through HAVING so exec_filter runs
+;; eagerly on a 70000-row group result (1 row per group).
+
+(set NL 70000)
+(set TL (table [k v] (list (til NL) (til NL))))
+
+;; sel_compact path on a >65536-row table — every boundary op reads it.
+(count (select {from: TL where: (> v 0)})) -- 69999
+(count (select {from: TL where: (>= v 0)})) -- 70000
+(count (select {from: TL where: (> v 999999)})) -- 0
+(count (select {from: TL where: (and (>= v 1000) (< v 2000))})) -- 1000
+(sum (at (select {from: TL where: (and (>= v 1000) (< v 2000))}) 'v)) -- 1499500
+
+;; HAVING-style filter on a large group result — a group per-row produces
+;; 70000 groups, then a where on the aggregated column eagerly filters
+;; that 70000-row table through exec_filter (parallel-gather branch when
+;; valid_ncols ≤ MGATHER_MAX_COLS).
+(count (select {from: (select {s: (sum v) from: TL by: k}) where: (> s 69990)})) -- 9
+
+;; ────────────── 8. multi-column wide table ──────────────
+;; valid_ncols ≤ MGATHER_MAX_COLS=16 routes through multi_gather_fn.
+;; A 12-column table at small size hits exec_filter_seq's per-column path.
+(set T12 (table [c0 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11] (list (til 50) (til 50) (til 50) (til 50) (til 50) (til 50) (til 50) (til 50) (til 50) (til 50) (til 50) (til 50))))
+(count (select {from: T12 where: (> c0 9)})) -- 40
+(sum (at (select {from: T12 where: (> c0 9)}) 'c5)) -- 1180
+;; HAVING over this wide table — exec_filter_seq on 12 cols
+(count (select {from: (select {s: (sum c0) from: T12 by: c1}) where: (> s 30)})) -- 19
+
+;; ────────────── 9. RAY_SEL_NONE / RAY_SEL_ALL segment-flag coverage ──────────────
+;; sel_compact's segment-flag dispatch (RAY_SEL_NONE/ALL/MIX) only varies
+;; meaningfully across multi-segment tables.  T1025 has 2 segments; an
+;; alternating mask hits MIX in both, an i>1023 mask hits ALL in seg 0
+;; and MIX in seg 1, an i>=0 mask hits ALL in both, and an i>9999 mask
+;; hits NONE in both (already returned NULL by from_pred for all-pass /
+;; never builds for all-fail; but mixed all-fail in one seg does occur).
+(set T2K (table [i] (list (til 2050))))
+;; first 1024 rows pass (seg 0 = ALL), next ~1024 rows fail (seg 1 = NONE
+;; for most), with the boundary (1024..1025] partial.
+(count (select {from: T2K where: (< i 1024)})) -- 1024
+(sum (at (select {from: T2K where: (< i 1024)}) 'i)) -- 523776
+;; NONE in seg 0, ALL in seg 1
+(count (select {from: T2K where: (>= i 1024)})) -- 1026
+;; MIX seg 0 + ALL seg 1
+(count (select {from: T2K where: (or (== (% i 2) 0) (>= i 1024))})) -- 1538
+
+;; ────────────── 10. error path: filter with mismatched lengths ──────────────
+;; Built-in `filter` (collection.c path) — already covered in
+;; test/rfl/hof/filter.rfl.  Repeat one length error to keep this file
+;; self-contained for a developer auditing filter behaviour.
+(filter [1 2 3] [true false]) !- length
+(filter [1 2 3] [1 2 3]) !- type
