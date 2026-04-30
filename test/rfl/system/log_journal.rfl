@@ -145,8 +145,8 @@
 ;; .log.roll / .log.snapshot must error when no journal is active.
 (.log.roll)     !- domain
 (.log.snapshot) !- domain
-;; .log.write returns RAY_NULL_OBJ (no-op) when no journal is open.
-(nil? (.log.write 42)) -- true
+;; .log.write errors with "noopen" when no journal is active.
+(.log.write 42) !- noopen
 ;; .log.sync / .log.close are no-ops on a closed journal — succeed silently.
 (nil? (.log.sync))  -- true
 (nil? (.log.close)) -- true
@@ -202,7 +202,7 @@
 (nil? (.log.close)) -- true
 (.log.roll)     !- domain
 (.log.snapshot) !- domain
-(nil? (.log.write 99)) -- true
+(.log.write 99) !- noopen
 
 ;; ── stage F: replay the file we just wrote (single-shot) ───────────
 ;; Replay returns the chunk count.  The three .log.write entries
