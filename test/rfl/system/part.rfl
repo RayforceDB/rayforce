@@ -1,0 +1,159 @@
+;; src/store/part.c — exercise every reachable branch of ray_read_parted
+;; (the function backing .db.parted.get / .db.parted.mount) plus the
+;; static helpers infer_mc_type, parse_date_dir, parse_int_dir,
+;; is_date_dir, is_integer_str, and collect_part_dirs.
+;;
+;; ray_part_load (lines 186-306 of part.c) is unreachable from rfl —
+;; nothing in src/ops or src/lang dispatches to it; only ray_read_parted
+;; is wired up as .db.parted.get / .db.parted.mount.  Coverage of that
+;; legacy concat path therefore stays 0 and is excluded from this file.
+;;
+;; Assertions stick to (count TABLE), (count (key TABLE)), (first (key
+;; TABLE)) and exact key-vector compares.  Reducing across a parted
+;; column directly (e.g. sum (at Pd 'val)) goes through ray_sum_fn,
+;; which has no parted code path and would type-error — covered cases
+;; below already exercise every line in part.c, no need to fan out.
+;;
+;; Fixture roots use the /tmp/rfl_part_* prefix so they don't collide
+;; with /tmp/rfl_mount_* (db_mount.rfl) or /tmp/rfl_splayed_* and
+;; /tmp/rfl_parted/ (splayed.rfl).  Pre- and post-cleanup is mandatory:
+;; stale sym.lk / .d files from a prior run cause "error: corrupt"
+;; on the second open.
+
+;; ────────────── pre-flight cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three")
+(.sys.exec "mkdir -p /tmp/rfl_part_empty")
+
+;; ────────────── date-partition path: RAY_MC_DATE branch ──────────────
+;; Two YYYY.MM.DD partitions, each with the same 2-column splayed
+;; table.  Drives is_date_dir → all_date branch of infer_mc_type,
+;; parse_date_dir for both partitions, the RAY_MC_DATE arm of
+;; ray_read_parted (kv_type = RAY_DATE, mc_name = "date").
+(set DT-A (table [id val] (list [1 2 3] [10.0 20.0 30.0])))
+(set DT-B (table [id val] (list [4 5] [40.0 50.0])))
+(.db.splayed.set "/tmp/rfl_part_date/2024.01.01/t/" DT-A)
+(.db.splayed.set "/tmp/rfl_part_date/2024.01.02/t/" DT-B)
+
+(set Pd (.db.parted.get "/tmp/rfl_part_date/" 't))
+;; total rows = 3 + 2; columns = 1 partition-key + 2 data
+(count Pd) -- 5
+(count (key Pd)) -- 3
+;; partition-key column is named 'date when partitions are dates
+(first (key Pd)) -- 'date
+;; data column names survive in their original order after the
+;; partition-key prefix
+(key Pd) -- ['date 'id 'val]
+
+;; ────────────── int-partition path: RAY_MC_I64 branch ──────────────
+;; Pure-integer partition names — drives is_integer_str → all_int
+;; branch of infer_mc_type, parse_int_dir, and the RAY_MC_I64 arm
+;; (kv_type = RAY_I64, mc_name = "part").
+(set IT-A (table [n] (list [100 101])))
+(set IT-B (table [n] (list [200 201 202])))
+(set IT-C (table [n] (list [300])))
+(.db.splayed.set "/tmp/rfl_part_int/100/t/" IT-A)
+(.db.splayed.set "/tmp/rfl_part_int/200/t/" IT-B)
+(.db.splayed.set "/tmp/rfl_part_int/300/t/" IT-C)
+
+(set Pi (.db.parted.get "/tmp/rfl_part_int/" 't))
+(count Pi) -- 6
+(count (key Pi)) -- 2
+;; non-date partition keys land under the 'part column name
+(first (key Pi)) -- 'part
+(key Pi) -- ['part 'n]
+
+;; ────────────── sym-partition path: RAY_MC_SYM branch ──────────────
+;; Names like "1.2.3" pass collect_part_dirs' digit/dot filter (and
+;; name_looks_partition, so .db.parted.mount accepts the root) but
+;; fail both is_date_dir (length != 10) and is_integer_str (has
+;; dots) → infer_mc_type falls through to RAY_MC_SYM, exercising the
+;; ray_sym_intern branch (lines 405-411 of part.c).
+(set ST-A (table [v] (list [1 2 3])))
+(set ST-B (table [v] (list [4 5])))
+(.db.splayed.set "/tmp/rfl_part_sym/1.2.3/t/" ST-A)
+(.db.splayed.set "/tmp/rfl_part_sym/4.5.6/t/" ST-B)
+
+(set Ps (.db.parted.get "/tmp/rfl_part_sym/" 't))
+(count Ps) -- 5
+(count (key Ps)) -- 2
+;; sym-typed partition keys also report under 'part
+(first (key Ps)) -- 'part
+(key Ps) -- ['part 'v]
+
+;; ────────────── single-partition root ──────────────
+;; ray_read_parted has no part_count==1 fast-return; it always runs
+;; the full builder (the legacy fast-path on line 224 lives in
+;; ray_part_load, which is unreachable from rfl).  This case still
+;; covers the for-loop bodies with a single iteration and the
+;; segment retain/willneed call.
+(set SP (table [x] (list [7 8 9 10])))
+(.db.splayed.set "/tmp/rfl_part_single/2024.06.15/t/" SP)
+(set Psp (.db.parted.get "/tmp/rfl_part_single/" 't))
+(count Psp) -- 4
+(count (key Psp)) -- 2
+(first (key Psp)) -- 'date
+
+;; ────────────── three-partition concatenation ordering ──────────────
+;; Bubble-sort in collect_part_dirs (lines 164-172) reorders dir
+;; entries lexically.  Insert in reverse to prove the sort runs;
+;; the row count would be the same either way, but iterating the
+;; outer loop more than once exercises the i-then-j swap branch.
+(set TR-1 (table [n] (list [1])))
+(set TR-2 (table [n] (list [2 2])))
+(set TR-3 (table [n] (list [3 3 3])))
+(.db.splayed.set "/tmp/rfl_part_three/2024.03.03/t/" TR-3)
+(.db.splayed.set "/tmp/rfl_part_three/2024.01.01/t/" TR-1)
+(.db.splayed.set "/tmp/rfl_part_three/2024.02.02/t/" TR-2)
+(set Pt (.db.parted.get "/tmp/rfl_part_three/" 't))
+(count Pt) -- 6
+(count (key Pt)) -- 2
+(first (key Pt)) -- 'date
+
+;; ────────────── .db.parted.mount over int partitions ──────────────
+;; Mount needs at least one digit/dot subdir (dir_is_parted_root) and
+;; uses the first partition's subdirs as table names.  This double-
+;; covers the int branch via the mount entry point and binds the
+;; loaded table as the global `t` so we can re-assert against it.
+(set Mi (.db.parted.mount "/tmp/rfl_part_int/"))
+(type Mi) -- 'DICT
+(count Mi) -- 1
+;; t is now a global, equal to the .db.parted.get round-trip
+(count t) -- 6
+(count (key t)) -- 2
+
+;; ────────────── error: empty db_root (collect_part_dirs IO) ──────────────
+;; Directory exists but has zero matching subdirs.  collect_part_dirs
+;; returns RAY_ERR_IO on part_count == 0; ray_read_parted bubbles it
+;; up as ray_error("io").
+(.db.parted.get "/tmp/rfl_part_empty/" 't) !- io
+
+;; ────────────── error: missing table file inside a partition ──────────────
+;; Partition dirs exist but the named table isn't under one of them.
+;; ray_read_splayed fails for that segment → fail_tables → "io".
+(set MM-A (table [v] (list [1 2])))
+(.db.splayed.set "/tmp/rfl_part_missing/2024.01.01/t/" MM-A)
+(.sys.exec "mkdir -p /tmp/rfl_part_missing/2024.01.02")
+(.db.parted.get "/tmp/rfl_part_missing/" 't) !- io
+
+;; ────────────── error: nonexistent db_root ──────────────
+;; opendir fails; collect_part_dirs returns RAY_ERR_IO immediately.
+(.db.parted.get "/tmp/rfl_part_does_not_exist/" 't) !- io
+
+;; ────────────── error: table_name path validation in ray_read_parted ──
+;; Covers lines 320-322: any path separator, ".." substring, or
+;; leading "." in the table name short-circuits with ray_error("io").
+;; The .db.parted.get wrapper passes the symbol through verbatim, so
+;; these surface as "io" (not "domain").
+(.db.parted.get "/tmp/rfl_part_date/" 'foo..bar) !- io
+(.db.parted.get "/tmp/rfl_part_date/" '.hidden)  !- io
+
+;; ────────────── error: wrong-type / wrong-arity at the wrapper ──────────────
+;; ray_get_parted_fn rejects non-string root (type), non-symbol table
+;; name (type), wrong arity (domain).  These don't reach part.c but
+;; round out the verb's surface and prove the wrapper guards still hold.
+(.db.parted.get 5 't)                       !- type
+(.db.parted.get "/tmp/rfl_part_date/" "t")  !- type
+(.db.parted.get "/tmp/rfl_part_date/")      !- domain
+
+;; ────────────── teardown ──────────────
+(.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three")
