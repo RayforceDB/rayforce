@@ -1,19 +1,31 @@
 ;; Coverage extension for src/ops/tblop.c.
 ;;
-;; Targets the less-trodden branches that pulled tblop.c coverage to 42%:
-;; pivot error guards + FIRST/LAST + nrows==0 early-return; modify error
-;; paths; row dict-construction + errors; union-all type/shape errors;
-;; table-distinct via polymorphic `distinct`; unify branches; del
-;; success + errors; alter SET/CONCAT branches.
+;; Existing files in test/rfl/table/ already exercise the happy paths of
+;; pivot/modify/alter against the DAG fast path.  This file targets the
+;; less-trodden branches that pulled tblop.c coverage down to 42%:
+;;   * ray_pivot_fn    — error paths + every type-check + the FIRST/LAST
+;;                       agg ops + the `nrows == 0` early-return + the
+;;                       string-column generic-fallback path that the
+;;                       happy-path file skips.
+;;   * ray_modify_fn   — arity / type / unknown-column errors and an fn
+;;                       that returns an error (call_fn1 RAY_IS_ERR).
+;;   * ray_alter_fn    — uncovered op dispatch:  unknown op, missing
+;;                       fourth arg for set, set on non-vec/non-list,
+;;                       remove on non-list, and the index-vector forms
+;;                       on a vec (broadcast scalar / pairwise vec val).
+;;   * ray_del_fn      — success path (return 0) plus arity / type /
+;;                       name-not-found error branches.
+;;   * ray_row_fn      — happy path returning a dict row, plus its two
+;;                       error branches (non-table, non-int index).
+;;   * ray_union_all_fn— mismatched-ncols and mismatched-name errors.
+;;   * ray_table_distinct_fn — table-shaped distinct (reached via the
+;;                       polymorphic `distinct` verb), plus the empty-
+;;                       columns early-return.
+;;   * ray_unify_fn    — the same-type, atom + value, and different-vec
+;;                       branches.
 ;;
-;; Two sections are PARKED for SEGV/env-corruption bugs in src that the
-;; agent's tests exposed:
-;;   1. pivot with non-sym pivot-col + lambda agg: SEGV in
-;;      src/ops/tblop.c:384 (atom_eq inside OP_GROUP fallback).
-;;   2. alter REMOVE branches: after a remove call runs, subsequent
-;;      (set X ...) corrupts X — repl shows correct behavior, only
-;;      manifests in the rfl harness's per-line eval+persistent env.
-;; Both are flagged as src-side bugs to fix; tests re-enable after.
+;; Cleanup is a no-op for tblop tests (no /tmp state, no ports), but the
+;; rfl-suite convention is to bracket with .sys.exec rm anyway.
 
 (.sys.exec "rm -rf /tmp/rfl_tblop")
 
@@ -21,27 +33,46 @@
 ;; ray_pivot_fn — error paths + special branches
 ;; ══════════════════════════════════════════════════════════════════
 
+;; Arity guard — pivot expects 5 args.
 (pivot) !- arity
 (pivot (table [a] (list [1]))) !- arity
 (pivot (table [a] (list [1])) 'a 'a 'a) !- arity
 
+;; First argument must be a table.
 (pivot 42 'a 'b 'c sum) !- type
 
+;; pivot-col must be a symbol.
 (set Tp1 (table [a b c] (list ['x 'y] ['p 'q] [1 2])))
 (pivot Tp1 'a 99 'c sum) !- type
+
+;; value-col must be a symbol.
 (pivot Tp1 'a 'b 99 sum) !- type
+
+;; agg-fn must be a function (UNARY/LAMBDA/VARY).
 (pivot Tp1 'a 'b 'c 99) !- type
+
+;; Index must be sym, list-of-syms, or sym-vec.  An int atom is wrong.
 (pivot Tp1 1 'b 'c sum) !- type
+
+;; Index list with a non-sym element fails the "index columns must be symbols" guard.
 (pivot Tp1 [1 2] 'b 'c sum) !- type
 
+;; Pivot column missing from table.
 (pivot Tp1 'a 'no_such_pcol 'c sum) !- domain
+
+;; Value column missing from table.
 (pivot Tp1 'a 'b 'no_such_vcol sum) !- domain
+
+;; Index column missing from table.
 (pivot Tp1 'no_such_idx 'b 'c sum) !- domain
 
+;; Empty input → empty output (nrows == 0 early-return).
 (set Tempty (select {from: Tp1 where: (== a 'never)}))
 (count Tempty) -- 0
 (count (pivot Tempty 'a 'b 'c sum)) -- 0
 
+;; FIRST / LAST aggregators — the remaining DAG-fast-path opcodes the
+;; existing pivot.rfl doesn't reach.
 (set Tfl (table [k1 k2 v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [1 2 3 4])))
 (set Pf (pivot Tfl 'k1 'k2 'v first))
 (at (at Pf 'x) 0) -- 1
@@ -50,48 +81,191 @@
 (at (at Pl 'x) 0) -- 1
 (at (at Pl 'y) 1) -- 4
 
-;; PARKED — non-sym pivot-col with lambda agg-fn SEGVs at
-;; src/ops/tblop.c:384 (ASAN: atom_eq reads 0x115).  Re-enable after
-;; src fix:
-;;   (pivot (table [k c v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [1 2 3 4])) 'k 'c 'v (fn [xs] (sum xs)))
-;;   (pivot (table [a b c v] (list ['X 'X 'Y 'Y] [1 2 1 2] ['p 'q 'p 'q] [10 20 30 40])) ['a 'b] 'c 'v (fn [xs] (sum xs)))
+;; Lambda agg-fn forces the generic OP_GROUP fallback (pivot_fn_to_agg_op
+;; returns 0 for non-builtin functions, so dag_ok = false).  This is the
+;; main reachable path through the second half of ray_pivot_fn.
+(set Tlam0 (table [k c v] (list ['A 'A 'B 'B] ['x 'y 'x 'y] [1 2 3 4])))
+(set Pgen (pivot Tlam0 'k 'c 'v (fn [xs] (sum xs))))
+(count Pgen) -- 2
+(at (at Pgen 'x) 0) -- 1
+(at (at Pgen 'y) 1) -- 4
+
+;; Generic fallback with multi-key index (vector form).
+(set Tgmk (table [a b c v] (list ['X 'X 'Y 'Y] [1 2 1 2] ['p 'q 'p 'q] [10 20 30 40])))
+(set Pgmk (pivot Tgmk ['a 'b] 'c 'v (fn [xs] (sum xs))))
+(count Pgmk) -- 4
+
+;; Pivot column = i64 vec, lambda agg → fallback path that snprintfs the
+;; i64 value into a column name ("col10" / "col20" via the i64 branch).
+(set Ti64 (table [k c v] (list ['A 'A 'B 'B] [10 20 10 20] [1 2 3 4])))
+(set Pii (pivot Ti64 'k 'c 'v (fn [xs] (sum xs))))
+(count Pii) -- 2
+
+;; Pivot column = bool vec via lambda → exercises the -RAY_BOOL → "true"/"false"
+;; column-name branch in the unstack code.
+(set Tb (table [k c v] (list ['A 'A 'B 'B] [true false true false] [1 2 3 4])))
+(set Pb (pivot Tb 'k 'c 'v (fn [xs] (sum xs))))
+(count Pb) -- 2
+
+;; Pivot column = f64 vec via lambda → exercises the f64 snprintf branch.
+(set Tf64p (table [k c v] (list ['A 'A 'B 'B] [1.5 2.5 1.5 2.5] [1 2 3 4])))
+(set Pf64p (pivot Tf64p 'k 'c 'v (fn [xs] (sum xs))))
+(count Pf64p) -- 2
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; ray_modify_fn — error paths
 ;; ══════════════════════════════════════════════════════════════════
 
+;; Arity guard.
 (modify) !- arity
 (modify (table [a] (list [1]))) !- arity
 (modify (table [a] (list [1])) 'a) !- arity
 
+;; First arg must be a table.
 (modify 42 'a (fn [x] x)) !- type
 
+;; Second arg must be a symbol.
 (set Tm (table [a b] (list [1 2 3] [10 20 30])))
 (modify Tm 99 (fn [x] x)) !- type
+
+;; Column not found.
 (modify Tm 'no_such_col (fn [x] x)) !- domain
+
+;; ══════════════════════════════════════════════════════════════════
+;; ray_alter_fn — error and uncovered branches
+;; ══════════════════════════════════════════════════════════════════
+
+;; Arity: < 3 args.
+(alter) !- domain
+(set v [1 2 3])
+(alter 'v) !- domain
+(alter 'v set) !- domain
+
+;; First arg must evaluate to a sym.  An int is wrong.
+(alter 42 set 0 99) !- type
+
+;; First arg names an unbound variable.
+(alter 'no_such_var set 0 99) !- name
+
+;; Second arg (op) must be a sym literal.
+(alter 'v 99 0 99) !- type
+
+;; Unknown op name falls through to the trailing domain error.
+(set vu [1 2 3])
+(alter 'vu spinach 0 99) !- domain
+
+;; SET on something that is neither vec nor list (e.g. an atom binding).
+(set vat 7)
+(alter 'vat set 0 99) !- type
+
+;; SET on a vector with a non-numeric, non-vec idx → "type" guard.
+(set vs [1 2 3])
+(alter 'vs set "bad" 99) !- type
+
+;; SET with vec-of-indices, scalar val (broadcast) — already covered for lists,
+;; this hits the typed-vec store_typed_elem broadcast branch.
+(set vbr [1 2 3 4 5])
+(alter 'vbr set [0 2 4] 0)
+vbr -- [0 2 0 4 0]
+
+;; SET with vec-of-indices, vec val (pairwise) — typed-vec branch.
+(set vpw [10 20 30 40])
+(alter 'vpw set [1 3] [200 400])
+vpw -- [10 200 30 400]
+
+;; SET with out-of-range index in the vec form is silently skipped — no error.
+(set vskip [1 2 3])
+(alter 'vskip set [0 99 -1] 7)
+vskip -- [7 2 3]
+
+;; SET on a list with vec-of-indices and the vec contains an out-of-range
+;; entry is silently skipped (matches the pre-existing list semantics).
+(set Loob (list 'a 'b 'c))
+(alter 'Loob set [0 99] 'X)
+Loob -- (list 'X 'b 'c)
+
+;; CONCAT with mismatched type — ray_concat_fn rejects.
+(set vct [1 2 3])
+(alter 'vct concat "abc") !- type
+
+;; REMOVE on a vec (not a list) — type guard.
+(set vrm [1 2 3])
+(alter 'vrm remove 0) !- type
+
+;; REMOVE with non-numeric, non-vec idx → type.
+(set Lrm (list 1 2 3))
+(alter 'Lrm remove "bad") !- type
+
+;; REMOVE with idx-vec longer than 256 → limit.
+(set Lbig (list 1 2 3 4 5))
+(alter 'Lbig remove (til 257)) !- limit
+
+;; REMOVE with negative / out-of-range indices is a no-op (ignored).
+(set Lr (list 1 2 3))
+(alter 'Lr remove [99 -1])
+Lr -- (list 1 2 3)
+
+;; ══════════════════════════════════════════════════════════════════
+;; ray_del_fn — success + error paths
+;; ══════════════════════════════════════════════════════════════════
+
+;; Arity guard.  `del` is a special form, but a 0-arg call still fails arity.
+(del) !- arity
+
+;; Type guard — args[0] must be a sym (special-form: the literal token).
+;; A bare integer literal isn't a symbol.
+(del 42) !- type
+
+;; Successful delete returns 0.  Use a private name we own; binding is
+;; gone afterwards (looking it up errors with "name").
+(set tblop_tmp_x 99)
+tblop_tmp_x -- 99
+(del tblop_tmp_x) -- 0
+tblop_tmp_x !- name
+
+;; Deleting a never-existed name silently returns 0 — del's contract
+;; is idempotent for missing names.
+(del tblop_never_existed) -- 0
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; ray_row_fn — happy path + error paths
 ;; ══════════════════════════════════════════════════════════════════
 
-(set Tr2 (table [a b c] (list [1 2 3] [10 20 30] ['x 'y 'z])))
-(type (row Tr2 0)) -- 'DICT
-(count (row Tr2 0)) -- 3
-(at (row Tr2 0) 'a) -- 1
-(at (row Tr2 1) 'b) -- 20
-(at (row Tr2 2) 'c) -- 'z
+(set Tr (table [a b c] (list [1 2 3] [10 20 30] ['x 'y 'z])))
+
+;; (row tbl 0) returns a dict whose keys are the column names.
+(type (row Tr 0)) -- 'DICT
+(count (row Tr 0)) -- 3
+(at (row Tr 0) 'a) -- 1
+(at (row Tr 1) 'b) -- 20
+(at (row Tr 2) 'c) -- 'z
+
+;; row matches at-by-int-index — same dict.
+(at (row Tr 1) 'a) -- (at (at Tr 1) 'a)
+
+;; Non-table first arg.
 (row 42 0) !- type
-(row Tr2 'a) !- type
+
+;; Non-numeric index.
+(row Tr 'a) !- type
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; ray_union_all_fn — error paths
 ;; ══════════════════════════════════════════════════════════════════
 
 (set Tua (table [a b] (list [1 2] [10 20])))
+
+;; First arg not a table.
 (union-all 42 Tua) !- type
+
+;; Second arg not a table.
 (union-all Tua 42) !- type
+
+;; Mismatched column count.
 (set Tdiff (table [a b c] (list [1] [2] [3])))
 (union-all Tua Tdiff) !- type
+
+;; Mismatched column names (same count, different names).
 (set Trename (table [a x] (list [1 2] [10 20])))
 (union-all Tua Trename) !- type
 
@@ -99,93 +273,38 @@
 ;; ray_table_distinct_fn — reached via the polymorphic `distinct` verb
 ;; ══════════════════════════════════════════════════════════════════
 
+;; Distinct on a table with duplicate rows collapses them.
 (set Tdup (table [a b] (list [1 1 2 2 1] [10 10 20 20 10])))
 (count (distinct Tdup)) -- 2
+
+;; A table with no duplicates is returned with all rows.
 (set Tunq (table [a b] (list [1 2 3] [10 20 30])))
 (count (distinct Tunq)) -- 3
+
+;; Type round-trip: `distinct` on a table returns a table.
 (type (distinct Tdup)) -- 'TABLE
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; ray_unify_fn — same-type, atom-mixed, different-vec branches
 ;; ══════════════════════════════════════════════════════════════════
 
+;; Same vector type → list of two.
 (count (unify [1 2 3] [4 5 6])) -- 2
 (at (unify [1 2 3] [4 5 6]) 0) -- [1 2 3]
 (at (unify [1 2 3] [4 5 6]) 1) -- [4 5 6]
+
+;; Atom + vec → atom branch (no promotion).
 (count (unify 7 [1 2 3])) -- 2
 (at (unify 7 [1 2 3]) 0) -- 7
+
+;; Vec + atom → also the atom branch.
 (count (unify [1 2 3] 7)) -- 2
+
+;; Two atoms of same type → same-type branch.
 (at (unify 1 2) 0) -- 1
 (at (unify 1 2) 1) -- 2
+
+;; Different vec types — falls through to the wrap-without-promotion path.
 (count (unify [1 2] [1.0 2.0])) -- 2
-
-;; ══════════════════════════════════════════════════════════════════
-;; ray_del_fn — success + error paths
-;; ══════════════════════════════════════════════════════════════════
-
-(del) !- arity
-(del 42) !- type
-(set tblop_tmp_x 99)
-tblop_tmp_x -- 99
-(del tblop_tmp_x) -- 0
-tblop_tmp_x !- name
-(del tblop_never_existed) -- 0
-
-;; ══════════════════════════════════════════════════════════════════
-;; ray_alter_fn — SET/CONCAT branches.  REMOVE branches PARKED below.
-;; Run last because alter SET on long lists/vecs corrupts subsequent
-;; table creation in this file (a real heap bug; see param notes).
-;; ══════════════════════════════════════════════════════════════════
-
-(alter) !- domain
-(set v [1 2 3])
-(alter 'v) !- domain
-(alter 'v set) !- domain
-(alter 42 set 0 99) !- type
-(alter 'no_such_var set 0 99) !- name
-(alter 'v 99 0 99) !- type
-
-(set vu [1 2 3])
-(alter 'vu spinach 0 99) !- domain
-
-(set vat 7)
-(alter 'vat set 0 99) !- type
-
-(set vs [1 2 3])
-(alter 'vs set "bad" 99) !- type
-
-(set vbr [1 2 3 4 5])
-(alter 'vbr set [0 2 4] 0)
-vbr -- [0 2 0 4 0]
-
-(set vpw [10 20 30 40])
-(alter 'vpw set [1 3] [200 400])
-vpw -- [10 200 30 400]
-
-(set vskip [1 2 3])
-(alter 'vskip set [0 99 -1] 7)
-vskip -- [7 2 3]
-
-(set Loob (list 'a 'b 'c))
-(alter 'Loob set [0 99] 'X)
-Loob -- (list 'X 'b 'c)
-
-(set vct [1 2 3])
-(alter 'vct concat "abc") !- type
-
-;; PARKED — alter REMOVE branches trigger env corruption: after one
-;; runs, any subsequent (set X ...) leaves X reading back as STR
-;; "repl" or table creation type-errors.  Repl-mode works correctly;
-;; bug only manifests in the rfl harness's per-line eval+persistent
-;; env.  Re-enable after src fix:
-;;   (set vrm [1 2 3])
-;;   (alter 'vrm remove 0) !- type
-;;   (set Lrm (list 1 2 3))
-;;   (alter 'Lrm remove "bad") !- type
-;;   (set Lbig (list 1 2 3 4 5))
-;;   (alter 'Lbig remove (til 257)) !- limit
-;;   (set Lr (list 1 2 3))
-;;   (alter 'Lr remove [99 -1])
-;;   Lr -- (list 1 2 3)
 
 (.sys.exec "rm -rf /tmp/rfl_tblop")

@@ -299,12 +299,17 @@ ray_t* ray_pivot_fn(ray_t** args, int64_t n) {
     }
     ray_free(gid_ht_hdr);
 
-    /* For each group, gather the value column subset and apply agg_fn */
+    /* For each group, gather the value column subset and apply agg_fn.
+     * agg_results owns the per-group results as a RAY_LIST, so ray_free
+     * on it releases each child exactly once via ray_release_owned_refs.
+     * Slots are NULL-initialised so error paths can free agg_results even
+     * before all slots are populated. */
     ray_t* agg_results = ray_alloc(n_grps * sizeof(ray_t*));
     if (!agg_results) { ray_release(gid_vec); ray_release(dvals); ray_release(grouped); return ray_error("oom", NULL); }
     agg_results->type = RAY_LIST;
     agg_results->len = n_grps;
     ray_t** ar = (ray_t**)ray_data(agg_results);
+    memset(ar, 0, (size_t)n_grps * sizeof(ray_t*));
 
     /* Counting-sort rows by gid: O(nrows + n_grps) vs the previous
      * O(nrows * n_grps) double-scan per group. */
@@ -347,7 +352,6 @@ ray_t* ray_pivot_fn(ray_t** args, int64_t n) {
         int64_t cnt = offs[gi + 1] - offs[gi];
         ray_t* subset = gather_by_idx(vcol, sorted + offs[gi], cnt);
         if (RAY_IS_ERR(subset)) {
-            for (int64_t j = 0; j < gi; j++) ray_release(ar[j]);
             ray_free(sorted_hdr); ray_free(off_hdr);
             ray_free(agg_results); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
             return subset;
@@ -355,7 +359,6 @@ ray_t* ray_pivot_fn(ray_t** args, int64_t n) {
         ray_t* agg_val = call_fn1(agg_fn, subset);
         ray_release(subset);
         if (RAY_IS_ERR(agg_val)) {
-            for (int64_t j = 0; j < gi; j++) ray_release(ar[j]);
             ray_free(sorted_hdr); ray_free(off_hdr);
             ray_free(agg_results); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
             return agg_val;
@@ -495,7 +498,9 @@ ray_t* ray_pivot_fn(ray_t** args, int64_t n) {
 fb_cleanup:
     ray_free(gmap);
     ray_release(ix_list);
-    for (int64_t gi = 0; gi < n_grps; gi++) ray_release(ar[gi]);
+    /* agg_results is a RAY_LIST that owns each ar[gi]; ray_free walks
+     * its children via ray_release_owned_refs, so a manual loop here
+     * would double-release every slot and corrupt the slab freelist. */
     ray_free(agg_results);
     ray_release(dvals);
     ray_release(grouped);
