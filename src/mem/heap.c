@@ -1007,7 +1007,13 @@ void ray_free(ray_t* v) {
 ray_t* ray_alloc_copy(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return NULL;
     size_t data_size;
-    if (ray_is_atom(v)) {
+    if (v->attrs & RAY_ATTR_SLICE) {
+        /* Slice blocks are header-only views; their .len reflects the
+         * slice extent on the parent, not their own storage.  A naive
+         * len*esz would overrun the 32-byte header.  ray_retain_owned_refs
+         * then bumps slice_parent's rc, keeping the view valid. */
+        data_size = 0;
+    } else if (ray_is_atom(v)) {
         data_size = 0;
     } else if (v->type == RAY_TABLE || v->type == RAY_DICT) {
         data_size = 2 * sizeof(ray_t*);
@@ -1070,7 +1076,9 @@ ray_t* ray_scratch_realloc(ray_t* v, size_t new_data_size) {
     if (!new_v) return NULL;
     if (v && !RAY_IS_ERR(v)) {
         size_t old_data;
-        if (ray_is_atom(v))
+        if (v->attrs & RAY_ATTR_SLICE)
+            old_data = 0;  /* slice blocks are header-only — no own storage */
+        else if (ray_is_atom(v))
             old_data = 0;
         else if (v->type == RAY_LIST) {
             if (v->len < 0) { old_data = 0; }
