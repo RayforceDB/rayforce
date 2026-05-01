@@ -157,15 +157,24 @@ static void dump_node(FILE* f, ray_graph_t* g, ray_op_t* node, int depth) {
     switch (node->opcode) {
         case OP_SCAN:
             if (ext) {
+                /* ray_sym_str returns a STR atom; SSO ("len ≤ 7") stores the
+                 * bytes inline in s->sdata — `ray_data(s)` would return
+                 * garbage for those.  Use the public ray_str_ptr/ray_str_len
+                 * accessors which handle both SSO and heap-backed cases. */
                 ray_t* s = ray_sym_str(ext->sym);
                 if (s)
-                    fprintf(f, "(%.*s)", (int)s->len, (char*)ray_data(s));
+                    fprintf(f, "(%.*s)", (int)ray_str_len(s), ray_str_ptr(s));
             }
             break;
         case OP_CONST:
             if (ext && ext->literal) {
                 ray_t* lit = ext->literal;
-                switch (lit->type) {
+                /* Atom types are stored negated (e.g. lit->type == -RAY_I64);
+                 * vector / table types are positive.  Fold the sign so the
+                 * arms match either form — without this, every atom literal
+                 * fell through to the "(?)" default.  */
+                int8_t kind = lit->type < 0 ? -lit->type : lit->type;
+                switch (kind) {
                     case RAY_I64:  fprintf(f, "(%lld)", (long long)lit->i64); break;
                     case RAY_F64:  fprintf(f, "(%.6g)", lit->f64); break;
                     case RAY_BOOL: fprintf(f, "(%s)", lit->i64 ? "true" : "false"); break;
