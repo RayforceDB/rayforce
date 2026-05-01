@@ -100,12 +100,15 @@ extern const test_entry_t cow_entries[];
 extern const test_entry_t csr_entries[];
 extern const test_entry_t csv_entries[];
 extern const test_entry_t datalog_entries[];
+extern const test_entry_t dict_entries[];
+extern const test_entry_t dump_entries[];
 extern const test_entry_t embedding_entries[];
 extern const test_entry_t exec_entries[];
 extern const test_entry_t format_entries[];
 extern const test_entry_t fvec_entries[];
 extern const test_entry_t graph_entries[];
 extern const test_entry_t graph_builtin_entries[];
+extern const test_entry_t heap_entries[];
 extern const test_entry_t index_entries[];
 extern const test_entry_t lang_entries[];
 extern const test_entry_t link_entries[];
@@ -129,12 +132,15 @@ extern const test_entry_t sys_entries[];
 extern const test_entry_t table_entries[];
 extern const test_entry_t types_entries[];
 extern const test_entry_t vec_entries[];
+extern const test_entry_t window_entries[];
 
 static const test_entry_t* const compiled_groups[] = {
     err_entries,      arena_entries,    atom_entries,     audit_entries,
     block_entries,    buddy_entries,    cow_entries,      csr_entries,
-    csv_entries,      datalog_entries,  embedding_entries, exec_entries,
+    csv_entries,      datalog_entries,  dict_entries,     dump_entries,
+    embedding_entries, exec_entries,
     format_entries,   fvec_entries,     graph_entries,    graph_builtin_entries,
+    heap_entries,
     index_entries,
     lang_entries,     link_entries,
     lftj_entries,     list_entries,     meta_entries,     morsel_entries,
@@ -143,7 +149,7 @@ static const test_entry_t* const compiled_groups[] = {
     pool_entries,
     rowsel_entries,   runtime_entries,  sel_entries,      store_entries,
     str_entries,      sym_entries,      sys_entries,      table_entries,
-    types_entries,    vec_entries,
+    types_entries,    vec_entries,      window_entries,
     NULL,
 };
 
