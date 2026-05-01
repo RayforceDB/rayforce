@@ -117,12 +117,16 @@
 ;; ────────────────────────────────────────────────────────────────────
 ;; 5. STRING SORT — top-level radix top_hist / top_scatter / bucket
 
-;; PARKED — shared-prefix STR sort hits assertion in src/vec/str.h:56
-;; (ray_str_t_ptr: pooled string requires non-NULL pool_base) on master
-;; 2026-05-01.  Repro:
-;;   (set Vss (take ["xxxxxxxx_apple" "xxxxxxxx_banana" "xxxxxxxx_cherry" "xxxxxxxx_date"] 200))
-;;   (count (asc Vss))   ;; → assertion failure under ASAN, undefined behaviour in release
-;; Re-enable once the strkey_cmp tail-comparator pool-base lookup is fixed.
+
+
+;; Long shared prefixes force the strkey_cmp tail-comparison (L1156-1175):
+;; 8 bytes packed prefix is identical, so comparator must memcmp the
+;; tail via the pool elems.  Take of long-string vec needs str_pool
+;; propagation in collection.c (fixed in same patch).
+(set Vss (take ["xxxxxxxx_apple" "xxxxxxxx_banana" "xxxxxxxx_cherry" "xxxxxxxx_date"] 200))
+(count (asc Vss)) -- 200
+(at (asc Vss) 0) -- "xxxxxxxx_apple"
+(at (take (asc Vss) -1) 0) -- "xxxxxxxx_date"
 
 ;; Large STR sort: triggers parallel top-byte hist/scatter (L1715-1777).
 (set Vstrbig (take ["zebra" "apple" "mango" "banana" "cherry" "kiwi" "lemon" "orange" "papaya" "grape"] 8192))

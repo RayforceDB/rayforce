@@ -28,6 +28,7 @@
 #include "core/pool.h"
 #include "mem/sys.h"
 #include "ops/hash.h"
+#include "ops/internal.h"   /* col_propagate_str_pool */
 #include <stdlib.h>
 #include <string.h>
 
@@ -1221,7 +1222,14 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             int64_t len = ray_len(vec);
             if (start < 0) start = len + start;
             if (start < 0) start = 0;
-            if (start >= len) return ray_vec_new(vec->type, 0);
+            if (start >= len) {
+                ray_t* empty = ray_vec_new(vec->type, 0);
+                /* Empty STR result still needs the source's pool reference
+                 * so downstream ops have a consistent owner. */
+                if (vec->type == RAY_STR && !RAY_IS_ERR(empty))
+                    col_propagate_str_pool(empty, vec);
+                return empty;
+            }
             int64_t end = start + amount;
             if (end > len) end = len;
             int64_t count = end - start;
@@ -1231,6 +1239,10 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             if (RAY_IS_ERR(result)) return result;
             result->len = count;
             memcpy(ray_data(result), (char*)ray_data(vec) + start * esz, (size_t)(count * esz));
+            /* RAY_STR: the copied ray_str_t records still reference the
+             * source's str_pool by pool_off — propagate the pool ray_t
+             * (with retain) so the result owns a valid backing store. */
+            if (vtype == RAY_STR) col_propagate_str_pool(result, vec);
             /* Propagate null bitmap — check parent's flag for slices */
             bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) ||
                              ((vec->attrs & RAY_ATTR_SLICE) && vec->slice_parent &&
@@ -1415,6 +1427,14 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
                 memcpy(dst + i * esz, src + si * esz, esz);
             }
         }
+        /* RAY_STR: the copied ray_str_t records still reference the
+         * source's str_pool by pool_off — propagate the pool ray_t
+         * (with retain) so the result owns a valid backing store.
+         * Without this, a subsequent op (e.g. asc) would see
+         * result->str_pool == NULL while the elements still point
+         * past the SSO threshold, tripping the assertion in
+         * ray_str_t_ptr / strsort_repack_window / strkey_cmp. */
+        if (vtype == RAY_STR) col_propagate_str_pool(result, vec);
         /* Propagate null bitmap — check parent's flag for slices */
         bool has_nulls = len > 0 &&
                          ((vec->attrs & RAY_ATTR_HAS_NULLS) ||
