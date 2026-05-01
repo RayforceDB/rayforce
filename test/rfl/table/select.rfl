@@ -28,6 +28,21 @@
 (sum (at (select {s: (sum size) from: trades by: sym}) 's)) -- 1240
 (sum (at (select {s: (sum size) from: trades by: sym where: (== sym 'AAPL)}) 's)) -- 460
 
+;; ── scalar aggregation (no `by:`) must honour `where:` — the lazy WHERE
+;; rowsel is consumed by exec_reduction over the column vector.  Two-step
+;; (filter then sum) and single-step (sum inside select) must agree.
+(at (at (select {s: (sum size) from: trades where: (== sym 'AAPL)}) 's) 0) -- 460
+(at (at (select {s: (sum size) from: trades where: (> price 200)}) 's) 0) -- 780
+(at (at (select {c: (count size) from: trades where: (== sym 'AAPL)}) 'c) 0) -- 4
+(at (at (select {m: (max price) from: trades where: (== sym 'GOOG)}) 'm) 0) -- 2810.0
+(at (at (select {m: (min size) from: trades where: (> price 200.0)}) 'm) 0) -- 40
+(at (at (select {a: (avg size) from: trades where: (== sym 'AAPL)}) 'a) 0) -- 115.0
+
+;; Larger fixture (>= RAY_PARALLEL_THRESHOLD) to exercise the parallel
+;; reduction worker path of exec_reduction.
+(set big-T (table [v] (list (til 100000))))
+(at (at (select {s: (sum v) from: big-T where: (>= v 50000)}) 's) 0) -- 3749975000
+
 ;; ────────────── 15-row fixture (sym, price, size, tms, d) ──────────────
 (set trades-15 (table [sym price size tms d] (list ['AAPL 'GOOG 'MSFT 'AAPL 'GOOG 'MSFT 'AAPL 'GOOG 'MSFT 'AMZN 'TSLA 'AAPL 'GOOG 'MSFT 'TSLA] [150.0 2800.0 310.0 151.5 2795.0 309.0 152.0 2810.0 311.0 3300.0 700.0 150.5 2805.0 312.0 702.5] [100 50 200 150 40 250 120 60 180 75 90 110 55 190 95] [09:30:15.000 09:30:15.100 09:30:15.200 09:30:15.300 09:30:15.400 09:30:15.500 09:30:15.600 09:30:15.700 09:30:15.800 09:30:15.900 09:30:16.000 09:30:16.100 09:30:16.200 09:30:16.300 09:30:16.400] [2024.01.15 2024.01.15 2024.01.15 2024.01.15 2024.01.15 2024.01.16 2024.01.16 2024.01.16 2024.01.16 2024.01.16 2024.01.17 2024.01.17 2024.01.17 2024.01.17 2024.01.17])))
 

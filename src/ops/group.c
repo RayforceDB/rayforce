@@ -44,11 +44,15 @@ static void reduce_acc_init(reduce_acc_t* acc) {
     acc->cnt = 0; acc->null_count = 0; acc->has_first = false;
 }
 
-/* Integer reduction loop — reads native type T, accumulates as i64 */
-#define REDUCE_LOOP_I(T, base, start, end, acc, has_nulls, null_bm) \
+/* Integer reduction loop — reads native type T, accumulates as i64.
+ * `idx` is an optional int64 selection vector: when non-NULL, iterate
+ * idx[start..end) and read d[idx[i]]; when NULL, iterate d[start..end)
+ * directly.  The branch is loop-invariant so the compiler hoists it. */
+#define REDUCE_LOOP_I(T, base, start, end, acc, has_nulls, null_bm, idx) \
     do { \
         const T* d = (const T*)(base); \
-        for (int64_t row = start; row < end; row++) { \
+        for (int64_t i = start; i < end; i++) { \
+            int64_t row = (idx) ? (idx)[i] : i; \
             if (has_nulls && (null_bm[row/8] >> (row%8)) & 1) { (acc)->null_count++; continue; } \
             int64_t v = (int64_t)d[row]; \
             /* sum/sum_sq may overflow on signed arithmetic — use defined \
@@ -63,11 +67,12 @@ static void reduce_acc_init(reduce_acc_t* acc) {
         } \
     } while (0)
 
-/* Float reduction loop */
-#define REDUCE_LOOP_F(base, start, end, acc, has_nulls, null_bm) \
+/* Float reduction loop — see REDUCE_LOOP_I for `idx` semantics. */
+#define REDUCE_LOOP_F(base, start, end, acc, has_nulls, null_bm, idx) \
     do { \
         const double* d = (const double*)(base); \
-        for (int64_t row = start; row < end; row++) { \
+        for (int64_t i = start; i < end; i++) { \
+            int64_t row = (idx) ? (idx)[i] : i; \
             if (has_nulls && (null_bm[row/8] >> (row%8)) & 1) { (acc)->null_count++; continue; } \
             double v = d[row]; \
             (acc)->sum_f += v; (acc)->sum_sq_f += v * v; (acc)->prod_f *= v; \
@@ -80,22 +85,23 @@ static void reduce_acc_init(reduce_acc_t* acc) {
 
 static void reduce_range(ray_t* input, int64_t start, int64_t end,
                          reduce_acc_t* acc, bool has_nulls,
-                         const uint8_t* null_bm) {
+                         const uint8_t* null_bm, const int64_t* idx) {
     void* base = ray_data(input);
     switch (input->type) {
     case RAY_BOOL: case RAY_U8:
-        REDUCE_LOOP_I(uint8_t, base, start, end, acc, has_nulls, null_bm); break;
+        REDUCE_LOOP_I(uint8_t, base, start, end, acc, has_nulls, null_bm, idx); break;
     case RAY_I16:
-        REDUCE_LOOP_I(int16_t, base, start, end, acc, has_nulls, null_bm); break;
+        REDUCE_LOOP_I(int16_t, base, start, end, acc, has_nulls, null_bm, idx); break;
     case RAY_I32: case RAY_DATE: case RAY_TIME:
-        REDUCE_LOOP_I(int32_t, base, start, end, acc, has_nulls, null_bm); break;
+        REDUCE_LOOP_I(int32_t, base, start, end, acc, has_nulls, null_bm, idx); break;
     case RAY_I64: case RAY_TIMESTAMP:
-        REDUCE_LOOP_I(int64_t, base, start, end, acc, has_nulls, null_bm); break;
+        REDUCE_LOOP_I(int64_t, base, start, end, acc, has_nulls, null_bm, idx); break;
     case RAY_F64:
-        REDUCE_LOOP_F(base, start, end, acc, has_nulls, null_bm); break;
+        REDUCE_LOOP_F(base, start, end, acc, has_nulls, null_bm, idx); break;
     case RAY_SYM: {
         /* Adaptive-width SYM columns — use read_col_i64 */
-        for (int64_t row = start; row < end; row++) {
+        for (int64_t i = start; i < end; i++) {
+            int64_t row = idx ? idx[i] : i;
             if (has_nulls && (null_bm[row/8] >> (row%8)) & 1) { acc->null_count++; continue; }
             int64_t v = read_col_i64(base, row, input->type, input->attrs);
             acc->sum_i += v; acc->sum_sq_i += v * v;
@@ -117,12 +123,13 @@ typedef struct {
     reduce_acc_t*  accs;   /* one per worker */
     bool           has_nulls;
     const uint8_t* null_bm;
+    const int64_t* idx;    /* NULL = no selection; else int64[total_pass] */
 } par_reduce_ctx_t;
 
 static void par_reduce_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     par_reduce_ctx_t* c = (par_reduce_ctx_t*)ctx;
     reduce_range(c->input, start, end, &c->accs[worker_id],
-                 c->has_nulls, c->null_bm);
+                 c->has_nulls, c->null_bm, c->idx);
 }
 
 static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_type) {
@@ -224,7 +231,6 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
 }
 
 ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
-    (void)g;
     if (!input || RAY_IS_ERR(input)) return input;
 
     /* TABLE input: COUNT returns row count, others need a column */
@@ -243,6 +249,32 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     bool has_nulls = (input->attrs & RAY_ATTR_HAS_NULLS) != 0;
     const uint8_t* null_bm = ray_vec_nullmap_bytes(input, NULL, NULL);
 
+    /* Selection-aware reduction: when a lazy WHERE filter has installed
+     * g->selection on the graph and the column we're reducing matches
+     * the selection's source-row count, the reduction must walk only
+     * the selected rows.  Without this, scalar aggs like
+     *   (select {s: (sum v) from: T where: (>= v 500)})
+     * silently sum the unfiltered column.  exec_group's by-keyed path
+     * already pulls the selection through match_idx — this is the
+     * non-grouped twin for OP_SUM/MIN/MAX/AVG/etc. dispatched from
+     * exec.c via a vector input (OP_SELECT projection of a scalar agg).
+     *
+     * We borrow g->selection — the caller (the OP_SUM dispatcher in
+     * exec.c, ultimately ray_execute) is responsible for releasing it.
+     * Only the materialised index block is freed here. */
+    ray_t* sel_idx_block = NULL;
+    const int64_t* sel_idx = NULL;
+    int64_t scan_n = len;
+    if (g && g->selection) {
+        ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
+        if (sm->nrows == len) {
+            sel_idx_block = ray_rowsel_to_indices(g->selection);
+            if (!sel_idx_block) return ray_error("oom", NULL);
+            sel_idx = (const int64_t*)ray_data(sel_idx_block);
+            scan_n = sm->total_pass;
+        }
+    }
+
     /* O(1) short-circuit: first/last on numeric columns don't need a
      * full reduction pass.  Non-numeric types (STR, GUID) fall through
      * to the serial reduction path below. */
@@ -251,14 +283,19 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
          in_type == RAY_I16 || in_type == RAY_BOOL || in_type == RAY_U8 ||
          in_type == RAY_TIMESTAMP || in_type == RAY_DATE || in_type == RAY_TIME ||
          in_type == RAY_SYM)) {
-        int64_t row;
+        int64_t row = -1;
         if (op->opcode == OP_FIRST) {
-            for (row = 0; row < len; row++)
-                if (!has_nulls || !((null_bm[row/8] >> (row%8)) & 1)) break;
+            for (int64_t i = 0; i < scan_n; i++) {
+                int64_t r = sel_idx ? sel_idx[i] : i;
+                if (!has_nulls || !((null_bm[r/8] >> (r%8)) & 1)) { row = r; break; }
+            }
         } else {
-            for (row = len - 1; row >= 0; row--)
-                if (!has_nulls || !((null_bm[row/8] >> (row%8)) & 1)) break;
+            for (int64_t i = scan_n - 1; i >= 0; i--) {
+                int64_t r = sel_idx ? sel_idx[i] : i;
+                if (!has_nulls || !((null_bm[r/8] >> (r%8)) & 1)) { row = r; break; }
+            }
         }
+        if (sel_idx_block) ray_release(sel_idx_block);
         if (row < 0 || row >= len)
             return ray_typed_null(-in_type);
         void* base = ray_data(input);
@@ -267,16 +304,17 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     }
 
     ray_pool_t* pool = ray_pool_get();
-    if (pool && len >= RAY_PARALLEL_THRESHOLD) {
+    if (pool && scan_n >= RAY_PARALLEL_THRESHOLD) {
         uint32_t nw = ray_pool_total_workers(pool);
         ray_t* accs_hdr;
         reduce_acc_t* accs = (reduce_acc_t*)scratch_calloc(&accs_hdr, nw * sizeof(reduce_acc_t));
-        if (!accs) return ray_error("oom", NULL);
+        if (!accs) { if (sel_idx_block) ray_release(sel_idx_block); return ray_error("oom", NULL); }
         for (uint32_t i = 0; i < nw; i++) reduce_acc_init(&accs[i]);
 
         par_reduce_ctx_t ctx = { .input = input, .accs = accs,
-                                 .has_nulls = has_nulls, .null_bm = null_bm };
-        ray_pool_dispatch(pool, par_reduce_fn, &ctx, len);
+                                 .has_nulls = has_nulls, .null_bm = null_bm,
+                                 .idx = sel_idx };
+        ray_pool_dispatch(pool, par_reduce_fn, &ctx, scan_n);
 
         /* Merge: worker 0 is the base, merge the rest in order */
         reduce_acc_t merged;
@@ -331,12 +369,14 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             default:       result = ray_error("nyi", NULL); break;
         }
         scratch_free(accs_hdr);
+        if (sel_idx_block) ray_release(sel_idx_block);
         return result;
     }
 
     reduce_acc_t acc;
     reduce_acc_init(&acc);
-    reduce_range(input, 0, len, &acc, has_nulls, null_bm);
+    reduce_range(input, 0, scan_n, &acc, has_nulls, null_bm, sel_idx);
+    if (sel_idx_block) ray_release(sel_idx_block);
 
     switch (op->opcode) {
         case OP_SUM:   return in_type == RAY_F64 ? ray_f64(acc.sum_f) : ray_i64(acc.sum_i);
@@ -1215,12 +1255,16 @@ typedef struct {
     da_val_t* max_val;   /* MAX [n_slots * n_aggs] */
     double*   sumsq_f64; /* sum-of-squares for STDDEV/VAR */
     int64_t*  count;     /* group counts [n_slots] */
+    int64_t*  first_row; /* min row index seen per slot (FIRST) [n_slots] */
+    int64_t*  last_row;  /* max row index seen per slot (LAST)  [n_slots] */
     /* Arena headers */
     ray_t* _h_sum;
     ray_t* _h_min;
     ray_t* _h_max;
     ray_t* _h_sumsq;
     ray_t* _h_count;
+    ray_t* _h_first_row;
+    ray_t* _h_last_row;
 } da_accum_t;
 
 static inline void da_accum_free(da_accum_t* a) {
@@ -1229,6 +1273,8 @@ static inline void da_accum_free(da_accum_t* a) {
     scratch_free(a->_h_max);
     scratch_free(a->_h_sumsq);
     scratch_free(a->_h_count);
+    scratch_free(a->_h_first_row);
+    scratch_free(a->_h_last_row);
 }
 
 /* Unified agg result emitter — used by both DA and HT paths.
@@ -1651,6 +1697,14 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
         return;
     }
 
+    /* Track per-slot row-index bounds when FIRST/LAST is needed.  Pool
+     * dispatch is work-stealing: tasks may be claimed by a single worker
+     * out of index order, so rows do NOT arrive in monotonic order within
+     * a worker.  Use explicit min/max comparison against r and update the
+     * stored value only when the new row beats the current bound. */
+    bool fl_take_first = (acc->first_row && r < acc->first_row[gid]);
+    bool fl_take_last  = (acc->last_row  && r > acc->last_row[gid]);
+
     for (uint8_t a = 0; a < n_aggs; a++) {
         if (!c->agg_ptrs[a]) continue;
         size_t idx = base + a;
@@ -1662,13 +1716,15 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             else acc->sum[idx].i = (int64_t)((uint64_t)acc->sum[idx].i + (uint64_t)iv);
             if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
         } else if (op == OP_FIRST) {
-            if (acc->count[gid] == 1) {
+            if (fl_take_first) {
                 if (c->agg_types[a] == RAY_F64) acc->sum[idx].f = fv;
                 else acc->sum[idx].i = iv;
             }
         } else if (op == OP_LAST) {
-            if (c->agg_types[a] == RAY_F64) acc->sum[idx].f = fv;
-            else acc->sum[idx].i = iv;
+            if (fl_take_last) {
+                if (c->agg_types[a] == RAY_F64) acc->sum[idx].f = fv;
+                else acc->sum[idx].i = iv;
+            }
         } else if (op == OP_MIN) {
             if (c->agg_types[a] == RAY_F64) {
                 if (fv < acc->min_val[idx].f) acc->min_val[idx].f = fv;
@@ -1683,6 +1739,10 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
             }
         }
     }
+
+    /* Commit row-index bounds after value writes. */
+    if (fl_take_first) acc->first_row[gid] = r;
+    if (fl_take_last)  acc->last_row[gid]  = r;
 }
 
 static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -2711,6 +2771,7 @@ da_path:;
             /* Recompute need_flags (da_fits may have changed scope) */
             uint8_t need_flags = DA_NEED_COUNT;
             bool all_sum = true;
+            bool da_has_first_last = false;
             for (uint8_t a = 0; a < n_aggs; a++) {
                 uint16_t aop = ext->agg_ops[a];
                 if (aop == OP_SUM || aop == OP_AVG || aop == OP_FIRST || aop == OP_LAST) need_flags |= DA_NEED_SUM;
@@ -2720,6 +2781,7 @@ da_path:;
                 else if (aop == OP_MAX) need_flags |= DA_NEED_MAX;
                 if (aop != OP_SUM && aop != OP_AVG && aop != OP_COUNT)
                     all_sum = false;
+                if (aop == OP_FIRST || aop == OP_LAST) da_has_first_last = true;
             }
 
             /* Compute strides: stride[k] = product of ranges[k+1..n_keys-1]
@@ -2813,6 +2875,18 @@ da_path:;
                 accums[w].count = (int64_t*)scratch_calloc(&accums[w]._h_count,
                     n_slots * sizeof(int64_t));
                 if (!accums[w].count) { alloc_ok = false; break; }
+                if (da_has_first_last) {
+                    accums[w].first_row = (int64_t*)scratch_alloc(
+                        &accums[w]._h_first_row, n_slots * sizeof(int64_t));
+                    if (!accums[w].first_row) { alloc_ok = false; break; }
+                    for (uint32_t s = 0; s < n_slots; s++)
+                        accums[w].first_row[s] = INT64_MAX;
+                    accums[w].last_row = (int64_t*)scratch_alloc(
+                        &accums[w]._h_last_row, n_slots * sizeof(int64_t));
+                    if (!accums[w].last_row) { alloc_ok = false; break; }
+                    for (uint32_t s = 0; s < n_slots; s++)
+                        accums[w].last_row[s] = INT64_MIN;
+                }
             }
             if (!alloc_ok) {
                 for (uint32_t w = 0; w < da_n_workers; w++)
@@ -2864,9 +2938,10 @@ da_path:;
             }
 
             /* Merge per-worker accumulators into accums[0].
-             * FIRST/LAST require worker-order-dependent merge (sequential).
-             * All other ops are commutative — dispatch over disjoint slot
-             * ranges for parallel merge. */
+             * FIRST/LAST need row-index-aware merge: pool dispatch is
+             * work-stealing, so worker_id ordering does not reflect global
+             * row order.  Use per-slot first_row/last_row to pick the
+             * worker whose entry has the smallest/largest row index. */
             if (has_first_last) {
                 for (uint32_t w = 1; w < da_n_workers; w++) {
                     da_accum_t* wa = &accums[w];
@@ -2877,6 +2952,10 @@ da_path:;
                     if (need_flags & DA_NEED_SUM) {
                         for (uint32_t s = 0; s < n_slots; s++) {
                             size_t base = (size_t)s * n_aggs;
+                            bool take_first = wa->first_row && merged->first_row &&
+                                wa->first_row[s] < merged->first_row[s];
+                            bool take_last  = wa->last_row && merged->last_row &&
+                                wa->last_row[s]  > merged->last_row[s];
                             for (uint8_t a = 0; a < n_aggs; a++) {
                                 size_t idx = base + a;
                                 uint16_t aop = ext->agg_ops[a];
@@ -2884,13 +2963,13 @@ da_path:;
                                     if (agg_types[a] == RAY_F64) merged->sum[idx].f += wa->sum[idx].f;
                                     else merged->sum[idx].i += wa->sum[idx].i;
                                 } else if (aop == OP_FIRST) {
-                                    if (merged->count[s] == 0 && wa->count[s] > 0)
-                                        merged->sum[idx] = wa->sum[idx];
+                                    if (take_first) merged->sum[idx] = wa->sum[idx];
                                 } else if (aop == OP_LAST) {
-                                    if (wa->count[s] > 0)
-                                        merged->sum[idx] = wa->sum[idx];
+                                    if (take_last)  merged->sum[idx] = wa->sum[idx];
                                 }
                             }
+                            if (take_first) merged->first_row[s] = wa->first_row[s];
+                            if (take_last)  merged->last_row[s]  = wa->last_row[s];
                         }
                     }
                     if (need_flags & DA_NEED_MIN) {

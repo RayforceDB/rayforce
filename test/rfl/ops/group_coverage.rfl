@@ -108,15 +108,14 @@
 (set Nfl 80000)
 (set Tfl (table [g v] (list (% (til Nfl) 4) (til Nfl))))
 (count (select {fi: (first v) la: (last v) from: Tfl by: g})) -- 4
-;; SHOULD be: first(v)=g per group → sum 6;  last(v) per group →
-;; sum 319990 for Nfl=80000.  Both first() AND last() return truncated
-;; values in the parallel path (nrows >= 65536, has_first_last merge in
-;; group.c:2860-2922).  Probed on master 2026-04-30:
-;;   N=65000 first sum=6   last sum=259990   (sequential, OK)
-;;   N=65536 first sum≠6   last sum≠262134   (parallel kicks in, broken)
-;;   N=80000 first=262150  last=32758        expected 6, 319990
-;; Asserting just (count ...) so we exercise the parallel-merge branch
-;; without locking the wrong value.  Re-add value asserts once fixed.
+;; first(v) per group is the v at the smallest rowid in that group:
+;; group g sees rowids {g, g+4, g+8, ...}; the smallest rowid is g
+;; itself, and v[g] = g.  Sum across groups = 0+1+2+3 = 6.
+(sum (at (select {fi: (first v) from: Tfl by: g}) 'fi)) -- 6
+;; last(v) per group is v at the largest rowid in that group:
+;; (Nfl-4)+g, (Nfl-3), (Nfl-2), (Nfl-1) = 79996,79997,79998,79999.
+;; Sum = 4*(Nfl-4) + (0+1+2+3) = 320000-16+6 = 319990.
+(sum (at (select {la: (last v) from: Tfl by: g}) 'la)) -- 319990
 
 ;; ────────────── 9. Affine SUM/AVG (sum (+ col const)) ──────────────
 ;; group.c:2336-2340 detects SUM/AVG of (scan + const) and aggregates
@@ -142,15 +141,11 @@
 ;; ────────────── 11. Scalar agg over filtered (selection on n_keys=0) ──────────────
 ;; The scalar tight loop has a "specialized when no match_idx" branch
 ;; (group.c:2513-2525); a where clause forces the generic path.
-;; KNOWN BUG (master 2026-04-30): scalar agg form `select {agg: ... from: T where: P}`
-;; ignores the where: clause — sum returns 499500 (full sum) not 374750 (v>=500 only).
-;; Two-step (select+sum) works correctly.  Probed:
-;;   (sum (at (select {from: T where: (>= v 500)}) 'v))                   -> 374750 (correct)
-;;   (at (at (select {s: (sum v) from: T where: (>= v 500)}) 's) 0)       -> 499500 (wrong)
-;; Asserting count(c) which IS computed correctly (whole-table count regardless
-;; of where:) — exercises the path without locking the buggy sum value.
+;; Scalar agg form `select {agg: ... from: T where: P}` honours where:
+;; via exec_reduction's selection-aware path (see fix in group.c).
 (set Sfilt (select {s: (sum v) c: (count v) from: Ts where: (>= v 500)}))
-(at (at Sfilt 'c) 0) -- 1000
+(at (at Sfilt 's) 0) -- 374750
+(at (at Sfilt 'c) 0) -- 500
 
 ;; ────────────── 12. DATE key (DA-eligible, narrow range) ──────────────
 ;; RAY_DATE is on the DA-eligible list (group.c:2622). With only 3
