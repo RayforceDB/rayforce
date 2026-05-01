@@ -595,8 +595,11 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
                 out[i] = (uint64_t)ray_read_sym(pkd, sidx[i], pk->type, pk->attrs);
         } else if (pk->type == RAY_I32 || pk->type == RAY_DATE || pk->type == RAY_TIME) {
             const int32_t* src = (const int32_t*)pkd;
+            /* Map signed [INT32_MIN..INT32_MAX] to unsigned [0..UINT32_MAX]
+             * by flipping the sign bit; computed as unsigned to avoid
+             * signed-integer-overflow UB on positive minus INT32_MIN. */
             for (int64_t i = start; i < end; i++)
-                out[i] = (uint64_t)((uint32_t)(src[sidx[i]] - INT32_MIN));
+                out[i] = (uint64_t)((uint32_t)src[sidx[i]] ^ 0x80000000u);
         } else {
             const uint64_t* src = (const uint64_t*)pkd;
             for (int64_t i = start; i < end; i++)
@@ -612,7 +615,8 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
                 if (RAY_IS_SYM(col->type))
                     key = (key << 32) | (uint32_t)ray_read_sym(d, r, col->type, col->attrs);
                 else if (col->type == RAY_I32 || col->type == RAY_DATE || col->type == RAY_TIME)
-                    key = (key << 32) | (uint32_t)(((const int32_t*)d)[r] - INT32_MIN);
+                    /* Sign-bit flip: avoids signed-integer-overflow UB. */
+                    key = (key << 32) | ((uint32_t)((const int32_t*)d)[r] ^ 0x80000000u);
                 else {
                     key = (key << 32) | (uint32_t)((const uint64_t*)d)[r];
                 }
