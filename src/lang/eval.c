@@ -2391,6 +2391,32 @@ static void ray_register_builtins(void) {
     register_unary (".col.unlink", RAY_FN_NONE, ray_col_unlink_fn);
     register_unary (".col.link?",  RAY_FN_NONE, ray_col_link_p_fn);
     register_unary (".col.target", RAY_FN_NONE, ray_col_target_fn);
+
+    /* Graph algorithms (see src/ops/graph_builtin.c, src/ops/traverse.c).
+     * Build a CSR handle from an edge table, then dispatch any of the 18
+     * algorithms in src/ops/traverse.c.  All wrappers are vary-arity so
+     * the underlying algorithm's optional parameters surface uniformly.
+     * Lifecycle handles auto-free on rc→0 (see RAY_ATTR_GRAPH branch in
+     * src/mem/heap.c). */
+    register_vary (".graph.build",         RAY_FN_NONE, ray_graph_build_fn);
+    register_unary(".graph.free",          RAY_FN_NONE, ray_graph_free_fn);
+    register_unary(".graph.info",          RAY_FN_NONE, ray_graph_info_fn);
+    register_vary (".graph.pagerank",      RAY_FN_NONE, ray_graph_pagerank_fn);
+    register_vary (".graph.connected",     RAY_FN_NONE, ray_graph_connected_fn);
+    register_vary (".graph.dijkstra",      RAY_FN_NONE, ray_graph_dijkstra_fn);
+    register_vary (".graph.louvain",       RAY_FN_NONE, ray_graph_louvain_fn);
+    register_vary (".graph.degree",        RAY_FN_NONE, ray_graph_degree_fn);
+    register_vary (".graph.topsort",       RAY_FN_NONE, ray_graph_topsort_fn);
+    register_vary (".graph.dfs",           RAY_FN_NONE, ray_graph_dfs_fn);
+    register_vary (".graph.cluster",       RAY_FN_NONE, ray_graph_cluster_fn);
+    register_vary (".graph.betweenness",   RAY_FN_NONE, ray_graph_betweenness_fn);
+    register_vary (".graph.closeness",     RAY_FN_NONE, ray_graph_closeness_fn);
+    register_vary (".graph.mst",           RAY_FN_NONE, ray_graph_mst_fn);
+    register_vary (".graph.random-walk",   RAY_FN_NONE, ray_graph_random_walk_fn);
+    register_vary (".graph.k-shortest",    RAY_FN_NONE, ray_graph_k_shortest_fn);
+    register_vary (".graph.shortest-path", RAY_FN_NONE, ray_graph_shortest_path_fn);
+    register_vary (".graph.expand",        RAY_FN_NONE, ray_graph_expand_fn);
+    register_vary (".graph.var-expand",    RAY_FN_NONE, ray_graph_var_expand_fn);
 }
 
 /* ══════════════════════════════════════════

@@ -506,6 +506,31 @@ ray_t* ray_anti_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join_fn(ray_t** args, int64_t n);
 ray_t* ray_asof_join_fn(ray_t** args, int64_t n);
 
+/* Graph builtins (.graph.* family).  Implemented in src/ops/graph_builtin.c —
+ * thin wrappers around the lazy-DAG graph algorithms in src/ops/traverse.c.
+ * The graph itself is an opaque ray_rel_t* wrapped in a -RAY_I64 atom with
+ * RAY_ATTR_GRAPH; ownership semantics mirror the HNSW handle (see
+ * src/ops/embedding.c). */
+ray_t* ray_graph_build_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_free_fn(ray_t* h);
+ray_t* ray_graph_info_fn(ray_t* h);
+ray_t* ray_graph_pagerank_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_connected_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_dijkstra_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_louvain_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_degree_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_topsort_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_dfs_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_cluster_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_betweenness_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_closeness_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_mst_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_random_walk_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_k_shortest_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_shortest_path_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_expand_fn(ray_t** args, int64_t n);
+ray_t* ray_graph_var_expand_fn(ray_t** args, int64_t n);
+
 /* Convenience wrapper: atomic_map_binary with no DAG opcode */
 static inline ray_t* atomic_map_binary(ray_binary_fn fn, ray_t* left, ray_t* right) {
     return atomic_map_binary_op(fn, 0, left, right);

@@ -1,0 +1,145 @@
+;; Smoke tests for the .graph.* family -- the rfl entry points to the
+;; CSR-backed graph algorithms in src/ops/traverse.c.
+;;
+;; Fixture: 6-node weighted DAG with 8 edges
+;;
+;;        0
+;;     1=1  4=W
+;;    1 -2--> 2
+;;       3 -2--> 5
+;;              ?
+;;              1
+;;              |
+;;              4
+;;
+;;   (edges: 0->1 w=1, 0->2 w=4, 1->2 w=2, 1->3 w=5,
+;;           2->3 w=1, 2->4 w=3, 3->5 w=2, 4->5 w=1)
+;;
+;; Shortest path from 0 to 5 is 0->1->2->3->5 with total weight 6.
+
+(set Edges (table [src dst w] (list [0 0 1 1 2 2 3 4] [1 2 2 3 3 4 5 5] [1.0 4.0 2.0 5.0 1.0 3.0 2.0 1.0])))
+
+;; Build a graph with weights -- exercises the optional 'w arm of
+;; .graph.build and the props-attach path in ray_rel_set_props.
+(set G (.graph.build Edges 'src 'dst 'w))
+
+;; -------------- (.graph.info) -- handle inspection --------------
+;; n_nodes = max(src,dst)+1 = 6, n_edges = 8 (one per row).
+(at (.graph.info G) 'n_nodes)     -- 6
+(at (.graph.info G) 'n_edges)     -- 8
+(at (.graph.info G) 'has_weights) -- true
+
+;; -------------- (.graph.pagerank) --------------
+;; PageRank returns one row per node with two columns: _node, _rank.
+;; The DAG has no dangling-redistribution issues for this graph (every
+;; node except 5 has out-edges); ranks must sum to ~1 (with tiny FP slop).
+(set Pr (.graph.pagerank G 30 0.85))
+(count Pr)                                      -- 6
+(>= (sum (at Pr '_rank)) 0.99)                  -- true
+(<= (sum (at Pr '_rank)) 1.01)                  -- true
+;; All ranks are strictly positive (no isolated nodes).
+(> (min (at Pr '_rank)) 0.0)                    -- true
+
+;; -------------- (.graph.dijkstra) --------------
+;; Single-source Dijkstra from node 0.  Hand-computed reference:
+;;   dist[0]=0, dist[1]=1, dist[2]=3, dist[3]=4, dist[4]=6, dist[5]=6
+;; (node 5 reached via 0->1->2->3->5: 1+2+1+2=6, beats 0->1->2->4->5=7).
+(set Dj (.graph.dijkstra G 0))
+(count Dj)                                      -- 6
+;; Node 0 has dist 0 (it's the source).  At-by-row would need a select;
+;; instead probe the column directly via index lookup.
+(set Dj_node (at Dj '_node))
+(set Dj_dist (at Dj '_dist))
+(at Dj_dist (at (where (== Dj_node 0)) 0))      -- 0.0
+(at Dj_dist (at (where (== Dj_node 1)) 0))      -- 1.0
+(at Dj_dist (at (where (== Dj_node 2)) 0))      -- 3.0
+(at Dj_dist (at (where (== Dj_node 3)) 0))      -- 4.0
+(at Dj_dist (at (where (== Dj_node 4)) 0))      -- 6.0
+(at Dj_dist (at (where (== Dj_node 5)) 0))      -- 6.0
+
+;; -------------- (.graph.dfs) --------------
+;; DFS from 0 with unbounded depth visits every node.  The first row
+;; must be the source itself (depth 0, parent -1).
+(set D (.graph.dfs G 0))
+(count D)                                       -- 6
+(first (at D '_node))                           -- 0
+(first (at D '_depth))                          -- 0
+(first (at D '_parent))                         -- -1
+;; All emitted nodes are valid IDs in [0..5] and distinct.
+(min (at D '_node))                             -- 0
+(max (at D '_node))                             -- 5
+(count (distinct (at D '_node)))                -- 6
+
+;; max_depth=1 limits the DFS frontier.  From node 0 we should see 0
+;; (depth 0), plus 1 and 2 (depth 1) -- three rows total.
+(count (.graph.dfs G 0 1))                      -- 3
+
+;; -------------- (.graph.topsort) --------------
+;; The fixture is a DAG, so a valid total ordering exists.  The order
+;; column maps node-id -> position; node 0 is a source so its order is 0.
+(set Ts (.graph.topsort G))
+(count Ts)                                      -- 6
+;; Distinct order values that are a permutation of [0..5].
+(count (distinct (at Ts '_order)))              -- 6
+(min (at Ts '_order))                           -- 0
+(max (at Ts '_order))                           -- 5
+;; Node 0 must precede every other node.
+(set Ts_node (at Ts '_node))
+(set Ts_ord  (at Ts '_order))
+(at Ts_ord (at (where (== Ts_node 0)) 0))       -- 0
+;; Node 5 has only inbound edges, so it must be last (order=5).
+(at Ts_ord (at (where (== Ts_node 5)) 0))       -- 5
+
+;; -------------- (.graph.mst) --------------
+;; MST treats edges as undirected.  Hand-Kruskal: sorted edges with
+;; weights 1,1,1,2,2,3,4,5 -- pick (2,3,1), (4,5,1), (0,1,1), then
+;; (1,2,2) bridging the two components, then (3,5,2) connecting the
+;; (4,5) component.  Total = 1+1+1+2+2 = 7.
+(set Mst (.graph.mst G))
+;; A spanning tree on 6 nodes has exactly 5 edges.
+(count Mst)                                     -- 5
+
+;; -------------- (.graph.degree) -- sanity --------------
+;; Degree centrality returns total degree per node.
+;; In/out/total are all summed from fwd CSR; see exec_degree_cent.
+;; Node 0 has out-degree 2, in-degree 0 -> total 2.
+;; Node 5 has out-degree 0, in-degree 2 -> total 2.
+(set Dg (.graph.degree G))
+(count Dg)                                      -- 6
+;; Sum of total degrees == 2 * n_edges.  Column is `_degree` (in + out).
+(sum (at Dg '_degree))                          -- 16
+
+;; -------------- (.graph.connected) -- sanity --------------
+;; Whole graph is one weakly-connected component.
+(set Cc (.graph.connected G))
+(count (distinct (at Cc '_component)))          -- 1
+
+;; -------------- (.graph.shortest-path) --------------
+;; BFS shortest path (hop count) from 0 to 5.  In our DAG the minimum
+;; hop count is 3: 0->1->3->5 or 0->2->3->5 etc. -- at any rate there must
+;; be at least one row in the result and the destination is reachable.
+(>= (count (.graph.shortest-path G 0 5)) 1)     -- true
+
+;; -------------- (.graph.expand) -- neighbors of node 1 --------------
+;; Node 1 has out-edges 1->2 and 1->3.  expand returns a 2-column table.
+(count (.graph.expand G 1))                     -- 2
+
+;; -------------- (.graph.free) --------------
+(.graph.free G)
+;; Second free is a type error (handle was zeroed), not a double-free.
+(.graph.free G)                                 !- type
+
+;; -------------- error paths --------------
+;; Building without the optional weight column on an algorithm that
+;; needs it must raise schema.
+(set G2 (.graph.build Edges 'src 'dst))
+(.graph.dijkstra G2 0)                          !- schema
+(.graph.mst G2)                                 !- schema
+;; topsort and dfs work on a weight-less graph.
+(count (.graph.topsort G2))                     -- 6
+(count (.graph.dfs G2 0))                       -- 6
+(.graph.free G2)
+
+;; Wrong handle type rejected.
+(.graph.info 42)                                !- type
+(.graph.pagerank 42)                            !- type
