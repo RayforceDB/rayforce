@@ -15,6 +15,26 @@
 ;;   - OOM allocator failure paths, hard-coded depth/breadth guards
 ;;     (visited[4096], stack_cap > 256, sp >= 64), `return ray_error`
 ;;     branches: classified as error guards, not useful work.
+;;   - fold_binary_const I32/DATE/TIME arm (opt.c:454-473): unreachable
+;;     from rfl.  graph.c::promote uses POSITIVE RAY_xxx constants but
+;;     ray_const_atom carries atom->type with NEGATIVE tag; promote
+;;     returns RAY_BOOL fallthrough for two-atom DATE/TIME/I32/I16
+;;     literal expressions.  Specialised ray_const_i64/f64/bool only
+;;     normalise I64/F64/BOOL atoms — DATE/TIME/SYM/I32/I16/U8 atoms
+;;     keep negative tags.  Top-level `(- 2026.05.05 2026.05.01)`
+;;     bypasses the DAG entirely (eval.c:494 gates can_dag on at least
+;;     one vec operand).  Same orphan shape as the topn family.
+;;   - infer_type_for_node body (opt.c:67-85) and downstream promote_type
+;;     arms reachable only when out_type==0; every graph constructor
+;;     sets a non-zero out_type, so the `if (node->out_type == 0)` gate
+;;     never opens from rfl.  promote_type runs only as the fallback
+;;     callee here — graph.c has its own promote() that actually fires.
+;;   - filter pushdown past EXPAND (opt.c:1373-1400) and helpers
+;;     collect_pred_scans / is_reachable_from (opt.c:1184-1307): only
+;;     called by the EXPAND branch of pass_predicate_pushdown.
+;;   - OP_WINDOW arms in pass_constant_fold (opt.c:690-700) and
+;;     pass_dce (opt.c:1685-1701): OP_WINDOW is the same orphan as
+;;     OP_EXPAND — not produced by ordinary `select`.
 ;;
 ;; All assertions feed through `select` so ray_optimize() runs
 ;; (query.c:322 etc.) and pass_* hooks fire.
@@ -319,3 +339,71 @@
 (sum (at (select {x: (sqrt (* 4 4)) from: T4}) 'x)) -- 16.0
 (sum (at (select {x: (abs (neg 7)) from: T4}) 'x)) -- 28
 (sum (at (select {x: (+ (sqrt 9) (sqrt 16)) from: T4}) 'x)) -- 28.0
+
+;; ====================================================================
+;; simplify_and_or_const — opt.c:515-559
+;; The four logical-identity arms when ONE operand is a const scalar
+;; bool and the other is a column predicate.  The both-const path goes
+;; through fold_binary_const (covered above); the both-non-const path
+;; is the common (and col col) form.
+;;
+;; AND identity (X & true → X) is exercised at opt_coverage:340 by
+;; (and (> a 0) (== (+ 1 1) 2)); AND dominant (X & false → false) at
+;; opt_coverage:342 by (== (+ 1 1) 3).  The OR mirrors are uncovered.
+;; ====================================================================
+;; OR dominant arm (opt.c:548-558): (or X true) → const true.
+;; Outer where then folds to MATERIALIZE keeping all rows.
+(count (select {from: TP where: (or (> a 5) (== 1 1))})) -- 10
+(count (select {from: TP where: (or (== a 999) (== (+ 1 1) 2))})) -- 10
+
+;; OR identity arm (opt.c:534-546): (or X false) → ALIAS(X).
+;; Reduces to plain column predicate.
+(count (select {from: TP where: (or (> a 5) (== 1 0))})) -- 5
+(sum  (at (select {from: TP where: (or (> a 5) (!= 1 1))}) 'a)) -- 40
+
+;; AND identity (X & true) — already covered indirectly, but pin a
+;; tighter oracle on the ALIAS-rewritten arm so the row count drops
+;; out of the column predicate alone.
+(count (select {from: TP where: (and (> a 3) (== 1 1))})) -- 7
+
+;; AND dominant (X & false) — explicit oracle.
+(count (select {from: TP where: (and (> a 3) (== 1 0))})) -- 0
+
+;; Const-on-LHS variants — simplify_and_or_const handles either side
+;; via lhs_const / rhs_const flags (opt.c:518-528).  These hit the
+;; `lhs_const ? rhs : lhs` branch (X is the rhs in this case).
+(count (select {from: TP where: (and (== 1 1) (> a 5))})) -- 5
+(count (select {from: TP where: (or  (== 1 0) (> a 5))})) -- 5
+(count (select {from: TP where: (and (== 1 0) (> a 5))})) -- 0
+(count (select {from: TP where: (or  (== 1 1) (> a 5))})) -- 10
+
+;; ====================================================================
+;; filter_cost default opcode arm — opt.c:1438
+;; OP_IN / OP_NOT_IN do not match any of the EQ/NE/LT/LE/GT/GE/LIKE/
+;; ILIKE cases, so they fall through to `cost += 1`.  Reaches that arm
+;; iff the predicate is part of a chain of >= 2 filters (chain_len < 2
+;; short-circuits the reorder loop at opt.c:1550).
+;; ====================================================================
+(set TIN (table [a b] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100])))
+
+;; AND-of-2: chain after split is (FILTER(>b30) (FILTER(in a [3 5 7]) TIN)).
+;; filter_cost runs on each predicate; OP_IN hits the default arm.
+(count (select {from: TIN where: (and (in a [3 5 7]) (> b 30))})) -- 2
+(count (select {from: TIN where: (and (not-in a [1 2 3]) (> b 30))})) -- 7
+
+;; OR predicate as a single filter (chain_len==1, filter_cost not run).
+;; Behavioural pin: optimizer must not split OR.
+(count (select {from: TIN where: (or (== a 1) (== a 10))})) -- 2
+
+;; ====================================================================
+;; filter_cost SCAN-as-predicate (opt.c:1438 default arm via opcode).
+;; A bool column referenced bare in `where` is an OP_SCAN, not a
+;; comparison.  In a chain it routes through the default opcode arm.
+;; The type-width arm (opt.c:1426 BOOL/U8 cost += 0) also fires.
+;; ====================================================================
+(set TBC (table [b a] (list [true false true false true false true false true false] [1 2 3 4 5 6 7 8 9 10])))
+(count (select {from: TBC where: (and b (> a 3))})) -- 3
+(count (select {from: TBC where: (and (> a 3) b)})) -- 3
+;; Three-way: bool col + comparison + comparison, exercises insertion-sort
+;; ranking with mixed costs.
+(count (select {from: TBC where: (and b (> a 1) (< a 8))})) -- 3

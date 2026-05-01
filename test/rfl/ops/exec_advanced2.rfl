@@ -1,0 +1,119 @@
+;; Pass 4b coverage targets for src/ops/exec.c — branches missed by
+;; exec_coverage.rfl.  Focus is on:
+;;   - HEAD(FILTER) selection-compact path (exec.c:1311-1318) reached
+;;     only when the input filter is *chained* (g->selection is already
+;;     set when OP_HEAD enters).  The optimizer's pass_filter_reorder
+;;     splits AND predicates into chained OP_FILTER nodes, so a query
+;;     of the shape `where: (and P1 P2) take: N` exercises this path.
+;;   - HEAD(SORT) selection-compact path (exec.c:1258-1265): same idea
+;;     but with an asc:/desc: clause replacing the second predicate.
+;;   - IN_READ_F64 macro arms (exec.c:595, 596, 599) for the BOOL,
+;;     I16, and I64 column types under use_double=1 (float probe set).
+;;     I32/DATE/TIME share L597-598 and are already covered by
+;;     exec_coverage.rfl line 284.  F32 and U8 arms are unreachable
+;;     from rfl source (no `(as 'F32 ...)` / `(as 'U8 ...)` casts).
+;;
+;; SKIPPED ranges (orphan / require parted/MAPCOMMON fixtures or
+;; segment-streaming infra not driven by rfl):
+;;   - L35-152   materialize_mapcommon* family
+;;   - L1351-1392, L1438-1502  HEAD/TAIL on parted/MAPCOMMON columns
+;;   - L1839-1920, L2134-2248 segment streaming / build_segment_table
+;;   - L1932-1951 op_streamable switch (only fires under streaming)
+;;   - L889-921   parted concat fallback in OP_SCAN
+;;   - L1277-1300 HEAD-of-GROUP selection compaction: query.c:3210
+;;     skips ray_head() entirely when by_expr is set, and the only
+;;     other OP_HEAD construction (opt.c:584 fold_filter_const_predicate)
+;;     produces HEAD with n=0 over the FILTER's input, but g->selection
+;;     is never set in that path because the constant predicate is
+;;     consumed during folding (there is no upstream FILTER left to
+;;     install the bitmap).  Reachability would require an internal
+;;     transformation that neither query.c nor opt.c performs.
+;;   - error / NYI paths not relevant to the useful-work scope
+
+(.sys.exec "rm -rf /tmp/rfl_exec_advanced2")
+
+;; ====================================================================
+;; HEAD(FILTER) — chained-filter selection compaction (exec.c:1311-1318)
+;; ====================================================================
+;; Build a 20-row fixture and use `(and P1 P2)`; the optimizer splits
+;; the AND into two OP_FILTER nodes.  When OP_HEAD evaluates its child
+;; OP_FILTER's input (exec.c:1304), the inner OP_FILTER installs
+;; g->selection on the lazy path (exec.c:1068).  At exec.c:1311 the
+;; selection-compact branch then fires before the outer predicate is
+;; evaluated.  Without `take:` the outer query goes through the chained
+;; OP_FILTER refine path (exec.c:1063), not OP_HEAD, so `take:` is
+;; required to route through HEAD(FILTER).
+(set TF2 (table [x y] (list [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20] [10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180 190 200])))
+
+;; (and P1 P2) becomes chained filters.  P1 keeps x in {6..20}=15 rows,
+;; P2 keeps x in {1..14}=14 rows, conjunction is x in {6..14}=9 rows;
+;; take 3 picks the first three matching = x in {6,7,8}, sum 21.
+(count (select {from: TF2 where: (and (> x 5) (< x 15)) take: 3})) -- 3
+(sum   (at (select {from: TF2 where: (and (> x 5) (< x 15)) take: 3}) 'x)) -- 21
+
+;; Three-way AND splits into a longer chain; both inner filters install
+;; selection before HEAD compacts.  P1: x>3 (17 rows), P2: x<18
+;; (17 rows), P3: x!=10 (one of the rows in 4..17 is dropped).
+;; Conjunction: x in {4..9, 11..17} = 13 rows; take 4 picks 4.
+(count (select {from: TF2 where: (and (and (> x 3) (< x 18)) (!= x 10)) take: 4})) -- 4
+;; sum of first 4 matches = 4+5+6+7 = 22.
+(sum   (at (select {from: TF2 where: (and (and (> x 3) (< x 18)) (!= x 10)) take: 4}) 'x)) -- 22
+
+;; Chained AND with take: -N also exercises selection compaction in the
+;; HEAD(FILTER) branch?  No — query.c:3219 routes negative take into
+;; ray_tail, and OP_TAIL has no FILTER fusion.  Skip.
+
+;; ====================================================================
+;; HEAD(SORT) — chained selection compaction (exec.c:1258-1265)
+;; ====================================================================
+;; `select { where: P asc: c take: N }` compiles to HEAD(SORT(FILTER)).
+;; When OP_HEAD recurses into the SORT child, the SORT's input is
+;; OP_FILTER which sets g->selection on the lazy path.  exec.c:1258
+;; sees the selection and calls sel_compact before sorting.
+(first (at (select {from: TF2 where: (> x 5) asc: x take: 3}) 'x)) -- 6
+(first (at (select {from: TF2 where: (> x 5) desc: x take: 3}) 'x)) -- 20
+;; Sum of first 3 ascending matches: 6+7+8 = 21.
+(sum (at (select {from: TF2 where: (> x 5) asc: x take: 3}) 'x)) -- 21
+;; Sum of first 3 descending matches: 20+19+18 = 57.
+(sum (at (select {from: TF2 where: (> x 5) desc: x take: 3}) 'x)) -- 57
+
+;; ====================================================================
+;; OP_IN — IN_READ_F64 macro arms (exec.c:595-602) for column types
+;; that aren't already covered by exec_coverage.rfl's int-set probes.
+;;
+;; Reuse the cross-type fixture shape locally (50 rows, multiple typed
+;; columns).  Probe with a float set so use_double=1 selects the F64
+;; branch in exec_in_worker (exec.c:607).  The column type then
+;; selects the IN_READ_F64 switch arm.
+;; ====================================================================
+(set N3 50)
+(set TY (table [i64c i16c boolc] (list (til N3) (as 'I16 (% (til N3) 50)) (take [true false] N3))))
+
+;; I64 col, F64 set — IN_READ_F64 RAY_I64 arm (exec.c:599-600).
+;; i64c=0..49, set={1.0,2.0,3.0} matches 3 rows.
+(count (select {from: TY where: (in i64c [1.0 2.0 3.0])})) -- 3
+;; sum of matched i64c values: 1+2+3 = 6.
+(sum   (at (select {from: TY where: (in i64c [1.0 2.0 3.0])}) 'i64c)) -- 6
+
+;; I16 col, F64 set — IN_READ_F64 RAY_I16 arm (exec.c:596).
+;; i16c=0..49 (one occurrence each), set={1.0,2.0,3.0} matches 3 rows.
+(count (select {from: TY where: (in i16c [1.0 2.0 3.0])})) -- 3
+(sum   (at (select {from: TY where: (in i16c [1.0 2.0 3.0])}) 'i16c)) -- 6
+
+;; BOOL col, F64 set — IN_READ_F64 RAY_BOOL arm (exec.c:595).
+;; boolc alternates [true,false] for 50 rows = 25 trues + 25 falses.
+;; Set {1.0} matches only true rows = 25.
+(count (select {from: TY where: (in boolc [1.0])})) -- 25
+;; Set {0.0} matches only false rows = 25.
+(count (select {from: TY where: (in boolc [0.0])})) -- 25
+;; Set {0.0,1.0} matches both = 50.
+(count (select {from: TY where: (in boolc [0.0 1.0])})) -- 50
+
+;; not-in symmetry: I64 col with float set, negate=1.
+;; 50 rows total minus 3 matches = 47.
+(count (select {from: TY where: (not-in i64c [1.0 2.0 3.0])})) -- 47
+
+;; ====================================================================
+;; Cleanup
+;; ====================================================================
+(.sys.exec "rm -rf /tmp/rfl_exec_advanced2")
