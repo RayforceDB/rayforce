@@ -23,6 +23,8 @@
 
 #include "core/numparse.h"
 
+#include <rayforce.h>
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -402,15 +404,25 @@ size_t ray_parse_f64(const char *src, size_t len, double *dst) {
     }
 
     if (need_strtod) {
-        char stackbuf[128];
-        char *buf = (i + 1 <= sizeof(stackbuf)) ? stackbuf : malloc(i + 1);
+        /* Project policy: no libc malloc/free.  Use a stack buffer for
+         * the common case; fall back to the internal allocator for
+         * anything larger. */
+        char   stackbuf[128];
+        char  *buf;
+        ray_t *buf_block = NULL;
+        if (i + 1 <= sizeof(stackbuf)) {
+            buf = stackbuf;
+        } else {
+            buf_block = ray_alloc(i + 1);
+            buf = buf_block ? (char*)ray_data(buf_block) : NULL;
+        }
         if (buf) {
             memcpy(buf, src, i);
             buf[i] = '\0';
             char *endp = NULL;
             double v = strtod(buf, &endp);
             bool ok = (endp == buf + i);
-            if (buf != stackbuf) free(buf);
+            if (buf_block) ray_free(buf_block);
             if (ok) {
                 /* strtod already applied the leading sign in buf, so
                  * don't apply `neg` again. */
