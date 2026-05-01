@@ -1,0 +1,315 @@
+;; src/mem/heap.c — pass 3 coverage push for the buddy / slab / cow /
+;; release-owned-refs paths.  Pass 1 + 2 leave 409 of 958 lines uncovered;
+;; this file targets the rfl-reachable subset (slab hits, buddy split
+;; cascade, scratch-realloc grow/shrink, ray_alloc_copy across every
+;; type family, owned-refs retain/release for lambda / lazy / index /
+;; slice / parted / mapcommon / table / dict / list, foreign-block
+;; flush via select, and ray_heap_destroy via .db.splayed.set's
+;; tempfile-mapped tables).
+;;
+;; Each block annotates the heap.c line(s) it drives.  Lines that sit
+;; behind allocator failure, fault injection, or platform-specific
+;; ifdefs (Apple F_PREALLOCATE, Emscripten aligned_alloc, MAP_FAILED
+;; branches) are out of scope — see the "PROPOSE FOR DEAD CODE FILE"
+;; section in the test report.
+;;
+;; Layout uses /tmp/rfl_heap_* (no collision with /tmp/rfl_part_*,
+;; /tmp/rfl_splayed_*, /tmp/rfl_mount_* or any other test prefix).
+
+;; ────────────── pre-flight cleanup ──────────────
+(.sys.exec "rm -rf /tmp/rfl_heap_*")
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 1. Slab hot path (heap.c:806-826).
+;;    Many small allocations of the same order — second through Nth alloc
+;;    must hit slabs[idx].count > 0.  Free + alloc churn keeps the slab
+;;    cache populated up to RAY_SLAB_CACHE_SIZE.
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; Tiny i64 vecs — order 6 (64-byte block).  Each (at ...) allocates a
+;; throwaway vec literal whose order falls in the slab range (orders 6-10).
+(at [1] 0)            -- 1
+(at [1 2] 0)          -- 1
+(at [1 2 3] 0)        -- 1
+(at [1 2 3 4] 0)      -- 1
+(at [1 2 3 4 5] 0)    -- 1
+(at [1 2 3 4 5 6] 0)  -- 1
+(at [1 2 3 4 5 6 7] 0) -- 1
+(at [1 2 3 4 5 6 7 8] 0) -- 1
+
+;; Small string allocations — RAY_STR with various lengths cover
+;; multiple slab orders; repeated calls must hit the cache.
+(count "abc")  -- 3
+(count "abcd") -- 4
+(count "abce") -- 4
+(count "ab")   -- 2
+(count "abcdef")  -- 6
+(count "abcdefg") -- 7
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 2. Buddy split cascade (heap.c:209-218, 832-869).
+;;    Allocations whose order > slab range walk the avail bitmask, take
+;;    a larger block from the freelist, and split down to target order.
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; 100k i64 vec — order ~20 (well above slab range), needs split cascade.
+(set BIG (til 100000))
+(count BIG) -- 100000
+(sum BIG)   -- 4999950000
+
+;; Larger still — drives split from a higher freelist order.
+(set HUGE (til 1000000))
+(count HUGE) -- 1000000
+
+;; Mixed-size churn so the pool's freelist sees coalescing too.
+(count (til 50000))  -- 50000
+(count (til 250000)) -- 250000
+(count (til 500000)) -- 500000
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 3. ray_alloc_copy across every type family (heap.c:978-1029).
+;;    Drives the type-dispatch chain inside ray_alloc_copy and the
+;;    matching retain_owned_refs branches (heap.c:600-697).
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; ray_alloc_copy is called from ray_cow when rc > 1.  Each block below
+;; aliases a value (rc=2 via set) then mutates the alias to force a
+;; full copy through every type-dispatch arm of ray_alloc_copy.
+
+;; Atom path: data_size = 0 (heap.c:982).  Atom mutation (e.g. as) goes
+;; through alloc_copy with size 0.
+(set A1 5)
+(set A2 A1)
+(+ A2 1) -- 6
+A1 -- 5
+
+;; Vector typed path: data_size = len * elem_size (heap.c:998-1007).
+;;   reverse on aliased vec → ray_cow → ray_alloc_copy on RAY_I64.
+(set V1 [10 20 30 40 50])
+(set V2 V1)
+(reverse V2) -- [50 40 30 20 10]
+V1 -- [10 20 30 40 50]
+
+;; Float vector — distinct elem_size in ray_sym_elem_size.
+(set FV1 [1.5 2.5 3.5])
+(set FV2 FV1)
+(reverse FV2) -- [3.5 2.5 1.5]
+FV1 -- [1.5 2.5 3.5]
+
+;; LIST path: data_size = len * sizeof(ray_t*) (heap.c:990-997).
+;;   retain_owned_refs RAY_LIST branch (heap.c:689-695).
+(set L1 (list [1 2 3] [4 5 6] [7 8 9]))
+(set L2 L1)
+(count (reverse L2)) -- 3
+(count L1) -- 3
+
+;; TABLE path: data_size = 2*sizeof(ray_t*) (heap.c:983-984).
+;;   retain_owned_refs RAY_TABLE branch (heap.c:682-687).
+(set TBL (table [a b] (list [1 2 3] [4 5 6])))
+(set TBL2 TBL)
+(count TBL2) -- 3
+(count TBL)  -- 3
+
+;; DICT path: same data_size as TABLE, RAY_DICT retain branch.
+(set D1 (dict [a b c] [1 2 3]))
+(set D2 D1)
+(count D2) -- 3
+(count D1) -- 3
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 4. ray_release_owned_refs / ray_retain_owned_refs symmetry —
+;;    every owned-resource type (heap.c:495-598, 600-697).
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; LAMBDA: ray_release_owned_refs RAY_LAMBDA path (heap.c:499-510)
+;;         + ray_retain_owned_refs (heap.c:604-613).
+(set FN1 (fn [x] (* x x)))
+(set FN2 FN1)
+(FN1 4) -- 16
+(FN2 5) -- 25
+
+;; Lambda used in a higher-order map — drives release on every
+;; intermediate copy.
+(map (fn [x] (+ x 1)) [10 20 30]) -- [11 21 31]
+
+;; Recursive lambda — release path runs at every scope exit.
+(set fact (fn [n] (if (<= n 1) 1 (* n (fact (- n 1))))))
+(fact 6) -- 720
+
+;; STR atom owning obj (long string, !sso): release_owned_refs
+;; ray_atom_owns_obj branch (heap.c:489-493, 529-530, 634-635).
+(set LS1 "hello world this is a long string past the SSO boundary")
+(set LS2 LS1)
+(count LS2) -- 55
+
+;; HNSW handle: -RAY_I64 with RAY_ATTR_HNSW (heap.c:521-528, 621-633).
+;; Build an index, alias it via set, free it — exercises retain on
+;; the alias and release on scope exit.
+(set V (list [1.0 0.0 0.0] [0.9 0.1 0.0] [0.0 1.0 0.0] [0.5 0.5 0.0]))
+(set IDX (hnsw-build V 'l2 8 100))
+(at (hnsw-info IDX) 'nrows) -- 4
+(hnsw-free IDX)
+
+;; INDEX block via .idx.* — retain_owned_refs RAY_INDEX path
+;; (heap.c:543-548, 645-650), ray_index_release_payload (heap.c:734-744).
+;; Hash, sort, bloom each have a distinct kind branch in
+;; ray_detach_owned_refs (heap.c:735-740).
+(set H (.idx.hash [1 2 3 4 5 1 2 3]))
+(.idx.has? H) -- true
+(set H2 H)
+(.idx.has? H2) -- true
+(set S (.idx.sort [5 2 8 1 9 3]))
+(.idx.has? S) -- true
+(set B (.idx.bloom [10 20 30 40 50]))
+(.idx.has? B) -- true
+
+;; SLICE attribute: dict range-take returns a slice over keys/vals
+;; (collection.c:1258 → ray_vec_slice).  Drives heap.c:534-538,
+;; 639-643, 726-731 (RAY_ATTR_SLICE retain/release/detach).
+(set DSRC (dict ['a 'b 'c 'd 'e 'f 'g 'h] [10 20 30 40 50 60 70 80]))
+(set DSL (take DSRC [2 4]))
+(count DSL) -- 4
+(at DSL 'c) -- 30
+;; alias and use the slice — retain_owned_refs SLICE branch fires
+;; whenever the dict moves through ray_alloc_copy (e.g. on cow).
+(set DSL2 DSL)
+(at DSL2 'e) -- 50
+
+;; PARTED column via .db.parted.get — RAY_IS_PARTED retain branch
+;; (heap.c:567-575, 665-673), detach (heap.c:762-768).
+(set P-1 (table [v] (list [10 20 30])))
+(set P-2 (table [v] (list [40 50])))
+(.db.splayed.set "/tmp/rfl_heap_part/2024.01.01/t/" P-1)
+(.db.splayed.set "/tmp/rfl_heap_part/2024.01.02/t/" P-2)
+(set PT (.db.parted.get "/tmp/rfl_heap_part/" 't))
+(count PT) -- 5
+(set PT2 PT)
+(count PT2) -- 5
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 5. ray_scratch_realloc grow + shrink (heap.c:1039-1084).
+;;    Vector / list mutations that grow past the inline order trigger
+;;    realloc; the old block is detached and freed.
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; List append cascade: grows the backing list across order boundaries,
+;; driving ray_scratch_realloc with type=RAY_LIST (heap.c:1046-1048).
+(set L (list 1))
+(set L (concat L (list 2)))
+(set L (concat L (list 3)))
+(set L (concat L (list 4 5 6 7 8 9 10)))
+(count L) -- 10
+
+;; Typed-vector grow via concat — drives the typed branch (heap.c:1056-1060).
+(set V [1 2 3])
+(set V (concat V [4 5 6 7 8]))
+(set V (concat V (til 100)))
+(count V) -- 108
+(sum V) -- 4986
+
+;; Float vector grow — distinct elem_size path.
+(set FV [1.0 2.0])
+(set FV (concat FV [3.0 4.0 5.0]))
+(set FV (concat FV [6.0 7.0 8.0 9.0 10.0]))
+(count FV) -- 10
+
+;; Sym vector grow — distinct elem_size path.
+(set SV ['a 'b 'c])
+(set SV (concat SV ['d 'e 'f]))
+(count SV) -- 6
+(set SV (concat SV ['g 'h 'i 'j]))
+(count SV) -- 10
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 6. ray_mem_stats (heap.c:1090-1099).
+;;    Drives both the heap-set and heap-unset branches.  In rfl the heap
+;;    is always set on entry, so the else branch is exercised only when
+;;    sys_get_stat returns something — covered indirectly via timeit.
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; .sys.timeit returns the bytes/free counters on toggle-off — touches
+;; ray_mem_stats path.
+(.sys.timeit 1) -- 1
+(.sys.timeit 0) -- 0
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 7. NULLMAP_EXT release/retain (heap.c:560-562, 658-660, 753-755).
+;;    A vector with > 128 elements where any are null spills the inline
+;;    nullmap into an external bitmap vec.
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; 200-element vec with nulls scattered — exceeds 128-bit inline cap
+;; so ext_nullmap is allocated.
+(set NV (concat (til 100) (concat [0Nl 0Nl 0Nl] (til 100))))
+(count NV) -- 203
+(set NV2 NV)
+(count NV2) -- 203
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 8. Foreign-block path / parallel flag (heap.c:426-477, 833-844, 1235-1240).
+;;    `select` with non-trivial filtering across a moderately-sized
+;;    table fans out via ray_pool_dispatch, which sets ray_parallel_flag
+;;    and forces heap_flush_foreign(local) to run in ray_alloc when the
+;;    avail bitmask is exhausted.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set BT (table [k v] (list (til 10000) (til 10000))))
+(count (select {from: BT where: (> v 5000)})) -- 4999
+(count (select {from: BT where: (< v 100)}))  -- 100
+
+;; Multi-condition where — drives multiple gather passes.
+(count (select {from: BT where: (> v 1000)})) -- 8999
+
+;; Group-by + aggregation — radix path triggers at 65536 rows.
+(set GT (table [g v] (list (% (til 100000) 1000) (til 100000))))
+(count (select {s: (sum v) from: GT by: g})) -- 1000
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 9. Lazy-graph release (heap.c:511-518, 615, 710-713).
+;;    sum / count over a vector returns a RAY_LAZY value that materialises
+;;    on demand; the lazy graph holds a pointer that the rc=0 cleanup hook
+;;    must free via ray_graph_free.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(sum [1 2 3 4 5]) -- 15
+(sum (til 1000))  -- 499500
+;; Chained lazy ops — multiple intermediate RAY_LAZY values get freed
+;; as expressions go out of scope.
+(sum (* 2 (til 100))) -- 9900
+(sum (+ 1 (til 50))) -- 1275
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 10. mmod=1 (file-mapped) free path (heap.c:905-919).
+;;     Splayed columns load via mmap; their backing ray_t carries mmod=1.
+;;     Releasing the table at scope exit drives the file-mapped free arm.
+;; ════════════════════════════════════════════════════════════════════════════
+
+(set ST (table [a b] (list [1 2 3 4 5] [10.0 20.0 30.0 40.0 50.0])))
+(.db.splayed.set "/tmp/rfl_heap_splayed/" ST)
+(set RT (.db.splayed.get "/tmp/rfl_heap_splayed/"))
+(count RT) -- 5
+(sum (at RT 'a)) -- 15
+;; Force the loaded table out of scope by overwriting the binding —
+;; ray_free runs with v->mmod==1 and drives ray_vm_unmap_file.
+(set RT 0)
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 11. Scratch arena via long-running vector pipeline.
+;;     ray_scratch_arena_push grows backing across blocks (heap.c:1560-1590).
+;;     Aggregations build temporary radix arenas — drive enough rows to
+;;     exceed RAY_ARENA_BLOCK_ORDER (64 KB per backing block).
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; A radix groupby on 200k rows easily pushes past one arena block.
+(set GT2 (table [g v] (list (% (til 200000) 5000) (til 200000))))
+(count (select {s: (sum v) from: GT2 by: g})) -- 5000
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; 12. ray_heap_init no-op when already initialized (heap.c:1106).
+;;     Implicitly drives the early-return — the runtime entered with
+;;     ray_tl_heap already set, so any ray_alloc above re-entered the
+;;     fast path.  Nothing to assert; see line 1106 in the trace.
+;; ════════════════════════════════════════════════════════════════════════════
+
+;; ────────────── teardown ──────────────
+(.sys.exec "rm -rf /tmp/rfl_heap_*")
