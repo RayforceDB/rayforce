@@ -65,6 +65,39 @@
 ;; returns what it has).  Reset state for any later toggle tests.
 (.sys.timeit 0)          -- 0
 
+;; ────────────── arg_as_i64: type-fallthrough (lines 85-86) ──────────────
+;; arg_as_i64 has an explicit early-return for every integer kind plus
+;; STR; any other typed arg falls past all branches into the final
+;; `*err = 1; return 0;` pair (lines 85-86).  Reaching it requires a
+;; non-null, non-int, non-bool, non-string atom routed past the
+;; string-dispatch guard — i.e. a direct `.sys.timeit` / `.sys.listen`
+;; call with a typed atom (float, sym, etc.).  The handler then sees
+;; err=1 and returns "type".  These probes are the only path from rfl
+;; that hit lines 85-86.
+(.sys.timeit 1.5)    !- type
+(.sys.timeit 3.14)   !- type
+(.sys.listen 1.5)    !- type
+(.sys.listen 3.14)   !- type
+;; State should be untouched by the failed timeit calls above (the
+;; type guard runs before the profiler flag is poked).  Confirm by
+;; toggling and reading back.
+(.sys.timeit 0)      -- 0
+(.sys.timeit 1)      -- 1
+(.sys.timeit 0)      -- 0
+
+;; ────────────── arg_as_i64: type-fallthrough (lines 85-86) ──────────
+;; Float atoms hit the final *err=1; return 0 branch — neither I64/I32/I16/U8/BOOL
+;; nor STR.  Only reachable via direct `.sys.timeit`/`.sys.listen` calls
+;; (the .sys.cmd dispatcher always wraps args as strings).
+(.sys.timeit 1.5)    !- type
+(.sys.timeit 3.14)   !- type
+(.sys.listen 1.5)    !- type
+(.sys.listen 3.14)   !- type
+;; Post-condition: state unchanged after type errors.
+(.sys.timeit 0)      -- 0
+(.sys.timeit 1)      -- 1
+(.sys.timeit 0)      -- 0
+
 ;; ────────────── h_timeit: no-arg toggle (arg_is_null branch, line 100) ──
 ;; Force off, then toggle: state flips on and back off.  Final value
 ;; is observable through the return code.
