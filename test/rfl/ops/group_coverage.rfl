@@ -217,22 +217,19 @@
 (>= (at (at (select {sd: (stddev f) from: TvF}) 'sd) 0) 28867.0) -- true
 
 ;; ────────────── 20. Scalar VAR/STDDEV with cnt<=1 via select (insufficient) ──────────────
-;; (select {v: (var v) ...}) routes through exec_reduction's OP_VAR branch
-;; (group.c:233).  KNOWN INCONSISTENCY (master 2026-05-01): scalar path
-;; returns 0.0 for cnt==1 while the by-keyed path correctly returns 0Nf.
-;; Probed:
-;;   (at (select {v: (var v) from: T1 by: g}) 'v)  → [0Nf]   (correct)
-;;   (at (select {v: (var v) from: T1}) 'v)        → 0.0     (wrong-ish)
-;; Sample variance of a single value is mathematically undefined
-;; (denominator n-1 = 0), so 0Nf is the right answer.  Lock in observed
-;; behaviour for now; flip to 0Nf once exec_reduction propagates insuf.
+;; Sample variance/stddev with n=1 are mathematically undefined
+;; (denominator n-1 = 0).  exec_reduction returns the typed-null atom
+;; (0Nf), and broadcast_scalar (exec.c) propagates the null bit into
+;; the 1-row result column so (at result 0) reports 0Nf.
+;; Population variants (var_pop / stddev_pop) divide by n and are
+;; well-defined for n=1, returning 0.0.
 (set Ttiny (table [v f] (list [42] (as 'F64 [3.14]))))
-(at (at (select {v: (var v) from: Ttiny}) 'v) 0) -- 0.0
-(at (at (select {sd: (stddev v) from: Ttiny}) 'sd) 0) -- 0.0
+(at (at (select {v: (var v) from: Ttiny}) 'v) 0) -- 0Nf
+(at (at (select {sd: (stddev v) from: Ttiny}) 'sd) 0) -- 0Nf
 (at (at (select {vp: (var_pop v) from: Ttiny}) 'vp) 0) -- 0.0
 (at (at (select {sp: (stddev_pop v) from: Ttiny}) 'sp) 0) -- 0.0
 ;; F64 cnt==1 case
-(at (at (select {v: (var f) from: Ttiny}) 'v) 0) -- 0.0
+(at (at (select {v: (var f) from: Ttiny}) 'v) 0) -- 0Nf
 (at (at (select {vp: (var_pop f) from: Ttiny}) 'vp) 0) -- 0.0
 
 ;; ────────────── 21. F64 group with stat aggs (HT path emit) ──────────────

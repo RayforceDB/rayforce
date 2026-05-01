@@ -533,6 +533,19 @@ ray_t* broadcast_scalar(ray_t* atom, int64_t nrows) {
         vec = ray_vec_append(vec, elem);
         if (RAY_IS_ERR(vec)) return vec;
     }
+    /* Propagate null state from the source atom.  A typed-null atom
+     * (e.g. 0Nf returned by VAR/STDDEV with cnt<=1) carries its null
+     * bit in atom->nullmap[0] & 1.  Without this propagation, the
+     * scalar-select pipeline
+     *   exec_reduction → ray_typed_null(-RAY_F64) → broadcast_scalar
+     * would silently surface a stray 0.0 at (at result 0) instead of
+     * the 0Nf the by-keyed path correctly reports.  Stamp every
+     * output row null so downstream collection_elem / null-aware ops
+     * preserve atom semantics. */
+    if (RAY_ATOM_IS_NULL(atom)) {
+        for (int64_t r = 0; r < nrows; r++)
+            ray_vec_set_null(vec, r, true);
+    }
     return vec;
 }
 
