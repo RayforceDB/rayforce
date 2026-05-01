@@ -11,6 +11,9 @@
 ;;     metrics (existing test only exercises l2)
 ;;   - hnsw-save / hnsw-load round trip
 ;;   - hnsw-free idempotency (second call must error, not double-free)
+;;   - rayvec_at_f64 RAY_I32 / RAY_I64 branches (lines 357-358)
+;;   - atom_to_i64 -RAY_I32 / -RAY_I16 branches (lines 541-542)
+;;   - empty-list shortcut in ray_knn_fn (lines 574-581)
 
 ;; ────────────── pre-flight: scrub any leftover save dirs ──────────────
 (.sys.exec "rm -rf /tmp/rfl_embcov_idx /tmp/rfl_embcov_idx_*")
@@ -147,6 +150,95 @@
 (hnsw-free Loaded)
 (hnsw-free Loaded) !- type
 (hnsw-free 5)      !- type
+
+;; ────────────── rayvec_at_f64: RAY_I32 / RAY_I64 element branches ──────────────
+;; rayvec_at_f64 (lines 352-361) switches on element type.  Existing
+;; tests only ever pass F64 vectors, leaving the I32/I64 cases dark.
+;; Both query_to_doubles (line 438) and per-row row_score (lines 415,
+;; 421) dispatch through it, so passing an integer query into cos-dist
+;; / l2-dist / inner-prod hits both arms.
+
+;; Integer query vectors → query_to_doubles walks the I32/I64 cases.
+;; cos-dist of [1.0 0.0] with itself ≈ 0; the integer-query result
+;; should match within fp tolerance.
+(cos-dist [1.0 0.0] (as 'I64 [1 0]))   -- 0.0   ;; L358 RAY_I64
+(cos-dist [1.0 0.0] (as 'I32 [1 0]))   -- 0.0   ;; L357 RAY_I32
+
+;; l2-dist with integer query — sanity that the I32/I64 path produces
+;; the same numeric answer as the F64 form.
+(l2-dist [0.0 0.0] (as 'I32 [3 4]))    -- 5.0   ;; L357 RAY_I32
+(l2-dist [0.0 0.0] (as 'I64 [3 4]))    -- 5.0   ;; L358 RAY_I64
+
+;; inner-prod with integer query.
+(inner-prod [1.0 2.0 3.0] (as 'I32 [4 5 6])) -- 32.0   ;; L357
+(inner-prod [1.0 2.0 3.0] (as 'I64 [4 5 6])) -- 32.0   ;; L358
+
+;; LIST element with integer type — knn iterates rayvec_at_f64 over
+;; each list row, hitting the I32/I64 cases on row data as well.
+(set Vi32 (list (as 'I32 [1 0 0]) (as 'I32 [0 1 0]) (as 'I32 [0 0 1])))
+(first (at (knn Vi32 [1.0 0.0 0.0] 1 'l2) '_rowid)) -- 0   ;; L357 row branch
+(first (at (knn Vi32 [1.0 0.0 0.0] 1 'l2) '_dist))  -- 0.0
+
+(set Vi64 (list [1 0 0] [0 1 0] [0 0 1]))
+(first (at (knn Vi64 [1.0 0.0 0.0] 1 'l2) '_rowid)) -- 0   ;; L358 row branch
+(first (at (knn Vi64 [1.0 0.0 0.0] 1 'l2) '_dist))  -- 0.0
+
+;; norm over a LIST of integer vectors also exercises rayvec_at_f64's
+;; I32/I64 arms via the ray_norm_fn LIST loop (line 510).
+(at (norm (list (as 'I32 [3 4]))) 0)  -- 5.0   ;; L357
+(at (norm (list [3 4])) 0)            -- 5.0   ;; L358 ([3 4] is I64)
+
+;; ────────────── atom_to_i64: -RAY_I32 / -RAY_I16 atom branches ──────────────
+;; atom_to_i64 (lines 537-545) extracts an int atom into int64_t.
+;; The -RAY_I64 case is already exercised by every plain literal k.
+;; -RAY_I32 needs a 1i-style suffix; -RAY_I16 needs 1h-style.
+;; knn's k argument and hnsw-build's M / ef_c arguments all funnel
+;; through atom_to_i64.
+
+;; knn k as I32 atom (1i) → atom_to_i64 hits case -RAY_I32 (L541).
+(first (at (knn V [1.0 0.0 0.0] 1i 'l2) '_rowid)) -- 0
+(count (knn V [1.0 0.0 0.0] 3i)) -- 3
+
+;; knn k as I16 atom (1h) → atom_to_i64 hits case -RAY_I16 (L542).
+(first (at (knn V [1.0 0.0 0.0] 1h 'l2) '_rowid)) -- 0
+(count (knn V [1.0 0.0 0.0] 3h)) -- 3
+
+;; hnsw-build with M and ef_c as I16/I32 atoms also funnels through
+;; atom_to_i64, providing redundant coverage of the same branches.
+(set IdxI16 (hnsw-build V 'l2 8h 64h))   ;; M, ef_c both I16 → L542
+(at (hnsw-info IdxI16) 'M)   -- 8
+(at (hnsw-info IdxI16) 'efc) -- 64
+(hnsw-free IdxI16)
+
+(set IdxI32 (hnsw-build V 'l2 16i 128i)) ;; M, ef_c both I32 → L541
+(at (hnsw-info IdxI32) 'M)   -- 16
+(at (hnsw-info IdxI32) 'efc) -- 128
+
+;; ann ef_s as I32/I16 atom hits atom_to_i64 again.
+(count (ann IdxI32 [1.0 0.0 0.0] 2 50i)) -- 2   ;; ef_s I32 → L541
+(count (ann IdxI32 [1.0 0.0 0.0] 2 50h)) -- 2   ;; ef_s I16 → L542
+
+;; ann k as I32/I16 atom — same atom_to_i64 path.
+(count (ann IdxI32 [1.0 0.0 0.0] 2i)) -- 2
+(count (ann IdxI32 [1.0 0.0 0.0] 2h)) -- 2
+
+(hnsw-free IdxI32)
+
+;; ────────────── empty-list shortcut in ray_knn_fn ──────────────
+;; Lines 572-581: when the column is an empty list and the query is a
+;; zero-length numeric vector (so query->len == dim == 0), ray_knn_fn
+;; returns a 2-column table {_rowid: I64, _dist: F64} with both columns
+;; empty.  Reachable only via this combination.
+(count (knn (list) (as 'F64 []) 1))            -- 0
+(count (at (knn (list) (as 'F64 []) 1) '_rowid)) -- 0
+(count (at (knn (list) (as 'F64 []) 1) '_dist))  -- 0
+(type (at (knn (list) (as 'F64 []) 1) '_rowid)) -- 'I64
+(type (at (knn (list) (as 'F64 []) 1) '_dist))  -- 'F64
+
+;; Same shortcut still triggers when an explicit metric is passed.
+(count (knn (list) (as 'F64 []) 5 'l2))     -- 0
+(count (knn (list) (as 'F64 []) 5 'cosine)) -- 0
+(count (knn (list) (as 'F64 []) 5 'ip))     -- 0
 
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_embcov_idx /tmp/rfl_embcov_idx_*")
