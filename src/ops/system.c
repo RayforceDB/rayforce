@@ -25,6 +25,7 @@
 #include "lang/env.h"
 #include "lang/parse.h"
 #include "mem/heap.h"
+#include "mem/sys.h"
 #include "store/serde.h"
 #include "store/splay.h"
 #include "store/part.h"
@@ -369,8 +370,10 @@ ray_t* ray_os_list_fn(ray_t* x) {
     DIR* d = opendir(path);
     if (!d) return ray_error("io", "%s: %s", path, strerror(errno));
 
-    /* Collect names into a heap-allocated string array; capacity grows
-     * geometrically so big directories don't quadratic-realloc. */
+    /* Collect names into a sys-allocator string array; capacity grows
+     * geometrically so big directories don't quadratic-realloc.  Uses
+     * ray_sys_alloc/realloc/strdup/free (NOT libc) per project policy —
+     * mirrors the collect_part_dirs idiom in src/store/part.c. */
     char** names = NULL;
     int64_t count = 0;
     int64_t cap = 0;
@@ -381,16 +384,24 @@ ray_t* ray_os_list_fn(ray_t* x) {
             continue;
         if (count >= cap) {
             int64_t new_cap = cap == 0 ? 16 : cap * 2;
-            char** tmp = (char**)realloc(names, (size_t)new_cap * sizeof(char*));
-            if (!tmp) { closedir(d); for (int64_t i = 0; i < count; i++) free(names[i]); free(names); return ray_error("oom", NULL); }
+            char** tmp = (char**)ray_sys_realloc(names, (size_t)new_cap * sizeof(char*));
+            if (!tmp) {
+                closedir(d);
+                for (int64_t i = 0; i < count; i++) ray_sys_free(names[i]);
+                ray_sys_free(names);
+                return ray_error("oom", NULL);
+            }
             names = tmp;
             cap = new_cap;
         }
-        size_t nlen = strlen(ent->d_name) + 1;
-        names[count] = (char*)malloc(nlen);
-        if (!names[count]) { closedir(d); for (int64_t i = 0; i < count; i++) free(names[i]); free(names); return ray_error("oom", NULL); }
-        memcpy(names[count], ent->d_name, nlen);
-        count++;
+        char* dup = ray_sys_strdup(ent->d_name);
+        if (!dup) {
+            closedir(d);
+            for (int64_t i = 0; i < count; i++) ray_sys_free(names[i]);
+            ray_sys_free(names);
+            return ray_error("oom", NULL);
+        }
+        names[count++] = dup;
     }
     closedir(d);
 
@@ -398,17 +409,17 @@ ray_t* ray_os_list_fn(ray_t* x) {
 
     ray_t* result = ray_vec_new(RAY_SYM, count);
     if (!result || RAY_IS_ERR(result)) {
-        for (int64_t i = 0; i < count; i++) free(names[i]);
-        free(names);
+        for (int64_t i = 0; i < count; i++) ray_sys_free(names[i]);
+        ray_sys_free(names);
         return result ? result : ray_error("oom", NULL);
     }
     result->len = count;
     int64_t* out = (int64_t*)ray_data(result);
     for (int64_t i = 0; i < count; i++) {
         out[i] = ray_sym_intern(names[i], strlen(names[i]));
-        free(names[i]);
+        ray_sys_free(names[i]);
     }
-    free(names);
+    ray_sys_free(names);
     return result;
 }
 
