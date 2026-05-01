@@ -781,6 +781,16 @@ typedef struct {
     uint16_t off_min;
     uint16_t off_max;
     uint16_t off_sumsq;
+    /* Per-slot source-row bounds for FIRST/LAST under work-stealing
+     * dispatch (see ght_compute_layout).  Allocated only when any agg
+     * is OP_FIRST or OP_LAST; otherwise both stay 0.  Each block is
+     * n_agg_vals * 8 bytes of int64 (initialized in init_accum_from_entry
+     * to the source row index of the entry that opened the group, then
+     * monotonically updated by accum_from_entry).  The matching entry
+     * tail slot at offset (entry_stride - 8) carries the source-row
+     * index of the row the entry was built from. */
+    uint16_t off_first_row;
+    uint16_t off_last_row;
     /* Wide-key support: bit k set iff key k does not fit in 8 bytes
      * (e.g. RAY_GUID = 16 B).  For wide keys the 8-byte key slot
      * stores a source-row index and the actual key bytes live in the

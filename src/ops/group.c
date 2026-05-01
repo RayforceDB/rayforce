@@ -466,7 +466,13 @@ ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
      * row (bit k = key k is null). Folding this slot into hash/memcmp lets
      * null and 0 form distinct groups. */
     uint16_t key_region = (uint16_t)((uint16_t)n_keys * 8 + 8);
-    ly.entry_stride = (uint16_t)(8 + key_region + (uint16_t)nv * 8);
+    /* Entry layout: hash | keys | null_mask | agg_vals | [entry_row?]
+     * Tail entry_row slot is appended only when any agg is FIRST/LAST,
+     * carrying the source-row index needed to merge correctly under
+     * work-stealing dispatch (see radix_phase1_fn / accum_from_entry). */
+    bool has_first_last = (ly.agg_is_first | ly.agg_is_last) != 0;
+    uint16_t entry_tail = has_first_last ? (uint16_t)8 : (uint16_t)0;
+    ly.entry_stride = (uint16_t)(8 + key_region + (uint16_t)nv * 8 + entry_tail);
 
     uint16_t off = (uint16_t)(8 + key_region);
     uint16_t block = (uint16_t)nv * 8;
@@ -474,6 +480,12 @@ ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
     if (need_flags & GHT_NEED_MIN)   { ly.off_min   = off; off += block; }
     if (need_flags & GHT_NEED_MAX)   { ly.off_max   = off; off += block; }
     if (need_flags & GHT_NEED_SUMSQ) { ly.off_sumsq = off; off += block; }
+    /* Per-slot row-index bounds for FIRST/LAST.  Two int64 blocks of
+     * n_agg_vals slots each, allocated only when needed. */
+    if (has_first_last) {
+        ly.off_first_row = off; off += block;
+        ly.off_last_row  = off; off += block;
+    }
     ly.row_stride = off;
     return ly;
 }
@@ -605,6 +617,11 @@ static inline void init_accum_from_entry(char* row, const char* entry,
     const char* agg_data = entry + 8 + ((size_t)ly->n_keys + 1) * 8;
     uint8_t na = ly->n_aggs;
     uint8_t nf = ly->need_flags;
+    bool has_fl = (ly->agg_is_first | ly->agg_is_last) != 0;
+    /* Entry tail slot carries the source-row index when has_fl. */
+    int64_t entry_row = 0;
+    if (has_fl)
+        memcpy(&entry_row, entry + ly->entry_stride - 8, 8);
 
     for (uint8_t a = 0; a < na; a++) {
         int8_t s = ly->agg_val_slot[a];
@@ -625,6 +642,14 @@ static inline void init_accum_from_entry(char* row, const char* entry,
                 memcpy(row + ly->off_sumsq + s * 8, &sq, 8);
             }
         }
+        /* Seed per-slot row-index bounds with the row that opened this
+         * group.  Only writes the populated slots; unpopulated slot
+         * bytes stay zero from the memset above (harmless — those slots
+         * never participate in accum_from_entry's compare/update). */
+        if (has_fl) {
+            memcpy(row + ly->off_first_row + s * 8, &entry_row, 8);
+            memcpy(row + ly->off_last_row  + s * 8, &entry_row, 8);
+        }
     }
 }
 
@@ -638,6 +663,15 @@ static inline void accum_from_entry(char* row, const char* entry,
     const char* agg_data = entry + 8 + ((size_t)ly->n_keys + 1) * 8;
     uint8_t na = ly->n_aggs;
     uint8_t nf = ly->need_flags;
+    /* Entry's source-row index — only present when any agg is FIRST/LAST.
+     * Pool dispatch is work-stealing (atomic_fetch_add), so phase1 may
+     * scatter entries into radix bufs out of source-row order; reading
+     * the row index from the entry restores the absolute ordering that
+     * "keep init / always overwrite" assumed. */
+    bool has_fl = (ly->agg_is_first | ly->agg_is_last) != 0;
+    int64_t entry_row = 0;
+    if (has_fl)
+        memcpy(&entry_row, entry + ly->entry_stride - 8, 8);
 
     for (uint8_t a = 0; a < na; a++) {
         int8_t s = ly->agg_val_slot[a];
@@ -645,12 +679,21 @@ static inline void accum_from_entry(char* row, const char* entry,
         const char* val = agg_data + s * 8;
 
         uint8_t amask = (1u << a);
+        bool take_first = false, take_last = false;
+        if (has_fl && (ly->agg_is_first & amask)) {
+            int64_t fr; memcpy(&fr, row + ly->off_first_row + s * 8, 8);
+            take_first = (entry_row < fr);
+        }
+        if (has_fl && (ly->agg_is_last & amask)) {
+            int64_t lr; memcpy(&lr, row + ly->off_last_row + s * 8, 8);
+            take_last = (entry_row > lr);
+        }
         if (ly->agg_is_f64 & amask) {
             double v;
             memcpy(&v, val, 8);
             if (nf & GHT_NEED_SUM) {
-                if (ly->agg_is_first & amask) { /* keep init value */ }
-                else if (ly->agg_is_last & amask) { memcpy(row + ly->off_sum + s * 8, val, 8); }
+                if (ly->agg_is_first & amask) { if (take_first) memcpy(row + ly->off_sum + s * 8, val, 8); }
+                else if (ly->agg_is_last & amask) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else { ROW_WR_F64(row, ly->off_sum, s) += v; }
             }
             if (nf & GHT_NEED_MIN) { double* p = &ROW_WR_F64(row, ly->off_min, s); if (v < *p) *p = v; }
@@ -660,14 +703,18 @@ static inline void accum_from_entry(char* row, const char* entry,
             int64_t v;
             memcpy(&v, val, 8);
             if (nf & GHT_NEED_SUM) {
-                if (ly->agg_is_first & amask) { /* keep init value */ }
-                else if (ly->agg_is_last & amask) { memcpy(row + ly->off_sum + s * 8, val, 8); }
+                if (ly->agg_is_first & amask) { if (take_first) memcpy(row + ly->off_sum + s * 8, val, 8); }
+                else if (ly->agg_is_last & amask) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else { ROW_WR_I64(row, ly->off_sum, s) += v; }
             }
             if (nf & GHT_NEED_MIN) { int64_t* p = &ROW_WR_I64(row, ly->off_min, s); if (v < *p) *p = v; }
             if (nf & GHT_NEED_MAX) { int64_t* p = &ROW_WR_I64(row, ly->off_max, s); if (v > *p) *p = v; }
             if (nf & GHT_NEED_SUMSQ) { ROW_WR_F64(row, ly->off_sumsq, s) += (double)v * (double)v; }
         }
+        /* Commit row-index bounds after value writes so a later entry in
+         * the same merge sees the updated bound. */
+        if (take_first) memcpy(row + ly->off_first_row + s * 8, &entry_row, 8);
+        if (take_last)  memcpy(row + ly->off_last_row  + s * 8, &entry_row, 8);
     }
 }
 
@@ -756,10 +803,12 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
     uint8_t nk = ly->n_keys;
     uint8_t na = ly->n_aggs;
     uint8_t wide = ly->wide_key_mask;
+    bool has_fl = (ly->agg_is_first | ly->agg_is_last) != 0;
     uint32_t mask = ht->ht_cap - 1;
-    /* Stack buffer for one entry: hash + (nk+1) key slots + nv agg_vals.
-     * Max size: 8 + 9*8 + 8*8 = 144 bytes. */
-    char ebuf[8 + 9 * 8 + 8 * 8];
+    /* Stack buffer for one entry: hash + (nk+1) key slots + nv agg_vals
+     * + optional 8-byte source-row tail (FIRST/LAST).
+     * Max size: 8 + 9*8 + 8*8 + 8 = 152 bytes. */
+    char ebuf[8 + 9 * 8 + 8 * 8 + 8];
 
     /* Check which key columns can produce nulls (parent vec's HAS_NULLS
      * attr for slices) — skips per-row null checks on the fast path. */
@@ -827,6 +876,11 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
                 ev[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
             vi++;
         }
+        /* Tail slot: source row index for FIRST/LAST tie-breaking.  Same
+         * layout as the radix path's entries so accum_from_entry can read
+         * it from the same offset. */
+        if (has_fl)
+            memcpy(ebuf + ly->entry_stride - 8, &row, 8);
 
         mask = group_probe_entry(ht, ebuf, key_types, mask);
     }
@@ -860,7 +914,8 @@ typedef struct {
 static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
                                    uint64_t hash, const int64_t* keys, uint8_t n_keys,
                                    int64_t null_mask,
-                                   const int64_t* agg_vals, uint8_t n_agg_vals) {
+                                   const int64_t* agg_vals, uint8_t n_agg_vals,
+                                   bool has_first_last, int64_t row) {
     if (__builtin_expect(buf->count >= buf->cap, 0)) {
         uint32_t old_cap = buf->cap;
         uint32_t new_cap = old_cap * 2;
@@ -878,6 +933,9 @@ static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
     memcpy(dst + 8 + (size_t)n_keys * 8, &null_mask, 8);
     if (n_agg_vals)
         memcpy(dst + 8 + ((size_t)n_keys + 1) * 8, agg_vals, (size_t)n_agg_vals * 8);
+    /* Tail slot: source row index for FIRST/LAST tie-breaking. */
+    if (has_first_last)
+        memcpy(dst + entry_stride - 8, &row, 8);
     buf->count++;
 }
 
@@ -905,6 +963,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
     uint8_t nv = ly->n_agg_vals;
     uint8_t wide = ly->wide_key_mask;
     uint16_t estride = ly->entry_stride;
+    bool has_fl = (ly->agg_is_first | ly->agg_is_last) != 0;
     const int64_t* match_idx = c->match_idx;
 
     int64_t keys[8];
@@ -959,7 +1018,8 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         }
 
         uint32_t part = RADIX_PART(h);
-        radix_buf_push(&my_bufs[part], estride, h, keys, nk, null_mask, agg_vals, nv);
+        radix_buf_push(&my_bufs[part], estride, h, keys, nk, null_mask,
+                       agg_vals, nv, has_fl, row);
     }
 }
 
