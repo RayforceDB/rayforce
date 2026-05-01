@@ -290,13 +290,25 @@ ray_t* ray_syscmd_dispatch(const char* str, size_t len,
             return ray_error("domain", "unknown command");
         /* Shell fallback — pass the entire original string verbatim
          * so quoting/redirection survives.  Match .sys.exec semantics:
-         * return the host shell's exit code. */
-        char* cmd = (char*)malloc(len + 1);
-        if (!cmd) return ray_error("oom", NULL);
+         * return the host shell's exit code.
+         *
+         * Project policy: no libc malloc/free.  Use a stack buffer for
+         * the common short-command case; fall back to the internal
+         * allocator for anything larger. */
+        char  stackbuf[1024];
+        char* cmd;
+        ray_t* cmd_block = NULL;
+        if (len + 1 <= sizeof(stackbuf)) {
+            cmd = stackbuf;
+        } else {
+            cmd_block = ray_alloc(len + 1);
+            if (!cmd_block) return ray_error("oom", NULL);
+            cmd = (char*)ray_data(cmd_block);
+        }
         memcpy(cmd, str, len);
         cmd[len] = '\0';
         int rc = system(cmd);
-        free(cmd);
+        if (cmd_block) ray_free(cmd_block);
         return ray_i64(rc);
     }
 
