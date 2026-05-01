@@ -194,17 +194,17 @@
 
 ;; Two-way AND — both sides cheap (k vs const, s vs const).
 ;; k>3: rows k={4..10}; s='a' at k={1,3,5,7,9}; intersection at k={5,7,9}.
-;; PARKED-bug: (count (select {from: Tcost where: (and (> k 3) (== s 'a))}))
+(count (select {from: Tcost where: (and (> k 3) (== s 'a))}))
 ;; Three-way AND — must split into chain of 3 filters.  collect_filter_chain
 ;; walks at most 64 nodes; reorder by cost.  Result is order-invariant.
-;; PARKED-bug: (count (select {from: Tcost where: (and (> k 2) (== s 'a) (< v 80))}))
+(count (select {from: Tcost where: (and (> k 2) (== s 'a) (< v 80))}))
 ;; Four-way AND — variadic balanced tree → split into 4 filters → reorder.
-;; PARKED-bug: (count (select {from: Tcost where: (and (> k 1) (< k 10) (== s 'a) (== b true))}))
+(count (select {from: Tcost where: (and (> k 1) (< k 10) (== s 'a) (== b true))}))
 ;; Nested AND(AND(...)) — opt.c:1471-1493 iterates split_iter up to 16.
 ;; Hand-built nested form via the 2-arg `and` resolver.
-;; PARKED-bug: (count (select {from: Tcost where: (and (and (> k 2) (< k 8)) (== s 'a))}))
+(count (select {from: Tcost where: (and (and (> k 2) (< k 8)) (== s 'a))}))
 ;; Order swap — must yield same count (cost-reorder canonicalizes)
-;; PARKED-bug: (count (select {from: Tcost where: (and (== s 'a) (> k 2) (< k 8))}))
+(count (select {from: Tcost where: (and (== s 'a) (> k 2) (< k 8))}))
 
 ;; LIKE in WHERE — filter_cost(opt.c:1404) charges +4 for OP_LIKE/ILIKE,
 ;; making it the most expensive predicate; reorder must put LIKE last.
@@ -212,13 +212,13 @@
 ;; STR column literal uses `(list "..." "...")` — the vec-literal `["..."]`
 ;; form doesn't accept STR atoms (per parse rules).
 (set Tlike (table [name flag] (list (list "alpha" "alphabet" "beta" "alpha2" "gamma") [true false true false true])))
-;; PARKED-bug: (count (select {from: Tlike where: (and (like name "alpha*") (== flag true))}))
-;; PARKED-bug: (count (select {from: Tlike where: (and (== flag true) (like name "alpha*"))}))
+(count (select {from: Tlike where: (and (like name "alpha*") (== flag true))}))
+(count (select {from: Tlike where: (and (== flag true) (like name "alpha*"))}))
 
 ;; Mixed I32 / I64 / F64 / SYM column predicates — every type bucket
 ;; in filter_cost (opt.c:1392-1397) gets cost-summed; reorder must be
 ;; stable equal-cost order.
-;; PARKED-bug: (count (select {from: Tcost where: (and (> i32c 2) (> v 30) (> f 4.5) (== s 'a))}))
+(count (select {from: Tcost where: (and (> i32c 2) (> v 30) (> f 4.5) (== s 'a))}))
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 6. Predicate pushdown across SELECT/ALIAS — opt.c:1304-1372
@@ -334,18 +334,18 @@
 (count (select {from: T where: (> (+ 100 50) (* 2 1))})) -- 10
 (count (select {from: T where: (== (+ 1 1) 2)})) -- 10
 (count (select {from: T where: (== (+ 1 1) 3)})) -- 0
-;; PARKED-bug: (count (select {from: T where: (and (== (+ 1 1) 2) (== (* 3 4) 12))}))
-;; PARKED-bug: (count (select {from: T where: (or (== (+ 1 1) 99) (== (* 3 4) 12))}))
+(count (select {from: T where: (and (== (+ 1 1) 2) (== (* 3 4) 12))})) -- 10
+(count (select {from: T where: (or (== (+ 1 1) 99) (== (* 3 4) 12))})) -- 10
 ;; Cascade with column predicate
-;; PARKED-bug: (count (select {from: T where: (and (> a 0) (== (+ 1 1) 2))}))
-;; PARKED-bug: (count (select {from: T where: (and (> a 5) (== (+ 1 1) 2))}))
-;; PARKED-bug: (count (select {from: T where: (and (> a 0) (== (+ 1 1) 3))}))
+(count (select {from: T where: (and (> a 0) (== (+ 1 1) 2))})) -- 10
+(count (select {from: T where: (and (> a 5) (== (+ 1 1) 2))})) -- 5
+(count (select {from: T where: (and (> a 0) (== (+ 1 1) 3))})) -- 0
 
 ;; Unary const cascade inside WHERE
-;; PARKED-bug: (count (select {from: T where: (and (> a 0) (not false))}))
-;; PARKED-bug: (count (select {from: T where: (and (> a 0) (not true))}))
-;; PARKED-bug: (count (select {from: T where: (and (> a 0) (== (neg 5) -5))}))
-;; PARKED-bug: (count (select {from: T where: (and (> a 0) (== (abs -7) 7))}))
+(count (select {from: T where: (and (> a 0) (not false))})) -- 10
+(count (select {from: T where: (and (> a 0) (not true))})) -- 0
+(count (select {from: T where: (and (> a 0) (== (neg 5) -5))}))
+(count (select {from: T where: (and (> a 0) (== (abs -7) 7))}))
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 10. Fusion: HEAD-of-FILTER, HEAD-of-SORT, HEAD-of-GROUP — opt.c invokes
@@ -439,15 +439,15 @@
 ;; Empty table — pass_constant_fold + DCE on a 0-row scan
 (set Te (table [a b] (list (as 'I64 []) (as 'I64 []))))
 (count (select {from: Te where: (> a 0)})) -- 0
-;; PARKED-bug: (count (select {from: Te where: (and (> a 0) (== 1 1))}))
-;; PARKED-bug: (count (select {from: Te where: (and (> a 0) (== 1 2))}))
+(count (select {from: Te where: (and (> a 0) (== 1 1))}))
+(count (select {from: Te where: (and (> a 0) (== 1 2))}))
 
 ;; Single-row table — opt visits one OP_SCAN
 (set T1 (table [a b] (list [42] [100])))
 (count (select {from: T1 where: (> a 0)})) -- 1
 (first (at (select {x: (* a 2) from: T1}) 'x)) -- 84
-;; PARKED-bug: (count (select {from: T1 where: (and (> a 0) (== 1 1))}))
-;; PARKED-bug: (count (select {from: T1 where: (and (> a 0) (== 1 2))}))
+(count (select {from: T1 where: (and (> a 0) (== 1 1))}))
+(count (select {from: T1 where: (and (> a 0) (== 1 2))}))
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 15. Constant predicate via fold cascade — verify fold_filter_const_predicate
@@ -455,9 +455,9 @@
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; (and (== 1 1) (== 1 2)) → bool false → fold_filter_const_predicate
 ;; rewrites FILTER to OP_HEAD with arity=1, est_rows=0.
-;; PARKED-bug: (count (select {from: T where: (and (== 1 1) (== 1 2))}))
+(count (select {from: T where: (and (== 1 1) (== 1 2))}))
 ;; (or (== 1 2) (== 'a 'b)) → bool false (sym EQ folded then OR folded)
-;; PARKED-bug: (count (select {from: T where: (or (== 1 2) (== 'a 'b))}))
+(count (select {from: T where: (or (== 1 2) (== 'a 'b))}))
 ;; All-false via comparison cascade
 (count (select {from: T where: (< 5 5)})) -- 0
 (count (select {from: T where: (> 5 5)})) -- 0

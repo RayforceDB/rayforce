@@ -497,6 +497,67 @@ static bool atom_to_bool(ray_t* v, bool* out) {
     return true;
 }
 
+/* Try to read an atom-bool value from a CONST node.  Returns false if the
+   node is not a const, has no atom literal, or isn't bool-coercible. */
+static bool const_node_bool(ray_graph_t* g, ray_op_t* n, bool* out) {
+    if (!is_const(n)) return false;
+    ray_op_ext_t* ext = find_ext(g, n->id);
+    if (!ext || !ext->literal || !ray_is_atom(ext->literal)) return false;
+    return atom_to_bool(ext->literal, out);
+}
+
+/* Partial fold for (and X c) / (or X c) where exactly one operand is a
+   constant scalar bool.  Without this, executing AND/OR with mismatched
+   vector + scalar shapes errors with "length".  Identities applied:
+       (and X true)  = X         (and X false) = false
+       (or  X true)  = true      (or  X false) = X
+   Two-const cases are already handled by fold_binary_const. */
+static bool simplify_and_or_const(ray_graph_t* g, ray_op_t* node) {
+    if (node->opcode != OP_AND && node->opcode != OP_OR) return false;
+    if (node->arity != 2) return false;
+    ray_op_t* lhs = node->inputs[0];
+    ray_op_t* rhs = node->inputs[1];
+    if (!lhs || !rhs) return false;
+
+    bool lhs_b = false, rhs_b = false;
+    bool lhs_const = const_node_bool(g, lhs, &lhs_b);
+    bool rhs_const = const_node_bool(g, rhs, &rhs_b);
+    if (lhs_const == rhs_const) return false;  /* both-const handled elsewhere; neither: nothing to do */
+
+    bool c_val   = lhs_const ? lhs_b : rhs_b;
+    ray_op_t* X  = lhs_const ? rhs : lhs;
+
+    bool is_and = node->opcode == OP_AND;
+    /* Identity arm: AND-with-true / OR-with-false → reduces to X */
+    bool identity = is_and ? c_val : !c_val;
+
+    if (identity) {
+        /* Replace AND/OR node in-place with an OP_ALIAS of the non-const arm. */
+        if (find_ext(g, node->id)) return false;  /* shouldn't happen for AND/OR */
+        node->opcode = OP_ALIAS;
+        node->arity = 1;
+        node->inputs[0] = X;
+        node->inputs[1] = NULL;
+        node->out_type = RAY_BOOL;
+        node->est_rows = X->est_rows;
+        node->flags &= (uint8_t)~OP_FLAG_FUSED;
+        g->nodes[node->id] = *node;
+        return true;
+    }
+
+    /* Dominant arm: AND-with-false → false; OR-with-true → true. */
+    ray_t* lit = ray_bool(is_and ? false : true);
+    if (!lit || RAY_IS_ERR(lit)) {
+        if (lit) ray_release(lit);
+        return false;
+    }
+    if (!replace_with_const(g, node, lit)) {
+        ray_release(lit);
+        return false;
+    }
+    return true;
+}
+
 static bool fold_filter_const_predicate(ray_graph_t* g, ray_op_t* node) {
     if (node->opcode != OP_FILTER || node->arity != 2) return false;
     ray_op_t* pred = node->inputs[1];
@@ -541,6 +602,10 @@ static void fold_node(ray_graph_t* g, ray_op_t* node) {
     if (node->arity == 2 && node->opcode >= OP_ADD && node->opcode <= OP_MAX2) {
         (void)fold_binary_const(g, node);
     }
+    /* Partial-fold AND/OR when one operand is a const scalar bool.  Must run
+       before fold_filter_const_predicate so the FILTER pass sees the simpler
+       form (and can finish the job if both arms collapsed to const). */
+    (void)simplify_and_or_const(g, node);
     /* FILTER with constant predicate can be reduced to pass-through/empty. */
     (void)fold_filter_const_predicate(g, node);
 }
