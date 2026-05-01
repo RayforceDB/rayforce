@@ -277,6 +277,100 @@ static test_result_t test_optimizer_constant_fold(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: optimizer constant-folds DATE/TIME/I32 atom arithmetic
+ *
+ * Pre-fix: ray_const_atom stored out_type as the negative atom-tag
+ * (-RAY_DATE etc.), so fold_binary_const's `case RAY_I32: case RAY_DATE:
+ * case RAY_TIME:` arm never fired — promote(-RAY_DATE, -RAY_DATE) returned
+ * the unknown rung (RAY_BOOL), routing arithmetic through the BOOL arm
+ * which has no OP_SUB handler.  Post-fix: ray_const_atom normalises to
+ * the positive type tag, matching ray_const_i64 / _f64 / _bool, so
+ * fold_binary_const's I32/DATE/TIME arm fires and replaces the binary
+ * op with an OP_CONST literal.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_optimizer_fold_atom_arith(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* DATE - DATE → I32 (days difference).  2026.05.05 - 2026.05.01 = 4. */
+    ray_graph_t* g = ray_graph_new(NULL);
+    TEST_ASSERT_NOT_NULL(g);
+    /* Date epoch = 2000.01.01.  2026.05.05 = 9621 days, 2026.05.01 = 9617. */
+    ray_t* d1 = ray_date(9621);
+    ray_t* d2 = ray_date(9617);
+    ray_op_t* c1 = ray_const_atom(g, d1);
+    ray_op_t* c2 = ray_const_atom(g, d2);
+    /* Release the atoms — ray_const_atom retained them. */
+    ray_release(d1);
+    ray_release(d2);
+    ray_op_t* sub = ray_sub(g, c1, c2);
+    TEST_ASSERT_NOT_NULL(sub);
+    TEST_ASSERT_EQ_I(sub->opcode, OP_SUB);
+
+    ray_op_t* opt = ray_optimize(g, sub);
+    TEST_ASSERT_NOT_NULL(opt);
+    /* The fold must have fired — node rewritten to OP_CONST. */
+    TEST_ASSERT_EQ_I(opt->opcode, OP_CONST);
+
+    ray_t* out = ray_execute(g, opt);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->type, -RAY_I32);
+    TEST_ASSERT_EQ_I(out->i32, 4);
+    ray_release(out);
+    ray_graph_free(g);
+
+    /* I32 + I32 → I32. */
+    g = ray_graph_new(NULL);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_t* i1 = ray_i32(5);
+    ray_t* i2 = ray_i32(7);
+    ray_op_t* ci1 = ray_const_atom(g, i1);
+    ray_op_t* ci2 = ray_const_atom(g, i2);
+    ray_release(i1);
+    ray_release(i2);
+    ray_op_t* add = ray_add(g, ci1, ci2);
+    ray_op_t* opt_i32 = ray_optimize(g, add);
+    TEST_ASSERT_NOT_NULL(opt_i32);
+    TEST_ASSERT_EQ_I(opt_i32->opcode, OP_CONST);
+
+    ray_t* out_i32 = ray_execute(g, opt_i32);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out_i32));
+    TEST_ASSERT_EQ_I(out_i32->type, -RAY_I32);
+    TEST_ASSERT_EQ_I(out_i32->i32, 12);
+    ray_release(out_i32);
+    ray_graph_free(g);
+
+    /* TIME - TIME → I32 (delta in milliseconds).  ray_time stores ms since
+     * midnight; 11:00 - 09:00 = 7200000 ms. */
+    g = ray_graph_new(NULL);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_t* t1 = ray_time(11LL * 3600 * 1000);
+    ray_t* t2 = ray_time(9LL * 3600 * 1000);
+    ray_op_t* ct1 = ray_const_atom(g, t1);
+    ray_op_t* ct2 = ray_const_atom(g, t2);
+    ray_release(t1);
+    ray_release(t2);
+    ray_op_t* tsub = ray_sub(g, ct1, ct2);
+    ray_op_t* opt_t = ray_optimize(g, tsub);
+    TEST_ASSERT_NOT_NULL(opt_t);
+    TEST_ASSERT_EQ_I(opt_t->opcode, OP_CONST);
+
+    ray_t* out_t = ray_execute(g, opt_t);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out_t));
+    /* TIME - TIME folds via the I32/DATE/TIME arm → I32 atom carrying the
+     * raw 32-bit difference of the millisecond payloads. */
+    TEST_ASSERT_EQ_I(out_t->type, -RAY_I32);
+    TEST_ASSERT_EQ_I(out_t->i32, 7200000);
+    ray_release(out_t);
+    ray_graph_free(g);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test: optimizer simplifies FILTER with constant predicates
  * -------------------------------------------------------------------------- */
 
@@ -524,6 +618,7 @@ const test_entry_t graph_entries[] = {
     { "graph/arithmetic", test_arithmetic, NULL, NULL },
     { "graph/group_sum", test_group_sum, NULL, NULL },
     { "graph/opt_fold", test_optimizer_constant_fold, NULL, NULL },
+    { "graph/opt_fold_atom_arith", test_optimizer_fold_atom_arith, NULL, NULL },
     { "graph/opt_filter_const", test_optimizer_filter_const_predicate, NULL, NULL },
     { "graph/group_affine_agg", test_group_affine_agg_input, NULL, NULL },
     { NULL, NULL, NULL, NULL },

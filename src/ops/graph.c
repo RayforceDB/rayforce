@@ -382,10 +382,14 @@ ray_op_t* ray_const_atom(ray_graph_t* g, ray_t* atom) {
 
     ext->base.opcode = OP_CONST;
     ext->base.arity = 0;
-    /* Atom types are stored negated (-RAY_I64 etc); the executor
-     * does not rely on out_type for OP_CONST dispatch, but we keep
-     * it consistent with the source atom. */
-    ext->base.out_type = atom->type;
+    /* Atom types are stored negated (-RAY_I64 etc); normalise to the
+     * positive type tag so downstream passes (promote(), fold_binary_const's
+     * out_type switch) see the same values used by ray_const_i64 /
+     * ray_const_f64 / ray_const_bool / ray_const_vec.  Without this, the
+     * I32/DATE/TIME arm of fold_binary_const (opt.c:454) is dead for any
+     * atom-typed const built via this constructor (e.g. DATE/TIME literals
+     * from rfl). */
+    ext->base.out_type = atom->type < 0 ? (int8_t)(-(int)atom->type) : atom->type;
     ext->base.est_rows = 1;
     ext->literal = atom;
     ray_retain(atom);

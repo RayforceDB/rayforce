@@ -127,6 +127,42 @@
 ;; should fold (and X true)→X / (and X false)→false / (or X true)→true /
 ;; (or X false)→X before exec_filter sees the AND.
 
+;; ── RAY_I32 / RAY_DATE / RAY_TIME case (opt.c:454-473) ──
+;; Pre-fix this arm was dead from rfl: ray_const_atom (graph.c:379) stored
+;; out_type as the negative atom-tag, so node->out_type for a compiled
+;; DATE/TIME/I32 const was -RAY_DATE / -RAY_TIME / -RAY_I32, never the
+;; positive value the switch in fold_binary_const expects.  Fix in
+;; ray_const_atom normalises out_type to the positive type tag, matching
+;; the precedent in ray_const_i64 / _f64 / _bool.
+
+;; Top-level oracles — eval path (already covered by temporal/date.rfl and
+;; arith/sub.rfl, repeated here for adjacency to the fold-side tests).
+(- 2026.05.05 2026.05.01) -- 4
+(- 2024.03.01 2024.02.01) -- 29
+(+ 2026.05.01 7) -- 2026.05.08
+(- 2026.05.05 2)  -- 2026.05.03
+(- 5i 3i) -- 2i
+(+ 5i 3i) -- 8i
+(* 5i 6i) -- 30i
+
+;; Fold path — same expressions threaded through ray_optimize →
+;; pass_constant_fold → fold_binary_const inside a WHERE clause.  Pre-fix,
+;; promote(-RAY_DATE, -RAY_DATE) returned RAY_BOOL (the unknown rung) and
+;; the I32/DATE/TIME arm never fired.  After the normalisation in
+;; ray_const_atom, promote sees positive RAY_DATE on both sides and routes
+;; to RAY_I32 (date diff), which the fold arm consumes.  The fold produces
+;; an I32 const which is then compared to another const → bool fold →
+;; fold_filter_const_predicate → MATERIALIZE / HEAD.
+(set Tdt (table [a] (list [1 2 3])))
+;; date - date folds to 4 (i32 days), then == 4 folds to true → all rows pass.
+(count (select {from: Tdt where: (== (- 2026.05.05 2026.05.01) 4)})) -- 3
+(count (select {from: Tdt where: (== (- 2024.03.01 2024.02.01) 29)})) -- 3
+(count (select {from: Tdt where: (== (- 2026.05.05 2026.05.01) 5)})) -- 0
+;; I32 atom arithmetic — 5i*6i folds to 30i, then == 30 folds to true.
+(count (select {from: Tdt where: (== (* 5i 6i) 30i)})) -- 3
+(count (select {from: Tdt where: (== (+ 5i 3i) 8i)})) -- 3
+(count (select {from: Tdt where: (== (- 5i 3i) 2i)})) -- 3
+
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 3. fold_reduction_til — opt.c:535-561
 ;; Closed-form reduction over OP_TIL(n).  Inner select wraps `(til n)`

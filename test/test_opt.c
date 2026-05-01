@@ -26,6 +26,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "ops/ops.h"
+#include "store/csr.h"
 #include <string.h>
 
 /* Helper: create a test table with columns id1(I64), v1(I64), v3(F64) */
@@ -734,6 +735,374 @@ static test_result_t test_partition_pruning_not_in(void) {
     PASS();
 }
 
+/*
+ * Test: OP_WINDOW DCE & projection-pushdown walk.
+ *
+ * Build: SCAN(grp), SCAN(val) -> WINDOW(part=[grp], order=[val], func=ROW_NUMBER(val))
+ * Run ray_optimize.  This forces projection_pushdown's BFS, mark_live's
+ * DCE walk, and pass_type_inference to walk through ext->window.{part_keys,
+ * order_keys, func_inputs}.  Verify all three columns survived (none
+ * marked OP_FLAG_DEAD).
+ */
+static test_result_t test_opt_window_dce(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 6;
+    int64_t grp_data[] = {1, 1, 1, 2, 2, 2};
+    int64_t val_data[] = {10, 20, 30, 40, 50, 60};
+    ray_t* grp_v = ray_vec_from_raw(RAY_I64, grp_data, n);
+    ray_t* val_v = ray_vec_from_raw(RAY_I64, val_data, n);
+    int64_t n_grp = ray_sym_intern("grp", 3);
+    int64_t n_val = ray_sym_intern("val", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, n_grp, grp_v);
+    tbl = ray_table_add_col(tbl, n_val, val_v);
+    ray_release(grp_v);
+    ray_release(val_v);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* grp_op = ray_scan(g, "grp");
+    ray_op_t* val_op = ray_scan(g, "val");
+
+    ray_op_t* parts[] = { grp_op };
+    ray_op_t* orders[] = { val_op };
+    uint8_t order_descs[] = { 0 };
+    uint8_t func_kinds[] = { RAY_WIN_ROW_NUMBER };
+    ray_op_t* func_inputs[] = { val_op };
+    int64_t func_params[] = { 0 };
+    ray_op_t* win = ray_window_op(g, tbl_op,
+                                  parts, 1,
+                                  orders, order_descs, 1,
+                                  func_kinds, func_inputs, func_params, 1,
+                                  RAY_FRAME_ROWS,
+                                  RAY_BOUND_UNBOUNDED_PRECEDING,
+                                  RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                  0, 0);
+    TEST_ASSERT_NOT_NULL(win);
+
+    uint32_t grp_id = grp_op->id;
+    uint32_t val_id = val_op->id;
+
+    ray_op_t* opt = ray_optimize(g, win);
+    TEST_ASSERT_NOT_NULL(opt);
+    TEST_ASSERT_EQ_I(opt->opcode, OP_WINDOW);
+
+    /* Both scans referenced through window's ext (part_keys, order_keys,
+     * func_inputs) must survive DCE/projection-pushdown. */
+    TEST_ASSERT_FALSE(g->nodes[grp_id].flags & OP_FLAG_DEAD);
+    TEST_ASSERT_FALSE(g->nodes[val_id].flags & OP_FLAG_DEAD);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: predicate pushdown past OP_EXPAND.
+ *
+ * Build: FILTER(EXPAND(SCAN_const_vec, rel), pred(SCAN_pred_const))
+ * The predicate references a CONST scan in the source subtree, so the
+ * pushdown must rewrite into:
+ *      EXPAND(FILTER(SCAN_const_vec, pred), rel)
+ *
+ * Note: predicate must reference scans reachable from EXPAND's source
+ * input.  We use a const-only predicate that has NO scans (n_scans==0,
+ * which collect_pred_scans returns) -- no, we need n_scans > 0 for the
+ * pushdown to fire.  So we build a graph with a small table that has
+ * a column we can scan + a const compare.
+ */
+static test_result_t test_opt_pushdown_past_expand(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Build node table with a column 'flag' we can filter on. */
+    int64_t n = 4;
+    int64_t flag_data[] = {1, 0, 1, 0};
+    int64_t id_data[]   = {0, 1, 2, 3};
+    ray_t* flag_v = ray_vec_from_raw(RAY_I64, flag_data, n);
+    ray_t* id_v   = ray_vec_from_raw(RAY_I64, id_data, n);
+    int64_t s_flag = ray_sym_intern("flag", 4);
+    int64_t s_id   = ray_sym_intern("id", 2);
+    ray_t* node_tbl = ray_table_new(2);
+    node_tbl = ray_table_add_col(node_tbl, s_id, id_v);
+    node_tbl = ray_table_add_col(node_tbl, s_flag, flag_v);
+    ray_release(flag_v);
+    ray_release(id_v);
+
+    /* Edges: 0->1, 0->2, 1->3, 2->3 */
+    int64_t src_data[] = {0, 0, 1, 2};
+    int64_t dst_data[] = {1, 2, 3, 3};
+    ray_t* src_v = ray_vec_from_raw(RAY_I64, src_data, 4);
+    ray_t* dst_v = ray_vec_from_raw(RAY_I64, dst_data, 4);
+    int64_t s_src = ray_sym_intern("src", 3);
+    int64_t s_dst = ray_sym_intern("dst", 3);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, s_src, src_v);
+    edges = ray_table_add_col(edges, s_dst, dst_v);
+    ray_release(src_v);
+    ray_release(dst_v);
+
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, false);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(node_tbl);
+
+    /* Source: scan 'flag' (so the predicate's scan is reachable from
+     * EXPAND's source subtree).  Predicate: flag = 1. */
+    ray_op_t* flag_scan = ray_scan(g, "flag");
+    ray_op_t* c1   = ray_const_i64(g, 1);
+    ray_op_t* pred = ray_eq(g, flag_scan, c1);
+
+    ray_op_t* expand = ray_expand(g, flag_scan, rel, 0);
+    TEST_ASSERT_NOT_NULL(expand);
+    uint32_t expand_id = expand->id;
+
+    ray_op_t* filt = ray_filter(g, expand, pred);
+    TEST_ASSERT_NOT_NULL(filt);
+
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    /* After pushdown, root is the EXPAND (filter pushed below it). */
+    TEST_ASSERT_EQ_U(opt->id, expand_id);
+    TEST_ASSERT_EQ_I(opt->opcode, OP_EXPAND);
+    /* EXPAND.inputs[0] should now be a FILTER node (the pushed filter). */
+    TEST_ASSERT_NOT_NULL(opt->inputs[0]);
+    TEST_ASSERT_EQ_I(opt->inputs[0]->opcode, OP_FILTER);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(node_tbl);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: predicate-pushdown past EXPAND must NOT fire when the predicate
+ * references a scan that is NOT in the EXPAND's source subtree.
+ *
+ * We can't easily build this in C without a multi-table graph, but we can
+ * still exercise collect_pred_scans's truncation/unknown path by
+ * building a predicate with multiple chained scans where the source is a
+ * const-vec (not a scan).  In that case is_reachable_from will return
+ * false for the predicate's scan, all_source becomes false, and pushdown
+ * is skipped.  This still walks collect_pred_scans + is_reachable_from.
+ */
+static test_result_t test_opt_pushdown_expand_blocked(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t flag_data[] = {1, 0, 1, 0};
+    int64_t id_data[]   = {0, 1, 2, 3};
+    ray_t* flag_v = ray_vec_from_raw(RAY_I64, flag_data, n);
+    ray_t* id_v   = ray_vec_from_raw(RAY_I64, id_data, n);
+    int64_t s_flag = ray_sym_intern("flag", 4);
+    int64_t s_id   = ray_sym_intern("id", 2);
+    ray_t* node_tbl = ray_table_new(2);
+    node_tbl = ray_table_add_col(node_tbl, s_id, id_v);
+    node_tbl = ray_table_add_col(node_tbl, s_flag, flag_v);
+    ray_release(flag_v);
+    ray_release(id_v);
+
+    int64_t src_data[] = {0, 1, 2};
+    int64_t dst_data[] = {1, 2, 3};
+    ray_t* src_v = ray_vec_from_raw(RAY_I64, src_data, 3);
+    ray_t* dst_v = ray_vec_from_raw(RAY_I64, dst_data, 3);
+    int64_t s_src = ray_sym_intern("src", 3);
+    int64_t s_dst = ray_sym_intern("dst", 3);
+    ray_t* edges = ray_table_new(2);
+    edges = ray_table_add_col(edges, s_src, src_v);
+    edges = ray_table_add_col(edges, s_dst, dst_v);
+    ray_release(src_v);
+    ray_release(dst_v);
+
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, false);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    ray_graph_t* g = ray_graph_new(node_tbl);
+
+    /* EXPAND's source is a const vec literal — has no SCAN.
+     * Predicate references a SCAN, which is NOT in source subtree.
+     * Pushdown must skip; we just verify it doesn't crash and
+     * the filter remains above the expand. */
+    int64_t start_data[] = {0, 1};
+    ray_t* start_vec = ray_vec_from_raw(RAY_I64, start_data, 2);
+    ray_op_t* src = ray_const_vec(g, start_vec);
+    ray_release(start_vec);
+
+    ray_op_t* expand = ray_expand(g, src, rel, 0);
+    TEST_ASSERT_NOT_NULL(expand);
+    uint32_t expand_id = expand->id;
+
+    /* Predicate: flag = 1 — its SCAN is NOT in the expand source subtree. */
+    ray_op_t* flag_scan = ray_scan(g, "flag");
+    ray_op_t* c1 = ray_const_i64(g, 1);
+    ray_op_t* pred = ray_eq(g, flag_scan, c1);
+
+    ray_op_t* filt = ray_filter(g, expand, pred);
+    uint32_t filt_id = filt->id;
+
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+    /* Pushdown blocked: filter remains the root, expand stays below. */
+    TEST_ASSERT_EQ_U(opt->id, filt_id);
+    TEST_ASSERT_EQ_I(opt->opcode, OP_FILTER);
+    TEST_ASSERT_EQ_U(opt->inputs[0]->id, expand_id);
+
+    ray_graph_free(g);
+    ray_rel_free(rel);
+    ray_release(node_tbl);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/*
+ * Test: graph_alloc_node_opt realloc fix-up.
+ *
+ * Build a graph with > GRAPH_INIT_CAP (4096) nodes, then add one
+ * filter with an AND predicate.  When the optimizer's split_and_filter
+ * pass calls graph_alloc_node_opt to allocate the new outer-filter
+ * node, the array is at capacity and must realloc + fix up all stored
+ * input pointers.
+ *
+ * We pad the graph by allocating many ray_const_i64 nodes (cheap, each
+ * adds one node) until we're just shy of cap, then build the AND filter
+ * on top.  The split must produce the correct structure after realloc.
+ *
+ * We also include OP_GROUP / OP_SELECT / OP_SORT / OP_WINDOW nodes
+ * (with structural ext->keys/columns/part_keys pointers) to exercise
+ * the per-opcode fix-up branches in graph_alloc_node_opt.  Those nodes
+ * are not in the optimized root's live subgraph, so DCE will mark
+ * them dead — but the realloc fix-up still walks them.
+ */
+static test_result_t test_opt_realloc_during_split(void) {
+    ray_heap_init();
+
+    ray_t* tbl = make_test_table();
+    ray_graph_t* g = ray_graph_new(tbl);
+
+    /* Build the predicate FIRST, before we cause a realloc — we want
+     * stored input pointers across the AND/EQ predicate so the fix-up
+     * has something to relocate. */
+    ray_op_t* v1   = ray_scan(g, "v1");
+    ray_op_t* id1  = ray_scan(g, "id1");
+    ray_op_t* v3   = ray_scan(g, "v3");
+    ray_op_t* c1   = ray_const_i64(g, 1);
+    ray_op_t* c5   = ray_const_f64(g, 5.0);
+    ray_op_t* eq   = ray_eq(g, id1, c1);
+    ray_op_t* gt   = ray_gt(g, v3, c5);
+    ray_op_t* combined = ray_and(g, eq, gt);
+    ray_op_t* filt = ray_filter(g, v1, combined);
+    uint32_t filt_id = filt->id;
+    uint32_t eq_id   = eq->id;
+    uint32_t gt_id   = gt->id;
+
+    /* Build extra structural ops to exercise the per-opcode fix-up
+     * branches in graph_alloc_node_opt.  These are NOT in the live
+     * subgraph reachable from filt — DCE will mark them dead — but
+     * they exist in g->ext_nodes when realloc fires. */
+    {
+        /* OP_GROUP with key + agg input */
+        ray_op_t* key = ray_scan(g, "id1");
+        ray_op_t* val = ray_scan(g, "v1");
+        ray_op_t* keys[] = { key };
+        uint16_t agg_ops[] = { OP_SUM };
+        ray_op_t* agg_ins[] = { val };
+        (void)ray_group(g, keys, 1, agg_ops, agg_ins, 1);
+
+        /* OP_SELECT with column array */
+        ray_op_t* sel_v1 = ray_scan(g, "v1");
+        ray_op_t* sel_id1 = ray_scan(g, "id1");
+        ray_op_t* sel_cols[] = { sel_v1, sel_id1 };
+        (void)ray_select(g, sel_v1, sel_cols, 2);
+
+        /* OP_WINDOW with part/order/func keys */
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* w_grp = ray_scan(g, "id1");
+        ray_op_t* w_val = ray_scan(g, "v1");
+        ray_op_t* w_parts[] = { w_grp };
+        ray_op_t* w_orders[] = { w_val };
+        uint8_t w_descs[] = { 0 };
+        uint8_t w_kinds[] = { RAY_WIN_ROW_NUMBER };
+        ray_op_t* w_ins[] = { w_val };
+        int64_t w_params[] = { 0 };
+        (void)ray_window_op(g, tbl_op,
+                            w_parts, 1,
+                            w_orders, w_descs, 1,
+                            w_kinds, w_ins, w_params, 1,
+                            RAY_FRAME_ROWS,
+                            RAY_BOUND_UNBOUNDED_PRECEDING,
+                            RAY_BOUND_UNBOUNDED_FOLLOWING,
+                            0, 0);
+    }
+
+    /* Now pad the graph until we're at exactly node_cap, so the very
+     * next allocation (split_and_filter's outer node) forces a realloc. */
+    while (g->node_count < g->node_cap) {
+        (void)ray_const_i64(g, 0);
+    }
+    /* node_count == node_cap now — next allocation will realloc */
+    TEST_ASSERT_EQ_U(g->node_count, g->node_cap);
+
+    uint32_t cap_before = g->node_cap;
+
+    ray_op_t* opt = ray_optimize(g, filt);
+    TEST_ASSERT_NOT_NULL(opt);
+
+    /* After AND-split, the original FILTER node (filt_id) should have
+     * one of the predicates (eq or gt), and a NEW outer FILTER (id ==
+     * old node_count == cap_before) wraps it with the other predicate. */
+    TEST_ASSERT_TRUE(g->node_cap > cap_before);  /* realloc fired */
+
+    /* Walk from new root: must be FILTER -> FILTER -> SCAN(v1) chain,
+     * with predicates pointing at eq and gt (post-fix-up). */
+    TEST_ASSERT_EQ_I(opt->opcode, OP_FILTER);
+    TEST_ASSERT_NOT_NULL(opt->inputs[0]);
+    TEST_ASSERT_EQ_I(opt->inputs[0]->opcode, OP_FILTER);
+
+    /* After AND-split + reorder, the inner predicate is the cheaper
+     * (eq on i64) and outer predicate is gt on f64 — but here we just
+     * need the predicates to point to valid live nodes (no use-after-
+     * realloc).  Both pred nodes' IDs must still resolve to live ops. */
+    ray_op_t* outer_pred = opt->inputs[1];
+    ray_op_t* inner = opt->inputs[0];
+    ray_op_t* inner_pred = inner->inputs[1];
+    TEST_ASSERT_NOT_NULL(outer_pred);
+    TEST_ASSERT_NOT_NULL(inner_pred);
+    TEST_ASSERT_TRUE(outer_pred->id == eq_id || outer_pred->id == gt_id);
+    TEST_ASSERT_TRUE(inner_pred->id == eq_id || inner_pred->id == gt_id);
+    TEST_ASSERT_TRUE(outer_pred->id != inner_pred->id);
+    /* Pointer correctness: the resolved nodes should match g->nodes[id]. */
+    TEST_ASSERT_EQ_PTR(outer_pred, &g->nodes[outer_pred->id]);
+    TEST_ASSERT_EQ_PTR(inner_pred, &g->nodes[inner_pred->id]);
+
+    /* And the filter chain bottoms out at SCAN(v1) — verifying the
+     * input-pointer fix-up walked the whole chain correctly. */
+    ray_op_t* scan_node = inner->inputs[0];
+    TEST_ASSERT_NOT_NULL(scan_node);
+    TEST_ASSERT_EQ_I(scan_node->opcode, OP_SCAN);
+
+    /* Original filter id is still valid (it's now the inner filter
+     * after split, since split_and_filter rewrites filter_node in
+     * place to be the inner). */
+    TEST_ASSERT_TRUE(filt_id < g->node_count);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t opt_entries[] = {
     { "opt/filter_reorder_type", test_filter_reorder_by_type, NULL, NULL },
     { "opt/filter_and_split", test_filter_and_split, NULL, NULL },
@@ -746,6 +1115,10 @@ const test_entry_t opt_entries[] = {
     { "opt/partition_pruning_in", test_partition_pruning_in, NULL, NULL },
     { "opt/partition_pruning_not_in", test_partition_pruning_not_in, NULL, NULL },
     { "opt/partition_pruning_in_type_mismatch", test_partition_pruning_in_type_mismatch, NULL, NULL },
+    { "opt/window_dce", test_opt_window_dce, NULL, NULL },
+    { "opt/pushdown_past_expand", test_opt_pushdown_past_expand, NULL, NULL },
+    { "opt/pushdown_expand_blocked", test_opt_pushdown_expand_blocked, NULL, NULL },
+    { "opt/realloc_during_split", test_opt_realloc_during_split, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
