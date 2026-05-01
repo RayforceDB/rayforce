@@ -1,0 +1,369 @@
+;; Coverage tests for src/ops/query.c — pass-4 useful-work paths that
+;; existing fixtures (test/rfl/{table,collection,integration,ops}/...)
+;; don't reach.  Focus is rich query shapes — projection forms, multi-
+;; clause selects, post-DAG scatter/sort/take, update-by, ANN/KNN
+;; nearest, eval-level group-by — NOT error guards or OOM cleanup.
+;;
+;; Each block calls out the target compile_expr_dag / select / update
+;; site by approximate line range.
+;;
+;; No /tmp files used.
+
+;; ====================================================================
+;; compile_expr_dag projection forms — query.c:412-921
+;; ====================================================================
+
+(set TT (table [a b s f] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100] ["alpha" "beta" "gamma" "delta" "eps" "zeta" "eta" "theta" "iota" "kappa"] (as 'F64 (til 10)))))
+
+;; (replace col "from" "to") — query.c:683-696, exec_replace path.
+;; Replace literal substring inside every row of a STR column.
+(first (at (select {r: (replace s "a" "X") from: TT}) 'r)) -- "XlphX"
+(first (at (select {r: (replace s "alpha" "AAAA") from: TT}) 'r)) -- "AAAA"
+
+;; (concat …) variadic string concat — query.c:699-711.  3+ args
+;; exercises the multi-input balanced-tree code path.
+(first (at (select {c: (concat s "_" s) from: TT}) 'c)) -- "alpha_alpha"
+(first (at (select {c: (concat "[" s "]") from: TT}) 'c)) -- "[alpha]"
+
+;; (as 'TYPE col) cast — query.c:714-735.  Hit the I64 and F64 arms
+;; (the widest-tested cast targets in the DAG executor).  Other
+;; arms (I32/I16/F32/U8/BOOL) compile fine but the DAG fallback's
+;; CAST loop only handles narrow→I64/F64 (expr.c:1277-1290) — they
+;; SKIP coverage rather than risk runtime divergence.
+(sum (at (select {x: (as 'F64 a) from: TT}) 'x)) -- 55.0
+(sum (at (select {x: (as 'I64 f) from: TT}) 'x)) -- 45
+
+;; Long-form temporal extracts (year/month/day/hour/minute/second/
+;; dayofweek/dayofyear) — query.c:737-753.  Distinct from the eval-
+;; level (yyyy x) shorthand which bypasses compile_expr_dag.
+(set TD (table [d ts] (list [2024.01.15 2024.01.20 2024.01.25] [2024.01.15D10:30:45.000 2024.01.20D11:30:45.000 2024.01.25D12:30:45.000])))
+;; year: 3*2024 = 6072.  month: 3*1 = 3.  day: 15+20+25 = 60.
+(sum (at (select {y: (year d) from: TD}) 'y)) -- 6072
+(sum (at (select {m: (month d) from: TD}) 'm)) -- 3
+(sum (at (select {dd: (day d) from: TD}) 'dd)) -- 60
+;; hour: 10+11+12 = 33.  minute: 3*30 = 90.  second: 3*45 = 135.
+(sum (at (select {hh: (hour ts) from: TD}) 'hh)) -- 33
+(sum (at (select {mn: (minute ts) from: TD}) 'mn)) -- 90
+(sum (at (select {sc: (second ts) from: TD}) 'sc)) -- 135
+;; dayofyear: 15+20+25 = 60 (all in Jan 2024).  dayofweek values
+;; differ by ISO conventions; the long-form `dayofweek` is
+;; equivalent to the short `(dow d)` — assert presence rather than
+;; sum of unknown calendar weekday encoding.
+(count (at (select {dw: (dayofweek d) from: TD}) 'dw)) -- 3
+(sum (at (select {dy: (dayofyear d) from: TD}) 'dy)) -- 60
+
+;; Dotted-name temporal segments — query.c:455-481.  Short-name forms
+;; (yyyy/mm/dd/hh/minute/ss/dow/doy) registered in temporal.c
+;; ray_temporal_field_from_sym.  `ts.yyyy` desugars to scan(ts) →
+;; extract(YEAR); `ts.date` (handled via temporal_trunc_from_sym)
+;; desugars to scan(ts) → date_trunc(DAY).
+(sum (at (select {y: ts.yyyy from: TD}) 'y)) -- 6072
+(sum (at (select {m: ts.mm from: TD}) 'm)) -- 3
+(sum (at (select {h: ts.hh from: TD}) 'h)) -- 33
+
+;; (do e1 ... eN) — query.c:759-762.  Compiles to the LAST expr only;
+;; earlier exprs are dropped.  Inside select, `(do (+ a 1) (* a 2))`
+;; becomes the multiplication.
+(sum (at (select {x: (do (+ a 1) (* a 2)) from: TT}) 'x)) -- 110
+
+;; (let var val body) — query.c:768-781.  Bind val to var, compile
+;; body with var resolved via cexpr_env_lookup.
+(sum (at (select {x: (let v (* a 3) (+ v 1)) from: TT}) 'x)) -- 175
+
+;; (cond (p1 e1) (p2 e2) ... (else en)) — query.c:784-821.  Builds
+;; a right-fold OP_IF chain.  3-clause cond exercises both the
+;; else-branch and the predicate-branch arms of the loop body.
+(sum (at (select {x: (cond ((> a 7) 100) ((> a 3) 10) (else 1)) from: TT}) 'x)) -- 343
+
+;; Lambda inlining — query.c:535-578.  An inline `((fn [x] body) arg)`
+;; inside a select projection β-reduces at compile time.
+(sum (at (select {x: ((fn [v] (+ (* v 2) 5)) a) from: TT}) 'x)) -- 160
+
+;; Named-lambda inlining — query.c:587-622.  A globally-bound
+;; single-expression lambda is inlined when used as a call head.
+(set dbl (fn [v] (* v 2)))
+(sum (at (select {x: (dbl a) from: TT}) 'x)) -- 110
+
+;; Variadic and/or balanced-tree fold — query.c:835-921.  4+ args
+;; folds into a balanced binary tree.  Mixed AND of integers + floats.
+(count (select {from: TT where: (and (> a 1) (< a 9) (> b 20) (< b 90))})) -- 6
+(count (select {from: TT where: (or (== a 1) (== a 5) (== a 9) (== a 10))})) -- 4
+
+;; ====================================================================
+;; apply_sort_take — query.c:246-363.  Multi-key SYM-vector sort.
+;; ====================================================================
+
+;; asc: [a b] / desc: [a b] — query.c:282-289 (the SYM vector branch
+;; of the sort-key loop).  Build a fixture where the secondary key
+;; tie-breaks the primary key — composite sort matters.
+(set TS (table [a b v] (list [2 1 2 1 2 1] [3 3 1 1 2 2] [10 20 30 40 50 60])))
+(at (at (select {from: TS asc: [a b]}) 'v) 0) -- 40
+(at (at (select {from: TS asc: [a b]}) 'v) 1) -- 60
+(at (at (select {from: TS asc: [a b]}) 'v) 2) -- 20
+(at (at (select {from: TS desc: [a b]}) 'v) 0) -- 10
+(at (at (select {from: TS desc: [a b]}) 'v) 1) -- 50
+
+;; Same multi-key sort, but applied AFTER a group-by — exercises the
+;; apply_sort_take branch via post-execution path (query.c:266-294).
+;; Use integer keys so positional invariants are deterministic.
+(set TG2 (table [g h v] (list [1 2 1 2 1 2] [1 1 2 2 1 1] [1 2 3 4 5 6])))
+(count (select {s: (sum v) from: TG2 by: [g h] asc: [g h]})) -- 4
+;; Smallest (g,h)=(1,1) appears in rows 0,4 → sum = 6.
+(at (at (select {s: (sum v) from: TG2 by: [g h] asc: [g h]}) 's) 0) -- 6
+;; Largest (g,h)=(2,2) → row 3 → sum = 4.
+(at (at (select {s: (sum v) from: TG2 by: [g h] desc: [g h]}) 's) 0) -- 4
+
+;; Take with [start amount] range form — query.c:314-321 (vec take).
+(count (select {from: TT take: [2 5]})) -- 5
+(first (at (select {from: TT take: [2 5]}) 'a)) -- 3
+
+;; ====================================================================
+;; eval-level group-by — query.c:1913-2422.  GUID / LIST-STR keys
+;; force the eval-level fallback (DAG path can't pack wide keys).
+;; ====================================================================
+
+;; GUID by-key with explicit aggs — query.c:2151-2204 (streaming
+;; aggr_unary branch on eval_tbl).  guid 4 produces 4 distinct keys.
+(set TGu (table [G v] (list (take (guid 4) 12) (til 12))))
+(count (select {s: (sum v) from: TGu by: G})) -- 4
+(sum (at (select {s: (sum v) from: TGu by: G}) 's)) -- 66
+
+;; GUID by-key with a non-agg expression — query.c:2205-2293
+;; (per-group LIST scatter via gather_by_idx).  `v2: (* v 2)` is
+;; non-agg (no aggregator wrapper) and must produce a LIST column.
+(count (at (select {v2: (* v 2) from: TGu by: G}) 'v2)) -- 4
+
+;; GUID by-key with a constant non-agg expr — broadcast branch
+;; query.c:2278-2287 (refs_column == 0, full_is_row_aligned == 0).
+(count (select {k: 7 from: TGu by: G})) -- 4
+
+;; GUID by-key with a non-row-aligned non-agg → nonagg_eval_per_group
+;; fallback at query.c:2252-2273.  A lambda that collapses to a scalar
+;; per group (count) is non-agg and not row-aligned, so it must take
+;; the per-group eval path.
+(count (at (select {n: ((fn [t] (count t)) v) from: TGu by: G}) 'n)) -- 4
+
+;; LIST/STR group key with first-of-group fast path — query.c:2347-2417.
+;; `(select {from: t by: NameCol})` (no aggs, no non-aggs) uses the
+;; LIST-key fast path at 2384-2389.
+(set TStr (table [Name v] (list (list "alpha" "beta" "alpha" "gamma" "beta") [10 20 30 40 50])))
+(count (select {from: TStr by: Name})) -- 3
+
+;; ====================================================================
+;; GUID first-of-group fast path — query.c:1945-2099.  Pure
+;; `(select {from: t by: G})` with no agg/non-agg expressions takes
+;; the dedicated O(N) hash-table scan.
+;; ====================================================================
+
+;; 50 rows over 5 GUID values exercises the SYM-attrs preserving
+;; gather (line ~2051-2064) and the typed-vec gather (~2065-2080).
+(set N5 50)
+(set TGfast (table [G iv fv sv] (list (take (guid 5) N5) (til N5) (as 'F64 (% (til N5) 7)) (take ['AAPL 'GOOG 'MSFT] N5))))
+(count (select {from: TGfast by: G})) -- 5
+
+;; ====================================================================
+;; aggr_unary_per_group_buf streaming path — query.c:1273-1359.
+;; Triggers when a select-by has BOTH agg and non-agg outputs (the
+;; non-agg scatter pre-computes idx_buf, then agg fast-paths into
+;; this).  Use a unary aggregator (med/dev) on a scalar key.
+;; ====================================================================
+
+(set TM (table [g v] (list ['a 'b 'a 'b 'a 'b 'a 'b] [1 2 3 4 5 6 7 8])))
+;; med per group — non-agg `bias: (+ v 1)` forces scatter; the
+;; agg `m: (med v)` then routes through aggr_unary_per_group_buf.
+(count (at (select {m: (med v) bias: (+ v 1) from: TM by: g}) 'm)) -- 2
+(count (at (select {m: (med v) bias: (+ v 1) from: TM by: g}) 'bias)) -- 2
+
+;; ====================================================================
+;; Post-DAG scatter — query.c:3382-3686.  Mixed agg + non-agg in a
+;; group-by produces a result with LIST-typed non-agg columns.
+;; ====================================================================
+
+(set TX (table [g v w] (list [1 1 2 2 3 3] [10 20 30 40 50 60] [100 200 300 400 500 600])))
+;; Pure non-agg expr (no agg) in by-clause: synth_count_col=1 path
+;; at query.c:2569-2572, plus the synth-count drop at 3314-3331.
+(count (select {x: (* v 2) from: TX by: g})) -- 3
+(count (at (select {x: (* v 2) from: TX by: g}) 'x)) -- 3
+
+;; Mixed agg + non-agg: scatter at 3382-3686 with refs_column branch
+;; at 3606-3627 (eval result is row-aligned → gather_by_idx per group).
+(at (at (select {s: (sum v) x: (* v 2) from: TX by: g}) 's) 0) -- 30
+
+;; Aggr_unary fast path inside scatter — query.c:3556-3567.
+(at (at (select {a: (avg v) m: (med v) from: TX by: g}) 'm) 0) -- 15.0
+
+;; ====================================================================
+;; BOOL group-key reorder — query.c:3252-3308.  GROUP BY a bool
+;; column where the first row is `true` must produce result rows in
+;; first-occurrence order (true before false), not radix-sorted.
+;; ====================================================================
+
+(set TB (table [b v] (list [true false true false] [1 2 3 4])))
+;; first row's b is true — radix sort would emit false first; the
+;; reorder block reverses rows to match first-occurrence order.
+(at (at (select {s: (sum v) from: TB by: b}) 'b) 0) -- true
+(at (at (select {s: (sum v) from: TB by: b}) 's) 0) -- 4
+
+;; ====================================================================
+;; nearest: KNN clause — query.c:1597-1832 with knn-rerank.
+;; ANN with hnsw-build → ann form covered too.
+;; ====================================================================
+
+;; Build a small embedding table; column `Vec` is a LIST of float vecs.
+(set TE (table [id Vec] (list [0 1 2 3 4] (list [1.0 0.0 0.0] [0.9 0.1 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.5 0.5 0.0]))))
+
+;; KNN form — query.c:1739-1764.  Default metric (cosine) at 1748,
+;; cosine arm at 1755.  Take 3 → result row count 3.
+(count (select {from: TE nearest: (knn Vec [1.0 0.0 0.0]) take: 3})) -- 3
+
+;; Explicit metric symbols hit each parse_metric arm 1753-1755.
+(count (select {from: TE nearest: (knn Vec [1.0 0.0 0.0] 'l2) take: 2})) -- 2
+(count (select {from: TE nearest: (knn Vec [1.0 0.0 0.0] 'ip) take: 2})) -- 2
+(count (select {from: TE nearest: (knn Vec [1.0 0.0 0.0] 'cosine) take: 2})) -- 2
+
+;; KNN with default take=10 — query.c:1614-1615 (k_req fallback).
+(count (select {from: TE nearest: (knn Vec [1.0 0.0 0.0])})) -- 5
+
+;; Explicit projection (n_out > 0) keeps user columns and skips the
+;; implicit-projection block at 1787-1832.
+(count (at (select {n: id from: TE nearest: (knn Vec [1.0 0.0 0.0]) take: 2}) 'n)) -- 2
+
+;; KNN with I64 query vector — switch arm at query.c:1678-1683.
+(count (select {from: TE nearest: (knn Vec [1 0 0]) take: 2})) -- 2
+
+;; (knn) with F32 query vector at query.c:1665-1667 SKIPPED — the
+;; eval-level (as 'F32 ...) builtin does not register F32 as a
+;; cast target (builtins.c:930+ cast_match list lacks F32), so we
+;; can't construct an F32 vec literal here.  Coverage of that
+;; switch arm needs an F32-producing call site we don't have at
+;; rfl level today.
+
+;; ANN form — query.c:1686-1738.  hnsw-build returns an HNSW handle;
+;; nearest: (ann Idx q [ef]) reranks via the index.  Default ef path
+;; at 1713; explicit ef path at 1714-1732.
+(set Idx (hnsw-build (at TE 'Vec) 'l2 8 100))
+(count (select {from: TE nearest: (ann Idx [1.0 0.0 0.0]) take: 3})) -- 3
+(count (select {from: TE nearest: (ann Idx [1.0 0.0 0.0] 50) take: 3})) -- 3
+(hnsw-free Idx)
+
+;; ====================================================================
+;; collect_col_refs dotted path — query.c:1049-1058.  Used by the
+;; nonagg scatter fallback so a per-group expr referencing `t.col`
+;; binds the head column slice.
+;; ====================================================================
+
+(set TT2 (table [g ts v] (list ['a 'b 'a 'b] [2024.01.01D00:00:00.000 2024.06.15D12:00:00.000 2025.03.10D08:30:00.000 2025.12.31D23:59:59.000] [1 2 3 4])))
+;; A non-agg expr that mentions ts inside an aggregator-shape lambda
+;; — collapse via fn forces nonagg_eval_per_group_*; the per-group
+;; bind needs collect_col_refs to recognize ts.yyyy as a column ref
+;; on `ts` (head segment lookup at L1051-1052).
+(count (at (select {y: ((fn [d] (sum d)) ts.yyyy) from: TT2 by: g}) 'y)) -- 2
+
+;; ====================================================================
+;; Update with by — query.c:3826-3966.  Compute aggregate per group,
+;; broadcast back to every row in that group.
+;; ====================================================================
+
+(set Tu (table [g v] (list ['a 'a 'b 'b 'c 'c] [1 2 3 4 5 6])))
+(set Tu2 (update {gs: (sum v) from: Tu by: g}))
+(at (at Tu2 'gs) 0) -- 3
+(at (at Tu2 'gs) 2) -- 7
+(at (at Tu2 'gs) 4) -- 11
+(count Tu2) -- 6
+
+;; Update with by + max aggregator — exercises the dynamic out_type
+;; resolution in query.c:3933-3942 (out_type from agg result).
+(set Tu3 (update {mx: (max v) from: Tu by: g}))
+(at (at Tu3 'mx) 0) -- 2
+(at (at Tu3 'mx) 5) -- 6
+
+;; ====================================================================
+;; Update with WHERE + numeric type promotion — query.c:4076-4113.
+;; Column is I64, expression yields F64 (* col 1.5) — must promote.
+;; ====================================================================
+
+(set Tup (table [id v] (list [1 2 3 4] [10 20 30 40])))
+(set Tup2 (update {v: (* v 1.5) from: Tup where: (> id 2)}))
+;; Untouched rows preserved; masked rows get F64-cast back to I64.
+(at (at Tup2 'v) 0) -- 10
+(at (at Tup2 'v) 1) -- 20
+(at (at Tup2 'v) 2) -- 45
+(at (at Tup2 'v) 3) -- 60
+
+;; Update WHERE atom-broadcast: scalar SYM value broadcast across
+;; mask, then RAY_SYM merge loop at query.c:4221-4229.  Both arms
+;; (mask=true → expr_vec, mask=false → orig_col) hit the
+;; ray_read_sym dispatch.
+(set TupL (table [id name] (list [1 2 3] ['alice 'bob 'charlie])))
+(set TupL2 (update {name: 'XXX from: 'TupL where: (== id 2)}))
+(at (at TupL2 'name) 0) -- 'alice
+(at (at TupL2 'name) 1) -- 'XXX
+(at (at TupL2 'name) 2) -- 'charlie
+
+;; ====================================================================
+;; Update no-WHERE add-new-col — query.c:4427-4475.  Column not in
+;; original table; eval expr and add as new column.
+;; ====================================================================
+
+(set Tnc (table [id v] (list [1 2 3] [10 20 30])))
+(set Tnc2 (update {NewCol: (+ v 1) from: Tnc}))
+(at (at Tnc2 'NewCol) 0) -- 11
+(at (at Tnc2 'NewCol) 2) -- 31
+;; Scalar broadcast for new col — atom-to-vec at 4448-4470.
+(set Tnc3 (update {Tag: 99 from: Tnc}))
+(sum (at Tnc3 'Tag)) -- 297
+
+;; ====================================================================
+;; Update WHERE SYM/STR null-bit propagation — query.c:4211-4229.
+;; STR / SYM columns hit dedicated merge loops with nullmap.
+;; ====================================================================
+
+(set TupS (table [id s] (list [1 2 3 4] (list "a" "b" "c" "d"))))
+(set TupS2 (update {s: "XX" from: 'TupS where: (> id 2)}))
+(first (at TupS2 's)) -- "a"
+(at (at TupS2 's) 2) -- "XX"
+
+(set TupSy (table [id k] (list [1 2 3] ['a 'b 'c])))
+(set TupSy2 (update {k: 'XX from: 'TupSy where: (== id 2)}))
+(at (at TupSy2 'k) 0) -- 'a
+(at (at TupSy2 'k) 1) -- 'XX
+
+;; ====================================================================
+;; Vector insert / append via insert builtin — query.c:4515-4674.
+;; vec target (not table) hits the special-case dispatch at 4519-4674.
+;; ====================================================================
+
+(set v1 [1 2 3 4 5])
+(count (insert v1 6)) -- 6
+;; Same-type vec splice — query.c:4580-4583.
+(count (insert v1 [10 20])) -- 7
+;; Positional insert at index — query.c:4621-4640.
+(at (insert v1 2 99) 2) -- 99
+(count (insert v1 2 99)) -- 6
+
+;; STR vec append/insert — query.c:4562-4564 / 4624-4627.
+(set vs ["a" "b" "c"])
+(count (insert vs "d")) -- 4
+(count (insert vs 1 "X")) -- 4
+
+;; Sym vec append — query.c:4564-4566.  `['a 'b 'c]` is a SYM vec.
+(set vsy ['a 'b 'c])
+(count (insert vsy 'd)) -- 4
+(at (insert vsy 1 'X) 1) -- 'X
+
+;; List target — query.c:4555-4558 (always single-slot append).
+(set vl (list 1 'two "three"))
+(count (insert vl 4.0)) -- 4
+
+;; ====================================================================
+;; Take with negative atom (tail) at apply_sort_take — query.c:337-352
+;; (negative path).  Hit ONLY when by_expr is set, since plain take
+;; without by_expr goes through ray_tail in the DAG.
+;; ====================================================================
+
+;; Group + take -2: keep last 2 groups by sort order.  3 groups → take
+;; tail of 2.  apply_sort_take negative branch: amount=2, start=1.
+(set Ttn (table [g v] (list [1 2 3 1 2 3] [10 20 30 40 50 60])))
+(count (select {s: (sum v) from: Ttn by: g asc: g take: -2})) -- 2
+(at (at (select {s: (sum v) from: Ttn by: g asc: g take: -2}) 'g) 0) -- 2
+(at (at (select {s: (sum v) from: Ttn by: g asc: g take: -2}) 'g) 1) -- 3

@@ -1,0 +1,139 @@
+;; Pass 4 — additional coverage for src/ops/exec.c.
+;;
+;; This file extends test/rfl/ops/exec_coverage.rfl.  It targets
+;; USEFUL-WORK paths inside exec.c that the previous coverage pass and
+;; sibling fixtures (query_coverage.rfl, filter.rfl, strop/like.rfl,
+;; integration/sort_radix_boundary.rfl) do not yet drive.
+;;
+;; Hit (with rationale):
+;;   - partitioned_gather phases (exec.c:275-473): single-key sort over
+;;     >= PG_MIN (=131072) rows.  No existing test crosses this size for
+;;     the OP_SORT path.  Phase 1 (pg_hist_fn), phase 2 (pg_route_fn),
+;;     phase 3 (pg_block_fn) all run; pg_block_fn covers e==4 and e==8
+;;     element-size arms when the table mixes I32 and I64 columns.
+;;   - OP_TRIM in select projection (exec.c:1548): no rfl fixture
+;;     currently invokes (trim col) — string.c's exec_string_unary
+;;     trim arm is reached for the first time.
+;;   - OP_HEAD(FILTER) early-termination over a 150k-row source —
+;;     exec.c:1301-1336.  Existing tests probe this path with 20-row
+;;     inputs; the large fixture exercises the morsel loop in
+;;     exec_filter_head with multiple morsel pages.
+;;   - OP_FILTER chained-refine on a STR-equality predicate
+;;     (exec.c:1059-1072 with non-NULL g->selection).  Existing
+;;     refines use I64/F64/SYM types; STR routes through a different
+;;     compare arm in ray_rowsel_refine.
+;;
+;; Skipped (per Pass 4 brief):
+;;   - materialize_mapcommon* family (exec.c:35-152) — orphan; needs
+;;     disk-backed parted/MAPCOMMON tables.
+;;   - build_segment_table / partition-streaming loop (exec.c:1839-2247)
+;;     — same orphan dependency on parted columns.
+;;   - OP_WINDOW (exec.c:1229) — no rfl-reachable builder for
+;;     ray_window_op.
+;;   - All graph-algo OPs (OP_LOUVAIN, OP_PAGERANK, OP_DIJKSTRA,
+;;     OP_DFS, OP_TOPSORT, OP_BETWEENNESS, OP_CLOSENESS, OP_MST,
+;;     OP_RANDOM_WALK, OP_ASTAR, OP_K_SHORTEST, OP_ANN_RERANK,
+;;     OP_KNN_RERANK, OP_DEGREE_CENT, OP_CLUSTER_COEFF, OP_EXPAND,
+;;     OP_VAR_EXPAND, OP_SHORTEST_PATH, OP_WCO_JOIN,
+;;     OP_CONNECTED_COMP) — graph-builder-only; not produced by
+;;     ordinary `select` queries.
+;;   - exec_node cancellation paths (ray_interrupted, pool->cancelled)
+;;     and every `return ray_error(...)` — error guards by spec.
+;;   - HEAD/TAIL on a vector (not table) input (exec.c:1410-1421,
+;;     1521-1533): OP_HEAD/OP_TAIL are emitted only via
+;;     `select { take: }`, which always feeds a TABLE input.
+;;   - OP_FILTER eager-vector path (exec.c:1075-1079): ray_filter is
+;;     only constructed by `select where:` whose input is a TABLE,
+;;     and the predicate is always BOOL after compile-time check.
+;;
+;; OP_EXTRACT (exec.c:1564), OP_DATE_TRUNC (exec.c:1568), OP_REPLACE
+;; (exec.c:1557), OP_CONCAT variadic (exec.c:1560), bracket-class
+;; OP_LIKE (exec.c:1540) are intentionally NOT duplicated — already
+;; covered in query_coverage.rfl / strop/like.rfl.
+
+(.sys.exec "rm -rf /tmp/rfl_exec_advanced")
+
+;; ====================================================================
+;; OP_TRIM — exec.c:1548 (OP_UPPER / OP_LOWER / OP_TRIM share
+;; exec_string_unary).  No existing fixture invokes (trim ...).
+;; ====================================================================
+(set TTr (table [s] (list ["  hello  " "  world " "no-pad" "   "])))
+(first (at (select {t: (trim s) from: TTr}) 't)) -- "hello"
+;; Leading and trailing space stripped.
+(at (at (select {t: (trim s) from: TTr}) 't) 1) -- "world"
+;; Already-trimmed string is unchanged.
+(at (at (select {t: (trim s) from: TTr}) 't) 2) -- "no-pad"
+;; All-whitespace becomes empty.
+(at (at (select {t: (trim s) from: TTr}) 't) 3) -- ""
+
+;; ====================================================================
+;; OP_SORT — partitioned_gather (exec.c:275-473).  Single-key sort over
+;; >= PG_MIN (=131072) rows triggers the partitioned routing path.
+;; Phase 1 (pg_hist_fn @275), phase 2 (pg_route_fn @304), phase 3
+;; (pg_block_fn @338) all run.  Mixing I64 and I32 columns drives
+;; pg_block_fn's e==8 (line 358) and e==4 (line 363) element-size arms.
+;; ====================================================================
+(set BIG_N 150000)
+;; Reverse-sorted I64 column; ascending puts row 0 (=N-1) last.
+(set TBigSort (table [k v] (list (- (- BIG_N 1) (til BIG_N)) (til BIG_N))))
+;; Count preserved.
+(count (select {from: TBigSort asc: k})) -- 150000
+;; First row of asc-sorted has k=0.
+(at (at (select {from: TBigSort asc: k}) 'k) 0) -- 0
+;; Last row has k=N-1.
+(at (at (select {from: TBigSort asc: k}) 'k) 149999) -- 149999
+;; Descending: first row is the original last (k=N-1).
+(at (at (select {from: TBigSort desc: k}) 'k) 0) -- 149999
+;; Companion `v` column rides through partitioned_gather block loop
+;; with esz=8.  Sum of v should be unchanged: N*(N-1)/2.
+(sum (at (select {from: TBigSort asc: k}) 'v)) -- 11249925000
+
+;; Mixed esz columns — drives pg_block_fn's e==8 and e==4 arms in
+;; one sort.  Multi-key sort uses multi_gather_fn (no partitioned),
+;; so use single-key.
+(set TBigMix (table [k a b] (list (- (- BIG_N 1) (til BIG_N)) (as 'I32 (% (til BIG_N) 1000)) (til BIG_N))))
+;; After asc by k=0 first, original row N-1 (with i=N-1) becomes
+;; row 0.  a[N-1] = (N-1)%1000 = 999.  b[N-1] = N-1 = 149999.
+(at (at (select {from: TBigMix asc: k}) 'a) 0) -- 999
+(at (at (select {from: TBigMix asc: k}) 'b) 0) -- 149999
+
+;; ====================================================================
+;; OP_HEAD(SORT) fusion at 150k rows — exec.c:1252-1269.  exec_sort
+;; gets a non-zero limit hint and uses the limited gather path; the
+;; sort indices loop still scans 150k rows but only N=5 rows are
+;; gathered into the result.
+;; ====================================================================
+(count (select {from: TBigSort asc: k take: 5})) -- 5
+(at (at (select {from: TBigSort asc: k take: 5}) 'k) 0) -- 0
+(at (at (select {from: TBigSort asc: k take: 5}) 'k) 4) -- 4
+
+;; ====================================================================
+;; OP_HEAD(FILTER) over 150k rows — exec.c:1301-1336.  exec_filter_head
+;; loops morsels until N matches accumulate; small-input tests don't
+;; cross the morsel boundary (RAY_MORSEL_ELEMS = 1024).
+;; ====================================================================
+(set TH150 (table [x] (list (til BIG_N))))
+;; Inner where x>50000 leaves 99999 rows; take 7 of them.  First row
+;; matching x>50000 is x=50001.
+(count (select {from: TH150 where: (> x 50000) take: 7})) -- 7
+(at (at (select {from: TH150 where: (> x 50000) take: 7}) 'x) 0) -- 50001
+(at (at (select {from: TH150 where: (> x 50000) take: 7}) 'x) 6) -- 50007
+
+;; ====================================================================
+;; OP_FILTER chained refine on a STR-equality predicate — exec.c:1059-
+;; 1072 with non-NULL g->selection.  Existing chained refines test
+;; I64/F64/SYM; STR routes through ray_rowsel_refine's STR comparator.
+;; ====================================================================
+(set TStrF (table [s n] (list ["alpha" "beta" "gamma" "alpha" "beta" "alpha"] [1 2 3 4 5 6])))
+(count (select {from: (select {from: TStrF where: (== s "alpha")}) where: (> n 3)})) -- 2
+(sum (at (select {from: (select {from: TStrF where: (== s "alpha")}) where: (> n 3)}) 'n)) -- 10
+
+;; OP_COUNT_DISTINCT (exec.c:1006-1012) — already covered by
+;; test_exec.c.  rfl `(count (distinct V))` is the eval-level
+;; pipeline (collection.c::ray_distinct + collection.c::ray_count),
+;; which never reaches exec.c.  Skipped.
+
+;; ====================================================================
+;; Cleanup
+;; ====================================================================
+(.sys.exec "rm -rf /tmp/rfl_exec_advanced")

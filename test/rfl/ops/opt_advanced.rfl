@@ -1,0 +1,321 @@
+;; Advanced coverage targets for src/ops/opt.c — extends opt_coverage
+;; intent.  Focuses on USEFUL-WORK paths only: type inference promotion,
+;; constant folding chains, predicate pushdown across SELECT/ALIAS,
+;; multi-clause AND-split, filter-cost reorder, projection pushdown
+;; reachability through ext-node children, and FILTER(const)
+;; pass-through / drop fusion.
+;;
+;; Skip rationale (per Pass 4 brief):
+;;   - track_ext_node realloc fix-up: only fires for very large queries,
+;;     not reachable from simple rfl SELECTs.
+;;   - SIP / factorize_pass: graph-DAG / datalog only; OP_EXPAND is not
+;;     produced by ordinary `select`.
+;;   - pass_partition_pruning: needs disk-backed parted RAY_MAPCOMMON
+;;     fixtures; orphan to rfl.
+;;   - OOM allocator failure paths, hard-coded depth/breadth guards
+;;     (visited[4096], stack_cap > 256, sp >= 64), `return ray_error`
+;;     branches: classified as error guards, not useful work.
+;;
+;; All assertions feed through `select` so ray_optimize() runs
+;; (query.c:322 etc.) and pass_* hooks fire.
+
+;; ====================================================================
+;; promote_type / infer_type_for_node — opt.c:54-84
+;; ====================================================================
+;; Each line drives a derived column whose two operands have distinct
+;; types so promote_type's switch arms fire in pass_type_inference's
+;; reverse-order infer_type_for_node loop.
+
+;; F64 dominates: I64+F64 -> F64  (opt.c:56)
+(set TF (table [i f] (list [1 2 3] [0.5 1.5 2.5])))
+(sum (at (select {x: (+ i f) from: TF}) 'x)) -- 10.5
+(type (at (select {x: (+ i f) from: TF}) 'x)) -- 'F64
+
+;; I64 dominates I32: opt.c:58
+(set TIJ (table [a b] (list (as 'I32 [10 20 30]) [100 200 300])))
+(sum (at (select {x: (+ a b) from: TIJ}) 'x)) -- 660
+(type (at (select {x: (+ a b) from: TIJ}) 'x)) -- 'I64
+
+;; SYM is treated as I64-class for promote_type purposes (opt.c:58)
+(set TSY (table [s v] (list ['AAPL 'GOOG 'MSFT] [1 2 3])))
+;; Compare SYM column to SYM atom; comparison opcode forces BOOL out
+;; (opt.c:70-72), independent of operand type.
+(count (select {from: TSY where: (== s 'GOOG)})) -- 1
+
+;; I32 dominates I16 in the absence of I64/F64 (opt.c:60)
+(set THJ (table [a b] (list (as 'I16 [1 2 3 4]) (as 'I32 [10 20 30 40]))))
+(sum (at (select {x: (+ a b) from: THJ}) 'x)) -- 110
+;; DAG widens to I64 anyway (cf. dag_binary_ops.rfl:38) — promote_type
+;; still ran during inference even if downstream lowering widens.
+(type (at (select {x: (+ a b) from: THJ}) 'x)) -- 'I64
+
+;; I16 + I16 promotes via opt.c:62 — same I16 path
+(set TH16 (table [a b] (list (as 'I16 [1 2 3]) (as 'I16 [4 5 6]))))
+(sum (at (select {x: (+ a b) from: TH16}) 'x)) -- 21
+
+;; DATE op shares the I32 namespace (opt.c:61)
+(set TDY (table [d v] (list [2024.01.01 2024.06.15 2024.12.31] [1 2 3])))
+(count (select {from: TDY where: (>= d 2024.06.01)})) -- 2
+
+;; Comparison & logical ops always BOOL — opt.c:70, 74
+(count (select {from: TF where: (and (> i 1) (< f 2.5))})) -- 1
+(count (select {from: TF where: (or  (< i 0) (>= f 1.5))})) -- 2
+
+;; arity-1 propagation (opt.c:81-82): unary on single column
+(sum (at (select {x: (neg i) from: TF}) 'x)) -- -6
+
+;; ====================================================================
+;; fold_unary_const — opt.c:323-376
+;; All inputs are CONST atoms in a derived column, so the fold runs
+;; before broadcast.  Each line picks an op so the matching switch
+;; arm fires.  Result is broadcast over a 4-row table to make the
+;; fold visible.
+;; ====================================================================
+(set T4 (table [r] (list [1 2 3 4])))
+
+;; OP_NEG on F64 const  (opt.c:338) — derived col is constant -3.5
+(sum (at (select {x: (neg 3.5) from: T4}) 'x)) -- -14.0
+;; OP_NEG on I64 const  (opt.c:340)
+(sum (at (select {x: (neg 7) from: T4}) 'x)) -- -28
+
+;; OP_ABS on F64 const  (opt.c:344)
+(sum (at (select {x: (abs -2.5) from: T4}) 'x)) -- 10.0
+;; OP_ABS on I64 const negative  (opt.c:346)
+(sum (at (select {x: (abs -9) from: T4}) 'x)) -- 36
+
+;; OP_NOT — opt.c:349 — bool of (5 != 0) is true; (not 5) is 0/false
+(sum (as 'I64 (at (select {x: (not 0) from: T4}) 'x))) -- 4
+(sum (as 'I64 (at (select {x: (not 1) from: T4}) 'x))) -- 0
+
+;; OP_SQRT  (opt.c:352) — sqrt(16) = 4
+(sum (at (select {x: (sqrt 16) from: T4}) 'x)) -- 16.0
+
+;; OP_LOG   (opt.c:355) — log(1) = 0
+(sum (at (select {x: (log 1) from: T4}) 'x)) -- 0.0
+
+;; OP_EXP   (opt.c:358) — exp(0) = 1
+(sum (at (select {x: (exp 0) from: T4}) 'x)) -- 4.0
+
+;; OP_CEIL on F64 (opt.c:361)
+(sum (at (select {x: (ceil 2.3) from: T4}) 'x)) -- 12.0
+;; OP_CEIL on I64 — passthrough (opt.c:361 else branch)
+(sum (at (select {x: (ceil 5) from: T4}) 'x)) -- 20
+
+;; OP_FLOOR on F64 (opt.c:364)
+(sum (at (select {x: (floor 2.7) from: T4}) 'x)) -- 8.0
+;; OP_FLOOR on I64 — passthrough
+(sum (at (select {x: (floor 5) from: T4}) 'x)) -- 20
+
+;; ====================================================================
+;; fold_binary_const — opt.c:378-485
+;; Two CONST atom inputs to an arithmetic / comparison op.  All cases
+;; route through a `where:` or projection so ray_optimize runs.
+;; ====================================================================
+
+;; F64 fold path  (opt.c:396-411)
+;; ADD: 1.5+2.5 = 4.0; broadcast x4
+(sum (at (select {x: (+ 1.5 2.5) from: T4}) 'x)) -- 16.0
+;; SUB
+(sum (at (select {x: (- 5.0 2.0) from: T4}) 'x)) -- 12.0
+;; MUL
+(sum (at (select {x: (* 1.5 2.0) from: T4}) 'x)) -- 12.0
+;; DIV (IEEE: 0/0 -> NaN, but here finite)
+(sum (at (select {x: (/ 6.0 2.0) from: T4}) 'x)) -- 12.0
+;; MOD via fmod
+(sum (at (select {x: (% 7.5 2.0) from: T4}) 'x)) -- 6.0
+
+;; I64 fold (opt.c:413-432)
+;; ADD/SUB/MUL/DIV/MOD on integer atoms
+(sum (at (select {x: (+ 3 4) from: T4}) 'x)) -- 28
+(sum (at (select {x: (- 10 3) from: T4}) 'x)) -- 28
+(sum (at (select {x: (* 3 7) from: T4}) 'x)) -- 84
+(sum (at (select {x: (% 11 3) from: T4}) 'x)) -- 8
+
+;; BOOL fold — comparison constants  (opt.c:434-453)
+;; The comparison itself is the binary; result is BOOL atom which
+;; broadcasts.  `where: (== 1 1)` keeps every row.
+(count (select {from: T4 where: (== 1 1)})) -- 4
+(count (select {from: T4 where: (!= 1 2)})) -- 4
+(count (select {from: T4 where: (< 1 2)})) -- 4
+(count (select {from: T4 where: (> 2 1)})) -- 4
+(count (select {from: T4 where: (<= 1 1)})) -- 4
+(count (select {from: T4 where: (>= 2 1)})) -- 4
+
+;; ====================================================================
+;; fold_filter_const_predicate — opt.c:500-533
+;; A constant boolean predicate folds FILTER → MATERIALIZE (keep) or
+;; → HEAD-0 (drop).  Hits both branches of opt.c:511-518 / 520-532.
+;; ====================================================================
+(set T10 (table [v] (list [1 2 3 4 5 6 7 8 9 10])))
+
+;; keep-rows branch — opt.c:511, MATERIALIZE rewrite
+(count (select {from: T10 where: (== 1 1)})) -- 10
+(count (select {from: T10 where: (!= 0 1)})) -- 10
+(sum  (at (select {from: T10 where: (== 1 1)}) 'v)) -- 55
+
+;; drop-rows branch — opt.c:520, HEAD-0 rewrite
+(count (select {from: T10 where: (== 1 0)})) -- 0
+(count (select {from: T10 where: (< 5 2)})) -- 0
+(sum  (at (select {from: T10 where: (== 1 0)}) 'v)) -- 0
+
+;; ====================================================================
+;; AND/OR fold of two const inputs — through pass_constant_fold's
+;; binary fold (BOOL out_type, OP_AND/OR, opt.c:447-448).
+;; ====================================================================
+;; (and 1 1) → true → keep all; (and 1 0) → false → drop all
+(count (select {from: T10 where: (and 1 1)})) -- 10
+(count (select {from: T10 where: (and 1 0)})) -- 0
+(count (select {from: T10 where: (or  0 1)})) -- 10
+(count (select {from: T10 where: (or  0 0)})) -- 0
+
+;; ====================================================================
+;; pass_predicate_pushdown — opt.c:1272-1339
+;; FILTER over SELECT (single-consumer) gets swapped:
+;;   FILTER(p, SELECT(x))  ->  SELECT(FILTER(p, x))
+;; The recently-fixed (and vec const) partial fold means the path is
+;; reachable; we use a pure scan/where shape so the rewrite fires.
+;; ====================================================================
+(set TP (table [a b] (list [1 2 3 4 5 6 7 8 9 10] [10 20 30 40 50 60 70 80 90 100])))
+
+;; Outer where on inner select — predicate pushed past SELECT.
+;; Result must equal the manually-merged form.
+(count (select {from: (select {a: a from: TP}) where: (> a 5)})) -- 5
+(sum  (at (select {from: (select {a: a from: TP}) where: (> a 5)}) 'a)) -- 40
+
+;; Two-deep nested SELECT — pushdown iterates (opt.c:1276 loop).
+(count (select {from: (select {a: a from: (select {a: a b: b from: TP})}) where: (> a 7)})) -- 3
+
+;; ====================================================================
+;; Filter chain — split AND + cost-based reorder
+;; opt.c:1381-1418 (split_and_filter), 1431-1528 (pass_filter_reorder).
+;; The inner AND splits into a chain of two FILTERs, then reorder
+;; ranks them by filter_cost (LIKE costliest, EQ cheapest).
+;; ====================================================================
+(set TM (table [s p q] (list ['AAA 'BBB 'AAB 'CCC 'BBA 'AAC 'BBC] [1 2 3 4 5 6 7] [10 20 30 40 50 60 70])))
+
+;; AND-of-three predicates — split_and_filter iterates (opt.c:1439 loop)
+;; All three should still match correctly after splitting.
+(count (select {from: TM where: (and (== s 'AAA) (> p 0) (< q 100))})) -- 1
+(count (select {from: TM where: (and (> p 1) (< p 7) (>= q 20))})) -- 5
+
+;; LIKE in chain — filter_cost charges 4 for LIKE (opt.c:1372).  The
+;; reorder must keep result identical regardless of physical order.
+(count (select {from: TM where: (and (like s "A*") (> p 0))})) -- 3
+(count (select {from: TM where: (and (> p 0) (like s "A*"))})) -- 3
+
+;; Equivalent nested-select forms must yield same row counts (covers
+;; collect_filter_chain at opt.c:1421-1429).
+(count (select {from: (select {from: TM where: (> p 1)}) where: (< q 70)})) -- 5
+(count (select {from: (select {from: (select {from: TM where: (> p 1)}) where: (< p 7)}) where: (>= q 20)})) -- 5
+
+;; ====================================================================
+;; filter_cost type-width branches — opt.c:1361-1364
+;; Each predicate uses a column of the indicated type so filter_cost
+;; selects the matching arm.
+;; ====================================================================
+;; BOOL/U8 column predicate (cost += 0) — opt.c:1361
+(set TBL (table [b v] (list [true false true false true] [1 2 3 4 5])))
+(count (select {from: TBL where: b})) -- 3
+
+;; I16 column predicate (cost += 1) — opt.c:1362 (RAY_I16)
+(set TI16 (table [a v] (list (as 'I16 [1 2 3 4 5]) [10 20 30 40 50])))
+(count (select {from: TI16 where: (> a 2)})) -- 3
+
+;; I32/DATE/TIME (cost += 2) — opt.c:1363
+(set TI32 (table [a v] (list (as 'I32 [1 2 3 4 5]) [10 20 30 40 50])))
+(count (select {from: TI32 where: (> a 2)})) -- 3
+(count (select {from: TDY where: (>= d 2024.06.01)})) -- 2
+
+;; I64/F64/SYM/STR default (cost += 3) — opt.c:1364
+(count (select {from: TP where: (> a 5)})) -- 5
+
+;; ====================================================================
+;; pass_projection_pushdown — opt.c:1539-1674
+;; Mark live via BFS through inputs and ext-node children for SORT,
+;; SELECT, GROUP, JOIN, WINDOW_JOIN cases.  Each shape below seeds a
+;; different ext-node walk.
+;; ====================================================================
+
+;; SORT extwalk — opt.c:1583-1590
+(set TS (table [s v] (list ['c 'a 'b 'd 'a] [3 1 2 4 5])))
+(count (select {from: TS asc: s})) -- 5
+(first (at (select {from: TS asc: s}) 's)) -- 'a
+
+;; GROUP extwalk — opt.c:1571-1582 (keys + agg_ins)
+(set TG (table [g v w] (list ['a 'b 'a 'b 'c 'c] [1 2 3 4 5 6] [10 20 30 40 50 60])))
+(count (select {s: (sum v) m: (max w) from: TG by: g})) -- 3
+(sum (at (select {s: (sum v) from: TG by: g}) 's)) -- 21
+
+;; SELECT projection extwalk — opt.c:1584-1590 (sort.columns reused)
+(count (select {a: v b: (* v 2) c: (+ v w) from: TG})) -- 6
+
+;; JOIN extwalk — opt.c:1591-1603 (left_keys + right_keys)
+(set TL (table [k v] (list [1 2 3 4] [10 20 30 40])))
+(set TR (table [k w] (list [2 3 4 5] [200 300 400 500])))
+(count (inner-join [k] TL TR)) -- 3
+
+;; WINDOW_JOIN extwalk — opt.c:1604-1619 (asof.time_key + eq_keys)
+;; Every TR1 row gets at least one matching TQ1 row in its window.
+(set TR1 (table [Sym Time Price] (list ['a 'a 'b] [10:00:01.000 10:00:05.000 10:00:01.000] [100 200 400])))
+(set TQ1 (table [Sym Time Bid]   (list ['a 'a 'a 'b] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:00.000] [99 100 101 199])))
+(set IV  (map-left + [-2000 2000] (at TR1 'Time)))
+(count (at (window-join [Sym Time] IV TR1 TQ1 {m: (min Bid)}) 'm)) -- 3
+
+;; ====================================================================
+;; Multi-pass interaction: const-fold then DCE
+;; opt.c:1958 pass_constant_fold then 1993 pass_dce
+;; A column that becomes constant (e.g. (* 0 v)) is replaced; downstream
+;; sums see the constant value.
+;; ====================================================================
+;; (* 0 v) folds elementwise but only the constant atom case folds at
+;; opt.c level; vec-const is handled later.  Use a pure-const expr.
+(sum (at (select {x: (* 2 3) from: T10}) 'x)) -- 60
+(sum (at (select {x: (- (+ 1 2) 1) from: T10}) 'x)) -- 20
+;; Chain folds through three operations: ((1+2)*3)+4 = 13
+(sum (at (select {x: (+ (* (+ 1 2) 3) 4) from: T10}) 'x)) -- 130
+
+;; ====================================================================
+;; Pushdown beyond ALIAS — opt.c:1291-1302
+;; ALIAS is a 1-input passthrough.  In rfl `select {a: a from: ...}`
+;; with a single trivial projection compiles to SELECT (covered above);
+;; the explicit ALIAS path is the same code branch.
+;; ====================================================================
+;; FILTER over (sum-derived) projection — also confirms no spurious
+;; pushdown: FILTER above a GROUP cannot be pushed (GROUP pushdown is
+;; intentionally disabled at opt.c:1304-1306).
+(count (select {from: (select {s: (sum v) from: TG by: g}) where: (>= s 5)})) -- 2
+
+;; ====================================================================
+;; OP_NOT in pred (covers fold_unary_const NOT branch even when
+;; predicate is non-constant downstream).
+;; ====================================================================
+(count (select {from: T10 where: (not (== v 5))})) -- 9
+(count (select {from: T10 where: (not (> v 5))})) -- 5
+
+;; ====================================================================
+;; Empty-table edge — fold_filter_const_predicate keep-rows over an
+;; empty input still produces 0 rows.  Confirms MATERIALIZE rewrite
+;; preserves arity 1 (opt.c:513-515).
+;; ====================================================================
+(set TE (table [v] (list (as 'I64 (til 0)))))
+(count (select {from: TE where: (== 1 1)})) -- 0
+
+;; ====================================================================
+;; count_node_consumers (opt.c:1080-1169) — gates pushdown rewrites.
+;; A single-row scan still drives the consumer-counting walk used by
+;; pass_predicate_pushdown to decide whether the SELECT child is safe
+;; to push past.  find_consumer / find_upstream_scan (opt.c:840-927)
+;; are sip_pass-only and not reachable from rfl `select`.
+;; ====================================================================
+(set T1 (table [a] (list [42])))
+(count (select {from: T1 where: (== a 42)})) -- 1
+(sum  (at (select {from: T1 where: (== a 42)}) 'a)) -- 42
+
+;; ====================================================================
+;; Fold over a deeper expression: (sqrt (* 4 4)) -> (sqrt 16) -> 4.0
+;; — confirms post-order traversal; child folds before parent.
+;; opt.c:548 pass_constant_fold traversal.
+;; ====================================================================
+(sum (at (select {x: (sqrt (* 4 4)) from: T4}) 'x)) -- 16.0
+(sum (at (select {x: (abs (neg 7)) from: T4}) 'x)) -- 28
+(sum (at (select {x: (+ (sqrt 9) (sqrt 16)) from: T4}) 'x)) -- 28.0
