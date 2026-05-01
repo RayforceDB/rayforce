@@ -1,0 +1,305 @@
+;; Coverage push for src/ops/datalog.c — focuses on paths that rule.rfl /
+;; eav_ops.rfl don't reach: programmatic API, aggregates, comparisons /
+;; assignments / between, inline rules, env-backed EDBs, pull, error guards,
+;; head constants of multiple types, empty results.
+;;
+;; All rules used here are passed inline via `(rules ...)` so they don't
+;; collide with the global rule registry shared with rule.rfl.
+
+;; ════════════════════════ assert-fact / retract-fact / scan-eav guards ═════════════════════════
+(set Db (datoms))
+(assert-fact Db) !- arity
+(assert-fact Db 1 'a) !- arity
+(assert-fact 1 1 'a 1) !- type
+(assert-fact Db 'a 'a 1) !- type
+(assert-fact Db 1 1 1) !- type
+(assert-fact Db 1 'a [1 2 3]) !- type
+(retract-fact Db) !- arity
+(retract-fact 1 1 'a 1) !- type
+(retract-fact Db 'a 'a 1) !- type
+(retract-fact Db 1 1 1) !- type
+(retract-fact Db 1 'a [1 2 3]) !- type
+(scan-eav Db) !- arity
+(scan-eav Db 1 'a 'b) !- arity
+(scan-eav 1 'a) !- type
+(scan-eav Db 1) !- type
+(scan-eav Db 'a 1) !- type
+(count (scan-eav Db 'a)) -- 0
+
+;; ════════════════════════ scan-eav 3-arg: missing triple ═════════════════════════
+(set Db (assert-fact Db 1 'age 30))
+(scan-eav Db 99 'age) !- value
+(scan-eav Db 1 'missing) !- value
+
+;; ════════════════════════ symbolic values via assert-fact ═════════════════════════
+;; covers the v_val = sym branch (line ~3059)
+(set Db (datoms))
+(set Db (assert-fact Db 1 'name 'Alice))
+(set Db (assert-fact Db 2 'name 'Bob))
+(set Db (assert-fact Db 1 'manager 'true))
+(count (query Db (find ?e) (where (?e :name 'Alice)))) -- 1
+(count (query Db (find ?e) (where (?e :name 'Bob))))   -- 1
+(count (query Db (find ?e) (where (?e :name 'Charlie)))) -- 0
+
+;; retract-fact symbol value branch (line ~3127)
+(set Db (retract-fact Db 1 'manager 'true))
+(count (query Db (find ?e ?m) (where (?e :manager ?m)))) -- 0
+
+;; ════════════════════════ pull (entity-centric retrieval) ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'age 30))
+(set Db (assert-fact Db 1 'name 100))
+(set Db (assert-fact Db 1 'salary 80000))
+(set Db (assert-fact Db 2 'age 25))
+;; pull returns a dict; full pull on entity 1 has 3 attrs.
+(count (pull Db 1)) -- 3
+(count (pull Db 2)) -- 1
+;; entity not in db → empty dict
+(count (pull Db 99)) -- 0
+;; pull with attribute filter (sym vector) keeps matching attrs only.
+(count (pull Db 1 ['age 'salary])) -- 2
+(count (pull Db 1 ['age]))         -- 1
+;; filter that matches nothing
+(count (pull Db 1 ['nonexistent])) -- 0
+
+;; pull error guards
+(pull Db) !- arity
+(pull Db 1 ['age] 4) !- arity
+(pull 1 1) !- type
+(pull Db 'a) !- type
+(pull Db 1 [1 2 3]) !- type
+
+;; ════════════════════════ Comparison ops in rule body ═════════════════════════
+;; (> ?x 25) — variable LHS, integer RHS  (line 3759-3760)
+(set Db (datoms))
+(set Db (assert-fact Db 1 'age 30))
+(set Db (assert-fact Db 2 'age 20))
+(set Db (assert-fact Db 3 'age 25))
+(set Db (assert-fact Db 4 'age 35))
+(count (query Db (find ?e ?a) (where (?e :age ?a) (> ?a 25)))) -- 2
+(count (query Db (find ?e ?a) (where (?e :age ?a) (>= ?a 25)))) -- 3
+(count (query Db (find ?e ?a) (where (?e :age ?a) (< ?a 30)))) -- 2
+(count (query Db (find ?e ?a) (where (?e :age ?a) (<= ?a 25)))) -- 2
+(count (query Db (find ?e ?a) (where (?e :age ?a) (== ?a 25)))) -- 1
+(count (query Db (find ?e ?a) (where (?e :age ?a) (!= ?a 25)))) -- 3
+
+;; const op var — exercises the flipped-comparison branch (3761-3771).
+(count (query Db (find ?e ?a) (where (?e :age ?a) (> 30 ?a)))) -- 2
+(count (query Db (find ?e ?a) (where (?e :age ?a) (< 25 ?a)))) -- 2
+(count (query Db (find ?e ?a) (where (?e :age ?a) (>= 25 ?a)))) -- 2
+(count (query Db (find ?e ?a) (where (?e :age ?a) (<= 30 ?a)))) -- 2
+
+;; var-var comparison after multi-attr join (3757-3758)
+(set Db (datoms))
+(set Db (assert-fact Db 1 'lo 10))
+(set Db (assert-fact Db 1 'hi 20))
+(set Db (assert-fact Db 2 'lo 30))
+(set Db (assert-fact Db 2 'hi 25))
+(set Db (assert-fact Db 3 'lo 5))
+(set Db (assert-fact Db 3 'hi 100))
+(count (query Db (find ?e ?l ?h) (where (?e :lo ?l) (?e :hi ?h) (< ?l ?h)))) -- 2
+
+;; ════════════════════════ between sugar ═════════════════════════
+(set Db (datoms))
+(set Db (assert-fact Db 1 'age 18))
+(set Db (assert-fact Db 2 'age 25))
+(set Db (assert-fact Db 3 'age 30))
+(set Db (assert-fact Db 4 'age 65))
+(count (query Db (find ?e ?a) (where (?e :age ?a) (between ?a 20 50)))) -- 2
+(count (query Db (find ?e ?a) (where (?e :age ?a) (between ?a 0 100)))) -- 4
+(count (query Db (find ?e ?a) (where (?e :age ?a) (between ?a 100 200)))) -- 0
+
+;; between guards
+(query Db (find ?e ?a) (where (?e :age ?a) (between 5 0 10))) !- type
+(query Db (find ?e ?a) (where (?e :age ?a) (between ?a 'lo 10))) !- type
+(query Db (find ?e ?a) (where (?e :age ?a) (between ?a 0 'hi))) !- type
+
+;; ════════════════════════ assignment / arithmetic expressions ═════════════════════════
+;; (= ?y (+ ?x 1)) — covers dl_build_expr binop + dl_eval_expr ADD path
+(set Db (datoms))
+(set Db (assert-fact Db 1 'x 10))
+(set Db (assert-fact Db 2 'x 20))
+(set Db (assert-fact Db 3 'x 30))
+(count (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (+ ?xv 1)) (> ?y 11)))) -- 2
+(count (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (- ?xv 5)) (> ?y 10)))) -- 2
+(count (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (* ?xv 2)) (>= ?y 40)))) -- 2
+(count (query Db (find ?e ?y) (where (?e :x ?xv) (= ?y (/ ?xv 10)) (== ?y 1)))) -- 1
+
+;; expression-vs-expression comparison — covers dl_rule_add_cmp_expr.
+;; ?xv ∈ {10,20,30}; LHS=?xv+5, RHS=2*?xv → all 3 rows pass.
+(count (query Db (find ?e) (where (?e :x ?xv) (< (+ ?xv 5) (* ?xv 2))))) -- 3
+;; Reversed comparison — LHS>RHS — only when ?xv < 5; no rows.
+(count (query Db (find ?e) (where (?e :x ?xv) (> (+ ?xv 5) (* ?xv 2))))) -- 0
+
+;; ════════════════════════ aggregates (count / sum / min / max / avg) ═════════════════════════
+;; Aggregates are body literals inside rules.  We use inline rules to avoid
+;; polluting the global rule store.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'salary 50))
+(set Db (assert-fact Db 2 'salary 100))
+(set Db (assert-fact Db 3 'salary 150))
+(set Db (assert-fact Db 4 'salary 200))
+
+;; count: total number of salary facts (one row produced for the count).
+(count (query Db (find ?n) (where (employee ?e ?s) (total-count ?n)) (rules ((employee ?e ?s) (?e :salary ?s)) ((total-count ?n) (count ?n employee))))) -- 1
+
+;; sum: total salary
+(count (query Db (find ?s) (where (total ?s)) (rules ((employee ?e ?v) (?e :salary ?v)) ((total ?s) (sum ?s employee 1))))) -- 1
+
+;; min and max
+(count (query Db (find ?m) (where (lowest ?m)) (rules ((employee ?e ?v) (?e :salary ?v)) ((lowest ?m) (min ?m employee 1))))) -- 1
+(count (query Db (find ?m) (where (highest ?m)) (rules ((employee ?e ?v) (?e :salary ?v)) ((highest ?m) (max ?m employee 1))))) -- 1
+
+;; avg — promotes to float
+(count (query Db (find ?a) (where (mean ?a)) (rules ((employee ?e ?v) (?e :salary ?v)) ((mean ?a) (avg ?a employee 1))))) -- 1
+
+;; aggregate over empty source — count emits 0 (one row), MIN/MAX/AVG emit no rows.
+(set Empty (datoms))
+(count (query Empty (find ?n) (where (zero ?n)) (rules ((tic ?e ?v) (?e :nope ?v)) ((zero ?n) (count ?n tic))))) -- 1
+(count (query Empty (find ?m) (where (none ?m)) (rules ((tic ?e ?v) (?e :nope ?v)) ((none ?m) (min ?m tic 1))))) -- 0
+
+;; aggregate guards
+(query Db (find ?n) (where (bad ?n)) (rules ((bad ?n) (count 1 employee)))) !- type
+(query Db (find ?s) (where (bad ?s)) (rules ((employee ?e ?v) (?e :salary ?v)) ((bad ?s) (sum ?s employee)))) !- type
+(query Db (find ?n) (where (bad ?n)) (rules ((employee ?e ?v) (?e :salary ?v)) ((bad ?n) (count ?n employee 1)))) !- type
+
+;; ════════════════════════ negated rule invocation ═════════════════════════
+;; (not (rule-name ?args)) — distinct from (not (?e :attr ?v)) triple form.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'dept 10))
+(set Db (assert-fact Db 2 'dept 10))
+(set Db (assert-fact Db 3 'dept 20))
+(set Db (assert-fact Db 4 'dept 20))
+;; (manager ?e) is true for entities in dept 20; (not (manager ?e)) excludes them.
+(count (query Db (find ?e) (where (?e :dept 10) (not (manager ?e))) (rules ((manager ?e) (?e :dept 20))))) -- 2
+
+;; not on a predicate that matches nothing → all entities pass
+(count (query Db (find ?e) (where (?e :dept 10) (not (impossible ?e))) (rules ((impossible ?e) (?e :dept 999))))) -- 2
+
+;; not on a predicate that matches everything → empty
+(count (query Db (find ?e) (where (?e :dept 10) (not (universal ?e))) (rules ((universal ?e) (?e :dept 10))))) -- 0
+
+;; ════════════════════════ inline rules error paths ═════════════════════════
+;; rules entry not a list → type error
+(query Db (find ?e) (where (?e :dept 10)) (rules 5)) !- type
+;; head must be (name ?var ...)
+(query Db (find ?e) (where (?e :dept 10)) (rules (1 (?x :dept 10)))) !- type
+;; head name is `_` (reserved wildcard)
+(query Db (find ?e) (where (?e :dept 10)) (rules ((_ ?x) (?x :dept 10)))) !- domain
+;; (rules) with no entries is valid (returns same as no inline rules)
+(count (query Db (find ?e) (where (?e :dept 10)) (rules))) -- 2
+
+;; ════════════════════════ query API guards ═════════════════════════
+(query) !- arity
+(query Db (find ?e) (where (?e :dept 10)) (rules ((bad ?x) (?x :dept 10))) 'extra) !- arity
+(query 1 (find ?e) (where (?e :dept 10))) !- type
+(query Db 'no-find (where (?e :dept 10))) !- type
+(query Db (xfind ?e) (where (?e :dept 10))) !- type
+(query Db (find ?e 1) (where (?e :dept 10))) !- type
+(query Db (find ?e) 'no-where) !- type
+(query Db (find ?e) (xwhere (?e :dept 10))) !- type
+(query Db (find ?e) (where (?e :dept 10)) 'extra) !- type
+(query Db (find ?e) (where (?e :dept 10)) (extras 1)) !- type
+(query (datoms) (find ?e) (where 1)) !- type
+
+;; rule special form guards
+(rule (bad-head)) !- arity
+(rule 'no-list ('a)) !- type
+(rule (1 ?x) (?x :dept 10)) !- type
+(rule (_ ?x) (?x :dept 10)) !- domain
+
+;; body shape guards — non-list body clause
+(query Db (find ?e) (where 1)) !- type
+;; reference to unknown predicate at eval time — empty result, not error
+(count (query Db (find ?e) (where ('weird ?e)))) -- 0
+
+;; ════════════════════════ empty-result schema preservation (4201-4211) ═════════════════════════
+;; Even when the result is empty, the schema must reflect the find vars.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'age 30))
+;; Find vars must appear in where — drop ?n which has no binding source.
+(count (query Db (find ?e) (where (?e :age 999)))) -- 0
+(count (query Db (find ?x ?y ?z) (where (?x :nothing ?y) (?x :nope ?z)))) -- 0
+
+;; ════════════════════════ programmatic Datalog API ═════════════════════════
+;; dl-program / dl-add-edb / dl-stratify / dl-eval / dl-query
+(set P (dl-program))
+(type P) -- 'i64
+(set Edges (table ['from 'to] (list [1 2 3] [2 3 4])))
+(dl-add-edb P 'edge Edges 2) -- true
+(dl-stratify P) -- true
+(dl-eval P)     -- true
+(count (dl-query P 'edge)) -- 3
+
+;; dl-program guards
+(dl-program 1) !- arity
+(dl-add-edb P 'edge Edges) !- arity
+;; first arg must unwrap to a -RAY_I64 atom; sym slips past unwrap and fails type-check
+(dl-add-edb 'notprog 'edge Edges 2) !- type
+(dl-add-edb P 5 Edges 2) !- type
+(dl-add-edb P 'edge 5 2) !- type
+(dl-add-edb P 'edge Edges 'two) !- type
+(dl-stratify 'notprog) !- type
+(dl-eval 'notprog)     !- type
+(dl-query 'notprog 'edge) !- type
+(dl-query P 5)     !- type
+(dl-query P 'nonexistent) !- domain
+
+;; dl-provenance — provenance flag is unset, so this errors with `domain`.
+(dl-provenance P 'edge) !- domain
+(dl-provenance 'notprog 'edge) !- type
+(dl-provenance P 5) !- type
+
+;; ════════════════════════ env-backed EDB tables (4068-4167) ═════════════════════════
+;; The where-clause references a relation `pairs` that isn't an `eav` triple
+;; — query auto-discovers the env-bound table and registers it as an EDB.
+(set Db2 (datoms))
+(set pairs (table ['l 'r] (list [1 2 3] [10 20 30])))
+(count (query Db2 (find ?l ?r) (where (pairs ?l ?r)))) -- 3
+
+;; reference relation with arity-mismatch — not registered, 0 rows.
+(set tri (table ['a 'b 'c] (list [1] [2] [3])))
+(count (query Db2 (find ?x ?y) (where (tri ?x ?y)))) -- 0
+
+;; env-backed table whose 2nd column is RAY_SYM (auto-converted to I64 via
+;; ray_read_sym branch — lines 4120-4140).
+(set syms (table ['k 's] (list [1 2 3] ['x 'y 'z])))
+(count (query Db2 (find ?k ?s) (where (syms ?k ?s)))) -- 3
+
+;; ════════════════════════ rule head with sym/string/i64 constants ═════════════════════════
+;; head_const_typed RAY_SYM branch (3833-3834)
+(set Db (datoms))
+(set Db (assert-fact Db 1 'role 'admin))
+(set Db (assert-fact Db 2 'role 'user))
+(set Db (assert-fact Db 3 'role 'user))
+(count (query Db (find ?e) (where (admin-only ?e)) (rules ((admin-only ?e) (?e :role 'admin))))) -- 1
+
+;; head_const_typed RAY_I64 branch (3831-3832).
+;; Head has integer constant 7; matching body rows produce tuples (7) in
+;; "lit-i" relation, deduped to 1 row.
+(count (query Db (find ?e) (where (lit-i ?e)) (rules ((lit-i 7) (?e :role 'user))))) -- 1
+;; All-variable head for comparison.
+(count (query Db (find ?e) (where (var-head ?e)) (rules ((var-head ?e) (?e :role 'admin))))) -- 1
+
+;; head with a quoted string constant (intern as sym, RAY_SYM branch via
+;; STR conversion path 3839-3843).
+(count (query Db (find ?x) (where (lit ?x)) (rules ((lit "static") (?e :role 'user))))) -- 1
+
+;; head with f64 constant — RAY_F64 branch (3835-3838).
+(count (query Db (find ?x) (where (lit-f ?x)) (rules ((lit-f 3.14) (?e :role 'user))))) -- 1
+
+;; head with unsupported constant type (a list literal) — type error.
+(rule (bad-h [1 2]) (?e :role 'admin)) !- type
+
+;; ════════════════════════ recursive rule via inline rules (no globals) ═════════════════════════
+(set Gdb (datoms))
+(set Gdb (assert-fact Gdb 1 'edge 2))
+(set Gdb (assert-fact Gdb 2 'edge 3))
+(set Gdb (assert-fact Gdb 3 'edge 4))
+(count (query Gdb (find ?x ?y) (where (reach ?x ?y)) (rules ((reach ?x ?y) (?x :edge ?y)) ((reach ?x ?z) (?x :edge ?y) (reach ?y ?z))))) -- 6
+
+;; ════════════════════════ unstratifiable negation cycle (4170-4173) ═════════════════════════
+;; p :- not q;  q :- not p.   Mutually negating predicates have no stratification.
+(set Db (datoms))
+(set Db (assert-fact Db 1 'tag 'x))
+(query Db (find ?e) (where (p ?e)) (rules ((p ?e) (?e :tag 'x) (not (q ?e))) ((q ?e) (?e :tag 'x) (not (p ?e))))) !- domain
