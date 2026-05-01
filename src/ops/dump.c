@@ -115,10 +115,6 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_K_SHORTEST:    return "K_SHORTEST";
         case OP_CLUSTER_COEFF: return "CLUSTER_COEFF";
         case OP_RANDOM_WALK:   return "RANDOM_WALK";
-        case OP_COSINE_SIM:    return "COSINE_SIM";
-        case OP_EUCLIDEAN_DIST:return "EUCLIDEAN_DIST";
-        case OP_KNN:           return "KNN";
-        case OP_HNSW_KNN:     return "HNSW_KNN";
         case OP_ANN_RERANK:    return "ANN_RERANK";
         case OP_KNN_RERANK:    return "KNN_RERANK";
         default:               return "UNKNOWN";

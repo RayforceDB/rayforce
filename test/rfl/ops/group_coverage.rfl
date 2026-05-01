@@ -128,6 +128,19 @@
 ;; total = 810
 (sum (at (select {s: (sum (+ v 100)) from: Ta by: g}) 's)) -- 810
 
+;; ────────────── 9b. PROD aggregator emit paths ──────────────
+;; Regression coverage: grouped PROD uses the same accumulator storage as SUM,
+;; but must multiply during accumulation/merge and emit the product value.
+(set Tp (table [g v f] (list ['a 'a 'b 'b] [2 3 4 5] [1.5 2.0 3.0 4.0])))
+(sum (at (select {p: (prod v) from: Tp by: g}) 'p)) -- 26
+(max (at (select {p: (prod v) from: Tp by: g}) 'p)) -- 20
+(sum (at (select {p: (prod f) from: Tp by: g}) 'p)) -- 15.0
+(at (at (select {p: (prod v) from: Tp}) 'p) 0) -- 120
+;; F64 key forces the row-layout HT path rather than the direct-array path.
+(set Tpf (table [k v] (list [1.5 2.5 1.5 2.5 3.5 1.5] [10 20 30 40 50 60])))
+(sum (at (select {p: (prod v) from: Tpf by: k}) 'p)) -- 18850
+(max (at (select {p: (prod v) from: Tpf by: k}) 'p)) -- 18000
+
 ;; ────────────── 10. Scalar agg (n_keys==0) — no by clause ──────────────
 ;; group.c:2421-2608 is the scalar fast-path with a flat reduction.
 ;; Multi-agg + no group exercises emit_agg_columns with grp_count=1.
@@ -490,4 +503,3 @@
 (sum (at (select {fi: (first f) from: Tfg by: k}) 'fi)) -- 30.0
 ;; Last per group: 1.5→50.0, 2.5→60.0; sum = 110.0
 (sum (at (select {la: (last f) from: Tfg by: k}) 'la)) -- 110.0
-

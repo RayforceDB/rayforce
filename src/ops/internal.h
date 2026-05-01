@@ -776,6 +776,7 @@ typedef struct {
     uint8_t  agg_is_f64;
     uint8_t  agg_is_first;
     uint8_t  agg_is_last;
+    uint8_t  agg_is_prod;
     int8_t   agg_val_slot[8];
     uint16_t off_sum;
     uint16_t off_min;
@@ -918,10 +919,6 @@ ray_t* exec_if(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 
 /* ── embedding_exec.c ── */
-ray_t* exec_cosine_sim(ray_graph_t* g, ray_op_t* op, ray_t* emb_vec);
-ray_t* exec_euclidean_dist(ray_graph_t* g, ray_op_t* op, ray_t* emb_vec);
-ray_t* exec_knn(ray_graph_t* g, ray_op_t* op, ray_t* emb_vec);
-ray_t* exec_hnsw_knn(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src);
 ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src);
 

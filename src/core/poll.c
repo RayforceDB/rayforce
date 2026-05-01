@@ -23,11 +23,6 @@
 
 #include "core/poll.h"
 #include "mem/sys.h"
-#include <string.h>
-
-#ifndef RAY_OS_WINDOWS
-#include <unistd.h>
-#endif
 
 /* ===== Shared (platform-independent) poll helpers ===== */
 
@@ -76,47 +71,4 @@ void ray_poll_rx_request(ray_poll_t* poll, ray_selector_t* sel, int64_t size)
         ray_poll_buf_free(sel->rx.buf);
     }
     sel->rx.buf = ray_poll_buf_new(size);
-}
-
-void ray_poll_rx_extend(ray_poll_t* poll, ray_selector_t* sel, int64_t extra)
-{
-    (void)poll;
-    if (!sel->rx.buf) {
-        sel->rx.buf = ray_poll_buf_new(extra);
-        return;
-    }
-    int64_t new_size = sel->rx.buf->size + extra;
-    ray_poll_buf_t* nb = ray_poll_buf_new(new_size);
-    if (!nb) return;
-    if (sel->rx.buf->offset > 0)
-        memcpy(nb->data, sel->rx.buf->data, (size_t)sel->rx.buf->offset);
-    nb->offset = sel->rx.buf->offset;
-    ray_poll_buf_free(sel->rx.buf);
-    sel->rx.buf = nb;
-}
-
-void ray_poll_send(ray_poll_t* poll, ray_selector_t* sel,
-                   ray_poll_buf_t* buf)
-{
-    (void)poll;
-    if (!sel || !buf) return;
-
-    /* Use platform send_fn if available, otherwise write() */
-    int64_t sent = 0;
-    while (buf->offset < buf->size) {
-        if (sel->tx.send_fn) {
-            sent = sel->tx.send_fn(sel->fd, buf->data + buf->offset,
-                                   buf->size - buf->offset);
-        } else {
-#ifdef RAY_OS_WINDOWS
-            sent = -1;  /* must have send_fn on Windows */
-#else
-            sent = (int64_t)write((int)sel->fd, buf->data + buf->offset,
-                                  (size_t)(buf->size - buf->offset));
-#endif
-        }
-        if (sent <= 0) break;
-        buf->offset += sent;
-    }
-    ray_poll_buf_free(buf);
 }

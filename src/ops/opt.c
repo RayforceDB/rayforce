@@ -532,34 +532,6 @@ static bool fold_filter_const_predicate(ray_graph_t* g, ray_op_t* node) {
     return true;
 }
 
-/* Fold reduction(OP_TIL(n)) → closed-form result.
- * sum(0..n-1) = n*(n-1)/2,  min(0..n-1) = 0,  max(0..n-1) = n-1,
- * count(0..n-1) = n,  avg(0..n-1) = (n-1)/2.0 */
-static bool fold_reduction_til(ray_graph_t* g, ray_op_t* node) {
-    if (node->arity != 1) return false;
-    ray_op_t* input = node->inputs[0];
-    if (!input || input->opcode != OP_TIL) return false;
-    ray_op_ext_t* til_ext = find_ext(g, input->id);
-    if (!til_ext || !til_ext->literal) return false;
-    int64_t n = til_ext->literal->i64;
-    if (n <= 0) return false;
-
-    ray_t* folded = NULL;
-    switch (node->opcode) {
-        case OP_SUM:   folded = ray_i64((n * (n - 1)) / 2); break;
-        case OP_MIN:   folded = ray_i64(0); break;
-        case OP_MAX:   folded = ray_i64(n - 1); break;
-        case OP_COUNT: folded = ray_i64(n); break;
-        case OP_AVG:   folded = ray_f64((double)(n - 1) / 2.0); break;
-        case OP_FIRST: folded = ray_i64(0); break;
-        case OP_LAST:  folded = ray_i64(n - 1); break;
-        default: return false;
-    }
-    if (!folded || RAY_IS_ERR(folded)) return false;
-    if (!replace_with_const(g, node, folded)) { ray_release(folded); return false; }
-    return true;
-}
-
 static void fold_node(ray_graph_t* g, ray_op_t* node) {
     /* Fold unary element-wise ops with constant input */
     if (node->arity == 1 && node->opcode >= OP_NEG && node->opcode <= OP_FLOOR) {
@@ -568,10 +540,6 @@ static void fold_node(ray_graph_t* g, ray_op_t* node) {
     /* Fold binary element-wise ops with two const inputs */
     if (node->arity == 2 && node->opcode >= OP_ADD && node->opcode <= OP_MAX2) {
         (void)fold_binary_const(g, node);
-    }
-    /* Fold reduction(til(n)) to closed-form */
-    if (node->arity == 1 && node->opcode >= OP_SUM && node->opcode <= OP_LAST) {
-        (void)fold_reduction_til(g, node);
     }
     /* FILTER with constant predicate can be reduced to pass-through/empty. */
     (void)fold_filter_const_predicate(g, node);

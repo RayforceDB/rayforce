@@ -217,8 +217,7 @@ void ray_graph_free(ray_graph_t* g) {
     /* M6: Release OP_CONST literal values before freeing ext nodes */
     for (uint32_t i = 0; i < g->ext_count; i++) {
         ray_op_ext_t* ext = g->ext_nodes[i];
-        if (ext && (g->nodes[ext->base.id].opcode == OP_CONST ||
-                    g->nodes[ext->base.id].opcode == OP_TIL) && ext->literal) {
+        if (ext && g->nodes[ext->base.id].opcode == OP_CONST && ext->literal) {
             ray_release(ext->literal);
         }
         /* Release runtime-built SIP bitmaps on graph traversal nodes */
@@ -352,20 +351,6 @@ ray_op_t* ray_const_str(ray_graph_t* g, const char* s, size_t len) {
     ext->literal = ray_str(s, len);
     /* L4: null/error check on allocation result */
     if (!ext->literal || RAY_IS_ERR(ext->literal)) ext->literal = NULL;
-
-    g->nodes[ext->base.id] = ext->base;
-    return &g->nodes[ext->base.id];
-}
-
-ray_op_t* ray_til(ray_graph_t* g, int64_t n) {
-    ray_op_ext_t* ext = graph_alloc_ext_node(g);
-    if (!ext) return NULL;
-
-    ext->base.opcode = OP_TIL;
-    ext->base.arity = 0;
-    ext->base.out_type = RAY_I64;
-    ext->base.est_rows = (uint32_t)(n > UINT32_MAX ? UINT32_MAX : n);
-    ext->literal = ray_i64(n);  /* store n as literal */
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
@@ -1470,76 +1455,6 @@ ray_op_t* ray_wco_join(ray_graph_t* g,
     return &g->nodes[ext->base.id];
 }
 
-/* --------------------------------------------------------------------------
- * Vector similarity builders
- * -------------------------------------------------------------------------- */
-
-ray_op_t* ray_cosine_sim(ray_graph_t* g, ray_op_t* emb_col,
-                        const float* query_vec, int32_t dim) {
-    if (!g || !emb_col || !query_vec || dim <= 0) return NULL;
-
-    ray_op_ext_t* ext = graph_alloc_ext_node(g);
-    if (!ext) return NULL;
-
-    emb_col = &g->nodes[emb_col->id];
-
-    ext->base.opcode    = OP_COSINE_SIM;
-    ext->base.arity     = 1;
-    ext->base.inputs[0] = emb_col;
-    ext->base.out_type  = RAY_F64;
-    ext->base.est_rows  = emb_col->est_rows;
-    ext->vector.query_vec = (float*)query_vec;
-    ext->vector.dim       = dim;
-
-    g->nodes[ext->base.id] = ext->base;
-    return &g->nodes[ext->base.id];
-}
-
-ray_op_t* ray_euclidean_dist(ray_graph_t* g, ray_op_t* emb_col,
-                            const float* query_vec, int32_t dim) {
-    if (!g || !emb_col || !query_vec || dim <= 0) return NULL;
-
-    ray_op_ext_t* ext = graph_alloc_ext_node(g);
-    if (!ext) return NULL;
-
-    emb_col = &g->nodes[emb_col->id];
-
-    ext->base.opcode    = OP_EUCLIDEAN_DIST;
-    ext->base.arity     = 1;
-    ext->base.inputs[0] = emb_col;
-    ext->base.out_type  = RAY_F64;
-    ext->base.est_rows  = emb_col->est_rows;
-    ext->vector.query_vec = (float*)query_vec;
-    ext->vector.dim       = dim;
-
-    g->nodes[ext->base.id] = ext->base;
-    return &g->nodes[ext->base.id];
-}
-
-ray_op_t* ray_knn(ray_graph_t* g, ray_op_t* emb_col,
-                 const float* query_vec, int32_t dim, int64_t k,
-                 ray_hnsw_metric_t metric) {
-    if (!g || !emb_col || !query_vec || dim <= 0 || k <= 0) return NULL;
-
-    ray_op_ext_t* ext = graph_alloc_ext_node(g);
-    if (!ext) return NULL;
-
-    emb_col = &g->nodes[emb_col->id];
-
-    ext->base.opcode    = OP_KNN;
-    ext->base.arity     = 1;
-    ext->base.inputs[0] = emb_col;
-    ext->base.out_type  = RAY_TABLE;
-    ext->base.est_rows  = (uint32_t)k;
-    ext->vector.query_vec = (float*)query_vec;
-    ext->vector.dim       = dim;
-    ext->vector.k         = k;
-    ext->vector.metric    = (int32_t)metric;
-
-    g->nodes[ext->base.id] = ext->base;
-    return &g->nodes[ext->base.id];
-}
-
 ray_op_t* ray_cluster_coeff(ray_graph_t* g, ray_rel_t* rel) {
     if (!g || !rel) return NULL;
     ray_op_ext_t* ext = graph_alloc_ext_node(g);
@@ -1679,28 +1594,6 @@ ray_op_t* ray_mst(ray_graph_t* g, ray_rel_t* rel, const char* weight_col) {
     ext->graph.rel     = rel;
     ext->graph.direction = 2;
     ext->graph.weight_col_sym = ray_sym_intern(weight_col, (int64_t)strlen(weight_col));
-    g->nodes[ext->base.id] = ext->base;
-    return &g->nodes[ext->base.id];
-}
-
-ray_op_t* ray_hnsw_knn(ray_graph_t* g, ray_hnsw_t* idx,
-                       const float* query_vec, int32_t dim,
-                       int64_t k, int32_t ef_search) {
-    if (!g || !idx || !query_vec || dim <= 0 || k <= 0) return NULL;
-
-    ray_op_ext_t* ext = graph_alloc_ext_node(g);
-    if (!ext) return NULL;
-
-    ext->base.opcode    = OP_HNSW_KNN;
-    ext->base.arity     = 0;  /* nullary: reads from index directly */
-    ext->base.out_type  = RAY_TABLE;
-    ext->base.est_rows  = (uint32_t)k;
-    ext->hnsw.hnsw_idx  = idx;
-    ext->hnsw.query_vec = (float*)query_vec;
-    ext->hnsw.dim       = dim;
-    ext->hnsw.k         = k;
-    ext->hnsw.ef_search = ef_search > 0 ? ef_search : HNSW_DEFAULT_EF_S;
-
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
 }

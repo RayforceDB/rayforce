@@ -27,7 +27,6 @@
 #include <rayforce.h>
 
 /* Partitioned table */
-ray_t*    ray_part_load(const char* db_root, const char* table_name);
 ray_t*    ray_read_parted(const char* db_root, const char* table_name);
 
 #endif /* RAY_PART_H */

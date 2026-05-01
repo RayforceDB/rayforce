@@ -930,19 +930,6 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             return ext->literal;
         }
 
-        case OP_TIL: {
-            ray_op_ext_t* ext = find_ext(g, op->id);
-            if (!ext || !ext->literal) return ray_error("nyi", NULL);
-            int64_t n = ext->literal->i64;
-            if (n <= 0) return ray_vec_new(RAY_I64, 0);
-            ray_t* vec = ray_vec_new(RAY_I64, n);
-            if (!vec || RAY_IS_ERR(vec)) return vec;
-            vec->len = n;
-            int64_t* d = (int64_t*)ray_data(vec);
-            for (int64_t i = 0; i < n; i++) d[i] = i;
-            return vec;
-        }
-
         /* Membership: col IN set_vec */
         case OP_IN: case OP_NOT_IN: {
             ray_t* col = exec_node(g, op->inputs[0]);
@@ -1777,30 +1764,6 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             return result;
         }
 
-        case OP_COSINE_SIM: {
-            ray_t* emb = exec_node(g, op->inputs[0]);
-            if (!emb || RAY_IS_ERR(emb)) return emb;
-            ray_t* result = exec_cosine_sim(g, op, emb);
-            ray_release(emb);
-            return result;
-        }
-        case OP_EUCLIDEAN_DIST: {
-            ray_t* emb = exec_node(g, op->inputs[0]);
-            if (!emb || RAY_IS_ERR(emb)) return emb;
-            ray_t* result = exec_euclidean_dist(g, op, emb);
-            ray_release(emb);
-            return result;
-        }
-        case OP_KNN: {
-            ray_t* emb = exec_node(g, op->inputs[0]);
-            if (!emb || RAY_IS_ERR(emb)) return emb;
-            ray_t* result = exec_knn(g, op, emb);
-            ray_release(emb);
-            return result;
-        }
-        case OP_HNSW_KNN: {
-            return exec_hnsw_knn(g, op);
-        }
         case OP_ANN_RERANK: {
             ray_t* src = exec_node(g, op->inputs[0]);
             if (!src || RAY_IS_ERR(src)) return src;

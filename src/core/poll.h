@@ -107,9 +107,5 @@ ray_poll_buf_t* ray_poll_buf_new(int64_t size);
 void            ray_poll_buf_free(ray_poll_buf_t* buf);
 void            ray_poll_rx_request(ray_poll_t* poll, ray_selector_t* sel,
                                     int64_t size);
-void            ray_poll_rx_extend(ray_poll_t* poll, ray_selector_t* sel,
-                                   int64_t extra);
-void            ray_poll_send(ray_poll_t* poll, ray_selector_t* sel,
-                              ray_poll_buf_t* buf);
 
 #endif /* RAY_POLL_H */

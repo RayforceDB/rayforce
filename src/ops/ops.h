@@ -103,7 +103,6 @@ void     ray_cancel(void);
 /* Opcodes — Sources */
 #define OP_SCAN          1
 #define OP_CONST         2
-#define OP_TIL           3   /* generate 0..n-1 sequence (lazy source)  */
 
 /* Opcodes — Unary element-wise (fuseable) */
 #define OP_NEG          10
@@ -216,11 +215,7 @@ void     ray_cancel(void);
 #define OP_CLOSENESS      100   /* closeness centrality                   */
 #define OP_MST            101   /* minimum spanning forest (Kruskal)      */
 
-/* Opcodes — Vector similarity */
-#define OP_COSINE_SIM      88   /* cosine similarity between embeddings   */
-#define OP_EUCLIDEAN_DIST  89   /* euclidean distance between embeddings  */
-#define OP_KNN             90   /* brute-force K nearest neighbors        */
-#define OP_HNSW_KNN        91   /* HNSW approximate K nearest neighbors   */
+/* Opcodes — Vector search */
 #define OP_ANN_RERANK     102   /* index-backed ANN over filtered source  */
 #define OP_KNN_RERANK     103   /* brute-force KNN over filtered source   */
 
@@ -337,19 +332,6 @@ typedef struct ray_op_ext {
             uint8_t   n_rels;
             uint8_t   n_vars;
         } wco;
-        struct {  /* OP_COSINE_SIM / OP_EUCLIDEAN_DIST / OP_INNER_PRODUCT / OP_KNN */
-            float*    query_vec;      /* query embedding (caller-owned, must outlive graph) */
-            int32_t   dim;            /* embedding dimension */
-            int64_t   k;              /* top-K for KNN */
-            int32_t   metric;         /* ray_hnsw_metric_t — used by OP_KNN only */
-        } vector;
-        struct {  /* OP_HNSW_KNN */
-            void*     hnsw_idx;       /* ray_hnsw_t* (opaque, must outlive graph) */
-            float*    query_vec;
-            int32_t   dim;
-            int64_t   k;
-            int32_t   ef_search;
-        } hnsw;
         struct {  /* OP_ANN_RERANK / OP_KNN_RERANK */
             void*     hnsw_idx;       /* ray_hnsw_t* for ANN; NULL for KNN */
             int64_t   col_sym;        /* sym id of column for KNN; 0 for ANN */
@@ -547,9 +529,6 @@ ray_op_t* ray_concat(ray_graph_t* g, ray_op_t** args, int n);
 ray_op_t* ray_extract(ray_graph_t* g, ray_op_t* col, int64_t field);
 ray_op_t* ray_date_trunc(ray_graph_t* g, ray_op_t* col, int64_t field);
 
-/* Source ops */
-ray_op_t* ray_til(ray_graph_t* g, int64_t n);
-
 /* Reduction ops */
 ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_prod(ray_graph_t* g, ray_op_t* a);
@@ -648,20 +627,6 @@ ray_op_t* ray_random_walk(ray_graph_t* g, ray_op_t* src, ray_rel_t* rel,
 ray_op_t* ray_betweenness(ray_graph_t* g, ray_rel_t* rel, uint16_t sample_size);
 ray_op_t* ray_closeness(ray_graph_t* g, ray_rel_t* rel, uint16_t sample_size);
 ray_op_t* ray_mst(ray_graph_t* g, ray_rel_t* rel, const char* weight_col);
-
-/* Vector similarity ops */
-ray_op_t* ray_cosine_sim(ray_graph_t* g, ray_op_t* emb_col,
-                        const float* query_vec, int32_t dim);
-ray_op_t* ray_euclidean_dist(ray_graph_t* g, ray_op_t* emb_col,
-                            const float* query_vec, int32_t dim);
-ray_op_t* ray_knn(ray_graph_t* g, ray_op_t* emb_col,
-                 const float* query_vec, int32_t dim, int64_t k,
-                 ray_hnsw_metric_t metric);
-
-/* HNSW-accelerated KNN (uses pre-built index instead of brute-force) */
-ray_op_t* ray_hnsw_knn(ray_graph_t* g, ray_hnsw_t* idx,
-                       const float* query_vec, int32_t dim,
-                       int64_t k, int32_t ef_search);
 
 /* Rerank ops: consume a filtered source table and return top-K nearest rows
  * (source columns + _dist appended).  Used by `select ... nearest ... take`. */

@@ -1,7 +1,7 @@
 ;; Targeted coverage for src/ops/exec.c — exercises the OP_<x> dispatcher
 ;; branches that the existing suites under test/rfl/{table,sort,agg,
-;; integration} don't reach: OP_TIL edges, OP_IN parallel-worker path,
-;; OP_HEAD with SORT/GROUP/FILTER fusion, OP_TAIL on tables, OP_PIVOT
+;; integration} don't reach: OP_IN parallel-worker path, OP_HEAD with
+;; SORT/GROUP/FILTER fusion, OP_TAIL on tables, OP_PIVOT
 ;; with selection compaction, chained OP_FILTER (rowsel refine),
 ;; HAVING-fusion (FILTER over GROUP), broadcast_scalar via SELECT
 ;; expression, ANTIJOIN selection compaction, OP_EXTRACT in projection,
@@ -12,7 +12,7 @@
 (.sys.exec "rm -rf /tmp/rfl_exec_coverage")
 
 ;; ====================================================================
-;; OP_TIL — exec.c:920-931
+;; til language builtin
 ;; ====================================================================
 ;; Positive arg path; dispatcher emits a fresh I64 vector.
 (count (til 100)) -- 100

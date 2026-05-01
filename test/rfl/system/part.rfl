@@ -3,11 +3,6 @@
 ;; static helpers infer_mc_type, parse_date_dir, parse_int_dir,
 ;; is_date_dir, is_integer_str, and collect_part_dirs.
 ;;
-;; ray_part_load (lines 186-306 of part.c) is unreachable from rfl —
-;; nothing in src/ops or src/lang dispatches to it; only ray_read_parted
-;; is wired up as .db.parted.get / .db.parted.mount.  Coverage of that
-;; legacy concat path therefore stays 0 and is excluded from this file.
-;;
 ;; Assertions stick to (count TABLE), (count (key TABLE)), (first (key
 ;; TABLE)) and exact key-vector compares.  Reducing across a parted
 ;; column directly (e.g. sum (at Pd 'val)) goes through ray_sum_fn,
@@ -82,10 +77,8 @@
 
 ;; ────────────── single-partition root ──────────────
 ;; ray_read_parted has no part_count==1 fast-return; it always runs
-;; the full builder (the legacy fast-path on line 224 lives in
-;; ray_part_load, which is unreachable from rfl).  This case still
-;; covers the for-loop bodies with a single iteration and the
-;; segment retain/willneed call.
+;; the full builder.  This case still covers the for-loop bodies with a
+;; single iteration and the segment retain/willneed call.
 (set SP (table [x] (list [7 8 9 10])))
 (.db.splayed.set "/tmp/rfl_part_single/2024.06.15/t/" SP)
 (set Psp (.db.parted.get "/tmp/rfl_part_single/" 't))
