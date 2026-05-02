@@ -255,6 +255,16 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         buf[8] = 0;
         return 1 + 8;
     }
+    /* RAY_NULL_OBJ — ray_serde_size mirrors this with `return 1`.
+     * Without this branch, ser_raw fell through to the vec path,
+     * wrote `obj->type` (= 126 = RAY_SERDE_NULL on the wire) plus
+     * vector-shape garbage, corrupting any frame that contained a
+     * null result (e.g. a list response from a `(println ...)`
+     * eval whose second element is the bare null sentinel). */
+    if (RAY_IS_NULL(obj)) {
+        buf[0] = RAY_SERDE_NULL;
+        return 1;
+    }
 
     int8_t type = obj->type;
     buf[0] = (uint8_t)type;
@@ -702,12 +712,24 @@ ray_t* ray_de_raw(uint8_t* buf, int64_t* len) {
         int64_t saved = *len;
         for (int64_t i = 0; i < l; i++) {
             elems[i] = ray_de_raw(buf + (saved - *len), len);
-            if (!elems[i] || RAY_IS_ERR(elems[i])) {
+            /* A NULL element is the in-band representation of
+             * RAY_NULL_OBJ on the wire (ray_ser_raw writes SERDE_NULL
+             * for the null singleton; ray_de_raw returns C NULL for
+             * that marker).  Lists must round-trip them — e.g. an IPC
+             * VERBOSE response is `[captured_str, result]` where
+             * `result` is RAY_NULL_OBJ for any (println ...) /
+             * (set ...) eval.  Rejecting NULL here would error the
+             * whole frame as "domain".  Substitute the singleton so
+             * downstream code (ray_lang_print, etc.) sees a valid
+             * pointer instead of a raw NULL. */
+            if (!elems[i]) {
+                elems[i] = RAY_NULL_OBJ;
+            } else if (RAY_IS_ERR(elems[i])) {
                 /* Clean up already-deserialized elements */
                 for (int64_t j = 0; j < i; j++) ray_release(elems[j]);
                 list->len = 0;
                 ray_release(list);
-                return elems[i] ? elems[i] : ray_error("domain", NULL);
+                return elems[i];
             }
         }
         return list;
