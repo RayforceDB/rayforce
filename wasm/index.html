@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Playground</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/clojure.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/obsidian.min.css">
+  <link rel="stylesheet" type="text/css" href="https://adobe-fonts.github.io/source-code-pro/source-code-pro.css">
+  <style>
+    body,
+    html {
+      height: 100%;
+      width: 100%;
+      margin: 0;
+      display: flex;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    #sidebar {
+      display: flex;
+      flex-direction: column;
+      padding: 12px;
+      background-color: #444;
+    }
+
+    #sidebar button {
+      background: none;
+      border: none;
+      color: white;
+      cursor: pointer;
+      margin-bottom: 10px;
+      font-size: 24px;
+    }
+
+    #container {
+      flex-grow: 1;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+    }
+
+    .textout {
+      font-family: monospace;
+      background-color: #282b2e;
+      color: white;
+      font-size: 16px;
+      margin-top: 0;
+    }
+
+    #output {
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+
+    .input-container {
+      display: flex;
+      align-items: center;
+      width: 100%;
+    }
+
+    .prompt {
+      font-size: 20px;
+      font-weight: bold;
+      color: #00da1a;
+      white-space: nowrap;
+      padding-left: 5px;
+    }
+
+    #input {
+      flex-grow: 1;
+      background-color: transparent;
+      border: none;
+      outline: none;
+      width: auto;
+      caret-color: white;
+    }
+
+    pre code.hljs {
+      display: block;
+      overflow-x: auto;
+      padding: 1em;
+      font-family: 'Source Code Pro', 'SF Mono', 'SFMono-Regular', ui-monospace, 'DejaVu Sans Mono', 'Menlo',
+        'Consolas', 'Roboto Mono', 'Roboto', monospace;
+      white-space-collapse: preserve;
+      text-wrap: nowrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="sidebar">
+    <button onclick="location.href='/'"><i class="fas fa-home"></i></button>
+    <button onclick="location.href='https://github.com/singaraiona/rayforce'"><i class="fab fa-github"></i></button>
+    <button class="icon-btn" onclick="clearInput()"><i class="fas fa-broom"></i></button>
+  </div>
+  <div id="container" class="textout">
+    <div id="about" class="textout"></div>
+    <pre id="output" class="textout"><code class="language-clojure"></code></pre>
+    <div id="input-container" class="input-container">
+      <span class="textout prompt">&#x21AA; </span>
+      <input id="input" class="textout" type="text" autofocus>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/ansi_up@5"></script>
+  <script src="rayforce.js"></script>
+  <script>
+    let history = []; // Array to store command history
+    let historyIndex = -1; // Current position in history;
+
+    document.getElementById('input').addEventListener('keydown', function (event) {
+      const inputField = document.getElementById('input');
+
+      // Enter key: Submit command
+      if (event.keyCode === 13) {
+        const input = inputField.value.trim();
+        if (input !== '') {
+          handleInput(input);
+
+          // Prevent duplicate consecutive entries
+          if (history.length === 0 || history[history.length - 1] !== input) {
+            history.push(input); // Add the command to the end of the history array
+          }
+
+          inputField.value = ''; // Clear input field
+          historyIndex = history.length; // Set history index to point past the last item
+        }
+        event.preventDefault(); // Prevent default to stop form submission
+      }
+      // Up arrow key: Move to previous command
+      else if (event.keyCode === 38) {
+        if (historyIndex > 0) {
+          historyIndex--;
+          inputField.value = history[historyIndex];
+          event.preventDefault(); // Prevent the cursor from moving
+        }
+      }
+      // Down arrow key: Move to next command
+      else if (event.keyCode === 40) {
+        if (historyIndex < history.length - 1) {
+          historyIndex++;
+          inputField.value = history[historyIndex];
+        } else {
+          historyIndex = history.length;
+          inputField.value = ''; // Clear input when moving past the most recent command
+        }
+        event.preventDefault(); // Prevent the cursor from moving
+      }
+    });
+
+    function onRuntimeInit(info) {
+      const about = document.getElementById('about');
+      const ansiUp = new AnsiUp();
+      const html = ansiUp.ansi_to_html(info);
+      about.innerHTML = '<pre><code class="language-clojure">' + html + '</code></pre>';
+    };
+
+    function handleInput(input) {
+      const obj = Module.ccall('eval_str', 'number', ['string'], [input]);
+      const fob = Module.ccall('obj_fmt', 'number', ['number'], [obj]);
+      const fmt = Module.ccall('strof_obj', 'string', ['number'], [fob]);
+      sendOutput(input + '\n' + fmt);
+      Module.ccall('drop_obj', 'null', ['number'], [fob]);
+      Module.ccall('drop_obj', 'null', ['number'], [obj]);
+    }
+
+    function sendOutput(text) {
+      const output = document.getElementById('output');
+      const ansiUp = new AnsiUp();
+      const html = ansiUp.ansi_to_html(text);
+      output.innerHTML += '<pre><code class="language-clojure">' + html + '</code></pre>';
+      hljs.highlightElement(output.lastChild.firstChild); // Highlight the latest code block
+      const container = document.getElementById('container');
+      container.scrollTop = container.scrollHeight;
+      output.scrollTop = output.scrollHeight;
+    }
+
+
+    function clearInput() {
+      document.getElementById('output').innerHTML = '';
+      document.getElementById('input').value = '';
+    }
+
+    Module['rayforce_ready'] = onRuntimeInit;
+
+  </script>
+</body>
+
+</html>
