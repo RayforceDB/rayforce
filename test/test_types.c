@@ -25,7 +25,23 @@
 #include <rayforce.h>
 #include <rayforce.h>
 #include "core/types.h"
+#include "lang/env.h"
 #include "ops/ops.h"
+
+/* Forward-declare runtime API (ray_fn_name test needs builtins registered). */
+struct ray_runtime_s;
+typedef struct ray_runtime_s ray_runtime_t;
+extern ray_runtime_t* ray_runtime_create(int argc, char** argv);
+extern void           ray_runtime_destroy(ray_runtime_t* rt);
+extern ray_runtime_t* __RUNTIME;
+
+static void types_runtime_setup(void) {
+    ray_runtime_create(0, NULL);
+}
+
+static void types_runtime_teardown(void) {
+    ray_runtime_destroy(__RUNTIME);
+}
 
 /* ---- test_type_sizes_known_types --------------------------------------- */
 
@@ -75,12 +91,97 @@ static test_result_t test_type_sizes_pointer_types(void) {
     PASS();
 }
 
+/* ---- test_version_getters --------------------------------------------- */
+
+static test_result_t test_version_getters(void) {
+    /* Version components are non-negative integers. */
+    int major = ray_version_major();
+    int minor = ray_version_minor();
+    int patch = ray_version_patch();
+
+    TEST_ASSERT(major >= 0, "ray_version_major < 0");
+    TEST_ASSERT(minor >= 0, "ray_version_minor < 0");
+    TEST_ASSERT(patch >= 0, "ray_version_patch < 0");
+
+    /* Must agree with the public macros (which the implementation echoes). */
+    TEST_ASSERT_EQ_I(major, RAY_VERSION_MAJOR);
+    TEST_ASSERT_EQ_I(minor, RAY_VERSION_MINOR);
+    TEST_ASSERT_EQ_I(patch, RAY_VERSION_PATCH);
+
+    PASS();
+}
+
+/* ---- test_version_string ----------------------------------------------- */
+
+static test_result_t test_version_string(void) {
+    const char* s = ray_version_string();
+    TEST_ASSERT_NOT_NULL(s);
+
+    /* Shape: "MAJOR.MINOR.PATCH" — at minimum two dots, all-digit between. */
+    int dots = 0;
+    int digits = 0;
+    for (const char* p = s; *p; p++) {
+        if (*p == '.') dots++;
+        else if (*p >= '0' && *p <= '9') digits++;
+        else FAILF("unexpected character '%c' in version string \"%s\"", *p, s);
+    }
+    TEST_ASSERT_EQ_I(dots, 2);
+    TEST_ASSERT(digits >= 3, "version string has fewer than 3 digits");
+
+    /* Parse back and compare with the integer getters. */
+    int maj = 0, min = 0, pat = 0;
+    int n = sscanf(s, "%d.%d.%d", &maj, &min, &pat);
+    TEST_ASSERT_EQ_I(n, 3);
+    TEST_ASSERT_EQ_I(maj, ray_version_major());
+    TEST_ASSERT_EQ_I(min, ray_version_minor());
+    TEST_ASSERT_EQ_I(pat, ray_version_patch());
+
+    PASS();
+}
+
+/* ---- test_fn_name_builtin ---------------------------------------------- */
+/* ray_fn_name reads the function-object name from nullmap[2..15].  After
+ * ray_runtime_create the global env contains builtins like "+", "sum", and
+ * "println"; looking them up and reading the name back round-trips the
+ * fn_set_name encoding inside env.c. */
+
+static test_result_t test_fn_name_builtin(void) {
+    /* "+" — single byte name, fits in nullmap[2..15] easily. */
+    int64_t plus_id = ray_sym_intern("+", 1);
+    ray_t* plus = ray_env_get(plus_id);
+    TEST_ASSERT_NOT_NULL(plus);
+    /* Builtin "+" is registered as a binary fn. */
+    TEST_ASSERT_EQ_I(plus->type, RAY_BINARY);
+
+    const char* plus_name = ray_fn_name(plus);
+    TEST_ASSERT_NOT_NULL(plus_name);
+    TEST_ASSERT_STR_EQ(plus_name, "+");
+
+    /* "sum" — multi-character name to exercise the memcpy path. */
+    int64_t sum_id = ray_sym_intern("sum", 3);
+    ray_t* sum = ray_env_get(sum_id);
+    TEST_ASSERT_NOT_NULL(sum);
+
+    const char* sum_name = ray_fn_name(sum);
+    TEST_ASSERT_NOT_NULL(sum_name);
+    TEST_ASSERT_STR_EQ(sum_name, "sum");
+
+    /* The pointer must be inside the function object's nullmap region
+     * (offset 2 from the nullmap base). */
+    TEST_ASSERT_EQ_PTR(sum_name, (const char*)sum->nullmap + 2);
+
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t types_entries[] = {
     { "types/sizes_known_types", test_type_sizes_known_types, NULL, NULL },
     { "types/elem_size_macro", test_elem_size_macro, NULL, NULL },
     { "types/sizes_pointer_types", test_type_sizes_pointer_types, NULL, NULL },
+    { "types/version_getters", test_version_getters, NULL, NULL },
+    { "types/version_string", test_version_string, NULL, NULL },
+    { "types/fn_name_builtin", test_fn_name_builtin, types_runtime_setup, types_runtime_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

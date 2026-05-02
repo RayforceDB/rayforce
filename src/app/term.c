@@ -898,6 +898,14 @@ static int32_t find_word_start(const char* buf, int32_t pos) {
 static void ray_term_update_ghost(ray_term_t* term) {
     term->ghost_len = 0;
 
+    /* While Tab cycling is active, leave comp_items/comp_count alone —
+     * the user is rotating through a fixed candidate set and a fresh
+     * collect (against the now-completed word) would either clobber
+     * with zero entries or with a different list, both of which break
+     * the next Tab's modulo.  Just suppress ghost text. */
+    if (term->comp_cycling)
+        return;
+
     /* Only show ghost at end of buffer or end of a word */
     if (term->buf_pos != term->buf_len) {
         term->comp_count = 0;
@@ -1782,6 +1790,14 @@ static ray_t* feed_normal(ray_term_t* term, int key) {
 
     case KEYCODE_TAB: {
         if (term->comp_cycling) {
+            /* update_ghost (called from each redraw) resets comp_count to
+             * 0 once the inserted word fully matches itself — without
+             * the guard the next Tab would `% 0` and crash.  Just exit
+             * cycling cleanly when the candidate list has gone away. */
+            if (term->comp_count <= 0) {
+                term->comp_cycling = 0;
+                return NULL;
+            }
             int32_t next = (term->comp_cycle_idx + 1) % term->comp_count;
             comp_cycle_insert(term, next);
             term->ghost_len = 0;

@@ -1009,6 +1009,1086 @@ static test_result_t test_term_collect_completions_history(void) {
     PASS();
 }
 
+/* ─── Prompt prefix + prompts ─────────────────────────────────────── */
+
+/* set_prompt_prefix with a normal short string: stores ANSI-wrapped bytes
+ * and tracks visual width (unwrapped + 1 for trailing space). */
+static test_result_t test_term_set_prompt_prefix_basic(void) {
+    ray_t* block = ray_alloc(sizeof(ray_term_t));
+    if (!block) FAIL("ray_alloc failed");
+    ray_term_t* t = (ray_term_t*)ray_data(block);
+    memset(t, 0, sizeof(*t));
+    t->_block = block;
+
+    ray_term_set_prompt_prefix(t, "host:8080");
+    TEST_ASSERT_FMT(t->prompt_prefix_len > 0, "prefix_len must be > 0");
+    TEST_ASSERT_FMT(t->prompt_prefix_vis == 9 + 1,
+                    "expected vis=10, got %d", t->prompt_prefix_vis);
+    TEST_ASSERT_FMT(strstr(t->prompt_prefix, "host:8080") != NULL,
+                    "prefix bytes missing user string");
+    TEST_ASSERT_FMT(strstr(t->prompt_prefix, "\033[33m") != NULL,
+                    "prefix missing yellow ANSI start");
+    TEST_ASSERT_FMT(strstr(t->prompt_prefix, "\033[0m") != NULL,
+                    "prefix missing reset");
+
+    /* Clear via NULL */
+    ray_term_set_prompt_prefix(t, NULL);
+    TEST_ASSERT_EQ_I(t->prompt_prefix_len, 0);
+    TEST_ASSERT_EQ_I(t->prompt_prefix_vis, 0);
+    TEST_ASSERT_EQ_I(t->prompt_prefix[0], '\0');
+
+    /* Clear via empty string */
+    ray_term_set_prompt_prefix(t, "x");
+    TEST_ASSERT_FMT(t->prompt_prefix_len > 0, "set after clear failed");
+    ray_term_set_prompt_prefix(t, "");
+    TEST_ASSERT_EQ_I(t->prompt_prefix_len, 0);
+
+    /* NULL term must not crash */
+    ray_term_set_prompt_prefix(NULL, "abc");
+
+    /* Overflow: snprintf writes ~80 bytes; pass a 200-char string to
+     * trip the truncation guard. */
+    char big[256];
+    memset(big, 'x', 200);
+    big[200] = '\0';
+    ray_term_set_prompt_prefix(t, big);
+    TEST_ASSERT_EQ_I(t->prompt_prefix_len, 0);
+    TEST_ASSERT_EQ_I(t->prompt_prefix_vis, 0);
+
+    ray_free(block);
+    PASS();
+}
+
+static test_result_t test_term_prompt_emits_bytes(void) {
+    ray_t* block = ray_alloc(sizeof(ray_term_t));
+    if (!block) FAIL("ray_alloc failed");
+    ray_term_t* t = (ray_term_t*)ray_data(block);
+    memset(t, 0, sizeof(*t));
+    t->_block = block;
+
+    char path[256], cap[512];
+    int saved = capture_begin(path, sizeof path);
+    if (saved < 0) { ray_free(block); FAIL("capture setup failed"); }
+    ray_term_prompt(t);
+    fflush(stdout);
+    int32_t n = capture_end(saved, path, cap, sizeof cap);
+    int saw_arrow = strstr(cap, "\xe2\x80\xa3") != NULL; /* ‣ */
+    int saw_green = strstr(cap, "\033[32m") != NULL;
+    TEST_ASSERT_FMT(n > 0, "no prompt output");
+    TEST_ASSERT_FMT(saw_arrow, "missing ‣ arrow in prompt: bytes=%d", n);
+    TEST_ASSERT_FMT(saw_green, "missing green ANSI in prompt");
+    TEST_ASSERT_EQ_I(t->prompt_len, 2);
+    ray_free(block);
+    PASS();
+}
+
+static test_result_t test_term_prompt_with_prefix(void) {
+    ray_t* block = ray_alloc(sizeof(ray_term_t));
+    if (!block) FAIL("ray_alloc failed");
+    ray_term_t* t = (ray_term_t*)ray_data(block);
+    memset(t, 0, sizeof(*t));
+    t->_block = block;
+
+    ray_term_set_prompt_prefix(t, "rmt");
+    char path[256], cap[512];
+    int saved = capture_begin(path, sizeof path);
+    if (saved < 0) { ray_free(block); FAIL("capture setup failed"); }
+    ray_term_prompt(t);
+    fflush(stdout);
+    int32_t n = capture_end(saved, path, cap, sizeof cap);
+    int saw_prefix = strstr(cap, "rmt") != NULL;
+    TEST_ASSERT_FMT(n > 0, "no prompt output");
+    TEST_ASSERT_FMT(saw_prefix, "prompt missing prefix bytes");
+    /* prompt_len = prefix vis (3+1) + PROMPT_VIS (2) = 6 */
+    TEST_ASSERT_EQ_I(t->prompt_len, 6);
+    ray_free(block);
+    PASS();
+}
+
+static test_result_t test_term_continuation_prompt(void) {
+    ray_t* block = ray_alloc(sizeof(ray_term_t));
+    if (!block) FAIL("ray_alloc failed");
+    ray_term_t* t = (ray_term_t*)ray_data(block);
+    memset(t, 0, sizeof(*t));
+    t->_block = block;
+
+    char path[256], cap[512];
+    int saved = capture_begin(path, sizeof path);
+    if (saved < 0) { ray_free(block); FAIL("capture setup failed"); }
+    ray_term_continuation_prompt(t);
+    fflush(stdout);
+    int32_t n = capture_end(saved, path, cap, sizeof cap);
+    /* Continuation prompt uses gray (\033[90m) and ellipsis (U+2026 = E2 80 A6). */
+    int saw_gray = strstr(cap, "\033[90m") != NULL;
+    int saw_ellip = strstr(cap, "\xe2\x80\xa6") != NULL;
+    TEST_ASSERT_FMT(n > 0, "no cont-prompt output");
+    TEST_ASSERT_FMT(saw_gray, "missing gray ANSI in continuation prompt");
+    TEST_ASSERT_FMT(saw_ellip, "missing … in continuation prompt");
+    TEST_ASSERT_EQ_I(t->prompt_len, 2);
+
+    /* With prefix: prompt_len = prefix_vis + 2 */
+    ray_term_set_prompt_prefix(t, "ab");
+    saved = capture_begin(path, sizeof path);
+    if (saved < 0) { ray_free(block); FAIL("capture setup failed"); }
+    ray_term_continuation_prompt(t);
+    fflush(stdout);
+    n = capture_end(saved, path, cap, sizeof cap);
+    TEST_ASSERT_FMT(n > 0, "no cont-prompt output (with prefix)");
+    TEST_ASSERT_EQ_I(t->prompt_len, 5); /* 2 for "ab" + 1 space + 2 for cont */
+
+    ray_free(block);
+    PASS();
+}
+
+/* ─── Interrupt flag ──────────────────────────────────────────────── */
+
+static test_result_t test_term_interrupt_flag(void) {
+    ray_term_clear_interrupt();
+    TEST_ASSERT_EQ_I(ray_term_interrupted(), 0);
+    /* Setting it via private state isn't exposed, but clear+query is. */
+    ray_term_clear_interrupt();
+    TEST_ASSERT_EQ_I(ray_term_interrupted(), 0);
+    PASS();
+}
+
+/* ─── ray_term_begin ──────────────────────────────────────────────── */
+
+static test_result_t test_term_begin_resets_state(void) {
+    ray_t* block = ray_alloc(sizeof(ray_term_t));
+    if (!block) FAIL("ray_alloc failed");
+    ray_term_t* t = (ray_term_t*)ray_data(block);
+    memset(t, 0, sizeof(*t));
+    t->_block = block;
+    /* Pre-set fields that begin() must reset */
+    strcpy(t->buf, "garbage");
+    t->buf_len = 7;
+    t->buf_pos = 7;
+    t->multiline_len = 5;
+    t->last_total_rows = 7;
+    t->esc_state = 3;
+    t->esc_buf_len = 9;
+
+    char path[256], cap[512];
+    int saved = capture_begin(path, sizeof path);
+    if (saved < 0) { ray_free(block); FAIL("capture setup failed"); }
+    ray_term_begin(t);
+    fflush(stdout);
+    (void)capture_end(saved, path, cap, sizeof cap);
+
+    TEST_ASSERT_EQ_I(t->buf_len, 0);
+    TEST_ASSERT_EQ_I(t->buf_pos, 0);
+    TEST_ASSERT_EQ_I(t->multiline_len, 0);
+    TEST_ASSERT_EQ_I(t->last_total_rows, 1);
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+    TEST_ASSERT_EQ_I(t->esc_buf_len, 0);
+    ray_free(block);
+    PASS();
+}
+
+/* ─── ray_term_feed driver: helpers ───────────────────────────────── */
+
+/* Allocate a fully-zeroed ray_term_t with a sane terminal width and a
+ * fresh history (so the keystroke driver has somewhere to push lines).
+ * Returns the heap block; caller frees via term_block_free(). */
+static ray_t* term_block_new(ray_term_t** out) {
+    ray_t* block = ray_alloc(sizeof(ray_term_t));
+    if (!block) return NULL;
+    ray_term_t* t = (ray_term_t*)ray_data(block);
+    memset(t, 0, sizeof(*t));
+    t->_block = block;
+    t->term_width = 80;
+    t->term_height = 24;
+    t->last_total_rows = 1;
+    ray_hist_create(&t->hist);
+    *out = t;
+    return block;
+}
+
+static void term_block_free(ray_t* block, ray_term_t* t) {
+    ray_hist_destroy(&t->hist);
+    ray_free(block);
+}
+
+/* Feed a single byte through ray_term_feed and return the produced ray_t
+ * (or NULL).  Captures all stdout writes into a discard buffer. */
+static ray_t* feed_byte(ray_term_t* t, int byte) {
+    char path[256], cap[1024];
+    int saved = capture_begin(path, sizeof path);
+    t->input[0] = (char)(unsigned char)byte;
+    ray_t* r = ray_term_feed(t);
+    fflush(stdout);
+    if (saved >= 0) (void)capture_end(saved, path, cap, sizeof cap);
+    return r;
+}
+
+/* Feed a string of bytes (each fed as a separate keystroke).  Returns
+ * the first non-NULL ray_t result, or NULL if none. */
+static ray_t* feed_str(ray_term_t* t, const char* s) {
+    ray_t* result = NULL;
+    while (*s) {
+        ray_t* r = feed_byte(t, (unsigned char)*s);
+        if (r && !result) result = r;
+        s++;
+    }
+    return result;
+}
+
+/* ─── ray_term_feed: printable keystrokes + Enter ─────────────────── */
+
+static test_result_t test_term_feed_printable_then_enter(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    /* Type "hi", then Enter — should yield a ray_t string "hi". */
+    feed_byte(t, 'h');
+    TEST_ASSERT_EQ_I(t->buf_len, 1);
+    TEST_ASSERT_EQ_I(t->buf[0], 'h');
+    feed_byte(t, 'i');
+    TEST_ASSERT_EQ_I(t->buf_len, 2);
+    TEST_ASSERT_EQ_I(t->buf_pos, 2);
+
+    ray_t* line = feed_byte(t, KEYCODE_RETURN);
+    TEST_ASSERT_NOT_NULL(line);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(line), "got ERR object back");
+    /* History must now hold "hi" */
+    TEST_ASSERT_EQ_I(t->hist.count, 1);
+    TEST_ASSERT_STR_EQ(t->hist.entries[0], "hi");
+
+    ray_release(line);
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Enter on empty buffer yields an empty-string ray_t (not NULL, not EOF). */
+static test_result_t test_term_feed_enter_empty(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_t* line = feed_byte(t, KEYCODE_RETURN);
+    TEST_ASSERT_NOT_NULL(line);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(line), "got ERR object back");
+    TEST_ASSERT_EQ_I((int)ray_str_len(line), 0);
+    ray_release(line);
+    /* Empty submission must NOT add to history */
+    TEST_ASSERT_EQ_I(t->hist.count, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Enter inside an unmatched paren goes into multiline continuation mode:
+ * feed returns NULL, the line is moved to multiline_buf with a trailing
+ * '\n', and the next Enter (after closing) returns the full block. */
+static test_result_t test_term_feed_multiline_continuation(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    /* "(a" then Enter — multiline_buf becomes "(a\n", buf cleared. */
+    feed_byte(t, '(');
+    feed_byte(t, 'a');
+    ray_t* r = feed_byte(t, KEYCODE_RETURN);
+    TEST_ASSERT_NULL(r);
+    TEST_ASSERT_EQ_I(t->multiline_len, 3);
+    TEST_ASSERT_FMT(t->multiline_buf[0] == '(' &&
+                    t->multiline_buf[1] == 'a' &&
+                    t->multiline_buf[2] == '\n',
+                    "multiline_buf wrong: %.*s",
+                    t->multiline_len, t->multiline_buf);
+    TEST_ASSERT_EQ_I(t->buf_len, 0);
+
+    /* Now type "b)" and press Enter — full block delivered. */
+    feed_byte(t, 'b');
+    feed_byte(t, ')');
+    ray_t* line = feed_byte(t, KEYCODE_RETURN);
+    TEST_ASSERT_NOT_NULL(line);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(line), "got ERR back");
+    TEST_ASSERT_EQ_I((int)ray_str_len(line), 5);
+    TEST_ASSERT_FMT(memcmp(ray_str_ptr(line), "(a\nb)", 5) == 0,
+                    "multiline result wrong: %.*s",
+                    (int)ray_str_len(line), ray_str_ptr(line));
+    ray_release(line);
+
+    /* multiline_len reset after delivery */
+    TEST_ASSERT_EQ_I(t->multiline_len, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Backspace removes the previous byte (pre-cursor); at empty buf is no-op. */
+static test_result_t test_term_feed_backspace(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    /* No-op at start */
+    feed_byte(t, KEYCODE_BACKSPACE);
+    TEST_ASSERT_EQ_I(t->buf_len, 0);
+
+    feed_str(t, "abc");
+    TEST_ASSERT_EQ_I(t->buf_len, 3);
+    feed_byte(t, KEYCODE_BACKSPACE);
+    TEST_ASSERT_EQ_I(t->buf_len, 2);
+    TEST_ASSERT_EQ_I(t->buf_pos, 2);
+    TEST_ASSERT_FMT(memcmp(t->buf, "ab", 2) == 0, "buf=%c%c", t->buf[0], t->buf[1]);
+
+    /* DEL (0x7f) is treated identically to backspace */
+    feed_byte(t, KEYCODE_DELETE);
+    TEST_ASSERT_EQ_I(t->buf_len, 1);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Ctrl-A jumps to start, Ctrl-E jumps to end. */
+static test_result_t test_term_feed_ctrl_a_e(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "hello");
+    TEST_ASSERT_EQ_I(t->buf_pos, 5);
+    feed_byte(t, KEYCODE_CTRL_A);
+    TEST_ASSERT_EQ_I(t->buf_pos, 0);
+    feed_byte(t, KEYCODE_CTRL_E);
+    TEST_ASSERT_EQ_I(t->buf_pos, 5);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Ctrl-K kills from cursor to end of line. */
+static test_result_t test_term_feed_ctrl_k(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "abcdef");
+    /* Position cursor at index 3 directly — Ctrl-K should truncate buf. */
+    t->buf_pos = 3;
+    feed_byte(t, KEYCODE_CTRL_K);
+    TEST_ASSERT_EQ_I(t->buf_len, 3);
+    TEST_ASSERT_FMT(memcmp(t->buf, "abc", 3) == 0, "buf wrong");
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Ctrl-U clears the entire line. */
+static test_result_t test_term_feed_ctrl_u(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "junk");
+    feed_byte(t, KEYCODE_CTRL_U);
+    TEST_ASSERT_EQ_I(t->buf_len, 0);
+    TEST_ASSERT_EQ_I(t->buf_pos, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Ctrl-W deletes the previous word (non-alphanum + alphanum span). */
+static test_result_t test_term_feed_ctrl_w(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "foo bar baz");
+    /* Cursor at end (pos=11).  feed_normal's Ctrl-W skips trailing
+     * non-alphanum, then back over alphanum — for "foo bar baz" with
+     * cursor on the last 'z' (alphanum), the first while loop is a
+     * no-op, then the second kills "baz", leaving "foo bar " (8 chars). */
+    feed_byte(t, KEYCODE_CTRL_W);
+    TEST_ASSERT_EQ_I(t->buf_len, 8);
+    TEST_ASSERT_FMT(memcmp(t->buf, "foo bar ", 8) == 0,
+                    "after first ^W buf='%.*s'", t->buf_len, t->buf);
+    /* Again — first loop skips " " (non-alphanum), then kills "bar" -> "foo " */
+    feed_byte(t, KEYCODE_CTRL_W);
+    TEST_ASSERT_EQ_I(t->buf_len, 4);
+    TEST_ASSERT_FMT(memcmp(t->buf, "foo ", 4) == 0,
+                    "after 2nd ^W buf='%.*s'", t->buf_len, t->buf);
+    /* Once more — kills "foo" with the leading nothing -> "" */
+    feed_byte(t, KEYCODE_CTRL_W);
+    TEST_ASSERT_EQ_I(t->buf_len, 0);
+    /* No-op at empty buf */
+    feed_byte(t, KEYCODE_CTRL_W);
+    TEST_ASSERT_EQ_I(t->buf_len, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Ctrl-D on empty buf returns EOF; with content acts as forward-delete. */
+static test_result_t test_term_feed_ctrl_d(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    /* Empty -> EOF */
+    ray_t* r = feed_byte(t, KEYCODE_CTRL_D);
+    TEST_ASSERT_FMT(r == RAY_TERM_EOF, "expected EOF marker, got %p", (void*)r);
+
+    /* With content + cursor mid-buf: forward-delete */
+    feed_str(t, "abcd");
+    t->buf_pos = 1;
+    feed_byte(t, KEYCODE_CTRL_D);
+    TEST_ASSERT_EQ_I(t->buf_len, 3);
+    TEST_ASSERT_FMT(memcmp(t->buf, "acd", 3) == 0, "buf=%.*s", t->buf_len, t->buf);
+    /* Cursor at end — Ctrl-D becomes a no-op (only deletes when buf_pos<len) */
+    t->buf_pos = t->buf_len;
+    feed_byte(t, KEYCODE_CTRL_D);
+    TEST_ASSERT_EQ_I(t->buf_len, 3);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Ctrl-C clears the line, prints "^C\n" + a fresh prompt. */
+static test_result_t test_term_feed_ctrl_c(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "junk");
+    char path[256], cap[2048];
+    int saved = capture_begin(path, sizeof path);
+    t->input[0] = KEYCODE_CTRL_C;
+    ray_t* r = ray_term_feed(t);
+    fflush(stdout);
+    int32_t n = capture_end(saved, path, cap, sizeof cap);
+    TEST_ASSERT_NULL(r);
+    TEST_ASSERT_EQ_I(t->buf_len, 0);
+    TEST_ASSERT_EQ_I(t->buf_pos, 0);
+    TEST_ASSERT_EQ_I(t->multiline_len, 0);
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+    TEST_ASSERT_FMT(n > 0, "no output");
+    TEST_ASSERT_FMT(strstr(cap, "^C") != NULL, "missing ^C marker");
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ─── ray_term_feed: escape sequences ─────────────────────────────── */
+
+/* ESC [ A = Up arrow.  Pre-populates history; expects buf to load with the
+ * previous entry. */
+static test_result_t test_term_feed_arrow_up(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "older",  5);
+    ray_hist_add(&t->hist, "newer",  5);
+
+    feed_byte(t, 0x1b);  /* ESC */
+    TEST_ASSERT_EQ_I(t->esc_state, 1);
+    feed_byte(t, '[');
+    TEST_ASSERT_EQ_I(t->esc_state, 2);
+    feed_byte(t, 'A');   /* up — loads "newer" */
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+    TEST_ASSERT_EQ_I(t->buf_len, 5);
+    TEST_ASSERT_FMT(memcmp(t->buf, "newer", 5) == 0,
+                    "after up: %.*s", t->buf_len, t->buf);
+
+    /* Another up loads "older" */
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, 'A');
+    TEST_ASSERT_FMT(memcmp(t->buf, "older", 5) == 0,
+                    "after 2nd up: %.*s", t->buf_len, t->buf);
+
+    /* Down arrow goes back forward */
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, 'B');
+    TEST_ASSERT_FMT(memcmp(t->buf, "newer", 5) == 0,
+                    "after down: %.*s", t->buf_len, t->buf);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Ctrl-P / Ctrl-N have the same semantics as Up / Down. */
+static test_result_t test_term_feed_ctrl_pn(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "histent", 7);
+
+    feed_byte(t, KEYCODE_CTRL_P);
+    TEST_ASSERT_FMT(memcmp(t->buf, "histent", 7) == 0,
+                    "Ctrl-P should load 'histent', got '%.*s'",
+                    t->buf_len, t->buf);
+    feed_byte(t, KEYCODE_CTRL_N);
+    TEST_ASSERT_EQ_I(t->buf_len, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ESC [ D = Left, ESC [ C = Right.  Right-at-end with no ghost is a no-op. */
+static test_result_t test_term_feed_arrow_left_right(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    /* Use chars unlikely to trigger ghost completion — "qzqzj" doesn't
+     * match any env builtin or history-word prefix in a fresh runtime. */
+    feed_str(t, "qzqzj");
+    TEST_ASSERT_EQ_I(t->buf_pos, 5);
+
+    /* Left */
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, 'D');
+    TEST_ASSERT_EQ_I(t->buf_pos, 4);
+
+    /* Right */
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, 'C');
+    TEST_ASSERT_EQ_I(t->buf_pos, 5);
+
+    /* Right past end with no ghost: no-op */
+    int32_t len_before = t->buf_len;
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, 'C');
+    TEST_ASSERT_EQ_I(t->buf_pos, 5);
+    TEST_ASSERT_EQ_I(t->buf_len, len_before);
+
+    /* Left at start — no-op */
+    t->buf_pos = 0;
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, 'D');
+    TEST_ASSERT_EQ_I(t->buf_pos, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ESC [ H = Home, ESC [ F = End. */
+static test_result_t test_term_feed_home_end(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "xyz");
+    /* Home (CSI H) */
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, 'H');
+    TEST_ASSERT_EQ_I(t->buf_pos, 0);
+    /* End (CSI F) */
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, 'F');
+    TEST_ASSERT_EQ_I(t->buf_pos, 3);
+    /* SS3 variants: ESC O H / ESC O F */
+    feed_byte(t, 0x1b); feed_byte(t, 'O'); feed_byte(t, 'H');
+    TEST_ASSERT_EQ_I(t->buf_pos, 0);
+    feed_byte(t, 0x1b); feed_byte(t, 'O'); feed_byte(t, 'F');
+    TEST_ASSERT_EQ_I(t->buf_pos, 3);
+    /* SS3 with unknown final byte — exits state, no-op */
+    feed_byte(t, 0x1b); feed_byte(t, 'O'); feed_byte(t, 'X');
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ESC [ 3 ~ = Delete (forward delete). */
+static test_result_t test_term_feed_csi_delete(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "abcd");
+    t->buf_pos = 1;
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, '3');
+    TEST_ASSERT_EQ_I(t->esc_state, 4);
+    feed_byte(t, '~');
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+    TEST_ASSERT_EQ_I(t->buf_len, 3);
+    TEST_ASSERT_FMT(memcmp(t->buf, "acd", 3) == 0, "buf=%.*s", t->buf_len, t->buf);
+
+    /* "ESC [ 3 X" (X != ~) — exits cleanly without deletion */
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, '3'); feed_byte(t, 'X');
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+    TEST_ASSERT_EQ_I(t->buf_len, 3);
+
+    /* CSI Delete at end — no-op */
+    t->buf_pos = t->buf_len;
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, '3'); feed_byte(t, '~');
+    TEST_ASSERT_EQ_I(t->buf_len, 3);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Bare ESC followed by an unrecognised byte returns to normal state.  No
+ * crash, no change to buf. */
+static test_result_t test_term_feed_bare_escape(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "hi");
+    feed_byte(t, 0x1b);
+    TEST_ASSERT_EQ_I(t->esc_state, 1);
+    /* Unrecognised continuation: 'X' — must reset state cleanly. */
+    feed_byte(t, 'X');
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+    TEST_ASSERT_EQ_I(t->buf_len, 2);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Unknown CSI is consumed until the final byte (anything in [0x40, 0x7E]). */
+static test_result_t test_term_feed_unknown_csi(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "x");
+    /* "ESC [ 1 ; 2 R" — unhandled: should be consumed without modifying buf. */
+    feed_byte(t, 0x1b); feed_byte(t, '[');
+    feed_byte(t, '1'); /* not a recognised final or special, becomes state 5 */
+    TEST_ASSERT_EQ_I(t->esc_state, 5);
+    feed_byte(t, ';');
+    feed_byte(t, '2');
+    feed_byte(t, 'R'); /* final byte (0x52) terminates */
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+    TEST_ASSERT_EQ_I(t->buf_len, 1);  /* original 'x' untouched */
+
+    /* Long unknown CSI — overflow guard kicks in after >8 bytes */
+    feed_byte(t, 0x1b); feed_byte(t, '[');
+    feed_byte(t, '?'); /* enters state 5 */
+    TEST_ASSERT_EQ_I(t->esc_state, 5);
+    for (int i = 0; i < 12; i++) feed_byte(t, '0');
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* When a printable char arrives mid-buffer, it should be inserted at
+ * cursor_pos (not appended). */
+static test_result_t test_term_feed_insert_mid_buffer(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    feed_str(t, "ab");
+    t->buf_pos = 1;       /* between 'a' and 'b' */
+    feed_byte(t, 'X');
+    TEST_ASSERT_EQ_I(t->buf_len, 3);
+    TEST_ASSERT_FMT(memcmp(t->buf, "aXb", 3) == 0,
+                    "expected aXb got %.*s", t->buf_len, t->buf);
+    TEST_ASSERT_EQ_I(t->buf_pos, 2);  /* advanced past inserted char */
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ─── ray_term_feed: Tab completion / ghost ───────────────────────── */
+
+/* Tab with multiple candidates enters cycling mode; subsequent Tabs
+ * advance the cycle. */
+static test_result_t test_term_feed_tab_cycling(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    /* History gives at least 2 distinct words starting with "uniq" */
+    ray_hist_add(&t->hist, "uniqaa one", 10);
+    ray_hist_add(&t->hist, "uniqbb two", 10);
+
+    feed_str(t, "uniq");
+    /* Sanity: at this point the redraw should have populated comp_count
+     * with the two history matches. */
+    TEST_ASSERT_FMT(t->comp_count >= 2,
+                    "expected >=2 completions before Tab, got %d", t->comp_count);
+
+    feed_byte(t, KEYCODE_TAB);
+    /* After first Tab the cycling flag is set and a candidate has been
+     * inserted (replacing the typed prefix).  Note: update_ghost is then
+     * called again on the now-complete word, which often clears comp_count
+     * to 0 — that's expected.  We assert on comp_cycling instead. */
+    TEST_ASSERT_FMT(t->comp_cycling == 1,
+                    "expected cycling=1 after Tab");
+    /* Buffer should now hold one of the two matches in full */
+    int matched = (t->buf_len == 6 && memcmp(t->buf, "uniqaa", 6) == 0)
+               || (t->buf_len == 6 && memcmp(t->buf, "uniqbb", 6) == 0);
+    TEST_ASSERT_FMT(matched, "expected uniqaa/uniqbb after Tab; got '%.*s'",
+                    t->buf_len, t->buf);
+    int after_first_idx = t->comp_cycle_idx;
+
+    /* Second Tab cycles to next candidate.  When cycling is active the
+     * stored comp_items aren't recomputed — the cycle just advances. */
+    feed_byte(t, KEYCODE_TAB);
+    TEST_ASSERT_FMT(t->comp_cycle_idx != after_first_idx,
+                    "cycle_idx didn't advance: %d", t->comp_cycle_idx);
+
+    /* Any non-Tab key resets cycling */
+    feed_byte(t, 'x');
+    TEST_ASSERT_EQ_I(t->comp_cycling, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Tab with a single ghost candidate accepts the ghost. */
+static test_result_t test_term_feed_tab_single_ghost(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    /* Just one word starting with "qzqz" in history. */
+    ray_hist_add(&t->hist, "qzqzunique end", 14);
+    feed_str(t, "qzqz");
+    /* feed_str redraw populates ghost+comp_count; if comp_count==1 ghost
+     * accepted by Tab.  This is the single-completion path. */
+    TEST_ASSERT_FMT(t->comp_count == 1,
+                    "expected 1 completion, got %d", t->comp_count);
+    int prev_len = t->buf_len;
+    feed_byte(t, KEYCODE_TAB);
+    TEST_ASSERT_FMT(t->buf_len > prev_len,
+                    "Tab should have extended buf from %d to %d",
+                    prev_len, t->buf_len);
+    TEST_ASSERT_FMT(memcmp(t->buf, "qzqzunique", 10) == 0,
+                    "buf=%.*s", t->buf_len, t->buf);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Right arrow at end-of-buffer with a ghost text accepts the ghost. */
+static test_result_t test_term_feed_right_accepts_ghost(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "spectreword done", 16);
+    feed_str(t, "spect");
+    /* Cursor at end; ghost should be set. */
+    TEST_ASSERT_FMT(t->ghost_len > 0,
+                    "expected ghost to be set for 'spect'");
+    int before = t->buf_len;
+    feed_byte(t, 0x1b); feed_byte(t, '['); feed_byte(t, 'C'); /* Right */
+    TEST_ASSERT_FMT(t->buf_len > before,
+                    "Right at end should accept ghost; before=%d after=%d",
+                    before, t->buf_len);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ESC alone after Tab cycling cancels the cycle (and redraws). */
+static test_result_t test_term_feed_esc_cancels_tab(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "abca one", 8);
+    ray_hist_add(&t->hist, "abcb two", 8);
+    feed_str(t, "abc");
+    feed_byte(t, KEYCODE_TAB);
+    TEST_ASSERT_EQ_I(t->comp_cycling, 1);
+
+    /* Bare ESC: state-1 enters, then any non-CSI byte exits.  Easiest
+     * way: send ESC followed by a non-recognised byte. */
+    feed_byte(t, 0x1b);
+    feed_byte(t, 'q');  /* unrecognised continuation */
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+    TEST_ASSERT_EQ_I(t->comp_cycling, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ─── ray_term_feed: search mode ──────────────────────────────────── */
+
+/* Ctrl-R enters search mode and prints the search prompt. */
+static test_result_t test_term_feed_ctrl_r_enters_search(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    char path[256], cap[2048];
+    int saved = capture_begin(path, sizeof path);
+    t->input[0] = KEYCODE_CTRL_R;
+    ray_term_feed(t);
+    fflush(stdout);
+    int32_t n = capture_end(saved, path, cap, sizeof cap);
+    TEST_ASSERT_EQ_I(t->search_mode, 1);
+    TEST_ASSERT_EQ_I(t->search_len, 0);
+    TEST_ASSERT_EQ_I(t->search_match_idx, -1);
+    TEST_ASSERT_FMT(n > 0, "no search prompt output");
+    TEST_ASSERT_FMT(strstr(cap, "(search)") != NULL,
+                    "missing '(search)' marker in output");
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Type characters in search mode: builds up search_buf and finds matches. */
+static test_result_t test_term_feed_search_typing(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "hello world", 11);
+    ray_hist_add(&t->hist, "goodbye now", 11);
+    feed_byte(t, KEYCODE_CTRL_R);
+    TEST_ASSERT_EQ_I(t->search_mode, 1);
+
+    feed_byte(t, 'h');
+    TEST_ASSERT_EQ_I(t->search_len, 1);
+    TEST_ASSERT_FMT(t->search_match_idx == 0,
+                    "expected match at idx 0, got %d", t->search_match_idx);
+    feed_byte(t, 'e');
+    TEST_ASSERT_EQ_I(t->search_len, 2);
+    TEST_ASSERT_FMT(t->search_match_idx == 0,
+                    "expected match at idx 0, got %d", t->search_match_idx);
+
+    /* Backspace shrinks query */
+    feed_byte(t, KEYCODE_BACKSPACE);
+    TEST_ASSERT_EQ_I(t->search_len, 1);
+    /* Backspace down to zero clears match_idx */
+    feed_byte(t, KEYCODE_BACKSPACE);
+    TEST_ASSERT_EQ_I(t->search_len, 0);
+    TEST_ASSERT_EQ_I(t->search_match_idx, -1);
+    /* Backspace at empty is a no-op */
+    feed_byte(t, KEYCODE_BACKSPACE);
+    TEST_ASSERT_EQ_I(t->search_len, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Ctrl-R while in search mode searches further back. */
+static test_result_t test_term_feed_search_repeat(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "select foo",  10);
+    ray_hist_add(&t->hist, "select bar",  10);
+    feed_byte(t, KEYCODE_CTRL_R);
+    feed_str(t, "sel");
+    TEST_ASSERT_EQ_I(t->search_match_idx, 1);  /* finds "select bar" */
+
+    /* Second Ctrl-R goes further back */
+    feed_byte(t, KEYCODE_CTRL_R);
+    TEST_ASSERT_EQ_I(t->search_match_idx, 0);
+
+    /* No older match -> stays at 0 */
+    feed_byte(t, KEYCODE_CTRL_R);
+    TEST_ASSERT_EQ_I(t->search_match_idx, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Enter inside search mode accepts the current match into the buffer
+ * and submits it as a line. */
+static test_result_t test_term_feed_search_accept(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "match_target_str", 16);
+    feed_byte(t, KEYCODE_CTRL_R);
+    feed_str(t, "target");
+    TEST_ASSERT_EQ_I(t->search_match_idx, 0);
+
+    ray_t* line = feed_byte(t, KEYCODE_RETURN);
+    TEST_ASSERT_NOT_NULL(line);
+    TEST_ASSERT_EQ_I(t->search_mode, 0);
+    TEST_ASSERT_EQ_I((int)ray_str_len(line), 16);
+    TEST_ASSERT_FMT(memcmp(ray_str_ptr(line), "match_target_str", 16) == 0,
+                    "line bytes wrong: %.*s",
+                    (int)ray_str_len(line), ray_str_ptr(line));
+    ray_release(line);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Ctrl-C inside search mode exits search and clears buf. */
+static test_result_t test_term_feed_search_ctrl_c(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "abc", 3);
+    feed_byte(t, KEYCODE_CTRL_R);
+    feed_str(t, "ab");
+    feed_byte(t, KEYCODE_CTRL_C);
+    TEST_ASSERT_EQ_I(t->search_mode, 0);
+    TEST_ASSERT_EQ_I(t->buf_len, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ESC inside search mode: exits search but enters the escape-state
+ * machine so the following bytes (e.g. arrow continuation) are consumed
+ * cleanly without being inserted into the buffer. */
+static test_result_t test_term_feed_search_escape_then_arrow(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "older_one", 9);
+    ray_hist_add(&t->hist, "newer_two", 9);
+    feed_byte(t, KEYCODE_CTRL_R);
+    feed_str(t, "older");
+    TEST_ASSERT_EQ_I(t->search_match_idx, 0);
+
+    /* ESC bytes — search exits, esc_state=1.  Then "[A" — but the way
+     * the code sets esc_state=1 before consuming the actual ESC byte
+     * means the caller is expected to send ESC again to drive the
+     * state machine?  Re-read: feed_search on ESC sets esc_state=1
+     * directly so that the subsequent bytes go through feed_escape.
+     * So we send the introducer + final byte next. */
+    feed_byte(t, KEYCODE_ESCAPE);
+    TEST_ASSERT_EQ_I(t->search_mode, 0);
+    TEST_ASSERT_EQ_I(t->esc_state, 1);
+    /* Send the introducer + final byte: '[' 'A' = up arrow */
+    feed_byte(t, '[');
+    TEST_ASSERT_EQ_I(t->esc_state, 2);
+    feed_byte(t, 'A');
+    TEST_ASSERT_EQ_I(t->esc_state, 0);
+    /* Up arrow nav loaded most-recent history entry */
+    TEST_ASSERT_EQ_I(t->buf_len, 9);
+    TEST_ASSERT_FMT(memcmp(t->buf, "newer_two", 9) == 0,
+                    "expected newer_two, got %.*s", t->buf_len, t->buf);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* Search with no match: search_match_idx stays at -1, Enter submits an
+ * empty line (since buf was never populated). */
+static test_result_t test_term_feed_search_no_match(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "nothing relevant", 16);
+    feed_byte(t, KEYCODE_CTRL_R);
+    feed_str(t, "qqqq");
+    TEST_ASSERT_EQ_I(t->search_match_idx, -1);
+    /* Enter still submits an empty line */
+    ray_t* line = feed_byte(t, KEYCODE_RETURN);
+    TEST_ASSERT_NOT_NULL(line);
+    TEST_ASSERT_EQ_I((int)ray_str_len(line), 0);
+    ray_release(line);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ─── ray_term_search_redraw exercise ─────────────────────────────── */
+
+/* Drives ray_term_search_redraw via a Ctrl-R + typed query and inspects
+ * the captured stdout for the expected escape-coded match highlight. */
+static test_result_t test_term_search_redraw_emits_highlight(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    ray_hist_add(&t->hist, "bingo result", 12);
+    feed_byte(t, KEYCODE_CTRL_R);
+
+    char path[256], cap[2048];
+    int saved = capture_begin(path, sizeof path);
+    /* Type the query — feed_search will call ray_term_search_redraw */
+    t->input[0] = 'b';
+    ray_term_feed(t);
+    t->input[0] = 'i';
+    ray_term_feed(t);
+    fflush(stdout);
+    int32_t n = capture_end(saved, path, cap, sizeof cap);
+    TEST_ASSERT_FMT(n > 0, "no search redraw output");
+    TEST_ASSERT_FMT(strstr(cap, "(search)") != NULL, "missing search prompt");
+    TEST_ASSERT_FMT(strstr(cap, "\033[7m") != NULL,
+                    "missing reverse-video match highlight (CSI 7m)");
+    TEST_ASSERT_FMT(strstr(cap, "bingo result") != NULL ||
+                    strstr(cap, "bi") != NULL,
+                    "missing matched entry text");
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ─── Multiline overflow ──────────────────────────────────────────── */
+
+/* When the multiline buffer would overflow, the code writes a diagnostic
+ * to stderr and resets state without pushing more.  Redirect both
+ * stderr (for the diagnostic) and stdout (for the prompt redraw) so the
+ * runner's output isn't polluted. */
+static test_result_t test_term_feed_multiline_overflow(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    /* Arrange: pre-fill multiline_buf to nearly full, set buf to a string
+     * that, when added, would exceed TERM_BUF_SIZE.  Buf has unmatched
+     * paren so Enter chooses the continuation path. */
+    int32_t fill = TERM_BUF_SIZE - 4;
+    memset(t->multiline_buf, 'x', (size_t)fill);
+    t->multiline_len = fill;
+    t->buf[0] = '(';
+    t->buf[1] = 'a';
+    t->buf[2] = 'b';
+    t->buf[3] = 'c';
+    t->buf_len = 4;
+    t->buf_pos = 4;
+
+    /* Redirect stderr to /dev/null to suppress the "input too long" diag. */
+    fflush(stderr);
+    int saved_err = dup(fileno(stderr));
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+        dup2(devnull, fileno(stderr));
+        close(devnull);
+    }
+
+    ray_t* r = feed_byte(t, KEYCODE_RETURN);
+
+    fflush(stderr);
+    if (saved_err >= 0) {
+        dup2(saved_err, fileno(stderr));
+        close(saved_err);
+    }
+
+    TEST_ASSERT_NULL(r);
+    /* On overflow path: multiline_len reset to 0, buf cleared. */
+    TEST_ASSERT_EQ_I(t->multiline_len, 0);
+    TEST_ASSERT_EQ_I(t->buf_len, 0);
+    TEST_ASSERT_EQ_I(t->buf_pos, 0);
+
+    term_block_free(block, t);
+    PASS();
+}
+
+/* ─── End-of-buffer overflow on insert ────────────────────────────── */
+
+/* feed_normal silently drops printable chars when buf is at TERM_BUF_SIZE-1.
+ * Drive that path so the bounds check is exercised. */
+static test_result_t test_term_feed_insert_overflow(void) {
+    ray_term_t* t;
+    ray_t* block = term_block_new(&t);
+    if (!block) FAIL("term_block_new failed");
+
+    /* Pre-fill buf with TERM_BUF_SIZE-1 bytes of 'a' so the next insert
+     * is rejected. */
+    memset(t->buf, 'a', TERM_BUF_SIZE - 1);
+    t->buf_len = TERM_BUF_SIZE - 1;
+    t->buf_pos = TERM_BUF_SIZE - 1;
+
+    feed_byte(t, 'b');  /* should be ignored */
+    TEST_ASSERT_EQ_I(t->buf_len, TERM_BUF_SIZE - 1);
+
+    term_block_free(block, t);
+    PASS();
+}
+
 /* ─── Suite ───────────────────────────────────────────────────────── */
 
 const test_entry_t term_entries[] = {
@@ -1096,6 +2176,97 @@ const test_entry_t term_entries[] = {
     { "term/completions_table_cols",    test_term_collect_completions_table_columns,
       runtime_setup, runtime_teardown },
     { "term/completions_history",       test_term_collect_completions_history,
+      runtime_setup, runtime_teardown },
+
+    /* Prompt prefix + prompts */
+    { "term/set_prompt_prefix",         test_term_set_prompt_prefix_basic,
+      heap_setup, heap_teardown },
+    { "term/prompt_emits_bytes",        test_term_prompt_emits_bytes,
+      heap_setup, heap_teardown },
+    { "term/prompt_with_prefix",        test_term_prompt_with_prefix,
+      heap_setup, heap_teardown },
+    { "term/continuation_prompt",       test_term_continuation_prompt,
+      heap_setup, heap_teardown },
+
+    /* Interrupt flag */
+    { "term/interrupt_flag",            test_term_interrupt_flag,
+      heap_setup, heap_teardown },
+
+    /* Event-driven line editor — keystroke state machine.  Many of these
+     * trigger ray_term_redraw which highlights words via ray_env_has_name,
+     * so they need the full runtime. */
+    { "term/begin_resets_state",        test_term_begin_resets_state,
+      runtime_setup, runtime_teardown },
+
+    { "term/feed_printable",            test_term_feed_printable_then_enter,
+      runtime_setup, runtime_teardown },
+    { "term/feed_enter_empty",          test_term_feed_enter_empty,
+      runtime_setup, runtime_teardown },
+    { "term/feed_multiline",            test_term_feed_multiline_continuation,
+      runtime_setup, runtime_teardown },
+    { "term/feed_backspace",            test_term_feed_backspace,
+      runtime_setup, runtime_teardown },
+    { "term/feed_ctrl_a_e",             test_term_feed_ctrl_a_e,
+      runtime_setup, runtime_teardown },
+    { "term/feed_ctrl_k",               test_term_feed_ctrl_k,
+      runtime_setup, runtime_teardown },
+    { "term/feed_ctrl_u",               test_term_feed_ctrl_u,
+      runtime_setup, runtime_teardown },
+    { "term/feed_ctrl_w",               test_term_feed_ctrl_w,
+      runtime_setup, runtime_teardown },
+    { "term/feed_ctrl_d",               test_term_feed_ctrl_d,
+      runtime_setup, runtime_teardown },
+    { "term/feed_ctrl_c",               test_term_feed_ctrl_c,
+      runtime_setup, runtime_teardown },
+
+    { "term/feed_arrow_up",             test_term_feed_arrow_up,
+      runtime_setup, runtime_teardown },
+    { "term/feed_ctrl_pn",              test_term_feed_ctrl_pn,
+      runtime_setup, runtime_teardown },
+    { "term/feed_arrow_left_right",     test_term_feed_arrow_left_right,
+      runtime_setup, runtime_teardown },
+    { "term/feed_home_end",             test_term_feed_home_end,
+      runtime_setup, runtime_teardown },
+    { "term/feed_csi_delete",           test_term_feed_csi_delete,
+      runtime_setup, runtime_teardown },
+    { "term/feed_bare_escape",          test_term_feed_bare_escape,
+      runtime_setup, runtime_teardown },
+    { "term/feed_unknown_csi",          test_term_feed_unknown_csi,
+      runtime_setup, runtime_teardown },
+    { "term/feed_insert_mid",           test_term_feed_insert_mid_buffer,
+      runtime_setup, runtime_teardown },
+
+    { "term/feed_tab_cycle",            test_term_feed_tab_cycling,
+      runtime_setup, runtime_teardown },
+    { "term/feed_tab_single",           test_term_feed_tab_single_ghost,
+      runtime_setup, runtime_teardown },
+    { "term/feed_right_ghost",          test_term_feed_right_accepts_ghost,
+      runtime_setup, runtime_teardown },
+    { "term/feed_esc_cancels_tab",      test_term_feed_esc_cancels_tab,
+      runtime_setup, runtime_teardown },
+
+    /* Search mode */
+    { "term/feed_ctrl_r_enters",        test_term_feed_ctrl_r_enters_search,
+      runtime_setup, runtime_teardown },
+    { "term/feed_search_typing",        test_term_feed_search_typing,
+      runtime_setup, runtime_teardown },
+    { "term/feed_search_repeat",        test_term_feed_search_repeat,
+      runtime_setup, runtime_teardown },
+    { "term/feed_search_accept",        test_term_feed_search_accept,
+      runtime_setup, runtime_teardown },
+    { "term/feed_search_ctrl_c",        test_term_feed_search_ctrl_c,
+      runtime_setup, runtime_teardown },
+    { "term/feed_search_esc_arrow",     test_term_feed_search_escape_then_arrow,
+      runtime_setup, runtime_teardown },
+    { "term/feed_search_no_match",      test_term_feed_search_no_match,
+      runtime_setup, runtime_teardown },
+    { "term/search_redraw_highlight",   test_term_search_redraw_emits_highlight,
+      runtime_setup, runtime_teardown },
+
+    /* Overflow paths */
+    { "term/feed_multiline_overflow",   test_term_feed_multiline_overflow,
+      runtime_setup, runtime_teardown },
+    { "term/feed_insert_overflow",      test_term_feed_insert_overflow,
       runtime_setup, runtime_teardown },
 
     { NULL, NULL, NULL, NULL },
