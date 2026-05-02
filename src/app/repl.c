@@ -1186,6 +1186,26 @@ int ray_repl_run_file(const char* path) {
 
     if (nread == 0) { ray_release(block); return 0; }
 
+    /* Skip files whose entire content is whitespace and `;` line
+     * comments — `parse_source` raises a `parse` error for empty
+     * input, which is the wrong UX when running `rayforce file.rfl`
+     * on a comments-only file (a script header with no body should
+     * be a successful no-op).  Cheap single-pass scan; mirrors the
+     * lexer's whitespace/comment rule. */
+    {
+        const char* p = buf;
+        const char* end = buf + nread;
+        bool any_expr = false;
+        while (p < end) {
+            char c = *p;
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { p++; continue; }
+            if (c == ';') { while (p < end && *p != '\n') p++; continue; }
+            any_expr = true;
+            break;
+        }
+        if (!any_expr) { ray_release(block); return 0; }
+    }
+
     /* File mode matches eval_and_print's structure so -t 1 / :t 1
      * produces the same span layout (parse / eval / materialize) as
      * REPL input, not one opaque "eval" tick.  Colors are keyed per
