@@ -205,12 +205,28 @@ void ray_term_get_size(ray_term_t* term) {
 
 int32_t ray_term_visual_width(const char* str, int32_t len) {
     int32_t width = 0;
+    /* 0=normal, 1=just saw ESC (next byte is the CSI/SS3 introducer:
+     *   '[' or 'O', or rarely a 1-byte sequence), 2=in CSI parameter
+     *   bytes; terminate on final byte in [0x40,0x7E].  Without the
+     *   intermediate state the introducer '[' (0x5B) would itself be
+     *   mistaken for a final byte and end the escape one char early —
+     *   the SGR digits/`;`/`m` then leak into width counting. */
     int32_t in_escape = 0;
 
     for (int32_t i = 0; i < len; i++) {
         if (str[i] == '\033') {
             in_escape = 1;
-        } else if (in_escape) {
+        } else if (in_escape == 1) {
+            /* Introducer byte after ESC.  Standard CSI uses '[',
+             * SS3 uses 'O'; both transition to body state.  Any
+             * other byte is treated as a 2-byte ESC sequence and
+             * we exit the escape state immediately. */
+            if (str[i] == '[' || str[i] == 'O') {
+                in_escape = 2;
+            } else {
+                in_escape = 0;
+            }
+        } else if (in_escape == 2) {
             if (str[i] >= 0x40 && str[i] <= 0x7E) {
                 in_escape = 0;
             }
