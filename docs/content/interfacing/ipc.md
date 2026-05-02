@@ -1,83 +1,170 @@
 # :material-remote: IPC
 
+A Rayforce process can listen for IPC clients and evaluate Rayfall code
+sent over the wire on their behalf.  This is the same channel the
+remote REPL uses (see [Remote REPL](remote-repl.md)).
+
 !!! warning
-    For now it is unsatable and possible subject of changes in the future!
+    The wire protocol is still evolving and may change between
+    releases.  Server and client must be the same Rayforce version.
 
-A RayforceDB can communicate with other RayforceDBs via IPC. It is a very fast and efficient way of communication. It is used to send data between RayforceDBs, to send data to the client, and to send data to the server.
+## :material-phone-log-outline: Listen on a port
 
-## :material-phone-log-outline: Listen to a port
+Start a server with `-p`:
 
-To start a Rayforce process that listens to a port, use the `-p` flag:
-
-``` bash
-> rayforce -p 5110
+```bash
+rayforce -p 5110
 ```
 
-## :material-connection: Connect to a remote process
+If `stdin` and `stdout` are both terminals, this also opens a local
+REPL alongside the listener — handy for inspecting state while clients
+connect.
 
-To connect to a port call `hopen` function:
+When `stdin` and `stdout` are both **not** terminals (typical service
+deployment under systemd, Docker, or `nohup &`), Rayforce auto-detects
+service mode, skips the REPL, and just runs the IPC poll loop.  In
+that case redirect `stdout` and `stderr` to a file or journal — any
+`(println …)` printed by the server-side eval lands there:
 
-``` clj
-(set h (hopen "127.0.0.1:5110"))
+```bash
+nohup rayforce -p 5110 > rayforce.log 2>&1 &
 ```
 
-Now, you can send data to the remote process:
-
-``` clj
-↪ (write h "(+ 1 2)")
-3
-↪ (write h (list (+ 1 2)))
-3
+```ini
+# systemd unit
+[Service]
+Type=simple
+ExecStart=/usr/bin/rayforce -p 5110
+StandardOutput=journal
+StandardError=journal
 ```
 
-## :material-message: Message format
+`-u PW` / `-U PW` set a connection password (the latter also marks the
+session restricted, which blocks state-mutating builtins).
 
-There are two ways of sending ipc messages: string or list. In case of string it will be parsed an evaluated then, in case of list it will be evaluated as is.
+## :material-connection: Connect from another Rayforce
 
-!!! note
-    Do not forget to call hclose for any unused connection handle!
-
-``` clj
-(hclose h)
+```clj
+(set h (.ipc.open "127.0.0.1:5110"))
 ```
 
-There are 3 types of messages:
+The address is `host:port` or `host:port:user:password` (the longer
+form when the server requires auth).  `.ipc.open` returns an integer
+handle on success or a Rayfall error on connect / auth / version
+failure.
 
-- Sync (request)
-- Response
-- Async
+Send a request and wait for a response:
 
-## :material-sync: Sync
-
-Sync messages are used to send a request and get a response. Sync messages are blocking, so the sender will wait for the response.
-
-``` clj
-↪ (write h "(+ 1 2)")
-3
+```clj
+(.ipc.send h "(+ 1 2)")    ;; → 3
+(.ipc.send h (list 1 2 3)) ;; → (1 2 3)
 ```
 
-## :material-responsive: Response
+Two payload shapes are accepted:
 
-Response messages are used to send a response to a sync message. Response messages are implicitly sent by the receiver of a sync message.
+* **String** — parsed and evaluated on the server (`ray_eval_str`).
+  This is the natural shape for sending Rayfall source code.
+* **Any other value** — evaluated as-is (`ray_eval`).  Useful when
+  the client has already constructed an AST or just wants to ship
+  data.
 
-## :material-sync-off: Async
+Always close the handle when you're done — server connection slots
+are bounded:
 
-Async messages are used to send a message without waiting for a response. Async messages are not blocking, so the sender will not wait for the response. To send an async message, use negate for a connection handle with a `write` function:
-
-``` clj
-↪ (write (neg h) (list (+ 1 2)))
+```clj
+(.ipc.close h)
 ```
 
-## :material-protocol: Protocol
+## :material-fire: Fire-and-forget
 
-The protocol is very simple. One just utilizes serialization to send/receive messages. Just one addition is: handshake. It is used to negotiate the protocol version and to send the credentials (if any).
+If you don't need a response, send through a negated handle:
 
-## :material-handshake: Handshake
-
-After a client has opened a connection to a server, the first message sent by the client is a handshake message. It is a simple null-terminated ASCII string followed by a version number byte of next format: ["username:password"]v
-
-Version is ancoded as follows:
-
-``` c
-(RAYFORCE_MAJOR_VERSION << 3 | RAYFORCE_MINOR_VERSION)
+```clj
+(.ipc.send (neg h) "(append-row! ...)")
 ```
+
+The call returns immediately; the server processes the message but
+sends no reply.  Use for telemetry pings, cache invalidations, etc.
+
+## :material-database: Shared state — read this before deploying
+
+**Every connected client and the local REPL share one global
+environment.**  This is intentional (it matches kdb+/q's model and
+makes ad-hoc collaborative analysis straightforward), but has
+non-obvious consequences:
+
+```clj
+;; client A:
+(.ipc.send h "(set x 100)")
+;; client B (same server):
+(.ipc.send h "x")            ;; → 100  ← B sees A's binding
+;; server REPL (if running interactively):
+‣ x                          ;; → 100  ← REPL sees it too
+```
+
+Because evaluation is single-threaded (one epoll loop drives both the
+listener and the server-side REPL), individual `set`/`get` calls are
+atomic from each client's point of view — no races on the binding
+itself.  But **lost updates are possible**: if A and B both write to
+`x` "at the same time", whichever the poll loop dequeued second wins.
+
+### Recommended isolation: namespace per client
+
+If you don't want clients to step on each other, give each client (or
+each session) its own namespace and write everything under it:
+
+```clj
+;; client A
+(.ipc.send h "(set .session-a.x 100)")
+(.ipc.send h "(set .session-a.tab (table [...] (list ...)))")
+
+;; client B works under .session-b.*
+;; server-wide builtins still work for everyone
+```
+
+This is exactly how q-style `.user.*` conventions are used in
+production deploys — Rayforce's symbol interner treats each
+dotted-prefixed name as a separate slot in the global env, and
+namespace boundaries are enforced by convention rather than runtime
+checks.  Cheap and effective.
+
+For full multi-tenant isolation (separate environments per
+connection, no shared state at all) — open a feature request; that's
+a different design and not currently supported.
+
+## :material-message: Message types
+
+Three over-the-wire variants:
+
+| Type | Direction | Reply? |
+|------|-----------|--------|
+| `RAY_IPC_MSG_SYNC` | client → server | yes (server returns result) |
+| `RAY_IPC_MSG_ASYNC` | client → server | no |
+| `RAY_IPC_MSG_RESP` | server → client | implicit reply to a sync |
+
+A `RAY_IPC_FLAG_VERBOSE` flag bit can be set on a SYNC request to ask
+the server to capture whatever the eval prints to `stdout` / `stderr`
+and return it alongside the result as a 2-element list
+`[captured_str, result]`.  This is what the [Remote REPL](remote-repl.md)
+uses to make `(println …)` from the connected client appear on the
+client's terminal instead of the server's.  Most callers don't need
+to set the flag manually — the helper builtins handle it.
+
+## :material-handshake: Handshake & auth
+
+When a client opens a connection, it sends a 2-byte handshake:
+`[wire_version, padding]`.  The server replies with two bytes:
+`[wire_version, auth_required]`.  If `auth_required` is set, the
+client follows up with `length(1) | "user:password\\0"`; the server
+responds with a 1-byte auth status.
+
+Mismatched wire versions or wrong credentials drop the connection at
+this point — `.ipc.open` surfaces those as `version` / `access`
+errors.  Past handshake, all messages are `[16-byte header,
+serialized payload]` framed.
+
+## :material-protocol: Compression
+
+Payloads larger than a fixed threshold are LZ4-compressed in-flight,
+indicated by `RAY_IPC_FLAG_COMPRESSED`.  Decompression is automatic
+on both sides; clients don't have to do anything.

@@ -258,8 +258,9 @@ nav:
     - Time:
       - Timer: content/time/timer.md
       - Timeit: content/time/timeit.md
-    - Interfacing: 
+    - Interfacing:
       - IPC: content/interfacing/ipc.md
+      - Remote REPL: content/interfacing/remote-repl.md
       - Load function: content/interfacing/loadfn.md
   - FAQ: content/faq.md
   - License: content/license.md
