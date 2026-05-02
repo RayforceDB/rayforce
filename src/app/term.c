@@ -1142,13 +1142,45 @@ int32_t ray_term_count_unmatched(ray_term_t* term) {
 #define CONT_PROMPT_VIS  2  /* visual: … + space */
 
 void ray_term_prompt(ray_term_t* term) {
+    if (term->prompt_prefix_len > 0)
+        term_write(term->prompt_prefix, (size_t)term->prompt_prefix_len);
     term_write(PROMPT_STR, PROMPT_LEN);
-    term->prompt_len = PROMPT_VIS;
+    term->prompt_len = term->prompt_prefix_vis + PROMPT_VIS;
 }
 
 void ray_term_continuation_prompt(ray_term_t* term) {
+    /* Continuation prompt mirrors the prefix so multi-line input
+     * stays visually aligned with the active session indicator. */
+    if (term->prompt_prefix_len > 0)
+        term_write(term->prompt_prefix, (size_t)term->prompt_prefix_len);
     term_write(CONT_PROMPT_STR, CONT_PROMPT_LEN);
-    term->prompt_len = CONT_PROMPT_VIS;
+    term->prompt_len = term->prompt_prefix_vis + CONT_PROMPT_VIS;
+}
+
+void ray_term_set_prompt_prefix(ray_term_t* term, const char* prefix) {
+    if (!term) return;
+    if (!prefix || !*prefix) {
+        term->prompt_prefix_len = 0;
+        term->prompt_prefix_vis = 0;
+        term->prompt_prefix[0]  = '\0';
+        return;
+    }
+    /* Wrap the user-visible bytes in a soft yellow ANSI tint so the
+     * remote prefix is visually distinct from local input.  The visual
+     * width is whatever ray_term_visual_width sees in the *plain*
+     * bytes — the ANSI escapes themselves don't take columns. */
+    int n = snprintf(term->prompt_prefix, sizeof(term->prompt_prefix),
+                     "\033[33m%s\033[0m ", prefix);
+    if (n < 0 || n >= (int)sizeof(term->prompt_prefix)) {
+        /* Fallback: prefix too long for the buffer — clear instead of
+         * truncating mid-escape, which would leak ANSI state on screen. */
+        term->prompt_prefix_len = 0;
+        term->prompt_prefix_vis = 0;
+        term->prompt_prefix[0]  = '\0';
+        return;
+    }
+    term->prompt_prefix_len = n;
+    term->prompt_prefix_vis = ray_term_visual_width(prefix, strlen(prefix)) + 1;
 }
 
 /* ===== Redraw ===== */
@@ -1179,12 +1211,25 @@ void ray_term_redraw(ray_term_t* term) {
         /* Each char can expand to ~15 bytes with ANSI escapes */
         char hlbuf[TERM_BUF_SIZE * 8];
         int32_t hlen = 0;
+        /* Prepend the prompt prefix (e.g. "host:port" in remote-REPL
+         * mode) so it stays visible across keystroke redraws.
+         * Without this, only ray_term_prompt's first render shows the
+         * prefix and the next keystroke wipes it, leaving the user
+         * unsure whether they're typing into the local or remote
+         * REPL.  The visual-width add-on for prompt_len is already
+         * computed by ray_term_prompt; we just have to keep the
+         * bytes flowing through every redraw. */
+        if (term->prompt_prefix_len > 0 &&
+            (int32_t)sizeof(hlbuf) > term->prompt_prefix_len) {
+            memcpy(hlbuf, term->prompt_prefix, (size_t)term->prompt_prefix_len);
+            hlen = term->prompt_prefix_len;
+        }
         if (term->multiline_len > 0) {
-            memcpy(hlbuf, CONT_PROMPT_STR, CONT_PROMPT_LEN);
-            hlen = CONT_PROMPT_LEN;
+            memcpy(hlbuf + hlen, CONT_PROMPT_STR, CONT_PROMPT_LEN);
+            hlen += CONT_PROMPT_LEN;
         } else {
-            memcpy(hlbuf, PROMPT_STR, PROMPT_LEN);
-            hlen = PROMPT_LEN;
+            memcpy(hlbuf + hlen, PROMPT_STR, PROMPT_LEN);
+            hlen += PROMPT_LEN;
         }
         if (term->buf_len > 0) {
             /* Find bracket match at cursor */
@@ -1588,12 +1633,23 @@ static ray_t* feed_normal(ray_term_t* term, int key) {
             printf("\r\033[J");
             char hlbuf[TERM_BUF_SIZE * 8];
             int32_t hlen = 0;
+            /* Mirror the redraw path: prepend the remote-REPL prefix
+             * so the line that's echoed on Enter (the final un-
+             * highlighted render before submitting to eval) keeps
+             * the host:port indicator instead of dropping back to
+             * the bare local prompt. */
+            if (term->prompt_prefix_len > 0 &&
+                (int32_t)sizeof(hlbuf) > term->prompt_prefix_len) {
+                memcpy(hlbuf, term->prompt_prefix,
+                       (size_t)term->prompt_prefix_len);
+                hlen = term->prompt_prefix_len;
+            }
             if (term->multiline_len > 0) {
-                memcpy(hlbuf, CONT_PROMPT_STR, CONT_PROMPT_LEN);
-                hlen = CONT_PROMPT_LEN;
+                memcpy(hlbuf + hlen, CONT_PROMPT_STR, CONT_PROMPT_LEN);
+                hlen += CONT_PROMPT_LEN;
             } else {
-                memcpy(hlbuf, PROMPT_STR, PROMPT_LEN);
-                hlen = PROMPT_LEN;
+                memcpy(hlbuf + hlen, PROMPT_STR, PROMPT_LEN);
+                hlen += PROMPT_LEN;
             }
             if (term->buf_len > 0)
                 hlen += term_highlight_into(hlbuf + hlen,

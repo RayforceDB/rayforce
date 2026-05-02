@@ -23,6 +23,7 @@
 
 #include "lang/eval.h"
 #include "lang/internal.h"
+#include "app/repl.h"
 #include "lang/env.h"
 #include "lang/nfo.h"
 #include "lang/parse.h"
@@ -2283,6 +2284,13 @@ static void ray_register_builtins(void) {
     register_unary( ".ipc.open",  RAY_FN_RESTRICTED,  ray_hopen_fn);
     register_unary( ".ipc.close", RAY_FN_RESTRICTED,  ray_hclose_fn);
     register_binary(".ipc.send",  RAY_FN_RESTRICTED,  ray_hsend_fn);
+
+    /* Remote-REPL session control under `.repl.*`.  Once .repl.connect
+     * succeeds, the local REPL line-loop reroutes each subsequent input
+     * through ray_ipc_send_verbose() until .repl.disconnect.  See
+     * src/app/repl_remote.c for the state model. */
+    register_unary(".repl.connect",    RAY_FN_RESTRICTED, ray_repl_connect_fn);
+    register_vary( ".repl.disconnect", RAY_FN_RESTRICTED, ray_repl_disconnect_fn);
 
     /* Transaction-log journaling under `.log.*` — q/kdb's -l/-L feature.
      * The CLI flags -l <base> / -L <base> call ray_journal_open() at

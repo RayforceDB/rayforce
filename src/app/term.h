@@ -89,6 +89,14 @@ typedef struct ray_term {
     int32_t  term_width;
     int32_t  term_height;
     int32_t  prompt_len;
+    /* Optional prefix shown before the standard `‣` prompt (e.g. the
+     * remote host:port when in remote-REPL mode).  Empty by default.
+     * Set via ray_term_set_prompt_prefix(); both the byte string and
+     * its rendered visual width must be in sync — visual is what the
+     * line editor uses for cursor math. */
+    char     prompt_prefix[80];
+    int32_t  prompt_prefix_len;
+    int32_t  prompt_prefix_vis;
     int32_t  last_total_rows;
     int32_t  last_cursor_row;
     ray_hist_t hist;
@@ -141,6 +149,13 @@ void    ray_term_goto_position(ray_term_t* term, int32_t from_pos, int32_t to_po
 ray_t*  ray_term_read(ray_term_t* term);
 void   ray_term_redraw(ray_term_t* term);
 void   ray_term_prompt(ray_term_t* term);
+
+/* Set (or clear, when prefix == NULL or empty) the prompt prefix.
+ * Used by the remote-REPL session to put the server address ahead
+ * of `‣` so the user can never mistake it for a local prompt.  The
+ * prefix bytes are copied into the term struct; caller may free
+ * after the call. */
+void   ray_term_set_prompt_prefix(ray_term_t* term, const char* prefix);
 
 /* Event-driven terminal API — split ray_term_read into begin + feed.
  * ray_term_begin: show prompt, reset line state.

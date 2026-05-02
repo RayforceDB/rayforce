@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#define _POSIX_C_SOURCE 200809L
 #include "core/poll.h"
 #include "core/ipc.h"
 #include "core/pool.h"
@@ -33,6 +34,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
+#include <unistd.h>
 
 int main(int argc, char** argv) {
     ray_runtime_t* rt = ray_runtime_create(argc, argv);
@@ -54,7 +57,6 @@ int main(int argc, char** argv) {
      *   -p PORT          IPC listen port
      *   -c N             worker-pool size (0 = auto: ncpu - 1)
      *   -t N             enable timeit at startup (N != 0 turns on)
-     *   -r N             repl mode (1 = enabled, 0 = disabled)
      *   -i               interactive
      * Plus rayforce-specific:
      *   -u PW / -U PW    auth password (plain / restricted)
@@ -106,7 +108,17 @@ int main(int argc, char** argv) {
                 "  -U PW               set restricted auth password\n"
                 "  -l BASE             enable journal logging (BASE.log + BASE.qdb)\n"
                 "  -L BASE             enable journal logging with fsync per write\n"
-                "  -h, --help          show this message\n",
+                "  -h, --help          show this message\n"
+                "\nFor a remote REPL, start rayforce locally and call\n"
+                "(.repl.connect \"host:port\") inside the REPL.\n"
+                "\nRunning as a service:\n"
+                "  When stdin and stdout are both not a terminal (systemd\n"
+                "  Type=simple, Docker, nohup &, etc.), rayforce skips the\n"
+                "  REPL and runs only the IPC poll loop.  Redirect stdout\n"
+                "  and stderr to a file/journal — anything (println ...)\n"
+                "  prints from the server side goes there.  Example:\n"
+                "    nohup rayforce -p 5000 > rayforce.log 2>&1 &\n"
+                "    systemd:  StandardOutput=journal StandardError=journal\n",
                 argv[0]);
             ray_runtime_destroy(rt);
             return 0;
@@ -175,14 +187,52 @@ int main(int argc, char** argv) {
         if (!interactive && !(port > 0)) goto done;
     }
 
-    /* REPL or pure server mode */
-    {
+    /* REPL or pure server mode.
+     *
+     * Auto-detect server-only when launched as a daemon-style service:
+     * `-p` set, no script, no `-i`, and neither stdin nor stdout is a
+     * terminal.  In that case we skip ray_repl_create entirely and just
+     * drive the poll loop — which is the right shape for `nohup ... &`,
+     * systemd `Type=simple`, Docker without `-it`, etc.
+     *
+     * Without this guard the local REPL would enter run_piped() and
+     * block on fgets, starving the same poll loop the IPC listener is
+     * registered on — so connections get accepted by the kernel but
+     * never user-space handled.  Auto-detect fixes the deploy hole;
+     * `-i` overrides for the rare case of "I want REPL even with stdin
+     * piped". */
+    bool stdin_tty  = isatty(STDIN_FILENO);
+    bool stdout_tty = isatty(STDOUT_FILENO);
+    bool server_only = poll && port > 0 && !file && !interactive
+                       && !stdin_tty && !stdout_tty;
+
+    if (server_only) {
+        /* In service deployments stdout/stderr are typically pointed
+         * at a journal pipe or log file by the supervisor (systemd,
+         * docker, nohup).  Anything (println …) prints from the
+         * server side ends up there — see --help "Running as a
+         * service" for guidance.  We deliberately don't auto-create
+         * a log file: that would conflict with whatever the admin
+         * already configured. */
+        /* Suppress SIGPIPE so a write to a stdout/stderr pipe whose
+         * peer has gone away (journald restart, log rotator, etc.)
+         * doesn't kill the daemon.  Writes still fail with EPIPE,
+         * libc sets ferror(stdout), and the bytes are simply lost —
+         * which is the right behaviour for a service whose log sink
+         * is recoverable.  Only set in server-only mode; an
+         * interactive REPL with a broken pipe is genuinely fatal. */
+#ifndef RAY_OS_WINDOWS
+        signal(SIGPIPE, SIG_IGN);
+#endif
+        fprintf(stderr, "no terminal — running in server-only mode\n");
+        ray_poll_run(poll);
+    } else {
         ray_repl_t* repl = ray_repl_create(poll);
         if (repl) {
             ray_repl_run(repl);
             ray_repl_destroy(repl);
         } else if (poll && port > 0) {
-            /* No REPL possible — run pure server loop */
+            /* REPL create failed (OOM etc.) — fall back to pure poll. */
             ray_poll_run(poll);
         }
     }

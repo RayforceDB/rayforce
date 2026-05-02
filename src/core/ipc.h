@@ -53,6 +53,14 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
  * crash + restart silently elevates restricted commands to full
  * privilege. */
 #define RAY_IPC_FLAG_RESTRICTED 0x02
+/* Set by clients that want a "verbose" eval response: the server
+ * captures whatever the eval wrote to stdout/stderr and returns a
+ * 2-element list [captured_str, result] instead of bare result.
+ * Used by the remote-REPL client wrapper so a `(println x)` from
+ * the connected client produces output on the *client's* terminal,
+ * not on the server's.  Default sync messages still get the bare
+ * result, so existing IPC clients are unaffected. */
+#define RAY_IPC_FLAG_VERBOSE    0x04
 #define RAY_IPC_MAX_CONNS 256
 
 /* ===== Poll-based IPC (new API) ===== */
@@ -92,5 +100,13 @@ int64_t   ray_ipc_connect(const char* host, uint16_t port,
 void      ray_ipc_close(int64_t handle);
 ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
+
+/* Remote-REPL helper: send a SYNC message with RAY_IPC_FLAG_VERBOSE
+ * set, returning a 2-element list [captured_str, result] where
+ * captured_str is whatever the server's eval wrote to stdout/stderr
+ * (combined) while running this request.  Used by the `-h` client
+ * loop in main.c so output produced by the remote eval is shown on
+ * the local user's terminal, not lost on the server. */
+ray_t*    ray_ipc_send_verbose(int64_t handle, ray_t* msg);
 
 #endif /* RAY_IPC_H */

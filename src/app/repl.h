@@ -49,4 +49,17 @@ void       ray_repl_run(ray_repl_t* repl);
  * (errors are printed but do not terminate the loop). */
 int        ray_repl_run_file(const char* path);
 
+/* Remote-REPL session.  When active, ray_repl_run's eval pipeline
+ * sends each input string through ray_ipc_send_verbose() to the
+ * connected server instead of evaluating locally; the captured
+ * server-side stdout + result are printed on the local terminal.
+ * Toggled by the .repl.connect / .repl.disconnect builtins, which
+ * are wrappers over .ipc.open / .ipc.close — no new wire path. */
+bool        ray_repl_remote_active(void);
+int64_t     ray_repl_remote_handle(void);
+const char* ray_repl_remote_addr(void);
+
+ray_t* ray_repl_connect_fn(ray_t* host_port_str);
+ray_t* ray_repl_disconnect_fn(ray_t** args, int64_t n);
+
 #endif /* RAY_IO_REPL_H */

@@ -30,10 +30,12 @@
 #include "lang/format.h"
 #include "app/repl.h"
 #include "app/term.h"
+#include "core/ipc.h"
 #include "core/poll.h"
 #include "core/pool.h"
 #include "lang/env.h"
 #include "lang/eval.h"
+#include "lang/internal.h"
 #include "lang/nfo.h"
 #include "lang/parse.h"
 #include "lang/syscmd.h"
@@ -534,8 +536,156 @@ void ray_repl_destroy(ray_repl_t* repl) {
     ray_free(repl->_block);
 }
 
+/* ===== Remote-REPL session ==========================================
+ *
+ * (.repl.connect "host:port") routes subsequent local REPL inputs to a
+ * remote rayforce via ray_ipc_send_verbose() instead of ray_eval_str.
+ * This is a thin per-line redirect on top of the existing .ipc.* family
+ * — no new wire path, no separate event loop.  Single session at a
+ * time (matches kdb+'s remote-mode UX); reconnect to a different
+ * address closes the previous handle automatically.
+ *
+ * State lives in this file so eval_and_print can check it without
+ * pulling in another header or a new compile unit. */
+
+/* Pretty-print a ray_t to a stdio stream — defined in ops/builtins.c
+ * (used by `(println val)`).  Not in a public header. */
+extern void ray_lang_print(FILE* fp, ray_t* val);
+
+static int64_t      g_remote_handle    = -1;
+static char         g_remote_addr[128] = {0};
+/* The currently-running interactive REPL's terminal, set by
+ * ray_repl_run before entering the line loop.  Used by .repl.connect /
+ * .repl.disconnect to update the prompt prefix without pushing a
+ * pointer through the eval pipeline.  NULL in piped / file mode —
+ * connect still works (state is updated; eval_and_print_remote uses
+ * it), the prompt simply has no prefix to render. */
+static ray_term_t*  g_active_term      = NULL;
+
+bool ray_repl_remote_active(void) { return g_remote_handle >= 0; }
+int64_t ray_repl_remote_handle(void) { return g_remote_handle; }
+const char* ray_repl_remote_addr(void) {
+    return g_remote_handle >= 0 ? g_remote_addr : NULL;
+}
+
+ray_t* ray_repl_connect_fn(ray_t* host_port_str) {
+    if (!host_port_str || !ray_is_atom(host_port_str) ||
+        host_port_str->type != -RAY_STR)
+        return ray_error("type", "expected host:port string");
+
+    /* .ipc.open already handles the host:port[:user:password] split
+     * and the connect-error-to-rayfall-error mapping; reusing it
+     * keeps .repl.connect a one-line wrapper instead of a parallel
+     * implementation that drifts. */
+    ray_t* opened = ray_hopen_fn(host_port_str);
+    if (!opened || RAY_IS_ERR(opened)) return opened;
+    if (!ray_is_atom(opened) ||
+        (opened->type != -RAY_I64 && opened->type != -RAY_I32)) {
+        ray_release(opened);
+        return ray_error("io", "ipc.open returned non-handle");
+    }
+
+    int64_t h = (opened->type == -RAY_I64) ? opened->i64 : opened->i32;
+
+    /* Drop any prior session before swapping the handle — leaving the
+     * old socket open would leak the server-side connection slot. */
+    if (g_remote_handle >= 0 && g_remote_handle != h)
+        ray_ipc_close(g_remote_handle);
+    g_remote_handle = h;
+
+    size_t n = ray_str_len(host_port_str);
+    if (n >= sizeof(g_remote_addr)) n = sizeof(g_remote_addr) - 1;
+    memcpy(g_remote_addr, ray_str_ptr(host_port_str), n);
+    g_remote_addr[n] = '\0';
+
+    if (g_active_term) ray_term_set_prompt_prefix(g_active_term, g_remote_addr);
+    return opened;
+}
+
+ray_t* ray_repl_disconnect_fn(ray_t** args, int64_t n) {
+    (void)args; (void)n;
+    if (g_remote_handle < 0) return RAY_NULL_OBJ;
+    ray_ipc_close(g_remote_handle);
+    g_remote_handle    = -1;
+    g_remote_addr[0]   = '\0';
+    if (g_active_term) ray_term_set_prompt_prefix(g_active_term, NULL);
+    return RAY_NULL_OBJ;
+}
+
+/* eval_and_print's remote branch: send the raw input string to the
+ * connected server with RAY_IPC_FLAG_VERBOSE set so server-side
+ * stdout/stderr written during eval are captured and returned to us
+ * inside the response list.  Print captured output first, then the
+ * evaluated result (if any). */
+static void eval_and_print_remote(const char* input) {
+    ray_t* msg = ray_str(input, strlen(input));
+    if (!msg) {
+        fprintf(stderr, "error: oom building message\n");
+        return;
+    }
+
+    ray_t* resp = ray_ipc_send_verbose(g_remote_handle, msg);
+    ray_release(msg);
+
+    if (!resp) {
+        fprintf(stderr, "error: no response\n");
+        return;
+    }
+    if (RAY_IS_ERR(resp)) {
+        const char* what = (const char*)resp->sdata;
+        fprintf(stderr, "error: %s\n", what && *what ? what : "ipc");
+        /* Do NOT auto-disconnect on error — most rayfall errors (type,
+         * domain, parse, etc.) are recoverable at the REPL level.  The
+         * user can call (.repl.disconnect) explicitly if they prefer. */
+        return;
+    }
+
+    /* eval_payload's VERBOSE path produces [captured_str, result].
+     * If the server fell back to the no-capture path (tmpfile/dup
+     * failure on its side) it still wraps as a list with empty
+     * captured_str — clients can rely on the shape. */
+    ray_t* result = resp;
+    if (resp->type == RAY_LIST && resp->len >= 2) {
+        ray_t** items = (ray_t**)ray_data(resp);
+        ray_t*  cap   = items[0];
+        if (cap && cap->type == -RAY_STR) {
+            size_t cl = ray_str_len(cap);
+            if (cl > 0) fwrite(ray_str_ptr(cap), 1, cl, stdout);
+        }
+        result = items[1];
+    }
+    if (result && result != RAY_NULL_OBJ && !RAY_IS_ERR(result)) {
+        ray_lang_print(stdout, result);
+        fputc('\n', stdout);
+    } else if (result && RAY_IS_ERR(result)) {
+        fprintf(stderr, "error: %s\n", (const char*)result->sdata);
+    }
+    fflush(stdout);
+    ray_release(resp);
+}
+
 static void eval_and_print(ray_term_t* term, const char* input,
                            bool use_color, bool timeit) {
+    /* Remote-REPL redirect: when a session is active every input goes
+     * to the connected server.  Profiling/timing in remote mode is the
+     * server's responsibility (server-side -t setting), so we skip the
+     * local profiler scaffolding entirely and never touch ray_eval.
+     *
+     * Exception: `.repl.*` calls always evaluate locally — they manage
+     * the client-side session state, so forwarding them to the server
+     * would be a no-op (server's own session state is irrelevant) and
+     * would prevent the user from ever calling .repl.disconnect from
+     * inside a remote session. */
+    if (g_remote_handle >= 0) {
+        const char* p = input;
+        while (*p == ' ' || *p == '\t') p++;
+        bool is_repl_ctl = (strncmp(p, "(.repl.", 7) == 0);
+        if (!is_repl_ctl) {
+            eval_and_print_remote(input);
+            return;
+        }
+    }
+
     bool profiling = timeit && g_ray_profile.active;
 
     if (profiling) {
@@ -684,13 +834,37 @@ static ray_t* repl_read(ray_poll_t* poll, ray_selector_t* sel)
             fflush(stdout);
             return NULL;
         }
-        /* EOF */
+        /* EOF (Ctrl-D).  Inside a remote session, treat as
+         * "disconnect from remote, return to local prompt" rather
+         * than killing the whole REPL — matches ssh / mosh UX where
+         * the first Ctrl-D logs out of the remote and the second
+         * exits the local shell. */
+        if (ray_repl_remote_active()) {
+            ray_t* args = NULL;
+            ray_release(ray_repl_disconnect_fn(&args, 0));
+            term->buf_len = 0;
+            term->buf_pos = 0;
+            term->multiline_len = 0;
+            ray_term_prompt(term);
+            fflush(stdout);
+            return NULL;
+        }
         ray_poll_exit(poll, 0);
         return NULL;
     }
 
     ray_t* line = ray_term_feed(term);
     if (line == RAY_TERM_EOF) {
+        if (ray_repl_remote_active()) {
+            ray_t* args = NULL;
+            ray_release(ray_repl_disconnect_fn(&args, 0));
+            term->buf_len = 0;
+            term->buf_pos = 0;
+            term->multiline_len = 0;
+            ray_term_prompt(term);
+            fflush(stdout);
+            return NULL;
+        }
         ray_poll_exit(poll, 0);
         return NULL;
     }
@@ -973,11 +1147,15 @@ static void run_piped(ray_repl_t* repl) {
 }
 
 void ray_repl_run(ray_repl_t* repl) {
+    /* Publish the active term so .repl.connect / .repl.disconnect can
+     * adjust the prompt prefix without threading it through eval. */
+    g_active_term = repl->term;
     if (repl->term) {
         run_interactive(repl);
     } else {
         run_piped(repl);
     }
+    g_active_term = NULL;
 }
 
 int ray_repl_run_file(const char* path) {

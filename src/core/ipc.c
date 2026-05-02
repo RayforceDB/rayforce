@@ -234,8 +234,12 @@ static void send_response(ray_sock_t fd, ray_t* result)
     if (payload) ray_sys_free(payload);
 }
 
-static ray_t* eval_payload(uint8_t* payload, size_t payload_len,
-                           ray_ipc_header_t* hdr)
+/* Run the actual decompress + de-serialize + ray_eval pipeline on a
+ * single inbound payload.  The wrapper eval_payload() below decides
+ * whether to capture stdout/stderr (RAY_IPC_FLAG_VERBOSE) and whether
+ * to wrap the result in a [captured_str, result] list. */
+static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
+                                ray_ipc_header_t* hdr)
 {
     /* Journal hook: log every inbound SYNC message (state-mutation
      * channel in q's model) before evaluation, so a crash mid-handler
@@ -313,6 +317,88 @@ static ray_t* eval_payload(uint8_t* payload, size_t payload_len,
         }
     }
     return result ? result : RAY_NULL_OBJ;
+}
+
+/* eval_payload — outer wrapper.  When the client sets
+ * RAY_IPC_FLAG_VERBOSE on the request header, redirect stdout / stderr
+ * to a tmpfile for the duration of the eval, then return a 2-element
+ * RAY_LIST [captured_str, result] so the client can print the
+ * captured output on its own terminal.  Without the flag the bare
+ * result is returned (current behaviour, unchanged for existing
+ * clients).
+ *
+ * On any failure of the capture setup (tmpfile, dup, dup2) we fall
+ * back to the no-capture path: better to keep the eval running than
+ * to fail the whole request because /tmp is full.  The captured
+ * string is then empty, and the response shape is still the 2-elem
+ * list — clients can rely on that invariant. */
+static ray_t* eval_payload(uint8_t* payload, size_t payload_len,
+                           ray_ipc_header_t* hdr)
+{
+    if (!(hdr->flags & RAY_IPC_FLAG_VERBOSE))
+        return eval_payload_core(payload, payload_len, hdr);
+
+    FILE* cap = tmpfile();
+    int saved_out = -1, saved_err = -1;
+    bool capturing = false;
+
+    if (cap) {
+        fflush(stdout); fflush(stderr);
+        saved_out = dup(STDOUT_FILENO);
+        saved_err = dup(STDERR_FILENO);
+        if (saved_out >= 0 && saved_err >= 0) {
+            int capfd = fileno(cap);
+            if (dup2(capfd, STDOUT_FILENO) >= 0 &&
+                dup2(capfd, STDERR_FILENO) >= 0) {
+                capturing = true;
+            }
+        }
+    }
+
+    ray_t* result = eval_payload_core(payload, payload_len, hdr);
+
+    char* captured = NULL;
+    int   cap_len  = 0;
+    if (capturing) {
+        fflush(stdout); fflush(stderr);
+        dup2(saved_out, STDOUT_FILENO);
+        dup2(saved_err, STDERR_FILENO);
+        long pos = ftell(cap);
+        if (pos > 0) {
+            captured = (char*)ray_sys_alloc((size_t)pos + 1);
+            if (captured) {
+                fseek(cap, 0, SEEK_SET);
+                size_t got = fread(captured, 1, (size_t)pos, cap);
+                captured[got] = '\0';
+                cap_len = (int)got;
+            }
+        }
+    }
+    if (saved_out >= 0) close(saved_out);
+    if (saved_err >= 0) close(saved_err);
+    if (cap) fclose(cap);
+
+    /* Build [captured_str, result] list.  If the result is the
+     * "no result" sentinel (RAY_NULL_OBJ), keep it as-is; the
+     * client can distinguish via the second element's type. */
+    ray_t* cap_str = ray_str(captured ? captured : "", (size_t)cap_len);
+    if (captured) ray_sys_free(captured);
+    if (!cap_str) {
+        /* Allocator pressure on a tiny string is unlikely but possible. */
+        return result;
+    }
+
+    ray_t* response = ray_list_new(2);
+    if (!response) {
+        ray_release(cap_str);
+        return result;
+    }
+    ray_list_append(response, cap_str);
+    ray_list_append(response, result);
+    /* ray_list_append takes its own ref; release ours. */
+    ray_release(cap_str);
+    if (result != RAY_NULL_OBJ) ray_release(result);
+    return response;
 }
 
 /* ======================================================================
@@ -893,7 +979,8 @@ static int64_t recv_full(ray_sock_t fd, void* buf, size_t len) {
     return (int64_t)total;
 }
 
-static int64_t client_send_msg(int64_t handle, ray_t* msg, uint8_t msgtype)
+static int64_t client_send_msg(int64_t handle, ray_t* msg, uint8_t msgtype,
+                               uint8_t extra_flags)
 {
     if (handle < 0 || handle >= RAY_IPC_MAX_CONNS) return -2;
     ray_sock_t fd = g_client_fds[handle];
@@ -938,7 +1025,7 @@ static int64_t client_send_msg(int64_t handle, ray_t* msg, uint8_t msgtype)
     ray_ipc_header_t hdr = {
         .prefix  = RAY_SERDE_PREFIX,
         .version = RAY_SERDE_WIRE_VERSION,
-        .flags   = flags,
+        .flags   = (uint8_t)(flags | extra_flags),
         .endian  = 0,
         .msgtype = msgtype,
         .size    = (int64_t)send_len,
@@ -1047,7 +1134,7 @@ void ray_ipc_close(int64_t handle)
 
 ray_t* ray_ipc_send(int64_t handle, ray_t* msg)
 {
-    { int64_t sr = client_send_msg(handle, msg, RAY_IPC_MSG_SYNC);
+    { int64_t sr = client_send_msg(handle, msg, RAY_IPC_MSG_SYNC, 0);
       if (sr == -2) return ray_error("io", "connection closed");
       if (sr < 0) return ray_error("io", "ipc send failed"); }
 
@@ -1111,7 +1198,77 @@ ray_t* ray_ipc_send(int64_t handle, ray_t* msg)
 
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
 {
-    if (client_send_msg(handle, msg, RAY_IPC_MSG_ASYNC) < 0)
+    if (client_send_msg(handle, msg, RAY_IPC_MSG_ASYNC, 0) < 0)
         return RAY_ERR_IO;
     return RAY_OK;
+}
+
+/* Verbose-eval client send: sets RAY_IPC_FLAG_VERBOSE on the
+ * outbound header so the server captures whatever the eval writes
+ * to stdout/stderr and returns a 2-element list [captured_str,
+ * result] instead of bare result.  Same wire path as ray_ipc_send
+ * otherwise — sync, blocking until response. */
+ray_t* ray_ipc_send_verbose(int64_t handle, ray_t* msg)
+{
+    { int64_t sr = client_send_msg(handle, msg, RAY_IPC_MSG_SYNC,
+                                   RAY_IPC_FLAG_VERBOSE);
+      if (sr == -2) return ray_error("io", "connection closed");
+      if (sr < 0) return ray_error("io", "ipc send failed"); }
+
+    ray_sock_t fd = g_client_fds[handle];
+
+    ray_ipc_header_t hdr;
+    if (recv_full(fd, &hdr, sizeof(hdr)) < 0) {
+        ray_ipc_close(handle);
+        return ray_error("io", "ipc recv header failed");
+    }
+    if (hdr.prefix != RAY_SERDE_PREFIX || hdr.size <= 0) {
+        ray_ipc_close(handle);
+        return ray_error("io", "ipc bad response header");
+    }
+    if (hdr.version != RAY_SERDE_WIRE_VERSION) {
+        ray_ipc_close(handle);
+        return ray_error("version", "ipc peer wire version mismatch");
+    }
+    if (hdr.size > 256 * 1024 * 1024) {
+        ray_ipc_close(handle);
+        return ray_error("io", "ipc response too large");
+    }
+
+    uint8_t* payload = (uint8_t*)ray_sys_alloc((size_t)hdr.size);
+    if (!payload) return ray_error("oom", NULL);
+    if (recv_full(fd, payload, (size_t)hdr.size) < 0) {
+        ray_sys_free(payload);
+        ray_ipc_close(handle);
+        return ray_error("io", "ipc recv payload failed");
+    }
+
+    uint8_t* deser_buf    = payload;
+    size_t   deser_len    = (size_t)hdr.size;
+    uint8_t* decompressed = NULL;
+
+    if (hdr.flags & RAY_IPC_FLAG_COMPRESSED) {
+        if (deser_len < 4) { ray_sys_free(payload); return ray_error("io", "ipc compressed payload too short"); }
+        uint32_t uncomp_size;
+        memcpy(&uncomp_size, payload, 4);
+        decompressed = (uint8_t*)ray_sys_alloc(uncomp_size);
+        if (!decompressed) { ray_sys_free(payload); return ray_error("oom", NULL); }
+        size_t dlen = ray_ipc_decompress(payload + 4, deser_len - 4,
+                                         decompressed, uncomp_size);
+        if (dlen != uncomp_size) {
+            ray_sys_free(decompressed);
+            ray_sys_free(payload);
+            return ray_error("io", "ipc decompress failed");
+        }
+        deser_buf = decompressed;
+        deser_len = uncomp_size;
+    }
+
+    int64_t de_len = (int64_t)deser_len;
+    ray_t*  result = ray_de_raw(deser_buf, &de_len);
+
+    if (decompressed) ray_sys_free(decompressed);
+    ray_sys_free(payload);
+
+    return result ? result : RAY_NULL_OBJ;
 }
