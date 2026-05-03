@@ -1894,6 +1894,395 @@ static test_result_t test_error_free_reclaims(void) {
     PASS();
 }
 
+/* =====================================================================
+ * Coverage pass: dl_rule_head_const (I64 wrapper), dl_rule_add_builtin,
+ * dl_rule_add_interval, and the dl_builtin_* family (BEFORE / DURATION_SINCE
+ * / ABS).  These exercise the public-API entry points that callers use to
+ * build rules with builtin predicates and interval binds.
+ * ===================================================================== */
+
+/* dl_rule_head_const() — the back-compat I64 wrapper that forwards to
+ * dl_rule_head_const_typed(rule, pos, val, RAY_I64).  Direct callers using
+ * the un-typed form go through this thin shim. */
+static test_result_t test_rule_head_const_wrapper_i64(void) {
+    int64_t vals[] = { 1, 2, 3 };
+    ray_t* col = ray_vec_from_raw(RAY_I64, vals, 3);
+    ray_t* trig = ray_table_new(1);
+    trig = ray_table_add_col(trig, ray_sym_intern("trig__c0", 8), col);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "trig", trig, 1), 0);
+
+    /* (rule (mark 42 ?X) (trig ?X)) — exercises the I64 wrapper at
+     * head pos 0 with a variable at pos 1. */
+    dl_rule_t r;
+    dl_rule_init(&r, "mark", 2);
+    dl_rule_head_const(&r, 0, 42);          /* I64 wrapper */
+    dl_rule_head_var(&r, 1, 0);
+    int b = dl_rule_add_atom(&r, "trig", 1);
+    dl_body_set_var(&r, b, 0, 0);
+    r.n_vars = 1;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "mark");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 3);
+    ray_t* c0 = ray_table_get_col_idx(out, 0);
+    TEST_ASSERT_NOT_NULL(c0);
+    TEST_ASSERT_EQ_I(c0->type, RAY_I64);
+    int64_t* d = (int64_t*)ray_data(c0);
+    TEST_ASSERT_EQ_I((int)d[0], 42);
+    TEST_ASSERT_EQ_I((int)d[1], 42);
+    TEST_ASSERT_EQ_I((int)d[2], 42);
+
+    dl_program_free(prog);
+    ray_release(trig); ray_release(col);
+    PASS();
+}
+
+/* dl_rule_head_const() with an out-of-range position must be a no-op
+ * (defensive guard at the top of the wrapper). */
+static test_result_t test_rule_head_const_wrapper_oor(void) {
+    dl_rule_t r;
+    dl_rule_init(&r, "x", 1);
+    /* pos < 0 — wrapper guard returns early. */
+    dl_rule_head_const(&r, -1, 99);
+    /* pos >= head_arity — wrapper guard returns early. */
+    dl_rule_head_const(&r,  5, 99);
+    /* Successful slot 0 path remains intact. */
+    dl_rule_head_const(&r,  0, 7);
+    TEST_ASSERT_EQ_I((int)r.head_consts[0], 7);
+    PASS();
+}
+
+/* dl_builtin_before via dl_rule_add_builtin: keep rows where T < S.
+ *
+ * Program:
+ *   EDB: ev(start, t)
+ *     (10, 5), (10, 12), (20, 19), (20, 25)
+ *   Rule: pre(S, T) :- ev(S, T), before(S, _, T)
+ *     where the builtin is wired with vars[0]=S, vars[2]=T (the third
+ *     positional slot in the BEFORE switch case is unused — only [0]/[2]
+ *     matter to dl_builtin_before). */
+static test_result_t test_builtin_before(void) {
+    int64_t s_vals[] = { 10, 10, 20, 20 };
+    int64_t t_vals[] = {  5, 12, 19, 25 };
+    ray_t* s = ray_vec_from_raw(RAY_I64, s_vals, 4);
+    ray_t* t = ray_vec_from_raw(RAY_I64, t_vals, 4);
+    ray_t* ev = ray_table_new(2);
+    ev = ray_table_add_col(ev, ray_sym_intern("ev__c0", 6), s);
+    ev = ray_table_add_col(ev, ray_sym_intern("ev__c1", 6), t);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_NOT_NULL(prog);
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "ev", ev, 2), 0);
+
+    dl_rule_t r;
+    dl_rule_init(&r, "pre", 2);
+    dl_rule_head_var(&r, 0, 0);
+    dl_rule_head_var(&r, 1, 1);
+
+    int body = dl_rule_add_atom(&r, "ev", 2);
+    dl_body_set_var(&r, body, 0, 0);  /* S = var 0 */
+    dl_body_set_var(&r, body, 1, 1);  /* T = var 1 */
+
+    int bi = dl_rule_add_builtin(&r, DL_BUILTIN_BEFORE, 3);
+    TEST_ASSERT((bi) >= (0), "bi >= 0");
+    /* dl_builtin_before reads vars[0] (S) and vars[2] (T). */
+    dl_body_set_var(&r, bi, 0, 0);
+    dl_body_set_var(&r, bi, 1, 0);  /* unused slot */
+    dl_body_set_var(&r, bi, 2, 1);
+
+    r.n_vars = 2;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "pre");
+    TEST_ASSERT_NOT_NULL(out);
+    /* Rows where T < S: (10,5) and (20,19). */
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 2);
+
+    dl_program_free(prog);
+    ray_release(ev); ray_release(s); ray_release(t);
+    PASS();
+}
+
+/* dl_builtin_before fast-path: every row passes T < S, so the helper
+ * retains and returns the input table without rebuilding columns
+ * (the `count == nrows` branch). */
+static test_result_t test_builtin_before_all_pass(void) {
+    int64_t s_vals[] = { 100, 200, 300 };
+    int64_t t_vals[] = {   1,   2,   3 };
+    ray_t* s = ray_vec_from_raw(RAY_I64, s_vals, 3);
+    ray_t* t = ray_vec_from_raw(RAY_I64, t_vals, 3);
+    ray_t* ev = ray_table_new(2);
+    ev = ray_table_add_col(ev, ray_sym_intern("ev__c0", 6), s);
+    ev = ray_table_add_col(ev, ray_sym_intern("ev__c1", 6), t);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "ev", ev, 2), 0);
+
+    dl_rule_t r;
+    dl_rule_init(&r, "pre", 2);
+    dl_rule_head_var(&r, 0, 0);
+    dl_rule_head_var(&r, 1, 1);
+    int body = dl_rule_add_atom(&r, "ev", 2);
+    dl_body_set_var(&r, body, 0, 0);
+    dl_body_set_var(&r, body, 1, 1);
+    int bi = dl_rule_add_builtin(&r, DL_BUILTIN_BEFORE, 3);
+    dl_body_set_var(&r, bi, 0, 0);
+    dl_body_set_var(&r, bi, 1, 0);
+    dl_body_set_var(&r, bi, 2, 1);
+    r.n_vars = 2;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "pre");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 3);
+
+    dl_program_free(prog);
+    ray_release(ev); ray_release(s); ray_release(t);
+    PASS();
+}
+
+/* dl_builtin_before short-circuit on empty input: should return tbl
+ * unchanged when the accumulator has zero rows. */
+static test_result_t test_builtin_before_empty(void) {
+    /* EDB with one row that won't survive the < filter, so the join
+     * accumulator before BEFORE has zero rows. */
+    int64_t s_vals[] = { 5 };
+    int64_t t_vals[] = { 5 };
+    ray_t* s = ray_vec_from_raw(RAY_I64, s_vals, 1);
+    ray_t* t = ray_vec_from_raw(RAY_I64, t_vals, 1);
+    ray_t* ev = ray_table_new(2);
+    ev = ray_table_add_col(ev, ray_sym_intern("ev__c0", 6), s);
+    ev = ray_table_add_col(ev, ray_sym_intern("ev__c1", 6), t);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "ev", ev, 2), 0);
+
+    dl_rule_t r;
+    dl_rule_init(&r, "pre", 2);
+    dl_rule_head_var(&r, 0, 0);
+    dl_rule_head_var(&r, 1, 1);
+    int body = dl_rule_add_atom(&r, "ev", 2);
+    dl_body_set_var(&r, body, 0, 0);
+    dl_body_set_var(&r, body, 1, 1);
+    /* Pre-filter to drain rows: T == 999 — never matches, accum is empty. */
+    int cmp = dl_rule_add_cmp_const(&r, DL_CMP_EQ, 1, 999);
+    TEST_ASSERT((cmp) >= (0), "cmp >= 0");
+    int bi = dl_rule_add_builtin(&r, DL_BUILTIN_BEFORE, 3);
+    dl_body_set_var(&r, bi, 0, 0);
+    dl_body_set_var(&r, bi, 1, 0);
+    dl_body_set_var(&r, bi, 2, 1);
+    r.n_vars = 2;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "pre");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 0);
+
+    dl_program_free(prog);
+    ray_release(ev); ray_release(s); ray_release(t);
+    PASS();
+}
+
+/* dl_builtin_duration_since via dl_rule_add_builtin: D = T2 - T1.
+ * Program:
+ *   EDB: span(t1, t2): (10, 25), (5, 17), (0, 100)
+ *   Rule: dur(T1, T2, D) :- span(T1, T2), duration_since(T1, T2, D)
+ * Expected: dur has 3 rows with D = 15, 12, 100. */
+static test_result_t test_builtin_duration_since(void) {
+    int64_t t1_vals[] = { 10,  5,   0 };
+    int64_t t2_vals[] = { 25, 17, 100 };
+    ray_t* c1 = ray_vec_from_raw(RAY_I64, t1_vals, 3);
+    ray_t* c2 = ray_vec_from_raw(RAY_I64, t2_vals, 3);
+    ray_t* span = ray_table_new(2);
+    span = ray_table_add_col(span, ray_sym_intern("span__c0", 8), c1);
+    span = ray_table_add_col(span, ray_sym_intern("span__c1", 8), c2);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "span", span, 2), 0);
+
+    dl_rule_t r;
+    dl_rule_init(&r, "dur", 3);
+    dl_rule_head_var(&r, 0, 0);
+    dl_rule_head_var(&r, 1, 1);
+    dl_rule_head_var(&r, 2, 2);
+
+    int body = dl_rule_add_atom(&r, "span", 2);
+    dl_body_set_var(&r, body, 0, 0);
+    dl_body_set_var(&r, body, 1, 1);
+
+    int bi = dl_rule_add_builtin(&r, DL_BUILTIN_DURATION_SINCE, 3);
+    TEST_ASSERT((bi) >= (0), "bi >= 0");
+    dl_body_set_var(&r, bi, 0, 0);  /* T1 */
+    dl_body_set_var(&r, bi, 1, 1);  /* T2 */
+    dl_body_set_var(&r, bi, 2, 2);  /* D = output */
+
+    r.n_vars = 3;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "dur");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 3);
+    ray_t* dcol = ray_table_get_col_idx(out, 2);
+    TEST_ASSERT_NOT_NULL(dcol);
+    TEST_ASSERT_EQ_I(dcol->type, RAY_I64);
+    /* Row order is implementation-defined after dedup; check the
+     * multiset by summing. */
+    int64_t* dd = (int64_t*)ray_data(dcol);
+    int64_t total = dd[0] + dd[1] + dd[2];
+    TEST_ASSERT_EQ_I((int)total, 127);  /* 15 + 12 + 100 */
+
+    dl_program_free(prog);
+    ray_release(span); ray_release(c1); ray_release(c2);
+    PASS();
+}
+
+/* dl_builtin_abs via dl_rule_add_builtin: Y = |X|.
+ * Program:
+ *   EDB: signed(x): (-3, -1, 0, 4, -7)
+ *   Rule: pos(X, Y) :- signed(X), abs(X, Y)
+ * Expected: rows with |X| = 3, 1, 0, 4, 7. */
+static test_result_t test_builtin_abs(void) {
+    int64_t vals[] = { -3, -1, 0, 4, -7 };
+    ray_t* col = ray_vec_from_raw(RAY_I64, vals, 5);
+    ray_t* signed_t = ray_table_new(1);
+    signed_t = ray_table_add_col(signed_t, ray_sym_intern("signed__c0", 10), col);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "signed", signed_t, 1), 0);
+
+    dl_rule_t r;
+    dl_rule_init(&r, "pos", 2);
+    dl_rule_head_var(&r, 0, 0);  /* X */
+    dl_rule_head_var(&r, 1, 1);  /* Y */
+
+    int body = dl_rule_add_atom(&r, "signed", 1);
+    dl_body_set_var(&r, body, 0, 0);
+
+    int bi = dl_rule_add_builtin(&r, DL_BUILTIN_ABS, 2);
+    TEST_ASSERT((bi) >= (0), "bi >= 0");
+    dl_body_set_var(&r, bi, 0, 0);  /* X — input col */
+    dl_body_set_var(&r, bi, 1, 1);  /* Y — output, gets bound */
+
+    r.n_vars = 2;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "pos");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 5);
+
+    /* Column 1 (Y) carries |X| values; sum to assert without ordering. */
+    ray_t* ycol = ray_table_get_col_idx(out, 1);
+    TEST_ASSERT_NOT_NULL(ycol);
+    TEST_ASSERT_EQ_I(ycol->type, RAY_I64);
+    int64_t* yd = (int64_t*)ray_data(ycol);
+    int64_t total = 0;
+    for (int i = 0; i < 5; i++) total += yd[i];
+    TEST_ASSERT_EQ_I((int)total, 15);  /* 3 + 1 + 0 + 4 + 7 */
+
+    dl_program_free(prog);
+    ray_release(signed_t); ray_release(col);
+    PASS();
+}
+
+/* dl_rule_add_builtin guard: returning -1 when n_body has reached
+ * DL_MAX_BODY.  Saturate the body literals first, then the next
+ * builtin add must report -1. */
+static test_result_t test_rule_add_builtin_overflow(void) {
+    dl_rule_t r;
+    dl_rule_init(&r, "x", 1);
+    /* Pack DL_MAX_BODY positive atoms. */
+    for (int i = 0; i < DL_MAX_BODY; i++) {
+        int idx = dl_rule_add_atom(&r, "p", 1);
+        TEST_ASSERT_EQ_I(idx, i);
+    }
+    /* Now n_body == DL_MAX_BODY — builder must refuse another body. */
+    int bad = dl_rule_add_builtin(&r, DL_BUILTIN_ABS, 2);
+    TEST_ASSERT_EQ_I(bad, -1);
+    PASS();
+}
+
+/* dl_rule_add_interval: bind a fact column pair as start/end.
+ *
+ * Program:
+ *   EDB: spans(start, end, payload):
+ *     (1, 5, 100), (2, 8, 200), (3, 9, 300)
+ *   Rule: iv(P, S, E) :- spans(S, E, P)  with interval bind on var 1
+ *
+ * The DL_INTERVAL evaluator sets var_col[start_var] = fact_col and
+ * var_col[end_var] = fact_col + 1.  We point the fact-var at the start
+ * column (col 0), and assert start_var/end_var bindings round-trip into
+ * the head. */
+static test_result_t test_rule_add_interval(void) {
+    int64_t s_vals[] = { 1, 2, 3 };
+    int64_t e_vals[] = { 5, 8, 9 };
+    int64_t p_vals[] = { 100, 200, 300 };
+    ray_t* s = ray_vec_from_raw(RAY_I64, s_vals, 3);
+    ray_t* e = ray_vec_from_raw(RAY_I64, e_vals, 3);
+    ray_t* p = ray_vec_from_raw(RAY_I64, p_vals, 3);
+    ray_t* spans = ray_table_new(3);
+    spans = ray_table_add_col(spans, ray_sym_intern("spans__c0", 9), s);
+    spans = ray_table_add_col(spans, ray_sym_intern("spans__c1", 9), e);
+    spans = ray_table_add_col(spans, ray_sym_intern("spans__c2", 9), p);
+
+    dl_program_t* prog = dl_program_new();
+    TEST_ASSERT_EQ_I(dl_add_edb(prog, "spans", spans, 3), 0);
+
+    dl_rule_t r;
+    dl_rule_init(&r, "iv", 3);
+    dl_rule_head_var(&r, 0, 2);  /* P */
+    dl_rule_head_var(&r, 1, 0);  /* S — bound by interval to col 0 */
+    dl_rule_head_var(&r, 2, 1);  /* E — bound by interval to col 1 */
+
+    int body = dl_rule_add_atom(&r, "spans", 3);
+    /* var 0 lives at col 0 (start), var 1 at col 1 (end), var 2 at col 2 */
+    dl_body_set_var(&r, body, 0, 0);
+    dl_body_set_var(&r, body, 1, 1);
+    dl_body_set_var(&r, body, 2, 2);
+
+    /* Interval bind: re-bind var 0 / var 1 via the interval helper.
+     * fact_var=0 means columns at fact_var (0) and fact_var+1 (1) are
+     * exposed as start_var=0 / end_var=1.  Effectively a no-op for this
+     * shape but exercises dl_rule_add_interval and the DL_INTERVAL eval
+     * branch. */
+    int ii = dl_rule_add_interval(&r, 0, 0, 1);
+    TEST_ASSERT((ii) >= (0), "ii >= 0");
+
+    r.n_vars = 3;
+    TEST_ASSERT_EQ_I(dl_add_rule(prog, &r), 0);
+    TEST_ASSERT_EQ_I(dl_eval(prog), 0);
+
+    ray_t* out = dl_query(prog, "iv");
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I((int)ray_table_nrows(out), 3);
+
+    dl_program_free(prog);
+    ray_release(spans); ray_release(s); ray_release(e); ray_release(p);
+    PASS();
+}
+
+/* dl_rule_add_interval guard: returns -1 when body table is full. */
+static test_result_t test_rule_add_interval_overflow(void) {
+    dl_rule_t r;
+    dl_rule_init(&r, "x", 1);
+    for (int i = 0; i < DL_MAX_BODY; i++) {
+        int idx = dl_rule_add_atom(&r, "p", 1);
+        TEST_ASSERT_EQ_I(idx, i);
+    }
+    int bad = dl_rule_add_interval(&r, 0, 0, 1);
+    TEST_ASSERT_EQ_I(bad, -1);
+    PASS();
+}
+
 const test_entry_t datalog_entries[] = {
     { "datalog/source_provenance", test_source_provenance, datalog_setup, datalog_teardown },
     { "datalog/source_prov_requires_flag", test_source_prov_requires_flag, datalog_setup, datalog_teardown },
@@ -1945,6 +2334,16 @@ const test_entry_t datalog_entries[] = {
     { "datalog/agg_scalar_value_col_oor_empty", test_agg_scalar_value_col_oor_empty, datalog_setup, datalog_teardown },
     { "datalog/agg_grouped_key_col_oor", test_agg_grouped_key_col_oor, datalog_setup, datalog_teardown },
     { "datalog/project_narrow_sym", test_project_narrow_sym, datalog_setup, datalog_teardown },
+    { "datalog/rule_head_const_wrapper_i64", test_rule_head_const_wrapper_i64, datalog_setup, datalog_teardown },
+    { "datalog/rule_head_const_wrapper_oor", test_rule_head_const_wrapper_oor, datalog_setup, datalog_teardown },
+    { "datalog/builtin_before", test_builtin_before, datalog_setup, datalog_teardown },
+    { "datalog/builtin_before_all_pass", test_builtin_before_all_pass, datalog_setup, datalog_teardown },
+    { "datalog/builtin_before_empty", test_builtin_before_empty, datalog_setup, datalog_teardown },
+    { "datalog/builtin_duration_since", test_builtin_duration_since, datalog_setup, datalog_teardown },
+    { "datalog/builtin_abs", test_builtin_abs, datalog_setup, datalog_teardown },
+    { "datalog/rule_add_builtin_overflow", test_rule_add_builtin_overflow, datalog_setup, datalog_teardown },
+    { "datalog/rule_add_interval", test_rule_add_interval, datalog_setup, datalog_teardown },
+    { "datalog/rule_add_interval_overflow", test_rule_add_interval_overflow, datalog_setup, datalog_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

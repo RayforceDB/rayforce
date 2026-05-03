@@ -3977,6 +3977,589 @@ static test_result_t test_builtin_write_file_fn(void) {
     PASS();
 }
 
+/* ── builtins.c coverage: group_ht_grow + ght_i64_hash_gi ───────────────────
+ * ray_group_fn on an I64 vector with 40 distinct values.
+ * seed_cap = 64 (n<64 path), so the HT starts at capacity 64.
+ * After 33 distinct entries, count*2 = 66 > 64 → group_ht_grow fires. */
+static test_result_t test_builtin_group_ht_grow_i64(void) {
+    /* Build [0,1,2,...,39] — all distinct → forces group_ht_grow */
+    ray_t* vec = ray_vec_new(RAY_I64, 40);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    int64_t vals[40];
+    for (int i = 0; i < 40; i++) vals[i] = (int64_t)i;
+    for (int i = 0; i < 40; i++) {
+        vec = ray_vec_append(vec, &vals[i]);
+        TEST_ASSERT_NOT_NULL(vec);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    }
+
+    ray_t* grp = ray_group_fn(vec);
+    TEST_ASSERT_NOT_NULL(grp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(grp));
+    /* Result is a dict — 40 distinct keys */
+    TEST_ASSERT_EQ_I(grp->type, RAY_DICT);
+    ray_release(grp);
+    ray_release(vec);
+    PASS();
+}
+
+/* ── builtins.c coverage: group_ht_grow + ght_guid_hash_gi ─────────────────
+ * ray_group_fn on a GUID vector with 40 distinct GUIDs.
+ * seed_cap = 64 (n<64), HT starts at 64; grows after 33 distinct GUIDs. */
+static test_result_t test_builtin_group_ht_grow_guid(void) {
+    ray_t* vec = ray_vec_new(RAY_GUID, 40);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    for (int i = 0; i < 40; i++) {
+        uint8_t g[16] = {0};
+        g[0]  = (uint8_t)(i & 0xff);
+        g[1]  = (uint8_t)((i >> 8) & 0xff);
+        /* fill rest with zeros — each entry has a unique first two bytes */
+        vec = ray_vec_append(vec, g);
+        TEST_ASSERT_NOT_NULL(vec);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    }
+
+    ray_t* grp = ray_group_fn(vec);
+    TEST_ASSERT_NOT_NULL(grp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(grp));
+    TEST_ASSERT_EQ_I(grp->type, RAY_DICT);
+    ray_release(grp);
+    ray_release(vec);
+    PASS();
+}
+
+/* ── builtins.c coverage: group_grow (I64 path) ─────────────────────────────
+ * ray_group_fn on an I64 vector with 1100 distinct values.
+ * max_groups starts at 1024 (capped); after processing 1025 distinct
+ * values group_grow fires to double the bookkeeping arrays. */
+static test_result_t test_builtin_group_grow_i64(void) {
+    int64_t N = 1100;
+    ray_t* vec = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    for (int64_t i = 0; i < N; i++) {
+        vec = ray_vec_append(vec, &i);
+        TEST_ASSERT_NOT_NULL(vec);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    }
+
+    ray_t* grp = ray_group_fn(vec);
+    TEST_ASSERT_NOT_NULL(grp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(grp));
+    TEST_ASSERT_EQ_I(grp->type, RAY_DICT);
+    ray_release(grp);
+    ray_release(vec);
+    PASS();
+}
+
+/* ── builtins.c coverage: cast_par_fn ────────────────────────────────────────
+ * Cast an I64 vector with 300000 elements (> CAST_PAR_MIN_ELEMS=262144).
+ * With a multi-worker pool, ray_pool_dispatch calls cast_par_fn per chunk. */
+static test_result_t test_builtin_cast_par_fn(void) {
+    int64_t N = 300000;
+    ray_t* vec = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    for (int64_t i = 0; i < N; i++) {
+        vec = ray_vec_append(vec, &i);
+        TEST_ASSERT_NOT_NULL(vec);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    }
+
+    /* Cast I64 → F64 — triggers parallel path when pool has >= 2 workers */
+    ray_t* f64_sym = ray_eval_str("'F64");
+    TEST_ASSERT_NOT_NULL(f64_sym);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(f64_sym));
+
+    ray_t* result = ray_cast_fn(f64_sym, vec);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_F64);
+    TEST_ASSERT_EQ_I(result->len, N);
+
+    ray_release(result);
+    ray_release(f64_sym);
+    ray_release(vec);
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_nil_fn ────────────────────────────────────────
+ * ray_nil_fn returns true for null/typed-null, false otherwise. */
+static test_result_t test_builtin_nil_fn(void) {
+    /* Non-null value → false */
+    ray_t* v = ray_i64(42);
+    ray_t* r = ray_nil_fn(v);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_BOOL);
+    TEST_ASSERT_FALSE(r->b8);
+    ray_release(r);
+    ray_release(v);
+
+    /* Typed null atom → true */
+    ray_t* tn = ray_typed_null(-RAY_I64);
+    TEST_ASSERT_NOT_NULL(tn);
+    r = ray_nil_fn(tn);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQ_I(r->type, -RAY_BOOL);
+    TEST_ASSERT_TRUE(r->b8);
+    ray_release(r);
+    ray_release(tn);
+
+    /* RAY_NULL_OBJ (null literal) → true */
+    r = ray_nil_fn(RAY_NULL_OBJ);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_EQ_I(r->type, -RAY_BOOL);
+    TEST_ASSERT_TRUE(r->b8);
+    ray_release(r);
+
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_where_fn ──────────────────────────────────────
+ * ray_where_fn returns indices of true elements in a bool vector. */
+static test_result_t test_builtin_where_fn(void) {
+    /* [false, true, false, true, true] → indices [1, 3, 4] */
+    ray_t* bvec = ray_vec_new(RAY_BOOL, 5);
+    TEST_ASSERT_NOT_NULL(bvec);
+    bool bvals[5] = { false, true, false, true, true };
+    for (int i = 0; i < 5; i++) {
+        bvec = ray_vec_append(bvec, &bvals[i]);
+        TEST_ASSERT_NOT_NULL(bvec);
+    }
+
+    ray_t* result = ray_where_fn(bvec);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
+    TEST_ASSERT_EQ_I(result->len, 3);
+    int64_t* out = (int64_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(out[0], 1);
+    TEST_ASSERT_EQ_I(out[1], 3);
+    TEST_ASSERT_EQ_I(out[2], 4);
+    ray_release(result);
+
+    /* Type error: not a bool vec */
+    ray_t* iv = ray_vec_new(RAY_I64, 1);
+    int64_t tmp = 1;
+    iv = ray_vec_append(iv, &tmp);
+    ray_t* err = ray_where_fn(iv);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+    ray_release(iv);
+    ray_release(bvec);
+
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_format_fn ─────────────────────────────────────
+ * ray_format_fn interpolates % placeholders in a format string. */
+static test_result_t test_builtin_format_fn(void) {
+    /* No placeholders: should return the format string unchanged */
+    ray_t* plain = ray_str("hello", 5);
+    ray_t* args1[1] = { plain };
+    ray_t* r1 = ray_format_fn(args1, 1);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(r1->type, -RAY_STR);
+    ray_release(r1);
+    ray_release(plain);
+
+    /* With % placeholders: "val=% end" with i64(7) → "val=7 end" */
+    ray_t* fmt  = ray_str("val=% end", 9);
+    ray_t* val  = ray_i64(7);
+    ray_t* args2[2] = { fmt, val };
+    ray_t* r2 = ray_format_fn(args2, 2);
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(r2->type, -RAY_STR);
+    /* Check content */
+    const char* sp = ray_str_ptr(r2);
+    size_t sl = ray_str_len(r2);
+    TEST_ASSERT_TRUE(sl == 9 && memcmp(sp, "val=7 end", 9) == 0);
+    ray_release(r2);
+    ray_release(val);
+    ray_release(fmt);
+
+    /* Error: no args */
+    ray_t* err = ray_format_fn(NULL, 0);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_raze_fn ───────────────────────────────────────
+ * ray_raze_fn flattens a list of vectors into one. */
+static test_result_t test_builtin_raze_fn(void) {
+    /* Atom passthrough */
+    ray_t* atom = ray_i64(5);
+    ray_t* r1 = ray_raze_fn(atom);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(r1->i64, 5);
+    ray_release(r1);
+    ray_release(atom);
+
+    /* Vec passthrough */
+    ray_t* vec = ray_vec_new(RAY_I64, 3);
+    int64_t tmp[3] = {1, 2, 3};
+    for (int i = 0; i < 3; i++) vec = ray_vec_append(vec, &tmp[i]);
+    ray_t* r2 = ray_raze_fn(vec);
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(r2->len, 3);
+    ray_release(r2);
+    ray_release(vec);
+
+    /* List of two I64 vecs → flattened */
+    ray_t* v1 = ray_vec_new(RAY_I64, 2);
+    int64_t a1[2] = {10, 20};
+    v1 = ray_vec_append(v1, &a1[0]);
+    v1 = ray_vec_append(v1, &a1[1]);
+    ray_t* v2 = ray_vec_new(RAY_I64, 2);
+    int64_t a2[2] = {30, 40};
+    v2 = ray_vec_append(v2, &a2[0]);
+    v2 = ray_vec_append(v2, &a2[1]);
+    ray_t* lst = ray_list_new(2);
+    lst = ray_list_append(lst, v1);
+    lst = ray_list_append(lst, v2);
+    ray_t* r3 = ray_raze_fn(lst);
+    TEST_ASSERT_NOT_NULL(r3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r3));
+    TEST_ASSERT_EQ_I(r3->len, 4);
+    ray_release(r3);
+    ray_release(v1);
+    ray_release(v2);
+    ray_release(lst);
+
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_within_fn ─────────────────────────────────────
+ * ray_within_fn returns bool vec: true where lo <= val <= hi. */
+static test_result_t test_builtin_within_fn(void) {
+    /* I64 vector: [1,5,10], range=[3,8] → [false,true,false] */
+    ray_t* vals = ray_vec_new(RAY_I64, 3);
+    int64_t vv[3] = {1, 5, 10};
+    for (int i = 0; i < 3; i++) vals = ray_vec_append(vals, &vv[i]);
+
+    ray_t* range = ray_vec_new(RAY_I64, 2);
+    int64_t rv[2] = {3, 8};
+    range = ray_vec_append(range, &rv[0]);
+    range = ray_vec_append(range, &rv[1]);
+
+    ray_t* result = ray_within_fn(vals, range);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_BOOL);
+    TEST_ASSERT_EQ_I(result->len, 3);
+    bool* out = (bool*)ray_data(result);
+    TEST_ASSERT_FALSE(out[0]);
+    TEST_ASSERT_TRUE(out[1]);
+    TEST_ASSERT_FALSE(out[2]);
+    ray_release(result);
+    ray_release(vals);
+    ray_release(range);
+
+    /* F64 vector */
+    ray_t* fvals = ray_vec_new(RAY_F64, 3);
+    double fv[3] = {1.0, 5.0, 10.0};
+    for (int i = 0; i < 3; i++) fvals = ray_vec_append(fvals, &fv[i]);
+    ray_t* frange = ray_vec_new(RAY_F64, 2);
+    double fr[2] = {3.0, 8.0};
+    frange = ray_vec_append(frange, &fr[0]);
+    frange = ray_vec_append(frange, &fr[1]);
+    ray_t* r2 = ray_within_fn(fvals, frange);
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    ray_release(r2);
+    ray_release(fvals);
+    ray_release(frange);
+
+    /* Type error */
+    ray_t* sv = ray_vec_new(RAY_BOOL, 1);
+    bool bv = true;
+    sv = ray_vec_append(sv, &bv);
+    ray_t* badrange = ray_vec_new(RAY_I64, 2);
+    badrange = ray_vec_append(badrange, &rv[0]);
+    badrange = ray_vec_append(badrange, &rv[1]);
+    ray_t* err = ray_within_fn(sv, badrange);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+    ray_error_free(err);
+    ray_release(sv);
+    ray_release(badrange);
+
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_fdiv_fn ───────────────────────────────────────
+ * ray_fdiv_fn always returns F64, handles zero-div and nulls. */
+static test_result_t test_builtin_fdiv_fn(void) {
+    /* Normal division: 7.0 / 2.0 = 3.5 */
+    ray_t* a = ray_f64(7.0);
+    ray_t* b = ray_f64(2.0);
+    ray_t* r = ray_fdiv_fn(a, b);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_F64);
+    TEST_ASSERT_TRUE(r->f64 == 3.5);
+    ray_release(r);
+    ray_release(a);
+    ray_release(b);
+
+    /* Division by zero → typed null */
+    ray_t* c = ray_f64(5.0);
+    ray_t* z = ray_f64(0.0);
+    ray_t* r2 = ray_fdiv_fn(c, z);
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r2));
+    ray_release(r2);
+    ray_release(c);
+    ray_release(z);
+
+    /* Null propagation: null / 2.0 → null */
+    ray_t* tn = ray_typed_null(-RAY_F64);
+    ray_t* d  = ray_f64(2.0);
+    ray_t* r3 = ray_fdiv_fn(tn, d);
+    TEST_ASSERT_NOT_NULL(r3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r3));
+    TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r3));
+    ray_release(r3);
+    ray_release(tn);
+    ray_release(d);
+
+    /* Type error: vec args */
+    ray_t* va = ray_vec_new(RAY_I64, 1);
+    int64_t tmp = 1;
+    va = ray_vec_append(va, &tmp);
+    ray_t* er = ray_fdiv_fn(va, va);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(er));
+    ray_error_free(er);
+    ray_release(va);
+
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_concat_fn (various paths) ──────────────────────
+ * Tests string concat, vec+vec, atom+vec, list+list paths. */
+static test_result_t test_builtin_concat_fn(void) {
+    /* String atom + string atom */
+    ray_t* sa = ray_str("hello", 5);
+    ray_t* sb = ray_str(" world", 6);
+    ray_t* r1 = ray_concat_fn(sa, sb);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(r1->type, -RAY_STR);
+    TEST_ASSERT_TRUE(ray_str_len(r1) == 11);
+    ray_release(r1);
+    ray_release(sa);
+    ray_release(sb);
+
+    /* I64 vec + I64 vec same type → ray_vec_concat */
+    ray_t* v1 = ray_vec_new(RAY_I64, 2);
+    int64_t a1[2] = {1, 2};
+    v1 = ray_vec_append(v1, &a1[0]);
+    v1 = ray_vec_append(v1, &a1[1]);
+    ray_t* v2 = ray_vec_new(RAY_I64, 2);
+    int64_t a2[2] = {3, 4};
+    v2 = ray_vec_append(v2, &a2[0]);
+    v2 = ray_vec_append(v2, &a2[1]);
+    ray_t* r2 = ray_concat_fn(v1, v2);
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(r2->len, 4);
+    ray_release(r2);
+
+    /* Mixed I64 vec + F64 vec → list */
+    ray_t* vf = ray_vec_new(RAY_F64, 2);
+    double fd[2] = {5.0, 6.0};
+    vf = ray_vec_append(vf, &fd[0]);
+    vf = ray_vec_append(vf, &fd[1]);
+    ray_t* r3 = ray_concat_fn(v1, vf);
+    TEST_ASSERT_NOT_NULL(r3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r3));
+    TEST_ASSERT_EQ_I(r3->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(r3->len, 4);
+    ray_release(r3);
+    ray_release(vf);
+
+    /* Atom + vec: i64 atom + i64 vec */
+    ray_t* at = ray_i64(0);
+    ray_t* r4 = ray_concat_fn(at, v1);
+    TEST_ASSERT_NOT_NULL(r4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r4));
+    TEST_ASSERT_EQ_I(r4->len, 3);
+    ray_release(r4);
+
+    /* Vec + atom: i64 vec + i64 atom */
+    ray_t* r5 = ray_concat_fn(v1, at);
+    TEST_ASSERT_NOT_NULL(r5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r5));
+    TEST_ASSERT_EQ_I(r5->len, 3);
+    ray_release(r5);
+    ray_release(at);
+
+    ray_release(v1);
+    ray_release(v2);
+
+    /* List + list */
+    ray_t* la = ray_list_new(1);
+    ray_t* ea = ray_i64(100);
+    ray_retain(ea);
+    la = ray_list_append(la, ea);
+    ray_t* lb = ray_list_new(1);
+    ray_t* eb = ray_i64(200);
+    ray_retain(eb);
+    lb = ray_list_append(lb, eb);
+    ray_t* r6 = ray_concat_fn(la, lb);
+    TEST_ASSERT_NOT_NULL(r6);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r6));
+    TEST_ASSERT_EQ_I(r6->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(r6->len, 2);
+    ray_release(r6);
+    ray_release(ea);
+    ray_release(eb);
+    ray_release(la);
+    ray_release(lb);
+
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_enlist_fn (various type paths) ────────────────
+ * Tests the homogeneous, mixed int/float, and list paths. */
+static test_result_t test_builtin_enlist_fn(void) {
+    /* Empty → empty i64 vec */
+    ray_t* r0 = ray_enlist_fn(NULL, 0);
+    TEST_ASSERT_NOT_NULL(r0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r0));
+    TEST_ASSERT_EQ_I(r0->len, 0);
+    ray_release(r0);
+
+    /* Homogeneous I64 */
+    ray_t* a = ray_i64(1), *b = ray_i64(2), *c = ray_i64(3);
+    ray_t* args3[3] = { a, b, c };
+    ray_t* r1 = ray_enlist_fn(args3, 3);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(r1->type, RAY_I64);
+    TEST_ASSERT_EQ_I(r1->len, 3);
+    ray_release(r1);
+    ray_release(a); ray_release(b); ray_release(c);
+
+    /* Mixed I64 + F64 → promote to F64 */
+    ray_t* ai = ray_i64(5);
+    ray_t* af = ray_f64(2.5);
+    ray_t* mixed[2] = { ai, af };
+    ray_t* r2 = ray_enlist_fn(mixed, 2);
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(r2->type, RAY_F64);
+    TEST_ASSERT_EQ_I(r2->len, 2);
+    ray_release(r2);
+    ray_release(ai); ray_release(af);
+
+    /* Homogeneous BOOL */
+    ray_t* bt = ray_bool(true), *bf2 = ray_bool(false);
+    ray_t* bargs[2] = { bt, bf2 };
+    ray_t* r3 = ray_enlist_fn(bargs, 2);
+    TEST_ASSERT_NOT_NULL(r3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r3));
+    TEST_ASSERT_EQ_I(r3->type, RAY_BOOL);
+    ray_release(r3);
+    ray_release(bt); ray_release(bf2);
+
+    /* Homogeneous STR */
+    ray_t* s1 = ray_str("foo", 3), *s2 = ray_str("bar", 3);
+    ray_t* sargs[2] = { s1, s2 };
+    ray_t* r4 = ray_enlist_fn(sargs, 2);
+    TEST_ASSERT_NOT_NULL(r4);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r4));
+    TEST_ASSERT_EQ_I(r4->type, RAY_STR);
+    TEST_ASSERT_EQ_I(r4->len, 2);
+    ray_release(r4);
+    ray_release(s1); ray_release(s2);
+
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_resolve_fn ─────────────────────────────────────
+ * ray_resolve_fn replaces I64 sym-ID columns with SYM columns in a table.
+ * Call it with a plain I64 atom (non-table path: return as-is). */
+static test_result_t test_builtin_resolve_fn(void) {
+    /* Non-table path: resolve returns the value as-is */
+    ray_t* iv = ray_i64(42);
+    /* resolve is a special form — call via ray_eval_str */
+    ray_t* r1 = ray_eval_str("(resolve 42)");
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
+    TEST_ASSERT_EQ_I(r1->i64, 42);
+    ray_release(r1);
+    ray_release(iv);
+
+    /* Table with SYM column: resolve on a table with a SYM col should keep cols */
+    ray_t* r2 = ray_eval_str(
+        "(do (set __rt (table ['Name] (list ['Alice 'Bob]))) (resolve __rt))"
+    );
+    TEST_ASSERT_NOT_NULL(r2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
+    TEST_ASSERT_EQ_I(r2->type, RAY_TABLE);
+    ray_release(r2);
+
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_nil_fn via rfl ─────────────────────────────────
+ * Covers the nil? builtin through rfl evaluation. */
+static test_result_t test_builtin_nil_rfl(void) {
+    ASSERT_EQ("(nil? 0Nl)", "true");
+    ASSERT_EQ("(nil? 42)", "false");
+    ASSERT_EQ("(nil? null)", "true");
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_where_fn via rfl ──────────────────────────────
+ * Covers the where builtin. */
+static test_result_t test_builtin_where_rfl(void) {
+    ASSERT_EQ("(count (where [true false true]))", "2");
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_within_fn via rfl ─────────────────────────────
+ * Covers the within builtin. */
+static test_result_t test_builtin_within_rfl(void) {
+    ASSERT_EQ("(within [1 5 10] [3 8])", "[false true false]");
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_fdiv_fn via rfl ───────────────────────────────
+ * Covers the div builtin (float division). */
+static test_result_t test_builtin_fdiv_rfl(void) {
+    ASSERT_EQ("(div 7.0 2.0)", "3.5");
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_group_fn with GUID via rfl ────────────────────
+ * Covers the GUID grouping path. */
+static test_result_t test_builtin_group_guid_rfl(void) {
+    /* Create 40 distinct GUIDs, group them, verify result is a dict */
+    ASSERT_EQ("(type (group (guid 40)))", "'DICT");
+    PASS();
+}
+
+/* ── builtins.c coverage: ray_group_fn empty and list ───────────────────────
+ * Covers empty vector and RAY_LIST paths in ray_group_fn. */
+static test_result_t test_builtin_group_empty_and_list(void) {
+    /* Empty group */
+    ASSERT_EQ("(count (key (group [])))", "0");
+    /* List grouping: list of mixed values */
+    ASSERT_EQ("(count (key (group (list 1 2 1 3 2))))", "3");
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },
     { "lang/fn_binary", test_fn_binary, lang_setup, lang_teardown },
@@ -4176,6 +4759,27 @@ const test_entry_t lang_entries[] = {
     { "lang/builtin/timeit",      test_builtin_timeit_fn,      lang_setup, lang_teardown },
     { "lang/builtin/load_file",   test_builtin_load_file_fn,   lang_setup, lang_teardown },
     { "lang/builtin/write_file",  test_builtin_write_file_fn,  lang_setup, lang_teardown },
+
+    /* ops/builtins.c deep coverage: group_ht_grow, group_grow, cast_par_fn */
+    { "lang/builtin/group_ht_grow_i64",   test_builtin_group_ht_grow_i64,   lang_setup, lang_teardown },
+    { "lang/builtin/group_ht_grow_guid",  test_builtin_group_ht_grow_guid,  lang_setup, lang_teardown },
+    { "lang/builtin/group_grow_i64",      test_builtin_group_grow_i64,      lang_setup, lang_teardown },
+    { "lang/builtin/cast_par_fn",         test_builtin_cast_par_fn,         lang_setup, lang_teardown },
+    { "lang/builtin/nil_fn",              test_builtin_nil_fn,              lang_setup, lang_teardown },
+    { "lang/builtin/where_fn",            test_builtin_where_fn,            lang_setup, lang_teardown },
+    { "lang/builtin/format_fn",           test_builtin_format_fn,           lang_setup, lang_teardown },
+    { "lang/builtin/raze_fn",             test_builtin_raze_fn,             lang_setup, lang_teardown },
+    { "lang/builtin/within_fn",           test_builtin_within_fn,           lang_setup, lang_teardown },
+    { "lang/builtin/fdiv_fn",             test_builtin_fdiv_fn,             lang_setup, lang_teardown },
+    { "lang/builtin/concat_fn",           test_builtin_concat_fn,           lang_setup, lang_teardown },
+    { "lang/builtin/enlist_fn",           test_builtin_enlist_fn,           lang_setup, lang_teardown },
+    { "lang/builtin/resolve_fn",          test_builtin_resolve_fn,          lang_setup, lang_teardown },
+    { "lang/builtin/nil_rfl",             test_builtin_nil_rfl,             lang_setup, lang_teardown },
+    { "lang/builtin/where_rfl",           test_builtin_where_rfl,           lang_setup, lang_teardown },
+    { "lang/builtin/within_rfl",          test_builtin_within_rfl,          lang_setup, lang_teardown },
+    { "lang/builtin/fdiv_rfl",            test_builtin_fdiv_rfl,            lang_setup, lang_teardown },
+    { "lang/builtin/group_guid_rfl",      test_builtin_group_guid_rfl,      lang_setup, lang_teardown },
+    { "lang/builtin/group_empty_list",    test_builtin_group_empty_and_list, lang_setup, lang_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

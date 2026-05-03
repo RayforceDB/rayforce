@@ -769,6 +769,154 @@ static test_result_t test_dispatch_workers_participate(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: ray_pool_dispatch_n with n_tasks exceeding MAX_RING_CAP (1<<16).
+ *
+ * Drives the growth-loop early-out (`new_cap < MAX_RING_CAP`) on line ~335
+ * and the post-growth clamp (`if (n_tasks > pool->task_cap) n_tasks = ...`)
+ * on line ~347. With n_tasks = 70000 and MAX_RING_CAP = 65536, the ring
+ * grows to 65536 then clamps n_tasks down to 65536; only 65536 tasks fire.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_dispatch_n_max_ring_cap_clamp(void) {
+    ray_heap_init();
+
+    ray_pool_t pool;
+    TEST_ASSERT_EQ_I(ray_pool_create(&pool, 1), RAY_OK);
+
+    pool_count_ctx_t ctx = {0};
+    /* MAX_RING_CAP is 1<<16 = 65536; ask for 70000 → growth caps at 65536,
+     * then n_tasks is clamped to task_cap. */
+    uint32_t requested = 70000;
+    ray_pool_dispatch_n(&pool, pool_count_fn, &ctx, requested);
+
+    /* task_cap should have grown to MAX_RING_CAP exactly */
+    TEST_ASSERT_EQ_U(pool.task_cap, 65536u);
+    /* Calls should equal the clamped count, not the requested one. */
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 65536);
+
+    ray_pool_free(&pool);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: ray_pool_dispatch with total_elems large enough that n_tasks would
+ * exceed MAX_RING_CAP, exercising the post-growth clamp on lines 246-249
+ * (rebalances grain so all elements still get covered).
+ *
+ * total_elems = 70000 * TASK_GRAIN (= 70000 * 8192 = 573M).  We pass a
+ * no-op fn so the cost is just the dispatch overhead — even at 65536
+ * tasks we're under a second.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_dispatch_max_ring_cap_clamp(void) {
+    ray_heap_init();
+
+    ray_pool_t pool;
+    TEST_ASSERT_EQ_I(ray_pool_create(&pool, 1), RAY_OK);
+
+    pool_count_ctx_t ctx = {0};
+    /* TASK_GRAIN = 8 * 1024 = 8192.  70000 * 8192 = 573_440_000 elements,
+     * which would naively want 70000 tasks. After clamp → 65536 tasks with
+     * a slightly larger grain so total_elems is still fully covered. */
+    int64_t grain = 8192;
+    int64_t total = 70000LL * grain;
+    ray_pool_dispatch(&pool, pool_count_fn, &ctx, total);
+
+    /* Ring should grow to MAX_RING_CAP and stop there */
+    TEST_ASSERT_EQ_U(pool.task_cap, 65536u);
+    /* Calls clamped to MAX_RING_CAP */
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 65536);
+    /* All elements covered (grain rebalanced) */
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), total);
+
+    ray_pool_free(&pool);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: ray_pool_destroy on uninitialized state is a no-op.
+ *
+ * Already partly covered by test_pool_destroy_and_reinit (calling destroy
+ * twice in a row), but this isolates the "state == 0" branch on entry to
+ * destroy by destroying first to drop to 0, then calling destroy again
+ * without any intervening init/get.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_destroy_when_uninit(void) {
+    /* Make sure we are at state==0 by destroying any existing pool first.
+     * If the pool is currently at state==2, this drops it to 0; if it's
+     * already 0 (no prior get/init), the CAS fails inside and it's a no-op. */
+    ray_pool_destroy();
+    /* Now in state==0: this destroy must hit the CAS-fail branch and return
+     * without touching the pool. */
+    ray_pool_destroy();
+
+    /* Re-init for subsequent tests. */
+    ray_err_t err = ray_pool_init(0);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: ray_pool_dispatch_n with ring growth to a power-of-2 < MAX_RING_CAP.
+ *
+ * Existing test_dispatch_n_ring_grow uses 2000 → grows to 2048.  This test
+ * pushes higher (5000 → grows to 8192) so the growth-loop runs multiple
+ * iterations (1024 → 2048 → 4096 → 8192), strengthening coverage of the
+ * `while (new_cap < n_tasks && new_cap < MAX_RING_CAP)` loop body.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_dispatch_n_multi_grow(void) {
+    ray_heap_init();
+
+    ray_pool_t pool;
+    TEST_ASSERT_EQ_I(ray_pool_create(&pool, 2), RAY_OK);
+    TEST_ASSERT_EQ_U(pool.task_cap, 1024u);
+
+    pool_count_ctx_t ctx = {0};
+    uint32_t n = 5000;
+    ray_pool_dispatch_n(&pool, pool_count_fn, &ctx, n);
+
+    /* 1024 → 2048 → 4096 → 8192 (next power of 2 ≥ 5000) */
+    TEST_ASSERT_EQ_U(pool.task_cap, 8192u);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), n);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.elem_sum), n);
+
+    ray_pool_free(&pool);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: dispatch with n_tasks exactly equal to task_cap (no growth).
+ *
+ * Boundary case for the `n_tasks > pool->task_cap` check — when equal,
+ * growth is skipped and the existing ring is used as-is.  Picks 1024
+ * tasks (= initial cap) using dispatch_n so we don't multiply by grain.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_dispatch_n_exact_cap(void) {
+    ray_heap_init();
+
+    ray_pool_t pool;
+    TEST_ASSERT_EQ_I(ray_pool_create(&pool, 2), RAY_OK);
+    TEST_ASSERT_EQ_U(pool.task_cap, 1024u);
+
+    pool_count_ctx_t ctx = {0};
+    ray_pool_dispatch_n(&pool, pool_count_fn, &ctx, 1024);
+
+    /* No growth — task_cap unchanged */
+    TEST_ASSERT_EQ_U(pool.task_cap, 1024u);
+    TEST_ASSERT_EQ_I(atomic_load(&ctx.calls), 1024);
+
+    ray_pool_free(&pool);
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Suite definition
  * -------------------------------------------------------------------------- */
 
@@ -792,6 +940,11 @@ const test_entry_t pool_entries[] = {
     { "pool/destroy_reinit",        test_pool_destroy_and_reinit, NULL, NULL },
     { "pool/ray_cancel_global",     test_ray_cancel_global,     NULL, NULL },
     { "pool/workers_participate",   test_dispatch_workers_participate, NULL, NULL },
+    { "pool/dispatch_n_max_ring",   test_dispatch_n_max_ring_cap_clamp, NULL, NULL },
+    { "pool/dispatch_max_ring",     test_dispatch_max_ring_cap_clamp, NULL, NULL },
+    { "pool/destroy_when_uninit",   test_destroy_when_uninit,   NULL, NULL },
+    { "pool/dispatch_n_multi_grow", test_dispatch_n_multi_grow, NULL, NULL },
+    { "pool/dispatch_n_exact_cap",  test_dispatch_n_exact_cap,  NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

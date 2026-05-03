@@ -2748,6 +2748,286 @@ static test_result_t test_mst(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: ray_rel_neighbors public API (fwd + rev + edge cases)
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_rel_neighbors_api(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* edges = make_edge_table();
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, true);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Forward (direction = 0): node 0 -> {1, 2} (sorted) */
+    int64_t cnt = -1;
+    const int64_t* nbrs = ray_rel_neighbors(rel, 0, 0, &cnt);
+    TEST_ASSERT_NOT_NULL(nbrs);
+    TEST_ASSERT_EQ_I(cnt, 2);
+    TEST_ASSERT_EQ_I(nbrs[0], 1);
+    TEST_ASSERT_EQ_I(nbrs[1], 2);
+
+    /* Forward node 3 -> {0} */
+    cnt = -1;
+    nbrs = ray_rel_neighbors(rel, 3, 0, &cnt);
+    TEST_ASSERT_NOT_NULL(nbrs);
+    TEST_ASSERT_EQ_I(cnt, 1);
+    TEST_ASSERT_EQ_I(nbrs[0], 0);
+
+    /* Reverse (direction = 1): node 3 has incoming from {1, 2} */
+    cnt = -1;
+    nbrs = ray_rel_neighbors(rel, 3, 1, &cnt);
+    TEST_ASSERT_NOT_NULL(nbrs);
+    TEST_ASSERT_EQ_I(cnt, 2);
+    TEST_ASSERT_EQ_I(nbrs[0], 1);
+    TEST_ASSERT_EQ_I(nbrs[1], 2);
+
+    /* Out-of-range node — should return NULL with cnt = 0 */
+    cnt = -1;
+    nbrs = ray_rel_neighbors(rel, 99, 0, &cnt);
+    TEST_ASSERT_EQ_PTR((void*)nbrs, NULL);
+    TEST_ASSERT_EQ_I(cnt, 0);
+
+    /* Negative node — should return NULL with cnt = 0 */
+    cnt = -1;
+    nbrs = ray_rel_neighbors(rel, -1, 0, &cnt);
+    TEST_ASSERT_EQ_PTR((void*)nbrs, NULL);
+    TEST_ASSERT_EQ_I(cnt, 0);
+
+    /* NULL rel — should return NULL with cnt = 0 (covers !rel branch) */
+    cnt = -1;
+    nbrs = ray_rel_neighbors(NULL, 0, 0, &cnt);
+    TEST_ASSERT_EQ_PTR((void*)nbrs, NULL);
+    TEST_ASSERT_EQ_I(cnt, 0);
+
+    /* NULL rel without out_count must not crash (covers if-out_count branch) */
+    nbrs = ray_rel_neighbors(NULL, 0, 0, NULL);
+    TEST_ASSERT_EQ_PTR((void*)nbrs, NULL);
+
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: ray_rel_n_nodes public API (fwd, rev, NULL)
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_rel_n_nodes_api(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Asymmetric: 4 src nodes, 5 dst nodes */
+    int64_t src_data[] = {0, 1, 2, 3};
+    int64_t dst_data[] = {4, 0, 1, 2};
+    ray_t* sv = ray_vec_from_raw(RAY_I64, src_data, 4);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, dst_data, 4);
+    int64_t ss = ray_sym_intern("src", 3);
+    int64_t ds = ray_sym_intern("dst", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ss, sv);
+    tbl = ray_table_add_col(tbl, ds, dv);
+    ray_release(sv); ray_release(dv);
+
+    ray_rel_t* rel = ray_rel_from_edges(tbl, "src", "dst", 4, 5, false);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* direction = 0: forward CSR carries n_src_nodes = 4 */
+    TEST_ASSERT_EQ_I(ray_rel_n_nodes(rel, 0), 4);
+    /* direction = 1: reverse CSR carries n_dst_nodes = 5 */
+    TEST_ASSERT_EQ_I(ray_rel_n_nodes(rel, 1), 5);
+    /* Non-zero direction values other than 1 fall through to fwd (only ==1 picks rev) */
+    TEST_ASSERT_EQ_I(ray_rel_n_nodes(rel, 2), 4);
+
+    /* NULL rel — returns 0 */
+    TEST_ASSERT_EQ_I(ray_rel_n_nodes(NULL, 0), 0);
+    TEST_ASSERT_EQ_I(ray_rel_n_nodes(NULL, 1), 0);
+
+    ray_rel_free(rel);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: ray_rel_set_props attaches & releases properly
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_rel_set_props_api(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* edges = make_edge_table();
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, false);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* Build a small props table */
+    int64_t w[] = {10, 20, 30, 40, 50, 60};
+    ray_t* w_vec = ray_vec_from_raw(RAY_I64, w, 6);
+    int64_t w_sym = ray_sym_intern("w", 1);
+    ray_t* props = ray_table_new(1);
+    props = ray_table_add_col(props, w_sym, w_vec);
+    ray_release(w_vec);
+
+    /* Initially both csr.props are NULL */
+    TEST_ASSERT_EQ_PTR((void*)rel->fwd.props, NULL);
+    TEST_ASSERT_EQ_PTR((void*)rel->rev.props, NULL);
+
+    ray_rel_set_props(rel, props);
+    TEST_ASSERT_EQ_PTR((void*)rel->fwd.props, (void*)props);
+    TEST_ASSERT_EQ_PTR((void*)rel->rev.props, (void*)props);
+
+    /* Calling again should release the old (same) pointer and re-retain */
+    ray_rel_set_props(rel, props);
+    TEST_ASSERT_EQ_PTR((void*)rel->fwd.props, (void*)props);
+
+    /* NULL guards: must be no-op */
+    ray_rel_set_props(NULL, props);
+    ray_rel_set_props(rel, NULL);
+
+    ray_release(props);
+    ray_rel_free(rel);  /* releases retained props twice */
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: ray_rel_save / load error paths
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_rel_save_load_errors(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* edges = make_edge_table();
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, false);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    /* NULL rel → RAY_ERR_IO */
+    TEST_ASSERT_EQ_I(ray_rel_save(NULL, "/tmp/test_csr_err"), RAY_ERR_IO);
+    /* NULL dir → RAY_ERR_IO */
+    TEST_ASSERT_EQ_I(ray_rel_save(rel, NULL), RAY_ERR_IO);
+
+    /* mkdir on a path under a non-existent parent — fails (not EEXIST) */
+    TEST_ASSERT_EQ_I(ray_rel_save(rel, "/no/such/parent/dir"), RAY_ERR_IO);
+
+    /* ray_rel_load on NULL or non-existent dir → NULL */
+    TEST_ASSERT_EQ_PTR(ray_rel_load(NULL), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_load("/tmp/this_csr_dir_must_not_exist_xyz"), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_mmap(NULL), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_mmap("/tmp/this_csr_dir_must_not_exist_xyz"), NULL);
+
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: save then mmap (mmap path of csr_load_impl) + idempotent save (EEXIST branch)
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_rel_save_mmap_reuse(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* edges = make_edge_table();
+    ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst", 4, 4, true);
+    TEST_ASSERT_NOT_NULL(rel);
+
+    const char* dir = "/tmp/test_csr_mmap_reuse";
+    /* First save creates dir */
+    TEST_ASSERT_EQ_I(ray_rel_save(rel, dir), RAY_OK);
+    /* Second save into existing dir hits the EEXIST branch (mkdir returns -1, errno=EEXIST) */
+    TEST_ASSERT_EQ_I(ray_rel_save(rel, dir), RAY_OK);
+
+    /* mmap path */
+    ray_rel_t* mm = ray_rel_mmap(dir);
+    TEST_ASSERT_NOT_NULL(mm);
+    TEST_ASSERT_EQ_I(mm->fwd.n_nodes, rel->fwd.n_nodes);
+    TEST_ASSERT_EQ_I(mm->fwd.n_edges, rel->fwd.n_edges);
+
+    /* Sanity: neighbors via public API match */
+    int64_t cnt_o, cnt_m;
+    const int64_t* o = ray_rel_neighbors(rel, 1, 0, &cnt_o);
+    const int64_t* m = ray_rel_neighbors(mm, 1, 0, &cnt_m);
+    TEST_ASSERT_EQ_I(cnt_o, cnt_m);
+    for (int64_t i = 0; i < cnt_o; i++) TEST_ASSERT_EQ_I(o[i], m[i]);
+
+    ray_rel_free(mm);
+    ray_rel_free(rel);
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: ray_rel_free(NULL) is a safe no-op (covers null guard)
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_rel_free_null(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    ray_rel_free(NULL);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: ray_rel_from_edges argument validation paths
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_rel_from_edges_errors(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* edges = make_edge_table();
+
+    /* NULL edge table */
+    TEST_ASSERT_EQ_PTR(ray_rel_from_edges(NULL, "src", "dst", 4, 4, false), NULL);
+
+    /* Non-table input (vector) — type != RAY_TABLE branch */
+    int64_t junk[] = {0, 1, 2};
+    ray_t* v = ray_vec_from_raw(RAY_I64, junk, 3);
+    TEST_ASSERT_EQ_PTR(ray_rel_from_edges(v, "src", "dst", 4, 4, false), NULL);
+    ray_release(v);
+
+    /* Missing column name → ray_table_get_col returns NULL */
+    TEST_ASSERT_EQ_PTR(ray_rel_from_edges(edges, "no_such_col", "dst", 4, 4, false), NULL);
+    TEST_ASSERT_EQ_PTR(ray_rel_from_edges(edges, "src", "no_such_col", 4, 4, false), NULL);
+
+    /* Negative n_dst_nodes */
+    TEST_ASSERT_EQ_PTR(ray_rel_from_edges(edges, "src", "dst", 4, -1, false), NULL);
+
+    /* Mismatched column lengths: build new table where src and dst differ in length */
+    int64_t s2[] = {0, 1};
+    int64_t d2[] = {0};
+    ray_t* sv = ray_vec_from_raw(RAY_I64, s2, 2);
+    ray_t* dv = ray_vec_from_raw(RAY_I64, d2, 1);
+    int64_t ss = ray_sym_intern("src", 3);
+    int64_t ds = ray_sym_intern("dst", 3);
+    ray_t* bad = ray_table_new(2);
+    bad = ray_table_add_col(bad, ss, sv);
+    bad = ray_table_add_col(bad, ds, dv);
+    ray_release(sv); ray_release(dv);
+    TEST_ASSERT_EQ_PTR(ray_rel_from_edges(bad, "src", "dst", 4, 4, false), NULL);
+    ray_release(bad);
+
+    ray_release(edges);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Suite definition
  * -------------------------------------------------------------------------- */
 
@@ -2808,6 +3088,13 @@ const test_entry_t csr_entries[] = {
     { "csr/closeness", test_closeness, NULL, NULL },
     { "csr/closeness_s", test_closeness_sampled, NULL, NULL },
     { "csr/mst", test_mst, NULL, NULL },
+    { "csr/rel_neighbors_api", test_rel_neighbors_api, NULL, NULL },
+    { "csr/rel_n_nodes_api", test_rel_n_nodes_api, NULL, NULL },
+    { "csr/rel_set_props_api", test_rel_set_props_api, NULL, NULL },
+    { "csr/rel_save_load_errors", test_rel_save_load_errors, NULL, NULL },
+    { "csr/rel_save_mmap_reuse", test_rel_save_mmap_reuse, NULL, NULL },
+    { "csr/rel_free_null", test_rel_free_null, NULL, NULL },
+    { "csr/rel_from_edges_errors", test_rel_from_edges_errors, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
