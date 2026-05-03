@@ -64,7 +64,11 @@
 #  include <sys/wait.h>
 #  include <signal.h>
 #  include <errno.h>
-#  include <pty.h>
+#  if defined(__APPLE__)
+#    include <util.h>
+#  else
+#    include <pty.h>
+#  endif
 #  include "core/poll.h"
 #endif
 
