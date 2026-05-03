@@ -28,6 +28,7 @@
 #include "mem/arena.h"
 #include "table/sym.h"
 #include "store/col.h"
+#include "lang/internal.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -845,6 +846,140 @@ static test_result_t test_sym_load_missing(void) {
     PASS();
 }
 
+/* ---- ray_sym_name_fn (src/ops/strop.c) -------------------------------- */
+
+/* Atom RAY_I64 (sym ID) → RAY_SYM atom: line 254-258 of strop.c. */
+static test_result_t test_sym_name_fn_atom_i64(void) {
+    int64_t id = (int64_t)ray_sym_intern("hello", 5);
+    ray_t* in  = ray_i64(id);
+    ray_t* out = ray_sym_name_fn(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->type, -RAY_SYM);
+    TEST_ASSERT_EQ_I(out->i64, id);
+    ray_release(out);
+    ray_release(in);
+    PASS();
+}
+
+/* Atom RAY_I64 with negative ID → domain error (line 255). */
+static test_result_t test_sym_name_fn_atom_negative_id(void) {
+    ray_t* in  = ray_i64(-1);
+    ray_t* out = ray_sym_name_fn(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(out));
+    ray_release(out);
+    ray_release(in);
+    PASS();
+}
+
+/* Atom RAY_I64 with out-of-range ID → domain error (line 255). */
+static test_result_t test_sym_name_fn_atom_unknown_id(void) {
+    /* sym IDs start at 0 — pick a large id that hasn't been interned. */
+    ray_t* in  = ray_i64(99999);
+    ray_t* out = ray_sym_name_fn(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(out));
+    ray_release(out);
+    ray_release(in);
+    PASS();
+}
+
+/* Vector RAY_I64 of valid IDs → RAY_SYM vector (lines 259-273). */
+static test_result_t test_sym_name_fn_vec_i64(void) {
+    int64_t a = (int64_t)ray_sym_intern("foo", 3);
+    int64_t b = (int64_t)ray_sym_intern("bar", 3);
+    int64_t c = (int64_t)ray_sym_intern("baz", 3);
+    int64_t ids[3] = { a, b, c };
+    ray_t* in  = ray_vec_from_raw(RAY_I64, ids, 3);
+    ray_t* out = ray_sym_name_fn(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(out->len, 3);
+    ray_release(out);
+    ray_release(in);
+    PASS();
+}
+
+/* Vector RAY_I64 with one invalid ID → domain error (lines 263-265). */
+static test_result_t test_sym_name_fn_vec_invalid_id(void) {
+    int64_t a = (int64_t)ray_sym_intern("ok", 2);
+    int64_t ids[2] = { a, -7 };
+    ray_t* in  = ray_vec_from_raw(RAY_I64, ids, 2);
+    ray_t* out = ray_sym_name_fn(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(out));
+    ray_release(out);
+    ray_release(in);
+    PASS();
+}
+
+/* Already a -RAY_SYM atom → passthrough with retain (line 276-278). */
+static test_result_t test_sym_name_fn_passthrough_atom(void) {
+    int64_t id = (int64_t)ray_sym_intern("alpha", 5);
+    ray_t* in  = ray_sym(id);
+    TEST_ASSERT_EQ_I(in->type, -RAY_SYM);
+    ray_t* out = ray_sym_name_fn(in);
+    TEST_ASSERT_EQ_PTR(out, in);
+    ray_release(out);
+    ray_release(in);
+    PASS();
+}
+
+/* RAY_SYM vector → passthrough (line 276-278). */
+static test_result_t test_sym_name_fn_passthrough_vec(void) {
+    int64_t a = (int64_t)ray_sym_intern("p", 1);
+    int64_t b = (int64_t)ray_sym_intern("q", 2);
+    int64_t ids[2] = { a, b };
+    ray_t* in = ray_vec_from_raw(RAY_SYM, ids, 2);
+    ray_t* out = ray_sym_name_fn(in);
+    TEST_ASSERT_EQ_PTR(out, in);
+    ray_release(out);
+    ray_release(in);
+    PASS();
+}
+
+/* Empty RAY_I64 vector → fresh empty RAY_SYM vector (the second-`if` body
+ * runs the validation loop zero times then ray_vec_new(RAY_SYM, 0)).
+ * Note: the `x->len == 0` arm in the third `if` is dead code for
+ * RAY_I64 because the RAY_I64 branch above already matched. */
+static test_result_t test_sym_name_fn_empty_i64_vec(void) {
+    ray_t* in  = ray_vec_new(RAY_I64, 0);
+    ray_t* out = ray_sym_name_fn(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(out->len, 0);
+    ray_release(out);
+    ray_release(in);
+    PASS();
+}
+
+/* Empty RAY_SYM vector → passthrough (the third `if` matches RAY_SYM). */
+static test_result_t test_sym_name_fn_empty_sym_vec(void) {
+    ray_t* in  = ray_vec_new(RAY_SYM, 0);
+    ray_t* out = ray_sym_name_fn(in);
+    TEST_ASSERT_EQ_PTR(out, in);
+    ray_release(out);
+    ray_release(in);
+    PASS();
+}
+
+/* Wrong-type atom → type error (line 280). */
+static test_result_t test_sym_name_fn_wrong_type(void) {
+    /* Build an F64 atom — neither I64 nor SYM. */
+    double v = 3.14;
+    ray_t* in = ray_vec_from_raw(RAY_F64, &v, 1);
+    in->type = -RAY_F64;
+    ray_t* out = ray_sym_name_fn(in);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(out));
+    ray_release(out);
+    ray_release(in);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t sym_entries[] = {
@@ -875,6 +1010,19 @@ const test_entry_t sym_entries[] = {
     { "sym/intern_atomic_no_orphans", test_sym_intern_atomic_no_orphans, sym_setup, sym_teardown },
     { "sym/intern_long_segments", test_sym_intern_long_segments, sym_setup, sym_teardown },
     { "sym/bytes_upper_covers_arena", test_sym_bytes_upper_covers_arena, sym_setup, sym_teardown },
+
+    /* ray_sym_name_fn (src/ops/strop.c) */
+    { "sym/name_fn/atom_i64",           test_sym_name_fn_atom_i64,         sym_setup, sym_teardown },
+    { "sym/name_fn/atom_negative_id",   test_sym_name_fn_atom_negative_id, sym_setup, sym_teardown },
+    { "sym/name_fn/atom_unknown_id",    test_sym_name_fn_atom_unknown_id,  sym_setup, sym_teardown },
+    { "sym/name_fn/vec_i64",            test_sym_name_fn_vec_i64,          sym_setup, sym_teardown },
+    { "sym/name_fn/vec_invalid_id",     test_sym_name_fn_vec_invalid_id,   sym_setup, sym_teardown },
+    { "sym/name_fn/passthrough_atom",   test_sym_name_fn_passthrough_atom, sym_setup, sym_teardown },
+    { "sym/name_fn/passthrough_vec",    test_sym_name_fn_passthrough_vec,  sym_setup, sym_teardown },
+    { "sym/name_fn/empty_i64_vec",      test_sym_name_fn_empty_i64_vec,    sym_setup, sym_teardown },
+    { "sym/name_fn/empty_sym_vec",      test_sym_name_fn_empty_sym_vec,    sym_setup, sym_teardown },
+    { "sym/name_fn/wrong_type",         test_sym_name_fn_wrong_type,       sym_setup, sym_teardown },
+
     { NULL, NULL, NULL, NULL },
 };
 

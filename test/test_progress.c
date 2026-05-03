@@ -40,6 +40,7 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "core/profile.h"
 
 #include <string.h>
 #include <time.h>
@@ -522,6 +523,125 @@ static test_result_t test_progress_end_branch_no_show(void) {
     PASS();
 }
 
+/* ---- core/profile.h inline progress helpers ---------------------------- */
+
+/* These cover the three uncovered static-inline functions in
+ * src/core/profile.h: ray_profile_progress_{begin,advance,end}.  The
+ * functions guard on g_ray_profile.active and on g_ray_profile.progress_cb.
+ * Tests below drive both the inactive-no-op path and the active path with
+ * a stub callback, plus the throttle gate inside _advance. */
+
+static int64_t      g_test_prog_done;
+static int64_t      g_test_prog_total;
+static const char*  g_test_prog_label;
+static int          g_test_prog_calls;
+
+static void test_profile_progress_cb(int64_t done, int64_t total, const char* label) {
+    g_test_prog_done   = done;
+    g_test_prog_total  = total;
+    g_test_prog_label  = label;
+    g_test_prog_calls += 1;
+}
+
+static void profile_inline_teardown(void) {
+    g_ray_profile.active        = false;
+    g_ray_profile.progress_cb   = NULL;
+    g_ray_profile.progress_label = NULL;
+    g_ray_profile.progress_total = 0;
+    g_ray_profile.progress_done  = 0;
+    g_ray_profile.progress_last_render = 0;
+}
+
+static test_result_t test_profile_inline_progress_begin(void) {
+    /* Inactive path: no fields touched. */
+    g_ray_profile.active = false;
+    g_ray_profile.progress_label = (const char*)0xdeadbeefULL;
+    g_ray_profile.progress_total = 42;
+    g_ray_profile.progress_done  = 7;
+    ray_profile_progress_begin("ignored", 999);
+    TEST_ASSERT_EQ_PTR(g_ray_profile.progress_label, (const char*)0xdeadbeefULL);
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_total, 42);
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_done,   7);
+
+    /* Active path: fields populated. */
+    ray_profile_reset();
+    g_ray_profile.active = true;
+    ray_profile_progress_begin("loading", 100);
+    TEST_ASSERT_EQ_PTR(g_ray_profile.progress_label, "loading");
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_total, 100);
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_done,   0);
+    PASS();
+}
+
+static test_result_t test_profile_inline_progress_advance(void) {
+    /* Inactive path: progress_done unchanged. */
+    ray_profile_reset();
+    g_ray_profile.active        = false;
+    g_ray_profile.progress_done = 5;
+    ray_profile_progress_advance(10);
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_done, 5);
+
+    /* Active + NULL callback: counter advances, no fire. */
+    ray_profile_reset();
+    g_ray_profile.active      = true;
+    g_ray_profile.progress_cb = NULL;
+    ray_profile_progress_begin("phase", 100);
+    ray_profile_progress_advance(3);
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_done, 3);
+
+    /* Active + callback + total>0: first advance fires (last_render==0). */
+    g_test_prog_done = g_test_prog_total = 0;
+    g_test_prog_label = NULL;
+    g_test_prog_calls = 0;
+    ray_profile_reset();
+    g_ray_profile.active      = true;
+    g_ray_profile.progress_cb = test_profile_progress_cb;
+    ray_profile_progress_begin("work", 50);
+    ray_profile_progress_advance(7);
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_done, 7);
+    TEST_ASSERT_EQ_I(g_test_prog_calls, 1);
+    TEST_ASSERT_EQ_I(g_test_prog_done,  7);
+    TEST_ASSERT_EQ_I(g_test_prog_total, 50);
+    TEST_ASSERT_STR_EQ(g_test_prog_label, "work");
+
+    /* Throttled: second advance within 100ms must not fire. */
+    ray_profile_progress_advance(2);
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_done, 9);
+    TEST_ASSERT_EQ_I(g_test_prog_calls, 1);
+
+    /* total<=0 path: callback set, but no total → no fire. */
+    ray_profile_reset();
+    g_ray_profile.active        = true;
+    g_ray_profile.progress_cb   = test_profile_progress_cb;
+    g_ray_profile.progress_total = 0;
+    g_test_prog_calls = 0;
+    ray_profile_progress_advance(1);
+    TEST_ASSERT_EQ_I(g_test_prog_calls, 0);
+    PASS();
+}
+
+static test_result_t test_profile_inline_progress_end(void) {
+    /* Inactive: fields preserved. */
+    g_ray_profile.active        = false;
+    g_ray_profile.progress_label = "still-here";
+    g_ray_profile.progress_total = 11;
+    g_ray_profile.progress_done  = 4;
+    ray_profile_progress_end();
+    TEST_ASSERT_STR_EQ(g_ray_profile.progress_label, "still-here");
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_total, 11);
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_done,   4);
+
+    /* Active: fields cleared. */
+    ray_profile_reset();
+    g_ray_profile.active = true;
+    ray_profile_progress_begin("done-soon", 200);
+    ray_profile_progress_end();
+    TEST_ASSERT_NULL(g_ray_profile.progress_label);
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_total, 0);
+    TEST_ASSERT_EQ_I(g_ray_profile.progress_done,  0);
+    PASS();
+}
+
 /* ---- Suite definition --------------------------------------------------- */
 
 const test_entry_t progress_entries[] = {
@@ -555,5 +675,14 @@ const test_entry_t progress_entries[] = {
       progress_setup, progress_teardown },
     { "progress/end_branch_no_show",       test_progress_end_branch_no_show,
       progress_setup, progress_teardown },
+
+    /* core/profile.h inline progress helpers */
+    { "profile/inline/progress_begin",     test_profile_inline_progress_begin,
+      NULL, profile_inline_teardown },
+    { "profile/inline/progress_advance",   test_profile_inline_progress_advance,
+      NULL, profile_inline_teardown },
+    { "profile/inline/progress_end",       test_profile_inline_progress_end,
+      NULL, profile_inline_teardown },
+
     { NULL, NULL, NULL, NULL },
 };

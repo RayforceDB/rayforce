@@ -711,6 +711,193 @@ static test_result_t test_partitioned_gather_fallback(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: exec_filter on a small parted I64 table — drives exec_filter_seq
+ * → exec_filter_parted_vec (the non-STR branch at filter.c:131-167).
+ * Small (12 rows total, 3 segments) so the parallel-gather path is
+ * skipped via the RAY_PARALLEL_THRESHOLD fallback in exec_filter.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_filter_parted_i64(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 3 segments of 4 i64 rows each — 12 total. */
+    ray_t* segs_v[3];
+    int64_t s0[] = {1, 2, 3, 4};
+    int64_t s1[] = {5, 6, 7, 8};
+    int64_t s2[] = {9, 10, 11, 12};
+    segs_v[0] = ray_vec_new(RAY_I64, 4); segs_v[0]->len = 4;
+    memcpy(ray_data(segs_v[0]), s0, sizeof(s0));
+    segs_v[1] = ray_vec_new(RAY_I64, 4); segs_v[1]->len = 4;
+    memcpy(ray_data(segs_v[1]), s1, sizeof(s1));
+    segs_v[2] = ray_vec_new(RAY_I64, 4); segs_v[2]->len = 4;
+    memcpy(ray_data(segs_v[2]), s2, sizeof(s2));
+    ray_t* val = make_parted(RAY_I64, segs_v, 3);
+
+    int64_t sym_val = ray_sym_intern("val", 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, sym_val, val);
+
+    /* Predicate: pass even values — 6 rows match (2,4,6,8,10,12). */
+    ray_t* pred = ray_vec_new(RAY_BOOL, 12); pred->len = 12;
+    uint8_t* pd = (uint8_t*)ray_data(pred);
+    int64_t expected[] = {2, 4, 6, 8, 10, 12};
+    int e = 0;
+    for (int seg = 0; seg < 3; seg++) {
+        int64_t* sd = (int64_t*)ray_data(segs_v[seg]);
+        for (int i = 0; i < 4; i++)
+            pd[seg * 4 + i] = (sd[i] % 2 == 0) ? 1 : 0;
+    }
+
+    ray_t* result = exec_filter(NULL, NULL, tbl, pred);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+
+    ray_t* out_col = ray_table_get_col_idx(result, 0);
+    TEST_ASSERT_NOT_NULL(out_col);
+    TEST_ASSERT_EQ_I(out_col->len, 6);
+    int64_t* od = (int64_t*)ray_data(out_col);
+    for (int i = 0; i < 6; i++) {
+        TEST_ASSERT_FMT(od[i] == expected[i],
+                        "i=%d got=%lld expected=%lld",
+                        i, (long long)od[i], (long long)expected[i]);
+    }
+    (void)e;
+
+    ray_release(result);
+    ray_release(tbl);
+    ray_release(pred);
+    ray_release(val);
+    for (int i = 0; i < 3; i++) ray_release(segs_v[i]);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: exec_filter on a small parted RAY_STR table — drives the STR
+ * branch in exec_filter_parted_vec (filter.c:111-129) via exec_filter_seq.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_filter_parted_str(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 2 segments of 3 strings each — 6 total. */
+    const char* w0[] = {"alpha", "beta", "gamma"};
+    const char* w1[] = {"delta", "epsilon", "zeta"};
+
+    ray_t* segs_v[2];
+    segs_v[0] = ray_vec_new(RAY_STR, 0);
+    for (int i = 0; i < 3; i++)
+        segs_v[0] = ray_str_vec_append(segs_v[0], w0[i], strlen(w0[i]));
+    segs_v[1] = ray_vec_new(RAY_STR, 0);
+    for (int i = 0; i < 3; i++)
+        segs_v[1] = ray_str_vec_append(segs_v[1], w1[i], strlen(w1[i]));
+
+    ray_t* val = make_parted(RAY_STR, segs_v, 2);
+
+    int64_t sym_val = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, sym_val, val);
+
+    /* Predicate: pick rows 1, 2, 4 — "beta", "gamma", "epsilon". */
+    ray_t* pred = ray_vec_new(RAY_BOOL, 6); pred->len = 6;
+    uint8_t* pd = (uint8_t*)ray_data(pred);
+    pd[0]=0; pd[1]=1; pd[2]=1; pd[3]=0; pd[4]=1; pd[5]=0;
+
+    ray_t* result = exec_filter(NULL, NULL, tbl, pred);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+
+    ray_t* out_col = ray_table_get_col_idx(result, 0);
+    TEST_ASSERT_NOT_NULL(out_col);
+    TEST_ASSERT_EQ_I(out_col->len, 3);
+
+    ray_release(result);
+    ray_release(tbl);
+    ray_release(pred);
+    ray_release(val);
+    for (int i = 0; i < 2; i++) ray_release(segs_v[i]);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: OP_HEAD / OP_TAIL on a parted RAY_STR table — drives the
+ * parted-STR helpers in src/ops/internal.h: parted_head_str,
+ * parted_tail_str, parted_str_single_pool, col_propagate_str_pool_parted.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_op_head_tail_on_parted_str(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* 3 segments of 3 strings each = 9 rows total. */
+    ray_t* s0 = ray_vec_new(RAY_STR, 0);
+    s0 = ray_str_vec_append(s0, "alpha", 5);
+    s0 = ray_str_vec_append(s0, "beta",  4);
+    s0 = ray_str_vec_append(s0, "gamma", 5);
+    ray_t* s1 = ray_vec_new(RAY_STR, 0);
+    s1 = ray_str_vec_append(s1, "delta",   5);
+    s1 = ray_str_vec_append(s1, "epsilon", 7);
+    s1 = ray_str_vec_append(s1, "zeta",    4);
+    ray_t* s2 = ray_vec_new(RAY_STR, 0);
+    s2 = ray_str_vec_append(s2, "eta",   3);
+    s2 = ray_str_vec_append(s2, "theta", 5);
+    s2 = ray_str_vec_append(s2, "iota",  4);
+
+    ray_t* segs[3] = { s0, s1, s2 };
+    ray_t* val = make_parted(RAY_STR, segs, 3);
+    TEST_ASSERT_NOT_NULL(val);
+
+    /* MAPCOMMON keyed by I64 — counts match parted segment lengths. */
+    int64_t keys[]   = {20240101, 20240102, 20240103};
+    int64_t counts[] = {3, 3, 3};
+    ray_t* kv = ray_vec_new(RAY_I64, 3); kv->len = 3;
+    memcpy(ray_data(kv), keys, sizeof(keys));
+    ray_t* rc = ray_vec_new(RAY_I64, 3); rc->len = 3;
+    memcpy(ray_data(rc), counts, sizeof(counts));
+    ray_t* mc = make_mapcommon(kv, rc);
+
+    int64_t sym_dt  = ray_sym_intern("dt", 2);
+    int64_t sym_val = ray_sym_intern("val", 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, sym_dt, mc);
+    tbl = ray_table_add_col(tbl, sym_val, val);
+
+    /* head 5 — first 5 strings: alpha, beta, gamma, delta, epsilon. */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tnode = ray_const_table(g, tbl);
+    ray_op_t* h = ray_head(g, tnode, 5);
+    ray_t* result = ray_execute(g, h);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 5);
+    ray_release(result);
+    ray_graph_free(g);
+
+    /* tail 4 — last 4 strings: zeta, eta, theta, iota. */
+    g = ray_graph_new(tbl);
+    tnode = ray_const_table(g, tbl);
+    ray_op_t* t = ray_tail(g, tnode, 4);
+    result = ray_execute(g, t);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 4);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_release(mc); ray_release(kv); ray_release(rc);
+    ray_release(val);
+    ray_release(s0); ray_release(s1); ray_release(s2);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Suite definition
  * -------------------------------------------------------------------------- */
 
@@ -725,5 +912,8 @@ const test_entry_t partition_exec_entries[] = {
     { "part_exec/pg_e2",            test_partitioned_gather_e2,        NULL, NULL },
     { "part_exec/pg_e1",            test_partitioned_gather_e1,        NULL, NULL },
     { "part_exec/pg_fallback",      test_partitioned_gather_fallback,  NULL, NULL },
+    { "part_exec/filter_parted_i64", test_filter_parted_i64,            NULL, NULL },
+    { "part_exec/filter_parted_str", test_filter_parted_str,            NULL, NULL },
+    { "part_exec/head_tail_parted_str", test_op_head_tail_on_parted_str, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

@@ -238,6 +238,134 @@ static test_result_t test_morsel_bool(void) {
     PASS();
 }
 
+/* ---- ray_morsel_init_range -------------------------------------------- */
+
+/* Field setup: range [start, end) over a 100-elem I64 vector.  m->len in
+ * the morsel struct holds the END index (not length) — ray_morsel_next
+ * compares offset >= len directly. */
+static test_result_t test_morsel_init_range_basic(void) {
+    int64_t raw[100];
+    for (int i = 0; i < 100; i++) raw[i] = (int64_t)i;
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 100);
+    TEST_ASSERT_NOT_NULL(v);
+
+    ray_morsel_t m;
+    ray_morsel_init_range(&m, v, 20, 80);
+
+    TEST_ASSERT_EQ_PTR(m.vec, v);
+    TEST_ASSERT_EQ_I(m.offset, 20);
+    TEST_ASSERT_EQ_I(m.len, 80);
+    TEST_ASSERT_EQ_U(m.elem_size, 8);
+    TEST_ASSERT_EQ_I(m.morsel_len, 0);
+    TEST_ASSERT_NULL(m.morsel_ptr);
+    TEST_ASSERT_NULL(m.null_bits);
+
+    ray_release(v);
+    PASS();
+}
+
+/* Iterate a sub-range — should yield exactly the elements in [20, 80). */
+static test_result_t test_morsel_init_range_iterate(void) {
+    int64_t raw[100];
+    for (int i = 0; i < 100; i++) raw[i] = (int64_t)(i * 7);
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 100);
+
+    ray_morsel_t m;
+    ray_morsel_init_range(&m, v, 20, 80);
+
+    int64_t total = 0;
+    while (ray_morsel_next(&m)) {
+        int64_t* data = (int64_t*)m.morsel_ptr;
+        for (int64_t i = 0; i < m.morsel_len; i++) {
+            int64_t global = m.offset + i;
+            TEST_ASSERT_EQ_I(data[i], global * 7);
+            total++;
+        }
+    }
+    TEST_ASSERT_EQ_I(total, 60);
+
+    ray_release(v);
+    PASS();
+}
+
+/* Empty range (start == end) — ray_morsel_next must return false on the
+ * first call without dereferencing morsel_ptr. */
+static test_result_t test_morsel_init_range_empty(void) {
+    int64_t raw[10];
+    for (int i = 0; i < 10; i++) raw[i] = (int64_t)i;
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 10);
+
+    ray_morsel_t m;
+    ray_morsel_init_range(&m, v, 5, 5);
+    TEST_ASSERT_FALSE(ray_morsel_next(&m));
+
+    ray_release(v);
+    PASS();
+}
+
+/* Multi-morsel range: [500, 2700) over a 3000-element vec — produces
+ * 1024 + 1024 + 152 morsels.  Validates offset accounting across morsel
+ * boundaries within a sub-range. */
+static test_result_t test_morsel_init_range_multi(void) {
+    ray_t* v = ray_vec_new(RAY_I64, 3000);
+    int64_t* raw = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < 3000; i++) raw[i] = i;
+
+    ray_morsel_t m;
+    ray_morsel_init_range(&m, v, 500, 2700);
+
+    TEST_ASSERT_TRUE(ray_morsel_next(&m));
+    TEST_ASSERT_EQ_I(m.offset, 500);
+    TEST_ASSERT_EQ_I(m.morsel_len, 1024);
+    TEST_ASSERT_TRUE(ray_morsel_next(&m));
+    TEST_ASSERT_EQ_I(m.offset, 1524);
+    TEST_ASSERT_EQ_I(m.morsel_len, 1024);
+    TEST_ASSERT_TRUE(ray_morsel_next(&m));
+    TEST_ASSERT_EQ_I(m.offset, 2548);
+    TEST_ASSERT_EQ_I(m.morsel_len, 152);
+    TEST_ASSERT_FALSE(ray_morsel_next(&m));
+
+    ray_release(v);
+    PASS();
+}
+
+/* Inline-nullmap path in ray_morsel_next: vec with HAS_NULLS, offset<128,
+ * no NULLMAP_EXT.  Drives line 96-100 (the inline-bitmap branch). */
+static test_result_t test_morsel_nulls_inline(void) {
+    int64_t raw[32];
+    for (int i = 0; i < 32; i++) raw[i] = (int64_t)i;
+    ray_t* v = ray_vec_from_raw(RAY_I64, raw, 32);
+    ray_vec_set_null(v, 5,  true);
+    ray_vec_set_null(v, 17, true);
+
+    ray_morsel_t m;
+    ray_morsel_init(&m, v);
+    TEST_ASSERT_TRUE(ray_morsel_next(&m));
+    TEST_ASSERT_NOT_NULL(m.null_bits);
+
+    ray_release(v);
+    PASS();
+}
+
+/* External-nullmap path: vec with >128 elements + HAS_NULLS forces
+ * RAY_ATTR_NULLMAP_EXT, exercising line 92-95 of morsel.c. */
+static test_result_t test_morsel_nulls_external(void) {
+    ray_t* v = ray_vec_new(RAY_I64, 200);
+    int64_t* raw = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < 200; i++) raw[i] = i;
+    ray_vec_set_null(v, 10,  true);
+    ray_vec_set_null(v, 150, true);
+
+    ray_morsel_t m;
+    ray_morsel_init(&m, v);
+    while (ray_morsel_next(&m)) {
+        TEST_ASSERT_NOT_NULL(m.null_bits);
+    }
+
+    ray_release(v);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t morsel_entries[] = {
@@ -249,6 +377,12 @@ const test_entry_t morsel_entries[] = {
     { "morsel/data_access", test_morsel_data_access, morsel_setup, morsel_teardown },
     { "morsel/f64", test_morsel_f64, morsel_setup, morsel_teardown },
     { "morsel/bool", test_morsel_bool, morsel_setup, morsel_teardown },
+    { "morsel/init_range_basic",   test_morsel_init_range_basic,   morsel_setup, morsel_teardown },
+    { "morsel/init_range_iterate", test_morsel_init_range_iterate, morsel_setup, morsel_teardown },
+    { "morsel/init_range_empty",   test_morsel_init_range_empty,   morsel_setup, morsel_teardown },
+    { "morsel/init_range_multi",   test_morsel_init_range_multi,   morsel_setup, morsel_teardown },
+    { "morsel/nulls_inline",       test_morsel_nulls_inline,       morsel_setup, morsel_teardown },
+    { "morsel/nulls_external",     test_morsel_nulls_external,     morsel_setup, morsel_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

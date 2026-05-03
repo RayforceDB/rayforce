@@ -367,3 +367,20 @@
 (count (select {s: (sum v) from: Ttn by: g asc: g take: -2})) -- 2
 (at (at (select {s: (sum v) from: Ttn by: g asc: g take: -2}) 'g) 0) -- 2
 (at (at (select {s: (sum v) from: Ttn by: g asc: g take: -2}) 'g) 1) -- 3
+
+;; ====================================================================
+;; Non-aggregate per-group eval — query.c:1042-1346 (nonagg_eval_per_group,
+;; nonagg_eval_per_group_core, collect_col_refs, bind_col_slice,
+;; typed_vec_to_list, groups_idx_feed, buf_idx_feed,
+;; nonagg_eval_per_group_buf).
+;;
+;; Trigger: a user-defined lambda that takes a column (vector arg) and
+;; returns a scalar.  Full-table eval produces a non-row-aligned shape,
+;; so the grouped-select falls back to per-group expression eval.
+;; ====================================================================
+(set Tnag (table [g x] (list [1 1 1 2 2 2 3 3] [10 20 30 40 50 60 70 80])))
+(set my_max (fn [v] (last v)))   ;; vector → scalar via `last`
+(count (select {m: (my_max x) from: Tnag by: g})) -- 3
+(at (at (select {m: (my_max x) from: Tnag by: g}) 'm) 0) -- 30
+(at (at (select {m: (my_max x) from: Tnag by: g}) 'm) 1) -- 60
+(at (at (select {m: (my_max x) from: Tnag by: g}) 'm) 2) -- 80

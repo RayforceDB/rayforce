@@ -21,12 +21,18 @@
  *   SOFTWARE.
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include "test.h"
 #include <rayforce.h>
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "table/sym.h"
+#include "lang/internal.h"
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 /* Forward declarations for lang modules */
 #include "lang/env.h"
@@ -3806,6 +3812,171 @@ static test_result_t test_dotted_table_column(void) {
     PASS();
 }
 
+/* ─── ops/builtins.c entry-point coverage ─────────────────────────── */
+
+/* Mute stdout so the print/show output doesn't pollute test runner output. */
+static int builtins_mute_stdout(void) {
+    fflush(stdout);
+    int saved = dup(fileno(stdout));
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) { dup2(devnull, fileno(stdout)); close(devnull); }
+    return saved;
+}
+static void builtins_restore_stdout(int saved) {
+    fflush(stdout);
+    if (saved >= 0) { dup2(saved, fileno(stdout)); close(saved); }
+}
+
+/* (print v1 v2 ...) — variadic stdout writer; returns RAY_NULL_OBJ. */
+static test_result_t test_builtin_print_fn(void) {
+    ray_t* a = ray_i64(7);
+    ray_t* b = ray_str("hello", 5);
+    ray_t* args[2] = { a, b };
+
+    int saved = builtins_mute_stdout();
+    ray_t* r = ray_print_fn(args, 2);
+    builtins_restore_stdout(saved);
+
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+
+    /* Format-string mode (first arg is a -RAY_STR with % placeholders). */
+    ray_t* fmt = ray_str("v=%", 3);
+    ray_t* x   = ray_i64(42);
+    ray_t* fa[2] = { fmt, x };
+    saved = builtins_mute_stdout();
+    r = ray_print_fn(fa, 2);
+    builtins_restore_stdout(saved);
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+
+    ray_release(a);
+    ray_release(b);
+    ray_release(fmt);
+    ray_release(x);
+    PASS();
+}
+
+/* (show v1 v2 ...) — formats via ray_fmt, newline at end. */
+static test_result_t test_builtin_show_fn(void) {
+    ray_t* a = ray_i64(99);
+    ray_t* b = ray_str("k", 1);
+    ray_t* args[2] = { a, b };
+
+    int saved = builtins_mute_stdout();
+    ray_t* r = ray_show_fn(args, 2);
+    builtins_restore_stdout(saved);
+
+    TEST_ASSERT_EQ_PTR(r, RAY_NULL_OBJ);
+
+    ray_release(a);
+    ray_release(b);
+    PASS();
+}
+
+/* (timeit expr) — returns elapsed ms as F64. */
+static test_result_t test_builtin_timeit_fn(void) {
+    /* timeit calls ray_eval(args[0]) — pass a parsed expression. */
+    ray_t* expr = ray_parse("(+ 1 2)");
+    TEST_ASSERT_NOT_NULL(expr);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+
+    ray_t* args[1] = { expr };
+    int saved = builtins_mute_stdout();
+    ray_t* r = ray_timeit_fn(args, 1);
+    builtins_restore_stdout(saved);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_F64);
+
+    /* Domain error path: n < 1. */
+    ray_t* re = ray_timeit_fn(NULL, 0);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(re));
+
+    ray_release(re);
+    ray_release(r);
+    ray_release(expr);
+    PASS();
+}
+
+/* (load path) — read+eval a Rayforce script file. */
+static test_result_t test_builtin_load_file_fn(void) {
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/ray_test_load_%d.rfl", (int)getpid());
+    FILE* fp = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(fp);
+    fputs("(+ 5 7)\n", fp);
+    fclose(fp);
+
+    ray_t* p = ray_str(path, strlen(path));
+    int saved = builtins_mute_stdout();
+    ray_t* r = ray_load_file_fn(p);
+    builtins_restore_stdout(saved);
+
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r->i64, 12);
+
+    /* Wrong-type path. */
+    ray_t* bad = ray_i64(5);
+    ray_t* re  = ray_load_file_fn(bad);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(re));
+
+    /* I/O error path (nonexistent file). */
+    ray_t* nope = ray_str("/tmp/ray_test_load_nope_xyz.rfl", 31);
+    ray_t* re2  = ray_load_file_fn(nope);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(re2));
+
+    unlink(path);
+    ray_release(re2);
+    ray_release(nope);
+    ray_release(re);
+    ray_release(bad);
+    ray_release(r);
+    ray_release(p);
+    PASS();
+}
+
+/* (write path content) — write a string to a file. */
+static test_result_t test_builtin_write_file_fn(void) {
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/ray_test_write_%d.txt", (int)getpid());
+    ray_t* p = ray_str(path, strlen(path));
+    ray_t* c = ray_str("hello world", 11);
+
+    ray_t* r = ray_write_file_fn(p, c);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+
+    /* Verify file contents. */
+    FILE* fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL(fp);
+    char buf[32] = {0};
+    size_t rd = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    TEST_ASSERT_EQ_U(rd, 11);
+    TEST_ASSERT_TRUE(memcmp(buf, "hello world", 11) == 0);
+
+    /* Wrong-type paths. */
+    ray_t* bad_path = ray_i64(0);
+    ray_t* re1 = ray_write_file_fn(bad_path, c);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(re1));
+    ray_t* bad_content = ray_i64(0);
+    ray_t* re2 = ray_write_file_fn(p, bad_content);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(re2));
+
+    unlink(path);
+    ray_release(re2);
+    ray_release(bad_content);
+    ray_release(re1);
+    ray_release(bad_path);
+    ray_release(r);
+    ray_release(c);
+    ray_release(p);
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/fn_unary", test_fn_unary, lang_setup, lang_teardown },
     { "lang/fn_binary", test_fn_binary, lang_setup, lang_teardown },
@@ -3998,6 +4169,14 @@ const test_entry_t lang_entries[] = {
     { "lang/select_by_computed_key_nullable_nonkey", test_select_by_computed_key_nullable_nonkey, lang_setup, lang_teardown },
     { "lang/datalog/fixpoint", test_datalog_fixpoint, lang_setup, lang_teardown },
     { "lang/datalog/query_inline_rules", test_datalog_query_inline_rules, lang_setup, lang_teardown },
+
+    /* ops/builtins.c entry-point coverage */
+    { "lang/builtin/print",       test_builtin_print_fn,       lang_setup, lang_teardown },
+    { "lang/builtin/show",        test_builtin_show_fn,        lang_setup, lang_teardown },
+    { "lang/builtin/timeit",      test_builtin_timeit_fn,      lang_setup, lang_teardown },
+    { "lang/builtin/load_file",   test_builtin_load_file_fn,   lang_setup, lang_teardown },
+    { "lang/builtin/write_file",  test_builtin_write_file_fn,  lang_setup, lang_teardown },
+
     { NULL, NULL, NULL, NULL },
 };
 
