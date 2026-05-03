@@ -29,6 +29,7 @@
 #include "table/sym.h"
 #include "store/col.h"
 #include "lang/internal.h"
+#include "ops/hash.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -982,6 +983,440 @@ static test_result_t test_sym_name_fn_wrong_type(void) {
 
 /* ---- Suite definition -------------------------------------------------- */
 
+/* ─── src/table/sym.h inline-fn coverage ───────────────────────── */
+
+static test_result_t test_sym_dict_width_w32_w64(void) {
+    /* W8 boundary */
+    TEST_ASSERT_EQ_U(ray_sym_dict_width(0),   RAY_SYM_W8);
+    TEST_ASSERT_EQ_U(ray_sym_dict_width(255),  RAY_SYM_W8);
+    /* W16 boundary */
+    TEST_ASSERT_EQ_U(ray_sym_dict_width(256),    RAY_SYM_W16);
+    TEST_ASSERT_EQ_U(ray_sym_dict_width(65535),  RAY_SYM_W16);
+    /* W32 branch (line 57 — previously never hit) */
+    TEST_ASSERT_EQ_U(ray_sym_dict_width(65536),      RAY_SYM_W32);
+    TEST_ASSERT_EQ_U(ray_sym_dict_width(4294967295LL), RAY_SYM_W32);
+    /* W64 fallthrough (line 58 — previously never hit) */
+    TEST_ASSERT_EQ_U(ray_sym_dict_width(4294967296LL), RAY_SYM_W64);
+    TEST_ASSERT_EQ_U(ray_sym_dict_width(INT64_MAX),    RAY_SYM_W64);
+
+    PASS();
+}
+
+/* ---- sym_elem_size_non_sym -------------------------------------------- */
+
+/* ray_sym_elem_size: non-RAY_SYM type must fall through to ray_elem_size
+ * (line 64 in test_sym.c's instantiation — always 0 in that TU). */
+static test_result_t test_sym_elem_size_non_sym(void) {
+    /* RAY_BOOL = 1 byte, RAY_I32 = 4 bytes, RAY_I64 = 8 bytes, RAY_F64 = 8 */
+    TEST_ASSERT_EQ_U(ray_sym_elem_size(RAY_BOOL, 0), 1);
+    TEST_ASSERT_EQ_U(ray_sym_elem_size(RAY_I32,  0), 4);
+    TEST_ASSERT_EQ_U(ray_sym_elem_size(RAY_I64,  0), 8);
+    TEST_ASSERT_EQ_U(ray_sym_elem_size(RAY_F64,  0), 8);
+    /* RAY_SYM path still works for completeness */
+    TEST_ASSERT_EQ_U(ray_sym_elem_size(RAY_SYM, RAY_SYM_W8),  1);
+    TEST_ASSERT_EQ_U(ray_sym_elem_size(RAY_SYM, RAY_SYM_W16), 2);
+    TEST_ASSERT_EQ_U(ray_sym_elem_size(RAY_SYM, RAY_SYM_W32), 4);
+    TEST_ASSERT_EQ_U(ray_sym_elem_size(RAY_SYM, RAY_SYM_W64), 8);
+
+    PASS();
+}
+
+/* ---- sym_read_write_w32 ----------------------------------------------- */
+
+/* ray_read_sym / ray_write_sym W32 case (lines 73/85 in test_sym.c TU).
+ * Also exercises the W8/W16/W64 paths to keep the switch fully covered. */
+static test_result_t test_sym_read_write_all_widths(void) {
+    /* Buffers large enough for 4 elements at the widest (W64 = 8 bytes each) */
+    uint8_t  buf8[4]  = {0};
+    uint16_t buf16[4] = {0};
+    uint32_t buf32[4] = {0};
+    int64_t  buf64[4] = {0};
+
+    /* W8 */
+    ray_write_sym(buf8,  0, 42,  RAY_SYM, RAY_SYM_W8);
+    ray_write_sym(buf8,  1, 200, RAY_SYM, RAY_SYM_W8);
+    TEST_ASSERT_EQ_I(ray_read_sym(buf8, 0, RAY_SYM, RAY_SYM_W8), 42);
+    TEST_ASSERT_EQ_I(ray_read_sym(buf8, 1, RAY_SYM, RAY_SYM_W8), 200);
+
+    /* W16 */
+    ray_write_sym(buf16, 0, 1000,  RAY_SYM, RAY_SYM_W16);
+    ray_write_sym(buf16, 2, 65000, RAY_SYM, RAY_SYM_W16);
+    TEST_ASSERT_EQ_I(ray_read_sym(buf16, 0, RAY_SYM, RAY_SYM_W16), 1000);
+    TEST_ASSERT_EQ_I(ray_read_sym(buf16, 2, RAY_SYM, RAY_SYM_W16), 65000);
+
+    /* W32 — previously uncovered in test_sym.c TU */
+    ray_write_sym(buf32, 0, 70000,      RAY_SYM, RAY_SYM_W32);
+    ray_write_sym(buf32, 3, 4000000000ULL, RAY_SYM, RAY_SYM_W32);
+    TEST_ASSERT_EQ_I(ray_read_sym(buf32, 0, RAY_SYM, RAY_SYM_W32), 70000);
+    TEST_ASSERT_EQ_I(ray_read_sym(buf32, 3, RAY_SYM, RAY_SYM_W32), (int64_t)4000000000ULL);
+
+    /* W64 */
+    ray_write_sym(buf64, 0, (uint64_t)5000000000LL, RAY_SYM, RAY_SYM_W64);
+    ray_write_sym(buf64, 1, 7,                      RAY_SYM, RAY_SYM_W64);
+    TEST_ASSERT_EQ_I(ray_read_sym(buf64, 0, RAY_SYM, RAY_SYM_W64), 5000000000LL);
+    TEST_ASSERT_EQ_I(ray_read_sym(buf64, 1, RAY_SYM, RAY_SYM_W64), 7);
+
+    PASS();
+}
+
+/* ---- Suite definition -------------------------------------------------- */
+
+
+/* ─── src/table/sym.c body coverage ────────────────────────────── */
+
+static test_result_t test_sym_cache_segs_trailing_dot(void) {
+    /* Insert trailing-dot name without segment processing. */
+    int64_t id = ray_sym_intern_no_split("foo.", 4);
+    TEST_ASSERT((id) >= (0), "id >= 0");
+    /* Not yet scanned. */
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(id));
+
+    /* Rebuild must succeed and must NOT mark the trailing-dot sym as dotted. */
+    TEST_ASSERT_EQ_I(ray_sym_rebuild_segments(), RAY_OK);
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(id));
+
+    /* A normal intern of the same name also sees it as plain. */
+    int64_t id2 = ray_sym_intern("foo.", 4);
+    TEST_ASSERT_EQ_I(id2, id);
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(id2));
+
+    PASS();
+}
+
+/* ---- sym_null_path ---------------------------------------------------- */
+
+static test_result_t test_sym_save_null_path(void) {
+    ray_err_t err = ray_sym_save(NULL);
+    TEST_ASSERT((err) != (RAY_OK), "save(NULL) should fail");
+    PASS();
+}
+
+static test_result_t test_sym_load_null_path(void) {
+    ray_err_t err = ray_sym_load(NULL);
+    TEST_ASSERT((err) != (RAY_OK), "load(NULL) should fail");
+    PASS();
+}
+
+/* ---- sym_load_non_list ------------------------------------------------- */
+
+/* ray_sym_load rejects a valid STRL file that contains something other than
+ * a RAY_LIST (e.g. a RAY_I64 vector). */
+static test_result_t test_sym_load_non_list(void) {
+    const char* sym_path = "/tmp/test_sym_nonlist.sym";
+    remove(sym_path);
+
+    /* Write a RAY_I64 vector instead of a RAY_LIST. */
+    ray_t* vec = ray_vec_new(RAY_I64, 3);
+    TEST_ASSERT_NOT_NULL(vec);
+    int64_t v0 = 1, v1 = 2, v2 = 3;
+    vec = ray_vec_append(vec, &v0);
+    vec = ray_vec_append(vec, &v1);
+    vec = ray_vec_append(vec, &v2);
+    TEST_ASSERT_NOT_NULL(vec);
+    ray_err_t err = ray_col_save(vec, sym_path);
+    ray_release(vec);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Loading must fail because type != RAY_LIST. */
+    err = ray_sym_load(sym_path);
+    TEST_ASSERT((err) != (RAY_OK), "load non-list should fail");
+    TEST_ASSERT_EQ_U(ray_sym_count(), 0);
+
+    remove(sym_path);
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
+    remove(lk_path);
+    PASS();
+}
+
+/* ---- sym_load_stale_prefix -------------------------------------------- */
+
+/* ray_sym_load rejects a file that has fewer entries than what was
+ * previously persisted (stale / truncated on disk). */
+static test_result_t test_sym_load_stale_prefix(void) {
+    const char* sym_path = "/tmp/test_sym_stale.sym";
+    remove(sym_path);
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
+    remove(lk_path);
+
+    /* Intern and save 3 symbols so persisted_count == 3. */
+    ray_sym_intern("aaa", 3);
+    ray_sym_intern("bbb", 3);
+    ray_sym_intern("ccc", 3);
+    ray_err_t err = ray_sym_save(sym_path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Reload from the same file so persisted_count stays 3. */
+    err = ray_sym_load(sym_path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Now overwrite the sym file on disk with only 2 entries (stale). */
+    ray_t* short_list = ray_list_new(2);
+    TEST_ASSERT_NOT_NULL(short_list);
+    ray_t* s0 = ray_str("aaa", 3);
+    ray_t* s1 = ray_str("bbb", 3);
+    short_list = ray_list_append(short_list, s0); ray_release(s0);
+    short_list = ray_list_append(short_list, s1); ray_release(s1);
+    TEST_ASSERT_NOT_NULL(short_list);
+    err = ray_col_save(short_list, sym_path);
+    ray_release(short_list);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Load must fail: disk has 2 entries but persisted_count==3. */
+    err = ray_sym_load(sym_path);
+    TEST_ASSERT((err) != (RAY_OK), "stale file should be rejected");
+
+    remove(sym_path);
+    remove(lk_path);
+    PASS();
+}
+
+/* ---- sym_load_prefix_mismatch ----------------------------------------- */
+
+/* ray_sym_load rejects a reload where the first (already-loaded) entry
+ * has a different string than what is in memory. */
+static test_result_t test_sym_load_prefix_mismatch(void) {
+    const char* sym_path = "/tmp/test_sym_mismatch.sym";
+    remove(sym_path);
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
+    remove(lk_path);
+
+    /* Intern and save 2 symbols. */
+    ray_sym_intern("dog", 3);
+    ray_sym_intern("cat", 3);
+    ray_err_t err = ray_sym_save(sym_path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Reload so persisted_count == 2. */
+    err = ray_sym_load(sym_path);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Overwrite sym file with different strings at same positions. */
+    ray_t* bad_list = ray_list_new(2);
+    TEST_ASSERT_NOT_NULL(bad_list);
+    ray_t* s0 = ray_str("fox", 3);   /* was "dog" */
+    ray_t* s1 = ray_str("cat", 3);
+    bad_list = ray_list_append(bad_list, s0); ray_release(s0);
+    bad_list = ray_list_append(bad_list, s1); ray_release(s1);
+    TEST_ASSERT_NOT_NULL(bad_list);
+    err = ray_col_save(bad_list, sym_path);
+    ray_release(bad_list);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Load must fail: prefix entry 0 has "fox" on disk but "dog" in memory. */
+    err = ray_sym_load(sym_path);
+    TEST_ASSERT((err) != (RAY_OK), "mismatched prefix should be rejected");
+
+    remove(sym_path);
+    remove(lk_path);
+    PASS();
+}
+
+/* ---- sym_load_id_mismatch --------------------------------------------- */
+
+/* ray_sym_load rejects a file when a disk entry would be assigned an
+ * in-memory id != its disk position.  This happens when a transient
+ * symbol already occupies the slot. */
+static test_result_t test_sym_load_id_mismatch(void) {
+    const char* sym_path = "/tmp/test_sym_idmismatch.sym";
+    remove(sym_path);
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
+    remove(lk_path);
+
+    /* Write a file that contains just one entry: "zebra". */
+    ray_t* file_list = ray_list_new(1);
+    TEST_ASSERT_NOT_NULL(file_list);
+    ray_t* s0 = ray_str("zebra", 5);
+    file_list = ray_list_append(file_list, s0); ray_release(s0);
+    TEST_ASSERT_NOT_NULL(file_list);
+    ray_err_t err = ray_col_save(file_list, sym_path);
+    ray_release(file_list);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Intern a different symbol first — it occupies id=0. */
+    int64_t transient_id = ray_sym_intern("apple", 5);
+    TEST_ASSERT_EQ_I(transient_id, 0);
+
+    /* Now load the file: "zebra" would need id=0 but "apple" is already there. */
+    err = ray_sym_load(sym_path);
+    TEST_ASSERT((err) != (RAY_OK), "id mismatch should be rejected");
+
+    remove(sym_path);
+    remove(lk_path);
+    PASS();
+}
+
+/* ---- sym_save_existing_not_list --------------------------------------- */
+
+/* ray_sym_save reads the existing file at the path before writing.
+ * If the file is readable but its contents are not a RAY_LIST, it should
+ * return RAY_ERR_CORRUPT rather than overwriting. */
+static test_result_t test_sym_save_existing_not_list(void) {
+    const char* sym_path = "/tmp/test_sym_save_notlist.sym";
+    remove(sym_path);
+    char lk_path[4096];
+    snprintf(lk_path, sizeof(lk_path), "%s.lk", sym_path);
+    remove(lk_path);
+
+    /* Write a RAY_I64 vector at the sym path. */
+    ray_t* vec = ray_vec_new(RAY_I64, 2);
+    TEST_ASSERT_NOT_NULL(vec);
+    int64_t v0 = 10, v1 = 20;
+    vec = ray_vec_append(vec, &v0);
+    vec = ray_vec_append(vec, &v1);
+    TEST_ASSERT_NOT_NULL(vec);
+    ray_err_t err = ray_col_save(vec, sym_path);
+    ray_release(vec);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Intern a symbol so there is something to save. */
+    ray_sym_intern("hello", 5);
+
+    /* ray_sym_save must fail because existing file is not a RAY_LIST. */
+    err = ray_sym_save(sym_path);
+    TEST_ASSERT((err) != (RAY_OK), "save over non-list file should fail");
+
+    remove(sym_path);
+    remove(lk_path);
+    PASS();
+}
+
+/* ---- sym_intern_prehashed_basic --------------------------------------- */
+
+/* Verify that ray_sym_intern_prehashed works and is consistent with
+ * ray_sym_intern. */
+static test_result_t test_sym_intern_prehashed_basic(void) {
+    int64_t id1 = ray_sym_intern("pretest", 7);
+    TEST_ASSERT((id1) >= (0), "id1 >= 0");
+
+    /* Using prehashed with the same string returns the same id. */
+    uint32_t h = (uint32_t)ray_hash_bytes("pretest", 7);
+    int64_t id2 = ray_sym_intern_prehashed(h, "pretest", 7);
+    TEST_ASSERT_EQ_I(id1, id2);
+
+    /* Prehashed with a new name creates it. */
+    uint32_t h2 = (uint32_t)ray_hash_bytes("newpre", 6);
+    int64_t id3 = ray_sym_intern_prehashed(h2, "newpre", 6);
+    TEST_ASSERT((id3) >= (0), "id3 >= 0");
+    TEST_ASSERT((id3) != (id1), "id3 != id1");
+
+    PASS();
+}
+
+/* ---- sym_str_invalid_id ----------------------------------------------- */
+
+/* ray_sym_str with out-of-range id should return NULL. */
+static test_result_t test_sym_str_invalid_id(void) {
+    /* No syms interned yet. */
+    ray_t* s = ray_sym_str(-1);
+    TEST_ASSERT_NULL(s);
+
+    ray_t* s2 = ray_sym_str(9999);
+    TEST_ASSERT_NULL(s2);
+
+    /* After one intern, id=0 is valid but id=1 is not. */
+    ray_sym_intern("x", 1);
+    ray_t* s3 = ray_sym_str(0);
+    TEST_ASSERT_NOT_NULL(s3);
+    ray_t* s4 = ray_sym_str(1);
+    TEST_ASSERT_NULL(s4);
+
+    PASS();
+}
+
+/* ---- sym_is_dotted_invalid_id ----------------------------------------- */
+
+/* ray_sym_is_dotted with out-of-range ids returns false, not a crash. */
+static test_result_t test_sym_is_dotted_invalid_id(void) {
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(-1));
+    TEST_ASSERT_FALSE(ray_sym_is_dotted(9999));
+    PASS();
+}
+
+/* ---- sym_segs_invalid_id ---------------------------------------------- */
+
+/* ray_sym_segs with out-of-range id returns 0. */
+static test_result_t test_sym_segs_invalid_id(void) {
+    const int64_t* segs = NULL;
+    TEST_ASSERT_EQ_I(ray_sym_segs(-1, &segs), 0);
+    TEST_ASSERT_EQ_I(ray_sym_segs(9999, &segs), 0);
+    PASS();
+}
+
+/* ---- sym_find_after_many ---------------------------------------------- */
+
+/* Ensure that hash table linear probing works after many collisions:
+ * intern 512 unique names (forces ht_grow) then verify all are findable. */
+static test_result_t test_sym_find_after_grow(void) {
+    char buf[32];
+    for (int i = 0; i < 512; i++) {
+        int len = snprintf(buf, sizeof(buf), "grow_%03d", i);
+        int64_t id = ray_sym_intern(buf, (size_t)len);
+        TEST_ASSERT((id) >= (0), "id >= 0");
+    }
+    /* Verify all 512 are findable. */
+    for (int i = 0; i < 512; i++) {
+        int len = snprintf(buf, sizeof(buf), "grow_%03d", i);
+        int64_t id = ray_sym_find(buf, (size_t)len);
+        TEST_ASSERT((id) >= (0), "found grow sym");
+    }
+    PASS();
+}
+
+/* ---- sym_ensure_cap_zero ---------------------------------------------- */
+
+/* Calling ray_sym_ensure_cap(0) is a no-op that returns true. */
+static test_result_t test_sym_ensure_cap_zero(void) {
+    TEST_ASSERT_TRUE(ray_sym_ensure_cap(0));
+    PASS();
+}
+
+/* ---- sym_ensure_cap_large --------------------------------------------- */
+
+/* Pre-grow to a large capacity, then intern up to that capacity. */
+static test_result_t test_sym_ensure_cap_large(void) {
+    bool ok = ray_sym_ensure_cap(2000);
+    TEST_ASSERT_TRUE(ok);
+    /* After ensure_cap, str_cap >= 2000 — just verify we can intern that many. */
+    char buf[32];
+    for (int i = 0; i < 2000; i++) {
+        int len = snprintf(buf, sizeof(buf), "ecap_%04d", i);
+        int64_t id = ray_sym_intern(buf, (size_t)len);
+        TEST_ASSERT((id) >= (0), "id >= 0");
+    }
+    TEST_ASSERT_EQ_U(ray_sym_count(), 2000);
+    PASS();
+}
+
+/* ---- sym_dotted_leading_dot_with_second_dot ---------------------------- */
+
+/* Leading dot followed by a second dot (`.sys.gc`) should be treated as
+ * dotted, with segment 0 being `.sys` (including the leading dot). */
+static test_result_t test_sym_dotted_leading_dot(void) {
+    int64_t id = ray_sym_intern(".sys.gc", 7);
+    TEST_ASSERT((id) >= (0), "id >= 0");
+    TEST_ASSERT_TRUE(ray_sym_is_dotted(id));
+
+    const int64_t* segs = NULL;
+    int n = ray_sym_segs(id, &segs);
+    TEST_ASSERT_EQ_I(n, 2);
+    /* Segment 0 is `.sys` (4 bytes), segment 1 is `gc` (2 bytes). */
+    int64_t seg0_id = ray_sym_find(".sys", 4);
+    int64_t seg1_id = ray_sym_find("gc",   2);
+    TEST_ASSERT((seg0_id) >= (0), "seg0_id >= 0");
+    TEST_ASSERT((seg1_id) >= (0), "seg1_id >= 0");
+    TEST_ASSERT_EQ_I(segs[0], seg0_id);
+    TEST_ASSERT_EQ_I(segs[1], seg1_id);
+
+    PASS();
+}
+
+/* ---- Suite definition -------------------------------------------------- */
+
+
 const test_entry_t sym_entries[] = {
     { "sym/init_destroy", test_sym_init_destroy, sym_setup, sym_teardown },
     { "sym/intern_basic", test_sym_intern_basic, sym_setup, sym_teardown },
@@ -1022,6 +1457,29 @@ const test_entry_t sym_entries[] = {
     { "sym/name_fn/empty_i64_vec",      test_sym_name_fn_empty_i64_vec,    sym_setup, sym_teardown },
     { "sym/name_fn/empty_sym_vec",      test_sym_name_fn_empty_sym_vec,    sym_setup, sym_teardown },
     { "sym/name_fn/wrong_type",         test_sym_name_fn_wrong_type,       sym_setup, sym_teardown },
+
+    /* src/table/sym.h inline-fn coverage */
+    { "sym/dict_width_w32_w64",         test_sym_dict_width_w32_w64,       sym_setup, sym_teardown },
+    { "sym/elem_size_non_sym",          test_sym_elem_size_non_sym,        sym_setup, sym_teardown },
+    { "sym/read_write_all_widths",      test_sym_read_write_all_widths,    sym_setup, sym_teardown },
+
+    /* src/table/sym.c body coverage */
+    { "sym/cache_segs_trailing_dot",    test_sym_cache_segs_trailing_dot,  sym_setup, sym_teardown },
+    { "sym/save_null_path",             test_sym_save_null_path,           sym_setup, sym_teardown },
+    { "sym/load_null_path",             test_sym_load_null_path,           sym_setup, sym_teardown },
+    { "sym/load_non_list",              test_sym_load_non_list,            sym_setup, sym_teardown },
+    { "sym/load_stale_prefix",          test_sym_load_stale_prefix,        sym_setup, sym_teardown },
+    { "sym/load_prefix_mismatch",       test_sym_load_prefix_mismatch,     sym_setup, sym_teardown },
+    { "sym/load_id_mismatch",           test_sym_load_id_mismatch,         sym_setup, sym_teardown },
+    { "sym/save_existing_not_list",     test_sym_save_existing_not_list,   sym_setup, sym_teardown },
+    { "sym/intern_prehashed_basic",     test_sym_intern_prehashed_basic,   sym_setup, sym_teardown },
+    { "sym/str_invalid_id",             test_sym_str_invalid_id,           sym_setup, sym_teardown },
+    { "sym/is_dotted_invalid_id",       test_sym_is_dotted_invalid_id,     sym_setup, sym_teardown },
+    { "sym/segs_invalid_id",            test_sym_segs_invalid_id,          sym_setup, sym_teardown },
+    { "sym/find_after_grow",            test_sym_find_after_grow,          sym_setup, sym_teardown },
+    { "sym/ensure_cap_zero",            test_sym_ensure_cap_zero,          sym_setup, sym_teardown },
+    { "sym/ensure_cap_large",           test_sym_ensure_cap_large,         sym_setup, sym_teardown },
+    { "sym/dotted_leading_dot",         test_sym_dotted_leading_dot,       sym_setup, sym_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

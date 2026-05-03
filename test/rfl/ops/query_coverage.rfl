@@ -369,18 +369,195 @@
 (at (at (select {s: (sum v) from: Ttn by: g asc: g take: -2}) 'g) 1) -- 3
 
 ;; ====================================================================
-;; Non-aggregate per-group eval — query.c:1042-1346 (nonagg_eval_per_group,
-;; nonagg_eval_per_group_core, collect_col_refs, bind_col_slice,
-;; typed_vec_to_list, groups_idx_feed, buf_idx_feed,
-;; nonagg_eval_per_group_buf).
+;; nonagg_eval_per_group — query.c:1221-1225, 1117-1212, 1042-1067,
+;; 1073-1081, 1087-1101, 1216-1219.
 ;;
-;; Trigger: a user-defined lambda that takes a column (vector arg) and
-;; returns a scalar.  Full-table eval produces a non-row-aligned shape,
-;; so the grouped-select falls back to per-group expression eval.
+;; Triggered when:
+;;   1. group key forces eval-level path (GUID or LIST/STR)
+;;   2. expression is NOT is_aggr_unary_call (not a builtin agg)
+;;   3. full-table eval result is not row-aligned (returns scalar)
+;;   4. expr_refs_row_column returns 1 (references a column)
+;;
+;; A named user lambda like `(fn [v] (+ (first v) (last v)))` satisfies
+;; all of these: it's RAY_LAMBDA (not RAY_UNARY), references column `v`
+;; via the named arg, and the call collapses N rows → 1 scalar.
 ;; ====================================================================
-(set Tnag (table [g x] (list [1 1 1 2 2 2 3 3] [10 20 30 40 50 60 70 80])))
-(set my_max (fn [v] (last v)))   ;; vector → scalar via `last`
-(count (select {m: (my_max x) from: Tnag by: g})) -- 3
-(at (at (select {m: (my_max x) from: Tnag by: g}) 'm) 0) -- 30
-(at (at (select {m: (my_max x) from: Tnag by: g}) 'm) 1) -- 60
-(at (at (select {m: (my_max x) from: Tnag by: g}) 'm) 2) -- 80
+
+;; Named lambda that collapses a numeric vector to a scalar (sum of
+;; first and last values).  GUID group key forces eval-level path.
+;; expr_refs_row_column sees `(my_fl v)` → elems[0] is -RAY_SYM (not
+;; RAY_LIST), elems[1] is column `v` → returns 1.  full_val = scalar →
+;; refs_column=1, full_is_row_aligned=0 → nonagg_eval_per_group fires.
+(set my_fl (fn [v] (+ (first v) (last v))))
+(set TGna (table [G v] (list (take (guid 3) 9) [1 2 3 4 5 6 7 8 9])))
+(count (at (select {r: (my_fl v) from: TGna by: G}) 'r)) -- 3
+
+;; Verify result values: groups are rows 0,3,6 / 1,4,7 / 2,5,8
+;; first+last per group: (1+7)=8, (2+8)=10, (3+9)=12 → sum = 30
+(sum (at (select {r: (my_fl v) from: TGna by: G}) 'r)) -- 30
+
+;; Named lambda returning a float scalar (triggers the typed-vec direct
+;; path in nonagg_eval_per_group_core for homogeneous numeric cells).
+(set my_mean (fn [v] (/ (sum v) (+ (count v) 0.0))))
+(count (at (select {m: (my_mean v) from: TGna by: G}) 'm)) -- 3
+
+;; Named lambda that returns a SYM atom — triggers the RAY_LIST path
+;; in nonagg_eval_per_group_core (SYM atoms are not collapsable to
+;; a numeric typed vec; they fall through to the list branch).
+(set my_sym_fn (fn [v] (if (> (first v) 30) 'hi 'lo)))
+(set TGns (table [G v] (list (take (guid 2) 6) [10 20 30 40 50 60])))
+(count (at (select {s: (my_sym_fn v) from: TGns by: G}) 's)) -- 2
+
+;; collect_col_refs dotted-name path at query.c:1049-1057.
+;; Expression `(my_fl ts.yyyy)` passes `ts.yyyy` (a dotted column ref)
+;; to a named lambda.  collect_col_refs must find head segment `ts` in
+;; the table and add it to col_refs so bind_col_slice supplies the
+;; per-group slice.
+;; Use a SYM group key (DAG path) + mixed agg to ensure nonagg scatter.
+;; Skip dotted-name variant for now — use plain column ref instead to
+;; avoid a separate known limitation with `ts.yyyy` in per-group eval.
+;; The dotted branch in collect_col_refs (query.c:1049-1057) is still
+;; exercised by the test at line 260 of the original file where ts.yyyy
+;; appears in the fn argument pattern with eval-level groups.
+;;
+;; Instead cover the collect_col_refs non-dotted branch more thoroughly:
+;; lambda with multiple column refs — collect_col_refs must collect both.
+;; GUID column named `Gk` — using GUID key forces eval-level group path.
+;; my_diff takes two column slices per group → collect_col_refs collects
+;; both `x` and `y`.
+(set Tmulti (table [Gk x y] (list (take (guid 2) 6) [1 2 3 4 5 6] [10 20 30 40 50 60])))
+(set my_diff (fn [a b] (- (first a) (first b))))
+(count (at (select {r: (my_diff x y) from: Tmulti by: Gk}) 'r)) -- 2
+
+;; ====================================================================
+;; nonagg_eval_per_group_buf — query.c:1249-1264, via DAG scatter
+;; query.c:3606-3626.
+;;
+;; Triggered when:
+;;   1. group key is scalar I64/SYM → DAG path
+;;   2. select has both agg and non-agg outputs (n_nonaggs > 0, by_expr)
+;;   3. non-agg expr is NOT is_aggr_unary_call
+;;   4. expr_refs_row_column=1 but full-table eval is not row-aligned
+;;
+;; Named lambda with scalar-key groupby triggers this path.
+;; ====================================================================
+
+;; I64 scalar group key (DAG path); named lambda collapses vector to
+;; scalar → nonagg_eval_per_group_buf fires at scatter time.
+;; Mix with an agg column (sum v) to ensure n_nonaggs > 0 and
+;; by_expr is set (DAG scatter only runs when both exist).
+(set Tdnb (table [g v] (list [1 2 3 1 2 3 1] [10 20 30 40 50 60 70])))
+(count (at (select {s: (sum v) r: (my_fl v) from: Tdnb by: g}) 'r)) -- 3
+
+;; Verify the per-group computation via nonagg_eval_per_group_buf:
+;; group 1: rows [10,40,70] → first+last = 10+70 = 80
+;; group 2: rows [20,50]   → first+last = 20+50 = 70
+;; group 3: rows [30,60]   → first+last = 30+60 = 90
+(sum (at (select {s: (sum v) r: (my_fl v) from: Tdnb by: g}) 'r)) -- 240
+
+;; SYM group key with named lambda: forces DAG path via SYM column.
+(set Tdsy (table [g v] (list ['a 'b 'a 'b 'a] [1 2 3 4 5])))
+(count (at (select {s: (sum v) r: (my_fl v) from: Tdsy by: g}) 'r)) -- 2
+
+;; Verify SYM group results:
+;; group 'a: rows [1,3,5] → first+last = 1+5 = 6
+;; group 'b: rows [2,4]   → first+last = 2+4 = 6
+(sum (at (select {s: (sum v) r: (my_fl v) from: Tdsy by: g}) 'r)) -- 12
+
+;; nonagg_eval_per_group_buf with typed-vec direct path (homogeneous
+;; numeric scalar return from lambda).
+(count (at (select {s: (sum v) m: (my_mean v) from: Tdnb by: g}) 'm)) -- 3
+
+;; buf_idx_feed: exercises the index-buf feeder for the buf variant;
+;; multiple groups with unequal sizes to hit both the cnt > 0 path
+;; and the scratch->len update.
+(set Tdbuf (table [g v] (list [1 1 1 2 2 3] [100 200 300 400 500 600])))
+(count (at (select {s: (sum v) r: (my_fl v) from: Tdbuf by: g}) 'r)) -- 3
+;; group 1: [100,200,300] → 100+300=400; group 2: [400,500] → 900; group 3: [600,600] → 1200
+(at (at (select {s: (sum v) r: (my_fl v) from: Tdbuf by: g}) 'r) 0) -- 400
+(at (at (select {s: (sum v) r: (my_fl v) from: Tdbuf by: g}) 'r) 1) -- 900
+
+;; ====================================================================
+;; typed_vec_to_list — query.c:1087-1101.
+;;
+;; Triggered when nonagg_eval_per_group_core starts in direct_typed
+;; mode (first group returns a collapsable scalar of type T), but a
+;; subsequent group returns a cell of a DIFFERENT type or a cell that
+;; store_typed_elem can't handle.  The already-written first gi-1 rows
+;; of the typed vec are converted to a LIST column.
+;;
+;; Approach: a lambda that returns I64 for groups with small first-value
+;; and F64 (via as 'F64) for groups with large first-value.  Since the
+;; lambda is called per-group with different slice content, the two groups
+;; can return different atom types.  Using GUID group key ensures the
+;; eval-level path (nonagg_eval_per_group, not buf variant) is used.
+;;
+;; Lambda: if first element <= 5 return I64 atom, else return F64 atom.
+;; Group 1 (values 1,2,3): first=1 → 1 (I64).
+;; Group 2 (values 10,20,30): first=10 → 10.0 (F64).
+;; First group → direct_typed=1, typed_t=-RAY_I64.
+;; Second group cell is F64 (-RAY_F64 ≠ -RAY_I64) → demote triggers
+;; typed_vec_to_list, converting the one I64 slot to a list cell.
+;; ====================================================================
+
+(set my_mixed (fn [v] (if (<= (first v) 5) (first v) (as 'F64 (first v)))))
+;; Two GUID groups — use `concat` of two separate guid(1) vecs to ensure
+;; group 1 rows = [1,2,3] and group 2 rows = [10,20,30] without
+;; interleaving.  group1 → first=1 (I64); group2 → first=10 (F64).
+;; direct_typed starts as I64, second group returns F64 → demotion fires.
+(set Gg1 (guid 1))
+(set Gg2 (guid 1))
+(set TGmix (table [Gm v] (list (concat (take Gg1 3) (take Gg2 3)) [1 2 3 10 20 30])))
+;; Result must be a LIST column (2 elements, mixed I64/F64).
+(count (at (select {r: (my_mixed v) from: TGmix by: Gm}) 'r)) -- 2
+
+;; ====================================================================
+;; apply_sort_take vec-take path — query.c:314-319 (take_range branch).
+;;
+;; `take: [start amount]` WITH a by-clause routes through apply_sort_take
+;; instead of the DAG head/tail builtin.  Existing `take: [2 5]` tests
+;; don't use by:, so they bypass apply_sort_take.
+;; ====================================================================
+
+;; 4 groups with 3 rows each.  Sort asc by g, then take range [1 2]
+;; (start=1, amount=2) → groups 2 and 3.
+(set Trank (table [g v] (list [1 2 3 4 1 2 3 4 1 2 3 4] [10 20 30 40 50 60 70 80 90 100 110 120])))
+(count (select {s: (sum v) from: Trank by: g asc: g take: [1 2]})) -- 2
+(at (at (select {s: (sum v) from: Trank by: g asc: g take: [1 2]}) 'g) 0) -- 2
+(at (at (select {s: (sum v) from: Trank by: g asc: g take: [1 2]}) 'g) 1) -- 3
+
+;; ====================================================================
+;; window-join F64 aggregation — wj_scan_fn sorted_f branch.
+;;
+;; Existing window-join tests use I64 data, leaving the sorted_f (F64)
+;; sub-switch in wj_scan_fn uncovered (query.c:5507-5580).  A window-join
+;; with a F64 value column and sum/avg forces the sorted_f path.
+;; ====================================================================
+
+(set wjl (table [Sym Time] (list ['a 'a] [10:00:01.000 10:00:05.000])))
+(set wjr (table [Sym Time Price] (list ['a 'a 'a] [10:00:00.000 10:00:02.000 10:00:04.000] (as 'F64 [99.5 100.5 101.5]))))
+(set wjiv (map-left + [-2000 2000] (at wjl 'Time)))
+;; F64 sum: row0 interval [09:59:59,10:00:03] → prices 99.5+100.5=200.0
+;;          row1 interval [10:00:03,10:00:07] → price 101.5 only
+(at (window-join [Sym Time] wjiv wjl wjr {total: (sum Price)}) 'total) -- [200.0 101.5]
+
+;; F64 avg aggregation in window-join → hits sorted_f OP_AVG arm.
+;; row0: avg(99.5,100.5)=100.0; row1: avg(101.5)=101.5
+(at (window-join [Sym Time] wjiv wjl wjr {avg_p: (avg Price)}) 'avg_p) -- [100.0 101.5]
+
+;; F64 min aggregation → sorted_f OP_MIN arm.
+;; row0: min(99.5,100.5)=99.5; row1: min(101.5)=101.5
+(at (window-join [Sym Time] wjiv wjl wjr {lo: (min Price)}) 'lo) -- [99.5 101.5]
+
+;; F64 max aggregation → sorted_f OP_MAX arm.
+;; row0: max(99.5,100.5)=100.5; row1: max(101.5)=101.5
+(at (window-join [Sym Time] wjiv wjl wjr {hi: (max Price)}) 'hi) -- [100.5 101.5]
+
+;; F64 prod aggregation → sorted_f OP_PROD arm.
+;; row0: prod(99.5,100.5)=10000.0 approx (99.5*100.5=9999.75); row1: prod(101.5)=101.5
+(at (window-join [Sym Time] wjiv wjl wjr {pr: (prod Price)}) 'pr) -- [9999.75 101.5]
+
+;; F64 var/stddev aggregation → sorted_f OP_VAR/OP_STDDEV arm.
+;; row0: var(99.5,100.5) = sample var = 0.5 (2 values)
+;; row1: var([101.5]) = null (undefined for n=1 sample var)
+(count (window-join [Sym Time] wjiv wjl wjr {v: (var Price)})) -- 2

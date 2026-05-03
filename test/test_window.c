@@ -1690,6 +1690,367 @@ static test_result_t test_window_i32_value(void) {
     PASS();
 }
 
+/* ─── Running MAX i64 (covers the previously-missed else-branch at line 378) */
+
+static test_result_t test_window_running_max_i64(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    int64_t vd[] = {10, 30, 20, 40};
+    ray_t* tbl = mk_tbl_i64_2(gd, vd, n);
+
+    /* Running MAX ordered by v ASC: sorted [10,20,30,40], cumulative max =
+     * value at each step.  out[orig_idx_of_sorted[i]] = running_max. */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* w = build_running_window(g, tbl_op, "g", "v",
+                                        RAY_WIN_MAX, "v", 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    TEST_ASSERT_EQ_I(rc->type, RAY_I64);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    /* sorted order: idx0(10), idx2(20), idx1(30), idx3(40)
+     * step0: orig=0, max=10  → rd[0]=10
+     * step1: orig=2, max=20  → rd[2]=20
+     * step2: orig=1, max=30  → rd[1]=30
+     * step3: orig=3, max=40  → rd[3]=40 */
+    TEST_ASSERT_EQ_I(rd[0], 10);
+    TEST_ASSERT_EQ_I(rd[2], 20);
+    TEST_ASSERT_EQ_I(rd[1], 30);
+    TEST_ASSERT_EQ_I(rd[3], 40);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Running MAX i64 with leading null: covers win_set_null branch in
+ *     running MAX i64 (found==0 at start) ─────────────────────────── */
+
+static test_result_t test_window_running_max_leading_null(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    int64_t vd[] = {0, 10, 20, 30};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    ray_vec_set_null(vv, 0, true);   /* first row null */
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* No order key — stable input order [null, 10, 20, 30].
+     * Running MAX: [null, 10, 20, 30] */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[] = { g_op };
+    uint8_t kinds[] = { RAY_WIN_MAX };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                NULL, NULL, 0,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_CURRENT_ROW,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    TEST_ASSERT_TRUE(ray_vec_is_null(rc, 0));
+    TEST_ASSERT_EQ_I(rd[1], 10);
+    TEST_ASSERT_EQ_I(rd[2], 20);
+    TEST_ASSERT_EQ_I(rd[3], 30);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── F64 order key: exercises win_keys_differ F64 branch (lines 42-46)
+ *     Use RANK so the differ call is reached with F64 order column. ── */
+
+static test_result_t test_window_f64_order_key(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    double  od[] = {1.0, 1.0, 2.0, 3.0};  /* two ties at 1.0 */
+    int64_t vd[] = {10, 20, 30, 40};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* ov = ray_vec_from_raw(RAY_F64, od, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    int64_t ng  = ray_sym_intern("g",  1);
+    int64_t no  = ray_sym_intern("o",  1);
+    int64_t nv2 = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, no, ov);
+    tbl = ray_table_add_col(tbl, nv2, vv);
+    ray_release(gv); ray_release(ov); ray_release(vv);
+
+    /* PARTITION BY g, ORDER BY o (F64) — use RANK to trigger win_keys_differ
+     * on the F64 order column: rows 0,1 tie (1.0==1.0) → rank 1,1; row 2
+     * differs (2.0) → rank 3; row 3 differs (3.0) → rank 4. */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* o_op = ray_scan(g, "o");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    ray_op_t* orders[] = { o_op };
+    uint8_t   ndesc[]  = { 0 };
+    uint8_t   kinds[]  = { RAY_WIN_RANK };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                orders, ndesc, 1,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 3);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    /* sorted by o ASC: [1.0, 1.0, 2.0, 3.0] — rows 0,1 (either order), then 2, then 3 */
+    /* ranks: 1, 1, 3, 4 */
+    TEST_ASSERT_EQ_I(rd[0], 1);
+    TEST_ASSERT_EQ_I(rd[1], 1);
+    TEST_ASSERT_EQ_I(rd[2], 3);
+    TEST_ASSERT_EQ_I(rd[3], 4);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── I32 order key: exercises win_keys_differ I32 branch (lines 47-50)
+ *     Use DATE-typed column as order key with ties. ──────────────────── */
+
+static test_result_t test_window_i32_order_key(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 4;
+    int64_t gd[] = {1, 1, 1, 1};
+    int32_t od[] = {100, 100, 200, 300};  /* ties at 100 */
+    int64_t vd[] = {10, 20, 30, 40};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* ov = ray_vec_from_raw(RAY_DATE, od, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t no = ray_sym_intern("o", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, no, ov);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(ov); ray_release(vv);
+
+    /* PARTITION BY g, ORDER BY o (DATE/I32) — RANK with ties at day=100.
+     * Expected ranks: 1, 1, 3, 4 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* o_op = ray_scan(g, "o");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    ray_op_t* orders[] = { o_op };
+    uint8_t   ndesc[]  = { 0 };
+    uint8_t   kinds[]  = { RAY_WIN_RANK };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                orders, ndesc, 1,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 3);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    /* sorted by DATE ASC: [100,100,200,300] → ranks 1,1,3,4 */
+    TEST_ASSERT_EQ_I(rd[0], 1);
+    TEST_ASSERT_EQ_I(rd[1], 1);
+    TEST_ASSERT_EQ_I(rd[2], 3);
+    TEST_ASSERT_EQ_I(rd[3], 4);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Single-key radix sort path (n_sort==1, nrows > 64) ───────────── */
+/* When there's exactly one sort key and nrows > 64 and the type is
+ * radix-encodable, exec_window takes the single-key radix branch.
+ * Use no order key, only partition key, with n=200. */
+
+static test_result_t test_window_single_key_radix(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    /* 200 rows, single I64 partition key, no order key — forces n_sort==1
+     * in the >64 branch, picking the single-key radix path. */
+    int64_t n = 200;
+    ray_t* gv = ray_vec_new(RAY_I64, n); gv->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* gd = (int64_t*)ray_data(gv);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < n; i++) {
+        gd[i] = i % 5;   /* 5 partitions of 40 each */
+        vd[i] = i;
+    }
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* No order key → n_sort == 1 (partition key only).
+     * nrows=200 > 64 → radix branch.  Use COUNT(*) whole-partition. */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    uint8_t   kinds[]  = { RAY_WIN_COUNT };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                NULL, NULL, 0,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    /* Each of 5 partitions has 40 rows → COUNT = 40 */
+    for (int64_t i = 0; i < n; i++) TEST_ASSERT_EQ_I(rd[i], 40);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Single-key radix sort path, large (nrows > RADIX_SORT_THRESHOLD=4096)
+ *     exercises the full radix_sort_run sub-path ──────────────────────── */
+
+static test_result_t test_window_single_key_radix_large(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    /* 5000 rows > RADIX_SORT_THRESHOLD(4096), single partition key, no order */
+    int64_t n = 5000;
+    ray_t* gv = ray_vec_new(RAY_I64, n); gv->len = n;
+    ray_t* vv = ray_vec_new(RAY_I64, n); vv->len = n;
+    int64_t* gd = (int64_t*)ray_data(gv);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < n; i++) {
+        gd[i] = i % 10;   /* 10 partitions of 500 each */
+        vd[i] = i;
+    }
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[]  = { g_op };
+    uint8_t   kinds[]  = { RAY_WIN_COUNT };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                NULL, NULL, 0,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_UNBOUNDED_FOLLOWING,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    int64_t* rd = (int64_t*)ray_data(rc);
+    /* Each of 10 partitions has 500 rows */
+    for (int64_t i = 0; i < n; i++) TEST_ASSERT_EQ_I(rd[i], 500);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+/* ─── Running AVG with leading null: cnt==0 path (lines 262-263) ────── */
+
+static test_result_t test_window_running_avg_leading_null(void) {
+    ray_heap_init(); (void)ray_sym_init();
+
+    int64_t n = 3;
+    int64_t gd[] = {1, 1, 1};
+    int64_t vd[] = {0, 20, 30};
+    ray_t* gv = ray_vec_from_raw(RAY_I64, gd, n);
+    ray_t* vv = ray_vec_from_raw(RAY_I64, vd, n);
+    ray_vec_set_null(vv, 0, true);   /* first row null */
+    int64_t ng = ray_sym_intern("g", 1);
+    int64_t nv = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ng, gv);
+    tbl = ray_table_add_col(tbl, nv, vv);
+    ray_release(gv); ray_release(vv);
+
+    /* No order key: input order is [null, 20, 30].
+     * Running AVG: row0=null (cnt==0), row1=20.0, row2=25.0 */
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* tbl_op = ray_const_table(g, tbl);
+    ray_op_t* g_op = ray_scan(g, "g");
+    ray_op_t* v_op = ray_scan(g, "v");
+    ray_op_t* parts[] = { g_op };
+    uint8_t kinds[] = { RAY_WIN_AVG };
+    ray_op_t* fins[]   = { v_op };
+    int64_t   params[] = { 0 };
+    ray_op_t* w = ray_window_op(g, tbl_op,
+                                parts, 1,
+                                NULL, NULL, 0,
+                                kinds, fins, params, 1,
+                                RAY_FRAME_ROWS,
+                                RAY_BOUND_UNBOUNDED_PRECEDING,
+                                RAY_BOUND_CURRENT_ROW,
+                                0, 0);
+    ray_t* result = ray_execute(g, w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    ray_t* rc = win_result_col(result, 2);
+    double* rd = (double*)ray_data(rc);
+    TEST_ASSERT_TRUE(ray_vec_is_null(rc, 0));   /* cnt==0 → null */
+    TEST_ASSERT_EQ_F(rd[1], 20.0, 1e-9);
+    TEST_ASSERT_EQ_F(rd[2], 25.0, 1e-9);
+
+    ray_release(result); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Suite registration ──────────────────────────────────────────── */
 
 const test_entry_t window_entries[] = {
@@ -1725,5 +2086,12 @@ const test_entry_t window_entries[] = {
     { "window/i32_value",              test_window_i32_value,              NULL, NULL },
     { "window/str_partition",          test_window_str_partition,          NULL, NULL },
     { "window/str_parallel_merge",     test_window_str_parallel_merge,     NULL, NULL },
+    { "window/running_max_i64",        test_window_running_max_i64,        NULL, NULL },
+    { "window/running_max_leading_null", test_window_running_max_leading_null, NULL, NULL },
+    { "window/f64_order_key",          test_window_f64_order_key,          NULL, NULL },
+    { "window/i32_order_key",          test_window_i32_order_key,          NULL, NULL },
+    { "window/single_key_radix",       test_window_single_key_radix,       NULL, NULL },
+    { "window/single_key_radix_large", test_window_single_key_radix_large, NULL, NULL },
+    { "window/running_avg_leading_null", test_window_running_avg_leading_null, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
