@@ -27,12 +27,8 @@
 #include "../ops/ops.h"
 #include "../table/sym.h"
 
-/* Weak stub for ray_alloc — historically a fallback if no allocator is
- * linked.  Every build configuration in tree links src/mem/heap.c, whose
- * strong ray_alloc always wins, so this body is dead code under llvm-cov.
- * Compiled out so the symbol no longer drags coverage down; restore the
- * #if 0 if a future build configuration ships without the buddy allocator. */
-#if 0
+/* Weak stub for ray_alloc — replaced by buddy allocator at link time.
+ * Uses ray_vm_alloc (mmap) — page-aligned and zero-filled. */
 __attribute__((weak))
 ray_t* ray_alloc(size_t size) {
     if (size < 32) size = 32;
@@ -41,7 +37,6 @@ ray_t* ray_alloc(size_t size) {
     if (!p) return ray_error("oom", NULL);
     return (ray_t*)p;
 }
-#endif
 
 size_t ray_block_size(ray_t* v) {
     if (ray_is_atom(v)) return 32;
