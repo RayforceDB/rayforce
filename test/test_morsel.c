@@ -26,7 +26,13 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "ops/ops.h"
+#include "ops/idxop.h"
+#include "store/col.h"
+#include "core/morsel.h"
 #include <string.h>
+#include <unistd.h>
+
+#define TMP_MORSEL_COL "/tmp/rayforce_morsel_test_col.dat"
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 
@@ -368,6 +374,126 @@ static test_result_t test_morsel_nulls_external(void) {
 
 /* ---- Suite definition -------------------------------------------------- */
 
+/* ─── HAS_INDEX + mmap-advise paths ────────────────────────── */
+
+static test_result_t test_morsel_mmap_advise(void) {
+    int64_t raw[8];
+    for (int i = 0; i < 8; i++) raw[i] = (int64_t)(i + 1);
+    ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 8);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+
+    ray_err_t err = ray_col_save(vec, TMP_MORSEL_COL);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    ray_release(vec);
+
+    /* Load via mmap -> mmod == 1 */
+    ray_t* mapped = ray_col_mmap(TMP_MORSEL_COL);
+    TEST_ASSERT_NOT_NULL(mapped);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    TEST_ASSERT_EQ_U(mapped->mmod, 1);
+
+    /* ray_morsel_init must hit the vec->mmod==1 branch (lines 49-51) */
+    ray_morsel_t m;
+    ray_morsel_init(&m, mapped);
+    TEST_ASSERT_EQ_PTR(m.vec, mapped);
+    TEST_ASSERT_EQ_I(m.len, 8);
+
+    /* Consume all elements */
+    int64_t count = 0;
+    while (ray_morsel_next(&m)) {
+        int64_t* data = (int64_t*)m.morsel_ptr;
+        for (int64_t i = 0; i < m.morsel_len; i++) {
+            TEST_ASSERT_EQ_I(data[i], m.offset + i + 1);
+            count++;
+        }
+    }
+    TEST_ASSERT_EQ_I(count, 8);
+
+    ray_release(mapped);
+    unlink(TMP_MORSEL_COL);
+    PASS();
+}
+
+static test_result_t test_morsel_has_index_inline_nulls(void) {
+    int64_t xs[] = {10, 20, 30, 40, 50};
+    ray_t* v = ray_vec_from_raw(RAY_I64, xs, 5);
+    TEST_ASSERT_NOT_NULL(v);
+
+    /* Set null at index 1 -> inline bitmap */
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 1, true), RAY_OK);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_HAS_NULLS);
+
+    /* Attach index — displaces nullmap, stores snapshot in ix->saved_nullmap */
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_INDEX);
+
+    ray_morsel_t m;
+    ray_morsel_init(&m, w);
+
+    /* ray_morsel_next must hit the HAS_INDEX + inline path (lines 84,89-90) */
+    TEST_ASSERT_TRUE(ray_morsel_next(&m));
+    TEST_ASSERT_EQ_I(m.morsel_len, 5);
+    TEST_ASSERT_NOT_NULL(m.null_bits);
+
+    /* Bit 1 should be set */
+    int bit1 = (m.null_bits[1 / 8] >> (1 % 8)) & 1;
+    TEST_ASSERT_EQ_I(bit1, 1);
+    /* Bit 0 should be clear */
+    int bit0 = (m.null_bits[0 / 8] >> (0 % 8)) & 1;
+    TEST_ASSERT_EQ_I(bit0, 0);
+
+    TEST_ASSERT_FALSE(ray_morsel_next(&m));
+
+    ray_release(w);
+    PASS();
+}
+
+static test_result_t test_morsel_has_index_ext_nulls(void) {
+    /* > 128 elements forces external nullmap */
+    int64_t n = 200;
+    ray_t* v = ray_vec_new(RAY_I64, 0);
+    TEST_ASSERT_NOT_NULL(v);
+    int64_t z = 0;
+    for (int64_t i = 0; i < n; i++) {
+        v = ray_vec_append(v, &z);
+        TEST_ASSERT_NOT_NULL(v);
+    }
+    TEST_ASSERT_EQ_I(v->len, n);
+
+    /* null at 150 -> forces NULLMAP_EXT */
+    TEST_ASSERT_EQ_I(ray_vec_set_null_checked(v, 150, true), RAY_OK);
+    TEST_ASSERT_TRUE(v->attrs & RAY_ATTR_NULLMAP_EXT);
+
+    ray_t* w = v;
+    ray_t* r = ray_index_attach_zone(&w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(w->attrs & RAY_ATTR_HAS_INDEX);
+    /* NULLMAP_EXT cleared in parent; stored in ix->saved_attrs */
+    TEST_ASSERT_FALSE(w->attrs & RAY_ATTR_NULLMAP_EXT);
+
+    ray_index_t* ix = ray_index_payload(w->index);
+    TEST_ASSERT_TRUE(ix->saved_attrs & RAY_ATTR_NULLMAP_EXT);
+
+    ray_morsel_t m;
+    ray_morsel_init(&m, w);
+
+    /* First morsel: hits HAS_INDEX + saved_attrs NULLMAP_EXT (lines 85-88) */
+    TEST_ASSERT_TRUE(ray_morsel_next(&m));
+    TEST_ASSERT_NOT_NULL(m.null_bits);
+
+    /* Bit 150 should be set */
+    int bit150 = (m.null_bits[150 / 8] >> (150 % 8)) & 1;
+    TEST_ASSERT_EQ_I(bit150, 1);
+
+    TEST_ASSERT_FALSE(ray_morsel_next(&m));
+
+    ray_release(w);
+    PASS();
+}
+
 const test_entry_t morsel_entries[] = {
     { "morsel/init", test_morsel_init, morsel_setup, morsel_teardown },
     { "morsel/single", test_morsel_single, morsel_setup, morsel_teardown },
@@ -383,6 +509,9 @@ const test_entry_t morsel_entries[] = {
     { "morsel/init_range_multi",   test_morsel_init_range_multi,   morsel_setup, morsel_teardown },
     { "morsel/nulls_inline",       test_morsel_nulls_inline,       morsel_setup, morsel_teardown },
     { "morsel/nulls_external",     test_morsel_nulls_external,     morsel_setup, morsel_teardown },
+    { "morsel/mmap_advise",        test_morsel_mmap_advise,        morsel_setup, morsel_teardown },
+    { "morsel/has_index_inline_nulls", test_morsel_has_index_inline_nulls, morsel_setup, morsel_teardown },
+    { "morsel/has_index_ext_nulls", test_morsel_has_index_ext_nulls, morsel_setup, morsel_teardown },
     { NULL, NULL, NULL, NULL },
 };
 
