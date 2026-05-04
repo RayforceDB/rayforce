@@ -561,3 +561,193 @@
 ;; row0: var(99.5,100.5) = sample var = 0.5 (2 values)
 ;; row1: var([101.5]) = null (undefined for n=1 sample var)
 (count (window-join [Sym Time] wjiv wjl wjr {v: (var Price)})) -- 2
+
+;; ====================================================================
+;; compile_expr_dag type-cast arms — query.c I32/I16/U8/BOOL casts.
+;; Existing tests cover I64/F64 only; hitting the DAG CAST paths for
+;; narrower integer types requires explicit (as 'TYPE col) in a select.
+;; ====================================================================
+
+(set TT2 (table [a b] (list [1 2 3 4 5] [10 20 30 40 50])))
+(count (at (select {x: (as 'I32 a) from: TT2}) 'x))  -- 5
+(count (at (select {x: (as 'I16 a) from: TT2}) 'x))  -- 5
+(count (at (select {x: (as 'U8 a) from: TT2}) 'x))   -- 5
+(count (at (select {x: (as 'BOOL a) from: TT2}) 'x)) -- 5
+
+;; ====================================================================
+;; Non-agg scatter KEY_READ arms — I32, F64, DATE, BOOL, I16.
+;; The KEY_READ macro dispatches on key column type when by: is used
+;; with a non-aggregation expression.  Each arm below covers a distinct
+;; branch in the DAG scatter path (query.c ~3508 / ~3514).
+;; ====================================================================
+
+;; I32 key non-agg scatter
+(set TI32 (table [g v] (list (as 'I32 [1 2 1 2 1]) [10 20 30 40 50])))
+(count (at (select {x: (* v 2) from: TI32 by: g}) 'x)) -- 2
+
+;; F64 key non-agg scatter
+(set TF64 (table [g v] (list (as 'F64 [1.0 2.0 1.0 2.0 1.0]) [10 20 30 40 50])))
+(count (at (select {x: (* v 2) from: TF64 by: g}) 'x)) -- 2
+
+;; DATE key non-agg scatter
+(set Tdate (table [g v] (list (list 2024.01.01 2024.01.02 2024.01.01 2024.01.02 2024.01.01) [10 20 30 40 50])))
+(count (at (select {x: (* v 2) from: Tdate by: g}) 'x)) -- 2
+
+;; BOOL key non-agg scatter
+(set Tbool (table [g v] (list [true false true false true] [10 20 30 40 50])))
+(count (at (select {x: (* v 2) from: Tbool by: g}) 'x)) -- 2
+
+;; I16 key non-agg scatter
+(set Ti16 (table [g v] (list (as 'I16 [1 2 1 2 1]) [10 20 30 40 50])))
+(count (at (select {x: (* v 2) from: Ti16 by: g}) 'x)) -- 2
+
+;; ====================================================================
+;; window-join F64 OP_FIRST / OP_LAST aggregation — query.c sorted_f.
+;; The existing wj tests use I64 Price; the F64 first/last arms in
+;; wj_scan_fn were uncovered.
+;; ====================================================================
+
+(set wjl2 (table [Sym Time] (list ['a 'a] [10:00:01.000 10:00:05.000])))
+(set wjr2 (table [Sym Time Price] (list ['a 'a 'a] [10:00:00.000 10:00:02.000 10:00:04.000] (as 'F64 [99.5 100.5 101.5]))))
+(set wjiv2 (map-left + [-2000 2000] (at wjl2 'Time)))
+(at (window-join [Sym Time] wjiv2 wjl2 wjr2 {f: (first Price)}) 'f) -- [99.5 101.5]
+(at (window-join [Sym Time] wjiv2 wjl2 wjr2 {l: (last Price)}) 'l) -- [100.5 101.5]
+
+;; window-join integer VAR/PROD/STDDEV — sorted_i OP_VAR/OP_PROD/OP_STDDEV.
+(set wjr_int (table [Sym Time Price] (list ['a 'a 'a] [10:00:00.000 10:00:02.000 10:00:04.000] [100 200 300])))
+(count (window-join [Sym Time] wjiv2 wjl2 wjr_int {v: (var Price)}))    -- 2
+(count (window-join [Sym Time] wjiv2 wjl2 wjr_int {v: (stddev Price)})) -- 2
+(count (window-join [Sym Time] wjiv2 wjl2 wjr_int {v: (prod Price)}))   -- 2
+
+;; ====================================================================
+;; Update (no-where) additional type-conversion paths.
+;; ====================================================================
+
+;; I64 vec expr → F64 col promotion (query.c update no-where path).
+(set TupF (table [id v] (list [1 2 3] (as 'F64 [1.0 2.0 3.0]))))
+(set TupF2 (update {v: (+ (as 'I64 v) 1) from: TupF}))
+(at (at TupF2 'v) 0) -- 2.0
+
+;; STR atom → STR col broadcast.
+(set TupStr (table [id s] (list [1 2 3] (list "a" "b" "c"))))
+(set TupStr2 (update {s: "new" from: TupStr}))
+(at (at TupStr2 's) 0) -- "new"
+(at (at TupStr2 's) 2) -- "new"
+
+;; STR scalar → STR col broadcast (redundant confirm with different name).
+(set TupStrN (table [id s] (list [1 2 3] (list "a" "b" "c"))))
+(set TupStrN2 (update {s: "NEW" from: TupStrN}))
+(at (at TupStrN2 's) 0) -- "NEW"
+(at (at TupStrN2 's) 2) -- "NEW"
+
+;; Type mismatch: SYM atom into I64 column → type error.
+(set TupMis (table [id v] (list [1 2 3] [10 20 30])))
+(update {v: 'bad from: TupMis}) !- type
+
+;; SYM atom → LIST column broadcast.
+(set TupList (table [id lv] (list [1 2 3] (list (list 1) (list 2) (list 3)))))
+(set TupList2 (update {lv: 'tag from: TupList}))
+(count (at TupList2 'lv)) -- 3
+
+;; ====================================================================
+;; Update WHERE additional paths.
+;; ====================================================================
+
+;; WHERE-update: non-BOOL mask → type error.
+(set TwBad (table [id v] (list [1 2 3] [10 20 30])))
+(update {v: 99 from: TwBad where: (+ v 0)}) !- type
+
+;; WHERE-update: SYM atom into I64 column → type error.
+(update {v: 'bad from: TwBad where: (== id 1)}) !- type
+
+;; WHERE-update: scalar I64 into F64 col via broadcast.
+(set TwScF (table [id v] (list [1 2 3] (as 'F64 [1.0 2.0 3.0]))))
+(set TwScF2 (update {v: 99 from: TwScF where: (== id 2)}))
+(at (at TwScF2 'v) 0) -- 1.0
+(at (at TwScF2 'v) 1) -- 99.0
+(at (at TwScF2 'v) 2) -- 3.0
+
+;; WHERE-update: I64 vec → F64 col promotion.
+(set TwF (table [id v] (list [1 2 3] (as 'F64 [1.0 2.0 3.0]))))
+(set TwF2 (update {v: (+ (as 'I64 v) 10) from: TwF where: (> id 1)}))
+(at (at TwF2 'v) 0) -- 1.0
+(at (at TwF2 'v) 1) -- 12.0
+(at (at TwF2 'v) 2) -- 13.0
+
+;; ====================================================================
+;; nearest: + by: → domain error (mixed clauses not supported).
+;; ====================================================================
+
+(set TE2 (table [id Vec] (list [0 1 2] (list [1.0 0.0] [0.0 1.0] [0.5 0.5]))))
+(set Idx2 (hnsw-build (at TE2 'Vec) 'l2 4 50))
+(select {from: TE2 nearest: (ann Idx2 [1.0 0.0]) by: id}) !- domain
+(hnsw-free Idx2)
+
+;; ====================================================================
+;; Eval-level group-by: empty groups with n_out=0 (query.c 2116-2140).
+;; ====================================================================
+
+;; GUID key + WHERE removing all rows + aggregation output.
+(set TGe (table [G v] (list (take (guid 3) 6) [1 2 3 4 5 6])))
+(count (select {s: (sum v) from: TGe by: G where: (> v 100)})) -- 0
+
+;; Eval-level group-by: no-agg with STR / LIST non-key columns.
+
+;; GUID key + no-agg columns (fires eval-level n_out=0 fast path).
+(set TGs (table [G s v] (list (take (guid 2) 4) (list "a" "b" "a" "b") [1 2 3 4])))
+(count (select {from: TGs by: G})) -- 2
+(count (at (select {from: TGs by: G}) 's)) -- 2
+
+;; LIST non-key column in GUID eval-group.
+(set TGl (table [G lv v] (list (take (guid 2) 4) (list (list 1 2) (list 3 4) (list 5 6) (list 7 8)) [10 20 30 40])))
+(count (select {from: TGl by: G})) -- 2
+
+;; STR key → eval-level path; STR non-key column.
+(set TStrK (table [Name Label v] (list (list "a" "b" "a" "b") (list "x" "y" "x" "y") [1 2 3 4])))
+(count (select {from: TStrK by: Name})) -- 2
+(count (at (select {from: TStrK by: Name}) 'Label)) -- 2
+
+;; STR key + LIST non-key column in eval-level no-agg group-by.
+(set TStrL (table [Name lv v] (list (list "a" "b" "a" "b") (list (list 1 2) (list 3 4) (list 5 6) (list 7 8)) [1 2 3 4])))
+(count (select {from: TStrL by: Name})) -- 2
+
+;; STR key + WHERE removing all rows + no output columns (n_out=0 empty).
+(set TEmptyStr (table [Name v] (list (list "a" "b" "c") [1 2 3])))
+(count (select {s: (sum v) from: TEmptyStr by: Name where: (> v 100)})) -- 0
+(count (select {from: TEmptyStr by: Name where: (> v 100)})) -- 0
+
+;; ====================================================================
+;; insert table row with STR column (query.c:4795-4806).
+;; The STR copy-loop in the table-row insert path was uncovered because
+;; existing tests used SYM columns exclusively.
+;; ====================================================================
+
+(set TinsStr (table [id s] (list [1 2] (list "alpha" "beta"))))
+(set TinsStr2 (insert TinsStr (list 3 "gamma")))
+(count TinsStr2) -- 3
+(at (at TinsStr2 's) 0) -- "alpha"
+(at (at TinsStr2 's) 2) -- "gamma"
+
+;; ====================================================================
+;; nearest: take with I32 atom / bad type / zero — query.c:1623-1633.
+;; ANN with I32 query vector — query.c:1673-1677.
+;; ====================================================================
+
+(set TE3 (table [id Vec] (list [0 1 2] (list [1.0 0.0] [0.0 1.0] [0.5 0.5]))))
+(set Idx3 (hnsw-build (at TE3 'Vec) 'l2 4 50))
+;; I32 take atom (line 1623)
+(count (select {from: TE3 nearest: (ann Idx3 [1.0 0.0]) take: (as 'I32 2)})) -- 2
+;; F64 take atom → type error (line 1624-1628)
+(select {from: TE3 nearest: (ann Idx3 [1.0 0.0]) take: 1.5}) !- type
+;; take=0 → domain error (line 1630-1633)
+(select {from: TE3 nearest: (ann Idx3 [1.0 0.0]) take: 0}) !- domain
+;; I32 query vector (line 1673-1677)
+(count (select {from: TE3 nearest: (ann Idx3 (as 'I32 [1 0]))})) -- 3
+(hnsw-free Idx3)
+
+;; ====================================================================
+;; knn: unrecognized metric → domain error (query.c:1756-1761).
+;; ====================================================================
+
+(set TE5 (table [id Vec] (list [0 1 2] (list [1.0 0.0] [0.0 1.0] [0.5 0.5]))))
+(select {from: TE5 nearest: (knn Vec [1.0 0.0] 'badmetric)}) !- domain
