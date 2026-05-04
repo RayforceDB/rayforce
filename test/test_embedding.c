@@ -830,6 +830,122 @@ static test_result_t test_select_nearest_recall(void) {
     PASS();
 }
 
+/* ============ Direct C-API coverage helpers ============ */
+
+/* ray_hnsw_dim: the only public accessor that no existing test exercises. */
+static test_result_t test_hnsw_dim_accessor(void) {
+    /* Build a small 3-dim index via the C API directly. */
+    float vecs[5 * 3] = {
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+        1.0f, 1.0f, 0.0f,
+        1.0f, 0.0f, 1.0f,
+    };
+    ray_hnsw_t* idx = ray_hnsw_build(vecs, 5, 3, RAY_HNSW_L2, 4, 50);
+    TEST_ASSERT_NOT_NULL(idx);
+    TEST_ASSERT_EQ_I(ray_hnsw_dim(idx), 3);
+    /* NULL guard. */
+    TEST_ASSERT_EQ_I(ray_hnsw_dim(NULL), 0);
+    ray_hnsw_free(idx);
+    PASS();
+}
+
+/* ray_hnsw_search_filter with accept=NULL falls through to plain search. */
+static test_result_t test_hnsw_search_filter_null_accept(void) {
+    float vecs[5 * 3] = {
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+        1.0f, 1.0f, 0.0f,
+        1.0f, 0.0f, 1.0f,
+    };
+    ray_hnsw_t* idx = ray_hnsw_build(vecs, 5, 3, RAY_HNSW_L2, 4, 50);
+    TEST_ASSERT_NOT_NULL(idx);
+
+    float q[3] = {1.0f, 0.0f, 0.0f};
+    int64_t ids[3];
+    double  dists[3];
+    /* accept=NULL: delegates to ray_hnsw_search — must still return results. */
+    int64_t n = ray_hnsw_search_filter(idx, q, 3, 3, 50, NULL, NULL, ids, dists);
+    TEST_ASSERT_EQ_I(n, 3);
+    TEST_ASSERT_EQ_I(ids[0], 0);
+    TEST_ASSERT_EQ_F(dists[0], 0.0, 1e-6);
+
+    ray_hnsw_free(idx);
+    PASS();
+}
+
+/* ray_hnsw_mmap: exercised via the C API directly (not exposed as a builtin). */
+static test_result_t test_hnsw_mmap_load(void) {
+    const char* dir = "/tmp/ray_hnsw_mmap_test";
+    /* Build & save a small index. */
+    float vecs[5 * 3] = {
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f,
+        1.0f, 1.0f, 0.0f,
+        1.0f, 0.0f, 1.0f,
+    };
+    ray_hnsw_t* idx = ray_hnsw_build(vecs, 5, 3, RAY_HNSW_COSINE, 4, 50);
+    TEST_ASSERT_NOT_NULL(idx);
+    TEST_ASSERT_EQ_I(ray_hnsw_save(idx, dir), RAY_OK);
+    ray_hnsw_free(idx);
+
+    /* Load via mmap path — currently both paths read into memory,
+     * but the call itself is the untouched region. */
+    ray_hnsw_t* loaded = ray_hnsw_mmap(dir);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_EQ_I(ray_hnsw_dim(loaded), 3);
+
+    float q[3] = {1.0f, 0.0f, 0.0f};
+    int64_t ids[1];
+    double dists[1];
+    TEST_ASSERT_EQ_I(ray_hnsw_search(loaded, q, 3, 1, 50, ids, dists), 1);
+    TEST_ASSERT_EQ_I(ids[0], 0);
+
+    ray_hnsw_free(loaded);
+    PASS();
+}
+
+/* Trigger the maxheap_sift_down / results-replacement path in hnsw_search_layer.
+ *
+ * The replacement branch (lines 342-344) fires when:
+ *   res_sz >= ef  AND  d < results[0].dist
+ *
+ * Strategy: build a large index with ef_construction=1.  During construction,
+ * hnsw_search_layer is called with ef=1.  After the first candidate fills
+ * the result heap (res_sz=1=ef), any neighbor that is closer than that one
+ * result must enter via the sift-down replacement path.
+ *
+ * ef_construction=1 is intentionally aggressive (low quality index) but
+ * fully legal — the test just verifies the code path is reached.
+ * We additionally search with ef=1 to hit the same path at query time. */
+static test_result_t test_hnsw_search_sift_down(void) {
+    /* 200 random 4-D vectors — large enough that construction visits many
+     * neighbors and the result-replacement branch fires at least once. */
+    srand(99);
+    const int N = 200, D = 4;
+    float vecs[200 * 4];
+    for (int i = 0; i < N * D; i++)
+        vecs[i] = (float)rand() / (float)RAND_MAX - 0.5f;
+
+    /* ef_construction=1: result heap saturates after 1 entry during build,
+     * triggering sift_down whenever a better candidate arrives. */
+    ray_hnsw_t* idx = ray_hnsw_build(vecs, N, D, RAY_HNSW_L2, 8, 1);
+    TEST_ASSERT_NOT_NULL(idx);
+
+    /* Also search with ef=1 so the same path fires at query time. */
+    float q[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int64_t ids[1];
+    double dists[1];
+    int64_t n = ray_hnsw_search(idx, q, D, 1, 1, ids, dists);
+    TEST_ASSERT_TRUE(n >= 1);
+
+    ray_hnsw_free(idx);
+    PASS();
+}
+
 /* ============ Suite table ============ */
 
 const test_entry_t embedding_entries[] = {
@@ -871,6 +987,10 @@ const test_entry_t embedding_entries[] = {
     { "embedding/select_nearest_ann_projection_error", test_select_nearest_ann_projection_error, emb_setup, emb_teardown },
     { "embedding/select_nearest_iterative_selective", test_select_nearest_iterative_selective, emb_setup, emb_teardown },
     { "embedding/select_nearest_recall", test_select_nearest_recall, emb_setup, emb_teardown },
+    { "embedding/hnsw_dim_accessor", test_hnsw_dim_accessor, emb_setup, emb_teardown },
+    { "embedding/hnsw_search_filter_null_accept", test_hnsw_search_filter_null_accept, emb_setup, emb_teardown },
+    { "embedding/hnsw_mmap_load", test_hnsw_mmap_load, emb_setup, emb_teardown },
+    { "embedding/hnsw_search_sift_down", test_hnsw_search_sift_down, emb_setup, emb_teardown },
     { NULL, NULL, NULL, NULL },
 };
 

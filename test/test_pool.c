@@ -21,15 +21,32 @@
  *   SOFTWARE.
  */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "test.h"
 #include <rayforce.h>
 #include <rayforce.h>
 #include "core/pool.h"
+#include "core/poll.h"
+#include "core/platform.h"
 #include "mem/heap.h"
 #include "ops/ops.h"
 #include <stdatomic.h>
 #include <string.h>
 #include <math.h>
+
+#if defined(__linux__)
+#include <unistd.h>
+#include <sys/socket.h>
+#include <time.h>
+
+static void epoll_sleep_ms(long ms) {
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+#endif
 
 /* --------------------------------------------------------------------------
  * Test: parallel sum via executor (ray_sum on large vector)
@@ -916,6 +933,229 @@ static test_result_t test_dispatch_n_exact_cap(void) {
     PASS();
 }
 
+/* ==========================================================================
+ * epoll.c region-coverage tests
+ *
+ * These tests are Linux-only and exercise paths in src/core/epoll.c that
+ * are not reached by the IPC/repl tests:
+ *   (a) sel_cap growth: register > RAY_POLL_INITIAL_CAP (16) selectors so
+ *       the selector array must be doubled (lines 91-101 in epoll.c).
+ *   (b) EPOLLHUP/EPOLLERR branch: register a socket fd with no recv_fn/
+ *       read_fn but with an error_fn; close the peer end so epoll fires
+ *       EPOLLIN|EPOLLHUP; the EPOLLIN block exits without goto, so the
+ *       hangup block at line 232 is reached (lines 234-241 in epoll.c).
+ * ========================================================================== */
+
+#if defined(__linux__)
+
+/* --------------------------------------------------------------------------
+ * Test: register more than RAY_POLL_INITIAL_CAP (16) selectors on a single
+ * poll — forces the selector-array growth path (epoll.c lines 91-101).
+ *
+ * We create 20 anonymous pipes, register the read ends with no callbacks,
+ * verify all return valid ids, then destroy the poll (which deregisters
+ * everything).  The write ends are closed immediately after registration
+ * to avoid fd leaks.
+ * -------------------------------------------------------------------------- */
+
+#define EPOLL_TEST_N_SELS 20   /* > RAY_POLL_INITIAL_CAP (16) */
+
+static test_result_t test_epoll_sel_cap_growth(void) {
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    int write_ends[EPOLL_TEST_N_SELS];
+    int64_t ids[EPOLL_TEST_N_SELS];
+
+    for (int i = 0; i < EPOLL_TEST_N_SELS; i++) {
+        int pfd[2];
+        TEST_ASSERT_EQ_I(pipe(pfd), 0);
+        write_ends[i] = pfd[1];
+
+        ray_poll_reg_t reg;
+        memset(&reg, 0, sizeof(reg));
+        reg.fd   = pfd[0];
+        reg.type = RAY_SEL_SOCKET;
+
+        ids[i] = ray_poll_register(poll, &reg);
+        TEST_ASSERT_FMT(ids[i] >= 0,
+            "ray_poll_register failed for sel %d (id=%lld)", i, (long long)ids[i]);
+    }
+
+    /* Close write ends to avoid fd leaks; the read ends are owned by poll */
+    for (int i = 0; i < EPOLL_TEST_N_SELS; i++)
+        close(write_ends[i]);
+
+    /* Verify the selector array grew past 16: n_sels should be 20 */
+    TEST_ASSERT_EQ_U(poll->n_sels, (uint32_t)EPOLL_TEST_N_SELS);
+    TEST_ASSERT_TRUE(poll->sel_cap >= (uint32_t)EPOLL_TEST_N_SELS);
+
+    /* Manually close the read-end fds before destroy so they don't leak;
+     * deregister each slot first (epoll_ctl DEL, free sel, NULL the slot). */
+    for (int i = 0; i < EPOLL_TEST_N_SELS; i++) {
+        ray_selector_t* sel = ray_poll_get(poll, ids[i]);
+        if (sel) {
+            int rfd = (int)sel->fd;
+            ray_poll_deregister(poll, ids[i]);
+            close(rfd);
+        }
+    }
+
+    ray_poll_destroy(poll);
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Context for the EPOLLHUP test thread.
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+    ray_poll_t* poll;
+} epoll_hup_ctx_t;
+
+static void epoll_hup_poll_thread(void* arg) {
+    epoll_hup_ctx_t* ctx = (epoll_hup_ctx_t*)arg;
+    ray_poll_run(ctx->poll);
+}
+
+/* error_fn: called by epoll.c lines 237-239 when EPOLLHUP fires on a
+ * selector with no recv_fn.  Calls ray_poll_exit so the poll loop stops. */
+static void epoll_hup_error_fn(ray_poll_t* poll, ray_selector_t* sel) {
+    (void)sel;
+    ray_poll_exit(poll, 0);
+}
+
+/* --------------------------------------------------------------------------
+ * Test: trigger EPOLLHUP/EPOLLERR branch (epoll.c lines 234-241).
+ *
+ * We use a socketpair.  Fd[0] is registered in the poll with no recv_fn/
+ * read_fn but with an error_fn.  The poll runs in a background thread.
+ * We then close fd[1] (the peer); epoll reports EPOLLIN|EPOLLHUP on fd[0].
+ *
+ *   EPOLLIN block (line 177): recv_fn==NULL → inner recv skipped; read_fn
+ *   ==NULL → break at line 209.  Block exits normally (no goto next_event).
+ *
+ *   EPOLLHUP block (line 232): condition is true (EPOLLHUP set); sel is
+ *   still registered; error_fn is non-NULL → error_fn called → poll exits.
+ *
+ * This covers lines 234-240 inclusive.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_epoll_hup_branch(void) {
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    int sv[2];
+    TEST_ASSERT_EQ_I(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+    ray_poll_reg_t reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.fd       = sv[0];
+    reg.type     = RAY_SEL_SOCKET;
+    reg.error_fn = epoll_hup_error_fn;
+    /* recv_fn and read_fn intentionally left NULL so EPOLLIN block exits
+     * without a goto, allowing the EPOLLHUP block to be reached. */
+
+    int64_t id = ray_poll_register(poll, &reg);
+    TEST_ASSERT_FMT(id >= 0, "ray_poll_register failed (id=%lld)", (long long)id);
+
+    /* Run poll loop in background thread */
+    epoll_hup_ctx_t ctx = { .poll = poll };
+    ray_thread_t tid;
+    ray_thread_create(&tid, epoll_hup_poll_thread, &ctx);
+
+    /* Give the thread time to enter epoll_wait */
+    epoll_sleep_ms(20);
+
+    /* Close the peer — triggers EPOLLHUP (possibly also EPOLLIN with 0 bytes) */
+    close(sv[1]);
+
+    /* Wait for the poll thread to exit (error_fn sets poll->code = 0) */
+    ray_thread_join(tid);
+
+    /* sv[0] is still owned by the selector; deregister+close */
+    ray_poll_deregister(poll, id);
+    close(sv[0]);
+
+    ray_poll_destroy(poll);
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test: trigger EPOLLHUP branch with no error_fn — default deregister path
+ * (epoll.c lines 238-239).  After deregister the selector slot is NULL,
+ * the poll still runs; we stop it by calling ray_poll_exit from a second
+ * thread after the hangup fires.
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+    ray_poll_t* poll;
+    volatile int hup_fired;
+} epoll_hup_noerrfn_ctx_t;
+
+static void epoll_hup_noerrfn_poll_thread(void* arg) {
+    epoll_hup_noerrfn_ctx_t* ctx = (epoll_hup_noerrfn_ctx_t*)arg;
+    /* poll->code starts at -1; we expect error_fn==NULL path to deregister
+     * the selector but not stop the loop.  We stop it with ray_poll_exit. */
+    ray_poll_run(ctx->poll);
+}
+
+static test_result_t test_epoll_hup_no_errfn(void) {
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+
+    int sv[2];
+    TEST_ASSERT_EQ_I(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+
+    ray_poll_reg_t reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.fd       = sv[0];
+    reg.type     = RAY_SEL_SOCKET;
+    /* No error_fn — hits the else branch at line 239 (ray_poll_deregister) */
+
+    int64_t id = ray_poll_register(poll, &reg);
+    TEST_ASSERT_FMT(id >= 0, "ray_poll_register failed (id=%lld)", (long long)id);
+
+    epoll_hup_noerrfn_ctx_t ctx = { .poll = poll, .hup_fired = 0 };
+    ray_thread_t tid;
+    ray_thread_create(&tid, epoll_hup_noerrfn_poll_thread, &ctx);
+
+    epoll_sleep_ms(20);
+
+    /* Close peer — triggers EPOLLHUP; default path deregisters sv[0] */
+    close(sv[1]);
+
+    /* Give the poll thread time to process the hangup, then stop the loop */
+    epoll_sleep_ms(50);
+    ray_poll_exit(poll, 0);
+
+    /* Wake epoll_wait by registering a self-pipe and writing a byte */
+    int wake_pipe[2];
+    if (pipe(wake_pipe) == 0) {
+        ray_poll_reg_t wake_reg;
+        memset(&wake_reg, 0, sizeof(wake_reg));
+        wake_reg.fd   = wake_pipe[0];
+        wake_reg.type = RAY_SEL_SOCKET;
+        ray_poll_register(poll, &wake_reg);
+        /* Writing to the pipe wakes epoll_wait so poll->code >= 0 is checked */
+        char b = 'x';
+        (void)write(wake_pipe[1], &b, 1);
+        epoll_sleep_ms(30);
+        close(wake_pipe[1]);
+        /* wake_pipe[0] is owned by the poll selector; destroy will clean it */
+    }
+
+    ray_thread_join(tid);
+
+    /* sv[0] was deregistered by the default hangup path; close our copy */
+    close(sv[0]);
+
+    ray_poll_destroy(poll);
+    PASS();
+}
+
+#endif /* __linux__ */
+
 /* --------------------------------------------------------------------------
  * Suite definition
  * -------------------------------------------------------------------------- */
@@ -945,6 +1185,11 @@ const test_entry_t pool_entries[] = {
     { "pool/destroy_when_uninit",   test_destroy_when_uninit,   NULL, NULL },
     { "pool/dispatch_n_multi_grow", test_dispatch_n_multi_grow, NULL, NULL },
     { "pool/dispatch_n_exact_cap",  test_dispatch_n_exact_cap,  NULL, NULL },
+#if defined(__linux__)
+    { "pool/epoll_sel_cap_growth",  test_epoll_sel_cap_growth,  NULL, NULL },
+    { "pool/epoll_hup_branch",      test_epoll_hup_branch,      NULL, NULL },
+    { "pool/epoll_hup_no_errfn",    test_epoll_hup_no_errfn,    NULL, NULL },
+#endif
     { NULL, NULL, NULL, NULL },
 };
 

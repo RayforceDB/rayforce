@@ -3506,6 +3506,501 @@ static test_result_t test_ipc_handshake_version_mismatch(void) {
     PASS();
 }
 
+/* ---- test_col_save_load_bool_u8_i16 --------------------------------------- */
+/* Covers is_serializable_type arms for RAY_BOOL / RAY_U8 / RAY_I16 and their
+ * col_save / col_load round-trip. */
+static test_result_t test_col_save_load_bool_u8_i16(void) {
+    /* RAY_BOOL */
+    {
+        bool raw[] = {true, false, true, true, false};
+        ray_t* vec = ray_vec_from_raw(RAY_BOOL, raw, 5);
+        TEST_ASSERT_NOT_NULL(vec);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+
+        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        TEST_ASSERT_EQ_I(err, RAY_OK);
+
+        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_NOT_NULL(loaded);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_EQ_I(loaded->type, RAY_BOOL);
+        TEST_ASSERT_EQ_I(loaded->len, 5);
+        bool* ld = (bool*)ray_data(loaded);
+        TEST_ASSERT_TRUE(ld[0]);
+        TEST_ASSERT_FALSE(ld[1]);
+        TEST_ASSERT_TRUE(ld[2]);
+        ray_release(loaded);
+
+        ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+        TEST_ASSERT_NOT_NULL(mapped);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+        TEST_ASSERT_EQ_I(mapped->type, RAY_BOOL);
+        TEST_ASSERT_EQ_I(mapped->len, 5);
+        ray_release(mapped);
+        ray_release(vec);
+        unlink(TMP_COL_PATH);
+    }
+    /* RAY_U8 */
+    {
+        uint8_t raw[] = {10, 20, 30};
+        ray_t* vec = ray_vec_from_raw(RAY_U8, raw, 3);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+
+        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        TEST_ASSERT_EQ_I(err, RAY_OK);
+
+        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_EQ_I(loaded->type, RAY_U8);
+        TEST_ASSERT_EQ_I(loaded->len, 3);
+        uint8_t* ld = (uint8_t*)ray_data(loaded);
+        TEST_ASSERT_EQ_I(ld[0], 10);
+        TEST_ASSERT_EQ_I(ld[1], 20);
+        TEST_ASSERT_EQ_I(ld[2], 30);
+        ray_release(loaded);
+        ray_release(vec);
+        unlink(TMP_COL_PATH);
+    }
+    /* RAY_I16 */
+    {
+        int16_t raw[] = {-100, 0, 200};
+        ray_t* vec = ray_vec_from_raw(RAY_I16, raw, 3);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+
+        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        TEST_ASSERT_EQ_I(err, RAY_OK);
+
+        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_EQ_I(loaded->type, RAY_I16);
+        TEST_ASSERT_EQ_I(loaded->len, 3);
+        int16_t* ld = (int16_t*)ray_data(loaded);
+        TEST_ASSERT_EQ_I(ld[0], -100);
+        TEST_ASSERT_EQ_I(ld[1], 0);
+        TEST_ASSERT_EQ_I(ld[2], 200);
+        ray_release(loaded);
+        ray_release(vec);
+        unlink(TMP_COL_PATH);
+    }
+    PASS();
+}
+
+/* ---- test_col_save_load_date_time_timestamp ------------------------------ */
+/* Covers RAY_DATE / RAY_TIME / RAY_TIMESTAMP save/load arms. */
+static test_result_t test_col_save_load_date_time_timestamp(void) {
+    /* RAY_DATE */
+    {
+        int32_t raw[] = {100, 200, 300};
+        ray_t* vec = ray_vec_from_raw(RAY_DATE, raw, 3);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        TEST_ASSERT_EQ_I(err, RAY_OK);
+        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_EQ_I(loaded->type, RAY_DATE);
+        TEST_ASSERT_EQ_I(loaded->len, 3);
+        ray_release(loaded);
+        ray_release(vec);
+        unlink(TMP_COL_PATH);
+    }
+    /* RAY_TIME */
+    {
+        int64_t raw[] = {0, 3600000000000LL, 7200000000000LL};
+        ray_t* vec = ray_vec_from_raw(RAY_TIME, raw, 3);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        TEST_ASSERT_EQ_I(err, RAY_OK);
+        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_EQ_I(loaded->type, RAY_TIME);
+        TEST_ASSERT_EQ_I(loaded->len, 3);
+        ray_release(loaded);
+        ray_release(vec);
+        unlink(TMP_COL_PATH);
+    }
+    /* RAY_TIMESTAMP */
+    {
+        int64_t raw[] = {1000000000000LL, 2000000000000LL};
+        ray_t* vec = ray_vec_from_raw(RAY_TIMESTAMP, raw, 2);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+        ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+        TEST_ASSERT_EQ_I(err, RAY_OK);
+        ray_t* loaded = ray_col_load(TMP_COL_PATH);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+        TEST_ASSERT_EQ_I(loaded->type, RAY_TIMESTAMP);
+        TEST_ASSERT_EQ_I(loaded->len, 2);
+        ray_release(loaded);
+        ray_release(vec);
+        unlink(TMP_COL_PATH);
+    }
+    PASS();
+}
+
+/* ---- test_col_sym_w32_roundtrip ----------------------------------------- */
+/* Covers validate_sym_bounds W32 arm (currently 0 coverage). */
+static test_result_t test_col_sym_w32_roundtrip(void) {
+    /* Intern enough symbols */
+    ray_sym_intern("w32_a", 5);
+    ray_sym_intern("w32_b", 5);
+    ray_sym_intern("w32_c", 5);
+    uint32_t sc = ray_sym_count();
+    TEST_ASSERT((sc) >= (3), "sc >= 3");
+
+    /* Build a W32 RAY_SYM column with valid indices */
+    ray_t* vec = ray_sym_vec_new(RAY_SYM_W32, 3);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec->len = 3;
+    uint32_t* data = (uint32_t*)ray_data(vec);
+    data[0] = 0; data[1] = 1; data[2] = 2;
+
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(loaded->len, 3);
+    TEST_ASSERT_EQ_U(loaded->attrs & RAY_SYM_W_MASK, RAY_SYM_W32);
+
+    uint32_t* ld = (uint32_t*)ray_data(loaded);
+    TEST_ASSERT_EQ_I(ld[0], 0);
+    TEST_ASSERT_EQ_I(ld[1], 1);
+    TEST_ASSERT_EQ_I(ld[2], 2);
+    ray_release(loaded);
+
+    /* Out-of-range W32 index should be rejected on load */
+    data[1] = sc + 100;
+    err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* bad = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+    TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+    ray_release(bad);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_save_load_empty --------------------------------------------- */
+/* Covers 0-length vector save/load to hit the `data_size == 0` branch. */
+static test_result_t test_col_save_load_empty(void) {
+    ray_t* vec = ray_vec_new(RAY_I64, 0);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_I64);
+    TEST_ASSERT_EQ_I(loaded->len, 0);
+    ray_release(loaded);
+
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(mapped);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    TEST_ASSERT_EQ_I(mapped->len, 0);
+    ray_release(mapped);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_validate_mapped_bad_type ----------------------------------- */
+/* Covers col_validate_mapped: invalid type in header triggers "nyi" error. */
+static test_result_t test_col_validate_mapped_bad_type(void) {
+    /* Write a 32-byte file with type=RAY_ERROR (127) in byte 18 */
+    FILE* f = fopen(TMP_COL_PATH, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    uint8_t hdr[32];
+    memset(hdr, 0, 32);
+    hdr[18] = 127;    /* type = RAY_ERROR -- not in serializable allowlist */
+    hdr[19] = 0;      /* attrs */
+    /* rc=1 at bytes 20-23 */
+    hdr[20] = 1;
+    /* len=0 at bytes 24-31 */
+    fwrite(hdr, 1, 32, f);
+    fclose(f);
+
+    /* Both load and mmap should fail; mmap uses col_validate_mapped */
+    ray_t* result = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    /* "nyi" from col_validate_mapped invalid type branch */
+    TEST_ASSERT_STR_EQ(ray_err_code(result), "nyi");
+    ray_release(result);
+
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_validate_mapped_neg_len ------------------------------------- */
+/* Covers col_validate_mapped: negative len in header => "corrupt". */
+static test_result_t test_col_validate_mapped_neg_len(void) {
+    FILE* f = fopen(TMP_COL_PATH, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    uint8_t hdr[32];
+    memset(hdr, 0, 32);
+    hdr[18] = RAY_I64;  /* valid type */
+    hdr[19] = 0;
+    hdr[20] = 1;        /* rc = 1 */
+    /* len = -1 at bytes 24-31 as little-endian int64 */
+    int64_t neg = -1;
+    memcpy(hdr + 24, &neg, 8);
+    fwrite(hdr, 1, 32, f);
+    fclose(f);
+
+    ray_t* result = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_STR_EQ(ray_err_code(result), "corrupt");
+    ray_release(result);
+
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_validate_mapped_data_truncated ----------------------------- */
+/* Covers col_validate_mapped: data region extends beyond file => "corrupt". */
+static test_result_t test_col_validate_mapped_data_truncated(void) {
+    FILE* f = fopen(TMP_COL_PATH, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    uint8_t hdr[40];  /* 32-byte header + 8 bytes of data (but claim 10 I64 elems) */
+    memset(hdr, 0, 40);
+    hdr[18] = RAY_I64;  /* esz = 8 */
+    hdr[20] = 1;        /* rc = 1 */
+    int64_t len = 10;   /* 10 * 8 = 80 bytes needed, but only 8 written => truncated */
+    memcpy(hdr + 24, &len, 8);
+    fwrite(hdr, 1, 40, f);  /* 40 bytes total, needs 32+80=112 */
+    fclose(f);
+
+    ray_t* result = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_STR_EQ(ray_err_code(result), "corrupt");
+    ray_release(result);
+
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_mmap_size_mismatch ---------------------------------------- */
+/* Covers ray_col_mmap: file size != expected (32 + data + bitmap) => "io". */
+static test_result_t test_col_mmap_size_mismatch(void) {
+    /* Save a valid I64 column, then append a junk byte to break the size check */
+    int64_t raw[] = {1, 2, 3};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    ray_release(vec);
+
+    /* Append one extra byte to break the exact-size check in ray_col_mmap */
+    FILE* f = fopen(TMP_COL_PATH, "ab");
+    TEST_ASSERT_NOT_NULL(f);
+    uint8_t extra = 0xAB;
+    fwrite(&extra, 1, 1, f);
+    fclose(f);
+
+    /* ray_col_load should still succeed (it re-validates differently) */
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_release(loaded);
+
+    /* ray_col_mmap should fail: size mismatch */
+    ray_t* result = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_STR_EQ(ray_err_code(result), "io");
+    ray_release(result);
+
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_recursive_atoms ------------------------------------------- */
+/* Covers col_write_recursive and col_read_recursive atom paths (type < 0):
+ * a RAY_LIST containing non-str atoms goes through the "fixed atom" branch. */
+static test_result_t test_col_recursive_atoms(void) {
+    /* Build a list with a mix: i64 atom + str atom */
+    ray_t* list = ray_list_new(3);
+    TEST_ASSERT_NOT_NULL(list);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(list));
+
+    ray_t* a_i64 = ray_i64(42);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a_i64));
+    ray_t* a_str = ray_str("hello", 5);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a_str));
+    ray_t* a_bool = ray_bool(true);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a_bool));
+
+    list = ray_list_append(list, a_i64);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(list));
+    list = ray_list_append(list, a_str);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(list));
+    list = ray_list_append(list, a_bool);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(list));
+
+    /* is_str_list returns false (mixed types) => goes through col_save_list
+     * which calls col_write_recursive with atom elements */
+    ray_err_t err = ray_col_save(list, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(loaded->len, 3);
+
+    ray_t** slots = (ray_t**)ray_data(loaded);
+    /* First element: i64 atom */
+    TEST_ASSERT_EQ_I(slots[0]->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(slots[0]->i64, 42);
+    /* Second element: str atom */
+    TEST_ASSERT_EQ_I(slots[1]->type, -RAY_STR);
+    /* Third element: bool atom */
+    TEST_ASSERT_EQ_I(slots[2]->type, -RAY_BOOL);
+
+    ray_release(loaded);
+    ray_release(a_i64);
+    ray_release(a_str);
+    ray_release(a_bool);
+    ray_release(list);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_recursive_sym_in_list -------------------------------------- */
+/* Covers col_write_recursive and col_read_recursive: RAY_SYM vector inside a
+ * generic list exercises the "type == RAY_SYM" attrs branch. */
+static test_result_t test_col_recursive_sym_in_list(void) {
+    ray_sym_intern("rsl_x", 5);
+    ray_sym_intern("rsl_y", 5);
+    uint32_t sc = ray_sym_count();
+
+    /* Build W8 sym column */
+    ray_t* sym_vec = ray_sym_vec_new(RAY_SYM_W8, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sym_vec));
+    sym_vec->len = 2;
+    uint8_t* sd = (uint8_t*)ray_data(sym_vec);
+    sd[0] = 0; sd[1] = 1;
+
+    /* Wrap in a list (not is_str_list, so uses col_save_list -> col_write_recursive) */
+    ray_t* list = ray_list_new(1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(list));
+    list = ray_list_append(list, sym_vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(list));
+
+    ray_err_t err = ray_col_save(list, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(loaded->len, 1);
+
+    ray_t** slots = (ray_t**)ray_data(loaded);
+    TEST_ASSERT_EQ_I(slots[0]->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(slots[0]->len, 2);
+    TEST_ASSERT_EQ_U(slots[0]->attrs & RAY_SYM_W_MASK, RAY_SYM_W8);
+
+    ray_release(loaded);
+    ray_release(sym_vec);
+    ray_release(list);
+    unlink(TMP_COL_PATH);
+    (void)sc;
+    PASS();
+}
+
+/* ---- test_col_validate_mapped_bitmap_truncated --------------------------- */
+/* Covers col_validate_mapped: ext_nullmap bitmap extends beyond file => corrupt. */
+static test_result_t test_col_validate_mapped_bitmap_truncated(void) {
+    /* Write a valid-looking I64 header claiming HAS_NULLS + NULLMAP_EXT,
+     * with len=16 (bitmap = 2 bytes needed) but only write 1 byte of bitmap. */
+    FILE* f = fopen(TMP_COL_PATH, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+
+    uint8_t hdr[32];
+    memset(hdr, 0, 32);
+    hdr[18] = RAY_I64;                               /* type */
+    hdr[19] = RAY_ATTR_HAS_NULLS | RAY_ATTR_NULLMAP_EXT; /* attrs */
+    hdr[20] = 1;                                     /* rc = 1 */
+    int64_t len = 16;
+    memcpy(hdr + 24, &len, 8);
+
+    /* Write header + data (16 * 8 = 128 bytes) + 1 byte bitmap (need 2) */
+    fwrite(hdr, 1, 32, f);
+    uint8_t data[128];
+    memset(data, 0, 128);
+    fwrite(data, 1, 128, f);
+    uint8_t bitmap_byte = 0xFF;
+    fwrite(&bitmap_byte, 1, 1, f);  /* write only 1 of the 2 needed bitmap bytes */
+    fclose(f);
+
+    ray_t* result = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_STR_EQ(ray_err_code(result), "corrupt");
+    ray_release(result);
+
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
+/* ---- test_col_sym_w64_negative_index ------------------------------------- */
+/* Covers validate_sym_bounds W64 negative-index branch (p[i] < 0). */
+static test_result_t test_col_sym_w64_negative_index(void) {
+    ray_sym_intern("w64_a", 5);
+    ray_sym_intern("w64_b", 5);
+    uint32_t sc = ray_sym_count();
+    TEST_ASSERT((sc) >= (2), "sc >= 2");
+
+    /* Build a W64 RAY_SYM column with a negative index */
+    ray_t* vec = ray_sym_vec_new(RAY_SYM_W64, 3);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+    vec->len = 3;
+    int64_t* data = (int64_t*)ray_data(vec);
+    data[0] = 0; data[1] = 1; data[2] = -1;  /* -1 is invalid */
+
+    /* Bypass normal save (which would reject via validate) by writing raw bytes.
+     * We save with sym_count=0 trick: temporarily save a zero-count column
+     * that won't be validated, then patch the file. */
+    /* Simpler: save valid column first to establish file, then corrupt index */
+    data[2] = 0;  /* make it valid for save */
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    /* Now patch byte at offset 32 + 2*8 = 48 to be 0xFF (represents -1 as int64 MSB) */
+    FILE* f = fopen(TMP_COL_PATH, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    /* data[2] is at offset 32 + 16 bytes = 48; set it to -1 */
+    fseek(f, 32 + 16, SEEK_SET);
+    int64_t neg = -1LL;
+    fwrite(&neg, 8, 1, f);
+    fclose(f);
+
+    /* Load should fail with "corrupt" since p[i] < 0 in W64 branch */
+    ray_t* bad = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+    TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+    ray_release(bad);
+
+    bad = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(bad));
+    TEST_ASSERT_STR_EQ(ray_err_code(bad), "corrupt");
+    ray_release(bad);
+
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    (void)sc;
+    PASS();
+}
+
 const test_entry_t store_entries[] = {
     { "store/col_mmap_i64", test_col_mmap_i64, store_setup, store_teardown },
     { "store/col_mmap_f64", test_col_mmap_f64, store_setup, store_teardown },
@@ -3525,6 +4020,18 @@ const test_entry_t store_entries[] = {
     { "store/col_save_load_str", test_col_save_load_str, store_setup, store_teardown },
     { "store/col_save_load_list", test_col_save_load_list, store_setup, store_teardown },
     { "store/col_save_load_table", test_col_save_load_table, store_setup, store_teardown },
+    { "store/col_save_load_bool_u8_i16", test_col_save_load_bool_u8_i16, store_setup, store_teardown },
+    { "store/col_save_load_date_time_ts", test_col_save_load_date_time_timestamp, store_setup, store_teardown },
+    { "store/col_sym_w32_roundtrip", test_col_sym_w32_roundtrip, store_setup, store_teardown },
+    { "store/col_save_load_empty", test_col_save_load_empty, store_setup, store_teardown },
+    { "store/col_validate_bad_type", test_col_validate_mapped_bad_type, store_setup, store_teardown },
+    { "store/col_validate_neg_len", test_col_validate_mapped_neg_len, store_setup, store_teardown },
+    { "store/col_validate_data_trunc", test_col_validate_mapped_data_truncated, store_setup, store_teardown },
+    { "store/col_mmap_size_mismatch", test_col_mmap_size_mismatch, store_setup, store_teardown },
+    { "store/col_recursive_atoms", test_col_recursive_atoms, store_setup, store_teardown },
+    { "store/col_recursive_sym_in_list", test_col_recursive_sym_in_list, store_setup, store_teardown },
+    { "store/col_validate_bitmap_trunc", test_col_validate_mapped_bitmap_truncated, store_setup, store_teardown },
+    { "store/col_sym_w64_neg_index", test_col_sym_w64_negative_index, store_setup, store_teardown },
     { "store/file_open_close", test_file_open_close, store_setup, store_teardown },
     { "store/file_lock_unlock", test_file_lock_unlock, store_setup, store_teardown },
     { "store/file_sync", test_file_sync_op, store_setup, store_teardown },
