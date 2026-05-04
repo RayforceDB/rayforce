@@ -968,12 +968,19 @@ static inline void par_set_null(ray_t* vec, int64_t idx) {
                       (uint8_t)(1u << bit_idx), __ATOMIC_RELAXED);
 }
 
-/* Pre-allocate external nullmap so parallel threads can set bits safely. */
+/* Pre-allocate external nullmap so parallel threads can set bits safely.
+ *
+ * Probe at idx>=128 (not idx=0): ray_vec_set_null_checked(vec, 0, true)
+ * stays in the inline-nullmap path because the inline 16-byte bitmap
+ * fits idx<128 — so it never promotes to ext_nullmap.  par_set_null
+ * for idx>=128 would then race-crash on lazy ext alloc.  Probing at
+ * len-1 forces the promotion path. */
 static inline ray_err_t par_prepare_nullmap(ray_t* vec) {
     if (vec->len <= 128) return RAY_OK;
-    ray_err_t err = ray_vec_set_null_checked(vec, 0, true);
+    int64_t probe = vec->len - 1;  /* >= 128, forces ext promotion */
+    ray_err_t err = ray_vec_set_null_checked(vec, probe, true);
     if (err != RAY_OK) return err;
-    ray_vec_set_null_checked(vec, 0, false);
+    ray_vec_set_null_checked(vec, probe, false);
     vec->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
     return RAY_OK;
 }
