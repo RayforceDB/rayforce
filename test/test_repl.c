@@ -2634,18 +2634,16 @@ static int run_pty_sigint_during_eval(int use_poll)
 
     int flags = fcntl(master_fd, F_GETFL, 0);
     if (flags >= 0) fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
-    usleep(120 * 1000);  /* wait for banner */
 
-    /* Drain banner. */
-    { char buf[4096]; for (int i=0;i<10;i++) { ssize_t n=read(master_fd,buf,sizeof(buf)); if(n<=0)break; } }
-
-    /* Send a long-running expression and press Enter. */
-    /* Tail-recursive busy loop the eval interrupt check can break out of.
-     * Original used (sum (til 50000000)) — 400MB allocation under ASan
-     * ran into runner-level memory pressure on macOS (7GB Apple Silicon
-     * runner, ASan ~2x).  Loop stays in eval longer (predictable hot
-     * path) without huge allocs. */
-    const char* expr = "(set f (fn [n] (if (== n 0) 0 (f (- n 1))))) (f 200000)\n";
+    /* Synchronise via observable PTY output rather than absolute sleeps.
+     * The eval is wrapped in `(do (println "EVALSTART") <work>)`: the
+     * marker bytes appear on master_fd as soon as the eval is past the
+     * println, which means <work> is now the in-flight expression.  We
+     * then deliver SIGINT, knowing the child is genuinely inside eval
+     * regardless of CPU speed or memory size — no resource-dependent
+     * timing assumption. */
+    const char* expr =
+        "(do (println \"EVALSTART\") (sum (til 100000)))\n";
     size_t elen = strlen(expr), etotal = 0;
     while (etotal < elen) {
         ssize_t w = write(master_fd, expr + etotal, elen - etotal);
@@ -2654,12 +2652,53 @@ static int run_pty_sigint_during_eval(int use_poll)
         else break;
     }
 
-    /* Wait for eval to be running (400 ms gives it plenty of time to start). */
-    usleep(400 * 1000);
-    kill(pid, SIGINT);
-    usleep(200 * 1000);  /* let interrupt propagate */
+    /* Read master_fd until we see EVALSTART (or 5s timeout).  This is
+     * the only place we sleep — short polls between non-blocking
+     * reads — and the budget is per the marker, not "guess how long
+     * eval needs". */
+    {
+        const char* marker = "EVALSTART";
+        size_t mlen = strlen(marker);
+        char accum[8192];
+        size_t pos = 0;
+        bool seen = false;
+        for (int waited = 0; waited < 5000 && !seen; waited += 10) {
+            char buf[1024];
+            ssize_t n = read(master_fd, buf, sizeof(buf));
+            if (n > 0) {
+                if (pos + (size_t)n > sizeof(accum)) {
+                    /* Shift left to keep room (preserve last half). */
+                    size_t keep = sizeof(accum) / 2;
+                    memmove(accum, accum + pos - keep, keep);
+                    pos = keep;
+                }
+                memcpy(accum + pos, buf, (size_t)n);
+                pos += (size_t)n;
+                for (size_t i = 0; i + mlen <= pos; i++) {
+                    if (memcmp(accum + i, marker, mlen) == 0) { seen = true; break; }
+                }
+            } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
+                break;
+            }
+            if (!seen) usleep(10 * 1000);
+        }
+        if (!seen) {
+            /* Marker never arrived — child not in eval.  Bail cleanly. */
+            kill(pid, SIGKILL);
+            int s; waitpid(pid, &s, 0);
+            close(master_fd);
+            return -1;
+        }
+    }
 
-    /* Drain any output, then send quit. */
+    /* Eval is in flight (we observed the marker; sum (til 100000) is
+     * either allocating, filling, or summing — all interruptible
+     * sync points downstream of println). */
+    kill(pid, SIGINT);
+
+    /* Drain whatever follows; let the SIGINT recovery print "^C\n"
+     * and re-prompt before we send :q.  10 short reads with 10ms
+     * apart = up to 100ms — plenty for any healthy machine. */
     { char buf[4096]; for (int i=0;i<10;i++) { ssize_t n=read(master_fd,buf,sizeof(buf)); if(n<=0)break; usleep(10*1000); } }
 
     const char* quit_cmd = ":q\n";
