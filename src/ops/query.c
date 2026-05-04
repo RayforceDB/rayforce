@@ -2055,11 +2055,17 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                             const char* sb = (const char*)ray_data(sc);
                             char* db = (char*)ray_data(dst);
                             bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
-                            for (int64_t gi = 0; gi < ngroups; gi++) {
-                                memcpy(db + (size_t)gi * esz,
-                                       sb + (size_t)fi[gi] * esz, esz);
-                                if (src_has_nulls && ray_vec_is_null(sc, fi[gi]))
-                                    ray_vec_set_null(dst, gi, true);
+                            if (src_has_nulls) {
+                                for (int64_t gi = 0; gi < ngroups; gi++) {
+                                    memcpy(db + (size_t)gi * esz,
+                                           sb + (size_t)fi[gi] * esz, esz);
+                                    if (ray_vec_is_null(sc, fi[gi]))
+                                        ray_vec_set_null(dst, gi, true);
+                                }
+                            } else {
+                                for (int64_t gi = 0; gi < ngroups; gi++)
+                                    memcpy(db + (size_t)gi * esz,
+                                           sb + (size_t)fi[gi] * esz, esz);
                             }
                         }
                     } else {
@@ -2070,11 +2076,17 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                             const char* sb = (const char*)ray_data(sc);
                             char* db = (char*)ray_data(dst);
                             bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
-                            for (int64_t gi = 0; gi < ngroups; gi++) {
-                                memcpy(db + (size_t)gi * esz,
-                                       sb + (size_t)fi[gi] * esz, esz);
-                                if (src_has_nulls && ray_vec_is_null(sc, fi[gi]))
-                                    ray_vec_set_null(dst, gi, true);
+                            if (src_has_nulls) {
+                                for (int64_t gi = 0; gi < ngroups; gi++) {
+                                    memcpy(db + (size_t)gi * esz,
+                                           sb + (size_t)fi[gi] * esz, esz);
+                                    if (ray_vec_is_null(sc, fi[gi]))
+                                        ray_vec_set_null(dst, gi, true);
+                                }
+                            } else {
+                                for (int64_t gi = 0; gi < ngroups; gi++)
+                                    memcpy(db + (size_t)gi * esz,
+                                           sb + (size_t)fi[gi] * esz, esz);
                             }
                         }
                     }
@@ -2369,12 +2381,20 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                     if (sc->type == RAY_STR) {
                         dst = ray_vec_new(RAY_STR, n_groups);
                         bool src_has_nulls = (sc->attrs & RAY_ATTR_HAS_NULLS) != 0;
-                        for (int64_t gi = 0; gi < n_groups && dst && !RAY_IS_ERR(dst); gi++) {
-                            if (src_has_nulls && ray_vec_is_null(sc, fi[gi])) {
-                                dst = ray_str_vec_append(dst, "", 0);
-                                if (dst && !RAY_IS_ERR(dst))
-                                    ray_vec_set_null(dst, dst->len - 1, true);
-                            } else {
+                        if (src_has_nulls) {
+                            for (int64_t gi = 0; gi < n_groups && dst && !RAY_IS_ERR(dst); gi++) {
+                                if (ray_vec_is_null(sc, fi[gi])) {
+                                    dst = ray_str_vec_append(dst, "", 0);
+                                    if (dst && !RAY_IS_ERR(dst))
+                                        ray_vec_set_null(dst, dst->len - 1, true);
+                                } else {
+                                    size_t slen = 0;
+                                    const char* sp = ray_str_vec_get(sc, fi[gi], &slen);
+                                    dst = ray_str_vec_append(dst, sp ? sp : "", sp ? slen : 0);
+                                }
+                            }
+                        } else {
+                            for (int64_t gi = 0; gi < n_groups && dst && !RAY_IS_ERR(dst); gi++) {
                                 size_t slen = 0;
                                 const char* sp = ray_str_vec_get(sc, fi[gi], &slen);
                                 dst = ray_str_vec_append(dst, sp ? sp : "", sp ? slen : 0);
@@ -2931,13 +2951,22 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
 
             if (grp_key_col) {
                 bool gk_has_nulls = (grp_key_col->attrs & RAY_ATTR_HAS_NULLS) != 0;
-                for (int64_t gi = 0; gi < n_groups; gi++) {
-                    if (kt == RAY_F64)
-                        memcpy(&gk_vals[gi], &((double*)ray_data(grp_key_col))[gi], 8);
-                    else
-                        gk_vals[gi] = read_col_i64(ray_data(grp_key_col), gi, kt, grp_key_col->attrs);
-                    if (gk_has_nulls && ray_vec_is_null(grp_key_col, gi))
-                        gk_null[gi] = 1;
+                if (gk_has_nulls) {
+                    for (int64_t gi = 0; gi < n_groups; gi++) {
+                        if (kt == RAY_F64)
+                            memcpy(&gk_vals[gi], &((double*)ray_data(grp_key_col))[gi], 8);
+                        else
+                            gk_vals[gi] = read_col_i64(ray_data(grp_key_col), gi, kt, grp_key_col->attrs);
+                        if (ray_vec_is_null(grp_key_col, gi))
+                            gk_null[gi] = 1;
+                    }
+                } else {
+                    for (int64_t gi = 0; gi < n_groups; gi++) {
+                        if (kt == RAY_F64)
+                            memcpy(&gk_vals[gi], &((double*)ray_data(grp_key_col))[gi], 8);
+                        else
+                            gk_vals[gi] = read_col_i64(ray_data(grp_key_col), gi, kt, grp_key_col->attrs);
+                    }
                 }
             }
             ray_release(grouped); /* grp_key_col is now invalid */
@@ -3285,10 +3314,15 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                                 char* src = (char*)ray_data(col);
                                 char* dst = (char*)ray_data(new_col);
                                 bool has_nulls = (col->attrs & RAY_ATTR_HAS_NULLS) != 0;
-                                for (int64_t r = 0; r < nrows_r; r++) {
-                                    memcpy(dst + r * esz, src + (nrows_r - 1 - r) * esz, esz);
-                                    if (has_nulls && ray_vec_is_null(col, nrows_r - 1 - r))
-                                        ray_vec_set_null(new_col, r, true);
+                                if (has_nulls) {
+                                    for (int64_t r = 0; r < nrows_r; r++) {
+                                        memcpy(dst + r * esz, src + (nrows_r - 1 - r) * esz, esz);
+                                        if (ray_vec_is_null(col, nrows_r - 1 - r))
+                                            ray_vec_set_null(new_col, r, true);
+                                    }
+                                } else {
+                                    for (int64_t r = 0; r < nrows_r; r++)
+                                        memcpy(dst + r * esz, src + (nrows_r - 1 - r) * esz, esz);
                                 }
                                 reordered = ray_table_add_col(reordered, cn, new_col);
                                 ray_release(new_col);

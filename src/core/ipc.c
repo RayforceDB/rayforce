@@ -27,6 +27,7 @@
 
 #include "core/ipc.h"
 #include "mem/sys.h"
+#include "ops/ops.h"
 #include "store/journal.h"
 #include <string.h>
 #include <stdio.h>
@@ -1138,35 +1139,46 @@ void ray_ipc_close(int64_t handle)
 
 ray_t* ray_ipc_send(int64_t handle, ray_t* msg)
 {
+    bool owned = false;
+    if (ray_is_lazy(msg)) {
+        msg = ray_lazy_materialize(msg);
+        if (RAY_IS_ERR(msg)) return msg;
+        owned = true;
+    }
     { int64_t sr = client_send_msg(handle, msg, RAY_IPC_MSG_SYNC, 0);
-      if (sr == -2) return ray_error("io", "connection closed");
-      if (sr < 0) return ray_error("io", "ipc send failed"); }
+      if (sr == -2) { if (owned) ray_release(msg); return ray_error("io", "connection closed"); }
+      if (sr < 0)  { if (owned) ray_release(msg); return ray_error("io", "ipc send failed"); } }
 
     ray_sock_t fd = g_client_fds[handle];
 
     ray_ipc_header_t hdr;
     if (recv_full(fd, &hdr, sizeof(hdr)) < 0) {
         ray_ipc_close(handle);
+        if (owned) ray_release(msg);
         return ray_error("io", "ipc recv header failed");
     }
     if (hdr.prefix != RAY_SERDE_PREFIX || hdr.size <= 0) {
         ray_ipc_close(handle);
+        if (owned) ray_release(msg);
         return ray_error("io", "ipc bad response header");
     }
     if (hdr.version != RAY_SERDE_WIRE_VERSION) {
         ray_ipc_close(handle);
+        if (owned) ray_release(msg);
         return ray_error("version", "ipc peer wire version mismatch");
     }
     if (hdr.size > 256 * 1024 * 1024) {
         ray_ipc_close(handle);
+        if (owned) ray_release(msg);
         return ray_error("io", "ipc response too large");
     }
 
     uint8_t* payload = (uint8_t*)ray_sys_alloc((size_t)hdr.size);
-    if (!payload) return ray_error("oom", NULL);
+    if (!payload) { if (owned) ray_release(msg); return ray_error("oom", NULL); }
     if (recv_full(fd, payload, (size_t)hdr.size) < 0) {
         ray_sys_free(payload);
         ray_ipc_close(handle);
+        if (owned) ray_release(msg);
         return ray_error("io", "ipc recv payload failed");
     }
 
@@ -1175,16 +1187,17 @@ ray_t* ray_ipc_send(int64_t handle, ray_t* msg)
     uint8_t* decompressed  = NULL;
 
     if (hdr.flags & RAY_IPC_FLAG_COMPRESSED) {
-        if (deser_len < 4) { ray_sys_free(payload); return ray_error("io", "ipc compressed payload too short"); }
+        if (deser_len < 4) { ray_sys_free(payload); if (owned) ray_release(msg); return ray_error("io", "ipc compressed payload too short"); }
         uint32_t uncomp_size;
         memcpy(&uncomp_size, payload, 4);
         decompressed = (uint8_t*)ray_sys_alloc(uncomp_size);
-        if (!decompressed) { ray_sys_free(payload); return ray_error("oom", NULL); }
+        if (!decompressed) { ray_sys_free(payload); if (owned) ray_release(msg); return ray_error("oom", NULL); }
         size_t dlen = ray_ipc_decompress(payload + 4, deser_len - 4,
                                          decompressed, uncomp_size);
         if (dlen != uncomp_size) {
             ray_sys_free(decompressed);
             ray_sys_free(payload);
+            if (owned) ray_release(msg);
             return ray_error("io", "ipc decompress failed");
         }
         deser_buf = decompressed;
@@ -1196,15 +1209,27 @@ ray_t* ray_ipc_send(int64_t handle, ray_t* msg)
 
     if (decompressed) ray_sys_free(decompressed);
     ray_sys_free(payload);
+    if (owned) ray_release(msg);
 
     return result ? result : RAY_NULL_OBJ;
 }
 
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
 {
-    if (client_send_msg(handle, msg, RAY_IPC_MSG_ASYNC, 0) < 0)
-        return RAY_ERR_IO;
-    return RAY_OK;
+    bool owned = false;
+    if (ray_is_lazy(msg)) {
+        msg = ray_lazy_materialize(msg);
+        if (RAY_IS_ERR(msg)) {
+            ray_err_t code = ray_err_from_obj(msg);
+            ray_error_free(msg);
+            return code;
+        }
+        owned = true;
+    }
+    ray_err_t rc = (client_send_msg(handle, msg, RAY_IPC_MSG_ASYNC, 0) < 0)
+                   ? RAY_ERR_IO : RAY_OK;
+    if (owned) ray_release(msg);
+    return rc;
 }
 
 /* Verbose-eval client send: sets RAY_IPC_FLAG_VERBOSE on the
@@ -1214,36 +1239,47 @@ ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
  * otherwise — sync, blocking until response. */
 ray_t* ray_ipc_send_verbose(int64_t handle, ray_t* msg)
 {
+    bool owned = false;
+    if (ray_is_lazy(msg)) {
+        msg = ray_lazy_materialize(msg);
+        if (RAY_IS_ERR(msg)) return msg;
+        owned = true;
+    }
     { int64_t sr = client_send_msg(handle, msg, RAY_IPC_MSG_SYNC,
                                    RAY_IPC_FLAG_VERBOSE);
-      if (sr == -2) return ray_error("io", "connection closed");
-      if (sr < 0) return ray_error("io", "ipc send failed"); }
+      if (sr == -2) { if (owned) ray_release(msg); return ray_error("io", "connection closed"); }
+      if (sr < 0)  { if (owned) ray_release(msg); return ray_error("io", "ipc send failed"); } }
 
     ray_sock_t fd = g_client_fds[handle];
 
     ray_ipc_header_t hdr;
     if (recv_full(fd, &hdr, sizeof(hdr)) < 0) {
         ray_ipc_close(handle);
+        if (owned) ray_release(msg);
         return ray_error("io", "ipc recv header failed");
     }
     if (hdr.prefix != RAY_SERDE_PREFIX || hdr.size <= 0) {
         ray_ipc_close(handle);
+        if (owned) ray_release(msg);
         return ray_error("io", "ipc bad response header");
     }
     if (hdr.version != RAY_SERDE_WIRE_VERSION) {
         ray_ipc_close(handle);
+        if (owned) ray_release(msg);
         return ray_error("version", "ipc peer wire version mismatch");
     }
     if (hdr.size > 256 * 1024 * 1024) {
         ray_ipc_close(handle);
+        if (owned) ray_release(msg);
         return ray_error("io", "ipc response too large");
     }
 
     uint8_t* payload = (uint8_t*)ray_sys_alloc((size_t)hdr.size);
-    if (!payload) return ray_error("oom", NULL);
+    if (!payload) { if (owned) ray_release(msg); return ray_error("oom", NULL); }
     if (recv_full(fd, payload, (size_t)hdr.size) < 0) {
         ray_sys_free(payload);
         ray_ipc_close(handle);
+        if (owned) ray_release(msg);
         return ray_error("io", "ipc recv payload failed");
     }
 
@@ -1252,16 +1288,17 @@ ray_t* ray_ipc_send_verbose(int64_t handle, ray_t* msg)
     uint8_t* decompressed = NULL;
 
     if (hdr.flags & RAY_IPC_FLAG_COMPRESSED) {
-        if (deser_len < 4) { ray_sys_free(payload); return ray_error("io", "ipc compressed payload too short"); }
+        if (deser_len < 4) { ray_sys_free(payload); if (owned) ray_release(msg); return ray_error("io", "ipc compressed payload too short"); }
         uint32_t uncomp_size;
         memcpy(&uncomp_size, payload, 4);
         decompressed = (uint8_t*)ray_sys_alloc(uncomp_size);
-        if (!decompressed) { ray_sys_free(payload); return ray_error("oom", NULL); }
+        if (!decompressed) { ray_sys_free(payload); if (owned) ray_release(msg); return ray_error("oom", NULL); }
         size_t dlen = ray_ipc_decompress(payload + 4, deser_len - 4,
                                          decompressed, uncomp_size);
         if (dlen != uncomp_size) {
             ray_sys_free(decompressed);
             ray_sys_free(payload);
+            if (owned) ray_release(msg);
             return ray_error("io", "ipc decompress failed");
         }
         deser_buf = decompressed;
@@ -1273,6 +1310,7 @@ ray_t* ray_ipc_send_verbose(int64_t handle, ray_t* msg)
 
     if (decompressed) ray_sys_free(decompressed);
     ray_sys_free(payload);
+    if (owned) ray_release(msg);
 
     return result ? result : RAY_NULL_OBJ;
 }

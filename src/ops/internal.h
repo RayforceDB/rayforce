@@ -760,6 +760,14 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input);
 ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input);
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit);
 
+/* ── collection.c ── */
+ray_t* distinct_vec_eager(ray_t* x);
+ray_t* reverse_vec_eager(ray_t* x);
+
+/* ── sort.c ── */
+ray_t* asc_vec_eager(ray_t* x);
+ray_t* desc_vec_eager(ray_t* x);
+
 /* Group HT types and helpers — shared with pivot (exec.c) */
 #define GHT_NEED_SUM   0x01
 #define GHT_NEED_MIN   0x02

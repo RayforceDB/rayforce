@@ -693,12 +693,47 @@ int atom_eq(ray_t* a, ray_t* b) {
 /* Forward declaration */
 ray_t* list_to_typed_vec(ray_t* list, int8_t orig_vec_type);
 
+/* Eager vector dedup — called by the DAG executor's OP_DISTINCT case.
+ * Factored out so the executor doesn't go through ray_distinct_fn, which
+ * is now a lazy producer for vectors and would re-wrap into a chain. */
+ray_t* distinct_vec_eager(ray_t* x) {
+    int64_t len = ray_len(x);
+    if (len == 0) { ray_retain(x); return x; }
+
+    int64_t idx_stack[256];
+    int64_t* idx = (len <= 256) ? idx_stack : (int64_t*)ray_sys_alloc((size_t)len * sizeof(int64_t));
+    if (!idx) return ray_error("oom", NULL);
+
+    hashset_t hs;
+    if (!hashset_init(&hs, x, len)) {
+        if (idx != idx_stack) ray_sys_free(idx);
+        return ray_error("oom", NULL);
+    }
+    int64_t count = 0;
+    for (int64_t i = 0; i < len; i++) {
+        if (hashset_insert(&hs, i)) idx[count++] = i;
+    }
+    hashset_destroy(&hs);
+
+    /* Sort unique indices by value for numeric/temporal types — preserves
+     * pre-existing distinct semantics.  qsort-based; was O(count^2). */
+    if (x->type != RAY_SYM && x->type != RAY_GUID && x->type != RAY_STR && count > 1) {
+        distinct_sort_indices(x, idx, count);
+    }
+
+    ray_t* result = gather_by_idx(x, idx, count);
+    if (idx != idx_stack) ray_sys_free(idx);
+    return result;
+}
+
 /* (distinct x) — remove duplicates. Dispatches on type:
  *   table → deduplicate rows (via DAG GROUP with zero aggs)
  *   vector → remove duplicate elements, preserving first occurrence
  *   string → unique chars, sorted */
 ray_t* ray_distinct_fn(ray_t* x) {
-    if (ray_is_lazy(x)) x = ray_lazy_materialize(x);
+    /* Extend an existing lazy chain — must come before the lazy-materialise
+     * guard so the chain is preserved rather than collapsed. */
+    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_DISTINCT);
 
     /* Table distinct: dispatch to table-specific implementation */
     if (x->type == RAY_TABLE)
@@ -723,37 +758,14 @@ ray_t* ray_distinct_fn(ray_t* x) {
         return ray_str(uniq, (size_t)nu);
     }
 
-    /* Typed vector path: deduplicate via hash set in O(n).
-     * The previous nested-loop scan was O(n^2); for a 100k vec it ran
-     * for ~3 minutes. */
+    /* Typed vector path: start a fresh lazy chain.  The DAG executor will
+     * call distinct_vec_eager() when the chain is materialised. */
     if (ray_is_vec(x)) {
-        int64_t len = ray_len(x);
-        if (len == 0) { ray_retain(x); return x; }
-
-        int64_t idx_stack[256];
-        int64_t* idx = (len <= 256) ? idx_stack : (int64_t*)ray_sys_alloc((size_t)len * sizeof(int64_t));
-        if (!idx) return ray_error("oom", NULL);
-
-        hashset_t hs;
-        if (!hashset_init(&hs, x, len)) {
-            if (idx != idx_stack) ray_sys_free(idx);
-            return ray_error("oom", NULL);
-        }
-        int64_t count = 0;
-        for (int64_t i = 0; i < len; i++) {
-            if (hashset_insert(&hs, i)) idx[count++] = i;
-        }
-        hashset_destroy(&hs);
-
-        /* Sort unique indices by value for numeric/temporal types — preserves
-         * pre-existing distinct semantics.  qsort-based; was O(count^2). */
-        if (x->type != RAY_SYM && x->type != RAY_GUID && x->type != RAY_STR && count > 1) {
-            distinct_sort_indices(x, idx, count);
-        }
-
-        ray_t* result = gather_by_idx(x, idx, count);
-        if (idx != idx_stack) ray_sys_free(idx);
-        return result;
+        ray_graph_t* g = ray_graph_new(NULL);
+        if (!g) return ray_error("oom", NULL);
+        ray_op_t* in = ray_graph_input_vec(g, x);
+        ray_op_t* op = ray_distinct_op(g, in);
+        return ray_lazy_wrap(g, op);
     }
 
     ray_t* _bx = NULL;
@@ -921,16 +933,28 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     if (ray_is_vec(vec) && ray_is_atom(val)) {
         int64_t len = vec->len;
         bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) != 0;
-        for (int64_t i = 0; i < len; i++) {
-            if (has_nulls && ray_vec_is_null(vec, i)) {
-                if (RAY_ATOM_IS_NULL(val)) return make_bool(1);
-                continue;
+        bool val_null = RAY_ATOM_IS_NULL(val);
+        if (has_nulls) {
+            for (int64_t i = 0; i < len; i++) {
+                if (ray_vec_is_null(vec, i)) {
+                    if (val_null) return make_bool(1);
+                    continue;
+                }
+                int alloc = 0;
+                ray_t* elem = collection_elem(vec, i, &alloc);
+                int eq = atom_eq(val, elem);
+                if (alloc) ray_release(elem);
+                if (eq) return make_bool(1);
             }
-            int alloc = 0;
-            ray_t* elem = collection_elem(vec, i, &alloc);
-            int eq = atom_eq(val, elem);
-            if (alloc) ray_release(elem);
-            if (eq) return make_bool(1);
+        } else {
+            if (val_null) return make_bool(0); /* no nulls in vec, null val → no match */
+            for (int64_t i = 0; i < len; i++) {
+                int alloc = 0;
+                ray_t* elem = collection_elem(vec, i, &alloc);
+                int eq = atom_eq(val, elem);
+                if (alloc) ray_release(elem);
+                if (eq) return make_bool(1);
+            }
         }
         return make_bool(0);
     }
@@ -1657,17 +1681,29 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
         int64_t len = vec->len;
         bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) != 0;
         bool val_null = RAY_ATOM_IS_NULL(val);
-        for (int64_t i = 0; i < len; i++) {
-            if (has_nulls && ray_vec_is_null(vec, i)) {
-                if (val_null) return make_i64(i);
-                continue;
+        if (has_nulls) {
+            for (int64_t i = 0; i < len; i++) {
+                if (ray_vec_is_null(vec, i)) {
+                    if (val_null) return make_i64(i);
+                    continue;
+                }
+                if (val_null) continue;
+                int alloc = 0;
+                ray_t* elem = collection_elem(vec, i, &alloc);
+                int eq = atom_eq(elem, val);
+                if (alloc) ray_release(elem);
+                if (eq) return make_i64(i);
             }
-            if (val_null) continue;
-            int alloc = 0;
-            ray_t* elem = collection_elem(vec, i, &alloc);
-            int eq = atom_eq(elem, val);
-            if (alloc) ray_release(elem);
-            if (eq) return make_i64(i);
+        } else {
+            if (!val_null) {
+                for (int64_t i = 0; i < len; i++) {
+                    int alloc = 0;
+                    ray_t* elem = collection_elem(vec, i, &alloc);
+                    int eq = atom_eq(elem, val);
+                    if (alloc) ray_release(elem);
+                    if (eq) return make_i64(i);
+                }
+            }
         }
         return ray_typed_null(-RAY_I64);
     }
@@ -1706,21 +1742,18 @@ ray_t* ray_til_fn(ray_t* x) {
     return vec;
 }
 
-/* (reverse vec) — reverse a vector */
-ray_t* ray_reverse_fn(ray_t* x) {
-    if (ray_is_lazy(x)) x = ray_lazy_materialize(x);
-
-    /* Typed vector: reverse directly without boxing */
-    if (ray_is_vec(x)) {
-        int64_t len = x->len;
-        if (len <= 1) { ray_retain(x); return x; }
-        int8_t vtype = x->type;
-        if (vtype == RAY_STR) {
-            ray_t* result = ray_vec_new(RAY_STR, len);
-            if (RAY_IS_ERR(result)) return result;
-            bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+/* Shared eager kernel — called by the OP_REVERSE executor. */
+ray_t* reverse_vec_eager(ray_t* x) {
+    int64_t len = x->len;
+    if (len <= 1) { ray_retain(x); return x; }
+    int8_t vtype = x->type;
+    if (vtype == RAY_STR) {
+        ray_t* result = ray_vec_new(RAY_STR, len);
+        if (RAY_IS_ERR(result)) return result;
+        bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
-                if (has_nulls && ray_vec_is_null(x, len - 1 - i)) {
+                if (ray_vec_is_null(x, len - 1 - i)) {
                     result = ray_str_vec_append(result, "", 0);
                     if (!RAY_IS_ERR(result))
                         ray_vec_set_null(result, result->len - 1, true);
@@ -1731,27 +1764,59 @@ ray_t* ray_reverse_fn(ray_t* x) {
                 }
                 if (RAY_IS_ERR(result)) return result;
             }
-            return result;
-        }
-        ray_t* result = (vtype == RAY_SYM)
-            ? ray_sym_vec_new(x->attrs & RAY_SYM_W_MASK, len)
-            : ray_vec_new(vtype, len);
-        if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
-        result->len = len;
-        int esz = ray_elem_size(vtype);
-        if (vtype == RAY_SYM) esz = ray_sym_elem_size(vtype, x->attrs);
-        char* src = (char*)ray_data(x);
-        char* dst = (char*)ray_data(result);
-        bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
-        for (int64_t i = 0; i < len; i++) {
-            memcpy(dst + i * esz, src + (len - 1 - i) * esz, esz);
-            if (has_nulls && ray_vec_is_null(x, len - 1 - i))
-                ray_vec_set_null(result, i, true);
+        } else {
+            for (int64_t i = 0; i < len; i++) {
+                size_t slen;
+                const char* sp = ray_str_vec_get(x, len - 1 - i, &slen);
+                result = ray_str_vec_append(result, sp ? sp : "", sp ? slen : 0);
+                if (RAY_IS_ERR(result)) return result;
+            }
         }
         return result;
     }
+    ray_t* result = (vtype == RAY_SYM)
+        ? ray_sym_vec_new(x->attrs & RAY_SYM_W_MASK, len)
+        : ray_vec_new(vtype, len);
+    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+    result->len = len;
+    int esz = ray_elem_size(vtype);
+    if (vtype == RAY_SYM) esz = ray_sym_elem_size(vtype, x->attrs);
+    char* src = (char*)ray_data(x);
+    char* dst = (char*)ray_data(result);
+    bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    if (has_nulls) {
+        for (int64_t i = 0; i < len; i++) {
+            memcpy(dst + i * esz, src + (len - 1 - i) * esz, esz);
+            if (ray_vec_is_null(x, len - 1 - i))
+                ray_vec_set_null(result, i, true);
+        }
+    } else {
+        for (int64_t i = 0; i < len; i++)
+            memcpy(dst + i * esz, src + (len - 1 - i) * esz, esz);
+    }
+    return result;
+}
 
-    /* Boxed list path */
+/* (reverse vec) — reverse a vector */
+ray_t* ray_reverse_fn(ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return x;
+
+    /* Extend an existing lazy chain. */
+    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_REVERSE);
+
+    if (ray_is_atom(x)) { ray_retain(x); return x; }
+
+    /* Typed vector path: start a fresh lazy chain.  The DAG executor will
+     * call reverse_vec_eager() when the chain is materialised. */
+    if (ray_is_vec(x)) {
+        ray_graph_t* g = ray_graph_new(NULL);
+        if (!g) return ray_error("oom", NULL);
+        ray_op_t* in = ray_graph_input_vec(g, x);
+        ray_op_t* op = ray_reverse_op(g, in);
+        return ray_lazy_wrap(g, op);
+    }
+
+    /* Boxed list path — eager (DAG cannot yet express list reversal) */
     ray_t* _bx = NULL;
     x = unbox_vec_arg(x, &_bx);
     if (RAY_IS_ERR(x)) return x;

@@ -1,0 +1,59 @@
+;; Lazy chain — sum builds a single-op chain, materialises at REPL.
+(set V [1 2 3 4 5])
+(sum V) -- 15
+
+;; sum + count over a stored vector — verifies the lazy infrastructure
+;; doesn't perturb behaviour.
+(count V) -- 5
+(avg V) -- 3.0
+
+;; first / last also use AGG_VEC_VIA_DAG (I64/F64 path).
+(first V) -- 1
+(last V)  -- 5
+
+;; Compose lazy producer with non-lazy-aware consumer — the dispatcher
+;; (Phase 1.5) must materialise (sum U) and (sum V) before passing to +.
+;; Regression test for the bug that originally blocked Plan Task 5.
+(set U [10 20 30])
+(+ (sum U) (sum V)) -- 75
+
+;; Lazy values must format correctly. Regression test for the
+;; format.c fmt_obj fix in commit 680b648e: previously consumed the
+;; borrowed lazy obj and crashed when the lazy was reused (e.g. by
+;; placing it inside a list).
+(set L (list (sum V) (count V) (avg V)))
+(at L 0) -- 15
+(at L 1) -- 5
+(at L 2) -- 3.0
+
+;; (count (sum V)) — lazy-aware-to-lazy-aware composition exercises
+;; ray_lazy_append's binary-op support, which is currently restricted
+;; to vector-producing chains. Skip until OP_COUNT supports atom results
+;; in the executor (separate cleanup tracked in the follow-up list).
+
+;; distinct returns lazy — chain extends through count.
+(set V [1 1 2 2 3 3])
+(count (distinct V)) -- 3
+
+;; The chain still works when reused.
+(count (distinct [4 4 4 4])) -- 1
+
+;; asc returns lazy — chain extends through count.
+(set V [1 2 3 4 5])
+(count (asc V)) -- 5
+
+;; asc preserves order semantics through the chain.
+(first (asc [3 1 4 1 5 9 2 6])) -- 1
+
+;; desc returns lazy — chain extends through count.
+(count (desc V)) -- 5
+
+;; desc reverses sort order; first(desc) = max element.
+(first (desc [3 1 4 1 5 9 2 6])) -- 9
+
+;; reverse returns lazy — chain extends through count.
+(count (reverse V)) -- 5
+
+;; reverse swaps endpoints; first(reverse) = original last element.
+(first (reverse [1 2 3 4 5])) -- 5
+(last  (reverse [1 2 3 4 5])) -- 1

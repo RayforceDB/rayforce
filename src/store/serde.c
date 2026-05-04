@@ -32,6 +32,7 @@
 #include "mem/heap.h"
 #include "vec/str.h"
 #include "vec/vec.h"
+#include "ops/ops.h"
 
 #ifndef RAY_OS_WINDOWS
 #  include <unistd.h>
@@ -947,19 +948,32 @@ ray_t* ray_de(ray_t* bytes) {
  * -------------------------------------------------------------------------- */
 
 ray_err_t ray_obj_save(ray_t* obj, const char* path) {
+    bool owned = false;
+    if (ray_is_lazy(obj)) {
+        obj = ray_lazy_materialize(obj);
+        if (RAY_IS_ERR(obj)) {
+            ray_err_t code = ray_err_from_obj(obj);
+            ray_error_free(obj);
+            return code;
+        }
+        owned = true;
+    }
+
     ray_t* bytes = ray_ser(obj);
     if (!bytes || RAY_IS_ERR(bytes)) {
         if (bytes && RAY_IS_ERR(bytes)) ray_error_free(bytes);
+        if (owned) ray_release(obj);
         return RAY_ERR_DOMAIN;
     }
 
     FILE* f = fopen(path, "wb");
-    if (!f) { ray_release(bytes); return RAY_ERR_IO; }
+    if (!f) { ray_release(bytes); if (owned) ray_release(obj); return RAY_ERR_IO; }
 
     size_t total = (size_t)bytes->len;
     size_t n = fwrite(ray_data(bytes), 1, total, f);
     if (n != total) {
         fclose(f); ray_release(bytes);
+        if (owned) ray_release(obj);
         return RAY_ERR_IO;
     }
 
@@ -970,11 +984,13 @@ ray_err_t ray_obj_save(ray_t* obj, const char* path) {
      * when the rename atomically swaps it in. */
     if (fflush(f) != 0) {
         fclose(f); ray_release(bytes);
+        if (owned) ray_release(obj);
         return RAY_ERR_IO;
     }
 #ifndef RAY_OS_WINDOWS
     if (fsync(fileno(f)) != 0) {
         fclose(f); ray_release(bytes);
+        if (owned) ray_release(obj);
         return RAY_ERR_IO;
     }
 #endif
@@ -982,6 +998,7 @@ ray_err_t ray_obj_save(ray_t* obj, const char* path) {
      * buffer).  Check it. */
     int close_rc = fclose(f);
     ray_release(bytes);
+    if (owned) ray_release(obj);
     return close_rc == 0 ? RAY_OK : RAY_ERR_IO;
 }
 

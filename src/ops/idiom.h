@@ -21,16 +21,25 @@
  *   SOFTWARE.
  */
 
-#ifndef RAY_OPT_H
-#define RAY_OPT_H
+#ifndef RAY_IDIOM_H
+#define RAY_IDIOM_H
 
 #include "ops.h"
 
-/* Un-staticed helpers exposed for use by idiom.c and future passes. */
-ray_op_t*      graph_alloc_node_opt(ray_graph_t* g);
-void           redirect_consumers(ray_graph_t* g, uint32_t old_id,
-                                  ray_op_t* new_target,
-                                  uint32_t skip_a, uint32_t skip_b);
-ray_op_ext_t*  find_ext(ray_graph_t* g, uint32_t node_id);
+typedef bool      (*ray_idiom_pre_t)(ray_graph_t* g, ray_op_t* node);
+typedef ray_op_t* (*ray_idiom_rw_t) (ray_graph_t* g, ray_op_t* node);
 
-#endif /* RAY_OPT_H */
+typedef struct {
+    uint16_t          root_op;
+    uint16_t          child0_op;
+    ray_idiom_pre_t   pre;       /* NULL = always */
+    ray_idiom_rw_t    rewrite;   /* returns replacement node, or NULL */
+    const char*       name;
+} ray_idiom_t;
+
+extern const ray_idiom_t ray_idioms[];
+extern const int         ray_idioms_count;
+
+void ray_idiom_pass(ray_graph_t* g, ray_op_t* root);
+
+#endif /* RAY_IDIOM_H */

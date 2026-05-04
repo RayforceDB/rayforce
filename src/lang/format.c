@@ -1050,8 +1050,13 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
         else fmt_puts(b, type == RAY_UNARY ? "<builtin/1>" :
                          type == RAY_BINARY ? "<builtin/2>" : "<builtin/n>");
     } else if (type == RAY_LAZY) {
-        ray_t* concrete = ray_lazy_materialize(obj);
+        /* fmt_obj borrows obj; ray_lazy_materialize is consuming.
+         * Add an extra retain so materialise consumes that ref, not the
+         * caller's.  Release the concrete result after formatting. */
+        ray_retain(obj);
+        ray_t* concrete = ray_lazy_materialize(obj); /* consumes the retain */
         fmt_obj(b, concrete, mode);
+        if (concrete) ray_release(concrete);
         return;
     } else {
         fmt_printf(b, "<%s>", ray_type_name(type));

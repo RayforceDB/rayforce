@@ -155,12 +155,21 @@ static ray_t* exec_filter_parted_vec(ray_t* parted_col, ray_t* pred,
         char* src = (char*)ray_data(segs[s]);
         char* dst = (char*)ray_data(result);
         bool seg_has_nulls = (segs[s]->attrs & RAY_ATTR_HAS_NULLS) != 0;
-        for (int64_t i = 0; i < seg_len; i++) {
-            if (pred_data[pred_off + i]) {
-                memcpy(dst + out_idx * esz, src + i * esz, esz);
-                if (seg_has_nulls && ray_vec_is_null(segs[s], i))
-                    ray_vec_set_null(result, out_idx, true);
-                out_idx++;
+        if (seg_has_nulls) {
+            for (int64_t i = 0; i < seg_len; i++) {
+                if (pred_data[pred_off + i]) {
+                    memcpy(dst + out_idx * esz, src + i * esz, esz);
+                    if (ray_vec_is_null(segs[s], i))
+                        ray_vec_set_null(result, out_idx, true);
+                    out_idx++;
+                }
+            }
+        } else {
+            for (int64_t i = 0; i < seg_len; i++) {
+                if (pred_data[pred_off + i]) {
+                    memcpy(dst + out_idx * esz, src + i * esz, esz);
+                    out_idx++;
+                }
             }
         }
         pred_off += seg_len;

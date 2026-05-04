@@ -24,6 +24,7 @@
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "lang/parse.h"
+#include "ops/ops.h"    /* ray_is_lazy, ray_lazy_materialize */
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "store/serde.h"
@@ -616,6 +617,12 @@ ray_t* ray_diverse_fn(ray_t* x) {
 
     ray_t* d = ray_distinct_fn(x);
     if (RAY_IS_ERR(d)) return d;
+    /* ray_distinct_fn returns lazy for concrete vecs; materialise here
+     * since we need the concrete length to compare. */
+    if (ray_is_lazy(d)) {
+        d = ray_lazy_materialize(d);
+        if (!d || RAY_IS_ERR(d)) return d ? d : ray_error("oom", NULL);
+    }
     int64_t dn = ray_len(d);
     ray_release(d);
     return make_bool(dn == n ? 1 : 0);

@@ -604,35 +604,62 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
         }                                                                   \
     } while (0)
 
+    /* Hoist col_atom_null, col_is_atom, col_has_nulls outside the loops so
+     * the per-element null check is a single ray_vec_is_null call when
+     * nulls are present, or eliminated entirely when they are not. */
+    bool vec_has_nulls = c->col_has_nulls && !c->col_is_atom;
     if (c->use_double) {
         const double* svf = c->svf;
-        for (int64_t i = start; i < end; i++) {
-            bool row_null = c->col_atom_null ||
-                            (c->col_has_nulls && !c->col_is_atom &&
-                             ray_vec_is_null(col, i));
-            if (row_null) { ob[i] = 0; continue; }
-            double cv;
-            if (c->col_is_atom) cv = (ct == RAY_F64) ? col->f64 : (double)col->i64;
-            else IN_READ_F64(cv, i);
-            int found = 0;
-            for (int64_t j = 0; j < sv_len; j++)
-                if (cv == svf[j]) { found = 1; break; }
-            ob[i] = (uint8_t)(found ^ negate);
+        if (c->col_atom_null) {
+            /* All elements are null — fill zeros */
+            for (int64_t i = start; i < end; i++) ob[i] = 0;
+        } else if (vec_has_nulls) {
+            for (int64_t i = start; i < end; i++) {
+                if (ray_vec_is_null(col, i)) { ob[i] = 0; continue; }
+                double cv;
+                if (c->col_is_atom) cv = (ct == RAY_F64) ? col->f64 : (double)col->i64;
+                else IN_READ_F64(cv, i);
+                int found = 0;
+                for (int64_t j = 0; j < sv_len; j++)
+                    if (cv == svf[j]) { found = 1; break; }
+                ob[i] = (uint8_t)(found ^ negate);
+            }
+        } else {
+            for (int64_t i = start; i < end; i++) {
+                double cv;
+                if (c->col_is_atom) cv = (ct == RAY_F64) ? col->f64 : (double)col->i64;
+                else IN_READ_F64(cv, i);
+                int found = 0;
+                for (int64_t j = 0; j < sv_len; j++)
+                    if (cv == svf[j]) { found = 1; break; }
+                ob[i] = (uint8_t)(found ^ negate);
+            }
         }
     } else {
         const int64_t* svi = c->svi;
-        for (int64_t i = start; i < end; i++) {
-            bool row_null = c->col_atom_null ||
-                            (c->col_has_nulls && !c->col_is_atom &&
-                             ray_vec_is_null(col, i));
-            if (row_null) { ob[i] = 0; continue; }
-            int64_t cv;
-            if (c->col_is_atom) cv = col->i64;
-            else IN_READ_I64(cv, i);
-            int found = 0;
-            for (int64_t j = 0; j < sv_len; j++)
-                if (cv == svi[j]) { found = 1; break; }
-            ob[i] = (uint8_t)(found ^ negate);
+        if (c->col_atom_null) {
+            for (int64_t i = start; i < end; i++) ob[i] = 0;
+        } else if (vec_has_nulls) {
+            for (int64_t i = start; i < end; i++) {
+                if (ray_vec_is_null(col, i)) { ob[i] = 0; continue; }
+                int64_t cv;
+                if (c->col_is_atom) cv = col->i64;
+                else IN_READ_I64(cv, i);
+                int found = 0;
+                for (int64_t j = 0; j < sv_len; j++)
+                    if (cv == svi[j]) { found = 1; break; }
+                ob[i] = (uint8_t)(found ^ negate);
+            }
+        } else {
+            for (int64_t i = start; i < end; i++) {
+                int64_t cv;
+                if (c->col_is_atom) cv = col->i64;
+                else IN_READ_I64(cv, i);
+                int found = 0;
+                for (int64_t j = 0; j < sv_len; j++)
+                    if (cv == svi[j]) { found = 1; break; }
+                ob[i] = (uint8_t)(found ^ negate);
+            }
         }
     }
     #undef IN_READ_I64
@@ -1007,6 +1034,54 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* input = exec_node(g, op->inputs[0]);
             if (!input || RAY_IS_ERR(input)) return input;
             ray_t* result = exec_count_distinct(g, op, input);
+            ray_release(input);
+            return result;
+        }
+
+        case OP_DISTINCT: {
+            ray_t* input = exec_node(g, op->inputs[0]);
+            if (!input || RAY_IS_ERR(input)) return input;
+            if (!ray_is_vec(input)) {
+                ray_release(input);
+                return ray_error("type", "OP_DISTINCT expects a vector input");
+            }
+            ray_t* result = distinct_vec_eager(input);
+            ray_release(input);
+            return result;
+        }
+
+        case OP_ASC: {
+            ray_t* input = exec_node(g, op->inputs[0]);
+            if (!input || RAY_IS_ERR(input)) return input;
+            if (!ray_is_vec(input)) {
+                ray_release(input);
+                return ray_error("type", "OP_ASC expects a vector input");
+            }
+            ray_t* result = asc_vec_eager(input);
+            ray_release(input);
+            return result;
+        }
+
+        case OP_DESC: {
+            ray_t* input = exec_node(g, op->inputs[0]);
+            if (!input || RAY_IS_ERR(input)) return input;
+            if (!ray_is_vec(input)) {
+                ray_release(input);
+                return ray_error("type", "OP_DESC expects a vector input");
+            }
+            ray_t* result = desc_vec_eager(input);
+            ray_release(input);
+            return result;
+        }
+
+        case OP_REVERSE: {
+            ray_t* input = exec_node(g, op->inputs[0]);
+            if (!input || RAY_IS_ERR(input)) return input;
+            if (!ray_is_vec(input)) {
+                ray_release(input);
+                return ray_error("type", "OP_REVERSE expects a vector input");
+            }
+            ray_t* result = reverse_vec_eager(input);
             ray_release(input);
             return result;
         }

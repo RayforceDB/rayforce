@@ -16,6 +16,7 @@ gmon.out
 .claude/
 rf_test_*.csv
 .coderlm/
+.worktrees/
 
 CLAUDE.md
 docs/plans/

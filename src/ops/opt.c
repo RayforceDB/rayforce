@@ -26,6 +26,7 @@
 #endif
 
 #include "opt.h"
+#include "idiom.h"
 #include "core/profile.h"
 #include "mem/sys.h"
 #include "mem/heap.h"
@@ -33,7 +34,7 @@
 #include <string.h>
 
 /* Forward declaration — defined below, used by type inference and DCE passes. */
-static ray_op_ext_t* find_ext(ray_graph_t* g, uint32_t node_id);
+ray_op_ext_t* find_ext(ray_graph_t* g, uint32_t node_id);
 
 /* --------------------------------------------------------------------------
  * Optimizer passes (v1): Type Inference + Constant Folding + Fusion + DCE
@@ -219,7 +220,7 @@ static bool is_const(ray_op_t* n) {
 /* O(ext_count) per call; acceptable for typical graph sizes (tens to
    hundreds of nodes).  L2: intentional duplication to keep files
    self-contained — also present in fuse.c. */
-static ray_op_ext_t* find_ext(ray_graph_t* g, uint32_t node_id) {
+ray_op_ext_t* find_ext(ray_graph_t* g, uint32_t node_id) {
     for (uint32_t i = 0; i < g->ext_count; i++) {
         if (g->ext_nodes[i] && g->ext_nodes[i]->base.id == node_id)
             return g->ext_nodes[i];
@@ -1024,7 +1025,7 @@ static void factorize_pass(ray_graph_t* g, ray_op_t* root) {
 
 /* Allocate a new node in the graph (for use during optimization passes).
  * Same logic as graph_alloc_node in graph.c but local to opt.c. */
-static ray_op_t* graph_alloc_node_opt(ray_graph_t* g) {
+ray_op_t* graph_alloc_node_opt(ray_graph_t* g) {
     if (g->node_count >= g->node_cap) {
         if (g->node_cap > UINT32_MAX / 2) return NULL;
         uint32_t new_cap = g->node_cap * 2;
@@ -1309,9 +1310,9 @@ static bool is_reachable_from(ray_graph_t* g, ray_op_t* start, uint32_t target_i
 /* Redirect all consumers of old_id to point to new_target instead.
  * Skips nodes with IDs skip_a and skip_b (the swapped pair).
  * Updates both g->nodes[] and g->ext_nodes[].base.inputs[]. */
-static void redirect_consumers(ray_graph_t* g, uint32_t old_id,
-                               ray_op_t* new_target,
-                               uint32_t skip_a, uint32_t skip_b) {
+void redirect_consumers(ray_graph_t* g, uint32_t old_id,
+                        ray_op_t* new_target,
+                        uint32_t skip_a, uint32_t skip_b) {
     uint32_t nc = g->node_count;
     for (uint32_t j = 0; j < nc; j++) {
         ray_op_t* c = &g->nodes[j];
@@ -2023,38 +2024,44 @@ ray_op_t* ray_optimize(ray_graph_t* g, ray_op_t* root) {
     pass_constant_fold(g, root);
     ray_profile_tick("constant fold");
 
-    /* Pass 3: SIP (graph-aware sideways information passing) */
+    /* Pass 3: Idiom rewrite */
+    ray_profile_span_start("idiom");
+    ray_idiom_pass(g, root);
+    ray_profile_span_end("idiom");
+    ray_profile_tick("idiom rewrite");
+
+    /* Pass 4: SIP (graph-aware sideways information passing) */
     sip_pass(g, root);
     ray_profile_tick("SIP");
 
-    /* Pass 4: Factorized detection (OP_EXPAND → OP_GROUP optimization) */
+    /* Pass 5: Factorized detection (OP_EXPAND → OP_GROUP optimization) */
     factorize_pass(g, root);
     ray_profile_tick("factorize");
 
-    /* Pass 5: Predicate pushdown (may change root) */
+    /* Pass 6: Predicate pushdown (may change root) */
     root = pass_predicate_pushdown(g, root);
     ray_profile_tick("predicate pushdown");
 
-    /* Pass 6: Filter reordering (split ANDs + reorder by cost, may change root) */
+    /* Pass 7: Filter reordering (split ANDs + reorder by cost, may change root) */
     root = pass_filter_reorder(g, root);
     ray_profile_tick("filter reorder");
 
-    /* Pass 7: Projection pushdown (mark unreachable nodes dead) */
+    /* Pass 8: Projection pushdown (mark unreachable nodes dead) */
     bool proj_ok = pass_projection_pushdown(g, root);
     ray_profile_tick("projection pushdown");
 
-    /* Pass 8: Partition pruning (set est_rows hints for mapcommon filters).
+    /* Pass 9: Partition pruning (set est_rows hints for mapcommon filters).
      * Only safe to run if projection pushdown completed: pruning walks all
      * nodes and would attach seg_masks to disconnected branches otherwise. */
     if (proj_ok)
         pass_partition_pruning(g, root);
     ray_profile_tick("partition pruning");
 
-    /* Pass 9: Fusion */
+    /* Pass 10: Fusion */
     ray_fuse_pass(g, root);
     ray_profile_tick("fusion");
 
-    /* Pass 10: DCE */
+    /* Pass 11: DCE */
     pass_dce(g, root);
     ray_profile_tick("DCE");
 

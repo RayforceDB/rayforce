@@ -151,17 +151,38 @@ ray_t* ray_temporal_extract(ray_t* input, int field) {
         ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
          (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
     const char* base = (const char*)ray_data(input);
-    for (int64_t i = 0; i < len; i++) {
-        if (src_has_nulls && ray_vec_is_null(input, i)) {
-            out[i] = 0;
-            ray_vec_set_null(result, i, true);
-            continue;
+    /* Hoist src_has_nulls and type dispatch outside the loop so the
+     * inner body is a tight typed kernel with no per-element branches. */
+    if (t == RAY_DATE || t == RAY_TIME) {
+        const int32_t* d32 = (const int32_t*)base;
+        if (src_has_nulls) {
+            for (int64_t i = 0; i < len; i++) {
+                if (ray_vec_is_null(input, i)) {
+                    out[i] = 0;
+                    ray_vec_set_null(result, i, true);
+                    continue;
+                }
+                out[i] = rte_extract_one(rte_to_us(t, (int64_t)d32[i]), field);
+            }
+        } else {
+            for (int64_t i = 0; i < len; i++)
+                out[i] = rte_extract_one(rte_to_us(t, (int64_t)d32[i]), field);
         }
-        int64_t raw;
-        if (t == RAY_DATE)       raw = (int64_t)((const int32_t*)base)[i];
-        else if (t == RAY_TIME)  raw = (int64_t)((const int32_t*)base)[i];
-        else                     raw = ((const int64_t*)base)[i];
-        out[i] = rte_extract_one(rte_to_us(t, raw), field);
+    } else {
+        const int64_t* d64 = (const int64_t*)base;
+        if (src_has_nulls) {
+            for (int64_t i = 0; i < len; i++) {
+                if (ray_vec_is_null(input, i)) {
+                    out[i] = 0;
+                    ray_vec_set_null(result, i, true);
+                    continue;
+                }
+                out[i] = rte_extract_one(rte_to_us(t, d64[i]), field);
+            }
+        } else {
+            for (int64_t i = 0; i < len; i++)
+                out[i] = rte_extract_one(rte_to_us(t, d64[i]), field);
+        }
     }
     return result;
 }
@@ -253,19 +274,43 @@ ray_t* ray_temporal_truncate(ray_t* input, int kind) {
         ? RTE_USEC_PER_DAY
         : RTE_USEC_PER_SEC;
 
-    for (int64_t i = 0; i < len; i++) {
-        if (src_has_nulls && ray_vec_is_null(input, i)) {
-            out[i] = 0;
-            ray_vec_set_null(result, i, true);
-            continue;
+    /* Hoist src_has_nulls and type dispatch outside the loop. */
+    if (t == RAY_DATE || t == RAY_TIME) {
+        const int32_t* d32 = (const int32_t*)base;
+        if (src_has_nulls) {
+            for (int64_t i = 0; i < len; i++) {
+                if (ray_vec_is_null(input, i)) {
+                    out[i] = 0; ray_vec_set_null(result, i, true); continue;
+                }
+                int64_t us = rte_to_us(t, (int64_t)d32[i]);
+                int64_t r = us % bucket;
+                out[i] = rte_us_to_ts_raw(us - r - (r < 0 ? bucket : 0));
+            }
+        } else {
+            for (int64_t i = 0; i < len; i++) {
+                int64_t us = rte_to_us(t, (int64_t)d32[i]);
+                int64_t r = us % bucket;
+                out[i] = rte_us_to_ts_raw(us - r - (r < 0 ? bucket : 0));
+            }
         }
-        int64_t raw;
-        if (t == RAY_DATE)       raw = (int64_t)((const int32_t*)base)[i];
-        else if (t == RAY_TIME)  raw = (int64_t)((const int32_t*)base)[i];
-        else                     raw = ((const int64_t*)base)[i];
-        int64_t us = rte_to_us(t, raw);
-        int64_t r = us % bucket;
-        out[i] = rte_us_to_ts_raw(us - r - (r < 0 ? bucket : 0));
+    } else {
+        const int64_t* d64 = (const int64_t*)base;
+        if (src_has_nulls) {
+            for (int64_t i = 0; i < len; i++) {
+                if (ray_vec_is_null(input, i)) {
+                    out[i] = 0; ray_vec_set_null(result, i, true); continue;
+                }
+                int64_t us = rte_to_us(t, d64[i]);
+                int64_t r = us % bucket;
+                out[i] = rte_us_to_ts_raw(us - r - (r < 0 ? bucket : 0));
+            }
+        } else {
+            for (int64_t i = 0; i < len; i++) {
+                int64_t us = rte_to_us(t, d64[i]);
+                int64_t r = us % bucket;
+                out[i] = rte_us_to_ts_raw(us - r - (r < 0 ? bucket : 0));
+            }
+        }
     }
     return result;
 }
@@ -311,103 +356,100 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
         ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
          (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
 
+    /* Macro to emit a tight inner loop body with loop-invariant branches
+     * hoisted at compile time.  HAS_NULLS and IN32 are 0/1 constants so
+     * the compiler eliminates dead branches via DCE.
+     * IN32=1 → RAY_DATE/RAY_TIME (int32 element), IN32=0 → TIMESTAMP/I64 (int64). */
+#define EXTRACT_INNER(HAS_NULLS, IN32)                                      \
+    do {                                                                    \
+        while (ray_morsel_next(&m)) {                                       \
+            int64_t n = m.morsel_len;                                       \
+            for (int64_t i = 0; i < n; i++) {                              \
+                if (HAS_NULLS && ray_vec_is_null(input, off + i)) {        \
+                    out[off + i] = 0;                                       \
+                    ray_vec_set_null(result, off + i, true);                \
+                    continue;                                               \
+                }                                                           \
+                int64_t us;                                                 \
+                if (IN32) {                                                 \
+                    /* RAY_DATE: int32 days → µs; RAY_TIME: int32 ms → µs */ \
+                    int32_t raw32 = ((const int32_t*)m.morsel_ptr)[i];     \
+                    us = (in_type == RAY_DATE)                              \
+                         ? (int64_t)raw32 * USEC_PER_DAY                   \
+                         : (int64_t)raw32 * 1000LL;                        \
+                } else {                                                    \
+                    /* RAY_TIMESTAMP: int64 nanoseconds → µs */             \
+                    int64_t ns = ((const int64_t*)m.morsel_ptr)[i];        \
+                    us = ns >= 0 ? ns / 1000LL                             \
+                                 : -(((-ns) + 999LL) / 1000LL);            \
+                }                                                           \
+                if (field == RAY_EXTRACT_EPOCH) {                          \
+                    out[off + i] = us;                                      \
+                } else if (field == RAY_EXTRACT_HOUR) {                    \
+                    int64_t day_us = us % USEC_PER_DAY;                    \
+                    if (day_us < 0) day_us += USEC_PER_DAY;               \
+                    out[off + i] = day_us / USEC_PER_HOUR;                 \
+                } else if (field == RAY_EXTRACT_MINUTE) {                  \
+                    int64_t day_us = us % USEC_PER_DAY;                    \
+                    if (day_us < 0) day_us += USEC_PER_DAY;               \
+                    out[off + i] = (day_us % USEC_PER_HOUR) / USEC_PER_MIN; \
+                } else if (field == RAY_EXTRACT_SECOND) {                  \
+                    int64_t day_us = us % USEC_PER_DAY;                    \
+                    if (day_us < 0) day_us += USEC_PER_DAY;               \
+                    out[off + i] = (day_us % USEC_PER_MIN) / USEC_PER_SEC; \
+                } else {                                                    \
+                    /* Calendar fields: YEAR, MONTH, DAY, DOW, DOY */      \
+                    int64_t days_since_2000 = us / USEC_PER_DAY;           \
+                    if (us < 0 && us % USEC_PER_DAY != 0) days_since_2000--; \
+                    int64_t z = days_since_2000 + 10957 + 719468;          \
+                    int64_t era = (z >= 0 ? z : z - 146096) / 146097;     \
+                    uint64_t doe = (uint64_t)(z - era * 146097);           \
+                    uint64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365; \
+                    int64_t y = (int64_t)yoe + era * 400;                  \
+                    uint64_t doy_mar = doe - (365*yoe + yoe/4 - yoe/100); \
+                    uint64_t mp = (5*doy_mar + 2) / 153;                   \
+                    uint64_t d_cal = doy_mar - (153*mp + 2) / 5 + 1;      \
+                    uint64_t mo = mp < 10 ? mp + 3 : mp - 9;              \
+                    y += (mo <= 2);                                         \
+                    if (field == RAY_EXTRACT_YEAR) {                       \
+                        out[off + i] = y;                                  \
+                    } else if (field == RAY_EXTRACT_MONTH) {               \
+                        out[off + i] = (int64_t)mo;                        \
+                    } else if (field == RAY_EXTRACT_DAY) {                 \
+                        out[off + i] = (int64_t)d_cal;                     \
+                    } else if (field == RAY_EXTRACT_DOW) {                 \
+                        out[off + i] = ((days_since_2000 % 7) + 7 + 5) % 7 + 1; \
+                    } else if (field == RAY_EXTRACT_DOY) {                 \
+                        static const int dbm[13] = {                       \
+                            0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 \
+                        };                                                  \
+                        if (mo < 1 || mo > 12) { out[off + i] = 0; continue; } \
+                        int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)); \
+                        int64_t doy_jan = dbm[mo] + (int64_t)d_cal;       \
+                        if (mo > 2 && leap) doy_jan++;                     \
+                        out[off + i] = doy_jan;                             \
+                    } else {                                                \
+                        out[off + i] = 0;                                  \
+                    }                                                       \
+                }                                                           \
+            }                                                               \
+            off += n;                                                       \
+        }                                                                   \
+    } while (0)
+
     ray_morsel_t m;
     ray_morsel_init(&m, input);
     int64_t off = 0;
 
-    while (ray_morsel_next(&m)) {
-        int64_t n = m.morsel_len;
+    /* Hoist src_has_nulls and in_type (32- vs 64-bit element) outside
+     * all loops using the macro dispatch above. */
+    bool in32 = (in_type == RAY_DATE || in_type == RAY_TIME);
+    if (!src_has_nulls && !in32) EXTRACT_INNER(0, 0);
+    else if (!src_has_nulls &&  in32) EXTRACT_INNER(0, 1);
+    else if ( src_has_nulls && !in32) EXTRACT_INNER(1, 0);
+    else                              EXTRACT_INNER(1, 1);
 
-        for (int64_t i = 0; i < n; i++) {
-            /* Propagate nulls: decomposing a null-sentinel's raw bytes
-             * would emit a bogus year / month / hour, so we zero the
-             * output slot and set its null bit instead. */
-            if (src_has_nulls && ray_vec_is_null(input, off + i)) {
-                out[off + i] = 0;
-                ray_vec_set_null(result, off + i, true);
-                continue;
-            }
-            int64_t us;
-            if (in_type == RAY_DATE) {
-                /* int32 days since 2000-01-01 -> microseconds */
-                int32_t d = ((const int32_t*)m.morsel_ptr)[i];
-                us = (int64_t)d * USEC_PER_DAY;
-            } else if (in_type == RAY_TIME) {
-                /* int32 milliseconds since midnight -> microseconds */
-                int32_t ms = ((const int32_t*)m.morsel_ptr)[i];
-                us = (int64_t)ms * 1000LL;
-            } else {
-                /* RAY_TIMESTAMP: int64 *nanoseconds* since 2000 (matches
-                 * io/csv parse and the rest of the runtime).  Convert to
-                 * µs for the calendar/time decomposition below.  RAY_I64
-                 * inputs flow through the same path; anything higher-
-                 * resolution than µs loses its low three digits, which
-                 * doesn't matter for calendar or clock field extraction. */
-                int64_t ns = ((const int64_t*)m.morsel_ptr)[i];
-                us = ns >= 0 ? ns / 1000LL
-                             : -(((-ns) + 999LL) / 1000LL);
-            }
-
-            if (field == RAY_EXTRACT_EPOCH) {
-                out[off + i] = us;
-            } else if (field == RAY_EXTRACT_HOUR) {
-                int64_t day_us = us % USEC_PER_DAY;
-                if (day_us < 0) day_us += USEC_PER_DAY;
-                out[off + i] = day_us / USEC_PER_HOUR;
-            } else if (field == RAY_EXTRACT_MINUTE) {
-                int64_t day_us = us % USEC_PER_DAY;
-                if (day_us < 0) day_us += USEC_PER_DAY;
-                out[off + i] = (day_us % USEC_PER_HOUR) / USEC_PER_MIN;
-            } else if (field == RAY_EXTRACT_SECOND) {
-                int64_t day_us = us % USEC_PER_DAY;
-                if (day_us < 0) day_us += USEC_PER_DAY;
-                out[off + i] = (day_us % USEC_PER_MIN) / USEC_PER_SEC;
-            } else {
-                /* Calendar fields: YEAR, MONTH, DAY, DOW, DOY */
-                /* Floor-divide microseconds to get day count */
-                int64_t days_since_2000 = us / USEC_PER_DAY;
-                if (us < 0 && us % USEC_PER_DAY != 0) days_since_2000--;
-
-                /* Hinnant civil_from_days: shift to 0000-03-01 era-based epoch */
-                int64_t z = days_since_2000 + 10957 + 719468;
-                int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-                uint64_t doe = (uint64_t)(z - era * 146097);
-                uint64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
-                int64_t y = (int64_t)yoe + era * 400;
-                uint64_t doy_mar = doe - (365*yoe + yoe/4 - yoe/100);
-                uint64_t mp = (5*doy_mar + 2) / 153;
-                uint64_t d = doy_mar - (153*mp + 2) / 5 + 1;
-                uint64_t mo = mp < 10 ? mp + 3 : mp - 9;
-                y += (mo <= 2);
-
-                if (field == RAY_EXTRACT_YEAR) {
-                    out[off + i] = y;
-                } else if (field == RAY_EXTRACT_MONTH) {
-                    out[off + i] = (int64_t)mo;
-                } else if (field == RAY_EXTRACT_DAY) {
-                    out[off + i] = (int64_t)d;
-                } else if (field == RAY_EXTRACT_DOW) {
-                    /* ISO day of week: Mon=1 .. Sun=7
-                     * 2000-01-01 was Saturday (ISO 6).
-                     * Formula: ((days%7)+7+5)%7 + 1 */
-                    out[off + i] = ((days_since_2000 % 7) + 7 + 5) % 7 + 1;
-                } else if (field == RAY_EXTRACT_DOY) {
-                    /* Day of year [1..366], January-based */
-                    static const int dbm[13] = {
-                        0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
-                    };
-                    if (mo < 1 || mo > 12) { out[off + i] = 0; continue; }
-                    int leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
-                    int64_t doy_jan = dbm[mo] + (int64_t)d;
-                    if (mo > 2 && leap) doy_jan++;
-                    out[off + i] = doy_jan;
-                } else {
-                    out[off + i] = 0;
-                }
-            }
-        }
-        off += n;
-    }
+#undef EXTRACT_INNER
 
     #undef USEC_PER_SEC
     #undef USEC_PER_MIN
@@ -467,103 +509,104 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op) {
         ((input->attrs & RAY_ATTR_SLICE) && input->slice_parent &&
          (input->slice_parent->attrs & RAY_ATTR_HAS_NULLS));
 
+    /* Macro to emit a tight inner loop body with HAS_NULLS and IN32 hoisted
+     * as compile-time constants (DCE removes dead branches).
+     * IN32=1 → RAY_DATE/RAY_TIME (int32 element), IN32=0 → TIMESTAMP (int64). */
+#define DATE_TRUNC_INNER(HAS_NULLS, IN32)                                   \
+    do {                                                                    \
+        while (ray_morsel_next(&m)) {                                       \
+            int64_t n = m.morsel_len;                                       \
+            for (int64_t i = 0; i < n; i++) {                              \
+                if (HAS_NULLS && ray_vec_is_null(input, off + i)) {        \
+                    out[off + i] = 0;                                       \
+                    ray_vec_set_null(result, off + i, true);                \
+                    continue;                                               \
+                }                                                           \
+                int64_t us;                                                 \
+                if (IN32) {                                                 \
+                    int32_t raw32 = ((const int32_t*)m.morsel_ptr)[i];     \
+                    us = (in_type == RAY_DATE)                              \
+                         ? (int64_t)raw32 * DT_USEC_PER_DAY                \
+                         : (int64_t)raw32 * 1000LL;                        \
+                } else {                                                    \
+                    int64_t ns = ((const int64_t*)m.morsel_ptr)[i];        \
+                    us = ns >= 0 ? ns / 1000LL                             \
+                                 : -(((-ns) + 999LL) / 1000LL);            \
+                }                                                           \
+                int64_t out_us;                                             \
+                switch (field) {                                            \
+                    case RAY_EXTRACT_SECOND: {                              \
+                        int64_t r = us % DT_USEC_PER_SEC;                  \
+                        out_us = us - r - (r < 0 ? DT_USEC_PER_SEC : 0);  \
+                        break;                                              \
+                    }                                                       \
+                    case RAY_EXTRACT_MINUTE: {                              \
+                        int64_t r = us % DT_USEC_PER_MIN;                  \
+                        out_us = us - r - (r < 0 ? DT_USEC_PER_MIN : 0);  \
+                        break;                                              \
+                    }                                                       \
+                    case RAY_EXTRACT_HOUR: {                                \
+                        int64_t r = us % DT_USEC_PER_HOUR;                 \
+                        out_us = us - r - (r < 0 ? DT_USEC_PER_HOUR : 0); \
+                        break;                                              \
+                    }                                                       \
+                    case RAY_EXTRACT_DAY: {                                 \
+                        int64_t r = us % DT_USEC_PER_DAY;                  \
+                        out_us = us - r - (r < 0 ? DT_USEC_PER_DAY : 0);  \
+                        break;                                              \
+                    }                                                       \
+                    case RAY_EXTRACT_MONTH: {                               \
+                        int64_t days2k = us / DT_USEC_PER_DAY;             \
+                        if (us < 0 && us % DT_USEC_PER_DAY != 0) days2k--; \
+                        int64_t z = days2k + 10957 + 719468;               \
+                        int64_t era = (z >= 0 ? z : z - 146096) / 146097; \
+                        uint64_t doe = (uint64_t)(z - era * 146097);       \
+                        uint64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365; \
+                        int64_t y = (int64_t)yoe + era * 400;              \
+                        uint64_t doy_mar = doe - (365*yoe + yoe/4 - yoe/100); \
+                        uint64_t mp = (5*doy_mar + 2) / 153;               \
+                        uint64_t mo = mp < 10 ? mp + 3 : mp - 9;          \
+                        y += (mo <= 2);                                     \
+                        out_us = days_from_civil(y, (int64_t)mo, 1) * DT_USEC_PER_DAY; \
+                        break;                                              \
+                    }                                                       \
+                    case RAY_EXTRACT_YEAR: {                                \
+                        int64_t days2k = us / DT_USEC_PER_DAY;             \
+                        if (us < 0 && us % DT_USEC_PER_DAY != 0) days2k--; \
+                        int64_t z = days2k + 10957 + 719468;               \
+                        int64_t era = (z >= 0 ? z : z - 146096) / 146097; \
+                        uint64_t doe = (uint64_t)(z - era * 146097);       \
+                        uint64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365; \
+                        int64_t y = (int64_t)yoe + era * 400;              \
+                        uint64_t doy_mar = doe - (365*yoe + yoe/4 - yoe/100); \
+                        uint64_t mp = (5*doy_mar + 2) / 153;               \
+                        uint64_t mo = mp < 10 ? mp + 3 : mp - 9;          \
+                        y += (mo <= 2);                                     \
+                        out_us = days_from_civil(y, 1, 1) * DT_USEC_PER_DAY; \
+                        break;                                              \
+                    }                                                       \
+                    default:                                                \
+                        out_us = us;                                        \
+                        break;                                              \
+                }                                                           \
+                out[off + i] = out_us * 1000LL; /* µs → ns for RAY_TIMESTAMP */ \
+            }                                                               \
+            off += n;                                                       \
+        }                                                                   \
+    } while (0)
+
     ray_morsel_t m;
     ray_morsel_init(&m, input);
     int64_t off = 0;
 
-    while (ray_morsel_next(&m)) {
-        int64_t n = m.morsel_len;
+    /* Hoist src_has_nulls and in_type dispatch outside all loops. */
+    bool dt_in32 = (in_type == RAY_DATE || in_type == RAY_TIME);
+    if (!src_has_nulls && !dt_in32) DATE_TRUNC_INNER(0, 0);
+    else if (!src_has_nulls &&  dt_in32) DATE_TRUNC_INNER(0, 1);
+    else if ( src_has_nulls && !dt_in32) DATE_TRUNC_INNER(1, 0);
+    else                                 DATE_TRUNC_INNER(1, 1);
 
-        for (int64_t i = 0; i < n; i++) {
-            /* Null sentinels decode to garbage times; propagate the
-             * null bit instead of emitting a bogus truncated value. */
-            if (src_has_nulls && ray_vec_is_null(input, off + i)) {
-                out[off + i] = 0;
-                ray_vec_set_null(result, off + i, true);
-                continue;
-            }
-
-            int64_t us;
-            if (in_type == RAY_DATE) {
-                int32_t d = ((const int32_t*)m.morsel_ptr)[i];
-                us = (int64_t)d * DT_USEC_PER_DAY;
-            } else if (in_type == RAY_TIME) {
-                int32_t ms = ((const int32_t*)m.morsel_ptr)[i];
-                us = (int64_t)ms * 1000LL;
-            } else {
-                /* RAY_TIMESTAMP: nanoseconds since 2000 → microseconds.
-                 * Sub-microsecond precision is intentionally dropped —
-                 * every DATE_TRUNC field truncates at second boundary
-                 * or coarser. */
-                int64_t ns = ((const int64_t*)m.morsel_ptr)[i];
-                us = ns >= 0 ? ns / 1000LL
-                             : -(((-ns) + 999LL) / 1000LL);
-            }
-
-            /* Truncation math below happens in µs; the final value is
-             * scaled back to ns before storing, because the result
-             * vector is RAY_TIMESTAMP and the rest of the runtime
-             * expects ns. */
-            int64_t out_us;
-            switch (field) {
-                case RAY_EXTRACT_SECOND: {
-                    int64_t r = us % DT_USEC_PER_SEC;
-                    out_us = us - r - (r < 0 ? DT_USEC_PER_SEC : 0);
-                    break;
-                }
-                case RAY_EXTRACT_MINUTE: {
-                    int64_t r = us % DT_USEC_PER_MIN;
-                    out_us = us - r - (r < 0 ? DT_USEC_PER_MIN : 0);
-                    break;
-                }
-                case RAY_EXTRACT_HOUR: {
-                    int64_t r = us % DT_USEC_PER_HOUR;
-                    out_us = us - r - (r < 0 ? DT_USEC_PER_HOUR : 0);
-                    break;
-                }
-                case RAY_EXTRACT_DAY: {
-                    int64_t r = us % DT_USEC_PER_DAY;
-                    out_us = us - r - (r < 0 ? DT_USEC_PER_DAY : 0);
-                    break;
-                }
-                case RAY_EXTRACT_MONTH: {
-                    int64_t days2k = us / DT_USEC_PER_DAY;
-                    if (us < 0 && us % DT_USEC_PER_DAY != 0) days2k--;
-                    int64_t z = days2k + 10957 + 719468;
-                    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-                    uint64_t doe = (uint64_t)(z - era * 146097);
-                    uint64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
-                    int64_t y = (int64_t)yoe + era * 400;
-                    uint64_t doy_mar = doe - (365*yoe + yoe/4 - yoe/100);
-                    uint64_t mp = (5*doy_mar + 2) / 153;
-                    uint64_t mo = mp < 10 ? mp + 3 : mp - 9;
-                    y += (mo <= 2);
-                    out_us = days_from_civil(y, (int64_t)mo, 1) * DT_USEC_PER_DAY;
-                    break;
-                }
-                case RAY_EXTRACT_YEAR: {
-                    int64_t days2k = us / DT_USEC_PER_DAY;
-                    if (us < 0 && us % DT_USEC_PER_DAY != 0) days2k--;
-                    int64_t z = days2k + 10957 + 719468;
-                    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-                    uint64_t doe = (uint64_t)(z - era * 146097);
-                    uint64_t yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
-                    int64_t y = (int64_t)yoe + era * 400;
-                    uint64_t doy_mar = doe - (365*yoe + yoe/4 - yoe/100);
-                    uint64_t mp = (5*doy_mar + 2) / 153;
-                    uint64_t mo = mp < 10 ? mp + 3 : mp - 9;
-                    y += (mo <= 2);
-                    out_us = days_from_civil(y, 1, 1) * DT_USEC_PER_DAY;
-                    break;
-                }
-                default:
-                    out_us = us;
-                    break;
-            }
-            out[off + i] = out_us * 1000LL;  /* µs → ns for RAY_TIMESTAMP */
-        }
-        off += n;
-    }
+#undef DATE_TRUNC_INNER
 
     #undef DT_USEC_PER_SEC
     #undef DT_USEC_PER_MIN

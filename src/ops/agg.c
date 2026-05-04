@@ -87,7 +87,7 @@ static void nth_element_dbl(double* a, int64_t lo, int64_t hi, int64_t k) {
     if (!g) return ray_error("oom", NULL);                  \
     ray_op_t* in = ray_graph_input_vec(g, x);              \
     ray_op_t* op = ctor(g, in);                            \
-    return ray_lazy_materialize(ray_lazy_wrap(g, op));      \
+    return ray_lazy_wrap(g, op);                            \
 } while(0)
 
 /* DAG executor returns I64 for all integer types — cast back to original. */
@@ -384,7 +384,9 @@ static ray_t* vec_to_f64_scratch(ray_t* x, double** out_vals) {
 }
 
 ray_t* ray_med_fn(ray_t* x) {
-    if (ray_is_lazy(x)) x = ray_lazy_materialize(x);
+    /* Note: after Phase 1.5 the dispatcher always materialises non-LAZY_AWARE
+     * fn args, so x is already concrete here.  The inline materialise guard
+     * that was here was unreachable and has been removed. */
     if (RAY_IS_ERR(x)) return x;
     /* Scalar: median of single value → f64 */
     if (ray_is_atom(x)) {
@@ -453,7 +455,9 @@ ray_t* ray_dev_fn(ray_t* x) { return var_stddev_core(x, 0, 1); }
  * sample=1 -> divide sum-of-squares by (n-1); sample=0 -> divide by n.
  * take_sqrt=1 -> stddev; take_sqrt=0 -> variance. */
 static ray_t* var_stddev_core(ray_t* x, int sample, int take_sqrt) {
-    if (ray_is_lazy(x)) x = ray_lazy_materialize(x);
+    /* Note: after Phase 1.5 the dispatcher always materialises non-LAZY_AWARE
+     * fn args, so x is already concrete here.  The inline materialise guard
+     * that was here was unreachable and has been removed. */
     if (RAY_IS_ERR(x)) return x;
     if (ray_is_atom(x)) {
         if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_F64);

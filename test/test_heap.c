@@ -31,6 +31,13 @@
  * (LIST / TABLE / DICT / parted / NULLMAP_EXT / SLICE / STR with str_pool).
  */
 
+/* MAP_ANONYMOUS is a Linux/glibc extension; needs _GNU_SOURCE before
+ * any system include. Matches the convention in src/core/ipc.c,
+ * src/store/journal.c, src/store/serde.c. */
+#if !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"

@@ -1217,79 +1217,151 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     if (!result || RAY_IS_ERR(result)) return result;
     result->len = len;
 
+    /* Hoist in_type, out_type, and opcode dispatch entirely outside the
+     * morsel loop so each inner loop is a tight, single-type kernel.
+     * This allows autovectorisation and eliminates per-element branch predict slots. */
     ray_morsel_t m;
     ray_morsel_init(&m, input);
     int64_t out_off = 0;
+    uint16_t opc = op->opcode;
 
-    while (ray_morsel_next(&m)) {
-        int64_t n = m.morsel_len;
-        void* dst = (char*)ray_data(result) + out_off * ray_elem_size(out_type);
-
-        if (in_type == RAY_F64 || in_type == RAY_I64) {
-            for (int64_t i = 0; i < n; i++) {
-                if (in_type == RAY_F64) {
-                    double v = ((double*)m.morsel_ptr)[i];
-                    double r;
-                    switch (op->opcode) {
-                        case OP_NEG:   r = -v; break;
-                        case OP_ABS:   r = fabs(v); break;
-                        case OP_SQRT:  r = sqrt(v); break;
-                        case OP_LOG:   r = log(v); break;
-                        case OP_EXP:   r = exp(v); break;
-                        case OP_CEIL:  r = ceil(v); break;
-                        case OP_FLOOR: r = floor(v); break;
-                        case OP_ROUND: r = round(v); break;
-                        default:       r = v; break;
-                    }
-                    if (out_type == RAY_F64) ((double*)dst)[i] = r;
-                    else if (out_type == RAY_I64) ((int64_t*)dst)[i] = (int64_t)r;
-                } else {
-                    int64_t v = ((int64_t*)m.morsel_ptr)[i];
-                    if (out_type == RAY_I64) {
-                        int64_t r;
-                        switch (op->opcode) {
-                            /* Unsigned negation avoids UB on INT64_MIN */
-                            case OP_NEG: r = (int64_t)(-(uint64_t)v); break;
-                            case OP_ABS: r = v < 0 ? (int64_t)(-(uint64_t)v) : v; break;
-                            default:     r = v; break;
-                        }
-                        ((int64_t*)dst)[i] = r;
-                    } else if (out_type == RAY_F64) {
-                        double r;
-                        switch (op->opcode) {
-                            case OP_NEG:   r = -(double)v; break;
-                            case OP_SQRT:  r = sqrt((double)v); break;
-                            case OP_LOG:   r = log((double)v); break;
-                            case OP_EXP:   r = exp((double)v); break;
-                            default:       r = (double)v; break;
-                        }
-                        ((double*)dst)[i] = r;
-                    } else if (out_type == RAY_BOOL) {
-                        /* ISNULL: for non-null vecs, always false */
-                        ((uint8_t*)dst)[i] = 0;
-                    }
+    if (in_type == RAY_F64 && out_type == RAY_F64) {
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            double* src = (double*)m.morsel_ptr;
+            double* dst = (double*)((char*)ray_data(result) + out_off * sizeof(double));
+            switch (opc) {
+                case OP_NEG:   for (int64_t i=0;i<n;i++) dst[i] = -src[i]; break;
+                case OP_ABS:   for (int64_t i=0;i<n;i++) dst[i] = fabs(src[i]); break;
+                case OP_SQRT:  for (int64_t i=0;i<n;i++) dst[i] = sqrt(src[i]); break;
+                case OP_LOG:   for (int64_t i=0;i<n;i++) dst[i] = log(src[i]); break;
+                case OP_EXP:   for (int64_t i=0;i<n;i++) dst[i] = exp(src[i]); break;
+                case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = ceil(src[i]); break;
+                case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = floor(src[i]); break;
+                case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = round(src[i]); break;
+                default:       for (int64_t i=0;i<n;i++) dst[i] = src[i]; break;
+            }
+            out_off += n;
+        }
+    } else if (in_type == RAY_F64 && out_type == RAY_I64) {
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            double* src = (double*)m.morsel_ptr;
+            int64_t* dst = (int64_t*)((char*)ray_data(result) + out_off * sizeof(int64_t));
+            switch (opc) {
+                case OP_NEG:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)(-src[i]); break;
+                case OP_ABS:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)fabs(src[i]); break;
+                case OP_SQRT:  for (int64_t i=0;i<n;i++) dst[i] = (int64_t)sqrt(src[i]); break;
+                case OP_LOG:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)log(src[i]); break;
+                case OP_EXP:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)exp(src[i]); break;
+                case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = (int64_t)ceil(src[i]); break;
+                case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)floor(src[i]); break;
+                case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)round(src[i]); break;
+                default:       for (int64_t i=0;i<n;i++) dst[i] = (int64_t)src[i]; break;
+            }
+            out_off += n;
+        }
+    } else if (in_type == RAY_I64 && out_type == RAY_I64) {
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            int64_t* src = (int64_t*)m.morsel_ptr;
+            int64_t* dst = (int64_t*)((char*)ray_data(result) + out_off * sizeof(int64_t));
+            switch (opc) {
+                /* Unsigned arithmetic avoids UB on INT64_MIN */
+                case OP_NEG: for (int64_t i=0;i<n;i++) dst[i]=(int64_t)(-(uint64_t)src[i]); break;
+                case OP_ABS: for (int64_t i=0;i<n;i++) dst[i]=src[i]<0?(int64_t)(-(uint64_t)src[i]):src[i]; break;
+                default:     for (int64_t i=0;i<n;i++) dst[i]=src[i]; break;
+            }
+            out_off += n;
+        }
+    } else if (in_type == RAY_I64 && out_type == RAY_F64) {
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            int64_t* src = (int64_t*)m.morsel_ptr;
+            double* dst = (double*)((char*)ray_data(result) + out_off * sizeof(double));
+            switch (opc) {
+                case OP_NEG:  for (int64_t i=0;i<n;i++) dst[i]=-(double)src[i]; break;
+                case OP_SQRT: for (int64_t i=0;i<n;i++) dst[i]=sqrt((double)src[i]); break;
+                case OP_LOG:  for (int64_t i=0;i<n;i++) dst[i]=log((double)src[i]); break;
+                case OP_EXP:  for (int64_t i=0;i<n;i++) dst[i]=exp((double)src[i]); break;
+                default:      for (int64_t i=0;i<n;i++) dst[i]=(double)src[i]; break;
+            }
+            out_off += n;
+        }
+    } else if (in_type == RAY_I64 && out_type == RAY_BOOL) {
+        /* ISNULL over a non-null vec: always false */
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            uint8_t* dst = (uint8_t*)((char*)ray_data(result) + out_off);
+            for (int64_t i = 0; i < n; i++) dst[i] = 0;
+            out_off += n;
+        }
+    } else if (in_type == RAY_BOOL && opc == OP_NOT) {
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            uint8_t* src = (uint8_t*)m.morsel_ptr;
+            uint8_t* dst = (uint8_t*)((char*)ray_data(result) + out_off);
+            for (int64_t i = 0; i < n; i++) dst[i] = !src[i];
+            out_off += n;
+        }
+    } else if (opc == OP_CAST) {
+        /* CAST from narrow integer types (I32/I16/U8/BOOL) to I64/F64.
+         * in_type is loop-invariant; select the typed read outside the loop. */
+        if (in_type == RAY_I32 || in_type == RAY_DATE || in_type == RAY_TIME) {
+            if (out_type == RAY_I64) {
+                while (ray_morsel_next(&m)) {
+                    int64_t n = m.morsel_len;
+                    int32_t* src = (int32_t*)m.morsel_ptr;
+                    int64_t* dst = (int64_t*)((char*)ray_data(result) + out_off * sizeof(int64_t));
+                    for (int64_t i = 0; i < n; i++) dst[i] = (int64_t)src[i];
+                    out_off += n;
+                }
+            } else {
+                while (ray_morsel_next(&m)) {
+                    int64_t n = m.morsel_len;
+                    int32_t* src = (int32_t*)m.morsel_ptr;
+                    double* dst = (double*)((char*)ray_data(result) + out_off * sizeof(double));
+                    for (int64_t i = 0; i < n; i++) dst[i] = (double)src[i];
+                    out_off += n;
                 }
             }
-        } else if (in_type == RAY_BOOL && op->opcode == OP_NOT) {
-            for (int64_t i = 0; i < n; i++) {
-                ((uint8_t*)dst)[i] = !((uint8_t*)m.morsel_ptr)[i];
+        } else if (in_type == RAY_I16) {
+            if (out_type == RAY_I64) {
+                while (ray_morsel_next(&m)) {
+                    int64_t n = m.morsel_len;
+                    int16_t* src = (int16_t*)m.morsel_ptr;
+                    int64_t* dst = (int64_t*)((char*)ray_data(result) + out_off * sizeof(int64_t));
+                    for (int64_t i = 0; i < n; i++) dst[i] = (int64_t)src[i];
+                    out_off += n;
+                }
+            } else {
+                while (ray_morsel_next(&m)) {
+                    int64_t n = m.morsel_len;
+                    int16_t* src = (int16_t*)m.morsel_ptr;
+                    double* dst = (double*)((char*)ray_data(result) + out_off * sizeof(double));
+                    for (int64_t i = 0; i < n; i++) dst[i] = (double)src[i];
+                    out_off += n;
+                }
             }
-        } else if (op->opcode == OP_CAST) {
-            /* CAST from narrow integer types (I32/I16/U8/BOOL) to I64/F64 */
-            for (int64_t i = 0; i < n; i++) {
-                int64_t v = 0;
-                if (in_type == RAY_I32 || in_type == RAY_DATE || in_type == RAY_TIME)
-                    v = (int64_t)((int32_t*)m.morsel_ptr)[i];
-                else if (in_type == RAY_I16)
-                    v = (int64_t)((int16_t*)m.morsel_ptr)[i];
-                else if (in_type == RAY_U8 || in_type == RAY_BOOL)
-                    v = (int64_t)((uint8_t*)m.morsel_ptr)[i];
-                if (out_type == RAY_I64)       ((int64_t*)dst)[i] = v;
-                else if (out_type == RAY_F64)  ((double*)dst)[i] = (double)v;
+        } else if (in_type == RAY_U8 || in_type == RAY_BOOL) {
+            if (out_type == RAY_I64) {
+                while (ray_morsel_next(&m)) {
+                    int64_t n = m.morsel_len;
+                    uint8_t* src = (uint8_t*)m.morsel_ptr;
+                    int64_t* dst = (int64_t*)((char*)ray_data(result) + out_off * sizeof(int64_t));
+                    for (int64_t i = 0; i < n; i++) dst[i] = (int64_t)src[i];
+                    out_off += n;
+                }
+            } else {
+                while (ray_morsel_next(&m)) {
+                    int64_t n = m.morsel_len;
+                    uint8_t* src = (uint8_t*)m.morsel_ptr;
+                    double* dst = (double*)((char*)ray_data(result) + out_off * sizeof(double));
+                    for (int64_t i = 0; i < n; i++) dst[i] = (double)src[i];
+                    out_off += n;
+                }
             }
         }
-
-        out_off += n;
     }
 
     /* Propagate null bitmap from input to result.
@@ -1343,22 +1415,37 @@ static void binary_range_str(ray_op_t* op, ray_t* lhs, ray_t* rhs, ray_t* result
         r_elems = &r_scalar_elem;
     }
 
-    for (int64_t i = 0; i < n; i++) {
-        const ray_str_t* a = l_scalar ? l_elems : &l_elems[i];
-        const ray_str_t* b = r_scalar ? r_elems : &r_elems[i];
-        const char* pa = l_scalar ? l_scalar_pool : l_pool;
-        const char* pb = r_scalar ? r_scalar_pool : r_pool;
+    /* Resolve final element pointers and pool pointers outside the loop.
+     * For scalar sides the element pointer is fixed; for vector sides it
+     * advances with i.  Use step_l / step_r (0 or 1) to avoid per-element
+     * ternaries on l_scalar / r_scalar. */
+    const ray_str_t* la = l_scalar ? l_elems            : l_elems;   /* base */
+    const ray_str_t* lb = r_scalar ? r_elems            : r_elems;
+    const char*      pa = l_scalar ? l_scalar_pool      : l_pool;
+    const char*      pb = r_scalar ? r_scalar_pool      : r_pool;
+    int step_l = l_scalar ? 0 : 1;
+    int step_r = r_scalar ? 0 : 1;
 
-        switch (opc) {
-            case OP_EQ: dst[i] = ray_str_t_eq(a, pa, b, pb); break;
-            case OP_NE: dst[i] = !ray_str_t_eq(a, pa, b, pb); break;
-            case OP_LT: dst[i] = ray_str_t_cmp(a, pa, b, pb) < 0; break;
-            case OP_LE: dst[i] = ray_str_t_cmp(a, pa, b, pb) <= 0; break;
-            case OP_GT: dst[i] = ray_str_t_cmp(a, pa, b, pb) > 0; break;
-            case OP_GE: dst[i] = ray_str_t_cmp(a, pa, b, pb) >= 0; break;
-            default: dst[i] = 0; break;
-        }
+    /* Hoist opc outside the loop — one tight loop per comparison opcode. */
+#define STR_CMP_LOOP(expr)                                          \
+    do {                                                            \
+        for (int64_t i = 0; i < n; i++) {                          \
+            const ray_str_t* a = la + i * step_l;                  \
+            const ray_str_t* b = lb + i * step_r;                  \
+            dst[i] = (uint8_t)(expr);                              \
+        }                                                           \
+    } while (0)
+
+    switch (opc) {
+        case OP_EQ: STR_CMP_LOOP(ray_str_t_eq(a, pa, b, pb));       break;
+        case OP_NE: STR_CMP_LOOP(!ray_str_t_eq(a, pa, b, pb));      break;
+        case OP_LT: STR_CMP_LOOP(ray_str_t_cmp(a, pa, b, pb) < 0);  break;
+        case OP_LE: STR_CMP_LOOP(ray_str_t_cmp(a, pa, b, pb) <= 0); break;
+        case OP_GT: STR_CMP_LOOP(ray_str_t_cmp(a, pa, b, pb) > 0);  break;
+        case OP_GE: STR_CMP_LOOP(ray_str_t_cmp(a, pa, b, pb) >= 0); break;
+        default: for (int64_t i = 0; i < n; i++) dst[i] = 0; break;
     }
+#undef STR_CMP_LOOP
 }
 
 /* Context for parallel RAY_STR binary dispatch */
@@ -1433,147 +1520,109 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         else if (rhs->type == RAY_BOOL || rhs->type == RAY_U8) rp_bool = (uint8_t*)rbase;
     }
 
-    for (int64_t i = 0; i < n; i++) {
-        double lv, rv;
-        if (lp_f64)       lv = lp_f64[i];
-        else if (lp_i64)  lv = (double)lp_i64[i];
-        else if (lp_i32)  lv = (double)lp_i32[i];
-        else if (lp_u32)  lv = (double)lp_u32[i];
-        else if (lp_i16)  lv = (double)lp_i16[i];
-        else if (lp_bool) lv = (double)lp_bool[i];
-        else if (l_scalar && (lhs->type == -RAY_F64 || lhs->type == RAY_F64)) lv = l_f64;
-        else              lv = (double)l_i64;
+    /* Resolve the lhs/rhs reader to a single decision made once before the loop.
+     * Each of these yields a double for the given index. */
+#define LV_READ(i)  (lp_f64 ? lp_f64[i] : lp_i64 ? (double)lp_i64[i] : lp_i32 ? (double)lp_i32[i] : lp_u32 ? (double)lp_u32[i] : lp_i16 ? (double)lp_i16[i] : lp_bool ? (double)lp_bool[i] : (l_scalar && (lhs->type == -RAY_F64 || lhs->type == RAY_F64)) ? l_f64 : (double)l_i64)
+#define RV_READ(i)  (rp_f64 ? rp_f64[i] : rp_i64 ? (double)rp_i64[i] : rp_i32 ? (double)rp_i32[i] : rp_u32 ? (double)rp_u32[i] : rp_i16 ? (double)rp_i16[i] : rp_bool ? (double)rp_bool[i] : (r_scalar && (rhs->type == -RAY_F64 || rhs->type == RAY_F64)) ? r_f64 : (double)r_i64)
 
-        if (rp_f64)       rv = rp_f64[i];
-        else if (rp_i64)  rv = (double)rp_i64[i];
-        else if (rp_i32)  rv = (double)rp_i32[i];
-        else if (rp_u32)  rv = (double)rp_u32[i];
-        else if (rp_i16)  rv = (double)rp_i16[i];
-        else if (rp_bool) rv = (double)rp_bool[i];
-        else if (r_scalar && (rhs->type == -RAY_F64 || rhs->type == RAY_F64)) rv = r_f64;
-        else              rv = (double)r_i64;
+    /* Compute once: is lhs/rhs integer-family (not float)? Used by BOOL path. */
+    int l_is_int = !(lp_f64 || (l_scalar && (lhs->type == -RAY_F64 || lhs->type == RAY_F64)));
+    int r_is_int = !(rp_f64 || (r_scalar && (rhs->type == -RAY_F64 || rhs->type == RAY_F64)));
+    int src_is_i64_all = l_is_int && r_is_int;
 
-        if (out_type == RAY_F64) {
-            double r;
+    /* Hoist out_type outside the loop. Each branch is a tight per-element kernel. */
+    if (out_type == RAY_F64) {
+        double* odst = (double*)dst;
+        switch (op->opcode) {
+            case OP_ADD:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv+rv; } break;
+            case OP_SUB:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv-rv; } break;
+            case OP_MUL:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv*rv; } break;
+            case OP_DIV:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?lv/rv:NAN; } break;
+            case OP_MOD:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); double r; if(rv!=0.0){r=fmod(lv,rv);if(r&&((r>0)!=(rv>0)))r+=rv;}else r=NAN; odst[i]=r; } break;
+            case OP_MIN2: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv<rv?lv:rv; } break;
+            case OP_MAX2: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv>rv?lv:rv; } break;
+            default:      for (int64_t i=0;i<n;i++) odst[i]=0.0; break;
+        }
+    } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP) {
+        int64_t* odst = (int64_t*)dst;
+        switch (op->opcode) {
+            case OP_ADD: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=(int64_t)((uint64_t)li+(uint64_t)ri);}break;
+            case OP_SUB: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=(int64_t)((uint64_t)li-(uint64_t)ri);}break;
+            case OP_MUL: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=(int64_t)((uint64_t)li*(uint64_t)ri);}break;
+            case OP_DIV: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);int64_t r;if(ri==0||(ri==-1&&li==((int64_t)1<<63))){r=0;}else{r=li/ri;if((li^ri)<0&&r*ri!=li)r--;}odst[i]=r;}break;
+            case OP_MOD: for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);int64_t r;if(ri==0||(ri==-1&&li==((int64_t)1<<63))){r=0;}else{r=li%ri;if(r&&(r^ri)<0)r+=ri;}odst[i]=r;}break;
+            case OP_MIN2:for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li<ri?li:ri;}break;
+            case OP_MAX2:for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li>ri?li:ri;}break;
+            default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
+        }
+    } else if (out_type == RAY_I32 || out_type == RAY_DATE || out_type == RAY_TIME) {
+        int32_t* odst = (int32_t*)dst;
+        switch (op->opcode) {
+            case OP_ADD: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);odst[i]=(int32_t)((uint32_t)li+(uint32_t)ri);}break;
+            case OP_SUB: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);odst[i]=(int32_t)((uint32_t)li-(uint32_t)ri);}break;
+            case OP_MUL: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);odst[i]=(int32_t)((uint32_t)li*(uint32_t)ri);}break;
+            case OP_DIV: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);int32_t r;if(ri==0||(ri==-1&&li==((int32_t)1<<31))){r=0;}else{r=li/ri;if((li^ri)<0&&r*ri!=li)r--;}odst[i]=r;}break;
+            case OP_MOD: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);int32_t r;if(ri==0||(ri==-1&&li==((int32_t)1<<31))){r=0;}else{r=li%ri;if(r&&(r^ri)<0)r+=ri;}odst[i]=r;}break;
+            case OP_MIN2:for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);odst[i]=li<ri?li:ri;}break;
+            case OP_MAX2:for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_READ(i),ri=(int32_t)RV_READ(i);odst[i]=li>ri?li:ri;}break;
+            default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
+        }
+    } else if (out_type == RAY_I16) {
+        int16_t* odst = (int16_t*)dst;
+        switch (op->opcode) {
+            case OP_ADD: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=(int16_t)((uint16_t)li+(uint16_t)ri);}break;
+            case OP_SUB: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=(int16_t)((uint16_t)li-(uint16_t)ri);}break;
+            case OP_MUL: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=(int16_t)((uint16_t)li*(uint16_t)ri);}break;
+            case OP_DIV: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=ri?li/ri:0;}break;
+            case OP_MOD: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=ri?li%ri:0;}break;
+            case OP_MIN2:for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=li<ri?li:ri;}break;
+            case OP_MAX2:for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_READ(i),ri=(int16_t)RV_READ(i);odst[i]=li>ri?li:ri;}break;
+            default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
+        }
+    } else if (out_type == RAY_U8) {
+        uint8_t* odst = (uint8_t*)dst;
+        switch (op->opcode) {
+            case OP_ADD: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li+ri;}break;
+            case OP_SUB: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li-ri;}break;
+            case OP_MUL: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li*ri;}break;
+            case OP_DIV: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=ri?li/ri:0;}break;
+            case OP_MOD: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=ri?li%ri:0;}break;
+            case OP_MIN2:for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li<ri?li:ri;}break;
+            case OP_MAX2:for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li>ri?li:ri;}break;
+            default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
+        }
+    } else if (out_type == RAY_BOOL) {
+        uint8_t* odst = (uint8_t*)dst;
+        if (src_is_i64_all) {
+            /* Integer-family operands: compare as int64 */
             switch (op->opcode) {
-                case OP_ADD: r = lv + rv; break;
-                case OP_SUB: r = lv - rv; break;
-                case OP_MUL: r = lv * rv; break;
-                case OP_DIV: r = rv != 0.0 ? lv / rv : NAN; break;
-                case OP_MOD: { if (rv != 0.0) { r = fmod(lv, rv); if (r && ((r > 0) != (rv > 0))) r += rv; } else { r = NAN; } } break;
-                case OP_MIN2: r = lv < rv ? lv : rv; break;
-                case OP_MAX2: r = lv > rv ? lv : rv; break;
-                default: r = 0.0; break;
+                case OP_EQ:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li==ri;}break;
+                case OP_NE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li!=ri;}break;
+                case OP_LT:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li<ri;}break;
+                case OP_LE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li<=ri;}break;
+                case OP_GT:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li>ri;}break;
+                case OP_GE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li>=ri;}break;
+                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li&&ri;}break;
+                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li||ri;}break;
+                default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
             }
-            ((double*)dst)[i] = r;
-        } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP) {
-            int64_t li = (int64_t)lv, ri = (int64_t)rv;
-            int64_t r;
+        } else {
+            /* Float-family: NaN is null sentinel */
             switch (op->opcode) {
-                case OP_ADD: r = (int64_t)((uint64_t)li + (uint64_t)ri); break;
-                case OP_SUB: r = (int64_t)((uint64_t)li - (uint64_t)ri); break;
-                case OP_MUL: r = (int64_t)((uint64_t)li * (uint64_t)ri); break;
-                case OP_DIV:
-                    if (ri==0 || (ri==-1 && li==((int64_t)1<<63))) { r = 0; }
-                    else { r = li/ri; if ((li^ri)<0 && r*ri!=li) r--; }
-                    break;
-                case OP_MOD:
-                    if (ri==0 || (ri==-1 && li==((int64_t)1<<63))) { r = 0; }
-                    else { r = li%ri; if (r && (r^ri)<0) r+=ri; }
-                    break;
-                case OP_MIN2: r = li < ri ? li : ri; break;
-                case OP_MAX2: r = li > ri ? li : ri; break;
-                default: r = 0; break;
+                case OP_EQ:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?1:(ln||rn)?0:lv==rv;}break;
+                case OP_NE:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?0:(ln||rn)?1:lv!=rv;}break;
+                case OP_LT:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?0:ln?1:rn?0:lv<rv;}break;
+                case OP_LE:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?1:ln?1:rn?0:lv<=rv;}break;
+                case OP_GT:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?0:rn?1:ln?0:lv>rv;}break;
+                case OP_GE:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?1:rn?1:ln?0:lv>=rv;}break;
+                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li&&ri;}break;
+                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li||ri;}break;
+                default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
             }
-            ((int64_t*)dst)[i] = r;
-        } else if (out_type == RAY_I32 || out_type == RAY_DATE || out_type == RAY_TIME) {
-            int32_t li = (int32_t)lv, ri = (int32_t)rv;
-            int32_t r;
-            switch (op->opcode) {
-                case OP_ADD: r = (int32_t)((uint32_t)li + (uint32_t)ri); break;
-                case OP_SUB: r = (int32_t)((uint32_t)li - (uint32_t)ri); break;
-                case OP_MUL: r = (int32_t)((uint32_t)li * (uint32_t)ri); break;
-                case OP_DIV:
-                    if (ri==0 || (ri==-1 && li==((int32_t)1<<31))) { r = 0; }
-                    else { r = li/ri; if ((li^ri)<0 && r*ri!=li) r--; }
-                    break;
-                case OP_MOD:
-                    if (ri==0 || (ri==-1 && li==((int32_t)1<<31))) { r = 0; }
-                    else { r = li%ri; if (r && (r^ri)<0) r+=ri; }
-                    break;
-                case OP_MIN2: r = li < ri ? li : ri; break;
-                case OP_MAX2: r = li > ri ? li : ri; break;
-                default: r = 0; break;
-            }
-            ((int32_t*)dst)[i] = r;
-        } else if (out_type == RAY_I16) {
-            int16_t li = (int16_t)lv, ri = (int16_t)rv;
-            int16_t r;
-            switch (op->opcode) {
-                case OP_ADD: r = (int16_t)((uint16_t)li + (uint16_t)ri); break;
-                case OP_SUB: r = (int16_t)((uint16_t)li - (uint16_t)ri); break;
-                case OP_MUL: r = (int16_t)((uint16_t)li * (uint16_t)ri); break;
-                case OP_DIV: r = ri ? li / ri : 0; break;
-                case OP_MOD: r = ri ? li % ri : 0; break;
-                case OP_MIN2: r = li < ri ? li : ri; break;
-                case OP_MAX2: r = li > ri ? li : ri; break;
-                default: r = 0; break;
-            }
-            ((int16_t*)dst)[i] = r;
-        } else if (out_type == RAY_U8) {
-            uint8_t li = (uint8_t)lv, ri = (uint8_t)rv;
-            uint8_t r;
-            switch (op->opcode) {
-                case OP_ADD: r = li + ri; break;
-                case OP_SUB: r = li - ri; break;
-                case OP_MUL: r = li * ri; break;
-                case OP_DIV: r = ri ? li / ri : 0; break;
-                case OP_MOD: r = ri ? li % ri : 0; break;
-                case OP_MIN2: r = li < ri ? li : ri; break;
-                case OP_MAX2: r = li > ri ? li : ri; break;
-                default: r = 0; break;
-            }
-            ((uint8_t*)dst)[i] = r;
-        } else if (out_type == RAY_BOOL) {
-            /* Read raw I64 values directly for null-aware comparison
-             * when both operands are I64/I32-family (not F64). */
-            int src_is_i64 = (lp_i64 || lp_i32 || lp_u32 || lp_i16 ||
-                              (l_scalar && lhs->type != -RAY_F64 && lhs->type != RAY_F64)) &&
-                             (rp_i64 || rp_i32 || rp_u32 || rp_i16 ||
-                              (r_scalar && rhs->type != -RAY_F64 && rhs->type != RAY_F64));
-            int64_t li64 = (int64_t)lv, ri64 = (int64_t)rv;
-            uint8_t r;
-            if (src_is_i64) {
-                /* No sentinel nulls — fix_null_comparisons handles null positions */
-                switch (op->opcode) {
-                    case OP_EQ: r = li64==ri64; break;
-                    case OP_NE: r = li64!=ri64; break;
-                    case OP_LT: r = li64<ri64; break;
-                    case OP_LE: r = li64<=ri64; break;
-                    case OP_GT: r = li64>ri64; break;
-                    case OP_GE: r = li64>=ri64; break;
-                    case OP_AND: r = (uint8_t)lv && (uint8_t)rv; break;
-                    case OP_OR:  r = (uint8_t)lv || (uint8_t)rv; break;
-                    default: r = 0; break;
-                }
-            } else {
-                /* Null-aware F64 comparisons: NaN is null sentinel */
-                int ln = (lv != lv), rn = (rv != rv); /* NaN check */
-                switch (op->opcode) {
-                    case OP_EQ:  r = (ln&&rn) ? 1 : (ln||rn) ? 0 : lv==rv; break;
-                    case OP_NE:  r = (ln&&rn) ? 0 : (ln||rn) ? 1 : lv!=rv; break;
-                    case OP_LT:  r = (ln&&rn) ? 0 : ln ? 1 : rn ? 0 : lv<rv; break;
-                    case OP_LE:  r = (ln&&rn) ? 1 : ln ? 1 : rn ? 0 : lv<=rv; break;
-                    case OP_GT:  r = (ln&&rn) ? 0 : rn ? 1 : ln ? 0 : lv>rv; break;
-                    case OP_GE:  r = (ln&&rn) ? 1 : rn ? 1 : ln ? 0 : lv>=rv; break;
-                    case OP_AND: r = (uint8_t)lv && (uint8_t)rv; break;
-                    case OP_OR:  r = (uint8_t)lv || (uint8_t)rv; break;
-                    default: r = 0; break;
-                }
-            }
-            ((uint8_t*)dst)[i] = r;
         }
     }
+#undef LV_READ
+#undef RV_READ
 }
 
 /* Context for parallel binary dispatch */

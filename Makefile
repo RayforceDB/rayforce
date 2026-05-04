@@ -19,7 +19,19 @@ UNAME_S := $(shell uname -s)
 DEBUG_CFLAGS   = -fPIC $(WARNS) -std=$(STD) -g -O0 -march=native -DDEBUG \
   -fsanitize=address,undefined -fno-omit-frame-pointer
 RELEASE_CFLAGS = -fPIC $(WARNS) -std=$(STD) -O3 -march=native \
-  -funroll-loops -fomit-frame-pointer -fno-math-errno
+  -funroll-loops -fomit-frame-pointer -fno-math-errno \
+  -fassociative-math -ffp-contract=fast -fno-signed-zeros -fno-trapping-math
+# -fassociative-math: license to reorder FP additions/multiplications.
+#   Required for autovectorization of F64 reductions (sum/avg/dot).
+#   Without it, scalar_sum_f64_fn at group.c:1666 is a serial latency
+#   chain (~3-4 cycles/op) instead of 4-8 lanes/cycle SIMD.
+# -ffp-contract=fast: emit FMA (fused multiply-add) where beneficial.
+# -fno-signed-zeros: treat -0.0 == +0.0 (matches how distinct/hashset
+#   normalises -0.0 → 0.0 in group.c:208).
+# -fno-trapping-math: assume FP ops never trap; enables more reorder.
+# NOT enabling -ffinite-math-only or -ffast-math: those assume no
+#   NaN/Inf, which would break our null sentinels (NaN-encoded nulls
+#   in F64 columns).
 
 # Coverage: clang source-based instrumentation.  Sanitizers conflict
 # with the profile runtime, so we drop them; -O0 keeps line numbers
