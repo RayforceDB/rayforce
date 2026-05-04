@@ -337,7 +337,12 @@ ray_t* exec_var_expand(ray_graph_t* g, ray_op_t* op, ray_t* start_vec) {
         frontier[0] = start_node;
         int64_t front_len = 1;
 
-        for (uint8_t depth = 1; depth <= max_depth && front_len > 0; depth++) {
+        /* int (not uint8_t): same overflow class as exec_shortest_path —
+         * if frontier is still non-empty at depth==255, post-increment
+         * wraps back to 0 and the loop spins forever.  front_len>0 guard
+         * usually saves us, but only for graphs whose BFS terminates
+         * quickly. */
+        for (int depth = 1; depth <= (int)max_depth && front_len > 0; depth++) {
             ray_t* next_hdr;
             int64_t next_cap = (front_len > INT64_MAX / 4) ? INT64_MAX : front_len * 4;
             if (next_cap < 64) next_cap = 64;
@@ -532,7 +537,11 @@ ray_t* exec_shortest_path(ray_graph_t* g, ray_op_t* op,
     int64_t q_start = 0, q_end = 1;
     bool found = false;
 
-    for (uint8_t depth = 1; depth <= max_depth && !found; depth++) {
+    /* Loop counter is int (not uint8_t): when max_depth==255, a uint8_t
+     * loop variable would wrap from 255 → 0 on the post-increment and
+     * the BFS would spin forever on a disconnected graph (target
+     * unreachable, queue settles, but the depth counter never exits). */
+    for (int depth = 1; depth <= (int)max_depth && !found; depth++) {
         int64_t level_end = q_end;
         for (int64_t qi = q_start; qi < level_end && !found; qi++) {
             int64_t node = queue[qi];

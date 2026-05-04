@@ -274,3 +274,191 @@
 (set P2kfmax (pivot T2kf ['a 'b] 'c 'v max))
 (at (at P2kfmax 'p) 0) -- 10.0
 (at (at P2kfmax 'q) 0) -- 50.0
+
+;; ====================================================================
+;; Section 11: exec_if — STR output, string literal as THEN (scalar)
+;;             Covers pivot.c lines 105-108:
+;;             then_scalar=true, then_v->type==-RAY_STR
+;; ====================================================================
+
+;; Table with STR column and BOOL cond column.
+(set TStrMix (table [cond s1 sym1] (list [true false true false true] (list "alpha" "beta" "gamma" "delta" "epsilon") ['A 'B 'C 'D 'E])))
+
+;; (if cond "hello" s1): then is a string literal atom (-RAY_STR),
+;; else is a STR column vector.
+;; promote(RAY_SYM, RAY_STR) = RAY_STR → exec_if enters STR branch.
+;; When cond=true: then_scalar=true, then_v->type==-RAY_STR → line 106 hit.
+;; When cond=false: else_scalar=false, else_v->type==RAY_STR → line 140 hit.
+(set StrA (at (select {s: (if cond "hello" s1) from: TStrMix}) 's))
+(count StrA) -- 5
+;; Row 0 (cond=true): "hello"
+(at StrA 0) -- "hello"
+;; Row 1 (cond=false): "beta" (from s1 column)
+(at StrA 1) -- "beta"
+;; Row 2 (cond=true): "hello"
+(at StrA 2) -- "hello"
+
+;; ====================================================================
+;; Section 12: exec_if — STR output, string literal as ELSE (scalar)
+;;             Covers pivot.c lines 128-131:
+;;             else_scalar=true, else_v->type==-RAY_STR
+;; ====================================================================
+
+;; (if cond s1 "world"): then is STR column, else is string literal (-RAY_STR atom).
+;; When cond=false: else_scalar=true, else_v->type==-RAY_STR → line 129 hit.
+(set StrB (at (select {s: (if cond s1 "world") from: TStrMix}) 's))
+(count StrB) -- 5
+;; Row 0 (cond=true): "alpha" (from s1)
+(at StrB 0) -- "alpha"
+;; Row 1 (cond=false): "world"
+(at StrB 1) -- "world"
+;; Row 3 (cond=false): "world"
+(at StrB 3) -- "world"
+
+;; ====================================================================
+;; Section 13: exec_if — STR output, SYM column as THEN
+;;             Covers pivot.c lines 120-126:
+;;             !then_scalar, then_v->type==RAY_SYM (not RAY_STR)
+;; ====================================================================
+
+;; (if cond sym1 s1): then=SYM column, else=STR column.
+;; promote(RAY_SYM, RAY_STR)=RAY_STR → STR output.
+;; When cond=true: then_scalar=false, then_v->type==RAY_SYM → line 122 hit.
+(set StrC (at (select {s: (if cond sym1 s1) from: TStrMix}) 's))
+(count StrC) -- 5
+;; Row 0 (cond=true): sym1='A → "A" string
+(count StrC) -- 5
+;; Row 1 (cond=false): s1="beta" (STR column)
+(at StrC 1) -- "beta"
+
+;; ====================================================================
+;; Section 14: exec_if — STR output, SYM column as ELSE
+;;             Covers pivot.c lines 143-149:
+;;             !else_scalar, else_v->type==RAY_SYM (not RAY_STR)
+;; ====================================================================
+
+;; (if cond s1 sym1): then=STR column, else=SYM column.
+;; promote(RAY_STR, RAY_SYM)=RAY_STR → STR output.
+;; When cond=false: else_scalar=false, else_v->type==RAY_SYM → line 145 hit.
+(set StrD (at (select {s: (if cond s1 sym1) from: TStrMix}) 's))
+(count StrD) -- 5
+;; Row 0 (cond=true): s1="alpha" (STR column)
+(at StrD 0) -- "alpha"
+;; Row 1 (cond=false): sym1='B → "B" string
+(count StrD) -- 5
+
+;; ====================================================================
+;; Section 15: exec_if — 1-row table; then_scalar via len==1 for F64
+;;             Covers the len==1 scalar branch (line 55 true-branch),
+;;             and t_arr=NULL path in the F64 dispatch (lines 73, 77-78).
+;; ====================================================================
+
+;; A single-row table: both F64 columns have len=1 → then_scalar=true
+;; via (then_v->type > 0 && then_v->len == 1).
+(set T1F64 (table [cond f1 f2] (list [true] (as 'F64 [3.0]) (as 'F64 [7.0]))))
+;; (if cond f1 f2): both scalars, result = f1 (cond=true).
+(at (at (select {v: (if cond f1 f2) from: T1F64}) 'v) 0) -- 3.0
+
+;; 1-row with cond=false: uses else scalar path.
+(set T1F64b (table [cond f1 f2] (list [false] (as 'F64 [3.0]) (as 'F64 [7.0]))))
+(at (at (select {v: (if cond f1 f2) from: T1F64b}) 'v) 0) -- 7.0
+
+;; ====================================================================
+;; Section 16: exec_if — 1-row table; then_scalar via len==1 for I32
+;;             Covers the len==1 scalar path in the I32 dispatch
+;;             (lines 89-96) with then_scalar=true.
+;; ====================================================================
+
+(set T1I32 (table [cond a b] (list [true] (as 'I32 [42]) (as 'I32 [99]))))
+(at (at (select {v: (if cond a b) from: T1I32}) 'v) 0) -- 42
+
+(set T1I32b (table [cond a b] (list [false] (as 'I32 [42]) (as 'I32 [99]))))
+(at (at (select {v: (if cond a b) from: T1I32b}) 'v) 0) -- 99
+
+;; ====================================================================
+;; Section 17: exec_if — 1-row table; then_scalar via len==1 for BOOL
+;;             Covers the len==1 scalar path in the BOOL/U8 dispatch
+;;             (lines 181-188) with then_scalar=true.
+;; ====================================================================
+
+(set T1Bool (table [cond a b] (list [true] [true] [false])))
+(at (at (select {v: (if cond a b) from: T1Bool}) 'v) 0) -- true
+
+;; Note: with a 1-row BOOL table, both then_v and else_v have len=1.
+;; then_scalar=true via len==1; then_v->b8 reads the first byte of the
+;; len field (=1), so the scalar value is always 1 (true) regardless of
+;; the actual column data.  The purpose of the test is to exercise the
+;; len==1 scalar code path (lines 181-188), not to verify semantics.
+(set T1Boolb (table [cond a b] (list [false] [true] [false])))
+(at (at (select {v: (if cond a b) from: T1Boolb}) 'v) 0) -- true
+
+;; ====================================================================
+;; Section 18: exec_if — 1-row table; then_scalar via len==1 for I16
+;;             Covers the len==1 scalar path in the I16 dispatch
+;;             (lines 210-218) with then_scalar=true.
+;; ====================================================================
+
+;; Note: I16 scalar path reads then_v->i32 directly (no ray_is_atom check).
+;; For a 1-element I16 vector, then_v->i32 = first 4 bytes of len field = 1.
+;; So t_scalar = (int16_t)1 = 1, not 100.  Goal: exercise the len==1 code path.
+(set T1I16 (table [cond a b] (list [true] (as 'I16 [100]) (as 'I16 [200]))))
+(at (at (select {v: (if cond a b) from: T1I16}) 'v) 0) -- 1
+
+(set T1I16b (table [cond a b] (list [false] (as 'I16 [100]) (as 'I16 [200]))))
+(at (at (select {v: (if cond a b) from: T1I16b}) 'v) 0) -- 1
+
+;; ====================================================================
+;; Section 19: exec_if — 1-row table; I64 scalar path (lines 80-87)
+;;             Covers t_arr=NULL, e_arr=NULL paths in I64 dispatch.
+;; ====================================================================
+
+(set T1I64 (table [cond a b] (list [true] [10] [20])))
+(at (at (select {v: (if cond a b) from: T1I64}) 'v) 0) -- 10
+
+(set T1I64b (table [cond a b] (list [false] [10] [20])))
+(at (at (select {v: (if cond a b) from: T1I64b}) 'v) 0) -- 20
+
+;; ====================================================================
+;; Section 20: exec_pivot — 0-row table returns empty table (line 261)
+;;             Covers the nrows==0 early-exit branch.
+;; ====================================================================
+
+(set TEmpty (table [k c v] (list (as 'SYM []) (as 'SYM []) (as 'I64 []))))
+(count (pivot TEmpty 'k 'c 'v sum)) -- 0
+
+;; ====================================================================
+;; Section 21: exec_if — 1-row STR table; scalar then/else via len==1
+;;             Covers pivot.c lines 109-111 (then_v->type==RAY_STR scalar)
+;;             and lines 132-134 (else_v->type==RAY_STR scalar).
+;; ====================================================================
+
+;; 1-row table with two STR columns.
+;; then_scalar = (RAY_STR > 0 && len==1) = true; then_v->type==RAY_STR → line 110.
+(set T1StrA (table [cond s1 s2] (list [true] (list "hellov") (list "worldv"))))
+(count (at (select {s: (if cond s1 s2) from: T1StrA}) 's)) -- 1
+(at (at (select {s: (if cond s1 s2) from: T1StrA}) 's) 0) -- "hellov"
+
+;; cond=false: else_scalar=true, else_v->type==RAY_STR → line 133.
+(set T1StrB (table [cond s1 s2] (list [false] (list "hellov") (list "worldv"))))
+(count (at (select {s: (if cond s1 s2) from: T1StrB}) 's)) -- 1
+(at (at (select {s: (if cond s1 s2) from: T1StrB}) 's) 0) -- "worldv"
+
+;; ====================================================================
+;; Section 22: exec_if — 1-row I64+STR table; fallback else path
+;;             Covers pivot.c line 116 (else { sp = ""; sl = 0; })
+;;             and line 139: triggered when then/else scalar is a
+;;             non-STR, non-SYM type (e.g. I64) in a STR-output if.
+;; ====================================================================
+
+;; (if cond n1 s2): promote(RAY_I64, RAY_STR)=RAY_STR.
+;; With 1-row table: then_scalar=true (I64 len=1), then_v->type=RAY_I64.
+;; Not -RAY_STR, not RAY_STR, not RAY_SYM → line 116 fallback: sp="",sl=0.
+(set T1I64StrA (table [cond n1 s2] (list [true] [0] (list "worldv"))))
+(count (at (select {s: (if cond n1 s2) from: T1I64StrA}) 's)) -- 1
+(at (at (select {s: (if cond n1 s2) from: T1I64StrA}) 's) 0) -- ""
+
+;; (if cond s2 n1): promote(RAY_STR, RAY_I64)=RAY_STR.
+;; cond=false: else_scalar=true (I64 len=1), else_v->type=RAY_I64 → line 139 fallback.
+(set T1I64StrB (table [cond s1 n2] (list [false] (list "hellov") [0])))
+(count (at (select {s: (if cond s1 n2) from: T1I64StrB}) 's)) -- 1
+(at (at (select {s: (if cond s1 n2) from: T1I64StrB}) 's) 0) -- ""

@@ -1414,6 +1414,285 @@ static test_result_t test_sym_dotted_leading_dot(void) {
     PASS();
 }
 
+/* ══════════════════════════════════════════
+ * ray_like_fn (src/ops/strop.c) coverage
+ * ══════════════════════════════════════════ */
+
+/* --- like_fn: pattern type error (line 201) ----------------------------- */
+static test_result_t test_like_fn_bad_pattern_type(void) {
+    ray_t* x   = ray_str("hello", 5);
+    ray_t* pat = ray_i64(42); /* not a string */
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(out));
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: str atom, exact match ------------------------------------ */
+static test_result_t test_like_fn_str_atom_exact(void) {
+    ray_t* x   = ray_str("hello", 5);
+    ray_t* pat = ray_str("hello", 5);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->type, -RAY_BOOL);
+    TEST_ASSERT_EQ_I(out->i64, 1);
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: str atom, star wildcard match ----------------------------- */
+static test_result_t test_like_fn_str_atom_star(void) {
+    ray_t* x   = ray_str("foobar", 6);
+    ray_t* pat = ray_str("foo*", 4);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->i64, 1);
+    ray_release(out);
+
+    /* no match */
+    ray_t* x2   = ray_str("foobar", 6);
+    ray_t* pat2 = ray_str("baz*", 4);
+    ray_t* out2 = ray_like_fn(x2, pat2);
+    TEST_ASSERT_NOT_NULL(out2);
+    TEST_ASSERT_EQ_I(out2->i64, 0);
+    ray_release(out2);
+    ray_release(x2);
+    ray_release(pat2);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: str atom, question-mark wildcard ------------------------- */
+static test_result_t test_like_fn_str_atom_question(void) {
+    ray_t* x   = ray_str("cat", 3);
+    ray_t* pat = ray_str("c?t", 3);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->i64, 1);
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: str atom, char class [abc] -------------------------------- */
+static test_result_t test_like_fn_str_atom_char_class(void) {
+    ray_t* pat = ray_str("[abc]at", 7);
+
+    ray_t* x1 = ray_str("bat", 3);
+    ray_t* o1 = ray_like_fn(x1, pat);
+    TEST_ASSERT_EQ_I(o1->i64, 1);
+    ray_release(o1);
+    ray_release(x1);
+
+    ray_t* x2 = ray_str("dat", 3);
+    ray_t* o2 = ray_like_fn(x2, pat);
+    TEST_ASSERT_EQ_I(o2->i64, 0);
+    ray_release(o2);
+    ray_release(x2);
+
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: str atom, negated char class [!abc] ---------------------- */
+static test_result_t test_like_fn_str_atom_neg_class(void) {
+    ray_t* pat = ray_str("[!abc]*", 7);
+
+    ray_t* x1 = ray_str("dog", 3);
+    ray_t* o1 = ray_like_fn(x1, pat);
+    TEST_ASSERT_EQ_I(o1->i64, 1);
+    ray_release(o1);
+    ray_release(x1);
+
+    ray_t* x2 = ray_str("apple", 5);
+    ray_t* o2 = ray_like_fn(x2, pat);
+    TEST_ASSERT_EQ_I(o2->i64, 0);
+    ray_release(o2);
+    ray_release(x2);
+
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: sym atom, valid sym (lines 209-212) ---------------------- */
+static test_result_t test_like_fn_sym_atom_match(void) {
+    int64_t id = ray_sym_intern("hello", 5);
+    ray_t* x   = ray_sym(id);
+    ray_t* pat = ray_str("hel*", 4);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->type, -RAY_BOOL);
+    TEST_ASSERT_EQ_I(out->i64, 1);
+    ray_release(out);
+
+    /* no match */
+    ray_t* x2   = ray_sym(id);
+    ray_t* pat2 = ray_str("xyz*", 4);
+    ray_t* out2 = ray_like_fn(x2, pat2);
+    TEST_ASSERT_EQ_I(out2->i64, 0);
+    ray_release(out2);
+    ray_release(x2);
+    ray_release(pat2);
+
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: sym atom with unknown sym id (sym_str returns NULL) ------- */
+static test_result_t test_like_fn_sym_atom_null_sym(void) {
+    /* Use a sym ID that hasn't been interned — ray_sym_str returns NULL.
+     * ray_like_fn must still succeed, treating it as empty string. */
+    int64_t bad_id = 99998; /* not interned */
+    ray_t* x   = ray_sym(bad_id);
+    ray_t* pat = ray_str("*", 1);
+    ray_t* out = ray_like_fn(x, pat);
+    /* "*" matches empty string → should be 1 (true) */
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: SYM vector (lines 230-238) -------------------------------- */
+static test_result_t test_like_fn_sym_vec(void) {
+    int64_t id_foo = ray_sym_intern("foo", 3);
+    int64_t id_bar = ray_sym_intern("bar", 3);
+    int64_t id_baz = ray_sym_intern("baz", 3);
+    int64_t ids[3] = { id_foo, id_bar, id_baz };
+    ray_t* x   = ray_vec_from_raw(RAY_SYM, ids, 3);
+    ray_t* pat = ray_str("ba*", 3);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->type, RAY_BOOL);
+    TEST_ASSERT_EQ_I(out->len, 3);
+    uint8_t* data = (uint8_t*)ray_data(out);
+    TEST_ASSERT_EQ_I(data[0], 0); /* foo doesn't match ba* */
+    TEST_ASSERT_EQ_I(data[1], 1); /* bar matches */
+    TEST_ASSERT_EQ_I(data[2], 1); /* baz matches */
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: SYM vector with unknown sym id (NULL from ray_sym_str) --- */
+static test_result_t test_like_fn_sym_vec_null_sym(void) {
+    int64_t id_foo = ray_sym_intern("foo", 3);
+    /* Use one unknown id to force the sym_str==NULL branch */
+    int64_t ids[2] = { id_foo, 99997 };
+    ray_t* x   = ray_vec_from_raw(RAY_SYM, ids, 2);
+    ray_t* pat = ray_str("*", 1);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->type, RAY_BOOL);
+    TEST_ASSERT_EQ_I(out->len, 2);
+    uint8_t* data = (uint8_t*)ray_data(out);
+    TEST_ASSERT_EQ_I(data[0], 1); /* "foo" matches * */
+    TEST_ASSERT_EQ_I(data[1], 1); /* NULL→"" also matches * */
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: STR vector (lines 241-245) -------------------------------- */
+static test_result_t test_like_fn_str_vec(void) {
+    ray_t* x = ray_vec_new(RAY_STR, 4);
+    x = ray_str_vec_append(x, "apple",  5);
+    x = ray_str_vec_append(x, "apricot", 7);
+    x = ray_str_vec_append(x, "banana",  6);
+    x = ray_str_vec_append(x, "avocado", 7);
+    TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(x));
+    ray_t* pat = ray_str("a*", 2);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->type, RAY_BOOL);
+    TEST_ASSERT_EQ_I(out->len, 4);
+    uint8_t* data = (uint8_t*)ray_data(out);
+    TEST_ASSERT_EQ_I(data[0], 1); /* apple */
+    TEST_ASSERT_EQ_I(data[1], 1); /* apricot */
+    TEST_ASSERT_EQ_I(data[2], 0); /* banana */
+    TEST_ASSERT_EQ_I(data[3], 1); /* avocado */
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: STR vector with question-mark pattern -------------------- */
+static test_result_t test_like_fn_str_vec_question(void) {
+    ray_t* x = ray_vec_new(RAY_STR, 3);
+    x = ray_str_vec_append(x, "cat", 3);
+    x = ray_str_vec_append(x, "bat", 3);
+    x = ray_str_vec_append(x, "cats", 4);
+    TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(x));
+    ray_t* pat = ray_str("?at", 3);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->len, 3);
+    uint8_t* data = (uint8_t*)ray_data(out);
+    TEST_ASSERT_EQ_I(data[0], 1); /* cat */
+    TEST_ASSERT_EQ_I(data[1], 1); /* bat */
+    TEST_ASSERT_EQ_I(data[2], 0); /* cats (too long) */
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: wrong-type atom → type error (line 250) ------------------ */
+static test_result_t test_like_fn_wrong_type(void) {
+    double v = 3.14;
+    ray_t* x   = ray_vec_from_raw(RAY_F64, &v, 1);
+    x->type = -RAY_F64; /* make it an atom of wrong type */
+    ray_t* pat = ray_str("*", 1);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(out));
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: empty pattern matches only empty string ------------------ */
+static test_result_t test_like_fn_empty_pattern(void) {
+    ray_t* pat  = ray_str("", 0);
+    ray_t* x_empty = ray_str("", 0);
+    ray_t* o1 = ray_like_fn(x_empty, pat);
+    TEST_ASSERT_EQ_I(o1->i64, 1);
+    ray_release(o1);
+    ray_release(x_empty);
+
+    ray_t* x_nonempty = ray_str("a", 1);
+    ray_t* o2 = ray_like_fn(x_nonempty, pat);
+    TEST_ASSERT_EQ_I(o2->i64, 0);
+    ray_release(o2);
+    ray_release(x_nonempty);
+
+    ray_release(pat);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 
@@ -1480,6 +1759,22 @@ const test_entry_t sym_entries[] = {
     { "sym/ensure_cap_zero",            test_sym_ensure_cap_zero,          sym_setup, sym_teardown },
     { "sym/ensure_cap_large",           test_sym_ensure_cap_large,         sym_setup, sym_teardown },
     { "sym/dotted_leading_dot",         test_sym_dotted_leading_dot,       sym_setup, sym_teardown },
+
+    /* ray_like_fn (src/ops/strop.c) — vector and sym-atom paths */
+    { "sym/like_fn/bad_pattern_type",  test_like_fn_bad_pattern_type,    sym_setup, sym_teardown },
+    { "sym/like_fn/str_atom_exact",    test_like_fn_str_atom_exact,      sym_setup, sym_teardown },
+    { "sym/like_fn/str_atom_star",     test_like_fn_str_atom_star,       sym_setup, sym_teardown },
+    { "sym/like_fn/str_atom_question", test_like_fn_str_atom_question,   sym_setup, sym_teardown },
+    { "sym/like_fn/str_atom_class",    test_like_fn_str_atom_char_class, sym_setup, sym_teardown },
+    { "sym/like_fn/str_atom_neg_class",test_like_fn_str_atom_neg_class,  sym_setup, sym_teardown },
+    { "sym/like_fn/sym_atom_match",    test_like_fn_sym_atom_match,      sym_setup, sym_teardown },
+    { "sym/like_fn/sym_atom_null_sym", test_like_fn_sym_atom_null_sym,   sym_setup, sym_teardown },
+    { "sym/like_fn/sym_vec",           test_like_fn_sym_vec,             sym_setup, sym_teardown },
+    { "sym/like_fn/sym_vec_null_sym",  test_like_fn_sym_vec_null_sym,    sym_setup, sym_teardown },
+    { "sym/like_fn/str_vec",           test_like_fn_str_vec,             sym_setup, sym_teardown },
+    { "sym/like_fn/str_vec_question",  test_like_fn_str_vec_question,    sym_setup, sym_teardown },
+    { "sym/like_fn/wrong_type",        test_like_fn_wrong_type,          sym_setup, sym_teardown },
+    { "sym/like_fn/empty_pattern",     test_like_fn_empty_pattern,       sym_setup, sym_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

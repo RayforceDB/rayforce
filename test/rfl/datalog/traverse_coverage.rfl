@@ -1,0 +1,403 @@
+;; traverse_coverage.rfl — region coverage push for src/ops/traverse.c
+;;
+;; Targets branches not reached by test/rfl/graph/graph_basic.rfl or
+;; test/rfl/graph/graph_advanced.rfl:
+;;   1. exec_cluster_coeff: deg < 2 branch (isolated / pendant nodes)
+;;   2. exec_dijkstra: negative-weight domain error + out-of-range src/dst
+;;   3. exec_shortest_path: out-of-range src/dst error paths
+;;   4. exec_var_expand: direction=2 (both fwd+rev) BFS
+;;   5. exec_expand: direction=1 (reverse) and direction=2 (both)
+;;   6. exec_connected_comp: multiple components, isolated nodes
+;;   7. exec_topsort: additional DAG shapes + n<=0 guard via tiny graph
+;;   8. exec_pagerank: domain errors, different iteration counts
+;;   9. exec_mst: MST with disconnected forest (not fully spanning)
+;;  10. exec_dfs / exec_random_walk: edge cases (single-node, out-of-range)
+;;  11. exec_betweenness / exec_closeness: additional sampling shapes
+;;  12. exec_louvain: additional graphs
+;;  13. graph API error guards: domain/type/rank errors
+;;
+;; Fixtures:
+;;   G6  — the standard 6-node weighted DAG from graph_basic.rfl
+;;   PEND — star graph: node 0 ← {1,2,3,4,5} (node 0 is hub; leaf nodes
+;;           have degree 1 in undirected sense → triggers deg<2 in cluster)
+;;   DISC — two disconnected 3-cliques: {0,1,2} and {3,4,5} (2 components)
+;;   SELF — simple graph with a self-loop edge 0->0
+
+;; ======================================================================
+;; Fixture G6: 6-node weighted DAG (same as graph_basic.rfl baseline)
+;; edges: 0->1 w=1, 0->2 w=4, 1->2 w=2, 1->3 w=5,
+;;        2->3 w=1, 2->4 w=3, 3->5 w=2, 4->5 w=1
+;; ======================================================================
+(set G6Edges (table [src dst w] (list [0 0 1 1 2 2 3 4] [1 2 2 3 3 4 5 5] [1.0 4.0 2.0 5.0 1.0 3.0 2.0 1.0])))
+(set G6 (.graph.build G6Edges 'src 'dst 'w))
+
+;; ======================================================================
+;; Fixture PEND: star graph (hub=0, spokes 1..5)
+;; edges: 0->1, 0->2, 0->3, 0->4, 0->5 (all weight 1.0)
+;; Undirected: hub node 0 has degree 5; leaf nodes 1..5 each have
+;;   undirected degree 1 — this triggers the deg<2 branch in
+;;   exec_cluster_coeff (line 1537: ldata[v] = 0.0).
+;; ======================================================================
+(set PENDEdges (table [src dst w] (list [0 0 0 0 0] [1 2 3 4 5] [1.0 1.0 1.0 1.0 1.0])))
+(set PEND (.graph.build PENDEdges 'src 'dst 'w))
+
+;; ======================================================================
+;; Fixture DISC: two disconnected 3-cliques
+;; Cluster 1: 0->1, 0->2, 1->2 (all weight 1.0)
+;; Cluster 2: 3->4, 3->5, 4->5 (all weight 1.0)
+;; ======================================================================
+(set DISCEdges (table [src dst w] (list [0 0 1 3 3 4] [1 2 2 4 5 5] [1.0 1.0 1.0 1.0 1.0 1.0])))
+(set DISC (.graph.build DISCEdges 'src 'dst 'w))
+
+;; ======================================================================
+;; Fixture TINY: 2-node graph with a single edge (exercises tiny MST etc.)
+;; ======================================================================
+(set TINYEdges (table [src dst w] (list [0] [1] [2.5])))
+(set TINY (.graph.build TINYEdges 'src 'dst 'w))
+
+;; ======================================================================
+;; Fixture NEG: graph with a negative-weight edge (triggers dijkstra domain error)
+;; ======================================================================
+(set NEGEdges (table [src dst w] (list [0 1] [1 2] [-1.0 1.0])))
+(set NEG (.graph.build NEGEdges 'src 'dst 'w))
+
+;; ======================================================================
+;; 1. exec_cluster_coeff: deg < 2 branch
+;;    Star graph PEND: leaves 1..5 have only 1 undirected neighbor (hub=0)
+;;    -> triggers ldata[v] = 0.0 for those nodes.
+;;    Hub node 0 has 5 neighbors, so cluster coeff is non-zero.
+;; ======================================================================
+(set ClPend (.graph.cluster PEND))
+(count ClPend) -- 6
+;; Sum of all clustering coefficients — leaves have 0, hub may have nonzero.
+(>= (sum (at ClPend '_coefficient)) 0.0) -- true
+;; At least one node must have clustering coeff = 0 (the leaves).
+(>= (count (where (== (at ClPend '_coefficient) 0.0))) 1) -- true
+
+;; Cluster on DISC (two separate 3-cliques): nodes within a clique have
+;; high LCC; the formula triangles / (deg*(deg-1)).
+(set ClDisc (.graph.cluster DISC))
+(count ClDisc) -- 6
+;; All clustering coefficients are non-negative.
+(>= (min (at ClDisc '_coefficient)) 0.0) -- true
+
+;; Cluster on TINY (2-node single edge): both nodes have degree 1 undirected
+;; → deg < 2 for every node → all coefficients are 0.
+(set ClTiny (.graph.cluster TINY))
+(count ClTiny) -- 2
+(== (sum (at ClTiny '_coefficient)) 0.0) -- true
+
+;; Cluster on G6 (baseline).
+(set ClG6 (.graph.cluster G6))
+(count ClG6) -- 6
+(>= (sum (at ClG6 '_coefficient)) 0.0) -- true
+
+;; ======================================================================
+;; 2. exec_dijkstra: error paths
+;;    - negative weight -> domain error (line 950)
+;;    - out-of-range src -> range error (line 936)
+;;    - out-of-range dst -> range error (line 937)
+;; ======================================================================
+(.graph.dijkstra NEG 0) !- domain
+(.graph.dijkstra G6 -1)  !- range
+(.graph.dijkstra G6 100) !- range
+
+;; dijkstra with valid but non-existent dst (dst_id != -1, out of range)
+;; dst=-1 is the "all-source" sentinel, so use dst=100 (out of range)
+(.graph.dijkstra G6 0 100) !- range
+
+;; dijkstra with both valid src and dst (point-to-point mode)
+(set DjPt (.graph.dijkstra G6 0 5))
+(count DjPt) -- 6
+
+;; ======================================================================
+;; 3. exec_shortest_path: out-of-range src/dst (line 494)
+;; ======================================================================
+(.graph.shortest-path G6 -1 5)  !- range
+(.graph.shortest-path G6 0 -1)  !- range
+(.graph.shortest-path G6 100 5) !- range
+(.graph.shortest-path G6 0 100) !- range
+
+;; shortest-path within same component — normal path
+(>= (count (.graph.shortest-path G6 0 5)) 1) -- true
+
+;; shortest-path from a node to itself (src==dst special case, already
+;; covered in graph_basic implicitly but add explicitly here).
+(count (.graph.shortest-path G6 3 3)) -- 1
+
+;; shortest-path on disconnected graph — nodes in different components
+;; cannot be reached => range error.
+(.graph.shortest-path DISC 0 3) !- range
+(.graph.shortest-path DISC 0 5) !- range
+
+;; ======================================================================
+;; 4. exec_var_expand: direction=2 (both forward and reverse BFS)
+;;    and direction=1 (reverse)
+;;    Note: graph_advanced.rfl tests direction=1 but only on G6.
+;;    Test on DISC and PEND for new graph shapes.
+;; ======================================================================
+;; var-expand with direction=2 on G6: BFS both directions from node 2
+(set VeBoth (.graph.var-expand G6 2 1 3 2))
+(>= (count VeBoth) 1) -- true
+
+;; direction=2 on PEND from hub: both fwd and rev neighbors (star spokes)
+(set VePendBoth (.graph.var-expand PEND 0 1 1 2))
+;; Hub 0 has 5 fwd-neighbors (spokes 1..5); no rev-edges → depth=1 gives 5
+(count VePendBoth) -- 5
+
+;; direction=1 (reverse) on G6 from node 5 — walks backward through rev CSR
+(set VeRev5 (.graph.var-expand G6 5 1 3 1))
+(>= (count VeRev5) 1) -- true
+
+;; direction=0 on DISC from node 0 (within its component)
+(set VeDisc (.graph.var-expand DISC 0 1 2))
+(count VeDisc) -- 2
+
+;; ======================================================================
+;; 5. exec_expand: direction=1 (reverse) and direction=2 (both)
+;; ======================================================================
+;; direction=0 (default forward) on PEND hub 0 → 5 forward neighbors
+(count (.graph.expand PEND 0)) -- 5
+
+;; direction=1 (reverse): from a spoke, its rev-neighbor is hub=0
+;; Spoke 1 has no fwd-edges but hub=0 is its rev-neighbor in PEND
+(set ExpRev (.graph.expand PEND 1 1))
+(count ExpRev) -- 1
+(== (at (at ExpRev '_dst) 0) 0) -- true
+
+;; direction=2 (both): from node 2 in G6
+;; fwd: 3, 4 (from edges 2->3 and 2->4); rev: 0, 1 (from 0->2 and 1->2)
+(set ExpBoth (.graph.expand G6 2 2))
+(count ExpBoth) -- 4
+
+;; direction=1 reverse from G6 node 5 (two rev-edges into 5: from 3, 4)
+(set ExpRev5 (.graph.expand G6 5 1))
+(count ExpRev5) -- 2
+
+;; error: direction out of range
+(.graph.expand G6 0 3) !- domain
+(.graph.expand G6 0 -1) !- domain
+
+;; ======================================================================
+;; 6. exec_connected_comp: multiple components, isolated nodes
+;; ======================================================================
+;; DISC has exactly 2 components.
+(set CcDisc (.graph.connected DISC))
+(count (distinct (at CcDisc '_component))) -- 2
+(count CcDisc) -- 6
+
+;; PEND is fully connected (hub + spokes all reachable via undirected).
+(set CcPend (.graph.connected PEND))
+(count (distinct (at CcPend '_component))) -- 1
+
+;; G6 is fully connected (one component).
+(set CcG6 (.graph.connected G6))
+(count (distinct (at CcG6 '_component))) -- 1
+
+;; TINY (2-node) — one component.
+(set CcTiny (.graph.connected TINY))
+(count (distinct (at CcTiny '_component))) -- 1
+(count CcTiny) -- 2
+
+;; ======================================================================
+;; 7. exec_topsort: additional DAG shapes
+;; ======================================================================
+;; PEND: hub-to-spokes DAG — valid total order exists.
+(set TsPend (.graph.topsort PEND))
+(count TsPend) -- 6
+(min (at TsPend '_order)) -- 0
+(max (at TsPend '_order)) -- 5
+
+;; TINY (2-node DAG)
+(set TsTiny (.graph.topsort TINY))
+(count TsTiny) -- 2
+(min (at TsTiny '_order)) -- 0
+(max (at TsTiny '_order)) -- 1
+
+;; topsort on a graph with a cycle → domain error.
+;; Build a minimal cycle: 0->1->0
+(set CYCEdges (table [src dst] (list [0 1] [1 0])))
+(set CYC (.graph.build CYCEdges 'src 'dst))
+(.graph.topsort CYC) !- domain
+(.graph.free CYC)
+
+;; ======================================================================
+;; 8. exec_pagerank: domain errors + different parameters
+;; ======================================================================
+;; iter=0 → domain error (v <= 0)
+(.graph.pagerank G6 0) !- domain
+;; damping=0 → domain error
+(.graph.pagerank G6 30 0.0) !- domain
+;; damping=1 → domain error
+(.graph.pagerank G6 30 1.0) !- domain
+;; damping out of range (negative)
+(.graph.pagerank G6 30 -0.5) !- domain
+
+;; Valid pagerank on PEND
+(set PrPend (.graph.pagerank PEND 20 0.85))
+(count PrPend) -- 6
+(>= (sum (at PrPend '_rank)) 0.99) -- true
+(<= (sum (at PrPend '_rank)) 1.01) -- true
+
+;; Valid pagerank on TINY
+(set PrTiny (.graph.pagerank TINY 10 0.5))
+(count PrTiny) -- 2
+
+;; ======================================================================
+;; 9. exec_mst: disconnected graph → forest (fewer than n-1 edges)
+;; ======================================================================
+;; DISC has 2 components → MST is actually 2 trees = 4 edges total
+;; (3 edges per 3-node tree, but Kruskal picks n-k edges where k=components)
+(set MstDisc (.graph.mst DISC))
+;; 6 nodes, 2 components → spanning forest has 6-2=4 edges
+(count MstDisc) -- 4
+
+;; MST on TINY (2 nodes, 1 edge) → exactly 1 MST edge.
+(set MstTiny (.graph.mst TINY))
+(count MstTiny) -- 1
+
+;; MST on PEND (star: 5 edges = n-1 = 5 → full spanning tree).
+(set MstPend (.graph.mst PEND))
+(count MstPend) -- 5
+
+;; ======================================================================
+;; 10. exec_dfs: edge cases + various graph shapes
+;; ======================================================================
+;; DFS on PEND from hub 0 with max_depth=1 → only depth-0 (hub) and depth-1 (5 leaves)
+(set DfsPend (.graph.dfs PEND 0 1))
+(count DfsPend) -- 6
+
+;; DFS on PEND from a leaf (max_depth = unlimited) — leaf has no out-edges
+(set DfsLeaf (.graph.dfs PEND 1))
+(count DfsLeaf) -- 1
+(first (at DfsLeaf '_depth)) -- 0
+
+;; DFS from out-of-range node
+(.graph.dfs G6 -1)   !- range
+(.graph.dfs G6 100)  !- range
+
+;; max-depth=0: only the source is returned.
+(set DfsTiny0 (.graph.dfs TINY 0 0))
+(count DfsTiny0) -- 1
+(first (at DfsTiny0 '_node)) -- 0
+
+;; ======================================================================
+;; 11. exec_random_walk: edge cases
+;; ======================================================================
+;; Random walk from an out-of-range node
+(.graph.random-walk G6 -1) !- range
+(.graph.random-walk G6 100) !- range
+
+;; Random walk on PEND from leaf (immediate dead-end → 1 row)
+(count (.graph.random-walk PEND 1 10)) -- 1
+
+;; Random walk from hub 0 on PEND (hub has 5 fwd-edges, walk length 3)
+(set RwPend (.graph.random-walk PEND 0 3))
+(<= (count RwPend) 4) -- true
+(>= (count RwPend) 1) -- true
+(first (at RwPend '_node)) -- 0
+
+;; Random walk from node 0 on TINY (only 1 fwd-edge 0->1, then dead-end)
+(set RwTiny (.graph.random-walk TINY 0 5))
+(count RwTiny) -- 2
+
+;; ======================================================================
+;; 12. exec_betweenness: additional shapes
+;; ======================================================================
+;; Betweenness on PEND: hub 0 lies on every shortest path between leaves
+;; → should have the highest centrality.  5 leaves = C(5,2)=10 paths.
+(set BPend (.graph.betweenness PEND))
+(count BPend) -- 6
+(>= (min (at BPend '_centrality)) 0.0) -- true
+;; hub=0 has the highest betweenness among all nodes.
+(set BPend_node (at BPend '_node))
+(set BPend_cent (at BPend '_centrality))
+(> (at BPend_cent (at (where (== BPend_node 0)) 0)) 0.0) -- true
+
+;; Betweenness on DISC: 2 components — no paths cross them, inter-component
+;; centrality is 0. Since the 3-cliques each have all paths within them.
+(set BDisc (.graph.betweenness DISC))
+(count BDisc) -- 6
+(>= (min (at BDisc '_centrality)) 0.0) -- true
+
+;; Betweenness on TINY (2 nodes — single edge, no intermediaries).
+(set BTiny (.graph.betweenness TINY))
+(count BTiny) -- 2
+
+;; ======================================================================
+;; 13. exec_closeness: additional shapes
+;; ======================================================================
+;; Closeness on PEND: hub 0 is close to all leaves; leaves are far from each other.
+(set CPend (.graph.closeness PEND))
+(count CPend) -- 6
+(>= (min (at CPend '_centrality)) 0.0) -- true
+
+;; Closeness on DISC: nodes in different components cannot reach each other.
+;; Only within-component paths count.
+(set CDisc (.graph.closeness DISC))
+(count CDisc) -- 6
+(>= (min (at CDisc '_centrality)) 0.0) -- true
+
+;; ======================================================================
+;; 14. exec_louvain: additional graphs
+;; ======================================================================
+;; Louvain on DISC (two clear communities → should find ~2 communities).
+(set LDisc (.graph.louvain DISC))
+(count LDisc) -- 6
+(>= (min (at LDisc '_community)) 0) -- true
+
+;; Louvain on TINY (2 nodes → 1 or 2 communities).
+(set LTiny (.graph.louvain TINY))
+(count LTiny) -- 2
+(>= (min (at LTiny '_community)) 0) -- true
+
+;; Louvain with max-iter=1 on PEND.
+(set LPend (.graph.louvain PEND 1))
+(count LPend) -- 6
+
+;; ======================================================================
+;; 15. graph API error guards at wrapper level
+;; ======================================================================
+;; pagerank: too many args
+(.graph.pagerank G6 30 0.85 'extra) !- rank
+;; topsort: requires exactly 1 handle
+(.graph.topsort G6 0) !- rank
+;; cluster: requires exactly 1 handle
+(.graph.cluster G6 0) !- rank
+;; connected: requires exactly 1 handle
+(.graph.connected G6 0) !- rank
+;; betweenness: sample out of range
+(.graph.betweenness G6 -1) !- domain
+;; closeness: sample out of range
+(.graph.closeness G6 -1) !- domain
+;; shortest-path: wrong arg count
+(.graph.shortest-path G6 0) !- rank
+(.graph.shortest-path G6 0 1 2 3) !- rank
+;; dfs: wrong arg count
+(.graph.dfs G6) !- rank
+(.graph.dfs G6 0 1 2) !- rank
+;; dfs: max-depth out of range
+(.graph.dfs G6 0 -1) !- domain
+;; expand: wrong arg count
+(.graph.expand G6) !- rank
+(.graph.expand G6 0 1 2) !- rank
+;; var-expand: depth constraints
+(.graph.var-expand G6 0 -1 5)  !- domain
+(.graph.var-expand G6 0 3 2)   !- domain
+(.graph.var-expand G6 0 0 256) !- domain
+
+;; ======================================================================
+;; 16. exec_var_expand domain guard
+;; ======================================================================
+;; var-expand: direction out of range
+(.graph.var-expand G6 0 1 3 3) !- domain
+(.graph.var-expand G6 0 1 3 -1) !- domain
+
+;; ======================================================================
+;; Cleanup
+;; ======================================================================
+(.graph.free G6)
+(.graph.free PEND)
+(.graph.free DISC)
+(.graph.free TINY)
+(.graph.free NEG)
