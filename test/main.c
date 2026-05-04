@@ -96,6 +96,7 @@ extern const test_entry_t atom_entries[];
 extern const test_entry_t audit_entries[];
 extern const test_entry_t block_entries[];
 extern const test_entry_t buddy_entries[];
+extern const test_entry_t compile_entries[];
 extern const test_entry_t cow_entries[];
 extern const test_entry_t csr_entries[];
 extern const test_entry_t csv_entries[];
@@ -109,6 +110,7 @@ extern const test_entry_t fvec_entries[];
 extern const test_entry_t graph_entries[];
 extern const test_entry_t graph_builtin_entries[];
 extern const test_entry_t group_extra_entries[];
+extern const test_entry_t hash_entries[];
 extern const test_entry_t heap_entries[];
 extern const test_entry_t index_entries[];
 extern const test_entry_t ipc_entries[];
@@ -130,6 +132,7 @@ extern const test_entry_t repl_entries[];
 extern const test_entry_t rowsel_entries[];
 extern const test_entry_t runtime_entries[];
 extern const test_entry_t sel_entries[];
+extern const test_entry_t sort_entries[];
 extern const test_entry_t splay_entries[];
 extern const test_entry_t store_entries[];
 extern const test_entry_t str_entries[];
@@ -143,11 +146,12 @@ extern const test_entry_t window_entries[];
 
 static const test_entry_t* const compiled_groups[] = {
     err_entries,      arena_entries,    atom_entries,     audit_entries,
-    block_entries,    buddy_entries,    cow_entries,      csr_entries,
+    block_entries,    buddy_entries,    compile_entries,  cow_entries,      csr_entries,
     csv_entries,      datalog_entries,  dict_entries,     dump_entries,
     embedding_entries, exec_entries,
     format_entries,   fvec_entries,     graph_entries,    graph_builtin_entries,
     group_extra_entries,
+    hash_entries,
     heap_entries,
     index_entries,    ipc_entries,
     journal_entries,
@@ -157,7 +161,7 @@ static const test_entry_t* const compiled_groups[] = {
     pipe_entries,     platform_entries,
     pool_entries,     progress_entries,
     repl_entries,     rowsel_entries,   runtime_entries,  sel_entries,
-    splay_entries,    store_entries,
+    sort_entries,     splay_entries,    store_entries,
     str_entries,      sym_entries,      sys_entries,      table_entries,
     term_entries,
     types_entries,    vec_entries,      window_entries,

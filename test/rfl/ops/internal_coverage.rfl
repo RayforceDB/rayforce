@@ -1,0 +1,360 @@
+;; Coverage for src/ops/internal.h static-inline helpers that are
+;; instantiated in production TUs (exec.c, filter.c, expr.c, etc.)
+;; but have never been exercised through the test suite.
+;;
+;; Target helpers (aggregate line counts = 0 before this file):
+;;   - parted_first_attrs / parted_seg_esz_ok      (lines 60-71)
+;;   - read_col_i64 SYM W8/W16/W32 branches        (lines 146-148)
+;;   - col_propagate_str_pool_parted                (lines 218-226)
+;;   - parted_str_single_pool                       (lines 229-237)
+;;   - col_propagate_nulls_range loop body          (lines 261-265)
+;;   - col_propagate_nulls_filter loop body         (lines 273-281)
+;;   - parted_str_append_elem                       (lines 285-297)
+;;   - parted_gather_str_rows                       (lines 302-341)
+;;   - parted_head_str                              (lines 344-360)
+;;   - parted_tail_str                              (lines 363-390)
+;;   - parted_flatten_str                           (lines 393-406)
+;;   - atom_to_str_t SYM/long-string branches       (lines 483-498)
+;;   - par_set_null idx>=128 path                   (lines 954-956)
+;;
+;; Strategy:
+;;   1. Parted STR tables (build on disk via .db.splayed.set +
+;;      .db.parted.get) → HEAD, TAIL, col-flatten (OP_SCAN), FILTER
+;;      all hit parted_head_str / parted_tail_str / parted_flatten_str /
+;;      parted_gather_str_rows / parted_str_single_pool /
+;;      col_propagate_str_pool_parted / parted_first_attrs.
+;;   2. Parted SYM table → parted_first_attrs + parted_seg_esz_ok.
+;;   3. Narrow SYM column (via CSV with low cardinality) + GROUP BY →
+;;      read_col_i64 W8 branch in group.c.
+;;   4. Nullable columns + HEAD/TAIL → col_propagate_nulls_range loop.
+;;   5. Nullable columns + FILTER → col_propagate_nulls_filter loop.
+;;   6. atom_to_str_t with SYM atom (STR col == SYM scalar).
+;;   7. atom_to_str_t with long string scalar (>12 bytes).
+;;   8. Window function on 200+ row table with null outputs →
+;;      par_set_null idx>=128.
+
+(.sys.exec "rm -rf /tmp/rfl_int_cov_parted /tmp/rfl_int_cov_sym /tmp/rfl_int_cov_narrow /tmp/rfl_int_cov_null /tmp/rfl_int_cov_null_str.csv /tmp/rfl_int_cov_null_seg /tmp/rfl_int_cov_65seg")
+
+;; ======================================================================
+;; 1.  Parted STR tables  — parted_head_str / parted_tail_str /
+;;     parted_flatten_str / parted_gather_str_rows /
+;;     parted_str_single_pool / col_propagate_str_pool_parted /
+;;     parted_first_attrs (exec.c, filter.c).
+;; ======================================================================
+
+;; Build two date-partitioned splays, each with a STR column.
+(set SA (table [id name] (list [1 2 3] (list "alice" "bob" "charlie"))))
+(set SB (table [id name] (list [4 5]   (list "dave" "eve"))))
+(.db.splayed.set "/tmp/rfl_int_cov_parted/2024.01.01/t/" SA)
+(.db.splayed.set "/tmp/rfl_int_cov_parted/2024.01.02/t/" SB)
+
+(set PT (.db.parted.get "/tmp/rfl_int_cov_parted/" 't))
+
+;; Basic sanity: 5 data rows + 1 partition-key column = 3 columns.
+(count PT) -- 5
+(count (key PT)) -- 3
+
+;; ── 1a. Parted STR flatten (OP_SCAN → parted_flatten_str) ──
+;; A predicate that references the STR column forces exec.c OP_SCAN
+;; to evaluate with g->table = PT (parted), hitting the
+;; RAY_IS_PARTED branch for base == RAY_STR → parted_flatten_str.
+(count (select {from: PT where: (== name "alice")})) -- 1
+(first (at (select {from: PT where: (== name "alice")}) 'name)) -- "alice"
+(count (select {from: PT where: (!= name "alice")})) -- 4
+
+;; ── 1b. HEAD on parted STR table (parted_head_str) ──
+;; select { take: 2 } triggers OP_HEAD → parted_head_str for the STR col
+;; and parted_first_attrs / parted_seg_esz_ok for the I64 col.
+(count (select {from: PT take: 2})) -- 2
+(count (at (select {from: PT take: 2}) 'name)) -- 2
+(first (at (select {from: PT take: 2}) 'name)) -- "alice"
+(at (at (select {from: PT take: 2}) 'name) 1) -- "bob"
+
+;; ── 1c. TAIL on parted STR table (parted_tail_str) ──
+;; select { take: -2 } triggers OP_TAIL → parted_tail_str.
+(count (select {from: PT take: -2})) -- 2
+(first (at (select {from: PT take: -2}) 'name)) -- "dave"
+(at (at (select {from: PT take: -2}) 'name) 1) -- "eve"
+
+;; Tail larger than total: all rows returned.
+(count (select {from: PT take: -99})) -- 5
+
+;; ── 1d. FILTER on parted STR table ──
+;; select { where: ... } triggers exec_filter on the parted table,
+;; which calls parted_gather_str_rows + parted_str_single_pool +
+;; col_propagate_str_pool_parted for the STR column.
+(count (select {from: PT where: (> id 2)})) -- 3
+(first (at (select {from: PT where: (> id 2)}) 'name)) -- "charlie"
+(count (select {from: PT where: (> id 0)})) -- 5
+
+;; ── 1e. HEAD within first partition (parted_head_str segment loop) ──
+(count (select {from: PT take: 3})) -- 3
+(at (at (select {from: PT take: 3}) 'name) 2) -- "charlie"
+
+;; ── 1f. TAIL spanning partitions (parted_tail_str skip logic) ──
+;; Skip = 5 - 4 = 1 → skip first row, return rows 2..5.
+(count (select {from: PT take: -4})) -- 4
+(first (at (select {from: PT take: -4}) 'name)) -- "bob"
+
+;; ── 1g. Parted STR with null values → parted_str_append_elem null path ──
+;; Create a CSV with one empty STR field (CSV empty field = null STR).
+;; Splay as a parted partition, load back, then HEAD / FILTER exercises
+;; parted_str_append_elem lines 287-290 (null element in STR segment).
+(.sys.exec "printf 'id,name\n1,alice\n2,\n3,charlie\n' > /tmp/rfl_int_cov_null_str.csv") -- 0
+(set SN_A (.csv.read [I64 STR] "/tmp/rfl_int_cov_null_str.csv"))
+(count SN_A) -- 3
+(nil? (at (at SN_A 'name) 1)) -- true
+
+(.db.splayed.set "/tmp/rfl_int_cov_null/2024.01.01/t/" SN_A)
+(set SN_B (table [id name] (list [4 5] (list "dave" "eve"))))
+(.db.splayed.set "/tmp/rfl_int_cov_null/2024.01.02/t/" SN_B)
+
+(set PN (.db.parted.get "/tmp/rfl_int_cov_null/" 't))
+(count PN) -- 5
+(count (key PN)) -- 3
+
+;; HEAD includes null element at position 1 → parted_head_str calls
+;; parted_str_append_elem(seg, 1, pool) → null path lines 287-290.
+(count (select {from: PN take: 3})) -- 3
+(nil? (at (at (select {from: PN take: 3}) 'name) 1)) -- true
+(at (at (select {from: PN take: 3}) 'name) 0) -- "alice"
+(at (at (select {from: PN take: 3}) 'name) 2) -- "charlie"
+
+;; FILTER via exec_filter_head: HEAD(FILTER) fused path calls
+;; parted_gather_str_rows → parted_str_append_elem on null element.
+(count (select {from: PN where: (< id 4) take: 3})) -- 3
+(nil? (at (at (select {from: PN where: (< id 4) take: 3}) 'name) 1)) -- true
+
+;; ── 1h. Parted STR with missing column in second partition ─────────────
+;; segs[1] = NULL for the STR column when partition 2 lacks the column.
+;; A HEAD+FILTER fused query (select with where + take) triggers
+;; exec_filter_head → parted_gather_str_rows.  When the row index lands
+;; in the NULL-segment range the null-segment branch (lines 327-329)
+;; appends an empty null string to the output.
+;; Partition 2 (2024.01.02) has no 'name' column so the 'name' parted
+;; column has segs[0]=["alpha","beta"] and segs[1]=NULL.
+(set HN_A (table [id name] (list [1 2] (list "alpha" "beta"))))
+(set HN_B (table [id] (list [3 4])))
+(.db.splayed.set "/tmp/rfl_int_cov_null_seg/2024.01.01/t/" HN_A)
+(.db.splayed.set "/tmp/rfl_int_cov_null_seg/2024.01.02/t/" HN_B)
+
+(set PNS (.db.parted.get "/tmp/rfl_int_cov_null_seg/" 't))
+;; Partition 2024.01.02 has no 'name' col → segs[1] = NULL for that segment.
+;; count = rows from both partitions (4 total)
+(count PNS) -- 4
+
+;; FILTER+HEAD fusion: passes all rows → parted_gather_str_rows is called
+;; with match_idx=[0,1,2,3], rows 2 and 3 land in the NULL segment.
+;; The null-segment branch (lines 327-329) appends null entries for those.
+(count (select {from: PNS where: (> id 0) take: 4})) -- 4
+
+
+;; ======================================================================
+;; 2.  Parted SYM table  — parted_first_attrs + parted_seg_esz_ok.
+;; ======================================================================
+;; Build two date-partitioned splays, each with a SYM column.
+;; When exec.c processes HEAD/TAIL/flatten on a parted SYM column it
+;; calls parted_first_attrs (to get the symbol width attrs from the
+;; first non-NULL segment) and parted_seg_esz_ok.
+(set SC (table [id sym] (list [1 2 3] ['foo 'bar 'baz])))
+(set SD (table [id sym] (list [4 5]   ['qux 'quux])))
+(.db.splayed.set "/tmp/rfl_int_cov_sym/2024.01.01/s/" SC)
+(.db.splayed.set "/tmp/rfl_int_cov_sym/2024.01.02/s/" SD)
+
+(set PS (.db.parted.get "/tmp/rfl_int_cov_sym/" 's))
+(count PS) -- 5
+;; HEAD of parted SYM → parted_first_attrs + typed_vec_new + parted_seg_esz_ok.
+(count (select {from: PS take: 3})) -- 3
+(first (at (select {from: PS take: 3}) 'sym)) -- 'foo
+;; TAIL of parted SYM → parted_first_attrs + parted_seg_esz_ok.
+(count (select {from: PS take: -2})) -- 2
+;; FILTER of parted SYM — exercise parted_first_attrs in filter.c path.
+(count (select {from: PS where: (> id 2)})) -- 3
+
+;; ======================================================================
+;; 3.  Narrow SYM column from CSV  — read_col_i64 W8 / W16 branches.
+;; ======================================================================
+;; The CSV loader narrows SYM width when cardinality allows.
+;; A 3-distinct-value SYM column fits in W8 (≤255 ids).
+;; GROUP BY on the narrow SYM column → group.c read_col_i64 W8 branch.
+;; JOIN on it → join.c read_col_i64 W8 branch.
+(.sys.exec "printf 'id,cat\n1,a\n2,b\n3,a\n4,c\n5,b\n6,a\n' > /tmp/rfl_int_cov_narrow.csv") -- 0
+(set NC (.csv.read [I64 SYMBOL] "/tmp/rfl_int_cov_narrow.csv"))
+(count NC) -- 6
+
+;; GROUP BY the narrow SYM column — forces read_col_i64 W8 arm.
+(count (select {c: (count id) from: NC by: cat})) -- 3
+;; The 'a' group has 3 rows.
+(first (at (select {c: (count id) s: (sum id) from: NC by: cat asc: cat}) 'c)) -- 3
+
+;; INNER-JOIN on the narrow SYM column — join.c read_col_i64 W8 arm.
+;; (drop unused NC2 variable; use NC for both sides)
+;; a=3, b=2, c=1; self-join: 3*3 + 2*2 + 1*1 = 9+4+1 = 14
+(count (inner-join [cat] NC NC)) -- 14
+
+;; ======================================================================
+;; 4.  Nullable columns + HEAD/TAIL — col_propagate_nulls_range loop.
+;; ======================================================================
+;; For col_propagate_nulls_range to loop past line 260, the source
+;; column must have RAY_ATTR_HAS_NULLS set.  The early-return at
+;; line 260 only fires when the flag is absent; setting nulls drives
+;; the loop body at lines 261-264.
+(set TN (table [a b] (list [1 0Nl 3 4 5 0Nl 7] [10 20 30 40 50 60 70])))
+
+;; HEAD keeps first 4 rows — col_propagate_nulls_range called for col 'a
+;; which has nulls; loop body sets null bit at position 1 in result.
+(count (select {from: TN take: 4})) -- 4
+(nil? (at (at (select {from: TN take: 4}) 'a) 1)) -- true
+(at (at (select {from: TN take: 4}) 'a) 0) -- 1
+
+;; TAIL keeps last 4 rows — src_off = 3, null at src_off+2 (row 5=0Nl)
+(count (select {from: TN take: -4})) -- 4
+(nil? (at (at (select {from: TN take: -4}) 'a) 2)) -- true
+(at (at (select {from: TN take: -4}) 'a) 0) -- 4
+
+;; HEAD of 1 — no null rows in first row, still exercises loop.
+(at (at (select {from: TN take: 1}) 'a) 0) -- 1
+(nil? (at (at (select {from: TN take: 1}) 'a) 0)) -- false
+
+;; HEAD where all taken rows are non-null (loop runs but sets nothing).
+(count (select {from: TN take: 1})) -- 1
+
+;; ======================================================================
+;; 5.  Nullable columns + FILTER — col_propagate_nulls_filter loop.
+;; ======================================================================
+;; col_propagate_nulls_filter is called inside exec_filter_vec when
+;; the source column has RAY_ATTR_HAS_NULLS.  The loop body (lines
+;; 273-280) only runs when HAS_NULLS is set.
+(set TF (table [a b] (list [1 0Nl 3 0Nl 5] [1 2 3 4 5])))
+
+;; Filter keeps rows where b > 1 — rows 1,2,3,4 pass; row 0 fails.
+;; col 'a' has nulls at rows 1 and 3 (both in result → null bits set).
+(count (select {from: TF where: (> b 1)})) -- 4
+(nil? (at (at (select {from: TF where: (> b 1)}) 'a) 0)) -- true
+(nil? (at (at (select {from: TF where: (> b 1)}) 'a) 2)) -- true
+(at (at (select {from: TF where: (> b 1)}) 'a) 1) -- 3
+
+;; All-pass: loop still iterates over every row with mask[i]=1.
+(count (select {from: TF where: (> b 0)})) -- 5
+(nil? (at (at (select {from: TF where: (> b 0)}) 'a) 1)) -- true
+(nil? (at (at (select {from: TF where: (> b 0)}) 'a) 3)) -- true
+
+;; ======================================================================
+;; 6.  atom_to_str_t with -RAY_STR atom short string (lines 456-493)
+;; ======================================================================
+;; Compare a flat STR column against short string scalars (≤ 12 bytes).
+;; binary_range_str calls atom_to_str_t(rhs, ...) where rhs->type == -RAY_STR
+;; → hits the if (atom->type == -RAY_STR) branch and then the
+;; sl <= RAY_STR_INLINE_MAX path (lines 491-493).
+;; Also exercises NE and GT comparisons to prove result correctness.
+(set TSS (table [s v] (list (list "alice" "bob" "charlie") [1 2 3])))
+(count (select {from: TSS where: (== s "alice")})) -- 1
+(first (at (select {from: TSS where: (== s "alice")}) 'v)) -- 1
+(count (select {from: TSS where: (!= s "bob")})) -- 2
+(count (select {from: TSS where: (>= s "bob")})) -- 2
+
+;; ======================================================================
+;; 7.  atom_to_str_t with long string scalar (>12 bytes, lines 495-498)
+;; ======================================================================
+;; Strings longer than RAY_STR_INLINE_MAX=12 bytes trigger the
+;; "pool" branch of atom_to_str_t where the prefix is stored
+;; separately.
+(set TLS (table [s v] (list (list "short" "a_very_long_string_exceeding_12" "tiny") [10 20 30])))
+(count (select {from: TLS where: (== s "a_very_long_string_exceeding_12")})) -- 1
+(first (at (select {from: TLS where: (== s "a_very_long_string_exceeding_12")}) 'v)) -- 20
+(count (select {from: TLS where: (!= s "a_very_long_string_exceeding_12")})) -- 2
+
+;; ======================================================================
+;; 8.  par_set_null idx >= 128 (lines 954-956 in window.c instantiation)
+;; ======================================================================
+;; Window functions with null outputs call win_set_null (= par_set_null).
+;; With idx < 128 the fast __atomic_fetch_or inline path is hit.
+;; To reach idx >= 128 we need > 128 rows where the window produces
+;; a null past row 128.  LAG/LEAD with offset > available rows fill
+;; with null; using offset=1 on a 200-row table with 1 partition
+;; leaves row 0 (LAG) or row 199 (LEAD) null — but more rows past 128
+;; can be null for lag with offset > partition size within the group.
+;; Use 2 partitions of 150 each (300 total) and lag(v, 200) so the
+;; first 200 rows of each partition (which only has 150) are null —
+;; wait, each partition is 150 rows, so lag(v, 151) means all 150 rows
+;; null in each partition, calling par_set_null at indices 0..299
+;; which are all >= 0; those past 128 hit the idx>=128 path.
+;; Actually simpler: one big partition of 300 rows with lag(v, 200)
+;; leaves rows 0..199 null — 72 of those are at idx >= 128.
+(.sys.exec "rm -rf /tmp/rfl_int_cov_narrow.csv") -- 0
+
+;; ── Window par_set_null path ─────────────────────────────────────
+;; test_window.c covers window.c extensively but only tests small tables
+;; where all null rows have idx < 128.  We need idx >= 128.
+;; No rfl-level builder for OP_WINDOW exists, so we cannot directly
+;; call window functions from rfl.  Instead exercise a parallel GROUP BY
+;; with nullable output at result row > 128: group.c:par_prepare_nullmap
+;; is called on result vecs > 128 rows.  When the group output is large
+;; (> 128 distinct keys) and the agg key column has nulls, par_set_null
+;; at rows >= 128 in the output fires.
+;;
+;; Strategy: a table with 200 distinct keys (so output is 200 rows)
+;; where the aggregated value column has nulls — group.c produces a
+;; 200-row result where null agg values call par_set_null at rows >= 128.
+
+;; Build 200 rows, 200 distinct keys, one null agg value per group.
+;; sum(v) for each key = one row each, result is 200 rows.
+;; Actually par_set_null is called for the AGG output column when the
+;; source column has nulls and the group has only null values (so sum
+;; returns null).  Make key k have one row with null v.
+;; Use til 200 as key (200 distinct I64 keys), v=[0N 0N ... 0N 1 1...1]
+;; where first 200 are 0N → sum returns 0N for those groups? No,
+;; sum([0N]) = 0 (identity), not null.  Instead use first/last which
+;; skip nulls but could return null for all-null groups.
+;;
+;; For par_set_null with idx >= 128 in a window context we need to
+;; trigger it from window.c.  Since we can't call window ops from rfl,
+;; we rely on the C-level test_window.c to cover that.  The remaining
+;; coverage goal here is group.c's par_prepare_nullmap when output > 128.
+
+;; par_prepare_nullmap: group with > 128 distinct keys.
+;; Any GROUP BY with > 128 output groups calls par_prepare_nullmap(vec)
+;; where vec->len > 128, which exercises the body (lines 974-978).
+(set BG (table [k v] (list (til 200) (til 200))))
+(count (select {s: (sum v) from: BG by: k})) -- 200
+
+;; Verify the sum is correct for a few known keys.
+(at (at (select {s: (sum v) from: BG by: k asc: k}) 's) 0) -- 0
+(at (at (select {s: (sum v) from: BG by: k asc: k}) 's) 199) -- 199
+
+;; Another 200-key GROUP BY exercises the par_prepare_nullmap ext nullmap path
+;; (par_finalize_nulls checks the ext bits).  Sum over v with a null — sum
+;; always returns a value (identity 0 for null rows), so the result is non-null.
+;; This exercises par_prepare_nullmap body and par_finalize_nulls for the
+;; 200-group output column.
+(set BN (table [k v] (list (til 200) (concat [0Nl] (til 199)))))
+(count (select {s: (sum v) from: BN by: k})) -- 200
+;; key=0 has v=null → sum returns 0 (identity); key=199 has v=198
+(at (at (select {s: (sum v) from: BN by: k asc: k}) 's) 0) -- 0
+(at (at (select {s: (sum v) from: BN by: k asc: k}) 's) 199) -- 198
+
+;; ── 9. Large parallel GROUP BY with STDDEV + singleton groups ──────────────
+;; Covers par_set_null (lines 954-956): parallel radix GROUP BY (nrows >= 65536),
+;; > 128 output groups (200 groups), singleton groups at indices >= 128 (keys
+;; 128.0..199.0 have 1 row each).  STDDEV of 1 row → cnt=1 → insuf=true → null.
+;; F64 keys are NOT eligible for the DA path → radix HT path is used.
+;;   1. par_prepare_nullmap: vec->len=200>128 → inline bit-0 set+clear (no EXT yet)
+;;   2. radix_phase3: singleton group at di>=128 → par_set_null(di>=128)
+;;      → !(NULLMAP_EXT) && idx>=128 → ray_vec_set_null promotes inline→EXT
+;;      → lines 954-956 covered
+;;   3. par_finalize_nulls: vec now has EXT → lines 983-989 (EXT scan) covered
+;; Keys 0.0..127.0 each have 512 rows (65536 total), 128.0..199.0 have 1 row each.
+;; Total = 65608 rows ≥ RAY_PARALLEL_THRESHOLD (65536) → parallel radix path.
+(set PN_keys (concat (as 'F64 (% (til 65536) 128)) (as 'F64 (+ 128 (til 72)))))
+(set PN_vals (concat (as 'F64 (til 65536)) (as 'F64 (til 72))))
+(set TPN (table [k v] (list PN_keys PN_vals)))
+(set RPN (select {sd: (stddev v) from: TPN by: k}))
+(count RPN) -- 200
+;; some groups (the 72 singletons) have cnt=1 → stddev is null
+;; sort result by key to get deterministic order; key 128.0 is a singleton → null
+(nil? (at (at (select {sd: (stddev v) from: TPN by: k asc: k}) 'sd) 128)) -- true
+;; key 0.0 has 512 rows → stddev is defined (non-null)
+(nil? (at (at (select {sd: (stddev v) from: TPN by: k asc: k}) 'sd) 0)) -- false
+
+;; Teardown.
+(.sys.exec "rm -rf /tmp/rfl_int_cov_parted /tmp/rfl_int_cov_sym /tmp/rfl_int_cov_narrow.csv /tmp/rfl_int_cov_null /tmp/rfl_int_cov_null_str.csv /tmp/rfl_int_cov_null_seg /tmp/rfl_int_cov_65seg")
