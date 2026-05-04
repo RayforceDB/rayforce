@@ -2640,7 +2640,12 @@ static int run_pty_sigint_during_eval(int use_poll)
     { char buf[4096]; for (int i=0;i<10;i++) { ssize_t n=read(master_fd,buf,sizeof(buf)); if(n<=0)break; } }
 
     /* Send a long-running expression and press Enter. */
-    const char* expr = "(sum (til 50000000))\n";
+    /* Tail-recursive busy loop the eval interrupt check can break out of.
+     * Original used (sum (til 50000000)) — 400MB allocation under ASan
+     * ran into runner-level memory pressure on macOS (7GB Apple Silicon
+     * runner, ASan ~2x).  Loop stays in eval longer (predictable hot
+     * path) without huge allocs. */
+    const char* expr = "(set f (fn [n] (if (== n 0) 0 (f (- n 1))))) (f 200000)\n";
     size_t elen = strlen(expr), etotal = 0;
     while (etotal < elen) {
         ssize_t w = write(master_fd, expr + etotal, elen - etotal);
