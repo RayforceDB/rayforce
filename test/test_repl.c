@@ -1941,18 +1941,22 @@ static test_result_t test_repl_progress_mechanism(void) {
  *          render_progress, clear_progress, repl_query_progress_cb. */
 #ifndef RAY_OS_WINDOWS
 static test_result_t test_repl_progress_bar_in_parent(void) {
-#if defined(__APPLE__)
-    /* macOS: tcsetattr on the PTY slave blocks indefinitely when the
-     * master end has unread bytes (the progress callback writes ANSI
-     * sequences to stderr → PTY slave → kernel buffer; nobody reads
-     * from master_fd, so ray_term_destroy's restore-attrs hangs).
-     * Linux is more permissive on this code path.  Skip on Darwin. */
-    PASS();
-#endif
     /* 1. Open a throwaway PTY (slave reports isatty=1). */
     int master_fd = -1, slave_fd = -1;
     if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) != 0)
         PASS();  /* no PTY available — skip */
+
+    /* Make master non-blocking so we can drain it without blocking the
+     * test.  ray_term_destroy calls tcsetattr(slave, TCSAFLUSH, ...)
+     * which on macOS waits for slave-side output to be transmitted
+     * (i.e., for master to consume the kernel PTY buffer).  Without
+     * draining master, that call hangs forever.  Linux's TTY layer
+     * allows this to complete without master reads, but we'd rather
+     * be portable than rely on the leniency. */
+    {
+        int flags = fcntl(master_fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
+    }
 
     /* Do NOT set a terminal size — openpty() leaves ws_col=0 by default so
      * TIOCGWINSZ succeeds but ws_col <= 10, hitting the else branch
@@ -2017,6 +2021,19 @@ static test_result_t test_repl_progress_bar_in_parent(void) {
     ray_progress_update("test", "phase", 500, 1000); /* non-final fire */
     ray_progress_update("test", "phase", 500, 0);    /* indeterminate (total=0) */
     ray_progress_end();                              /* final fire → clear_progress */
+
+    /* Drain master_fd before destroy: the progress callback wrote ANSI
+     * escape sequences to stderr (= PTY slave); on macOS, tcsetattr in
+     * ray_term_destroy uses TCSAFLUSH which blocks until the slave's
+     * output buffer drains to master.  Master is non-blocking, so we
+     * just read until EAGAIN. */
+    {
+        char buf[4096];
+        for (int i = 0; i < 16; i++) {
+            ssize_t n = read(master_fd, buf, sizeof(buf));
+            if (n <= 0) break;
+        }
+    }
 
     /* 6. Destroy the repl while stdin is still the PTY slave so tcsetattr
      *    targets the slave (harmless to the real terminal). */
@@ -2666,16 +2683,15 @@ done_sigint_eval:
 }
 #endif
 
-/* SIGINT during eval (poll mode) — exercises lines 741-748.  Test goal
- * is to drive the SIGINT recovery code path, not to assert a specific
- * exit code: the child may exit cleanly (0), be killed by signal
- * (-N), or hit a runner-environment timeout (-2).  macOS's signal
- * handling under ASan can deliver SIGBUS during interrupted syscalls
- * — we're not asserting that semantics here, just that the path runs. */
+/* SIGINT during eval (poll mode) — exercises lines 741-748.
+ * Expected: child handles SIGINT, returns to prompt, accepts :q, exits
+ * cleanly (rc=0).  Timeout (rc=-2) is acceptable under heavy CI load.
+ * Any other exit code is a real bug worth investigating. */
 static test_result_t test_repl_pty_sigint_during_eval(void) {
 #ifndef RAY_OS_WINDOWS
     int rc = run_pty_sigint_during_eval(1);
-    (void)rc;
+    TEST_ASSERT_FMT(rc == 0 || rc == -1 || rc == -2,
+                    "unexpected child exit: %d", rc);
 #endif
     PASS();
 }
