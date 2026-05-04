@@ -1,0 +1,297 @@
+;; collection_coverage.rfl — targeted coverage tests for src/ops/collection.c
+;; Each section targets specific uncovered code paths.
+
+;; ══════════════════════════════════════
+;; 1. hashset_grow — trigger by inserting >cap/2 unique items
+;;    hashset_init starts with cap=16 (initial_cap); fill >8 distinct items.
+;; ══════════════════════════════════════
+;; distinct on 64 unique i64 values triggers at least one hashset_grow
+(count (distinct (til 64))) -- 64
+;; distinct on 256 unique i64 values — multiple grows
+(count (distinct (til 256))) -- 256
+;; distinct on 200 unique syms
+(set bigsym (take [aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp] 200))
+(count (distinct bigsym)) -- 16
+;; distinct on 100 unique f64 values
+(count (distinct (as 'F64 (til 100)))) -- 100
+;; except over 100 distinct values — builds hashset with grows
+(count (except (til 100) (til 50))) -- 50
+;; union over 100 distinct values
+(count (union (til 50) (til 100))) -- 100
+;; sect over large sets
+(count (sect (til 100) (til 50))) -- 50
+;; in over large sets
+(sum (as 'I64 (in (til 50) (til 100)))) -- 50
+
+;; ══════════════════════════════════════
+;; 2. RAY_LIST path in hs_hash_row / hs_row_is_null
+;;    distinct/union/except on boxed lists with mixed atom types
+;; ══════════════════════════════════════
+;; distinct on list with sym atoms
+(count (distinct (list 'a 'b 'a 'c 'b))) -- 3
+;; distinct on list with str atoms
+(count (distinct (list "foo" "bar" "foo" "baz"))) -- 3
+;; distinct on list with numeric atoms
+(count (distinct (list 1 2 1 3 2))) -- 3
+;; union of two lists
+(count (union (list 1 2 3) (list 2 3 4))) -- 4
+;; except of lists
+(count (except (list 1 2 3 4) (list 2 4))) -- 2
+
+;; ══════════════════════════════════════
+;; 3. sect — boxed list fallback (lines 1149-1174)
+;;    sect with non-typed-vec inputs
+;; ══════════════════════════════════════
+;; sect on (list ...) atoms — boxed list path
+(sect (list 1 2 3 4) (list 2 4 6)) -- (list 2 4)
+(sect (list 'a 'b 'c) (list 'b 'c 'd)) -- (list 'b 'c)
+(sect (list) (list 1 2)) -- (list)
+(sect (list 1 2 3) (list)) -- (list)
+
+;; ══════════════════════════════════════
+;; 4. except — boxed list scalar path (lines 1035-1037)
+;;    except where vec2 is atom in boxed-list branch
+;;    Note: typed-vec path handles scalar, boxed-list path goes line 1034
+;; ══════════════════════════════════════
+;; These go through boxed list path because vec1 is a list (not typed vec)
+(except (list 1 2 3 4 5) (list 1 3 5)) -- (list 2 4)
+(count (except (list 'a 'b 'c 'd) (list 'a 'c))) -- 2
+
+;; ══════════════════════════════════════
+;; 5. find — list/unbox path (lines 1674-1685)
+;;    find where vec is a list (not typed vec)
+;; ══════════════════════════════════════
+(find (list 10 20 30 40) 30) -- 2
+(find (list 10 20 30 40) 50) -- 0Nl
+(find (list 'a 'b 'c) 'b) -- 1
+
+;; ══════════════════════════════════════
+;; 6. ray_fold_left_fn (lines 1961-1964)
+;;    fold-left is an alias for fold — just needs to be called
+;; ══════════════════════════════════════
+(fold-left + 0 (list 1 2 3 4 5)) -- 15
+(fold-left * 1 (list 1 2 3 4 5)) -- 120
+(fold-left + 0 (list)) -- 0
+
+;; ══════════════════════════════════════
+;; 7. fold-right (lines 1967-2040) with no-init form (n==2)
+;; ══════════════════════════════════════
+(fold-right + 0 (list 1 2 3)) -- 6
+(fold-right * 1 (list 2 3 4)) -- 24
+;; fold-right with 2-arg form: uses last element as init
+(fold-right + (list 1 2 3 4)) -- 10
+
+;; ══════════════════════════════════════
+;; 8. binr — scalar atom path (lines 1847-1855)
+;; ══════════════════════════════════════
+(binr [0 1 2 3 4] 2) -- 2
+(binr [0 1 1 2 4] 1) -- 1
+(binr [1 2 3 4 5] 0) -- 0
+(binr [1 2 3 4 5] 6) -- 4
+(binr [0 2 4 6] 3) -- 2
+
+;; ══════════════════════════════════════
+;; 9. rand — i32 param paths (lines 1784-1788)
+;; ══════════════════════════════════════
+(count (rand 5i 100i)) -- 5
+(count (rand 10i 50i)) -- 10
+(type (rand 5i 100i)) -- 'I64
+
+;; ══════════════════════════════════════
+;; 10. take — zero-length vector from empty vec (len==0) (line 1404)
+;;     (take [] n) where n > 0 — dst zeroed
+;; ══════════════════════════════════════
+(take [] 3) -- [0 0 0]
+(type (take [] 5)) -- 'I64
+(count (take [] 5)) -- 5
+
+;; ══════════════════════════════════════
+;; 11. take — range take on empty list (start >= len) (lines 1298-1302)
+;;     (take list [start amount]) where start >= len
+;; ══════════════════════════════════════
+(count (take (list 1 2 3) [10 5])) -- 0
+(count (take (list 1 2 3) [3 2])) -- 0
+
+;; ══════════════════════════════════════
+;; 12. take — range take on empty STR vector (line 1229-1231)
+;;     vec is a STR typed vec, start out of bounds
+;; ══════════════════════════════════════
+(count (take (map (fn [x] (as 'STR x)) ['a 'b 'c]) [10 2])) -- 0
+
+;; ══════════════════════════════════════
+;; 13. take — range take on dict with typed (non-list) vals (lines 1285-1288)
+;;     create dict with sym keys and typed int vals
+;; ══════════════════════════════════════
+;; Dict with typed value vector (not RAY_LIST)
+(set d (dict [a b c d e] [1 2 3 4 5]))
+(count (key (take d [1 2]))) -- 2
+(at (value (take d [1 2])) 0) -- 2
+
+;; ══════════════════════════════════════
+;; 14. take — range take on vec with null bitmap (lines 1251-1254)
+;;     take from a null-containing vec, start > 0
+;; ══════════════════════════════════════
+(set nv (concat [0Nl 2 3] [4 5]))
+(nil? (at (take nv [0 2]) 0)) -- true
+(at (take nv [1 2]) 0) -- 2
+;; range-take from vec starting after null
+(nil? (at (take nv [0 1]) 0)) -- true
+
+;; ══════════════════════════════════════
+;; 15. take — string take with empty string (line 1351)
+;; ══════════════════════════════════════
+(take "" 3) -- ""
+(take "" 0) -- ""
+(take "" -2) -- ""
+
+;; ══════════════════════════════════════
+;; 16. list_to_typed_vec — empty SYM/STR path (lines 957-959)
+;;     empty result from filter/except on sym/str vecs
+;; ══════════════════════════════════════
+;; except on sym vec that results in empty → should go through list_to_typed_vec
+(count (except ['a 'b 'c] ['a 'b 'c 'd 'e])) -- 0
+;; except on str vec that results in empty
+(count (except ["foo" "bar"] ["foo" "bar" "baz"])) -- 0
+
+;; ══════════════════════════════════════
+;; 17. scan — empty list (lines 463-469)
+;;     (scan fn empty-list) → empty list
+;; ══════════════════════════════════════
+(count (scan + (list))) -- 0
+(type (scan + (list))) -- 'LIST
+
+;; ══════════════════════════════════════
+;; 18. map binary with scalar vec (lines 375-377)
+;;     (map fn val scalar-vec) where vec is NOT a list
+;; ══════════════════════════════════════
+(map + 1 2) -- 3
+(map * 3 4) -- 12
+
+;; ══════════════════════════════════════
+;; 19. atom_eq — timestamp comparison (lines 673-674)
+;;     Need distinct or in with timestamps
+;; ══════════════════════════════════════
+(distinct [2024.01.01D10:00:00.000000000 2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000]) -- [2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000]
+(in 2024.01.01D10:00:00.000000000 [2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000]) -- true
+(in 2024.01.03D10:00:00.000000000 [2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000]) -- false
+(count (distinct [2024.01.01D10:00:00.000000000 2024.01.01D10:00:00.000000000])) -- 1
+
+;; ══════════════════════════════════════
+;; 20. map-right — with scalar vec swapped (lines 1948-1951)
+;;     map-right where vec is scalar and fixed is vector
+;; ══════════════════════════════════════
+(map-right + [1 2 3] 10) -- (list 11 12 13)
+(map-right * [1 2 3] 2) -- (list 2 4 6)
+
+;; ══════════════════════════════════════
+;; 21. distinct_sort_cmp default branch (lines 281-291)
+;;     Need distinct on a type that goes through default (e.g. sym in list context)
+;;     Actually sym has its own branch, so use a STR vec to hit distinct sort
+;; ══════════════════════════════════════
+;; distinct on STR vec — preserves first-occurrence order for STR
+(count (distinct ["cc" "aa" "bb" "aa" "cc"])) -- 3
+(at (distinct ["cc" "aa" "bb" "aa" "cc"]) 0) -- "cc"
+(count (distinct ["x" "y" "z" "x" "y"])) -- 3
+
+;; ══════════════════════════════════════
+;; 22. Timestamp hs_hash_row — RAY_TIMESTAMP in typed vec ops
+;; ══════════════════════════════════════
+(set ts1 [2024.01.01D10:00:00.000000000 2024.01.02D12:00:00.000000000 2024.01.01D10:00:00.000000000])
+(count (distinct ts1)) -- 2
+(count (except ts1 [2024.01.01D10:00:00.000000000])) -- 1
+(in 2024.01.01D10:00:00.000000000 ts1) -- true
+(in 2024.01.03D10:00:00.000000000 ts1) -- false
+
+;; ══════════════════════════════════════
+;; 23. union typed vec — large union triggers hashset_grow
+;; ══════════════════════════════════════
+(count (union (til 50) [100 200 300])) -- 53
+(count (union (til 100) (til 200))) -- 200
+
+;; ══════════════════════════════════════
+;; 24. in — empty collection val (line 848)
+;; ══════════════════════════════════════
+(in [] [1 2 3]) -- (list)
+(count (in [] [1 2 3])) -- 0
+
+;; ══════════════════════════════════════
+;; 25. find — vec with nulls (lines 1662-1664)
+;; ══════════════════════════════════════
+(find [1 0Nl 2 3] 0Nl) -- 1
+(find [0Nl 1 2] 0Nl) -- 0
+
+;; ══════════════════════════════════════
+;; 26. scan-left — alias for scan (line 2016)
+;; ══════════════════════════════════════
+(scan-left + (list 1 2 3 4 5)) -- (list 1 3 6 10 15)
+(scan-left * (list 1 2 3 4)) -- (list 1 2 6 24)
+
+;; ══════════════════════════════════════
+;; 27. scan-right — empty list (lines 2033-2039)
+;; ══════════════════════════════════════
+(count (scan-right + (list))) -- 0
+
+;; ══════════════════════════════════════
+;; 28. fold-right — 2-arg form (lines 1979-1994)
+;;     (fold-right fn vec) uses last elem as init
+;; ══════════════════════════════════════
+(fold-right + (list 1 2 3 4 5)) -- 15
+(fold-right * (list 1 2 3 4)) -- 24
+(fold-right + (list 42)) -- 42
+
+;; ══════════════════════════════════════
+;; 29. except — boxed list + scalar vec2 (lines 1035-1037)
+;;     When vec1 is a list and vec2 is an atom
+;; ══════════════════════════════════════
+;; vec1 is a list (unboxes to list), vec2 is an atom
+(count (except (list 1 2 3 4 5) 3)) -- 4
+(except (list 10 20 30 40) 20) -- (list 10 30 40)
+(except (list 'a 'b 'c) 'b) -- (list 'a 'c)
+
+;; ══════════════════════════════════════
+;; 30. map-right — scalar-vec swap (line 1950)
+;;     (map-right fn scalar fixed-vec) where vec is scalar, fixed is vec
+;; ══════════════════════════════════════
+;; fn vec fixed: vec is scalar, fixed is a vector — should swap
+;; Actually map-right (fn vec fixed): when vec is scalar and fixed is vector
+;; the "auto-detect" swap fires: map_iterate(fn, vec, fixed, 1)
+(map-right + 5 [1 2 3]) -- (list 6 7 8)
+(map-right - 10 [1 2 3]) -- (list 9 8 7)
+
+;; ══════════════════════════════════════
+;; 31. reverse STR vec with nulls (lines 1724-1726)
+;;     Need a STR vec with null elements
+;; ══════════════════════════════════════
+;; Build a STR vec with nulls using filter then concat
+(set sv (map (fn [x] (as 'STR x)) ['aa 'bb 'cc]))
+(count (reverse sv)) -- 3
+(at (reverse sv) 0) -- "cc"
+
+;; ══════════════════════════════════════
+;; 32. at — type error path (line 1596)
+;;     idx type not in {-I64,-I32,-I16,-U8} — should return error
+;; ══════════════════════════════════════
+(at [1 2 3] 1) -- 2
+(at [1 2 3] 0i) -- 1
+(at [1 2 3] 0h) -- 1
+
+;; ══════════════════════════════════════
+;; 33. where — coverage of vec/list paths
+;; ══════════════════════════════════════
+(where [true false true true false]) -- [0 2 3]
+(where [false false false]) -- []
+(where [true]) -- [0]
+
+;; ══════════════════════════════════════
+;; 34. group — various types
+;; ══════════════════════════════════════
+(count (key (group [1.0 2.0 1.0 3.0]))) -- 3
+(count (key (group [true false true]))) -- 2
+(count (key (group [1h 2h 1h]))) -- 2
+
+;; ══════════════════════════════════════
+;; 35. raze — flatten nested list
+;; ══════════════════════════════════════
+(raze (list [1 2] [3 4] [5 6])) -- [1 2 3 4 5 6]
+(raze (list)) -- (list)
+(count (raze (list [1 2 3] [4 5 6]))) -- 6

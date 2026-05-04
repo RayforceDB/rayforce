@@ -948,6 +948,315 @@ static test_result_t test_hnsw_search_sift_down(void) {
 
 /* ============ Suite table ============ */
 
+/* ─── rerank coverage (S7) ───────────────────────────────── */
+
+static test_result_t test_knn_i32_source_vecs(void) {
+    const int N = 4, D = 3;
+    ray_t* vlist = ray_list_new(N);
+    TEST_ASSERT_NOT_NULL(vlist);
+    int32_t raw[3];
+    /* row 0: [1,0,0], row 1: [0,1,0], row 2: [0,0,1], row 3: [1,1,0] */
+    int32_t rows[4][3] = {{1,0,0},{0,1,0},{0,0,1},{1,1,0}};
+    for (int i = 0; i < N; i++) {
+        raw[0] = rows[i][0]; raw[1] = rows[i][1]; raw[2] = rows[i][2];
+        ray_t* v = ray_vec_from_raw(RAY_I32, raw, D);
+        TEST_ASSERT_NOT_NULL(v);
+        vlist = ray_list_append(vlist, v);
+        ray_release(v);
+    }
+    TEST_ASSERT_EQ_I(vlist->len, N);
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("__i32vlist", 10), vlist), RAY_OK);
+    ray_release(vlist);
+
+    ray_eval_str(
+        "(set __i32docs (table [id emb] "
+        "  (list [0 1 2 3] __i32vlist)))");
+
+    /* KNN over I32 vecs — rr_at_f64 RAY_I32 arm fires for each element. */
+    ray_t* r = ray_eval_str(
+        "(select {from: __i32docs nearest: (knn emb [1.0 0.0 0.0] 'l2) take: 2})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 2);
+    /* Row 0 (id=0, [1,0,0]) is the exact match. */
+    ray_t* id_col = ray_table_get_col(r, ray_sym_intern("id", 2));
+    TEST_ASSERT_NOT_NULL(id_col);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(id_col))[0], 0);
+    ray_release(r);
+    PASS();
+}
+
+/* rr_at_f64: I64 source vectors — hits the RAY_I64 arm. */
+static test_result_t test_knn_i64_source_vecs(void) {
+    const int N = 4, D = 3;
+    ray_t* vlist = ray_list_new(N);
+    TEST_ASSERT_NOT_NULL(vlist);
+    int64_t rows[4][3] = {{2,0,0},{0,2,0},{0,0,2},{2,2,0}};
+    for (int i = 0; i < N; i++) {
+        ray_t* v = ray_vec_from_raw(RAY_I64, rows[i], D);
+        TEST_ASSERT_NOT_NULL(v);
+        vlist = ray_list_append(vlist, v);
+        ray_release(v);
+    }
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("__i64vlist", 10), vlist), RAY_OK);
+    ray_release(vlist);
+
+    ray_eval_str(
+        "(set __i64docs (table [id emb] "
+        "  (list [0 1 2 3] __i64vlist)))");
+
+    /* Query with a float [1,0,0]: row 0 ([2,0,0]) is closest by L2. */
+    ray_t* r = ray_eval_str(
+        "(select {from: __i64docs nearest: (knn emb [1.0 0.0 0.0] 'l2) take: 1})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 1);
+    ray_t* id_col = ray_table_get_col(r, ray_sym_intern("id", 2));
+    TEST_ASSERT_NOT_NULL(id_col);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(id_col))[0], 0);
+    ray_release(r);
+    PASS();
+}
+
+/* exec_ann_rerank: empty source table — hits the src_rows==0 branch.
+ * We need an empty table with an HNSW index built from the same embedding
+ * shape, but the source table being passed to exec_ann_rerank has 0 rows. */
+static test_result_t test_ann_rerank_empty_source(void) {
+    /* Build an index from a small non-empty list so the index is valid,
+     * then create a 0-row table (matching dim=3) for the select. */
+    ray_eval_str("(set __ann_idx (hnsw-build "
+                 "(list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]) 'cosine 4 50))");
+
+    /* Empty source: 0-row table with emb LIST column. */
+    ray_eval_str(
+        "(set __ann_empty (table [id emb] (list [] (list))))");
+
+    ray_t* r = ray_eval_str(
+        "(select {from: __ann_empty "
+        "         nearest: (ann __ann_idx [1.0 0.0 0.0]) "
+        "         take: 3})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 0);
+    /* Source has 2 cols (id, emb); _dist not projected → schema unchanged. */
+    TEST_ASSERT_EQ_I(ray_table_ncols(r), 2);
+    ray_release(r);
+    ray_eval_str("(hnsw-free __ann_idx)");
+    PASS();
+}
+
+/* exec_ann_rerank: filter rejects all rows — hits accepted_count==0 branch. */
+static test_result_t test_ann_rerank_filter_rejects_all(void) {
+    ray_eval_str(
+        "(set __afdocs (table [id score emb] "
+        "  (list [0 1 2] "
+        "        [0.1 0.2 0.3] "
+        "        (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]))))");
+    ray_eval_str("(set __af_idx (hnsw-build (at __afdocs 'emb) 'cosine 4 50))");
+
+    /* Filter rejects every row (score > 100) → accepted_count = 0. */
+    ray_t* r = ray_eval_str(
+        "(select {from: __afdocs where: (> score 100.0) "
+        "         nearest: (ann __af_idx [1.0 0.0 0.0]) "
+        "         take: 3})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 0);
+    /* Source has 3 cols (id, score, emb); _dist not projected. */
+    TEST_ASSERT_EQ_I(ray_table_ncols(r), 3);
+    ray_release(r);
+    ray_eval_str("(hnsw-free __af_idx)");
+    PASS();
+}
+
+/* exec_knn_rerank identity scan: non-numeric row triggers type error.
+ * The identity scan (no filter) iterates all rows; if any element is
+ * not a numeric vector, exec_knn_rerank returns a type error. */
+static test_result_t test_knn_rerank_identity_scan_bad_row(void) {
+    /* Build a LIST where one element is a BOOL vector (not numeric). */
+    ray_t* vlist = ray_list_new(3);
+    TEST_ASSERT_NOT_NULL(vlist);
+    /* Good rows. */
+    float r0[3] = {1.0f, 0.0f, 0.0f};
+    float r1[3] = {0.0f, 1.0f, 0.0f};
+    ray_t* v0 = ray_vec_from_raw(RAY_F32, r0, 3);
+    ray_t* v1 = ray_vec_from_raw(RAY_F32, r1, 3);
+    /* Bad row: BOOL vector — rr_is_numeric returns false. */
+    uint8_t bdata[3] = {1, 0, 1};
+    ray_t* vbad = ray_vec_from_raw(RAY_BOOL, bdata, 3);
+    TEST_ASSERT_NOT_NULL(v0); TEST_ASSERT_NOT_NULL(v1); TEST_ASSERT_NOT_NULL(vbad);
+    vlist = ray_list_append(vlist, v0); ray_release(v0);
+    vlist = ray_list_append(vlist, v1); ray_release(v1);
+    vlist = ray_list_append(vlist, vbad); ray_release(vbad);
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("__badvlist", 10), vlist), RAY_OK);
+    ray_release(vlist);
+
+    ray_eval_str(
+        "(set __baddocs (table [id emb] "
+        "  (list [0 1 2] __badvlist)))");
+
+    /* Identity scan (no where clause) — should hit the type error in the else branch. */
+    ray_t* r = ray_eval_str(
+        "(select {from: __baddocs nearest: (knn emb [1.0 0.0 0.0]) take: 3})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* exec_knn_rerank filtered scan: non-numeric row triggers type error.
+ * The filtered scan (accepted rowid list) iterates selected rows;
+ * if any accepted element is not a numeric vector, type error is returned. */
+static test_result_t test_knn_rerank_filtered_scan_bad_row(void) {
+    /* Build a LIST where the first row (which passes the filter) is bad. */
+    ray_t* vlist2 = ray_list_new(3);
+    TEST_ASSERT_NOT_NULL(vlist2);
+    uint8_t bdata2[3] = {0, 1, 0};
+    ray_t* vbad2 = ray_vec_from_raw(RAY_BOOL, bdata2, 3);
+    float r1[3] = {0.0f, 1.0f, 0.0f};
+    float r2[3] = {1.0f, 0.0f, 0.0f};
+    ray_t* vg1 = ray_vec_from_raw(RAY_F32, r1, 3);
+    ray_t* vg2 = ray_vec_from_raw(RAY_F32, r2, 3);
+    TEST_ASSERT_NOT_NULL(vbad2); TEST_ASSERT_NOT_NULL(vg1); TEST_ASSERT_NOT_NULL(vg2);
+    vlist2 = ray_list_append(vlist2, vbad2); ray_release(vbad2);
+    vlist2 = ray_list_append(vlist2, vg1);  ray_release(vg1);
+    vlist2 = ray_list_append(vlist2, vg2);  ray_release(vg2);
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("__badvlist2", 11), vlist2), RAY_OK);
+    ray_release(vlist2);
+
+    /* score col: row 0 has score=1.0 (passes > 0.5), rows 1,2 have score=0.0. */
+    ray_eval_str(
+        "(set __baddocs2 (table [id score emb] "
+        "  (list [0 1 2] [1.0 0.0 0.0] __badvlist2)))");
+
+    /* Filter keeps row 0 (score > 0.5); row 0's emb is a BOOL vec → type error. */
+    ray_t* r = ray_eval_str(
+        "(select {from: __baddocs2 where: (> score 0.5) "
+        "         nearest: (knn emb [1.0 0.0 0.0]) take: 2})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    PASS();
+}
+
+/* gather_rows_with_dist: nullable column — hits src_has_nulls branch (lines 200-204).
+ * Build a table with a nullable I64 id column (some nulls) and an emb LIST,
+ * then run select nearest knn so gather_rows_with_dist encounters a column
+ * with RAY_ATTR_HAS_NULLS set. */
+static test_result_t test_knn_rerank_nullable_col_gather(void) {
+    /* id col with a null at row 1: [0, 0N, 2, 3, 4] */
+    ray_eval_str(
+        "(set __nulldocs (table [id emb] "
+        "  (list [0 0Nl 2 3 4] "
+        "        (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] "
+        "              [1.0 1.0 0.0] [1.0 0.0 1.0]))))");
+
+    /* Verify the id column actually has nulls (sanity check). */
+    ray_t* tbl = ray_env_get(ray_sym_intern("__nulldocs", 10));
+    TEST_ASSERT_NOT_NULL(tbl);
+    ray_t* id_col = ray_table_get_col(tbl, ray_sym_intern("id", 2));
+    TEST_ASSERT_NOT_NULL(id_col);
+    TEST_ASSERT_TRUE((id_col->attrs & RAY_ATTR_HAS_NULLS) != 0);
+
+    /* KNN query toward [0,1,0] (row 1 — the null row) — it must be selected.
+     * This forces ray_vec_set_null to be called in gather_rows_with_dist. */
+    ray_t* r = ray_eval_str(
+        "(select {from: __nulldocs nearest: (knn emb [0.0 1.0 0.0] 'l2) take: 3})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3);
+    /* Check that row 1 (the null-id row) is included in the results. */
+    ray_t* id_col2 = ray_table_get_col(r, ray_sym_intern("id", 2));
+    TEST_ASSERT_NOT_NULL(id_col2);
+    /* At least one result should be null (the id for the nearest row). */
+    bool found_null = false;
+    for (int64_t i = 0; i < ray_table_nrows(r); i++) {
+        if (ray_vec_is_null(id_col2, i)) { found_null = true; break; }
+    }
+    TEST_ASSERT_TRUE(found_null);
+    ray_release(r);
+    PASS();
+}
+
+/* rr_row_dist cosine with zero denom — hits the `denom <= 0.0` false branch.
+ * A zero query vector has q_norm=0, making denom=0*anything=0 → sim=0.0. */
+static test_result_t test_knn_rerank_zero_query_cosine(void) {
+    build_docs();
+    /* Zero query vector: q_norm=0 → denom=0 in cosine distance → sim=0. */
+    ray_t* r = ray_eval_str(
+        "(select {from: __docs nearest: (knn emb [0.0 0.0 0.0] 'cosine) take: 3})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+    /* All rows get distance 1.0 (1 - 0.0 = 1.0); any 3 rows are valid. */
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3);
+    ray_release(r);
+    PASS();
+}
+
+/* rr_heap_insert: right-child wins in the percolate-down loop.
+ * With k=3 and vectors at distances [3.0, 2.0, 2.5, 1.0] (L2 from origin),
+ * inserting 1.0 replaces the root (3.0); left child is 2.0, right child is 2.5
+ * → right child wins (best=r), covering line 303's true branch. */
+static test_result_t test_knn_rerank_heap_right_child(void) {
+    /* Vectors at L2 distances from [0,0]: [3,0]=3.0, [2,0]=2.0, [2.5,0]=2.5, [1,0]=1.0. */
+    ray_eval_str(
+        "(set __heapdocs (table [id emb] "
+        "  (list [0 1 2 3] "
+        "        (list [3.0 0.0] [2.0 0.0] [2.5 0.0] [1.0 0.0]))))");
+
+    /* Take top-3 nearest to [0,0] by L2 → heap fill order triggers right-child win. */
+    ray_t* r = ray_eval_str(
+        "(select {from: __heapdocs nearest: (knn emb [0.0 0.0] 'l2) take: 3})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 3);
+    /* Closest 3 by ascending distance: id=3 (d=1.0), id=1 (d=2.0), id=2 (d=2.5). */
+    ray_t* id_col = ray_table_get_col(r, ray_sym_intern("id", 2));
+    TEST_ASSERT_NOT_NULL(id_col);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(id_col))[0], 3);
+    ray_release(r);
+    PASS();
+}
+
+/* exec_knn_rerank F64 source vectors — hits the RAY_F64 arm in rr_at_f64. */
+static test_result_t test_knn_f64_source_vecs(void) {
+    const int N = 3, D = 3;
+    ray_t* vlist = ray_list_new(N);
+    TEST_ASSERT_NOT_NULL(vlist);
+    double rows[3][3] = {{1.0,0.0,0.0},{0.0,1.0,0.0},{0.0,0.0,1.0}};
+    for (int i = 0; i < N; i++) {
+        ray_t* v = ray_vec_from_raw(RAY_F64, rows[i], D);
+        TEST_ASSERT_NOT_NULL(v);
+        vlist = ray_list_append(vlist, v);
+        ray_release(v);
+    }
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("__f64vlist", 10), vlist), RAY_OK);
+    ray_release(vlist);
+
+    ray_eval_str(
+        "(set __f64docs (table [id emb] "
+        "  (list [0 1 2] __f64vlist)))");
+
+    ray_t* r = ray_eval_str(
+        "(select {from: __f64docs nearest: (knn emb [1.0 0.0 0.0] 'cosine) take: 1})");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 1);
+    ray_t* id_col = ray_table_get_col(r, ray_sym_intern("id", 2));
+    TEST_ASSERT_NOT_NULL(id_col);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(id_col))[0], 0);
+    ray_release(r);
+    PASS();
+}
+
+/* ============ Suite table ============ */
+
 const test_entry_t embedding_entries[] = {
     { "embedding/cos_dist_scalar", test_cos_dist_scalar, emb_setup, emb_teardown },
     { "embedding/l2_dist_scalar", test_l2_dist_scalar, emb_setup, emb_teardown },
@@ -991,6 +1300,19 @@ const test_entry_t embedding_entries[] = {
     { "embedding/hnsw_search_filter_null_accept", test_hnsw_search_filter_null_accept, emb_setup, emb_teardown },
     { "embedding/hnsw_mmap_load", test_hnsw_mmap_load, emb_setup, emb_teardown },
     { "embedding/hnsw_search_sift_down", test_hnsw_search_sift_down, emb_setup, emb_teardown },
+
+    /* rerank coverage (S7) */
+    { "embedding/rerank_knn_i32_source", test_knn_i32_source_vecs, emb_setup, emb_teardown },
+    { "embedding/rerank_knn_i64_source", test_knn_i64_source_vecs, emb_setup, emb_teardown },
+    { "embedding/rerank_knn_f64_source", test_knn_f64_source_vecs, emb_setup, emb_teardown },
+    { "embedding/rerank_ann_empty_source", test_ann_rerank_empty_source, emb_setup, emb_teardown },
+    { "embedding/rerank_ann_filter_rejects_all", test_ann_rerank_filter_rejects_all, emb_setup, emb_teardown },
+    { "embedding/rerank_knn_identity_scan_bad_row", test_knn_rerank_identity_scan_bad_row, emb_setup, emb_teardown },
+    { "embedding/rerank_knn_filtered_scan_bad_row", test_knn_rerank_filtered_scan_bad_row, emb_setup, emb_teardown },
+    { "embedding/rerank_knn_nullable_col_gather", test_knn_rerank_nullable_col_gather, emb_setup, emb_teardown },
+    { "embedding/rerank_knn_heap_right_child", test_knn_rerank_heap_right_child, emb_setup, emb_teardown },
+    { "embedding/rerank_knn_zero_query_cosine", test_knn_rerank_zero_query_cosine, emb_setup, emb_teardown },
+
     { NULL, NULL, NULL, NULL },
 };
 

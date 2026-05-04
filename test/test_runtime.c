@@ -27,12 +27,15 @@
 #include <rayforce.h>
 #include <rayforce.h>
 #include "core/runtime.h"   /* ray_runtime_t, ray_runtime_create*, __RUNTIME */
+#include "core/sock.h"      /* ray_sock_* */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 static char* make_tmpdir(void) {
     char tmpl[] = "/tmp/rayforce-rt-test-XXXXXX";
@@ -264,6 +267,82 @@ static test_result_t test_oom_sentinel_is_well_formed(void) {
     PASS();
 }
 
+/* ---- sock.c coverage helpers ---------------------------------------- */
+
+/* ray_sock_close must silently ignore RAY_INVALID_SOCK without crashing.
+ * Covers the early-return region at line 180 of sock.c. */
+static test_result_t test_sock_close_invalid(void) {
+    ray_sock_close(RAY_INVALID_SOCK);   /* must not crash */
+    ray_sock_close(RAY_INVALID_SOCK);   /* idempotent */
+    PASS();
+}
+
+/* ray_sock_listen with a port already in the LISTEN state must fail and
+ * return RAY_INVALID_SOCK (EADDRINUSE bind path, lines 65-67 of sock.c).
+ *
+ * We occupy the port with a raw socket that has SO_REUSEPORT disabled
+ * (never set) and is actively listening.  ray_sock_listen sets
+ * SO_REUSEADDR on its own socket which allows rebinding a TIME_WAIT
+ * address but NOT a currently-listening one when SO_REUSEPORT is absent.
+ * Using INADDR_ANY (same as ray_sock_listen) ensures the conflict. */
+static test_result_t test_sock_listen_bind_fails_eaddrinuse(void) {
+    int raw = socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT(raw >= 0, "raw socket");
+    /* Do NOT set SO_REUSEPORT — leave the port exclusively owned. */
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port        = 0; /* OS assigns */
+    TEST_ASSERT(bind(raw, (struct sockaddr*)&addr, sizeof(addr)) == 0, "first bind");
+    TEST_ASSERT(listen(raw, 1) == 0, "first listen");
+
+    socklen_t alen = sizeof(addr);
+    getsockname(raw, (struct sockaddr*)&addr, &alen);
+    uint16_t port = ntohs(addr.sin_port);
+
+    /* ray_sock_listen sets SO_REUSEADDR but NOT SO_REUSEPORT, so binding
+     * INADDR_ANY on a port already in LISTEN must return EADDRINUSE. */
+    ray_sock_t srv = ray_sock_listen(port);
+
+    close(raw);
+
+    TEST_ASSERT_EQ_I((int)srv, (int)RAY_INVALID_SOCK);
+    PASS();
+}
+
+/* ray_sock_connect with an unresolvable hostname must return
+ * RAY_INVALID_SOCK (getaddrinfo failure region, line 100 of sock.c). */
+static test_result_t test_sock_connect_bad_host(void) {
+    /* .invalid TLD is IANA-reserved to never resolve. */
+    ray_sock_t fd = ray_sock_connect("this.host.is.invalid", 9999, 500);
+    TEST_ASSERT_EQ_I((int)fd, (int)RAY_INVALID_SOCK);
+    PASS();
+}
+
+/* ray_sock_connect with timeout_ms == 0 must take the else-branch of the
+ * "if (timeout_ms > 0)" guard (line 110 of sock.c).  We connect to a
+ * listener on localhost so the connect itself succeeds and we exercise
+ * the code past that branch. */
+static test_result_t test_sock_connect_no_timeout(void) {
+    ray_sock_t srv = ray_sock_listen(0);
+    if (srv == RAY_INVALID_SOCK) SKIP("could not open listen socket");
+
+    struct sockaddr_in addr;
+    socklen_t alen = sizeof(addr);
+    getsockname((int)srv, (struct sockaddr*)&addr, &alen);
+    uint16_t port = ntohs(addr.sin_port);
+
+    /* timeout_ms == 0: must NOT enter the timeout-setup block */
+    ray_sock_t client = ray_sock_connect("127.0.0.1", port, 0);
+
+    ray_sock_close(srv);
+    if (client != RAY_INVALID_SOCK) ray_sock_close(client);
+    TEST_ASSERT((int)client != (int)RAY_INVALID_SOCK, "connect with timeout=0 should succeed");
+    PASS();
+}
+
 const test_entry_t runtime_entries[] = {
     { "runtime/create_with_sym_absent_is_ok", test_create_with_sym_absent_is_ok, NULL, NULL },
     { "runtime/create_with_sym_io_error_surfaces", test_create_with_sym_io_error_surfaces, NULL, NULL },
@@ -272,6 +351,10 @@ const test_entry_t runtime_entries[] = {
     { "runtime/create_with_sym_load_preserves_user_ids", test_create_with_sym_load_preserves_user_ids, NULL, NULL },
     { "runtime/create_with_sym_oversized_file", test_create_with_sym_oversized_file, NULL, NULL },
     { "runtime/oom_sentinel_is_well_formed", test_oom_sentinel_is_well_formed, NULL, NULL },
+    { "runtime/sock_close_invalid",                  test_sock_close_invalid,                  NULL, NULL },
+    { "runtime/sock_listen_bind_fails_eaddrinuse",   test_sock_listen_bind_fails_eaddrinuse,   NULL, NULL },
+    { "runtime/sock_connect_bad_host",               test_sock_connect_bad_host,               NULL, NULL },
+    { "runtime/sock_connect_no_timeout",             test_sock_connect_no_timeout,             NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 

@@ -26,7 +26,10 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "vec/str.h"
+#include "ops/ops.h"
+#include "table/sym.h"
 #include <string.h>
+#include <stdio.h>
 
 /* ---- Setup / Teardown -------------------------------------------------- */
 
@@ -786,6 +789,882 @@ static test_result_t test_str_vec_concat_vecs(void) {
     PASS();
 }
 
+/* ====================================================================
+ * Graph-level string op tests (src/ops/string.c coverage)
+ * ==================================================================== */
+
+/* Helper: build a small SYM table with one "name" column */
+static ray_t* make_str_sym_table(void) {
+    (void)ray_sym_init();
+    int64_t s0 = ray_sym_intern("hello", 5);
+    int64_t s1 = ray_sym_intern("WORLD", 5);
+    int64_t s2 = ray_sym_intern("  foo  ", 7);
+    ray_t* vec = ray_sym_vec_new(RAY_SYM_W64, 3);
+    vec->len = 3;
+    int64_t* d = (int64_t*)ray_data(vec);
+    d[0] = s0; d[1] = s1; d[2] = s2;
+    int64_t n = ray_sym_intern("name", 4);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, n, vec);
+    ray_release(vec);
+    return tbl;
+}
+
+/* exec_like: non-STR/non-SYM input → memset(dst,0) else-branch */
+static test_result_t test_str_like_non_string_type(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Build an I64 column — exec_like's else branch fills with 0 */
+    ray_t* col = ray_vec_new(RAY_I64, 3);
+    col->len = 3;
+    int64_t* cd = (int64_t*)ray_data(col);
+    cd[0] = 1; cd[1] = 2; cd[2] = 3;
+
+    int64_t nm = ray_sym_intern("val", 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* val = ray_scan(g, "val");
+    ray_op_t* pat = ray_const_str(g, "1*", 2);
+    ray_op_t* lk  = ray_like(g, val, pat);
+    ray_t* result = ray_execute(g, lk);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_BOOL);
+    TEST_ASSERT_EQ_I(result->len, 3);
+    uint8_t* rd = (uint8_t*)ray_data(result);
+    /* All false — I64 is not a string type */
+    TEST_ASSERT_EQ_I(rd[0], 0);
+    TEST_ASSERT_EQ_I(rd[1], 0);
+    TEST_ASSERT_EQ_I(rd[2], 0);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_ilike: non-STR/non-SYM input → memset(dst,0) else-branch */
+static test_result_t test_str_ilike_non_string_type(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* col = ray_vec_new(RAY_I64, 2);
+    col->len = 2;
+    int64_t* cd = (int64_t*)ray_data(col);
+    cd[0] = 10; cd[1] = 20;
+
+    int64_t nm = ray_sym_intern("val", 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* val = ray_scan(g, "val");
+    ray_op_t* pat = ray_const_str(g, "*", 1);
+    ray_op_t* ilk = ray_ilike(g, val, pat);
+    ray_t* result = ray_execute(g, ilk);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_BOOL);
+    uint8_t* rd = (uint8_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(rd[0], 0);
+    TEST_ASSERT_EQ_I(rd[1], 0);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_ilike: STR column, case-insensitive match */
+static test_result_t test_str_ilike_str_column(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* col = ray_vec_new(RAY_STR, 3);
+    col = ray_str_vec_append(col, "Hello", 5);
+    col = ray_str_vec_append(col, "WORLD", 5);
+    col = ray_str_vec_append(col, "foo", 3);
+
+    int64_t nm = ray_sym_intern("name", 4);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name = ray_scan(g, "name");
+    ray_op_t* pat  = ray_const_str(g, "hello", 5);
+    ray_op_t* ilk  = ray_ilike(g, name, pat);
+    ray_t* result  = ray_execute(g, ilk);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_BOOL);
+    uint8_t* rd = (uint8_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(rd[0], 1);  /* "Hello" ilike "hello" */
+    TEST_ASSERT_EQ_I(rd[1], 0);  /* "WORLD" ilike "hello" — no */
+    TEST_ASSERT_EQ_I(rd[2], 0);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_string_unary (UPPER): SYM column with null → sym_dst[i]=0 + set_null */
+static test_result_t test_str_upper_sym_null(void) {
+    ray_heap_init();
+    ray_t* tbl = make_str_sym_table();
+
+    /* mark row 1 null in the SYM column */
+    ray_t* col = ray_table_get_col(tbl, ray_sym_intern("name", 4));
+    ray_vec_set_null(col, 1, true);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name = ray_scan(g, "name");
+    ray_op_t* up   = ray_upper(g, name);
+    ray_t* result  = ray_execute(g, up);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(result->len, 3);
+
+    /* row 0: HELLO */
+    int64_t* rd = (int64_t*)ray_data(result);
+    ray_t* s0 = ray_sym_str(rd[0]);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(s0), "HELLO");
+
+    /* row 1: null */
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_string_unary (LOWER): SYM column with null */
+static test_result_t test_str_lower_sym_null(void) {
+    ray_heap_init();
+    ray_t* tbl = make_str_sym_table();
+
+    ray_t* col = ray_table_get_col(tbl, ray_sym_intern("name", 4));
+    ray_vec_set_null(col, 0, true);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name = ray_scan(g, "name");
+    ray_op_t* lo   = ray_lower(g, name);
+    ray_t* result  = ray_execute(g, lo);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 0));
+
+    /* row 1: "world" */
+    int64_t* rd = (int64_t*)ray_data(result);
+    ray_t* s1 = ray_sym_str(rd[1]);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(s1), "world");
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_strlen: SYM column with null → null propagation in SYM branch */
+static test_result_t test_str_strlen_sym_null(void) {
+    ray_heap_init();
+    ray_t* tbl = make_str_sym_table();
+
+    ray_t* col = ray_table_get_col(tbl, ray_sym_intern("name", 4));
+    ray_vec_set_null(col, 2, true);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name  = ray_scan(g, "name");
+    ray_op_t* slen  = ray_strlen(g, name);
+    ray_t* result   = ray_execute(g, slen);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
+    int64_t* rd = (int64_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(rd[0], 5);   /* "hello" */
+    TEST_ASSERT_EQ_I(rd[1], 5);   /* "WORLD" */
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 2));  /* null propagated */
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_substr: SYM column → SYM output */
+static test_result_t test_str_substr_sym(void) {
+    ray_heap_init();
+    ray_t* tbl = make_str_sym_table();
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name   = ray_scan(g, "name");
+    ray_op_t* start  = ray_const_i64(g, 2);   /* 1-based → skip first char */
+    ray_op_t* len_op = ray_const_i64(g, 3);
+    ray_op_t* sub    = ray_substr(g, name, start, len_op);
+    ray_t* result    = ray_execute(g, sub);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(result->len, 3);
+
+    int64_t* rd = (int64_t*)ray_data(result);
+    /* "hello"[2..4] = "ell" */
+    ray_t* s0 = ray_sym_str(rd[0]);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(s0), "ell");
+    /* "WORLD"[2..4] = "ORL" */
+    ray_t* s1 = ray_sym_str(rd[1]);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(s1), "ORL");
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_substr: SYM column with null → null propagation in SYM branch */
+static test_result_t test_str_substr_sym_null(void) {
+    ray_heap_init();
+    ray_t* tbl = make_str_sym_table();
+
+    ray_t* col = ray_table_get_col(tbl, ray_sym_intern("name", 4));
+    ray_vec_set_null(col, 1, true);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name   = ray_scan(g, "name");
+    ray_op_t* start  = ray_const_i64(g, 1);
+    ray_op_t* len_op = ray_const_i64(g, 2);
+    ray_op_t* sub    = ray_substr(g, name, start, len_op);
+    ray_t* result    = ray_execute(g, sub);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_substr: SYM column — start beyond string length → empty sym */
+static test_result_t test_str_substr_sym_out_of_range(void) {
+    ray_heap_init();
+    ray_t* tbl = make_str_sym_table();
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name   = ray_scan(g, "name");
+    ray_op_t* start  = ray_const_i64(g, 100);  /* way beyond any string */
+    ray_op_t* len_op = ray_const_i64(g, 3);
+    ray_op_t* sub    = ray_substr(g, name, start, len_op);
+    ray_t* result    = ray_execute(g, sub);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    /* all rows: empty string */
+    int64_t* rd = (int64_t*)ray_data(result);
+    ray_t* s0 = ray_sym_str(rd[0]);
+    TEST_ASSERT_EQ_U(ray_str_len(s0), 0);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_replace: SYM column → SYM output */
+static test_result_t test_str_replace_sym(void) {
+    ray_heap_init();
+    ray_t* tbl = make_str_sym_table();
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name = ray_scan(g, "name");
+    ray_op_t* from = ray_const_str(g, "l", 1);
+    ray_op_t* to   = ray_const_str(g, "L", 1);  /* same length replace */
+    ray_op_t* rep  = ray_replace(g, name, from, to);
+    ray_t* result  = ray_execute(g, rep);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(result->len, 3);
+
+    int64_t* rd = (int64_t*)ray_data(result);
+    ray_t* s0 = ray_sym_str(rd[0]);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(s0), "heLLo");  /* "hello" -> "heLLo" */
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_replace: SYM column with null */
+static test_result_t test_str_replace_sym_null(void) {
+    ray_heap_init();
+    ray_t* tbl = make_str_sym_table();
+
+    ray_t* col = ray_table_get_col(tbl, ray_sym_intern("name", 4));
+    ray_vec_set_null(col, 0, true);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name = ray_scan(g, "name");
+    ray_op_t* from = ray_const_str(g, "o", 1);
+    ray_op_t* to   = ray_const_str(g, "0", 1);
+    ray_op_t* rep  = ray_replace(g, name, from, to);
+    ray_t* result  = ray_execute(g, rep);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 0));
+
+    /* row 1: "WORLD" → no lowercase o → "WORLD" */
+    int64_t* rd = (int64_t*)ray_data(result);
+    ray_t* s1 = ray_sym_str(rd[1]);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(s1), "WORLD");
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_replace: shrink path (to_len < from_len) on STR column */
+static test_result_t test_str_replace_str_shrink(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* col = ray_vec_new(RAY_STR, 3);
+    col = ray_str_vec_append(col, "aabbaabb", 8);
+    col = ray_str_vec_append(col, "xyzxyz", 6);
+    col = ray_str_vec_append(col, "cc", 2);
+
+    int64_t nm = ray_sym_intern("val", 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* val  = ray_scan(g, "val");
+    ray_op_t* from = ray_const_str(g, "aa", 2);  /* 2-char from */
+    ray_op_t* to   = ray_const_str(g, "A", 1);   /* 1-char to → shrink */
+    ray_op_t* rep  = ray_replace(g, val, from, to);
+    ray_t* result  = ray_execute(g, rep);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_STR);
+
+    size_t len;
+    const char* s0 = ray_str_vec_get(result, 0, &len);
+    TEST_ASSERT_EQ_U(len, 6);
+    TEST_ASSERT_MEM_EQ(6, s0, "AbbAbb");  /* "aabbaabb" → "AbbAbb" */
+
+    const char* s1 = ray_str_vec_get(result, 1, &len);
+    TEST_ASSERT_EQ_U(len, 6);
+    TEST_ASSERT_MEM_EQ(6, s1, "xyzxyz");  /* no match */
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_concat: >16 args → scratch_calloc path for args array */
+static test_result_t test_str_concat_many_args(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Build a table with 17 STR columns */
+    enum { NCOLS = 17 };
+    ray_t* tbl = ray_table_new(NCOLS);
+    ray_t* cols[NCOLS];
+    int64_t colnames[NCOLS];
+    for (int i = 0; i < NCOLS; i++) {
+        char nbuf[8];
+        snprintf(nbuf, sizeof(nbuf), "c%d", i);
+        colnames[i] = ray_sym_intern(nbuf, strlen(nbuf));
+
+        cols[i] = ray_vec_new(RAY_STR, 1);
+        cols[i] = ray_str_vec_append(cols[i], "x", 1);
+        tbl = ray_table_add_col(tbl, colnames[i], cols[i]);
+        ray_release(cols[i]);
+    }
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* ops[NCOLS];
+    for (int i = 0; i < NCOLS; i++) {
+        char nbuf[8];
+        snprintf(nbuf, sizeof(nbuf), "c%d", i);
+        ops[i] = ray_scan(g, nbuf);
+    }
+    ray_op_t* cat = ray_concat(g, ops, NCOLS);
+    ray_t* result = ray_execute(g, cat);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_STR);
+    TEST_ASSERT_EQ_I(result->len, 1);
+
+    size_t len;
+    (void)ray_str_vec_get(result, 0, &len);
+    TEST_ASSERT_EQ_U(len, NCOLS);  /* 17 x "x" = "xxxxxxxxxxxxxxxxx" */
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_concat: SYM output with null → dst[r]=0 + set_null */
+static test_result_t test_str_concat_sym_null(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Build a SYM table with two columns, null in second col row 1 */
+    int64_t sa = ray_sym_intern("hello", 5);
+    int64_t sb = ray_sym_intern("world", 5);
+
+    ray_t* ca = ray_sym_vec_new(RAY_SYM_W64, 2);
+    ca->len = 2;
+    int64_t* da = (int64_t*)ray_data(ca);
+    da[0] = sa; da[1] = sa;
+
+    ray_t* cb = ray_sym_vec_new(RAY_SYM_W64, 2);
+    cb->len = 2;
+    int64_t* db = (int64_t*)ray_data(cb);
+    db[0] = sb; db[1] = sb;
+    ray_vec_set_null(cb, 1, true);  /* null in second arg, row 1 */
+
+    int64_t n1 = ray_sym_intern("a", 1);
+    int64_t n2 = ray_sym_intern("b", 1);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, n1, ca);
+    tbl = ray_table_add_col(tbl, n2, cb);
+    ray_release(ca);
+    ray_release(cb);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* oa = ray_scan(g, "a");
+    ray_op_t* ob = ray_scan(g, "b");
+    ray_op_t* args[] = {oa, ob};
+    ray_op_t* cat = ray_concat(g, args, 2);
+    ray_t* result = ray_execute(g, cat);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    /* row 0: "hello" + "world" = "helloworld" */
+    TEST_ASSERT_FALSE(ray_vec_is_null(result, 0));
+    /* row 1: second arg is null → entire row null */
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_trim: SYM column with null */
+static test_result_t test_str_trim_sym_null(void) {
+    ray_heap_init();
+    ray_t* tbl = make_str_sym_table();
+
+    ray_t* col = ray_table_get_col(tbl, ray_sym_intern("name", 4));
+    ray_vec_set_null(col, 2, true);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name = ray_scan(g, "name");
+    ray_op_t* tr   = ray_trim_op(g, name);
+    ray_t* result  = ray_execute(g, tr);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    TEST_ASSERT_EQ_I(result->len, 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(result, 2));
+
+    int64_t* rd = (int64_t*)ray_data(result);
+    ray_t* s0 = ray_sym_str(rd[0]);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(s0), "hello");  /* no whitespace */
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_like: STR column (verifies STR arm of exec_like) */
+static test_result_t test_str_like_str_column(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* col = ray_vec_new(RAY_STR, 3);
+    col = ray_str_vec_append(col, "foobar", 6);
+    col = ray_str_vec_append(col, "baz", 3);
+    col = ray_str_vec_append(col, "fooXXX", 6);
+
+    int64_t nm = ray_sym_intern("name", 4);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name = ray_scan(g, "name");
+    ray_op_t* pat  = ray_const_str(g, "foo*", 4);
+    ray_op_t* lk   = ray_like(g, name, pat);
+    ray_t* result  = ray_execute(g, lk);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    uint8_t* rd = (uint8_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(rd[0], 1);
+    TEST_ASSERT_EQ_I(rd[1], 0);
+    TEST_ASSERT_EQ_I(rd[2], 1);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_ilike: SYM column, case-insensitive */
+static test_result_t test_str_ilike_sym_column(void) {
+    ray_heap_init();
+    ray_t* tbl = make_str_sym_table();
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name = ray_scan(g, "name");
+    ray_op_t* pat  = ray_const_str(g, "HELLO", 5);
+    ray_op_t* ilk  = ray_ilike(g, name, pat);
+    ray_t* result  = ray_execute(g, ilk);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    uint8_t* rd = (uint8_t*)ray_data(result);
+    TEST_ASSERT_EQ_I(rd[0], 1);  /* "hello" ilike "HELLO" */
+    TEST_ASSERT_EQ_I(rd[1], 0);
+    TEST_ASSERT_EQ_I(rd[2], 0);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_substr: F64 scalar start → -RAY_F64 branch (line 289) */
+static test_result_t test_str_substr_f64_scalar_start(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    ray_t* tbl = make_str_sym_table();  /* SYM: "hello","WORLD","  foo  " */
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name   = ray_scan(g, "name");
+    ray_op_t* start  = ray_const_f64(g, 2.0);  /* F64 scalar → -RAY_F64 branch */
+    ray_op_t* len_op = ray_const_i64(g, 3);
+    ray_op_t* sub    = ray_substr(g, name, start, len_op);
+    ray_t* result    = ray_execute(g, sub);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    /* "hello"[2..4] = "ell" */
+    int64_t* rd = (int64_t*)ray_data(result);
+    ray_t* s0 = ray_sym_str(rd[0]);
+    TEST_ASSERT_EQ_U(ray_str_len(s0), 3);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_substr: F64 scalar len → -RAY_F64 branch on len (line 301) */
+static test_result_t test_str_substr_f64_scalar_len(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    ray_t* tbl = make_str_sym_table();
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name   = ray_scan(g, "name");
+    ray_op_t* start  = ray_const_i64(g, 1);
+    ray_op_t* len_op = ray_const_f64(g, 3.0);  /* F64 scalar for len */
+    ray_op_t* sub    = ray_substr(g, name, start, len_op);
+    ray_t* result    = ray_execute(g, sub);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_SYM);
+    int64_t* rd = (int64_t*)ray_data(result);
+    ray_t* s0 = ray_sym_str(rd[0]);
+    TEST_ASSERT_EQ_U(ray_str_len(s0), 3);  /* "hel" */
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_substr: I32 vector start → s_data_i32 branch (line 298) */
+static test_result_t test_str_substr_i32_vec_start(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* col = ray_vec_new(RAY_STR, 3);
+    col = ray_str_vec_append(col, "hello", 5);
+    col = ray_str_vec_append(col, "world", 5);
+    col = ray_str_vec_append(col, "foobar", 6);
+
+    int32_t start_raw[] = {1, 2, 3};
+    ray_t* start_col = ray_vec_from_raw(RAY_I32, start_raw, 3);
+
+    int64_t nm = ray_sym_intern("name", 4);
+    int64_t ns = ray_sym_intern("start", 5);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, nm, col);
+    tbl = ray_table_add_col(tbl, ns, start_col);
+    ray_release(col);
+    ray_release(start_col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name   = ray_scan(g, "name");
+    ray_op_t* start  = ray_scan(g, "start");   /* I32 vector */
+    ray_op_t* len_op = ray_const_i64(g, 3);
+    ray_op_t* sub    = ray_substr(g, name, start, len_op);
+    ray_t* result    = ray_execute(g, sub);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_STR);
+    /* row0: "hello"[0..2] = "hel" */
+    size_t len;
+    const char* s0 = ray_str_vec_get(result, 0, &len);
+    TEST_ASSERT_EQ_U(len, 3);
+    TEST_ASSERT_MEM_EQ(3, s0, "hel");
+    /* row1: "world"[1..3] = "orl" */
+    const char* s1 = ray_str_vec_get(result, 1, &len);
+    TEST_ASSERT_EQ_U(len, 3);
+    TEST_ASSERT_MEM_EQ(3, s1, "orl");
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_substr: I64 vector start → s_data branch (line 299) */
+static test_result_t test_str_substr_i64_vec_start(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* col = ray_vec_new(RAY_STR, 3);
+    col = ray_str_vec_append(col, "hello", 5);
+    col = ray_str_vec_append(col, "world", 5);
+    col = ray_str_vec_append(col, "ray", 3);
+
+    int64_t start_raw[] = {1, 3, 2};
+    ray_t* start_col = ray_vec_from_raw(RAY_I64, start_raw, 3);
+
+    int64_t nm = ray_sym_intern("name", 4);
+    int64_t ns = ray_sym_intern("start", 5);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, nm, col);
+    tbl = ray_table_add_col(tbl, ns, start_col);
+    ray_release(col);
+    ray_release(start_col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name   = ray_scan(g, "name");
+    ray_op_t* start  = ray_scan(g, "start");   /* I64 vector */
+    ray_op_t* len_op = ray_const_i64(g, 2);
+    ray_op_t* sub    = ray_substr(g, name, start, len_op);
+    ray_t* result    = ray_execute(g, sub);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_STR);
+    size_t len;
+    const char* s0 = ray_str_vec_get(result, 0, &len);
+    TEST_ASSERT_EQ_U(len, 2);
+    TEST_ASSERT_MEM_EQ(2, s0, "he");  /* "hello"[0..1] */
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_substr: I32 vector len → l_data_i32 branch (line 310) */
+static test_result_t test_str_substr_i32_vec_len(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* col = ray_vec_new(RAY_STR, 3);
+    col = ray_str_vec_append(col, "hello", 5);
+    col = ray_str_vec_append(col, "world", 5);
+    col = ray_str_vec_append(col, "foobar", 6);
+
+    int32_t len_raw[] = {2, 3, 4};
+    ray_t* len_col = ray_vec_from_raw(RAY_I32, len_raw, 3);
+
+    int64_t nm = ray_sym_intern("name", 4);
+    int64_t nl = ray_sym_intern("lenv", 4);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, nm, col);
+    tbl = ray_table_add_col(tbl, nl, len_col);
+    ray_release(col);
+    ray_release(len_col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name   = ray_scan(g, "name");
+    ray_op_t* start  = ray_const_i64(g, 1);
+    ray_op_t* len_op = ray_scan(g, "lenv");   /* I32 vector */
+    ray_op_t* sub    = ray_substr(g, name, start, len_op);
+    ray_t* result    = ray_execute(g, sub);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_STR);
+    size_t len;
+    const char* s0 = ray_str_vec_get(result, 0, &len);
+    TEST_ASSERT_EQ_U(len, 2);
+    TEST_ASSERT_MEM_EQ(2, s0, "he");
+    const char* s1 = ray_str_vec_get(result, 1, &len);
+    TEST_ASSERT_EQ_U(len, 3);
+    TEST_ASSERT_MEM_EQ(3, s1, "wor");
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_substr: I64 vector len → l_data branch (line 311) */
+static test_result_t test_str_substr_i64_vec_len(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* col = ray_vec_new(RAY_STR, 2);
+    col = ray_str_vec_append(col, "hello", 5);
+    col = ray_str_vec_append(col, "world", 5);
+
+    int64_t len_raw[] = {4, 2};
+    ray_t* len_col = ray_vec_from_raw(RAY_I64, len_raw, 2);
+
+    int64_t nm = ray_sym_intern("name", 4);
+    int64_t nl = ray_sym_intern("lenv", 4);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, nm, col);
+    tbl = ray_table_add_col(tbl, nl, len_col);
+    ray_release(col);
+    ray_release(len_col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* name   = ray_scan(g, "name");
+    ray_op_t* start  = ray_const_i64(g, 1);
+    ray_op_t* len_op = ray_scan(g, "lenv");   /* I64 vector */
+    ray_op_t* sub    = ray_substr(g, name, start, len_op);
+    ray_t* result    = ray_execute(g, sub);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_STR);
+    size_t len;
+    const char* s0 = ray_str_vec_get(result, 0, &len);
+    TEST_ASSERT_EQ_U(len, 4);
+    TEST_ASSERT_MEM_EQ(4, s0, "hell");
+    const char* s1 = ray_str_vec_get(result, 1, &len);
+    TEST_ASSERT_EQ_U(len, 2);
+    TEST_ASSERT_MEM_EQ(2, s1, "wo");
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_string_unary: large string (>= 8192 bytes) → scratch_alloc branch */
+static test_result_t test_str_upper_large_string(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    /* Build a string of 8200 'a' chars — forces scratch_alloc path */
+    enum { BIG = 8200 };
+    char big[BIG];
+    memset(big, 'a', BIG);
+
+    ray_t* col = ray_vec_new(RAY_STR, 1);
+    col = ray_str_vec_append(col, big, BIG);
+
+    int64_t nm = ray_sym_intern("val", 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, nm, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* val  = ray_scan(g, "val");
+    ray_op_t* up   = ray_upper(g, val);
+    ray_t* result  = ray_execute(g, up);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_STR);
+    TEST_ASSERT_EQ_I(result->len, 1);
+
+    size_t len;
+    const char* s = ray_str_vec_get(result, 0, &len);
+    TEST_ASSERT_EQ_U(len, BIG);
+    /* All chars should be uppercase 'A' */
+    TEST_ASSERT_EQ_I(s[0], 'A');
+    TEST_ASSERT_EQ_I(s[BIG - 1], 'A');
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 static test_result_t test_str_t_hash_inline(void) {
@@ -1030,6 +1909,31 @@ const test_entry_t str_entries[] = {
     { "str/vec_slice_null", test_str_vec_slice_null, str_setup, str_teardown },
     { "str/vec_cow_append", test_str_vec_cow_append, str_setup, str_teardown },
     { "str/vec_cow_set", test_str_vec_cow_set, str_setup, str_teardown },
+    /* Graph-level string.c coverage tests */
+    { "str/like_non_string", test_str_like_non_string_type, NULL, NULL },
+    { "str/ilike_non_string", test_str_ilike_non_string_type, NULL, NULL },
+    { "str/ilike_str_col", test_str_ilike_str_column, NULL, NULL },
+    { "str/ilike_sym_col", test_str_ilike_sym_column, NULL, NULL },
+    { "str/like_str_col", test_str_like_str_column, NULL, NULL },
+    { "str/upper_sym_null", test_str_upper_sym_null, NULL, NULL },
+    { "str/lower_sym_null", test_str_lower_sym_null, NULL, NULL },
+    { "str/trim_sym_null", test_str_trim_sym_null, NULL, NULL },
+    { "str/strlen_sym_null", test_str_strlen_sym_null, NULL, NULL },
+    { "str/substr_sym", test_str_substr_sym, NULL, NULL },
+    { "str/substr_sym_null", test_str_substr_sym_null, NULL, NULL },
+    { "str/substr_sym_oor", test_str_substr_sym_out_of_range, NULL, NULL },
+    { "str/replace_sym", test_str_replace_sym, NULL, NULL },
+    { "str/replace_sym_null", test_str_replace_sym_null, NULL, NULL },
+    { "str/replace_str_shrink", test_str_replace_str_shrink, NULL, NULL },
+    { "str/concat_many_args", test_str_concat_many_args, NULL, NULL },
+    { "str/concat_sym_null", test_str_concat_sym_null, NULL, NULL },
+    { "str/substr_f64_scalar_start", test_str_substr_f64_scalar_start, NULL, NULL },
+    { "str/substr_f64_scalar_len", test_str_substr_f64_scalar_len, NULL, NULL },
+    { "str/substr_i32_vec_start", test_str_substr_i32_vec_start, NULL, NULL },
+    { "str/substr_i64_vec_start", test_str_substr_i64_vec_start, NULL, NULL },
+    { "str/substr_i32_vec_len", test_str_substr_i32_vec_len, NULL, NULL },
+    { "str/substr_i64_vec_len", test_str_substr_i64_vec_len, NULL, NULL },
+    { "str/upper_large_string", test_str_upper_large_string, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
