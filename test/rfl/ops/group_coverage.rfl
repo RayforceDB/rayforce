@@ -503,3 +503,389 @@
 (sum (at (select {fi: (first f) from: Tfg by: k}) 'fi)) -- 30.0
 ;; Last per group: 1.5→50.0, 2.5→60.0; sum = 110.0
 (sum (at (select {la: (last f) from: Tfg by: k}) 'la)) -- 110.0
+
+;; ────────────── 57. radix_phase3_fn with F64 agg output (group.c:1143-1190) ──────────────
+;; F64 key forces HT path; ≥64K rows triggers radix.  F64 agg column
+;; forces out_type==RAY_F64 for every op branch in radix_phase3_fn
+;; (SUM, AVG, MIN, MAX, FIRST, LAST were all 0 prior to this section).
+(set N57 70000)
+(set T57 (table [k f] (list (as 'F64 (% (til N57) 100)) (as 'F64 (til N57)))))
+;; SUM F64 branch (group.c:1146)
+(count (select {s: (sum f) from: T57 by: k})) -- 100
+(sum (at (select {s: (sum f) from: T57 by: k}) 's)) -- 2449965000.0
+;; AVG F64 branch (group.c:1155)
+(count (select {av: (avg f) from: T57 by: k})) -- 100
+;; MIN/MAX F64 branch (group.c:1160-1166)
+(count (select {mn: (min f) mx: (max f) from: T57 by: k})) -- 100
+;; FIRST/LAST F64 branch (group.c:1168)
+(count (select {fi: (first f) la: (last f) from: T57 by: k})) -- 100
+;; PROD F64 branch (group.c:1151)
+(count (select {p: (prod f) from: T57 by: k})) -- 100
+
+;; ────────────── 58. Radix HT: SUM/COUNT/AVG/PROD/MIN/MAX agg out_type + naming ──────────────
+;; F64 key + I64 agg + ≥64K rows.  Adds the out_type branches:
+;;   OP_AVG  → out_type = RAY_F64 (group.c:3477)
+;;   OP_COUNT → out_type = RAY_I64 (group.c:3481)
+;;   OP_SUM/PROD → out_type = I64 (group.c:3482, is_f64=false)
+;;   OP_MIN/MAX → radix_phase3_fn I64 output (group.c:1200-1201)
+;; Also covers the per-agg suffix naming cases (group.c:3586-3591).
+(count (select {s: (sum v) c: (count v) av: (avg v) from: Tfhk by: k})) -- 100
+(sum (at (select {s: (sum v) from: Tfhk by: k}) 's)) -- 2449965000
+(count (select {p: (prod v) from: Tfhk by: k})) -- 100
+;; MIN/MAX I64 in radix_phase3_fn (group.c:1200-1201)
+(count (select {mn: (min v) mx: (max v) from: Tfhk by: k})) -- 100
+
+;; ────────────── 59. materialize_broadcast_input: constant agg input ──────────────
+;; When agg input is a OP_CONST atom, agg_vecs[a] = literal atom, and
+;; needs_broadcast = ray_is_atom(src) = true → materialize_broadcast_input
+;; (group.c:1569) is called to broadcast it to nrows length.
+;; Exercises type cases: -RAY_I64 (first 3), -RAY_F64 (min 3.0),
+;; -RAY_I64 (max 7), -RAY_I64 (last 3), -RAY_I64 (prod 3).
+(set Tbc (table [g v] (list ['a 'a 'b 'b 'c] [1 2 3 4 5])))
+;; (first 3): const I64 atom broadcast, first of each group = 3 always
+(sum (at (select {fi: (first 3) from: Tbc by: g}) 'fi)) -- 9
+;; (min 3.0): const F64 atom broadcast → F64 branch of materialize
+(sum (at (select {mn: (min 3.0) from: Tbc by: g}) 'mn)) -- 9.0
+;; (max 7): const I64 atom
+(sum (at (select {mx: (max 7) from: Tbc by: g}) 'mx)) -- 21
+;; (last 3): const I64 atom
+(sum (at (select {la: (last 3) from: Tbc by: g}) 'la)) -- 9
+
+;; ────────────── 60. Sequential HT: F64 PROD + I64 FIRST/LAST ──────────────
+;; Small table (<64K rows), F64 key → sequential HT path.
+;; F64 agg + PROD hits group.c:3720 (F64 PROD in sequential HT).
+;; I64 agg + FIRST/LAST hits group.c:3771 (I64 FIRST/LAST in sequential HT).
+(set Tsh (table [k f v] (list [1.5 2.5 1.5 2.5 3.5 1.5] (as 'F64 [10.0 20.0 30.0 40.0 50.0 60.0]) [10 20 30 40 50 60])))
+;; F64 PROD: 1.5→(10*30*60=18000), 2.5→(20*40=800), 3.5→50
+(sum (at (select {p: (prod f) from: Tsh by: k}) 'p)) -- 18850.0
+;; I64 FIRST: 1.5→10, 2.5→20, 3.5→50; sum=80
+(sum (at (select {fi: (first v) from: Tsh by: k}) 'fi)) -- 80
+;; I64 LAST: 1.5→60, 2.5→40, 3.5→50; sum=150
+(sum (at (select {la: (last v) from: Tsh by: k}) 'la)) -- 150
+
+;; ────────────── 61. DA sequential merge (path-3): PROD + F64 SUM + F64 MIN/MAX ──────────────
+;; DA path with n_slots < 1024 AND no FIRST/LAST → path-3 sequential merge.
+;; PROD op (group.c:3150) and F64 SUM (group.c:3159) are in path-3.
+;; Also F64 MIN (group.c:3170) and F64 MAX (group.c:3182) in path-3.
+;; 80K rows → parallel workers dispatch; 10 slots → n_slots < 1024 → path 3.
+(set N61 80000)
+(set T61 (table [g v f] (list (% (til N61) 10) (til N61) (as 'F64 (til N61)))))
+;; PROD in DA sequential merge (no FIRST/LAST → has_first_last=false, n_slots=10 < 1024)
+(count (select {p: (prod v) from: T61 by: g})) -- 10
+;; F64 SUM in DA sequential merge
+(sum (at (select {sf: (sum f) from: T61 by: g}) 'sf)) -- 3199960000.0
+;; F64 MIN in DA sequential merge
+(count (select {mn: (min f) from: T61 by: g})) -- 10
+;; F64 MAX in DA sequential merge
+(count (select {mx: (max f) from: T61 by: g})) -- 10
+
+;; ────────────── 62. DA parallel merge (path-2): PROD + F64 SUM + F64 MIN/MAX ──────────────
+;; DA path with n_slots >= 1024 AND no FIRST/LAST → path-2 parallel merge (da_merge_fn).
+;; PROD (group.c:1970), F64 SUM (group.c:1979), F64 MIN/MAX (group.c:1988-2002) all 0.
+;; 100K rows → parallel, n_slots = 1500 >= 1024 → path-2.
+(set N62 100000)
+(set T62 (table [g v f] (list (% (til N62) 1500) (til N62) (as 'F64 (til N62)))))
+;; PROD in parallel merge
+(count (select {p: (prod v) from: T62 by: g})) -- 1500
+;; F64 SUM in parallel merge
+(count (select {sf: (sum f) from: T62 by: g})) -- 1500
+;; F64 MIN/MAX in parallel merge
+(count (select {mn: (min f) mx: (max f) from: T62 by: g})) -- 1500
+
+;; ────────────── 63. exec_group_per_partition: parted table GROUP BY ──────────────
+;; exec_group_parted → exec_group_per_partition (group.c:3866-4418).
+;; Requires: parted table + GROUP BY + est_groups*100 <= rows_per_part.
+;; Use date-partitioned root from part.rfl setup: 2 partitions of 3+2 rows,
+;; only 2 distinct id values → est_groups=2, rows_per_part=min(3,2)=2, 2*100>2 → fail.
+;; Instead build our own large parted table in /tmp.
+(.sys.exec "rm -rf /tmp/grp_cov_parted")
+(set GP1 (table [k v] (list (% (til 1000) 5) (til 1000))))
+(set GP2 (table [k v] (list (% (til 1000) 5) (+ 1000 (til 1000)))))
+(.db.splayed.set "/tmp/grp_cov_parted/2024.01.01/t/" GP1)
+(.db.splayed.set "/tmp/grp_cov_parted/2024.01.02/t/" GP2)
+(set Pgp (.db.parted.get "/tmp/grp_cov_parted/" 't))
+;; GROUP BY k on parted table: 5 distinct values, rows_per_part=1000, est_groups=5
+;; 5*100=500 <= 1000 → can_partition=1 → exec_group_per_partition
+(count (select {s: (sum v) c: (count v) from: Pgp by: k})) -- 5
+(sum (at (select {s: (sum v) from: Pgp by: k}) 's)) -- 1999000
+;; With AVG (has_avg=1) and STDDEV (has_stddev=1)
+(count (select {av: (avg v) sd: (stddev v) from: Pgp by: k})) -- 5
+(.sys.exec "rm -rf /tmp/grp_cov_parted")
+
+;; ────────────── 64. materialize_broadcast_input: DATE/TIME/I32/I16/U8 atom types ──────────────
+;; Lines 1602-1626 of group.c: broadcast atom types for DATE, TIME, I32, I16, U8/BOOL.
+;; The existing section 59 covers -RAY_F64 and -RAY_I64/-RAY_SYM/-RAY_TIMESTAMP.
+;; Now add DATE, TIME, I32, I16, U8 via atom variables passed as agg inputs.
+(set Tbc64 (table [g v] (list [1 2 3] [10 20 30])))
+;; DATE atom: -RAY_DATE branch (group.c:1602-1606)
+(count (select {mn: (min 2024.01.01) from: Tbc64 by: g})) -- 3
+(count (select {la: (last 2024.06.15) from: Tbc64 by: g})) -- 3
+;; TIME atom: -RAY_TIME branch (group.c:1602-1606 same case)
+(count (select {mn: (min 12:00:00) from: Tbc64 by: g})) -- 3
+;; I32 atom via variable (as 'I32 val): -RAY_I32 branch (group.c:1608-1611)
+;; Use PROD (not MIN) to avoid out_type=I32 in emit_agg_columns (which would write
+;; int64_t into an I32 array, clobbering adjacent elements on little-endian).
+;; PROD out_type = RAY_I64 regardless of input type, so emit is correct.
+(set Tbc64i32 (as 'I32 7))
+(sum (at (select {p: (prod Tbc64i32) from: Tbc64 by: g}) 'p)) -- 21
+;; I16 atom: -RAY_I16 branch (group.c:1613-1616)
+(set Tbc64i16 (as 'I16 5))
+(sum (at (select {p: (prod Tbc64i16) from: Tbc64 by: g}) 'p)) -- 15
+;; U8 atom: -RAY_U8/-RAY_BOOL branch (group.c:1618-1622)
+(set Tbc64u8 (as 'U8 3))
+(sum (at (select {p: (prod Tbc64u8) from: Tbc64 by: g}) 'p)) -- 9
+
+;; ────────────── 65. exec_group_per_partition: 9 partitions → second batch (running != NULL) ──────────────
+;; MERGE_BATCH=8 → 9 partitions → first batch processes 8, second processes 1.
+;; On the second iteration, `running` is non-NULL, covering lines:
+;;   4116: tref = ray_table_get_col(running, key_syms[k])
+;;   4134-4138: memcpy from running key column
+;;   4183-4188: memcpy from running agg column
+;; 5 groups, 1000 rows/partition → est_groups*100=500 <= rows_per_part=1000 → can_partition=1
+(.sys.exec "rm -rf /tmp/grp_cov_9p")
+(set GP9 (table [k v] (list (% (til 1000) 5) (til 1000))))
+(.db.splayed.set "/tmp/grp_cov_9p/2024.01.01/t/" GP9)
+(.db.splayed.set "/tmp/grp_cov_9p/2024.01.02/t/" GP9)
+(.db.splayed.set "/tmp/grp_cov_9p/2024.01.03/t/" GP9)
+(.db.splayed.set "/tmp/grp_cov_9p/2024.01.04/t/" GP9)
+(.db.splayed.set "/tmp/grp_cov_9p/2024.01.05/t/" GP9)
+(.db.splayed.set "/tmp/grp_cov_9p/2024.01.06/t/" GP9)
+(.db.splayed.set "/tmp/grp_cov_9p/2024.01.07/t/" GP9)
+(.db.splayed.set "/tmp/grp_cov_9p/2024.01.08/t/" GP9)
+(.db.splayed.set "/tmp/grp_cov_9p/2024.01.09/t/" GP9)
+(set P9p (.db.parted.get "/tmp/grp_cov_9p/" 't))
+(count (select {s: (sum v) c: (count v) from: P9p by: k})) -- 5
+;; 9 partitions × sum(0..999) = 9 × 499500 = 4495500
+(sum (at (select {s: (sum v) from: P9p by: k}) 's)) -- 4495500
+;; AVG/STDDEV post-processing with 9 partitions
+(count (select {av: (avg v) sd: (stddev v) from: P9p by: k})) -- 5
+(.sys.exec "rm -rf /tmp/grp_cov_9p")
+
+;; ────────────── 66. exec_group_per_partition: MAPCOMMON key (GROUP BY date) ──────────────
+;; GROUP BY the date column (MAPCOMMON) → n_mc_keys=1, n_part_keys=0.
+;; Covers group.c:3904 (mc_sym_ids[n_mc_keys++]), 4111 (is_mc check), 4118-4119 (mc tref).
+;; Also covers 4146-4153 (replicate MAPCOMMON key value per partition group).
+;; est_groups=1 (MAPCOMMON skips cardinality → stays 1), 1*100=100 <= rows_per_part=1000.
+(.sys.exec "rm -rf /tmp/grp_cov_mc")
+(set GP_mc1 (table [v] (list (til 500))))
+(set GP_mc2 (table [v] (list (+ 500 (til 500)))))
+(.db.splayed.set "/tmp/grp_cov_mc/2024.01.01/t/" GP_mc1)
+(.db.splayed.set "/tmp/grp_cov_mc/2024.01.02/t/" GP_mc2)
+(set Pmc (.db.parted.get "/tmp/grp_cov_mc/" 't))
+;; GROUP BY date: 2 groups (one per partition), sum(v) for each
+(count (select {s: (sum v) from: Pmc by: date})) -- 2
+;; date 2024.01.01 → sum(0..499)=124750; date 2024.01.02 → sum(500..999)=374750
+(sum (at (select {s: (sum v) from: Pmc by: date}) 's)) -- 499500
+;; AVG/STDDEV with MAPCOMMON key
+(count (select {av: (avg v) from: Pmc by: date})) -- 2
+(.sys.exec "rm -rf /tmp/grp_cov_mc")
+
+;; ────────────── 67. exec_group_parted: SYM key cardinality estimation ──────────────
+;; group.c:2099-2112: cardinality estimation when key column has SYM base type.
+;; Requires: parted table with SYM-typed parted key column + GROUP BY that key.
+;; The SYM branch runs whenever can_partition=1 and key base-type is SYM,
+;; regardless of whether the cardinality gate later sets can_partition=0.
+;; Use small tables (10 rows each) with SYM key 'a/'b/'c/'d/'e:
+;;   est_groups (via bitset popcount) = 5
+;;   rows_per_part = 20/2 = 10
+;;   5*100=500 > 10 → can_partition=0 → concat fallback is used
+;; But the SYM bitset loop at lines 2099-2112 still executes.
+(.sys.exec "rm -rf /tmp/grp_cov_sym")
+(set GP_sym (table [k v] (list ['a 'b 'c 'd 'e 'a 'b 'c 'd 'e] (til 10))))
+(.db.splayed.set "/tmp/grp_cov_sym/2024.01.01/t/" GP_sym)
+(.db.splayed.set "/tmp/grp_cov_sym/2024.01.02/t/" GP_sym)
+(set Psym (.db.parted.get "/tmp/grp_cov_sym/" 't))
+;; 2 partitions × 10 rows = 20 rows total; 5 distinct sym keys
+(count (select {s: (sum v) from: Psym by: k})) -- 5
+;; 2 partitions × sum(0..9) = 2 × 45 = 90
+(sum (at (select {s: (sum v) from: Psym by: k}) 's)) -- 90
+(.sys.exec "rm -rf /tmp/grp_cov_sym")
+
+;; ────────────── 68b. materialize_broadcast_input: len-1 vector (non-atom) path ──────────────
+;; group.c:1580-1587 is the path for broadcasting a len-1 non-atom vector to nrows.
+;; `(set v1 [42])` creates a len-1 I64 vector (type=RAY_I64, not atom).
+;; Using it as agg input in a grouped select triggers needs_broadcast=true via
+;; `agg_vecs[a]->type > 0 && agg_vecs[a]->len == 1 && nrows > 1`.
+(set Tb68b (table [g] (list [0 1 2 0 1 2])))
+(set v68b [42])
+(count (select {s: (sum v68b) from: Tb68b by: g})) -- 3
+(sum (at (select {s: (sum v68b) from: Tb68b by: g}) 's)) -- 252
+
+;; ────────────── 68. Large pivot: parallel pivot_ingest_run (group.c:4488+) ──────────────
+;; pivot_ingest_run (group.c:4447) is called from pivot.c.
+;; Parallel path (lines 4488+) requires n_scan >= RAY_PARALLEL_THRESHOLD (65536).
+;; Create 100K-row table, pivot with sym row-key, sym pivot-col, i64 val.
+(set N68 100000)
+(set T68 (table [r c v] (list (% (til N68) 100) (at ['x 'y 'z] (% (til N68) 3)) (til N68))))
+(set P68 (pivot T68 'r 'c 'v sum))
+(count P68) -- 100
+(count (key P68)) -- 4
+;; spot-check: column 'x is sum of v where c='x for each r
+;; For r=0: rows where r=0, c='x: rows 0, 3, 6... (every 3rd of the r=0 rows)
+;; Just verify the total: sum of all 'x values = sum(v where c='x) = sum(0,3,6,...,99999 step 3)
+(+ (sum (at P68 'x)) (+ (sum (at P68 'y)) (sum (at P68 'z)))) -- (sum (til N68))
+
+;; ────────────── 69. Multi-key DA path: uniform element-size composites ──────────────
+;; da_fn (group.c:1880-1928) has specialised loops for uniform key element size:
+;;   case 1: da_composite_gid_u8  (all keys are BOOL/U8, esz=1)
+;;   case 2: da_composite_gid_u16 (all keys are I16, esz=2)
+;;   case 4: da_composite_gid_u32 (all keys are I32/DATE/TIME, esz=4)
+;; These paths are uncovered.  Use small tables (< DA_MAX_COMPOSITE_SLOTS)
+;; so the DA composite GID path is chosen.
+
+;; ── esz=1: two U8 keys ──
+;; Key range: a ∈ {0,1,2}, b ∈ {0,1,2}; product 3×3 = 9 slots — well within DA budget.
+(set T69u8 (table [a b v] (list (as 'U8 [0x00 0x01 0x02 0x00 0x01 0x02 0x00 0x01 0x02]) (as 'U8 [0x00 0x00 0x00 0x01 0x01 0x01 0x02 0x02 0x02]) [1 2 3 4 5 6 7 8 9])))
+(count (select {s: (sum v) from: T69u8 by: [a b]})) -- 9
+(sum (at (select {s: (sum v) from: T69u8 by: [a b]}) 's)) -- 45
+
+;; ── esz=2: two I16 keys ──
+(set T69i16 (table [a b v] (list (as 'I16 [0h 1h 2h 0h 1h 2h 0h 1h 2h]) (as 'I16 [0h 0h 0h 1h 1h 1h 2h 2h 2h]) [10 20 30 40 50 60 70 80 90])))
+(count (select {s: (sum v) from: T69i16 by: [a b]})) -- 9
+(sum (at (select {s: (sum v) from: T69i16 by: [a b]}) 's)) -- 450
+
+;; ── esz=4: two I32 keys ──
+(set T69i32 (table [a b v] (list (as 'I32 [0i 1i 2i 0i 1i 2i 0i 1i 2i]) (as 'I32 [0i 0i 0i 1i 1i 1i 2i 2i 2i]) [100 200 300 400 500 600 700 800 900])))
+(count (select {s: (sum v) from: T69i32 by: [a b]})) -- 9
+(sum (at (select {s: (sum v) from: T69i32 by: [a b]}) 's)) -- 4500
+
+;; ────────────── 70. DA parallel merge: PROD, I64 MIN/MAX ──────────────
+;; Lines 1970-2005 in da_merge_fn require a large (> 65536 rows) keyed group-by
+;; that uses the DA path.  100K rows with an I64 key 0..9 triggers parallel
+;; DA dispatch and exercises the merge branches for PROD, I64 MIN, I64 MAX.
+(set N70 100000)
+(set K70 (% (til N70) 10))
+;; I64 MIN per group: group k has values k, k+10, k+20, ...; min = k
+(set T70 (table [k v] (list K70 (til N70))))
+(set R70min (select {mn: (min v) from: T70 by: k}))
+(count R70min) -- 10
+;; sum of mins: 0+1+2+...+9 = 45
+(sum (at R70min 'mn)) -- 45
+;; I64 MAX per group: group k has values k, k+10, ...; max = k + N70 - 10
+(set R70max (select {mx: (max v) from: T70 by: k}))
+(count R70max) -- 10
+;; max of group k = k + (N70/10 - 1) * 10 = k + N70 - 10; sum = 45 + 10*(N70-10) = 10*N70 - 55
+(sum (at R70max 'mx)) -- (- (* 10 N70) 55)
+;; PROD on all-ones column (v=1 for all rows; product = 1 per group)
+;; (+ 1 (% (til N70) 1)) = all 1s because (% x 1) = 0 always
+(set T70ones (table [k v] (list K70 (as 'I64 (+ 1 (% (til N70) 1))))))
+(set R70p (select {p: (prod v) from: T70ones by: k}))
+(count R70p) -- 10
+(sum (at R70p 'p)) -- 10
+
+;; ── DA parallel merge path: n_slots >= 1024 triggers da_merge_fn ──
+;; da_merge_fn is only dispatched when n_slots >= 1024 (line 3119).
+;; Use key range 0..2047 (2048 slots) with I64 agg to hit I64 MIN/MAX branches.
+(set N70b 200000)
+(set K70b (% (til N70b) 2048))
+(set T70b (table [k v] (list K70b (til N70b))))
+;; MIN: group k has values k, k+2048, k+4096,...; min = k
+(set R70bmin (select {mn: (min v) from: T70b by: k}))
+(count R70bmin) -- 2048
+;; sum of mins 0+1+...+2047 = 2047*2048/2 = 2096128
+(sum (at R70bmin 'mn)) -- 2096128
+;; MAX: group k has values k, k+2048,...,k+(N70b/2048-1)*2048; max = k+(N70b-2048)
+(set R70bmax (select {mx: (max v) from: T70b by: k}))
+(count R70bmax) -- 2048
+;; max of group k = k + N70b - 2048; sum = 2096128 + 2048*(N70b-2048)
+(sum (at R70bmax 'mx)) -- (+ 2096128 (* 2048 (- N70b 2048)))
+
+;; ────────────── 71. exec_reduction parallel: I64 VAR/STDDEV ──────────────
+;; exec_reduction's parallel path (group.c:307-373) requires scan_n >= 65536.
+;; Direct reductions on large I64 vectors go through exec_reduction.
+;; L359: I64 path in parallel VAR/STDDEV merge (else branch, in_type != RAY_F64)
+(set Nprod 100000)
+(set vi64 (as 'I64 (til Nprod)))
+(>= (var vi64) 0.0) -- true
+(>= (stddev vi64) 0.0) -- true
+(>= (stddev_pop vi64) 28867.0) -- true
+
+;; ────────────── 72. radix HT naming: stddev_pop + var_pop in parallel path ──────────────
+;; group.c:3594 (OP_STDDEV_POP) and 3596 (OP_VAR_POP) in the radix parallel HT
+;; naming loop require a SYM-key (HT path), N >= 65536 (parallel), and those ops.
+;; Tsm is already defined (70K rows, SYM key 's0..'s9, I64 value).
+(set R72sp (select {sp: (stddev_pop v) vp: (var_pop v) from: Tsm by: k}))
+(count R72sp) -- 10
+;; stddev_pop of each group (7000 values each): >= 0
+(>= (sum (at R72sp 'sp)) 0.0) -- true
+(>= (sum (at R72sp 'vp)) 0.0) -- true
+
+;; ────────────── 73. sequential HT naming: expr-input SUM/PROD/AVG/MIN/MAX/FIRST/LAST/VAR/STDDEV ──────────────
+;; group.c:3821-3832 are the expr-input naming cases in the sequential HT path.
+;; These require: agg input is NOT a plain scan (expression), and N < 65536 (sequential).
+;; Using a small SYM-key table with expression agg inputs forces the synthetic "_e0_X" naming.
+;; Note: `(take [...] 6)` creates a proper RAY_SYM vector (not RAY_LIST), ensuring the DAG HT
+;; path is taken (not the eval-level group path which would bypass group.c naming code).
+(set Tsym73 (take ['a 'b 'c] 6))
+(set T73 (table [g v] (list Tsym73 (as 'F64 [1 2 3 4 5 6]))))
+;; (sum (* v 2)) — the agg input is (* v 2), not a scan — triggers expr branch (group.c:3821)
+(set R73s (select {s: (sum (* v 2.0)) from: T73 by: g}))
+(count R73s) -- 3
+;; prod of (v*1) for each group (group.c:3822)
+(set R73p (select {p: (prod (* v 1.0)) from: T73 by: g}))
+(count R73p) -- 3
+;; avg of (v*1) small table (group.c:3824)
+(set R73a (select {a: (avg (* v 1.0)) from: T73 by: g}))
+(count R73a) -- 3
+;; min/max of (v*1) (group.c:3825-3826)
+(set R73mn (select {mn: (min (* v 1.0)) from: T73 by: g}))
+(count R73mn) -- 3
+(set R73mx (select {mx: (max (* v 1.0)) from: T73 by: g}))
+(count R73mx) -- 3
+;; first/last of (v*1) (group.c:3827-3828)
+(set R73fi (select {fi: (first (* v 1.0)) from: T73 by: g}))
+(count R73fi) -- 3
+(set R73la (select {la: (last (* v 1.0)) from: T73 by: g}))
+(count R73la) -- 3
+;; stddev of (v*1) (group.c:3829)
+(set R73sd (select {sd: (stddev (* v 1.0)) from: T73 by: g}))
+(count R73sd) -- 3
+;; stddev_pop of (v*1) (group.c:3830)
+(set R73sp2 (select {sp: (stddev_pop (* v 1.0)) from: T73 by: g}))
+(count R73sp2) -- 3
+;; var of (v*1) (group.c:3831)
+(set R73v (select {vv: (var (* v 1.0)) from: T73 by: g}))
+(count R73v) -- 3
+;; var_pop of (v*1) (group.c:3832)
+(set R73vp (select {vp: (var_pop (* v 1.0)) from: T73 by: g}))
+(count R73vp) -- 3
+
+;; ────────────── 74. sequential HT naming: expr-input (F64 key, forces HT path) ──────────────
+;; group.c:3821-3832 — sequential HT path, expression (non-scan) agg inputs.
+;; F64 key is NOT DA-eligible (only integer types are), so it falls through
+;; to ht_path. With n<65536 and n_total==1 it takes the sequential_fallback path.
+;; All 11 agg ops with expression inputs hit the switch cases at L3821-3832.
+(set Thtf (table [g v] (list (as 'F64 [1.0 1.0 2.0 2.0 3.0 3.0]) (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0]))))
+;; sum(v*2): L3821 case OP_SUM
+(set Rhtf_s (select {s: (sum (* v 2.0)) from: Thtf by: g}))
+(count Rhtf_s) -- 3
+;; prod(v*1): L3822 case OP_PROD
+(set Rhtf_p (select {p: (prod (* v 1.0)) from: Thtf by: g}))
+(count Rhtf_p) -- 3
+;; avg(v*1): L3824 case OP_AVG
+(set Rhtf_a (select {a: (avg (* v 1.0)) from: Thtf by: g}))
+(count Rhtf_a) -- 3
+;; min(v*1): L3825 case OP_MIN
+(set Rhtf_mn (select {mn: (min (* v 1.0)) from: Thtf by: g}))
+(count Rhtf_mn) -- 3
+;; max(v*1): L3826 case OP_MAX
+(set Rhtf_mx (select {mx: (max (* v 1.0)) from: Thtf by: g}))
+(count Rhtf_mx) -- 3
+;; first(v*1): L3827 case OP_FIRST
+(set Rhtf_fi (select {fi: (first (* v 1.0)) from: Thtf by: g}))
+(count Rhtf_fi) -- 3
+;; last(v*1): L3828 case OP_LAST
+(set Rhtf_la (select {la: (last (* v 1.0)) from: Thtf by: g}))
+(count Rhtf_la) -- 3
+;; stddev(v*1): L3829 case OP_STDDEV
+(set Rhtf_sd (select {sd: (stddev (* v 1.0)) from: Thtf by: g}))
+(count Rhtf_sd) -- 3
+;; stddev_pop(v*1): L3830 case OP_STDDEV_POP
+(set Rhtf_sp (select {sp: (stddev_pop (* v 1.0)) from: Thtf by: g}))
+(count Rhtf_sp) -- 3
+;; var(v*1): L3831 case OP_VAR
+(set Rhtf_v (select {vv: (var (* v 1.0)) from: Thtf by: g}))
+(count Rhtf_v) -- 3
+;; var_pop(v*1): L3832 case OP_VAR_POP
+(set Rhtf_vp (select {vp: (var_pop (* v 1.0)) from: Thtf by: g}))
+(count Rhtf_vp) -- 3
