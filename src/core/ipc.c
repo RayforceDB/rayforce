@@ -418,15 +418,11 @@ static ray_t* ipc_read_handshake(ray_poll_t* poll, ray_selector_t* sel);
 static ray_t* ipc_read_creds(ray_poll_t* poll, ray_selector_t* sel);
 static ray_t* ipc_read_header(ray_poll_t* poll, ray_selector_t* sel);
 static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel);
-static ray_t* ipc_on_data(ray_poll_t* poll, ray_selector_t* sel, void* data);
 static void   ipc_on_close(ray_poll_t* poll, ray_selector_t* sel);
 
-/* Wrappers matching ray_io_fn signature for socket recv/send */
+/* Wrappers matching ray_io_fn signature for socket recv */
 static int64_t ipc_recv_fn(int64_t fd, uint8_t* buf, int64_t len) {
     return ray_sock_recv((ray_sock_t)fd, buf, (size_t)len);
-}
-static int64_t ipc_send_fn(int64_t fd, uint8_t* buf, int64_t len) {
-    return ray_sock_send((ray_sock_t)fd, buf, (size_t)len);
 }
 
 /* Accept callback — called when listener fd is readable */
@@ -449,9 +445,7 @@ static ray_t* ipc_accept(ray_poll_t* poll, ray_selector_t* sel)
     reg.fd       = (int64_t)new_fd;
     reg.type     = RAY_SEL_SOCKET;
     reg.recv_fn  = ipc_recv_fn;
-    reg.send_fn  = ipc_send_fn;
     reg.read_fn  = ipc_read_handshake;
-    reg.data_fn  = ipc_on_data;
     reg.close_fn = ipc_on_close;
     reg.data     = cd;
 
@@ -505,8 +499,24 @@ static ray_t* ipc_read_creds(ray_poll_t* poll, ray_selector_t* sel)
     if (!sel->rx.buf || sel->rx.buf->offset < 1) return NULL;
     uint8_t cred_len = sel->rx.buf->data[0];
 
-    if (sel->rx.buf->offset < 1 + cred_len) {
-        ray_poll_rx_request(poll, sel, 1 + cred_len);
+    /* The handshake first asks for 1 byte (the cred_len prefix); after
+     * reading it we need to grow the rx buffer to 1 + cred_len without
+     * losing the byte we already have.  ray_poll_rx_request resets the
+     * buffer when it grows, so do the grow in-place here. */
+    int64_t need = 1 + (int64_t)cred_len;
+    if (sel->rx.buf->size < need) {
+        ray_poll_buf_t* old = sel->rx.buf;
+        ray_poll_buf_t* nb  = ray_poll_buf_new(need);
+        if (!nb) { ray_poll_deregister(poll, sel->id); return NULL; }
+        nb->data[0] = cred_len;
+        nb->offset  = 1;
+        nb->size    = need;
+        ray_poll_buf_free(old);
+        sel->rx.buf = nb;
+        return NULL;
+    }
+    if (sel->rx.buf->offset < need) {
+        sel->rx.buf->size = need;
         return NULL;
     }
 
@@ -578,12 +588,6 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     sel->rx.read_fn = ipc_read_header;
     ray_poll_rx_request(poll, sel, sizeof(ray_ipc_header_t));
 
-    return NULL;
-}
-
-static ray_t* ipc_on_data(ray_poll_t* poll, ray_selector_t* sel, void* data)
-{
-    (void)poll; (void)sel; (void)data;
     return NULL;
 }
 

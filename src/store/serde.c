@@ -291,9 +291,16 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
         case RAY_TIME:
             memcpy(buf, &obj->i32, 4);
             return 1 + 1 + 4;
-        case RAY_F32:
-            memcpy(buf, &obj->i32, 4); /* same 4-byte slot */
+        case RAY_F32: {
+            /* F32 atoms store the value in obj->f64 (see ray_f32 in
+             * src/vec/atom.c).  Earlier code read &obj->i32 hoping
+             * those bytes aliased the float — but f64 is 8 bytes, so
+             * the low half is just the lsb of the double bit pattern,
+             * not the float value.  Narrow explicitly. */
+            float f = (float)obj->f64;
+            memcpy(buf, &f, 4);
             return 1 + 1 + 4;
+        }
         case RAY_I64:
         case RAY_TIMESTAMP:
             memcpy(buf, &obj->i64, 8);
@@ -539,8 +546,8 @@ ray_t* ray_de_raw(uint8_t* buf, int64_t* len) {
         case RAY_F32:
             if (*len < 4) return ray_error("domain", NULL);
             { float v; memcpy(&v, buf, 4); *len -= 4;
-              return is_null ? ray_typed_null(-RAY_F64)
-                             : ray_f64((double)v); /* promote to f64 atom */ }
+              return is_null ? ray_typed_null(-RAY_F32)
+                             : ray_f32(v); }
         case RAY_I64:
             if (*len < 8) return ray_error("domain", NULL);
             { int64_t v; memcpy(&v, buf, 8); *len -= 8;
