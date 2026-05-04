@@ -63,6 +63,7 @@
 #include "store/serde.h"
 #include "mem/sys.h"
 #include "store/journal.h"
+#include "ops/ops.h"
 
 #ifndef RAY_OS_WINDOWS
   #include <sys/socket.h>
@@ -1367,6 +1368,82 @@ static test_result_t test_ipc_journal_restricted(void) {
     PASS();
 }
 
+/* ---- test_ipc_send_lazy_msg --------------------------------------------- */
+/*
+ * Exercise the lazy-materialise paths in ray_ipc_send / ray_ipc_send_async /
+ * ray_ipc_send_verbose (added in master commits 0b243faf, 7db74534, f207976d).
+ * Sending a lazy ray_t must materialise it before serialising; without these
+ * fixes the wire would carry a RAY_LAZY type the server can't deserialise.
+ */
+static test_result_t test_ipc_send_lazy_msg(void) {
+    ray_ipc_server_t srv;
+    ray_err_t err = ray_ipc_server_init(&srv, 0);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    uint16_t port = get_listen_port(srv.listen_fd);
+    TEST_ASSERT((port) > (0), "port > 0");
+
+    ray_vm_t* srv_vm = make_server_vm();
+    TEST_ASSERT_NOT_NULL(srv_vm);
+
+    ipc_thread_ctx_t ctx = { .srv = &srv, .vm = srv_vm };
+    ray_thread_t tid;
+    ray_thread_create(&tid, server_thread_fn, &ctx);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", port, NULL, NULL);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+
+    /* Build a lazy that materialises to int 15 (sum of 1..5). */
+    int64_t raw[] = {1, 2, 3, 4, 5};
+    ray_t* vec = ray_vec_from_raw(RAY_I64, raw, 5);
+    ray_graph_t* g = ray_graph_new(NULL);
+    ray_op_t* in = ray_graph_input_vec(g, vec);
+    ray_op_t* sum = ray_sum(g, in);
+    ray_t* lazy = ray_lazy_wrap(g, sum);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lazy));
+    TEST_ASSERT_TRUE(ray_is_lazy(lazy));
+
+    /* SYNC send: covers ray_ipc_send lazy-materialise block. */
+    ray_t* resp = ray_ipc_send(h, lazy);
+    TEST_ASSERT_NOT_NULL(resp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(resp));
+    /* Server evals the int 15 → returns 15. */
+    TEST_ASSERT_EQ_I(resp->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(resp->i64, 15);
+    ray_release(resp);
+
+    /* Verbose send: covers ray_ipc_send_verbose lazy-materialise block.
+     * Build a fresh lazy because the prior one was released after send. */
+    ray_graph_t* g2 = ray_graph_new(NULL);
+    ray_op_t* in2 = ray_graph_input_vec(g2, vec);
+    ray_op_t* sum2 = ray_sum(g2, in2);
+    ray_t* lazy2 = ray_lazy_wrap(g2, sum2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lazy2));
+    ray_t* vresp = ray_ipc_send_verbose(h, lazy2);
+    TEST_ASSERT_NOT_NULL(vresp);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vresp));
+    TEST_ASSERT_EQ_I(vresp->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(vresp->len, 2);
+    ray_release(vresp);
+
+    /* ASYNC send: covers ray_ipc_send_async lazy-materialise block. */
+    ray_graph_t* g3 = ray_graph_new(NULL);
+    ray_op_t* in3 = ray_graph_input_vec(g3, vec);
+    ray_op_t* sum3 = ray_sum(g3, in3);
+    ray_t* lazy3 = ray_lazy_wrap(g3, sum3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(lazy3));
+    ray_err_t arc = ray_ipc_send_async(h, lazy3);
+    TEST_ASSERT_EQ_I(arc, RAY_OK);
+
+    ray_release(vec);
+    ray_ipc_close(h);
+    srv.running = false;
+    ray_thread_join(tid);
+    ray_ipc_server_destroy(&srv);
+    ray_sys_free(srv_vm);
+    PASS();
+}
+
 /* ---- Registry ------------------------------------------------------------ */
 
 const test_entry_t ipc_entries[] = {
@@ -1396,5 +1473,6 @@ const test_entry_t ipc_entries[] = {
     { "ipc/server_destroy_active_conns", test_ipc_server_destroy_active_conns,   ipc_setup, ipc_teardown },
     { "ipc/server_conn_swap",            test_ipc_server_conn_swap,               ipc_setup, ipc_teardown },
     { "ipc/journal_restricted",          test_ipc_journal_restricted,             ipc_setup, ipc_teardown },
+    { "ipc/send_lazy_msg",               test_ipc_send_lazy_msg,                  ipc_setup, ipc_teardown },
     { NULL, NULL, NULL, NULL },
 };

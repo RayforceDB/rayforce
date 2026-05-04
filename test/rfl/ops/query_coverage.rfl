@@ -751,3 +751,66 @@
 
 (set TE5 (table [id Vec] (list [0 1 2] (list [1.0 0.0] [0.0 1.0] [0.5 0.5]))))
 (select {from: TE5 nearest: (knn Vec [1.0 0.0] 'badmetric)}) !- domain
+
+;; ====================================================================
+;; by-dict shape validation — query.c:1454-1530
+;; Hits the new no-null branch and the dict-key error guards.
+;; ====================================================================
+
+(set TBd (table [a b c] (list [1 2 3 1 2] [10 20 30 40 50] ["x" "y" "z" "x" "y"])))
+
+;; by-dict with too many keys (>16) → domain error (line 1459-1462).
+(select {from: TBd by: {k1: a k2: a k3: a k4: a k5: a k6: a k7: a k8: a k9: a k10: a k11: a k12: a k13: a k14: a k15: a k16: a k17: a}}) !- domain
+
+;; by-dict with duplicate key → domain error (line 1499-1501).
+(select {from: TBd by: {g: a g: b}}) !- domain
+
+;; by-dict alias shadows existing column → domain error (line 1513-1516).
+(select {from: TBd by: {b: a}}) !- domain
+
+;; by-dict val that's not a column vector (atom) → length error (line 1527-1530).
+(select {from: TBd by: {g: 5}}) !- length
+
+;; by-dict val that's a vector of wrong length → length error.
+(select {from: TBd by: {g: [1 2 3]}}) !- length
+
+;; ====================================================================
+;; nearest: shape validation — query.c:1597-1610
+;; ====================================================================
+
+(set TNs (table [id Vec] (list [0 1 2] (list [1.0 0.0] [0.0 1.0] [0.5 0.5]))))
+
+;; nearest: with non-list arg → domain error (line 1597-1602).
+(select {from: TNs nearest: 'foo}) !- domain
+;; nearest: with too-short list (<3 elems) → domain error.
+(select {from: TNs nearest: (list 'ann)}) !- domain
+;; nearest: first elem not a symbol → domain error (line 1606-1610).
+(select {from: TNs nearest: (list 5 'foo 'bar)}) !- type
+
+;; ====================================================================
+;; sort-take expression validation — query.c:304-319
+;; ====================================================================
+
+(set TSk (table [a v] (list [3 1 2 4] [30 10 20 40])))
+
+;; take expr that fails to eval (undefined symbol) → domain error (line 306-309).
+(select {from: TSk asc: a take: nonexistent_var}) !- error
+;; take expr that's a non-numeric atom → domain error (line 316-319).
+(select {from: TSk asc: a take: 'badtype}) !- domain
+;; take expr that's a F64 atom → domain error (only I64/I32 atoms allowed).
+(select {from: TSk asc: a take: 1.5}) !- domain
+;; take expr that's a vector of wrong length → domain error.
+(select {from: TSk asc: a take: [1 2 3]}) !- domain
+
+;; ====================================================================
+;; left-join / inner-join key validation — query.c:5331-5345
+;; ====================================================================
+
+(set TJl (table [a v] (list [1 2 3] [10 20 30])))
+(set TJr (table [a w] (list [1 2 4] [100 200 400])))
+
+;; Empty key list → domain error (line 5331).
+(left-join TJl TJr (list)) !- domain
+;; Non-symbol key in list → type error (line 5342-5345).
+(left-join TJl TJr (list 1 2)) !- type
+(inner-join TJl TJr (list 'a 5)) !- type
