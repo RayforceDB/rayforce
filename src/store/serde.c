@@ -950,7 +950,8 @@ ray_t* ray_de(ray_t* bytes) {
 ray_err_t ray_obj_save(ray_t* obj, const char* path) {
     bool owned = false;
     if (ray_is_lazy(obj)) {
-        obj = ray_lazy_materialize(obj);
+        ray_retain(obj);
+        obj = ray_lazy_materialize(obj); /* consumes the retain */
         if (RAY_IS_ERR(obj)) {
             ray_err_t code = ray_err_from_obj(obj);
             ray_error_free(obj);

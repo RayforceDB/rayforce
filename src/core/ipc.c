@@ -1141,7 +1141,8 @@ ray_t* ray_ipc_send(int64_t handle, ray_t* msg)
 {
     bool owned = false;
     if (ray_is_lazy(msg)) {
-        msg = ray_lazy_materialize(msg);
+        ray_retain(msg);
+        msg = ray_lazy_materialize(msg); /* consumes the retain */
         if (RAY_IS_ERR(msg)) return msg;
         owned = true;
     }
@@ -1218,7 +1219,8 @@ ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg)
 {
     bool owned = false;
     if (ray_is_lazy(msg)) {
-        msg = ray_lazy_materialize(msg);
+        ray_retain(msg);
+        msg = ray_lazy_materialize(msg); /* consumes the retain */
         if (RAY_IS_ERR(msg)) {
             ray_err_t code = ray_err_from_obj(msg);
             ray_error_free(msg);
@@ -1241,7 +1243,8 @@ ray_t* ray_ipc_send_verbose(int64_t handle, ray_t* msg)
 {
     bool owned = false;
     if (ray_is_lazy(msg)) {
-        msg = ray_lazy_materialize(msg);
+        ray_retain(msg);
+        msg = ray_lazy_materialize(msg); /* consumes the retain */
         if (RAY_IS_ERR(msg)) return msg;
         owned = true;
     }

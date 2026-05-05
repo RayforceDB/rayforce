@@ -41,6 +41,7 @@
 #include "lang/eval.h"
 #include "lang/nfo.h"
 #include "lang/format.h"
+#include "ops/ops.h"
 #include "ops/temporal.h"
 
 /* Forward-declare runtime API to avoid ray_vm_t redefinition from runtime.h */
@@ -130,6 +131,13 @@ static void lang_teardown(void) {
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
 static ray_t* dummy_vary(ray_t** args, int64_t n) { (void)n; return ray_retain(args[0]), args[0]; }
+
+static ray_t* concrete_vary_check(ray_t** args, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        if (ray_is_lazy(args[i])) return ray_error("lazy", NULL);
+    }
+    return ray_i64(n);
+}
 
 /* ---- Test: create unary function object ---- */
 static test_result_t test_fn_unary(void) {
@@ -4522,6 +4530,51 @@ static test_result_t test_eval_vm_callf_vary(void) {
     PASS();
 }
 
+static void bind_concrete_vary_check(void) {
+    ray_t* fn = ray_fn_vary("__lazy_vary_check", RAY_FN_NONE, concrete_vary_check);
+    ray_env_set(ray_sym_intern("__lazy_vary_check", 17), fn);
+    ray_release(fn);
+}
+
+static void unbind_concrete_vary_check(void) {
+    ray_env_set(ray_sym_intern("__lazy_vary_check", 17), NULL);
+}
+
+static test_result_t test_eval_vary_materializes_op_calln(void) {
+    bind_concrete_vary_check();
+    ray_t* r = ray_eval_str("(__lazy_vary_check (+ (til 5) 1))");
+    unbind_concrete_vary_check();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r->i64, 1);
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_eval_vary_materializes_op_callf(void) {
+    bind_concrete_vary_check();
+    ray_t* r = ray_eval_str("((fn [f] (f (+ (til 5) 1))) __lazy_vary_check)");
+    unbind_concrete_vary_check();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r->i64, 1);
+    ray_release(r);
+    PASS();
+}
+
+static test_result_t test_eval_vary_materializes_interpreter(void) {
+    bind_concrete_vary_check();
+    ray_t* ast = ray_parse("(__lazy_vary_check (+ (til 5) 1))");
+    ray_t* r = ray_eval(ast);
+    ray_release(ast);
+    unbind_concrete_vary_check();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r->i64, 1);
+    ray_release(r);
+    PASS();
+}
+
 /* --- vm: nested lambda call chain via op_callf --- */
 static test_result_t test_eval_vm_callf_lambda(void) {
     ASSERT_EQ(
@@ -6745,6 +6798,9 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/vm_callf_unary", test_eval_vm_callf_unary, lang_setup, lang_teardown },
     { "lang/eval/vm_callf_binary", test_eval_vm_callf_binary, lang_setup, lang_teardown },
     { "lang/eval/vm_callf_vary", test_eval_vm_callf_vary, lang_setup, lang_teardown },
+    { "lang/eval/vary_materializes_op_calln", test_eval_vary_materializes_op_calln, lang_setup, lang_teardown },
+    { "lang/eval/vary_materializes_op_callf", test_eval_vary_materializes_op_callf, lang_setup, lang_teardown },
+    { "lang/eval/vary_materializes_interpreter", test_eval_vary_materializes_interpreter, lang_setup, lang_teardown },
     { "lang/eval/vm_callf_lambda", test_eval_vm_callf_lambda, lang_setup, lang_teardown },
     { "lang/sort/sym_narrow", test_eval_sort_sym_narrow, lang_setup, lang_teardown },
     { "lang/eval/table_list_nested_vec", test_eval_table_list_nested_vec, lang_setup, lang_teardown },
@@ -6865,5 +6921,3 @@ const test_entry_t lang_entries[] = {
 
     { NULL, NULL, NULL, NULL },
 };
-
-

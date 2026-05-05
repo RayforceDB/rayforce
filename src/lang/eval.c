@@ -93,6 +93,24 @@ static inline bool fn_is_restricted(ray_t* fn_obj) {
     return g_eval_restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
 }
 
+static ray_t* materialize_owned_args(ray_t** args, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        if (!args[i] || !ray_is_lazy(args[i])) continue;
+
+        args[i] = ray_lazy_materialize(args[i]); /* consumes owned ref */
+        if (!args[i] || RAY_IS_ERR(args[i])) {
+            ray_t* err = args[i] ? args[i] : ray_error("type", NULL);
+            args[i] = NULL;
+            for (int64_t j = 0; j < n; j++) {
+                if (args[j]) ray_release(args[j]);
+                args[j] = NULL;
+            }
+            return err;
+        }
+    }
+    return NULL;
+}
+
 /* ══════════════════════════════════════════
  * Error handling: try / raise
  * ══════════════════════════════════════════ */
@@ -1656,6 +1674,10 @@ op_calln: {
         fn_args[i] = POP();
     ray_t *fn_obj = POP();
     ray_vary_fn fn = (ray_vary_fn)(uintptr_t)fn_obj->i64;
+    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {
+        ray_t* err = materialize_owned_args(fn_args, n);
+        if (err) { ray_release(fn_obj); vm_err_obj = err; goto vm_error; }
+    }
     ray_t *result = fn(fn_args, n);
     for (int32_t i = 0; i < n; i++)
         ray_release(fn_args[i]);
@@ -1764,6 +1786,10 @@ op_callf: {
             break;
         case RAY_VARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
+            if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {
+                result = materialize_owned_args(fn_args, n);
+                if (result) break;
+            }
             result = ((ray_vary_fn)(uintptr_t)fn_obj->i64)(fn_args, n);
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
             break;
@@ -2716,6 +2742,10 @@ ray_t* ray_eval(ray_t* obj) {
                     ray_release(head);
                     ret = err; goto out;
                 }
+            }
+            if (!(head->attrs & RAY_FN_LAZY_AWARE)) {
+                ray_t* err = materialize_owned_args(args, argc);
+                if (err) { ray_release(head); ret = err; goto out; }
             }
             ray_release(head);
             ray_t* result = fn(args, argc);
