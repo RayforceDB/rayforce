@@ -1020,7 +1020,28 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
         }
         case RAY_I16: {
             const int16_t* d = (const int16_t*)c->data;
-            if (c->desc) {
+            bool has_nulls = c->col && (c->col->attrs & RAY_ATTR_HAS_NULLS);
+            bool nf = c->nulls_first;
+            bool desc = c->desc;
+            if (has_nulls) {
+                /* Shift non-null encoded values up by 1 so the null
+                 * sentinel sits outside the [1, 0x10000] data range and
+                 * cannot tie with INT16_MIN or INT16_MAX.  Costs one
+                 * extra radix-byte pass; sort_indices_ex bumps
+                 * key_nbytes_max accordingly. */
+                uint64_t null_e = (nf ^ desc) ? 0 : 0x10001ULL;
+                if (desc) {
+                    for (int64_t i = start; i < end; i++) {
+                        if (ray_vec_is_null(c->col, i)) c->keys[i] = ~null_e;
+                        else c->keys[i] = ~((uint64_t)((uint16_t)d[i] ^ ((uint16_t)1 << 15)) + 1);
+                    }
+                } else {
+                    for (int64_t i = start; i < end; i++) {
+                        if (ray_vec_is_null(c->col, i)) c->keys[i] = null_e;
+                        else c->keys[i] = (uint64_t)((uint16_t)d[i] ^ ((uint16_t)1 << 15)) + 1;
+                    }
+                }
+            } else if (desc) {
                 for (int64_t i = start; i < end; i++)
                     c->keys[i] = ~((uint64_t)((uint16_t)d[i] ^ ((uint16_t)1 << 15)));
             } else {
@@ -1031,7 +1052,26 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
         }
         case RAY_BOOL: case RAY_U8: {
             const uint8_t* d = (const uint8_t*)c->data;
-            if (c->desc) {
+            bool has_nulls = c->col && (c->col->attrs & RAY_ATTR_HAS_NULLS);
+            bool nf = c->nulls_first;
+            bool desc = c->desc;
+            if (has_nulls) {
+                /* Shift non-null encoded values up by 1; null sentinel
+                 * lives at 0 (NF) or 0x101 (NL), beyond every U8/BOOL
+                 * data value. */
+                uint64_t null_e = (nf ^ desc) ? 0 : 0x101ULL;
+                if (desc) {
+                    for (int64_t i = start; i < end; i++) {
+                        if (ray_vec_is_null(c->col, i)) c->keys[i] = ~null_e;
+                        else c->keys[i] = ~((uint64_t)d[i] + 1);
+                    }
+                } else {
+                    for (int64_t i = start; i < end; i++) {
+                        if (ray_vec_is_null(c->col, i)) c->keys[i] = null_e;
+                        else c->keys[i] = (uint64_t)d[i] + 1;
+                    }
+                }
+            } else if (desc) {
                 for (int64_t i = start; i < end; i++)
                     c->keys[i] = ~(uint64_t)d[i];
             } else {
@@ -2466,6 +2506,15 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
             if (can_radix && n_cols == 1) {
                 /* --- Single-key sort --- */
                 uint8_t key_nbytes_max = radix_key_bytes(cols[0]->type);
+                /* Narrow-int + has_nulls uses a +1-shifted encoding so
+                 * the null sentinel sits one byte beyond the data
+                 * range; reserve that extra byte for the radix pass. */
+                if ((cols[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+                    (cols[0]->type == RAY_BOOL || cols[0]->type == RAY_U8 ||
+                     cols[0]->type == RAY_I16) &&
+                    key_nbytes_max < 8) {
+                    key_nbytes_max++;
+                }
 
                 /* Skip pool for small arrays - dispatch overhead dominates */
                 ray_pool_t* sk_pool = (nrows >= SMALL_POOL_THRESHOLD) ? pool : NULL;
@@ -3365,7 +3414,11 @@ ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
                                       &sorted_keys, &keys_hdr);
         if (!idx || RAY_IS_ERR(idx)) return idx;
 
-        if (sorted_keys && !RAY_IS_SYM(cols[0]->type)) {
+        bool c0_shifted = (cols[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+                          (cols[0]->type == RAY_BOOL ||
+                           cols[0]->type == RAY_U8 ||
+                           cols[0]->type == RAY_I16);
+        if (sorted_keys && !RAY_IS_SYM(cols[0]->type) && !c0_shifted) {
             /* Decode path: sequential writes, no random access */
             ray_t* result = ray_vec_new(cols[0]->type, nrows);
             if (!result || RAY_IS_ERR(result)) {
@@ -3581,9 +3634,16 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
 
     /* Decode-gather optimisation: decode the sort key column directly from
      * sorted radix keys (sequential writes) instead of random-access gather.
-     * Only for single-key, non-SYM sorts where radix keys are available. */
+     * Only for single-key, non-SYM sorts where radix keys are available.
+     * Narrow-int + has_nulls uses a +1-shifted encoding that radix_decode_into
+     * doesn't invert, so fall back to gather there. */
+    int8_t sk0_type = sort_vecs[0] ? sort_vecs[0]->type : 0;
+    bool sk0_shifted = sort_vecs[0] &&
+                       (sort_vecs[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+                       (sk0_type == RAY_BOOL || sk0_type == RAY_U8 ||
+                        sk0_type == RAY_I16);
     int64_t sort_key_sym = -1;
-    if (sorted_keys && n_sort == 1 && !RAY_IS_SYM(sort_vecs[0]->type)) {
+    if (sorted_keys && n_sort == 1 && !RAY_IS_SYM(sk0_type) && !sk0_shifted) {
         ray_op_ext_t* key_ext = find_ext(g, ext->sort.columns[0]->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN)
             sort_key_sym = key_ext->sym;
@@ -3910,9 +3970,15 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     /* Decode sort key column directly from sorted radix keys when
      * available — sequential write, much faster than random-access
      * gather.  Only for single-key sorts where sort_indices_ex
-     * produced sorted_keys (non-packed path). */
+     * produced sorted_keys (non-packed path).  Narrow-int + has_nulls
+     * uses a +1-shifted encoding that radix_decode_into doesn't invert,
+     * so fall back to gather in that case. */
     int64_t decode_col_idx = -1;
-    if (sorted_keys && n_keys == 1 && !RAY_IS_SYM(key_cols[0]->type)) {
+    int8_t k0_type = key_cols[0]->type;
+    bool k0_shifted = (key_cols[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+                      (k0_type == RAY_BOOL || k0_type == RAY_U8 ||
+                       k0_type == RAY_I16);
+    if (sorted_keys && n_keys == 1 && !RAY_IS_SYM(k0_type) && !k0_shifted) {
         for (int64_t c = 0; c < ncols; c++) {
             if (col_names[c] == key_ids[0] && new_cols[c]) {
                 decode_col_idx = c;
@@ -3922,7 +3988,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     }
     if (decode_col_idx >= 0) {
         radix_decode_into(ray_data(new_cols[decode_col_idx]),
-                          key_cols[0]->type, sorted_keys,
+                          k0_type, sorted_keys,
                           nrows, descs[0]);
     }
 

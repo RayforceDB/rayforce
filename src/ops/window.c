@@ -757,6 +757,15 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             if (can_radix && n_sort == 1) {
                 /* Single-key sort */
                 uint8_t key_nbytes = radix_key_bytes(sort_vecs[0]->type);
+                /* Narrow-int + has_nulls uses a +1-shifted encoding —
+                 * keep the radix pass aligned with the wider key. */
+                if ((sort_vecs[0]->attrs & RAY_ATTR_HAS_NULLS) &&
+                    (sort_vecs[0]->type == RAY_BOOL ||
+                     sort_vecs[0]->type == RAY_U8 ||
+                     sort_vecs[0]->type == RAY_I16) &&
+                    key_nbytes < 8) {
+                    key_nbytes++;
+                }
                 ray_pool_t* sk_pool = (nrows >= SMALL_POOL_THRESHOLD) ? pool : NULL;
                 ray_t *keys_hdr;
                 uint64_t* keys = (uint64_t*)scratch_alloc(&keys_hdr,

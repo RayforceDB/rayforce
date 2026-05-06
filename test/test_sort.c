@@ -865,6 +865,231 @@ static test_result_t test_sort_multi_col(void) {
     PASS();
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ * Narrow-int single-key sort with nulls — regression for
+ * radix_encode_fn (I16, BOOL, U8) which previously did not consult
+ * the column's null bitmap and aliased nulls onto whatever the
+ * underlying byte data happened to be.  Each test forces nrows above
+ * the comparison-merge threshold (64) so we exercise the radix path,
+ * and seeds non-null values around the encoded null sentinel so the
+ * underlying byte data cannot mask the bug.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Build an I16 vec with `data` and mark `null_pos` rows null. */
+static ray_t* build_i16_with_nulls(const int16_t* data, int64_t n,
+                                    const int64_t* null_pos, int64_t n_nulls) {
+    ray_t* vec = ray_vec_from_raw(RAY_I16, data, n);
+    for (int64_t i = 0; i < n_nulls; i++)
+        ray_vec_set_null(vec, null_pos[i], true);
+    return vec;
+}
+
+static test_result_t test_sort_i16_nulls_first_with_negatives(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    /* 96 rows: span includes negatives so the encoded null sentinel
+     * (0 ASC) cannot land "by accident" between negatives and positives.
+     * Without the fix, nulls land where the underlying data byte (here
+     * zeroed by the helper) happens to encode, i.e. between -1 and 0. */
+    enum { N = 96 };
+    int16_t data[N];
+    for (int i = 0; i < N; i++) data[i] = (int16_t)(i - 48); /* -48..47 */
+    int64_t null_pos[] = {3, 17, 50, 80};
+    ray_t* vec = build_i16_with_nulls(data, N, null_pos, 4);
+
+    uint8_t desc = 0, nf = 1;
+    ray_t* idx = ray_sort_indices(&vec, &desc, &nf, 1, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(idx));
+    const int64_t* idxd = (const int64_t*)ray_data(idx);
+
+    /* First 4 must be null rows */
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_FMT(ray_vec_is_null(vec, idxd[i]),
+                        "i16 nulls-first: position %d is not null", i);
+    /* Remaining must be non-decreasing and non-null */
+    for (int64_t i = 5; i < N; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(vec, idxd[i]));
+        TEST_ASSERT_FMT(data[idxd[i]] >= data[idxd[i-1]],
+                        "i16 asc: out of order at %lld", (long long)i);
+    }
+
+    ray_release(idx);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_sort_i16_nulls_last_desc(void) {
+    ray_heap_init();
+    ray_sym_init();
+
+    enum { N = 96 };
+    int16_t data[N];
+    for (int i = 0; i < N; i++) data[i] = (int16_t)(i - 48);
+    int64_t null_pos[] = {1, 9, 60, 95};
+    ray_t* vec = build_i16_with_nulls(data, N, null_pos, 4);
+
+    uint8_t desc = 1, nf = 0;  /* DESC, nulls LAST */
+    ray_t* idx = ray_sort_indices(&vec, &desc, &nf, 1, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(idx));
+    const int64_t* idxd = (const int64_t*)ray_data(idx);
+
+    /* Last 4 must be null rows */
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_FMT(ray_vec_is_null(vec, idxd[N - 1 - i]),
+                        "i16 nulls-last: position %d from end is not null", i);
+    /* Leading non-null prefix must be non-increasing */
+    for (int64_t i = 1; i < N - 4; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(vec, idxd[i]));
+        TEST_ASSERT_FMT(data[idxd[i]] <= data[idxd[i-1]],
+                        "i16 desc: out of order at %lld", (long long)i);
+    }
+
+    ray_release(idx);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_sort_i16_nulls_first_desc(void) {
+    /* DESC × nulls-first: encoded null sentinel UINT64_MAX, must beat
+     * even INT16_MIN at the leading edge. */
+    ray_heap_init();
+    ray_sym_init();
+
+    enum { N = 96 };
+    int16_t data[N];
+    for (int i = 0; i < N; i++) data[i] = (int16_t)(i - 48);
+    int64_t null_pos[] = {0, 47, 70};
+    ray_t* vec = build_i16_with_nulls(data, N, null_pos, 3);
+
+    uint8_t desc = 1, nf = 1;
+    ray_t* idx = ray_sort_indices(&vec, &desc, &nf, 1, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(idx));
+    const int64_t* idxd = (const int64_t*)ray_data(idx);
+
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_TRUE(ray_vec_is_null(vec, idxd[i]));
+
+    ray_release(idx);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_sort_u8_nulls_last_asc(void) {
+    /* U8 ASC × nulls-last: with the bug, nulls follow the underlying
+     * byte data (zeroed) and would group with the smallest values
+     * instead of trailing the result. */
+    ray_heap_init();
+    ray_sym_init();
+
+    enum { N = 100 };
+    uint8_t data[N];
+    for (int i = 0; i < N; i++) data[i] = (uint8_t)(i + 1);  /* 1..100, no zeros */
+    ray_t* vec = ray_vec_from_raw(RAY_U8, data, N);
+    int64_t null_pos[] = {2, 33, 77};
+    for (int i = 0; i < 3; i++) ray_vec_set_null(vec, null_pos[i], true);
+
+    uint8_t desc = 0, nf = 0;  /* ASC, nulls LAST */
+    ray_t* idx = ray_sort_indices(&vec, &desc, &nf, 1, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(idx));
+    const int64_t* idxd = (const int64_t*)ray_data(idx);
+
+    /* Last three must be nulls */
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_FMT(ray_vec_is_null(vec, idxd[N - 1 - i]),
+                        "u8 nulls-last: pos %d from end is not null", i);
+    /* Leading prefix non-decreasing */
+    for (int64_t i = 1; i < N - 3; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(vec, idxd[i]));
+        TEST_ASSERT_TRUE(data[idxd[i]] >= data[idxd[i-1]]);
+    }
+
+    ray_release(idx);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_sort_u8_nulls_first_desc(void) {
+    /* DESC × nulls-first: encoded null = ~0 = UINT64_MAX, sorts before
+     * even 0xFF.  Underlying data here intentionally contains 0xFF so
+     * the bug's natural-byte-order behavior cannot mimic the fix. */
+    ray_heap_init();
+    ray_sym_init();
+
+    enum { N = 100 };
+    uint8_t data[N];
+    for (int i = 0; i < N; i++) data[i] = (uint8_t)(150 + i % 50);  /* 150..199 */
+    ray_t* vec = ray_vec_from_raw(RAY_U8, data, N);
+    int64_t null_pos[] = {10, 50, 90};
+    for (int i = 0; i < 3; i++) ray_vec_set_null(vec, null_pos[i], true);
+
+    uint8_t desc = 1, nf = 1;
+    ray_t* idx = ray_sort_indices(&vec, &desc, &nf, 1, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(idx));
+    const int64_t* idxd = (const int64_t*)ray_data(idx);
+
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_TRUE(ray_vec_is_null(vec, idxd[i]));
+    /* Tail non-increasing */
+    for (int64_t i = 4; i < N; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(vec, idxd[i]));
+        TEST_ASSERT_TRUE(data[idxd[i]] <= data[idxd[i-1]]);
+    }
+
+    ray_release(idx);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_sort_bool_nulls_first(void) {
+    /* BOOL shares the U8 encode path; nulls must still respect the
+     * requested boundary and not get folded into the false bucket. */
+    ray_heap_init();
+    ray_sym_init();
+
+    enum { N = 100 };
+    uint8_t data[N];
+    for (int i = 0; i < N; i++) data[i] = (uint8_t)(i & 1);
+    ray_t* vec = ray_vec_from_raw(RAY_BOOL, data, N);
+    int64_t null_pos[] = {0, 25, 50, 99};
+    for (int i = 0; i < 4; i++) ray_vec_set_null(vec, null_pos[i], true);
+
+    uint8_t desc = 0, nf = 1;
+    ray_t* idx = ray_sort_indices(&vec, &desc, &nf, 1, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(idx));
+    const int64_t* idxd = (const int64_t*)ray_data(idx);
+
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT_FMT(ray_vec_is_null(vec, idxd[i]),
+                        "bool nulls-first: pos %d is not null", i);
+
+    /* Among non-nulls, all 0s come before all 1s. */
+    int saw_one = 0;
+    for (int64_t i = 4; i < N; i++) {
+        TEST_ASSERT_FALSE(ray_vec_is_null(vec, idxd[i]));
+        if (data[idxd[i]] == 1) saw_one = 1;
+        else TEST_ASSERT_FMT(saw_one == 0,
+                              "bool asc: a 0 appears after a 1 at %lld",
+                              (long long)i);
+    }
+
+    ray_release(idx);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* ─── Entry table ────────────────────────────────────────────────── */
 
 const test_entry_t sort_entries[] = {
@@ -901,5 +1126,13 @@ const test_entry_t sort_entries[] = {
     { "sort/nulls_first",               test_sort_nulls_first,          NULL, NULL },
     /* ray_sort multi-column path */
     { "sort/multi_col",                 test_sort_multi_col,            NULL, NULL },
+    /* Narrow-int single-key null encoding (regression for radix_encode_fn
+     * I16/BOOL/U8 cases that ignored the null bitmap). */
+    { "sort/i16_nulls_first_negs",      test_sort_i16_nulls_first_with_negatives, NULL, NULL },
+    { "sort/i16_nulls_last_desc",       test_sort_i16_nulls_last_desc,  NULL, NULL },
+    { "sort/i16_nulls_first_desc",      test_sort_i16_nulls_first_desc, NULL, NULL },
+    { "sort/u8_nulls_last_asc",         test_sort_u8_nulls_last_asc,    NULL, NULL },
+    { "sort/u8_nulls_first_desc",       test_sort_u8_nulls_first_desc,  NULL, NULL },
+    { "sort/bool_nulls_first",          test_sort_bool_nulls_first,     NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
