@@ -46,9 +46,11 @@ typedef struct {
 } like_resolve_ctx_t;
 
 /* Worker for the SYM-LIKE seen-mark phase.  Marks `seen[sid] = 1` for
- * every row's sym_id.  Multiple workers may write 1 to the same byte
- * concurrently — the value is idempotent (always 1), so the data race
- * is benign.  Width-specialised on the SYM dictionary width. */
+ * every row's sym_id.  Multiple workers can target the same byte, so
+ * the store is via __atomic_store_n with relaxed ordering — same
+ * machine code as a plain byte store on x86, but standard-defined
+ * (plain non-atomic concurrent writes are UB even when the value is
+ * idempotent).  Width-specialised on the SYM dictionary width. */
 typedef struct {
     const void* base;
     uint8_t*    seen;
@@ -65,20 +67,26 @@ typedef struct {
     int64_t         total_rows;
 } like_seen_ctx_t;
 
-/* Macro to mark seen[sid] for a single row at index `r`. */
+/* Macro to mark seen[sid] for a single row at index `r`.  The store
+ * is __atomic_store_n with relaxed ordering — workers can race on the
+ * same byte (different rows can resolve to the same dict ID), and the
+ * relaxed atomic gives UB-free semantics with the same x86 codegen as
+ * a plain byte store. */
+#define LIKE_SEEN_MARK(SID) \
+    __atomic_store_n(&seen[(SID)], (uint8_t)1, __ATOMIC_RELAXED)
 #define LIKE_SEEN_MARK_ROW(W) do {                                  \
     if ((W) == RAY_SYM_W8) {                                         \
         uint64_t sid = ((const uint8_t*)x->base)[r];                 \
-        if (sid < dict_n) seen[sid] = 1;                             \
+        if (sid < dict_n) LIKE_SEEN_MARK(sid);                       \
     } else if ((W) == RAY_SYM_W16) {                                 \
         uint64_t sid = ((const uint16_t*)x->base)[r];                \
-        if (sid < dict_n) seen[sid] = 1;                             \
+        if (sid < dict_n) LIKE_SEEN_MARK(sid);                       \
     } else if ((W) == RAY_SYM_W32) {                                 \
         uint64_t sid = ((const uint32_t*)x->base)[r];                \
-        if (sid < dict_n) seen[sid] = 1;                             \
+        if (sid < dict_n) LIKE_SEEN_MARK(sid);                       \
     } else {                                                         \
         int64_t sid = ((const int64_t*)x->base)[r];                  \
-        if ((uint64_t)sid < dict_n) seen[sid] = 1;                   \
+        if ((uint64_t)sid < dict_n) LIKE_SEEN_MARK(sid);             \
     }                                                                \
 } while (0)
 
@@ -135,7 +143,7 @@ static void like_seen_fn(void* vctx, uint32_t worker_id,
         const uint8_t* d = (const uint8_t*)x->base;
         for (int64_t i = start; i < end; i++) {
             uint64_t sid = d[i];
-            if (sid < dict_n) seen[sid] = 1;
+            if (sid < dict_n) LIKE_SEEN_MARK(sid);
         }
         break;
     }
@@ -143,7 +151,7 @@ static void like_seen_fn(void* vctx, uint32_t worker_id,
         const uint16_t* d = (const uint16_t*)x->base;
         for (int64_t i = start; i < end; i++) {
             uint64_t sid = d[i];
-            if (sid < dict_n) seen[sid] = 1;
+            if (sid < dict_n) LIKE_SEEN_MARK(sid);
         }
         break;
     }
@@ -151,7 +159,7 @@ static void like_seen_fn(void* vctx, uint32_t worker_id,
         const uint32_t* d = (const uint32_t*)x->base;
         for (int64_t i = start; i < end; i++) {
             uint64_t sid = d[i];
-            if (sid < dict_n) seen[sid] = 1;
+            if (sid < dict_n) LIKE_SEEN_MARK(sid);
         }
         break;
     }
@@ -160,7 +168,7 @@ static void like_seen_fn(void* vctx, uint32_t worker_id,
         const int64_t* d = (const int64_t*)x->base;
         for (int64_t i = start; i < end; i++) {
             int64_t sid = d[i];
-            if ((uint64_t)sid < dict_n) seen[sid] = 1;
+            if ((uint64_t)sid < dict_n) LIKE_SEEN_MARK(sid);
         }
         break;
     }

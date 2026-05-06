@@ -1420,10 +1420,37 @@ ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,
     csv_free_escaped_strrefs(str_ref_bufs, ncols, parse_types, n_rows, buf, file_size);
     for (int c = 0; c < ncols; c++) scratch_free(str_ref_hdrs[c]);
 
-    /* ---- 9c. Strip nullmaps from all-valid columns ---- */
+    /* ---- 9c. Strip nullmaps from all-valid columns ----
+     *
+     * Two cases qualify as "no nulls":
+     *   (a) col_had_null[c] is false — the parser never saw a null.
+     *   (b) col_had_null[c] is true (parser did see nulls) BUT step 9b's
+     *       csv_remap_empty_sym_to_id mapped every empty SYM null to the
+     *       empty-symbol ID, clearing each null bit.  In that case the
+     *       nullmap is all-zero post-remap and the column is, in fact,
+     *       null-free — but the stale HAS_NULLS attr was breaking
+     *       downstream gates that key on the attribute (e.g. fused
+     *       top-K's nullable gate).  Walk the actual nullmap to detect
+     *       case (b) and strip the attribute. */
     for (int c = 0; c < ncols; c++) {
-        if (col_had_null[c]) continue;
         ray_t* vec = col_vecs[c];
+        int strip = !col_had_null[c];
+        if (!strip && (vec->attrs & RAY_ATTR_HAS_NULLS)) {
+            const uint8_t* nm = (vec->attrs & RAY_ATTR_NULLMAP_EXT)
+                                ? (const uint8_t*)ray_data(vec->ext_nullmap)
+                                : vec->nullmap;
+            if (nm) {
+                int64_t nm_bytes = (vec->attrs & RAY_ATTR_NULLMAP_EXT)
+                                   ? ((vec->len + 7) / 8)
+                                   : 16;
+                int any_set = 0;
+                for (int64_t b = 0; b < nm_bytes; b++) {
+                    if (nm[b]) { any_set = 1; break; }
+                }
+                strip = !any_set;
+            }
+        }
+        if (!strip) continue;
         if (vec->attrs & RAY_ATTR_NULLMAP_EXT) {
             ray_release(vec->ext_nullmap);
             vec->ext_nullmap = NULL;

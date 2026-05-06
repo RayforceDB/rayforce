@@ -183,12 +183,41 @@ static inline uint8_t col_esz(const ray_t* col) {
 
 /* Fast key reader for DA/sort hot loops: elem_size is pre-computed and
  * loop-invariant, so the switch is always perfectly predicted.  Avoids the
- * ray_read_sym → type dispatch chain (3+ branches per element). */
+ * ray_read_sym → type dispatch chain (3+ branches per element).
+ *
+ * Unsigned widening — appropriate for SYM dictionary IDs (which are
+ * unsigned) and for packing keys into composite ints where bit-pattern
+ * round-trip matters more than sign.  Do NOT use for arithmetic on
+ * signed narrow column values (I16/I32/DATE/TIME) — use
+ * `read_signed_by_esz` so a stored -1 reads as -1 and not 65535. */
 static inline int64_t read_by_esz(const void* data, int64_t row, uint8_t esz) {
     switch (esz) {
     case 1:  return (int64_t)((const uint8_t*)data)[row];
     case 2:  return (int64_t)((const uint16_t*)data)[row];
     case 4:  return (int64_t)((const uint32_t*)data)[row];
+    default: return ((const int64_t*)data)[row];
+    }
+}
+
+/* Sign-aware reader.  Aggregate kernels (SUM/MIN/MAX/AVG) need the
+ * stored value's mathematical magnitude, so signed narrow columns
+ * must be sign-extended into the int64 result.  Pass `is_unsigned=1`
+ * for U8/BOOL or SYM dict ID reads, `0` for I16/I32/I64 and the
+ * temporal types (DATE/TIME/TIMESTAMP) which are stored signed. */
+static inline int64_t read_signed_by_esz(const void* data, int64_t row,
+                                         uint8_t esz, int is_unsigned) {
+    if (is_unsigned) {
+        switch (esz) {
+        case 1:  return (int64_t)((const uint8_t*)data)[row];
+        case 2:  return (int64_t)((const uint16_t*)data)[row];
+        case 4:  return (int64_t)((const uint32_t*)data)[row];
+        default: return ((const int64_t*)data)[row];
+        }
+    }
+    switch (esz) {
+    case 1:  return (int64_t)((const int8_t*)data)[row];
+    case 2:  return (int64_t)((const int16_t*)data)[row];
+    case 4:  return (int64_t)((const int32_t*)data)[row];
     default: return ((const int64_t*)data)[row];
     }
 }

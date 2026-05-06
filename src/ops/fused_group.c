@@ -211,6 +211,12 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
     int8_t  ct = p->col_type;
     uint8_t esz = p->col_esz;
 
+    /* Compile-time fold: out-of-range constant ⇒ all-true or all-false. */
+    if (p->fold) {
+        memset(bits, (p->fold == FP_FOLD_TRUE) ? 1 : 0, (size_t)n);
+        return;
+    }
+
     /* SYM low-card fold: const not in dict ⇒ EQ all-zero / NE all-one.
      * Ordering ops are rejected at compile for SYM, so unreachable here. */
     if (ct == RAY_SYM && !p->cval_in_dict) {
@@ -306,6 +312,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
                           fp_cmp_t* out)
 {
     if (!pred_op || pred_op->arity != 2) return -1;
+    out->fold = FP_FOLD_NONE;
     switch (pred_op->opcode) {
     case OP_EQ: out->op = FP_EQ; break;
     case OP_NE: out->op = FP_NE; break;
@@ -363,6 +370,47 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         default: return -1;
         }
         out->cval_in_dict = 1;
+    }
+
+    /* Range-check cval against the column's representable range and
+     * pre-fold the comparison when the constant lies outside it.
+     * Without this, the inner-loop cast `(T)cval` silently truncates and
+     * yields wrong results (e.g. `u8_col == 300` matched value 44).
+     *
+     * For SYM, the storage IDs are unsigned and bounded by 2^(8*esz);
+     * a global sym ID larger than that can't appear in this column.
+     * For numeric, U8/BOOL is unsigned [0..255], I16/I32/I64 are signed. */
+    int64_t v_min, v_max;
+    int     is_unsigned;
+    if (out->col_type == RAY_SYM) {
+        is_unsigned = 1;
+        v_min = 0;
+        switch (out->col_esz) {
+        case 1: v_max = 0xFFLL;       break;
+        case 2: v_max = 0xFFFFLL;     break;
+        case 4: v_max = 0xFFFFFFFFLL; break;
+        default: v_max = INT64_MAX;   break;
+        }
+    } else {
+        switch (out->col_esz) {
+        case 1: is_unsigned = 1; v_min = 0;          v_max = 0xFFLL;     break; /* U8/BOOL */
+        case 2: is_unsigned = 0; v_min = INT16_MIN;  v_max = INT16_MAX;  break;
+        case 4: is_unsigned = 0; v_min = INT32_MIN;  v_max = INT32_MAX;  break;
+        default: is_unsigned = 0; v_min = INT64_MIN; v_max = INT64_MAX;  break;
+        }
+    }
+    (void)is_unsigned;
+
+    if (out->cval < v_min || out->cval > v_max) {
+        int below = (out->cval < v_min);
+        switch (out->op) {
+        case FP_EQ: out->fold = FP_FOLD_FALSE; break;
+        case FP_NE: out->fold = FP_FOLD_TRUE;  break;
+        case FP_LT: out->fold = below ? FP_FOLD_FALSE : FP_FOLD_TRUE;  break; /* col < below ⇒ false; col < above ⇒ true */
+        case FP_LE: out->fold = below ? FP_FOLD_FALSE : FP_FOLD_TRUE;  break;
+        case FP_GT: out->fold = below ? FP_FOLD_TRUE  : FP_FOLD_FALSE; break;
+        case FP_GE: out->fold = below ? FP_FOLD_TRUE  : FP_FOLD_FALSE; break;
+        }
     }
     return 0;
 }
@@ -1071,6 +1119,11 @@ typedef struct {
     int8_t        in_type;
     uint8_t       in_attrs;
     uint8_t       in_esz;
+    /* 1 when in_type stores an unsigned narrow value (U8/BOOL); 0 for
+     * signed widths (I16/I32/I64/DATE/TIME/TIMESTAMP).  Used to
+     * sign-extend correctly in SUM/MIN/MAX/AVG so a stored -1 reads as
+     * -1 and not 65535. */
+    uint8_t       in_unsigned;
     const void*   in_base;
     uint8_t       state_off;
 } mk_agg_t;
@@ -1191,12 +1244,12 @@ static inline void mk_state_init_row(int64_t* st, const mk_agg_t* aggs,
         case MK_AGG_SUM:
         case MK_AGG_MIN:
         case MK_AGG_MAX: {
-            int64_t v = read_by_esz(a->in_base, row, a->in_esz);
+            int64_t v = read_signed_by_esz(a->in_base, row, a->in_esz, a->in_unsigned);
             st[a->state_off] = v;
             break;
         }
         case MK_AGG_AVG: {
-            int64_t v = read_by_esz(a->in_base, row, a->in_esz);
+            int64_t v = read_signed_by_esz(a->in_base, row, a->in_esz, a->in_unsigned);
             st[a->state_off    ] = v;
             st[a->state_off + 1] = 1;
             break;
@@ -1215,22 +1268,22 @@ static inline void mk_state_accum_row(int64_t* st, const mk_agg_t* aggs,
             st[a->state_off] += 1;
             break;
         case MK_AGG_SUM: {
-            int64_t v = read_by_esz(a->in_base, row, a->in_esz);
+            int64_t v = read_signed_by_esz(a->in_base, row, a->in_esz, a->in_unsigned);
             st[a->state_off] += v;
             break;
         }
         case MK_AGG_MIN: {
-            int64_t v = read_by_esz(a->in_base, row, a->in_esz);
+            int64_t v = read_signed_by_esz(a->in_base, row, a->in_esz, a->in_unsigned);
             if (v < st[a->state_off]) st[a->state_off] = v;
             break;
         }
         case MK_AGG_MAX: {
-            int64_t v = read_by_esz(a->in_base, row, a->in_esz);
+            int64_t v = read_signed_by_esz(a->in_base, row, a->in_esz, a->in_unsigned);
             if (v > st[a->state_off]) st[a->state_off] = v;
             break;
         }
         case MK_AGG_AVG: {
-            int64_t v = read_by_esz(a->in_base, row, a->in_esz);
+            int64_t v = read_signed_by_esz(a->in_base, row, a->in_esz, a->in_unsigned);
             st[a->state_off    ] += v;
             st[a->state_off + 1] += 1;
             break;
@@ -1541,8 +1594,11 @@ static void mk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end)
             case MK_AGG_SUM: {
                 const void* in_base = ag->in_base;
                 uint8_t in_esz = ag->in_esz;
+                int     in_uns = ag->in_unsigned;
                 for (int i = 0; i < match_count; i++) {
-                    int64_t v = read_by_esz(in_base, base_row + src_rows[i], in_esz);
+                    int64_t v = read_signed_by_esz(in_base,
+                                                   base_row + src_rows[i],
+                                                   in_esz, in_uns);
                     state[slot_idx[i] * total_state + off] += v;
                 }
                 break;
@@ -1550,8 +1606,11 @@ static void mk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end)
             case MK_AGG_MIN: {
                 const void* in_base = ag->in_base;
                 uint8_t in_esz = ag->in_esz;
+                int     in_uns = ag->in_unsigned;
                 for (int i = 0; i < match_count; i++) {
-                    int64_t v = read_by_esz(in_base, base_row + src_rows[i], in_esz);
+                    int64_t v = read_signed_by_esz(in_base,
+                                                   base_row + src_rows[i],
+                                                   in_esz, in_uns);
                     int64_t* p = &state[slot_idx[i] * total_state + off];
                     if (v < *p) *p = v;
                 }
@@ -1560,8 +1619,11 @@ static void mk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end)
             case MK_AGG_MAX: {
                 const void* in_base = ag->in_base;
                 uint8_t in_esz = ag->in_esz;
+                int     in_uns = ag->in_unsigned;
                 for (int i = 0; i < match_count; i++) {
-                    int64_t v = read_by_esz(in_base, base_row + src_rows[i], in_esz);
+                    int64_t v = read_signed_by_esz(in_base,
+                                                   base_row + src_rows[i],
+                                                   in_esz, in_uns);
                     int64_t* p = &state[slot_idx[i] * total_state + off];
                     if (v > *p) *p = v;
                 }
@@ -1570,8 +1632,11 @@ static void mk_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end)
             case MK_AGG_AVG: {
                 const void* in_base = ag->in_base;
                 uint8_t in_esz = ag->in_esz;
+                int     in_uns = ag->in_unsigned;
                 for (int i = 0; i < match_count; i++) {
-                    int64_t v = read_by_esz(in_base, base_row + src_rows[i], in_esz);
+                    int64_t v = read_signed_by_esz(in_base,
+                                                   base_row + src_rows[i],
+                                                   in_esz, in_uns);
                     state[slot_idx[i] * total_state + off    ] += v;
                     state[slot_idx[i] * total_state + off + 1] += 1;
                 }
@@ -2344,6 +2409,7 @@ static int mk_compile(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
         a->in_attrs = col->attrs;
         a->in_esz = ray_sym_elem_size(ct, col->attrs);
         a->in_base = ray_data(col);
+        a->in_unsigned = (ct == RAY_BOOL || ct == RAY_U8) ? 1 : 0;
     }
     ctx->total_state = state_off;
     ctx->n_aggs = ext->n_aggs;

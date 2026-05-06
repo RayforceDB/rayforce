@@ -2327,14 +2327,41 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                     continue;
                 }
                 if (kid == by_id) { bad_clause = 1; break; }
-                /* Output column: trivial alias of a source column. */
+                /* Output column must be a *trivial* projection of a source
+                 * column — and the dict key (the output alias) must equal
+                 * the source column sym, since the fused materialiser names
+                 * output columns after the source.  Renamings like
+                 * `{alias: source_col}` would silently emit a column named
+                 * `source_col` instead of `alias`, which is a schema bug.
+                 * Until the fused exec accepts a separate aliases array,
+                 * gate the fused path off for any rename. */
                 if (n_out_syms >= 64) { bad_clause = 1; break; }
                 if (v && v->type == -RAY_SYM && (v->attrs & RAY_ATTR_NAME)
+                    && v->i64 == kid
                     && ray_table_get_col(tbl, v->i64) != NULL) {
                     out_syms[n_out_syms++] = v->i64;
                 } else {
                     bad_clause = 1;
                     break;
+                }
+            }
+            /* Nullable columns are not supported by the fused materialise:
+             * the fused path reads raw payload values and writes them back
+             * via write_col_i64 without propagating the source column's
+             * nullmap.  Sort key compares also bypass null ordering.  Gate
+             * fused off if any sort key or output column carries nulls so
+             * the unfused FILTER + SORT + TAKE path handles them.  Same
+             * rationale is applied to sort/output cols (not just sort keys)
+             * because materialised null sentinels would surface even if
+             * the column isn't on the sort path. */
+            if (!bad_clause) {
+                for (uint8_t i = 0; i < n_sort_keys && !bad_clause; i++) {
+                    ray_t* kc = ray_table_get_col(tbl, sort_key_syms[i]);
+                    if (!kc || (kc->attrs & RAY_ATTR_HAS_NULLS)) bad_clause = 1;
+                }
+                for (uint8_t i = 0; i < n_out_syms && !bad_clause; i++) {
+                    ray_t* oc = ray_table_get_col(tbl, out_syms[i]);
+                    if (!oc || (oc->attrs & RAY_ATTR_HAS_NULLS)) bad_clause = 1;
                 }
             }
             if (!bad_clause && n_sort_keys > 0 && n_out_syms > 0) {
@@ -2658,6 +2685,15 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                      * to the existing OP_AND tree, which ray_optimize
                      * already constant-folds. */
                     int all_ok = 1;
+                    /* `reorder_safe` flips to 0 when any conjunct contains
+                     * an op that can fault, error or have observable
+                     * side effects — division, modulo, call into a user
+                     * function, etc.  In that case we still chain the
+                     * conjuncts as separate filters (the selection-aware
+                     * win), but evaluate them in user-given order so an
+                     * earlier guard like `(!= y 0)` keeps protecting a
+                     * later `(< (/ x y) 10)`. */
+                    int reorder_safe = 1;
                     ray_op_t* compiled[64];
                     int       cost[64];
                     if (k > 64) all_ok = 0;
@@ -2710,6 +2746,16 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                                 break;  /* leaves — no compute cost */
                             default:
                                 c += 5;
+                                /* Unknown op — could be arithmetic that
+                                 * faults (OP_DIV / OP_MOD divide-by-zero),
+                                 * a user-defined call with side effects,
+                                 * or any op whose error behavior depends
+                                 * on what the prior conjuncts already
+                                 * filtered out.  Keep this conjunct in
+                                 * its user-given position so a guard like
+                                 * `(!= y 0)` continues to short-circuit
+                                 * a later `(< (/ x y) 10)`. */
+                                reorder_safe = 0;
                                 break;
                             }
                             for (uint8_t a = 0; a < cur->arity && sp < 64; a++)
@@ -2722,18 +2768,23 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                     if (all_ok) {
                         /* Selection-sort by cost ascending — small k so
                          * O(k²) is fine and avoids dragging a bigger
-                         * sort into the query path. */
+                         * sort into the query path.  Skipped when the
+                         * conjunct set contains a fault-able / side-
+                         * effecting op (see `reorder_safe` below) so
+                         * user-given short-circuit order is preserved. */
                         int order[64];
                         for (int64_t i = 0; i < k; i++) order[i] = (int)i;
-                        for (int64_t i = 0; i < k - 1; i++) {
-                            int min_i = (int)i;
-                            for (int64_t j = i + 1; j < k; j++)
-                                if (cost[order[j]] < cost[order[min_i]])
-                                    min_i = (int)j;
-                            if (min_i != (int)i) {
-                                int tmp = order[i];
-                                order[i] = order[min_i];
-                                order[min_i] = tmp;
+                        if (reorder_safe) {
+                            for (int64_t i = 0; i < k - 1; i++) {
+                                int min_i = (int)i;
+                                for (int64_t j = i + 1; j < k; j++)
+                                    if (cost[order[j]] < cost[order[min_i]])
+                                        min_i = (int)j;
+                                if (min_i != (int)i) {
+                                    int tmp = order[i];
+                                    order[i] = order[min_i];
+                                    order[min_i] = tmp;
+                                }
                             }
                         }
                         for (int64_t i = 0; i < k; i++)

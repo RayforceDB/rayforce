@@ -38,11 +38,23 @@ typedef enum {
     FP_GE = 5,
 } fp_op_t;
 
+/* fold values: when the predicate constant is provably outside the
+ * column's representable range, we don't run the per-row compare at
+ * all — the result is mathematically all-true or all-false.  Without
+ * this fold, casting the constant down to the storage width silently
+ * truncates (e.g. `u8_col == 300` becoming `u8_col == 44`). */
+typedef enum {
+    FP_FOLD_NONE  = 0,
+    FP_FOLD_FALSE = 1,
+    FP_FOLD_TRUE  = 2,
+} fp_fold_t;
+
 typedef struct {
     fp_op_t      op;
     int8_t       col_type;
     uint8_t      col_attrs;
     uint8_t      col_esz;
+    uint8_t      fold;        /* fp_fold_t — set when cval is out-of-range */
     const void*  col_base;
     int64_t      col_len;
     int64_t      cval;
