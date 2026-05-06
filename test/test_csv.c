@@ -1131,6 +1131,171 @@ static test_result_t test_csv_sym_narrowing(void) {
     PASS();
 }
 
+/* Explicit narrow-int schema: regression for the parse_types map that
+ * silently routed RAY_U8/RAY_I16/RAY_I32 to CSV_TYPE_STR.  In that
+ * state csv_intern_strings would write 4-byte sym IDs into the smaller
+ * column buffer, overflowing the heap for U8/I16 (eventual SIGSEGV in
+ * later allocators) and producing sym IDs instead of integers for I32. */
+
+static test_result_t test_csv_explicit_u8_schema(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    fprintf(f, "v\n");
+    /* 10 000 rows ⇒ parallel parse path; values 0..255 cycling so the
+     * truncated bytes fully exercise the U8 range. */
+    const int N = 10000;
+    for (int i = 0; i < N; i++) fprintf(f, "%d\n", (i + 1) % 256);
+    fclose(f);
+
+    int8_t schema[1] = { RAY_U8 };
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, 0, true, schema, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), N);
+
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_EQ_I(col->type, RAY_U8);
+    const uint8_t* d = (const uint8_t*)ray_data(col);
+    TEST_ASSERT_EQ_I((int)d[0], 1);
+    TEST_ASSERT_EQ_I((int)d[N - 1], (int)((N) % 256));
+    /* Spot-check a mid value to make sure we didn't get sym IDs. */
+    TEST_ASSERT_EQ_I((int)d[100], (int)(101 % 256));
+    /* No null sentinels expected; column must not advertise nulls. */
+    TEST_ASSERT_FALSE(col->attrs & RAY_ATTR_HAS_NULLS);
+
+    /* Sort it — without the fix this segfaults inside packed_radix_sort_run
+     * on the corrupted heap. */
+    ray_t* col_arg = col;
+    uint8_t desc = 0, nf = 1;
+    ray_t* idx = ray_sort_indices(&col_arg, &desc, &nf, 1, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(idx));
+    ray_release(idx);
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_csv_explicit_i16_schema_with_nulls(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    fprintf(f, "v\n");
+    const int N = 1500;
+    for (int i = 0; i < N; i++) {
+        if (i % 200 == 0) fprintf(f, "\n");          /* empty → null */
+        else fprintf(f, "%d\n", (i % 17) - 8);       /* range -8..8 */
+    }
+    fclose(f);
+
+    int8_t schema[1] = { RAY_I16 };
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, 0, true, schema, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), N);
+
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_EQ_I(col->type, RAY_I16);
+    TEST_ASSERT_TRUE(col->attrs & RAY_ATTR_HAS_NULLS);
+
+    /* Every 200th row must be null, others must hold the parsed integer. */
+    const int16_t* d = (const int16_t*)ray_data(col);
+    int null_count = 0;
+    for (int i = 0; i < N; i++) {
+        if (i % 200 == 0) {
+            TEST_ASSERT_TRUE(ray_vec_is_null(col, i));
+            null_count++;
+        } else {
+            TEST_ASSERT_FALSE(ray_vec_is_null(col, i));
+            TEST_ASSERT_EQ_I((int)d[i], (i % 17) - 8);
+        }
+    }
+    TEST_ASSERT_EQ_I(null_count, (N + 199) / 200);
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_csv_explicit_i32_schema(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    fprintf(f, "v\n");
+    const int N = 500;
+    for (int i = 0; i < N; i++) fprintf(f, "%d\n", -100000 + i * 137);
+    fclose(f);
+
+    int8_t schema[1] = { RAY_I32 };
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, 0, true, schema, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_EQ_I(col->type, RAY_I32);
+
+    /* Without the fix this column would hold sym IDs (1, 2, 3, …) instead
+     * of the actual integers. */
+    const int32_t* d = (const int32_t*)ray_data(col);
+    for (int i = 0; i < N; i++)
+        TEST_ASSERT_EQ_I((int)d[i], -100000 + i * 137);
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_csv_explicit_u8_schema_serial(void) {
+    /* Force the serial parse path (n_rows ≤ 8192) and exercise truncated-row
+     * fill defaults plus null-column path. */
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    fprintf(f, "a,b\n");
+    /* 200 rows; second column missing on every 50th row → triggers
+     * past-row-boundary fill in the parser. */
+    for (int i = 0; i < 200; i++) {
+        if (i % 50 == 0) fprintf(f, "%d\n", i);
+        else fprintf(f, "%d,%d\n", i, i + 1);
+    }
+    fclose(f);
+
+    int8_t schema[2] = { RAY_U8, RAY_U8 };
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, 0, true, schema, 2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 200);
+
+    ray_t* a = ray_table_get_col_idx(loaded, 0);
+    ray_t* b = ray_table_get_col_idx(loaded, 1);
+    TEST_ASSERT_EQ_I(a->type, RAY_U8);
+    TEST_ASSERT_EQ_I(b->type, RAY_U8);
+    TEST_ASSERT_TRUE(b->attrs & RAY_ATTR_HAS_NULLS);
+
+    const uint8_t* ad = (const uint8_t*)ray_data(a);
+    const uint8_t* bd = (const uint8_t*)ray_data(b);
+    for (int i = 0; i < 200; i++) {
+        TEST_ASSERT_EQ_I((int)ad[i], i % 256);
+        if (i % 50 == 0) TEST_ASSERT_TRUE(ray_vec_is_null(b, i));
+        else {
+            TEST_ASSERT_FALSE(ray_vec_is_null(b, i));
+            TEST_ASSERT_EQ_I((int)bd[i], (i + 1) % 256);
+        }
+    }
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },
@@ -1167,5 +1332,13 @@ const test_entry_t csv_entries[] = {
     { "csv/header_needs_quoting", test_csv_header_needs_quoting, NULL, NULL },
     { "csv/parallel_parse", test_csv_parallel_parse, NULL, NULL },
     { "csv/sym_narrowing", test_csv_sym_narrowing, NULL, NULL },
+    /* Narrow-int explicit schema (regression for missing parse_types map
+     * entries that routed U8/I16/I32 to STR and corrupted the heap). */
+    { "csv/explicit_u8_schema",  test_csv_explicit_u8_schema,             NULL, NULL },
+    { "csv/explicit_i16_schema_with_nulls",
+                                  test_csv_explicit_i16_schema_with_nulls, NULL, NULL },
+    { "csv/explicit_i32_schema", test_csv_explicit_i32_schema,            NULL, NULL },
+    { "csv/explicit_u8_schema_serial",
+                                  test_csv_explicit_u8_schema_serial,      NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

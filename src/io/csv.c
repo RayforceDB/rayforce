@@ -131,7 +131,13 @@ typedef enum {
     CSV_TYPE_DATE,
     CSV_TYPE_TIME,
     CSV_TYPE_TIMESTAMP,
-    CSV_TYPE_GUID
+    CSV_TYPE_GUID,
+    /* Narrow-int parse types — selected only via explicit schema (never from
+     * inference, so they do not appear in promote_csv_type). Each parses the
+     * field as int64 and narrows at write time to match the column width. */
+    CSV_TYPE_U8,
+    CSV_TYPE_I16,
+    CSV_TYPE_I32
 } csv_type_t;
 
 static csv_type_t detect_type(const char* f, size_t len) {
@@ -795,6 +801,9 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                 for (; c < ctx->n_cols; c++) {
                     switch (ctx->col_types[c]) {
                         case CSV_TYPE_BOOL: ((uint8_t*)ctx->col_data[c])[row] = 0; break;
+                        case CSV_TYPE_U8:   ((uint8_t*)ctx->col_data[c])[row] = 0; break;
+                        case CSV_TYPE_I16:  ((int16_t*)ctx->col_data[c])[row] = 0; break;
+                        case CSV_TYPE_I32:  ((int32_t*)ctx->col_data[c])[row] = 0; break;
                         case CSV_TYPE_I64:  ((int64_t*)ctx->col_data[c])[row] = 0; break;
                         case CSV_TYPE_F64:  ((double*)ctx->col_data[c])[row] = 0.0; break;
                         case CSV_TYPE_DATE: ((int32_t*)ctx->col_data[c])[row] = 0; break;
@@ -840,6 +849,36 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     bool is_null;
                     int64_t v = fast_i64(fld, flen, &is_null);
                     ((int64_t*)ctx->col_data[c])[row] = v;
+                    if (is_null) {
+                        ctx->col_nullmaps[c][row >> 3] |= (uint8_t)(1u << (row & 7));
+                        my_had_null[c] = true;
+                    }
+                    break;
+                }
+                case CSV_TYPE_U8: {
+                    bool is_null;
+                    int64_t v = fast_i64(fld, flen, &is_null);
+                    ((uint8_t*)ctx->col_data[c])[row] = (uint8_t)v;
+                    if (is_null) {
+                        ctx->col_nullmaps[c][row >> 3] |= (uint8_t)(1u << (row & 7));
+                        my_had_null[c] = true;
+                    }
+                    break;
+                }
+                case CSV_TYPE_I16: {
+                    bool is_null;
+                    int64_t v = fast_i64(fld, flen, &is_null);
+                    ((int16_t*)ctx->col_data[c])[row] = (int16_t)v;
+                    if (is_null) {
+                        ctx->col_nullmaps[c][row >> 3] |= (uint8_t)(1u << (row & 7));
+                        my_had_null[c] = true;
+                    }
+                    break;
+                }
+                case CSV_TYPE_I32: {
+                    bool is_null;
+                    int64_t v = fast_i64(fld, flen, &is_null);
+                    ((int32_t*)ctx->col_data[c])[row] = (int32_t)v;
                     if (is_null) {
                         ctx->col_nullmaps[c][row >> 3] |= (uint8_t)(1u << (row & 7));
                         my_had_null[c] = true;
@@ -953,6 +992,9 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
                 for (; c < n_cols; c++) {
                     switch (col_types[c]) {
                         case CSV_TYPE_BOOL: ((uint8_t*)col_data[c])[row] = 0; break;
+                        case CSV_TYPE_U8:   ((uint8_t*)col_data[c])[row] = 0; break;
+                        case CSV_TYPE_I16:  ((int16_t*)col_data[c])[row] = 0; break;
+                        case CSV_TYPE_I32:  ((int32_t*)col_data[c])[row] = 0; break;
                         case CSV_TYPE_I64:  ((int64_t*)col_data[c])[row] = 0; break;
                         case CSV_TYPE_F64:  ((double*)col_data[c])[row] = 0.0; break;
                         case CSV_TYPE_DATE: ((int32_t*)col_data[c])[row] = 0; break;
@@ -998,6 +1040,36 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
                     bool is_null;
                     int64_t v = fast_i64(fld, flen, &is_null);
                     ((int64_t*)col_data[c])[row] = v;
+                    if (is_null) {
+                        col_nullmaps[c][row >> 3] |= (uint8_t)(1u << (row & 7));
+                        col_had_null[c] = true;
+                    }
+                    break;
+                }
+                case CSV_TYPE_U8: {
+                    bool is_null;
+                    int64_t v = fast_i64(fld, flen, &is_null);
+                    ((uint8_t*)col_data[c])[row] = (uint8_t)v;
+                    if (is_null) {
+                        col_nullmaps[c][row >> 3] |= (uint8_t)(1u << (row & 7));
+                        col_had_null[c] = true;
+                    }
+                    break;
+                }
+                case CSV_TYPE_I16: {
+                    bool is_null;
+                    int64_t v = fast_i64(fld, flen, &is_null);
+                    ((int16_t*)col_data[c])[row] = (int16_t)v;
+                    if (is_null) {
+                        col_nullmaps[c][row >> 3] |= (uint8_t)(1u << (row & 7));
+                        col_had_null[c] = true;
+                    }
+                    break;
+                }
+                case CSV_TYPE_I32: {
+                    bool is_null;
+                    int64_t v = fast_i64(fld, flen, &is_null);
+                    ((int32_t*)col_data[c])[row] = (int32_t)v;
                     if (is_null) {
                         col_nullmaps[c][row >> 3] |= (uint8_t)(1u << (row & 7));
                         col_had_null[c] = true;
@@ -1298,6 +1370,9 @@ ray_t* ray_read_csv_opts(const char* path, char delimiter, bool header,
     for (int c = 0; c < ncols; c++) {
         switch (resolved_types[c]) {
             case RAY_BOOL:      parse_types[c] = CSV_TYPE_BOOL;      break;
+            case RAY_U8:        parse_types[c] = CSV_TYPE_U8;        break;
+            case RAY_I16:       parse_types[c] = CSV_TYPE_I16;       break;
+            case RAY_I32:       parse_types[c] = CSV_TYPE_I32;       break;
             case RAY_I64:       parse_types[c] = CSV_TYPE_I64;       break;
             case RAY_F64:       parse_types[c] = CSV_TYPE_F64;       break;
             case RAY_DATE:      parse_types[c] = CSV_TYPE_DATE;      break;
