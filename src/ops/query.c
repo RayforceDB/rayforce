@@ -2592,6 +2592,12 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                         && ict != RAY_DATE && ict != RAY_TIME
                         && ict != RAY_TIMESTAMP)
                         { n_other++; break; }
+                    /* Mirror mk_compile's null-rejection: the fused agg
+                     * kernels read raw payload, so a stored null sentinel
+                     * would corrupt SUM/MIN/MAX/AVG.  Keep these on the
+                     * unfused null-aware OP_GROUP path. */
+                    if (in_col->attrs & RAY_ATTR_HAS_NULLS)
+                        { n_other++; break; }
                 }
                 n_aggs_ok++;
             }
@@ -2620,6 +2626,13 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                         && kct != RAY_I16 && kct != RAY_I32 && kct != RAY_I64
                         && kct != RAY_DATE && kct != RAY_TIME
                         && kct != RAY_TIMESTAMP)
+                        { keys_ok = 0; break; }
+                    /* Mirror mk_compile's null-rejection: the composite
+                     * key compose treats every byte as part of the key,
+                     * so a null-sentinel collides with a row legitimately
+                     * holding the same bit pattern.  Fall back to
+                     * OP_GROUP, which buckets null keys separately. */
+                    if (kc->attrs & RAY_ATTR_HAS_NULLS)
                         { keys_ok = 0; break; }
                     total_bytes += ray_sym_elem_size(kct, kc->attrs);
                 }

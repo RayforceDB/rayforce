@@ -106,6 +106,54 @@ static int fp_op_from_1char(const char* op, size_t len) {
     return -1;
 }
 
+/* Return 1 when an atom of `atom_type` (negative-typed RAY_*) is a
+ * legal RHS for a comparison against a column of `col_type`.  The
+ * fused per-row compare reads raw bit patterns from the column and
+ * compares against an int64-decoded constant, so column ↔ atom must
+ * agree on units.  In particular, mixing temporal units (DATE days
+ * vs TIMESTAMP nanoseconds vs TIME microseconds) is rejected — let
+ * the unfused engine handle the implicit conversion.  Atom types
+ * here are the negative-typed (-RAY_*) atom encoding from values. */
+static int fp_atom_col_compatible(int8_t atom_type, int8_t col_type) {
+    switch (col_type) {
+    case RAY_SYM:
+        /* SYM compares against a symbol-id atom or a string literal
+         * (string is intern-resolved to a sym id at compile time). */
+        return atom_type == -RAY_SYM || atom_type == -RAY_STR;
+    case RAY_DATE:
+        return atom_type == -RAY_DATE;
+    case RAY_TIME:
+        return atom_type == -RAY_TIME;
+    case RAY_TIMESTAMP:
+        return atom_type == -RAY_TIMESTAMP;
+    case RAY_BOOL:
+    case RAY_U8:
+    case RAY_I16:
+    case RAY_I32:
+    case RAY_I64:
+        /* Any signed/unsigned integer literal; we still range-check
+         * cval against the column width to fold out-of-range. */
+        return atom_type == -RAY_BOOL || atom_type == -RAY_U8
+            || atom_type == -RAY_I16  || atom_type == -RAY_I32
+            || atom_type == -RAY_I64;
+    default:
+        return 0;
+    }
+}
+
+/* Reject columns the fused per-row compare can't read safely.
+ * Currently: any column carrying a non-empty nullmap (RAY_ATTR_HAS_NULLS).
+ * The fused evaluator reads raw payload bytes — for nullable columns it
+ * would compare the sentinel value rather than treating the slot as
+ * null, producing a different result from the unfused null-aware
+ * compare kernel.  Until fp_eval_cmp learns to skip nulls, gate fused
+ * off here at compile so the planner falls back transparently. */
+static int fp_col_supported(const ray_t* col) {
+    if (!col) return 0;
+    if (col->attrs & RAY_ATTR_HAS_NULLS) return 0;
+    return 1;
+}
+
 /* Is `expr` a phase-3 simple comparison form (op col const)?  Validates
  * that the column exists in `tbl` and that ordering ops only target
  * non-SYM columns.  Returns the FP_* code on success, or -1 on miss. */
@@ -129,7 +177,12 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
     if (!rhs || !ray_is_atom(rhs) || (rhs->attrs & RAY_ATTR_NAME))
         return -1;
 
-    /* Resolve column type to gate ordering ops. */
+    /* Resolve column type to gate ordering ops AND verify the column
+     * is fused-supported (no nulls, supported type) AND the constant's
+     * atom type is compatible with the column's storage class.  This
+     * mirrors fp_compile_cmp exactly so the planner gate and executor
+     * compile agree — divergence here means the executor returns
+     * `nyi` on shapes the planner thought were ok. */
     if (tbl) {
         ray_t* col = ray_table_get_col(tbl, lhs->i64);
         if (!col) return -1;
@@ -142,6 +195,8 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
             && ct != RAY_I16 && ct != RAY_I32 && ct != RAY_I64
             && ct != RAY_DATE && ct != RAY_TIME && ct != RAY_TIMESTAMP)
             return -1;
+        if (!fp_col_supported(col)) return -1;
+        if (!fp_atom_col_compatible(rhs->type, ct)) return -1;
     }
     return code;
 }
@@ -339,6 +394,16 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     if (col->type == RAY_SYM && (out->op == FP_LT || out->op == FP_LE ||
                                  out->op == FP_GT || out->op == FP_GE))
         return -1;
+    /* Reject nullable columns — fp_eval_cmp doesn't read the nullmap,
+     * so a comparison against a stored sentinel slot would diverge from
+     * the unfused null-aware kernel. */
+    if (!fp_col_supported(col)) return -1;
+
+    ray_t* cv = rext->literal;
+    /* Atom type ↔ column class compatibility — block mixed-temporal
+     * forms like `(== date_col timestamp_const)` whose raw-unit
+     * comparison is meaningless. */
+    if (!fp_atom_col_compatible(cv->type, col->type)) return -1;
 
     out->col_type  = col->type;
     out->col_attrs = col->attrs;
@@ -346,7 +411,6 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     out->col_base  = ray_data(col);
     out->col_len   = col->len;
 
-    ray_t* cv = rext->literal;
     if (out->col_type == RAY_SYM) {
         if (cv->type == -RAY_SYM) {
             out->cval = cv->i64;
@@ -360,7 +424,10 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         }
     } else {
         /* Numeric / temporal: decode the atom into an int64 via the same
-         * type-aware reader used elsewhere in the engine. */
+         * type-aware reader used elsewhere in the engine.  Atom type
+         * has already been validated against col_type by
+         * fp_atom_col_compatible above, so each branch knows the
+         * stored unit matches the column's. */
         switch (cv->type) {
         case -RAY_I64:       case -RAY_TIMESTAMP: out->cval = cv->i64;            break;
         case -RAY_I32:       case -RAY_DATE:
@@ -2400,6 +2467,12 @@ static int mk_compile(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
         ray_t* col = ray_table_get_col(tbl, iext->sym);
         if (!col) return -1;
         if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return -1;
+        /* Aggregate inputs cannot carry nulls — the per-row read in
+         * mk_state_init_row / mk_state_accum_row treats every slot as
+         * a real value, so a stored sentinel for null would corrupt
+         * SUM / MIN / MAX / AVG.  Bail to OP_GROUP, which has the
+         * null-aware aggregate kernels. */
+        if (col->attrs & RAY_ATTR_HAS_NULLS) return -1;
         int8_t ct = col->type;
         if (ct != RAY_BOOL && ct != RAY_U8 && ct != RAY_I16
             && ct != RAY_I32 && ct != RAY_I64
@@ -2427,6 +2500,12 @@ static int mk_compile(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
         ray_t* col = ray_table_get_col(tbl, kext->sym);
         if (!col) return -1;
         if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return -1;
+        /* Group keys cannot carry nulls — the composite key compose
+         * reads raw bytes into the int64 slot, so a sentinel value for
+         * null collides with a legitimate row that happens to hold the
+         * same bit pattern.  Bail to OP_GROUP, which groups null keys
+         * via a dedicated null bucket. */
+        if (col->attrs & RAY_ATTR_HAS_NULLS) return -1;
         uint8_t esz = ray_sym_elem_size(col->type, col->attrs);
         total_bytes += esz;
         if (total_bytes > 16) return -1;

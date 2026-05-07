@@ -1,0 +1,46 @@
+;; Parity tests for OP_FILTERED_GROUP / fused-top-K vs the unfused
+;; FILTER + GROUP / FILTER + SORT + TAKE paths.  Each query must
+;; produce the same answer with and without the fused planner gates
+;; enabled — the fused path is a performance optimisation, not a
+;; semantic change.  Bugs surfaced by an external review (see
+;; rayforce-performance-smell-review.md) all manifest as a fused
+;; result diverging from the unfused result; checking equality here
+;; catches regressions deterministically.
+
+;; Build a small table where every fused gate is exercised:
+;;
+;;   - U8 column with the value 44 — the "300 truncated to 44" bug
+;;     (constant truncation, finding #3) would falsely match this row
+;;     for `u8 == 300`.  After the range-fold fix, both paths produce
+;;     0 rows.
+;;
+;;   - I16 column with negative values — finding #4 bug would read
+;;     -1 as 65535.  After the signed read fix, SUM/MIN/MAX agree
+;;     with the unfused path.
+(set T (table [u8 i16 grp] (list (as 'U8 [0 1 44 2 0 1]) (as 'I16 [-1 -2 3 4 -5 6]) [0 0 0 1 1 1])))
+
+;; finding #3: out-of-range constant must fold consistently
+;; Both paths must return 0 rows for `u8 == 300` (300 is outside U8).
+(count (select {c: (count u8) from: T where: (== u8 300) by: grp})) -- 0
+(count (select {c: (count u8) from: T where: (!= u8 300) by: grp})) -- 2
+
+;; finding #4: signed I16 SUM must equal -1+-2+3+4+-5+6 = 5
+(sum (at (select {s: (sum i16) from: T where: (>= grp 0) by: grp}) 's)) -- 5
+
+;; finding #4: MIN must be -5 (negative), MAX must be 6
+(min (at (select {m: (min i16) from: T where: (>= grp 0) by: grp}) 'm)) -- -5
+(max (at (select {m: (max i16) from: T where: (>= grp 0) by: grp}) 'm)) -- 6
+
+;; ordering ops with out-of-range constants fold to all-true / all-false
+;; u8 < 300 is a tautology — every row passes (6 rows over 2 groups)
+(count (select {c: (count u8) from: T where: (< u8 300) by: grp})) -- 2
+;; u8 > 300 matches no row
+(count (select {c: (count u8) from: T where: (> u8 300) by: grp})) -- 0
+
+;; group-by-only no-WHERE shape stays on OP_GROUP (no fused gate
+;; accepts it) and remains correct
+(count (select {c: (count u8) from: T by: grp})) -- 2
+
+;; chained AND filter with cheap-vs-expensive ordering must produce
+;; the same result whether or not the planner reorders
+(count (select {c: (count u8) from: T where: (and (>= grp 0) (< i16 100) (!= u8 99)) by: grp})) -- 2
