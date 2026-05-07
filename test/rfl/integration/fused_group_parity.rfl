@@ -96,3 +96,53 @@
 (at (at (select {k: k v: v from: Tt where: (>= v 0) asc: k take: 3}) 'v) 0) -- 10
 (at (at (select {k: k v: v from: Tt where: (>= v 0) asc: k take: 3}) 'v) 1) -- 20
 (at (at (select {k: k v: v from: Tt where: (>= v 0) asc: k take: 3}) 'v) 2) -- 30
+
+;; ────────────── width-boundary constants (round-3 review) ─────────
+;; Each integer storage width has a representable range; constants
+;; outside that range must fold to all-true / all-false consistently
+;; with the unfused path.
+
+;; I16 range is [-32768, 32767].  I16 column with -1, sentinel-like
+;; values, and the boundary; comparisons against INT16_MAX+1 and
+;; INT16_MIN-1 must fold deterministically.
+(set Ti16 (table [v g] (list (as 'I16 [-32768 -1 0 1 32767]) [0 0 0 0 0])))
+;; v == 32768 (one past INT16_MAX) is unrepresentable ⇒ 0 rows
+(count (select {c: (count v) from: Ti16 where: (== v 32768) by: g})) -- 0
+;; v != 32768 is a tautology over all 5 rows
+(count (select {c: (count v) from: Ti16 where: (!= v 32768) by: g})) -- 1
+;; v < 32768 is also a tautology
+(count (select {c: (count v) from: Ti16 where: (< v 32768) by: g})) -- 1
+;; v > -32769 (one below INT16_MIN) is also a tautology
+(count (select {c: (count v) from: Ti16 where: (> v -32769) by: g})) -- 1
+;; v < -32768 matches no row (no value is smaller)
+(count (select {c: (count v) from: Ti16 where: (< v -32768) by: g})) -- 0
+
+;; I16 SUM with full range:  -32768 + -1 + 0 + 1 + 32767 = -1
+(sum (at (select {s: (sum v) from: Ti16 where: (>= g 0) by: g}) 's)) -- -1
+;; MIN, MAX preserve full range
+(min (at (select {m: (min v) from: Ti16 where: (>= g 0) by: g}) 'm)) -- -32768
+(max (at (select {m: (max v) from: Ti16 where: (>= g 0) by: g}) 'm)) -- 32767
+
+;; I32 boundaries — same pattern.  INT32_MAX = 2147483647.
+;; v32 = -2^31 + 0 + 2^31-1 = -1 across three rows.
+(set Ti32 (table [v g] (list (as 'I32 [-2147483648 0 2147483647]) [0 0 0])))
+(sum (at (select {s: (sum v) from: Ti32 where: (>= g 0) by: g}) 's)) -- -1
+;; v == INT32_MAX+1 (= 2147483648) folds to 0 — out-of-range for I32
+(count (select {c: (count v) from: Ti32 where: (== v 2147483648) by: g})) -- 0
+
+;; ────────────── multi-key composite with mixed widths ─────────────
+;; Composite key = i16 + i32 = 6 bytes (narrow path).  Negative i16
+;; values + non-zero i32 values must produce distinct buckets and
+;; correct per-bucket counts.
+(set Tk2 (table [k16 k32 c] (list (as 'I16 [-1 -1 1 1 -1]) (as 'I32 [100 100 200 200 100]) [10 20 30 40 50])))
+;; Distinct (k16, k32) pairs: (-1, 100) [3 rows], (1, 200) [2 rows].
+(count (select {n: (count c) from: Tk2 where: (>= c 0) by: {k16: k16 k32: k32}})) -- 2
+;; Sum of c grouped by (k16, k32) totalled = 10 + 20 + 30 + 40 + 50 = 150
+(sum (at (select {s: (sum c) from: Tk2 where: (>= c 0) by: {k16: k16 k32: k32}}) 's)) -- 150
+
+;; ────────────── Top-K with negative I32 sort key ─────────────────
+;; Stable top-3 by ascending v: smallest 3 are -100, -50, 0 (rows 0, 2, 4).
+(set Ttn (table [v p] (list (as 'I32 [-100 50 -50 75 0]) [1 2 3 4 5])))
+(at (at (select {v: v p: p from: Ttn where: (>= p 0) asc: v take: 3}) 'v) 0) -- -100
+(at (at (select {v: v p: p from: Ttn where: (>= p 0) asc: v take: 3}) 'v) 1) -- -50
+(at (at (select {v: v p: p from: Ttn where: (>= p 0) asc: v take: 3}) 'v) 2) -- 0
