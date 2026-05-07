@@ -521,8 +521,23 @@ int fp_compile_pred(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
  * materialising the 2-column [key, count] result table.
  * ──────────────────────────────────────────────────────────────────────── */
 
+/* Per-worker shard capacity bounds.  INIT_CAP is the initial allocation
+ * size; the shard grows by 2× whenever load factor exceeds 0.5.
+ * MAX_CAP bounds the per-shard memory: 64 M slots ≈ 1 GB at one int64
+ * key + state per slot (more for wide keys / multi-agg).  Group queries
+ * with cardinalities approaching MAX_CAP × n_workers will hit OOM at
+ * the shard grow and the fused exec returns oom; the OOM path triggers
+ * the unfused fallback. */
 #define FP_SHARD_INIT_CAP   1024ULL
-#define FP_SHARD_MAX_CAP    (1ULL << 26)   /* 64 M slots ≈ 1 GB per shard */
+#define FP_SHARD_MAX_CAP    (1ULL << 26)
+
+/* Crossover row count below which the parallel combine (3-pass radix
+ * scatter) loses to the serial walk because dispatch + scratch alloc
+ * cost dominate.  Determined empirically; set high enough that
+ * fixed-cost setup is amortised over enough work to pay back.  When
+ * total_local < this, mk_combine_parallel returns 0 and the caller
+ * runs the serial combine instead. */
+#define FP_COMBINE_PAR_MIN  50000
 
 typedef struct {
     int64_t* slots;       /* cap × 2 (occupied flag, key) */
@@ -858,7 +873,7 @@ static ray_t* fp_combine_and_materialize(fp_shard_t* shards, uint32_t nw,
      * Crossover at 50 K entries — below that, the serial walk has lower
      * overhead than the dispatch + scratch alloc cost. */
     ray_pool_t* cpool = ray_pool_get();
-    if (cpool && total_local >= 50000 &&
+    if (cpool && total_local >= FP_COMBINE_PAR_MIN &&
         ray_pool_total_workers(cpool) >= 2 && nw <= 256)
     {
         uint32_t cnw = ray_pool_total_workers(cpool);
@@ -2025,7 +2040,7 @@ static int mk_combine_parallel(mk_par_ctx_t* c, uint32_t nw,
     int64_t total_local = 0;
     for (uint32_t w = 0; w < nw; w++) total_local += shards[w].n_filled;
 
-    if (total_local < 50000) return 0;  /* not worth parallelising */
+    if (total_local < FP_COMBINE_PAR_MIN) return 0;  /* not worth parallelising */
 
     ray_pool_t* pool = ray_pool_get();
     if (!pool || ray_pool_total_workers(pool) < 2) return 0;

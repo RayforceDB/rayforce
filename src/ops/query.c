@@ -323,7 +323,7 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                 /* Bound K and the over-cardinality ratio: only useful
                  * when K is well under nrows.  Leave the take=full /
                  * negative-take cases to the existing path. */
-                if (k > 0 && k < nrows && k <= 8192) {
+                if (k > 0 && k < nrows && k <= FPK_MAX_K) {
                     /* Reject LIST columns — full path handles those. */
                     int has_list = 0;
                     int64_t ncols = ray_table_ncols(result);
@@ -2370,7 +2370,7 @@ ray_t* ray_select_fn(ray_t** args, int64_t n) {
                     (tv->type == -RAY_I64 || tv->type == -RAY_I32)) {
                     int64_t k = (tv->type == -RAY_I64) ? tv->i64 : tv->i32;
                     ray_release(tv);
-                    if (k > 0 && k <= 8192 && k < ray_table_nrows(tbl)) {
+                    if (k > 0 && k <= FPK_MAX_K && k < ray_table_nrows(tbl)) {
                         ray_t* res = ray_fused_topk_select(tbl, where_expr,
                                                            sort_key_syms,
                                                            sort_descs,

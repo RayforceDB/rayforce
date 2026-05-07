@@ -26,6 +26,14 @@
 
 #include "rayforce.h"
 
+/* Maximum K for the fused top-K path.  Bounded so the per-task and
+ * global merge buffers stay on stack: `int64_t global_idx[FPK_MAX_K]`
+ * is 64 KiB — large enough for typical OFFSET / LIMIT workloads but
+ * small enough not to overflow worker thread stacks (default 8 MiB).
+ * Queries with K > FPK_MAX_K fall through to the unfused
+ * FILTER + SORT + TAKE path which has no buffer-size constraint. */
+#define FPK_MAX_K 8192
+
 /* Predicate-shape probe — true when `where_expr` is one of the shapes
  * fused_topk handles (single comparison or AND of comparisons against
  * literal constants on flat columns).  Same vocabulary as fused_group's

@@ -235,7 +235,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
                              uint8_t n_out)
 {
     if (!tbl || tbl->type != RAY_TABLE || k <= 0 || n_out == 0) return NULL;
-    if (k > 8192) return NULL;
+    if (k > FPK_MAX_K) return NULL;
     if (n_sort_keys == 0 || n_sort_keys > FPK_MAX_KEYS) return NULL;
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0 || k >= nrows) return NULL;
@@ -306,8 +306,10 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         return NULL;
     }
 
-    /* Combine per-worker heaps into one global K-heap. */
-    int64_t global_idx[8192];
+    /* Combine per-worker heaps into one global K-heap.  Stack-resident
+     * to avoid an alloc on the hot combine path.  k <= FPK_MAX_K is
+     * enforced at function entry. */
+    int64_t global_idx[FPK_MAX_K];
     int32_t global_n = 0;
     for (uint32_t w = 0; w < nw; w++) {
         int32_t  hn   = ctx.heap_n[w];
