@@ -98,7 +98,20 @@ typedef struct {
 
 /* Compare two source rows by the multi-key sort spec.  Returns
  * "a is worse than b" sense: positive means evict-a-first in the
- * max-heap of K-best entries.  Short-circuits on first non-equal key. */
+ * max-heap of K-best entries.  Short-circuits on first non-equal key.
+ *
+ * Numeric/temporal narrow widths use sign-aware reads so a stored -1
+ * compares as -1 and not 65535 — same fix as the fused-group agg
+ * read.  Signed/unsigned matches the column class: BOOL/U8/SYM-id
+ * are unsigned; I16/I32/I64 and the temporals (DATE/TIME/TIMESTAMP)
+ * are signed.
+ *
+ * Final tie-break is by source row index ascending — produces a
+ * deterministic, source-order-preserving result that matches a
+ * stable sort of the surviving rows.  Without the tie-break, two
+ * runs of the same query against the same data could return
+ * different rows for ties because morsel scheduling between
+ * workers is non-deterministic. */
 static inline int fpk_cmp(const fpk_par_ctx_t* c, int64_t row_a, int64_t row_b) {
     if (RAY_UNLIKELY(row_a == row_b)) return 0;
     for (uint8_t k = 0; k < c->n_keys; k++) {
@@ -132,6 +145,16 @@ static inline int fpk_cmp(const fpk_par_ctx_t* c, int64_t row_a, int64_t row_b) 
         }
         if (cmp != 0) return ks->desc ? -cmp : cmp;
     }
+    /* All sort keys tie: break by source row index.  A stable sort
+     * preserves source order on ties — the prefix of K rows that
+     * survives is the K rows with the smallest original indices.
+     * In the max-heap of K best entries, the root holds the worst
+     * survivor (the one most likely to be evicted), so a row with
+     * a higher source index ranks worse than a row with a lower
+     * one.  Direction-independent: for both ASC and DESC top-K we
+     * want stable source-order semantics on ties. */
+    if (row_a > row_b) return  1;   /* a is worse — evict first */
+    if (row_a < row_b) return -1;
     return 0;
 }
 

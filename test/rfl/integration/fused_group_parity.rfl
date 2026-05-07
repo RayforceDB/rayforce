@@ -44,3 +44,55 @@
 ;; chained AND filter with cheap-vs-expensive ordering must produce
 ;; the same result whether or not the planner reorders
 (count (select {c: (count u8) from: T where: (and (>= grp 0) (< i16 100) (!= u8 99)) by: grp})) -- 2
+
+;; ────────────── nullable column gates (round-2 review) ──────────────
+;; A predicate column carrying a nullmap must NOT route through the
+;; fused per-row evaluator (which reads raw payload, not the null
+;; bits).  These queries are correctness-checked against the same
+;; data; a divergence between fused and unfused would surface here.
+(set Tn (table [v g] (list [1 2 0N 4 5] [0 0 1 1 1])))
+;; v = 1 ⇒ 1 row passes (the literal "1"; the null does NOT match)
+(count (select {c: (count v) from: Tn where: (== v 1) by: g})) -- 1
+;; v != 0 ⇒ 4 non-null rows pass (null compares false to anything)
+(count (select {c: (count v) from: Tn where: (!= v 0) by: g})) -- 2
+
+;; A nullable agg-input column must aggregate null-aware; a stored
+;; sentinel for the null would otherwise be summed as a real value.
+(sum (at (select {s: (sum v) from: Tn where: (>= g 0) by: g}) 's)) -- 12
+
+;; A nullable group key must bucket nulls separately, not mix them
+;; with rows holding the sentinel bit pattern.
+(set Tk (table [k v] (list [1 0N 1 0N 2] [10 20 30 40 50])))
+(count (select {c: (count v) from: Tk where: (>= v 0) by: k})) -- 3
+;; (groups: 1 → 2 rows, 2 → 1 row, null → 2 rows.  Three buckets.)
+
+;; ────────────── temporal mixing (round-2 review) ──────────────
+;; DATE col compared to a TIMESTAMP constant has different units
+;; (days vs nanoseconds).  The fused fast path now rejects this
+;; combination so the unfused engine handles the conversion.
+;; Construct a DATE col and verify a same-typed compare works.
+(set Td (table [d v] (list (as 'date [2013.07.01 2013.07.15 2013.07.31]) [1 2 3])))
+(count (select {c: (count v) from: Td where: (>= d 2013.07.10) by: d})) -- 2
+
+;; ────────────── fused top-K alias rejection (round-1 review) ──────
+;; An aliased projection (alias != source col) must NOT route
+;; through the fused top-K materialiser, which names columns after
+;; the source sym.  The unfused path emits the alias correctly.
+(set To (table [a b] (list [10 20 30 40 50] [1 2 3 4 5])))
+(at (at (select {alias: a from: To where: (>= b 0) asc: a take: 3}) 'alias) 0) -- 10
+;; The output column must be present under the alias and unchanged
+;; values — second sample row confirms ordering is correct too.
+(at (at (select {alias: a from: To where: (>= b 0) asc: a take: 3}) 'alias) 1) -- 20
+
+;; ────────────── top-K tie ordering (finding #9, round-3) ──────────
+;; When the sort key ties, a stable sort returns the K rows with
+;; the smallest source row index.  Source-order tie-break in the
+;; fused heap comparator must match this — without it, scheduling
+;; non-determinism in the worker pool could pick different rows
+;; per run.
+(set Tt (table [k v] (list [5 5 5 5 5 5] [10 20 30 40 50 60])))
+;; All sort keys equal — TAKE 3 must return the FIRST 3 source rows
+;; (v = 10, 20, 30) regardless of run.
+(at (at (select {k: k v: v from: Tt where: (>= v 0) asc: k take: 3}) 'v) 0) -- 10
+(at (at (select {k: k v: v from: Tt where: (>= v 0) asc: k take: 3}) 'v) 1) -- 20
+(at (at (select {k: k v: v from: Tt where: (>= v 0) asc: k take: 3}) 'v) 2) -- 30

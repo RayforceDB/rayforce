@@ -596,18 +596,32 @@ static bool csv_intern_strings(csv_strref_t** str_refs, int n_cols,
                                 uint8_t** col_nullmaps) {
     bool ok = true;
 
-    /* Empty TSV/CSV fields are flagged in the parse-time nullmap (see
-     * CSV_TYPE_STR branch of the parse loop) — that's correct for STR
-     * columns where the null/empty distinction matters, but for SYM
-     * columns it conflates with the "no value" sentinel and breaks the
-     * SQL-style `(!= col "")` filter (which never excludes nulls in the
-     * q/k value-vs-null comparison kernel).  Pre-intern "" once and
-     * remap null rows to that ID, clearing their null bit so the
-     * compare kernel takes the both-non-null branch.  Net effect: the
-     * CSV format's "field is empty" — which can't be distinguished from
-     * "field is missing" anyway — round-trips through Rayforce as the
-     * empty SYM, matching how DuckDB / Spark / polars treat the same
-     * input. */
+    /* CSV/TSV import policy for SYM columns:
+     *
+     *   default              empty fields → empty-symbol "" (RAY_ATTR_HAS_NULLS
+     *                         cleared once the nullmap is fully drained).
+     *                         This matches the row-level semantics used by
+     *                         DuckDB / Spark / polars for CSV imports — the
+     *                         file format itself can't distinguish "missing
+     *                         field" from "empty string", so we collapse
+     *                         them into a single deterministic value.
+     *
+     *   RAYFORCE_CSV_EMPTY_SYM_NULL=1
+     *                        empty fields → typed NULL (HAS_NULLS retained).
+     *                         Use when downstream code treats `(!= col "")`
+     *                         as "non-null and non-empty", or when the CSV
+     *                         was produced by a tool that uses an explicit
+     *                         empty-string token to mean "absent value".
+     *                         This was the pre-2026-05 behaviour.
+     *
+     * Round-trip warning: the SYM column type does not preserve a separate
+     * NULL sentinel — both branches end up with the same "" symbol on the
+     * value side; the only difference is whether the row's null bit is
+     * cleared.  See ROADMAP.md for the optional separate empty/null
+     * tracking proposal. */
+    const char* policy_env = getenv("RAYFORCE_CSV_EMPTY_SYM_NULL");
+    int empty_sym_keep_null = (policy_env && policy_env[0] == '1') ? 1 : 0;
+
     int64_t empty_sym_id = ray_sym_intern_prehashed(
         (uint32_t)ray_hash_bytes("", 0), "", 0);
     if (empty_sym_id < 0) empty_sym_id = 0;  /* fall back to old behavior on intern failure */
@@ -629,12 +643,20 @@ static bool csv_intern_strings(csv_strref_t** str_refs, int n_cols,
         for (int64_t r = 0; r < n_rows; r++) {
             if (nm && (nm[r >> 3] & (1u << (r & 7)))) {
                 ids[r] = (uint32_t)empty_sym_id;
-                /* Clear the null bit — this row now holds a real value
-                 * (the empty SYM).  Without this clear, fmt_raw_elem
-                 * still prints "0Ns" and ray_eq_fn still routes through
-                 * the null-vs-non-null branch (returning false for
-                 * `== ""` and true for `!= ""`). */
-                nm[r >> 3] &= (uint8_t)~(1u << (r & 7));
+                if (!empty_sym_keep_null) {
+                    /* Default policy: clear the null bit — this row now
+                     * holds a real value (the empty SYM).  Without this
+                     * clear, fmt_raw_elem still prints "0Ns" and
+                     * ray_eq_fn still routes through the null-vs-non-
+                     * null branch (returning false for `== ""` and true
+                     * for `!= ""`). */
+                    nm[r >> 3] &= (uint8_t)~(1u << (r & 7));
+                }
+                /* RAYFORCE_CSV_EMPTY_SYM_NULL=1 path: keep the bit set,
+                 * so the column stays nullable and downstream null-
+                 * aware kernels treat the row as missing.  We still
+                 * write the empty-sym ID so the value side has a
+                 * deterministic placeholder. */
                 continue;
             }
             uint32_t hash = (uint32_t)ray_hash_bytes(refs[r].ptr, refs[r].len);

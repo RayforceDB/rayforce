@@ -2573,6 +2573,32 @@ static ray_t* exec_filtered_group_multi(ray_graph_t* g, ray_op_ext_t* ext,
 
 /* ─── Public entry: dispatcher ──────────────────────────────────────── */
 
+/* Graceful fallback: build a freshly-constructed FILTER + GROUP
+ * subgraph from the inputs already on the fused node and execute it
+ * via the regular DAG path.  Defense-in-depth — the planner gate
+ * should be tight enough that the fused exec never sees an
+ * unsupported shape, but if a future change introduces a divergence
+ * we degrade to a slower-but-correct result instead of surfacing a
+ * user-visible "nyi" error.
+ *
+ * The original predicate / keys / agg-input ops are still present in
+ * the graph (we don't tear down the OP_FILTERED_GROUP node), so the
+ * unfused subgraph just references them. */
+static ray_t* exec_filtered_group_fallback(ray_graph_t* g, ray_op_ext_t* ext) {
+    if (!g || !ext) return ray_error("nyi", NULL);
+    ray_op_t* root = ray_const_table(g, g->table);
+    if (!root) return ray_error("oom", NULL);
+    ray_op_t* pred = ext->base.inputs[0];
+    if (pred) {
+        root = ray_filter(g, root, pred);
+        if (!root) return ray_error("oom", NULL);
+    }
+    root = ray_group(g, ext->keys, ext->n_keys,
+                     ext->agg_ops, ext->agg_ins, ext->n_aggs);
+    if (!root) return ray_error("oom", NULL);
+    return ray_execute(g, root);
+}
+
 ray_t* exec_filtered_group(ray_graph_t* g, ray_op_t* op) {
     if (!g || !op) return ray_error("nyi", NULL);
     ray_t* tbl = g->table;
@@ -2581,11 +2607,23 @@ ray_t* exec_filtered_group(ray_graph_t* g, ray_op_t* op) {
     if (!ext) return ray_error("nyi", NULL);
 
     /* count1 fast path: single key, single OP_COUNT.  Unchanged from
-     * Phase 3 — guarantees zero regression on Q8/Q37/Q38/Q43. */
+     * Phase 3 — guarantees zero regression on Q8/Q37/Q38/Q43.
+     * If the fused exec rejects the shape (planner / executor gate
+     * divergence), fall back to the unfused FILTER + GROUP subgraph. */
+    ray_t* res;
     if (ext->n_keys == 1 && ext->n_aggs == 1
         && ext->agg_ops[0] == OP_COUNT)
-        return exec_filtered_group_count1(g, ext, tbl);
-
-    /* Multi-agg or multi-key path — separate ctx, separate worker fn. */
-    return exec_filtered_group_multi(g, ext, tbl);
+    {
+        res = exec_filtered_group_count1(g, ext, tbl);
+    } else {
+        res = exec_filtered_group_multi(g, ext, tbl);
+    }
+    if (res && RAY_IS_ERR(res)) {
+        const char* code = ray_err_code(res);
+        if (code && strcmp(code, "nyi") == 0) {
+            ray_release(res);
+            return exec_filtered_group_fallback(g, ext);
+        }
+    }
+    return res;
 }
