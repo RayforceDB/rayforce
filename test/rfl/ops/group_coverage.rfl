@@ -892,3 +892,174 @@
 ;; var_pop(v*1): L3832 case OP_VAR_POP
 (set Rhtf_vp (select {vp: (var_pop (* v 1.0)) from: Thtf by: g}))
 (count Rhtf_vp) -- 3
+
+;; ────────────── 75. SYM reduction with selection + nulls (group.c L144-176) ──────────────
+;; reduce_range's SYM branch (group.c L130-179) has 4 sub-paths:
+;;   !has_nulls && !idx     : already covered (large SYM agg sans where:)
+;;   !has_nulls &&  idx     : SYM agg with where: clause (selection only)
+;;    has_nulls && !idx     : SYM agg without where: but column has nulls
+;;    has_nulls &&  idx     : SYM agg WITH where: AND nulls in column (L165-176)
+;;
+;; The combined-null+selection arm (L165-176) is the deepest uncovered.
+;; Trigger via scalar agg (no by:) on a SYM column carrying ' (null sym)
+;; with a where: filter so g->selection is installed and exec_reduction
+;; routes through reduce_range with sel_idx != NULL.
+;; Use a literal SYM vector with nulls; min on SYM walks through L165-176.
+(set Tsymsel (table [s v] (list ['a 'b 'c 'a 'b ' 'c 'a 'b 'c] [0 1 2 3 4 5 6 7 8 9])))
+;; Without where: — has_nulls=true, idx=NULL → L154-164 branch
+(at (at (select {c: (count s) from: Tsymsel}) 'c) 0) -- 10
+;; With where: — has_nulls=true, idx!=NULL → L165-176 branch (deepest)
+(at (at (select {c: (count s) from: Tsymsel where: (< v 8)}) 'c) 0) -- 8
+;; SYM count via selection that includes the null row
+(at (at (select {c: (count s) from: Tsymsel where: (>= v 5)}) 'c) 0) -- 5
+
+;; Sized just below parallel threshold to keep the sequential reduce_range
+;; path with sel_idx; covers the !has_nulls && idx branch L143-153.
+(set Tsymsel2 (table [s v] (list (take ['p 'q 'r] 1000) (til 1000))))
+(at (at (select {c: (count s) from: Tsymsel2 where: (< v 500)}) 'c) 0) -- 500
+(at (at (select {c: (count s) from: Tsymsel2 where: (>= v 700)}) 'c) 0) -- 300
+
+;; Larger SYM column with nulls AND where: — exercises parallel reduce
+;; with sel_idx + has_nulls (groups.c L154/L165 but in parallel via
+;; par_reduce_fn).  Use 70k rows to cross RAY_PARALLEL_THRESHOLD.
+(set Nlsel 70000)
+(set Tslsel (table [s v] (list (take ['x 'y 'z '] Nlsel) (til Nlsel))))
+;; count(s) where v<10000 — selection-aware reduction on SYM with nulls.
+(at (at (select {c: (count s) from: Tslsel where: (< v 10000)}) 'c) 0) -- 10000
+(at (at (select {c: (count s) from: Tslsel where: (>= v 60000)}) 'c) 0) -- 10000
+
+;; ────────────── 76. DA-path F64 affine SUM (group.c L2326) ──────────────
+;; Section 28 covered I64 affine SUM emit at L2365.  Line 2326
+;; (`v += affine[a].bias_f64 * counts[gi]` for F64 SUM) needs a
+;; DA-path group-by with F64 agg input + affine bias.  Use a narrow-int
+;; key (DA-eligible) and a F64 agg column for sum(f + const).
+(set TafF (table [g f] (list ['a 'b 'a 'b 'a 'b] (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0]))))
+;; Group 'a: f∈{1,3,5}, sum(f+10) = 9 + 30 = 39
+;; Group 'b: f∈{2,4,6}, sum(f+10) = 12 + 30 = 42
+(sum (at (select {s: (sum (+ f 10.0)) from: TafF by: g}) 's)) -- 81.0
+;; Verify count is 2 groups
+(count (select {s: (sum (+ f 10.0)) from: TafF by: g})) -- 2
+
+;; ────────────── 77. Scalar agg parallel: F64 affine sum + count combined ──────────────
+;; Parallel scalar path with F64 affine SUM: scalar_sum_f64_fn (or
+;; scalar_accum_fn for multi-agg) over (sum (+ f const)).
+(set Tafs (table [f] (list (as 'F64 (til 70000)))))
+;; sum(f+1) over til 70000 = sum(f) + 70000 = (70000*69999/2) + 70000 = 2449965000 + 70000
+(at (at (select {s: (sum (+ f 1.0)) from: Tafs}) 's) 0) -- 2450035000.0
+
+;; ────────────── 78. (chunk 8) FIRST/LAST + by: with I16/U8 KEY (DA path) ──────────────
+;; The narrow-int side is the GROUP KEY, with I64 agg input — exercises
+;; DA composite GID with esz=2/esz=1 keys + first/last accumulator.
+;; (Existing tests in section 30/32 don't combine the narrow-int key
+;; with first/last in the same select.)
+(set NkfI16 100)
+(set TkfI16 (table [k v] (list (as 'I16 (% (til NkfI16) 4)) (til NkfI16))))
+(count (select {fi: (first v) la: (last v) from: TkfI16 by: k})) -- 4
+;; group k=0 sees rows 0,4,8,...,96 → first=0, last=96
+;; group k=1 sees rows 1,5,9,...,97 → first=1, last=97
+;; ...; sum of firsts = 0+1+2+3 = 6; sum of lasts = 4*(NkfI16-4)+6 = 390
+(sum (at (select {fi: (first v) from: TkfI16 by: k}) 'fi)) -- 6
+(sum (at (select {la: (last v) from: TkfI16 by: k}) 'la)) -- 390
+
+;; U8 narrow-int KEY with FIRST/LAST + by: (DA path, esz=1)
+(set NkfU8 100)
+(set TkfU8 (table [k v] (list (as 'U8 (% (til NkfU8) 5)) (til NkfU8))))
+(count (select {fi: (first v) la: (last v) from: TkfU8 by: k})) -- 5
+(sum (at (select {fi: (first v) from: TkfU8 by: k}) 'fi)) -- 10
+(sum (at (select {la: (last v) from: TkfU8 by: k}) 'la)) -- 485
+
+;; ────────────── 79. Scalar narrow-int agg (no by) — BOOL/U8/I16 (chunk 7) ──────────────
+;; Scalar reduction on narrow-int columns; coverage of the read_col_i64
+;; dispatch in reduce_range's SYM/narrow paths.
+(set Tnar (table [b u s] (list (take [true false true false] 200) (as 'U8 (% (til 200) 17)) (as 'I16 (% (til 200) 30)))))
+;; sum on BOOL: counts true bits
+(at (at (select {sb: (sum b) from: Tnar}) 'sb) 0) -- 100
+;; sum on U8 — values 0..16 cycling.  200/17 = 11 full cycles (sum 11*136
+;; = 1496) + 13 leftover rows with values 0..12 (sum 78) → total 1574.
+(at (at (select {su: (sum u) from: Tnar}) 'su) 0) -- 1574
+;; min/max on U8 (U8 atoms format with 0x prefix; compare via type-cast)
+(at (at (select {mn: (min u) from: Tnar}) 'mn) 0) -- 0x00
+(at (at (select {mx: (max u) from: Tnar}) 'mx) 0) -- 0x10
+;; min/max on I16
+(at (at (select {mn: (min s) from: Tnar}) 'mn) 0) -- 0h
+(at (at (select {mx: (max s) from: Tnar}) 'mx) 0) -- 29h
+
+;; ────────────── 80. Scalar narrow agg parallel (>= 65k rows) ──────────────
+;; Parallel scalar reduction on narrow-int columns (esz=1, esz=2, esz=4).
+;; Drives the per-worker reduce_range with non-RAY_F64/RAY_I64 base type
+;; via DISPATCH_I in scalar_accum_fn.
+(set Nnar 70000)
+(set TnarP (table [b u h i] (list (take [true false] Nnar) (as 'U8 (% (til Nnar) 100)) (as 'I16 (% (til Nnar) 1000)) (as 'I32 (% (til Nnar) 10000)))))
+;; sum on BOOL parallel: 70000/2 = 35000 trues
+(at (at (select {sb: (sum b) from: TnarP}) 'sb) 0) -- 35000
+;; min/max on U8/I16/I32 in parallel (atom literals carry the typed
+;; suffix when promoted by min/max; compare with the matching literal)
+(at (at (select {mn: (min u) mx: (max u) from: TnarP}) 'mn) 0) -- 0x00
+(at (at (select {mn: (min u) mx: (max u) from: TnarP}) 'mx) 0) -- 0x63
+(at (at (select {mn: (min h) mx: (max h) from: TnarP}) 'mn) 0) -- 0h
+(at (at (select {mn: (min h) mx: (max h) from: TnarP}) 'mx) 0) -- 999h
+(at (at (select {mn: (min i) mx: (max i) from: TnarP}) 'mn) 0) -- 0i
+(at (at (select {mn: (min i) mx: (max i) from: TnarP}) 'mx) 0) -- 9999i
+
+;; ────────────── 81. Group-by narrow-int key with stat aggs (chunk 5 — DA path) ──────────────
+;; DA path n_slots small + narrow-int key + multiple stat aggs (sum,
+;; sumsq, count) — exercises the F64 emit branches for var/stddev with
+;; narrow-int agg input through DA accumulation.
+(set TdaN (table [k v] (list (as 'I16 (% (til 600) 30)) (% (til 600) 50))))
+(count (select {s: (sum v) v: (var v) sd: (stddev v) from: TdaN by: k})) -- 30
+;; Via U8 key: hits da_accum_fn / da_merge_fn arms with esz=1 keys
+(set TdaU (table [k v] (list (as 'U8 (% (til 600) 30)) (% (til 600) 50))))
+(count (select {s: (sum v) v: (var v) sd: (stddev v) from: TdaU by: k})) -- 30
+
+;; ────────────── 82. Per-group count(distinct) with low cardinality (≤50000 groups) ──────────────
+;; Routes through count_distinct_per_group_buf (query.c L1849), the
+;; cdpg_buf_par_fn parallel variant when n_groups ≥ 4.  Smaller scale
+;; than chunks 9/10 above so the buf path (not group.c's parallel) fires.
+(set Tcdb (table [g v] (list (% (til 1000) 10) (% (til 1000) 20))))
+(set Rcdb (select {n: (count (distinct v)) from: Tcdb by: g}))
+(count Rcdb) -- 10
+;; Group g sees rows {g, g+10, g+20, ..., g+990}; values are
+;; (g)%20, (g+10)%20, (g+20)%20=g%20, ...; with 100 rows per group and
+;; values cycling g%20 and (g+10)%20 → 2 distinct per group.
+(min (at Rcdb 'n)) -- 2
+(max (at Rcdb 'n)) -- 2
+
+;; ────────────── 83. Group HT grow/rehash mid-grouping ──────────────
+;; Force a rehash by exceeding the initial HT capacity.  Default initial
+;; capacity is around 1024 entries; using 4096 distinct keys with a
+;; non-DA-eligible key (F64) forces the HT path → group_ht_grow +
+;; group_ht_rehash (group.c L1482-1547).  Multi-agg drives the per-row
+;; HT probe so growth latency is amortised.
+(set Nrh 4096)
+(set Trh (table [k v] (list (as 'F64 (til Nrh)) (til Nrh))))
+(count (select {s: (sum v) c: (count v) from: Trh by: k})) -- Nrh
+(sum (at (select {s: (sum v) from: Trh by: k}) 's)) -- 8386560
+
+;; ────────────── 84. Empty/null group handling — agg input column is all-null ──────────────
+;; (chunk 6) When an agg input column has every row null, the
+;; insufficient-cnt path fires for every group → grp_set_null is called
+;; per group (group.c L1332/L2344) to mark NULL.
+(set Tnu (table [g v] (list ['x 'y 'x 'y] [0Nl 0Nl 0Nl 0Nl])))
+(count (select {s: (sum v) from: Tnu by: g})) -- 2
+;; sum of all-null grouped column: each group gets sum=0 (count==0 path).
+(sum (at (select {s: (sum v) from: Tnu by: g}) 's)) -- 0
+;; var/stddev with all-null group: result column has nulls or zeros.
+;; Test the count to verify the path runs; exact null-vs-zero depends
+;; on fast-path vs. full-eval — both are valid, both hit emit code.
+(count (select {v: (var v) sd: (stddev v) from: Tnu by: g})) -- 2
+
+;; Mixed-null agg input: one group has all nulls, another has values.
+(set Tnm (table [g v] (list ['a 'a 'b 'b] [0Nl 0Nl 1 2])))
+(count (select {s: (sum v) c: (count v) from: Tnm by: g})) -- 2
+;; group 'a: all nulls → sum=0; group 'b: sum=3
+(sum (at (select {s: (sum v) from: Tnm by: g}) 's)) -- 3
+
+;; ────────────── 85. Group HT growth on multi-key composite + F64 ──────────────
+;; F64 + I64 composite keys with cardinality > initial HT cap → forces
+;; both group_ht_grow (rows) and group_ht_rehash (slots) at scale.
+(set Nrh2 2000)
+(set Trh2 (table [a b v] (list (as 'F64 (til Nrh2)) (til Nrh2) (til Nrh2))))
+(count (select {s: (sum v) from: Trh2 by: [a b]})) -- Nrh2
+;; sum 0..1999 = 1999*2000/2
+(sum (at (select {s: (sum v) from: Trh2 by: [a b]}) 's)) -- 1999000
+

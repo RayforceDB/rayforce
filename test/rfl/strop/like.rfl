@@ -87,3 +87,88 @@
 (count (select {from: Tlike where: (like s "h*")})) -- 3
 (count (select {from: Tlike where: (like s "h?llo")})) -- 1
 (count (select {from: Tlike where: (like s "[hw]*")})) -- 4
+
+;; ────────────── chunk 7: glob compile shape branches ──────────────
+;; Each shape exercises a distinct dispatch case in ray_glob_match_compiled.
+(like "abc" "abc")        -- true   ;; SHAPE_EXACT
+(like "abc" "abd")        -- false  ;; SHAPE_EXACT mismatch
+(like "abcdef" "abc*")    -- true   ;; SHAPE_PREFIX hit
+(like "abx"    "abc*")    -- false  ;; SHAPE_PREFIX miss
+(like "abcdef" "*def")    -- true   ;; SHAPE_SUFFIX hit
+(like "abcdex" "*def")    -- false  ;; SHAPE_SUFFIX miss
+(like "fooBARbaz" "*BAR*") -- true  ;; SHAPE_CONTAINS hit (memmem)
+(like "foobaz"    "*BAR*") -- false ;; SHAPE_CONTAINS miss
+(like "anything" "*")     -- true   ;; SHAPE_ANY (lit_len==0, both stars)
+(like ""         "*")     -- true   ;; SHAPE_ANY empty input
+(like "a"        "**")    -- true   ;; SHAPE_NONE — interior '*' forces general matcher
+(like "abc"      "a*c")   -- true   ;; SHAPE_NONE — interior '*' forces general matcher
+(like "abc"      "a?c")   -- true   ;; SHAPE_NONE — '?' forces general matcher
+(like "abc"      "[a]bc") -- true   ;; SHAPE_NONE — '[' forces general matcher
+
+;; ────────────── chunk 8: match_class edge cases ──────────────
+;; Sole `-` in a class (must match literal '-').
+(like "a-z" "a[-]z")      -- true
+;; Embedded `]` first → literal ']' allowed (after optional '!').
+(like "a]b" "a[]]b")      -- true
+;; `[!]]` — negation with `]` immediately after.
+(like "a]b" "a[!]]b")     -- false
+(like "axb" "a[!]]b")     -- true
+;; Range plus single chars in same class.
+(like "k"   "[abck]")     -- true
+(like "z"   "[abck]")     -- false
+;; Hyphen at end of class (treated as literal).
+(like "a-" "a[a-]")       -- true
+;; Bracket class with literal special chars (escape via class).
+(like "*"  "[*]")         -- true
+(like "?"  "[?]")         -- true
+
+;; ────────────── chunk 9: ILIKE — case-insensitive eval-via-select ──────────────
+;; ILIKE is registered only as a DAG/query op; surface via select-where.
+(set Til (table [s] (list ["Apple" "BANANA" "cherry" "Apricot"])))
+(count (select {from: Til where: (ilike s "a*")}))     -- 2  ;; SHAPE_PREFIX, ci
+(count (select {from: Til where: (ilike s "*RY")}))    -- 1  ;; SHAPE_SUFFIX, ci
+(count (select {from: Til where: (ilike s "*an*")}))   -- 1  ;; SHAPE_CONTAINS, ci ("BANANA")
+(count (select {from: Til where: (ilike s "BANANA")})) -- 1  ;; SHAPE_EXACT, ci
+(count (select {from: Til where: (ilike s "?pple")}))  -- 1  ;; ?, ci
+(count (select {from: Til where: (ilike s "[a-z]*")})) -- 4  ;; class+star, all ci-fold to lower
+(count (select {from: Til where: (ilike s "[A-Z]pple")})) -- 1 ;; class range, ci
+
+;; ────────────── chunk 6: ILIKE on SYM column (dict-cache LUT) ──────────────
+;; exec_ilike SYM-vec branch (string.c:565-579): seen[]/lut[] short-circuits
+;; per-row matcher when sym_id repeats.
+(set TilS (table [s] (list ['Foo 'Bar 'foo 'BAR 'Baz])))
+(count (select {from: TilS where: (ilike s "foo")}))  -- 2  ;; 'Foo + 'foo
+(count (select {from: TilS where: (ilike s "bar")}))  -- 2  ;; 'Bar + 'BAR
+(count (select {from: TilS where: (ilike s "ba*")}))  -- 3  ;; 'Bar 'BAR 'Baz
+(count (select {from: TilS where: (ilike s "*OO")}))  -- 2  ;; suffix ci
+
+;; ────────────── chunk 3: rowsel-aware exec_like (chained where+like) ──────────────
+;; exec_like with g->selection set by an earlier conjunct hits the
+;; selection-aware branch in like_seen_fn / like_proj_fn.
+;; Cheap conjunct (>) is sorted before LIKE, so by the time exec_like
+;; runs g->selection is a refined rowsel.
+(set Tcs (table [s v] (list ['Apple 'Banana 'Cherry 'Apricot 'Berry] [1 2 3 4 5])))
+(count (select {from: Tcs where: (and (> v 1) (like s "B*"))}))     -- 2  ;; v>1 then B*
+(count (select {from: Tcs where: (and (> v 0) (like s "*err*"))}))  -- 2  ;; 'Berry 'Cherry
+(count (select {from: Tcs where: (and (> v 0) (ilike s "*err*"))})) -- 2  ;; same — already lowercase err
+(count (select {from: Tcs where: (and (>= v 3) (like s "[BC]*"))})) -- 2  ;; class via rowsel-aware
+
+;; ────────────── chunk 4: ILIKE on STR vector (string.c:545-552) ──────────────
+;; STR-vec branch of exec_ilike — different from SYM-vec branch above.
+(set TilStr (table [s] (list ["Hello" "WORLD" "hi" "Help" "help"])))
+(count (select {from: TilStr where: (ilike s "h*")}))    -- 4  ;; ci prefix
+(count (select {from: TilStr where: (ilike s "*P")}))    -- 2  ;; ci suffix ("Help","help")
+(count (select {from: TilStr where: (ilike s "*ELL*")})) -- 1  ;; ci contains ("Hello")
+(count (select {from: TilStr where: (ilike s "WORLD")})) -- 1  ;; ci exact
+(count (select {from: TilStr where: (ilike s "h?")}))    -- 1  ;; ci '?' — only "hi"
+(count (select {from: TilStr where: (ilike s "[h-w]*")})) -- 5 ;; ci class range
+
+;; ────────────── empty-input matches against shapes ──────────────
+;; SHAPE_PREFIX/SUFFIX/CONTAINS with literal — empty input fails when lit_len>0.
+(like "" "abc")   -- false   ;; SHAPE_EXACT, sn=0 vs lit_len=3
+(like "" "a*")    -- false   ;; SHAPE_PREFIX, sn=0 < lit_len
+(like "" "*a")    -- false   ;; SHAPE_SUFFIX, sn=0 < lit_len
+(like "" "*a*")   -- false   ;; SHAPE_CONTAINS, sn=0 < lit_len
+
+;; SHAPE_PREFIX with empty lit ("`*`" alone is SHAPE_ANY, not PREFIX, so use trailing only)
+;; — covered by `(like "" "*")` above (SHAPE_ANY).

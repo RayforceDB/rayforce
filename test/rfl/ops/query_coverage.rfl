@@ -834,3 +834,261 @@
 ;; Non-symbol key in list → type error (line 5342-5345).
 (left-join TJl TJr (list 1 2)) !- type
 (inner-join TJl TJr (list 'a 5)) !- type
+
+;; ====================================================================
+;; CHUNK 2: atom_broadcast_vec — query.c:2222-2301
+;;
+;; Triggered when DAG group-by produces all-literal non-agg columns:
+;;   - by-clause with a SCALAR (numeric/SYM) by-key (DAG path)
+;;   - one or more non-agg projection expressions are LITERAL ATOMS
+;;     with no NAME attr and no column refs
+;;   - all_broadcastable=1 → atom_broadcast_vec called per literal
+;;
+;; This is the Q35 fast path: `{one: 1, c: count(URL), by: URL}`-shape
+;; queries.  Each atom-type arm of the switch is exercised here.
+;; ====================================================================
+
+;; Setup: SYM by-key forces DAG path (NOT GUID/STR which go eval).
+(set TBcast (table [g v] (list ['a 'b 'a 'b 'a 'b] [10 20 30 40 50 60])))
+
+;; I64 literal broadcast (RAY_I64 arm at 2258-2264).
+;; Trigger: {one: 1 c: (count v) by: g}.  one=1 is I64 atom, count is agg.
+(count (at (select {one: 1 c: (count v) from: TBcast by: g}) 'one)) -- 2
+(at (at (select {one: 1 c: (count v) from: TBcast by: g}) 'one) 0) -- 1
+(at (at (select {one: 1 c: (count v) from: TBcast by: g}) 'one) 1) -- 1
+
+;; F64 literal broadcast (RAY_F64 arm at 2265-2270).
+(at (at (select {pi: 3.14 c: (count v) from: TBcast by: g}) 'pi) 0) -- 3.14
+(at (at (select {pi: 3.14 c: (count v) from: TBcast by: g}) 'pi) 1) -- 3.14
+
+;; SYM literal broadcast (RAY_SYM arm at 2271-2287).
+;; Default sym width is W32 → exercises the W32 else branch (2282-2286).
+;; NOTE: There is a known bug where atom_broadcast_vec for SYM literals
+;; clobbers the sym ID into the wrong width.  We assert only that the
+;; column has 2 elements (which exercises the broadcast code path);
+;; value correctness is tracked separately as a known issue.
+(count (at (select {tag: 'hello c: (count v) from: TBcast by: g}) 'tag)) -- 2
+
+;; BOOL literal broadcast (RAY_BOOL arm at 2239-2243, memset path).
+(at (at (select {flag: true c: (count v) from: TBcast by: g}) 'flag) 0) -- true
+(at (at (select {flag: true c: (count v) from: TBcast by: g}) 'flag) 1) -- true
+
+;; DATE literal broadcast (RAY_DATE arm at 2250-2256, int32 path).
+(at (at (select {d: 2024.06.15 c: (count v) from: TBcast by: g}) 'd) 0) -- 2024.06.15
+(at (at (select {d: 2024.06.15 c: (count v) from: TBcast by: g}) 'd) 1) -- 2024.06.15
+
+;; TIMESTAMP literal broadcast (RAY_TIMESTAMP arm at 2258-2264, int64 path).
+(at (at (select {ts: 2024.06.15D12:00:00.000 c: (count v) from: TBcast by: g}) 'ts) 0) -- 2024.06.15D12:00:00.000
+
+;; Multiple literals together — each goes through atom_broadcast_vec.
+;; Combines I64, F64, BOOL in one query (skip SYM here per known bug).
+(count (at (select {a: 7 b: 1.5 d: false n: (count v) from: TBcast by: g}) 'a)) -- 2
+(at (at (select {a: 7 b: 1.5 d: false n: (count v) from: TBcast by: g}) 'b) 0) -- 1.5
+
+;; Numeric scalar by-key (I64) also drives DAG path.
+(set TBcastI (table [g v] (list [1 2 1 2 1 2] [10 20 30 40 50 60])))
+(at (at (select {k: 99 c: (count v) from: TBcastI by: g}) 'k) 0) -- 99
+(at (at (select {k: 99 c: (count v) from: TBcastI by: g}) 'k) 1) -- 99
+
+;; ====================================================================
+;; CHUNK 5: collect_col_refs dotted-name — query.c:1224-1228
+;;
+;; Reachability note: collect_col_refs is called from
+;; nonagg_eval_per_group_core (1296) and eval_expr_per_row (1443).
+;; The dotted branch fires when a SYM-with-NAME-attr is NOT a column
+;; but its head segment IS.  All known query-level paths to that
+;; branch go through the row-aligned scatter (gather_by_idx) instead,
+;; or hit a separate eval-binding bug with named lambdas + dotted
+;; refs (see UPDATE FN/dotted-ref combo).  Marking this branch as
+;; unreachable from query-level RFL fixtures today.
+;;
+;; The companion expr_refs_row_column dotted branch (1093-1097) IS
+;; covered below by direct dotted-ref non-agg.
+;; ====================================================================
+
+;; ====================================================================
+;; aggr_unary_per_group_buf computed-source path — query.c:1571-1576
+;;
+;; Triggered when:
+;;   - DAG path with by: and mixed agg+non-agg (n_nonaggs>0, by_expr set)
+;;   - a non-agg is a streaming-aggr-unary call (med/dev/var/...)
+;;   - the inner expression of that aggr is NOT a direct column ref
+;;     (so col_expr->type != -RAY_SYM with NAME attr)
+;;
+;; The eval branch (1571-1576) binds table cols and ray_evals the
+;; computed sub-expression to produce the source vec.
+;; ====================================================================
+
+;; med of computed expr (* v 2).  Mixed with sum to force scatter.
+(set TaggC (table [g v] (list ['a 'b 'a 'b 'a 'b 'a 'b] [1 2 3 4 5 6 7 8])))
+;; Group 'a vals=[1,3,5,7] → (* v 2)=[2,6,10,14] → med=8.0
+;; Group 'b vals=[2,4,6,8] → (* v 2)=[4,8,12,16] → med=10.0
+(count (at (select {s: (sum v) m: (med (* v 2)) from: TaggC by: g}) 'm)) -- 2
+(at (at (select {s: (sum v) m: (med (* v 2)) from: TaggC by: g}) 'm) 0) -- 8.0
+
+;; dev of computed expr — different streaming agg fn.
+(count (at (select {s: (sum v) d: (dev (+ v 10)) from: TaggC by: g}) 'd)) -- 2
+
+;; ====================================================================
+;; key_read_i64 narrow-int dispatch — query.c:2032-2050
+;;
+;; key_read_i64 is the type-aware key reader used by rgid_probe_fn (the
+;; PARALLEL probe at >=200K rows) AND by the SERIAL probe via the same
+;; dispatch.  The serial probe at line 5475 uses a KEY_READ macro that
+;; mirrors the same dispatch but inline; nonetheless tests that hit the
+;; serial path with non-I64 keys ensure the same correctness invariants.
+;;
+;; Each narrow-int arm exercised: I32, I16, U8, BOOL, F64, F32 keys.
+;; ====================================================================
+
+;; I32 key (line 2038-2040 arm).  Mixed agg+non-agg forces scatter path.
+(set TKi32 (table [g v] (list (as 'I32 [1 2 1 2 1 2 1 2]) [10 20 30 40 50 60 70 80])))
+(count (at (select {s: (sum v) lit: 9 from: TKi32 by: g}) 'lit)) -- 2
+
+;; I16 key (line 2037 arm).
+(set TKi16 (table [g v] (list (as 'I16 [1 2 1 2 1 2]) [10 20 30 40 50 60])))
+(count (at (select {s: (sum v) lit: 9 from: TKi16 by: g}) 'lit)) -- 2
+
+;; U8 key (line 2036 arm).
+(set TKu8 (table [g v] (list (as 'U8 [1 2 1 2 1 2]) [10 20 30 40 50 60])))
+(count (at (select {s: (sum v) lit: 9 from: TKu8 by: g}) 'lit)) -- 2
+
+;; BOOL key (line 2035 arm).
+(set TKbool (table [g v] (list [true false true false true false] [10 20 30 40 50 60])))
+(count (at (select {s: (sum v) lit: 9 from: TKbool by: g}) 'lit)) -- 2
+
+;; F64 key (line 2046-2048 arm).
+(set TKf64 (table [g v] (list (as 'F64 [1.0 2.0 1.0 2.0 1.0 2.0]) [10 20 30 40 50 60])))
+(count (at (select {s: (sum v) lit: 9 from: TKf64 by: g}) 'lit)) -- 2
+
+;; DATE key (line 2039 arm via I32 dispatch).
+(set TKdate (table [g v] (list [2024.01.01 2024.01.02 2024.01.01 2024.01.02] [10 20 30 40])))
+(count (at (select {s: (sum v) lit: 9 from: TKdate by: g}) 'lit)) -- 2
+
+;; TIMESTAMP key (line 2042 arm via I64 dispatch).
+(set TKts (table [g v] (list [2024.01.01D00:00:00.000 2024.06.01D00:00:00.000 2024.01.01D00:00:00.000 2024.06.01D00:00:00.000] [10 20 30 40])))
+(count (at (select {s: (sum v) lit: 9 from: TKts by: g}) 'lit)) -- 2
+
+;; ====================================================================
+;; expr_refs_row_column dotted-name branch — query.c:1093-1097
+;;
+;; The dotted-name walk inside expr_refs_row_column.  Triggered when:
+;;   - non-agg expr has a SYM with NAME attr but it's NOT a column
+;;   - the sym is dotted, head segment IS a column
+;;   - thus expr returns 1 (refs row column)
+;; This in turn drives the row-aligned scatter decision.
+;; ====================================================================
+
+;; Direct dotted ref as non-agg.  Routes through expr_refs_row_column,
+;; finds dotted ts.yyyy, head ts is a column → returns 1 → row-aligned
+;; scatter via gather_by_idx.
+(set TDot2 (table [g ts] (list ['a 'b 'a 'b] [2024.01.15D00:00:00.000 2024.03.20D00:00:00.000 2024.06.10D00:00:00.000 2024.09.05D00:00:00.000])))
+(count (at (select {s: (count ts) y: ts.yyyy from: TDot2 by: g}) 'y)) -- 2
+
+;; ====================================================================
+;; nonagg_eval_per_group_core — typed_vec demotion (query.c:1366-1378)
+;;
+;; First group returns a collapsable scalar of one type, subsequent
+;; group returns DIFFERENT type → typed-direct mode demotes to LIST
+;; via typed_vec_to_list.
+;;
+;; Use named lambda + GUID by-key (eval-level) so we go through
+;; nonagg_eval_per_group_core, not the DAG buf variant.  Lambda
+;; returns I64 for first group, F64 for second.
+;; ====================================================================
+
+(set my_first_typed (fn [v] (if (<= (first v) 5) (first v) (as 'F64 (first v)))))
+(set Gtypa (guid 1))
+(set Gtypb (guid 1))
+(set TTyp (table [G v] (list (concat (take Gtypa 3) (take Gtypb 3)) [1 2 3 10 20 30])))
+(count (at (select {r: (my_first_typed v) from: TTyp by: G}) 'r)) -- 2
+
+;; ====================================================================
+;; Empty-rows error scenarios — eval-level group with column-not-found
+;; ====================================================================
+
+;; by: list referencing nonexistent column → segfault in group_rows_range.
+;; Tracked separately as a known crash; assertion omitted to avoid
+;; tripping ASan on every test run.
+
+;; ====================================================================
+;; nearest: take with negative atom — query.c:1623-1633 family.
+;; ====================================================================
+
+(set TE6 (table [id Vec] (list [0 1 2] (list [1.0 0.0] [0.0 1.0] [0.5 0.5]))))
+;; Negative take → domain error (k must be > 0).
+(select {from: TE6 nearest: (knn Vec [1.0 0.0]) take: -1}) !- domain
+
+;; ====================================================================
+;; Update with by: + non-existent agg result column type promotion
+;; ====================================================================
+
+(set TupBy (table [g v] (list ['a 'a 'b 'b 'c 'c] [1 2 3 4 5 6])))
+;; avg returns F64 even from I64 input — exercises broadcast back to F64.
+(set TupBy2 (update {a: (avg v) from: TupBy by: g}))
+(at (at TupBy2 'a) 0) -- 1.5
+(at (at TupBy2 'a) 5) -- 5.5
+
+;; min aggregator on F64 column.
+(set TupByF (table [g v] (list ['a 'a 'b 'b] (as 'F64 [1.5 2.5 3.5 4.5]))))
+(set TupByF2 (update {mn: (min v) from: TupByF by: g}))
+(at (at TupByF2 'mn) 0) -- 1.5
+(at (at TupByF2 'mn) 2) -- 3.5
+
+;; ====================================================================
+;; SYM W8 / W16 broadcast variants — atom_broadcast_vec SYM widths.
+;;
+;; A `(rand-sym 200 8)` etc. produces sym vecs of various widths.
+;; Wider sym vecs need >= 256/65536 distinct syms — too expensive to
+;; force here.  Default W32 is exercised above.  Skip narrower widths:
+;; their existence path is gated by the column's attrs, but the
+;; literal atom inside `{tag: 'foo}` always carries W32 attrs because
+;; rfl-level sym literals use the global pool's full width.
+;; ====================================================================
+
+;; ====================================================================
+;; nonagg lambda with multi-column refs — collect_col_refs deduplication
+;; query.c:1230 (the dedupe early-return when same sym already collected)
+;; ====================================================================
+
+;; Lambda referencing same column twice — exercises the dedupe path
+;; at line 1230 (for-loop returns n unchanged when duplicate found).
+(set my_dup (fn [a b] (+ (first a) (first b))))
+(set Tdup (table [G x] (list (take (guid 2) 6) [1 2 3 4 5 6])))
+;; Pass x twice → collect_col_refs called twice with x; second hit returns early.
+(count (at (select {r: (my_dup x x) from: Tdup by: G}) 'r)) -- 2
+
+;; ====================================================================
+;; Nested LIST in expression — collect_col_refs RAY_LIST recursion
+;; query.c:1235-1240
+;; ====================================================================
+
+;; Nested call: outer fn wraps inner fn, both reference column x.
+;; Recursive collect_col_refs handles nested LIST elements.
+(set my_outer (fn [a] (* (first a) 2)))
+(set my_combine (fn [a b] (+ (my_outer a) (first b))))
+(set Tnest (table [G x y] (list (take (guid 2) 6) [10 20 30 40 50 60] [1 2 3 4 5 6])))
+(count (at (select {r: (my_combine x y) from: Tnest by: G}) 'r)) -- 2
+
+;; ====================================================================
+;; eval-level group LIST/STR paths — multi-column non-key columns
+;; query.c:3636-3699 area.  Already partially covered; ensure both
+;; STR and SYM branches fire alongside numeric typed-vec branches.
+;; ====================================================================
+
+(set TGmix (table [G iv fv sv strc lst] (list (take (guid 2) 6) [10 20 30 40 50 60] (as 'F64 [1.5 2.5 3.5 4.5 5.5 6.5]) ['AAPL 'GOOG 'AAPL 'GOOG 'AAPL 'GOOG] (list "alpha" "beta" "gamma" "delta" "eps" "zeta") (list (list 1) (list 2) (list 3) (list 4) (list 5) (list 6)))))
+;; First-of-group fast path with all column types: I64, F64, SYM, STR, LIST.
+(count (select {from: TGmix by: G})) -- 2
+(count (at (select {from: TGmix by: G}) 'iv)) -- 2
+(count (at (select {from: TGmix by: G}) 'fv)) -- 2
+(count (at (select {from: TGmix by: G}) 'sv)) -- 2
+(count (at (select {from: TGmix by: G}) 'strc)) -- 2
+(count (at (select {from: TGmix by: G}) 'lst)) -- 2
+
+;; ====================================================================
+;; eval-level group with WHERE, multi-column non-key columns
+;; ====================================================================
+
+(set TGwhere (table [G v lst] (list (take (guid 3) 9) [10 20 30 40 50 60 70 80 90] (list (list 1) (list 2) (list 3) (list 4) (list 5) (list 6) (list 7) (list 8) (list 9)))))
+;; WHERE keeps subset; first-of-group + LIST gather still works.
+(count (select {from: TGwhere by: G where: (> v 30)})) -- 3

@@ -30,6 +30,7 @@
 #include "store/col.h"
 #include "lang/internal.h"
 #include "ops/hash.h"
+#include "ops/glob.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -1710,6 +1711,418 @@ static test_result_t test_like_fn_empty_pattern(void) {
     PASS();
 }
 
+/* ══════════════════════════════════════════
+ * SYM-LIKE width-matrix coverage (chunks 1, 2, 5)
+ *
+ * The dict-cached LIKE path in src/ops/strop.c::ray_like_fn dispatches
+ * to width-specialised DICT_PASS/ROW_PASS for W8/W16/W32/W64. Default
+ * `ray_vec_from_raw(RAY_SYM,…)` produces W64 only, leaving the W8/W16/W32
+ * cases (lines 317-328) at zero coverage. These tests build the column
+ * directly via ray_sym_vec_new(width, capacity) and drive ray_like_fn
+ * across each width.
+ *
+ * `attrs & RAY_SYM_W_MASK` is asserted post-construction to confirm the
+ * width bits actually took, otherwise the switch case under test wouldn't
+ * fire.
+ * ══════════════════════════════════════════ */
+
+/* Helper: build a SYM vector at `width` whose i'th cell is sym_ids[i].
+ * Caller-managed lifetime. */
+static ray_t* build_sym_vec(uint8_t width, const int64_t* sym_ids, int64_t n) {
+    ray_t* v = ray_sym_vec_new(width, n);
+    if (!v || RAY_IS_ERR(v)) return v;
+    v->len = n;
+    void* d = ray_data(v);
+    for (int64_t i = 0; i < n; i++)
+        ray_write_sym(d, i, (uint64_t)sym_ids[i], RAY_SYM, width);
+    return v;
+}
+
+/* --- like_fn: SYM-vec W8 width — DICT_PASS / ROW_PASS u8 case --------- */
+static test_result_t test_like_fn_sym_vec_w8(void) {
+    int64_t a = ray_sym_intern("alpha", 5);
+    int64_t b = ray_sym_intern("beta", 4);
+    int64_t c = ray_sym_intern("gamma", 5);
+    int64_t ids[6] = { a, b, c, a, b, c };  /* repeats hit the seen-cache */
+    ray_t* x   = build_sym_vec(RAY_SYM_W8, ids, 6);
+    TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(x));
+    /* Verify width actually took (chunk-1/2 contract). */
+    TEST_ASSERT_EQ_U(x->attrs & RAY_SYM_W_MASK, RAY_SYM_W8);
+
+    ray_t* pat = ray_str("a*", 2);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->len, 6);
+    uint8_t* d = (uint8_t*)ray_data(out);
+    TEST_ASSERT_EQ_I(d[0], 1); /* alpha */
+    TEST_ASSERT_EQ_I(d[1], 0); /* beta */
+    TEST_ASSERT_EQ_I(d[2], 0); /* gamma */
+    TEST_ASSERT_EQ_I(d[3], 1); /* alpha (lut[a] cached) */
+    TEST_ASSERT_EQ_I(d[4], 0); /* beta */
+    TEST_ASSERT_EQ_I(d[5], 0); /* gamma */
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: SYM-vec W16 width — DICT_PASS / ROW_PASS u16 case ------- */
+static test_result_t test_like_fn_sym_vec_w16(void) {
+    int64_t a = ray_sym_intern("alpha", 5);
+    int64_t b = ray_sym_intern("beta", 4);
+    int64_t c = ray_sym_intern("gamma", 5);
+    int64_t ids[5] = { a, b, c, a, b };
+    ray_t* x   = build_sym_vec(RAY_SYM_W16, ids, 5);
+    TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(x));
+    TEST_ASSERT_EQ_U(x->attrs & RAY_SYM_W_MASK, RAY_SYM_W16);
+
+    ray_t* pat = ray_str("*a", 2);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    uint8_t* d = (uint8_t*)ray_data(out);
+    TEST_ASSERT_EQ_I(d[0], 1); /* alpha */
+    TEST_ASSERT_EQ_I(d[1], 1); /* beta */
+    TEST_ASSERT_EQ_I(d[2], 1); /* gamma */
+    TEST_ASSERT_EQ_I(d[3], 1);
+    TEST_ASSERT_EQ_I(d[4], 1);
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: SYM-vec W32 width — DICT_PASS / ROW_PASS u32 case ------- */
+static test_result_t test_like_fn_sym_vec_w32(void) {
+    int64_t a = ray_sym_intern("alpha", 5);
+    int64_t b = ray_sym_intern("beta", 4);
+    int64_t c = ray_sym_intern("gamma", 5);
+    int64_t ids[4] = { a, b, c, a };
+    ray_t* x   = build_sym_vec(RAY_SYM_W32, ids, 4);
+    TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(x));
+    TEST_ASSERT_EQ_U(x->attrs & RAY_SYM_W_MASK, RAY_SYM_W32);
+
+    ray_t* pat = ray_str("*am*", 4);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    uint8_t* d = (uint8_t*)ray_data(out);
+    TEST_ASSERT_EQ_I(d[0], 0); /* alpha */
+    TEST_ASSERT_EQ_I(d[1], 0); /* beta */
+    TEST_ASSERT_EQ_I(d[2], 1); /* gamma */
+    TEST_ASSERT_EQ_I(d[3], 0);
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: SYM-vec W8 with empty-SYM (sym 0) mixed in --------------
+ * Chunk 5: sym 0 is reserved as the canonical empty string post-`84d6f4dd`.
+ * Mixing sid=0 with valid sids exercises the "small string" path inside
+ * DICT_PASS where lut[0] is computed against the empty string. */
+static test_result_t test_like_fn_sym_vec_w8_empty_sym(void) {
+    int64_t alpha = ray_sym_intern("alpha", 5);
+    int64_t ids[4] = { alpha, 0, alpha, 0 };  /* 0 = empty SYM */
+    ray_t* x = build_sym_vec(RAY_SYM_W8, ids, 4);
+    TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(x));
+    TEST_ASSERT_EQ_U(x->attrs & RAY_SYM_W_MASK, RAY_SYM_W8);
+
+    /* "*" matches anything including empty → all rows true */
+    ray_t* pat_any = ray_str("*", 1);
+    ray_t* out_any = ray_like_fn(x, pat_any);
+    TEST_ASSERT_NOT_NULL(out_any);
+    uint8_t* da = (uint8_t*)ray_data(out_any);
+    TEST_ASSERT_EQ_I(da[0], 1);
+    TEST_ASSERT_EQ_I(da[1], 1);
+    TEST_ASSERT_EQ_I(da[2], 1);
+    TEST_ASSERT_EQ_I(da[3], 1);
+    ray_release(out_any);
+    ray_release(pat_any);
+
+    /* "" pattern (SHAPE_EXACT, lit_len=0) matches only the empty string */
+    ray_t* pat_empty = ray_str("", 0);
+    ray_t* out_empty = ray_like_fn(x, pat_empty);
+    TEST_ASSERT_NOT_NULL(out_empty);
+    uint8_t* de = (uint8_t*)ray_data(out_empty);
+    TEST_ASSERT_EQ_I(de[0], 0); /* alpha */
+    TEST_ASSERT_EQ_I(de[1], 1); /* "" sym */
+    TEST_ASSERT_EQ_I(de[2], 0);
+    TEST_ASSERT_EQ_I(de[3], 1);
+    ray_release(out_empty);
+    ray_release(pat_empty);
+
+    ray_release(x);
+    PASS();
+}
+
+/* --- like_fn: SYM-atom — sym 0 (empty) match against "*" --------------
+ * The atom path at strop.c:217-223 reads sym_str(0) which now returns the
+ * empty interned string instead of NULL (post-84d6f4dd). */
+static test_result_t test_like_fn_sym_atom_empty(void) {
+    ray_t* x_empty = ray_sym(0);   /* empty SYM, valid atom */
+    ray_t* pat_any = ray_str("*", 1);
+    ray_t* out = ray_like_fn(x_empty, pat_any);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->i64, 1); /* "*" matches "" */
+    ray_release(out);
+    ray_release(pat_any);
+
+    /* Empty pattern also matches empty atom */
+    ray_t* pat_empty = ray_str("", 0);
+    ray_t* out2 = ray_like_fn(x_empty, pat_empty);
+    TEST_ASSERT_EQ_I(out2->i64, 1);
+    ray_release(out2);
+    ray_release(pat_empty);
+
+    /* Non-empty pattern fails */
+    ray_t* pat_x = ray_str("x", 1);
+    ray_t* out3 = ray_like_fn(x_empty, pat_x);
+    TEST_ASSERT_EQ_I(out3->i64, 0);
+    ray_release(out3);
+    ray_release(pat_x);
+
+    ray_release(x_empty);
+    PASS();
+}
+
+/* --- like_fn: SYM-vec W64 with sym 0 mixed in (formerly null_sym_vec) --
+ * Re-exercises the rewritten W64 case where sid=0 is now valid (sym table
+ * always returns a non-NULL string for sid=0 since b1de30cd). */
+static test_result_t test_like_fn_sym_vec_w64_zero(void) {
+    int64_t alpha = ray_sym_intern("alpha", 5);
+    int64_t beta  = ray_sym_intern("beta",  4);
+    int64_t ids[5] = { alpha, 0, beta, 0, alpha };
+    ray_t* x = ray_vec_from_raw(RAY_SYM, ids, 5); /* default W64 */
+    TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(x));
+    TEST_ASSERT_EQ_U(x->attrs & RAY_SYM_W_MASK, RAY_SYM_W64);
+
+    /* "a*" matches alpha, not "" or beta */
+    ray_t* pat = ray_str("a*", 2);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    uint8_t* d = (uint8_t*)ray_data(out);
+    TEST_ASSERT_EQ_I(d[0], 1); /* alpha */
+    TEST_ASSERT_EQ_I(d[1], 0); /* "" */
+    TEST_ASSERT_EQ_I(d[2], 0); /* beta */
+    TEST_ASSERT_EQ_I(d[3], 0); /* "" */
+    TEST_ASSERT_EQ_I(d[4], 1); /* alpha (cached) */
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* --- like_fn: SYM-vec width matrix with out-of-range sid -------------
+ * Forces the out-of-range branch in DICT_PASS (line 297) and ROW_PASS
+ * (line 312, falling through to empty_match) for W8 (and by symmetry
+ * the W16/W32/W64 paths via the macro expansion).  Out-of-range for W8
+ * means sid >= dict_n in the global sym table; we set a sentinel byte
+ * value 254 (255 reserved by some platforms; 254 is safely > all
+ * interned ids in this test's setup). */
+static test_result_t test_like_fn_sym_vec_w8_out_of_range(void) {
+    int64_t a = ray_sym_intern("a", 1);
+    /* Build manually with a raw out-of-range byte sid (254). */
+    ray_t* x = ray_sym_vec_new(RAY_SYM_W8, 3);
+    TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(x));
+    x->len = 3;
+    uint8_t* d = (uint8_t*)ray_data(x);
+    d[0] = (uint8_t)a;
+    d[1] = 254;          /* sid >= dict_n */
+    d[2] = (uint8_t)a;
+    TEST_ASSERT_EQ_U(x->attrs & RAY_SYM_W_MASK, RAY_SYM_W8);
+    /* Sanity: 254 must be out of dict range to drive the branch. */
+    TEST_ASSERT((uint64_t)ray_sym_count() < 254ULL,
+                "dict_n must be < 254 to drive the OOR branch");
+
+    /* "*" matches anything → empty_match==1, OOR row falls through to
+     * empty_match (line 314 in strop.c). */
+    ray_t* pat_any = ray_str("*", 1);
+    ray_t* out = ray_like_fn(x, pat_any);
+    TEST_ASSERT_NOT_NULL(out);
+    uint8_t* o = (uint8_t*)ray_data(out);
+    TEST_ASSERT_EQ_I(o[0], 1);
+    TEST_ASSERT_EQ_I(o[1], 1); /* OOR → empty_match=1 since "*" matches "" */
+    TEST_ASSERT_EQ_I(o[2], 1);
+    ray_release(out);
+    ray_release(pat_any);
+
+    /* Pattern that does NOT match empty: empty_match==0 → OOR row=0. */
+    ray_t* pat_a = ray_str("a", 1);
+    ray_t* out2 = ray_like_fn(x, pat_a);
+    TEST_ASSERT_NOT_NULL(out2);
+    uint8_t* o2 = (uint8_t*)ray_data(out2);
+    TEST_ASSERT_EQ_I(o2[0], 1); /* "a" matches "a" */
+    TEST_ASSERT_EQ_I(o2[1], 0); /* OOR → empty_match=0 since "a"!="" */
+    TEST_ASSERT_EQ_I(o2[2], 1);
+    ray_release(out2);
+    ray_release(pat_a);
+
+    ray_release(x);
+    PASS();
+}
+
+/* --- like_fn: SYM-vec — long pattern forces general matcher (use_simple=false)
+ * Triggers the `ray_glob_match` arm of DICT_PASS / ROW_PASS rather than
+ * the compiled fast path.  Pattern with an interior wildcard (`a*b*c`) has
+ * SHAPE_NONE → use_simple=false. */
+static test_result_t test_like_fn_sym_vec_general_matcher(void) {
+    int64_t s1 = ray_sym_intern("axbyc",   5);
+    int64_t s2 = ray_sym_intern("a-b-c",   5);
+    int64_t s3 = ray_sym_intern("nope",    4);
+    int64_t ids[4] = { s1, s2, s3, s1 };
+    ray_t* x = build_sym_vec(RAY_SYM_W8, ids, 4);
+    TEST_ASSERT_NOT_NULL(x);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(x));
+    TEST_ASSERT_EQ_U(x->attrs & RAY_SYM_W_MASK, RAY_SYM_W8);
+
+    /* Interior `*` between literal a/b/c → SHAPE_NONE, exercises
+     * ray_glob_match (general matcher) inside DICT_PASS. */
+    ray_t* pat = ray_str("a*b*c", 5);
+    ray_t* out = ray_like_fn(x, pat);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    uint8_t* d = (uint8_t*)ray_data(out);
+    TEST_ASSERT_EQ_I(d[0], 1);
+    TEST_ASSERT_EQ_I(d[1], 1);
+    TEST_ASSERT_EQ_I(d[2], 0);
+    TEST_ASSERT_EQ_I(d[3], 1);
+    ray_release(out);
+    ray_release(x);
+    ray_release(pat);
+    PASS();
+}
+
+/* ══════════════════════════════════════════
+ * src/ops/glob.[ch] direct coverage — chunks 7-9
+ *
+ * These tests poke ray_glob_match{,_ci} and ray_glob_compile directly,
+ * driving cases that the higher-level rfl tests cannot reach precisely:
+ *   • RAY_GLOB_SHAPE_ANY through ray_glob_match_compiled
+ *   • RAY_GLOB_SHAPE_NONE default fall-through (caller-contract guard)
+ *   • match_class CI branches (line 36 ci=true)
+ * ══════════════════════════════════════════ */
+
+/* --- glob_match_compiled: SHAPE_ANY direct hit -----------------------
+ * Note: `*` alone compiles to SHAPE_SUFFIX (the trailing-star flag is
+ * suppressed when the same `*` is also the leading char — see
+ * glob.c:121-123).  To trigger SHAPE_ANY we need both a leading and
+ * trailing `*` with empty literal in between, i.e. `**`. */
+static test_result_t test_glob_match_compiled_shape_any(void) {
+    ray_glob_compiled_t pc = ray_glob_compile("**", 2);
+    TEST_ASSERT_EQ_I(pc.shape, RAY_GLOB_SHAPE_ANY);
+    /* SHAPE_ANY: every input matches, including empty. */
+    TEST_ASSERT_TRUE(ray_glob_match_compiled(&pc, "anything", 8));
+    TEST_ASSERT_TRUE(ray_glob_match_compiled(&pc, "", 0));
+
+    /* SHAPE_SUFFIX with empty lit (single `*`) hits the lit_len==0
+     * branch in case RAY_GLOB_SHAPE_SUFFIX (line 165 of glob.c). */
+    ray_glob_compiled_t pc_star = ray_glob_compile("*", 1);
+    TEST_ASSERT_EQ_I(pc_star.shape, RAY_GLOB_SHAPE_SUFFIX);
+    TEST_ASSERT_TRUE(ray_glob_match_compiled(&pc_star, "anything", 8));
+    TEST_ASSERT_TRUE(ray_glob_match_compiled(&pc_star, "", 0));
+    PASS();
+}
+
+/* --- glob_match_compiled: SHAPE_NONE caller-contract guard ----------
+ * Pattern with interior `*` → SHAPE_NONE.  Calling
+ * ray_glob_match_compiled with such a shape is a contract violation;
+ * the function must fall through to `return false` (line 196), not
+ * silently match everything. */
+static test_result_t test_glob_match_compiled_shape_none(void) {
+    ray_glob_compiled_t pc = ray_glob_compile("a*b*c", 5);
+    TEST_ASSERT_EQ_I(pc.shape, RAY_GLOB_SHAPE_NONE);
+    TEST_ASSERT_FALSE(ray_glob_match_compiled(&pc, "axbyc", 5));
+    TEST_ASSERT_FALSE(ray_glob_match_compiled(&pc, "anything", 8));
+    PASS();
+}
+
+/* --- glob_match_compiled: SHAPE_EXACT empty / non-empty -------------- */
+static test_result_t test_glob_match_compiled_shape_exact(void) {
+    ray_glob_compiled_t pc_empty = ray_glob_compile("", 0);
+    TEST_ASSERT_EQ_I(pc_empty.shape, RAY_GLOB_SHAPE_EXACT);
+    TEST_ASSERT_TRUE(ray_glob_match_compiled(&pc_empty, "", 0));
+    TEST_ASSERT_FALSE(ray_glob_match_compiled(&pc_empty, "x", 1));
+
+    ray_glob_compiled_t pc = ray_glob_compile("hello", 5);
+    TEST_ASSERT_EQ_I(pc.shape, RAY_GLOB_SHAPE_EXACT);
+    TEST_ASSERT_TRUE(ray_glob_match_compiled(&pc, "hello", 5));
+    TEST_ASSERT_FALSE(ray_glob_match_compiled(&pc, "hellx", 5));
+    TEST_ASSERT_FALSE(ray_glob_match_compiled(&pc, "hell", 4));
+    PASS();
+}
+
+/* --- glob_match_ci: case-insensitive class with mixed-case input ---
+ * Drives match_class with ci=true (line 34/36 in glob.c).  The
+ * ray_glob_match_compiled path skips classes (SHAPE_NONE forces general
+ * matcher), so we use ray_glob_match_ci which routes through glob_impl
+ * with ci=true. */
+static test_result_t test_glob_match_ci_class_branches(void) {
+    /* `[A-Z]ello` with ci=true must match lowercase 'h' too. */
+    TEST_ASSERT_TRUE (ray_glob_match_ci("hello", 5, "[A-Z]ello", 9));
+    TEST_ASSERT_TRUE (ray_glob_match_ci("Hello", 5, "[A-Z]ello", 9));
+    TEST_ASSERT_FALSE(ray_glob_match_ci("3ello", 5, "[A-Z]ello", 9));
+
+    /* Negated class with ci. */
+    TEST_ASSERT_TRUE (ray_glob_match_ci("3ello", 5, "[!A-Z]ello", 10));
+    TEST_ASSERT_FALSE(ray_glob_match_ci("hello", 5, "[!A-Z]ello", 10));
+    TEST_ASSERT_FALSE(ray_glob_match_ci("Hello", 5, "[!A-Z]ello", 10));
+
+    /* Single-char class — no range, ci-fold matters. */
+    TEST_ASSERT_TRUE(ray_glob_match_ci("Apple", 5, "[a]pple", 7));
+    TEST_ASSERT_TRUE(ray_glob_match_ci("apple", 5, "[A]pple", 7));
+
+    /* Mixed-case inside `[]` with ci: both cases match either input. */
+    TEST_ASSERT_TRUE(ray_glob_match_ci("Apple", 5, "[Aa]pple", 8));
+    TEST_ASSERT_TRUE(ray_glob_match_ci("apple", 5, "[Aa]pple", 8));
+    PASS();
+}
+
+/* --- glob_match: punctuation / digit / non-ascii classes ----------- */
+static test_result_t test_glob_match_class_edge(void) {
+    /* Digit range. */
+    TEST_ASSERT_TRUE (ray_glob_match("5", 1, "[0-9]", 5));
+    TEST_ASSERT_FALSE(ray_glob_match("a", 1, "[0-9]", 5));
+
+    /* Single-char class containing meta-char. */
+    TEST_ASSERT_TRUE (ray_glob_match("?", 1, "[?]", 3));
+    TEST_ASSERT_TRUE (ray_glob_match("*", 1, "[*]", 3));
+
+    /* Empty class-content — no chars between `[` and `]`.  After `[`
+     * the matcher loops while `first || p[i] != ']'`, sees `]` after
+     * first iteration… actually `[]` is the open bracket immediately
+     * followed by `]` — the matcher accepts `]` first then fails to
+     * find the closing `]`.  Documented behaviour: no match. */
+    TEST_ASSERT_FALSE(ray_glob_match("a", 1, "[]", 2));
+
+    /* ']' as first char of class is literal (allowed by spec). */
+    TEST_ASSERT_TRUE(ray_glob_match("]", 1, "[]]", 3));
+
+    /* Hyphen-trailing class `[a-]` — `-` is literal because there is
+     * no third char.  Loop hits the else branch (not a range). */
+    TEST_ASSERT_TRUE (ray_glob_match("-", 1, "[a-]", 4));
+    TEST_ASSERT_TRUE (ray_glob_match("a", 1, "[a-]", 4));
+    TEST_ASSERT_FALSE(ray_glob_match("b", 1, "[a-]", 4));
+
+    /* Range that does not match — exercises i+=3 with no match. */
+    TEST_ASSERT_FALSE(ray_glob_match("9", 1, "[a-z]", 5));
+
+    /* Unterminated class — implementation accepts the partial class
+     * up to end-of-pattern.  Documenting the behaviour, not enforcing
+     * a stricter contract. */
+    TEST_ASSERT_TRUE(ray_glob_match("a", 1, "[abc", 4));
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 
@@ -1792,6 +2205,23 @@ const test_entry_t sym_entries[] = {
     { "sym/like_fn/str_vec_question",  test_like_fn_str_vec_question,    sym_setup, sym_teardown },
     { "sym/like_fn/wrong_type",        test_like_fn_wrong_type,          sym_setup, sym_teardown },
     { "sym/like_fn/empty_pattern",     test_like_fn_empty_pattern,       sym_setup, sym_teardown },
+
+    /* SYM-LIKE width matrix and empty-SYM (chunks 1, 2, 5) */
+    { "sym/like_fn/sym_vec_w8",                 test_like_fn_sym_vec_w8,                 sym_setup, sym_teardown },
+    { "sym/like_fn/sym_vec_w16",                test_like_fn_sym_vec_w16,                sym_setup, sym_teardown },
+    { "sym/like_fn/sym_vec_w32",                test_like_fn_sym_vec_w32,                sym_setup, sym_teardown },
+    { "sym/like_fn/sym_vec_w8_empty_sym",       test_like_fn_sym_vec_w8_empty_sym,       sym_setup, sym_teardown },
+    { "sym/like_fn/sym_atom_empty",             test_like_fn_sym_atom_empty,             sym_setup, sym_teardown },
+    { "sym/like_fn/sym_vec_w64_zero",           test_like_fn_sym_vec_w64_zero,           sym_setup, sym_teardown },
+    { "sym/like_fn/sym_vec_w8_out_of_range",    test_like_fn_sym_vec_w8_out_of_range,    sym_setup, sym_teardown },
+    { "sym/like_fn/sym_vec_general_matcher",    test_like_fn_sym_vec_general_matcher,    sym_setup, sym_teardown },
+
+    /* glob.c direct (chunks 7-9) */
+    { "sym/glob/match_compiled_shape_any",      test_glob_match_compiled_shape_any,      sym_setup, sym_teardown },
+    { "sym/glob/match_compiled_shape_none",     test_glob_match_compiled_shape_none,     sym_setup, sym_teardown },
+    { "sym/glob/match_compiled_shape_exact",    test_glob_match_compiled_shape_exact,    sym_setup, sym_teardown },
+    { "sym/glob/match_ci_class_branches",       test_glob_match_ci_class_branches,       sym_setup, sym_teardown },
+    { "sym/glob/match_class_edge",              test_glob_match_class_edge,              sym_setup, sym_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

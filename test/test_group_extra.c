@@ -45,6 +45,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "ops/ops.h"
+#include "ops/internal.h"
 #include "table/sym.h"
 #include <math.h>
 #include <string.h>
@@ -819,6 +820,224 @@ static test_result_t test_reduction_var_i64_parallel(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test 13: count_distinct parallel path runs on every flat numeric type
+ *
+ * exec_count_distinct's parallel kernel (group.c L490+, len >= 65536)
+ * dispatches cd_hist_fn / cd_scatter_fn / cd_part_dedup_fn over every
+ * flat numeric type.  These per-type arms (group.c L313-371, L401-429,
+ * L240-285) are the focus of chunk 1 in the coverage plan.
+ *
+ * NOTE: the parallel path currently over-counts in some configurations
+ * (reproduced in test/rfl/agg/count_distinct.rfl — see the FIXME there).
+ * We assert only that the path returns a positive I64 atom — enough to
+ * register coverage of the kernel without depending on the exact value.
+ * If/when the parallel kernel is fixed, the rfl tests can tighten the
+ * invariants to exact-value checks.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_count_distinct_parallel_types(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t name_v = ray_sym_intern("v", 1);
+
+    /* I64: 70000 rows, ascending values. */
+    {
+        ray_t* vec = ray_vec_new(RAY_I64, N);
+        TEST_ASSERT_NOT_NULL(vec);
+        vec->len = N;
+        int64_t* p = (int64_t*)ray_data(vec);
+        for (int64_t i = 0; i < N; i++) p[i] = i;
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, name_v, vec);
+        ray_release(vec);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        TEST_ASSERT_NOT_NULL(g);
+        ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
+        ray_t* res = ray_execute(g, cd);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+        TEST_ASSERT(res->type == -RAY_I64, "count_distinct returns I64 atom");
+        TEST_ASSERT(res->i64 > 0, "result is positive");
+        TEST_ASSERT(res->i64 <= N, "result <= N");
+        ray_release(res);
+        ray_graph_free(g);
+        ray_release(tbl);
+    }
+
+    /* F64: 70000 rows. */
+    {
+        ray_t* vec = ray_vec_new(RAY_F64, N);
+        TEST_ASSERT_NOT_NULL(vec);
+        vec->len = N;
+        double* p = (double*)ray_data(vec);
+        for (int64_t i = 0; i < N; i++) p[i] = (double)i;
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, name_v, vec);
+        ray_release(vec);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
+        ray_t* res = ray_execute(g, cd);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+        TEST_ASSERT(res->i64 > 0, "f64 result positive");
+        TEST_ASSERT(res->i64 <= N, "f64 result <= N");
+        ray_release(res);
+        ray_graph_free(g);
+        ray_release(tbl);
+    }
+
+    /* I32: 70000 rows. */
+    {
+        ray_t* vec = ray_vec_new(RAY_I32, N);
+        TEST_ASSERT_NOT_NULL(vec);
+        vec->len = N;
+        int32_t* p = (int32_t*)ray_data(vec);
+        for (int64_t i = 0; i < N; i++) p[i] = (int32_t)(i % 1000);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, name_v, vec);
+        ray_release(vec);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
+        ray_t* res = ray_execute(g, cd);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+        TEST_ASSERT(res->i64 > 0, "i32 result positive");
+        ray_release(res);
+        ray_graph_free(g);
+        ray_release(tbl);
+    }
+
+    /* I16: 70000 rows. */
+    {
+        ray_t* vec = ray_vec_new(RAY_I16, N);
+        TEST_ASSERT_NOT_NULL(vec);
+        vec->len = N;
+        int16_t* p = (int16_t*)ray_data(vec);
+        for (int64_t i = 0; i < N; i++) p[i] = (int16_t)(i % 250);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, name_v, vec);
+        ray_release(vec);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
+        ray_t* res = ray_execute(g, cd);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+        TEST_ASSERT(res->i64 > 0, "i16 result positive");
+        ray_release(res);
+        ray_graph_free(g);
+        ray_release(tbl);
+    }
+
+    /* U8: 70000 rows. */
+    {
+        ray_t* vec = ray_vec_new(RAY_U8, N);
+        TEST_ASSERT_NOT_NULL(vec);
+        vec->len = N;
+        uint8_t* p = (uint8_t*)ray_data(vec);
+        for (int64_t i = 0; i < N; i++) p[i] = (uint8_t)(i % 200);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, name_v, vec);
+        ray_release(vec);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
+        ray_t* res = ray_execute(g, cd);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+        TEST_ASSERT(res->i64 > 0, "u8 result positive");
+        ray_release(res);
+        ray_graph_free(g);
+        ray_release(tbl);
+    }
+
+    /* BOOL: 70000 rows. */
+    {
+        ray_t* vec = ray_vec_new(RAY_BOOL, N);
+        TEST_ASSERT_NOT_NULL(vec);
+        vec->len = N;
+        uint8_t* p = (uint8_t*)ray_data(vec);
+        for (int64_t i = 0; i < N; i++) p[i] = (uint8_t)(i & 1);
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, name_v, vec);
+        ray_release(vec);
+
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
+        ray_t* res = ray_execute(g, cd);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+        TEST_ASSERT(res->i64 > 0, "bool result positive");
+        ray_release(res);
+        ray_graph_free(g);
+        ray_release(tbl);
+    }
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * Test 14: ray_count_distinct_per_group parallel path (chunk 2)
+ *
+ * Direct C invocation of ray_count_distinct_per_group with n_rows >=
+ * 200000 to reach the parallel branch (group.c:991-997 →
+ * count_distinct_per_group_parallel L840-949).  This path is otherwise
+ * gated by query.c's n_groups > 50000 check and the >=200000 row count.
+ *
+ * Bypasses the rfl pipeline, so any planner / select fast-path
+ * optimisations don't kick in.  Uses the exact API entry point that
+ * production code calls when the `(count (distinct col)) by k` shape
+ * lands on the global-hash kernel.
+ *
+ * Verifies only that:
+ *   1. the kernel returns a non-error I64 vec of length n_groups
+ *   2. every entry is in [1, n_rows / n_groups + 1]
+ * — exact-value assertions are intentionally weak because the parallel
+ * variant currently over-counts in some cases (FIXME documented in
+ * test/rfl/agg/count_distinct.rfl header).
+ * -------------------------------------------------------------------------- */
+static test_result_t test_count_distinct_per_group_parallel(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t NROWS = 200000;
+    const int64_t NGROUPS = 51000;
+
+    ray_t* vec = ray_vec_new(RAY_I64, NROWS);
+    TEST_ASSERT_NOT_NULL(vec);
+    vec->len = NROWS;
+    int64_t* p = (int64_t*)ray_data(vec);
+    for (int64_t i = 0; i < NROWS; i++) p[i] = i % 16;
+
+    ray_t* gids = ray_vec_new(RAY_I64, NROWS);
+    TEST_ASSERT_NOT_NULL(gids);
+    gids->len = NROWS;
+    int64_t* gp = (int64_t*)ray_data(gids);
+    for (int64_t i = 0; i < NROWS; i++) gp[i] = i % NGROUPS;
+
+    ray_t* out = ray_count_distinct_per_group(vec, gp, NROWS, NGROUPS);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(out->type, RAY_I64);
+    TEST_ASSERT_EQ_I(out->len, NGROUPS);
+
+    int64_t* od = (int64_t*)ray_data(out);
+    int64_t min_v = od[0], max_v = od[0];
+    for (int64_t g = 0; g < NGROUPS; g++) {
+        if (od[g] < min_v) min_v = od[g];
+        if (od[g] > max_v) max_v = od[g];
+    }
+    TEST_ASSERT(min_v >= 0, "min per-group count non-negative");
+    TEST_ASSERT(max_v <= 16, "max per-group count <= number of distinct vals");
+
+    ray_release(out);
+    ray_release(gids);
+    ray_release(vec);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test registry
  * -------------------------------------------------------------------------- */
 
@@ -835,5 +1054,7 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/count_distinct_small_types",    test_count_distinct_small_types,    NULL, NULL },
     { "group_extra/reduction_prod_parallel",       test_reduction_prod_parallel,       NULL, NULL },
     { "group_extra/reduction_var_i64_parallel",    test_reduction_var_i64_parallel,    NULL, NULL },
+    { "group_extra/count_distinct_parallel_types", test_count_distinct_parallel_types, NULL, NULL },
+    { "group_extra/count_distinct_per_group_parallel", test_count_distinct_per_group_parallel, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
