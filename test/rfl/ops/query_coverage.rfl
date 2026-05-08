@@ -861,13 +861,11 @@
 (at (at (select {pi: 3.14 c: (count v) from: TBcast by: g}) 'pi) 0) -- 3.14
 (at (at (select {pi: 3.14 c: (count v) from: TBcast by: g}) 'pi) 1) -- 3.14
 
-;; SYM literal broadcast (RAY_SYM arm at 2271-2287).
-;; Default sym width is W32 → exercises the W32 else branch (2282-2286).
-;; NOTE: There is a known bug where atom_broadcast_vec for SYM literals
-;; clobbers the sym ID into the wrong width.  We assert only that the
-;; column has 2 elements (which exercises the broadcast code path);
-;; value correctness is tracked separately as a known issue.
-(count (at (select {tag: 'hello c: (count v) from: TBcast by: g}) 'tag)) -- 2
+;; SYM literal broadcast (RAY_SYM arm at 2271-2293).
+;; Width is selected from the sym ID magnitude, not a->attrs (atom-built
+;; syms never set the width attr).  Verifies value, not just length.
+(at (at (select {tag: 'hello c: (count v) from: TBcast by: g}) 'tag) 0) -- 'hello
+(at (at (select {tag: 'hello c: (count v) from: TBcast by: g}) 'tag) 1) -- 'hello
 
 ;; BOOL literal broadcast (RAY_BOOL arm at 2239-2243, memset path).
 (at (at (select {flag: true c: (count v) from: TBcast by: g}) 'flag) 0) -- true
@@ -881,9 +879,9 @@
 (at (at (select {ts: 2024.06.15D12:00:00.000 c: (count v) from: TBcast by: g}) 'ts) 0) -- 2024.06.15D12:00:00.000
 
 ;; Multiple literals together — each goes through atom_broadcast_vec.
-;; Combines I64, F64, BOOL in one query (skip SYM here per known bug).
-(count (at (select {a: 7 b: 1.5 d: false n: (count v) from: TBcast by: g}) 'a)) -- 2
-(at (at (select {a: 7 b: 1.5 d: false n: (count v) from: TBcast by: g}) 'b) 0) -- 1.5
+(at (at (select {a: 7 b: 1.5 d: false s: 'mark n: (count v) from: TBcast by: g}) 'a) 0) -- 7
+(at (at (select {a: 7 b: 1.5 d: false s: 'mark n: (count v) from: TBcast by: g}) 'b) 0) -- 1.5
+(at (at (select {a: 7 b: 1.5 d: false s: 'mark n: (count v) from: TBcast by: g}) 's) 0) -- 'mark
 
 ;; Numeric scalar by-key (I64) also drives DAG path.
 (set TBcastI (table [g v] (list [1 2 1 2 1 2] [10 20 30 40 50 60])))

@@ -2224,10 +2224,20 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
     int8_t vec_type = (int8_t)(-a->type);
     if (vec_type <= 0) return NULL;
 
+    /* SYM atoms produced by ray_sym(id) carry no width attr (always 0 →
+     * W8), so we can't trust a->attrs when the id exceeds one byte.
+     * Pick the narrowest width that fits a->i64. */
+    uint8_t sym_w = 0;
+    if (vec_type == RAY_SYM) {
+        uint64_t id = (uint64_t)a->i64;
+        sym_w = id <= 0xFFu        ? RAY_SYM_W8
+              : id <= 0xFFFFu      ? RAY_SYM_W16
+              : id <= 0xFFFFFFFFu  ? RAY_SYM_W32
+                                   : RAY_SYM_W64;
+    }
     ray_t* v;
     if (vec_type == RAY_SYM) {
-        uint8_t w = (uint8_t)(a->attrs & RAY_SYM_W_MASK);
-        v = ray_sym_vec_new(w, n);
+        v = ray_sym_vec_new(sym_w, n);
     } else {
         v = ray_vec_new(vec_type, n);
     }
@@ -2269,19 +2279,21 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
         break;
     }
     case RAY_SYM: {
-        /* SYM stores the ID in `i64` regardless of width; truncate per
-         * the vector's width attribute.  Width came from the atom and
-         * was carried by ray_sym_vec_new above. */
-        uint8_t w = (uint8_t)(a->attrs & RAY_SYM_W_MASK);
-        if (w == RAY_SYM_W8) {
+        /* Width was selected above to fit a->i64, not read from a->attrs
+         * (atom-built syms never set the width attr). */
+        if (sym_w == RAY_SYM_W8) {
             memset(dst, (uint8_t)a->i64, (size_t)n);
-        } else if (w == RAY_SYM_W16) {
+        } else if (sym_w == RAY_SYM_W16) {
             uint16_t val = (uint16_t)a->i64;
             uint16_t* d = (uint16_t*)dst;
             for (int64_t i = 0; i < n; i++) d[i] = val;
-        } else { /* W32 — default */
+        } else if (sym_w == RAY_SYM_W32) {
             uint32_t val = (uint32_t)a->i64;
             uint32_t* d = (uint32_t*)dst;
+            for (int64_t i = 0; i < n; i++) d[i] = val;
+        } else { /* W64 */
+            int64_t val = a->i64;
+            int64_t* d = (int64_t*)dst;
             for (int64_t i = 0; i < n; i++) d[i] = val;
         }
         break;
