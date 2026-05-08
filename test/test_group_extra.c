@@ -824,15 +824,11 @@ static test_result_t test_reduction_var_i64_parallel(void) {
  *
  * exec_count_distinct's parallel kernel (group.c L490+, len >= 65536)
  * dispatches cd_hist_fn / cd_scatter_fn / cd_part_dedup_fn over every
- * flat numeric type.  These per-type arms (group.c L313-371, L401-429,
- * L240-285) are the focus of chunk 1 in the coverage plan.
+ * flat numeric type.  These per-type arms are the focus of chunk 1 in
+ * the coverage plan.
  *
- * NOTE: the parallel path currently over-counts in some configurations
- * (reproduced in test/rfl/agg/count_distinct.rfl — see the FIXME there).
- * We assert only that the path returns a positive I64 atom — enough to
- * register coverage of the kernel without depending on the exact value.
- * If/when the parallel kernel is fixed, the rfl tests can tighten the
- * invariants to exact-value checks.
+ * After the task-keyed cursor fix, exact distinct counts are stable
+ * across runs.
  * -------------------------------------------------------------------------- */
 static test_result_t test_count_distinct_parallel_types(void) {
     ray_heap_init();
@@ -840,7 +836,7 @@ static test_result_t test_count_distinct_parallel_types(void) {
 
     int64_t name_v = ray_sym_intern("v", 1);
 
-    /* I64: 70000 rows, ascending values. */
+    /* I64: 70000 rows, ascending values → 70000 distinct. */
     {
         ray_t* vec = ray_vec_new(RAY_I64, N);
         TEST_ASSERT_NOT_NULL(vec);
@@ -857,14 +853,13 @@ static test_result_t test_count_distinct_parallel_types(void) {
         ray_t* res = ray_execute(g, cd);
         TEST_ASSERT_FALSE(RAY_IS_ERR(res));
         TEST_ASSERT(res->type == -RAY_I64, "count_distinct returns I64 atom");
-        TEST_ASSERT(res->i64 > 0, "result is positive");
-        TEST_ASSERT(res->i64 <= N, "result <= N");
+        TEST_ASSERT_EQ_I(res->i64, N);
         ray_release(res);
         ray_graph_free(g);
         ray_release(tbl);
     }
 
-    /* F64: 70000 rows. */
+    /* F64: 70000 rows → 70000 distinct. */
     {
         ray_t* vec = ray_vec_new(RAY_F64, N);
         TEST_ASSERT_NOT_NULL(vec);
@@ -879,14 +874,13 @@ static test_result_t test_count_distinct_parallel_types(void) {
         ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
         ray_t* res = ray_execute(g, cd);
         TEST_ASSERT_FALSE(RAY_IS_ERR(res));
-        TEST_ASSERT(res->i64 > 0, "f64 result positive");
-        TEST_ASSERT(res->i64 <= N, "f64 result <= N");
+        TEST_ASSERT_EQ_I(res->i64, N);
         ray_release(res);
         ray_graph_free(g);
         ray_release(tbl);
     }
 
-    /* I32: 70000 rows. */
+    /* I32 mod 1000 → exactly 1000 distinct. */
     {
         ray_t* vec = ray_vec_new(RAY_I32, N);
         TEST_ASSERT_NOT_NULL(vec);
@@ -901,13 +895,13 @@ static test_result_t test_count_distinct_parallel_types(void) {
         ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
         ray_t* res = ray_execute(g, cd);
         TEST_ASSERT_FALSE(RAY_IS_ERR(res));
-        TEST_ASSERT(res->i64 > 0, "i32 result positive");
+        TEST_ASSERT_EQ_I(res->i64, 1000);
         ray_release(res);
         ray_graph_free(g);
         ray_release(tbl);
     }
 
-    /* I16: 70000 rows. */
+    /* I16 mod 250 → 250 distinct. */
     {
         ray_t* vec = ray_vec_new(RAY_I16, N);
         TEST_ASSERT_NOT_NULL(vec);
@@ -922,13 +916,13 @@ static test_result_t test_count_distinct_parallel_types(void) {
         ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
         ray_t* res = ray_execute(g, cd);
         TEST_ASSERT_FALSE(RAY_IS_ERR(res));
-        TEST_ASSERT(res->i64 > 0, "i16 result positive");
+        TEST_ASSERT_EQ_I(res->i64, 250);
         ray_release(res);
         ray_graph_free(g);
         ray_release(tbl);
     }
 
-    /* U8: 70000 rows. */
+    /* U8 mod 200 → 200 distinct. */
     {
         ray_t* vec = ray_vec_new(RAY_U8, N);
         TEST_ASSERT_NOT_NULL(vec);
@@ -943,13 +937,13 @@ static test_result_t test_count_distinct_parallel_types(void) {
         ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
         ray_t* res = ray_execute(g, cd);
         TEST_ASSERT_FALSE(RAY_IS_ERR(res));
-        TEST_ASSERT(res->i64 > 0, "u8 result positive");
+        TEST_ASSERT_EQ_I(res->i64, 200);
         ray_release(res);
         ray_graph_free(g);
         ray_release(tbl);
     }
 
-    /* BOOL: 70000 rows. */
+    /* BOOL alternating → exactly 2 distinct. */
     {
         ray_t* vec = ray_vec_new(RAY_BOOL, N);
         TEST_ASSERT_NOT_NULL(vec);
@@ -964,7 +958,7 @@ static test_result_t test_count_distinct_parallel_types(void) {
         ray_op_t* cd = ray_count_distinct(g, ray_scan(g, "v"));
         ray_t* res = ray_execute(g, cd);
         TEST_ASSERT_FALSE(RAY_IS_ERR(res));
-        TEST_ASSERT(res->i64 > 0, "bool result positive");
+        TEST_ASSERT_EQ_I(res->i64, 2);
         ray_release(res);
         ray_graph_free(g);
         ray_release(tbl);
@@ -988,12 +982,10 @@ static test_result_t test_count_distinct_parallel_types(void) {
  * production code calls when the `(count (distinct col)) by k` shape
  * lands on the global-hash kernel.
  *
- * Verifies only that:
- *   1. the kernel returns a non-error I64 vec of length n_groups
- *   2. every entry is in [1, n_rows / n_groups + 1]
- * — exact-value assertions are intentionally weak because the parallel
- * variant currently over-counts in some cases (FIXME documented in
- * test/rfl/agg/count_distinct.rfl header).
+ * Verifies that the kernel returns a non-error I64 vec of length
+ * n_groups and that every entry equals the expected per-group distinct
+ * count.  The 200000-row dataset uses gid = i % 51000 and val = i % 16,
+ * so each group sees ⌈200000/51000⌉ ≤ 4 rows and at most 4 distinct vals.
  * -------------------------------------------------------------------------- */
 static test_result_t test_count_distinct_per_group_parallel(void) {
     ray_heap_init();
@@ -1020,14 +1012,25 @@ static test_result_t test_count_distinct_per_group_parallel(void) {
     TEST_ASSERT_EQ_I(out->type, RAY_I64);
     TEST_ASSERT_EQ_I(out->len, NGROUPS);
 
+    /* Each group sees the values gid+0*51000, gid+1*51000, gid+2*51000, gid+3*51000
+     * filtered to NROWS — i.e. up to ⌈(NROWS-gid)/NGROUPS⌉ rows.  Within
+     * those rows the val column is i % 16, so the distinct count per
+     * group equals the number of distinct (i%16) values across the rows
+     * landed in that group. */
     int64_t* od = (int64_t*)ray_data(out);
-    int64_t min_v = od[0], max_v = od[0];
     for (int64_t g = 0; g < NGROUPS; g++) {
-        if (od[g] < min_v) min_v = od[g];
-        if (od[g] > max_v) max_v = od[g];
+        /* Reproduce the build-side logic: rows i ∈ [0, NROWS) with i%NGROUPS == g.
+         * Their vals are (i % 16); count distinct. */
+        uint8_t seen[16] = {0};
+        int64_t expected = 0;
+        for (int64_t i = g; i < NROWS; i += NGROUPS) {
+            uint8_t v = (uint8_t)(i % 16);
+            if (!seen[v]) { seen[v] = 1; expected++; }
+        }
+        TEST_ASSERT_FMT(od[g] == expected,
+                        "group %lld: got %lld, expected %lld",
+                        (long long)g, (long long)od[g], (long long)expected);
     }
-    TEST_ASSERT(min_v >= 0, "min per-group count non-negative");
-    TEST_ASSERT(max_v <= 16, "max per-group count <= number of distinct vals");
 
     ray_release(out);
     ray_release(gids);

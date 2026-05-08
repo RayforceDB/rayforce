@@ -288,24 +288,48 @@ static void cd_part_dedup_fn(void* ctx, uint32_t worker_id,
 /* Width-specialised value extraction for the partition pass.  Reading
  * row-by-row through read_col_i64 was the dispatch overhead in the
  * sequential path; specialising on the column width lets the autovec
- * pass tighten the loop. */
+ * pass tighten the loop.
+ *
+ * Indexing note: histograms and cursors are keyed by *task index*, not
+ * worker id.  ray_pool_dispatch's ring is work-stealing — the same
+ * worker_id can claim different tasks across two consecutive
+ * dispatches, so the row range processed by worker w in pass 1
+ * (histogram) need not match the range processed by worker w in pass 2
+ * (scatter).  Using worker_id as the cursor key would let pass 2
+ * scatter writes overshoot the slot reserved by pass 1, mangle the
+ * partition layout, and over- or under-count distinct values
+ * non-deterministically.  Task index is stable across passes because
+ * the row range tied to task t is fixed at dispatch-fill time. */
 typedef struct {
     const void* base;
-    int64_t*    counts;        /* P per-partition row counts (per worker) */
+    int64_t*    counts;        /* P per-partition row counts (per task) */
     uint32_t    p_bits;
     uint64_t    p_mask;
+    int64_t     grain;         /* rows per task (last task may have fewer) */
+    int64_t     total;         /* total row count */
     uint8_t     stride_log2;   /* log2(elem size) for plain int paths */
     uint8_t     is_f64;
     int8_t      type;
     uint8_t     attrs;
 } cd_count_ctx_t;
 
-/* Count rows per partition (per worker, into worker-local slot).  Two
- * passes: this one fills the histograms; the next does the scatter. */
+/* Count rows per partition (per task, into task-local slot).  Two
+ * passes: this one fills the histograms; the next does the scatter.
+ * Dispatched via ray_pool_dispatch_n with start=task_idx so the
+ * cursor key is stable across the histogram and scatter passes. */
 static void cd_hist_fn(void* ctx, uint32_t worker_id,
                        int64_t start, int64_t end) {
+    (void)worker_id;
+    (void)end;
     cd_count_ctx_t* x = (cd_count_ctx_t*)ctx;
-    int64_t* hist = x->counts + (size_t)worker_id * (x->p_mask + 1);
+    int64_t task_idx = start;
+    int64_t row_start = task_idx * x->grain;
+    int64_t row_end = row_start + x->grain;
+    if (row_end > x->total) row_end = x->total;
+    int64_t* hist = x->counts + (size_t)task_idx * (x->p_mask + 1);
+    /* Reuse the existing tight loops by aliasing the local names. */
+    start = row_start;
+    end = row_end;
     const void* base = x->base;
     int8_t in_type = x->type;
     uint8_t in_attrs = x->attrs;
@@ -373,9 +397,11 @@ static void cd_hist_fn(void* ctx, uint32_t worker_id,
 typedef struct {
     const void* base;
     int64_t*    out_buf;       /* concatenated payloads (output) */
-    int64_t*    cursor;        /* per-worker × P; advances per scatter */
+    int64_t*    cursor;        /* per-task × P; advances per scatter */
     uint32_t    p_bits;
     uint64_t    p_mask;
+    int64_t     grain;         /* rows per task (last task may have fewer) */
+    int64_t     total;         /* total row count */
     uint8_t     is_f64;
     int8_t      type;
     uint8_t     attrs;
@@ -383,8 +409,17 @@ typedef struct {
 
 static void cd_scatter_fn(void* ctx, uint32_t worker_id,
                           int64_t start, int64_t end) {
+    (void)worker_id;
+    (void)end;
     cd_scatter_ctx_t* x = (cd_scatter_ctx_t*)ctx;
-    int64_t* cur = x->cursor + (size_t)worker_id * (x->p_mask + 1);
+    int64_t task_idx = start;
+    int64_t row_start = task_idx * x->grain;
+    int64_t row_end = row_start + x->grain;
+    if (row_end > x->total) row_end = x->total;
+    int64_t* cur = x->cursor + (size_t)task_idx * (x->p_mask + 1);
+    /* Reuse the existing tight loops by aliasing the local names. */
+    start = row_start;
+    end = row_end;
     int64_t* out = x->out_buf;
     const void* base = x->base;
     int8_t in_type = x->type;
@@ -541,31 +576,51 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     uint64_t P = (uint64_t)1 << p_bits;
     uint64_t p_mask = P - 1;
 
-    /* Pass 1: per-worker histogram (P × nw int64 cells). */
+    /* Histograms and cursors are keyed by *task* index, not worker id, so
+     * pass-2 scatter writes land in the slot that pass-1 histogram
+     * reserved.  A worker may execute different tasks in the two passes
+     * (the dispatch ring is work-stealing); the row range tied to a task
+     * is fixed when ray_pool_dispatch_n fills the ring. */
+    int64_t grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+    if (grain <= 0) grain = 8192;
+    int64_t n_tasks_64 = (len + grain - 1) / grain;
+    if (n_tasks_64 <= 0) n_tasks_64 = 1;
+    /* MAX_RING_CAP guards against pathological len; if we'd exceed it,
+     * fall back to the sequential kernel — the cap is high enough that
+     * this only fires on absurd inputs. */
+    if (n_tasks_64 > (1u << 16)) {
+        int64_t cnt = cd_seq_count(in_type, input->attrs, base, len);
+        if (cnt < 0) return ray_error("oom", NULL);
+        return ray_i64(cnt);
+    }
+    uint32_t n_tasks = (uint32_t)n_tasks_64;
+
+    /* Pass 1: per-task histogram (P × n_tasks int64 cells). */
     ray_t* hist_hdr = NULL;
     int64_t* hist = (int64_t*)scratch_calloc(&hist_hdr,
-                                             (size_t)P * nw * sizeof(int64_t));
+                                             (size_t)P * n_tasks * sizeof(int64_t));
     if (!hist) {
         return ray_error("oom", NULL);
     }
     cd_count_ctx_t hctx = {
         .base = base, .counts = hist,
         .p_bits = p_bits, .p_mask = p_mask,
+        .grain = grain, .total = len,
         .stride_log2 = 0, .is_f64 = (in_type == RAY_F64),
         .type = in_type, .attrs = input->attrs,
     };
-    ray_pool_dispatch(pool, cd_hist_fn, &hctx, len);
+    ray_pool_dispatch_n(pool, cd_hist_fn, &hctx, n_tasks);
 
-    /* Convert per-worker histograms into a global prefix sum.  Order:
-     * partition_0_worker_0, partition_0_worker_1, …, partition_1_worker_0, …
-     * so each (worker, partition) range is a contiguous slice of out_buf. */
+    /* Convert per-task histograms into a global prefix sum.  Order:
+     * partition_0_task_0, partition_0_task_1, …, partition_1_task_0, …
+     * so each (task, partition) range is a contiguous slice of out_buf. */
     ray_t* off_hdr = NULL;
     int64_t* part_off = (int64_t*)scratch_alloc(&off_hdr,
                                                 (size_t)(P + 1) * sizeof(int64_t));
     if (!part_off) { scratch_free(hist_hdr); return ray_error("oom", NULL); }
     ray_t* cur_hdr = NULL;
     int64_t* cursor = (int64_t*)scratch_alloc(&cur_hdr,
-                                              (size_t)P * nw * sizeof(int64_t));
+                                              (size_t)P * n_tasks * sizeof(int64_t));
     if (!cursor) {
         scratch_free(off_hdr); scratch_free(hist_hdr);
         return ray_error("oom", NULL);
@@ -574,9 +629,9 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     int64_t total = 0;
     for (uint64_t p = 0; p < P; p++) {
         part_off[p] = total;
-        for (uint32_t w = 0; w < nw; w++) {
-            cursor[(size_t)w * P + p] = total;
-            total += hist[(size_t)w * P + p];
+        for (uint32_t t = 0; t < n_tasks; t++) {
+            cursor[(size_t)t * P + p] = total;
+            total += hist[(size_t)t * P + p];
         }
     }
     part_off[P] = total;
@@ -598,10 +653,11 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     cd_scatter_ctx_t sctx = {
         .base = base, .out_buf = out_buf, .cursor = cursor,
         .p_bits = p_bits, .p_mask = p_mask,
+        .grain = grain, .total = len,
         .is_f64 = (in_type == RAY_F64),
         .type = in_type, .attrs = input->attrs,
     };
-    ray_pool_dispatch(pool, cd_scatter_fn, &sctx, len);
+    ray_pool_dispatch_n(pool, cd_scatter_fn, &sctx, n_tasks);
 
     /* Pass 3: dedup each partition in parallel.  Each partition gets one
      * task — distinct values land in the same partition, so per-partition
