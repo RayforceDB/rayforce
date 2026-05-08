@@ -3414,6 +3414,11 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 key_owned[k] = 1;
             }
         }
+        if (!key_vecs[k]) {
+            for (uint8_t j = 0; j < k; j++)
+                if (key_owned[j] && key_vecs[j]) ray_release(key_vecs[j]);
+            return ray_error("domain", "by: column not found in table");
+        }
     }
 
     /* Resolve agg input columns (VLA — n_aggs ≤ 8; use ≥1 to avoid zero-size VLA UB) */

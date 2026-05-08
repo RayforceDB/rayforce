@@ -1007,9 +1007,11 @@
 ;; Empty-rows error scenarios — eval-level group with column-not-found
 ;; ====================================================================
 
-;; by: list referencing nonexistent column → segfault in group_rows_range.
-;; Tracked separately as a known crash; assertion omitted to avoid
-;; tripping ASan on every test run.
+;; by: list referencing nonexistent column → domain error.
+(set TEMPTY (table [a b] (list (til 5) (+ 100 (til 5)))))
+(select {by: [a nonexistent_col] from: TEMPTY})  !- domain
+(select {by: [nonexistent_col a] from: TEMPTY})  !- domain
+(select {by: [nonexistent_col]    from: TEMPTY}) !- domain
 
 ;; ====================================================================
 ;; nearest: take with negative atom — query.c:1623-1633 family.
