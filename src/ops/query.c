@@ -4914,26 +4914,87 @@ by_dict_done:
 
                         ray_t* agg_vec = NULL;
                         ray_t** grp_items = (ray_t**)ray_data(groups);
-                        for (int64_t gi = 0; gi < out_groups; gi++) {
-                            ray_t* idx_list = grp_items[gi * 2 + 1];
-                            ray_t* subset = ray_at_fn(src_col_val, idx_list);
-                            if (!subset || RAY_IS_ERR(subset)) continue;
-                            ray_t* agg_val = NULL;
-                            ray_t* fn_obj = ray_env_get(agg_fn_name->i64);
-                            if (fn_obj && fn_obj->type == RAY_UNARY) {
-                                ray_unary_fn uf = (ray_unary_fn)(uintptr_t)fn_obj->i64;
-                                agg_val = uf(subset);
+
+                        /* Median fast path: skip per-group ray_at_fn slice
+                         * allocation + ray_med_fn scratch allocation; read
+                         * src[idx_list[i]] straight into a reusable double
+                         * scratch buffer, then ray_median_dbl_inplace.  For
+                         * q6's 10k-group / 1k-row-per-group shape this
+                         * eliminates 20k ray-vector allocations.  Numeric
+                         * inputs only — non-numeric falls back to the
+                         * generic loop below. */
+                        bool med_fast = is_med_call(val_expr_item) &&
+                            (src_col_val->type == RAY_F64 || src_col_val->type == RAY_I64 ||
+                             src_col_val->type == RAY_I32 || src_col_val->type == RAY_I16 ||
+                             src_col_val->type == RAY_U8);
+                        if (med_fast) {
+                            int8_t  t = src_col_val->type;
+                            int64_t max_cnt = 0;
+                            for (int64_t gi = 0; gi < out_groups; gi++) {
+                                int64_t c = ray_len(grp_items[gi * 2 + 1]);
+                                if (c > max_cnt) max_cnt = c;
                             }
-                            ray_release(subset);
-                            if (!agg_val || RAY_IS_ERR(agg_val)) continue;
-                            if (!agg_vec) {
-                                int8_t vt = -(agg_val->type);
-                                agg_vec = ray_vec_new(vt, out_groups);
-                                if (!agg_vec || RAY_IS_ERR(agg_vec)) { ray_release(agg_val); break; }
+                            agg_vec = ray_vec_new(RAY_F64, out_groups);
+                            if (agg_vec && !RAY_IS_ERR(agg_vec)) {
                                 agg_vec->len = out_groups;
+                                double* out_data = (double*)ray_data(agg_vec);
+                                ray_t* sch_hdr = NULL;
+                                double* scratch = max_cnt > 0
+                                    ? (double*)scratch_alloc(&sch_hdr,
+                                          (size_t)max_cnt * sizeof(double))
+                                    : NULL;
+                                bool ok = (max_cnt == 0) || (scratch != NULL);
+                                bool has_nulls = (src_col_val->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                                const uint8_t* null_bm = has_nulls
+                                    ? ray_vec_nullmap_bytes(src_col_val, NULL, NULL) : NULL;
+                                const void* base = ray_data(src_col_val);
+                                for (int64_t gi = 0; gi < out_groups && ok; gi++) {
+                                    ray_t* idx_list = grp_items[gi * 2 + 1];
+                                    int64_t cnt = ray_len(idx_list);
+                                    if (cnt == 0) { out_data[gi] = 0.0; ray_vec_set_null(agg_vec, gi, true); continue; }
+                                    int64_t* idx_data = (int64_t*)ray_data(idx_list);
+                                    int64_t actual = 0;
+                                    for (int64_t i = 0; i < cnt; i++) {
+                                        int64_t row = idx_data[i];
+                                        if (null_bm && ((null_bm[row >> 3] >> (row & 7)) & 1)) continue;
+                                        double v;
+                                        switch (t) {
+                                            case RAY_F64: memcpy(&v, (const char*)base + (size_t)row * 8, 8); break;
+                                            case RAY_I64: { int64_t iv; memcpy(&iv, (const char*)base + (size_t)row * 8, 8); v = (double)iv; break; }
+                                            case RAY_I32: { int32_t iv; memcpy(&iv, (const char*)base + (size_t)row * 4, 4); v = (double)iv; break; }
+                                            case RAY_I16: { int16_t iv; memcpy(&iv, (const char*)base + (size_t)row * 2, 2); v = (double)iv; break; }
+                                            case RAY_U8:  v = (double)((const uint8_t*)base)[row]; break;
+                                            default:      v = 0.0; break;
+                                        }
+                                        scratch[actual++] = v;
+                                    }
+                                    if (actual == 0) { out_data[gi] = 0.0; ray_vec_set_null(agg_vec, gi, true); continue; }
+                                    out_data[gi] = ray_median_dbl_inplace(scratch, actual);
+                                }
+                                if (sch_hdr) scratch_free(sch_hdr);
                             }
-                            store_typed_elem(agg_vec, gi, agg_val);
-                            ray_release(agg_val);
+                        } else {
+                            for (int64_t gi = 0; gi < out_groups; gi++) {
+                                ray_t* idx_list = grp_items[gi * 2 + 1];
+                                ray_t* subset = ray_at_fn(src_col_val, idx_list);
+                                if (!subset || RAY_IS_ERR(subset)) continue;
+                                ray_t* agg_val = NULL;
+                                ray_t* fn_obj = ray_env_get(agg_fn_name->i64);
+                                if (fn_obj && fn_obj->type == RAY_UNARY) {
+                                    ray_unary_fn uf = (ray_unary_fn)(uintptr_t)fn_obj->i64;
+                                    agg_val = uf(subset);
+                                }
+                                ray_release(subset);
+                                if (!agg_val || RAY_IS_ERR(agg_val)) continue;
+                                if (!agg_vec) {
+                                    int8_t vt = -(agg_val->type);
+                                    agg_vec = ray_vec_new(vt, out_groups);
+                                    if (!agg_vec || RAY_IS_ERR(agg_vec)) { ray_release(agg_val); break; }
+                                    agg_vec->len = out_groups;
+                                }
+                                store_typed_elem(agg_vec, gi, agg_val);
+                                ray_release(agg_val);
+                            }
                         }
                         ray_release(src_col_val);
                         agg_names[n_agg_out] = kid;
@@ -5301,6 +5362,67 @@ by_dict_done:
                     /* For each group, compute aggregation */
                     ray_t* agg_vec = NULL;
                     ray_t** grp_items = (ray_t**)ray_data(groups);
+
+                    /* Median fast path — see the twin site above for
+                     * rationale (skips per-group ray_at_fn + ray_med_fn
+                     * scratch allocations). */
+                    bool med_fast = is_med_call(val_expr_item) &&
+                        (src_col_val->type == RAY_F64 || src_col_val->type == RAY_I64 ||
+                         src_col_val->type == RAY_I32 || src_col_val->type == RAY_I16 ||
+                         src_col_val->type == RAY_U8);
+                    if (med_fast) {
+                        int8_t  t = src_col_val->type;
+                        int64_t max_cnt = 0;
+                        for (int64_t gi = 0; gi < n_groups; gi++) {
+                            int64_t c = ray_len(grp_items[gi * 2 + 1]);
+                            if (c > max_cnt) max_cnt = c;
+                        }
+                        agg_vec = ray_vec_new(RAY_F64, n_groups);
+                        if (agg_vec && !RAY_IS_ERR(agg_vec)) {
+                            agg_vec->len = n_groups;
+                            double* out_data = (double*)ray_data(agg_vec);
+                            ray_t* sch_hdr = NULL;
+                            double* scratch = max_cnt > 0
+                                ? (double*)scratch_alloc(&sch_hdr,
+                                      (size_t)max_cnt * sizeof(double))
+                                : NULL;
+                            bool ok = (max_cnt == 0) || (scratch != NULL);
+                            bool has_nulls = (src_col_val->attrs & RAY_ATTR_HAS_NULLS) != 0;
+                            const uint8_t* null_bm = has_nulls
+                                ? ray_vec_nullmap_bytes(src_col_val, NULL, NULL) : NULL;
+                            const void* base = ray_data(src_col_val);
+                            for (int64_t gi = 0; gi < n_groups && ok; gi++) {
+                                ray_t* idx_list = grp_items[gi * 2 + 1];
+                                int64_t cnt = ray_len(idx_list);
+                                if (cnt == 0) { out_data[gi] = 0.0; ray_vec_set_null(agg_vec, gi, true); continue; }
+                                int64_t* idx_data = (int64_t*)ray_data(idx_list);
+                                int64_t actual = 0;
+                                for (int64_t i = 0; i < cnt; i++) {
+                                    int64_t row = idx_data[i];
+                                    if (null_bm && ((null_bm[row >> 3] >> (row & 7)) & 1)) continue;
+                                    double v;
+                                    switch (t) {
+                                        case RAY_F64: memcpy(&v, (const char*)base + (size_t)row * 8, 8); break;
+                                        case RAY_I64: { int64_t iv; memcpy(&iv, (const char*)base + (size_t)row * 8, 8); v = (double)iv; break; }
+                                        case RAY_I32: { int32_t iv; memcpy(&iv, (const char*)base + (size_t)row * 4, 4); v = (double)iv; break; }
+                                        case RAY_I16: { int16_t iv; memcpy(&iv, (const char*)base + (size_t)row * 2, 2); v = (double)iv; break; }
+                                        case RAY_U8:  v = (double)((const uint8_t*)base)[row]; break;
+                                        default:      v = 0.0; break;
+                                    }
+                                    scratch[actual++] = v;
+                                }
+                                if (actual == 0) { out_data[gi] = 0.0; ray_vec_set_null(agg_vec, gi, true); continue; }
+                                out_data[gi] = ray_median_dbl_inplace(scratch, actual);
+                            }
+                            if (sch_hdr) scratch_free(sch_hdr);
+                        }
+                        ray_release(src_col_val);
+                        agg_names[n_agg_out] = kid;
+                        agg_results[n_agg_out] = agg_vec;
+                        n_agg_out++;
+                        continue;
+                    }
+
                     for (int64_t gi = 0; gi < n_groups; gi++) {
                         ray_t* idx_list = grp_items[gi * 2 + 1];
                         ray_t* subset = ray_at_fn(src_col_val, idx_list);
