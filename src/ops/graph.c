@@ -56,6 +56,12 @@ static void graph_fixup_ext_ptrs(ray_graph_t* g, ptrdiff_t delta) {
                     ext->keys[k] = graph_fix_ptr(ext->keys[k], delta);
                 for (uint8_t a = 0; a < ext->n_aggs; a++)
                     ext->agg_ins[a] = graph_fix_ptr(ext->agg_ins[a], delta);
+                if (ext->agg_ins2) {
+                    for (uint8_t a = 0; a < ext->n_aggs; a++) {
+                        if (ext->agg_ins2[a])
+                            ext->agg_ins2[a] = graph_fix_ptr(ext->agg_ins2[a], delta);
+                    }
+                }
                 break;
             case OP_JOIN:
             case OP_ANTIJOIN:
@@ -679,6 +685,11 @@ ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_
 ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a)  { return make_unary(g, OP_STDDEV_POP, a, RAY_F64); }
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a)         { return make_unary(g, OP_VAR, a, RAY_F64); }
 ray_op_t* ray_var_pop(ray_graph_t* g, ray_op_t* a)     { return make_unary(g, OP_VAR_POP, a, RAY_F64); }
+/* Pearson correlation is a 2-input aggregator; the node carries two
+ * input pointers (x and y) and lowers to OP_PEARSON_CORR. */
+ray_op_t* ray_pearson_corr(ray_graph_t* g, ray_op_t* x, ray_op_t* y) {
+    return make_binary(g, OP_PEARSON_CORR, x, y, RAY_F64);
+}
 
 /* --------------------------------------------------------------------------
  * Structural ops
@@ -747,22 +758,37 @@ ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
     return &g->nodes[ext->base.id];
 }
 
-ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
-                   uint16_t* agg_ops, ray_op_t** agg_ins, uint8_t n_aggs) {
+/* Shared impl for ray_group / ray_group2.  agg_ins2 NULL → no binary
+ * aggs; otherwise must be the same length as agg_ins (NULL slots for
+ * unary aggs, non-NULL for OP_PEARSON_CORR slots). */
+static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+                                uint16_t* agg_ops, ray_op_t** agg_ins,
+                                ray_op_t** agg_ins2, uint8_t n_aggs) {
     uint32_t key_ids[256];
     uint32_t agg_ids[256];
+    uint32_t agg_ids2[256];  /* parallel to agg_ids; 0 when no second input */
+    bool has_ins2 = false;
     for (uint8_t i = 0; i < n_keys; i++) key_ids[i] = keys[i]->id;
-    for (uint8_t i = 0; i < n_aggs; i++) agg_ids[i] = agg_ins[i]->id;
+    for (uint8_t i = 0; i < n_aggs; i++) {
+        agg_ids[i]  = agg_ins[i]->id;
+        agg_ids2[i] = 0;
+        if (agg_ins2 && agg_ins2[i]) {
+            agg_ids2[i] = agg_ins2[i]->id;
+            has_ins2 = true;
+        }
+    }
 
     size_t keys_sz = (size_t)n_keys * sizeof(ray_op_t*);
     size_t ops_sz  = (size_t)n_aggs * sizeof(uint16_t);
     size_t ins_sz  = (size_t)n_aggs * sizeof(ray_op_t*);
-    /* Align ops after keys (pointer-sized), ins after ops (needs ptr alignment) */
-    size_t ops_off = keys_sz;
-    size_t ins_off = ops_off + ops_sz;
+    size_t ins2_sz = has_ins2 ? ins_sz : 0;
+    /* Align ops after keys (pointer-sized), ins after ops, ins2 after ins. */
+    size_t ops_off  = keys_sz;
+    size_t ins_off  = ops_off + ops_sz;
     /* Round ins_off up to pointer alignment */
     ins_off = (ins_off + sizeof(ray_op_t*) - 1) & ~(sizeof(ray_op_t*) - 1);
-    ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, ins_off + ins_sz);
+    size_t ins2_off = ins_off + ins_sz;
+    ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, ins2_off + ins2_sz);
     if (!ext) return NULL;
 
     ext->base.opcode = OP_GROUP;
@@ -782,11 +808,29 @@ ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
     ext->agg_ins = (ray_op_t**)(trail + ins_off);
     for (uint8_t i = 0; i < n_aggs; i++)
         ext->agg_ins[i] = &g->nodes[agg_ids[i]];
+    if (has_ins2) {
+        ext->agg_ins2 = (ray_op_t**)(trail + ins2_off);
+        for (uint8_t i = 0; i < n_aggs; i++)
+            ext->agg_ins2[i] = agg_ids2[i] ? &g->nodes[agg_ids2[i]] : NULL;
+    } else {
+        ext->agg_ins2 = NULL;
+    }
     ext->n_keys = n_keys;
     ext->n_aggs = n_aggs;
 
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
+}
+
+ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+                   uint16_t* agg_ops, ray_op_t** agg_ins, uint8_t n_aggs) {
+    return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, NULL, n_aggs);
+}
+
+ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+                     uint16_t* agg_ops, ray_op_t** agg_ins,
+                     ray_op_t** agg_ins2, uint8_t n_aggs) {
+    return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, agg_ins2, n_aggs);
 }
 
 ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys) {

@@ -195,6 +195,7 @@ void     ray_cancel(void);
 #define OP_ILIKE        76
 #define OP_PIVOT        77   /* single-pass pivot table            */
 #define OP_ANTIJOIN     78   /* anti-semi-join (left rows with no right match) */
+#define OP_PEARSON_CORR 79   /* Pearson correlation per group (binary input) */
 
 /* Opcodes — Graph */
 #define OP_EXPAND        80   /* 1-hop CSR neighbor expansion       */
@@ -287,6 +288,11 @@ typedef struct ray_op_ext {
             uint8_t    n_aggs;
             uint16_t*  agg_ops;
             ray_op_t**  agg_ins;
+            /* Optional second input per agg — non-NULL only for binary
+             * aggregators (currently: OP_PEARSON_CORR). NULL for all
+             * unary aggs and for the whole pointer when no binary agg
+             * is present in this group. */
+            ray_op_t**  agg_ins2;
         };
         struct {               /* OP_SORT: multi-column sort */
             ray_op_t**  columns;
@@ -557,6 +563,7 @@ ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_var_pop(ray_graph_t* g, ray_op_t* a);
+ray_op_t* ray_pearson_corr(ray_graph_t* g, ray_op_t* x, ray_op_t* y);
 
 /* Structural ops */
 ray_op_t* ray_filter(ray_graph_t* g, ray_op_t* input, ray_op_t* predicate);
@@ -565,6 +572,12 @@ ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
                      uint8_t n_cols);
 ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
                    uint16_t* agg_ops, ray_op_t** agg_ins, uint8_t n_aggs);
+/* Variant accepting an optional second-input column per agg.  agg_ins2
+ * is parallel to agg_ins (length n_aggs); slots are NULL for unary aggs
+ * and non-NULL only for binary aggregators (currently OP_PEARSON_CORR). */
+ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+                     uint16_t* agg_ops, ray_op_t** agg_ins,
+                     ray_op_t** agg_ins2, uint8_t n_aggs);
 ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys);
 ray_op_t* ray_pivot_op(ray_graph_t* g,
                        ray_op_t** index_cols, uint8_t n_index,

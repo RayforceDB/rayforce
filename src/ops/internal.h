@@ -820,10 +820,13 @@ ray_t* asc_vec_eager(ray_t* x);
 ray_t* desc_vec_eager(ray_t* x);
 
 /* Group HT types and helpers — shared with pivot (exec.c) */
-#define GHT_NEED_SUM   0x01
-#define GHT_NEED_MIN   0x02
-#define GHT_NEED_MAX   0x04
-#define GHT_NEED_SUMSQ 0x08
+#define GHT_NEED_SUM     0x01
+#define GHT_NEED_MIN     0x02
+#define GHT_NEED_MAX     0x04
+#define GHT_NEED_SUMSQ   0x08
+/* OP_PEARSON_CORR per-group accumulators: x-side piggybacks on SUM and
+ * SUMSQ blocks; this flag enables the y-side blocks (Σy, Σy², Σxy). */
+#define GHT_NEED_PEARSON 0x10
 
 typedef struct {
     uint16_t entry_stride;
@@ -851,6 +854,18 @@ typedef struct {
      * index of the row the entry was built from. */
     uint16_t off_first_row;
     uint16_t off_last_row;
+    /* OP_PEARSON_CORR y-side accumulators.  Allocated when
+     * GHT_NEED_PEARSON is set; for an OP_PEARSON_CORR agg at slot s the
+     * x-side accumulators live at off_sum[s] (Σx) and off_sumsq[s] (Σx²),
+     * the y-side at these three offsets at the same slot index. */
+    uint16_t off_sum_y;
+    uint16_t off_sumsq_y;
+    uint16_t off_sumxy;
+    /* Per-agg "binary input" bitset: bit a set iff agg a takes two
+     * inputs (OP_PEARSON_CORR).  Drives phase-1 packing — binary aggs
+     * pack TWO consecutive 8-byte values per row (x then y) starting at
+     * agg_val_slot[a]. */
+    uint8_t  agg_is_binary;
     /* Wide-key support: bit k set iff key k does not fit in 8 bytes
      * (e.g. RAY_GUID = 16 B).  For wide keys the 8-byte key slot
      * stores a source-row index and the actual key bytes live in the

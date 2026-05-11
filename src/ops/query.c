@@ -323,6 +323,7 @@ static uint16_t resolve_agg_opcode(int64_t sym_id) {
     if (len == 7 && memcmp(name, "dev_pop",      7) == 0) return OP_STDDEV_POP;
     if (len == 7 && memcmp(name, "var_pop",      7) == 0) return OP_VAR_POP;
     if (len == 10 && memcmp(name, "stddev_pop", 10) == 0) return OP_STDDEV_POP;
+    if (len == 12 && memcmp(name, "pearson_corr", 12) == 0) return OP_PEARSON_CORR;
     return 0;
 }
 
@@ -1754,6 +1755,14 @@ static bool bounded_multikey_count_take_candidate(ray_t** dict_elems, int64_t di
     }
     return n_count_out > 0;
 }
+
+/* NOTE: binary-aggregator gates (is_aggr_binary_call /
+ * is_streaming_aggr_binary_call) are not needed at the planner-call
+ * sites for the canonical fast path — `(pearson_corr x y)` flows
+ * through is_agg_expr → is_group_dag_agg_expr → the OP_GROUP planning
+ * block that emits ray_group2.  Eval-fallback (aggr_unary_per_group_buf
+ * twin for two-input shapes, LIST keys, etc.) will need them; add
+ * alongside that path when it's wired. */
 
 /* Detect `(count (distinct <inner>))` exactly — the only shape that
  * routes through the OP_COUNT_DISTINCT fast path per group.  Returns
@@ -5628,10 +5637,15 @@ by_dict_done:
         }
 
         /* Collect aggregation expressions from output columns.
-         * Non-agg expressions are tracked separately for post-DAG scatter. */
+         * Non-agg expressions are tracked separately for post-DAG scatter.
+         * agg_ins2[] is parallel to agg_ins[] — NULL for unary aggs,
+         * non-NULL for binary aggs (currently OP_PEARSON_CORR).  The
+         * has_binary_agg flag selects ray_group2 below. */
         uint16_t agg_ops[16];
         ray_op_t* agg_ins[16];
+        ray_op_t* agg_ins2[16];
         uint8_t n_aggs = 0;
+        int has_binary_agg = 0;
 
         for (int64_t i = 0; i + 1 < dict_n; i += 2) {
             int64_t kid = dict_elems[i]->i64;
@@ -5640,10 +5654,18 @@ by_dict_done:
             ray_t* val_expr = dict_elems[i + 1];
             if (is_group_dag_agg_expr(val_expr) && n_aggs < 16) {
                 ray_t** agg_elems = (ray_t**)ray_data(val_expr);
-                agg_ops[n_aggs] = resolve_agg_opcode(agg_elems[0]->i64);
+                uint16_t op = resolve_agg_opcode(agg_elems[0]->i64);
+                agg_ops[n_aggs] = op;
                 /* Compile the aggregation input (the column reference) */
                 agg_ins[n_aggs] = compile_expr_dag(g, agg_elems[1]);
                 if (!agg_ins[n_aggs]) { ray_graph_free(g); ray_release(tbl); return ray_error("domain", NULL); }
+                agg_ins2[n_aggs] = NULL;
+                if (op == OP_PEARSON_CORR) {
+                    if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); return ray_error("arity", NULL); }
+                    agg_ins2[n_aggs] = compile_expr_dag(g, agg_elems[2]);
+                    if (!agg_ins2[n_aggs]) { ray_graph_free(g); ray_release(tbl); return ray_error("domain", NULL); }
+                    has_binary_agg = 1;
+                }
                 n_aggs++;
             } else if (!is_group_dag_agg_expr(val_expr) && n_nonaggs < 16) {
                 if (is_single_group_key_projection(by_expr, val_expr))
@@ -5664,14 +5686,20 @@ by_dict_done:
                         agg_kinds_ok = 0;
                 }
                 if (can_fuse_phase1 && fused_pred_op != NULL
-                    && n_nonaggs == 0 && agg_kinds_ok)
+                    && n_nonaggs == 0 && agg_kinds_ok
+                    && !has_binary_agg)
                 {
                     /* exec_filtered_group dispatches: count1 (single key,
                      * single COUNT) → Phase 3 fast path; everything else →
-                     * multi path with packed composite key. */
+                     * multi path with packed composite key.  Skipped when
+                     * any agg is binary (filtered-group fusion only knows
+                     * about unary aggs). */
                     root = ray_filtered_group(g, fused_pred_op,
                                               key_ops, n_keys,
                                               agg_ops, agg_ins, n_aggs);
+                } else if (has_binary_agg) {
+                    root = ray_group2(g, key_ops, n_keys, agg_ops,
+                                       agg_ins, agg_ins2, n_aggs);
                 } else {
                     root = ray_group(g, key_ops, n_keys, agg_ops, agg_ins, n_aggs);
                 }
@@ -6311,15 +6339,19 @@ by_dict_done:
 
             uint16_t  s_agg_ops[16];
             ray_op_t* s_agg_ins[16];
+            ray_op_t* s_agg_ins2[16];
             uint8_t   s_n_aggs = 0;
+            int       s_has_binary = 0;
             for (int64_t i = 0; i + 1 < dict_n && s_n_aggs < 16; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id ||
                     kid == take_id || kid == asc_id || kid == desc_id || kid == nearest_id) continue;
                 ray_t*  val_expr  = dict_elems[i + 1];
                 ray_t** agg_elems = (ray_t**)ray_data(val_expr);
-                s_agg_ops[s_n_aggs] = resolve_agg_opcode(agg_elems[0]->i64);
+                uint16_t op = resolve_agg_opcode(agg_elems[0]->i64);
+                s_agg_ops[s_n_aggs] = op;
                 s_agg_ins[s_n_aggs] = compile_expr_dag(g, agg_elems[1]);
+                s_agg_ins2[s_n_aggs] = NULL;
                 if (!s_agg_ins[s_n_aggs]) {
                     if (g->selection) {
                         ray_release(g->selection);
@@ -6328,9 +6360,27 @@ by_dict_done:
                     ray_graph_free(g); ray_release(tbl);
                     return ray_error("domain", NULL);
                 }
+                if (op == OP_PEARSON_CORR) {
+                    if (ray_len(val_expr) < 3) {
+                        if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                        ray_graph_free(g); ray_release(tbl);
+                        return ray_error("arity", NULL);
+                    }
+                    s_agg_ins2[s_n_aggs] = compile_expr_dag(g, agg_elems[2]);
+                    if (!s_agg_ins2[s_n_aggs]) {
+                        if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                        ray_graph_free(g); ray_release(tbl);
+                        return ray_error("domain", NULL);
+                    }
+                    s_has_binary = 1;
+                }
                 s_n_aggs++;
             }
-            root = ray_group(g, NULL, 0, s_agg_ops, s_agg_ins, s_n_aggs);
+            if (s_has_binary)
+                root = ray_group2(g, NULL, 0, s_agg_ops, s_agg_ins,
+                                   s_agg_ins2, s_n_aggs);
+            else
+                root = ray_group(g, NULL, 0, s_agg_ops, s_agg_ins, s_n_aggs);
         } else {
             /* Projection only (no group by) — select specific columns */
             ray_op_t* col_ops[16];
