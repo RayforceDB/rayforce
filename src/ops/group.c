@@ -1448,6 +1448,13 @@ ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
             if (agg_vecs[a]->type == RAY_F64)
                 ly.agg_is_f64 |= (1u << a);
             nv++;
+            /* Binary aggregator (OP_PEARSON_CORR): the y-side input
+             * occupies the very next slot so phase1 packs (x, y)
+             * consecutively.  agg_is_binary bit drives that packing. */
+            if (agg_ops && agg_ops[a] == OP_PEARSON_CORR) {
+                ly.agg_is_binary |= (uint8_t)(1u << a);
+                nv++;
+            }
         } else {
             ly.agg_val_slot[a] = -1;
         }
@@ -1482,6 +1489,15 @@ ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
     if (has_first_last) {
         ly.off_first_row = off; off += block;
         ly.off_last_row  = off; off += block;
+    }
+    /* PEARSON y-side accumulators (Σy, Σy², Σxy).  Allocated when any
+     * OP_PEARSON_CORR agg is present.  x-side reuses off_sum + off_sumsq
+     * at the same slot index; the y value lives at slot+1 in agg_vals,
+     * but its derived accumulators live in their own blocks below. */
+    if (need_flags & GHT_NEED_PEARSON) {
+        ly.off_sum_y   = off; off += block;
+        ly.off_sumsq_y = off; off += block;
+        ly.off_sumxy   = off; off += block;
     }
     ly.row_stride = off;
     return ly;
@@ -5504,6 +5520,9 @@ ht_path:;
             ght_need |= GHT_NEED_SUM;
         if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
             { ght_need |= GHT_NEED_SUM; ght_need |= GHT_NEED_SUMSQ; }
+        if (aop == OP_PEARSON_CORR)
+            { ght_need |= GHT_NEED_SUM; ght_need |= GHT_NEED_SUMSQ;
+              ght_need |= GHT_NEED_PEARSON; }
         if (aop == OP_MIN) ght_need |= GHT_NEED_MIN;
         if (aop == OP_MAX) ght_need |= GHT_NEED_MAX;
     }
