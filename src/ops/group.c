@@ -6349,6 +6349,7 @@ skip_top_count_filter:
                 case OP_AVG:
                 case OP_STDDEV: case OP_STDDEV_POP:
                 case OP_VAR: case OP_VAR_POP:
+                case OP_PEARSON_CORR:
                     out_type = RAY_F64; break;
                 case OP_COUNT: out_type = RAY_I64; break;
                 case OP_SUM: case OP_PROD:
@@ -6568,6 +6569,7 @@ build_from_final_ht:
             case OP_AVG:
             case OP_STDDEV: case OP_STDDEV_POP:
             case OP_VAR: case OP_VAR_POP:
+            case OP_PEARSON_CORR:
                 out_type = RAY_F64; break;
             case OP_COUNT: out_type = RAY_I64; break;
             case OP_SUM: case OP_PROD:
@@ -6626,6 +6628,22 @@ build_from_final_ht:
                         else if (agg_op == OP_VAR) v = var_pop * cnt / (cnt - 1);
                         else if (agg_op == OP_STDDEV_POP) v = sqrt(var_pop);
                         else v = sqrt(var_pop * cnt / (cnt - 1));
+                        break;
+                    }
+                    case OP_PEARSON_CORR: {
+                        if (cnt < 2) { v = 0.0; ray_vec_set_null(new_col, gi, true); break; }
+                        double sx  = is_f64 ? ROW_RD_F64(row, ly->off_sum,    s)
+                                            : (double)ROW_RD_I64(row, ly->off_sum, s);
+                        double sxx = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
+                        double sy  = ly->off_sum_y   ? ROW_RD_F64(row, ly->off_sum_y,   s) : 0.0;
+                        double syy = ly->off_sumsq_y ? ROW_RD_F64(row, ly->off_sumsq_y, s) : 0.0;
+                        double sxy = ly->off_sumxy   ? ROW_RD_F64(row, ly->off_sumxy,   s) : 0.0;
+                        double dn  = (double)cnt;
+                        double num = dn * sxy - sx * sy;
+                        double dx  = dn * sxx - sx * sx;
+                        double dy  = dn * syy - sy * sy;
+                        if (dx <= 0.0 || dy <= 0.0) { v = NAN; break; }
+                        v = num / sqrt(dx * dy);
                         break;
                     }
                     default: v = 0.0; break;
