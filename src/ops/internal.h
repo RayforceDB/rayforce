@@ -926,8 +926,11 @@ void ray_group_emit_filter_set(ray_group_emit_filter_t filter);
  * space (number of passing rows), not the source column length.
  * When match_idx is NULL, `row = i` — iterating directly over source
  * column rows (no selection). */
+/* agg_vecs2 is the optional y-side input column per agg (NULL when no
+ * binary aggs).  Phase 1 packs (x, y) consecutively for binary aggs. */
 void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
                       uint8_t* key_attrs, ray_t** key_vecs, ray_t** agg_vecs,
+                      ray_t** agg_vecs2,
                       uint8_t* agg_strlen,
                       ray_t* rowsel,
                       int64_t start, int64_t end,

@@ -1636,6 +1636,7 @@ static inline void init_accum_from_entry(char* row, const char* entry,
     if (has_fl)
         memcpy(&entry_row, entry + ly->entry_stride - 8, 8);
 
+    uint8_t bin_mask = ly->agg_is_binary;
     for (uint8_t a = 0; a < na; a++) {
         int8_t s = ly->agg_val_slot[a];
         if (s < 0) continue;
@@ -1654,6 +1655,28 @@ static inline void init_accum_from_entry(char* row, const char* entry,
                 double sq = (double)v * (double)v;
                 memcpy(row + ly->off_sumsq + s * 8, &sq, 8);
             }
+        }
+        /* PEARSON y-side: seed Σy, Σy², Σxy from the (x, y) pair packed
+         * at slots (s, s+1).  x-side Σx/Σx² are seeded by the SUM/SUMSQ
+         * blocks above (OP_PEARSON_CORR sets both need-flags).  Reads
+         * the typed bit-pattern packed by phase1 — F64 stays double,
+         * i64 reinterprets and casts. */
+        if ((nf & GHT_NEED_PEARSON) && (bin_mask & (1u << a))) {
+            double x, y;
+            if (ly->agg_is_f64 & (1u << a)) {
+                memcpy(&x, agg_data +  s      * 8, 8);
+                memcpy(&y, agg_data + (s + 1) * 8, 8);
+            } else {
+                int64_t xi, yi;
+                memcpy(&xi, agg_data +  s      * 8, 8);
+                memcpy(&yi, agg_data + (s + 1) * 8, 8);
+                x = (double)xi; y = (double)yi;
+            }
+            memcpy(row + ly->off_sum_y   + s * 8, &y, 8);
+            double yy = y * y;
+            memcpy(row + ly->off_sumsq_y + s * 8, &yy, 8);
+            double xy = x * y;
+            memcpy(row + ly->off_sumxy   + s * 8, &xy, 8);
         }
         /* Seed per-slot row-index bounds with the row that opened this
          * group.  Only writes the populated slots; unpopulated slot
@@ -1713,6 +1736,14 @@ static inline void accum_from_entry(char* row, const char* entry,
             if (nf & GHT_NEED_MIN) { double* p = &ROW_WR_F64(row, ly->off_min, s); if (v < *p) *p = v; }
             if (nf & GHT_NEED_MAX) { double* p = &ROW_WR_F64(row, ly->off_max, s); if (v > *p) *p = v; }
             if (nf & GHT_NEED_SUMSQ) { ROW_WR_F64(row, ly->off_sumsq, s) += v * v; }
+            /* PEARSON y-side: accumulate Σy, Σy², Σxy.  v above is x. */
+            if ((nf & GHT_NEED_PEARSON) && (ly->agg_is_binary & amask)) {
+                double y;
+                memcpy(&y, agg_data + (s + 1) * 8, 8);
+                ROW_WR_F64(row, ly->off_sum_y,   s) += y;
+                ROW_WR_F64(row, ly->off_sumsq_y, s) += y * y;
+                ROW_WR_F64(row, ly->off_sumxy,   s) += v * y;
+            }
         } else {
             int64_t v;
             memcpy(&v, val, 8);
@@ -1725,6 +1756,16 @@ static inline void accum_from_entry(char* row, const char* entry,
             if (nf & GHT_NEED_MIN) { int64_t* p = &ROW_WR_I64(row, ly->off_min, s); if (v < *p) *p = v; }
             if (nf & GHT_NEED_MAX) { int64_t* p = &ROW_WR_I64(row, ly->off_max, s); if (v > *p) *p = v; }
             if (nf & GHT_NEED_SUMSQ) { ROW_WR_F64(row, ly->off_sumsq, s) += (double)v * (double)v; }
+            /* PEARSON y-side (i64 input branch): y was packed via
+             * read_col_i64 — reinterpret as int64 then cast to double. */
+            if ((nf & GHT_NEED_PEARSON) && (ly->agg_is_binary & amask)) {
+                int64_t yi; memcpy(&yi, agg_data + (s + 1) * 8, 8);
+                double y  = (double)yi;
+                double xd = (double)v;
+                ROW_WR_F64(row, ly->off_sum_y,   s) += y;
+                ROW_WR_F64(row, ly->off_sumsq_y, s) += y * y;
+                ROW_WR_F64(row, ly->off_sumxy,   s) += xd * y;
+            }
         }
         /* Commit row-index bounds after value writes so a later entry in
          * the same merge sees the updated bound. */
@@ -1889,6 +1930,7 @@ static inline bool group_rowsel_pass(ray_t* sel, int64_t row) {
 
 void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
                               uint8_t* key_attrs, ray_t** key_vecs, ray_t** agg_vecs,
+                              ray_t** agg_vecs2,
                               uint8_t* agg_strlen,
                               ray_t* rowsel,
                               int64_t start, int64_t end,
@@ -1962,6 +2004,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
 
         int64_t* ev = (int64_t*)(ebuf + 8 + ((size_t)nk + 1) * 8);
         uint8_t vi = 0;
+        uint8_t bin_mask = ly->agg_is_binary;
         for (uint8_t a = 0; a < na; a++) {
             ray_t* ac = agg_vecs[a];
             if (!ac) continue;
@@ -1972,6 +2015,15 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
             else
                 ev[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
             vi++;
+            /* Binary aggregator: pack y after x in the same entry. */
+            if ((bin_mask & (1u << a)) && agg_vecs2 && agg_vecs2[a]) {
+                ray_t* ay = agg_vecs2[a];
+                if (ay->type == RAY_F64)
+                    memcpy(&ev[vi], &((double*)ray_data(ay))[row], 8);
+                else
+                    ev[vi] = read_col_i64(ray_data(ay), row, ay->type, ay->attrs);
+                vi++;
+            }
         }
         /* Tail slot: source row index for FIRST/LAST tie-breaking.  Same
          * layout as the radix path's entries so accum_from_entry can read
@@ -2124,6 +2176,11 @@ typedef struct {
     ray_t**      key_vecs;
     uint8_t      nullable_mask;   /* bit k = key k column may contain nulls */
     ray_t**       agg_vecs;
+    /* Second input column per agg; NULL when no binary aggs in this
+     * OP_GROUP.  Phase 1 reads agg_vecs2[a] alongside agg_vecs[a] and
+     * packs (x, y) consecutively into the entry agg_vals area for any
+     * agg whose layout bit agg_is_binary is set. */
+    ray_t**       agg_vecs2;
     uint8_t*     agg_strlen;
     uint32_t     n_workers;
     radix_buf_t* bufs;        /* [n_workers * RADIX_P] */
@@ -2188,6 +2245,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
 
         uint8_t vi = 0;
+        uint8_t bin_mask = ly->agg_is_binary;
         for (uint8_t a = 0; a < na; a++) {
             ray_t* ac = c->agg_vecs[a];
             if (!ac) continue;
@@ -2198,6 +2256,19 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             else
                 agg_vals[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
             vi++;
+            /* Binary aggregator: read y-side value into the next slot.
+             * Cast non-F64 inputs through read_col_i64 — pearson_corr's
+             * finalize reads both slots as F64 doubles regardless of
+             * input type (i64 will be reinterpreted; for now we only
+             * support F64 inputs cleanly — i64 path is a perf followup). */
+            if ((bin_mask & (1u << a)) && c->agg_vecs2 && c->agg_vecs2[a]) {
+                ray_t* ay = c->agg_vecs2[a];
+                if (ay->type == RAY_F64)
+                    memcpy(&agg_vals[vi], &((double*)ray_data(ay))[row], 8);
+                else
+                    agg_vals[vi] = read_col_i64(ray_data(ay), row, ay->type, ay->attrs);
+                vi++;
+            }
         }
 
         uint32_t part = RADIX_PART(h);
@@ -2363,6 +2434,27 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                             else if (op == OP_VAR) v = var_pop * cnt / (cnt - 1);
                             else if (op == OP_STDDEV_POP) v = sqrt(var_pop);
                             else v = sqrt(var_pop * cnt / (cnt - 1));
+                            break;
+                        }
+                        case OP_PEARSON_CORR: {
+                            /* Single-pass formula (same as ray_pearson_corr_fn):
+                             *   r = (n·Σxy − Σx·Σy) /
+                             *       sqrt((n·Σx² − Σx²)(n·Σy² − Σy²))
+                             * Undefined for n<2 or constant side → emit
+                             * NaN (canonicalize folds to null upstream). */
+                            if (cnt < 2) { v = 0.0; grp_set_null(ao->vec, di); break; }
+                            double sx  = sf ? ROW_RD_F64(row, ly->off_sum,    s)
+                                            : (double)ROW_RD_I64(row, ly->off_sum, s);
+                            double sxx = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
+                            double sy  = ly->off_sum_y   ? ROW_RD_F64(row, ly->off_sum_y,   s) : 0.0;
+                            double syy = ly->off_sumsq_y ? ROW_RD_F64(row, ly->off_sumsq_y, s) : 0.0;
+                            double sxy = ly->off_sumxy   ? ROW_RD_F64(row, ly->off_sumxy,   s) : 0.0;
+                            double dn  = (double)cnt;
+                            double num = dn * sxy - sx * sy;
+                            double dx  = dn * sxx - sx * sx;
+                            double dy  = dn * syy - sy * sy;
+                            if (dx <= 0.0 || dy <= 0.0) { v = NAN; break; }
+                            v = num / sqrt(dx * dy);
                             break;
                         }
                         default: v = 0.0; break;
@@ -3946,12 +4038,20 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     /* Resolve agg input columns (VLA — n_aggs ≤ 8; use ≥1 to avoid zero-size VLA UB) */
     uint8_t vla_aggs = n_aggs > 0 ? n_aggs : 1;
     ray_t* agg_vecs[vla_aggs];
+    /* Second input column per agg — non-NULL only for binary aggs
+     * (OP_PEARSON_CORR).  Allocated independently of agg_vecs because
+     * agg_owned2 may differ (each side can come from a different source
+     * — OP_SCAN literal or expr_compile). */
+    ray_t* agg_vecs2[vla_aggs];
     uint8_t agg_owned[vla_aggs]; /* 1 = we allocated via exec_node, must free */
+    uint8_t agg_owned2[vla_aggs];
     uint8_t agg_strlen[vla_aggs];
     agg_affine_t agg_affine[vla_aggs];
     agg_linear_t agg_linear[vla_aggs];
     memset(agg_vecs, 0, vla_aggs * sizeof(ray_t*));
+    memset(agg_vecs2, 0, vla_aggs * sizeof(ray_t*));
     memset(agg_owned, 0, vla_aggs * sizeof(uint8_t));
+    memset(agg_owned2, 0, vla_aggs * sizeof(uint8_t));
     memset(agg_strlen, 0, vla_aggs * sizeof(uint8_t));
     memset(agg_affine, 0, vla_aggs * sizeof(agg_affine_t));
     memset(agg_linear, 0, vla_aggs * sizeof(agg_linear_t));
@@ -3993,7 +4093,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 if (vec && !RAY_IS_ERR(vec)) {
                     agg_vecs[a] = vec;
                     agg_owned[a] = 1;
-                    continue;
+                    goto resolve_ins2;
                 }
             }
             /* Fallback: full recursive evaluation */
@@ -4004,6 +4104,41 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (vec && !RAY_IS_ERR(vec)) {
                 agg_vecs[a] = vec;
                 agg_owned[a] = 1;
+            }
+        }
+    resolve_ins2:;
+        /* Binary aggregators (OP_PEARSON_CORR): mirror the resolution
+         * above for the y-side input.  Same OP_SCAN / OP_CONST / expr
+         * fallback ladder, separate ownership flag because each side
+         * may have come from a different source. */
+        if (ext->agg_ins2 && ext->agg_ins2[a]) {
+            ray_op_t* agg_input_op2 = ext->agg_ins2[a];
+            ray_op_ext_t* agg_ext2 = find_ext(g, agg_input_op2->id);
+            if (agg_ext2 && agg_ext2->base.opcode == OP_SCAN) {
+                agg_vecs2[a] = ray_table_get_col(tbl, agg_ext2->sym);
+            } else if (agg_ext2 && agg_ext2->base.opcode == OP_CONST && agg_ext2->literal) {
+                agg_vecs2[a] = agg_ext2->literal;
+            } else {
+                ray_expr_t agg_expr2;
+                int compiled2 = 0;
+                if (expr_compile(g, tbl, agg_input_op2, &agg_expr2)) {
+                    ray_t* vec = expr_eval_full(&agg_expr2, nrows);
+                    if (vec && !RAY_IS_ERR(vec)) {
+                        agg_vecs2[a] = vec;
+                        agg_owned2[a] = 1;
+                        compiled2 = 1;
+                    }
+                }
+                if (!compiled2) {
+                    ray_t* saved_table = g->table;
+                    g->table = tbl;
+                    ray_t* vec = exec_node(g, agg_input_op2);
+                    g->table = saved_table;
+                    if (vec && !RAY_IS_ERR(vec)) {
+                        agg_vecs2[a] = vec;
+                        agg_owned2[a] = 1;
+                    }
+                }
             }
         }
     }
@@ -4023,7 +4158,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* bcast = materialize_broadcast_input(agg_vecs[a], nrows);
         if (!bcast || RAY_IS_ERR(bcast)) {
             for (uint8_t i = 0; i < n_aggs; i++) {
-                if (agg_owned[i] && agg_vecs[i]) ray_release(agg_vecs[i]);
+                { if (agg_owned[i] && agg_vecs[i]) ray_release(agg_vecs[i]); if (agg_owned2[i] && agg_vecs2[i]) ray_release(agg_vecs2[i]); }
             }
             for (uint8_t k = 0; k < n_keys; k++) {
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
@@ -4246,7 +4381,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (!result || RAY_IS_ERR(result)) {
             da_accum_free(&sc_acc[0]); scratch_free(sc_hdr);
             for (uint8_t a = 0; a < n_aggs; a++)
-                if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
             for (uint8_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
             if (match_idx_block) ray_release(match_idx_block);
@@ -4261,7 +4396,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
         da_accum_free(&sc_acc[0]); scratch_free(sc_hdr);
         for (uint8_t a = 0; a < n_aggs; a++)
-            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+            { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
         for (uint8_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
         if (match_idx_block) ray_release(match_idx_block);
@@ -4276,6 +4411,12 @@ da_path:;
     #define DA_PER_WORKER_MAX  (6ULL << 20)    /* 6 MB per-worker max */
     {
         bool da_eligible = (nrows > 0 && n_keys > 0 && n_keys <= 8);
+        /* Binary aggregators (OP_PEARSON_CORR) are not wired into the
+         * dense-array accumulator's per-worker da_accum_t struct — force
+         * the HT path which has the row-layout offsets allocated. */
+        for (uint8_t a = 0; a < n_aggs && da_eligible; a++) {
+            if (ext->agg_ops[a] == OP_PEARSON_CORR) da_eligible = false;
+        }
         for (uint8_t k = 0; k < n_keys && da_eligible; k++) {
             if (!key_data[k]) { da_eligible = false; break; }
             int8_t t = key_types[k];
@@ -4717,7 +4858,7 @@ da_path:;
             if (!result || RAY_IS_ERR(result)) {
                 da_accum_free(&accums[0]); scratch_free(accums_hdr);
                 for (uint8_t a = 0; a < n_aggs; a++)
-                    if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                    { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
                 for (uint8_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                 if (match_idx_block) ray_release(match_idx_block);
@@ -4784,7 +4925,7 @@ da_path:;
 
             da_accum_free(&accums[0]); scratch_free(accums_hdr);
             for (uint8_t a = 0; a < n_aggs; a++)
-                if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
             for (uint8_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
             if (match_idx_block) ray_release(match_idx_block);
@@ -5535,7 +5676,7 @@ ht_path:;
             for (uint8_t kk = 0; kk < n_keys; kk++)
                 if (key_owned[kk] && key_vecs[kk]) ray_release(key_vecs[kk]);
             for (uint8_t a = 0; a < n_aggs; a++)
-                if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
             if (match_idx_block) ray_release(match_idx_block);
             return ray_error("nyi", NULL);
         }
@@ -6101,6 +6242,7 @@ skip_top_count_filter:
             .key_vecs      = key_vecs,
             .nullable_mask = p1_nullable,
             .agg_vecs      = agg_vecs,
+            .agg_vecs2     = agg_vecs2,
             .agg_strlen    = agg_strlen,
             .n_workers     = n_total,
             .bufs          = radix_bufs,
@@ -6359,7 +6501,7 @@ sequential_fallback:;
         goto cleanup;
     }
     group_rows_range(&single_ht, key_data, key_types, key_attrs, key_vecs, agg_vecs,
-                     agg_strlen, rowsel,
+                     agg_vecs2, agg_strlen, rowsel,
                      0, n_scan, match_idx);
     final_ht = &single_ht;
     if (ray_interrupted()) { result = ray_error("cancel", "interrupted"); goto cleanup; }
@@ -6590,7 +6732,7 @@ cleanup:
         scratch_free(part_hts_hdr);
     }
     for (uint8_t a = 0; a < n_aggs; a++)
-        if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+        { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
     for (uint8_t k = 0; k < n_keys; k++)
         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
     if (match_idx_block) ray_release(match_idx_block);
@@ -7174,7 +7316,7 @@ static void pivot_ingest_sequential(pivot_ingest_t* out, const ght_layout_t* ly,
     out->n_parts = 1;
     out->row_stride = ly->row_stride;
     group_rows_range(scratch_ht, key_data, key_types, key_attrs, key_vecs,
-                     agg_vecs, NULL, NULL, 0, n_scan, NULL);
+                     agg_vecs, NULL, NULL, NULL, 0, n_scan, NULL);
     out->total_grps = scratch_ht->grp_count;
     out->part_offsets[0] = 0;
     out->part_offsets[1] = scratch_ht->grp_count;
@@ -7263,6 +7405,7 @@ bool pivot_ingest_run(pivot_ingest_t* out,
         .key_vecs      = key_vecs,
         .nullable_mask = p1_nullable,
         .agg_vecs      = agg_vecs,
+        .agg_vecs2     = NULL,   /* this scratch path doesn't use binary aggs */
         .n_workers     = n_total,
         .bufs          = radix_bufs,
         .layout        = *ly,
