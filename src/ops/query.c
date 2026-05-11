@@ -2229,6 +2229,110 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
     return agg_vec;
 }
 
+/* Recognise `(med col)`.  Used to gate the fast median per-group path
+ * below — `med` is RAY_FN_AGGR + RAY_UNARY so it normally routes
+ * through aggr_unary_per_group_buf, which allocates one ray vector
+ * per group via ray_at_fn and then another scratch inside ray_med_fn.
+ * For 10k+ groups that's 20k+ allocs; the bucket-scatter path skips it. */
+static int is_med_call(ray_t* expr) {
+    if (!expr || expr->type != RAY_LIST) return 0;
+    if (ray_len(expr) != 2) return 0;
+    ray_t** elems = (ray_t**)ray_data(expr);
+    if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
+    ray_t* nm = ray_sym_str(elems[0]->i64);
+    if (!nm) return 0;
+    return ray_str_len(nm) == 3 && memcmp(ray_str_ptr(nm), "med", 3) == 0;
+}
+
+/* Fast median per group: read values straight out of the source column
+ * via idx_buf+offsets+grp_cnt into a reusable double scratch buffer
+ * sized at max group, then ray_median_dbl_inplace.  Returns the f64
+ * median vec of length n_groups, or NULL on type miss (caller falls
+ * back to the generic aggr_unary_per_group_buf path). */
+static ray_t* aggr_med_per_group_buf(ray_t* expr, ray_t* tbl,
+                                     const int64_t* idx_buf,
+                                     const int64_t* offsets,
+                                     const int64_t* grp_cnt,
+                                     int64_t n_groups) {
+    ray_t** elems = (ray_t**)ray_data(expr);
+    ray_t* col_expr = elems[1];
+
+    /* Resolve source column (direct ref preferred — no copy). */
+    ray_t* src = NULL;
+    int    src_owned = 0;
+    if (col_expr->type == -RAY_SYM && (col_expr->attrs & RAY_ATTR_NAME)) {
+        src = ray_table_get_col(tbl, col_expr->i64);
+        if (src) ray_retain(src);
+    }
+    if (!src) {
+        if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+        expr_bind_table_names(col_expr, tbl);
+        src = ray_eval(col_expr);
+        ray_env_pop_scope();
+        if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("domain", NULL);
+        src_owned = 1;
+    }
+
+    /* Numeric only on the fast path.  Anything else → caller's fallback. */
+    int8_t t = src->type;
+    if (t != RAY_F64 && t != RAY_I64 && t != RAY_I32 &&
+        t != RAY_I16 && t != RAY_U8) {
+        ray_release(src);
+        return NULL;
+    }
+
+    int64_t max_cnt = 0;
+    for (int64_t g = 0; g < n_groups; g++)
+        if (grp_cnt[g] > max_cnt) max_cnt = grp_cnt[g];
+
+    ray_t* out = ray_vec_new(RAY_F64, n_groups);
+    if (!out || RAY_IS_ERR(out)) { ray_release(src); return out ? out : ray_error("oom", NULL); }
+    out->len = n_groups;
+    double* out_data = (double*)ray_data(out);
+
+    ray_t* scratch_hdr = NULL;
+    double* scratch = NULL;
+    if (max_cnt > 0) {
+        scratch = (double*)scratch_alloc(&scratch_hdr,
+                                          (size_t)max_cnt * sizeof(double));
+        if (!scratch) { ray_release(src); ray_release(out); return ray_error("oom", NULL); }
+    }
+
+    bool has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    const uint8_t* null_bm = has_nulls ? ray_vec_nullmap_bytes(src, NULL, NULL) : NULL;
+    const void* base = ray_data(src);
+
+    for (int64_t g = 0; g < n_groups; g++) {
+        int64_t cnt = grp_cnt[g];
+        int64_t base_off = offsets[g];
+        if (cnt == 0) { out_data[g] = 0.0; ray_vec_set_null(out, g, true); continue; }
+
+        int64_t actual = 0;
+        for (int64_t i = 0; i < cnt; i++) {
+            int64_t row = idx_buf[base_off + i];
+            if (null_bm && ((null_bm[row >> 3] >> (row & 7)) & 1)) continue;
+            double v;
+            switch (t) {
+                case RAY_F64: memcpy(&v, (const char*)base + (size_t)row * 8, 8); break;
+                case RAY_I64: { int64_t iv; memcpy(&iv, (const char*)base + (size_t)row * 8, 8); v = (double)iv; break; }
+                case RAY_I32: { int32_t iv; memcpy(&iv, (const char*)base + (size_t)row * 4, 4); v = (double)iv; break; }
+                case RAY_I16: { int16_t iv; memcpy(&iv, (const char*)base + (size_t)row * 2, 2); v = (double)iv; break; }
+                case RAY_U8:  v = (double)((const uint8_t*)base)[row]; break;
+                default:      v = 0.0; break;
+            }
+            scratch[actual++] = v;
+        }
+
+        if (actual == 0) { out_data[g] = 0.0; ray_vec_set_null(out, g, true); continue; }
+        out_data[g] = ray_median_dbl_inplace(scratch, actual);
+    }
+
+    if (scratch_hdr) scratch_free(scratch_hdr);
+    (void)src_owned;
+    ray_release(src);
+    return out;
+}
+
 /* Per-group count(distinct) parallel kernel — one task per group, each
  * task does its own dedup with a scratch hash table.  Skips the
  * gather_by_idx + exec_count_distinct allocation that the serial path
@@ -7250,9 +7354,22 @@ by_dict_done:
                      * vec.  Equivalent perf-class to the streaming AGG path
                      * the eval-fallback uses for the same shapes. */
                     if (is_streaming_aggr_unary_call(nonagg_exprs[ni])) {
-                        ray_t* col = aggr_unary_per_group_buf(
-                            nonagg_exprs[ni], tbl,
-                            idx_buf, offsets, grp_cnt, n_groups);
+                        ray_t* col = NULL;
+                        /* `(med col)` fast path — bucket-scatter values
+                         * into a reused scratch and quickselect, skipping
+                         * the per-group ray_at_fn + ray_med_fn scratch
+                         * allocations.  NULL → unsupported input type
+                         * (LIST/STR/etc); fall back to the generic
+                         * aggr_unary_per_group_buf path below. */
+                        if (is_med_call(nonagg_exprs[ni])) {
+                            col = aggr_med_per_group_buf(nonagg_exprs[ni], tbl,
+                                idx_buf, offsets, grp_cnt, n_groups);
+                        }
+                        if (!col) {
+                            col = aggr_unary_per_group_buf(
+                                nonagg_exprs[ni], tbl,
+                                idx_buf, offsets, grp_cnt, n_groups);
+                        }
                         if (RAY_IS_ERR(col)) { scatter_err = col; break; }
                         result = ray_table_add_col(result, nonagg_names[ni], col);
                         ray_release(col);

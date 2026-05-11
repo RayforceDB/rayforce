@@ -196,6 +196,7 @@ void     ray_cancel(void);
 #define OP_PIVOT        77   /* single-pass pivot table            */
 #define OP_ANTIJOIN     78   /* anti-semi-join (left rows with no right match) */
 #define OP_PEARSON_CORR 79   /* Pearson correlation per group (binary input) */
+#define OP_MEDIAN       88   /* exact median per group (bucket-scatter + quickselect) */
 
 /* Opcodes — Graph */
 #define OP_EXPAND        80   /* 1-hop CSR neighbor expansion       */
@@ -564,6 +565,7 @@ ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_var_pop(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_pearson_corr(ray_graph_t* g, ray_op_t* x, ray_op_t* y);
+ray_op_t* ray_median(ray_graph_t* g, ray_op_t* a);
 
 /* Structural ops */
 ray_op_t* ray_filter(ray_graph_t* g, ray_op_t* input, ray_op_t* predicate);

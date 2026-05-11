@@ -328,6 +328,11 @@ ray_t* ray_top_fn(ray_t* v, ray_t* n_obj);
 ray_t* ray_bot_fn(ray_t* v, ray_t* n_obj);
 ray_t* ray_pearson_corr_fn(ray_t* x, ray_t* y);
 
+/* In-place median (quickselect).  Caller owns the buffer; we permute
+ * elements.  Returns NaN if n <= 0.  Used by aggr_med_per_group_buf in
+ * query.c for the fast per-group median path. */
+double ray_median_dbl_inplace(double* a, int64_t n);
+
 /* Collection helpers (formerly static in eval.c, now in collection.c) */
 int    atom_eq(ray_t* a, ray_t* b);
 ray_t* list_to_typed_vec(ray_t* list, int8_t orig_vec_type);

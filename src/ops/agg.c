@@ -546,6 +546,26 @@ ray_t* ray_med_fn(ray_t* x) {
 static ray_t* var_stddev_core(ray_t* x, int sample, int take_sqrt);
 
 
+/* In-place exact median over a flat double buffer.  Caller owns the
+ * buffer; we permute its elements via nth_element_dbl.  Returns NaN
+ * if n <= 0 (caller must filter that case if a typed-null is needed).
+ *
+ * Used by the per-group median fast path in query.c which avoids the
+ * full ray_med_fn slice-allocation cost — see aggr_med_per_group_buf. */
+double ray_median_dbl_inplace(double* a, int64_t n) {
+    if (n <= 0) return 0.0;
+    if (n == 1) return a[0];
+    int64_t k = n / 2;
+    if (n % 2 == 1) {
+        nth_element_dbl(a, 0, n - 1, k);
+        return a[k];
+    }
+    nth_element_dbl(a, 0, n - 1, k - 1);
+    nth_element_dbl(a, k, n - 1, k);
+    return (a[k - 1] + a[k]) / 2.0;
+}
+
+
 ray_t* ray_dev_fn(ray_t* x) { return var_stddev_core(x, 0, 1); }
 
 /* Shared core for variance / stddev in sample or population mode.

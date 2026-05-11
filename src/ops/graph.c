@@ -691,6 +691,13 @@ ray_op_t* ray_pearson_corr(ray_graph_t* g, ray_op_t* x, ray_op_t* y) {
     return make_binary(g, OP_PEARSON_CORR, x, y, RAY_F64);
 }
 
+/* Exact median per group. Runtime forks to a separate bucket-scatter +
+ * quickselect path (see ray_median_per_group) — it can't fit the
+ * fixed-size row-layout HT because per-group buffer size is variable. */
+ray_op_t* ray_median(ray_graph_t* g, ray_op_t* a) {
+    return make_unary(g, OP_MEDIAN, a, RAY_F64);
+}
+
 /* --------------------------------------------------------------------------
  * Structural ops
  * -------------------------------------------------------------------------- */
