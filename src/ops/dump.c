@@ -89,6 +89,7 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_VAR:           return "VAR";
         case OP_VAR_POP:       return "VAR_POP";
         case OP_PEARSON_CORR:  return "PEARSON_CORR";
+        case OP_MEDIAN:        return "MEDIAN";
         case OP_FILTER:        return "FILTER";
         case OP_SORT:          return "SORT";
         case OP_GROUP:         return "GROUP";

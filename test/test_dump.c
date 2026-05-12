@@ -123,6 +123,7 @@ static test_result_t test_dump_opcode_name_all(void) {
         { OP_STDDEV,"STDDEV"}, { OP_STDDEV_POP,"STDDEV_POP"},
         { OP_VAR,"VAR"}, { OP_VAR_POP,"VAR_POP"},
         { OP_PEARSON_CORR,"PEARSON_CORR"},
+        { OP_MEDIAN,"MEDIAN"},
         { OP_FILTER,"FILTER"}, { OP_SORT,"SORT"}, { OP_GROUP,"GROUP"},
         { OP_PIVOT,"PIVOT"}, { OP_ANTIJOIN,"ANTIJOIN"}, { OP_JOIN,"JOIN"},
         { OP_WINDOW_JOIN,"WINDOW_JOIN"}, { OP_SELECT,"SELECT"},
