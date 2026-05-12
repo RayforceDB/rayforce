@@ -23,6 +23,7 @@
 
 #include "ops/internal.h"
 #include "ops/rowsel.h"
+#include "lang/internal.h"  /* for ray_median_dbl_inplace */
 
 /* ============================================================================
  * Reduction execution
@@ -1190,6 +1191,147 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
     return out;
 }
 
+/* ─── ray_median_per_group_buf ──────────────────────────────────────────
+ *
+ * Parallel exact-median per group using the bucket-scatter layout that
+ * the upstream group-by phase has already produced (idx_buf is already
+ * group-contiguous; offsets[g]..offsets[g]+grp_cnt[g] is group g's row-
+ * index slice).  Each group becomes one task in ray_pool_dispatch_n:
+ * the task allocates a stack-or-heap-backed double slice, reads
+ * src[idx_buf[off+i]] into it, then runs ray_median_dbl_inplace.
+ *
+ * Why this layout — and why it matches DuckDB without paying their
+ * realloc-per-group price:
+ *   - DuckDB's holistic quantile aggregate accumulates a per-group
+ *     vector<INPUT_TYPE> during the radix probe; each insert is a
+ *     potential vector grow.  At finalize it nth_element's each group's
+ *     vector in parallel.
+ *   - rayforce's radix probe (see idxbuf_par_fn) already produced
+ *     prefix-summed group-contiguous indices.  So we skip DuckDB's
+ *     vector-grow phase entirely — we just dispatch n_groups tasks
+ *     that each gather values + quickselect.
+ *
+ * Cache behaviour: the inner loop reads src[idx_buf[off+i]] for a
+ * single group, then quickselects the resulting slice.  The slice is
+ * sized at grp_cnt[g] (median group ~1k for q6) and stays L2-hot for
+ * the partial-sort.  Inputs are random over src so reads are still
+ * cache-missing on the source column, but those misses overlap with
+ * parallel tasks on other cores — the 27-core dispatch hides them.
+ *
+ * Type support: F64 native; I64/I32/I16/U8 cast-to-double on read.
+ * Null rows are skipped (pairwise complete, matching DuckDB).
+ *
+ * Returns: F64 vec of length n_groups, or NULL on unsupported type
+ * (caller must fall back).  On error returns RAY_IS_ERR ptr.
+ *
+ * Threshold: serial fallback when n_groups < 8 OR total < 4096 — the
+ * dispatch overhead for tiny inputs is not worth it. */
+
+typedef struct {
+    const void*    base;        /* ray_data(src) */
+    int8_t         src_type;
+    bool           has_nulls;
+    const uint8_t* null_bm;
+    const int64_t* idx_buf;
+    const int64_t* offsets;
+    const int64_t* grp_cnt;
+    double*        scratch_pool; /* flat shared scratch, sized at sum(grp_cnt) */
+    double*        out_data;     /* ray_data(out) */
+    ray_t*         out;          /* for set_null */
+} med_par_ctx_t;
+
+static inline double med_read_as_f64(const void* base, int8_t t, int64_t row) {
+    switch (t) {
+        case RAY_F64: { double v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return v; }
+        case RAY_I64: { int64_t v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return (double)v; }
+        case RAY_I32: { int32_t v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return (double)v; }
+        case RAY_I16: { int16_t v; memcpy(&v, (const char*)base + (size_t)row * 2, 2); return (double)v; }
+        case RAY_U8:  return (double)((const uint8_t*)base)[row];
+        default:      return 0.0;
+    }
+}
+
+static void med_per_group_fn(void* ctx_v, uint32_t worker_id,
+                             int64_t start, int64_t end) {
+    (void)worker_id;
+    med_par_ctx_t* c = (med_par_ctx_t*)ctx_v;
+    for (int64_t g = start; g < end; g++) {
+        int64_t cnt = c->grp_cnt[g];
+        int64_t off = c->offsets[g];
+        double* slice = c->scratch_pool + off;
+        int64_t actual = 0;
+        if (c->has_nulls && c->null_bm) {
+            for (int64_t i = 0; i < cnt; i++) {
+                int64_t row = c->idx_buf[off + i];
+                if ((c->null_bm[row >> 3] >> (row & 7)) & 1) continue;
+                slice[actual++] = med_read_as_f64(c->base, c->src_type, row);
+            }
+        } else {
+            for (int64_t i = 0; i < cnt; i++) {
+                int64_t row = c->idx_buf[off + i];
+                slice[actual++] = med_read_as_f64(c->base, c->src_type, row);
+            }
+        }
+        if (actual == 0) {
+            c->out_data[g] = 0.0;
+            ray_vec_set_null(c->out, g, true);
+        } else {
+            c->out_data[g] = ray_median_dbl_inplace(slice, actual);
+        }
+    }
+}
+
+ray_t* ray_median_per_group_buf(ray_t* src,
+                                const int64_t* idx_buf,
+                                const int64_t* offsets,
+                                const int64_t* grp_cnt,
+                                int64_t n_groups) {
+    if (!src || RAY_IS_ERR(src) || n_groups < 0) return NULL;
+    int8_t t = src->type;
+    if (t != RAY_F64 && t != RAY_I64 && t != RAY_I32 &&
+        t != RAY_I16 && t != RAY_U8) return NULL;
+
+    int64_t total = 0;
+    for (int64_t g = 0; g < n_groups; g++) total += grp_cnt[g];
+
+    ray_t* out = ray_vec_new(RAY_F64, n_groups);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n_groups;
+
+    ray_t* buf_hdr = NULL;
+    double* scratch = NULL;
+    if (total > 0) {
+        scratch = (double*)scratch_alloc(&buf_hdr,
+                                         (size_t)total * sizeof(double));
+        if (!scratch) { ray_release(out); return ray_error("oom", NULL); }
+    }
+
+    med_par_ctx_t ctx = {
+        .base = ray_data(src),
+        .src_type = t,
+        .has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0,
+        .null_bm = (src->attrs & RAY_ATTR_HAS_NULLS)
+                   ? ray_vec_nullmap_bytes(src, NULL, NULL) : NULL,
+        .idx_buf = idx_buf,
+        .offsets = offsets,
+        .grp_cnt = grp_cnt,
+        .scratch_pool = scratch,
+        .out_data = (double*)ray_data(out),
+        .out = out,
+    };
+
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && n_groups >= 8 && total >= 4096;
+    if (par) {
+        ray_pool_dispatch_n(pool, med_per_group_fn, &ctx, (uint32_t)n_groups);
+    } else {
+        med_per_group_fn(&ctx, 0, 0, n_groups);
+    }
+
+    if (buf_hdr) scratch_free(buf_hdr);
+    return out;
+}
+
 static ray_t* reduction_i64_result(int64_t val, int8_t out_type) {
     switch (out_type) {
         case RAY_DATE:      return ray_date((int32_t)val);
@@ -1443,7 +1585,16 @@ ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
 
     uint8_t nv = 0;
     for (uint8_t a = 0; a < n_aggs && a < 8; a++) {
-        if (agg_vecs[a]) {
+        /* OP_MEDIAN reserves no row-layout slot — the column is
+         * materialized in agg_vecs[a] but values are not packed into
+         * entries or HT rows.  A post-radix pass over row_gid+grp_cnt
+         * gathers per-group slices and runs quickselect; see
+         * ray_median_per_group_buf. */
+        bool holistic = agg_ops && agg_ops[a] == OP_MEDIAN;
+        if (holistic) {
+            ly.agg_is_holistic |= (uint8_t)(1u << a);
+            ly.agg_val_slot[a] = -1;
+        } else if (agg_vecs[a]) {
             ly.agg_val_slot[a] = (int8_t)nv;
             if (agg_vecs[a]->type == RAY_F64)
                 ly.agg_is_f64 |= (1u << a);
@@ -2005,7 +2156,11 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         int64_t* ev = (int64_t*)(ebuf + 8 + ((size_t)nk + 1) * 8);
         uint8_t vi = 0;
         uint8_t bin_mask = ly->agg_is_binary;
+        uint8_t hol_mask = ly->agg_is_holistic;
         for (uint8_t a = 0; a < na; a++) {
+            /* Holistic agg (OP_MEDIAN): no slot reserved — skip packing.
+             * Source column read in the post-radix pass. */
+            if (hol_mask & (1u << a)) continue;
             ray_t* ac = agg_vecs[a];
             if (!ac) continue;
             if (agg_strlen && agg_strlen[a])
@@ -2246,7 +2401,11 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
 
         uint8_t vi = 0;
         uint8_t bin_mask = ly->agg_is_binary;
+        uint8_t hol_mask = ly->agg_is_holistic;
         for (uint8_t a = 0; a < na; a++) {
+            /* Holistic agg (OP_MEDIAN): no slot reserved — skip
+             * packing.  Source column is read in the post-radix pass. */
+            if (hol_mask & (1u << a)) continue;
             ray_t* ac = c->agg_vecs[a];
             if (!ac) continue;
             if (c->agg_strlen && c->agg_strlen[a])
@@ -2386,6 +2545,9 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
 
             /* Scatter agg results to result columns */
             for (uint8_t a = 0; a < na; a++) {
+                /* Holistic aggs (OP_MEDIAN) are filled by the
+                 * post-radix pass — skip emitting from the row layout. */
+                if (ly->agg_is_holistic & (1u << a)) continue;
                 agg_out_t* ao = &c->agg_outs[a];
                 if (!ao->dst) continue; /* allocation failed (OOM) */
                 uint16_t op = ao->agg_op;
@@ -2730,6 +2892,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 case OP_STDDEV_POP: sfx = "_stddev_pop"; slen = 11; break;
                 case OP_VAR:        sfx = "_var";        slen = 4; break;
                 case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
+                case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
             }
             char buf[256];
             if (base && blen + slen < sizeof(buf)) {
@@ -2763,6 +2926,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 case OP_STDDEV_POP: nsfx = "_stddev_pop"; nslen = 11; break;
                 case OP_VAR:        nsfx = "_var";        nslen = 4; break;
                 case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
+                case OP_MEDIAN:     nsfx = "_median";     nslen = 7; break;
             }
             memcpy(nbuf + np, nsfx, nslen);
             name_id = ray_sym_intern(nbuf, (size_t)np + nslen);
@@ -3580,6 +3744,168 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
 }
 
 /* ============================================================================
+ * Post-radix holistic-aggregate fill (OP_MEDIAN)
+ *
+ * After the radix pipeline produces stable per-partition group IDs in
+ * part_hts[] + part_offsets[], we still need to materialize per-group
+ * value slices to feed the holistic quickselect kernel.  This pass:
+ *
+ *   1. Re-probe each source row against part_hts[RADIX_PART(h)] to
+ *      recover its global gid (parallel, lookup-only — no inserts).
+ *      Writes row_gid[r] = part_offsets[p] + local_gid.
+ *   2. Build idx_buf + offsets via the idxbuf hist/scat pattern over
+ *      row_gid (parallel).
+ *   3. For each OP_MEDIAN agg, call ray_median_per_group_buf and copy
+ *      the F64 output into the pre-allocated agg_outs[a].vec.
+ *
+ * Cost: ~1 extra parallel hash+probe pass over nrows (~50 ms at 10 M
+ * rows, 27 cores).  The eval-fallback this replaces was building a
+ * LIST<LIST<key>> for the same data — ~5500 ms at the same scale.
+ * ============================================================================ */
+
+/* Lookup-only HT probe — finds the gid of the matching group without
+ * modifying the HT.  Returns UINT32_MAX if the row's key combination
+ * is absent (shouldn't happen post-phase-2 since every row was
+ * inserted, but a defensive sentinel keeps callers robust under
+ * partial-build OOM corner cases). */
+static inline uint32_t group_ht_lookup_gid(const group_ht_t* ht,
+                                            uint64_t hash,
+                                            const int64_t* ekeys,
+                                            const int8_t* key_types) {
+    (void)key_types;
+    const ght_layout_t* ly = &ht->layout;
+    uint32_t mask = ht->ht_cap - 1;
+    uint8_t salt = HT_SALT(hash);
+    uint32_t slot = (uint32_t)(hash & mask);
+    uint16_t rs = ly->row_stride;
+    for (;;) {
+        uint32_t sv = ht->slots[slot];
+        if (sv == HT_EMPTY) return UINT32_MAX;
+        if (HT_SALT_V(sv) == salt) {
+            uint32_t gid = HT_GID(sv);
+            const char* row = ht->rows + (size_t)gid * rs;
+            if (group_keys_equal((const int64_t*)(const void*)(row + 8),
+                                  ekeys, ly, ht->key_data))
+                return gid;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+typedef struct {
+    void**        key_data;
+    int8_t*       key_types;
+    uint8_t*      key_attrs;
+    ray_t**       key_vecs;
+    uint8_t       n_keys;
+    uint8_t       nullable_mask;
+    uint8_t       wide_mask;
+    const uint8_t* wide_esz;
+    group_ht_t*   part_hts;
+    const uint32_t* part_offsets;
+    int64_t*      row_gid;          /* output [nrows] */
+    const int64_t* match_idx;
+} reprobe_ctx_t;
+
+static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
+                            int64_t start, int64_t end) {
+    (void)worker_id;
+    reprobe_ctx_t* c = (reprobe_ctx_t*)vctx;
+    uint8_t nk = c->n_keys;
+    int64_t ek_buf[9];           /* nk + null_mask slot */
+    int8_t* key_types = c->key_types;
+    void** key_data = c->key_data;
+    uint8_t* key_attrs = c->key_attrs;
+    ray_t** key_vecs = c->key_vecs;
+    uint8_t nullable = c->nullable_mask;
+    uint8_t wide = c->wide_mask;
+    const uint8_t* wide_esz = c->wide_esz;
+    const int64_t* match_idx = c->match_idx;
+    for (int64_t i = start; i < end; i++) {
+        if (((i - start) & 65535) == 0 && ray_interrupted()) break;
+        int64_t row = match_idx ? match_idx[i] : i;
+        uint64_t h = 0;
+        int64_t null_mask = 0;
+        for (uint8_t k = 0; k < nk; k++) {
+            int8_t t = key_types[k];
+            uint64_t kh;
+            bool is_null = (nullable & (1u << k))
+                           && ray_vec_is_null(key_vecs[k], row);
+            if (is_null) {
+                null_mask |= (int64_t)(1u << k);
+                ek_buf[k] = 0;
+                kh = ray_hash_i64(0);
+            } else if (wide & (1u << k)) {
+                uint8_t esz = wide_esz[k];
+                const void* src = (const char*)key_data[k] + (size_t)row * esz;
+                ek_buf[k] = row;
+                kh = ray_hash_bytes(src, esz);
+            } else if (t == RAY_F64) {
+                int64_t kv;
+                memcpy(&kv, &((double*)key_data[k])[row], 8);
+                ek_buf[k] = kv;
+                kh = ray_hash_f64(((double*)key_data[k])[row]);
+            } else {
+                int64_t kv = read_col_i64(key_data[k], row, t, key_attrs[k]);
+                ek_buf[k] = kv;
+                kh = ray_hash_i64(kv);
+            }
+            h = (k == 0) ? kh : ray_hash_combine(h, kh);
+        }
+        ek_buf[nk] = null_mask;
+        if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
+
+        uint32_t part = RADIX_PART(h);
+        uint32_t local = group_ht_lookup_gid(&c->part_hts[part], h,
+                                              ek_buf, key_types);
+        if (local == UINT32_MAX) {
+            c->row_gid[row] = -1;
+        } else {
+            c->row_gid[row] = (int64_t)c->part_offsets[part] + (int64_t)local;
+        }
+    }
+}
+
+/* Histogram + scatter for idx_buf construction.  Identical pattern to
+ * query.c's idxbuf_hist_fn / idxbuf_scat_fn — duplicated here to avoid
+ * pulling a query.c-internal helper through internal.h. */
+typedef struct {
+    const int64_t* row_gid;
+    int64_t*       hist;          /* [n_tasks * n_groups] */
+    int64_t*       cursor;        /* [n_tasks * n_groups] */
+    int64_t*       idx_buf;
+    int64_t        n_groups;
+    int64_t        grain;
+} med_idx_ctx_t;
+
+static void med_idx_hist_fn(void* vctx, uint32_t worker_id,
+                            int64_t start, int64_t end) {
+    (void)worker_id;
+    med_idx_ctx_t* c = (med_idx_ctx_t*)vctx;
+    int64_t task_id = start / c->grain;
+    int64_t* hist = c->hist + task_id * c->n_groups;
+    const int64_t* row_gid = c->row_gid;
+    for (int64_t r = start; r < end; r++) {
+        int64_t gi = row_gid[r];
+        if (gi >= 0) hist[gi]++;
+    }
+}
+
+static void med_idx_scat_fn(void* vctx, uint32_t worker_id,
+                            int64_t start, int64_t end) {
+    (void)worker_id;
+    med_idx_ctx_t* c = (med_idx_ctx_t*)vctx;
+    int64_t task_id = start / c->grain;
+    int64_t* cur = c->cursor + task_id * c->n_groups;
+    const int64_t* row_gid = c->row_gid;
+    int64_t* idx_buf = c->idx_buf;
+    for (int64_t r = start; r < end; r++) {
+        int64_t gi = row_gid[r];
+        if (gi >= 0) idx_buf[cur[gi]++] = r;
+    }
+}
+
+/* ============================================================================
  * Partition-aware group-by: detect parted columns, concatenate segments into
  * a flat table, then run standard exec_group once.
  * ============================================================================ */
@@ -3635,6 +3961,11 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     int64_t agg_syms[8];
     for (uint8_t a = 0; a < n_aggs && can_partition; a++) {
         uint16_t aop = ext->agg_ops[a];
+        /* OP_MEDIAN is holistic — you can't merge medians across
+         * partitions without re-scanning the underlying values, so
+         * decline per-partition exec when any agg is median.  Falls
+         * through to the concat path which sees the full vector. */
+        if (aop == OP_MEDIAN) { can_partition = 0; break; }
         if (aop != OP_SUM && aop != OP_COUNT && aop != OP_MIN &&
             aop != OP_MAX && aop != OP_AVG && aop != OP_FIRST &&
             aop != OP_LAST && aop != OP_STDDEV && aop != OP_STDDEV_POP &&
@@ -4413,9 +4744,13 @@ da_path:;
         bool da_eligible = (nrows > 0 && n_keys > 0 && n_keys <= 8);
         /* Binary aggregators (OP_PEARSON_CORR) are not wired into the
          * dense-array accumulator's per-worker da_accum_t struct — force
-         * the HT path which has the row-layout offsets allocated. */
+         * the HT path which has the row-layout offsets allocated.
+         * Holistic aggregators (OP_MEDIAN) have no per-row accumulator
+         * at all — they need the post-radix row_gid+grp_cnt pass which
+         * only the HT path provides. */
         for (uint8_t a = 0; a < n_aggs && da_eligible; a++) {
             if (ext->agg_ops[a] == OP_PEARSON_CORR) da_eligible = false;
+            if (ext->agg_ops[a] == OP_MEDIAN)       da_eligible = false;
         }
         for (uint8_t k = 0; k < n_keys && da_eligible; k++) {
             if (!key_data[k]) { da_eligible = false; break; }
@@ -6350,6 +6685,7 @@ skip_top_count_filter:
                 case OP_STDDEV: case OP_STDDEV_POP:
                 case OP_VAR: case OP_VAR_POP:
                 case OP_PEARSON_CORR:
+                case OP_MEDIAN:
                     out_type = RAY_F64; break;
                 case OP_COUNT: out_type = RAY_I64; break;
                 case OP_SUM: case OP_PROD:
@@ -6401,6 +6737,153 @@ skip_top_count_filter:
                 .key_src_data = key_data,
             };
             ray_pool_dispatch_n(pool, radix_phase3_fn, &p3ctx, RADIX_P);
+        }
+
+        /* Post-radix holistic fill: OP_MEDIAN slots need a per-group
+         * value slice + quickselect that doesn't fit the row-layout HT.
+         * Re-probe source rows to recover global gids, build a
+         * group-contiguous idx_buf, then dispatch ray_median_per_group_buf
+         * once per OP_MEDIAN agg.  See helpers above for the rationale. */
+        if (ght_layout.agg_is_holistic) {
+            int64_t n_groups = (int64_t)total_grps;
+
+            /* row_gid[nrows] — global group id per source row, or -1 on
+             * miss (defensive sentinel; phase-2 inserts every probed row). */
+            ray_t* rg_hdr = NULL;
+            int64_t* row_gid = (int64_t*)scratch_alloc(&rg_hdr,
+                (size_t)nrows * sizeof(int64_t));
+            if (!row_gid) { result = ray_error("oom", NULL); goto cleanup; }
+
+            uint8_t reprobe_nullable = 0;
+            for (uint8_t k = 0; k < n_keys; k++) {
+                if (!key_vecs[k]) continue;
+                ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
+                             ? key_vecs[k]->slice_parent : key_vecs[k];
+                if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
+                    reprobe_nullable |= (uint8_t)(1u << k);
+            }
+            reprobe_ctx_t rp = {
+                .key_data = key_data,
+                .key_types = key_types,
+                .key_attrs = key_attrs,
+                .key_vecs = key_vecs,
+                .n_keys = n_keys,
+                .nullable_mask = reprobe_nullable,
+                .wide_mask = ght_layout.wide_key_mask,
+                .wide_esz = ght_layout.wide_key_esz,
+                .part_hts = part_hts,
+                .part_offsets = part_offsets,
+                .row_gid = row_gid,
+                .match_idx = match_idx,
+            };
+            ray_pool_dispatch(pool, reprobe_rows_fn, &rp, n_scan);
+
+            /* Build idx_buf + offsets + grp_cnt via histogram/scatter. */
+            int64_t med_grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
+            int64_t med_ntasks = (nrows + med_grain - 1) / med_grain;
+            if (med_ntasks < 1) med_ntasks = 1;
+            if (med_ntasks > 65536) {
+                med_ntasks = 65536;
+                med_grain = (nrows + med_ntasks - 1) / med_ntasks;
+            }
+            ray_t* hist_hdr = NULL;
+            ray_t* cur_hdr  = NULL;
+            ray_t* cnt_hdr  = NULL;
+            ray_t* off_hdr  = NULL;
+            int64_t* hist = (int64_t*)scratch_calloc(&hist_hdr,
+                (size_t)med_ntasks * (size_t)n_groups * sizeof(int64_t));
+            int64_t* cur  = (int64_t*)scratch_alloc(&cur_hdr,
+                (size_t)med_ntasks * (size_t)n_groups * sizeof(int64_t));
+            int64_t* grp_cnt = (int64_t*)scratch_alloc(&cnt_hdr,
+                (size_t)n_groups * sizeof(int64_t));
+            int64_t* offsets = (int64_t*)scratch_alloc(&off_hdr,
+                (size_t)n_groups * sizeof(int64_t));
+            ray_t* idx_hdr = NULL;
+            int64_t* idx_buf = NULL;
+            if (hist && cur && grp_cnt && offsets) {
+                med_idx_ctx_t mctx = {
+                    .row_gid = row_gid,
+                    .hist = hist,
+                    .cursor = cur,
+                    .idx_buf = NULL,
+                    .n_groups = n_groups,
+                    .grain = med_grain,
+                };
+                ray_pool_dispatch(pool, med_idx_hist_fn, &mctx, nrows);
+                int64_t total = 0;
+                for (int64_t gi = 0; gi < n_groups; gi++) {
+                    int64_t cum = total;
+                    for (int64_t t = 0; t < med_ntasks; t++) {
+                        int64_t cn = hist[t * n_groups + gi];
+                        cur[t * n_groups + gi] = cum;
+                        cum += cn;
+                    }
+                    grp_cnt[gi] = cum - total;
+                    offsets[gi] = total;
+                    total = cum;
+                }
+                idx_buf = (int64_t*)scratch_alloc(&idx_hdr,
+                    (size_t)(total > 0 ? total : 1) * sizeof(int64_t));
+                if (idx_buf) {
+                    mctx.idx_buf = idx_buf;
+                    ray_pool_dispatch(pool, med_idx_scat_fn, &mctx, nrows);
+                }
+            }
+
+            if (idx_buf) {
+                for (uint8_t a = 0; a < n_aggs; a++) {
+                    if (!(ght_layout.agg_is_holistic & (1u << a))) continue;
+                    if (!agg_vecs[a] || !agg_cols[a]) continue;
+                    ray_t* med_vec = ray_median_per_group_buf(
+                        agg_vecs[a], idx_buf, offsets, grp_cnt, n_groups);
+                    if (!med_vec) {
+                        /* Unsupported source type — set all-null,
+                         * caller's eval-fallback would never have
+                         * routed here for unsupported types.  Fail
+                         * the whole exec_group with "nyi". */
+                        if (hist_hdr) scratch_free(hist_hdr);
+                        if (cur_hdr)  scratch_free(cur_hdr);
+                        if (cnt_hdr)  scratch_free(cnt_hdr);
+                        if (off_hdr)  scratch_free(off_hdr);
+                        if (idx_hdr)  scratch_free(idx_hdr);
+                        scratch_free(rg_hdr);
+                        result = ray_error("nyi", "median: type");
+                        goto cleanup;
+                    }
+                    if (RAY_IS_ERR(med_vec)) {
+                        if (hist_hdr) scratch_free(hist_hdr);
+                        if (cur_hdr)  scratch_free(cur_hdr);
+                        if (cnt_hdr)  scratch_free(cnt_hdr);
+                        if (off_hdr)  scratch_free(off_hdr);
+                        if (idx_hdr)  scratch_free(idx_hdr);
+                        scratch_free(rg_hdr);
+                        result = med_vec;
+                        goto cleanup;
+                    }
+                    /* Replace the empty agg_cols[a] vector with the
+                     * filled one.  agg_outs[a] is no longer consulted
+                     * for this slot (the row-layout finalize loop
+                     * already skipped it via agg_is_holistic). */
+                    ray_release(agg_cols[a]);
+                    agg_cols[a] = med_vec;
+                }
+            } else {
+                if (hist_hdr) scratch_free(hist_hdr);
+                if (cur_hdr)  scratch_free(cur_hdr);
+                if (cnt_hdr)  scratch_free(cnt_hdr);
+                if (off_hdr)  scratch_free(off_hdr);
+                if (idx_hdr)  scratch_free(idx_hdr);
+                scratch_free(rg_hdr);
+                result = ray_error("oom", NULL);
+                goto cleanup;
+            }
+
+            if (hist_hdr) scratch_free(hist_hdr);
+            if (cur_hdr)  scratch_free(cur_hdr);
+            if (cnt_hdr)  scratch_free(cnt_hdr);
+            if (off_hdr)  scratch_free(off_hdr);
+            if (idx_hdr)  scratch_free(idx_hdr);
+            scratch_free(rg_hdr);
         }
 
         /* Fixup: if nullmap prep failed for any VAR/STDDEV agg, re-scan
@@ -6467,6 +6950,7 @@ skip_top_count_filter:
                     case OP_STDDEV_POP: sfx = "_stddev_pop"; slen = 11; break;
                     case OP_VAR:        sfx = "_var";        slen = 4; break;
                     case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
+                    case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
                 }
                 char buf[256];
                 ray_t* name_dyn_hdr = NULL;
@@ -6559,6 +7043,110 @@ build_from_final_ht:
         ray_release(new_col);
     }
 
+    /* If any holistic agg (OP_MEDIAN) is present, run a sequential
+     * re-probe + median fill into a per-slot output vector array.
+     * Built lazily on first need and reused across all median slots. */
+    ray_t** med_out = NULL;
+    ray_t* med_hdr = NULL;
+    if (ly->agg_is_holistic) {
+        med_out = (ray_t**)scratch_calloc(&med_hdr,
+            (size_t)n_aggs * sizeof(ray_t*));
+        if (med_out) {
+            /* Build row_gid + grp_cnt + idx_buf sequentially.  The
+             * seq path runs at small nrows so a single-thread pass is
+             * fine; matches the radix path's logic but without
+             * dispatch overhead. */
+            ray_t* rg_hdr = NULL;
+            int64_t* row_gid = (int64_t*)scratch_alloc(&rg_hdr,
+                (size_t)nrows * sizeof(int64_t));
+            ray_t* cnt_hdr_s = NULL;
+            int64_t* grp_cnt_s = (int64_t*)scratch_calloc(&cnt_hdr_s,
+                (size_t)grp_count * sizeof(int64_t));
+            ray_t* off_hdr_s = NULL;
+            int64_t* offsets_s = (int64_t*)scratch_alloc(&off_hdr_s,
+                (size_t)grp_count * sizeof(int64_t));
+            ray_t* pos_hdr_s = NULL;
+            int64_t* pos_s = (int64_t*)scratch_alloc(&pos_hdr_s,
+                (size_t)grp_count * sizeof(int64_t));
+            if (row_gid && grp_cnt_s && offsets_s && pos_s) {
+                uint8_t reprobe_nullable_s = 0;
+                for (uint8_t k = 0; k < n_keys; k++) {
+                    if (!key_vecs[k]) continue;
+                    ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
+                                 ? key_vecs[k]->slice_parent : key_vecs[k];
+                    if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
+                        reprobe_nullable_s |= (uint8_t)(1u << k);
+                }
+                int64_t ek_buf[9];
+                for (int64_t i = 0; i < n_scan; i++) {
+                    int64_t row = match_idx ? match_idx[i] : i;
+                    uint64_t h = 0;
+                    int64_t null_mask = 0;
+                    for (uint8_t k = 0; k < n_keys; k++) {
+                        int8_t t = key_types[k];
+                        uint64_t kh;
+                        bool is_null = (reprobe_nullable_s & (1u << k))
+                                       && ray_vec_is_null(key_vecs[k], row);
+                        if (is_null) {
+                            null_mask |= (int64_t)(1u << k);
+                            ek_buf[k] = 0;
+                            kh = ray_hash_i64(0);
+                        } else if (ly->wide_key_mask & (1u << k)) {
+                            uint8_t esz = ly->wide_key_esz[k];
+                            const void* src = (const char*)key_data[k] + (size_t)row * esz;
+                            ek_buf[k] = row;
+                            kh = ray_hash_bytes(src, esz);
+                        } else if (t == RAY_F64) {
+                            int64_t kv;
+                            memcpy(&kv, &((double*)key_data[k])[row], 8);
+                            ek_buf[k] = kv;
+                            kh = ray_hash_f64(((double*)key_data[k])[row]);
+                        } else {
+                            int64_t kv = read_col_i64(key_data[k], row, t, key_attrs[k]);
+                            ek_buf[k] = kv;
+                            kh = ray_hash_i64(kv);
+                        }
+                        h = (k == 0) ? kh : ray_hash_combine(h, kh);
+                    }
+                    ek_buf[n_keys] = null_mask;
+                    if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
+                    uint32_t gid = group_ht_lookup_gid(final_ht, h, ek_buf, key_types);
+                    row_gid[row] = (gid == UINT32_MAX) ? -1 : (int64_t)gid;
+                    if (gid != UINT32_MAX) grp_cnt_s[gid]++;
+                }
+                int64_t total_s = 0;
+                for (uint32_t gi = 0; gi < grp_count; gi++) {
+                    offsets_s[gi] = total_s;
+                    pos_s[gi] = total_s;
+                    total_s += grp_cnt_s[gi];
+                }
+                ray_t* ix_hdr_s = NULL;
+                int64_t* idx_buf_s = (int64_t*)scratch_alloc(&ix_hdr_s,
+                    (size_t)(total_s > 0 ? total_s : 1) * sizeof(int64_t));
+                if (idx_buf_s) {
+                    for (int64_t i = 0; i < n_scan; i++) {
+                        int64_t row = match_idx ? match_idx[i] : i;
+                        int64_t gi = row_gid[row];
+                        if (gi >= 0) idx_buf_s[pos_s[gi]++] = row;
+                    }
+                    for (uint8_t a = 0; a < n_aggs; a++) {
+                        if (!(ly->agg_is_holistic & (1u << a))) continue;
+                        if (!agg_vecs[a]) continue;
+                        ray_t* med_vec = ray_median_per_group_buf(
+                            agg_vecs[a], idx_buf_s, offsets_s, grp_cnt_s,
+                            (int64_t)grp_count);
+                        med_out[a] = med_vec;  /* NULL or RAY_IS_ERR handled below */
+                    }
+                    scratch_free(ix_hdr_s);
+                }
+            }
+            scratch_free(rg_hdr);
+            scratch_free(cnt_hdr_s);
+            scratch_free(off_hdr_s);
+            scratch_free(pos_hdr_s);
+        }
+    }
+
     /* Agg columns from inline accumulators */
     for (uint8_t a = 0; a < n_aggs; a++) {
         uint16_t agg_op = ext->agg_ops[a];
@@ -6570,6 +7158,7 @@ build_from_final_ht:
             case OP_STDDEV: case OP_STDDEV_POP:
             case OP_VAR: case OP_VAR_POP:
             case OP_PEARSON_CORR:
+            case OP_MEDIAN:
                 out_type = RAY_F64; break;
             case OP_COUNT: out_type = RAY_I64; break;
             case OP_SUM: case OP_PROD:
@@ -6577,11 +7166,24 @@ build_from_final_ht:
             default:
                 out_type = agg_col ? agg_col->type : RAY_I64; break;
         }
-        ray_t* new_col = ray_vec_new(out_type, (int64_t)grp_count);
-        if (!new_col || RAY_IS_ERR(new_col)) continue;
-        new_col->len = (int64_t)grp_count;
+        ray_t* new_col;
+        if (agg_op == OP_MEDIAN && med_out && med_out[a]
+            && !RAY_IS_ERR(med_out[a])) {
+            new_col = med_out[a];
+            med_out[a] = NULL;  /* transferred ownership */
+        } else if (agg_op == OP_MEDIAN) {
+            /* Unsupported source type or earlier failure — skip. */
+            continue;
+        } else {
+            new_col = ray_vec_new(out_type, (int64_t)grp_count);
+            if (!new_col || RAY_IS_ERR(new_col)) continue;
+            new_col->len = (int64_t)grp_count;
+        }
 
         int8_t s = ly->agg_val_slot[a]; /* unified accum slot */
+        /* Holistic agg (OP_MEDIAN) is already filled — skip row-layout
+         * reads.  Naming + add_col below still applies. */
+        if (agg_op == OP_MEDIAN) goto med_attach;
         for (uint32_t gi = 0; gi < grp_count; gi++) {
             const char* row = final_ht->rows + (size_t)gi * ly->row_stride;
             int64_t cnt = *(const int64_t*)(const void*)row;
@@ -6667,6 +7269,7 @@ build_from_final_ht:
             }
         }
 
+    med_attach:;
         /* Generate unique column name */
         ray_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]->id);
         int64_t name_id;
@@ -6689,6 +7292,7 @@ build_from_final_ht:
                 case OP_STDDEV_POP: sfx = "_stddev_pop"; slen = 11; break;
                 case OP_VAR:        sfx = "_var";        slen = 4; break;
                 case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
+                case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
             }
             char buf[256];
             if (base && blen + slen < sizeof(buf)) {
@@ -6722,12 +7326,18 @@ build_from_final_ht:
                 case OP_STDDEV_POP: nsfx = "_stddev_pop"; nslen = 11; break;
                 case OP_VAR:        nsfx = "_var";        nslen = 4; break;
                 case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
+                case OP_MEDIAN:     nsfx = "_median";     nslen = 7; break;
             }
             memcpy(nbuf + np, nsfx, nslen);
             name_id = ray_sym_intern(nbuf, (size_t)np + nslen);
         }
         result = ray_table_add_col(result, name_id, new_col);
         ray_release(new_col);
+    }
+    if (med_out) {
+        for (uint8_t a = 0; a < n_aggs; a++)
+            if (med_out[a] && !RAY_IS_ERR(med_out[a])) ray_release(med_out[a]);
+        scratch_free(med_hdr);
     }
     }
 

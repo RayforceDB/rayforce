@@ -809,6 +809,17 @@ ray_t* exec_count_distinct(ray_graph_t* g, ray_op_t* op, ray_t* input);
 ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
                                     int64_t n_rows, int64_t n_groups);
 
+/* Parallel exact median per group via ray_pool_dispatch_n.  idx_buf is
+ * the group-contiguous row-index layout produced by the upstream
+ * group-by phase (already prefix-summed; offsets[g]..offsets[g]+
+ * grp_cnt[g] is group g's slice).  Returns F64 vec of n_groups, NULL
+ * on unsupported source type (caller falls back to serial). */
+ray_t* ray_median_per_group_buf(ray_t* src,
+                                const int64_t* idx_buf,
+                                const int64_t* offsets,
+                                const int64_t* grp_cnt,
+                                int64_t n_groups);
+
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit);
 
 /* ── collection.c ── */
@@ -866,6 +877,12 @@ typedef struct {
      * pack TWO consecutive 8-byte values per row (x then y) starting at
      * agg_val_slot[a]. */
     uint8_t  agg_is_binary;
+    /* Holistic aggregators (OP_MEDIAN): no accumulator slot reserved,
+     * agg_val_slot[a] == -1, phase-1 doesn't pack a value, phase-3
+     * skips emitting from the row layout.  A separate post-radix pass
+     * runs ray_median_per_group_buf over the source column using a
+     * row_gid+grp_cnt-derived idx_buf. */
+    uint8_t  agg_is_holistic;
     /* Wide-key support: bit k set iff key k does not fit in 8 bytes
      * (e.g. RAY_GUID = 16 B).  For wide keys the 8-byte key slot
      * stores a source-row index and the actual key bytes live in the
