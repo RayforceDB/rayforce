@@ -765,16 +765,19 @@ ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
     return &g->nodes[ext->base.id];
 }
 
-/* Shared impl for ray_group / ray_group2.  agg_ins2 NULL → no binary
- * aggs; otherwise must be the same length as agg_ins (NULL slots for
- * unary aggs, non-NULL for OP_PEARSON_CORR slots). */
+/* Shared impl for ray_group / ray_group2 / ray_group3.  agg_ins2 NULL →
+ * no binary aggs; otherwise must be the same length as agg_ins (NULL
+ * slots for unary aggs, non-NULL for OP_PEARSON_CORR slots).  agg_k NULL
+ * → no scalar params; otherwise length n_aggs (0 in slots without). */
 static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
                                 uint16_t* agg_ops, ray_op_t** agg_ins,
-                                ray_op_t** agg_ins2, uint8_t n_aggs) {
+                                ray_op_t** agg_ins2, const int64_t* agg_k,
+                                uint8_t n_aggs) {
     uint32_t key_ids[256];
     uint32_t agg_ids[256];
     uint32_t agg_ids2[256];  /* parallel to agg_ids; 0 when no second input */
     bool has_ins2 = false;
+    bool has_k = false;
     for (uint8_t i = 0; i < n_keys; i++) key_ids[i] = keys[i]->id;
     for (uint8_t i = 0; i < n_aggs; i++) {
         agg_ids[i]  = agg_ins[i]->id;
@@ -783,19 +786,24 @@ static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
             agg_ids2[i] = agg_ins2[i]->id;
             has_ins2 = true;
         }
+        if (agg_k && agg_k[i] != 0) has_k = true;
     }
 
     size_t keys_sz = (size_t)n_keys * sizeof(ray_op_t*);
     size_t ops_sz  = (size_t)n_aggs * sizeof(uint16_t);
     size_t ins_sz  = (size_t)n_aggs * sizeof(ray_op_t*);
     size_t ins2_sz = has_ins2 ? ins_sz : 0;
+    size_t k_sz    = has_k ? (size_t)n_aggs * sizeof(int64_t) : 0;
     /* Align ops after keys (pointer-sized), ins after ops, ins2 after ins. */
     size_t ops_off  = keys_sz;
     size_t ins_off  = ops_off + ops_sz;
     /* Round ins_off up to pointer alignment */
     ins_off = (ins_off + sizeof(ray_op_t*) - 1) & ~(sizeof(ray_op_t*) - 1);
     size_t ins2_off = ins_off + ins_sz;
-    ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, ins2_off + ins2_sz);
+    size_t k_off    = ins2_off + ins2_sz;
+    /* Round k_off up to int64 alignment */
+    k_off = (k_off + sizeof(int64_t) - 1) & ~(sizeof(int64_t) - 1);
+    ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, k_off + k_sz);
     if (!ext) return NULL;
 
     ext->base.opcode = OP_GROUP;
@@ -822,6 +830,13 @@ static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
     } else {
         ext->agg_ins2 = NULL;
     }
+    if (has_k) {
+        ext->agg_k = (int64_t*)(trail + k_off);
+        for (uint8_t i = 0; i < n_aggs; i++)
+            ext->agg_k[i] = agg_k ? agg_k[i] : 0;
+    } else {
+        ext->agg_k = NULL;
+    }
     ext->n_keys = n_keys;
     ext->n_aggs = n_aggs;
 
@@ -831,13 +846,20 @@ static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
 
 ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
                    uint16_t* agg_ops, ray_op_t** agg_ins, uint8_t n_aggs) {
-    return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, NULL, n_aggs);
+    return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, NULL, NULL, n_aggs);
 }
 
 ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
                      ray_op_t** agg_ins2, uint8_t n_aggs) {
-    return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, agg_ins2, n_aggs);
+    return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, agg_ins2, NULL, n_aggs);
+}
+
+ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+                     uint16_t* agg_ops, ray_op_t** agg_ins,
+                     ray_op_t** agg_ins2, const int64_t* agg_k,
+                     uint8_t n_aggs) {
+    return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, agg_ins2, agg_k, n_aggs);
 }
 
 ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys) {

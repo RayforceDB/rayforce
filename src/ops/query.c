@@ -328,6 +328,12 @@ static uint16_t resolve_agg_opcode(int64_t sym_id) {
      * pass over row_gid+grp_cnt (see exec_group + ray_median_per_group_buf). */
     if (len == 3 && memcmp(name, "med",    3) == 0) return OP_MEDIAN;
     if (len == 6 && memcmp(name, "median", 6) == 0) return OP_MEDIAN;
+    /* Holistic, binary-shape (col + K literal).  K compiled-time literal,
+     * not a DAG input — extracted from the dict expr at planner time and
+     * stored in agg_k[].  See ray_topk_per_group_buf for the per-group
+     * bounded-heap kernel. */
+    if (len == 3 && memcmp(name, "top",    3) == 0) return OP_TOP_N;
+    if (len == 3 && memcmp(name, "bot",    3) == 0) return OP_BOT_N;
     return 0;
 }
 
@@ -5790,12 +5796,16 @@ by_dict_done:
          * Non-agg expressions are tracked separately for post-DAG scatter.
          * agg_ins2[] is parallel to agg_ins[] — NULL for unary aggs,
          * non-NULL for binary aggs (currently OP_PEARSON_CORR).  The
-         * has_binary_agg flag selects ray_group2 below. */
+         * has_binary_agg flag selects ray_group2 below.  agg_k[] carries
+         * a scalar literal alongside the column for holistic aggs that
+         * take K (top/bot); zero in unrelated slots. */
         uint16_t agg_ops[16];
         ray_op_t* agg_ins[16];
         ray_op_t* agg_ins2[16];
+        int64_t agg_k[16];
         uint8_t n_aggs = 0;
         int has_binary_agg = 0;
+        int has_agg_k = 0;
 
         for (int64_t i = 0; i + 1 < dict_n; i += 2) {
             int64_t kid = dict_elems[i]->i64;
@@ -5810,11 +5820,23 @@ by_dict_done:
                 agg_ins[n_aggs] = compile_expr_dag(g, agg_elems[1]);
                 if (!agg_ins[n_aggs]) { ray_graph_free(g); ray_release(tbl); return ray_error("domain", NULL); }
                 agg_ins2[n_aggs] = NULL;
+                agg_k[n_aggs] = 0;
                 if (op == OP_PEARSON_CORR) {
                     if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); return ray_error("arity", NULL); }
                     agg_ins2[n_aggs] = compile_expr_dag(g, agg_elems[2]);
                     if (!agg_ins2[n_aggs]) { ray_graph_free(g); ray_release(tbl); return ray_error("domain", NULL); }
                     has_binary_agg = 1;
+                } else if (op == OP_TOP_N || op == OP_BOT_N) {
+                    if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); return ray_error("arity", NULL); }
+                    ray_t* k_expr = agg_elems[2];
+                    int64_t k_val;
+                    if (k_expr->type == -RAY_I64)       k_val = k_expr->i64;
+                    else if (k_expr->type == -RAY_I32)  k_val = (int64_t)(int32_t)k_expr->i64;
+                    else { ray_graph_free(g); ray_release(tbl); return ray_error("type", "top/bot K must be integer literal"); }
+                    if (k_val < 1) { ray_graph_free(g); ray_release(tbl); return ray_error("range", "top/bot K must be >= 1"); }
+                    if (k_val > 1024) { ray_graph_free(g); ray_release(tbl); return ray_error("range", "top/bot K capped at 1024"); }
+                    agg_k[n_aggs] = k_val;
+                    has_agg_k = 1;
                 }
                 n_aggs++;
             } else if (!is_group_dag_agg_expr(val_expr) && n_nonaggs < 16) {
@@ -5837,16 +5859,20 @@ by_dict_done:
                 }
                 if (can_fuse_phase1 && fused_pred_op != NULL
                     && n_nonaggs == 0 && agg_kinds_ok
-                    && !has_binary_agg)
+                    && !has_binary_agg && !has_agg_k)
                 {
                     /* exec_filtered_group dispatches: count1 (single key,
                      * single COUNT) → Phase 3 fast path; everything else →
                      * multi path with packed composite key.  Skipped when
                      * any agg is binary (filtered-group fusion only knows
-                     * about unary aggs). */
+                     * about unary aggs) or holistic with a K param. */
                     root = ray_filtered_group(g, fused_pred_op,
                                               key_ops, n_keys,
                                               agg_ops, agg_ins, n_aggs);
+                } else if (has_agg_k) {
+                    root = ray_group3(g, key_ops, n_keys, agg_ops,
+                                       agg_ins, has_binary_agg ? agg_ins2 : NULL,
+                                       agg_k, n_aggs);
                 } else if (has_binary_agg) {
                     root = ray_group2(g, key_ops, n_keys, agg_ops,
                                        agg_ins, agg_ins2, n_aggs);

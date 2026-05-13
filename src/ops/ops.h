@@ -197,6 +197,8 @@ void     ray_cancel(void);
 #define OP_ANTIJOIN     78   /* anti-semi-join (left rows with no right match) */
 #define OP_PEARSON_CORR 79   /* Pearson correlation per group (binary input) */
 #define OP_MEDIAN       88   /* exact median per group (bucket-scatter + quickselect) */
+#define OP_TOP_N        89   /* per-group largest K values (bounded max-heap) */
+#define OP_BOT_N        90   /* per-group smallest K values (bounded min-heap) */
 
 /* Opcodes — Graph */
 #define OP_EXPAND        80   /* 1-hop CSR neighbor expansion       */
@@ -294,6 +296,11 @@ typedef struct ray_op_ext {
              * unary aggs and for the whole pointer when no binary agg
              * is present in this group. */
             ray_op_t**  agg_ins2;
+            /* Optional integer parameter per agg — used by holistic
+             * aggregators that take a scalar literal alongside the
+             * column (currently OP_TOP_N / OP_BOT_N: K).  NULL for
+             * groups whose aggs all take no scalar param. */
+            int64_t*    agg_k;
         };
         struct {               /* OP_SORT: multi-column sort */
             ray_op_t**  columns;
@@ -580,6 +587,13 @@ ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
 ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
                      ray_op_t** agg_ins2, uint8_t n_aggs);
+/* Variant accepting an optional integer scalar per agg (e.g. top/bot K).
+ * agg_k is parallel to agg_ins (length n_aggs); slots are 0 for aggs
+ * that take no scalar param.  Pass NULL for agg_ins2 / agg_k if not used. */
+ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+                     uint16_t* agg_ops, ray_op_t** agg_ins,
+                     ray_op_t** agg_ins2, const int64_t* agg_k,
+                     uint8_t n_aggs);
 ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys);
 ray_op_t* ray_pivot_op(ray_graph_t* g,
                        ray_op_t** index_cols, uint8_t n_index,
