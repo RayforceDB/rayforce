@@ -3172,6 +3172,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 case OP_VAR:        sfx = "_var";        slen = 4; break;
                 case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
                 case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
+                case OP_TOP_N:      sfx = "_top";        slen = 4; break;
+                case OP_BOT_N:      sfx = "_bot";        slen = 4; break;
             }
             char buf[256];
             if (base && blen + slen < sizeof(buf)) {
@@ -3206,6 +3208,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 case OP_VAR:        nsfx = "_var";        nslen = 4; break;
                 case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
                 case OP_MEDIAN:     nsfx = "_median";     nslen = 7; break;
+                case OP_TOP_N:      nsfx = "_top";        nslen = 4; break;
+                case OP_BOT_N:      nsfx = "_bot";        nslen = 4; break;
             }
             memcpy(nbuf + np, nsfx, nslen);
             name_id = ray_sym_intern(nbuf, (size_t)np + nslen);
@@ -7117,38 +7121,50 @@ skip_top_count_filter:
                 for (uint8_t a = 0; a < n_aggs; a++) {
                     if (!(ght_layout.agg_is_holistic & (1u << a))) continue;
                     if (!agg_vecs[a] || !agg_cols[a]) continue;
-                    ray_t* med_vec = ray_median_per_group_buf(
-                        agg_vecs[a], idx_buf, offsets, grp_cnt, n_groups);
-                    if (!med_vec) {
-                        /* Unsupported source type — set all-null,
-                         * caller's eval-fallback would never have
-                         * routed here for unsupported types.  Fail
-                         * the whole exec_group with "nyi". */
+                    uint16_t aop = ext->agg_ops[a];
+                    ray_t* hol_vec = NULL;
+                    const char* err_tag = "median: type";
+                    if (aop == OP_MEDIAN) {
+                        hol_vec = ray_median_per_group_buf(
+                            agg_vecs[a], idx_buf, offsets, grp_cnt, n_groups);
+                    } else if (aop == OP_TOP_N || aop == OP_BOT_N) {
+                        int64_t k_val = (ext->agg_k && ext->agg_k[a] > 0)
+                                        ? ext->agg_k[a] : 1;
+                        hol_vec = ray_topk_per_group_buf(
+                            agg_vecs[a], k_val,
+                            aop == OP_TOP_N ? 1 : 0,
+                            idx_buf, offsets, grp_cnt, n_groups);
+                        err_tag = "top/bot: type";
+                    }
+                    if (!hol_vec) {
                         if (hist_hdr) scratch_free(hist_hdr);
                         if (cur_hdr)  scratch_free(cur_hdr);
                         if (cnt_hdr)  scratch_free(cnt_hdr);
                         if (off_hdr)  scratch_free(off_hdr);
                         if (idx_hdr)  scratch_free(idx_hdr);
                         scratch_free(rg_hdr);
-                        result = ray_error("nyi", "median: type");
+                        result = ray_error("nyi", err_tag);
                         goto cleanup;
                     }
-                    if (RAY_IS_ERR(med_vec)) {
+                    if (RAY_IS_ERR(hol_vec)) {
                         if (hist_hdr) scratch_free(hist_hdr);
                         if (cur_hdr)  scratch_free(cur_hdr);
                         if (cnt_hdr)  scratch_free(cnt_hdr);
                         if (off_hdr)  scratch_free(off_hdr);
                         if (idx_hdr)  scratch_free(idx_hdr);
                         scratch_free(rg_hdr);
-                        result = med_vec;
+                        result = hol_vec;
                         goto cleanup;
                     }
-                    /* Replace the empty agg_cols[a] vector with the
-                     * filled one.  agg_outs[a] is no longer consulted
-                     * for this slot (the row-layout finalize loop
-                     * already skipped it via agg_is_holistic). */
+                    /* Replace the stub agg_cols[a] vector with the
+                     * filled holistic column.  Update agg_outs[a].vec
+                     * to track the same pointer so the downstream
+                     * finalize_nulls loop operates on live memory
+                     * (the prior stub's ref hits zero on this
+                     * release). */
                     ray_release(agg_cols[a]);
-                    agg_cols[a] = med_vec;
+                    agg_cols[a] = hol_vec;
+                    agg_outs[a].vec = hol_vec;
                 }
             } else {
                 if (hist_hdr) scratch_free(hist_hdr);
@@ -7190,9 +7206,14 @@ skip_top_count_filter:
             }
         }
 
-        /* Finalize null flags after parallel execution */
+        /* Finalize null flags after parallel execution.  Holistic slots
+         * are filled by the post-radix pass into a fresh column; we
+         * already updated agg_outs[a].vec to track it.  For RAY_LIST
+         * cells (OP_TOP_N / OP_BOT_N) the per-cell nullmap is not
+         * consulted downstream — finalize is a no-op-y read of attrs. */
         for (uint8_t a = 0; a < n_aggs; a++) {
             if (!agg_cols[a]) continue;
+            if (agg_outs[a].vec && agg_outs[a].vec->type == RAY_LIST) continue;
             grp_finalize_nulls(agg_outs[a].vec);
         }
         for (uint8_t k = 0; k < n_keys; k++) {
@@ -7234,6 +7255,8 @@ skip_top_count_filter:
                     case OP_VAR:        sfx = "_var";        slen = 4; break;
                     case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
                     case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
+                    case OP_TOP_N:      sfx = "_top";        slen = 4; break;
+                    case OP_BOT_N:      sfx = "_bot";        slen = 4; break;
                 }
                 char buf[256];
                 ray_t* name_dyn_hdr = NULL;
@@ -7415,10 +7438,22 @@ build_from_final_ht:
                     for (uint8_t a = 0; a < n_aggs; a++) {
                         if (!(ly->agg_is_holistic & (1u << a))) continue;
                         if (!agg_vecs[a]) continue;
-                        ray_t* med_vec = ray_median_per_group_buf(
-                            agg_vecs[a], idx_buf_s, offsets_s, grp_cnt_s,
-                            (int64_t)grp_count);
-                        med_out[a] = med_vec;  /* NULL or RAY_IS_ERR handled below */
+                        uint16_t aop = ext->agg_ops[a];
+                        ray_t* hol_vec = NULL;
+                        if (aop == OP_MEDIAN) {
+                            hol_vec = ray_median_per_group_buf(
+                                agg_vecs[a], idx_buf_s, offsets_s, grp_cnt_s,
+                                (int64_t)grp_count);
+                        } else if (aop == OP_TOP_N || aop == OP_BOT_N) {
+                            int64_t k_val = (ext->agg_k && ext->agg_k[a] > 0)
+                                            ? ext->agg_k[a] : 1;
+                            hol_vec = ray_topk_per_group_buf(
+                                agg_vecs[a], k_val,
+                                aop == OP_TOP_N ? 1 : 0,
+                                idx_buf_s, offsets_s, grp_cnt_s,
+                                (int64_t)grp_count);
+                        }
+                        med_out[a] = hol_vec;  /* NULL or RAY_IS_ERR handled below */
                     }
                     scratch_free(ix_hdr_s);
                 }
@@ -7450,11 +7485,13 @@ build_from_final_ht:
                 out_type = agg_col ? agg_col->type : RAY_I64; break;
         }
         ray_t* new_col;
-        if (agg_op == OP_MEDIAN && med_out && med_out[a]
+        bool is_holistic = (agg_op == OP_MEDIAN || agg_op == OP_TOP_N ||
+                            agg_op == OP_BOT_N);
+        if (is_holistic && med_out && med_out[a]
             && !RAY_IS_ERR(med_out[a])) {
             new_col = med_out[a];
             med_out[a] = NULL;  /* transferred ownership */
-        } else if (agg_op == OP_MEDIAN) {
+        } else if (is_holistic) {
             /* Unsupported source type or earlier failure — skip. */
             continue;
         } else {
@@ -7464,9 +7501,10 @@ build_from_final_ht:
         }
 
         int8_t s = ly->agg_val_slot[a]; /* unified accum slot */
-        /* Holistic agg (OP_MEDIAN) is already filled — skip row-layout
-         * reads.  Naming + add_col below still applies. */
-        if (agg_op == OP_MEDIAN) goto med_attach;
+        /* Holistic agg (OP_MEDIAN / OP_TOP_N / OP_BOT_N) is already
+         * filled — skip row-layout reads.  Naming + add_col below
+         * still applies. */
+        if (is_holistic) goto med_attach;
         for (uint32_t gi = 0; gi < grp_count; gi++) {
             const char* row = final_ht->rows + (size_t)gi * ly->row_stride;
             int64_t cnt = *(const int64_t*)(const void*)row;
@@ -7576,6 +7614,8 @@ build_from_final_ht:
                 case OP_VAR:        sfx = "_var";        slen = 4; break;
                 case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
                 case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
+                case OP_TOP_N:      sfx = "_top";        slen = 4; break;
+                case OP_BOT_N:      sfx = "_bot";        slen = 4; break;
             }
             char buf[256];
             if (base && blen + slen < sizeof(buf)) {
@@ -7610,6 +7650,8 @@ build_from_final_ht:
                 case OP_VAR:        nsfx = "_var";        nslen = 4; break;
                 case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
                 case OP_MEDIAN:     nsfx = "_median";     nslen = 7; break;
+                case OP_TOP_N:      nsfx = "_top";        nslen = 4; break;
+                case OP_BOT_N:      nsfx = "_bot";        nslen = 4; break;
             }
             memcpy(nbuf + np, nsfx, nslen);
             name_id = ray_sym_intern(nbuf, (size_t)np + nslen);
