@@ -4151,7 +4151,15 @@ static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
 
 /* Histogram + scatter for idx_buf construction.  Identical pattern to
  * query.c's idxbuf_hist_fn / idxbuf_scat_fn — duplicated here to avoid
- * pulling a query.c-internal helper through internal.h. */
+ * pulling a query.c-internal helper through internal.h.
+ *
+ * Dispatched via ray_pool_dispatch_n with n_tasks units.  Each unit owns
+ * a contiguous row range [task_id*grain, min((task_id+1)*grain, nrows)).
+ * grain is sized to give n_tasks ≈ total_workers — this caps the
+ * hist/cur matrices at n_tasks * n_groups * 8 bytes (rather than
+ * blowing up to ~1GB when n_groups is large and grain is the default
+ * 8K morsel size).  The serial cumsum that walks hist by-gi becomes
+ * cheap (n_groups * n_tasks ops, n_tasks small). */
 typedef struct {
     const int64_t* row_gid;
     int64_t*       hist;          /* [n_tasks * n_groups] */
@@ -4159,16 +4167,20 @@ typedef struct {
     int64_t*       idx_buf;
     int64_t        n_groups;
     int64_t        grain;
+    int64_t        nrows;
 } med_idx_ctx_t;
 
 static void med_idx_hist_fn(void* vctx, uint32_t worker_id,
                             int64_t start, int64_t end) {
-    (void)worker_id;
+    (void)worker_id; (void)end;
     med_idx_ctx_t* c = (med_idx_ctx_t*)vctx;
-    int64_t task_id = start / c->grain;
+    int64_t task_id = start;  /* dispatched via _n: start = task index */
+    int64_t r_lo = task_id * c->grain;
+    int64_t r_hi = r_lo + c->grain;
+    if (r_hi > c->nrows) r_hi = c->nrows;
     int64_t* hist = c->hist + task_id * c->n_groups;
     const int64_t* row_gid = c->row_gid;
-    for (int64_t r = start; r < end; r++) {
+    for (int64_t r = r_lo; r < r_hi; r++) {
         int64_t gi = row_gid[r];
         if (gi >= 0) hist[gi]++;
     }
@@ -4176,13 +4188,16 @@ static void med_idx_hist_fn(void* vctx, uint32_t worker_id,
 
 static void med_idx_scat_fn(void* vctx, uint32_t worker_id,
                             int64_t start, int64_t end) {
-    (void)worker_id;
+    (void)worker_id; (void)end;
     med_idx_ctx_t* c = (med_idx_ctx_t*)vctx;
-    int64_t task_id = start / c->grain;
+    int64_t task_id = start;
+    int64_t r_lo = task_id * c->grain;
+    int64_t r_hi = r_lo + c->grain;
+    if (r_hi > c->nrows) r_hi = c->nrows;
     int64_t* cur = c->cursor + task_id * c->n_groups;
     const int64_t* row_gid = c->row_gid;
     int64_t* idx_buf = c->idx_buf;
-    for (int64_t r = start; r < end; r++) {
+    for (int64_t r = r_lo; r < r_hi; r++) {
         int64_t gi = row_gid[r];
         if (gi >= 0) idx_buf[cur[gi]++] = r;
     }
@@ -7065,14 +7080,30 @@ skip_top_count_filter:
             };
             ray_pool_dispatch(pool, reprobe_rows_fn, &rp, n_scan);
 
-            /* Build idx_buf + offsets + grp_cnt via histogram/scatter. */
-            int64_t med_grain = (int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS;
-            int64_t med_ntasks = (nrows + med_grain - 1) / med_grain;
+            /* Build idx_buf + offsets + grp_cnt via histogram/scatter.
+             *
+             * n_tasks is capped to a small multiple of worker count: the
+             * hist/cur matrices are sized [n_tasks * n_groups] and the
+             * cumsum below walks every entry serially.  With the default
+             * 8K-morsel grain, 10M rows × 100k groups would inflate hist
+             * to ~1GB and the cumsum to ~120M cache-strided ops (≈1.4s).
+             * Capping n_tasks ≈ worker count keeps memory in the L2/L3
+             * regime and the cumsum in single-digit ms, while leaving
+             * scatter parallelism saturated (each task is large enough). */
+            int64_t n_workers = (int64_t)ray_pool_total_workers(pool);
+            int64_t med_ntasks = n_workers > 1 ? n_workers : 1;
+            /* Don't over-task tiny inputs — each task should see ≥ 8K
+             * rows so the per-task fixed overhead is amortised. */
+            int64_t min_grain = 8192;
+            if (med_ntasks * min_grain > nrows)
+                med_ntasks = (nrows + min_grain - 1) / min_grain;
             if (med_ntasks < 1) med_ntasks = 1;
-            if (med_ntasks > 65536) {
-                med_ntasks = 65536;
-                med_grain = (nrows + med_ntasks - 1) / med_ntasks;
-            }
+            int64_t med_grain = (nrows + med_ntasks - 1) / med_ntasks;
+            if (med_grain < 1) med_grain = 1;
+            /* Recompute med_ntasks from grain so the last task covers the
+             * tail without overflow (grain rounds up; final task may be
+             * shorter). */
+            med_ntasks = (nrows + med_grain - 1) / med_grain;
             ray_t* hist_hdr = NULL;
             ray_t* cur_hdr  = NULL;
             ray_t* cnt_hdr  = NULL;
@@ -7095,8 +7126,10 @@ skip_top_count_filter:
                     .idx_buf = NULL,
                     .n_groups = n_groups,
                     .grain = med_grain,
+                    .nrows = nrows,
                 };
-                ray_pool_dispatch(pool, med_idx_hist_fn, &mctx, nrows);
+                ray_pool_dispatch_n(pool, med_idx_hist_fn, &mctx,
+                                    (uint32_t)med_ntasks);
                 int64_t total = 0;
                 for (int64_t gi = 0; gi < n_groups; gi++) {
                     int64_t cum = total;
@@ -7113,7 +7146,8 @@ skip_top_count_filter:
                     (size_t)(total > 0 ? total : 1) * sizeof(int64_t));
                 if (idx_buf) {
                     mctx.idx_buf = idx_buf;
-                    ray_pool_dispatch(pool, med_idx_scat_fn, &mctx, nrows);
+                    ray_pool_dispatch_n(pool, med_idx_scat_fn, &mctx,
+                                        (uint32_t)med_ntasks);
                 }
             }
 
