@@ -96,6 +96,27 @@
 ;; (A,X) max = 3, (A,Y) max = 2, (B,X) max = 4, (B,Y) max = 6
 (count (select {top: (take (desc v) 1) by: [g h] from: Tq8b})) -- 4
 
+;; ─── q8 native: (top col K) / (bot col K) aggregators ──────────────
+;;
+;; The OP_TOP_N / OP_BOT_N DAG-route — same canonical Tq8 as above
+;; but using the native bounded-heap aggregator instead of the
+;; (take (desc v) K) composition.  Result is a LIST<vec> per group.
+;;   A → [5 3] (top-2 of {3,1,5}), B → [7 2], C → [9 8]
+(count (select {top2: (top v3 2) by: id6 from: Tq8})) -- 3
+;; sum of (count of each list) == total kept across groups
+;;   A: min(3,2)=2, B: min(2,2)=2, C: min(4,2)=2 → 6
+(sum (map count (at (select {top2: (top v3 2) by: id6 from: Tq8}) 'top2))) -- 6
+;; Symmetric for bot: A→[1 3], B→[2 7], C→[4 6]
+(count (select {bot2: (bot v3 2) by: id6 from: Tq8})) -- 3
+;; F64 source preserves cell type: each cell is a vec of doubles
+(set Tq8f (table [id v] (list [A A A B B C C C C] [3.0 1.0 5.0 2.0 7.0 4.0 9.0 6.0 8.0])))
+(type (at (at (select {t: (top v 2) by: id from: Tq8f}) 't) 0)) -- 'F64
+;; K > grp_cnt → cell shorter than K (matches standalone topk_take_vec)
+;; Tq8 group B has 2 rows {2,7}; K=3 → cell length 2
+(count (at (at (select {t: (top v3 3) by: id6 from: Tq8}) 't) 1)) -- 2
+;; K=1 → 1-element cell, equivalent to (max v3) wrapped in a vec
+(at (at (select {t: (top v3 1) by: id6 from: Tq8}) 't) 0) -- [5]
+
 ;; ─── Composite-key correctness regression for the atom_eq fix ─────
 ;;
 ;; The exact shape that exposed the atom_eq RAY_LIST bug — confirms
