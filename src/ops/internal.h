@@ -820,6 +820,21 @@ ray_t* ray_median_per_group_buf(ray_t* src,
                                 const int64_t* grp_cnt,
                                 int64_t n_groups);
 
+/* Parallel per-group bounded top-K / bot-K via ray_pool_dispatch_n.
+ * Reuses the same idx_buf/offsets/grp_cnt layout as
+ * ray_median_per_group_buf.  K must be >= 1; cells shorter than K when
+ * grp_cnt[gi] < K (matches the standalone topk_take_vec convention).
+ * desc=1 → top (K largest, descending), desc=0 → bot (K smallest,
+ * ascending).  Returns ray_list_new(n_groups), each cell is a vec of
+ * the same type as `src`.  NULL on unsupported source type. */
+ray_t* ray_topk_per_group_buf(ray_t* src,
+                              int64_t k,
+                              uint8_t desc,
+                              const int64_t* idx_buf,
+                              const int64_t* offsets,
+                              const int64_t* grp_cnt,
+                              int64_t n_groups);
+
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit);
 
 /* ── collection.c ── */

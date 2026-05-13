@@ -1332,6 +1332,282 @@ ray_t* ray_median_per_group_buf(ray_t* src,
     return out;
 }
 
+/* ─── ray_topk_per_group_buf ──────────────────────────────────────────
+ *
+ * Parallel per-group bounded-heap top-K / bot-K.  Same idx_buf/offsets/
+ * grp_cnt layout as the median kernel — produced by exec_group's
+ * post-radix re-probe + histogram-scatter.  Each group becomes one
+ * task; the task initialises a heap with the first kk = min(K, cnt)
+ * source values, then scans the remaining cnt - kk values and replaces
+ * the worst-of-kept whenever a better value arrives.  Final heap is
+ * sorted in-place via heapsort_extract so the cell reads in the
+ * conventional order (desc=1 → largest-first, desc=0 → smallest-first),
+ * matching the standalone ray_top_fn / ray_bot_fn conventions.
+ *
+ * For K=2 (q8 canonical) the heap ops are nearly free — the dominant
+ * cost is reading from the source column under random-index access.
+ *
+ * Output is a LIST of n_groups cells; cells are pre-allocated typed
+ * vecs of the same element type as `src`, so workers can write into
+ * cell data without locking.  Null rows are skipped (matches the
+ * standalone topk_take_vec path which routes nulls-last for asc,
+ * nulls-first for desc and gathers only the non-null prefix). */
+
+typedef struct {
+    const void*    base;
+    int8_t         src_type;
+    bool           has_nulls;
+    const uint8_t* null_bm;
+    int64_t        k;
+    uint8_t        desc;
+    const int64_t* idx_buf;
+    const int64_t* offsets;
+    const int64_t* grp_cnt;
+    ray_t*         out_list;
+} topk_par_ctx_t;
+
+/* Read src element as f64 (for the F64 path).  Matches med_read_as_f64
+ * but the topk kernel uses it only on the F64 type arm. */
+static inline double topk_read_f64(const void* base, int64_t row) {
+    double v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return v;
+}
+
+/* Read src element as int64 for integer source types. */
+static inline int64_t topk_read_i64(const void* base, int8_t t, int64_t row) {
+    switch (t) {
+        case RAY_I64: case RAY_TIMESTAMP:
+            { int64_t v; memcpy(&v, (const char*)base + (size_t)row * 8, 8); return v; }
+        case RAY_I32: case RAY_DATE: case RAY_TIME:
+            { int32_t v; memcpy(&v, (const char*)base + (size_t)row * 4, 4); return (int64_t)v; }
+        case RAY_I16:
+            { int16_t v; memcpy(&v, (const char*)base + (size_t)row * 2, 2); return (int64_t)v; }
+        case RAY_BOOL: case RAY_U8:
+            return (int64_t)((const uint8_t*)base)[row];
+        default: return 0;
+    }
+}
+
+/* Write int64 value to dst at slot idx, narrowing to esz bytes. */
+static inline void topk_write_i64(void* dst, int64_t idx, int64_t v, uint8_t esz) {
+    switch (esz) {
+        case 1: ((uint8_t*)dst)[idx]  = (uint8_t)v; break;
+        case 2: ((int16_t*)dst)[idx]  = (int16_t)v; break;
+        case 4: ((int32_t*)dst)[idx]  = (int32_t)v; break;
+        default: ((int64_t*)dst)[idx] = v; break;
+    }
+}
+
+/* sift_down on a double[] heap.  max=1 → max-heap (root is largest),
+ * max=0 → min-heap (root is smallest).  Called only with i < n. */
+static inline void topk_sift_down_dbl(double* h, int64_t n, int64_t i, int max_heap) {
+    for (;;) {
+        int64_t l = 2*i+1, r = 2*i+2, w = i;
+        if (max_heap) {
+            if (l < n && h[l] > h[w]) w = l;
+            if (r < n && h[r] > h[w]) w = r;
+        } else {
+            if (l < n && h[l] < h[w]) w = l;
+            if (r < n && h[r] < h[w]) w = r;
+        }
+        if (w == i) break;
+        double t = h[i]; h[i] = h[w]; h[w] = t;
+        i = w;
+    }
+}
+
+static inline void topk_sift_down_i64(int64_t* h, int64_t n, int64_t i, int max_heap) {
+    for (;;) {
+        int64_t l = 2*i+1, r = 2*i+2, w = i;
+        if (max_heap) {
+            if (l < n && h[l] > h[w]) w = l;
+            if (r < n && h[r] > h[w]) w = r;
+        } else {
+            if (l < n && h[l] < h[w]) w = l;
+            if (r < n && h[r] < h[w]) w = r;
+        }
+        if (w == i) break;
+        int64_t t = h[i]; h[i] = h[w]; h[w] = t;
+        i = w;
+    }
+}
+
+/* For top (desc=1), the kept-K live in a MIN-heap so the root is the
+ * smallest of the kept (worst-of-best) — easy to evict when a larger
+ * value arrives.  Final heapsort with a min-heap drains smallest-first,
+ * so to emit largest-first we extract into the tail of the cell and
+ * read forward.  Symmetric for bot.  This keeps the inner loop in the
+ * cheap "compare against root, sift" shape. */
+static void topk_per_group_fn(void* ctx_v, uint32_t worker_id,
+                              int64_t start, int64_t end) {
+    (void)worker_id;
+    topk_par_ctx_t* c = (topk_par_ctx_t*)ctx_v;
+    int8_t t = c->src_type;
+    int64_t K = c->k;
+    uint8_t desc = c->desc;
+    for (int64_t gi = start; gi < end; gi++) {
+        ray_t* cell = ray_list_get(c->out_list, gi);
+        if (!cell) continue;
+        int64_t cnt = c->grp_cnt[gi];
+        int64_t off = c->offsets[gi];
+        const int64_t* idxs = &c->idx_buf[off];
+
+        /* Heap orientation: top (desc=1) keeps largest → min-heap
+         * (root=smallest-of-kept) so a larger candidate evicts the root.
+         * bot (desc=0) keeps smallest → max-heap symmetric.  max_heap
+         * arg to sift_down follows that mapping (inverted from the
+         * "what we want" direction). */
+        int max_heap = desc ? 0 : 1;
+
+        if (t == RAY_F64) {
+            double* dst = (double*)ray_data(cell);
+            int64_t kept = 0;
+            int64_t init_end = 0;  /* idx into idxs[] right after init */
+            for (int64_t i = 0; i < cnt && kept < K; i++) {
+                int64_t row = idxs[i];
+                init_end = i + 1;
+                if (c->has_nulls && c->null_bm &&
+                    ((c->null_bm[row >> 3] >> (row & 7)) & 1)) continue;
+                dst[kept++] = topk_read_f64(c->base, row);
+            }
+            if (kept == K) {
+                for (int64_t j = K/2 - 1; j >= 0; j--)
+                    topk_sift_down_dbl(dst, K, j, max_heap);
+                for (int64_t i = init_end; i < cnt; i++) {
+                    int64_t row = idxs[i];
+                    if (c->has_nulls && c->null_bm &&
+                        ((c->null_bm[row >> 3] >> (row & 7)) & 1)) continue;
+                    double v = topk_read_f64(c->base, row);
+                    if (desc ? (v > dst[0]) : (v < dst[0])) {
+                        dst[0] = v;
+                        topk_sift_down_dbl(dst, K, 0, max_heap);
+                    }
+                }
+            }
+            /* Heapsort drains root-first.  Our heap orientation is
+             * opposite to the desired output order (top → min-heap →
+             * drains ascending, but we want descending), so the
+             * standard heapsort + reverse sequence puts elements in
+             * the correct order.  Equivalent shortcut: extract roots
+             * into the tail.  We do that by sifting after swapping
+             * heap[0] with heap[n-1] — that puts the root at the end
+             * each iteration, which already gives the desired final
+             * order. */
+            int64_t n = kept;
+            while (n > 1) {
+                double tmp = dst[0]; dst[0] = dst[n-1]; dst[n-1] = tmp;
+                n--;
+                topk_sift_down_dbl(dst, n, 0, max_heap);
+            }
+            cell->len = kept;
+        } else {
+            /* Integer source: stage heap in stack buffer (K <= 1024 →
+             * 8KB), then narrow back to cell esz on write. */
+            void* dst = ray_data(cell);
+            uint8_t esz = ray_sym_elem_size(t, cell->attrs);
+            int64_t heap[1024];
+            int64_t kept = 0;
+            int64_t init_end = 0;
+            for (int64_t i = 0; i < cnt && kept < K; i++) {
+                int64_t row = idxs[i];
+                init_end = i + 1;
+                if (c->has_nulls && c->null_bm &&
+                    ((c->null_bm[row >> 3] >> (row & 7)) & 1)) continue;
+                heap[kept++] = topk_read_i64(c->base, t, row);
+            }
+            if (kept == K) {
+                for (int64_t j = K/2 - 1; j >= 0; j--)
+                    topk_sift_down_i64(heap, K, j, max_heap);
+                for (int64_t i = init_end; i < cnt; i++) {
+                    int64_t row = idxs[i];
+                    if (c->has_nulls && c->null_bm &&
+                        ((c->null_bm[row >> 3] >> (row & 7)) & 1)) continue;
+                    int64_t v = topk_read_i64(c->base, t, row);
+                    if (desc ? (v > heap[0]) : (v < heap[0])) {
+                        heap[0] = v;
+                        topk_sift_down_i64(heap, K, 0, max_heap);
+                    }
+                }
+            }
+            int64_t n = kept;
+            while (n > 1) {
+                int64_t tmp = heap[0]; heap[0] = heap[n-1]; heap[n-1] = tmp;
+                n--;
+                topk_sift_down_i64(heap, n, 0, max_heap);
+            }
+            for (int64_t i = 0; i < kept; i++)
+                topk_write_i64(dst, i, heap[i], esz);
+            cell->len = kept;
+        }
+    }
+}
+
+ray_t* ray_topk_per_group_buf(ray_t* src,
+                              int64_t k,
+                              uint8_t desc,
+                              const int64_t* idx_buf,
+                              const int64_t* offsets,
+                              const int64_t* grp_cnt,
+                              int64_t n_groups) {
+    if (!src || RAY_IS_ERR(src) || n_groups < 0) return NULL;
+    if (k < 1 || k > 1024) return NULL;
+    int8_t t = src->type;
+    if (t != RAY_F64 && t != RAY_I64 && t != RAY_I32 && t != RAY_I16 &&
+        t != RAY_U8  && t != RAY_BOOL && t != RAY_DATE && t != RAY_TIME &&
+        t != RAY_TIMESTAMP)
+        return NULL;
+
+    int64_t total = 0;
+    for (int64_t g = 0; g < n_groups; g++) total += grp_cnt[g];
+
+    ray_t* out = ray_list_new(n_groups);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+
+    /* Pre-allocate per-group cells, sized at min(K, grp_cnt[gi]).
+     * Cells are typed to match `src` so q8's F64 source gives F64
+     * cells, and (top (as 'I32 v) 3) preserves I32 (matches the
+     * standalone top_bot.rfl invariants). */
+    for (int64_t gi = 0; gi < n_groups; gi++) {
+        int64_t kk = grp_cnt[gi] < k ? grp_cnt[gi] : k;
+        ray_t* cell = col_vec_new(src, kk);
+        if (!cell || RAY_IS_ERR(cell)) {
+            ray_release(out);
+            return cell ? cell : ray_error("oom", NULL);
+        }
+        cell->len = 0;  /* worker fills in and sets cell->len = kept */
+        ray_t* new_out = ray_list_append(out, cell);
+        ray_release(cell);
+        if (!new_out || RAY_IS_ERR(new_out)) {
+            ray_release(out);
+            return new_out ? new_out : ray_error("oom", NULL);
+        }
+        out = new_out;
+    }
+
+    topk_par_ctx_t ctx = {
+        .base = ray_data(src),
+        .src_type = t,
+        .has_nulls = (src->attrs & RAY_ATTR_HAS_NULLS) != 0,
+        .null_bm = (src->attrs & RAY_ATTR_HAS_NULLS)
+                   ? ray_vec_nullmap_bytes(src, NULL, NULL) : NULL,
+        .k = k,
+        .desc = desc,
+        .idx_buf = idx_buf,
+        .offsets = offsets,
+        .grp_cnt = grp_cnt,
+        .out_list = out,
+    };
+
+    ray_pool_t* pool = ray_pool_get();
+    bool par = pool && n_groups >= 8 && total >= 4096;
+    if (par) {
+        ray_pool_dispatch_n(pool, topk_per_group_fn, &ctx, (uint32_t)n_groups);
+    } else {
+        topk_per_group_fn(&ctx, 0, 0, n_groups);
+    }
+
+    return out;
+}
+
 static ray_t* reduction_i64_result(int64_t val, int8_t out_type) {
     switch (out_type) {
         case RAY_DATE:      return ray_date((int32_t)val);
@@ -1585,12 +1861,15 @@ ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
 
     uint8_t nv = 0;
     for (uint8_t a = 0; a < n_aggs && a < 8; a++) {
-        /* OP_MEDIAN reserves no row-layout slot — the column is
-         * materialized in agg_vecs[a] but values are not packed into
-         * entries or HT rows.  A post-radix pass over row_gid+grp_cnt
-         * gathers per-group slices and runs quickselect; see
-         * ray_median_per_group_buf. */
-        bool holistic = agg_ops && agg_ops[a] == OP_MEDIAN;
+        /* OP_MEDIAN / OP_TOP_N / OP_BOT_N reserve no row-layout slot —
+         * the column is materialized in agg_vecs[a] but values are not
+         * packed into entries or HT rows.  A post-radix pass over
+         * row_gid+grp_cnt gathers per-group slices and runs quickselect
+         * (median) or a bounded heap (top/bot); see
+         * ray_median_per_group_buf / ray_topk_per_group_buf. */
+        bool holistic = agg_ops && (agg_ops[a] == OP_MEDIAN ||
+                                    agg_ops[a] == OP_TOP_N ||
+                                    agg_ops[a] == OP_BOT_N);
         if (holistic) {
             ly.agg_is_holistic |= (uint8_t)(1u << a);
             ly.agg_val_slot[a] = -1;
@@ -3961,11 +4240,13 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     int64_t agg_syms[8];
     for (uint8_t a = 0; a < n_aggs && can_partition; a++) {
         uint16_t aop = ext->agg_ops[a];
-        /* OP_MEDIAN is holistic — you can't merge medians across
-         * partitions without re-scanning the underlying values, so
-         * decline per-partition exec when any agg is median.  Falls
-         * through to the concat path which sees the full vector. */
-        if (aop == OP_MEDIAN) { can_partition = 0; break; }
+        /* Holistic aggs (OP_MEDIAN / OP_TOP_N / OP_BOT_N) can't be
+         * merged across partitions without re-scanning underlying
+         * values — decline per-partition exec.  Falls through to the
+         * concat path which sees the full vector. */
+        if (aop == OP_MEDIAN || aop == OP_TOP_N || aop == OP_BOT_N) {
+            can_partition = 0; break;
+        }
         if (aop != OP_SUM && aop != OP_COUNT && aop != OP_MIN &&
             aop != OP_MAX && aop != OP_AVG && aop != OP_FIRST &&
             aop != OP_LAST && aop != OP_STDDEV && aop != OP_STDDEV_POP &&
@@ -4745,12 +5026,14 @@ da_path:;
         /* Binary aggregators (OP_PEARSON_CORR) are not wired into the
          * dense-array accumulator's per-worker da_accum_t struct — force
          * the HT path which has the row-layout offsets allocated.
-         * Holistic aggregators (OP_MEDIAN) have no per-row accumulator
-         * at all — they need the post-radix row_gid+grp_cnt pass which
-         * only the HT path provides. */
+         * Holistic aggregators (OP_MEDIAN / OP_TOP_N / OP_BOT_N) have
+         * no per-row accumulator at all — they need the post-radix
+         * row_gid+grp_cnt pass which only the HT path provides. */
         for (uint8_t a = 0; a < n_aggs && da_eligible; a++) {
             if (ext->agg_ops[a] == OP_PEARSON_CORR) da_eligible = false;
             if (ext->agg_ops[a] == OP_MEDIAN)       da_eligible = false;
+            if (ext->agg_ops[a] == OP_TOP_N)        da_eligible = false;
+            if (ext->agg_ops[a] == OP_BOT_N)        da_eligible = false;
         }
         for (uint8_t k = 0; k < n_keys && da_eligible; k++) {
             if (!key_data[k]) { da_eligible = false; break; }
