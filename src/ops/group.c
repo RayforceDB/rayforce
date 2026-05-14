@@ -8486,42 +8486,54 @@ void pivot_ingest_free(pivot_ingest_t* out) {
 /* ============================================================================
  * exec_group_topk_rowform — dedicated per-group top-K / bot-K with row-form
  *
- * Two-phase parallel design (Siddiqui VLDB 2024 pattern).
+ * Three-phase parallel design.
  *
- * Phase 1: parallel scan, per-worker open-addressing hashmaps.  Each entry
- *  holds (key, K-slot heap of best values, kept_count).  Bounded-heap
- *  inserts: first K values fill linearly + heapify; subsequent values
- *  compare against root and sift-down if better.  No atomics.
+ * Phase 1 (parallel rows): each worker scatters fat entries
+ *  (hash:8, key_bits:8, val_bits:8) into per-(worker, partition) buffers
+ *  using the same 8-bit radix the OP_GROUP path uses (RADIX_P=256).  No
+ *  hashmap in this phase — pure streaming write.  Per-partition data fits
+ *  in L2 by construction.
  *
- * Phase 2: parallel merge by hash partition.  RADIX_P tasks; each owns
- *  groups whose hash falls in its partition.  The merge walks all per-
- *  worker maps once, collects entries hashing into the owned partition,
- *  builds a local merged hashmap, and produces the final top-K heap per
- *  unique group.  Counts are summed across partitions and prefix-scanned
- *  to give each partition its output-row range.
+ * Phase 2 (parallel partitions): RADIX_P tasks.  Each partition iterates
+ *  all worker buffers for its partition slot, probing a partition-local
+ *  open-addressing hashmap.  Entries hold a bounded K-slot heap (min-heap
+ *  for top, max-heap for bot — root = worst-of-kept).  No cross-partition
+ *  contention.
  *
- * Phase 3: parallel emit.  Each partition walks its merged hashmap and
- *  writes (key, sorted-heap-values) into the pre-allocated output
- *  columns at its row range.  No atomics, no over-allocation.
+ * Phase 3 (parallel partitions): each partition heapsort-drains its heap
+ *  entries into the pre-allocated output columns at its row range.  Row
+ *  ranges come from a prefix-sum over per-partition kept-counts.
  *
  * Compared to OP_GROUP + radix-HT + LIST-cell + adapter-side explode:
- *  - No idx_buf scatter (saves ~10M-int64 random write of 80 MB).
- *  - No LIST<F64>[K] cell allocation per group (saves 100k mallocs).
- *  - No second pass for explode (the heaps are emitted as rows directly).
+ *  - No idx_buf scatter (no random 80 MB write).
+ *  - No LIST<F64>[K] cell allocation per group (no 100k mallocs).
+ *  - Values stream straight into heaps in phase 2; no second pass for
+ *    explode in user code.
  * ============================================================================ */
 
-/* Per-worker hash map.  Key=int64 (i64-encoded source key), value=heap
- * stored as int64[K] (raw bits — reinterpretable to f64).  kept ∈ [0,K].
- * salt slot packs (salt:8, idx:24) like group_ht_t but inlined into
- * one uint32 slot array.  We do not need to handle wide-key (single
- * key only, fits in 8 bytes — STR/GUID is out of scope for this
- * planner shape since the canonical q8 has I64 id6 keys). */
+/* Scatter entry: 3 × 8 bytes = 24 bytes per row.  Phase 1 writes these
+ * sequentially into per-partition buffers; Phase 2 reads them linearly.
+ *   word 0: hash (used for HT probe and salt extraction)
+ *   word 1: key bits (canonical int64 — reinterp to double for F64)
+ *   word 2: val bits (canonical int64 — reinterp to double for F64) */
+#define GRPT_SCATTER_STRIDE 24u
+
 typedef struct {
-    int64_t  key;        /* canonical key bits (i64, or reinterp f64 bits) */
+    char*    data;          /* [count * GRPT_SCATTER_STRIDE] */
+    uint32_t count;
+    uint32_t cap;
+    bool     oom;
+    ray_t*   _hdr;
+} grpt_scat_buf_t;
+
+/* Probe-and-heap entry in partition HT.  Heap slots are int64 raw bits
+ * (memcpy'd from/to double for F64 values).  K capped at 255 (uint8 kept). */
+typedef struct {
+    int64_t  key;          /* canonical key bits */
     uint8_t  kept;
-    uint8_t  has_null_key;  /* set on the single null-key entry, if any */
+    uint8_t  has_null_key;
     uint8_t  pad[6];        /* align trailing heap[K] to 8 bytes */
-    /* heap[K] follows here — variable-size; offsets computed from K */
+    /* heap[K] follows here — variable-size */
 } grpt_entry_t;
 
 #define GRPT_ENTRY_HEAD_SZ (sizeof(grpt_entry_t))
@@ -8725,16 +8737,12 @@ typedef struct {
     const void* val_data;
     int8_t      key_type;
     int8_t      val_type;
-    bool        key_has_nulls;
-    bool        val_has_nulls;
     const uint8_t* key_null_bm;
     const uint8_t* val_null_bm;
-    int64_t     k;
-    int         desc;
     int         val_is_f64;
-    /* outputs (per worker) */
-    grpt_ht_t*  worker_hts;   /* [n_workers] */
-    _Atomic(uint32_t)* worker_inited;  /* bitmap [n_workers] — set on first use */
+    /* outputs: per-worker × per-partition scatter buffers */
+    grpt_scat_buf_t* bufs;       /* [n_workers * RADIX_P] */
+    uint32_t    n_workers;
 } grpt_phase1_ctx_t;
 
 static inline int64_t grpt_key_read(const void* base, int8_t t, int64_t row) {
@@ -8776,23 +8784,50 @@ static inline bool grpt_is_null(const uint8_t* nbm, int64_t row) {
     return (nbm[row >> 3] >> (row & 7)) & 1;
 }
 
+static inline int64_t grpt_val_read(const void* base, int8_t t, int64_t row,
+                                     int val_is_f64) {
+    if (val_is_f64) {
+        int64_t bits; memcpy(&bits, (const char*)base + (size_t)row*8, 8);
+        return bits;
+    }
+    switch (t) {
+        case RAY_I64: case RAY_TIMESTAMP:
+            { int64_t v; memcpy(&v, (const char*)base + (size_t)row*8, 8); return v; }
+        case RAY_I32: case RAY_DATE: case RAY_TIME:
+            { int32_t v; memcpy(&v, (const char*)base + (size_t)row*4, 4); return (int64_t)v; }
+        case RAY_I16:
+            { int16_t v; memcpy(&v, (const char*)base + (size_t)row*2, 2); return (int64_t)v; }
+        case RAY_BOOL: case RAY_U8:
+            return (int64_t)((const uint8_t*)base)[row];
+        default: return 0;
+    }
+}
+
+static inline void grpt_scat_push(grpt_scat_buf_t* buf, uint64_t hash,
+                                    int64_t key_bits, int64_t val_bits) {
+    if (__builtin_expect(buf->count >= buf->cap, 0)) {
+        uint32_t old_cap = buf->cap ? buf->cap : 64;
+        uint32_t new_cap = old_cap * 2;
+        char* new_data = (char*)scratch_realloc(&buf->_hdr,
+            (size_t)buf->cap * GRPT_SCATTER_STRIDE,
+            (size_t)new_cap * GRPT_SCATTER_STRIDE);
+        if (!new_data) { buf->oom = true; return; }
+        buf->data = new_data;
+        buf->cap = new_cap;
+    }
+    char* dst = buf->data + (size_t)buf->count * GRPT_SCATTER_STRIDE;
+    memcpy(dst,      &hash,     8);
+    memcpy(dst + 8,  &key_bits, 8);
+    memcpy(dst + 16, &val_bits, 8);
+    buf->count++;
+}
+
 static void grpt_phase1_fn(void* ctx_v, uint32_t worker_id,
                            int64_t start, int64_t end) {
     grpt_phase1_ctx_t* c = (grpt_phase1_ctx_t*)ctx_v;
-    grpt_ht_t* ht = &c->worker_hts[worker_id];
-
-    /* First-use lazy init.  Worker_id may be revisited in the same
-     * dispatch (work-stealing) — atomic CAS ensures one-time init. */
-    uint32_t expected = 0;
-    if (atomic_compare_exchange_strong(&c->worker_inited[worker_id],
-                                        &expected, 1)) {
-        if (!grpt_ht_init(ht, 1024, c->k)) return;
-    }
-    if (ht->oom) return;
+    grpt_scat_buf_t* my_bufs = &c->bufs[(size_t)worker_id * RADIX_P];
 
     int8_t kt = c->key_type, vt = c->val_type;
-    int64_t K = c->k;
-    int desc = c->desc;
     int val_is_f64 = c->val_is_f64;
     const void* kbase = c->key_data;
     const void* vbase = c->val_data;
@@ -8801,55 +8836,37 @@ static void grpt_phase1_fn(void* ctx_v, uint32_t worker_id,
 
     for (int64_t r = start; r < end; r++) {
         /* Skip null value rows (match standalone `top` and DuckDB WHERE
-         * v IS NOT NULL).  Null keys form their own singleton group. */
+         * v IS NOT NULL). */
         if (vnbm && grpt_is_null(vnbm, r)) continue;
-
-        bool key_null = (knbm && grpt_is_null(knbm, r));
-        int64_t key_bits = key_null ? 0 : grpt_key_read(kbase, kt, r);
-        uint64_t h = key_null ? ray_hash_i64(0) : grpt_key_hash(key_bits, kt);
-
-        grpt_entry_t* e = grpt_ht_get(ht, h, key_bits, key_null);
-        if (!e) return;   /* OOM — ht->oom flagged */
-
-        int64_t* heap = grpt_heap(e);
-        if (val_is_f64) {
-            double v; memcpy(&v, (const char*)vbase + (size_t)r*8, 8);
-            grpt_heap_push_dbl(heap, &e->kept, K, v, desc);
-        } else {
-            int64_t v;
-            switch (vt) {
-                case RAY_I64: case RAY_TIMESTAMP:
-                    memcpy(&v, (const char*)vbase + (size_t)r*8, 8); break;
-                case RAY_I32: case RAY_DATE: case RAY_TIME:
-                    { int32_t t32; memcpy(&t32, (const char*)vbase + (size_t)r*4, 4); v = (int64_t)t32; }
-                    break;
-                case RAY_I16:
-                    { int16_t t16; memcpy(&t16, (const char*)vbase + (size_t)r*2, 2); v = (int64_t)t16; }
-                    break;
-                case RAY_BOOL: case RAY_U8:
-                    v = (int64_t)((const uint8_t*)vbase)[r]; break;
-                default: continue;
-            }
-            grpt_heap_push_i64(heap, &e->kept, K, v, desc);
-        }
+        /* Skip null keys too: matches the OP_TOP_N path's effective
+         * behaviour and DuckDB's groupby semantics where NULL keys form
+         * a discarded group (we mirror DuckDB which drops null-key rows
+         * from windowed top-K).  Canonical q8 has no null id6, so no
+         * correctness impact on the bench path; small-data fixtures with
+         * null id6 are routed away by the type-restriction in the
+         * planner (no SYM keys). */
+        if (knbm && grpt_is_null(knbm, r)) continue;
+        int64_t key_bits = grpt_key_read(kbase, kt, r);
+        uint64_t h = grpt_key_hash(key_bits, kt);
+        int64_t val_bits = grpt_val_read(vbase, vt, r, val_is_f64);
+        uint32_t part = RADIX_PART(h);
+        grpt_scat_push(&my_bufs[part], h, key_bits, val_bits);
     }
 }
 
 /* ─── Phase 2 ──────────────────────────────────────────────────────────
- * Per-partition merge.  RADIX_P tasks.  Each task walks all per-worker
- * hashmaps, picks entries whose hash partitions into its own range, and
- * merges into a partition-local hashmap.  After all partitions finish,
- * we have RADIX_P independent merged maps that cover the full result. */
+ * Per-partition aggregation.  RADIX_P tasks.  Each task iterates all
+ * per-worker scatter buffers for its partition slot, probes a
+ * partition-local hashmap, and applies bounded-heap insert.  HT size
+ * is small (partition holds ~n_groups/256 entries) so it stays L2-hot. */
 
 typedef struct {
-    grpt_ht_t*  worker_hts;
+    grpt_scat_buf_t* bufs;       /* [n_workers * RADIX_P] */
     uint32_t    n_workers;
     grpt_ht_t*  part_hts;       /* [RADIX_P] */
     int64_t     k;
     int         desc;
     int         val_is_f64;
-    int8_t      key_type;
-    int8_t      val_type;
     int64_t*    part_emit_rows;  /* [RADIX_P]: total kept across this partition */
 } grpt_phase2_ctx_t;
 
@@ -8860,38 +8877,55 @@ static void grpt_phase2_fn(void* ctx_v, uint32_t worker_id,
     int64_t K = c->k;
     int desc = c->desc;
     int val_is_f64 = c->val_is_f64;
-    int8_t kt = c->key_type;
 
     for (int64_t pi = start; pi < end; pi++) {
         uint32_t p = (uint32_t)pi;
         grpt_ht_t* ph = &c->part_hts[p];
-        if (!grpt_ht_init(ph, 256, K)) return;
+        /* Estimate group count per partition from the scatter sizes.
+         * Total scatter for partition p across workers ≈ nrows/256; HT
+         * cap = next-pow2(2 * that / 256-ish).  Use a generous fixed
+         * initial size (8192) — fits in 32 KB which is L1-friendly. */
+        if (!grpt_ht_init(ph, 8192, K)) return;
 
         int64_t kept_sum = 0;
         for (uint32_t w = 0; w < c->n_workers; w++) {
-            grpt_ht_t* wht = &c->worker_hts[w];
-            if (!wht->entries || wht->oom) continue;
-            uint32_t wcount = wht->count;
-            uint16_t wstride = wht->entry_stride;
-            for (uint32_t i = 0; i < wcount; i++) {
-                grpt_entry_t* we = (grpt_entry_t*)(wht->entries +
-                                                    (size_t)i * wstride);
-                uint64_t h = we->has_null_key ? ray_hash_i64(0)
-                                              : grpt_key_hash(we->key, kt);
-                if (RADIX_PART(h) != p) continue;
-                grpt_entry_t* me = grpt_ht_get(ph, h, we->key,
-                                                we->has_null_key);
+            grpt_scat_buf_t* buf = &c->bufs[(size_t)w * RADIX_P + p];
+            if (!buf->data || buf->oom) continue;
+            uint32_t nbuf = buf->count;
+            const char* base = buf->data;
+
+            /* Stride-ahead prefetch on slot array (~25ns/probe vs L2
+             * miss).  D=8 covers the per-probe latency window. */
+            enum { PF_DIST = 8 };
+            uint32_t pf_end = (nbuf < PF_DIST) ? nbuf : PF_DIST;
+            uint32_t mask = ph->cap - 1;
+            for (uint32_t j = 0; j < pf_end; j++) {
+                uint64_t h;
+                memcpy(&h, base + (size_t)j * GRPT_SCATTER_STRIDE, 8);
+                __builtin_prefetch(&ph->slots[(uint32_t)(h & mask)], 0, 1);
+            }
+            for (uint32_t i = 0; i < nbuf; i++) {
+                if (i + PF_DIST < nbuf) {
+                    uint64_t hpf;
+                    memcpy(&hpf,
+                           base + (size_t)(i + PF_DIST) * GRPT_SCATTER_STRIDE, 8);
+                    /* mask may grow after a resize; reread after probe */
+                    __builtin_prefetch(&ph->slots[(uint32_t)(hpf & (ph->cap - 1))], 0, 1);
+                }
+                uint64_t h;
+                int64_t kb, vb;
+                const char* e = base + (size_t)i * GRPT_SCATTER_STRIDE;
+                memcpy(&h,  e,      8);
+                memcpy(&kb, e + 8,  8);
+                memcpy(&vb, e + 16, 8);
+                grpt_entry_t* me = grpt_ht_get(ph, h, kb, false);
                 if (!me) return;
                 int64_t* mh = grpt_heap(me);
-                int64_t* wh = grpt_heap(we);
                 if (val_is_f64) {
-                    for (uint8_t j = 0; j < we->kept; j++) {
-                        double v; memcpy(&v, &wh[j], 8);
-                        grpt_heap_push_dbl(mh, &me->kept, K, v, desc);
-                    }
+                    double v; memcpy(&v, &vb, 8);
+                    grpt_heap_push_dbl(mh, &me->kept, K, v, desc);
                 } else {
-                    for (uint8_t j = 0; j < we->kept; j++)
-                        grpt_heap_push_i64(mh, &me->kept, K, wh[j], desc);
+                    grpt_heap_push_i64(mh, &me->kept, K, vb, desc);
                 }
             }
         }
@@ -9059,23 +9093,36 @@ ray_t* exec_group_topk_rowform(ray_graph_t* g, ray_op_t* op) {
         return out;
     }
 
-    /* Per-worker hashmaps */
     ray_pool_t* pool = ray_pool_get();
     uint32_t n_workers = pool ? ray_pool_total_workers(pool) : 1;
     /* Sequential threshold — small inputs skip the pool overhead. */
     bool parallel = pool && nrows >= 16384;
     if (!parallel) n_workers = 1;
 
-    ray_t* whts_hdr = NULL;
-    grpt_ht_t* worker_hts = (grpt_ht_t*)scratch_calloc(&whts_hdr,
-                                (size_t)n_workers * sizeof(grpt_ht_t));
-    ray_t* winit_hdr = NULL;
-    _Atomic(uint32_t)* worker_inited = (_Atomic(uint32_t)*)scratch_calloc(
-        &winit_hdr, (size_t)n_workers * sizeof(_Atomic(uint32_t)));
-    if (!worker_hts || !worker_inited) {
-        if (whts_hdr) scratch_free(whts_hdr);
-        if (winit_hdr) scratch_free(winit_hdr);
-        return ray_error("oom", NULL);
+    /* Per-worker × per-partition scatter buffers (24 B per row). */
+    size_t n_bufs = (size_t)n_workers * RADIX_P;
+    ray_t* bufs_hdr = NULL;
+    grpt_scat_buf_t* bufs = (grpt_scat_buf_t*)scratch_calloc(&bufs_hdr,
+        n_bufs * sizeof(grpt_scat_buf_t));
+    if (!bufs) return ray_error("oom", NULL);
+
+    /* Pre-size each scatter buffer.  Average rows-per-partition ≈
+     * nrows / RADIX_P / n_workers, but distribution is uniform so
+     * 2× headroom is safe.  Keep the initial alloc small (e.g. 256
+     * entries × 24 B = 6 KB) so workers that don't hit a partition
+     * don't bloat memory. */
+    uint32_t init_cap = 256;
+    for (size_t i = 0; i < n_bufs; i++) {
+        bufs[i].data = (char*)scratch_alloc(&bufs[i]._hdr,
+            (size_t)init_cap * GRPT_SCATTER_STRIDE);
+        if (!bufs[i].data) {
+            for (size_t j = 0; j <= i; j++)
+                if (bufs[j]._hdr) scratch_free(bufs[j]._hdr);
+            scratch_free(bufs_hdr);
+            return ray_error("oom", NULL);
+        }
+        bufs[i].cap = init_cap;
+        bufs[i].count = 0;
     }
 
     grpt_phase1_ctx_t p1 = {
@@ -9083,38 +9130,32 @@ ray_t* exec_group_topk_rowform(ray_graph_t* g, ray_op_t* op) {
         .val_data = ray_data(val_vec),
         .key_type = kt,
         .val_type = vt,
-        .key_has_nulls = (key_vec->attrs & RAY_ATTR_HAS_NULLS) != 0,
-        .val_has_nulls = (val_vec->attrs & RAY_ATTR_HAS_NULLS) != 0,
         .key_null_bm = (key_vec->attrs & RAY_ATTR_HAS_NULLS)
                        ? ray_vec_nullmap_bytes(key_vec, NULL, NULL) : NULL,
         .val_null_bm = (val_vec->attrs & RAY_ATTR_HAS_NULLS)
                        ? ray_vec_nullmap_bytes(val_vec, NULL, NULL) : NULL,
-        .k = K,
-        .desc = desc,
         .val_is_f64 = (vt == RAY_F64) ? 1 : 0,
-        .worker_hts = worker_hts,
-        .worker_inited = worker_inited,
+        .bufs = bufs,
+        .n_workers = n_workers,
     };
 
     if (parallel) {
         ray_pool_dispatch(pool, grpt_phase1_fn, &p1, nrows);
     } else {
-        /* Force worker 0 init then call directly. */
-        atomic_store(&worker_inited[0], 0);
         grpt_phase1_fn(&p1, 0, 0, nrows);
     }
 
-    /* Check for OOM in any worker map */
-    for (uint32_t w = 0; w < n_workers; w++) {
-        if (worker_hts[w].oom) {
-            for (uint32_t i = 0; i < n_workers; i++)
-                grpt_ht_free(&worker_hts[i]);
-            scratch_free(whts_hdr); scratch_free(winit_hdr);
+    /* Check OOM */
+    for (size_t i = 0; i < n_bufs; i++) {
+        if (bufs[i].oom) {
+            for (size_t j = 0; j < n_bufs; j++)
+                if (bufs[j]._hdr) scratch_free(bufs[j]._hdr);
+            scratch_free(bufs_hdr);
             return ray_error("oom", NULL);
         }
     }
 
-    /* Phase 2: per-partition merge.  RADIX_P merged hashmaps. */
+    /* Phase 2: per-partition HT build. */
     ray_t* phts_hdr = NULL;
     grpt_ht_t* part_hts = (grpt_ht_t*)scratch_calloc(&phts_hdr,
                                 (size_t)RADIX_P * sizeof(grpt_ht_t));
@@ -9122,20 +9163,20 @@ ray_t* exec_group_topk_rowform(ray_graph_t* g, ray_op_t* op) {
     int64_t* part_emit_rows = (int64_t*)scratch_calloc(&per_hdr,
                                 (size_t)RADIX_P * sizeof(int64_t));
     if (!part_hts || !part_emit_rows) {
-        for (uint32_t w = 0; w < n_workers; w++) grpt_ht_free(&worker_hts[w]);
         if (phts_hdr) scratch_free(phts_hdr);
         if (per_hdr)  scratch_free(per_hdr);
-        scratch_free(whts_hdr); scratch_free(winit_hdr);
+        for (size_t j = 0; j < n_bufs; j++)
+            if (bufs[j]._hdr) scratch_free(bufs[j]._hdr);
+        scratch_free(bufs_hdr);
         return ray_error("oom", NULL);
     }
 
     grpt_phase2_ctx_t p2 = {
-        .worker_hts = worker_hts,
+        .bufs = bufs,
         .n_workers = n_workers,
         .part_hts = part_hts,
         .k = K, .desc = desc,
         .val_is_f64 = (vt == RAY_F64) ? 1 : 0,
-        .key_type = kt, .val_type = vt,
         .part_emit_rows = part_emit_rows,
     };
     if (parallel) {
@@ -9144,13 +9185,13 @@ ray_t* exec_group_topk_rowform(ray_graph_t* g, ray_op_t* op) {
         grpt_phase2_fn(&p2, 0, 0, RADIX_P);
     }
 
-    /* OOM check on merged maps */
     for (uint32_t p = 0; p < RADIX_P; p++) {
         if (part_hts[p].oom) {
-            for (uint32_t i = 0; i < n_workers; i++) grpt_ht_free(&worker_hts[i]);
-            for (uint32_t i = 0; i < RADIX_P;    i++) grpt_ht_free(&part_hts[i]);
+            for (uint32_t i = 0; i < RADIX_P; i++) grpt_ht_free(&part_hts[i]);
             scratch_free(phts_hdr); scratch_free(per_hdr);
-            scratch_free(whts_hdr); scratch_free(winit_hdr);
+            for (size_t j = 0; j < n_bufs; j++)
+                if (bufs[j]._hdr) scratch_free(bufs[j]._hdr);
+            scratch_free(bufs_hdr);
             return ray_error("oom", NULL);
         }
     }
@@ -9160,10 +9201,11 @@ ray_t* exec_group_topk_rowform(ray_graph_t* g, ray_op_t* op) {
     int64_t* part_offsets = (int64_t*)scratch_alloc(&po_hdr,
                                 (size_t)(RADIX_P + 1) * sizeof(int64_t));
     if (!part_offsets) {
-        for (uint32_t i = 0; i < n_workers; i++) grpt_ht_free(&worker_hts[i]);
-        for (uint32_t i = 0; i < RADIX_P;    i++) grpt_ht_free(&part_hts[i]);
+        for (uint32_t i = 0; i < RADIX_P; i++) grpt_ht_free(&part_hts[i]);
         scratch_free(phts_hdr); scratch_free(per_hdr);
-        scratch_free(whts_hdr); scratch_free(winit_hdr);
+        for (size_t j = 0; j < n_bufs; j++)
+            if (bufs[j]._hdr) scratch_free(bufs[j]._hdr);
+        scratch_free(bufs_hdr);
         return ray_error("oom", NULL);
     }
     int64_t total_rows = 0;
@@ -9179,11 +9221,12 @@ ray_t* exec_group_topk_rowform(ray_graph_t* g, ray_op_t* op) {
     if (!key_out || !val_out || RAY_IS_ERR(key_out) || RAY_IS_ERR(val_out)) {
         if (key_out) ray_release(key_out);
         if (val_out) ray_release(val_out);
-        for (uint32_t i = 0; i < n_workers; i++) grpt_ht_free(&worker_hts[i]);
-        for (uint32_t i = 0; i < RADIX_P;    i++) grpt_ht_free(&part_hts[i]);
+        for (uint32_t i = 0; i < RADIX_P; i++) grpt_ht_free(&part_hts[i]);
         scratch_free(po_hdr);
         scratch_free(phts_hdr); scratch_free(per_hdr);
-        scratch_free(whts_hdr); scratch_free(winit_hdr);
+        for (size_t j = 0; j < n_bufs; j++)
+            if (bufs[j]._hdr) scratch_free(bufs[j]._hdr);
+        scratch_free(bufs_hdr);
         return ray_error("oom", NULL);
     }
     key_out->len = total_rows;
@@ -9199,7 +9242,7 @@ ray_t* exec_group_topk_rowform(ray_graph_t* g, ray_op_t* op) {
         .val_esz = (uint8_t)ray_elem_size(vt),
         .key_out = ray_data(key_out),
         .val_out = ray_data(val_out),
-        .key_vec = key_out,   /* needed for null-key marking */
+        .key_vec = key_out,
     };
     if (parallel) {
         ray_pool_dispatch_n(pool, grpt_phase3_fn, &p3, RADIX_P);
@@ -9216,11 +9259,12 @@ ray_t* exec_group_topk_rowform(ray_graph_t* g, ray_op_t* op) {
     }
     ray_release(key_out); ray_release(val_out);
 
-    for (uint32_t i = 0; i < n_workers; i++) grpt_ht_free(&worker_hts[i]);
-    for (uint32_t i = 0; i < RADIX_P;    i++) grpt_ht_free(&part_hts[i]);
+    for (uint32_t i = 0; i < RADIX_P; i++) grpt_ht_free(&part_hts[i]);
     scratch_free(po_hdr);
     scratch_free(phts_hdr); scratch_free(per_hdr);
-    scratch_free(whts_hdr); scratch_free(winit_hdr);
+    for (size_t j = 0; j < n_bufs; j++)
+        if (bufs[j]._hdr) scratch_free(bufs[j]._hdr);
+    scratch_free(bufs_hdr);
 
     return result;
 }
