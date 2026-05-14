@@ -199,6 +199,13 @@ void     ray_cancel(void);
 #define OP_MEDIAN       88   /* exact median per group (bucket-scatter + quickselect) */
 #define OP_TOP_N        89   /* per-group largest K values (bounded max-heap) */
 #define OP_BOT_N        90   /* per-group smallest K values (bounded min-heap) */
+/* Dedicated single-pass per-group top-K / bot-K with row-form emission.
+ * Replaces the OP_GROUP + radix-HT + LIST<K>-cell + explode pipeline for
+ * the canonical shape `(select (top|bot col K) from t by single_key)`.
+ * Two-phase parallel: per-worker bounded heaps in phase 1; merge by hash
+ * partition in phase 2; emit a 2-column table (key, value) in row form. */
+#define OP_GROUP_TOPK_ROWFORM  91
+#define OP_GROUP_BOTK_ROWFORM 110
 
 /* Opcodes — Graph */
 #define OP_EXPAND        80   /* 1-hop CSR neighbor expansion       */
@@ -594,6 +601,14 @@ ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
                      ray_op_t** agg_ins2, const int64_t* agg_k,
                      uint8_t n_aggs);
+/* Dedicated per-group top-K / bot-K with row-form emission.  Replaces
+ * the OP_GROUP + post-radix LIST-cell + explode pipeline for the
+ * canonical shape `(select (top|bot col K) from t by single_key)`.
+ * Pass desc=1 for top-K, desc=0 for bot-K.  Result is a 2-column
+ * table: the key column (type-matched to `key`) and the value column
+ * (type-matched to `val`), both flat — one row per (group, kept-value). */
+ray_op_t* ray_group_topk_rowform(ray_graph_t* g, ray_op_t* key,
+                                  ray_op_t* val, int64_t k, uint8_t desc);
 ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys);
 ray_op_t* ray_pivot_op(ray_graph_t* g,
                        ray_op_t** index_cols, uint8_t n_index,

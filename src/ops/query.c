@@ -5870,9 +5870,58 @@ by_dict_done:
                                               key_ops, n_keys,
                                               agg_ops, agg_ins, n_aggs);
                 } else if (has_agg_k) {
-                    root = ray_group3(g, key_ops, n_keys, agg_ops,
-                                       agg_ins, has_binary_agg ? agg_ins2 : NULL,
-                                       agg_k, n_aggs);
+                    /* Fast path: dedicated row-form emit for the exact
+                     * shape `(select (top|bot col K) from T by single_key)`.
+                     * Avoids the OP_GROUP + radix-HT + LIST<K> + adapter-
+                     * side explode pipeline; two-phase parallel hashed
+                     * top-K with direct (key, val) row emission.  Falls
+                     * through to ray_group3 for any unsupported shape.
+                     *
+                     * Restricted to non-SYM key/val column types — SYM
+                     * columns and LIST/STR/GUID stay on the OP_TOP_N path
+                     * so prior callers depending on LIST-cell output
+                     * (existing rfl tests) keep their semantics.  q8
+                     * canonical (I64 id6 + F64 v3) hits this path. */
+                    int rowform_ok = 0;
+                    if (n_aggs == 1 && n_keys == 1 && n_nonaggs == 0
+                        && !where_expr
+                        && (agg_ops[0] == OP_TOP_N || agg_ops[0] == OP_BOT_N)
+                        && agg_k[0] >= 1 && agg_k[0] <= 255
+                        && key_ops[0] && key_ops[0]->opcode == OP_SCAN
+                        && agg_ins[0] && agg_ins[0]->opcode == OP_SCAN)
+                    {
+                        /* Resolve key/val column types from the bound
+                         * table — only route numeric/temporal types
+                         * the executor handles. */
+                        ray_op_ext_t* kext = find_ext(g, key_ops[0]->id);
+                        ray_op_ext_t* vext = find_ext(g, agg_ins[0]->id);
+                        ray_t* kc = (kext && tbl) ? ray_table_get_col(tbl, kext->sym) : NULL;
+                        ray_t* vc = (vext && tbl) ? ray_table_get_col(tbl, vext->sym) : NULL;
+                        if (kc && vc) {
+                            int8_t kt = kc->type, vt = vc->type;
+                            int kt_ok = (kt == RAY_I64 || kt == RAY_I32 ||
+                                         kt == RAY_I16 || kt == RAY_U8 ||
+                                         kt == RAY_BOOL || kt == RAY_DATE ||
+                                         kt == RAY_TIME || kt == RAY_TIMESTAMP ||
+                                         kt == RAY_F64);
+                            int vt_ok = (vt == RAY_I64 || vt == RAY_I32 ||
+                                         vt == RAY_I16 || vt == RAY_U8 ||
+                                         vt == RAY_BOOL || vt == RAY_DATE ||
+                                         vt == RAY_TIME || vt == RAY_TIMESTAMP ||
+                                         vt == RAY_F64);
+                            if (kt_ok && vt_ok) rowform_ok = 1;
+                        }
+                    }
+                    if (rowform_ok) {
+                        uint8_t desc = (agg_ops[0] == OP_TOP_N) ? 1 : 0;
+                        root = ray_group_topk_rowform(g, key_ops[0],
+                                                      agg_ins[0],
+                                                      agg_k[0], desc);
+                    } else {
+                        root = ray_group3(g, key_ops, n_keys, agg_ops,
+                                           agg_ins, has_binary_agg ? agg_ins2 : NULL,
+                                           agg_k, n_aggs);
+                    }
                 } else if (has_binary_agg) {
                     root = ray_group2(g, key_ops, n_keys, agg_ops,
                                        agg_ins, agg_ins2, n_aggs);

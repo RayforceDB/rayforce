@@ -859,6 +859,7 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
 /* Is this opcode a "heavy" pipeline breaker worth profiling? */
 static inline bool op_is_heavy(uint16_t opc) {
     return opc == OP_FILTER || opc == OP_SORT || opc == OP_GROUP ||
+           opc == OP_GROUP_TOPK_ROWFORM || opc == OP_GROUP_BOTK_ROWFORM ||
            opc == OP_JOIN   || opc == OP_WINDOW_JOIN || opc == OP_SELECT ||
            opc == OP_HEAD   || opc == OP_TAIL || opc == OP_WINDOW ||
            opc == OP_PIVOT  ||
@@ -1234,6 +1235,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
 
         case OP_FILTERED_GROUP:
             return exec_filtered_group(g, op);
+
+        case OP_GROUP_TOPK_ROWFORM:
+        case OP_GROUP_BOTK_ROWFORM:
+            return exec_group_topk_rowform(g, op);
 
         case OP_PIVOT: {
             ray_t* tbl = g->table;

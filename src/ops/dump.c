@@ -93,6 +93,8 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_FILTER:        return "FILTER";
         case OP_SORT:          return "SORT";
         case OP_GROUP:         return "GROUP";
+        case OP_GROUP_TOPK_ROWFORM: return "GROUP_TOPK_ROWFORM";
+        case OP_GROUP_BOTK_ROWFORM: return "GROUP_BOTK_ROWFORM";
         case OP_FILTERED_GROUP:return "FILTERED_GROUP";
         case OP_PIVOT:         return "PIVOT";
         case OP_ANTIJOIN:      return "ANTIJOIN";

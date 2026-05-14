@@ -866,6 +866,51 @@ ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys) {
     return ray_group(g, keys, n_keys, NULL, NULL, 0);
 }
 
+/* Dedicated per-group top/bot-K with row-form emission.  Mirrors the
+ * OP_GROUP ext-node layout (single key + single agg + agg_k slot) so
+ * downstream optimiser passes can introspect ext->keys / ext->agg_ins
+ * the same way they do for OP_GROUP, but with a distinct opcode that
+ * exec.c routes to exec_group_topk_rowform. */
+ray_op_t* ray_group_topk_rowform(ray_graph_t* g, ray_op_t* key,
+                                  ray_op_t* val, int64_t k, uint8_t desc) {
+    if (!g || !key || !val || k < 1 || k > 1024) return NULL;
+
+    size_t keys_sz = sizeof(ray_op_t*);
+    size_t ops_sz  = sizeof(uint16_t);
+    size_t ins_sz  = sizeof(ray_op_t*);
+    size_t ops_off = keys_sz;
+    size_t ins_off = ops_off + ops_sz;
+    ins_off = (ins_off + sizeof(ray_op_t*) - 1) & ~(sizeof(ray_op_t*) - 1);
+    size_t k_off   = ins_off + ins_sz;
+    k_off = (k_off + sizeof(int64_t) - 1) & ~(sizeof(int64_t) - 1);
+    size_t k_sz    = sizeof(int64_t);
+
+    ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, k_off + k_sz);
+    if (!ext) return NULL;
+
+    ext->base.opcode = desc ? OP_GROUP_TOPK_ROWFORM : OP_GROUP_BOTK_ROWFORM;
+    ext->base.arity = 0;
+    ext->base.out_type = RAY_TABLE;
+    ext->base.est_rows = key->est_rows;
+    ext->base.inputs[0] = key;
+
+    char* trail = EXT_TRAIL(ext);
+    ext->keys = (ray_op_t**)trail;
+    ext->keys[0] = key;
+    ext->agg_ops = (uint16_t*)(trail + ops_off);
+    ext->agg_ops[0] = desc ? OP_TOP_N : OP_BOT_N;
+    ext->agg_ins = (ray_op_t**)(trail + ins_off);
+    ext->agg_ins[0] = val;
+    ext->agg_ins2 = NULL;
+    ext->agg_k = (int64_t*)(trail + k_off);
+    ext->agg_k[0] = k;
+    ext->n_keys = 1;
+    ext->n_aggs = 1;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
 ray_op_t* ray_pivot_op(ray_graph_t* g,
                        ray_op_t** index_cols, uint8_t n_index,
                        ray_op_t* pivot_col,
