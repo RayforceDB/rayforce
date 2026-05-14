@@ -1323,7 +1323,15 @@ ray_t* ray_median_per_group_buf(ray_t* src,
     ray_pool_t* pool = ray_pool_get();
     bool par = pool && n_groups >= 8 && total >= 4096;
     if (par) {
-        ray_pool_dispatch_n(pool, med_per_group_fn, &ctx, (uint32_t)n_groups);
+        /* dispatch_n's task ring is capped at MAX_RING_CAP (65536); when
+         * n_groups exceeds that, fall back to elements-based dispatch
+         * (auto-grows grain so every group is covered).  Under the cap,
+         * one task per group gives the best parallelism for small K
+         * per-group work like quickselect. */
+        if (n_groups < (1 << 16))
+            ray_pool_dispatch_n(pool, med_per_group_fn, &ctx, (uint32_t)n_groups);
+        else
+            ray_pool_dispatch(pool, med_per_group_fn, &ctx, n_groups);
     } else {
         med_per_group_fn(&ctx, 0, 0, n_groups);
     }
@@ -1600,7 +1608,12 @@ ray_t* ray_topk_per_group_buf(ray_t* src,
     ray_pool_t* pool = ray_pool_get();
     bool par = pool && n_groups >= 8 && total >= 4096;
     if (par) {
-        ray_pool_dispatch_n(pool, topk_per_group_fn, &ctx, (uint32_t)n_groups);
+        /* See ray_median_per_group_buf for the rationale on the
+         * dispatch_n vs dispatch split. */
+        if (n_groups < (1 << 16))
+            ray_pool_dispatch_n(pool, topk_per_group_fn, &ctx, (uint32_t)n_groups);
+        else
+            ray_pool_dispatch(pool, topk_per_group_fn, &ctx, n_groups);
     } else {
         topk_per_group_fn(&ctx, 0, 0, n_groups);
     }
