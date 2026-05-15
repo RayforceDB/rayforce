@@ -89,8 +89,135 @@ static void nth_element_dbl(double* a, int64_t lo, int64_t hi, int64_t k) {
     return ray_lazy_wrap(g, op);                            \
 } while(0)
 
+static int agg_parted_numeric_base(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F64 ||
+           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+static int64_t agg_read_i64(ray_t* v, int64_t i) {
+    void* d = ray_data(v);
+    switch (v->type) {
+    case RAY_BOOL:
+    case RAY_U8: return ((uint8_t*)d)[i];
+    case RAY_I16: return ((int16_t*)d)[i];
+    case RAY_I32:
+    case RAY_DATE:
+    case RAY_TIME: return ((int32_t*)d)[i];
+    case RAY_I64:
+    case RAY_TIMESTAMP: return ((int64_t*)d)[i];
+    default: return 0;
+    }
+}
+
+static ray_t* agg_atom_i64_for_type(int8_t t, int64_t v) {
+    switch (t) {
+    case RAY_BOOL: return ray_bool(v != 0);
+    case RAY_U8: return ray_u8((uint8_t)v);
+    case RAY_I16: return ray_i16((int16_t)v);
+    case RAY_I32: return ray_i32((int32_t)v);
+    case RAY_DATE: return ray_date(v);
+    case RAY_TIME: return ray_time(v);
+    case RAY_TIMESTAMP: return ray_timestamp(v);
+    default: return ray_i64(v);
+    }
+}
+
+static ray_t* agg_parted_sum(ray_t* x) {
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
+    if (!agg_parted_numeric_base(base) || base == RAY_DATE)
+        return ray_error("type", NULL);
+    ray_t** segs = (ray_t**)ray_data(x);
+    if (base == RAY_F64) {
+        double sum = 0.0;
+        for (int64_t s = 0; s < x->len; s++) {
+            ray_t* seg = segs[s];
+            if (!seg) continue;
+            double* d = (double*)ray_data(seg);
+            int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+            for (int64_t i = 0; i < seg->len; i++)
+                if (!has_nulls || !ray_vec_is_null(seg, i)) sum += d[i];
+        }
+        return make_f64(sum);
+    }
+    int64_t sum = 0;
+    for (int64_t s = 0; s < x->len; s++) {
+        ray_t* seg = segs[s];
+        if (!seg) continue;
+        int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        for (int64_t i = 0; i < seg->len; i++)
+            if (!has_nulls || !ray_vec_is_null(seg, i)) sum += agg_read_i64(seg, i);
+    }
+    if (base == RAY_TIME) return ray_time(sum);
+    if (base == RAY_TIMESTAMP) return ray_timestamp(sum);
+    return make_i64(sum);
+}
+
+static ray_t* agg_parted_avg(ray_t* x) {
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
+    if (!agg_parted_numeric_base(base)) return ray_error("type", NULL);
+    ray_t** segs = (ray_t**)ray_data(x);
+    double sum = 0.0;
+    int64_t cnt = 0;
+    for (int64_t s = 0; s < x->len; s++) {
+        ray_t* seg = segs[s];
+        if (!seg) continue;
+        int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        if (base == RAY_F64) {
+            double* d = (double*)ray_data(seg);
+            for (int64_t i = 0; i < seg->len; i++) {
+                if (has_nulls && ray_vec_is_null(seg, i)) continue;
+                sum += d[i]; cnt++;
+            }
+        } else {
+            for (int64_t i = 0; i < seg->len; i++) {
+                if (has_nulls && ray_vec_is_null(seg, i)) continue;
+                sum += (double)agg_read_i64(seg, i); cnt++;
+            }
+        }
+    }
+    if (cnt == 0) return ray_typed_null(-RAY_F64);
+    return make_f64(sum / (double)cnt);
+}
+
+static ray_t* agg_parted_minmax(ray_t* x, int want_max) {
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
+    if (!agg_parted_numeric_base(base)) return ray_error("type", NULL);
+    ray_t** segs = (ray_t**)ray_data(x);
+    int found = 0;
+    double best_f = 0.0;
+    int64_t best_i = 0;
+    for (int64_t s = 0; s < x->len; s++) {
+        ray_t* seg = segs[s];
+        if (!seg) continue;
+        int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        if (base == RAY_F64) {
+            double* d = (double*)ray_data(seg);
+            for (int64_t i = 0; i < seg->len; i++) {
+                if (has_nulls && ray_vec_is_null(seg, i)) continue;
+                double v = d[i];
+                if (!found || (want_max ? v > best_f : v < best_f)) {
+                    best_f = v; found = 1;
+                }
+            }
+        } else {
+            for (int64_t i = 0; i < seg->len; i++) {
+                if (has_nulls && ray_vec_is_null(seg, i)) continue;
+                int64_t v = agg_read_i64(seg, i);
+                if (!found || (want_max ? v > best_i : v < best_i)) {
+                    best_i = v; found = 1;
+                }
+            }
+        }
+    }
+    if (!found) return ray_typed_null(-base);
+    if (base == RAY_F64) return make_f64(best_f);
+    return agg_atom_i64_for_type(base, best_i);
+}
+
 ray_t* ray_sum_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_SUM);
+    if (RAY_IS_PARTED(x->type)) return agg_parted_sum(x);
     if (ray_is_atom(x)) {
         /* u8/i16 scalar sum promotes to i64 */
         if (x->type == -RAY_U8)  return make_i64((int64_t)x->u8);
@@ -175,6 +302,7 @@ ray_t* ray_count_fn(ray_t* x) {
 
 ray_t* ray_avg_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_AVG);
+    if (RAY_IS_PARTED(x->type)) return agg_parted_avg(x);
     if (ray_is_atom(x)) {
         if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_F64);
         if (is_numeric(x)) return make_f64(as_f64(x));
@@ -198,6 +326,7 @@ ray_t* ray_avg_fn(ray_t* x) {
 
 ray_t* ray_min_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_MIN);
+    if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 0);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) AGG_VEC_VIA_DAG(x, ray_min_op);
     if (!is_list(x)) return ray_error("type", NULL);
@@ -219,6 +348,7 @@ ray_t* ray_min_fn(ray_t* x) {
 
 ray_t* ray_max_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_MAX);
+    if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 1);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
     if (ray_is_vec(x)) AGG_VEC_VIA_DAG(x, ray_max_op);
     if (!is_list(x)) return ray_error("type", NULL);

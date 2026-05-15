@@ -16,7 +16,7 @@
 ;; on the second open.
 
 ;; ────────────── pre-flight cleanup ──────────────
-(.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three")
+(.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three /tmp/rfl_part_cd /tmp/rfl_part_cd_sym /tmp/rfl_part_minute /tmp/rfl_part_like")
 (.sys.exec "mkdir -p /tmp/rfl_part_empty")
 
 ;; ────────────── date-partition path: RAY_MC_DATE branch ──────────────
@@ -24,20 +24,26 @@
 ;; table.  Drives is_date_dir → all_date branch of infer_mc_type,
 ;; parse_date_dir for both partitions, the RAY_MC_DATE arm of
 ;; ray_read_parted (kv_type = RAY_DATE, mc_name = "date").
-(set DT-A (table [id val] (list [1 2 3] [10.0 20.0 30.0])))
-(set DT-B (table [id val] (list [4 5] [40.0 50.0])))
+(set DT-A (table [id d val] (list [1 2 3] [2024.01.01 2024.01.01 2024.01.02] [10.0 20.0 30.0])))
+(set DT-B (table [id d val] (list [4 5] [2024.01.03 2024.01.04] [40.0 50.0])))
 (.db.splayed.set "/tmp/rfl_part_date/2024.01.01/t/" DT-A)
 (.db.splayed.set "/tmp/rfl_part_date/2024.01.02/t/" DT-B)
 
 (set Pd (.db.parted.get "/tmp/rfl_part_date/" 't))
-;; total rows = 3 + 2; columns = 1 partition-key + 2 data
+;; total rows = 3 + 2; columns = 1 partition-key + 3 data
 (count Pd) -- 5
-(count (key Pd)) -- 3
+(count (key Pd)) -- 4
 ;; partition-key column is named 'date when partitions are dates
 (first (key Pd)) -- 'date
 ;; data column names survive in their original order after the
 ;; partition-key prefix
-(key Pd) -- ['date 'id 'val]
+(key Pd) -- ['date 'id 'd 'val]
+(sum (at Pd 'id)) -- 15
+(avg (at Pd 'val)) -- 30.0
+(min (at Pd 'd)) -- 2024.01.01
+(max (at Pd 'd)) -- 2024.01.04
+(count (distinct (at Pd 'id))) -- 5
+(sum (+ (at Pd 'id) 1)) -- 20
 
 ;; ────────────── int-partition path: RAY_MC_I64 branch ──────────────
 ;; Pure-integer partition names — drives is_integer_str → all_int
@@ -78,7 +84,7 @@
 ;; ────────────── single-partition root ──────────────
 ;; ray_read_parted has no part_count==1 fast-return; it always runs
 ;; the full builder.  This case still covers the for-loop bodies with a
-;; single iteration and the segment retain/willneed call.
+;; single iteration and segment retaining.
 (set SP (table [x] (list [7 8 9 10])))
 (.db.splayed.set "/tmp/rfl_part_single/2024.06.15/t/" SP)
 (set Psp (.db.parted.get "/tmp/rfl_part_single/" 't))
@@ -101,6 +107,50 @@
 (count Pt) -- 6
 (count (key Pt)) -- 2
 (first (key Pt)) -- 'date
+
+;; ────────────── grouped count(distinct) over parted input ──────────────
+;; Regression for the non-agg scatter path used by analytical grouped
+;; count-distinct queries: parted inputs should not require flattening the
+;; whole table, and the row->group map must still span all partitions.
+(set CD-A (table [RegionID UserID payload] (list [1 1 2 2] [10 10 20 21] ["a" "b" "c" "d"])))
+(set CD-B (table [RegionID UserID payload] (list [2 2 3 3] [20 22 30 31] ["e" "f" "g" "h"])))
+(.db.splayed.set "/tmp/rfl_part_cd/2024.01.01/t/" CD-A)
+(.db.splayed.set "/tmp/rfl_part_cd/2024.01.02/t/" CD-B)
+(set Pcd (.db.parted.get "/tmp/rfl_part_cd/" 't))
+(set Rcd (select {RegionID: RegionID u: (count (distinct UserID)) from: Pcd by: RegionID desc: u take: 3}))
+(at Rcd 'RegionID) -- [2 3 1]
+(at Rcd 'u) -- [3 2 1]
+(set CD-S1 (table [phrase user] (list ['skip 'alpha 'alpha 'beta] [1 2 3 4])))
+(set CD-S2 (table [phrase user] (list ['skip 'beta 'gamma 'gamma] [5 6 7 8])))
+(.db.splayed.set "/tmp/rfl_part_cd_sym/2024.02.01/s/" CD-S1)
+(.db.splayed.set "/tmp/rfl_part_cd_sym/2024.02.02/s/" CD-S2)
+(set Pcs (.db.parted.get "/tmp/rfl_part_cd_sym/" 's))
+(set Rcs (select {phrase: phrase c: (count phrase) from: Pcs where: (!= phrase 'skip) by: phrase desc: c take: 3}))
+(at Rcs 'phrase) -- ['alpha 'beta 'gamma]
+(at Rcs 'c) -- [2 2 2]
+
+(set TM-A (table [UserID EventTime phrase] (list [1 1 2] [00:01:00 00:01:30 00:02:00] ['a 'a 'b])))
+(set TM-B (table [UserID EventTime phrase] (list [1 3 3] [00:01:45 00:03:00 00:03:30] ['a 'c 'c])))
+(.db.splayed.set "/tmp/rfl_part_minute/2024.03.01/t/" TM-A)
+(.db.splayed.set "/tmp/rfl_part_minute/2024.03.02/t/" TM-B)
+(set Ptm (.db.parted.get "/tmp/rfl_part_minute/" 't))
+(set Rtm (select {c: (count UserID) from: Ptm by: {UserID: UserID m: (minute EventTime) phrase: phrase} desc: c take: 3}))
+(at Rtm 'UserID) -- [1 3 2]
+(at Rtm 'm) -- [1 3 2]
+(at Rtm 'phrase) -- ['a 'c 'b]
+(at Rtm 'c) -- [3 2 1]
+
+;; ────────────── LIKE over parted text columns ──────────────
+;; Regression for predicates over parted STR/SYM columns: the boolean
+;; result must be sized to total rows, not number of partitions.
+(set LK-A (table [url title] (list ['alpha 'google 'docs] ["alpha page" "search google" "manual"])))
+(set LK-B (table [url title] (list ['googlemaps 'plain 'news] ["maps" "plain page" "google news"])))
+(.db.splayed.set "/tmp/rfl_part_like/2024.04.01/t/" LK-A)
+(.db.splayed.set "/tmp/rfl_part_like/2024.04.02/t/" LK-B)
+(set Plk (.db.parted.get "/tmp/rfl_part_like/" 't))
+(count (select {from: Plk where: (like url "*google*")})) -- 2
+(count (select {from: Plk where: (like title "*google*")})) -- 2
+(count (select {from: Plk where: (and (!= url 'plain) (like url "*google*"))})) -- 2
 
 ;; ────────────── .db.parted.mount over int partitions ──────────────
 ;; Mount needs at least one digit/dot subdir (dir_is_parted_root) and
@@ -149,4 +199,4 @@
 (.db.parted.get "/tmp/rfl_part_date/")      !- domain
 
 ;; ────────────── teardown ──────────────
-(.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three")
+(.sys.exec "rm -rf /tmp/rfl_part_date /tmp/rfl_part_int /tmp/rfl_part_sym /tmp/rfl_part_single /tmp/rfl_part_empty /tmp/rfl_part_missing /tmp/rfl_part_three /tmp/rfl_part_cd /tmp/rfl_part_cd_sym /tmp/rfl_part_minute /tmp/rfl_part_like")

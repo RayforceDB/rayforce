@@ -41,6 +41,8 @@
 
 #define SYM_INIT_CAP     256
 #define SYM_LOAD_FACTOR  0.7
+#define SYM_STRL_MAGIC   0x4C525453U  /* "STRL" */
+#define SYM_LAZY_LOAD_MIN_BYTES (64u * 1024u * 1024u)
 
 /* Cached segment list for a dotted sym: nsegs sym_ids that together make up
  * the dotted path.  segs is arena-allocated (same lifetime as sym table). */
@@ -75,6 +77,13 @@ typedef struct {
 
     /* Persistence: entries [0..persisted_count-1] are known on disk */
     uint32_t   persisted_count;
+
+    /* Large on-disk dictionaries stay mapped and are materialized by id. */
+    uint8_t*      lazy_map;
+    size_t        lazy_size;
+    uint32_t      lazy_next_id;
+    const uint8_t* lazy_ptr;
+    size_t        lazy_remaining;
 
     /* Arena for string atoms — avoids per-string buddy allocator calls */
     ray_arena_t*  arena;
@@ -235,6 +244,15 @@ ray_err_t ray_sym_init(void) {
 void ray_sym_destroy(void) {
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return;
 
+    if (g_sym.lazy_map) {
+        ray_vm_unmap_file(g_sym.lazy_map, g_sym.lazy_size);
+        g_sym.lazy_map = NULL;
+        g_sym.lazy_size = 0;
+        g_sym.lazy_next_id = 0;
+        g_sym.lazy_ptr = NULL;
+        g_sym.lazy_remaining = 0;
+    }
+
     /* Arena-backed strings: ray_release is a no-op (RAY_ATTR_ARENA).
      * Destroy the arena to free all string atoms at once.
      * segments[i].segs pointers are arena-allocated too, freed with it. */
@@ -312,6 +330,7 @@ static bool sym_grow_str_cap(uint32_t new_cap) {
     ray_t** new_strings = (ray_t**)ray_sys_realloc(g_sym.strings,
                                                    (size_t)new_cap * sizeof(ray_t*));
     if (!new_strings) return false;
+    memset(new_strings + old_cap, 0, (size_t)(new_cap - old_cap) * sizeof(ray_t*));
     g_sym.strings = new_strings;
 
     uint32_t old_bm_words = (old_cap + 63) / 64;
@@ -351,6 +370,7 @@ static int64_t sym_intern_nolock(uint32_t hash, const char* str, size_t len);
 static int64_t sym_probe(uint32_t hash, const char* str, size_t len);
 static int64_t sym_commit_new(uint32_t hash, const char* str, size_t len);
 static bool    sym_reserve_capacity(uint32_t new_sym_count, size_t arena_bytes);
+static bool    sym_lazy_materialize_to_locked(uint32_t target_id);
 
 /* --------------------------------------------------------------------------
  * sym_cache_segments — idempotent cache-and-apply for an EXISTING sym.
@@ -572,6 +592,51 @@ static bool sym_reserve_capacity(uint32_t new_sym_count, size_t arena_bytes) {
     return true;
 }
 
+static void sym_lazy_unmap_locked(void) {
+    if (!g_sym.lazy_map) return;
+    ray_vm_unmap_file(g_sym.lazy_map, g_sym.lazy_size);
+    g_sym.lazy_map = NULL;
+    g_sym.lazy_size = 0;
+    g_sym.lazy_next_id = 0;
+    g_sym.lazy_ptr = NULL;
+    g_sym.lazy_remaining = 0;
+}
+
+static bool sym_lazy_materialize_to_locked(uint32_t target_id) {
+    if (!g_sym.lazy_map) return false;
+    if (target_id >= g_sym.persisted_count) return false;
+    if (target_id < g_sym.lazy_next_id) return g_sym.strings[target_id] != NULL;
+
+    while (g_sym.lazy_next_id <= target_id) {
+        if (g_sym.lazy_remaining < 4) return false;
+        uint32_t slen;
+        memcpy(&slen, g_sym.lazy_ptr, 4);
+        g_sym.lazy_ptr += 4;
+        g_sym.lazy_remaining -= 4;
+        if ((size_t)slen > g_sym.lazy_remaining) return false;
+
+        uint32_t id = g_sym.lazy_next_id;
+        const char* sp = (const char*)g_sym.lazy_ptr;
+        ray_t* existing = g_sym.strings[id];
+        if (existing) {
+            if (ray_str_len(existing) != (size_t)slen ||
+                memcmp(ray_str_ptr(existing), sp, slen) != 0)
+                return false;
+        } else {
+            ray_t* s = sym_str_arena(g_sym.arena, sp, (size_t)slen);
+            if (!s) return false;
+            g_sym.strings[id] = s;
+            ht_insert(g_sym.buckets, g_sym.bucket_cap,
+                      (uint32_t)ray_hash_bytes(sp, (size_t)slen), id);
+        }
+
+        g_sym.lazy_ptr += slen;
+        g_sym.lazy_remaining -= slen;
+        g_sym.lazy_next_id++;
+    }
+    return true;
+}
+
 /* --------------------------------------------------------------------------
  * sym_intern_nolock — fully atomic intern.
  *
@@ -744,6 +809,12 @@ int64_t ray_sym_intern_no_split(const char* str, size_t len) {
     return id;
 }
 
+int64_t ray_sym_intern_no_split_unlocked(const char* str, size_t len) {
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return -1;
+    uint32_t hash = (uint32_t)ray_hash_bytes(str, len);
+    return sym_intern_nolock_noseg(hash, str, len);
+}
+
 /* --------------------------------------------------------------------------
  * ray_sym_rebuild_segments — populate dotted cache for any not-yet-cached
  * entries.  Must follow a batch of ray_sym_intern_no_split calls.
@@ -844,6 +915,12 @@ ray_t* ray_sym_str(int64_t id) {
     /* Lock required: concurrent ray_sym_intern may realloc g_sym.strings. */
     sym_lock();
     if (id < 0 || (uint32_t)id >= g_sym.str_count) { sym_unlock(); return NULL; }
+    if (!g_sym.strings[id] && (uint32_t)id < g_sym.persisted_count) {
+        if (!sym_lazy_materialize_to_locked((uint32_t)id)) {
+            sym_unlock();
+            return NULL;
+        }
+    }
     ray_t* s = g_sym.strings[id];
     sym_unlock();
     return s;
@@ -859,6 +936,15 @@ uint32_t ray_sym_count(void) {
     /* Lock required: concurrent ray_sym_intern may modify str_count. */
     sym_lock();
     uint32_t count = g_sym.str_count;
+    sym_unlock();
+    return count;
+}
+
+uint32_t ray_sym_persisted_count(void) {
+    if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return 0;
+
+    sym_lock();
+    uint32_t count = g_sym.persisted_count;
     sym_unlock();
     return count;
 }
@@ -884,6 +970,9 @@ void ray_sym_strings_borrow(ray_t*** out_strings, uint32_t* out_count) {
     if (out_count)   *out_count   = 0;
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return;
     sym_lock();
+    if (g_sym.lazy_map && g_sym.persisted_count > 0) {
+        (void)sym_lazy_materialize_to_locked(g_sym.persisted_count - 1);
+    }
     if (out_strings) *out_strings = g_sym.strings;
     if (out_count)   *out_count   = g_sym.str_count;
     sym_unlock();
@@ -950,7 +1039,7 @@ bool ray_sym_ensure_cap(uint32_t needed) {
  * when persisted_count == str_count.
  * -------------------------------------------------------------------------- */
 
-ray_err_t ray_sym_save(const char* path) {
+static ray_err_t sym_save_impl(const char* path, bool durable) {
     if (!path) return RAY_ERR_IO;
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return RAY_ERR_IO;
 
@@ -1076,29 +1165,39 @@ ray_err_t ray_sym_save(const char* path) {
     memcpy(snap, g_sym.strings, snap_sz);
     sym_unlock();
 
-    /* Build RAY_LIST of -RAY_STR from snapshot */
-    ray_t* list = ray_list_new((int64_t)count);
-    if (!list || RAY_IS_ERR(list)) {
-        ray_free(snap_block);
-        ray_file_unlock(lock_fd);
-        ray_file_close(lock_fd);
-        return RAY_ERR_OOM;
-    }
-
-    for (uint32_t i = 0; i < count; i++) {
-        list = ray_list_append(list, snap[i]);
-        if (!list || RAY_IS_ERR(list)) {
+    /* Save STRL directly instead of first materializing a giant RAY_LIST. */
+    {
+        FILE* f = fopen(tmp_path, "wb");
+        if (!f) {
             ray_free(snap_block);
             ray_file_unlock(lock_fd);
             ray_file_close(lock_fd);
-            return RAY_ERR_OOM;
+            return RAY_ERR_IO;
         }
+        uint32_t magic = SYM_STRL_MAGIC;
+        int64_t n64 = (int64_t)count;
+        err = RAY_OK;
+        if (fwrite(&magic, 4, 1, f) != 1 ||
+            fwrite(&n64, 8, 1, f) != 1) {
+            err = RAY_ERR_IO;
+        } else {
+            for (uint32_t i = 0; i < count; i++) {
+                ray_t* s = snap[i];
+                if (!s || s->type != -RAY_STR) { err = RAY_ERR_CORRUPT; break; }
+                const char* sp = ray_str_ptr(s);
+                size_t slen = ray_str_len(s);
+                if (slen > UINT32_MAX) { err = RAY_ERR_RANGE; break; }
+                uint32_t len32 = (uint32_t)slen;
+                if (fwrite(&len32, 4, 1, f) != 1 ||
+                    (slen > 0 && fwrite(sp, 1, slen, f) != slen)) {
+                    err = RAY_ERR_IO;
+                    break;
+                }
+            }
+        }
+        if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
     }
     ray_free(snap_block);
-
-    /* Save to temp file via ray_col_save (writes STRL format) */
-    err = ray_col_save(list, tmp_path);
-    ray_release(list);
     if (err != RAY_OK) {
         remove(tmp_path);
         ray_file_unlock(lock_fd);
@@ -1106,21 +1205,23 @@ ray_err_t ray_sym_save(const char* path) {
         return err;
     }
 
-    /* Fsync temp file for durability */
-    ray_fd_t tmp_fd = ray_file_open(tmp_path, RAY_OPEN_READ | RAY_OPEN_WRITE);
-    if (tmp_fd == RAY_FD_INVALID) {
-        remove(tmp_path);
-        ray_file_unlock(lock_fd);
-        ray_file_close(lock_fd);
-        return RAY_ERR_IO;
-    }
-    err = ray_file_sync(tmp_fd);
-    ray_file_close(tmp_fd);
-    if (err != RAY_OK) {
-        remove(tmp_path);
-        ray_file_unlock(lock_fd);
-        ray_file_close(lock_fd);
-        return err;
+    if (durable) {
+        /* Fsync temp file for durability */
+        ray_fd_t tmp_fd = ray_file_open(tmp_path, RAY_OPEN_READ | RAY_OPEN_WRITE);
+        if (tmp_fd == RAY_FD_INVALID) {
+            remove(tmp_path);
+            ray_file_unlock(lock_fd);
+            ray_file_close(lock_fd);
+            return RAY_ERR_IO;
+        }
+        err = ray_file_sync(tmp_fd);
+        ray_file_close(tmp_fd);
+        if (err != RAY_OK) {
+            remove(tmp_path);
+            ray_file_unlock(lock_fd);
+            ray_file_close(lock_fd);
+            return err;
+        }
     }
 
     /* Atomic rename: tmp -> final path */
@@ -1132,13 +1233,15 @@ ray_err_t ray_sym_save(const char* path) {
         return err;
     }
 
-    /* Fsync parent directory so the new directory entry is durable.
-     * Without this, a crash after rename can lose the new file. */
-    err = ray_file_sync_dir(path);
-    if (err != RAY_OK) {
-        ray_file_unlock(lock_fd);
-        ray_file_close(lock_fd);
-        return err;
+    if (durable) {
+        /* Fsync parent directory so the new directory entry is durable.
+         * Without this, a crash after rename can lose the new file. */
+        err = ray_file_sync_dir(path);
+        if (err != RAY_OK) {
+            ray_file_unlock(lock_fd);
+            ray_file_close(lock_fd);
+            return err;
+        }
     }
 
     /* Update persisted count */
@@ -1149,6 +1252,14 @@ ray_err_t ray_sym_save(const char* path) {
     ray_file_unlock(lock_fd);
     ray_file_close(lock_fd);
     return RAY_OK;
+}
+
+ray_err_t ray_sym_save(const char* path) {
+    return sym_save_impl(path, true);
+}
+
+ray_err_t ray_sym_save_bulk(const char* path) {
+    return sym_save_impl(path, false);
 }
 
 /* --------------------------------------------------------------------------
@@ -1189,20 +1300,88 @@ ray_err_t ray_sym_load(const char* path) {
         if (err != RAY_OK) { ray_file_close(lock_fd); return err; }
     }
 
-    /* Load the sym file as a RAY_LIST of -RAY_STR */
-    ray_t* list = ray_col_load(path);
-    if (!list || RAY_IS_ERR(list)) {
-        ray_err_t code = RAY_IS_ERR(list) ? ray_err_from_obj(list) : RAY_ERR_IO;
+    size_t mapped_size = 0;
+    uint8_t* mapped = (uint8_t*)ray_vm_map_file(path, &mapped_size);
+    if (!mapped) {
         ray_file_unlock(lock_fd);
         ray_file_close(lock_fd);
-        return code;
+        return RAY_ERR_IO;
     }
-
-    if (list->type != RAY_LIST || list->len > UINT32_MAX) {
-        ray_release(list);
+    if (mapped_size < 12) {
+        ray_vm_unmap_file(mapped, mapped_size);
         ray_file_unlock(lock_fd);
         ray_file_close(lock_fd);
         return RAY_ERR_CORRUPT;
+    }
+    uint32_t magic;
+    memcpy(&magic, mapped, 4);
+    if (magic != SYM_STRL_MAGIC) {
+        ray_vm_unmap_file(mapped, mapped_size);
+        ray_file_unlock(lock_fd);
+        ray_file_close(lock_fd);
+        return RAY_ERR_CORRUPT;
+    }
+
+    int64_t disk_count;
+    memcpy(&disk_count, mapped + 4, 8);
+    if (disk_count < 0 || disk_count > UINT32_MAX) {
+        ray_vm_unmap_file(mapped, mapped_size);
+        ray_file_unlock(lock_fd);
+        ray_file_close(lock_fd);
+        return RAY_ERR_CORRUPT;
+    }
+
+    if (mapped_size >= SYM_LAZY_LOAD_MIN_BYTES) {
+        sym_lock();
+        uint32_t current = g_sym.str_count;
+        uint32_t persisted = g_sym.persisted_count;
+        uint32_t disk_u = (uint32_t)disk_count;
+        if (disk_count < (int64_t)persisted) {
+            sym_unlock();
+            ray_vm_unmap_file(mapped, mapped_size);
+            ray_file_unlock(lock_fd);
+            ray_file_close(lock_fd);
+            return RAY_ERR_CORRUPT;
+        }
+
+        uint32_t target_count = current > disk_u ? current : disk_u;
+        if (target_count > current && !sym_reserve_capacity(target_count - current, 0)) {
+            sym_unlock();
+            ray_vm_unmap_file(mapped, mapped_size);
+            ray_file_unlock(lock_fd);
+            ray_file_close(lock_fd);
+            return RAY_ERR_OOM;
+        }
+        if (disk_u > current) {
+            memset(g_sym.strings + current, 0,
+                   ((size_t)disk_u - current) * sizeof(ray_t*));
+        }
+
+        sym_lazy_unmap_locked();
+        g_sym.lazy_map = mapped;
+        g_sym.lazy_size = mapped_size;
+        g_sym.lazy_next_id = 0;
+        g_sym.lazy_ptr = mapped + 12;
+        g_sym.lazy_remaining = mapped_size - 12;
+        g_sym.str_count = target_count;
+        g_sym.persisted_count = disk_u;
+
+        uint32_t validate_count = current < disk_u ? current : disk_u;
+        bool ok = validate_count == 0 ||
+                  sym_lazy_materialize_to_locked(validate_count - 1);
+        sym_unlock();
+        if (!ok) {
+            sym_lock();
+            sym_lazy_unmap_locked();
+            sym_unlock();
+            ray_file_unlock(lock_fd);
+            ray_file_close(lock_fd);
+            return RAY_ERR_CORRUPT;
+        }
+
+        ray_file_unlock(lock_fd);
+        ray_file_close(lock_fd);
+        return RAY_OK;
     }
 
     /* Validate existing entries match, then intern remaining.
@@ -1213,71 +1392,71 @@ ray_err_t ray_sym_load(const char* path) {
     sym_lock();
     uint32_t already = g_sym.persisted_count;
     sym_unlock();
-    ray_t** slots = (ray_t**)ray_data(list);
 
     /* Reject stale/truncated sym file: if disk has fewer entries than what
      * we previously loaded from disk, the file is outdated or truncated. */
-    if (already > 0 && list->len < (int64_t)already) {
-        ray_release(list);
+    if (already > 0 && disk_count < (int64_t)already) {
+        ray_vm_unmap_file(mapped, mapped_size);
         ray_file_unlock(lock_fd);
         ray_file_close(lock_fd);
         return RAY_ERR_CORRUPT;
     }
 
-    /* Validate entries [0..already-1] match the persisted prefix */
-    for (int64_t i = 0; i < (int64_t)already && i < list->len; i++) {
-        ray_t* s = slots[i];
-        if (!s || RAY_IS_ERR(s) || s->type != -RAY_STR) {
-            ray_release(list);
+    const uint8_t* ptr = mapped + 12;
+    size_t remaining = mapped_size - 12;
+    for (int64_t i = 0; i < disk_count; i++) {
+        if (remaining < 4) {
+            ray_vm_unmap_file(mapped, mapped_size);
             ray_file_unlock(lock_fd);
             ray_file_close(lock_fd);
             return RAY_ERR_CORRUPT;
         }
-        ray_t* mem_s = ray_sym_str(i);
-        if (!mem_s || ray_str_len(mem_s) != ray_str_len(s) ||
-            memcmp(ray_str_ptr(mem_s), ray_str_ptr(s), ray_str_len(s)) != 0) {
-            ray_release(list);
+        uint32_t slen;
+        memcpy(&slen, ptr, 4);
+        ptr += 4;
+        remaining -= 4;
+        if ((size_t)slen > remaining) {
+            ray_vm_unmap_file(mapped, mapped_size);
             ray_file_unlock(lock_fd);
             ray_file_close(lock_fd);
             return RAY_ERR_CORRUPT;
         }
-    }
 
-    /* Intern entries beyond what's already in memory.
-     * Verify each entry's in-memory ID matches its disk position:
-     * if transient runtime-interned symbols already occupy these
-     * slots, the disk entries would get wrong IDs, causing RAY_SYM
-     * columns to resolve the wrong strings. */
-    for (int64_t i = (int64_t)already; i < list->len; i++) {
-        ray_t* s = slots[i];
-        if (!s || RAY_IS_ERR(s) || s->type != -RAY_STR) {
-            ray_release(list);
-            ray_file_unlock(lock_fd);
-            ray_file_close(lock_fd);
-            return RAY_ERR_CORRUPT;
+        const char* sp = (const char*)ptr;
+        if (i < (int64_t)already) {
+            ray_t* mem_s = ray_sym_str(i);
+            if (!mem_s || ray_str_len(mem_s) != (size_t)slen ||
+                memcmp(ray_str_ptr(mem_s), sp, slen) != 0) {
+                ray_vm_unmap_file(mapped, mapped_size);
+                ray_file_unlock(lock_fd);
+                ray_file_close(lock_fd);
+                return RAY_ERR_CORRUPT;
+            }
+        } else {
+            /* Bulk load uses no-split interning so dotted names cannot append
+             * segment symbols mid-stream and shift disk-position IDs. */
+            int64_t id = ray_sym_intern_no_split(sp, (size_t)slen);
+            if (id < 0) {
+                ray_vm_unmap_file(mapped, mapped_size);
+                ray_file_unlock(lock_fd);
+                ray_file_close(lock_fd);
+                return RAY_ERR_OOM;
+            }
+            if (id != i) {
+                ray_vm_unmap_file(mapped, mapped_size);
+                ray_file_unlock(lock_fd);
+                ray_file_close(lock_fd);
+                return RAY_ERR_CORRUPT;
+            }
         }
-        /* Bulk load MUST use the no-split variant so that loading a disk
-         * entry like "user.name" doesn't recursively intern "user" + "name"
-         * mid-loop and shift subsequent disk positions — that would break
-         * the id==i contract below.  Segment cache is populated in one
-         * pass after the loop finishes. */
-        int64_t id = ray_sym_intern_no_split(ray_str_ptr(s), ray_str_len(s));
-        if (id < 0) {
-            ray_release(list);
-            ray_file_unlock(lock_fd);
-            ray_file_close(lock_fd);
-            return RAY_ERR_OOM;
-        }
-        if (id != i) {
-            /* ID mismatch: disk position i was assigned in-memory
-             * id != i, meaning a transient symbol occupies the slot.
-             * The sym table has diverged from disk; continuing would
-             * cause RAY_SYM columns to resolve wrong strings. */
-            ray_release(list);
-            ray_file_unlock(lock_fd);
-            ray_file_close(lock_fd);
-            return RAY_ERR_CORRUPT;
-        }
+        ptr += slen;
+        remaining -= slen;
+    }
+    if (remaining != 0) {
+        ray_vm_unmap_file(mapped, mapped_size);
+        ray_file_unlock(lock_fd);
+        ray_file_close(lock_fd);
+        return RAY_ERR_CORRUPT;
     }
 
     /* Populate dotted cache for every loaded (and previously-loaded) sym.
@@ -1287,7 +1466,7 @@ ray_err_t ray_sym_load(const char* path) {
      * namespace semantics on anything the user stored with a '.' in it. */
     ray_err_t rebuild_err = ray_sym_rebuild_segments();
     if (rebuild_err != RAY_OK) {
-        ray_release(list);
+        ray_vm_unmap_file(mapped, mapped_size);
         ray_file_unlock(lock_fd);
         ray_file_close(lock_fd);
         return rebuild_err;
@@ -1297,10 +1476,10 @@ ray_err_t ray_sym_load(const char* path) {
      * Use list->len (not str_count) because transient runtime-interned
      * symbols may exist beyond the persisted prefix. */
     sym_lock();
-    g_sym.persisted_count = (uint32_t)list->len;
+    g_sym.persisted_count = (uint32_t)disk_count;
     sym_unlock();
 
-    ray_release(list);
+    ray_vm_unmap_file(mapped, mapped_size);
     ray_file_unlock(lock_fd);
     ray_file_close(lock_fd);
     return RAY_OK;

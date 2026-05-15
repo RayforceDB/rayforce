@@ -28,6 +28,7 @@
 #include "store/fileio.h"
 #include "table/sym.h"
 #include "ops/idxop.h"
+#include "vec/str.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdatomic.h>
@@ -86,6 +87,8 @@ static ray_err_t validate_sym_bounds(const void* data, int64_t len,
 #define LIST_MAGIC      0x4754534CU  /* "LSTG" */
 #define TABLE_MAGIC     0x4C425454U  /* "TTBL" */
 
+static size_t col_str_pool_payload_len(const ray_t* vec);
+
 /* --------------------------------------------------------------------------
  * Column file format:
  *   Bytes 0-15:  nullmap (inline) or zeroed (ext_nullmap / no nulls)
@@ -97,14 +100,16 @@ static ray_err_t validate_sym_bounds(const void* data, int64_t len,
  * -------------------------------------------------------------------------- */
 
 /* Explicit allowlist of types that are safe to serialize as raw bytes.
- * Only fixed-size scalar types -- pointer-bearing types (STR, LIST, TABLE)
- * and non-scalar types are excluded. */
+ * Fixed-size scalar types plus RAY_STR.  RAY_STR has a pointer-bearing pool
+ * in memory, but the column format stores the fixed 16-byte descriptors and
+ * the byte pool as adjacent raw regions so mmap can restore the pointer
+ * without deserializing string contents. */
 static bool is_serializable_type(int8_t t) {
     switch (t) {
     case RAY_BOOL: case RAY_U8:   case RAY_I16:
     case RAY_I32:  case RAY_I64:  case RAY_F64:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_GUID:
-    case RAY_SYM:
+    case RAY_SYM:  case RAY_STR:
         return true;
     default:
         return false;
@@ -188,34 +193,6 @@ static ray_t* col_load_str_list(const uint8_t* ptr, size_t remaining) {
     return list;
 }
 
-/* --------------------------------------------------------------------------
- * col_save_str_vec -- serialize a RAY_STR vector with Rayforce serde
- *
- * RAY_STR columns carry a string pool through the header union, so they cannot
- * use the raw 32-byte column layout. Reuse the object wire format here; it
- * already preserves pooled strings and external null bitmaps.
- * -------------------------------------------------------------------------- */
-
-static ray_err_t col_save_str_vec(ray_t* vec, FILE* f) {
-    uint32_t magic = STR_VEC_MAGIC;
-    if (fwrite(&magic, 4, 1, f) != 1) return RAY_ERR_IO;
-
-    int64_t len = ray_serde_size(vec);
-    if (len <= 0) return RAY_ERR_IO;
-    ray_t* bytes = ray_vec_new(RAY_U8, len);
-    if (!bytes || RAY_IS_ERR(bytes)) return RAY_ERR_OOM;
-
-    int64_t wrote = ray_ser_raw((uint8_t*)ray_data(bytes), vec);
-    if (wrote != len) {
-        ray_release(bytes);
-        return RAY_ERR_IO;
-    }
-
-    size_t out = fwrite(ray_data(bytes), 1, (size_t)len, f);
-    ray_release(bytes);
-    return out == (size_t)len ? RAY_OK : RAY_ERR_IO;
-}
-
 static ray_t* col_load_str_vec(const uint8_t* ptr, size_t remaining) {
     if (remaining > (size_t)INT64_MAX) return ray_error("range", NULL);
     int64_t len = (int64_t)remaining;
@@ -266,10 +243,11 @@ static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
 
     if (is_serializable_type(type)) {
         /* Fixed-size vector: write len + raw data.
-         * RAY_SYM: also write attrs byte (adaptive width W8/W16/W32/W64). */
+         * RAY_SYM: also write attrs byte (adaptive width W8/W16/W32/W64).
+         * RAY_STR: also write attrs byte and the adjacent byte pool. */
         int64_t len = obj->len;
         if (fwrite(&len, 8, 1, f) != 1) return RAY_ERR_IO;
-        if (type == RAY_SYM) {
+        if (type == RAY_SYM || type == RAY_STR) {
             uint8_t attrs = obj->attrs;
             if (fwrite(&attrs, 1, 1, f) != 1) return RAY_ERR_IO;
         }
@@ -277,6 +255,13 @@ static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
         size_t data_size = (size_t)len * esz;
         if (data_size > 0 && fwrite(ray_data(obj), 1, data_size, f) != data_size)
             return RAY_ERR_IO;
+        if (type == RAY_STR) {
+            uint64_t pool_size = (uint64_t)col_str_pool_payload_len(obj);
+            if (fwrite(&pool_size, 8, 1, f) != 1) return RAY_ERR_IO;
+            if (pool_size > 0 &&
+                fwrite(ray_data(obj->str_pool), 1, (size_t)pool_size, f) != pool_size)
+                return RAY_ERR_IO;
+        }
         return RAY_OK;
     }
 
@@ -352,9 +337,9 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
         *pp += 8; *remaining -= 8;
         if (len < 0) return ray_error("corrupt", NULL);
 
-        /* RAY_SYM: read attrs byte for adaptive width */
+        /* RAY_SYM / RAY_STR: read attrs byte for adaptive width/nulls */
         uint8_t attrs = 0;
-        if (type == RAY_SYM) {
+        if (type == RAY_SYM || type == RAY_STR) {
             if (*remaining < 1) return ray_error("corrupt", NULL);
             memcpy(&attrs, *pp, 1);
             *pp += 1; *remaining -= 1;
@@ -374,6 +359,31 @@ static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
         if (data_size > 0)
             memcpy(ray_data(vec), *pp, data_size);
         *pp += data_size; *remaining -= data_size;
+
+        if (type == RAY_STR) {
+            if (*remaining < 8) { ray_release(vec); return ray_error("corrupt", NULL); }
+            uint64_t pool_size;
+            memcpy(&pool_size, *pp, 8);
+            *pp += 8; *remaining -= 8;
+            if (pool_size > *remaining || pool_size > (uint64_t)INT64_MAX) {
+                ray_release(vec);
+                return ray_error("corrupt", NULL);
+            }
+            if (pool_size > 0) {
+                vec->str_pool = ray_alloc((size_t)pool_size);
+                if (!vec->str_pool || RAY_IS_ERR(vec->str_pool)) {
+                    ray_t* err = vec->str_pool ? vec->str_pool : ray_error("oom", NULL);
+                    vec->str_pool = NULL;
+                    ray_release(vec);
+                    return err;
+                }
+                vec->str_pool->type = RAY_U8;
+                vec->str_pool->len = (int64_t)pool_size;
+                memcpy(ray_data(vec->str_pool), *pp, (size_t)pool_size);
+            }
+            *pp += pool_size; *remaining -= (size_t)pool_size;
+            vec->attrs = attrs;
+        }
 
         if (type == RAY_SYM) {
             uint32_t sc = ray_sym_count();
@@ -489,7 +499,7 @@ static void try_load_link_sidecar(ray_t* vec, const char* path) {
  * ray_col_save -- write a vector to a column file
  * -------------------------------------------------------------------------- */
 
-ray_err_t ray_col_save(ray_t* vec, const char* path) {
+static ray_err_t col_save_impl(ray_t* vec, const char* path, bool durable) {
     if (!vec || RAY_IS_ERR(vec)) return RAY_ERR_TYPE;
     if (!path) return RAY_ERR_IO;
 
@@ -503,16 +513,6 @@ ray_err_t ray_col_save(ray_t* vec, const char* path) {
         FILE* f = fopen(tmp_path, "wb");
         if (!f) return RAY_ERR_IO;
         ray_err_t err = col_save_str_list(vec, f);
-        fclose(f);
-        if (err != RAY_OK) { remove(tmp_path); return err; }
-        goto fsync_and_rename;
-    }
-
-    /* String vector */
-    if (vec->type == RAY_STR) {
-        FILE* f = fopen(tmp_path, "wb");
-        if (!f) return RAY_ERR_IO;
-        ray_err_t err = col_save_str_vec(vec, f);
         fclose(f);
         if (err != RAY_OK) { remove(tmp_path); return err; }
         goto fsync_and_rename;
@@ -633,6 +633,32 @@ ray_err_t ray_col_save(ray_t* vec, const char* path) {
             if (written != data_size) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }
         }
 
+        if (vec->type == RAY_STR) {
+            size_t pool_size = col_str_pool_payload_len(vec);
+            ray_t pool_header;
+            memset(&pool_header, 0, sizeof(pool_header));
+            if (vec->str_pool && !RAY_IS_ERR(vec->str_pool)) {
+                memcpy(&pool_header, vec->str_pool, 32);
+            }
+            pool_header.mmod = 0;
+            pool_header.order = 0;
+            pool_header.type = RAY_U8;
+            pool_header.attrs = 0;
+            pool_header.rc = 0;
+            pool_header.len = (int64_t)pool_size;
+            written = fwrite(&pool_header, 1, 32, f);
+            if (written != 32) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }
+            if (pool_size > 0) {
+                if (!vec->str_pool || RAY_IS_ERR(vec->str_pool)) {
+                    fclose(f);
+                    remove(tmp_path);
+                    return RAY_ERR_CORRUPT;
+                }
+                written = fwrite(ray_data(vec->str_pool), 1, pool_size, f);
+                if (written != pool_size) { fclose(f); remove(tmp_path); return RAY_ERR_IO; }
+            }
+        }
+
         /* Append external nullmap bitmap after data.  Use header.attrs
          * (rebased above for HAS_INDEX) and ext_for_append (the
          * effective ext_nullmap pointer, possibly extracted from the
@@ -648,12 +674,15 @@ ray_err_t ray_col_save(ray_t* vec, const char* path) {
     }
 
 fsync_and_rename:;
-    /* Fsync temp file for durability */
-    ray_fd_t tmp_fd = ray_file_open(tmp_path, RAY_OPEN_READ | RAY_OPEN_WRITE);
-    if (tmp_fd == RAY_FD_INVALID) { remove(tmp_path); return RAY_ERR_IO; }
-    ray_err_t err = ray_file_sync(tmp_fd);
-    ray_file_close(tmp_fd);
-    if (err != RAY_OK) { remove(tmp_path); return err; }
+    ray_err_t err = RAY_OK;
+    if (durable) {
+        /* Fsync temp file for durability */
+        ray_fd_t tmp_fd = ray_file_open(tmp_path, RAY_OPEN_READ | RAY_OPEN_WRITE);
+        if (tmp_fd == RAY_FD_INVALID) { remove(tmp_path); return RAY_ERR_IO; }
+        err = ray_file_sync(tmp_fd);
+        ray_file_close(tmp_fd);
+        if (err != RAY_OK) { remove(tmp_path); return err; }
+    }
 
     /* Atomic rename: tmp -> final path */
     err = ray_file_rename(tmp_path, path);
@@ -700,6 +729,14 @@ fsync_and_rename:;
     return RAY_OK;
 }
 
+ray_err_t ray_col_save(ray_t* vec, const char* path) {
+    return col_save_impl(vec, path, true);
+}
+
+ray_err_t ray_col_save_bulk(ray_t* vec, const char* path) {
+    return col_save_impl(vec, path, false);
+}
+
 /* --------------------------------------------------------------------------
  * col_validate_mapped -- shared validation for ray_col_load / ray_col_mmap
  *
@@ -715,9 +752,74 @@ typedef struct {
     ray_t*  header;       /* pointer into mapped region */
     uint8_t esz;
     size_t  data_size;
+    bool    has_str_pool;
+    size_t  str_pool_offset;
+    size_t  str_pool_size;
+    size_t  bitmap_offset;
     bool    has_ext_nullmap;
     size_t  bitmap_len;
+    uint32_t saved_sym_count;
 } col_mapped_t;
+
+static size_t col_str_pool_payload_len(const ray_t* vec) {
+    if (!vec || vec->type != RAY_STR || !vec->str_pool || RAY_IS_ERR(vec->str_pool))
+        return 0;
+    return vec->str_pool->len > 0 ? (size_t)vec->str_pool->len : 0;
+}
+
+static ray_t* col_copy_str_pool(const col_mapped_t* cm) {
+    if (!cm->has_str_pool) return NULL;
+
+    const ray_t* src = (const ray_t*)((const char*)cm->mapped + cm->str_pool_offset);
+    if (cm->str_pool_size == 0) return NULL;
+
+    ray_t* pool = ray_alloc(cm->str_pool_size);
+    if (!pool || RAY_IS_ERR(pool)) return pool ? pool : ray_error("oom", NULL);
+
+    uint8_t saved_order = pool->order;
+    uint8_t saved_mmod = pool->mmod;
+    memcpy(pool, src, 32 + cm->str_pool_size);
+    pool->order = saved_order;
+    pool->mmod = saved_mmod;
+    pool->attrs &= (uint8_t)~RAY_ATTR_SLICE;
+    ray_atomic_store(&pool->rc, 1);
+    return pool;
+}
+
+static ray_err_t col_validate_str_region(ray_t* hdr, const void* ptr,
+                                         size_t mapped_size, col_mapped_t* out) {
+    size_t offset = 32 + out->data_size;
+    if (offset > mapped_size || mapped_size - offset < 32)
+        return RAY_ERR_CORRUPT;
+
+    ray_t* pool = (ray_t*)((char*)ptr + offset);
+    if (pool->type != RAY_U8 || pool->len < 0)
+        return RAY_ERR_CORRUPT;
+
+    size_t pool_size = (size_t)pool->len;
+    if (pool_size > mapped_size - offset - 32)
+        return RAY_ERR_CORRUPT;
+
+    const ray_str_t* elems = (const ray_str_t*)((const char*)ptr + 32);
+    for (int64_t i = 0; i < hdr->len; i++) {
+        uint32_t len = elems[i].len;
+        if (len <= RAY_STR_INLINE_MAX) continue;
+        if (pool_size == 0 || elems[i].pool_off > pool_size ||
+            len > pool_size - elems[i].pool_off)
+            return RAY_ERR_CORRUPT;
+        if (len >= 4) {
+            const char* p = (const char*)ptr + offset + 32 + elems[i].pool_off;
+            if (memcmp(elems[i].prefix, p, 4) != 0)
+                return RAY_ERR_CORRUPT;
+        }
+    }
+
+    out->has_str_pool = true;
+    out->str_pool_offset = offset;
+    out->str_pool_size = pool_size;
+    out->bitmap_offset = offset + 32 + pool_size;
+    return RAY_OK;
+}
 
 static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
     size_t mapped_size = 0;
@@ -777,11 +879,28 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
         return ray_error("corrupt", NULL);
     }
 
+    out->data_size = data_size;
+    size_t bitmap_offset = 32 + data_size;
+    if (hdr->type == RAY_STR) {
+        ray_err_t se = col_validate_str_region(hdr, ptr, mapped_size, out);
+        if (se != RAY_OK) {
+            ray_vm_unmap_file(ptr, mapped_size);
+            return ray_error(ray_err_code_str(se), NULL);
+        }
+        bitmap_offset = out->bitmap_offset;
+    } else {
+        out->has_str_pool = false;
+        out->str_pool_offset = 0;
+        out->str_pool_size = 0;
+        out->bitmap_offset = bitmap_offset;
+    }
+
     /* Check for appended ext_nullmap bitmap */
     bool has_ext_nullmap = (hdr->attrs & RAY_ATTR_HAS_NULLS) &&
                            (hdr->attrs & RAY_ATTR_NULLMAP_EXT);
     size_t bitmap_len = has_ext_nullmap ? ((size_t)hdr->len + 7) / 8 : 0;
-    if (has_ext_nullmap && 32 + data_size + bitmap_len > mapped_size) {
+    if (has_ext_nullmap && (bitmap_offset > mapped_size ||
+                            bitmap_len > mapped_size - bitmap_offset)) {
         ray_vm_unmap_file(ptr, mapped_size);
         return ray_error("corrupt", NULL);
     }
@@ -791,6 +910,7 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
     if (hdr->type == RAY_SYM) {
         uint32_t saved_sc;
         memcpy(&saved_sc, (const char*)ptr + offsetof(ray_t, rc), sizeof(saved_sc));
+        out->saved_sym_count = saved_sc;
         uint32_t cur_sc = ray_sym_count();
         if (saved_sc > 0 && cur_sc > 0 && cur_sc < saved_sc) {
             ray_vm_unmap_file(ptr, mapped_size);
@@ -803,6 +923,7 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
     out->header          = hdr;
     out->esz             = esz;
     out->data_size       = data_size;
+    out->bitmap_offset   = bitmap_offset;
     out->has_ext_nullmap = has_ext_nullmap;
     out->bitmap_len      = bitmap_len;
     return NULL;  /* success */
@@ -819,7 +940,7 @@ static ray_t* col_restore_ext_nullmap(ray_t* vec, const col_mapped_t* cm) {
     ray_t* ext = ray_vec_new(RAY_U8, (int64_t)cm->bitmap_len);
     if (!ext || RAY_IS_ERR(ext)) return ray_error("oom", NULL);
     ext->len = (int64_t)cm->bitmap_len;
-    memcpy(ray_data(ext), (char*)cm->mapped + 32 + cm->data_size, cm->bitmap_len);
+    memcpy(ray_data(ext), (char*)cm->mapped + cm->bitmap_offset, cm->bitmap_len);
     vec->ext_nullmap = ext;
     return NULL;  /* success */
 }
@@ -876,6 +997,16 @@ ray_t* ray_col_load(const char* path) {
     uint8_t saved_order = vec->order;  /* preserve buddy order */
     memcpy(vec, cm.mapped, 32 + cm.data_size);
 
+    if (vec->type == RAY_STR) {
+        ray_t* pool = col_copy_str_pool(&cm);
+        if (pool && RAY_IS_ERR(pool)) {
+            ray_vm_unmap_file(cm.mapped, cm.mapped_size);
+            ray_free(vec);
+            return pool;
+        }
+        vec->str_pool = pool;
+    }
+
     /* Restore external nullmap if present */
     if (cm.has_ext_nullmap) {
         ray_t* ext_err = col_restore_ext_nullmap(vec, &cm);
@@ -920,7 +1051,7 @@ ray_t* ray_col_load(const char* path) {
  * ray_release -> ray_free -> munmap.
  * -------------------------------------------------------------------------- */
 
-ray_t* ray_col_mmap(const char* path) {
+static ray_t* col_mmap_impl(const char* path, bool trust_splayed_sym_count) {
     if (!path) return ray_error("io", NULL);
 
     col_mapped_t cm = {0};
@@ -929,7 +1060,7 @@ ray_t* ray_col_mmap(const char* path) {
 
     /* Validate that file size matches expected layout exactly.
      * ray_free() reconstructs the munmap size using the same formula. */
-    size_t expected = 32 + cm.data_size + cm.bitmap_len;
+    size_t expected = cm.bitmap_offset + cm.bitmap_len;
     if (expected != cm.mapped_size) {
         ray_vm_unmap_file(cm.mapped, cm.mapped_size);
         return ray_error("io", NULL);
@@ -937,13 +1068,27 @@ ray_t* ray_col_mmap(const char* path) {
 
     ray_t* vec = cm.header;
 
-    /* RAY_SYM: bounds check on data */
+    /* RAY_SYM: generic mmap validates indices by scanning the data.  Splayed
+     * reads are the trusted local table format, so opening them must only map
+     * files and validate headers; walking every symbol column would turn mmap
+     * open into an eager cold-disk scan.  New files carry a saved symbol count
+     * for an O(1) reject.  Older files have zero there, so they rely on the
+     * loaded global symfile contract instead. */
     if (vec->type == RAY_SYM) {
-        ray_err_t sym_err = validate_sym_bounds(
-            (const char*)cm.mapped + 32, vec->len, vec->attrs, ray_sym_count());
-        if (sym_err != RAY_OK) {
+        uint32_t cur_sc = ray_sym_count();
+        uint32_t trusted_sc = trust_splayed_sym_count ? ray_sym_persisted_count() : cur_sc;
+        if (trust_splayed_sym_count && cm.saved_sym_count > trusted_sc) {
             ray_vm_unmap_file(cm.mapped, cm.mapped_size);
-            return ray_error(ray_err_code_str(sym_err), NULL);
+            return ray_error("corrupt", NULL);
+        }
+        bool skip_bounds = trust_splayed_sym_count && trusted_sc > 0;
+        if (!skip_bounds) {
+            ray_err_t sym_err = validate_sym_bounds(
+                (const char*)cm.mapped + 32, vec->len, vec->attrs, cur_sc);
+            if (sym_err != RAY_OK) {
+                ray_vm_unmap_file(cm.mapped, cm.mapped_size);
+                return ray_error(ray_err_code_str(sym_err), NULL);
+            }
         }
     }
 
@@ -965,10 +1110,27 @@ ray_t* ray_col_mmap(const char* path) {
         vec->attrs &= ~RAY_ATTR_NULLMAP_EXT;
     ray_atomic_store(&vec->rc, 1);
 
+    if (vec->type == RAY_STR) {
+        ray_t* pool = (ray_t*)((char*)cm.mapped + cm.str_pool_offset);
+        pool->mmod = 2;
+        pool->order = 0;
+        pool->attrs &= (uint8_t)~RAY_ATTR_SLICE;
+        ray_atomic_store(&pool->rc, 1);
+        vec->str_pool = pool;
+    }
+
     /* Reattach link sidecar if present.  Without this, linked columns
      * round-tripped through splay-mmap (splay.c:184) lose HAS_LINK
      * even though ray_col_load restores it. */
     try_load_link_sidecar(vec, path);
 
     return vec;
+}
+
+ray_t* ray_col_mmap(const char* path) {
+    return col_mmap_impl(path, false);
+}
+
+ray_t* ray_col_mmap_splayed(const char* path) {
+    return col_mmap_impl(path, true);
 }

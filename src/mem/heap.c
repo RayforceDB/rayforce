@@ -936,6 +936,12 @@ void ray_free(ray_t* v) {
         if (v->type > 0 && v->type < RAY_TYPE_COUNT) {
             uint8_t esz = ray_sym_elem_size(v->type, v->attrs);
             size_t data_size = 32 + (size_t)v->len * esz;
+            if (v->type == RAY_STR) {
+                size_t pool_len = 0;
+                if (v->str_pool && !RAY_IS_ERR(v->str_pool) && v->str_pool->len > 0)
+                    pool_len = (size_t)v->str_pool->len;
+                data_size += 32 + pool_len;
+            }
             if (v->attrs & RAY_ATTR_NULLMAP_EXT)
                 data_size += ((size_t)v->len + 7) / 8;
             size_t mapped_size = (data_size + 4095) & ~(size_t)4095;
@@ -1425,6 +1431,25 @@ void ray_heap_gc(void) {
                 }
                 gh->pools[p] = gh->pools[--gh->pool_count];
                 /* Don't increment p — check swapped entry */
+            }
+        }
+
+        /* Phase 5: Release physical pages from free blocks in every
+         * idle heap.  Phase 2 may have returned blocks to worker-owned
+         * freelists; releasing only the caller heap leaves those worker
+         * pages resident across large query repetitions. */
+        for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
+            ray_heap_t* gh = ray_heap_registry[hid];
+            if (!gh) continue;
+            for (int i = 13; i < RAY_HEAP_FL_SIZE; i++) {
+                ray_fl_head_t* head = &gh->freelist[i];
+                ray_t* blk = head->fl_next;
+                while (blk != (ray_t*)head) {
+                    size_t bsize = BSIZEOF(i);
+                    if (bsize > 4096)
+                        ray_vm_release((char*)blk + 4096, bsize - 4096);
+                    blk = blk->fl_next;
+                }
             }
         }
     }

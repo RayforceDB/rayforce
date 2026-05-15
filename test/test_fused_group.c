@@ -33,6 +33,7 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "ops/internal.h"
 #include "ops/ops.h"
 #include "ops/fused_group.h"
 #include "table/sym.h"
@@ -227,6 +228,65 @@ static test_result_t test_ne_const_out_of_range_u8(void) {
     for (int64_t i = 0; i < ray_table_nrows(res); i++)
         total += ((int64_t*)ray_data(cnt_col))[i];
     TEST_ASSERT_EQ_I(total, 7);
+
+    ray_release(res);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_count1_i16_direct_counts_negative_keys(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int16_t kv[] = { -2, -1, -2, 0, 1, 1, 1 };
+    ray_t* col = ray_vec_new(RAY_I16, 7);
+    TEST_ASSERT_NOT_NULL(col);
+    col->len = 7;
+    memcpy(ray_data(col), kv, sizeof(kv));
+
+    int64_t k_sym = ray_sym_intern("k16", 3);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, k_sym, col);
+    ray_release(col);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_op_t* scan_k    = ray_scan(g, "k16");
+    ray_op_t* scan_pred = ray_scan(g, "k16");
+    ray_op_t* min_key   = ray_const_i64(g, -2);
+    ray_op_t* pred      = ray_binop(g, OP_GE, scan_pred, min_key);
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_k };
+    ray_op_t* keys[]    = { scan_k };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 1, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 4);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* key_col = ray_table_get_col(res, k_sym);
+    ray_t* cnt_col = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_NOT_NULL(key_col);
+    TEST_ASSERT_NOT_NULL(cnt_col);
+
+    int64_t got_m2 = -1, got_m1 = -1, got_0 = -1, got_1 = -1;
+    int16_t* ks = (int16_t*)ray_data(key_col);
+    int64_t* cs = (int64_t*)ray_data(cnt_col);
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        if (ks[i] == -2) got_m2 = cs[i];
+        else if (ks[i] == -1) got_m1 = cs[i];
+        else if (ks[i] == 0) got_0 = cs[i];
+        else if (ks[i] == 1) got_1 = cs[i];
+    }
+    TEST_ASSERT_EQ_I(got_m2, 2);
+    TEST_ASSERT_EQ_I(got_m1, 1);
+    TEST_ASSERT_EQ_I(got_0, 1);
+    TEST_ASSERT_EQ_I(got_1, 3);
 
     ray_release(res);
     ray_graph_free(g);
@@ -704,6 +764,219 @@ static test_result_t test_multi_agg_multi_key(void) {
     PASS();
 }
 
+static test_result_t test_multi_key_in_pred(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* g1c = ray_vec_new(RAY_I32, 8); g1c->len = 8;
+    ray_t* g2c = ray_vec_new(RAY_I32, 8); g2c->len = 8;
+    ray_t* vc  = ray_vec_new(RAY_I64, 8); vc->len  = 8;
+    ray_t* sc  = ray_vec_new(RAY_I64, 2); sc->len  = 2;
+    int32_t g1[] = {1, 1, 2, 2, 1, 1, 2, 2};
+    int32_t g2[] = {1, 2, 1, 2, 1, 2, 1, 2};
+    int64_t v[]  = {10, 20, 30, 40, 50, 60, 70, 80};
+    int64_t set_vals[] = {20, 70};
+    memcpy(ray_data(g1c), g1, sizeof(g1));
+    memcpy(ray_data(g2c), g2, sizeof(g2));
+    memcpy(ray_data(vc),  v,  sizeof(v));
+    memcpy(ray_data(sc),  set_vals, sizeof(set_vals));
+
+    int64_t s_g1 = ray_sym_intern("g1", 2);
+    int64_t s_g2 = ray_sym_intern("g2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_g1, g1c); ray_release(g1c);
+    tbl = ray_table_add_col(tbl, s_g2, g2c); ray_release(g2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_g1 = ray_scan(g, "g1");
+    ray_op_t* scan_g2 = ray_scan(g, "g2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* set_op  = ray_const_vec(g, sc);
+    ray_op_t* pred    = ray_binop(g, OP_IN, scan_vp, set_op);
+    ray_release(sc);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_g1, scan_g2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 2);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* k1_col = ray_table_get_col(res, s_g1);
+    ray_t* k2_col = ray_table_get_col(res, s_g2);
+    ray_t* c_col  = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_NOT_NULL(k1_col);
+    TEST_ASSERT_NOT_NULL(k2_col);
+    TEST_ASSERT_NOT_NULL(c_col);
+    int64_t got_12 = 0, got_21 = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int32_t a = ((int32_t*)ray_data(k1_col))[i];
+        int32_t b = ((int32_t*)ray_data(k2_col))[i];
+        int64_t c = ((int64_t*)ray_data(c_col))[i];
+        if (a == 1 && b == 2) got_12 = c;
+        if (a == 2 && b == 1) got_21 = c;
+    }
+    TEST_ASSERT_EQ_I(got_12, 1);
+    TEST_ASSERT_EQ_I(got_21, 1);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_wide_multi_key_in_pred(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* k1c = ray_vec_new(RAY_I64, 8); k1c->len = 8;
+    ray_t* k2c = ray_vec_new(RAY_I32, 8); k2c->len = 8;
+    ray_t* vc  = ray_vec_new(RAY_I64, 8); vc->len  = 8;
+    ray_t* sc  = ray_vec_new(RAY_I64, 2); sc->len  = 2;
+    int64_t k1[] = {10, 10, 20, 20, 10, 10, 20, 20};
+    int32_t k2[] = {1, 2, 1, 2, 1, 2, 1, 2};
+    int64_t v[]  = {10, 20, 30, 40, 50, 60, 70, 80};
+    int64_t set_vals[] = {20, 70};
+    memcpy(ray_data(k1c), k1, sizeof(k1));
+    memcpy(ray_data(k2c), k2, sizeof(k2));
+    memcpy(ray_data(vc),  v,  sizeof(v));
+    memcpy(ray_data(sc),  set_vals, sizeof(set_vals));
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* set_op  = ray_const_vec(g, sc);
+    ray_op_t* pred    = ray_binop(g, OP_IN, scan_vp, set_op);
+    ray_release(sc);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_t* res = ray_execute(g, fused);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 2);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* out_k1 = ray_table_get_col(res, s_k1);
+    ray_t* out_k2 = ray_table_get_col(res, s_k2);
+    ray_t* c_col  = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_NOT_NULL(out_k1);
+    TEST_ASSERT_NOT_NULL(out_k2);
+    TEST_ASSERT_NOT_NULL(c_col);
+    int64_t got_102 = 0, got_201 = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int64_t a = ((int64_t*)ray_data(out_k1))[i];
+        int32_t b = ((int32_t*)ray_data(out_k2))[i];
+        int64_t c = ((int64_t*)ray_data(c_col))[i];
+        if (a == 10 && b == 2) got_102 = c;
+        if (a == 20 && b == 1) got_201 = c;
+    }
+    TEST_ASSERT_EQ_I(got_102, 1);
+    TEST_ASSERT_EQ_I(got_201, 1);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_wide_multi_key_top_count_emit_filter(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    enum { N = 15 };
+    ray_t* k1c = ray_vec_new(RAY_I64, N); k1c->len = N;
+    ray_t* k2c = ray_vec_new(RAY_I32, N); k2c->len = N;
+    ray_t* vc  = ray_vec_new(RAY_I64, N); vc->len  = N;
+    int64_t k1[] = {
+        10,10,10,10,10, 20,20,20,20, 30,30,30, 40,40, 50
+    };
+    int32_t k2[] = {
+        1,1,1,1,1, 2,2,2,2, 3,3,3, 4,4, 5
+    };
+    int64_t v[] = {
+        0,1,2,3,4, 5,6,7,8, 9,10,11, 12,13, 14
+    };
+    memcpy(ray_data(k1c), k1, sizeof(k1));
+    memcpy(ray_data(k2c), k2, sizeof(k2));
+    memcpy(ray_data(vc),  v,  sizeof(v));
+
+    int64_t s_k1 = ray_sym_intern("k1", 2);
+    int64_t s_k2 = ray_sym_intern("k2", 2);
+    int64_t s_v  = ray_sym_intern("v",  1);
+    ray_t* tbl = ray_table_new(3);
+    tbl = ray_table_add_col(tbl, s_k1, k1c); ray_release(k1c);
+    tbl = ray_table_add_col(tbl, s_k2, k2c); ray_release(k2c);
+    tbl = ray_table_add_col(tbl, s_v,  vc);  ray_release(vc);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* scan_k1 = ray_scan(g, "k1");
+    ray_op_t* scan_k2 = ray_scan(g, "k2");
+    ray_op_t* scan_v  = ray_scan(g, "v");
+    ray_op_t* scan_vp = ray_scan(g, "v");
+    ray_op_t* zero    = ray_const_i64(g, 0);
+    ray_op_t* pred    = ray_binop(g, OP_GE, scan_vp, zero);
+
+    uint16_t  agg_ops[] = { OP_COUNT };
+    ray_op_t* agg_ins[] = { scan_v };
+    ray_op_t* keys[]    = { scan_k1, scan_k2 };
+    ray_op_t* fused     = ray_filtered_group(g, pred, keys, 2, agg_ops, agg_ins, 1);
+    TEST_ASSERT_NOT_NULL(fused);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 2;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, fused);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 2);
+
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    ray_t* out_k1 = ray_table_get_col(res, s_k1);
+    ray_t* out_k2 = ray_table_get_col(res, s_k2);
+    ray_t* c_col  = ray_table_get_col(res, cnt_sym);
+    TEST_ASSERT_NOT_NULL(out_k1);
+    TEST_ASSERT_NOT_NULL(out_k2);
+    TEST_ASSERT_NOT_NULL(c_col);
+
+    int64_t got_101 = 0, got_202 = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int64_t a = ((int64_t*)ray_data(out_k1))[i];
+        int32_t b = ((int32_t*)ray_data(out_k2))[i];
+        int64_t c = ((int64_t*)ray_data(c_col))[i];
+        if (a == 10 && b == 1) got_101 = c;
+        if (a == 20 && b == 2) got_202 = c;
+    }
+    TEST_ASSERT_EQ_I(got_101, 5);
+    TEST_ASSERT_EQ_I(got_202, 4);
+
+    ray_release(res); ray_graph_free(g); ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 /* Chunk 2 + 3 + 4: wide multi-key path (mk_shard_grow wide branch,
  * mk_compose_key2, mk_hash_lo_hi, mk_state_merge AVG).
  *
@@ -1113,6 +1386,7 @@ const test_entry_t fused_group_entries[] = {
     { "fused_group/eq_no_match",                 test_eq_no_match,                 NULL, NULL },
     { "fused_group/eq_const_out_of_range_u8",    test_eq_const_out_of_range_u8,    NULL, NULL },
     { "fused_group/ne_const_out_of_range_u8",    test_ne_const_out_of_range_u8,    NULL, NULL },
+    { "fused_group/count1_i16_direct_negative",  test_count1_i16_direct_counts_negative_keys, NULL, NULL },
     { "fused_group/sum_negative_i16",            test_sum_negative_i16,            NULL, NULL },
     { "fused_group/fallback_filter_honored",     test_fallback_filter_honored,     NULL, NULL },
     { "fused_group/count1_rejects_nullable_key", test_count1_rejects_nullable_key, NULL, NULL },
@@ -1125,6 +1399,9 @@ const test_entry_t fused_group_entries[] = {
     { "fused_group/fold_i32_eq_above",           test_fold_i32_eq_above,           NULL, NULL },
     { "fused_group/fold_i32_ne_above",           test_fold_i32_ne_above,           NULL, NULL },
     { "fused_group/multi_agg_multi_key",         test_multi_agg_multi_key,         NULL, NULL },
+    { "fused_group/multi_key_in_pred",           test_multi_key_in_pred,           NULL, NULL },
+    { "fused_group/wide_multi_key_in_pred",      test_wide_multi_key_in_pred,      NULL, NULL },
+    { "fused_group/wide_multi_key_top_count",    test_wide_multi_key_top_count_emit_filter, NULL, NULL },
     { "fused_group/wide_multi_key",              test_wide_multi_key,              NULL, NULL },
     { "fused_group/count1_parallel_combine",     test_count1_parallel_combine,     NULL, NULL },
     { "fused_group/count1_shard_grow",           test_count1_shard_grow,           NULL, NULL },

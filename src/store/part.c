@@ -27,13 +27,14 @@
 #define _GNU_SOURCE
 #endif
 #include "part.h"
-#include "core/platform.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
 #include "store/splay.h"
 #include "table/sym.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -126,6 +127,7 @@ static ray_err_t collect_part_dirs(const char* db_root, char*** out_dirs,
     char** part_dirs = NULL;
     int64_t part_count = 0;
     int64_t part_cap = 0;
+    ray_err_t err = RAY_OK;
 
     struct dirent* ent;
     while ((ent = readdir(d)) != NULL) {
@@ -144,18 +146,26 @@ static ray_err_t collect_part_dirs(const char* db_root, char*** out_dirs,
 
         if (part_count >= part_cap) {
             part_cap = part_cap == 0 ? 16 : part_cap * 2;
-            char** tmp = (char**)ray_sys_realloc(part_dirs, (size_t)part_cap * sizeof(char*));
-            if (!tmp) break;
+            char** tmp = (char**)realloc(part_dirs, (size_t)part_cap * sizeof(char*));
+            if (!tmp) { err = RAY_ERR_OOM; break; }
             part_dirs = tmp;
         }
-        char* dup = ray_sys_strdup(ent->d_name);
-        if (!dup) break;
+        size_t len = strlen(ent->d_name);
+        char* dup = (char*)malloc(len + 1);
+        if (!dup) { err = RAY_ERR_OOM; break; }
+        memcpy(dup, ent->d_name, len + 1);
         part_dirs[part_count++] = dup;
     }
     closedir(d);
 
+    if (err != RAY_OK) {
+        for (int64_t i = 0; i < part_count; i++) free(part_dirs[i]);
+        free(part_dirs);
+        return err;
+    }
+
     if (part_count == 0) {
-        ray_sys_free(part_dirs);
+        free(part_dirs);
         return RAY_ERR_IO;
     }
 
@@ -186,6 +196,9 @@ static ray_err_t collect_part_dirs(const char* db_root, char*** out_dirs,
 
 ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     if (!db_root || !table_name) return ray_error("io", NULL);
+    bool trace = getenv("RAY_CSV_TRACE") != NULL;
+    if (trace)
+        fprintf(stderr, "parted.get: root=%s table=%s\n", db_root, table_name);
 
     /* Validate table_name: no path separators or traversal */
     if (strchr(table_name, '/') || strchr(table_name, '\\') ||
@@ -212,7 +225,14 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     char** part_dirs = NULL;
     int64_t part_count = 0;
     ray_err_t collect_err = collect_part_dirs(db_root, &part_dirs, &part_count, true);
-    if (collect_err != RAY_OK) return ray_error("io", NULL);
+    if (collect_err != RAY_OK) {
+        if (trace)
+            fprintf(stderr, "parted.get: collect dirs failed err=%s\n",
+                    ray_err_code_str(collect_err));
+        return ray_error("io", NULL);
+    }
+    if (trace)
+        fprintf(stderr, "parted.get: parts=%" PRId64 "\n", part_count);
 
     /* Open each partition via ray_read_splayed */
     ray_t** part_tables = (ray_t**)ray_sys_alloc((size_t)part_count * sizeof(ray_t*));
@@ -228,6 +248,11 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
         }
         part_tables[p] = ray_read_splayed(path, NULL);
         if (!part_tables[p] || RAY_IS_ERR(part_tables[p])) {
+            if (trace)
+                fprintf(stderr, "parted.get: splayed load failed part=%" PRId64 " path=%s err=%s\n",
+                        p, path,
+                        part_tables[p] && RAY_IS_ERR(part_tables[p])
+                            ? ray_err_code(part_tables[p]) : "io");
             part_tables[p] = NULL;
             goto fail_tables;
         }
@@ -235,7 +260,13 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
 
     /* Get schema from first partition */
     int64_t ncols = ray_table_ncols(part_tables[0]);
-    if (ncols <= 0) goto fail_tables;
+    if (ncols <= 0) {
+        if (trace)
+            fprintf(stderr, "parted.get: empty first partition\n");
+        goto fail_tables;
+    }
+    if (trace)
+        fprintf(stderr, "parted.get: ncols=%" PRId64 "\n", ncols);
 
     /* Infer MAPCOMMON sub-type from partition directory names */
     uint8_t mc_type = infer_mc_type(part_dirs, part_count);
@@ -322,6 +353,8 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
 
         ray_t* parted = ray_alloc((size_t)part_count * sizeof(ray_t*));
         if (!parted || RAY_IS_ERR(parted)) {
+            if (trace)
+                fprintf(stderr, "parted.get: alloc failed col=%" PRId64 "\n", c);
             ray_release(result);
             goto fail_tables;
         }
@@ -339,8 +372,6 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
             }
             ray_retain(seg);
             segs[p] = seg;
-            ray_vm_advise_willneed(ray_data(seg),
-                                  (size_t)seg->len * ray_sym_elem_size(seg->type, seg->attrs));
         }
 
         result = ray_table_add_col(result, name_id, parted);
@@ -351,14 +382,16 @@ ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     /* Release partition sub-tables (segment vectors survive via retain) */
     for (int64_t p = 0; p < part_count; p++) {
         if (part_tables[p]) ray_release(part_tables[p]);
-        ray_sys_free(part_dirs[p]);
+        free(part_dirs[p]);
     }
     ray_sys_free(part_tables);
-    ray_sys_free(part_dirs);
+    free(part_dirs);
 
     return result;
 
 fail_tables:
+    if (trace)
+        fprintf(stderr, "parted.get: failed\n");
     for (int64_t p = 0; p < part_count; p++) {
         if (part_tables[p] && !RAY_IS_ERR(part_tables[p]))
             ray_release(part_tables[p]);
@@ -367,8 +400,8 @@ fail_tables:
 
 fail_dirs:
     for (int64_t p = 0; p < part_count; p++)
-        ray_sys_free(part_dirs[p]);
-    ray_sys_free(part_dirs);
+        free(part_dirs[p]);
+    free(part_dirs);
 
     return ray_error("io", NULL);
 }

@@ -109,6 +109,7 @@ int ray_sym_segs(int64_t sym_id, const int64_t** out_segs);
  * appending entries mid-sequence.  Callers MUST follow a batch of these
  * with ray_sym_rebuild_segments to populate the dotted cache. */
 int64_t ray_sym_intern_no_split(const char* str, size_t len);
+int64_t ray_sym_intern_no_split_unlocked(const char* str, size_t len);
 
 /* Walk the intern table and cache segment sym_ids for any dotted name
  * that hasn't been cached yet.  Idempotent — safe to call multiple times.
@@ -116,6 +117,15 @@ int64_t ray_sym_intern_no_split(const char* str, size_t len);
  * RAY_ERR_OOM on the first allocation/sub-intern failure so persistence
  * paths can abort instead of leaving dotted names silently un-cached. */
 ray_err_t ray_sym_rebuild_segments(void);
+
+/* Number of symbols loaded from or saved to the current on-disk dictionary.
+ * Runtime-only interned symbols may exist above this prefix. */
+uint32_t ray_sym_persisted_count(void);
+
+/* Save the same on-disk symbol format as ray_sym_save, but skip durability
+ * syncs.  Intended for generated bulk-import caches where throughput matters
+ * more than crash recovery of a half-written target. */
+ray_err_t ray_sym_save_bulk(const char* path);
 
 /* Upper bound on the arena bytes that sym_str_arena consumes for a name
  * of the given length.  Used by the three-phase atomic intern to pre-

@@ -87,10 +87,6 @@ void ray_vm_advise_seq(void* ptr, size_t size) {
     if (ptr) madvise(ptr, size, MADV_SEQUENTIAL);
 }
 
-void ray_vm_advise_willneed(void* ptr, size_t size) {
-    if (ptr) madvise(ptr, size, MADV_WILLNEED);
-}
-
 void ray_vm_release(void* ptr, size_t size) {
     if (!ptr) return;
 #if defined(RAY_OS_MACOS)
@@ -423,7 +419,6 @@ void ray_vm_unmap_file(void* ptr, size_t size) {
 
 /* madvise hints are advisory and have no analog on WASM — no-ops. */
 void ray_vm_advise_seq(void* ptr, size_t size)      { (void)ptr; (void)size; }
-void ray_vm_advise_willneed(void* ptr, size_t size) { (void)ptr; (void)size; }
 void ray_vm_release(void* ptr, size_t size)         { (void)ptr; (void)size; }
 
 void* ray_vm_alloc_aligned(size_t size, size_t alignment) {

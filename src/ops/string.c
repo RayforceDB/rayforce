@@ -33,7 +33,7 @@
 
 /* Parallelism crossover thresholds.  Below these row counts the
  * pool dispatch + per-task setup cost outweighs the parallel speedup.
- * Determined empirically against ClickBench-shaped workloads.  STR
+ * Determined empirically against wide analytical workloads.  STR
  * scans set their threshold higher because the pattern is matched
  * per row (no dict-shared prefix); SYM is per-dict-entry so the work
  * scales with cardinality, not row count, and parallelises well at
@@ -333,6 +333,14 @@ static void str_like_par_fn(void* vctx, uint32_t worker_id,
     }
 }
 
+static int64_t parted_row_count(ray_t* input) {
+    ray_t** segs = (ray_t**)ray_data(input);
+    int64_t total = 0;
+    for (int64_t s = 0; s < input->len; s++)
+        if (segs[s]) total += segs[s]->len;
+    return total;
+}
+
 static void like_resolve_fn(void* ctx, uint32_t worker_id,
                             int64_t start, int64_t end) {
     (void)worker_id;
@@ -350,8 +358,180 @@ static void like_resolve_fn(void* ctx, uint32_t worker_id,
     }
 }
 
+static void exec_like_parted_str(ray_t* input, uint8_t* dst,
+                                 const ray_glob_compiled_t* pc,
+                                 bool use_simple,
+                                 const char* pat_str, size_t pat_len) {
+    ray_t** segs = (ray_t**)ray_data(input);
+    ray_pool_t* pool = ray_pool_get();
+    int64_t out_off = 0;
+
+    for (int64_t s = 0; s < input->len; s++) {
+        ray_t* seg = segs[s];
+        if (!seg) continue;
+        int64_t seg_len = seg->len;
+        const ray_str_t* elems;
+        const char* pool_data;
+        str_resolve(seg, &elems, &pool_data);
+
+        str_like_par_ctx_t lctx = {
+            .elems      = elems,
+            .pool_data  = pool_data,
+            .dst        = dst + out_off,
+            .pc         = pc,
+            .use_simple = use_simple,
+            .pat_str    = pat_str,
+            .pat_len    = pat_len,
+        };
+        if (pool && seg_len >= LIKE_PAR_MIN_ROWS_STR &&
+            ray_pool_total_workers(pool) >= 2) {
+            ray_pool_dispatch(pool, str_like_par_fn, &lctx, seg_len);
+        } else {
+            str_like_par_fn(&lctx, 0, 0, seg_len);
+        }
+        out_off += seg_len;
+    }
+}
+
+static void exec_like_parted_sym(ray_t* input, uint8_t* dst,
+                                 const ray_glob_compiled_t* pc,
+                                 bool use_simple,
+                                 const char* pat_str, size_t pat_len,
+                                 int64_t total_len) {
+    ray_t** segs = (ray_t**)ray_data(input);
+    ray_t** sym_strings = NULL;
+    uint32_t dict_n = 0;
+    ray_sym_strings_borrow(&sym_strings, &dict_n);
+    ray_t* lut_hdr = NULL;
+    ray_t* seen_hdr = NULL;
+    uint8_t* lut = NULL;
+    uint8_t* seen = NULL;
+    if (dict_n > 0) {
+        lut  = (uint8_t*)scratch_alloc (&lut_hdr,  (size_t)dict_n);
+        seen = (uint8_t*)scratch_calloc(&seen_hdr, (size_t)dict_n);
+    }
+
+    ray_pool_t* pool = ray_pool_get();
+    if (lut && seen) {
+        for (int64_t s = 0; s < input->len; s++) {
+            ray_t* seg = segs[s];
+            if (!seg) continue;
+            int64_t seg_len = seg->len;
+            like_seen_ctx_t sctx = {
+                .base       = ray_data(seg),
+                .seen       = seen,
+                .dict_n     = (uint64_t)dict_n,
+                .sym_w      = (int)(seg->attrs & RAY_SYM_W_MASK),
+                .sel_flg    = NULL,
+                .sel_offs   = NULL,
+                .sel_idx    = NULL,
+                .sel_n_segs = 0,
+                .total_rows = seg_len,
+            };
+            if (pool && seg_len >= LIKE_PAR_MIN_ROWS_SYM &&
+                ray_pool_total_workers(pool) >= 2) {
+                ray_pool_dispatch(pool, like_seen_fn, &sctx, seg_len);
+            } else {
+                like_seen_fn(&sctx, 0, 0, seg_len);
+            }
+        }
+
+        like_resolve_ctx_t rctx = {
+            .sym_strings = sym_strings, .seen = seen, .lut = lut,
+            .pc = pc, .use_simple = use_simple,
+            .pat_str = pat_str, .pat_len = pat_len,
+        };
+        if (pool && (int64_t)dict_n >= 16384) {
+            ray_pool_dispatch(pool, like_resolve_fn, &rctx, (int64_t)dict_n);
+        } else {
+            like_resolve_fn(&rctx, 0, 0, (int64_t)dict_n);
+        }
+
+        int64_t out_off = 0;
+        for (int64_t s = 0; s < input->len; s++) {
+            ray_t* seg = segs[s];
+            if (!seg) continue;
+            int64_t seg_len = seg->len;
+            like_proj_ctx_t pctx = {
+                .base       = ray_data(seg),
+                .dst        = dst + out_off,
+                .lut        = lut,
+                .dict_n     = (uint64_t)dict_n,
+                .sym_w      = (int)(seg->attrs & RAY_SYM_W_MASK),
+                .sel_flg    = NULL,
+                .sel_offs   = NULL,
+                .sel_idx    = NULL,
+                .sel_n_segs = 0,
+            };
+            if (pool && seg_len >= LIKE_PAR_MIN_ROWS_SYM &&
+                ray_pool_total_workers(pool) >= 2) {
+                ray_pool_dispatch(pool, like_proj_fn, &pctx, seg_len);
+            } else {
+                like_proj_fn(&pctx, 0, 0, seg_len);
+            }
+            out_off += seg_len;
+        }
+        scratch_free(lut_hdr);
+        scratch_free(seen_hdr);
+        return;
+    }
+
+    if (lut_hdr) scratch_free(lut_hdr);
+    if (seen_hdr) scratch_free(seen_hdr);
+
+    int64_t out_off = 0;
+    for (int64_t s = 0; s < input->len; s++) {
+        ray_t* seg = segs[s];
+        if (!seg) continue;
+        const void* base = ray_data(seg);
+        for (int64_t i = 0; i < seg->len; i++) {
+            int64_t sym_id = ray_read_sym(base, i, seg->type, seg->attrs);
+            ray_t* str = (sym_strings && (uint64_t)sym_id < (uint64_t)dict_n)
+                       ? sym_strings[sym_id] : NULL;
+            if (!str) { dst[out_off + i] = 0; continue; }
+            const char* sp = ray_str_ptr(str);
+            size_t sl = ray_str_len(str);
+            dst[out_off + i] = (use_simple
+                                ? ray_glob_match_compiled(pc, sp, sl)
+                                : ray_glob_match(sp, sl, pat_str, pat_len))
+                               ? 1 : 0;
+        }
+        out_off += seg->len;
+    }
+    if (out_off < total_len)
+        memset(dst + out_off, 0, (size_t)(total_len - out_off));
+}
+
+static ray_t* exec_like_input(ray_graph_t* g, ray_op_t* input_op) {
+    if (!input_op || input_op->opcode != OP_SCAN)
+        return exec_node(g, input_op);
+
+    ray_op_ext_t* ext = find_ext(g, input_op->id);
+    if (!ext) return exec_node(g, input_op);
+
+    uint16_t stored_table_id = 0;
+    memcpy(&stored_table_id, ext->base.pad, sizeof(uint16_t));
+    ray_t* scan_tbl = NULL;
+    if (stored_table_id > 0 && g->tables && (stored_table_id - 1) < g->n_tables)
+        scan_tbl = g->tables[stored_table_id - 1];
+    else
+        scan_tbl = g->table;
+    if (!scan_tbl) return exec_node(g, input_op);
+
+    ray_t* col = ray_table_get_col(scan_tbl, ext->sym);
+    if (!col) return exec_node(g, input_op);
+    if (RAY_IS_PARTED(col->type)) {
+        int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
+        if (base == RAY_STR || RAY_IS_SYM(base)) {
+            ray_retain(col);
+            return col;
+        }
+    }
+    return exec_node(g, input_op);
+}
+
 ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
-    ray_t* input = exec_node(g, op->inputs[0]);
+    ray_t* input = exec_like_input(g, op->inputs[0]);
     ray_t* pat_v = exec_node(g, op->inputs[1]);
     if (!input || RAY_IS_ERR(input)) { if (pat_v && !RAY_IS_ERR(pat_v)) ray_release(pat_v); return input; }
     if (!pat_v || RAY_IS_ERR(pat_v)) { ray_release(input); return pat_v; }
@@ -367,7 +547,10 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
     ray_glob_compiled_t pc = ray_glob_compile(pat_str, pat_len);
     bool use_simple = pc.shape != RAY_GLOB_SHAPE_NONE;
 
-    int64_t len = input->len;
+    int8_t in_type = input->type;
+    bool in_parted = RAY_IS_PARTED(in_type);
+    int8_t base_type = in_parted ? (int8_t)RAY_PARTED_BASETYPE(in_type) : in_type;
+    int64_t len = in_parted ? parted_row_count(input) : input->len;
     ray_t* result = ray_vec_new(RAY_BOOL, len);
     if (!result || RAY_IS_ERR(result)) {
         ray_release(input); ray_release(pat_v);
@@ -376,11 +559,14 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
     result->len = len;
     uint8_t* dst = (uint8_t*)ray_data(result);
 
-    int8_t in_type = input->type;
-    if (in_type == RAY_STR) {
-        /* Parallel substring/glob match over RAY_STR.  Q22/Q23 ClickBench
-         * are 5 M URL/Title columns × ~80 chars/row = ~400 MB scan,
-         * memory-bandwidth bound; the worker pool gives a 5-10× speedup
+    if (in_parted && base_type == RAY_STR) {
+        exec_like_parted_str(input, dst, &pc, use_simple, pat_str, pat_len);
+    } else if (in_parted && RAY_IS_SYM(base_type)) {
+        exec_like_parted_sym(input, dst, &pc, use_simple, pat_str, pat_len, len);
+    } else if (in_type == RAY_STR) {
+        /* Parallel substring/glob match over RAY_STR.  Wide text scans
+         * over URL/title-like columns are memory-bandwidth bound; the
+         * worker pool gives a 5-10× speedup
          * since glob_match is independent per row. */
         const ray_str_t* elems; const char* pool_data;
         str_resolve(input, &elems, &pool_data);
@@ -434,7 +620,7 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
 
             ray_pool_t* pool = ray_pool_get();
             /* Phase 1: mark used sym_ids.  Parallelised because for
-             * high-cardinality columns (URL on ClickBench) the seen-
+             * high-cardinality text columns the seen-
              * mark scan was a 5 ms-class serial pass.  Multiple workers
              * may write 1 to the same byte concurrently — the value is
              * idempotent so the race is benign. */

@@ -280,9 +280,8 @@ static test_result_t test_csv_null_sym(void) {
     /* CSV format conflates "empty field" and "missing field" — both
      * appear as a zero-length cell.  The Rayforce loader interns empty
      * SYM cells as the empty SYM (not the null sentinel) so SQL-style
-     * `(!= col "")` filters work the way users expect.  See R6 in
-     * ClickBench/rayforce/REMAINING_FIXES.md.  RAY_STR columns and
-     * non-string types preserve the null distinction. */
+     * `(!= col "")` filters work the way users expect.  RAY_STR columns
+     * and non-string types preserve the null distinction. */
     ray_heap_init();
     (void)ray_sym_init();
 
@@ -1296,6 +1295,30 @@ static test_result_t test_csv_explicit_u8_schema_serial(void) {
     PASS();
 }
 
+static test_result_t test_csv_infer_high_cardinality_str(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    FILE* f = fopen(TMP_CSV, "w");
+    fprintf(f, "payload\n");
+    for (int i = 0; i < 100; i++)
+        fprintf(f, "unique_payload_%03d\n", i);
+    fclose(f);
+
+    ray_t* loaded = ray_read_csv(TMP_CSV);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_NOT_NULL(col);
+    TEST_ASSERT_EQ_I(col->type, RAY_STR);
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 100);
+
+    ray_release(loaded);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t csv_entries[] = {
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },
@@ -1332,6 +1355,7 @@ const test_entry_t csv_entries[] = {
     { "csv/header_needs_quoting", test_csv_header_needs_quoting, NULL, NULL },
     { "csv/parallel_parse", test_csv_parallel_parse, NULL, NULL },
     { "csv/sym_narrowing", test_csv_sym_narrowing, NULL, NULL },
+    { "csv/infer_high_cardinality_str", test_csv_infer_high_cardinality_str, NULL, NULL },
     /* Narrow-int explicit schema (regression for missing parse_types map
      * entries that routed U8/I16/I32 to STR and corrupted the heap). */
     { "csv/explicit_u8_schema",  test_csv_explicit_u8_schema,             NULL, NULL },

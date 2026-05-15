@@ -54,6 +54,25 @@
 #define RAY_EVAL_MAX_DEPTH 512
 _Thread_local static int eval_depth = 0;
 
+typedef struct {
+    const ray_t* vec;
+    const void* data;
+    int64_t len;
+    int8_t type;
+    uint8_t attrs;
+    int is_f64;
+    int64_t sum_i;
+    double sum_f;
+} affine_sum_cache_entry_t;
+
+#define AFFINE_SUM_CACHE_N 16
+static _Thread_local affine_sum_cache_entry_t affine_sum_cache[AFFINE_SUM_CACHE_N];
+static _Thread_local uint8_t affine_sum_cache_n = 0;
+
+static void affine_sum_cache_clear(void) {
+    affine_sum_cache_n = 0;
+}
+
 /* Thread-local nfo for eval context — tracks source locations during evaluation */
 static _Thread_local ray_t* g_eval_nfo = NULL;
 
@@ -109,6 +128,128 @@ static ray_t* materialize_owned_args(ray_t** args, int64_t n) {
         }
     }
     return NULL;
+}
+
+static int64_t numeric_atom_i64(ray_t* x) {
+    switch (x->type) {
+    case -RAY_I64:
+    case -RAY_TIMESTAMP:
+    case -RAY_SYM:
+        return x->i64;
+    case -RAY_I32:
+    case -RAY_DATE:
+    case -RAY_TIME:
+        return x->i32;
+    case -RAY_I16:
+        return x->i16;
+    case -RAY_U8:
+    case -RAY_BOOL:
+        return x->u8;
+    default:
+        return (int64_t)as_f64(x);
+    }
+}
+
+static ray_t* materialize_owned_value(ray_t* x) {
+    if (x && ray_is_lazy(x))
+        x = ray_lazy_materialize(x);
+    return x;
+}
+
+static int affine_sum_cache_lookup(ray_t* vec, affine_sum_cache_entry_t* out) {
+    const void* data = ray_data(vec);
+    for (uint8_t i = 0; i < affine_sum_cache_n; i++) {
+        affine_sum_cache_entry_t* e = &affine_sum_cache[i];
+        if (e->vec == vec && e->data == data && e->len == vec->len &&
+            e->type == vec->type && e->attrs == vec->attrs) {
+            *out = *e;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void affine_sum_cache_store(ray_t* vec, const affine_sum_cache_entry_t* in) {
+    if (affine_sum_cache_n >= AFFINE_SUM_CACHE_N) return;
+    affine_sum_cache[affine_sum_cache_n++] = *in;
+}
+
+static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
+    *handled = 0;
+    if (!expr || expr->type != RAY_LIST || ray_len(expr) != 3)
+        return NULL;
+    ray_t** e = (ray_t**)ray_data(expr);
+    if (!e[0] || e[0]->type != -RAY_SYM)
+        return NULL;
+    ray_t* name = ray_sym_str(e[0]->i64);
+    if (!name || ray_str_len(name) != 1 || ray_str_ptr(name)[0] != '+')
+        return NULL;
+
+    ray_t* vec_expr = NULL;
+    ray_t* c_expr = NULL;
+    if (ray_is_atom(e[1]) && is_numeric(e[1])) {
+        c_expr = e[1];
+        vec_expr = e[2];
+    } else if (ray_is_atom(e[2]) && is_numeric(e[2])) {
+        vec_expr = e[1];
+        c_expr = e[2];
+    } else {
+        return NULL;
+    }
+
+    ray_t* vec = ray_eval(vec_expr);
+    if (!vec || RAY_IS_ERR(vec))
+        return vec ? vec : ray_error("type", NULL);
+    vec = materialize_owned_value(vec);
+    if (!vec || RAY_IS_ERR(vec))
+        return vec ? vec : ray_error("type", NULL);
+    if (!ray_is_vec(vec)) {
+        ray_release(vec);
+        *handled = 0;
+        return NULL;
+    }
+    if (vec->attrs & RAY_ATTR_HAS_NULLS) {
+        ray_release(vec);
+        *handled = 0;
+        return NULL;
+    }
+
+    *handled = 1;
+    affine_sum_cache_entry_t ce;
+    if (!affine_sum_cache_lookup(vec, &ce)) {
+        ray_t* sum = ray_sum_fn(vec);
+        if (!sum || RAY_IS_ERR(sum)) {
+            ray_release(vec);
+            return sum ? sum : ray_error("type", NULL);
+        }
+        sum = materialize_owned_value(sum);
+        if (!sum || RAY_IS_ERR(sum)) {
+            ray_release(vec);
+            return sum ? sum : ray_error("type", NULL);
+        }
+
+        memset(&ce, 0, sizeof(ce));
+        ce.vec = vec;
+        ce.data = ray_data(vec);
+        ce.len = vec->len;
+        ce.type = vec->type;
+        ce.attrs = vec->attrs;
+        ce.is_f64 = (sum->type == -RAY_F64);
+        if (ce.is_f64) ce.sum_f = as_f64(sum);
+        else           ce.sum_i = numeric_atom_i64(sum);
+        ray_release(sum);
+        affine_sum_cache_store(vec, &ce);
+    }
+
+    int64_t n = vec->len;
+    ray_release(vec);
+    if (ce.is_f64 || c_expr->type == -RAY_F64) {
+        double base = ce.is_f64 ? ce.sum_f : (double)ce.sum_i;
+        double out = base + as_f64(c_expr) * (double)n;
+        return make_f64(out);
+    }
+    int64_t out = ce.sum_i + numeric_atom_i64(c_expr) * n;
+    return make_i64(out);
 }
 
 /* ══════════════════════════════════════════
@@ -240,7 +381,59 @@ static ray_t* zero_atom_for_elem_type(ray_t* coll) {
 /* Map a binary function element-wise over collections.
  * Both args can be collections (zip-map) or one scalar (broadcast).
  * Produces typed vectors when output is numeric/bool, boxed lists otherwise. */
+static ray_t* atomic_map_binary_parted(ray_binary_fn fn, uint16_t dag_opcode,
+                                       ray_t* left, ray_t* right) {
+    int left_parted = left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type);
+    int right_parted = right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type);
+    int64_t nseg = left_parted ? left->len : right->len;
+    if (left_parted && right_parted && right->len < nseg) nseg = right->len;
+
+    ray_t* out = ray_alloc((size_t)nseg * sizeof(ray_t*));
+    if (!out) return ray_error("oom", NULL);
+    out->type = RAY_LIST;
+    out->len = 0;
+    out->attrs = 0;
+    memset(out->nullmap, 0, sizeof(out->nullmap));
+    ray_t** dst = (ray_t**)ray_data(out);
+    ray_t** lsegs = left_parted ? (ray_t**)ray_data(left) : NULL;
+    ray_t** rsegs = right_parted ? (ray_t**)ray_data(right) : NULL;
+    int8_t out_base = 0;
+
+    for (int64_t s = 0; s < nseg; s++) {
+        ray_t* l = left_parted ? lsegs[s] : left;
+        ray_t* r = right_parted ? rsegs[s] : right;
+        if (!l || !r) {
+            ray_release(out);
+            return ray_error("type", NULL);
+        }
+        ray_t* seg = atomic_map_binary_op(fn, dag_opcode, l, r);
+        if (!seg || RAY_IS_ERR(seg)) {
+            ray_release(out);
+            return seg ? seg : ray_error("domain", NULL);
+        }
+        if (!ray_is_vec(seg)) {
+            ray_release(seg);
+            ray_release(out);
+            return ray_error("type", NULL);
+        }
+        if (s == 0) out_base = seg->type;
+        if (seg->type != out_base) {
+            ray_release(seg);
+            ray_release(out);
+            return ray_error("type", NULL);
+        }
+        dst[s] = seg;
+        out->len = s + 1;
+    }
+    out->type = RAY_PARTED_BASE + out_base;
+    return out;
+}
+
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
+    if ((left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type)) ||
+        (right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type)))
+        return atomic_map_binary_parted(fn, dag_opcode, left, right);
+
     int left_coll = is_collection(left);
     int right_coll = is_collection(right);
 
@@ -618,8 +811,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                     for (int64_t i = 0; i < n; i++) obuf[i] = fill;
                 } else if (!atom_null && !vec_has_nulls) {
                     /* Hot path: tight per-width loop, no per-element
-                     * null checks.  This is what ClickBench Q22..Q38
-                     * with R6-cleaned columns actually hit. */
+                     * null checks. */
                     uint8_t w = (uint8_t)(va & RAY_SYM_W_MASK);
                     if (w == RAY_SYM_W8) {
                         const uint8_t* d = (const uint8_t*)src;
@@ -959,6 +1151,15 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
                 if (ray_vec_is_null(vec, idx[i]))
                     ray_vec_set_null(result, i, true);
         }
+        const ray_t* dict_owner = (vec->attrs & RAY_ATTR_SLICE) ? vec->slice_parent : vec;
+        if (dict_owner &&
+            !(dict_owner->attrs & RAY_ATTR_SLICE) &&
+            (!(dict_owner->attrs & RAY_ATTR_HAS_NULLS) ||
+             (dict_owner->attrs & RAY_ATTR_NULLMAP_EXT)) &&
+            dict_owner->sym_dict) {
+            ray_retain(dict_owner->sym_dict);
+            result->sym_dict = dict_owner->sym_dict;
+        }
         return result;
     }
 
@@ -1294,7 +1495,9 @@ ray_t* ray_do_fn(ray_t** args, int64_t n) {
     if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
     ray_t* result = NULL;
     for (int64_t i = 0; i < n; i++) {
-        if (result) ray_release(result);
+        if (result) {
+            ray_release(result);
+        }
         result = ray_eval(args[i]);
         if (RAY_IS_ERR(result)) {
             ray_env_pop_scope();
@@ -2376,8 +2579,10 @@ static void ray_register_builtins(void) {
     register_vary("format",     RAY_FN_NONE, ray_format_fn);
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
-    register_vary(".csv.read",  RAY_FN_RESTRICTED, ray_read_csv_fn);
-    register_vary(".csv.write", RAY_FN_RESTRICTED, ray_write_csv_fn);
+    register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
+    register_vary(".csv.splayed",      RAY_FN_RESTRICTED, ray_read_csv_splayed_fn);
+    register_vary(".csv.parted",       RAY_FN_RESTRICTED, ray_read_csv_parted_fn);
+    register_vary(".csv.write",        RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_binary("as",       RAY_FN_NONE, ray_cast_fn);
     register_unary("type",      RAY_FN_NONE, ray_type_fn);
     register_unary("read",      RAY_FN_RESTRICTED, ray_read_file_fn);
@@ -2623,6 +2828,7 @@ static void ray_register_builtins(void) {
     register_vary (".graph.shortest-path", RAY_FN_NONE, ray_graph_shortest_path_fn);
     register_vary (".graph.expand",        RAY_FN_NONE, ray_graph_expand_fn);
     register_vary (".graph.var-expand",    RAY_FN_NONE, ray_graph_var_expand_fn);
+    register_unary("strlen",               RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_strlen_fn);
 }
 
 /* ══════════════════════════════════════════
@@ -2650,6 +2856,9 @@ void ray_lang_destroy(void) {
 
 ray_t* ray_eval(ray_t* obj) {
     if (!obj || RAY_IS_ERR(obj)) return obj;
+
+    if (eval_depth == 0)
+        affine_sum_cache_clear();
 
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */
     if (g_eval_interrupted) return ray_error("limit", "interrupted");
@@ -2721,6 +2930,24 @@ ray_t* ray_eval(ray_t* obj) {
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
             ray_unary_fn fn = (ray_unary_fn)(uintptr_t)head->i64;
             uint8_t fn_attrs = head->attrs;
+            if (fn == (ray_unary_fn)ray_sum_fn) {
+                int handled = 0;
+                ray_t* fast = try_sum_affine_expr(elems[1], &handled);
+                if (handled) {
+                    ray_release(head);
+                    ret = fast ? fast : ray_error("type", NULL);
+                    goto out;
+                }
+            }
+            if (fn == (ray_unary_fn)ray_count_fn) {
+                int handled = 0;
+                ray_t* fast = ray_try_count_select_expr(elems[1], &handled);
+                if (handled) {
+                    ray_release(head);
+                    ret = fast ? fast : ray_error("type", NULL);
+                    goto out;
+                }
+            }
             ray_t* arg = ray_eval(elems[1]);
             ray_release(head);
             if (arg && RAY_IS_ERR(arg)) { ret = arg; goto out; }

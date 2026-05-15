@@ -139,7 +139,6 @@ void  ray_vm_free(void* ptr, size_t size);
 void* ray_vm_map_file(const char* path, size_t* out_size);
 void  ray_vm_unmap_file(void* ptr, size_t size);
 void  ray_vm_advise_seq(void* ptr, size_t size);
-void  ray_vm_advise_willneed(void* ptr, size_t size);
 void  ray_vm_release(void* ptr, size_t size);
 void* ray_vm_alloc_aligned(size_t size, size_t alignment);
 

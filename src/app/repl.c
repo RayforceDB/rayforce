@@ -754,6 +754,7 @@ static void eval_and_print(ray_term_t* term, const char* input,
     }
 
     if (profiling) profile_print(use_color);
+    ray_heap_gc();
 }
 
 /* `type_label` and `cmd_match` were inlined into the previous bespoke
@@ -1263,5 +1264,6 @@ int ray_repl_run_file(const char* path) {
 
     /* profile tree goes to stdout via profile_print; honour stdout's tty. */
     if (profiling) profile_print(color_out);
+    ray_heap_gc();
     return rc;
 }

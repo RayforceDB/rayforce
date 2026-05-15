@@ -27,6 +27,14 @@
 (count (select {s: (sum size) from: trades by: sym})) -- 3
 (sum (at (select {s: (sum size) from: trades by: sym}) 's)) -- 1240
 (sum (at (select {s: (sum size) from: trades by: sym where: (== sym 'AAPL)}) 's)) -- 460
+(set grp-key-proj (select {sym: sym s: (sum size) c: (count sym) u: (count (distinct price)) from: trades by: sym desc: c}))
+(count (key grp-key-proj)) -- 4
+(type (at grp-key-proj 'sym)) -- 'SYM
+(count (select {sym: sym c: (count sym) from: trades by: sym desc: c take: 2})) -- 2
+(first (at (select {sym: sym c: (count sym) from: trades by: sym desc: c take: 2}) 'c)) -- 4
+(sum (at (select {sym: sym c: (count sym) from: trades by: sym desc: c take: 2}) 'c)) -- 7
+(count (select {sym: sym c: (count sym) from: trades where: (> size 50) by: sym desc: c take: 2})) -- 2
+(sum (at (select {sym: sym c: (count sym) from: trades where: (> size 50) by: sym desc: c take: 2}) 'c)) -- 7
 
 ;; ── scalar aggregation (no `by:`) must honour `where:` — the lazy WHERE
 ;; rowsel is consumed by exec_reduction over the column vector.  Two-step
@@ -121,6 +129,12 @@
 (count (select {s: (sum qty) from: trades-mk by: [sector side]})) -- 6
 (sum (at (select {s: (sum qty) from: trades-mk by: [sector side]}) 's)) -- 1165
 (sum (at (select {s: (sum qty) from: trades-mk by: [sector side] where: (and (== sector 'Tech) (== side 'Buy))}) 's)) -- 515
+(count (select {c: (count qty) from: trades-mk by: [sector side] take: 3})) -- 3
+
+;; ── grouped string length aggregation streams from the source column
+(set page-lens (table [bucket url] (list [1 1 2 2] (list "aa" "bbbb" "ccc" ""))))
+(first (at (select {l: (avg (strlen url)) from: page-lens by: bucket where: (== bucket 1)} ) 'l)) -- 3.0
+(first (at (select {l: (sum (strlen url)) from: page-lens by: bucket where: (== bucket 2)} ) 'l)) -- 3
 
 ;; ── three-key
 (count (select {s: (sum qty) from: trades-mk by: [sym sector side]})) -- 12
@@ -129,6 +143,13 @@
 ;; ── int key (non-symbol grouping)
 (count (select {s: (sum price) from: trades-mk by: qty})) -- 11
 (sum (at (select {s: (sum price) from: trades-mk by: qty}) 's)) -- 15346.5
+
+;; ── dependent integer keys are equivalent to grouping by the base key
+(set dep-keys (table [id] (list [1 1 2 3 3])))
+(count (select {c: (count id) from: dep-keys by: {id: id m1: (- id 1) p2: (+ id 2)}})) -- 3
+(sum (at (select {c: (count id) from: dep-keys by: {id: id m1: (- id 1) p2: (+ id 2)}}) 'c)) -- 5
+(sum (at (select {c: (count id) from: dep-keys by: {id: id m1: (- id 1) p2: (+ id 2)}}) 'm1)) -- 3
+(sum (at (select {c: (count id) from: dep-keys by: {id: id m1: (- id 1) p2: (+ id 2)}}) 'p2)) -- 12
 
 ;; ── filter-then-group preserves filtered totals
 (count (select {s: (sum qty) from: trades-mk by: sym where: (== side 'Buy)})) -- 6

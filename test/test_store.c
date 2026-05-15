@@ -369,8 +369,10 @@ static test_result_t test_splay_str_column_roundtrip(void) {
     TEST_ASSERT_NOT_NULL(loaded_ids);
     TEST_ASSERT_NOT_NULL(loaded_names);
     TEST_ASSERT_EQ_U(loaded_ids->mmod, 1);
-    TEST_ASSERT_EQ_U(loaded_names->mmod, 0);
+    TEST_ASSERT_EQ_U(loaded_names->mmod, 1);
     TEST_ASSERT_EQ_I(loaded_names->type, RAY_STR);
+    TEST_ASSERT_NOT_NULL(loaded_names->str_pool);
+    TEST_ASSERT_EQ_U(loaded_names->str_pool->mmod, 2);
     TEST_ASSERT_TRUE(loaded_names->attrs & RAY_ATTR_HAS_NULLS);
     TEST_ASSERT_TRUE(ray_vec_is_null(loaded_names, 2));
 
@@ -392,12 +394,9 @@ static test_result_t test_splay_str_column_roundtrip(void) {
 }
 
 /* ---- test_splay_short_strv_roundtrip ----------------------------------
- * Regression: 0-row STRV columns serialize to 14 bytes and 1-row STRV
- * columns with content < 10 bytes serialize under 32 bytes total.  The
- * splay reader uses ray_col_mmap which falls through col_validate_mapped;
- * before the magic-aware fix, mapped_size < 32 returned "corrupt" and
- * the splay loader's "nyi" fallback to ray_col_load never fired,
- * making short STRV tables unreadable via ray_read_splayed.
+ * Regression: short string columns must remain readable through
+ * ray_read_splayed.  Older files used STRV and could be smaller than the
+ * raw header; newer files use the raw RAY_STR layout and mmap directly.
  * ---------------------------------------------------------------------- */
 
 static test_result_t test_splay_short_strv_roundtrip(void) {

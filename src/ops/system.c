@@ -112,7 +112,7 @@ ray_t* ray_get_splayed_fn(ray_t** args, int64_t n) {
     else
         sym_path = splay_default_sym(dir, sym, sizeof(sym), true);
 
-    return ray_splay_load(dir, sym_path);
+    return ray_read_splayed(dir, sym_path);
 }
 
 /* (.db.parted.get "db_root" `table_name) -- load partitioned table */

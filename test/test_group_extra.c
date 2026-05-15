@@ -1040,6 +1040,223 @@ static test_result_t test_count_distinct_per_group_parallel(void) {
     PASS();
 }
 
+static test_result_t test_i16_group_top_count_emit_filter(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int16_t keys_data[] = {
+        1,1,1,1,1,
+        2,2,2,2,
+        3,3,3,
+        4,4,
+        5
+    };
+    enum { R = (int)(sizeof(keys_data) / sizeof(keys_data[0])) };
+
+    ray_t* keys_vec = ray_vec_new(RAY_I16, R);
+    TEST_ASSERT_NOT_NULL(keys_vec);
+    keys_vec->len = R;
+    memcpy(ray_data(keys_vec), keys_data, sizeof(keys_data));
+
+    int64_t key_sym = ray_sym_intern("k", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, key_sym, keys_vec);
+    ray_release(keys_vec);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_op_t* scan_key = ray_scan(g, "k");
+    uint16_t ops[] = { OP_COUNT };
+    ray_op_t* ins[] = { scan_key };
+    ray_op_t* keys[] = { scan_key };
+    ray_op_t* grp = ray_group(g, keys, 1, ops, ins, 1);
+    TEST_ASSERT_NOT_NULL(grp);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 2;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, grp);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 2);
+
+    ray_t* out_key = ray_table_get_col(res, key_sym);
+    ray_t* out_cnt = ray_table_get_col_idx(res, 1);
+    TEST_ASSERT_NOT_NULL(out_key);
+    TEST_ASSERT_NOT_NULL(out_cnt);
+
+    int got_1 = 0, got_2 = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int16_t k = ((int16_t*)ray_data(out_key))[i];
+        int64_t c = ((int64_t*)ray_data(out_cnt))[i];
+        if (k == 1 && c == 5) got_1 = 1;
+        if (k == 2 && c == 4) got_2 = 1;
+    }
+    TEST_ASSERT_TRUE(got_1 && got_2);
+
+    ray_release(res);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_sym_group_top_count_emit_filter(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t sym_a = ray_sym_intern("alpha", 5);
+    int64_t sym_b = ray_sym_intern("beta", 4);
+    int64_t sym_c = ray_sym_intern("gamma", 5);
+    int64_t sym_d = ray_sym_intern("delta", 5);
+    uint32_t keys_data[] = {
+        (uint32_t)sym_a, (uint32_t)sym_a, (uint32_t)sym_a, (uint32_t)sym_a,
+        (uint32_t)sym_b, (uint32_t)sym_b, (uint32_t)sym_b,
+        (uint32_t)sym_c, (uint32_t)sym_c,
+        (uint32_t)sym_d
+    };
+    enum { R = (int)(sizeof(keys_data) / sizeof(keys_data[0])) };
+
+    ray_t* keys_vec = ray_sym_vec_new(RAY_SYM_W32, R);
+    TEST_ASSERT_NOT_NULL(keys_vec);
+    keys_vec->len = R;
+    memcpy(ray_data(keys_vec), keys_data, sizeof(keys_data));
+
+    int64_t key_sym = ray_sym_intern("s", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, key_sym, keys_vec);
+    ray_release(keys_vec);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_op_t* scan_key = ray_scan(g, "s");
+    uint16_t ops[] = { OP_COUNT };
+    ray_op_t* ins[] = { scan_key };
+    ray_op_t* keys[] = { scan_key };
+    ray_op_t* grp = ray_group(g, keys, 1, ops, ins, 1);
+    TEST_ASSERT_NOT_NULL(grp);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 2;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, grp);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 2);
+
+    ray_t* out_key = ray_table_get_col(res, key_sym);
+    ray_t* out_cnt = ray_table_get_col_idx(res, 1);
+    TEST_ASSERT_NOT_NULL(out_key);
+    TEST_ASSERT_NOT_NULL(out_cnt);
+
+    int got_a = 0, got_b = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int64_t k = ray_read_sym(ray_data(out_key), i, out_key->type, out_key->attrs);
+        int64_t c = ((int64_t*)ray_data(out_cnt))[i];
+        if (k == sym_a && c == 4) got_a = 1;
+        if (k == sym_b && c == 3) got_b = 1;
+    }
+    TEST_ASSERT_TRUE(got_a && got_b);
+
+    ray_release(res);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+static test_result_t test_five_key_group_top_count_emit_filter(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int16_t rows[][5] = {
+        {1, 10, 20, 30, 40}, {1, 10, 20, 30, 40},
+        {1, 10, 20, 30, 40}, {1, 10, 20, 30, 40},
+        {2, 11, 21, 31, 41}, {2, 11, 21, 31, 41},
+        {2, 11, 21, 31, 41},
+        {3, 12, 22, 32, 42}, {3, 12, 22, 32, 42},
+        {4, 13, 23, 33, 43}
+    };
+    enum { R = (int)(sizeof(rows) / sizeof(rows[0])) };
+    const char* names[5] = { "k0", "k1", "k2", "k3", "k4" };
+    int64_t syms[5];
+
+    ray_t* tbl = ray_table_new(5);
+    TEST_ASSERT_NOT_NULL(tbl);
+    for (int col = 0; col < 5; col++) {
+        ray_t* vec = ray_vec_new(RAY_I16, R);
+        TEST_ASSERT_NOT_NULL(vec);
+        vec->len = R;
+        int16_t* data = (int16_t*)ray_data(vec);
+        for (int row = 0; row < R; row++)
+            data[row] = rows[row][col];
+        syms[col] = ray_sym_intern(names[col], 2);
+        tbl = ray_table_add_col(tbl, syms[col], vec);
+        ray_release(vec);
+    }
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_op_t* scans[5];
+    for (int i = 0; i < 5; i++) {
+        scans[i] = ray_scan(g, names[i]);
+        TEST_ASSERT_NOT_NULL(scans[i]);
+    }
+    uint16_t ops[] = { OP_COUNT };
+    ray_op_t* ins[] = { scans[0] };
+    ray_op_t* grp = ray_group(g, scans, 5, ops, ins, 1);
+    TEST_ASSERT_NOT_NULL(grp);
+
+    ray_group_emit_filter_t prev = ray_group_emit_filter_get();
+    ray_group_emit_filter_t filter = {0};
+    filter.enabled = 1;
+    filter.agg_index = 0;
+    filter.top_count_take = 2;
+    ray_group_emit_filter_set(filter);
+    ray_t* res = ray_execute(g, grp);
+    ray_group_emit_filter_set(prev);
+
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 2);
+
+    ray_t* out_k0 = ray_table_get_col(res, syms[0]);
+    ray_t* out_k1 = ray_table_get_col(res, syms[1]);
+    ray_t* out_k4 = ray_table_get_col(res, syms[4]);
+    ray_t* out_cnt = ray_table_get_col_idx(res, 5);
+    TEST_ASSERT_NOT_NULL(out_k0);
+    TEST_ASSERT_NOT_NULL(out_k1);
+    TEST_ASSERT_NOT_NULL(out_k4);
+    TEST_ASSERT_NOT_NULL(out_cnt);
+
+    int got_1 = 0, got_2 = 0;
+    for (int64_t i = 0; i < ray_table_nrows(res); i++) {
+        int16_t k0 = ((int16_t*)ray_data(out_k0))[i];
+        int16_t k1 = ((int16_t*)ray_data(out_k1))[i];
+        int16_t k4 = ((int16_t*)ray_data(out_k4))[i];
+        int64_t c = ((int64_t*)ray_data(out_cnt))[i];
+        if (k0 == 1 && k1 == 10 && k4 == 40 && c == 4) got_1 = 1;
+        if (k0 == 2 && k1 == 11 && k4 == 41 && c == 3) got_2 = 1;
+    }
+    TEST_ASSERT_TRUE(got_1 && got_2);
+
+    ray_release(res);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 /* --------------------------------------------------------------------------
  * Test registry
  * -------------------------------------------------------------------------- */
@@ -1059,5 +1276,8 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/reduction_var_i64_parallel",    test_reduction_var_i64_parallel,    NULL, NULL },
     { "group_extra/count_distinct_parallel_types", test_count_distinct_parallel_types, NULL, NULL },
     { "group_extra/count_distinct_per_group_parallel", test_count_distinct_per_group_parallel, NULL, NULL },
+    { "group_extra/i16_group_top_count_emit_filter", test_i16_group_top_count_emit_filter, NULL, NULL },
+    { "group_extra/sym_group_top_count_emit_filter", test_sym_group_top_count_emit_filter, NULL, NULL },
+    { "group_extra/five_key_group_top_count_emit_filter", test_five_key_group_top_count_emit_filter, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

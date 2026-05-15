@@ -19,6 +19,45 @@
 
 (.sys.exec "rm -f rf_test_syms.csv") -- 0
 
+;; Explicit names + types loads a no-header CSV and binds user names.
+(.sys.exec "rm -f rf_test_named_no_header.csv") -- 0
+(.sys.exec "printf '1,alice\\n2,bob\\n' > rf_test_named_no_header.csv") -- 0
+(set _named (.csv.read [id name] [I64 STR] "rf_test_named_no_header.csv"))
+(count _named) -- 2
+(sum (at _named 'id)) -- 3
+(first (at _named 'name)) -- "alice"
+(.sys.exec "rm -f rf_test_named_no_header.csv") -- 0
+
+;; CSV storage helpers keep parsing in .csv but return disk-backed tables.
+(.sys.exec "rm -rf rf_test_csv_splayed rf_test_csv_parted rf_test_csv_store.csv") -- 0
+(.sys.exec "printf 'id,val\\n1,10\\n2,20\\n' > rf_test_csv_store.csv") -- 0
+(set _csv_sp (.csv.splayed "rf_test_csv_store.csv" "rf_test_csv_splayed/"))
+(count _csv_sp) -- 2
+(sum (at _csv_sp 'id)) -- 3
+(count (.db.splayed.get "rf_test_csv_splayed/")) -- 2
+(set _csv_pt (.csv.parted "rf_test_csv_store.csv" "rf_test_csv_parted/" 'hits))
+(count _csv_pt) -- 2
+(sum (at _csv_pt 'id)) -- 3
+(sum (+ (at _csv_pt 'id) 1)) -- 5
+(.sys.exec "rm -rf rf_test_csv_splayed rf_test_csv_parted rf_test_csv_store.csv") -- 0
+
+;; The stored variants support the explicit names + types no-header form too.
+(.sys.exec "rm -rf rf_test_csv_parted2 rf_test_csv_no_header.csv") -- 0
+(.sys.exec "printf '1,10\\n2,20\\n' > rf_test_csv_no_header.csv") -- 0
+(set _csv_pn (.csv.parted [id val] [I64 I64] "rf_test_csv_no_header.csv" "rf_test_csv_parted2/" 't))
+(count _csv_pn) -- 2
+(sum (at _csv_pn 'val)) -- 30
+(.sys.exec "rm -rf rf_test_csv_parted2 rf_test_csv_no_header.csv") -- 0
+
+;; .csv.parted accepts an optional rows-per-part argument before root/table.
+(.sys.exec "rm -rf rf_test_csv_parted_rows rf_test_csv_rows.csv") -- 0
+(.sys.exec "printf '1,10\\n2,20\\n3,30\\n' > rf_test_csv_rows.csv") -- 0
+(set _csv_pr (.csv.parted [id val] [I64 I64] "rf_test_csv_rows.csv" 1 "rf_test_csv_parted_rows/" 't))
+(count _csv_pr) -- 3
+(count (.db.parted.get "rf_test_csv_parted_rows/" 't)) -- 3
+(.sys.exec "test $(find rf_test_csv_parted_rows -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 3") -- 0
+(.sys.exec "rm -rf rf_test_csv_parted_rows rf_test_csv_rows.csv") -- 0
+
 ;; ── R6 regression: empty TSV/CSV fields → empty SYM (not null sentinel) ──
 ;; CSV format conflates "missing" and "empty"; the loader treats empty
 ;; SYM cells as the interned empty string so SQL-style `(!= col "")`

@@ -22,11 +22,14 @@
  */
 
 #include "lang/internal.h"
+#include "ops/ops.h"
 
 /* Arithmetic builtins (atom-only).
  * Vector dispatch goes through the DAG executor. */
 
 ray_t* ray_add_fn(ray_t* a, ray_t* b) {
+    if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
+        return atomic_map_binary_op(ray_add_fn, OP_ADD, a, b);
     /* Vector fast path — only when at least one operand is a typed vector */
 
     /* Temporal + integer arithmetic (only int types, not float) */
@@ -91,6 +94,8 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
+    if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
+        return atomic_map_binary_op(ray_sub_fn, OP_SUB, a, b);
 
     /* Temporal - int null propagation (both operands) */
     if (is_temporal(a) && is_numeric(b)) {
@@ -161,6 +166,8 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_mul_fn(ray_t* a, ray_t* b) {
+    if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
+        return atomic_map_binary_op(ray_mul_fn, OP_MUL, a, b);
 
     /* int * TIME → TIME, TIME * int → TIME */
     if (is_numeric(a) && b->type == -RAY_TIME) {
@@ -186,6 +193,8 @@ ray_t* ray_mul_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_div_fn(ray_t* a, ray_t* b) {
+    if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
+        return atomic_map_binary_op(ray_div_fn, OP_DIV, a, b);
     if (!is_numeric(a) || !is_numeric(b))
         return ray_error("type", "cannot divide %s by %s",
                          ray_type_name(a->type), ray_type_name(b->type));
@@ -213,6 +222,8 @@ ray_t* ray_idiv_fn(ray_t* a, ray_t* b) {
 }
 
 ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
+    if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
+        return atomic_map_binary_op(ray_mod_fn, OP_MOD, a, b);
     /* Temporal % numeric → temporal (same type as left operand) */
     if (is_temporal(a) && is_numeric(b)) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))

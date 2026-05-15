@@ -154,6 +154,22 @@ static int fp_col_supported(const ray_t* col) {
     return 1;
 }
 
+static int fp_expr_const_str(ray_t* expr) {
+    if (!expr) return 0;
+    if (expr->type == -RAY_STR && !(expr->attrs & RAY_ATTR_NAME)) return 1;
+    if (expr->type != RAY_LIST || ray_len(expr) < 2) return 0;
+    ray_t** elems = (ray_t**)ray_data(expr);
+    if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
+    ray_t* head = ray_sym_str(elems[0]->i64);
+    if (!head) return 0;
+    int is_concat = (ray_str_len(head) == 6
+                     && memcmp(ray_str_ptr(head), "concat", 6) == 0);
+    if (!is_concat) return 0;
+    for (int64_t i = 1; i < ray_len(expr); i++)
+        if (!fp_expr_const_str(elems[i])) return 0;
+    return 1;
+}
+
 /* Is `expr` a phase-3 simple comparison form (op col const)?  Validates
  * that the column exists in `tbl` and that ordering ops only target
  * non-SYM columns.  Returns the FP_* code on success, or -1 on miss. */
@@ -201,6 +217,59 @@ static int fp_check_simple_cmp(ray_t* expr, ray_t* tbl) {
     return code;
 }
 
+static int fp_check_like(ray_t* expr, ray_t* tbl) {
+    if (!expr || expr->type != RAY_LIST) return 0;
+    if (ray_len(expr) != 3) return 0;
+    ray_t** elems = (ray_t**)ray_data(expr);
+    if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
+    ray_t* op_sym = ray_sym_str(elems[0]->i64);
+    if (!op_sym || ray_str_len(op_sym) != 4
+        || memcmp(ray_str_ptr(op_sym), "like", 4) != 0)
+        return 0;
+    ray_t* lhs = elems[1];
+    if (!lhs || lhs->type != -RAY_SYM || !(lhs->attrs & RAY_ATTR_NAME))
+        return 0;
+    if (!fp_expr_const_str(elems[2])) return 0;
+    if (tbl) {
+        ray_t* col = ray_table_get_col(tbl, lhs->i64);
+        if (!col || !fp_col_supported(col)) return 0;
+        if (col->type != RAY_STR && col->type != RAY_SYM) return 0;
+    }
+    return 1;
+}
+
+static int fp_int_family(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 ||
+           t == RAY_I64 || t == RAY_DATE || t == RAY_TIME ||
+           t == RAY_TIMESTAMP;
+}
+
+static int fp_check_in(ray_t* expr, ray_t* tbl) {
+    if (!expr || expr->type != RAY_LIST) return 0;
+    if (ray_len(expr) != 3) return 0;
+    ray_t** elems = (ray_t**)ray_data(expr);
+    if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
+    ray_t* op_sym = ray_sym_str(elems[0]->i64);
+    if (!op_sym || ray_str_len(op_sym) != 2
+        || memcmp(ray_str_ptr(op_sym), "in", 2) != 0)
+        return 0;
+    ray_t* lhs = elems[1];
+    ray_t* rhs = elems[2];
+    if (!lhs || lhs->type != -RAY_SYM || !(lhs->attrs & RAY_ATTR_NAME))
+        return 0;
+    if (!rhs || !ray_is_vec(rhs) || (rhs->attrs & RAY_ATTR_NAME))
+        return 0;
+    if (ray_len(rhs) > 16) return 0;
+    if (!fp_int_family(rhs->type)) return 0;
+    if (tbl) {
+        ray_t* col = ray_table_get_col(tbl, lhs->i64);
+        if (!col || !fp_col_supported(col)) return 0;
+        if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return 0;
+        if (!fp_int_family(col->type)) return 0;
+    }
+    return 1;
+}
+
 /* Phase-3 supported shapes:
  *
  *   pred  = simple_cmp | (and simple_cmp simple_cmp …)
@@ -224,13 +293,16 @@ int ray_fused_group_supported(ray_t* expr, ray_t* tbl) {
             int64_t k = n - 1;
             if (k < 1 || k > FP_PRED_MAX_CHILDREN) return 0;
             for (int64_t i = 0; i < k; i++) {
-                if (fp_check_simple_cmp(elems[i + 1], tbl) < 0) return 0;
+                if (fp_check_simple_cmp(elems[i + 1], tbl) < 0
+                    && !fp_check_like(elems[i + 1], tbl)
+                    && !fp_check_in(elems[i + 1], tbl)) return 0;
             }
             return 1;
         }
     }
     /* Fall through: single simple cmp. */
-    return fp_check_simple_cmp(expr, tbl) >= 0 ? 1 : 0;
+    return (fp_check_simple_cmp(expr, tbl) >= 0 ||
+            fp_check_like(expr, tbl) || fp_check_in(expr, tbl)) ? 1 : 0;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -279,6 +351,86 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
         return;
     }
 
+    if (op == FP_LIKE) {
+        if (ct == RAY_SYM) {
+            uint32_t lut_n = p->like_lut_count;
+            uint8_t* lut = p->like_lut;
+            const void* base = p->col_base;
+            uint8_t esz_l = p->col_esz;
+            ray_t** sym_strings = p->like_sym_strings;
+            int use_simple = p->pat_compiled.shape != RAY_GLOB_SHAPE_NONE;
+            for (int64_t r = 0; r < n; r++) {
+                uint64_t sid = (uint64_t)read_by_esz(base, start + r, esz_l);
+                if (sid >= lut_n || !lut || !sym_strings) {
+                    bits[r] = 0;
+                    continue;
+                }
+                uint8_t state = lut[sid];
+                if (!state) {
+                    ray_t* s = sym_strings[sid];
+                    uint8_t match = 0;
+                    if (s) {
+                        const char* sp = ray_str_ptr(s);
+                        size_t sl = ray_str_len(s);
+                        match = use_simple
+                            ? (uint8_t)ray_glob_match_compiled(&p->pat_compiled, sp, sl)
+                            : (uint8_t)ray_glob_match(sp, sl, p->pat_str, p->pat_len);
+                    }
+                    state = (uint8_t)(match ? 2 : 1);
+                    lut[sid] = state;
+                }
+                bits[r] = (uint8_t)(state == 2);
+            }
+            return;
+        }
+        if (ct != RAY_STR) {
+            memset(bits, 0, (size_t)n);
+            return;
+        }
+        int use_simple = p->pat_compiled.shape != RAY_GLOB_SHAPE_NONE;
+        for (int64_t r = 0; r < n; r++) {
+            size_t sl = 0;
+            const char* sp = ray_str_vec_get(p->col_obj, start + r, &sl);
+            if (!sp) sp = "";
+            bits[r] = use_simple
+                    ? (uint8_t)ray_glob_match_compiled(&p->pat_compiled, sp, sl)
+                    : (uint8_t)ray_glob_match(sp, sl, p->pat_str, p->pat_len);
+        }
+        return;
+    }
+
+    if (op == FP_IN) {
+        if (p->n_cvals == 0) {
+            memset(bits, 0, (size_t)n);
+            return;
+        }
+#define FP_RUN_IN(T) do {                                                   \
+            const T* d = (const T*)p->col_base + start;                      \
+            for (int64_t r = 0; r < n; r++) {                                \
+                int64_t v = (int64_t)d[r];                                   \
+                uint8_t hit = 0;                                             \
+                for (uint8_t j = 0; j < p->n_cvals; j++)                     \
+                    hit |= (uint8_t)(v == p->cvals[j]);                      \
+                bits[r] = hit;                                               \
+            }                                                                \
+        } while (0)
+        if (esz == 1) {
+            FP_RUN_IN(uint8_t);
+            return;
+        }
+        if (esz == 2) {
+            FP_RUN_IN(int16_t);
+            return;
+        }
+        if (esz == 4) {
+            FP_RUN_IN(int32_t);
+            return;
+        }
+        FP_RUN_IN(int64_t);
+        return;
+#undef FP_RUN_IN
+    }
+
     if (esz == 1) {
         switch (op) {
         case FP_EQ: FP_RUN(uint8_t, ==); break;
@@ -287,6 +439,7 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
         case FP_LE: FP_RUN(uint8_t, <=); break;
         case FP_GT: FP_RUN(uint8_t, > ); break;
         case FP_GE: FP_RUN(uint8_t, >=); break;
+        case FP_LIKE: case FP_IN: memset(bits, 0, (size_t)n); break;
         }
         return;
     }
@@ -295,7 +448,8 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
             switch (op) {
             case FP_EQ: FP_RUN(uint16_t, ==); break;
             case FP_NE: FP_RUN(uint16_t, !=); break;
-            default:    memset(bits, 0, (size_t)n); break;  /* unreachable */
+            case FP_LT: case FP_LE: case FP_GT: case FP_GE:
+            case FP_LIKE: case FP_IN: memset(bits, 0, (size_t)n); break;  /* unreachable */
             }
         } else {
             switch (op) {
@@ -305,6 +459,7 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
             case FP_LE: FP_RUN(int16_t, <=); break;
             case FP_GT: FP_RUN(int16_t, > ); break;
             case FP_GE: FP_RUN(int16_t, >=); break;
+            case FP_LIKE: case FP_IN: memset(bits, 0, (size_t)n); break;
             }
         }
         return;
@@ -314,7 +469,8 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
             switch (op) {
             case FP_EQ: FP_RUN(uint32_t, ==); break;
             case FP_NE: FP_RUN(uint32_t, !=); break;
-            default:    memset(bits, 0, (size_t)n); break;  /* unreachable */
+            case FP_LT: case FP_LE: case FP_GT: case FP_GE:
+            case FP_LIKE: case FP_IN: memset(bits, 0, (size_t)n); break;  /* unreachable */
             }
         } else {
             switch (op) {
@@ -324,6 +480,7 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
             case FP_LE: FP_RUN(int32_t, <=); break;
             case FP_GT: FP_RUN(int32_t, > ); break;
             case FP_GE: FP_RUN(int32_t, >=); break;
+            case FP_LIKE: case FP_IN: memset(bits, 0, (size_t)n); break;
             }
         }
         return;
@@ -336,6 +493,7 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
     case FP_LE: FP_RUN(int64_t, <=); break;
     case FP_GT: FP_RUN(int64_t, > ); break;
     case FP_GE: FP_RUN(int64_t, >=); break;
+    case FP_LIKE: case FP_IN: memset(bits, 0, (size_t)n); break;
     }
 }
 #undef FP_RUN
@@ -375,6 +533,8 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     case OP_LE: out->op = FP_LE; break;
     case OP_GT: out->op = FP_GT; break;
     case OP_GE: out->op = FP_GE; break;
+    case OP_LIKE: out->op = FP_LIKE; break;
+    case OP_IN: out->op = FP_IN; break;
     default: return -1;
     }
 
@@ -390,6 +550,68 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     ray_t* col = ray_table_get_col(tbl, lext->sym);
     if (!col) return -1;
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return -1;
+    if (out->op == FP_IN) {
+        if (!fp_col_supported(col) || !fp_int_family(col->type)) return -1;
+        ray_t* sv = rext->literal;
+        if (!sv || !ray_is_vec(sv) || !fp_int_family(sv->type)) return -1;
+        if (ray_len(sv) > 16) return -1;
+        out->col_type  = col->type;
+        out->col_attrs = col->attrs;
+        out->col_esz   = ray_sym_elem_size(col->type, col->attrs);
+        out->col_base  = ray_data(col);
+        out->col_obj   = col;
+        out->col_len   = col->len;
+        int8_t st = sv->type;
+        int64_t nsv = ray_len(sv);
+        int64_t out_n = 0;
+        for (int64_t i = 0; i < nsv; i++) {
+            if ((sv->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(sv, i))
+                continue;
+            switch (st) {
+            case RAY_BOOL:
+            case RAY_U8:        out->cvals[out_n++] = ((uint8_t*)ray_data(sv))[i]; break;
+            case RAY_I16:       out->cvals[out_n++] = ((int16_t*)ray_data(sv))[i]; break;
+            case RAY_I32:
+            case RAY_DATE:
+            case RAY_TIME:      out->cvals[out_n++] = ((int32_t*)ray_data(sv))[i]; break;
+            case RAY_I64:
+            case RAY_TIMESTAMP: out->cvals[out_n++] = ((int64_t*)ray_data(sv))[i]; break;
+            default: return -1;
+            }
+        }
+        out->n_cvals = (uint8_t)out_n;
+        out->cval_in_dict = 1;
+        return 0;
+    }
+    if (out->op == FP_LIKE) {
+        if (col->type != RAY_STR && col->type != RAY_SYM) return -1;
+        if (!fp_col_supported(col)) return -1;
+        ray_t* cv_like = rext->literal;
+        if (!cv_like || cv_like->type != -RAY_STR) return -1;
+        out->col_type  = col->type;
+        out->col_attrs = col->attrs;
+        out->col_esz   = ray_sym_elem_size(col->type, col->attrs);
+        out->col_base  = ray_data(col);
+        out->col_obj   = col;
+        out->col_len   = col->len;
+        out->pat_str   = ray_str_ptr(cv_like);
+        out->pat_len   = ray_str_len(cv_like);
+        out->pat_compiled = ray_glob_compile(out->pat_str, out->pat_len);
+        if (col->type == RAY_SYM) {
+            ray_t** sym_strings = NULL;
+            uint32_t sym_count = 0;
+            ray_sym_strings_borrow(&sym_strings, &sym_count);
+            if (!sym_strings || sym_count == 0) return -1;
+            uint8_t* lut = (uint8_t*)scratch_calloc(&out->aux_hdr, sym_count);
+            if (!lut) return -1;
+            out->like_lut = lut;
+            out->like_lut_count = sym_count;
+            out->like_sym_strings = sym_strings;
+        }
+        out->cval_in_dict = 1;
+        return 0;
+    }
+
     /* Ordering ops on SYM are meaningless (dict ID order != string order). */
     if (col->type == RAY_SYM && (out->op == FP_LT || out->op == FP_LE ||
                                  out->op == FP_GT || out->op == FP_GE))
@@ -409,6 +631,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
     out->col_attrs = col->attrs;
     out->col_esz   = ray_sym_elem_size(col->type, col->attrs);
     out->col_base  = ray_data(col);
+    out->col_obj   = col;
     out->col_len   = col->len;
 
     if (out->col_type == RAY_SYM) {
@@ -477,6 +700,7 @@ static int fp_compile_cmp(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
         case FP_LE: out->fold = below ? FP_FOLD_FALSE : FP_FOLD_TRUE;  break;
         case FP_GT: out->fold = below ? FP_FOLD_TRUE  : FP_FOLD_FALSE; break;
         case FP_GE: out->fold = below ? FP_FOLD_TRUE  : FP_FOLD_FALSE; break;
+        case FP_LIKE: case FP_IN: break;
         }
     }
     return 0;
@@ -497,17 +721,38 @@ static int fp_compile_pred_dag(ray_graph_t* g, ray_op_t* node, ray_t* tbl,
         return 0;
     }
     if (out->n_children >= FP_PRED_MAX_CHILDREN) return -1;
-    return fp_compile_cmp(g, node, tbl, &out->children[out->n_children++]);
+    fp_cmp_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    if (fp_compile_cmp(g, node, tbl, &tmp) != 0) {
+        if (tmp.aux_hdr) scratch_free(tmp.aux_hdr);
+        return -1;
+    }
+    out->children[out->n_children++] = tmp;
+    return 0;
 }
 
 int fp_compile_pred(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
                     fp_pred_t* out)
 {
+    memset(out, 0, sizeof(*out));
     out->n_children = 0;
     /* No predicate → const-true.  fp_eval_pred memsets bits to 1
      * when n_children == 0, so the worker treats every row as a hit. */
     if (!pred_op) return 0;
     return fp_compile_pred_dag(g, pred_op, tbl, out);
+}
+
+void fp_pred_cleanup(fp_pred_t* p) {
+    if (!p) return;
+    for (uint8_t i = 0; i < p->n_children; i++) {
+        if (p->children[i].aux_hdr) {
+            scratch_free(p->children[i].aux_hdr);
+            p->children[i].aux_hdr = NULL;
+            p->children[i].like_lut = NULL;
+            p->children[i].like_lut_count = 0;
+            p->children[i].like_sym_strings = NULL;
+        }
+    }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -559,6 +804,12 @@ typedef struct {
     uint64_t   init_cap;
     _Atomic(uint32_t) oom;  /* set by any worker on OOM; main bails */
 } fp_par_ctx_t;
+
+static int64_t fp_count_emit_keep_min(int64_t total_groups,
+                                      ray_group_emit_filter_t filter,
+                                      const int64_t* used_key_slots,
+                                      const int64_t* counts,
+                                      uint64_t n_slots);
 
 static int fp_shard_init(fp_shard_t* sh, uint64_t cap) {
     sh->slots  = (int64_t*)scratch_calloc(&sh->slots_hdr,
@@ -675,6 +926,152 @@ static void fp_par_fn(void* raw, uint32_t worker_id, int64_t start, int64_t end)
     }
 }
 
+typedef struct {
+    const fp_pred_t* pred;
+    const void*      kbase;
+    int8_t           kt;
+    uint8_t          kesz;
+    uint32_t         n_slots;
+    int32_t          bias;
+    int64_t*         counts;  /* [n_workers * n_slots] */
+} fp_direct_count_ctx_t;
+
+static void fp_direct_count_fn(void* raw, uint32_t worker_id,
+                               int64_t start, int64_t end) {
+    fp_direct_count_ctx_t* c = (fp_direct_count_ctx_t*)raw;
+    int64_t* counts = c->counts + (size_t)worker_id * c->n_slots;
+    int64_t row = start;
+    while (row < end) {
+        int64_t mend = row + RAY_MORSEL_ELEMS;
+        if (mend > end) mend = end;
+        int64_t mlen = mend - row;
+        uint8_t bits[RAY_MORSEL_ELEMS];
+        fp_eval_pred(c->pred, row, mend, bits);
+        if (c->kt == RAY_I16) {
+            const int16_t* k = (const int16_t*)c->kbase + row;
+            for (int64_t r = 0; r < mlen; r++)
+                if (bits[r]) counts[(uint32_t)((int32_t)k[r] + c->bias)]++;
+        } else {
+            const uint8_t* k = (const uint8_t*)c->kbase + row;
+            for (int64_t r = 0; r < mlen; r++)
+                if (bits[r]) counts[(uint32_t)k[r]]++;
+        }
+        row = mend;
+    }
+}
+
+static ray_t* fp_try_direct_count1(const fp_par_ctx_t* ctx, int64_t nrows,
+                                   int64_t key_sym, uint32_t nw) {
+    uint32_t n_slots;
+    int32_t bias = 0;
+    if (ctx->kt == RAY_BOOL) {
+        n_slots = 2;
+    } else if (ctx->kt == RAY_U8) {
+        n_slots = 256;
+    } else if (ctx->kt == RAY_I16) {
+        n_slots = 65536;
+        bias = 32768;
+    } else {
+        return NULL;
+    }
+
+    ray_t* counts_hdr = NULL;
+    int64_t* counts = (int64_t*)scratch_calloc(&counts_hdr,
+        (size_t)nw * (size_t)n_slots * sizeof(int64_t));
+    if (!counts) return ray_error("oom", NULL);
+
+    fp_direct_count_ctx_t dctx = {
+        .pred = &ctx->pred,
+        .kbase = ctx->kbase,
+        .kt = ctx->kt,
+        .kesz = ctx->kesz,
+        .n_slots = n_slots,
+        .bias = bias,
+        .counts = counts,
+    };
+
+    ray_pool_t* pool = ray_pool_get();
+    if (pool) ray_pool_dispatch(pool, fp_direct_count_fn, &dctx, nrows);
+    else      fp_direct_count_fn(&dctx, 0, 0, nrows);
+
+    int64_t out_n = 0;
+    ray_group_emit_filter_t emit_filter = ray_group_emit_filter_get();
+    bool use_emit_filter = emit_filter.enabled && emit_filter.agg_index == 0;
+    int64_t keep_min = emit_filter.min_count_exclusive + 1;
+    ray_t* totals_hdr = NULL;
+    int64_t* totals = NULL;
+    if (use_emit_filter && emit_filter.top_count_take > 0) {
+        totals = (int64_t*)scratch_calloc(&totals_hdr,
+            (size_t)n_slots * sizeof(int64_t));
+        if (!totals) {
+            scratch_free(counts_hdr);
+            return ray_error("oom", NULL);
+        }
+    }
+    for (uint32_t s = 0; s < n_slots; s++) {
+        int64_t total = 0;
+        for (uint32_t w = 0; w < nw; w++)
+            total += counts[(size_t)w * n_slots + s];
+        if (totals) totals[s] = total;
+        if (total) out_n++;
+    }
+    if (use_emit_filter) {
+        if (totals) {
+            keep_min = fp_count_emit_keep_min(out_n, emit_filter, NULL,
+                                             totals, n_slots);
+        }
+        out_n = 0;
+        for (uint32_t s = 0; s < n_slots; s++) {
+            int64_t total = totals ? totals[s] : 0;
+            if (!totals) {
+                for (uint32_t w = 0; w < nw; w++)
+                    total += counts[(size_t)w * n_slots + s];
+            }
+            if (total >= keep_min) out_n++;
+        }
+    }
+
+    ray_t* k_out = ray_vec_new(ctx->kt, out_n);
+    ray_t* c_out = ray_vec_new(RAY_I64, out_n);
+    if (!k_out || !c_out || RAY_IS_ERR(k_out) || RAY_IS_ERR(c_out)) {
+        if (k_out && !RAY_IS_ERR(k_out)) ray_release(k_out);
+        if (c_out && !RAY_IS_ERR(c_out)) ray_release(c_out);
+        if (totals_hdr) scratch_free(totals_hdr);
+        scratch_free(counts_hdr);
+        return ray_error("oom", NULL);
+    }
+    k_out->len = out_n;
+    c_out->len = out_n;
+    void* k_dst = ray_data(k_out);
+    int64_t* c_dst = (int64_t*)ray_data(c_out);
+    int64_t oi = 0;
+    for (uint32_t s = 0; s < n_slots; s++) {
+        int64_t total = 0;
+        for (uint32_t w = 0; w < nw; w++)
+            total += counts[(size_t)w * n_slots + s];
+        if (totals) total = totals[s];
+        if (total < keep_min) continue;
+        int64_t key = (ctx->kt == RAY_I16) ? ((int64_t)s - bias) : (int64_t)s;
+        write_col_i64(k_dst, oi, key, ctx->kt, ctx->katt);
+        c_dst[oi++] = total;
+    }
+    if (totals_hdr) scratch_free(totals_hdr);
+    scratch_free(counts_hdr);
+
+    ray_t* result = ray_table_new(2);
+    if (!result || RAY_IS_ERR(result)) {
+        ray_release(k_out);
+        ray_release(c_out);
+        return ray_error("oom", NULL);
+    }
+    int64_t cnt_sym = ray_sym_intern("count", 5);
+    result = ray_table_add_col(result, key_sym, k_out);
+    result = ray_table_add_col(result, cnt_sym, c_out);
+    ray_release(k_out);
+    ray_release(c_out);
+    return result;
+}
+
 /* Parallel combine: 3-pass radix scatter.
  *
  *   Pass A (per shard, parallel): histogram slot counts per partition.
@@ -706,6 +1103,72 @@ typedef struct {
     int64_t*          part_n;          /* [P]: deduped count */
     _Atomic(uint32_t) oom;
 } fp_combine_par_ctx_t;
+
+static void fp_count_heap_down(int64_t* heap, int64_t n, int64_t i) {
+    for (;;) {
+        int64_t l = i * 2 + 1;
+        int64_t r = l + 1;
+        int64_t m = i;
+        if (l < n && heap[l] < heap[m]) m = l;
+        if (r < n && heap[r] < heap[m]) m = r;
+        if (m == i) break;
+        int64_t tmp = heap[i];
+        heap[i] = heap[m];
+        heap[m] = tmp;
+        i = m;
+    }
+}
+
+static void fp_count_heap_up(int64_t* heap, int64_t i) {
+    while (i > 0) {
+        int64_t p = (i - 1) / 2;
+        if (heap[p] <= heap[i]) break;
+        int64_t tmp = heap[p];
+        heap[p] = heap[i];
+        heap[i] = tmp;
+        i = p;
+    }
+}
+
+static void fp_count_heap_consider(int64_t* heap, int64_t* hn,
+                                   int64_t cap, int64_t count) {
+    if (cap <= 0 || count <= 0) return;
+    if (*hn < cap) {
+        heap[(*hn)++] = count;
+        fp_count_heap_up(heap, *hn - 1);
+    } else if (count > heap[0]) {
+        heap[0] = count;
+        fp_count_heap_down(heap, *hn, 0);
+    }
+}
+
+static int64_t fp_count_emit_keep_min(int64_t total_groups,
+                                      ray_group_emit_filter_t filter,
+                                      const int64_t* used_key_slots,
+                                      const int64_t* counts,
+                                      uint64_t n_slots) {
+    int64_t keep_min = filter.min_count_exclusive + 1;
+    int64_t k_take = filter.top_count_take;
+    if (!filter.enabled || k_take <= 0 || total_groups <= k_take)
+        return keep_min;
+
+    ray_t* heap_hdr = NULL;
+    int64_t* heap = (int64_t*)scratch_alloc(&heap_hdr,
+        (size_t)k_take * sizeof(int64_t));
+    if (!heap) return keep_min;
+
+    int64_t hn = 0;
+    for (uint64_t s = 0; s < n_slots; s++) {
+        if (used_key_slots && !used_key_slots[s * 2]) continue;
+        int64_t cnt = counts[s];
+        if (cnt >= keep_min)
+            fp_count_heap_consider(heap, &hn, k_take, cnt);
+    }
+    if (hn == k_take && heap[0] > keep_min)
+        keep_min = heap[0];
+    scratch_free(heap_hdr);
+    return keep_min;
+}
 
 static void fp_combine_hist_fn(void* vctx, uint32_t worker_id,
                                int64_t start, int64_t end) {
@@ -869,11 +1332,15 @@ static ray_t* fp_combine_and_materialize(fp_shard_t* shards, uint32_t nw,
         return result;
     }
 
+    ray_group_emit_filter_t emit_filter = ray_group_emit_filter_get();
+    bool use_emit_filter = emit_filter.enabled && emit_filter.agg_index == 0 &&
+        (emit_filter.min_count_exclusive > 0 || emit_filter.top_count_take > 0);
+
     /* Parallel combine for high-cardinality results: 3-pass radix scatter.
      * Crossover at 50 K entries — below that, the serial walk has lower
      * overhead than the dispatch + scratch alloc cost. */
     ray_pool_t* cpool = ray_pool_get();
-    if (cpool && total_local >= FP_COMBINE_PAR_MIN &&
+    if (!use_emit_filter && cpool && total_local >= FP_COMBINE_PAR_MIN &&
         ray_pool_total_workers(cpool) >= 2 && nw <= 256)
     {
         uint32_t cnw = ray_pool_total_workers(cpool);
@@ -1073,24 +1540,37 @@ static ray_t* fp_combine_and_materialize(fp_shard_t* shards, uint32_t nw,
         }
     }
 
+    int64_t keep_min = use_emit_filter
+        ? fp_count_emit_keep_min(global_n, emit_filter, gs, gc, gcap)
+        : 1;
+    int64_t out_n = global_n;
+    if (use_emit_filter) {
+        out_n = 0;
+        for (uint64_t s = 0; s < gcap; s++) {
+            if (!gs[s * 2]) continue;
+            if (gc[s] >= keep_min) out_n++;
+        }
+    }
+
     /* Materialize. */
     ray_t* k_out = (kt == RAY_SYM)
-                 ? ray_sym_vec_new(katt & RAY_SYM_W_MASK, global_n)
-                 : ray_vec_new(kt, global_n);
-    ray_t* c_out = ray_vec_new(RAY_I64, global_n);
+                 ? ray_sym_vec_new(katt & RAY_SYM_W_MASK, out_n)
+                 : ray_vec_new(kt, out_n);
+    ray_t* c_out = ray_vec_new(RAY_I64, out_n);
     if (!k_out || !c_out || RAY_IS_ERR(k_out) || RAY_IS_ERR(c_out)) {
         if (k_out && !RAY_IS_ERR(k_out)) ray_release(k_out);
         if (c_out && !RAY_IS_ERR(c_out)) ray_release(c_out);
         scratch_free(gs_hdr); scratch_free(gc_hdr);
         return ray_error("oom", NULL);
     }
-    k_out->len = global_n;
-    c_out->len = global_n;
+    k_out->len = out_n;
+    c_out->len = out_n;
     void*    k_dst = ray_data(k_out);
     int64_t* c_dst = (int64_t*)ray_data(c_out);
     int64_t  gi    = 0;
     for (uint64_t s = 0; s < gcap; s++) {
         if (!gs[s * 2]) continue;
+        if (gc[s] < keep_min) continue;
         int64_t kv = gs[s * 2 + 1];
         write_col_i64(k_dst, gi, kv, kt, katt);
         c_dst[gi] = gc[s];
@@ -1152,6 +1632,9 @@ static ray_t* exec_filtered_group_count1(ray_graph_t* g, ray_op_ext_t* ext,
 
     ray_pool_t* pool = ray_pool_get();
     uint32_t nw = pool ? ray_pool_total_workers(pool) : 1;
+    ray_t* direct = fp_try_direct_count1(&ctx, nrows, kext->sym, nw);
+    if (direct) return direct;
+
     ray_t* shards_hdr = NULL;
     ctx.shards = (fp_shard_t*)scratch_calloc(&shards_hdr,
                                              (size_t)nw * sizeof(fp_shard_t));
@@ -1698,6 +2181,73 @@ static ray_t* mk_materialize_agg(const mk_agg_t* a, const int64_t* gstate,
         }
     }
     return col;
+}
+
+static void mk_apply_count_emit_filter(const mk_par_ctx_t* c,
+                                       int64_t* gs, int64_t* gst,
+                                       int64_t gcap, int64_t* global_n)
+{
+    ray_group_emit_filter_t emit_filter = ray_group_emit_filter_get();
+    if (!emit_filter.enabled || emit_filter.agg_index >= c->n_aggs)
+        return;
+
+    const mk_agg_t* count_agg = &c->aggs[emit_filter.agg_index];
+    if (count_agg->kind != MK_AGG_COUNT)
+        return;
+
+    int64_t keep_min = emit_filter.min_count_exclusive + 1;
+    int64_t k_take = emit_filter.top_count_take;
+    if (k_take > 0 && k_take < *global_n) {
+        ray_t* heap_hdr = NULL;
+        int64_t* heap = (int64_t*)scratch_alloc(&heap_hdr,
+                                                (size_t)k_take * sizeof(int64_t));
+        if (heap) {
+            int64_t heap_n = 0;
+            for (int64_t s = 0; s < gcap; s++) {
+                if (!gs[s * 2]) continue;
+                int64_t cnt = gst[(size_t)s * c->total_state + count_agg->state_off];
+                if (heap_n < k_take) {
+                    int64_t j = heap_n++;
+                    heap[j] = cnt;
+                    while (j > 0) {
+                        int64_t p = (j - 1) >> 1;
+                        if (heap[p] <= heap[j]) break;
+                        int64_t tmp = heap[p]; heap[p] = heap[j]; heap[j] = tmp;
+                        j = p;
+                    }
+                } else if (cnt > heap[0]) {
+                    heap[0] = cnt;
+                    int64_t j = 0;
+                    for (;;) {
+                        int64_t l = j * 2 + 1, r = l + 1, m = j;
+                        if (l < heap_n && heap[l] < heap[m]) m = l;
+                        if (r < heap_n && heap[r] < heap[m]) m = r;
+                        if (m == j) break;
+                        int64_t tmp = heap[m]; heap[m] = heap[j]; heap[j] = tmp;
+                        j = m;
+                    }
+                }
+            }
+            if (heap_n == k_take && heap[0] > keep_min)
+                keep_min = heap[0];
+            scratch_free(heap_hdr);
+        }
+    }
+
+    if (keep_min <= 1)
+        return;
+
+    int64_t kept = 0;
+    for (int64_t s = 0; s < gcap; s++) {
+        if (!gs[s * 2]) continue;
+        int64_t cnt = gst[(size_t)s * c->total_state + count_agg->state_off];
+        if (cnt < keep_min) {
+            gs[s * 2] = 0;
+        } else {
+            kept++;
+        }
+    }
+    *global_n = kept;
 }
 
 /* Parallel combine for the multi-agg/multi-key path.  Same 3-pass radix
@@ -2283,6 +2833,8 @@ materialize:
        * declaration in that position, and clang on macOS enforces it
        * with -Werror,-Wc23-extensions.  Empty statement is the
        * portable form. */
+
+    mk_apply_count_emit_filter(c, gs, gst, gcap, &global_n);
 
     /* Build n_keys key columns by decomposing the composite. */
     ray_t* key_cols[FP_MAX_KEYS];

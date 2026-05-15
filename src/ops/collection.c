@@ -29,6 +29,7 @@
 #include "mem/sys.h"
 #include "ops/hash.h"
 #include "ops/internal.h"   /* col_propagate_str_pool */
+#include "ops/ops.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -693,6 +694,19 @@ int atom_eq(ray_t* a, ray_t* b) {
 /* Forward declaration */
 ray_t* list_to_typed_vec(ray_t* list, int8_t orig_vec_type);
 
+static void propagate_sym_dict(ray_t* dst, const ray_t* src) {
+    if (!dst || !src || dst->type != RAY_SYM || src->type != RAY_SYM) return;
+    const ray_t* owner = (src->attrs & RAY_ATTR_SLICE) ? src->slice_parent : src;
+    if (owner &&
+        !(owner->attrs & RAY_ATTR_SLICE) &&
+        (!(owner->attrs & RAY_ATTR_HAS_NULLS) ||
+         (owner->attrs & RAY_ATTR_NULLMAP_EXT)) &&
+        owner->sym_dict) {
+        ray_retain(owner->sym_dict);
+        dst->sym_dict = owner->sym_dict;
+    }
+}
+
 /* Eager vector dedup — called by the DAG executor's OP_DISTINCT case.
  * Factored out so the executor doesn't go through ray_distinct_fn, which
  * is now a lazy producer for vectors and would re-wrap into a chain. */
@@ -726,6 +740,45 @@ ray_t* distinct_vec_eager(ray_t* x) {
     return result;
 }
 
+static ray_t* parted_to_flat_vec(ray_t* x) {
+    if (!x || !RAY_IS_PARTED(x->type)) return ray_error("type", NULL);
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
+    ray_t** segs = (ray_t**)ray_data(x);
+    int64_t total = 0;
+    for (int64_t s = 0; s < x->len; s++)
+        if (segs[s]) total += segs[s]->len;
+
+    ray_t* out = ray_vec_new(base, base == RAY_STR ? 0 : total);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    if (base != RAY_STR) out->len = total;
+
+    int64_t pos = 0;
+    for (int64_t s = 0; s < x->len; s++) {
+        ray_t* seg = segs[s];
+        if (!seg) continue;
+        for (int64_t i = 0; i < seg->len; i++) {
+            if (base == RAY_STR) {
+                size_t slen = 0;
+                const char* sp = ray_str_vec_get(seg, i, &slen);
+                out = ray_str_vec_append(out, sp ? sp : "", sp ? slen : 0);
+                if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+                if (ray_vec_is_null(seg, i)) ray_vec_set_null(out, pos, true);
+            } else {
+                int allocated = 0;
+                ray_t* elem = collection_elem(seg, i, &allocated);
+                if (!elem || RAY_IS_ERR(elem) || store_typed_elem(out, pos, elem) != 0) {
+                    if (allocated && elem && !RAY_IS_ERR(elem)) ray_release(elem);
+                    ray_release(out);
+                    return elem && RAY_IS_ERR(elem) ? elem : ray_error("type", NULL);
+                }
+                if (allocated) ray_release(elem);
+            }
+            pos++;
+        }
+    }
+    return out;
+}
+
 /* (distinct x) — remove duplicates. Dispatches on type:
  *   table → deduplicate rows (via DAG GROUP with zero aggs)
  *   vector → remove duplicate elements, preserving first occurrence
@@ -738,6 +791,14 @@ ray_t* ray_distinct_fn(ray_t* x) {
     /* Table distinct: dispatch to table-specific implementation */
     if (x->type == RAY_TABLE)
         return ray_table_distinct_fn(x);
+
+    if (RAY_IS_PARTED(x->type)) {
+        ray_t* flat = parted_to_flat_vec(x);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* out = distinct_vec_eager(flat);
+        ray_release(flat);
+        return out;
+    }
 
     /* String distinct: unique chars, sorted */
     if (ray_is_atom(x) && (-x->type) == RAY_STR) {
@@ -1224,7 +1285,8 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
                 ray_t* taken = ray_take_fn(col, n_obj);
                 if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
                 result = ray_table_add_col(result, name_id, taken);
-                if (RAY_IS_ERR(result)) { ray_release(taken); return result; }
+                ray_release(taken);
+                if (RAY_IS_ERR(result)) return result;
             }
             return result;
         }
@@ -1258,8 +1320,10 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             if (end > len) end = len;
             int64_t count = end - start;
             int8_t vtype = vec->type;
-            int esz = ray_elem_size(vtype);
-            ray_t* result = ray_vec_new(vtype, count);
+            int esz = ray_sym_elem_size(vtype, vec->attrs);
+            ray_t* result = (vtype == RAY_SYM)
+                          ? ray_sym_vec_new(vec->attrs & RAY_SYM_W_MASK, count)
+                          : ray_vec_new(vtype, count);
             if (RAY_IS_ERR(result)) return result;
             result->len = count;
             memcpy(ray_data(result), (char*)ray_data(vec) + start * esz, (size_t)(count * esz));
@@ -1267,6 +1331,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
              * source's str_pool by pool_off — propagate the pool ray_t
              * (with retain) so the result owns a valid backing store. */
             if (vtype == RAY_STR) col_propagate_str_pool(result, vec);
+            if (vtype == RAY_SYM) propagate_sym_dict(result, vec);
             /* Propagate null bitmap — check parent's flag for slices */
             bool has_nulls = (vec->attrs & RAY_ATTR_HAS_NULLS) ||
                              ((vec->attrs & RAY_ATTR_SLICE) && vec->slice_parent &&
@@ -1396,7 +1461,8 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
             ray_t* taken = ray_take_fn(col, n_obj);
             if (RAY_IS_ERR(taken)) { ray_release(result); return taken; }
             result = ray_table_add_col(result, name_id, taken);
-            if (RAY_IS_ERR(result)) { ray_release(taken); return result; }
+            ray_release(taken);
+            if (RAY_IS_ERR(result)) return result;
         }
         return result;
     }
@@ -1418,8 +1484,10 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
         int64_t n = as_i64(n_obj);
         int64_t abs_n = n < 0 ? -n : n;
         int8_t vtype = vec->type;
-        int esz = ray_elem_size(vtype);
-        ray_t* result = ray_vec_new(vtype, abs_n);
+        int esz = ray_sym_elem_size(vtype, vec->attrs);
+        ray_t* result = (vtype == RAY_SYM)
+                      ? ray_sym_vec_new(vec->attrs & RAY_SYM_W_MASK, abs_n)
+                      : ray_vec_new(vtype, abs_n);
         if (RAY_IS_ERR(result)) return result;
         result->len = abs_n;
         char* src = (char*)ray_data(vec);
@@ -1459,6 +1527,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
          * past the SSO threshold, tripping the assertion in
          * ray_str_t_ptr / strsort_repack_window / strkey_cmp. */
         if (vtype == RAY_STR) col_propagate_str_pool(result, vec);
+        if (vtype == RAY_SYM) propagate_sym_dict(result, vec);
         /* Propagate null bitmap — check parent's flag for slices */
         bool has_nulls = len > 0 &&
                          ((vec->attrs & RAY_ATTR_HAS_NULLS) ||

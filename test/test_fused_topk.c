@@ -428,9 +428,10 @@ static test_result_t test_topk_gate_k_ge_nrows(void) {
     PASS();
 }
 
-static test_result_t test_topk_gate_unsupported_out_col_type(void) {
-    /* Build a table with an F64 column — F64 is not in the supported
-     * output set, so the out-col gate must reject. */
+static test_result_t test_topk_gathers_f64_out_col_type(void) {
+    /* Output columns use the shared gather helper, so F64 projections
+     * are safe even though the sort key still uses the fixed-width
+     * comparator gate. */
     int64_t N = 50;
     ray_t* fc = ray_vec_new(RAY_F64, N); fc->len = N;
     double* fd = (double*)ray_data(fc);
@@ -447,12 +448,21 @@ static test_result_t test_topk_gate_unsupported_out_col_type(void) {
     ray_t* where_expr = ray_parse("(>= sel 0)");
     int64_t sort_keys[1]  = { s_sel };
     uint8_t sort_descs[1] = { 0 };
-    int64_t out_syms[2]   = { s_sel, s_f };  /* f is F64 → unsupported */
+    int64_t out_syms[2]   = { s_sel, s_f };
     ray_t* res = ray_fused_topk_select(tbl, where_expr,
                                        sort_keys, sort_descs, 1, 5,
                                        out_syms, NULL, 2);
-    TEST_ASSERT_NULL(res);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_EQ_I(res->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 5);
+    ray_t* out_f = ray_table_get_col(res, s_f);
+    TEST_ASSERT_NOT_NULL(out_f);
+    TEST_ASSERT_EQ_I(out_f->type, RAY_F64);
+    double* out_fd = (double*)ray_data(out_f);
+    TEST_ASSERT_FMT(out_fd[0] == 0.0, "expected first F64 output to be 0");
+    TEST_ASSERT_FMT(out_fd[4] == 4.0, "expected fifth F64 output to be 4");
 
+    ray_release(res);
     ray_release(where_expr); ray_release(tbl);
     PASS();
 }
@@ -566,6 +576,36 @@ static test_result_t test_topk_basic_i64_asc(void) {
     ray_t* v_col = ray_table_get_col(res, s_v);
     for (int64_t i = 0; i < k_pick; i++)
         TEST_ASSERT_EQ_I(((int64_t*)ray_data(v_col))[i], i);
+
+    ray_release(res); ray_release(where_expr); ray_release(tbl);
+    PASS();
+}
+
+static test_result_t test_topk_in_pred(void) {
+    int64_t N = 100;
+    ray_t* tbl = make_i64_table(N);
+    ray_t* where_expr = ray_parse("(in g [1 3])");
+    int64_t s_v = ray_sym_intern("v", 1);
+    int64_t s_g = ray_sym_intern("g", 1);
+    int64_t sort_keys[1]  = { s_v };
+    uint8_t sort_descs[1] = { 0 };
+    int64_t out_syms[2]   = { s_v, s_g };
+    ray_t* res = ray_fused_topk_select(tbl, where_expr,
+                                       sort_keys, sort_descs, 1, 4,
+                                       out_syms, NULL, 2);
+    TEST_ASSERT_NOT_NULL(res);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(res));
+    TEST_ASSERT_EQ_I(ray_table_nrows(res), 4);
+    ray_t* v_col = ray_table_get_col(res, s_v);
+    ray_t* g_col = ray_table_get_col(res, s_g);
+    TEST_ASSERT_NOT_NULL(v_col);
+    TEST_ASSERT_NOT_NULL(g_col);
+    int64_t expect_v[] = {1, 3, 5, 7};
+    int64_t expect_g[] = {1, 3, 1, 3};
+    for (int64_t i = 0; i < 4; i++) {
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(v_col))[i], expect_v[i]);
+        TEST_ASSERT_EQ_I(((int64_t*)ray_data(g_col))[i], expect_g[i]);
+    }
 
     ray_release(res); ray_release(where_expr); ray_release(tbl);
     PASS();
@@ -703,13 +743,14 @@ const test_entry_t fused_topk_entries[] = {
     { "fused_topk/gate_k_too_large",          test_topk_gate_k_too_large,          topk_setup, topk_teardown },
     { "fused_topk/gate_zero_sort_keys",       test_topk_gate_zero_sort_keys,       topk_setup, topk_teardown },
     { "fused_topk/gate_k_ge_nrows",           test_topk_gate_k_ge_nrows,           topk_setup, topk_teardown },
-    { "fused_topk/gate_unsupported_out_col",  test_topk_gate_unsupported_out_col_type,  topk_setup, topk_teardown },
+    { "fused_topk/gather_f64_out_col",        test_topk_gathers_f64_out_col_type,       topk_setup, topk_teardown },
     { "fused_topk/gate_unsupported_sort_key", test_topk_gate_unsupported_sort_key_type, topk_setup, topk_teardown },
     { "fused_topk/gate_n_out_zero",           test_topk_gate_n_out_zero,           topk_setup, topk_teardown },
     { "fused_topk/gate_too_many_sort_keys",   test_topk_gate_too_many_sort_keys,   topk_setup, topk_teardown },
     { "fused_topk/gate_negative_k",           test_topk_gate_negative_k,           topk_setup, topk_teardown },
     /* Happy paths */
     { "fused_topk/basic_i64_asc",             test_topk_basic_i64_asc,             topk_setup, topk_teardown },
+    { "fused_topk/in_pred",                   test_topk_in_pred,                   topk_setup, topk_teardown },
     { "fused_topk/aliased_out",               test_topk_aliased_out,               topk_setup, topk_teardown },
     { "fused_topk/propagates_nullmap",        test_topk_propagates_nullmap,        topk_setup, topk_teardown },
     { "fused_topk/three_keys",                test_topk_three_keys,                topk_setup, topk_teardown },

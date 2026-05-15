@@ -1790,12 +1790,91 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
     }
 }
 
+static bool group_ht_insert_empty_group(group_ht_t* ht, const int64_t* keys,
+                                        const int8_t* key_types) {
+    const ght_layout_t* ly = &ht->layout;
+    if (ht->grp_count >= ht->grp_cap) {
+        if (!group_ht_grow(ht)) { ht->oom = 1; return false; }
+    }
+    uint64_t h = hash_keys_inline(keys, key_types, ly->n_keys,
+                                  ly->wide_key_mask, ly->wide_key_esz,
+                                  ht->key_data);
+    uint32_t mask = ht->ht_cap - 1;
+    uint32_t slot = (uint32_t)(h & mask);
+    uint8_t salt = HT_SALT(h);
+    while (ht->slots[slot] != HT_EMPTY)
+        slot = (slot + 1) & mask;
+
+    uint32_t gid = ht->grp_count++;
+    char* row = ht->rows + (size_t)gid * ly->row_stride;
+    memset(row, 0, ly->row_stride);
+    memcpy(row + 8, keys, (size_t)(ly->n_keys + 1) * 8);
+    ht->slots[slot] = HT_PACK(salt, gid);
+    if (ht->grp_count * 2 > ht->ht_cap) {
+        group_ht_rehash(ht, key_types);
+        if (ht->oom) return false;
+    }
+    return true;
+}
+
+static inline void group_probe_existing_entry(group_ht_t* ht,
+    const char* entry, const int8_t* key_types) {
+    const ght_layout_t* ly = &ht->layout;
+    uint64_t hash = *(const uint64_t*)entry;
+    const char* ekeys = entry + 8;
+    uint8_t salt = HT_SALT(hash);
+    uint32_t mask = ht->ht_cap - 1;
+    uint32_t slot = (uint32_t)(hash & mask);
+
+    for (;;) {
+        uint32_t sv = ht->slots[slot];
+        if (sv == HT_EMPTY) return;
+        if (HT_SALT_V(sv) == salt) {
+            uint32_t gid = HT_GID(sv);
+            char* row = ht->rows + (size_t)gid * ly->row_stride;
+            if (group_keys_equal((const int64_t*)(row + 8),
+                                  (const int64_t*)ekeys, ly, ht->key_data)) {
+                (*(int64_t*)row)++;
+                accum_from_entry(row, entry, ly);
+                return;
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
 /* Process rows [start, end) from original columns into a local hash table.
  * Converts each row to a fat entry on the stack, then probes. */
 #define GROUP_PREFETCH_BATCH 16
 
+static inline int64_t group_strlen_at(const ray_t* col, int64_t row);
+
+static inline bool group_rowsel_pass(ray_t* sel, int64_t row) {
+    if (!sel) return true;
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    if (row < 0 || row >= m->nrows) return false;
+    uint32_t seg = (uint32_t)(row / RAY_MORSEL_ELEMS);
+    uint8_t f = ray_rowsel_flags(sel)[seg];
+    if (f == RAY_SEL_ALL) return true;
+    if (f == RAY_SEL_NONE) return false;
+    uint16_t local = (uint16_t)(row - (int64_t)seg * RAY_MORSEL_ELEMS);
+    uint32_t lo = ray_rowsel_offsets(sel)[seg];
+    uint32_t hi = ray_rowsel_offsets(sel)[seg + 1];
+    const uint16_t* idx = ray_rowsel_idx(sel);
+    while (lo < hi) {
+        uint32_t mid = lo + ((hi - lo) >> 1);
+        uint16_t v = idx[mid];
+        if (v == local) return true;
+        if (v < local) lo = mid + 1;
+        else hi = mid;
+    }
+    return false;
+}
+
 void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
                               uint8_t* key_attrs, ray_t** key_vecs, ray_t** agg_vecs,
+                              uint8_t* agg_strlen,
+                              ray_t* rowsel,
                               int64_t start, int64_t end,
                               const int64_t* match_idx) {
     const ght_layout_t* ly = &ht->layout;
@@ -1830,6 +1909,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
          * sub-100ms response time on Ctrl-C. */
         if (((i - start) & 65535) == 0 && ray_interrupted()) break;
         int64_t row = match_idx ? match_idx[i] : i;
+        if (!match_idx && rowsel && !group_rowsel_pass(rowsel, row)) continue;
         uint64_t h = 0;
         int64_t* ek = (int64_t*)(ebuf + 8);
         int64_t null_mask = 0;
@@ -1869,7 +1949,9 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         for (uint8_t a = 0; a < na; a++) {
             ray_t* ac = agg_vecs[a];
             if (!ac) continue;
-            if (ac->type == RAY_F64)
+            if (agg_strlen && agg_strlen[a])
+                ev[vi] = group_strlen_at(ac, row);
+            else if (ac->type == RAY_F64)
                 memcpy(&ev[vi], &((double*)ray_data(ac))[row], 8);
             else
                 ev[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
@@ -1882,6 +1964,87 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
             memcpy(ebuf + ly->entry_stride - 8, &row, 8);
 
         mask = group_probe_entry(ht, ebuf, key_types, mask);
+    }
+}
+
+static void group_rows_range_existing(group_ht_t* ht, void** key_data,
+                                      int8_t* key_types, uint8_t* key_attrs,
+                                      ray_t** key_vecs, ray_t** agg_vecs,
+                                      uint8_t* agg_strlen, ray_t* rowsel,
+                                      int64_t start, int64_t end,
+                                      const int64_t* match_idx) {
+    const ght_layout_t* ly = &ht->layout;
+    uint8_t nk = ly->n_keys;
+    uint8_t na = ly->n_aggs;
+    uint8_t wide = ly->wide_key_mask;
+    bool has_fl = (ly->agg_is_first | ly->agg_is_last) != 0;
+    char ebuf[8 + 9 * 8 + 8 * 8 + 8];
+
+    uint8_t nullable_mask = 0;
+    for (uint8_t k = 0; k < nk; k++) {
+        if (!key_vecs || !key_vecs[k]) continue;
+        ray_t* kv = key_vecs[k];
+        ray_t* src = (kv->attrs & RAY_ATTR_SLICE) ? kv->slice_parent : kv;
+        if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
+            nullable_mask |= (uint8_t)(1u << k);
+    }
+
+    if (wide) group_ht_set_key_data(ht, key_data);
+
+    for (int64_t i = start; i < end; i++) {
+        if (((i - start) & 65535) == 0 && ray_interrupted()) break;
+        int64_t row = match_idx ? match_idx[i] : i;
+        if (!match_idx && rowsel && !group_rowsel_pass(rowsel, row)) continue;
+        uint64_t h = 0;
+        int64_t* ek = (int64_t*)(ebuf + 8);
+        int64_t null_mask = 0;
+        for (uint8_t k = 0; k < nk; k++) {
+            int8_t t = key_types[k];
+            uint64_t kh;
+            bool is_null = (nullable_mask & (1u << k))
+                           && ray_vec_is_null(key_vecs[k], row);
+            if (is_null) {
+                null_mask |= (int64_t)(1u << k);
+                ek[k] = 0;
+                kh = ray_hash_i64(0);
+            } else if (wide & (1u << k)) {
+                uint8_t esz = ly->wide_key_esz[k];
+                const void* src = (const char*)key_data[k] + (size_t)row * esz;
+                ek[k] = row;
+                kh = ray_hash_bytes(src, esz);
+            } else if (t == RAY_F64) {
+                int64_t kv;
+                memcpy(&kv, &((double*)key_data[k])[row], 8);
+                ek[k] = kv;
+                kh = ray_hash_f64(((double*)key_data[k])[row]);
+            } else {
+                int64_t kv = read_col_i64(key_data[k], row, t, key_attrs[k]);
+                ek[k] = kv;
+                kh = ray_hash_i64(kv);
+            }
+            h = (k == 0) ? kh : ray_hash_combine(h, kh);
+        }
+        ek[nk] = null_mask;
+        if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
+        *(uint64_t*)ebuf = h;
+
+        int64_t* ev = (int64_t*)(ebuf + 8 + ((size_t)nk + 1) * 8);
+        uint8_t vi = 0;
+        for (uint8_t a = 0; a < na; a++) {
+            ray_t* ac = agg_vecs[a];
+            if (!ac) continue;
+            if (agg_strlen && agg_strlen[a])
+                ev[vi] = group_strlen_at(ac, row);
+            else if (ac->type == RAY_F64)
+                memcpy(&ev[vi], &((double*)ray_data(ac))[row], 8);
+            else
+                ev[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
+            vi++;
+        }
+        if (has_fl)
+            memcpy(ebuf + ly->entry_stride - 8, &row, 8);
+
+        group_probe_existing_entry(ht, ebuf, key_types);
     }
 }
 
@@ -1945,9 +2108,11 @@ typedef struct {
     ray_t**      key_vecs;
     uint8_t      nullable_mask;   /* bit k = key k column may contain nulls */
     ray_t**       agg_vecs;
+    uint8_t*     agg_strlen;
     uint32_t     n_workers;
     radix_buf_t* bufs;        /* [n_workers * RADIX_P] */
     ght_layout_t layout;
+    ray_t* rowsel;
     /* When non-NULL, workers iterate match_idx[start..end) and
      * read row=match_idx[i].  When NULL, row=i. */
     const int64_t* match_idx;
@@ -1975,6 +2140,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
          * sub-100ms response time on Ctrl-C. */
         if (((i - start) & 65535) == 0 && ray_interrupted()) break;
         int64_t row = match_idx ? match_idx[i] : i;
+        if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, row)) continue;
         uint64_t h = 0;
         int64_t null_mask = 0;
         for (uint8_t k = 0; k < nk; k++) {
@@ -2009,7 +2175,9 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         for (uint8_t a = 0; a < na; a++) {
             ray_t* ac = c->agg_vecs[a];
             if (!ac) continue;
-            if (ac->type == RAY_F64)
+            if (c->agg_strlen && c->agg_strlen[a])
+                agg_vals[vi] = group_strlen_at(ac, row);
+            else if (ac->type == RAY_F64)
                 memcpy(&agg_vals[vi], &((double*)ray_data(ac))[row], 8);
             else
                 agg_vals[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
@@ -2268,6 +2436,7 @@ typedef struct {
     int64_t*    per_worker_max;  /* [n_workers] */
     uint32_t    n_workers;
     const int64_t* match_idx;    /* NULL = no selection */
+    ray_t*      rowsel;
 } minmax_ctx_t;
 
 static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -2282,6 +2451,7 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
             const TYPE* kd = (const TYPE*)c->key_data; \
             for (int64_t i = start; i < end; i++) { \
                 int64_t r = match_idx ? match_idx[i] : i; \
+                if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
                 int64_t v = (int64_t)CAST kd[r]; \
                 if (v < kmin) kmin = v; \
                 if (v > kmax) kmax = v; \
@@ -2513,6 +2683,8 @@ typedef struct {
     uint8_t        n_keys;
     void**         agg_ptrs;
     int8_t*        agg_types;
+    ray_t**        agg_cols;
+    uint8_t*       agg_strlen;
     uint16_t*      agg_ops;      /* per-agg operation code */
     uint8_t        n_aggs;
     uint8_t        need_flags;   /* DA_NEED_* bitmask */
@@ -2520,7 +2692,230 @@ typedef struct {
     bool           all_sum;      /* true when all ops are SUM/AVG/COUNT (no MIN/MAX/FIRST/LAST) */
     uint32_t       n_slots;
     const int64_t* match_idx;    /* NULL = no selection */
+    ray_t*         rowsel;
 } da_ctx_t;
+
+typedef struct {
+    uint8_t*   used;
+    int64_t*   keys;
+    int64_t*   counts;
+    da_val_t*  sums;
+    uint32_t   cap;
+    uint32_t   size;
+    ray_t*     _h_used;
+    ray_t*     _h_keys;
+    ray_t*     _h_counts;
+    ray_t*     _h_sums;
+} sparse_i64_ht_t;
+
+static inline uint64_t sparse_i64_mix(uint64_t x) {
+    x ^= x >> 30;
+    x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x *= UINT64_C(0x94d049bb133111eb);
+    x ^= x >> 31;
+    return x;
+}
+
+static inline uint32_t sparse_i64_pow2(uint32_t x) {
+    if (x <= 1) return 1;
+    x--;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return x + 1;
+}
+
+static void sparse_i64_free(sparse_i64_ht_t* ht) {
+    if (!ht) return;
+    scratch_free(ht->_h_used);
+    scratch_free(ht->_h_keys);
+    scratch_free(ht->_h_counts);
+    scratch_free(ht->_h_sums);
+    memset(ht, 0, sizeof(*ht));
+}
+
+static _Thread_local ray_group_emit_filter_t tl_group_emit_filter;
+
+ray_group_emit_filter_t ray_group_emit_filter_get(void) {
+    return tl_group_emit_filter;
+}
+
+void ray_group_emit_filter_set(ray_group_emit_filter_t filter) {
+    tl_group_emit_filter = filter;
+}
+
+static int64_t da_count_emit_keep_min(const int64_t* counts, uint32_t n_slots,
+                                      uint32_t group_count,
+                                      ray_group_emit_filter_t filter)
+{
+    int64_t keep_min = filter.min_count_exclusive + 1;
+    int64_t k_take = filter.top_count_take;
+    if (k_take <= 0 || k_take >= (int64_t)group_count)
+        return keep_min;
+
+    ray_t* heap_hdr = NULL;
+    int64_t* heap = (int64_t*)scratch_alloc(&heap_hdr,
+                                            (size_t)k_take * sizeof(int64_t));
+    if (!heap)
+        return keep_min;
+
+    int64_t heap_n = 0;
+    for (uint32_t s = 0; s < n_slots; s++) {
+        int64_t cnt = counts[s];
+        if (cnt <= 0)
+            continue;
+        if (heap_n < k_take) {
+            int64_t j = heap_n++;
+            heap[j] = cnt;
+            while (j > 0) {
+                int64_t p = (j - 1) >> 1;
+                if (heap[p] <= heap[j]) break;
+                int64_t tmp = heap[p]; heap[p] = heap[j]; heap[j] = tmp;
+                j = p;
+            }
+        } else if (cnt > heap[0]) {
+            heap[0] = cnt;
+            int64_t j = 0;
+            for (;;) {
+                int64_t l = j * 2 + 1, r = l + 1, m = j;
+                if (l < heap_n && heap[l] < heap[m]) m = l;
+                if (r < heap_n && heap[r] < heap[m]) m = r;
+                if (m == j) break;
+                int64_t tmp = heap[m]; heap[m] = heap[j]; heap[j] = tmp;
+                j = m;
+            }
+        }
+    }
+
+    if (heap_n == k_take && heap[0] > keep_min)
+        keep_min = heap[0];
+    scratch_free(heap_hdr);
+    return keep_min;
+}
+
+static int64_t da_count_emit_keep_min_u32(const uint32_t* counts,
+                                          uint64_t n_slots,
+                                          uint32_t group_count,
+                                          ray_group_emit_filter_t filter)
+{
+    int64_t keep_min = filter.min_count_exclusive + 1;
+    int64_t k_take = filter.top_count_take;
+    if (k_take <= 0 || k_take >= (int64_t)group_count)
+        return keep_min;
+
+    ray_t* heap_hdr = NULL;
+    int64_t* heap = (int64_t*)scratch_alloc(&heap_hdr,
+                                            (size_t)k_take * sizeof(int64_t));
+    if (!heap)
+        return keep_min;
+
+    int64_t heap_n = 0;
+    for (uint64_t s = 0; s < n_slots; s++) {
+        int64_t cnt = (int64_t)counts[s];
+        if (cnt <= 0)
+            continue;
+        if (heap_n < k_take) {
+            int64_t j = heap_n++;
+            heap[j] = cnt;
+            while (j > 0) {
+                int64_t p = (j - 1) >> 1;
+                if (heap[p] <= heap[j]) break;
+                int64_t tmp = heap[p]; heap[p] = heap[j]; heap[j] = tmp;
+                j = p;
+            }
+        } else if (cnt > heap[0]) {
+            heap[0] = cnt;
+            int64_t j = 0;
+            for (;;) {
+                int64_t l = j * 2 + 1, r = l + 1, m = j;
+                if (l < heap_n && heap[l] < heap[m]) m = l;
+                if (r < heap_n && heap[r] < heap[m]) m = r;
+                if (m == j) break;
+                int64_t tmp = heap[m]; heap[m] = heap[j]; heap[j] = tmp;
+                j = m;
+            }
+        }
+    }
+
+    if (heap_n == k_take && heap[0] > keep_min)
+        keep_min = heap[0];
+    scratch_free(heap_hdr);
+    return keep_min;
+}
+
+static bool sparse_i64_init(sparse_i64_ht_t* ht, uint32_t cap, uint8_t n_aggs,
+                            bool need_sum) {
+    memset(ht, 0, sizeof(*ht));
+    if (cap < 1024) cap = 1024;
+    cap = sparse_i64_pow2(cap);
+    ht->used = (uint8_t*)scratch_calloc(&ht->_h_used, cap);
+    ht->keys = (int64_t*)scratch_alloc(&ht->_h_keys, (size_t)cap * sizeof(int64_t));
+    ht->counts = (int64_t*)scratch_calloc(&ht->_h_counts,
+                                          (size_t)cap * sizeof(int64_t));
+    if (need_sum) {
+        ht->sums = (da_val_t*)scratch_calloc(&ht->_h_sums,
+            (size_t)cap * n_aggs * sizeof(da_val_t));
+    }
+    if (!ht->used || !ht->keys || !ht->counts || (need_sum && !ht->sums)) {
+        sparse_i64_free(ht);
+        return false;
+    }
+    ht->cap = cap;
+    return true;
+}
+
+static int32_t sparse_i64_find_slot(const sparse_i64_ht_t* ht, int64_t key) {
+    uint32_t mask = ht->cap - 1;
+    uint32_t pos = (uint32_t)sparse_i64_mix((uint64_t)key) & mask;
+    while (ht->used[pos] && ht->keys[pos] != key)
+        pos = (pos + 1) & mask;
+    return (int32_t)pos;
+}
+
+static bool sparse_i64_rehash(sparse_i64_ht_t* ht, uint8_t n_aggs,
+                              bool need_sum) {
+    sparse_i64_ht_t old = *ht;
+    sparse_i64_ht_t nw;
+    if (!sparse_i64_init(&nw, old.cap * 2u, n_aggs, need_sum))
+        return false;
+    for (uint32_t i = 0; i < old.cap; i++) {
+        if (!old.used[i]) continue;
+        int32_t s = sparse_i64_find_slot(&nw, old.keys[i]);
+        nw.used[s] = 1;
+        nw.keys[s] = old.keys[i];
+        nw.counts[s] = old.counts[i];
+        if (need_sum)
+            memcpy(&nw.sums[(size_t)s * n_aggs], &old.sums[(size_t)i * n_aggs],
+                   (size_t)n_aggs * sizeof(da_val_t));
+        nw.size++;
+    }
+    sparse_i64_free(&old);
+    *ht = nw;
+    return true;
+}
+
+static bool sparse_i64_touch(sparse_i64_ht_t* ht, int64_t key, uint8_t n_aggs,
+                             bool need_sum, int32_t* out_slot) {
+    if ((uint64_t)(ht->size + 1) * 10u >= (uint64_t)ht->cap * 7u) {
+        if (!sparse_i64_rehash(ht, n_aggs, need_sum))
+            return false;
+    }
+    int32_t s = sparse_i64_find_slot(ht, key);
+    if (!ht->used[s]) {
+        ht->used[s] = 1;
+        ht->keys[s] = key;
+        ht->counts[s] = 0;
+        if (need_sum)
+            memset(&ht->sums[(size_t)s * n_aggs], 0,
+                   (size_t)n_aggs * sizeof(da_val_t));
+        ht->size++;
+    }
+    *out_slot = s;
+    return true;
+}
 
 /* Composite GID from multi-key.  Arithmetic overflow is prevented in practice
  * by the DA budget check (DA_PER_WORKER_MAX) which limits total_slots to 262K. */
@@ -2558,6 +2953,57 @@ static inline void da_read_val(const void* ptr, int8_t type, uint8_t attrs,
         *out_i64 = read_col_i64(ptr, r, type, attrs);
         *out_f64 = (double)*out_i64;
     }
+}
+
+static inline int64_t group_strlen_at(const ray_t* col, int64_t row) {
+    if (!col || ray_vec_is_null((ray_t*)col, row)) return 0;
+    if (col->type == RAY_STR) {
+        const ray_str_t* elems;
+        const char* pool;
+        (void)pool;
+        str_resolve(col, &elems, &pool);
+        return (int64_t)elems[row].len;
+    }
+    const char* sp;
+    size_t sl;
+    (void)sp;
+    sym_elem(col, row, &sp, &sl);
+    return (int64_t)sl;
+}
+
+static inline int64_t group_strlen_at_cached(const ray_t* col, int64_t row,
+                                             ray_t** sym_strings,
+                                             uint32_t sym_count) {
+    if (!col || ray_vec_is_null((ray_t*)col, row)) return 0;
+    if (col->type == RAY_STR) {
+        const ray_str_t* elems;
+        const char* pool;
+        (void)pool;
+        str_resolve(col, &elems, &pool);
+        return (int64_t)elems[row].len;
+    }
+    if (col->type == RAY_SYM && sym_strings) {
+        int64_t sym_id = ray_read_sym(ray_data((ray_t*)col), row,
+                                      col->type, col->attrs);
+        if (sym_id < 0 || (uint64_t)sym_id >= sym_count) return 0;
+        ray_t* atom = sym_strings[sym_id];
+        return atom ? (int64_t)ray_str_len(atom) : 0;
+    }
+    return group_strlen_at(col, row);
+}
+
+static bool try_strlen_sumavg_input(ray_graph_t* g, ray_t* tbl,
+                                    ray_op_t* input_op, ray_t** out_vec) {
+    if (!g || !tbl || !input_op || !out_vec) return false;
+    if (input_op->opcode != OP_STRLEN || input_op->arity != 1 || !input_op->inputs[0])
+        return false;
+    ray_op_t* child = input_op->inputs[0];
+    ray_op_ext_t* child_ext = find_ext(g, child->id);
+    if (!child_ext || child_ext->base.opcode != OP_SCAN) return false;
+    ray_t* col = ray_table_get_col(tbl, child_ext->sym);
+    if (!col || (col->type != RAY_STR && col->type != RAY_SYM)) return false;
+    *out_vec = col;
+    return true;
 }
 
 /* Materialize a scalar (atom or len-1 vector) into a full-length vector so
@@ -2627,11 +3073,14 @@ static ray_t* materialize_broadcast_input(ray_t* src, int64_t nrows) {
 typedef struct {
     void**         agg_ptrs;
     int8_t*        agg_types;
+    ray_t**        agg_cols;
+    uint8_t*       agg_strlen;
     uint16_t*      agg_ops;
     agg_linear_t*  agg_linear;
     uint8_t        n_aggs;
     uint8_t        need_flags;
     const int64_t* match_idx;    /* NULL = no selection */
+    ray_t*         rowsel;
     /* per-worker accumulators (1 slot each) */
     da_accum_t*    accums;
     uint32_t       n_accums;
@@ -2706,7 +3155,12 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
             fv = (double)iv;
         } else {
             if (!c->agg_ptrs[a]) continue;
-            da_read_val(c->agg_ptrs[a], c->agg_types[a], 0, r, &fv, &iv);
+            if (c->agg_strlen && c->agg_strlen[a]) {
+                iv = group_strlen_at(c->agg_cols[a], r);
+                fv = (double)iv;
+            } else {
+                da_read_val(c->agg_ptrs[a], c->agg_types[a], 0, r, &fv, &iv);
+            }
         }
         uint16_t op = c->agg_ops[a];
         bool is_f = (c->agg_types[a] == RAY_F64);
@@ -2745,6 +3199,7 @@ static void scalar_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
 
     for (int64_t i = start; i < end; i++) {
         int64_t r = match_idx ? match_idx[i] : i;
+        if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue;
         scalar_accum_row(c, acc, r);
     }
 }
@@ -2766,7 +3221,9 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
         for (uint8_t a = 0; a < n_aggs; a++) {
             if (!c->agg_ptrs[a]) continue;
             size_t idx = base + a;
-            if (f64m & (1u << a))
+            if (c->agg_strlen && c->agg_strlen[a])
+                acc->sum[idx].i += group_strlen_at(c->agg_cols[a], r);
+            else if (f64m & (1u << a))
                 acc->sum[idx].f += ((const double*)c->agg_ptrs[a])[r];
             else
                 acc->sum[idx].i += read_col_i64(c->agg_ptrs[a], r,
@@ -2787,7 +3244,12 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
         if (!c->agg_ptrs[a]) continue;
         size_t idx = base + a;
         double fv; int64_t iv;
-        da_read_val(c->agg_ptrs[a], c->agg_types[a], 0, r, &fv, &iv);
+        if (c->agg_strlen && c->agg_strlen[a]) {
+            iv = group_strlen_at(c->agg_cols[a], r);
+            fv = (double)iv;
+        } else {
+            da_read_val(c->agg_ptrs[a], c->agg_types[a], 0, r, &fv, &iv);
+        }
         uint16_t op = c->agg_ops[a];
         if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
             if (c->agg_types[a] == RAY_F64) acc->sum[idx].f += fv;
@@ -2849,6 +3311,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
         bool da_pf = c->n_slots >= 4096; \
         for (int64_t i = start; i < end; i++) { \
             int64_t r = match_idx ? match_idx[i] : i; \
+            if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
             if (da_pf && RAY_LIKELY(i + DA_PF_DIST < end)) { \
                 int64_t pf_r = match_idx ? match_idx[i + DA_PF_DIST] : (i + DA_PF_DIST); \
                 int64_t pfk = (int64_t)KCAST kp[pf_r]; \
@@ -2879,6 +3342,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
         bool _da_pf = c->n_slots >= 4096; \
         for (int64_t i = start; i < end; i++) { \
             int64_t r = match_idx ? match_idx[i] : i; \
+            if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
             if (_da_pf && RAY_LIKELY(i + DA_PF_DIST < end)) { \
                 int64_t pf_r = match_idx ? match_idx[i + DA_PF_DIST] : (i + DA_PF_DIST); \
                 int32_t pf_gid = GID_FN(pf_r); \
@@ -3051,7 +3515,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
      * - All keys and agg inputs must be simple SCANs
      * - Supported agg ops: SUM, COUNT, MIN, MAX, AVG, FIRST, LAST,
      *   STDDEV, STDDEV_POP, VAR, VAR_POP */
-    int can_partition = 1;
+    int can_partition = g->selection ? 0 : 1;
     int has_avg = 0;
     int has_stddev = 0;
     int64_t key_syms[8];
@@ -3284,12 +3748,6 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         for (int64_t c = 0; c < nc; c++) {
             ray_t* col = ray_table_get_col_idx(tbl, c);
             if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
-                /* exec_group_parted has no rowsel plumbing — a
-                 * selection in flight would be silently ignored.
-                 * Reject rather than produce unfiltered results. */
-                if (g->selection)
-                    return ray_error("nyi",
-                        "GROUP BY with selection on parted table");
                 return exec_group_parted(g, op, tbl, group_limit);
             }
         }
@@ -3428,23 +3886,15 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
     if (n_keys > 8 || n_aggs > 8) return ray_error("nyi", NULL);
 
-    /* Extract selection (rowsel) for pushdown.  Workers iterate over
-     * [0, n_scan) and read row=match_idx[i].  When no selection is
-     * present, match_idx is NULL and n_scan equals nrows.  The
-     * match_idx_block must be released on every exec_group exit
-     * path — see the various `goto cleanup` and early returns below.
-     *
-     * The top-of-function guard already rejected nrows mismatches,
-     * so if we reach here with a selection it's guaranteed valid
-     * for `tbl`. */
+    /* Extract selection (rowsel) for pushdown.  Prefer streaming the
+     * morsel-local rowsel directly; flattening to int64 indices is kept
+     * only as a fallback for callers that still pass match_idx. */
     ray_t* match_idx_block = NULL;
     const int64_t* match_idx = NULL;
+    ray_t* rowsel = NULL;
     int64_t n_scan = nrows;
     if (g->selection) {
-        match_idx_block = ray_rowsel_to_indices(g->selection);
-        if (!match_idx_block) return ray_error("oom", NULL);
-        match_idx = (const int64_t*)ray_data(match_idx_block);
-        n_scan = ray_rowsel_meta(g->selection)->total_pass;
+        rowsel = g->selection;
     }
 
     /* Resolve key columns (VLA — n_keys ≤ 8; use ≥1 to avoid zero-size VLA UB) */
@@ -3481,10 +3931,12 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     uint8_t vla_aggs = n_aggs > 0 ? n_aggs : 1;
     ray_t* agg_vecs[vla_aggs];
     uint8_t agg_owned[vla_aggs]; /* 1 = we allocated via exec_node, must free */
+    uint8_t agg_strlen[vla_aggs];
     agg_affine_t agg_affine[vla_aggs];
     agg_linear_t agg_linear[vla_aggs];
     memset(agg_vecs, 0, vla_aggs * sizeof(ray_t*));
     memset(agg_owned, 0, vla_aggs * sizeof(uint8_t));
+    memset(agg_strlen, 0, vla_aggs * sizeof(uint8_t));
     memset(agg_affine, 0, vla_aggs * sizeof(agg_affine_t));
     memset(agg_linear, 0, vla_aggs * sizeof(agg_linear_t));
 
@@ -3496,6 +3948,12 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         uint16_t agg_kind = ext->agg_ops[a];
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
             try_affine_sumavg_input(g, tbl, agg_input_op, &agg_vecs[a], &agg_affine[a])) {
+            continue;
+        }
+
+        if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
+            try_strlen_sumavg_input(g, tbl, agg_input_op, &agg_vecs[a])) {
+            agg_strlen[a] = 1;
             continue;
         }
 
@@ -3540,6 +3998,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     for (uint8_t a = 0; a < n_aggs; a++) {
         if (!agg_vecs[a] || RAY_IS_ERR(agg_vecs[a])) continue;
         if (ext->agg_ops[a] == OP_COUNT) continue; /* value is ignored for COUNT */
+        if (agg_strlen[a]) continue;
 
         bool needs_broadcast = ray_is_atom(agg_vecs[a]) ||
                                (agg_vecs[a]->type > 0 && agg_vecs[a]->len == 1 && nrows > 1);
@@ -3576,6 +4035,10 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             key_attrs[k] = 0;
         }
     }
+    ray_group_emit_filter_t emit_filter = ray_group_emit_filter_get();
+    bool use_emit_filter = emit_filter.enabled &&
+        emit_filter.agg_index < n_aggs &&
+        ext->agg_ops[emit_filter.agg_index] == OP_COUNT;
 
     /* ---- Scalar aggregate fast path (n_keys == 0): flat vector scan ---- */
     if (n_keys == 0 && nrows > 0) {
@@ -3665,11 +4128,14 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         scalar_ctx_t sc_ctx = {
             .agg_ptrs   = agg_ptrs,
             .agg_types  = agg_types,
+            .agg_cols   = agg_vecs,
+            .agg_strlen = agg_strlen,
             .agg_ops    = ext->agg_ops,
             .agg_linear = agg_linear,
             .n_aggs     = n_aggs,
             .need_flags = need_flags,
             .match_idx  = match_idx,
+            .rowsel     = rowsel,
             .accums     = sc_acc,
             .n_accums   = sc_n,
         };
@@ -3680,7 +4146,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * safe when no selection is in flight. */
         typedef void (*scalar_fn_t)(void*, uint32_t, int64_t, int64_t);
         scalar_fn_t sc_fn = scalar_accum_fn;
-        if (n_aggs == 1 && !match_idx && agg_ptrs[0] != NULL) {
+        if (n_aggs == 1 && !match_idx && !rowsel && agg_ptrs[0] != NULL) {
             uint16_t op0 = ext->agg_ops[0];
             int8_t   t0  = agg_types[0];
             if ((op0 == OP_SUM || op0 == OP_AVG) &&
@@ -3688,7 +4154,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 sc_fn = scalar_sum_i64_fn;
             else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_F64)
                 sc_fn = scalar_sum_f64_fn;
-        } else if (n_aggs == 1 && !match_idx && agg_linear[0].enabled) {
+        } else if (n_aggs == 1 && !match_idx && !rowsel && agg_linear[0].enabled) {
             uint16_t op0 = ext->agg_ops[0];
             if (op0 == OP_SUM || op0 == OP_AVG)
                 sc_fn = scalar_sum_linear_i64_fn;
@@ -3837,6 +4303,7 @@ da_path:;
                     .per_worker_max = mm_maxs,
                     .n_workers      = mm_n,
                     .match_idx      = match_idx,
+                    .rowsel         = rowsel,
                 };
                 if (mm_n > 1) {
                     ray_pool_dispatch(mm_pool, minmax_scan_fn, &mm_ctx, n_scan);
@@ -4032,6 +4499,8 @@ da_path:;
                 .n_keys      = n_keys,
                 .agg_ptrs    = agg_ptrs,
                 .agg_types   = agg_types,
+                .agg_cols    = agg_vecs,
+                .agg_strlen  = agg_strlen,
                 .agg_ops     = ext->agg_ops,
                 .n_aggs      = n_aggs,
                 .need_flags  = need_flags,
@@ -4039,6 +4508,7 @@ da_path:;
                 .all_sum     = all_sum,
                 .n_slots     = n_slots,
                 .match_idx   = match_idx,
+                .rowsel      = rowsel,
             };
 
             if (da_n_workers > 1)
@@ -4214,9 +4684,17 @@ da_path:;
             double*   da_sumsq   = merged->sumsq_f64; /* may be NULL if !DA_NEED_SUMSQ */
             int64_t*  da_count   = merged->count;
 
+            uint32_t all_grp_count = 0;
+            for (uint32_t s = 0; s < n_slots; s++)
+                if (da_count[s] > 0) all_grp_count++;
+
+            int64_t da_keep_min = use_emit_filter
+                ? da_count_emit_keep_min(da_count, n_slots, all_grp_count, emit_filter)
+                : 1;
+
             uint32_t grp_count = 0;
             for (uint32_t s = 0; s < n_slots; s++)
-                if (da_count[s] > 0) grp_count++;
+                if (da_count[s] >= da_keep_min) grp_count++;
 
             int64_t total_cols = n_keys + n_aggs;
             ray_t* result = ray_table_new(total_cols);
@@ -4239,7 +4717,7 @@ da_path:;
                 key_col->len = (int64_t)grp_count;
                 uint32_t gi = 0;
                 for (uint32_t s = 0; s < n_slots; s++) {
-                    if (da_count[s] == 0) continue;
+                    if (da_count[s] < da_keep_min) continue;
                     int64_t offset = ((int64_t)s / da_key_stride[k]) % da_key_range[k];
                     int64_t key_val = da_key_min[k] + offset;
                     write_col_i64(ray_data(key_col), gi, key_val, src_col->type, key_col->attrs);
@@ -4259,11 +4737,13 @@ da_path:;
             da_val_t* dense_min_val = da_min_val ? (da_val_t*)scratch_alloc(&_h_dmin, dense_total * sizeof(da_val_t)) : NULL;
             da_val_t* dense_max_val = da_max_val ? (da_val_t*)scratch_alloc(&_h_dmax, dense_total * sizeof(da_val_t)) : NULL;
             double*   dense_sumsq   = da_sumsq   ? (double*)scratch_alloc(&_h_dsq, dense_total * sizeof(double)) : NULL;
-            int64_t*  dense_counts  = (int64_t*)scratch_alloc(&_h_dcnt, grp_count * sizeof(int64_t));
+            int64_t*  dense_counts  = grp_count
+                ? (int64_t*)scratch_alloc(&_h_dcnt, grp_count * sizeof(int64_t))
+                : NULL;
 
             uint32_t gi = 0;
             for (uint32_t s = 0; s < n_slots; s++) {
-                if (da_count[s] == 0) continue;
+                if (da_count[s] < da_keep_min) continue;
                 dense_counts[gi] = da_count[s];
                 for (uint8_t a = 0; a < n_aggs; a++) {
                     size_t si = (size_t)s * n_aggs + a;
@@ -4287,6 +4767,724 @@ da_path:;
             scratch_free(_h_dsq); scratch_free(_h_dcnt);
 
             da_accum_free(&accums[0]); scratch_free(accums_hdr);
+            for (uint8_t a = 0; a < n_aggs; a++)
+                if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+            for (uint8_t k = 0; k < n_keys; k++)
+                if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+            if (match_idx_block) ray_release(match_idx_block);
+            return result;
+        }
+    }
+
+    {
+        bool sp_eligible = (nrows > 0 && n_keys == 1 && key_data[0] != NULL);
+        int8_t kt = sp_eligible ? key_types[0] : 0;
+        if (sp_eligible && kt != RAY_I64 && kt != RAY_I32 && kt != RAY_I16 &&
+            kt != RAY_U8 && kt != RAY_BOOL && kt != RAY_DATE &&
+            kt != RAY_TIME && kt != RAY_TIMESTAMP && kt != RAY_SYM)
+            sp_eligible = false;
+        if (sp_eligible && key_vecs[0]) {
+            ray_t* src = (key_vecs[0]->attrs & RAY_ATTR_SLICE)
+                         ? key_vecs[0]->slice_parent : key_vecs[0];
+            if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
+                sp_eligible = false;
+        }
+        bool sp_need_sum = false;
+        for (uint8_t a = 0; a < n_aggs && sp_eligible; a++) {
+            uint16_t op = ext->agg_ops[a];
+            if (op == OP_COUNT) continue;
+            if (op != OP_SUM && op != OP_AVG)
+                sp_eligible = false;
+            else
+                sp_need_sum = true;
+        }
+
+        if (sp_eligible) {
+            void* agg_ptrs[vla_aggs];
+            int8_t agg_types[vla_aggs];
+            uint32_t agg_f64_mask = 0;
+            for (uint8_t a = 0; a < n_aggs; a++) {
+                if (agg_vecs[a]) {
+                    agg_ptrs[a] = ray_data(agg_vecs[a]);
+                    agg_types[a] = agg_vecs[a]->type;
+                    if (agg_vecs[a]->type == RAY_F64)
+                        agg_f64_mask |= (1u << a);
+                } else {
+                    agg_ptrs[a] = NULL;
+                    agg_types[a] = 0;
+                }
+            }
+            ray_t** strlen_sym_strings = NULL;
+            uint32_t strlen_sym_count = 0;
+            for (uint8_t a = 0; a < n_aggs; a++) {
+                if (agg_strlen[a] && agg_vecs[a] &&
+                    agg_vecs[a]->type == RAY_SYM) {
+                    ray_sym_strings_borrow(&strlen_sym_strings,
+                                           &strlen_sym_count);
+                    break;
+                }
+            }
+
+            uint8_t key_esz = ray_sym_elem_size(key_types[0], key_attrs[0]);
+
+            if (use_emit_filter &&
+                (emit_filter.min_count_exclusive > 0 ||
+                 emit_filter.top_count_take > 0) &&
+                n_scan <= UINT32_MAX) {
+                uint64_t cap = 1u << 20;
+                const uint64_t max_dense_cap = 1u << 24;
+                bool count_only_first = (key_types[0] == RAY_SYM);
+                ray_t *cnt_hdr = NULL, *range_sum_hdr = NULL;
+                uint32_t* range_count = (uint32_t*)scratch_calloc(
+                    &cnt_hdr, (size_t)cap * sizeof(uint32_t));
+                da_val_t* range_sum = NULL;
+                bool dyn_ok = range_count != NULL;
+                if (dyn_ok && sp_need_sum && !count_only_first) {
+                    range_sum = (da_val_t*)scratch_calloc(
+                        &range_sum_hdr,
+                        (size_t)cap * n_aggs * sizeof(da_val_t));
+                    dyn_ok = range_sum != NULL;
+                }
+
+	                uint64_t max_seen = 0;
+	                bool have_dyn_key = false;
+#define DYN_DENSE_ACCUM_ROW(row_expr)                                            \
+    do {                                                                         \
+        int64_t dyn_row = (row_expr);                                            \
+        int64_t key = read_by_esz(key_data[0], dyn_row, key_esz);                \
+        if (key < 0 || (uint64_t)key >= max_dense_cap) {                         \
+            dyn_ok = false;                                                      \
+            goto dyn_dense_done;                                                 \
+        }                                                                        \
+        uint64_t off = (uint64_t)key;                                            \
+        if (off >= cap) {                                                        \
+            uint64_t old_cap = cap;                                              \
+            while (off >= cap) cap <<= 1;                                        \
+            uint32_t* new_count = (uint32_t*)scratch_realloc(                    \
+                &cnt_hdr, (size_t)old_cap * sizeof(uint32_t),                    \
+                (size_t)cap * sizeof(uint32_t));                                 \
+            if (!new_count) {                                                    \
+                dyn_ok = false;                                                  \
+                goto dyn_dense_done;                                             \
+            }                                                                    \
+            range_count = new_count;                                             \
+            memset(range_count + old_cap, 0,                                     \
+                   (size_t)(cap - old_cap) * sizeof(uint32_t));                  \
+            if (sp_need_sum && !count_only_first) {                              \
+                da_val_t* new_sum = (da_val_t*)scratch_realloc(                  \
+                    &range_sum_hdr,                                              \
+                    (size_t)old_cap * n_aggs * sizeof(da_val_t),                 \
+                    (size_t)cap * n_aggs * sizeof(da_val_t));                    \
+                if (!new_sum) {                                                  \
+                    dyn_ok = false;                                              \
+                    goto dyn_dense_done;                                         \
+                }                                                                \
+                range_sum = new_sum;                                             \
+                memset(range_sum + (size_t)old_cap * n_aggs, 0,                 \
+                       (size_t)(cap - old_cap) * n_aggs * sizeof(da_val_t));     \
+            }                                                                    \
+        }                                                                        \
+        have_dyn_key = true;                                                     \
+        if (off > max_seen) max_seen = off;                                      \
+        if (range_count[off] != UINT32_MAX) range_count[off]++;                  \
+        if (range_sum) {                                                         \
+            da_val_t* sums = &range_sum[(size_t)off * n_aggs];                   \
+            for (uint8_t a = 0; a < n_aggs; a++) {                               \
+                if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;       \
+                if (agg_strlen[a])                                               \
+                    sums[a].i += group_strlen_at_cached(                         \
+                        agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
+                else if (agg_f64_mask & (1u << a))                               \
+                    sums[a].f += ((const double*)agg_ptrs[a])[dyn_row];          \
+                else                                                             \
+                    sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0); \
+            }                                                                    \
+        }                                                                        \
+    } while (0)
+
+	                if (dyn_ok && match_idx) {
+	                    for (int64_t i = 0; i < n_scan; i++)
+	                        DYN_DENSE_ACCUM_ROW(match_idx[i]);
+	                } else if (dyn_ok && rowsel) {
+	                    ray_rowsel_t* m = ray_rowsel_meta(rowsel);
+	                    const uint8_t* flags = ray_rowsel_flags(rowsel);
+	                    const uint32_t* offs = ray_rowsel_offsets(rowsel);
+	                    const uint16_t* idx = ray_rowsel_idx(rowsel);
+	                    uint32_t nseg = (uint32_t)((m->nrows + RAY_MORSEL_ELEMS - 1) /
+	                                              RAY_MORSEL_ELEMS);
+	                    for (uint32_t seg = 0; seg < nseg; seg++) {
+	                        int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
+	                        if (flags[seg] == RAY_SEL_NONE) continue;
+	                        if (flags[seg] == RAY_SEL_ALL) {
+	                            int64_t end = base + RAY_MORSEL_ELEMS;
+	                            if (end > m->nrows) end = m->nrows;
+	                            for (int64_t r = base; r < end; r++)
+	                                DYN_DENSE_ACCUM_ROW(r);
+	                        } else {
+	                            for (uint32_t p = offs[seg]; p < offs[seg + 1]; p++)
+	                                DYN_DENSE_ACCUM_ROW(base + idx[p]);
+	                        }
+	                    }
+	                } else if (dyn_ok) {
+	                    for (int64_t r = 0; r < n_scan; r++)
+	                        DYN_DENSE_ACCUM_ROW(r);
+	                }
+dyn_dense_done:
+#undef DYN_DENSE_ACCUM_ROW
+
+	                if (dyn_ok && have_dyn_key) {
+                    uint32_t total_groups = 0;
+                    for (uint64_t off = 0; off <= max_seen; off++)
+                        if (range_count[off] > 0)
+                            total_groups++;
+                    int64_t keep_min = da_count_emit_keep_min_u32(
+                        range_count, max_seen + 1, total_groups, emit_filter);
+                    uint32_t grp_count = 0;
+                    for (uint64_t off = 0; off <= max_seen; off++)
+                        if ((int64_t)range_count[off] >= keep_min)
+                            grp_count++;
+
+                    ray_t* result = ray_table_new((int64_t)n_keys + n_aggs);
+                    if (!result || RAY_IS_ERR(result)) {
+                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                        for (uint8_t a = 0; a < n_aggs; a++)
+                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                        for (uint8_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) ray_release(match_idx_block);
+                        return result ? result : ray_error("oom", NULL);
+                    }
+
+                    ray_t* key_col = col_vec_new(key_vecs[0], (int64_t)grp_count);
+                    if (!key_col || RAY_IS_ERR(key_col)) {
+                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                        ray_release(result);
+                        for (uint8_t a = 0; a < n_aggs; a++)
+                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                        for (uint8_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) ray_release(match_idx_block);
+                        return key_col ? key_col : ray_error("oom", NULL);
+                    }
+                    key_col->len = (int64_t)grp_count;
+
+                    ray_t *_h_sum = NULL, *_h_cnt = NULL;
+                    da_val_t* dense_sum = sp_need_sum
+                        ? (da_val_t*)scratch_alloc(&_h_sum,
+                            (size_t)grp_count * n_aggs * sizeof(da_val_t))
+                        : NULL;
+                    int64_t* dense_count = (int64_t*)scratch_alloc(
+                        &_h_cnt, (size_t)grp_count * sizeof(int64_t));
+                    if ((sp_need_sum && !dense_sum) || !dense_count) {
+                        scratch_free(_h_sum); scratch_free(_h_cnt);
+                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                        ray_release(key_col); ray_release(result);
+                        for (uint8_t a = 0; a < n_aggs; a++)
+                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                        for (uint8_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) ray_release(match_idx_block);
+                        return ray_error("oom", NULL);
+                    }
+                    if (sp_need_sum && !range_sum)
+                        memset(dense_sum, 0,
+                               (size_t)grp_count * n_aggs * sizeof(da_val_t));
+
+                    uint32_t gi = 0;
+                    for (uint64_t off = 0; off <= max_seen; off++) {
+                        uint32_t cnt = range_count[off];
+                        if ((int64_t)cnt < keep_min) {
+                            if (!range_sum) range_count[off] = 0;
+                            continue;
+                        }
+                        write_col_i64(ray_data(key_col), gi, (int64_t)off,
+                                      key_col->type, key_col->attrs);
+                        dense_count[gi] = (int64_t)cnt;
+                        if (range_sum) {
+                            memcpy(&dense_sum[(size_t)gi * n_aggs],
+                                   &range_sum[(size_t)off * n_aggs],
+                                   (size_t)n_aggs * sizeof(da_val_t));
+                        }
+                        if (!range_sum) range_count[off] = gi + 1u;
+                        gi++;
+                    }
+
+                    if (sp_need_sum && !range_sum) {
+#define DYN_DENSE_SUM_ROW(row_expr)                                              \
+    do {                                                                         \
+        int64_t dyn_row = (row_expr);                                            \
+        int64_t key = read_by_esz(key_data[0], dyn_row, key_esz);                \
+        if (key < 0 || (uint64_t)key > max_seen) break;                          \
+        uint32_t marker = range_count[(uint64_t)key];                            \
+        if (!marker) break;                                                      \
+        da_val_t* sums = &dense_sum[(size_t)(marker - 1u) * n_aggs];             \
+        for (uint8_t a = 0; a < n_aggs; a++) {                                   \
+            if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;           \
+            if (agg_strlen[a])                                                   \
+                sums[a].i += group_strlen_at_cached(                             \
+                    agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
+            else if (agg_f64_mask & (1u << a))                                   \
+                sums[a].f += ((const double*)agg_ptrs[a])[dyn_row];              \
+            else                                                                 \
+                sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0);\
+        }                                                                        \
+    } while (0)
+                        if (match_idx) {
+                            for (int64_t i = 0; i < n_scan; i++)
+                                DYN_DENSE_SUM_ROW(match_idx[i]);
+                        } else if (rowsel) {
+                            ray_rowsel_t* m = ray_rowsel_meta(rowsel);
+                            const uint8_t* flags = ray_rowsel_flags(rowsel);
+                            const uint32_t* offs = ray_rowsel_offsets(rowsel);
+                            const uint16_t* idx = ray_rowsel_idx(rowsel);
+                            uint32_t nseg = (uint32_t)((m->nrows + RAY_MORSEL_ELEMS - 1) /
+                                                      RAY_MORSEL_ELEMS);
+                            for (uint32_t seg = 0; seg < nseg; seg++) {
+                                int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
+                                if (flags[seg] == RAY_SEL_NONE) continue;
+                                if (flags[seg] == RAY_SEL_ALL) {
+                                    int64_t end = base + RAY_MORSEL_ELEMS;
+                                    if (end > m->nrows) end = m->nrows;
+                                    for (int64_t r = base; r < end; r++)
+                                        DYN_DENSE_SUM_ROW(r);
+                                } else {
+                                    for (uint32_t p = offs[seg]; p < offs[seg + 1]; p++)
+                                        DYN_DENSE_SUM_ROW(base + idx[p]);
+                                }
+                            }
+                        } else {
+                            for (int64_t r = 0; r < n_scan; r++)
+                                DYN_DENSE_SUM_ROW(r);
+                        }
+#undef DYN_DENSE_SUM_ROW
+                    }
+
+                    ray_op_ext_t* key_ext = find_ext(g, ext->keys[0]->id);
+                    int64_t name_id = key_ext ? key_ext->sym : 0;
+                    result = ray_table_add_col(result, name_id, key_col);
+                    ray_release(key_col);
+                    emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
+                                     (double*)dense_sum, (int64_t*)dense_sum,
+                                     NULL, NULL, NULL, NULL,
+                                     dense_count, agg_affine, NULL);
+
+                    scratch_free(_h_sum); scratch_free(_h_cnt);
+                    scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                    for (uint8_t a = 0; a < n_aggs; a++)
+                        if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                    for (uint8_t k = 0; k < n_keys; k++)
+                        if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                    if (match_idx_block) ray_release(match_idx_block);
+                    return result;
+                }
+
+                scratch_free(range_sum_hdr);
+                scratch_free(cnt_hdr);
+            }
+
+            if (use_emit_filter &&
+                (emit_filter.min_count_exclusive > 0 ||
+                 emit_filter.top_count_take > 0) &&
+                key_types[0] != RAY_SYM && n_scan <= UINT32_MAX) {
+                bool have_key = false;
+                int64_t min_key = 0, max_key = 0;
+                for (int64_t i = 0; i < n_scan; i++) {
+                    int64_t r = match_idx ? match_idx[i] : i;
+                    if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
+                        continue;
+                    int64_t key = read_by_esz(key_data[0], r, key_esz);
+                    if (!have_key) {
+                        min_key = max_key = key;
+                        have_key = true;
+                    } else {
+                        if (key < min_key) min_key = key;
+                        if (key > max_key) max_key = key;
+                    }
+                }
+
+                uint64_t key_range = have_key
+                    ? (uint64_t)((uint64_t)max_key - (uint64_t)min_key + 1u)
+                    : 0u;
+                if (have_key && key_range > 0 && key_range <= (1u << 26)) {
+                    ray_t *cnt_hdr = NULL, *range_sum_hdr = NULL;
+                    ray_t *_h_sum = NULL, *_h_cnt = NULL;
+                    uint32_t* range_count = (uint32_t*)scratch_calloc(
+                        &cnt_hdr, (size_t)key_range * sizeof(uint32_t));
+                    if (!range_count)
+                        goto ht_path;
+                    da_val_t* range_sum = NULL;
+                    if (sp_need_sum && key_range <= (1u << 24)) {
+                        range_sum = (da_val_t*)scratch_calloc(
+                            &range_sum_hdr,
+                            (size_t)key_range * n_aggs * sizeof(da_val_t));
+                        if (!range_sum) {
+                            scratch_free(cnt_hdr);
+                            goto ht_path;
+                        }
+                    }
+
+                    for (int64_t i = 0; i < n_scan; i++) {
+                        int64_t r = match_idx ? match_idx[i] : i;
+                        if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
+                            continue;
+                        int64_t key = read_by_esz(key_data[0], r, key_esz);
+                        uint64_t off = (uint64_t)((uint64_t)key - (uint64_t)min_key);
+                        if (range_count[off] != UINT32_MAX)
+                            range_count[off]++;
+                        if (range_sum) {
+                            da_val_t* sums = &range_sum[(size_t)off * n_aggs];
+                            for (uint8_t a = 0; a < n_aggs; a++) {
+                                if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
+                                    continue;
+                                if (agg_strlen[a])
+                                    sums[a].i += group_strlen_at_cached(
+                                        agg_vecs[a], r, strlen_sym_strings,
+                                        strlen_sym_count);
+                                else if (agg_f64_mask & (1u << a))
+                                    sums[a].f += ((const double*)agg_ptrs[a])[r];
+                                else
+                                    sums[a].i += read_col_i64(agg_ptrs[a], r,
+                                                              agg_types[a], 0);
+                            }
+                        }
+                    }
+
+                    uint32_t total_groups = 0;
+                    for (uint64_t off = 0; off < key_range; off++) {
+                        if (range_count[off] > 0)
+                            total_groups++;
+                    }
+                    int64_t keep_min = da_count_emit_keep_min_u32(
+                        range_count, key_range, total_groups, emit_filter);
+                    uint32_t grp_count = 0;
+                    for (uint64_t off = 0; off < key_range; off++) {
+                        if ((int64_t)range_count[off] >= keep_min)
+                            grp_count++;
+                    }
+
+                    ray_t* result = ray_table_new((int64_t)n_keys + n_aggs);
+                    if (!result || RAY_IS_ERR(result)) {
+                        scratch_free(range_sum_hdr);
+                        scratch_free(cnt_hdr);
+                        for (uint8_t a = 0; a < n_aggs; a++)
+                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                        for (uint8_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) ray_release(match_idx_block);
+                        return result ? result : ray_error("oom", NULL);
+                    }
+
+                    ray_t* key_col = col_vec_new(key_vecs[0], (int64_t)grp_count);
+                    if (!key_col || RAY_IS_ERR(key_col)) {
+                        scratch_free(range_sum_hdr);
+                        scratch_free(cnt_hdr);
+                        ray_release(result);
+                        for (uint8_t a = 0; a < n_aggs; a++)
+                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                        for (uint8_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) ray_release(match_idx_block);
+                        return key_col ? key_col : ray_error("oom", NULL);
+                    }
+                    key_col->len = (int64_t)grp_count;
+
+                    da_val_t* dense_sum = sp_need_sum
+                        ? (da_val_t*)scratch_calloc(&_h_sum,
+                            (size_t)grp_count * n_aggs * sizeof(da_val_t))
+                        : NULL;
+                    int64_t* dense_count = (int64_t*)scratch_alloc(
+                        &_h_cnt, (size_t)grp_count * sizeof(int64_t));
+                    if ((sp_need_sum && !dense_sum) || !dense_count) {
+                        scratch_free(_h_sum); scratch_free(_h_cnt);
+                        scratch_free(range_sum_hdr);
+                        scratch_free(cnt_hdr);
+                        ray_release(key_col); ray_release(result);
+                        for (uint8_t a = 0; a < n_aggs; a++)
+                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                        for (uint8_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) ray_release(match_idx_block);
+                        return ray_error("oom", NULL);
+                    }
+
+                    uint32_t gi = 0;
+                    for (uint64_t off = 0; off < key_range; off++) {
+                        uint32_t cnt = range_count[off];
+                        if ((int64_t)cnt < keep_min) {
+                            range_count[off] = 0;
+                            continue;
+                        }
+                        int64_t key = (int64_t)((uint64_t)min_key + off);
+                        write_col_i64(ray_data(key_col), gi, key,
+                                      key_col->type, key_col->attrs);
+                        dense_count[gi] = (int64_t)cnt;
+                        if (range_sum) {
+                            memcpy(&dense_sum[(size_t)gi * n_aggs],
+                                   &range_sum[(size_t)off * n_aggs],
+                                   (size_t)n_aggs * sizeof(da_val_t));
+                        }
+                        range_count[off] = gi + 1u;
+                        gi++;
+                    }
+
+                    if (sp_need_sum && !range_sum) {
+                        for (int64_t i = 0; i < n_scan; i++) {
+                            int64_t r = match_idx ? match_idx[i] : i;
+                            if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
+                                continue;
+                            int64_t key = read_by_esz(key_data[0], r, key_esz);
+                            uint64_t off = (uint64_t)((uint64_t)key - (uint64_t)min_key);
+                            uint32_t marker = range_count[off];
+                            if (!marker) continue;
+                            da_val_t* sums = &dense_sum[(size_t)(marker - 1u) * n_aggs];
+                            for (uint8_t a = 0; a < n_aggs; a++) {
+                                if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
+                                    continue;
+                                if (agg_strlen[a])
+                                    sums[a].i += group_strlen_at_cached(
+                                        agg_vecs[a], r, strlen_sym_strings,
+                                        strlen_sym_count);
+                                else if (agg_f64_mask & (1u << a))
+                                    sums[a].f += ((const double*)agg_ptrs[a])[r];
+                                else
+                                    sums[a].i += read_col_i64(agg_ptrs[a], r,
+                                                              agg_types[a], 0);
+                            }
+                        }
+                    }
+
+                    scratch_free(range_sum_hdr);
+                    scratch_free(cnt_hdr);
+                    ray_op_ext_t* key_ext = find_ext(g, ext->keys[0]->id);
+                    int64_t name_id = key_ext ? key_ext->sym : 0;
+                    result = ray_table_add_col(result, name_id, key_col);
+                    ray_release(key_col);
+
+                    emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
+                                     (double*)dense_sum, (int64_t*)dense_sum,
+                                     NULL, NULL, NULL, NULL,
+                                     dense_count, agg_affine, NULL);
+
+                    scratch_free(_h_sum);
+                    scratch_free(_h_cnt);
+                    for (uint8_t a = 0; a < n_aggs; a++)
+                        if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                    for (uint8_t k = 0; k < n_keys; k++)
+                        if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                    if (match_idx_block) ray_release(match_idx_block);
+                    return result;
+                }
+            }
+
+            sparse_i64_ht_t sp_ht;
+            memset(&sp_ht, 0, sizeof(sp_ht));
+            bool sp_ok = true;
+
+            if (use_emit_filter &&
+                (emit_filter.min_count_exclusive > 0 ||
+                 emit_filter.top_count_take > 0)) {
+                uint64_t expected = (uint64_t)nrows / 64u;
+                if (expected < 4096) expected = 4096;
+                if (expected > (1u << 20)) expected = (1u << 20);
+                if (!sparse_i64_init(&sp_ht, (uint32_t)expected, n_aggs, false))
+                    goto ht_path;
+
+                for (int64_t i = 0; i < n_scan; i++) {
+                    int64_t r = match_idx ? match_idx[i] : i;
+                    if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
+                        continue;
+                    int64_t key = read_by_esz(key_data[0], r, key_esz);
+                    int32_t slot;
+                    if (!sparse_i64_touch(&sp_ht, key, n_aggs, false, &slot)) {
+                        sp_ok = false;
+                        break;
+                    }
+                    sp_ht.counts[slot]++;
+                }
+            } else {
+                uint64_t expected = (uint64_t)nrows / 64u;
+                if (expected < 4096) expected = 4096;
+                if (expected > (1u << 20)) expected = (1u << 20);
+                if (!sparse_i64_init(&sp_ht, (uint32_t)expected, n_aggs, sp_need_sum))
+                    goto ht_path;
+
+                for (int64_t i = 0; i < n_scan; i++) {
+                    int64_t r = match_idx ? match_idx[i] : i;
+                    if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
+                        continue;
+                    int64_t key = read_by_esz(key_data[0], r, key_esz);
+                    int32_t slot;
+                    if (!sparse_i64_touch(&sp_ht, key, n_aggs, sp_need_sum, &slot)) {
+                        sp_ok = false;
+                        break;
+                    }
+                    sp_ht.counts[slot]++;
+                    if (!sp_need_sum) continue;
+                    da_val_t* sums = &sp_ht.sums[(size_t)slot * n_aggs];
+                    for (uint8_t a = 0; a < n_aggs; a++) {
+                        if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
+                            continue;
+                        if (agg_strlen[a])
+                            sums[a].i += group_strlen_at_cached(
+                                agg_vecs[a], r, strlen_sym_strings,
+                                strlen_sym_count);
+                        else if (agg_f64_mask & (1u << a))
+                            sums[a].f += ((const double*)agg_ptrs[a])[r];
+                        else
+                            sums[a].i += read_col_i64(agg_ptrs[a], r, agg_types[a], 0);
+                    }
+                }
+            }
+            if (!sp_ok) {
+                sparse_i64_free(&sp_ht);
+                goto ht_path;
+            }
+
+            uint32_t total_groups = 0;
+            for (uint32_t s = 0; s < sp_ht.cap; s++) {
+                if (!sp_ht.used[s]) continue;
+                total_groups++;
+            }
+            int64_t keep_min = use_emit_filter
+                ? da_count_emit_keep_min(sp_ht.counts, sp_ht.cap,
+                                         total_groups, emit_filter)
+                : 1;
+            uint32_t grp_count = 0;
+            for (uint32_t s = 0; s < sp_ht.cap; s++) {
+                if (!sp_ht.used[s]) continue;
+                if (sp_ht.counts[s] < keep_min) continue;
+                grp_count++;
+            }
+            ray_t* result = ray_table_new((int64_t)n_keys + n_aggs);
+            if (!result || RAY_IS_ERR(result)) {
+                sparse_i64_free(&sp_ht);
+                for (uint8_t a = 0; a < n_aggs; a++)
+                    if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                for (uint8_t k = 0; k < n_keys; k++)
+                    if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                if (match_idx_block) ray_release(match_idx_block);
+                return result ? result : ray_error("oom", NULL);
+            }
+
+            ray_t* key_col = col_vec_new(key_vecs[0], (int64_t)grp_count);
+            if (!key_col || RAY_IS_ERR(key_col)) {
+                sparse_i64_free(&sp_ht);
+                ray_release(result);
+                for (uint8_t a = 0; a < n_aggs; a++)
+                    if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                for (uint8_t k = 0; k < n_keys; k++)
+                    if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                if (match_idx_block) ray_release(match_idx_block);
+                return key_col ? key_col : ray_error("oom", NULL);
+            }
+            key_col->len = (int64_t)grp_count;
+
+            ray_t *_h_sum = NULL, *_h_cnt = NULL;
+            da_val_t* dense_sum = sp_need_sum
+                ? (da_val_t*)scratch_alloc(&_h_sum,
+                    (size_t)grp_count * n_aggs * sizeof(da_val_t))
+                : NULL;
+            int64_t* dense_count = (int64_t*)scratch_alloc(&_h_cnt,
+                (size_t)grp_count * sizeof(int64_t));
+            if ((sp_need_sum && !dense_sum) || !dense_count) {
+                scratch_free(_h_sum); scratch_free(_h_cnt);
+                ray_release(key_col); ray_release(result);
+                sparse_i64_free(&sp_ht);
+                for (uint8_t a = 0; a < n_aggs; a++)
+                    if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                for (uint8_t k = 0; k < n_keys; k++)
+                    if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                if (match_idx_block) ray_release(match_idx_block);
+                return ray_error("oom", NULL);
+            }
+            if (use_emit_filter && sp_need_sum)
+                memset(dense_sum, 0, (size_t)grp_count * n_aggs * sizeof(da_val_t));
+
+            sparse_i64_ht_t heavy_ht;
+            memset(&heavy_ht, 0, sizeof(heavy_ht));
+            if (use_emit_filter && grp_count > 0) {
+                if (!sparse_i64_init(&heavy_ht, grp_count * 2u, n_aggs, false)) {
+                    scratch_free(_h_sum); scratch_free(_h_cnt);
+                    ray_release(key_col); ray_release(result);
+                    sparse_i64_free(&sp_ht);
+                    for (uint8_t a = 0; a < n_aggs; a++)
+                        if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                    for (uint8_t k = 0; k < n_keys; k++)
+                        if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                    if (match_idx_block) ray_release(match_idx_block);
+                    return ray_error("oom", NULL);
+                }
+            }
+
+            uint32_t gi = 0;
+            for (uint32_t s = 0; s < sp_ht.cap; s++) {
+                if (!sp_ht.used[s]) continue;
+                if (sp_ht.counts[s] < keep_min) continue;
+                write_col_i64(ray_data(key_col), gi, sp_ht.keys[s],
+                              key_col->type, key_col->attrs);
+                dense_count[gi] = sp_ht.counts[s];
+                if (use_emit_filter) {
+                    int32_t hslot;
+                    if (!sparse_i64_touch(&heavy_ht, sp_ht.keys[s], n_aggs, false, &hslot)) {
+                        scratch_free(_h_sum); scratch_free(_h_cnt);
+                        ray_release(key_col); ray_release(result);
+                        sparse_i64_free(&heavy_ht);
+                        sparse_i64_free(&sp_ht);
+                        for (uint8_t a = 0; a < n_aggs; a++)
+                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                        for (uint8_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) ray_release(match_idx_block);
+                        return ray_error("oom", NULL);
+                    }
+                    heavy_ht.counts[hslot] = gi;
+                } else if (sp_need_sum) {
+                    memcpy(&dense_sum[(size_t)gi * n_aggs],
+                           &sp_ht.sums[(size_t)s * n_aggs],
+                           (size_t)n_aggs * sizeof(da_val_t));
+                }
+                gi++;
+            }
+            sparse_i64_free(&sp_ht);
+
+            if (use_emit_filter && sp_need_sum) {
+                for (int64_t i = 0; i < n_scan; i++) {
+                    int64_t r = match_idx ? match_idx[i] : i;
+                    if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
+                        continue;
+                    int64_t key = read_by_esz(key_data[0], r, key_esz);
+                    int32_t hslot = sparse_i64_find_slot(&heavy_ht, key);
+                    if (!heavy_ht.used[hslot] || heavy_ht.keys[hslot] != key)
+                        continue;
+                    uint32_t out_gi = (uint32_t)heavy_ht.counts[hslot];
+                    da_val_t* sums = &dense_sum[(size_t)out_gi * n_aggs];
+                    for (uint8_t a = 0; a < n_aggs; a++) {
+                        if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
+                            continue;
+                        if (agg_strlen[a])
+                            sums[a].i += group_strlen_at_cached(
+                                agg_vecs[a], r, strlen_sym_strings,
+                                strlen_sym_count);
+                        else if (agg_f64_mask & (1u << a))
+                            sums[a].f += ((const double*)agg_ptrs[a])[r];
+                        else
+                            sums[a].i += read_col_i64(agg_ptrs[a], r, agg_types[a], 0);
+                    }
+                }
+            }
+            sparse_i64_free(&heavy_ht);
+            ray_op_ext_t* key_ext = find_ext(g, ext->keys[0]->id);
+            int64_t name_id = key_ext ? key_ext->sym : 0;
+            result = ray_table_add_col(result, name_id, key_col);
+            ray_release(key_col);
+
+            emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
+                             (double*)dense_sum, (int64_t*)dense_sum,
+                             NULL, NULL, NULL, NULL,
+                             dense_count, agg_affine, NULL);
+
+            scratch_free(_h_sum);
+            scratch_free(_h_cnt);
             for (uint8_t a = 0; a < n_aggs; a++)
                 if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
             for (uint8_t k = 0; k < n_keys; k++)
@@ -4340,7 +5538,9 @@ ht_path:;
     uint32_t n_total = pool ? ray_pool_total_workers(pool) : 1;
 
     group_ht_t single_ht;
+    group_ht_t top_ht;
     group_ht_t* final_ht = NULL;
+    bool top_ht_ready = false;
     ray_t* result = NULL;
 
     ray_t* radix_bufs_hdr = NULL;
@@ -4348,7 +5548,495 @@ ht_path:;
     ray_t* part_hts_hdr = NULL;
     group_ht_t*  part_hts   = NULL;
 
-    if (pool && nrows >= RAY_PARALLEL_THRESHOLD && n_total > 1) {
+    if (use_emit_filter && emit_filter.top_count_take > 0 &&
+        n_keys > 1) {
+        bool top_count_nonselective = false;
+        if (n_keys >= 2 && n_keys <= 5) {
+            bool supported = true;
+            bool nullable = false;
+            for (uint16_t k = 0; k < n_keys; k++) {
+                if (key_types[k] == RAY_F64 || key_types[k] == RAY_GUID ||
+                    key_types[k] == RAY_STR) {
+                    supported = false;
+                    break;
+                }
+                ray_t* src = key_vecs[k] && (key_vecs[k]->attrs & RAY_ATTR_SLICE)
+                    ? key_vecs[k]->slice_parent : key_vecs[k];
+                if (src && (src->attrs & RAY_ATTR_HAS_NULLS)) {
+                    nullable = true;
+                    break;
+                }
+            }
+            if (!nullable && n_scan > 0 && n_scan <= INT32_MAX) {
+                uint64_t want = ((uint64_t)n_scan * 4u) / 3u;
+                uint32_t cap = 256;
+                while ((uint64_t)cap < want && cap < (1u << 28)) cap <<= 1;
+                if (supported && (uint64_t)cap >= want) {
+                    ray_t *hk[5] = { NULL, NULL, NULL, NULL, NULL };
+                    ray_t *hc = NULL;
+                    int64_t* ck64[5] = { NULL, NULL, NULL, NULL, NULL };
+                    int32_t* ck32[5] = { NULL, NULL, NULL, NULL, NULL };
+                    uint8_t key_is_i32[5] = { 0, 0, 0, 0, 0 };
+                    for (uint16_t k = 0; k < n_keys; k++) {
+                        int8_t kt = key_types[k];
+                        key_is_i32[k] = (kt == RAY_I32 || kt == RAY_DATE ||
+                                          kt == RAY_TIME || kt == RAY_I16 ||
+                                          kt == RAY_BOOL || kt == RAY_U8);
+                        if (key_is_i32[k])
+                            ck32[k] = (int32_t*)scratch_alloc(&hk[k], (size_t)cap * sizeof(int32_t));
+                        else
+                            ck64[k] = (int64_t*)scratch_alloc(&hk[k], (size_t)cap * sizeof(int64_t));
+                    }
+                    uint16_t* cc = (uint16_t*)scratch_calloc(&hc, (size_t)cap * sizeof(uint16_t));
+                    bool keys_alloc_ok = true;
+                    for (uint16_t k = 0; k < n_keys; k++) {
+                        if (key_is_i32[k] ? (ck32[k] == NULL) : (ck64[k] == NULL)) {
+                            keys_alloc_ok = false;
+                            break;
+                        }
+                    }
+                    if (keys_alloc_ok && cc) {
+                        uint32_t mask = cap - 1;
+                        bool counted_fast = false;
+                        bool count_overflow = false;
+#define TOP_COUNT2_FIXED_LOOP(T0, T1) do {                                      \
+                            const T0* d0 = (const T0*)key_data[0];              \
+                            const T1* d1 = (const T1*)key_data[1];              \
+                            for (int64_t r = 0; r < n_scan; r++) {              \
+                                int64_t v0 = (int64_t)d0[r];                    \
+                                int64_t v1 = (int64_t)d1[r];                    \
+                                uint64_t h = ray_hash_combine(ray_hash_i64(v0), \
+                                                               ray_hash_i64(v1));\
+                                uint32_t slot = (uint32_t)(h & mask);           \
+                                while (cc[slot]) {                              \
+                                    int64_t s0 = key_is_i32[0]                  \
+                                        ? (int64_t)ck32[0][slot]                \
+                                        : ck64[0][slot];                        \
+                                    int64_t s1 = key_is_i32[1]                  \
+                                        ? (int64_t)ck32[1][slot]                \
+                                        : ck64[1][slot];                        \
+                                    if (s0 == v0 && s1 == v1) break;            \
+                                    slot = (slot + 1) & mask;                   \
+                                }                                                \
+                                if (!cc[slot]) {                                \
+                                    if (key_is_i32[0]) ck32[0][slot] = (int32_t)v0; \
+                                    else ck64[0][slot] = v0;                    \
+                                    if (key_is_i32[1]) ck32[1][slot] = (int32_t)v1; \
+                                    else ck64[1][slot] = v1;                    \
+                                    cc[slot] = 1;                               \
+                                } else if (cc[slot] != UINT16_MAX) {            \
+                                    cc[slot]++;                                 \
+                                } else {                                        \
+                                    count_overflow = true;                      \
+                                }                                                \
+                            }                                                    \
+                            counted_fast = true;                                \
+                        } while (0)
+                        if (!rowsel && !match_idx &&
+                            n_keys == 2 && key_types[0] != RAY_SYM &&
+                            key_types[1] != RAY_SYM) {
+                            bool k0_64 = (key_types[0] == RAY_I64 ||
+                                          key_types[0] == RAY_TIMESTAMP);
+                            bool k1_64 = (key_types[1] == RAY_I64 ||
+                                          key_types[1] == RAY_TIMESTAMP);
+                            bool k0_32 = (key_types[0] == RAY_I32 ||
+                                          key_types[0] == RAY_DATE ||
+                                          key_types[0] == RAY_TIME);
+                            bool k1_32 = (key_types[1] == RAY_I32 ||
+                                          key_types[1] == RAY_DATE ||
+                                          key_types[1] == RAY_TIME);
+                            if (k0_64 && k1_64) TOP_COUNT2_FIXED_LOOP(int64_t, int64_t);
+                            else if (k0_64 && k1_32) TOP_COUNT2_FIXED_LOOP(int64_t, int32_t);
+                            else if (k0_32 && k1_64) TOP_COUNT2_FIXED_LOOP(int32_t, int64_t);
+                            else if (k0_32 && k1_32) TOP_COUNT2_FIXED_LOOP(int32_t, int32_t);
+                        }
+#undef TOP_COUNT2_FIXED_LOOP
+                        if (!counted_fast) {
+                            for (int64_t i = 0; i < n_scan; i++) {
+                                int64_t r = match_idx ? match_idx[i] : i;
+                                if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
+                                    continue;
+                                int64_t vals[5] = { 0, 0, 0, 0, 0 };
+                                uint64_t h = 0;
+                                for (uint16_t k = 0; k < n_keys; k++) {
+                                    vals[k] = read_col_i64(key_data[k], r, key_types[k], key_attrs[k]);
+                                    uint64_t kh = ray_hash_i64(vals[k]);
+                                    h = (k == 0) ? kh : ray_hash_combine(h, kh);
+                                }
+                                uint32_t slot = (uint32_t)(h & mask);
+                                while (cc[slot]) {
+                                    bool same = true;
+                                    for (uint16_t k = 0; k < n_keys; k++) {
+                                        int64_t stored = key_is_i32[k]
+                                            ? (int64_t)ck32[k][slot]
+                                            : ck64[k][slot];
+                                        if (stored != vals[k]) {
+                                            same = false;
+                                            break;
+                                        }
+                                    }
+                                    if (same) break;
+                                    slot = (slot + 1) & mask;
+                                }
+                                if (!cc[slot]) {
+                                    for (uint16_t k = 0; k < n_keys; k++) {
+                                        if (key_is_i32[k])
+                                            ck32[k][slot] = (int32_t)vals[k];
+                                        else
+                                            ck64[k][slot] = vals[k];
+                                    }
+                                    cc[slot] = 1;
+                                } else if (cc[slot] != UINT16_MAX) {
+                                    cc[slot]++;
+                                } else {
+                                    count_overflow = true;
+                                }
+                            }
+                        }
+
+                        if (!count_overflow) {
+                            int64_t k_take = emit_filter.top_count_take;
+                            int64_t heap_n = 0;
+                            int64_t heap[1024];
+                            uint32_t heap_slots[1024];
+                            if (k_take > (int64_t)(sizeof(heap) / sizeof(heap[0])))
+                                k_take = (int64_t)(sizeof(heap) / sizeof(heap[0]));
+                            uint32_t total_groups = 0;
+                            for (uint32_t i = 0; i < cap; i++) {
+                                if (!cc[i]) continue;
+                                total_groups++;
+                                int64_t cnt = cc[i];
+                                if (heap_n < k_take) {
+                                    int64_t j = heap_n++;
+                                    heap[j] = cnt;
+                                    heap_slots[j] = i;
+                                    while (j > 0) {
+                                        int64_t parent = (j - 1) >> 1;
+                                        if (heap[parent] <= heap[j]) break;
+                                        int64_t tmp = heap[parent]; heap[parent] = heap[j]; heap[j] = tmp;
+                                        uint32_t stmp = heap_slots[parent]; heap_slots[parent] = heap_slots[j]; heap_slots[j] = stmp;
+                                        j = parent;
+                                    }
+                                } else if (cnt > heap[0]) {
+                                    heap[0] = cnt;
+                                    heap_slots[0] = i;
+                                    int64_t j = 0;
+                                    for (;;) {
+                                        int64_t l = j * 2 + 1, rr = l + 1, m = j;
+                                        if (l < heap_n && heap[l] < heap[m]) m = l;
+                                        if (rr < heap_n && heap[rr] < heap[m]) m = rr;
+                                        if (m == j) break;
+                                        int64_t tmp = heap[m]; heap[m] = heap[j]; heap[j] = tmp;
+                                        uint32_t stmp = heap_slots[m]; heap_slots[m] = heap_slots[j]; heap_slots[j] = stmp;
+                                        j = m;
+                                    }
+                                }
+                            }
+                            uint32_t heavy_count = (uint32_t)heap_n;
+
+                            if (heavy_count > 0 && total_groups > 0) {
+                                uint32_t hcap = 256;
+                                while (hcap < heavy_count * 2u && hcap < (1u << 30)) hcap <<= 1;
+                                memset(&top_ht, 0, sizeof(top_ht));
+                                if (group_ht_init_sized(&top_ht, hcap, &ght_layout, heavy_count)) {
+                                    top_ht_ready = true;
+                                    group_ht_set_key_data(&top_ht, key_data);
+                                    int64_t keys[6] = { 0, 0, 0, 0, 0, 0 };
+	                                for (uint32_t hi = 0; hi < heavy_count && !top_ht.oom; hi++) {
+	                                    uint32_t i = heap_slots[hi];
+	                                    for (uint16_t k = 0; k < n_keys; k++)
+	                                        keys[k] = key_is_i32[k]
+	                                            ? (int64_t)ck32[k][i]
+	                                            : ck64[k][i];
+	                                    keys[n_keys] = 0;
+                                        uint32_t gid = top_ht.grp_count;
+	                                    if (!group_ht_insert_empty_group(&top_ht, keys, key_types))
+	                                        break;
+                                        if (gid < top_ht.grp_count) {
+                                            char* row = top_ht.rows + (size_t)gid * ght_layout.row_stride;
+                                            *(int64_t*)row = (int64_t)cc[i];
+                                        }
+                                    }
+                                    if (!top_ht.oom) {
+                                    bool count_only = true;
+                                    for (uint8_t a = 0; a < n_aggs; a++) {
+                                        if (ext->agg_ops[a] != OP_COUNT) {
+                                            count_only = false;
+                                            break;
+                                        }
+                                    }
+                                    if (count_only) {
+                                        for (uint16_t k = 0; k < n_keys; k++)
+                                            scratch_free(hk[k]);
+                                        scratch_free(hc);
+                                        final_ht = &top_ht;
+                                        goto build_from_final_ht;
+                                    }
+                                    bool direct_ok = (heavy_count <= 64);
+                                    for (uint8_t a = 0; a < n_aggs && direct_ok; a++) {
+                                        uint16_t aop = ext->agg_ops[a];
+                                        if (aop == OP_COUNT) continue;
+                                        if ((aop == OP_SUM || aop == OP_AVG) &&
+                                            agg_vecs[a] && !agg_strlen[a] &&
+                                            agg_vecs[a]->type != RAY_STR &&
+                                            agg_vecs[a]->type != RAY_GUID)
+                                            continue;
+                                        direct_ok = false;
+                                    }
+                                    if (direct_ok) {
+	                                        int64_t sel_keys[64][5];
+	                                        for (uint32_t hi = 0; hi < heavy_count; hi++) {
+	                                            uint32_t i = heap_slots[hi];
+	                                            for (uint16_t k = 0; k < n_keys; k++)
+	                                                sel_keys[hi][k] = key_is_i32[k]
+	                                                    ? (int64_t)ck32[k][i]
+	                                                    : ck64[k][i];
+	                                        }
+                                        bool unique_first_key = true;
+                                        for (uint32_t i = 0; i < heavy_count && unique_first_key; i++) {
+                                            for (uint32_t j = i + 1; j < heavy_count; j++) {
+                                                if (sel_keys[i][0] == sel_keys[j][0]) {
+                                                    unique_first_key = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        uint8_t lk_used[256];
+                                        uint32_t lk_idx[256];
+                                        int64_t lk_key[256];
+                                        if (unique_first_key) {
+                                            memset(lk_used, 0, sizeof(lk_used));
+                                            for (uint32_t hi = 0; hi < heavy_count; hi++) {
+                                                uint32_t pos = (uint32_t)ray_hash_i64(sel_keys[hi][0]) & 255u;
+                                                while (lk_used[pos])
+                                                    pos = (pos + 1u) & 255u;
+                                                lk_used[pos] = 1;
+                                                lk_key[pos] = sel_keys[hi][0];
+                                                lk_idx[pos] = hi;
+                                            }
+                                        }
+                                        for (uint16_t k = 0; k < n_keys; k++)
+                                            scratch_free(hk[k]);
+                                        scratch_free(hc);
+
+                                        for (int64_t i = 0; i < n_scan; i++) {
+                                            int64_t r = match_idx ? match_idx[i] : i;
+                                            if (!match_idx && rowsel && !group_rowsel_pass(rowsel, r))
+                                                continue;
+                                            int64_t v0 = read_col_i64(key_data[0], r, key_types[0], key_attrs[0]);
+                                            uint32_t hit = UINT32_MAX;
+                                            if (unique_first_key) {
+                                                uint32_t pos = (uint32_t)ray_hash_i64(v0) & 255u;
+                                                while (lk_used[pos]) {
+                                                    if (lk_key[pos] == v0) {
+                                                        hit = lk_idx[pos];
+                                                        break;
+                                                    }
+                                                    pos = (pos + 1u) & 255u;
+                                                }
+                                                if (hit == UINT32_MAX) continue;
+                                                int64_t v1 = read_col_i64(key_data[1], r, key_types[1], key_attrs[1]);
+                                                if (sel_keys[hit][1] != v1) continue;
+                                                if (n_keys >= 3) {
+                                                    int64_t v2 = read_col_i64(key_data[2], r, key_types[2], key_attrs[2]);
+                                                    if (sel_keys[hit][2] != v2) continue;
+                                                }
+                                                if (n_keys >= 4) {
+                                                    int64_t v3 = read_col_i64(key_data[3], r, key_types[3], key_attrs[3]);
+                                                    if (sel_keys[hit][3] != v3) continue;
+                                                }
+                                                if (n_keys == 5) {
+                                                    int64_t v4 = read_col_i64(key_data[4], r, key_types[4], key_attrs[4]);
+                                                    if (sel_keys[hit][4] != v4) continue;
+                                                }
+                                            } else {
+                                                int64_t v1 = read_col_i64(key_data[1], r, key_types[1], key_attrs[1]);
+                                                int64_t v2 = 0;
+                                                int64_t v3 = 0;
+                                                int64_t v4 = 0;
+                                                if (n_keys >= 3)
+                                                    v2 = read_col_i64(key_data[2], r, key_types[2], key_attrs[2]);
+                                                if (n_keys >= 4)
+                                                    v3 = read_col_i64(key_data[3], r, key_types[3], key_attrs[3]);
+                                                if (n_keys == 5)
+                                                    v4 = read_col_i64(key_data[4], r, key_types[4], key_attrs[4]);
+                                                for (uint32_t hi = 0; hi < heavy_count; hi++) {
+                                                    if (sel_keys[hi][0] == v0 && sel_keys[hi][1] == v1 &&
+                                                        (n_keys == 2 || sel_keys[hi][2] == v2) &&
+                                                        (n_keys < 4 || sel_keys[hi][3] == v3) &&
+                                                        (n_keys < 5 || sel_keys[hi][4] == v4)) {
+                                                        hit = hi;
+                                                        break;
+                                                    }
+                                                }
+                                                if (hit == UINT32_MAX) continue;
+                                            }
+                                            char* row = top_ht.rows + (size_t)hit * ght_layout.row_stride;
+                                            (*(int64_t*)row)++;
+                                            for (uint8_t a = 0; a < n_aggs; a++) {
+                                                uint16_t aop = ext->agg_ops[a];
+                                                if (aop == OP_COUNT || !agg_vecs[a]) continue;
+                                                int8_t s = ght_layout.agg_val_slot[a];
+                                                if (s < 0) continue;
+                                                if (agg_vecs[a]->type == RAY_F64) {
+                                                    double* dst = &ROW_WR_F64(row, ght_layout.off_sum, s);
+                                                    *dst += ((const double*)ray_data(agg_vecs[a]))[r];
+                                                } else {
+                                                    int64_t* dst = &ROW_WR_I64(row, ght_layout.off_sum, s);
+                                                    *dst += read_col_i64(ray_data(agg_vecs[a]), r,
+                                                                         agg_vecs[a]->type,
+                                                                         agg_vecs[a]->attrs);
+                                                }
+                                            }
+                                        }
+                                        final_ht = &top_ht;
+                                        goto build_from_final_ht;
+                                    }
+                                    for (uint16_t k = 0; k < n_keys; k++)
+                                        scratch_free(hk[k]);
+                                    scratch_free(hc);
+                                    group_rows_range_existing(&top_ht, key_data, key_types,
+                                        key_attrs, key_vecs, agg_vecs, agg_strlen, rowsel,
+                                        0, n_scan, match_idx);
+                                    if (ray_interrupted()) {
+                                        result = ray_error("cancel", "interrupted");
+                                        goto cleanup;
+                                    }
+                                    final_ht = &top_ht;
+                                    goto build_from_final_ht;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (uint16_t k = 0; k < n_keys; k++)
+                        scratch_free(hk[k]);
+                    scratch_free(hc);
+                    if (top_ht_ready) {
+                        group_ht_free(&top_ht);
+                        top_ht_ready = false;
+                    }
+                }
+            }
+        }
+
+        if (top_count_nonselective)
+            goto skip_top_count_filter;
+        if (rowsel || match_idx)
+            goto skip_top_count_filter;
+
+        uint16_t cnt_op = OP_COUNT;
+        ray_t* cnt_vecs[1] = { NULL };
+        ght_layout_t cnt_layout =
+            ght_compute_layout(n_keys, 1, cnt_vecs, 0, &cnt_op, key_types);
+        pivot_ingest_t cnt_ingest;
+        if (pivot_ingest_run(&cnt_ingest, &cnt_layout, key_data, key_types,
+                             key_attrs, key_vecs, cnt_vecs, n_scan)) {
+            if (ray_interrupted()) {
+                pivot_ingest_free(&cnt_ingest);
+                result = ray_error("cancel", "interrupted");
+                goto cleanup;
+            }
+
+            int64_t k_take = emit_filter.top_count_take;
+            int64_t heap_n = 0;
+            int64_t heap[1024];
+            if (k_take > (int64_t)(sizeof(heap) / sizeof(heap[0])))
+                k_take = (int64_t)(sizeof(heap) / sizeof(heap[0]));
+            int64_t total_count_groups = 0;
+            for (uint32_t p = 0; p < cnt_ingest.n_parts; p++) {
+                group_ht_t* ph = &cnt_ingest.part_hts[p];
+                uint16_t rs = ph->layout.row_stride;
+                total_count_groups += ph->grp_count;
+                for (uint32_t gi = 0; gi < ph->grp_count; gi++) {
+                    const char* row = ph->rows + (size_t)gi * rs;
+                    int64_t cnt = *(const int64_t*)(const void*)row;
+                    if (heap_n < k_take) {
+                        int64_t j = heap_n++;
+                        heap[j] = cnt;
+                        while (j > 0) {
+                            int64_t parent = (j - 1) >> 1;
+                            if (heap[parent] <= heap[j]) break;
+                            int64_t tmp = heap[parent]; heap[parent] = heap[j]; heap[j] = tmp;
+                            j = parent;
+                        }
+                    } else if (cnt > heap[0]) {
+                        heap[0] = cnt;
+                        int64_t j = 0;
+                        for (;;) {
+                            int64_t l = j * 2 + 1, r = l + 1, m = j;
+                            if (l < heap_n && heap[l] < heap[m]) m = l;
+                            if (r < heap_n && heap[r] < heap[m]) m = r;
+                            if (m == j) break;
+                            int64_t tmp = heap[m]; heap[m] = heap[j]; heap[j] = tmp;
+                            j = m;
+                        }
+                    }
+                }
+            }
+
+            int64_t threshold = (heap_n == k_take) ? heap[0] : 1;
+            uint32_t heavy_count = 0;
+            for (uint32_t p = 0; p < cnt_ingest.n_parts; p++) {
+                group_ht_t* ph = &cnt_ingest.part_hts[p];
+                uint16_t rs = ph->layout.row_stride;
+                for (uint32_t gi = 0; gi < ph->grp_count; gi++) {
+                    const char* row = ph->rows + (size_t)gi * rs;
+                    int64_t cnt = *(const int64_t*)(const void*)row;
+                    if (cnt >= threshold) heavy_count++;
+                }
+            }
+
+            if (threshold <= 1 ||
+                (uint64_t)heavy_count * 4u >= (uint64_t)total_count_groups * 3u) {
+                pivot_ingest_free(&cnt_ingest);
+                goto skip_top_count_filter;
+            }
+
+            if (heavy_count > 0 && total_count_groups > 0) {
+                uint32_t cap = 256;
+                while (cap < heavy_count * 2u && cap < (1u << 30)) cap <<= 1;
+                memset(&top_ht, 0, sizeof(top_ht));
+                if (group_ht_init_sized(&top_ht, cap, &ght_layout, heavy_count)) {
+                    top_ht_ready = true;
+                    group_ht_set_key_data(&top_ht, key_data);
+                    for (uint32_t p = 0; p < cnt_ingest.n_parts && !top_ht.oom; p++) {
+                        group_ht_t* ph = &cnt_ingest.part_hts[p];
+                        uint16_t rs = ph->layout.row_stride;
+                        for (uint32_t gi = 0; gi < ph->grp_count; gi++) {
+                            const char* row = ph->rows + (size_t)gi * rs;
+                            int64_t cnt = *(const int64_t*)(const void*)row;
+                            if (cnt < threshold) continue;
+                            const int64_t* keys = (const int64_t*)(const void*)(row + 8);
+                            if (!group_ht_insert_empty_group(&top_ht, keys, key_types))
+                                break;
+                        }
+                    }
+                    if (!top_ht.oom) {
+                        pivot_ingest_free(&cnt_ingest);
+                        group_rows_range_existing(&top_ht, key_data, key_types,
+                            key_attrs, key_vecs, agg_vecs, agg_strlen, rowsel,
+                            0, n_scan, match_idx);
+                        if (ray_interrupted()) {
+                            result = ray_error("cancel", "interrupted");
+                            goto cleanup;
+                        }
+                        final_ht = &top_ht;
+                        goto build_from_final_ht;
+                    }
+                }
+            }
+            pivot_ingest_free(&cnt_ingest);
+            if (top_ht_ready) {
+                group_ht_free(&top_ht);
+                top_ht_ready = false;
+            }
+        }
+    }
+
+skip_top_count_filter:
+
+    if (pool && nrows >= RAY_PARALLEL_THRESHOLD && n_total > 1 && !rowsel) {
         size_t n_bufs = (size_t)n_total * RADIX_P;
         radix_bufs = (radix_buf_t*)scratch_calloc(&radix_bufs_hdr,
             n_bufs * sizeof(radix_buf_t));
@@ -4394,9 +6082,11 @@ ht_path:;
             .key_vecs      = key_vecs,
             .nullable_mask = p1_nullable,
             .agg_vecs      = agg_vecs,
+            .agg_strlen    = agg_strlen,
             .n_workers     = n_total,
             .bufs          = radix_bufs,
             .layout        = ght_layout,
+            .rowsel        = rowsel,
             .match_idx     = match_idx,
         };
         ray_pool_dispatch(pool, radix_phase1_fn, &p1ctx, n_scan);
@@ -4437,6 +6127,16 @@ ht_path:;
         };
         ray_pool_dispatch_n(pool, radix_phase2_fn, &p2ctx, RADIX_P);
         CHECK_CANCEL_GOTO(pool, cleanup);
+
+        if (radix_bufs) {
+            size_t n_bufs_free = (size_t)n_total * RADIX_P;
+            for (size_t i = 0; i < n_bufs_free; i++)
+                scratch_free(radix_bufs[i]._hdr);
+            scratch_free(radix_bufs_hdr);
+            radix_bufs = NULL;
+            radix_bufs_hdr = NULL;
+            ray_heap_gc();
+        }
 
         /* Prefix offsets */
         uint32_t part_offsets[RADIX_P + 1];
@@ -4640,12 +6340,14 @@ sequential_fallback:;
         goto cleanup;
     }
     group_rows_range(&single_ht, key_data, key_types, key_attrs, key_vecs, agg_vecs,
+                     agg_strlen, rowsel,
                      0, n_scan, match_idx);
     final_ht = &single_ht;
     if (ray_interrupted()) { result = ray_error("cancel", "interrupted"); goto cleanup; }
     if (single_ht.oom) { result = ray_error("oom", NULL); goto cleanup; }
 
     /* Build result from sequential HT (inline row layout) */
+build_from_final_ht:
     {
     uint32_t grp_count = final_ht->grp_count;
     const ght_layout_t* ly = &final_ht->layout;
@@ -4854,6 +6556,9 @@ cleanup:
     if (final_ht == &single_ht) {
         group_ht_free(&single_ht);
     }
+    if (top_ht_ready) {
+        group_ht_free(&top_ht);
+    }
     if (radix_bufs) {
         size_t n_bufs = (size_t)n_total * RADIX_P;
         for (size_t i = 0; i < n_bufs; i++) scratch_free(radix_bufs[i]._hdr);
@@ -4870,6 +6575,8 @@ cleanup:
     for (uint8_t k = 0; k < n_keys; k++)
         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
     if (match_idx_block) ray_release(match_idx_block);
+
+    ray_heap_gc();
 
     return result;
 }
@@ -5448,7 +7155,7 @@ static void pivot_ingest_sequential(pivot_ingest_t* out, const ght_layout_t* ly,
     out->n_parts = 1;
     out->row_stride = ly->row_stride;
     group_rows_range(scratch_ht, key_data, key_types, key_attrs, key_vecs,
-                     agg_vecs, 0, n_scan, NULL);
+                     agg_vecs, NULL, NULL, 0, n_scan, NULL);
     out->total_grps = scratch_ht->grp_count;
     out->part_offsets[0] = 0;
     out->part_offsets[1] = scratch_ht->grp_count;

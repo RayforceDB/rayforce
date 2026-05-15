@@ -26,6 +26,7 @@
 
 #include "rayforce.h"
 #include "ops/internal.h"
+#include "ops/glob.h"
 
 #define FP_PRED_MAX_CHILDREN 8
 
@@ -36,6 +37,8 @@ typedef enum {
     FP_LE = 3,
     FP_GT = 4,
     FP_GE = 5,
+    FP_LIKE = 6,
+    FP_IN = 7,
 } fp_op_t;
 
 /* fold values: when the predicate constant is provably outside the
@@ -56,9 +59,19 @@ typedef struct {
     uint8_t      col_esz;
     uint8_t      fold;        /* fp_fold_t — set when cval is out-of-range */
     const void*  col_base;
+    ray_t*       col_obj;
     int64_t      col_len;
     int64_t      cval;
     int          cval_in_dict;
+    int64_t      cvals[16];
+    uint8_t      n_cvals;
+    const char*  pat_str;
+    size_t       pat_len;
+    ray_glob_compiled_t pat_compiled;
+    ray_t*       aux_hdr;
+    uint8_t*      like_lut;
+    uint32_t     like_lut_count;
+    ray_t**      like_sym_strings;
 } fp_cmp_t;
 
 typedef struct {
@@ -78,5 +91,7 @@ void fp_eval_pred(const fp_pred_t* p, int64_t start, int64_t end, uint8_t* bits)
  * exceeds FP_PRED_MAX_CHILDREN. */
 int fp_compile_pred(ray_graph_t* g, ray_op_t* pred_op, ray_t* tbl,
                     fp_pred_t* out);
+
+void fp_pred_cleanup(fp_pred_t* p);
 
 #endif /* RAY_OPS_FUSED_PRED_H */

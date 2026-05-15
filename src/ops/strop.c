@@ -24,11 +24,132 @@
 #include "lang/internal.h"
 #include "ops/internal.h"
 #include "table/sym.h"
+#include "table/table.h"
 #include "ops/glob.h"
 
 /* ══════════════════════════════════════════
  * String builtins
  * ══════════════════════════════════════════ */
+
+static bool strlen_atom_value(ray_t* x, int64_t* out) {
+    if (x->type == -RAY_STR) {
+        *out = (int64_t)ray_str_len(x);
+        return true;
+    }
+    if (x->type == -RAY_SYM) {
+        ray_t* s = ray_sym_str(x->i64);
+        *out = s ? (int64_t)ray_str_len(s) : 0;
+        return true;
+    }
+    return false;
+}
+
+static bool strlen_vec_value(ray_t* x, int64_t row, int64_t* out) {
+    if (x->type == RAY_STR) {
+        size_t slen = 0;
+        const char* s = ray_str_vec_get(x, row, &slen);
+        *out = s ? (int64_t)slen : 0;
+        return true;
+    }
+    if (x->type == RAY_SYM) {
+        int64_t sid = ray_read_sym(ray_data(x), row, x->type, x->attrs);
+        ray_t* s = ray_sym_str(sid);
+        *out = s ? (int64_t)ray_str_len(s) : 0;
+        return true;
+    }
+    return false;
+}
+
+static ray_t* strlen_vec(ray_t* x) {
+    if (x->type != RAY_STR && x->type != RAY_SYM)
+        return ray_error("type", "strlen: expected string or symbol");
+
+    int64_t n = x->len;
+    ray_t* out = ray_vec_new(RAY_I64, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    int64_t* dst = (int64_t*)ray_data(out);
+    bool has_nulls = (x->attrs & RAY_ATTR_HAS_NULLS) != 0;
+
+    for (int64_t i = 0; i < n; i++) {
+        if (has_nulls && ray_vec_is_null(x, i)) {
+            dst[i] = 0;
+            ray_vec_set_null(out, i, true);
+            continue;
+        }
+        strlen_vec_value(x, i, &dst[i]);
+    }
+    return out;
+}
+
+static ray_t* strlen_mapcommon(ray_t* x) {
+    ray_t** ptrs = (ray_t**)ray_data(x);
+    ray_t* keys = ptrs[0];
+    ray_t* counts = ptrs[1];
+    if (!keys || !counts || RAY_IS_ERR(keys) || RAY_IS_ERR(counts))
+        return ray_error("domain", "strlen: invalid partition column");
+    if (keys->type != RAY_STR && keys->type != RAY_SYM)
+        return ray_error("type", "strlen: expected string or symbol");
+
+    int64_t total = ray_parted_nrows(x);
+    ray_t* out = ray_vec_new(RAY_I64, total);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = total;
+    int64_t* dst = (int64_t*)ray_data(out);
+    const int64_t* cnt = (const int64_t*)ray_data(counts);
+
+    int64_t off = 0;
+    for (int64_t p = 0; p < counts->len; p++) {
+        int64_t v = 0;
+        bool is_null = (keys->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(keys, p);
+        if (!is_null) strlen_vec_value(keys, p, &v);
+        for (int64_t r = 0; r < cnt[p]; r++) {
+            dst[off] = v;
+            if (is_null) ray_vec_set_null(out, off, true);
+            off++;
+        }
+    }
+    return out;
+}
+
+static ray_t* strlen_parted(ray_t* x) {
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
+    if (base != RAY_STR && base != RAY_SYM)
+        return ray_error("type", "strlen: expected string or symbol");
+
+    int64_t total = ray_parted_nrows(x);
+    ray_t* out = ray_vec_new(RAY_I64, total);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = total;
+    int64_t* dst = (int64_t*)ray_data(out);
+
+    ray_t** segs = (ray_t**)ray_data(x);
+    int64_t off = 0;
+    for (int64_t s = 0; s < x->len; s++) {
+        ray_t* seg = segs[s];
+        if (!seg || RAY_IS_ERR(seg)) continue;
+        bool has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        for (int64_t i = 0; i < seg->len; i++) {
+            if (has_nulls && ray_vec_is_null(seg, i)) {
+                dst[off] = 0;
+                ray_vec_set_null(out, off, true);
+            } else {
+                strlen_vec_value(seg, i, &dst[off]);
+            }
+            off++;
+        }
+    }
+    return out;
+}
+
+ray_t* ray_strlen_fn(ray_t* x) {
+    int64_t len = 0;
+    if (strlen_atom_value(x, &len)) return ray_i64(len);
+    if (ray_is_vec(x)) return strlen_vec(x);
+    if (x->type == RAY_MAPCOMMON) return strlen_mapcommon(x);
+    if (RAY_IS_PARTED(x->type)) return strlen_parted(x);
+    return ray_error("type", "strlen: expected string or symbol");
+}
 
 ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
     /* List split: (split list indices) → list of sub-lists */
@@ -203,7 +324,7 @@ ray_t* ray_like_fn(ray_t* x, ray_t* pattern) {
     const char* pat = ray_str_ptr(pattern);
     size_t pat_len = ray_str_len(pattern);
 
-    /* Pre-compile the pattern once.  Most ClickBench LIKE shapes are
+    /* Pre-compile the pattern once.  Most benchmark LIKE shapes are
      * `*literal*` (substring) which collapses to a memmem call — the
      * libc-provided implementation is SIMD on glibc/Apple/BSD.  When the
      * shape is RAY_GLOB_SHAPE_NONE we keep the iterative matcher. */

@@ -896,6 +896,14 @@ ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
                                 const int8_t* key_types);
 bool group_ht_init(group_ht_t* ht, uint32_t cap, const ght_layout_t* ly);
 void group_ht_free(group_ht_t* ht);
+typedef struct {
+    int enabled;
+    uint8_t agg_index;
+    int64_t min_count_exclusive;
+    int64_t top_count_take;
+} ray_group_emit_filter_t;
+ray_group_emit_filter_t ray_group_emit_filter_get(void);
+void ray_group_emit_filter_set(ray_group_emit_filter_t filter);
 /* Hash-aggregate rows [start, end) into ht.
  *
  * When match_idx is non-NULL, the loop iterates `i` in [start, end)
@@ -905,6 +913,8 @@ void group_ht_free(group_ht_t* ht);
  * column rows (no selection). */
 void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
                       uint8_t* key_attrs, ray_t** key_vecs, ray_t** agg_vecs,
+                      uint8_t* agg_strlen,
+                      ray_t* rowsel,
                       int64_t start, int64_t end,
                       const int64_t* match_idx);
 

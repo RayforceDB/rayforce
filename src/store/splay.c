@@ -24,8 +24,11 @@
 #include "splay.h"
 #include "store/col.h"
 #include "store/fileio.h"
+#include "table/sym.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
 
 /* --------------------------------------------------------------------------
  * Splayed table: directory of column files + .d schema file
@@ -59,7 +62,8 @@ static ray_err_t validate_sym_columns(ray_t* tbl, int64_t schema_ncols) {
  * ray_splay_save — save a table to a splayed table directory
  * -------------------------------------------------------------------------- */
 
-ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
+static ray_err_t splay_save_impl(ray_t* tbl, const char* dir, const char* sym_path,
+                                 bool durable) {
     if (!tbl || RAY_IS_ERR(tbl)) return RAY_ERR_TYPE;
     if (!dir) return RAY_ERR_IO;
 
@@ -71,7 +75,7 @@ ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
 
     /* Save symbol table if sym_path provided */
     if (sym_path) {
-        ray_err_t sym_err = ray_sym_save(sym_path);
+        ray_err_t sym_err = durable ? ray_sym_save(sym_path) : ray_sym_save_bulk(sym_path);
         if (sym_err != RAY_OK) return sym_err;
     }
 
@@ -83,7 +87,7 @@ ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
         char path[1024];
         int path_len = snprintf(path, sizeof(path), "%s/.d", dir);
         if (path_len < 0 || (size_t)path_len >= sizeof(path)) return RAY_ERR_RANGE;
-        ray_err_t err = ray_col_save(schema, path);
+        ray_err_t err = durable ? ray_col_save(schema, path) : ray_col_save_bulk(schema, path);
         if (err != RAY_OK) return err;
     }
 
@@ -110,13 +114,21 @@ ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
         int path_len = snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
         if (path_len < 0 || (size_t)path_len >= sizeof(path)) return RAY_ERR_RANGE;
 
-        ray_err_t err = ray_col_save(col, path);
+        ray_err_t err = durable ? ray_col_save(col, path) : ray_col_save_bulk(col, path);
         /* On partial failure, columns 0..c-1 remain on disk.
          * Caller should clean up or use atomic rename for safe writes. */
         if (err != RAY_OK) return err;
     }
 
     return RAY_OK;
+}
+
+ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
+    return splay_save_impl(tbl, dir, sym_path, true);
+}
+
+ray_err_t ray_splay_save_bulk(ray_t* tbl, const char* dir, const char* sym_path) {
+    return splay_save_impl(tbl, dir, sym_path, false);
 }
 
 /* --------------------------------------------------------------------------
@@ -129,6 +141,9 @@ ray_err_t ray_splay_save(ray_t* tbl, const char* dir, const char* sym_path) {
 
 static ray_t* splay_load_impl(const char* dir, const char* sym_path, bool use_mmap) {
     if (!dir) return ray_error("io", NULL);
+    bool trace = getenv("RAY_CSV_TRACE") != NULL;
+    if (trace)
+        fprintf(stderr, "splayed.get: dir=%s mmap=%d\n", dir, use_mmap ? 1 : 0);
 
     /* Load symbol table if sym_path provided */
     if (sym_path) {
@@ -142,7 +157,12 @@ static ray_t* splay_load_impl(const char* dir, const char* sym_path, bool use_mm
     if (path_len < 0 || (size_t)path_len >= sizeof(path))
         return ray_error("range", NULL);
     ray_t* schema = ray_col_load(path);
-    if (!schema || RAY_IS_ERR(schema)) return schema;
+    if (!schema || RAY_IS_ERR(schema)) {
+        if (trace)
+            fprintf(stderr, "splayed.get: schema load failed path=%s err=%s\n",
+                    path, schema && RAY_IS_ERR(schema) ? ray_err_code(schema) : "io");
+        return schema;
+    }
 
     int64_t ncols = schema->len;
     int64_t* name_ids = (int64_t*)ray_data(schema);
@@ -160,6 +180,9 @@ static ray_t* splay_load_impl(const char* dir, const char* sym_path, bool use_mm
         if (!name_atom) {
             /* Schema references a sym ID that doesn't exist — sym table
              * is stale or wrong for this data. */
+            if (trace)
+                fprintf(stderr, "splayed.get: missing schema symbol col=%" PRId64 " id=%" PRId64 "\n",
+                        c, name_id);
             ray_release(schema);
             ray_release(tbl);
             return ray_error("corrupt", NULL);
@@ -185,7 +208,7 @@ static ray_t* splay_load_impl(const char* dir, const char* sym_path, bool use_mm
             return ray_error("range", NULL);
         }
 
-        ray_t* col = use_mmap ? ray_col_mmap(path) : ray_col_load(path);
+        ray_t* col = use_mmap ? ray_col_mmap_splayed(path) : ray_col_load(path);
         if (use_mmap && col && RAY_IS_ERR(col) &&
             strcmp(ray_err_code(col), "nyi") == 0) {
             /* ray_release on an error object is a no-op (rayforce.h:180);
@@ -195,6 +218,9 @@ static ray_t* splay_load_impl(const char* dir, const char* sym_path, bool use_mm
             col = ray_col_load(path);
         }
         if (!col || RAY_IS_ERR(col)) {
+            if (trace)
+                fprintf(stderr, "splayed.get: col load failed path=%s err=%s\n",
+                        path, col && RAY_IS_ERR(col) ? ray_err_code(col) : "io");
             ray_release(schema);
             ray_release(tbl);
             return col ? col : ray_error("io", NULL);

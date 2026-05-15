@@ -915,6 +915,37 @@ static test_result_t test_eval_count_table(void) {
     PASS();
 }
 
+/* ---- Test: count filtered table ---- */
+static test_result_t test_eval_count_select_where(void) {
+    ray_t* result = ray_eval_str(
+        "(do (set t (table ['a 'b] (list [1 2 3 4] [10 20 30 40]))) "
+        "(count (select {from: t where: (> a 2)})))");
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(result->i64, 2);
+    ray_release(result);
+
+    result = ray_eval_str(
+        "(do (set t (table ['a 'b] (list [1 2 3 4] [10 20 30 40]))) "
+        "(count (select {from: t where: (!= a 2)})))");
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(result->i64, 3);
+    ray_release(result);
+
+    result = ray_eval_str(
+        "(do (set t (table ['a 'b] (list [1 2 3 4] [10 20 30 40]))) "
+        "(count (select {from: t where: (<= 3 a)})))");
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(result->i64, 2);
+    ray_release(result);
+    PASS();
+}
+
 /* ---- Test: select all ---- */
 static test_result_t test_eval_select_all(void) {
     ray_t* result = ray_eval_str(
@@ -6610,6 +6641,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/at_table", test_eval_at_table, lang_setup, lang_teardown },
     { "lang/eval/key_table", test_eval_key_table, lang_setup, lang_teardown },
     { "lang/eval/count_table", test_eval_count_table, lang_setup, lang_teardown },
+    { "lang/eval/count_select_where", test_eval_count_select_where, lang_setup, lang_teardown },
     { "lang/eval/select_all", test_eval_select_all, lang_setup, lang_teardown },
     { "lang/eval/select_where", test_eval_select_where, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_sym", test_eval_select_where_in_sym, lang_setup, lang_teardown },

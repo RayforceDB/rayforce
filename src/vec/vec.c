@@ -959,9 +959,11 @@ void ray_vec_set_null(ray_t* vec, int64_t idx, bool is_null) {
 static ray_t* str_pool_cow(ray_t* vec) {
     if (!vec->str_pool || RAY_IS_ERR(vec->str_pool)) return vec;
     uint32_t pool_rc = ray_atomic_load(&vec->str_pool->rc);
-    if (pool_rc <= 1) return vec;
+    if (pool_rc <= 1 && vec->str_pool->mmod == 0) return vec;
 
-    size_t pool_data_size = ((size_t)1 << vec->str_pool->order) - 32;
+    size_t pool_data_size = vec->str_pool->mmod == 0
+        ? ((size_t)1 << vec->str_pool->order) - 32
+        : (vec->str_pool->len > 64 ? (size_t)vec->str_pool->len : 64);
     ray_t* new_pool = ray_alloc(pool_data_size);
     if (!new_pool || RAY_IS_ERR(new_pool)) return NULL;
 

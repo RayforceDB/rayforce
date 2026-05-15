@@ -45,6 +45,7 @@
 #include "ops/fused_pred.h"
 #include "ops/fused_group.h"   /* ray_fused_group_supported */
 #include "ops/internal.h"
+#include "lang/internal.h"
 #include "core/pool.h"
 
 #include <string.h>
@@ -269,33 +270,13 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0 || k >= nrows) return NULL;
 
-    /* Output column type gate.  The materialise loop reads via
-     * read_by_esz (which assumes a fixed-width scalar payload) and
-     * writes via write_col_i64 (which only handles BOOL/U8/I16/I32/
-     * I64/DATE/TIME/TIMESTAMP/SYM).  Variable-width types like
-     * RAY_STR or compound types like LIST/MAP/GUID would corrupt
-     * the output silently — gate the fused path off so the unfused
-     * FILTER + SORT + TAKE handles them. */
     for (uint8_t c = 0; c < n_out; c++) {
         ray_t* col = ray_table_get_col(tbl, out_col_syms[c]);
         if (!col) return NULL;
         int8_t ot = col->type;
         if (RAY_IS_PARTED(ot) || ot == RAY_MAPCOMMON) return NULL;
-        if (ot != RAY_SYM && ot != RAY_BOOL && ot != RAY_U8
-            && ot != RAY_I16 && ot != RAY_I32 && ot != RAY_I64
-            && ot != RAY_DATE && ot != RAY_TIME && ot != RAY_TIMESTAMP)
+        if (!ray_is_vec(col))
             return NULL;
-        /* SYM columns with a per-vector sym_dict store narrow-width
-         * indices into a LOCAL dictionary, not the global one.  The
-         * fused materialiser builds a fresh ray_sym_vec_new and copies
-         * raw IDs without propagating sym_dict (cf. sort.c:3642-3660 /
-         * rerank.c:174-188 which DO propagate it).  Falling back keeps
-         * the unfused gather, which propagates correctly. */
-        if (ot == RAY_SYM) {
-            const ray_t* dict_owner = (col->attrs & RAY_ATTR_SLICE)
-                                    ? col->slice_parent : col;
-            if (dict_owner && dict_owner->sym_dict) return NULL;
-        }
     }
 
     /* Resolve sort-key columns + decide if any need the SYM dict snapshot. */
@@ -341,6 +322,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     ray_op_t* pred_dag = compile_expr_dag(g, where_expr);
     if (!pred_dag) { ray_graph_free(g); return NULL; }
     if (fp_compile_pred(g, pred_dag, tbl, &ctx.pred) != 0) {
+        fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
         return NULL;
     }
@@ -363,6 +345,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     if (!ctx.heap_idx || !ctx.heap_n) {
         if (idx_hdr) scratch_free(idx_hdr);
         if (hn_hdr)  scratch_free(hn_hdr);
+        fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
         return NULL;
     }
@@ -372,6 +355,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
 
     if (atomic_load_explicit(&ctx.oom, memory_order_relaxed)) {
         scratch_free(idx_hdr); scratch_free(hn_hdr);
+        fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
         return NULL;
     }
@@ -405,6 +389,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     /* Materialize n_out output columns by gathering rows[global_idx]. */
     ray_t* result = ray_table_new(n_out);
     if (!result || RAY_IS_ERR(result)) {
+        fp_pred_cleanup(&ctx.pred);
         ray_graph_free(g);
         return result ? result : ray_error("oom", NULL);
     }
@@ -414,31 +399,13 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         int64_t alias = out_alias_syms ? out_alias_syms[c] : cs;
         ray_t* src = ray_table_get_col(tbl, cs);
         if (!src) { build_ok = 0; break; }
-        ray_t* col = (src->type == RAY_SYM)
-                   ? ray_sym_vec_new(src->attrs & RAY_SYM_W_MASK, global_n)
-                   : ray_vec_new(src->type, global_n);
+        ray_t* col = gather_by_idx(src, global_idx, global_n);
         if (!col || RAY_IS_ERR(col)) { build_ok = 0; break; }
-        col->len = global_n;
-        void* dst = ray_data(col);
-        uint8_t esz = ray_sym_elem_size(src->type, src->attrs);
-        for (int32_t i = 0; i < global_n; i++) {
-            int64_t v = read_by_esz(ray_data(src), global_idx[i], esz);
-            write_col_i64(dst, i, v, src->type, src->attrs);
-        }
-        /* Propagate the source nullmap so a nullable select column
-         * survives the top-K gather.  ray_vec_set_null lazily allocates
-         * dst's nullmap on the first set, so we only pay the alloc cost
-         * when there are actual nulls to copy. */
-        if (src->attrs & RAY_ATTR_HAS_NULLS) {
-            for (int32_t i = 0; i < global_n; i++) {
-                if (ray_vec_is_null(src, global_idx[i]))
-                    ray_vec_set_null(col, i, true);
-            }
-        }
         result = ray_table_add_col(result, alias, col);
         ray_release(col);
     }
     ray_graph_free(g);
+    fp_pred_cleanup(&ctx.pred);
     if (!build_ok) {
         ray_release(result);
         return ray_error("schema", NULL);

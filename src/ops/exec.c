@@ -24,6 +24,7 @@
 #include "ops/internal.h"
 #include "ops/rowsel.h"
 #include "ops/fused_group.h"
+#include "mem/heap.h"
 #include "mem/sys.h"
 
 /* Global profiler instance (zero-initialized = inactive) */
@@ -1344,6 +1345,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
                 ray_t* result = exec_sort(g, child_op, tbl, n);
                 if (sort_input != g->table) ray_release(sort_input);
+                if (result && !RAY_IS_ERR(result)) ray_heap_gc();
                 return result;
             }
 
@@ -1412,6 +1414,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 ray_release(pred);
                 if (filter_input != saved_table)
                     ray_release(filter_input);
+                if (result && !RAY_IS_ERR(result)) ray_heap_gc();
                 return result;
             } else {
                 input = exec_node(g, op->inputs[0]);

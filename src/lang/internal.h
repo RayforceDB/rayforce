@@ -358,6 +358,7 @@ ray_t* ray_enlist_fn(ray_t** args, int64_t n);
 
 /* String builtins (formerly static in eval.c, now in str_builtin.c) */
 ray_t* ray_split_fn(ray_t* str, ray_t* delim);
+ray_t* ray_strlen_fn(ray_t* x);
 ray_t* ray_like_fn(ray_t* x, ray_t* pattern);
 ray_t* ray_sym_name_fn(ray_t* x);
 
@@ -479,6 +480,8 @@ ray_t* ray_resolve_fn(ray_t** args, int64_t n);
 ray_t* ray_timeit_fn(ray_t** args, int64_t n);
 ray_t* ray_exit_fn(ray_t* arg);
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n);
+ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n);
+ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n);
 ray_t* ray_write_csv_fn(ray_t** args, int64_t n);
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val);
 ray_t* ray_type_fn(ray_t* val);
@@ -495,6 +498,7 @@ ray_t* ray_within_fn(ray_t* vals, ray_t* range);
 
 /* Query bridge builtins (formerly in eval.c, now in ops/query.c) */
 ray_t* ray_select_fn(ray_t** args, int64_t n);
+ray_t* ray_try_count_select_expr(ray_t* expr, int* handled);
 ray_t* ray_update_fn(ray_t** args, int64_t n);
 ray_t* ray_insert_fn(ray_t** args, int64_t n);
 ray_t* ray_upsert_fn(ray_t** args, int64_t n);

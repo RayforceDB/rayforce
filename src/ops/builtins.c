@@ -34,6 +34,8 @@
 #include "core/types.h"
 #include "io/csv.h"
 #include "ops/ops.h"
+#include "store/part.h"
+#include "store/splay.h"
 #include "table/sym.h"
 #include "core/profile.h"
 #include "mem/sys.h"
@@ -470,12 +472,18 @@ static int8_t resolve_type_name(int64_t sym_id) {
 }
 
 ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
-    if (n < 1) return ray_error("domain", NULL);
+    if (n < 1 || n > 3) return ray_error("domain", NULL);
 
-    /* (read-csv [types] "path") or (read-csv "path") */
+    /* (read-csv [types] "path"), (read-csv [names] [types] "path"), or (read-csv "path") */
     ray_t* path_obj = NULL;
     ray_t* schema = NULL;
-    if (n >= 2 && ray_is_vec(args[0]) && args[0]->type == RAY_SYM) {
+    ray_t* names = NULL;
+    if (n >= 3 && ray_is_vec(args[0]) && args[0]->type == RAY_SYM &&
+        ray_is_vec(args[1]) && args[1]->type == RAY_SYM) {
+        names = args[0];
+        schema = args[1];
+        path_obj = args[2];
+    } else if (n >= 2 && ray_is_vec(args[0]) && args[0]->type == RAY_SYM) {
         schema = args[0];
         path_obj = args[1];
     } else {
@@ -493,19 +501,215 @@ ray_t* ray_read_csv_fn(ray_t** args, int64_t n) {
         int64_t ncols = schema->len;
         int8_t col_types[256];
         if (ncols > 256) return ray_error("limit", NULL);
-        int64_t* sym_ids = (int64_t*)ray_data(schema);
+        void* sym_data = ray_data(schema);
         for (int64_t i = 0; i < ncols; i++) {
-            col_types[i] = resolve_type_name(sym_ids[i]);
+            int64_t sid = ray_read_sym(sym_data, i, schema->type, schema->attrs);
+            col_types[i] = resolve_type_name(sid);
             if (col_types[i] < 0) return ray_error("type", NULL);
         }
-        ray_t* tbl = ray_read_csv_opts(path, 0, true, col_types, (int32_t)ncols);
-        if (!tbl || RAY_IS_ERR(tbl)) return ray_error("io", NULL);
+        int64_t col_names[256];
+        if (names) {
+            if (names->len != ncols) return ray_error("length", NULL);
+            void* name_data = ray_data(names);
+            for (int64_t i = 0; i < ncols; i++)
+                col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
+        }
+        ray_t* tbl = names
+            ? ray_read_csv_named_opts(path, 0, false, col_types, (int32_t)ncols,
+                                      col_names, (int32_t)ncols)
+            : ray_read_csv_opts(path, 0, true, col_types, (int32_t)ncols);
+        if (!tbl) return ray_error("io", NULL);
+        if (RAY_IS_ERR(tbl)) return tbl;
         return tbl;
     }
 
     ray_t* tbl = ray_read_csv(path);
-    if (!tbl || RAY_IS_ERR(tbl)) return ray_error("io", NULL);
+    if (!tbl) return ray_error("io", NULL);
+    if (RAY_IS_ERR(tbl)) return tbl;
     return tbl;
+}
+
+static const char* csv_str_arg(ray_t* s, char* buf, size_t bufsz) {
+    if (!s || s->type != -RAY_STR) return NULL;
+    const char* p = ray_str_ptr(s);
+    size_t len = ray_str_len(s);
+    if (!p || len == 0 || len >= bufsz) return NULL;
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static const char* csv_sym_arg(ray_t* s, char* buf, size_t bufsz) {
+    if (!s || s->type != -RAY_SYM) return NULL;
+    ray_t* text = ray_sym_str(s->i64);
+    if (!text) return NULL;
+    const char* p = ray_str_ptr(text);
+    size_t len = ray_str_len(text);
+    if (!p || len == 0 || len >= bufsz) {
+        ray_release(text);
+        return NULL;
+    }
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    ray_release(text);
+    return buf;
+}
+
+static int csv_valid_table_name(const char* name) {
+    return name && name[0] != '\0' && name[0] != '.' &&
+           !strchr(name, '/') && !strchr(name, '\\') && !strstr(name, "..");
+}
+
+static const char* csv_default_sym_path(const char* dir, char* buf, size_t bufsz) {
+    int n = snprintf(buf, bufsz, "%s/sym", dir);
+    if (n < 0 || (size_t)n >= bufsz) return NULL;
+    return buf;
+}
+
+ray_t* ray_read_csv_splayed_fn(ray_t** args, int64_t n) {
+    if (n < 2 || n > 4) return ray_error("domain", NULL);
+
+    char dir[1024];
+    if (!csv_str_arg(args[n - 1], dir, sizeof(dir))) return ray_error("type", NULL);
+
+    int64_t data_n = n - 1;
+    ray_t* path_obj = NULL;
+    ray_t* schema = NULL;
+    ray_t* names = NULL;
+    if (data_n >= 3 && ray_is_vec(args[0]) && args[0]->type == RAY_SYM &&
+        ray_is_vec(args[1]) && args[1]->type == RAY_SYM) {
+        names = args[0];
+        schema = args[1];
+        path_obj = args[2];
+    } else if (data_n >= 2 && ray_is_vec(args[0]) && args[0]->type == RAY_SYM) {
+        schema = args[0];
+        path_obj = args[1];
+    } else if (data_n == 1) {
+        path_obj = args[0];
+    } else {
+        return ray_error("domain", NULL);
+    }
+    if (!path_obj || path_obj->type != -RAY_STR) return ray_error("type", NULL);
+    const char* path = ray_str_ptr(path_obj);
+    if (!path) return ray_error("domain", NULL);
+
+    int8_t col_types[256];
+    int64_t col_names[256];
+    int32_t ncols = 0;
+    const int8_t* types_arg = NULL;
+    const int64_t* names_arg = NULL;
+    bool header = true;
+
+    if (schema) {
+        if (schema->len > 256) return ray_error("limit", NULL);
+        ncols = (int32_t)schema->len;
+        void* sym_data = ray_data(schema);
+        for (int64_t i = 0; i < schema->len; i++) {
+            int64_t sid = ray_read_sym(sym_data, i, schema->type, schema->attrs);
+            col_types[i] = resolve_type_name(sid);
+            if (col_types[i] < 0) return ray_error("type", NULL);
+        }
+        types_arg = col_types;
+        if (names) {
+            if (names->len != schema->len) return ray_error("length", NULL);
+            void* name_data = ray_data(names);
+            for (int64_t i = 0; i < names->len; i++)
+                col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
+            names_arg = col_names;
+            header = false;
+        }
+    }
+
+    ray_err_t err = ray_csv_save_splayed_named_opts(path, 0, header,
+                                                    types_arg, ncols,
+                                                    names_arg, ncols,
+                                                    dir, 0);
+    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+
+    char sym_path[1024];
+    const char* sym = csv_default_sym_path(dir, sym_path, sizeof(sym_path));
+    if (!sym) return ray_error("io", NULL);
+    return ray_read_splayed(dir, sym);
+}
+
+ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
+    if (n < 3 || n > 6) return ray_error("domain", NULL);
+
+    char root[1024];
+    if (!csv_str_arg(args[n - 2], root, sizeof(root))) return ray_error("type", NULL);
+
+    char table_name[256];
+    if (!csv_sym_arg(args[n - 1], table_name, sizeof(table_name)))
+        return ray_error("type", NULL);
+    if (!csv_valid_table_name(table_name)) return ray_error("domain", NULL);
+
+    int64_t rows_per_part = 0;
+    int64_t data_n = n - 2;
+    if (data_n >= 2 && is_numeric(args[n - 3])) {
+        rows_per_part = as_i64(args[n - 3]);
+        if (rows_per_part <= 0) return ray_error("domain", NULL);
+        data_n--;
+    }
+    ray_t* path_obj = NULL;
+    ray_t* schema = NULL;
+    ray_t* names = NULL;
+    if (data_n >= 3 && ray_is_vec(args[0]) && args[0]->type == RAY_SYM &&
+        ray_is_vec(args[1]) && args[1]->type == RAY_SYM) {
+        names = args[0];
+        schema = args[1];
+        path_obj = args[2];
+    } else if (data_n >= 2 && ray_is_vec(args[0]) && args[0]->type == RAY_SYM) {
+        schema = args[0];
+        path_obj = args[1];
+    } else if (data_n == 1) {
+        path_obj = args[0];
+    } else {
+        return ray_error("domain", NULL);
+    }
+
+    if (!path_obj || path_obj->type != -RAY_STR) return ray_error("type", NULL);
+    const char* path = ray_str_ptr(path_obj);
+    if (!path) return ray_error("domain", NULL);
+
+    int8_t col_types[256];
+    int64_t col_names[256];
+    int32_t ncols = 0;
+    const int8_t* types_arg = NULL;
+    const int64_t* names_arg = NULL;
+    bool header = true;
+
+    if (schema) {
+        if (schema->len > 256) return ray_error("limit", NULL);
+        ncols = (int32_t)schema->len;
+        void* sym_data = ray_data(schema);
+        for (int64_t i = 0; i < schema->len; i++) {
+            int64_t sid = ray_read_sym(sym_data, i, schema->type, schema->attrs);
+            col_types[i] = resolve_type_name(sid);
+            if (col_types[i] < 0) return ray_error("type", NULL);
+        }
+        types_arg = col_types;
+        if (names) {
+            if (names->len != schema->len) return ray_error("length", NULL);
+            void* name_data = ray_data(names);
+            for (int64_t i = 0; i < names->len; i++)
+                col_names[i] = ray_read_sym(name_data, i, names->type, names->attrs);
+            names_arg = col_names;
+            header = false;
+        }
+    }
+
+    ray_err_t err = ray_csv_save_parted_named_opts(path, 0, header,
+                                                   types_arg, ncols,
+                                                   names_arg, ncols,
+                                                   root, table_name, rows_per_part);
+    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+
+    ray_t* out = ray_read_parted(root, table_name);
+    if (getenv("RAY_CSV_TRACE") && out && RAY_IS_ERR(out)) {
+        fprintf(stderr, "csv.parted: read_parted failure root=%s table=%s err=%s\n",
+                root, table_name, ray_err_code(out));
+    }
+    return out;
 }
 
 /* (write-csv table path) — write table to CSV file */
