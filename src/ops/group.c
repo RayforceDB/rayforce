@@ -3107,6 +3107,12 @@ typedef struct {
     uint32_t    n_workers;
     const int64_t* match_idx;    /* NULL = no selection */
     ray_t*      rowsel;
+    /* DA-path early-out: once any worker observes a key span wider than
+     * span_budget the direct-array path is provably infeasible (its slot
+     * count would exceed DA_MAX_COMPOSITE_SLOTS), so the whole scan can
+     * stop instead of reading the rest of a 10M-row column for nothing. */
+    int64_t          span_budget;
+    _Atomic(int)*    abort_flag;
 } minmax_ctx_t;
 
 static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -3115,11 +3121,25 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
     const int64_t* match_idx = c->match_idx;
     int64_t kmin = INT64_MAX, kmax = INT64_MIN;
     int8_t t = c->key_type;
+    const int64_t span_budget = c->span_budget;
 
+    /* Span check and abort poll are batched (every 8192 rows) so the
+     * hot per-row loop body stays a branchless min/max with no atomics. */
     #define MINMAX_SEG_LOOP(TYPE, CAST) \
         do { \
             const TYPE* kd = (const TYPE*)c->key_data; \
             for (int64_t i = start; i < end; i++) { \
+                if (((i - start) & 8191) == 0) { \
+                    if (atomic_load_explicit(c->abort_flag, \
+                                             memory_order_relaxed)) \
+                        goto minmax_done; \
+                    if (kmax >= kmin && \
+                        (uint64_t)(kmax - kmin) > (uint64_t)span_budget) { \
+                        atomic_store_explicit(c->abort_flag, 1, \
+                                              memory_order_relaxed); \
+                        goto minmax_done; \
+                    } \
+                } \
                 int64_t r = match_idx ? match_idx[i] : i; \
                 if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
                 int64_t v = (int64_t)CAST kd[r]; \
@@ -3146,6 +3166,7 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
 
     #undef MINMAX_SEG_LOOP
 
+minmax_done:
     /* Merge with existing per-worker values (a worker may process multiple morsels) */
     if (kmin < c->per_worker_min[wid]) c->per_worker_min[wid] = kmin;
     if (kmax > c->per_worker_max[wid]) c->per_worker_max[wid] = kmax;
@@ -5414,6 +5435,9 @@ da_path:;
                             ? ray_pool_total_workers(mm_pool) : 1;
             /* VLA bounded by worker count — max ~2KB per key even on 256-core systems. */
             int64_t mm_mins[mm_n], mm_maxs[mm_n];
+            /* Shared across keys: once any key proves the DA slot count
+             * infeasible the scan aborts instead of reading the rest. */
+            _Atomic(int) mm_abort = 0;
             for (uint8_t k = 0; k < n_keys && da_fits; k++) {
                 int64_t kmin, kmax;
                 for (uint32_t w = 0; w < mm_n; w++) {
@@ -5429,11 +5453,17 @@ da_path:;
                     .n_workers      = mm_n,
                     .match_idx      = match_idx,
                     .rowsel         = rowsel,
+                    .span_budget    = DA_MAX_COMPOSITE_SLOTS,
+                    .abort_flag     = &mm_abort,
                 };
                 if (mm_n > 1) {
                     ray_pool_dispatch(mm_pool, minmax_scan_fn, &mm_ctx, n_scan);
                 } else {
                     minmax_scan_fn(&mm_ctx, 0, 0, n_scan);
+                }
+                if (atomic_load_explicit(&mm_abort, memory_order_relaxed)) {
+                    da_fits = false;
+                    break;
                 }
                 kmin = INT64_MAX; kmax = INT64_MIN;
                 for (uint32_t w = 0; w < mm_n; w++) {
