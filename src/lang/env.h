@@ -43,7 +43,6 @@ static inline const char* ray_fn_name(const ray_t* fn) {
 ray_err_t ray_env_init(void);
 void     ray_env_destroy(void);
 ray_t*    ray_env_get(int64_t sym_id);
-uint64_t  ray_env_generation(void);
 
 /* User-facing binder.  Refuses any name starting with `.` — that root is
  * reserved for system namespaces (.sys, .os, .io, .ipc, …) populated by

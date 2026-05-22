@@ -30,17 +30,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static _Atomic uint64_t g_env_generation = 1;
-
-uint64_t ray_env_generation(void) {
-    return atomic_load_explicit(&g_env_generation, memory_order_relaxed);
-}
-
-static void env_bump_generation_if_user(int is_user) {
-    if (is_user)
-        atomic_fetch_add_explicit(&g_env_generation, 1, memory_order_relaxed);
-}
-
 /* ---- Function constructors ---- */
 
 /* Builtin name stored inline in nullmap[2..15] (max 13 chars + null).
@@ -311,7 +300,6 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
                     g_env.user[j] = g_env.user[j + 1];
                 }
                 g_env.count--;
-                env_bump_generation_if_user(is_user);
                 env_unlock();
                 return RAY_OK;
             }
@@ -324,7 +312,6 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
              * flag alone — once user, always user, until the slot is
              * deleted. */
             if (is_user) g_env.user[i] = 1;
-            env_bump_generation_if_user(is_user);
             env_unlock();
             return RAY_OK;
         }
@@ -342,7 +329,6 @@ static ray_err_t env_bind_global_impl(int64_t sym_id, ray_t* val, int is_user) {
     g_env.vals[g_env.count] = val;
     g_env.user[g_env.count] = is_user ? 1 : 0;
     g_env.count++;
-    env_bump_generation_if_user(is_user);
     env_unlock();
     return RAY_OK;
 }

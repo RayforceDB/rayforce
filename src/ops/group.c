@@ -243,46 +243,6 @@ static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_t
      * and the last worker's last is the global last. */
 }
 
-typedef struct {
-    ray_t*       input;
-    const void*  data;
-    int64_t      len;
-    int8_t       type;
-    uint8_t      attrs;
-    reduce_acc_t acc;
-} reduce_cache_entry_t;
-
-static reduce_cache_entry_t g_reduce_cache[16];
-static uint32_t g_reduce_cache_next = 0;
-
-static bool reduce_cache_allowed(ray_t* input, const int64_t* sel_idx) {
-    return input && input->mmod != 0 && sel_idx == NULL;
-}
-
-static bool reduce_cache_get(ray_t* input, reduce_acc_t* out) {
-    const void* data = ray_data(input);
-    for (size_t i = 0; i < sizeof(g_reduce_cache) / sizeof(g_reduce_cache[0]); i++) {
-        reduce_cache_entry_t* e = &g_reduce_cache[i];
-        if (e->input == input && e->data == data && e->len == input->len &&
-            e->type == input->type && e->attrs == input->attrs) {
-            *out = e->acc;
-            return true;
-        }
-    }
-    return false;
-}
-
-static void reduce_cache_put(ray_t* input, const reduce_acc_t* acc) {
-    reduce_cache_entry_t* e = &g_reduce_cache[
-        g_reduce_cache_next++ % (sizeof(g_reduce_cache) / sizeof(g_reduce_cache[0]))];
-    e->input = input;
-    e->data = ray_data(input);
-    e->len = input->len;
-    e->type = input->type;
-    e->attrs = input->attrs;
-    e->acc = *acc;
-}
-
 /* Hash mixing constants used by the count-distinct kernel and helpers. */
 #define CD_HASH_K1 0x9E3779B97F4A7C15ULL
 #define CD_HASH_K2 0xBF58476D1CE4E5B9ULL
@@ -1855,18 +1815,6 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
         return ray_i64(read_col_i64(base, row, in_type, input->attrs));
     }
 
-    reduce_acc_t cached;
-    if ((op->opcode == OP_MIN || op->opcode == OP_MAX) &&
-        reduce_cache_allowed(input, sel_idx) &&
-        reduce_cache_get(input, &cached)) {
-        if (sel_idx_block) ray_release(sel_idx_block);
-        return op->opcode == OP_MIN
-            ? reduction_extreme_result(op, in_type, cached.cnt > 0,
-                                       cached.min_f, cached.min_i)
-            : reduction_extreme_result(op, in_type, cached.cnt > 0,
-                                       cached.max_f, cached.max_i);
-    }
-
     ray_pool_t* pool = ray_pool_get();
     if (pool && scan_n >= RAY_PARALLEL_THRESHOLD) {
         uint32_t nw = ray_pool_total_workers(pool);
@@ -1902,9 +1850,6 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                 break;
             }
         }
-
-        if (reduce_cache_allowed(input, sel_idx))
-            reduce_cache_put(input, &merged);
 
         ray_t* result;
         switch (op->opcode) {
@@ -1945,8 +1890,6 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     reduce_acc_init(&acc);
     reduce_range(input, 0, scan_n, &acc, has_nulls, sel_idx);
     if (sel_idx_block) ray_release(sel_idx_block);
-    if (reduce_cache_allowed(input, sel_idx))
-        reduce_cache_put(input, &acc);
 
     switch (op->opcode) {
         case OP_SUM:   return in_type == RAY_F64 ? ray_f64(acc.sum_f) : ray_i64(acc.sum_i);

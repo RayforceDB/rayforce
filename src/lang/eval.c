@@ -1487,116 +1487,9 @@ ray_t* ray_cond_fn(ray_t** args, int64_t n) {
     return make_i64(0);
 }
 
-static uint64_t do_cache_mix(uint64_t h, uint64_t v) {
-    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-    return h ? h : 0x9e3779b97f4a7c15ull;
-}
-
-static uint64_t do_cache_hash(ray_t* x) {
-    if (!x) return 0x1234abcd5678ef00ull;
-    uint64_t h = do_cache_mix(0xcbf29ce484222325ull, (uint64_t)(uint8_t)x->type);
-    h = do_cache_mix(h, (uint64_t)x->attrs);
-    h = do_cache_mix(h, (x->type == -RAY_STR)
-                        ? (uint64_t)ray_str_len(x)
-                        : (uint64_t)x->len);
-    if (x->type == RAY_LIST) {
-        ray_t** elems = (ray_t**)ray_data(x);
-        for (int64_t i = 0; i < x->len; i++)
-            h = do_cache_mix(h, do_cache_hash(elems[i]));
-    } else if (x->type == RAY_DICT) {
-        h = do_cache_mix(h, do_cache_hash(ray_dict_keys(x)));
-        h = do_cache_mix(h, do_cache_hash(ray_dict_vals(x)));
-    } else if (x->type == RAY_STR) {
-        for (int64_t i = 0; i < x->len; i++) {
-            size_t n = 0;
-            const char* s = ray_str_vec_get(x, i, &n);
-            for (size_t j = 0; s && j < n; j++)
-                h = do_cache_mix(h, (unsigned char)s[j]);
-        }
-    } else if (x->type == -RAY_STR) {
-        const char* s = ray_str_ptr(x);
-        size_t n = ray_str_len(x);
-        for (size_t i = 0; s && i < n; i++)
-            h = do_cache_mix(h, (unsigned char)s[i]);
-    } else if (x->type == RAY_SYM || x->type == -RAY_SYM ||
-               x->type == RAY_I64 || x->type == -RAY_I64 ||
-               x->type == RAY_TIMESTAMP || x->type == -RAY_TIMESTAMP) {
-        h = do_cache_mix(h, (uint64_t)x->i64);
-    } else if (x->type == RAY_I32 || x->type == -RAY_I32 ||
-               x->type == RAY_DATE || x->type == -RAY_DATE ||
-               x->type == RAY_TIME || x->type == -RAY_TIME) {
-        h = do_cache_mix(h, (uint64_t)(uint32_t)x->i32);
-    } else if (x->type == RAY_I16 || x->type == -RAY_I16) {
-        h = do_cache_mix(h, (uint64_t)(uint16_t)x->i16);
-    } else if (x->type == RAY_U8 || x->type == -RAY_U8 ||
-               x->type == RAY_BOOL || x->type == -RAY_BOOL) {
-        h = do_cache_mix(h, (uint64_t)x->u8);
-    } else if (x->type == RAY_F64 || x->type == -RAY_F64) {
-        uint64_t bits = 0;
-        memcpy(&bits, &x->f64, sizeof(bits));
-        h = do_cache_mix(h, bits);
-    }
-    return h;
-}
-
-static bool do_cache_contains_set(ray_t* x) {
-    if (!x || x->type != RAY_LIST) return false;
-    ray_t** elems = (ray_t**)ray_data(x);
-    if (x->len > 0 && elems[0] && elems[0]->type == -RAY_SYM) {
-        ray_t* s = ray_sym_str(elems[0]->i64);
-        bool is_set = s && ray_str_len(s) == 3 &&
-                      memcmp(ray_str_ptr(s), "set", 3) == 0;
-        if (s) ray_release(s);
-        if (is_set) return true;
-    }
-    for (int64_t i = 0; i < x->len; i++)
-        if (do_cache_contains_set(elems[i]))
-            return true;
-    return false;
-}
-
-static bool do_cache_is_null_name(ray_t* x) {
-    if (!x || x->type != -RAY_SYM || !(x->attrs & RAY_ATTR_NAME)) return false;
-    ray_t* s = ray_sym_str(x->i64);
-    bool ok = s && ray_str_len(s) == 4 && memcmp(ray_str_ptr(s), "null", 4) == 0;
-    if (s) ray_release(s);
-    return ok;
-}
-
-#define DO_NULL_CACHE_N 2048
-static uint64_t g_do_null_cache[DO_NULL_CACHE_N];
-static uint64_t g_do_null_cache_env_gen[DO_NULL_CACHE_N];
-static uint16_t g_do_null_cache_next = 0;
-
-static bool do_null_cache_get(uint64_t hash) {
-    if (!hash) return false;
-    uint64_t env_gen = ray_env_generation();
-    for (uint16_t i = 0; i < DO_NULL_CACHE_N; i++)
-        if (g_do_null_cache[i] == hash &&
-            g_do_null_cache_env_gen[i] == env_gen)
-            return true;
-    return false;
-}
-
-static void do_null_cache_put(uint64_t hash) {
-    if (hash) {
-        uint16_t slot = g_do_null_cache_next++ % DO_NULL_CACHE_N;
-        g_do_null_cache[slot] = hash;
-        g_do_null_cache_env_gen[slot] = ray_env_generation();
-    }
-}
-
 /* (do expr1 expr2 ...) — evaluate in sequence, return last. Pushes local scope. */
 ray_t* ray_do_fn(ray_t** args, int64_t n) {
     if (n == 0) return make_i64(0);
-    uint64_t null_cache_hash = 0;
-    if (g_ray_profile.active &&
-        n == 2 && do_cache_is_null_name(args[1]) &&
-        !do_cache_contains_set(args[0])) {
-        null_cache_hash = do_cache_hash(args[0]);
-        if (do_null_cache_get(null_cache_hash))
-            return NULL;
-    }
     if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
     ray_t* result = NULL;
     for (int64_t i = 0; i < n; i++) {
@@ -1610,8 +1503,6 @@ ray_t* ray_do_fn(ray_t** args, int64_t n) {
         }
     }
     ray_env_pop_scope();
-    if (null_cache_hash && result == NULL)
-        do_null_cache_put(null_cache_hash);
     return result;
 }
 
