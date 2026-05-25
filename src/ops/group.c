@@ -3112,23 +3112,30 @@ static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
  *   Phase3 (radix_phase3_fn) emits from part_hts[] exactly as before.
  * ============================================================================ */
 
-/* Merge one source group row (count + keys + null_mask) into the target HT.
- * Hash is recomputed from the row's key region via hash_keys_inline —
- * identical to what group_probe_entry did when the row was first inserted,
- * so the partition assignment is consistent.  Count-only: state merge is
- * just count += src_count; new groups inherit the source's count. */
-static inline uint32_t group_merge_count_row(group_ht_t* ht,
+/* Merge one source group row into the target HT.  Hash is recomputed from
+ * the row's key region via hash_keys_inline — identical to what
+ * group_probe_entry did when the row was first inserted, so the partition
+ * assignment is consistent.  Supports need_flags ∈ {0, GHT_NEED_SUM}:
+ * count-only and count+SUM/AVG.  On miss, the entire source row is copied
+ * verbatim (memcpy of row_stride); on hit, count += src.count and, when
+ * need_sum, each enabled sum slot accumulates the source's sum (f64 or
+ * i64 per agg_is_f64).  Caller's v2 gate filters out PROD/FIRST/LAST/
+ * MIN/MAX/SUMSQ/PEARSON/MEDIAN — those need richer state merges. */
+static inline uint32_t group_merge_row(group_ht_t* ht,
     const char* src_row, const int8_t* key_types, uint32_t mask)
 {
     const ght_layout_t* ly = &ht->layout;
     int64_t src_count = *(const int64_t*)src_row;
     const int64_t* skeys = (const int64_t*)(src_row + 8);
-    uint16_t key_bytes = (uint16_t)((ly->n_keys + 1) * 8);
     uint64_t h = hash_keys_inline(skeys, key_types, ly->n_keys,
                                   ly->wide_key_mask, ly->wide_key_esz,
                                   ht->key_data);
     uint8_t salt = HT_SALT(h);
     uint32_t slot = (uint32_t)(h & mask);
+    uint8_t na = ly->n_aggs;
+    uint8_t f64_mask = ly->agg_is_f64;
+    uint16_t off_sum = ly->off_sum;
+    bool need_sum = (ly->need_flags & GHT_NEED_SUM) != 0;
     for (;;) {
         uint32_t sv = ht->slots[slot];
         if (sv == HT_EMPTY) {
@@ -3137,8 +3144,8 @@ static inline uint32_t group_merge_count_row(group_ht_t* ht,
             }
             uint32_t gid = ht->grp_count++;
             char* row = ht->rows + (size_t)gid * ly->row_stride;
-            *(int64_t*)row = src_count;
-            memcpy(row + 8, skeys, key_bytes);
+            /* Whole-row copy: count + keys/null_mask + aggregator state. */
+            memcpy(row, src_row, ly->row_stride);
             ht->slots[slot] = HT_PACK(salt, gid);
             if (ht->grp_count * 2 > ht->ht_cap) {
                 group_ht_rehash(ht, key_types);
@@ -3152,6 +3159,22 @@ static inline uint32_t group_merge_count_row(group_ht_t* ht,
             if (group_keys_equal((const int64_t*)(row + 8),
                                   skeys, ly, ht->key_data)) {
                 *(int64_t*)row += src_count;
+                if (need_sum) {
+                    for (uint8_t a = 0; a < na; a++) {
+                        int8_t s = ly->agg_val_slot[a];
+                        if (s < 0) continue;
+                        size_t off = (size_t)off_sum + (size_t)s * 8;
+                        if (f64_mask & (1u << a)) {
+                            double sv_f;
+                            memcpy(&sv_f, src_row + off, 8);
+                            *(double*)(row + off) += sv_f;
+                        } else {
+                            int64_t sv_i;
+                            memcpy(&sv_i, src_row + off, 8);
+                            *(int64_t*)(row + off) += sv_i;
+                        }
+                    }
+                }
                 return mask;
             }
         }
@@ -3164,6 +3187,9 @@ typedef struct {
     int8_t*        key_types;
     uint8_t*       key_attrs;
     ray_t**        key_vecs;
+    ray_t**        agg_vecs;        /* may be NULL for pure COUNT (n_agg_vals==0) */
+    ray_t**        agg_vecs2;
+    uint8_t*       agg_strlen;
     uint8_t        nullable_mask;
     uint32_t       n_workers;
     group_ht_t*    wpart_hts;        /* [n_workers * RADIX_P] */
@@ -3237,8 +3263,37 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
         ek[nk] = null_mask;
         if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
         *(uint64_t*)ebuf = h;
-        /* Count-only: no agg_vals to pack; entry body ends at the null-mask
-         * slot.  The HT row layout matches (need_flags == 0). */
+        /* Pack agg values into entry — only when the HT layout actually
+         * reads them.  For count-only need_flags == 0 and accum_from_entry
+         * skips every agg slot; packing here would be a wasted column
+         * read per row (a measurable regression on q15-class queries). */
+        if (ly->need_flags) {
+            int64_t* ev = (int64_t*)(ebuf + 8 + ((size_t)nk + 1) * 8);
+            uint8_t vi = 0;
+            uint8_t na = ly->n_aggs;
+            uint8_t bin_mask = ly->agg_is_binary;
+            uint8_t hol_mask = ly->agg_is_holistic;
+            for (uint8_t a = 0; a < na; a++) {
+                if (hol_mask & (1u << a)) continue;
+                ray_t* ac = c->agg_vecs ? c->agg_vecs[a] : NULL;
+                if (!ac) continue;
+                if (c->agg_strlen && c->agg_strlen[a])
+                    ev[vi] = group_strlen_at(ac, row);
+                else if (ac->type == RAY_F64)
+                    memcpy(&ev[vi], &((double*)ray_data(ac))[row], 8);
+                else
+                    ev[vi] = read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
+                vi++;
+                if ((bin_mask & (1u << a)) && c->agg_vecs2 && c->agg_vecs2[a]) {
+                    ray_t* ay = c->agg_vecs2[a];
+                    if (ay->type == RAY_F64)
+                        memcpy(&ev[vi], &((double*)ray_data(ay))[row], 8);
+                    else
+                        ev[vi] = read_col_i64(ray_data(ay), row, ay->type, ay->attrs);
+                    vi++;
+                }
+            }
+        }
         uint32_t p = RADIX_PART(h);
         uint32_t new_mask = group_probe_entry(&my_hts[p], ebuf,
                                               c->key_types, masks[p]);
@@ -3294,9 +3349,9 @@ static void radix_v2_phase2_fn(void* ctx, uint32_t worker_id,
             if (src->grp_count == 0) continue;
             const char* rows = src->rows;
             for (uint32_t gi = 0; gi < src->grp_count; gi++) {
-                mask = group_merge_count_row(&c->part_hts[p],
-                                             rows + (size_t)gi * row_stride,
-                                             c->key_types, mask);
+                mask = group_merge_row(&c->part_hts[p],
+                                       rows + (size_t)gi * row_stride,
+                                       c->key_types, mask);
                 if (c->part_hts[p].oom) {
                     atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
                     return;
@@ -7505,16 +7560,40 @@ ht_path:;
 skip_top_count_filter:
 
     if (pool && nrows >= RAY_PARALLEL_THRESHOLD && n_total > 1 && !rowsel) {
-        /* Per-(worker, partition) direct-insert path for count-only.
-         * Bypasses the fat-entry materialisation and the phase1→phase2
-         * DRAM round trip; on success it populates part_hts[] in the
-         * same format the existing phase3 emit consumes. */
-        bool v2_count_only = (n_keys >= 1 && n_aggs > 0);
-        for (uint8_t a = 0; a < n_aggs && v2_count_only; a++)
-            if (ext->agg_ops[a] != OP_COUNT) v2_count_only = false;
-        if (v2_count_only && !(ght_layout.agg_is_first | ght_layout.agg_is_last
-                                | ght_layout.agg_is_holistic
-                                | ght_layout.agg_is_binary)) {
+        /* Per-(worker, partition) direct-insert path: aggregates into
+         * thread-local partition HTs during phase1, then merges per
+         * partition.  Bypasses the phase1 fat-entry materialisation +
+         * phase2 re-read DRAM round trip.  On success it populates
+         * part_hts[] in the format the existing phase3 emit consumes.
+         *
+         * Gate: every agg is COUNT/SUM/AVG (the merge primitive knows
+         * how to add counts and sum slots; PROD/MIN/MAX/FIRST/LAST/
+         * SUMSQ/PEARSON/MEDIAN need richer state-merge logic).  Agg
+         * input columns must be non-nullable for now — sentinel-skip
+         * inside accum_from_entry is correct, but the merge step needs
+         * an nn_count and that isn't tracked yet. */
+        bool v2_ok = (n_keys >= 1 && n_aggs > 0);
+        /* SYM single-key queries already had a tuned path (q33/q34 hit it
+         * before falling to the radix); v2 doesn't beat it for them, so
+         * skip when any key is SYM and let the existing pipeline handle it. */
+        for (uint8_t k = 0; k < n_keys && v2_ok; k++)
+            if (key_types[k] == RAY_SYM) v2_ok = false;
+        for (uint8_t a = 0; a < n_aggs && v2_ok; a++) {
+            uint16_t op = ext->agg_ops[a];
+            if (op != OP_COUNT && op != OP_SUM && op != OP_AVG) {
+                v2_ok = false;
+                break;
+            }
+            if (agg_vecs[a]) {
+                ray_t* src = (agg_vecs[a]->attrs & RAY_ATTR_SLICE)
+                             ? agg_vecs[a]->slice_parent : agg_vecs[a];
+                if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
+                    v2_ok = false;
+            }
+        }
+        if (v2_ok && !(ght_layout.agg_is_first | ght_layout.agg_is_last
+                        | ght_layout.agg_is_holistic
+                        | ght_layout.agg_is_binary)) {
             ray_t* wpart_hdr = NULL;
             size_t v2_n_w = (size_t)n_total * RADIX_P;
             group_ht_t* wpart_hts = (group_ht_t*)scratch_calloc(
@@ -7542,6 +7621,9 @@ skip_top_count_filter:
                 .key_types     = key_types,
                 .key_attrs     = key_attrs,
                 .key_vecs      = key_vecs,
+                .agg_vecs      = agg_vecs,
+                .agg_vecs2     = agg_vecs2,
+                .agg_strlen    = agg_strlen,
                 .nullable_mask = v2_nullable,
                 .n_workers     = n_total,
                 .wpart_hts     = wpart_hts,
