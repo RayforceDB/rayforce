@@ -3094,6 +3094,219 @@ static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
 }
 
 /* ============================================================================
+ * Fused radix: per-(worker, partition) HT direct-insert + per-partition merge
+ *
+ *   Replaces the materialise-fat-entries-then-build-HTs round trip with a
+ *   single-pass aggregation per (worker, partition) HT, followed by an
+ *   in-cache merge per partition.  Currently restricted to count-only
+ *   queries (every agg is OP_COUNT) — the merge primitive here only
+ *   knows how to combine counts; SUM/AVG/MIN/MAX would need their own
+ *   state-merge logic (next increment).
+ *
+ *   Per-(worker, partition) HT for a 10M-row count-by-UserID: ~3M distinct
+ *   keys ÷ 256 parts ÷ 8 workers ≈ 1.5K groups → cap ~4K slots → ~64 KB
+ *   row store, L1/L2-resident.  Worker w processes its row range; per row
+ *   it hashes keys, computes partition = RADIX_PART(h), probes its local
+ *   HT_p.  Phase2 dispatches partitions across workers; each merges the n
+ *   worker HTs for one partition into a final partition HT in part_hts[p].
+ *   Phase3 (radix_phase3_fn) emits from part_hts[] exactly as before.
+ * ============================================================================ */
+
+/* Merge one source group row (count + keys + null_mask) into the target HT.
+ * Hash is recomputed from the row's key region via hash_keys_inline —
+ * identical to what group_probe_entry did when the row was first inserted,
+ * so the partition assignment is consistent.  Count-only: state merge is
+ * just count += src_count; new groups inherit the source's count. */
+static inline uint32_t group_merge_count_row(group_ht_t* ht,
+    const char* src_row, const int8_t* key_types, uint32_t mask)
+{
+    const ght_layout_t* ly = &ht->layout;
+    int64_t src_count = *(const int64_t*)src_row;
+    const int64_t* skeys = (const int64_t*)(src_row + 8);
+    uint16_t key_bytes = (uint16_t)((ly->n_keys + 1) * 8);
+    uint64_t h = hash_keys_inline(skeys, key_types, ly->n_keys,
+                                  ly->wide_key_mask, ly->wide_key_esz,
+                                  ht->key_data);
+    uint8_t salt = HT_SALT(h);
+    uint32_t slot = (uint32_t)(h & mask);
+    for (;;) {
+        uint32_t sv = ht->slots[slot];
+        if (sv == HT_EMPTY) {
+            if (ht->grp_count >= ht->grp_cap) {
+                if (!group_ht_grow(ht)) { ht->oom = 1; return mask; }
+            }
+            uint32_t gid = ht->grp_count++;
+            char* row = ht->rows + (size_t)gid * ly->row_stride;
+            *(int64_t*)row = src_count;
+            memcpy(row + 8, skeys, key_bytes);
+            ht->slots[slot] = HT_PACK(salt, gid);
+            if (ht->grp_count * 2 > ht->ht_cap) {
+                group_ht_rehash(ht, key_types);
+                mask = ht->ht_cap - 1;
+            }
+            return mask;
+        }
+        if (HT_SALT_V(sv) == salt) {
+            uint32_t gid = HT_GID(sv);
+            char* row = ht->rows + (size_t)gid * ly->row_stride;
+            if (group_keys_equal((const int64_t*)(row + 8),
+                                  skeys, ly, ht->key_data)) {
+                *(int64_t*)row += src_count;
+                return mask;
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+typedef struct {
+    void**         key_data;
+    int8_t*        key_types;
+    uint8_t*       key_attrs;
+    ray_t**        key_vecs;
+    uint8_t        nullable_mask;
+    uint32_t       n_workers;
+    group_ht_t*    wpart_hts;        /* [n_workers * RADIX_P] */
+    ght_layout_t   layout;
+    ray_t*         rowsel;
+    const int64_t* match_idx;
+    _Atomic(int)   oom;
+} radix_v2_phase1_ctx_t;
+
+static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
+                               int64_t start, int64_t end) {
+    radix_v2_phase1_ctx_t* c = (radix_v2_phase1_ctx_t*)ctx;
+    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
+    const ght_layout_t* ly = &c->layout;
+    uint8_t nk = ly->n_keys;
+    uint8_t wide = ly->wide_key_mask;
+    uint8_t nullable = c->nullable_mask;
+    const int64_t* match_idx = c->match_idx;
+
+    group_ht_t* my_hts = &c->wpart_hts[(size_t)worker_id * RADIX_P];
+    /* Lazily init this worker's 256 partition HTs. */
+    for (uint32_t p = 0; p < RADIX_P; p++) {
+        if (!my_hts[p].slots) {
+            if (!group_ht_init_sized(&my_hts[p], 256, ly, 128)) {
+                atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+                return;
+            }
+            if (wide && c->key_data)
+                group_ht_set_key_data(&my_hts[p], c->key_data);
+        }
+    }
+    uint32_t masks[RADIX_P];
+    for (uint32_t p = 0; p < RADIX_P; p++) masks[p] = my_hts[p].ht_cap - 1;
+
+    /* Stack-resident transient entry, same layout as group_rows_range. */
+    char ebuf[8 + 9 * 8 + 8 * 8 + 8];
+    for (int64_t i = start; i < end; i++) {
+        if (((i - start) & 65535) == 0 && ray_interrupted()) break;
+        int64_t row = match_idx ? match_idx[i] : i;
+        if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, row))
+            continue;
+        uint64_t h = 0;
+        int64_t* ek = (int64_t*)(ebuf + 8);
+        int64_t null_mask = 0;
+        for (uint8_t k = 0; k < nk; k++) {
+            int8_t t = c->key_types[k];
+            uint64_t kh;
+            bool is_null = (nullable & (1u << k))
+                           && ray_vec_is_null(c->key_vecs[k], row);
+            if (is_null) {
+                null_mask |= (int64_t)(1u << k);
+                ek[k] = 0;
+                kh = ray_hash_i64(0);
+            } else if (wide & (1u << k)) {
+                uint8_t esz = ly->wide_key_esz[k];
+                const void* src = (const char*)c->key_data[k] + (size_t)row * esz;
+                ek[k] = row;
+                kh = ray_hash_bytes(src, esz);
+            } else if (t == RAY_F64) {
+                int64_t kv;
+                memcpy(&kv, &((double*)c->key_data[k])[row], 8);
+                ek[k] = kv;
+                kh = ray_hash_f64(((double*)c->key_data[k])[row]);
+            } else {
+                int64_t kv = read_col_i64(c->key_data[k], row, t, c->key_attrs[k]);
+                ek[k] = kv;
+                kh = ray_hash_i64(kv);
+            }
+            h = (k == 0) ? kh : ray_hash_combine(h, kh);
+        }
+        ek[nk] = null_mask;
+        if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
+        *(uint64_t*)ebuf = h;
+        /* Count-only: no agg_vals to pack; entry body ends at the null-mask
+         * slot.  The HT row layout matches (need_flags == 0). */
+        uint32_t p = RADIX_PART(h);
+        uint32_t new_mask = group_probe_entry(&my_hts[p], ebuf,
+                                              c->key_types, masks[p]);
+        if (my_hts[p].oom) {
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            return;
+        }
+        masks[p] = new_mask;
+    }
+}
+
+typedef struct {
+    group_ht_t*   wpart_hts;     /* [n_workers * RADIX_P] — input */
+    group_ht_t*   part_hts;      /* [RADIX_P] — output */
+    int8_t*       key_types;
+    uint32_t      n_workers;
+    ght_layout_t  layout;
+    void**        key_data;
+    _Atomic(int)  oom;
+} radix_v2_phase2_ctx_t;
+
+static void radix_v2_phase2_fn(void* ctx, uint32_t worker_id,
+                               int64_t start, int64_t end) {
+    (void)worker_id;
+    radix_v2_phase2_ctx_t* c = (radix_v2_phase2_ctx_t*)ctx;
+    if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
+    uint16_t row_stride = c->layout.row_stride;
+    for (int64_t p = start; p < end; p++) {
+        /* Upper bound on the merged partition: sum of worker grp_counts
+         * (some keys may be present in multiple workers — the merge will
+         * fold those, so the final grp_count is ≤ this sum). */
+        uint32_t total_grps = 0;
+        for (uint32_t w = 0; w < c->n_workers; w++)
+            total_grps += c->wpart_hts[(size_t)w * RADIX_P + p].grp_count;
+        if (total_grps == 0) continue;
+        uint32_t ht_cap = 256;
+        {
+            uint64_t target = (uint64_t)total_grps * 2;
+            if (target < 256) target = 256;
+            while (ht_cap < target) ht_cap *= 2;
+        }
+        uint32_t init_grp = 256;
+        while (init_grp < total_grps && init_grp < 65536) init_grp *= 2;
+        if (!group_ht_init_sized(&c->part_hts[p], ht_cap, &c->layout, init_grp)) {
+            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+            return;
+        }
+        if (c->layout.wide_key_mask && c->key_data)
+            group_ht_set_key_data(&c->part_hts[p], c->key_data);
+        uint32_t mask = c->part_hts[p].ht_cap - 1;
+        for (uint32_t w = 0; w < c->n_workers; w++) {
+            group_ht_t* src = &c->wpart_hts[(size_t)w * RADIX_P + p];
+            if (src->grp_count == 0) continue;
+            const char* rows = src->rows;
+            for (uint32_t gi = 0; gi < src->grp_count; gi++) {
+                mask = group_merge_count_row(&c->part_hts[p],
+                                             rows + (size_t)gi * row_stride,
+                                             c->key_types, mask);
+                if (c->part_hts[p].oom) {
+                    atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/* ============================================================================
  * Parallel direct-array accumulation for low-cardinality single integer key
  * ============================================================================ */
 
@@ -7292,6 +7505,87 @@ ht_path:;
 skip_top_count_filter:
 
     if (pool && nrows >= RAY_PARALLEL_THRESHOLD && n_total > 1 && !rowsel) {
+        /* Per-(worker, partition) direct-insert path for count-only.
+         * Bypasses the fat-entry materialisation and the phase1→phase2
+         * DRAM round trip; on success it populates part_hts[] in the
+         * same format the existing phase3 emit consumes. */
+        bool v2_count_only = (n_keys >= 1 && n_aggs > 0);
+        for (uint8_t a = 0; a < n_aggs && v2_count_only; a++)
+            if (ext->agg_ops[a] != OP_COUNT) v2_count_only = false;
+        if (v2_count_only && !(ght_layout.agg_is_first | ght_layout.agg_is_last
+                                | ght_layout.agg_is_holistic
+                                | ght_layout.agg_is_binary)) {
+            ray_t* wpart_hdr = NULL;
+            size_t v2_n_w = (size_t)n_total * RADIX_P;
+            group_ht_t* wpart_hts = (group_ht_t*)scratch_calloc(
+                &wpart_hdr, v2_n_w * sizeof(group_ht_t));
+            ray_t* v2_part_hdr = NULL;
+            group_ht_t* v2_part_hts = wpart_hts
+                ? (group_ht_t*)scratch_calloc(&v2_part_hdr,
+                                              RADIX_P * sizeof(group_ht_t))
+                : NULL;
+            if (!wpart_hts || !v2_part_hts) {
+                if (wpart_hts) scratch_free(wpart_hdr);
+                if (v2_part_hts) scratch_free(v2_part_hdr);
+                goto v2_done;
+            }
+            uint8_t v2_nullable = 0;
+            for (uint8_t k = 0; k < n_keys; k++) {
+                if (!key_vecs[k]) continue;
+                ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
+                             ? key_vecs[k]->slice_parent : key_vecs[k];
+                if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
+                    v2_nullable |= (uint8_t)(1u << k);
+            }
+            radix_v2_phase1_ctx_t v2p1 = {
+                .key_data      = key_data,
+                .key_types     = key_types,
+                .key_attrs     = key_attrs,
+                .key_vecs      = key_vecs,
+                .nullable_mask = v2_nullable,
+                .n_workers     = n_total,
+                .wpart_hts     = wpart_hts,
+                .layout        = ght_layout,
+                .rowsel        = rowsel,
+                .match_idx     = match_idx,
+                .oom           = 0,
+            };
+            ray_pool_dispatch(pool, radix_v2_phase1_fn, &v2p1, n_scan);
+            CHECK_CANCEL_GOTO(pool, cleanup);
+            if (atomic_load_explicit(&v2p1.oom, memory_order_relaxed)) {
+                for (size_t i = 0; i < v2_n_w; i++)
+                    group_ht_free(&wpart_hts[i]);
+                scratch_free(wpart_hdr);
+                scratch_free(v2_part_hdr);
+                goto v2_done;
+            }
+            radix_v2_phase2_ctx_t v2p2 = {
+                .wpart_hts = wpart_hts,
+                .part_hts  = v2_part_hts,
+                .key_types = key_types,
+                .n_workers = n_total,
+                .layout    = ght_layout,
+                .key_data  = key_data,
+                .oom       = 0,
+            };
+            ray_pool_dispatch_n(pool, radix_v2_phase2_fn, &v2p2, RADIX_P);
+            CHECK_CANCEL_GOTO(pool, cleanup);
+            /* Worker HTs are no longer needed once the merge is done. */
+            for (size_t i = 0; i < v2_n_w; i++)
+                group_ht_free(&wpart_hts[i]);
+            scratch_free(wpart_hdr);
+            if (atomic_load_explicit(&v2p2.oom, memory_order_relaxed)) {
+                for (uint32_t p = 0; p < RADIX_P; p++)
+                    group_ht_free(&v2_part_hts[p]);
+                scratch_free(v2_part_hdr);
+                goto v2_done;
+            }
+            /* Hand off to the existing phase3 emit. */
+            part_hts = v2_part_hts;
+            part_hts_hdr = v2_part_hdr;
+            goto v2_emit;
+        }
+v2_done:;
         size_t n_bufs = (size_t)n_total * RADIX_P;
         radix_bufs = (radix_buf_t*)scratch_calloc(&radix_bufs_hdr,
             n_bufs * sizeof(radix_buf_t));
@@ -7394,6 +7688,7 @@ skip_top_count_filter:
             ray_heap_gc();
         }
 
+v2_emit:;
         /* Prefix offsets */
         uint32_t part_offsets[RADIX_P + 1];
         part_offsets[0] = 0;
