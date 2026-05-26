@@ -3669,10 +3669,21 @@ static ray_t* exec_filtered_group_multi(ray_graph_t* g, ray_op_ext_t* ext,
     }
     if (nrows < 0) return ray_error("nyi", NULL);
 
-    ctx.init_cap = FP_SHARD_INIT_CAP;
     atomic_store_explicit(&ctx.oom, 0, memory_order_relaxed);
     ray_pool_t* pool = ray_pool_get();
     uint32_t nw = pool ? ray_pool_total_workers(pool) : 1;
+    /* Pre-size each worker shard a bit larger than the 1024-slot default
+     * so high-cardinality queries don't pay log2(target/1024) rehashes.
+     * The cap stays modest (16 K slots ≈ ~750 KB per shard with a 4-slot
+     * agg state) so very selective predicates that produce a handful of
+     * groups don't burn RAM up front.  Sparse keys still grow on-demand. */
+    {
+        uint64_t expected = (uint64_t)nrows / ((uint64_t)nw * 16u);
+        uint64_t init_cap = FP_SHARD_INIT_CAP;
+        while (init_cap < expected * 2u && init_cap < (1ULL << 14))
+            init_cap <<= 1;
+        ctx.init_cap = init_cap;
+    }
     ray_t* shards_hdr = NULL;
     ctx.shards = (mk_shard_t*)scratch_calloc(&shards_hdr,
                                              (size_t)nw * sizeof(mk_shard_t));
