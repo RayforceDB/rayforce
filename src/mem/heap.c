@@ -1471,20 +1471,33 @@ void ray_heap_gc(void) {
         }
 
         /* Pass 5: Release physical pages from free blocks in every
-         * idle heap.  Pass 2 may have returned blocks to worker-owned
-         * freelists; releasing only the caller heap leaves those worker
-         * pages resident across large query repetitions. */
-        for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
-            ray_heap_t* gh = ray_heap_registry[hid];
-            if (!gh) continue;
-            for (int i = 13; i < RAY_HEAP_FL_SIZE; i++) {
-                ray_fl_head_t* head = &gh->freelist[i];
-                ray_t* blk = head->fl_next;
-                while (blk != (ray_t*)head) {
-                    size_t bsize = BSIZEOF(i);
-                    if (bsize > 4096)
-                        ray_vm_release((char*)blk + 4096, bsize - 4096);
-                    blk = blk->fl_next;
+         * idle heap, throttled to once every PASS5_PERIOD GCs.
+         *
+         * The original unthrottled walk issued one madvise(MADV_DONTNEED)
+         * per free block > 4 KB on every GC.  For repeated-query
+         * workloads (any bench / OLAP loop) the freed blocks would be
+         * reused on the very next query — but the madvise tears down
+         * page tables and forces a re-fault, paying the cost twice.
+         *
+         * Period 16 keeps the long-running-process invariant (free
+         * blocks eventually return physical pages to the OS) while
+         * removing the per-query madvise cost.  Explicit callers
+         * needing prompt release should use ray_heap_release_pages. */
+        static uint32_t pass5_counter = 0;
+        enum { PASS5_PERIOD = 16 };
+        if ((++pass5_counter % PASS5_PERIOD) == 0) {
+            for (int hid = 0; hid < RAY_HEAP_REGISTRY_SIZE; hid++) {
+                ray_heap_t* gh = ray_heap_registry[hid];
+                if (!gh) continue;
+                for (int i = 13; i < RAY_HEAP_FL_SIZE; i++) {
+                    ray_fl_head_t* head = &gh->freelist[i];
+                    ray_t* blk = head->fl_next;
+                    while (blk != (ray_t*)head) {
+                        size_t bsize = BSIZEOF(i);
+                        if (bsize > 4096)
+                            ray_vm_release((char*)blk + 4096, bsize - 4096);
+                        blk = blk->fl_next;
+                    }
                 }
             }
         }
