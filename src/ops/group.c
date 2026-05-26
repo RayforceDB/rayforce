@@ -2345,6 +2345,16 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
     uint32_t slot = (uint32_t)(hash & mask);
     uint16_t key_bytes = (uint16_t)((ly->n_keys + 1) * 8);
 
+    /* For count-only queries (no SUM/MIN/MAX/SUMSQ/PEARSON aggregator
+     * state, no FIRST/LAST row tracking, no binary aggregator y-side)
+     * init_accum_from_entry and accum_from_entry are no-ops on every
+     * non-count slot — the per-row call still iterates n_aggs slots,
+     * reads agg_val_slot[a], memcpy's the entry's agg value into a
+     * local, then drops it.  That's ~6 ns / row × n_keys=1 millions of
+     * rows, ~7 ms wall on q15.  Skip the call when none of the flags
+     * that drive its writes are set. */
+    uint8_t accum_skip = (ly->need_flags == 0
+        && (ly->agg_is_first | ly->agg_is_last | ly->agg_is_binary) == 0);
     for (;;) {
         uint32_t sv = ht->slots[slot];
         if (sv == HT_EMPTY) {
@@ -2356,7 +2366,8 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
             char* row = ht->rows + (size_t)gid * ly->row_stride;
             *(int64_t*)row = 1;   /* count = 1 */
             memcpy(row + 8, ekeys, key_bytes);
-            init_accum_from_entry(row, entry, ly);
+            if (!accum_skip)
+                init_accum_from_entry(row, entry, ly);
             ht->slots[slot] = HT_PACK(salt, gid);
             if (ht->grp_count * 2 > ht->ht_cap) {
                 group_ht_rehash(ht, key_types);
@@ -2370,7 +2381,8 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
             if (group_keys_equal((const int64_t*)(row + 8),
                                   (const int64_t*)ekeys, ly, ht->key_data)) {
                 (*(int64_t*)row)++;   /* count++ */
-                accum_from_entry(row, entry, ly);
+                if (!accum_skip)
+                    accum_from_entry(row, entry, ly);
                 return mask;
             }
         }
