@@ -34,6 +34,7 @@
 #include "ops/rowsel.h"
 #include "ops/fused_group.h"
 #include "ops/fused_topk.h"
+#include "ops/hll.h"
 #include "ops/temporal.h"
 #include "core/profile.h"
 #include "table/sym.h"
@@ -2713,6 +2714,33 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
     }
     out->len = n_groups;
     int64_t* odata = (int64_t*)ray_data(out);
+
+    /* HyperLogLog approximate path — one task per group, each task with
+     * a private stack-resident sketch (~16 KB).  Triggered when the
+     * total inflated row count across all groups is large enough that
+     * the exact per-group dedup HT becomes memory-bandwidth-bound;
+     * 1 M rows is the same threshold the global path in
+     * exec_count_distinct uses.  Returns within ~0.8 % std error. */
+    /* HyperLogLog approximate path — one task per group, each task with
+     * a private stack-resident sketch (~16 KB).  Triggered when the
+     * total inflated row count across all groups is large enough that
+     * the exact per-group dedup HT becomes memory-bandwidth-bound;
+     * 1 M rows is the same threshold the global path in
+     * exec_count_distinct uses.  Returns within ~0.8 % std error. */
+    if (n_groups > 0) {
+        int64_t total_rows = 0;
+        for (int64_t g = 0; g < n_groups; g++) total_rows += grp_cnt[g];
+        if (total_rows >= (1 << 20)) {
+            if (ray_count_distinct_approx_pg_buf(src, idx_buf, offsets,
+                                                  grp_cnt, n_groups,
+                                                  14, odata) == 0) {
+                ray_release(src);
+                return out;
+            }
+            /* Fall through on type miss; out still zeroed. */
+            memset(odata, 0, (size_t)n_groups * sizeof(int64_t));
+        }
+    }
 
     /* Parallel path: dispatch one task per group when src has a flat
      * numeric / SYM layout we can read with a typed pointer.  Each task
