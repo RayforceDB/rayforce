@@ -23,6 +23,7 @@
 
 #include "lang/internal.h"
 #include "ops/ops.h"
+#include "ops/idxop.h"   /* RAY_IDX_CHUNK_ZONE fast path for min/max */
 #include "mem/heap.h"
 
 #include <stdlib.h>  /* qsort (introselect fallback) */
@@ -328,7 +329,43 @@ ray_t* ray_min_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_MIN);
     if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 0);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
-    if (ray_is_vec(x)) AGG_VEC_VIA_DAG(x, ray_min_op);
+    if (ray_is_vec(x)) {
+        /* Per-chunk zone index fast path: O(n_chunks) instead of O(n_rows).
+         * Only valid when the index was built for the column's current len
+         * (mutation paths call ray_index_drop). */
+        if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
+            ray_index_t* ix = ray_index_payload(x->index);
+            if (ix->built_for_len == x->len) {
+                uint32_t n_chunks = ix->u.chunk_zone.n_chunks;
+                if (ix->u.chunk_zone.is_f64) {
+                    const double* mins = (const double*)ray_data(ix->u.chunk_zone.mins);
+                    double mn = INFINITY;
+                    for (uint32_t g = 0; g < n_chunks; g++)
+                        if (mins[g] < mn) mn = mins[g];
+                    if (mn == INFINITY) return ray_typed_null(-RAY_F64);
+                    return make_f64(mn);
+                } else {
+                    const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
+                    int64_t mn = INT64_MAX;
+                    for (uint32_t g = 0; g < n_chunks; g++)
+                        if (mins[g] < mn) mn = mins[g];
+                    if (mn == INT64_MAX) return ray_typed_null(-x->type);
+                    /* Preserve the column's storage width on the result. */
+                    switch (x->type) {
+                    case RAY_BOOL:      return ray_bool((bool)mn);
+                    case RAY_U8:        return ray_u8((uint8_t)mn);
+                    case RAY_I16:       return ray_i16((int16_t)mn);
+                    case RAY_I32:       return ray_i32((int32_t)mn);
+                    case RAY_DATE:      return ray_date((int32_t)mn);
+                    case RAY_TIME:      return ray_time(mn);
+                    case RAY_TIMESTAMP: return ray_timestamp(mn);
+                    default:            return ray_i64(mn);
+                    }
+                }
+            }
+        }
+        AGG_VEC_VIA_DAG(x, ray_min_op);
+    }
     if (!is_list(x)) return ray_error("type", NULL);
     int64_t len = ray_len(x);
     if (len == 0) return ray_error("domain", NULL);
@@ -350,7 +387,39 @@ ray_t* ray_max_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_MAX);
     if (RAY_IS_PARTED(x->type)) return agg_parted_minmax(x, 1);
     if (ray_is_atom(x)) { ray_retain(x); return x; }
-    if (ray_is_vec(x)) AGG_VEC_VIA_DAG(x, ray_max_op);
+    if (ray_is_vec(x)) {
+        if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
+            ray_index_t* ix = ray_index_payload(x->index);
+            if (ix->built_for_len == x->len) {
+                uint32_t n_chunks = ix->u.chunk_zone.n_chunks;
+                if (ix->u.chunk_zone.is_f64) {
+                    const double* maxs = (const double*)ray_data(ix->u.chunk_zone.maxs);
+                    double mx = -INFINITY;
+                    for (uint32_t g = 0; g < n_chunks; g++)
+                        if (maxs[g] > mx) mx = maxs[g];
+                    if (mx == -INFINITY) return ray_typed_null(-RAY_F64);
+                    return make_f64(mx);
+                } else {
+                    const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
+                    int64_t mx = INT64_MIN;
+                    for (uint32_t g = 0; g < n_chunks; g++)
+                        if (maxs[g] > mx) mx = maxs[g];
+                    if (mx == INT64_MIN) return ray_typed_null(-x->type);
+                    switch (x->type) {
+                    case RAY_BOOL:      return ray_bool((bool)mx);
+                    case RAY_U8:        return ray_u8((uint8_t)mx);
+                    case RAY_I16:       return ray_i16((int16_t)mx);
+                    case RAY_I32:       return ray_i32((int32_t)mx);
+                    case RAY_DATE:      return ray_date((int32_t)mx);
+                    case RAY_TIME:      return ray_time(mx);
+                    case RAY_TIMESTAMP: return ray_timestamp(mx);
+                    default:            return ray_i64(mx);
+                    }
+                }
+            }
+        }
+        AGG_VEC_VIA_DAG(x, ray_max_op);
+    }
     if (!is_list(x)) return ray_error("type", NULL);
     int64_t len = ray_len(x);
     if (len == 0) return ray_error("domain", NULL);

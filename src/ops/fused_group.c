@@ -23,6 +23,7 @@
 
 #include "ops/fused_group.h"
 #include "ops/fused_pred.h" /* fp_pred_t / fp_compile_pred / fp_eval_pred */
+#include "ops/idxop.h"      /* RAY_IDX_CHUNK_ZONE chunk-skip in fp_eval_cmp */
 #include "lang/eval.h"      /* RAY_ATTR_NAME */
 #include "core/pool.h"      /* ray_pool_get / ray_pool_dispatch */
 
@@ -342,6 +343,72 @@ void fp_eval_cmp(const fp_cmp_t* p, int64_t start, int64_t end,
     if (p->fold) {
         memset(bits, (p->fold == FP_FOLD_TRUE) ? 1 : 0, (size_t)n);
         return;
+    }
+
+    /* Chunk-zone fast path: if the column carries per-chunk min/max
+     * metadata and [start, end) fits inside a single chunk, decide the
+     * whole morsel from chunk extrema without reading a single value.
+     * Only integer/temporal comparisons (EQ/NE/LT/LE/GT/GE) — LIKE/IN
+     * have their own evaluators below and SYM ordering is rejected at
+     * compile time anyway.  The all-pass shortcut is gated on "no
+     * nulls in this chunk" because SQL `(x op c)` is FALSE/NULL when x
+     * is NULL; the all-fail shortcut needs no such guard. */
+    if (p->col_obj && (p->col_obj->attrs & RAY_ATTR_HAS_INDEX) &&
+        p->col_obj->index)
+    {
+        ray_index_t* ix = ray_index_payload(p->col_obj->index);
+        if (ix->kind == RAY_IDX_CHUNK_ZONE &&
+            ix->built_for_len == p->col_obj->len &&
+            !ix->u.chunk_zone.is_f64 &&
+            (op == FP_EQ || op == FP_NE ||
+             op == FP_LT || op == FP_LE ||
+             op == FP_GT || op == FP_GE))
+        {
+            uint8_t log2 = ix->u.chunk_zone.chunk_log2;
+            int64_t s_ch = start >> log2;
+            int64_t e_ch = (end - 1) >> log2;
+            if (s_ch == e_ch && (uint32_t)s_ch < ix->u.chunk_zone.n_chunks) {
+                const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
+                const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
+                int64_t cmin = mins[s_ch], cmax = maxs[s_ch];
+                if (cmin <= cmax) {       /* skip empty (all-null) chunks */
+                    const uint8_t* nb = (const uint8_t*)ray_data(ix->u.chunk_zone.null_bits);
+                    bool has_nulls = (nb[s_ch >> 3] >> (s_ch & 7)) & 1u;
+                    int decision = -1;   /* 0=all-fail, 1=all-pass, -1=mixed */
+                    switch (op) {
+                    case FP_EQ:
+                        if (cval < cmin || cval > cmax)        decision = 0;
+                        else if (!has_nulls && cmin == cmax)   decision = 1;
+                        break;
+                    case FP_NE:
+                        if (!has_nulls && (cval < cmin || cval > cmax)) decision = 1;
+                        else if (cmin == cmax && cval == cmin)          decision = 0;
+                        break;
+                    case FP_LT:
+                        if (cmin >= cval)                      decision = 0;
+                        else if (!has_nulls && cmax < cval)    decision = 1;
+                        break;
+                    case FP_LE:
+                        if (cmin >  cval)                      decision = 0;
+                        else if (!has_nulls && cmax <= cval)   decision = 1;
+                        break;
+                    case FP_GT:
+                        if (cmax <= cval)                      decision = 0;
+                        else if (!has_nulls && cmin >  cval)   decision = 1;
+                        break;
+                    case FP_GE:
+                        if (cmax <  cval)                      decision = 0;
+                        else if (!has_nulls && cmin >= cval)   decision = 1;
+                        break;
+                    default: break;
+                    }
+                    if (decision >= 0) {
+                        memset(bits, (uint8_t)decision, (size_t)n);
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /* SYM low-card fold: const not in dict ⇒ EQ all-zero / NE all-one.
@@ -2539,20 +2606,90 @@ static void mk_eq_i64_count_fn(void* raw, uint32_t worker_id,
     const fp_cmp_t* eq = &c->pred.children[fc->eq_idx];
     const int64_t* eq_col = (const int64_t*)eq->col_base;
     int64_t eq_val = eq->cval;
-    for (int64_t row = start; row < end; row++) {
-        if (eq_col[row] != eq_val) continue;
-        uint8_t pass = 1;
-        for (uint8_t i = 0; i < c->pred.n_children; i++) {
-            if (i == fc->eq_idx) continue;
-            if (!fp_eval_cmp_one(&c->pred.children[i], row)) {
-                pass = 0;
+
+    /* Chunk-skip: for each predicate child whose column carries a
+     * chunk_zone index, walk the row range in chunk strides and skip
+     * any chunk where the child's [min, max] proves an all-fail.  For
+     * clustered columns (e.g. data sorted by CounterID, EventDate) this
+     * eliminates the per-row RefererHash/URLHash read for ~all chunks
+     * outside the matching counter / date range — q40/q41/q42 pattern.
+     * Picks chunk_log2 from any indexed child (every chunk_zone built
+     * by csv.read uses the same chunk_log2 today).  Falls through to
+     * the plain per-row loop when no child has a usable index. */
+    uint8_t chunk_log2 = 0;
+    for (uint8_t i = 0; i < c->pred.n_children; i++) {
+        ray_t* co = c->pred.children[i].col_obj;
+        if (co && (co->attrs & RAY_ATTR_HAS_INDEX) && co->index) {
+            ray_index_t* ix = ray_index_payload(co->index);
+            if (ix->kind == RAY_IDX_CHUNK_ZONE &&
+                ix->built_for_len == co->len) {
+                chunk_log2 = ix->u.chunk_zone.chunk_log2;
                 break;
             }
         }
-        if (!pass) continue;
-        if (mk_count_upsert_row(c, sh, row) != 0) {
-            atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
-            return;
+    }
+
+    int64_t row = start;
+    while (row < end) {
+        int64_t chunk_end;
+        if (chunk_log2 > 0) {
+            int64_t csz = 1LL << chunk_log2;
+            chunk_end = ((row >> chunk_log2) + 1) << chunk_log2;
+            (void)csz;
+            if (chunk_end > end) chunk_end = end;
+            bool all_fail = false;
+            for (uint8_t i = 0; i < c->pred.n_children && !all_fail; i++) {
+                const fp_cmp_t* p = &c->pred.children[i];
+                ray_t* co = p->col_obj;
+                if (!co || !(co->attrs & RAY_ATTR_HAS_INDEX) || !co->index)
+                    continue;
+                ray_index_t* ix = ray_index_payload(co->index);
+                if (ix->kind != RAY_IDX_CHUNK_ZONE ||
+                    ix->built_for_len != co->len ||
+                    ix->u.chunk_zone.chunk_log2 != chunk_log2 ||
+                    ix->u.chunk_zone.is_f64)
+                    continue;
+                fp_op_t op = p->op;
+                if (op != FP_EQ && op != FP_NE && op != FP_LT &&
+                    op != FP_LE && op != FP_GT && op != FP_GE)
+                    continue;
+                int64_t s_ch = row >> chunk_log2;
+                if ((uint32_t)s_ch >= ix->u.chunk_zone.n_chunks) continue;
+                const int64_t* mins = (const int64_t*)ray_data(ix->u.chunk_zone.mins);
+                const int64_t* maxs = (const int64_t*)ray_data(ix->u.chunk_zone.maxs);
+                int64_t cmin = mins[s_ch], cmax = maxs[s_ch];
+                if (cmin > cmax) continue;   /* empty chunk */
+                int64_t cv = p->cval;
+                switch (op) {
+                case FP_EQ: if (cv < cmin || cv > cmax) all_fail = true; break;
+                case FP_NE: if (cmin == cmax && cv == cmin) all_fail = true; break;
+                case FP_LT: if (cmin >= cv) all_fail = true; break;
+                case FP_LE: if (cmin >  cv) all_fail = true; break;
+                case FP_GT: if (cmax <= cv) all_fail = true; break;
+                case FP_GE: if (cmax <  cv) all_fail = true; break;
+                default: break;
+                }
+            }
+            if (all_fail) { row = chunk_end; continue; }
+        } else {
+            chunk_end = end;
+        }
+
+        for (; row < chunk_end; row++) {
+            if (eq_col[row] != eq_val) continue;
+            uint8_t pass = 1;
+            for (uint8_t i = 0; i < c->pred.n_children; i++) {
+                if (i == fc->eq_idx) continue;
+                if (!fp_eval_cmp_one(&c->pred.children[i], row)) {
+                    pass = 0;
+                    break;
+                }
+            }
+            if (!pass) continue;
+            if (mk_count_upsert_row(c, sh, row) != 0) {
+                atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
+                return;
+            }
         }
     }
 }

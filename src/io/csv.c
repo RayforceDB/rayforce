@@ -44,6 +44,7 @@
 #include "core/pool.h"
 #include "lang/format.h"
 #include "ops/hash.h"
+#include "ops/idxop.h"      /* attach per-chunk zone index after load */
 #include "store/col.h"
 #include "store/fileio.h"
 #include "store/splay.h"
@@ -1410,6 +1411,20 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
         col_data[c] = dst;
     }
 
+    /* Per-chunk min/max + null bit on every column big enough to be worth
+     * indexing — gives the reduce min/max and the filter chunk-skip paths
+     * an O(n_chunks) scan instead of O(n_rows).  Attach is best-effort:
+     * unsupported types (RAY_STR/RAY_SYM/RAY_GUID in v1) just stay
+     * unindexed and the consumer falls back to a row scan. */
+    for (int c = 0; c < ncols; c++) {
+        ray_t* v = col_vecs[c];
+        if (!v || RAY_IS_ERR(v)) continue;
+        if (v->len < (1 << 16)) continue;        /* < one chunk, skip */
+        ray_t* r = ray_index_attach_chunk_zone(&v, 16);
+        if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;  /* attach succeeded */
+        /* On failure the original column stays in col_vecs[c]; ignore. */
+    }
+
     ray_t* tbl = ray_table_new(ncols);
     if (!tbl || RAY_IS_ERR(tbl)) {
         for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);
@@ -1788,6 +1803,17 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
 
     /* ---- 11. Build table ---- */
     {
+        /* Best-effort per-chunk zone index attach (see comment on the
+         * matching loop in build_table_from_cols) — unsupported types
+         * fall through to the unindexed path inside the consumer. */
+        for (int c = 0; c < ncols; c++) {
+            ray_t* v = col_vecs[c];
+            if (!v || RAY_IS_ERR(v)) continue;
+            if (v->len < (1 << 16)) continue;
+            ray_t* r = ray_index_attach_chunk_zone(&v, 16);
+            if (r && !RAY_IS_ERR(r)) col_vecs[c] = v;
+        }
+
         ray_t* tbl = ray_table_new(ncols);
         if (!tbl || RAY_IS_ERR(tbl)) {
             for (int c = 0; c < ncols; c++) ray_release(col_vecs[c]);

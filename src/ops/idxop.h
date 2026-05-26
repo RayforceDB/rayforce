@@ -47,11 +47,20 @@
 
 /* Index kinds.  Stored in ray_index_t.kind. */
 typedef enum {
-    RAY_IDX_NONE  = 0,
-    RAY_IDX_HASH  = 1,
-    RAY_IDX_SORT  = 2,
-    RAY_IDX_ZONE  = 3,
-    RAY_IDX_BLOOM = 4,
+    RAY_IDX_NONE       = 0,
+    RAY_IDX_HASH       = 1,
+    RAY_IDX_SORT       = 2,
+    RAY_IDX_ZONE       = 3,
+    RAY_IDX_BLOOM      = 4,
+    /* Per-chunk min/max + null bit, one entry per (1 << chunk_log2) rows.
+     * The whole-column zone is derivable as
+     *   min(chunk_mins)/max(chunk_maxs) over the entries, so this
+     *   subsumes RAY_IDX_ZONE wherever it's used in the reduce path.
+     * Built at column ingest (csv.read); read by the min/max reduce
+     * and by the predicate planner to skip chunks whose [min,max]
+     * provably excludes/includes the constant.  See chunk_zone arm
+     * of ray_index_t.u below. */
+    RAY_IDX_CHUNK_ZONE = 5,
 } ray_idx_kind_t;
 
 /* The payload stored inside data[] of a RAY_INDEX ray_t. */
@@ -99,6 +108,19 @@ typedef struct {
             uint32_t _pad;
             int64_t  n_keys;    /* number of non-null rows added */
         } bloom;
+        struct {                /* RAY_IDX_CHUNK_ZONE */
+            /* mins / maxs hold n_chunks entries.  For integer / temporal
+             * column types they are RAY_I64 vecs storing the per-chunk
+             * extrema as int64; for RAY_F64 columns they are RAY_F64
+             * vecs.  is_f64 disambiguates at read time. */
+            ray_t*   mins;
+            ray_t*   maxs;
+            ray_t*   null_bits;   /* RAY_U8 vec, packed: bit i = chunk i has any null */
+            uint32_t n_chunks;
+            uint8_t  chunk_log2;  /* chunk size = 1 << chunk_log2 (default 16 → 64 K rows) */
+            uint8_t  is_f64;
+            uint8_t  _pad[2];
+        } chunk_zone;
     } u;
 } ray_index_t;
 
@@ -118,6 +140,10 @@ ray_t* ray_index_attach_zone (ray_t** vp);
 ray_t* ray_index_attach_hash (ray_t** vp);
 ray_t* ray_index_attach_sort (ray_t** vp);
 ray_t* ray_index_attach_bloom(ray_t** vp);
+/* Build per-chunk min/max + null bit at chunk_size = 1 << chunk_log2.
+ * Passing 0 picks the default (16 → 64 K rows / chunk).  Only valid on
+ * numeric and temporal vectors; SYM/STR/GUID return RAY_ERR_NYI. */
+ray_t* ray_index_attach_chunk_zone(ray_t** vp, uint8_t chunk_log2);
 
 /* Drop any attached index from *vp.  No-op if none.  Restores the
  * pre-attach nullmap state byte-for-byte.  Returns *vp. */
