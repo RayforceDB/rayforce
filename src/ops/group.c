@@ -3391,13 +3391,17 @@ static void minmax_scan_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
     int8_t t = c->key_type;
     const int64_t span_budget = c->span_budget;
 
-    /* Span check and abort poll are batched (every 8192 rows) so the
-     * hot per-row loop body stays a branchless min/max with no atomics. */
+    /* Span check and abort poll are batched (every 1024 rows) so the
+     * hot per-row loop body stays a branchless min/max with no atomics.
+     * 8192 was too sparse — the dispatcher hands out 8K-row morsels, so
+     * `(i-start) & 8191 == 0` only ever fired at the morsel boundary
+     * (where kmin=INT64_MAX/kmax=INT64_MIN make the span check vacuous),
+     * leaving every full 8K morsel to run end-to-end on doomed columns. */
     #define MINMAX_SEG_LOOP(TYPE, CAST) \
         do { \
             const TYPE* kd = (const TYPE*)c->key_data; \
             for (int64_t i = start; i < end; i++) { \
-                if (((i - start) & 8191) == 0) { \
+                if (((i - start) & 1023) == 0) { \
                     if (atomic_load_explicit(c->abort_flag, \
                                              memory_order_relaxed)) \
                         goto minmax_done; \
