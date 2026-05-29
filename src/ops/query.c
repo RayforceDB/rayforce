@@ -4317,9 +4317,15 @@ by_dict_done:
         int multi_key_vec     = by_expr && by_expr->type == RAY_SYM
                               && ray_len(by_expr) >= 1
                               && ray_len(by_expr) <= 16;
-        if (where_expr && by_expr && !nearest_expr
+        /* WHERE may be absent: a fused group with no predicate runs the
+         * worker with a const-true mask (ray_filtered_group accepts a
+         * NULL pred).  This routes high-cardinality multi-key group-bys
+         * (q16/q32 — no WHERE, millions of groups) onto the fused mk_
+         * shard path instead of the unfused exec_group fallback, whose
+         * per-row/per-call SYM-lock overhead dominates at scale. */
+        if (by_expr && !nearest_expr
             && (single_key_scalar || multi_key_vec)
-            && ray_fused_group_supported(where_expr, tbl))
+            && (!where_expr || ray_fused_group_supported(where_expr, tbl)))
         {
             /* Walk the dict aggs.  Accept any combination of count/sum/
              * min/max/avg with non-COUNT requiring an integer/temporal
@@ -4431,9 +4437,26 @@ by_dict_done:
                      * count-only: the multi path's per-row update has higher
                      * overhead than count1.  Specifically, count1 owns the
                      * common-case wins. */
-                    if (n_keys_local == 1 && n_aggs_ok == 1 && has_only_count) {
+                    if (n_keys_local == 1 && n_aggs_ok == 1 && has_only_count
+                        && where_expr) {
+                        /* Single-key count1 only fuses with a WHERE.  A
+                         * no-WHERE single key over a near-unique column
+                         * (e.g. q15 UserID, ~10M groups) is faster on the
+                         * unfused radix exec_group than on the count1
+                         * linear-probe shard; keep it there. */
                         can_fuse_phase1 = 1;  /* will use count1 exec */
-                    } else if (narrow_fits || wide_fits) {
+                    } else if ((narrow_fits || wide_fits)
+                               && (where_expr
+                                   || (has_only_count && n_keys_local >= 2))) {
+                        /* No-WHERE: only fuse multi-key (≥2) count-only
+                         * shapes.  Single-key no-WHERE (even count-only,
+                         * e.g. q15 UserID) and multi-agg (SUM/AVG) over
+                         * near-unique keys (e.g. q32 {WatchID,ClientIP})
+                         * keep per-group state that the unfused radix
+                         * exec_group scatters more cheaply at very high
+                         * cardinality; fusing them there regresses.  With
+                         * a WHERE the filtered row count is small enough
+                         * that fusing always wins. */
                         can_fuse_phase1 = 1;  /* will use multi exec */
                     }
                 }
@@ -6317,7 +6340,8 @@ by_dict_done:
                     agg_ops[0] == OP_COUNT) {
                     root = ray_filtered_group(g, NULL, key_ops, n_keys,
                                               agg_ops, agg_ins, n_aggs);
-                } else if (can_fuse_phase1 && fused_pred_op != NULL
+                } else if (can_fuse_phase1
+                    && (fused_pred_op != NULL || !where_expr)
                     && n_nonaggs == 0 && agg_kinds_ok
                     && !has_binary_agg && !has_agg_k)
                 {
@@ -6325,7 +6349,9 @@ by_dict_done:
                      * single COUNT) → Pass 3 fast path; everything else →
                      * multi path with packed composite key.  Skipped when
                      * any agg is binary (filtered-group fusion only knows
-                     * about unary aggs) or holistic with a K param. */
+                     * about unary aggs) or holistic with a K param.
+                     * fused_pred_op is NULL when there is no WHERE — the
+                     * fused worker then runs a const-true mask. */
                     root = ray_filtered_group(g, fused_pred_op,
                                               key_ops, n_keys,
                                               agg_ops, agg_ins, n_aggs);
