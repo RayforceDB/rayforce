@@ -4428,10 +4428,13 @@ by_dict_done:
                 /* Single-key case fits unconditionally (one key column, one
                  * slot).  Multi-key narrow path (≤ 8 bytes packed) uses a
                  * single int64 slot; the wide path (9..16 bytes) adds a
-                 * side kv_hi side array. */
-                int wide_fits  = (total_bytes >  8 && total_bytes <= 16);
+                 * side kv_hi side array; widest path (17..24 bytes) adds
+                 * a second side kv_top array. */
                 int narrow_fits = (total_bytes <= 8);
-                int fits = (n_keys_local == 1) || narrow_fits || wide_fits;
+                int wide_fits   = (total_bytes >  8 && total_bytes <= 16);
+                int widest_fits = (total_bytes > 16 && total_bytes <= 24);
+                int fits = (n_keys_local == 1)
+                         || narrow_fits || wide_fits || widest_fits;
                 if (keys_ok && fits) {
                     /* Don't fire the multi path when n_keys == 1 AND not
                      * count-only: the multi path's per-row update has higher
@@ -4445,7 +4448,7 @@ by_dict_done:
                          * unfused radix exec_group than on the count1
                          * linear-probe shard; keep it there. */
                         can_fuse_phase1 = 1;  /* will use count1 exec */
-                    } else if ((narrow_fits || wide_fits)
+                    } else if ((narrow_fits || wide_fits || widest_fits)
                                && (where_expr
                                    || (has_only_count && n_keys_local >= 2))) {
                         /* No-WHERE: only fuse multi-key (≥2) count-only
