@@ -43,6 +43,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include <rayforce.h>
 #include "lang/eval.h"
@@ -608,12 +609,51 @@ static void print_status(test_status_t s, double ms, const char* msg) {
     }
 }
 
+/* Per-test timeout watchdog: when a test hangs (infinite loop, deadlock,
+ * etc.), without this guard the whole CI job stalls and we never learn
+ * which test was the culprit.  The SIGALRM handler writes the offending
+ * test name to stderr using async-signal-safe primitives, then _exit's
+ * the process so the CI log captures it.  Disabled by setting
+ * RAY_TEST_TIMEOUT_S=0; default 90 s comfortably exceeds the slowest
+ * legitimate tests (large-N HLL, splayed I/O round-trips) while still
+ * catching real hangs an order of magnitude faster than CI's outer cap. */
+static const char* volatile g_running_test = NULL;
+static void timeout_handler(int sig) {
+    (void)sig;
+    static const char prefix[] = "\nTIMEOUT in test: ";
+    static const char suffix[] = "\n";
+    /* write(2) is async-signal-safe; printf/longjmp are not. */
+    (void)!write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+    if (g_running_test) {
+        size_t n = 0; const char* p = g_running_test;
+        while (p[n] && n < 200) n++;
+        (void)!write(STDERR_FILENO, g_running_test, n);
+    }
+    (void)!write(STDERR_FILENO, suffix, sizeof(suffix) - 1);
+    _exit(124);  /* convention: 124 = timeout */
+}
+static unsigned g_test_timeout_s = 90;
+static void test_timeout_init(void) {
+    const char* env = getenv("RAY_TEST_TIMEOUT_S");
+    if (env) {
+        long v = strtol(env, NULL, 10);
+        if (v >= 0 && v < 3600) g_test_timeout_s = (unsigned)v;
+    }
+    if (g_test_timeout_s == 0) return;
+    struct sigaction sa = {0};
+    sa.sa_handler = timeout_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM, &sa, NULL);
+}
+
 static int run_one(const test_entry_t* e, int* pass, int* fail, int* skip) {
     printf("  %-52s  ", e->name);
     fflush(stdout);
 
     if (e->setup) e->setup();
 
+    g_running_test = e->name;
+    if (g_test_timeout_s) alarm(g_test_timeout_s);
     clock_t t0 = clock();
     test_result_t r;
 
@@ -630,6 +670,8 @@ static int run_one(const test_entry_t* e, int* pass, int* fail, int* skip) {
         r = (test_result_t){ TEST_FAIL, ray_test_fail_buf };
     }
 
+    if (g_test_timeout_s) alarm(0);
+    g_running_test = NULL;
     double ms = (double)(clock() - t0) * 1000.0 / CLOCKS_PER_SEC;
 
     if (e->teardown) e->teardown();
@@ -649,6 +691,7 @@ static int name_matches_filter(const char* name, const char* filter) {
 
 int main(int argc, char** argv) {
     g_color = isatty(fileno(stdout));
+    test_timeout_init();
 
     const char* filter = NULL;
     for (int i = 1; i < argc; i++) {
