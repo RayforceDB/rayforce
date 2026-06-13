@@ -839,6 +839,7 @@ static bool csv_fill_str_cols(csv_strref_t** str_refs, int n_cols,
             } else {
                 memcpy(dst[r].prefix, p, 4);
                 dst[r].pool_off = pool_off;
+                if ((uint64_t)pool_off + l > pool_bytes) return false;
                 memcpy(pool_base + pool_off, p, l);
                 pool_off += l;  /* cannot wrap: pool_bytes <= UINT32_MAX */
             }
