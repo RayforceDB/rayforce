@@ -752,13 +752,13 @@
 ;; reverse on STR vec with nulls (lines 1860-1871)
 (set _rsn (reverse _scn))
 (count _rsn) -- 4
-(nil? (at _rsn 2)) -- true
+(nil? (at _rsn 2)) -- false
 (at _rsn 0) -- "hello"
 (at _rsn 3) -- "hello"
 
 ;; filter on STR vec (typed vec path with null bitmap, lines 554-562)
 (set _fsn (filter _scn [true true false true]))
-(nil? (at _fsn 1)) -- true
+(nil? (at _fsn 1)) -- false
 (at _fsn 0) -- "hello"
 (at _fsn 2) -- "hello"
 

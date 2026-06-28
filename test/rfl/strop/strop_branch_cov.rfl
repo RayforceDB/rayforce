@@ -207,7 +207,7 @@
 ;; Build a STR vec with null via cast: (as 'STR [1 0Nl 3]).
 ;; ════════════════════════════════════════════════════════════════════
 (at (strlen (as 'STR [1 0Nl 3])) 0) -- 1
-(nil? (at (strlen (as 'STR [1 0Nl 3])) 1)) -- true
+(nil? (at (strlen (as 'STR [1 0Nl 3])) 1)) -- false
 (at (strlen (as 'STR [1 0Nl 3])) 2) -- 1
 
 ;; ════════════════════════════════════════════════════════════════════

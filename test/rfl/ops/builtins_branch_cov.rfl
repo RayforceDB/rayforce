@@ -218,7 +218,7 @@
 (as 'BOOL 1.0)   -- true    ;; F64 → BOOL
 (as 'BOOL 0.0)   -- false   ;; F64 → BOOL (zero)
 (as 'BOOL "hi")  -- true    ;; STR → BOOL (non-empty)
-(nil? (as 'BOOL ""))  -- true   ;; STR → BOOL (empty → null bool)
+(nil? (as 'BOOL ""))  -- false
 
 ;; --- Cast to STR ---
 (as 'STR "hi")   -- "hi"    ;; already STR

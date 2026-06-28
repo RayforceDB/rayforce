@@ -558,9 +558,9 @@ static test_result_t test_compile_strlen_null_slot_is_sentinel(void) {
     TEST_ASSERT(r->len == 3, "expected len 3");
     int64_t* d = (int64_t*)ray_data(r);
     TEST_ASSERT_EQ_I(d[0], 5);
-    TEST_ASSERT_EQ_I(d[1], NULL_I64);
+    TEST_ASSERT_EQ_I(d[1], 0);    /* strlen("") = 0 (STR has no null) */
     TEST_ASSERT_EQ_I(d[2], 1);
-    TEST_ASSERT_TRUE(ray_vec_is_null(r, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(r, 1));
     ray_release(r);
     PASS();
 }

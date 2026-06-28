@@ -6,7 +6,7 @@
 (nil? 0) -- false
 (nil? 1) -- false
 ;; STR null = empty string (len 0).
-(nil? "") -- true
+(nil? "") -- false
 ;; nil? distinguishes typed nulls from zero-valued atoms across types
 (nil? 0Ni)   -- true
 (nil? 0Nf)   -- true

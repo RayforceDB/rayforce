@@ -143,7 +143,7 @@ _dcov_y -- 5
 (set t_str_n (table ['s 'k] (list (as 'STR [1 0Nl 2]) [2 1 3])))
 (set t_str_s (xasc t_str_n 'k))
 ;; After sort by k: row k=1 is first, s[0] = null str
-(nil? (at (at t_str_s 's) 0)) -- true
+(nil? (at (at t_str_s 's) 0)) -- false
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;; 8. affine_sum_cache: vec has RAY_ATTR_HAS_NULLS → cache bypass

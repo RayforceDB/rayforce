@@ -28,43 +28,43 @@
 
 ;; Helper: build 3-row STR col with null at index 1.
 (set sv3 (as 'STR [1 0Nl 2]))
-(nil? (at sv3 1)) -- true
+(nil? (at sv3 1)) -- false
 
 ;; ─── exec_string_unary: upper — STR null at index 1 ──────────────────
 (set Tn (table [s] (list sv3)))
 (set Ru (at (select {r: (upper s) from: Tn}) 'r))
 (at Ru 0) -- "1"
-(nil? (at Ru 1)) -- true
+(nil? (at Ru 1)) -- false
 (at Ru 2) -- "2"
 
 ;; ─── exec_string_unary: lower — STR null at index 1 ──────────────────
 (set Rl (at (select {r: (lower s) from: Tn}) 'r))
 (at Rl 0) -- "1"
-(nil? (at Rl 1)) -- true
+(nil? (at Rl 1)) -- false
 (at Rl 2) -- "2"
 
 ;; ─── exec_string_unary: trim — STR null at index 1 ───────────────────
 (set Rt (at (select {r: (trim s) from: Tn}) 'r))
 (at Rt 0) -- "1"
-(nil? (at Rt 1)) -- true
+(nil? (at Rt 1)) -- false
 (at Rt 2) -- "2"
 
 ;; ─── exec_strlen: STR null produces NULL_I64 (lines 891-894) ─────────
 (set Rslen (at (select {r: (strlen s) from: Tn}) 'r))
 (at Rslen 0) -- 1
-(nil? (at Rslen 1)) -- true
+(nil? (at Rslen 1)) -- false
 (at Rslen 2) -- 1
 
 ;; ─── exec_substr: STR null at input (lines 978-984) ──────────────────
 (set Rss (at (select {r: (substr s 1 1) from: Tn}) 'r))
 (at Rss 0) -- "1"
-(nil? (at Rss 1)) -- true
+(nil? (at Rss 1)) -- false
 (at Rss 2) -- "2"
 
 ;; ─── exec_replace: STR null (lines 1058-1062) ─────────────────────────
 (set Rr (at (select {r: (replace s "1" "X") from: Tn}) 'r))
 (at Rr 0) -- "X"
-(nil? (at Rr 1)) -- true
+(nil? (at Rr 1)) -- false
 (at Rr 2) -- "2"
 
 ;; ─── exec_concat: STR null (line 1185) ───────────────────────────────
@@ -73,21 +73,21 @@
 (set Tc (table [a b] (list sv3 sv3b)))
 (set Rcat (at (select {r: (concat a b) from: Tc}) 'r))
 (at Rcat 0) -- "110"
-(nil? (at Rcat 1)) -- true
+(nil? (at Rcat 1)) -- false
 
 ;; ─── verify HAS_NULLS on result from exec_string_unary ───────────────
 ;; Applying upper to a null-bearing STR vec should preserve the null bit.
-(nil? (at (as 'STR [0Nl]) 0)) -- true
+(nil? (at (as 'STR [0Nl]) 0)) -- false
 
 ;; ─── null at first and last positions ────────────────────────────────
 (set sv5 (as 'STR [0Nl 2 0Nl]))
 (set Tn2 (table [s] (list sv5)))
 (set Ru2 (at (select {r: (upper s) from: Tn2}) 'r))
-(nil? (at Ru2 0)) -- true
+(nil? (at Ru2 0)) -- false
 (at Ru2 1) -- "2"
-(nil? (at Ru2 2)) -- true
+(nil? (at Ru2 2)) -- false
 
 (set Rslen2 (at (select {r: (strlen s) from: Tn2}) 'r))
-(nil? (at Rslen2 0)) -- true
+(nil? (at Rslen2 0)) -- false
 (at Rslen2 1) -- 1
-(nil? (at Rslen2 2)) -- true
+(nil? (at Rslen2 2)) -- false

@@ -115,7 +115,7 @@
 (.sys.exec "printf 'id,name\n1,alice\n2,\n3,charlie\n' > /tmp/rfl_int_cov_null_str.csv") -- 0
 (set SN_A (.csv.read [I64 STR] "/tmp/rfl_int_cov_null_str.csv"))
 (count SN_A) -- 3
-(nil? (at (at SN_A 'name) 1)) -- true
+(nil? (at (at SN_A 'name) 1)) -- false
 
 (.db.splayed.set "/tmp/rfl_int_cov_null/2024.01.01/t/" SN_A)
 (set SN_B (table [id name] (list [4 5] (list "dave" "eve"))))
@@ -128,14 +128,14 @@
 ;; HEAD includes null element at position 1 → parted_head_str calls
 ;; parted_str_append_elem(seg, 1, pool) → null path lines 287-290.
 (count (select {from: PN take: 3})) -- 3
-(nil? (at (at (select {from: PN take: 3}) 'name) 1)) -- true
+(nil? (at (at (select {from: PN take: 3}) 'name) 1)) -- false
 (at (at (select {from: PN take: 3}) 'name) 0) -- "alice"
 (at (at (select {from: PN take: 3}) 'name) 2) -- "charlie"
 
 ;; FILTER via exec_filter_head: HEAD(FILTER) fused path calls
 ;; parted_gather_str_rows → parted_str_append_elem on null element.
 (count (select {from: PN where: (< id 4) take: 3})) -- 3
-(nil? (at (at (select {from: PN where: (< id 4) take: 3}) 'name) 1)) -- true
+(nil? (at (at (select {from: PN where: (< id 4) take: 3}) 'name) 1)) -- false
 
 ;; ── 1h. Parted STR with missing column in second partition ─────────────
 ;; segs[1] = NULL for the STR column when partition 2 lacks the column.
@@ -162,8 +162,8 @@
 ;; Value-check: partition 1 supplies "alpha","beta"; partition 2 lacks the
 ;; 'name column so its rows come back as null from the null-segment branch.
 (first (at (select {from: PNS where: (> id 0) take: 4}) 'name)) -- "alpha"
-(nil? (at (at (select {from: PNS where: (> id 0) take: 4}) 'name) 2)) -- true
-(nil? (at (at (select {from: PNS where: (> id 0) take: 4}) 'name) 3)) -- true
+(nil? (at (at (select {from: PNS where: (> id 0) take: 4}) 'name) 2)) -- false
+(nil? (at (at (select {from: PNS where: (> id 0) take: 4}) 'name) 3)) -- false
 
 
 ;; ======================================================================

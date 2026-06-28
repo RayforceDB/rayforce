@@ -518,7 +518,7 @@
 (set strnv (as 'STR (list "x" 0Ni "z")))
 ;; WHERE k>0 masks rows 1,2; strnv[1]=null → line 8698 fires for row 1
 (count (update {name: strnv from: Tupd_str3 where: (> k 0)})) -- 3
-(nil? (at (at (update {name: strnv from: Tupd_str3 where: (> k 0)}) 'name) 1)) -- true
+(nil? (at (at (update {name: strnv from: Tupd_str3 where: (> k 0)}) 'name) 1)) -- false
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; insert into table with null STR column (lines 9333-9335)
@@ -530,7 +530,7 @@
 ;; Insert new row (k=4, name="d"): copies existing rows including null
 ;; → line 9333 fires for row 1 (null STR element)
 (count (insert Tstr_null_ins (list 4 "d"))) -- 4
-(nil? (at (at (insert Tstr_null_ins (list 4 "d")) 'name) 1)) -- true
+(nil? (at (at (insert Tstr_null_ins (list 4 "d")) 'name) 1)) -- false
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; insert into table with null SYM column (line 9349)

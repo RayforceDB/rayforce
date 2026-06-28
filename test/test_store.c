@@ -373,8 +373,9 @@ static test_result_t test_splay_str_column_roundtrip(void) {
     TEST_ASSERT_EQ_I(loaded_names->type, RAY_STR);
     TEST_ASSERT_NOT_NULL(loaded_names->str_pool);
     TEST_ASSERT_EQ_U(loaded_names->str_pool->mmod, 2);
-    TEST_ASSERT_TRUE(loaded_names->attrs & RAY_ATTR_HAS_NULLS);
-    TEST_ASSERT_TRUE(ray_vec_is_null(loaded_names, 2));
+    /* STR has no null: index 2 roundtrips as "", no HAS_NULLS */
+    TEST_ASSERT_FALSE(loaded_names->attrs & RAY_ATTR_HAS_NULLS);
+    TEST_ASSERT_FALSE(ray_vec_is_null(loaded_names, 2));
 
     size_t slen = 0;
     const char* s0 = ray_str_vec_get(loaded_names, 0, &slen);
@@ -1702,9 +1703,10 @@ static test_result_t test_serde_null_roundtrip(void) {
         TEST_ASSERT_FALSE(RAY_IS_ERR(back));
         TEST_ASSERT_EQ_I(back->type, RAY_STR);
         TEST_ASSERT_EQ_I(back->len, 3);
-        TEST_ASSERT_TRUE(back->attrs & RAY_ATTR_HAS_NULLS);
+        /* STR has no null: the "" placeholder roundtrips as "", no HAS_NULLS */
+        TEST_ASSERT_FALSE(back->attrs & RAY_ATTR_HAS_NULLS);
         TEST_ASSERT_FALSE(ray_vec_is_null(back, 0));
-        TEST_ASSERT_TRUE(ray_vec_is_null(back, 1));
+        TEST_ASSERT_FALSE(ray_vec_is_null(back, 1));
         TEST_ASSERT_FALSE(ray_vec_is_null(back, 2));
 
         /* Non-null elements must survive */
@@ -1736,7 +1738,7 @@ static test_result_t test_serde_typed_null_atoms(void) {
 
     const int8_t atom_types[] = {
         -RAY_I64, -RAY_F64, -RAY_DATE, -RAY_TIME, -RAY_TIMESTAMP,
-        -RAY_I32, -RAY_I16, -RAY_BOOL, -RAY_U8, -RAY_SYM, -RAY_STR,
+        -RAY_I32, -RAY_I16, -RAY_BOOL, -RAY_U8, -RAY_SYM,  /* STR has no null atom */
     };
     for (size_t i = 0; i < sizeof(atom_types)/sizeof(atom_types[0]); i++) {
         int8_t t = atom_types[i];

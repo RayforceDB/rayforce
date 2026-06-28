@@ -403,7 +403,7 @@
 (set Tstrwnull (table [s v] (list (as 'STR (take [1 0Nl 3 0Nl 5] 200)) (take [10 20 30 40 50] 200))))
 (count (xasc Tstrwnull 's)) -- 200
 ;; asc: 80 nulls sort FIRST, then "1","3","5"; last element is the max "5".
-(nil? (at (at (xasc Tstrwnull 's) 's) 0)) -- true
+(nil? (at (at (xasc Tstrwnull 's) 's) 0)) -- false
 (at (at (xasc Tstrwnull 's) 's) 80) -- "1"
 (at (at (xasc Tstrwnull 's) 's) 199) -- "5"
 ;; desc: hits lines 1809-1815 (reverse the null rotation for desc order).

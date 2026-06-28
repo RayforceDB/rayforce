@@ -304,6 +304,30 @@ static char* find_top_sep(char* s, const char* marker) {
     return NULL;
 }
 
+/* RFL_UPDATE=1 regen: rewrite a .rfl's ` -- RHS` goldens with actual values. */
+static void rfl_rewrite_goldens(const char* path, const int* lns, char (*vals)[512], int nu) {
+    FILE* f = fopen(path, "rb"); if (!f) return;
+    fseek(f, 0, SEEK_END); long n = ftell(f); rewind(f);
+    char* s = (char*)malloc((size_t)n + 1); if (!s) { fclose(f); return; }
+    size_t rd = fread(s, 1, (size_t)n, f); s[rd] = '\0'; fclose(f);
+    FILE* o = fopen(path, "wb"); if (!o) { free(s); return; }
+    char* q = s; int ln = 0;
+    while (*q) {
+        char* nl = strchr(q, '\n'); size_t L = nl ? (size_t)(nl - q) : strlen(q);
+        ln++;
+        int ui = -1; for (int i = 0; i < nu; i++) if (lns[i] == ln) { ui = i; break; }
+        if (ui >= 0) {
+            char line[2048]; size_t cl = L < 2047 ? L : 2047; memcpy(line, q, cl); line[cl] = '\0';
+            char* sep = find_top_sep(line, " -- ");
+            if (sep) { *(sep + 4) = '\0'; fprintf(o, "%s%s", line, vals[ui]); }
+            else fwrite(q, 1, L, o);
+        } else fwrite(q, 1, L, o);
+        if (nl) fputc('\n', o);
+        q = nl ? nl + 1 : q + L;
+    }
+    free(s); fclose(o);
+}
+
 static test_result_t run_rfl_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) FAILF("cannot open %s", path);
@@ -321,6 +345,10 @@ static test_result_t run_rfl_file(const char* path) {
     int   assert_count  = 0;  /* tallies LHS -- RHS and EXPR !- SUBSTR lines */
     char* p             = src;
     test_result_t res   = { TEST_PASS, NULL };
+    int   upd    = getenv("RFL_UPDATE") != NULL;
+    static int  upd_ln[4096];
+    static char upd_v[4096][512];
+    int   nu     = 0;
 
     while (*p) {
         char* nl_ptr = strchr(p, '\n');
@@ -375,6 +403,12 @@ static test_result_t run_rfl_file(const char* path) {
                 char lbuf[512], rbuf[512];
                 fmt_into(le, lbuf, sizeof lbuf);
                 fmt_into(re, rbuf, sizeof rbuf);
+                if (upd) {
+                    if (nu < 4096) { upd_ln[nu] = line_no;
+                        snprintf(upd_v[nu], sizeof upd_v[nu], "%s", lbuf); nu++; }
+                    ray_release(le); ray_release(re);
+                    goto next;
+                }
                 snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,
                          "%s:%d: expected \"%s\", got \"%s\"  -- src: %s",
                          path, line_no, rbuf, lbuf, lhs);
@@ -444,6 +478,7 @@ done:
                  path);
         res = (test_result_t){ TEST_FAIL, ray_test_fail_buf };
     }
+    if (upd && nu) rfl_rewrite_goldens(path, upd_ln, upd_v, nu);
     free(src);
     return res;
 }

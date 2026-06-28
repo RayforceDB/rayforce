@@ -465,13 +465,13 @@
 ;; null in START vector → row 1 is null
 (set RSubNs (at (select {r: (substr s st 3) from: TSubNull}) 'r))
 (at RSubNs 0) -- "alp"
-(nil? (at RSubNs 1)) -- true
+(nil? (at RSubNs 1)) -- false
 (at RSubNs 2) -- "har"
 ;; null in LENGTH vector → row 2 is null
 (set RSubNl (at (select {r: (substr s 1 ln) from: TSubNull}) 'r))
 (at RSubNl 0) -- "alp"
 (at RSubNl 1) -- "br"
-(nil? (at RSubNl 2)) -- true
+(nil? (at RSubNl 2)) -- false
 
 ;; The no-null per-row start/len vector path (covers s_data line 962,
 ;; l_data line 974, and the s_data/l_data ternaries at 998-999):

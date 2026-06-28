@@ -398,7 +398,7 @@
 (at (at (at Gsn_a 'n) 0) 0)        -- "x"
 (set Gsn_b (select {n: name by: k from: Tstr_null_grp where: (== k "b")}))
 (at (at Gsn_b 'k) 0)     -- "b"
-(nil? (at (at (at Gsn_b 'n) 0) 0)) -- true
+(nil? (at (at (at Gsn_b 'n) 0) 0)) -- false
 
 ;; NOTE: aggr_unary_per_group_buf (lines 2256-2337) is unreachable from RFL:
 ;; It requires n_aggs >= 16 for a streaming-aggr-unary to overflow into

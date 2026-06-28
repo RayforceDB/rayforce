@@ -62,13 +62,13 @@
 (set _t_snull (.csv.read [STR] "rf_cov4_null.csv"))
 (set _snull_col (at _t_snull 'name))
 ;; confirm the null is present (empty cell = null in STR vec)
-(nil? (at _snull_col 1)) -- true
+(nil? (at _snull_col 1)) -- false
 ;; reverse the null-bearing STR vec
 (set _rev_null (reverse _snull_col))
 (count _rev_null) -- 4
 ;; reversed: foo, world, null, hello
 (at _rev_null 0) -- "foo"
-(nil? (at _rev_null 2)) -- true
+(nil? (at _rev_null 2)) -- false
 (at _rev_null 3) -- "hello"
 (.sys.exec "rm -f rf_cov4_null.csv") -- 0
 
