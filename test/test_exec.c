@@ -3285,8 +3285,10 @@ static test_result_t test_exec_str_upper_null(void) {
     TEST_ASSERT_EQ_U(len, 5);
     TEST_ASSERT_MEM_EQ(5, s0, "HELLO");
 
-    /* Row 1: null propagated */
-    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
+    /* Row 1: empty -> empty (STR has no null) */
+    TEST_ASSERT_FALSE(ray_vec_is_null(result, 1));
+    (void)ray_str_vec_get(result, 1, &len);
+    TEST_ASSERT_EQ_U(len, 0);
 
     /* Row 2: "FOO" */
     const char* s2 = ray_str_vec_get(result, 2, &len);
@@ -3326,7 +3328,7 @@ static test_result_t test_exec_str_strlen_null(void) {
     TEST_ASSERT_EQ_I(result->type, RAY_I64);
     int64_t* d = (int64_t*)ray_data(result);
     TEST_ASSERT_EQ_I(d[0], 5);
-    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));  /* null propagated */
+    TEST_ASSERT_EQ_I(d[1], 0);  /* empty string -> length 0 (STR has no null) */
     TEST_ASSERT_EQ_I(d[2], 3);
 
     ray_release(result);
@@ -3369,7 +3371,10 @@ static test_result_t test_exec_str_substr_null(void) {
     TEST_ASSERT_EQ_U(len, 3);
     TEST_ASSERT_MEM_EQ(3, s0, "hel");
 
-    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
+    /* Row 1: empty in -> empty out (STR has no null) */
+    TEST_ASSERT_FALSE(ray_vec_is_null(result, 1));
+    (void)ray_str_vec_get(result, 1, &len);
+    TEST_ASSERT_EQ_U(len, 0);
 
     const char* s2 = ray_str_vec_get(result, 2, &len);
     TEST_ASSERT_EQ_U(len, 3);
@@ -3415,7 +3420,10 @@ static test_result_t test_exec_str_replace_null(void) {
     TEST_ASSERT_EQ_U(len, 5);
     TEST_ASSERT_MEM_EQ(5, s0, "hell0");
 
-    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
+    /* Row 1: empty in -> empty out (STR has no null) */
+    TEST_ASSERT_FALSE(ray_vec_is_null(result, 1));
+    (void)ray_str_vec_get(result, 1, &len);
+    TEST_ASSERT_EQ_U(len, 0);
 
     const char* s2 = ray_str_vec_get(result, 2, &len);
     TEST_ASSERT_EQ_U(len, 3);
@@ -3470,8 +3478,11 @@ static test_result_t test_exec_str_concat_null(void) {
     TEST_ASSERT_EQ_U(len, 8);
     TEST_ASSERT_MEM_EQ(8, s0, "John Doe");
 
-    /* Row 1: null in first arg → entire row null */
-    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
+    /* Row 1: empty first arg -> "" + " Smith" = " Smith" (STR has no null) */
+    TEST_ASSERT_FALSE(ray_vec_is_null(result, 1));
+    const char* s1c = ray_str_vec_get(result, 1, &len);
+    TEST_ASSERT_EQ_U(len, 6);
+    TEST_ASSERT_MEM_EQ(6, s1c, " Smith");
 
     const char* s2 = ray_str_vec_get(result, 2, &len);
     TEST_ASSERT_EQ_U(len, 6);

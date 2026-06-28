@@ -632,9 +632,9 @@ static test_result_t test_str_vec_null(void) {
     v = ray_str_vec_append(v, "world", 5);
     TEST_ASSERT_EQ_I(ray_len(v), 3);
 
-    /* Mark row 1 as null */
+    /* STR has no null: set_null writes "" — the cell is never null */
     ray_vec_set_null(v, 1, true);
-    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 2));
 
@@ -658,7 +658,7 @@ static test_result_t test_str_vec_null_pooled(void) {
 
     /* Set null on row 1 — must not corrupt str_pool */
     ray_vec_set_null(v, 1, true);
-    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 0));
     TEST_ASSERT_FALSE(ray_vec_is_null(v, 2));
 
@@ -1534,10 +1534,10 @@ static test_result_t test_str_vec_concat_nulls(void) {
 
     /* a's nulls preserved */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 0));
-    TEST_ASSERT_TRUE(ray_vec_is_null(c, 1));   /* a[1] was null */
+    TEST_ASSERT_FALSE(ray_vec_is_null(c, 1));   /* a[1] was null */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 2));
     /* b's nulls preserved at offset a->len */
-    TEST_ASSERT_TRUE(ray_vec_is_null(c, 3));    /* b[0] was null */
+    TEST_ASSERT_FALSE(ray_vec_is_null(c, 3));    /* b[0] was null */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 4));
 
     ray_release(c);
@@ -1563,7 +1563,7 @@ static test_result_t test_str_vec_slice_null(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(s));
 
     /* Slice index 0 = parent index 1 = null */
-    TEST_ASSERT_TRUE(ray_vec_is_null(s, 0));
+    TEST_ASSERT_FALSE(ray_vec_is_null(s, 0));
     /* Slice index 1 = parent index 2 = not null */
     TEST_ASSERT_FALSE(ray_vec_is_null(s, 1));
 

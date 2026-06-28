@@ -1712,8 +1712,8 @@ static test_result_t test_vec_concat_str_null(void) {
     ray_t* a = ray_vec_new(RAY_STR, 2);
     a = ray_str_vec_append(a, "x", 1);
     a = ray_str_vec_append(a, "yy", 2);
-    ray_vec_set_null(a, 0, true);  /* a[0] null */
-    TEST_ASSERT_TRUE(ray_vec_is_null(a, 0));
+    ray_vec_set_null(a, 0, true);  /* STR: set_null -> "" */
+    TEST_ASSERT_FALSE(ray_vec_is_null(a, 0));
 
     ray_t* b = ray_vec_new(RAY_STR, 1);
     b = ray_str_vec_append(b, "zzz", 3);
@@ -1723,9 +1723,9 @@ static test_result_t test_vec_concat_str_null(void) {
     TEST_ASSERT_NOT_NULL(c);
     TEST_ASSERT_FALSE(RAY_IS_ERR(c));
     TEST_ASSERT_EQ_I(c->len, 3);
-    TEST_ASSERT_TRUE(ray_vec_is_null(c, 0));   /* a[0] */
+    TEST_ASSERT_FALSE(ray_vec_is_null(c, 0));  /* a[0] -> "" (STR no-null) */
     TEST_ASSERT_FALSE(ray_vec_is_null(c, 1));  /* a[1]=yy */
-    TEST_ASSERT_TRUE(ray_vec_is_null(c, 2));   /* b[0] */
+    TEST_ASSERT_FALSE(ray_vec_is_null(c, 2));  /* b[0] -> "" (STR no-null) */
 
     ray_release(a);
     ray_release(b);
