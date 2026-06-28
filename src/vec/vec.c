@@ -978,8 +978,10 @@ ray_err_t ray_vec_set_null_checked(ray_t* vec, int64_t idx, bool is_null) {
             case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[idx] = NULL_I32; break;
             case RAY_I16:                          ((int16_t*)p)[idx] = NULL_I16; break;
             case RAY_STR:
+                /* STR has no null distinct from "" (kdb+ model): write the
+                 * empty string but do NOT mark the column nullable. */
                 memset(&((ray_str_t*)p)[idx], 0, sizeof(ray_str_t));
-                break;
+                return RAY_OK;
             case RAY_GUID:
                 memset((uint8_t*)p + idx * 16, 0, 16);
                 break;
@@ -1356,11 +1358,10 @@ bool ray_vec_is_null(ray_t* vec, int64_t idx) {
     if (!vec || RAY_IS_ERR(vec)) return false;
     if (idx < 0 || idx >= vec->len) return false;
 
-    /* SYM columns are no-null by design — see ray_vec_set_null_checked
-     * for the rationale.  Sentinel check is bypassed here; consumers
-     * that need sym-null detection (e.g. dict.c key handling) test the
-     * sym id directly. */
-    if (vec->type == RAY_SYM) return false;
+    /* SYM and STR columns are no-null by design (kdb+ model: empty "" / sym 0
+     * is the convention — there is no null distinct from empty).  Consumers
+     * that need empty detection test the value (sym id 0 / str len 0) directly. */
+    if (vec->type == RAY_SYM || vec->type == RAY_STR) return false;
 
     /* Slice: delegate to parent with adjusted index */
     if (vec->attrs & RAY_ATTR_SLICE) {
