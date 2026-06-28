@@ -1913,8 +1913,8 @@ static test_result_t test_str_vec_compact_paths(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(v));
 
     /* set element 1 null (STR is nullable). */
-    ray_vec_set_null(v, 1, true);
-    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
+    ray_vec_set_null(v, 1, true);  /* STR: set_null -> "" */
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
 
     /* compact reclaims dead bytes; null + inline elements are skipped. */
     v = ray_str_vec_compact(v);
@@ -1926,8 +1926,8 @@ static test_result_t test_str_vec_compact_paths(void) {
     const char* s2 = ray_str_vec_get(v, 2, &l);
     TEST_ASSERT_EQ_I((int64_t)l, 32);
     TEST_ASSERT_MEM_EQ(32, s2, "pooled_gamma_string_three_here!!");
-    /* element 1 remains null after compact. */
-    TEST_ASSERT_TRUE(ray_vec_is_null(v, 1));
+    /* element 1 is "" after compact (STR no-null). */
+    TEST_ASSERT_FALSE(ray_vec_is_null(v, 1));
 
     /* compact with no dead bytes is a no-op early return (line 1182). */
     ray_t* same = ray_str_vec_compact(v);

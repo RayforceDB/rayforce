@@ -443,13 +443,10 @@ static inline bool ray_atom_is_null_fn(const union ray_t* x) {
         case RAY_I16:       return x->i16 == NULL_I16;
         case RAY_SYM:       return x->i64 == 0;
         case RAY_STR:
-            /* STR atom null = empty string.  Atoms use SSO (slen + sdata)
-             * for len<=7 and a pool pointer (obj) for longer strings; the
-             * union overlap means a non-zero obj pointer has a low byte
-             * that ALSO reads as slen via the SSO arm.  Only when slen==0
-             * AND obj==NULL is the atom genuinely the empty string (see
-             * is_sso in src/vec/str.c). */
-            return x->slen == 0 && x->obj == NULL;
+            /* STR has no null distinct from "" (kdb+ model: char lists have no
+             * null, only symbols do).  A STR atom is never null — the empty
+             * string is a value. */
+            return false;
         case RAY_GUID: {
             /* GUID null = 16 all-zero bytes in obj's U8 buffer.
              * obj is always populated by ray_guid / ray_typed_null —
