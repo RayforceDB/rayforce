@@ -17,3 +17,15 @@
 (at (meta rc) 'len) -- 11
 (at rc 'c01) -- [32 72]
 (at rc 'c10) -- [32 72]
+
+;; ── v2 engine: 17 aggs, low-card dense ──
+(set bt (table [k v] (list [1 1 2 2] [1.5 2.5 3.5 4.5])))
+(set rv (select {from: bt b01: (sum v) b02: (min v) b03: (max v) b04: (count v) b05: (avg v) b06: (sum v) b07: (min v) b08: (max v) b09: (count v) b10: (avg v) b11: (sum v) b12: (min v) b13: (max v) b14: (count v) b15: (avg v) b16: (sum v) b17: (sum v) by: {k: k}}))
+(at (meta rv) 'len) -- 18
+(at rv 'b17) -- [4.0 8.0]
+
+;; ── v2 engine: same width, high-card key (hash/radix strategy) ──
+(set ht (table [k v] (list (til 5000) (til 5000))))
+(set rh (select {from: ht b01: (sum v) b02: (min v) b03: (max v) b04: (count v) b05: (sum v) b06: (min v) b07: (max v) b08: (count v) b09: (sum v) b10: (min v) b11: (max v) b12: (count v) b13: (sum v) b14: (min v) b15: (max v) b16: (count v) b17: (sum v) by: {k: k}}))
+(at (meta rh) 'len) -- 18
+(sum (at rh 'b17)) -- 12497500
