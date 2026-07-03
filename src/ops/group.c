@@ -5559,12 +5559,16 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
      * Used when query has AVG or expression keys/aggs.
      * Only concatenates the columns actually referenced by the GROUP BY. */
     {
-        /* Collect needed column sym IDs (keys + agg inputs).  Keys and agg
-         * inputs are each capped at RAY_GROUP_MAX_SLOTS by the compile path,
-         * but their deduplicated UNION can reach the sum of both caps —
-         * size for that, not for one cap (a bare [16] here overflowed the
-         * stack with >16 distinct key+agg columns). */
-        int64_t needed[2 * RAY_GROUP_MAX_SLOTS];
+        /* Collect needed column sym IDs (keys + agg inputs).  The
+         * deduplicated UNION of key and agg-input columns can reach the sum
+         * of both counts, so size the scratch to that union bound exactly
+         * (min 1 to avoid a zero-size allocation). */
+        int64_t needed_max = (int64_t)n_keys + (int64_t)n_aggs;
+        if (needed_max < 1) needed_max = 1;
+        ray_t* needed_hdr = NULL;
+        int64_t* needed = (int64_t*)scratch_alloc(&needed_hdr,
+                (size_t)needed_max * sizeof(int64_t));
+        if (!needed) return ray_error("oom", NULL);
         int n_needed = 0;
         for (uint8_t k = 0; k < n_keys; k++) {
             ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
@@ -5592,7 +5596,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
 
         /* Build flat table with only needed columns (or all if n_needed==0) */
         ray_t* flat_tbl = ray_table_new(n_needed > 0 ? (int64_t)n_needed : ncols);
-        if (!flat_tbl || RAY_IS_ERR(flat_tbl)) return flat_tbl;
+        if (!flat_tbl || RAY_IS_ERR(flat_tbl)) { scratch_free(needed_hdr); return flat_tbl; }
 
         int64_t cols_to_iter = n_needed > 0 ? (int64_t)n_needed : ncols;
         for (int64_t ci = 0; ci < cols_to_iter; ci++) {
@@ -5634,6 +5638,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 flat = typed_vec_new(base_type, base_attrs, total_rows);
                 if (!flat || RAY_IS_ERR(flat)) {
                     ray_release(flat_tbl);
+                    scratch_free(needed_hdr);
                     return ray_error("oom", NULL);
                 }
                 /* segment cells are copied id-preserving — all partitions
@@ -5658,6 +5663,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
             }
             if (!flat || RAY_IS_ERR(flat)) {
                 ray_release(flat_tbl);
+                scratch_free(needed_hdr);
                 return ray_error("oom", NULL);
             }
 
@@ -5670,6 +5676,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
         ray_t* result = exec_group(g, op, flat_tbl, 0);
         g->table = saved;
         ray_release(flat_tbl);
+        scratch_free(needed_hdr);
         return result;
     }
 }

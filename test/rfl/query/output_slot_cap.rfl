@@ -1,4 +1,4 @@
-;; Output-column slot cap RETIRED (was RAY_GROUP_MAX_SLOTS = 16): every
+;; Output-column slot cap RETIRED (was a fixed 16-slot array): every
 ;; select/group path now produces ALL requested outputs at any width — the
 ;; collectors are exact-size scratch, not fixed 16-slot arrays.  This file
 ;; guards correct wide results on the paths that used to error `range`.

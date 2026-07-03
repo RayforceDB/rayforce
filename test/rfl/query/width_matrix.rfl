@@ -137,6 +137,18 @@
 (set wp (table [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17 v] (list [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [3.0 5.0])))
 (at (window {from: wp part: [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17] funcs: {mn: (min v)}}) 'mn) -- [3.0 3.0]
 
+;; ── nonagg scatter path: 17 pure non-agg outputs, single key.  Retires the
+;; DAG-compile `n_nonaggs >= 16` cap in src/ops/query.c ray_select_fn (the
+;; last of the fixed 16-slot behaviour caps): with by: {k: k} and no aggregate
+;; outputs, each nNN: v collapses to a per-group LIST column.  Group k=1
+;; collects v=[10 20], group k=2 collects v=[30 40]; the 17th output n17
+;; proves the surplus past the former cap survives, not just the head.
+(set rna (select {from: t n01: v n02: v n03: v n04: v n05: v n06: v n07: v n08: v n09: v n10: v n11: v n12: v n13: v n14: v n15: v n16: v n17: v by: {k: k}}))
+(at (meta rna) 'len) -- 18
+(at rna 'k) -- [1 2]
+(at (at rna 'n17) 0) -- [10 20]
+(at (at rna 'n17) 1) -- [30 40]
+
 ;; ── nonagg per-group output: pure-arithmetic expression referencing 17
 ;; columns, single group (src/ops/query.c collect_col_refs callers in
 ;; nonagg_eval_per_group_core/eval_expr_per_row — exact-size scratch carve

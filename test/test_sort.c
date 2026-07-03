@@ -650,8 +650,8 @@ static test_result_t test_sort_indices_many_cols(void) {
     ray_heap_init();
     ray_sym_init();
 
-    /* n_cols=17 (one past the retired RAY_GROUP_MAX_SLOTS-shaped cap):
-     * sort_indices_ex has no n_cols limit of its own any more — the fixed
+    /* n_cols=17 (one past the fixed 16-key radix fast path):
+     * sort_indices_ex has no n_cols limit of its own — the fixed
      * 16-key radix_encode_ctx_t fast path just gates itself off above 16
      * and falls through to the n_cols-unbounded comparator merge sort.
      * 16 constant columns (every row ties) + one discriminator column

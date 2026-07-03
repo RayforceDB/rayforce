@@ -5650,7 +5650,7 @@ by_dict_done:
     ray_op_t** agg_ins2       = agg_ins + aggs_max;
     int64_t*   agg_k          = (int64_t*)(agg_ins2 + aggs_max);
     uint16_t*  agg_ops        = (uint16_t*)(agg_k + aggs_max);
-    uint8_t n_nonaggs = 0;
+    int64_t n_nonaggs = 0;  /* bounded by n_out_max (nonagg_names/_exprs size) */
     int     n_hidden_aggs = 0;
     int     n_compound = 0;
     int     n_aggs_real = 0;           /* DAG agg slots before hidden ones */
@@ -7882,11 +7882,6 @@ by_dict_done:
                         if (compound_pos[ci] == i) { pre_compound = true; break; }
                     if (pre_compound) continue;
                 }
-                if (n_nonaggs >= RAY_GROUP_MAX_SLOTS) {
-                    for (int ci = 0; ci < n_compound; ci++) ray_release(compound_rw[ci]);
-                    ray_graph_free(g); ray_release(tbl);
-                    scratch_free(sel_slots_hdr); return ray_error("range", "select by: too many non-aggregate columns (max %d)", RAY_GROUP_MAX_SLOTS);
-                }
                 nonagg_names[n_nonaggs] = kid;
                 nonagg_exprs[n_nonaggs] = val_expr;
                 n_nonaggs++;
@@ -9186,12 +9181,12 @@ by_dict_done:
                 /* Pre-check ALL nonaggs first so we don't half-apply on
                  * an unhandled atom type and then have to roll back. */
                 int all_broadcastable = 1;
-                for (uint8_t ni = 0; ni < n_nonaggs && all_broadcastable; ni++) {
+                for (int64_t ni = 0; ni < n_nonaggs && all_broadcastable; ni++) {
                     if (!can_atom_broadcast(nonagg_exprs[ni]))
                         all_broadcastable = 0;
                 }
                 if (all_broadcastable) {
-                    for (uint8_t ni = 0; ni < n_nonaggs; ni++) {
+                    for (int64_t ni = 0; ni < n_nonaggs; ni++) {
                         ray_t* col = atom_broadcast_vec(nonagg_exprs[ni], n_groups);
                         if (!col) {
                             /* can_atom_broadcast vetted these — anything
@@ -9667,7 +9662,7 @@ by_dict_done:
                  * group counts — falls into count_distinct_per_group_buf
                  * which requires idx_buf+offsets+grp_cnt. */
                 int needs_slice_idx = 0;
-                for (uint8_t ni = 0; ni < n_nonaggs && !needs_slice_idx; ni++) {
+                for (int64_t ni = 0; ni < n_nonaggs && !needs_slice_idx; ni++) {
                     ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
                     int simple_cd_global = (cd_inner &&
                                             cd_inner->type == -RAY_SYM &&
@@ -9783,7 +9778,7 @@ by_dict_done:
                 }
 
                 ray_t* scatter_err = NULL;
-                for (uint8_t ni = 0; ni < n_nonaggs && !scatter_err; ni++) {
+                for (int64_t ni = 0; ni < n_nonaggs && !scatter_err; ni++) {
                     /* Per-group count(distinct) — dispatch directly to
                      * exec_count_distinct on each group's slice using
                      * the same idx_buf+offsets+grp_cnt layout the
@@ -10025,7 +10020,7 @@ by_dict_done:
                 /* Empty group set: add empty LIST columns so the
                  * output schema still includes the user-declared
                  * non-agg columns. */
-                for (uint8_t ni = 0; ni < n_nonaggs; ni++) {
+                for (int64_t ni = 0; ni < n_nonaggs; ni++) {
                     ray_t* empty_list = ray_list_new(0);
                     if (!empty_list || RAY_IS_ERR(empty_list)) {
                         ray_release(result); ray_release(tbl);

@@ -117,15 +117,6 @@ static inline void* scratch_calloc(ray_t** hdr_out, size_t nbytes) {
     return p;
 }
 
-/* Fixed slot capacity for the select/group-by compile and exec paths: group
- * keys, aggregate outputs, non-aggregate outputs, and sort keys each collect
- * into stack arrays of this size.  Exceeding it is rejected with a clear
- * error rather than silently dropping the surplus (which produced wrong
- * results).  Exec-side consumers (group.c, agg_engine.c) may rely on
- * compiled GROUP nodes respecting this bound but must still guard their own
- * fixed arrays against it. */
-#define RAY_GROUP_MAX_SLOTS 16
-
 /* Allocate uninitialized scratch buffer. */
 static inline void* scratch_alloc(ray_t** hdr_out, size_t nbytes) {
     ray_t* h = ray_alloc(nbytes);
