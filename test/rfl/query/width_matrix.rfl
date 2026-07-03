@@ -90,3 +90,8 @@
 (set rt (select {from: t c01: (count v) c02: (count v) c03: (count v) c04: (count v) c05: (count v) c06: (count v) c07: (count v) c08: (count v) c09: (count v) c10: (count v) c11: (count v) c12: (count v) c13: (count v) c14: (count v) c15: (count v) c16: (count v) c17: (count v) by: {k: k} take: 2}))
 (at (meta rt) 'len) -- 18
 (at rt 'c17) -- [2 2]
+
+;; ── scalar reduction (no by:): 17 aggregates — was a SILENT drop past 16 ──
+(set rs (select {from: t s01: (sum v) s02: (count v) s03: (min v) s04: (max v) s05: (sum v) s06: (count v) s07: (min v) s08: (max v) s09: (sum v) s10: (count v) s11: (min v) s12: (max v) s13: (sum v) s14: (count v) s15: (min v) s16: (max v) s17: (sum v)}))
+(at (meta rs) 'len) -- 17
+(at rs 's17) -- [100]

@@ -8421,12 +8421,26 @@ by_dict_done:
                 ray_release(fres);
             }
 
-            uint16_t  s_agg_ops[16];
-            ray_op_t* s_agg_ins[16];
-            ray_op_t* s_agg_ins2[16];
-            uint8_t   s_n_aggs = 0;
-            int       s_has_binary = 0;
-            for (int64_t i = 0; i + 1 < dict_n && s_n_aggs < 16; i += 2) {
+            /* Exact-size scratch carve: bound by select_output_count (every
+             * output here is an aggregate, so outputs == aggs).  The former
+             * fixed [16] arrays silently stopped compiling past the 16th
+             * output (loop guard `s_n_aggs < 16`) — the remaining outputs
+             * were never wired into the group node. */
+            int64_t s_max = select_output_count(dict_elems, dict_n);
+            if (s_max < 1) s_max = 1;
+            ray_t* sagg_hdr = NULL;
+            ray_op_t** s_agg_ins = (ray_op_t**)scratch_alloc(&sagg_hdr,
+                    (size_t)s_max * (2 * sizeof(ray_op_t*) + sizeof(uint16_t)));
+            if (!s_agg_ins) {
+                if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                ray_graph_free(g); ray_release(tbl);
+                scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
+            }
+            ray_op_t** s_agg_ins2 = s_agg_ins + s_max;
+            uint16_t*  s_agg_ops  = (uint16_t*)(s_agg_ins2 + s_max);
+            int64_t    s_n_aggs = 0;
+            int        s_has_binary = 0;
+            for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id ||
                     kid == take_id || kid == asc_id || kid == desc_id || kid == nearest_id) continue;
@@ -8442,6 +8456,7 @@ by_dict_done:
                         g->selection = NULL;
                     }
                     ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sagg_hdr);
                     scratch_free(sel_slots_hdr); return ray_error("domain", "select: failed to compile aggregation argument");
                 }
                 /* Canonical aggregand type-admission (same table as the scalar
@@ -8453,29 +8468,42 @@ by_dict_done:
                     int8_t in_t = s_agg_ins[s_n_aggs]->out_type;            /* capture BEFORE free */
                     if (g->selection) { ray_release(g->selection); g->selection = NULL; }
                     ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sagg_hdr);
                     scratch_free(sel_slots_hdr); return ray_error("type", "select: aggregation does not admit input type %s", ray_type_name(in_t));
                 }
                 if (op == OP_PEARSON_CORR) {
                     if (ray_len(val_expr) < 3) {
                         if (g->selection) { ray_release(g->selection); g->selection = NULL; }
                         ray_graph_free(g); ray_release(tbl);
+                        scratch_free(sagg_hdr);
                         scratch_free(sel_slots_hdr); return ray_error("arity", "select: cor aggregation requires two column arguments");
                     }
                     s_agg_ins2[s_n_aggs] = compile_expr_dag(g, agg_elems[2]);
                     if (!s_agg_ins2[s_n_aggs]) {
                         if (g->selection) { ray_release(g->selection); g->selection = NULL; }
                         ray_graph_free(g); ray_release(tbl);
+                        scratch_free(sagg_hdr);
                         scratch_free(sel_slots_hdr); return ray_error("domain", "select: failed to compile cor second argument");
                     }
                     s_has_binary = 1;
                 }
                 s_n_aggs++;
             }
+            /* The op-graph builders carry the agg count in uint8_t; guard the
+             * representational limit before narrowing at the call (same shape
+             * as the by: path's group-column guard). */
+            if (s_n_aggs > UINT8_MAX) {
+                if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                ray_graph_free(g); ray_release(tbl);
+                scratch_free(sagg_hdr);
+                scratch_free(sel_slots_hdr); return ray_error("range", "select: too many aggregate outputs for the op graph (max %d)", UINT8_MAX);
+            }
             if (s_has_binary)
                 root = ray_group2(g, NULL, 0, s_agg_ops, s_agg_ins,
-                                   s_agg_ins2, s_n_aggs);
+                                   s_agg_ins2, (uint8_t)s_n_aggs);
             else
-                root = ray_group(g, NULL, 0, s_agg_ops, s_agg_ins, s_n_aggs);
+                root = ray_group(g, NULL, 0, s_agg_ops, s_agg_ins, (uint8_t)s_n_aggs);
+            scratch_free(sagg_hdr);
         } else {
             /* Projection only (no group by) — select specific columns */
             ray_op_t* col_ops[16];

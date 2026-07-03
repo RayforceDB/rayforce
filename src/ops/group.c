@@ -4656,8 +4656,11 @@ typedef struct {
     /* per-worker accumulators (1 slot each) */
     da_accum_t*    accums;
     uint32_t       n_accums;
-    /* Per-agg integer-null sentinel + mask (mirrors da_ctx_t). */
-    uint32_t       agg_int_null_mask;
+    /* Per-agg integer-null sentinel + has-nulls flag.  A per-element array
+     * (not a bitmask, unlike da_ctx_t's agg_int_null_mask) because this
+     * path's n_aggs is VLA-sized with no fixed cap — a 32/64-bit mask would
+     * silently alias past that many aggregates. */
+    const bool*    agg_int_null_has;
     int64_t*       agg_int_null_sentinel;
 } scalar_ctx_t;
 
@@ -4749,7 +4752,7 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
         uint16_t op = c->agg_ops[a];
         bool is_f = (c->agg_types[a] == RAY_F64);
         /* NULL_I* sentinel = null. */
-        bool int_null = !is_f && (c->agg_int_null_mask & (1u << a)) &&
+        bool int_null = !is_f && c->agg_int_null_has[a] &&
                         iv == c->agg_int_null_sentinel[a];
         bool is_null = is_f ? !(fv == fv) : int_null;
         if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
@@ -6637,7 +6640,17 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
     }
 
-    if (n_keys > 8 || n_aggs > 8) return ray_error("nyi", NULL);
+    /* The ght `[8]` fast layout (key_data[8]/key_pool[8], and the per-agg
+     * agg_is_binary/agg_is_holistic/agg_is_wide bitmasks) structurally caps
+     * n_keys and n_aggs at 8 there — kept until a future cut (see the
+     * unbounded-slots design doc: "group-HT [8] fast layout ... until cut
+     * 4").  The scalar-reduction fast path below (n_keys == 0) is a
+     * separate, VLA-sized accumulator with no such limit, so let n_aggs > 8
+     * through when there are no group keys; the guard just before
+     * ght_compute_layout (`ht_path:`) still rejects the rare fallback
+     * (accumulator OOM / oversized scan) that would actually need the
+     * capped HT layout. */
+    if (n_keys > 8 || (n_keys > 0 && n_aggs > 8)) return ray_error("nyi", NULL);
 
     /* Extract selection (rowsel) for pushdown.  Prefer streaming the
      * morsel-local rowsel directly; flattening to int64 indices is kept
@@ -6911,7 +6924,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         void* agg_ptrs[vla_aggs];
         int8_t agg_types[vla_aggs];
         int64_t sc_int_null_sentinel[vla_aggs];
-        uint32_t sc_int_null_mask = 0;
+        /* Per-element flag, not a bitmask: this path's n_aggs is VLA-sized
+         * with no fixed cap, so a fixed-width bitmask would silently alias
+         * once n_aggs exceeded its bit width. */
+        bool sc_int_null_has[vla_aggs];
         bool sc_any_nullable = false;
         for (uint8_t a = 0; a < n_aggs; a++) {
             if (agg_prod[a].enabled) {
@@ -6919,22 +6935,22 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 agg_ptrs[a]  = NULL;
                 agg_types[a] = RAY_F64;
                 sc_int_null_sentinel[a] = 0;
+                sc_int_null_has[a] = false;
                 continue;
             }
             if (agg_vecs[a]) {
                 agg_ptrs[a]  = ray_data(agg_vecs[a]);
                 agg_types[a] = agg_vecs[a]->type;
                 sc_int_null_sentinel[a] = agg_int_null_sentinel_for(agg_vecs[a]->type);
-                /* Only set the int-null mask bit for storage types whose
-                 * sentinel is meaningful.  BOOL/U8/SYM use 0 as their default
+                /* Only flag int-null for storage types whose sentinel is
+                 * meaningful.  BOOL/U8/SYM use 0 as their default
                  * "sentinel" which collides with legitimate values
                  * (FALSE / zero byte / SYM id 0); gating those would silently
                  * drop real rows from SUM/MIN/MAX.  F64 has its own NaN path. */
                 int8_t t = agg_vecs[a]->type;
                 bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
                                           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP);
-                if (is_sentinel_typed && (agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS))
-                    sc_int_null_mask |= (1u << a);
+                sc_int_null_has[a] = is_sentinel_typed && (agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS);
                 if ((agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS) &&
                     (agg_vecs[a]->type == RAY_F64 || is_sentinel_typed))
                     sc_any_nullable = true;
@@ -6942,6 +6958,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 agg_ptrs[a]  = NULL;
                 agg_types[a] = 0;
                 sc_int_null_sentinel[a] = 0;
+                sc_int_null_has[a] = false;
             }
         }
 
@@ -7022,7 +7039,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             .rowsel     = rowsel,
             .accums     = sc_acc,
             .n_accums   = sc_n,
-            .agg_int_null_mask = sc_int_null_mask,
+            .agg_int_null_has = sc_int_null_has,
             .agg_int_null_sentinel = sc_int_null_sentinel,
         };
 
@@ -7038,7 +7055,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * agg_linear[0].enabled implies null-free.) */
         typedef void (*scalar_fn_t)(void*, uint32_t, int64_t, int64_t);
         scalar_fn_t sc_fn = scalar_accum_fn;
-        bool agg0_has_nulls = (sc_int_null_mask & 1u) != 0 ||
+        bool agg0_has_nulls = sc_int_null_has[0] ||
             (agg_vecs[0] && agg_vecs[0]->type == RAY_F64 &&
              (agg_vecs[0]->attrs & RAY_ATTR_HAS_NULLS));
         if (n_aggs == 1 && !match_idx && !rowsel && agg_ptrs[0] != NULL && !agg0_has_nulls) {
@@ -8707,6 +8724,21 @@ dyn_dense_done:
     }
 
 ht_path:;
+    /* n_keys == 0 with n_aggs > 8 is let through the top-of-function guard
+     * on the assumption the scalar fast path (VLA-sized) will serve it —
+     * that path returns before reaching here in the common case.  The rare
+     * fallback into this HT row-layout (accumulator OOM / oversized scan)
+     * still can't serve n_aggs > 8: agg_is_binary/agg_is_holistic/agg_is_wide
+     * are single-byte bitmasks in ght_layout_t.  n_keys > 0 with n_aggs > 8
+     * already returned at the top of the function and never reaches here. */
+    if (n_aggs > 8) {
+        for (uint8_t a = 0; a < n_aggs; a++)
+            { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+              if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
+        for (uint8_t k = 0; k < n_keys; k++)
+            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+        return ray_error("nyi", NULL);
+    }
     /* The HT row-layout reads agg_vecs directly — convert any fused-product
      * slots into ordinary materialized inputs first. */
     if (!group_materialize_prod_slots(agg_prod, agg_vecs, agg_owned,
