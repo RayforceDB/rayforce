@@ -4,8 +4,11 @@
 
 (set t (table [k g v] (list [1 1 2 2] [5 5 6 6] [10 20 30 40])))
 
-;; DAG path (single sym key, pure agg): 17 aggregates → range error
-(select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) a17: (sum v) by: {k: k}}) !- range
+;; DAG path (single sym key, pure agg): 17 aggregates now compile and run
+;; (the 16-slot compile cap is retired).  NOTE: currently gated on the
+;; exec-side agg-width lift (agg_engine.c v2 >16 bail + group.c legacy 8-cap)
+;; — until that lands the select returns `nyi`; this asserts the target state.
+(at (meta (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) a17: (sum v) by: {k: k}})) 'len) -- 18
 
 ;; eval-group path (multi-key + non-agg output): 17 outputs → range error
 (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) n1: v by: {k: k g: g}}) !- range

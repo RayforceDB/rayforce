@@ -11,3 +11,9 @@
 (at r17 'a01) -- [30 70]
 (at r17 'a16) -- [20 40]
 (at r17 'a17) -- [30 70]
+
+;; ── DAG path: 10 compound outputs, each decomposing into 2 hidden agg slots (20 hidden > 16) ──
+(set rc (select {from: t c01: (+ (sum v) (count v)) c02: (+ (sum v) (count v)) c03: (+ (sum v) (count v)) c04: (+ (sum v) (count v)) c05: (+ (sum v) (count v)) c06: (+ (sum v) (count v)) c07: (+ (sum v) (count v)) c08: (+ (sum v) (count v)) c09: (+ (sum v) (count v)) c10: (+ (sum v) (count v)) by: {k: k}}))
+(at (meta rc) 'len) -- 11
+(at rc 'c01) -- [32 72]
+(at rc 'c10) -- [32 72]

@@ -10,8 +10,12 @@
 ;; 16 aggregates — exactly at the cap: compiles and returns both groups.
 (count (select {by: k a: (sum v) b: (max v) c: (min v) d: (avg v) e: (sum v) f: (max v) g: (min v) h: (avg v) i: (sum v) j: (max v) l: (min v) m: (avg v) n: (sum v) o: (max v) p: (min v) q: (avg v) from: t})) -- 2
 
-;; 17 aggregates — one over the cap: clear error, not a silently dropped column.
-(select {by: k a: (sum v) b: (max v) c: (min v) d: (avg v) e: (sum v) f: (max v) g: (min v) h: (avg v) i: (sum v) j: (max v) l: (min v) m: (avg v) n: (sum v) o: (max v) p: (min v) q: (avg v) s: (sum v) from: t}) !- range
+;; 17 aggregates — one over the former cap: the DAG group-by compile cap is
+;; retired, so this now compiles and returns both groups.  NOTE: currently
+;; gated on the exec-side agg-width lift (agg_engine.c v2 >16 bail + group.c
+;; legacy 8-cap) — until that lands the select returns `nyi`; this asserts the
+;; target state.
+(count (select {by: k a: (sum v) b: (max v) c: (min v) d: (avg v) e: (sum v) f: (max v) g: (min v) h: (avg v) i: (sum v) j: (max v) l: (min v) m: (avg v) n: (sum v) o: (max v) p: (min v) q: (avg v) s: (sum v) from: t})) -- 2
 
 ;; ─── non-aggregate outputs ──────────────────────────────────────────
 ;; 17 non-aggregate outputs exercise the same cap on the scatter path.
