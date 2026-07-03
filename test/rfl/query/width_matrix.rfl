@@ -1,0 +1,13 @@
+;; Width matrix (spec: unbounded-slots cut 1).  Each section proves a select
+;; path produces ALL requested outputs at widths beyond the former 16 cap,
+;; with values checked against per-column oracles.
+
+(set t (table [k g v] (list [1 1 2 2] [5 5 6 6] [10 20 30 40])))
+
+;; ── DAG path: single sym key, 17 aggregates ──
+(set r17 (select {from: t a01: (sum v) a02: (count v) a03: (min v) a04: (max v) a05: (sum v) a06: (count v) a07: (min v) a08: (max v) a09: (sum v) a10: (count v) a11: (min v) a12: (max v) a13: (sum v) a14: (count v) a15: (min v) a16: (max v) a17: (sum v) by: {k: k}}))
+(at (meta r17) 'len) -- 18
+(at r17 'k) -- [1 2]
+(at r17 'a01) -- [30 70]
+(at r17 'a16) -- [20 40]
+(at r17 'a17) -- [30 70]

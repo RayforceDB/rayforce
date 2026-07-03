@@ -146,6 +146,18 @@ static void dict_pair_view(ray_t* d, ray_t* key_atoms, ray_t** out_elems, int64_
  * `ray_release(tbl); return ray_error("domain", "clause too big");`. */
 #define DICT_VIEW_OVERFLOW(name) ((name##_n) < 0)
 
+/* File-scope keyword id globals for select clauses.  Cached symbol ids for
+ * the reserved select keywords: from, where, by, take, asc, desc, nearest.
+ * These are populated by ray_select before use in compile-time helper
+ * functions like select_output_count and count_agg_subexprs. */
+static int64_t from_id = 0;
+static int64_t where_id = 0;
+static int64_t by_id = 0;
+static int64_t take_id = 0;
+static int64_t asc_id = 0;
+static int64_t desc_id = 0;
+static int64_t nearest_id = 0;
+
 /* Convert a RAY_DICT (keys, vals) into a transient interleaved
  * [k0_atom, v0, k1_atom, v1, …] RAY_LIST.  Used by select's group-by
  * aggregation paths which were written for the old in-place pair-array
@@ -2220,6 +2232,36 @@ static ray_t* match_count_distinct(ray_t* expr) {
     if (!dnm || ray_str_len(dnm) != 8 ||
         memcmp(ray_str_ptr(dnm), "distinct", 8) != 0) return NULL;
     return in_elems[1];
+}
+
+/* Count the OUTPUT entries of a select dict view: every key/value pair
+ * whose key is not a clause keyword.  This is the natural bound for all
+ * per-output collection arrays in the select compile path (the former
+ * fixed-16 slot arrays).  dict_n is the element count of the flattened
+ * [k0 v0 k1 v1 ...] view, so outputs <= dict_n/2 <= DICT_VIEW_MAX. */
+static int64_t __attribute__((unused)) select_output_count(ray_t** dict_elems, int64_t dict_n) {
+    int64_t n = 0;
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id ||
+            kid == take_id || kid == asc_id || kid == desc_id ||
+            kid == nearest_id) continue;
+        n++;
+    }
+    return n;
+}
+
+/* Upper bound on the aggregate subcalls a compound output decomposes
+ * into (try_decompose_agg_arith extracts each is_group_dag_agg_expr
+ * node as one hidden slot).  Pure structural walk — cheap, compile-time. */
+static int64_t __attribute__((unused)) count_agg_subexprs(ray_t* expr) {
+    if (!expr) return 0;
+    if (is_group_dag_agg_expr(expr)) return 1;
+    if (expr->type != RAY_LIST) return 0;
+    ray_t** e = (ray_t**)ray_data(expr);
+    int64_t n = ray_len(expr), c = 0;
+    for (int64_t i = 0; i < n; i++) c += count_agg_subexprs(e[i]);
+    return c;
 }
 
 /* Walk expr once, gather unique column-ref symbol ids that resolve to
