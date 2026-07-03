@@ -2374,13 +2374,21 @@ typedef ray_t* (*idx_feeder_fn)(int64_t gi, void* state);
 static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
                                          int64_t n_groups) {
-    int64_t col_syms[16];
-    int n_cols = collect_col_refs(expr, tbl, col_syms, 16, 0);
-    ray_t* cols[16];
+    /* Exact-size carve: collect_col_refs dedups against real table columns,
+     * so ray_table_ncols(tbl) is a hard upper bound — no silent truncation
+     * past the former [16] cap. */
+    int64_t ncols_max = ray_table_ncols(tbl);
+    if (ncols_max < 1) ncols_max = 1;
+    ray_t* refs_hdr = NULL;
+    int64_t* col_syms = (int64_t*)scratch_alloc(&refs_hdr,
+            (size_t)ncols_max * (sizeof(int64_t) + sizeof(ray_t*)));
+    if (!col_syms) return ray_error("oom", NULL);
+    int n_cols = collect_col_refs(expr, tbl, col_syms, (int)ncols_max, 0);
+    ray_t** cols = (ray_t**)(col_syms + ncols_max);
     for (int i = 0; i < n_cols; i++)
         cols[i] = ray_table_get_col(tbl, col_syms[i]);
 
-    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    if (ray_env_push_scope() != RAY_OK) { scratch_free(refs_hdr); return ray_error("oom", NULL); }
 
     /* B3 Part 2: publish `tbl` as the active query table so a literal
      * column-name symbol inside `expr` resolves to its column during the
@@ -2400,6 +2408,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
             g_active_query_table = _aqt;
             ray_env_pop_scope();
             if (result) ray_release(result);
+            scratch_free(refs_hdr);
             return ray_error("oom", NULL);
         }
         for (int i = 0; i < n_cols; i++) {
@@ -2408,6 +2417,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                 g_active_query_table = _aqt;
                 ray_env_pop_scope();
                 if (result) ray_release(result);
+                scratch_free(refs_hdr);
                 return err;
             }
         }
@@ -2416,6 +2426,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
             g_active_query_table = _aqt;
             ray_env_pop_scope();
             if (result) ray_release(result);
+            scratch_free(refs_hdr);
             return cell ? cell : ray_error("domain", "select by: per-group expression evaluation failed");
         }
         /* Materialise lazy cells before storing.  Per-group projection
@@ -2431,6 +2442,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                 g_active_query_table = _aqt;
                 ray_env_pop_scope();
                 if (result) ray_release(result);
+                scratch_free(refs_hdr);
                 return cell ? cell : ray_error("domain", "select by: failed to materialize per-group cell");
             }
         }
@@ -2444,6 +2456,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                 if (!result || RAY_IS_ERR(result)) {
                     g_active_query_table = _aqt;
                     ray_env_pop_scope(); ray_release(cell);
+                    scratch_free(refs_hdr);
                     return result ? result : ray_error("oom", NULL);
                 }
                 result->len = n_groups;
@@ -2461,6 +2474,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                 if (!result) {
                     g_active_query_table = _aqt;
                     ray_env_pop_scope(); ray_release(cell);
+                    scratch_free(refs_hdr);
                     return ray_error("oom", NULL);
                 }
                 result->type = RAY_LIST;
@@ -2481,6 +2495,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                 if (RAY_IS_ERR(list_col)) {
                     g_active_query_table = _aqt;
                     ray_env_pop_scope(); ray_release(cell);
+                    scratch_free(refs_hdr);
                     return list_col;
                 }
                 result = list_col;
@@ -2496,6 +2511,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
 
     g_active_query_table = _aqt;
     ray_env_pop_scope();
+    scratch_free(refs_hdr);
     return result;
 }
 
@@ -2552,13 +2568,21 @@ static ray_t* nonagg_eval_per_group_buf(ray_t* expr, ray_t* tbl,
 }
 
 static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
-    int64_t col_syms[16];
-    int n_cols = collect_col_refs(expr, tbl, col_syms, 16, 0);
-    ray_t* cols[16];
+    /* Exact-size carve, mirrors nonagg_eval_per_group_core: ncols(tbl) is
+     * a hard upper bound for collect_col_refs's deduplicated table-column
+     * output — no silent truncation past the former [16] cap. */
+    int64_t ncols_max = ray_table_ncols(tbl);
+    if (ncols_max < 1) ncols_max = 1;
+    ray_t* refs_hdr = NULL;
+    int64_t* col_syms = (int64_t*)scratch_alloc(&refs_hdr,
+            (size_t)ncols_max * (sizeof(int64_t) + sizeof(ray_t*)));
+    if (!col_syms) return ray_error("oom", NULL);
+    int n_cols = collect_col_refs(expr, tbl, col_syms, (int)ncols_max, 0);
+    ray_t** cols = (ray_t**)(col_syms + ncols_max);
     for (int i = 0; i < n_cols; i++)
         cols[i] = ray_table_get_col(tbl, col_syms[i]);
 
-    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    if (ray_env_push_scope() != RAY_OK) { scratch_free(refs_hdr); return ray_error("oom", NULL); }
 
     /* B3 Part 2: publish `tbl` as the active query table so a literal
      * column-name symbol inside `expr` resolves to its column during the
@@ -2580,6 +2604,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
                 g_active_query_table = _aqt;
                 ray_env_pop_scope();
                 if (result) ray_release(result);
+                scratch_free(refs_hdr);
                 return arg ? arg : ray_error("domain", "select: failed to read column cell for per-row eval");
             }
             ray_env_set_local(col_syms[i], arg);
@@ -2591,6 +2616,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
             g_active_query_table = _aqt;
             ray_env_pop_scope();
             if (result) ray_release(result);
+            scratch_free(refs_hdr);
             return cell ? cell : ray_error("domain", "select: per-row expression evaluation failed");
         }
 
@@ -2603,6 +2629,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
                     g_active_query_table = _aqt;
                     ray_env_pop_scope();
                     ray_release(cell);
+                    scratch_free(refs_hdr);
                     return result ? result : ray_error("oom", NULL);
                 }
                 result->len = nrows;
@@ -2622,6 +2649,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
                     g_active_query_table = _aqt;
                     ray_env_pop_scope();
                     ray_release(cell);
+                    scratch_free(refs_hdr);
                     return ray_error("oom", NULL);
                 }
                 result->type = RAY_LIST;
@@ -2641,6 +2669,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
                     g_active_query_table = _aqt;
                     ray_env_pop_scope();
                     ray_release(cell);
+                    scratch_free(refs_hdr);
                     return list_col;
                 }
                 result = list_col;
@@ -2656,6 +2685,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
 
     g_active_query_table = _aqt;
     ray_env_pop_scope();
+    scratch_free(refs_hdr);
     if (!result) {
         result = ray_alloc(0);
         if (!result) return ray_error("oom", NULL);
@@ -3259,7 +3289,12 @@ static ray_t* try_count_distinct_v2_rewrite(
     if (!X_name) { ray_graph_free(g_in); return NULL; }
     ray_op_t* X_scan = ray_scan(g_in, ray_str_ptr(X_name));
     if (!X_scan) { ray_graph_free(g_in); return NULL; }
-    ray_op_t* keys_in[16];
+    /* Exact-size carve: the inner group's key list is K_scans[0..n_K) plus
+     * the distinct-target X_scan — n_K+1 is the exact count, not a cap. */
+    ray_t* ki_hdr = NULL;
+    ray_op_t** keys_in = (ray_op_t**)scratch_alloc(&ki_hdr,
+            (size_t)(n_K + 1) * sizeof(ray_op_t*));
+    if (!keys_in) { ray_graph_free(g_in); return ray_error("oom", NULL); }
     for (int j = 0; j < n_K; j++) keys_in[j] = K_scans[j];
     keys_in[n_K] = X_scan;
     uint16_t  agg_ops_in[1] = { OP_COUNT };
@@ -3271,21 +3306,23 @@ static ray_t* try_count_distinct_v2_rewrite(
      * OP_FILTERED_GROUP fused node; results are identical. */
     if (where_expr) {
         ray_op_t* pred = compile_expr_dag(g_in, where_expr);
-        if (!pred) { ray_graph_free(g_in); return NULL; }
+        if (!pred) { scratch_free(ki_hdr); ray_graph_free(g_in); return NULL; }
         ray_op_t* froot = ray_filter(g_in, ray_const_table(g_in, tbl), pred);
-        if (!froot) { ray_graph_free(g_in); return NULL; }
+        if (!froot) { scratch_free(ki_hdr); ray_graph_free(g_in); return NULL; }
         froot = ray_optimize(g_in, froot);
         ray_t* fres = exec_node(g_in, froot);
         if (!fres || RAY_IS_ERR(fres)) {
             if (g_in->selection) { ray_release(g_in->selection); g_in->selection = NULL; }
+            scratch_free(ki_hdr);
             ray_graph_free(g_in);
             return (fres && RAY_IS_ERR(fres)) ? fres : NULL;
         }
     }
     ray_op_t* inner = ray_group(g_in, keys_in, n_K + 1,
                                 agg_ops_in, agg_ins_in, 1);
-    if (!inner) { ray_graph_free(g_in); return NULL; }
+    if (!inner) { scratch_free(ki_hdr); ray_graph_free(g_in); return NULL; }
     ray_t* dedup = ray_execute(g_in, inner);
+    scratch_free(ki_hdr);
     ray_graph_free(g_in);
     if (!dedup) return NULL;
     if (RAY_IS_ERR(dedup)) return dedup;
@@ -5109,9 +5146,17 @@ ray_t* ray_select(ray_t** args, int64_t n) {
      * ray_select_fn sees a standard multi-key group-by. */
     ray_t* by_sym_vec_owned = NULL;
     int64_t dep_key_base_sym = -1;
+    /* dep_key_names/biases stay fixed-size: they hold at most nk entries,
+     * and nk is already hard-bound to <=16 by the "1..16 keys" domain check
+     * below (a genuine exec-kernel key-count limit shared with
+     * agg_engine.c's own composite-key grouping, not a query.c collector
+     * artifact) — sizing from nk here would buy nothing since nk can never
+     * exceed 16, while this pair must survive across the rest of this
+     * (very long) function, so heap-carving them would need a matching
+     * scratch_free at every one of its many return sites for no benefit. */
     int64_t dep_key_names[16];
     int64_t dep_key_biases[16];
-    uint8_t n_dep_keys = 0;
+    int64_t n_dep_keys = 0;
 
     /* B3 Part 2: a LITERAL scalar by-key symbol (`by: 'g`) resolves like a
      * name-ref — the same column-only, query-only rule the projection/where
@@ -5185,10 +5230,23 @@ ray_t* ray_select(ray_t** args, int64_t n) {
             dep_candidate = base_col && key_type_i64_projectable(base_col->type) &&
                             !(base_col->attrs & RAY_ATTR_HAS_NULLS);
         }
-        int64_t local_dep_names[16];
-        int64_t local_dep_biases[16];
-        uint8_t local_n_dep = 0;
+        /* Exact-size carve: at most nk dependent-key entries can ever be
+         * collected (one per by-dict pair) — nk is already bound to ≤16 by
+         * the "1..16 keys" gate above (a genuine exec-kernel key-count
+         * limit, not a query.c collector cap), so this scratch buffer is
+         * tiny and short-lived (consumed entirely within this block). */
+        ray_t* local_dep_hdr = NULL;
+        int64_t* local_dep_names = NULL;
+        int64_t* local_dep_biases = NULL;
+        int64_t local_n_dep = 0;
         if (dep_candidate && base_sym >= 0) {
+            local_dep_names = (int64_t*)scratch_alloc(&local_dep_hdr,
+                    (size_t)nk * 2 * sizeof(int64_t));
+            if (!local_dep_names) {
+                ray_release(tbl);
+                return ray_error("oom", NULL);
+            }
+            local_dep_biases = local_dep_names + nk;
             for (int64_t i = 0; i < nk && dep_candidate; i++) {
                 ray_t* k = d_elems[i * 2];
                 ray_t* v = d_elems[i * 2 + 1];
@@ -5220,6 +5278,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
         if (dep_candidate && base_sym >= 0 && local_n_dep > 0) {
             by_sym_vec_owned = ray_vec_new(RAY_SYM, 1);
             if (!by_sym_vec_owned || RAY_IS_ERR(by_sym_vec_owned)) {
+                scratch_free(local_dep_hdr);
                 ray_release(tbl);
                 return ray_error("oom", NULL);
             }
@@ -5228,12 +5287,14 @@ ray_t* ray_select(ray_t** args, int64_t n) {
             by_expr = by_sym_vec_owned;
             dep_key_base_sym = base_key_name;
             n_dep_keys = local_n_dep;
-            for (uint8_t i = 0; i < n_dep_keys; i++) {
+            for (int64_t i = 0; i < n_dep_keys; i++) {
                 dep_key_names[i] = local_dep_names[i];
                 dep_key_biases[i] = local_dep_biases[i];
             }
+            scratch_free(local_dep_hdr);
             goto by_dict_done;
         }
+        scratch_free(local_dep_hdr);
 
         bool has_computed_by_val = false;
         for (int64_t i = 0; i < nk; i++) {
@@ -5313,11 +5374,19 @@ ray_t* ray_select(ray_t** args, int64_t n) {
          * what was meant to be a cheap prefilter (single-col filter
          * is O(passing × esz), full filter is ~50× that). */
         if (where_expr && (prefilter_computed_by || prefilter_multi_key_where)) {
-            int64_t keep_syms[256];
+            /* Exact-size carve: collect_col_refs_set dedups against real
+             * table columns, so ray_table_ncols(tbl) is a hard upper bound —
+             * no silent cap on wide tables past the former [256]. */
+            int64_t ncols_max = ray_table_ncols(tbl);
+            if (ncols_max < 1) ncols_max = 1;
+            ray_t* keep_hdr = NULL;
+            int64_t* keep_syms = (int64_t*)scratch_alloc(&keep_hdr,
+                    (size_t)ncols_max * sizeof(int64_t));
+            if (!keep_syms) { ray_release(tbl); return ray_error("oom", NULL); }
             int n_keep = 0;
             n_keep = collect_col_refs_set(where_expr, tbl,
-                                          keep_syms, 256, n_keep);
-            for (int64_t i = 0; i + 1 < dict_n && n_keep < 256; i += 2) {
+                                          keep_syms, (int)ncols_max, n_keep);
+            for (int64_t i = 0; i + 1 < dict_n && n_keep < ncols_max; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == take_id ||
                     kid == nearest_id) continue;
@@ -5328,10 +5397,9 @@ ray_t* ray_select(ray_t** args, int64_t n) {
                  * other entries are output cols — agg or non-agg
                  * expressions whose refs we also need post-filter. */
                 n_keep = collect_col_refs_set(dict_elems[i + 1], tbl,
-                                              keep_syms, 256, n_keep);
+                                              keep_syms, (int)ncols_max, n_keep);
             }
-            int can_project = (n_keep > 0 && n_keep < 256 &&
-                               n_keep < ray_table_ncols(tbl));
+            int can_project = (n_keep > 0 && n_keep < ncols_max);
             ray_t* narrow_tbl = NULL;
             if (can_project) {
                 narrow_tbl = project_table_cols(tbl, keep_syms, n_keep);
@@ -5341,6 +5409,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
                     can_project = 0;
                 }
             }
+            scratch_free(keep_hdr);
             ray_t* prefilter_input = can_project ? narrow_tbl : tbl;
             ray_graph_t* fg = ray_graph_new(prefilter_input);
             if (!fg) {
@@ -5440,9 +5509,22 @@ ray_t* ray_select(ray_t** args, int64_t n) {
                 sv_data[i] = k->i64;
                 continue;
             }
-            int64_t ref_syms[16];
-            ray_t* materialized_refs[16];
-            int n_refs = collect_col_refs(v, tbl, ref_syms, 16, 0);
+            /* Exact-size carve: collect_col_refs dedups against real table
+             * columns, so ray_table_ncols(tbl) is a hard upper bound — no
+             * silent truncation past the former [16] cap.  Scoped to this
+             * loop iteration only (tbl may gain a column each pass via
+             * ray_table_add_col below), freed before every exit. */
+            int64_t ncols_max = ray_table_ncols(tbl);
+            if (ncols_max < 1) ncols_max = 1;
+            ray_t* refs_hdr = NULL;
+            int64_t* ref_syms = (int64_t*)scratch_alloc(&refs_hdr,
+                    (size_t)ncols_max * (sizeof(int64_t) + sizeof(ray_t*)));
+            if (!ref_syms) {
+                fail_err = ray_error("oom", NULL);
+                failed = true; break;
+            }
+            ray_t** materialized_refs = (ray_t**)(ref_syms + ncols_max);
+            int n_refs = collect_col_refs(v, tbl, ref_syms, (int)ncols_max, 0);
             for (int ri = 0; ri < n_refs; ri++) materialized_refs[ri] = NULL;
             for (int ri = 0; ri < n_refs; ri++) {
                 ray_t* ref_col = ray_table_get_col(tbl, ref_syms[ri]);
@@ -5465,6 +5547,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
                         ray_release(materialized_refs[ri]);
                     }
                 }
+                scratch_free(refs_hdr);
                 break;
             }
             ray_t* col_vec = ray_eval(v);
@@ -5475,6 +5558,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
                     ray_release(materialized_refs[ri]);
                 }
             }
+            scratch_free(refs_hdr);
             if (!col_vec || RAY_IS_ERR(col_vec)) {
                 fail_err = col_vec ? col_vec : ray_error("domain", "by-dict val eval");
                 failed = true; break;
@@ -9972,7 +10056,7 @@ by_dict_done:
                 scratch_free(sel_slots_hdr); return ray_error("domain", "dependent group key base missing");
             }
             int64_t n_groups = ray_table_nrows(result);
-            for (uint8_t dk = 0; dk < n_dep_keys; dk++) {
+            for (int64_t dk = 0; dk < n_dep_keys; dk++) {
                 ray_t* col = ray_vec_new(RAY_I64, n_groups);
                 if (!col || RAY_IS_ERR(col)) {
                     ray_release(result);

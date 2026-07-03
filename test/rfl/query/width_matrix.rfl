@@ -136,3 +136,45 @@
 ;; partition broadcasts min(3.0, 5.0) = 3.0 to every row in that partition.
 (set wp (table [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17 v] (list [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [3.0 5.0])))
 (at (window {from: wp part: [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17] funcs: {mn: (min v)}}) 'mn) -- [3.0 3.0]
+
+;; ── nonagg per-group output: pure-arithmetic expression referencing 17
+;; columns, single group (src/ops/query.c collect_col_refs callers in
+;; nonagg_eval_per_group_core/eval_expr_per_row — exact-size scratch carve
+;; replaces the fixed col_syms[16]/cols[16]).  This shape is a PIN, not a
+;; regression probe: a pure-arithmetic nonagg expression with no nested
+;; aggregate is evaluated ONCE against the whole table via bind_all_columns
+;; (src/ops/query.c ray_select_fn's DAG nonagg-fill, ~"R8 fallback" region)
+;; and then split per group by row index — that fast path binds every
+;; column unconditionally and never calls collect_col_refs, so this exact
+;; shape was already correct pre-fix (verified by running it against the
+;; pre-fix binary: identical output). x sums c01..c17 per row: row0 =
+;; 16*1+2=18, row1 = 16*1+3=19; a = (sum c01) = 1+1 = 2.
+(set nw (table [k c01 c02 c03 c04 c05 c06 c07 c08 c09 c10 c11 c12 c13 c14 c15 c16 c17] (list [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [2 3])))
+(set rn (select {from: nw a: (sum c01) x: (+ c01 (+ c02 (+ c03 (+ c04 (+ c05 (+ c06 (+ c07 (+ c08 (+ c09 (+ c10 (+ c11 (+ c12 (+ c13 (+ c14 (+ c15 (+ c16 c17)))))))))))))))) by: {k: k}}))
+(at (meta rn) 'len) -- 3
+(at rn 'a) -- [2]
+(at (at rn 'x) 0) -- [18 19]
+
+;; ── nonagg per-group eval, GENUINE regression probe: same 17-column
+;; arithmetic expression but with a NESTED aggregate ((max c01)) wrapping
+;; the first operand, over TWO groups.  expr_contains_agg forces this
+;; through nonagg_eval_per_group_buf → nonagg_eval_per_group_core (a
+;; single whole-table eval would collapse (max c01) globally instead of
+;; per-group) — exactly the collect_col_refs-capped path the pin above
+;; doesn't reach.  Confirmed pre-fix: collect_col_refs truncates at 16
+;; refs (c01 via `max`, plus c02..c16), drops c17 from col_syms/cols, and
+;; since bind_col_slice only binds the first 16 refs as locals, the
+;; per-group ray_eval of `c17` raised "name: 'c17' undefined" — a hard
+;; error, not a silently wrong value (reproduced against the pre-fix
+;; binary).  Post-fix, ncols(tbl) sizes the carve so all 17 refs are
+;; collected and bound, and the group evaluates cleanly.
+;; Oracle: group k=1 (rows with c17=[2 3]): max(c01)=1, c02..c16 sum to
+;; 15, x = 1+15+c17 = [18 19].  Group k=2 (rows with c17=[4 5]): x =
+;; 1+15+c17 = [20 21].  a = (sum c01) = [2 2] (two rows of c01=1 per group).
+(set nwg (table [k c01 c02 c03 c04 c05 c06 c07 c08 c09 c10 c11 c12 c13 c14 c15 c16 c17] (list [1 1 2 2] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [1 1 1 1] [2 3 4 5])))
+(set rng (select {from: nwg a: (sum c01) x: (+ (max c01) (+ c02 (+ c03 (+ c04 (+ c05 (+ c06 (+ c07 (+ c08 (+ c09 (+ c10 (+ c11 (+ c12 (+ c13 (+ c14 (+ c15 (+ c16 c17)))))))))))))))) by: {k: k}}))
+(at (meta rng) 'len) -- 3
+(at rng 'k) -- [1 2]
+(at rng 'a) -- [2 2]
+(at (at rng 'x) 0) -- [18 19]
+(at (at rng 'x) 1) -- [20 21]
