@@ -12,6 +12,33 @@
 (at r17 'a16) -- [20 40]
 (at r17 'a17) -- [30 70]
 
+;; ── DAG path: boundary widths around the former 16-agg cap (15/16/17).
+;; The 17-agg case is r17 above; these two pin the immediate neighbours so
+;; a future regression that reintroduces an off-by-one at the boundary
+;; (rather than a hard 16 cap) is still caught. ──
+(at (meta (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) by: {k: k}})) 'len) -- 16
+(at (meta (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) by: {k: k}})) 'len) -- 17
+
+;; ── DAG path: composition oracle — 33 outputs, single sym key, cycling
+;; sum/count/min/max every 4 columns (a01=sum, a02=count, a03=min, a04=max,
+;; a05=sum, ...).  Values are the same 2-group fixture as r17 (k=[1 1 2 2]
+;; v=[10 20 30 40]): group k=1 has v=[10 20], group k=2 has v=[30 40], so
+;; sum=[30 70] count=[2 2] min=[10 30] max=[20 40] regardless of which
+;; column position asks for them.  Position p's function is
+;; [sum count min max][(p-1) mod 4]: a01 (p=1) -> sum, a17 (p=17,
+;; (17-1) mod 4 = 0) -> sum, a32 (p=32, (32-1) mod 4 = 3) -> max, a33
+;; (p=33, (33-1) mod 4 = 0) -> sum.  meta len = 1 key col + 33 outputs = 34. ──
+(set r33 (select {from: t a01: (sum v) a02: (count v) a03: (min v) a04: (max v) a05: (sum v) a06: (count v) a07: (min v) a08: (max v) a09: (sum v) a10: (count v) a11: (min v) a12: (max v) a13: (sum v) a14: (count v) a15: (min v) a16: (max v) a17: (sum v) a18: (count v) a19: (min v) a20: (max v) a21: (sum v) a22: (count v) a23: (min v) a24: (max v) a25: (sum v) a26: (count v) a27: (min v) a28: (max v) a29: (sum v) a30: (count v) a31: (min v) a32: (max v) a33: (sum v) by: {k: k}}))
+(at (meta r33) 'len) -- 34
+(at r33 'k) -- [1 2]
+(at r33 'a01) -- [30 70]
+(at r33 'a02) -- [2 2]
+(at r33 'a03) -- [10 30]
+(at r33 'a04) -- [20 40]
+(at r33 'a17) -- [30 70]
+(at r33 'a32) -- [20 40]
+(at r33 'a33) -- [30 70]
+
 ;; ── DAG path: 10 compound outputs, each decomposing into 2 hidden agg slots (20 hidden > 16) ──
 (set rc (select {from: t c01: (+ (sum v) (count v)) c02: (+ (sum v) (count v)) c03: (+ (sum v) (count v)) c04: (+ (sum v) (count v)) c05: (+ (sum v) (count v)) c06: (+ (sum v) (count v)) c07: (+ (sum v) (count v)) c08: (+ (sum v) (count v)) c09: (+ (sum v) (count v)) c10: (+ (sum v) (count v)) by: {k: k}}))
 (at (meta rc) 'len) -- 11
@@ -28,8 +55,10 @@
 
 ;; ── v2 engine: same width, higher-card key, still serial dense path (not
 ;; hash/radix: nrows=5000 stays below the 65536 parallel threshold, so the
-;; serial branch runs agg_dense_plan/agg_group_keys_dense regardless of key
-;; cardinality) ──
+;; serial branch runs; key range here is 0..4999, comfortably within
+;; DENSE_MAX_SLOTS, so agg_dense_plan succeeds and agg_group_keys_dense
+;; drives it — the serial-vs-parallel choice tracks nrows, not key
+;; cardinality, but agg_dense_plan's own range check still applies) ──
 (set ht (table [k v] (list (til 5000) (til 5000))))
 (set rh (select {from: ht b01: (sum v) b02: (min v) b03: (max v) b04: (count v) b05: (sum v) b06: (min v) b07: (max v) b08: (count v) b09: (sum v) b10: (min v) b11: (max v) b12: (count v) b13: (sum v) b14: (min v) b15: (max v) b16: (count v) b17: (sum v) by: {k: k}}))
 (at (meta rh) 'len) -- 18
@@ -90,6 +119,48 @@
 (set rt (select {from: t c01: (count v) c02: (count v) c03: (count v) c04: (count v) c05: (count v) c06: (count v) c07: (count v) c08: (count v) c09: (count v) c10: (count v) c11: (count v) c12: (count v) c13: (count v) c14: (count v) c15: (count v) c16: (count v) c17: (count v) by: {k: k} take: 2}))
 (at (meta rt) 'len) -- 18
 (at rt 'c17) -- [2 2]
+
+;; ── multi-key count-only take: 17 count outputs, TWO by-keys, take: 2.
+;; Fixture: t has k=[1 1 2 2] g=[5 5 6 6] v=[10 20 30 40], so the composite
+;; groups are (k=1,g=5) and (k=2,g=6), each of size 2; take: 2 keeps both.
+;; Expected: nk(2) + 17 count columns = 19 columns total, every cNN=[2 2].
+;;
+;; ROUTING NOTE (verified by reading src/ops/query.c's by: routing, lines
+;; ~6101-6231, PLUS empirically by temporarily instrumenting that routing
+;; with an stderr probe, rebuilding, and running this exact query — the
+;; instrumentation was reverted before committing, not shipped):
+;; this shape does NOT reach the eval-group multi-key count-only pre-take
+;; block (query.c ~6353-6480, sized in commit f9c5cae7 "select: exact-size
+;; eval-group and count-only collectors").  That block only runs inside
+;; `if (use_eval_group)`, and for a >1-key by: with EVERY output a plain
+;; DAG-aggregable expr (is_group_dag_agg_expr — true for a bare `(count
+;; v)`), `use_eval_group` has no path to become true: the only multi-key
+;; trigger is a by-key column of type RAY_LIST (query.c ~6186-6189); the
+;; `n_out == 0` and `any_nonagg` triggers both require zero outputs or a
+;; non-agg output, neither of which holds for an all-count shape.  Probed
+;; directly: `use_eval_group=0` for this exact query.  A comment at query.c
+;; ~6191-6202 confirms this is intentional — a prior routing that sent
+;; bounded multi-key count-take queries to this eval-level block was
+;; removed because the parallel multi-key DAG/v2-agg path measured faster
+;; at every sampled size, so plain int/sym multi-key count-only + take:
+;; queries are answered by that DAG/v2 path instead (the same engine the
+;; rv/rh/rp/rx cells above already exercise).  Forcing entry via a
+;; RAY_LIST-typed by-key column DOES reach the count-only block
+;; (count_only=1 probed), but that block then hits an unrelated
+;; pre-existing bug building the LIST-typed key output column ("type:
+;; vec_new: type must be a positive concrete vector type, got LIST") —
+;; so no shape both reaches that exact block AND returns a correct
+;; result. This cell instead pins the width-retirement guarantee for
+;; whichever multi-key count-only path IS live (the DAG/v2 engine),
+;; which is the coverage gap an earlier review actually flagged as
+;; missing; the eval-group block itself is presently dead code for any
+;; correctness-preserving multi-key shape. ──
+(set rmk (select {from: t c01: (count v) c02: (count v) c03: (count v) c04: (count v) c05: (count v) c06: (count v) c07: (count v) c08: (count v) c09: (count v) c10: (count v) c11: (count v) c12: (count v) c13: (count v) c14: (count v) c15: (count v) c16: (count v) c17: (count v) by: {k: k g: g} take: 2}))
+(at (meta rmk) 'len) -- 19
+(at rmk 'k) -- [1 2]
+(at rmk 'g) -- [5 6]
+(at rmk 'c01) -- [2 2]
+(at rmk 'c17) -- [2 2]
 
 ;; ── scalar reduction (no by:): 17 aggregates — was a SILENT drop past 16 ──
 (set rs (select {from: t s01: (sum v) s02: (count v) s03: (min v) s04: (max v) s05: (sum v) s06: (count v) s07: (min v) s08: (max v) s09: (sum v) s10: (count v) s11: (min v) s12: (max v) s13: (sum v) s14: (count v) s15: (min v) s16: (max v) s17: (sum v)}))
