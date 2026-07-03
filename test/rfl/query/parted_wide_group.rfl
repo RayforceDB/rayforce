@@ -1,0 +1,48 @@
+;; parted_wide_group.rfl — regression for a pre-existing stack-buffer
+;; overflow in src/ops/group.c exec_group_parted.
+;;
+;; The parted GROUP-BY dispatch (exec_group → exec_group_parted) fills the
+;; fixed stack arrays `key_syms[8]` / `agg_syms[8]` with loops bounded by
+;; ext->n_keys / ext->n_aggs.  Those bounds can exceed 8 (compile-time slot
+;; caps were lifted on the unbounded-slots branch), and the dispatch runs
+;; BEFORE the `n_keys > 8 || (n_keys > 0 && n_aggs > 8)` nyi guard — so a
+;; parted GROUP BY with 9+ aggregate inputs writes past agg_syms[8].  ASan
+;; reports a stack-buffer-overflow WRITE.
+;;
+;; Fixture: a two-partition on-disk table, key `k` with two groups, plus 9
+;; independent value columns v1..v9 (vN is constant N in every row).  A
+;; GROUP BY k with 9 sums (sum(v1)..sum(v9)) drives n_aggs = 9 > 8.
+;;
+;; Oracle: each partition holds rows k=[1 2] and vN=[N N].  Group k=1 keeps
+;; row 0 of both partitions, group k=2 keeps row 1 of both partitions, so for
+;; EITHER group sum(vN) = vN + vN = 2*N.  Thus s1=[2 2], s2=[4 4], …,
+;; s9=[18 18].
+
+;; ─── fixture setup ───────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_parted_wide")
+(set TW1 (table [k v1 v2 v3 v4 v5 v6 v7 v8 v9] (list (as 'I64 [1 2]) (as 'I64 [1 1]) (as 'I64 [2 2]) (as 'I64 [3 3]) (as 'I64 [4 4]) (as 'I64 [5 5]) (as 'I64 [6 6]) (as 'I64 [7 7]) (as 'I64 [8 8]) (as 'I64 [9 9]))))
+(set TW2 (table [k v1 v2 v3 v4 v5 v6 v7 v8 v9] (list (as 'I64 [1 2]) (as 'I64 [1 1]) (as 'I64 [2 2]) (as 'I64 [3 3]) (as 'I64 [4 4]) (as 'I64 [5 5]) (as 'I64 [6 6]) (as 'I64 [7 7]) (as 'I64 [8 8]) (as 'I64 [9 9]))))
+(.db.splayed.set "/tmp/rfl_parted_wide/1/t/" TW1)
+(.db.splayed.set "/tmp/rfl_parted_wide/2/t/" TW2)
+(set PW (.db.parted.get "/tmp/rfl_parted_wide/" 't))
+
+;; ─── 9-agg parted GROUP BY (n_aggs = 9 > 8, overflows agg_syms[8]) ────
+(set rw (select {from: PW s1: (sum v1) s2: (sum v2) s3: (sum v3) s4: (sum v4) s5: (sum v5) s6: (sum v6) s7: (sum v7) s8: (sum v8) s9: (sum v9) by: {k: k}}))
+(count (at rw 'k)) -- 2
+(at rw 'k) -- [1 2]
+(at rw 's1) -- [2 2]
+(at rw 's2) -- [4 4]
+(at rw 's8) -- [16 16]
+(at rw 's9) -- [18 18]
+
+;; ─── 9 keys (n_keys = 9 > 8, overflows key_syms[8]) ──────────────────
+;; k plus v1..v8 as group keys (9 keys); each row is a distinct key tuple in
+;; its partition but rows collapse across the two identical partitions.
+;; Both partitions hold identical rows, so grouping by all 9 columns yields
+;; exactly the 2 distinct tuples (one per source row), counted once each.
+(set rk (select {from: PW c: (count v9) by: {k: k a: v1 b: v2 d: v3 e: v4 f: v5 g: v6 h: v7 i: v8}}))
+(count (at rk 'k)) -- 2
+(sum (at rk 'c)) -- 4
+
+;; ─── cleanup ─────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_parted_wide")

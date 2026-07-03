@@ -5450,13 +5450,29 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     int can_partition = g->selection ? 0 : 1;
     int has_avg = 0;
     int has_stddev = 0;
-    int64_t key_syms[8];
+    /* Exact-size scratch carves — n_keys/n_aggs are uint8_t (up to 255 on the
+     * unbounded-slots branch) and this dispatch runs BEFORE the n_keys/n_aggs
+     * > 8 nyi guard, so fixed key_syms[8]/agg_syms[8] stack arrays overflowed
+     * for a parted GROUP BY with 9+ keys or agg inputs.  Sized min 1 to avoid
+     * a zero-byte allocation; both stay live through the
+     * exec_group_per_partition call below (they are passed to it), then freed
+     * before the concat fallback (which re-derives its columns via find_ext,
+     * not these arrays). */
+    int64_t key_max = n_keys > 0 ? (int64_t)n_keys : 1;
+    ray_t* key_syms_hdr = NULL;
+    int64_t* key_syms = (int64_t*)scratch_alloc(&key_syms_hdr,
+            (size_t)key_max * sizeof(int64_t));
+    if (!key_syms) return ray_error("oom", NULL);
     for (uint8_t k = 0; k < n_keys && can_partition; k++) {
         ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
         if (!ke || ke->base.opcode != OP_SCAN) { can_partition = 0; break; }
         key_syms[k] = ke->sym;
     }
-    int64_t agg_syms[8];
+    int64_t agg_max = n_aggs > 0 ? (int64_t)n_aggs : 1;
+    ray_t* agg_syms_hdr = NULL;
+    int64_t* agg_syms = (int64_t*)scratch_alloc(&agg_syms_hdr,
+            (size_t)agg_max * sizeof(int64_t));
+    if (!agg_syms) { scratch_free(key_syms_hdr); return ray_error("oom", NULL); }
     for (uint8_t a = 0; a < n_aggs && can_partition; a++) {
         uint16_t aop = ext->agg_ops[a];
         /* Holistic aggs (OP_MEDIAN / OP_TOP_N / OP_BOT_N) can't be
@@ -5550,9 +5566,17 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
         ray_t* result = exec_group_per_partition(parted_tbl, ext, n_parts,
                                                  key_syms, agg_syms, has_avg,
                                                  has_stddev, group_limit);
-        if (result) return result;
+        if (result) {
+            scratch_free(key_syms_hdr);
+            scratch_free(agg_syms_hdr);
+            return result;
+        }
         /* NULL = per-partition failed, fall through to concat */
     }
+    /* key_syms/agg_syms are unused past this point (the concat fallback
+     * re-derives its columns via find_ext) — free before falling through. */
+    scratch_free(key_syms_hdr);
+    scratch_free(agg_syms_hdr);
 
     /* ---- Concat fallback ---- */
     /* ---- Concat-only-needed-columns fallback ----
