@@ -4056,9 +4056,16 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
         return ray_error("domain", "window: `funcs:` has too many entries");
     }
     int n_funcs = (int)(fv_n / 2);
-    if (n_funcs == 0 || n_funcs > 32) {
+    if (n_funcs == 0) {
         ray_release(tbl);
-        return ray_error("domain", "window: `funcs:` must have 1-32 entries, got %d", n_funcs);
+        return ray_error("domain", "window: `funcs:` must have at least 1 entry, got %d", n_funcs);
+    }
+    /* ray_window_op's n_funcs parameter is uint8_t — DICT_VIEW_MAX (256) sits
+     * one past UINT8_MAX, so this is a real representational limit, not the
+     * old fixed-array cap. */
+    if (n_funcs > UINT8_MAX) {
+        ray_release(tbl);
+        return ray_error("range", "window: too many `funcs:` entries for the op graph (max %d)", UINT8_MAX);
     }
 
     /* ── frame: ── */
@@ -4087,53 +4094,94 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
     if (!g) { ray_release(tbl); return ray_error("oom", NULL); }
     ray_op_t* tbl_node = ray_const_table(g, tbl);
 
-    /* part: – SYM vector or atom naming partition columns */
-    ray_op_t* part_ops[16];
-    uint8_t   n_part = 0;
-    {
-        ray_t* pe = dict_get(dict, "part");
-        if (pe) {
-            if (pe->type == -RAY_SYM && !(pe->attrs & ATTR_QUOTED)) {
-                ray_t* s = ray_sym_str(pe->i64);
+    /* part: – SYM vector or atom naming partition columns. Exact-size scratch
+     * carve replaces the fixed part_ops[16] stack array; bound is 1 for an
+     * atom column ref, else the SYM vector's length. */
+    ray_t* pe = dict_get(dict, "part");
+    int64_t n_part_max = (pe && pe->type == RAY_SYM) ? pe->len : 1;
+    if (n_part_max < 1) n_part_max = 1;
+    ray_t* part_hdr = NULL;
+    ray_op_t** part_ops = (ray_op_t**)scratch_alloc(&part_hdr, (size_t)n_part_max * sizeof(ray_op_t*));
+    if (!part_ops) { ray_graph_free(g); ray_release(tbl); return ray_error("oom", NULL); }
+    int64_t n_part = 0;
+    if (pe) {
+        if (pe->type == -RAY_SYM && !(pe->attrs & ATTR_QUOTED)) {
+            ray_t* s = ray_sym_str(pe->i64);
+            if (s) part_ops[n_part++] = ray_scan(g, ray_str_ptr(s));
+        } else if (pe->type == RAY_SYM) {
+            for (int64_t i = 0; i < pe->len; i++) {
+                int64_t sid = sym_cell_runtime_id(pe, i);
+                ray_t*  s   = ray_sym_str(sid);
                 if (s) part_ops[n_part++] = ray_scan(g, ray_str_ptr(s));
-            } else if (pe->type == RAY_SYM) {
-                if (pe->len > RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(tbl); return ray_error("range", "window: too many partition columns (max %d)", RAY_GROUP_MAX_SLOTS); }
-                for (int64_t i = 0; i < pe->len; i++) {
-                    int64_t sid = sym_cell_runtime_id(pe, i);
-                    ray_t*  s   = ray_sym_str(sid);
-                    if (s) part_ops[n_part++] = ray_scan(g, ray_str_ptr(s));
-                }
             }
         }
     }
+    /* ray_window_op takes n_part as uint8_t (and graph.c's own part_ids[256]
+     * scratch caps there too) — this is the real representational limit. */
+    if (n_part > UINT8_MAX) {
+        scratch_free(part_hdr); ray_graph_free(g); ray_release(tbl);
+        return ray_error("range", "window: too many partition columns for the op graph (max %d)", UINT8_MAX);
+    }
 
-    /* order: – SYM vector or atom naming sort columns (all ascending) */
-    ray_op_t* order_ops[16];
-    uint8_t   order_descs[16];
-    uint8_t   n_order = 0;
-    memset(order_descs, 0, sizeof(order_descs));
-    {
-        ray_t* oe = dict_get(dict, "order");
-        if (oe) {
-            if (oe->type == -RAY_SYM && !(oe->attrs & ATTR_QUOTED)) {
-                ray_t* s = ray_sym_str(oe->i64);
+    /* order: – SYM vector or atom naming sort columns (all ascending).
+     * One carve holds both order_ops (pointers) and order_descs (bytes,
+     * trailing), sized the same way as part_ops. */
+    ray_t* oe = dict_get(dict, "order");
+    int64_t n_order_max = (oe && oe->type == RAY_SYM) ? oe->len : 1;
+    if (n_order_max < 1) n_order_max = 1;
+    ray_t* order_hdr = NULL;
+    ray_op_t** order_ops = (ray_op_t**)scratch_alloc(&order_hdr,
+            (size_t)n_order_max * (sizeof(ray_op_t*) + 1));
+    if (!order_ops) {
+        scratch_free(part_hdr); ray_graph_free(g); ray_release(tbl);
+        return ray_error("oom", NULL);
+    }
+    uint8_t* order_descs = (uint8_t*)(order_ops + n_order_max);
+    memset(order_descs, 0, (size_t)n_order_max);
+    int64_t n_order = 0;
+    if (oe) {
+        if (oe->type == -RAY_SYM && !(oe->attrs & ATTR_QUOTED)) {
+            ray_t* s = ray_sym_str(oe->i64);
+            if (s) order_ops[n_order++] = ray_scan(g, ray_str_ptr(s));
+        } else if (oe->type == RAY_SYM) {
+            for (int64_t i = 0; i < oe->len; i++) {
+                int64_t sid = sym_cell_runtime_id(oe, i);
+                ray_t*  s   = ray_sym_str(sid);
                 if (s) order_ops[n_order++] = ray_scan(g, ray_str_ptr(s));
-            } else if (oe->type == RAY_SYM) {
-                if (oe->len > RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(tbl); return ray_error("range", "window: too many order columns (max %d)", RAY_GROUP_MAX_SLOTS); }
-                for (int64_t i = 0; i < oe->len; i++) {
-                    int64_t sid = sym_cell_runtime_id(oe, i);
-                    ray_t*  s   = ray_sym_str(sid);
-                    if (s) order_ops[n_order++] = ray_scan(g, ray_str_ptr(s));
-                }
             }
         }
     }
+    if (n_order > UINT8_MAX) {
+        scratch_free(order_hdr); scratch_free(part_hdr); ray_graph_free(g); ray_release(tbl);
+        return ray_error("range", "window: too many order columns for the op graph (max %d)", UINT8_MAX);
+    }
 
-    /* Parse each funcs: entry: key = output name atom, value = (fn input_col) list */
-    uint8_t    func_kinds[32];
-    ray_op_t*  func_inputs[32];
-    int64_t    func_params[32];
-    int64_t    out_name_ids[32];
+    /* Parse each funcs: entry: key = output name atom, value = (fn input_col)
+     * list. One carve holds func_inputs (pointers) + func_params (int64_t) +
+     * func_kinds (bytes, trailing) sized to n_funcs — all three are only
+     * needed through the ray_window_op call below, so they're freed right
+     * after it. out_name_ids gets its own carve: it's read again after
+     * ray_execute() to rename the output columns, so it must outlive the
+     * other three (freed at the very end of the function instead). */
+    ray_t* funcs_hdr = NULL;
+    size_t func_ptr_sz = (size_t)n_funcs * sizeof(ray_op_t*);
+    size_t func_i64_sz = (size_t)n_funcs * sizeof(int64_t);
+    void*  func_scratch = scratch_alloc(&funcs_hdr, func_ptr_sz + func_i64_sz + (size_t)n_funcs);
+    if (!func_scratch) {
+        scratch_free(order_hdr); scratch_free(part_hdr); ray_graph_free(g); ray_release(tbl);
+        return ray_error("oom", NULL);
+    }
+    ray_op_t** func_inputs  = (ray_op_t**)func_scratch;
+    int64_t*   func_params  = (int64_t*)((char*)func_scratch + func_ptr_sz);
+    uint8_t*   func_kinds   = (uint8_t*)((char*)func_scratch + func_ptr_sz + func_i64_sz);
+
+    ray_t* outname_hdr = NULL;
+    int64_t* out_name_ids = (int64_t*)scratch_alloc(&outname_hdr, (size_t)n_funcs * sizeof(int64_t));
+    if (!out_name_ids) {
+        scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
+        ray_graph_free(g); ray_release(tbl);
+        return ray_error("oom", NULL);
+    }
 
     for (int fi = 0; fi < n_funcs; fi++) {
         ray_t* key_atom = fv[fi * 2];
@@ -4143,6 +4191,7 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
 
         /* val_expr must be a list: (fn_name input_col [param]) */
         if (!val_expr || val_expr->type != RAY_LIST || ray_len(val_expr) < 2) {
+            scratch_free(outname_hdr); scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
             ray_graph_free(g); ray_release(tbl);
             return ray_error("domain",
                 "window: `funcs:` value must be a function call like (min v), got wrong shape at entry %d",
@@ -4154,17 +4203,24 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
 
         /* Function name → RAY_WIN_* kind */
         if (!fn_expr || fn_expr->type != -RAY_SYM) {
+            scratch_free(outname_hdr); scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
             ray_graph_free(g); ray_release(tbl);
             return ray_error("domain", "window: function name must be a symbol");
         }
         ray_t* fn_s = ray_sym_str(fn_expr->i64);
-        if (!fn_s) { ray_graph_free(g); ray_release(tbl); return ray_error("domain", "window: unknown function"); }
+        if (!fn_s) {
+            scratch_free(outname_hdr); scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
+            ray_graph_free(g); ray_release(tbl);
+            return ray_error("domain", "window: unknown function");
+        }
         uint8_t kind = win_kind_from_name(ray_str_ptr(fn_s), ray_str_len(fn_s));
         if (kind == 255) {
+            scratch_free(outname_hdr); scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
             ray_graph_free(g); ray_release(tbl);
             return ray_error("domain", "window: unsupported window function '%s'", ray_str_ptr(fn_s));
         }
         if ((kind == RAY_WIN_FIRST_VALUE || kind == RAY_WIN_LAST_VALUE) && n_order == 0) {
+            scratch_free(outname_hdr); scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
             ray_graph_free(g); ray_release(tbl);
             return ray_error("domain", "window: first/last require order:");
         }
@@ -4173,32 +4229,41 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
 
         /* Input column name */
         if (!col_expr || col_expr->type != -RAY_SYM) {
+            scratch_free(outname_hdr); scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
             ray_graph_free(g); ray_release(tbl);
             return ray_error("domain", "window: function input must be a column name symbol");
         }
         ray_t* col_s = ray_sym_str(col_expr->i64);
-        if (!col_s) { ray_graph_free(g); ray_release(tbl); return ray_error("domain", "window: unknown input column"); }
+        if (!col_s) {
+            scratch_free(outname_hdr); scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
+            ray_graph_free(g); ray_release(tbl);
+            return ray_error("domain", "window: unknown input column");
+        }
         func_inputs[fi] = ray_scan(g, ray_str_ptr(col_s));
     }
 
     /* ── Assemble and execute ── */
     ray_op_t* win_op = ray_window_op(g, tbl_node,
-                                     n_part  ? part_ops  : NULL, n_part,
+                                     n_part  ? part_ops  : NULL, (uint8_t)n_part,
                                      n_order ? order_ops : NULL,
-                                     n_order ? order_descs : NULL, n_order,
+                                     n_order ? order_descs : NULL, (uint8_t)n_order,
                                      func_kinds, func_inputs, func_params,
                                      (uint8_t)n_funcs,
                                      RAY_FRAME_ROWS,
                                      RAY_BOUND_UNBOUNDED_PRECEDING, frame_end,
                                      0, 0);
-    if (!win_op) { ray_graph_free(g); ray_release(tbl); return ray_error("oom", NULL); }
+    scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
+    if (!win_op) {
+        scratch_free(outname_hdr); ray_graph_free(g); ray_release(tbl);
+        return ray_error("oom", NULL);
+    }
 
     win_op = ray_optimize(g, win_op);
     ray_t* result = ray_execute(g, win_op);
     ray_graph_free(g);
     ray_release(tbl);
 
-    if (!result || RAY_IS_ERR(result)) return result;
+    if (!result || RAY_IS_ERR(result)) { scratch_free(outname_hdr); return result; }
 
     /* Rename _w0/_w1/… to the user-specified output names */
     int64_t base_ncols = ray_table_ncols(result) - n_funcs;
@@ -4206,6 +4271,7 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
         if (out_name_ids[fi] >= 0)
             ray_table_set_col_name(result, base_ncols + fi, out_name_ids[fi]);
     }
+    scratch_free(outname_hdr);
 
     return result;
 }

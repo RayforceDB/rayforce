@@ -127,3 +127,12 @@
 (set rg (select {from: gt a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) a17: (sum v) by: {k: k} asc: [a01 a02 a03 a04 a05 a06 a07 a08 a09 a10 a11 a12 a13 a14 a15 a16 a17]}))
 (at rg 'a17) -- [10 20]
 (at rg 'k) -- [1 2]
+
+;; ── window: 17 partition columns (src/ops/query.c ray_window_fn — exact-size
+;; scratch carve replaces the fixed part_ops[16]/order_ops[16]/order_descs[16]
+;; and func_kinds[32]/func_inputs[32]/func_params[32]/out_name_ids[32] stack
+;; arrays). p01..p17 are all constant (value 1 in both rows), so both rows
+;; fall into a single partition; v = [3.0 5.0], and `min` over the whole
+;; partition broadcasts min(3.0, 5.0) = 3.0 to every row in that partition.
+(set wp (table [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17 v] (list [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [3.0 5.0])))
+(at (window {from: wp part: [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17] funcs: {mn: (min v)}}) 'mn) -- [3.0 3.0]
