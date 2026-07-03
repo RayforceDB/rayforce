@@ -572,9 +572,25 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
 
     /* Sort */
     if (has_sort) {
-        ray_op_t* sort_keys[16];
-        uint8_t   sort_descs[16];
-        uint8_t   n_sort = 0;
+        /* Exact-size scratch carve: bound = total names across the dict's
+         * asc:/desc: entries (a -RAY_SYM atom counts 1, a RAY_SYM vector
+         * counts its length).  The former fixed [16] arrays silently
+         * capped multi-key sorts past the 16th key. */
+        int64_t n_sort_max = 0;
+        for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+            int64_t kid = dict_elems[i]->i64;
+            if (kid != asc_id && kid != desc_id) continue;
+            ray_t* val = dict_elems[i + 1];
+            if (val->type == -RAY_SYM) n_sort_max += 1;
+            else if (ray_is_vec(val) && val->type == RAY_SYM) n_sort_max += ray_len(val);
+        }
+        if (n_sort_max < 1) n_sort_max = 1;
+        ray_t* sortk_hdr = NULL;
+        ray_op_t** sort_keys = (ray_op_t**)scratch_alloc(&sortk_hdr,
+                (size_t)n_sort_max * (sizeof(ray_op_t*) + 1));
+        if (!sort_keys) { ray_graph_free(g); ray_release(result); return ray_error("oom", NULL); }
+        uint8_t* sort_descs = (uint8_t*)(sort_keys + n_sort_max);
+        int64_t n_sort = 0;
         for (int64_t i = 0; i + 1 < dict_n; i += 2) {
             int64_t kid = dict_elems[i]->i64;
             uint8_t is_desc = 0;
@@ -583,14 +599,12 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
             else continue;
             ray_t* val = dict_elems[i + 1];
             if (val->type == -RAY_SYM) {
-                if (n_sort >= RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(result); return ray_error("range", "select: too many sort keys (max %d)", RAY_GROUP_MAX_SLOTS); }
                 ray_t* s = ray_sym_str(val->i64);
                 sort_keys[n_sort] = ray_scan(g, ray_str_ptr(s));
                 sort_descs[n_sort] = is_desc;
                 n_sort++;
             } else if (ray_is_vec(val) && val->type == RAY_SYM) {
                 for (int64_t c = 0; c < val->len; c++) {
-                    if (n_sort >= RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(result); return ray_error("range", "select: too many sort keys (max %d)", RAY_GROUP_MAX_SLOTS); }
                     /* cell-data: resolve through the vec's domain */
                     ray_t* s = ray_sym_vec_cell(val, c);
                     sort_keys[n_sort] = ray_scan(g, ray_str_ptr(s));
@@ -599,8 +613,14 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                 }
             }
         }
+        if (n_sort > UINT8_MAX) {
+            scratch_free(sortk_hdr);
+            ray_graph_free(g); ray_release(result);
+            return ray_error("range", "select: too many sort keys for the op graph (max %d)", UINT8_MAX);
+        }
         if (n_sort > 0)
-            root = ray_sort_op(g, root, sort_keys, sort_descs, NULL, n_sort);
+            root = ray_sort_op(g, root, sort_keys, sort_descs, NULL, (uint8_t)n_sort);
+        scratch_free(sortk_hdr);
     }
 
     /* Take: avoid the DAG ray_head/ray_tail op — it can't handle
@@ -4895,6 +4915,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
              * a single scalar column, take is an atom K, and every
              * output column is a -RAY_SYM source-column reference (no
              * agg, no expression). */
+            /* fast-path budget: >16 declines to the general sort (not a correctness cap) */
             int64_t sort_key_syms[16];
             uint8_t sort_descs[16];
             uint8_t n_sort_keys = 0;
@@ -8644,9 +8665,25 @@ by_dict_done:
      * Values are unevaluated — a SYM atom is a column name, a SYM vector
      * is multiple column names.  No ray_eval needed. */
     if (has_sort && !by_expr) {
-        ray_op_t* sort_keys[16];
-        uint8_t   sort_descs[16];
-        uint8_t   n_sort = 0;
+        /* Exact-size scratch carve: bound = total names across the dict's
+         * asc:/desc: entries (a -RAY_SYM atom counts 1, a RAY_SYM vector
+         * counts its length).  The former fixed [16] arrays silently
+         * capped multi-key sorts past the 16th key. */
+        int64_t n_sort_max = 0;
+        for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+            int64_t kid = dict_elems[i]->i64;
+            if (kid != asc_id && kid != desc_id) continue;
+            ray_t* val = dict_elems[i + 1];
+            if (val->type == -RAY_SYM) n_sort_max += 1;
+            else if (ray_is_vec(val) && val->type == RAY_SYM) n_sort_max += ray_len(val);
+        }
+        if (n_sort_max < 1) n_sort_max = 1;
+        ray_t* sortk_hdr = NULL;
+        ray_op_t** sort_keys = (ray_op_t**)scratch_alloc(&sortk_hdr,
+                (size_t)n_sort_max * (sizeof(ray_op_t*) + 1));
+        if (!sort_keys) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); return ray_error("oom", NULL); }
+        uint8_t* sort_descs = (uint8_t*)(sort_keys + n_sort_max);
+        int64_t n_sort = 0;
         for (int64_t i = 0; i + 1 < dict_n; i += 2) {
             int64_t kid = dict_elems[i]->i64;
             uint8_t is_desc = 0;
@@ -8656,7 +8693,6 @@ by_dict_done:
             ray_t* val = dict_elems[i + 1];
             if (val->type == -RAY_SYM) {
                 /* Single column name */
-                if (n_sort >= RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); return ray_error("range", "select: too many sort keys (max %d)", RAY_GROUP_MAX_SLOTS); }
                 ray_t* s = ray_sym_str(val->i64);
                 sort_keys[n_sort] = ray_scan(g, ray_str_ptr(s));
                 sort_descs[n_sort] = is_desc;
@@ -8664,19 +8700,25 @@ by_dict_done:
             } else if (ray_is_vec(val) && val->type == RAY_SYM) {
                 /* Multiple column names — cell-data via the vec's domain */
                 for (int64_t c = 0; c < val->len; c++) {
-                    if (n_sort >= RAY_GROUP_MAX_SLOTS) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); return ray_error("range", "select: too many sort keys (max %d)", RAY_GROUP_MAX_SLOTS); }
                     ray_t* s = ray_sym_vec_cell(val, c);
                     sort_keys[n_sort] = ray_scan(g, ray_str_ptr(s));
                     sort_descs[n_sort] = is_desc;
                     n_sort++;
                 }
             } else {
+                scratch_free(sortk_hdr);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); return ray_error("domain", "select: asc/desc value must be a column name or symbol list, got %s", ray_type_name(val->type));
             }
         }
+        if (n_sort > UINT8_MAX) {
+            scratch_free(sortk_hdr);
+            ray_graph_free(g); ray_release(tbl);
+            scratch_free(sel_slots_hdr); return ray_error("range", "select: too many sort keys for the op graph (max %d)", UINT8_MAX);
+        }
         if (n_sort > 0)
-            root = ray_sort_op(g, root, sort_keys, sort_descs, NULL, n_sort);
+            root = ray_sort_op(g, root, sort_keys, sort_descs, NULL, (uint8_t)n_sort);
+        scratch_free(sortk_hdr);
     }
 
     /* Take: add to DAG only when no group-by and no nearest (rerank

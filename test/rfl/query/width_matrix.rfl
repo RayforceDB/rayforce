@@ -101,3 +101,29 @@
 (set rp (select {from: wt p01: c01 p20: c20 p17: c17 p02: c02 p03: c03 p04: c04 p05: c05 p06: c06 p07: c07 p08: c08 p09: c09 p10: c10 p11: c11 p12: c12 p13: c13 p14: c14 p15: c15 p16: c16 p18: c18 p19: c19}))
 (at (meta rp) 'len) -- 20
 (at rp 'p20) -- [20]
+
+;; ── sort: 17 sort keys, no by: (DAG-compiled path, src/ops/query.c ~line
+;; 574) — exact-size scratch carve replaces the fixed sort_keys[16]/
+;; sort_descs[16] stack arrays.  16 all-equal dummy keys (d01..d16) plus a
+;; discriminator `sk` last: sorting ascending by [d01..d16 sk] is fully
+;; decided by `sk` (1 before 2) since every d0N tie-breaks to nothing.
+;; No output projection dict here (plain pass-through of every source
+;; column) — a narrowed projection that drops the sort-key columns hits an
+;; unrelated, pre-existing bug in exec_sort's OP_SCAN shortcut (it resolves
+;; scan nodes against the post-projection table instead of g->table; already
+;; reproducible on unmodified code with a single sort key, out of scope here).
+(set st (table [d01 d02 d03 d04 d05 d06 d07 d08 d09 d10 d11 d12 d13 d14 d15 d16 sk pay] (list [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [0 0] [2 1] [20 10])))
+(at (select {from: st asc: [d01 d02 d03 d04 d05 d06 d07 d08 d09 d10 d11 d12 d13 d14 d15 d16 sk]}) 'pay) -- [10 20]
+
+;; ── sort: 17 sort keys, WITH by: (apply_sort_take path, src/ops/query.c
+;; ~line 8647 in this file's numbering pre-fix — post-agg sort, group-by
+;; changes the output schema so this can't be added to the DAG and instead
+;; sorts the materialized group-by result).  17 aggregate outputs a01..a17
+;; are each (sum v): within one group every a0N is numerically identical, so
+;; sorting ascending by all 17 is fully decided by that one value.  Source
+;; row order is k=2 (v=20) before k=1 (v=10) — the opposite of sorted order —
+;; so a genuine reorder (not a no-op pass-through) is required to get [10 20].
+(set gt (table [k v] (list [2 1] [20 10])))
+(set rg (select {from: gt a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) a17: (sum v) by: {k: k} asc: [a01 a02 a03 a04 a05 a06 a07 a08 a09 a10 a11 a12 a13 a14 a15 a16 a17]}))
+(at rg 'a17) -- [10 20]
+(at rg 'k) -- [1 2]

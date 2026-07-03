@@ -646,15 +646,41 @@ static test_result_t test_sort_indices_zero_rows(void) {
     PASS();
 }
 
-static test_result_t test_sort_indices_too_many_cols(void) {
+static test_result_t test_sort_indices_many_cols(void) {
     ray_heap_init();
     ray_sym_init();
 
-    /* n_cols=17 > 16 → error */
-    ray_t* result = ray_sort_indices(NULL, NULL, NULL, 17, 10);
-    TEST_ASSERT_NOT_NULL(result);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    /* n_cols=17 (one past the retired RAY_GROUP_MAX_SLOTS-shaped cap):
+     * sort_indices_ex has no n_cols limit of its own any more — the fixed
+     * 16-key radix_encode_ctx_t fast path just gates itself off above 16
+     * and falls through to the n_cols-unbounded comparator merge sort.
+     * 16 constant columns (every row ties) + one discriminator column
+     * last: ascending order is fully decided by the discriminator. */
+    int64_t n = 2;
+    ray_t* cols[17];
+    int64_t zeros[2] = {0, 0};
+    int64_t disc[2]  = {2, 1};
+    for (int i = 0; i < 16; i++) {
+        cols[i] = ray_vec_from_raw(RAY_I64, zeros, n);
+        TEST_ASSERT_NOT_NULL(cols[i]);
+    }
+    cols[16] = ray_vec_from_raw(RAY_I64, disc, n);
+    TEST_ASSERT_NOT_NULL(cols[16]);
 
+    uint8_t descs[17];
+    for (int i = 0; i < 17; i++) descs[i] = 0;
+
+    ray_t* result = ray_sort_indices(cols, descs, NULL, 17, n);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(ray_len(result), n);
+    const int64_t* idx = (const int64_t*)ray_data(result);
+    /* disc = [2, 1] ascending → row 1 (disc=1) before row 0 (disc=2) */
+    TEST_ASSERT_EQ_I(idx[0], 1);
+    TEST_ASSERT_EQ_I(idx[1], 0);
+
+    ray_release(result);
+    for (int i = 0; i < 17; i++) ray_release(cols[i]);
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
@@ -1514,7 +1540,7 @@ const test_entry_t sort_entries[] = {
     /* edge cases */
     { "sort/indices_zero_cols",         test_sort_indices_zero_cols,    NULL, NULL },
     { "sort/indices_zero_rows",         test_sort_indices_zero_rows,    NULL, NULL },
-    { "sort/indices_too_many_cols",     test_sort_indices_too_many_cols, NULL, NULL },
+    { "sort/indices_many_cols",         test_sort_indices_many_cols,    NULL, NULL },
     { "sort/asc_atom_passthrough",      test_asc_atom_passthrough,      NULL, NULL },
     { "sort/asc_single_element",        test_asc_single_element,        NULL, NULL },
     { "sort/asc_not_vec_error",         test_asc_not_vec_error,         NULL, NULL },

@@ -1,8 +1,11 @@
 ;; Slot-limit guards for the select/group-by compile paths (src/ops/query.c).
-;; More than RAY_GROUP_MAX_SLOTS (16) aggregate, non-aggregate, or sort-key
-;; entries in one `select` are rejected with a clear error rather than silently
-;; truncating the surplus (which returned wrong results).  Plain projections
-;; have no such cap — they route to the eval fallback and keep every column.
+;; More than RAY_GROUP_MAX_SLOTS (16) aggregate or non-aggregate entries in
+;; one `select` are rejected with a clear error rather than silently
+;; truncating the surplus (which returned wrong results).  The sort-key
+;; collector's cap is retired (exact-size scratch carve): >16 asc:/desc:
+;; entries now compile and execute correctly instead of erroring.  Plain
+;; projections have no cap either — they route to the eval fallback and
+;; keep every column.
 
 (set t (table [k v] (list [1 1 2 2] (as 'F64 [10 20 30 40]))))
 
@@ -22,8 +25,13 @@
 (select {by: k a: (+ v 1) b: (+ v 2) c: (+ v 3) d: (+ v 4) e: (+ v 5) f: (+ v 6) g: (+ v 7) h: (+ v 8) i: (+ v 9) j: (+ v 10) l: (+ v 11) m: (+ v 12) n: (+ v 13) o: (+ v 14) p: (+ v 15) q: (+ v 16) s: (+ v 17) from: t}) !- range
 
 ;; ─── sort keys ──────────────────────────────────────────────────────
-;; 17 sort keys — over the cap: clear error, not a silently ignored key.
-(select {from: t asc: [k v k v k v k v k v k v k v k v k]}) !- range
+;; 17 sort keys — the DAG sort-key collector cap is retired: exact-size
+;; scratch carve (query.c) sizes to the real bound and ray_sort_op /
+;; exec_sort take all 17.  t is [k v] = [1 1 2 2]/[10 20 30 40], already
+;; in ascending (k,v) order, so this proves no-error + a correct
+;; pass-through result (not a genuine reorder — see width_matrix.rfl for
+;; a reorder-proving case on both the DAG and post-agg sort sites).
+(at (select {from: t asc: [k v k v k v k v k v k v k v k v k]}) 'v) -- [10.0 20.0 30.0 40.0]
 
 ;; ─── plain projection — NO cap (routes to the eval fallback) ─────────
 (set w (table [c0 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14 c15 c16] (list [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [1 2] [9 8])))

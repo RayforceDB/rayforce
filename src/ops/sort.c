@@ -2234,8 +2234,10 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                                uint64_t** sorted_keys_out, ray_t** keys_hdr_out) {
     if (n_cols == 0 || nrows <= 0)
         return ray_vec_new(RAY_I64, 0);
-    if (n_cols > 16)
-        return ray_error("nyi", NULL);
+    /* No n_cols cap here: the composite-radix fast path below (`fits`)
+     * uses a fixed-16-key encode context and gates itself on n_cols <= 16;
+     * anything wider (or any key type it declines) falls through to the
+     * generic comparator-based merge sort, which is n_cols-unbounded. */
 
     /* Allocate index array */
     ray_t* indices_hdr;
@@ -2731,7 +2733,12 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                         if (rank_hdrs[k]) scratch_free(rank_hdrs[k]);
                 }
 
-                if (fits) {
+                /* radix_encode_ctx_t (internal.h) carries fixed 16-key
+                 * mins/ranges/bit_shifts/descs/enum_ranks arrays — this
+                 * direct-encode path is only safe up to that width.  Wider
+                 * composites (any n_cols above 16) fall through to the
+                 * merge sort below rather than overrun those arrays. */
+                if (fits && n_cols <= 16) {
                     /* Compute bit-shift for each key: primary key in MSBs */
                     uint8_t bit_shifts[n_cols];
                     uint8_t accum = 0;
@@ -3335,7 +3342,6 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
     int64_t ncols = ray_table_ncols(tbl);
     if (ncols > 4096) return ray_error("nyi", NULL); /* stack safety */
     uint8_t n_sort = ext->sort.n_cols;
-    if (n_sort > 16) return ray_error("nyi", NULL); /* radix_encode_ctx_t limit */
 
     /* ---- Top-K bounded-heap shortcut ----
      * Triggered by the SORT+HEAD fusion (HEAD passes limit > 0).  When
@@ -3345,8 +3351,11 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
      * Single key → radix-encoded fast path; multi-key → comparator
      * heap (still O(n log K) in compares, big win when K << n).
      * Falls through to the full sort whenever the topk path returns
-     * NULL (unsupported type, computed-key sort, etc.). */
-    if (limit > 0 && n_sort >= 1 && limit < nrows && limit <= 8192 &&
+     * NULL (unsupported type, computed-key sort, etc.).  Bounded to
+     * n_sort <= 16: the shortcut's key_cols/nfs scratch below is a
+     * fixed-16 stack array; wider sorts skip straight to the general
+     * sort_indices_ex path (itself n_cols-unbounded). */
+    if (limit > 0 && n_sort >= 1 && n_sort <= 16 && limit < nrows && limit <= 8192 &&
         g && g->selection == NULL) {
         ray_t* key_cols[16];
         int    all_scan = 1;
