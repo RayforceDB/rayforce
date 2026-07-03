@@ -18,14 +18,65 @@
 (at rc 'c01) -- [32 72]
 (at rc 'c10) -- [32 72]
 
-;; ── v2 engine: 17 aggs, low-card dense ──
+;; ── v2 engine: 17 aggs, low-card dense (serial dense path: nrows=4 is far
+;; below RAY_PARALLEL_THRESHOLD = 64*RAY_MORSEL_ELEMS = 65536, so this always
+;; runs the serial agg_group_keys_dense driver, never the pool) ──
 (set bt (table [k v] (list [1 1 2 2] [1.5 2.5 3.5 4.5])))
 (set rv (select {from: bt b01: (sum v) b02: (min v) b03: (max v) b04: (count v) b05: (avg v) b06: (sum v) b07: (min v) b08: (max v) b09: (count v) b10: (avg v) b11: (sum v) b12: (min v) b13: (max v) b14: (count v) b15: (avg v) b16: (sum v) b17: (sum v) by: {k: k}}))
 (at (meta rv) 'len) -- 18
 (at rv 'b17) -- [4.0 8.0]
 
-;; ── v2 engine: same width, high-card key (hash/radix strategy) ──
+;; ── v2 engine: same width, higher-card key, still serial dense path (not
+;; hash/radix: nrows=5000 stays below the 65536 parallel threshold, so the
+;; serial branch runs agg_dense_plan/agg_group_keys_dense regardless of key
+;; cardinality) ──
 (set ht (table [k v] (list (til 5000) (til 5000))))
 (set rh (select {from: ht b01: (sum v) b02: (min v) b03: (max v) b04: (count v) b05: (sum v) b06: (min v) b07: (max v) b08: (count v) b09: (sum v) b10: (min v) b11: (max v) b12: (count v) b13: (sum v) b14: (min v) b15: (max v) b16: (count v) b17: (sum v) by: {k: k}}))
 (at (meta rh) 'len) -- 18
 (sum (at rh 'b17)) -- 12497500
+
+;; ── v2 engine: 17 aggs, PARALLEL DENSE path ──
+;; Routing (src/ops/agg_engine.c exec_group_v2_run, ~line 2569 on): once
+;; `pool && eff_n >= RAY_PARALLEL_THRESHOLD` (65536), dense_par_ok is tried
+;; FIRST and wins whenever agg_dense_plan succeeds (product of key ranges <=
+;; DENSE_MAX_SLOTS = 262144) and the per-worker slab fits the 8MB/worker cap.
+;; k = (% (til 100000) 1000): nrows=100000 >= 65536 and key range is exactly
+;; 1000 (values 0..999) <= 262144, and total_slots(1000)*(block+8) is far
+;; under 8MB for any block size — so this provably takes
+;; exec_group_v2_parallel_dense.
+;; Each group g in 0..999 has exactly 100 members {g, g+1000, ..., g+99000}
+;; (v = til 100000, so v_i = i = k-column's own row index).
+;; sum(v) over group g = 100*g + 1000*(0+1+...+99) = 100*g + 4950000.
+;; Sum of that across all 1000 groups = 100*(0+...+999) + 1000*4950000
+;;   = 100*499500 + 4950000000 = 49950000 + 4950000000 = 4999950000
+;;   = sum(til 100000) = 99999*100000/2, as expected (every v is counted
+;;   exactly once, partitioned across groups).
+(set pt (table [k v] (list (% (til 100000) 1000) (til 100000))))
+(set rp (select {from: pt p01: (sum v) p02: (min v) p03: (max v) p04: (count v) p05: (sum v) p06: (min v) p07: (max v) p08: (count v) p09: (sum v) p10: (min v) p11: (max v) p12: (count v) p13: (sum v) p14: (min v) p15: (max v) p16: (count v) p17: (sum v) by: {k: k}}))
+(at (meta rp) 'len) -- 18
+(count (at rp 'k)) -- 1000
+(sum (at rp 'p17)) -- 4999950000
+
+;; ── v2 engine: 17 aggs, RADIX path ──
+;; k = (* 5 (til 100000)) is UNIQUE per row: min=0, max=499995, range=499996,
+;; which exceeds DENSE_MAX_SLOTS (262144) — agg_dense_plan's overflow-safe
+;; product check (`total > DENSE_MAX_SLOTS / rng`) rejects it, so dp.ok=false
+;; and dense_par_ok is false (short-circuited on dp.ok before the byte-budget
+;; check). keys_intsym is true (I64 key, no nulls), and every aggregate below
+;; is ACC_STREAMING, so the router takes the cardinality-estimate branch:
+;; agg_estimate_card samples up to 65536 rows and early-exits the moment
+;; distinct count passes T_ROUTE=16384. Since every key in the sampled prefix
+;; is distinct (unique per row), the sample hits 16385 distinct groups well
+;; before exhausting its 65536-row budget and returns t_route+1 (16385) >
+;; T_ROUTE — so `est <= T_ROUTE` is false and the router falls through to
+;; exec_group_v2_parallel_radix. This provably exercises the radix path, not
+;; small-hash.
+;; Every group has exactly 1 member (keys are unique), so sum(v) per group is
+;; just that row's v = its row index; summed over all 100000 groups that is
+;; sum(til 100000) = 4999950000 again, and the result has exactly 100000
+;; groups (one per input row).
+(set xt (table [k v] (list (* 5 (til 100000)) (til 100000))))
+(set rx (select {from: xt x01: (sum v) x02: (min v) x03: (max v) x04: (count v) x05: (sum v) x06: (min v) x07: (max v) x08: (count v) x09: (sum v) x10: (min v) x11: (max v) x12: (count v) x13: (sum v) x14: (min v) x15: (max v) x16: (count v) x17: (sum v) by: {k: k}}))
+(at (meta rx) 'len) -- 18
+(count (at rx 'k)) -- 100000
+(sum (at rx 'x17)) -- 4999950000
