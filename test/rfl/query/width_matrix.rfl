@@ -80,3 +80,13 @@
 (at (meta rx) 'len) -- 18
 (count (at rx 'k)) -- 100000
 (sum (at rx 'x17)) -- 4999950000
+
+;; ── eval-group path (multi-key + non-agg output): 17 outputs ──
+(set re (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) n1: v by: {k: k g: g}}))
+(at (meta re) 'len) -- 19
+(at re 'a16) -- [30 70]
+
+;; ── count-only pre-take fast path: 17 count outputs with take: ──
+(set rt (select {from: t c01: (count v) c02: (count v) c03: (count v) c04: (count v) c05: (count v) c06: (count v) c07: (count v) c08: (count v) c09: (count v) c10: (count v) c11: (count v) c12: (count v) c13: (count v) c14: (count v) c15: (count v) c16: (count v) c17: (count v) by: {k: k} take: 2}))
+(at (meta rt) 'len) -- 18
+(at rt 'c17) -- [2 2]

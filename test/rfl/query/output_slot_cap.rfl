@@ -1,17 +1,16 @@
-;; Output-column slot cap (RAY_GROUP_MAX_SLOTS = 16): every select/group
-;; path must either produce ALL requested outputs or reject loudly with
-;; `range` — never silently truncate (audit regression).
+;; Output-column slot cap RETIRED (was RAY_GROUP_MAX_SLOTS = 16): every
+;; select/group path now produces ALL requested outputs at any width — the
+;; collectors are exact-size scratch, not fixed 16-slot arrays.  This file
+;; guards correct wide results on the paths that used to error `range`.
 
 (set t (table [k g v] (list [1 1 2 2] [5 5 6 6] [10 20 30 40])))
 
-;; DAG path (single sym key, pure agg): 17 aggregates now compile and run
-;; (the 16-slot compile cap is retired).  NOTE: currently gated on the
-;; exec-side agg-width lift (agg_engine.c v2 >16 bail + group.c legacy 8-cap)
-;; — until that lands the select returns `nyi`; this asserts the target state.
+;; DAG path (single sym key, pure agg): 17 aggregates compile and run (the
+;; 16-slot compile cap and the exec-side agg-width bail are retired).
 (at (meta (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) a17: (sum v) by: {k: k}})) 'len) -- 18
 
-;; eval-group path (multi-key + non-agg output): 17 outputs → range error
-(select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) n1: v by: {k: k g: g}}) !- range
+;; eval-group path (multi-key + non-agg output): 17 outputs + 2 keys = 19 cols
+(at (meta (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) n1: v by: {k: k g: g}})) 'len) -- 19
 
 ;; control: 16 outputs on the same eval-group shape succeeds (2 keys + 16)
 (at (meta (select {from: t a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) n1: v by: {k: k g: g}})) 'len) -- 18

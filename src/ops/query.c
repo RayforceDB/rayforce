@@ -6096,15 +6096,25 @@ by_dict_done:
                 int64_t nk = ray_len(by_expr);
                 int64_t* key_syms = (int64_t*)ray_data(by_expr);
                 int64_t nrows = ray_table_nrows(eval_tbl);
-                ray_t* key_cols[16];
-                if (nk <= 0 || nk > 16) {
+                if (nk <= 0) {
                     if (eval_tbl != tbl) ray_release(eval_tbl);
                     ray_release(tbl);
-                    scratch_free(sel_slots_hdr); return ray_error("domain", "eval-level multi-key groupby requires 1..16 keys");
+                    scratch_free(sel_slots_hdr); return ray_error("domain", "eval-level multi-key groupby requires at least one key");
+                }
+                /* Pure-eval grouping carries no graph-representation limit —
+                 * carve the key-column pointers to the exact key count.  This
+                 * scratch lives until every return path in this block. */
+                ray_t* keycols_hdr = NULL;
+                ray_t** key_cols = (ray_t**)scratch_alloc(&keycols_hdr, (size_t)nk * sizeof(ray_t*));
+                if (!key_cols) {
+                    if (eval_tbl != tbl) ray_release(eval_tbl);
+                    ray_release(tbl);
+                    scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
                 }
                 for (int64_t k = 0; k < nk; k++) {
                     key_cols[k] = ray_table_get_col(eval_tbl, key_syms[k]);
                     if (!key_cols[k]) {
+                        scratch_free(keycols_hdr);
                         if (eval_tbl != tbl) ray_release(eval_tbl);
                         ray_release(tbl);
                         scratch_free(sel_slots_hdr); return ray_error("domain", "group key column not found");
@@ -6148,6 +6158,10 @@ by_dict_done:
                         default: distinct_only = false; break;
                     }
                 }
+                /* agg_select_distinct addresses keys through a uint8_t count —
+                 * beyond 255 keys the fast path cannot represent the shape, so
+                 * fall through to the composite (unbounded) path below. */
+                if (nk > UINT8_MAX) distinct_only = false;
                 if (distinct_only) {
                     /* Consume the projection hint (if a consumer published one) —
                      * carry only its referenced non-key columns.  Consume-once. */
@@ -6159,6 +6173,7 @@ by_dict_done:
                     }
                     ray_t* dres = agg_select_distinct(eval_tbl, key_cols, key_syms,
                                                       (uint8_t)nk, nrows, keep, keep_n);
+                    scratch_free(keycols_hdr);
                     if (eval_tbl != tbl) ray_release(eval_tbl);
                     ray_release(tbl);
                     scratch_free(sel_slots_hdr); return dres;
@@ -6169,26 +6184,42 @@ by_dict_done:
                     dict_elems, dict_n, asc_id, desc_id, take_id,
                     nrows, &pre_take_groups);
                 if (has_pre_take && pre_take_groups <= 1024) {
-                    query_key_reader_t key_readers[16];
+                    /* Per-key reader and per-output name buffers carved to the
+                     * exact key / output counts (no fixed slot cap).  Both live
+                     * until this pre-take block returns or falls through to the
+                     * composite path below. */
+                    ray_t* keyrd_hdr = NULL;
+                    query_key_reader_t* key_readers = (query_key_reader_t*)scratch_alloc(
+                        &keyrd_hdr, (size_t)nk * sizeof(query_key_reader_t));
+                    int64_t cnt_out_max = select_output_count(dict_elems, dict_n);
+                    ray_t* cntnames_hdr = NULL;
+                    int64_t* count_names = (int64_t*)scratch_alloc(
+                        &cntnames_hdr, (size_t)(cnt_out_max > 0 ? cnt_out_max : 1) * sizeof(int64_t));
+                    if (!key_readers || !count_names) {
+                        scratch_free(keyrd_hdr); scratch_free(cntnames_hdr);
+                        scratch_free(keycols_hdr);
+                        if (eval_tbl != tbl) ray_release(eval_tbl);
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
+                    }
                     for (int64_t k = 0; k < nk; k++) {
                         if (!query_key_reader_init(&key_readers[k], key_cols[k])) {
+                            scratch_free(keyrd_hdr); scratch_free(cntnames_hdr);
+                            scratch_free(keycols_hdr);
                             if (eval_tbl != tbl) ray_release(eval_tbl);
                             ray_release(tbl);
                             scratch_free(sel_slots_hdr); return ray_error("type", "unsupported group key");
                         }
                     }
                     int n_count_out = 0;
-                    int64_t count_names[RAY_GROUP_MAX_SLOTS];
                     bool count_only = true;
                     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                         int64_t kid = dict_elems[i]->i64;
                         if (kid == from_id || kid == where_id || kid == by_id ||
                             kid == take_id || kid == asc_id || kid == desc_id) continue;
                         ray_t* val_expr_item = dict_elems[i + 1];
-                        if (!is_plain_count_expr(val_expr_item) ||
-                            n_count_out >= RAY_GROUP_MAX_SLOTS) {
-                            /* Not a count expr, or too many outputs for this
-                             * fast path's fixed slots — use the general path
+                        if (!is_plain_count_expr(val_expr_item)) {
+                            /* Not a plain count expr — use the general path
                              * (never silently drop outputs). */
                             count_only = false;
                             break;
@@ -6204,6 +6235,7 @@ by_dict_done:
                             if (vals_hdr) ray_free(vals_hdr);
                             if (null_hdr) ray_free(null_hdr);
                             if (cnt_hdr) ray_free(cnt_hdr);
+                            scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
                             if (eval_tbl != tbl) ray_release(eval_tbl);
                             ray_release(tbl);
                             scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
@@ -6214,13 +6246,26 @@ by_dict_done:
                         memset(key_null, 0, (size_t)cap * (size_t)nk);
                         memset(counts, 0, (size_t)cap * sizeof(int64_t));
 
+                        /* Per-row key value / null scratch, carved once to the
+                         * exact key count and reused across the row loop. */
+                        ray_t* rowbuf_hdr = NULL;
+                        int64_t* rv = (int64_t*)scratch_alloc(&rowbuf_hdr,
+                            (size_t)nk * (sizeof(int64_t) + 1));
+                        uint8_t* rn = (uint8_t*)(rv + nk);
+                        if (!rv) {
+                            ray_free(vals_hdr); ray_free(null_hdr); ray_free(cnt_hdr);
+                            scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
+                            if (eval_tbl != tbl) ray_release(eval_tbl);
+                            ray_release(tbl);
+                            scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
+                        }
+
                         int64_t found = 0;
                         for (int64_t r = 0; r < nrows; r++) {
-                            int64_t rv[16];
-                            uint8_t rn[16];
                             for (int64_t k = 0; k < nk; k++) {
                                 if (!query_key_reader_read(&key_readers[k], r, &rv[k], &rn[k])) {
                                     ray_free(vals_hdr); ray_free(null_hdr); ray_free(cnt_hdr);
+                                    scratch_free(rowbuf_hdr); scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
                                     if (eval_tbl != tbl) ray_release(eval_tbl);
                                     ray_release(tbl);
                                     scratch_free(sel_slots_hdr); return ray_error("type", "unsupported group key");
@@ -6254,6 +6299,7 @@ by_dict_done:
                         ray_t* result = ray_table_new(nk + n_count_out);
                         if (!result || RAY_IS_ERR(result)) {
                             ray_free(vals_hdr); ray_free(null_hdr); ray_free(cnt_hdr);
+                            scratch_free(rowbuf_hdr); scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
                             if (eval_tbl != tbl) ray_release(eval_tbl);
                             ray_release(tbl);
                             scratch_free(sel_slots_hdr); return result ? result : ray_error("oom", NULL);
@@ -6273,6 +6319,7 @@ by_dict_done:
                             if (!key_vec || RAY_IS_ERR(key_vec)) {
                                 ray_release(result);
                                 ray_free(vals_hdr); ray_free(null_hdr); ray_free(cnt_hdr);
+                                scratch_free(rowbuf_hdr); scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
                                 if (eval_tbl != tbl) ray_release(eval_tbl);
                                 ray_release(tbl);
                                 scratch_free(sel_slots_hdr); return key_vec ? key_vec : ray_error("oom", NULL);
@@ -6316,6 +6363,7 @@ by_dict_done:
                             ray_release(key_vec);
                             if (RAY_IS_ERR(result)) {
                                 ray_free(vals_hdr); ray_free(null_hdr); ray_free(cnt_hdr);
+                                scratch_free(rowbuf_hdr); scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
                                 if (eval_tbl != tbl) ray_release(eval_tbl);
                                 ray_release(tbl);
                                 scratch_free(sel_slots_hdr); return result;
@@ -6326,6 +6374,7 @@ by_dict_done:
                             if (!cv || RAY_IS_ERR(cv)) {
                                 ray_release(result);
                                 ray_free(vals_hdr); ray_free(null_hdr); ray_free(cnt_hdr);
+                                scratch_free(rowbuf_hdr); scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
                                 if (eval_tbl != tbl) ray_release(eval_tbl);
                                 ray_release(tbl);
                                 scratch_free(sel_slots_hdr); return cv ? cv : ray_error("oom", NULL);
@@ -6336,20 +6385,26 @@ by_dict_done:
                             ray_release(cv);
                             if (RAY_IS_ERR(result)) {
                                 ray_free(vals_hdr); ray_free(null_hdr); ray_free(cnt_hdr);
+                                scratch_free(rowbuf_hdr); scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
                                 if (eval_tbl != tbl) ray_release(eval_tbl);
                                 ray_release(tbl);
                                 scratch_free(sel_slots_hdr); return result;
                             }
                         }
                         ray_free(vals_hdr); ray_free(null_hdr); ray_free(cnt_hdr);
+                        scratch_free(rowbuf_hdr); scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
                         if (eval_tbl != tbl) ray_release(eval_tbl);
                         ray_release(tbl);
                         scratch_free(sel_slots_hdr); return result;
                     }
+                    /* Not a count-only shape — release the pre-take scratch and
+                     * fall through to the composite grouping path. */
+                    scratch_free(keyrd_hdr); scratch_free(cntnames_hdr);
                 }
 
                 ray_t* composite_keys = ray_list_new(nrows);
                 if (!composite_keys || RAY_IS_ERR(composite_keys)) {
+                    scratch_free(keycols_hdr);
                     if (eval_tbl != tbl) ray_release(eval_tbl);
                     ray_release(tbl);
                     scratch_free(sel_slots_hdr); return composite_keys ? composite_keys : ray_error("oom", NULL);
@@ -6358,6 +6413,7 @@ by_dict_done:
                     ray_t* row_key = ray_list_new(nk);
                     if (!row_key || RAY_IS_ERR(row_key)) {
                         ray_release(composite_keys);
+                        scratch_free(keycols_hdr);
                         if (eval_tbl != tbl) ray_release(eval_tbl);
                         ray_release(tbl);
                         scratch_free(sel_slots_hdr); return row_key ? row_key : ray_error("oom", NULL);
@@ -6368,6 +6424,7 @@ by_dict_done:
                         if (!cell || RAY_IS_ERR(cell)) {
                             ray_release(row_key);
                             ray_release(composite_keys);
+                            scratch_free(keycols_hdr);
                             if (eval_tbl != tbl) ray_release(eval_tbl);
                             ray_release(tbl);
                             scratch_free(sel_slots_hdr); return cell ? cell : ray_error("domain", "select by: failed to read composite group key cell");
@@ -6376,6 +6433,7 @@ by_dict_done:
                         if (alloc) ray_release(cell);
                         if (!row_key || RAY_IS_ERR(row_key)) {
                             ray_release(composite_keys);
+                            scratch_free(keycols_hdr);
                             if (eval_tbl != tbl) ray_release(eval_tbl);
                             ray_release(tbl);
                             scratch_free(sel_slots_hdr); return row_key ? row_key : ray_error("oom", NULL);
@@ -6384,6 +6442,7 @@ by_dict_done:
                     composite_keys = ray_list_append(composite_keys, row_key);
                     ray_release(row_key);
                     if (!composite_keys || RAY_IS_ERR(composite_keys)) {
+                        scratch_free(keycols_hdr);
                         if (eval_tbl != tbl) ray_release(eval_tbl);
                         ray_release(tbl);
                         scratch_free(sel_slots_hdr); return composite_keys ? composite_keys : ray_error("oom", NULL);
@@ -6393,6 +6452,7 @@ by_dict_done:
                 ray_t* groups_dict = ray_group_fn(composite_keys);
                 ray_release(composite_keys);
                 if (!groups_dict || RAY_IS_ERR(groups_dict)) {
+                    scratch_free(keycols_hdr);
                     if (eval_tbl != tbl) ray_release(eval_tbl);
                     ray_release(tbl);
                     scratch_free(sel_slots_hdr); return groups_dict ? groups_dict : ray_error("domain", "select by: failed to compute composite groups");
@@ -6400,6 +6460,7 @@ by_dict_done:
                 ray_t* groups = groups_to_pair_list(groups_dict);
                 ray_release(groups_dict);
                 if (!groups || RAY_IS_ERR(groups)) {
+                    scratch_free(keycols_hdr);
                     if (eval_tbl != tbl) ray_release(eval_tbl);
                     ray_release(tbl);
                     scratch_free(sel_slots_hdr); return groups ? groups : ray_error("domain", "select by: failed to build groups pair list");
@@ -6411,19 +6472,24 @@ by_dict_done:
                     n_groups, &out_groups);
 
                 int n_agg_out = 0;
-                int64_t agg_names[RAY_GROUP_MAX_SLOTS];
-                ray_t* agg_results[RAY_GROUP_MAX_SLOTS] = {0};
+                /* Per-output collectors carved to the exact output count (no
+                 * fixed slot cap); results slots zeroed so unassigned entries
+                 * are NULL for the error-path release loops. */
+                int64_t agg_nout_max = select_output_count(dict_elems, dict_n);
+                if (agg_nout_max < 1) agg_nout_max = 1;
+                ray_t* aggnames_hdr = NULL;
+                int64_t* agg_names = (int64_t*)scratch_alloc(&aggnames_hdr, (size_t)agg_nout_max * sizeof(int64_t));
+                ray_t* aggres_hdr = NULL;
+                ray_t** agg_results = (ray_t**)scratch_calloc(&aggres_hdr, (size_t)agg_nout_max * sizeof(ray_t*));
+                if (!agg_names || !agg_results) {
+                    scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
+                    ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
+                }
                 for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
                     if (kid == from_id || kid == where_id || kid == by_id ||
                         kid == take_id || kid == asc_id || kid == desc_id) continue;
-                    if (n_agg_out >= RAY_GROUP_MAX_SLOTS) {
-                        /* Terminal eval-group path: reject loudly instead of
-                         * silently dropping outputs past the slot cap. */
-                        for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
-                        ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
-                        scratch_free(sel_slots_hdr); return ray_error("range", "select: too many output columns (max %d)", RAY_GROUP_MAX_SLOTS);
-                    }
                     ray_t* val_expr_item = dict_elems[i + 1];
 
                     /* Per-group count(distinct) — bypass full ray_eval per
@@ -6436,6 +6502,7 @@ by_dict_done:
                             cd_inner, eval_tbl, groups, out_groups);
                         if (!per_group || RAY_IS_ERR(per_group)) {
                             for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
                             ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                             scratch_free(sel_slots_hdr); return per_group ? per_group : ray_error("domain", "select by: count-distinct aggregation failed");
                         }
@@ -6463,6 +6530,7 @@ by_dict_done:
                                 src_col_val = ray_lazy_materialize(src_col_val);
                             if (!src_col_val || RAY_IS_ERR(src_col_val)) {
                                 for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
+                                scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
                                 ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                                 scratch_free(sel_slots_hdr); return src_col_val ? src_col_val : ray_error("domain", "select by: failed to evaluate aggregation source column");
                             }
@@ -6545,6 +6613,7 @@ by_dict_done:
                         ray_t* per_group = nonagg_eval_per_group(val_expr_item, eval_tbl, groups, n_groups);
                         if (!per_group || RAY_IS_ERR(per_group)) {
                             for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
                             ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                             scratch_free(sel_slots_hdr); return per_group ? per_group : ray_error("domain", "select by: per-group projection evaluation failed");
                         }
@@ -6557,6 +6626,7 @@ by_dict_done:
                 ray_t* result = ray_table_new(nk + n_agg_out);
                 if (!result || RAY_IS_ERR(result)) {
                     for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
+                    scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
                     ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                     scratch_free(sel_slots_hdr); return result ? result : ray_error("oom", NULL);
                 }
@@ -6593,6 +6663,7 @@ by_dict_done:
                     }
                     if (!key_vec || RAY_IS_ERR(key_vec)) {
                         for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
+                        scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
                         ray_release(result); ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                         scratch_free(sel_slots_hdr); return key_vec ? key_vec : ray_error("oom", NULL);
                     }
@@ -6600,6 +6671,7 @@ by_dict_done:
                     ray_release(key_vec);
                     if (RAY_IS_ERR(result)) {
                         for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
+                        scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
                         ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                         scratch_free(sel_slots_hdr); return result;
                     }
@@ -6608,9 +6680,12 @@ by_dict_done:
                     if (agg_results[ai]) {
                         result = ray_table_add_col(result, agg_names[ai], agg_results[ai]);
                         ray_release(agg_results[ai]);
-                        if (RAY_IS_ERR(result)) { ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); return result; }
+                        if (RAY_IS_ERR(result)) { scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr); ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); return result; }
                     }
                 }
+                /* Aggregate results consumed and key columns emitted — release
+                 * their exact-size collectors before the tail paths. */
+                scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
 
                 /* No-agg-no-nonagg form (`select {by:[k1 k2]}`): carry the
                  * first-of-group value of every non-key column, matching the
@@ -6928,20 +7003,24 @@ by_dict_done:
                 scratch_free(sel_slots_hdr); return empty;
             }
 
-            /* Collect aggregation results */
+            /* Collect aggregation results.  Per-output collectors carved to the
+             * exact output count (no fixed slot cap); result slots zeroed so
+             * unassigned entries are NULL for the error-path release loops. */
             int n_agg_out = 0;
-            int64_t agg_names[RAY_GROUP_MAX_SLOTS];
-            ray_t* agg_results[RAY_GROUP_MAX_SLOTS] = {0};
+            int64_t agg_nout_max = select_output_count(dict_elems, dict_n);
+            if (agg_nout_max < 1) agg_nout_max = 1;
+            ray_t* aggnames_hdr = NULL;
+            int64_t* agg_names = (int64_t*)scratch_alloc(&aggnames_hdr, (size_t)agg_nout_max * sizeof(int64_t));
+            ray_t* aggres_hdr = NULL;
+            ray_t** agg_results = (ray_t**)scratch_calloc(&aggres_hdr, (size_t)agg_nout_max * sizeof(ray_t*));
+            if (!agg_names || !agg_results) {
+                scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
+                ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
+            }
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id) continue;
-                if (n_agg_out >= RAY_GROUP_MAX_SLOTS) {
-                    /* Terminal eval-group path: reject loudly instead of
-                     * silently dropping outputs past the slot cap. */
-                    for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
-                    ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
-                    scratch_free(sel_slots_hdr); return ray_error("range", "select: too many output columns (max %d)", RAY_GROUP_MAX_SLOTS);
-                }
                 ray_t* val_expr_item = dict_elems[i + 1];
 
                 /* Per-group count(distinct) — bypass full ray_eval per
@@ -6953,6 +7032,7 @@ by_dict_done:
                             cd_inner, eval_tbl, groups, n_groups);
                         if (!per_group || RAY_IS_ERR(per_group)) {
                             for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
                             ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                             scratch_free(sel_slots_hdr); return per_group ? per_group : ray_error("domain", "select by: count-distinct aggregation failed");
                         }
@@ -6989,6 +7069,7 @@ by_dict_done:
                             src_col_val = ray_lazy_materialize(src_col_val);
                         if (RAY_IS_ERR(src_col_val)) {
                             for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
                             ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); return src_col_val;
                         }
                     }
@@ -7074,6 +7155,7 @@ by_dict_done:
                             val_expr_item, eval_tbl, groups, n_groups);
                         if (RAY_IS_ERR(per_group)) {
                             for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
                             ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                             scratch_free(sel_slots_hdr); return per_group;
                         }
@@ -7088,6 +7170,7 @@ by_dict_done:
                      * (non-agg produces list-of-vectors). */
                     if (ray_env_push_scope() != RAY_OK) {
                         for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                        scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
                         ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                         scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
                     }
@@ -7097,6 +7180,7 @@ by_dict_done:
                     ray_env_pop_scope();
                     if (RAY_IS_ERR(full_val)) {
                         for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                        scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
                         ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); return full_val;
                     }
 
@@ -7106,6 +7190,7 @@ by_dict_done:
                     if (!list_col || RAY_IS_ERR(list_col)) {
                         ray_release(full_val);
                         for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                        scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
                         ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                         scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
                     }
@@ -7143,6 +7228,7 @@ by_dict_done:
                             val_expr_item, eval_tbl, groups, n_groups);
                         if (RAY_IS_ERR(per_group)) {
                             for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); }
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
                             ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                             scratch_free(sel_slots_hdr); return per_group;
                         }
@@ -7177,7 +7263,7 @@ by_dict_done:
 
             /* Build result table: key column + aggregation columns */
             ray_t* result = ray_table_new(1 + n_agg_out);
-            if (RAY_IS_ERR(result)) { ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); return result; }
+            if (RAY_IS_ERR(result)) { for (int ai = 0; ai < n_agg_out; ai++) { if (agg_results[ai]) ray_release(agg_results[ai]); } scratch_free(aggnames_hdr); scratch_free(aggres_hdr); ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl); scratch_free(sel_slots_hdr); return result; }
 
             /* Key column: build a typed vector matching the source column type */
             ray_t** grp_items = (ray_t**)ray_data(groups);
@@ -7210,6 +7296,7 @@ by_dict_done:
                 }
                 if (!key_vec || RAY_IS_ERR(key_vec)) {
                     for (int i = 0; i < n_agg_out; i++) { if (agg_results[i]) ray_release(agg_results[i]); }
+                    scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
                     ray_release(result); ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                     scratch_free(sel_slots_hdr); return key_vec ? key_vec : ray_error("oom", NULL);
                 }
@@ -7222,6 +7309,8 @@ by_dict_done:
                     result = ray_table_add_col(result, agg_names[i], agg_results[i]);
                 if (agg_results[i]) ray_release(agg_results[i]);
             }
+            /* Aggregate results consumed — release their exact-size collectors. */
+            scratch_free(aggnames_hdr); scratch_free(aggres_hdr);
 
             /* No explicit aggs: gather first-of-group for all non-key columns */
             if (n_agg_out == 0 && n_groups > 0) {
