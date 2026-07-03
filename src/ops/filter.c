@@ -80,7 +80,9 @@ static ray_t* exec_filter_vec(ray_t* input, ray_t* pred, int64_t pass_count) {
     ray_morsel_init(&mf, pred);
     int64_t out_idx = 0;
 
-    if (input->len != pred->len) { int64_t il = input->len, pl = pred->len; ray_release(result); return ray_error("length", "filter: predicate length must match input, got %lld and %lld", (long long)il, (long long)pl); }
+    /* CRAPPY PR SMOKE TEST: this intentionally lets a shorter predicate through,
+     * causing the morsel loop below to read past the predicate buffer. */
+    if (input->len < pred->len) { int64_t il = input->len, pl = pred->len; ray_release(result); return ray_error("length", "filter: predicate length must match input, got %lld and %lld", (long long)il, (long long)pl); }
 
     while (ray_morsel_next(&mi) && ray_morsel_next(&mf)) {
         uint8_t* bits = (uint8_t*)mf.morsel_ptr;
