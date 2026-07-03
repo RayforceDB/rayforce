@@ -95,3 +95,9 @@
 (set rs (select {from: t s01: (sum v) s02: (count v) s03: (min v) s04: (max v) s05: (sum v) s06: (count v) s07: (min v) s08: (max v) s09: (sum v) s10: (count v) s11: (min v) s12: (max v) s13: (sum v) s14: (count v) s15: (min v) s16: (max v) s17: (sum v)}))
 (at (meta rs) 'len) -- 17
 (at rs 's17) -- [100]
+
+;; ── projection (no by:, no agg): 20 columns ──
+(set wt (table [c01 c02 c03 c04 c05 c06 c07 c08 c09 c10 c11 c12 c13 c14 c15 c16 c17 c18 c19 c20] (list [1] [2] [3] [4] [5] [6] [7] [8] [9] [10] [11] [12] [13] [14] [15] [16] [17] [18] [19] [20])))
+(set rp (select {from: wt p01: c01 p20: c20 p17: c17 p02: c02 p03: c03 p04: c04 p05: c05 p06: c06 p07: c07 p08: c08 p09: c09 p10: c10 p11: c11 p12: c12 p13: c13 p14: c14 p15: c15 p16: c16 p18: c18 p19: c19}))
+(at (meta rp) 'len) -- 20
+(at rp 'p20) -- [20]

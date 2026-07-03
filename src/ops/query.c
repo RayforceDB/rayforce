@@ -8505,21 +8505,25 @@ by_dict_done:
                 root = ray_group(g, NULL, 0, s_agg_ops, s_agg_ins, (uint8_t)s_n_aggs);
             scratch_free(sagg_hdr);
         } else {
-            /* Projection only (no group by) — select specific columns */
-            ray_op_t* col_ops[16];
-            uint8_t nc = 0;
+            /* Projection only (no group by) — select specific columns.
+             * Exact-size scratch carve bound by select_output_count — the
+             * former fixed col_ops[16] silently routed >16 outputs to the
+             * eval fallback via the width check below; now only the other
+             * use_eval_fallback trigger (a failed compile) applies. */
+            int64_t nc_max = select_output_count(dict_elems, dict_n);
+            if (nc_max < 1) nc_max = 1;
+            ray_t* colops_hdr = NULL;
+            ray_op_t** col_ops = (ray_op_t**)scratch_alloc(&colops_hdr,
+                    (size_t)nc_max * sizeof(ray_op_t*));
+            if (!col_ops) {
+                ray_graph_free(g); ray_release(tbl);
+                scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
+            }
+            int64_t nc = 0;
             int use_eval_fallback = 0;
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id || kid == nearest_id) continue;
-                if (nc >= RAY_GROUP_MAX_SLOTS) {
-                    /* More projection columns than the DAG fast path's fixed
-                     * col_ops[] holds — take the eval fallback, which builds
-                     * the result column-by-column with no fixed cap, rather
-                     * than silently dropping the surplus columns. */
-                    use_eval_fallback = 1;
-                    break;
-                }
                 col_ops[nc] = compile_expr_dag(g, dict_elems[i + 1]);
                 if (!col_ops[nc]) {
                     use_eval_fallback = 1;
@@ -8543,6 +8547,7 @@ by_dict_done:
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
                         if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
                         ray_release(tbl);
+                        scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); return fres ? fres : ray_error("domain", "select: `where:` filter produced no result");
                     }
                     ray_release(tbl);
@@ -8552,6 +8557,7 @@ by_dict_done:
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
                         if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
                         ray_release(tbl);
+                        scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
                     }
                 }
@@ -8560,6 +8566,7 @@ by_dict_done:
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
                     if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
+                    scratch_free(colops_hdr);
                     scratch_free(sel_slots_hdr); return result ? result : ray_error("oom", NULL);
                 }
                 int64_t nrows = ray_table_nrows(tbl);
@@ -8581,6 +8588,7 @@ by_dict_done:
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
                         if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
+                        scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); return err;
                     }
                     /* All output columns must agree in length — a length-changing
@@ -8595,6 +8603,7 @@ by_dict_done:
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
                         if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
+                        scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); return ray_error("length", "select: output column length %lld does not match %lld", (long long)col_len, (long long)out_len);
                     }
                     result = ray_table_add_col(result, kid, col);
@@ -8603,6 +8612,7 @@ by_dict_done:
                         if (nearest_handle_owned) ray_release(nearest_handle_owned);
                         if (nearest_query_owned)  ray_sys_free(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
+                        scratch_free(colops_hdr);
                         scratch_free(sel_slots_hdr); return result;
                     }
                 }
@@ -8611,9 +8621,19 @@ by_dict_done:
                 ray_graph_free(g); ray_release(tbl);
                 result = apply_sort_take(result, dict_elems, dict_n,
                                          asc_id, desc_id, take_id);
+                scratch_free(colops_hdr);
                 scratch_free(sel_slots_hdr); return result;
             } else {
-                root = ray_select_op(g, root, col_ops, nc);
+                /* The op-graph builder carries the column count in uint8_t;
+                 * guard the representational limit before narrowing at the
+                 * call (same shape as the by: path's aggregate-count guard). */
+                if (nc > UINT8_MAX) {
+                    scratch_free(colops_hdr);
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sel_slots_hdr); return ray_error("range", "select: too many projection columns for the op graph (max %d)", UINT8_MAX);
+                }
+                root = ray_select_op(g, root, col_ops, (uint8_t)nc);
+                scratch_free(colops_hdr);
             }
         }
     }
