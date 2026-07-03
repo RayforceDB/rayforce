@@ -43,6 +43,11 @@
 (set rk (select {from: PW c: (count v9) by: {k: k a: v1 b: v2 d: v3 e: v4 f: v5 g: v6 h: v7 i: v8}}))
 (count (at rk 'k)) -- 2
 (sum (at rk 'c)) -- 4
+;; 'i' is the 9th key column (v8, key index 8) — the one slot that overflows
+;; key_syms[8] if the guard regresses.  v8 is constant 8 in every row of both
+;; partitions, so both groups carry i=8; sum is order-independent across the
+;; parted merge.
+(sum (at rk 'i)) -- 16
 
 ;; ─── cleanup ─────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_parted_wide")

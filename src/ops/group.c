@@ -8768,6 +8768,7 @@ ht_path:;
               if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
         for (uint8_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+        if (match_idx_block) ray_release(match_idx_block);
         return ray_error("nyi", NULL);
     }
     /* The HT row-layout reads agg_vecs directly — convert any fused-product
@@ -8779,6 +8780,7 @@ ht_path:;
               if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
         for (uint8_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+        if (match_idx_block) ray_release(match_idx_block);
         return ray_error("oom", NULL);
     }
 

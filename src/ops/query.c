@@ -2246,7 +2246,9 @@ static ray_t* match_count_distinct(ray_t* expr) {
  * whose key is not a clause keyword.  This is the natural bound for all
  * per-output collection arrays in the select compile path (the former
  * fixed-16 slot arrays).  dict_n is the element count of the flattened
- * [k0 v0 k1 v1 ...] view, so outputs <= dict_n/2 <= DICT_VIEW_MAX. */
+ * [k0 v0 k1 v1 ...] view, so outputs <= dict_n/2 <= DICT_VIEW_MAX.
+ * Contract: callers must pass a non-overflowed dict view (dict_n >= 0);
+ * an overflowed view (dict_n == -1) yields 0, which callers clamp to 1. */
 static int64_t select_output_count(ray_t** dict_elems, int64_t dict_n) {
     int64_t from_id    = ray_sym_intern("from",    4);
     int64_t where_id   = ray_sym_intern("where",   5);
@@ -6350,6 +6352,16 @@ by_dict_done:
                     scratch_free(sel_slots_hdr); return dres;
                 }
 
+                /* NOTE: this multi-key count-only pre-take block is currently
+                 * unreachable for any shape that returns a correct result. Since
+                 * the routing change above, every all-count-agg >1-key by:
+                 * answers through the parallel DAG/v2 path instead (see
+                 * test/rfl/query/width_matrix.rfl's ROUTING NOTE on the `rmk`
+                 * cell). The only remaining trigger into this block is a
+                 * RAY_LIST-typed by-key column, which hits a pre-existing
+                 * vec_new(LIST) bug building the key output column. Left in
+                 * place — not correctness-load-bearing — pending a follow-up
+                 * that either fixes the LIST-key case or deletes this block. */
                 int64_t pre_take_groups = nrows;
                 bool has_pre_take = unsorted_positive_take_limit(
                     dict_elems, dict_n, asc_id, desc_id, take_id,
@@ -7601,10 +7613,14 @@ by_dict_done:
          * WHERE materialize path (and, on parted sources, a full column
          * flatten) that its rewritten form no longer needs.  Decompose
          * here, before the routing decisions, and let the compile loop
-         * consume the precomputed rewrites via compound_pos.  The mirror
-         * counter replicates the compile loop's slot accounting exactly:
-         * dag-aggs claim slots in output order and hidden slots share
-         * the 16-slot cap. */
+         * consume the precomputed rewrites via compound_pos.  This pass
+         * also classifies every output for routing: dag-aggs and
+         * decomposed compounds are tallied into n_grp_agg_outputs, a bare
+         * count(distinct sym) sets has_cd_output, and sg_shapes_ok tracks
+         * whether every agg slot seen so far is kernel-shaped.  Everything
+         * else marks has_nonagg_needing_flat.  All per-output arrays are
+         * sized to n_out_max (select_output_count), not a fixed slot
+         * cap. */
         int has_nonagg_needing_flat = 0;
         int n_grp_agg_outputs = 0;   /* dag-aggs + decomposed compounds */
         int has_cd_output = 0;
