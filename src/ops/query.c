@@ -146,18 +146,6 @@ static void dict_pair_view(ray_t* d, ray_t* key_atoms, ray_t** out_elems, int64_
  * `ray_release(tbl); return ray_error("domain", "clause too big");`. */
 #define DICT_VIEW_OVERFLOW(name) ((name##_n) < 0)
 
-/* File-scope keyword id globals for select clauses.  Cached symbol ids for
- * the reserved select keywords: from, where, by, take, asc, desc, nearest.
- * These are populated by ray_select before use in compile-time helper
- * functions like select_output_count and count_agg_subexprs. */
-static int64_t from_id = 0;
-static int64_t where_id = 0;
-static int64_t by_id = 0;
-static int64_t take_id = 0;
-static int64_t asc_id = 0;
-static int64_t desc_id = 0;
-static int64_t nearest_id = 0;
-
 /* Convert a RAY_DICT (keys, vals) into a transient interleaved
  * [k0_atom, v0, k1_atom, v1, …] RAY_LIST.  Used by select's group-by
  * aggregation paths which were written for the old in-place pair-array
@@ -2240,6 +2228,13 @@ static ray_t* match_count_distinct(ray_t* expr) {
  * fixed-16 slot arrays).  dict_n is the element count of the flattened
  * [k0 v0 k1 v1 ...] view, so outputs <= dict_n/2 <= DICT_VIEW_MAX. */
 static int64_t __attribute__((unused)) select_output_count(ray_t** dict_elems, int64_t dict_n) {
+    int64_t from_id    = ray_sym_intern("from",    4);
+    int64_t where_id   = ray_sym_intern("where",   5);
+    int64_t by_id      = ray_sym_intern("by",      2);
+    int64_t take_id    = ray_sym_intern("take",    4);
+    int64_t asc_id     = ray_sym_intern("asc",     3);
+    int64_t desc_id    = ray_sym_intern("desc",    4);
+    int64_t nearest_id = ray_sym_intern("nearest", 7);
     int64_t n = 0;
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
