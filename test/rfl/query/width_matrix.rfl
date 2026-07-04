@@ -282,3 +282,25 @@
 (at rng 'a) -- [2 2]
 (at (at rng 'x) 0) -- [18 19]
 (at (at rng 'x) 1) -- [20 21]
+
+;; ── compact-fallback sym buffer, GENUINE regression probe: WHERE + GROUP
+;; with 16 keys and 33 distinct-column aggs (src/ops/agg_engine.c
+;; agg_build_compact's want[] scratch, formerly a fixed want[48]).  A WHERE
+;; clause forces exec_group_v2_run down AGG_RUN_COMPACT_FALLBACK, which
+;; de-dups every key sym + every agg-input sym into want[]: 16 keys + 33
+;; agg inputs = 49 distinct syms here, one past the old fixed want[48] —
+;; UBSan reported "index 48 out of bounds for type 'int64_t [48]'" and ASan
+;; a stack-buffer-overflow WRITE at agg_engine.c:2768 (agg_build_compact),
+;; called from exec_group_v2_run (agg_engine.c:2692). Fixed by sizing want[]
+;; from an exact carve (n_keys + 2*n_aggs, the structural max before dedup)
+;; instead of a fixed array.
+;; Oracle (hand-derived): all 16 keys are (% (til 100) 2), so every row's
+;; full key tuple is just (row%2) repeated 16x — exactly 2 groups. WHERE
+;; (> v01 10) keeps rows 11..99 (v01 = til 100). Group parity 1 (odd rows
+;; 11,13,...,99) and parity 0 (even rows 12,14,...,98); v33 = til 100, so
+;; sum(s33) over kept rows = sum(11..99) = sum(0..99) - sum(0..10)
+;; = 4950 - 55 = 4895.
+(set wide48 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 v01 v02 v03 v04 v05 v06 v07 v08 v09 v10 v11 v12 v13 v14 v15 v16 v17 v18 v19 v20 v21 v22 v23 v24 v25 v26 v27 v28 v29 v30 v31 v32 v33] (list (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (% (til 100) 2) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100) (til 100))))
+(set r48 (select {from: wide48 s01: (sum v01) s02: (sum v02) s03: (sum v03) s04: (sum v04) s05: (sum v05) s06: (sum v06) s07: (sum v07) s08: (sum v08) s09: (sum v09) s10: (sum v10) s11: (sum v11) s12: (sum v12) s13: (sum v13) s14: (sum v14) s15: (sum v15) s16: (sum v16) s17: (sum v17) s18: (sum v18) s19: (sum v19) s20: (sum v20) s21: (sum v21) s22: (sum v22) s23: (sum v23) s24: (sum v24) s25: (sum v25) s26: (sum v26) s27: (sum v27) s28: (sum v28) s29: (sum v29) s30: (sum v30) s31: (sum v31) s32: (sum v32) s33: (sum v33) where: (> v01 10) by: {k01: k01 k02: k02 k03: k03 k04: k04 k05: k05 k06: k06 k07: k07 k08: k08 k09: k09 k10: k10 k11: k11 k12: k12 k13: k13 k14: k14 k15: k15 k16: k16}}))
+(count (at r48 's33)) -- 2
+(sum (at r48 's33)) -- 4895

@@ -29,9 +29,14 @@ typedef struct {
  * order == first-occurrence order; first_row[gid] records the row where the
  * group first appeared. Returns 0 on success (caller releases out via
  * agg_groups_free()), -1 on allocation failure.
- * n_keys stays uint8_t: every caller reaches this only via a count already
- * bounded <=16 (agg_v2_can_handle's admission) or <=255 (agg_select_distinct's
- * own UINT8_MAX gate in query.c) — see agg_v2_can_handle's comment. */
+ * n_keys stays uint8_t: the interface admits up to 255 (agg_select_distinct's
+ * own UINT8_MAX gate in query.c), but the LIVE bound today is 1..16 for both
+ * callers — the GROUP path via agg_v2_can_handle's admission, and the
+ * keys-only DISTINCT path via the by-dict's own 1..16 cap in query.c (~5203,
+ * "by-dict must have 1..16 keys"), which dominates before nk ever reaches
+ * agg_select_distinct. Cut-3 is the boundary where either gate may lift past
+ * 16, at which point the fixed data[16] inside agg_group_keys must become a
+ * carve. */
 int agg_group_keys(ray_t** key_cols, uint8_t n_keys, int64_t nrows, agg_groups_t* out);
 
 /* Release the buffers an agg_groups_t holds (buddy-backed, NOT libc malloc — so

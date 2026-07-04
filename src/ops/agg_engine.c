@@ -2745,14 +2745,21 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_op_ext_t* ext = find_ext(g, op->id);
 
     /* Collect the distinct syms this group needs from the source table.
-     * want[48]/n_want stay uint8_t: this is a LOCAL de-dup counter bounded by
-     * the fixed want[] array itself (<=16 keys + <=16 aggs*2 inputs today), not
-     * a copy of ext->n_keys/n_aggs — unrelated to the count-field sweep. */
-    int64_t want[48]; uint8_t n_want = 0;   /* <=16 keys + <=16 aggs*2 inputs */
+     * want/n_want is a LOCAL de-dup counter/scratch, sized exactly to the
+     * structural maximum before dedup: every key (ext->n_keys, admission-
+     * bounded <=16 today) plus up to 2 input syms per agg (ext->n_aggs,
+     * gated <=255 today via the compile-time UINT8_MAX check but NOT capped
+     * at 16 — a WHERE-filtered group with >48 distinct key/agg syms used to
+     * overflow the old fixed want[48] here; see width_matrix.rfl). */
+    size_t want_cap = (size_t)ext->n_keys + 2 * (size_t)ext->n_aggs;
+    ray_t* want_hdr = NULL;
+    int64_t* want = (int64_t*)scratch_alloc(&want_hdr, want_cap * sizeof(int64_t));
+    if (want_cap && !want) return ray_error("oom", NULL);
+    uint32_t n_want = 0;
     for (uint32_t k = 0; k < ext->n_keys; k++) {
         int64_t s = find_ext(g, ext->keys[k])->sym;
         bool seen = false;
-        for (uint8_t i = 0; i < n_want; i++) if (want[i] == s) { seen = true; break; }
+        for (uint32_t i = 0; i < n_want; i++) if (want[i] == s) { seen = true; break; }
         if (!seen) want[n_want++] = s;
     }
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
@@ -2764,22 +2771,29 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (!ins[j]) continue;
             int64_t s = find_ext(g, ins[j]->id)->sym;
             bool seen = false;
-            for (uint8_t i = 0; i < n_want; i++) if (want[i] == s) { seen = true; break; }
+            for (uint32_t i = 0; i < n_want; i++) if (want[i] == s) { seen = true; break; }
             if (!seen) want[n_want++] = s;
         }
     }
 
     ray_t* compact = ray_table_new(n_want);
-    if (!compact || RAY_IS_ERR(compact)) return compact ? compact : ray_error("oom", NULL);
-    for (uint8_t i = 0; i < n_want; i++) {
+    if (!compact || RAY_IS_ERR(compact)) {
+        scratch_free(want_hdr);
+        return compact ? compact : ray_error("oom", NULL);
+    }
+    for (uint32_t i = 0; i < n_want; i++) {
         ray_t* src = ray_table_get_col(tbl, want[i]);
-        if (!src) { ray_release(compact); return ray_error("nyi", NULL); }
+        if (!src) { ray_release(compact); scratch_free(want_hdr); return ray_error("nyi", NULL); }
         ray_t* gcol = gather_by_idx(src, idx, n_sel);   /* fresh, no alias */
-        if (!gcol || RAY_IS_ERR(gcol)) { ray_release(compact); return gcol ? gcol : ray_error("oom", NULL); }
+        if (!gcol || RAY_IS_ERR(gcol)) {
+            ray_release(compact); scratch_free(want_hdr);
+            return gcol ? gcol : ray_error("oom", NULL);
+        }
         compact = ray_table_add_col(compact, want[i], gcol);  /* retains gcol */
         ray_release(gcol);                                    /* drop our ref */
-        if (!compact || RAY_IS_ERR(compact)) return compact ? compact : ray_error("oom", NULL);
+        if (!compact || RAY_IS_ERR(compact)) { scratch_free(want_hdr); return compact ? compact : ray_error("oom", NULL); }
     }
+    scratch_free(want_hdr);
     return compact;
 }
 
@@ -2991,7 +3005,14 @@ static inline int agg_key_eq_at(ray_t* col, const void* data, int64_t a, int64_t
 }
 
 int agg_group_keys(ray_t** key_cols, uint8_t n_keys, int64_t nrows, agg_groups_t* out) {
-    const void* data[16];   /* [16]: protected by agg_v2_can_handle's 1..16-key admission (cut-3 boundary) */
+    /* [16]: bounded today by two independent callers — the GROUP path via
+     * agg_v2_can_handle's 1..16-key admission, and the keys-only DISTINCT
+     * path (agg_select_distinct, query.c:6348) via the by-dict's own 1..16
+     * cap ("by-dict must have 1..16 keys", query.c ~5203), which dominates
+     * that whole call chain (verified empirically: a 17-key by: errors
+     * there, never reaching this function). Neither caller passes nk beyond
+     * 16 today. When cut-3 lifts either gate, this must become a carve. */
+    const void* data[16];
     for (uint32_t k = 0; k < n_keys; k++) data[k] = ray_data(key_cols[k]);
 
     /* hash table capacity: next pow2 >= 2*nrows, min 16 */
