@@ -28,7 +28,10 @@ typedef struct {
  * SYM) and hashes the tuple. Assigns gids incrementally on first sight → gid
  * order == first-occurrence order; first_row[gid] records the row where the
  * group first appeared. Returns 0 on success (caller releases out via
- * agg_groups_free()), -1 on allocation failure. */
+ * agg_groups_free()), -1 on allocation failure.
+ * n_keys stays uint8_t: every caller reaches this only via a count already
+ * bounded <=16 (agg_v2_can_handle's admission) or <=255 (agg_select_distinct's
+ * own UINT8_MAX gate in query.c) — see agg_v2_can_handle's comment. */
 int agg_group_keys(ray_t** key_cols, uint8_t n_keys, int64_t nrows, agg_groups_t* out);
 
 /* Release the buffers an agg_groups_t holds (buddy-backed, NOT libc malloc — so
@@ -41,7 +44,10 @@ void agg_groups_free(agg_groups_t* out);
  * interning).  See agg_engine.c.  Precondition (caller-gated): keys are int/SYM
  * and every tbl column is fixed-width/SYM/STR/LIST.  Caller owns the table.
  * keep_syms (or NULL) lists the column syms a consumer references — non-key
- * columns NOT in it are dropped (projection pushdown); keys are always kept. */
+ * columns NOT in it are dropped (projection pushdown); keys are always kept.
+ * nk stays uint8_t: query.c's only caller gates `nk > UINT8_MAX` before the
+ * call (its own MIGRATION GATE — falls through to the composite path beyond
+ * 255 keys), so this parameter never sees a truncated value. */
 ray_t* agg_select_distinct(ray_t* tbl, ray_t** key_cols, const int64_t* key_syms,
                            uint8_t nk, int64_t nrows,
                            const int64_t* keep_syms, int keep_n);
@@ -62,10 +68,10 @@ ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
 
 typedef struct {
     bool     ok;
-    uint8_t  n_keys;
-    int64_t  mins[16];      /* per-key min */
-    int64_t  ranges[16];    /* per-key (max-min+1) */
-    int64_t  strides[16];   /* composite packing: slot = sum_k (key_k - min_k)*strides[k] */
+    uint32_t n_keys;        /* mirrors ext->n_keys' width; value stays 1..16 */
+    int64_t  mins[16];      /* [16]: protected by agg_v2_can_handle's 1..16-key admission (cut-3 boundary) */
+    int64_t  ranges[16];    /* [16]: protected by agg_v2_can_handle's 1..16-key admission (cut-3 boundary) */
+    int64_t  strides[16];   /* [16]: protected by agg_v2_can_handle's 1..16-key admission (cut-3 boundary); composite packing: slot = sum_k (key_k - min_k)*strides[k] */
     int64_t  total_slots;   /* product of ranges */
 } dense_plan_t;
 
@@ -73,9 +79,13 @@ typedef struct {
  *  - every key type in {I64,I32,I16,U8,BOOL,DATE,TIME,TIMESTAMP,SYM} and NOT HAS_NULLS
  *  - every agg vtable is ACC_STREAMING (no buffered median/top)
  *  - product of per-key ranges <= DENSE_MAX_SLOTS (no overflow)
- * Does one min/max prescan over the key columns.  Sets out->ok accordingly. */
+ * Does one min/max prescan over the key columns.  Sets out->ok accordingly.
+ * n_keys stays uint8_t: only ever called with ext->n_keys post agg_v2_can_handle's
+ * 1..16 admission (dense direct-index routing bound; wider shapes take the hash
+ * path) — see agg_v2_can_handle's comment.  n_aggs is unused by dense eligibility
+ * (kept uint32_t so a widened ext->n_aggs never narrows at this call). */
 bool agg_dense_plan(ray_t** key_cols, uint8_t n_keys,
-                    const agg_vtable_t** vts, uint8_t n_aggs,
+                    const agg_vtable_t** vts, uint32_t n_aggs,
                     int64_t nrows, dense_plan_t* out);
 
 /* Result column name for a plain-column-input aggregate: input column name
