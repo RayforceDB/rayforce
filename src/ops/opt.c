@@ -148,21 +148,21 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
         if (ext) {
             switch (n->opcode) {
                 case OP_GROUP:
-                    for (uint8_t k = 0; k < ext->n_keys; k++)
+                    for (uint32_t k = 0; k < ext->n_keys; k++)
                         if (op_node(g, ext->keys[k]) && !visited[ext->keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->keys[k];
-                    for (uint8_t a = 0; a < ext->n_aggs; a++)
+                    for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !visited[ext->agg_ins[a]] && sp < (int)stack_cap)
                             stack[sp++] = ext->agg_ins[a];
                     break;
                 case OP_SORT:
                 case OP_SELECT:
-                    for (uint8_t k = 0; k < ext->sort.n_cols; k++)
+                    for (uint32_t k = 0; k < ext->sort.n_cols; k++)
                         if (op_node(g, ext->sort.columns[k]) && !visited[ext->sort.columns[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->sort.columns[k];
                     break;
                 case OP_JOIN:
-                    for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                    for (uint32_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (op_node(g, ext->join.left_keys[k]) && !visited[ext->join.left_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->join.left_keys[k];
                         if (ext->join.right_keys && op_node(g, ext->join.right_keys[k]) &&
@@ -175,7 +175,7 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
                     if (wj_ext) {
                         if (op_node(g, wj_ext->asof.time_key) && !visited[wj_ext->asof.time_key] && sp < (int)stack_cap)
                             stack[sp++] = wj_ext->asof.time_key;
-                        for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
+                        for (uint32_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
                             if (op_node(g, wj_ext->asof.eq_keys[k]) && !visited[wj_ext->asof.eq_keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = wj_ext->asof.eq_keys[k];
                         }
@@ -183,13 +183,13 @@ static void pass_type_inference(ray_graph_t* g, ray_op_t* root) {
                     break;
                 }
                 case OP_WINDOW:
-                    for (uint8_t k = 0; k < ext->window.n_part_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_part_keys; k++)
                         if (op_node(g, ext->window.part_keys[k]) && !visited[ext->window.part_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.part_keys[k];
-                    for (uint8_t k = 0; k < ext->window.n_order_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_order_keys; k++)
                         if (op_node(g, ext->window.order_keys[k]) && !visited[ext->window.order_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.order_keys[k];
-                    for (uint8_t f = 0; f < ext->window.n_funcs; f++)
+                    for (uint32_t f = 0; f < ext->window.n_funcs; f++)
                         if (op_node(g, ext->window.func_inputs[f]) && !visited[ext->window.func_inputs[f]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.func_inputs[f];
                     break;
@@ -670,21 +670,21 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
         if (ext) {
             switch (n->opcode) {
                 case OP_GROUP:
-                    for (uint8_t k = 0; k < ext->n_keys; k++)
+                    for (uint32_t k = 0; k < ext->n_keys; k++)
                         if (op_node(g, ext->keys[k]) && !visited[ext->keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->keys[k];
-                    for (uint8_t a = 0; a < ext->n_aggs; a++)
+                    for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !visited[ext->agg_ins[a]] && sp < (int)stack_cap)
                             stack[sp++] = ext->agg_ins[a];
                     break;
                 case OP_SORT:
                 case OP_SELECT:
-                    for (uint8_t k = 0; k < ext->sort.n_cols; k++)
+                    for (uint32_t k = 0; k < ext->sort.n_cols; k++)
                         if (op_node(g, ext->sort.columns[k]) && !visited[ext->sort.columns[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->sort.columns[k];
                     break;
                 case OP_JOIN:
-                    for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                    for (uint32_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (op_node(g, ext->join.left_keys[k]) && !visited[ext->join.left_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->join.left_keys[k];
                         if (ext->join.right_keys && op_node(g, ext->join.right_keys[k]) &&
@@ -697,7 +697,7 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
                     if (wj_ext) {
                         if (op_node(g, wj_ext->asof.time_key) && !visited[wj_ext->asof.time_key] && sp < (int)stack_cap)
                             stack[sp++] = wj_ext->asof.time_key;
-                        for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
+                        for (uint32_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
                             if (op_node(g, wj_ext->asof.eq_keys[k]) && !visited[wj_ext->asof.eq_keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = wj_ext->asof.eq_keys[k];
                         }
@@ -705,13 +705,13 @@ static void pass_constant_fold(ray_graph_t* g, ray_op_t* root) {
                     break;
                 }
                 case OP_WINDOW:
-                    for (uint8_t k = 0; k < ext->window.n_part_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_part_keys; k++)
                         if (op_node(g, ext->window.part_keys[k]) && !visited[ext->window.part_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.part_keys[k];
-                    for (uint8_t k = 0; k < ext->window.n_order_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_order_keys; k++)
                         if (op_node(g, ext->window.order_keys[k]) && !visited[ext->window.order_keys[k]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.order_keys[k];
-                    for (uint8_t f = 0; f < ext->window.n_funcs; f++)
+                    for (uint32_t f = 0; f < ext->window.n_funcs; f++)
                         if (op_node(g, ext->window.func_inputs[f]) && !visited[ext->window.func_inputs[f]] && sp < (int)stack_cap)
                             stack[sp++] = ext->window.func_inputs[f];
                     break;
@@ -814,25 +814,25 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
             if (ext) {
                 switch (n->opcode) {
                     case OP_GROUP:
-                        for (uint8_t k = 0; k < ext->n_keys; k++) {
+                        for (uint32_t k = 0; k < ext->n_keys; k++) {
                             if (op_node(g, ext->keys[k]) && !live[ext->keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->keys[k];
                         }
-                        for (uint8_t a = 0; a < ext->n_aggs; a++) {
+                        for (uint32_t a = 0; a < ext->n_aggs; a++) {
                             if (op_node(g, ext->agg_ins[a]) && !live[ext->agg_ins[a]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->agg_ins[a];
                         }
                         break;
                     case OP_SORT:
                     case OP_SELECT:
-                        for (uint8_t k = 0; k < ext->sort.n_cols; k++) {
+                        for (uint32_t k = 0; k < ext->sort.n_cols; k++) {
                             if (op_node(g, ext->sort.columns[k]) && !live[ext->sort.columns[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->sort.columns[k];
                         }
                         break;
                     case OP_JOIN:
                     case OP_ANTIJOIN:
-                        for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                        for (uint32_t k = 0; k < ext->join.n_join_keys; k++) {
                             if (op_node(g, ext->join.left_keys[k]) && !live[ext->join.left_keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->join.left_keys[k];
                             if (ext->join.right_keys && op_node(g, ext->join.right_keys[k]) &&
@@ -841,7 +841,7 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
                         }
                         break;
                     case OP_PIVOT:
-                        for (uint8_t k = 0; k < ext->pivot.n_index; k++) {
+                        for (uint32_t k = 0; k < ext->pivot.n_index; k++) {
                             if (op_node(g, ext->pivot.index_cols[k]) && !live[ext->pivot.index_cols[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->pivot.index_cols[k];
                         }
@@ -855,7 +855,7 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
                         if (wj_ext) {
                             if (op_node(g, wj_ext->asof.time_key) && !live[wj_ext->asof.time_key] && sp < (int)stack_cap)
                                 stack[sp++] = wj_ext->asof.time_key;
-                            for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
+                            for (uint32_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
                                 if (op_node(g, wj_ext->asof.eq_keys[k]) && !live[wj_ext->asof.eq_keys[k]] && sp < (int)stack_cap)
                                     stack[sp++] = wj_ext->asof.eq_keys[k];
                             }
@@ -863,15 +863,15 @@ static void mark_live(ray_graph_t* g, ray_op_t* root, bool* live) {
                         break;
                     }
                     case OP_WINDOW:
-                        for (uint8_t k = 0; k < ext->window.n_part_keys; k++) {
+                        for (uint32_t k = 0; k < ext->window.n_part_keys; k++) {
                             if (op_node(g, ext->window.part_keys[k]) && !live[ext->window.part_keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->window.part_keys[k];
                         }
-                        for (uint8_t k = 0; k < ext->window.n_order_keys; k++) {
+                        for (uint32_t k = 0; k < ext->window.n_order_keys; k++) {
                             if (op_node(g, ext->window.order_keys[k]) && !live[ext->window.order_keys[k]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->window.order_keys[k];
                         }
-                        for (uint8_t f = 0; f < ext->window.n_funcs; f++) {
+                        for (uint32_t f = 0; f < ext->window.n_funcs; f++) {
                             if (op_node(g, ext->window.func_inputs[f]) && !live[ext->window.func_inputs[f]] && sp < (int)stack_cap)
                                 stack[sp++] = ext->window.func_inputs[f];
                         }
@@ -1296,7 +1296,7 @@ static ray_op_t* pass_predicate_pushdown(ray_graph_t* g, ray_op_t* root) {
                 {
                     int64_t src_sym = ray_sym_intern("_src", 4);
                     bool is_fact = false;
-                    for (uint8_t kk = 0; kk < gext->n_keys; kk++) {
+                    for (uint32_t kk = 0; kk < gext->n_keys; kk++) {
                         ray_op_ext_t* ke = op_node(g, gext->keys[kk])
                             ? find_ext(g, gext->keys[kk]) : NULL;
                         if (ke && ke->base.opcode == OP_SCAN &&
@@ -1312,7 +1312,7 @@ static ray_op_t* pass_predicate_pushdown(ray_graph_t* g, ray_op_t* root) {
                     ray_op_ext_t* sext = find_ext(g, scan_ids[s]);
                     if (!sext) { keys_only = false; break; }
                     bool matched = false;
-                    for (uint8_t kk = 0; kk < gext->n_keys; kk++) {
+                    for (uint32_t kk = 0; kk < gext->n_keys; kk++) {
                         ray_op_t* kop = op_node(g, gext->keys[kk]);
                         if (!kop || kop->opcode != OP_SCAN) continue;
                         ray_op_ext_t* kext = find_ext(g, gext->keys[kk]);
@@ -1722,12 +1722,12 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
         if (ext) {
             switch (n->opcode) {
                 case OP_GROUP:
-                    for (uint8_t k = 0; k < ext->n_keys; k++)
+                    for (uint32_t k = 0; k < ext->n_keys; k++)
                         if (op_node(g, ext->keys[k]) && !live[ext->keys[k]]) {
                             live[ext->keys[k]] = true;
                             if (qt < (int)nc) q[qt++] = ext->keys[k];
                         }
-                    for (uint8_t a = 0; a < ext->n_aggs; a++)
+                    for (uint32_t a = 0; a < ext->n_aggs; a++)
                         if (op_node(g, ext->agg_ins[a]) && !live[ext->agg_ins[a]]) {
                             live[ext->agg_ins[a]] = true;
                             if (qt < (int)nc) q[qt++] = ext->agg_ins[a];
@@ -1735,14 +1735,14 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
                     break;
                 case OP_SORT:
                 case OP_SELECT:
-                    for (uint8_t k = 0; k < ext->sort.n_cols; k++)
+                    for (uint32_t k = 0; k < ext->sort.n_cols; k++)
                         if (op_node(g, ext->sort.columns[k]) && !live[ext->sort.columns[k]]) {
                             live[ext->sort.columns[k]] = true;
                             if (qt < (int)nc) q[qt++] = ext->sort.columns[k];
                         }
                     break;
                 case OP_JOIN:
-                    for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
+                    for (uint32_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (op_node(g, ext->join.left_keys[k]) && !live[ext->join.left_keys[k]]) {
                             live[ext->join.left_keys[k]] = true;
                             if (qt < (int)nc) q[qt++] = ext->join.left_keys[k];
@@ -1761,7 +1761,7 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
                             live[wj_ext->asof.time_key] = true;
                             if (qt < (int)nc) q[qt++] = wj_ext->asof.time_key;
                         }
-                        for (uint8_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
+                        for (uint32_t k = 0; k < wj_ext->asof.n_eq_keys; k++) {
                             if (op_node(g, wj_ext->asof.eq_keys[k]) && !live[wj_ext->asof.eq_keys[k]]) {
                                 live[wj_ext->asof.eq_keys[k]] = true;
                                 if (qt < (int)nc) q[qt++] = wj_ext->asof.eq_keys[k];
@@ -1771,17 +1771,17 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
                     break;
                 }
                 case OP_WINDOW:
-                    for (uint8_t k = 0; k < ext->window.n_part_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_part_keys; k++)
                         if (op_node(g, ext->window.part_keys[k]) && !live[ext->window.part_keys[k]]) {
                             live[ext->window.part_keys[k]] = true;
                             if (qt < (int)nc) q[qt++] = ext->window.part_keys[k];
                         }
-                    for (uint8_t k = 0; k < ext->window.n_order_keys; k++)
+                    for (uint32_t k = 0; k < ext->window.n_order_keys; k++)
                         if (op_node(g, ext->window.order_keys[k]) && !live[ext->window.order_keys[k]]) {
                             live[ext->window.order_keys[k]] = true;
                             if (qt < (int)nc) q[qt++] = ext->window.order_keys[k];
                         }
-                    for (uint8_t f = 0; f < ext->window.n_funcs; f++)
+                    for (uint32_t f = 0; f < ext->window.n_funcs; f++)
                         if (op_node(g, ext->window.func_inputs[f]) && !live[ext->window.func_inputs[f]]) {
                             live[ext->window.func_inputs[f]] = true;
                             if (qt < (int)nc) q[qt++] = ext->window.func_inputs[f];

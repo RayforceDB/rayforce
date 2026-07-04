@@ -644,17 +644,19 @@ ray_op_t* ray_filter(ray_graph_t* g, ray_op_t* input, ray_op_t* predicate) {
 
 ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
                      ray_op_t** keys, uint8_t* descs, uint8_t* nulls_first,
-                     uint8_t n_cols) {
+                     uint32_t n_cols) {
     uint32_t table_id = table_node->id;
-    /* L5: n_cols is uint8_t (max 255) so 256-element array is always sufficient. */
-    uint32_t key_ids[256];
-    for (uint8_t i = 0; i < n_cols; i++) key_ids[i] = keys[i]->id;
+    ray_t* ids_hdr = NULL;
+    uint32_t* key_ids = (uint32_t*)scratch_alloc(&ids_hdr,
+                            (size_t)(n_cols ? n_cols : 1) * sizeof(uint32_t));
+    if (!key_ids) return NULL;
+    for (uint32_t i = 0; i < n_cols; i++) key_ids[i] = keys[i]->id;
 
     size_t keys_sz = (size_t)n_cols * sizeof(ray_op_t*);
     size_t descs_sz = (size_t)n_cols;
     size_t nf_sz = (size_t)n_cols;
     ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, keys_sz + descs_sz + nf_sz);
-    if (!ext) return NULL;
+    if (!ext) { scratch_free(ids_hdr); return NULL; }
 
     table_node = &g->nodes[table_id];
 
@@ -667,7 +669,7 @@ ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
     /* Arrays embedded in trailing space — freed with ext node */
     char* trail = EXT_TRAIL(ext);
     ext->sort.columns = (uint32_t*)trail;
-    for (uint8_t i = 0; i < n_cols; i++)
+    for (uint32_t i = 0; i < n_cols; i++)
         ext->sort.columns[i] = key_ids[i];
     ext->sort.desc = (uint8_t*)(trail + keys_sz);
     memcpy(ext->sort.desc, descs, descs_sz);
@@ -676,11 +678,12 @@ ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
         memcpy(ext->sort.nulls_first, nulls_first, nf_sz);
     } else {
         /* Default: NULLS LAST for ASC, NULLS FIRST for DESC */
-        for (uint8_t i = 0; i < n_cols; i++)
+        for (uint32_t i = 0; i < n_cols; i++)
             ext->sort.nulls_first[i] = descs[i] ? 1 : 0;
     }
     ext->sort.n_cols = n_cols;
 
+    scratch_free(ids_hdr);
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
 }
@@ -689,17 +692,24 @@ ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
  * no binary aggs; otherwise must be the same length as agg_ins (NULL
  * slots for unary aggs, non-NULL for OP_PEARSON_CORR slots).  agg_k NULL
  * → no scalar params; otherwise length n_aggs (0 in slots without). */
-static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                                 uint16_t* agg_ops, ray_op_t** agg_ins,
                                 ray_op_t** agg_ins2, const int64_t* agg_k,
-                                uint8_t n_aggs) {
-    uint32_t key_ids[256];
-    uint32_t agg_ids[256];
-    uint32_t agg_ids2[256];  /* parallel to agg_ids; 0 when no second input */
+                                uint32_t n_aggs) {
+    /* One carve for all three id arrays (key_ids/agg_ids/agg_ids2 are all
+     * uint32_t, so a single flat buffer sliced by offset suffices). */
+    ray_t* ids_hdr = NULL;
+    size_t ids_elems = (size_t)n_keys + (size_t)n_aggs * 2;
+    uint32_t* ids_buf = (uint32_t*)scratch_alloc(&ids_hdr,
+                            (ids_elems ? ids_elems : 1) * sizeof(uint32_t));
+    if (!ids_buf) return NULL;
+    uint32_t* key_ids  = ids_buf;
+    uint32_t* agg_ids  = ids_buf + n_keys;
+    uint32_t* agg_ids2 = ids_buf + n_keys + n_aggs;  /* parallel to agg_ids; 0 when no second input */
     bool has_ins2 = false;
     bool has_k = false;
-    for (uint8_t i = 0; i < n_keys; i++) key_ids[i] = keys[i]->id;
-    for (uint8_t i = 0; i < n_aggs; i++) {
+    for (uint32_t i = 0; i < n_keys; i++) key_ids[i] = keys[i]->id;
+    for (uint32_t i = 0; i < n_aggs; i++) {
         agg_ids[i]  = agg_ins[i]->id;
         agg_ids2[i] = RAY_OP_NONE;
         if (agg_ins2 && agg_ins2[i]) {
@@ -724,7 +734,7 @@ static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
     /* Round k_off up to int64 alignment */
     k_off = (k_off + sizeof(int64_t) - 1) & ~(sizeof(int64_t) - 1);
     ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, k_off + k_sz);
-    if (!ext) return NULL;
+    if (!ext) { scratch_free(ids_hdr); return NULL; }
 
     ext->base.opcode = OP_GROUP;
     ext->base.arity = 0;
@@ -736,23 +746,23 @@ static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
     /* Arrays embedded in trailing space — freed with ext node */
     char* trail = EXT_TRAIL(ext);
     ext->keys = (uint32_t*)trail;
-    for (uint8_t i = 0; i < n_keys; i++)
+    for (uint32_t i = 0; i < n_keys; i++)
         ext->keys[i] = key_ids[i];
     ext->agg_ops = (uint16_t*)(trail + ops_off);
     if (ops_sz > 0) memcpy(ext->agg_ops, agg_ops, ops_sz);
     ext->agg_ins = (uint32_t*)(trail + ins_off);
-    for (uint8_t i = 0; i < n_aggs; i++)
+    for (uint32_t i = 0; i < n_aggs; i++)
         ext->agg_ins[i] = agg_ids[i];
     if (has_ins2) {
         ext->agg_ins2 = (uint32_t*)(trail + ins2_off);
-        for (uint8_t i = 0; i < n_aggs; i++)
+        for (uint32_t i = 0; i < n_aggs; i++)
             ext->agg_ins2[i] = agg_ids2[i] != RAY_OP_NONE ? agg_ids2[i] : RAY_OP_NONE;
     } else {
         ext->agg_ins2 = NULL;
     }
     if (has_k) {
         ext->agg_k = (int64_t*)(trail + k_off);
-        for (uint8_t i = 0; i < n_aggs; i++)
+        for (uint32_t i = 0; i < n_aggs; i++)
             ext->agg_k[i] = agg_k ? agg_k[i] : 0;
     } else {
         ext->agg_k = NULL;
@@ -760,45 +770,49 @@ static ray_op_t* ray_group_impl(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
     ext->n_keys = n_keys;
     ext->n_aggs = n_aggs;
 
+    scratch_free(ids_hdr);
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
 }
 
-ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
-                   uint16_t* agg_ops, ray_op_t** agg_ins, uint8_t n_aggs) {
+ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
+                   uint16_t* agg_ops, ray_op_t** agg_ins, uint32_t n_aggs) {
     return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, NULL, NULL, n_aggs);
 }
 
-ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
-                     ray_op_t** agg_ins2, uint8_t n_aggs) {
+                     ray_op_t** agg_ins2, uint32_t n_aggs) {
     return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, agg_ins2, NULL, n_aggs);
 }
 
-ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
                      ray_op_t** agg_ins2, const int64_t* agg_k,
-                     uint8_t n_aggs) {
+                     uint32_t n_aggs) {
     return ray_group_impl(g, keys, n_keys, agg_ops, agg_ins, agg_ins2, agg_k, n_aggs);
 }
 
-ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys) {
+ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys) {
     return ray_group(g, keys, n_keys, NULL, NULL, 0);
 }
 
 ray_op_t* ray_pivot_op(ray_graph_t* g,
-                       ray_op_t** index_cols, uint8_t n_index,
+                       ray_op_t** index_cols, uint32_t n_index,
                        ray_op_t* pivot_col,
                        ray_op_t* value_col,
                        uint16_t agg_op) {
-    uint32_t idx_ids[16];
-    for (uint8_t i = 0; i < n_index; i++) idx_ids[i] = index_cols[i]->id;
+    ray_t* idx_hdr = NULL;
+    uint32_t* idx_ids = (uint32_t*)scratch_alloc(&idx_hdr,
+                            (size_t)(n_index ? n_index : 1) * sizeof(uint32_t));
+    if (!idx_ids) return NULL;
+    for (uint32_t i = 0; i < n_index; i++) idx_ids[i] = index_cols[i]->id;
     uint32_t pcol_id = pivot_col->id;
     uint32_t vcol_id = value_col->id;
 
     size_t idx_sz = (size_t)n_index * sizeof(ray_op_t*);
     ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, idx_sz);
-    if (!ext) return NULL;
+    if (!ext) { scratch_free(idx_hdr); return NULL; }
 
     ext->base.opcode = OP_PIVOT;
     ext->base.arity = 0;
@@ -807,13 +821,14 @@ ray_op_t* ray_pivot_op(ray_graph_t* g,
 
     char* trail = EXT_TRAIL(ext);
     ext->pivot.index_cols = (uint32_t*)trail;
-    for (uint8_t i = 0; i < n_index; i++)
+    for (uint32_t i = 0; i < n_index; i++)
         ext->pivot.index_cols[i] = idx_ids[i];
     ext->pivot.pivot_col = pcol_id;
     ext->pivot.value_col = vcol_id;
     ext->pivot.agg_op = agg_op;
     ext->pivot.n_index = n_index;
 
+    scratch_free(idx_hdr);
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
 }
@@ -821,19 +836,24 @@ ray_op_t* ray_pivot_op(ray_graph_t* g,
 ray_op_t* ray_join(ray_graph_t* g,
                   ray_op_t* left_table, ray_op_t** left_keys,
                   ray_op_t* right_table, ray_op_t** right_keys,
-                  uint8_t n_keys, uint8_t join_type) {
+                  uint32_t n_keys, uint8_t join_type) {
     uint32_t left_table_id = left_table->id;
     uint32_t right_table_id = right_table->id;
-    uint32_t lkey_ids[256];
-    uint32_t rkey_ids[256];
-    for (uint8_t i = 0; i < n_keys; i++) {
+    ray_t* keyids_hdr = NULL;
+    size_t keyids_elems = (size_t)n_keys * 2;
+    uint32_t* keyids_buf = (uint32_t*)scratch_alloc(&keyids_hdr,
+                            (keyids_elems ? keyids_elems : 1) * sizeof(uint32_t));
+    if (!keyids_buf) return NULL;
+    uint32_t* lkey_ids = keyids_buf;
+    uint32_t* rkey_ids = keyids_buf + n_keys;
+    for (uint32_t i = 0; i < n_keys; i++) {
         lkey_ids[i] = left_keys[i]->id;
         rkey_ids[i] = right_keys[i]->id;
     }
 
     size_t keys_sz = (size_t)n_keys * sizeof(ray_op_t*);
     ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, keys_sz * 2);
-    if (!ext) return NULL;
+    if (!ext) { scratch_free(keyids_hdr); return NULL; }
 
     left_table = &g->nodes[left_table_id];
     right_table = &g->nodes[right_table_id];
@@ -848,14 +868,15 @@ ray_op_t* ray_join(ray_graph_t* g,
     /* Arrays embedded in trailing space — freed with ext node */
     char* trail = EXT_TRAIL(ext);
     ext->join.left_keys = (uint32_t*)trail;
-    for (uint8_t i = 0; i < n_keys; i++)
+    for (uint32_t i = 0; i < n_keys; i++)
         ext->join.left_keys[i] = lkey_ids[i];
     ext->join.right_keys = (uint32_t*)(trail + (size_t)n_keys * sizeof(ray_op_t*));
-    for (uint8_t i = 0; i < n_keys; i++)
+    for (uint32_t i = 0; i < n_keys; i++)
         ext->join.right_keys[i] = rkey_ids[i];
     ext->join.n_join_keys = n_keys;
     ext->join.join_type = join_type;
 
+    scratch_free(keyids_hdr);
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
 }
@@ -863,19 +884,24 @@ ray_op_t* ray_join(ray_graph_t* g,
 ray_op_t* ray_antijoin(ray_graph_t* g,
                       ray_op_t* left_table, ray_op_t** left_keys,
                       ray_op_t* right_table, ray_op_t** right_keys,
-                      uint8_t n_keys) {
+                      uint32_t n_keys) {
     uint32_t left_table_id = left_table->id;
     uint32_t right_table_id = right_table->id;
-    uint32_t lkey_ids[256];
-    uint32_t rkey_ids[256];
-    for (uint8_t i = 0; i < n_keys; i++) {
+    ray_t* keyids_hdr = NULL;
+    size_t keyids_elems = (size_t)n_keys * 2;
+    uint32_t* keyids_buf = (uint32_t*)scratch_alloc(&keyids_hdr,
+                            (keyids_elems ? keyids_elems : 1) * sizeof(uint32_t));
+    if (!keyids_buf) return NULL;
+    uint32_t* lkey_ids = keyids_buf;
+    uint32_t* rkey_ids = keyids_buf + n_keys;
+    for (uint32_t i = 0; i < n_keys; i++) {
         lkey_ids[i] = left_keys[i]->id;
         rkey_ids[i] = right_keys[i]->id;
     }
 
     size_t keys_sz = (size_t)n_keys * sizeof(ray_op_t*);
     ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, keys_sz * 2);
-    if (!ext) return NULL;
+    if (!ext) { scratch_free(keyids_hdr); return NULL; }
 
     left_table = &g->nodes[left_table_id];
     right_table = &g->nodes[right_table_id];
@@ -889,14 +915,15 @@ ray_op_t* ray_antijoin(ray_graph_t* g,
 
     char* trail = EXT_TRAIL(ext);
     ext->join.left_keys = (uint32_t*)trail;
-    for (uint8_t i = 0; i < n_keys; i++)
+    for (uint32_t i = 0; i < n_keys; i++)
         ext->join.left_keys[i] = lkey_ids[i];
     ext->join.right_keys = (uint32_t*)(trail + (size_t)n_keys * sizeof(ray_op_t*));
-    for (uint8_t i = 0; i < n_keys; i++)
+    for (uint32_t i = 0; i < n_keys; i++)
         ext->join.right_keys[i] = rkey_ids[i];
     ext->join.n_join_keys = n_keys;
     ext->join.join_type = 3;  /* anti */
 
+    scratch_free(keyids_hdr);
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
 }
@@ -904,18 +931,21 @@ ray_op_t* ray_antijoin(ray_graph_t* g,
 ray_op_t* ray_asof_join(ray_graph_t* g,
                        ray_op_t* left_table, ray_op_t* right_table,
                        ray_op_t* time_key,
-                       ray_op_t** eq_keys, uint8_t n_eq_keys,
+                       ray_op_t** eq_keys, uint32_t n_eq_keys,
                        uint8_t join_type) {
     uint32_t left_id  = left_table->id;
     uint32_t right_id = right_table->id;
     uint32_t time_id  = time_key->id;
-    uint32_t eq_ids[256];
-    for (uint8_t i = 0; i < n_eq_keys; i++) eq_ids[i] = eq_keys[i]->id;
+    ray_t* eq_hdr = NULL;
+    uint32_t* eq_ids = (uint32_t*)scratch_alloc(&eq_hdr,
+                            (size_t)(n_eq_keys ? n_eq_keys : 1) * sizeof(uint32_t));
+    if (!eq_ids) return NULL;
+    for (uint32_t i = 0; i < n_eq_keys; i++) eq_ids[i] = eq_keys[i]->id;
 
     /* Trailing: [eq_keys: n_eq_keys * ptr] */
     size_t keys_sz = (size_t)n_eq_keys * sizeof(ray_op_t*);
     ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, keys_sz);
-    if (!ext) return NULL;
+    if (!ext) { scratch_free(eq_hdr); return NULL; }
 
     left_table  = &g->nodes[left_id];
     right_table = &g->nodes[right_id];
@@ -931,26 +961,33 @@ ray_op_t* ray_asof_join(ray_graph_t* g,
     ext->asof.n_eq_keys  = n_eq_keys;
     ext->asof.join_type  = join_type;
     ext->asof.eq_keys    = (uint32_t*)EXT_TRAIL(ext);
-    for (uint8_t i = 0; i < n_eq_keys; i++)
+    for (uint32_t i = 0; i < n_eq_keys; i++)
         ext->asof.eq_keys[i] = eq_ids[i];
 
+    scratch_free(eq_hdr);
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
 }
 
 ray_op_t* ray_window_op(ray_graph_t* g, ray_op_t* table_node,
-                       ray_op_t** part_keys, uint8_t n_part,
-                       ray_op_t** order_keys, uint8_t* order_descs, uint8_t n_order,
+                       ray_op_t** part_keys, uint32_t n_part,
+                       ray_op_t** order_keys, uint8_t* order_descs, uint32_t n_order,
                        uint8_t* func_kinds, ray_op_t** func_inputs,
-                       int64_t* func_params, uint8_t n_funcs,
+                       int64_t* func_params, uint32_t n_funcs,
                        uint8_t frame_type, uint8_t frame_start, uint8_t frame_end,
                        int64_t frame_start_n, int64_t frame_end_n) {
-    uint32_t part_ids[256];
-    uint32_t order_ids[256];
-    uint32_t func_ids[256];
-    for (uint8_t i = 0; i < n_part; i++) part_ids[i] = part_keys[i]->id;
-    for (uint8_t i = 0; i < n_order; i++) order_ids[i] = order_keys[i]->id;
-    for (uint8_t i = 0; i < n_funcs; i++) func_ids[i] = func_inputs[i]->id;
+    /* One carve for all three id arrays (all uint32_t; sliced by offset). */
+    ray_t* ids_hdr = NULL;
+    size_t ids_elems = (size_t)n_part + (size_t)n_order + (size_t)n_funcs;
+    uint32_t* ids_buf = (uint32_t*)scratch_alloc(&ids_hdr,
+                            (ids_elems ? ids_elems : 1) * sizeof(uint32_t));
+    if (!ids_buf) return NULL;
+    uint32_t* part_ids  = ids_buf;
+    uint32_t* order_ids = ids_buf + n_part;
+    uint32_t* func_ids  = ids_buf + n_part + n_order;
+    for (uint32_t i = 0; i < n_part; i++) part_ids[i] = part_keys[i]->id;
+    for (uint32_t i = 0; i < n_order; i++) order_ids[i] = order_keys[i]->id;
+    for (uint32_t i = 0; i < n_funcs; i++) func_ids[i] = func_inputs[i]->id;
 
     /* Trailing layout:
      *   [part_keys:   n_part * ptr]
@@ -979,7 +1016,7 @@ ray_op_t* ray_window_op(ray_graph_t* g, ray_op_t* table_node,
     uint32_t est   = table_node->est_rows;
 
     ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, total);
-    if (!ext) return NULL;
+    if (!ext) { scratch_free(ids_hdr); return NULL; }
 
     /* Re-resolve table_node after potential realloc */
     table_node = &g->nodes[table_id];
@@ -993,18 +1030,18 @@ ray_op_t* ray_window_op(ray_graph_t* g, ray_op_t* table_node,
     /* Fill trailing arrays */
     char* trail = EXT_TRAIL(ext);
     ext->window.part_keys = (uint32_t*)trail;
-    for (uint8_t i = 0; i < n_part; i++)
+    for (uint32_t i = 0; i < n_part; i++)
         ext->window.part_keys[i] = part_ids[i];
 
     ext->window.order_keys = (uint32_t*)(trail + pk_sz);
-    for (uint8_t i = 0; i < n_order; i++)
+    for (uint32_t i = 0; i < n_order; i++)
         ext->window.order_keys[i] = order_ids[i];
 
     ext->window.order_descs = (uint8_t*)(trail + pk_sz + ok_sz);
     if (n_order) memcpy(ext->window.order_descs, order_descs, od_sz);
 
     ext->window.func_inputs = (uint32_t*)(trail + fi_off);
-    for (uint8_t i = 0; i < n_funcs; i++)
+    for (uint32_t i = 0; i < n_funcs; i++)
         ext->window.func_inputs[i] = func_ids[i];
 
     ext->window.func_kinds = (uint8_t*)(trail + fk_off);
@@ -1022,19 +1059,23 @@ ray_op_t* ray_window_op(ray_graph_t* g, ray_op_t* table_node,
     ext->window.frame_start_n = frame_start_n;
     ext->window.frame_end_n   = frame_end_n;
 
+    scratch_free(ids_hdr);
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
 }
 
 ray_op_t* ray_select_op(ray_graph_t* g, ray_op_t* input,
-                        ray_op_t** cols, uint8_t n_cols) {
+                        ray_op_t** cols, uint32_t n_cols) {
     uint32_t input_id = input->id;
-    uint32_t col_ids[256];
-    for (uint8_t i = 0; i < n_cols; i++) col_ids[i] = cols[i]->id;
+    ray_t* ids_hdr = NULL;
+    uint32_t* col_ids = (uint32_t*)scratch_alloc(&ids_hdr,
+                            (size_t)(n_cols ? n_cols : 1) * sizeof(uint32_t));
+    if (!col_ids) return NULL;
+    for (uint32_t i = 0; i < n_cols; i++) col_ids[i] = cols[i]->id;
 
     size_t cols_sz = (size_t)n_cols * sizeof(ray_op_t*);
     ray_op_ext_t* ext = graph_alloc_ext_node_ex(g, cols_sz);
-    if (!ext) return NULL;
+    if (!ext) { scratch_free(ids_hdr); return NULL; }
 
     input = &g->nodes[input_id];
 
@@ -1046,10 +1087,11 @@ ray_op_t* ray_select_op(ray_graph_t* g, ray_op_t* input,
 
     /* Array embedded in trailing space — freed with ext node */
     ext->sort.columns = (uint32_t*)EXT_TRAIL(ext);
-    for (uint8_t i = 0; i < n_cols; i++)
+    for (uint32_t i = 0; i < n_cols; i++)
         ext->sort.columns[i] = col_ids[i];
     ext->sort.n_cols = n_cols;
 
+    scratch_free(ids_hdr);
     g->nodes[ext->base.id] = ext->base;
     return &g->nodes[ext->base.id];
 }

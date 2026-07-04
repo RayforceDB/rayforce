@@ -238,27 +238,27 @@ static void dump_node(FILE* f, ray_graph_t* g, ray_op_t* node, int depth) {
         case OP_GROUP:
             if (ext) {
                 /* keys */
-                for (uint8_t i = 0; i < ext->n_keys; i++)
+                for (uint32_t i = 0; i < ext->n_keys; i++)
                     dump_node(f, g, op_node(g, ext->keys[i]), depth + 1);
                 /* agg inputs */
-                for (uint8_t i = 0; i < ext->n_aggs; i++)
+                for (uint32_t i = 0; i < ext->n_aggs; i++)
                     dump_node(f, g, op_node(g, ext->agg_ins[i]), depth + 1);
             }
             /* Also recurse into standard inputs */
-            for (uint8_t i = 0; i < node->arity && i < 2; i++)
+            for (uint32_t i = 0; i < node->arity && i < 2; i++)
                 dump_node(f, g, op_child(g, node, i), depth + 1);
             break;
         case OP_SORT:
         case OP_SELECT:
             if (ext) {
-                for (uint8_t i = 0; i < ext->sort.n_cols; i++)
+                for (uint32_t i = 0; i < ext->sort.n_cols; i++)
                     dump_node(f, g, op_node(g, ext->sort.columns[i]), depth + 1);
             }
-            for (uint8_t i = 0; i < node->arity && i < 2; i++)
+            for (uint32_t i = 0; i < node->arity && i < 2; i++)
                 dump_node(f, g, op_child(g, node, i), depth + 1);
             break;
         default:
-            for (uint8_t i = 0; i < node->arity && i < 2; i++)
+            for (uint32_t i = 0; i < node->arity && i < 2; i++)
                 dump_node(f, g, op_child(g, node, i), depth + 1);
             break;
     }

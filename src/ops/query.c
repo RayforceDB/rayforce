@@ -538,7 +538,7 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                             ray_t* key_cols[TOPK_MAX_KEYS];
                             uint8_t nfs[TOPK_MAX_KEYS];
                             int ok = 1;
-                            for (uint8_t i = 0; i < n_keys; i++) {
+                            for (uint32_t i = 0; i < n_keys; i++) {
                                 key_cols[i] = ray_table_get_col(result, key_syms[i]);
                                 nfs[i] = key_descs[i];
                                 if (!key_cols[i]) { ok = 0; break; }
@@ -613,13 +613,13 @@ static ray_t* apply_sort_take(ray_t* result, ray_t** dict_elems, int64_t dict_n,
                 }
             }
         }
-        if (n_sort > UINT8_MAX) {
+        if (n_sort > UINT8_MAX) {  /* MIGRATION GATE — removed by the cut-2 flip (Task 8) */
             scratch_free(sortk_hdr);
             ray_graph_free(g); ray_release(result);
             return ray_error("range", "select: too many sort keys for the op graph (max %d)", UINT8_MAX);
         }
         if (n_sort > 0)
-            root = ray_sort_op(g, root, sort_keys, sort_descs, NULL, (uint8_t)n_sort);
+            root = ray_sort_op(g, root, sort_keys, sort_descs, NULL, n_sort);
         scratch_free(sortk_hdr);
     }
 
@@ -4099,9 +4099,9 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
         ray_release(tbl);
         return ray_error("domain", "window: `funcs:` must have at least 1 entry, got %d", n_funcs);
     }
-    /* ray_window_op's n_funcs parameter is uint8_t — DICT_VIEW_MAX (256) sits
-     * one past UINT8_MAX, so this is a real representational limit, not the
-     * old fixed-array cap. */
+    /* MIGRATION GATE — removed by the cut-2 flip (Task 8): ray_window_op's
+     * n_funcs parameter is now uint32_t, but the exec-side consumers aren't
+     * widened yet, so this compile-side cap stays until they are. */
     if (n_funcs > UINT8_MAX) {
         ray_release(tbl);
         return ray_error("range", "window: too many `funcs:` entries for the op graph (max %d)", UINT8_MAX);
@@ -4155,8 +4155,9 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
             }
         }
     }
-    /* ray_window_op takes n_part as uint8_t (and graph.c's own part_ids[256]
-     * scratch caps there too) — this is the real representational limit. */
+    /* MIGRATION GATE — removed by the cut-2 flip (Task 8): ray_window_op's
+     * n_part parameter is now uint32_t (graph.c's part_ids carve is exact-size
+     * too), but the exec-side consumers aren't widened yet. */
     if (n_part > UINT8_MAX) {
         scratch_free(part_hdr); ray_graph_free(g); ray_release(tbl);
         return ray_error("range", "window: too many partition columns for the op graph (max %d)", UINT8_MAX);
@@ -4190,7 +4191,7 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
             }
         }
     }
-    if (n_order > UINT8_MAX) {
+    if (n_order > UINT8_MAX) {  /* MIGRATION GATE — removed by the cut-2 flip (Task 8) */
         scratch_free(order_hdr); scratch_free(part_hdr); ray_graph_free(g); ray_release(tbl);
         return ray_error("range", "window: too many order columns for the op graph (max %d)", UINT8_MAX);
     }
@@ -5105,7 +5106,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
              * Output columns are also handled — the fused materialiser
              * propagates null bitmaps via ray_vec_set_null. */
             if (!bad_clause) {
-                for (uint8_t i = 0; i < n_sort_keys && !bad_clause; i++) {
+                for (uint32_t i = 0; i < n_sort_keys && !bad_clause; i++) {
                     ray_t* kc = ray_table_get_col(tbl, sort_key_syms[i]);
                     if (!kc) bad_clause = 1;
                 }
@@ -6069,7 +6070,7 @@ by_dict_done:
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
                 }
-                root = ray_select_op(g, root, col_ops, (uint8_t)nc);
+                root = ray_select_op(g, root, col_ops, nc);
                 ray_sys_free(col_ops);
                 if (!root) {
                     if (nearest_handle_owned) ray_release(nearest_handle_owned);
@@ -7931,8 +7932,10 @@ by_dict_done:
             n_aggs++;
         }
 
-        /* The op-graph builders carry key/agg counts in uint8_t; guard the
-         * representational limit before narrowing at the call. */
+        /* MIGRATION GATE — removed by the cut-2 flip (Task 8): the op-graph
+         * builders now carry key/agg counts in uint32_t, but no count above
+         * 255 can be produced yet until the exec-side consumers (Tasks 2-6)
+         * are widened, so this compile-side cap stays in place. */
         if (n_aggs > UINT8_MAX || n_keys > UINT8_MAX) {
             for (int ci = 0; ci < n_compound; ci++) ray_release(compound_rw[ci]);
             scratch_free(sel_slots_hdr);
@@ -7946,20 +7949,20 @@ by_dict_done:
                      * these and produces LIST output (differential-validated
                      * to match the old OP_TOP_N LIST shape).  Build a plain
                      * OP_GROUP node via ray_group3 so agg_k is preserved. */
-                    root = ray_group3(g, key_ops, (uint8_t)n_keys, agg_ops,
+                    root = ray_group3(g, key_ops, n_keys, agg_ops,
                                        agg_ins, has_binary_agg ? agg_ins2 : NULL,
-                                       agg_k, (uint8_t)n_aggs);
+                                       agg_k, n_aggs);
                 } else if (has_binary_agg) {
                     /* pearson carries a 2nd input column (y) per agg.  v2
                      * admits these and computes signed r.  Build a plain
                      * OP_GROUP node via ray_group2 so agg_ins2 is preserved. */
-                    root = ray_group2(g, key_ops, (uint8_t)n_keys, agg_ops,
-                                       agg_ins, agg_ins2, (uint8_t)n_aggs);
+                    root = ray_group2(g, key_ops, n_keys, agg_ops,
+                                       agg_ins, agg_ins2, n_aggs);
                 } else {
                     /* Plain unary aggs (incl. max+min, median+stddev,
                      * sum+count) — v2 handles all of these.  Build a plain
                      * OP_GROUP node. */
-                    root = ray_group(g, key_ops, (uint8_t)n_keys, agg_ops, agg_ins, (uint8_t)n_aggs);
+                    root = ray_group(g, key_ops, n_keys, agg_ops, agg_ins, n_aggs);
                 }
             } else {
                 /* No aggs but non-agg expressions exist — still need group
@@ -7967,7 +7970,7 @@ by_dict_done:
                  * The count column will be dropped after execution. */
                 uint16_t cnt_op = OP_COUNT;
                 ray_op_t* cnt_in = key_ops[0];
-                root = ray_group(g, key_ops, (uint8_t)n_keys, &cnt_op, &cnt_in, 1);
+                root = ray_group(g, key_ops, n_keys, &cnt_op, &cnt_in, 1);
                 synth_count_col = 1;
             }
         } else {
@@ -8000,7 +8003,7 @@ by_dict_done:
                 }
             }
 
-            if (n_keys > UINT8_MAX) {
+            if (n_keys > UINT8_MAX) {  /* MIGRATION GATE — removed by the cut-2 flip (Task 8) */
                 ray_graph_free(g);
                 if (filtered_tbl != tbl) ray_release(filtered_tbl);
                 ray_release(tbl);
@@ -8008,7 +8011,7 @@ by_dict_done:
             }
             uint16_t cnt_op = OP_COUNT;
             ray_op_t* cnt_in = key_ops[0];
-            root = ray_group(g, key_ops, (uint8_t)n_keys, &cnt_op, &cnt_in, 1);
+            root = ray_group(g, key_ops, n_keys, &cnt_op, &cnt_in, 1);
             root = ray_optimize(g, root);
             ray_t* grouped = ray_execute(g, root);
             ray_graph_free(g); g = NULL;
@@ -8671,9 +8674,7 @@ by_dict_done:
                 }
                 s_n_aggs++;
             }
-            /* The op-graph builders carry the agg count in uint8_t; guard the
-             * representational limit before narrowing at the call (same shape
-             * as the by: path's group-column guard). */
+            /* MIGRATION GATE — removed by the cut-2 flip (Task 8) */
             if (s_n_aggs > UINT8_MAX) {
                 if (g->selection) { ray_release(g->selection); g->selection = NULL; }
                 ray_graph_free(g); ray_release(tbl);
@@ -8682,9 +8683,9 @@ by_dict_done:
             }
             if (s_has_binary)
                 root = ray_group2(g, NULL, 0, s_agg_ops, s_agg_ins,
-                                   s_agg_ins2, (uint8_t)s_n_aggs);
+                                   s_agg_ins2, s_n_aggs);
             else
-                root = ray_group(g, NULL, 0, s_agg_ops, s_agg_ins, (uint8_t)s_n_aggs);
+                root = ray_group(g, NULL, 0, s_agg_ops, s_agg_ins, s_n_aggs);
             scratch_free(sagg_hdr);
         } else {
             /* Projection only (no group by) — select specific columns.
@@ -8806,15 +8807,13 @@ by_dict_done:
                 scratch_free(colops_hdr);
                 scratch_free(sel_slots_hdr); return result;
             } else {
-                /* The op-graph builder carries the column count in uint8_t;
-                 * guard the representational limit before narrowing at the
-                 * call (same shape as the by: path's aggregate-count guard). */
+                /* MIGRATION GATE — removed by the cut-2 flip (Task 8) */
                 if (nc > UINT8_MAX) {
                     scratch_free(colops_hdr);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); return ray_error("range", "select: too many projection columns for the op graph (max %d)", UINT8_MAX);
                 }
-                root = ray_select_op(g, root, col_ops, (uint8_t)nc);
+                root = ray_select_op(g, root, col_ops, nc);
                 scratch_free(colops_hdr);
             }
         }
@@ -8872,13 +8871,13 @@ by_dict_done:
                 scratch_free(sel_slots_hdr); return ray_error("domain", "select: asc/desc value must be a column name or symbol list, got %s", ray_type_name(val->type));
             }
         }
-        if (n_sort > UINT8_MAX) {
+        if (n_sort > UINT8_MAX) {  /* MIGRATION GATE — removed by the cut-2 flip (Task 8) */
             scratch_free(sortk_hdr);
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); return ray_error("range", "select: too many sort keys for the op graph (max %d)", UINT8_MAX);
         }
         if (n_sort > 0)
-            root = ray_sort_op(g, root, sort_keys, sort_descs, NULL, (uint8_t)n_sort);
+            root = ray_sort_op(g, root, sort_keys, sort_descs, NULL, n_sort);
         scratch_free(sortk_hdr);
     }
 
@@ -13173,7 +13172,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
     if (!time_op) { ray_graph_free(g); return ray_error("domain", "window-join: time key column not found"); }
 
     ray_op_t* eq_ops[16];
-    for (uint8_t i = 0; i < n_eq; i++) {
+    for (uint32_t i = 0; i < n_eq; i++) {
         if (eq_elems[i]->type != -RAY_SYM) {
             ray_graph_free(g);
             return ray_error("type", "window-join: equality key must be a symbol, got %s", ray_type_name(eq_elems[i]->type));
@@ -13255,7 +13254,7 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
     if (!time_op) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "asof-join: time key column not found"); }
 
     ray_op_t* eq_ops[16];
-    for (uint8_t i = 0; i < n_eq; i++) {
+    for (uint32_t i = 0; i < n_eq; i++) {
         if (eq_syms[i]->type != -RAY_SYM) {
             int8_t es_t = eq_syms[i]->type;            /* capture BEFORE free */
             ray_graph_free(g); if (_bxk) ray_release(_bxk);

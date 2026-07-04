@@ -340,6 +340,8 @@ typedef struct ray_op {
     uint32_t       in_id[2];   /* input node ids; RAY_OP_NONE if unused */
 } ray_op_t;
 
+/* In-memory only: op graphs are built from parsed AST per query and never
+ * serialized (queries cross the wire as text/AST — see src/store/serde.h). */
 /* Extended operation node for N-ary ops (heap-allocated, variable size) */
 typedef struct ray_op_ext {
     ray_op_t base;              /* 32 bytes standard node */
@@ -348,8 +350,8 @@ typedef struct ray_op_ext {
         int64_t sym;           /* OP_SCAN: column name symbol ID */
         struct {               /* OP_GROUP: group-by specification */
             uint32_t*  keys;        /* node ids */
-            uint8_t    n_keys;
-            uint8_t    n_aggs;
+            uint32_t   n_keys;
+            uint32_t   n_aggs;
             uint16_t*  agg_ops;
             uint32_t*  agg_ins;     /* node ids */
             /* Optional second input per agg — non-NULL only for binary
@@ -367,18 +369,18 @@ typedef struct ray_op_ext {
             uint32_t*  columns;     /* node ids */
             uint8_t*   desc;
             uint8_t*   nulls_first; /* 1=nulls first, 0=nulls last */
-            uint8_t    n_cols;
+            uint32_t   n_cols;
         } sort;
         struct {               /* OP_JOIN: join specification */
             uint32_t*  left_keys;   /* node ids */
             uint32_t*  right_keys;  /* node ids */
-            uint8_t    n_join_keys;
+            uint32_t   n_join_keys;
             uint8_t    join_type;  /* 0=inner, 1=left, 2=full, 3=anti */
         } join;
         struct {               /* OP_WINDOW_JOIN: ASOF join */
             uint32_t   time_key;       /* time/ordered key column (node id) */
             uint32_t*  eq_keys;        /* equality partition keys (node ids) */
-            uint8_t    n_eq_keys;     /* number of equality keys */
+            uint32_t   n_eq_keys;     /* number of equality keys */
             uint8_t    join_type;     /* 0=inner, 1=left outer */
         } asof;
         struct {               /* OP_WINDOW: window functions */
@@ -388,9 +390,9 @@ typedef struct ray_op_ext {
             uint32_t*  func_inputs; /* node ids */
             uint8_t*   func_kinds;    /* RAY_WIN_ROW_NUMBER etc. */
             int64_t*   func_params;   /* NTILE(n), LAG offset, etc. */
-            uint8_t    n_part_keys;
-            uint8_t    n_order_keys;
-            uint8_t    n_funcs;
+            uint32_t   n_part_keys;
+            uint32_t   n_order_keys;
+            uint32_t   n_funcs;
             uint8_t    frame_type;    /* RAY_FRAME_ROWS / RAY_FRAME_RANGE */
             uint8_t    frame_start;   /* RAY_BOUND_* */
             uint8_t    frame_end;     /* RAY_BOUND_* */
@@ -430,7 +432,7 @@ typedef struct ray_op_ext {
             uint32_t    pivot_col;    /* OP_SCAN node id for pivot column */
             uint32_t    value_col;    /* OP_SCAN node id for value column */
             uint16_t    agg_op;       /* OP_SUM, OP_AVG, etc. */
-            uint8_t     n_index;      /* number of index columns */
+            uint32_t    n_index;      /* number of index columns */
         } pivot;
     };
     /* Third input node id for 3-ary ops (OP_IF else-branch, OP_SUBSTR length,
@@ -662,50 +664,50 @@ ray_op_t* ray_median(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_filter(ray_graph_t* g, ray_op_t* input, ray_op_t* predicate);
 ray_op_t* ray_sort_op(ray_graph_t* g, ray_op_t* table_node,
                      ray_op_t** keys, uint8_t* descs, uint8_t* nulls_first,
-                     uint8_t n_cols);
-ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
-                   uint16_t* agg_ops, ray_op_t** agg_ins, uint8_t n_aggs);
+                     uint32_t n_cols);
+ray_op_t* ray_group(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
+                   uint16_t* agg_ops, ray_op_t** agg_ins, uint32_t n_aggs);
 /* Variant accepting an optional second-input column per agg.  agg_ins2
  * is parallel to agg_ins (length n_aggs); slots are NULL for unary aggs
  * and non-NULL only for binary aggregators (currently OP_PEARSON_CORR). */
-ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+ray_op_t* ray_group2(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
-                     ray_op_t** agg_ins2, uint8_t n_aggs);
+                     ray_op_t** agg_ins2, uint32_t n_aggs);
 /* Variant accepting an optional integer scalar per agg (e.g. top/bot K).
  * agg_k is parallel to agg_ins (length n_aggs); slots are 0 for aggs
  * that take no scalar param.  Pass NULL for agg_ins2 / agg_k if not used. */
-ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys,
+ray_op_t* ray_group3(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys,
                      uint16_t* agg_ops, ray_op_t** agg_ins,
                      ray_op_t** agg_ins2, const int64_t* agg_k,
-                     uint8_t n_aggs);
-ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint8_t n_keys);
+                     uint32_t n_aggs);
+ray_op_t* ray_distinct(ray_graph_t* g, ray_op_t** keys, uint32_t n_keys);
 ray_op_t* ray_pivot_op(ray_graph_t* g,
-                       ray_op_t** index_cols, uint8_t n_index,
+                       ray_op_t** index_cols, uint32_t n_index,
                        ray_op_t* pivot_col,
                        ray_op_t* value_col,
                        uint16_t agg_op);
 ray_op_t* ray_join(ray_graph_t* g,
                   ray_op_t* left_table, ray_op_t** left_keys,
                   ray_op_t* right_table, ray_op_t** right_keys,
-                  uint8_t n_keys, uint8_t join_type);
+                  uint32_t n_keys, uint8_t join_type);
 ray_op_t* ray_antijoin(ray_graph_t* g,
                       ray_op_t* left_table, ray_op_t** left_keys,
                       ray_op_t* right_table, ray_op_t** right_keys,
-                      uint8_t n_keys);
+                      uint32_t n_keys);
 ray_op_t* ray_asof_join(ray_graph_t* g,
                        ray_op_t* left_table, ray_op_t* right_table,
                        ray_op_t* time_key,
-                       ray_op_t** eq_keys, uint8_t n_eq_keys,
+                       ray_op_t** eq_keys, uint32_t n_eq_keys,
                        uint8_t join_type);
 ray_op_t* ray_window_op(ray_graph_t* g, ray_op_t* table_node,
-                       ray_op_t** part_keys, uint8_t n_part,
-                       ray_op_t** order_keys, uint8_t* order_descs, uint8_t n_order,
+                       ray_op_t** part_keys, uint32_t n_part,
+                       ray_op_t** order_keys, uint8_t* order_descs, uint32_t n_order,
                        uint8_t* func_kinds, ray_op_t** func_inputs,
-                       int64_t* func_params, uint8_t n_funcs,
+                       int64_t* func_params, uint32_t n_funcs,
                        uint8_t frame_type, uint8_t frame_start, uint8_t frame_end,
                        int64_t frame_start_n, int64_t frame_end_n);
 ray_op_t* ray_select_op(ray_graph_t* g, ray_op_t* input,
-                        ray_op_t** cols, uint8_t n_cols);
+                        ray_op_t** cols, uint32_t n_cols);
 ray_op_t* ray_head(ray_graph_t* g, ray_op_t* input, int64_t n);
 ray_op_t* ray_tail(ray_graph_t* g, ray_op_t* input, int64_t n);
 
