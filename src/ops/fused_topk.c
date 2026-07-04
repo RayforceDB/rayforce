@@ -90,7 +90,12 @@ typedef struct {
 typedef struct {
     fp_pred_t      pred;
     fpk_keyspec_t  keys[FPK_MAX_KEYS];
-    uint8_t        n_keys;
+    /* n_keys mirrors n_sort_keys (now uint32_t at the API boundary), but
+     * its VALUE stays permanently <= FPK_MAX_KEYS==16 — a routing/arity
+     * admission gate below (n_sort_keys > FPK_MAX_KEYS -> NULL), not a
+     * cut-3 cap slated to lift.  Widened anyway so no narrower carrier
+     * stores a value that arrived through the wide parameter. */
+    uint32_t       n_keys;
     int64_t        k;
     /* Per-worker bounded heap of row indices.  Comparator is invoked
      * via fpk_cmp; multi-key comparisons short-circuit on the first
@@ -130,7 +135,7 @@ typedef struct {
  * workers is non-deterministic. */
 static inline int fpk_cmp(const fpk_par_ctx_t* c, int64_t row_a, int64_t row_b) {
     if (RAY_UNLIKELY(row_a == row_b)) return 0;
-    for (uint8_t k = 0; k < c->n_keys; k++) {
+    for (uint32_t k = 0; k < c->n_keys; k++) {
         const fpk_keyspec_t* ks = &c->keys[k];
         int cmp = 0;
         /* Null-aware leg.  Default policy matches sort.c: NULLS LAST
@@ -293,11 +298,11 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
                              ray_t* where_expr,
                              const int64_t* sort_key_syms,
                              const uint8_t* sort_descs,
-                             uint8_t n_sort_keys,
+                             uint32_t n_sort_keys,
                              int64_t k,
                              const int64_t* out_col_syms,
                              const int64_t* out_alias_syms,
-                             uint8_t n_out)
+                             uint32_t n_out)
 {
     if (!tbl || tbl->type != RAY_TABLE || k <= 0 || n_out == 0) return NULL;
     if (k > FPK_MAX_K) return NULL;
@@ -305,7 +310,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0 || k >= nrows) return NULL;
 
-    for (uint8_t c = 0; c < n_out; c++) {
+    for (uint32_t c = 0; c < n_out; c++) {
         ray_t* col = ray_table_get_col(tbl, out_col_syms[c]);
         if (!col) return NULL;
         int8_t ot = col->type;
@@ -318,7 +323,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
     fpk_par_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     int sym_needed = 0;
-    for (uint8_t i = 0; i < n_sort_keys; i++) {
+    for (uint32_t i = 0; i < n_sort_keys; i++) {
         ray_t* col = ray_table_get_col(tbl, sort_key_syms[i]);
         if (!col) return NULL;
         int8_t kt = col->type;
@@ -422,7 +427,7 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
         return result ? result : ray_error("oom", NULL);
     }
     int build_ok = 1;
-    for (uint8_t c = 0; c < n_out; c++) {
+    for (uint32_t c = 0; c < n_out; c++) {
         int64_t cs    = out_col_syms[c];
         int64_t alias = out_alias_syms ? out_alias_syms[c] : cs;
         ray_t* src = ray_table_get_col(tbl, cs);

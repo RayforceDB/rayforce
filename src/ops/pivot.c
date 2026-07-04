@@ -270,13 +270,15 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
 
-    uint8_t n_idx   = ext->pivot.n_index;
+    uint32_t n_idx  = ext->pivot.n_index;
     uint16_t agg_op = ext->pivot.agg_op;
     int64_t nrows   = ray_table_nrows(tbl);
 
-    /* Resolve input columns */
+    /* Fixed [16]: n_idx (pivot index-column count) is gated to ≤16 at
+     * the compile-side caller (tblop.c pivot_fn_impl: "too many index
+     * columns, max 16") before OP_PIVOT is ever built — cut-3 cap. */
     ray_t* idx_vecs[16];
-    for (uint8_t i = 0; i < n_idx; i++) {
+    for (uint32_t i = 0; i < n_idx; i++) {
         ray_op_ext_t* ie = find_ext(g, ext->pivot.index_cols[i]);
         idx_vecs[i] = (ie && ie->base.opcode == OP_SCAN)
                      ? ray_table_get_col(tbl, ie->sym) : NULL;
@@ -296,14 +298,18 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (nrows == 0) return ray_table_new(0);
 
     /* Combined keys: index_cols + pivot_col */
-    uint8_t n_keys = n_idx + 1;
+    uint32_t n_keys = n_idx + 1;
     if (n_keys > 8) return ray_error("limit", "pivot: too many index columns");
 
     /* Wide-key resolution: for RAY_GUID the HT slot holds a source row
      * index rather than the 16 raw bytes, so phase2 dedupe and emit
-     * route wide keys through the source column (key_data[k]). */
+     * route wide keys through the source column (key_data[k]).
+     * Fixed [8]: n_idx <= 7 here — the n_keys > 8 check just above
+     * (n_keys = n_idx + 1) already rejected anything wider, so these
+     * arrays (indexed up to n_idx inclusive, for the pivot key at
+     * key_data[n_idx] etc.) are sized with exactly one spare slot. */
     bool idx_wide[8] = {0};
-    for (uint8_t k = 0; k < n_idx; k++)
+    for (uint32_t k = 0; k < n_idx; k++)
         idx_wide[k] = (idx_vecs[k]->type == RAY_GUID);
     bool pvt_wide = (pcol->type == RAY_GUID);
 
@@ -311,7 +317,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     int8_t  key_types[8];
     uint8_t key_attrs[8];
     ray_t*  key_vecs[8];
-    for (uint8_t k = 0; k < n_idx; k++) {
+    for (uint32_t k = 0; k < n_idx; k++) {
         key_data[k]  = ray_data(idx_vecs[k]);
         key_types[k] = idx_vecs[k]->type;
         key_attrs[k] = idx_vecs[k]->attrs;
@@ -448,7 +454,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         /* Hash index keys only (exclude pivot key) + null mask.
          * Wide keys (GUID) resolve actual bytes via key_data[k]. */
         uint64_t ih = 0;
-        for (uint8_t k = 0; k < n_idx; k++) {
+        for (uint32_t k = 0; k < n_idx; k++) {
             uint64_t kh;
             if (idx_wide[k]) {
                 const char* base = (const char*)key_data[k];
@@ -472,7 +478,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             if (*(const uint64_t*)ix_entry_p == ih) {
                 const int64_t* ekeys = (const int64_t*)(ix_entry_p + 8);
                 bool eq = true;
-                for (uint8_t k = 0; k < n_idx && eq; k++) {
+                for (uint32_t k = 0; k < n_idx && eq; k++) {
                     if (idx_wide[k]) {
                         const char* base = (const char*)key_data[k];
                         eq = (memcmp(base + (size_t)ekeys[k] * 16,
@@ -543,7 +549,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!result || RAY_IS_ERR(result)) goto pivot_cleanup;
 
     /* Index columns */
-    for (uint8_t k = 0; k < n_idx; k++) {
+    for (uint32_t k = 0; k < n_idx; k++) {
         ray_t* new_col = col_vec_new(idx_vecs[k], (int64_t)ix_count);
         if (!new_col || RAY_IS_ERR(new_col)) { ray_release(result); result = ray_error("oom", NULL); goto pivot_cleanup; }
         new_col->len = (int64_t)ix_count;

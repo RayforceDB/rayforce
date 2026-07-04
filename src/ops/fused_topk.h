@@ -46,15 +46,22 @@ int ray_fused_topk_supported(ray_t* where_expr, ray_t* tbl);
  *
  *   tbl              - source table.
  *   where_expr       - predicate AST.
- *   sort_key_syms[]  - column name syms to sort by (1..16).
+ *   sort_key_syms[]  - column name syms to sort by (1..16, admission-gated
+ *                       by FPK_MAX_KEYS — a permanent comparator-arity
+ *                       limit, not a lift-able cap).
  *   sort_descs[]     - per-key direction: 0=asc, 1=desc.
- *   n_sort_keys      - number of sort keys.
+ *   n_sort_keys      - number of sort keys (uint32_t carrier; value stays
+ *                       <= FPK_MAX_KEYS via the admission check above).
  *   k                - top-K size.
  *   out_col_syms[]   - source column name syms (one per output col).
  *   out_alias_syms[] - alias under which to publish each output col;
  *                       may be NULL when every alias matches the
  *                       corresponding out_col_syms entry.
- *   n_out            - count of output cols.
+ *   n_out            - count of output cols; a SELECT output-column count,
+ *                       not one of the cut-3-capped join/pivot/asof key
+ *                       counts — carries no fixed-size array here, so it
+ *                       is uint32_t (unbounded) ahead of its caller's own
+ *                       cap eventually lifting.
  *
  * Bypasses the DAG entirely: the predicate is compiled inline against
  * `tbl`'s columns; per-worker bounded heaps are merged after the parallel
@@ -69,10 +76,10 @@ ray_t* ray_fused_topk_select(ray_t* tbl,
                              ray_t* where_expr,
                              const int64_t* sort_key_syms,
                              const uint8_t* sort_descs,
-                             uint8_t n_sort_keys,
+                             uint32_t n_sort_keys,
                              int64_t k,
                              const int64_t* out_col_syms,
                              const int64_t* out_alias_syms,
-                             uint8_t n_out);
+                             uint32_t n_out);
 
 #endif /* RAY_OPS_FUSED_TOPK_H */

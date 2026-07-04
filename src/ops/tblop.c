@@ -116,7 +116,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         n_idx = 1;
     } else if (index_arg->type == RAY_LIST || ray_is_vec(index_arg)) {
         int64_t len = ray_len(index_arg);
-        if (len > 16) return ray_error("limit", "pivot: too many index columns, max 16, got %lld", (long long)len);
+        if (len > 16) return ray_error("limit", "pivot: too many index columns, max 16, got %lld", (long long)len); /* cut-3 */
         for (int64_t i = 0; i < len; i++) {
             int alloc = 0;
             ray_t* elem = collection_elem(index_arg, i, &alloc);
@@ -178,7 +178,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         ray_op_t* p_op = (ps && ok) ? ray_scan(g, ray_str_ptr(ps)) : NULL;
         ray_op_t* v_op = (vs && p_op) ? ray_scan(g, ray_str_ptr(vs)) : NULL;
         if (v_op) {
-            ray_op_t* root = ray_pivot_op(g, idx_ops, (uint8_t)n_idx, p_op, v_op, agg_op);
+            ray_op_t* root = ray_pivot_op(g, idx_ops, (uint32_t)n_idx, p_op, v_op, agg_op);
             if (root) {
                 ray_t* result = ray_execute(g, root);
                 ray_graph_free(g);
@@ -195,7 +195,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) return ray_error("oom", NULL);
 
-    uint8_t n_keys = (uint8_t)(n_idx + 1);
+    uint32_t n_keys = n_idx + 1;
     ray_op_t* key_ops[16];
     bool ok = true;
     for (int64_t i = 0; i < n_idx && ok; i++) {
@@ -979,10 +979,13 @@ ray_t* ray_table_distinct_fn(ray_t* tbl) {
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) return ray_error("oom", NULL);
 
-    /* ray_distinct takes a uint8_t key count, so 255 is the true cap —
-     * allowing 256 wrapped the cast to 0 keys and degenerated the query. */
+    /* Fixed [255]: ray_distinct's own n_keys parameter is uint32_t
+     * (already widened) — the true cap here is this file's OWN check
+     * just below (ncols > 255), not ray_distinct's signature.  The
+     * check runs before any element of keys[] is written (the
+     * populating loop is further down), so the array stays in bounds. */
     ray_op_t* keys[255];
-    if (ncols > 255) { ray_graph_free(g); return ray_error("range", "table-distinct: too many columns, max 255, got %lld", (long long)ncols); }
+    if (ncols > 255) { ray_graph_free(g); return ray_error("range", "table-distinct: too many columns, max 255, got %lld", (long long)ncols); } /* cut-3 */
 
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name_id = ray_table_col_name(tbl, c);
