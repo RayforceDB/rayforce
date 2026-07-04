@@ -3007,11 +3007,16 @@ static inline int agg_key_eq_at(ray_t* col, const void* data, int64_t a, int64_t
 int agg_group_keys(ray_t** key_cols, uint8_t n_keys, int64_t nrows, agg_groups_t* out) {
     /* [16]: bounded today by two independent callers — the GROUP path via
      * agg_v2_can_handle's 1..16-key admission, and the keys-only DISTINCT
-     * path (agg_select_distinct, query.c:6348) via the by-dict's own 1..16
-     * cap ("by-dict must have 1..16 keys", query.c ~5203), which dominates
-     * that whole call chain (verified empirically: a 17-key by: errors
-     * there, never reaching this function). Neither caller passes nk beyond
-     * 16 today. When cut-3 lifts either gate, this must become a carve. */
+     * path (agg_select_distinct, query.c:6348) via query.c's own
+     * `nk > 16` distinct-admission gate (~query.c:6338, guarding the raw
+     * sym-vector `by:` shape). NOTE: the by-dict's "1..16 keys" cap
+     * (query.c ~5203) does NOT dominate this call chain — it only guards
+     * RAY_DICT by: shapes; a raw sym-vector by: (`by: ['k1 'k2 ...]`)
+     * bypasses it entirely and previously reached this function with
+     * nk == 17, overflowing this buffer (ASan stack-buffer-overflow,
+     * fixed by adding the dedicated gate above). Neither caller passes nk
+     * beyond 16 today. When cut-3 lifts either gate, this must become a
+     * carve. */
     const void* data[16];
     for (uint32_t k = 0; k < n_keys; k++) data[k] = ray_data(key_cols[k]);
 

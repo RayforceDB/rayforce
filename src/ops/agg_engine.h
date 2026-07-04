@@ -29,14 +29,16 @@ typedef struct {
  * order == first-occurrence order; first_row[gid] records the row where the
  * group first appeared. Returns 0 on success (caller releases out via
  * agg_groups_free()), -1 on allocation failure.
- * n_keys stays uint8_t: the interface admits up to 255 (agg_select_distinct's
- * own UINT8_MAX gate in query.c), but the LIVE bound today is 1..16 for both
- * callers — the GROUP path via agg_v2_can_handle's admission, and the
- * keys-only DISTINCT path via the by-dict's own 1..16 cap in query.c (~5203,
- * "by-dict must have 1..16 keys"), which dominates before nk ever reaches
- * agg_select_distinct. Cut-3 is the boundary where either gate may lift past
- * 16, at which point the fixed data[16] inside agg_group_keys must become a
- * carve. */
+ * n_keys stays uint8_t: the interface admits up to 255, but the LIVE bound
+ * today is 16 via two independent admission gates — the GROUP path via
+ * agg_v2_can_handle's 1..16-key admission, and the keys-only DISTINCT path
+ * via query.c's own `nk > 16` distinct-admission gate (~query.c:6338).
+ * NOTE: the by-dict's "1..16 keys" cap in query.c (~5203) does NOT cover
+ * this — it only guards RAY_DICT by: shapes; a raw sym-vector by: bypasses
+ * it and previously overran the fixed data[16] inside agg_group_keys at 17
+ * keys (fixed by adding the dedicated gate above it). Cut-3 is the boundary
+ * where either gate may lift past 16, at which point the fixed data[16]
+ * inside agg_group_keys must become a carve. */
 int agg_group_keys(ray_t** key_cols, uint8_t n_keys, int64_t nrows, agg_groups_t* out);
 
 /* Release the buffers an agg_groups_t holds (buddy-backed, NOT libc malloc — so
@@ -50,9 +52,10 @@ void agg_groups_free(agg_groups_t* out);
  * and every tbl column is fixed-width/SYM/STR/LIST.  Caller owns the table.
  * keep_syms (or NULL) lists the column syms a consumer references — non-key
  * columns NOT in it are dropped (projection pushdown); keys are always kept.
- * nk stays uint8_t: query.c's only caller gates `nk > UINT8_MAX` before the
- * call (its own MIGRATION GATE — falls through to the composite path beyond
- * 255 keys), so this parameter never sees a truncated value. */
+ * nk stays uint8_t: query.c's only caller gates `nk > 16` before the call
+ * (~query.c:6338 — falls through to the composite path beyond 16 keys, the
+ * live bound of agg_group_keys' fixed data[16]), so this parameter never
+ * sees a truncated value. */
 ray_t* agg_select_distinct(ray_t* tbl, ray_t** key_cols, const int64_t* key_syms,
                            uint8_t nk, int64_t nrows,
                            const int64_t* keep_syms, int keep_n);

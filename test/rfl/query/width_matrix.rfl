@@ -304,3 +304,33 @@
 (set r48 (select {from: wide48 s01: (sum v01) s02: (sum v02) s03: (sum v03) s04: (sum v04) s05: (sum v05) s06: (sum v06) s07: (sum v07) s08: (sum v08) s09: (sum v09) s10: (sum v10) s11: (sum v11) s12: (sum v12) s13: (sum v13) s14: (sum v14) s15: (sum v15) s16: (sum v16) s17: (sum v17) s18: (sum v18) s19: (sum v19) s20: (sum v20) s21: (sum v21) s22: (sum v22) s23: (sum v23) s24: (sum v24) s25: (sum v25) s26: (sum v26) s27: (sum v27) s28: (sum v28) s29: (sum v29) s30: (sum v30) s31: (sum v31) s32: (sum v32) s33: (sum v33) where: (> v01 10) by: {k01: k01 k02: k02 k03: k03 k04: k04 k05: k05 k06: k06 k07: k07 k08: k08 k09: k09 k10: k10 k11: k11 k12: k12 k13: k13 k14: k14 k15: k15 k16: k16}}))
 (count (at r48 's33)) -- 2
 (sum (at r48 's33)) -- 4895
+
+;; ── raw sym-vector by:, GENUINE regression probe: a 17-key raw sym-vector
+;; `by: ['k1 'k2 ... 'k17]` (NOT a by-dict {k1: k1 ...}) skips query.c's
+;; by-dict "1..16 keys" gate entirely — that gate lives inside the
+;; `by_expr->type == RAY_DICT` block (~query.c:5194/5202) and never runs for
+;; a `by_expr->type == RAY_SYM` shape. The sym-vector form instead reaches
+;; the keys-only-distinct routing (~query.c:6269), which called
+;; agg_select_distinct -> agg_group_keys (src/ops/agg_engine.c) filling a
+;; fixed `const void* data[16]` with no bound of its own beyond a uint8_t
+;; count — 17 keys overflowed it. ASan: stack-buffer-overflow WRITE in
+;; agg_group_keys agg_engine.c:3016, via agg_select_distinct agg_engine.c:3121,
+;; via ray_select query.c:6348. Fixed by gating query.c's distinct-admission
+;; check at `nk > 16` (~query.c:6338, was `nk > UINT8_MAX`) so 17+-key
+;; sym-vector by: shapes fall through to the composite (unbounded) grouping
+;; path below instead of the fixed-size fast path. The real bound is
+;; agg_group_keys' fixed data[16] (agg_engine.c) — cut-3 lifts it via a carve.
+;; Oracle: 17 int columns k01..k17, each [1 1 2] (3 rows) — every key column
+;; is identical, so there are exactly 2 distinct group tuples; the composite
+;; path (verified empirically post-fix) answers this correctly.
+(set t17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2])))
+(set r17 (select {from: t17 by: ['k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16 'k17]}))
+(count (at r17 'k17)) -- 2
+
+;; ── raw sym-vector by:, boundary companion: same shape at exactly 16 keys
+;; still takes the keys-only-distinct fast path (agg_select_distinct /
+;; agg_group_keys, data[16] at capacity, no overflow) — pins the fast path
+;; stays correct right at the cut-3 boundary this gate protects.
+(set t16v (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2])))
+(set r16v (select {from: t16v by: ['k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16]}))
+(count (at r16v 'k16)) -- 2

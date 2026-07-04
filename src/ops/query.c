@@ -6332,10 +6332,16 @@ by_dict_done:
                         default: distinct_only = false; break;
                     }
                 }
-                /* agg_select_distinct addresses keys through a uint8_t count —
-                 * beyond 255 keys the fast path cannot represent the shape, so
-                 * fall through to the composite (unbounded) path below. */
-                if (nk > UINT8_MAX) distinct_only = false;
+                /* agg_group_keys (called by agg_select_distinct) fills a fixed
+                 * `const void* data[16]` (agg_engine.c) — beyond 16 keys the
+                 * fast path would overrun that stack buffer, so fall through
+                 * to the composite (unbounded) path below instead. This is
+                 * the ONLY admission gate on this route: a raw sym-vector
+                 * by: (by_expr->type == RAY_SYM here) never passes through
+                 * the by-dict's own "1..16 keys" check at ~query.c:5202 —
+                 * that gate guards RAY_DICT by: shapes only. Cut-3 lifts
+                 * this once agg_group_keys' data[16] becomes a carve. */
+                if (nk > 16) distinct_only = false;
                 if (distinct_only) {
                     /* Consume the projection hint (if a consumer published one) —
                      * carry only its referenced non-key columns.  Consume-once. */
