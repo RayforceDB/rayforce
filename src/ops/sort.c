@@ -3445,11 +3445,20 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
         }
     }
 
-    /* Resolve sort key vectors */
-    ray_t* sort_vecs[n_sort > 0 ? n_sort : 1];
-    uint8_t sort_owned[n_sort > 0 ? n_sort : 1];
-    memset(sort_vecs, 0, (n_sort > 0 ? n_sort : 1) * sizeof(ray_t*));
-    memset(sort_owned, 0, n_sort > 0 ? n_sort : 1);
+    /* Resolve sort key vectors.  n_sort is the (unbounded) widened sort
+     * key count post-migration — carve the key-vector/owned-flag scratch
+     * from the heap instead of two stack VLAs (stack-blow risk on worker
+     * threads for wide sorts).  Single consolidated allocation: sort_vecs
+     * (8-byte entries) first, sort_owned (1-byte entries) immediately
+     * after; scratch_calloc zero-inits both, matching the prior memsets. */
+    uint32_t n_sort_alloc = n_sort > 0 ? n_sort : 1;
+    size_t sort_vecs_bytes = (size_t)n_sort_alloc * sizeof(ray_t*);
+    ray_t* sort_hdr;
+    char* sort_scratch = (char*)scratch_calloc(&sort_hdr,
+        sort_vecs_bytes + (size_t)n_sort_alloc * sizeof(uint8_t));
+    if (!sort_scratch) return ray_error("oom", NULL);
+    ray_t** sort_vecs = (ray_t**)sort_scratch;
+    uint8_t* sort_owned = (uint8_t*)(sort_scratch + sort_vecs_bytes);
 
     for (uint32_t k = 0; k < n_sort; k++) {
         ray_op_t* key_op = op_node(g, ext->sort.columns[k]);
@@ -3469,6 +3478,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
                 if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
                     ray_release(sort_vecs[j]);
             }
+            scratch_free(sort_hdr);
             return err;
         }
     }
@@ -3518,6 +3528,7 @@ sort_idx_ready:;
             if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
                 ray_release(sort_vecs[k]);
         }
+        scratch_free(sort_hdr);
         return idx_vec ? idx_vec : ray_error("oom", NULL);
     }
     int64_t* sorted_idx = (int64_t*)ray_data(idx_vec);
@@ -3531,6 +3542,7 @@ sort_idx_ready:;
                 if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
                     ray_release(sort_vecs[k]);
             }
+            scratch_free(sort_hdr);
             ray_release(idx_vec);
             return ray_error("cancel", NULL);
         }
@@ -3548,6 +3560,7 @@ sort_idx_ready:;
             if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
                 ray_release(sort_vecs[k]);
         }
+        scratch_free(sort_hdr);
         ray_release(idx_vec);
         return result;
     }
@@ -3579,6 +3592,7 @@ sort_idx_ready:;
             for (uint32_t k = 0; k < n_sort; k++)
                 if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
                     ray_release(sort_vecs[k]);
+            scratch_free(sort_hdr);
             ray_release(idx_vec);
             return nc ? nc : ray_error("oom", NULL);
         }
@@ -3692,6 +3706,7 @@ sort_idx_ready:;
         if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
             ray_release(sort_vecs[k]);
     }
+    scratch_free(sort_hdr);
 
     ray_release(idx_vec);
     return result;
