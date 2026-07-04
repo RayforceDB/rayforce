@@ -873,7 +873,10 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 /* Multi-key composite radix sort */
                 ray_pool_t* pool2 = pool;
                 int64_t mins[n_sort], maxs[n_sort];
-                uint8_t total_bits = 0;
+                /* Wider accumulator: up to 16 keys * 63 bits = 1008,
+                 * which would wrap a uint8_t and let an oversized
+                 * budget falsely pass the <=64 fits check. */
+                uint16_t total_bits = 0;
                 bool fits = true;
 
                 ray_pool_t* mk_prescan_pool2 = (nrows >= SMALL_POOL_THRESHOLD) ? pool2 : NULL;
@@ -968,7 +971,12 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 
                 if (total_bits > 64) fits = false;
 
-                if (fits) {
+                /* radix_encode_ctx_t (internal.h) carries fixed 16-key
+                 * mins/ranges/bit_shifts/descs/enum_ranks arrays — this
+                 * direct-encode path is only safe up to that width.  Wider
+                 * composites (any n_sort above 16) fall through to the
+                 * merge sort below rather than overrun those arrays. */
+                if (fits && n_sort <= 16) {
                     uint8_t bit_shifts[n_sort];
                     uint8_t accum = 0;
                     for (int k = n_sort - 1; k >= 0; k--) {

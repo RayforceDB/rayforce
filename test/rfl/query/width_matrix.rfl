@@ -115,7 +115,9 @@
 (at (meta re) 'len) -- 19
 (at re 'a16) -- [30 70]
 
-;; ── count-only pre-take fast path: 17 count outputs with take: ──
+;; ── count-only with take:: 17 count outputs, single by-key (DAG path;
+;; the eval-level count-only pre-take block is multi-key-only — see the
+;; ROUTING NOTE below) ──
 (set rt (select {from: t c01: (count v) c02: (count v) c03: (count v) c04: (count v) c05: (count v) c06: (count v) c07: (count v) c08: (count v) c09: (count v) c10: (count v) c11: (count v) c12: (count v) c13: (count v) c14: (count v) c15: (count v) c16: (count v) c17: (count v) by: {k: k} take: 2}))
 (at (meta rt) 'len) -- 18
 (at rt 'c17) -- [2 2]
@@ -207,6 +209,25 @@
 ;; partition broadcasts min(3.0, 5.0) = 3.0 to every row in that partition.
 (set wp (table [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17 v] (list [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [1 1] [3.0 5.0])))
 (at (window {from: wp part: [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17] funcs: {mn: (min v)}}) 'mn) -- [3.0 3.0]
+
+;; ── window exec: 17 partition keys over >64 rows (src/ops/window.c
+;; multi-key composite radix gate).  The exec-side radix_encode_ctx_t
+;; (src/ops/internal.h) carries fixed 16-key mins/ranges/bit_shifts/descs/
+;; enum_ranks arrays; 17 narrow keys (total_bits = 17 <= 64) used to pass
+;; the `fits` check alone and overrun them — stack corruption in
+;; exec_window's frame.  Post-fix the gate is `fits && n_sort <= 16`
+;; (mirroring src/ops/sort.c), so this shape takes the unbounded
+;; merge-sort fallback instead.  100 rows forces past the nrows <= 64
+;; insertion-sort path that the 2-row wp cell above stops at.  p01..p16
+;; are constant (range 0 → 1 bit each) and p17 alternates 0/1, so the
+;; rows split into two 50-row partitions: even v (min 0) and odd v
+;; (min 1), broadcast back per row in source order → mn = [0 1 0 1 ...].
+(set wq (table [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17 v] (list (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (take [1] 100) (% (til 100) 2) (til 100))))
+(set wr (at (window {from: wq part: [p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12 p13 p14 p15 p16 p17] funcs: {mn: (min v)}}) 'mn))
+(count wr) -- 100
+(at wr 0) -- 0
+(at wr 1) -- 1
+(sum wr) -- 50
 
 ;; ── nonagg scatter path: 17 pure non-agg outputs, single key.  Retires the
 ;; DAG-compile `n_nonaggs >= 16` cap in src/ops/query.c ray_select_fn (the
