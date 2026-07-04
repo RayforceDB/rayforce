@@ -6434,7 +6434,6 @@ by_dict_done:
                         ray_t* rowbuf_hdr = NULL;
                         int64_t* rv = (int64_t*)scratch_alloc(&rowbuf_hdr,
                             (size_t)nk * (sizeof(int64_t) + 1));
-                        uint8_t* rn = (uint8_t*)(rv + nk);
                         if (!rv) {
                             ray_free(vals_hdr); ray_free(null_hdr); ray_free(cnt_hdr);
                             scratch_free(keyrd_hdr); scratch_free(cntnames_hdr); scratch_free(keycols_hdr);
@@ -6442,6 +6441,7 @@ by_dict_done:
                             ray_release(tbl);
                             scratch_free(sel_slots_hdr); return ray_error("oom", NULL);
                         }
+                        uint8_t* rn = (uint8_t*)(rv + nk);
 
                         int64_t found = 0;
                         for (int64_t r = 0; r < nrows; r++) {

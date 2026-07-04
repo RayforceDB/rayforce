@@ -3,8 +3,8 @@
 ;; sort keys are all retired (exact-size scratch carves): more than 16 entries
 ;; of any kind in one `select` now compile and execute correctly instead of
 ;; erroring or silently truncating the surplus (which returned wrong results).
-;; Plain projections have no cap either — they route to the eval fallback and
-;; keep every column.
+;; Plain projections have no cap either — they compile through the same
+;; exact-size collectors and keep every column.
 
 (set t (table [k v] (list [1 1 2 2] (as 'F64 [10 20 30 40]))))
 

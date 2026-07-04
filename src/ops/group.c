@@ -7086,9 +7086,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * agg_linear[0].enabled implies null-free.) */
         typedef void (*scalar_fn_t)(void*, uint32_t, int64_t, int64_t);
         scalar_fn_t sc_fn = scalar_accum_fn;
-        bool agg0_has_nulls = sc_int_null_has[0] ||
-            (agg_vecs[0] && agg_vecs[0]->type == RAY_F64 &&
-             (agg_vecs[0]->attrs & RAY_ATTR_HAS_NULLS));
+        bool agg0_has_nulls = n_aggs > 0 &&
+            (sc_int_null_has[0] ||
+             (agg_vecs[0] && agg_vecs[0]->type == RAY_F64 &&
+              (agg_vecs[0]->attrs & RAY_ATTR_HAS_NULLS)));
         if (n_aggs == 1 && !match_idx && !rowsel && agg_ptrs[0] != NULL && !agg0_has_nulls) {
             uint16_t op0 = ext->agg_ops[0];
             int8_t   t0  = agg_types[0];
