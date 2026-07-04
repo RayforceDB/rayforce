@@ -1230,7 +1230,10 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         is_f64[f] = out_f64;
         result_vecs[f] = ray_vec_new(out_f64 ? RAY_F64 : RAY_I64, nrows);
         if (!result_vecs[f] || RAY_IS_ERR(result_vecs[f])) {
-            for (uint32_t j = 0; j < f; j++) ray_release(result_vecs[j]);
+            for (uint32_t j = 0; j < f; j++) {
+                ray_release(result_vecs[j]);
+                result_vecs[j] = NULL;
+            }
             scratch_free(poff_hdr);
             scratch_free(indices_hdr);
             goto oom;
@@ -1285,7 +1288,10 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     /* --- Pass 4: Build result table --- */
     ray_t* result = ray_table_new(ncols + n_funcs);
     if (!result || RAY_IS_ERR(result)) {
-        for (uint32_t f = 0; f < n_funcs; f++) ray_release(result_vecs[f]);
+        for (uint32_t f = 0; f < n_funcs; f++) {
+            ray_release(result_vecs[f]);
+            result_vecs[f] = NULL;
+        }
         scratch_free(poff_hdr);
         scratch_free(indices_hdr);
         goto oom;
