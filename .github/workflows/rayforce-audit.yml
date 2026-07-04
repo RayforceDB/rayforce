@@ -53,6 +53,13 @@ jobs:
           - Head SHA: ${HEAD_SHA}
           - Diff command: git diff ${BASE_REF}...HEAD
 
+          CI mode constraints:
+          - This is the fast required gate, not a full deep-audit/remediation run.
+          - Do not fan out to subagents or run independent multi-pass reviewers.
+          - Do not reproduce findings with builds/tests or execute PR code.
+          - Spend the review on the diff and directly adjacent code needed to validate blocking issues.
+          - Target completion in under 8 minutes. If more time would be needed, report the best grounded blocking findings or an explicit inconclusive FAIL.
+
           CI safety rules:
           - This is running on a self-hosted runner.
           - Do not modify files.
@@ -76,15 +83,39 @@ jobs:
             RAYFORCE_AUDIT_VERDICT: PASS
             or
             RAYFORCE_AUDIT_VERDICT: FAIL
-          - Use FAIL only for issues that should block merge.
+          - Use FAIL only for issues that should block merge, including an inconclusive timeout.
           EOF
 
-          claude -p "$(cat audit-output/rayforce-audit-prompt.md)" \
+          set +e
+          timeout 12m claude -p "$(cat audit-output/rayforce-audit-prompt.md)" \
             --plugin-dir "${RAYFORCE_AUDIT_PLUGIN_DIR}" \
             --permission-mode dontAsk \
             --allowedTools "Read,Glob,Grep,LS,Bash(git *)" \
+            --effort medium \
             --no-session-persistence \
             | tee audit-output/rayforce-audit.md
+          claude_status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${claude_status}" -eq 124 ]; then
+            cat > audit-output/rayforce-audit.md <<'EOF_TIMEOUT'
+          ## Rayforce targeted audit timed out
+
+          The required Rayforce audit gate exceeded its 12 minute CI budget before producing a final verdict. This is a gate infrastructure failure, not a PASS.
+
+          RAYFORCE_AUDIT_VERDICT: FAIL
+          EOF_TIMEOUT
+          elif [ "${claude_status}" -ne 0 ]; then
+            if [ ! -s audit-output/rayforce-audit.md ]; then
+              cat > audit-output/rayforce-audit.md <<'EOF_ERROR'
+          ## Rayforce targeted audit failed before producing a report
+
+          The Claude audit command exited non-zero before producing a final verdict. Open the check logs for details.
+
+          RAYFORCE_AUDIT_VERDICT: FAIL
+          EOF_ERROR
+            fi
+          fi
 
           tail -n 1 audit-output/rayforce-audit.md | grep -q '^RAYFORCE_AUDIT_VERDICT: PASS$'
 
