@@ -3985,7 +3985,7 @@ static inline int64_t agg_int_null_sentinel_for(int8_t t);
  * behaviour (callers without HAS_NULLS aggs need not allocate it). */
 static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t* ext,
                               ray_t* const* agg_vecs, uint32_t grp_count,
-                              uint8_t n_aggs,
+                              uint32_t n_aggs,
                               const double*  sum_f64,  const int64_t* sum_i64,
                               const double*  min_f64,  const double*  max_f64,
                               const int64_t* min_i64,  const int64_t* max_i64,
