@@ -995,7 +995,7 @@ ray_t* ray_table_distinct_fn(ray_t* tbl) {
         if (!keys[c]) { ray_graph_free(g); return ray_error("oom", NULL); }
     }
 
-    ray_op_t* root = ray_distinct(g, keys, (uint8_t)ncols);
+    ray_op_t* root = ray_distinct(g, keys, (uint32_t)ncols);
     if (!root) { ray_graph_free(g); return ray_error("oom", NULL); }
 
     ray_t* result = ray_execute(g, root);

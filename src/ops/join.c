@@ -3018,7 +3018,22 @@ build_output:;
     int64_t right_ncols = ray_table_ncols(right_table);
 
     /* Collect right column indices, excluding duplicate key columns */
-    int64_t right_out_idx[256];
+    ray_t* right_out_idx_hdr = NULL;
+    int64_t* right_out_idx = right_ncols > 0
+        ? (int64_t*)scratch_alloc(&right_out_idx_hdr, (size_t)right_ncols * sizeof(int64_t))
+        : NULL;
+    if (right_ncols > 0 && !right_out_idx) {
+        scratch_free(mo_hdr);
+        scratch_free(match_hdr);
+        scratch_free(li_hdr);
+        scratch_free(ri_hdr);
+        if (lt_null_hdr) scratch_free(lt_null_hdr);
+        if (rt_null_hdr) scratch_free(rt_null_hdr);
+        if (lt_time_hdr) scratch_free(lt_time_hdr);
+        if (rt_time_hdr) scratch_free(rt_time_hdr);
+        if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        return ray_error("oom", NULL);
+    }
     int64_t right_out_count = 0;
     for (int64_t c = 0; c < right_ncols; c++) {
         int64_t rname = ray_table_col_name(right_table, c);
@@ -3044,6 +3059,7 @@ build_output:;
     if (out_n > 0 && (!lidx || !ridx)) {
         if (lidx_hdr) scratch_free(lidx_hdr);
         if (ridx_hdr) scratch_free(ridx_hdr);
+        if (right_out_idx_hdr) scratch_free(right_out_idx_hdr);
         scratch_free(mo_hdr);
         scratch_free(match_hdr);
         scratch_free(li_hdr);
@@ -3126,6 +3142,7 @@ build_output:;
 
     if (lidx_hdr) scratch_free(lidx_hdr);
     if (ridx_hdr) scratch_free(ridx_hdr);
+    if (right_out_idx_hdr) scratch_free(right_out_idx_hdr);
     scratch_free(mo_hdr);
     scratch_free(match_hdr);
     scratch_free(li_hdr);

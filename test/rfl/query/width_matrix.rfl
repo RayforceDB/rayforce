@@ -334,3 +334,32 @@
 (set t16v (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2])))
 (set r16v (select {from: t16v by: ['k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16]}))
 (count (at r16v 'k16)) -- 2
+
+;; ── asof/window-join right-column overflow, GENUINE regression probe:
+;; exec_window_join's right_out_idx[] (src/ops/join.c) was a fixed
+;; int64_t[256] filled by a loop over the RIGHT table's column count
+;; (right_ncols), skipping only the time key (and any eq keys) — a right
+;; table with >256 columns overflows it. WR below has 260 columns (Time +
+;; d001..d259); only Time is the join key, so the loop writes
+;; right_out_count = 259 entries into what was a 256-slot array, 3 past
+;; the old cap. ASan (pre-fix): stack-buffer-overflow WRITE in
+;; exec_window_join, join.c:3029.
+;; d001..d258 all share one replicated filler column ([0]) — built via
+;; (take (list [0]) 258) so the literal itself stays small (`list`/table
+;; literals are capped at 64 args by the VM's calln opcodes; the bracket
+;; name-vector literal below is parsed directly by the lexer with its own
+;; much larger cap, so a 260-symbol names vector is fine, but the *values*
+;; list has to be built via take+concat instead of a 260-arg `list` call).
+;; d259 — past the former 256-column boundary — carries a distinct value
+;; (777) precisely so a truncation/overflow that merely drops or corrupts
+;; trailing columns (rather than crashing outright) still surfaces as a
+;; wrong value here instead of silently passing.
+(set wj_names [Time d001 d002 d003 d004 d005 d006 d007 d008 d009 d010 d011 d012 d013 d014 d015 d016 d017 d018 d019 d020 d021 d022 d023 d024 d025 d026 d027 d028 d029 d030 d031 d032 d033 d034 d035 d036 d037 d038 d039 d040 d041 d042 d043 d044 d045 d046 d047 d048 d049 d050 d051 d052 d053 d054 d055 d056 d057 d058 d059 d060 d061 d062 d063 d064 d065 d066 d067 d068 d069 d070 d071 d072 d073 d074 d075 d076 d077 d078 d079 d080 d081 d082 d083 d084 d085 d086 d087 d088 d089 d090 d091 d092 d093 d094 d095 d096 d097 d098 d099 d100 d101 d102 d103 d104 d105 d106 d107 d108 d109 d110 d111 d112 d113 d114 d115 d116 d117 d118 d119 d120 d121 d122 d123 d124 d125 d126 d127 d128 d129 d130 d131 d132 d133 d134 d135 d136 d137 d138 d139 d140 d141 d142 d143 d144 d145 d146 d147 d148 d149 d150 d151 d152 d153 d154 d155 d156 d157 d158 d159 d160 d161 d162 d163 d164 d165 d166 d167 d168 d169 d170 d171 d172 d173 d174 d175 d176 d177 d178 d179 d180 d181 d182 d183 d184 d185 d186 d187 d188 d189 d190 d191 d192 d193 d194 d195 d196 d197 d198 d199 d200 d201 d202 d203 d204 d205 d206 d207 d208 d209 d210 d211 d212 d213 d214 d215 d216 d217 d218 d219 d220 d221 d222 d223 d224 d225 d226 d227 d228 d229 d230 d231 d232 d233 d234 d235 d236 d237 d238 d239 d240 d241 d242 d243 d244 d245 d246 d247 d248 d249 d250 d251 d252 d253 d254 d255 d256 d257 d258 d259])
+(set wj_filler [0])
+(set wj_last [777])
+(set wj_cols (concat (list [10:00:00.000]) (concat (take (list wj_filler) 258) (list wj_last))))
+(set WR (table wj_names wj_cols))
+(set WL (table [Time V] (list [10:00:01.000] [1.0])))
+(set wj_out (asof-join [Time] WL WR))
+(count (at wj_out 'd259)) -- 1
+(at wj_out 'd259) -- [777]
