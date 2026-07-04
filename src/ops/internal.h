@@ -730,7 +730,7 @@ typedef struct {
     ray_t**       vecs;
     uint8_t*     desc;
     uint8_t*     nulls_first;
-    uint8_t      n_sort;
+    uint32_t     n_sort;
 } sort_cmp_ctx_t;
 
 /* Radix pass context (shared across histogram + scatter phases) */
@@ -760,7 +760,7 @@ typedef struct {
     /* SYM rank mapping (NULL if not sym): */
     const uint32_t* enum_rank; /* intern_id → sort rank */
     /* Composite-key fields (n_keys > 1): */
-    uint8_t         n_keys;
+    uint8_t         n_keys; /* uint8: filled only under the <=16 radix gates (sort.c/window.c) */
     ray_t**          vecs;
     int64_t         mins[16];
     int64_t         ranges[16];
@@ -773,7 +773,7 @@ typedef struct {
 typedef struct {
     ray_t*     const* vecs;
     uint32_t* const* enum_ranks;
-    uint8_t          n_keys;
+    uint32_t         n_keys;
     int64_t          nrows;
     uint32_t         n_workers;
     int64_t*         pw_mins;

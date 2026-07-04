@@ -34,7 +34,7 @@
 /* sort_cmp_ctx_t defined in exec_internal.h */
 
 int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
-    for (uint8_t k = 0; k < ctx->n_sort; k++) {
+    for (uint32_t k = 0; k < ctx->n_sort; k++) {
         ray_t* col = ctx->vecs[k];
         if (!col) continue;
         int cmp = 0;
@@ -1091,7 +1091,7 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
         /* Composite-key encoding */
         for (int64_t i = start; i < end; i++) {
             uint64_t composite = 0;
-            for (uint8_t k = 0; k < c->n_keys; k++) {
+            for (uint32_t k = 0; k < c->n_keys; k++) {
                 ray_t* col = c->vecs[k];
                 int64_t val;
                 if (c->enum_ranks[k]) {
@@ -2102,18 +2102,18 @@ void sort_merge_fn(void* arg, uint32_t worker_id, int64_t start, int64_t end) {
 void mk_prescan_fn(void* arg, uint32_t wid,
                            int64_t start, int64_t end) {
     mk_prescan_ctx_t* c = (mk_prescan_ctx_t*)arg;
-    uint8_t nk = c->n_keys;
+    uint32_t nk = c->n_keys;
     int64_t* my_mins = c->pw_mins + (int64_t)wid * nk;
     int64_t* my_maxs = c->pw_maxs + (int64_t)wid * nk;
 
     /* Initialize on first morsel, merge on subsequent */
-    for (uint8_t k = 0; k < nk; k++) {
+    for (uint32_t k = 0; k < nk; k++) {
         if (my_mins[k] == INT64_MAX) {
             /* first morsel for this worker — will be set below */
         }
     }
 
-    for (uint8_t k = 0; k < nk; k++) {
+    for (uint32_t k = 0; k < nk; k++) {
         ray_t* col = c->vecs[k];
         int64_t kmin = my_mins[k], kmax = my_maxs[k];
 
@@ -2231,7 +2231,7 @@ static void radix_decode_into(void* dst, int8_t type, const uint64_t* sorted_key
  * keys_hdr_out:    if non-NULL, receives scratch header for sorted_keys_out
  * Returns:     ray_t* I64 vector of sorted indices (caller owns), or RAY_ERROR */
 static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
-                               uint8_t n_cols, int64_t nrows,
+                               uint32_t n_cols, int64_t nrows,
                                uint64_t** sorted_keys_out, ray_t** keys_hdr_out) {
     if (n_cols == 0 || nrows <= 0)
         return ray_vec_new(RAY_I64, 0);
@@ -2253,8 +2253,10 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
     bool radix_done = false;
     int64_t* sorted_idx = indices;  /* may point to itmp after radix sort */
     ray_t* radix_itmp_hdr = NULL;   /* kept alive until we copy out */
-    ray_t* enum_rank_hdrs[n_cols];
-    memset(enum_rank_hdrs, 0, n_cols * sizeof(ray_t*));
+    ray_t* enum_rank_hdrs_hdr;
+    ray_t** enum_rank_hdrs = (ray_t**)scratch_calloc(&enum_rank_hdrs_hdr,
+                                 (size_t)n_cols * sizeof(ray_t*));
+    if (!enum_rank_hdrs) { scratch_free(indices_hdr); return ray_error("oom", NULL); }
 
     if (nrows > 64) {
         /* RAY_STR single-key fast path — dedicated MSD byte-radix
@@ -2281,7 +2283,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
          * path with the new RAY_GUID comparator for guids). */
         bool can_radix = true;
         bool has_wide_key = false;  /* RAY_STR or RAY_GUID — forces rank fallback */
-        for (uint8_t k = 0; k < n_cols; k++) {
+        for (uint32_t k = 0; k < n_cols; k++) {
             if (!cols[k]) { can_radix = false; break; }
             int8_t t = cols[k]->type;
             if (t == RAY_STR || t == RAY_GUID) { has_wide_key = true; continue; }
@@ -2301,14 +2303,19 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
             ray_pool_t* pool = ray_pool_get();
 
             /* Build SYM rank mappings (intern_id -> sorted rank by string) */
-            uint32_t* enum_ranks[n_cols];
-            memset(enum_ranks, 0, n_cols * sizeof(uint32_t*));
-            for (uint8_t k = 0; k < n_cols; k++) {
-                if (RAY_IS_SYM(cols[k]->type)) {
-                    enum_ranks[k] = build_enum_rank(cols[k], nrows,
-                                                     &enum_rank_hdrs[k]);
-                    if (!enum_ranks[k]) { can_radix = false; break; }
+            ray_t* enum_ranks_hdr;
+            uint32_t** enum_ranks = (uint32_t**)scratch_calloc(&enum_ranks_hdr,
+                                         (size_t)n_cols * sizeof(uint32_t*));
+            if (enum_ranks) {
+                for (uint32_t k = 0; k < n_cols; k++) {
+                    if (RAY_IS_SYM(cols[k]->type)) {
+                        enum_ranks[k] = build_enum_rank(cols[k], nrows,
+                                                         &enum_rank_hdrs[k]);
+                        if (!enum_ranks[k]) { can_radix = false; break; }
+                    }
                 }
+            } else {
+                can_radix = false;
             }
 
             if (can_radix && n_cols == 1) {
@@ -2501,7 +2508,12 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
 
             } else if (can_radix && n_cols > 1) {
                 /* --- Multi-key composite radix sort --- */
-                int64_t mins[n_cols], maxs[n_cols];
+                ray_t* minmax_hdr;
+                int64_t* minmax = (int64_t*)scratch_alloc(&minmax_hdr,
+                                      2 * (size_t)n_cols * sizeof(int64_t));
+              if (minmax) {
+                int64_t* mins = minmax;
+                int64_t* maxs = minmax + n_cols;
                 /* Wider accumulator: up to 16 keys * 63 bits = 1008,
                  * which would wrap a uint8_t and let an oversized
                  * budget falsely pass the <=64 fits check. */
@@ -2537,7 +2549,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                     ray_pool_dispatch(mk_prescan_pool, mk_prescan_fn, &pctx, nrows);
 
                     /* Merge per-worker results */
-                    for (uint8_t k = 0; k < n_cols; k++) {
+                    for (uint32_t k = 0; k < n_cols; k++) {
                         int64_t kmin = INT64_MAX, kmax = INT64_MIN;
                         for (uint32_t w = 0; w < nw; w++) {
                             int64_t wmin = pw_mins[w * n_cols + k];
@@ -2557,7 +2569,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                     if (pw_maxs_hdr) scratch_free(pw_maxs_hdr);
                 } else {
                     /* Sequential fallback (no pool or too many keys) */
-                    for (uint8_t k = 0; k < n_cols; k++) {
+                    for (uint32_t k = 0; k < n_cols; k++) {
                         ray_t* col = cols[k];
                         int64_t kmin = INT64_MAX, kmax = INT64_MIN;
 
@@ -2629,14 +2641,19 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                      * compose the ranks.  Bits per key shrinks from
                      * "data range" to "ceil(log2 distinct_count)", which
                      * always fits for n_cols * ceil(log2 nrows) <= 64. */
-                    ray_t* rank_hdrs[n_cols];
-                    uint32_t* ranks[n_cols];
-                    uint32_t rank_max[n_cols];
-                    bool rank_ok = true;
-                    for (uint8_t k = 0; k < n_cols; k++) {
-                        rank_hdrs[k] = NULL; ranks[k] = NULL; rank_max[k] = 0;
-                    }
-                    for (uint8_t k = 0; k < n_cols && rank_ok; k++) {
+                    ray_t* rank_buf_hdr;
+                    size_t rank_off_ranks = (size_t)n_cols * sizeof(ray_t*);
+                    size_t rank_off_max = rank_off_ranks
+                                          + (size_t)n_cols * sizeof(uint32_t*);
+                    size_t rank_buf_bytes = rank_off_max
+                                            + (size_t)n_cols * sizeof(uint32_t);
+                    uint8_t* rank_buf = (uint8_t*)scratch_calloc(&rank_buf_hdr,
+                                                                  rank_buf_bytes);
+                    bool rank_ok = rank_buf != NULL;
+                    ray_t** rank_hdrs = (ray_t**)rank_buf;
+                    uint32_t** ranks = (uint32_t**)(rank_buf + rank_off_ranks);
+                    uint32_t* rank_max = (uint32_t*)(rank_buf + rank_off_max);
+                    for (uint32_t k = 0; k < n_cols && rank_ok; k++) {
                         uint8_t kdesc = descs ? descs[k] : 0;
                         uint8_t knf   = nulls_first ? nulls_first[k] : !kdesc;
                         ray_t* col_arg[1] = { cols[k] };
@@ -2670,18 +2687,24 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                         ray_release(sk_idx);
                     }
                     if (rank_ok) {
-                        uint8_t rank_bits[n_cols];
+                        ray_t* rank_bits_hdr;
+                        uint8_t* rank_bits = (uint8_t*)scratch_alloc(&rank_bits_hdr,
+                                                                      n_cols);
+                      if (rank_bits) {
                         /* Accumulate in a wider type: up to 16 keys * 63
                          * bits each = 1008, which would wrap a uint8_t. */
                         uint16_t rank_total = 0;
-                        for (uint8_t k = 0; k < n_cols; k++) {
+                        for (uint32_t k = 0; k < n_cols; k++) {
                             uint8_t b = 1;
                             while (((uint64_t)1 << b) <= rank_max[k] && b < 64) b++;
                             rank_bits[k] = b;
                             rank_total = (uint16_t)(rank_total + b);
                         }
                         if (rank_total <= 64) {
-                            uint8_t rshift[n_cols];
+                            ray_t* rshift_hdr;
+                            uint8_t* rshift = (uint8_t*)scratch_alloc(&rshift_hdr,
+                                                                       n_cols);
+                          if (rshift) {
                             uint16_t accum = 0;
                             for (int k = n_cols - 1; k >= 0; k--) {
                                 rshift[k] = (uint8_t)accum;
@@ -2697,7 +2720,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                             if (rkeys) {
                                 for (int64_t i = 0; i < nrows; i++) {
                                     uint64_t composite = 0;
-                                    for (uint8_t k = 0; k < n_cols; k++)
+                                    for (uint32_t k = 0; k < n_cols; k++)
                                         composite |= ((uint64_t)ranks[k][i]) << rshift[k];
                                     rkeys[i] = composite;
                                     indices[i] = i;
@@ -2728,10 +2751,17 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                                 }
                                 scratch_free(rkeys_hdr);
                             }
+                          } /* if (rshift) */
+                            scratch_free(rshift_hdr);
                         }
+                      } /* if (rank_bits) */
+                        scratch_free(rank_bits_hdr);
                     }
-                    for (uint8_t k = 0; k < n_cols; k++)
-                        if (rank_hdrs[k]) scratch_free(rank_hdrs[k]);
+                    if (rank_buf) {
+                        for (uint32_t k = 0; k < n_cols; k++)
+                            if (rank_hdrs[k]) scratch_free(rank_hdrs[k]);
+                    }
+                    scratch_free(rank_buf_hdr);
                 }
 
                 /* radix_encode_ctx_t (internal.h) carries fixed 16-key
@@ -2766,7 +2796,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                                 .keys = keys, .indices = indices,
                                 .n_keys = n_cols, .vecs = cols,
                             };
-                            for (uint8_t k = 0; k < n_cols; k++) {
+                            for (uint32_t k = 0; k < n_cols; k++) {
                                 enc.mins[k] = mins[k];
                                 enc.ranges[k] = maxs[k] - mins[k];
                                 enc.bit_shifts[k] = bit_shifts[k];
@@ -2812,7 +2842,10 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                         scratch_free(keys_hdr);
                     }
                 }
+              } /* if (minmax) */
+                scratch_free(minmax_hdr);
             }
+            scratch_free(enum_ranks_hdr);
         }
     }
 
@@ -2822,9 +2855,17 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
             for (int64_t i = 0; i < nrows; i++) indices[i] = i;
         /* Null = minimum value.
          * ASC → nulls first (nf=1), DESC → nulls last (nf=0). */
-        uint8_t default_nf[n_cols > 0 ? n_cols : 1];
+        ray_t* default_nf_hdr = NULL;
         if (!nulls_first) {
-            for (uint8_t k = 0; k < n_cols; k++)
+            uint8_t* default_nf = (uint8_t*)scratch_alloc(&default_nf_hdr, n_cols);
+            if (!default_nf) {
+                for (uint32_t k = 0; k < n_cols; k++)
+                    scratch_free(enum_rank_hdrs[k]);
+                scratch_free(enum_rank_hdrs_hdr);
+                scratch_free(indices_hdr);
+                return ray_error("oom", NULL);
+            }
+            for (uint32_t k = 0; k < n_cols; k++)
                 default_nf[k] = descs ? !descs[k] : 1;
             nulls_first = default_nf;
         }
@@ -2845,8 +2886,10 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
             int64_t* tmp = (int64_t*)scratch_alloc(&tmp_hdr,
                                 (size_t)nrows * sizeof(int64_t));
             if (!tmp) {
-                for (uint8_t k = 0; k < n_cols; k++)
+                for (uint32_t k = 0; k < n_cols; k++)
                     scratch_free(enum_rank_hdrs[k]);
+                scratch_free(enum_rank_hdrs_hdr);
+                scratch_free(default_nf_hdr);
                 scratch_free(indices_hdr);
                 return ray_error("oom", NULL);
             }
@@ -2890,6 +2933,7 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
 
             scratch_free(tmp_hdr);
         }
+        scratch_free(default_nf_hdr);
     }
 
 str_msd_done:;
@@ -2904,8 +2948,9 @@ str_msd_done:;
     if (!result || RAY_IS_ERR(result)) {
         if (sorted_keys_out && *sorted_keys_out && keys_hdr_out)
             scratch_free(*keys_hdr_out);
-        for (uint8_t k = 0; k < n_cols; k++)
+        for (uint32_t k = 0; k < n_cols; k++)
             scratch_free(enum_rank_hdrs[k]);
+        scratch_free(enum_rank_hdrs_hdr);
         scratch_free(radix_itmp_hdr);
         scratch_free(indices_hdr);
         return result ? result : ray_error("oom", NULL);
@@ -2917,8 +2962,9 @@ str_msd_done:;
     memcpy(ray_data(result), sorted_idx, (size_t)nrows * sizeof(int64_t));
 
     /* Free all scratch allocations */
-    for (uint8_t k = 0; k < n_cols; k++)
+    for (uint32_t k = 0; k < n_cols; k++)
         scratch_free(enum_rank_hdrs[k]);
+    scratch_free(enum_rank_hdrs_hdr);
     scratch_free(radix_itmp_hdr);
     scratch_free(indices_hdr);
     return result;
@@ -3342,7 +3388,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
     int64_t nrows = ray_table_nrows(tbl);
     int64_t ncols = ray_table_ncols(tbl);
     if (ncols > 4096) return ray_error("nyi", NULL); /* stack safety */
-    uint8_t n_sort = ext->sort.n_cols;
+    uint32_t n_sort = ext->sort.n_cols;
 
     /* ---- Top-K bounded-heap shortcut ----
      * Triggered by the SORT+HEAD fusion (HEAD passes limit > 0).  When
@@ -3360,7 +3406,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
         g && g->selection == NULL) {
         ray_t* key_cols[16];
         int    all_scan = 1;
-        for (uint8_t k = 0; k < n_sort; k++) {
+        for (uint32_t k = 0; k < n_sort; k++) {
             ray_op_t* key_op = op_node(g, ext->sort.columns[k]);
             ray_op_ext_t* key_ext = find_ext(g, key_op->id);
             if (key_ext && key_ext->base.opcode == OP_SCAN) {
@@ -3384,7 +3430,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
                 /* Default nulls-first to !desc per-key when caller
                  * didn't supply a vector. */
                 uint8_t nfs[16];
-                for (uint8_t k = 0; k < n_sort; k++) {
+                for (uint32_t k = 0; k < n_sort; k++) {
                     uint8_t d = ext->sort.desc ? ext->sort.desc[k] : 0;
                     nfs[k] = ext->sort.nulls_first
                              ? ext->sort.nulls_first[k]
@@ -3405,7 +3451,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
     memset(sort_vecs, 0, (n_sort > 0 ? n_sort : 1) * sizeof(ray_t*));
     memset(sort_owned, 0, n_sort > 0 ? n_sort : 1);
 
-    for (uint8_t k = 0; k < n_sort; k++) {
+    for (uint32_t k = 0; k < n_sort; k++) {
         ray_op_t* key_op = op_node(g, ext->sort.columns[k]);
         ray_op_ext_t* key_ext = find_ext(g, key_op->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
@@ -3419,7 +3465,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
         }
         if (!sort_vecs[k] || RAY_IS_ERR(sort_vecs[k])) {
             ray_t* err = sort_vecs[k] ? sort_vecs[k] : ray_error("nyi", NULL);
-            for (uint8_t j = 0; j < k; j++) {
+            for (uint32_t j = 0; j < k; j++) {
                 if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
                     ray_release(sort_vecs[j]);
             }
@@ -3468,7 +3514,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
 sort_idx_ready:;
     if (!idx_vec || RAY_IS_ERR(idx_vec)) {
         if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
-        for (uint8_t k = 0; k < n_sort; k++) {
+        for (uint32_t k = 0; k < n_sort; k++) {
             if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
                 ray_release(sort_vecs[k]);
         }
@@ -3481,7 +3527,7 @@ sort_idx_ready:;
         ray_pool_t* cp = ray_pool_get();
         if (pool_cancelled(cp)) {
             if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
-            for (uint8_t k = 0; k < n_sort; k++) {
+            for (uint32_t k = 0; k < n_sort; k++) {
                 if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
                     ray_release(sort_vecs[k]);
             }
@@ -3498,7 +3544,7 @@ sort_idx_ready:;
     ray_t* result = ray_table_new(ncols);
     if (!result || RAY_IS_ERR(result)) {
         if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
-        for (uint8_t k = 0; k < n_sort; k++) {
+        for (uint32_t k = 0; k < n_sort; k++) {
             if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
                 ray_release(sort_vecs[k]);
         }
@@ -3530,7 +3576,7 @@ sort_idx_ready:;
                 if (new_cols[j]) ray_release(new_cols[j]);
             ray_release(result);
             if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
-            for (uint8_t k = 0; k < n_sort; k++)
+            for (uint32_t k = 0; k < n_sort; k++)
                 if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
                     ray_release(sort_vecs[k]);
             ray_release(idx_vec);
@@ -3642,7 +3688,7 @@ sort_idx_ready:;
     if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
 
     /* Free expression-evaluated sort keys */
-    for (uint8_t k = 0; k < n_sort; k++) {
+    for (uint32_t k = 0; k < n_sort; k++) {
         if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
             ray_release(sort_vecs[k]);
     }
@@ -3851,13 +3897,13 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         /* SYM vector */
         int64_t* syms = (int64_t*)ray_data(keys);
         n_keys = ray_len(keys);
-        if (n_keys > 16) return ray_error("limit", "xasc/xdesc: max 16 key columns");
+        if (n_keys > 16) return ray_error("limit", "xasc/xdesc: max 16 key columns"); /* cut-3: API key-count limit */
         for (int64_t i = 0; i < n_keys; i++) key_ids[i] = syms[i];
     } else if (is_list(keys)) {
         /* List of symbol atoms */
         ray_t** elems = (ray_t**)ray_data(keys);
         n_keys = ray_len(keys);
-        if (n_keys > 16) return ray_error("limit", "xasc/xdesc: max 16 key columns");
+        if (n_keys > 16) return ray_error("limit", "xasc/xdesc: max 16 key columns"); /* cut-3: API key-count limit */
         for (int64_t i = 0; i < n_keys; i++) {
             if (elems[i]->type != -RAY_SYM)
                 return ray_error("type", "xasc/xdesc key must be a symbol");

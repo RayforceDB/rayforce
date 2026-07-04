@@ -2789,7 +2789,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             }
             ray_op_ext_t* ext = find_ext(g, op->id);
             if (!ext) { ray_release(input); return ray_error("nyi", NULL); }
-            uint8_t n_cols = ext->sort.n_cols;
+            uint32_t n_cols = ext->sort.n_cols;
             uint32_t* columns = ext->sort.columns;
 
             /* Sparse-selection pre-compaction (mirrors OP_GROUP): expression
@@ -2833,7 +2833,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             ray_t* saved_table = g->table;
             g->table = input;
 
-            for (uint8_t c = 0; c < n_cols; c++) {
+            for (uint32_t c = 0; c < n_cols; c++) {
                 ray_op_t* col_op = op_node(g, columns[c]);
                 if (col_op->opcode == OP_SCAN) {
                     /* Direct column reference — copy from input table */
@@ -3243,7 +3243,7 @@ static bool subtree_has_default_scan(ray_graph_t* g, ray_op_t* op, bool* ok,
     if (opc == OP_SELECT) {
         ray_op_ext_t* ext = find_ext(g, op->id);
         if (ext) {
-            for (uint8_t c = 0; c < ext->sort.n_cols && *ok; c++)
+            for (uint32_t c = 0; c < ext->sort.n_cols && *ok; c++)
                 found |= subtree_has_default_scan(g, op_node(g, ext->sort.columns[c]), ok, visited);
         }
     } else if (opc == OP_IF || opc == OP_SUBSTR || opc == OP_REPLACE) {
