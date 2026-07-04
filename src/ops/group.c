@@ -2293,6 +2293,9 @@ ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
      * row index; probe/rehash/scatter resolve the actual bytes via
      * group_ht_t.key_data[k].  Currently only RAY_GUID is supported. */
     if (key_types) {
+        /* `&& k < 8`: wide_key_mask/wide_key_esz/wide_key_type are fixed
+         * uint8_t bitmask + [8] arrays in ght_layout_t — a structural cap
+         * independent of any caller's own n_keys gate (cut-4 boundary). */
         for (uint8_t k = 0; k < n_keys && k < 8; k++) {
             if (key_types[k] == RAY_GUID) {
                 ly.wide_key_mask |= (uint8_t)(1u << k);
@@ -2312,6 +2315,8 @@ ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
     }
 
     uint8_t nv = 0;
+    /* `&& a < 8`: the agg_is_* fields below are uint8_t bitmasks / [8]
+     * arrays in ght_layout_t — same structural cap as the key loop above. */
     for (uint8_t a = 0; a < n_aggs && a < 8; a++) {
         /* OP_MEDIAN / OP_TOP_N / OP_BOT_N reserve no row-layout slot —
          * the column is materialized in agg_vecs[a] but values are not
@@ -2374,6 +2379,8 @@ ght_layout_t ght_compute_layout(uint8_t n_keys, uint8_t n_aggs,
      * the legacy fixed-8 layout, so non-STR group-bys are unchanged). */
     {
         uint16_t koff = 0;
+        /* `&& k < 8`: key_off is a fixed [9] array in ght_layout_t (same
+         * structural cap as the loops above). */
         for (uint8_t k = 0; k < n_keys && k < 8; k++) {
             ly.key_off[k] = koff;
             koff += (ly.key_inline_str & (1u << k)) ? 16 : 8;
@@ -2454,6 +2461,7 @@ bool group_ht_init(group_ht_t* ht, uint32_t cap, const ght_layout_t* ly) {
 static inline void group_ht_set_key_data(group_ht_t* ht, void** kd) {
     uint8_t mask = ht->layout.wide_key_mask;
     if (!mask || !kd) return;
+    /* `&& k < 8`: group_ht_t.key_data is a fixed [8] array (internal.h). */
     for (uint8_t k = 0; k < ht->layout.n_keys && k < 8; k++) {
         if (mask & (1u << k)) ht->key_data[k] = kd[k];
     }
@@ -2464,6 +2472,7 @@ static inline void group_ht_set_key_data(group_ht_t* ht, void** kd) {
  * SSO-aware resolution. */
 static inline void derive_key_pool(const ght_layout_t* ly, ray_t* const* key_vecs,
                                    const void** out) {
+    /* `&& k < 8`: `out` is the caller's key_pool[8] (group_ht_t, fixed). */
     for (uint8_t k = 0; k < ly->n_keys && k < 8; k++) {
         out[k] = NULL;
         if ((ly->wide_key_mask & (1u << k)) && ly->wide_key_type[k] == RAY_STR
@@ -2485,6 +2494,7 @@ static inline void group_ht_set_key_pool(group_ht_t* ht, ray_t* const* key_vecs)
 static inline void group_ht_copy_key_pool(group_ht_t* ht, const void* const* kp) {
     uint8_t mask = ht->layout.wide_key_mask;
     if (!mask || !kp) return;
+    /* `&& k < 8`: group_ht_t.key_pool is a fixed [8] array (internal.h). */
     for (uint8_t k = 0; k < ht->layout.n_keys && k < 8; k++)
         if (mask & (1u << k)) ht->key_pool[k] = kp[k];
 }
@@ -2578,15 +2588,19 @@ static inline uint64_t inline_build_keys(const ght_layout_t* ly, const int8_t* k
         ray_t* const* key_vecs, uint8_t nullable, int64_t row,
         char* keybase, int64_t* out_null_mask) {
     uint64_t h = 0;
+    /* int64 null mask: null-tracking tops out at 64 keys — revisit when key
+     * admission passes 64 (cut 3+).  Untriggerable today (keys ≤ 16) — every
+     * `null_mask |= ((int64_t)1 << k)` site in this file shifts in the int64
+     * domain (not 32-bit then widen) so it stays defined once it is. */
     int64_t null_mask = 0;
     uint8_t nk = ly->n_keys;
-    for (uint8_t k = 0; k < nk; k++) {
+    for (uint32_t k = 0; k < nk; k++) {
         char* slot = keybase + ly->key_off[k];
         uint64_t kh;
         bool is_null = (nullable & (1u << k)) && key_vecs && key_vecs[k]
                        && ray_vec_is_null(key_vecs[k], row);
         if (is_null) {
-            null_mask |= (int64_t)(1u << k);
+            null_mask |= ((int64_t)1 << k);
             if (ly->key_inline_str & (1u << k)) memset(slot, 0, sizeof(ray_str_t));
             else *(int64_t*)slot = 0;
             kh = ray_hash_i64(0);
@@ -2624,7 +2638,7 @@ static inline uint64_t hash_keys_inline(const int64_t* keys, const int8_t* key_t
         /* Inline-STR layout: key offsets are shifted by 16-byte descriptors,
          * so address every key via key_off[k] and hash the inline descriptor. */
         uint64_t h = 0;
-        for (uint8_t k = 0; k < n_keys; k++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
             uint64_t kh = inline_layout_key_hash(ly, k, key_types, keys, key_data, key_pool);
             h = (k == 0) ? kh : ray_hash_combine(h, kh);
         }
@@ -2633,7 +2647,7 @@ static inline uint64_t hash_keys_inline(const int64_t* keys, const int8_t* key_t
         return h;
     }
     uint64_t h = 0;
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         uint64_t kh;
         if (wide_mask & (1u << k)) {
             /* Wide key: keys[k] is the source row index.  Resolve + hash the
@@ -2699,7 +2713,7 @@ static inline void init_accum_from_entry(char* row, const char* entry,
         memcpy(&entry_row, entry + ly->entry_stride - 8, 8);
 
     uint8_t bin_mask = ly->agg_is_binary;
-    for (uint8_t a = 0; a < na; a++) {
+    for (uint32_t a = 0; a < na; a++) {
         int8_t s = ly->agg_val_slot[a];
         if (s < 0) continue;
         /* Copy raw 8 bytes from entry into each enabled accumulator block */
@@ -2771,7 +2785,7 @@ static inline void accum_from_entry(char* row, const char* entry,
     if (has_fl)
         memcpy(&entry_row, entry + ly->entry_stride - 8, 8);
 
-    for (uint8_t a = 0; a < na; a++) {
+    for (uint32_t a = 0; a < na; a++) {
         int8_t s = ly->agg_val_slot[a];
         if (s < 0) continue;
         const char* val = agg_data + s * 8;
@@ -2864,7 +2878,7 @@ static inline bool group_keys_equal(const int64_t* a_keys, const int64_t* b_keys
          * their inline descriptors cache-locally (pool only for >12 B). */
         const char* a = (const char*)a_keys;
         const char* b = (const char*)b_keys;
-        for (uint8_t k = 0; k < nk; k++) {
+        for (uint32_t k = 0; k < nk; k++) {
             if (ly->key_inline_str & (1u << k)) {
                 if (!inline_str_eq(ly, k, a_keys, b_keys, key_pool)) return false;
             } else if (wide & (1u << k)) {           /* GUID: row indices */
@@ -2879,7 +2893,7 @@ static inline bool group_keys_equal(const int64_t* a_keys, const int64_t* b_keys
         return *(const int64_t*)(a + ly->key_off[nk]) ==
                *(const int64_t*)(b + ly->key_off[nk]);
     }
-    for (uint8_t k = 0; k < nk; k++) {
+    for (uint32_t k = 0; k < nk; k++) {
         if (wide & (1u << k)) {
             if (!wide_key_eq_at(ly, k, key_data, key_pool, a_keys[k], b_keys[k]))
                 return false;
@@ -2996,7 +3010,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
     /* Check which key columns can produce nulls (parent vec's HAS_NULLS
      * attr for slices) — skips per-row null checks on the fast path. */
     uint8_t nullable_mask = 0;
-    for (uint8_t k = 0; k < nk; k++) {
+    for (uint32_t k = 0; k < nk; k++) {
         if (!key_vecs || !key_vecs[k]) continue;
         ray_t* kv = key_vecs[k];
         ray_t* src = (kv->attrs & RAY_ATTR_SLICE) ? kv->slice_parent : kv;
@@ -3022,13 +3036,13 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
             h = inline_build_keys(ly, key_types, key_data, key_attrs, ht->key_pool,
                                   key_vecs, nullable_mask, row, ebuf + 8, &null_mask);
         } else {
-        for (uint8_t k = 0; k < nk; k++) {
+        for (uint32_t k = 0; k < nk; k++) {
             int8_t t = key_types[k];
             uint64_t kh;
             bool is_null = (nullable_mask & (1u << k))
                            && ray_vec_is_null(key_vecs[k], row);
             if (is_null) {
-                null_mask |= (int64_t)(1u << k);
+                null_mask |= ((int64_t)1 << k);
                 ek[k] = 0;  /* canonical null value — real 0 differs via null_mask */
                 kh = ray_hash_i64(0);
             } else if (wide & (1u << k)) {
@@ -3057,7 +3071,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         uint8_t vi = 0;
         uint8_t bin_mask = ly->agg_is_binary;
         uint8_t hol_mask = ly->agg_is_holistic;
-        for (uint8_t a = 0; a < na; a++) {
+        for (uint32_t a = 0; a < na; a++) {
             /* Holistic agg (OP_MEDIAN): no slot reserved — skip packing.
              * Source column read in the post-radix pass. */
             if (hol_mask & (1u << a)) continue;
@@ -3212,13 +3226,13 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                                   c->key_pool, c->key_vecs, nullable, row,
                                   keybuf, &null_mask);
         } else {
-        for (uint8_t k = 0; k < nk; k++) {
+        for (uint32_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
             uint64_t kh;
             bool is_null = (nullable & (1u << k))
                            && ray_vec_is_null(c->key_vecs[k], row);
             if (is_null) {
-                null_mask |= (int64_t)(1u << k);
+                null_mask |= ((int64_t)1 << k);
                 keys[k] = 0;
                 kh = ray_hash_i64(0);
             } else if (wide & (1u << k)) {
@@ -3242,7 +3256,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         uint8_t vi = 0;
         uint8_t bin_mask = ly->agg_is_binary;
         uint8_t hol_mask = ly->agg_is_holistic;
-        for (uint8_t a = 0; a < na; a++) {
+        for (uint32_t a = 0; a < na; a++) {
             /* Holistic agg (OP_MEDIAN): no slot reserved — skip
              * packing.  Source column is read in the post-radix pass. */
             if (hol_mask & (1u << a)) continue;
@@ -3360,12 +3374,12 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             uint32_t di = off + gi;
 
             /* Scatter keys to result columns */
-            for (uint8_t k = 0; k < nk; k++) {
+            for (uint32_t k = 0; k < nk; k++) {
                 char* dst = c->key_dsts[k];
                 uint8_t esz = c->key_esizes[k];
                 int8_t kt = c->key_types[k];
                 size_t doff = (size_t)di * esz;
-                if (null_mask & (int64_t)(1u << k)) {
+                if (null_mask & ((int64_t)1 << k)) {
                     if (c->key_cols && c->key_cols[k])
                         grp_set_null(c->key_cols[k], di);
                     /* Fill the correct-width sentinel. */
@@ -3407,7 +3421,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             }
 
             /* Scatter agg results to result columns */
-            for (uint8_t a = 0; a < na; a++) {
+            for (uint32_t a = 0; a < na; a++) {
                 /* Holistic aggs (OP_MEDIAN) are filled by the
                  * post-radix pass — skip emitting from the row layout. */
                 if (ly->agg_is_holistic & (1u << a)) continue;
@@ -3629,7 +3643,7 @@ static inline uint32_t group_merge_row(group_ht_t* ht,
                                   skeys, ly, ht->key_data, ht->key_pool)) {
                 *(int64_t*)row += src_count;
                 if (need_sum) {
-                    for (uint8_t a = 0; a < na; a++) {
+                    for (uint32_t a = 0; a < na; a++) {
                         int8_t s = ly->agg_val_slot[a];
                         if (s < 0) continue;
                         size_t off = (size_t)off_sum + (size_t)s * 8;
@@ -3711,13 +3725,13 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
             h = inline_build_keys(ly, c->key_types, c->key_data, c->key_attrs,
                                   kpool, c->key_vecs, nullable, row, ebuf + 8, &null_mask);
         } else {
-        for (uint8_t k = 0; k < nk; k++) {
+        for (uint32_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
             uint64_t kh;
             bool is_null = (nullable & (1u << k))
                            && ray_vec_is_null(c->key_vecs[k], row);
             if (is_null) {
-                null_mask |= (int64_t)(1u << k);
+                null_mask |= ((int64_t)1 << k);
                 ek[k] = 0;
                 kh = ray_hash_i64(0);
             } else if (wide & (1u << k)) {
@@ -3749,7 +3763,7 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
             uint8_t na = ly->n_aggs;
             uint8_t bin_mask = ly->agg_is_binary;
             uint8_t hol_mask = ly->agg_is_holistic;
-            for (uint8_t a = 0; a < na; a++) {
+            for (uint32_t a = 0; a < na; a++) {
                 if (hol_mask & (1u << a)) continue;
                 ray_t* ac = c->agg_vecs ? c->agg_vecs[a] : NULL;
                 if (!ac) continue;
@@ -3980,7 +3994,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                               const agg_prod_t* prod,
                               const double*  sumsq_f64,
                               const int64_t* nn_counts) {
-    for (uint8_t a = 0; a < n_aggs; a++) {
+    for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t agg_op = ext->agg_ops[a];
         ray_t* agg_col = agg_vecs[a];
         /* agg_col == NULL means a fused input.  The accumulator family
@@ -4427,7 +4441,7 @@ static bool sparse_i64_touch(sparse_i64_ht_t* ht, int64_t key, uint8_t n_aggs,
  * by the DA budget check (DA_PER_WORKER_MAX) which limits total_slots to 262K. */
 static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
     int32_t gid = 0;
-    for (uint8_t k = 0; k < c->n_keys; k++) {
+    for (uint32_t k = 0; k < c->n_keys; k++) {
         int64_t val = read_by_esz(c->key_ptrs[k], r, c->key_esz[k]);
         gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]);
     }
@@ -4438,7 +4452,7 @@ static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
 #define DEFINE_DA_COMPOSITE_GID_TYPED(SUFFIX, KTYPE) \
 static inline int32_t da_composite_gid_##SUFFIX(da_ctx_t* c, int64_t r) { \
     int32_t gid = 0; \
-    for (uint8_t k = 0; k < c->n_keys; k++) { \
+    for (uint32_t k = 0; k < c->n_keys; k++) { \
         int64_t val = (int64_t)((const KTYPE*)c->key_ptrs[k])[r]; \
         gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]); \
     } \
@@ -4622,7 +4636,7 @@ static void prod_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
 static bool group_materialize_prod_slots(agg_prod_t* prod, ray_t** agg_vecs,
                                          uint8_t* agg_owned, uint8_t n_aggs,
                                          int64_t nrows) {
-    for (uint8_t a = 0; a < n_aggs; a++) {
+    for (uint32_t a = 0; a < n_aggs; a++) {
         if (!prod[a].enabled) continue;
         ray_t* v = ray_vec_new(RAY_F64, nrows > 0 ? nrows : 1);
         if (!v || RAY_IS_ERR(v)) return false;
@@ -4649,7 +4663,7 @@ typedef struct {
     uint16_t*      agg_ops;
     agg_linear_t*  agg_linear;
     agg_prod_t*    agg_prod;     /* fused SUM/AVG(a*b) slots (may be NULL) */
-    uint8_t        n_aggs;
+    uint32_t       n_aggs;
     uint8_t        need_flags;
     const int64_t* match_idx;    /* NULL = no selection */
     ray_t*         rowsel;
@@ -4701,6 +4715,9 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
     int64_t n = end - start;
 
     int64_t sum = lin->bias_i64 * n;
+    /* n_terms is bounded by AGG_LINEAR_MAX_TERMS (8, internal.h) — an
+     * unrelated fixed cap on linear-expression arity, not a GROUP n_keys/
+     * n_aggs count, so it stays uint8_t. */
     for (uint8_t t = 0; t < lin->n_terms; t++) {
         int64_t coeff = lin->coeff_i64[t];
         if (coeff == 0) continue;
@@ -4719,14 +4736,14 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
 /* Generic scalar accumulation: handles all ops, all types, mask */
 /* Inner scalar accumulation for a single row */
 static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r) {
-    uint8_t n_aggs = c->n_aggs;
+    uint32_t n_aggs = c->n_aggs;
     acc->count[0]++;
     /* Per-(group, agg) non-null counters drive AVG/VAR/STDDEV divisors
      * and all-null finalization for MIN/MAX/PROD/FIRST/LAST.  Only
      * allocated when at least one agg can produce a null
      * (acc->nn_count != NULL). */
     int64_t* nn = acc->nn_count;
-    for (uint8_t a = 0; a < n_aggs; a++) {
+    for (uint32_t a = 0; a < n_aggs; a++) {
         double fv; int64_t iv;
         if (c->agg_prod && c->agg_prod[a].enabled) {
             fv = prod_val_f64(&c->agg_prod[a], r);
@@ -4734,6 +4751,8 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
         } else if (c->agg_linear && c->agg_linear[a].enabled) {
             const agg_linear_t* lin = &c->agg_linear[a];
             iv = lin->bias_i64;
+            /* n_terms bounded by AGG_LINEAR_MAX_TERMS (8) — see the note in
+             * scalar_sum_linear_i64_fn above; unrelated to n_keys/n_aggs. */
             for (uint8_t t = 0; t < lin->n_terms; t++) {
                 iv += lin->coeff_i64[t] *
                       scalar_i64_at(lin->term_ptrs[t], lin->term_types[t], r);
@@ -4852,7 +4871,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
         uint32_t f64m = c->agg_f64_mask;
         uint32_t inm = c->agg_int_null_mask;
         int64_t* nn = acc->nn_count;
-        for (uint8_t a = 0; a < n_aggs; a++) {
+        for (uint32_t a = 0; a < n_aggs; a++) {
             size_t idx = base + a;
             if (c->agg_prod && c->agg_prod[a].enabled) {
                 /* Fused product: gated null-free, so every row counts. */
@@ -4905,7 +4924,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
     bool first_advanced = false, last_advanced = false;
 
     int64_t* nn = acc->nn_count;
-    for (uint8_t a = 0; a < n_aggs; a++) {
+    for (uint32_t a = 0; a < n_aggs; a++) {
         if (!c->agg_ptrs[a] && !(c->agg_prod && c->agg_prod[a].enabled))
             continue;
         size_t idx = base + a;
@@ -5072,7 +5091,7 @@ static void da_accum_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t en
 
     /* Check if all keys share the same element size */
     bool uniform_esz = true;
-    for (uint8_t k = 1; k < n_keys; k++)
+    for (uint32_t k = 1; k < n_keys; k++)
         if (c->key_esz[k] != c->key_esz[0]) { uniform_esz = false; break; }
 
     if (uniform_esz) {
@@ -5130,11 +5149,11 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
         for (int64_t s = start; s < end; s++) {
             size_t base = (size_t)s * n_aggs;
             if (c->need_flags & DA_NEED_SUMSQ) {
-                for (uint8_t a = 0; a < n_aggs; a++)
+                for (uint32_t a = 0; a < n_aggs; a++)
                     merged->sumsq_f64[base + a] += wa->sumsq_f64[base + a];
             }
             if (c->need_flags & DA_NEED_SUM) {
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     size_t idx = base + a;
                     uint16_t aop = c->agg_ops ? c->agg_ops[a] : OP_SUM;
                     /* nn_count is per-(group, agg); count is per group.
@@ -5165,7 +5184,7 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
                 }
             }
             if (c->need_flags & DA_NEED_MIN) {
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     size_t idx = base + a;
                     if (agg_types[a] == RAY_F64) {
                         if (wa->min_val[idx].f < merged->min_val[idx].f)
@@ -5183,7 +5202,7 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
                 }
             }
             if (c->need_flags & DA_NEED_MAX) {
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     size_t idx = base + a;
                     if (agg_types[a] == RAY_F64) {
                         if (wa->max_val[idx].f > merged->max_val[idx].f)
@@ -5201,7 +5220,7 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
                 }
             }
             if (merged->nn_count && wa->nn_count) {
-                for (uint8_t a = 0; a < n_aggs; a++)
+                for (uint32_t a = 0; a < n_aggs; a++)
                     merged->nn_count[base + a] += wa->nn_count[base + a];
             }
             merged->count[s] += wa->count[s];
@@ -5309,13 +5328,13 @@ static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
                                   c->key_pool, key_vecs, nullable, row, keybuf, &null_mask);
             lookup_keys = (const int64_t*)keybuf;
         } else {
-        for (uint8_t k = 0; k < nk; k++) {
+        for (uint32_t k = 0; k < nk; k++) {
             int8_t t = key_types[k];
             uint64_t kh;
             bool is_null = (nullable & (1u << k))
                            && ray_vec_is_null(key_vecs[k], row);
             if (is_null) {
-                null_mask |= (int64_t)(1u << k);
+                null_mask |= ((int64_t)1 << k);
                 ek_buf[k] = 0;
                 kh = ray_hash_i64(0);
             } else if (wide & (1u << k)) {
@@ -5427,8 +5446,8 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
 
-    uint8_t n_keys = ext->n_keys;
-    uint8_t n_aggs = ext->n_aggs;
+    uint32_t n_keys = ext->n_keys;
+    uint32_t n_aggs = ext->n_aggs;
 
     /* Find partition count and total rows from first parted column */
     int32_t n_parts = 0;
@@ -5463,7 +5482,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     int64_t* key_syms = (int64_t*)scratch_alloc(&key_syms_hdr,
             (size_t)key_max * sizeof(int64_t));
     if (!key_syms) return ray_error("oom", NULL);
-    for (uint8_t k = 0; k < n_keys && can_partition; k++) {
+    for (uint32_t k = 0; k < n_keys && can_partition; k++) {
         ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
         if (!ke || ke->base.opcode != OP_SCAN) { can_partition = 0; break; }
         key_syms[k] = ke->sym;
@@ -5473,7 +5492,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     int64_t* agg_syms = (int64_t*)scratch_alloc(&agg_syms_hdr,
             (size_t)agg_max * sizeof(int64_t));
     if (!agg_syms) { scratch_free(key_syms_hdr); return ray_error("oom", NULL); }
-    for (uint8_t a = 0; a < n_aggs && can_partition; a++) {
+    for (uint32_t a = 0; a < n_aggs && can_partition; a++) {
         uint16_t aop = ext->agg_ops[a];
         /* Holistic aggs (OP_MEDIAN / OP_TOP_N / OP_BOT_N) can't be
          * merged across partitions without re-scanning underlying
@@ -5499,7 +5518,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     if (can_partition) {
         int64_t rows_per_part = total_rows / n_parts;
         int64_t est_groups = 1;
-        for (uint8_t k = 0; k < n_keys; k++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
             ray_t* pcol = ray_table_get_col(parted_tbl, key_syms[k]);
             if (!pcol) { est_groups = rows_per_part; break; }
             /* MAPCOMMON key: constant per partition — excluded from
@@ -5594,7 +5613,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 (size_t)needed_max * sizeof(int64_t));
         if (!needed) return ray_error("oom", NULL);
         int n_needed = 0;
-        for (uint8_t k = 0; k < n_keys; k++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
             ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
             if (ke && ke->base.opcode == OP_SCAN) {
                 int dup = 0;
@@ -5603,7 +5622,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 if (!dup) needed[n_needed++] = ke->sym;
             }
         }
-        for (uint8_t a = 0; a < n_aggs; a++) {
+        for (uint32_t a = 0; a < n_aggs; a++) {
             ray_op_ext_t* ae = find_ext(g, ext->agg_ins[a]);
             if (ae && ae->base.opcode == OP_SCAN) {
                 int dup = 0;
@@ -5804,6 +5823,8 @@ static void ray_grp_card_add(int64_t sym, int64_t n_distinct) {
 }
 static int64_t ray_grp_card_lookup(int64_t sym) {
     if (!__VM) return 0;
+    /* grp_card_n is the VM's known-cardinality hint cache (capped at 8 by
+     * ray_grp_card_add above) — unrelated to this GROUP op's n_keys/n_aggs. */
     for (uint8_t i = 0; i < __VM->grp_card_n; i++)
         if (__VM->grp_card_sym[i] == sym) return __VM->grp_card_val[i];
     return 0;
@@ -5835,11 +5856,11 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
 
-    uint8_t nk = ext->n_keys;
+    uint32_t nk = ext->n_keys;
     ray_t*  key_col[8] = {0};   /* source STR column per dict'd key (for output) */
     int64_t dict_sym[8];
     bool any = false;
-    for (uint8_t k = 0; k < nk; k++) {
+    for (uint32_t k = 0; k < nk; k++) {
         ray_op_t* key_op = op_node(g, ext->keys[k]);
         ray_op_ext_t* ke = key_op ? find_ext(g, key_op->id) : NULL;
         if (!ke || ke->base.opcode != OP_SCAN) continue;
@@ -5849,7 +5870,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         if (ray_index_kind(col) != RAY_IDX_DICT) continue;
         /* Skip if any non-COUNT agg reads this key column as strings. */
         bool unsafe = false;
-        for (uint8_t a = 0; a < ext->n_aggs; a++) {
+        for (uint32_t a = 0; a < ext->n_aggs; a++) {
             if (ext->agg_ops[a] == OP_COUNT) continue;
             ray_op_t* ain = op_node(g, ext->agg_ins[a]);
             ray_op_ext_t* ae = ain ? find_ext(g, ain->id) : NULL;
@@ -5869,7 +5890,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name = ray_table_col_name(tbl, c);
         ray_t* use = ray_table_get_col_idx(tbl, c);
-        for (uint8_t k = 0; k < nk; k++)
+        for (uint32_t k = 0; k < nk; k++)
             if (key_col[k] && dict_sym[k] == name) {
                 const ray_index_t* dix = ray_index_payload(key_col[k]->index);
                 use = dix->u.dict.codes;
@@ -5886,7 +5907,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
     ray_release(sub);
 
     if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
-        for (uint8_t k = 0; k < nk; k++) {
+        for (uint32_t k = 0; k < nk; k++) {
             if (!key_col[k]) continue;
             ray_t* codes_col = ray_table_get_col_idx(result, k);
             if (codes_col && codes_col->type == RAY_I32) {
@@ -6046,7 +6067,7 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
          * accumulate then streams raw column pointers and vectorizes. */
         bool contig = (n > 0 && rows[n - 1] - rows[0] + 1 == n);
         int64_t r0 = (n > 0) ? rows[0] : 0;
-        for (uint8_t a = 0; a < c->n_aggs; a++) {
+        for (uint32_t a = 0; a < c->n_aggs; a++) {
             size_t idx = (size_t)ti * c->n_aggs + a;
             if (c->prod[a].enabled) {
                 /* Fused product: gated null-free, every row counts. */
@@ -6181,7 +6202,7 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_t* key_col = ray_table_get_col(tbl, ke->sym);
     if (!key_col || key_col != g->sg_col) return false;
 
-    for (uint8_t a = 0; a < ext->n_aggs; a++) {
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
         if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) return false;
         uint16_t aop = ext->agg_ops[a];
         if (aop == OP_COUNT) continue;    /* group size; input unused */
@@ -6231,7 +6252,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_op_ext_t* ext = find_ext(g, op->id);
     ray_op_ext_t* ke = find_ext(g, ext->keys[0]);
     ray_t* key_col = ray_table_get_col(tbl, ke->sym);
-    uint8_t n_aggs = ext->n_aggs;
+    uint32_t n_aggs = ext->n_aggs;
 
     int64_t K = g->sg_nslices;
     const ray_idx_slice_t* slices = (K > 0)
@@ -6278,15 +6299,18 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* Shared-stream pairing: a bare-scan SUM/AVG over the same column
          * a product's int side already streams rides the product loop —
          * one pass over the column instead of two. */
+        /* pair_sum/fused_by are fixed sg_ctx_t scratch, [16] behind their own
+         * fused-pair gate (sg path requires a key, so n_aggs ≤ 8 here anyway
+         * via the 6684 guard) — not the general n_keys/n_aggs count. */
         for (uint8_t a = 0; a < 16; a++) { ctx.pair_sum[a] = -1; ctx.fused_by[a] = -1; }
-        for (uint8_t a = 0; a < n_aggs; a++) {
+        for (uint32_t a = 0; a < n_aggs; a++) {
             if (!prod[a].enabled) continue;
             const void* ip; int8_t it;
             if (prod[a].ta != RAY_F64)      { ip = prod[a].pa; it = prod[a].ta; }
             else if (prod[a].tb != RAY_F64) { ip = prod[a].pb; it = prod[a].tb; }
             else continue;                   /* F64×F64 — no int side */
             if (it != RAY_I64 && it != RAY_TIME && it != RAY_I32) continue;
-            for (uint8_t b = 0; b < n_aggs; b++) {
+            for (uint32_t b = 0; b < n_aggs; b++) {
                 if (b == a || !agg_vecs[b] || ctx.fused_by[b] >= 0) continue;
                 if (ext->agg_ops[b] != OP_SUM && ext->agg_ops[b] != OP_AVG) continue;
                 if (ray_data(agg_vecs[b]) != ip || agg_vecs[b]->type != it) continue;
@@ -6308,7 +6332,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         for (int64_t ti = 0; ti < n_tasks; ti++) {
             int64_t gi = tasks[ti].gi;
             counts[gi] += tasks[ti].hi - tasks[ti].lo;
-            for (uint8_t a = 0; a < n_aggs; a++) {
+            for (uint32_t a = 0; a < n_aggs; a++) {
                 size_t di = (size_t)gi * n_aggs + a;
                 size_t si = (size_t)ti * n_aggs + a;
                 if (prod[a].enabled || ext->agg_ops[a] == OP_COUNT ||
@@ -6366,6 +6390,11 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
     ray_op_ext_t* ext = find_ext(g, op->id);
+    /* Own gate: this v2-expression shadow path caps both counts at 16 here
+     * (independent of the 6684/8766 exec_group_run guards below — this
+     * helper runs before those, straight off ext->n_keys/n_aggs) and uses
+     * fixed [16] scratch (synth/names/in_ids/keys/ins/ins2) throughout, so
+     * every uint8_t loop below stays uint8_t. */
     if (!ext || ext->n_keys < 1 || ext->n_keys > 16 ||
         ext->n_aggs < 1 || ext->n_aggs > 16) return NULL;
 
@@ -6544,8 +6573,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
 
     int64_t nrows = ray_table_nrows(tbl);
-    uint8_t n_keys = ext->n_keys;
-    uint8_t n_aggs = ext->n_aggs;
+    uint32_t n_keys = ext->n_keys;
+    uint32_t n_aggs = ext->n_aggs;
 
     /* Factorized shortcut: if input is a factorized expand result with
      * (_src, _count) columns, and GROUP BY _src with COUNT/SUM(_count),
@@ -6591,7 +6620,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
             if (sm->total_pass > 0) {
                 bool needs_weighting = false;
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     uint16_t aop = ext->agg_ops[a];
                     ray_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]);
                     if (aop == OP_COUNT) { needs_weighting = true; break; }
@@ -6620,7 +6649,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                  * COUNT(*) → use _count directly
                  * SUM(_count) → use _count directly */
                 bool all_compat = true;
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     uint16_t aop = ext->agg_ops[a];
                     ray_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]);
                     if (aop == OP_COUNT) continue;
@@ -6648,7 +6677,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                             return ray_error("oom", NULL);
                         }
                         result = tmp_r;
-                        for (uint8_t a = 0; a < n_aggs; a++) {
+                        for (uint32_t a = 0; a < n_aggs; a++) {
                             ray_retain(cnt_col);
                             int64_t agg_name = ray_sym_intern("_agg", 4);
                             if (n_aggs > 1) {
@@ -6695,7 +6724,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
 
     /* Resolve key columns (VLA — n_keys ≤ 8; use ≥1 to avoid zero-size VLA UB) */
-    uint8_t vla_keys = n_keys > 0 ? n_keys : 1;
+    uint32_t vla_keys = n_keys > 0 ? n_keys : 1;
     ray_t* key_vecs[vla_keys];
     memset(key_vecs, 0, vla_keys * sizeof(ray_t*));
 
@@ -6704,8 +6733,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     /* Source-column sym per key (OP_SCAN keys only; -1 for expression keys) —
      * used to consult the dict known-cardinality map for the DA-reject. */
     int64_t key_scan_sym[vla_keys];
-    for (uint8_t k = 0; k < vla_keys; k++) key_scan_sym[k] = -1;
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < vla_keys; k++) key_scan_sym[k] = -1;
+    for (uint32_t k = 0; k < n_keys; k++) {
         ray_op_t* key_op = op_node(g, ext->keys[k]);
         ray_op_ext_t* key_ext = find_ext(g, key_op->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
@@ -6723,14 +6752,20 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             }
         }
         if (!key_vecs[k]) {
-            for (uint8_t j = 0; j < k; j++)
+            for (uint32_t j = 0; j < k; j++)
                 if (key_owned[j] && key_vecs[j]) ray_release(key_vecs[j]);
             return ray_error("domain", "by: column not found in table");
         }
     }
 
-    /* Resolve agg input columns (VLA — n_aggs ≤ 8; use ≥1 to avoid zero-size VLA UB) */
-    uint8_t vla_aggs = n_aggs > 0 ? n_aggs : 1;
+    /* Resolve agg input columns (VLA; use ≥1 to avoid zero-size VLA UB).
+     * n_aggs is ≤ 8 here whenever n_keys > 0 (the 6684 guard), but the
+     * keyless path (n_keys == 0) admits any n_aggs up to the query.c
+     * compile-side cap (255 today) — these arrays scale with it.  Not
+     * carved in this pass: Task 2 scoped the keyless-VLA carve to the
+     * scalar fast path's own per-agg cluster below (sc_vla_hdr); revisit
+     * this shared preamble when the 255 cap is lifted (cut 3/4). */
+    uint32_t vla_aggs = n_aggs > 0 ? n_aggs : 1;
     ray_t* agg_vecs[vla_aggs];
     /* Second input column per agg — non-NULL only for binary aggs
      * (OP_PEARSON_CORR).  Allocated independently of agg_vecs because
@@ -6752,7 +6787,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     memset(agg_linear, 0, vla_aggs * sizeof(agg_linear_t));
     memset(agg_prod,   0, vla_aggs * sizeof(agg_prod_t));
 
-    for (uint8_t a = 0; a < n_aggs; a++) {
+    for (uint32_t a = 0; a < n_aggs; a++) {
         ray_op_t* agg_input_op = op_node(g, ext->agg_ins[a]);
         ray_op_ext_t* agg_ext = find_ext(g, agg_input_op->id);
 
@@ -6807,9 +6842,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_t* vec = exec_node(g, agg_input_op);
             g->table = saved_table;
             if (vec && RAY_IS_ERR(vec)) {
-                for (uint8_t i = 0; i < a; i++)
+                for (uint32_t i = 0; i < a; i++)
                     { if (agg_owned[i] && agg_vecs[i]) ray_release(agg_vecs[i]); if (agg_owned2[i] && agg_vecs2[i]) ray_release(agg_vecs2[i]); }
-                for (uint8_t k = 0; k < n_keys; k++)
+                for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                 return vec;
             }
@@ -6850,9 +6885,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     g->table = saved_table;
                     if (vec && RAY_IS_ERR(vec)) {
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint8_t i = 0; i < a; i++)
+                        for (uint32_t i = 0; i < a; i++)
                             { if (agg_owned[i] && agg_vecs[i]) ray_release(agg_vecs[i]); if (agg_owned2[i] && agg_vecs2[i]) ray_release(agg_vecs2[i]); }
-                        for (uint8_t k = 0; k < n_keys; k++)
+                        for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                         return vec;
                     }
@@ -6868,7 +6903,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     /* Normalize scalar agg inputs to full-length vectors.
      * Constants and scalar sub-expressions (len=1) must be broadcast to nrows
      * before row-wise aggregation loops. */
-    for (uint8_t a = 0; a < n_aggs; a++) {
+    for (uint32_t a = 0; a < n_aggs; a++) {
         if (!agg_vecs[a] || RAY_IS_ERR(agg_vecs[a])) continue;
         if (ext->agg_ops[a] == OP_COUNT) continue; /* value is ignored for COUNT */
         if (agg_strlen[a]) continue;
@@ -6879,10 +6914,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
         ray_t* bcast = materialize_broadcast_input(agg_vecs[a], nrows);
         if (!bcast || RAY_IS_ERR(bcast)) {
-            for (uint8_t i = 0; i < n_aggs; i++) {
+            for (uint32_t i = 0; i < n_aggs; i++) {
                 { if (agg_owned[i] && agg_vecs[i]) ray_release(agg_vecs[i]); if (agg_owned2[i] && agg_vecs2[i]) ray_release(agg_vecs2[i]); }
             }
-            for (uint8_t k = 0; k < n_keys; k++) {
+            for (uint32_t k = 0; k < n_keys; k++) {
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
             }
             return bcast && RAY_IS_ERR(bcast) ? bcast : ray_error("oom", NULL);
@@ -6897,7 +6932,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     void* key_data[vla_keys];
     int8_t key_types[vla_keys];
     uint8_t key_attrs[vla_keys];
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         if (key_vecs[k]) {
             key_data[k]  = ray_data(key_vecs[k]);
             key_types[k] = key_vecs[k]->type;
@@ -6936,12 +6971,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * them. Without this the Pearson slot accumulates nothing and emit
      * falls to its integer default, returning 0. */
     bool sc_has_binary = false;
-    for (uint8_t a = 0; a < n_aggs; a++)
+    for (uint32_t a = 0; a < n_aggs; a++)
         if (ext->agg_ops[a] == OP_PEARSON_CORR) { sc_has_binary = true; break; }
     if (n_keys == 0 && nrows > 0 && !sc_has_binary) {
         uint8_t need_flags = DA_NEED_COUNT;
         bool has_first_last = false;
-        for (uint8_t a = 0; a < n_aggs; a++) {
+        for (uint32_t a = 0; a < n_aggs; a++) {
             uint16_t aop = ext->agg_ops[a];
             if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_FIRST || aop == OP_LAST)
                 need_flags |= DA_NEED_SUM;
@@ -6952,15 +6987,29 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (aop == OP_FIRST || aop == OP_LAST) has_first_last = true;
         }
 
-        void* agg_ptrs[vla_aggs];
-        int8_t agg_types[vla_aggs];
-        int64_t sc_int_null_sentinel[vla_aggs];
+        /* Keyless path serves unbounded n_aggs — VLAs here scale with the query,
+         * so carve exactly (8-byte arrays first). */
+        ray_t* sc_vla_hdr = NULL;
+        size_t sc_vla_bytes = (size_t)vla_aggs * (sizeof(void*) + sizeof(int64_t)
+                                                  + sizeof(int8_t) + sizeof(bool));
+        uint8_t* sc_blk = (uint8_t*)scratch_alloc(&sc_vla_hdr, sc_vla_bytes);
+        if (!sc_blk) {
+            for (uint32_t a = 0; a < n_aggs; a++)
+                { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
+            for (uint32_t k = 0; k < n_keys; k++)
+                if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+            if (match_idx_block) ray_release(match_idx_block);
+            return ray_error("oom", NULL);
+        }
+        void*    *agg_ptrs             = (void**)sc_blk;
+        int64_t  *sc_int_null_sentinel = (int64_t*)(agg_ptrs + vla_aggs);
+        int8_t   *agg_types            = (int8_t*)(sc_int_null_sentinel + vla_aggs);
         /* Per-element flag, not a bitmask: this path's n_aggs is VLA-sized
          * with no fixed cap, so a fixed-width bitmask would silently alias
          * once n_aggs exceeded its bit width. */
-        bool sc_int_null_has[vla_aggs];
+        bool     *sc_int_null_has      = (bool*)(agg_types + vla_aggs);
         bool sc_any_nullable = false;
-        for (uint8_t a = 0; a < n_aggs; a++) {
+        for (uint32_t a = 0; a < n_aggs; a++) {
             if (agg_prod[a].enabled) {
                 /* Fused product: F64 accumulate, no source vec. */
                 agg_ptrs[a]  = NULL;
@@ -7008,7 +7057,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* sc_hdr;
         da_accum_t* sc_acc = (da_accum_t*)scratch_calloc(&sc_hdr,
             sc_n * sizeof(da_accum_t));
-        if (!sc_acc) goto da_path;
+        if (!sc_acc) { scratch_free(sc_vla_hdr); goto da_path; }
 
         /* Allocate 1-slot accumulators per worker (n_aggs entries) */
         bool alloc_ok = true;
@@ -7022,7 +7071,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 sc_acc[w].min_val = (da_val_t*)scratch_alloc(&sc_acc[w]._h_min,
                     n_aggs * sizeof(da_val_t));
                 if (!sc_acc[w].min_val) { alloc_ok = false; break; }
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     if (agg_types[a] == RAY_F64) sc_acc[w].min_val[a].f = DBL_MAX;
                     else sc_acc[w].min_val[a].i = INT64_MAX;
                 }
@@ -7031,7 +7080,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 sc_acc[w].max_val = (da_val_t*)scratch_alloc(&sc_acc[w]._h_max,
                     n_aggs * sizeof(da_val_t));
                 if (!sc_acc[w].max_val) { alloc_ok = false; break; }
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     if (agg_types[a] == RAY_F64) sc_acc[w].max_val[a].f = -DBL_MAX;
                     else sc_acc[w].max_val[a].i = INT64_MIN;
                 }
@@ -7053,6 +7102,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (!alloc_ok) {
             for (uint32_t w = 0; w < sc_n; w++) da_accum_free(&sc_acc[w]);
             scratch_free(sc_hdr);
+            scratch_free(sc_vla_hdr);
             goto da_path;
         }
 
@@ -7114,7 +7164,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         for (uint32_t w = 1; w < sc_n; w++) {
             da_accum_t* wa = &sc_acc[w];
             if (need_flags & DA_NEED_SUM) {
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     uint16_t merge_op = ext->agg_ops[a];
                     /* nn_count is per-agg; count is per worker.  Fall back
                      * to count when nn_count is absent (no nullable aggs). */
@@ -7144,11 +7194,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 }
             }
             if (need_flags & DA_NEED_SUMSQ) {
-                for (uint8_t a = 0; a < n_aggs; a++)
+                for (uint32_t a = 0; a < n_aggs; a++)
                     m->sumsq_f64[a] += wa->sumsq_f64[a];
             }
             if (need_flags & DA_NEED_MIN) {
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     if (agg_types[a] == RAY_F64) {
                         if (wa->min_val[a].f < m->min_val[a].f)
                             m->min_val[a].f = wa->min_val[a].f;
@@ -7165,7 +7215,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 }
             }
             if (need_flags & DA_NEED_MAX) {
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     if (agg_types[a] == RAY_F64) {
                         if (wa->max_val[a].f > m->max_val[a].f)
                             m->max_val[a].f = wa->max_val[a].f;
@@ -7182,7 +7232,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 }
             }
             if (m->nn_count && wa->nn_count) {
-                for (uint8_t a = 0; a < n_aggs; a++)
+                for (uint32_t a = 0; a < n_aggs; a++)
                     m->nn_count[a] += wa->nn_count[a];
             }
             m->count[0] += wa->count[0];
@@ -7193,9 +7243,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* result = ray_table_new(n_aggs);
         if (!result || RAY_IS_ERR(result)) {
             da_accum_free(&sc_acc[0]); scratch_free(sc_hdr);
-            for (uint8_t a = 0; a < n_aggs; a++)
+            scratch_free(sc_vla_hdr);
+            for (uint32_t a = 0; a < n_aggs; a++)
                 { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
-            for (uint8_t k = 0; k < n_keys; k++)
+            for (uint32_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
             if (match_idx_block) ray_release(match_idx_block);
             return result ? result : ray_error("oom", NULL);
@@ -7211,7 +7262,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * fixed-width slots (it truncated them to 1 byte above).  Recompute
          * those 1-row columns by materialising the winning row — mirroring
          * exec_reduction — and override them in the result table. */
-        for (uint8_t a = 0; a < n_aggs; a++) {
+        for (uint32_t a = 0; a < n_aggs; a++) {
             uint16_t aop = ext->agg_ops[a];
             if (!(agg_vecs[a] && agg_is_wide_type(agg_vecs[a]->type) &&
                   (aop == OP_MIN || aop == OP_MAX ||
@@ -7254,7 +7305,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * carry the K argument, so they keep their scalar-builtin form.) */
         {
             bool any_med = false;
-            for (uint8_t a = 0; a < n_aggs; a++)
+            for (uint32_t a = 0; a < n_aggs; a++)
                 if (ext->agg_ops[a] == OP_MEDIAN) { any_med = true; break; }
             if (any_med) {
                 ray_t* hsel_blk = NULL; const int64_t* hsel = NULL; int64_t hscan = nrows;
@@ -7275,7 +7326,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     else      { for (int64_t i = 0; i < hscan; i++) idxb[i] = i; }
                     int64_t offs[1] = {0};
                     int64_t cnts[1] = {hscan};
-                    for (uint8_t a = 0; a < n_aggs; a++) {
+                    for (uint32_t a = 0; a < n_aggs; a++) {
                         if (ext->agg_ops[a] != OP_MEDIAN || !agg_vecs[a]) continue;
                         ray_t* hv = ray_median_per_group_buf(agg_vecs[a], idxb, offs, cnts, 1);
                         if (hv && !RAY_IS_ERR(hv)) ray_table_set_col_idx(result, a, hv);
@@ -7288,9 +7339,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
 
         da_accum_free(&sc_acc[0]); scratch_free(sc_hdr);
-        for (uint8_t a = 0; a < n_aggs; a++)
+        scratch_free(sc_vla_hdr);
+        for (uint32_t a = 0; a < n_aggs; a++)
             { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
-        for (uint8_t k = 0; k < n_keys; k++)
+        for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
         if (match_idx_block) ray_release(match_idx_block);
         return result;
@@ -7315,7 +7367,7 @@ da_path:;
          * Holistic aggregators (OP_MEDIAN / OP_TOP_N / OP_BOT_N) have
          * no per-row accumulator at all — they need the post-radix
          * row_gid+grp_cnt pass which only the HT path provides. */
-        for (uint8_t a = 0; a < n_aggs && da_eligible; a++) {
+        for (uint32_t a = 0; a < n_aggs && da_eligible; a++) {
             uint16_t aop = ext->agg_ops[a];
             if (aop == OP_PEARSON_CORR) da_eligible = false;
             if (aop == OP_MEDIAN)       da_eligible = false;
@@ -7328,7 +7380,7 @@ da_path:;
                  aop == OP_FIRST || aop == OP_LAST))
                 da_eligible = false;
         }
-        for (uint8_t k = 0; k < n_keys && da_eligible; k++) {
+        for (uint32_t k = 0; k < n_keys && da_eligible; k++) {
             if (!key_data[k]) { da_eligible = false; break; }
             int8_t t = key_types[k];
             if (t != RAY_I64 && t != RAY_SYM && t != RAY_I32
@@ -7358,7 +7410,7 @@ da_path:;
          * this over-reject, but that is a perf-only effect. */
         if (da_eligible && __VM && __VM->grp_card_n > 0) {
             uint64_t known_ub = 1;
-            for (uint8_t k = 0; k < n_keys; k++) {
+            for (uint32_t k = 0; k < n_keys; k++) {
                 if (key_scan_sym[k] < 0) continue;
                 int64_t card = ray_grp_card_lookup(key_scan_sym[k]);
                 if (card <= 1) continue;
@@ -7386,7 +7438,7 @@ da_path:;
             /* Shared across keys: once any key proves the DA slot count
              * infeasible the scan aborts instead of reading the rest. */
             _Atomic(int) mm_abort = 0;
-            for (uint8_t k = 0; k < n_keys && da_fits; k++) {
+            for (uint32_t k = 0; k < n_keys && da_fits; k++) {
                 int64_t kmin, kmax;
                 for (uint32_t w = 0; w < mm_n; w++) {
                     mm_mins[w] = INT64_MAX;
@@ -7433,7 +7485,7 @@ da_path:;
         if (da_fits) {
             /* Compute which accumulator arrays we actually need */
             uint8_t need_flags = DA_NEED_COUNT; /* always need count */
-            for (uint8_t a = 0; a < n_aggs; a++) {
+            for (uint32_t a = 0; a < n_aggs; a++) {
                 uint16_t aop = ext->agg_ops[a];
                 if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_FIRST || aop == OP_LAST) need_flags |= DA_NEED_SUM;
                 else if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
@@ -7461,7 +7513,7 @@ da_path:;
             uint8_t need_flags = DA_NEED_COUNT;
             bool all_sum = true;
             bool da_has_first_last = false;
-            for (uint8_t a = 0; a < n_aggs; a++) {
+            for (uint32_t a = 0; a < n_aggs; a++) {
                 uint16_t aop = ext->agg_ops[a];
                 if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_FIRST || aop == OP_LAST) need_flags |= DA_NEED_SUM;
                 else if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
@@ -7477,9 +7529,9 @@ da_path:;
              * Guard against overflow: if any product exceeds INT64_MAX,
              * fall through to HT path. */
             bool stride_overflow = false;
-            for (uint8_t k = 0; k < n_keys; k++) {
+            for (uint32_t k = 0; k < n_keys; k++) {
                 int64_t s = 1;
-                for (uint8_t j = k + 1; j < n_keys; j++) {
+                for (uint32_t j = k + 1; j < n_keys; j++) {
                     if (da_key_range[j] != 0 && s > INT64_MAX / da_key_range[j]) {
                         stride_overflow = true; break;
                     }
@@ -7493,6 +7545,9 @@ da_path:;
             uint32_t n_slots = (uint32_t)total_slots;
             size_t total = (size_t)n_slots * n_aggs;
 
+            /* VLA bounded ≤8: this whole block is under da_fits, which
+             * requires da_eligible, which requires n_keys > 0 (line ~7360)
+             * — and n_keys > 0 forces n_aggs ≤ 8 via the 6684 guard. */
             void* agg_ptrs[vla_aggs];
             int8_t agg_types[vla_aggs];
             int64_t da_int_null_sentinel[vla_aggs];
@@ -7503,7 +7558,7 @@ da_path:;
              * F64 with HAS_NULLS uses NaN-skip; sentinel-typed integers
              * with HAS_NULLS use sentinel-skip. */
             bool da_any_nullable = false;
-            for (uint8_t a = 0; a < n_aggs; a++) {
+            for (uint32_t a = 0; a < n_aggs; a++) {
                 if (agg_prod[a].enabled) {
                     /* Fused product: F64 accumulate, no source vec. */
                     agg_ptrs[a]  = NULL;
@@ -7625,7 +7680,7 @@ da_path:;
 
             /* Pre-compute per-key element sizes for fast DA reads */
             uint8_t da_key_esz[n_keys];
-            for (uint8_t k = 0; k < n_keys; k++)
+            for (uint32_t k = 0; k < n_keys; k++)
                 da_key_esz[k] = ray_sym_elem_size(key_types[k], key_attrs[k]);
 
             /* strlen-on-SYM aggs (e.g. avg(strlen URL)) read the sym
@@ -7634,7 +7689,7 @@ da_path:;
              * once and let da_accum_row index it lock-free. */
             ray_t** da_sym_strings = NULL;
             uint32_t da_sym_count = 0;
-            for (uint8_t a = 0; a < n_aggs; a++) {
+            for (uint32_t a = 0; a < n_aggs; a++) {
                 if (agg_strlen[a] && agg_vecs[a] &&
                     agg_vecs[a]->type == RAY_SYM) {
                     ray_sym_strings_borrow(&da_sym_strings, &da_sym_count);
@@ -7680,7 +7735,7 @@ da_path:;
 
             /* Check if any agg is FIRST/LAST (needs ordered per-worker merge) */
             bool has_first_last = false;
-            for (uint8_t a = 0; a < n_aggs; a++) {
+            for (uint32_t a = 0; a < n_aggs; a++) {
                 uint16_t aop = ext->agg_ops[a];
                 if (aop == OP_FIRST || aop == OP_LAST) { has_first_last = true; break; }
             }
@@ -7704,7 +7759,7 @@ da_path:;
                                 wa->first_row[s] < merged->first_row[s];
                             bool take_last  = wa->last_row && merged->last_row &&
                                 wa->last_row[s]  > merged->last_row[s];
-                            for (uint8_t a = 0; a < n_aggs; a++) {
+                            for (uint32_t a = 0; a < n_aggs; a++) {
                                 size_t idx = base + a;
                                 uint16_t aop = ext->agg_ops[a];
                                 if (aop == OP_SUM || aop == OP_AVG || aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP) {
@@ -7804,7 +7859,7 @@ da_path:;
                     if (need_flags & DA_NEED_SUM) {
                         for (uint32_t s = 0; s < n_slots; s++) {
                             size_t base = (size_t)s * n_aggs;
-                            for (uint8_t a = 0; a < n_aggs; a++) {
+                            for (uint32_t a = 0; a < n_aggs; a++) {
                                 size_t idx = base + a;
                                 uint16_t aop = ext->agg_ops[a];
                                 int64_t mnn = merged->nn_count ? merged->nn_count[idx] : merged->count[s];
@@ -7908,16 +7963,16 @@ da_path:;
             ray_t* result = ray_table_new(total_cols);
             if (!result || RAY_IS_ERR(result)) {
                 da_accum_free(&accums[0]); scratch_free(accums_hdr);
-                for (uint8_t a = 0; a < n_aggs; a++)
+                for (uint32_t a = 0; a < n_aggs; a++)
                     { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
-                for (uint8_t k = 0; k < n_keys; k++)
+                for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                 if (match_idx_block) ray_release(match_idx_block);
                 return result ? result : ray_error("oom", NULL);
             }
 
             /* Key columns — decompose composite slot back to per-key values */
-            for (uint8_t k = 0; k < n_keys; k++) {
+            for (uint32_t k = 0; k < n_keys; k++) {
                 ray_t* src_col = key_vecs[k];
                 if (!src_col) continue;
                 ray_t* key_col = col_vec_new(src_col, (int64_t)grp_count);
@@ -7962,7 +8017,7 @@ da_path:;
             for (uint32_t s = 0; s < n_slots; s++) {
                 if (da_count[s] < da_keep_min) continue;
                 dense_counts[gi] = da_count[s];
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     size_t si = (size_t)s * n_aggs + a;
                     size_t di = (size_t)gi * n_aggs + a;
                     if (dense_sum)     dense_sum[di]     = da_sum[si];
@@ -7987,9 +8042,9 @@ da_path:;
             scratch_free(_h_dnn);
 
             da_accum_free(&accums[0]); scratch_free(accums_hdr);
-            for (uint8_t a = 0; a < n_aggs; a++)
+            for (uint32_t a = 0; a < n_aggs; a++)
                 { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
-            for (uint8_t k = 0; k < n_keys; k++)
+            for (uint32_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
             if (match_idx_block) ray_release(match_idx_block);
             return result;
@@ -8010,7 +8065,7 @@ da_path:;
                 sp_eligible = false;
         }
         bool sp_need_sum = false;
-        for (uint8_t a = 0; a < n_aggs && sp_eligible; a++) {
+        for (uint32_t a = 0; a < n_aggs && sp_eligible; a++) {
             uint16_t op = ext->agg_ops[a];
             if (op == OP_COUNT) continue;
             if (op != OP_SUM && op != OP_AVG)
@@ -8036,10 +8091,12 @@ da_path:;
             if (!group_materialize_prod_slots(agg_prod, agg_vecs, agg_owned,
                                               n_aggs, nrows))
                 goto ht_path;
+            /* VLA bounded ≤8: sp_eligible requires n_keys == 1 (line ~8033),
+             * and n_keys > 0 forces n_aggs ≤ 8 via the 6684 guard. */
             void* agg_ptrs[vla_aggs];
             int8_t agg_types[vla_aggs];
             uint32_t agg_f64_mask = 0;
-            for (uint8_t a = 0; a < n_aggs; a++) {
+            for (uint32_t a = 0; a < n_aggs; a++) {
                 if (agg_vecs[a]) {
                     agg_ptrs[a] = ray_data(agg_vecs[a]);
                     agg_types[a] = agg_vecs[a]->type;
@@ -8052,7 +8109,7 @@ da_path:;
             }
             ray_t** strlen_sym_strings = NULL;
             uint32_t strlen_sym_count = 0;
-            for (uint8_t a = 0; a < n_aggs; a++) {
+            for (uint32_t a = 0; a < n_aggs; a++) {
                 if (agg_strlen[a] && agg_vecs[a] &&
                     agg_vecs[a]->type == RAY_SYM) {
                     ray_sym_strings_borrow(&strlen_sym_strings,
@@ -8127,7 +8184,7 @@ da_path:;
         if (range_count[off] != UINT32_MAX) range_count[off]++;                  \
         if (range_sum) {                                                         \
             da_val_t* sums = &range_sum[(size_t)off * n_aggs];                   \
-            for (uint8_t a = 0; a < n_aggs; a++) {                               \
+            for (uint32_t a = 0; a < n_aggs; a++) {                               \
                 if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;       \
                 if (agg_strlen[a])                                               \
                     sums[a].i += group_strlen_at_cached(                         \
@@ -8185,9 +8242,9 @@ dyn_dense_done:
                     ray_t* result = ray_table_new((int64_t)n_keys + n_aggs);
                     if (!result || RAY_IS_ERR(result)) {
                         scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
-                        for (uint8_t a = 0; a < n_aggs; a++)
+                        for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint8_t k = 0; k < n_keys; k++)
+                        for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                         if (match_idx_block) ray_release(match_idx_block);
                         return result ? result : ray_error("oom", NULL);
@@ -8201,9 +8258,9 @@ dyn_dense_done:
                     if (!key_col || RAY_IS_ERR(key_col)) {
                         scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
                         ray_release(result);
-                        for (uint8_t a = 0; a < n_aggs; a++)
+                        for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint8_t k = 0; k < n_keys; k++)
+                        for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                         if (match_idx_block) ray_release(match_idx_block);
                         return key_col ? key_col : ray_error("oom", NULL);
@@ -8221,9 +8278,9 @@ dyn_dense_done:
                         scratch_free(_h_sum); scratch_free(_h_cnt);
                         scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
                         ray_release(key_col); ray_release(result);
-                        for (uint8_t a = 0; a < n_aggs; a++)
+                        for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint8_t k = 0; k < n_keys; k++)
+                        for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                         if (match_idx_block) ray_release(match_idx_block);
                         return ray_error("oom", NULL);
@@ -8260,7 +8317,7 @@ dyn_dense_done:
         uint32_t marker = range_count[(uint64_t)key];                            \
         if (!marker) break;                                                      \
         da_val_t* sums = &dense_sum[(size_t)(marker - 1u) * n_aggs];             \
-        for (uint8_t a = 0; a < n_aggs; a++) {                                   \
+        for (uint32_t a = 0; a < n_aggs; a++) {                                   \
             if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;           \
             if (agg_strlen[a])                                                   \
                 sums[a].i += group_strlen_at_cached(                             \
@@ -8316,9 +8373,9 @@ dyn_dense_done:
 
                     scratch_free(_h_sum); scratch_free(_h_cnt);
                     scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
-                    for (uint8_t a = 0; a < n_aggs; a++)
+                    for (uint32_t a = 0; a < n_aggs; a++)
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                    for (uint8_t k = 0; k < n_keys; k++)
+                    for (uint32_t k = 0; k < n_keys; k++)
                         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                     if (match_idx_block) ray_release(match_idx_block);
                     return result;
@@ -8379,7 +8436,7 @@ dyn_dense_done:
                             range_count[off]++;
                         if (range_sum) {
                             da_val_t* sums = &range_sum[(size_t)off * n_aggs];
-                            for (uint8_t a = 0; a < n_aggs; a++) {
+                            for (uint32_t a = 0; a < n_aggs; a++) {
                                 if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                                     continue;
                                 if (agg_strlen[a])
@@ -8412,9 +8469,9 @@ dyn_dense_done:
                     if (!result || RAY_IS_ERR(result)) {
                         scratch_free(range_sum_hdr);
                         scratch_free(cnt_hdr);
-                        for (uint8_t a = 0; a < n_aggs; a++)
+                        for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint8_t k = 0; k < n_keys; k++)
+                        for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                         if (match_idx_block) ray_release(match_idx_block);
                         return result ? result : ray_error("oom", NULL);
@@ -8429,9 +8486,9 @@ dyn_dense_done:
                         scratch_free(range_sum_hdr);
                         scratch_free(cnt_hdr);
                         ray_release(result);
-                        for (uint8_t a = 0; a < n_aggs; a++)
+                        for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint8_t k = 0; k < n_keys; k++)
+                        for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                         if (match_idx_block) ray_release(match_idx_block);
                         return key_col ? key_col : ray_error("oom", NULL);
@@ -8449,9 +8506,9 @@ dyn_dense_done:
                         scratch_free(range_sum_hdr);
                         scratch_free(cnt_hdr);
                         ray_release(key_col); ray_release(result);
-                        for (uint8_t a = 0; a < n_aggs; a++)
+                        for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint8_t k = 0; k < n_keys; k++)
+                        for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                         if (match_idx_block) ray_release(match_idx_block);
                         return ray_error("oom", NULL);
@@ -8487,7 +8544,7 @@ dyn_dense_done:
                             uint32_t marker = range_count[off];
                             if (!marker) continue;
                             da_val_t* sums = &dense_sum[(size_t)(marker - 1u) * n_aggs];
-                            for (uint8_t a = 0; a < n_aggs; a++) {
+                            for (uint32_t a = 0; a < n_aggs; a++) {
                                 if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                                     continue;
                                 if (agg_strlen[a])
@@ -8520,9 +8577,9 @@ dyn_dense_done:
 
                     scratch_free(_h_sum);
                     scratch_free(_h_cnt);
-                    for (uint8_t a = 0; a < n_aggs; a++)
+                    for (uint32_t a = 0; a < n_aggs; a++)
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                    for (uint8_t k = 0; k < n_keys; k++)
+                    for (uint32_t k = 0; k < n_keys; k++)
                         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                     if (match_idx_block) ray_release(match_idx_block);
                     return result;
@@ -8575,7 +8632,7 @@ dyn_dense_done:
                     sp_ht.counts[slot]++;
                     if (!sp_need_sum) continue;
                     da_val_t* sums = &sp_ht.sums[(size_t)slot * n_aggs];
-                    for (uint8_t a = 0; a < n_aggs; a++) {
+                    for (uint32_t a = 0; a < n_aggs; a++) {
                         if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                             continue;
                         if (agg_strlen[a])
@@ -8612,9 +8669,9 @@ dyn_dense_done:
             ray_t* result = ray_table_new((int64_t)n_keys + n_aggs);
             if (!result || RAY_IS_ERR(result)) {
                 sparse_i64_free(&sp_ht);
-                for (uint8_t a = 0; a < n_aggs; a++)
+                for (uint32_t a = 0; a < n_aggs; a++)
                     if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                for (uint8_t k = 0; k < n_keys; k++)
+                for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                 if (match_idx_block) ray_release(match_idx_block);
                 return result ? result : ray_error("oom", NULL);
@@ -8628,9 +8685,9 @@ dyn_dense_done:
             if (!key_col || RAY_IS_ERR(key_col)) {
                 sparse_i64_free(&sp_ht);
                 ray_release(result);
-                for (uint8_t a = 0; a < n_aggs; a++)
+                for (uint32_t a = 0; a < n_aggs; a++)
                     if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                for (uint8_t k = 0; k < n_keys; k++)
+                for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                 if (match_idx_block) ray_release(match_idx_block);
                 return key_col ? key_col : ray_error("oom", NULL);
@@ -8648,9 +8705,9 @@ dyn_dense_done:
                 scratch_free(_h_sum); scratch_free(_h_cnt);
                 ray_release(key_col); ray_release(result);
                 sparse_i64_free(&sp_ht);
-                for (uint8_t a = 0; a < n_aggs; a++)
+                for (uint32_t a = 0; a < n_aggs; a++)
                     if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                for (uint8_t k = 0; k < n_keys; k++)
+                for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                 if (match_idx_block) ray_release(match_idx_block);
                 return ray_error("oom", NULL);
@@ -8665,9 +8722,9 @@ dyn_dense_done:
                     scratch_free(_h_sum); scratch_free(_h_cnt);
                     ray_release(key_col); ray_release(result);
                     sparse_i64_free(&sp_ht);
-                    for (uint8_t a = 0; a < n_aggs; a++)
+                    for (uint32_t a = 0; a < n_aggs; a++)
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                    for (uint8_t k = 0; k < n_keys; k++)
+                    for (uint32_t k = 0; k < n_keys; k++)
                         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                     if (match_idx_block) ray_release(match_idx_block);
                     return ray_error("oom", NULL);
@@ -8688,9 +8745,9 @@ dyn_dense_done:
                         ray_release(key_col); ray_release(result);
                         sparse_i64_free(&heavy_ht);
                         sparse_i64_free(&sp_ht);
-                        for (uint8_t a = 0; a < n_aggs; a++)
+                        for (uint32_t a = 0; a < n_aggs; a++)
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint8_t k = 0; k < n_keys; k++)
+                        for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
                         if (match_idx_block) ray_release(match_idx_block);
                         return ray_error("oom", NULL);
@@ -8716,7 +8773,7 @@ dyn_dense_done:
                         continue;
                     uint32_t out_gi = (uint32_t)heavy_ht.counts[hslot];
                     da_val_t* sums = &dense_sum[(size_t)out_gi * n_aggs];
-                    for (uint8_t a = 0; a < n_aggs; a++) {
+                    for (uint32_t a = 0; a < n_aggs; a++) {
                         if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a])
                             continue;
                         if (agg_strlen[a])
@@ -8746,9 +8803,9 @@ dyn_dense_done:
 
             scratch_free(_h_sum);
             scratch_free(_h_cnt);
-            for (uint8_t a = 0; a < n_aggs; a++)
+            for (uint32_t a = 0; a < n_aggs; a++)
                 if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-            for (uint8_t k = 0; k < n_keys; k++)
+            for (uint32_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
             if (match_idx_block) ray_release(match_idx_block);
             return result;
@@ -8764,10 +8821,10 @@ ht_path:;
      * are single-byte bitmasks in ght_layout_t.  n_keys > 0 with n_aggs > 8
      * already returned at the top of the function and never reaches here. */
     if (n_aggs > 8) {
-        for (uint8_t a = 0; a < n_aggs; a++)
+        for (uint32_t a = 0; a < n_aggs; a++)
             { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
               if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
-        for (uint8_t k = 0; k < n_keys; k++)
+        for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
         if (match_idx_block) ray_release(match_idx_block);
         return ray_error("nyi", NULL);
@@ -8776,10 +8833,10 @@ ht_path:;
      * slots into ordinary materialized inputs first. */
     if (!group_materialize_prod_slots(agg_prod, agg_vecs, agg_owned,
                                       n_aggs, nrows)) {
-        for (uint8_t a = 0; a < n_aggs; a++)
+        for (uint32_t a = 0; a < n_aggs; a++)
             { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
               if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
-        for (uint8_t k = 0; k < n_keys; k++)
+        for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
         if (match_idx_block) ray_release(match_idx_block);
         return ray_error("oom", NULL);
@@ -8788,7 +8845,7 @@ ht_path:;
     /* Compute which accumulator arrays the HT needs based on agg ops.
      * COUNT only reads group row's count field — no accumulator needed. */
     uint8_t ght_need = 0;
-    for (uint8_t a = 0; a < n_aggs; a++) {
+    for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t aop = ext->agg_ops[a];
         if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_FIRST || aop == OP_LAST)
             ght_need |= GHT_NEED_SUM;
@@ -8805,6 +8862,8 @@ ht_path:;
      * indirection + SSO-aware hash/eq via key_pool); see ght_layout_t. */
 
     /* Compute row-layout: keys + agg values inline */
+    /* narrowing into uint8_t params is safe: this path is gated ≤8 keys/aggs
+     * (group.c:6684); ght widens in cut 4 */
     ght_layout_t ght_layout = ght_compute_layout(n_keys, n_aggs, agg_vecs, ght_need, ext->agg_ops, key_types);
 
     /* Right-sized hash table: start small, rehash on load > 0.5 */
@@ -8870,9 +8929,9 @@ ht_path:;
          * direct-insert is ~3x slower; only at very low cardinality (where
          * the working set is tiny and probes hit cache) do the two converge.
          * So route any SYM-keyed group-by through the fat-entry pipeline. */
-        for (uint8_t k = 0; k < n_keys && v2_ok; k++)
+        for (uint32_t k = 0; k < n_keys && v2_ok; k++)
             if (key_types[k] == RAY_SYM) v2_ok = false;
-        for (uint8_t a = 0; a < n_aggs && v2_ok; a++) {
+        for (uint32_t a = 0; a < n_aggs && v2_ok; a++) {
             uint16_t op = ext->agg_ops[a];
             if (op != OP_COUNT && op != OP_SUM && op != OP_AVG) {
                 v2_ok = false;
@@ -8903,7 +8962,7 @@ ht_path:;
                 goto v2_done;
             }
             uint8_t v2_nullable = 0;
-            for (uint8_t k = 0; k < n_keys; k++) {
+            for (uint32_t k = 0; k < n_keys; k++) {
                 if (!key_vecs[k]) continue;
                 ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
                              ? key_vecs[k]->slice_parent : key_vecs[k];
@@ -9017,7 +9076,7 @@ v2_done:;
         /* Compute per-key nullability — lets phase1 skip null checks on
          * key columns with no nulls (the common case). */
         uint8_t p1_nullable = 0;
-        for (uint8_t k = 0; k < n_keys; k++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
             if (!key_vecs[k]) continue;
             ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
                          ? key_vecs[k]->slice_parent : key_vecs[k];
@@ -9283,7 +9342,7 @@ v2_emit:;
         char* key_dsts[n_keys];
         int8_t key_out_types[n_keys];
         uint8_t key_esizes[n_keys];
-        for (uint8_t k = 0; k < n_keys; k++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
             ray_t* src_col = key_vecs[k];
             key_cols[k] = NULL;
             key_dsts[k] = NULL;
@@ -9321,10 +9380,15 @@ v2_emit:;
             key_esizes[k] = esz;
         }
 
-        /* Pre-allocate agg result vectors */
+        /* Pre-allocate agg result vectors.
+         * VLA bounded ≤8: this finalize step is inside ht_path, which
+         * rejects n_aggs > 8 at its own guard (group.c:8766) before any of
+         * this runs — keyless-unbounded queries that fell through the
+         * scalar/DA/sparse fast paths are turned away there, never reaching
+         * here. */
         agg_out_t agg_outs[n_aggs];
         ray_t* agg_cols[n_aggs];
-        for (uint8_t a = 0; a < n_aggs; a++) {
+        for (uint32_t a = 0; a < n_aggs; a++) {
             uint16_t agg_op = ext->agg_ops[a];
             ray_t* agg_col = agg_vecs[a];
             bool is_f64 = agg_col && agg_col->type == RAY_F64;
@@ -9406,7 +9470,7 @@ v2_emit:;
             if (!row_gid) { result = ray_error("oom", NULL); goto cleanup; }
 
             uint8_t reprobe_nullable = 0;
-            for (uint8_t k = 0; k < n_keys; k++) {
+            for (uint32_t k = 0; k < n_keys; k++) {
                 if (!key_vecs[k]) continue;
                 ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
                              ? key_vecs[k]->slice_parent : key_vecs[k];
@@ -9505,7 +9569,7 @@ v2_emit:;
             }
 
             if (idx_buf) {
-                for (uint8_t a = 0; a < n_aggs; a++) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
                     if (!(ght_layout.agg_is_holistic & (1u << a))) continue;
                     if (!agg_vecs[a] || !agg_cols[a]) continue;
                     uint16_t aop = ext->agg_ops[a];
@@ -9582,18 +9646,18 @@ v2_emit:;
          * already updated agg_outs[a].vec to track it.  For RAY_LIST
          * cells (OP_TOP_N / OP_BOT_N) the per-cell null state is not
          * consulted downstream — finalize is a no-op-y read of attrs. */
-        for (uint8_t a = 0; a < n_aggs; a++) {
+        for (uint32_t a = 0; a < n_aggs; a++) {
             if (!agg_cols[a]) continue;
             if (agg_outs[a].vec && agg_outs[a].vec->type == RAY_LIST) continue;
             grp_finalize_nulls(agg_outs[a].vec);
         }
-        for (uint8_t k = 0; k < n_keys; k++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
             if (!key_cols[k]) continue;
             grp_finalize_nulls(key_cols[k]);
         }
 
         /* Add key columns to result */
-        for (uint8_t k = 0; k < n_keys; k++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
             if (!key_cols[k]) continue;
             ray_op_ext_t* key_ext = find_ext(g, ext->keys[k]);
             int64_t name_id = key_ext ? key_ext->sym : k;
@@ -9602,7 +9666,7 @@ v2_emit:;
         }
 
         /* Add agg columns to result */
-        for (uint8_t a = 0; a < n_aggs; a++) {
+        for (uint32_t a = 0; a < n_aggs; a++) {
             if (!agg_cols[a]) continue;
             uint16_t agg_op = ext->agg_ops[a];
             ray_op_ext_t* agg_ext = find_ext(g, ext->agg_ins[a]);
@@ -9680,7 +9744,7 @@ sequential_fallback:;
     /* Key columns: read from inline group rows, narrow to original type.
      * Wide keys store a source row index in the HT slot; resolve it
      * through the original key column (key_data[k]) and copy bytes. */
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* src_col = key_vecs[k];
         if (!src_col) continue;
         uint8_t esz = col_esz(src_col);
@@ -9703,7 +9767,7 @@ sequential_fallback:;
             const char* row = final_ht->rows + (size_t)gi * ly->row_stride;
             const char* rk = row + 8;
             int64_t null_mask = *(const int64_t*)(rk + ly->key_off[n_keys]);
-            if (null_mask & (int64_t)(1u << k)) {
+            if (null_mask & ((int64_t)1 << k)) {
                 ray_vec_set_null(new_col, (int64_t)gi, true);
                 /* Fill the correct-width sentinel. */
                 switch (kt) {
@@ -9773,7 +9837,7 @@ sequential_fallback:;
                 (size_t)grp_count * sizeof(int64_t));
             if (row_gid && grp_cnt_s && offsets_s && pos_s) {
                 uint8_t reprobe_nullable_s = 0;
-                for (uint8_t k = 0; k < n_keys; k++) {
+                for (uint32_t k = 0; k < n_keys; k++) {
                     if (!key_vecs[k]) continue;
                     ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
                                  ? key_vecs[k]->slice_parent : key_vecs[k];
@@ -9803,13 +9867,13 @@ sequential_fallback:;
                                               row, keybuf, &null_mask);
                         lookup_keys = (const int64_t*)keybuf;
                     } else {
-                    for (uint8_t k = 0; k < n_keys; k++) {
+                    for (uint32_t k = 0; k < n_keys; k++) {
                         int8_t t = key_types[k];
                         uint64_t kh;
                         bool is_null = (reprobe_nullable_s & (1u << k))
                                        && ray_vec_is_null(key_vecs[k], row);
                         if (is_null) {
-                            null_mask |= (int64_t)(1u << k);
+                            null_mask |= ((int64_t)1 << k);
                             ek_buf[k] = 0;
                             kh = ray_hash_i64(0);
                         } else if (ly->wide_key_mask & (1u << k)) {
@@ -9851,7 +9915,7 @@ sequential_fallback:;
                         int64_t gi = row_gid[row];
                         if (gi >= 0) idx_buf_s[pos_s[gi]++] = row;
                     }
-                    for (uint8_t a = 0; a < n_aggs; a++) {
+                    for (uint32_t a = 0; a < n_aggs; a++) {
                         if (!(ly->agg_is_holistic & (1u << a))) continue;
                         if (!agg_vecs[a]) continue;
                         uint16_t aop = ext->agg_ops[a];
@@ -9887,7 +9951,7 @@ sequential_fallback:;
     }
 
     /* Agg columns from inline accumulators */
-    for (uint8_t a = 0; a < n_aggs; a++) {
+    for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t agg_op = ext->agg_ops[a];
         ray_t* agg_col = agg_vecs[a];
         bool is_f64 = agg_col && agg_col->type == RAY_F64;
@@ -10083,7 +10147,7 @@ sequential_fallback:;
         ray_release(new_col);
     }
     if (med_out) {
-        for (uint8_t a = 0; a < n_aggs; a++)
+        for (uint32_t a = 0; a < n_aggs; a++)
             if (med_out[a] && !RAY_IS_ERR(med_out[a])) ray_release(med_out[a]);
         scratch_free(med_hdr);
     }
@@ -10107,9 +10171,9 @@ cleanup:
         }
         scratch_free(part_hts_hdr);
     }
-    for (uint8_t a = 0; a < n_aggs; a++)
+    for (uint32_t a = 0; a < n_aggs; a++)
         { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
-    for (uint8_t k = 0; k < n_keys; k++)
+    for (uint32_t k = 0; k < n_keys; k++)
         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
     if (match_idx_block) ray_release(match_idx_block);
 
@@ -10140,8 +10204,8 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
                          const int64_t* agg_syms, int has_avg,
                          int has_stddev, int64_t group_limit) {
 
-    uint8_t n_keys = ext->n_keys;
-    uint8_t n_aggs = ext->n_aggs;
+    uint32_t n_keys = ext->n_keys;
+    uint32_t n_aggs = ext->n_aggs;
 
     /* Guard: fixed-size arrays below cap at 24 agg ops.
      * Each AVG adds 1 extra (COUNT), each STDDEV/VAR adds 2 (SUM_SQ + COUNT).
@@ -10151,12 +10215,12 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
     /* Identify MAPCOMMON vs PARTED keys.  MAPCOMMON keys are constant
      * within a partition, so they are excluded from per-partition GROUP BY
      * and reconstructed after concat. */
-    uint8_t  n_mc_keys = 0;
+    uint32_t n_mc_keys = 0;
     int64_t  mc_sym_ids[8];
-    uint8_t  n_part_keys = 0;
+    uint32_t n_part_keys = 0;
     int64_t  pk_syms[8];       /* non-MAPCOMMON key sym IDs */
 
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* pcol = ray_table_get_col(parted_tbl, key_syms[k]);
         if (pcol && pcol->type == RAY_MAPCOMMON) {
             mc_sym_ids[n_mc_keys++] = key_syms[k];
@@ -10178,14 +10242,14 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
     uint8_t  avg_idx[8];     /* which original agg slots are AVG */
     uint8_t  std_idx[8];     /* which original agg slots are STDDEV/VAR */
     uint16_t std_orig_op[8]; /* original op for each std slot */
-    uint8_t  n_avg = 0;
-    uint8_t  n_std = 0;
-    uint8_t  part_n_aggs = n_aggs;
+    uint32_t n_avg = 0;
+    uint32_t n_std = 0;
+    uint32_t part_n_aggs = n_aggs;
     /* stddev_needs_sq[a]: index into part_ops for the SUM(x²) slot */
     uint8_t  std_sq_slot[8];
     uint8_t  std_cnt_slot[8];
 
-    for (uint8_t a = 0; a < n_aggs; a++) {
+    for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t aop = ext->agg_ops[a];
         if (aop == OP_AVG) {
             part_ops[a] = OP_SUM;     /* partition: compute SUM */
@@ -10203,22 +10267,22 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
     if (n_aggs + n_avg + 2 * n_std > 24) return NULL;
 
     /* Append SUM(x²) for each STDDEV/VAR slot */
-    for (uint8_t i = 0; i < n_std; i++) {
+    for (uint32_t i = 0; i < n_std; i++) {
         std_sq_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = OP_SUM;  /* SUM(x²) */
     }
     /* Append COUNT for each AVG column */
-    for (uint8_t i = 0; i < n_avg; i++)
+    for (uint32_t i = 0; i < n_avg; i++)
         part_ops[part_n_aggs++] = OP_COUNT;
     /* Append COUNT for each STDDEV/VAR column */
-    for (uint8_t i = 0; i < n_std; i++) {
+    for (uint32_t i = 0; i < n_std; i++) {
         std_cnt_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = OP_COUNT;
     }
 
     /* Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX,
      * FIRST→FIRST, LAST→LAST, all appended slots → SUM */
-    for (uint8_t a = 0; a < part_n_aggs; a++) {
+    for (uint32_t a = 0; a < part_n_aggs; a++) {
         merge_ops[a] = part_ops[a];
         if (merge_ops[a] == OP_COUNT) merge_ops[a] = OP_SUM;
     }
@@ -10231,18 +10295,18 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
     int part_needs_sq[24];
     memset(part_needs_sq, 0, sizeof(part_needs_sq));
 
-    for (uint8_t a = 0; a < n_aggs; a++)
+    for (uint32_t a = 0; a < n_aggs; a++)
         part_agg_syms[a] = agg_syms[a];
     /* SUM(x²) slots for STDDEV/VAR */
-    for (uint8_t i = 0; i < n_std; i++) {
+    for (uint32_t i = 0; i < n_std; i++) {
         part_agg_syms[std_sq_slot[i]] = agg_syms[std_idx[i]];
         part_needs_sq[std_sq_slot[i]] = 1;
     }
     /* COUNT slots for AVG */
-    for (uint8_t i = 0; i < n_avg; i++)
+    for (uint32_t i = 0; i < n_avg; i++)
         part_agg_syms[n_aggs + n_std + i] = agg_syms[avg_idx[i]];
     /* COUNT slots for STDDEV/VAR */
-    for (uint8_t i = 0; i < n_std; i++)
+    for (uint32_t i = 0; i < n_std; i++)
         part_agg_syms[std_cnt_slot[i]] = agg_syms[std_idx[i]];
 
     /* ---- Batched incremental merge ----
@@ -10277,12 +10341,12 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
             /* Collect unique agg input sym IDs (avoid duplicate columns) */
             int64_t unique_agg[24];
             int n_unique_agg = 0;
-            for (uint8_t a = 0; a < part_n_aggs; a++) {
+            for (uint32_t a = 0; a < part_n_aggs; a++) {
                 int dup = 0;
                 for (int j = 0; j < n_unique_agg; j++)
                     if (unique_agg[j] == part_agg_syms[a]) { dup = 1; break; }
                 if (!dup) {
-                    for (uint8_t k = 0; k < n_keys; k++)
+                    for (uint32_t k = 0; k < n_keys; k++)
                         if (key_syms[k] == part_agg_syms[a]) { dup = 1; break; }
                     if (!dup) unique_agg[n_unique_agg++] = part_agg_syms[a];
                 }
@@ -10291,7 +10355,7 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
             ray_t* sub = ray_table_new((int64_t)(n_part_keys + n_unique_agg));
             if (!sub || RAY_IS_ERR(sub)) goto batch_fail;
 
-            for (uint8_t k = 0; k < n_part_keys; k++) {
+            for (uint32_t k = 0; k < n_part_keys; k++) {
                 ray_t* pcol = ray_table_get_col(parted_tbl, pk_syms[k]);
                 if (!pcol || !RAY_IS_PARTED(pcol->type)) {
                     ray_release(sub); goto batch_fail;
@@ -10318,16 +10382,16 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
             if (!pg) { ray_release(sub); goto batch_fail; }
 
             ray_op_t* pkeys[8];
-            for (uint8_t k = 0; k < n_part_keys; k++) {
+            for (uint32_t k = 0; k < n_part_keys; k++) {
                 ray_t* sym_atom = ray_sym_str(pk_syms[k]);
                 pkeys[k] = ray_scan(pg, ray_str_ptr(sym_atom));
             }
             ray_op_t* pagg_ins[24];
-            for (uint8_t a = 0; a < part_n_aggs; a++) {
+            for (uint32_t a = 0; a < part_n_aggs; a++) {
                 ray_t* sym_atom = ray_sym_str(part_agg_syms[a]);
                 pagg_ins[a] = ray_scan(pg, ray_str_ptr(sym_atom));
             }
-            for (uint8_t j = 0; j < n_std; j++) {
+            for (uint32_t j = 0; j < n_std; j++) {
                 uint8_t sq = std_sq_slot[j];
                 ray_op_t* x = pagg_ins[sq];
                 /* STDDEV/VAR is inherently F64 (mean, sqrt).  Cast input to
@@ -10349,7 +10413,7 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
 
             /* Capture agg column name IDs once (all partials share names) */
             if (!agg_names_captured) {
-                for (uint8_t a = 0; a < part_n_aggs; a++)
+                for (uint32_t a = 0; a < part_n_aggs; a++)
                     agg_name_ids[a] = ray_table_col_name(
                         bp[bi], (int64_t)n_part_keys + a);
                 agg_names_captured = 1;
@@ -10368,9 +10432,9 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
         }
 
         /* Key columns */
-        for (uint8_t k = 0; k < n_keys; k++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
             int is_mc = 0;
-            for (uint8_t m = 0; m < n_mc_keys; m++)
+            for (uint32_t m = 0; m < n_mc_keys; m++)
                 if (mc_sym_ids[m] == key_syms[k]) { is_mc = 1; break; }
 
             /* Type reference for column allocation */
@@ -10462,7 +10526,7 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
         }
 
         /* Agg columns */
-        for (uint8_t a = 0; a < part_n_aggs; a++) {
+        for (uint32_t a = 0; a < part_n_aggs; a++) {
             ray_t* tref = running
                 ? ray_table_get_col_idx(running, (int64_t)n_keys + a)
                 : ray_table_get_col_idx(bp[0], (int64_t)n_part_keys + a);
@@ -10531,13 +10595,13 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
         if (!mg) goto batch_fail;
 
         ray_op_t* mkeys[8];
-        for (uint8_t k = 0; k < n_keys; k++) {
+        for (uint32_t k = 0; k < n_keys; k++) {
             ray_t* sym_atom = ray_sym_str(key_syms[k]);
             mkeys[k] = ray_scan(mg, ray_str_ptr(sym_atom));
         }
 
         ray_op_t* magg_ins[24];
-        for (uint8_t a = 0; a < part_n_aggs; a++) {
+        for (uint32_t a = 0; a < part_n_aggs; a++) {
             ray_t* agg_name = ray_sym_str(agg_name_ids[a]);
             magg_ins[a] = ray_scan(mg, ray_str_ptr(agg_name));
         }
@@ -10558,7 +10622,7 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
 
         /* Rename running's agg columns back to the original partial names.
          * Without this, each merge adds an extra suffix (e.g. v1_sum → v1_sum_sum). */
-        for (uint8_t a = 0; a < part_n_aggs; a++)
+        for (uint32_t a = 0; a < part_n_aggs; a++)
             ray_table_set_col_name(running, (int64_t)n_keys + a, agg_name_ids[a]);
 
         continue;
@@ -10598,10 +10662,10 @@ batch_fail:
             uint8_t avg_i = 0, std_i = 0;
             if (c >= n_keys) {
                 uint8_t a = (uint8_t)(c - n_keys);
-                for (uint8_t j = 0; j < n_avg; j++) {
+                for (uint32_t j = 0; j < n_avg; j++) {
                     if (avg_idx[j] == a) { is_avg_slot = 1; avg_i = j; break; }
                 }
-                for (uint8_t j = 0; j < n_std; j++) {
+                for (uint32_t j = 0; j < n_std; j++) {
                     if (std_idx[j] == a) { is_std_slot = 1; std_i = j; break; }
                 }
             }
@@ -10735,7 +10799,7 @@ batch_fail:
 
     /* Agg column names already fixed by ray_table_set_col_name inside batch loop.
      * Apply final name fixup for the user-facing n_aggs columns (trim decomposed extras). */
-    for (uint8_t a = 0; a < n_aggs && (int64_t)(n_keys + a) < rncols; a++)
+    for (uint32_t a = 0; a < n_aggs && (int64_t)(n_keys + a) < rncols; a++)
         ray_table_set_col_name(result, (int64_t)n_keys + a, agg_name_ids[a]);
 
     if (merge_tbl) ray_release(merge_tbl);
@@ -10836,7 +10900,7 @@ bool pivot_ingest_run(pivot_ingest_t* out,
     }
 
     uint8_t p1_nullable = 0;
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         if (!key_vecs[k]) continue;
         ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
                      ? key_vecs[k]->slice_parent : key_vecs[k];
