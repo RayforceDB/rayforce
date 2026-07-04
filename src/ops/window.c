@@ -29,9 +29,9 @@
  * ============================================================================ */
 
 /* Compare rows ra and rb on the given key columns. Returns true if any differ. */
-static inline bool win_keys_differ(ray_t* const* vecs, uint8_t n_keys,
+static inline bool win_keys_differ(ray_t* const* vecs, uint32_t n_keys,
                                     int64_t ra, int64_t rb) {
-    for (uint8_t k = 0; k < n_keys; k++) {
+    for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* col = vecs[k];
         if (!col) continue;
         switch (col->type) {
@@ -138,9 +138,9 @@ static ray_t* win_resolve_vec(ray_graph_t* g, ray_op_t* key_op, ray_t* tbl,
 
 /* Compute window functions for one partition [ps, pe) in sorted_idx */
 static void win_compute_partition(
-    ray_t* const* order_vecs, uint8_t n_order,
+    ray_t* const* order_vecs, uint32_t n_order,
     ray_t* const* func_vecs, const uint8_t* func_kinds, const int64_t* func_params,
-    uint8_t n_funcs,
+    uint32_t n_funcs,
     uint8_t frame_start, uint8_t frame_end,
     const int64_t* sorted_idx, int64_t ps, int64_t pe,
     ray_t* const* result_vecs, const bool* is_f64)
@@ -148,7 +148,7 @@ static void win_compute_partition(
     if (ps >= pe) return; /* empty partition — nothing to compute */
     int64_t part_len = pe - ps;
 
-    for (uint8_t f = 0; f < n_funcs; f++) {
+    for (uint32_t f = 0; f < n_funcs; f++) {
         uint8_t kind = func_kinds[f];
         ray_t* fvec = func_vecs[f];
         ray_t* rvec = result_vecs[f];
@@ -559,11 +559,11 @@ static void win_compute_partition(
 /* Parallel per-partition window compute context */
 typedef struct {
     ray_t** order_vecs;
-    uint8_t n_order;
+    uint32_t n_order;
     ray_t** func_vecs;
     uint8_t* func_kinds;
     int64_t* func_params;
-    uint8_t n_funcs;
+    uint32_t n_funcs;
     uint8_t frame_start;
     uint8_t frame_end;
     int64_t* sorted_idx;
@@ -592,7 +592,7 @@ typedef struct {
     const int64_t* sorted_idx;
     uint64_t*      pkey_sorted;
     ray_t**         sort_vecs;
-    uint8_t        n_part;
+    uint32_t       n_part;
 } pkey_gather_ctx_t;
 
 static void pkey_gather_fn(void* arg, uint32_t wid,
@@ -624,7 +624,7 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
         for (int64_t i = start; i < end; i++) {
             int64_t r = sidx[i];
             uint64_t key = 0;
-            for (uint8_t k = 0; k < ctx->n_part; k++) {
+            for (uint32_t k = 0; k < ctx->n_part; k++) {
                 ray_t* col = ctx->sort_vecs[k];
                 const void* d = ray_data(col);
                 if (RAY_IS_SYM(col->type))
@@ -672,13 +672,10 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 
     int64_t nrows = ray_table_nrows(tbl);
     int64_t ncols = ray_table_ncols(tbl);
-    uint8_t n_part  = ext->window.n_part_keys;
-    uint8_t n_order = ext->window.n_order_keys;
-    uint8_t n_funcs = ext->window.n_funcs;
-    /* Guard against uint8_t overflow on n_part + n_order */
-    if ((uint16_t)n_part + n_order > 255)
-        return ray_error("nyi", NULL);
-    uint8_t n_sort  = n_part + n_order;
+    uint32_t n_part  = ext->window.n_part_keys;
+    uint32_t n_order = ext->window.n_order_keys;
+    uint32_t n_funcs = ext->window.n_funcs;
+    uint32_t n_sort  = n_part + n_order;
 
     if (nrows == 0 || n_funcs == 0) {
         ray_retain(tbl);
@@ -686,58 +683,79 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
 
     /* --- Phase 0: Resolve key and func_input vectors --- */
-    /* VLAs below are bounded by uint8_t limits (max 255 each),
-     * so max ~10KB on stack; bounded by uint8_t limits. */
-    ray_t* sort_vecs[n_sort > 0 ? n_sort : 1];
-    uint8_t sort_owned[n_sort > 0 ? n_sort : 1];
-    uint8_t sort_descs[n_sort > 0 ? n_sort : 1];
-    memset(sort_owned, 0, sizeof(sort_owned));
-    memset(sort_descs, 0, sizeof(sort_descs));
+    /* Frame-entry scratch: one carve for every array whose lifetime spans
+     * the whole function (freed at every exit incl. `oom:`) — sort_vecs/
+     * sort_owned/sort_descs, func_vecs/func_owned/result_vecs/is_f64, and
+     * win_enum_rank_hdrs (Pass 1's per-key rank-map headers, hoisted here
+     * since it shares this lifetime).  n_sort/n_funcs are unbounded
+     * post-migration, so this can no longer be stack VLAs.  Layout:
+     * 8-byte pointer arrays first, then the 1-byte flag arrays.
+     * scratch_calloc zero-inits the whole block: result_vecs and (in the
+     * radix-block carve below) enum_ranks are read across their FULL
+     * range on some exits before every slot has necessarily been written
+     * (e.g. a mid-loop OOM leaves later funcs' result_vecs untouched), so
+     * those slots must read back NULL — calloc'ing the whole carve is
+     * simpler and cheaper-than-hot-path-relevant than splitting it into
+     * a calloc'd sub-range and an alloc'd one. */
+    uint32_t n_sort_alloc = n_sort > 0 ? n_sort : 1;
+    size_t frame_ptr_bytes  = (size_t)n_sort_alloc * sizeof(ray_t*) * 2   /* sort_vecs, win_enum_rank_hdrs */
+                            + (size_t)n_funcs      * sizeof(ray_t*) * 2; /* func_vecs, result_vecs */
+    size_t frame_flag_bytes = (size_t)n_sort_alloc * 2                   /* sort_owned, sort_descs */
+                            + (size_t)n_funcs      * 2;                  /* func_owned, is_f64 */
+    ray_t* frame_hdr;
+    char* frame_base = (char*)scratch_calloc(&frame_hdr,
+                                              frame_ptr_bytes + frame_flag_bytes);
+    if (!frame_base) return ray_error("oom", NULL);
+    ray_t** sort_vecs          = (ray_t**)frame_base;
+    ray_t** func_vecs          = sort_vecs + n_sort_alloc;
+    ray_t** result_vecs        = func_vecs + n_funcs;
+    ray_t** win_enum_rank_hdrs = result_vecs + n_funcs;
+    uint8_t* sort_owned = (uint8_t*)(win_enum_rank_hdrs + n_sort_alloc);
+    uint8_t* sort_descs = sort_owned + n_sort_alloc;
+    uint8_t* func_owned = sort_descs + n_sort_alloc;
+    bool*    is_f64     = (bool*)(func_owned + n_funcs);
 
-    for (uint8_t k = 0; k < n_part; k++) {
+    for (uint32_t k = 0; k < n_part; k++) {
         sort_vecs[k] = win_resolve_vec(g, op_node(g, ext->window.part_keys[k]), tbl,
                                         &sort_owned[k]);
         sort_descs[k] = 0;  /* partition keys always ASC */
         if (!sort_vecs[k] || RAY_IS_ERR(sort_vecs[k])) {
             ray_t* err = sort_vecs[k] ? sort_vecs[k] : ray_error("nyi", NULL);
-            for (uint8_t j = 0; j < k; j++)
+            for (uint32_t j = 0; j < k; j++)
                 if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
                     ray_release(sort_vecs[j]);
+            scratch_free(frame_hdr);
             return err;
         }
     }
-    for (uint8_t k = 0; k < n_order; k++) {
+    for (uint32_t k = 0; k < n_order; k++) {
         sort_vecs[n_part + k] = win_resolve_vec(g, op_node(g, ext->window.order_keys[k]),
                                                  tbl, &sort_owned[n_part + k]);
         sort_descs[n_part + k] = ext->window.order_descs[k];
         if (!sort_vecs[n_part + k] || RAY_IS_ERR(sort_vecs[n_part + k])) {
             ray_t* err = sort_vecs[n_part + k] ? sort_vecs[n_part + k]
                                                : ray_error("nyi", NULL);
-            for (uint8_t j = 0; j < n_part + k; j++)
+            for (uint32_t j = 0; j < n_part + k; j++)
                 if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
                     ray_release(sort_vecs[j]);
+            scratch_free(frame_hdr);
             return err;
         }
     }
 
-    ray_t* func_vecs[n_funcs];
-    uint8_t func_owned[n_funcs];
-    ray_t* result_vecs[n_funcs];
-    bool is_f64[n_funcs];
-    memset(func_owned, 0, sizeof(func_owned));
-    memset(result_vecs, 0, sizeof(result_vecs));
-    for (uint8_t f = 0; f < n_funcs; f++) {
+    for (uint32_t f = 0; f < n_funcs; f++) {
         ray_op_t* fi = op_node(g, ext->window.func_inputs[f]);
         if (fi) {
             func_vecs[f] = win_resolve_vec(g, fi, tbl, &func_owned[f]);
             if (!func_vecs[f] || RAY_IS_ERR(func_vecs[f])) {
                 ray_t* err = func_vecs[f] ? func_vecs[f] : ray_error("nyi", NULL);
-                for (uint8_t j = 0; j < f; j++)
+                for (uint32_t j = 0; j < f; j++)
                     if (func_owned[j] && func_vecs[j] && !RAY_IS_ERR(func_vecs[j]))
                         ray_release(func_vecs[j]);
-                for (uint8_t j = 0; j < n_sort; j++)
+                for (uint32_t j = 0; j < n_sort; j++)
                     if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
                         ray_release(sort_vecs[j]);
+                scratch_free(frame_hdr);
                 return err;
             }
         } else {
@@ -752,27 +770,26 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * (sym.c's frozen-table rule).  No-op for runtime-domain columns.
      * LUT-build OOM is a loud error (7a-review hardening): silent -1
      * translations would corrupt window outputs downstream. */
-    for (uint8_t f = 0; f < n_funcs; f++) {
+    for (uint32_t f = 0; f < n_funcs; f++) {
         if (!func_vecs[f] || func_vecs[f]->type != RAY_SYM) continue;
         struct ray_sym_domain_s* fdom = ray_sym_vec_domain(func_vecs[f]);
         if (fdom == ray_sym_runtime_domain()) continue;
         if (!ray_sym_domain_runtime_lut(fdom)) {
             ray_t* err = ray_error("oom",
                 "window: sym domain runtime-id LUT build failed");
-            for (uint8_t j = 0; j < n_funcs; j++)
+            for (uint32_t j = 0; j < n_funcs; j++)
                 if (func_owned[j] && func_vecs[j] && !RAY_IS_ERR(func_vecs[j]))
                     ray_release(func_vecs[j]);
-            for (uint8_t j = 0; j < n_sort; j++)
+            for (uint32_t j = 0; j < n_sort; j++)
                 if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
                     ray_release(sort_vecs[j]);
+            scratch_free(frame_hdr);
             return err;
         }
     }
 
     /* --- Pass 1: Sort by (partition_keys ++ order_keys) --- */
     ray_t* radix_itmp_hdr = NULL;
-    ray_t* win_enum_rank_hdrs[n_sort > 0 ? n_sort : 1];
-    memset(win_enum_rank_hdrs, 0, sizeof(win_enum_rank_hdrs));
 
     ray_t* indices_hdr = NULL;
     int64_t* indices = (int64_t*)scratch_alloc(&indices_hdr,
@@ -791,7 +808,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     } else if (n_sort > 0) {
         /* --- Radix sort fast path --- */
         bool can_radix = true;
-        for (uint8_t k = 0; k < n_sort; k++) {
+        for (uint32_t k = 0; k < n_sort; k++) {
             if (!sort_vecs[k]) { can_radix = false; break; }
             int8_t t = sort_vecs[k]->type;
             if (t != RAY_I64 && t != RAY_F64 && t != RAY_I32 && t != RAY_I16 &&
@@ -805,14 +822,34 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         if (can_radix) {
             ray_pool_t* pool = ray_pool_get();
 
-            /* Build SYM rank mappings */
-            uint32_t* enum_ranks[n_sort];
-            memset(enum_ranks, 0, n_sort * sizeof(uint32_t*));
-            for (uint8_t k = 0; k < n_sort; k++) {
-                if (RAY_IS_SYM(sort_vecs[k]->type)) {
-                    enum_ranks[k] = build_enum_rank(sort_vecs[k], nrows,
-                                                     &win_enum_rank_hdrs[k]);
-                    if (!enum_ranks[k]) { can_radix = false; break; }
+            /* Second consolidated carve: enum_ranks (SYM rank maps),
+             * mins/maxs (multi-key range prescan, filled below).  All
+             * three scale with n_sort with no <=16 cap — unlike
+             * bit_shifts further down, which stays inside that gate.
+             * Scoped to this `if (can_radix)` block and freed at its
+             * close, whichever of the n_sort==1 / n_sort>1 arms below
+             * runs.  A heap failure here just degrades to the merge-sort
+             * fallback (same as any other can_radix=false case) rather
+             * than failing the query. */
+            ray_t* radix_arrs_hdr = NULL;
+            uint32_t** enum_ranks = NULL;
+            int64_t* mins = NULL;
+            int64_t* maxs = NULL;
+            char* radix_arrs_base = (char*)scratch_calloc(&radix_arrs_hdr,
+                (size_t)n_sort * (sizeof(uint32_t*) + 2 * sizeof(int64_t)));
+            if (!radix_arrs_base) {
+                can_radix = false;
+            } else {
+                enum_ranks = (uint32_t**)radix_arrs_base;
+                mins = (int64_t*)(enum_ranks + n_sort);
+                maxs = mins + n_sort;
+
+                for (uint32_t k = 0; k < n_sort; k++) {
+                    if (RAY_IS_SYM(sort_vecs[k]->type)) {
+                        enum_ranks[k] = build_enum_rank(sort_vecs[k], nrows,
+                                                         &win_enum_rank_hdrs[k]);
+                        if (!enum_ranks[k]) { can_radix = false; break; }
+                    }
                 }
             }
 
@@ -872,7 +909,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             } else if (can_radix && n_sort > 1) {
                 /* Multi-key composite radix sort */
                 ray_pool_t* pool2 = pool;
-                int64_t mins[n_sort], maxs[n_sort];
+                /* mins/maxs carved above (radix_arrs_base), alongside enum_ranks. */
                 /* Wider accumulator: up to 16 keys * 63 bits = 1008,
                  * which would wrap a uint8_t and let an oversized
                  * budget falsely pass the <=64 fits check. */
@@ -902,7 +939,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     };
                     ray_pool_dispatch(mk_prescan_pool2, mk_prescan_fn, &pctx, nrows);
 
-                    for (uint8_t k = 0; k < n_sort; k++) {
+                    for (uint32_t k = 0; k < n_sort; k++) {
                         int64_t kmin = INT64_MAX, kmax = INT64_MIN;
                         for (uint32_t w = 0; w < nw; w++) {
                             int64_t wmin = pw_mins[w * n_sort + k];
@@ -921,7 +958,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     if (pw_mins_hdr) scratch_free(pw_mins_hdr);
                     if (pw_maxs_hdr) scratch_free(pw_maxs_hdr);
                 } else {
-                    for (uint8_t k = 0; k < n_sort; k++) {
+                    for (uint32_t k = 0; k < n_sort; k++) {
                         ray_t* col = sort_vecs[k];
                         int64_t kmin = INT64_MAX, kmax = INT64_MIN;
                         if (enum_ranks[k]) {
@@ -999,7 +1036,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                         radix_encode_ctx_t enc = {
                             .keys = keys, .n_keys = n_sort, .vecs = sort_vecs,
                         };
-                        for (uint8_t k = 0; k < n_sort; k++) {
+                        for (uint32_t k = 0; k < n_sort; k++) {
                             enc.mins[k] = mins[k];
                             enc.ranges[k] = maxs[k] - mins[k];
                             enc.bit_shifts[k] = bit_shifts[k];
@@ -1035,6 +1072,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     scratch_free(keys_hdr);
                 }
             }
+            scratch_free(radix_arrs_hdr);
         }
 
         /* --- Merge sort fallback --- */
@@ -1103,7 +1141,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         uint8_t pk_bits = 0;
         bool can_pack = true;
         bool has_64bit_key = false;
-        for (uint8_t k = 0; k < n_part; k++) {
+        for (uint32_t k = 0; k < n_part; k++) {
             int8_t t = sort_vecs[k]->type;
             if (RAY_IS_SYM(t) || t == RAY_I32 || t == RAY_DATE || t == RAY_TIME) pk_bits += 32;
             else if (t == RAY_I64 || t == RAY_SYM || t == RAY_TIMESTAMP ||
@@ -1161,20 +1199,21 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             scratch_free(poff_hdr);
             scratch_free(indices_hdr);
             if (radix_itmp_hdr) scratch_free(radix_itmp_hdr);
-            for (uint8_t k = 0; k < n_sort; k++)
+            for (uint32_t k = 0; k < n_sort; k++)
                 if (win_enum_rank_hdrs[k]) scratch_free(win_enum_rank_hdrs[k]);
-            for (uint8_t k = 0; k < n_sort; k++)
+            for (uint32_t k = 0; k < n_sort; k++)
                 if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
                     ray_release(sort_vecs[k]);
-            for (uint8_t f = 0; f < n_funcs; f++)
+            for (uint32_t f = 0; f < n_funcs; f++)
                 if (func_owned[f] && func_vecs[f] && !RAY_IS_ERR(func_vecs[f]))
                     ray_release(func_vecs[f]);
+            scratch_free(frame_hdr);
             return ray_error("cancel", NULL);
         }
     }
 
     /* --- Pass 3: Allocate result vectors and compute per-partition --- */
-    for (uint8_t f = 0; f < n_funcs; f++) {
+    for (uint32_t f = 0; f < n_funcs; f++) {
         uint8_t kind = ext->window.func_kinds[f];
         ray_t* fvec = func_vecs[f];
 
@@ -1191,7 +1230,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         is_f64[f] = out_f64;
         result_vecs[f] = ray_vec_new(out_f64 ? RAY_F64 : RAY_I64, nrows);
         if (!result_vecs[f] || RAY_IS_ERR(result_vecs[f])) {
-            for (uint8_t j = 0; j < f; j++) ray_release(result_vecs[j]);
+            for (uint32_t j = 0; j < f; j++) ray_release(result_vecs[j]);
             scratch_free(poff_hdr);
             scratch_free(indices_hdr);
             goto oom;
@@ -1239,14 +1278,14 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         }
 
         /* Set RAY_ATTR_HAS_NULLS on vectors that actually received nulls */
-        for (uint8_t f = 0; f < n_funcs; f++)
+        for (uint32_t f = 0; f < n_funcs; f++)
             win_finalize_nulls(result_vecs[f]);
     }
 
     /* --- Pass 4: Build result table --- */
     ray_t* result = ray_table_new(ncols + n_funcs);
     if (!result || RAY_IS_ERR(result)) {
-        for (uint8_t f = 0; f < n_funcs; f++) ray_release(result_vecs[f]);
+        for (uint32_t f = 0; f < n_funcs; f++) ray_release(result_vecs[f]);
         scratch_free(poff_hdr);
         scratch_free(indices_hdr);
         goto oom;
@@ -1263,7 +1302,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
 
     /* Add window result columns with auto-generated names */
-    for (uint8_t f = 0; f < n_funcs; f++) {
+    for (uint32_t f = 0; f < n_funcs; f++) {
         char buf[16] = "_w";
         int pos = 2;
         if (f >= 100) buf[pos++] = '0' + (f / 100);
@@ -1278,31 +1317,40 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     scratch_free(poff_hdr);
     if (radix_itmp_hdr) scratch_free(radix_itmp_hdr);
     scratch_free(indices_hdr);
-    for (uint8_t k = 0; k < n_sort; k++)
+    for (uint32_t k = 0; k < n_sort; k++)
         if (win_enum_rank_hdrs[k]) scratch_free(win_enum_rank_hdrs[k]);
 
     /* Free owned key/func vectors */
-    for (uint8_t k = 0; k < n_sort; k++)
+    for (uint32_t k = 0; k < n_sort; k++)
         if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
             ray_release(sort_vecs[k]);
-    for (uint8_t f = 0; f < n_funcs; f++)
+    for (uint32_t f = 0; f < n_funcs; f++)
         if (func_owned[f] && func_vecs[f] && !RAY_IS_ERR(func_vecs[f]))
             ray_release(func_vecs[f]);
+
+    /* frame_hdr backs sort_vecs/sort_owned/func_vecs/func_owned/
+     * result_vecs/is_f64/win_enum_rank_hdrs — free it LAST, after every
+     * loop above that reads through those arrays (cut-1 UAF lesson on
+     * this file: free-order matters when one carve backs the very
+     * arrays another cleanup step still needs to read). */
+    scratch_free(frame_hdr);
 
     return result;
 
 oom:
     if (radix_itmp_hdr) scratch_free(radix_itmp_hdr);
-    for (uint8_t k = 0; k < n_sort; k++)
+    for (uint32_t k = 0; k < n_sort; k++)
         if (win_enum_rank_hdrs[k]) scratch_free(win_enum_rank_hdrs[k]);
-    for (uint8_t k = 0; k < n_sort; k++)
+    for (uint32_t k = 0; k < n_sort; k++)
         if (sort_owned[k] && sort_vecs[k] && !RAY_IS_ERR(sort_vecs[k]))
             ray_release(sort_vecs[k]);
-    for (uint8_t f = 0; f < n_funcs; f++) {
+    for (uint32_t f = 0; f < n_funcs; f++) {
         if (func_owned[f] && func_vecs[f] && !RAY_IS_ERR(func_vecs[f]))
             ray_release(func_vecs[f]);
         if (result_vecs[f] && !RAY_IS_ERR(result_vecs[f]))
             ray_release(result_vecs[f]);
     }
+    /* Same free-order rule as the success path above. */
+    scratch_free(frame_hdr);
     return ray_error("oom", NULL);
 }
