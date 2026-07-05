@@ -371,14 +371,32 @@
 ;; stack-buffer-overflow at 18 keys) and silently dropped aggs past 16.
 ;; ══════════════════════════════════════════════════════════════════
 
-;; ── 17 equality keys (18-key vector, n_eq=17 > former [16] cap). Constant
-;; eq keys ('a) → single partition; oracle mirrors the canonical 1-key
-;; window-join (min Bid) = [99 100] / window-join1 = [99 101].
-(set L17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time V] (list [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [10:00:01.000 10:00:05.000] [100 200])))
-(set R17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time Bid] (list [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [a a a] [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101])))
+;; ── 17 equality keys (18-key vector, n_eq=17 > former [16] cap).  GENUINE
+;; partitioning oracle (review gap: an all-constant-key sentinel can't tell
+;; a correct 17-key partition from a truncated eq count that collapses to a
+;; single partition, since a single 'a' partition already IS the answer).
+;; Here k01..k16 are constant 'a for both left rows (so they alone would
+;; merge everything into one partition), and ONLY the 17th key partitions:
+;; row0 -> k17='p, row1 -> k17='q. R17 mirrors that: 3 'p' rows carrying the
+;; ORIGINAL 1-key oracle's bids [99 100 101] at [00:00 00:02 00:04], and 3
+;; 'q' rows carrying LOW bids [1 2 3] at the same times — deliberately below
+;; every 'p' bid, so if a regression silently drops k17 (e.g. an eq-count
+;; truncation) the merged partition's min would leak a 'q' value into row0's
+;; result. Verified empirically against a k17-dropped call on this exact
+;; fixture: it returns [1 2] instead of the correct [99 2].
+;; Oracle (per-partition, unaffected by the other group):
+;;  row0 (partition 'p', Time=10:00:01, window=[09:59:59,10:00:03]):
+;;   identical to the original single-group derivation -> min=99 both modes.
+;;  row1 (partition 'q', Time=10:00:05, window=[10:00:03,10:00:07]):
+;;   mode0 (prevailing quote): lb seeds from the last 'q' row with time<=lo
+;;   (10:00:02, bid=2), ub runs to the end (all q times<=hi) -> range={2,3}
+;;   -> min=2.  mode1 (strict, time>=lo): lb is the first 'q' row with
+;;   time>=10:00:03, i.e. 10:00:04 (bid=3) -> range={3} -> min=3.
+(set L17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time V] (list [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [p q] [10:00:01.000 10:00:05.000] [100 200])))
+(set R17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time Bid] (list [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [a a a a a a] [p p p q q q] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101 1 2 3])))
 (set iv17 (map-left + [-2000 2000] (at L17 'Time)))
-(at (window-join [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time] iv17 L17 R17 {minBid: (min Bid)}) 'minBid) -- [99 100]
-(at (window-join1 [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time] iv17 L17 R17 {minBid: (min Bid)}) 'minBid) -- [99 101]
+(at (window-join [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time] iv17 L17 R17 {minBid: (min Bid)}) 'minBid) -- [99 2]
+(at (window-join1 [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time] iv17 L17 R17 {minBid: (min Bid)}) 'minBid) -- [99 3]
 
 ;; ── 17 aggregates. Pre-fix the collection loop `n_agg < WJ_MAX_AGG` silently
 ;; DROPPED the 17th agg — result had 19 cols not 20 and 'a17 was absent.
@@ -390,11 +408,21 @@
 (at rq17 'a17) -- [928 918 817]
 
 ;; ── 256 equality keys (257-key vector, n_eq=256) — exact-size eq carve, far
-;; past the former cap. Constant int eq keys → one partition; oracle [99 100].
-(set L256 (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time V] (concat (take (list [1 1]) 256) (list [10:00:01.000 10:00:05.000] [100 200]))))
-(set R256 (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time Bid] (concat (take (list [1 1 1]) 256) (list [10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101]))))
+;; past the former cap.  GENUINE partitioning oracle (same review gap as the
+;; 17-key sentinel above): k001..k255 are constant int 1 for every row, and
+;; ONLY k256 partitions: L row0 -> k256=1, row1 -> k256=2.  R256 carries 3
+;; rows per group at the ORIGINAL [00:00 00:02 00:04] times — group 1 with
+;; the original bids [99 100 101], group 2 with LOW bids [1 2 3], again
+;; strictly below every group-1 bid so a truncation that drops k256 (over-
+;; matching into one partition) leaks a group-2 value into row0's min.
+;; Oracle mirrors the 17-key derivation exactly (identical time geometry):
+;; row0 (group 1) -> min=99 (unaffected by group 2); row1 (group 2, mode0
+;; prevailing-quote) -> lb seeds from the last group-2 row with time<=lo
+;; (10:00:02, bid=2), ub runs to the end -> range={2,3} -> min=2.
+(set L256 (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time V] (concat (take (list [1 1]) 255) (list [1 2] [10:00:01.000 10:00:05.000] [100 200]))))
+(set R256 (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time Bid] (concat (take (list [1 1 1 1 1 1]) 255) (list [1 1 1 2 2 2] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101 1 2 3]))))
 (set iv256 (map-left + [-2000 2000] (at L256 'Time)))
-(at (window-join [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time] iv256 L256 R256 {minBid: (min Bid)}) 'minBid) -- [99 100]
+(at (window-join [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time] iv256 L256 R256 {minBid: (min Bid)}) 'minBid) -- [99 2]
 
 ;; ── 256 aggregates. meta len = 3 left + 256 = 259; last = (max Size).
 (set tr256 (table [Sym Time Price] (list [x x x] [12:00:01 12:00:04 12:00:06] [89.17 70.5 80.54])))
@@ -403,6 +431,49 @@
 (set rq256 (window-join [Sym Time] ivq256 tr256 qu256 {a000: (min Size) a001: (min Size) a002: (min Size) a003: (min Size) a004: (min Size) a005: (min Size) a006: (min Size) a007: (min Size) a008: (min Size) a009: (min Size) a010: (min Size) a011: (min Size) a012: (min Size) a013: (min Size) a014: (min Size) a015: (min Size) a016: (min Size) a017: (min Size) a018: (min Size) a019: (min Size) a020: (min Size) a021: (min Size) a022: (min Size) a023: (min Size) a024: (min Size) a025: (min Size) a026: (min Size) a027: (min Size) a028: (min Size) a029: (min Size) a030: (min Size) a031: (min Size) a032: (min Size) a033: (min Size) a034: (min Size) a035: (min Size) a036: (min Size) a037: (min Size) a038: (min Size) a039: (min Size) a040: (min Size) a041: (min Size) a042: (min Size) a043: (min Size) a044: (min Size) a045: (min Size) a046: (min Size) a047: (min Size) a048: (min Size) a049: (min Size) a050: (min Size) a051: (min Size) a052: (min Size) a053: (min Size) a054: (min Size) a055: (min Size) a056: (min Size) a057: (min Size) a058: (min Size) a059: (min Size) a060: (min Size) a061: (min Size) a062: (min Size) a063: (min Size) a064: (min Size) a065: (min Size) a066: (min Size) a067: (min Size) a068: (min Size) a069: (min Size) a070: (min Size) a071: (min Size) a072: (min Size) a073: (min Size) a074: (min Size) a075: (min Size) a076: (min Size) a077: (min Size) a078: (min Size) a079: (min Size) a080: (min Size) a081: (min Size) a082: (min Size) a083: (min Size) a084: (min Size) a085: (min Size) a086: (min Size) a087: (min Size) a088: (min Size) a089: (min Size) a090: (min Size) a091: (min Size) a092: (min Size) a093: (min Size) a094: (min Size) a095: (min Size) a096: (min Size) a097: (min Size) a098: (min Size) a099: (min Size) a100: (min Size) a101: (min Size) a102: (min Size) a103: (min Size) a104: (min Size) a105: (min Size) a106: (min Size) a107: (min Size) a108: (min Size) a109: (min Size) a110: (min Size) a111: (min Size) a112: (min Size) a113: (min Size) a114: (min Size) a115: (min Size) a116: (min Size) a117: (min Size) a118: (min Size) a119: (min Size) a120: (min Size) a121: (min Size) a122: (min Size) a123: (min Size) a124: (min Size) a125: (min Size) a126: (min Size) a127: (min Size) a128: (min Size) a129: (min Size) a130: (min Size) a131: (min Size) a132: (min Size) a133: (min Size) a134: (min Size) a135: (min Size) a136: (min Size) a137: (min Size) a138: (min Size) a139: (min Size) a140: (min Size) a141: (min Size) a142: (min Size) a143: (min Size) a144: (min Size) a145: (min Size) a146: (min Size) a147: (min Size) a148: (min Size) a149: (min Size) a150: (min Size) a151: (min Size) a152: (min Size) a153: (min Size) a154: (min Size) a155: (min Size) a156: (min Size) a157: (min Size) a158: (min Size) a159: (min Size) a160: (min Size) a161: (min Size) a162: (min Size) a163: (min Size) a164: (min Size) a165: (min Size) a166: (min Size) a167: (min Size) a168: (min Size) a169: (min Size) a170: (min Size) a171: (min Size) a172: (min Size) a173: (min Size) a174: (min Size) a175: (min Size) a176: (min Size) a177: (min Size) a178: (min Size) a179: (min Size) a180: (min Size) a181: (min Size) a182: (min Size) a183: (min Size) a184: (min Size) a185: (min Size) a186: (min Size) a187: (min Size) a188: (min Size) a189: (min Size) a190: (min Size) a191: (min Size) a192: (min Size) a193: (min Size) a194: (min Size) a195: (min Size) a196: (min Size) a197: (min Size) a198: (min Size) a199: (min Size) a200: (min Size) a201: (min Size) a202: (min Size) a203: (min Size) a204: (min Size) a205: (min Size) a206: (min Size) a207: (min Size) a208: (min Size) a209: (min Size) a210: (min Size) a211: (min Size) a212: (min Size) a213: (min Size) a214: (min Size) a215: (min Size) a216: (min Size) a217: (min Size) a218: (min Size) a219: (min Size) a220: (min Size) a221: (min Size) a222: (min Size) a223: (min Size) a224: (min Size) a225: (min Size) a226: (min Size) a227: (min Size) a228: (min Size) a229: (min Size) a230: (min Size) a231: (min Size) a232: (min Size) a233: (min Size) a234: (min Size) a235: (min Size) a236: (min Size) a237: (min Size) a238: (min Size) a239: (min Size) a240: (min Size) a241: (min Size) a242: (min Size) a243: (min Size) a244: (min Size) a245: (min Size) a246: (min Size) a247: (min Size) a248: (min Size) a249: (min Size) a250: (min Size) a251: (min Size) a252: (min Size) a253: (min Size) a254: (min Size) a255: (max Size)}))
 (at (meta rq256) 'len) -- 259
 (at rq256 'a255) -- [928 918 817]
+
+;; ── parallel window-join, GENUINE regression probe (review gap: every wj
+;; cell above uses 2-3 left rows, so none ever exercises the parallel worker
+;; — src/ops/query.c's dispatch predicate `pool && left_nrows >= 2048`
+;; (~query.c:13209/13256) is only live once left_nrows crosses 2048; below
+;; that the whole scan runs on worker 0 via a direct wj_scan_fn(&wctx, 0, 0,
+;; left_nrows) call, same as no pool at all).  The per-worker scratch this
+;; cut carved out of a fixed cap — acc_base + worker_id*n_agg (wj_acc_t
+;; slab) and target_base + worker_id*n_eq (int64 eq-tuple slab), disjoint
+;; slices indexed by worker_id — is untouched by every other cell here.
+;; left_nrows=4096 >= 2048 and this machine's default pool (ray_pool_get(),
+;; auto ncpu-1 workers) is non-NULL, so this call provably takes
+;; ray_pool_dispatch(pool, wj_scan_fn, &wctx, left_nrows) with >1 worker,
+;; not the serial fallback.
+;;
+;; Fixture: 4096 left rows, two eq keys (k1, k2, both (% (til 4096) 2)) so
+;; row parity gives exactly 2 partitions interleaved across the ENTIRE row
+;; range (not one contiguous block per group) — every worker's morsel spans
+;; both partitions, so a worker-slice aliasing bug (two worker_ids sharing
+;; one acc/target_eq slice) and an eq-group cross-talk bug (a row reading
+;; the wrong partition's matches) would both show up as a wrong value
+;; somewhere in the 4096-row output, not just at the edges.
+;; Each left row's interval is a generous +-10000ms around its own Time (Time
+;; spans only 0..4095ms), so lo<0 and hi>10000 for every row: the window
+;; unconditionally spans the ENTIRE right table for both modes, making the
+;; per-row aggregate a closed-form function of eq-group alone, independent
+;; of which specific left row it is. The right table (300 rows, "a few
+;; hundred") is split asymmetrically by the same eq pattern: 100 rows in
+;; group 0 (Bid=111 constant), 200 rows in group 1 (Bid=222 constant) — group
+;; sizes differ too, so a count mismatch alone would also catch cross-talk.
+;; Oracle per left row r (group = r mod 2):
+;;   group 0: count=100, sum=100*111=11100, min=max=111
+;;   group 1: count=200, sum=200*222=44400, min=max=222
+;; Expressed via `take`'s cycling (take [x0 x1] 4096)[i] = [x0 x1][i mod 2],
+;; which matches k1/k2's own (% (til 4096) 2) pattern row-for-row.
+(set Lwjp (table [k1 k2 Time V] (list (% (til 4096) 2) (% (til 4096) 2) (+ 10:00:00.000 (til 4096)) (til 4096))))
+(set Rwjp (table [k1 k2 Time Bid] (list (concat (take [0] 100) (take [1] 200)) (concat (take [0] 100) (take [1] 200)) (+ 10:00:00.000 (til 300)) (concat (take [111] 100) (take [222] 200)))))
+(set ivwjp (map-left + [-10000 10000] (at Lwjp 'Time)))
+(set rwjp (window-join [k1 k2 Time] ivwjp Lwjp Rwjp {c: (count Bid) s: (sum Bid) mn: (min Bid) mx: (max Bid)}))
+(at rwjp 'c) -- (take [100 200] 4096)
+(at rwjp 's) -- (take [11100 44400] 4096)
+(at rwjp 'mn) -- (take [111 222] 4096)
+(at rwjp 'mx) -- (take [111 222] 4096)
 
 ;; ═══ cut-2: 255/256/300 widths (generated; see plan Task 8) ═══
 ;; The cut-2 flip (query.c) deletes the nine compile-side UINT8_MAX slot
