@@ -12320,8 +12320,6 @@ ray_t* ray_anti_join_fn(ray_t** args, int64_t n) { return antijoin_impl(args, n)
 /* window-join parallel worker                                              */
 /* ------------------------------------------------------------------------ */
 
-#define WJ_MAX_AGG 16
-
 typedef struct {
     int64_t cnt;
     int64_t sum_i;
@@ -12334,6 +12332,10 @@ typedef struct {
     double  prod_f;
 } wj_acc_t;
 
+/* All variable-count arrays are pointers into exact-size scratch carves owned
+ * by window_join_impl (eq family sized by n_eq, agg family by the agg-dict
+ * length).  No fixed cap: the eq-key and aggregate counts are memory-limited
+ * only. */
 typedef struct {
     int64_t  left_nrows;
     int64_t  right_nrows;
@@ -12345,29 +12347,35 @@ typedef struct {
      * without touching any ray_t objects (no locking, no allocation). */
     const int64_t*  lo_arr;
     const int64_t*  hi_arr;
-    const int64_t*  left_eq_arr[WJ_MAX_AGG];
+    const int64_t** left_eq_arr;    /* [n_eq] */
 
     /* Right-side sort order and time column (sorted rank -> original idx) */
     const int64_t*  right_sort;
     const int64_t*  rt_time_i;
 
-    /* Right equality columns (raw), kept for binary-search compares */
-    const void*     eq_data[WJ_MAX_AGG];
-    int8_t          eq_type[WJ_MAX_AGG];
-    uint8_t         eq_attrs[WJ_MAX_AGG];
+    /* Right equality columns (raw), kept for binary-search compares [n_eq] */
+    const void**    eq_data;
+    const int8_t*   eq_type;
+    const uint8_t*  eq_attrs;
 
-    /* Per-agg metadata and preloaded sorted source vectors */
-    uint8_t         agg_raw[WJ_MAX_AGG];
-    uint16_t        agg_ops[WJ_MAX_AGG];
-    int8_t          agg_result_types[WJ_MAX_AGG];
-    int             agg_is_float[WJ_MAX_AGG];
-    const int64_t*  sorted_i[WJ_MAX_AGG];
-    const double*   sorted_f[WJ_MAX_AGG];
-    const uint8_t*  sorted_nn[WJ_MAX_AGG];
+    /* Per-agg metadata and preloaded sorted source vectors [n_agg] */
+    const uint8_t*  agg_raw;
+    const uint16_t* agg_ops;
+    const int8_t*   agg_result_types;
+    const int*      agg_is_float;
+    const int64_t** sorted_i;
+    const double**  sorted_f;
+    const uint8_t** sorted_nn;
 
-    /* Per-agg result output — writers index by lr directly */
-    void*           result_data[WJ_MAX_AGG];
-    uint8_t*        result_null[WJ_MAX_AGG];  /* 1 byte per row: 1 = null */
+    /* Per-agg result output — writers index by lr directly [n_agg] */
+    void**          result_data;
+    uint8_t**       result_null;  /* 1 byte per row: 1 = null */
+
+    /* Per-worker scratch, indexed by worker_id (no per-row allocation):
+     *   acc slice    = acc_base    + worker_id * n_agg   (wj_acc_t[n_agg])
+     *   target slice = target_base + worker_id * n_eq    (int64_t[n_eq]) */
+    wj_acc_t*       acc_base;
+    int64_t*        target_base;
 } wj_scan_ctx_t;
 
 /* Compare the equality tuple of sorted-right row `ri` against `target_eq`.
@@ -12383,11 +12391,12 @@ static inline int wj_eq_cmp(const wj_scan_ctx_t* c, int64_t ri,
 }
 
 static void wj_scan_fn(void* ctx_, uint32_t worker_id, int64_t start, int64_t end) {
-    (void)worker_id;
     wj_scan_ctx_t* c = (wj_scan_ctx_t*)ctx_;
-    wj_acc_t acc[WJ_MAX_AGG];
     int64_t  n_eq   = c->n_eq;
     int64_t  n_agg  = c->n_agg;
+    /* Per-worker scratch slices (disjoint by worker_id → no contention). */
+    wj_acc_t* acc       = c->acc_base    + (size_t)worker_id * n_agg;
+    int64_t*  target_eq = c->target_base + (size_t)worker_id * n_eq;
     int64_t  rn     = c->right_nrows;
     const int64_t* right_sort = c->right_sort;
     const int64_t* rt_time_i  = c->rt_time_i;
@@ -12396,7 +12405,6 @@ static void wj_scan_fn(void* ctx_, uint32_t worker_id, int64_t start, int64_t en
         int64_t lo = c->lo_arr[lr];
         int64_t hi = c->hi_arr[lr];
 
-        int64_t target_eq[WJ_MAX_AGG];
         for (int64_t e = 0; e < n_eq; e++)
             target_eq[e] = c->left_eq_arr[e][lr];
 
@@ -12444,7 +12452,7 @@ static void wj_scan_fn(void* ctx_, uint32_t worker_id, int64_t start, int64_t en
         }
         if (lb > ub) lb = ub;   /* empty window / no partition → null result */
 
-        memset(acc, 0, sizeof(acc));
+        memset(acc, 0, (size_t)n_agg * sizeof(wj_acc_t));
         for (int64_t a = 0; a < n_agg; a++) {
             if (c->agg_ops[a] == OP_PROD) { acc[a].prod_i = 1; acc[a].prod_f = 1.0; }
         }
@@ -12759,35 +12767,103 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         ray_t* right_time = ray_table_get_col(right_tbl, time_key);
         if (!left_time || !right_time) return ray_error("domain", "window-join: time key column not found in both tables");
 
-        /* Get equality columns */
-        ray_t* left_eq[16], *right_eq[16];
-        for (int64_t e = 0; e < n_eq && e < 16; e++) {
+        /* Get equality columns.  One calloc'd carve holds every n_eq-sized eq
+         * buffer: five pointer arrays (left_eq/right_eq/eq_data/left_eq_hdr/
+         * left_eq_arr) then two byte arrays (eq_type/eq_attrs).  Zero-init is
+         * required — left_eq_hdr/left_eq_arr are released by a loop that
+         * iterates unconditionally, and eq_data/eq_type/eq_attrs are aliased
+         * into the scan ctx.  n_eq >= 1 (nkeys >= 2), so the carve is never
+         * zero-sized. */
+        ray_t* eq_hdr = NULL;
+        ray_t** left_eq = (ray_t**)scratch_calloc(&eq_hdr,
+            (size_t)n_eq * (5 * sizeof(void*) + 2 * sizeof(uint8_t)));
+        if (!left_eq) { for (int i = 0; i < 4; i++) ray_release(eargs[i]); return ray_error("oom", NULL); }
+        ray_t**      right_eq    = (ray_t**)(left_eq + n_eq);
+        const void** eq_data     = (const void**)(right_eq + n_eq);
+        ray_t**      left_eq_hdr = (ray_t**)(eq_data + n_eq);
+        int64_t**    left_eq_arr = (int64_t**)(left_eq_hdr + n_eq);
+        int8_t*      eq_type     = (int8_t*)(left_eq_arr + n_eq);
+        uint8_t*     eq_attrs    = (uint8_t*)(eq_type + n_eq);
+        for (int64_t e = 0; e < n_eq; e++) {
             int64_t eq_key = sym_cell_runtime_id(keys_vec, e);
             left_eq[e] = ray_table_get_col(left_tbl, eq_key);
             right_eq[e] = ray_table_get_col(right_tbl, eq_key);
-            if (!left_eq[e] || !right_eq[e]) return ray_error("domain", "window-join: equality key column not found in both tables");
+            if (!left_eq[e] || !right_eq[e]) {
+                scratch_free(eq_hdr);
+                for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                return ray_error("domain", "window-join: equality key column not found in both tables");
+            }
         }
 
         /* Parse every (name, (op src)) pair from the agg dict.  The dict's
          * physical layout is [keys (SYM vec), vals (LIST)] — read keys[i]
          * via ray_read_sym and pair it with vals[i] from the LIST.
-         * WJ_MAX_AGG is defined at file scope (for wj_scan_ctx_t). */
-        int64_t  agg_names[WJ_MAX_AGG];
-        uint16_t agg_ops[WJ_MAX_AGG];
-        int64_t  agg_src_ids[WJ_MAX_AGG];
-        ray_t*   agg_src_vecs[WJ_MAX_AGG] = {0};
-        int8_t   agg_types[WJ_MAX_AGG];
-        int      agg_is_float[WJ_MAX_AGG];
-        ray_t*   agg_result_vecs[WJ_MAX_AGG] = {0};
-        int      agg_raw[WJ_MAX_AGG] = {0};  /* {name: Col} bare-column form — legacy placeholder */
-        int64_t  n_agg = 0;
-
+         *
+         * The agg-dict length is the exact upper bound on the aggregate count;
+         * carve every agg-sized buffer from one calloc'd block sized by it (or
+         * leave the pointers NULL when there is no dict — n_agg stays 0 and
+         * every a<n_agg loop is inert).  Order: thirteen 8-byte arrays, then
+         * the int / uint16 / three byte arrays.  calloc: many of these
+         * (agg_src_vecs, agg_result_vecs, sorted_*, sorted_*_hdr, null_stage*)
+         * are read or freed at slots the producers may skip. */
+        ray_t*  dkeys = NULL, *dvals = NULL;
+        ray_t** lvals = NULL;
+        int64_t adn = 0;
         if (agg_dict && agg_dict->type == RAY_DICT) {
-            ray_t* dkeys = ray_dict_keys(agg_dict);
-            ray_t* dvals = ray_dict_vals(agg_dict);
-            int64_t adn = (dkeys && dkeys->type == RAY_SYM) ? dkeys->len : 0;
-            ray_t** lvals = (dvals && dvals->type == RAY_LIST) ? (ray_t**)ray_data(dvals) : NULL;
-            for (int64_t di = 0; di < adn && n_agg < WJ_MAX_AGG; di++) {
+            dkeys = ray_dict_keys(agg_dict);
+            dvals = ray_dict_vals(agg_dict);
+            if (dkeys && dkeys->type == RAY_SYM) adn = dkeys->len;
+            lvals = (dvals && dvals->type == RAY_LIST) ? (ray_t**)ray_data(dvals) : NULL;
+        }
+        ray_t*    agg_hdr = NULL;
+        int64_t*  agg_names = NULL;
+        int64_t*  agg_src_ids = NULL;
+        ray_t**   agg_src_vecs = NULL;
+        ray_t**   agg_result_vecs = NULL;
+        int64_t** sorted_i = NULL;
+        double**  sorted_f = NULL;
+        uint8_t** sorted_nn = NULL;
+        ray_t**   sorted_i_hdr = NULL;
+        ray_t**   sorted_f_hdr = NULL;
+        ray_t**   sorted_nn_hdr = NULL;
+        ray_t**   null_stage_hdr = NULL;
+        uint8_t** null_stage = NULL;
+        void**    result_data = NULL;
+        int*      agg_is_float = NULL;
+        uint16_t* agg_ops = NULL;
+        int8_t*   agg_types = NULL;
+        int8_t*   agg_result_types = NULL;
+        uint8_t*  agg_raw = NULL;
+        if (adn > 0) {
+            agg_names = (int64_t*)scratch_calloc(&agg_hdr,
+                (size_t)adn * (13 * sizeof(void*) + sizeof(int) + sizeof(uint16_t) + 3 * sizeof(uint8_t)));
+            if (!agg_names) {
+                scratch_free(eq_hdr);
+                for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                return ray_error("oom", NULL);
+            }
+            agg_src_ids      = (int64_t*)(agg_names + adn);
+            agg_src_vecs     = (ray_t**)(agg_src_ids + adn);
+            agg_result_vecs  = (ray_t**)(agg_src_vecs + adn);
+            sorted_i         = (int64_t**)(agg_result_vecs + adn);
+            sorted_f         = (double**)(sorted_i + adn);
+            sorted_nn        = (uint8_t**)(sorted_f + adn);
+            sorted_i_hdr     = (ray_t**)(sorted_nn + adn);
+            sorted_f_hdr     = (ray_t**)(sorted_i_hdr + adn);
+            sorted_nn_hdr    = (ray_t**)(sorted_f_hdr + adn);
+            null_stage_hdr   = (ray_t**)(sorted_nn_hdr + adn);
+            null_stage       = (uint8_t**)(null_stage_hdr + adn);
+            result_data      = (void**)(null_stage + adn);
+            agg_is_float     = (int*)(result_data + adn);
+            agg_ops          = (uint16_t*)(agg_is_float + adn);
+            agg_types        = (int8_t*)(agg_ops + adn);
+            agg_result_types = (int8_t*)(agg_types + adn);
+            agg_raw          = (uint8_t*)(agg_result_types + adn);
+        }
+        int64_t n_agg = 0;
+
+        {
+            for (int64_t di = 0; di < adn; di++) {
                 /* dict-key cell becomes an output column NAME — runtime */
                 int64_t kname_id = sym_cell_runtime_id(dkeys, di);
                 ray_t* expr = lvals ? lvals[di] : NULL;
@@ -12821,7 +12897,6 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
          * accepts any column type (numeric or not) and always produces a
          * nullable i64 column filled with nulls. All true aggregation ops
          * require a numeric source column. */
-        int8_t agg_result_types[WJ_MAX_AGG];
         for (int64_t a = 0; a < n_agg; a++) {
             if (agg_raw[a]) {
                 agg_src_vecs[a]    = NULL;
@@ -12833,6 +12908,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                     ray_t* err = agg_result_vecs[a];
                     for (int64_t b = 0; b < a; b++) ray_release(agg_result_vecs[b]);
                     for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                    scratch_free(agg_hdr); scratch_free(eq_hdr);
                     return err;
                 }
                 continue;
@@ -12840,12 +12916,14 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
             if (agg_ops[a] == 0) {
                 for (int64_t b = 0; b < a; b++) ray_release(agg_result_vecs[b]);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                scratch_free(agg_hdr); scratch_free(eq_hdr);
                 return ray_error("domain", "window-join: unsupported aggregation op");
             }
             ray_t* src = ray_table_get_col(right_tbl, agg_src_ids[a]);
             if (!src) {
                 for (int64_t b = 0; b < a; b++) ray_release(agg_result_vecs[b]);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                scratch_free(agg_hdr); scratch_free(eq_hdr);
                 return ray_error("domain", "window-join: aggregation source column not found");
             }
             int8_t t = src->type;
@@ -12860,6 +12938,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                 default:
                     for (int64_t b = 0; b < a; b++) ray_release(agg_result_vecs[b]);
                     for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                    scratch_free(agg_hdr); scratch_free(eq_hdr);
                     return ray_error("type", "window-join: aggregation source must be numeric, got %s", ray_type_name(t));
                 }
             }
@@ -12884,6 +12963,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                 ray_t* err = agg_result_vecs[a];
                 for (int64_t b = 0; b < a; b++) ray_release(agg_result_vecs[b]);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                scratch_free(agg_hdr); scratch_free(eq_hdr);
                 return err;
             }
         }
@@ -12897,9 +12977,8 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         int64_t* right_sort = NULL;
         int64_t* rt_time_i  = NULL;
         int64_t* tmp_sort   = NULL;
-        const void* eq_data[16];
-        int8_t      eq_type[16];
-        uint8_t     eq_attrs[16];
+        /* eq_data/eq_type/eq_attrs live in the eq carve (aliased into the scan
+         * ctx); fill the right-side metadata for the sort compare here. */
         for (int64_t e = 0; e < n_eq; e++) {
             eq_data[e]  = ray_data(right_eq[e]);
             eq_type[e]  = right_eq[e]->type;
@@ -12915,6 +12994,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                 if (tmp_hdr) scratch_free(tmp_hdr);
                 for (int64_t a = 0; a < n_agg; a++) ray_release(agg_result_vecs[a]);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                scratch_free(agg_hdr); scratch_free(eq_hdr);
                 return ray_error("oom", NULL);
             }
             /* Cache time column access so the sort compare avoids reloading them */
@@ -12967,13 +13047,9 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
          *
          * COUNT / raw form carry no source; nothing to preload. PROD and
          * ops on null-containing columns still go through the slow scan
-         * (see below), so the preload is gated on the easy numeric cases. */
-        int64_t* sorted_i[WJ_MAX_AGG]  = {0};
-        double*  sorted_f[WJ_MAX_AGG]  = {0};
-        uint8_t* sorted_nn[WJ_MAX_AGG] = {0};  /* 0 = null, 1 = value present */
-        ray_t*   sorted_i_hdr[WJ_MAX_AGG] = {0};
-        ray_t*   sorted_f_hdr[WJ_MAX_AGG] = {0};
-        ray_t*   sorted_nn_hdr[WJ_MAX_AGG] = {0};
+         * (see below), so the preload is gated on the easy numeric cases.
+         * sorted_i/f/nn and their _hdr arrays live in the (zero-initialized)
+         * agg carve — slots skipped here stay NULL for WJ_CLEANUP_TEMP. */
         for (int64_t a = 0; a < n_agg; a++) {
             if (agg_raw[a] || agg_ops[a] == OP_COUNT) continue;
             ray_t* src = agg_src_vecs[a];
@@ -13029,6 +13105,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
             WJ_CLEANUP_TEMP();
             for (int64_t a = 0; a < n_agg; a++) ray_release(agg_result_vecs[a]);
             for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+            scratch_free(agg_hdr); scratch_free(eq_hdr);
             return ray_error("oom", NULL);
         }
 
@@ -13045,6 +13122,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
             WJ_CLEANUP_TEMP();
             for (int64_t a = 0; a < n_agg; a++) ray_release(agg_result_vecs[a]);
             for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+            scratch_free(agg_hdr); scratch_free(eq_hdr);
             return ray_error("oom", NULL);
         }
         /* `intervals` is the v1 two-parallel-vector form: a 2-element list
@@ -13066,6 +13144,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                 WJ_CLEANUP_TEMP();
                 for (int64_t a = 0; a < n_agg; a++) ray_release(agg_result_vecs[a]);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                scratch_free(agg_hdr); scratch_free(eq_hdr);
                 return ray_error("domain", "window-join: intervals must be [lo hi] vectors matching left row count");
             }
             const void* lo_d = ray_data(lo_vec);
@@ -13080,8 +13159,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
             if (alloc_hi_v) ray_release(hi_vec);
         }
 
-        ray_t*   left_eq_hdr[WJ_MAX_AGG] = {0};
-        int64_t* left_eq_arr[WJ_MAX_AGG] = {0};
+        /* left_eq_hdr/left_eq_arr live in the (zero-initialized) eq carve. */
         for (int64_t e = 0; e < n_eq; e++) {
             left_eq_arr[e] = (int64_t*)scratch_alloc(&left_eq_hdr[e],
                                                      (size_t)left_nrows * sizeof(int64_t));
@@ -13093,6 +13171,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                 WJ_CLEANUP_TEMP();
                 for (int64_t a = 0; a < n_agg; a++) ray_release(agg_result_vecs[a]);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                scratch_free(agg_hdr); scratch_free(eq_hdr);
                 return ray_error("oom", NULL);
             }
             const void* sd = ray_data(left_eq[e]);
@@ -13104,8 +13183,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
 
         /* Pre-size each result vector and allocate a 1-byte-per-row null
          * staging array — writers index by lr without touching nulls. */
-        ray_t*   null_stage_hdr[WJ_MAX_AGG] = {0};
-        uint8_t* null_stage[WJ_MAX_AGG]     = {0};
+        /* null_stage_hdr/null_stage live in the (zero-initialized) agg carve. */
         for (int64_t a = 0; a < n_agg; a++) {
             agg_result_vecs[a]->len = left_nrows;
             null_stage[a] = (uint8_t*)scratch_alloc(&null_stage_hdr[a], (size_t)left_nrows);
@@ -13117,12 +13195,37 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
                 WJ_CLEANUP_TEMP();
                 for (int64_t b = 0; b < n_agg; b++) ray_release(agg_result_vecs[b]);
                 for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+                scratch_free(agg_hdr); scratch_free(eq_hdr);
                 return ray_error("oom", NULL);
             }
             memset(null_stage[a], 0, (size_t)left_nrows);
         }
 
-        /* Build the scan context and dispatch. */
+        /* Build the scan context and dispatch.  Per-worker scratch (acc +
+         * target_eq) is carved once, sized by the worker count — no per-row
+         * or per-morsel allocation.  Worker 0 (main thread) covers the serial
+         * path too. */
+        ray_pool_t* pool = ray_pool_get();
+        int64_t nw = (pool && left_nrows >= 2048) ? ray_pool_total_workers(pool) : 1;
+        ray_t* wscr_hdr = NULL;
+        wj_acc_t* acc_base = (wj_acc_t*)scratch_alloc(&wscr_hdr,
+            (size_t)nw * ((size_t)n_agg * sizeof(wj_acc_t) + (size_t)n_eq * sizeof(int64_t)));
+        if (!acc_base) {
+            if (lo_hdr) scratch_free(lo_hdr);
+            if (hi_hdr) scratch_free(hi_hdr);
+            for (int64_t f = 0; f < n_eq; f++) if (left_eq_hdr[f]) scratch_free(left_eq_hdr[f]);
+            for (int64_t b = 0; b < n_agg; b++) if (null_stage_hdr[b]) scratch_free(null_stage_hdr[b]);
+            WJ_CLEANUP_TEMP();
+            for (int64_t b = 0; b < n_agg; b++) ray_release(agg_result_vecs[b]);
+            for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+            scratch_free(agg_hdr); scratch_free(eq_hdr);
+            return ray_error("oom", NULL);
+        }
+        int64_t* target_base = (int64_t*)(acc_base + (size_t)nw * n_agg);
+
+        for (int64_t a = 0; a < n_agg; a++)
+            result_data[a] = ray_data(agg_result_vecs[a]);
+
         wj_scan_ctx_t wctx;
         memset(&wctx, 0, sizeof(wctx));
         wctx.left_nrows  = left_nrows;
@@ -13134,25 +13237,22 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         wctx.hi_arr      = hi_arr;
         wctx.right_sort  = right_sort;
         wctx.rt_time_i   = rt_time_i;
-        for (int64_t e = 0; e < n_eq; e++) {
-            wctx.left_eq_arr[e] = left_eq_arr[e];
-            wctx.eq_data[e]     = eq_data[e];
-            wctx.eq_type[e]     = eq_type[e];
-            wctx.eq_attrs[e]    = eq_attrs[e];
-        }
-        for (int64_t a = 0; a < n_agg; a++) {
-            wctx.agg_raw[a]          = (uint8_t)agg_raw[a];
-            wctx.agg_ops[a]          = agg_ops[a];
-            wctx.agg_result_types[a] = agg_result_types[a];
-            wctx.agg_is_float[a]     = agg_is_float[a];
-            wctx.sorted_i[a]         = sorted_i[a];
-            wctx.sorted_f[a]         = sorted_f[a];
-            wctx.sorted_nn[a]        = sorted_nn[a];
-            wctx.result_data[a]      = ray_data(agg_result_vecs[a]);
-            wctx.result_null[a]      = null_stage[a];
-        }
+        wctx.left_eq_arr = (const int64_t**)left_eq_arr;
+        wctx.eq_data     = eq_data;
+        wctx.eq_type     = eq_type;
+        wctx.eq_attrs    = eq_attrs;
+        wctx.agg_raw          = agg_raw;
+        wctx.agg_ops          = agg_ops;
+        wctx.agg_result_types = agg_result_types;
+        wctx.agg_is_float     = agg_is_float;
+        wctx.sorted_i    = (const int64_t**)sorted_i;
+        wctx.sorted_f    = (const double**)sorted_f;
+        wctx.sorted_nn   = (const uint8_t**)sorted_nn;
+        wctx.result_data = result_data;
+        wctx.result_null = null_stage;
+        wctx.acc_base    = acc_base;
+        wctx.target_base = target_base;
 
-        ray_pool_t* pool = ray_pool_get();
         if (pool && left_nrows >= 2048) {
             ray_pool_dispatch(pool, wj_scan_fn, &wctx, left_nrows);
         } else {
@@ -13168,6 +13268,7 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
         }
 
         /* Free pre-extract scratch */
+        scratch_free(wscr_hdr);
         if (lo_hdr) scratch_free(lo_hdr);
         if (hi_hdr) scratch_free(hi_hdr);
         for (int64_t e = 0; e < n_eq; e++)
@@ -13194,8 +13295,11 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
             ray_release(agg_result_vecs[a]);
         }
         for (int i = 0; i < 4; i++) ray_release(eargs[i]);
+        /* agg_hdr/eq_hdr hold only the (now-consumed) pointer arrays; the
+         * result table owns the vecs and left columns. */
+        scratch_free(agg_hdr);
+        scratch_free(eq_hdr);
         return result;
-        #undef WJ_MAX_AGG
     }
 
     ray_t* left_tbl  = eargs[0];
