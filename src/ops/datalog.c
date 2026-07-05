@@ -98,6 +98,10 @@ static int64_t dl_col_sym(const char* rel_name, int col_idx) {
 int dl_add_edb(dl_program_t* prog, const char* name, ray_t* table, int arity) {
     if (!prog || !name || !table || prog->n_rels >= DL_MAX_RELS)
         return -1;
+    /* col_names[] is fixed at DL_MAX_ARITY; reject over-arity EDBs at
+     * admission to prevent truncation or out-of-bounds access. */
+    if (arity > DL_MAX_ARITY)
+        return -1;
 
     int idx = prog->n_rels++;
     dl_rel_t* rel = &prog->rels[idx];
