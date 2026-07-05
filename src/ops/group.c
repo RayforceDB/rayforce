@@ -2352,15 +2352,38 @@ void ght_layout_free(ght_layout_t* ly) {
 
 void ght_layout_copy(ght_layout_t* dst, const ght_layout_t* src) {
     *dst = *src;   /* scalars + inline-array CONTENTS; the pointers are wrong */
-    if (src->spill_hdr == NULL) {
-        /* Inline: re-aim the bases at dst's own inline arrays (self-contained
-         * — no dependency on src's lifetime). */
+    /* Decide by STORAGE, not ownership: src->spill_hdr == NULL is true both
+     * for a genuine inline layout AND for a BORROWER (a prior copy of a
+     * spilled master — its bases point into the master's spill block but it
+     * does not own that block, so its own spill_hdr is NULL).  Testing
+     * spill_hdr here would send a borrower-of-a-borrower down the inline
+     * branch, re-pointing it at its own zeroed size-8 *_in arrays — silently
+     * truncating any layout with > GHT_INLINE keys/aggs two copies deep
+     * (e.g. master ctx -> per-partition ctx -> per-partition group_ht_t).
+     *
+     * The storage-identity test below is depth-invariant: src->agg_val_slot
+     * == src->agg_val_slot_in is true iff src's bases are self-referential,
+     * i.e. src itself is inline storage (whether or not src owns it) — a
+     * spilled master, a borrower, and a borrower-of-a-borrower all read
+     * false here alike, so master -> b1 -> b2 -> b3 ... all correctly keep
+     * borrowing the one shared spill block.  This needs no new field: the
+     * inline arrays already carry a unique identity (dst's own struct
+     * address), so pointer identity against them IS the storage test. */
+    if (src->agg_val_slot == src->agg_val_slot_in) {
+        /* Inline storage: re-aim the bases at dst's own inline arrays
+         * (self-contained — no dependency on src's lifetime). */
         ght_layout_point_inline(dst);
+        dst->spill_hdr = NULL;
     } else {
-        /* Spilled: BORROW src's shared read-only spill block.  The base
-         * pointers copied above already aim into it; drop ownership so
-         * ght_layout_free(dst) is a no-op — the original frees it, and the
-         * caller must ensure dst does not outlive src. */
+        /* Spill storage (src is either the owning master or a prior
+         * borrower): BORROW the shared read-only spill block.  The base
+         * pointers copied above already aim into it — that's true whether
+         * src owns the block or is itself borrowing it, since a borrower's
+         * bases are copied verbatim from what it borrowed.  Drop ownership
+         * so ght_layout_free(dst) is a no-op.  Lifetime rule: the OWNING
+         * MASTER must outlive every borrower transitively copied from it —
+         * all borrowers (at any depth) must be done with / freed before the
+         * master frees the spill. */
         dst->spill_hdr = NULL;
     }
 }
@@ -6825,15 +6848,17 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
     }
 
-    /* The ght `[8]` fast layout (key_data[8]/key_pool[8], and the per-agg
-     * agg_is_binary/agg_is_holistic/agg_is_wide bitmasks) structurally caps
-     * n_keys and n_aggs at 8 there — kept until a future cut (see the
-     * unbounded-slots design doc: "group-HT [8] fast layout ... until cut
-     * 4").  The scalar-reduction fast path below (n_keys == 0) is a
-     * separate, VLA-sized accumulator with no such limit, so let n_aggs > 8
-     * through when there are no group keys; the guard just before
-     * ght_compute_layout (`ht_path:`) still rejects the rare fallback
-     * (accumulator OOM / oversized scan) that would actually need the
+    /* ght_layout_t itself is now unbounded (inline-or-spill, this cut) —
+     * n_keys/n_aggs no longer structurally cap at 8 there.  But group_ht_t's
+     * own key_data[8]/key_pool[8] (wide-key source-column resolution) are
+     * still fixed [8] arrays, so the n_keys/n_aggs > 8 gate below stays as a
+     * deliberate behavior-freeze for this cut, not a ght_layout_t limit —
+     * lifting it is follow-up work (widen key_data/key_pool alongside).  The
+     * scalar-reduction fast path below (n_keys == 0) is a separate,
+     * VLA-sized accumulator with no such limit, so let n_aggs > 8 through
+     * when there are no group keys; the guard just before ght_compute_layout
+     * (`ht_path:`) still rejects the rare fallback (accumulator OOM /
+     * oversized scan) that would actually need the
      * capped HT layout. */
     if (n_keys > 8 || (n_keys > 0 && n_aggs > 8)) return ray_error("nyi", NULL);
 
@@ -8957,9 +8982,13 @@ ht_path:;
      * on the assumption the scalar fast path (VLA-sized) will serve it —
      * that path returns before reaching here in the common case.  The rare
      * fallback into this HT row-layout (accumulator OOM / oversized scan)
-     * still can't serve n_aggs > 8: agg_is_binary/agg_is_holistic/agg_is_wide
-     * are single-byte bitmasks in ght_layout_t.  n_keys > 0 with n_aggs > 8
-     * already returned at the top of the function and never reaches here. */
+     * still can't serve n_aggs > 8 this cut: ght_layout_t's per-agg
+     * metadata (agg_flags etc.) is unbounded as of this cut, but this HT
+     * row-layout path as a whole remains gated to ≤8 keys/aggs as a
+     * deliberate behavior-freeze (see the exec_group_run width guard and
+     * group_ht_t's still-fixed key_data[8]/key_pool[8]) — lifting it is
+     * follow-up work.  n_keys > 0 with n_aggs > 8 already returned at the
+     * top of the function and never reaches here. */
     if (n_aggs > 8) {
         for (uint32_t a = 0; a < n_aggs; a++)
             { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);

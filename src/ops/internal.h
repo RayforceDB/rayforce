@@ -1093,8 +1093,19 @@ typedef struct {
     uint8_t   key_flags_in[GHT_INLINE];
     uint8_t   wide_key_esz_in[GHT_INLINE];
     int8_t    wide_key_type_in[GHT_INLINE];
-    /* Owned heap spill block for wider layouts; NULL when inline.  Freed by
-     * ght_layout_free (the owner only — copies borrow, see ght_layout_copy). */
+    /* Owned heap spill block for wider layouts; NULL when inline OR when
+     * this instance is a borrower (a copy of a spilled layout — its bases
+     * point into the ORIGINAL owner's spill block, but spill_hdr stays NULL
+     * so ght_layout_free is a no-op on it).  Because a borrower's own
+     * spill_hdr reads NULL exactly like true-inline storage, ght_layout_copy
+     * cannot dispatch on spill_hdr == NULL — it must test STORAGE identity
+     * (agg_val_slot == agg_val_slot_in) instead; see ght_layout_copy.  That
+     * test is depth-invariant: master -> borrower -> borrower -> ... all
+     * correctly re-borrow the one shared block, however many copies deep.
+     * Freed by ght_layout_free (the owning master only).  Lifetime rule:
+     * the owning master must outlive every borrower transitively copied
+     * from it — all borrowers, at any depth, must be done with before the
+     * master frees the spill. */
     ray_t*    spill_hdr;
 } ght_layout_t;
 
@@ -1105,7 +1116,7 @@ typedef struct {
     uint32_t     grp_count;
     uint32_t     grp_cap;
     ght_layout_t layout;
-    /* Non-NULL only when layout.wide_key_mask != 0.  Pointers into
+    /* Non-NULL only when layout.any_wide_key != 0.  Pointers into
      * the original key columns (slice-unaware raw data), used by
      * group_probe_entry / group_ht_rehash to resolve row-indexed
      * wide keys. */
@@ -1138,10 +1149,18 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                         ray_t** agg_vecs, uint8_t need_flags,
                         const uint16_t* agg_ops,
                         const int8_t* key_types);
-/* By-value copy that fixes the base pointers: for an inline src, dst's bases
- * aim at dst's own inline arrays (self-contained); for a spilled src, dst
- * BORROWS src's spill read-only (dst->spill_hdr = NULL, so ght_layout_free(dst)
- * is a no-op) — the original owns/frees it and MUST outlive every copy. */
+/* By-value copy that fixes the base pointers.  Dispatches on STORAGE, not
+ * ownership (src->spill_hdr == NULL is true both for genuine inline layouts
+ * AND for borrowers, so it cannot be the test): when src->agg_val_slot ==
+ * src->agg_val_slot_in, src's bases are self-referential inline storage and
+ * dst's bases are re-aimed at dst's OWN inline arrays (self-contained).
+ * Otherwise dst BORROWS the shared spill block that src's bases already
+ * point into (dst->spill_hdr = NULL, so ght_layout_free(dst) is a no-op).
+ * This makes the copy depth-invariant: master -> borrower -> borrower -> ...
+ * all correctly borrow the one spill block regardless of copy depth.
+ * Lifetime rule: the owning master MUST outlive every borrower copied from
+ * it, transitively — all borrowers at any depth must be done with / freed
+ * before the master frees the spill. */
 void ght_layout_copy(ght_layout_t* dst, const ght_layout_t* src);
 /* NULL-safe; frees the owned spill block (no-op when inline / already freed). */
 void ght_layout_free(ght_layout_t* ly);

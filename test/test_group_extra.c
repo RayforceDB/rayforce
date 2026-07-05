@@ -2273,6 +2273,111 @@ static test_result_t test_hll_merge_edges(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: ght_layout_copy depth-invariance (review fix, unbounded-slots cut 4)
+ *
+ * ght_compute_layout carves ONE owned heap spill block when n_keys or
+ * n_aggs exceeds GHT_INLINE (8); ght_layout_copy re-points a copy's base
+ * pointers at either the copy's own inline arrays (inline src) or the
+ * shared spill block (spilled src, borrowed read-only).
+ *
+ * The defect this test targets: a BORROWER (a copy of a spilled master)
+ * has spill_hdr == NULL too — that's how "borrow, don't own" is encoded —
+ * so a naive `src->spill_hdr == NULL` test in ght_layout_copy cannot tell
+ * a true-inline source from a borrower source.  Copying FROM a borrower
+ * (master -> b1 -> b2, exactly the group_ht_init_sized(&c->part_hts[p],
+ * ..., &c->layout, ...) / group_ht_init_sized(&my_hts[p], ..., ly, ...)
+ * shape used for per-partition HTs) would take the wrong branch and
+ * re-point b2's bases at b2's own zeroed size-8 *_in arrays — silently
+ * truncating any layout with > 8 keys/aggs two copies deep.
+ *
+ * The fix dispatches on STORAGE identity (src->agg_val_slot ==
+ * src->agg_val_slot_in) instead of ownership (spill_hdr == NULL), which is
+ * depth-invariant: this test builds a 10-key/10-agg (> GHT_INLINE) layout
+ * directly via ght_compute_layout, copies it twice (master -> b1 -> b2),
+ * and asserts b2's bases are pointer-identical to the master's spill bases
+ * (not b2's own inline arrays) and that master/b1/b2 read identical values
+ * through those bases.  Free order: borrowers (no-ops) then the owning
+ * master last.
+ * -------------------------------------------------------------------------- */
+static test_result_t test_ght_layout_copy_depth_invariance(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    enum { NK = 10, NA = 10 };  /* both > GHT_INLINE (8): forces the spill path */
+
+    int8_t key_types[NK];
+    for (int i = 0; i < NK; i++) key_types[i] = RAY_I64;  /* narrow keys, no wide-key path */
+
+    uint16_t agg_ops[NA];
+    ray_t* agg_vecs[NA];
+    for (int i = 0; i < NA; i++) {
+        agg_ops[i] = OP_SUM;
+        agg_vecs[i] = ray_vec_new(RAY_F64, 1);
+        TEST_ASSERT_NOT_NULL(agg_vecs[i]);
+        agg_vecs[i]->len = 1;
+        ((double*)ray_data(agg_vecs[i]))[0] = 0.0;
+    }
+
+    ght_layout_t master;
+    TEST_ASSERT_TRUE(ght_compute_layout(&master, NK, NA, agg_vecs,
+                                        GHT_NEED_SUM, agg_ops, key_types));
+    /* > GHT_INLINE on both axes: this must be a real, owned spill block. */
+    TEST_ASSERT_NOT_NULL(master.spill_hdr);
+    TEST_ASSERT_FALSE(master.agg_val_slot == master.agg_val_slot_in);
+
+    ght_layout_t b1;
+    ght_layout_copy(&b1, &master);
+    TEST_ASSERT_NULL(b1.spill_hdr);                          /* borrows, doesn't own */
+    TEST_ASSERT_EQ_PTR(b1.agg_val_slot, master.agg_val_slot); /* shares master's spill */
+    TEST_ASSERT_EQ_PTR(b1.key_off,      master.key_off);
+    TEST_ASSERT_EQ_PTR(b1.agg_flags,    master.agg_flags);
+    TEST_ASSERT_EQ_PTR(b1.wide_key_esz, master.wide_key_esz);
+
+    /* The bug: copying FROM a borrower.  b1.spill_hdr == NULL looks
+     * identical to a true-inline layout to the old (fixed) spill_hdr-based
+     * test, so the buggy branch would re-point b2 at b2's OWN inline
+     * arrays instead of the shared spill block. */
+    ght_layout_t b2;
+    ght_layout_copy(&b2, &b1);
+    TEST_ASSERT_NULL(b2.spill_hdr);
+    TEST_ASSERT_EQ_PTR(b2.agg_val_slot, master.agg_val_slot);
+    TEST_ASSERT_EQ_PTR(b2.key_off,      master.key_off);
+    TEST_ASSERT_EQ_PTR(b2.agg_flags,    master.agg_flags);
+    TEST_ASSERT_EQ_PTR(b2.wide_key_esz, master.wide_key_esz);
+    /* The failure signature the bug would produce, explicitly ruled out:
+     * b2 re-pointed at its own inline storage instead of the spill. */
+    TEST_ASSERT_FALSE(b2.agg_val_slot == b2.agg_val_slot_in);
+    TEST_ASSERT_FALSE(b2.key_off == b2.key_off_in);
+
+    /* All three read identical values through their (possibly distinct
+     * struct, but pointer-identical base) views. */
+    for (int a = 0; a < NA; a++) {
+        TEST_ASSERT_EQ_I(master.agg_val_slot[a], b1.agg_val_slot[a]);
+        TEST_ASSERT_EQ_I(master.agg_val_slot[a], b2.agg_val_slot[a]);
+        TEST_ASSERT_EQ_I(master.agg_flags[a],    b2.agg_flags[a]);
+    }
+    for (int k = 0; k <= NK; k++) {
+        TEST_ASSERT_EQ_I(master.key_off[k], b1.key_off[k]);
+        TEST_ASSERT_EQ_I(master.key_off[k], b2.key_off[k]);
+    }
+
+    /* Free order: borrowers first (no-ops — dst->spill_hdr is NULL for
+     * both), the owning master last (actually frees the block). Freeing
+     * a borrower must never touch the master's block. */
+    ght_layout_free(&b2);
+    ght_layout_free(&b1);
+    TEST_ASSERT_NOT_NULL(master.spill_hdr);  /* untouched by borrower frees */
+    ght_layout_free(&master);
+    TEST_ASSERT_NULL(master.spill_hdr);
+
+    for (int i = 0; i < NA; i++) ray_release(agg_vecs[i]);
+
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test registry
  * -------------------------------------------------------------------------- */
 
@@ -2300,5 +2405,6 @@ const test_entry_t group_extra_entries[] = {
     { "group_extra/hll_count_distinct_approx_pg_buf_direct", test_hll_count_distinct_approx_pg_buf_direct, NULL, NULL },
     { "group_extra/hll_count_distinct_approx_pg_stream_types", test_hll_count_distinct_approx_pg_stream_types, NULL, NULL },
     { "group_extra/hll_merge_edges",               test_hll_merge_edges,               NULL, NULL },
+    { "group_extra/ght_layout_copy_depth_invariance", test_ght_layout_copy_depth_invariance, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
