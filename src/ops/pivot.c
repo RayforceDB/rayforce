@@ -344,7 +344,15 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (agg_op == OP_MIN) need_flags |= GHT_NEED_MIN;
     if (agg_op == OP_MAX) need_flags |= GHT_NEED_MAX;
 
-    ght_layout_t ly = ght_compute_layout(n_keys, 1, agg_vecs, need_flags, agg_ops, key_types);
+    /* n_keys ≤ 8 (gated above) and n_aggs == 1, so the layout is always
+     * inline (spill_hdr == NULL); ght_compute_layout can only fail on the
+     * uint16 key-stride budget, unreachable at ≤8 keys.  ly owns no spill;
+     * ght_layout_free(&ly) at pivot_cleanup is therefore a no-op (kept for
+     * hygiene / future gate lift).  The early-return paths below likewise
+     * free nothing. */
+    ght_layout_t ly;
+    if (!ght_compute_layout(&ly, n_keys, 1, agg_vecs, need_flags, agg_ops, key_types))
+        return ray_error("limit", "pivot: key stride budget exceeded");
 
     /* Hash-aggregate all rows via the shared radix pipeline — parallel
      * across thread-pool workers for n_scan ≥ RAY_PARALLEL_THRESHOLD,
@@ -786,6 +794,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
 
 pivot_cleanup:
+    ght_layout_free(&ly);   /* no-op: pivot layout is always inline (see above) */
     scratch_free(map_hdr);
     scratch_free(ix_ht_hdr);
     scratch_free(ix_hdr);
