@@ -441,20 +441,21 @@
 ;; cut carved out of a fixed cap — acc_base + worker_id*n_agg (wj_acc_t
 ;; slab) and target_base + worker_id*n_eq (int64 eq-tuple slab), disjoint
 ;; slices indexed by worker_id — is untouched by every other cell here.
-;; left_nrows=4096 >= 2048 and this machine's default pool (ray_pool_get(),
-;; auto ncpu-1 workers) is non-NULL, so this call provably takes
-;; ray_pool_dispatch(pool, wj_scan_fn, &wctx, left_nrows) with >1 worker,
-;; not the serial fallback.
+;; left_nrows=65536: at TASK_GRAIN=8192 ELEMENTS, 65536 rows = 8 dispatch
+;; tasks, providing genuine multi-worker slicing of the per-worker acc/target_eq
+;; carve. This machine's default pool (ray_pool_get(), auto ncpu-1 workers) is
+;; non-NULL, so this call provably takes ray_pool_dispatch(pool, wj_scan_fn,
+;; &wctx, left_nrows) with parallel task scheduling, not the serial fallback.
 ;;
-;; Fixture: 4096 left rows, two eq keys (k1, k2, both (% (til 4096) 2)) so
+;; Fixture: 65536 left rows, two eq keys (k1, k2, both (% (til 65536) 2)) so
 ;; row parity gives exactly 2 partitions interleaved across the ENTIRE row
 ;; range (not one contiguous block per group) — every worker's morsel spans
 ;; both partitions, so a worker-slice aliasing bug (two worker_ids sharing
 ;; one acc/target_eq slice) and an eq-group cross-talk bug (a row reading
 ;; the wrong partition's matches) would both show up as a wrong value
-;; somewhere in the 4096-row output, not just at the edges.
-;; Each left row's interval is a generous +-10000ms around its own Time (Time
-;; spans only 0..4095ms), so lo<0 and hi>10000 for every row: the window
+;; somewhere in the 65536-row output, not just at the edges.
+;; Each left row's interval is a generous ±160000ms around its own Time (Time
+;; spans 0..65535ms = 0..65.5s), so lo<0 and hi>65535 for every row: the window
 ;; unconditionally spans the ENTIRE right table for both modes, making the
 ;; per-row aggregate a closed-form function of eq-group alone, independent
 ;; of which specific left row it is. The right table (300 rows, "a few
@@ -464,16 +465,16 @@
 ;; Oracle per left row r (group = r mod 2):
 ;;   group 0: count=100, sum=100*111=11100, min=max=111
 ;;   group 1: count=200, sum=200*222=44400, min=max=222
-;; Expressed via `take`'s cycling (take [x0 x1] 4096)[i] = [x0 x1][i mod 2],
-;; which matches k1/k2's own (% (til 4096) 2) pattern row-for-row.
-(set Lwjp (table [k1 k2 Time V] (list (% (til 4096) 2) (% (til 4096) 2) (+ 10:00:00.000 (til 4096)) (til 4096))))
+;; Expressed via `take`'s cycling (take [x0 x1] 65536)[i] = [x0 x1][i mod 2],
+;; which matches k1/k2's own (% (til 65536) 2) pattern row-for-row.
+(set Lwjp (table [k1 k2 Time V] (list (% (til 65536) 2) (% (til 65536) 2) (+ 10:00:00.000 (til 65536)) (til 65536))))
 (set Rwjp (table [k1 k2 Time Bid] (list (concat (take [0] 100) (take [1] 200)) (concat (take [0] 100) (take [1] 200)) (+ 10:00:00.000 (til 300)) (concat (take [111] 100) (take [222] 200)))))
-(set ivwjp (map-left + [-10000 10000] (at Lwjp 'Time)))
+(set ivwjp (map-left + [-160000 160000] (at Lwjp 'Time)))
 (set rwjp (window-join [k1 k2 Time] ivwjp Lwjp Rwjp {c: (count Bid) s: (sum Bid) mn: (min Bid) mx: (max Bid)}))
-(at rwjp 'c) -- (take [100 200] 4096)
-(at rwjp 's) -- (take [11100 44400] 4096)
-(at rwjp 'mn) -- (take [111 222] 4096)
-(at rwjp 'mx) -- (take [111 222] 4096)
+(at rwjp 'c) -- (take [100 200] 65536)
+(at rwjp 's) -- (take [11100 44400] 65536)
+(at rwjp 'mn) -- (take [111 222] 65536)
+(at rwjp 'mx) -- (take [111 222] 65536)
 
 ;; ═══ cut-2: 255/256/300 widths (generated; see plan Task 8) ═══
 ;; The cut-2 flip (query.c) deletes the nine compile-side UINT8_MAX slot
