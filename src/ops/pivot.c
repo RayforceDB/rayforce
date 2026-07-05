@@ -274,10 +274,11 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     uint16_t agg_op = ext->pivot.agg_op;
     int64_t nrows   = ray_table_nrows(tbl);
 
-    /* Fixed [16]: n_idx (pivot index-column count) is gated to ≤16 at
+    /* Fixed [8]: n_idx (pivot index-column count) is gated to ≤7 at
      * the compile-side caller (tblop.c pivot_fn_impl: "too many index
-     * columns, max 16") before OP_PIVOT is ever built — cut-3 cap. */
-    ray_t* idx_vecs[16];
+     * columns, max 7") before OP_PIVOT is ever built — the honest cut-3
+     * cap, matching this function's own n_keys > 8 gate just below. */
+    ray_t* idx_vecs[8];
     for (uint32_t i = 0; i < n_idx; i++) {
         ray_op_ext_t* ie = find_ext(g, ext->pivot.index_cols[i]);
         idx_vecs[i] = (ie && ie->base.opcode == OP_SCAN)
@@ -299,6 +300,12 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 
     /* Combined keys: index_cols + pivot_col */
     uint32_t n_keys = n_idx + 1;
+    /* Defensive: tblop.c's caller-side cap (max 7 index cols) already
+     * enforces n_keys <= 8 before OP_PIVOT is built, so this is
+     * unreachable from the language surface today — kept as the real
+     * structural gate on the [8]-slot ght layout below (and as a
+     * backstop against any future caller that builds OP_PIVOT
+     * directly, bypassing tblop.c's check). */
     if (n_keys > 8) return ray_error("limit", "pivot: too many index columns");
 
     /* Wide-key resolution: for RAY_GUID the HT slot holds a source row
@@ -359,8 +366,13 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * where the keys region holds n_idx index keys + 1 pivot key,
      * followed by the key-null bitmap written by group_rows_range. */
 
-    /* SQL PIVOT treats a null pivot key as "no column" — drop those groups. */
-    const uint8_t pvt_null_bit = (uint8_t)(1u << n_idx);
+    /* SQL PIVOT treats a null pivot key as "no column" — drop those groups.
+     * Widened to int64_t to match the stored null-mask slot's width
+     * (nmask below is read as a full int64 from the group row): a uint8
+     * mask can't overflow while n_idx <= 7 (this cap), but truncating a
+     * shift into uint8 is the wrong-type idiom this codebase purges, and
+     * the cut-4 ght rework will widen n_idx past 7. */
+    const int64_t pvt_null_bit = ((int64_t)1 << n_idx);
 
     /* Collect distinct pivot values */
     uint32_t pv_cap = 64, pv_count = 0;
@@ -410,7 +422,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     uint32_t ix_cap = 256, ix_count = 0;
     ray_t* ix_hdr = NULL;
     size_t ix_entry = 8 + (size_t)n_idx * 8 + 8;
-    const uint8_t idx_null_bits = (uint8_t)((1u << n_idx) - 1u);
+    /* Widened to int64_t for the same reason as pvt_null_bit above:
+     * matches the 64-bit stored null-mask slot, avoids the uint8
+     * shift-truncate idiom. */
+    const int64_t idx_null_bits = (((int64_t)1 << n_idx) - 1);
     char* ix_rows = (char*)scratch_alloc(&ix_hdr, ix_cap * ix_entry);
     if (!ix_rows) { scratch_free(pv_hdr); pivot_ingest_free(&pg); return ray_error("oom", NULL); }
 
@@ -561,7 +576,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             int64_t kv = ((const int64_t*)(ix_entry_p + 8))[k];
             int64_t ent_nmask;
             memcpy(&ent_nmask, ix_entry_p + 8 + (size_t)n_idx * 8, 8);
-            if (ent_nmask & (int64_t)(1u << k)) {
+            if (ent_nmask & ((int64_t)1 << k)) {
                 ray_vec_set_null(new_col, (int64_t)r, true);
                 /* Fill the correct-width sentinel. */
                 switch (kt) {

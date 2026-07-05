@@ -108,15 +108,22 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     /* Determine index columns.  idx_syms are column NAME ids: atoms are
      * runtime-domain by design and collection_elem re-expresses SYM vec
      * cells into runtime atoms (the Task-3 chokepoint), so the
-     * ray_sym_str / ray_table_get_col calls below stay global. */
-    int64_t idx_syms[16];
+     * ray_sym_str / ray_table_get_col calls below stay global.
+     *
+     * Bound: 7 index columns, honestly matching exec_pivot's ght
+     * layout gate (pivot.c: n_keys = n_idx + 1 > 8 → error) — the
+     * true structural limit of the [8]-slot group layout.  This is a
+     * documented spec deviation: cut 3 lifts join/group/distinct key
+     * caps to unbounded, but pivot routes through the cut-4 ght
+     * rework's fixed [8] layout, so its cap stays put until then. */
+    int64_t idx_syms[8];
     int64_t n_idx = 0;
     if (index_arg->type == -RAY_SYM) {
         idx_syms[0] = index_arg->i64;
         n_idx = 1;
     } else if (index_arg->type == RAY_LIST || ray_is_vec(index_arg)) {
         int64_t len = ray_len(index_arg);
-        if (len > 16) return ray_error("limit", "pivot: too many index columns, max 16, got %lld", (long long)len); /* cut-3 */
+        if (len > 7) return ray_error("limit", "pivot: too many index columns, max 7 (group layout bound, lifted in the ght rework)");
         for (int64_t i = 0; i < len; i++) {
             int alloc = 0;
             ray_t* elem = collection_elem(index_arg, i, &alloc);
@@ -148,7 +155,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         return ray_error("nyi", "pivot: STR pivot column not supported as column names");
 
     /* Get index columns */
-    ray_t* icols[16];
+    ray_t* icols[8]; /* n_idx <= 7, see the bound comment above */
     for (int64_t i = 0; i < n_idx; i++) {
         icols[i] = ray_table_get_col(tbl, idx_syms[i]);
         if (!icols[i]) return ray_error("domain", "pivot: index column not found");
@@ -166,7 +173,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     if (dag_ok) {
         ray_graph_t* g = ray_graph_new(tbl);
         if (!g) return ray_error("oom", NULL);
-        ray_op_t* idx_ops[16];
+        ray_op_t* idx_ops[8]; /* n_idx <= 7 */
         bool ok = true;
         for (int64_t i = 0; i < n_idx && ok; i++) {
             ray_t* s = ray_sym_str(idx_syms[i]);
@@ -196,7 +203,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     if (!g) return ray_error("oom", NULL);
 
     uint32_t n_keys = n_idx + 1;
-    ray_op_t* key_ops[16];
+    ray_op_t* key_ops[8]; /* n_keys = n_idx + 1 <= 8 */
     bool ok = true;
     for (int64_t i = 0; i < n_idx && ok; i++) {
         ray_t* s = ray_sym_str(idx_syms[i]);
@@ -228,7 +235,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     int64_t n_grps = ray_table_nrows(grouped);
 
     /* Get grouped columns */
-    ray_t* g_icols[16];
+    ray_t* g_icols[8]; /* n_idx <= 7 */
     for (int64_t i = 0; i < n_idx; i++)
         g_icols[i] = ray_table_get_col(grouped, idx_syms[i]);
     ray_t* g_pcol = ray_table_get_col(grouped, pivot_col_name->i64);

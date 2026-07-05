@@ -9,7 +9,7 @@
 ;;
 ;; Reachable branches targeted:
 ;;   L85   — ray_is_vec(index_arg) true (SYM vec index arg, lambda agg)
-;;   L87   — len > 16 index columns guard
+;;   L87   — len > 7 index columns guard (honest cut-3 bound, was 16)
 ;;   L124  — STR index column forces dag_ok=false (tested via !- nyi)
 ;;   L253  — gid_cap while-loop for large n_grps
 ;;   L265  — hash collision during grouped-HT insert
@@ -150,16 +150,60 @@
 (at (at Pmk_fb 'q) 1) -- 20
 
 ;; ══════════════════════════════════════════════════════════════════
-;; Section 8: pivot with >16 index columns → L87 ("too many index
-;;            columns" error)
+;; Section 8: pivot index-column cap → L119 ("too many index columns"
+;;            error)
+;;
+;;            Cut-3 honesty fix: the cap is now 7 (not 16) — pivot's
+;;            true structural bound is exec_pivot's ght layout, which
+;;            groups (index_cols + pivot_col) through a fixed [8]-slot
+;;            key array (pivot.c: n_keys = n_idx + 1 > 8 -> error).
+;;            Lifting tblop.c's caller-side check alone used to just
+;;            move the error from tblop.c to pivot.c at 17 index cols;
+;;            now both layers agree at 7.  (Full lift to unbounded
+;;            index columns is deferred to the cut-4 ght rework.)
 ;; ══════════════════════════════════════════════════════════════════
 
-;; The pivot limit is 16 index columns.  We test via a list (not vec)
-;; of 17 symbols as the index arg.  Any table with 17+ named columns
-;; would work; the error fires during index-arg parsing before the
-;; table is examined.
+;; Any table with enough named columns would work; the error fires during
+;; index-arg parsing (a length check) before the table is examined, so the
+;; index list may repeat names freely.
 (set T17 (table [a b c pv val] (list [1] [1] [1] ['x] [42])))
+
+;; 8 index columns -> one past the honest bound -> !- limit (was previously
+;; accepted under the old, dishonest 16-column cap; pins the new boundary).
+(pivot T17 (list 'a 'b 'c 'a 'b 'c 'a 'b) 'pv 'val sum) !- limit
+
+;; 17 index columns -> still over the bound either way (regression pin: the
+;; pre-existing assertion below must keep passing under the new cap, same
+;; error tag, just a different exact-max reason).
 (pivot T17 (list 'a 'b 'c 'a 'b 'c 'a 'b 'c 'a 'b 'c 'a 'b 'c 'a 'b) 'pv 'val sum) !- limit
+
+;; ══════════════════════════════════════════════════════════════════
+;; Section 8b: pivot at exactly 7 index columns -> SUCCESS (the honest
+;;             bound is inclusive: n_idx = 7 -> n_keys = n_idx + 1 = 8,
+;;             which is exactly the ght layout's [8]-slot capacity, not
+;;             one past it).  Exercises the DAG fast path (sum is a known
+;;             agg builtin, all columns are non-STR) straight into
+;;             exec_pivot, i.e. the exact pivot.c code this task widened
+;;             (pvt_null_bit/idx_null_bits/the 1<<k null-mask read).
+;;
+;;             Oracle derivation: both rows share the same 7-tuple index
+;;             key (1,2,3,4,5,6,7), so exec_pivot groups them into a
+;;             SINGLE index row regardless of internal hash-table
+;;             iteration order (no row-order ambiguity to reason about).
+;;             Row1 pv='x val=10, row2 pv='y val=20 are two distinct
+;;             pivot values -> two output value columns, x=10 and y=20,
+;;             looked up by name (also order-independent).  Output shape:
+;;             7 index cols + 2 pivot value cols = 9 columns, 1 row.
+;; ══════════════════════════════════════════════════════════════════
+
+(set T7 (table [k1 k2 k3 k4 k5 k6 k7 pv val] (list [1 1] [2 2] [3 3] [4 4] [5 5] [6 6] [7 7] ['x 'y] [10 20])))
+(set P7 (pivot T7 ['k1 'k2 'k3 'k4 'k5 'k6 'k7] 'pv 'val sum))
+(count P7) -- 1
+(count (key P7)) -- 9
+(at (at P7 'k1) 0) -- 1
+(at (at P7 'k7) 0) -- 7
+(at (at P7 'x) 0) -- 10
+(at (at P7 'y) 0) -- 20
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; Section 9: Larger pivot to exercise HT probe walks past non-matching
