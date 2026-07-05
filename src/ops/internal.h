@@ -1059,7 +1059,13 @@ typedef struct {
     uint16_t off_sum_y;
     uint16_t off_sumsq_y;
     uint16_t off_sumxy;
-    uint16_t key_region;       /* total key region bytes = key_off[n_keys] + 8 */
+    uint16_t key_region;       /* total key region bytes = key_off[n_keys] + null_words*8 */
+    /* Number of int64 null-mask words carried after the keys: ceil(n_keys/64)
+     * (floored at 1 so the n_keys==0 fallback keeps a null slot).  Key null
+     * bit k lives at word (k>>6), bit (k&63); word w is at key_off[n_keys]+w*8.
+     * ≤64 keys use exactly one word — byte-identical to the legacy single-int64
+     * null slot, so every reachable (≤8-key) shape is unchanged. */
+    uint16_t null_words;
     uint8_t  agg_flags_any;    /* OR of all agg_flags[a] — scalar shape guard */
     uint8_t  any_wide_key;     /* replaces wide_key_mask != 0 */
     uint8_t  any_inline_str;   /* replaces key_inline_str != 0 */
@@ -1074,7 +1080,8 @@ typedef struct {
     struct ray_sym_domain_s** agg_dom;   /* [n_aggs] */
     /* Byte offset of each key within the entry/HT-row key region (relative to
      * the start of the key region, i.e. entry+8 / row+8).  key_off[n_keys] is
-     * the null-mask slot.  Most keys are 8 B (key_off[k]==k*8); a RAY_STR key
+     * the offset of null-mask word 0 (null_words words follow contiguously).
+     * Most keys are 8 B (key_off[k]==k*8); a RAY_STR key
      * stores its ray_str_t descriptor INLINE (16 B) so probe/rehash compare it
      * cache-locally instead of chasing key_data[k]+row*16 in the source column. */
     uint16_t* key_off;         /* [n_keys + 1] */

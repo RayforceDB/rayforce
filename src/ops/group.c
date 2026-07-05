@@ -2485,12 +2485,18 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
     }
     out->n_agg_vals = nv;
     out->agg_flags_any = agg_any;
-    /* Key region = keys + 8-byte null mask slot (stored after last key).
-     * The null mask slot holds a bitmap of which keys were null in the source
-     * row (bit k = key k is null). Folding this slot into hash/memcmp lets
-     * null and 0 form distinct groups.  Inline-STR keys are 16 B, all others
-     * 8 B; when no inline-STR key is present every offset is k*8 (byte-identical
-     * to the legacy fixed-8 layout, so non-STR group-bys are unchanged). */
+    /* Null tracking: ceil(n_keys/64) int64 words, floored at 1 so the rare
+     * n_keys==0 HT fallback keeps a (trivially-zero) null slot — byte-identical
+     * to the legacy single-int64 layout for every ≤64-key shape. */
+    uint32_t null_words = n_keys ? ((n_keys + 63u) >> 6) : 1u;
+    out->null_words = (uint16_t)null_words;
+    /* Key region = keys + null_words*8 null-mask words (stored after last key).
+     * The null-mask words hold a bitmap of which keys were null in the source
+     * row (word k>>6 bit k&63 = key k is null).  Folding them into hash/memcmp
+     * lets null and 0 form distinct groups.  Inline-STR keys are 16 B, all
+     * others 8 B; when no inline-STR key is present every offset is k*8 and the
+     * single null word sits at n_keys*8 (byte-identical to the legacy fixed-8
+     * layout, so non-STR ≤64-key group-bys are unchanged). */
     {
         uint32_t koff = 0;
         for (uint32_t k = 0; k < n_keys; k++) {
@@ -2501,8 +2507,8 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
             koff += (out->key_flags[k] & GHT_KEYF_INLINE_STR) ? 16 : 8;
         }
         if (koff > UINT16_MAX) { ght_layout_free(out); return false; }
-        out->key_off[n_keys] = (uint16_t)koff;   /* null mask */
-        koff += 8;
+        out->key_off[n_keys] = (uint16_t)koff;   /* null-mask word 0 */
+        koff += null_words * 8;
         if (koff > UINT16_MAX) { ght_layout_free(out); return false; }  /* stride budget, not a slot count */
         out->key_region = (uint16_t)koff;
     }
@@ -2665,6 +2671,17 @@ static inline bool wide_key_eq_at(const ght_layout_t* ly, uint8_t k,
     return memcmp(base + (size_t)ra * esz, base + (size_t)rb * esz, esz) == 0;
 }
 
+/* Fold the null-mask words [nullw, nullw+null_words) into the running key
+ * hash.  Mirrors the historical `if (null_mask) combine` exactly, word-wise:
+ * an all-zero word contributes nothing, so a single-word (≤64-key) layout
+ * produces the byte-identical hash of the legacy single-int64 null slot. */
+static inline uint64_t ght_hash_null_words(uint64_t h, const int64_t* nullw,
+                                           uint32_t null_words) {
+    for (uint32_t w = 0; w < null_words; w++)
+        if (nullw[w]) h = ray_hash_combine(h, ray_hash_i64(nullw[w]));
+    return h;
+}
+
 /* ── Inline-STR key resolution (descriptor stored in the entry/row) ──
  * key_inline_str keys hold their 16-byte ray_str_t descriptor at
  * keybase+key_off[k], so hash/compare are cache-local; key_pool[k] (the source
@@ -2700,29 +2717,30 @@ static inline uint64_t inline_layout_key_hash(const ght_layout_t* ly, uint8_t k,
 }
 
 /* Build the key region of a fat entry for an inline-STR layout (offsets
- * shifted by 16-byte descriptors).  Writes keys + null mask at keybase (entry+8
- * / row+8), returns the combined hash and the null mask.  Mirrors the legacy
+ * shifted by 16-byte descriptors).  Writes keys + null-mask words at keybase
+ * (entry+8 / row+8) and returns the combined hash.  Mirrors the legacy
  * fixed-8 build but addresses every slot via key_off[k]. */
 static inline uint64_t inline_build_keys(const ght_layout_t* ly, const int8_t* key_types,
         void* const* key_data, const uint8_t* key_attrs, const void* const* key_pool,
         ray_t* const* key_vecs, uint8_t nullable, int64_t row,
-        char* keybase, int64_t* out_null_mask) {
+        char* keybase) {
     uint64_t h = 0;
-    /* int64 null mask: null-tracking tops out at 64 keys — revisit when key
-     * admission passes 64 (cut 3+).  Untriggerable today (keys ≤ 16) — every
-     * `null_mask |= ((int64_t)1 << k)` site in this file shifts in the int64
-     * domain (not 32-bit then widen) so it stays defined once it is. */
-    int64_t null_mask = 0;
     uint16_t nk = ly->n_keys;
     const uint8_t* const kflags = ly->key_flags;
     const uint16_t* const koff = ly->key_off;
+    /* Null-mask words live in the key region at koff[nk]; ceil(nk/64) words,
+     * so bit k is word (k>>6) bit (k&63).  Written in-place — no scalar
+     * accumulator caps the key count at 64. */
+    int64_t* nullw = (int64_t*)(keybase + koff[nk]);
+    uint32_t null_words = ly->null_words;
+    for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
     for (uint32_t k = 0; k < nk; k++) {
         char* slot = keybase + koff[k];
         uint64_t kh;
         bool is_null = (nullable & (1u << k)) && key_vecs && key_vecs[k]
                        && ray_vec_is_null(key_vecs[k], row);
         if (is_null) {
-            null_mask |= ((int64_t)1 << k);
+            nullw[k >> 6] |= (int64_t)1 << (k & 63);
             if (kflags[k] & GHT_KEYF_INLINE_STR) memset(slot, 0, sizeof(ray_str_t));
             else *(int64_t*)slot = 0;
             kh = ray_hash_i64(0);
@@ -2743,10 +2761,7 @@ static inline uint64_t inline_build_keys(const ght_layout_t* ly, const int8_t* k
         }
         h = (k == 0) ? kh : ray_hash_combine(h, kh);
     }
-    *(int64_t*)(keybase + koff[nk]) = null_mask;
-    if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
-    *out_null_mask = null_mask;
-    return h;
+    return ght_hash_null_words(h, nullw, null_words);
 }
 
 /* Hash inline int64_t keys (for rehash — resolves wide keys via
@@ -2763,9 +2778,8 @@ static inline uint64_t hash_keys_inline(const int64_t* keys, const int8_t* key_t
             uint64_t kh = inline_layout_key_hash(ly, k, key_types, keys, key_data, key_pool);
             h = (k == 0) ? kh : ray_hash_combine(h, kh);
         }
-        int64_t null_mask = *(const int64_t*)((const char*)keys + ly->key_off[n_keys]);
-        if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
-        return h;
+        const int64_t* nullw = (const int64_t*)((const char*)keys + ly->key_off[n_keys]);
+        return ght_hash_null_words(h, nullw, ly->null_words);
     }
     const uint8_t* const kflags = ly->key_flags;
     uint64_t h = 0;
@@ -2784,11 +2798,9 @@ static inline uint64_t hash_keys_inline(const int64_t* keys, const int8_t* key_t
         }
         h = (k == 0) ? kh : ray_hash_combine(h, kh);
     }
-    /* Fold null mask (slot n_keys) into hash so null/0 form distinct groups */
-    int64_t null_mask = keys[n_keys];
-    if (null_mask)
-        h = ray_hash_combine(h, ray_hash_i64(null_mask));
-    return h;
+    /* Fold null-mask words (at slot n_keys) into hash so null/0 form distinct
+     * groups.  Non-inline keys are 8 B each, so word w is keys[n_keys+w]. */
+    return ght_hash_null_words(h, keys + n_keys, ly->null_words);
 }
 
 static void group_ht_rehash(group_ht_t* ht, const int8_t* key_types) {
@@ -3003,8 +3015,10 @@ static inline bool group_keys_equal(const int64_t* a_keys, const int64_t* b_keys
                                       const void* const* key_pool) {
     uint16_t nk = ly->n_keys;
     if (!ly->any_wide_key) {
-        /* memcmp covers nk values + trailing 8-byte null mask slot */
-        return memcmp(a_keys, b_keys, (size_t)(nk + 1) * 8) == 0;
+        /* memcmp covers nk 8-byte values + the null_words trailing words:
+         * key_region == (nk + null_words)*8 with no wide/inline-STR keys, so
+         * the compare length widens with the null region — no shape change. */
+        return memcmp(a_keys, b_keys, (size_t)ly->key_region) == 0;
     }
     const uint8_t* const kflags = ly->key_flags;
     const uint16_t* const koff = ly->key_off;
@@ -3025,8 +3039,8 @@ static inline bool group_keys_equal(const int64_t* a_keys, const int64_t* b_keys
                     *(const int64_t*)(b + koff[k])) return false;
             }
         }
-        return *(const int64_t*)(a + koff[nk]) ==
-               *(const int64_t*)(b + koff[nk]);
+        return memcmp(a + koff[nk], b + koff[nk],
+                      (size_t)ly->null_words * 8) == 0;
     }
     for (uint32_t k = 0; k < nk; k++) {
         if (kflags[k] & GHT_KEYF_WIDE) {
@@ -3036,8 +3050,10 @@ static inline bool group_keys_equal(const int64_t* a_keys, const int64_t* b_keys
             if (a_keys[k] != b_keys[k]) return false;
         }
     }
-    /* Null mask slot must match too */
-    if (a_keys[nk] != b_keys[nk]) return false;
+    /* Null-mask words must match too (non-inline keys are 8 B, so the words
+     * start at slot nk). */
+    if (memcmp(a_keys + nk, b_keys + nk, (size_t)ly->null_words * 8) != 0)
+        return false;
     return true;
 }
 
@@ -3172,19 +3188,23 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         if (!match_idx && rowsel && !group_rowsel_pass(rowsel, row)) continue;
         uint64_t h = 0;
         int64_t* ek = (int64_t*)(ebuf + 8);
-        int64_t null_mask = 0;
         if (ly->any_inline_str) {
             h = inline_build_keys(ly, key_types, key_data, key_attrs, ht->key_pool,
-                                  key_vecs, nullable_mask, row, ebuf + 8, &null_mask);
+                                  key_vecs, nullable_mask, row, ebuf + 8);
         } else {
+        /* Non-inline keys are 8 B each, so the null-mask words start at ek[nk]
+         * (== ebuf+8+key_off[nk]); write bit k into word k>>6 in place. */
+        int64_t* nullw = ek + nk;
+        uint32_t null_words = ly->null_words;
+        for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = key_types[k];
             uint64_t kh;
             bool is_null = (nullable_mask & (1u << k))
                            && ray_vec_is_null(key_vecs[k], row);
             if (is_null) {
-                null_mask |= ((int64_t)1 << k);
-                ek[k] = 0;  /* canonical null value — real 0 differs via null_mask */
+                nullw[k >> 6] |= (int64_t)1 << (k & 63);
+                ek[k] = 0;  /* canonical null value — real 0 differs via null mask */
                 kh = ray_hash_i64(0);
             } else if (wide_any && (kflags[k] & GHT_KEYF_WIDE)) {
                 /* Wide key: store source row index, hash the actual bytes
@@ -3203,8 +3223,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
             }
             h = (k == 0) ? kh : ray_hash_combine(h, kh);
         }
-        ek[nk] = null_mask;
-        if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
+        h = ght_hash_null_words(h, nullw, null_words);
         }
         *(uint64_t*)ebuf = h;
 
@@ -3277,12 +3296,14 @@ typedef struct {
     ray_t*    _hdr;
 } radix_buf_t;
 
+/* key_region_buf holds the full prebuilt key region (keys + null-mask words),
+ * contiguous, key_region bytes — inline-STR and plain layouts both stage it
+ * this way, so one memcpy serves both. */
 static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
-                                   uint64_t hash, const int64_t* keys, uint8_t n_keys,
-                                   int64_t null_mask,
+                                   uint64_t hash, const int64_t* key_region_buf,
                                    const int64_t* agg_vals, uint8_t n_agg_vals,
                                    bool has_first_last, int64_t row,
-                                   uint16_t key_region, bool inline_keys) {
+                                   uint16_t key_region) {
     if (__builtin_expect(buf->count >= buf->cap, 0)) {
         uint32_t old_cap = buf->cap;
         uint32_t new_cap = old_cap * 2;
@@ -3295,15 +3316,7 @@ static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
     }
     char* dst = buf->data + (size_t)buf->count * entry_stride;
     *(uint64_t*)dst = hash;
-    if (inline_keys) {
-        /* keys points at a prebuilt key-region buffer (incl. null mask) with
-         * 16-byte inline STR descriptors at shifted offsets. */
-        memcpy(dst + 8, keys, key_region);
-    } else {
-        memcpy(dst + 8, keys, (size_t)n_keys * 8);
-        /* Null mask slot sits right after the keys */
-        memcpy(dst + 8 + (size_t)n_keys * 8, &null_mask, 8);
-    }
+    memcpy(dst + 8, key_region_buf, key_region);
     if (n_agg_vals)
         memcpy(dst + 8 + key_region, agg_vals, (size_t)n_agg_vals * 8);
     /* Tail slot: source row index for FIRST/LAST tie-breaking. */
@@ -3350,7 +3363,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
     bool has_fl = (ly->agg_flags_any & (GHT_AF_FIRST | GHT_AF_LAST)) != 0;
     const int64_t* match_idx = c->match_idx;
 
-    int64_t keys[8];
+    int64_t keys[9];       /* non-inline key region: 8 keys + 1 null-mask word */
     int64_t agg_vals[8];
     char    keybuf[136];   /* inline-STR key region: max 8*16 + 8 null mask */
 
@@ -3363,19 +3376,23 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         int64_t row = match_idx ? match_idx[i] : i;
         if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, row)) continue;
         uint64_t h = 0;
-        int64_t null_mask = 0;
         if (inline_str) {
             h = inline_build_keys(ly, c->key_types, c->key_data, c->key_attrs,
                                   c->key_pool, c->key_vecs, nullable, row,
-                                  keybuf, &null_mask);
+                                  keybuf);
         } else {
+        /* Stage keys + null-mask words contiguously (key-region shaped) so the
+         * push is one memcpy; null words start at keys[nk]. */
+        int64_t* nullw = keys + nk;
+        uint32_t null_words = ly->null_words;
+        for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
             uint64_t kh;
             bool is_null = (nullable & (1u << k))
                            && ray_vec_is_null(c->key_vecs[k], row);
             if (is_null) {
-                null_mask |= ((int64_t)1 << k);
+                nullw[k >> 6] |= (int64_t)1 << (k & 63);
                 keys[k] = 0;
                 kh = ray_hash_i64(0);
             } else if (wide_any && (kflags[k] & GHT_KEYF_WIDE)) {
@@ -3393,7 +3410,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             }
             h = (k == 0) ? kh : ray_hash_combine(h, kh);
         }
-        if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
+        h = ght_hash_null_words(h, nullw, null_words);
         }
 
         uint8_t vi = 0;
@@ -3428,8 +3445,8 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
 
         uint32_t part = RADIX_PART(h);
         radix_buf_push(&my_bufs[part], estride, h,
-                       inline_str ? (const int64_t*)keybuf : keys, (uint8_t)nk, null_mask,
-                       agg_vals, (uint8_t)nv, has_fl, row, ly->key_region, inline_str != 0);
+                       inline_str ? (const int64_t*)keybuf : keys,
+                       agg_vals, (uint8_t)nv, has_fl, row, ly->key_region);
     }
 }
 
@@ -3516,7 +3533,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             const char* row = ph->rows + (size_t)gi * rs;
             const char* rk = row + 8;     /* key region (key_off-addressed) */
             int64_t cnt = *(const int64_t*)(const void*)row;
-            int64_t null_mask = *(const int64_t*)(const void*)(rk + koff[nk]);
+            const int64_t* nullw = (const int64_t*)(const void*)(rk + koff[nk]);
             uint32_t di = off + gi;
 
             /* Scatter keys to result columns */
@@ -3525,7 +3542,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 uint8_t esz = c->key_esizes[k];
                 int8_t kt = c->key_types[k];
                 size_t doff = (size_t)di * esz;
-                if (null_mask & ((int64_t)1 << k)) {
+                if (nullw[k >> 6] & ((int64_t)1 << (k & 63))) {
                     if (c->key_cols && c->key_cols[k])
                         grp_set_null(c->key_cols[k], di);
                     /* Fill the correct-width sentinel. */
@@ -3869,18 +3886,20 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
             continue;
         uint64_t h = 0;
         int64_t* ek = (int64_t*)(ebuf + 8);
-        int64_t null_mask = 0;
         if (inline_str) {
             h = inline_build_keys(ly, c->key_types, c->key_data, c->key_attrs,
-                                  kpool, c->key_vecs, nullable, row, ebuf + 8, &null_mask);
+                                  kpool, c->key_vecs, nullable, row, ebuf + 8);
         } else {
+        int64_t* nullw = ek + nk;   /* null-mask words at key_off[nk]==nk*8 */
+        uint32_t null_words = ly->null_words;
+        for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
             uint64_t kh;
             bool is_null = (nullable & (1u << k))
                            && ray_vec_is_null(c->key_vecs[k], row);
             if (is_null) {
-                null_mask |= ((int64_t)1 << k);
+                nullw[k >> 6] |= (int64_t)1 << (k & 63);
                 ek[k] = 0;
                 kh = ray_hash_i64(0);
             } else if (wide_any && (kflags[k] & GHT_KEYF_WIDE)) {
@@ -3898,8 +3917,7 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
             }
             h = (k == 0) ? kh : ray_hash_combine(h, kh);
         }
-        ek[nk] = null_mask;
-        if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
+        h = ght_hash_null_words(h, nullw, null_words);
         }
         *(uint64_t*)ebuf = h;
         /* Pack agg values into entry — only when the HT layout actually
@@ -5468,20 +5486,22 @@ static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
             continue;
         }
         uint64_t h = 0;
-        int64_t null_mask = 0;
         const int64_t* lookup_keys;
         if (c->layout->any_inline_str) {
             h = inline_build_keys(c->layout, key_types, key_data, key_attrs,
-                                  c->key_pool, key_vecs, nullable, row, keybuf, &null_mask);
+                                  c->key_pool, key_vecs, nullable, row, keybuf);
             lookup_keys = (const int64_t*)keybuf;
         } else {
+        int64_t* nullw = ek_buf + nk;   /* null-mask words at key_off[nk]==nk*8 */
+        uint32_t null_words = c->layout->null_words;
+        for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = key_types[k];
             uint64_t kh;
             bool is_null = (nullable & (1u << k))
                            && ray_vec_is_null(key_vecs[k], row);
             if (is_null) {
-                null_mask |= ((int64_t)1 << k);
+                nullw[k >> 6] |= (int64_t)1 << (k & 63);
                 ek_buf[k] = 0;
                 kh = ray_hash_i64(0);
             } else if (wide_any && (kflags[k] & GHT_KEYF_WIDE)) {
@@ -5499,8 +5519,7 @@ static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
             }
             h = (k == 0) ? kh : ray_hash_combine(h, kh);
         }
-        ek_buf[nk] = null_mask;
-        if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
+        h = ght_hash_null_words(h, nullw, null_words);
         lookup_keys = ek_buf;
         }
 
@@ -9963,11 +9982,14 @@ sequential_fallback:;
         const char* src_base = is_wide ? (const char*)key_data[k] : NULL;
 
         bool inline_str_k = (ly->key_flags[k] & GHT_KEYF_INLINE_STR) != 0;
+        /* Key k's null bit lives in null-mask word (k>>6), bit (k&63). */
+        size_t null_woff = (size_t)ly->key_off[n_keys] + (size_t)(k >> 6) * 8;
+        int64_t null_kbit = (int64_t)1 << (k & 63);
         for (uint32_t gi = 0; gi < grp_count; gi++) {
             const char* row = final_ht->rows + (size_t)gi * ly->row_stride;
             const char* rk = row + 8;
-            int64_t null_mask = *(const int64_t*)(rk + ly->key_off[n_keys]);
-            if (null_mask & ((int64_t)1 << k)) {
+            int64_t null_word = *(const int64_t*)(rk + null_woff);
+            if (null_word & null_kbit) {
                 ray_vec_set_null(new_col, (int64_t)gi, true);
                 /* Fill the correct-width sentinel. */
                 switch (kt) {
@@ -10059,21 +10081,23 @@ sequential_fallback:;
                      * agg which already respects the selection. */
                     if (!match_idx && !group_rowsel_pass(rowsel, row)) continue;
                     uint64_t h = 0;
-                    int64_t null_mask = 0;
                     const int64_t* lookup_keys;
                     if (ly->any_inline_str) {
                         h = inline_build_keys(ly, key_types, key_data, key_attrs,
                                               reprobe_pool, key_vecs, reprobe_nullable_s,
-                                              row, keybuf, &null_mask);
+                                              row, keybuf);
                         lookup_keys = (const int64_t*)keybuf;
                     } else {
+                    int64_t* nullw = ek_buf + n_keys;   /* null-mask words at key_off[nk] */
+                    uint32_t null_words = ly->null_words;
+                    for (uint32_t w = 0; w < null_words; w++) nullw[w] = 0;
                     for (uint32_t k = 0; k < n_keys; k++) {
                         int8_t t = key_types[k];
                         uint64_t kh;
                         bool is_null = (reprobe_nullable_s & (1u << k))
                                        && ray_vec_is_null(key_vecs[k], row);
                         if (is_null) {
-                            null_mask |= ((int64_t)1 << k);
+                            nullw[k >> 6] |= (int64_t)1 << (k & 63);
                             ek_buf[k] = 0;
                             kh = ray_hash_i64(0);
                         } else if (ly->key_flags[k] & GHT_KEYF_WIDE) {
@@ -10091,8 +10115,7 @@ sequential_fallback:;
                         }
                         h = (k == 0) ? kh : ray_hash_combine(h, kh);
                     }
-                    ek_buf[n_keys] = null_mask;
-                    if (null_mask) h = ray_hash_combine(h, ray_hash_i64(null_mask));
+                    h = ght_hash_null_words(h, nullw, null_words);
                     lookup_keys = ek_buf;
                     }
                     uint32_t gid = group_ht_lookup_gid(final_ht, h, lookup_keys, key_types);

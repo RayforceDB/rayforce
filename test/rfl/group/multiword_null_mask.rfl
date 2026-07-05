@@ -1,0 +1,68 @@
+;; Task 3 — multi-word entry null mask (key region carries ceil(nk/64) words)
+;;
+;; The legacy group HT entry tracked key-nullness in ONE int64 word at
+;; key_off[n_keys].  It now carries ceil(n_keys/64) null-mask words (bit k =
+;; word k>>6, bit k&63).  For every reachable (<=8-key) shape null_words==1, so
+;; grouping must stay byte-identical — this file is the frozen-behavior net.
+;;
+;; The discriminating property throughout: a NULL key forms a DISTINCT group
+;; from a real 0 key (the null-mask bit is what separates them), in every key
+;; slot.  If NULL and 0 ever collapsed, the group counts below would shrink.
+
+;; ── A. Single I64 key: NULL vs 0 are distinct groups ──
+(set A (table [k v] (list (as 'I64 [0 0N 0 0N 5 0N]) (as 'I64 [1 2 3 4 5 6]))))
+(set RA (select {s: (sum v) c: (count v) from: A by: k}))
+;; k=0 (rows 0,2 -> 1+3=4), null (rows 1,3,5 -> 2+4+6=12), k=5 (row 4 -> 5)
+(count RA) -- 3
+(sum (at RA 's)) -- 21
+(sum (at RA 'c)) -- 6
+
+;; ── B. F64 key: NULL (NaN-encoded) vs 0.0 distinct ──
+(set B (table [k v] (list (as 'F64 [0.0 0N 0.0 0N 2.5]) (as 'I64 [1 2 3 4 5]))))
+(set RB (select {s: (sum v) from: B by: k}))
+;; k=0.0 (rows 0,2 -> 4), null (rows 1,3 -> 6), k=2.5 (row 4 -> 5)
+(count RB) -- 3
+(sum (at RB 's)) -- 15
+
+;; ── C. Two keys: all four (null,zero) combinations are distinct ──
+(set C (table [a b v] (list (as 'I64 [0 0 0N 0N 0 0N]) (as 'I64 [0 0N 0 0N 0 0N]) (as 'I64 [10 20 30 40 1 2]))))
+(set RC (select {s: (sum v) from: C by: [a b]}))
+;; (0,0):r0,r4->11  (0,N):r1->20  (N,0):r2->30  (N,N):r3,r5->42
+(count RC) -- 4
+(sum (at RC 's)) -- 103
+
+;; ── D. Eight keys: a null in each distinct slot forms its own group ──
+;; 9 rows: row 0 is all-zero (null mask 0); row j (1..8) sets key (j-1) null.
+;; Every row carries a distinct null-mask (0, then one bit per slot) over an
+;; otherwise byte-identical all-zero key region -> 9 groups of 1 row each.
+;; Exercises the widest reachable shape (n_keys == 8).
+(set D (table [k0 k1 k2 k3 k4 k5 k6 k7 v] (list (as 'I64 [0 0N 0 0 0 0 0 0 0]) (as 'I64 [0 0 0N 0 0 0 0 0 0]) (as 'I64 [0 0 0 0N 0 0 0 0 0]) (as 'I64 [0 0 0 0 0N 0 0 0 0]) (as 'I64 [0 0 0 0 0 0N 0 0 0]) (as 'I64 [0 0 0 0 0 0 0N 0 0]) (as 'I64 [0 0 0 0 0 0 0 0N 0]) (as 'I64 [0 0 0 0 0 0 0 0 0N]) (as 'I64 [1 2 3 4 5 6 7 8 9]))))
+(set RD (select {s: (sum v) c: (count v) from: D by: [k0 k1 k2 k3 k4 k5 k6 k7]}))
+(count RD) -- 9
+(sum (at RD 's)) -- 45
+(max (at RD 'c)) -- 1
+(min (at RD 'c)) -- 1
+
+;; ── E. All-null-key rows collapse to a single group ──
+(set E (table [a b v] (list (as 'I64 [0N 0N 0N]) (as 'I64 [0N 0N 0N]) (as 'I64 [10 20 30]))))
+(set RE (select {s: (sum v) c: (count v) from: E by: [a b]}))
+(count RE) -- 1
+(at (at RE 's) 0) -- 60
+(at (at RE 'c) 0) -- 3
+
+;; ── F. Narrow (I32) key: 0, null, and a nonzero value all distinct ──
+(set F (table [k v] (list (as 'I32 [0 0N 7 0 0N 7]) (as 'I64 [1 2 3 4 5 6]))))
+(set RF (select {c: (count v) from: F by: k}))
+;; k=0 (r0,r3), null (r1,r4), k=7 (r2,r5) -> 3 groups, 2 rows each
+(count RF) -- 3
+(min (at RF 'c)) -- 2
+(max (at RF 'c)) -- 2
+
+;; ── G. Radix (parallel) path: large null-bearing key, NULL vs 0 held ──
+;; take cycles the pattern; the two null slots collapse to ONE null group.
+(set NG 100000)
+(set G (table [k v] (list (take (as 'I64 [0 0N 1 0N 2]) NG) (as 'I64 (til NG)))))
+(set RG (select {c: (count v) from: G by: k}))
+;; distinct keys {0, null, 1, 2} -> 4 groups; count includes every row.
+(count RG) -- 4
+(sum (at RG 'c)) -- 100000

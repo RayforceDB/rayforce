@@ -375,11 +375,13 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * followed by the key-null bitmap written by group_rows_range. */
 
     /* SQL PIVOT treats a null pivot key as "no column" — drop those groups.
-     * Widened to int64_t to match the stored null-mask slot's width
-     * (nmask below is read as a full int64 from the group row): a uint8
-     * mask can't overflow while n_idx <= 7 (this cap), but truncating a
-     * shift into uint8 is the wrong-type idiom this codebase purges, and
-     * the cut-4 ght rework will widen n_idx past 7. */
+     * Read as a full int64 from the group row's first null-mask word.  The
+     * ght layout now carries ceil(n_keys/64) null words, but pivot's own
+     * n_idx <= 7 admission gate (n_keys = n_idx+1 <= 8, independent of the
+     * ght-path key gate this migration lifts) pins pivot at exactly one word,
+     * so every null bit here lives in word 0 and this single-word read stays
+     * correct.  Widening this to word-indexed is contingent on pivot's own
+     * index-column gate rising, not on the ght key gate. */
     const int64_t pvt_null_bit = ((int64_t)1 << n_idx);
 
     /* Collect distinct pivot values */
@@ -430,9 +432,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     uint32_t ix_cap = 256, ix_count = 0;
     ray_t* ix_hdr = NULL;
     size_t ix_entry = 8 + (size_t)n_idx * 8 + 8;
-    /* Widened to int64_t for the same reason as pvt_null_bit above:
-     * matches the 64-bit stored null-mask slot, avoids the uint8
-     * shift-truncate idiom. */
+    /* int64 for the same reason as pvt_null_bit above: pivot's n_idx <= 7 gate
+     * pins the null mask at one word, so the low n_idx bits (the index-key null
+     * flags, excluding the pivot key at bit n_idx) all live in word 0. */
     const int64_t idx_null_bits = (((int64_t)1 << n_idx) - 1);
     char* ix_rows = (char*)scratch_alloc(&ix_hdr, ix_cap * ix_entry);
     if (!ix_rows) { scratch_free(pv_hdr); pivot_ingest_free(&pg); return ray_error("oom", NULL); }
