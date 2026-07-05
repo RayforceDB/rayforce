@@ -13342,10 +13342,11 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
     if (!eq_ops) { ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("oom", NULL); }
     for (int64_t i = 0; i < n_eq; i++) {
         if (eq_elems[i]->type != -RAY_SYM) {
+            int8_t et = eq_elems[i]->type;  /* capture BEFORE free */
             scratch_free(eqops_hdr);
             ray_graph_free(g);
             if (_bxeq) ray_release(_bxeq);
-            return ray_error("type", "window-join: equality key must be a symbol, got %s", ray_type_name(eq_elems[i]->type));
+            return ray_error("type", "window-join: equality key must be a symbol, got %s", ray_type_name(et));
         }
         ray_t* nm = ray_sym_str(eq_elems[i]->i64);
         if (!nm) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: unknown equality key symbol"); }
