@@ -13313,42 +13313,51 @@ static ray_t* window_join_impl(ray_t** args, int64_t n, int mode) {
     if (time_sym->type != -RAY_SYM)
         return ray_error("type", "window-join: time key must be a symbol, got %s", ray_type_name(time_sym->type));
 
-    uint8_t n_eq = 0;
+    int64_t n_eq = 0;
     ray_t** eq_elems = NULL;
     ray_t* _bxeq = NULL;
     eq_keys = unbox_vec_arg(eq_keys, &_bxeq);
     if (is_list(eq_keys)) {
-        n_eq = (uint8_t)ray_len(eq_keys);
+        n_eq = ray_len(eq_keys);
         eq_elems = (ray_t**)ray_data(eq_keys);
     }
 
     ray_graph_t* g = ray_graph_new(left_tbl);
-    if (!g) return ray_error("oom", NULL);
+    if (!g) { if (_bxeq) ray_release(_bxeq); return ray_error("oom", NULL); }
 
     ray_op_t* left_node  = ray_const_table(g, left_tbl);
     ray_op_t* right_node = ray_const_table(g, right_tbl);
 
     ray_t* tname = ray_sym_str(time_sym->i64);
-    if (!tname) { ray_graph_free(g); return ray_error("domain", "window-join: unknown time key symbol"); }
+    if (!tname) { ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: unknown time key symbol"); }
     ray_op_t* time_op = ray_scan(g, ray_str_ptr(tname));
-    if (!time_op) { ray_graph_free(g); return ray_error("domain", "window-join: time key column not found"); }
+    if (!time_op) { ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: time key column not found"); }
 
-    ray_op_t* eq_ops[16];
-    for (uint32_t i = 0; i < n_eq; i++) {
+    /* eq_ops: exact-size carve, n_eq wide (unbounded — no fixed key-count
+     * ceiling).  ray_asof_join copies every id out of eq_ops before it
+     * returns, so the carve is freed right after that call. */
+    ray_t* eqops_hdr = NULL;
+    ray_op_t** eq_ops = (ray_op_t**)scratch_alloc(&eqops_hdr,
+            (size_t)(n_eq ? n_eq : 1) * sizeof(ray_op_t*));
+    if (!eq_ops) { ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("oom", NULL); }
+    for (int64_t i = 0; i < n_eq; i++) {
         if (eq_elems[i]->type != -RAY_SYM) {
+            scratch_free(eqops_hdr);
             ray_graph_free(g);
+            if (_bxeq) ray_release(_bxeq);
             return ray_error("type", "window-join: equality key must be a symbol, got %s", ray_type_name(eq_elems[i]->type));
         }
         ray_t* nm = ray_sym_str(eq_elems[i]->i64);
-        if (!nm) { ray_graph_free(g); return ray_error("domain", "window-join: unknown equality key symbol"); }
+        if (!nm) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: unknown equality key symbol"); }
         eq_ops[i] = ray_scan(g, ray_str_ptr(nm));
-        if (!eq_ops[i]) { ray_graph_free(g); return ray_error("domain", "window-join: equality key column not found"); }
+        if (!eq_ops[i]) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxeq) ray_release(_bxeq); return ray_error("domain", "window-join: equality key column not found"); }
     }
 
     if (_bxeq) ray_release(_bxeq);
 
     ray_op_t* jn = ray_asof_join(g, left_node, right_node,
-                                time_op, eq_ops, n_eq, 1);
+                                time_op, eq_ops, (uint32_t)n_eq, 1);
+    scratch_free(eqops_hdr);
     if (!jn) { ray_graph_free(g); return ray_error("oom", NULL); }
 
     jn = ray_optimize(g, jn);
@@ -13401,7 +13410,7 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
     }
 
     /* Remaining keys are equality keys */
-    uint8_t n_eq = (uint8_t)(nkeys - 1);
+    int64_t n_eq = nkeys - 1;
     ray_t** eq_syms = kelems; /* first n_eq elements */
 
     ray_graph_t* g = ray_graph_new(left_tbl);
@@ -13415,23 +13424,31 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
     ray_op_t* time_op = ray_scan(g, ray_str_ptr(tname));
     if (!time_op) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "asof-join: time key column not found"); }
 
-    ray_op_t* eq_ops[16];
-    for (uint32_t i = 0; i < n_eq; i++) {
+    /* eq_ops: exact-size carve, n_eq wide (unbounded — no fixed key-count
+     * ceiling).  ray_asof_join copies every id out of eq_ops before it
+     * returns, so the carve is freed right after that call. */
+    ray_t* eqops_hdr = NULL;
+    ray_op_t** eq_ops = (ray_op_t**)scratch_alloc(&eqops_hdr,
+            (size_t)(n_eq ? n_eq : 1) * sizeof(ray_op_t*));
+    if (!eq_ops) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("oom", NULL); }
+    for (int64_t i = 0; i < n_eq; i++) {
         if (eq_syms[i]->type != -RAY_SYM) {
             int8_t es_t = eq_syms[i]->type;            /* capture BEFORE free */
+            scratch_free(eqops_hdr);
             ray_graph_free(g); if (_bxk) ray_release(_bxk);
             return ray_error("type", "asof-join: equality key must be a symbol, got %s", ray_type_name(es_t));
         }
         ray_t* nm = ray_sym_str(eq_syms[i]->i64);
-        if (!nm) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "asof-join: unknown equality key symbol"); }
+        if (!nm) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "asof-join: unknown equality key symbol"); }
         eq_ops[i] = ray_scan(g, ray_str_ptr(nm));
-        if (!eq_ops[i]) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "asof-join: equality key column not found"); }
+        if (!eq_ops[i]) { scratch_free(eqops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "asof-join: equality key column not found"); }
     }
 
     if (_bxk) ray_release(_bxk);
 
     ray_op_t* jn = ray_asof_join(g, left_node, right_node,
-                                time_op, eq_ops, n_eq, 1);
+                                time_op, eq_ops, (uint32_t)n_eq, 1);
+    scratch_free(eqops_hdr);
     if (!jn) { ray_graph_free(g); return ray_error("oom", NULL); }
 
     jn = ray_optimize(g, jn);

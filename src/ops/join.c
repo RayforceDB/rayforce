@@ -1930,7 +1930,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
 
     ray_t *tab_hdr = NULL, *keys_hdr = NULL, *gid_hdr = NULL,
           *cnt_hdr = NULL, *off_hdr = NULL, *rows_hdr = NULL,
-          *lgid_hdr = NULL;
+          *lgid_hdr = NULL, *rowkey_hdr = NULL;
     int32_t* tab      = NULL;   /* slot -> group id + 1 (0 = empty) */
     int64_t* gkeys    = NULL;   /* n_groups × n_eq translated key values */
     int32_t* left_gid = NULL;   /* per left row: its group id (or -1) */
@@ -1938,6 +1938,13 @@ static bool asof_hash_group_match(uint32_t n_eq,
     int32_t* cnt      = NULL;
     int32_t* off      = NULL;
     int32_t* rows     = NULL;
+    /* Single per-row eq-key scratch buffer, exact-sized to n_eq (unbounded —
+     * no fixed key-count ceiling) and carved ONCE here rather than per row.
+     * Reused sequentially by Pass 1 below, the Pass 2 hash-scan fallback,
+     * and the ASOF_RESOLVE_GID macro's OA-probe branch — none of those
+     * three loops is ever live at the same time as another, so one buffer
+     * covers all of them. */
+    int64_t* rowkey   = NULL;
 
     left_gid = (int32_t*)scratch_alloc(&lgid_hdr, (size_t)left_n * 4);
     row_gid  = (int32_t*)scratch_alloc(&gid_hdr, (size_t)right_n * 4);
@@ -1945,9 +1952,10 @@ static bool asof_hash_group_match(uint32_t n_eq,
         tab   = (int32_t*)scratch_alloc(&tab_hdr, (size_t)cap * 4);
         gkeys = (int64_t*)scratch_alloc(&keys_hdr,
                                         (size_t)left_n * n_eq * 8);
+        rowkey = (int64_t*)scratch_alloc(&rowkey_hdr, (size_t)n_eq * 8);
         if (tab) memset(tab, 0, (size_t)cap * 4);
     }
-    bool ok = left_gid && row_gid && (n_eq == 0 || (tab && gkeys));
+    bool ok = left_gid && row_gid && (n_eq == 0 || (tab && gkeys && rowkey));
 
     /* Pass 1 — distinct left keys.  n_groups <= left_n. */
     int32_t n_groups = 0;
@@ -1958,22 +1966,12 @@ static bool asof_hash_group_match(uint32_t n_eq,
     } else if (ok) {
         for (int64_t li = 0; li < left_n; li++) {
             if (lt_null[li]) { left_gid[li] = -1; continue; }
-            /* Fixed [256]: n_eq's only real ceiling today is query.c's OWN
-             * uint8_t local (asof-join/window-join compile helpers narrow
-             * ray_len() into uint8_t before calling ray_asof_join, with no
-             * explicit ≤16 domain check — a known pre-existing gap in
-             * query.c, out of scope here per task-6 brief).  That cast
-             * mathematically caps every n_eq this function ever sees at
-             * 255, hence 256 slots — NOT a designed API cap like join's
-             * ≤16.  If query.c's carrier is ever widened past uint8_t,
-             * this array (and eq_syms/lt_eq/rt_eq/eq_xlut/eq_xn/xcnt in
-             * exec_window_join, and _rv[] in ASOF_RESOLVE_GID below) must
-             * grow with it. */
-            int64_t lv[256];
+            /* rowkey: carved once above this loop, sized n_eq — see the
+             * declaration comment. */
             uint64_t h = 0;
             for (uint32_t k = 0; k < n_eq; k++) {
-                lv[k] = asof_eq_lread(lt_eq[k], eq_xlut[k], eq_xn[k], li);
-                uint64_t kh = ray_hash_i64(lv[k]);
+                rowkey[k] = asof_eq_lread(lt_eq[k], eq_xlut[k], eq_xn[k], li);
+                uint64_t kh = ray_hash_i64(rowkey[k]);
                 h = (k == 0) ? kh : ray_hash_combine(h, kh);
             }
             uint64_t slot = h & mask;
@@ -1982,7 +1980,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 if (gp1 == 0) {
                     tab[slot] = n_groups + 1;
                     for (uint32_t k = 0; k < n_eq; k++)
-                        gkeys[(int64_t)n_groups * n_eq + k] = lv[k];
+                        gkeys[(int64_t)n_groups * n_eq + k] = rowkey[k];
                     left_gid[li] = n_groups;
                     n_groups++;
                     break;
@@ -1990,7 +1988,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 const int64_t* gk = gkeys + (int64_t)(gp1 - 1) * n_eq;
                 int eq = 1;
                 for (uint32_t k = 0; k < n_eq; k++)
-                    if (gk[k] != lv[k]) { eq = 0; break; }
+                    if (gk[k] != rowkey[k]) { eq = 0; break; }
                 if (eq) { left_gid[li] = gp1 - 1; break; }
                 slot = (slot + 1) & mask;
             }
@@ -2325,15 +2323,14 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 _g = gid_next[_g];                                             \
             }                                                                  \
         } else {                                                               \
-            /* Fixed [256]: see the n_eq bound note in asof_hash_group_match  \
-             * above (query.c's own uint8_t narrowing, not a designed cap).   \
+            /* rowkey: the same per-row scratch buffer Pass 1 uses above,     \
+             * carved once at function entry, sized n_eq — no per-row alloc. \
              */                                                                \
-            int64_t _rv[256];                                                  \
             uint64_t _h = 0;                                                   \
             for (uint32_t _k = 0; _k < n_eq; _k++) {                            \
-                _rv[_k] = read_col_i64(ray_data(rt_eq[_k]), (i),               \
+                rowkey[_k] = read_col_i64(ray_data(rt_eq[_k]), (i),            \
                                        rt_eq[_k]->type, rt_eq[_k]->attrs);     \
-                uint64_t _kh = ray_hash_i64(_rv[_k]);                          \
+                uint64_t _kh = ray_hash_i64(rowkey[_k]);                       \
                 _h = (_k == 0) ? _kh : ray_hash_combine(_h, _kh);              \
             }                                                                  \
             uint64_t _slot = _h & mask;                                        \
@@ -2343,7 +2340,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 const int64_t* _gk = gkeys + (int64_t)(_gp1 - 1) * n_eq;       \
                 int _eq = 1;                                                   \
                 for (uint32_t _k = 0; _k < n_eq; _k++)                          \
-                    if (_gk[_k] != _rv[_k]) { _eq = 0; break; }                \
+                    if (_gk[_k] != rowkey[_k]) { _eq = 0; break; }             \
                 if (_eq) { _g = _gp1 - 1; break; }                             \
                 _slot = (_slot + 1) & mask;                                    \
             }                                                                  \
@@ -2466,15 +2463,17 @@ static bool asof_hash_group_match(uint32_t n_eq,
             if (gid >= 0) { cnt[gid]++; n_matched++; }
         }
     } else if (ok) {
+        /* rowkey: same carve as Pass 1 (function-entry, sized n_eq) — Pass 1
+         * over left rows has already finished by the time this right-row
+         * pass runs, so reusing it here adds no aliasing. */
         for (int64_t i = 0; i < right_n; i++) {
             if (rt_null[i]) { row_gid[i] = -1; continue; }
             int32_t gid = -1;
-            int64_t rv[256];
             uint64_t h = 0;
             for (uint32_t k = 0; k < n_eq; k++) {
-                rv[k] = read_col_i64(ray_data(rt_eq[k]), i,
+                rowkey[k] = read_col_i64(ray_data(rt_eq[k]), i,
                                      rt_eq[k]->type, rt_eq[k]->attrs);
-                uint64_t kh = ray_hash_i64(rv[k]);
+                uint64_t kh = ray_hash_i64(rowkey[k]);
                 h = (k == 0) ? kh : ray_hash_combine(h, kh);
             }
             uint64_t slot = h & mask;
@@ -2484,7 +2483,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 const int64_t* gk = gkeys + (int64_t)(gp1 - 1) * n_eq;
                 int eq = 1;
                 for (uint32_t k = 0; k < n_eq; k++)
-                    if (gk[k] != rv[k]) { eq = 0; break; }
+                    if (gk[k] != rowkey[k]) { eq = 0; break; }
                 if (eq) { gid = gp1 - 1; break; }
                 slot = (slot + 1) & mask;
             }
@@ -2549,6 +2548,7 @@ done:
     scratch_free(rows_hdr);
     scratch_free(lut_hdr);
     scratch_free(gnx_hdr);
+    scratch_free(rowkey_hdr);
     return ok;
 }
 
@@ -2570,21 +2570,27 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
     int64_t time_sym = time_ext->sym;
 
     /* Resolve equality keys.
-     * Fixed [256] here and below (lt_eq/rt_eq, eq_xlut, eq_xn, xcnt):
-     * n_eq's only real ceiling today is query.c's OWN uint8_t local —
-     * asof-join/window-join compile helpers narrow ray_len() into
-     * uint8_t before calling ray_asof_join, with NO explicit ≤16 domain
-     * check (a known pre-existing gap in query.c, out of scope for this
-     * task-6 lockstep sweep of join.c/pivot.c/tblop.c/fused_topk.c).
-     * That upstream cast mathematically caps every n_eq value this
-     * function ever sees at 255, hence 256 slots — this is NOT a
-     * designed API cap the way join's ≤16 is.  If query.c's carrier is
-     * ever widened past uint8_t, every array below must grow with it. */
-    int64_t eq_syms[256];
+     * eq_syms/lt_eq/rt_eq/eq_xlut/eq_xn/xcnt: one exact-size carve, all
+     * 8-byte elements (int64 or pointer) so one n_eq-wide (?: 1) block —
+     * naturally 8-byte-aligned — covers all six arrays by offset.  This
+     * replaces six fixed [256] arrays that were sized to query.c's
+     * uint8_t eq-count narrowing (removed in this same commit); n_eq is
+     * unbounded from here down.  Freed on every return below. */
+    ray_t* eqbuf_hdr = NULL;
+    size_t eq_cap = (size_t)(n_eq ? n_eq : 1);
+    int64_t* eq_syms = (int64_t*)scratch_alloc(&eqbuf_hdr, eq_cap * 6 * sizeof(int64_t));
+    if (!eq_syms) return ray_error("oom", NULL);
+    ray_t**          lt_eq   = (ray_t**)(eq_syms + eq_cap);
+    ray_t**          rt_eq   = (ray_t**)(lt_eq + eq_cap);
+    const int64_t** eq_xlut  = (const int64_t**)(rt_eq + eq_cap);
+    int64_t*         eq_xn   = (int64_t*)(eq_xlut + eq_cap);
+    int64_t*         xcnt    = eq_xn + eq_cap;
     for (uint32_t k = 0; k < n_eq; k++) {
         ray_op_ext_t* ek = find_ext(g, ext->asof.eq_keys[k]);
-        if (!ek || ek->base.opcode != OP_SCAN)
+        if (!ek || ek->base.opcode != OP_SCAN) {
+            scratch_free(eqbuf_hdr);
             return ray_error("nyi", NULL);
+        }
         eq_syms[k] = ek->sym;
     }
 
@@ -2593,7 +2599,10 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
      * We expand to a temporary i64 array for uniform comparison. */
     ray_t* lt_time_vec = ray_table_get_col(left_table, time_sym);
     ray_t* rt_time_vec = ray_table_get_col(right_table, time_sym);
-    if (!lt_time_vec || !rt_time_vec) return ray_error("schema", NULL);
+    if (!lt_time_vec || !rt_time_vec) {
+        scratch_free(eqbuf_hdr);
+        return ray_error("schema", NULL);
+    }
     int8_t time_type = lt_time_vec->type;
 
     /* Helper macro to read time value as int64_t regardless of storage type */
@@ -2618,6 +2627,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         if ((!lt_time && left_n > 0) || (!rt_time && right_n > 0)) {
             if (lt_time_hdr) scratch_free(lt_time_hdr);
             if (rt_time_hdr) scratch_free(rt_time_hdr);
+            scratch_free(eqbuf_hdr);
             return ray_error("oom", NULL);
         }
         for (int64_t i = 0; i < left_n; i++) lt_time[i] = READ_TIME(lt_time_vec, i);
@@ -2625,14 +2635,15 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
     }
     #undef READ_TIME
 
-    /* Get eq key vectors — stored as ray_t* for type-safe access */
-    ray_t* lt_eq[256], *rt_eq[256];
+    /* Get eq key vectors — stored as ray_t* for type-safe access.
+     * lt_eq/rt_eq point into the eqbuf carve above (no separate alloc). */
     for (uint32_t k = 0; k < n_eq; k++) {
         ray_t* lv = ray_table_get_col(left_table, eq_syms[k]);
         ray_t* rv = ray_table_get_col(right_table, eq_syms[k]);
         if (!lv || !rv) {
             if (lt_time_hdr) scratch_free(lt_time_hdr);
             if (rt_time_hdr) scratch_free(rt_time_hdr);
+            scratch_free(eqbuf_hdr);
             return ray_error("schema", NULL);
         }
         lt_eq[k] = lv;
@@ -2644,12 +2655,10 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
      * vocabulary (never the rows) replacing the old per-read str+find
      * hash lookups in asof_eq_lread.  Pre-flip both sides are the
      * runtime singleton: no table is built, the reader's raw fast path
-     * is byte-identical. */
-    const int64_t* eq_xlut[256];
-    int64_t eq_xn[256];
+     * is byte-identical.  eq_xlut/eq_xn/xcnt point into the eqbuf carve
+     * above (no separate alloc). */
     ray_t* eq_xl_hdr = NULL;
     {
-        int64_t xcnt[256];
         size_t  xtotal = 0;
         for (uint32_t k = 0; k < n_eq; k++) {
             eq_xlut[k] = NULL;
@@ -2670,6 +2679,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
             if (!blk) {
                 if (lt_time_hdr) scratch_free(lt_time_hdr);
                 if (rt_time_hdr) scratch_free(rt_time_hdr);
+                scratch_free(eqbuf_hdr);
                 return ray_error("oom", NULL);
             }
         }
@@ -2712,6 +2722,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
     if (left_n > 0) memset(lt_null, 0, (size_t)left_n);
@@ -2744,6 +2755,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
 
@@ -2784,6 +2796,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
     for (int64_t i = 0; i < left_n; i++) li_idx[i] = i;
@@ -2839,6 +2852,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
             if (lt_time_hdr) scratch_free(lt_time_hdr);
             if (rt_time_hdr) scratch_free(rt_time_hdr);
             if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+            scratch_free(eqbuf_hdr);
             return ray_error("oom", NULL);
         }
 
@@ -2923,6 +2937,7 @@ ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
 
@@ -3032,6 +3047,7 @@ build_output:;
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
     int64_t right_out_count = 0;
@@ -3069,6 +3085,7 @@ build_output:;
         if (lt_time_hdr) scratch_free(lt_time_hdr);
         if (rt_time_hdr) scratch_free(rt_time_hdr);
         if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+        scratch_free(eqbuf_hdr);
         return ray_error("oom", NULL);
     }
     {
@@ -3152,5 +3169,6 @@ build_output:;
     if (lt_time_hdr) scratch_free(lt_time_hdr);
     if (rt_time_hdr) scratch_free(rt_time_hdr);
     if (eq_xl_hdr) scratch_free(eq_xl_hdr);
+    scratch_free(eqbuf_hdr);
     return out;
 }

@@ -476,6 +476,58 @@
 (at rwjp 'mn) -- (take [111 222] 65536)
 (at rwjp 'mx) -- (take [111 222] 65536)
 
+;; ══════════════════════════════════════════════════════════════════
+;; cut-3 task 2: asof-join/window-join LEGACY carriers + join.c [256] family
+;; query.c's ray_asof_join_fn and the 4-arg window_join_impl fall-through
+;; (asof-join / window-join with a table-form eq-keys arg, NOT the 5-arg
+;; window-join fast path task 1 already fixed) narrowed the eq-key count
+;; through a uint8_t local before feeding it to ray_asof_join — overflow at
+;; 17+ eq keys, silent WRAP TO 0 at exactly 256 (256 truncates to 0 in an
+;; 8-bit local).  join.c's exec_window_join / asof_hash_group_match then
+;; sized eq_syms/lt_eq/rt_eq/eq_xlut/eq_xn/xcnt/lv/_rv/rv at a fixed [256]
+;; to match that (accidental) ceiling.  Both sides now carry the exact
+;; eq-key count with exact-size carves — no arbitrary cap.
+;; ══════════════════════════════════════════════════════════════════
+
+;; ── 17-eq-key asof-join, reusing the L17/R17 fixture defined above (same
+;; genuine-partitioning oracle: k01..k16 constant 'a for every row, ONLY
+;; k17 partitions 'p vs 'q).  Plain asof (no window, no aggregation): each
+;; left row matches the LATEST same-partition right row with time <= its
+;; own time.
+;;  row0 (partition p, Time=10:00:01): latest p-row time<=10:00:01 is
+;;   10:00:00 -> Bid=99.
+;;  row1 (partition q, Time=10:00:05): latest q-row time<=10:00:05 is
+;;   10:00:04 -> Bid=3.
+;; A dropped k17 (collapse to the 16-key partition, or worse the surviving
+;; uint8_t narrowing bug) merges p and q into one partition, so row1 could
+;; leak a p-side value or otherwise diverge from 3.
+(at (asof-join [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 Time] L17 R17) 'Bid) -- [99 3]
+
+;; ── 256-eq-key asof-join, reusing the L256/R256 fixture defined above.
+;; This is the SENTINEL cell: 256 is exactly where the retired uint8_t
+;; local wrapped to 0 (256 mod 256 == 0), which used to feed ray_asof_join
+;; n_eq_keys=0 — i.e. "no equality keys", matching EVERY right row
+;; against every left row regardless of k001..k256.  Group 1 (row0) and
+;; group 2 (row1) carry IDENTICAL right-side timestamps but group 2's bids
+;; are deliberately far below group 1's, so an n_eq=0 collapse mixes them
+;; and this oracle fails loudly rather than passing by accident.
+;;  row0 (group 1, Time=10:00:01): latest group-1 row time<=10:00:01 is
+;;   10:00:00 -> Bid=99.
+;;  row1 (group 2, Time=10:00:05): latest group-2 row time<=10:00:05 is
+;;   10:00:04 -> Bid=3.
+(at (asof-join [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 Time] L256 R256) 'Bid) -- [99 3]
+
+;; ── 300-eq-key asof-join.  Past both the former uint8_t ceiling (255) and
+;; the 256-wrap sentinel above — proves the carve is genuinely unbounded,
+;; not just widened to cover 256.  Same genuine-partitioning derivation as
+;; the 256-key cell: k001..k299 constant 1 for every row, ONLY k300
+;; partitions group 1 (row0) vs group 2 (row1); group 2's right-side bids
+;; are far below group 1's at identical timestamps.
+(set L300 (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 k257 k258 k259 k260 k261 k262 k263 k264 k265 k266 k267 k268 k269 k270 k271 k272 k273 k274 k275 k276 k277 k278 k279 k280 k281 k282 k283 k284 k285 k286 k287 k288 k289 k290 k291 k292 k293 k294 k295 k296 k297 k298 k299 k300 Time V] (concat (take (list [1 1]) 299) (list [1 2] [10:00:01.000 10:00:05.000] [100 200]))))
+(set R300 (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 k257 k258 k259 k260 k261 k262 k263 k264 k265 k266 k267 k268 k269 k270 k271 k272 k273 k274 k275 k276 k277 k278 k279 k280 k281 k282 k283 k284 k285 k286 k287 k288 k289 k290 k291 k292 k293 k294 k295 k296 k297 k298 k299 k300 Time Bid] (concat (take (list [1 1 1 1 1 1]) 299) (list [1 1 1 2 2 2] [10:00:00.000 10:00:02.000 10:00:04.000 10:00:00.000 10:00:02.000 10:00:04.000] [99 100 101 1 2 3]))))
+(at (asof-join [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 k257 k258 k259 k260 k261 k262 k263 k264 k265 k266 k267 k268 k269 k270 k271 k272 k273 k274 k275 k276 k277 k278 k279 k280 k281 k282 k283 k284 k285 k286 k287 k288 k289 k290 k291 k292 k293 k294 k295 k296 k297 k298 k299 k300 Time] L300 R300) 'Bid) -- [99 3]
+
+
 ;; ═══ cut-2: 255/256/300 widths (generated; see plan Task 8) ═══
 ;; The cut-2 flip (query.c) deletes the nine compile-side UINT8_MAX slot
 ;; gates.  These cells pin select/window/sort/update output widths at 255,
