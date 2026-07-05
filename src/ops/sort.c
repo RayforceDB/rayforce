@@ -3901,48 +3901,62 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         return ray_error("type", "xasc/xdesc expects a table as first argument");
 
     /* keys can be a SYM atom, a SYM vector, or a list of SYM atoms */
-    int64_t n_keys = 0;
-    int64_t key_ids[16];
-
+    int64_t n_keys;
     if (keys->type == -RAY_SYM) {
-        /* Single symbol atom */
-        key_ids[0] = keys->i64;
         n_keys = 1;
     } else if (keys->type == RAY_SYM) {
-        /* SYM vector */
-        int64_t* syms = (int64_t*)ray_data(keys);
         n_keys = ray_len(keys);
-        if (n_keys > 16) return ray_error("limit", "xasc/xdesc: max 16 key columns"); /* cut-3: API key-count limit */
-        for (int64_t i = 0; i < n_keys; i++) key_ids[i] = syms[i];
     } else if (is_list(keys)) {
-        /* List of symbol atoms */
-        ray_t** elems = (ray_t**)ray_data(keys);
         n_keys = ray_len(keys);
-        if (n_keys > 16) return ray_error("limit", "xasc/xdesc: max 16 key columns"); /* cut-3: API key-count limit */
-        for (int64_t i = 0; i < n_keys; i++) {
-            if (elems[i]->type != -RAY_SYM)
-                return ray_error("type", "xasc/xdesc key must be a symbol");
-            key_ids[i] = elems[i]->i64;
-        }
     } else {
         return ray_error("type", "xasc/xdesc key must be a symbol or list of symbols");
     }
 
     if (n_keys == 0) { ray_retain(tbl); return tbl; }
 
+    /* Exact-size carve for the key ids, resolved key columns and per-key
+     * descending flags: one block, the two 8-byte arrays (key_ids,
+     * key_cols) followed by the descs bytes.  Unbounded key count; freed
+     * at every exit below. */
+    ray_t* k_hdr;
+    int64_t* key_ids = (int64_t*)scratch_alloc(&k_hdr,
+        (size_t)n_keys * (sizeof(int64_t) + sizeof(ray_t*) + sizeof(uint8_t)));
+    if (!key_ids) return ray_error("oom", NULL);
+    ray_t** key_cols = (ray_t**)(key_ids + n_keys);
+    uint8_t* descs   = (uint8_t*)(key_cols + n_keys);
+
+    if (keys->type == -RAY_SYM) {
+        /* Single symbol atom */
+        key_ids[0] = keys->i64;
+    } else if (keys->type == RAY_SYM) {
+        /* SYM vector */
+        int64_t* syms = (int64_t*)ray_data(keys);
+        for (int64_t i = 0; i < n_keys; i++) key_ids[i] = syms[i];
+    } else {
+        /* List of symbol atoms */
+        ray_t** elems = (ray_t**)ray_data(keys);
+        for (int64_t i = 0; i < n_keys; i++) {
+            if (elems[i]->type != -RAY_SYM) {
+                scratch_free(k_hdr);
+                return ray_error("type", "xasc/xdesc key must be a symbol");
+            }
+            key_ids[i] = elems[i]->i64;
+        }
+    }
+
     int64_t nrows = ray_table_nrows(tbl);
-    if (nrows <= 1) { ray_retain(tbl); return tbl; }
+    if (nrows <= 1) { scratch_free(k_hdr); ray_retain(tbl); return tbl; }
 
     /* Resolve key columns */
-    ray_t* key_cols[16];
     for (int64_t i = 0; i < n_keys; i++) {
         key_cols[i] = ray_table_get_col(tbl, key_ids[i]);
-        if (!key_cols[i])
+        if (!key_cols[i]) {
+            scratch_free(k_hdr);
             return ray_error("domain", "xasc/xdesc: key column not found in table");
+        }
     }
 
     /* Build descs array */
-    uint8_t descs[16];
     for (int64_t i = 0; i < n_keys; i++) descs[i] = descending;
 
     /* Already-in-order detection: one bail-early pass comparing consecutive
@@ -3977,16 +3991,17 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
                 ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
             else
                 sorted_check_fn(&sctx, 0, 1, nrows);
-            if (ordered) { ray_retain(tbl); return tbl; }
+            if (ordered) { scratch_free(k_hdr); ray_retain(tbl); return tbl; }
         }
     }
 
     uint64_t* sorted_keys = NULL;
     ray_t* sorted_keys_hdr = NULL;
-    ray_t* idx = sort_indices_ex(key_cols, descs, NULL, (uint8_t)n_keys, nrows,
+    ray_t* idx = sort_indices_ex(key_cols, descs, NULL, n_keys, nrows,
                                  &sorted_keys, &sorted_keys_hdr);
     if (RAY_IS_ERR(idx)) {
         if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+        scratch_free(k_hdr);
         return idx;
     }
 
@@ -4016,6 +4031,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         if (nc_hdr) scratch_free(nc_hdr);
         if (cn_hdr) scratch_free(cn_hdr);
         if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+        scratch_free(k_hdr);
         ray_release(idx);
         return ray_error("oom", NULL);
     }
@@ -4040,6 +4056,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
             scratch_free(nc_hdr);
             scratch_free(cn_hdr);
             if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+            scratch_free(k_hdr);
             ray_release(idx);
             return nc ? nc : ray_error("oom", NULL);
         }
@@ -4164,6 +4181,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         scratch_free(nc_hdr);
         scratch_free(cn_hdr);
         if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+        scratch_free(k_hdr);
         ray_release(idx);
         return result ? result : ray_error("oom", NULL);
     }
@@ -4176,6 +4194,7 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     scratch_free(nc_hdr);
     scratch_free(cn_hdr);
     if (sorted_keys_hdr) scratch_free(sorted_keys_hdr);
+    scratch_free(k_hdr);
     ray_release(idx);
     return result;
 }
