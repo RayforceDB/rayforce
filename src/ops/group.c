@@ -6651,6 +6651,26 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     return result;   /* NULL → legacy path */
 }
 
+/* Pin the DA-prescan dense-group finalize alignment.  This function owns the
+ * dict/dense-array (DA) group path whose finalize loop (the total_groups /
+ * keep_min / range_count compaction region below, ~line 8395-8475, family
+ * da_count_emit_keep_min_u32) is the sole hot symbol for ClickBench q34
+ * (group-by-URL + count + desc-sort + take 10), 66% of self cycles.  Task 1
+ * of the unbounded-slots cut added ~230 net lines ELSEWHERE in group.c
+ * (the legacy ght_layout_t hash path — unrelated, byte-identical to baseline
+ * at the hot lines), shifting this loop's absolute address/alignment and
+ * dropping IPC 2.07→1.96 (+7.2% cycles, +1.6% instructions — a placement
+ * artifact, not new work; RCA in .superpowers/sdd/task-2-bench-checkpoint.md).
+ * Same remedy as reduce_range's cut-3 pin: aligned(64) stabilizes the entry
+ * cacheline; align-loops=32 re-pins every loop head and align-jumps=32 the
+ * unrolled branch targets, making the finalize loop's internal alignment
+ * invariant to future whole-TU layout churn.  Per-function attributes only —
+ * no global codegen flag.  GCC-only: clang lacks the `optimize` attribute and
+ * -Werror would promote the unknown-attribute warning; the pin is
+ * performance-only, so clang builds go without it. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((aligned(64), optimize("align-loops=32","align-jumps=32")))
+#endif
 static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                   int64_t group_limit) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
