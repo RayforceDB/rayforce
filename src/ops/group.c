@@ -6331,7 +6331,8 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * one pass over the column instead of two. */
         /* pair_sum/fused_by are fixed sg_ctx_t scratch, [16] behind their own
          * fused-pair gate (sg path requires a key, so n_aggs ≤ 8 here anyway
-         * via the 6684 guard) — not the general n_keys/n_aggs count. */
+         * via the exec_group_run width guard) — not the general n_keys/n_aggs
+         * count. */
         for (uint8_t a = 0; a < 16; a++) { ctx.pair_sum[a] = -1; ctx.fused_by[a] = -1; }
         for (uint32_t a = 0; a < n_aggs; a++) {
             if (!prod[a].enabled) continue;
@@ -6421,8 +6422,9 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
     ray_op_ext_t* ext = find_ext(g, op->id);
     /* Own gate: this v2-expression shadow path caps both counts at 16 here
-     * (independent of the 6684/8766 exec_group_run guards below — this
-     * helper runs before those, straight off ext->n_keys/n_aggs) and uses
+     * (independent of the exec_group_run width guard and ht_path n_aggs
+     * guard below — this helper runs before those, straight off
+     * ext->n_keys/n_aggs) and uses
      * fixed [16] scratch (synth/names/in_ids/keys/ins/ins2) throughout, so
      * every uint8_t loop below stays uint8_t. */
     if (!ext || ext->n_keys < 1 || ext->n_keys > 16 ||
@@ -7589,8 +7591,9 @@ da_path:;
             size_t total = (size_t)n_slots * n_aggs;
 
             /* VLA bounded ≤8: this whole block is under da_fits, which
-             * requires da_eligible, which requires n_keys > 0 (line ~7360)
-             * — and n_keys > 0 forces n_aggs ≤ 8 via the 6684 guard. */
+             * requires da_eligible, which requires n_keys > 0 (da_eligible's
+             * definition) — and n_keys > 0 forces n_aggs ≤ 8 via the
+             * exec_group_run width guard. */
             void* agg_ptrs[vla_aggs];
             int8_t agg_types[vla_aggs];
             int64_t da_int_null_sentinel[vla_aggs];
@@ -8134,8 +8137,9 @@ da_path:;
             if (!group_materialize_prod_slots(agg_prod, agg_vecs, agg_owned,
                                               n_aggs, nrows))
                 goto ht_path;
-            /* VLA bounded ≤8: sp_eligible requires n_keys == 1 (line ~8033),
-             * and n_keys > 0 forces n_aggs ≤ 8 via the 6684 guard. */
+            /* VLA bounded ≤8: sp_eligible requires n_keys == 1 (sp_eligible's
+             * definition), and n_keys > 0 forces n_aggs ≤ 8 via the
+             * exec_group_run width guard. */
             void* agg_ptrs[vla_aggs];
             int8_t agg_types[vla_aggs];
             uint32_t agg_f64_mask = 0;
@@ -8906,7 +8910,7 @@ ht_path:;
 
     /* Compute row-layout: keys + agg values inline */
     /* narrowing into uint8_t params is safe: this path is gated ≤8 keys/aggs
-     * (group.c:6684); ght widens in cut 4 */
+     * by the exec_group_run width guard; ght widens in cut 4 */
     ght_layout_t ght_layout = ght_compute_layout(n_keys, n_aggs, agg_vecs, ght_need, ext->agg_ops, key_types);
 
     /* Right-sized hash table: start small, rehash on load > 0.5 */
@@ -9425,7 +9429,7 @@ v2_emit:;
 
         /* Pre-allocate agg result vectors.
          * VLA bounded ≤8: this finalize step is inside ht_path, which
-         * rejects n_aggs > 8 at its own guard (group.c:8766) before any of
+         * rejects n_aggs > 8 at its own ht_path n_aggs guard before any of
          * this runs — keyless-unbounded queries that fell through the
          * scalar/DA/sparse fast paths are turned away there, never reaching
          * here. */

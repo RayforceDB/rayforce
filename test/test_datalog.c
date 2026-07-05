@@ -202,7 +202,7 @@ static test_result_t test_source_prov_requires_flag(void) {
  *
  * dl_build_source_prov matches each derived row against the body relation,
  * and for a constant body position it compares the source cell against
- * body->const_vals[c] (datalog.c:2566).  The plain-variable provenance test
+ * body->const_vals[c] (datalog.c:2634).  The plain-variable provenance test
  * above never exercises that comparison.
  *
  * Program:
@@ -278,7 +278,7 @@ static test_result_t test_source_prov_const_body_slot(void) {
 /* Source provenance whose packed-ref buffer must GROW past its initial cap.
  *
  * dl_build_source_prov sizes the scratch buffer at nrows*4 (min 64) and
- * doubles it on overflow (datalog.c:2574-2583).  A cross-product rule whose
+ * doubles it on overflow (datalog.c:2642-2651).  A cross-product rule whose
  * second body atom shares no variables ("always matches") attaches every row
  * of that relation to each derived row, so the ref count is nrows*(1+M) which
  * blows past nrows*4 once M is large enough.

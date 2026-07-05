@@ -938,7 +938,7 @@ static ray_t* dl_join_tables(ray_t* left, ray_t* right,
         rkeys[k] = ray_scan_table(g, r_tid, rname);
     }
 
-    ray_op_t* join = ray_join(g, l_op, lkeys, r_op, rkeys, (uint8_t)n_keys, 0);
+    ray_op_t* join = ray_join(g, l_op, lkeys, r_op, rkeys, (uint32_t)n_keys, 0);
     ray_t* result = ray_execute(g, join);
     ray_graph_free(g);
     ray_release(ltbl);
@@ -989,7 +989,7 @@ static ray_t* dl_antijoin_tables(ray_t* left, ray_t* right,
         rkeys[k] = ray_scan_table(g, r_tid, rname);
     }
 
-    ray_op_t* aj = ray_antijoin(g, l_op, lkeys, r_op, rkeys, (uint8_t)n_keys);
+    ray_op_t* aj = ray_antijoin(g, l_op, lkeys, r_op, rkeys, (uint32_t)n_keys);
     ray_t* result = ray_execute(g, aj);
     ray_graph_free(g);
     ray_release(ltbl);
@@ -1705,7 +1705,7 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 }
 
                 ray_op_t* ag_ins[1] = { agg_in };
-                ray_op_t* root = ray_group(gg, keys_ops, (uint8_t)nk, &op_code, ag_ins, 1);
+                ray_op_t* root = ray_group(gg, keys_ops, (uint32_t)nk, &op_code, ag_ins, 1);
                 if (!root) {
                     ray_graph_free(gg);
                     ray_release(accum);
@@ -2384,6 +2384,13 @@ static ray_t* table_distinct(ray_t* tbl) {
 
     int64_t ncols = ray_table_ncols(tbl);
     if (ncols <= 0) { ray_retain(tbl); return tbl; }
+    /* keys[] is fixed at DL_MAX_ARITY (dl_rule_add_atom rejects over-arity
+     * atoms the same way); a relation admitted via dl-add-edb with a
+     * caller-supplied arity is not clamped there, so surface an error here
+     * rather than silently deduping on a truncated key prefix. */
+    if (ncols > DL_MAX_ARITY)
+        return ray_error("domain", "table_distinct: table has %lld cols, exceeds DL_MAX_ARITY=%d",
+                          (long long)ncols, DL_MAX_ARITY);
 
     ray_t* canonical = canonicalize(tbl);
     if (!canonical || RAY_IS_ERR(canonical))
@@ -2396,13 +2403,13 @@ static ray_t* table_distinct(ray_t* tbl) {
     }
 
     ray_op_t* keys[DL_MAX_ARITY];
-    for (int64_t c = 0; c < ncols && c < DL_MAX_ARITY; c++) {
+    for (int64_t c = 0; c < ncols; c++) {
         char buf[16];
         snprintf(buf, sizeof(buf), "c%d", (int)c);
         keys[c] = ray_scan(g, buf);
     }
 
-    ray_op_t* dist = ray_distinct(g, keys, (uint8_t)ncols);
+    ray_op_t* dist = ray_distinct(g, keys, (uint32_t)ncols);
     dist = ray_optimize(g, dist);
     ray_t* deduped = ray_execute(g, dist);
     ray_graph_free(g);
@@ -2426,6 +2433,13 @@ static ray_t* table_antijoin(ray_t* left, ray_t* right) {
 
     int64_t ncols = ray_table_ncols(left);
     if (ncols <= 0) { ray_retain(left); return left; }
+    /* Same over-arity guard as table_distinct: lkeys/rkeys are fixed at
+     * DL_MAX_ARITY, and a dl-add-edb relation isn't clamped to that bound
+     * at admission, so reject rather than silently anti-joining on a
+     * truncated key prefix. */
+    if (ncols > DL_MAX_ARITY)
+        return ray_error("domain", "table_antijoin: table has %lld cols, exceeds DL_MAX_ARITY=%d",
+                          (long long)ncols, DL_MAX_ARITY);
 
     ray_t* cl = canonicalize(left);
     if (!cl || RAY_IS_ERR(cl))
@@ -2451,14 +2465,14 @@ static ray_t* table_antijoin(ray_t* left, ray_t* right) {
 
     ray_op_t* lkeys[DL_MAX_ARITY];
     ray_op_t* rkeys[DL_MAX_ARITY];
-    for (int64_t c = 0; c < ncols && c < DL_MAX_ARITY; c++) {
+    for (int64_t c = 0; c < ncols; c++) {
         char buf[16];
         snprintf(buf, sizeof(buf), "c%d", (int)c);
         lkeys[c] = ray_scan_table(g, l_tid, buf);
         rkeys[c] = ray_scan_table(g, r_tid, buf);
     }
 
-    ray_op_t* aj = ray_antijoin(g, l, lkeys, r, rkeys, (uint8_t)ncols);
+    ray_op_t* aj = ray_antijoin(g, l, lkeys, r, rkeys, (uint32_t)ncols);
     ray_t* raw = ray_execute(g, aj);
     ray_graph_free(g);
     ray_release(cl);

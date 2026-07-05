@@ -157,7 +157,7 @@ static void dict_pair_view(ray_t* d, ray_t** hdr_out, ray_t*** view_out,
 /* Returns true if the open hit OOM (post-cut-2: overflow is impossible).
  * Caller closes the view and returns an "oom" error / decline. */
 #define DICT_VIEW_OVERFLOW(name) ((name##_n) < 0)
-#define DICT_VIEW_CLOSE(name)    scratch_free(name##_hdr)  /* NULL-safe */
+#define DICT_VIEW_CLOSE(name)    do { scratch_free(name##_hdr); name##_hdr = NULL; } while (0)
 
 /* Convert a RAY_DICT (keys, vals) into a transient interleaved
  * [k0_atom, v0, k1_atom, v1, …] RAY_LIST.  Used by select's group-by
@@ -5669,10 +5669,10 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     }
 by_dict_done:
     /* byv is dead past the by-dict block (reached here by fall-through or the
-     * dependent-key `goto` above); free its carve once.  NULL the header so no
-     * later exit re-frees it (function-scoped decl, dv-threaded returns below
-     * only close dv). */
-    DICT_VIEW_CLOSE(byv); byv_hdr = NULL;
+     * dependent-key `goto` above); free its carve once (DICT_VIEW_CLOSE nulls
+     * byv_hdr itself, so later exits are safe re-closing it; function-scoped
+     * decl, dv-threaded returns below only close dv). */
+    DICT_VIEW_CLOSE(byv);
 
     /* Build DAG */
     ray_graph_t* g = ray_graph_new(tbl);
