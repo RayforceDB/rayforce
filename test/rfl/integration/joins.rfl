@@ -371,3 +371,73 @@
 (set WLJ (left-join [ID] WL WR))
 (at WLJ 'c17) -- [117 17]
 (sum (at WLJ 'r17)) -- 217
+
+;; ══════════════════════════════════════════════════════════════════
+;; cut-3: equi-join / antijoin / upsert key-count caps retired (was
+;; "requires 1..16 keys" / upsert "1..min(ncols,16)").  Compile-side
+;; lk/rk[16] (join_impl/antijoin_impl) and upsert's three [16] arrays
+;; became exact-size carves; exec_antijoin's l_key_vecs/r_key_vecs[16]
+;; and exec_join's pre-existing VLA (both fixed to n_keys post-lift, a
+;; >16-key join VLA would be a stack blow) became one carve sized
+;; 2*n_keys each.  The (uint8_t)nk cast at both join_impl/antijoin_impl
+;; call sites also silently wrapped nk mod 256 into ray_join/ray_antijoin's
+;; uint32_t n_keys parameter -- fixed to (uint32_t)nk alongside the carve.
+;; ══════════════════════════════════════════════════════════════════
+
+;; ── 17-key inner/left join.  GENUINE partitioning oracle: k01..k16 are
+;; constant 'a on both sides (so they alone would over-match everything
+;; into a cross join) and ONLY k17 discriminates.  L row0 (k17='p)
+;; matches R row0 (k17='p); L row1 (k17='q) matches nothing (R's other
+;; row is k17='r).  A truncated (<=16) key count collapses both L rows
+;; onto R row0 -- count 2 instead of 1, and lval/rval leak row1's data.
+(set L17j (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 lval] (list [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [p q] [10 20])))
+(set R17j (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 rval] (list [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [p r] [100 200])))
+(set IJ17 (inner-join [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17] L17j R17j))
+(count IJ17) -- 1
+(at IJ17 'lval) -- [10]
+(at IJ17 'rval) -- [100]
+(set LJ17 (left-join [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17] L17j R17j))
+(count LJ17) -- 2
+(at LJ17 'lval) -- [10 20]
+(at LJ17 'rval) -- [100 0Nl]
+
+;; ── 17-key antijoin.  Same L17j fixture; R_aj has only the 'p-matching
+;; row.  Correct 17-key antijoin excludes L row0 ('p, has a match) and
+;; keeps L row1 ('q, no match).  A truncated (<=16) key count sees BOTH
+;; L rows as matching (R's one row is also k01..16='a) -> empty result.
+(set R_aj (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 rval] (list [a] [a] [a] [a] [a] [a] [a] [a] [a] [a] [a] [a] [a] [a] [a] [a] [p] [100])))
+(set AJ17 (anti-join [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17] L17j R_aj))
+(count AJ17) -- 1
+(at AJ17 'lval) -- [20]
+(at AJ17 'k17) -- [q]
+
+;; ── 17-key upsert.  T17 has k01..k16 constant 'a (2 rows) + k17
+;; discriminator ['p 'q] -- the first 17 columns are keys (n=17).
+;; Upserting a genuinely NEW key (k17='z, absent from T17) with a
+;; truncated (<=16) key match would find k01..16='a already present in
+;; row 0 and wrongly UPDATE it instead of inserting -- table stays at 2
+;; rows and row 0's val is clobbered, instead of growing to 3 rows.
+(set T17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 val] (list [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [a a] [p q] [1 2])))
+(set T17U (upsert T17 17 (list 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'z 99)))
+(count T17U) -- 3
+(at T17U 'val) -- [1 2 99]
+(at T17U 'k17) -- [p q z]
+;; upsert with a genuinely MATCHING 17th key updates in place, not a
+;; different row (would-be first-match under truncation is row 0/'p').
+(set T17U2 (upsert T17 17 (list 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'a 'q 99)))
+(count T17U2) -- 2
+(at T17U2 'val) -- [1 99]
+
+;; ── 256-key inner join: n_keys=256 is the smallest count that wraps to
+;; 0 under the old (uint8_t)nk truncation (256 mod 256 == 0), which would
+;; turn this into an unconditional (0-key) cross join.  k001..k255
+;; constant 1 on both sides; k256 discriminates ([1 2] left, [1 3]
+;; right) exactly like the 17-key sentinel above.  Correct count is 1;
+;; a 0-key cross join would report 4 (2 left rows x 2 right rows).
+(set L256j (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 val] (concat (take (list [1 1]) 255) (list [1 2] [10 20]))))
+(set R256j (table [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 rval] (concat (take (list [1 1]) 255) (list [1 3] [100 200]))))
+(set IJ256 (inner-join [k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256] L256j R256j))
+(count IJ256) -- 1
+(at IJ256 'val) -- [10]
+(at IJ256 'rval) -- [100]
+

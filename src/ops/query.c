@@ -11828,16 +11828,21 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
          * column(s) MUST be present — otherwise the recursive upsert
          * reads a NULL from row_elems[key_col] and segfaults.  Resolve
          * key names from key_sym and require each to appear in row. */
-        int64_t key_names[16];
+        ray_t* keynames_hdr = NULL;
+        int64_t* key_names = NULL;
         int64_t n_key = 0;
         if (key_sym->type == -RAY_SYM) {
+            key_names = (int64_t*)scratch_alloc(&keynames_hdr, sizeof(int64_t));
+            if (!key_names) { ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
             key_names[n_key++] = key_sym->i64;
         } else if (key_sym->type == -RAY_I64) {
             int64_t k = key_sym->i64;
-            if (k <= 0 || k > ncols || k > 16) {
+            if (k <= 0 || k > ncols) {
                 ray_release(tbl); ray_release(key_sym); ray_release(row);
-                return ray_error("domain", "upsert: key count must be 1..min(ncols,16), got %lld", (long long)k);
+                return ray_error("domain", "upsert: key count must be 1..ncols, got %lld", (long long)k);
             }
+            key_names = (int64_t*)scratch_alloc(&keynames_hdr, (size_t)k * sizeof(int64_t));
+            if (!key_names) { ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
             for (int64_t i = 0; i < k; i++)
                 key_names[n_key++] = ray_table_col_name(tbl, i);
         } else {
@@ -11850,10 +11855,12 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             for (int64_t i = 0; i < src_ncols; i++)
                 if (ray_table_col_name(row, i) == key_names[k]) { found = 1; break; }
             if (!found) {
+                scratch_free(keynames_hdr);
                 ray_release(tbl); ray_release(key_sym); ray_release(row);
                 return ray_error("value", NULL);
             }
         }
+        scratch_free(keynames_hdr);
 
         /* Gather source columns in target order (now guaranteed 1-to-1). */
         ray_t* src_cols[64];
@@ -11960,8 +11967,11 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
 
     /* Determine key columns — integer N means "first N columns are keys" */
     int64_t n_key_cols = 1;
-    int64_t key_col_indices[16];
+    ray_t* kci_hdr = NULL;
+    int64_t* key_col_indices = NULL;
     if (key_sym->type == -RAY_SYM) {
+        key_col_indices = (int64_t*)scratch_alloc(&kci_hdr, sizeof(int64_t));
+        if (!key_col_indices) { ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
         key_col_indices[0] = -1;
         for (int64_t c = 0; c < ncols; c++) {
             if (ray_table_col_name(tbl, c) == key_sym->i64) {
@@ -11969,10 +11979,12 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
                 break;
             }
         }
-        if (key_col_indices[0] < 0) { ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("domain", "upsert: key column not found in target table"); }
+        if (key_col_indices[0] < 0) { scratch_free(kci_hdr); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("domain", "upsert: key column not found in target table"); }
     } else if (key_sym->type == -RAY_I64) {
         n_key_cols = key_sym->i64;
-        if (n_key_cols <= 0 || n_key_cols > ncols || n_key_cols > 16) { ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("domain", "upsert: key count must be 1..min(ncols,16), got %lld", (long long)n_key_cols); }
+        if (n_key_cols <= 0 || n_key_cols > ncols) { ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("domain", "upsert: key count must be 1..ncols, got %lld", (long long)n_key_cols); }
+        key_col_indices = (int64_t*)scratch_alloc(&kci_hdr, (size_t)n_key_cols * sizeof(int64_t));
+        if (!key_col_indices) { ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
         for (int64_t k = 0; k < n_key_cols; k++) key_col_indices[k] = k;
     } else {
         int8_t ks_t = key_sym->type;            /* capture BEFORE free */
@@ -11989,7 +12001,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         for (int64_t r = 0; r < new_nrows; r++) {
             /* Build single-row list from multi-row columns */
             ray_t* single_row = ray_alloc(ncols * sizeof(ray_t*));
-            if (!single_row) { ray_release(cur_tbl); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
+            if (!single_row) { scratch_free(kci_hdr); ray_release(cur_tbl); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
             single_row->type = RAY_LIST;
             single_row->len = ncols;
             ray_t** sr = (ray_t**)ray_data(single_row);
@@ -12006,9 +12018,10 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             single_row->len = 0;
             ray_free(single_row);
             ray_release(cur_tbl);
-            if (RAY_IS_ERR(new_tbl)) { ray_release(tbl); ray_release(key_sym); ray_release(row); return new_tbl; }
+            if (RAY_IS_ERR(new_tbl)) { scratch_free(kci_hdr); ray_release(tbl); ray_release(key_sym); ray_release(row); return new_tbl; }
             cur_tbl = new_tbl;
         }
+        scratch_free(kci_hdr);
         ray_release(tbl);
         ray_release(key_sym);
         ray_release(row);
@@ -12026,7 +12039,9 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
      * against this per-column want-id.  Absent from the column's
      * domain → -1 → matches nothing → insert path (correct).  Exact
      * no-op while the column is runtime-domain (want == atom->i64). */
-    int64_t key_sym_want[16];
+    ray_t* kw_hdr = NULL;
+    int64_t* key_sym_want = (int64_t*)scratch_alloc(&kw_hdr, (size_t)n_key_cols * sizeof(int64_t));
+    if (!key_sym_want) { scratch_free(kci_hdr); ray_release(tbl); ray_release(key_sym); ray_release(row); return ray_error("oom", NULL); }
     for (int64_t k = 0; k < n_key_cols; k++) {
         int64_t kci = key_col_indices[k];
         ray_t* key_col = ray_table_get_col_idx(tbl, kci);
@@ -12034,11 +12049,13 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         int8_t kt = key_col->type;
         if (kt == RAY_STR && key_atom->type != -RAY_STR) {
             int8_t ka_t = key_atom->type;            /* capture BEFORE free */
+            scratch_free(kw_hdr); scratch_free(kci_hdr);
             ray_release(tbl); ray_release(key_sym); ray_release(row);
             return ray_error("type", "upsert: key column is str but key value is %s", ray_type_name(ka_t));
         }
         if (kt == RAY_SYM && key_atom->type != -RAY_SYM) {
             int8_t ka_t = key_atom->type;            /* capture BEFORE free */
+            scratch_free(kw_hdr); scratch_free(kci_hdr);
             ray_release(tbl); ray_release(key_sym); ray_release(row);
             return ray_error("type", "upsert: key column is sym but key value is %s", ray_type_name(ka_t));
         }
@@ -12089,6 +12106,8 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
         }
         if (match) { match_row = r; break; }
     }
+    scratch_free(kw_hdr);
+    scratch_free(kci_hdr);
 
     if (match_row < 0) {
         /* Key not found — insert: pass pre-evaluated args */
@@ -12216,7 +12235,7 @@ static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
         { if (_bxk) ray_release(_bxk); return ray_error("type", "join: keys must be a symbol list, got %s", ray_type_name(keys->type)); }
 
     int64_t nk = ray_len(keys);
-    if (nk == 0 || nk > 16) { if (_bxk) ray_release(_bxk); return ray_error("domain", "join: requires 1..16 keys, got %lld", (long long)nk); }
+    if (nk == 0) { if (_bxk) ray_release(_bxk); return ray_error("domain", "join: requires at least 1 key, got %lld", (long long)nk); }
     ray_t** key_elems = (ray_t**)ray_data(keys);
 
     ray_graph_t* g = ray_graph_new(left_tbl);
@@ -12225,24 +12244,33 @@ static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
     ray_op_t* left_node  = ray_const_table(g, left_tbl);
     ray_op_t* right_node = ray_const_table(g, right_tbl);
 
-    ray_op_t* lk[16], *rk[16];
+    /* Exact-size carve, 2*nk wide (unbounded — no fixed key-count ceiling).
+     * ray_join copies every id out of lk/rk before it returns, so the carve
+     * is freed right after that call. */
+    ray_t* keyops_hdr = NULL;
+    ray_op_t** keyops = (ray_op_t**)scratch_alloc(&keyops_hdr, (size_t)nk * 2 * sizeof(ray_op_t*));
+    if (!keyops) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("oom", NULL); }
+    ray_op_t** lk = keyops;
+    ray_op_t** rk = keyops + nk;
     for (int64_t i = 0; i < nk; i++) {
         if (key_elems[i]->type != -RAY_SYM) {
             int8_t ke_t = key_elems[i]->type;            /* capture BEFORE free */
+            scratch_free(keyops_hdr);
             ray_graph_free(g); if (_bxk) ray_release(_bxk);
             return ray_error("type", "join: key must be a symbol name, got %s", ray_type_name(ke_t));
         }
         ray_t* name_str = ray_sym_str(key_elems[i]->i64);
-        if (!name_str) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "join: unknown key symbol"); }
+        if (!name_str) { scratch_free(keyops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "join: unknown key symbol"); }
         lk[i] = ray_scan(g, ray_str_ptr(name_str));
         rk[i] = ray_scan(g, ray_str_ptr(name_str));
-        if (!lk[i] || !rk[i]) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "join: key column not found"); }
+        if (!lk[i] || !rk[i]) { scratch_free(keyops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "join: key column not found"); }
     }
 
     if (_bxk) ray_release(_bxk);
 
     ray_op_t* jn = ray_join(g, left_node, lk, right_node, rk,
-                           (uint8_t)nk, join_type);
+                           (uint32_t)nk, join_type);
+    scratch_free(keyops_hdr);
     if (!jn) { ray_graph_free(g); return ray_error("oom", NULL); }
 
     jn = ray_optimize(g, jn);
@@ -12280,7 +12308,7 @@ static ray_t* antijoin_impl(ray_t** args, int64_t n) {
         { if (_bxk) ray_release(_bxk); return ray_error("type", "antijoin: keys must be a symbol list, got %s", ray_type_name(keys->type)); }
 
     int64_t nk = ray_len(keys);
-    if (nk == 0 || nk > 16) { if (_bxk) ray_release(_bxk); return ray_error("domain", "antijoin: requires 1..16 keys, got %lld", (long long)nk); }
+    if (nk == 0) { if (_bxk) ray_release(_bxk); return ray_error("domain", "antijoin: requires at least 1 key, got %lld", (long long)nk); }
     ray_t** key_elems = (ray_t**)ray_data(keys);
 
     ray_graph_t* g = ray_graph_new(left_tbl);
@@ -12289,23 +12317,32 @@ static ray_t* antijoin_impl(ray_t** args, int64_t n) {
     ray_op_t* left_node  = ray_const_table(g, left_tbl);
     ray_op_t* right_node = ray_const_table(g, right_tbl);
 
-    ray_op_t* lk[16], *rk[16];
+    /* Exact-size carve, 2*nk wide (unbounded — no fixed key-count ceiling).
+     * ray_antijoin copies every id out of lk/rk before it returns, so the
+     * carve is freed right after that call. */
+    ray_t* keyops_hdr = NULL;
+    ray_op_t** keyops = (ray_op_t**)scratch_alloc(&keyops_hdr, (size_t)nk * 2 * sizeof(ray_op_t*));
+    if (!keyops) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("oom", NULL); }
+    ray_op_t** lk = keyops;
+    ray_op_t** rk = keyops + nk;
     for (int64_t i = 0; i < nk; i++) {
         if (key_elems[i]->type != -RAY_SYM) {
             int8_t ke_t = key_elems[i]->type;            /* capture BEFORE free */
+            scratch_free(keyops_hdr);
             ray_graph_free(g); if (_bxk) ray_release(_bxk);
             return ray_error("type", "antijoin: key must be a symbol name, got %s", ray_type_name(ke_t));
         }
         ray_t* name_str = ray_sym_str(key_elems[i]->i64);
-        if (!name_str) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "antijoin: unknown key symbol"); }
+        if (!name_str) { scratch_free(keyops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "antijoin: unknown key symbol"); }
         lk[i] = ray_scan(g, ray_str_ptr(name_str));
         rk[i] = ray_scan(g, ray_str_ptr(name_str));
-        if (!lk[i] || !rk[i]) { ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "antijoin: key column not found"); }
+        if (!lk[i] || !rk[i]) { scratch_free(keyops_hdr); ray_graph_free(g); if (_bxk) ray_release(_bxk); return ray_error("domain", "antijoin: key column not found"); }
     }
 
     if (_bxk) ray_release(_bxk);
 
-    ray_op_t* jn = ray_antijoin(g, left_node, lk, right_node, rk, (uint8_t)nk);
+    ray_op_t* jn = ray_antijoin(g, left_node, lk, right_node, rk, (uint32_t)nk);
+    scratch_free(keyops_hdr);
     if (!jn) { ray_graph_free(g); return ray_error("oom", NULL); }
 
     jn = ray_optimize(g, jn);

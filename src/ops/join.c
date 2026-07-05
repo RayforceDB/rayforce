@@ -861,14 +861,18 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
     uint32_t n_keys = ext->join.n_join_keys;
     uint8_t join_type = ext->join.join_type;
 
-    /* VLA bound of zero is UB under -fsanitize=undefined.  Guarantee >=1
-     * slot; iterations below are bounded by n_keys so the extra slot is
-     * untouched when n_keys == 0. */
+    /* n_keys is unbounded post-lift (no fixed key-count ceiling) — a stack
+     * VLA here would be a stack blow for a wide join.  One zero-inited
+     * carve holds both l_key_vecs and r_key_vecs (key_slots each); guard
+     * >=1 slot so the carve is never zero-sized when n_keys == 0.  Freed
+     * on every return between here and the end of the function (join_cleanup
+     * covers the fall-through paths; direct returns free it explicitly). */
     size_t key_slots = n_keys ? n_keys : 1;
-    ray_t* l_key_vecs[key_slots];
-    ray_t* r_key_vecs[key_slots];
-    memset(l_key_vecs, 0, key_slots * sizeof(ray_t*));
-    memset(r_key_vecs, 0, key_slots * sizeof(ray_t*));
+    ray_t* key_vecs_hdr = NULL;
+    ray_t** key_vecs = (ray_t**)scratch_calloc(&key_vecs_hdr, key_slots * 2 * sizeof(ray_t*));
+    if (!key_vecs) return ray_error("oom", NULL);
+    ray_t** l_key_vecs = key_vecs;
+    ray_t** r_key_vecs = key_vecs + key_slots;
 
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
@@ -884,13 +888,17 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
     /* RAY_STR keys not yet supported (16-byte elements vs 8-byte hash/eq slots) */
     for (uint32_t k = 0; k < n_keys; k++) {
         if ((l_key_vecs[k] && l_key_vecs[k]->type == RAY_STR) ||
-            (r_key_vecs[k] && r_key_vecs[k]->type == RAY_STR))
+            (r_key_vecs[k] && r_key_vecs[k]->type == RAY_STR)) {
+            scratch_free(key_vecs_hdr);
             return ray_error("nyi", NULL);
+        }
     }
 
     /* Sequential LUT warm-up BEFORE any dispatch (see join_warm_sym_luts). */
-    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys))
+    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys)) {
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", "join: sym domain runtime-id LUT build failed");
+    }
 
     ray_pool_t* pool = ray_pool_get();
 
@@ -951,6 +959,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
 
         if (pool_cancelled(pool)) {
             scratch_free(r_hash_hdr); scratch_free(l_hash_hdr);
+            scratch_free(key_vecs_hdr);
             return ray_error("cancel", NULL);
         }
 
@@ -984,6 +993,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
                 if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
             }
             scratch_free(r_parts_hdr); scratch_free(l_parts_hdr);
+            scratch_free(key_vecs_hdr);
             return ray_error("cancel", NULL);
         }
 
@@ -1061,7 +1071,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
             scratch_free(pp_meta_hdr); scratch_free(pcounts_hdr);
             if (matched_right_hdr) { scratch_free(matched_right_hdr); matched_right_hdr = NULL; }
             matched_right = NULL;
-            if (bp_cancelled) return ray_error("cancel", NULL);
+            if (bp_cancelled) { scratch_free(key_vecs_hdr); return ray_error("cancel", NULL); }
             if (bp_pathological) ray_join_dup_fallbacks++;
             goto chained_ht_fallback;
         }
@@ -1100,6 +1110,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
                 scratch_free(pcounts_hdr);
                 if (matched_right_hdr) scratch_free(matched_right_hdr);
                 matched_right_hdr = NULL;
+                scratch_free(key_vecs_hdr);
                 return ray_error("oom", NULL);
             }
 
@@ -1158,6 +1169,7 @@ chained_ht_fallback:;
     _Atomic(uint32_t)* ht_heads = (_Atomic(uint32_t)*)scratch_alloc(&ht_heads_hdr, ht_cap * sizeof(uint32_t));
     if (!ht_next || !ht_heads) {
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", NULL);
     }
     memset(ht_heads, 0xFF, ht_cap * sizeof(uint32_t));  /* JHT_EMPTY = 0xFFFFFFFF */
@@ -1247,6 +1259,7 @@ chained_ht_fallback:;
                               (size_t)(n_tasks + 1) * sizeof(int64_t));
     if (!morsel_counts) {
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", NULL);
     }
 
@@ -1524,6 +1537,7 @@ join_cleanup:
     scratch_free(r_idx_hdr);
     if (counts_hdr) scratch_free(counts_hdr);
     scratch_free(matched_right_hdr);
+    scratch_free(key_vecs_hdr);
     if (sjoin_sel) ray_release(sjoin_sel);
     if (asp_sel) ray_release(asp_sel);
 
@@ -1562,14 +1576,17 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
         return left_table;
     }
 
-    /* Fixed [16]: n_keys is join/antijoin key count, gated to 1..16 at
-     * every compile-side caller (query.c join_impl/antijoin_impl:
-     * "requires 1..16 keys"; datalog.c dl_*_tables: DL_MAX_ARITY==16) —
-     * cut-3 cap, verified at all call sites, not just this one. */
-    ray_t* l_key_vecs[16];
-    ray_t* r_key_vecs[16];
-    memset(l_key_vecs, 0, n_keys * sizeof(ray_t*));
-    memset(r_key_vecs, 0, n_keys * sizeof(ray_t*));
+    /* n_keys is unbounded post-lift (query.c join_impl/antijoin_impl no
+     * longer cap at 16; datalog.c callers stay bounded by DL_MAX_ARITY,
+     * a separate cap on a different call path) — carve instead of a fixed
+     * [16] or a stack VLA (both wrong for an unbounded key count).  One
+     * zero-inited carve holds both l_key_vecs and r_key_vecs. */
+    ray_t* key_vecs_hdr = NULL;
+    ray_t** key_vecs = (ray_t**)scratch_calloc(&key_vecs_hdr,
+                            (size_t)(n_keys ? n_keys : 1) * 2 * sizeof(ray_t*));
+    if (!key_vecs) return ray_error("oom", NULL);
+    ray_t** l_key_vecs = key_vecs;
+    ray_t** r_key_vecs = key_vecs + n_keys;
 
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
@@ -1585,13 +1602,17 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     /* RAY_STR keys not yet supported */
     for (uint32_t k = 0; k < n_keys; k++) {
         if ((l_key_vecs[k] && l_key_vecs[k]->type == RAY_STR) ||
-            (r_key_vecs[k] && r_key_vecs[k]->type == RAY_STR))
+            (r_key_vecs[k] && r_key_vecs[k]->type == RAY_STR)) {
+            scratch_free(key_vecs_hdr);
             return ray_error("nyi", NULL);
+        }
     }
 
     /* Sequential LUT warm-up BEFORE the parallel build dispatch. */
-    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys))
+    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys)) {
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", "join: sym domain runtime-id LUT build failed");
+    }
 
     /* Build chained hash table from right side */
     ray_t* ht_next_hdr = NULL;
@@ -1610,6 +1631,7 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     if (!ht_next || !ht_heads) {
         if (ht_next_hdr) scratch_free(ht_next_hdr);
         if (ht_heads_hdr) scratch_free(ht_heads_hdr);
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", NULL);
     }
     memset(ht_heads, 0xFF, ht_cap * sizeof(uint32_t));  /* JHT_EMPTY */
@@ -1635,6 +1657,7 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     if (pool_cancelled(pool)) {
         scratch_free(ht_next_hdr);
         scratch_free(ht_heads_hdr);
+        scratch_free(key_vecs_hdr);
         return ray_error("cancel", NULL);
     }
 
@@ -1645,6 +1668,7 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
     if (!out_idx) {
         scratch_free(ht_next_hdr);
         scratch_free(ht_heads_hdr);
+        scratch_free(key_vecs_hdr);
         return ray_error("oom", NULL);
     }
 
@@ -1667,6 +1691,7 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
 
     scratch_free(ht_next_hdr);
     scratch_free(ht_heads_hdr);
+    scratch_free(key_vecs_hdr);
 
     /* Gather: build result table with only left columns */
     int64_t left_ncols = ray_table_ncols(left_table);
