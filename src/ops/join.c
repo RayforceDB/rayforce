@@ -1963,13 +1963,17 @@ static bool asof_hash_group_match(uint32_t n_eq,
     int32_t* cnt      = NULL;
     int32_t* off      = NULL;
     int32_t* rows     = NULL;
-    /* Single per-row eq-key scratch buffer, exact-sized to n_eq (unbounded —
-     * no fixed key-count ceiling) and carved ONCE here rather than per row.
-     * Reused sequentially by Pass 1 below, the Pass 2 hash-scan fallback,
-     * and the ASOF_RESOLVE_GID macro's OA-probe branch — none of those
-     * three loops is ever live at the same time as another, so one buffer
-     * covers all of them. */
-    int64_t* rowkey   = NULL;
+    /* Single per-row eq-key scratch buffer, reused sequentially by Pass 1
+     * below, the Pass 2 hash-scan fallback, and the ASOF_RESOLVE_GID macro's
+     * OA-probe branch — none of those three loops is ever live at the same
+     * time as another, so one buffer covers all of them.  For the common
+     * bounded case (n_eq <= 16) stage into a STACK array (matches the
+     * pre-cut-3 per-loop `int64_t lv[256]`/`rv[256]`/`_rv[256]` provenance a
+     * unified heap carve gave up); wide keys (>16, unbounded — no fixed
+     * ceiling) fall back to the exact-sized heap carve.  The pointer is chosen
+     * ONCE here (no per-row branch). */
+    int64_t  rowkey_stk[16];
+    int64_t* rowkey_heap = NULL;
 
     left_gid = (int32_t*)scratch_alloc(&lgid_hdr, (size_t)left_n * 4);
     row_gid  = (int32_t*)scratch_alloc(&gid_hdr, (size_t)right_n * 4);
@@ -1977,10 +1981,13 @@ static bool asof_hash_group_match(uint32_t n_eq,
         tab   = (int32_t*)scratch_alloc(&tab_hdr, (size_t)cap * 4);
         gkeys = (int64_t*)scratch_alloc(&keys_hdr,
                                         (size_t)left_n * n_eq * 8);
-        rowkey = (int64_t*)scratch_alloc(&rowkey_hdr, (size_t)n_eq * 8);
+        if (n_eq > 16)
+            rowkey_heap = (int64_t*)scratch_alloc(&rowkey_hdr, (size_t)n_eq * 8);
         if (tab) memset(tab, 0, (size_t)cap * 4);
     }
-    bool ok = left_gid && row_gid && (n_eq == 0 || (tab && gkeys && rowkey));
+    int64_t* rowkey = (n_eq <= 16) ? rowkey_stk : rowkey_heap;
+    bool ok = left_gid && row_gid &&
+              (n_eq == 0 || (tab && gkeys && (n_eq <= 16 || rowkey_heap)));
 
     /* Pass 1 — distinct left keys.  n_groups <= left_n. */
     int32_t n_groups = 0;
