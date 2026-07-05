@@ -6330,9 +6330,8 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * a product's int side already streams rides the product loop —
          * one pass over the column instead of two. */
         /* pair_sum/fused_by are fixed sg_ctx_t scratch, [16] admitted via
-         * sg_shape_eligible's gate (ext->n_aggs ≤ 16 check at line ~6217),
-         * which runs before this call site — not the exec_group_run width guard
-         * that runs after. */
+         * sg_shape_eligible's ≤16 aggs gate, which runs before this call
+         * site — not the exec_group_run width guard that runs after. */
         for (uint8_t a = 0; a < 16; a++) { ctx.pair_sum[a] = -1; ctx.fused_by[a] = -1; }
         for (uint32_t a = 0; a < n_aggs; a++) {
             if (!prod[a].enabled) continue;

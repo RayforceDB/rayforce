@@ -2436,10 +2436,10 @@ static test_result_t test_rule_add_interval_overflow(void) {
 }
 
 /* Regression test for over-arity domain guard: tables with ncols > DL_MAX_ARITY
- * (16) are rejected to prevent silent truncation or out-of-bounds access to
- * fixed-size key arrays in table_distinct/table_antijoin. The guard is enforced
- * at dl_add_edb admission to prevent the UBSan error (col_names[] is [16]), with
- * additional safeguards in table_distinct/table_antijoin for defense in depth.
+ * (16) trigger admission rejection at dl_add_edb (lines 101–104) to prevent
+ * uninitialized keys[16..] in table_distinct/table_antijoin and wrong-answer
+ * bugs from silent truncation. The guard is defended in depth with secondary
+ * checks in table_distinct/table_antijoin.
  *
  * Expected: dl_add_edb rejects arity=17 and returns -1. */
 static test_result_t test_edb_over_arity_domain_guard(void) {
