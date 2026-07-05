@@ -269,8 +269,13 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
  * parity.  Now the hot loop's internal alignment is invariant to reduce_range's
  * absolute address, so future binary-layout churn can no longer reshuffle it
  * onto a bad boundary.  aligned(64) keeps the entry cacheline-stable too.
- * Per-function attributes only — no global codegen flag, no -m target hack. */
+ * Per-function attributes only — no global codegen flag, no -m target hack.
+ * GCC-only: clang has no `optimize` function attribute and -Werror promotes
+ * the unknown-attribute warning to an error; the pin is performance-only,
+ * so clang builds simply go without it (the pre-pin status quo). */
+#if defined(__GNUC__) && !defined(__clang__)
 __attribute__((aligned(64), optimize("align-loops=32","align-jumps=32")))
+#endif
 static void reduce_range(ray_t* input, int64_t start, int64_t end,
                          reduce_acc_t* acc, bool has_nulls,
                          const int64_t* idx) {
