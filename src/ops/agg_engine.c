@@ -2056,12 +2056,16 @@ static inline int agg_radix_scatter_one(agg_radix_ctx_t* c, agg_pay_buf_t* my,
     return 0;
 }
 
-/* Phase 1: scatter one packed payload record per row into per-(worker,
- * partition) contiguous buffers, keyed by RADIX_PART(tuple hash). */
-static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
-    agg_pay_buf_t* my = &c->bufs[(size_t)wid * AGG_RADIX_P];
-    int64_t* kv = &c->kv_scratch[(size_t)wid * c->n_keys];  /* this worker's staging row */
+/* Scatter this worker's [start,end) rows, staging each row's keys through kv.
+ * static inline so each caller below inlines its own copy: when the stack
+ * array is passed, kv's alloca provenance reaches the per-row kv[k]=v stage
+ * unmerged and the compiler scalarizes/register-promotes it (parent codegen);
+ * a heap slice stays compiler-opaque (may alias key_data/rec/bufs).
+ * RAY_INLINE (always_inline) so both call sites below get their own copy —
+ * an out-of-line body would merge the two provenances into one pointer param
+ * and re-pessimize the stack path. */
+RAY_INLINE void agg_radix_scatter_range(agg_radix_ctx_t* c, agg_pay_buf_t* my,
+                                        int64_t* kv, int64_t start, int64_t end) {
     if (c->sel) {
         /* Chunk-decode this worker's slice of selected rows; scatter each. */
         int64_t rows[AGG_SEL_CHUNK];
@@ -2075,6 +2079,27 @@ static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_
     }
     for (int64_t r = start; r < end; r++)
         if (agg_radix_scatter_one(c, my, kv, r) != 0) return;
+}
+
+/* Phase 1: scatter one packed payload record per row into per-(worker,
+ * partition) contiguous buffers, keyed by RADIX_PART(tuple hash). */
+static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
+    agg_pay_buf_t* my = &c->bufs[(size_t)wid * AGG_RADIX_P];
+    /* Key-staging row for this worker.  The common bounded case (n_keys <= 16)
+     * stages through a STACK array: a compiler-opaque heap slice defeated the
+     * scalarization/register-promotion of the per-row kv[k]=v stage (flat
+     * retired instructions, IPC 0.71->0.58, scatter self-time tripled — see
+     * task-9-rca.md).  Branch ONCE here (not per row) so each inlined copy of
+     * agg_radix_scatter_range gets its argument's provenance unmerged: the
+     * stack call restores parent codegen (and drops the secondary false-sharing
+     * term); wide keys (>16) fall back to the per-worker heap slice. */
+    if (c->n_keys <= 16) {
+        int64_t kv_stk[16];
+        agg_radix_scatter_range(c, my, kv_stk, start, end);
+    } else {
+        agg_radix_scatter_range(c, my, &c->kv_scratch[(size_t)wid * c->n_keys], start, end);
+    }
 }
 
 /* Phase 2: group + accumulate one partition by walking its packed payload
