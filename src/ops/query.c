@@ -4783,6 +4783,59 @@ static int collect_syms(ray_t* e, int64_t* out, int max, int n) {
     return n;
 }
 
+/* Over-count of the sym atoms collect_syms could gather from `e`.  Mirrors
+ * collect_syms' recursion shape (unquoted -RAY_SYM leaves; recurse LIST elems
+ * and DICT vals) but WITHOUT dedup — an over-count is exactly what a keep-set
+ * carve wants (dedup only shrinks the real count, so the carve stays large
+ * enough).  Used once per compile to size proj_buf to a bound collect_syms
+ * cannot saturate. */
+static int64_t count_syms(ray_t* e) {
+    if (!e) return 0;
+    if (e->type == -RAY_SYM) return (e->attrs & ATTR_QUOTED) ? 0 : 1;
+    if (e->type == RAY_LIST) {
+        ray_t** el = (ray_t**)ray_data(e);
+        int64_t len = ray_len(e), c = 0;
+        for (int64_t i = 0; i < len; i++) c += count_syms(el[i]);
+        return c;
+    }
+    if (e->type == RAY_DICT) {
+        ray_t* vals = ray_dict_vals(e);
+        if (vals && vals->type == RAY_LIST) {
+            ray_t** v = (ray_t**)ray_data(vals);
+            int64_t len = ray_len(vals), c = 0;
+            for (int64_t i = 0; i < len; i++) c += count_syms(v[i]);
+            return c;
+        }
+    }
+    return 0;
+}
+
+/* Buffer size that proj_compute_keep's keep-set can never saturate: walk the
+ * same non-`from` value exprs collect_syms visits and count every sym atom
+ * (an over-count of the distinct total — dedup only shrinks it), then add 1.
+ *
+ * The +1 is load-bearing.  collect_syms fills `out[0..n-1]` and the guard
+ * declines when `n >= max`.  The distinct count it produces is ≤ this
+ * occurrence over-count B, so with `max = B + 1` we always have `n ≤ B < max`
+ * — the guard is unreachable and a legitimate full keep-set is published, not
+ * declined.  Sizing to exactly B would re-trip the guard whenever a query has
+ * no duplicate refs (n == B == max), which is precisely the q11 shape.  Floor
+ * keeps it ≥ 1 slot. */
+static int64_t proj_keep_bound(ray_t* dict) {
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return 1;
+    int64_t from_id = dict_key_id(dict, "from");
+    int64_t n = keys->len;
+    ray_t** vptrs = (ray_t**)ray_data(vals);
+    int64_t cnt = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (sym_cell_runtime_id(keys, i) == from_id) continue;  /* the subquery */
+        cnt += count_syms(vptrs[i]);
+    }
+    return cnt + 1;
+}
+
 /* Projection-pushdown keep-set: for an EXPLICITLY-projected select (one with
  * value exprs, so it references only named columns), collect the column syms its
  * non-`from` clauses reference.  Returns false (→ carry all) for an implicit-all
@@ -4810,11 +4863,12 @@ static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
     }
     DICT_VIEW_CLOSE(pv);  /* pv dead past the clause scan */
     if (!has_value_expr) return false;               /* implicit-all → carry all */
-    /* Completeness guard: collect_syms caps at `max`, so a saturated buffer
-     * may have dropped a referenced column.  A referenced column must never
-     * be silently dropped from the keep-set (see collect_syms) — so if the
-     * set filled the buffer, decline the pushdown and carry all columns
-     * (correct, just unoptimized) rather than publish a truncated set. */
+    /* Completeness safety net: with proj_buf sized from proj_keep_bound (an
+     * over-count of exactly the sym atoms this loop can collect) `n >= max` is
+     * unreachable.  It is kept anyway: should the bound ever under-count, a
+     * saturated buffer may have dropped a referenced column, and a referenced
+     * column must never be silently dropped — so decline the pushdown and
+     * carry all columns (correct, just unoptimized) rather than truncate. */
     if (n >= max) return false;
     *out_n = n;
     return true;
@@ -4917,13 +4971,15 @@ ray_t* ray_select(ray_t** args, int64_t n) {
      * IMMEDIATE nested `select {by:}` distinct in `from:` (eval_depth+1) carries
      * only those.  Stack buffer stays live across the from: eval; save/restore
      * keeps it scoped and nesting-safe. */
-    /* proj_buf holds the pushdown keep-set (over-approximated column-ref
-     * syms).  Sized from the dict's key count: proj_compute_keep declines
-     * (carry-all) rather than truncate if the keep-set doesn't fit, so any
-     * size is CORRECT — dict_keys_len fits the common one-ref-per-output
-     * shape and keeps the carve exact.  Published to pvm->proj_keep only
-     * across the from: eval; freed right after the restore. */
-    int64_t proj_hdr_keys = ray_dict_keys(dict)->len;
+    /* proj_buf holds the pushdown keep-set (over-approximated column-ref syms
+     * from collect_syms).  Sized from proj_keep_bound — an over-count of the
+     * sym atoms proj_compute_keep can collect — so the keep-set never
+     * saturates.  (The old dict-key-count carve under-sized this: an agg
+     * output `(count X)` yields 2 syms for 1 dict key and `desc:`/`asc:` add an
+     * alias sym, so the count filled the buffer and pushdown was wrongly
+     * declined — q11 +340%.)  Published to pvm->proj_keep only across the
+     * from: eval; freed right after the restore. */
+    int64_t proj_hdr_keys = proj_keep_bound(dict);
     ray_t*  proj_hdr = NULL;
     int64_t* proj_buf = (int64_t*)scratch_alloc(&proj_hdr,
         (size_t)(proj_hdr_keys > 0 ? proj_hdr_keys : 1) * sizeof(int64_t));
