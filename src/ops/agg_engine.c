@@ -34,7 +34,17 @@ bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * protect.  ext->n_keys is uint32_t (widened, Task 1); dense direct-index
      * routing still self-limits to <=16 inside agg_dense_plan (see there). */
     if (ext->n_keys < 1) return false;  /* need >=1 key */
-    if (ext->n_aggs == 0) return false;        /* need >=1 aggregate  */
+    /* n_aggs == 0 (table-distinct: ray_group(keys, n_keys, NULL, NULL, 0)) is
+     * now ADMITTED (cut-3): every strategy below — dense/smallhash/radix
+     * parallel, and the serial dense/hash tail in exec_group_v2_run — sizes
+     * its per-agg state from ext->n_aggs (agg_vo_init's block/vts/off carve,
+     * the per-strategy output-column loops) with no agg assumed to exist, so
+     * a 0-agg run just emits the grouped key columns with no agg columns
+     * appended — exactly table-distinct's needed shape.  Before this, 0-agg
+     * groups fell through to the legacy exec_group_run tail, whose
+     * `n_keys > 8` guard (group.c) died `nyi` on any 9+-column
+     * `(distinct t)` — a live bug, not a deliberate width cap; fixed here
+     * instead of adding a parallel distinct-only route. */
     if (!tbl) return false;
     /* A pushed WHERE filter (g->selection set) is now handled by exec_group_v2's
      * compact-table prologue: it gathers the selected rows of the keys/agg-inputs

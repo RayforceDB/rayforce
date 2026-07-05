@@ -979,23 +979,25 @@ ray_t* ray_table_distinct_fn(ray_t* tbl) {
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) return ray_error("oom", NULL);
 
-    /* Fixed [255]: ray_distinct's own n_keys parameter is uint32_t
-     * (already widened) — the true cap here is this file's OWN check
-     * just below (ncols > 255), not ray_distinct's signature.  The
-     * check runs before any element of keys[] is written (the
-     * populating loop is further down), so the array stays in bounds. */
-    ray_op_t* keys[255];
-    if (ncols > 255) { ray_graph_free(g); return ray_error("range", "table-distinct: too many columns, max 255, got %lld", (long long)ncols); } /* cut-3 */
+    /* Exact-size carve (cut-3): ray_distinct's n_keys parameter is uint32_t
+     * (already widened, so ncols itself is the only limit), and v2's 0-agg
+     * GROUP now serves this shape at any width (agg_v2_can_handle no longer
+     * declines n_aggs == 0 — see agg_engine.c) — the old fixed keys[255] plus
+     * its ncols > 255 range error retire with it. */
+    ray_t* keys_hdr;
+    ray_op_t** keys = (ray_op_t**)scratch_alloc(&keys_hdr, (size_t)ncols * sizeof(ray_op_t*));
+    if (!keys) { ray_graph_free(g); return ray_error("oom", NULL); }
 
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name_id = ray_table_col_name(tbl, c);
         ray_t* name_str = ray_sym_str(name_id);
-        if (!name_str) { ray_graph_free(g); return ray_error("domain", "table-distinct: column name symbol not found at index %lld", (long long)c); }
+        if (!name_str) { scratch_free(keys_hdr); ray_graph_free(g); return ray_error("domain", "table-distinct: column name symbol not found at index %lld", (long long)c); }
         keys[c] = ray_scan(g, ray_str_ptr(name_str));
-        if (!keys[c]) { ray_graph_free(g); return ray_error("oom", NULL); }
+        if (!keys[c]) { scratch_free(keys_hdr); ray_graph_free(g); return ray_error("oom", NULL); }
     }
 
     ray_op_t* root = ray_distinct(g, keys, (uint32_t)ncols);
+    scratch_free(keys_hdr);
     if (!root) { ray_graph_free(g); return ray_error("oom", NULL); }
 
     ray_t* result = ray_execute(g, root);
