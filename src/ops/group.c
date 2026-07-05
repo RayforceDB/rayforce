@@ -6928,10 +6928,13 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         agg_owned[a] = 1;
     }
 
-    /* Pre-compute key metadata (VLA — n_keys ≤ 8; vla_keys ≥ 1) */
-    void* key_data[vla_keys];
-    int8_t key_types[vla_keys];
-    uint8_t key_attrs[vla_keys];
+    /* Pre-compute key metadata.  Fixed [8], not VLA: the ~6713 guard above
+     * (`n_keys > 8 || ...`) caps n_keys <= 8 on this path, but under -O3 gcc's
+     * range analysis can't chain that bound through a VLA sized off vla_keys
+     * to prove `k < n_keys` writes stay in-bounds (-Wstringop-overflow). */
+    void* key_data[8];
+    int8_t key_types[8];
+    uint8_t key_attrs[8];
     for (uint32_t k = 0; k < n_keys; k++) {
         if (key_vecs[k]) {
             key_data[k]  = ray_data(key_vecs[k]);
@@ -10263,19 +10266,26 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
             part_ops[a] = aop;
         }
     }
+    /* Redundant with n_aggs <= 8 (guard above): makes the [8] slot-array
+     * bounds provable for the optimizer's range analysis. */
+    if (n_avg > 8 || n_std > 8) return NULL;
     /* Guard: total decomposed slots must fit */
     if (n_aggs + n_avg + 2 * n_std > 24) return NULL;
 
-    /* Append SUM(x²) for each STDDEV/VAR slot */
-    for (uint32_t i = 0; i < n_std; i++) {
+    /* Append SUM(x²) for each STDDEV/VAR slot.  The `&& i < 8` conjunct is
+     * redundant with the n_std <= 8 guard above (dead by construction) but
+     * gives the optimizer's range analysis a literal bound it can chain
+     * straight to the std_sq_slot[8]/std_cnt_slot[8] writes below, which it
+     * otherwise can't prove under -O3 (-Wstringop-overflow false positive). */
+    for (uint32_t i = 0; i < n_std && i < 8; i++) {
         std_sq_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = OP_SUM;  /* SUM(x²) */
     }
     /* Append COUNT for each AVG column */
     for (uint32_t i = 0; i < n_avg; i++)
         part_ops[part_n_aggs++] = OP_COUNT;
-    /* Append COUNT for each STDDEV/VAR column */
-    for (uint32_t i = 0; i < n_std; i++) {
+    /* Append COUNT for each STDDEV/VAR column (see the `&& i < 8` note above) */
+    for (uint32_t i = 0; i < n_std && i < 8; i++) {
         std_cnt_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = OP_COUNT;
     }
