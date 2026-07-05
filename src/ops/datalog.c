@@ -2388,13 +2388,9 @@ static ray_t* table_distinct(ray_t* tbl) {
 
     int64_t ncols = ray_table_ncols(tbl);
     if (ncols <= 0) { ray_retain(tbl); return tbl; }
-    /* keys[] is fixed at DL_MAX_ARITY (dl_rule_add_atom rejects over-arity
-     * atoms the same way); a relation admitted via dl-add-edb with a
-     * caller-supplied arity is not clamped there, so surface an error here
-     * rather than silently deduping on a truncated key prefix. */
     /* keys[] is fixed at DL_MAX_ARITY; the primary gate is dl_add_edb's
-     * admission rejection (lines 101–104), but we defend in depth: if a table
-     * somehow exceeds that bound, reject here rather than silently deduping on
+     * admission rejection, but we defend in depth: if a table somehow
+     * exceeds that bound, reject here rather than silently deduping on
      * a truncated key prefix. */
     if (ncols > DL_MAX_ARITY)
         return ray_error("domain", "table_distinct: table has %lld cols, exceeds DL_MAX_ARITY=%d",
@@ -2442,7 +2438,7 @@ static ray_t* table_antijoin(ray_t* left, ray_t* right) {
     int64_t ncols = ray_table_ncols(left);
     if (ncols <= 0) { ray_retain(left); return left; }
     /* lkeys/rkeys are fixed at DL_MAX_ARITY; the primary gate is
-     * dl_add_edb's admission rejection (lines 101–104), but we defend in
+     * dl_add_edb's admission rejection, but we defend in
      * depth: if a table somehow exceeds that bound, reject here rather than
      * silently anti-joining on a truncated key prefix. */
     if (ncols > DL_MAX_ARITY)

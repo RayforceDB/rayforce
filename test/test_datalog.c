@@ -2436,7 +2436,7 @@ static test_result_t test_rule_add_interval_overflow(void) {
 }
 
 /* Regression test for over-arity domain guard: tables with ncols > DL_MAX_ARITY
- * (16) trigger admission rejection at dl_add_edb (lines 101–104) to prevent
+ * (16) trigger admission rejection at dl_add_edb to prevent
  * uninitialized keys[16..] in table_distinct/table_antijoin and wrong-answer
  * bugs from silent truncation. The guard is defended in depth with secondary
  * checks in table_distinct/table_antijoin.
