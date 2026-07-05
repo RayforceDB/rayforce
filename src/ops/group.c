@@ -254,6 +254,23 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             REDUCE_LOOP_F(base, start, end, acc, 1, 1, idx); \
     } while (0)
 
+/* Pin the keyless reduction kernel's hot-loop/jump alignment.  This kernel's
+ * tight inner reduction loops are alignment-fragile on 32-byte-fetch cores (DSB
+ * / JCC-erratum class): as the branch as a whole grows, .o files linked
+ * before group.o shift reduce_range's ABSOLUTE address (it is early in the TU,
+ * so the shift is cumulative binary-layout, not a group.c edit), which moved
+ * its hot I64 loop off its 32-byte boundary and dropped IPC 1.56→1.01 on q03/
+ * q02 (+48% cycles, byte-identical instructions) — RCA task-9.  Entry alignment
+ * is NOT the lever (the loop's offset from entry is fixed, so its absolute
+ * alignment tracks the entry's low bits).  `align-loops=32` re-pins every loop
+ * head AND `align-jumps=32` re-pins the branch targets inside the unrolled
+ * reduction (the min/max-update return path) — both are needed: loops alone
+ * only recovered ~⅔ of the gap (IPC 1.37); adding jump alignment restores full
+ * parity.  Now the hot loop's internal alignment is invariant to reduce_range's
+ * absolute address, so future binary-layout churn can no longer reshuffle it
+ * onto a bad boundary.  aligned(64) keeps the entry cacheline-stable too.
+ * Per-function attributes only — no global codegen flag, no -m target hack. */
+__attribute__((aligned(64), optimize("align-loops=32","align-jumps=32")))
 static void reduce_range(ray_t* input, int64_t start, int64_t end,
                          reduce_acc_t* acc, bool has_nulls,
                          const int64_t* idx) {
