@@ -6758,34 +6758,41 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
     }
 
-    /* Resolve agg input columns (VLA; use ≥1 to avoid zero-size VLA UB).
-     * n_aggs is ≤ 8 here whenever n_keys > 0 (the 6684 guard), but the
-     * keyless path (n_keys == 0) admits any n_aggs up to the query.c
-     * compile-side cap (255 today) — these arrays scale with it.  Not
-     * carved in this pass: Task 2 scoped the keyless-VLA carve to the
-     * scalar fast path's own per-agg cluster below (sc_vla_hdr); revisit
-     * this shared preamble when the 255 cap is lifted (cut 3/4). */
+    /* Resolve agg input columns.  n_aggs is ≤ 8 here whenever n_keys > 0
+     * (the 6713 guard), but the keyless path (n_keys == 0) admits any
+     * n_aggs — the cut-2 flip lifted query.c's 255 compile cap — so these
+     * per-agg arrays scale with the query and must not sit on the stack.
+     * One consolidated scratch carve: the two ray_t* arrays first, then the
+     * affine/linear/prod structs (all int64/pointer-backed, so 8-aligned and
+     * multiple-of-8 sized), then the three byte-flag arrays last.  Second
+     * input column (agg_vecs2) is non-NULL only for binary aggs
+     * (OP_PEARSON_CORR); it carries its own agg_owned2 because each side can
+     * come from a different source (OP_SCAN literal or expr_compile).
+     * calloc-zeroed: the cleanup loop reads agg_owned/agg_vecs slots the
+     * resolve loop may leave unwritten on an early error, and the
+     * *_affine/_linear/_prod `.enabled` fields must default false.
+     * vla_aggs ≥ 1 avoids a zero-size carve.  vla_hdr is freed at every
+     * function exit (each early return's manual-cleanup block and the shared
+     * `cleanup:` label). */
     uint32_t vla_aggs = n_aggs > 0 ? n_aggs : 1;
-    ray_t* agg_vecs[vla_aggs];
-    /* Second input column per agg — non-NULL only for binary aggs
-     * (OP_PEARSON_CORR).  Allocated independently of agg_vecs because
-     * agg_owned2 may differ (each side can come from a different source
-     * — OP_SCAN literal or expr_compile). */
-    ray_t* agg_vecs2[vla_aggs];
-    uint8_t agg_owned[vla_aggs]; /* 1 = we allocated via exec_node, must free */
-    uint8_t agg_owned2[vla_aggs];
-    uint8_t agg_strlen[vla_aggs];
-    agg_affine_t agg_affine[vla_aggs];
-    agg_linear_t agg_linear[vla_aggs];
-    agg_prod_t   agg_prod[vla_aggs];
-    memset(agg_vecs, 0, vla_aggs * sizeof(ray_t*));
-    memset(agg_vecs2, 0, vla_aggs * sizeof(ray_t*));
-    memset(agg_owned, 0, vla_aggs * sizeof(uint8_t));
-    memset(agg_owned2, 0, vla_aggs * sizeof(uint8_t));
-    memset(agg_strlen, 0, vla_aggs * sizeof(uint8_t));
-    memset(agg_affine, 0, vla_aggs * sizeof(agg_affine_t));
-    memset(agg_linear, 0, vla_aggs * sizeof(agg_linear_t));
-    memset(agg_prod,   0, vla_aggs * sizeof(agg_prod_t));
+    ray_t* vla_hdr = NULL;
+    size_t vla_bytes = (size_t)vla_aggs * (2 * sizeof(ray_t*)
+                        + sizeof(agg_affine_t) + sizeof(agg_linear_t)
+                        + sizeof(agg_prod_t) + 3 * sizeof(uint8_t));
+    uint8_t* vla_blk = (uint8_t*)scratch_calloc(&vla_hdr, vla_bytes);
+    if (!vla_blk) {
+        for (uint32_t k = 0; k < n_keys; k++)
+            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+        return ray_error("oom", NULL);
+    }
+    ray_t**       agg_vecs   = (ray_t**)vla_blk;
+    ray_t**       agg_vecs2  = agg_vecs + vla_aggs;
+    agg_affine_t* agg_affine = (agg_affine_t*)(agg_vecs2 + vla_aggs);
+    agg_linear_t* agg_linear = (agg_linear_t*)(agg_affine + vla_aggs);
+    agg_prod_t*   agg_prod   = (agg_prod_t*)(agg_linear + vla_aggs);
+    uint8_t*      agg_owned  = (uint8_t*)(agg_prod + vla_aggs);
+    uint8_t*      agg_owned2 = agg_owned + vla_aggs;
+    uint8_t*      agg_strlen = agg_owned2 + vla_aggs;
 
     for (uint32_t a = 0; a < n_aggs; a++) {
         ray_op_t* agg_input_op = op_node(g, ext->agg_ins[a]);
@@ -6846,6 +6853,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     { if (agg_owned[i] && agg_vecs[i]) ray_release(agg_vecs[i]); if (agg_owned2[i] && agg_vecs2[i]) ray_release(agg_vecs2[i]); }
                 for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                scratch_free(vla_hdr);
                 return vec;
             }
             if (vec) {
@@ -6889,6 +6897,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                             { if (agg_owned[i] && agg_vecs[i]) ray_release(agg_vecs[i]); if (agg_owned2[i] && agg_vecs2[i]) ray_release(agg_vecs2[i]); }
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        scratch_free(vla_hdr);
                         return vec;
                     }
                     if (vec) {
@@ -6920,6 +6929,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             for (uint32_t k = 0; k < n_keys; k++) {
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
             }
+            scratch_free(vla_hdr);
             return bcast && RAY_IS_ERR(bcast) ? bcast : ray_error("oom", NULL);
         }
 
@@ -7001,7 +7011,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
             for (uint32_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-            if (match_idx_block) ray_release(match_idx_block);
+            if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
             return ray_error("oom", NULL);
         }
         void*    *agg_ptrs             = (void**)sc_blk;
@@ -7251,7 +7261,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
             for (uint32_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-            if (match_idx_block) ray_release(match_idx_block);
+            if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
             return result ? result : ray_error("oom", NULL);
         }
 
@@ -7347,7 +7357,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
         for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-        if (match_idx_block) ray_release(match_idx_block);
+        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
         return result;
     }
 
@@ -7970,7 +7980,7 @@ da_path:;
                     { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
                 for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                if (match_idx_block) ray_release(match_idx_block);
+                if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                 return result ? result : ray_error("oom", NULL);
             }
 
@@ -8049,7 +8059,7 @@ da_path:;
                 { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
             for (uint32_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-            if (match_idx_block) ray_release(match_idx_block);
+            if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
             return result;
         }
     }
@@ -8249,7 +8259,7 @@ dyn_dense_done:
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                        if (match_idx_block) ray_release(match_idx_block);
+                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return result ? result : ray_error("oom", NULL);
                     }
 
@@ -8265,7 +8275,7 @@ dyn_dense_done:
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                        if (match_idx_block) ray_release(match_idx_block);
+                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return key_col ? key_col : ray_error("oom", NULL);
                     }
                     key_col->len = (int64_t)grp_count;
@@ -8285,7 +8295,7 @@ dyn_dense_done:
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                        if (match_idx_block) ray_release(match_idx_block);
+                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return ray_error("oom", NULL);
                     }
                     if (sp_need_sum && !range_sum)
@@ -8380,7 +8390,7 @@ dyn_dense_done:
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                     for (uint32_t k = 0; k < n_keys; k++)
                         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                    if (match_idx_block) ray_release(match_idx_block);
+                    if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                     return result;
                 }
 
@@ -8476,7 +8486,7 @@ dyn_dense_done:
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                        if (match_idx_block) ray_release(match_idx_block);
+                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return result ? result : ray_error("oom", NULL);
                     }
 
@@ -8493,7 +8503,7 @@ dyn_dense_done:
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                        if (match_idx_block) ray_release(match_idx_block);
+                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return key_col ? key_col : ray_error("oom", NULL);
                     }
                     key_col->len = (int64_t)grp_count;
@@ -8513,7 +8523,7 @@ dyn_dense_done:
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                        if (match_idx_block) ray_release(match_idx_block);
+                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return ray_error("oom", NULL);
                     }
 
@@ -8584,7 +8594,7 @@ dyn_dense_done:
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                     for (uint32_t k = 0; k < n_keys; k++)
                         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                    if (match_idx_block) ray_release(match_idx_block);
+                    if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                     return result;
                 }
             }
@@ -8676,7 +8686,7 @@ dyn_dense_done:
                     if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                 for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                if (match_idx_block) ray_release(match_idx_block);
+                if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                 return result ? result : ray_error("oom", NULL);
             }
 
@@ -8692,7 +8702,7 @@ dyn_dense_done:
                     if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                 for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                if (match_idx_block) ray_release(match_idx_block);
+                if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                 return key_col ? key_col : ray_error("oom", NULL);
             }
             key_col->len = (int64_t)grp_count;
@@ -8712,7 +8722,7 @@ dyn_dense_done:
                     if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                 for (uint32_t k = 0; k < n_keys; k++)
                     if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                if (match_idx_block) ray_release(match_idx_block);
+                if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                 return ray_error("oom", NULL);
             }
             if (use_emit_filter && sp_need_sum)
@@ -8729,7 +8739,7 @@ dyn_dense_done:
                         if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                     for (uint32_t k = 0; k < n_keys; k++)
                         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                    if (match_idx_block) ray_release(match_idx_block);
+                    if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                     return ray_error("oom", NULL);
                 }
             }
@@ -8752,7 +8762,7 @@ dyn_dense_done:
                             if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
                         for (uint32_t k = 0; k < n_keys; k++)
                             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                        if (match_idx_block) ray_release(match_idx_block);
+                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
                         return ray_error("oom", NULL);
                     }
                     heavy_ht.counts[hslot] = gi;
@@ -8810,7 +8820,7 @@ dyn_dense_done:
                 if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
             for (uint32_t k = 0; k < n_keys; k++)
                 if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-            if (match_idx_block) ray_release(match_idx_block);
+            if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
             return result;
         }
     }
@@ -8829,7 +8839,7 @@ ht_path:;
               if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
         for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-        if (match_idx_block) ray_release(match_idx_block);
+        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
         return ray_error("nyi", NULL);
     }
     /* The HT row-layout reads agg_vecs directly — convert any fused-product
@@ -8841,7 +8851,7 @@ ht_path:;
               if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
         for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-        if (match_idx_block) ray_release(match_idx_block);
+        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
         return ray_error("oom", NULL);
     }
 
@@ -10178,7 +10188,7 @@ cleanup:
         { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]); if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
     for (uint32_t k = 0; k < n_keys; k++)
         if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-    if (match_idx_block) ray_release(match_idx_block);
+    if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
 
     /* No explicit GC — top-level statement runner (run_piped / repl)
      * calls ray_heap_gc() once per statement, catching every
