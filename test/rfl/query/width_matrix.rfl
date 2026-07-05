@@ -306,23 +306,15 @@
 (sum (at r48 's33)) -- 4895
 
 ;; ── raw sym-vector by:, GENUINE regression probe: a 17-key raw sym-vector
-;; `by: ['k1 'k2 ... 'k17]` (NOT a by-dict {k1: k1 ...}) skips query.c's
-;; by-dict "1..16 keys" gate entirely — that gate lives inside the
-;; `by_expr->type == RAY_DICT` block (~query.c:5194/5202) and never runs for
-;; a `by_expr->type == RAY_SYM` shape. The sym-vector form instead reaches
-;; the keys-only-distinct routing (~query.c:6269), which called
-;; agg_select_distinct -> agg_group_keys (src/ops/agg_engine.c) filling a
-;; fixed `const void* data[16]` with no bound of its own beyond a uint8_t
-;; count — 17 keys overflowed it. ASan: stack-buffer-overflow WRITE in
-;; agg_group_keys agg_engine.c:3016, via agg_select_distinct agg_engine.c:3121,
-;; via ray_select query.c:6348. Fixed by gating query.c's distinct-admission
-;; check at `nk > 16` (~query.c:6338, was `nk > UINT8_MAX`) so 17+-key
-;; sym-vector by: shapes fall through to the composite (unbounded) grouping
-;; path below instead of the fixed-size fast path. The real bound is
-;; agg_group_keys' fixed data[16] (agg_engine.c) — cut-3 lifts it via a carve.
-;; Oracle: 17 int columns k01..k17, each [1 1 2] (3 rows) — every key column
-;; is identical, so there are exactly 2 distinct group tuples; the composite
-;; path (verified empirically post-fix) answers this correctly.
+;; `by: ['k1 'k2 ... 'k17]` reaches the keys-only-distinct fast path
+;; (agg_select_distinct -> agg_group_keys, src/ops/agg_engine.c).  Before cut-3
+;; that path filled a fixed `const void* data[16]` behind a uint8_t count, so
+;; 17 keys overran it (ASan stack-buffer-overflow), and query.c gated it off at
+;; `nk > 16` to divert 17+ keys to the composite grouper.  Cut-3 makes
+;; agg_group_keys carve its key-data table and take a uint32_t key count, and
+;; drops that query.c gate — so this now takes the FAST distinct grouper at any
+;; key count, no diversion.  Oracle: 17 int columns k01..k17, each [1 1 2]
+;; (3 rows) — every key column is identical, so exactly 2 distinct group tuples.
 (set t17 (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2])))
 (set r17 (select {from: t17 by: ['k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16 'k17]}))
 (count (at r17 'k17)) -- 2
@@ -335,6 +327,43 @@
 (set r16v (select {from: t16v by: ['k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16]}))
 (count (at r16v 'k16)) -- 2
 
+;; ── raw sym-vector by:, 256-key distinct SENTINEL: exactly the uint8 wrap
+;; boundary.  agg_select_distinct / agg_group_keys take a uint32_t key count
+;; (cut-3); a residual uint8_t truncation would read 256 -> 0 keys and collapse
+;; every row into one group (dropping 'k255 entirely), so 2 distinct tuples
+;; over 256 identical [1 1 2] key columns pins the widening.  Columns built via
+;; take (list builder caps at 64 args); the name/sym vectors are lexer-parsed. ──
+(set t256v (table [k000 k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255] (take (list [1 1 2]) 256)))
+(set r256v (select {from: t256v by: ['k000 'k001 'k002 'k003 'k004 'k005 'k006 'k007 'k008 'k009 'k010 'k011 'k012 'k013 'k014 'k015 'k016 'k017 'k018 'k019 'k020 'k021 'k022 'k023 'k024 'k025 'k026 'k027 'k028 'k029 'k030 'k031 'k032 'k033 'k034 'k035 'k036 'k037 'k038 'k039 'k040 'k041 'k042 'k043 'k044 'k045 'k046 'k047 'k048 'k049 'k050 'k051 'k052 'k053 'k054 'k055 'k056 'k057 'k058 'k059 'k060 'k061 'k062 'k063 'k064 'k065 'k066 'k067 'k068 'k069 'k070 'k071 'k072 'k073 'k074 'k075 'k076 'k077 'k078 'k079 'k080 'k081 'k082 'k083 'k084 'k085 'k086 'k087 'k088 'k089 'k090 'k091 'k092 'k093 'k094 'k095 'k096 'k097 'k098 'k099 'k100 'k101 'k102 'k103 'k104 'k105 'k106 'k107 'k108 'k109 'k110 'k111 'k112 'k113 'k114 'k115 'k116 'k117 'k118 'k119 'k120 'k121 'k122 'k123 'k124 'k125 'k126 'k127 'k128 'k129 'k130 'k131 'k132 'k133 'k134 'k135 'k136 'k137 'k138 'k139 'k140 'k141 'k142 'k143 'k144 'k145 'k146 'k147 'k148 'k149 'k150 'k151 'k152 'k153 'k154 'k155 'k156 'k157 'k158 'k159 'k160 'k161 'k162 'k163 'k164 'k165 'k166 'k167 'k168 'k169 'k170 'k171 'k172 'k173 'k174 'k175 'k176 'k177 'k178 'k179 'k180 'k181 'k182 'k183 'k184 'k185 'k186 'k187 'k188 'k189 'k190 'k191 'k192 'k193 'k194 'k195 'k196 'k197 'k198 'k199 'k200 'k201 'k202 'k203 'k204 'k205 'k206 'k207 'k208 'k209 'k210 'k211 'k212 'k213 'k214 'k215 'k216 'k217 'k218 'k219 'k220 'k221 'k222 'k223 'k224 'k225 'k226 'k227 'k228 'k229 'k230 'k231 'k232 'k233 'k234 'k235 'k236 'k237 'k238 'k239 'k240 'k241 'k242 'k243 'k244 'k245 'k246 'k247 'k248 'k249 'k250 'k251 'k252 'k253 'k254 'k255]}))
+(count (at r256v 'k255)) -- 2
+(at r256v 'k000) -- [1 2]
+(at r256v 'k255) -- [1 2]
+
+;; ── 300-key by-DICT with a sum agg: 299 constant keys k000..k298 (all 1) +
+;; a discriminator key disc, plus sm: (sum v).  Bare-ref keys are OP_SCANs and
+;; an agg is present, so this routes through the DAG GROUP -> v2 agg engine
+;; (not the distinct path).  Serial exec_group_v2_run at nrows=2 exercises its
+;; carved key_cols[] and agg_group_keys' carved key-data table at 300 keys.
+;; The disc key sits at tuple position 299 (>255): a mod-256 key count would
+;; stop before it and MERGE the two rows into one group, so count 2 and
+;; sum [10 30] both break under any uint8 wrap.  Table built via take/concat. ──
+(set t300d (table [k000 k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 k256 k257 k258 k259 k260 k261 k262 k263 k264 k265 k266 k267 k268 k269 k270 k271 k272 k273 k274 k275 k276 k277 k278 k279 k280 k281 k282 k283 k284 k285 k286 k287 k288 k289 k290 k291 k292 k293 k294 k295 k296 k297 k298 disc v] (concat (take (list [1 1]) 299) (list [1 2] [10 30]))))
+(set r300d (select {from: t300d sm: (sum v) by: {k000: k000 k001: k001 k002: k002 k003: k003 k004: k004 k005: k005 k006: k006 k007: k007 k008: k008 k009: k009 k010: k010 k011: k011 k012: k012 k013: k013 k014: k014 k015: k015 k016: k016 k017: k017 k018: k018 k019: k019 k020: k020 k021: k021 k022: k022 k023: k023 k024: k024 k025: k025 k026: k026 k027: k027 k028: k028 k029: k029 k030: k030 k031: k031 k032: k032 k033: k033 k034: k034 k035: k035 k036: k036 k037: k037 k038: k038 k039: k039 k040: k040 k041: k041 k042: k042 k043: k043 k044: k044 k045: k045 k046: k046 k047: k047 k048: k048 k049: k049 k050: k050 k051: k051 k052: k052 k053: k053 k054: k054 k055: k055 k056: k056 k057: k057 k058: k058 k059: k059 k060: k060 k061: k061 k062: k062 k063: k063 k064: k064 k065: k065 k066: k066 k067: k067 k068: k068 k069: k069 k070: k070 k071: k071 k072: k072 k073: k073 k074: k074 k075: k075 k076: k076 k077: k077 k078: k078 k079: k079 k080: k080 k081: k081 k082: k082 k083: k083 k084: k084 k085: k085 k086: k086 k087: k087 k088: k088 k089: k089 k090: k090 k091: k091 k092: k092 k093: k093 k094: k094 k095: k095 k096: k096 k097: k097 k098: k098 k099: k099 k100: k100 k101: k101 k102: k102 k103: k103 k104: k104 k105: k105 k106: k106 k107: k107 k108: k108 k109: k109 k110: k110 k111: k111 k112: k112 k113: k113 k114: k114 k115: k115 k116: k116 k117: k117 k118: k118 k119: k119 k120: k120 k121: k121 k122: k122 k123: k123 k124: k124 k125: k125 k126: k126 k127: k127 k128: k128 k129: k129 k130: k130 k131: k131 k132: k132 k133: k133 k134: k134 k135: k135 k136: k136 k137: k137 k138: k138 k139: k139 k140: k140 k141: k141 k142: k142 k143: k143 k144: k144 k145: k145 k146: k146 k147: k147 k148: k148 k149: k149 k150: k150 k151: k151 k152: k152 k153: k153 k154: k154 k155: k155 k156: k156 k157: k157 k158: k158 k159: k159 k160: k160 k161: k161 k162: k162 k163: k163 k164: k164 k165: k165 k166: k166 k167: k167 k168: k168 k169: k169 k170: k170 k171: k171 k172: k172 k173: k173 k174: k174 k175: k175 k176: k176 k177: k177 k178: k178 k179: k179 k180: k180 k181: k181 k182: k182 k183: k183 k184: k184 k185: k185 k186: k186 k187: k187 k188: k188 k189: k189 k190: k190 k191: k191 k192: k192 k193: k193 k194: k194 k195: k195 k196: k196 k197: k197 k198: k198 k199: k199 k200: k200 k201: k201 k202: k202 k203: k203 k204: k204 k205: k205 k206: k206 k207: k207 k208: k208 k209: k209 k210: k210 k211: k211 k212: k212 k213: k213 k214: k214 k215: k215 k216: k216 k217: k217 k218: k218 k219: k219 k220: k220 k221: k221 k222: k222 k223: k223 k224: k224 k225: k225 k226: k226 k227: k227 k228: k228 k229: k229 k230: k230 k231: k231 k232: k232 k233: k233 k234: k234 k235: k235 k236: k236 k237: k237 k238: k238 k239: k239 k240: k240 k241: k241 k242: k242 k243: k243 k244: k244 k245: k245 k246: k246 k247: k247 k248: k248 k249: k249 k250: k250 k251: k251 k252: k252 k253: k253 k254: k254 k255: k255 k256: k256 k257: k257 k258: k258 k259: k259 k260: k260 k261: k261 k262: k262 k263: k263 k264: k264 k265: k265 k266: k266 k267: k267 k268: k268 k269: k269 k270: k270 k271: k271 k272: k272 k273: k273 k274: k274 k275: k275 k276: k276 k277: k277 k278: k278 k279: k279 k280: k280 k281: k281 k282: k282 k283: k283 k284: k284 k285: k285 k286: k286 k287: k287 k288: k288 k289: k289 k290: k290 k291: k291 k292: k292 k293: k293 k294: k294 k295: k295 k296: k296 k297: k297 k298: k298 disc: disc}}))
+(count (at r300d 'disc)) -- 2
+(at r300d 'disc) -- [1 2]
+(at r300d 'sm) -- [10 30]
+
+;; ── 17-key PARALLEL radix scatter: >16 keys through the high-row v2 path that
+;; packs each row's keys via the per-worker kv-staging carve (agg_engine.c
+;; agg_radix_scatter_one).  k00 is unique per row (70000 distinct) so the card
+;; estimate exceeds T_ROUTE and the router takes exec_group_v2_parallel_radix;
+;; k01..k16 are constant.  Every group has one member, so sum(v)=that row's v;
+;; summed over all groups = sum(til 70000) = 69999*70000/2 = 2449965000, with
+;; exactly 70000 groups.  Guards the unbounded-key radix kv carve under ASan. ──
+(set t17r (table [k00 k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 v] (list (til 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (take [1] 70000) (til 70000))))
+(set r17r (select {from: t17r sm: (sum v) by: ['k00 'k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16]}))
+(count (at r17r 'k00)) -- 70000
+(sum (at r17r 'sm)) -- 2449965000
 ;; ── asof/window-join right-column overflow, GENUINE regression probe:
 ;; exec_window_join's right_out_idx[] (src/ops/join.c) was a fixed
 ;; int64_t[256] filled by a loop over the RIGHT table's column count
@@ -645,11 +674,16 @@
 (update {from: 'uup c000: (+ c000 1) c001: (+ c001 1) c002: (+ c002 1) c003: (+ c003 1) c004: (+ c004 1) c005: (+ c005 1) c006: (+ c006 1) c007: (+ c007 1) c008: (+ c008 1) c009: (+ c009 1) c010: (+ c010 1) c011: (+ c011 1) c012: (+ c012 1) c013: (+ c013 1) c014: (+ c014 1) c015: (+ c015 1) c016: (+ c016 1) c017: (+ c017 1) c018: (+ c018 1) c019: (+ c019 1) c020: (+ c020 1) c021: (+ c021 1) c022: (+ c022 1) c023: (+ c023 1) c024: (+ c024 1) c025: (+ c025 1) c026: (+ c026 1) c027: (+ c027 1) c028: (+ c028 1) c029: (+ c029 1) c030: (+ c030 1) c031: (+ c031 1) c032: (+ c032 1) c033: (+ c033 1) c034: (+ c034 1) c035: (+ c035 1) c036: (+ c036 1) c037: (+ c037 1) c038: (+ c038 1) c039: (+ c039 1) c040: (+ c040 1) c041: (+ c041 1) c042: (+ c042 1) c043: (+ c043 1) c044: (+ c044 1) c045: (+ c045 1) c046: (+ c046 1) c047: (+ c047 1) c048: (+ c048 1) c049: (+ c049 1) c050: (+ c050 1) c051: (+ c051 1) c052: (+ c052 1) c053: (+ c053 1) c054: (+ c054 1) c055: (+ c055 1) c056: (+ c056 1) c057: (+ c057 1) c058: (+ c058 1) c059: (+ c059 1) c060: (+ c060 1) c061: (+ c061 1) c062: (+ c062 1) c063: (+ c063 1) c064: (+ c064 1) c065: (+ c065 1) c066: (+ c066 1) c067: (+ c067 1) c068: (+ c068 1) c069: (+ c069 1) c070: (+ c070 1) c071: (+ c071 1) c072: (+ c072 1) c073: (+ c073 1) c074: (+ c074 1) c075: (+ c075 1) c076: (+ c076 1) c077: (+ c077 1) c078: (+ c078 1) c079: (+ c079 1) c080: (+ c080 1) c081: (+ c081 1) c082: (+ c082 1) c083: (+ c083 1) c084: (+ c084 1) c085: (+ c085 1) c086: (+ c086 1) c087: (+ c087 1) c088: (+ c088 1) c089: (+ c089 1) c090: (+ c090 1) c091: (+ c091 1) c092: (+ c092 1) c093: (+ c093 1) c094: (+ c094 1) c095: (+ c095 1) c096: (+ c096 1) c097: (+ c097 1) c098: (+ c098 1) c099: (+ c099 1) c100: (+ c100 1) c101: (+ c101 1) c102: (+ c102 1) c103: (+ c103 1) c104: (+ c104 1) c105: (+ c105 1) c106: (+ c106 1) c107: (+ c107 1) c108: (+ c108 1) c109: (+ c109 1) c110: (+ c110 1) c111: (+ c111 1) c112: (+ c112 1) c113: (+ c113 1) c114: (+ c114 1) c115: (+ c115 1) c116: (+ c116 1) c117: (+ c117 1) c118: (+ c118 1) c119: (+ c119 1) c120: (+ c120 1) c121: (+ c121 1) c122: (+ c122 1) c123: (+ c123 1) c124: (+ c124 1) c125: (+ c125 1) c126: (+ c126 1) c127: (+ c127 1) c128: (+ c128 1) c129: (+ c129 1) c130: (+ c130 1) c131: (+ c131 1) c132: (+ c132 1) c133: (+ c133 1) c134: (+ c134 1) c135: (+ c135 1) c136: (+ c136 1) c137: (+ c137 1) c138: (+ c138 1) c139: (+ c139 1) c140: (+ c140 1) c141: (+ c141 1) c142: (+ c142 1) c143: (+ c143 1) c144: (+ c144 1) c145: (+ c145 1) c146: (+ c146 1) c147: (+ c147 1) c148: (+ c148 1) c149: (+ c149 1) c150: (+ c150 1) c151: (+ c151 1) c152: (+ c152 1) c153: (+ c153 1) c154: (+ c154 1) c155: (+ c155 1) c156: (+ c156 1) c157: (+ c157 1) c158: (+ c158 1) c159: (+ c159 1) c160: (+ c160 1) c161: (+ c161 1) c162: (+ c162 1) c163: (+ c163 1) c164: (+ c164 1) c165: (+ c165 1) c166: (+ c166 1) c167: (+ c167 1) c168: (+ c168 1) c169: (+ c169 1) c170: (+ c170 1) c171: (+ c171 1) c172: (+ c172 1) c173: (+ c173 1) c174: (+ c174 1) c175: (+ c175 1) c176: (+ c176 1) c177: (+ c177 1) c178: (+ c178 1) c179: (+ c179 1) c180: (+ c180 1) c181: (+ c181 1) c182: (+ c182 1) c183: (+ c183 1) c184: (+ c184 1) c185: (+ c185 1) c186: (+ c186 1) c187: (+ c187 1) c188: (+ c188 1) c189: (+ c189 1) c190: (+ c190 1) c191: (+ c191 1) c192: (+ c192 1) c193: (+ c193 1) c194: (+ c194 1) c195: (+ c195 1) c196: (+ c196 1) c197: (+ c197 1) c198: (+ c198 1) c199: (+ c199 1) c200: (+ c200 1) c201: (+ c201 1) c202: (+ c202 1) c203: (+ c203 1) c204: (+ c204 1) c205: (+ c205 1) c206: (+ c206 1) c207: (+ c207 1) c208: (+ c208 1) c209: (+ c209 1) c210: (+ c210 1) c211: (+ c211 1) c212: (+ c212 1) c213: (+ c213 1) c214: (+ c214 1) c215: (+ c215 1) c216: (+ c216 1) c217: (+ c217 1) c218: (+ c218 1) c219: (+ c219 1) c220: (+ c220 1) c221: (+ c221 1) c222: (+ c222 1) c223: (+ c223 1) c224: (+ c224 1) c225: (+ c225 1) c226: (+ c226 1) c227: (+ c227 1) c228: (+ c228 1) c229: (+ c229 1) c230: (+ c230 1) c231: (+ c231 1) c232: (+ c232 1) c233: (+ c233 1) c234: (+ c234 1) c235: (+ c235 1) c236: (+ c236 1) c237: (+ c237 1) c238: (+ c238 1) c239: (+ c239 1) c240: (+ c240 1) c241: (+ c241 1) c242: (+ c242 1) c243: (+ c243 1) c244: (+ c244 1) c245: (+ c245 1) c246: (+ c246 1) c247: (+ c247 1) c248: (+ c248 1) c249: (+ c249 1) c250: (+ c250 1) c251: (+ c251 1) c252: (+ c252 1) c253: (+ c253 1) c254: (+ c254 1) c255: (+ c255 1) c256: (+ c256 1) c257: (+ c257 1) c258: (+ c258 1) c259: (+ c259 1) c260: (+ c260 1) c261: (+ c261 1) c262: (+ c262 1) c263: (+ c263 1) c264: (+ c264 1) c265: (+ c265 1) c266: (+ c266 1) c267: (+ c267 1) c268: (+ c268 1) c269: (+ c269 1) c270: (+ c270 1) c271: (+ c271 1) c272: (+ c272 1) c273: (+ c273 1) c274: (+ c274 1) c275: (+ c275 1) c276: (+ c276 1) c277: (+ c277 1) c278: (+ c278 1) c279: (+ c279 1) c280: (+ c280 1) c281: (+ c281 1) c282: (+ c282 1) c283: (+ c283 1) c284: (+ c284 1) c285: (+ c285 1) c286: (+ c286 1) c287: (+ c287 1) c288: (+ c288 1) c289: (+ c289 1) c290: (+ c290 1) c291: (+ c291 1) c292: (+ c292 1) c293: (+ c293 1) c294: (+ c294 1) c295: (+ c295 1) c296: (+ c296 1) c297: (+ c297 1) c298: (+ c298 1) c299: (+ c299 1)})
 (sum (at uup 'c299)) -- 5
 
-;; ── F8 group-key boundary pin: a 17-key by-DICT still errors (query.c's
-;; 'by-dict must have 1..16 keys' gate at the RAY_DICT by: shape).  This is
-;; the cut-3 boundary — agg_group_keys' fixed data[16] — NOT one of the nine
-;; slot gates the cut-2 flip removes; asserted so cut 3 flips it consciously.
-;; (The 17-key raw sym-VECTOR by: form below in this file takes a different
-;; path and already works via the composite grouper.) ──
+;; ── F8 group-key admission lift: a 17-key by-DICT now GROUPS correctly (cut-3
+;; retires query.c's 'by-dict must have 1..16 keys' gate at the RAY_DICT by:
+;; shape, and agg_group_keys' data[16] became a carve).  Bare-column-ref keys
+;; are renames → the no-agg by-dict routes to the keys-only-distinct grouper.
+;; Fixture: 17 int columns k01..k17, each [1 1 2] (rows 0,1 share tuple, row 2
+;; differs) → exactly 2 distinct group tuples; each key column's first-of-group
+;; value is [1 2].  (The 17-key raw sym-VECTOR by: form above takes the same
+;; distinct grouper.) ──
 (set t17d (table [k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2])))
-(select {from: t17d by: {k01: k01 k02: k02 k03: k03 k04: k04 k05: k05 k06: k06 k07: k07 k08: k08 k09: k09 k10: k10 k11: k11 k12: k12 k13: k13 k14: k14 k15: k15 k16: k16 k17: k17}}) !- domain
+(set r17d (select {from: t17d by: {k01: k01 k02: k02 k03: k03 k04: k04 k05: k05 k06: k06 k07: k07 k08: k08 k09: k09 k10: k10 k11: k11 k12: k12 k13: k13 k14: k14 k15: k15 k16: k16 k17: k17}}))
+(count (at r17d 'k17)) -- 2
+(at r17d 'k01) -- [1 2]
+(at r17d 'k17) -- [1 2]

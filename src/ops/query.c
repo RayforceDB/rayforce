@@ -5221,16 +5221,19 @@ ray_t* ray_select(ray_t** args, int64_t n) {
      * ray_select_fn sees a standard multi-key group-by. */
     ray_t* by_sym_vec_owned = NULL;
     int64_t dep_key_base_sym = -1;
-    /* dep_key_names/biases stay fixed-size: they hold at most nk entries,
-     * and nk is already hard-bound to <=16 by the "1..16 keys" domain check
-     * below (a genuine exec-kernel key-count limit shared with
-     * agg_engine.c's own composite-key grouping, not a query.c collector
-     * artifact) — sizing from nk here would buy nothing since nk can never
-     * exceed 16, while this pair must survive across the rest of this
-     * (very long) function, so heap-carving them would need a matching
-     * scratch_free at every one of its many return sites for no benefit. */
-    int64_t dep_key_names[16];
-    int64_t dep_key_biases[16];
+    /* Dependent affine group keys (by-dict xbar-bucket shapes): unbounded now
+     * that the by-dict "1..16 keys" gate is lifted, so these can't be fixed
+     * [16].  They must survive to the post-group emit (~10130), past this
+     * function's many return sites — rather than heap-carve a pair that needs a
+     * free at each exit, they ride the sel_slots_hdr collector block carved far
+     * below (freed at every return past it).  The by-dict block collects into a
+     * transient buffer (dep_src_*) that dep_src_hdr bridges to the copy-in point
+     * where that block is carved. */
+    int64_t* dep_key_names = NULL;    /* [n_dep_keys], into sel_slots_hdr */
+    int64_t* dep_key_biases = NULL;   /* [n_dep_keys], into sel_slots_hdr */
+    ray_t*   dep_src_hdr = NULL;       /* transient collector, freed at the copy-in / early exit */
+    int64_t* dep_src_names = NULL;
+    int64_t* dep_src_biases = NULL;
     int64_t n_dep_keys = 0;
 
     /* B3 Part 2: a LITERAL scalar by-key symbol (`by: 'g`) resolves like a
@@ -5271,9 +5274,9 @@ ray_t* ray_select(ray_t** args, int64_t n) {
         }
         int64_t dlen = byv_n;
         int64_t nk = dlen / 2;
-        if (nk == 0 || nk > 16) {
+        if (nk == 0) {
             ray_release(tbl);
-            DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return ray_error("domain", "by-dict must have 1..16 keys");
+            DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return ray_error("domain", "by-dict must have at least 1 key");
         }
         ray_t** d_elems = byv;
 
@@ -5305,11 +5308,10 @@ ray_t* ray_select(ray_t** args, int64_t n) {
             dep_candidate = base_col && key_type_i64_projectable(base_col->type) &&
                             !(base_col->attrs & RAY_ATTR_HAS_NULLS);
         }
-        /* Exact-size carve: at most nk dependent-key entries can ever be
-         * collected (one per by-dict pair) — nk is already bound to ≤16 by
-         * the "1..16 keys" gate above (a genuine exec-kernel key-count
-         * limit, not a query.c collector cap), so this scratch buffer is
-         * tiny and short-lived (consumed entirely within this block). */
+        /* Exact-size carve (unbounded): at most nk dependent-key entries can
+         * ever be collected (one per by-dict pair).  On the dependent-key
+         * success path this buffer is handed to dep_src_hdr and survives to the
+         * sel_slots_hdr copy-in below; otherwise it is freed within this block. */
         ray_t* local_dep_hdr = NULL;
         int64_t* local_dep_names = NULL;
         int64_t* local_dep_biases = NULL;
@@ -5362,11 +5364,13 @@ ray_t* ray_select(ray_t** args, int64_t n) {
             by_expr = by_sym_vec_owned;
             dep_key_base_sym = base_key_name;
             n_dep_keys = local_n_dep;
-            for (int64_t i = 0; i < n_dep_keys; i++) {
-                dep_key_names[i] = local_dep_names[i];
-                dep_key_biases[i] = local_dep_biases[i];
-            }
-            scratch_free(local_dep_hdr);
+            /* Hand the collected names/biases to the function-scope bridge; the
+             * copy into the sel_slots_hdr collector block (and this buffer's
+             * free) happen once that block is carved below.  local_dep_hdr is
+             * now owned by dep_src_hdr — do NOT free it here. */
+            dep_src_hdr = local_dep_hdr;
+            dep_src_names = local_dep_names;
+            dep_src_biases = local_dep_biases;
             goto by_dict_done;
         }
         scratch_free(local_dep_hdr);
@@ -5673,6 +5677,7 @@ by_dict_done:
     /* Build DAG */
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) {
+        scratch_free(dep_src_hdr);   /* bridged dep-key collector (dep path only; NULL otherwise) */
         if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
         ray_release(tbl); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
     }
@@ -5707,14 +5712,19 @@ by_dict_done:
                          ? ray_len(by_expr) : 1;
     if (nk_max < 1) nk_max = 1;
     int64_t aggs_max = n_out_max + hidden_max;
-    /* One block for all collector arrays (8-byte elems first, uint16 tail). */
+    /* One block for all collector arrays (8-byte elems first, uint16 tail).
+     * The dependent-key names/biases (dep_key_*, at most n_dep_keys each, both
+     * int64) tail the 8-byte region so they share this block's lifetime — freed
+     * at every return past here, so no per-exit free of a separate carve. */
     ray_t* sel_slots_hdr = NULL;
     int64_t* nonagg_names = (int64_t*)scratch_alloc(&sel_slots_hdr,
         (size_t)n_out_max * (3 * sizeof(int64_t) + 2 * sizeof(ray_t*)) +
         (size_t)hidden_max * (sizeof(ray_t*) + sizeof(int64_t)) +
         (size_t)nk_max * sizeof(ray_op_t*) +
-        (size_t)aggs_max * (2 * sizeof(ray_op_t*) + sizeof(int64_t) + sizeof(uint16_t)));
+        (size_t)aggs_max * (2 * sizeof(ray_op_t*) + sizeof(int64_t) + sizeof(uint16_t)) +
+        (size_t)2 * (size_t)n_dep_keys * sizeof(int64_t));
     if (!nonagg_names) {
+        scratch_free(dep_src_hdr);
         if (by_sym_vec_owned) ray_release(by_sym_vec_owned);
         ray_graph_free(g); ray_release(tbl); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
     }
@@ -5728,7 +5738,17 @@ by_dict_done:
     ray_op_t** agg_ins        = key_ops + nk_max;
     ray_op_t** agg_ins2       = agg_ins + aggs_max;
     int64_t*   agg_k          = (int64_t*)(agg_ins2 + aggs_max);
-    uint16_t*  agg_ops        = (uint16_t*)(agg_k + aggs_max);
+    dep_key_names             = agg_k + aggs_max;          /* [n_dep_keys] */
+    dep_key_biases            = dep_key_names + n_dep_keys; /* [n_dep_keys] */
+    uint16_t*  agg_ops        = (uint16_t*)(dep_key_biases + n_dep_keys);
+    /* Copy the bridged dependent-key names/biases into this block, then release
+     * the transient collector.  n_dep_keys == 0 (non-dep path) → no-op, and
+     * dep_src_hdr stays NULL. */
+    for (int64_t i = 0; i < n_dep_keys; i++) {
+        dep_key_names[i]  = dep_src_names[i];
+        dep_key_biases[i] = dep_src_biases[i];
+    }
+    scratch_free(dep_src_hdr); dep_src_hdr = NULL;
     int64_t n_nonaggs = 0;  /* bounded by n_out_max (nonagg_names/_exprs size) */
     int     n_hidden_aggs = 0;
     int     n_compound = 0;
@@ -6418,16 +6438,12 @@ by_dict_done:
                         default: distinct_only = false; break;
                     }
                 }
-                /* agg_group_keys (called by agg_select_distinct) fills a fixed
-                 * `const void* data[16]` (agg_engine.c) — beyond 16 keys the
-                 * fast path would overrun that stack buffer, so fall through
-                 * to the composite (unbounded) path below instead. This is
-                 * the ONLY admission gate on this route: a raw sym-vector
-                 * by: (by_expr->type == RAY_SYM here) never passes through
-                 * the by-dict's own "1..16 keys" check at ~query.c:5202 —
-                 * that gate guards RAY_DICT by: shapes only. Cut-3 lifts
-                 * this once agg_group_keys' data[16] becomes a carve. */
-                if (nk > 16) distinct_only = false;
+                /* Cut-3: agg_group_keys (called by agg_select_distinct) carves
+                 * its key-data table and takes a uint32_t key count, so this
+                 * fast path serves ANY key count — no 16-key ceiling.  A raw
+                 * sym-vector by: (by_expr->type == RAY_SYM here) reaches it
+                 * regardless of the by-dict's key-count check (which guards
+                 * RAY_DICT shapes only). */
                 if (distinct_only) {
                     /* Consume the projection hint (if a consumer published one) —
                      * carry only its referenced non-key columns.  Consume-once. */
@@ -6438,7 +6454,7 @@ by_dict_done:
                         __VM->proj_active = false;   /* consume-once */
                     }
                     ray_t* dres = agg_select_distinct(eval_tbl, key_cols, key_syms,
-                                                      (uint8_t)nk, nrows, keep, keep_n);
+                                                      (uint32_t)nk, nrows, keep, keep_n);
                     scratch_free(keycols_hdr);
                     if (eval_tbl != tbl) ray_release(eval_tbl);
                     ray_release(tbl);

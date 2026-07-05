@@ -787,8 +787,13 @@
 
 (set TBd (table [a b c] (list [1 2 3 1 2] [10 20 30 40 50] ["x" "y" "z" "x" "y"])))
 
-;; by-dict with too many keys (>16) → domain error (line 1459-1462).
-(select {from: TBd by: {k1: a k2: a k3: a k4: a k5: a k6: a k7: a k8: a k9: a k10: a k11: a k12: a k13: a k14: a k15: a k16: a k17: a}}) !- domain
+;; by-dict with 17 keys now GROUPS (cut-3 retired the 1..16-key by-dict gate).
+;; All 17 keys alias column a = [1 2 3 1 2] → 3 distinct values, groups in
+;; first-occurrence order [1 2 3]; every key column carries that first-of-group.
+(set r17bd (select {from: TBd by: {k1: a k2: a k3: a k4: a k5: a k6: a k7: a k8: a k9: a k10: a k11: a k12: a k13: a k14: a k15: a k16: a k17: a}}))
+(count (at r17bd 'k17)) -- 3
+(at r17bd 'k1) -- [1 2 3]
+(at r17bd 'k17) -- [1 2 3]
 
 ;; by-dict with duplicate key → domain error (line 1499-1501).
 (select {from: TBd by: {g: a g: b}}) !- domain

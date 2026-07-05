@@ -27,10 +27,13 @@ ray_t* agg_run_one_bin(const agg_vtable_t* vt, ray_t* x_col, ray_t* y_col,
 bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return false;
-    /* 1..16 keys: v2's fixed [16] key buffers (kv/key_cols/key_syms/key_data/want)
-     * bound admission — cut-3 lifts this with exact carves.  ext->n_keys is
-     * uint32_t (widened, Task 1); this compares the untruncated value. */
-    if (ext->n_keys < 1 || ext->n_keys > 16) return false;  /* 1b: 1..16 keys */
+    /* Unbounded keys (>=1): every per-run key buffer the v2 engine touches
+     * (key_cols/key_syms, the radix scatter's per-worker key row, key_data,
+     * agg_group_keys' data[]) is now an exact carve, and the key-count params
+     * downstream are uint32_t — so there is no fixed [16]/[255] cap left to
+     * protect.  ext->n_keys is uint32_t (widened, Task 1); dense direct-index
+     * routing still self-limits to <=16 inside agg_dense_plan (see there). */
+    if (ext->n_keys < 1) return false;  /* need >=1 key */
     if (ext->n_aggs == 0) return false;        /* need >=1 aggregate  */
     if (!tbl) return false;
     /* A pushed WHERE filter (g->selection set) is now handled by exec_group_v2's
@@ -113,15 +116,17 @@ bool agg_v2_can_handle(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
  * Aggregates may be ACC_STREAMING or ACC_BUFFERED (median/top-k): the dense
  * serial driver (agg_run_one) and the dense parallel path both carry the
  * per-group destroy lifecycle, so buffered state is handled. */
-bool agg_dense_plan(ray_t** key_cols, uint8_t n_keys,
+bool agg_dense_plan(ray_t** key_cols, uint32_t n_keys,
                     const agg_vtable_t** vts, uint32_t n_aggs,
                     int64_t nrows, dense_plan_t* out) {
     (void)vts; (void)n_aggs;   /* agg kind no longer gates dense eligibility */
     out->ok = false;
     out->n_keys = n_keys;
-    /* dense direct-index routing bound; wider shapes take the hash path.
-     * n_keys is uint8_t (see header): only ever called with ext->n_keys, already
-     * <=16 via agg_v2_can_handle's admission. */
+    /* Dense direct-index routing self-limits to <=16 keys: dense_plan_t's
+     * mins/ranges/strides are fixed [16] (the direct-index packing bound).
+     * n_keys is uint32_t (untruncated ext->n_keys), so a wider shape is
+     * rejected HERE and takes v2's unbounded hash/radix path — never reads
+     * those [16] arrays with a truncated count. */
     if (n_keys < 1 || n_keys > 16) return false;
 
     /* Per-key type check + min/max prescan. */
@@ -612,10 +617,10 @@ static int agg_sel_accum_chunk(const agg_valdesc_t* vd, agg_sel_scratch_t* sc,
  * O(nrows).  This is what lets a high-selectivity filter (e.g. 100 distinct SYM
  * keys among 100k of 10M rows) reach the dense direct-index path cheaply,
  * instead of scanning all 10M rows just to discover the range. */
-/* n_keys stays uint8_t: only ever called with ext->n_keys, already <=16 via
- * agg_v2_can_handle's admission (dense direct-index routing bound; wider
- * shapes take the hash path). */
-static bool agg_dense_plan_sel(ray_t** key_cols, uint8_t n_keys, int64_t n_sel,
+/* n_keys is uint32_t (untruncated ext->n_keys): the >16 shapes are rejected by
+ * the same dense direct-index bound as agg_dense_plan and take v2's unbounded
+ * hash/radix path; the fixed [16] mins/ranges/strides are only read at <=16. */
+static bool agg_dense_plan_sel(ray_t** key_cols, uint32_t n_keys, int64_t n_sel,
                                ray_t* sel, const int64_t* sel_prefix,
                                dense_plan_t* out) {
     out->ok = false;
@@ -699,11 +704,10 @@ typedef struct {
 } agg_local_t;
 
 /* Tuple FNV-1a hash over all keys at row r — identical to agg_group_keys.
- * n_keys stays uint8_t: every caller passes a count already bounded <=16 by
- * agg_v2_can_handle's admission (see its comment) or (agg_estimate_card/_sel)
- * transitively from the same ext->n_keys. */
+ * n_keys is uint32_t: unbounded key count (carries the untruncated ext->n_keys
+ * through every caller). */
 static inline uint64_t agg_tuple_hash(ray_t** key_cols, const void** key_data,
-                                      uint8_t n_keys, int64_t r) {
+                                      uint32_t n_keys, int64_t r) {
     uint64_t h = 1469598103934665603ULL;
     for (uint32_t k = 0; k < n_keys; k++) {
         int64_t v = agg_read_key_i64(key_cols[k], key_data[k], r);
@@ -723,10 +727,10 @@ static inline uint64_t agg_tuple_hash(ray_t** key_cols, const void** key_data,
     return h;
 }
 
-/* All keys at row ra equal all keys at row rb?  n_keys stays uint8_t: same
- * admission-bounded contract as agg_tuple_hash above. */
+/* All keys at row ra equal all keys at row rb?  n_keys is uint32_t (unbounded),
+ * same contract as agg_tuple_hash above. */
 static inline int agg_tuple_eq(ray_t** key_cols, const void** key_data,
-                               uint8_t n_keys, int64_t ra, int64_t rb) {
+                               uint32_t n_keys, int64_t ra, int64_t rb) {
     for (uint32_t k = 0; k < n_keys; k++)
         if (agg_read_key_i64(key_cols[k], key_data[k], ra) !=
             agg_read_key_i64(key_cols[k], key_data[k], rb))
@@ -1414,10 +1418,10 @@ static ray_t* exec_group_v2_parallel_dense(
  * distinct count exceeds t_route → returns t_route+1 to signal "high card" so
  * high-card shapes (q10/S2) pay only the bounded sample, never a full pass.
  * On no early-exit, returns the exact distinct count of the sample (capped at
- * t_route).  sample_rows is clamped to nrows.  n_keys stays uint8_t: only
- * called with ext->n_keys, admission-bounded <=16 (see agg_v2_can_handle). */
+ * t_route).  sample_rows is clamped to nrows.  n_keys is uint32_t (unbounded:
+ * carries the untruncated ext->n_keys). */
 static int64_t agg_estimate_card(ray_t** key_cols, const void** key_data,
-                                 uint8_t n_keys, int64_t nrows,
+                                 uint32_t n_keys, int64_t nrows,
                                  int64_t sample_rows, int64_t t_route) {
     int64_t ns = sample_rows < nrows ? sample_rows : nrows;
     if (ns <= 0) return 0;
@@ -1453,10 +1457,10 @@ static int64_t agg_estimate_card(ray_t** key_cols, const void** key_data,
 /* Sel-mode cardinality estimate: samples the first `sample_rows` SELECTED rows
  * (decoded to ORIGINAL indices via the cursor) so the routing reflects the
  * cardinality of the rows that actually survive the WHERE — not the full table.
- * Same early-exit-above-t_route contract as agg_estimate_card.  n_keys stays
- * uint8_t: same admission-bounded contract as agg_estimate_card above. */
+ * Same early-exit-above-t_route contract as agg_estimate_card.  n_keys is
+ * uint32_t (unbounded), same contract as agg_estimate_card above. */
 static int64_t agg_estimate_card_sel(ray_t** key_cols, const void** key_data,
-                                     uint8_t n_keys, ray_t* sel,
+                                     uint32_t n_keys, ray_t* sel,
                                      const int64_t* sel_prefix, int64_t n_sel,
                                      int64_t sample_rows, int64_t t_route) {
     int64_t ns = sample_rows < n_sel ? sample_rows : n_sel;
@@ -1542,10 +1546,10 @@ static int agg_sh_grow_cap(agg_sh_t* sh) {
 
 /* Rehash the hash table to a larger htcap (keeps load factor low).  The gid set
  * is unchanged; we recompute each group's slot from its representative row's
- * tuple hash.  n_keys stays uint8_t: same admission-bounded contract as
+ * tuple hash.  n_keys is uint32_t (unbounded), same contract as
  * agg_tuple_hash. */
 static int agg_sh_grow_ht(agg_sh_t* sh, ray_t** key_cols, const void** key_data,
-                          uint8_t n_keys) {
+                          uint32_t n_keys) {
     int64_t nc = sh->htcap * 2;
     int32_t* nht = ray_alloc_raw((size_t)nc * sizeof(int32_t));
     if (!nht) { sh->oom = 1; return -1; }
@@ -1598,10 +1602,9 @@ typedef struct {
 } agg_sh_ctx_t;
 
 /* Probe-or-insert key tuple at row r in sh; returns gid (>=0) or -1 on oom.
- * n_keys stays uint8_t (admission-bounded, see agg_tuple_hash); n_aggs widens
- * (no <=16 gate protects it — only init's per-agg loop below reads it). */
+ * n_keys and n_aggs are both uint32_t (unbounded). */
 static inline int32_t agg_sh_find_or_insert(
-        agg_sh_t* sh, ray_t** key_cols, const void** key_data, uint8_t n_keys,
+        agg_sh_t* sh, ray_t** key_cols, const void** key_data, uint32_t n_keys,
         const agg_vtable_t** vts, const size_t* off, uint32_t n_aggs, int64_t r) {
     uint64_t h = agg_tuple_hash(key_cols, key_data, n_keys, r);
     uint64_t slot = h & sh->htmask;
@@ -1949,7 +1952,7 @@ static void agg_radix_parts_destroy(agg_radix_part_t* parts, uint32_t nparts,
  * just like agg_gather_key_col.  Caller owns the returned column.
  * key_idx/n_keys stay uint8_t: both are admission-bounded <=16 (see
  * agg_v2_can_handle) and key_idx indexes the packed-key stride below. */
-static ray_t* agg_unpack_key_col(ray_t* src_col, uint8_t key_idx, uint8_t n_keys,
+static ray_t* agg_unpack_key_col(ray_t* src_col, uint32_t key_idx, uint32_t n_keys,
                                  const agg_radix_part_t* parts, uint32_t nparts,
                                  int64_t n) {
     ray_t* out = col_vec_new(src_col, n);
@@ -2003,13 +2006,21 @@ typedef struct {
      * first_row / key-unpack stay correct in original-row space. */
     ray_t*              sel;
     const int64_t*      sel_prefix;
+    /* Per-WORKER key-staging row: [nw * n_keys] int64.  The scatter reads all
+     * keys into its worker's slice to compute the partition hash, THEN copies
+     * them into the reserved record (the record's partition is not known until
+     * the hash is computed, so the keys can't be written straight to it).  One
+     * carve for the whole dispatch (caller-owned) — never a per-row alloc. */
+    int64_t*            kv_scratch;
 } agg_radix_ctx_t;
 
 /* Scatter one ORIGINAL row r's packed payload record into the worker's per-
  * partition buffer.  Returns 0 or -1 on push OOM (sets phase1_oom). */
-static inline int agg_radix_scatter_one(agg_radix_ctx_t* c, agg_pay_buf_t* my, int64_t r) {
+static inline int agg_radix_scatter_one(agg_radix_ctx_t* c, agg_pay_buf_t* my,
+                                        int64_t* kv, int64_t r) {
     uint32_t n_keys = c->n_keys, n_aggs = c->n_aggs;
-    int64_t kv[16];   /* [16]: protected by agg_v2_can_handle's 1..16-key admission (cut-3 boundary) */
+    /* kv: this worker's key-staging slice (c->kv_scratch + wid*n_keys), sized
+     * for any key count — no fixed [16] cap. */
     uint64_t h = 1469598103934665603ULL;
     for (uint32_t k = 0; k < n_keys; k++) {
         int64_t v = agg_read_key_i64(c->key_cols[k], c->key_data[k], r);
@@ -2040,6 +2051,7 @@ static inline int agg_radix_scatter_one(agg_radix_ctx_t* c, agg_pay_buf_t* my, i
 static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     agg_radix_ctx_t* c = (agg_radix_ctx_t*)vctx;
     agg_pay_buf_t* my = &c->bufs[(size_t)wid * AGG_RADIX_P];
+    int64_t* kv = &c->kv_scratch[(size_t)wid * c->n_keys];  /* this worker's staging row */
     if (c->sel) {
         /* Chunk-decode this worker's slice of selected rows; scatter each. */
         int64_t rows[AGG_SEL_CHUNK];
@@ -2048,11 +2060,11 @@ static void agg_radix_scatter_fn(void* vctx, uint32_t wid, int64_t start, int64_
         int64_t cn;
         while ((cn = agg_sel_cursor_next(&cur, rows)) > 0)
             for (int64_t i = 0; i < cn; i++)
-                if (agg_radix_scatter_one(c, my, rows[i]) != 0) return;
+                if (agg_radix_scatter_one(c, my, kv, rows[i]) != 0) return;
         return;
     }
     for (int64_t r = start; r < end; r++)
-        if (agg_radix_scatter_one(c, my, r) != 0) return;
+        if (agg_radix_scatter_one(c, my, kv, r) != 0) return;
 }
 
 /* Phase 2: group + accumulate one partition by walking its packed payload
@@ -2300,11 +2312,16 @@ static ray_t* exec_group_v2_parallel_radix(
         if (ext->agg_ops[a] == OP_FIRST || ext->agg_ops[a] == OP_LAST) { needs_row = true; break; }
 
     /* Per-row payload record layout: [packed keys][agg values][row_idx?].
-     * val_off/val2_off are per-dispatch (filled once here, read by workers). */
+     * val_off/val2_off are per-dispatch (filled once here, read by workers).
+     * The same carve tails a per-worker key-staging block (nw*n_keys int64,
+     * both 8-byte) so kv_scratch shares off_hdr's lifetime — one free, no extra
+     * exit sites.  Only phases 1-2 read either; both freed once phase 2 joins. */
     ray_t* off_hdr;
-    size_t* val_off = (size_t*)scratch_calloc(&off_hdr, 2u * (size_t)n_aggs * sizeof(size_t));
+    size_t* val_off = (size_t*)scratch_calloc(&off_hdr,
+        2u * (size_t)n_aggs * sizeof(size_t) + (size_t)nw * (size_t)n_keys * sizeof(int64_t));
     if (!val_off) { agg_desc_free(&d); return ray_error("oom", NULL); }
     size_t* val2_off = val_off + n_aggs;
+    int64_t* kv_scratch = (int64_t*)(val2_off + n_aggs);   /* [nw * n_keys] */
     size_t rec_cur = (size_t)n_keys * 8;
     for (uint32_t a = 0; a < n_aggs; a++) {
         if (val_data[a])  { val_off[a]  = rec_cur; rec_cur += val_esz[a]; }
@@ -2331,6 +2348,7 @@ static ray_t* exec_group_v2_parallel_radix(
         .rec = rec, .row_off = row_off, .needs_row = needs_row,
         .sel = sel, .sel_prefix = sel_prefix,
         .val_off = val_off, .val2_off = val2_off,
+        .kv_scratch = kv_scratch,
     };
 
     /* Phase 1: scatter.  Sel mode dispatches over selected-row space [0,n_sel);
@@ -2541,8 +2559,15 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 const int64_t* sel_prefix, int64_t n_sel) {
     ray_op_ext_t* ext = find_ext(g, op->id);
 
-    /* [16]: protected by agg_v2_can_handle's 1..16-key admission (cut-3 boundary) */
-    ray_t* key_cols[16]; int64_t key_syms[16];
+    /* Exact-size carve for the per-key column pointers + syms (one block, both
+     * 8-byte): unbounded key count, freed at every exit of this function
+     * (parallel branches free it beside agg_vo_free; the serial tail frees it
+     * after the key-emit loop; the compact-fallback macro frees it too). */
+    ray_t* kc_hdr;
+    ray_t** key_cols = (ray_t**)scratch_alloc(&kc_hdr,
+        (size_t)ext->n_keys * (sizeof(ray_t*) + sizeof(int64_t)));
+    if (!key_cols) return ray_error("oom", NULL);
+    int64_t* key_syms = (int64_t*)(key_cols + ext->n_keys);
     for (uint32_t k = 0; k < ext->n_keys; k++) {
         ray_op_ext_t* kext = find_ext(g, ext->keys[k]);
         key_cols[k] = ray_table_get_col(tbl, kext->sym);
@@ -2551,7 +2576,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
     /* Precompute AoS state layout for the admitted aggregates. */
     agg_vo_t vo;
-    if (!agg_vo_init(&vo, g, ext, tbl)) return ray_error("oom", NULL);
+    if (!agg_vo_init(&vo, g, ext, tbl)) { scratch_free(kc_hdr); return ray_error("oom", NULL); }
     const agg_vtable_t** vts = vo.vts; size_t* off = vo.off; size_t block = vo.block;
 
     /* Dense plan (low-card int/SYM keys + streaming aggs → direct index, no
@@ -2570,6 +2595,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     #define AGG_RUN_COMPACT_FALLBACK()                                          \
         do {                                                                    \
             agg_vo_free(&vo);   /* not needed by the compact recursion */       \
+            scratch_free(kc_hdr);  /* key_cols dead: the recursion rebuilds them */ \
             ray_t* idxb = ray_rowsel_to_indices(sel);                           \
             if (!idxb) return ray_error("oom", NULL);                           \
             ray_t* compact = agg_build_compact(g, op, tbl, (int64_t*)ray_data(idxb), n_sel); \
@@ -2630,7 +2656,7 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (dense_par_ok) {
             ray_t* r = exec_group_v2_parallel_dense(g, op, tbl, key_cols, key_syms, ext, nrows, pool, &dp,
                                                     sel, sel_prefix, n_sel);
-            agg_vo_free(&vo); return r;
+            agg_vo_free(&vo); scratch_free(kc_hdr); return r;
         }
         if (keys_intsym) {
             /* Dense-FAIL int/SYM streaming shapes: probe cardinality on a bounded
@@ -2642,7 +2668,11 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
              * high-card column still routes to small-hash when the surviving
              * rows are few-and-low-card. */
             if (all_streaming) {
-                const void* key_data[16];   /* [16]: protected by agg_v2_can_handle's 1..16-key admission (cut-3 boundary) */
+                /* Exact-size carve (unbounded keys) for the estimate's key-data
+                 * pointers; freed at the smallhash return and on fall-through. */
+                ray_t* kd_hdr;
+                const void** key_data = (const void**)scratch_alloc(&kd_hdr, (size_t)ext->n_keys * sizeof(void*));
+                if (!key_data) { agg_vo_free(&vo); scratch_free(kc_hdr); return ray_error("oom", NULL); }
                 for (uint32_t k = 0; k < ext->n_keys; k++) key_data[k] = ray_data(key_cols[k]);
                 /* T_ROUTE: the group cardinality where the small-hash
                  * per-worker working set stops fitting cache and radix's
@@ -2670,17 +2700,18 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 if (est <= T_ROUTE) {
                     ray_t* r = exec_group_v2_parallel_smallhash(g, op, tbl, nrows,
                             key_cols, key_syms, vts, off, block, est, sel, sel_prefix, n_sel);
-                    agg_vo_free(&vo); return r;
+                    scratch_free(kd_hdr); agg_vo_free(&vo); scratch_free(kc_hdr); return r;
                 }
+                scratch_free(kd_hdr);   /* fall through to radix */
             }
             { ray_t* r = exec_group_v2_parallel_radix(g, op, tbl, nrows, key_cols, key_syms, vts, off, block,
                                                       sel, sel_prefix, n_sel);
-              agg_vo_free(&vo); return r; }
+              agg_vo_free(&vo); scratch_free(kc_hdr); return r; }
         }
         /* Hash fallback (F64 / STR keys): not a chunked strategy — compact. */
         if (sel) AGG_RUN_COMPACT_FALLBACK();
         { ray_t* r = exec_group_v2_parallel(g, op, tbl, nrows, key_cols, key_syms, vts, off, block);
-          agg_vo_free(&vo); return r; }
+          agg_vo_free(&vo); scratch_free(kc_hdr); return r; }
     }
 
     /* Serial path does not consult the vts/off tables (per-agg vt is re-resolved
@@ -2694,17 +2725,18 @@ static ray_t* exec_group_v2_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     agg_groups_t groups = {0};
     int grp_rc = dense ? agg_group_keys_dense(key_cols, nrows, &dp, &groups)
                        : agg_group_keys(key_cols, ext->n_keys, nrows, &groups);
-    if (grp_rc != 0) return ray_error("oom", NULL);
+    if (grp_rc != 0) { scratch_free(kc_hdr); return ray_error("oom", NULL); }
 
     ray_t* result = ray_table_new(ext->n_keys + ext->n_aggs);
-    if (!result || RAY_IS_ERR(result)) { agg_groups_free(&groups); return ray_error("oom", NULL); }
+    if (!result || RAY_IS_ERR(result)) { scratch_free(kc_hdr); agg_groups_free(&groups); return ray_error("oom", NULL); }
 
     for (uint32_t k = 0; k < ext->n_keys; k++) {
         ray_t* kc = agg_gather_key_col(key_cols[k], groups.first_row, groups.ngroups);
-        if (!kc || RAY_IS_ERR(kc)) { agg_groups_free(&groups); ray_release(result); return kc ? kc : ray_error("oom", NULL); }
+        if (!kc || RAY_IS_ERR(kc)) { scratch_free(kc_hdr); agg_groups_free(&groups); ray_release(result); return kc ? kc : ray_error("oom", NULL); }
         result = ray_table_add_col(result, key_syms[k], kc);
         ray_release(kc);
     }
+    scratch_free(kc_hdr);   /* key_cols/key_syms done — agg loop below reads neither */
 
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
@@ -2950,7 +2982,8 @@ ray_t* agg_run_one_bin(const agg_vtable_t* vt, ray_t* x_col, ray_t* y_col,
  * first-occurrence order) so the downstream emit/assembler is unchanged. */
 static int agg_group_keys_dense(ray_t** key_cols, int64_t nrows,
                                 const dense_plan_t* dp, agg_groups_t* out) {
-    const void* data[16];   /* [16]: protected by agg_v2_can_handle's 1..16-key admission (cut-3 boundary) */
+    const void* data[16];   /* [16]: dense path is <=16-key by construction (agg_dense_plan
+                             * rejects wider shapes to v2's hash/radix; dp->n_keys is that <=16) */
     for (uint32_t k = 0; k < dp->n_keys; k++) data[k] = ray_data(key_cols[k]);
     int32_t* slot2gid = ray_alloc_raw((size_t)dp->total_slots * sizeof(int32_t));
     out->gids      = ray_alloc_raw((size_t)(nrows > 0 ? nrows : 1) * sizeof(uint32_t));
@@ -3004,20 +3037,13 @@ static inline int agg_key_eq_at(ray_t* col, const void* data, int64_t a, int64_t
     return agg_read_key_i64(col, data, a) == agg_read_key_i64(col, data, b);
 }
 
-int agg_group_keys(ray_t** key_cols, uint8_t n_keys, int64_t nrows, agg_groups_t* out) {
-    /* [16]: bounded today by two independent callers — the GROUP path via
-     * agg_v2_can_handle's 1..16-key admission, and the keys-only DISTINCT
-     * path (agg_select_distinct, query.c:6348) via query.c's own
-     * `nk > 16` distinct-admission gate (~query.c:6338, guarding the raw
-     * sym-vector `by:` shape). NOTE: the by-dict's "1..16 keys" cap
-     * (query.c ~5203) does NOT dominate this call chain — it only guards
-     * RAY_DICT by: shapes; a raw sym-vector by: (`by: ['k1 'k2 ...]`)
-     * bypasses it entirely and previously reached this function with
-     * nk == 17, overflowing this buffer (ASan stack-buffer-overflow,
-     * fixed by adding the dedicated gate above). Neither caller passes nk
-     * beyond 16 today. When cut-3 lifts either gate, this must become a
-     * carve. */
-    const void* data[16];
+int agg_group_keys(ray_t** key_cols, uint32_t n_keys, int64_t nrows, agg_groups_t* out) {
+    /* Unbounded keys: cut-3 lifted both admission gates (the GROUP path and the
+     * keys-only DISTINCT path via agg_select_distinct), so the key-data pointer
+     * table is an exact carve, not a fixed [16]. */
+    ray_t* data_hdr;
+    const void** data = (const void**)scratch_alloc(&data_hdr, (size_t)n_keys * sizeof(void*));
+    if (!data) return -1;
     for (uint32_t k = 0; k < n_keys; k++) data[k] = ray_data(key_cols[k]);
 
     /* hash table capacity: next pow2 >= 2*nrows, min 16 */
@@ -3029,6 +3055,7 @@ int agg_group_keys(ray_t** key_cols, uint8_t n_keys, int64_t nrows, agg_groups_t
     out->gids      = ray_alloc_raw((size_t)(nrows > 0 ? nrows : 1) * sizeof(uint32_t));
     out->first_row = ray_alloc_raw((size_t)(nrows > 0 ? nrows : 1) * sizeof(int64_t));
     if (!ht_gid || !out->gids || !out->first_row) {
+        scratch_free(data_hdr);
         ray_free_raw(ht_gid); ray_free_raw(out->gids); ray_free_raw(out->first_row);
         out->gids = NULL; out->first_row = NULL; return -1;
     }
@@ -3061,6 +3088,7 @@ int agg_group_keys(ray_t** key_cols, uint8_t n_keys, int64_t nrows, agg_groups_t
     }
     out->ngroups = ngroups;
     ray_free_raw(ht_gid);
+    scratch_free(data_hdr);
     return 0;
 }
 
@@ -3120,7 +3148,7 @@ static ray_t* agg_gather_col_at(ray_t* sc, const int64_t* first_row, int64_t n) 
  * columns are fixed-width/SYM/STR/LIST (parted/mapcommon fall back to legacy).
  * Caller owns the returned table. */
 ray_t* agg_select_distinct(ray_t* tbl, ray_t** key_cols, const int64_t* key_syms,
-                           uint8_t nk, int64_t nrows,
+                           uint32_t nk, int64_t nrows,
                            const int64_t* keep_syms, int keep_n) {
     agg_groups_t groups = {0};
     if (agg_group_keys(key_cols, nk, nrows, &groups) != 0)
