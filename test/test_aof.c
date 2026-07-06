@@ -173,7 +173,17 @@ static test_result_t test_aof_uncommitted_invisible_to_scan(void) {
     TEST_ASSERT_NOT_NULL(log);
     ray_aof_append(log, "committed", 9, &err);
     TEST_ASSERT_EQ_I(ray_aof_commit(log), RAY_OK);
-    ray_aof_append(log, "buffered", 8, &err); /* NOT committed */
+
+    /* Deliberately larger than any stdio buffer, so the bytes reach the
+     * filesystem before commit — the audit's counter-example.  The scan
+     * must still not see it: visibility is the commit frame, not the
+     * accident of buffering. */
+    size_t big_len = 512 * 1024;
+    char*  big = malloc(big_len);
+    TEST_ASSERT_NOT_NULL(big);
+    memset(big, 'B', big_len);
+    TEST_ASSERT_EQ_I(ray_aof_append(log, big, (int64_t)big_len, &err), 1);
+    free(big);
 
     collect_t c = {0};
     TEST_ASSERT_EQ_I(ray_aof_scan(g_aof_dir, 0, collect_cb, &c, &err), 1);
@@ -182,7 +192,70 @@ static test_result_t test_aof_uncommitted_invisible_to_scan(void) {
     TEST_ASSERT_EQ_I(ray_aof_commit(log), RAY_OK);
     collect_t c2 = {0};
     TEST_ASSERT_EQ_I(ray_aof_scan(g_aof_dir, 0, collect_cb, &c2, &err), 2);
+    TEST_ASSERT_EQ_I(c2.lens[1], (int64_t)big_len);
     TEST_ASSERT_EQ_I(ray_aof_close(log), RAY_OK);
+    PASS();
+}
+
+/* The audit's LSN-reuse scenario: an uncommitted append that reached the
+ * filesystem is lost in a crash and its LSN is reissued — which is safe
+ * ONLY because no scan could ever have delivered it.  Prove both halves. */
+static test_result_t test_aof_crash_reuses_only_unobservable_lsns(void) {
+    ray_err_t err = RAY_OK;
+    ray_aof_t* log = ray_aof_open(g_aof_dir, 0, &err);
+    TEST_ASSERT_NOT_NULL(log);
+    TEST_ASSERT_EQ_I(ray_aof_append(log, "acked", 5, &err), 0);
+    TEST_ASSERT_EQ_I(ray_aof_commit(log), RAY_OK);
+
+    size_t big_len = 512 * 1024; /* flushes past stdio buffering */
+    char*  big = malloc(big_len);
+    TEST_ASSERT_NOT_NULL(big);
+    memset(big, 'X', big_len);
+    TEST_ASSERT_EQ_I(ray_aof_append(log, big, (int64_t)big_len, &err), 1);
+    free(big);
+
+    /* Even though the bytes are on disk, LSN 1 is not observable. */
+    collect_t before = {0};
+    TEST_ASSERT_EQ_I(ray_aof_scan(g_aof_dir, 0, collect_cb, &before, &err), 1);
+
+    /* Crash: abandon the writer (leak it — a graceful close would
+     * commit).  Recovery truncates the uncommitted suffix and reissues
+     * LSN 1 for different data; no reader ever saw the old LSN 1. */
+    log = ray_aof_open(g_aof_dir, 0, &err);
+    TEST_ASSERT_NOT_NULL(log);
+    TEST_ASSERT_EQ_I(ray_aof_next_lsn(log), 1);
+    TEST_ASSERT_EQ_I(ray_aof_append(log, "replacement", 11, &err), 1);
+    TEST_ASSERT_EQ_I(ray_aof_commit(log), RAY_OK);
+
+    collect_t after = {0};
+    TEST_ASSERT_EQ_I(ray_aof_scan(g_aof_dir, 0, collect_cb, &after, &err), 2);
+    TEST_ASSERT(strcmp(after.payloads[1], "replacement") == 0, "payload mismatch");
+    TEST_ASSERT_EQ_I(ray_aof_close(log), RAY_OK);
+    PASS();
+}
+
+/* Damage BELOW the commit boundary is acknowledged data — open must
+ * refuse with RAY_ERR_CORRUPT, never silently truncate. */
+static test_result_t test_aof_committed_corruption_fails_open(void) {
+    ray_err_t err = RAY_OK;
+    ray_aof_t* log = ray_aof_open(g_aof_dir, 0, &err);
+    TEST_ASSERT_NOT_NULL(log);
+    ray_aof_append(log, "aaaa", 4, &err);
+    ray_aof_append(log, "bbbb", 4, &err);
+    TEST_ASSERT_EQ_I(ray_aof_close(log), RAY_OK); /* close commits */
+
+    char path[1024];
+    seg_path(path, sizeof path, 0);
+    FILE* f = fopen(path, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    fseek(f, 8 + 1, SEEK_SET); /* into record 0's committed payload */
+    int ch = fgetc(f);
+    fseek(f, 8 + 1, SEEK_SET);
+    fputc(ch ^ 0xFF, f);
+    fclose(f);
+
+    TEST_ASSERT_EQ_PTR(ray_aof_open(g_aof_dir, 0, &err), NULL);
+    TEST_ASSERT_EQ_I(err, RAY_ERR_CORRUPT);
     PASS();
 }
 
@@ -332,6 +405,8 @@ const test_entry_t aof_entries[] = {
     { "aof/reopen_continues_lsn",         test_aof_reopen_continues_lsn,         aof_setup, aof_teardown },
     { "aof/torn_tail_truncated",          test_aof_torn_tail_truncated,          aof_setup, aof_teardown },
     { "aof/uncommitted_invisible",        test_aof_uncommitted_invisible_to_scan, aof_setup, aof_teardown },
+    { "aof/crash_lsn_reuse_unobservable", test_aof_crash_reuses_only_unobservable_lsns, aof_setup, aof_teardown },
+    { "aof/committed_corruption_open",    test_aof_committed_corruption_fails_open, aof_setup, aof_teardown },
     { "aof/rotation",                     test_aof_rotation,                     aof_setup, aof_teardown },
     { "aof/scan_from_skips_segments",     test_aof_scan_from_skips_segments,     aof_setup, aof_teardown },
     { "aof/scan_early_stop",              test_aof_scan_early_stop,              aof_setup, aof_teardown },

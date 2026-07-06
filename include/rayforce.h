@@ -699,13 +699,22 @@ ray_t*    ray_ipc_send_verbose(int64_t handle, ray_t* msg);
  * before ray_runtime_create and after ray_runtime_destroy.
  *
  * Durability model: ray_aof_append() buffers and returns the reserved
- * LSN; ray_aof_commit() is the fsync barrier — every append issued
- * before it is durable once it returns RAY_OK.  A crash discards only
- * un-committed appends: on the next open the torn tail is truncated and
- * the LSN sequence continues from the last committed record.  (This is
- * deliberate and differs from the transaction journal, where a torn
- * tail is fatal: AOF payloads are opaque data the writer was never
- * acknowledged for, not replayable commands.)
+ * LSN; ray_aof_commit() writes a commit frame into the stream and
+ * fsyncs — every append issued before it is durable and becomes
+ * observable once it returns RAY_OK.  Scans deliver only records that
+ * precede the last commit frame, so uncommitted appends are invisible
+ * BY CONSTRUCTION (not as an accident of buffering), no matter how
+ * large the append or what reached the page cache.  A crash discards
+ * only the un-committed suffix: on the next open, bytes after the last
+ * commit frame are truncated and the LSN sequence continues from the
+ * last committed record — LSNs of truncated records are reused, but
+ * only ever for records no scan could have observed.  A CRC failure
+ * BEFORE the last commit frame is damage to acknowledged data and
+ * fails ray_aof_open with RAY_ERR_CORRUPT rather than truncating.
+ * (The torn-tail tolerance is deliberate and differs from the
+ * transaction journal, where a torn tail is fatal: AOF payloads are
+ * opaque data the writer was never acknowledged for, not replayable
+ * commands.)
  *
  * Threading: one writer handle per directory, no internal locking.
  * Concurrent ray_aof_scan() calls are safe, including against a live
@@ -713,8 +722,8 @@ ray_t*    ray_ipc_send_verbose(int64_t handle, ray_t* msg);
  * the first incomplete tail record.
  *
  * Errors: RAY_ERR_DOMAIN on bad arguments, RAY_ERR_IO on filesystem
- * failure, RAY_ERR_LIMIT on payload > UINT32_MAX, RAY_ERR_CORRUPT when
- * a scan finds a bad record in the interior of the log (not the tail).
+ * failure, RAY_ERR_LIMIT on payload >= 2^32-1 bytes, RAY_ERR_CORRUPT
+ * from open or scan when acknowledged (committed) data fails its CRC.
  */
 
 typedef struct ray_aof_s ray_aof_t;

@@ -34,11 +34,19 @@
  *
  * On-disk layout: one directory per log; append-only segment files named
  * by the LSN of their first record (`%020lld.aof`), rotated once a
- * segment exceeds the configured byte limit.  Record framing:
+ * segment exceeds the configured byte limit.  Record framing (all
+ * fields explicitly little-endian on every architecture):
  *
- *     u32 LE payload length | u32 LE CRC32(payload) | payload
+ *     u32 LE payload length | u32 LE CRC32(length || payload) | payload
  *
- * LSNs are monotonic and contiguous across segments.
+ * The CRC covers the length prefix too, so a bit-flipped length cannot
+ * read as a huge "valid" record during recovery.  Commit frames — a
+ * sentinel header (length 0xFFFFFFFF, CRC field = a fixed magic) — are
+ * written by ray_aof_commit() and by rotation; they mark the committed
+ * boundary, consume no LSN, and are never delivered to scan callbacks.
+ * Data records are capped one byte below the sentinel (RAY_ERR_LIMIT).
+ * LSNs are monotonic and contiguous across segments; only records in
+ * the truncated (never-observable) suffix ever have their LSN reused.
  *
  * Threading: one writer handle per directory (the module does not lock;
  * a second concurrent writer corrupts the log).  Any number of
