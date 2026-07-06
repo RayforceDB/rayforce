@@ -1,10 +1,6 @@
 ;; Journal feature — invariants the basic test (log_journal.rfl) does
 ;; not cover.  Each phase uses a distinct base + port so a phase
 ;; failing mid-run doesn't pollute the next one's state.
-;; The `.ipc.open` calls carry a 5s connect-retry window: the readiness
-;; probe confirms the spawned server is listening, but on loaded CI runners
-;; (esp. macOS) the connect can still race a momentarily-busy accept queue —
-;; retrying instead of one-shot-failing removes the flake (was intermittent io).
 ;;
 ;; Phase A: -L sync mode survives kill -9 (durability promise of -L)
 ;; Phase B: user override of a builtin survives snapshot/restart
@@ -13,6 +9,16 @@
 ;;          abort replay (commit message documents this; basic test
 ;;          only exercises framing badtail)
 ;; Phase D: .log.write manual escape hatch round-trips via replay
+
+;; ── IPC connect with handshake-level retry ──────────────────────────
+;; A /dev/tcp probe reports ready the instant the server calls listen(),
+;; but a server restarted on a journal base is still replaying when the
+;; port first accepts SYNs — an .ipc.open landing in that window gets
+;; `io` before the accept/handshake loop is live (intermittent on loaded
+;; macOS CI).  The .ipc.open timeout arg bounds a *single* connect+
+;; handshake (default already 5s), so it can't paper over this; retry the
+;; open itself, short per-attempt, until the server completes a handshake.
+(set wait_ipc (fn [addr n] (try (.ipc.open addr 500) (if (== n 0) (.ipc.open addr 500) (do (.sys.exec "sleep 0.1") (wait_ipc addr (- n 1)))))))
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Phase A — -L durability under kill -9
@@ -28,7 +34,7 @@
 (.sys.exec "./rayforce -L /tmp/rftest_jdura -p 19991 </dev/null >/dev/null 2>&1 &")
 (.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19991) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
 
-(set hA (.ipc.open "127.0.0.1:19991" 5000))
+(set hA (wait_ipc "127.0.0.1:19991" 50))
 (.ipc.send hA "(set durable_a 7)") -- 7
 (.ipc.send hA "(set durable_b \"survived\")") -- "survived"
 (.ipc.close hA)
@@ -42,7 +48,7 @@
 (.sys.exec "./rayforce -L /tmp/rftest_jdura -p 19991 </dev/null >/dev/null 2>&1 &")
 (.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19991) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
 
-(set hA2 (.ipc.open "127.0.0.1:19991" 5000))
+(set hA2 (wait_ipc "127.0.0.1:19991" 50))
 (.ipc.send hA2 "durable_a") -- 7
 (.ipc.send hA2 "durable_b") -- "survived"
 (.ipc.close hA2)
@@ -64,7 +70,7 @@
 (.sys.exec "./rayforce -l /tmp/rftest_jovr -p 19992 </dev/null >/dev/null 2>&1 &")
 (.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19992) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
 
-(set hB (.ipc.open "127.0.0.1:19992" 5000))
+(set hB (wait_ipc "127.0.0.1:19992" 50))
 ;; Override the `+` builtin with a sentinel integer, then snapshot.
 ;; The snapshot's .qdb must contain `+` -> 42 so phase-B-restart can
 ;; load it from .qdb (not from log replay, which is also rolled).
@@ -78,7 +84,7 @@
 (.sys.exec "./rayforce -l /tmp/rftest_jovr -p 19992 </dev/null >/dev/null 2>&1 &")
 (.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19992) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
 
-(set hB2 (.ipc.open "127.0.0.1:19992" 5000))
+(set hB2 (wait_ipc "127.0.0.1:19992" 50))
 ;; The override must have survived the .qdb roundtrip.
 (.ipc.send hB2 "+") -- 42
 (.ipc.close hB2)
@@ -99,7 +105,7 @@
 (.sys.exec "./rayforce -l /tmp/rftest_jerr -p 19993 </dev/null >/dev/null 2>&1 &")
 (.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19993) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
 
-(set hC (.ipc.open "127.0.0.1:19993" 5000))
+(set hC (wait_ipc "127.0.0.1:19993" 50))
 (.ipc.send hC "(set c1 100)") -- 100
 ;; This one errors on the server (undefined `not_a_thing`) — the
 ;; .ipc.send returns an error response, but the inbound message was
@@ -113,7 +119,7 @@
 (.sys.exec "./rayforce -l /tmp/rftest_jerr -p 19993 </dev/null >/dev/null 2>&1 &")
 (.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19993) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
 
-(set hC2 (.ipc.open "127.0.0.1:19993" 5000))
+(set hC2 (wait_ipc "127.0.0.1:19993" 50))
 (.ipc.send hC2 "c1") -- 100
 ;; c2 is expected to be undefined (the bad replay entry was warn-
 ;; skipped, not applied).  Use try to catch the undefined-name error.
@@ -135,7 +141,7 @@
 (.sys.exec "./rayforce -l /tmp/rftest_jwr -p 19994 </dev/null >/dev/null 2>&1 &")
 (.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19994) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
 
-(set hD (.ipc.open "127.0.0.1:19994" 5000))
+(set hD (wait_ipc "127.0.0.1:19994" 50))
 ;; Journal a string-eval entry manually.  On replay this string will
 ;; be re-evaluated (string payloads go through ray_eval_str), binding d1.
 (.ipc.send hD "(.log.write \"(set d1 999)\")")
@@ -146,7 +152,7 @@
 (.sys.exec "./rayforce -l /tmp/rftest_jwr -p 19994 </dev/null >/dev/null 2>&1 &")
 (.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19994) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
 
-(set hD2 (.ipc.open "127.0.0.1:19994" 5000))
+(set hD2 (wait_ipc "127.0.0.1:19994" 50))
 (.ipc.send hD2 "d1") -- 999
 (.ipc.close hD2)
 (.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jwr' 2>/dev/null; true")
