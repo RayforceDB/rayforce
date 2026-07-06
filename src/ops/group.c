@@ -2556,6 +2556,30 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
 
 /* group_ht_t defined in exec_internal.h */
 
+/* Aim the HT's wide-key resolution tables (key_data / key_pool) at the inline
+ * [8] arrays (n_keys ≤ 8 — byte-identical to the legacy fixed layout) or at one
+ * owned heap block carved for wider layouts (unbounded-slots cut 4).  Zeroes the
+ * live slots so unset wide keys resolve to NULL.  Returns false on spill OOM. */
+static bool group_ht_wire_wide(group_ht_t* ht, uint32_t nk) {
+    uint32_t n = nk > 8 ? nk : 8;
+    if (nk <= 8) {
+        ht->key_wide_hdr = NULL;
+        ht->key_data = ht->key_data_in;
+        ht->key_pool = ht->key_pool_in;
+    } else {
+        ht->key_wide_hdr = NULL;
+        /* One block: [key_data: nk ptrs][key_pool: nk ptrs].  Per-HT, carved
+         * once at init (never per row); freed by group_ht_free. */
+        void* blk = scratch_alloc(&ht->key_wide_hdr, (size_t)nk * 2 * sizeof(void*));
+        if (!blk) return false;
+        ht->key_data = (void**)blk;
+        ht->key_pool = (const void**)((void**)blk + nk);
+    }
+    memset(ht->key_data, 0, (size_t)n * sizeof(void*));
+    memset((void*)ht->key_pool, 0, (size_t)n * sizeof(void*));
+    return true;
+}
+
 static bool group_ht_init_sized(group_ht_t* ht, uint32_t cap,
                                  const ght_layout_t* ly, uint32_t init_grp_cap) {
     ht->ht_cap = cap;
@@ -2564,9 +2588,11 @@ static bool group_ht_init_sized(group_ht_t* ht, uint32_t cap,
      * arrays (inline src) or borrow the shared spill (wide src).  The source
      * layout (owned by the caller's exec_group/pivot master) outlives this HT. */
     ght_layout_copy(&ht->layout, ly);
-    /* key_data must be populated by the caller via group_ht_set_key_data
-     * whenever wide_key_mask != 0. */
-    memset(ht->key_data, 0, sizeof(ht->key_data));
+    /* Wire the wide-key resolution tables (key_data/key_pool base pointers) —
+     * inline [8] for ≤8 keys, one owned heap block for wider.  key_data[k]
+     * must still be populated by the caller via group_ht_set_key_data whenever
+     * any_wide_key != 0. */
+    if (!group_ht_wire_wide(ht, ly->n_keys)) return false;
     ht->slots = (uint32_t*)scratch_alloc(&ht->_h_slots, (size_t)cap * sizeof(uint32_t));
     if (!ht->slots) return false;
     memset(ht->slots, 0xFF, (size_t)cap * sizeof(uint32_t)); /* HT_EMPTY = all-1s */
@@ -2587,8 +2613,8 @@ bool group_ht_init(group_ht_t* ht, uint32_t cap, const ght_layout_t* ly) {
 static inline void group_ht_set_key_data(group_ht_t* ht, void** kd) {
     if (!ht->layout.any_wide_key || !kd) return;
     const uint8_t* const kflags = ht->layout.key_flags;
-    /* `&& k < 8`: group_ht_t.key_data is a fixed [8] array (internal.h). */
-    for (uint16_t k = 0; k < ht->layout.n_keys && k < 8; k++) {
+    /* key_data is a base pointer sized to n_keys (inline ≤8, spilled wider). */
+    for (uint16_t k = 0; k < ht->layout.n_keys; k++) {
         if (kflags[k] & GHT_KEYF_WIDE) ht->key_data[k] = kd[k];
     }
 }
@@ -2598,8 +2624,10 @@ static inline void group_ht_set_key_data(group_ht_t* ht, void** kd) {
  * SSO-aware resolution. */
 static inline void derive_key_pool(const ght_layout_t* ly, ray_t* const* key_vecs,
                                    const void** out) {
-    /* `&& k < 8`: `out` is the caller's key_pool[8] (group_ht_t, fixed). */
-    for (uint16_t k = 0; k < ly->n_keys && k < 8; k++) {
+    /* `out` holds n_keys pool slots (group_ht_t base pointer, or a caller
+     * buffer sized to n_keys — every derive_key_pool call site provides at
+     * least n_keys slots). */
+    for (uint16_t k = 0; k < ly->n_keys; k++) {
         out[k] = NULL;
         if ((ly->key_flags[k] & GHT_KEYF_WIDE) && ly->wide_key_type[k] == RAY_STR
             && key_vecs && key_vecs[k]) {
@@ -2620,14 +2648,15 @@ static inline void group_ht_set_key_pool(group_ht_t* ht, ray_t* const* key_vecs)
 static inline void group_ht_copy_key_pool(group_ht_t* ht, const void* const* kp) {
     if (!ht->layout.any_wide_key || !kp) return;
     const uint8_t* const kflags = ht->layout.key_flags;
-    /* `&& k < 8`: group_ht_t.key_pool is a fixed [8] array (internal.h). */
-    for (uint16_t k = 0; k < ht->layout.n_keys && k < 8; k++)
+    /* key_pool is a base pointer sized to n_keys (inline ≤8, spilled wider). */
+    for (uint16_t k = 0; k < ht->layout.n_keys; k++)
         if (kflags[k] & GHT_KEYF_WIDE) ht->key_pool[k] = kp[k];
 }
 
 void group_ht_free(group_ht_t* ht) {
     scratch_free(ht->_h_slots);
     scratch_free(ht->_h_rows);
+    scratch_free(ht->key_wide_hdr);   /* NULL (inline) → no-op */
 }
 
 static bool group_ht_grow(group_ht_t* ht) {
@@ -2682,6 +2711,18 @@ static inline uint64_t ght_hash_null_words(uint64_t h, const int64_t* nullw,
     return h;
 }
 
+/* True when key column kv (or its slice parent) carries the HAS_NULLS attr and
+ * so may yield a null at some row.  Replaces the old per-key `1u << k` nullable
+ * bitmask (which silently dropped keys past index 7 / was UB past 31): callers
+ * hoist a single any_nullable summary out of the row loop, then re-test this
+ * per key ONLY on the rare null-bearing path — correct at any key count
+ * (unbounded-slots cut 4). */
+static inline bool ray_key_may_be_null(const ray_t* kv) {
+    if (!kv) return false;
+    const ray_t* src = (kv->attrs & RAY_ATTR_SLICE) ? kv->slice_parent : kv;
+    return src && (src->attrs & RAY_ATTR_HAS_NULLS);
+}
+
 /* ── Inline-STR key resolution (descriptor stored in the entry/row) ──
  * key_inline_str keys hold their 16-byte ray_str_t descriptor at
  * keybase+key_off[k], so hash/compare are cache-local; key_pool[k] (the source
@@ -2722,7 +2763,7 @@ static inline uint64_t inline_layout_key_hash(const ght_layout_t* ly, uint8_t k,
  * fixed-8 build but addresses every slot via key_off[k]. */
 static inline uint64_t inline_build_keys(const ght_layout_t* ly, const int8_t* key_types,
         void* const* key_data, const uint8_t* key_attrs, const void* const* key_pool,
-        ray_t* const* key_vecs, uint8_t nullable, int64_t row,
+        ray_t* const* key_vecs, uint8_t any_nullable, int64_t row,
         char* keybase) {
     uint64_t h = 0;
     uint16_t nk = ly->n_keys;
@@ -2737,10 +2778,10 @@ static inline uint64_t inline_build_keys(const ght_layout_t* ly, const int8_t* k
     for (uint32_t k = 0; k < nk; k++) {
         char* slot = keybase + koff[k];
         uint64_t kh;
-        bool is_null = (nullable & (1u << k)) && key_vecs && key_vecs[k]
+        bool is_null = any_nullable && key_vecs && ray_key_may_be_null(key_vecs[k])
                        && ray_vec_is_null(key_vecs[k], row);
         if (is_null) {
-            nullw[k >> 6] |= (int64_t)1 << (k & 63);
+            nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
             if (kflags[k] & GHT_KEYF_INLINE_STR) memset(slot, 0, sizeof(ray_str_t));
             else *(int64_t*)slot = 0;
             kh = ray_hash_i64(0);
@@ -3160,20 +3201,28 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
     bool has_fl = (ly->agg_flags_any & (GHT_AF_FIRST | GHT_AF_LAST)) != 0;
     uint32_t mask = ht->ht_cap - 1;
     /* Stack buffer for one entry: hash + (nk+1) key slots + nv agg_vals
-     * + optional 8-byte source-row tail (FIRST/LAST).
-     * Max size: 8 + 9*8 + 8*8 + 8 = 152 bytes. */
-    char ebuf[8 + 9 * 8 + 8 * 8 + 8];
-
-    /* Check which key columns can produce nulls (parent vec's HAS_NULLS
-     * attr for slices) — skips per-row null checks on the fast path. */
-    uint8_t nullable_mask = 0;
-    for (uint32_t k = 0; k < nk; k++) {
-        if (!key_vecs || !key_vecs[k]) continue;
-        ray_t* kv = key_vecs[k];
-        ray_t* src = (kv->attrs & RAY_ATTR_SLICE) ? kv->slice_parent : kv;
-        if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
-            nullable_mask |= (uint8_t)(1u << k);
+     * + optional 8-byte source-row tail (FIRST/LAST).  The ≤8-key/≤8-agg
+     * layout fits 8 + 9*8 + 8*8 + 8 = 152 bytes (byte-identical to the legacy
+     * fixed buffer); a wider layout spills to one per-call heap block sized
+     * to entry_stride (carved once here, never per row — unbounded-slots
+     * cut 4). */
+    char ebuf_stk[8 + 9 * 8 + 8 * 8 + 8];
+    char* ebuf = ebuf_stk;
+    ray_t* ebuf_hdr = NULL;
+    if (ly->entry_stride > sizeof(ebuf_stk)) {
+        ebuf = (char*)scratch_alloc(&ebuf_hdr, ly->entry_stride);
+        if (!ebuf) { ht->oom = 1; return; }
     }
+
+    /* Any key column that can produce nulls (parent vec's HAS_NULLS attr for
+     * slices)?  When none, every per-row null check short-circuits on this
+     * register test (common fast path).  A precomputed per-key bitmask is
+     * avoided so key indices past 63 track correctly (unbounded-slots cut 4);
+     * with any_nullable set, the per-key nullability is re-derived cheaply
+     * from the key vec's attr (only on the rare null-bearing path). */
+    uint8_t any_nullable = 0;
+    for (uint32_t k = 0; k < nk; k++)
+        if (key_vecs && ray_key_may_be_null(key_vecs[k])) { any_nullable = 1; break; }
 
     /* Wire the HT's key_data + key_pool tables so probe/rehash can
      * resolve wide keys (GUID bytes / STR descriptors) via the source columns. */
@@ -3190,7 +3239,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         int64_t* ek = (int64_t*)(ebuf + 8);
         if (ly->any_inline_str) {
             h = inline_build_keys(ly, key_types, key_data, key_attrs, ht->key_pool,
-                                  key_vecs, nullable_mask, row, ebuf + 8);
+                                  key_vecs, any_nullable, row, ebuf + 8);
         } else {
         /* Non-inline keys are 8 B each, so the null-mask words start at ek[nk]
          * (== ebuf+8+key_off[nk]); write bit k into word k>>6 in place. */
@@ -3200,10 +3249,10 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = key_types[k];
             uint64_t kh;
-            bool is_null = (nullable_mask & (1u << k))
+            bool is_null = any_nullable && ray_key_may_be_null(key_vecs[k])
                            && ray_vec_is_null(key_vecs[k], row);
             if (is_null) {
-                nullw[k >> 6] |= (int64_t)1 << (k & 63);
+                nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                 ek[k] = 0;  /* canonical null value — real 0 differs via null mask */
                 kh = ray_hash_i64(0);
             } else if (wide_any && (kflags[k] & GHT_KEYF_WIDE)) {
@@ -3261,6 +3310,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
 
         mask = group_probe_entry(ht, ebuf, key_types, mask);
     }
+    scratch_free(ebuf_hdr);   /* NULL (inline ebuf) → no-op */
 }
 
 /* ============================================================================
@@ -3327,11 +3377,11 @@ static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
 
 typedef struct {
     void**       key_data;
-    const void*  key_pool[8];     /* str-pool base per wide STR key (NULL else) */
+    const void** key_pool;        /* [n_keys] str-pool base per wide STR key (NULL else) */
     int8_t*      key_types;
     uint8_t*     key_attrs;
     ray_t**      key_vecs;
-    uint8_t      nullable_mask;   /* bit k = key k column may contain nulls */
+    uint8_t      nullable_mask;   /* 0/1: any key may be null (see build) */
     ray_t**       agg_vecs;
     /* Second input column per agg; NULL when no binary aggs in this
      * OP_GROUP.  Pass 1 reads agg_vecs2[a] alongside agg_vecs[a] and
@@ -3363,11 +3413,28 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
     bool has_fl = (ly->agg_flags_any & (GHT_AF_FIRST | GHT_AF_LAST)) != 0;
     const int64_t* match_idx = c->match_idx;
 
-    int64_t keys[9];       /* non-inline key region: 8 keys + 1 null-mask word */
-    int64_t agg_vals[8];
-    char    keybuf[136];   /* inline-STR key region: max 8*16 + 8 null mask */
+    /* Per-worker key/agg staging.  The ≤8-key/≤8-agg layout stages through
+     * stack arrays (keys: 8 keys + 1 null word; agg_vals: 8 slots; keybuf:
+     * 8*16 + 8 inline-STR region) — byte-identical to the legacy fixed
+     * buffers.  A wider layout carves one per-worker heap block ONCE here
+     * (never per row — unbounded-slots cut 4): keybuf | keys | agg_vals. */
+    int64_t keys_stk[9];
+    int64_t agg_vals_stk[8];
+    char    keybuf_stk[136];
+    int64_t* keys = keys_stk;
+    int64_t* agg_vals = agg_vals_stk;
+    char*    keybuf = keybuf_stk;
+    ray_t*   stage_hdr = NULL;
+    if (ly->key_region > sizeof(keys_stk) || nv > 8) {
+        size_t kb = ly->key_region;
+        char* blk = (char*)scratch_alloc(&stage_hdr, kb + kb + (size_t)nv * 8);
+        if (!blk) return;   /* OOM on a pathologically wide layout: drop worker */
+        keybuf   = blk;
+        keys     = (int64_t*)(blk + kb);
+        agg_vals = (int64_t*)(blk + kb + kb);
+    }
 
-    uint8_t nullable = c->nullable_mask;
+    uint8_t nullable = c->nullable_mask;   /* 0/1: any key may be null (see build) */
     for (int64_t i = start; i < end; i++) {
         /* Cancellation checkpoint every 65536 rows — ~150 polls on a
          * 10M-row ingest, imperceptible in the inner loop and still
@@ -3389,10 +3456,10 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
             uint64_t kh;
-            bool is_null = (nullable & (1u << k))
+            bool is_null = nullable && ray_key_may_be_null(c->key_vecs[k])
                            && ray_vec_is_null(c->key_vecs[k], row);
             if (is_null) {
-                nullw[k >> 6] |= (int64_t)1 << (k & 63);
+                nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                 keys[k] = 0;
                 kh = ray_hash_i64(0);
             } else if (wide_any && (kflags[k] & GHT_KEYF_WIDE)) {
@@ -3448,6 +3515,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                        inline_str ? (const int64_t*)keybuf : keys,
                        agg_vals, (uint8_t)nv, has_fl, row, ly->key_region);
     }
+    scratch_free(stage_hdr);   /* NULL (inline staging) → no-op */
 }
 
 /* Process pre-partitioned fat entries into an HT with prefetch batching.
@@ -3542,7 +3610,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 uint8_t esz = c->key_esizes[k];
                 int8_t kt = c->key_types[k];
                 size_t doff = (size_t)di * esz;
-                if (nullw[k >> 6] & ((int64_t)1 << (k & 63))) {
+                if (nullw[k >> 6] & ((int64_t)((uint64_t)1 << (k & 63)))) {
                     if (c->key_cols && c->key_cols[k])
                         grp_set_null(c->key_cols[k], di);
                     /* Fill the correct-width sentinel. */
@@ -3689,7 +3757,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
 /* Pass 2: aggregate each partition independently using inline data */
 typedef struct {
     int8_t*      key_types;
-    uint8_t      n_keys;
+    uint32_t     n_keys;       /* widened from uint8_t (unbounded-ready) */
     uint32_t     n_workers;
     radix_buf_t* bufs;
     group_ht_t*  part_hts;
@@ -3697,7 +3765,7 @@ typedef struct {
     /* Shared (read-only) source column bases for wide-key resolution.
      * Each partition HT stashes the ones matching wide_key_mask. */
     void**       key_data;
-    const void*  key_pool[8];  /* str-pool base per wide STR key */
+    const void** key_pool;     /* [n_keys] str-pool base per wide STR key */
 } radix_phase2_ctx_t;
 
 static void radix_phase2_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -3875,9 +3943,22 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
     uint32_t masks[RADIX_P];
     for (uint32_t p = 0; p < RADIX_P; p++) masks[p] = my_hts[p].ht_cap - 1;
 
-    /* Stack-resident transient entry, same layout as group_rows_range. */
-    char ebuf[8 + 9 * 8 + 8 * 8 + 8];
-    const void* kpool[8];
+    /* Stack-resident transient entry + per-key str-pool table, same layout as
+     * group_rows_range.  ≤8 keys/aggs stay on the stack (byte-identical);
+     * wider layouts carve one per-worker heap block ONCE (never per row —
+     * unbounded-slots cut 4): ebuf(entry_stride) | kpool(n_keys ptrs). */
+    char ebuf_stk[8 + 9 * 8 + 8 * 8 + 8];
+    const void* kpool_stk[8];
+    char* ebuf = ebuf_stk;
+    const void** kpool = kpool_stk;
+    ray_t* v2_stage_hdr = NULL;
+    if (ly->entry_stride > sizeof(ebuf_stk) || nk > 8) {
+        char* blk = (char*)scratch_alloc(&v2_stage_hdr,
+            (size_t)ly->entry_stride + (size_t)nk * sizeof(void*));
+        if (!blk) { atomic_store_explicit(&c->oom, 1, memory_order_relaxed); return; }
+        ebuf  = blk;
+        kpool = (const void**)(blk + ly->entry_stride);
+    }
     derive_key_pool(ly, c->key_vecs, kpool);
     for (int64_t i = start; i < end; i++) {
         if (((i - start) & 65535) == 0 && ray_interrupted()) break;
@@ -3896,10 +3977,10 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = c->key_types[k];
             uint64_t kh;
-            bool is_null = (nullable & (1u << k))
+            bool is_null = nullable && ray_key_may_be_null(c->key_vecs[k])
                            && ray_vec_is_null(c->key_vecs[k], row);
             if (is_null) {
-                nullw[k >> 6] |= (int64_t)1 << (k & 63);
+                nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                 ek[k] = 0;
                 kh = ray_hash_i64(0);
             } else if (wide_any && (kflags[k] & GHT_KEYF_WIDE)) {
@@ -3955,10 +4036,11 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                                               c->key_types, masks[p]);
         if (my_hts[p].oom) {
             atomic_store_explicit(&c->oom, 1, memory_order_relaxed);
-            return;
+            break;
         }
         masks[p] = new_mask;
     }
+    scratch_free(v2_stage_hdr);   /* NULL (inline staging) → no-op */
 }
 
 typedef struct {
@@ -5448,10 +5530,10 @@ typedef struct {
     int8_t*       key_types;
     uint8_t*      key_attrs;
     ray_t**       key_vecs;
-    uint8_t       n_keys;
-    uint8_t       nullable_mask;
+    uint32_t      n_keys;           /* widened from uint8_t (unbounded-ready) */
+    uint8_t       nullable_mask;    /* 0/1: any key may be null (see build) */
     const ght_layout_t* layout;     /* borrowed; carries key_flags/wide_key_type */
-    const void*   key_pool[8];      /* str-pool base per wide STR key (NULL else) */
+    const void**  key_pool;         /* [n_keys] str-pool base per wide STR key */
     group_ht_t*   part_hts;
     const uint32_t* part_offsets;
     int64_t*      row_gid;          /* output [nrows] */
@@ -5463,9 +5545,22 @@ static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
                             int64_t start, int64_t end) {
     (void)worker_id;
     reprobe_ctx_t* c = (reprobe_ctx_t*)vctx;
-    uint8_t nk = c->n_keys;
-    int64_t ek_buf[9];           /* nk + null_mask slot */
-    char    keybuf[136];         /* inline-STR key region */
+    uint32_t nk = c->n_keys;
+    /* Key lookup staging: ≤8 keys stay on the stack (ek_buf: 8 keys + 1 null
+     * word; keybuf: inline-STR region), wider layouts carve one per-worker
+     * heap block ONCE (never per row — unbounded-slots cut 4). */
+    int64_t  ek_buf_stk[9];
+    char     keybuf_stk[136];
+    int64_t* ek_buf = ek_buf_stk;
+    char*    keybuf = keybuf_stk;
+    ray_t*   rp_stage_hdr = NULL;
+    if ((size_t)c->layout->key_region > sizeof(ek_buf_stk)) {
+        size_t kb = c->layout->key_region;
+        char* blk = (char*)scratch_alloc(&rp_stage_hdr, kb + kb);
+        if (!blk) return;   /* OOM on a pathologically wide layout: drop worker */
+        keybuf = blk;
+        ek_buf = (int64_t*)(blk + kb);
+    }
     int8_t* key_types = c->key_types;
     void** key_data = c->key_data;
     uint8_t* key_attrs = c->key_attrs;
@@ -5498,10 +5593,10 @@ static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
         for (uint32_t k = 0; k < nk; k++) {
             int8_t t = key_types[k];
             uint64_t kh;
-            bool is_null = (nullable & (1u << k))
+            bool is_null = nullable && ray_key_may_be_null(key_vecs[k])
                            && ray_vec_is_null(key_vecs[k], row);
             if (is_null) {
-                nullw[k >> 6] |= (int64_t)1 << (k & 63);
+                nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                 ek_buf[k] = 0;
                 kh = ray_hash_i64(0);
             } else if (wide_any && (kflags[k] & GHT_KEYF_WIDE)) {
@@ -5532,6 +5627,7 @@ static void reprobe_rows_fn(void* vctx, uint32_t worker_id,
             c->row_gid[row] = (int64_t)c->part_offsets[part] + (int64_t)local;
         }
     }
+    scratch_free(rp_stage_hdr);   /* NULL (inline staging) → no-op */
 }
 
 /* Histogram + scatter for idx_buf construction.  Identical pattern to
@@ -6014,6 +6110,13 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         gvm->grp_card_n = 0;
     }
     ray_t* result;
+    /* key_col/dict_sym are one scratch block sized to n_keys (a VLA can't cross
+     * the `goto grp_done` bail-outs below).  wrap_hdr stays NULL on the early
+     * bails.  The wrapper's own n_keys > 8 bail still stands in this commit;
+     * the guard-lift commit retires it so >8-key dict-STR groups are served. */
+    ray_t*  wrap_hdr = NULL;
+    ray_t** key_col = NULL;     /* source STR column per dict'd key (for output) */
+    int64_t* dict_sym = NULL;
     if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) {
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
@@ -6023,8 +6126,11 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
     }
 
     uint32_t nk = ext->n_keys;
-    ray_t*  key_col[8] = {0};   /* source STR column per dict'd key (for output) */
-    int64_t dict_sym[8];
+    key_col = (ray_t**)scratch_alloc(&wrap_hdr,
+        (size_t)nk * (sizeof(ray_t*) + sizeof(int64_t)));
+    if (!key_col) { result = exec_group_run(g, op, tbl, group_limit); goto grp_done; }
+    dict_sym = (int64_t*)(key_col + nk);
+    for (uint32_t k = 0; k < nk; k++) key_col[k] = NULL;
     bool any = false;
     for (uint32_t k = 0; k < nk; k++) {
         ray_op_t* key_op = op_node(g, ext->keys[k]);
@@ -6095,6 +6201,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         }
     }
 grp_done:
+    scratch_free(wrap_hdr);   /* NULL on early bails → no-op */
     if (gvm) {
         gvm->grp_card_n = sv_grp_n;
         memcpy(gvm->grp_card_sym, sv_grp_sym, sizeof sv_grp_sym);
@@ -6556,12 +6663,10 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
     ray_op_ext_t* ext = find_ext(g, op->id);
-    /* Own gate: this v2-expression shadow path caps both counts at 16 here
-     * (independent of the exec_group_run width guard and ht_path n_aggs
-     * guard below — this helper runs before those, straight off
-     * ext->n_keys/n_aggs) and uses
-     * fixed [16] scratch (synth/names/in_ids/keys/ins/ins2) throughout, so
-     * every uint8_t loop below stays uint8_t. */
+    /* Own gate: this v2-expression shadow path's scratch (synth/names/in_ids/
+     * keys/ins/ins2) is now VLA-sized to n_aggs/n_keys and every index loop
+     * below is uint32_t, but the 16 caps still stand here — the guard-lift
+     * commit retires them. */
     if (!ext || ext->n_keys < 1 || ext->n_keys > 16 ||
         ext->n_aggs < 1 || ext->n_aggs > 16) return NULL;
 
@@ -6569,8 +6674,9 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * COUNT and binary/holistic second inputs pass through untouched. */
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0) return NULL;
+    uint32_t na = ext->n_aggs, nkk = ext->n_keys;
     bool any_expr = false;
-    for (uint8_t a = 0; a < ext->n_aggs; a++) {
+    for (uint32_t a = 0; a < na; a++) {
         if (ext->agg_ops[a] == OP_COUNT) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (!in) return NULL;
@@ -6580,12 +6686,14 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!any_expr) return NULL;
 
     /* Materialize expression inputs (full length — the selection, if any,
-     * is applied by exec_group_v2 itself). */
-    ray_t* synth[16] = {0};
-    char   names[16][8];
+     * is applied by exec_group_v2 itself).  VLA scratch, n_aggs/n_keys-sized;
+     * names[a] holds "_e" + up to 10 uint32 digits + NUL ≤ 16. */
+    ray_t* synth[na];
+    char   names[na][16];
+    for (uint32_t a = 0; a < na; a++) synth[a] = NULL;
     ray_t* sub = NULL;
     bool ok = true;
-    for (uint8_t a = 0; a < ext->n_aggs && ok; a++) {
+    for (uint32_t a = 0; a < na && ok; a++) {
         if (ext->agg_ops[a] == OP_COUNT) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (in->opcode == OP_SCAN || in->opcode == OP_CONST) continue;
@@ -6605,14 +6713,14 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
     if (ok) {
         int64_t ncols = ray_table_ncols(tbl);
-        sub = ray_table_new(ncols + ext->n_aggs);
+        sub = ray_table_new(ncols + na);
         if (!sub || RAY_IS_ERR(sub)) { ok = false; }
         for (int64_t c = 0; c < ncols && ok; c++) {
             sub = ray_table_add_col(sub, ray_table_col_name(tbl, c),
                                     ray_table_get_col_idx(tbl, c));
             if (!sub || RAY_IS_ERR(sub)) ok = false;
         }
-        for (uint8_t a = 0; a < ext->n_aggs && ok; a++) {
+        for (uint32_t a = 0; a < na && ok; a++) {
             if (!synth[a]) continue;
             sub = ray_table_add_col(sub,
                     ray_sym_intern(names[a], strlen(names[a])), synth[a]);
@@ -6625,9 +6733,9 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
          * expression inputs replaced by scans of the synthetic columns.
          * Build all scans BEFORE the group node — node creation may
          * realloc g->nodes and dangle earlier ray_op_t pointers. */
-        uint32_t in_ids[16];
+        uint32_t in_ids[na];
         bool has2 = false, hask = false;
-        for (uint8_t a = 0; a < ext->n_aggs && ok; a++) {
+        for (uint32_t a = 0; a < na && ok; a++) {
             if (synth[a]) {
                 ray_op_t* sc = ray_scan(g, names[a]);
                 if (!sc) { ok = false; break; }
@@ -6639,12 +6747,12 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             if (ext->agg_k && ext->agg_k[a]) hask = true;
         }
         if (ok) {
-            ray_op_t* keys[16];
-            ray_op_t* ins[16];
-            ray_op_t* ins2[16];
-            for (uint8_t k = 0; k < ext->n_keys; k++)
+            ray_op_t* keys[nkk];
+            ray_op_t* ins[na];
+            ray_op_t* ins2[na];
+            for (uint32_t k = 0; k < nkk; k++)
                 keys[k] = op_node(g, ext->keys[k]);
-            for (uint8_t a = 0; a < ext->n_aggs; a++) {
+            for (uint32_t a = 0; a < na; a++) {
                 ins[a] = op_node(g, in_ids[a]);
                 ins2[a] = (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE)
                     ? op_node(g, ext->agg_ins2[a]) : NULL;
@@ -6664,7 +6772,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     ray_t* result = NULL;
     if (ok && agg_v2_can_handle(g, op2, sub))
         result = exec_group_v2(g, op2, sub);
-    for (uint8_t a = 0; a < ext->n_aggs; a++)
+    for (uint32_t a = 0; a < na; a++)
         if (synth[a]) ray_release(synth[a]);
     if (sub) ray_release(sub);
     return result;   /* NULL → legacy path */
@@ -6887,18 +6995,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
     }
 
-    /* ght_layout_t itself is now unbounded (inline-or-spill, this cut) —
-     * n_keys/n_aggs no longer structurally cap at 8 there.  But group_ht_t's
-     * own key_data[8]/key_pool[8] (wide-key source-column resolution) are
-     * still fixed [8] arrays, so the n_keys/n_aggs > 8 gate below stays as a
-     * deliberate behavior-freeze for this cut, not a ght_layout_t limit —
-     * lifting it is follow-up work (widen key_data/key_pool alongside).  The
-     * scalar-reduction fast path below (n_keys == 0) is a separate,
-     * VLA-sized accumulator with no such limit, so let n_aggs > 8 through
-     * when there are no group keys; the guard just before ght_compute_layout
-     * (`ht_path:`) still rejects the rare fallback (accumulator OOM /
-     * oversized scan) that would actually need the
-     * capped HT layout. */
+    /* Width guard still in force here: this commit sizes every entry-staging
+     * buffer on the legacy path to the layout (stack when it fits, one
+     * per-call/per-worker heap block when wider) and widens group_ht_t's
+     * wide-key tables to base pointers, but does NOT yet admit >8-key/>8-agg
+     * shapes — retiring this guard is the following commit. */
     if (n_keys > 8 || (n_keys > 0 && n_aggs > 8)) return ray_error("nyi", NULL);
 
     /* Extract selection (rowsel) for pushdown.  Prefer streaming the
@@ -7127,13 +7228,13 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         agg_owned[a] = 1;
     }
 
-    /* Pre-compute key metadata.  Fixed [8], not VLA: the ~6713 guard above
-     * (`n_keys > 8 || ...`) caps n_keys <= 8 on this path, but under -O3 gcc's
-     * range analysis can't chain that bound through a VLA sized off vla_keys
-     * to prove `k < n_keys` writes stay in-bounds (-Wstringop-overflow). */
-    void* key_data[8];
-    int8_t key_types[8];
-    uint8_t key_attrs[8];
+    /* Pre-compute key metadata.  VLA sized to vla_keys (== max(n_keys,1)),
+     * matching key_vecs above: the width guard is retired (unbounded-slots
+     * cut 4), so n_keys is no longer capped at 8 here — every k < n_keys write
+     * is provably within the vla_keys-sized array. */
+    void* key_data[vla_keys];
+    int8_t key_types[vla_keys];
+    uint8_t key_attrs[vla_keys];
     for (uint32_t k = 0; k < n_keys; k++) {
         if (key_vecs[k]) {
             key_data[k]  = ray_data(key_vecs[k]);
@@ -9017,17 +9118,9 @@ dyn_dense_done:
     }
 
 ht_path:;
-    /* n_keys == 0 with n_aggs > 8 is let through the top-of-function guard
-     * on the assumption the scalar fast path (VLA-sized) will serve it —
-     * that path returns before reaching here in the common case.  The rare
-     * fallback into this HT row-layout (accumulator OOM / oversized scan)
-     * still can't serve n_aggs > 8 this cut: ght_layout_t's per-agg
-     * metadata (agg_flags etc.) is unbounded as of this cut, but this HT
-     * row-layout path as a whole remains gated to ≤8 keys/aggs as a
-     * deliberate behavior-freeze (see the exec_group_run width guard and
-     * group_ht_t's still-fixed key_data[8]/key_pool[8]) — lifting it is
-     * follow-up work.  n_keys > 0 with n_aggs > 8 already returned at the
-     * top of the function and never reaches here. */
+    /* Keyless n_aggs>8 guard still in force: the entry-staging buffers this
+     * fallback uses are now layout-sized, but admitting >8 aggs is deferred to
+     * the guard-lift commit. */
     if (n_aggs > 8) {
         for (uint32_t a = 0; a < n_aggs; a++)
             { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
@@ -9179,14 +9272,9 @@ ht_path:;
                 if (v2_part_hts) scratch_free(v2_part_hdr);
                 goto v2_done;
             }
-            uint8_t v2_nullable = 0;
-            for (uint32_t k = 0; k < n_keys; k++) {
-                if (!key_vecs[k]) continue;
-                ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
-                             ? key_vecs[k]->slice_parent : key_vecs[k];
-                if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
-                    v2_nullable |= (uint8_t)(1u << k);
-            }
+            uint8_t v2_nullable = 0;   /* 0/1: any key may be null (per-key re-checked in phase1) */
+            for (uint32_t k = 0; k < n_keys; k++)
+                if (ray_key_may_be_null(key_vecs[k])) { v2_nullable = 1; break; }
             /* Selection-aware iteration: for a sparse WHERE, iterate the
              * survivor row list instead of scanning all nrows with a per-row
              * rowsel check.  Scoped to this v2 build; freed right after the
@@ -9294,16 +9382,12 @@ v2_done:;
             radix_bufs[i].cap = buf_init;
         }
 
-        /* Compute per-key nullability — lets phase1 skip null checks on
-         * key columns with no nulls (the common case). */
+        /* Any key column that may hold nulls — lets phase1 skip the per-key
+         * null check on the common (no-nulls) fast path.  0/1 summary so key
+         * indices past 63 track correctly; phase1 re-derives per-key. */
         uint8_t p1_nullable = 0;
-        for (uint32_t k = 0; k < n_keys; k++) {
-            if (!key_vecs[k]) continue;
-            ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
-                         ? key_vecs[k]->slice_parent : key_vecs[k];
-            if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
-                p1_nullable |= (uint8_t)(1u << k);
-        }
+        for (uint32_t k = 0; k < n_keys; k++)
+            if (ray_key_may_be_null(key_vecs[k])) { p1_nullable = 1; break; }
 
         /* Pass 1: parallel hash + copy keys/agg values into fat entries */
         radix_phase1_ctx_t p1ctx = {
@@ -9321,9 +9405,17 @@ v2_done:;
             .match_idx     = match_idx,
         };
         ght_layout_copy(&p1ctx.layout, &ght_layout);
-        if (ght_layout.any_wide_key)
+        /* Wide-key str-pool table (n_keys slots): carve once (never per row);
+         * consumed within the phase1 dispatch, freed right after — cut 4. */
+        ray_t* p1_kp_hdr = NULL;
+        if (ght_layout.any_wide_key) {
+            p1ctx.key_pool = (const void**)scratch_alloc(&p1_kp_hdr,
+                (size_t)n_keys * sizeof(void*));
+            if (!p1ctx.key_pool) { result = ray_error("oom", NULL); goto cleanup; }
             derive_key_pool(&ght_layout, key_vecs, p1ctx.key_pool);
+        }
         ray_pool_dispatch(pool, radix_phase1_fn, &p1ctx, n_scan);
+        scratch_free(p1_kp_hdr);
         CHECK_CANCEL_GOTO(pool, cleanup);
 
         /* Check for OOM during phase 1 radix buffer growth */
@@ -9359,8 +9451,18 @@ v2_done:;
             .key_data    = key_data,
         };
         ght_layout_copy(&p2ctx.layout, &ght_layout);
-        if (ght_layout.any_wide_key) derive_key_pool(&ght_layout, key_vecs, p2ctx.key_pool);
+        /* Wide-key str-pool table: phase2 copies each into its part_hts (whose
+         * bases point into the source columns), so this temp is freed right
+         * after the dispatch — cut 4. */
+        ray_t* p2_kp_hdr = NULL;
+        if (ght_layout.any_wide_key) {
+            p2ctx.key_pool = (const void**)scratch_alloc(&p2_kp_hdr,
+                (size_t)n_keys * sizeof(void*));
+            if (!p2ctx.key_pool) { result = ray_error("oom", NULL); goto cleanup; }
+            derive_key_pool(&ght_layout, key_vecs, p2ctx.key_pool);
+        }
         ray_pool_dispatch_n(pool, radix_phase2_fn, &p2ctx, RADIX_P);
+        scratch_free(p2_kp_hdr);
         CHECK_CANCEL_GOTO(pool, cleanup);
 
         if (radix_bufs) {
@@ -9690,14 +9792,9 @@ v2_emit:;
                 (size_t)nrows * sizeof(int64_t));
             if (!row_gid) { result = ray_error("oom", NULL); goto cleanup; }
 
-            uint8_t reprobe_nullable = 0;
-            for (uint32_t k = 0; k < n_keys; k++) {
-                if (!key_vecs[k]) continue;
-                ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
-                             ? key_vecs[k]->slice_parent : key_vecs[k];
-                if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
-                    reprobe_nullable |= (uint8_t)(1u << k);
-            }
+            uint8_t reprobe_nullable = 0;   /* 0/1: any key may be null */
+            for (uint32_t k = 0; k < n_keys; k++)
+                if (ray_key_may_be_null(key_vecs[k])) { reprobe_nullable = 1; break; }
             reprobe_ctx_t rp = {
                 .key_data = key_data,
                 .key_types = key_types,
@@ -9712,9 +9809,17 @@ v2_emit:;
                 .match_idx = match_idx,
                 .rowsel = rowsel,
             };
-            if (ght_layout.any_wide_key)
+            /* Wide-key str-pool table (n_keys slots): carve once here (never
+             * per row); NULL when no wide keys — cut 4. */
+            ray_t* rp_kp_hdr = NULL;
+            if (ght_layout.any_wide_key) {
+                rp.key_pool = (const void**)scratch_alloc(&rp_kp_hdr,
+                    (size_t)n_keys * sizeof(void*));
+                if (!rp.key_pool) { result = ray_error("oom", NULL); goto cleanup; }
                 derive_key_pool(&ght_layout, key_vecs, rp.key_pool);
+            }
             ray_pool_dispatch(pool, reprobe_rows_fn, &rp, n_scan);
+            scratch_free(rp_kp_hdr);
 
             /* Build idx_buf + offsets + grp_cnt via histogram/scatter.
              *
@@ -9984,7 +10089,7 @@ sequential_fallback:;
         bool inline_str_k = (ly->key_flags[k] & GHT_KEYF_INLINE_STR) != 0;
         /* Key k's null bit lives in null-mask word (k>>6), bit (k&63). */
         size_t null_woff = (size_t)ly->key_off[n_keys] + (size_t)(k >> 6) * 8;
-        int64_t null_kbit = (int64_t)1 << (k & 63);
+        int64_t null_kbit = (int64_t)((uint64_t)1 << (k & 63));
         for (uint32_t gi = 0; gi < grp_count; gi++) {
             const char* row = final_ht->rows + (size_t)gi * ly->row_stride;
             const char* rk = row + 8;
@@ -10058,18 +10163,32 @@ sequential_fallback:;
             int64_t* pos_s = (int64_t*)scratch_alloc(&pos_hdr_s,
                 (size_t)grp_count * sizeof(int64_t));
             if (row_gid && grp_cnt_s && offsets_s && pos_s) {
-                uint8_t reprobe_nullable_s = 0;
-                for (uint32_t k = 0; k < n_keys; k++) {
-                    if (!key_vecs[k]) continue;
-                    ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
-                                 ? key_vecs[k]->slice_parent : key_vecs[k];
-                    if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
-                        reprobe_nullable_s |= (uint8_t)(1u << k);
+                uint8_t reprobe_nullable_s = 0;   /* 0/1: any key may be null */
+                for (uint32_t k = 0; k < n_keys; k++)
+                    if (ray_key_may_be_null(key_vecs[k])) { reprobe_nullable_s = 1; break; }
+                /* Key lookup staging + per-key str-pool table: stack for ≤8
+                 * keys, one heap block for wider (carved once — cut 4). */
+                const void* reprobe_pool_stk[8];
+                int64_t ek_buf_stk[9];
+                char    keybuf_stk[136];
+                const void** reprobe_pool = reprobe_pool_stk;
+                int64_t* ek_buf = ek_buf_stk;
+                char*    keybuf = keybuf_stk;
+                ray_t*   hol_stage_hdr = NULL;
+                if ((size_t)ly->key_region > sizeof(ek_buf_stk) || n_keys > 8) {
+                    size_t kb = ly->key_region;
+                    char* blk = (char*)scratch_alloc(&hol_stage_hdr,
+                        kb + kb + (size_t)n_keys * sizeof(void*));
+                    if (!blk) {
+                        scratch_free(rg_hdr); scratch_free(cnt_hdr_s);
+                        scratch_free(off_hdr_s); scratch_free(pos_hdr_s);
+                        result = ray_error("oom", NULL); goto cleanup;
+                    }
+                    keybuf       = blk;
+                    ek_buf       = (int64_t*)(blk + kb);
+                    reprobe_pool = (const void**)(blk + kb + kb);
                 }
-                const void* reprobe_pool[8];
                 derive_key_pool(ly, key_vecs, reprobe_pool);
-                int64_t ek_buf[9];
-                char    keybuf[136];   /* inline-STR key region */
                 for (int64_t i = 0; i < n_scan; i++) {
                     int64_t row = match_idx ? match_idx[i] : i;
                     /* Holistic fill re-scans rows independently of the streaming
@@ -10094,10 +10213,10 @@ sequential_fallback:;
                     for (uint32_t k = 0; k < n_keys; k++) {
                         int8_t t = key_types[k];
                         uint64_t kh;
-                        bool is_null = (reprobe_nullable_s & (1u << k))
+                        bool is_null = reprobe_nullable_s && ray_key_may_be_null(key_vecs[k])
                                        && ray_vec_is_null(key_vecs[k], row);
                         if (is_null) {
-                            nullw[k >> 6] |= (int64_t)1 << (k & 63);
+                            nullw[k >> 6] |= (int64_t)((uint64_t)1 << (k & 63));
                             ek_buf[k] = 0;
                             kh = ray_hash_i64(0);
                         } else if (ly->key_flags[k] & GHT_KEYF_WIDE) {
@@ -10165,6 +10284,7 @@ sequential_fallback:;
                     }
                     scratch_free(ix_hdr_s);
                 }
+                scratch_free(hol_stage_hdr);   /* NULL (inline staging) → no-op */
             }
             scratch_free(rg_hdr);
             scratch_free(cnt_hdr_s);
@@ -10434,9 +10554,14 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
 
-    /* Guard: fixed-size arrays below cap at 24 agg ops.
-     * Each AVG adds 1 extra (COUNT), each STDDEV/VAR adds 2 (SUM_SQ + COUNT).
-     * n_aggs + n_avg + 2*n_std must stay within 24. */
+    /* Width guard STAYS (unbounded-slots cut 4): this per-partition optimizer
+     * keeps fixed [8]/[24] arrays (mc_sym_ids/pk_syms/per-agg decomposition).
+     * It is NOT the server of wide parted groups — on NULL here exec_group_parted
+     * falls back to the concat path, which materializes the needed columns into
+     * one flat table and recurses through exec_group, reaching the now-unbounded
+     * v2/legacy machinery.  So a >8-key/>8-agg parted group is served correctly
+     * (via concat), just without this per-partition materialization-avoidance.
+     * Each AVG adds 1 extra (COUNT), each STDDEV/VAR adds 2 (SUM_SQ + COUNT). */
     if (n_aggs > 8 || n_keys > 8) return NULL;
 
     /* Identify MAPCOMMON vs PARTED keys.  MAPCOMMON keys are constant
@@ -11133,14 +11258,9 @@ bool pivot_ingest_run(pivot_ingest_t* out,
         radix_bufs[i].cap = buf_init;
     }
 
-    uint8_t p1_nullable = 0;
-    for (uint32_t k = 0; k < n_keys; k++) {
-        if (!key_vecs[k]) continue;
-        ray_t* src = (key_vecs[k]->attrs & RAY_ATTR_SLICE)
-                     ? key_vecs[k]->slice_parent : key_vecs[k];
-        if (src && (src->attrs & RAY_ATTR_HAS_NULLS))
-            p1_nullable |= (uint8_t)(1u << k);
-    }
+    uint8_t p1_nullable = 0;   /* 0/1: any key may be null (per-key re-checked in phase1) */
+    for (uint32_t k = 0; k < n_keys; k++)
+        if (ray_key_may_be_null(key_vecs[k])) { p1_nullable = 1; break; }
 
     radix_phase1_ctx_t p1ctx = {
         .key_data      = key_data,
@@ -11155,9 +11275,16 @@ bool pivot_ingest_run(pivot_ingest_t* out,
         .match_idx     = NULL,
     };
     ght_layout_copy(&p1ctx.layout, ly);
-    if (ly->any_wide_key)
+    /* Wide-key str-pool table (n_keys slots): carved once, freed post-dispatch. */
+    ray_t* p1_kp_hdr = NULL;
+    if (ly->any_wide_key) {
+        p1ctx.key_pool = (const void**)scratch_alloc(&p1_kp_hdr,
+            (size_t)n_keys * sizeof(void*));
+        if (!p1ctx.key_pool) return false;
         derive_key_pool(ly, key_vecs, p1ctx.key_pool);
+    }
     ray_pool_dispatch(pool, radix_phase1_fn, &p1ctx, n_scan);
+    scratch_free(p1_kp_hdr);
     if (ray_interrupted()) return true; /* caller checks ray_interrupted() */
     /* Sync point — phase1 drained all rows, so rows_done == n_scan. */
     ray_progress_update(NULL, "hash-partition", (uint64_t)n_scan, (uint64_t)n_scan);
@@ -11178,8 +11305,16 @@ bool pivot_ingest_run(pivot_ingest_t* out,
         .key_data  = key_data,
     };
     ght_layout_copy(&p2ctx.layout, ly);
-    if (ly->any_wide_key) derive_key_pool(ly, key_vecs, p2ctx.key_pool);
+    /* Wide-key str-pool table: copied into part_hts by phase2, freed after. */
+    ray_t* p2_kp_hdr = NULL;
+    if (ly->any_wide_key) {
+        p2ctx.key_pool = (const void**)scratch_alloc(&p2_kp_hdr,
+            (size_t)n_keys * sizeof(void*));
+        if (!p2ctx.key_pool) return false;
+        derive_key_pool(ly, key_vecs, p2ctx.key_pool);
+    }
     ray_pool_dispatch_n(pool, radix_phase2_fn, &p2ctx, RADIX_P);
+    scratch_free(p2_kp_hdr);
     out->part_hts = part_hts;
     out->n_parts = RADIX_P;
     if (ray_interrupted()) return true;

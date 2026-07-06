@@ -1123,14 +1123,21 @@ typedef struct {
     uint32_t     grp_count;
     uint32_t     grp_cap;
     ght_layout_t layout;
-    /* Non-NULL only when layout.any_wide_key != 0.  Pointers into
-     * the original key columns (slice-unaware raw data), used by
-     * group_probe_entry / group_ht_rehash to resolve row-indexed
-     * wide keys. */
-    void*        key_data[8];
-    /* String pool base per wide STR key (NULL otherwise) — paired with
-     * key_data[k] (the ray_str_t descriptor array) for SSO-aware resolve. */
-    const void*  key_pool[8];
+    /* Wide-key source-column resolution (non-NULL slots only when
+     * layout.any_wide_key != 0).  key_data[k] = raw data pointer into the
+     * original key column (slice-unaware) for group_probe_entry /
+     * group_ht_rehash to resolve row-indexed wide keys; key_pool[k] = its
+     * str-pool base for SSO-aware STR resolve.  BASE POINTERS (unbounded-
+     * slots cut 4): aimed at the in-struct inline [8] arrays when n_keys ≤ 8
+     * (byte-identical to the legacy fixed layout), or at one owned heap spill
+     * (key_wide_hdr) carved by group_ht_init_sized when n_keys > 8.  Because
+     * group_ht_t is only ever memset-then-init'd in place (never memcpy'd by
+     * value), self-referential inline bases are safe.  Freed with the HT. */
+    void**       key_data;
+    const void** key_pool;
+    void*        key_data_in[8];
+    const void*  key_pool_in[8];
+    ray_t*       key_wide_hdr;   /* owned spill for the >8-key key_data+key_pool block */
     ray_t*        _h_slots;
     ray_t*        _h_rows;
     uint8_t       oom;        /* set by group_probe_entry on grow failure */
