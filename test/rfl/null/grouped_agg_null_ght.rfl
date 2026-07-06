@@ -1,0 +1,118 @@
+;; Null handling on the legacy ght (hash) group-by path.
+;;
+;; The DA, scalar, and v2 engines all skip nulls in aggregates, but the
+;; row-layout ght accumulators (init_accum_from_entry / accum_from_entry in
+;; src/ops/group.c) historically summed / compared the F64 NaN and NULL_I*
+;; sentinels as ordinary values — a live wrong-answer bug for any
+;; high-cardinality or multi-key SUM/MIN/MAX/AVG/PROD/FIRST/LAST/STDDEV that
+;; declined DA (slot-budget) and v2 (nullable) and fell to the hash path.
+;;
+;; A key range > the DA composite-slot budget (262144) forces the ght path.
+;; Keys {0, 10000000} do that; each group then holds a null + a value, and a
+;; post-group WHERE on the RESULT table pins the group without compacting the
+;; key range (which would re-admit DA).  Group k=0 = rows [null, 3]; group
+;; k=10000000 = rows [5, 8].
+
+;; ---------- I32 SUM: the review's exact repro ----------
+;; Pre-fix this emitted [-2147483645, 13] (3 + NULL_I32 summed as a value).
+(set Ti (table [k v] (list [0 10000000 0 10000000] (as 'I32 [0N 5 3 8]))))
+(set Ri (select {s:(sum v) mn:(min v) mx:(max v) av:(avg v) fi:(first v) la:(last v) pr:(prod v) ct:(count v) from: Ti by: k}))
+(at (at (select {x: s  from: Ri where: (== k 0)}) 'x) 0) -- 3
+(at (at (select {x: s  from: Ri where: (== k 10000000)}) 'x) 0) -- 13
+;; MIN skips the NULL_I32 sentinel (pre-fix it won the compare → 0Ni).
+(at (at (select {x: mn from: Ri where: (== k 0)}) 'x) 0) -- 3
+(at (at (select {x: mx from: Ri where: (== k 0)}) 'x) 0) -- 3
+;; AVG divides by the NON-NULL count (1), not the row count (2).
+(at (at (select {x: av from: Ri where: (== k 0)}) 'x) 0) -- 3.0
+(at (at (select {x: av from: Ri where: (== k 10000000)}) 'x) 0) -- 6.5
+;; FIRST skips the null prefix; PROD skips the null factor.
+(at (at (select {x: fi from: Ri where: (== k 0)}) 'x) 0) -- 3
+(at (at (select {x: la from: Ri where: (== k 0)}) 'x) 0) -- 3
+(at (at (select {x: pr from: Ri where: (== k 0)}) 'x) 0) -- 3
+;; COUNT still tallies ALL rows (nulls included).
+(at (at (select {x: ct from: Ri where: (== k 0)}) 'x) 0) -- 2
+
+;; ---------- I16 (narrow, NULL_I16) ----------
+(set Th (table [k v] (list [0 10000000 0 10000000] (as 'I16 [0N 5 3 8]))))
+(set Rh (select {s:(sum v) mn:(min v) pr:(prod v) from: Th by: k}))
+(at (at (select {x: s  from: Rh where: (== k 0)}) 'x) 0) -- 3
+(at (at (select {x: mn from: Rh where: (== k 0)}) 'x) 0) -- 3
+(at (at (select {x: pr from: Rh where: (== k 0)}) 'x) 0) -- 3
+
+;; ---------- I64 (NULL_I64) in a mixed-op query (forced to ght by MIN) ----------
+(set Tl (table [k v] (list [0 10000000 0 10000000] (as 'I64 [0N 5 3 8]))))
+(set Rl (select {s:(sum v) mn:(min v) mx:(max v) from: Tl by: k}))
+(at (at (select {x: s  from: Rl where: (== k 0)}) 'x) 0) -- 3
+(at (at (select {x: mn from: Rl where: (== k 0)}) 'x) 0) -- 3
+
+;; ---------- TIMESTAMP MIN/MAX (I64-backed sentinel) ----------
+(set Tt (table [k v] (list [0 10000000 0 10000000] (as 'TIMESTAMP [0N 5 3 8]))))
+(set Rt (select {mn:(min v) mx:(max v) from: Tt by: k}))
+(at (at (select {x: mn from: Rt where: (== k 0)}) 'x) 0) -- 2000.01.01D00:00:00.000000003
+(nil? (at (at (select {x: mx from: Rt where: (== k 0)}) 'x) 0)) -- false
+
+;; ---------- F64 (NaN-encoded null) forced to ght by MIN ----------
+;; Pre-fix ght summed NaN → whole group went null; MIN kept the NaN seed.
+(set Tf (table [k v] (list [0 10000000 0 10000000] (as 'F64 [0N 5.0 3.0 8.0]))))
+(set Rf (select {s:(sum v) mn:(min v) mx:(max v) av:(avg v) fi:(first v) pr:(prod v) from: Tf by: k}))
+(at (at (select {x: s  from: Rf where: (== k 0)}) 'x) 0) -- 3.0
+(at (at (select {x: mn from: Rf where: (== k 0)}) 'x) 0) -- 3.0
+(at (at (select {x: av from: Rf where: (== k 0)}) 'x) 0) -- 3.0
+(at (at (select {x: fi from: Rf where: (== k 0)}) 'x) 0) -- 3.0
+(at (at (select {x: pr from: Rf where: (== k 0)}) 'x) 0) -- 3.0
+
+;; ---------- ALL-NULL group: SUM = 0, everything else typed null ----------
+;; Group k=0 = [null, null]; group k=10000000 = [5, 8].
+(set Ta (table [k v] (list [0 10000000 0 10000000] (as 'I32 [0N 5 0N 8]))))
+(set Ra (select {s:(sum v) mn:(min v) mx:(max v) av:(avg v) pr:(prod v) ct:(count v) sd:(stddev v) from: Ta by: k}))
+;; SUM of an all-null group is the additive identity 0 (NOT null).
+(at (at (select {x: s  from: Ra where: (== k 0)}) 'x) 0) -- 0
+(nil? (at (at (select {x: s  from: Ra where: (== k 0)}) 'x) 0)) -- false
+;; MIN/MAX/AVG/PROD/STDDEV of an all-null group are typed nulls.
+(nil? (at (at (select {x: mn from: Ra where: (== k 0)}) 'x) 0)) -- true
+(nil? (at (at (select {x: mx from: Ra where: (== k 0)}) 'x) 0)) -- true
+(nil? (at (at (select {x: av from: Ra where: (== k 0)}) 'x) 0)) -- true
+(nil? (at (at (select {x: pr from: Ra where: (== k 0)}) 'x) 0)) -- true
+(nil? (at (at (select {x: sd from: Ra where: (== k 0)}) 'x) 0)) -- true
+;; COUNT still tallies the two null rows.
+(at (at (select {x: ct from: Ra where: (== k 0)}) 'x) 0) -- 2
+;; The live group is unaffected.
+(at (at (select {x: s  from: Ra where: (== k 10000000)}) 'x) 0) -- 13
+;; STDDEV needs >= 2 non-null; the live group has exactly 2 -> defined.
+(nil? (at (at (select {x: sd from: Ra where: (== k 10000000)}) 'x) 0)) -- false
+
+;; ---------- ght (high-card key) vs DA (low-card key) oracle: identical ----------
+;; Same value column and grouping structure; only the key VALUES differ, so
+;; DA serves the low-card table and ght serves the high-card one.  Every
+;; aggregate must agree cell-for-cell.
+(set Vv (as 'I32 [0N 5 3 8 0N 0N 7 2]))
+(set Gght (select {s:(sum v) mn:(min v) mx:(max v) av:(avg v) pr:(prod v) ct:(count v) from: (table [k v] (list [0 10000000 0 10000000 0 10000000 0 10000000] Vv)) by: k}))
+(set Gda  (select {s:(sum v) mn:(min v) mx:(max v) av:(avg v) pr:(prod v) ct:(count v) from: (table [k v] (list [0 1 0 1 0 1 0 1] Vv)) by: k}))
+(at (at (select {x: s  from: Gght where: (== k 0)}) 'x) 0) -- 10
+(at (at (select {x: s  from: Gda  where: (== k 0)}) 'x) 0) -- 10
+(at (at (select {x: av from: Gght where: (== k 0)}) 'x) 0) -- (at (at (select {x: av from: Gda where: (== k 0)}) 'x) 0)
+(at (at (select {x: mn from: Gght where: (== k 0)}) 'x) 0) -- (at (at (select {x: mn from: Gda where: (== k 0)}) 'x) 0)
+;; k=10000000 (ght) and k=1 (DA) are the same logical group (odd indices).
+(at (at (select {x: pr from: Gght where: (== k 10000000)}) 'x) 0) -- (at (at (select {x: pr from: Gda where: (== k 1)}) 'x) 0)
+
+;; ---------- multi-key DA-ineligible variant ----------
+;; Two high-card keys -> composite budget blown -> ght; nulls still skipped.
+(set Tm (table [k1 k2 v] (list [0 10000000 0 10000000] [0 5000000 0 5000000] (as 'I32 [0N 5 3 8]))))
+(set Rm (select {s:(sum v) mn:(min v) from: Tm by: [k1 k2]}))
+(at (at (select {x: s  from: Rm where: (== k1 0)}) 'x) 0) -- 3
+(at (at (select {x: mn from: Rm where: (== k1 0)}) 'x) 0) -- 3
+
+;; ---------- parallel ght path (N above the parallel threshold) ----------
+;; N = 600000 >= 64*8192 forces the partitioned radix (radix_phase3_fn).
+;; Values tile [null 5 null 8 3 null 7 null]; row i lands in group i%2.
+;; Even rows -> {null,null,3,7}, odd rows -> {5,8,null,null}.
+(set Np 600000)
+(set Vp (take (as 'I64 [0N 5 0N 8 3 0N 7 0N]) Np))
+(set Rp (select {s:(sum v) mn:(min v) mx:(max v) av:(avg v) ct:(count v) from: (table [k v] (list (take [0 10000000] Np) Vp)) by: k}))
+(at (at (select {x: s  from: Rp where: (== k 0)}) 'x) 0) -- 750000
+(at (at (select {x: mn from: Rp where: (== k 0)}) 'x) 0) -- 3
+(at (at (select {x: mx from: Rp where: (== k 0)}) 'x) 0) -- 7
+(at (at (select {x: av from: Rp where: (== k 0)}) 'x) 0) -- 5.0
+(at (at (select {x: ct from: Rp where: (== k 0)}) 'x) 0) -- 300000
+(at (at (select {x: s  from: Rp where: (== k 10000000)}) 'x) 0) -- 975000
+(at (at (select {x: av from: Rp where: (== k 10000000)}) 'x) 0) -- 6.5

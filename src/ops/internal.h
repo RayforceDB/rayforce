@@ -1028,6 +1028,11 @@ ray_t* desc_vec_eager(ray_t* x);
 #define GHT_AF_BINARY   32u  /* two inputs (OP_PEARSON_CORR): packs (x,y) */
 #define GHT_AF_HOLISTIC 64u  /* OP_MEDIAN/TOP/BOT/wide-mm: no accum slot */
 #define GHT_AF_WIDE     128u /* subset of HOLISTIC: wide-element min/max/first/last */
+/* agg_flags2 bits (agg_flags is full — 8 bits used) */
+#define GHT_AF2_NULLABLE 1u  /* agg input column advertises HAS_NULLS: the row-layout
+                              * accumulators skip F64 NaN / NULL_I* sentinels and track
+                              * a per-slot non-null count (off_nn) for the divisor and
+                              * all-null → typed-null finalization. */
 /* key_flags bits */
 #define GHT_KEYF_WIDE       1u  /* key does not fit in 8 B (RAY_GUID / RAY_STR) */
 #define GHT_KEYF_INLINE_STR 2u  /* key stores a 16 B ray_str_t descriptor inline */
@@ -1059,6 +1064,13 @@ typedef struct {
     uint16_t off_sum_y;
     uint16_t off_sumsq_y;
     uint16_t off_sumxy;
+    /* Per-slot non-null count block (n_agg_vals int64 slots), allocated only
+     * when any_agg_null (any agg input column HAS_NULLS).  Zero otherwise —
+     * finalize then divides by the group row count exactly as before, so
+     * every null-free shape is byte-identical.  When present, AVG/VAR/STDDEV
+     * use nn[s] as the divisor and MIN/MAX/PROD/FIRST/LAST/AVG/VAR/STDDEV
+     * emit a typed null for nn[s]==0 (all-null group), matching the DA path. */
+    uint16_t off_nn;
     uint16_t key_region;       /* total key region bytes = key_off[n_keys] + null_words*8 */
     /* Number of int64 null-mask words carried after the keys: ceil(n_keys/64)
      * (floored at 1 so the n_keys==0 fallback keeps a null slot).  Key null
@@ -1069,6 +1081,7 @@ typedef struct {
     uint8_t  agg_flags_any;    /* OR of all agg_flags[a] — scalar shape guard */
     uint8_t  any_wide_key;     /* replaces wide_key_mask != 0 */
     uint8_t  any_inline_str;   /* replaces key_inline_str != 0 */
+    uint8_t  any_agg_null;     /* OR of GHT_AF2_NULLABLE over aggs — hoisted hot-loop gate */
     /* ── base pointers: aim at the *_in inline arrays (≤8) or the spill block ── */
     int8_t*  agg_val_slot;     /* [n_aggs] accum slot per agg, -1 = none */
     uint8_t* agg_flags;        /* [n_aggs] GHT_AF_* per agg */
@@ -1078,6 +1091,13 @@ typedef struct {
      * lex MIN/MAX resolves cell ids through it (cell ids are positions
      * in the COLUMN's domain, not the global intern table). */
     struct ray_sym_domain_s** agg_dom;   /* [n_aggs] */
+    /* Per-agg null metadata (populated only when any_agg_null).  agg_flags2[a]
+     * bit GHT_AF2_NULLABLE marks a HAS_NULLS agg input; agg_null_sentinel[a]
+     * is the NULL_I* sentinel for its integer/temporal type (0 for F64, which
+     * detects null via NaN, and for non-nullable aggs).  Same inline-or-spill
+     * base-pointer discipline as agg_flags/agg_val_slot. */
+    uint8_t*  agg_flags2;      /* [n_aggs] GHT_AF2_* per agg */
+    int64_t*  agg_null_sentinel; /* [n_aggs] integer null sentinel per agg */
     /* Byte offset of each key within the entry/HT-row key region (relative to
      * the start of the key region, i.e. entry+8 / row+8).  key_off[n_keys] is
      * the offset of null-mask word 0 (null_words words follow contiguously).
@@ -1095,6 +1115,8 @@ typedef struct {
     /* ── inline storage (used when n_keys ≤ 8 AND n_aggs ≤ 8) ── */
     int8_t    agg_val_slot_in[GHT_INLINE];
     uint8_t   agg_flags_in[GHT_INLINE];
+    uint8_t   agg_flags2_in[GHT_INLINE];
+    int64_t   agg_null_sentinel_in[GHT_INLINE];
     struct ray_sym_domain_s* agg_dom_in[GHT_INLINE];
     uint16_t  key_off_in[GHT_INLINE + 2];
     uint8_t   key_flags_in[GHT_INLINE];
@@ -1159,6 +1181,19 @@ typedef struct {
  * failure (key stride budget overflow, or spill-block OOM for wide layouts);
  * on false *out carries no owned spill.  On success *out owns its spill_hdr
  * (NULL when inline) and every base pointer aims at *out's own storage. */
+/* Per-type integer null sentinel for an aggregation column.  Returns 0 for
+ * non-nullable / non-integer types (BOOL, U8, SYM, F64) since 0 will never
+ * match a value flagged as null via HAS_NULLS.  Shared by the group row-layout
+ * accumulators/finalizers and the pivot finalizer. */
+static inline int64_t agg_int_null_sentinel_for(int8_t t) {
+    switch (t) {
+        case RAY_I64: case RAY_TIMESTAMP:            return NULL_I64;
+        case RAY_I32: case RAY_DATE: case RAY_TIME:  return (int64_t)NULL_I32;
+        case RAY_I16:                                return (int64_t)NULL_I16;
+        default:                                     return 0;
+    }
+}
+
 bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                         ray_t** agg_vecs, uint8_t need_flags,
                         const uint16_t* agg_ops,

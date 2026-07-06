@@ -685,6 +685,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 uint32_t r = grp_ix[gi];
                 const char* row = ph->rows + (size_t)gi_local * pg.row_stride;
                 int64_t cnt = *(const int64_t*)(const void*)row;
+                /* nn = per-slot non-null count (nullable value column) or the
+                 * group row count (null-free — byte-identical to before). */
+                int64_t nn = ly.off_nn
+                    ? ((const int64_t*)(const void*)(row + ly.off_nn))[s] : cnt;
 
             if (out_agg_type == RAY_F64) {
                 double v;
@@ -694,18 +698,22 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                                        : (double)ROW_RD_I64(row, ly.off_sum, s);
                         break;
                     case OP_AVG:
-                        v = val_is_f64 ? ROW_RD_F64(row, ly.off_sum, s) / cnt
-                                       : (double)ROW_RD_I64(row, ly.off_sum, s) / cnt;
+                        if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, (int64_t)r, true); break; }
+                        v = val_is_f64 ? ROW_RD_F64(row, ly.off_sum, s) / nn
+                                       : (double)ROW_RD_I64(row, ly.off_sum, s) / nn;
                         break;
                     case OP_MIN:
+                        if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, (int64_t)r, true); break; }
                         v = val_is_f64 ? ROW_RD_F64(row, ly.off_min, s)
                                        : (double)ROW_RD_I64(row, ly.off_min, s);
                         break;
                     case OP_MAX:
+                        if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, (int64_t)r, true); break; }
                         v = val_is_f64 ? ROW_RD_F64(row, ly.off_max, s)
                                        : (double)ROW_RD_I64(row, ly.off_max, s);
                         break;
                     case OP_FIRST: case OP_LAST:
+                        if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, (int64_t)r, true); break; }
                         v = val_is_f64 ? ROW_RD_F64(row, ly.off_sum, s)
                                        : (double)ROW_RD_I64(row, ly.off_sum, s);
                         break;
@@ -717,12 +725,19 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 ((double*)ray_data(new_col))[r] = ray_f64_fin(v);
             } else {
                 int64_t v;
+                int64_t int_null = agg_int_null_sentinel_for(out_agg_type);
                 switch (agg_op) {
                     case OP_SUM:   v = ROW_RD_I64(row, ly.off_sum, s); break;
                     case OP_COUNT: v = cnt; break;
-                    case OP_MIN:   v = ROW_RD_I64(row, ly.off_min, s); break;
-                    case OP_MAX:   v = ROW_RD_I64(row, ly.off_max, s); break;
-                    case OP_FIRST: case OP_LAST: v = ROW_RD_I64(row, ly.off_sum, s); break;
+                    case OP_MIN:
+                        if (nn == 0) { v = int_null; ray_vec_set_null(new_col, (int64_t)r, true); break; }
+                        v = ROW_RD_I64(row, ly.off_min, s); break;
+                    case OP_MAX:
+                        if (nn == 0) { v = int_null; ray_vec_set_null(new_col, (int64_t)r, true); break; }
+                        v = ROW_RD_I64(row, ly.off_max, s); break;
+                    case OP_FIRST: case OP_LAST:
+                        if (nn == 0) { v = int_null; ray_vec_set_null(new_col, (int64_t)r, true); break; }
+                        v = ROW_RD_I64(row, ly.off_sum, s); break;
                     default:       v = 0; break;
                 }
                     write_col_i64(ray_data(new_col), (int64_t)r, v, out_agg_type, new_col->attrs);
