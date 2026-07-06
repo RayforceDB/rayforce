@@ -800,24 +800,50 @@
 (set wm_re (select {from: wm_te sm: (sum (* a b)) by: ['k00 'k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16]}))
 (at wm_re 'sm) -- [28 28]
 
-;; ── 1-key group with 17 total aggs, ONE of which is an expression-input
-;; agg (sum(a*b)) — the >16-AGG twin of the >16-KEY cell above.  v2 declines
-;; on the expr-input agg alone (agg_v2_can_handle decline i); v2-exprs also
-;; declines, but on ITS OWN n_aggs>16 gate (group.c ~6430, unrelated to the
-;; >8 width guard) since 17 > 16; the group then falls all the way to the
-;; `6744` nyi guard (n_keys>0 && n_aggs>8), now width-lifted, and is served
-;; by the legacy ht_path, which materializes sum(a*b) via the generic
-;; expr_compile/exec_node fallback (~group.c:7349-7376) — the same
-;; machinery that handles ANY agg input shape, not just OP_SCAN.
-;; k=[1 1 2 2] a=[2 3 4 5] b=[5 6 7 8] v=[10 20 30 40]: a*b=[10 18 28 40] ->
-;; group1(rows0,1) sum=28, group2(rows2,3) sum=68; sum(v) group1=30 group2=70. ──
-(set wm_tg (table [k a b v] (list [1 1 2 2] [2 3 4 5] [5 6 7 8] [10 20 30 40])))
-(set wm_rg (select {from: wm_tg a01: (sum (* a b)) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) a17: (sum v) by: {k: k}}))
+;; ── 1-key group with 17 total aggs, mixing an expression-input agg
+;; (sum(a*b)) with a v2-ineligible agg (first(v)) — genuinely legacy-routed,
+;; unlike the naive "sum(a*b) + 16 plain sums" shape this cell used to test.
+;; That all-SUM shape was checked by runtime trace (temporary fprintf at
+;; exec_group_v2_exprs's success return + at the `da_path:`/`ht_path:` labels
+;; in exec_group_run, group.c, debug rebuild, removed after) and turned out
+;; to be served by v2 end to end, NOT legacy: v2 declines directly on the
+;; expr-input agg (agg_v2_can_handle requires OP_SCAN inputs), but
+;; exec_group_v2_exprs materializes a*b into a synthetic `_e0` column and
+;; rebuilds a shadow GROUP node of 17 plain-scan SUMs — every one of which
+;; `agg_resolve` supports — so its own agg_v2_can_handle(op2, sub) admits it
+;; and v2 runs the shadow.  The stale comment claiming "legacy ht_path" here
+;; was false on this branch (the v2-exprs >16-agg cap it cited was already
+;; retired, group.c ~6892).
+;;
+;; Adding first(v) — OP_FIRST is not in agg_resolve at all, so no scan-input
+;; shape admits it — forces BOTH declines: the direct v2 check now fails on
+;; two counts, and the shadow node's own agg_v2_can_handle(op2, sub) fails
+;; too (the FIRST persists into the shadow unchanged), so v2-exprs returns
+;; NULL and exec_group_run falls through to its post-v2 body.  Making v
+;; (first's input) STR — a wide element type — additionally disqualifies the
+;; DA direct-index fast path (group.c ~7910: wide-type FIRST/LAST forces the
+;; HT row-layout, which tracks the winning min/max ROW INDEX instead of
+;; truncating to a byte) so the shape reaches ht_path specifically, not just
+;; "legacy" generically — confirmed by the same trace technique (`ht_path:`
+;; fired; `da_path:` also fired first since da_eligible is only cleared
+;; partway through that block, but da_fits ends up false and control falls
+;; through to ht_path, which returns the result).
+;; FIRST is defined by original ROW INDEX, not iteration/thread order (the HT
+;; and DA paths both track first_row/last_row per group and keep the
+;; smallest/largest index across per-worker merges — group.c ~8283-8325), so
+;; first(v) is deterministic here regardless of scheduling: k=[1 1 2 2] means
+;; group1 = rows 0,1 (first row 0), group2 = rows 2,3 (first row 2).
+;; a=[2 3 4 5] b=[5 6 7 8] w=[10 20 30 40]: a*b=[10 18 28 40] ->
+;; group1(rows0,1) sum=28, group2(rows2,3) sum=68; sum(w) group1=30 group2=70;
+;; v=["p" "q" "r" "s"]: first(v) group1="p" (row0), group2="r" (row2). ──
+(set wm_tg (table [k a b v w] (list [1 1 2 2] [2 3 4 5] [5 6 7 8] ["p" "q" "r" "s"] [10 20 30 40])))
+(set wm_rg (select {from: wm_tg a01: (sum (* a b)) f01: (first v) a02: (sum w) a03: (sum w) a04: (sum w) a05: (sum w) a06: (sum w) a07: (sum w) a08: (sum w) a09: (sum w) a10: (sum w) a11: (sum w) a12: (sum w) a13: (sum w) a14: (sum w) a15: (sum w) a16: (sum w) by: {k: k}}))
 (at (meta wm_rg) 'len) -- 18
 (at wm_rg 'k) -- [1 2]
 (at wm_rg 'a01) -- [28 68]
+(at wm_rg 'f01) -- ["p" "r"]
 (at wm_rg 'a02) -- [30 70]
-(at wm_rg 'a17) -- [30 70]
+(at wm_rg 'a16) -- [30 70]
 
 ;; ── 65-key group (F64 key forces legacy; 65 keys -> ceil(65/64)=2 null-mask
 ;; words) with nulls in key 0 (word 0) and key 64 (word 1) — proves per-key
@@ -1039,4 +1065,22 @@
 (at wm5_r65 'a02) -- [14 6]
 (at wm5_r65 'a64) -- [14 6]
 (at wm5_r65 'a65) -- [4.0 31.0]
+
+;; ── keyless, EMPTY table (0 rows), 9 total aggs — n_keys==0 so the DA
+;; path's `n_keys > 0` gate excludes it outright and the scalar fast path's
+;; own `nrows > 0` guard (group.c ~7503, the same guard the `wm_tp`
+;; PEARSON_CORR cell above skips via `sc_has_binary` instead) also excludes
+;; it here since nrows==0 — both routes decline for the SAME reason nrows
+;; gives them nothing to scan, landing on ht_path unconditionally, same as
+;; every other keyless shape in this file. Verified today's deterministic
+;; behavior is a 9-column, 0-ROW result (not a 1-row all-null/zero scalar
+;; row) — identical in shape to the always-legal 2-agg keyless-empty case,
+;; just wider; a mix of SUM/COUNT/MIN/MAX/AVG confirms the shape holds
+;; across agg kinds, not just one. ──
+(set wm_e0 (table [x] (list (take [1] 0))))
+(count (at wm_e0 'x)) -- 0
+(set wm_e0_r9 (select {from: wm_e0 a01: (sum x) a02: (count x) a03: (min x) a04: (max x) a05: (avg x) a06: (sum x) a07: (min x) a08: (max x) a09: (count x)}))
+(at (meta wm_e0_r9) 'len) -- 9
+(count (at wm_e0_r9 'a01)) -- 0
+(count (at wm_e0_r9 'a09)) -- 0
 
