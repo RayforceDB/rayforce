@@ -4452,8 +4452,8 @@ typedef struct {
     uint16_t*      agg_ops;      /* per-agg operation code */
     uint8_t        n_aggs;
     uint8_t        need_flags;   /* DA_NEED_* bitmask */
-    uint32_t       agg_f64_mask; /* bitmask: bit a set if agg[a] is RAY_F64 */
-    uint32_t       agg_int_null_mask; /* bitmask: bit a set if agg[a] is an integer col with HAS_NULLS */
+    uint64_t       agg_f64_mask; /* bitmask: bit a set if agg[a] is RAY_F64 */
+    uint64_t       agg_int_null_mask; /* bitmask: bit a set if agg[a] is an integer col with HAS_NULLS */
     int64_t*       agg_int_null_sentinel; /* per-agg int sentinel (NULL_I64 etc) when bit set in mask */
     bool           all_sum;      /* true when all ops are SUM/AVG/COUNT (no MIN/MAX/FIRST/LAST) */
     uint32_t       n_slots;
@@ -5116,8 +5116,8 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
         /* SUM/AVG/COUNT fast path — no op-code dispatch, typed read only.
          * COUNT-only queries have acc->sum==NULL; count[gid]++ above suffices. */
         if (!acc->sum) return;
-        uint32_t f64m = c->agg_f64_mask;
-        uint32_t inm = c->agg_int_null_mask;
+        uint64_t f64m = c->agg_f64_mask;
+        uint64_t inm = c->agg_int_null_mask;
         int64_t* nn = acc->nn_count;
         for (uint32_t a = 0; a < n_aggs; a++) {
             size_t idx = base + a;
@@ -5132,7 +5132,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
                 acc->sum[idx].i += group_strlen_at_cached(
                     c->agg_cols[a], r, c->sym_strings, c->sym_count);
                 if (nn) nn[idx]++;
-            } else if (f64m & (1u << a)) {
+            } else if (f64m & ((uint64_t)1 << a)) {
                 /* NaN payload = null, skip from sum. */
                 double v = ((const double*)c->agg_ptrs[a])[r];
                 if (RAY_LIKELY(v == v)) { acc->sum[idx].f += v; if (nn) nn[idx]++; }
@@ -5193,7 +5193,7 @@ static inline void da_accum_row(da_ctx_t* c, da_accum_t* acc, int32_t gid, int64
         /* NULL_I* sentinel = null.  Bit set in agg_int_null_mask AND
          * value equal to per-agg sentinel means this row is null for
          * an integer aggregation column. */
-        bool int_null = (c->agg_int_null_mask & (1u << a)) &&
+        bool int_null = (c->agg_int_null_mask & ((uint64_t)1 << a)) &&
                         iv == c->agg_int_null_sentinel[a];
         bool is_null = is_f ? !(fv == fv) : int_null;
         if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
@@ -7662,7 +7662,12 @@ da_path:;
     #define DA_MEM_BUDGET      (256ULL << 20)  /* 256 MB total across all workers */
     #define DA_PER_WORKER_MAX  (6ULL << 20)    /* 6 MB per-worker max */
     {
-        bool da_eligible = (nrows > 0 && n_keys > 0 && n_keys <= 8);
+        /* n_aggs <= 64 is not a slot cap — it is the width of the da_ctx_t
+         * agg_f64_mask/agg_int_null_mask bitmasks (uint64_t, one bit per
+         * agg).  Wider agg lists route to the hash (HT) path instead, which
+         * carries per-agg arrays rather than a fixed-width bitmask. */
+        bool da_eligible = (nrows > 0 && n_keys > 0 && n_keys <= 8 &&
+                             n_aggs <= 64);
         if (da_eligible && rowsel && n_keys == 1) {
             ray_rowsel_t* sm = ray_rowsel_meta(rowsel);
             if (sm && sm->total_pass * 4 < nrows)
@@ -7852,15 +7857,17 @@ da_path:;
             uint32_t n_slots = (uint32_t)total_slots;
             size_t total = (size_t)n_slots * n_aggs;
 
-            /* VLA bounded ≤8: this whole block is under da_fits, which
-             * requires da_eligible, which requires n_keys > 0 (da_eligible's
-             * definition) — and n_keys > 0 forces n_aggs ≤ 8 via the
-             * exec_group_run width guard. */
+            /* VLA sized to vla_aggs (== n_aggs): agg_ptrs/agg_types/
+             * da_int_null_sentinel are per-element arrays, not bitmasks, so
+             * they scale with n_aggs directly.  This whole block is under
+             * da_fits, which requires da_eligible, which caps n_aggs <= 64 —
+             * the width of the agg_f64_mask/da_int_null_mask bitmasks built
+             * just below, not a VLA bound. */
             void* agg_ptrs[vla_aggs];
             int8_t agg_types[vla_aggs];
             int64_t da_int_null_sentinel[vla_aggs];
-            uint32_t agg_f64_mask = 0;
-            uint32_t da_int_null_mask = 0;
+            uint64_t agg_f64_mask = 0;
+            uint64_t da_int_null_mask = 0;
             /* Track whether any agg column can produce a null so we can
              * allocate per-(group, agg) non-null counts only when required.
              * F64 with HAS_NULLS uses NaN-skip; sentinel-typed integers
@@ -7871,7 +7878,7 @@ da_path:;
                     /* Fused product: F64 accumulate, no source vec. */
                     agg_ptrs[a]  = NULL;
                     agg_types[a] = RAY_F64;
-                    agg_f64_mask |= (1u << a);
+                    agg_f64_mask |= ((uint64_t)1 << a);
                     da_int_null_sentinel[a] = 0;
                     continue;
                 }
@@ -7879,7 +7886,7 @@ da_path:;
                     agg_ptrs[a]  = ray_data(agg_vecs[a]);
                     agg_types[a] = agg_vecs[a]->type;
                     if (agg_vecs[a]->type == RAY_F64)
-                        agg_f64_mask |= (1u << a);
+                        agg_f64_mask |= ((uint64_t)1 << a);
                     da_int_null_sentinel[a] = agg_int_null_sentinel_for(agg_vecs[a]->type);
                     /* Only set the int-null mask bit for storage types whose
                      * sentinel is meaningful.  BOOL/U8/SYM use 0 as their default
@@ -7890,7 +7897,7 @@ da_path:;
                     bool is_sentinel_typed = (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 ||
                                               t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP);
                     if (is_sentinel_typed && (agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS))
-                        da_int_null_mask |= (1u << a);
+                        da_int_null_mask |= ((uint64_t)1 << a);
                     if ((agg_vecs[a]->attrs & RAY_ATTR_HAS_NULLS) &&
                         (agg_vecs[a]->type == RAY_F64 || is_sentinel_typed))
                         da_any_nullable = true;
@@ -8360,7 +8367,11 @@ da_path:;
     }
 
     {
-        bool sp_eligible = (nrows > 0 && n_keys == 1 && key_data[0] != NULL);
+        /* n_aggs <= 64: same mask-width bound as da_eligible above — this
+         * path's independent agg_f64_mask is also a uint64_t.  Beyond 64
+         * aggs, fall through to the hash path. */
+        bool sp_eligible = (nrows > 0 && n_keys == 1 && key_data[0] != NULL &&
+                             n_aggs <= 64);
         int8_t kt = sp_eligible ? key_types[0] : 0;
         if (sp_eligible && kt != RAY_I64 && kt != RAY_I32 && kt != RAY_I16 &&
             kt != RAY_U8 && kt != RAY_BOOL && kt != RAY_DATE &&
@@ -8399,18 +8410,19 @@ da_path:;
             if (!group_materialize_prod_slots(agg_prod, agg_vecs, agg_owned,
                                               n_aggs, nrows))
                 goto ht_path;
-            /* VLA bounded ≤8: sp_eligible requires n_keys == 1 (sp_eligible's
-             * definition), and n_keys > 0 forces n_aggs ≤ 8 via the
-             * exec_group_run width guard. */
+            /* VLA sized to vla_aggs (== n_aggs): agg_ptrs/agg_types are
+             * per-element arrays, not bitmasks.  sp_eligible caps n_aggs <=
+             * 64 — the width of the agg_f64_mask bitmask built just below,
+             * not a VLA bound. */
             void* agg_ptrs[vla_aggs];
             int8_t agg_types[vla_aggs];
-            uint32_t agg_f64_mask = 0;
+            uint64_t agg_f64_mask = 0;
             for (uint32_t a = 0; a < n_aggs; a++) {
                 if (agg_vecs[a]) {
                     agg_ptrs[a] = ray_data(agg_vecs[a]);
                     agg_types[a] = agg_vecs[a]->type;
                     if (agg_vecs[a]->type == RAY_F64)
-                        agg_f64_mask |= (1u << a);
+                        agg_f64_mask |= ((uint64_t)1 << a);
                 } else {
                     agg_ptrs[a] = NULL;
                     agg_types[a] = 0;
@@ -8498,7 +8510,7 @@ da_path:;
                 if (agg_strlen[a])                                               \
                     sums[a].i += group_strlen_at_cached(                         \
                         agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
-                else if (agg_f64_mask & (1u << a))                               \
+                else if (agg_f64_mask & ((uint64_t)1 << a))                      \
                     sums[a].f += ((const double*)agg_ptrs[a])[dyn_row];          \
                 else                                                             \
                     sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0); \
@@ -8631,7 +8643,7 @@ dyn_dense_done:
             if (agg_strlen[a])                                                   \
                 sums[a].i += group_strlen_at_cached(                             \
                     agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
-            else if (agg_f64_mask & (1u << a))                                   \
+            else if (agg_f64_mask & ((uint64_t)1 << a))                          \
                 sums[a].f += ((const double*)agg_ptrs[a])[dyn_row];              \
             else                                                                 \
                 sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0);\
@@ -8752,7 +8764,7 @@ dyn_dense_done:
                                     sums[a].i += group_strlen_at_cached(
                                         agg_vecs[a], r, strlen_sym_strings,
                                         strlen_sym_count);
-                                else if (agg_f64_mask & (1u << a))
+                                else if (agg_f64_mask & ((uint64_t)1 << a))
                                     sums[a].f += ((const double*)agg_ptrs[a])[r];
                                 else
                                     sums[a].i += read_col_i64(agg_ptrs[a], r,
@@ -8860,7 +8872,7 @@ dyn_dense_done:
                                     sums[a].i += group_strlen_at_cached(
                                         agg_vecs[a], r, strlen_sym_strings,
                                         strlen_sym_count);
-                                else if (agg_f64_mask & (1u << a))
+                                else if (agg_f64_mask & ((uint64_t)1 << a))
                                     sums[a].f += ((const double*)agg_ptrs[a])[r];
                                 else
                                     sums[a].i += read_col_i64(agg_ptrs[a], r,
@@ -8948,7 +8960,7 @@ dyn_dense_done:
                             sums[a].i += group_strlen_at_cached(
                                 agg_vecs[a], r, strlen_sym_strings,
                                 strlen_sym_count);
-                        else if (agg_f64_mask & (1u << a))
+                        else if (agg_f64_mask & ((uint64_t)1 << a))
                             sums[a].f += ((const double*)agg_ptrs[a])[r];
                         else
                             sums[a].i += read_col_i64(agg_ptrs[a], r, agg_types[a], 0);
@@ -9089,7 +9101,7 @@ dyn_dense_done:
                             sums[a].i += group_strlen_at_cached(
                                 agg_vecs[a], r, strlen_sym_strings,
                                 strlen_sym_count);
-                        else if (agg_f64_mask & (1u << a))
+                        else if (agg_f64_mask & ((uint64_t)1 << a))
                             sums[a].f += ((const double*)agg_ptrs[a])[r];
                         else
                             sums[a].i += read_col_i64(agg_ptrs[a], r, agg_types[a], 0);

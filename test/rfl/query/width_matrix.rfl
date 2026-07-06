@@ -898,3 +898,126 @@
 (set wm_xr (select {from: wm_xt sm: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8 k9: k9}}))
 (at wm_xr 'k0) -- ["a" "b"]
 (at wm_xr 'sm) -- [1224965000 1225000000]
+
+;; ══════════════════════════════════════════════════════════════════
+;; Task 5 (unbounded-slots cut 4): DA/sp-path per-agg bitmasks widened
+;; uint32_t -> uint64_t (da_ctx_t agg_f64_mask/agg_int_null_mask; the
+;; independent agg_f64_mask in the single-key sparse (sp) macro path).
+;; Post-Task-4 the legacy group path serves any n_aggs at all, so the
+;; DA path (n_keys<=8, admitted at group.c da_eligible) could for the
+;; first time see n_aggs > 32 — a uint32_t bitmask's bit `a` for a>=32
+;; is a variable shift-by->=32, which x86 hardware evaluates modulo 32
+;; (SHL/SHR only ever use the low 5 bits of the count register), so bit
+;; 32 silently aliases bit 0, bit 33 aliases bit 1, etc.  This section
+;; gates admission at n_aggs<=64 (the width of the new uint64_t masks)
+;; and pins three shapes: the exact historical alias point (33 aggs,
+;; bit 32 vs bit 0), the new upper boundary (64 aggs, bit 63), and one
+;; past it (65 aggs, forced to the hash/ht_path — ght_layout_t's
+;; per-agg metadata is per-element flag BYTES, not a bitmask, so it has
+;; no width cap to alias against).
+;;
+;; Shared fixture, single I64 key, two groups (k=1 rows 0-1, k=2 rows
+;; 2-3):
+;;   wm5_va (I32, no nulls): row0 is 2147483647i + 1i, which WRAPS to
+;;     -2147483648 (INT32_MIN) — a real, non-null data value per the
+;;     documented I16/I32 wraparound exception (src/vec/validate.c
+;;     invariant 16.4: narrow-int sentinels are NOT reserved because
+;;     modulo arithmetic legitimately produces them; see also
+;;     test/rfl/expr/narrow_binary.rfl's `(+ [2147483647i] [1i]) --
+;;     [-2147483648]`).  It is chosen because it exactly equals
+;;     NULL_I32 — the value da_ctx_t's int-null sentinel check compares
+;;     against — so if agg 0's mask bit is ever wrongly turned on by an
+;;     unrelated agg's alias, this row is wrongly dropped from the sum.
+;;     Row1 = 100 (untainted control value); rows2-3 = 10, 20 for the
+;;     second group (no wraparound there, plain control values).
+;;   wm5_vf (I32, no nulls): filler agg input, DISTINCT per group
+;;     (7,7 / 3,3) so any cross-group corruption is visible too.
+;;   wm5_vn (I32, WITH a genuine null): 0Ni at the first row of each
+;;     group, a real value at the second — placed at the boundary agg
+;;     position in the 33-agg and 64-agg tests below (both admitted to
+;;     the DA path, which correctly int-null-skips), so its own mask
+;;     bit is legitimately set from real HAS_NULLS.  NOT used at the
+;;     65-agg boundary — see wm5_vd below and the comment at that test.
+;;   wm5_vd (F64, no nulls): used only by the 65-agg test's boundary
+;;     position, in place of wm5_vn — see that test's comment for why.
+;;
+;; Group k=1 (rows 0,1): a01 (wm5_va) correct sum = -2147483648 + 100 =
+;;   -2147483548; buggy (bit-32-aliased-to-0) sum = 100 (row0 wrongly
+;;   treated as null and dropped).  Filler sum = 7+7 = 14.  wm5_vn
+;;   correct sum = 5 (row0 null skipped).  wm5_vd sum = 1.5+2.5 = 4.0.
+;; Group k=2 (rows 2,3): a01 sum = 10+20 = 30 (no wraparound row, so
+;;   this group is unaffected by the alias either way — a control).
+;;   Filler sum = 3+3 = 6.  wm5_vn sum = 8.  wm5_vd sum = 10.5+20.5=31.0.
+;; ══════════════════════════════════════════════════════════════════
+
+(set wm5_va (+ [2147483647i 99i 10i 20i] [1i 1i 0i 0i]))
+;; The vector itself carries no HAS_NULLS (the wraparound row is a real
+;; value, not a null) even though extracting it as a bare scalar via
+;; `at` renders as `0Ni` — nil?/format on an ATOM re-derives nullness
+;; from the sentinel bit pattern alone (an atom has no attrs byte to
+;; carry HAS_NULLS), so that quirk is scalar-context-only and does NOT
+;; reflect how the vector's own consumers (sum, the DA accumulator)
+;; treat it: they gate on the VECTOR's HAS_NULLS attribute first, which
+;; is correctly unset here.
+(nil? wm5_va) -- false
+(sum wm5_va) -- -2147483518
+(at wm5_va 1) -- 100
+(set wm5_vf [7i 7i 3i 3i])
+(set wm5_vn [0Ni 5i 0Ni 8i])
+(set wm5_t (table [k va vf vn] (list [1 1 2 2] wm5_va wm5_vf wm5_vn)))
+
+;; ── 33 aggs: pins the exact historical alias point.  a33 (agg index
+;; 32) is the nulls column — bit 32 of a uint32_t mask aliases bit 0
+;; (a01's).  Pre-Task-5 this would corrupt a01's group-1 sum to 100;
+;; post-Task-5 (uint64_t masks) bits 0 and 32 are independent. ──
+(set wm5_r33 (select {from: wm5_t a01: (sum wm5_va) a02: (sum wm5_vf) a03: (sum wm5_vf) a04: (sum wm5_vf) a05: (sum wm5_vf) a06: (sum wm5_vf) a07: (sum wm5_vf) a08: (sum wm5_vf) a09: (sum wm5_vf) a10: (sum wm5_vf) a11: (sum wm5_vf) a12: (sum wm5_vf) a13: (sum wm5_vf) a14: (sum wm5_vf) a15: (sum wm5_vf) a16: (sum wm5_vf) a17: (sum wm5_vf) a18: (sum wm5_vf) a19: (sum wm5_vf) a20: (sum wm5_vf) a21: (sum wm5_vf) a22: (sum wm5_vf) a23: (sum wm5_vf) a24: (sum wm5_vf) a25: (sum wm5_vf) a26: (sum wm5_vf) a27: (sum wm5_vf) a28: (sum wm5_vf) a29: (sum wm5_vf) a30: (sum wm5_vf) a31: (sum wm5_vf) a32: (sum wm5_vf) a33: (sum wm5_vn) by: {gk: k}}))
+(at (meta wm5_r33) 'len) -- 34
+(at wm5_r33 'gk) -- [1 2]
+(at wm5_r33 'a01) -- [-2147483548 30]
+(at wm5_r33 'a02) -- [14 6]
+(at wm5_r33 'a32) -- [14 6]
+(at wm5_r33 'a33) -- [5 8]
+
+;; ── 64 aggs: upper boundary of the new uint64_t mask width.  a64 (agg
+;; index 63, the top bit) is the nulls column — this pins that the full
+;; widened range 33..64 is admitted to the DA path and computed
+;; correctly, not just the head of the range. ──
+(set wm5_r64 (select {from: wm5_t a01: (sum wm5_va) a02: (sum wm5_vf) a03: (sum wm5_vf) a04: (sum wm5_vf) a05: (sum wm5_vf) a06: (sum wm5_vf) a07: (sum wm5_vf) a08: (sum wm5_vf) a09: (sum wm5_vf) a10: (sum wm5_vf) a11: (sum wm5_vf) a12: (sum wm5_vf) a13: (sum wm5_vf) a14: (sum wm5_vf) a15: (sum wm5_vf) a16: (sum wm5_vf) a17: (sum wm5_vf) a18: (sum wm5_vf) a19: (sum wm5_vf) a20: (sum wm5_vf) a21: (sum wm5_vf) a22: (sum wm5_vf) a23: (sum wm5_vf) a24: (sum wm5_vf) a25: (sum wm5_vf) a26: (sum wm5_vf) a27: (sum wm5_vf) a28: (sum wm5_vf) a29: (sum wm5_vf) a30: (sum wm5_vf) a31: (sum wm5_vf) a32: (sum wm5_vf) a33: (sum wm5_vf) a34: (sum wm5_vf) a35: (sum wm5_vf) a36: (sum wm5_vf) a37: (sum wm5_vf) a38: (sum wm5_vf) a39: (sum wm5_vf) a40: (sum wm5_vf) a41: (sum wm5_vf) a42: (sum wm5_vf) a43: (sum wm5_vf) a44: (sum wm5_vf) a45: (sum wm5_vf) a46: (sum wm5_vf) a47: (sum wm5_vf) a48: (sum wm5_vf) a49: (sum wm5_vf) a50: (sum wm5_vf) a51: (sum wm5_vf) a52: (sum wm5_vf) a53: (sum wm5_vf) a54: (sum wm5_vf) a55: (sum wm5_vf) a56: (sum wm5_vf) a57: (sum wm5_vf) a58: (sum wm5_vf) a59: (sum wm5_vf) a60: (sum wm5_vf) a61: (sum wm5_vf) a62: (sum wm5_vf) a63: (sum wm5_vf) a64: (sum wm5_vn) by: {gk: k}}))
+(at (meta wm5_r64) 'len) -- 65
+(at wm5_r64 'gk) -- [1 2]
+(at wm5_r64 'a01) -- [-2147483548 30]
+(at wm5_r64 'a02) -- [14 6]
+(at wm5_r64 'a63) -- [14 6]
+(at wm5_r64 'a64) -- [5 8]
+
+;; ── 65 aggs: one past the mask width.  n_aggs=65 fails both
+;; da_eligible's and sp_eligible's `n_aggs <= 64` gate (group.c, added
+;; this task), so this shape is forced onto the legacy ht_path — a
+;; completely different mechanism (ght_layout_t's agg_flags[a] is a
+;; per-element uint8_t array, not a bitmask, per src/ops/internal.h) —
+;; not exercised by this task's fix at all.
+;;
+;; a65 (agg index 64) is wm5_vd, an F64 column with NO nulls — chosen
+;; instead of reusing wm5_vn's int-null trick because the legacy
+;; ht_path's accum_from_entry has no int-null-sentinel skip at all for
+;; narrow-int SUM (a separate, pre-existing gap, confirmed independently
+;; via a 9-key/1-agg repro that is orthogonal to this task's masks — see
+;; task report); an F64 agg with no nulls sidesteps that gap entirely
+;; while still exercising the alias position. Bit 64 does not exist in
+;; a uint64_t (the shift itself is UB), so agg index 64 is exactly what
+;; a future regression that loosened the 64 cap without further
+;; widening da_ctx_t's agg_f64_mask would corrupt the SAME way a33 was
+;; corrupted above: index 64 mod 64 = index 0 (a01's slot), so a01 (an
+;; I32, non-F64 agg) would be wrongly reinterpreted as F64 raw bits —
+;; a drastically wrong number, not a subtle one. Correct results here
+;; both confirm the hash-path fallback is right AND stand as a
+;; regression guard on the gate itself. ──
+(set wm5_vd [1.5 2.5 10.5 20.5])
+(set wm5_r65 (select {from: wm5_t a01: (sum wm5_va) a02: (sum wm5_vf) a03: (sum wm5_vf) a04: (sum wm5_vf) a05: (sum wm5_vf) a06: (sum wm5_vf) a07: (sum wm5_vf) a08: (sum wm5_vf) a09: (sum wm5_vf) a10: (sum wm5_vf) a11: (sum wm5_vf) a12: (sum wm5_vf) a13: (sum wm5_vf) a14: (sum wm5_vf) a15: (sum wm5_vf) a16: (sum wm5_vf) a17: (sum wm5_vf) a18: (sum wm5_vf) a19: (sum wm5_vf) a20: (sum wm5_vf) a21: (sum wm5_vf) a22: (sum wm5_vf) a23: (sum wm5_vf) a24: (sum wm5_vf) a25: (sum wm5_vf) a26: (sum wm5_vf) a27: (sum wm5_vf) a28: (sum wm5_vf) a29: (sum wm5_vf) a30: (sum wm5_vf) a31: (sum wm5_vf) a32: (sum wm5_vf) a33: (sum wm5_vf) a34: (sum wm5_vf) a35: (sum wm5_vf) a36: (sum wm5_vf) a37: (sum wm5_vf) a38: (sum wm5_vf) a39: (sum wm5_vf) a40: (sum wm5_vf) a41: (sum wm5_vf) a42: (sum wm5_vf) a43: (sum wm5_vf) a44: (sum wm5_vf) a45: (sum wm5_vf) a46: (sum wm5_vf) a47: (sum wm5_vf) a48: (sum wm5_vf) a49: (sum wm5_vf) a50: (sum wm5_vf) a51: (sum wm5_vf) a52: (sum wm5_vf) a53: (sum wm5_vf) a54: (sum wm5_vf) a55: (sum wm5_vf) a56: (sum wm5_vf) a57: (sum wm5_vf) a58: (sum wm5_vf) a59: (sum wm5_vf) a60: (sum wm5_vf) a61: (sum wm5_vf) a62: (sum wm5_vf) a63: (sum wm5_vf) a64: (sum wm5_vf) a65: (sum wm5_vd) by: {gk: k}}))
+(at (meta wm5_r65) 'len) -- 66
+(at wm5_r65 'gk) -- [1 2]
+(at wm5_r65 'a01) -- [-2147483548 30]
+(at wm5_r65 'a02) -- [14 6]
+(at wm5_r65 'a64) -- [14 6]
+(at wm5_r65 'a65) -- [4.0 31.0]
+
