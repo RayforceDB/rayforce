@@ -2142,11 +2142,12 @@ static ray_t* attach_via(ray_t* v, ray_t* (*fn)(ray_t**)) {
     if (!v || RAY_IS_ERR(v)) return v;
     ray_t* w = v;
     ray_retain(w);
+    /* fn() receives &w only to REWRITE w's heap value (COW); it never
+     * returns the local's address — cppcheck 2.13 infers r could alias
+     * &w through the callback and misfires returnDanglingLifetime. */
     ray_t* r = fn(&w);
-    if (RAY_IS_ERR(r)) { ray_release(w); return r; }
-    /* Returns w's heap VALUE (fn may rewrite it through &w for COW), not a
-     * pointer to the local itself — cppcheck 2.13 misreads the pattern. */
     // cppcheck-suppress returnDanglingLifetime
+    if (RAY_IS_ERR(r)) { ray_release(w); return r; }
     return w;
 }
 
