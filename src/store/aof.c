@@ -50,6 +50,10 @@
 #include <errno.h>
 
 #define AOF_PATH_MAX    1024
+/* Segment-path buffers are sized past the worst case (dir + '/' + 24-char
+ * segment name) so gcc's -Wformat-truncation can prove snprintf fits even
+ * without seeing the dir-length guard in ray_aof_open. */
+#define AOF_SEGPATH_MAX (AOF_PATH_MAX + 32)
 #define AOF_HEADER      8            /* u32 len + u32 crc                   */
 #define AOF_SEG_FMT     "%020lld.aof"
 #define AOF_SEG_NAMELN  24           /* 20 digits + ".aof"                  */
@@ -191,7 +195,7 @@ static int64_t aof_segments(const char* dir, int64_t** out) {
 }
 
 static void aof_seg_path(char* buf, const char* dir, int64_t first_lsn) {
-    snprintf(buf, AOF_PATH_MAX, "%s/" AOF_SEG_FMT, dir, (long long)first_lsn);
+    snprintf(buf, AOF_SEGPATH_MAX, "%s/" AOF_SEG_FMT, dir, (long long)first_lsn);
 }
 
 /* ── Segment walk ──────────────────────────────────────────────────────
@@ -327,7 +331,7 @@ ray_aof_t* ray_aof_open(const char* dir, int64_t segment_limit,
     int64_t  nseg = aof_segments(dir, &segs);
     if (nseg < 0) { ray_sys_free(log); *out_err = RAY_ERR_IO; return NULL; }
 
-    char path[AOF_PATH_MAX];
+    char path[AOF_SEGPATH_MAX];
     aof_seg_path(path, dir, 0);
     if (nseg > 0) {
         int64_t tail_base = segs[nseg - 1];
@@ -382,7 +386,7 @@ static ray_err_t aof_rotate(ray_aof_t* log) {
     if (ray_file_sync((ray_fd_t)fileno(log->fp)) != RAY_OK) return RAY_ERR_IO;
     if (fclose(log->fp) != 0) { log->fp = NULL; return RAY_ERR_IO; }
 
-    char path[AOF_PATH_MAX];
+    char path[AOF_SEGPATH_MAX];
     aof_seg_path(path, log->dir, log->next_lsn);
     log->fp = fopen(path, "ab");
     if (!log->fp) return RAY_ERR_IO;
@@ -447,7 +451,7 @@ int64_t ray_aof_scan(const char* dir, int64_t from_lsn, ray_aof_scan_cb_t cb,
     if (nseg < 0) { *out_err = RAY_ERR_IO; return -1; }
 
     int64_t delivered = 0;
-    char    path[AOF_PATH_MAX];
+    char    path[AOF_SEGPATH_MAX];
     for (int64_t i = 0; i < nseg; i++) {
         if (i + 1 < nseg && segs[i + 1] <= from_lsn) continue;
 
