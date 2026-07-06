@@ -1538,6 +1538,197 @@ static inline bool op_is_heavy(uint16_t opc) {
            (opc >= OP_EXPAND && opc <= OP_KNN_RERANK);
 }
 
+/* ── Deep-DAG stack discipline ──────────────────────────────────────
+ * exec_node/exec_node_inner recurse per child, and exec_node_inner's
+ * frame is the union of every case's locals (~35 KB under ASan), so a
+ * deep op chain overflows the 8 MB main stack around depth ~220 —
+ * worker/IPC threads with 512 KB stacks die far sooner.  Two defenses:
+ *
+ *  1. Elementwise chains — the one shape that gets arbitrarily deep in
+ *     practice (machine-generated arithmetic, the >1024-node streaming
+ *     DAG test) — are evaluated iteratively by exec_elementwise_tree
+ *     and consume no recursion depth.
+ *  2. Any other graph nesting past RAY_EXEC_MAX_DEPTH is pathological:
+ *     fail with a clean "limit" error instead of a stack overflow
+ *     (mirrors RAY_EVAL_MAX_DEPTH in lang/eval.c).  The counter is
+ *     per-thread; 64 levels of non-elementwise nesting stays within
+ *     ~2.5 MB even at ASan frame sizes. */
+#define RAY_EXEC_MAX_DEPTH 64
+static _Thread_local int32_t tl_exec_depth = 0;
+
+/* Opcodes handled by the elementwise case of exec_node_inner — must
+ * match its case labels (ROUND sits at 9, outside NEG..CAST; IDIV at
+ * 49, outside ADD..MAX2). */
+static inline bool op_is_elementwise(uint16_t o) {
+    return o == OP_ROUND || (o >= OP_NEG && o <= OP_CAST)
+        || (o >= OP_ADD && o <= OP_MAX2) || o == OP_IDIV;
+}
+
+/* Iterative post-order evaluation of an elementwise subtree.
+ *
+ * Replaces the recursive per-child fallback, which burned one
+ * exec_node+exec_node_inner frame pair per chain link.  The walk uses
+ * an explicit heap stack:
+ *
+ *  - elementwise children are evaluated exactly once (vals[] memo,
+ *    released when their last in-tree consumer has run);
+ *  - non-elementwise children (SCAN/CONST/aggregates/...) remain
+ *    exec_node calls, evaluated per reference like the recursion did,
+ *    and bounded by the depth guard;
+ *  - each node still gets an expr_compile attempt on descent, so
+ *    fuseable sub-windows (within the compiler's depth-64 DFS cap)
+ *    run the fused kernels exactly as before — only the spine above
+ *    them is interpreted node-by-node. */
+static ray_t* exec_elementwise_tree(ray_graph_t* g, ray_op_t* root) {
+    uint32_t nc = g->node_count;
+    int64_t  nr = g->table ? ray_table_nrows(g->table) : 0;
+
+    typedef struct { uint32_t id; uint8_t phase; } ew_ent_t;
+    enum { EW_NEW = 0, EW_PENDING = 1, EW_DONE = 2, EW_SEEN = 3 };
+
+    /* One carve for the id-indexed maps plus the walk stack.  Stack
+     * bound: one discover push per edge (≤ 2·nc) + one emit push per
+     * node (≤ nc).  The byte-wide state map goes last so every wider
+     * field stays naturally aligned. */
+    size_t vals_sz = (size_t)nc * sizeof(ray_t*);
+    size_t uses_sz = (size_t)nc * sizeof(uint32_t);
+    size_t stk_sz  = ((size_t)3 * nc + 2) * sizeof(ew_ent_t);
+    ray_t* hdr = NULL;
+    char* mem = (char*)scratch_calloc(&hdr, vals_sz + uses_sz + stk_sz + (size_t)nc);
+    if (!mem) return ray_error("oom", NULL);
+    ray_t**   vals  = (ray_t**)mem;
+    uint32_t* uses  = (uint32_t*)(mem + vals_sz);
+    ew_ent_t* stk   = (ew_ent_t*)(mem + vals_sz + uses_sz);
+    uint8_t*  state = (uint8_t*)(mem + vals_sz + uses_sz + stk_sz);
+
+    ray_t* result = NULL;
+    int64_t sp = 0;
+
+    /* Prepass: count each node's in-tree consumers (parent edges from
+     * elementwise nodes, +1 for the root's return reference) BEFORE
+     * evaluating anything.  Counting lazily during the walk is wrong
+     * for diamond sharing: the first parent to emit would see the
+     * shared child at 1 use, drop it to 0 and free the value while a
+     * later parent still needs it.  Marks nodes EW_SEEN, which the
+     * evaluation walk below treats as unvisited. */
+    uses[root->id] = 1;
+    stk[sp++] = (ew_ent_t){root->id, 0};
+    while (sp > 0) {
+        uint32_t id = stk[--sp].id;
+        if (state[id] != EW_NEW) continue;
+        state[id] = EW_SEEN;
+        ray_op_t* n = op_node(g, id);
+        if (!n) { result = ray_error("nyi", NULL); goto done; }
+        for (int k = 0; k < n->arity; k++) {
+            ray_op_t* c = op_child(g, n, k);
+            if (c && op_is_elementwise(c->opcode)) {
+                uses[c->id]++;                    /* one per edge */
+                stk[sp++] = (ew_ent_t){c->id, 0};
+            }
+        }
+    }
+
+    stk[sp++] = (ew_ent_t){root->id, 0};
+
+    while (sp > 0) {
+        ew_ent_t e = stk[--sp];
+        ray_op_t* n = op_node(g, e.id);
+        if (!n) { result = ray_error("nyi", NULL); goto done; }
+
+        if (e.phase == 0) {                       /* discover */
+            if (state[e.id] == EW_DONE)           /* shared node, evaluated */
+                continue;
+            if (state[e.id] == EW_PENDING) {
+                /* Re-discovering a node whose emit is still pending means
+                 * the node is its own ancestor — a cyclic graph.  Refuse
+                 * rather than read a missing value. */
+                result = ray_error("nyi", NULL);
+                goto done;
+            }
+            state[e.id] = EW_PENDING;
+
+            /* Fusion attempt on descent (root's was just done by the
+             * caller).  The recursion re-tried expr_compile at every
+             * level; keep that so the deepest fuseable window still
+             * runs compiled. */
+            if (n != root && g->table && nr > 0) {
+                ray_expr_t ex;
+                if (expr_compile(g, g->table, n, &ex)) {
+                    ray_t* vec = expr_eval_full(&ex, nr);
+                    if (vec && !RAY_IS_ERR(vec)) {
+                        vals[e.id]  = vec;
+                        state[e.id] = EW_DONE;
+                        continue;
+                    }
+                    ray_error_free(vec);   /* fall through to per-node eval */
+                }
+            }
+
+            stk[sp++] = (ew_ent_t){e.id, 1};
+            for (int k = 0; k < n->arity; k++) {
+                ray_op_t* c = op_child(g, n, k);
+                if (c && op_is_elementwise(c->opcode))
+                    stk[sp++] = (ew_ent_t){c->id, 0};
+                /* non-elementwise children evaluate at emit time */
+            }
+        } else {                                  /* emit */
+            ray_t* in[2]    = {NULL, NULL};
+            bool   owned[2] = {false, false};     /* boundary refs to release */
+            for (int k = 0; k < n->arity; k++) {
+                ray_op_t* c = op_child(g, n, k);
+                if (c && op_is_elementwise(c->opcode)) {
+                    in[k] = vals[c->id];
+                    if (!in[k]) { result = ray_error("nyi", NULL); goto emit_fail; }
+                } else {
+                    in[k] = exec_node(g, c);      /* may recurse; depth-guarded */
+                    owned[k] = true;
+                    if (!in[k] || RAY_IS_ERR(in[k])) {
+                        result = in[k];
+                        in[k] = NULL;
+                        goto emit_fail;
+                    }
+                }
+            }
+
+            ray_t* out = (n->arity == 1)
+                       ? exec_elementwise_unary(g, n, in[0])
+                       : exec_elementwise_binary(g, n, in[0], in[1]);
+
+            for (int k = 0; k < n->arity; k++) {
+                if (owned[k]) {
+                    ray_release(in[k]);
+                } else {
+                    uint32_t cid = op_child(g, n, k)->id;
+                    if (--uses[cid] == 0) {
+                        ray_release(vals[cid]);
+                        vals[cid] = NULL;
+                    }
+                }
+            }
+            if (!out || RAY_IS_ERR(out)) { result = out; goto done; }
+            vals[e.id]  = out;
+            state[e.id] = EW_DONE;
+            continue;
+
+        emit_fail:
+            for (int k = 0; k < n->arity; k++)
+                if (owned[k] && in[k]) ray_release(in[k]);
+            goto done;
+        }
+    }
+
+    result = vals[root->id];
+    vals[root->id] = NULL;
+
+done:
+    /* Release stragglers: partially-evaluated memo entries on the error
+     * path (the success path has drained all consumers already). */
+    for (uint32_t i = 0; i < nc; i++)
+        if (vals[i]) ray_release(vals[i]);
+    scratch_free(hdr);
+    return result;
+}
+
 ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
     if (!op) return ray_error("nyi", NULL);
 
@@ -1545,6 +1736,12 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
      * exec_node many times; this catches Ctrl-C between operators
      * without adding cost to the per-row hot path. */
     if (ray_interrupted()) return ray_error("cancel", "interrupted");
+
+    /* Recursion depth guard — see RAY_EXEC_MAX_DEPTH above. */
+    if (++tl_exec_depth > RAY_EXEC_MAX_DEPTH) {
+        tl_exec_depth--;
+        return ray_error("limit", "exec depth exceeded");
+    }
 
     bool heavy = op_is_heavy(op->opcode);
     bool profiling = g_ray_profile.active && heavy;
@@ -1570,6 +1767,7 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
     }
 
     ray_t* _prof_result = exec_node_inner(g, op);
+    tl_exec_depth--;
 
     if (profiling) {
         ray_prof_span_t* ep = ray_profile_span_end(oname);
@@ -1693,23 +1891,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     }
                 }
             }
-            /* Fallback: recursive per-node evaluation */
-            if (op->arity == 1) {
-                ray_t* input = exec_node(g, op_child(g, op, 0));
-                if (!input || RAY_IS_ERR(input)) return input;
-                ray_t* result = exec_elementwise_unary(g, op, input);
-                ray_release(input);
-                return result;
-            } else {
-                ray_t* lhs = exec_node(g, op_child(g, op, 0));
-                ray_t* rhs = exec_node(g, op_child(g, op, 1));
-                if (!lhs || RAY_IS_ERR(lhs)) { if (rhs && !RAY_IS_ERR(rhs)) ray_release(rhs); return lhs; }
-                if (!rhs || RAY_IS_ERR(rhs)) { ray_release(lhs); return rhs; }
-                ray_t* result = exec_elementwise_binary(g, op, lhs, rhs);
-                ray_release(lhs);
-                ray_release(rhs);
-                return result;
-            }
+            /* Fallback: iterative per-node evaluation.  Deep chains
+             * (>1024-node NEG spines, machine-generated arithmetic)
+             * previously recursed one exec_node frame pair per link
+             * and overflowed the stack — see exec_elementwise_tree. */
+            return exec_elementwise_tree(g, op);
         }
 
         /* Reductions */

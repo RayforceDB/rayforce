@@ -2220,13 +2220,27 @@ static void propagate_nulls_binary(ray_t* lhs, ray_t* rhs, ray_t* result,
  * Element-wise execution
  * ============================================================================ */
 
+/* Graph type-inference stamps elementwise nodes with the scanned
+ * column's raw STORAGE tag — RAY_PARTED_* / RAY_MAPCOMMON propagate
+ * verbatim through NEG/ABS/... and promote().  At exec time OP_SCAN
+ * always hands the kernels a flat vector (segment tables in streaming
+ * mode, the flatten cold path otherwise), so a storage-tagged out_type
+ * would make ray_vec_new reject the allocation ("type" error).
+ * Normalize to the runtime element type: parted → its base type,
+ * mapcommon → the materialized operand's type. */
+static inline int8_t ew_runtime_out_type(int8_t out_type, int8_t operand_type) {
+    if (RAY_IS_PARTED(out_type)) return (int8_t)RAY_PARTED_BASETYPE(out_type);
+    if (out_type == RAY_MAPCOMMON) return operand_type;
+    return out_type;
+}
+
 ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     (void)g;
     if (!input || RAY_IS_ERR(input)) return input;
     if (!ray_is_vec(input)) return ray_error("type", "expr eval: unary op expects a vector, got %s", ray_type_name(input->type));
     int64_t len = input->len;
     int8_t in_type = input->type;
-    int8_t out_type = op->out_type;
+    int8_t out_type = ew_runtime_out_type(op->out_type, in_type);
 
     ray_t* result = ray_vec_new(out_type, len);
     if (!result || RAY_IS_ERR(result)) return result;
@@ -3010,7 +3024,10 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         len = lhs->len;
     }
 
-    int8_t out_type = op->out_type;
+    int8_t out_type = ew_runtime_out_type(op->out_type,
+                                          !l_scalar ? lhs->type
+                                        : !r_scalar ? rhs->type
+                                        : (int8_t)(lhs->type < 0 ? -lhs->type : lhs->type));
     ray_t* result = ray_vec_new(out_type, len);
     if (!result || RAY_IS_ERR(result)) return result;
     result->len = len;

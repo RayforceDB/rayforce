@@ -9016,11 +9016,23 @@ static test_result_t test_exec_streaming_large_dag(void) {
     /* node_count = 1026 after the loop      */
 
     ray_t* result = ray_execute(g, op);
-    if (result && !RAY_IS_ERR(result)) {
-        /* 1025 NEG ops = odd count → result is the negated column.
-         * Values: [-3, 1, 2, -5] (each negated 1025 times) */
-        ray_release(result);
+    /* 1025 NEG ops = odd count → result is the negated column.
+     * Values: [-3, 1, 2, -5] (each negated 1025 times).  Must be a real
+     * value, not an error: deep elementwise chains evaluate iteratively
+     * (exec_elementwise_tree), so neither the stack nor the exec depth
+     * guard bounds them. */
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_TRUE(!RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
+    TEST_ASSERT_EQ_I(result->len, 4);
+    {
+        const int64_t* rd = (const int64_t*)ray_data(result);
+        TEST_ASSERT_EQ_I(rd[0], -3);
+        TEST_ASSERT_EQ_I(rd[1],  1);
+        TEST_ASSERT_EQ_I(rd[2],  2);
+        TEST_ASSERT_EQ_I(rd[3], -5);
     }
+    ray_release(result);
 
     ray_graph_free(g);
     ray_release(tbl);
@@ -9030,6 +9042,126 @@ static test_result_t test_exec_streaming_large_dag(void) {
     ray_release(pcol);
     ray_release(seg0);
     ray_release(seg1);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- deep binary elementwise chain: 1500 ADD(const) links.
+ *
+ * Exercises the binary arm of exec_elementwise_tree on a flat (non-
+ * streaming) table: each link's right child is a non-elementwise
+ * OP_CONST boundary evaluated at emit time.  Before the iterative
+ * fallback this recursed one exec_node+exec_node_inner frame pair per
+ * link (~35 KB each under ASan) and overflowed the 8 MB main stack. */
+static test_result_t test_exec_deep_binary_chain(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t v_data[] = {3, -1, -2, 5};
+    int64_t col_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, col_v, ray_vec_from_raw(RAY_I64, v_data, 4));
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* op = ray_scan(g, "v");
+    for (int i = 0; i < 1500; i++)
+        op = ray_add(g, op, ray_const_i64(g, 1));
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_TRUE(!RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
+    TEST_ASSERT_EQ_I(result->len, 4);
+    {
+        const int64_t* rd = (const int64_t*)ray_data(result);
+        TEST_ASSERT_EQ_I(rd[0], 1503);
+        TEST_ASSERT_EQ_I(rd[1], 1499);
+        TEST_ASSERT_EQ_I(rd[2], 1498);
+        TEST_ASSERT_EQ_I(rd[3], 1505);
+    }
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- deep DAG with a shared (diamond) elementwise node.
+ *
+ * root = ADD(NEG^100(D), D) with D = NEG(v): the chain is deep enough
+ * (>64) that expr_compile bails and exec_elementwise_tree interprets
+ * it, and D has two in-tree consumers — the chain bottom and root.
+ * Locks the prepass use-counting: with lazy counting the chain bottom
+ * would free D's value before root's emit read it. */
+static test_result_t test_exec_deep_shared_dag(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t v_data[] = {3, -1, -2, 5};
+    int64_t col_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, col_v, ray_vec_from_raw(RAY_I64, v_data, 4));
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* d = ray_neg(g, ray_scan(g, "v"));   /* D = -v */
+    ray_op_t* chain = d;
+    for (int i = 0; i < 100; i++)                 /* NEG^100(D) = D */
+        chain = ray_neg(g, chain);
+    ray_op_t* root = ray_add(g, chain, d);        /* D + D = -2v */
+
+    ray_t* result = ray_execute(g, root);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_TRUE(!RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_I64);
+    TEST_ASSERT_EQ_I(result->len, 4);
+    {
+        const int64_t* rd = (const int64_t*)ray_data(result);
+        TEST_ASSERT_EQ_I(rd[0],  -6);
+        TEST_ASSERT_EQ_I(rd[1],   2);
+        TEST_ASSERT_EQ_I(rd[2],   4);
+        TEST_ASSERT_EQ_I(rd[3], -10);
+    }
+    ray_release(result);
+
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ---- exec depth guard: non-elementwise nesting past RAY_EXEC_MAX_DEPTH.
+ *
+ * Elementwise chains bypass the recursion entirely, but every other
+ * opcode still burns a frame pair per level; a 100-deep SUM tower must
+ * come back as a clean "limit" error (exec.c RAY_EXEC_MAX_DEPTH = 64),
+ * not a stack overflow. */
+static test_result_t test_exec_depth_guard_limit(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t v_data[] = {1, 2, 3, 4};
+    int64_t col_v = ray_sym_intern("v", 1);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, col_v, ray_vec_from_raw(RAY_I64, v_data, 4));
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* op = ray_scan(g, "v");
+    for (int i = 0; i < 100; i++)
+        op = ray_sum(g, op);
+
+    ray_t* result = ray_execute(g, op);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->slen, 5);
+    TEST_ASSERT_TRUE(memcmp(result->sdata, "limit", 5) == 0);
+    ray_error_free(result);
+
+    ray_graph_free(g);
+    ray_release(tbl);
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
@@ -17391,6 +17523,9 @@ const test_entry_t exec_entries[] = {
     { "exec/head_filter_pred_error",           test_exec_head_filter_pred_error,           NULL, NULL },
     { "exec/select_expr_col_error",            test_exec_select_expr_col_error,            NULL, NULL },
     { "exec/streaming_large_dag",              test_exec_streaming_large_dag,              NULL, NULL },
+    { "exec/deep_binary_chain",                test_exec_deep_binary_chain,                NULL, NULL },
+    { "exec/deep_shared_dag",                  test_exec_deep_shared_dag,                  NULL, NULL },
+    { "exec/depth_guard_limit",                test_exec_depth_guard_limit,                NULL, NULL },
     { "exec/filter_group_parted_empty",        test_exec_filter_group_parted_empty,        NULL, NULL },
     { "exec/head_parted_sym_wrong_esz",        test_exec_head_parted_sym_wrong_esz,        NULL, NULL },
     { "exec/tail_parted_sym_wrong_esz",        test_exec_tail_parted_sym_wrong_esz,        NULL, NULL },
