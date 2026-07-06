@@ -2917,7 +2917,19 @@ static void accum_from_entry_nullable(char* row, const char* entry,
 static inline void init_accum_from_entry(char* row, const char* entry,
                                           const ght_layout_t* ly) {
     if (ly->any_agg_null) { init_accum_from_entry_nullable(row, entry, ly); return; }
-    uint16_t accum_start = (uint16_t)(8 + ((uint16_t)ly->n_keys + 1) * 8);
+    /* key_region-based (mirrors init_accum_from_entry_nullable): the old
+     * `8 + (n_keys+1)*8` assumed exactly one trailing null-mask word.  For
+     * null_words > 1 (n_keys > 64) that understates the accumulator start
+     * by (null_words-1)*8 bytes, so this memset's zero-fill reached
+     * backward into the last null-mask word — clobbering it to 0
+     * immediately after group_probe_entry's memcpy stored it correctly.
+     * Invisible to plain GROUP BY (which never re-reads null words from a
+     * stored HT row after ingest — the emitted key values come from a
+     * separate source-column re-scan), but wrong for PIVOT, whose own
+     * ix-dedupe/emit code (pivot.c) reads the null words directly back out
+     * of these same rows: the 65-index conflation-detector cell in
+     * tblop_branch_cov.rfl is the regression pin. */
+    uint16_t accum_start = (uint16_t)(8 + ly->key_region);
     if (ly->row_stride > accum_start)
         memset(row + accum_start, 0, ly->row_stride - accum_start);
 
@@ -11453,7 +11465,15 @@ bool pivot_ingest_run(pivot_ingest_t* out,
         (size_t)(RADIX_P + 1) * sizeof(uint32_t));
     if (!out->part_offsets) return false;
 
-    uint8_t n_keys = ly->n_keys;
+    /* uint32_t, not uint8_t: ly->n_keys is uint16_t (unbounded-ready, Task
+     * 1).  This local used to truncate mod 256 — dormant while every
+     * caller's n_keys stayed <=8, but pivot.c (the only caller of this
+     * function) now admits any n_idx, so n_keys > 255 is reachable.  A
+     * truncated value here undersizes the key_pool carve below while
+     * derive_key_pool still writes ly->n_keys (untruncated) entries into
+     * it — a heap buffer overflow, not just a wrong answer, once any
+     * index key is wide (RAY_GUID/RAY_STR) and n_keys > 255. */
+    uint32_t n_keys = ly->n_keys;
 
     ray_pool_t* pool = ray_pool_get();
     uint32_t n_total = pool ? ray_pool_total_workers(pool) : 1;

@@ -110,21 +110,37 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
      * cells into runtime atoms (the Task-3 chokepoint), so the
      * ray_sym_str / ray_table_get_col calls below stay global.
      *
-     * Bound: 7 index columns, honestly matching exec_pivot's ght
-     * layout gate (pivot.c: n_keys = n_idx + 1 > 8 → error) — the
-     * true structural limit of the [8]-slot group layout.  This is a
-     * documented spec deviation: cut 3 lifts join/group/distinct key
-     * caps to unbounded, but pivot routes through the cut-4 ght
-     * rework's fixed [8] layout, so its cap stays put until then. */
-    int64_t idx_syms[8];
-    int64_t n_idx = 0;
+     * No count cap: pivot's index-column bound used to mirror exec_pivot's
+     * ght layout's fixed [8]-slot key array (pivot.c: n_keys = n_idx + 1 >
+     * 8 -> error), a documented spec deviation from cut 3's otherwise-
+     * unbounded join/group/distinct key caps.  The cut-4 ght rework widens
+     * that layout to spill past 8 keys (same mechanism group.c's
+     * exec_group_run relies on), so both this caller-side check and
+     * exec_pivot's own gate are gone — n_idx is sized from the real column
+     * count below, not compared against a cap. */
+    int64_t n_idx;
     if (index_arg->type == -RAY_SYM) {
-        idx_syms[0] = index_arg->i64;
         n_idx = 1;
     } else if (index_arg->type == RAY_LIST || ray_is_vec(index_arg)) {
-        int64_t len = ray_len(index_arg);
-        if (len > 7) return ray_error("limit", "pivot: too many index columns, max 7 (group layout bound, lifted in the ght rework)");
-        for (int64_t i = 0; i < len; i++) {
+        n_idx = ray_len(index_arg);
+    } else {
+        return ray_error("type", "pivot: index must be a symbol or list of symbols, got %s", ray_type_name(index_arg->type));
+    }
+
+    /* VLA, exact-size (mirrors group.c's exec_group_run driver arrays —
+     * key_vecs/key_data/key_types/key_attrs, cut-4 Task 4 — the established
+     * pattern for small per-index metadata scoped to one function call:
+     * every one of this function's many return points below frees it via
+     * ordinary C stack unwind, so there is no carve-then-forget-to-free
+     * hazard to track across those exits).  Floored at 1 to sidestep
+     * zero-length VLA UB (an empty index list is legal: pivot grouped by
+     * the pivot column alone). */
+    int64_t vla_idx = n_idx > 0 ? n_idx : 1;
+    int64_t idx_syms[vla_idx];
+    if (index_arg->type == -RAY_SYM) {
+        idx_syms[0] = index_arg->i64;
+    } else {
+        for (int64_t i = 0; i < n_idx; i++) {
             int alloc = 0;
             ray_t* elem = collection_elem(index_arg, i, &alloc);
             if (RAY_IS_ERR(elem)) return elem;
@@ -136,9 +152,6 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
             idx_syms[i] = elem->i64;
             if (alloc) ray_release(elem);
         }
-        n_idx = len;
-    } else {
-        return ray_error("type", "pivot: index must be a symbol or list of symbols, got %s", ray_type_name(index_arg->type));
     }
 
     /* Get pivot column, value column */
@@ -154,8 +167,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     if (pcol->type == RAY_STR)
         return ray_error("nyi", "pivot: STR pivot column not supported as column names");
 
-    /* Get index columns */
-    ray_t* icols[8]; /* n_idx <= 7, see the bound comment above */
+    /* Get index columns (VLA, exact-size; see idx_syms above) */
+    ray_t* icols[vla_idx];
     for (int64_t i = 0; i < n_idx; i++) {
         icols[i] = ray_table_get_col(tbl, idx_syms[i]);
         if (!icols[i]) return ray_error("domain", "pivot: index column not found");
@@ -173,7 +186,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     if (dag_ok) {
         ray_graph_t* g = ray_graph_new(tbl);
         if (!g) return ray_error("oom", NULL);
-        ray_op_t* idx_ops[8]; /* n_idx <= 7 */
+        ray_op_t* idx_ops[vla_idx]; /* VLA, exact-size; see idx_syms above */
         bool ok = true;
         for (int64_t i = 0; i < n_idx && ok; i++) {
             ray_t* s = ray_sym_str(idx_syms[i]);
@@ -202,8 +215,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) return ray_error("oom", NULL);
 
-    uint32_t n_keys = n_idx + 1;
-    ray_op_t* key_ops[8]; /* n_keys = n_idx + 1 <= 8 */
+    uint32_t n_keys = (uint32_t)n_idx + 1;
+    ray_op_t* key_ops[n_keys]; /* VLA, exact-size; n_keys = n_idx + 1 >= 1 always */
     bool ok = true;
     for (int64_t i = 0; i < n_idx && ok; i++) {
         ray_t* s = ray_sym_str(idx_syms[i]);
@@ -234,8 +247,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
      * Now for each group, gather the value column subset and apply agg_fn. */
     int64_t n_grps = ray_table_nrows(grouped);
 
-    /* Get grouped columns */
-    ray_t* g_icols[8]; /* n_idx <= 7 */
+    /* Get grouped columns (VLA, exact-size; see idx_syms above) */
+    ray_t* g_icols[vla_idx];
     for (int64_t i = 0; i < n_idx; i++)
         g_icols[i] = ray_table_get_col(grouped, idx_syms[i]);
     ray_t* g_pcol = ray_table_get_col(grouped, pivot_col_name->i64);

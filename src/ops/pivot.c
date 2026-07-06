@@ -257,6 +257,18 @@ ray_t* exec_if(ray_graph_t* g, ray_op_t* op) {
     return result;
 }
 
+/* Fold the null-mask words [nullw, nullw+null_words) into a running hash.
+ * Mirrors group.c's ght_hash_null_words (file-local there, so pivot.c
+ * carries its own copy): an all-zero word contributes nothing, so the
+ * single-word (<=64-key) case is byte-identical to the historical
+ * `if (idx_nmask) combine` this replaces. */
+static inline uint64_t pivot_hash_null_words(uint64_t h, const int64_t* nullw,
+                                             uint32_t null_words) {
+    for (uint32_t w = 0; w < null_words; w++)
+        if (nullw[w]) h = ray_hash_combine(h, ray_hash_i64(nullw[w]));
+    return h;
+}
+
 /* ============================================================================
  * exec_pivot — single-pass hash-aggregated pivot table
  *
@@ -274,11 +286,16 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     uint16_t agg_op = ext->pivot.agg_op;
     int64_t nrows   = ray_table_nrows(tbl);
 
-    /* Fixed [8]: n_idx (pivot index-column count) is gated to ≤7 at
-     * the compile-side caller (tblop.c pivot_fn_impl: "too many index
-     * columns, max 7") before OP_PIVOT is ever built — the honest cut-3
-     * cap, matching this function's own n_keys > 8 gate just below. */
-    ray_t* idx_vecs[8];
+    /* VLA, exact-size: n_idx is no longer capped at 7 (task 6 lifts both
+     * this function's own former n_keys > 8 gate and tblop.c's caller-side
+     * check — the ght layout below spills to a heap block for n_keys > 8,
+     * same mechanism group.c's exec_group_run already relies on).  Sized
+     * ≥1 to sidestep zero-length VLA UB when n_idx == 0 (a pivot with no
+     * index columns is legal — grouping is by the pivot column alone).
+     * Scope-lifetime: every one of this function's many early returns
+     * below frees it via ordinary C stack unwind, so there is no
+     * carve-then-forget-to-free hazard to track across those exits. */
+    ray_t* idx_vecs[n_idx ? n_idx : 1];
     for (uint32_t i = 0; i < n_idx; i++) {
         ray_op_ext_t* ie = find_ext(g, ext->pivot.index_cols[i]);
         idx_vecs[i] = (ie && ie->base.opcode == OP_SCAN)
@@ -298,32 +315,31 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 
     if (nrows == 0) return ray_table_new(0);
 
-    /* Combined keys: index_cols + pivot_col */
+    /* Combined keys: index_cols + pivot_col.  No count cap — the ght
+     * layout below (ght_compute_layout) spills to an owned heap block
+     * whenever n_keys exceeds its GHT_INLINE (8) inline capacity; its own
+     * key-stride budget (uint16 byte offsets) is the only remaining limit,
+     * unreachable at any index-column count a real table could carry. */
     uint32_t n_keys = n_idx + 1;
-    /* Defensive: tblop.c's caller-side cap (max 7 index cols) already
-     * enforces n_keys <= 8 before OP_PIVOT is built, so this is
-     * unreachable from the language surface today — kept as the real
-     * structural gate on the [8]-slot ght layout below (and as a
-     * backstop against any future caller that builds OP_PIVOT
-     * directly, bypassing tblop.c's check). */
-    if (n_keys > 8) return ray_error("limit", "pivot: too many index columns");
 
-    /* Wide-key resolution: for RAY_GUID the HT slot holds a source row
+    /* VLA, exact-size (see idx_vecs above for the rationale/precedent).
+     * Wide-key resolution: for RAY_GUID the HT slot holds a source row
      * index rather than the 16 raw bytes, so phase2 dedupe and emit
-     * route wide keys through the source column (key_data[k]).
-     * Fixed [8]: n_idx <= 7 here — the n_keys > 8 check just above
-     * (n_keys = n_idx + 1) already rejected anything wider, so these
-     * arrays (indexed up to n_idx inclusive, for the pivot key at
-     * key_data[n_idx] etc.) are sized with exactly one spare slot. */
-    bool idx_wide[8] = {0};
+     * route wide keys through the source column (key_data[k]).  These
+     * arrays are indexed up to n_idx inclusive (the pivot key itself
+     * lives at key_data[n_idx] etc.), so key_data/key_types/key_attrs/
+     * key_vecs are sized to n_keys (always >= 1); idx_wide only covers
+     * the n_idx index keys, floored at 1 for the same zero-VLA reason. */
+    bool idx_wide[n_idx ? n_idx : 1];
+    memset(idx_wide, 0, sizeof(idx_wide));
     for (uint32_t k = 0; k < n_idx; k++)
         idx_wide[k] = (idx_vecs[k]->type == RAY_GUID);
     bool pvt_wide = (pcol->type == RAY_GUID);
 
-    void*   key_data[8];
-    int8_t  key_types[8];
-    uint8_t key_attrs[8];
-    ray_t*  key_vecs[8];
+    void*   key_data[n_keys];
+    int8_t  key_types[n_keys];
+    uint8_t key_attrs[n_keys];
+    ray_t*  key_vecs[n_keys];
     for (uint32_t k = 0; k < n_idx; k++) {
         key_data[k]  = ray_data(idx_vecs[k]);
         key_types[k] = idx_vecs[k]->type;
@@ -344,12 +360,12 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (agg_op == OP_MIN) need_flags |= GHT_NEED_MIN;
     if (agg_op == OP_MAX) need_flags |= GHT_NEED_MAX;
 
-    /* n_keys ≤ 8 (gated above) and n_aggs == 1, so the layout is always
-     * inline (spill_hdr == NULL); ght_compute_layout can only fail on the
-     * uint16 key-stride budget, unreachable at ≤8 keys.  ly owns no spill;
-     * ght_layout_free(&ly) at pivot_cleanup is therefore a no-op (kept for
-     * hygiene / future gate lift).  The early-return paths below likewise
-     * free nothing. */
+    /* n_keys/n_aggs are no longer capped: ght_compute_layout spills to an
+     * owned heap block (ly.spill_hdr) whenever n_keys exceeds GHT_INLINE
+     * (8) — the same path group.c's exec_group_run already exercises.
+     * ght_layout_free(&ly) is therefore no longer always a no-op past this
+     * point; every exit below (early return AND pivot_cleanup) must call
+     * it exactly once so a spilled layout's heap block is never leaked. */
     ght_layout_t ly;
     if (!ght_compute_layout(&ly, n_keys, 1, agg_vecs, need_flags, agg_ops, key_types))
         return ray_error("limit", "pivot: key stride budget exceeded");
@@ -362,33 +378,44 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!pivot_ingest_run(&pg, &ly, key_data, key_types, key_attrs,
                           key_vecs, agg_vecs, nrows)) {
         pivot_ingest_free(&pg);
+        ght_layout_free(&ly);
         return ray_error("oom", NULL);
     }
     ray_progress_update("pivot", "dedupe", 0, (uint64_t)pg.total_grps);
-    if (ray_interrupted()) { pivot_ingest_free(&pg); return ray_error("cancel", "interrupted"); }
+    if (ray_interrupted()) {
+        pivot_ingest_free(&pg);
+        ght_layout_free(&ly);
+        return ray_error("cancel", "interrupted");
+    }
     uint32_t grp_count = pg.total_grps;
-    if (grp_count == 0) { pivot_ingest_free(&pg); return ray_table_new(0); }
+    if (grp_count == 0) {
+        pivot_ingest_free(&pg);
+        ght_layout_free(&ly);
+        return ray_table_new(0);
+    }
 
     /* Pass 2: Collect distinct pivot values and distinct index keys.
-     * Each group row layout: [hash:8][key0:8]...[keyN-1:8][null_mask:8][accum...]
-     * where the keys region holds n_idx index keys + 1 pivot key,
-     * followed by the key-null bitmap written by group_rows_range. */
+     * Each group row layout: [hash:8][key0:8]...[keyN-1:8][null_word0:8]
+     * ...[null_wordM-1:8][accum...] where the keys region holds n_idx
+     * index keys + 1 pivot key, followed by the ceil(n_keys/64) key-null
+     * mask words written by group_rows_range (ly.null_words; Task 3). */
 
     /* SQL PIVOT treats a null pivot key as "no column" — drop those groups.
-     * Read as a full int64 from the group row's first null-mask word.  The
-     * ght layout now carries ceil(n_keys/64) null words, but pivot's own
-     * n_idx <= 7 admission gate (n_keys = n_idx+1 <= 8, independent of the
-     * ght-path key gate this migration lifts) pins pivot at exactly one word,
-     * so every null bit here lives in word 0 and this single-word read stays
-     * correct.  Widening this to word-indexed is contingent on pivot's own
-     * index-column gate rising, not on the ght key gate. */
-    const int64_t pvt_null_bit = ((int64_t)1 << n_idx);
+     * The pivot key is the LAST of the n_keys keys, at bit position n_idx —
+     * word-indexed per the Task-3/4 convention (word k>>6, bit k&63; the
+     * unsigned-shift idiom sidesteps UB at bit 63) since n_idx can now
+     * exceed 63 (pivot's own admission gate lifts along with the ght-path
+     * key gate this migration also lifts — the two are no longer
+     * independent facts once BOTH caps are gone). */
+    const uint32_t null_words     = ly.null_words;
+    const uint32_t pvt_null_word  = n_idx >> 6;
+    const int64_t  pvt_null_bit   = (int64_t)((uint64_t)1 << (n_idx & 63));
 
     /* Collect distinct pivot values */
     uint32_t pv_cap = 64, pv_count = 0;
     ray_t* pv_hdr = NULL;
     int64_t* pv_vals = (int64_t*)scratch_alloc(&pv_hdr, pv_cap * sizeof(int64_t));
-    if (!pv_vals) { pivot_ingest_free(&pg); return ray_error("oom", NULL); }
+    if (!pv_vals) { pivot_ingest_free(&pg); ght_layout_free(&ly); return ray_error("oom", NULL); }
 
     const char* pvt_base = pvt_wide ? (const char*)key_data[n_idx] : NULL;
     for (uint32_t _p = 0; _p < pg.n_parts; _p++) {
@@ -397,8 +424,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         for (uint32_t gi_local = 0; gi_local < pcount; gi_local++) {
             const char* row = ph->rows + (size_t)gi_local * pg.row_stride;
             const int64_t* rkeys = (const int64_t*)(row + 8);
-            int64_t nmask = rkeys[n_keys];
-            if (nmask & pvt_null_bit) continue;
+            if (rkeys[n_keys + pvt_null_word] & pvt_null_bit) continue;
             int64_t pval = rkeys[n_idx];
             bool found = false;
             for (uint32_t p = 0; p < pv_count; p++) {
@@ -414,7 +440,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     uint32_t new_cap = pv_cap * 2;
                     int64_t* new_pv = (int64_t*)scratch_realloc(&pv_hdr,
                         pv_cap * sizeof(int64_t), new_cap * sizeof(int64_t));
-                    if (!new_pv) { pivot_ingest_free(&pg); return ray_error("oom", NULL); }
+                    if (!new_pv) { pivot_ingest_free(&pg); ght_layout_free(&ly); return ray_error("oom", NULL); }
                     pv_vals = new_pv;
                     pv_cap = new_cap;
                 }
@@ -425,19 +451,20 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 
     /* Collect distinct index keys.
      * Flat append-only entry array + secondary open-addressed HT keyed by
-     * the hash of (idx_keys + idx_null_mask). The HT makes phase2 dedupe
+     * the hash of (idx_keys + idx_null_words). The HT makes phase2 dedupe
      * O(grp_count) instead of the previous O(grp_count * ix_count)
      * linear scan which hung on large pivots.
-     * Entry layout: [hash:8 | idx_keys:8*n_idx | idx_null_mask:8]. */
+     * Entry layout: [hash:8 | idx_keys:8*n_idx | idx_null_words:8*null_words].
+     * Widened from a single trailing null word (Task-3 carryover finding):
+     * a single word only ever compared/hashed/stored bits 0..63, silently
+     * conflating two index tuples that agree on keys/nulls < 64 but differ
+     * in a null bit >= 64 (index key 64+) into one dedupe entry — the
+     * 65-index cell in tblop_branch_cov.rfl is the regression pin. */
     uint32_t ix_cap = 256, ix_count = 0;
     ray_t* ix_hdr = NULL;
-    size_t ix_entry = 8 + (size_t)n_idx * 8 + 8;
-    /* int64 for the same reason as pvt_null_bit above: pivot's n_idx <= 7 gate
-     * pins the null mask at one word, so the low n_idx bits (the index-key null
-     * flags, excluding the pivot key at bit n_idx) all live in word 0. */
-    const int64_t idx_null_bits = (((int64_t)1 << n_idx) - 1);
+    size_t ix_entry = 8 + (size_t)n_idx * 8 + (size_t)null_words * 8;
     char* ix_rows = (char*)scratch_alloc(&ix_hdr, ix_cap * ix_entry);
-    if (!ix_rows) { scratch_free(pv_hdr); pivot_ingest_free(&pg); return ray_error("oom", NULL); }
+    if (!ix_rows) { scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly); return ray_error("oom", NULL); }
 
     /* Secondary HT: hash slot -> ix_row index; empty = UINT32_MAX. */
     uint32_t ix_ht_cap = 256;
@@ -445,7 +472,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     ray_t* ix_ht_hdr = NULL;
     uint32_t* ix_ht = (uint32_t*)scratch_alloc(&ix_ht_hdr, ix_ht_cap * sizeof(uint32_t));
     if (!ix_ht) {
-        scratch_free(ix_hdr); scratch_free(pv_hdr); pivot_ingest_free(&pg);
+        scratch_free(ix_hdr); scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly);
         return ray_error("oom", NULL);
     }
     memset(ix_ht, 0xFF, ix_ht_cap * sizeof(uint32_t));
@@ -454,7 +481,11 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     /* Map: group_id -> (ix_row, pv_idx) for result cell placement */
     ray_t* map_hdr = NULL;
     uint32_t* grp_ix  = (uint32_t*)scratch_alloc(&map_hdr, grp_count * 2 * sizeof(uint32_t));
-    if (!grp_ix) { scratch_free(ix_ht_hdr); scratch_free(ix_hdr); scratch_free(pv_hdr); pivot_ingest_free(&pg); return ray_error("oom", NULL); }
+    if (!grp_ix) {
+        scratch_free(ix_ht_hdr); scratch_free(ix_hdr); scratch_free(pv_hdr);
+        pivot_ingest_free(&pg); ght_layout_free(&ly);
+        return ray_error("oom", NULL);
+    }
     uint32_t* grp_pv = grp_ix + grp_count;
 
     for (uint32_t _p = 0; _p < pg.n_parts; _p++) {
@@ -468,15 +499,19 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             uint32_t gi = gi_base + gi_local;
             const char* row = ph->rows + (size_t)gi_local * pg.row_stride;
             const int64_t* keys = (const int64_t*)(row + 8);
-            int64_t nmask = keys[n_keys];
-            if (nmask & pvt_null_bit) {
+            if (keys[n_keys + pvt_null_word] & pvt_null_bit) {
                 grp_ix[gi] = UINT32_MAX;
                 grp_pv[gi] = UINT32_MAX;
                 continue;
             }
-        int64_t idx_nmask = nmask & idx_null_bits;
+        /* Index-key null words: keys[n_keys .. n_keys+null_words) as-is.
+         * The pivot key's own null bit (position n_idx, word pvt_null_word)
+         * is guaranteed 0 here — the check just above already `continue`d
+         * on it being set — so these words already carry exactly the
+         * index-key null flags with no separate masking needed. */
+        const int64_t* idx_nwords = keys + n_keys;
 
-        /* Hash index keys only (exclude pivot key) + null mask.
+        /* Hash index keys only (exclude pivot key) + null words.
          * Wide keys (GUID) resolve actual bytes via key_data[k]. */
         uint64_t ih = 0;
         for (uint32_t k = 0; k < n_idx; k++) {
@@ -491,7 +526,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             }
             ih = (k == 0) ? kh : ray_hash_combine(ih, kh);
         }
-        if (idx_nmask) ih = ray_hash_combine(ih, ray_hash_i64(idx_nmask));
+        ih = pivot_hash_null_words(ih, idx_nwords, null_words);
 
         /* Open-addressed HT probe. On match, reuse; else insert. */
         uint32_t ix_row = UINT32_MAX;
@@ -512,9 +547,11 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                         eq = (ekeys[k] == keys[k]);
                     }
                 }
-                int64_t ent_nmask;
-                memcpy(&ent_nmask, ix_entry_p + 8 + (size_t)n_idx * 8, 8);
-                if (eq && ent_nmask == idx_nmask) { ix_row = ent; break; }
+                if (eq) {
+                    const int64_t* ent_nwords = (const int64_t*)(ix_entry_p + 8 + (size_t)n_idx * 8);
+                    eq = (memcmp(ent_nwords, idx_nwords, (size_t)null_words * 8) == 0);
+                }
+                if (eq) { ix_row = ent; break; }
             }
             slot = (slot + 1) & ix_ht_mask;
         }
@@ -525,7 +562,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     ix_cap * ix_entry, new_cap * ix_entry);
                 if (!new_rows) {
                     scratch_free(map_hdr); scratch_free(ix_ht_hdr);
-                    scratch_free(pv_hdr); pivot_ingest_free(&pg);
+                    scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly);
                     return ray_error("oom", NULL);
                 }
                 ix_rows = new_rows;
@@ -535,7 +572,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             char* dst = ix_rows + (size_t)ix_row * ix_entry;
             *(uint64_t*)dst = ih;
             memcpy(dst + 8, keys, (size_t)n_idx * 8);
-            memcpy(dst + 8 + (size_t)n_idx * 8, &idx_nmask, 8);
+            memcpy(dst + 8 + (size_t)n_idx * 8, idx_nwords, (size_t)null_words * 8);
             ix_ht[slot] = ix_row;
         }
 
@@ -581,12 +618,17 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         uint8_t esz = col_esz(idx_vecs[k]);
         int8_t kt = idx_vecs[k]->type;
         const char* src_base = idx_wide[k] ? (const char*)key_data[k] : NULL;
+        /* Word-indexed per the Task-3/4 convention: k is fixed in this outer
+         * scope, so hoist its word/bit out of the per-row loop below (as
+         * the seq emit loop in group.c does) rather than recomputing it
+         * ix_count times. */
+        const uint32_t null_kw  = k >> 6;
+        const int64_t  null_kbit = (int64_t)((uint64_t)1 << (k & 63));
         for (uint32_t r = 0; r < ix_count; r++) {
             const char* ix_entry_p = ix_rows + r * ix_entry;
             int64_t kv = ((const int64_t*)(ix_entry_p + 8))[k];
-            int64_t ent_nmask;
-            memcpy(&ent_nmask, ix_entry_p + 8 + (size_t)n_idx * 8, 8);
-            if (ent_nmask & ((int64_t)1 << k)) {
+            const int64_t* ent_nwords = (const int64_t*)(ix_entry_p + 8 + (size_t)n_idx * 8);
+            if (ent_nwords[null_kw] & null_kbit) {
                 ray_vec_set_null(new_col, (int64_t)r, true);
                 /* Fill the correct-width sentinel. */
                 switch (kt) {
@@ -811,7 +853,8 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
 
 pivot_cleanup:
-    ght_layout_free(&ly);   /* no-op: pivot layout is always inline (see above) */
+    ght_layout_free(&ly);   /* no-op when inline (n_keys <= 8); frees the
+                             * owned spill block otherwise (see above) */
     scratch_free(map_hdr);
     scratch_free(ix_ht_hdr);
     scratch_free(ix_hdr);
