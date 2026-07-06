@@ -3552,13 +3552,22 @@ ray_t* ray_eval(ray_t* obj) {
 
     /* Open a profiling span around the builtin invocation.  Gated on the
      * profiler flag FIRST so the disabled path is a single predicted branch
-     * per call — nothing else runs (pillar-4 zero-cost-off).  When active,
-     * ray_fn_name reads the label inline from the fn object (stable,
-     * NUL-terminated), so there is no allocation. */
+     * per call — nothing else runs (pillar-4 zero-cost-off).  ray_fn_name
+     * reads the label inline from the fn object's aux bytes — stable for
+     * as long as `head` lives, but NOT beyond: a builtin's env slot can be
+     * rebound (e.g. `(set + ...)`), dropping the object's refcount to zero
+     * and freeing those bytes.  The span outlives this call (read later by
+     * `.sys.prof`, possibly after such a rebind), so the raw aux pointer
+     * must not be stored directly.  Intern it instead: the sym table's
+     * arena never frees or relocates an interned string once allocated, so
+     * ray_str_ptr(ray_sym_str(...)) is valid for the rest of the process,
+     * independent of `head`'s lifetime. */
     if (g_ray_profile.active &&
         (head->type == RAY_UNARY || head->type == RAY_BINARY ||
          head->type == RAY_VARY)) {
-        ev_name = ray_fn_name(head);
+        const char* raw_name = ray_fn_name(head);
+        ray_t* name_atom = ray_sym_str(ray_sym_intern(raw_name, strlen(raw_name)));
+        ev_name = name_atom ? ray_str_ptr(name_atom) : raw_name;
         ev_span = ray_profile_span_start(ev_name);
         if (ev_span) {
             ev_idx = (int64_t)g_ray_profile.n - 1;   /* index of this START */
