@@ -362,6 +362,13 @@ ray_aof_t* ray_aof_open(const char* dir, int64_t segment_limit,
 
     log->fp = fopen(path, "ab");
     if (!log->fp) { ray_sys_free(log); *out_err = RAY_ERR_IO; return NULL; }
+    /* A brand-new log just created its first segment file; fsync log->dir
+     * (via the segment path — see aof_rotate) so the directory entry is
+     * durable before the first commit can acknowledge data. */
+    if (nseg == 0) {
+        ray_err_t derr = ray_file_sync_dir(path);
+        if (derr != RAY_OK) { fclose(log->fp); ray_sys_free(log); *out_err = derr; return NULL; }
+    }
     return log;
 }
 
@@ -391,7 +398,11 @@ static ray_err_t aof_rotate(ray_aof_t* log) {
     log->fp = fopen(path, "ab");
     if (!log->fp) return RAY_ERR_IO;
     log->seg_bytes = 0;
-    return ray_file_sync_dir(log->dir);
+    /* fsync the segment's CONTAINING directory (= log->dir) so the new
+     * segment's directory entry is durable — ray_file_sync_dir strips the
+     * last component, so pass the segment path, not log->dir (which would
+     * fsync log->dir's parent).  Matches sym.c/col.c/journal.c usage. */
+    return ray_file_sync_dir(path);
 }
 
 int64_t ray_aof_append(ray_aof_t* log, const void* payload, int64_t len,
