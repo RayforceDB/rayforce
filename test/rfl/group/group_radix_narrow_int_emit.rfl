@@ -1,0 +1,55 @@
+;; ════════════════════════════════════════════════════════════════════
+;; group_radix_narrow_int_emit.rfl — width-correct parallel radix emit
+;; (radix_phase3_fn, src/ops/group.c) for narrow-int MIN/MAX/PROD/FIRST/LAST
+;; output columns.
+;;
+;; MIN/MAX/PROD/FIRST/LAST keep out_type == the source agg column's type
+;; (unlike SUM/AVG, which widen to I64/F64), so their result column can be a
+;; narrow I32/I16 vector.  radix_phase3_fn's final emit used a fixed 8-byte
+;; `((int64_t*)ao->dst)[di] = v` store regardless of ao->out_type — every
+;; group past di==0 in a narrow-int output column overshoots its 4-/2-byte
+;; slot, corrupting neighboring groups and eventually running off the
+;; allocation entirely (heap overflow / SIGSEGV).  The serial emit (~line
+;; 4586) and the pivot finalizer (~line 10679) already used the width-correct
+;; topk_write_i64(dst, di, v, ray_sym_elem_size(out_type, attrs)) idiom;
+;; radix_phase3_fn (the parallel partitioned emit) did not.
+;;
+;; This was latent for a long time because a width guard kept the row-layout
+;; ght path (and its parallel radix_phase3_fn variant) from ever being
+;; reached by narrow-int aggregates in practice; the unbounded-slots cut-4
+;; guard lift (055b4446 / 99dc4ead / 0b1b6e0f) admits them, making the crash
+;; trivially reachable.
+;;
+;; Trigger conditions (both required to reach radix_phase3_fn, not DA):
+;;   - key range > DA_MAX_COMPOSITE_SLOTS (262144)   -> DA declined
+;;   - nrows >= RAY_PARALLEL_THRESHOLD (65536)        -> parallel radix, not
+;;                                                        the serial ght loop
+;;
+;; til(300000): 300000 distinct keys (range 299999 > 262144) and 300000 rows
+;; (>= 65536) -> every group is a singleton, so MIN/MAX/PROD/FIRST/LAST of
+;; the group is trivially the row's own (provable) value — safe from PROD
+;; overflow since each "product" is a single factor.
+;; ════════════════════════════════════════════════════════════════════
+
+;; ---------- I32 out_type: the review's exact repro (MIN) ----------
+(set Tw32 (table [k v] (list (til 300000) (as 'I32 (% (til 300000) 97)))))
+(set Rw32 (select {mn:(min v) mx:(max v) pr:(prod v) fi:(first v) la:(last v) from: Tw32 by: k}))
+(count Rw32) -- 300000
+(at (at (select {x: mn from: Rw32 where: (== k 0)}) 'x) 0) -- 0
+(at (at (select {x: mn from: Rw32 where: (== k 150000)}) 'x) 0) -- 38
+(at (at (select {x: mn from: Rw32 where: (== k 299999)}) 'x) 0) -- 75
+(at (at (select {x: mx from: Rw32 where: (== k 150000)}) 'x) 0) -- 38
+(at (at (select {x: pr from: Rw32 where: (== k 150000)}) 'x) 0) -- 38
+(at (at (select {x: fi from: Rw32 where: (== k 299999)}) 'x) 0) -- 75
+(at (at (select {x: la from: Rw32 where: (== k 299999)}) 'x) 0) -- 75
+;; Whole-column oracle: singleton groups means {mn} is a permutation of {v}.
+(sum (at Rw32 'mn)) -- (sum (at Tw32 'v))
+
+;; ---------- I16 out_type: same shape, narrower width ----------
+(set Tw16 (table [k v] (list (til 300000) (as 'I16 (% (til 300000) 251)))))
+(set Rw16 (select {mn:(min v) mx:(max v) from: Tw16 by: k}))
+(count Rw16) -- 300000
+(at (at (select {x: mn from: Rw16 where: (== k 0)}) 'x) 0) -- 0
+(at (at (select {x: mn from: Rw16 where: (== k 150000)}) 'x) 0) -- 153
+(at (at (select {x: mx from: Rw16 where: (== k 299999)}) 'x) 0) -- 54
+(sum (at Rw16 'mn)) -- (sum (at Tw16 'v))

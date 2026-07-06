@@ -2332,6 +2332,8 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
     TEST_ASSERT_EQ_PTR(b1.key_off,      master.key_off);
     TEST_ASSERT_EQ_PTR(b1.agg_flags,    master.agg_flags);
     TEST_ASSERT_EQ_PTR(b1.wide_key_esz, master.wide_key_esz);
+    TEST_ASSERT_EQ_PTR(b1.agg_flags2,       master.agg_flags2);
+    TEST_ASSERT_EQ_PTR(b1.agg_null_sentinel, master.agg_null_sentinel);
 
     /* The bug: copying FROM a borrower.  b1.spill_hdr == NULL looks
      * identical to a true-inline layout to the old (fixed) spill_hdr-based
@@ -2344,6 +2346,8 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
     TEST_ASSERT_EQ_PTR(b2.key_off,      master.key_off);
     TEST_ASSERT_EQ_PTR(b2.agg_flags,    master.agg_flags);
     TEST_ASSERT_EQ_PTR(b2.wide_key_esz, master.wide_key_esz);
+    TEST_ASSERT_EQ_PTR(b2.agg_flags2,       master.agg_flags2);
+    TEST_ASSERT_EQ_PTR(b2.agg_null_sentinel, master.agg_null_sentinel);
     /* The failure signature the bug would produce, explicitly ruled out:
      * b2 re-pointed at its own inline storage instead of the spill. */
     TEST_ASSERT_FALSE(b2.agg_val_slot == b2.agg_val_slot_in);

@@ -2492,13 +2492,21 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
         agg_any |= af;
         /* Null metadata for value-slot aggs whose input column advertises
          * HAS_NULLS.  Holistic/wide aggs reserve no accum slot (their per-group
-         * pass skips nulls itself), so they carry no nullable flag here.  A
-         * nullable value-slot agg makes the row-layout accumulators skip nulls
-         * (F64 NaN or the type's NULL_I* sentinel) and count non-nulls in the
-         * off_nn block. */
+         * pass skips nulls itself), so they carry no nullable flag here.
+         * COUNT reserves an nv slot for generic bookkeeping (phase1 still
+         * stages its raw value) but its emit reads the group's row count
+         * (cnt) directly, never off_nn — so a nullable COUNT input must not
+         * flip any_agg_null either, or a count-only nullable group-by
+         * allocates an off_nn block no agg ever reads.  Gate on the agg
+         * actually owning a value slot (vslot >= 0) and not being COUNT.  A
+         * nullable value-slot agg makes the row-layout accumulators skip
+         * nulls (F64 NaN or the type's NULL_I* sentinel) and count non-nulls
+         * in the off_nn block. */
         uint8_t af2 = 0;
         int64_t sent = 0;
-        if (!holistic && agg_vecs[a]) {
+        int8_t vslot = out->agg_val_slot[a];
+        bool is_count = agg_ops && agg_ops[a] == OP_COUNT;
+        if (vslot >= 0 && !is_count && agg_vecs[a]) {
             ray_t* src = (agg_vecs[a]->attrs & RAY_ATTR_SLICE)
                          ? agg_vecs[a]->slice_parent : agg_vecs[a];
             if (src && (src->attrs & RAY_ATTR_HAS_NULLS)) {
@@ -3957,7 +3965,13 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                             v = ROW_RD_I64(row, ly->off_sum, s); break;
                         default:       v = 0; break;
                     }
-                    ((int64_t*)(void*)ao->dst)[di] = v;
+                    /* MIN/MAX/PROD/FIRST/LAST keep out_type = agg_col->type
+                     * (~9955 region), so ao->vec/ao->dst may be a narrow-int
+                     * (I32/I16/U8) column — mirror the serial emit (~4586):
+                     * a fixed 8-byte store overshoots a narrower slot,
+                     * corrupting/segfaulting past index 0. */
+                    topk_write_i64(ao->dst, di, v,
+                                   ray_sym_elem_size(ao->out_type, ao->vec->attrs));
                 }
             }
         }
