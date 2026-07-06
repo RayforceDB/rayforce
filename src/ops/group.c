@@ -6999,6 +6999,343 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     return result;   /* NULL → legacy path */
 }
 
+/* ---- q34/count hot path extracted from exec_group_run ------------------
+ * Single-key (n_keys==1) sparse-dense emit-filter path: the dict-SYM
+ * count-only scatter (`range_count[off]++`) plus its keep-min compaction
+ * and result emit.  Pulled out of exec_group_run — a 3700-line monolith
+ * whose ~1600-line cut-4 growth degraded this loop's register allocation
+ * (stack spills at ~1MB frame offsets, +5.5% executed instructions on q34)
+ * and unseated the alignment the checkpoint pin had tuned.  Isolating it in
+ * its own noinline function gives it an independent register allocation and
+ * code layout (mirrors exec_group_per_partition's noinline isolation).
+ * Called once per dispatch — no per-row overhead at the boundary.
+ * Returns the group result (or an OOM/error object) when it handled the
+ * query; returns NULL when the dynamic-dense probe bailed (unbounded key or
+ * no surviving row), leaving all shared resources untouched so the caller
+ * continues on the next sp path. */
+typedef struct {
+    ray_graph_t*   g;
+    ray_op_ext_t*  ext;
+    void**         key_data;
+    int8_t*        key_types;
+    ray_t**        key_vecs;
+    uint8_t*       key_owned;
+    void**         agg_ptrs;
+    int8_t*        agg_types;
+    uint8_t*       agg_strlen;
+    ray_t**        agg_vecs;
+    uint8_t*       agg_owned;
+    agg_affine_t*  agg_affine;
+    agg_prod_t*    agg_prod;
+    ray_t**        strlen_sym_strings;
+    uint32_t       strlen_sym_count;
+    uint64_t       agg_f64_mask;
+    uint32_t       n_aggs;
+    uint32_t       n_keys;
+    int64_t        n_scan;
+    uint8_t        key_esz;
+    bool           sp_need_sum;
+    const int64_t* match_idx;
+    ray_t*         rowsel;
+    ray_t*         match_idx_block;
+    ray_t*         vla_hdr;
+    ray_group_emit_filter_t emit_filter;
+} sp_dyn_ctx_t;
+
+static ray_t* __attribute__((noinline))
+exec_group_sp_dyn_emit(const sp_dyn_ctx_t* c) {
+    ray_graph_t*   g          = c->g;
+    ray_op_ext_t*  ext        = c->ext;
+    void**         key_data   = c->key_data;
+    int8_t*        key_types  = c->key_types;
+    ray_t**        key_vecs   = c->key_vecs;
+    uint8_t*       key_owned  = c->key_owned;
+    void**         agg_ptrs   = c->agg_ptrs;
+    int8_t*        agg_types  = c->agg_types;
+    uint8_t*       agg_strlen = c->agg_strlen;
+    ray_t**        agg_vecs   = c->agg_vecs;
+    uint8_t*       agg_owned  = c->agg_owned;
+    agg_affine_t*  agg_affine = c->agg_affine;
+    agg_prod_t*    agg_prod   = c->agg_prod;
+    ray_t**        strlen_sym_strings = c->strlen_sym_strings;
+    uint32_t       strlen_sym_count   = c->strlen_sym_count;
+    uint64_t       agg_f64_mask = c->agg_f64_mask;
+    uint32_t       n_aggs     = c->n_aggs;
+    uint32_t       n_keys     = c->n_keys;
+    int64_t        n_scan     = c->n_scan;
+    uint8_t        key_esz    = c->key_esz;
+    bool           sp_need_sum = c->sp_need_sum;
+    const int64_t* match_idx  = c->match_idx;
+    ray_t*         rowsel     = c->rowsel;
+    ray_t*         match_idx_block = c->match_idx_block;
+    ray_t*         vla_hdr    = c->vla_hdr;
+    ray_group_emit_filter_t emit_filter = c->emit_filter;
+
+                uint64_t cap = key_esz == 1 ? 256u
+                             : key_esz == 2 ? (1u << 16)
+                             : (1u << 20);
+                const uint64_t max_dense_cap = 1u << 24;
+                bool count_only_first = (key_types[0] == RAY_SYM);
+                ray_t *cnt_hdr = NULL, *range_sum_hdr = NULL;
+                uint32_t* range_count = (uint32_t*)scratch_calloc(
+                    &cnt_hdr, (size_t)cap * sizeof(uint32_t));
+                da_val_t* range_sum = NULL;
+                bool dyn_ok = range_count != NULL;
+                if (dyn_ok && sp_need_sum && !count_only_first) {
+                    range_sum = (da_val_t*)scratch_calloc(
+                        &range_sum_hdr,
+                        (size_t)cap * n_aggs * sizeof(da_val_t));
+                    dyn_ok = range_sum != NULL;
+                }
+
+	                uint64_t max_seen = 0;
+	                bool have_dyn_key = false;
+#define DYN_DENSE_ACCUM_ROW(row_expr)                                            \
+    do {                                                                         \
+        int64_t dyn_row = (row_expr);                                            \
+        int64_t key = read_by_esz(key_data[0], dyn_row, key_esz);                \
+        if (key < 0 || (uint64_t)key >= max_dense_cap) {                         \
+            dyn_ok = false;                                                      \
+            goto dyn_dense_done;                                                 \
+        }                                                                        \
+        uint64_t off = (uint64_t)key;                                            \
+        if (off >= cap) {                                                        \
+            uint64_t old_cap = cap;                                              \
+            while (off >= cap) cap <<= 1;                                        \
+            uint32_t* new_count = (uint32_t*)scratch_realloc(                    \
+                &cnt_hdr, (size_t)old_cap * sizeof(uint32_t),                    \
+                (size_t)cap * sizeof(uint32_t));                                 \
+            if (!new_count) {                                                    \
+                dyn_ok = false;                                                  \
+                goto dyn_dense_done;                                             \
+            }                                                                    \
+            range_count = new_count;                                             \
+            memset(range_count + old_cap, 0,                                     \
+                   (size_t)(cap - old_cap) * sizeof(uint32_t));                  \
+            if (sp_need_sum && !count_only_first) {                              \
+                da_val_t* new_sum = (da_val_t*)scratch_realloc(                  \
+                    &range_sum_hdr,                                              \
+                    (size_t)old_cap * n_aggs * sizeof(da_val_t),                 \
+                    (size_t)cap * n_aggs * sizeof(da_val_t));                    \
+                if (!new_sum) {                                                  \
+                    dyn_ok = false;                                              \
+                    goto dyn_dense_done;                                         \
+                }                                                                \
+                range_sum = new_sum;                                             \
+                memset(range_sum + (size_t)old_cap * n_aggs, 0,                 \
+                       (size_t)(cap - old_cap) * n_aggs * sizeof(da_val_t));     \
+            }                                                                    \
+        }                                                                        \
+        have_dyn_key = true;                                                     \
+        if (off > max_seen) max_seen = off;                                      \
+        if (range_count[off] != UINT32_MAX) range_count[off]++;                  \
+        if (range_sum) {                                                         \
+            da_val_t* sums = &range_sum[(size_t)off * n_aggs];                   \
+            for (uint32_t a = 0; a < n_aggs; a++) {                               \
+                if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;       \
+                if (agg_strlen[a])                                               \
+                    sums[a].i += group_strlen_at_cached(                         \
+                        agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
+                else if (agg_f64_mask & ((uint64_t)1 << a))                      \
+                    sums[a].f += ((const double*)agg_ptrs[a])[dyn_row];          \
+                else                                                             \
+                    sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0); \
+            }                                                                    \
+        }                                                                        \
+    } while (0)
+
+	                if (dyn_ok && match_idx) {
+	                    for (int64_t i = 0; i < n_scan; i++)
+	                        DYN_DENSE_ACCUM_ROW(match_idx[i]);
+	                } else if (dyn_ok && rowsel) {
+	                    ray_rowsel_t* m = ray_rowsel_meta(rowsel);
+	                    const uint8_t* flags = ray_rowsel_flags(rowsel);
+	                    const uint32_t* offs = ray_rowsel_offsets(rowsel);
+	                    const uint16_t* idx = ray_rowsel_idx(rowsel);
+	                    uint32_t nseg = (uint32_t)((m->nrows + RAY_MORSEL_ELEMS - 1) /
+	                                              RAY_MORSEL_ELEMS);
+	                    for (uint32_t seg = 0; seg < nseg; seg++) {
+	                        int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
+	                        if (flags[seg] == RAY_SEL_NONE) continue;
+	                        if (flags[seg] == RAY_SEL_ALL) {
+	                            int64_t end = base + RAY_MORSEL_ELEMS;
+	                            if (end > m->nrows) end = m->nrows;
+	                            for (int64_t r = base; r < end; r++)
+	                                DYN_DENSE_ACCUM_ROW(r);
+	                        } else {
+	                            for (uint32_t p = offs[seg]; p < offs[seg + 1]; p++)
+	                                DYN_DENSE_ACCUM_ROW(base + idx[p]);
+	                        }
+	                    }
+	                } else if (dyn_ok) {
+	                    for (int64_t r = 0; r < n_scan; r++)
+	                        DYN_DENSE_ACCUM_ROW(r);
+	                }
+dyn_dense_done:
+#undef DYN_DENSE_ACCUM_ROW
+
+	                if (dyn_ok && have_dyn_key) {
+                    uint32_t total_groups = 0;
+                    for (uint64_t off = 0; off <= max_seen; off++)
+                        if (range_count[off] > 0)
+                            total_groups++;
+                    int64_t keep_min = da_count_emit_keep_min_u32(
+                        range_count, max_seen + 1, total_groups, emit_filter);
+                    uint32_t grp_count = 0;
+                    for (uint64_t off = 0; off <= max_seen; off++)
+                        if ((int64_t)range_count[off] >= keep_min)
+                            grp_count++;
+
+                    ray_t* result = ray_table_new((int64_t)n_keys + n_aggs);
+                    if (!result || RAY_IS_ERR(result)) {
+                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                        for (uint32_t a = 0; a < n_aggs; a++)
+                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                        for (uint32_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
+                        return result ? result : ray_error("oom", NULL);
+                    }
+
+                    ray_t* key_col = col_vec_new(key_vecs[0], (int64_t)grp_count);
+                    out_col_adopt_str_pool(key_col, key_vecs[0]);
+                    if (key_col && !RAY_IS_ERR(key_col) && key_col->type == RAY_SYM)
+                        /* raw cell ids from key_vecs[0] — adopt its domain */
+                        ray_sym_vec_adopt_domain(key_col, sym_domain_rep(key_vecs[0]));
+                    if (!key_col || RAY_IS_ERR(key_col)) {
+                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                        ray_release(result);
+                        for (uint32_t a = 0; a < n_aggs; a++)
+                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                        for (uint32_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
+                        return key_col ? key_col : ray_error("oom", NULL);
+                    }
+                    key_col->len = (int64_t)grp_count;
+
+                    ray_t *_h_sum = NULL, *_h_cnt = NULL;
+                    da_val_t* dense_sum = sp_need_sum
+                        ? (da_val_t*)scratch_alloc(&_h_sum,
+                            (size_t)grp_count * n_aggs * sizeof(da_val_t))
+                        : NULL;
+                    int64_t* dense_count = (int64_t*)scratch_alloc(
+                        &_h_cnt, (size_t)grp_count * sizeof(int64_t));
+                    if ((sp_need_sum && !dense_sum) || !dense_count) {
+                        scratch_free(_h_sum); scratch_free(_h_cnt);
+                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                        ray_release(key_col); ray_release(result);
+                        for (uint32_t a = 0; a < n_aggs; a++)
+                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                        for (uint32_t k = 0; k < n_keys; k++)
+                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
+                        return ray_error("oom", NULL);
+                    }
+                    if (sp_need_sum && !range_sum)
+                        memset(dense_sum, 0,
+                               (size_t)grp_count * n_aggs * sizeof(da_val_t));
+
+                    uint32_t gi = 0;
+                    for (uint64_t off = 0; off <= max_seen; off++) {
+                        uint32_t cnt = range_count[off];
+                        if ((int64_t)cnt < keep_min) {
+                            if (!range_sum) range_count[off] = 0;
+                            continue;
+                        }
+                        write_col_i64(ray_data(key_col), gi, (int64_t)off,
+                                      key_col->type, key_col->attrs);
+                        dense_count[gi] = (int64_t)cnt;
+                        if (range_sum) {
+                            memcpy(&dense_sum[(size_t)gi * n_aggs],
+                                   &range_sum[(size_t)off * n_aggs],
+                                   (size_t)n_aggs * sizeof(da_val_t));
+                        }
+                        if (!range_sum) range_count[off] = gi + 1u;
+                        gi++;
+                    }
+
+                    if (sp_need_sum && !range_sum) {
+#define DYN_DENSE_SUM_ROW(row_expr)                                              \
+    do {                                                                         \
+        int64_t dyn_row = (row_expr);                                            \
+        int64_t key = read_by_esz(key_data[0], dyn_row, key_esz);                \
+        if (key < 0 || (uint64_t)key > max_seen) break;                          \
+        uint32_t marker = range_count[(uint64_t)key];                            \
+        if (!marker) break;                                                      \
+        da_val_t* sums = &dense_sum[(size_t)(marker - 1u) * n_aggs];             \
+        for (uint32_t a = 0; a < n_aggs; a++) {                                   \
+            if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;           \
+            if (agg_strlen[a])                                                   \
+                sums[a].i += group_strlen_at_cached(                             \
+                    agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
+            else if (agg_f64_mask & ((uint64_t)1 << a))                          \
+                sums[a].f += ((const double*)agg_ptrs[a])[dyn_row];              \
+            else                                                                 \
+                sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0);\
+        }                                                                        \
+    } while (0)
+                        if (match_idx) {
+                            for (int64_t i = 0; i < n_scan; i++)
+                                DYN_DENSE_SUM_ROW(match_idx[i]);
+                        } else if (rowsel) {
+                            ray_rowsel_t* m = ray_rowsel_meta(rowsel);
+                            const uint8_t* flags = ray_rowsel_flags(rowsel);
+                            const uint32_t* offs = ray_rowsel_offsets(rowsel);
+                            const uint16_t* idx = ray_rowsel_idx(rowsel);
+                            uint32_t nseg = (uint32_t)((m->nrows + RAY_MORSEL_ELEMS - 1) /
+                                                      RAY_MORSEL_ELEMS);
+                            for (uint32_t seg = 0; seg < nseg; seg++) {
+                                int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
+                                if (flags[seg] == RAY_SEL_NONE) continue;
+                                if (flags[seg] == RAY_SEL_ALL) {
+                                    int64_t end = base + RAY_MORSEL_ELEMS;
+                                    if (end > m->nrows) end = m->nrows;
+                                    for (int64_t r = base; r < end; r++)
+                                        DYN_DENSE_SUM_ROW(r);
+                                } else {
+                                    for (uint32_t p = offs[seg]; p < offs[seg + 1]; p++)
+                                        DYN_DENSE_SUM_ROW(base + idx[p]);
+                                }
+                            }
+                        } else {
+                            for (int64_t r = 0; r < n_scan; r++)
+                                DYN_DENSE_SUM_ROW(r);
+                        }
+#undef DYN_DENSE_SUM_ROW
+                    }
+
+                    ray_op_ext_t* key_ext = find_ext(g, ext->keys[0]);
+                    int64_t name_id = key_ext ? key_ext->sym : 0;
+                    result = ray_table_add_col(result, name_id, key_col);
+                    ray_release(key_col);
+                    /* nn_counts == NULL: this fast path rejected HAS_NULLS
+                     * inputs at the sp_eligible gate (~line 5737), so every
+                     * row is non-null and the legacy count-based divisor is
+                     * correct. */
+                    emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
+                                     (double*)dense_sum, (int64_t*)dense_sum,
+                                     NULL, NULL, NULL, NULL,
+                                     dense_count, agg_affine, agg_prod, NULL, NULL);
+
+                    scratch_free(_h_sum); scratch_free(_h_cnt);
+                    scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
+                    for (uint32_t a = 0; a < n_aggs; a++)
+                        if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
+                    for (uint32_t k = 0; k < n_keys; k++)
+                        if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
+                    if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
+                    return result;
+                }
+
+                scratch_free(range_sum_hdr);
+                scratch_free(cnt_hdr);
+
+    /* Dynamic-dense probe bailed (unbounded key or no surviving row): shared
+     * resources are untouched — caller continues on the next sp path. */
+    return NULL;
+}
+
 /* Pin the DA-prescan dense-group finalize alignment.  This function owns the
  * dict/dense-array (DA) group path whose finalize loop (the total_groups /
  * keep_min / range_count compaction region below, ~line 8395-8475, family
@@ -8665,265 +9002,23 @@ da_path:;
                 (emit_filter.min_count_exclusive > 0 ||
                  emit_filter.top_count_take > 0) &&
                 n_scan <= UINT32_MAX) {
-                uint64_t cap = key_esz == 1 ? 256u
-                             : key_esz == 2 ? (1u << 16)
-                             : (1u << 20);
-                const uint64_t max_dense_cap = 1u << 24;
-                bool count_only_first = (key_types[0] == RAY_SYM);
-                ray_t *cnt_hdr = NULL, *range_sum_hdr = NULL;
-                uint32_t* range_count = (uint32_t*)scratch_calloc(
-                    &cnt_hdr, (size_t)cap * sizeof(uint32_t));
-                da_val_t* range_sum = NULL;
-                bool dyn_ok = range_count != NULL;
-                if (dyn_ok && sp_need_sum && !count_only_first) {
-                    range_sum = (da_val_t*)scratch_calloc(
-                        &range_sum_hdr,
-                        (size_t)cap * n_aggs * sizeof(da_val_t));
-                    dyn_ok = range_sum != NULL;
-                }
-
-	                uint64_t max_seen = 0;
-	                bool have_dyn_key = false;
-#define DYN_DENSE_ACCUM_ROW(row_expr)                                            \
-    do {                                                                         \
-        int64_t dyn_row = (row_expr);                                            \
-        int64_t key = read_by_esz(key_data[0], dyn_row, key_esz);                \
-        if (key < 0 || (uint64_t)key >= max_dense_cap) {                         \
-            dyn_ok = false;                                                      \
-            goto dyn_dense_done;                                                 \
-        }                                                                        \
-        uint64_t off = (uint64_t)key;                                            \
-        if (off >= cap) {                                                        \
-            uint64_t old_cap = cap;                                              \
-            while (off >= cap) cap <<= 1;                                        \
-            uint32_t* new_count = (uint32_t*)scratch_realloc(                    \
-                &cnt_hdr, (size_t)old_cap * sizeof(uint32_t),                    \
-                (size_t)cap * sizeof(uint32_t));                                 \
-            if (!new_count) {                                                    \
-                dyn_ok = false;                                                  \
-                goto dyn_dense_done;                                             \
-            }                                                                    \
-            range_count = new_count;                                             \
-            memset(range_count + old_cap, 0,                                     \
-                   (size_t)(cap - old_cap) * sizeof(uint32_t));                  \
-            if (sp_need_sum && !count_only_first) {                              \
-                da_val_t* new_sum = (da_val_t*)scratch_realloc(                  \
-                    &range_sum_hdr,                                              \
-                    (size_t)old_cap * n_aggs * sizeof(da_val_t),                 \
-                    (size_t)cap * n_aggs * sizeof(da_val_t));                    \
-                if (!new_sum) {                                                  \
-                    dyn_ok = false;                                              \
-                    goto dyn_dense_done;                                         \
-                }                                                                \
-                range_sum = new_sum;                                             \
-                memset(range_sum + (size_t)old_cap * n_aggs, 0,                 \
-                       (size_t)(cap - old_cap) * n_aggs * sizeof(da_val_t));     \
-            }                                                                    \
-        }                                                                        \
-        have_dyn_key = true;                                                     \
-        if (off > max_seen) max_seen = off;                                      \
-        if (range_count[off] != UINT32_MAX) range_count[off]++;                  \
-        if (range_sum) {                                                         \
-            da_val_t* sums = &range_sum[(size_t)off * n_aggs];                   \
-            for (uint32_t a = 0; a < n_aggs; a++) {                               \
-                if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;       \
-                if (agg_strlen[a])                                               \
-                    sums[a].i += group_strlen_at_cached(                         \
-                        agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
-                else if (agg_f64_mask & ((uint64_t)1 << a))                      \
-                    sums[a].f += ((const double*)agg_ptrs[a])[dyn_row];          \
-                else                                                             \
-                    sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0); \
-            }                                                                    \
-        }                                                                        \
-    } while (0)
-
-	                if (dyn_ok && match_idx) {
-	                    for (int64_t i = 0; i < n_scan; i++)
-	                        DYN_DENSE_ACCUM_ROW(match_idx[i]);
-	                } else if (dyn_ok && rowsel) {
-	                    ray_rowsel_t* m = ray_rowsel_meta(rowsel);
-	                    const uint8_t* flags = ray_rowsel_flags(rowsel);
-	                    const uint32_t* offs = ray_rowsel_offsets(rowsel);
-	                    const uint16_t* idx = ray_rowsel_idx(rowsel);
-	                    uint32_t nseg = (uint32_t)((m->nrows + RAY_MORSEL_ELEMS - 1) /
-	                                              RAY_MORSEL_ELEMS);
-	                    for (uint32_t seg = 0; seg < nseg; seg++) {
-	                        int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
-	                        if (flags[seg] == RAY_SEL_NONE) continue;
-	                        if (flags[seg] == RAY_SEL_ALL) {
-	                            int64_t end = base + RAY_MORSEL_ELEMS;
-	                            if (end > m->nrows) end = m->nrows;
-	                            for (int64_t r = base; r < end; r++)
-	                                DYN_DENSE_ACCUM_ROW(r);
-	                        } else {
-	                            for (uint32_t p = offs[seg]; p < offs[seg + 1]; p++)
-	                                DYN_DENSE_ACCUM_ROW(base + idx[p]);
-	                        }
-	                    }
-	                } else if (dyn_ok) {
-	                    for (int64_t r = 0; r < n_scan; r++)
-	                        DYN_DENSE_ACCUM_ROW(r);
-	                }
-dyn_dense_done:
-#undef DYN_DENSE_ACCUM_ROW
-
-	                if (dyn_ok && have_dyn_key) {
-                    uint32_t total_groups = 0;
-                    for (uint64_t off = 0; off <= max_seen; off++)
-                        if (range_count[off] > 0)
-                            total_groups++;
-                    int64_t keep_min = da_count_emit_keep_min_u32(
-                        range_count, max_seen + 1, total_groups, emit_filter);
-                    uint32_t grp_count = 0;
-                    for (uint64_t off = 0; off <= max_seen; off++)
-                        if ((int64_t)range_count[off] >= keep_min)
-                            grp_count++;
-
-                    ray_t* result = ray_table_new((int64_t)n_keys + n_aggs);
-                    if (!result || RAY_IS_ERR(result)) {
-                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
-                        for (uint32_t a = 0; a < n_aggs; a++)
-                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint32_t k = 0; k < n_keys; k++)
-                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
-                        return result ? result : ray_error("oom", NULL);
-                    }
-
-                    ray_t* key_col = col_vec_new(key_vecs[0], (int64_t)grp_count);
-                    out_col_adopt_str_pool(key_col, key_vecs[0]);
-                    if (key_col && !RAY_IS_ERR(key_col) && key_col->type == RAY_SYM)
-                        /* raw cell ids from key_vecs[0] — adopt its domain */
-                        ray_sym_vec_adopt_domain(key_col, sym_domain_rep(key_vecs[0]));
-                    if (!key_col || RAY_IS_ERR(key_col)) {
-                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
-                        ray_release(result);
-                        for (uint32_t a = 0; a < n_aggs; a++)
-                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint32_t k = 0; k < n_keys; k++)
-                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
-                        return key_col ? key_col : ray_error("oom", NULL);
-                    }
-                    key_col->len = (int64_t)grp_count;
-
-                    ray_t *_h_sum = NULL, *_h_cnt = NULL;
-                    da_val_t* dense_sum = sp_need_sum
-                        ? (da_val_t*)scratch_alloc(&_h_sum,
-                            (size_t)grp_count * n_aggs * sizeof(da_val_t))
-                        : NULL;
-                    int64_t* dense_count = (int64_t*)scratch_alloc(
-                        &_h_cnt, (size_t)grp_count * sizeof(int64_t));
-                    if ((sp_need_sum && !dense_sum) || !dense_count) {
-                        scratch_free(_h_sum); scratch_free(_h_cnt);
-                        scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
-                        ray_release(key_col); ray_release(result);
-                        for (uint32_t a = 0; a < n_aggs; a++)
-                            if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                        for (uint32_t k = 0; k < n_keys; k++)
-                            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
-                        return ray_error("oom", NULL);
-                    }
-                    if (sp_need_sum && !range_sum)
-                        memset(dense_sum, 0,
-                               (size_t)grp_count * n_aggs * sizeof(da_val_t));
-
-                    uint32_t gi = 0;
-                    for (uint64_t off = 0; off <= max_seen; off++) {
-                        uint32_t cnt = range_count[off];
-                        if ((int64_t)cnt < keep_min) {
-                            if (!range_sum) range_count[off] = 0;
-                            continue;
-                        }
-                        write_col_i64(ray_data(key_col), gi, (int64_t)off,
-                                      key_col->type, key_col->attrs);
-                        dense_count[gi] = (int64_t)cnt;
-                        if (range_sum) {
-                            memcpy(&dense_sum[(size_t)gi * n_aggs],
-                                   &range_sum[(size_t)off * n_aggs],
-                                   (size_t)n_aggs * sizeof(da_val_t));
-                        }
-                        if (!range_sum) range_count[off] = gi + 1u;
-                        gi++;
-                    }
-
-                    if (sp_need_sum && !range_sum) {
-#define DYN_DENSE_SUM_ROW(row_expr)                                              \
-    do {                                                                         \
-        int64_t dyn_row = (row_expr);                                            \
-        int64_t key = read_by_esz(key_data[0], dyn_row, key_esz);                \
-        if (key < 0 || (uint64_t)key > max_seen) break;                          \
-        uint32_t marker = range_count[(uint64_t)key];                            \
-        if (!marker) break;                                                      \
-        da_val_t* sums = &dense_sum[(size_t)(marker - 1u) * n_aggs];             \
-        for (uint32_t a = 0; a < n_aggs; a++) {                                   \
-            if (ext->agg_ops[a] == OP_COUNT || !agg_ptrs[a]) continue;           \
-            if (agg_strlen[a])                                                   \
-                sums[a].i += group_strlen_at_cached(                             \
-                    agg_vecs[a], dyn_row, strlen_sym_strings, strlen_sym_count); \
-            else if (agg_f64_mask & ((uint64_t)1 << a))                          \
-                sums[a].f += ((const double*)agg_ptrs[a])[dyn_row];              \
-            else                                                                 \
-                sums[a].i += read_col_i64(agg_ptrs[a], dyn_row, agg_types[a], 0);\
-        }                                                                        \
-    } while (0)
-                        if (match_idx) {
-                            for (int64_t i = 0; i < n_scan; i++)
-                                DYN_DENSE_SUM_ROW(match_idx[i]);
-                        } else if (rowsel) {
-                            ray_rowsel_t* m = ray_rowsel_meta(rowsel);
-                            const uint8_t* flags = ray_rowsel_flags(rowsel);
-                            const uint32_t* offs = ray_rowsel_offsets(rowsel);
-                            const uint16_t* idx = ray_rowsel_idx(rowsel);
-                            uint32_t nseg = (uint32_t)((m->nrows + RAY_MORSEL_ELEMS - 1) /
-                                                      RAY_MORSEL_ELEMS);
-                            for (uint32_t seg = 0; seg < nseg; seg++) {
-                                int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
-                                if (flags[seg] == RAY_SEL_NONE) continue;
-                                if (flags[seg] == RAY_SEL_ALL) {
-                                    int64_t end = base + RAY_MORSEL_ELEMS;
-                                    if (end > m->nrows) end = m->nrows;
-                                    for (int64_t r = base; r < end; r++)
-                                        DYN_DENSE_SUM_ROW(r);
-                                } else {
-                                    for (uint32_t p = offs[seg]; p < offs[seg + 1]; p++)
-                                        DYN_DENSE_SUM_ROW(base + idx[p]);
-                                }
-                            }
-                        } else {
-                            for (int64_t r = 0; r < n_scan; r++)
-                                DYN_DENSE_SUM_ROW(r);
-                        }
-#undef DYN_DENSE_SUM_ROW
-                    }
-
-                    ray_op_ext_t* key_ext = find_ext(g, ext->keys[0]);
-                    int64_t name_id = key_ext ? key_ext->sym : 0;
-                    result = ray_table_add_col(result, name_id, key_col);
-                    ray_release(key_col);
-                    /* nn_counts == NULL: this fast path rejected HAS_NULLS
-                     * inputs at the sp_eligible gate (~line 5737), so every
-                     * row is non-null and the legacy count-based divisor is
-                     * correct. */
-                    emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
-                                     (double*)dense_sum, (int64_t*)dense_sum,
-                                     NULL, NULL, NULL, NULL,
-                                     dense_count, agg_affine, agg_prod, NULL, NULL);
-
-                    scratch_free(_h_sum); scratch_free(_h_cnt);
-                    scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
-                    for (uint32_t a = 0; a < n_aggs; a++)
-                        if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-                    for (uint32_t k = 0; k < n_keys; k++)
-                        if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-                    if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
-                    return result;
-                }
-
-                scratch_free(range_sum_hdr);
-                scratch_free(cnt_hdr);
+                sp_dyn_ctx_t sc = {
+                    .g = g, .ext = ext, .key_data = key_data,
+                    .key_types = key_types, .key_vecs = key_vecs,
+                    .key_owned = key_owned, .agg_ptrs = agg_ptrs,
+                    .agg_types = agg_types, .agg_strlen = agg_strlen,
+                    .agg_vecs = agg_vecs, .agg_owned = agg_owned,
+                    .agg_affine = agg_affine, .agg_prod = agg_prod,
+                    .strlen_sym_strings = strlen_sym_strings,
+                    .strlen_sym_count = strlen_sym_count,
+                    .agg_f64_mask = agg_f64_mask, .n_aggs = n_aggs,
+                    .n_keys = n_keys, .n_scan = n_scan, .key_esz = key_esz,
+                    .sp_need_sum = sp_need_sum, .match_idx = match_idx,
+                    .rowsel = rowsel, .match_idx_block = match_idx_block,
+                    .vla_hdr = vla_hdr, .emit_filter = emit_filter,
+                };
+                ray_t* sp_r = exec_group_sp_dyn_emit(&sc);
+                if (sp_r) return sp_r;
             }
 
             if (use_emit_filter &&
