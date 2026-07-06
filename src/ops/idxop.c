@@ -2144,8 +2144,9 @@ static ray_t* attach_via(ray_t* v, ray_t* (*fn)(ray_t**)) {
     ray_retain(w);
     ray_t* r = fn(&w);
     if (RAY_IS_ERR(r)) { ray_release(w); return r; }
-    // cppcheck-suppress returnDanglingLifetime  — returns w's heap VALUE (fn may
-    // rewrite it through &w for COW); not a pointer to the local itself.
+    /* Returns w's heap VALUE (fn may rewrite it through &w for COW), not a
+     * pointer to the local itself — cppcheck 2.13 misreads the pattern. */
+    // cppcheck-suppress returnDanglingLifetime
     return w;
 }
 

@@ -999,7 +999,7 @@ ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_t
 
         /* FULL OUTER: allocate matched_right tracker */
         if (join_type == 2 && right_rows > 0) {
-            // cppcheck-suppress internalAstError  — _Atomic(T)* cast breaks cppcheck's parser (see :1167)
+            // cppcheck-suppress internalAstError // _Atomic(T)* cast breaks cppcheck parser (see :1167)
             matched_right = (_Atomic(uint8_t)*)scratch_calloc(&matched_right_hdr,
                                                                (size_t)right_rows);
             if (!matched_right) {
