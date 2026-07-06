@@ -691,6 +691,69 @@ ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
 ray_err_t ray_ipc_send_async(int64_t handle, ray_t* msg);
 ray_t*    ray_ipc_send_verbose(int64_t handle, ray_t* msg);
 
+/* ===== Append-Only Log (AOF) API =====
+ *
+ * Embeddable durable event log for host applications: opaque payloads,
+ * monotonic contiguous LSNs, explicit commit barriers, segment rotation,
+ * crash recovery.  Independent of the ray_runtime_t lifecycle — usable
+ * before ray_runtime_create and after ray_runtime_destroy.
+ *
+ * Durability model: ray_aof_append() buffers and returns the reserved
+ * LSN; ray_aof_commit() is the fsync barrier — every append issued
+ * before it is durable once it returns RAY_OK.  A crash discards only
+ * un-committed appends: on the next open the torn tail is truncated and
+ * the LSN sequence continues from the last committed record.  (This is
+ * deliberate and differs from the transaction journal, where a torn
+ * tail is fatal: AOF payloads are opaque data the writer was never
+ * acknowledged for, not replayable commands.)
+ *
+ * Threading: one writer handle per directory, no internal locking.
+ * Concurrent ray_aof_scan() calls are safe, including against a live
+ * writer — a scan observes the committed prefix and stops cleanly at
+ * the first incomplete tail record.
+ *
+ * Errors: RAY_ERR_DOMAIN on bad arguments, RAY_ERR_IO on filesystem
+ * failure, RAY_ERR_LIMIT on payload > UINT32_MAX, RAY_ERR_CORRUPT when
+ * a scan finds a bad record in the interior of the log (not the tail).
+ */
+
+typedef struct ray_aof_s ray_aof_t;
+
+#define RAY_AOF_DEFAULT_SEGMENT_LIMIT ((int64_t)256 * 1024 * 1024)
+
+/* Open (creating the directory if needed) and recover the log at `dir`.
+ * `segment_limit` <= 0 selects RAY_AOF_DEFAULT_SEGMENT_LIMIT.  On
+ * failure returns NULL and sets *out_err (out_err may be NULL). */
+ray_aof_t* ray_aof_open(const char* dir, int64_t segment_limit,
+                        ray_err_t* out_err);
+
+/* Buffered append of `len` bytes; returns the reserved LSN (>= 0), or
+ * -1 with *out_err set.  Durable only after ray_aof_commit(). */
+int64_t    ray_aof_append(ray_aof_t* log, const void* payload,
+                          int64_t len, ray_err_t* out_err);
+
+/* Durability barrier: flush + fsync the active segment. */
+ray_err_t  ray_aof_commit(ray_aof_t* log);
+
+/* The LSN the next append will receive. */
+int64_t    ray_aof_next_lsn(const ray_aof_t* log);
+
+/* Scan callback: return true to continue, false to stop the scan. */
+typedef bool (*ray_aof_scan_cb_t)(int64_t lsn, const void* payload,
+                                  int64_t len, void* ctx);
+
+/* Scan committed records with lsn >= from_lsn in LSN order, invoking
+ * `cb` per record.  Needs no ray_aof_t handle — reads directly from
+ * `dir`, concurrently with a live writer.  Returns the number of
+ * records delivered, or -1 with *out_err set. */
+int64_t    ray_aof_scan(const char* dir, int64_t from_lsn,
+                        ray_aof_scan_cb_t cb, void* ctx,
+                        ray_err_t* out_err);
+
+/* Flush, fsync and close; frees the handle.  Returns the commit error
+ * if the final flush fails (the handle is freed either way). */
+ray_err_t  ray_aof_close(ray_aof_t* log);
+
 #ifdef __cplusplus
 }
 #endif

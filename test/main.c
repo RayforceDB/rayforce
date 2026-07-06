@@ -103,6 +103,7 @@ static int g_color = 0;
  * new file is added.  Sentinel-terminated (final entry has NULL name). */
 
 extern const test_entry_t err_entries[];
+extern const test_entry_t aof_entries[];
 extern const test_entry_t arena_entries[];
 extern const test_entry_t atom_entries[];
 extern const test_entry_t audit_entries[];
@@ -173,7 +174,7 @@ extern const test_entry_t vec_entries[];
 extern const test_entry_t window_entries[];
 
 static const test_entry_t* const compiled_groups[] = {
-    err_entries,      arena_entries,    atom_entries,     audit_entries,
+    err_entries,      aof_entries,      arena_entries,    atom_entries,     audit_entries,
     block_entries,    buddy_entries,    compile_entries,  cow_entries,      csr_entries,
     csv_entries,      datalog_entries,  dict_entries,     domain_entries,
     dump_entries,
