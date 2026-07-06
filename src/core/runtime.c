@@ -22,6 +22,7 @@
  */
 
 #include "runtime.h"
+#include "core/profile.h"   /* g_ray_profile rings — dropped on destroy */
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "table/sym.h"
@@ -425,6 +426,15 @@ void ray_runtime_destroy(ray_runtime_t* rt) {
 
     __VM = NULL;
     __RUNTIME = NULL;
+
+    /* The profiler rings hold `const char* msg` pointers whose backing
+     * (sym-arena strings, fn-object aux bytes) dies with the runtime.
+     * A process that re-initializes the runtime (the test harness does)
+     * must not let spans from a dead runtime survive into the next one —
+     * .sys.prof would strlen dangling pointers. Drop both rings here. */
+    g_ray_profile.active = false;
+    g_ray_profile.n = 0;
+    g_ray_profile_last.n = 0;
 
     ray_sym_destroy();
     ray_heap_destroy();
