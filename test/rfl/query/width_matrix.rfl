@@ -800,6 +800,25 @@
 (set wm_re (select {from: wm_te sm: (sum (* a b)) by: ['k00 'k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16]}))
 (at wm_re 'sm) -- [28 28]
 
+;; ── 1-key group with 17 total aggs, ONE of which is an expression-input
+;; agg (sum(a*b)) — the >16-AGG twin of the >16-KEY cell above.  v2 declines
+;; on the expr-input agg alone (agg_v2_can_handle decline i); v2-exprs also
+;; declines, but on ITS OWN n_aggs>16 gate (group.c ~6430, unrelated to the
+;; >8 width guard) since 17 > 16; the group then falls all the way to the
+;; `6744` nyi guard (n_keys>0 && n_aggs>8), now width-lifted, and is served
+;; by the legacy ht_path, which materializes sum(a*b) via the generic
+;; expr_compile/exec_node fallback (~group.c:7349-7376) — the same
+;; machinery that handles ANY agg input shape, not just OP_SCAN.
+;; k=[1 1 2 2] a=[2 3 4 5] b=[5 6 7 8] v=[10 20 30 40]: a*b=[10 18 28 40] ->
+;; group1(rows0,1) sum=28, group2(rows2,3) sum=68; sum(v) group1=30 group2=70. ──
+(set wm_tg (table [k a b v] (list [1 1 2 2] [2 3 4 5] [5 6 7 8] [10 20 30 40])))
+(set wm_rg (select {from: wm_tg a01: (sum (* a b)) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) a17: (sum v) by: {k: k}}))
+(at (meta wm_rg) 'len) -- 18
+(at wm_rg 'k) -- [1 2]
+(at wm_rg 'a01) -- [28 68]
+(at wm_rg 'a02) -- [30 70]
+(at wm_rg 'a17) -- [30 70]
+
 ;; ── 65-key group (F64 key forces legacy; 65 keys -> ceil(65/64)=2 null-mask
 ;; words) with nulls in key 0 (word 0) and key 64 (word 1) — proves per-key
 ;; null tracking PAST word 0.  k00 F64 [1.0 1.0 0Nf 1.0] (null at row 2);

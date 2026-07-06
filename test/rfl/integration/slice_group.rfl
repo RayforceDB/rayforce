@@ -112,3 +112,23 @@
 (set QDP (select {sv: (sum v) from: TP by: s where: (in s ['aa 'bb 'cc 'dd]) desc: sv take: 2}))
 (count QDI) -- 2
 (min (== (at QDI 'sv) (at QDP 'sv))) -- true
+
+;; ── sg 16-agg gate: unchanged by cut 4 (regression pin, not a lift) ──
+;; sg_shape_eligible's OWN cap (ext->n_aggs > 16 -> false, group.c ~6690) is
+;; a fixed-array [16] bound unrelated to the unbounded-slots cut-4 width
+;; guards this file otherwise exercises — cut 4 does not touch it.  A
+;; 17-agg query in this exact fused shape (FILTER(in on grouped SYM col) +
+;; GROUP by that col) must decline the slice path and fall back to whatever
+;; serves it next (here: v2, since all 17 aggs are plain SUM/COUNT scans,
+;; group_limit==0, no emit-filter armed) with results identical to the
+;; plain-table (non-indexed) run — same equivalence idiom as every other
+;; cell above, just past the sg agg-count boundary instead of the width
+;; guards.
+(set Q10I (select {a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) a17: (count v) from: TI by: s where: (in s ['aa 'cc])}))
+(set Q10P (select {a01: (sum v) a02: (sum v) a03: (sum v) a04: (sum v) a05: (sum v) a06: (sum v) a07: (sum v) a08: (sum v) a09: (sum v) a10: (sum v) a11: (sum v) a12: (sum v) a13: (sum v) a14: (sum v) a15: (sum v) a16: (sum v) a17: (count v) from: TP by: s where: (in s ['aa 'cc])}))
+(at (meta Q10I) 'len) -- 18
+(min (== (at Q10I 'a01) (at Q10P 'a01))) -- true
+(min (== (at Q10I 'a17) (at Q10P 'a17))) -- true
+(min (== (at Q10I 's) (at Q10P 's))) -- true
+(at (at Q10I 'a01) 0) -- 998000
+(at (at Q10I 'a17) 0) -- 500
