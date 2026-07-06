@@ -42,7 +42,6 @@ typedef struct {
     int64_t  time_ns;       /* wall-clock finish time (RAY_TIMESTAMP units)  */
     double   duration_ms;   /* total wall time                               */
     int64_t  result_rows;   /* rows in the result (atom => 1)                */
-    double   output_kib;    /* serialized result footprint                   */
     double   memory_kib;    /* net system-allocation delta over the query    */
     double   parallelism;   /* qstats busy_ns / wall                         */
     int32_t  workers;       /* qstats distinct workers                       */

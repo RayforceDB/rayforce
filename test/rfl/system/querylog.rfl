@@ -9,9 +9,9 @@
 ;; It is a table.
 (type (.sys.querylog)) -- 'TABLE
 
-;; Nine fixed columns, in order.
-(count (key (.sys.querylog))) -- 9
-(key (.sys.querylog)) -- [time duration-ms result-rows output-kib memory-kib workers parallelism status query]
+;; Eight fixed columns, in order.
+(count (key (.sys.querylog))) -- 8
+(key (.sys.querylog)) -- [time duration-ms result-rows memory-kib workers parallelism status query]
 
 ;; Empty in the harness (logging capture never fires here).
 (count (.sys.querylog)) -- 0

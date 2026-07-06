@@ -8,8 +8,7 @@
  *   writes only to its own cache-line-padded slot, and the main thread
  *   sums the slots after a dispatch barrier (or samples them on its wait
  *   path).  It is the shared foundation for two features:
- *     - per-query statistics (parallelism / bandwidth payloads on profile
- *       spans), and
+ *     - per-query statistics (parallelism payloads on profile spans), and
  *     - long-query progress reporting.
  *
  *   Zero cost when disabled: a worker reads the global `mode` once per

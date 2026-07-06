@@ -756,7 +756,6 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
  *   exclusive-ms   self time — this span minus its children
  *   percent        share of total query time (exclusive-based, sums to ~100)
  *   rows           result element/row count (operator spans)
- *   output-kib     result serialized footprint, KiB (operator spans)
  *   allocated-kib  net process bytes allocated across the span, KiB
  *   workers        worker threads that ran a task for this span
  *   busy-ms        summed worker busy time, ms (parallelism)
@@ -787,13 +786,12 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
     ray_t* c_self  = ray_vec_new(RAY_F64, nrows);
     ray_t* c_pct   = ray_vec_new(RAY_F64, nrows);
     ray_t* c_rows  = ray_vec_new(RAY_I64, nrows);
-    ray_t* c_kb    = ray_vec_new(RAY_F64, nrows);
     ray_t* c_alloc = ray_vec_new(RAY_F64, nrows);
     ray_t* c_wrk   = ray_vec_new(RAY_I64, nrows);
     ray_t* c_busy  = ray_vec_new(RAY_F64, nrows);
     ray_t* c_par   = ray_vec_new(RAY_F64, nrows);
     ray_t* cols[] = { c_op, c_depth, c_dur, c_self, c_pct,
-                      c_rows, c_kb, c_alloc, c_wrk, c_busy, c_par };
+                      c_rows, c_alloc, c_wrk, c_busy, c_par };
     for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++)
         if (!cols[i] || RAY_IS_ERR(cols[i])) {
             for (size_t j = 0; j < sizeof(cols)/sizeof(cols[0]); j++)
@@ -807,7 +805,6 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
     double*  selfs   = (double*)ray_data(c_self);
     double*  pcts    = (double*)ray_data(c_pct);
     int64_t* rows    = (int64_t*)ray_data(c_rows);
-    double*  kbs     = (double*)ray_data(c_kb);
     double*  allocs  = (double*)ray_data(c_alloc);
     int64_t* wrks    = (int64_t*)ray_data(c_wrk);
     double*  busys   = (double*)ray_data(c_busy);
@@ -850,7 +847,6 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
              * and sums to ~100% — a direct "where did time go" ranking. */
             pcts[r]   = total_ns > 0 ? (double)self * 100.0 / (double)total_ns : 0.0;
             rows[r]   = s->rows_out;
-            kbs[r]    = (double)s->bytes_out / 1024.0;
             allocs[r] = (double)(s->sys_cur - st->sys_cur) / 1024.0;
             wrks[r]   = (int64_t)s->qs_workers;
             busys[r]  = (double)busy / 1e6;
@@ -866,7 +862,7 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
             durs[r]   = (double)wall / 1e6;
             selfs[r]  = (double)wall / 1e6;
             pcts[r]   = total_ns > 0 ? (double)wall * 100.0 / (double)total_ns : 0.0;
-            rows[r]   = 0; kbs[r] = 0.0; allocs[r] = 0.0;
+            rows[r]   = 0; allocs[r] = 0.0;
             wrks[r]   = 0; busys[r] = 0.0; pars[r] = 0.0;
             r++;
         }
@@ -880,9 +876,9 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
 
     /* Assemble the table. */
     static const char* names[] = { "operator","depth","cumulative-ms","exclusive-ms",
-                                   "percent","rows","output-kib","allocated-kib",
+                                   "percent","rows","allocated-kib",
                                    "workers","busy-ms","parallelism" };
-    ray_t* tbl = ray_table_new(11);
+    ray_t* tbl = ray_table_new(10);
     if (!tbl || RAY_IS_ERR(tbl)) {
         for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++) ray_release(cols[i]);
         return tbl ? tbl : ray_error("oom", "sys.prof: table");
@@ -908,7 +904,6 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
  *   time         wall-clock time the query finished (timestamp)
  *   duration-ms  total wall time
  *   result-rows  rows in the result (scalar => 1)
- *   output-kib   serialized result footprint, KiB
  *   memory-kib   net process allocation across the query, KiB
  *   workers      worker threads that ran a task
  *   parallelism  worker busy time / wall time

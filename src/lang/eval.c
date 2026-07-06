@@ -3388,11 +3388,11 @@ void ray_lang_destroy(void) {
  * Tree-walking evaluator
  * ══════════════════════════════════════════ */
 
-/* Fill a profiler span's payload — memory (sys_cur), bandwidth (bytes_out),
- * and parallelism (qstats) — from the live counters.  Mirrors exec_node's
- * capture so direct-builtin ops (arithmetic, aggregation, generators that
- * run OUTSIDE the DAG) report the same columns as DAG operators.  `result`
- * is NULL at span START (no footprint to size yet). */
+/* Fill a profiler span's payload — memory (sys_cur) and parallelism (qstats)
+ * — from the live counters.  Mirrors exec_node's capture so direct-builtin
+ * ops (arithmetic, aggregation, generators that run OUTSIDE the DAG) report
+ * the same columns as DAG operators.  `result` is NULL at span START (no
+ * row count to size yet). */
 static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
     if (!s) return;
     int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
@@ -3409,7 +3409,6 @@ static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
         s->rows_out  = (result->type == RAY_TABLE) ? ray_table_nrows(result)
                      : ray_is_atom(result)         ? 1
                      :                                (int64_t)ray_len(result);
-        s->bytes_out = ray_serde_size(result);
     }
 }
 

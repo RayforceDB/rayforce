@@ -11,7 +11,6 @@
 #include <rayforce.h>
 #include "core/qlog.h"
 #include "core/qstats.h"   /* ray_qstats_agg */
-#include "store/serde.h"   /* ray_serde_size */
 
 /* Single global instance.  Zero-initialised: disabled, empty ring. */
 ray_qlog_t g_qlog;
@@ -37,15 +36,12 @@ void ray_qlog_end(const ray_qlog_ctx_t* c, const char* src, size_t src_len,
         const char* code = ray_err_code(result);
         status = code ? code : "error";
         row->result_rows = 0;
-        row->output_kib  = 0.0;
     } else if (!result || RAY_IS_NULL(result)) {
         row->result_rows = 0;
-        row->output_kib  = 0.0;
     } else {
         row->result_rows = (result->type == RAY_TABLE) ? ray_table_nrows(result)
                          : ray_is_atom(result)         ? 1
                          :                                (int64_t)ray_len(result);
-        row->output_kib  = (double)ray_serde_size(result) / 1024.0;
     }
 
     /* Parallelism from the query-scoped qstats aggregate (ray_eval resets the
@@ -79,14 +75,13 @@ ray_t* ray_qlog_table(void) {
     ray_t* c_time = ray_vec_new(RAY_TIMESTAMP, n);
     ray_t* c_dur  = ray_vec_new(RAY_F64, n);
     ray_t* c_rows = ray_vec_new(RAY_I64, n);
-    ray_t* c_out  = ray_vec_new(RAY_F64, n);
     ray_t* c_mem  = ray_vec_new(RAY_F64, n);
     ray_t* c_wrk  = ray_vec_new(RAY_I64, n);
     ray_t* c_par  = ray_vec_new(RAY_F64, n);
     ray_t* c_stat = ray_vec_new(RAY_SYM, n);
     ray_t* c_qry  = ray_vec_new(RAY_STR, n);
-    ray_t* fixed[] = { c_time, c_dur, c_rows, c_out, c_mem, c_wrk, c_par, c_stat };
-    ray_t* all[]   = { c_time, c_dur, c_rows, c_out, c_mem, c_wrk, c_par, c_stat, c_qry };
+    ray_t* fixed[] = { c_time, c_dur, c_rows, c_mem, c_wrk, c_par, c_stat };
+    ray_t* all[]   = { c_time, c_dur, c_rows, c_mem, c_wrk, c_par, c_stat, c_qry };
     for (size_t i = 0; i < sizeof(all)/sizeof(all[0]); i++)
         if (!all[i] || RAY_IS_ERR(all[i])) {
             for (size_t j = 0; j < sizeof(all)/sizeof(all[0]); j++)
@@ -97,7 +92,6 @@ ray_t* ray_qlog_table(void) {
     int64_t* times = (int64_t*)ray_data(c_time);
     double*  durs  = (double*)ray_data(c_dur);
     int64_t* rows  = (int64_t*)ray_data(c_rows);
-    double*  outs  = (double*)ray_data(c_out);
     double*  mems  = (double*)ray_data(c_mem);
     int64_t* wrks  = (int64_t*)ray_data(c_wrk);
     double*  pars  = (double*)ray_data(c_par);
@@ -109,7 +103,6 @@ ray_t* ray_qlog_table(void) {
         times[i] = r->time_ns;
         durs[i]  = r->duration_ms;
         rows[i]  = r->result_rows;
-        outs[i]  = r->output_kib;
         mems[i]  = r->memory_kib;
         wrks[i]  = r->workers;
         pars[i]  = r->parallelism;
@@ -124,10 +117,10 @@ ray_t* ray_qlog_table(void) {
         fixed[i]->len = n;
 
     static const char* names[] = { "time", "duration-ms", "result-rows",
-                                   "output-kib", "memory-kib", "workers",
+                                   "memory-kib", "workers",
                                    "parallelism", "status", "query" };
-    ray_t* cols[] = { c_time, c_dur, c_rows, c_out, c_mem, c_wrk, c_par, c_stat, c_qry };
-    ray_t* tbl = ray_table_new(9);
+    ray_t* cols[] = { c_time, c_dur, c_rows, c_mem, c_wrk, c_par, c_stat, c_qry };
+    ray_t* tbl = ray_table_new(8);
     if (!tbl || RAY_IS_ERR(tbl)) {
         for (size_t i = 0; i < sizeof(cols)/sizeof(cols[0]); i++) ray_release(cols[i]);
         return tbl ? tbl : ray_error("oom", "sys.querylog: table");

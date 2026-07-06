@@ -9,9 +9,9 @@
 ;; It is a table.
 (type (.sys.prof)) -- 'TABLE
 
-;; Eleven fixed columns, in order.
-(count (key (.sys.prof))) -- 11
-(key (.sys.prof)) -- [operator depth cumulative-ms exclusive-ms percent rows output-kib allocated-kib workers busy-ms parallelism]
+;; Ten fixed columns, in order.
+(count (key (.sys.prof))) -- 10
+(key (.sys.prof)) -- [operator depth cumulative-ms exclusive-ms percent rows allocated-kib workers busy-ms parallelism]
 
 ;; It is an ordinary table — queryable like any other, without error.
 ;; (The row count reflects whatever query last ran with profiling on, so we

@@ -64,7 +64,6 @@ typedef struct {
      * fields carry no cost when inactive — the span is simply not created. */
     int64_t  sys_cur;     /* process bytes in use (ray_sys) at this instant */
     int64_t  rows_out;    /* result element/row count (END spans)            */
-    int64_t  bytes_out;   /* result serialized footprint (END spans)         */
     uint64_t qs_rows;     /* cumulative qstats rows_done at this instant      */
     uint64_t qs_busy_ns;  /* cumulative qstats worker busy-ns at this instant */
     uint64_t qs_tasks;    /* cumulative qstats tasks_run at this instant      */

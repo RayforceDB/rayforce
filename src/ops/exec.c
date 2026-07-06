@@ -30,7 +30,6 @@
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "core/qstats.h"   /* per-worker parallelism stats for profile spans */
-#include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "core/runtime.h"  /* __VM — filter-compaction projection keep-set */
 
 /* Global profiler instance (zero-initialized = inactive) */
@@ -1582,15 +1581,13 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
             ray_qstats_agg(&used, &sum, &mx);
             ep->qs_busy_ns = sum;
             ep->qs_workers = used;
-            /* Result footprint — rows and serialized byte size, a proxy for
-             * the bandwidth this operator produced. */
+            /* Result footprint — rows this operator produced. */
             if (_prof_result && !RAY_IS_ERR(_prof_result) && !RAY_IS_NULL(_prof_result)) {
                 /* Scalar atoms alias their value into the len field, so
                  * ray_len would report the value, not a row count. */
                 ep->rows_out  = (_prof_result->type == RAY_TABLE) ? ray_table_nrows(_prof_result)
                               : ray_is_atom(_prof_result)         ? 1
                               :                                      (int64_t)ray_len(_prof_result);
-                ep->bytes_out = ray_serde_size(_prof_result);
             }
         }
     }

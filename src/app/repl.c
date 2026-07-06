@@ -249,15 +249,13 @@ static int32_t profile_print_tree(int32_t idx, int32_t indent,
                     fprintf(stdout, " self=%.3f ms", (double)self / 1e6);
                 if (total_ns > 0)
                     fprintf(stdout, " %.0f%%", (double)wall * 100.0 / (double)total_ns);
-                /* Append the captured per-operator payload: result rows and
-                 * footprint, net allocation, and parallelism (worker count and
-                 * effective parallelism = worker busy time / wall time). Only
-                 * heavy operators carry a payload; phase spans stay bare. */
+                /* Append the captured per-operator payload: result rows, net
+                 * allocation, and parallelism (worker count and effective
+                 * parallelism = worker busy time / wall time). Only heavy
+                 * operators carry a payload; phase spans stay bare. */
                 int64_t dmem = ep->sys_cur - sp->sys_cur;
                 if (ep->rows_out > 0 || ep->qs_workers > 0 || dmem != 0) {
                     fprintf(stdout, "  rows=%lld", (long long)ep->rows_out);
-                    if (ep->bytes_out > 0)
-                        fprintf(stdout, " out=%.1fKB", (double)ep->bytes_out / 1024.0);
                     if (dmem != 0)
                         fprintf(stdout, " mem=%+.1fKB", (double)dmem / 1024.0);
                     if (ep->qs_workers > 0) {
