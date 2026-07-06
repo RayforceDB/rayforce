@@ -742,3 +742,125 @@
 (count (at rd300 'k299)) -- 2
 (at rd300 'k000) -- [1 1]
 (at rd300 'k299) -- [1 2]
+
+;; ══════════════════════════════════════════════════════════════════
+;; cut-4: LEGACY group path serves ANY key/agg count — width guards retired
+;; The exec_group_run width guard (n_keys>8 || (n_keys>0 && n_aggs>8)), the
+;; ht_path keyless n_aggs>8 guard, the exec_group dict-STR wrapper n_keys>8
+;; bail, and the exec_group_v2_exprs >16 caps are all removed.  Every entry-
+;; staging buffer on the legacy path is layout-sized (stack when it fits, one
+;; per-call/per-worker heap block when wider); per-key null tracking uses
+;; ceil(n_keys/64) mask words.  These shapes all `nyi`d before this cut.
+;; ══════════════════════════════════════════════════════════════════
+
+;; ── 9-key group with an F64 key (v2-ineligible: F64 keys decline the v2
+;; engine, forcing the legacy ght path) + sum agg.  k0 is F64 [1.0 1.0 2.0 2.0],
+;; k1..k8 int, all rows share the group discriminator so there are exactly 2
+;; groups: (1.0,...) over rows 0,1 -> sum 10+20=30; (2.0,...) over rows 2,3 ->
+;; sum 30+40=70.  Exercises the 9-key legacy scatter (key_region 80 > the old
+;; 8-key stack; group_ht wide-table spill carve at n_keys>8). ──
+(set wm_f9 (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list [1.0 1.0 2.0 2.0] [1 1 2 2] [1 1 2 2] [1 1 2 2] [1 1 2 2] [1 1 2 2] [1 1 2 2] [1 1 2 2] [1 1 2 2] [10 20 30 40])))
+(set wm_rf9 (select {from: wm_f9 s: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8}}))
+(at wm_rf9 'k0) -- [1.0 2.0]
+(at wm_rf9 's) -- [30 70]
+
+;; ── 2-key group with 9 aggs including FIRST and LAST (both v2-ineligible —
+;; not in the agg_resolve registry — so the whole group drops to legacy, and
+;; n_aggs>8 with n_keys>0 was the second guard clause).  Fixture k=[1 1 2 2]
+;; g=[5 5 6 6] v=[10 20 30 40]: group (1,5) rows 0,1; group (2,6) rows 2,3.
+;; first v = first row's v per group = [10 30]; last v = [20 40];
+;; sum=[30 70] count=[2 2] min=[10 30] max=[20 40] avg=[15.0 35.0]. ──
+(set wm_fl (table [k g v] (list [1 1 2 2] [5 5 6 6] [10 20 30 40])))
+(set wm_rfl (select {from: wm_fl a1: (sum v) a2: (count v) a3: (min v) a4: (max v) a5: (avg v) a6: (sum v) a7: (min v) a8: (first v) a9: (last v) by: {k: k g: g}}))
+(at (meta wm_rfl) 'len) -- 11
+(at wm_rfl 'a8) -- [10 30]
+(at wm_rfl 'a9) -- [20 40]
+(at wm_rfl 'a1) -- [30 70]
+(at wm_rfl 'a5) -- [15.0 35.0]
+
+;; ── keyless group with pearson_corr + 8 other aggs (9 total).  Keyless groups
+;; always decline v2; a PEARSON_CORR agg sets sc_has_binary so the scalar
+;; fast path is skipped and it lands on ht_path, whose n_aggs>8 guard is now
+;; retired.  x=[1..5] y=[2 4 6 8 10]=2x: pearson=1.0 (perfect positive);
+;; sum(x)=15 min(x)=1 max(x)=5 count(x)=5 sum(y)=30 min(y)=2 max(y)=10 avg(y)=6.0 ──
+(set wm_tp (table [x y] (list [1.0 2.0 3.0 4.0 5.0] [2.0 4.0 6.0 8.0 10.0])))
+(set wm_rp (select {from: wm_tp c: (pearson_corr x y) a1: (sum x) a2: (min x) a3: (max x) a4: (count x) a5: (sum y) a6: (min y) a7: (max y) a8: (avg y)}))
+(at (meta wm_rp) 'len) -- 9
+(at wm_rp 'c) -- [1.0]
+(at wm_rp 'a1) -- [15.0]
+(at wm_rp 'a5) -- [30.0]
+(at wm_rp 'a8) -- [6.0]
+
+;; ── 17-key group with an expression-input agg (sum(a*b)).  The expression
+;; input routes to exec_group_v2_exprs, whose n_keys>16 cap is retired (its
+;; [16] scratch is now VLA-sized).  17 identical key columns [1 1 2] -> 2
+;; groups (rows 0,1 key 1; row 2 key 2).  a=[2 3 4] b=[5 6 7] a*b=[10 18 28]:
+;; group1 (rows 0,1) sum=10+18=28; group2 (row 2) sum=28.  So sm=[28 28]. ──
+(set wm_te (table [k00 k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 a b] (list [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [1 1 2] [2 3 4] [5 6 7])))
+(set wm_re (select {from: wm_te sm: (sum (* a b)) by: ['k00 'k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16]}))
+(at wm_re 'sm) -- [28 28]
+
+;; ── 65-key group (F64 key forces legacy; 65 keys -> ceil(65/64)=2 null-mask
+;; words) with nulls in key 0 (word 0) and key 64 (word 1) — proves per-key
+;; null tracking PAST word 0.  k00 F64 [1.0 1.0 0Nf 1.0] (null at row 2);
+;; k01..k63 all 0; k64 int [0 0N 0 0] (null at row 1); v=[10 20 30 40].
+;; Tuples: row0=(1.0, 0*63, 0); row1=(1.0, 0*63, NULL@k64); row2=(NULL@k00,
+;; 0*63, 0); row3==row0.  Distinct groups: {0,3}, {1}, {2} = 3.  If the
+;; word-1 null bit for k64 were dropped, row1 would merge into row0 -> 2
+;; groups; the k00 null (word 0) splits row2.  count==3 pins both null words;
+;; sum over all group sums = 10+40 + 20 + 30 = 100 (every row counted once). ──
+(set wm_t65 (table [k00 k01 k02 k03 k04 k05 k06 k07 k08 k09 k10 k11 k12 k13 k14 k15 k16 k17 k18 k19 k20 k21 k22 k23 k24 k25 k26 k27 k28 k29 k30 k31 k32 k33 k34 k35 k36 k37 k38 k39 k40 k41 k42 k43 k44 k45 k46 k47 k48 k49 k50 k51 k52 k53 k54 k55 k56 k57 k58 k59 k60 k61 k62 k63 k64 v] (concat (list [1.0 1.0 0Nf 1.0]) (concat (take (list [0 0 0 0]) 63) (list [0 0N 0 0] [10 20 30 40])))))
+(set wm_r65 (select {from: wm_t65 s: (sum v) by: ['k00 'k01 'k02 'k03 'k04 'k05 'k06 'k07 'k08 'k09 'k10 'k11 'k12 'k13 'k14 'k15 'k16 'k17 'k18 'k19 'k20 'k21 'k22 'k23 'k24 'k25 'k26 'k27 'k28 'k29 'k30 'k31 'k32 'k33 'k34 'k35 'k36 'k37 'k38 'k39 'k40 'k41 'k42 'k43 'k44 'k45 'k46 'k47 'k48 'k49 'k50 'k51 'k52 'k53 'k54 'k55 'k56 'k57 'k58 'k59 'k60 'k61 'k62 'k63 'k64]}))
+(count (at wm_r65 'k00)) -- 3
+(sum (at wm_r65 's)) -- 100
+
+;; ── 256-key sentinel on the legacy path (F64 key k000 forces legacy;
+;; k001..k254 constant int; k255 the discriminator [1 2]).  256 keys -> 4
+;; null-mask words, and key index 255 exercises the k&63==63 shift bits (now
+;; unsigned-safe).  The two rows differ ONLY in k255, so there are 2 groups;
+;; a mod-256 truncation of the key count (256 -> 0) would collapse both rows
+;; into one and drop k255 -> count 1.  count==2, s=[10 30], k255=[1 2]. ──
+(set wm_t256 (table [k000 k001 k002 k003 k004 k005 k006 k007 k008 k009 k010 k011 k012 k013 k014 k015 k016 k017 k018 k019 k020 k021 k022 k023 k024 k025 k026 k027 k028 k029 k030 k031 k032 k033 k034 k035 k036 k037 k038 k039 k040 k041 k042 k043 k044 k045 k046 k047 k048 k049 k050 k051 k052 k053 k054 k055 k056 k057 k058 k059 k060 k061 k062 k063 k064 k065 k066 k067 k068 k069 k070 k071 k072 k073 k074 k075 k076 k077 k078 k079 k080 k081 k082 k083 k084 k085 k086 k087 k088 k089 k090 k091 k092 k093 k094 k095 k096 k097 k098 k099 k100 k101 k102 k103 k104 k105 k106 k107 k108 k109 k110 k111 k112 k113 k114 k115 k116 k117 k118 k119 k120 k121 k122 k123 k124 k125 k126 k127 k128 k129 k130 k131 k132 k133 k134 k135 k136 k137 k138 k139 k140 k141 k142 k143 k144 k145 k146 k147 k148 k149 k150 k151 k152 k153 k154 k155 k156 k157 k158 k159 k160 k161 k162 k163 k164 k165 k166 k167 k168 k169 k170 k171 k172 k173 k174 k175 k176 k177 k178 k179 k180 k181 k182 k183 k184 k185 k186 k187 k188 k189 k190 k191 k192 k193 k194 k195 k196 k197 k198 k199 k200 k201 k202 k203 k204 k205 k206 k207 k208 k209 k210 k211 k212 k213 k214 k215 k216 k217 k218 k219 k220 k221 k222 k223 k224 k225 k226 k227 k228 k229 k230 k231 k232 k233 k234 k235 k236 k237 k238 k239 k240 k241 k242 k243 k244 k245 k246 k247 k248 k249 k250 k251 k252 k253 k254 k255 v] (concat (list [1.0 1.0]) (concat (take (list [1 1]) 254) (list [1 2] [10 30])))))
+(set wm_r256 (select {from: wm_t256 s: (sum v) by: ['k000 'k001 'k002 'k003 'k004 'k005 'k006 'k007 'k008 'k009 'k010 'k011 'k012 'k013 'k014 'k015 'k016 'k017 'k018 'k019 'k020 'k021 'k022 'k023 'k024 'k025 'k026 'k027 'k028 'k029 'k030 'k031 'k032 'k033 'k034 'k035 'k036 'k037 'k038 'k039 'k040 'k041 'k042 'k043 'k044 'k045 'k046 'k047 'k048 'k049 'k050 'k051 'k052 'k053 'k054 'k055 'k056 'k057 'k058 'k059 'k060 'k061 'k062 'k063 'k064 'k065 'k066 'k067 'k068 'k069 'k070 'k071 'k072 'k073 'k074 'k075 'k076 'k077 'k078 'k079 'k080 'k081 'k082 'k083 'k084 'k085 'k086 'k087 'k088 'k089 'k090 'k091 'k092 'k093 'k094 'k095 'k096 'k097 'k098 'k099 'k100 'k101 'k102 'k103 'k104 'k105 'k106 'k107 'k108 'k109 'k110 'k111 'k112 'k113 'k114 'k115 'k116 'k117 'k118 'k119 'k120 'k121 'k122 'k123 'k124 'k125 'k126 'k127 'k128 'k129 'k130 'k131 'k132 'k133 'k134 'k135 'k136 'k137 'k138 'k139 'k140 'k141 'k142 'k143 'k144 'k145 'k146 'k147 'k148 'k149 'k150 'k151 'k152 'k153 'k154 'k155 'k156 'k157 'k158 'k159 'k160 'k161 'k162 'k163 'k164 'k165 'k166 'k167 'k168 'k169 'k170 'k171 'k172 'k173 'k174 'k175 'k176 'k177 'k178 'k179 'k180 'k181 'k182 'k183 'k184 'k185 'k186 'k187 'k188 'k189 'k190 'k191 'k192 'k193 'k194 'k195 'k196 'k197 'k198 'k199 'k200 'k201 'k202 'k203 'k204 'k205 'k206 'k207 'k208 'k209 'k210 'k211 'k212 'k213 'k214 'k215 'k216 'k217 'k218 'k219 'k220 'k221 'k222 'k223 'k224 'k225 'k226 'k227 'k228 'k229 'k230 'k231 'k232 'k233 'k234 'k235 'k236 'k237 'k238 'k239 'k240 'k241 'k242 'k243 'k244 'k245 'k246 'k247 'k248 'k249 'k250 'k251 'k252 'k253 'k254 'k255]}))
+(count (at wm_r256 'k255)) -- 2
+(at wm_r256 's) -- [10 30]
+(at wm_r256 'k255) -- [1 2]
+
+;; ── 9-key group with a group emit-filter (desc/take) — v2 and v2-exprs are
+;; both skipped when a group emit-filter is armed, so this stays on the legacy
+;; ght path, which the width-guard lift now serves at 9 keys.  F64 k0 gives 3
+;; groups (k0=1.0 sum 30, k0=2.0 sum 70, k0=3.0 sum 50); desc: s take: 2 keeps
+;; the two largest sums -> [70 50]. ──
+(set wm_tf (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list [1.0 1.0 2.0 2.0 3.0] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [1 1 2 2 3] [10 20 30 40 50])))
+(set wm_ref (select {from: wm_tf s: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8} desc: s take: 2}))
+(count (at wm_ref 's)) -- 2
+(at wm_ref 's) -- [70 50]
+
+;; ── 9-key DICT-STR group (the exec_group wrapper shape; n_keys>8 bail
+;; retired).  Splayed STR columns >= 65536 rows carry a RAY_IDX_DICT, so the
+;; wrapper substitutes each key's int32 code vector and the rewritten integer
+;; group is served by v2 at 9 keys.  s = repeated ["a" "b"] over 70000 rows:
+;; even rows "a", odd rows "b"; v = til 70000.  Group "a" = even indices
+;; 0,2,..,69998: sum = 2*(0+1+..+34999) = 34999*35000 = 1224965000.
+;; Group "b" = odd indices: sum(til 70000) - 1224965000 = 2449965000 -
+;; 1224965000 = 1225000000.  Dict codes "a"->0 "b"->1 so groups emit [a b]. ──
+(set wm_ds (take ["a" "b"] 70000))
+(set wm_dt (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list wm_ds wm_ds wm_ds wm_ds wm_ds wm_ds wm_ds wm_ds wm_ds (til 70000))))
+(.db.splayed.set "/tmp/rfl_wm_dict9/t/" wm_dt)
+(set wm_dg (.db.splayed.get "/tmp/rfl_wm_dict9/t/"))
+(set wm_rd (select {from: wm_dg sm: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8}}))
+(at wm_rd 'k0) -- ["a" "b"]
+(at wm_rd 'sm) -- [1224965000 1225000000]
+
+;; ── 9-key PLAIN-STR (non-dict) group: the width-guard lift means this shape
+;; no longer `nyi`s and the legacy ght inline-STR scatter groups it correctly
+;; (verified: identical key tuples hash-collide and merge in group_ht).  It is
+;; NOT asserted for grouped VALUES here because a PRE-EXISTING, cut-4-orthogonal
+;; bug in the query-layer routing sends any select with >=2 STR/wide key
+;; columns AND >=3 total keys to an eval path that fails to merge groups
+;; (repro: 2 STR + 1 int keys returns one group per row; 1 STR + 2 int keys is
+;; correct — reproduces on master, independent of the >8 width guards).  The
+;; correct STR-key width path is covered by the dict-STR cell above; this cell
+;; pins only that the 9-key plain-STR shape is now SERVED (a table, no nyi). ──
+(set wm_ps (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] [10 20 30 40])))
+(at (meta (select {from: wm_ps s: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8}})) 'len) -- 10

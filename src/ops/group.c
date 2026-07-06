@@ -6110,10 +6110,12 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         gvm->grp_card_n = 0;
     }
     ray_t* result;
-    /* key_col/dict_sym are one scratch block sized to n_keys (a VLA can't cross
-     * the `goto grp_done` bail-outs below).  wrap_hdr stays NULL on the early
-     * bails.  The wrapper's own n_keys > 8 bail still stands in this commit;
-     * the guard-lift commit retires it so >8-key dict-STR groups are served. */
+    /* Dict-STR key substitution admits any key count (unbounded-slots cut 4):
+     * substituting each dict'd STR key with its int32 code vector rewrites the
+     * group to integer keys, which exec_group_run's v2 engine serves at any
+     * width.  The former n_keys > 8 bail is retired; key_col/dict_sym are one
+     * scratch block sized to n_keys (a VLA can't cross the `goto grp_done`
+     * bail-outs below).  wrap_hdr stays NULL on the early bails. */
     ray_t*  wrap_hdr = NULL;
     ray_t** key_col = NULL;     /* source STR column per dict'd key (for output) */
     int64_t* dict_sym = NULL;
@@ -6121,7 +6123,7 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
     ray_op_ext_t* ext = find_ext(g, op->id);
-    if (!ext || ext->n_keys == 0 || ext->n_keys > 8) {
+    if (!ext || ext->n_keys == 0) {
         result = exec_group_run(g, op, tbl, group_limit); goto grp_done;
     }
 
@@ -6663,12 +6665,11 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
     ray_op_ext_t* ext = find_ext(g, op->id);
-    /* Own gate: this v2-expression shadow path's scratch (synth/names/in_ids/
-     * keys/ins/ins2) is now VLA-sized to n_aggs/n_keys and every index loop
-     * below is uint32_t, but the 16 caps still stand here — the guard-lift
-     * commit retires them. */
-    if (!ext || ext->n_keys < 1 || ext->n_keys > 16 ||
-        ext->n_aggs < 1 || ext->n_aggs > 16) return NULL;
+    /* Own gate: this v2-expression shadow path serves any key/agg count
+     * (unbounded-slots cut 4 — the former 16 caps are retired).  Its scratch
+     * (synth/names/in_ids/keys/ins/ins2) is now VLA-sized to n_aggs/n_keys and
+     * every index loop below is uint32_t. */
+    if (!ext || ext->n_keys < 1 || ext->n_aggs < 1) return NULL;
 
     /* At least one agg input must be a compiled-expression node; scans,
      * COUNT and binary/holistic second inputs pass through untouched. */
@@ -6995,12 +6996,15 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
     }
 
-    /* Width guard still in force here: this commit sizes every entry-staging
-     * buffer on the legacy path to the layout (stack when it fits, one
-     * per-call/per-worker heap block when wider) and widens group_ht_t's
-     * wide-key tables to base pointers, but does NOT yet admit >8-key/>8-agg
-     * shapes — retiring this guard is the following commit. */
-    if (n_keys > 8 || (n_keys > 0 && n_aggs > 8)) return ray_error("nyi", NULL);
+    /* Width guard RETIRED (unbounded-slots cut 4): the legacy ght/scalar
+     * machinery now serves any key/agg count.  ght_layout_t is unbounded
+     * (inline-or-spill); group_ht_t's key_data/key_pool wide-key tables are
+     * base pointers (inline ≤8, heap-spilled wider); every fixed entry-staging
+     * buffer on this path (ebuf/keys/agg_vals/keybuf/ek_buf/kpool + the driver
+     * key_data/key_types/key_attrs) is layout-sized; and per-key null tracking
+     * uses ceil(n_keys/64) mask words (no <64 cap).  Shapes that reach here are
+     * exactly the v2/v2-exprs declines (F64/STR/GUID/expression keys, or
+     * v2-ineligible aggs like FIRST/LAST/PROD/narrow-int-SUM), at any width. */
 
     /* Extract selection (rowsel) for pushdown.  Prefer streaming the
      * morsel-local rowsel directly; flattening to int64 indices is kept
@@ -9118,18 +9122,12 @@ dyn_dense_done:
     }
 
 ht_path:;
-    /* Keyless n_aggs>8 guard still in force: the entry-staging buffers this
-     * fallback uses are now layout-sized, but admitting >8 aggs is deferred to
-     * the guard-lift commit. */
-    if (n_aggs > 8) {
-        for (uint32_t a = 0; a < n_aggs; a++)
-            { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
-              if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }
-        for (uint32_t k = 0; k < n_keys; k++)
-            if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
-        if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
-        return ray_error("nyi", NULL);
-    }
+    /* n_aggs > 8 guard RETIRED (unbounded-slots cut 4): the HT row-layout is
+     * now layout-sized end to end (ght_layout_t agg metadata is unbounded, the
+     * entry-staging buffers spill past 8), so this fallback — reached by the
+     * keyless shapes that skip the scalar fast path (a PEARSON_CORR binary agg,
+     * or an empty table) — serves any agg count.  n_keys > 0 shapes flow the
+     * same machinery. */
     /* The HT row-layout reads agg_vecs directly — convert any fused-product
      * slots into ordinary materialized inputs first. */
     if (!group_materialize_prod_slots(agg_prod, agg_vecs, agg_owned,
