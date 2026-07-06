@@ -258,6 +258,7 @@ ray_err_t ray_mkdir_p(const char* path) {
     // cppcheck-suppress arrayIndexOutOfBoundsCond // buf is RAY_PATH_MAX (>=4096) bytes and len < sizeof(buf); cppcheck misjudges the extent when PATH_MAX is unresolved
     while (len > 1 && buf[len - 1] == '/') buf[--len] = '\0';
     for (size_t i = 1; i < len; i++) {
+        // cppcheck-suppress arrayIndexOutOfBounds // same FP as above: PATH_MAX unresolved => cppcheck 2.13 guesses buf as size 1; i < len < sizeof(buf)
         if (buf[i] == '/') {
             buf[i] = '\0';
             if (mkdir(buf, 0755) != 0 && errno != EEXIST) return RAY_ERR_IO;
