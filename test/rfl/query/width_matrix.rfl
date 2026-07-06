@@ -864,3 +864,37 @@
 ;; pins only that the 9-key plain-STR shape is now SERVED (a table, no nyi). ──
 (set wm_ps (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] ["a" "a" "b" "b"] [10 20 30 40])))
 (at (meta (select {from: wm_ps s: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8}})) 'len) -- 10
+
+;; ── 1 plain-STR key + N int keys, 70000 rows forcing the PARALLEL radix_v2
+;; path (>= RAY_PARALLEL_THRESHOLD = 64*1024 = 65536).  Review Critical:
+;; radix_v2_phase2_ctx_t's key_pool was left a fixed `const void* key_pool[8]`
+;; while every sibling ctx was widened to a carved `const void**`;
+;; derive_key_pool writes out[k] for ALL k < n_keys, so any_wide_key (the STR
+;; key) + >8 total keys overflows the [8] at exec_group_run's v2p2 setup
+;; (~9338).  Two cells pin the two failure modes (both ASan-verified pre-fix):
+;;   * 9 keys (1 STR + 8 int): out[8] lands on the adjacent _Atomic oom field
+;;     — an INTRA-struct overflow ASan cannot see; silent corruption boundary.
+;;   * 10 keys (1 STR + 9 int): out[9] crosses the struct end into the stack
+;;     redzone — ASan stack-buffer-overflow WRITE in derive_key_pool via
+;;     exec_group_run (verified crashing pre-fix, passing post-fix).
+;; Only 1 wide/STR key is used (k0) — a second wide key would hit the
+;; separate, pre-existing, cut-4-orthogonal eval-misroute bug noted above and
+;; is deliberately avoided here.  k0 STR cycles ["a" "b"] non-splayed (stays
+;; PLAIN, not RAY_IDX_DICT — dict conversion is a splayed-storage attribute);
+;; the int keys are all constant 0 so grouping is solely by k0 -> exactly 2
+;; groups.  v = til 70000.  Group "a" = even indices 0,2,..,69998: sum =
+;; 2*(0+1+..+34999) = 34999*35000 = 1224965000.  Group "b" = odd indices:
+;; sum(til 70000) - 1224965000 = 69999*70000/2 - 1224965000 =
+;; 2449965000 - 1224965000 = 1225000000. ──
+(set wm_wk (take ["a" "b"] 70000))
+(set wm_wz (take [0] 70000))
+(set wm_wt (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list wm_wk wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz (til 70000))))
+(set wm_wr (select {from: wm_wt sm: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8}}))
+(at wm_wr 'k0) -- ["a" "b"]
+(at wm_wr 'sm) -- [1224965000 1225000000]
+
+;; 10-key variant: the ASan-visible redzone crossing (crashed pre-fix).
+(set wm_xt (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 k9 v] (list wm_wk wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz wm_wz (til 70000))))
+(set wm_xr (select {from: wm_xt sm: (sum v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8 k9: k9}}))
+(at wm_xr 'k0) -- ["a" "b"]
+(at wm_xr 'sm) -- [1224965000 1225000000]

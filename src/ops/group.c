@@ -4050,7 +4050,7 @@ typedef struct {
     uint32_t      n_workers;
     ght_layout_t  layout;
     void**        key_data;
-    const void*  key_pool[8];  /* str-pool base per wide STR key */
+    const void**  key_pool;    /* [n_keys] str-pool base per wide STR key */
     _Atomic(int)  oom;
 } radix_v2_phase2_ctx_t;
 
@@ -9335,8 +9335,18 @@ ht_path:;
                 .oom       = 0,
             };
             ght_layout_copy(&v2p2.layout, &ght_layout);
-            if (ght_layout.any_wide_key) derive_key_pool(&ght_layout, key_vecs, v2p2.key_pool);
+            /* Wide-key str-pool table: phase2 copies each into its part_hts
+             * (whose bases point into the source columns), so this temp is
+             * freed right after the dispatch — mirrors p2ctx below. */
+            ray_t* v2p2_kp_hdr = NULL;
+            if (ght_layout.any_wide_key) {
+                v2p2.key_pool = (const void**)scratch_alloc(&v2p2_kp_hdr,
+                    (size_t)(n_keys ? n_keys : 1) * sizeof(void*));
+                if (!v2p2.key_pool) { result = ray_error("oom", NULL); goto cleanup; }
+                derive_key_pool(&ght_layout, key_vecs, v2p2.key_pool);
+            }
             ray_pool_dispatch_n(pool, radix_v2_phase2_fn, &v2p2, RADIX_P);
+            scratch_free(v2p2_kp_hdr);
             CHECK_CANCEL_GOTO(pool, cleanup);
             /* Worker HTs are no longer needed once the merge is done. */
             for (size_t i = 0; i < v2_n_w; i++)
