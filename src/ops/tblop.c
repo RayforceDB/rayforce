@@ -127,26 +127,35 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         return ray_error("type", "pivot: index must be a symbol or list of symbols, got %s", ray_type_name(index_arg->type));
     }
 
-    /* VLA, exact-size (mirrors group.c's exec_group_run driver arrays —
-     * key_vecs/key_data/key_types/key_attrs, cut-4 Task 4 — the established
-     * pattern for small per-index metadata scoped to one function call:
-     * every one of this function's many return points below frees it via
-     * ordinary C stack unwind, so there is no carve-then-forget-to-free
-     * hazard to track across those exits).  Floored at 1 to sidestep
-     * zero-length VLA UB (an empty index list is legal: pivot grouped by
-     * the pivot column alone). */
+    /* n_idx is a USER-SUPPLIED RUNTIME value — the index-arg's length, not
+     * an AST-bounded count (unlike group.c's exec_group_run driver arrays,
+     * whose element count is capped by query text) — so a caller can pass
+     * a multi-million-element index vector.  A stack VLA at that size is a
+     * stack-clash SIGSEGV where the old code returned a clean limit error;
+     * heap-carve instead.  One consolidated block holds idx_syms (column
+     * NAME ids) and icols (the resolved column pointers) — both survive to
+     * the very end of this function (the fb_cleanup result-building code
+     * below reads both) — so every one of this function's many return
+     * points must scratch_free(ic_hdr) exactly once.  Floored at 1 to
+     * sidestep zero-size alloc UB (an empty index list is legal: pivot
+     * grouped by the pivot column alone). */
     int64_t vla_idx = n_idx > 0 ? n_idx : 1;
-    int64_t idx_syms[vla_idx];
+    ray_t* ic_hdr = NULL;
+    int64_t* idx_syms = (int64_t*)scratch_alloc(&ic_hdr,
+            (size_t)vla_idx * (sizeof(int64_t) + sizeof(ray_t*)));
+    if (!idx_syms) return ray_error("oom", NULL);
+    ray_t** icols = (ray_t**)(idx_syms + vla_idx);
     if (index_arg->type == -RAY_SYM) {
         idx_syms[0] = index_arg->i64;
     } else {
         for (int64_t i = 0; i < n_idx; i++) {
             int alloc = 0;
             ray_t* elem = collection_elem(index_arg, i, &alloc);
-            if (RAY_IS_ERR(elem)) return elem;
+            if (RAY_IS_ERR(elem)) { scratch_free(ic_hdr); return elem; }
             if (elem->type != -RAY_SYM) {
                 int8_t et = elem->type;
                 if (alloc) ray_release(elem);
+                scratch_free(ic_hdr);
                 return ray_error("type", "pivot: index columns must be symbols, got %s", ray_type_name(et));
             }
             idx_syms[i] = elem->i64;
@@ -156,26 +165,27 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
 
     /* Get pivot column, value column */
     ray_t* pcol = ray_table_get_col(tbl, pivot_col_name->i64);
-    if (!pcol) return ray_error("domain", "pivot: pivot column not found");
+    if (!pcol) { scratch_free(ic_hdr); return ray_error("domain", "pivot: pivot column not found"); }
     ray_t* vcol = ray_table_get_col(tbl, value_col_name->i64);
-    if (!vcol) return ray_error("domain", "pivot: value column not found");
+    if (!vcol) { scratch_free(ic_hdr); return ray_error("domain", "pivot: value column not found"); }
 
     /* The pivot column's distinct values become output column NAMES (syms);
      * a STR pivot column cannot supply names.  (STR *index* columns ARE now
      * supported — they group via the wide-key path; this restriction is
      * specific to the pivot column, whose values name the unstacked columns.) */
-    if (pcol->type == RAY_STR)
+    if (pcol->type == RAY_STR) {
+        scratch_free(ic_hdr);
         return ray_error("nyi", "pivot: STR pivot column not supported as column names");
+    }
 
-    /* Get index columns (VLA, exact-size; see idx_syms above) */
-    ray_t* icols[vla_idx];
+    /* Get index columns (icols carved together with idx_syms above) */
     for (int64_t i = 0; i < n_idx; i++) {
         icols[i] = ray_table_get_col(tbl, idx_syms[i]);
-        if (!icols[i]) return ray_error("domain", "pivot: index column not found");
+        if (!icols[i]) { scratch_free(ic_hdr); return ray_error("domain", "pivot: index column not found"); }
     }
 
     int64_t nrows = ray_table_nrows(tbl);
-    if (nrows == 0) return ray_table_new(0);
+    if (nrows == 0) { scratch_free(ic_hdr); return ray_table_new(0); }
 
     /* DAG fast path: known agg builtins on hashable columns → OP_PIVOT */
     uint16_t agg_op = pivot_fn_to_agg_op(agg_fn);
@@ -185,25 +195,59 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
 
     if (dag_ok) {
         ray_graph_t* g = ray_graph_new(tbl);
-        if (!g) return ray_error("oom", NULL);
-        ray_op_t* idx_ops[vla_idx]; /* VLA, exact-size; see idx_syms above */
+        if (!g) { scratch_free(ic_hdr); return ray_error("oom", NULL); }
+        /* Same user-length hazard as idx_syms/icols above: heap-carve.
+         *
+         * SECOND, independent hazard uncovered by lifting the index-count
+         * cap: ray_scan() appends a node to `g`, which grows g->nodes via
+         * realloc once node_count crosses node_cap (GRAPH_INIT_CAP=4096,
+         * doubling) — moving the whole array.  Any ray_op_t* returned by an
+         * EARLIER ray_scan() call in the loop below is a pointer into the
+         * OLD (now freed) g->nodes block once a LATER call in the same
+         * loop crosses that boundary — exactly the hazard op_node's own
+         * contract warns about ("never store [a node pointer] across a
+         * node allocation; re-resolve from the id instead").  n_idx used
+         * to be capped well under 4096, so this was unreachable; a 5000+
+         * duplicated-index pivot now reaches it and segfaults inside
+         * exec_group on a garbage node id read through the stale pointer.
+         * Fix: collect each scan's stable ->id through every ray_scan call
+         * in this block, and only resolve id -> pointer in ONE pass after
+         * the LAST scan call (v_op below) — that resolve reads the FINAL
+         * g->nodes block, and nothing after it grows the graph again
+         * before ray_pivot_op consumes the pointers. */
+        ray_t* iids_hdr = NULL;
+        ray_op_t** idx_ops = (ray_op_t**)scratch_alloc(&iids_hdr,
+                (size_t)vla_idx * (sizeof(ray_op_t*) + sizeof(uint32_t)));
+        if (!idx_ops) { ray_graph_free(g); scratch_free(ic_hdr); return ray_error("oom", NULL); }
+        uint32_t* idx_ids = (uint32_t*)(idx_ops + vla_idx);
         bool ok = true;
         for (int64_t i = 0; i < n_idx && ok; i++) {
             ray_t* s = ray_sym_str(idx_syms[i]);
-            idx_ops[i] = s ? ray_scan(g, ray_str_ptr(s)) : NULL;
-            if (!idx_ops[i]) ok = false;
+            ray_op_t* op = s ? ray_scan(g, ray_str_ptr(s)) : NULL;
+            if (!op) { ok = false; break; }
+            idx_ids[i] = op->id;
         }
         ray_t* ps = ray_sym_str(pivot_col_name->i64);
+        ray_op_t* p_scan = (ps && ok) ? ray_scan(g, ray_str_ptr(ps)) : NULL;
+        uint32_t p_id = p_scan ? p_scan->id : RAY_OP_NONE;
         ray_t* vs = ray_sym_str(value_col_name->i64);
-        ray_op_t* p_op = (ps && ok) ? ray_scan(g, ray_str_ptr(ps)) : NULL;
-        ray_op_t* v_op = (vs && p_op) ? ray_scan(g, ray_str_ptr(vs)) : NULL;
+        ray_op_t* v_op = (vs && p_scan) ? ray_scan(g, ray_str_ptr(vs)) : NULL;
         if (v_op) {
+            /* Resolve now: v_op (the LAST scan call above) is still fresh;
+             * idx_ops/p_op must be re-read from their ids (see comment
+             * above — their own earlier pointers may already be stale). */
+            for (int64_t i = 0; i < n_idx; i++) idx_ops[i] = op_node(g, idx_ids[i]);
+            ray_op_t* p_op = op_node(g, p_id);
             ray_op_t* root = ray_pivot_op(g, idx_ops, (uint32_t)n_idx, p_op, v_op, agg_op);
+            scratch_free(iids_hdr);
             if (root) {
                 ray_t* result = ray_execute(g, root);
                 ray_graph_free(g);
+                scratch_free(ic_hdr);
                 return result;
             }
+        } else {
+            scratch_free(iids_hdr);
         }
         ray_graph_free(g);
     }
@@ -213,42 +257,59 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
 
     /* Build GROUP BY (idx0, ..., idxN-1, pivot_col) with COUNT agg via DAG */
     ray_graph_t* g = ray_graph_new(tbl);
-    if (!g) return ray_error("oom", NULL);
+    if (!g) { scratch_free(ic_hdr); return ray_error("oom", NULL); }
 
     uint32_t n_keys = (uint32_t)n_idx + 1;
-    ray_op_t* key_ops[n_keys]; /* VLA, exact-size; n_keys = n_idx + 1 >= 1 always */
+    /* Same two hazards as the DAG fast path above (user-length heap-carve
+     * + stale ray_op_t* across a reallocating ray_scan loop): collect ids
+     * through every scan call, resolve to pointers in one pass right
+     * before ray_group — val_scan below is the LAST scan call in this
+     * function, so it stays fresh without needing the id round-trip. */
+    ray_t* kids_hdr = NULL;
+    ray_op_t** key_ops = (ray_op_t**)scratch_alloc(&kids_hdr,
+            (size_t)n_keys * (sizeof(ray_op_t*) + sizeof(uint32_t)));
+    if (!key_ops) { ray_graph_free(g); scratch_free(ic_hdr); return ray_error("oom", NULL); }
+    uint32_t* key_ids = (uint32_t*)(key_ops + n_keys);
     bool ok = true;
     for (int64_t i = 0; i < n_idx && ok; i++) {
         ray_t* s = ray_sym_str(idx_syms[i]);
-        key_ops[i] = s ? ray_scan(g, ray_str_ptr(s)) : NULL;
-        if (!key_ops[i]) ok = false;
+        ray_op_t* op = s ? ray_scan(g, ray_str_ptr(s)) : NULL;
+        if (!op) { ok = false; break; }
+        key_ids[i] = op->id;
     }
     {
         ray_t* ps = ray_sym_str(pivot_col_name->i64);
-        key_ops[n_idx] = (ps && ok) ? ray_scan(g, ray_str_ptr(ps)) : NULL;
-        if (!key_ops[n_idx]) ok = false;
+        ray_op_t* op = (ps && ok) ? ray_scan(g, ray_str_ptr(ps)) : NULL;
+        if (op) key_ids[n_idx] = op->id; else ok = false;
     }
     /* Value column scan for COUNT (just need a column ref for group) */
     ray_t* vs = ray_sym_str(value_col_name->i64);
     ray_op_t* val_scan = (vs && ok) ? ray_scan(g, ray_str_ptr(vs)) : NULL;
-    if (!val_scan) { ray_graph_free(g); return ray_error("domain", "pivot: failed to build DAG"); }
+    if (!val_scan) { scratch_free(kids_hdr); ray_graph_free(g); scratch_free(ic_hdr); return ray_error("domain", "pivot: failed to build DAG"); }
+    for (uint32_t i = 0; i < n_keys; i++) key_ops[i] = op_node(g, key_ids[i]);
 
     uint16_t grp_agg_ops[1] = { OP_COUNT };
     ray_op_t* grp_agg_ins[1] = { val_scan };
     ray_op_t* grp_root = ray_group(g, key_ops, n_keys, grp_agg_ops, grp_agg_ins, 1);
-    if (!grp_root) { ray_graph_free(g); return ray_error("oom", NULL); }
+    scratch_free(kids_hdr);
+    if (!grp_root) { ray_graph_free(g); scratch_free(ic_hdr); return ray_error("oom", NULL); }
 
     ray_t* grouped = ray_execute(g, grp_root);
     ray_graph_free(g);
-    if (!grouped || RAY_IS_ERR(grouped)) return grouped;
+    if (!grouped || RAY_IS_ERR(grouped)) { scratch_free(ic_hdr); return grouped; }
 
     /* `grouped` is a table: (idx0, ..., idxN-1, pivot_col, _count).
      * Each row is one (index, pivot) combination.
      * Now for each group, gather the value column subset and apply agg_fn. */
     int64_t n_grps = ray_table_nrows(grouped);
 
-    /* Get grouped columns (VLA, exact-size; see idx_syms above) */
-    ray_t* g_icols[vla_idx];
+    /* Same user-length hazard as idx_syms/icols: heap-carve.  Lives until
+     * the unstack loop below finishes using it (last read is inside the
+     * "Find or insert index key" loop over ix_list), then freed there —
+     * every return between here and that point must also free it. */
+    ray_t* g_icols_hdr = NULL;
+    ray_t** g_icols = (ray_t**)scratch_alloc(&g_icols_hdr, (size_t)vla_idx * sizeof(ray_t*));
+    if (!g_icols) { ray_release(grouped); scratch_free(ic_hdr); return ray_error("oom", NULL); }
     for (int64_t i = 0; i < n_idx; i++)
         g_icols[i] = ray_table_get_col(grouped, idx_syms[i]);
     ray_t* g_pcol = ray_table_get_col(grouped, pivot_col_name->i64);
@@ -259,10 +320,13 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     ray_retain(g_pcol);
     ray_t* dvals = ray_distinct_fn(g_pcol);
     ray_release(g_pcol);
-    if (RAY_IS_ERR(dvals)) { ray_release(grouped); return dvals; }
+    if (RAY_IS_ERR(dvals)) { scratch_free(g_icols_hdr); ray_release(grouped); scratch_free(ic_hdr); return dvals; }
     if (ray_is_lazy(dvals)) {
         dvals = ray_lazy_materialize(dvals);
-        if (!dvals || RAY_IS_ERR(dvals)) { ray_release(grouped); return dvals ? dvals : ray_error("oom", NULL); }
+        if (!dvals || RAY_IS_ERR(dvals)) {
+            scratch_free(g_icols_hdr); ray_release(grouped); scratch_free(ic_hdr);
+            return dvals ? dvals : ray_error("oom", NULL);
+        }
     }
     int64_t n_pv = ray_len(dvals);
 
@@ -312,7 +376,10 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     uint32_t gid_cap = 256;
     while (gid_cap < (uint32_t)n_grps * 2 && gid_cap < (1u << 30)) gid_cap <<= 1;
     ray_t* gid_ht_hdr = ray_alloc((size_t)gid_cap * sizeof(uint32_t));
-    if (!gid_ht_hdr) { ray_release(dvals); ray_release(grouped); return ray_error("oom", NULL); }
+    if (!gid_ht_hdr) {
+        scratch_free(g_icols_hdr); ray_release(dvals); ray_release(grouped); scratch_free(ic_hdr);
+        return ray_error("oom", NULL);
+    }
     uint32_t* gid_ht = (uint32_t*)ray_data(gid_ht_hdr);
     memset(gid_ht, 0xFF, gid_cap * sizeof(uint32_t));
     uint32_t gid_mask = gid_cap - 1;
@@ -328,7 +395,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
 
     ray_t* gid_vec = ray_vec_new(RAY_I64, nrows);
     if (!gid_vec || RAY_IS_ERR(gid_vec)) {
-        ray_free(gid_ht_hdr); ray_release(dvals); ray_release(grouped);
+        ray_free(gid_ht_hdr); scratch_free(g_icols_hdr); ray_release(dvals); ray_release(grouped);
+        scratch_free(ic_hdr);
         return ray_error("oom", NULL);
     }
     gid_vec->len = nrows;
@@ -371,7 +439,11 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
      * Slots are NULL-initialised so error paths can free agg_results even
      * before all slots are populated. */
     ray_t* agg_results = ray_alloc(n_grps * sizeof(ray_t*));
-    if (!agg_results) { ray_release(gid_vec); ray_release(dvals); ray_release(grouped); return ray_error("oom", NULL); }
+    if (!agg_results) {
+        scratch_free(g_icols_hdr); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+        scratch_free(ic_hdr);
+        return ray_error("oom", NULL);
+    }
     agg_results->type = RAY_LIST;
     agg_results->len = n_grps;
     ray_t** ar = (ray_t**)ray_data(agg_results);
@@ -381,7 +453,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
      * O(nrows * n_grps) double-scan per group. */
     ray_t* off_hdr = ray_alloc((size_t)(n_grps + 1) * sizeof(int64_t));
     if (!off_hdr) {
-        ray_free(agg_results); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+        ray_free(agg_results); scratch_free(g_icols_hdr); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+        scratch_free(ic_hdr);
         return ray_error("oom", NULL);
     }
     int64_t* offs = (int64_t*)ray_data(off_hdr);
@@ -395,7 +468,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     ray_t* sorted_hdr = ray_alloc((size_t)nrows * sizeof(int64_t));
     if (!sorted_hdr) {
         ray_free(off_hdr);
-        ray_free(agg_results); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+        ray_free(agg_results); scratch_free(g_icols_hdr); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+        scratch_free(ic_hdr);
         return ray_error("oom", NULL);
     }
     int64_t* sorted = (int64_t*)ray_data(sorted_hdr);
@@ -403,7 +477,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     ray_t* wcur_hdr = ray_alloc((size_t)n_grps * sizeof(int64_t));
     if (!wcur_hdr) {
         ray_free(sorted_hdr); ray_free(off_hdr);
-        ray_free(agg_results); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+        ray_free(agg_results); scratch_free(g_icols_hdr); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+        scratch_free(ic_hdr);
         return ray_error("oom", NULL);
     }
     int64_t* wcur = (int64_t*)ray_data(wcur_hdr);
@@ -419,7 +494,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         ray_t* subset = gather_by_idx(vcol, sorted + offs[gi], cnt);
         if (RAY_IS_ERR(subset)) {
             ray_free(sorted_hdr); ray_free(off_hdr);
-            ray_free(agg_results); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+            ray_free(agg_results); scratch_free(g_icols_hdr); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+            scratch_free(ic_hdr);
             return subset;
         }
         ray_t* agg_val = call_fn1(agg_fn, subset);
@@ -431,7 +507,8 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
             agg_val = ray_lazy_materialize(agg_val);
         if (RAY_IS_ERR(agg_val)) {
             ray_free(sorted_hdr); ray_free(off_hdr);
-            ray_free(agg_results); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+            ray_free(agg_results); scratch_free(g_icols_hdr); ray_release(gid_vec); ray_release(dvals); ray_release(grouped);
+            scratch_free(ic_hdr);
             return agg_val;
         }
         ar[gi] = agg_val;
@@ -490,6 +567,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
             ray_release(tup);
         }
     }
+    scratch_free(g_icols_hdr); /* last use of g_icols was inside this loop */
 
     int64_t n_ix = ray_len(ix_list);
 
@@ -575,6 +653,8 @@ fb_cleanup:
     ray_free(agg_results);
     ray_release(dvals);
     ray_release(grouped);
+    scratch_free(ic_hdr); /* idx_syms/icols consolidated carve — last read
+                            * just above (icols[ci]->type / idx_syms[ci]) */
     return result;
 }
 

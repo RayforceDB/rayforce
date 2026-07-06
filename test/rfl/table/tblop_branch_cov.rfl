@@ -552,6 +552,56 @@ Lset -- (list 'a 'b 'Z 'd)
 (at (at Pf64v 'y) 1) -- 4.5
 
 ;; ══════════════════════════════════════════════════════════════════
+;; Section 29: pivot — USER-LENGTH index arg no longer a stack VLA
+;;             (rayforce-audit finding, unbounded-slots cut 4).  n_idx =
+;;             ray_len(index_arg) is a RUNTIME value the caller controls
+;;             directly (index_arg is just a vector of column-name syms —
+;;             nothing requires it to be short, or even to name distinct
+;;             columns).  Before this fix, tblop.c's idx_syms/icols/
+;;             idx_ops/key_ops/g_icols and pivot.c's idx_vecs/idx_wide/
+;;             key_data/key_types/key_attrs/key_vecs were STACK VLAs sized
+;;             by n_idx.  Confirmed (pre-fix, via git stash, default 8 MiB
+;;             ulimit -s): 8200 copies of the valid column sym 'k SIGSEGV'd
+;;             with the fault inside ray_pivot_op's `index_cols[i]->id`
+;;             read (graph.c) — idx_ops, the STACK VLA holding those
+;;             pointers, corrupted by the stack-clash — instead of a clean
+;;             error.  All eleven arrays across both functions are heap
+;;             scratch-carves now, so this either runs or fails cleanly —
+;;             never crashes.
+;;
+;;             A SECOND, independent hazard surfaced while pinning this:
+;;             ray_scan() grows g->nodes (realloc) as scan nodes are
+;;             appended, so a ray_op_t* returned by an early ray_scan call
+;;             in tblop.c's idx_ops/key_ops fill loops went stale once a
+;;             later call in the same loop crossed a capacity boundary
+;;             (GRAPH_INIT_CAP=4096) — unreachable pre-cut-4 (n_idx capped
+;;             well under 4096), reachable now.  Fixed alongside the VLA
+;;             carve: both loops collect each scan's stable ->id and
+;;             resolve id -> pointer in one pass after the LAST scan call,
+;;             per op_node's own contract ("never store a node pointer
+;;             across a node allocation; re-resolve from the id instead").
+;;
+;;             Oracle: 8200 index columns (all the same 'k, repeated —
+;;             pivot does not require distinct index-column names) plus
+;;             the pivot column gives n_keys = 8201, past
+;;             ght_compute_layout's uint16 byte-offset stride budget
+;;             (~8192 plain 8-byte keys before the offset accumulator
+;;             would overflow UINT16_MAX) — so this must fail with the
+;;             SAME clean "limit" domain error ght_compute_layout already
+;;             returns for any over-budget key set, not crash and not
+;;             silently truncate.  (A much larger n_idx, e.g. 200000, also
+;;             fails cleanly but is excluded here on runtime grounds: a
+;;             separate, pre-existing O(n^2) exec_pivot cost — repeated
+;;             find_ext() linear scans over the DAG's ext-node list, one
+;;             per index column — makes it minutes slow rather than a
+;;             fast, deterministic test cell; that algorithmic-complexity
+;;             issue is out of scope for this memory-safety fix.) ──
+;; ══════════════════════════════════════════════════════════════════
+
+(set Tbig29 (table [k p v] (list [1 2] ['x 'y] [10 20])))
+(pivot Tbig29 (take ['k] 8200) 'p 'v sum) !- limit
+
+;; ══════════════════════════════════════════════════════════════════
 ;; Unreachable branches documentation (OOM guards, internal-only):
 ;;
 ;; L128  — ray_graph_new returns NULL (OOM in DAG fast path)

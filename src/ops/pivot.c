@@ -286,60 +286,67 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     uint16_t agg_op = ext->pivot.agg_op;
     int64_t nrows   = ray_table_nrows(tbl);
 
-    /* VLA, exact-size: n_idx is no longer capped at 7 (task 6 lifts both
-     * this function's own former n_keys > 8 gate and tblop.c's caller-side
-     * check — the ght layout below spills to a heap block for n_keys > 8,
-     * same mechanism group.c's exec_group_run already relies on).  Sized
-     * ≥1 to sidestep zero-length VLA UB when n_idx == 0 (a pivot with no
-     * index columns is legal — grouping is by the pivot column alone).
-     * Scope-lifetime: every one of this function's many early returns
-     * below frees it via ordinary C stack unwind, so there is no
-     * carve-then-forget-to-free hazard to track across those exits. */
-    ray_t* idx_vecs[n_idx ? n_idx : 1];
+    /* n_idx is USER-DATA-sized (the index-arg vector's length, tblop.c's
+     * pivot_fn_impl), not AST-bounded — task 6 lifts both this function's
+     * own former n_keys > 8 gate and tblop.c's caller-side check (the ght
+     * layout below spills to a heap block for n_keys > 8, same mechanism
+     * group.c's exec_group_run already relies on), so a caller can drive
+     * n_idx into the millions.  A stack VLA at that size is a stack-clash
+     * SIGSEGV waiting to happen; heap-carve instead.  One consolidated
+     * block holds all six per-index/per-key arrays below (idx_vecs,
+     * key_data, key_vecs — pointer-sized, placed first so every array
+     * after the first stays 8-byte aligned — then idx_wide, key_types,
+     * key_attrs, the byte-sized ones); freed on every exit from here to
+     * pivot_cleanup below.  n_idx_cap floors n_idx at 1 (an index-less
+     * pivot is legal — grouping by the pivot column alone), n_keys = n_idx
+     * + 1 is already >= 1. */
+    uint32_t n_idx_cap = n_idx ? n_idx : 1;
+    uint32_t n_keys = n_idx + 1;
+    size_t key_ptr_bytes  = (size_t)n_idx_cap * sizeof(ray_t*)   /* idx_vecs */
+                          + (size_t)n_keys   * sizeof(void*)     /* key_data */
+                          + (size_t)n_keys   * sizeof(ray_t*);   /* key_vecs */
+    size_t key_byte_bytes = (size_t)n_idx_cap * sizeof(bool)     /* idx_wide */
+                          + (size_t)n_keys   * sizeof(int8_t)    /* key_types */
+                          + (size_t)n_keys   * sizeof(uint8_t);  /* key_attrs */
+    ray_t* key_hdr = NULL;
+    uint8_t* key_base = (uint8_t*)scratch_alloc(&key_hdr, key_ptr_bytes + key_byte_bytes);
+    if (!key_base) return ray_error("oom", NULL);
+    ray_t**  idx_vecs  = (ray_t**)key_base;
+    void**   key_data  = (void**)(idx_vecs + n_idx_cap);
+    ray_t**  key_vecs  = (ray_t**)(key_data + n_keys);
+    bool*    idx_wide  = (bool*)(key_vecs + n_keys);
+    int8_t*  key_types = (int8_t*)(idx_wide + n_idx_cap);
+    uint8_t* key_attrs = (uint8_t*)(key_types + n_keys);
+    memset(idx_wide, 0, (size_t)n_idx_cap * sizeof(bool));
+
     for (uint32_t i = 0; i < n_idx; i++) {
         ray_op_ext_t* ie = find_ext(g, ext->pivot.index_cols[i]);
         idx_vecs[i] = (ie && ie->base.opcode == OP_SCAN)
                      ? ray_table_get_col(tbl, ie->sym) : NULL;
-        if (!idx_vecs[i]) return ray_error("domain", "pivot: index column not found");
+        if (!idx_vecs[i]) { scratch_free(key_hdr); return ray_error("domain", "pivot: index column not found"); }
     }
 
     ray_op_ext_t* pe = find_ext(g, ext->pivot.pivot_col);
     ray_t* pcol = (pe && pe->base.opcode == OP_SCAN)
                 ? ray_table_get_col(tbl, pe->sym) : NULL;
-    if (!pcol) return ray_error("domain", "pivot: pivot column not found");
+    if (!pcol) { scratch_free(key_hdr); return ray_error("domain", "pivot: pivot column not found"); }
 
     ray_op_ext_t* ve = find_ext(g, ext->pivot.value_col);
     ray_t* vcol = (ve && ve->base.opcode == OP_SCAN)
                 ? ray_table_get_col(tbl, ve->sym) : NULL;
-    if (!vcol) return ray_error("domain", "pivot: value column not found");
+    if (!vcol) { scratch_free(key_hdr); return ray_error("domain", "pivot: value column not found"); }
 
-    if (nrows == 0) return ray_table_new(0);
+    if (nrows == 0) { scratch_free(key_hdr); return ray_table_new(0); }
 
     /* Combined keys: index_cols + pivot_col.  No count cap — the ght
      * layout below (ght_compute_layout) spills to an owned heap block
      * whenever n_keys exceeds its GHT_INLINE (8) inline capacity; its own
      * key-stride budget (uint16 byte offsets) is the only remaining limit,
      * unreachable at any index-column count a real table could carry. */
-    uint32_t n_keys = n_idx + 1;
-
-    /* VLA, exact-size (see idx_vecs above for the rationale/precedent).
-     * Wide-key resolution: for RAY_GUID the HT slot holds a source row
-     * index rather than the 16 raw bytes, so phase2 dedupe and emit
-     * route wide keys through the source column (key_data[k]).  These
-     * arrays are indexed up to n_idx inclusive (the pivot key itself
-     * lives at key_data[n_idx] etc.), so key_data/key_types/key_attrs/
-     * key_vecs are sized to n_keys (always >= 1); idx_wide only covers
-     * the n_idx index keys, floored at 1 for the same zero-VLA reason. */
-    bool idx_wide[n_idx ? n_idx : 1];
-    memset(idx_wide, 0, sizeof(idx_wide));
     for (uint32_t k = 0; k < n_idx; k++)
         idx_wide[k] = (idx_vecs[k]->type == RAY_GUID);
     bool pvt_wide = (pcol->type == RAY_GUID);
 
-    void*   key_data[n_keys];
-    int8_t  key_types[n_keys];
-    uint8_t key_attrs[n_keys];
-    ray_t*  key_vecs[n_keys];
     for (uint32_t k = 0; k < n_idx; k++) {
         key_data[k]  = ray_data(idx_vecs[k]);
         key_types[k] = idx_vecs[k]->type;
@@ -367,8 +374,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * point; every exit below (early return AND pivot_cleanup) must call
      * it exactly once so a spilled layout's heap block is never leaked. */
     ght_layout_t ly;
-    if (!ght_compute_layout(&ly, n_keys, 1, agg_vecs, need_flags, agg_ops, key_types))
+    if (!ght_compute_layout(&ly, n_keys, 1, agg_vecs, need_flags, agg_ops, key_types)) {
+        scratch_free(key_hdr);
         return ray_error("limit", "pivot: key stride budget exceeded");
+    }
 
     /* Hash-aggregate all rows via the shared radix pipeline — parallel
      * across thread-pool workers for n_scan ≥ RAY_PARALLEL_THRESHOLD,
@@ -379,18 +388,21 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                           key_vecs, agg_vecs, nrows)) {
         pivot_ingest_free(&pg);
         ght_layout_free(&ly);
+        scratch_free(key_hdr);
         return ray_error("oom", NULL);
     }
     ray_progress_update("pivot", "dedupe", 0, (uint64_t)pg.total_grps);
     if (ray_interrupted()) {
         pivot_ingest_free(&pg);
         ght_layout_free(&ly);
+        scratch_free(key_hdr);
         return ray_error("cancel", "interrupted");
     }
     uint32_t grp_count = pg.total_grps;
     if (grp_count == 0) {
         pivot_ingest_free(&pg);
         ght_layout_free(&ly);
+        scratch_free(key_hdr);
         return ray_table_new(0);
     }
 
@@ -415,7 +427,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     uint32_t pv_cap = 64, pv_count = 0;
     ray_t* pv_hdr = NULL;
     int64_t* pv_vals = (int64_t*)scratch_alloc(&pv_hdr, pv_cap * sizeof(int64_t));
-    if (!pv_vals) { pivot_ingest_free(&pg); ght_layout_free(&ly); return ray_error("oom", NULL); }
+    if (!pv_vals) { pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
 
     const char* pvt_base = pvt_wide ? (const char*)key_data[n_idx] : NULL;
     for (uint32_t _p = 0; _p < pg.n_parts; _p++) {
@@ -440,7 +452,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     uint32_t new_cap = pv_cap * 2;
                     int64_t* new_pv = (int64_t*)scratch_realloc(&pv_hdr,
                         pv_cap * sizeof(int64_t), new_cap * sizeof(int64_t));
-                    if (!new_pv) { pivot_ingest_free(&pg); ght_layout_free(&ly); return ray_error("oom", NULL); }
+                    if (!new_pv) { pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
                     pv_vals = new_pv;
                     pv_cap = new_cap;
                 }
@@ -464,7 +476,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     ray_t* ix_hdr = NULL;
     size_t ix_entry = 8 + (size_t)n_idx * 8 + (size_t)null_words * 8;
     char* ix_rows = (char*)scratch_alloc(&ix_hdr, ix_cap * ix_entry);
-    if (!ix_rows) { scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly); return ray_error("oom", NULL); }
+    if (!ix_rows) { scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
 
     /* Secondary HT: hash slot -> ix_row index; empty = UINT32_MAX. */
     uint32_t ix_ht_cap = 256;
@@ -473,6 +485,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     uint32_t* ix_ht = (uint32_t*)scratch_alloc(&ix_ht_hdr, ix_ht_cap * sizeof(uint32_t));
     if (!ix_ht) {
         scratch_free(ix_hdr); scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly);
+        scratch_free(key_hdr);
         return ray_error("oom", NULL);
     }
     memset(ix_ht, 0xFF, ix_ht_cap * sizeof(uint32_t));
@@ -484,6 +497,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!grp_ix) {
         scratch_free(ix_ht_hdr); scratch_free(ix_hdr); scratch_free(pv_hdr);
         pivot_ingest_free(&pg); ght_layout_free(&ly);
+        scratch_free(key_hdr);
         return ray_error("oom", NULL);
     }
     uint32_t* grp_pv = grp_ix + grp_count;
@@ -563,6 +577,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 if (!new_rows) {
                     scratch_free(map_hdr); scratch_free(ix_ht_hdr);
                     scratch_free(pv_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly);
+                    scratch_free(key_hdr);
                     return ray_error("oom", NULL);
                 }
                 ix_rows = new_rows;
@@ -859,6 +874,9 @@ pivot_cleanup:
     scratch_free(ix_ht_hdr);
     scratch_free(ix_hdr);
     scratch_free(pv_hdr);
+    scratch_free(key_hdr); /* idx_vecs/idx_wide/key_data/key_types/key_attrs/
+                             * key_vecs consolidated carve, alive since the
+                             * top of this function (see key_hdr above) */
     pivot_ingest_free(&pg);
     return result;
 }
