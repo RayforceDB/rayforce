@@ -106,7 +106,7 @@ static bool vec_is_ascending(const ray_t* v) {
         for (int64_t i = 0; i < n; i++)
             if (ray_vec_is_null((ray_t*)v, i)) return false;
     }
-    const uint8_t* b = (const uint8_t*)ray_data((ray_t*)v);
+    const void* b = ray_data((ray_t*)v);
     switch (v->type) {
     case RAY_BOOL: case RAY_U8: {
         const uint8_t* p = b;

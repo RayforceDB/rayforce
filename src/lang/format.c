@@ -272,7 +272,7 @@ static void fmt_sym(fmt_buf_t* b, int64_t sym_id) {
 #include "lang/cal.h"
 
 static void time_to_hms(int32_t ms, int* h, int* min, int* s, int* ms_out) {
-    int32_t mask = ms >> 31;
+    int32_t mask = -(int32_t)((uint32_t)ms >> 31);  /* 0 or -1, without the impl-defined signed shift */
     int32_t val  = (mask ^ ms) - mask;  /* absolute value */
 
     int32_t secs = val / 1000;

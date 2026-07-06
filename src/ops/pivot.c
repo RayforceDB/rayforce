@@ -534,7 +534,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 const char* base = (const char*)key_data[k];
                 kh = ray_hash_bytes(base + (size_t)keys[k] * 16, 16);
             } else if (key_types[k] == RAY_F64) {
-                kh = ray_hash_f64(*(const double*)&keys[k]);
+                double kd;                          /* F64 key bits live in the i64 slot; */
+                memcpy(&kd, &keys[k], sizeof kd);   /* memcpy bit-cast is aliasing-safe   */
+                kh = ray_hash_f64(kd);
             } else {
                 kh = ray_hash_i64(keys[k]);
             }

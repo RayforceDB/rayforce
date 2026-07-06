@@ -4133,6 +4133,7 @@ static inline uint32_t group_merge_row(group_ht_t* ht,
                         if (aflags[a] & GHT_AF_F64) {
                             double sv_f;
                             memcpy(&sv_f, src_row + off, 8);
+                            // cppcheck-suppress invalidPointerCast // GHT rows are 8-byte aligned and off_sum/s*8 are multiples of 8
                             *(double*)(row + off) += sv_f;
                         } else {
                             int64_t sv_i;
@@ -7555,7 +7556,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                             int64_t agg_name = ray_sym_intern("_agg", 4);
                             if (n_aggs > 1) {
                                 char buf[16];
-                                int n = snprintf(buf, sizeof(buf), "_agg%d", a);
+                                int n = snprintf(buf, sizeof(buf), "_agg%u", a);
                                 agg_name = ray_sym_intern(buf, (size_t)n);
                             }
                             tmp_r = ray_table_add_col(result, agg_name, cnt_col);

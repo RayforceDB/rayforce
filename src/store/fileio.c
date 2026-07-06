@@ -255,6 +255,7 @@ ray_err_t ray_mkdir_p(const char* path) {
     if (len >= sizeof(buf)) return RAY_ERR_IO;
     memcpy(buf, path, len + 1);
     /* Strip trailing slash so the final mkdir creates `buf` itself. */
+    // cppcheck-suppress arrayIndexOutOfBoundsCond // buf is RAY_PATH_MAX (>=4096) bytes and len < sizeof(buf); cppcheck misjudges the extent when PATH_MAX is unresolved
     while (len > 1 && buf[len - 1] == '/') buf[--len] = '\0';
     for (size_t i = 1; i < len; i++) {
         if (buf[i] == '/') {

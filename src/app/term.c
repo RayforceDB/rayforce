@@ -715,6 +715,7 @@ int32_t ray_term_find_matching_paren(const char* buf, int32_t buf_len,
             str_map[i] = (uint8_t)s;
         }
         for (int32_t i = cursor_pos; i >= 0; i--) {
+            // cppcheck-suppress uninitvar // entry guard ensures cursor_pos < buf_len, so the fill loop above covered [0, cursor_pos]
             if (str_map[i]) continue;
             if (buf[i] == c) depth++;
             else if (buf[i] == target) {

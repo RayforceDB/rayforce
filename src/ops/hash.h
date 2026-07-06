@@ -162,7 +162,12 @@ static inline uint64_t ray_hash_bytes(const void *data, size_t len) {
     uint64_t a, b;
     if (RAY_HASH_LIKELY(len <= 16)) {
         if (RAY_HASH_LIKELY(len >= 4)) {
+            /* Upstream wyhash tail reads: every access stays inside [p, p+len)
+             * for any valid (ptr, len) pair; cppcheck's valueflow misjudges the
+             * intermediate offsets at some call sites. */
+            // cppcheck-suppress pointerOutOfBoundsCond // (len>>3)<<2 is 8 only when len==16, so the 4-byte read ends at p+12
             a = (ray__wyr4(p) << 32) | ray__wyr4(p + ((len >> 3) << 2));
+            // cppcheck-suppress pointerOutOfBoundsCond // p+len is at most one-past-end before the -4 rewind
             b = (ray__wyr4(p + len - 4) << 32) | ray__wyr4(p + len - 4 - ((len >> 3) << 2));
         } else if (RAY_HASH_LIKELY(len > 0)) {
             a = ray__wyr3(p, len);
@@ -184,11 +189,15 @@ static inline uint64_t ray_hash_bytes(const void *data, size_t len) {
             seed ^= see1 ^ see2;
         }
         while (RAY_HASH_UNLIKELY(i > 16)) {
+            // cppcheck-suppress pointerOutOfBounds // loop guard i > 16 leaves >= 17 readable bytes at p
             seed = ray__wymix(ray__wyr8(p) ^ ray__wyp[1], ray__wyr8(p + 8) ^ seed);
             i -= 16;
             p += 16;
         }
+        /* p+i == one-past-end here; both reads rewind first (i in [1,16], len > 16). */
+        // cppcheck-suppress pointerOutOfBoundsCond // reads [end-16, end-8)
         a = ray__wyr8(p + i - 16);
+        // cppcheck-suppress pointerOutOfBoundsCond // reads [end-8, end)
         b = ray__wyr8(p + i - 8);
     }
     a ^= ray__wyp[1];

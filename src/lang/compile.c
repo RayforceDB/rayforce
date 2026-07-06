@@ -187,7 +187,7 @@ static void patch_jump(compiler_t *c, int32_t pos) {
     int32_t raw = c->code_len - pos - 2;
     if (raw > 32767 || raw < -32768) { c->error = true; return; }
     int16_t offset = (int16_t)raw;
-    c->code[pos]     = (uint8_t)(offset >> 8);
+    c->code[pos]     = (uint8_t)((uint16_t)offset >> 8);
     c->code[pos + 1] = (uint8_t)(offset & 0xFF);
 }
 

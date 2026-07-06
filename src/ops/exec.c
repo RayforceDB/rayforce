@@ -1518,7 +1518,7 @@ static const char* prof_op_label(uint16_t opc) {
         const char* up = ray_opcode_name(opc);
         if (!up) return NULL;
         size_t i = 0;
-        for (; up[i] && i < sizeof(lc[0]) - 1; i++) {
+        for (; i < sizeof(lc[0]) - 1 && up[i]; i++) {
             char c = up[i];
             if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
             else if (c == '_')        c = ' ';
