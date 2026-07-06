@@ -2334,6 +2334,9 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
     TEST_ASSERT_EQ_PTR(b1.wide_key_esz, master.wide_key_esz);
     TEST_ASSERT_EQ_PTR(b1.agg_flags2,       master.agg_flags2);
     TEST_ASSERT_EQ_PTR(b1.agg_null_sentinel, master.agg_null_sentinel);
+    TEST_ASSERT_EQ_PTR(b1.agg_dom,          master.agg_dom);
+    TEST_ASSERT_EQ_PTR(b1.key_flags,        master.key_flags);
+    TEST_ASSERT_EQ_PTR(b1.wide_key_type,    master.wide_key_type);
 
     /* The bug: copying FROM a borrower.  b1.spill_hdr == NULL looks
      * identical to a true-inline layout to the old (fixed) spill_hdr-based
@@ -2348,6 +2351,9 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
     TEST_ASSERT_EQ_PTR(b2.wide_key_esz, master.wide_key_esz);
     TEST_ASSERT_EQ_PTR(b2.agg_flags2,       master.agg_flags2);
     TEST_ASSERT_EQ_PTR(b2.agg_null_sentinel, master.agg_null_sentinel);
+    TEST_ASSERT_EQ_PTR(b2.agg_dom,          master.agg_dom);
+    TEST_ASSERT_EQ_PTR(b2.key_flags,        master.key_flags);
+    TEST_ASSERT_EQ_PTR(b2.wide_key_type,    master.wide_key_type);
     /* The failure signature the bug would produce, explicitly ruled out:
      * b2 re-pointed at its own inline storage instead of the spill. */
     TEST_ASSERT_FALSE(b2.agg_val_slot == b2.agg_val_slot_in);
@@ -2364,6 +2370,23 @@ static test_result_t test_ght_layout_copy_depth_invariance(void) {
         TEST_ASSERT_EQ_I(master.key_off[k], b1.key_off[k]);
         TEST_ASSERT_EQ_I(master.key_off[k], b2.key_off[k]);
     }
+
+    /* Inline leg of the copy dispatch: a true-inline (≤ GHT_INLINE) source
+     * must have its copy RE-POINTED at the destination's own inline arrays,
+     * never left aliasing the source's — the mirror of the spill leg above. */
+    ght_layout_t inl;
+    TEST_ASSERT_TRUE(ght_compute_layout(&inl, 2, 2, agg_vecs,
+                                        GHT_NEED_SUM, agg_ops, key_types));
+    TEST_ASSERT_NULL(inl.spill_hdr);
+    TEST_ASSERT_TRUE(inl.agg_val_slot == inl.agg_val_slot_in);
+    ght_layout_t ic;
+    ght_layout_copy(&ic, &inl);
+    TEST_ASSERT_NULL(ic.spill_hdr);
+    TEST_ASSERT_TRUE(ic.agg_val_slot == ic.agg_val_slot_in);   /* its OWN inline */
+    TEST_ASSERT_FALSE(ic.agg_val_slot == inl.agg_val_slot);    /* not the source's */
+    TEST_ASSERT_TRUE(ic.key_off == ic.key_off_in);
+    ght_layout_free(&ic);
+    ght_layout_free(&inl);
 
     /* Free order: borrowers first (no-ops — dst->spill_hdr is NULL for
      * both), the owning master last (actually frees the block). Freeing

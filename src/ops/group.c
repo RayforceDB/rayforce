@@ -2547,37 +2547,54 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
     /* Entry layout: hash | keys | null_mask | agg_vals | [entry_row?]
      * Tail entry_row slot is appended only when any agg is FIRST/LAST,
      * carrying the source-row index needed to merge correctly under
-     * work-stealing dispatch (see radix_phase1_fn / accum_from_entry). */
+     * work-stealing dispatch (see radix_phase1_fn / accum_from_entry).
+     *
+     * The agg region is a representational budget, exactly like the key
+     * region above: agg_val_slot is int8 (so ≤ INT8_MAX value slots), and
+     * entry_stride / row_stride / every off_* are uint16 (so the whole
+     * entry and HT row must fit in 64 KiB).  Accumulate the strides in
+     * uint32 and REFUSE a layout that would overflow either budget — a
+     * silent wrap here scatters aggs to wrong offsets (the key region was
+     * already budget-guarded; the agg region was not). */
     bool has_first_last = (agg_any & (GHT_AF_FIRST | GHT_AF_LAST)) != 0;
-    uint16_t entry_tail = has_first_last ? (uint16_t)8 : (uint16_t)0;
-    out->entry_stride = (uint16_t)(8 + key_region + (uint16_t)nv * 8 + entry_tail);
+    uint32_t entry_tail = has_first_last ? 8u : 0u;
+    uint32_t entry_stride = 8u + key_region + (uint32_t)nv * 8 + entry_tail;
 
-    uint16_t off = (uint16_t)(8 + key_region);
-    uint16_t block = (uint16_t)nv * 8;
-    if (need_flags & GHT_NEED_SUM)   { out->off_sum   = off; off += block; }
-    if (need_flags & GHT_NEED_MIN)   { out->off_min   = off; off += block; }
-    if (need_flags & GHT_NEED_MAX)   { out->off_max   = off; off += block; }
-    if (need_flags & GHT_NEED_SUMSQ) { out->off_sumsq = off; off += block; }
+    uint32_t off = 8u + key_region;
+    uint32_t block = (uint32_t)nv * 8;
+    if (need_flags & GHT_NEED_SUM)   { out->off_sum   = (uint16_t)off; off += block; }
+    if (need_flags & GHT_NEED_MIN)   { out->off_min   = (uint16_t)off; off += block; }
+    if (need_flags & GHT_NEED_MAX)   { out->off_max   = (uint16_t)off; off += block; }
+    if (need_flags & GHT_NEED_SUMSQ) { out->off_sumsq = (uint16_t)off; off += block; }
     /* Per-slot row-index bounds for FIRST/LAST.  Two int64 blocks of
      * n_agg_vals slots each, allocated only when needed. */
     if (has_first_last) {
-        out->off_first_row = off; off += block;
-        out->off_last_row  = off; off += block;
+        out->off_first_row = (uint16_t)off; off += block;
+        out->off_last_row  = (uint16_t)off; off += block;
     }
     /* PEARSON y-side accumulators (Σy, Σy², Σxy).  Allocated when any
      * OP_PEARSON_CORR agg is present.  x-side reuses off_sum + off_sumsq
      * at the same slot index; the y value lives at slot+1 in agg_vals,
      * but its derived accumulators live in their own blocks below. */
     if (need_flags & GHT_NEED_PEARSON) {
-        out->off_sum_y   = off; off += block;
-        out->off_sumsq_y = off; off += block;
-        out->off_sumxy   = off; off += block;
+        out->off_sum_y   = (uint16_t)off; off += block;
+        out->off_sumsq_y = (uint16_t)off; off += block;
+        out->off_sumxy   = (uint16_t)off; off += block;
     }
     /* Per-slot non-null count block — only when a nullable agg is present.
      * Null-free shapes leave off_nn == 0 and finalize on the group row count,
      * so their row_stride and layout are byte-identical to before. */
-    if (out->any_agg_null) { out->off_nn = off; off += block; }
-    out->row_stride = off;
+    if (out->any_agg_null) { out->off_nn = (uint16_t)off; off += block; }
+    /* Refuse (not wrap) any layout past the int8 value-slot count or the
+     * uint16 entry/row-stride budget.  On overflow the off_* casts above
+     * stored wrapped junk, but nothing reads it — the layout is freed and
+     * the caller sees a clean failure (mirrors the key-region guards). */
+    if (nv > INT8_MAX || entry_stride > UINT16_MAX || off > UINT16_MAX) {
+        ght_layout_free(out);
+        return false;
+    }
+    out->entry_stride = (uint16_t)entry_stride;
+    out->row_stride = (uint16_t)off;
     return true;
 }
 
@@ -2923,12 +2940,15 @@ static inline void init_accum_from_entry(char* row, const char* entry,
      * by (null_words-1)*8 bytes, so this memset's zero-fill reached
      * backward into the last null-mask word — clobbering it to 0
      * immediately after group_probe_entry's memcpy stored it correctly.
-     * Invisible to plain GROUP BY (which never re-reads null words from a
-     * stored HT row after ingest — the emitted key values come from a
-     * separate source-column re-scan), but wrong for PIVOT, whose own
-     * ix-dedupe/emit code (pivot.c) reads the null words directly back out
-     * of these same rows: the 65-index conflation-detector cell in
-     * tblop_branch_cov.rfl is the regression pin. */
+     * Not structurally invisible to plain GROUP BY — the radix phase-3
+     * scatter DOES re-read these same null words straight out of the HT row
+     * (radix_phase3_fn) — but empirically it surfaced first through PIVOT:
+     * no pre-existing GROUP-BY test exercised a >64-key null in the trailing
+     * null-mask word, whereas PIVOT's own ix-dedupe/emit code (pivot.c) reads
+     * the null words directly back out of these rows and its 65-index
+     * conflation-detector cell (tblop_branch_cov.rfl) caught the clobber.
+     * The 65-key null GROUP cell (width_matrix.rfl) now covers the GROUP
+     * side of the same fix. */
     uint16_t accum_start = (uint16_t)(8 + ly->key_region);
     if (ly->row_stride > accum_start)
         memset(row + accum_start, 0, ly->row_stride - accum_start);
@@ -3553,7 +3573,7 @@ typedef struct {
  * this way, so one memcpy serves both. */
 static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
                                    uint64_t hash, const int64_t* key_region_buf,
-                                   const int64_t* agg_vals, uint8_t n_agg_vals,
+                                   const int64_t* agg_vals, uint16_t n_agg_vals,
                                    bool has_first_last, int64_t row,
                                    uint16_t key_region) {
     if (__builtin_expect(buf->count >= buf->cap, 0)) {
@@ -3715,7 +3735,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
         uint32_t part = RADIX_PART(h);
         radix_buf_push(&my_bufs[part], estride, h,
                        inline_str ? (const int64_t*)keybuf : keys,
-                       agg_vals, (uint8_t)nv, has_fl, row, ly->key_region);
+                       agg_vals, nv, has_fl, row, ly->key_region);
     }
     scratch_free(stage_hdr);   /* NULL (inline staging) → no-op */
 }
@@ -3770,9 +3790,9 @@ typedef struct {
     uint8_t*      key_attrs;
     uint8_t*      key_esizes;
     ray_t**       key_cols;       /* [n_keys] output key vecs (for null bit writes) */
-    uint8_t       n_keys;
+    uint32_t      n_keys;         /* full width — a uint8 here wrapped 256 keys to 0 */
     agg_out_t*    agg_outs;
-    uint8_t       n_aggs;
+    uint32_t      n_aggs;
     /* For wide-key columns (RAY_GUID), the stored key slot is a
      * source row index and we copy the actual bytes from the source
      * column here during the result scatter. */
@@ -3782,8 +3802,8 @@ typedef struct {
 static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     (void)worker_id;
     radix_phase3_ctx_t* c = (radix_phase3_ctx_t*)ctx;
-    uint8_t nk = c->n_keys;
-    uint8_t na = c->n_aggs;
+    uint32_t nk = c->n_keys;
+    uint32_t na = c->n_aggs;
 
     for (int64_t p = start; p < end; p++) {
         group_ht_t* ph = &c->part_hts[p];
@@ -7574,7 +7594,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         rowsel = g->selection;
     }
 
-    /* Resolve key columns (VLA — n_keys ≤ 8; use ≥1 to avoid zero-size VLA UB) */
+    /* Resolve key columns (VLA scales with n_keys — the ≤8-key guard is
+     * retired; use ≥1 to avoid zero-size VLA UB). */
     uint32_t vla_keys = n_keys > 0 ? n_keys : 1;
     ray_t* key_vecs[vla_keys];
     memset(key_vecs, 0, vla_keys * sizeof(ray_t*));
@@ -7609,10 +7630,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
     }
 
-    /* Resolve agg input columns.  n_aggs is ≤ 8 here whenever n_keys > 0
-     * (the 6713 guard), but the keyless path (n_keys == 0) admits any
-     * n_aggs — the cut-2 flip lifted query.c's 255 compile cap — so these
-     * per-agg arrays scale with the query and must not sit on the stack.
+    /* Resolve agg input columns.  n_aggs is unbounded regardless of n_keys
+     * (the old ≤8-agg keyed guard is retired — 2-key 9-agg FIRST/LAST shapes
+     * flow here — and the keyless path never capped it; the cut-2 flip also
+     * lifted query.c's 255 compile cap), so these per-agg arrays scale with
+     * the query and must not sit on the stack.
      * One consolidated scratch carve: the two ray_t* arrays first, then the
      * affine/linear/prod structs (all int64/pointer-backed, so 8-aligned and
      * multiple-of-8 sized), then the three byte-flag arrays last.  Second
@@ -9487,10 +9509,12 @@ ht_path:;
     /* RAY_STR keys are now handled inline by the wide-key mechanism (row
      * indirection + SSO-aware hash/eq via key_pool); see ght_layout_t. */
 
-    /* Compute row-layout: keys + agg values inline.  This path is gated ≤8
-     * keys/aggs by the exec_group_run width guard, so the layout is always
-     * inline (no spill); ght_compute_layout only fails here on the uint16
-     * key-stride budget, which ≤8 keys can never exceed. */
+    /* Compute row-layout: keys + agg values inline.  The ≤8-key/≤8-agg width
+     * guards are retired: any key/agg count is served, with ght_compute_layout
+     * carving an owned spill block past GHT_INLINE.  It fails here only on
+     * spill OOM or a representational budget overflow — the uint16 key/agg
+     * stride budgets or the int8 value-slot count — none of which a ≤8 shape
+     * can hit. */
     ght_layout_t ght_layout;
     if (!ght_compute_layout(&ght_layout, n_keys, n_aggs, agg_vecs, ght_need,
                             ext->agg_ops, key_types)) {
@@ -9500,7 +9524,7 @@ ht_path:;
         for (uint32_t k = 0; k < n_keys; k++)
             if (key_owned[k] && key_vecs[k]) ray_release(key_vecs[k]);
         if (match_idx_block) { ray_release(match_idx_block); } scratch_free(vla_hdr);
-        return ray_error("limit", "group: key stride budget exceeded");
+        return ray_error("limit", "group: layout stride/slot budget exceeded (or OOM)");
     }
 
     /* Right-sized hash table: start small, rehash on load > 0.5 */
@@ -9669,7 +9693,16 @@ ht_path:;
             if (ght_layout.any_wide_key) {
                 v2p2.key_pool = (const void**)scratch_alloc(&v2p2_kp_hdr,
                     (size_t)(n_keys ? n_keys : 1) * sizeof(void*));
-                if (!v2p2.key_pool) { result = ray_error("oom", NULL); goto cleanup; }
+                if (!v2p2.key_pool) {
+                    /* cleanup frees only part_hts (wired at v2_emit, below); the
+                     * worker HTs + both partition-table blocks are still local
+                     * here — free them like the phase1-OOM bail above. */
+                    for (size_t i = 0; i < v2_n_w; i++)
+                        group_ht_free(&wpart_hts[i]);
+                    scratch_free(wpart_hdr);
+                    scratch_free(v2_part_hdr);
+                    result = ray_error("oom", NULL); goto cleanup;
+                }
                 derive_key_pool(&ght_layout, key_vecs, v2p2.key_pool);
             }
             ray_pool_dispatch_n(pool, radix_v2_phase2_fn, &v2p2, RADIX_P);
@@ -10038,12 +10071,10 @@ v2_emit:;
             key_esizes[k] = esz;
         }
 
-        /* Pre-allocate agg result vectors.
-         * VLA bounded ≤8: this finalize step is inside ht_path, which
-         * rejects n_aggs > 8 at its own ht_path n_aggs guard before any of
-         * this runs — keyless-unbounded queries that fell through the
-         * scalar/DA/sparse fast paths are turned away there, never reaching
-         * here. */
+        /* Pre-allocate agg result vectors.  These VLAs scale with n_aggs
+         * (the ≤8-agg ht_path guard is retired — 9/17/65-agg legacy shapes
+         * reach here); ght_compute_layout has already accepted this n_aggs,
+         * so it is within the layout stride/slot budget. */
         agg_out_t agg_outs[n_aggs];
         ray_t* agg_cols[n_aggs];
         for (uint32_t a = 0; a < n_aggs; a++) {
@@ -10150,7 +10181,7 @@ v2_emit:;
             if (ght_layout.any_wide_key) {
                 rp.key_pool = (const void**)scratch_alloc(&rp_kp_hdr,
                     (size_t)n_keys * sizeof(void*));
-                if (!rp.key_pool) { result = ray_error("oom", NULL); goto cleanup; }
+                if (!rp.key_pool) { scratch_free(rg_hdr); result = ray_error("oom", NULL); goto cleanup; }
                 derive_key_pool(&ght_layout, key_vecs, rp.key_pool);
             }
             ray_pool_dispatch(pool, reprobe_rows_fn, &rp, n_scan);
@@ -11658,6 +11689,11 @@ bool pivot_ingest_run(pivot_ingest_t* out,
     group_ht_t* part_hts = (group_ht_t*)scratch_calloc(&out->_part_hts_hdr,
         RADIX_P * sizeof(group_ht_t));
     if (!part_hts) return false;
+    /* Wire out->part_hts/n_parts at alloc time (like the sequential path) so
+     * every failure below funnels through pivot_ingest_free — the calloc-zeroed
+     * HTs are skipped by its rows||slots guard until phase2 fills them. */
+    out->part_hts = part_hts;
+    out->n_parts = RADIX_P;
 
     radix_phase2_ctx_t p2ctx = {
         .key_types = key_types,
@@ -11678,8 +11714,6 @@ bool pivot_ingest_run(pivot_ingest_t* out,
     }
     ray_pool_dispatch_n(pool, radix_phase2_fn, &p2ctx, RADIX_P);
     scratch_free(p2_kp_hdr);
-    out->part_hts = part_hts;
-    out->n_parts = RADIX_P;
     if (ray_interrupted()) return true;
     /* Sync point — partitions materialized; show RADIX_P/RADIX_P. */
     ray_progress_update(NULL, "per-partition aggregate", RADIX_P, RADIX_P);
