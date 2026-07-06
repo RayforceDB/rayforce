@@ -373,7 +373,7 @@ cppcheck:
 	  --suppress=missingIncludeSystem \
 	  --suppress=assignBoolToPointer \
 	  --suppress=nullPointerRedundantCheck \
-	  --std=c11 -q $(INCLUDES) src/
+	  --std=c17 -q $(INCLUDES) src/
 # assignBoolToPointer: cppcheck misparses the GNU computed-goto label
 #   address `&&label` (a void*) as a logical-AND yielding a bool.
 # nullPointerRedundantCheck: a heuristic that fires on the codebase's
