@@ -1,0 +1,82 @@
+;; asof_tie_stable.rfl — streaming parted asof must resolve EXACT-timestamp ties
+;; within an equality-key group identically to the flat eager oracle.
+;;
+;; The streaming path pre-sorts each day's (carry ∪ quotes) view time-ascending
+;; before deriving the carry via `(last Bid) by: Sym` and before handing it to
+;; the asof kernel (src/ops/query.c).  That pre-sort routes through
+;; sort_table_by_keys → sort_indices_ex.  For a single time key with 65..4096
+;; rows it lands on key_introsort (src/ops/sort.c) — a median-of-3 quicksort.
+;; A quicksort is NOT stable unless its comparator is a strict total order, so
+;; before the fix it REORDERED rows that tie on time within a group.  `(last)`
+;; then picked an ARBITRARY tied row, and the kernel's rightmost-<= binary search
+;; saw the same scrambled order — diverging from the flat oracle, which never
+;; sorts the quote side and thus resolves ties by ORIGINAL storage position.
+;;
+;; This fixture drives a MID-SIZED day (200 rows, one sym → one introsort call)
+;; stored time-UNSORTED (forces a real sort, not the already-ordered bail) with a
+;; 50-row block of DUPLICATE-timestamp quotes carrying DIFFERENT bids, so which
+;; tied row wins is directly observable.  A same-day trade probes the tied block,
+;; and a next-day trade must carry the correct end-of-day (tied) quote forward.
+;;
+;; Ground truth = the FLAT oracle: all partitions concatenated in day/storage
+;; order, run through the eager asof (non-select operands).  Streamed result must
+;; equal it column-for-column.  RED before the stable-tiebreak fix, GREEN after.
+
+(.sys.exec "rm -rf /tmp/rfl_asof_tie_t /tmp/rfl_asof_tie_q")
+
+;; ── Day 1 (2024.01.01): 200 quote rows for sym a, stored time-DESCENDING with a
+;; 50-row tie plateau at the MAXIMUM time. -----------------------------------
+;; Storage time offsets (seconds past 10:00:00): [150 ×50, 149, 148, ..., 1, 0].
+;;   rows 0..49  : time 150s (the plateau/max), bids   0.0 .. 49.0
+;;   rows 50..199: time 149s..0s (descending),  bids  50.0 ..199.0
+;; Not ascending → sort_table_by_keys does a real sort (key_introsort, 200 rows).
+;; A CORRECT stable ascending sort sends the plateau to the end preserving storage
+;; order → the last row is time 150s / bid 49.0.  An UNSTABLE sort scrambles the
+;; plateau → a different (wrong) bid ends up last.
+(set QT1 (+ 2024.01.01D10:00:00.000000000 (* 1000000000 (concat (take 150 50) (reverse (til 150))))))
+(set Q1  (table [Sym Time Bid] (list (take 'a 200) QT1 (as 'F64 (til 200)))))
+
+;; Day 1 trades:
+;;   a@10:00:00 (0s)     → most-recent ≤0s   is the 0s   quote → bid 199.0
+;;   a@10:02:29 (149s)   → most-recent ≤149s is the 149s quote → bid  50.0
+;;   a@10:02:30 (150s)   → most-recent ≤150s is the LAST tied plateau quote → 49.0  [TIE]
+(set T1 (table [Sym Time Price] (list [a a a] [2024.01.01D10:00:00.000000000 2024.01.01D10:02:29.000000000 2024.01.01D10:02:30.000000000] (as 'F64 [10.0 11.0 12.0]))))
+
+;; ── Day 2 (2024.01.02): two in-order quotes for a. ---------------------------
+(set Q2 (table [Sym Time Bid] (list [a a] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:05.000000000] (as 'F64 [500.0 600.0]))))
+;; Day 2 trades:
+;;   a@09:59:00 → before day-2's first quote → CARRY day-1 end-of-day = bid 49.0  [TIE via carry]
+;;   a@10:00:03 → same-day 10:00:00 quote → bid 500.0
+(set T2 (table [Sym Time Price] (list [a a] [2024.01.02D09:59:00.000000000 2024.01.02D10:00:03.000000000] (as 'F64 [20.0 21.0]))))
+
+(.db.splayed.set "/tmp/rfl_asof_tie_q/2024.01.01/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_tie_q/2024.01.02/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_tie_t/2024.01.01/trade/" T1)
+(.db.splayed.set "/tmp/rfl_asof_tie_t/2024.01.02/trade/" T2)
+(set Pt (.db.parted.get "/tmp/rfl_asof_tie_t/" 'trade))
+(set Pq (.db.parted.get "/tmp/rfl_asof_tie_q/" 'quote))
+
+;; ── (a) streaming ran: union of days = 2. ────────────────────────────────────
+(set Ba (at (.sys.mem) 'asof-perpart-runs))
+(set RS (asof-join [Sym Time] (select {from: Pt}) (select {from: Pq})))
+(set Aa (at (.sys.mem) 'asof-perpart-runs))
+(> Aa Ba) -- true
+(- Aa Ba) -- 2
+
+;; ── (b) flat oracle: quotes/trades concatenated in day+storage order. The eager
+;; asof kernel sorts the quote side STABLY, anchoring ties to original position. ─
+(set QF (concat Q1 Q2))
+(set TF (concat T1 T2))
+(set RF (asof-join [Sym Time] TF QF))
+
+(count RS) -- 5
+(count RS) -- (count RF)
+(at RS 'Price) -- (at RF 'Price)
+(at RS 'Bid)   -- (at RF 'Bid)
+
+;; ── (c) explicit goldens — the tie-sensitive values (rows 3 and 4 below) are the
+;; ones that were WRONG before the stable-tiebreak fix. ───────────────────────
+;;   trades:  [10:00:00 10:02:29 10:02:30 | 09:59:00 10:00:03]
+;;   bids  :  [ 199.0     50.0    49.0(T)  |  49.0(T)   500.0 ]
+(at RS 'Price) -- (as 'F64 [10.0 11.0 12.0 20.0 21.0])
+(at RS 'Bid)   -- (as 'F64 [199.0 50.0 49.0 49.0 500.0])

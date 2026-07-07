@@ -117,11 +117,25 @@ int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
 
 /* RADIX_SORT_THRESHOLD, SMALL_POOL_THRESHOLD defined in exec_internal.h */
 
+/* Total-order comparison of (key, idx) pairs.  Equal keys break ties on the
+ * carried index, which callers seed as the original iota (radix_encode_fn does
+ * idx[i]=i).  Because those indices are unique, this is a strict total order
+ * with no true ties, so the comparison sorts below — quicksort included —
+ * produce the UNIQUE (key,idx)-ascending permutation: equal keys retain their
+ * original storage order (a STABLE sort).  This matches the ≤64 merge-sort path
+ * and the >4096 packed-radix path (both stable), so all three size regimes now
+ * resolve equal-key ties identically.  The streaming asof carry relies on this:
+ * `(last col) by:eq` over a time-pre-sorted qtab must pick the same tied row the
+ * asof kernel's rightmost-<= binary search would. */
+static inline bool key_lt(uint64_t ka, int64_t ia, uint64_t kb, int64_t ib) {
+    return ka < kb || (ka == kb && ia < ib);
+}
+
 static void key_sift_down(uint64_t* keys, int64_t* idx, int64_t n, int64_t i) {
     for (;;) {
         int64_t largest = i, l = 2*i+1, r = 2*i+2;
-        if (l < n && keys[l] > keys[largest]) largest = l;
-        if (r < n && keys[r] > keys[largest]) largest = r;
+        if (l < n && key_lt(keys[largest], idx[largest], keys[l], idx[l])) largest = l;
+        if (r < n && key_lt(keys[largest], idx[largest], keys[r], idx[r])) largest = r;
         if (largest == i) return;
         uint64_t tk = keys[i]; keys[i] = keys[largest]; keys[largest] = tk;
         int64_t  ti = idx[i];  idx[i]  = idx[largest];  idx[largest]  = ti;
@@ -144,7 +158,7 @@ static void key_insertion_sort(uint64_t* keys, int64_t* idx, int64_t n) {
         uint64_t kk = keys[i];
         int64_t  ii = idx[i];
         int64_t j = i - 1;
-        while (j >= 0 && keys[j] > kk) {
+        while (j >= 0 && key_lt(kk, ii, keys[j], idx[j])) {
             keys[j+1] = keys[j];
             idx[j+1]  = idx[j];
             j--;
@@ -177,7 +191,7 @@ static void key_introsort_impl(uint64_t* keys, int64_t* idx,
         /* Partition */
         int64_t lo = 0;
         for (int64_t i = 0; i < n - 1; i++) {
-            if (keys[i] < pk) {
+            if (key_lt(keys[i], idx[i], pk, pv)) {
                 uint64_t tk = keys[i]; keys[i] = keys[lo]; keys[lo] = tk;
                 int64_t  ti = idx[i];  idx[i]  = idx[lo];  idx[lo]  = ti;
                 lo++;
