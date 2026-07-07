@@ -1,0 +1,116 @@
+;; parted_group_expr_key.rfl — per-partition streaming GROUP BY with EXPRESSION
+;; group-keys and expression agg-inputs.  Previously exec_group_per_partition
+;; only accepted bare OP_SCAN keys/agg-inputs; anything computed disqualified
+;; the streaming path (→ full-table concat/flatten).  Now a pure row-local
+;; scalar expression (e.g. xbar = `t - t%n` → OP_SUB/OP_MOD, or `(* v w)`) is
+;; materialized per partition into a synthetic column and streamed, with the
+;; pass-3 merge re-grouping on the materialized value.
+;;
+;; The (.sys.mem) 'group-perpart-runs counter increments exactly once per
+;; exec_group_per_partition entry, so a strict increase proves the streaming
+;; kernel ran; equality proves it did not (concat fallback).
+;;
+;; NOTE ON THE by-DICT HEADLINE: `by: {tb: (xbar ts N) s: sym}` does NOT reach
+;; this streaming path — the select front-end (ray_select_fn, query.c) EAGERLY
+;; materializes every computed by-dict value into a FLAT column over the whole
+;; (flattened) parted table before grouping, so exec_group_parted only ever
+;; sees a bare flat key there.  The routes exercised below are the ones that
+;; actually deliver a computed key/agg NODE to exec_group_parted over a parted
+;; table: a single computed `by:` expression, and expression agg-inputs.
+
+;; ─── fixture: 2 partitions, 400 rows each ────────────────────────────────────
+(set N 400)
+(set TS (til N))                          ;; monotone field, 0..399 (same both parts)
+(set SG (as 'SYM (% (til N) 2)))          ;; 2-value symbol key
+(set V1 (as 'F64 (til N)))                ;; value, partition 1
+(set V2 (as 'F64 (+ 1000 (til N))))       ;; value, partition 2
+(set W1 (as 'F64 (+ 1 (% (til N) 5))))    ;; weight 1..5
+(set W2 (as 'F64 (+ 2 (% (til N) 5))))    ;; weight 2..6
+(set P1 (table [ts sg v w] (list TS SG V1 W1)))
+(set P2 (table [ts sg v w] (list TS SG V2 W2)))
+(.sys.exec "rm -rf /tmp/rfl_pgek")
+(.db.splayed.set "/tmp/rfl_pgek/1/t/" P1)
+(.db.splayed.set "/tmp/rfl_pgek/2/t/" P2)
+(set Pw (.db.parted.get "/tmp/rfl_pgek/" 't))
+;; identical-data flat in-memory oracle (part1 rows ++ part2 rows)
+(set TF (table [ts sg v w] (list (concat TS TS) (concat SG SG) (concat V1 V2) (concat W1 W2))))
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (1) EXPRESSION AGG-INPUT `(sum (* v w))` over a bare scan key — streams.
+;;     est_groups = 2 (sg) → 2*100=200 <= 400 rows/part clears the gate.
+;; ══════════════════════════════════════════════════════════════════════════
+(set B1 (at (.sys.mem) 'group-perpart-runs))
+(set RP1 (select {sp: (sum (* v w)) sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) sdv: (stddev v) fv: (first v) lv: (last v) by: sg from: Pw asc: sg}))
+(set A1 (at (.sys.mem) 'group-perpart-runs))
+;; PROVES exec_group_per_partition ran with an expression agg-input.
+(> A1 B1) -- true
+(set RF1 (select {sp: (sum (* v w)) sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) sdv: (stddev v) fv: (first v) lv: (last v) by: sg from: TF asc: sg}))
+(count RP1) -- 2
+(at RP1 'sg)  -- (at RF1 'sg)
+(at RP1 'sv)  -- (at RF1 'sv)
+(at RP1 'cv)  -- (at RF1 'cv)
+(at RP1 'mnv) -- (at RF1 'mnv)
+(at RP1 'mxv) -- (at RF1 'mxv)
+(at RP1 'fv)  -- (at RF1 'fv)
+(at RP1 'lv)  -- (at RF1 'lv)
+;; expression agg-input sum(v*w) matches the flat oracle (float tolerance)
+(< (max (abs (- (at RP1 'sp)  (at RF1 'sp))))  0.0001)   -- true
+(< (max (abs (- (at RP1 'av)  (at RF1 'av))))  0.000001) -- true
+(< (max (abs (- (at RP1 'sdv) (at RF1 'sdv)))) 0.000001) -- true
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (2) EXPRESSION KEY `(xbar ts 200)` (time-bucket) — streams.  ts spans 0..399
+;;     so (xbar ts 200) has 2 buckets {0,200}, present in BOTH partitions, so
+;;     the pass-3 merge genuinely combines them (cross-partition materialized-
+;;     key identity).  est_groups = 2 clears the gate.  A single bare computed
+;;     by-key inherits the group kernel's key-column name, so results are
+;;     compared sorted by the (named) aggregate output.
+;; ══════════════════════════════════════════════════════════════════════════
+(set B2 (at (.sys.mem) 'group-perpart-runs))
+(set RP2 (select {sv: (sum v) cv: (count v) av: (avg v) by: (xbar ts 200) from: Pw asc: sv}))
+(set A2 (at (.sys.mem) 'group-perpart-runs))
+;; PROVES exec_group_per_partition ran with an xbar expression KEY.
+(> A2 B2) -- true
+(set RF2 (select {sv: (sum v) cv: (count v) av: (avg v) by: (xbar ts 200) from: TF asc: sv}))
+(count RP2) -- 2
+(at RP2 'sv) -- (at RF2 'sv)
+(at RP2 'cv) -- (at RF2 'cv)
+(< (max (abs (- (at RP2 'av) (at RF2 'av)))) 0.000001) -- true
+
+;; TIMESTAMP-typed xbar key (faithful time-bucket) — also streams.
+(set TSt (as 'TIMESTAMP (til N)))
+(set Q1 (table [ts v] (list TSt V1)))
+(set Q2 (table [ts v] (list TSt V2)))
+(.sys.exec "rm -rf /tmp/rfl_pgek2")
+(.db.splayed.set "/tmp/rfl_pgek2/1/t/" Q1)
+(.db.splayed.set "/tmp/rfl_pgek2/2/t/" Q2)
+(set Qw (.db.parted.get "/tmp/rfl_pgek2/" 't))
+(set QF (table [ts v] (list (concat TSt TSt) (concat V1 V2))))
+(set B2t (at (.sys.mem) 'group-perpart-runs))
+(set RP2t (select {sv: (sum v) by: (xbar ts 200) from: Qw asc: sv}))
+(set A2t (at (.sys.mem) 'group-perpart-runs))
+(> A2t B2t) -- true
+(set RF2t (select {sv: (sum v) by: (xbar ts 200) from: QF asc: sv}))
+(count RP2t) -- 2
+(at RP2t 'sv) -- (at RF2t 'sv)
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (3) CONCAT-FALLBACK latent-bug repro: a HIGH-cardinality expression key
+;;     disqualifies the streaming gate → concat fallback.  Before this change
+;;     the concat needed-columns collector silently DROPPED an expression key's
+;;     source columns, so exec_group over the narrowed flat table failed
+;;     "by: column not found".  Bucket = 1 ⇒ (xbar ts 1) = ts ⇒ 400 distinct
+;;     buckets ⇒ est_groups*100 >> rows_per_part ⇒ concat (no streaming).
+;; ══════════════════════════════════════════════════════════════════════════
+(set B3 (at (.sys.mem) 'group-perpart-runs))
+(set RP3 (select {sv: (sum v) by: (xbar ts 1) from: Pw asc: sv}))
+(set A3 (at (.sys.mem) 'group-perpart-runs))
+;; streaming kernel did NOT run (concat path) — counter unchanged
+(== A3 B3) -- true
+(set RF3 (select {sv: (sum v) by: (xbar ts 1) from: TF asc: sv}))
+(count RP3) -- 400
+(at RP3 'sv) -- (at RF3 'sv)
+
+;; ─── cleanup ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_pgek")
+(.sys.exec "rm -rf /tmp/rfl_pgek2")

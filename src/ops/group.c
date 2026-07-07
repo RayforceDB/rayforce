@@ -5946,10 +5946,123 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                   int64_t group_limit); /* forward decl */
 
 /* Forward declaration — defined below exec_group */
-static ray_t* exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
-                                       int32_t n_parts, const int64_t* key_syms,
-                                       const int64_t* agg_syms, int has_avg,
-                                       int has_stddev, int64_t group_limit);
+static ray_t* exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl,
+                                       ray_op_ext_t* ext, int32_t n_parts,
+                                       const int64_t* key_syms,
+                                       const int64_t* agg_syms,
+                                       const uint8_t* key_is_expr,
+                                       const uint8_t* agg_is_expr,
+                                       const int64_t* borrow_syms, int n_borrow,
+                                       int has_avg, int has_stddev,
+                                       int64_t group_limit);
+
+/* ── Per-partition streaming: expression key / agg-input support ──────────
+ *
+ * A parted GROUP BY streams per-partition only when every key and agg input
+ * is either a bare OP_SCAN or a PURE ROW-LOCAL scalar expression.  The pass-3
+ * merge re-GROUPs on the materialized key VALUE, so equal logical keys across
+ * partitions must produce BIT-IDENTICAL materialized values — this holds for
+ * deterministic element-wise ops (OP_ROUND..OP_IDIV, e.g. xbar which lowers
+ * to `t - t%n` = OP_SUB/OP_MOD) and ONLY those.  No cross-row operator (rank /
+ * window / aggregate) or table-shape-dependent op lives in that opcode range,
+ * so admitting exactly that range is both sufficient and safe.  None of those
+ * ops produce SYM output (casts target numeric types; concat/upper/lower/trim
+ * produce STR, self-contained with no symfile domain), so the cross-partition
+ * SYM-domain identity concern that applies to plain SYM key columns does not
+ * arise for admitted expression keys.
+ *
+ * group_expr_src_syms walks the subtree rooted at `root_id`, collecting the
+ * distinct source-column syms it scans into out_syms[] (up to max).  Returns
+ * the count, or -1 if the subtree contains any non row-local op, references a
+ * non-default table (stored_table_id != 0 — a joined table that would NOT
+ * resolve against the per-partition sub-table), overflows, or an oversized
+ * graph.  A -1 result means "decline per-partition streaming for this key". */
+static int group_expr_src_syms(ray_graph_t* g, uint32_t root_id,
+                               int64_t* out_syms, int max) {
+    uint32_t nc = g->node_count;
+    if (nc > 4096 || root_id >= nc) return -1;
+    uint32_t stack[64];
+    int sp = 0, n = 0;
+    bool visited[4096];
+    memset(visited, 0, nc * sizeof(bool));
+    stack[sp++] = root_id;
+    while (sp > 0) {
+        uint32_t nid = stack[--sp];
+        if (nid >= nc || visited[nid]) continue;
+        visited[nid] = true;
+        ray_op_t* node = &g->nodes[nid];
+        if (node->flags & OP_FLAG_DEAD) continue;
+        if (node->opcode == OP_SCAN) {
+            ray_op_ext_t* sx = find_ext(g, nid);
+            if (!sx) return -1;
+            /* Only the default (from-) table resolves against the
+             * per-partition sub-table; a scan bound to another table id
+             * would read the full joined table, not this partition. */
+            uint16_t tbl_id = 0;
+            memcpy(&tbl_id, sx->base.pad, sizeof(uint16_t));
+            if (tbl_id != 0) return -1;
+            bool dup = false;
+            for (int j = 0; j < n; j++)
+                if (out_syms[j] == sx->sym) { dup = true; break; }
+            if (!dup) {
+                if (n >= max) return -1;
+                out_syms[n++] = sx->sym;
+            }
+            continue;
+        }
+        if (node->opcode == OP_CONST) continue;
+        /* Admit ONLY pure row-local element-wise ops (see header). */
+        if (node->opcode < OP_ROUND || node->opcode > OP_IDIV) return -1;
+        for (int i = 0; i < node->arity && i < 2; i++) {
+            if (node->in_id[i] == RAY_OP_NONE) continue;
+            if (sp >= 64) return -1;
+            stack[sp++] = node->in_id[i];
+        }
+        /* 3-ary ops (OP_IF else / OP_SUBSTR len / OP_REPLACE repl) keep the
+         * third operand in ext->third_in. */
+        ray_op_ext_t* nx = find_ext(g, nid);
+        if (nx && nx->third_in != RAY_OP_NONE && nx->third_in != 0) {
+            if (sp >= 64) return -1;
+            stack[sp++] = nx->third_in;
+        }
+    }
+    return n;
+}
+
+/* Materialize a pure row-local expr subtree over partition `p` of parted_tbl.
+ * Borrows segment[p] of each source column named in src_syms[] (all must be
+ * plain PARTED columns) into a throwaway sub-table, evaluates `root` via
+ * exec_node with g->table swapped to that sub-table (the same mechanism the
+ * flat key-expression path uses), and returns a fresh vec of the partition's
+ * row count — caller releases — or NULL on any failure.  g->selection is
+ * guaranteed NULL on the per-partition path (checked in exec_group_parted),
+ * so exec_node applies no filtering. */
+static ray_t* group_eval_part_expr(ray_graph_t* g, ray_t* parted_tbl,
+                                   const int64_t* src_syms, int n_src,
+                                   uint32_t root, int32_t p) {
+    ray_t* sub = ray_table_new(n_src > 0 ? (int64_t)n_src : 1);
+    if (!sub || RAY_IS_ERR(sub)) return NULL;
+    for (int j = 0; j < n_src; j++) {
+        ray_t* pcol = ray_table_get_col(parted_tbl, src_syms[j]);
+        if (!pcol || !RAY_IS_PARTED(pcol->type)) { ray_release(sub); return NULL; }
+        ray_t* seg = ((ray_t**)ray_data(pcol))[p];
+        if (!seg) { ray_release(sub); return NULL; }
+        ray_retain(seg);
+        sub = ray_table_add_col(sub, src_syms[j], seg);
+        ray_release(seg);
+        if (!sub || RAY_IS_ERR(sub)) return NULL;
+    }
+    ray_t* saved = g->table;
+    g->table = sub;
+    ray_t* vec = exec_node(g, op_node(g, root));
+    g->table = saved;
+    ray_release(sub);
+    if (!vec || RAY_IS_ERR(vec) || !ray_is_vec(vec)) {
+        if (vec && !RAY_IS_ERR(vec)) ray_release(vec);
+        return NULL;
+    }
+    return vec;
+}
 
 /* --------------------------------------------------------------------------
  * exec_group_parted — dispatch per-partition or concat-fallback
@@ -5998,16 +6111,72 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     int64_t* key_syms = (int64_t*)scratch_alloc(&key_syms_hdr,
             (size_t)key_max * sizeof(int64_t));
     if (!key_syms) return ray_error("oom", NULL);
-    for (uint32_t k = 0; k < n_keys && can_partition; k++) {
-        ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
-        if (!ke || ke->base.opcode != OP_SCAN) { can_partition = 0; break; }
-        key_syms[k] = ke->sym;
-    }
     int64_t agg_max = n_aggs > 0 ? (int64_t)n_aggs : 1;
     ray_t* agg_syms_hdr = NULL;
     int64_t* agg_syms = (int64_t*)scratch_alloc(&agg_syms_hdr,
             (size_t)agg_max * sizeof(int64_t));
     if (!agg_syms) { scratch_free(key_syms_hdr); return ray_error("oom", NULL); }
+
+    /* Per-slot expression flags + the borrow set of real source columns that
+     * every eligible expression / scan key + agg input needs materialized in
+     * its per-partition sub-table.  key_syms[k]/agg_syms[a] hold the real
+     * source-column sym for a bare OP_SCAN, or a SYNTHETIC sym ("_gpk<k>" /
+     * "_gpa<a>") that names the per-partition-materialized value for an
+     * expression.  borrow_syms is the deduped union of the plain (non-
+     * MAPCOMMON) PARTED columns those keys/aggs scan; distinct source cols can
+     * never exceed the table's column count.  All carves are freed both after
+     * the exec_group_per_partition call and before the concat fallback. */
+    ray_t *key_is_expr_hdr = NULL, *agg_is_expr_hdr = NULL,
+          *borrow_hdr = NULL, *esrc_hdr = NULL;
+    uint8_t* key_is_expr = (uint8_t*)scratch_calloc(&key_is_expr_hdr, (size_t)key_max);
+    uint8_t* agg_is_expr = (uint8_t*)scratch_calloc(&agg_is_expr_hdr, (size_t)agg_max);
+    int64_t bsz = ncols > 0 ? ncols : 1;
+    int64_t* borrow_syms = (int64_t*)scratch_alloc(&borrow_hdr, (size_t)bsz * sizeof(int64_t));
+    int64_t* esrc = (int64_t*)scratch_alloc(&esrc_hdr, (size_t)bsz * sizeof(int64_t));
+    if (!key_is_expr || !agg_is_expr || !borrow_syms || !esrc) {
+        scratch_free(key_syms_hdr); scratch_free(agg_syms_hdr);
+        scratch_free(key_is_expr_hdr); scratch_free(agg_is_expr_hdr);
+        scratch_free(borrow_hdr); scratch_free(esrc_hdr);
+        return ray_error("oom", NULL);
+    }
+    int n_borrow = 0;
+    /* Add a real, plain PARTED source column to the borrow set (deduped).
+     * Returns 0 if the column is missing or MAPCOMMON (expression sources
+     * must be plain PARTED so segment[p] can be borrowed directly). */
+    #define GP_BORROW_ADD(sym) do {                                          \
+        ray_t* _pc = ray_table_get_col(parted_tbl, (sym));                   \
+        if (!_pc || !RAY_IS_PARTED(_pc->type)) { can_partition = 0; break; } \
+        int _dup = 0;                                                        \
+        for (int _i = 0; _i < n_borrow; _i++)                                \
+            if (borrow_syms[_i] == (sym)) { _dup = 1; break; }               \
+        if (!_dup && n_borrow < bsz) borrow_syms[n_borrow++] = (sym);        \
+    } while (0)
+
+    for (uint32_t k = 0; k < n_keys && can_partition; k++) {
+        ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
+        if (ke && ke->base.opcode == OP_SCAN) {
+            key_syms[k] = ke->sym;
+            key_is_expr[k] = 0;
+            /* MAPCOMMON scan keys are reconstructed post-merge, not borrowed. */
+            ray_t* pc = ray_table_get_col(parted_tbl, ke->sym);
+            if (pc && pc->type == RAY_MAPCOMMON) continue;
+            GP_BORROW_ADD(ke->sym);
+        } else {
+            /* Expression key: admit only pure row-local scalar exprs and
+             * record its source columns for per-partition materialization. */
+            int ns = group_expr_src_syms(g, ext->keys[k], esrc, (int)bsz);
+            if (ns <= 0) { can_partition = 0; break; }
+            char nbuf[24];
+            int nl = snprintf(nbuf, sizeof(nbuf), "_gpk%u", (unsigned)k);
+            int64_t synth = ray_sym_intern(nbuf, (size_t)nl);
+            /* A real column shadowing the synthetic name would be borrowed
+             * over the materialized value — decline. */
+            if (ray_table_get_col(parted_tbl, synth)) { can_partition = 0; break; }
+            for (int s = 0; s < ns && can_partition; s++) GP_BORROW_ADD(esrc[s]);
+            key_syms[k] = synth;
+            key_is_expr[k] = 1;
+        }
+    }
     for (uint32_t a = 0; a < n_aggs && can_partition; a++) {
         uint16_t aop = ext->agg_ops[a];
         /* Holistic aggs (OP_MEDIAN / OP_TOP_N / OP_BOT_N) can't be
@@ -6025,9 +6194,25 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
         if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
             aop == OP_VAR || aop == OP_VAR_POP) has_stddev = 1;
         ray_op_ext_t* ae = find_ext(g, ext->agg_ins[a]);
-        if (!ae || ae->base.opcode != OP_SCAN) { can_partition = 0; break; }
-        agg_syms[a] = ae->sym;
+        if (ae && ae->base.opcode == OP_SCAN) {
+            agg_syms[a] = ae->sym;
+            agg_is_expr[a] = 0;
+            GP_BORROW_ADD(ae->sym);
+        } else {
+            /* Expression agg input (e.g. (sum (* a b))): admit only pure
+             * row-local scalar exprs and record its source columns. */
+            int ns = group_expr_src_syms(g, ext->agg_ins[a], esrc, (int)bsz);
+            if (ns <= 0) { can_partition = 0; break; }
+            char nbuf[24];
+            int nl = snprintf(nbuf, sizeof(nbuf), "_gpa%u", (unsigned)a);
+            int64_t synth = ray_sym_intern(nbuf, (size_t)nl);
+            if (ray_table_get_col(parted_tbl, synth)) { can_partition = 0; break; }
+            for (int s = 0; s < ns && can_partition; s++) GP_BORROW_ADD(esrc[s]);
+            agg_syms[a] = synth;
+            agg_is_expr[a] = 1;
+        }
     }
+    #undef GP_BORROW_ADD
 
     /* Cardinality gate: estimate groups from first partition.
      * Per-partition only wins when #groups << partition_size. */
@@ -6035,6 +6220,28 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
         int64_t rows_per_part = total_rows / n_parts;
         int64_t est_groups = 1;
         for (uint32_t k = 0; k < n_keys; k++) {
+            if (key_is_expr[k]) {
+                /* Expression key: materialize partition 0 and estimate its
+                 * distinct group count via HyperLogLog.  A range-based proxy
+                 * (as used for integer scan keys below) would badly over-count
+                 * bucketed keys — xbar values are spaced N apart, so hi-lo
+                 * spans the whole domain range, not the bucket count. */
+                ray_t* v0 = group_eval_part_expr(g, parted_tbl, borrow_syms,
+                                                 n_borrow, ext->keys[k], 0);
+                if (!v0) { est_groups = rows_per_part; break; }
+                ray_t* cd = ray_count_distinct_approx(v0);
+                ray_release(v0);
+                if (!cd || RAY_IS_ERR(cd) || !ray_is_atom(cd)) {
+                    if (cd && !RAY_IS_ERR(cd)) ray_release(cd);
+                    est_groups = rows_per_part; break;
+                }
+                int64_t card = cd->i64;
+                ray_release(cd);
+                if (card < 1) card = 1;
+                est_groups *= card;
+                if (est_groups > rows_per_part) { est_groups = rows_per_part; break; }
+                continue;
+            }
             ray_t* pcol = ray_table_get_col(parted_tbl, key_syms[k]);
             if (!pcol) { est_groups = rows_per_part; break; }
             /* MAPCOMMON key: constant per partition — excluded from
@@ -6098,12 +6305,18 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
 
     /* Try per-partition path (separate noinline function to avoid I-cache pressure) */
     if (can_partition) {
-        ray_t* result = exec_group_per_partition(parted_tbl, ext, n_parts,
-                                                 key_syms, agg_syms, has_avg,
-                                                 has_stddev, group_limit);
+        ray_t* result = exec_group_per_partition(g, parted_tbl, ext, n_parts,
+                                                 key_syms, agg_syms,
+                                                 key_is_expr, agg_is_expr,
+                                                 borrow_syms, n_borrow,
+                                                 has_avg, has_stddev, group_limit);
         if (result) {
             scratch_free(key_syms_hdr);
             scratch_free(agg_syms_hdr);
+            scratch_free(key_is_expr_hdr);
+            scratch_free(agg_is_expr_hdr);
+            scratch_free(borrow_hdr);
+            scratch_free(esrc_hdr);
             return result;
         }
         /* NULL = per-partition failed, fall through to concat */
@@ -6112,33 +6325,61 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
      * re-derives its columns via find_ext) — free before falling through. */
     scratch_free(key_syms_hdr);
     scratch_free(agg_syms_hdr);
+    scratch_free(key_is_expr_hdr);
+    scratch_free(agg_is_expr_hdr);
+    scratch_free(borrow_hdr);
+    scratch_free(esrc_hdr);
 
     /* ---- Concat fallback ---- */
     /* ---- Concat-only-needed-columns fallback ----
      * Used when query has AVG or expression keys/aggs.
      * Only concatenates the columns actually referenced by the GROUP BY. */
     {
-        /* Collect needed column sym IDs (keys + agg inputs).  The
-         * deduplicated UNION of key and agg-input columns can reach the sum
-         * of both counts, so size the scratch to that union bound exactly
-         * (min 1 to avoid a zero-size allocation). */
-        int64_t needed_max = (int64_t)n_keys + (int64_t)n_aggs;
+        /* Collect needed column sym IDs (keys + agg inputs).  A bare OP_SCAN
+         * key/agg contributes its own source column; an EXPRESSION key (e.g.
+         * `(xbar time N)`) contributes the distinct source columns its subtree
+         * scans — those MUST be carried into flat_tbl or exec_group's re-eval
+         * of the key over flat_tbl fails "by: column not found" (the former
+         * collector silently dropped expression-key sources).  A distinct
+         * source column can never exceed the table's column count, and each
+         * slot may reference several, so bound the union at n_keys+n_aggs+ncols
+         * (min 1); the dedup keeps the live count ≤ ncols. */
+        int64_t needed_max = (int64_t)n_keys + (int64_t)n_aggs + ncols;
         if (needed_max < 1) needed_max = 1;
         ray_t* needed_hdr = NULL;
         int64_t* needed = (int64_t*)scratch_alloc(&needed_hdr,
                 (size_t)needed_max * sizeof(int64_t));
-        if (!needed) return ray_error("oom", NULL);
+        int64_t esrc_max = ncols > 0 ? ncols : 1;
+        ray_t* c_esrc_hdr = NULL;
+        int64_t* c_esrc = (int64_t*)scratch_alloc(&c_esrc_hdr,
+                (size_t)esrc_max * sizeof(int64_t));
+        if (!needed || !c_esrc) {
+            scratch_free(needed_hdr); scratch_free(c_esrc_hdr);
+            return ray_error("oom", NULL);
+        }
         int n_needed = 0;
-        for (uint32_t k = 0; k < n_keys; k++) {
+        int copy_all = 0;   /* 1 = an unbounded/unknown ref forces "copy all" */
+        for (uint32_t k = 0; k < n_keys && !copy_all; k++) {
             ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
             if (ke && ke->base.opcode == OP_SCAN) {
                 int dup = 0;
                 for (int i = 0; i < n_needed; i++)
                     if (needed[i] == ke->sym) { dup = 1; break; }
                 if (!dup) needed[n_needed++] = ke->sym;
+            } else {
+                /* Expression key — carry its source columns.  If the walk
+                 * can't characterize the subtree, copy everything (safe). */
+                int ns = group_expr_src_syms(g, ext->keys[k], c_esrc, (int)esrc_max);
+                if (ns < 0) { copy_all = 1; break; }
+                for (int s = 0; s < ns; s++) {
+                    int dup = 0;
+                    for (int i = 0; i < n_needed; i++)
+                        if (needed[i] == c_esrc[s]) { dup = 1; break; }
+                    if (!dup) needed[n_needed++] = c_esrc[s];
+                }
             }
         }
-        for (uint32_t a = 0; a < n_aggs; a++) {
+        for (uint32_t a = 0; !copy_all && a < n_aggs; a++) {
             ray_op_ext_t* ae = find_ext(g, ext->agg_ins[a]);
             if (ae && ae->base.opcode == OP_SCAN) {
                 int dup = 0;
@@ -6146,12 +6387,20 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                     if (needed[i] == ae->sym) { dup = 1; break; }
                 if (!dup) needed[n_needed++] = ae->sym;
             } else {
-                /* Expression agg input — need all columns for evaluation.
-                 * Fall back to copying everything. */
-                n_needed = 0;
-                break;
+                /* Expression agg input — carry its source columns; unknown
+                 * subtrees copy everything (safe). */
+                int ns = group_expr_src_syms(g, ext->agg_ins[a], c_esrc, (int)esrc_max);
+                if (ns < 0) { copy_all = 1; break; }
+                for (int s = 0; s < ns; s++) {
+                    int dup = 0;
+                    for (int i = 0; i < n_needed; i++)
+                        if (needed[i] == c_esrc[s]) { dup = 1; break; }
+                    if (!dup) needed[n_needed++] = c_esrc[s];
+                }
             }
         }
+        if (copy_all) n_needed = 0;   /* 0 ⇒ downstream copies all ncols */
+        scratch_free(c_esrc_hdr);
 
         /* Build flat table with only needed columns (or all if n_needed==0) */
         ray_t* flat_tbl = ray_table_new(n_needed > 0 ? (int64_t)n_needed : ncols);
@@ -10946,10 +11195,12 @@ cleanup:
  * Returns NULL if any step fails (caller falls through to concat path).
  * -------------------------------------------------------------------------- */
 static ray_t* __attribute__((noinline))
-exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
+exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                          int32_t n_parts, const int64_t* key_syms,
-                         const int64_t* agg_syms, int has_avg,
-                         int has_stddev, int64_t group_limit) {
+                         const int64_t* agg_syms, const uint8_t* key_is_expr,
+                         const uint8_t* agg_is_expr, const int64_t* borrow_syms,
+                         int n_borrow, int has_avg, int has_stddev,
+                         int64_t group_limit) {
 
     /* Count every entry into the streaming per-partition kernel (O(1), see the
      * ray_group_perpart_runs_ctr definition near the top of this file). */
@@ -11142,45 +11393,67 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
             ray_progress_update("group", "per-partition aggregate",
                                 (uint64_t)p, (uint64_t)n_parts);
 
-            /* Collect unique agg input sym IDs (avoid duplicate columns).
-             * unique_agg carved above (sized part_n_aggs_max); reused each
-             * partition — its contents are recomputed per iteration. */
-            int n_unique_agg = 0;
-            for (uint32_t a = 0; a < part_n_aggs; a++) {
-                int dup = 0;
-                for (int j = 0; j < n_unique_agg; j++)
-                    if (unique_agg[j] == part_agg_syms[a]) { dup = 1; break; }
-                if (!dup) {
-                    for (uint32_t k = 0; k < n_keys; k++)
-                        if (key_syms[k] == part_agg_syms[a]) { dup = 1; break; }
-                    if (!dup) unique_agg[n_unique_agg++] = part_agg_syms[a];
-                }
-            }
-
-            ray_t* sub = ray_table_new((int64_t)(n_part_keys + n_unique_agg));
+            /* Build the per-partition sub-table.  It carries (a) the borrow
+             * set — the deduped plain PARTED source columns every scan key,
+             * scan agg input, AND expression source references (computed once
+             * by exec_group_parted); plus (b) one materialized column per
+             * expression key / agg input, added under its synthetic sym.  The
+             * pkeys/pagg_ins scans below then always see plain columns — a
+             * scan slot by its real sym, an expression slot by its synthetic
+             * sym — so ALL downstream per-partition/merge machinery is
+             * unchanged.  (unique_agg's key/agg dedup is subsumed by
+             * borrow_syms, which is already deduplicated.) */
+            (void)unique_agg;
+            ray_t* sub = ray_table_new((int64_t)(n_borrow + n_keys + n_aggs));
             if (!sub || RAY_IS_ERR(sub)) goto batch_fail;
 
-            for (uint32_t k = 0; k < n_part_keys; k++) {
-                ray_t* pcol = ray_table_get_col(parted_tbl, pk_syms[k]);
+            int64_t part_nrows = -1;
+            for (int j = 0; j < n_borrow; j++) {
+                ray_t* pcol = ray_table_get_col(parted_tbl, borrow_syms[j]);
                 if (!pcol || !RAY_IS_PARTED(pcol->type)) {
                     ray_release(sub); goto batch_fail;
                 }
                 ray_t* seg = ((ray_t**)ray_data(pcol))[p];
                 if (!seg) { ray_release(sub); goto batch_fail; }
+                if (part_nrows < 0) part_nrows = seg->len;
                 ray_retain(seg);
-                sub = ray_table_add_col(sub, pk_syms[k], seg);
+                sub = ray_table_add_col(sub, borrow_syms[j], seg);
                 ray_release(seg);
             }
-            for (int j = 0; j < n_unique_agg; j++) {
-                ray_t* pcol = ray_table_get_col(parted_tbl, unique_agg[j]);
-                if (!pcol || !RAY_IS_PARTED(pcol->type)) {
+
+            /* Materialize expression keys / agg inputs over this partition.
+             * exec_node resolves the subtree's scans against `sub` (g->table
+             * swap); g->selection is NULL on this path.  Each result must be a
+             * full-partition-length vector — a length mismatch (e.g. a scan
+             * bound to a different table) fails the whole per-partition attempt
+             * cleanly, falling back to concat. */
+            for (uint32_t k = 0; k < n_keys; k++) {
+                if (!key_is_expr[k]) continue;
+                ray_t* saved = g->table;
+                g->table = sub;
+                ray_t* v = exec_node(g, op_node(g, ext->keys[k]));
+                g->table = saved;
+                if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) ||
+                    (part_nrows >= 0 && v->len != part_nrows)) {
+                    if (v && !RAY_IS_ERR(v)) ray_release(v);
                     ray_release(sub); goto batch_fail;
                 }
-                ray_t* seg = ((ray_t**)ray_data(pcol))[p];
-                if (!seg) { ray_release(sub); goto batch_fail; }
-                ray_retain(seg);
-                sub = ray_table_add_col(sub, unique_agg[j], seg);
-                ray_release(seg);
+                sub = ray_table_add_col(sub, key_syms[k], v);
+                ray_release(v);
+            }
+            for (uint32_t a = 0; a < n_aggs; a++) {
+                if (!agg_is_expr[a]) continue;
+                ray_t* saved = g->table;
+                g->table = sub;
+                ray_t* v = exec_node(g, op_node(g, ext->agg_ins[a]));
+                g->table = saved;
+                if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) ||
+                    (part_nrows >= 0 && v->len != part_nrows)) {
+                    if (v && !RAY_IS_ERR(v)) ray_release(v);
+                    ray_release(sub); goto batch_fail;
+                }
+                sub = ray_table_add_col(sub, agg_syms[a], v);
+                ray_release(v);
             }
 
             ray_graph_t* pg = ray_graph_new(sub);
@@ -11622,6 +11895,19 @@ batch_fail:
         ray_release(result);
         result = trimmed;
         rncols = ray_table_ncols(result);
+    }
+
+    /* Key column names: the intermediate tables carry each key under its
+     * runtime name (a real source sym for a scan key, or a synthetic "_gpk<k>"
+     * for an expression key).  Rename the user-facing key columns to EXACTLY
+     * what the flat exec_group emit produces — `find_ext(ext->keys[k])->sym`
+     * (the source sym for scans; a non-scan node's ext sym, or the key index k
+     * when it has no ext) — so the streaming result is name-for-name identical
+     * to the concat fallback and the in-memory path (a select on a bare
+     * computed by-key inherits this name directly). */
+    for (uint32_t k = 0; k < n_keys && (int64_t)k < rncols; k++) {
+        ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
+        ray_table_set_col_name(result, (int64_t)k, ke ? ke->sym : (int64_t)k);
     }
 
     /* Agg column names already fixed by ray_table_set_col_name inside batch loop.
