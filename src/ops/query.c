@@ -384,6 +384,8 @@ static uint16_t resolve_moving_opcode(int64_t sym_id) {
         if (memcmp(name, "mavg", 4) == 0) return OP_MAVG;
         if (memcmp(name, "mmin", 4) == 0) return OP_MMIN;
         if (memcmp(name, "mmax", 4) == 0) return OP_MMAX;
+        if (memcmp(name, "mvar", 4) == 0) return OP_MVAR;
+        if (memcmp(name, "mdev", 4) == 0) return OP_MDEV;
     } else if (len == 6) {
         if (memcmp(name, "mcount", 6) == 0) return OP_MCOUNT;
     }
@@ -1483,6 +1485,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                     case OP_MMIN:   return ray_mmin_op(g, arg, window);
                     case OP_MMAX:   return ray_mmax_op(g, arg, window);
                     case OP_MCOUNT: return ray_mcount_op(g, arg, window);
+                    case OP_MVAR:   return ray_mvar_op(g, arg, window);
+                    case OP_MDEV:   return ray_mdev_op(g, arg, window);
                     default: return NULL;
                 }
             }

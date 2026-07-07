@@ -305,6 +305,8 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
 #define OP_MMIN           126   /* moving minimum over trailing N rows          */
 #define OP_MMAX           127   /* moving maximum over trailing N rows          */
 #define OP_MCOUNT         128   /* moving non-null count over trailing N rows   */
+#define OP_MVAR           129   /* moving population variance over trailing N   */
+#define OP_MDEV           130   /* moving population stddev over trailing N     */
 
 /* Opcodes — Misc */
 #define OP_ALIAS        70
@@ -690,6 +692,8 @@ ray_op_t* ray_mavg_op(ray_graph_t* g, ray_op_t* a, int64_t window);
 ray_op_t* ray_mmin_op(ray_graph_t* g, ray_op_t* a, int64_t window);
 ray_op_t* ray_mmax_op(ray_graph_t* g, ray_op_t* a, int64_t window);
 ray_op_t* ray_mcount_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mvar_op(ray_graph_t* g, ray_op_t* a, int64_t window);
+ray_op_t* ray_mdev_op(ray_graph_t* g, ray_op_t* a, int64_t window);
 ray_op_t* ray_stddev(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_stddev_pop(ray_graph_t* g, ray_op_t* a);
 ray_op_t* ray_var(ray_graph_t* g, ray_op_t* a);

@@ -3009,6 +3009,7 @@ static void ray_register_builtins(void) {
     /* RAY_FN_LAZY_AWARE: these fns have 'if (ray_is_lazy(x)) return ray_lazy_append(...)' shells
      * and must NOT have their args materialised by the dispatcher. */
     register_unary("sum",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_sum_fn);
+    register_unary("prod",  RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_prod_fn);
     register_unary("count", RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_count_fn);
     register_unary("avg",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_avg_fn);
     register_unary("min",   RAY_FN_AGGR | RAY_FN_LAZY_AWARE, ray_min_fn);
@@ -3064,6 +3065,8 @@ static void ray_register_builtins(void) {
     register_binary("mmin",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mmin_fn);
     register_binary("mmax",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mmax_fn);
     register_binary("mcount", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mcount_fn);
+    register_binary("mvar",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mvar_fn);
+    register_binary("mdev",   RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_mdev_fn);
 
     /* Sorting operations */
     register_unary("asc",      RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_asc_fn);

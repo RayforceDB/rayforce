@@ -150,6 +150,8 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_MMIN:          return "MMIN";
         case OP_MMAX:          return "MMAX";
         case OP_MCOUNT:        return "MCOUNT";
+        case OP_MVAR:          return "MVAR";
+        case OP_MDEV:          return "MDEV";
         default:               return "UNKNOWN";
     }
 }
@@ -238,6 +240,8 @@ static void dump_node(FILE* f, ray_graph_t* g, ray_op_t* node, int depth) {
         case OP_MMIN:
         case OP_MMAX:
         case OP_MCOUNT:
+        case OP_MVAR:
+        case OP_MDEV:
             if (ext)
                 fprintf(f, "(N=%lld)", (long long)ext->param);
             break;

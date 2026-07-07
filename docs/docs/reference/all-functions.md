@@ -11,7 +11,7 @@
 | | | |
 |---|---|---|
 | [Arithmetic](#arithmetic) (16) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
-| [Aggregation](#aggregation) (14) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (35) |
+| [Aggregation](#aggregation) (15) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (37) |
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (14) |
 | [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
 | [String](#string-ops) (4) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
@@ -40,7 +40,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 
 ### Unary
 
-`not`, `neg`, `round`, `floor`, `ceil`, `abs`, `sqrt`, `log`, `exp`, `sum`, `count`, `avg`, `min`, `max`,
+`not`, `neg`, `round`, `floor`, `ceil`, `abs`, `sqrt`, `log`, `exp`, `sum`, `prod`, `count`, `avg`, `min`, `max`,
 `first`, `last`, `med`, `dev`, `stddev`, `stddev_pop`, `dev_pop`, `var`, `var_pop`, `raise`, `distinct`,
 `reverse`, `til`, `lag`, `lead`, `deltas`, `ratios`, `fills`, `sums`, `avgs`, `mins`, `maxs`, `prds`,
 `differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `value`, `type`, `read`, `load`, `exit`,
@@ -56,7 +56,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 
 `+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `set`, `let`,
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `at`, `find`, `msum`, `mavg`, `mmin`, `mmax`,
-`mcount`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `dict`, `concat`, `within`, `div`,
+`mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `dict`, `concat`, `within`, `div`,
 `rand`, `bin`, `binr`, `split`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
 `unify`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`, `inner-prod`, `l2-dist`, `hnsw-save`, `.attr.set`,
 `.col.link`
@@ -157,6 +157,7 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `sum` | unary | aggr | Sum of all elements | `(sum [1 2 3])` → `6` |
+| `prod` | unary | aggr | Product of all non-null numeric elements | `(prod [2 3 4])` → `24` |
 | `count` | unary | aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary | aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
 | `min` | unary | aggr | Minimum value | `(min [3 1 2])` → `1` |
@@ -246,6 +247,8 @@ Operations on vectors and lists as collections — set operations, indexing, sea
 | `mmin` | binary | lazy/DAG | Moving minimum over trailing N rows | `(mmin 3 [3 2 4 1])` → `[3 2 2 1]` |
 | `mmax` | binary | lazy/DAG | Moving maximum over trailing N rows | `(mmax 3 [3 2 4 1])` → `[3 3 4 4]` |
 | `mcount` | binary | lazy/DAG | Moving non-null count over trailing N rows | `(mcount 3 [1 2 3 4])` → `[1 2 3 3]` |
+| `mvar` | binary | lazy/DAG | Moving population variance over trailing N rows and non-null values | `(mvar 2 [1 3 5])` → `[0.0 1.0 1.0]` |
+| `mdev` | binary | lazy/DAG | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `enlist` | variadic | — | Wrap value(s) in a vector (list of atoms) | `(enlist 1 2 3)` → `[1 2 3]` |
 | `concat` | binary | — | Concatenate two vectors or strings | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
 | `raze` | unary | — | Flatten a list of vectors into one vector | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
@@ -276,6 +279,8 @@ Operations on vectors and lists as collections — set operations, indexing, sea
 (msum 3 [1 2 3 4])        ; [1 3 6 9]
 (mavg 3 [1 2 3 4])        ; [1.0 1.5 2.0 3.0]
 (mcount 3 [1 2 3 4])      ; [1 2 3 3]
+(mvar 2 [1 3 5])          ; [0.0 1.0 1.0]
+(mdev 2 [1 3 5])          ; [0.0 1.0 1.0]
 ```
 
 Time-series vector helpers are lazy-aware DAG operations for vector inputs. Moving-window helpers take a positive integer window first, then the vector. Constant windows inside `select` lower into DAG nodes; dynamic windows evaluate through the normal function path. These functions materialize through morsel-based kernels, can run in parallel, and poll the query cancellation flag during execution.

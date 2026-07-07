@@ -62,6 +62,7 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `sum` | unary, aggr | Sum of all elements | `(sum [1 2 3])` → `6` |
+| `prod` | unary, aggr | Product of all non-null numeric elements | `(prod [2 3 4])` → `24` |
 | `count` | unary, aggr | Count of elements | `(count [1 2 3])` → `3` |
 | `avg` | unary, aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
 | `min` | unary, aggr | Minimum value | `(min [3 1 2])` → `1` |
@@ -139,6 +140,8 @@ Operations on vectors as collections.
 | `mmin` | binary | Moving minimum over trailing N rows | `(mmin 3 [3 2 4 1])` → `[3 2 2 1]` |
 | `mmax` | binary | Moving maximum over trailing N rows | `(mmax 3 [3 2 4 1])` → `[3 3 4 4]` |
 | `mcount` | binary | Moving non-null count over trailing N rows | `(mcount 3 [1 2 3 4])` → `[1 2 3 3]` |
+| `mvar` | binary | Moving population variance over trailing N rows and non-null values | `(mvar 2 [1 3 5])` → `[0.0 1.0 1.0]` |
+| `mdev` | binary | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `enlist` | variadic | Wrap value(s) in a vector | `(enlist 1 2 3)` → `[1 2 3]` |
 | `concat` | binary | Concatenate two vectors | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
 | `raze` | unary | Flatten a list of vectors into one | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |

@@ -181,6 +181,41 @@ static ray_t* agg_parted_avg(ray_t* x) {
     return make_f64(sum / (double)cnt);
 }
 
+static ray_t* agg_parted_prod(ray_t* x) {
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
+    if (!agg_parted_numeric_base(base) ||
+        base == RAY_DATE || base == RAY_TIME || base == RAY_TIMESTAMP) {
+        return ray_error("type", "prod expects a numeric parted column, got %s", ray_type_name(base));
+    }
+    ray_t** segs = (ray_t**)ray_data(x);
+    if (base == RAY_F64) {
+        double prod = 1.0;
+        for (int64_t s = 0; s < x->len; s++) {
+            ray_t* seg = segs[s];
+            if (!seg) continue;
+            double* d = (double*)ray_data(seg);
+            int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+            for (int64_t i = 0; i < seg->len; i++) {
+                if (has_nulls && ray_vec_is_null(seg, i)) continue;
+                prod *= d[i];
+            }
+        }
+        return make_f64(prod);
+    }
+
+    int64_t prod = 1;
+    for (int64_t s = 0; s < x->len; s++) {
+        ray_t* seg = segs[s];
+        if (!seg) continue;
+        int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
+        for (int64_t i = 0; i < seg->len; i++) {
+            if (has_nulls && ray_vec_is_null(seg, i)) continue;
+            prod = (int64_t)((uint64_t)prod * (uint64_t)agg_read_i64(seg, i));
+        }
+    }
+    return make_i64(prod);
+}
+
 static ray_t* agg_parted_minmax(ray_t* x, int want_max) {
     int8_t base = (int8_t)RAY_PARTED_BASETYPE(x->type);
     if (!agg_parted_numeric_base(base)) return ray_error("type", want_max ? "max expects a numeric or temporal parted column, got %s" : "min expects a numeric or temporal parted column, got %s", ray_type_name(base));
@@ -284,6 +319,41 @@ ray_t* ray_sum_fn(ray_t* x) {
         else { int64_t v = (int64_t)as_f64(elems[i]); isum += v; fsum += (double)v; }
     }
     return has_float ? make_f64(fsum) : make_i64(isum);
+}
+
+ray_t* ray_prod_fn(ray_t* x) {
+    if (ray_is_lazy(x)) return ray_lazy_append(x, OP_PROD);
+    if (RAY_IS_PARTED(x->type)) return agg_parted_prod(x);
+    if (ray_is_atom(x)) { ray_retain(x); return x; }
+    if (ray_is_vec(x)) {
+        if (!agg_type_admitted(OP_PROD, x->type))
+            return ray_error("type", "prod expects a numeric vector, got %s", ray_type_name(x->type));
+        AGG_VEC_VIA_DAG(x, ray_prod);
+    }
+    if (!is_list(x)) return ray_error("type", "prod expects a numeric vector, atom, or list, got %s", ray_type_name(x->type));
+    int64_t len = ray_len(x);
+    if (len == 0) return make_i64(1);
+    ray_t** elems = (ray_t**)ray_data(x);
+    int has_float = 0;
+    double fprod = 1.0;
+    int64_t iprod = 1;
+    for (int64_t i = 0; i < len; i++) {
+        if (!is_numeric(elems[i]))
+            return ray_error("type", "prod: list elements must be numeric, got %s", ray_type_name(elems[i]->type));
+        if (RAY_ATOM_IS_NULL(elems[i])) {
+            if (elems[i]->type == -RAY_F64) has_float = 1;
+            continue;
+        }
+        if (elems[i]->type == -RAY_F64) {
+            has_float = 1;
+            fprod *= elems[i]->f64;
+        } else {
+            int64_t v = (int64_t)as_f64(elems[i]);
+            iprod = (int64_t)((uint64_t)iprod * (uint64_t)v);
+            fprod *= (double)v;
+        }
+    }
+    return has_float ? make_f64(fprod) : make_i64(iprod);
 }
 
 ray_t* ray_count_fn(ray_t* x) {

@@ -171,6 +171,8 @@ Unary vector operations that preserve row count. These are lazy DAG nodes in Ray
 | `ray_mmin_op(g, a, window)` | `OP_MMIN` | Moving minimum over trailing `window` rows |
 | `ray_mmax_op(g, a, window)` | `OP_MMAX` | Moving maximum over trailing `window` rows |
 | `ray_mcount_op(g, a, window)` | `OP_MCOUNT` | Moving non-null count over trailing `window` rows |
+| `ray_mvar_op(g, a, window)` | `OP_MVAR` | Moving population variance over trailing `window` rows |
+| `ray_mdev_op(g, a, window)` | `OP_MDEV` | Moving population standard deviation over trailing `window` rows |
 
 Moving-window constructors require a positive `int64_t` window. Rayfall syntax uses the same order, for example `(msum 20 price)`. In query projections, constant windows lower into DAG nodes; non-constant windows use the normal evaluator path.
 

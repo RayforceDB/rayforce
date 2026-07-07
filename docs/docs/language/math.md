@@ -190,9 +190,17 @@ Sum of all elements.
 (sum [1 2 3 4])  ; 10
 ```
 
+### `(prod x)` — aggregate
+
+Product of all non-null numeric elements.
+
+```lisp
+(prod [2 3 4])  ; 24
+```
+
 ### `(count x)` — aggregate
 
-Number of elements. Counts non-null values.
+Number of elements. Counts total vector length, including nulls.
 
 ```lisp
 (count [1 2 3])  ; 3
@@ -421,6 +429,8 @@ For common time-series scans, prefer the built-in DAG forms. They avoid per-row 
 (mmin 3 [3 2 4 1])          ; [3 2 2 1]
 (mmax 3 [3 2 4 1])          ; [3 3 4 4]
 (mcount 3 [1 2 3 4])        ; [1 2 3 3]
+(mvar 2 [1 3 5])            ; [0.0 1.0 1.0]
+(mdev 2 [1 3 5])            ; [0.0 1.0 1.0]
 ```
 
 The moving forms take a positive integer window first. Constant windows inside query projections lower to DAG operations; dynamic windows still evaluate as ordinary function calls.
@@ -456,7 +466,7 @@ Parallel map. Like `map` but distributes work across threads for large inputs.
 | **Arithmetic** | `+` `-` `*` `/` `%` `neg` `round` `floor` `ceil` |
 | **Comparison** | `==` `!=` `<` `<=` `>` `>=` `within` |
 | **Logic** | `and` `or` `not` |
-| **Aggregation** | `sum` `count` `avg` `min` `max` `med` `dev` `first` `last` `distinct` |
+| **Aggregation** | `sum` `prod` `count` `avg` `min` `max` `med` `dev` `first` `last` `distinct` |
 | **Ordering** | `asc` `desc` `iasc` `idesc` `xasc` `xdesc` `xrank` |
 | **Generation** | `til` `take` `reverse` `where` `find` `xbar` |
 | **Higher-order** | `map` `fold` `scan` `apply` `filter` `pmap` |

@@ -472,6 +472,8 @@ ray_t* ray_mavg_fn(ray_t* n, ray_t* x);
 ray_t* ray_mmin_fn(ray_t* n, ray_t* x);
 ray_t* ray_mmax_fn(ray_t* n, ray_t* x);
 ray_t* ray_mcount_fn(ray_t* n, ray_t* x);
+ray_t* ray_mvar_fn(ray_t* n, ray_t* x);
+ray_t* ray_mdev_fn(ray_t* n, ray_t* x);
 ray_t* ray_rand_fn(ray_t* a, ray_t* b);
 ray_t* ray_bin_fn(ray_t* sorted, ray_t* val);
 ray_t* ray_binr_fn(ray_t* sorted, ray_t* val);

@@ -1,0 +1,12 @@
+;; Standalone product aggregate. Query aggregation already had OP_PROD;
+;; this covers the language-level builtin registration and lazy vector path.
+
+(prod [2 3 4]) -- 24
+(prod [1.5 2.0 4.0]) -- 12.0
+(prod (as 'I64 (list 2 0N 3))) -- 6
+(prod (list 2 3 4)) -- 24
+(prod []) -- 1
+(prod ['a 'b]) !- type
+
+(set Tp (table [g x] (list ['a 'a 'b] [2 3 4])))
+(at (select {from: Tp p: (prod x) by: g}) 'p) -- [6 4]

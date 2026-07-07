@@ -233,6 +233,7 @@ ray_t* ray_neg_fn(ray_t* x);
 
 /* Aggregation */
 ray_t* ray_sum_fn(ray_t* x);
+ray_t* ray_prod_fn(ray_t* x);
 ray_t* ray_count_fn(ray_t* x);
 ray_t* ray_avg_fn(ray_t* x);
 ray_t* ray_min_fn(ray_t* x);
@@ -282,6 +283,8 @@ ray_t* ray_mavg_fn(ray_t* n, ray_t* x);
 ray_t* ray_mmin_fn(ray_t* n, ray_t* x);
 ray_t* ray_mmax_fn(ray_t* n, ray_t* x);
 ray_t* ray_mcount_fn(ray_t* n, ray_t* x);
+ray_t* ray_mvar_fn(ray_t* n, ray_t* x);
+ray_t* ray_mdev_fn(ray_t* n, ray_t* x);
 
 /* Table construction */
 ray_t* ray_list_fn(ray_t** args, int64_t n);

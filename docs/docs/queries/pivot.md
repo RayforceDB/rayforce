@@ -145,7 +145,7 @@ Running computations like cumulative sums can be computed using the DAG-backed t
          avg3: (mavg 3 Price)})
 ```
 
-Use `scan` when the accumulator is a custom function. Use `sums`, `avgs`, `mins`, `maxs`, and `prds` for built-in running aggregates, and `msum`, `mavg`, `mmin`, `mmax`, and `mcount` for fixed trailing windows. Constant-window calls are lazy-aware DAG operations and materialize with morsel-based kernels.
+Use `scan` when the accumulator is a custom function. Use `sums`, `avgs`, `mins`, `maxs`, and `prds` for built-in running aggregates, and `msum`, `mavg`, `mmin`, `mmax`, `mcount`, `mvar`, and `mdev` for fixed trailing windows. Constant-window calls are lazy-aware DAG operations and materialize with morsel-based kernels.
 
 ### Rank and Order
 

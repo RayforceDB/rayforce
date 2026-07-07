@@ -122,14 +122,16 @@ The pattern is: sort descending with `xdesc`, then filter with a threshold. For 
 ; Fixed trailing window: current row plus the previous two rows
 (msum 3 [3 1 4 1 5 9])
 (mavg 3 [3 1 4 1 5 9])
+(mdev 3 [3 1 4 1 5 9])
 ```
 
 ```text
 [3 4 8 6 10 15]
 [3.0 2.0 2.6666666667 2.0 3.3333333333 5.0]
+[0.0 1.0 1.2472191289 1.4142135624 1.6996731712 3.2659863237]
 ```
 
-Use the specialized running verbs (`sums`, `prds`, `avgs`, `mins`, `maxs`) and moving-window verbs (`msum`, `mavg`, `mmin`, `mmax`, `mcount`) for common analytics paths. Constant-window calls lower to DAG vector kernels, run with morsel-based execution, and poll cancellation during execution. The generic `scan` function is still available when the accumulator is a custom function. The related `fold` function returns only the final accumulated value.
+Use the specialized running verbs (`sums`, `prds`, `avgs`, `mins`, `maxs`) and moving-window verbs (`msum`, `mavg`, `mmin`, `mmax`, `mcount`, `mvar`, `mdev`) for common analytics paths. Constant-window calls lower to DAG vector kernels, run with morsel-based execution, and poll cancellation during execution. The generic `scan` function is still available when the accumulator is a custom function. The related `fold` function returns only the final accumulated value.
 
 ## 4. Pivoting (Cross-Tabulation) { #pivot }
 
