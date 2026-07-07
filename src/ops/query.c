@@ -13894,11 +13894,11 @@ static ray_t* ray_asof_join_core(ray_t* keys_vec, ray_t* left_tbl, ray_t* right_
 
 /* ── streaming parted asof: shape detection + per-partition eval ────────────
  *
- * SPIKE scope: prove that the parted operands can be received UNFLATTENED and
- * the join run per-day with bounded memory.  NO cross-day carry state — a
- * trade that needs a PRIOR day's prevailing quote will mismatch, so this path
- * is only taken (and is only correct) when every trade's prevailing quote is
- * same-day.  See report / test for where carry must plug in.
+ * The parted operands are received UNFLATTENED and the join runs per-day with
+ * bounded memory.  A running CARRY table (last prevailing quote per equality-key
+ * tuple, as of the end of each processed day) is prepended to each day's quote
+ * segment, so a first-of-day trade — or a trade on a day its symbol is quiet —
+ * still resolves to the most recent prior-day quote.  See asof_carry_recompute.
  */
 
 /* Does this table carry at least one parted / MAPCOMMON column (i.e. is it a
@@ -14039,6 +14039,106 @@ static ray_t* asof_empty_right(ray_t* dict, ray_t* parted_tbl) {
     return out;
 }
 
+/* ── cross-day carry: running last-prevailing-quote per equality-key tuple ───
+ *
+ * Recompute the carry table from `qtab` (= prior carry rows PREPENDED to the
+ * day's quote segment).  The carry is the most-recent quote row per full
+ * equality-key tuple, obtained with the engine's own group-by:
+ *
+ *   (select {c: (last c) for every non-eq column c  by: {eq keys}  from: qtab})
+ *
+ * Because qtab lists the (older) carry rows before the (newer) same-day quotes,
+ * and quotes within a day are time-ascending, `last` per group picks the
+ * most-recent quote — which naturally (a) keeps a gap key's carried row when it
+ * did not quote today (it is still present in qtab), (b) refreshes keys that
+ * quoted today, and (c) never invents a slot for a key that never quoted.
+ *
+ * `template` is the day's quote-segment table; the group-by output is reordered
+ * to `template`'s exact column order so the NEXT day's ray_result_merge (which
+ * concatenates columns positionally) stays schema-consistent.  `eq_names` are
+ * the equality-key column name ids (keys_vec minus the trailing time key).
+ * Returns an owned table (or RAY_IS_ERR); `qtab` is borrowed. */
+static ray_t* asof_carry_recompute(ray_t* qtab, ray_t* template,
+                                   const int64_t* eq_names, int64_t n_eq) {
+    int64_t ncols = ray_table_ncols(template);
+
+    /* by: SYM vec of the full equality-key tuple (name ids). */
+    ray_t* by_vec = ray_vec_new(RAY_SYM, n_eq ? n_eq : 1);
+    if (!by_vec || RAY_IS_ERR(by_vec)) return by_vec ? by_vec : ray_error("oom", NULL);
+    by_vec->len = n_eq;
+    for (int64_t i = 0; i < n_eq; i++) ((int64_t*)ray_data(by_vec))[i] = eq_names[i];
+
+    /* Clause dict: one `col: (last col)` projection per NON-eq column, plus
+     * by: and from:.  Slot count = (ncols - n_eq non-eq cols) + 2. */
+    int64_t n_proj = ncols - n_eq;
+    if (n_proj < 0) n_proj = 0;
+    int64_t nslot = n_proj + 2;
+    ray_t* keys = ray_vec_new(RAY_SYM, nslot);
+    if (!keys || RAY_IS_ERR(keys)) { ray_release(by_vec); return keys ? keys : ray_error("oom", NULL); }
+    keys->len = nslot;
+    ray_t* vals = ray_list_new(nslot);
+    if (!vals || RAY_IS_ERR(vals)) { ray_release(by_vec); ray_release(keys); return vals ? vals : ray_error("oom", NULL); }
+    vals->len = nslot;
+    int64_t* kids = (int64_t*)ray_data(keys);
+
+    int64_t last_sym = ray_sym_intern("last", 4);
+    int64_t s = 0;
+    ray_t* build_err = NULL;
+    for (int64_t c = 0; c < ncols && !build_err; c++) {
+        int64_t nm = ray_table_col_name(template, c);
+        bool is_eq = false;
+        for (int64_t k = 0; k < n_eq; k++) if (eq_names[k] == nm) { is_eq = true; break; }
+        if (is_eq) continue;   /* eq keys enter the output via by: */
+        if (s >= n_proj) { build_err = ray_error("schema", "asof carry: projection overflow"); break; }
+        /* (last <col>) — head + column ref are both unquoted name syms. */
+        ray_t* head = ray_sym(last_sym);
+        ray_t* cref = ray_sym(nm);
+        ray_t* agg  = ray_list_new(2);
+        if (!head || RAY_IS_ERR(head) || !cref || RAY_IS_ERR(cref) || !agg || RAY_IS_ERR(agg)) {
+            if (head && !RAY_IS_ERR(head)) ray_release(head);
+            if (cref && !RAY_IS_ERR(cref)) ray_release(cref);
+            build_err = (agg && RAY_IS_ERR(agg)) ? agg : ray_error("oom", NULL);
+            if (agg && !RAY_IS_ERR(agg)) ray_release(agg);
+            break;
+        }
+        agg->len = 2;
+        agg = ray_list_set(agg, 0, head);   ray_release(head);
+        agg = ray_list_set(agg, 1, cref);   ray_release(cref);
+        kids[s] = nm;
+        vals = ray_list_set(vals, s, agg);   ray_release(agg);
+        s++;
+    }
+    if (!build_err) {
+        kids[s]  = ray_sym_intern("by", 2);
+        vals = ray_list_set(vals, s, by_vec);   /* retains */
+        s++;
+        kids[s]  = ray_sym_intern("from", 4);
+        vals = ray_list_set(vals, s, qtab);      /* retains borrowed qtab */
+    }
+    ray_release(by_vec);
+    if (build_err) { ray_release(keys); ray_release(vals); return build_err; }
+
+    ray_t* dict = ray_dict_new(keys, vals);      /* consumes keys + vals */
+    if (!dict || RAY_IS_ERR(dict)) return dict ? dict : ray_error("oom", NULL);
+    ray_t* raw = ray_select(&dict, 1);
+    ray_release(dict);
+    if (!raw || RAY_IS_ERR(raw)) return raw ? raw : ray_error("type", NULL);
+
+    /* Reorder group-by output (eq keys first, then aggs) back to `template`'s
+     * column order so positional column concat stays valid next day. */
+    ray_t* out = ray_table_new(ncols);
+    if (!out || RAY_IS_ERR(out)) { ray_release(raw); return out ? out : ray_error("oom", NULL); }
+    for (int64_t c = 0; c < ncols; c++) {
+        int64_t nm = ray_table_col_name(template, c);
+        ray_t* col = ray_table_get_col(raw, nm);
+        if (!col) { ray_release(raw); ray_release(out); return ray_error("schema", "asof carry: column %lld missing from group-last", (long long)nm); }
+        out = ray_table_add_col(out, nm, col);
+        if (!out || RAY_IS_ERR(out)) { ray_release(raw); return out ? out : ray_error("oom", NULL); }
+    }
+    ray_release(raw);
+    return out;
+}
+
 /* (asof-join [key1 key2 ... timeKey] leftTable rightTable)
  * Last key is the time/asof column, rest are equality keys.  The equality
  * keys are OPTIONAL: a lone time key (asof-join [timeKey] L R) performs an
@@ -14073,20 +14173,42 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
     if (lparted && rparted && l_dates && r_dates && l_ndates > 0 && r_ndates > 0) {
         /* Streaming per-day path over the ASCENDING UNION of both sides' dates.
          * ld/rd are the per-partition DATE values (ascending by construction).
-         * A two-pointer merge visits each distinct date once; for each date d:
-         *   both sides have d  → asof(trade seg, quote seg)
-         *   trades-only (d only on left)  → asof(trade seg, empty quote) → all
-         *                                    trades no-match (null right cols)
-         *   quotes-only (d only on right) → no trades, emit nothing (Task 2's
-         *                                    cross-day carry will consume these
-         *                                    quotes; today just skip the day)
-         * Peak memory is ~one day's trade+quote (+ the growing result). */
+         * A two-pointer merge visits each distinct date once; for each date d a
+         * per-day prevailing-quote view `qtab` = carry ∪ day-d quotes drives:
+         *   both sides have d  → asof(trade seg, qtab), then refresh carry
+         *   trades-only (d only on left)  → asof(trade seg, carry) so cross-day /
+         *                                    gap trades match the carried quote;
+         *                                    trades with no carry entry no-match
+         *   quotes-only (d only on right) → no trades emitted, but carry IS
+         *                                    refreshed (its quotes matter later)
+         * Peak memory is ~one day's trade+quote + the carry (+ growing result). */
         const int32_t* ld = (const int32_t*)ray_data(l_dates);
         const int32_t* rd = (const int32_t*)ray_data(r_dates);
         int64_t i = 0, j = 0;
         ray_t* accum   = NULL;
         ray_t* err     = NULL;
         ray_t* empty_r = NULL;   /* lazily-built 0-row right schema (reused) */
+        ray_t* carry   = NULL;   /* running last-prevailing-quote per eq tuple */
+
+        /* Equality-key column name ids = keys_vec minus the trailing time key.
+         * The carry keys on the FULL eq tuple so (AAPL,NYSE) never matches an
+         * (AAPL,NASDAQ) carried quote. */
+        ray_t* eqn_kbx = NULL;
+        ray_t* eqn_kv  = unbox_vec_arg(keys_vec, &eqn_kbx);
+        int64_t  n_eq_c  = (is_list(eqn_kv) && ray_len(eqn_kv) >= 1) ? ray_len(eqn_kv) - 1 : 0;
+        ray_t*   eqn_hdr = NULL;
+        int64_t* eq_names = (int64_t*)scratch_alloc(&eqn_hdr,
+                (size_t)(n_eq_c ? n_eq_c : 1) * sizeof(int64_t));
+        if (!eq_names) {
+            if (eqn_kbx) ray_release(eqn_kbx);
+            ray_release(lparted); ray_release(rparted); ray_release(keys_vec);
+            return ray_error("oom", NULL);
+        }
+        {
+            ray_t** ke = (ray_t**)ray_data(eqn_kv);
+            for (int64_t k = 0; k < n_eq_c; k++) eq_names[k] = ke[k]->i64;
+        }
+        if (eqn_kbx) ray_release(eqn_kbx);
 
         while (i < l_ndates || j < r_ndates) {
             int32_t d;
@@ -14105,34 +14227,69 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
             /* Count every union day processed (once, O(1) — never per-row). */
             atomic_fetch_add_explicit(&ray_asof_perpart_runs_ctr, 1, memory_order_relaxed);
 
-            if (lseg < 0) continue;    /* quotes-only day → nothing to emit */
-
-            ray_t* day_l = asof_eval_select_segment(ldict, lparted, (int32_t)lseg);
-            if (!day_l || RAY_IS_ERR(day_l)) { err = day_l ? day_l : ray_error("type", NULL); break; }
-
-            ray_t* day_r;
+            /* Today's quote segment (owned), or NULL when this day has none. */
+            ray_t* day_r_seg = NULL;
             if (rseg >= 0) {
-                day_r = asof_eval_select_segment(rdict, rparted, (int32_t)rseg);
-                if (!day_r || RAY_IS_ERR(day_r)) { ray_release(day_l); err = day_r ? day_r : ray_error("type", NULL); break; }
-            } else {
-                /* trades-only day: no quote partition for d → empty right. */
-                if (!empty_r) {
-                    empty_r = asof_empty_right(rdict, rparted);
-                    if (!empty_r || RAY_IS_ERR(empty_r)) { ray_release(day_l); err = empty_r ? empty_r : ray_error("type", NULL); empty_r = NULL; break; }
-                }
-                day_r = empty_r; ray_retain(day_r);   /* balance the release below */
+                day_r_seg = asof_eval_select_segment(rdict, rparted, (int32_t)rseg);
+                if (!day_r_seg || RAY_IS_ERR(day_r_seg)) { err = day_r_seg ? day_r_seg : ray_error("type", NULL); break; }
             }
 
-            ray_t* part = ray_asof_join_core(keys_vec, day_l, day_r);
-            ray_release(day_l); ray_release(day_r);
-            if (!part || RAY_IS_ERR(part)) { err = part ? part : ray_error("type", NULL); break; }
+            /* qtab = prior carry rows PREPENDED to today's quotes.  Carry rows
+             * come FIRST: they hold their ORIGINAL prior-day timestamps (older
+             * than any day-d quote), so per-key time order stays ascending and
+             * the asof kernel resolves a first-of-day trade to the carried quote
+             * when no same-day quote precedes it.  A gap day (no quotes) reuses
+             * the carry table directly as the prevailing-quote view. */
+            ray_t* qtab = NULL;
+            if (day_r_seg && carry)  qtab = ray_result_merge(carry, day_r_seg);
+            else if (day_r_seg)    { qtab = day_r_seg; ray_retain(qtab); }
+            else if (carry)        { qtab = carry;     ray_retain(qtab); }
+            if (qtab && RAY_IS_ERR(qtab)) { err = qtab; qtab = NULL; if (day_r_seg) ray_release(day_r_seg); break; }
 
-            ray_t* merged = ray_result_merge(accum, part);  /* returns owned */
-            ray_release(part);
-            if (accum) ray_release(accum);
-            accum = merged;
-            if (!accum || RAY_IS_ERR(accum)) { err = accum; accum = NULL; break; }
+            /* Emit this day's trades (if any) against the prevailing-quote view. */
+            if (lseg >= 0) {
+                ray_t* day_l = asof_eval_select_segment(ldict, lparted, (int32_t)lseg);
+                if (!day_l || RAY_IS_ERR(day_l)) { err = day_l ? day_l : ray_error("type", NULL); if (qtab) ray_release(qtab); if (day_r_seg) ray_release(day_r_seg); break; }
+
+                ray_t* rt;
+                if (qtab) { rt = qtab; ray_retain(rt); }
+                else {
+                    /* No quote seen on or before this day → empty right: every
+                     * trade no-matches (null right cols), exactly as a genuine
+                     * first-appearance would (no stale carry slot invented). */
+                    if (!empty_r) {
+                        empty_r = asof_empty_right(rdict, rparted);
+                        if (!empty_r || RAY_IS_ERR(empty_r)) { err = empty_r ? empty_r : ray_error("type", NULL); empty_r = NULL; ray_release(day_l); if (day_r_seg) ray_release(day_r_seg); break; }
+                    }
+                    rt = empty_r; ray_retain(rt);
+                }
+
+                ray_t* part = ray_asof_join_core(keys_vec, day_l, rt);
+                ray_release(day_l); ray_release(rt);
+                if (!part || RAY_IS_ERR(part)) { err = part ? part : ray_error("type", NULL); if (qtab) ray_release(qtab); if (day_r_seg) ray_release(day_r_seg); break; }
+
+                ray_t* merged = ray_result_merge(accum, part);  /* returns owned */
+                ray_release(part);
+                if (accum) ray_release(accum);
+                accum = merged;
+                if (!accum || RAY_IS_ERR(accum)) { err = accum; accum = NULL; if (qtab) ray_release(qtab); if (day_r_seg) ray_release(day_r_seg); break; }
+            }
+
+            /* Refresh carry = group-last-by-eq(qtab) after a day that quoted.
+             * qtab holds (carry ∪ today's quotes) so a key that did NOT quote
+             * today keeps its carried row through the group-last. */
+            if (rseg >= 0) {
+                ray_t* nc = asof_carry_recompute(qtab, day_r_seg, eq_names, n_eq_c);
+                if (!nc || RAY_IS_ERR(nc)) { err = nc ? nc : ray_error("type", NULL); if (qtab) ray_release(qtab); ray_release(day_r_seg); break; }
+                if (carry) ray_release(carry);
+                carry = nc;
+            }
+
+            if (qtab) ray_release(qtab);
+            if (day_r_seg) ray_release(day_r_seg);
         }
+        scratch_free(eqn_hdr);
+        if (carry) ray_release(carry);
         if (empty_r) ray_release(empty_r);
         ray_release(lparted); ray_release(rparted); ray_release(keys_vec);
         if (err) { if (accum) ray_release(accum); return err; }

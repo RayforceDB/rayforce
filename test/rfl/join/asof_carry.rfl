@@ -1,0 +1,103 @@
+;; asof_carry.rfl — streaming parted asof carries the last prevailing quote
+;; ACROSS day partitions.
+;;
+;; The streaming parted asof (src/ops/query.c ray_asof_join_fn) runs the join
+;; one day at a time over the ascending union of both operands' DATE partitions.
+;; A running CARRY table (asof_carry_recompute) = the last prevailing quote per
+;; equality-key tuple, as of the end of each processed day, is PREPENDED to the
+;; next day's quote segment.  So a first-of-day trade — or a trade on a day its
+;; symbol is quiet — still resolves to the most recent PRIOR-day quote.  Carry
+;; rows keep their ORIGINAL prior-day timestamps, so a same-day quote at or
+;; before the trade always supersedes the (older) carry.
+;;
+;; Ground truth for every case is the FLAT in-memory oracle: concatenate all
+;; partitions into one table and run the eager asof (non-select operands →
+;; fallback path).  The streamed result must equal it column-for-column.
+;;
+;; Cases (single-key [Sym Time], §A):
+;;   1 cross-day match : a day-2 trade earlier than day-2's first quote for its
+;;                       sym matches the DAY-1 last quote.
+;;   2 gap             : sym quotes day 1, NONE day 2, trade day 2 → day-1 carry.
+;;   3 first appearance: sym with NO prior quote → null right (no stale slot).
+;;   5 timestamp keep  : carried quote keeps its day-1 timestamp (older than the
+;;                       trade) so the asof time-order is correct.
+;;   6 same-day beats  : an earlier SAME-DAY quote supersedes the stale carry.
+;; Case 4 (multi-key [Sym Ex Time], §B): carry keys on the FULL (Sym,Ex) tuple.
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; §A  single-key [Sym Time]
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_asof_carry_t /tmp/rfl_asof_carry_q")
+
+;; Day 1 (2024.01.01): quotes for a (:00 bid99, :02 bid100) and b (:01 bid50).
+(set Q1 (table [Sym Time Bid] (list [a a b] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:01.000000000] (as 'F64 [99.0 100.0 50.0]))))
+;; Day 1 trade: a @ :03 → same-day match a's :02 quote (bid100).
+(set T1 (table [Sym Time Price] (list [a] [2024.01.01D10:00:03.000000000] (as 'F64 [10.0]))))
+;; Day 2 (2024.01.02): quotes for a only (:01 bid150, :05 bid200).  b, c quiet.
+(set Q2 (table [Sym Time Bid] (list [a a] [2024.01.02D10:00:01.000000000 2024.01.02D10:00:05.000000000] (as 'F64 [150.0 200.0]))))
+;; Day 2 trades (input order preserved through the join):
+;;   a@:00 → CASE 1/5 carry day-1 bid100 (before day-2's first :01 quote)
+;;   a@:02 → CASE 6 same-day :01 bid150 supersedes the stale carry
+;;   a@:06 → same-day :05 bid200
+;;   b@:03 → CASE 2 gap: b never quoted day 2 → day-1 carry bid50
+;;   c@:04 → CASE 3 first appearance: c never quoted anywhere → null
+(set T2 (table [Sym Time Price] (list [a a a b c] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000 2024.01.02D10:00:06.000000000 2024.01.02D10:00:03.000000000 2024.01.02D10:00:04.000000000] (as 'F64 [20.0 21.0 22.0 30.0 40.0]))))
+
+(.db.splayed.set "/tmp/rfl_asof_carry_q/2024.01.01/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_carry_q/2024.01.02/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_carry_t/2024.01.01/trade/" T1)
+(.db.splayed.set "/tmp/rfl_asof_carry_t/2024.01.02/trade/" T2)
+(set Pt (.db.parted.get "/tmp/rfl_asof_carry_t/" 'trade))
+(set Pq (.db.parted.get "/tmp/rfl_asof_carry_q/" 'quote))
+
+;; flat oracle — every partition concatenated (day-ascending, trade input order).
+(set TF (table [Sym Time Price] (list [a a a a b c] [2024.01.01D10:00:03.000000000 2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000 2024.01.02D10:00:06.000000000 2024.01.02D10:00:03.000000000 2024.01.02D10:00:04.000000000] (as 'F64 [10.0 20.0 21.0 22.0 30.0 40.0]))))
+(set QF (table [Sym Time Bid] (list [a a b a a] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:01.000000000 2024.01.02D10:00:01.000000000 2024.01.02D10:00:05.000000000] (as 'F64 [99.0 100.0 50.0 150.0 200.0]))))
+
+;; ── (a) streaming ran: union of days = 2 (one per-part run each). ────────────
+(set Ba (at (.sys.mem) 'asof-perpart-runs))
+(set RS (asof-join [Sym Time] (select {from: Pt}) (select {from: Pq})))
+(set Aa (at (.sys.mem) 'asof-perpart-runs))
+(> Aa Ba) -- true
+(- Aa Ba) -- 2
+
+;; ── (b) parity vs the flat oracle + explicit carried-quote goldens. ──────────
+(set RF (asof-join [Sym Time] TF QF))
+(count RS) -- 6
+(count RS) -- (count RF)
+(at RS 'Price) -- (at RF 'Price)
+(at RS 'Bid)   -- (at RF 'Bid)
+;; Bid golden: [day1 same-day 100] [cross-day 100][same-day 150][same-day 200]
+;;             [gap 50][first-appearance null].
+(at RS 'Bid) -- (as 'F64 [100.0 100.0 150.0 200.0 50.0 0Nf])
+(at RS 'Price) -- (as 'F64 [10.0 20.0 21.0 22.0 30.0 40.0])
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; §B  multi-key [Sym Ex Time] — carry keys on the FULL (Sym,Ex) tuple.
+;;     Day-1 quotes (a,NYSE)=100 and (a,NASDAQ)=900; day 2 has NO quotes.  Two
+;;     day-2 trades, one per exchange, MUST each match their OWN carried bid — a
+;;     Sym-only carry would collapse them to one value.
+;; ════════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_asof_carry_mt /tmp/rfl_asof_carry_mq")
+(set MQ1 (table [Sym Ex Time Bid] (list [a a] [N Q] [2024.01.01D10:00:02.000000000 2024.01.01D10:00:02.000000000] (as 'F64 [100.0 900.0]))))
+(set MT2 (table [Sym Ex Time Price] (list [a a] [N Q] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:00.000000000] (as 'F64 [1.0 2.0]))))
+(.db.splayed.set "/tmp/rfl_asof_carry_mq/2024.01.01/quote/" MQ1)
+(.db.splayed.set "/tmp/rfl_asof_carry_mt/2024.01.02/trade/" MT2)
+(set MPt (.db.parted.get "/tmp/rfl_asof_carry_mt/" 'trade))
+(set MPq (.db.parted.get "/tmp/rfl_asof_carry_mq/" 'quote))
+
+(set MTF (table [Sym Ex Time Price] (list [a a] [N Q] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:00.000000000] (as 'F64 [1.0 2.0]))))
+(set MQF (table [Sym Ex Time Bid] (list [a a] [N Q] [2024.01.01D10:00:02.000000000 2024.01.01D10:00:02.000000000] (as 'F64 [100.0 900.0]))))
+
+(set MBa (at (.sys.mem) 'asof-perpart-runs))
+(set MRS (asof-join [Sym Ex Time] (select {from: MPt}) (select {from: MPq})))
+(set MAa (at (.sys.mem) 'asof-perpart-runs))
+;; union days = 2 (day-1 quotes-only refreshes carry, day-2 trades-only emits).
+(- MAa MBa) -- 2
+
+(set MRF (asof-join [Sym Ex Time] MTF MQF))
+(count MRS) -- 2
+(at MRS 'Bid) -- (at MRF 'Bid)
+;; the (a,NYSE) trade keeps 100, the (a,NASDAQ) trade keeps 900 — no tuple leak.
+(at MRS 'Bid) -- (as 'F64 [100.0 900.0])
+(at MRS 'Price) -- (as 'F64 [1.0 2.0])
