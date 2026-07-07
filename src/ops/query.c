@@ -14062,22 +14062,35 @@ static ray_t* asof_carry_recompute(ray_t* qtab, ray_t* template,
                                    const int64_t* eq_names, int64_t n_eq) {
     int64_t ncols = ray_table_ncols(template);
 
-    /* by: SYM vec of the full equality-key tuple (name ids). */
-    ray_t* by_vec = ray_vec_new(RAY_SYM, n_eq ? n_eq : 1);
-    if (!by_vec || RAY_IS_ERR(by_vec)) return by_vec ? by_vec : ray_error("oom", NULL);
-    by_vec->len = n_eq;
-    for (int64_t i = 0; i < n_eq; i++) ((int64_t*)ray_data(by_vec))[i] = eq_names[i];
+    /* Lone-time-key asof (n_eq == 0): the equality keys are OPTIONAL, so the
+     * carry is a SINGLE global row = the last quote across the whole day.  A
+     * present-but-0-length `by:` SYM vector does NOT mean "one global group" —
+     * the select by-clause compiler special-cases len==1 and len>1 only, and a
+     * 0-length by: degrades to an ungrouped PASSTHROUGH (every row survives),
+     * which would let the carry grow without bound across days.  So we emit the
+     * clause with NO by: entry at all — a whole-table `(select {c:(last c)}…)`
+     * aggregate, which yields exactly one row.  With eq keys present we build the
+     * by: SYM vec of the full equality-key tuple (name ids). */
+    bool has_by = (n_eq > 0);
+    ray_t* by_vec = NULL;
+    if (has_by) {
+        by_vec = ray_vec_new(RAY_SYM, n_eq);
+        if (!by_vec || RAY_IS_ERR(by_vec)) return by_vec ? by_vec : ray_error("oom", NULL);
+        by_vec->len = n_eq;
+        for (int64_t i = 0; i < n_eq; i++) ((int64_t*)ray_data(by_vec))[i] = eq_names[i];
+    }
 
     /* Clause dict: one `col: (last col)` projection per NON-eq column, plus
-     * by: and from:.  Slot count = (ncols - n_eq non-eq cols) + 2. */
+     * from: and (when eq keys exist) by:.  Slot count = non-eq cols + 1 (+1 for
+     * by: when has_by). */
     int64_t n_proj = ncols - n_eq;
     if (n_proj < 0) n_proj = 0;
-    int64_t nslot = n_proj + 2;
+    int64_t nslot = n_proj + (has_by ? 2 : 1);
     ray_t* keys = ray_vec_new(RAY_SYM, nslot);
-    if (!keys || RAY_IS_ERR(keys)) { ray_release(by_vec); return keys ? keys : ray_error("oom", NULL); }
+    if (!keys || RAY_IS_ERR(keys)) { if (by_vec) ray_release(by_vec); return keys ? keys : ray_error("oom", NULL); }
     keys->len = nslot;
     ray_t* vals = ray_list_new(nslot);
-    if (!vals || RAY_IS_ERR(vals)) { ray_release(by_vec); ray_release(keys); return vals ? vals : ray_error("oom", NULL); }
+    if (!vals || RAY_IS_ERR(vals)) { if (by_vec) ray_release(by_vec); ray_release(keys); return vals ? vals : ray_error("oom", NULL); }
     vals->len = nslot;
     int64_t* kids = (int64_t*)ray_data(keys);
 
@@ -14109,13 +14122,15 @@ static ray_t* asof_carry_recompute(ray_t* qtab, ray_t* template,
         s++;
     }
     if (!build_err) {
-        kids[s]  = ray_sym_intern("by", 2);
-        vals = ray_list_set(vals, s, by_vec);   /* retains */
-        s++;
+        if (has_by) {
+            kids[s]  = ray_sym_intern("by", 2);
+            vals = ray_list_set(vals, s, by_vec);   /* retains */
+            s++;
+        }
         kids[s]  = ray_sym_intern("from", 4);
         vals = ray_list_set(vals, s, qtab);      /* retains borrowed qtab */
     }
-    ray_release(by_vec);
+    if (by_vec) ray_release(by_vec);
     if (build_err) { ray_release(keys); ray_release(vals); return build_err; }
 
     ray_t* dict = ray_dict_new(keys, vals);      /* consumes keys + vals */
@@ -14206,7 +14221,21 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
         }
         {
             ray_t** ke = (ray_t**)ray_data(eqn_kv);
-            for (int64_t k = 0; k < n_eq_c; k++) eq_names[k] = ke[k]->i64;
+            for (int64_t k = 0; k < n_eq_c; k++) {
+                /* A quotes-only first day reaches asof_carry_recompute (via
+                 * eq_names) before ray_asof_join_core runs its own key
+                 * validation.  Reject a non-symbol equality key up front, the
+                 * same way ray_asof_join_core does, instead of reading a bogus
+                 * union field. */
+                if (ke[k]->type != -RAY_SYM) {
+                    int8_t kt = ke[k]->type;
+                    if (eqn_kbx) ray_release(eqn_kbx);
+                    scratch_free(eqn_hdr);
+                    ray_release(lparted); ray_release(rparted); ray_release(keys_vec);
+                    return ray_error("type", "asof-join: equality key must be a symbol, got %s", ray_type_name(kt));
+                }
+                eq_names[k] = ke[k]->i64;
+            }
         }
         if (eqn_kbx) ray_release(eqn_kbx);
 
@@ -14241,7 +14270,17 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
              * when no same-day quote precedes it.  A gap day (no quotes) reuses
              * the carry table directly as the prevailing-quote view. */
             ray_t* qtab = NULL;
-            if (day_r_seg && carry)  qtab = ray_result_merge(carry, day_r_seg);
+            if (day_r_seg && carry) {
+                qtab = ray_result_merge(carry, day_r_seg);
+                /* ray_result_merge / ray_vec_concat propagate OOM as a BARE
+                 * NULL, not a RAY_IS_ERR sentinel.  Both merge inputs are
+                 * non-NULL here, so a NULL result is a real merge failure — it
+                 * must NOT be confused with the legitimate "no carry and no
+                 * quotes" case (which leaves qtab NULL via the branches below).
+                 * Match the `!x || RAY_IS_ERR(x)` convention used everywhere
+                 * else in this loop. */
+                if (!qtab || RAY_IS_ERR(qtab)) { err = qtab ? qtab : ray_error("oom", NULL); qtab = NULL; ray_release(day_r_seg); break; }
+            }
             else if (day_r_seg)    { qtab = day_r_seg; ray_retain(qtab); }
             else if (carry)        { qtab = carry;     ray_retain(qtab); }
             if (qtab && RAY_IS_ERR(qtab)) { err = qtab; qtab = NULL; if (day_r_seg) ray_release(day_r_seg); break; }

@@ -1,0 +1,54 @@
+;; asof_lone_time_key.rfl — streaming parted asof with NO equality key.
+;;
+;; ray_asof_join_fn's contract: the equality keys are OPTIONAL.  A lone time key
+;; `(asof-join [Time] L R)` performs an UN-PARTITIONED asof over all rows — one
+;; global prevailing quote (n_eq == 0).  In the streaming parted path the cross-
+;; day carry must still work: a day-2 trade earlier than day-2's first quote must
+;; resolve to the single GLOBAL last quote carried from day 1.
+;;
+;; Ground truth is the FLAT oracle: concatenate all partitions into one table and
+;; run the eager asof (non-select operands → fallback path).  The streamed result
+;; must equal it column-for-column, and asof-perpart-runs must increment (proving
+;; the streaming per-day path — not the flat fallback — actually ran).
+
+(.sys.exec "rm -rf /tmp/rfl_asof_lone_t /tmp/rfl_asof_lone_q")
+
+;; Day 1 (2024.01.01): quotes @:00 bid99, @:02 bid100.
+(set Q1 (table [Time Bid] (list [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000] (as 'F64 [99.0 100.0]))))
+;; Day 1 trade: @:03 → same-day match the :02 quote (bid100).
+(set T1 (table [Time Price] (list [2024.01.01D10:00:03.000000000] (as 'F64 [10.0]))))
+;; Day 2 (2024.01.02): quotes @:01 bid150, @:05 bid200.
+(set Q2 (table [Time Bid] (list [2024.01.02D10:00:01.000000000 2024.01.02D10:00:05.000000000] (as 'F64 [150.0 200.0]))))
+;; Day 2 trades:
+;;   @:00 → CARRY: earlier than day-2's first (:01) quote → day-1 global last bid100
+;;   @:02 → same-day :01 bid150
+;;   @:06 → same-day :05 bid200
+(set T2 (table [Time Price] (list [2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000 2024.01.02D10:00:06.000000000] (as 'F64 [20.0 21.0 22.0]))))
+
+(.db.splayed.set "/tmp/rfl_asof_lone_q/2024.01.01/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_lone_q/2024.01.02/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_lone_t/2024.01.01/trade/" T1)
+(.db.splayed.set "/tmp/rfl_asof_lone_t/2024.01.02/trade/" T2)
+(set Pt (.db.parted.get "/tmp/rfl_asof_lone_t/" 'trade))
+(set Pq (.db.parted.get "/tmp/rfl_asof_lone_q/" 'quote))
+
+;; flat oracle — every partition concatenated (day-ascending, trade input order).
+(set TF (table [Time Price] (list [2024.01.01D10:00:03.000000000 2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000 2024.01.02D10:00:06.000000000] (as 'F64 [10.0 20.0 21.0 22.0]))))
+(set QF (table [Time Bid] (list [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.02D10:00:01.000000000 2024.01.02D10:00:05.000000000] (as 'F64 [99.0 100.0 150.0 200.0]))))
+
+;; ── (a) streaming ran: union of days = 2. ────────────────────────────────────
+(set Ba (at (.sys.mem) 'asof-perpart-runs))
+(set RS (asof-join [Time] (select {from: Pt}) (select {from: Pq})))
+(set Aa (at (.sys.mem) 'asof-perpart-runs))
+(> Aa Ba) -- true
+(- Aa Ba) -- 2
+
+;; ── (b) parity vs the flat oracle + explicit carried-quote goldens. ──────────
+(set RF (asof-join [Time] TF QF))
+(count RS) -- 4
+(count RS) -- (count RF)
+(at RS 'Price) -- (at RF 'Price)
+(at RS 'Bid)   -- (at RF 'Bid)
+;; Bid golden: [day1 same-day 100] [cross-day carry 100][same-day 150][same-day 200].
+(at RS 'Bid) -- (as 'F64 [100.0 100.0 150.0 200.0])
+(at RS 'Price) -- (as 'F64 [10.0 20.0 21.0 22.0])
