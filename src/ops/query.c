@@ -5594,8 +5594,14 @@ ray_t* ray_select(ray_t** args, int64_t n) {
          * Gated hard so the FLAT path stays byte-identical and correctness never
          * depends on the optimisation — any gate failure falls through to the
          * unchanged eager materialize below:
-         *   - input actually parted, and NO WHERE (a WHERE on a parted source
-         *     flattens before grouping anyway, so streaming can't apply);
+         *   - input actually parted.  A WHERE is now permitted: it installs a
+         *     rowsel over the parted table's global row space (segment order,
+         *     no flatten) and exec_group_parted applies it PER PARTITION,
+         *     composing with the per-partition materialization of the deferred
+         *     computed keys (both index the same segment rows).  A single-key
+         *     keys-only HAVING is still split off to post_group_where_expr
+         *     below; a value-column WHERE (the streaming case) stays a
+         *     selection and rides the per-partition path;
          *   - at least one output and EVERY output a plain group aggregate
          *     (non-agg / count-distinct / compound-arith outputs re-read the
          *     materialized key columns post-group — the deferred alias column is
@@ -5616,7 +5622,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
                 }
             }
         }
-        if (by_input_parted && where_expr == NULL && n_out > 0) {
+        if (by_input_parted && n_out > 0) {
             bool defer_ok = true;
             for (int64_t i = 0; i + 1 < dict_n && defer_ok; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
@@ -8140,7 +8146,21 @@ by_dict_done:
          * ignored before the filter was wired through the group
          * pipeline.) */
         if (where_expr) {
-            bool can_fuse = !has_nonagg_needing_flat && !table_is_parted;
+            /* Fused/lazy WHERE: exec_node(OP_FILTER) installs a rowsel on
+             * g->selection over the (possibly parted) table's global row space
+             * and returns it uncompacted; the group DAG built below then
+             * consumes that selection.  A PARTED source no longer forces the
+             * materialize path: exec_group_parted slices the global selection
+             * per partition and streams (see src/ops/group.c).  A non-agg
+             * output still needs the flat scatter view, so those keep the
+             * materialize path (has_nonagg_needing_flat already flattened the
+             * parted table above, clearing table_is_parted).  A count-distinct
+             * output over a PARTED source keeps the materialize path: its
+             * post-group scatter reads the flat filtered table, which the
+             * streaming per-partition kernel does not produce — only pure
+             * group aggregates fuse-and-stream over parted input. */
+            bool can_fuse = !has_nonagg_needing_flat &&
+                            (!table_is_parted || !has_cd_output);
             if (can_fuse) {
                 root = ray_optimize(g, root);
                 /* Slice-group fusion: when the WHERE predicate is exactly

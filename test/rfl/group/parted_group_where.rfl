@@ -1,0 +1,142 @@
+;; parted_group_where.rfl — WHERE-FILTERED parted GROUP BY that STREAMS the
+;; pushed-down selection per partition (exec_group_parted / Part A) and, for the
+;; computed by-dict headline, defers the computed keys over a filtered parted
+;; input (ray_select / Part B).
+;;
+;; Before this change a pushed-down WHERE (g->selection set) forced
+;; exec_group_parted onto the full-concat fallback — the streaming kernel never
+;; ran with a filter.  Now g->selection is a rowsel over the parted table's
+;; GLOBAL concatenated row space (segment order); exec_group_per_partition
+;; flattens it once, binary-searches each partition's [off_p, off_p+len_p)
+;; range, rebases the ids to partition-local, and installs them as each
+;; sub-group's own selection.  Zero-survivor partitions contribute an empty
+;; partial (correct empty handling).
+;;
+;; The (.sys.mem) 'group-perpart-runs counter increments once per
+;; exec_group_per_partition entry, so a strict increase proves the streaming
+;; kernel ran; parity with an identical-data flat in-memory oracle under the
+;; SAME WHERE proves correctness.
+;;
+;; Cardinality gate (exec_group_parted): est_groups*100 <= rows_per_part with
+;; rows_per_part = total_rows/n_parts (UNFILTERED — models the concat fallback's
+;; cost), est_groups capped by post-filter survivor density.  400 rows/partition
+;; with 2-value keys keeps est_groups small so every filtered shape below clears.
+
+;; ─── fixture: 4 partitions, 400 rows each ────────────────────────────────────
+;;   ts = 0..399 (same every partition)  → (xbar ts 200) = {0,200}, 2 buckets
+;;   sg = (% (til 400) 2) as SYM         → 2-value symbol key
+;;   v  = 0..399 (same every partition)  → uniform filter selectivity for (a)-(c)
+;;   u  = base_p + 0..399, base_p ∈ {0,400,800,1200} → partition-varying column
+;;        used to zero out a whole partition in (d)
+(set N 400)
+(set TS (til N))
+(set SG (as 'SYM (% (til N) 2)))
+(set V  (as 'F64 (til N)))
+(set U1 (til N))
+(set U2 (+ 400  (til N)))
+(set U3 (+ 800  (til N)))
+(set U4 (+ 1200 (til N)))
+(set P1 (table [ts sg v u] (list TS SG V U1)))
+(set P2 (table [ts sg v u] (list TS SG V U2)))
+(set P3 (table [ts sg v u] (list TS SG V U3)))
+(set P4 (table [ts sg v u] (list TS SG V U4)))
+(.sys.exec "rm -rf /tmp/rfl_pgwh")
+(.db.splayed.set "/tmp/rfl_pgwh/1/t/" P1)
+(.db.splayed.set "/tmp/rfl_pgwh/2/t/" P2)
+(.db.splayed.set "/tmp/rfl_pgwh/3/t/" P3)
+(.db.splayed.set "/tmp/rfl_pgwh/4/t/" P4)
+(set Pw (.db.parted.get "/tmp/rfl_pgwh/" 't))
+
+;; identical-data flat in-memory oracle (part1..part4 rows, same order)
+(set TSA (concat (concat TS TS) (concat TS TS)))
+(set SGA (concat (concat SG SG) (concat SG SG)))
+(set VA  (concat (concat V V)   (concat V V)))
+(set UA  (concat (concat U1 U2) (concat U3 U4)))
+(set TF (table [ts sg v u] (list TSA SGA VA UA)))
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (a) BARE KEY + FILTER — `by: sg where: (> v 100)`.  Selection streams per
+;;     partition (Part A); est_groups = 2 clears the gate.
+;; ══════════════════════════════════════════════════════════════════════════
+(set Ba (at (.sys.mem) 'group-perpart-runs))
+(set RPa (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) by: sg from: Pw where: (> v 100) asc: sg}))
+(set Aa (at (.sys.mem) 'group-perpart-runs))
+;; PROVES exec_group_per_partition ran with a pushed-down selection.
+(> Aa Ba) -- true
+(set RFa (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) by: sg from: TF where: (> v 100) asc: sg}))
+(count RPa) -- 2
+(count RPa) -- (count RFa)
+(at RPa 'sg)  -- (at RFa 'sg)
+(at RPa 'sv)  -- (at RFa 'sv)
+(at RPa 'cv)  -- (at RFa 'cv)
+(at RPa 'mnv) -- (at RFa 'mnv)
+(at RPa 'mxv) -- (at RFa 'mxv)
+(< (max (abs (- (at RPa 'av) (at RFa 'av)))) 0.000001) -- true
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (b) FILTERED OPTIONS HEADLINE — `by: {tb: (xbar ts 200) s: sg} where: (> v
+;;     100)`.  The computed+rename by-dict is DEFERRED over the FILTERED parted
+;;     input (Part B) and the per-partition selection composes with the
+;;     per-partition xbar key materialization (Part A).  est_groups = 2*2 = 4,
+;;     4*100 = 400 <= 400 clears the gate.
+;; ══════════════════════════════════════════════════════════════════════════
+(set Bb (at (.sys.mem) 'group-perpart-runs))
+(set RPb (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) by: {tb: (xbar ts 200) s: sg} from: Pw where: (> v 100) asc: tb}))
+(set Ab (at (.sys.mem) 'group-perpart-runs))
+;; PROVES exec_group_per_partition ran for the filtered computed by-dict.
+(> Ab Bb) -- true
+(set RFb (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) by: {tb: (xbar ts 200) s: sg} from: TF where: (> v 100) asc: tb}))
+(count RPb) -- 4
+(count RPb) -- (count RFb)
+(at RPb 'tb)  -- (at RFb 'tb)
+(at RPb 's)   -- (at RFb 's)
+(at RPb 'sv)  -- (at RFb 'sv)
+(at RPb 'cv)  -- (at RFb 'cv)
+(at RPb 'mnv) -- (at RFb 'mnv)
+(at RPb 'mxv) -- (at RFb 'mxv)
+(< (max (abs (- (at RPb 'av) (at RFb 'av)))) 0.000001) -- true
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (c) HIGH-SELECTIVITY FILTER — `by: sg where: (> v 395)`.  Only v in 396..399
+;;     survive: 4 rows/partition × 4 partitions = 16 survivors spread across
+;;     ALL partitions.  Still streams (est_groups capped by survivor density);
+;;     parity confirms sparse per-partition slicing is correct.
+;; ══════════════════════════════════════════════════════════════════════════
+(set Bc (at (.sys.mem) 'group-perpart-runs))
+(set RPc (select {sv: (sum v) cv: (count v) by: sg from: Pw where: (> v 395) asc: sg}))
+(set Ac (at (.sys.mem) 'group-perpart-runs))
+;; PROVES exec_group_per_partition ran even with few survivors per partition.
+(> Ac Bc) -- true
+(set RFc (select {sv: (sum v) cv: (count v) by: sg from: TF where: (> v 395) asc: sg}))
+(count RPc) -- (count RFc)
+(at RPc 'sg) -- (at RFc 'sg)
+(at RPc 'sv) -- (at RFc 'sv)
+(at RPc 'cv) -- (at RFc 'cv)
+;; survivors: v ∈ {396,398} (even sg=0) and {397,399} (odd sg=1), ×4 partitions
+(at RPc 'cv) -- [8 8]
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (d) EMPTY-PARTITION HANDLING — a WHERE that filters out an ENTIRE partition.
+;;     (d1) `> u 700`: P1 (u 0..399) contributes ZERO survivors — it is the
+;;          FIRST partition, built as the empty schema reference.
+;;     (d2) `< u 1200`: P4 (u 1200..1599) contributes ZERO survivors — a LATER
+;;          partition, short-circuited (skipped).  Both assert parity.
+;; ══════════════════════════════════════════════════════════════════════════
+(set RPd1 (select {sv: (sum v) cv: (count v) mnv: (min v) by: sg from: Pw where: (> u 700) asc: sg}))
+(set RFd1 (select {sv: (sum v) cv: (count v) mnv: (min v) by: sg from: TF where: (> u 700) asc: sg}))
+(count RPd1) -- (count RFd1)
+(at RPd1 'sg)  -- (at RFd1 'sg)
+(at RPd1 'sv)  -- (at RFd1 'sv)
+(at RPd1 'cv)  -- (at RFd1 'cv)
+(at RPd1 'mnv) -- (at RFd1 'mnv)
+
+(set RPd2 (select {sv: (sum v) cv: (count v) mxv: (max v) by: sg from: Pw where: (< u 1200) asc: sg}))
+(set RFd2 (select {sv: (sum v) cv: (count v) mxv: (max v) by: sg from: TF where: (< u 1200) asc: sg}))
+(count RPd2) -- (count RFd2)
+(at RPd2 'sg)  -- (at RFd2 'sg)
+(at RPd2 'sv)  -- (at RFd2 'sv)
+(at RPd2 'cv)  -- (at RFd2 'cv)
+(at RPd2 'mxv) -- (at RFd2 'mxv)
+
+;; ─── cleanup ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_pgwh")

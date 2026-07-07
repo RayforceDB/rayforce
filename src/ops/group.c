@@ -6034,9 +6034,11 @@ static int group_expr_src_syms(ray_graph_t* g, uint32_t root_id,
  * plain PARTED columns) into a throwaway sub-table, evaluates `root` via
  * exec_node with g->table swapped to that sub-table (the same mechanism the
  * flat key-expression path uses), and returns a fresh vec of the partition's
- * row count — caller releases — or NULL on any failure.  g->selection is
- * guaranteed NULL on the per-partition path (checked in exec_group_parted),
- * so exec_node applies no filtering. */
+ * row count — caller releases — or NULL on any failure.  Only pure row-local
+ * element-wise subtrees are admitted here, and those do not consult
+ * g->selection, so this materialization is unfiltered regardless of whether a
+ * pushed-down WHERE is active (the per-partition sub-group applies the
+ * filter, not the key materialization). */
 static ray_t* group_eval_part_expr(ray_graph_t* g, ray_t* parted_tbl,
                                    const int64_t* src_syms, int n_src,
                                    uint32_t root, int32_t p) {
@@ -6094,8 +6096,15 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     /* Check eligibility for per-partition exec + merge:
      * - All keys and agg inputs must be simple SCANs
      * - Supported agg ops: SUM, COUNT, MIN, MAX, AVG, FIRST, LAST,
-     *   STDDEV, STDDEV_POP, VAR, VAR_POP */
-    int can_partition = g->selection ? 0 : 1;
+     *   STDDEV, STDDEV_POP, VAR, VAR_POP
+     *
+     * A pushed-down WHERE (g->selection set) no longer forces the concat
+     * fallback: g->selection is a rowsel over the parted table's GLOBAL
+     * concatenated row space (segment order, nrows == ray_parted_nrows —
+     * the same order OP_SCAN flattens partitions in), so it can be sliced
+     * per partition and applied as each sub-table's own local selection.
+     * exec_group_per_partition performs that translation. */
+    int can_partition = 1;
     int has_avg = 0;
     int has_stddev = 0;
     /* Exact-size scratch carves — n_keys/n_aggs are uint8_t (up to 255 on the
@@ -6214,6 +6223,13 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
     }
     #undef GP_BORROW_ADD
 
+    /* Per-partition WHERE needs at least one real borrowed source column to
+     * carry the selection's surviving rows into each sub-table.  With none
+     * (e.g. a COUNT grouped solely by MAPCOMMON keys) the sub-table would be
+     * empty and the local selection could not be applied — fall back to the
+     * concat path, which applies g->selection over the flattened table. */
+    if (g->selection && n_borrow == 0) can_partition = 0;
+
     /* Cardinality gate: estimate groups from first partition.
      * Per-partition only wins when #groups << partition_size. */
     if (can_partition) {
@@ -6293,6 +6309,22 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
             }
             est_groups *= card;
             if (est_groups > rows_per_part) { est_groups = rows_per_part; break; }
+        }
+        /* Post-filter cap: est_groups is estimated from partition 0's
+         * UNFILTERED rows, but a pushed-down WHERE lets a partition yield at
+         * most one group per SURVIVING row.  Without this cap a selective
+         * filter over a genuinely low-cardinality group-by would be judged
+         * high-cardinality against the (still-unfiltered) rows_per_part and
+         * wrongly forced onto the concat path — which materialises ALL rows,
+         * exactly the work per-partition streaming avoids.  rows_per_part
+         * itself stays on total_rows: it models the concat fallback's cost
+         * (that path flattens every row, not just survivors), so the density
+         * test correctly keeps low-cardinality group-bys streaming even when
+         * the filter is highly selective (few survivors). */
+        if (g->selection) {
+            ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
+            int64_t pass_per_part = sm->total_pass / (n_parts > 0 ? n_parts : 1);
+            if (est_groups > pass_per_part) est_groups = pass_per_part;
         }
         /* Block per-partition when cardinality is high AND the concat
          * fallback would fit in memory (< 4 GB estimated).  When concat is
@@ -11181,6 +11213,20 @@ cleanup:
     return result;
 }
 
+/* Smallest index i in a[0..n) with a[i] >= key (lower_bound over a SORTED
+ * ascending int64 array).  Used to slice the flattened global selection ids
+ * into per-partition ranges. */
+static inline int64_t grp_sorted_lower_bound(const int64_t* a, int64_t n,
+                                             int64_t key) {
+    int64_t lo = 0, hi = n;
+    while (lo < hi) {
+        int64_t mid = lo + ((hi - lo) >> 1);
+        if (a[mid] < key) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
 /* --------------------------------------------------------------------------
  * exec_group_per_partition — per-partition GROUP BY with merge
  *
@@ -11191,6 +11237,15 @@ cleanup:
  * AVG: decomposed into SUM+COUNT per partition, merged, then divided.
  * STDDEV/VAR: decomposed into SUM(x)+SUM(x²)+COUNT(x) per partition,
  *   merged with SUM, then final variance/stddev computed from merged totals.
+ *
+ * Pushed-down WHERE (g->selection set): the global selection covers the parted
+ * table's concatenated row space in segment order.  It is flattened once to a
+ * sorted global-id array, g->selection is cleared for the duration (so the
+ * per-partition key/agg materialization runs unfiltered), and each partition's
+ * range [off_p, off_p+len_p) is binary-searched out, rebased to partition-local
+ * ids, and installed as that sub-group's own local selection.  The original
+ * g->selection is restored before returning so the concat fallback still sees
+ * it when this path declines.
  *
  * Returns NULL if any step fails (caller falls through to concat path).
  * -------------------------------------------------------------------------- */
@@ -11230,6 +11285,19 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     size_t pna_n = part_n_aggs_max ? part_n_aggs_max : 1;
 
     ray_t* ret = NULL;   /* pp_cleanup return value (NULL on any early bail) */
+
+    /* Pushed-down WHERE state (Part A).  saved_sel is captured now and
+     * g->selection cleared later (in the setup block below) so the setup's
+     * failures before that point leave g->selection untouched; pp_cleanup
+     * always restores it.  All carves/blocks freed in pp_cleanup. */
+    ray_t*   saved_sel     = g->selection;
+    ray_t*   sel_ids_block = NULL;
+    const int64_t* sel_ids = NULL;
+    int64_t  sel_total     = 0;
+    ray_t*   part_off_hdr  = NULL;
+    int64_t* part_off      = NULL;   /* [n_parts+1] global prefix-sum offsets */
+    ray_t*   local_ids_hdr = NULL;
+    int64_t* local_ids     = NULL;   /* [max_part_len] rebased-id scratch     */
 
     /* key-scoped carves (sized n_keys) */
     ray_t *mc_sym_ids_hdr = NULL, *pk_syms_hdr = NULL,
@@ -11283,9 +11351,61 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     }
 
     /* LIMIT pushdown: when all GROUP BY keys are MAPCOMMON (n_part_keys==0),
-     * each partition produces exactly 1 group.  Limit the partition loop. */
-    if (group_limit > 0 && n_part_keys == 0 && group_limit < n_parts)
+     * each partition produces exactly 1 group.  Limit the partition loop.
+     * Disabled under a pushed-down WHERE: a filtered partition may yield 0
+     * groups (all rows filtered out), breaking the "1 group per partition"
+     * assumption the limit relies on — the outer take/limit truncates the
+     * merged result instead. */
+    if (group_limit > 0 && n_part_keys == 0 && group_limit < n_parts && !saved_sel)
         n_parts = (int32_t)group_limit;
+
+    /* Pushed-down WHERE setup (Part A): flatten the global selection once,
+     * clear g->selection for the materialization phase, and precompute the
+     * per-partition global row offsets (prefix sum of segment lengths, which
+     * every column shares).  Any failure here routes through pp_cleanup →
+     * NULL → the caller's concat fallback (which still has g->selection). */
+    if (saved_sel) {
+        ray_rowsel_t* sm = ray_rowsel_meta(saved_sel);
+        sel_total     = sm->total_pass;
+        sel_ids_block = ray_rowsel_to_indices(saved_sel);
+        if (!sel_ids_block) goto pp_cleanup;   /* OOM → concat fallback */
+        sel_ids = (const int64_t*)ray_data(sel_ids_block);
+        g->selection = NULL;                   /* restored in pp_cleanup */
+
+        part_off = scratch_alloc(&part_off_hdr,
+                                 (size_t)(n_parts + 1) * sizeof(int64_t));
+        if (!part_off) goto pp_cleanup;
+
+        /* Reference column for per-partition lengths: any PARTED column (seg
+         * len) or MAPCOMMON (counts[p]).  All columns share partition
+         * boundaries, so any one is authoritative. */
+        int64_t pncols = ray_table_ncols(parted_tbl);
+        ray_t*  ref    = NULL;
+        for (int64_t c = 0; c < pncols; c++) {
+            ray_t* col = ray_table_get_col_idx(parted_tbl, c);
+            if (col && (RAY_IS_PARTED(col->type) ||
+                        col->type == RAY_MAPCOMMON)) { ref = col; break; }
+        }
+        if (!ref) goto pp_cleanup;
+        const int64_t* mc_counts = (ref->type == RAY_MAPCOMMON)
+            ? (const int64_t*)ray_data(((ray_t**)ray_data(ref))[1]) : NULL;
+        ray_t** ref_segs = (ref->type == RAY_MAPCOMMON)
+            ? NULL : (ray_t**)ray_data(ref);
+        int64_t cum = 0, max_len = 0;
+        for (int32_t p = 0; p < n_parts; p++) {
+            part_off[p] = cum;
+            int64_t len_p = mc_counts ? mc_counts[p]
+                          : (ref_segs[p] ? ref_segs[p]->len : 0);
+            cum += len_p;
+            if (len_p > max_len) max_len = len_p;
+        }
+        part_off[n_parts] = cum;
+
+        local_ids = scratch_alloc(&local_ids_hdr,
+                                  (size_t)(max_len > 0 ? max_len : 1) * sizeof(int64_t));
+        if (!local_ids) goto pp_cleanup;
+        if (ray_interrupted()) { ret = ray_error("cancel", NULL); goto pp_cleanup; }
+    }
 
     /* Decomposition: AVG(x) → SUM(x) + COUNT(x).
      * STDDEV/VAR(x) → SUM(x) + SUM(x²) + COUNT(x).
@@ -11377,6 +11497,11 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         /* Pass 1: exec_group each partition in this batch */
         ray_t* bp[MERGE_BATCH];
         memset(bp, 0, sizeof(bp));
+        /* First BUILT partial in this batch — the schema/type reference used
+         * below when there is no `running` yet (first batch).  Zero-survivor
+         * partitions may be skipped (bp[bi] left NULL), but the reference
+         * partition is always built, so ref_bi stays valid. */
+        int32_t ref_bi = -1;
 
         for (int32_t bi = 0; bi < batch_n; bi++) {
             int32_t p = batch_start + bi;
@@ -11392,6 +11517,28 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             }
             ray_progress_update("group", "per-partition aggregate",
                                 (uint64_t)p, (uint64_t)n_parts);
+
+            /* Pushed-down WHERE: slice this partition's surviving global row
+             * ids out of the sorted flattened selection.  A partition with
+             * zero survivors contributes no groups — skip its sub-table build
+             * and group execution entirely (bp[bi] stays NULL; the merge
+             * concat loop is NULL-safe), provided a schema reference already
+             * exists (a prior `running` result or an earlier built partial in
+             * this batch).  The reference partition is never skipped, so the
+             * bp[ref_bi] type lookups below always resolve. */
+            int64_t sel_off = 0, sel_len = 0, sel_lo = 0, sel_cnt = -1;
+            if (saved_sel) {
+                sel_off = part_off[p];
+                sel_len = part_off[p + 1] - sel_off;
+                sel_lo  = grp_sorted_lower_bound(sel_ids, sel_total, sel_off);
+                int64_t sel_hi = grp_sorted_lower_bound(sel_ids, sel_total,
+                                                        sel_off + sel_len);
+                sel_cnt = sel_hi - sel_lo;
+                if (sel_cnt == 0 && (running || ref_bi >= 0)) {
+                    bp[bi] = NULL;
+                    continue;
+                }
+            }
 
             /* Build the per-partition sub-table.  It carries (a) the borrow
              * set — the deduped plain PARTED source columns every scan key,
@@ -11481,11 +11628,33 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             ray_op_t* proot = ray_group(pg, pkeys, n_part_keys,
                                        part_ops, pagg_ins, part_n_aggs);
             proot = ray_optimize(pg, proot);
+
+            /* Pushed-down WHERE: translate this partition's global survivor
+             * ids to partition-LOCAL ids (rebased by sel_off) and install them
+             * as pg's own selection.  Its nrows MUST equal the sub-table row
+             * count (exec_group_run's selection-shape guard rejects a mismatch
+             * — fail-loud); part_nrows (the borrow segment length) equals
+             * sel_len (the reference column's segment length) by the parted
+             * partition invariant, so build the local rowsel over sel_len.
+             * ray_graph_free(pg) releases pg->selection. */
+            if (saved_sel) {
+                if (part_nrows >= 0 && part_nrows != sel_len) {
+                    ray_graph_free(pg); ray_release(sub); goto batch_fail;
+                }
+                for (int64_t j = 0; j < sel_cnt; j++)
+                    local_ids[j] = sel_ids[sel_lo + j] - sel_off;
+                ray_t* lsel = ray_index_rowsel_from_ids(sel_len, local_ids,
+                                                        sel_cnt);
+                if (!lsel) { ray_graph_free(pg); ray_release(sub); goto batch_fail; }
+                pg->selection = lsel;
+            }
+
             bp[bi] = ray_execute(pg, proot);
             ray_graph_free(pg);
             ray_release(sub);
 
             if (!bp[bi] || RAY_IS_ERR(bp[bi])) goto batch_fail;
+            if (ref_bi < 0) ref_bi = bi;   /* first built partial in this batch */
 
             /* Capture agg column name IDs once (all partials share names) */
             if (!agg_names_captured) {
@@ -11528,7 +11697,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 ray_t* mc_col = ray_table_get_col(parted_tbl, key_syms[k]);
                 tref = ((ray_t**)ray_data(mc_col))[0];
             } else {
-                tref = ray_table_get_col(bp[0], key_syms[k]);
+                /* ref_bi = first built partial (skipped zero-survivor
+                 * partitions leave bp[bi] NULL); always >= 0 here. */
+                tref = ray_table_get_col(bp[ref_bi >= 0 ? ref_bi : 0], key_syms[k]);
             }
             if (!tref) goto batch_fail;
 
@@ -11627,7 +11798,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             }
             ray_t* tref = running
                 ? ray_table_get_col_idx(running, (int64_t)n_keys + a)
-                : ray_table_get_col_idx(bp[0], (int64_t)n_part_keys + a);
+                : ray_table_get_col_idx(bp[ref_bi >= 0 ? ref_bi : 0],
+                                        (int64_t)n_part_keys + a);
             if (!tref) goto batch_fail;
 
             /* SYM partials (FIRST/LAST/MIN/MAX) keep their partition's
@@ -11936,6 +12108,13 @@ pp_cleanup:
     scratch_free(pagg_ins_hdr);
     scratch_free(magg_ins_hdr);
     scratch_free(unique_agg_hdr);
+    /* Pushed-down WHERE cleanup: free the flattened-ids block and offset/
+     * local-id scratch, and restore the caller's global selection (needed by
+     * the concat fallback when this path returns NULL). */
+    if (sel_ids_block) ray_release(sel_ids_block);
+    scratch_free(part_off_hdr);
+    scratch_free(local_ids_hdr);
+    g->selection = saved_sel;
     return ret;
 }
 
