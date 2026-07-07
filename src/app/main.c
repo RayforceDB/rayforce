@@ -33,6 +33,7 @@
 #include "store/journal.h"
 #include "ops/internal.h"
 #include "ops/idxop.h"
+#include "mem/heap.h"
 #include <rayforce.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,31 @@
 #include <errno.h>
 #include <signal.h>
 #include <unistd.h>
+
+/* Parse a byte size with an optional K/M/G/T suffix (base-1024).  Returns
+ * the byte count, or -1 on a malformed value.  Used by the -m/--mem RAM
+ * budget flag: allocations that would push the anonymous (RAM-resident)
+ * footprint past this bound spill to a disk-backed mapping instead of
+ * OOM-ing (see ray_heap_set_anon_watermark). */
+static int64_t parse_size_arg(const char* s) {
+    if (!s || !*s) return -1;
+    char* end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno != 0 || end == s || v < 0) return -1;
+    int64_t mult = 1;
+    if (*end) {
+        switch (*end) {
+            case 'k': case 'K': mult = 1LL << 10; break;
+            case 'm': case 'M': mult = 1LL << 20; break;
+            case 'g': case 'G': mult = 1LL << 30; break;
+            case 't': case 'T': mult = 1LL << 40; break;
+            default: return -1;
+        }
+        if (end[1] != '\0') return -1;   /* trailing junk after the suffix */
+    }
+    return (int64_t)(v * (double)mult);
+}
 
 int main(int argc, char** argv) {
     /* Install the fatal-signal handler first: a crash during startup
@@ -111,10 +137,19 @@ int main(int argc, char** argv) {
             log_base = argv[++i];
             log_mode = RAY_JOURNAL_SYNC;
         }
+        else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mem") == 0) && i + 1 < argc) {
+            int64_t wm = parse_size_arg(argv[++i]);
+            if (wm <= 0) {
+                fprintf(stderr, "error: -m/--mem expects a size like 4G, 512M, or a byte count\n");
+                ray_runtime_destroy(rt);
+                return 1;
+            }
+            ray_heap_set_anon_watermark(wm);
+        }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             fprintf(stdout,
                 "usage: %s [-f file] [-p port] [-c cores] [-t 0|1] [-i]"
-                " [-u PW | -U PW] [-l BASE | -L BASE] [file.rfl] [-- app args]\n"
+                " [-u PW | -U PW] [-l BASE | -L BASE] [-m SIZE] [file.rfl] [-- app args]\n"
                 "  -f, --file FILE     run script file (or pass as a positional arg)\n"
                 "  -p, --port PORT     listen for IPC clients on PORT\n"
                 "  -c, --cores N       worker-pool size (0 = auto: ncpu - 1, default)\n"
@@ -124,6 +159,8 @@ int main(int argc, char** argv) {
                 "  -U PW               set restricted auth password\n"
                 "  -l BASE             enable journal logging (BASE.log + BASE.qdb)\n"
                 "  -L BASE             enable journal logging with fsync per write\n"
+                "  -m, --mem SIZE      RAM budget (e.g. 4G, 512M); allocations past it\n"
+                "                      spill to disk instead of OOM (default: physical RAM)\n"
                 "  -h, --help          show this message\n"
                 "  --                  pass following args to the app; read\n"
                 "                      them in Rayfall via (.sys.args)\n"

@@ -228,6 +228,12 @@ static inline bool ray_direct_file_backed(const ray_t* v) {
  * the OOM killer.  ray_heap_set_anon_watermark overrides the threshold (0
  * restores the default); intended for diagnostics and tests. */
 int64_t ray_heap_anon_committed(void);
+/* High-water mark of the anon-committed footprint since process start — the
+ * peak RAM an operator actually demanded (pools + direct; excludes spill). */
+int64_t ray_heap_anon_peak(void);
+/* Current anon watermark in bytes (the effective spill threshold; resolves 0
+ * to total physical RAM). */
+int64_t ray_heap_anon_watermark(void);
 void    ray_heap_set_anon_watermark(int64_t bytes);
 
 /* --------------------------------------------------------------------------

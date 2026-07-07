@@ -248,6 +248,22 @@ static _Atomic(int64_t) g_direct_count = 0;
  * spill file instead — this never rejects work, it just picks disk over RAM. */
 static _Atomic(int64_t) g_anon_committed = 0;
 static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = default to physical RAM */
+static _Atomic(int64_t) g_anon_peak      = 0;   /* high-water of g_anon_committed */
+
+/* Commit `bytes` of anonymous (RAM-resident) footprint and advance the peak
+ * high-water.  Called only from the two anon-commit sites; file-backed spill
+ * mappings never call this (they must not count toward the RAM watermark). */
+static void heap_anon_commit(int64_t bytes) {
+    int64_t nv = atomic_fetch_add_explicit(&g_anon_committed, bytes,
+                                            memory_order_relaxed) + bytes;
+    int64_t pk = atomic_load_explicit(&g_anon_peak, memory_order_relaxed);
+    while (nv > pk &&
+           !atomic_compare_exchange_weak_explicit(&g_anon_peak, &pk, nv,
+                                                   memory_order_relaxed,
+                                                   memory_order_relaxed)) {
+        /* pk reloaded with the current value on failure; retry. */
+    }
+}
 
 /* Threshold above which anon allocations spill to disk.  Default keeps our
  * anon footprint within physical RAM (swap + page cache stay as headroom). */
@@ -265,6 +281,12 @@ static bool heap_anon_would_exceed(size_t bytes) {
 
 int64_t ray_heap_anon_committed(void) {
     return atomic_load_explicit(&g_anon_committed, memory_order_relaxed);
+}
+int64_t ray_heap_anon_peak(void) {
+    return atomic_load_explicit(&g_anon_peak, memory_order_relaxed);
+}
+int64_t ray_heap_anon_watermark(void) {
+    return heap_anon_watermark();
 }
 void ray_heap_set_anon_watermark(int64_t bytes) {
     atomic_store_explicit(&g_anon_watermark, bytes < 0 ? 0 : bytes,
@@ -603,8 +625,7 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
     h->pool_count++;
 
     if (swap_fd < 0)   /* anonymous pool: counts toward the RAM watermark */
-        atomic_fetch_add_explicit(&g_anon_committed, (int64_t)pool_size,
-                                  memory_order_relaxed);
+        heap_anon_commit((int64_t)pool_size);
 
     return true;
 }
@@ -1126,8 +1147,7 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size) {
         if (!base) return NULL;
     }
     if (swap_fd < 0)   /* anonymous: counts toward the RAM watermark */
-        atomic_fetch_add_explicit(&g_anon_committed, (int64_t)map_size,
-                                  memory_order_relaxed);
+        heap_anon_commit((int64_t)map_size);
 
     ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)base;
     hdr->map_size  = map_size;
