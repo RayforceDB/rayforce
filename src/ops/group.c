@@ -10941,23 +10941,68 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;
 
-    /* Width guard STAYS (unbounded-slots cut 4): this per-partition optimizer
-     * keeps fixed [8]/[24] arrays (mc_sym_ids/pk_syms/per-agg decomposition).
-     * It is NOT the server of wide parted groups — on NULL here exec_group_parted
-     * falls back to the concat path, which materializes the needed columns into
-     * one flat table and recurses through exec_group, reaching the now-unbounded
-     * v2/legacy machinery.  So a >8-key/>8-agg parted group is served correctly
-     * (via concat), just without this per-partition materialization-avoidance.
-     * Each AVG adds 1 extra (COUNT), each STDDEV/VAR adds 2 (SUM_SQ + COUNT). */
-    if (n_aggs > 8 || n_keys > 8) return NULL;
+    /* Unbounded-slots: this per-partition optimizer sizes its key/agg scratch
+     * from the query's true n_keys/n_aggs (was capped at [8]/[24]).  A pre-pass
+     * counts the AVG/STDDEV/VAR decompositions so the appended-slot arrays are
+     * sized exactly: each AVG adds 1 COUNT slot, each STDDEV/VAR adds 2 slots
+     * (SUM(x²) + COUNT).  All carves are freed via the pp_cleanup epilogue on
+     * every return path. */
+    uint32_t n_avg = 0, n_std = 0;
+    for (uint32_t a = 0; a < n_aggs; a++) {
+        uint16_t aop = ext->agg_ops[a];
+        if (aop == OP_AVG) n_avg++;
+        else if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
+                 aop == OP_VAR || aop == OP_VAR_POP) n_std++;
+    }
+    uint32_t part_n_aggs_max = n_aggs + n_avg + 2 * n_std;
+
+    size_t key_n = n_keys ? n_keys : 1;             /* min-1 guarded */
+    size_t agg_n = n_aggs ? n_aggs : 1;
+    size_t pna_n = part_n_aggs_max ? part_n_aggs_max : 1;
+
+    ray_t* ret = NULL;   /* pp_cleanup return value (NULL on any early bail) */
+
+    /* key-scoped carves (sized n_keys) */
+    ray_t *mc_sym_ids_hdr = NULL, *pk_syms_hdr = NULL,
+          *pkeys_hdr = NULL, *mkeys_hdr = NULL;
+    int64_t*   mc_sym_ids = scratch_alloc(&mc_sym_ids_hdr, key_n * sizeof(int64_t));
+    int64_t*   pk_syms    = scratch_alloc(&pk_syms_hdr,    key_n * sizeof(int64_t));
+    ray_op_t** pkeys      = scratch_alloc(&pkeys_hdr,      key_n * sizeof(ray_op_t*));
+    ray_op_t** mkeys      = scratch_alloc(&mkeys_hdr,      key_n * sizeof(ray_op_t*));
+
+    /* per-agg decomposition carves (sized n_aggs) */
+    ray_t *avg_idx_hdr = NULL, *std_idx_hdr = NULL, *std_orig_op_hdr = NULL,
+          *std_sq_slot_hdr = NULL, *std_cnt_slot_hdr = NULL;
+    uint8_t*  avg_idx      = scratch_alloc(&avg_idx_hdr,      agg_n * sizeof(uint8_t));
+    uint8_t*  std_idx      = scratch_alloc(&std_idx_hdr,      agg_n * sizeof(uint8_t));
+    uint16_t* std_orig_op  = scratch_alloc(&std_orig_op_hdr,  agg_n * sizeof(uint16_t));
+    uint8_t*  std_sq_slot  = scratch_alloc(&std_sq_slot_hdr,  agg_n * sizeof(uint8_t));
+    uint8_t*  std_cnt_slot = scratch_alloc(&std_cnt_slot_hdr, agg_n * sizeof(uint8_t));
+
+    /* decomposed per-partition/merge slot carves (sized part_n_aggs_max) */
+    ray_t *part_ops_hdr = NULL, *merge_ops_hdr = NULL, *part_agg_syms_hdr = NULL,
+          *part_needs_sq_hdr = NULL, *agg_name_ids_hdr = NULL, *pagg_ins_hdr = NULL,
+          *magg_ins_hdr = NULL, *unique_agg_hdr = NULL;
+    uint16_t* part_ops      = scratch_alloc(&part_ops_hdr,      pna_n * sizeof(uint16_t));
+    uint16_t* merge_ops     = scratch_alloc(&merge_ops_hdr,     pna_n * sizeof(uint16_t));
+    int64_t*  part_agg_syms = scratch_alloc(&part_agg_syms_hdr, pna_n * sizeof(int64_t));
+    int*      part_needs_sq = scratch_alloc(&part_needs_sq_hdr, pna_n * sizeof(int));
+    int64_t*  agg_name_ids  = scratch_alloc(&agg_name_ids_hdr,  pna_n * sizeof(int64_t));
+    ray_op_t** pagg_ins     = scratch_alloc(&pagg_ins_hdr,      pna_n * sizeof(ray_op_t*));
+    ray_op_t** magg_ins     = scratch_alloc(&magg_ins_hdr,      pna_n * sizeof(ray_op_t*));
+    int64_t*  unique_agg    = scratch_alloc(&unique_agg_hdr,    pna_n * sizeof(int64_t));
+
+    if (!mc_sym_ids || !pk_syms || !pkeys || !mkeys || !avg_idx || !std_idx ||
+        !std_orig_op || !std_sq_slot || !std_cnt_slot || !part_ops ||
+        !merge_ops || !part_agg_syms || !part_needs_sq || !agg_name_ids ||
+        !pagg_ins || !magg_ins || !unique_agg)
+        goto pp_cleanup;
 
     /* Identify MAPCOMMON vs PARTED keys.  MAPCOMMON keys are constant
      * within a partition, so they are excluded from per-partition GROUP BY
      * and reconstructed after concat. */
     uint32_t n_mc_keys = 0;
-    int64_t  mc_sym_ids[8];
     uint32_t n_part_keys = 0;
-    int64_t  pk_syms[8];       /* non-MAPCOMMON key sym IDs */
 
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* pcol = ray_table_get_col(parted_tbl, key_syms[k]);
@@ -10975,18 +11020,12 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
 
     /* Decomposition: AVG(x) → SUM(x) + COUNT(x).
      * STDDEV/VAR(x) → SUM(x) + SUM(x²) + COUNT(x).
-     * Build per-partition agg_ops with decomposed ops, then merge ops. */
-    uint16_t part_ops[24];   /* per-partition agg ops */
-    uint16_t merge_ops[24];  /* merge agg ops */
-    uint8_t  avg_idx[8];     /* which original agg slots are AVG */
-    uint8_t  std_idx[8];     /* which original agg slots are STDDEV/VAR */
-    uint16_t std_orig_op[8]; /* original op for each std slot */
-    uint32_t n_avg = 0;
-    uint32_t n_std = 0;
+     * Build per-partition agg_ops with decomposed ops, then merge ops.
+     * part_ops/merge_ops/avg_idx/std_idx/std_orig_op/std_sq_slot/std_cnt_slot
+     * are carved above; n_avg/n_std are recounted here to fill them. */
+    n_avg = 0;
+    n_std = 0;
     uint32_t part_n_aggs = n_aggs;
-    /* stddev_needs_sq[a]: index into part_ops for the SUM(x²) slot */
-    uint8_t  std_sq_slot[8];
-    uint8_t  std_cnt_slot[8];
 
     for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t aop = ext->agg_ops[a];
@@ -11002,26 +11041,16 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
             part_ops[a] = aop;
         }
     }
-    /* Redundant with n_aggs <= 8 (guard above): makes the [8] slot-array
-     * bounds provable for the optimizer's range analysis. */
-    if (n_avg > 8 || n_std > 8) return NULL;
-    /* Guard: total decomposed slots must fit */
-    if (n_aggs + n_avg + 2 * n_std > 24) return NULL;
-
-    /* Append SUM(x²) for each STDDEV/VAR slot.  The `&& i < 8` conjunct is
-     * redundant with the n_std <= 8 guard above (dead by construction) but
-     * gives the optimizer's range analysis a literal bound it can chain
-     * straight to the std_sq_slot[8]/std_cnt_slot[8] writes below, which it
-     * otherwise can't prove under -O3 (-Wstringop-overflow false positive). */
-    for (uint32_t i = 0; i < n_std && i < 8; i++) {
+    /* Append SUM(x²) for each STDDEV/VAR slot. */
+    for (uint32_t i = 0; i < n_std; i++) {
         std_sq_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = OP_SUM;  /* SUM(x²) */
     }
     /* Append COUNT for each AVG column */
     for (uint32_t i = 0; i < n_avg; i++)
         part_ops[part_n_aggs++] = OP_COUNT;
-    /* Append COUNT for each STDDEV/VAR column (see the `&& i < 8` note above) */
-    for (uint32_t i = 0; i < n_std && i < 8; i++) {
+    /* Append COUNT for each STDDEV/VAR column */
+    for (uint32_t i = 0; i < n_std; i++) {
         std_cnt_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = OP_COUNT;
     }
@@ -11036,10 +11065,9 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
     /* Agg input syms for the decomposed ops.
      * AVG's COUNT uses same input column as the AVG itself.
      * STDDEV's SUM(x²) and COUNT use same input column as the STDDEV. */
-    int64_t part_agg_syms[24];
-    /* Flag: slot needs x*x graph node (for SUM(x²)) */
-    int part_needs_sq[24];
-    memset(part_needs_sq, 0, sizeof(part_needs_sq));
+    /* part_agg_syms/part_needs_sq carved above (sized part_n_aggs_max).
+     * part_needs_sq flags slots that need an x*x graph node (for SUM(x²)). */
+    memset(part_needs_sq, 0, pna_n * sizeof(int));
 
     for (uint32_t a = 0; a < n_aggs; a++)
         part_agg_syms[a] = agg_syms[a];
@@ -11063,8 +11091,8 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
      * Bounds peak memory to O(MERGE_BATCH × groups_per_partition). */
 #define MERGE_BATCH 8
 
-    /* Capture agg column name IDs from first partition result */
-    int64_t agg_name_ids[24];
+    /* Capture agg column name IDs from first partition result
+     * (agg_name_ids carved above, sized part_n_aggs_max). */
     int agg_names_captured = 0;
 
     ray_t* running = NULL;
@@ -11084,8 +11112,9 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
         for (int32_t bi = 0; bi < batch_n; bi++) {
             int32_t p = batch_start + bi;
 
-            /* Collect unique agg input sym IDs (avoid duplicate columns) */
-            int64_t unique_agg[24];
+            /* Collect unique agg input sym IDs (avoid duplicate columns).
+             * unique_agg carved above (sized part_n_aggs_max); reused each
+             * partition — its contents are recomputed per iteration. */
             int n_unique_agg = 0;
             for (uint32_t a = 0; a < part_n_aggs; a++) {
                 int dup = 0;
@@ -11127,12 +11156,10 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
             ray_graph_t* pg = ray_graph_new(sub);
             if (!pg) { ray_release(sub); goto batch_fail; }
 
-            ray_op_t* pkeys[8];
             for (uint32_t k = 0; k < n_part_keys; k++) {
                 ray_t* sym_atom = ray_sym_str(pk_syms[k]);
                 pkeys[k] = ray_scan(pg, ray_str_ptr(sym_atom));
             }
-            ray_op_t* pagg_ins[24];
             for (uint32_t a = 0; a < part_n_aggs; a++) {
                 ray_t* sym_atom = ray_sym_str(part_agg_syms[a]);
                 pagg_ins[a] = ray_scan(pg, ray_str_ptr(sym_atom));
@@ -11340,13 +11367,11 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
         ray_graph_t* mg = ray_graph_new(merge_tbl);
         if (!mg) goto batch_fail;
 
-        ray_op_t* mkeys[8];
         for (uint32_t k = 0; k < n_keys; k++) {
             ray_t* sym_atom = ray_sym_str(key_syms[k]);
             mkeys[k] = ray_scan(mg, ray_str_ptr(sym_atom));
         }
 
-        ray_op_t* magg_ins[24];
         for (uint32_t a = 0; a < part_n_aggs; a++) {
             ray_t* agg_name = ray_sym_str(agg_name_ids[a]);
             magg_ins[a] = ray_scan(mg, ray_str_ptr(agg_name));
@@ -11363,7 +11388,7 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
 
         if (!running || RAY_IS_ERR(running)) {
             ray_release(merge_tbl);
-            return NULL;
+            goto pp_cleanup;
         }
 
         /* Rename running's agg columns back to the original partial names.
@@ -11378,14 +11403,14 @@ batch_fail:
             if (bp[i]) ray_release(bp[i]);
         if (running) ray_release(running);
         if (merge_tbl) ray_release(merge_tbl);
-        return NULL;
+        goto pp_cleanup;
     }
 
     ray_t* result = running;
 
     if (!result || RAY_IS_ERR(result)) {
         if (merge_tbl) ray_release(merge_tbl);
-        return NULL;
+        goto pp_cleanup;
     }
 
     int64_t rncols = ray_table_ncols(result);
@@ -11397,7 +11422,7 @@ batch_fail:
         if (!trimmed || RAY_IS_ERR(trimmed)) {
             ray_release(result);
             if (merge_tbl) ray_release(merge_tbl);
-            return NULL;
+            goto pp_cleanup;
         }
 
         for (int64_t c = 0; c < (int64_t)(n_keys + n_aggs) && c < rncols; c++) {
@@ -11437,7 +11462,7 @@ batch_fail:
                 if (!avg_col || RAY_IS_ERR(avg_col)) {
                     ray_release(trimmed); ray_release(result);
                     if (merge_tbl) ray_release(merge_tbl);
-                    return NULL;
+                    goto pp_cleanup;
                 }
                 avg_col->len = nrows;
 
@@ -11483,7 +11508,7 @@ batch_fail:
                 if (!out_col || RAY_IS_ERR(out_col)) {
                     ray_release(trimmed); ray_release(result);
                     if (merge_tbl) ray_release(merge_tbl);
-                    return NULL;
+                    goto pp_cleanup;
                 }
                 out_col->len = nrows;
                 double* out = (double*)ray_data(out_col);
@@ -11549,7 +11574,27 @@ batch_fail:
         ray_table_set_col_name(result, (int64_t)n_keys + a, agg_name_ids[a]);
 
     if (merge_tbl) ray_release(merge_tbl);
-    return result;
+    ret = result;
+
+pp_cleanup:
+    scratch_free(mc_sym_ids_hdr);
+    scratch_free(pk_syms_hdr);
+    scratch_free(pkeys_hdr);
+    scratch_free(mkeys_hdr);
+    scratch_free(avg_idx_hdr);
+    scratch_free(std_idx_hdr);
+    scratch_free(std_orig_op_hdr);
+    scratch_free(std_sq_slot_hdr);
+    scratch_free(std_cnt_slot_hdr);
+    scratch_free(part_ops_hdr);
+    scratch_free(merge_ops_hdr);
+    scratch_free(part_agg_syms_hdr);
+    scratch_free(part_needs_sq_hdr);
+    scratch_free(agg_name_ids_hdr);
+    scratch_free(pagg_ins_hdr);
+    scratch_free(magg_ins_hdr);
+    scratch_free(unique_agg_hdr);
+    return ret;
 }
 
 /* ══════════════════════════════════════════════════════════════════════

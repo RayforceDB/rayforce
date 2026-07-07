@@ -1,0 +1,71 @@
+;; parted_group_wide.rfl — wide parted GROUP BY (9 keys, 9 aggregates).
+;;
+;; Exercises exec_group_per_partition (src/ops/group.c) beyond the historical
+;; n_keys<=8 / n_aggs<=8 cap.  A 2-partition parted table is grouped by 9 key
+;; columns with 9 aggregates (incl. AVG/STDDEV/VAR decomposition slots).  The
+;; result MUST match the identical-data flat in-memory table row-for-row.
+;;
+;; Today (pre-change) this passes via the concat fallback (same kernel as the
+;; flat path).  After the per-partition buffers are sized from their true
+;; bounds, the wide group takes the streaming per-partition path — this test
+;; guards that the answer is unchanged.
+
+;; ─── fixture: 2 partitions, 6 rows each, 3 groups spanning both ──────────
+;;   group id g = [0 1 2 0 1 2] per partition (each group = 2 rows/partition)
+;;   9 key columns: k_i = g + i*100  (bijection with g → 3 groups)
+;;   value column v (F64), integer-valued so exact aggs are order-independent
+(set G1 [0 1 2 0 1 2])
+(set G2 [0 1 2 0 1 2])
+(set V1 (as 'F64 [10.0 40.0 70.0 20.0 50.0 80.0]))
+(set V2 (as 'F64 [30.0 60.0 90.0 40.0 70.0 100.0]))
+(set P1 (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list G1 (+ G1 100) (+ G1 200) (+ G1 300) (+ G1 400) (+ G1 500) (+ G1 600) (+ G1 700) (+ G1 800) V1)))
+(set P2 (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list G2 (+ G2 100) (+ G2 200) (+ G2 300) (+ G2 400) (+ G2 500) (+ G2 600) (+ G2 700) (+ G2 800) V2)))
+(.sys.exec "rm -rf /tmp/rfl_pgw")
+(.db.splayed.set "/tmp/rfl_pgw/1/t/" P1)
+(.db.splayed.set "/tmp/rfl_pgw/2/t/" P2)
+(set Pw (.db.parted.get "/tmp/rfl_pgw/" 't))
+
+;; identical-data flat in-memory table (part1 rows ++ part2 rows, same order)
+(set GA (concat G1 G2))
+(set VA (concat V1 V2))
+(set TF (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list GA (+ GA 100) (+ GA 200) (+ GA 300) (+ GA 400) (+ GA 500) (+ GA 600) (+ GA 700) (+ GA 800) VA)))
+
+;; ─── wide group: 9 keys, 9 aggregates, sorted by k0 for stable compare ──
+(set RP (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) sdv: (stddev v) vrv: (var v) fv: (first v) lv: (last v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8} from: Pw asc: k0}))
+(set RF (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) sdv: (stddev v) vrv: (var v) fv: (first v) lv: (last v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8} from: TF asc: k0}))
+
+;; cardinality: 3 groups
+(count RP) -- 3
+(count RP) -- (count RF)
+
+;; key columns match flat
+(at RP 'k0) -- (at RF 'k0)
+(at RP 'k4) -- (at RF 'k4)
+(at RP 'k8) -- (at RF 'k8)
+
+;; exact (order-independent integer-valued) aggregates match flat
+(at RP 'sv) -- (at RF 'sv)
+(at RP 'cv) -- (at RF 'cv)
+(at RP 'mnv) -- (at RF 'mnv)
+(at RP 'mxv) -- (at RF 'mxv)
+(at RP 'fv) -- (at RF 'fv)
+(at RP 'lv) -- (at RF 'lv)
+
+;; independent literal oracle for the exact aggregates
+(at RP 'k0) -- [0 1 2]
+(at RP 'k8) -- [800 801 802]
+(at RP 'sv) -- (as 'F64 [100.0 220.0 340.0])
+(at RP 'cv) -- [4 4 4]
+(at RP 'mnv) -- (as 'F64 [10.0 40.0 70.0])
+(at RP 'mxv) -- (as 'F64 [40.0 70.0 100.0])
+(at RP 'av) -- (as 'F64 [25.0 55.0 85.0])
+(at RP 'fv) -- (as 'F64 [10.0 40.0 70.0])
+(at RP 'lv) -- (as 'F64 [40.0 70.0 100.0])
+
+;; float aggregates (avg/stddev/var) match flat within tolerance
+(< (max (abs (- (at RP 'av) (at RF 'av)))) 0.000001) -- true
+(< (max (abs (- (at RP 'sdv) (at RF 'sdv)))) 0.000001) -- true
+(< (max (abs (- (at RP 'vrv) (at RF 'vrv)))) 0.000001) -- true
+
+;; ─── cleanup ────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_pgw")
