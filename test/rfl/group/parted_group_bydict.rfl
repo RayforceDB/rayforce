@@ -1,0 +1,108 @@
+;; parted_group_bydict.rfl — per-partition streaming GROUP BY where the group
+;; keys are supplied via a by-DICT of COMPUTED and/or RENAMED values over a
+;; PARTED input table.
+;;
+;; Previously ray_select EAGERLY flattened every non-identity by-dict value
+;; (ray_eval + ray_table_add_col over the whole flattened parted table) before
+;; grouping, so exec_group_parted only ever saw a bare flat key and the
+;; streaming per-partition kernel never ran for these shapes.  Now the by-dict
+;; keys are DEFERRED: by_expr is rewritten to a SYM vec of the ALIAS names and
+;; the value ASTs are compiled at the group-key site (compile_expr_dag per key),
+;; so a rename lowers to the same OP_SCAN a bare key does and a computed key to a
+;; DAG node the per-partition kernel materialises and streams.  Result key
+;; columns are renamed to the by-dict aliases after execution.
+;;
+;; The (.sys.mem) 'group-perpart-runs counter increments once per
+;; exec_group_per_partition entry, so a strict increase proves the streaming
+;; kernel ran; parity with an identical-data flat oracle proves correctness.
+;;
+;; Cardinality gate (exec_group_parted): est_groups*100 <= rows_per_part.  With
+;; 400 rows/partition, the varying key(s) must stay low-cardinality.  ts here is
+;; a slow-moving field so (xbar ts 200) gives 2 buckets and sym/ex are 2-value
+;; keys → est_groups stays 2..4 and clears 400.
+
+;; ─── fixture: 2 partitions, 400 rows each ────────────────────────────────────
+(set N 400)
+(set TS (til N))                          ;; 0..399, monotone (same both parts)
+(set SG (as 'SYM (% (til N) 2)))          ;; 2-value symbol key
+(set EX (as 'SYM (% (til N) 2)))          ;; 2-value symbol key (exchange-like)
+(set GS (as 'STR (% (til N) 2)))          ;; 2-value STRING key (negative guard)
+(set V1 (as 'F64 (til N)))                ;; value, partition 1
+(set V2 (as 'F64 (+ 1000 (til N))))       ;; value, partition 2
+(set P1 (table [ts sg ex gs v] (list TS SG EX GS V1)))
+(set P2 (table [ts sg ex gs v] (list TS SG EX GS V2)))
+(.sys.exec "rm -rf /tmp/rfl_pgbd")
+(.db.splayed.set "/tmp/rfl_pgbd/1/t/" P1)
+(.db.splayed.set "/tmp/rfl_pgbd/2/t/" P2)
+(set Pw (.db.parted.get "/tmp/rfl_pgbd/" 't))
+;; identical-data flat in-memory oracle (part1 rows ++ part2 rows, same order)
+(set TF (table [ts sg ex gs v] (list (concat TS TS) (concat SG SG) (concat EX EX) (concat GS GS) (concat V1 V2))))
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (a) HEADLINE: computed key + rename — `by: {tb: (xbar ts 200) s: sym}`.
+;;     est_groups = 2 buckets * 2 syms = 4 → 4*100=400 <= 400 clears the gate.
+;; ══════════════════════════════════════════════════════════════════════════
+(set Ba (at (.sys.mem) 'group-perpart-runs))
+(set RPa (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) by: {tb: (xbar ts 200) s: sg} from: Pw asc: tb}))
+(set Aa (at (.sys.mem) 'group-perpart-runs))
+;; PROVES exec_group_per_partition ran for the computed+rename by-dict.
+(> Aa Ba) -- true
+(set RFa (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) by: {tb: (xbar ts 200) s: sg} from: TF asc: tb}))
+(count RPa) -- 4
+(count RPa) -- (count RFa)
+;; aliased key columns present under their by-dict names, matching the oracle
+(at RPa 'tb)  -- (at RFa 'tb)
+(at RPa 's)   -- (at RFa 's)
+(at RPa 'sv)  -- (at RFa 'sv)
+(at RPa 'cv)  -- (at RFa 'cv)
+(at RPa 'mnv) -- (at RFa 'mnv)
+(at RPa 'mxv) -- (at RFa 'mxv)
+(< (max (abs (- (at RPa 'av) (at RFa 'av)))) 0.000001) -- true
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (b) PURE RENAME — `by: {s: sym}`.  est_groups = 2 clears the gate.
+;; ══════════════════════════════════════════════════════════════════════════
+(set Bb (at (.sys.mem) 'group-perpart-runs))
+(set RPb (select {sv: (sum v) cv: (count v) by: {s: sg} from: Pw asc: s}))
+(set Ab (at (.sys.mem) 'group-perpart-runs))
+;; PROVES exec_group_per_partition ran for the pure-rename by-dict.
+(> Ab Bb) -- true
+(set RFb (select {sv: (sum v) cv: (count v) by: {s: sg} from: TF asc: s}))
+(count RPb) -- 2
+(at RPb 's)  -- (at RFb 's)
+(at RPb 'sv) -- (at RFb 'sv)
+(at RPb 'cv) -- (at RFb 'cv)
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (c) TWO RENAMES — `by: {s: sym e: ex}`.  est_groups = 2*2 = 4 (both keys
+;;     move together: row r has sg=ex=r%2, so only 2 groups actually occur).
+;; ══════════════════════════════════════════════════════════════════════════
+(set Bc (at (.sys.mem) 'group-perpart-runs))
+(set RPc (select {sv: (sum v) cv: (count v) by: {s: sg e: ex} from: Pw asc: s}))
+(set Ac (at (.sys.mem) 'group-perpart-runs))
+;; PROVES exec_group_per_partition ran for the two-rename by-dict.
+(> Ac Bc) -- true
+(set RFc (select {sv: (sum v) cv: (count v) by: {s: sg e: ex} from: TF asc: s}))
+(count RPc) -- (count RFc)
+(at RPc 's)  -- (at RFc 's)
+(at RPc 'e)  -- (at RFc 'e)
+(at RPc 'sv) -- (at RFc 'sv)
+(at RPc 'cv) -- (at RFc 'cv)
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (d) NEGATIVE GUARD — mixed computed + STRING key `by: {tb: (xbar ts 200)
+;;     g: gs}`.  A STR key routes to the eval-level toy grouper which gathers
+;;     key columns by name; a deferred alias column would not exist there, so
+;;     this shape MUST NOT be deferred — it falls back to eager flatten/concat.
+;;     Assert CORRECTNESS (parity with the flat oracle), not streaming.
+;; ══════════════════════════════════════════════════════════════════════════
+(set RPd (select {sv: (sum v) cv: (count v) by: {tb: (xbar ts 200) g: gs} from: Pw asc: tb}))
+(set RFd (select {sv: (sum v) cv: (count v) by: {tb: (xbar ts 200) g: gs} from: TF asc: tb}))
+(count RPd) -- (count RFd)
+(at RPd 'tb) -- (at RFd 'tb)
+(at RPd 'g)  -- (at RFd 'g)
+(at RPd 'sv) -- (at RFd 'sv)
+(at RPd 'cv) -- (at RFd 'cv)
+
+;; ─── cleanup ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_pgbd")

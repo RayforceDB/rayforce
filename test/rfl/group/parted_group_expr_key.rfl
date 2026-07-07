@@ -10,13 +10,13 @@
 ;; exec_group_per_partition entry, so a strict increase proves the streaming
 ;; kernel ran; equality proves it did not (concat fallback).
 ;;
-;; NOTE ON THE by-DICT HEADLINE: `by: {tb: (xbar ts N) s: sym}` does NOT reach
-;; this streaming path — the select front-end (ray_select_fn, query.c) EAGERLY
-;; materializes every computed by-dict value into a FLAT column over the whole
-;; (flattened) parted table before grouping, so exec_group_parted only ever
-;; sees a bare flat key there.  The routes exercised below are the ones that
-;; actually deliver a computed key/agg NODE to exec_group_parted over a parted
-;; table: a single computed `by:` expression, and expression agg-inputs.
+;; NOTE ON THE by-DICT HEADLINE: `by: {tb: (xbar ts N) s: sym}` over a parted
+;; input now ALSO reaches this streaming path — the select front-end defers the
+;; computed/renamed by-dict values (no eager flatten) and compiles their ASTs at
+;; the group-key site, so exec_group_parted sees real key NODES.  That route is
+;; covered by test/rfl/group/parted_group_bydict.rfl.  The routes exercised
+;; below deliver a computed key/agg NODE to exec_group_parted directly: a single
+;; computed `by:` expression, and expression agg-inputs.
 
 ;; ─── fixture: 2 partitions, 400 rows each ────────────────────────────────────
 (set N 400)

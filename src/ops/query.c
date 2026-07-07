@@ -2021,6 +2021,29 @@ static int64_t key_col_read_i64(ray_t* col, int64_t row) {
     }
 }
 
+/* Effective element type of a group-key column, seeing through a PARTED
+ * segment-list and a MAPCOMMON broadcast column to the underlying scalar
+ * type.  Used to decide whether a parted by-dict rename key can stream. */
+static int8_t query_col_base_type(ray_t* col) {
+    if (!col) return 0;
+    if (RAY_IS_PARTED(col->type)) return (int8_t)RAY_PARTED_BASETYPE(col->type);
+    if (col->type == RAY_MAPCOMMON) {
+        ray_t** p = (ray_t**)ray_data(col);
+        return (p && p[0]) ? p[0]->type : 0;
+    }
+    return col->type;
+}
+
+/* A scalar key type the streaming per-partition group kernel packs into an
+ * 8-byte slot.  STR/LIST/GUID keys route to the eval-level toy grouper (which
+ * gathers materialized key columns by name) and MUST NOT be deferred over a
+ * parted source — the deferred alias column never exists there, so that path
+ * would silently drop the key. */
+static int query_key_type_streamable(int8_t t) {
+    return key_type_i64_projectable(t) || t == RAY_SYM ||
+           t == RAY_F64 || t == RAY_F32;
+}
+
 static bool parse_gt_name_i64(ray_t* expr, int64_t* out_name, int64_t* out_threshold) {
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 3)
         return false;
@@ -5393,6 +5416,15 @@ ray_t* ray_select(ray_t** args, int64_t n) {
      * plain RAY_SYM vector of the dict keys so the rest of
      * ray_select_fn sees a standard multi-key group-by. */
     ray_t* by_sym_vec_owned = NULL;
+    /* Parted by-dict streaming: when the by-dict's computed/renamed keys are
+     * deferred (not eagerly flattened) so the per-partition group kernel can
+     * stream them, deferred_bydict points at the original by-dict AST (whose
+     * value ASTs the group-key compile site reads) and by_expr is rewritten to
+     * a SYM vec of the ALIAS names.  parted_bydict_deferred stays false on the
+     * FLAT path so nothing there changes. */
+    bool   parted_bydict_deferred = false;
+    ray_t* deferred_bydict = NULL;
+    int64_t deferred_nk = 0;
     int64_t dep_key_base_sym = -1;
     /* Dependent affine group keys (by-dict xbar-bucket shapes): unbounded now
      * that the by-dict "1..16 keys" gate is lifted, so these can't be fixed
@@ -5440,6 +5472,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     ray_t* post_group_where_expr = NULL;
     DICT_VIEW_DECL(byv);
     if (by_expr && by_expr->type == RAY_DICT) {
+        ray_t* by_dict_ast = by_expr;   /* original by-dict; value ASTs read again at compile */
         DICT_VIEW_OPEN(by_expr, byv);
         if (DICT_VIEW_OVERFLOW(byv)) {
             ray_release(tbl);
@@ -5547,6 +5580,89 @@ ray_t* ray_select(ray_t** args, int64_t n) {
             goto by_dict_done;
         }
         scratch_free(local_dep_hdr);
+
+        /* ── Parted by-dict streaming (defer computed/renamed keys) ───────────
+         * For a PARTED input, do NOT eagerly flatten + ray_eval + add_col each
+         * computed/renamed by-dict value.  Instead keep by_expr as a SYM vec of
+         * the ALIAS names and hand the value ASTs to the group-key compile site,
+         * which calls compile_expr_dag per key: a bare column ref degenerates to
+         * exactly the ray_scan the flat multi-key path uses; a computed expr
+         * becomes a real DAG node that exec_group_parted streams per partition
+         * (materialising it into a synthetic per-partition column).  The result
+         * key columns are renamed to the aliases after execution.
+         *
+         * Gated hard so the FLAT path stays byte-identical and correctness never
+         * depends on the optimisation — any gate failure falls through to the
+         * unchanged eager materialize below:
+         *   - input actually parted, and NO WHERE (a WHERE on a parted source
+         *     flattens before grouping anyway, so streaming can't apply);
+         *   - at least one output and EVERY output a plain group aggregate
+         *     (non-agg / count-distinct / compound-arith outputs re-read the
+         *     materialized key columns post-group — the deferred alias column is
+         *     absent, so those shapes keep the eager path);
+         *   - every key a bare scalar-column rename or a computed expression,
+         *     never a STR/LIST/GUID key (which routes to the eval toy grouper
+         *     that gathers key columns by name and would drop the deferred key);
+         *   - no duplicate key and no alias shadowing an input column (same
+         *     name-only validation the eager loop performs). */
+        bool by_input_parted = false;
+        {
+            int64_t in_nc = ray_table_ncols(tbl);
+            for (int64_t c = 0; c < in_nc; c++) {
+                ray_t* col = ray_table_get_col_idx(tbl, c);
+                if (col && (RAY_IS_PARTED(col->type) ||
+                            col->type == RAY_MAPCOMMON)) {
+                    by_input_parted = true; break;
+                }
+            }
+        }
+        if (by_input_parted && where_expr == NULL && n_out > 0) {
+            bool defer_ok = true;
+            for (int64_t i = 0; i + 1 < dict_n && defer_ok; i += 2) {
+                int64_t kid = dict_elems[i]->i64;
+                if (kid == from_id || kid == where_id || kid == by_id ||
+                    kid == take_id || kid == asc_id || kid == desc_id ||
+                    kid == nearest_id) continue;
+                if (!is_group_dag_agg_expr(dict_elems[i + 1])) defer_ok = false;
+            }
+            for (int64_t i = 0; i < nk && defer_ok; i++) {
+                ray_t* k = d_elems[i * 2];
+                ray_t* v = d_elems[i * 2 + 1];
+                if (!k || k->type != -RAY_SYM) { defer_ok = false; break; }
+                for (int64_t j = 0; j < i; j++)
+                    if (d_elems[j * 2]->i64 == k->i64) { defer_ok = false; break; }
+                if (!defer_ok) break;
+                bool trivial_self = (v && v->type == -RAY_SYM && v->i64 == k->i64);
+                if (ray_table_get_col(tbl, k->i64) && !trivial_self) {
+                    defer_ok = false; break;   /* alias shadows an input column */
+                }
+                if (v && v->type == RAY_LIST) continue;  /* computed expr */
+                if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) {
+                    ray_t* src = ray_table_get_col(tbl, v->i64);
+                    if (!src ||
+                        !query_key_type_streamable(query_col_base_type(src))) {
+                        defer_ok = false; break;
+                    }
+                    continue;
+                }
+                defer_ok = false;   /* literal / quoted / unsupported by-val */
+            }
+            if (defer_ok) {
+                by_sym_vec_owned = ray_vec_new(RAY_SYM, nk);
+                if (!by_sym_vec_owned || RAY_IS_ERR(by_sym_vec_owned)) {
+                    ray_release(tbl);
+                    DICT_VIEW_CLOSE(dv); DICT_VIEW_CLOSE(byv); return ray_error("oom", NULL);
+                }
+                int64_t* sv = (int64_t*)ray_data(by_sym_vec_owned);
+                for (int64_t i = 0; i < nk; i++) sv[i] = d_elems[i * 2]->i64;
+                by_sym_vec_owned->len = nk;
+                by_expr = by_sym_vec_owned;
+                parted_bydict_deferred = true;
+                deferred_bydict = by_dict_ast;
+                deferred_nk = nk;
+                goto by_dict_done;
+            }
+        }
 
         bool has_computed_by_val = false;
         for (int64_t i = 0; i < nk; i++) {
@@ -8093,7 +8209,25 @@ by_dict_done:
         /* Compile group key(s) — key_ops carved with the top-level collectors */
         int64_t n_keys = 0;
 
-        if (by_expr->type == RAY_SYM) {
+        if (parted_bydict_deferred) {
+            /* Parted by-dict: compile each deferred value AST directly.  A bare
+             * column ref lowers to the same OP_SCAN the SYM-vec path emits; a
+             * computed expr lowers to a DAG node exec_group_parted streams.  The
+             * key op's own output name is ignored — the result key columns are
+             * renamed to the by-dict ALIAS names post-execution (search
+             * parted_bydict_deferred near the output rename). */
+            DICT_VIEW_DECL(dfv);
+            DICT_VIEW_OPEN(deferred_bydict, dfv);
+            if (DICT_VIEW_OVERFLOW(dfv)) {
+                DICT_VIEW_CLOSE(dfv); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+            }
+            for (int64_t i = 0; i < deferred_nk && n_keys < nk_max; i++) {
+                key_ops[n_keys] = compile_expr_dag(g, dfv[i * 2 + 1]);
+                if (!key_ops[n_keys]) { DICT_VIEW_CLOSE(dfv); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile group key expression"); }
+                n_keys++;
+            }
+            DICT_VIEW_CLOSE(dfv);
+        } else if (by_expr->type == RAY_SYM) {
             /* Multiple keys as SYM vector: [col1 col2 ...] —
              * cell-data resolved through the vec's domain. */
             int64_t nk = ray_len(by_expr);
@@ -9313,6 +9447,19 @@ by_dict_done:
              * with correct names already — only agg columns need renaming,
              * in dict-iteration order of the agg entries. */
             if (by_expr) {
+                /* Parted by-dict streaming: the deferred key columns carry the
+                 * source-derived names their key ops emitted (a rename groups on
+                 * the source sym, a computed key on the expr's derived sym).
+                 * Rename the key positions (0..n_key_cols-1) to the by-dict
+                 * ALIAS names.  by_expr is the SYM vec of aliases in key order,
+                 * and the group result always lays keys out first, so position
+                 * maps 1:1.  No-op on every non-deferred path. */
+                if (parted_bydict_deferred &&
+                    ray_is_vec(by_expr) && by_expr->type == RAY_SYM) {
+                    const int64_t* aliases = (const int64_t*)ray_data(by_expr);
+                    for (int64_t k = 0; k < n_key_cols && k < ncols; k++)
+                        ray_table_set_col_name(result, k, aliases[k]);
+                }
                 /* Rename only the agg columns (positions after keys).
                  * Non-agg LIST columns were named at scatter time. */
                 ray_t* aun_hdr = NULL;
