@@ -1,0 +1,69 @@
+;; asof_partition_align.rfl — streaming parted asof pairs partitions by DATE
+;; VALUE, not by segment index.
+;;
+;; The streaming parted asof (src/ops/query.c ray_asof_join_fn) iterates the
+;; ASCENDING UNION of both operands' partition dates and runs the per-day asof
+;; on the trade/quote segments that share each date.  A day present on only one
+;; side is still processed: a trades-only day resolves to no-match (empty quote,
+;; null right columns), a quotes-only day emits nothing.
+;;
+;; BUG this fixture guards: the spike paired segment index p on the left with
+;; index p on the right.  Real parted DBs can have DIFFERENT partition sets, so
+;; index p maps to DIFFERENT dates on the two sides and the join lands on the
+;; WRONG day.  Here trade days {01.02,01.03,01.04} and quote days
+;; {01.01,01.02,01.03} differ, so index pairing joins 01.02 trades against
+;; 01.01 quotes (wrong bids) and undercounts the per-day runs (3, not 4).
+;;
+;; Data is SAME-DAY-matched (no cross-day carry needed yet): every ID=1 trade's
+;; prevailing quote is same-day; the 01.04 trades use ID=9, which has NO quote
+;; anywhere, so they no-match in BOTH the streamed result and the flat oracle.
+;; The equality key is an INTEGER (ID) so no cross-symfile SYM domain is needed.
+
+;; ─── fixture: two INDEPENDENT parted roots with DIFFERENT date sets ─────────
+(.sys.exec "rm -rf /tmp/rfl_asof_palign_t /tmp/rfl_asof_palign_q")
+
+;; Quotes — days 01.01, 01.02, 01.03 (all ID=1)
+(set Q1 (table [ID Time Bid] (list [1 1] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000] (as 'F64 [99.0 100.5]))))
+(set Q2 (table [ID Time Bid] (list [1 1] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000] (as 'F64 [199.0 200.5]))))
+(set Q3 (table [ID Time Bid] (list [1 1] [2024.01.03D10:00:00.000000000 2024.01.03D10:00:02.000000000] (as 'F64 [299.0 300.5]))))
+;; Trades — days 01.02, 01.03 (ID=1, same-day match), 01.04 (ID=9, no quote)
+(set T2 (table [ID Time Price] (list [1 1] [2024.01.02D10:00:01.000000000 2024.01.02D10:00:03.000000000] (as 'F64 [200.0 201.0]))))
+(set T3 (table [ID Time Price] (list [1 1] [2024.01.03D10:00:01.000000000 2024.01.03D10:00:03.000000000] (as 'F64 [300.0 301.0]))))
+(set T4 (table [ID Time Price] (list [9 9] [2024.01.04D10:00:01.000000000 2024.01.04D10:00:03.000000000] (as 'F64 [400.0 401.0]))))
+
+(.db.splayed.set "/tmp/rfl_asof_palign_q/2024.01.01/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_palign_q/2024.01.02/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_palign_q/2024.01.03/quote/" Q3)
+(.db.splayed.set "/tmp/rfl_asof_palign_t/2024.01.02/trade/" T2)
+(.db.splayed.set "/tmp/rfl_asof_palign_t/2024.01.03/trade/" T3)
+(.db.splayed.set "/tmp/rfl_asof_palign_t/2024.01.04/trade/" T4)
+(set Pt (.db.parted.get "/tmp/rfl_asof_palign_t/" 'trade))
+(set Pq (.db.parted.get "/tmp/rfl_asof_palign_q/" 'quote))
+
+;; flat in-memory oracle — same rows, trade order (day-ascending), no date col.
+(set TF (table [ID Time Price] (list [1 1 1 1 9 9] [2024.01.02D10:00:01.000000000 2024.01.02D10:00:03.000000000 2024.01.03D10:00:01.000000000 2024.01.03D10:00:03.000000000 2024.01.04D10:00:01.000000000 2024.01.04D10:00:03.000000000] (as 'F64 [200.0 201.0 300.0 301.0 400.0 401.0]))))
+(set QF (table [ID Time Bid] (list [1 1 1 1 1 1] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000 2024.01.03D10:00:00.000000000 2024.01.03D10:00:02.000000000] (as 'F64 [99.0 100.5 199.0 200.5 299.0 300.5]))))
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (a) counter — union of days = 4 (01.01 quote-only, 01.02/03 both, 01.04
+;;     trade-only).  BEFORE the fix this is 3 (index-paired lsegs runs).
+;; ══════════════════════════════════════════════════════════════════════════
+(set Ba (at (.sys.mem) 'asof-perpart-runs))
+(set RS (asof-join [ID Time] (select {from: Pt}) (select {from: Pq})))
+(set Aa (at (.sys.mem) 'asof-perpart-runs))
+(> Aa Ba) -- true
+(- Aa Ba) -- 4
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (b) correctness — streamed result equals the flat in-memory oracle.
+;;     BEFORE the fix the bids are wrong (01.02 trades matched 01.01 quotes).
+;; ══════════════════════════════════════════════════════════════════════════
+(set RF (asof-join [ID Time] TF QF))
+(count RS) -- 6
+(count RS) -- (count RF)
+(at RS 'Price) -- (at RF 'Price)
+(at RS 'Bid)   -- (at RF 'Bid)
+;; explicit goldens: prices carry straight through; same-day bids match, the
+;; ID=9 (01.04 trade-only) rows have no prevailing quote → null.
+(at RS 'Price) -- (as 'F64 [200.0 201.0 300.0 301.0 400.0 401.0])
+(at RS 'Bid)   -- (as 'F64 [199.0 200.5 299.0 300.5 0Nf 0Nf])

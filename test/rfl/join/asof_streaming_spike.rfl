@@ -31,12 +31,15 @@
 (set T3 (table [Sym Time Price] (list [x x] [2024.01.03D10:00:01.000000000 2024.01.03D10:00:03.000000000] (as 'F64 [300.0 301.0]))))
 (set Q3 (table [Sym Time Bid]   (list [x x] [2024.01.03D10:00:00.000000000 2024.01.03D10:00:02.000000000] (as 'F64 [299.0 300.5]))))
 
-(.db.splayed.set "/tmp/rfl_asof_spike/1/trade/" T1)
-(.db.splayed.set "/tmp/rfl_asof_spike/1/quote/" Q1)
-(.db.splayed.set "/tmp/rfl_asof_spike/2/trade/" T2)
-(.db.splayed.set "/tmp/rfl_asof_spike/2/quote/" Q2)
-(.db.splayed.set "/tmp/rfl_asof_spike/3/trade/" T3)
-(.db.splayed.set "/tmp/rfl_asof_spike/3/quote/" Q3)
+;; DATE partition dirs (YYYY.MM.DD): streaming aligns partitions by date VALUE,
+;; so the on-disk partition key must be a date (integer dirs decline to the
+;; eager fallback).  Both tables share these 3 dates (index==value here).
+(.db.splayed.set "/tmp/rfl_asof_spike/2024.01.01/trade/" T1)
+(.db.splayed.set "/tmp/rfl_asof_spike/2024.01.01/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_spike/2024.01.02/trade/" T2)
+(.db.splayed.set "/tmp/rfl_asof_spike/2024.01.02/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_spike/2024.01.03/trade/" T3)
+(.db.splayed.set "/tmp/rfl_asof_spike/2024.01.03/quote/" Q3)
 (set Pt (.db.parted.get "/tmp/rfl_asof_spike/" 'trade))
 (set Pq (.db.parted.get "/tmp/rfl_asof_spike/" 'quote))
 

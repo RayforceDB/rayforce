@@ -13986,6 +13986,59 @@ static ray_t* asof_eval_select_segment(ray_t* dict, ray_t* parted_tbl, int32_t s
     return r;
 }
 
+/* If `tbl` is DATE-partitioned, return its (borrowed) per-partition RAY_DATE
+ * key-values vector and set *out_n to the partition count; else return NULL.
+ *
+ * The partition key VALUES live in the MAPCOMMON column's mc[0] (one date per
+ * partition), ascending by construction (collect_part_dirs sorts the on-disk
+ * YYYY.MM.DD dirs, which sort chronologically).  We date-align ONLY when the
+ * key is a DATE — an integer/sym partition scheme (mc[0] not RAY_DATE) returns
+ * NULL so the caller falls back to the eager kernel (correctness first, no
+ * date arithmetic on a non-date scheme). */
+static ray_t* asof_parted_date_keys(ray_t* tbl, int64_t* out_n) {
+    *out_n = 0;
+    if (!tbl || tbl->type != RAY_TABLE) return NULL;
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && col->type == RAY_MAPCOMMON) {
+            ray_t** mc = (ray_t**)ray_data(col);
+            if (col->len >= 1 && mc[0] && mc[0]->type == RAY_DATE) {
+                *out_n = mc[0]->len;
+                return mc[0];   /* borrowed: owned by tbl's MAPCOMMON column */
+            }
+            return NULL;        /* MAPCOMMON but not DATE-keyed → no date align */
+        }
+    }
+    return NULL;
+}
+
+/* Build a 0-row table matching the schema the right operand's select produces
+ * per day (evaluated over segment 0), for a trades-only day: the asof then
+ * null-fills every right column, exactly as a genuine no-match would.  Owned;
+ * caller releases.  Built once and reused across all trades-only days. */
+static ray_t* asof_empty_right(ray_t* dict, ray_t* parted_tbl) {
+    ray_t* seg0 = asof_eval_select_segment(dict, parted_tbl, 0);
+    if (!seg0 || RAY_IS_ERR(seg0)) return seg0;
+    int64_t nc = ray_table_ncols(seg0);
+    ray_t* out = ray_table_new(nc);
+    if (!out || RAY_IS_ERR(out)) { ray_release(seg0); return out ? out : ray_error("oom", NULL); }
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(seg0, c);
+        int64_t nm = ray_table_col_name(seg0, c);
+        int8_t  ct = col ? col->type : RAY_I64;
+        ray_t*  ev = ray_vec_new(ct, 0);
+        if (!ev || RAY_IS_ERR(ev)) { ray_release(seg0); ray_release(out); return ev ? ev : ray_error("oom", NULL); }
+        ev->len = 0;
+        if (ct == RAY_SYM && col) ray_sym_vec_adopt_domain(ev, col);
+        out = ray_table_add_col(out, nm, ev);
+        ray_release(ev);
+        if (!out || RAY_IS_ERR(out)) { ray_release(seg0); return out ? out : ray_error("oom", NULL); }
+    }
+    ray_release(seg0);
+    return out;
+}
+
 /* (asof-join [key1 key2 ... timeKey] leftTable rightTable)
  * Last key is the time/asof column, rest are equality keys.  The equality
  * keys are OPTIONAL: a lone time key (asof-join [timeKey] L R) performs an
@@ -14007,26 +14060,71 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
     ray_t* ldict = NULL, *rdict = NULL;
     ray_t* lparted = asof_parted_select_operand(args[1], &ldict);
     ray_t* rparted = asof_parted_select_operand(args[2], &rdict);
-    int64_t lsegs = lparted ? asof_parted_seg_count(lparted) : -1;
-    int64_t rsegs = rparted ? asof_parted_seg_count(rparted) : -1;
 
-    if (lparted && rparted && lsegs == rsegs && lsegs > 0) {
-        /* Streaming per-day path.  Iterate partitions in order; for each day
-         * evaluate both operand selects restricted to that segment, run the
-         * existing kernel, and ordered-concat the partial into the accumulator.
-         * Peak memory is bounded by ~one day's trade+quote (+ the growing
-         * result) rather than both full histories. */
-        ray_t* accum = NULL;
-        ray_t* err = NULL;
-        for (int64_t p = 0; p < lsegs; p++) {
-            ray_t* day_l = asof_eval_select_segment(ldict, lparted, (int32_t)p);
+    /* Date-aligned streaming requires BOTH operands DATE-partitioned.  The two
+     * sides may carry DIFFERENT partition sets (a day with quotes but no
+     * trades, or vice versa), so segments are paired by their partition-key
+     * DATE VALUE, never by index.  A non-date (integer/sym) partition scheme on
+     * either side declines to the eager fallback below. */
+    int64_t l_ndates = 0, r_ndates = 0;
+    ray_t* l_dates = lparted ? asof_parted_date_keys(lparted, &l_ndates) : NULL;
+    ray_t* r_dates = rparted ? asof_parted_date_keys(rparted, &r_ndates) : NULL;
+
+    if (lparted && rparted && l_dates && r_dates && l_ndates > 0 && r_ndates > 0) {
+        /* Streaming per-day path over the ASCENDING UNION of both sides' dates.
+         * ld/rd are the per-partition DATE values (ascending by construction).
+         * A two-pointer merge visits each distinct date once; for each date d:
+         *   both sides have d  → asof(trade seg, quote seg)
+         *   trades-only (d only on left)  → asof(trade seg, empty quote) → all
+         *                                    trades no-match (null right cols)
+         *   quotes-only (d only on right) → no trades, emit nothing (Task 2's
+         *                                    cross-day carry will consume these
+         *                                    quotes; today just skip the day)
+         * Peak memory is ~one day's trade+quote (+ the growing result). */
+        const int32_t* ld = (const int32_t*)ray_data(l_dates);
+        const int32_t* rd = (const int32_t*)ray_data(r_dates);
+        int64_t i = 0, j = 0;
+        ray_t* accum   = NULL;
+        ray_t* err     = NULL;
+        ray_t* empty_r = NULL;   /* lazily-built 0-row right schema (reused) */
+
+        while (i < l_ndates || j < r_ndates) {
+            int32_t d;
+            int64_t lseg = -1, rseg = -1;
+            if (i < l_ndates && (j >= r_ndates || ld[i] <= rd[j])) {
+                d = ld[i];
+                lseg = i;
+                if (j < r_ndates && rd[j] == d) rseg = j;
+            } else {
+                d = rd[j];
+                rseg = j;              /* quotes-only day: lseg stays -1 */
+            }
+            if (i < l_ndates && ld[i] == d) i++;
+            if (j < r_ndates && rd[j] == d) j++;
+
+            /* Count every union day processed (once, O(1) — never per-row). */
+            atomic_fetch_add_explicit(&ray_asof_perpart_runs_ctr, 1, memory_order_relaxed);
+
+            if (lseg < 0) continue;    /* quotes-only day → nothing to emit */
+
+            ray_t* day_l = asof_eval_select_segment(ldict, lparted, (int32_t)lseg);
             if (!day_l || RAY_IS_ERR(day_l)) { err = day_l ? day_l : ray_error("type", NULL); break; }
-            ray_t* day_r = asof_eval_select_segment(rdict, rparted, (int32_t)p);
-            if (!day_r || RAY_IS_ERR(day_r)) { ray_release(day_l); err = day_r ? day_r : ray_error("type", NULL); break; }
+
+            ray_t* day_r;
+            if (rseg >= 0) {
+                day_r = asof_eval_select_segment(rdict, rparted, (int32_t)rseg);
+                if (!day_r || RAY_IS_ERR(day_r)) { ray_release(day_l); err = day_r ? day_r : ray_error("type", NULL); break; }
+            } else {
+                /* trades-only day: no quote partition for d → empty right. */
+                if (!empty_r) {
+                    empty_r = asof_empty_right(rdict, rparted);
+                    if (!empty_r || RAY_IS_ERR(empty_r)) { ray_release(day_l); err = empty_r ? empty_r : ray_error("type", NULL); empty_r = NULL; break; }
+                }
+                day_r = empty_r; ray_retain(day_r);   /* balance the release below */
+            }
 
             ray_t* part = ray_asof_join_core(keys_vec, day_l, day_r);
             ray_release(day_l); ray_release(day_r);
-            atomic_fetch_add_explicit(&ray_asof_perpart_runs_ctr, 1, memory_order_relaxed);
             if (!part || RAY_IS_ERR(part)) { err = part ? part : ray_error("type", NULL); break; }
 
             ray_t* merged = ray_result_merge(accum, part);  /* returns owned */
@@ -14035,13 +14133,15 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
             accum = merged;
             if (!accum || RAY_IS_ERR(accum)) { err = accum; accum = NULL; break; }
         }
+        if (empty_r) ray_release(empty_r);
         ray_release(lparted); ray_release(rparted); ray_release(keys_vec);
         if (err) { if (accum) ray_release(accum); return err; }
         return accum ? accum : ray_error("domain", "asof stream: no partitions produced");
     }
 
-    /* Fallback: not the parted-select shape — evaluate operands and run the
-     * flat kernel (identical to pre-spike behaviour). */
+    /* Fallback: not the parted-select shape, or a non-date partition scheme —
+     * evaluate operands and run the flat kernel (identical to pre-spike
+     * behaviour, always correct). */
     if (lparted) ray_release(lparted);
     if (rparted) ray_release(rparted);
 
