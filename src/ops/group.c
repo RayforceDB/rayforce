@@ -33,6 +33,19 @@
 #include "ops/idxop.h"      /* RAY_IDX_DICT: group on persisted string codes */
 #include "core/runtime.h"   /* __VM — per-thread group-key cardinality hint */
 
+/* Monotonic count of exec_group_per_partition entries (the streaming parted
+ * GROUP kernel).  Bumped ONCE at the kernel entry — O(1) per query, never
+ * per-row, so it does not violate the "instrumentation never costs O(data)"
+ * rule.  Counts every entry regardless of success/cancel/NULL-return.  Atomic
+ * because group exec may run on worker threads.  Surfaced via
+ * ray_group_perpart_runs() and (.sys.mem)'s "group-perpart-runs" entry. */
+static _Atomic(int64_t) ray_group_perpart_runs_ctr = 0;
+
+int64_t ray_group_perpart_runs(void) {
+    return atomic_load_explicit(&ray_group_perpart_runs_ctr,
+                                memory_order_relaxed);
+}
+
 /* ============================================================================
  * Reduction execution
  * ============================================================================ */
@@ -10937,6 +10950,11 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
                          int32_t n_parts, const int64_t* key_syms,
                          const int64_t* agg_syms, int has_avg,
                          int has_stddev, int64_t group_limit) {
+
+    /* Count every entry into the streaming per-partition kernel (O(1), see the
+     * ray_group_perpart_runs_ctr definition near the top of this file). */
+    atomic_fetch_add_explicit(&ray_group_perpart_runs_ctr, 1,
+                              memory_order_relaxed);
 
     uint32_t n_keys = ext->n_keys;
     uint32_t n_aggs = ext->n_aggs;

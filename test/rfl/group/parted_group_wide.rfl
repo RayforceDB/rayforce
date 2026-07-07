@@ -1,71 +1,83 @@
-;; parted_group_wide.rfl — wide parted GROUP BY (9 keys, 9 aggregates).
+;; parted_group_wide.rfl — wide parted GROUP BY (9 keys, 9 aggregates) that
+;; genuinely DRIVES the streaming per-partition kernel.
 ;;
-;; Exercises exec_group_per_partition (src/ops/group.c) beyond the historical
-;; n_keys<=8 / n_aggs<=8 cap.  A 2-partition parted table is grouped by 9 key
-;; columns with 9 aggregates (incl. AVG/STDDEV/VAR decomposition slots).  The
-;; result MUST match the identical-data flat in-memory table row-for-row.
+;; exec_group_parted (src/ops/group.c) only calls exec_group_per_partition when
+;; the cardinality gate holds: est_groups*100 <= rows_per_part, where est_groups
+;; is the product of per-key cardinalities.  A small fixture with every key
+;; varying routes through the concat fallback instead, making the assertions
+;; vacuous.  So here 8 of the 9 group keys are CONSTANT columns (cardinality 1)
+;; and only ONE key varies with 3 distinct values → est_groups = 3; with 400
+;; rows/partition rows_per_part = 400 >= 100*3 = 300, clearing the gate.
 ;;
-;; Today (pre-change) this passes via the concat fallback (same kernel as the
-;; flat path).  After the per-partition buffers are sized from their true
-;; bounds, the wide group takes the streaming per-partition path — this test
-;; guards that the answer is unchanged.
+;; Two assertions: (a) group-perpart-runs (from (.sys.mem)) strictly increments,
+;; proving exec_group_per_partition actually ran; (b) the parted grouped result
+;; equals the identical-data flat in-memory oracle, row-for-row (sorted by the
+;; varying key), covering all 9 aggregate ops incl. AVG/STDDEV/VAR decomposition.
 
-;; ─── fixture: 2 partitions, 6 rows each, 3 groups spanning both ──────────
-;;   group id g = [0 1 2 0 1 2] per partition (each group = 2 rows/partition)
-;;   9 key columns: k_i = g + i*100  (bijection with g → 3 groups)
-;;   value column v (F64), integer-valued so exact aggs are order-independent
-(set G1 [0 1 2 0 1 2])
-(set G2 [0 1 2 0 1 2])
-(set V1 (as 'F64 [10.0 40.0 70.0 20.0 50.0 80.0]))
-(set V2 (as 'F64 [30.0 60.0 90.0 40.0 70.0 100.0]))
-(set P1 (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list G1 (+ G1 100) (+ G1 200) (+ G1 300) (+ G1 400) (+ G1 500) (+ G1 600) (+ G1 700) (+ G1 800) V1)))
-(set P2 (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list G2 (+ G2 100) (+ G2 200) (+ G2 300) (+ G2 400) (+ G2 500) (+ G2 600) (+ G2 700) (+ G2 800) V2)))
+;; ─── fixture: 2 partitions, 400 rows each, 3 groups spanning both ────────────
+;;   kv = (% (til 400) 3) → varying key with 3 distinct values (the only one)
+;;   k1..k8 = constant columns (cardinality 1 each) so est_groups stays = 3
+;;   v = F64 value column (partition 2 offset by 1000 so aggregates differ)
+(set N 400)
+(set KV (% (til N) 3))
+(set C1 (+ 11 (* 0 (til N))))
+(set C2 (+ 22 (* 0 (til N))))
+(set C3 (+ 33 (* 0 (til N))))
+(set C4 (+ 44 (* 0 (til N))))
+(set C5 (+ 55 (* 0 (til N))))
+(set C6 (+ 66 (* 0 (til N))))
+(set C7 (+ 77 (* 0 (til N))))
+(set C8 (+ 88 (* 0 (til N))))
+(set V1 (as 'F64 (til N)))
+(set V2 (as 'F64 (+ 1000 (til N))))
+(set P1 (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list KV C1 C2 C3 C4 C5 C6 C7 C8 V1)))
+(set P2 (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list KV C1 C2 C3 C4 C5 C6 C7 C8 V2)))
 (.sys.exec "rm -rf /tmp/rfl_pgw")
 (.db.splayed.set "/tmp/rfl_pgw/1/t/" P1)
 (.db.splayed.set "/tmp/rfl_pgw/2/t/" P2)
 (set Pw (.db.parted.get "/tmp/rfl_pgw/" 't))
 
 ;; identical-data flat in-memory table (part1 rows ++ part2 rows, same order)
-(set GA (concat G1 G2))
+(set KA (concat KV KV))
 (set VA (concat V1 V2))
-(set TF (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list GA (+ GA 100) (+ GA 200) (+ GA 300) (+ GA 400) (+ GA 500) (+ GA 600) (+ GA 700) (+ GA 800) VA)))
+(set TF (table [k0 k1 k2 k3 k4 k5 k6 k7 k8 v] (list KA (concat C1 C1) (concat C2 C2) (concat C3 C3) (concat C4 C4) (concat C5 C5) (concat C6 C6) (concat C7 C7) (concat C8 C8) VA)))
 
-;; ─── wide group: 9 keys, 9 aggregates, sorted by k0 for stable compare ──
+;; ─── snapshot the streaming-kernel run counter BEFORE the parted group ───────
+(set B (at (.sys.mem) 'group-perpart-runs))
+
+;; ─── wide group: 9 keys, 9 aggregates, sorted by k0 for stable compare ───────
 (set RP (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) sdv: (stddev v) vrv: (var v) fv: (first v) lv: (last v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8} from: Pw asc: k0}))
+
+;; ─── snapshot AFTER: the streaming per-partition kernel must have run ─────────
+(set A (at (.sys.mem) 'group-perpart-runs))
+;; PROVES exec_group_per_partition executed (else fixture routed via concat).
+(> A B) -- true
+
 (set RF (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) sdv: (stddev v) vrv: (var v) fv: (first v) lv: (last v) by: {k0: k0 k1: k1 k2: k2 k3: k3 k4: k4 k5: k5 k6: k6 k7: k7 k8: k8} from: TF asc: k0}))
 
 ;; cardinality: 3 groups
 (count RP) -- 3
 (count RP) -- (count RF)
 
-;; key columns match flat
+;; key columns match flat oracle
 (at RP 'k0) -- (at RF 'k0)
 (at RP 'k4) -- (at RF 'k4)
 (at RP 'k8) -- (at RF 'k8)
+(at RP 'k0) -- [0 1 2]
+(at RP 'k8) -- [88 88 88]
 
 ;; exact (order-independent integer-valued) aggregates match flat
-(at RP 'sv) -- (at RF 'sv)
-(at RP 'cv) -- (at RF 'cv)
+(at RP 'sv)  -- (at RF 'sv)
+(at RP 'cv)  -- (at RF 'cv)
 (at RP 'mnv) -- (at RF 'mnv)
 (at RP 'mxv) -- (at RF 'mxv)
-(at RP 'fv) -- (at RF 'fv)
-(at RP 'lv) -- (at RF 'lv)
-
-;; independent literal oracle for the exact aggregates
-(at RP 'k0) -- [0 1 2]
-(at RP 'k8) -- [800 801 802]
-(at RP 'sv) -- (as 'F64 [100.0 220.0 340.0])
-(at RP 'cv) -- [4 4 4]
-(at RP 'mnv) -- (as 'F64 [10.0 40.0 70.0])
-(at RP 'mxv) -- (as 'F64 [40.0 70.0 100.0])
-(at RP 'av) -- (as 'F64 [25.0 55.0 85.0])
-(at RP 'fv) -- (as 'F64 [10.0 40.0 70.0])
-(at RP 'lv) -- (as 'F64 [40.0 70.0 100.0])
+(at RP 'fv)  -- (at RF 'fv)
+(at RP 'lv)  -- (at RF 'lv)
 
 ;; float aggregates (avg/stddev/var) match flat within tolerance
-(< (max (abs (- (at RP 'av) (at RF 'av)))) 0.000001) -- true
+(< (max (abs (- (at RP 'av)  (at RF 'av))))  0.000001) -- true
 (< (max (abs (- (at RP 'sdv) (at RF 'sdv)))) 0.000001) -- true
 (< (max (abs (- (at RP 'vrv) (at RF 'vrv)))) 0.000001) -- true
 
-;; ─── cleanup ────────────────────────────────────────────────────────────
+;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_pgw")

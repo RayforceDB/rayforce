@@ -957,6 +957,10 @@ ray_t* ray_wide_minmax_per_group_buf(ray_t* src, uint16_t op,
 
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit);
 
+/* Monotonic count of streaming parted-GROUP kernel (exec_group_per_partition)
+ * entries.  O(1) per query; surfaced via (.sys.mem)'s "group-perpart-runs". */
+int64_t ray_group_perpart_runs(void);
+
 /* Slice-group fusion probe (exec.c): arm g's slice-group hint instead of
  * executing the WHERE filter when its predicate is exactly in/eq on the
  * single bare group-key column with a fresh CSR hash index.  See the

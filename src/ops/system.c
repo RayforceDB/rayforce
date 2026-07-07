@@ -26,6 +26,7 @@
 #include "lang/eval.h"  /* LAMBDA_PARAMS */
 #include "lang/parse.h"
 #include "ops/ops.h"    /* ray_is_lazy, ray_lazy_materialize */
+#include "ops/internal.h"   /* ray_group_perpart_runs — (.sys.mem) counter */
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "core/profile.h"   /* g_ray_profile — (.sys.prof) */
@@ -720,9 +721,9 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
     ray_mem_stats_t st;
     ray_mem_stats(&st);
 
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 11);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 12);
     if (RAY_IS_ERR(keys)) return keys;
-    ray_t* vals = ray_list_new(11);
+    ray_t* vals = ray_list_new(12);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
     struct { const char* name; size_t nlen; int64_t v; } rows[] = {
@@ -737,6 +738,7 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
         { "anon-committed",  14, ray_heap_anon_committed()     },
         { "anon-peak",        9, ray_heap_anon_peak()          },
         { "anon-watermark",  14, ray_heap_anon_watermark()     },
+        { "group-perpart-runs", 18, ray_group_perpart_runs()   },
     };
     for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
         int64_t s = ray_sym_intern(rows[i].name, rows[i].nlen);
