@@ -14039,6 +14039,24 @@ static ray_t* asof_empty_right(ray_t* dict, ray_t* parted_tbl) {
     return out;
 }
 
+/* O(ncols) positional column-NAME alignment check.  ray_result_merge /
+ * ray_vec_concat pair columns by INDEX, so concatenating two tables is only
+ * meaningful when they list the same column names in the same order.
+ * asof_carry_recompute reorders the carry to the day segment's column order to
+ * keep this invariant, and every day's segment is the same rdict select over
+ * the same parted table (so its order is stable) — but both are implicit.  This
+ * guard makes the invariant explicit and lets a merge site fail LOUD (clean
+ * schema error) rather than silently concatenating a column under the wrong
+ * name.  Returns true iff aligned; O(ncols), never O(rows). */
+static bool asof_cols_aligned(ray_t* a, ray_t* b) {
+    if (!a || !b || a->type != RAY_TABLE || b->type != RAY_TABLE) return false;
+    int64_t na = ray_table_ncols(a), nb = ray_table_ncols(b);
+    if (na != nb) return false;
+    for (int64_t c = 0; c < na; c++)
+        if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return false;
+    return true;
+}
+
 /* ── cross-day carry: running last-prevailing-quote per equality-key tuple ───
  *
  * Recompute the carry table from `qtab` (= prior carry rows PREPENDED to the
@@ -14219,6 +14237,11 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
             ray_release(lparted); ray_release(rparted); ray_release(keys_vec);
             return ray_error("oom", NULL);
         }
+        /* Trailing time-key column name: used to sort each day's carry view
+         * time-ascending before the group-last (see below).  Captured up front
+         * with the same sym validation ray_asof_join_core applies, since a
+         * quotes-only first day sorts + recomputes carry BEFORE the core runs. */
+        int64_t time_name = -1;
         {
             ray_t** ke = (ray_t**)ray_data(eqn_kv);
             for (int64_t k = 0; k < n_eq_c; k++) {
@@ -14235,6 +14258,17 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
                     return ray_error("type", "asof-join: equality key must be a symbol, got %s", ray_type_name(kt));
                 }
                 eq_names[k] = ke[k]->i64;
+            }
+            if (is_list(eqn_kv) && ray_len(eqn_kv) >= 1) {
+                ray_t* tk = ke[ray_len(eqn_kv) - 1];
+                if (tk->type != -RAY_SYM) {
+                    int8_t tt = tk->type;
+                    if (eqn_kbx) ray_release(eqn_kbx);
+                    scratch_free(eqn_hdr);
+                    ray_release(lparted); ray_release(rparted); ray_release(keys_vec);
+                    return ray_error("type", "asof-join: time key must be a symbol, got %s", ray_type_name(tt));
+                }
+                time_name = tk->i64;
             }
         }
         if (eqn_kbx) ray_release(eqn_kbx);
@@ -14271,6 +14305,14 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
              * the carry table directly as the prevailing-quote view. */
             ray_t* qtab = NULL;
             if (day_r_seg && carry) {
+                /* Guard the positional-concat invariant before the merge: the
+                 * carry MUST list the same columns in the same order as today's
+                 * quote segment, else ray_result_merge would concat mismatched
+                 * columns.  O(ncols); fail loud rather than corrupt silently. */
+                if (!asof_cols_aligned(carry, day_r_seg)) {
+                    err = ray_error("schema", "asof stream: carry/quote column order mismatch");
+                    ray_release(day_r_seg); break;
+                }
                 qtab = ray_result_merge(carry, day_r_seg);
                 /* ray_result_merge / ray_vec_concat propagate OOM as a BARE
                  * NULL, not a RAY_IS_ERR sentinel.  Both merge inputs are
@@ -14284,6 +14326,27 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
             else if (day_r_seg)    { qtab = day_r_seg; ray_retain(qtab); }
             else if (carry)        { qtab = carry;     ray_retain(qtab); }
             if (qtab && RAY_IS_ERR(qtab)) { err = qtab; qtab = NULL; if (day_r_seg) ray_release(day_r_seg); break; }
+
+            /* Sort the prevailing-quote view time-ascending.  The asof KERNEL
+             * re-sorts its right input internally, so this does not change a
+             * same-day match — but asof_carry_recompute derives the carry with a
+             * `(last col) by: eq` group-by, whose `last` picks each group's LAST
+             * ROW IN qtab ORDER.  That equals the latest-TIME quote only when
+             * qtab is time-ascending per group; a day segment stored time-
+             * UNSORTED would otherwise carry the wrong (last-stored) quote
+             * forward.  Carry rows keep their older prior-day timestamps and stay
+             * ahead of the same-day quotes.  sort_table_by_keys bails early and
+             * returns the input retained when already ordered (the common case),
+             * so a sorted day pays only an O(n) monotonicity scan. */
+            if (qtab && time_name >= 0) {
+                ray_t* sk = ray_sym(time_name);
+                if (!sk || RAY_IS_ERR(sk)) { err = sk ? sk : ray_error("oom", NULL); ray_release(qtab); if (day_r_seg) ray_release(day_r_seg); break; }
+                ray_t* qs = sort_table_by_keys(qtab, sk, 0);
+                ray_release(sk);
+                ray_release(qtab);
+                qtab = qs;
+                if (!qtab || RAY_IS_ERR(qtab)) { err = qtab ? qtab : ray_error("type", NULL); qtab = NULL; if (day_r_seg) ray_release(day_r_seg); break; }
+            }
 
             /* Emit this day's trades (if any) against the prevailing-quote view. */
             if (lseg >= 0) {
@@ -14307,6 +14370,15 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
                 ray_release(day_l); ray_release(rt);
                 if (!part || RAY_IS_ERR(part)) { err = part ? part : ray_error("type", NULL); if (qtab) ray_release(qtab); if (day_r_seg) ray_release(day_r_seg); break; }
 
+                /* Same positional-concat guard for the day-to-day output
+                 * accumulation: every day's asof output must share the running
+                 * result's column order.  accum == NULL on the first emit
+                 * (ray_result_merge then just adopts part), so only check when
+                 * there is something to concat against. */
+                if (accum && !asof_cols_aligned(accum, part)) {
+                    err = ray_error("schema", "asof stream: per-day output column order mismatch");
+                    ray_release(part); if (qtab) ray_release(qtab); if (day_r_seg) ray_release(day_r_seg); break;
+                }
                 ray_t* merged = ray_result_merge(accum, part);  /* returns owned */
                 ray_release(part);
                 if (accum) ray_release(accum);

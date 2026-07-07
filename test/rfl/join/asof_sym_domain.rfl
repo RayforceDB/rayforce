@@ -1,0 +1,72 @@
+;; asof_sym_domain.rfl — streaming parted asof resolves SYM equality keys under
+;; a CONSISTENT domain across day partitions and the cross-day carry.
+;;
+;; The carry rows come from a group-by over a prior day's quote segment and are
+;; PREPENDED (ray_vec_concat) to the next day's segment.  All segments of one
+;; parted table share the ROOT .sym domain (store/part.c ray_read_parted opens
+;; db_root/.sym ONCE and passes the shared domain to every partition).  So the
+;; carry's SYM columns and the next segment's SYM columns are same-domain and
+;; concat is a raw append; even were they to diverge, ray_vec_concat translates
+;; both sides to the runtime domain (vec.c cross-domain path) and the kernel's
+;; cross-domain eq-key xlut still matches correctly.  Either way the streamed
+;; SYM keys must resolve identically to the flat oracle — this fixture is the
+;; ≥3-day GUARD for that.
+;;
+;; Ground truth is the FLAT oracle: concatenate all partitions and run the eager
+;; asof.  The streamed result must equal it column-for-column, over THREE days
+;; with carry, gaps, and each of two symbols going quiet on a different day.
+
+(.sys.exec "rm -rf /tmp/rfl_asof_symdom_t /tmp/rfl_asof_symdom_q")
+
+;; Day 1 (2024.01.01): quotes for a (:00 bid10, :02 bid11) and b (:01 bid50).
+(set Q1 (table [Sym Time Bid] (list [a a b] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:01.000000000] (as 'F64 [10.0 11.0 50.0]))))
+;; Day 1 trades: a@:03 same-day :02 bid11 ; b@:02 same-day :01 bid50.
+(set T1 (table [Sym Time Price] (list [a b] [2024.01.01D10:00:03.000000000 2024.01.01D10:00:02.000000000] (as 'F64 [1.0 2.0]))))
+
+;; Day 2 (2024.01.02): quotes for a ONLY (:05 bid20).  b goes quiet.
+(set Q2 (table [Sym Time Bid] (list [a] [2024.01.02D10:00:05.000000000] (as 'F64 [20.0]))))
+;; Day 2 trades:
+;;   a@:04 → CARRY day-1 a :02 bid11 (before day-2's :05 quote)
+;;   a@:06 → same-day :05 bid20
+;;   b@:07 → GAP: b did not quote day 2 → day-1 carry bid50
+(set T2 (table [Sym Time Price] (list [a a b] [2024.01.02D10:00:04.000000000 2024.01.02D10:00:06.000000000 2024.01.02D10:00:07.000000000] (as 'F64 [3.0 4.0 5.0]))))
+
+;; Day 3 (2024.01.03): quotes for b ONLY (:10 bid60).  a goes quiet.
+(set Q3 (table [Sym Time Bid] (list [b] [2024.01.03D10:00:10.000000000] (as 'F64 [60.0]))))
+;; Day 3 trades:
+;;   a@:11 → GAP: a did not quote day 3 → day-2 carry bid20
+;;   b@:09 → CARRY day-1 b bid50 (before day-3's :10 quote)
+;;   b@:12 → same-day :10 bid60
+(set T3 (table [Sym Time Price] (list [a b b] [2024.01.03D10:00:11.000000000 2024.01.03D10:00:09.000000000 2024.01.03D10:00:12.000000000] (as 'F64 [6.0 7.0 8.0]))))
+
+(.db.splayed.set "/tmp/rfl_asof_symdom_q/2024.01.01/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_symdom_q/2024.01.02/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_symdom_q/2024.01.03/quote/" Q3)
+(.db.splayed.set "/tmp/rfl_asof_symdom_t/2024.01.01/trade/" T1)
+(.db.splayed.set "/tmp/rfl_asof_symdom_t/2024.01.02/trade/" T2)
+(.db.splayed.set "/tmp/rfl_asof_symdom_t/2024.01.03/trade/" T3)
+(set Pt (.db.parted.get "/tmp/rfl_asof_symdom_t/" 'trade))
+(set Pq (.db.parted.get "/tmp/rfl_asof_symdom_q/" 'quote))
+
+;; flat oracle — all partitions concatenated (day-ascending, trade input order).
+(set TF (table [Sym Time Price] (list [a b a a b a b b] [2024.01.01D10:00:03.000000000 2024.01.01D10:00:02.000000000 2024.01.02D10:00:04.000000000 2024.01.02D10:00:06.000000000 2024.01.02D10:00:07.000000000 2024.01.03D10:00:11.000000000 2024.01.03D10:00:09.000000000 2024.01.03D10:00:12.000000000] (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0]))))
+(set QF (table [Sym Time Bid] (list [a a b a b] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:01.000000000 2024.01.02D10:00:05.000000000 2024.01.03D10:00:10.000000000] (as 'F64 [10.0 11.0 50.0 20.0 60.0]))))
+
+;; ── (a) streaming ran: union of days = 3 (each day has both sides). ──────────
+(set Ba (at (.sys.mem) 'asof-perpart-runs))
+(set RS (asof-join [Sym Time] (select {from: Pt}) (select {from: Pq})))
+(set Aa (at (.sys.mem) 'asof-perpart-runs))
+(> Aa Ba) -- true
+(- Aa Ba) -- 3
+
+;; ── (b) parity vs flat oracle + explicit goldens across three days. ──────────
+(set RF (asof-join [Sym Time] TF QF))
+(count RS) -- 8
+(count RS) -- (count RF)
+(at RS 'Sym)   -- (at RF 'Sym)
+(at RS 'Price) -- (at RF 'Price)
+(at RS 'Bid)   -- (at RF 'Bid)
+;; Sym keys stay a/b (correct domain resolution); bids follow same-day/carry/gap.
+(at RS 'Sym)   -- [a b a a b a b b]
+(at RS 'Bid)   -- (as 'F64 [11.0 50.0 11.0 20.0 50.0 20.0 50.0 60.0])
+(at RS 'Price) -- (as 'F64 [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0])

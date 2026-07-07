@@ -1,0 +1,67 @@
+;; asof_unsorted_day.rfl — streaming parted asof tolerates a day whose quote
+;; rows are NOT in time order.
+;;
+;; The asof kernel (exec_window_join, src/ops/join.c) needs time-ascending
+;; quotes WITHIN each equality-key group.  Global sortedness is NOT guaranteed
+;; once data is chunked per day: a single day's on-disk segment can be stored
+;; time-UNSORTED depending on ingest order.  The kernel runs its own per-call
+;; sort-merge whenever the presort markers (RAY_ATTR_SORTED / parted-within
+;; time monotonicity) are absent, so each per-day call re-sorts and stays
+;; correct — this fixture is the GUARD that proves it composes through the
+;; streaming path (and that the prepended carry, which ray_vec_concat builds
+;; WITHOUT a stale sorted marker, does not trip the presort shortcut).
+;;
+;; Ground truth is the FLAT oracle: concatenate all partitions and run the eager
+;; asof (non-select operands → fallback).  The streamed result must equal it
+;; column-for-column.
+
+(.sys.exec "rm -rf /tmp/rfl_asof_unsorted_t /tmp/rfl_asof_unsorted_q")
+
+;; Day 1 (2024.01.01) quotes for a — stored OUT OF TIME ORDER on disk:
+;;   row0 :05 bid200, row1 :00 bid99, row2 :02 bid100  (NOT ascending).
+;; The kernel must sort these so the asof resolves each trade to the correct
+;; most-recent-at-or-before quote.
+(set Q1 (table [Sym Time Bid] (list [a a a] [2024.01.01D10:00:05.000000000 2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000] (as 'F64 [200.0 99.0 100.0]))))
+;; Day 1 trades (input order preserved through the join):
+;;   a@:01 → most-recent ≤:01 is the :00 quote (bid99)
+;;   a@:03 → most-recent ≤:03 is the :02 quote (bid100)
+;;   a@:06 → most-recent ≤:06 is the :05 quote (bid200)
+(set T1 (table [Sym Time Price] (list [a a a] [2024.01.01D10:00:01.000000000 2024.01.01D10:00:03.000000000 2024.01.01D10:00:06.000000000] (as 'F64 [10.0 11.0 12.0]))))
+
+;; Day 2 (2024.01.02) quotes for a — also stored OUT OF ORDER:
+;;   row0 :04 bid400, row1 :01 bid300.
+(set Q2 (table [Sym Time Bid] (list [a a] [2024.01.02D10:00:04.000000000 2024.01.02D10:00:01.000000000] (as 'F64 [400.0 300.0]))))
+;; Day 2 trades:
+;;   a@:00 → earlier than day-2's first (:01) quote → CARRY day-1 last (:05 bid200)
+;;   a@:02 → same-day :01 bid300
+;;   a@:05 → same-day :04 bid400
+(set T2 (table [Sym Time Price] (list [a a a] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000 2024.01.02D10:00:05.000000000] (as 'F64 [20.0 21.0 22.0]))))
+
+(.db.splayed.set "/tmp/rfl_asof_unsorted_q/2024.01.01/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_unsorted_q/2024.01.02/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_unsorted_t/2024.01.01/trade/" T1)
+(.db.splayed.set "/tmp/rfl_asof_unsorted_t/2024.01.02/trade/" T2)
+(set Pt (.db.parted.get "/tmp/rfl_asof_unsorted_t/" 'trade))
+(set Pq (.db.parted.get "/tmp/rfl_asof_unsorted_q/" 'quote))
+
+;; flat oracle — every partition concatenated (day-ascending, trade input order).
+;; The quote oracle keeps the SAME out-of-order storage the kernel re-sorts.
+(set TF (table [Sym Time Price] (list [a a a a a a] [2024.01.01D10:00:01.000000000 2024.01.01D10:00:03.000000000 2024.01.01D10:00:06.000000000 2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000 2024.01.02D10:00:05.000000000] (as 'F64 [10.0 11.0 12.0 20.0 21.0 22.0]))))
+(set QF (table [Sym Time Bid] (list [a a a a a] [2024.01.01D10:00:05.000000000 2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.02D10:00:04.000000000 2024.01.02D10:00:01.000000000] (as 'F64 [200.0 99.0 100.0 400.0 300.0]))))
+
+;; ── (a) streaming ran: union of days = 2. ────────────────────────────────────
+(set Ba (at (.sys.mem) 'asof-perpart-runs))
+(set RS (asof-join [Sym Time] (select {from: Pt}) (select {from: Pq})))
+(set Aa (at (.sys.mem) 'asof-perpart-runs))
+(> Aa Ba) -- true
+(- Aa Ba) -- 2
+
+;; ── (b) parity vs flat oracle + explicit goldens (kernel re-sorted each day). ─
+(set RF (asof-join [Sym Time] TF QF))
+(count RS) -- 6
+(count RS) -- (count RF)
+(at RS 'Price) -- (at RF 'Price)
+(at RS 'Bid)   -- (at RF 'Bid)
+;; Bid golden: [:01→99][:03→100][:06→200] day1, then [cross-day carry 200][:02→300][:05→400] day2.
+(at RS 'Bid)   -- (as 'F64 [99.0 100.0 200.0 200.0 300.0 400.0])
+(at RS 'Price) -- (as 'F64 [10.0 11.0 12.0 20.0 21.0 22.0])

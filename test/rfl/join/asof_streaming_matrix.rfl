@@ -1,0 +1,84 @@
+;; asof_streaming_matrix.rfl — ONE fixture exercising the whole streaming parted
+;; asof surface together: multi-day + cross-day carry + symbol gaps + multi-key
+;; (Sym,Ex) tuple + one-sided days (trades-only AND quotes-only) + first
+;; appearance (no prior quote → null right) + an UNSORTED-within-day quote
+;; segment.  This is the integration guard for Tasks 1–2 and the hardening
+;; items combined.
+;;
+;; Ground truth is the FLAT oracle: concatenate ALL partitions into one trade
+;; table and one quote table, then run the eager asof (non-select operands →
+;; fallback path).  The streamed result must equal it column-for-column, and the
+;; per-partition run counter must equal the UNION of both sides' distinct days.
+;;
+;; Layout (keys [Sym Ex Time]):
+;;   Quotes on days {01.01, 01.02, 01.04} ; trades on days {01.02, 01.03, 01.05}.
+;;   Union = 5 distinct days → asof-perpart-runs == 5.
+;;   01.01 quotes-only (seeds carry) · 01.03 & 01.05 trades-only (all carry) ·
+;;   01.04 quotes-only (refreshes carry) · 01.02 both, with an out-of-order
+;;   (a,N) quote segment and a first-appearance (c,N) trade.
+
+(.sys.exec "rm -rf /tmp/rfl_asof_matrix_t /tmp/rfl_asof_matrix_q")
+
+;; ── Day 01.01 — QUOTES-ONLY (seeds carry): (a,N):02=100 (a,Q):02=900 (b,N):03=50
+(set Q1 (table [Sym Ex Time Bid] (list [a a b] [N Q N] [2024.01.01D10:00:02.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:03.000000000] (as 'F64 [100.0 900.0 50.0]))))
+
+;; ── Day 01.02 — BOTH sides.  (a,N) quote rows stored OUT OF TIME ORDER
+;;    (:05 before :01) so the kernel must re-sort per day.  (b,N):04=55.
+(set Q2 (table [Sym Ex Time Bid] (list [a a b] [N N N] [2024.01.02D10:00:05.000000000 2024.01.02D10:00:01.000000000 2024.01.02D10:00:04.000000000] (as 'F64 [110.0 105.0 55.0]))))
+;; Day 01.02 trades (input order preserved):
+;;   (a,N)@:00 → CARRY day-1 (a,N):02 bid100 (before day-2's first :01 quote)
+;;   (a,N)@:03 → same-day :01 bid105
+;;   (a,Q)@:06 → GAP: (a,Q) no quote day 2 → day-1 carry bid900
+;;   (b,N)@:05 → same-day :04 bid55
+;;   (c,N)@:01 → FIRST APPEARANCE: c never quoted anywhere → null right
+(set T2 (table [Sym Ex Time Price] (list [a a a b c] [N N Q N N] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:03.000000000 2024.01.02D10:00:06.000000000 2024.01.02D10:00:05.000000000 2024.01.02D10:00:01.000000000] (as 'F64 [10.0 11.0 12.0 13.0 14.0]))))
+
+;; ── Day 01.03 — TRADES-ONLY (all resolve to carry):
+;;   (a,N)@:00 → carry = day-2 last (a,N):05 bid110
+;;   (a,Q)@:00 → carry = day-1 (a,Q) bid900 (never re-quoted)
+;;   (b,N)@:00 → carry = day-2 (b,N):04 bid55
+(set T3 (table [Sym Ex Time Price] (list [a a b] [N Q N] [2024.01.03D10:00:00.000000000 2024.01.03D10:00:00.000000000 2024.01.03D10:00:00.000000000] (as 'F64 [20.0 21.0 22.0]))))
+
+;; ── Day 01.04 — QUOTES-ONLY (refreshes carry, emits nothing): (a,N):20=200
+(set Q4 (table [Sym Ex Time Bid] (list [a] [N] [2024.01.04D10:00:20.000000000] (as 'F64 [200.0]))))
+
+;; ── Day 01.05 — TRADES-ONLY: (a,N)@:00 → carry = day-4 (a,N):20 bid200
+(set T5 (table [Sym Ex Time Price] (list [a] [N] [2024.01.05D10:00:00.000000000] (as 'F64 [30.0]))))
+
+(.db.splayed.set "/tmp/rfl_asof_matrix_q/2024.01.01/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_matrix_q/2024.01.02/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_matrix_q/2024.01.04/quote/" Q4)
+(.db.splayed.set "/tmp/rfl_asof_matrix_t/2024.01.02/trade/" T2)
+(.db.splayed.set "/tmp/rfl_asof_matrix_t/2024.01.03/trade/" T3)
+(.db.splayed.set "/tmp/rfl_asof_matrix_t/2024.01.05/trade/" T5)
+(set Pt (.db.parted.get "/tmp/rfl_asof_matrix_t/" 'trade))
+(set Pq (.db.parted.get "/tmp/rfl_asof_matrix_q/" 'quote))
+
+;; flat oracle — every partition concatenated (day-ascending, within-day input order).
+(set TF (table [Sym Ex Time Price] (list [a a a b c a a b a] [N N Q N N N Q N N] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:03.000000000 2024.01.02D10:00:06.000000000 2024.01.02D10:00:05.000000000 2024.01.02D10:00:01.000000000 2024.01.03D10:00:00.000000000 2024.01.03D10:00:00.000000000 2024.01.03D10:00:00.000000000 2024.01.05D10:00:00.000000000] (as 'F64 [10.0 11.0 12.0 13.0 14.0 20.0 21.0 22.0 30.0]))))
+(set QF (table [Sym Ex Time Bid] (list [a a b a a b a] [N Q N N N N N] [2024.01.01D10:00:02.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:03.000000000 2024.01.02D10:00:05.000000000 2024.01.02D10:00:01.000000000 2024.01.02D10:00:04.000000000 2024.01.04D10:00:20.000000000] (as 'F64 [100.0 900.0 50.0 110.0 105.0 55.0 200.0]))))
+
+;; ── (a) streaming ran: union of days = 5 (== asof-perpart-runs delta). ────────
+(set Ba (at (.sys.mem) 'asof-perpart-runs))
+(set RS (asof-join [Sym Ex Time] (select {from: Pt}) (select {from: Pq})))
+(set Aa (at (.sys.mem) 'asof-perpart-runs))
+(> Aa Ba) -- true
+(- Aa Ba) -- 5
+
+;; ── (b) per-column parity vs the flat oracle for the WHOLE shape. ────────────
+(set RF (asof-join [Sym Ex Time] TF QF))
+(count RS) -- 9
+(count RS) -- (count RF)
+(at RS 'Sym)   -- (at RF 'Sym)
+(at RS 'Ex)    -- (at RF 'Ex)
+(at RS 'Time)  -- (at RF 'Time)
+(at RS 'Price) -- (at RF 'Price)
+(at RS 'Bid)   -- (at RF 'Bid)
+
+;; ── (c) explicit goldens (carry / gap / first-appearance / trades-only). ─────
+(at RS 'Sym)   -- [a a a b c a a b a]
+(at RS 'Ex)    -- [N N Q N N N Q N N]
+(at RS 'Price) -- (as 'F64 [10.0 11.0 12.0 13.0 14.0 20.0 21.0 22.0 30.0])
+;; Bid: [carry100][sameday105][gap900][sameday55][firstAppear null]
+;;      [carry110][carry900][carry55][carry200]
+(at RS 'Bid)   -- (as 'F64 [100.0 105.0 900.0 55.0 0Nf 110.0 900.0 55.0 200.0])
