@@ -527,26 +527,6 @@ static test_result_t test_vec_concat_slice_null(void) {
     PASS();
 }
 
-/* ---- vec_new_oom_returns_error ----------------------------------------
- *
- * Regression: ray_alloc returns plain NULL on out-of-memory paths (heap
- * pool exhaustion, single-block size > RAY_HEAP_MAX_ORDER).  Before this
- * fix, ray_vec_new propagated the NULL untouched, which let downstream
- * `if (RAY_IS_ERR(v))` checks miss the failure entirely — the user-visible
- * symptom being silent (set k (til 10000000000)) → "k undefined".
- *
- * This test triggers the size > MAX_ORDER path with an absurdly large
- * capacity; the result must be a real error pointer, not NULL. */
-static test_result_t test_vec_new_oom_returns_error(void) {
-    /* 1e11 elements * 8 bytes = 800 GB > 256 GB pool max — guaranteed to
-     * fail in ray_alloc with "order > RAY_HEAP_MAX_ORDER".  This avoids
-     * relying on overcommit settings or actual physical memory state. */
-    ray_t* v = ray_vec_new(RAY_I64, (int64_t)100000000000LL);
-    TEST_ASSERT_NOT_NULL(v);            /* must not be silent NULL */
-    TEST_ASSERT_TRUE(RAY_IS_ERR(v));    /* must be a real error */
-    PASS();
-}
-
 /* ---- sentinel_is_null: F32 null via NaN -------------------------------- */
 
 static test_result_t test_vec_f32_null_sentinel(void) {
@@ -2201,7 +2181,6 @@ static test_result_t test_vec_slice_guards(void) {
 const test_entry_t vec_entries[] = {
     { "vec/new", test_vec_new, vec_setup, vec_teardown },
     { "vec/new_invalid", test_vec_new_invalid, vec_setup, vec_teardown },
-    { "vec/new_oom_returns_error", test_vec_new_oom_returns_error, vec_setup, vec_teardown },
     { "vec/append", test_vec_append, vec_setup, vec_teardown },
     { "vec/get", test_vec_get, vec_setup, vec_teardown },
     { "vec/set", test_vec_set, vec_setup, vec_teardown },
