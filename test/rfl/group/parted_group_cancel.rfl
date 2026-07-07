@@ -1,0 +1,65 @@
+;; parted_group_cancel.rfl — cancellation-poll / sweep-progress smoke test.
+;;
+;; exec_group_per_partition (src/ops/group.c) streams a parted GROUP BY one
+;; partition at a time.  It now polls ray_interrupted() once per partition, in
+;; the pass-2 concat copy loops, and inside the O(groups) MAPCOMMON replicate
+;; loop, and ticks a single ray_progress_update meter across the whole sweep.
+;;
+;; Those polls/progress calls MUST be no-ops on the happy path: an uncancelled
+;; run returns byte-identical results to the flat in-memory kernel.  This test
+;; is the automated gate for that invariant (correctness-under-no-cancel).
+;;
+;; Deterministic cancellation cannot be provoked from .rfl, so cancel LATENCY
+;; (abort within ~one morsel, leak-free under ASan) is verified manually by the
+;; orchestrator — this file only proves the added instrumentation is inert.
+
+;; ─── fixture: 3 partitions, groups spanning all of them ─────────────────────
+;;   group id g = [0 1 2 0 1 2] per partition; value v (F64), integer-valued so
+;;   exact aggregates are order-independent.
+(set G1 [0 1 2 0 1 2])
+(set G2 [0 1 2 0 1 2])
+(set G3 [0 1 2 0 1 2])
+(set V1 (as 'F64 [10.0 40.0 70.0 20.0 50.0 80.0]))
+(set V2 (as 'F64 [30.0 60.0 90.0 40.0 70.0 100.0]))
+(set V3 (as 'F64 [11.0 41.0 71.0 21.0 51.0 81.0]))
+(set P1 (table [k v] (list G1 V1)))
+(set P2 (table [k v] (list G2 V2)))
+(set P3 (table [k v] (list G3 V3)))
+(.sys.exec "rm -rf /tmp/rfl_pgc")
+(.db.splayed.set "/tmp/rfl_pgc/1/t/" P1)
+(.db.splayed.set "/tmp/rfl_pgc/2/t/" P2)
+(.db.splayed.set "/tmp/rfl_pgc/3/t/" P3)
+(set Pp (.db.parted.get "/tmp/rfl_pgc/" 't))
+
+;; identical-data flat in-memory table (part1 ++ part2 ++ part3, same order)
+(set GA (concat (concat G1 G2) G3))
+(set VA (concat (concat V1 V2) V3))
+(set TF (table [k v] (list GA VA)))
+
+;; ─── streaming per-partition group vs flat kernel ───────────────────────────
+(set RP (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) by: {k: k} from: Pp asc: k}))
+(set RF (select {sv: (sum v) cv: (count v) mnv: (min v) mxv: (max v) av: (avg v) by: {k: k} from: TF asc: k}))
+
+;; cardinality: 3 groups
+(count RP) -- 3
+(count RP) -- (count RF)
+
+;; keys + exact aggregates match the flat kernel (no-op instrumentation proof)
+(at RP 'k)   -- (at RF 'k)
+(at RP 'sv)  -- (at RF 'sv)
+(at RP 'cv)  -- (at RF 'cv)
+(at RP 'mnv) -- (at RF 'mnv)
+(at RP 'mxv) -- (at RF 'mxv)
+
+;; independent literal oracle
+(at RP 'k)   -- [0 1 2]
+(at RP 'cv)  -- [6 6 6]
+(at RP 'sv)  -- (as 'F64 [132.0 312.0 492.0])
+(at RP 'mnv) -- (as 'F64 [10.0 40.0 70.0])
+(at RP 'mxv) -- (as 'F64 [40.0 70.0 100.0])
+
+;; float avg matches flat within tolerance
+(< (max (abs (- (at RP 'av) (at RF 'av)))) 0.000001) -- true
+
+;; ─── cleanup ────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_pgc")

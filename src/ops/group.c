@@ -11112,6 +11112,18 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
         for (int32_t bi = 0; bi < batch_n; bi++) {
             int32_t p = batch_start + bi;
 
+            /* Poll cancellation once per partition (in-memory parity: abort
+             * within one partition, not one whole sweep) and tick the sweep
+             * meter so a single progress bar advances 0→n_parts across all
+             * partitions.  batch_fail frees every live intermediate
+             * (bp[] partials, running, merge_tbl) — mirror the error path. */
+            if (ray_interrupted()) {
+                ret = ray_error("cancel", NULL);
+                goto batch_fail;
+            }
+            ray_progress_update("group", "per-partition aggregate",
+                                (uint64_t)p, (uint64_t)n_parts);
+
             /* Collect unique agg input sym IDs (avoid duplicate columns).
              * unique_agg carved above (sized part_n_aggs_max); reused each
              * partition — its contents are recomputed per iteration. */
@@ -11206,6 +11218,13 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
 
         /* Key columns */
         for (uint32_t k = 0; k < n_keys; k++) {
+            /* Poll cancellation before allocating this column's flat vec
+             * (each concat copy is O(total merged groups)).  No live `flat`
+             * yet, so batch_fail's bp[]/running/merge_tbl release is complete. */
+            if (ray_interrupted()) {
+                ret = ray_error("cancel", NULL);
+                goto batch_fail;
+            }
             int is_mc = 0;
             for (uint32_t m = 0; m < n_mc_keys; m++)
                 if (mc_sym_ids[m] == key_syms[k]) { is_mc = 1; break; }
@@ -11276,9 +11295,18 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
                     int32_t p = batch_start + i;
                     ray_t* mc_col = ray_table_get_col(parted_tbl, key_syms[k]);
                     ray_t* mc_kv = ((ray_t**)ray_data(mc_col))[0];
-                    for (int64_t r = 0; r < pnrows; r++)
+                    for (int64_t r = 0; r < pnrows; r++) {
+                        /* O(groups) replicate: stride-poll cancellation.
+                         * `flat` is live and not yet added to merge_tbl —
+                         * release it before routing through batch_fail. */
+                        if ((r & 0xFFFF) == 0 && ray_interrupted()) {
+                            ray_release(flat);
+                            ret = ray_error("cancel", NULL);
+                            goto batch_fail;
+                        }
                         parted_copy_cells(out, flat->type, out_attrs,
                                           off + r, mc_kv, p, 1);
+                    }
                     src_nulls |= mc_kv->attrs & RAY_ATTR_HAS_NULLS;
                     off += pnrows;
                 } else {
@@ -11300,6 +11328,12 @@ exec_group_per_partition(ray_t* parted_tbl, ray_op_ext_t* ext,
 
         /* Agg columns */
         for (uint32_t a = 0; a < part_n_aggs; a++) {
+            /* Poll cancellation before allocating this column's flat vec
+             * (concat copy is O(total merged groups)); no live `flat` yet. */
+            if (ray_interrupted()) {
+                ret = ray_error("cancel", NULL);
+                goto batch_fail;
+            }
             ray_t* tref = running
                 ? ray_table_get_col_idx(running, (int64_t)n_keys + a)
                 : ray_table_get_col_idx(bp[0], (int64_t)n_part_keys + a);
@@ -11405,6 +11439,10 @@ batch_fail:
         if (merge_tbl) ray_release(merge_tbl);
         goto pp_cleanup;
     }
+
+    /* Sweep complete: settle the meter at 100%. */
+    ray_progress_update("group", "per-partition aggregate",
+                        (uint64_t)n_parts, (uint64_t)n_parts);
 
     ray_t* result = running;
 
