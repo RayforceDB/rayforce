@@ -961,6 +961,22 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
  * entries.  O(1) per query; surfaced via (.sys.mem)'s "group-perpart-runs". */
 int64_t ray_group_perpart_runs(void);
 
+/* Monotonic count of streaming parted asof-join per-partition (day) runs
+ * bumped once per partition processed by the streaming asof path in query.c.
+ * O(1) per partition; surfaced via (.sys.mem)'s "asof-perpart-runs". */
+int64_t ray_asof_perpart_runs(void);
+
+/* Build a flat table holding one segment (seg_idx) of a parted table:
+ * parted columns yield segs[seg_idx], MAPCOMMON columns are broadcast.
+ * Returns an owned flat RAY_TABLE (rc=1), or a RAY_IS_ERR value.  Defined
+ * in exec.c; consumed by the streaming parted asof path in query.c. */
+ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx);
+
+/* Ordered concat-merge of two partial partition-streamed results (tables:
+ * per-column concat; vectors: direct concat).  Returns an OWNED result.
+ * Defined in exec.c; consumed by the streaming parted asof path in query.c. */
+ray_t* ray_result_merge(ray_t* accum, ray_t* partial);
+
 /* Slice-group fusion probe (exec.c): arm g's slice-group hint instead of
  * executing the WHERE filter when its predicate is exactly in/eq on the
  * single bare group-key column with a fresh CSR hash index.  See the

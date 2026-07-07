@@ -49,6 +49,7 @@
 #include <math.h>
 #include <inttypes.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 /* ══════════════════════════════════════════
  * Select query — DAG bridge
@@ -13803,16 +13804,23 @@ ray_t* ray_window_join1_fn(ray_t** args, int64_t n) {
     return window_join_impl(args, n, 1);
 }
 
-/* (asof-join [key1 key2 ... timeKey] leftTable rightTable)
- * Last key is the time/asof column, rest are equality keys.  The equality
- * keys are OPTIONAL: a lone time key (asof-join [timeKey] L R) performs an
- * un-partitioned asof over all rows. */
-ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
-    if (n < 3) return ray_error("arity", "asof-join: expects keys, left table and right table, got %lld args", (long long)n);
-    ray_t* keys_vec   = args[0];
-    ray_t* left_tbl   = args[1];
-    ray_t* right_tbl  = args[2];
+/* ── streaming parted asof (SPIKE) ──────────────────────────────────────────
+ * Monotonic count of per-partition (per-day) asof runs taken by the streaming
+ * parted path below.  Bumped ONCE per partition processed — O(1) per partition,
+ * never per-row, so it honours the "instrumentation never costs O(data)" rule.
+ * Surfaced via ray_asof_perpart_runs() / (.sys.mem)'s "asof-perpart-runs". */
+static _Atomic(int64_t) ray_asof_perpart_runs_ctr = 0;
 
+int64_t ray_asof_perpart_runs(void) {
+    return atomic_load_explicit(&ray_asof_perpart_runs_ctr,
+                                memory_order_relaxed);
+}
+
+/* asof-join core: builds the disconnected asof DAG over two already-evaluated
+ * flat table VALUES and runs the existing kernel.  keys_vec/left_tbl/right_tbl
+ * are borrowed (caller owns).  This is the exact pre-spike behaviour; both the
+ * flat fallback and the per-day streaming loop call it. */
+static ray_t* ray_asof_join_core(ray_t* keys_vec, ray_t* left_tbl, ray_t* right_tbl) {
     if (left_tbl->type != RAY_TABLE || right_tbl->type != RAY_TABLE)
         return ray_error("type", "asof-join: both operands must be tables, got %s and %s",
                          ray_type_name(left_tbl->type), ray_type_name(right_tbl->type));
@@ -13882,4 +13890,167 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
     ray_t* result = ray_execute(g, jn);
     ray_graph_free(g);
     return result;
+}
+
+/* ── streaming parted asof: shape detection + per-partition eval ────────────
+ *
+ * SPIKE scope: prove that the parted operands can be received UNFLATTENED and
+ * the join run per-day with bounded memory.  NO cross-day carry state — a
+ * trade that needs a PRIOR day's prevailing quote will mismatch, so this path
+ * is only taken (and is only correct) when every trade's prevailing quote is
+ * same-day.  See report / test for where carry must plug in.
+ */
+
+/* Does this table carry at least one parted / MAPCOMMON column (i.e. is it a
+ * parted table we can segment)?  All parted columns must share a segment
+ * count; we read it from the first parted/MAPCOMMON column. */
+static int64_t asof_parted_seg_count(ray_t* tbl) {
+    if (!tbl || tbl->type != RAY_TABLE) return -1;
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (!col) continue;
+        if (RAY_IS_PARTED(col->type)) return col->len;
+        if (col->type == RAY_MAPCOMMON) {
+            /* MAPCOMMON layout: [key_values, ...]; seg count = key_values len */
+            ray_t** mc = (ray_t**)ray_data(col);
+            return (col->len >= 1 && mc[0]) ? mc[0]->len : -1;
+        }
+    }
+    return -1;  /* flat table — no segments */
+}
+
+/* If arg_ast is exactly `(select {from: X …})` and X evaluates to a parted
+ * table, return that parted table (OWNED — caller releases) and set *out_dict
+ * to the (borrowed) clause dict AST.  Otherwise return NULL (caller falls back
+ * to flat evaluation).  A NULL / non-parted / non-select operand declines. */
+static ray_t* asof_parted_select_operand(ray_t* arg_ast, ray_t** out_dict) {
+    *out_dict = NULL;
+    if (!arg_ast || arg_ast->type != RAY_LIST || ray_len(arg_ast) < 2) return NULL;
+    ray_t** e = (ray_t**)ray_data(arg_ast);
+    ray_t* head = e[0];
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return NULL;
+    if (head->i64 != ray_sym_intern("select", 6)) return NULL;
+    ray_t* dict = e[1];
+    if (!dict || dict->type != RAY_DICT) return NULL;
+    ray_t* from_expr = dict_get(dict, "from");
+    if (!from_expr) return NULL;
+    ray_t* tbl = ray_eval(from_expr);
+    if (!tbl || RAY_IS_ERR(tbl)) { if (tbl) ray_release(tbl); return NULL; }
+    if (tbl->type != RAY_TABLE || asof_parted_seg_count(tbl) < 0) {
+        ray_release(tbl);
+        return NULL;
+    }
+    *out_dict = dict;
+    return tbl;   /* owned */
+}
+
+/* Evaluate the operand's select over ONE partition: rebuild the clause dict
+ * with from: bound to segment `seg` of parted_tbl (a self-evaluating flat
+ * table value), then run ray_select.  Reuses ALL of select's projection /
+ * where / by logic on a single day's flat sub-table.  Returns an owned table
+ * (or RAY_IS_ERR). */
+static ray_t* asof_eval_select_segment(ray_t* dict, ray_t* parted_tbl, int32_t seg) {
+    ray_t* seg_tbl = build_segment_table(parted_tbl, seg);
+    if (!seg_tbl || RAY_IS_ERR(seg_tbl)) return seg_tbl;
+
+    ray_t* keys = ray_dict_keys(dict);   /* borrowed */
+    ray_t* vals = ray_dict_vals(dict);   /* borrowed */
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) {
+        ray_release(seg_tbl);
+        return ray_error("type", "asof stream: malformed select clause dict");
+    }
+    int64_t from_idx = -1, nk = keys->len;
+    for (int64_t i = 0; i < nk; i++) {
+        ray_t* s = ray_sym_vec_cell(keys, i);
+        if (s && ray_str_len(s) == 4 && memcmp(ray_str_ptr(s), "from", 4) == 0) {
+            from_idx = i; break;
+        }
+    }
+    if (from_idx < 0) { ray_release(seg_tbl); return ray_error("domain", "asof stream: select missing from:"); }
+
+    /* Clone vals with from: -> seg_tbl (self-evaluating). */
+    ray_t* nvals = ray_list_new(vals->len);
+    if (!nvals || RAY_IS_ERR(nvals)) { ray_release(seg_tbl); return nvals ? nvals : ray_error("oom", NULL); }
+    nvals->len = vals->len;
+    ray_t** src = (ray_t**)ray_data(vals);
+    for (int64_t i = 0; i < vals->len; i++)
+        nvals = ray_list_set(nvals, i, (i == from_idx) ? seg_tbl : src[i]);  /* set retains */
+    ray_release(seg_tbl);   /* nvals now holds the ref */
+
+    ray_retain(keys);
+    ray_t* ndict = ray_dict_new(keys, nvals);   /* consumes both */
+    if (!ndict || RAY_IS_ERR(ndict)) return ndict ? ndict : ray_error("oom", NULL);
+    ray_t* r = ray_select(&ndict, 1);
+    ray_release(ndict);
+    return r;
+}
+
+/* (asof-join [key1 key2 ... timeKey] leftTable rightTable)
+ * Last key is the time/asof column, rest are equality keys.  The equality
+ * keys are OPTIONAL: a lone time key (asof-join [timeKey] L R) performs an
+ * un-partitioned asof over all rows.
+ *
+ * SPECIAL FORM: args arrive UNEVALUATED so a parted (select…from:PARTED) pair
+ * can be detected and streamed per-partition (bounded memory).  Any other
+ * shape (flat / non-parted / non-select operands, mismatched partitioning)
+ * falls back to exactly the pre-spike behaviour: evaluate both operands and
+ * run ray_asof_join_core over the flattened tables. */
+ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
+    if (n < 3) return ray_error("arity", "asof-join: expects keys, left table and right table, got %lld args", (long long)n);
+
+    ray_t* keys_vec = ray_eval(args[0]);
+    if (!keys_vec || RAY_IS_ERR(keys_vec))
+        return keys_vec ? keys_vec : ray_error("type", "asof-join: key evaluation failed");
+
+    /* Parted-shape probe: both operands must be (select {from:PARTED …}). */
+    ray_t* ldict = NULL, *rdict = NULL;
+    ray_t* lparted = asof_parted_select_operand(args[1], &ldict);
+    ray_t* rparted = asof_parted_select_operand(args[2], &rdict);
+    int64_t lsegs = lparted ? asof_parted_seg_count(lparted) : -1;
+    int64_t rsegs = rparted ? asof_parted_seg_count(rparted) : -1;
+
+    if (lparted && rparted && lsegs == rsegs && lsegs > 0) {
+        /* Streaming per-day path.  Iterate partitions in order; for each day
+         * evaluate both operand selects restricted to that segment, run the
+         * existing kernel, and ordered-concat the partial into the accumulator.
+         * Peak memory is bounded by ~one day's trade+quote (+ the growing
+         * result) rather than both full histories. */
+        ray_t* accum = NULL;
+        ray_t* err = NULL;
+        for (int64_t p = 0; p < lsegs; p++) {
+            ray_t* day_l = asof_eval_select_segment(ldict, lparted, (int32_t)p);
+            if (!day_l || RAY_IS_ERR(day_l)) { err = day_l ? day_l : ray_error("type", NULL); break; }
+            ray_t* day_r = asof_eval_select_segment(rdict, rparted, (int32_t)p);
+            if (!day_r || RAY_IS_ERR(day_r)) { ray_release(day_l); err = day_r ? day_r : ray_error("type", NULL); break; }
+
+            ray_t* part = ray_asof_join_core(keys_vec, day_l, day_r);
+            ray_release(day_l); ray_release(day_r);
+            atomic_fetch_add_explicit(&ray_asof_perpart_runs_ctr, 1, memory_order_relaxed);
+            if (!part || RAY_IS_ERR(part)) { err = part ? part : ray_error("type", NULL); break; }
+
+            ray_t* merged = ray_result_merge(accum, part);  /* returns owned */
+            ray_release(part);
+            if (accum) ray_release(accum);
+            accum = merged;
+            if (!accum || RAY_IS_ERR(accum)) { err = accum; accum = NULL; break; }
+        }
+        ray_release(lparted); ray_release(rparted); ray_release(keys_vec);
+        if (err) { if (accum) ray_release(accum); return err; }
+        return accum ? accum : ray_error("domain", "asof stream: no partitions produced");
+    }
+
+    /* Fallback: not the parted-select shape — evaluate operands and run the
+     * flat kernel (identical to pre-spike behaviour). */
+    if (lparted) ray_release(lparted);
+    if (rparted) ray_release(rparted);
+
+    ray_t* left = ray_eval(args[1]);
+    if (!left || RAY_IS_ERR(left)) { ray_release(keys_vec); return left ? left : ray_error("type", "asof-join: left evaluation failed"); }
+    ray_t* right = ray_eval(args[2]);
+    if (!right || RAY_IS_ERR(right)) { ray_release(left); ray_release(keys_vec); return right ? right : ray_error("type", "asof-join: right evaluation failed"); }
+
+    ray_t* r = ray_asof_join_core(keys_vec, left, right);
+    ray_release(left); ray_release(right); ray_release(keys_vec);
+    return r;
 }

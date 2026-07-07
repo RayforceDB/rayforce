@@ -3316,7 +3316,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
 
 /* Merge two partial results from partition-streamed execution.
  * Concatenates table columns or vectors across segments. */
-static ray_t* ray_result_merge(ray_t* accum, ray_t* partial) {
+ray_t* ray_result_merge(ray_t* accum, ray_t* partial) {
     if (!accum || RAY_IS_ERR(accum)) {
         if (partial && !RAY_IS_ERR(partial)) ray_retain(partial);
         return partial;
@@ -3363,7 +3363,7 @@ static ray_t* ray_result_merge(ray_t* accum, ray_t* partial) {
  * MAPCOMMON columns are materialized for segment seg_idx: the partition key
  * value is broadcast to fill seg_rows elements.
  * Non-parted columns are retained as-is. */
-static ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
+ray_t* build_segment_table(ray_t* parted_tbl, int32_t seg_idx) {
     int64_t ncols = ray_table_ncols(parted_tbl);
     ray_t* seg_tbl = ray_table_new(ncols);
     if (!seg_tbl || RAY_IS_ERR(seg_tbl)) return seg_tbl;

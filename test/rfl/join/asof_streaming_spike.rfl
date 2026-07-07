@@ -1,0 +1,79 @@
+;; asof_streaming_spike.rfl — SPIKE: parted asof-join streams per-partition.
+;;
+;; asof-join is a SPECIAL FORM (src/lang/eval.c): its operand ASTs arrive
+;; UNEVALUATED so the shape `(asof-join keys (select {from:PARTED})
+;; (select {from:PARTED}))` can be detected and run day-by-day instead of
+;; flattening both histories into RAM.  For each partition the operand select
+;; is re-evaluated over that day's segment (build_segment_table) and the
+;; existing exec_window_join kernel runs on one day's trade+quote; the partials
+;; are ordered-concat merged (ray_result_merge).
+;;
+;; SPIKE has NO cross-day carry: a trade needing a PRIOR day's prevailing quote
+;; would mismatch.  This fixture therefore makes Time GLOBALLY MONOTONIC across
+;; days (Jan1 < Jan2 < Jan3) so every trade's prevailing quote is SAME-DAY —
+;; which also makes the flat in-memory asof and the streamed asof agree.
+;;
+;; The (.sys.mem) 'asof-perpart-runs counter increments once per partition, so
+;; a strict increase (by n_days = 3) proves the streaming path ran; parity with
+;; the identical-data flat in-memory oracle proves correctness on the no-carry
+;; case.
+
+;; ─── fixture: 3 day-partitions, each same-day-matched trade/quote ───────────
+(.sys.exec "rm -rf /tmp/rfl_asof_spike")
+
+;; Day 1 (2024.01.01): trades at :01,:03 ; quotes at :00,:02
+(set T1 (table [Sym Time Price] (list [x x] [2024.01.01D10:00:01.000000000 2024.01.01D10:00:03.000000000] (as 'F64 [100.0 101.0]))))
+(set Q1 (table [Sym Time Bid]   (list [x x] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000] (as 'F64 [99.0  100.5]))))
+;; Day 2 (2024.01.02)
+(set T2 (table [Sym Time Price] (list [x x] [2024.01.02D10:00:01.000000000 2024.01.02D10:00:03.000000000] (as 'F64 [200.0 201.0]))))
+(set Q2 (table [Sym Time Bid]   (list [x x] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000] (as 'F64 [199.0 200.5]))))
+;; Day 3 (2024.01.03)
+(set T3 (table [Sym Time Price] (list [x x] [2024.01.03D10:00:01.000000000 2024.01.03D10:00:03.000000000] (as 'F64 [300.0 301.0]))))
+(set Q3 (table [Sym Time Bid]   (list [x x] [2024.01.03D10:00:00.000000000 2024.01.03D10:00:02.000000000] (as 'F64 [299.0 300.5]))))
+
+(.db.splayed.set "/tmp/rfl_asof_spike/1/trade/" T1)
+(.db.splayed.set "/tmp/rfl_asof_spike/1/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_spike/2/trade/" T2)
+(.db.splayed.set "/tmp/rfl_asof_spike/2/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_spike/3/trade/" T3)
+(.db.splayed.set "/tmp/rfl_asof_spike/3/quote/" Q3)
+(set Pt (.db.parted.get "/tmp/rfl_asof_spike/" 'trade))
+(set Pq (.db.parted.get "/tmp/rfl_asof_spike/" 'quote))
+
+;; identical-data flat in-memory oracle (day1..day3 rows, same order); the
+;; RFL harness is line-based, so each table literal must be a single line.
+(set TF (table [Sym Time Price] (list [x x x x x x] [2024.01.01D10:00:01.000000000 2024.01.01D10:00:03.000000000 2024.01.02D10:00:01.000000000 2024.01.02D10:00:03.000000000 2024.01.03D10:00:01.000000000 2024.01.03D10:00:03.000000000] (as 'F64 [100.0 101.0 200.0 201.0 300.0 301.0]))))
+(set QF (table [Sym Time Bid] (list [x x x x x x] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000 2024.01.03D10:00:00.000000000 2024.01.03D10:00:02.000000000] (as 'F64 [99.0 100.5 199.0 200.5 299.0 300.5]))))
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (a) STREAMED parted asof — proves the per-partition path ran.
+;; ══════════════════════════════════════════════════════════════════════════
+(set Ba (at (.sys.mem) 'asof-perpart-runs))
+(set RS (asof-join [Sym Time] (select {from: Pt}) (select {from: Pq})))
+(set Aa (at (.sys.mem) 'asof-perpart-runs))
+;; strict increase proves the streaming path ran; +3 == one run per day-partition.
+(> Aa Ba) -- true
+(- Aa Ba) -- 3
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (b) CORRECTNESS — streamed result equals the flat in-memory oracle asof.
+;;     RF uses RAW flat tables (non-select operands → fallback path).
+;; ══════════════════════════════════════════════════════════════════════════
+(set RF (asof-join [Sym Time] TF QF))
+(count RS) -- 6
+(count RS) -- (count RF)
+(at RS 'Price) -- (at RF 'Price)
+(at RS 'Bid)   -- (at RF 'Bid)
+;; explicit prevailing-quote goldens (same-day matches)
+(at RS 'Bid) -- (as 'F64 [99.0 100.5 199.0 200.5 299.0 300.5])
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; (c) FALLBACK for select-but-FLAT operands — `(select {from: FLAT})` is a
+;;     select shape but its from: is not parted, so it declines to the flat
+;;     kernel.  No per-partition increment; result still matches.
+;; ══════════════════════════════════════════════════════════════════════════
+(set Bc (at (.sys.mem) 'asof-perpart-runs))
+(set RC (asof-join [Sym Time] (select {from: TF}) (select {from: QF})))
+(set Ac (at (.sys.mem) 'asof-perpart-runs))
+(- Ac Bc) -- 0
+(at RC 'Bid) -- (at RF 'Bid)

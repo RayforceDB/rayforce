@@ -739,6 +739,7 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
         { "anon-peak",        9, ray_heap_anon_peak()          },
         { "anon-watermark",  14, ray_heap_anon_watermark()     },
         { "group-perpart-runs", 18, ray_group_perpart_runs()   },
+        { "asof-perpart-runs",  17, ray_asof_perpart_runs()    },
     };
     for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
         int64_t s = ray_sym_intern(rows[i].name, rows[i].nlen);

@@ -3110,7 +3110,10 @@ static void ray_register_builtins(void) {
     register_vary("anti-join",   RAY_FN_NONE, ray_anti_join_fn);
     register_vary("window-join", RAY_FN_SPECIAL_FORM, ray_window_join_fn);
     register_vary("window-join1", RAY_FN_SPECIAL_FORM, ray_window_join1_fn);
-    register_vary("asof-join",   RAY_FN_NONE, ray_asof_join_fn);
+    /* Special form: asof-join inspects its operand ASTs (parted-select
+     * detection) before evaluating them so a parted (select … from:PARTED)
+     * pair can stream per-partition instead of flattening both histories. */
+    register_vary("asof-join",   RAY_FN_SPECIAL_FORM, ray_asof_join_fn);
 
     /* I/O builtins */
     register_vary("println",    RAY_FN_NONE, ray_println_fn);
