@@ -276,8 +276,55 @@ static inline uint64_t pivot_hash_null_words(uint64_t h, const int64_t* nullw,
  * pivot values into separate output columns.
  * ============================================================================ */
 
+/* Segment count of a parted table = length of any parted column's segs array
+ * (mirrors build_segment_table exec.c). */
+static int64_t pivot_parted_seg_count(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && RAY_IS_PARTED(col->type)) return col->len;
+    }
+    return 0;
+}
+
+static bool pivot_table_has_parted_col(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+            return true;
+    }
+    return false;
+}
+
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+
+    /* Parted-input guard: exec_pivot fetches columns via ray_table_get_col and
+     * indexes them by row up to ray_table_nrows.  A raw RAY_PARTED/MAPCOMMON
+     * column (whose data is a tiny segs array, not nrows elements) would be
+     * indexed out of bounds → OOB read / SIGSEGV.  Flatten (concat all
+     * segments) and recompute on the flat table, mirroring exec_window /
+     * join_with_parted_guard.  A flat table has no parted column, so the
+     * recursive call falls straight through this guard (one level). */
+    if (pivot_table_has_parted_col(tbl)) {
+        int64_t nseg = pivot_parted_seg_count(tbl);
+        ray_t* flat = NULL;
+        for (int64_t s = 0; s < nseg; s++) {
+            ray_t* seg = build_segment_table(tbl, (int32_t)s);
+            if (!seg || RAY_IS_ERR(seg)) { if (flat) ray_release(flat); return seg ? seg : ray_error("oom", NULL); }
+            if (!flat) flat = seg;
+            else {
+                ray_t* m = ray_result_merge(flat, seg);
+                ray_release(flat); ray_release(seg);
+                if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+                flat = m;
+            }
+        }
+        ray_t* r = exec_pivot(g, op, flat);
+        ray_release(flat);
+        return r;
+    }
 
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);

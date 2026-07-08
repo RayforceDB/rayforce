@@ -1,0 +1,24 @@
+;; pivot_parted_guard.rfl — a parted table fed to (pivot ...) must flatten and
+;; compute, not out-of-bounds read.  exec_pivot fetches columns via
+;; ray_table_get_col and indexes them to ray_table_nrows; a raw RAY_PARTED
+;; column (data = tiny segs array, not nrows elements) was indexed OOB →
+;; SIGSEGV exit 139 (confirmed on a 40M-row parted table).  The guard flattens
+;; (concat segments) then recomputes; result must equal the flat-oracle pivot.
+(.sys.exec "rm -rf /tmp/rfl_pivot_parted")
+(set T1 (table [sym cat qty] (list (as 'SYM ['a 'b 'a]) (as 'SYM ['x 'y 'x]) (as 'I64 [1 2 3]))))
+(set T2 (table [sym cat qty] (list (as 'SYM ['b 'a]) (as 'SYM ['y 'x]) (as 'I64 [4 5]))))
+(.db.splayed.set "/tmp/rfl_pivot_parted/2024.01.01/t/" T1 "/tmp/rfl_pivot_parted/.sym")
+(.db.splayed.set "/tmp/rfl_pivot_parted/2024.01.02/t/" T2 "/tmp/rfl_pivot_parted/.sym")
+(set P (.db.parted.get "/tmp/rfl_pivot_parted" 't))
+(count P) -- 5
+;; flat oracle: the same rows concatenated in partition order.
+(set F (table [sym cat qty] (list (as 'SYM ['a 'b 'a 'b 'a]) (as 'SYM ['x 'y 'x 'y 'x]) (as 'I64 [1 2 3 4 5]))))
+;; parted pivot must not crash and must equal the flat pivot.
+(set RP (pivot P 'sym 'cat 'qty sum))
+(set RF (pivot F 'sym 'cat 'qty sum))
+(count RP) -- (count RF)
+(count RP) -- 2
+(cols RP) -- (cols RF)
+(at RP 'sym) -- (at RF 'sym)
+(at RP 'x) -- (at RF 'x)
+(at RP 'y) -- (at RF 'y)
