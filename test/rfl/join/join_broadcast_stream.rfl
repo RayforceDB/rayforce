@@ -1,0 +1,198 @@
+;; join_broadcast_stream.rfl — broadcast-streaming fast-path for a join where
+;; EXACTLY ONE side is parted: stream that side per-segment against the whole
+;; other (resident) side, calling the unchanged flat kernel per segment and
+;; concat-merging, instead of Task-1's flatten-then-single-call fallback.
+;;
+;; Eligibility is the crux — a wrong rule silently produces wrong results,
+;; because unmatched-row emission can span segments:
+;;   INNER : symmetric, either side parted is eligible.
+;;   LEFT  : eligible ONLY if the parted side is LEFT (probe) — a left
+;;           segment's unmatched status is resolved against the WHOLE right
+;;           side in that call.  RIGHT parted declines (a left row unmatched
+;;           in one right segment might match another).
+;;   ANTI  : eligible ONLY if the parted side is LEFT, same reasoning.
+;;   FULL  : never eligible (unmatched rows from BOTH sides can span
+;;           segments).
+;;
+;; (.sys.mem) 'join-perpart-runs increments once per segment ONLY on the
+;; streaming path, so a strict delta == nseg proves it ran; every case is
+;; also checked against a FLAT oracle (same join on the parted side fully
+;; flattened into one in-RAM table) as a SORTED MULTISET — the radix join
+;; path does not preserve row order past RAY_PARALLEL_THRESHOLD.
+;;
+;; NOTE: build_segment_table (the per-segment sub-table builder, shared by
+;; this fast-path AND Task-1's flatten) broadcasts the physical partition
+;; value as a synthetic leading 'date' column onto every segment.  When the
+;; parted side is the LEFT operand that column lands ahead of Sym in the
+;; joined output — so sorting by "every column" (as join_parted_guard.rfl
+;; does via `(cols _)`) would make 'date' the sort's primary key on one side
+;; and Sym primary on the other (the hand-built FLAT/oracle table has no
+;; such column), silently desyncing tie order between two multisets that are
+;; still value-identical.  Sort by an EXPLICIT, shared key list of just the
+;; value columns instead — robust to whichever side (or neither) carries the
+;; extra provenance column.
+
+(.sys.exec "rm -rf /tmp/rfl_join_bcast_p /tmp/rfl_join_bcast_sp")
+
+;; ── PARTED: 3 day-segments, columns [Sym V]. ────────────────────────────────
+;;   Day 1: a, b        Day 2: b, c        Day 3: b, d
+;; 'b' repeats in all 3 segments (duplicate-key -> cartesian per group vs a
+;; resident side with its own duplicate 'b').  'd' appears only in day 3 and
+;; has NO match in SMALL (LEFT/ANTI unmatched-row case).  Flattened row order
+;; is day-ascending, mirroring build_segment_table's own concat order.
+(set D1 (table [Sym V] (list [a b] (as 'I64 [1 2]))))
+(set D2 (table [Sym V] (list [b c] (as 'I64 [3 4]))))
+(set D3 (table [Sym V] (list [b d] (as 'I64 [5 6]))))
+(.db.splayed.set "/tmp/rfl_join_bcast_p/2024.01.01/t/" D1)
+(.db.splayed.set "/tmp/rfl_join_bcast_p/2024.01.02/t/" D2)
+(.db.splayed.set "/tmp/rfl_join_bcast_p/2024.01.03/t/" D3)
+(set PARTED (.db.parted.get "/tmp/rfl_join_bcast_p/" 't))
+(set FLAT (table [Sym V] (list [a b b c b d] (as 'I64 [1 2 3 4 5 6]))))
+
+;; SMALL is a plain in-RAM table: a matches once, b matches TWICE (so PARTED's
+;; three 'b' rows x SMALL's two 'b' rows = 6-row cartesian per group), c
+;; matches once, e matches nothing anywhere (unmatched on the resident side).
+;; 'd' (PARTED-only) has no counterpart here at all.
+(set SMALL (table [Sym W] (list [a b b c e] (as 'I64 [10 20 21 30 50]))))
+
+;; SMALL_FULL is SMALL minus 'e': FULL join's right-only-unmatched path
+;; coalesces the right key into the LEFT-typed output column, and PARTED's
+;; Sym column is a FILE-domain (on-disk vocabulary) column when it's the
+;; left operand — 'e' was never interned into that on-disk vocabulary, so
+;; representing it there fails with a "domain" error.  That's a real,
+;; pre-existing FULL-join representability limit for FILE-domain SYM
+;; columns, orthogonal to broadcast streaming (FULL never streams here
+;; regardless); side-step it for this decline-path test by using a right
+;; side whose every Sym already exists somewhere in PARTED.
+(set SMALL_FULL (table [Sym W] (list [a b b c] (as 'I64 [10 20 21 30]))))
+
+;; A second parted table, for the both-sides-parted decline case.
+(set SP1 (table [Sym W] (list [a b] (as 'I64 [10 20]))))
+(set SP2 (table [Sym W] (list [b c] (as 'I64 [21 30]))))
+(.db.splayed.set "/tmp/rfl_join_bcast_sp/2024.01.01/t/" SP1)
+(.db.splayed.set "/tmp/rfl_join_bcast_sp/2024.01.02/t/" SP2)
+(set SMALL_PARTED (.db.parted.get "/tmp/rfl_join_bcast_sp/" 't))
+(set SMALL_PARTED_FLAT (table [Sym W] (list [a b b c] (as 'I64 [10 20 21 30]))))
+
+;; ════════════════════════════════════════════════════════════════════════
+;; POSITIVE — streams (delta == nseg == 3), result == flat oracle.
+;; ════════════════════════════════════════════════════════════════════════
+
+;; INNER, parted LEFT.
+(set B1 (at (.sys.mem) 'join-perpart-runs))
+(set RS1 (inner-join [Sym] PARTED SMALL))
+(set A1 (at (.sys.mem) 'join-perpart-runs))
+(- A1 B1) -- 3
+(set RF1 (inner-join [Sym] FLAT SMALL))
+(count RS1) -- (count RF1)
+(set RS1s (xasc RS1 [Sym V W]))
+(set RF1s (xasc RF1 [Sym V W]))
+(at RS1s 'Sym) -- (at RF1s 'Sym)
+(at RS1s 'V) -- (at RF1s 'V)
+(at RS1s 'W) -- (at RF1s 'W)
+
+;; INNER, parted RIGHT (symmetric — same eligibility as parted-left).
+(set B2 (at (.sys.mem) 'join-perpart-runs))
+(set RS2 (inner-join [Sym] SMALL PARTED))
+(set A2 (at (.sys.mem) 'join-perpart-runs))
+(- A2 B2) -- 3
+(set RF2 (inner-join [Sym] SMALL FLAT))
+(count RS2) -- (count RF2)
+(set RS2s (xasc RS2 [Sym W V]))
+(set RF2s (xasc RF2 [Sym W V]))
+(at RS2s 'Sym) -- (at RF2s 'Sym)
+(at RS2s 'W) -- (at RF2s 'W)
+(at RS2s 'V) -- (at RF2s 'V)
+
+;; LEFT, parted LEFT (probe side) — includes the 'd' unmatched-row case
+;; (streamed-left row with no right match -> null W) and the 'b' cartesian.
+(set B3 (at (.sys.mem) 'join-perpart-runs))
+(set RS3 (left-join [Sym] PARTED SMALL))
+(set A3 (at (.sys.mem) 'join-perpart-runs))
+(- A3 B3) -- 3
+(set RF3 (left-join [Sym] FLAT SMALL))
+(count RS3) -- (count RF3)
+(set RS3s (xasc RS3 [Sym V W]))
+(set RF3s (xasc RF3 [Sym V W]))
+(at RS3s 'Sym) -- (at RF3s 'Sym)
+(at RS3s 'V) -- (at RF3s 'V)
+(at RS3s 'W) -- (at RF3s 'W)
+
+;; ANTI, parted LEFT — only 'd' has no match anywhere in SMALL.
+(set B4 (at (.sys.mem) 'join-perpart-runs))
+(set RS4 (anti-join [Sym] PARTED SMALL))
+(set A4 (at (.sys.mem) 'join-perpart-runs))
+(- A4 B4) -- 3
+(set RF4 (anti-join [Sym] FLAT SMALL))
+(count RS4) -- (count RF4)
+(count RS4) -- 1
+(at RS4 'Sym) -- (at RF4 'Sym)
+(at RS4 'Sym) -- [d]
+(at RS4 'V) -- (at RF4 'V)
+
+;; ════════════════════════════════════════════════════════════════════════
+;; NEGATIVE — must DECLINE (delta == 0), still correct via Task-1 flatten.
+;; ════════════════════════════════════════════════════════════════════════
+
+;; LEFT, parted RIGHT — a left-unmatched right-segment row could match
+;; another segment, so this must decline.
+(set B5 (at (.sys.mem) 'join-perpart-runs))
+(set RS5 (left-join [Sym] SMALL PARTED))
+(set A5 (at (.sys.mem) 'join-perpart-runs))
+(- A5 B5) -- 0
+(set RF5 (left-join [Sym] SMALL FLAT))
+(count RS5) -- (count RF5)
+(set RS5s (xasc RS5 [Sym W V]))
+(set RF5s (xasc RF5 [Sym W V]))
+(at RS5s 'Sym) -- (at RF5s 'Sym)
+(at RS5s 'W) -- (at RF5s 'W)
+(at RS5s 'V) -- (at RF5s 'V)
+
+;; ANTI, parted RIGHT — must decline (only left-parted is safe for anti).
+(set B6 (at (.sys.mem) 'join-perpart-runs))
+(set RS6 (anti-join [Sym] SMALL PARTED))
+(set A6 (at (.sys.mem) 'join-perpart-runs))
+(- A6 B6) -- 0
+(set RF6 (anti-join [Sym] SMALL FLAT))
+(count RS6) -- (count RF6)
+(count RS6) -- 1
+(at RS6 'Sym) -- (at RF6 'Sym)
+(at RS6 'Sym) -- [e]
+(at RS6 'W) -- (at RF6 'W)
+
+;; FULL — never eligible, either side parted.
+(set B7 (at (.sys.mem) 'join-perpart-runs))
+(set RS7a (full-join [Sym] PARTED SMALL_FULL))
+(set RS7b (full-join [Sym] SMALL_FULL PARTED))
+(set A7 (at (.sys.mem) 'join-perpart-runs))
+(- A7 B7) -- 0
+(set RF7a (full-join [Sym] FLAT SMALL_FULL))
+(set RF7b (full-join [Sym] SMALL_FULL FLAT))
+(count RS7a) -- (count RF7a)
+(count RS7b) -- (count RF7b)
+(set RS7as (xasc RS7a [Sym V W]))
+(set RF7as (xasc RF7a [Sym V W]))
+(at RS7as 'Sym) -- (at RF7as 'Sym)
+(at RS7as 'V) -- (at RF7as 'V)
+(at RS7as 'W) -- (at RF7as 'W)
+(set RS7bs (xasc RS7b [Sym W V]))
+(set RF7bs (xasc RF7b [Sym W V]))
+(at RS7bs 'Sym) -- (at RF7bs 'Sym)
+(at RS7bs 'W) -- (at RF7bs 'W)
+(at RS7bs 'V) -- (at RF7bs 'V)
+
+;; BOTH sides parted — decline (only exactly-one-side-parted is eligible).
+(set B8 (at (.sys.mem) 'join-perpart-runs))
+(set RS8 (inner-join [Sym] PARTED SMALL_PARTED))
+(set A8 (at (.sys.mem) 'join-perpart-runs))
+(- A8 B8) -- 0
+(set RF8 (inner-join [Sym] FLAT SMALL_PARTED_FLAT))
+(count RS8) -- (count RF8)
+(set RS8s (xasc RS8 [Sym V W]))
+(set RF8s (xasc RF8 [Sym V W]))
+(at RS8s 'Sym) -- (at RF8s 'Sym)
+(at RS8s 'V) -- (at RF8s 'V)
+(at RS8s 'W) -- (at RF8s 'W)
+
+;; ─── cleanup ─────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_join_bcast_p /tmp/rfl_join_bcast_sp")

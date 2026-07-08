@@ -721,9 +721,9 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
     ray_mem_stats_t st;
     ray_mem_stats(&st);
 
-    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 15);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 16);
     if (RAY_IS_ERR(keys)) return keys;
-    ray_t* vals = ray_list_new(15);
+    ray_t* vals = ray_list_new(16);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
     struct { const char* name; size_t nlen; int64_t v; } rows[] = {
@@ -742,6 +742,7 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
         { "asof-perpart-runs",  17, ray_asof_perpart_runs()    },
         { "sort-perpart-runs",  17, ray_sort_perpart_runs()    },
         { "window-perpart-runs", 19, ray_window_perpart_runs() },
+        { "join-perpart-runs",   17, ray_join_perpart_runs()   },
     };
     for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
         int64_t s = ray_sym_intern(rows[i].name, rows[i].nlen);

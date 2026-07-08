@@ -976,6 +976,12 @@ int64_t ray_sort_perpart_runs(void);
  * once per segment; surfaced via (.sys.mem)'s "window-perpart-runs". */
 int64_t ray_window_perpart_runs(void);
 
+/* Monotonic count of per-segment runs taken by the join broadcast-streaming
+ * fast-path (exactly one side parted, streamed against the whole other
+ * side).  Bumped once per segment; surfaced via (.sys.mem)'s
+ * "join-perpart-runs". */
+int64_t ray_join_perpart_runs(void);
+
 /* Are these key columns already sorted (single uniform direction) under the
  * sort's lexicographic ordering?  Null-free integer-family / SYM keys only;
  * everything else returns false.  O(nrows) with early bail.  Defined in
