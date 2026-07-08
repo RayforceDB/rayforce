@@ -1,0 +1,113 @@
+;; asof_clause_fallback.rfl — the streaming parted asof may per-day-stream a
+;; select operand ONLY when its clause dict is `from:` (+ optional `where:`).
+;;
+;; Per-day streaming runs each operand's select ONCE PER DAY partition and
+;; concatenates the results.  That equals the flat (whole-table) eval ONLY for
+;; row-preserving clauses (`from:`/`where:`).  `by:` (group-by), `take:` (limit)
+;; and `asc:`/`desc:` (sort) are WHOLE-ROWSET semantics: run per-day and
+;; concatenated they SILENTLY diverge from the flat result — e.g. a
+;; `by:[Sym] (last Bid)` yields one row per (DAY,Sym) instead of one row per Sym
+;; over all history.  The operand-shape detector (asof_parted_select_operand)
+;; therefore DECLINES any clause other than from/where, so the caller falls back
+;; to the flat eager kernel (correctness first).
+;;
+;; For each aggregating-clause operand we assert asof-perpart-runs does NOT
+;; increment (delta 0 → it took the FLAT fallback, did not stream); by/take also
+;; check the fallback equals the flat eager evaluation of the identical data held
+;; in-memory (non-parted → guaranteed flat path).  A `where:` operand STILL
+;; streams (delta > 0) — where is a safe row-preserving clause.
+;;
+;; The LEFT operand for the aggregating cases is an EXPLICIT-PROJECTION parted
+;; select, written INLINE in each asof-join (asof-join is a special form that
+;; receives its operands UNEVALUATED, so the parted-select shape is only visible
+;; when the select is inline, not pre-bound to a variable).  It materialises to a
+;; concrete flat table (so the eager fallback can asof-join it), it too DECLINES
+;; under the fix (its keys are not from/where), and — critically — it is
+;; streaming-ELIGIBLE if the fix is reverted, so the delta-0 assertions genuinely
+;; catch a regression (a revert re-streams both operands → delta > 0).  A plain
+;; `(select {from: PARTED})` companion cannot be used here: it stays lazily
+;; deferred and only materialises via the streaming per-day segmentation, so it
+;; errors in the eager fallback (pre-existing).
+
+(.sys.exec "rm -rf /tmp/rfl_asof_cf_t /tmp/rfl_asof_cf_q")
+
+;; Parted quote Pq: sym a quotes 100 on day 1, 200 on day 2.
+(set Q1 (table [Sym Time Bid] (list [a] [2024.01.01D10:00:00.000000000] (as 'F64 [100.0]))))
+(set Q2 (table [Sym Time Bid] (list [a] [2024.01.02D10:00:00.000000000] (as 'F64 [200.0]))))
+;; Parted trade Pt: one day-1 trade for a at :30 (AFTER the day-1 quote, BEFORE
+;; any day-2 quote) — so a `by:[Sym] (last …)` collapse of the quotes to a single
+;; day-2 row makes the trade NO-match (null), whereas a per-day STREAM would
+;; wrongly resolve it to the day-1 quote (100).  Clean streamed-vs-flat divergence.
+(set T1 (table [Sym Time Price] (list [a] [2024.01.01D10:00:30.000000000] (as 'F64 [10.0]))))
+
+(.db.splayed.set "/tmp/rfl_asof_cf_q/2024.01.01/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_cf_q/2024.01.02/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_cf_t/2024.01.01/trade/" T1)
+(set Pt (.db.parted.get "/tmp/rfl_asof_cf_t/" 'trade))
+(set Pq (.db.parted.get "/tmp/rfl_asof_cf_q/" 'quote))
+
+;; In-memory FLAT oracles (non-parted → the eager kernel, never streamed).
+(set Tall (table [Sym Time Price] (list [a] [2024.01.01D10:00:30.000000000] (as 'F64 [10.0]))))
+(set Qall (table [Sym Time Bid] (list [a a] [2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000] (as 'F64 [100.0 200.0]))))
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; §A  by:  — group-by is whole-rowset → MUST fall back (delta 0), MUST be flat.
+;;     Flat: a → (last Bid)=200 @ day-2; the earlier day-1 trade → null.
+;;     A per-day stream would give Bid=100 (the WRONG day-1 quote).
+;; ════════════════════════════════════════════════════════════════════════════
+(set ORby (asof-join [Sym Time] Tall (select {by:[Sym] Bid:(last Bid) Time:(last Time) from: Qall})))
+(set Bby (at (.sys.mem) 'asof-perpart-runs))
+(set RSby (asof-join [Sym Time] (select {Sym: Sym Time: Time Price: Price from: Pt}) (select {by:[Sym] Bid:(last Bid) Time:(last Time) from: Pq})))
+(set Aby (at (.sys.mem) 'asof-perpart-runs))
+;; (a) NO streaming — the aggregating operand declined.
+(- Aby Bby) -- 0
+;; (b) correct = flat oracle: a's day-1 trade no-matches the day-2 last quote.
+(count RSby) -- (count ORby)
+(at RSby 'Bid) -- (at ORby 'Bid)
+(at RSby 'Price) -- (at ORby 'Price)
+(at RSby 'Bid) -- (as 'F64 [0Nf])
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; §B  take:  — limit is whole-rowset → MUST fall back (delta 0), MUST be flat.
+;;     Flat take 1 = the day-1 quote (100); a per-day stream would take 1 PER day.
+;; ════════════════════════════════════════════════════════════════════════════
+(set ORtk (asof-join [Sym Time] Tall (select {take: 1 from: Qall})))
+(set Btk (at (.sys.mem) 'asof-perpart-runs))
+(set RStk (asof-join [Sym Time] (select {Sym: Sym Time: Time Price: Price from: Pt}) (select {take: 1 from: Pq})))
+(set Atk (at (.sys.mem) 'asof-perpart-runs))
+(- Atk Btk) -- 0
+(count RStk) -- (count ORtk)
+(at RStk 'Bid) -- (at ORtk 'Bid)
+(at RStk 'Price) -- (at ORtk 'Price)
+(at RStk 'Bid) -- (as 'F64 [100.0])
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; §C  asc:  — sort is whole-rowset → MUST fall back (delta 0), MUST NOT stream.
+;;     `(select {asc:… from: PARTED})` is itself unmaterialisable in the eager
+;;     path (a PRE-EXISTING lazy-sort-over-parted limitation), so the flat
+;;     fallback surfaces that error LOUDLY rather than silently streaming a
+;;     per-day-sorted (wrong) result.  A loud error ≫ a silent wrong answer.
+;;     Before the fix this would instead STREAM (delta > 0) and return a value.
+;; ════════════════════════════════════════════════════════════════════════════
+(set Bac (at (.sys.mem) 'asof-perpart-runs))
+(asof-join [Sym Time] (select {Sym: Sym Time: Time Price: Price from: Pt}) (select {asc: Bid from: Pq})) !- type
+(set Aac (at (.sys.mem) 'asof-perpart-runs))
+(- Aac Bac) -- 0
+
+;; ════════════════════════════════════════════════════════════════════════════
+;; §D  where:  — row-preserving → STILL STREAMS (delta > 0), and stays correct.
+;;     Both operands are from/where selects over parted tables → eligible.
+;;     Union of days = {day1(t,q), day2(q)} = 2 per-part runs.
+;; ════════════════════════════════════════════════════════════════════════════
+(set ORwh (asof-join [Sym Time] Tall (select {from: Qall where: (> Bid 0.0)})))
+(set Bwh (at (.sys.mem) 'asof-perpart-runs))
+(set RSwh (asof-join [Sym Time] (select {from: Pt}) (select {from: Pq where: (> Bid 0.0)})))
+(set Awh (at (.sys.mem) 'asof-perpart-runs))
+;; (a) streaming DID run — where is an allowed row-preserving clause.
+(> Awh Bwh) -- true
+(- Awh Bwh) -- 2
+;; (b) correct = flat oracle: trade a@day1:30 resolves to the day-1 quote (100).
+(count RSwh) -- (count ORwh)
+(at RSwh 'Bid) -- (at ORwh 'Bid)
+(at RSwh 'Price) -- (at ORwh 'Price)
+(at RSwh 'Bid) -- (as 'F64 [100.0])

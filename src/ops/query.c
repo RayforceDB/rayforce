@@ -13941,6 +13941,25 @@ static ray_t* asof_parted_select_operand(ray_t* arg_ast, ray_t** out_dict) {
         ray_release(tbl);
         return NULL;
     }
+    /* Per-day streaming concatenates each partition's select result.  That is
+     * equivalent to flat (whole-table) evaluation ONLY for row-preserving
+     * clauses.  `by:` (group-by), `take:` (limit), `asc:`/`desc:` (sort) and
+     * `nearest:` (ANN order) are WHOLE-ROWSET semantics: run per partition and
+     * concatenated they SILENTLY diverge from the flat result (e.g. `by:` yields
+     * one row per (DAY,key) instead of one row per key overall).  Admit only
+     * `from:` + `where:`; any other clause key declines to stream so the caller
+     * falls back to the byte-identical flat eager path (correctness first). */
+    ray_t* keys = ray_dict_keys(dict);   /* borrowed */
+    if (!keys || keys->type != RAY_SYM) { ray_release(tbl); return NULL; }
+    for (int64_t i = 0; i < keys->len; i++) {
+        ray_t* s = ray_sym_vec_cell(keys, i);
+        if (!s) { ray_release(tbl); return NULL; }
+        int64_t sl = ray_str_len(s);
+        const char* sp = ray_str_ptr(s);
+        bool ok = (sl == 4 && memcmp(sp, "from", 4) == 0) ||
+                  (sl == 5 && memcmp(sp, "where", 5) == 0);
+        if (!ok) { ray_release(tbl); return NULL; }
+    }
     *out_dict = dict;
     return tbl;   /* owned */
 }
@@ -14325,7 +14344,6 @@ ray_t* ray_asof_join_fn(ray_t** args, int64_t n) {
             }
             else if (day_r_seg)    { qtab = day_r_seg; ray_retain(qtab); }
             else if (carry)        { qtab = carry;     ray_retain(qtab); }
-            if (qtab && RAY_IS_ERR(qtab)) { err = qtab; qtab = NULL; if (day_r_seg) ray_release(day_r_seg); break; }
 
             /* Sort the prevailing-quote view time-ascending.  The asof KERNEL
              * re-sorts its right input internally, so this does not change a
