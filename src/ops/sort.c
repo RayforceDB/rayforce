@@ -3183,6 +3183,27 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
     return result;
 }
 
+/* True when any column of `tbl` is a raw parted wrapper (RAY_IS_PARTED)
+ * or the virtual partition column (RAY_MAPCOMMON).  The raw sort/top-k
+ * builtins drive their whole-table gather off row indices in [0, nrows)
+ * (nrows = the true parted row count, tens of millions), but a parted
+ * wrapper's storage is an array of segment pointers sized to the SEGMENT
+ * count (tens/hundreds) — a shape the gather is not built for and which,
+ * once any path indexes ray_data(col) at a row position, reads out of
+ * bounds.  Reject such tables up front with a clean, intentional error
+ * instead of letting them fall through to an incidental type error deep in
+ * the gather (or a future OOB).  The select-clause path sorts a
+ * materialized result table, so it never trips this guard. */
+static bool table_has_parted_col(ray_t* tbl) {
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+            return true;
+    }
+    return false;
+}
+
 /* Gather K rows of `tbl` at the given indices and return a new table.
  * Used by both single-key and multi-key top-K paths.  Releases `idx`. */
 static ray_t* topk_gather_rows(ray_t* tbl, ray_t* idx, int64_t k) {
@@ -3231,6 +3252,8 @@ static ray_t* topk_gather_rows(ray_t* tbl, ray_t* idx, int64_t k) {
 ray_t* ray_topk_table(ray_t* tbl, ray_t* col, uint8_t desc, uint8_t nf,
                       int64_t k) {
     if (!tbl || tbl->type != RAY_TABLE || !col) return NULL;
+    if (table_has_parted_col(tbl))
+        return ray_error("nyi", "top/bot: parted table input not supported");
     int64_t nrows = ray_table_nrows(tbl);
     if (k <= 0 || nrows <= 0) return NULL;
     if (k >= nrows) return NULL;
@@ -3257,6 +3280,8 @@ ray_t* ray_topk_table(ray_t* tbl, ray_t* col, uint8_t desc, uint8_t nf,
 ray_t* ray_topk_table_multi(ray_t* tbl, ray_t** key_cols, uint8_t* descs,
                             uint8_t* nfs, uint8_t n_keys, int64_t k) {
     if (!tbl || tbl->type != RAY_TABLE || !key_cols || n_keys == 0) return NULL;
+    if (table_has_parted_col(tbl))
+        return ray_error("nyi", "top/bot: parted table input not supported");
     int64_t nrows = ray_table_nrows(tbl);
     if (k <= 0 || nrows <= 0 || k >= nrows) return NULL;
     int64_t ncols = ray_table_ncols(tbl);
@@ -3913,6 +3938,8 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
 ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     if (!tbl || tbl->type != RAY_TABLE)
         return ray_error("type", "xasc/xdesc expects a table as first argument");
+    if (table_has_parted_col(tbl))
+        return ray_error("nyi", "xasc/xdesc: parted table input not supported");
 
     /* keys can be a SYM atom, a SYM vector, or a list of SYM atoms */
     int64_t n_keys;

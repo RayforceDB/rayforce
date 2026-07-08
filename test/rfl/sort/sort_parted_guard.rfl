@@ -1,0 +1,48 @@
+;; sort_parted_guard.rfl — the raw table-sort builtins must REJECT a raw parted
+;; table with a clean error instead of proceeding to index its columns.
+;;
+;; A parted column wrapper's storage is an array of SEGMENT pointers sized to
+;; the partition count (tens/hundreds), but ray_table_nrows() reports the TRUE
+;; total row count (millions).  sort_table_by_keys (xasc/xdesc) resolves the
+;; parted key columns and drives the whole-table gather off nrows-1 indices —
+;; a shape that has no business touching a raw parted wrapper.  The fix detects
+;; any RAY_IS_PARTED / RAY_MAPCOMMON column up front and returns `nyi` with a
+;; clear message, rather than an incidental type error from deep in the gather
+;; (or a future out-of-bounds read if the gather ever learned to allocate a
+;; parted-typed output column).
+;;
+;; Note on arg order: xasc/xdesc are (xasc TABLE KEYS) — table first, keys
+;; second.  Note on top/bot: those are vector builtins and `at` materializes a
+;; parted column to a flat vector before they ever see it, so there is no
+;; language path that hands a raw parted wrapper to top/bot; the ray_topk_table
+;; C entry points are guarded defensively but are only ever reached (via select
+;; / OP_SORT) with an already-materialized result table.
+;;
+;; The guard must NOT false-positive on an ordinary in-memory table — the last
+;; case confirms xasc still sorts a plain (non-parted) table correctly.
+
+;; ── build a 2-partition parted table sharing one .sym ────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_sort_parted")
+(set D1 (table [Sym Time Px] (list [a b a] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:01.000000000 2024.01.01D10:00:02.000000000] (as 'F64 [10.0 11.0 12.0]))))
+(set D2 (table [Sym Time Px] (list [b a b] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:01.000000000 2024.01.02D10:00:02.000000000] (as 'F64 [20.0 21.0 22.0]))))
+(.db.splayed.set "/tmp/rfl_sort_parted/2024.01.01/tbl/" D1)
+(.db.splayed.set "/tmp/rfl_sort_parted/2024.01.02/tbl/" D2)
+(set Pt (.db.parted.get "/tmp/rfl_sort_parted/" 'tbl))
+
+;; sanity: the parted table reports the true total row count (2 parts × 3 rows).
+(count Pt) -- 6
+
+;; ── xasc / xdesc on the raw parted table → clean `nyi`, not an index-past-end.
+;;    Cover an integer-family key (Time), a SYM key, an F64 key, and multi-key. ─
+(xasc Pt [Time])      !- nyi
+(xdesc Pt [Time])     !- nyi
+(xasc Pt [Sym])       !- nyi
+(xasc Pt [Px])        !- nyi
+(xdesc Pt [Px])       !- nyi
+(xasc Pt [Sym Time])  !- nyi
+(xdesc Pt [Sym Time]) !- nyi
+
+;; ── the guard is parted-only: xasc on an ordinary in-memory table still sorts
+;;    (rows given out of Time order come back ascending → Px 10,11,12). ─────────
+(set TF (table [Time Px] (list [2024.01.01D10:00:02.000000000 2024.01.01D10:00:00.000000000 2024.01.01D10:00:01.000000000] (as 'F64 [12.0 10.0 11.0]))))
+(at (xasc TF [Time]) 'Px) -- (as 'F64 [10.0 11.0 12.0])
