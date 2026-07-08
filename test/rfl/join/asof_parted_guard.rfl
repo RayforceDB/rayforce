@@ -1,0 +1,30 @@
+;; asof_parted_guard.rfl — a BARE parted table (not a (select {from:...})
+;; operand) handed directly to (asof-join ...) must flatten and compute, not
+;; out-of-bounds read.  exec_window_join fetched time/key columns via
+;; ray_table_get_col and indexed to ray_table_nrows; a raw RAY_PARTED column
+;; was indexed OOB → SIGSEGV exit 139 (confirmed bare-parted on a 40M-row
+;; table).  The parted-asof STREAMING path (asof of select-operands) is
+;; separate and feeds this kernel flat per-day tables; this guards the eager
+;; path for a bare parted table.  Result must equal the flat-oracle asof.
+(.sys.exec "rm -rf /tmp/rfl_asofg_t /tmp/rfl_asofg_q")
+(set T1 (table [sym time price] (list [a b] [2024.01.01D10:00:03.000000000 2024.01.01D10:00:05.000000000] (as 'F64 [10.0 20.0]))))
+(set Q1 (table [sym time bid] (list [a a b] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:01.000000000] (as 'F64 [99.0 100.0 50.0]))))
+(set T2 (table [sym time price] (list [a] [2024.01.02D10:00:02.000000000] (as 'F64 [30.0]))))
+(set Q2 (table [sym time bid] (list [a] [2024.01.02D10:00:01.000000000] (as 'F64 [150.0]))))
+(.db.splayed.set "/tmp/rfl_asofg_t/2024.01.01/trade/" T1 "/tmp/rfl_asofg_t/.sym")
+(.db.splayed.set "/tmp/rfl_asofg_t/2024.01.02/trade/" T2 "/tmp/rfl_asofg_t/.sym")
+(.db.splayed.set "/tmp/rfl_asofg_q/2024.01.01/quote/" Q1 "/tmp/rfl_asofg_q/.sym")
+(.db.splayed.set "/tmp/rfl_asofg_q/2024.01.02/quote/" Q2 "/tmp/rfl_asofg_q/.sym")
+(set PT (.db.parted.get "/tmp/rfl_asofg_t" 'trade))
+(set PQ (.db.parted.get "/tmp/rfl_asofg_q" 'quote))
+(count PT) -- 3
+;; flat oracle: partitions concatenated in day order.
+(set FT (table [sym time price] (list [a b a] [2024.01.01D10:00:03.000000000 2024.01.01D10:00:05.000000000 2024.01.02D10:00:02.000000000] (as 'F64 [10.0 20.0 30.0]))))
+(set FQ (table [sym time bid] (list [a a b a] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:01.000000000 2024.01.02D10:00:01.000000000] (as 'F64 [99.0 100.0 50.0 150.0]))))
+;; bare parted asof must not crash and must equal the flat asof.
+(set RP (asof-join ['sym 'time] PT PQ))
+(set RF (asof-join ['sym 'time] FT FQ))
+(count RP) -- 3
+(count RP) -- (count RF)
+(at RP 'bid) -- (at RF 'bid)
+(at RP 'price) -- (at RF 'price)

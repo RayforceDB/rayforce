@@ -2860,7 +2860,34 @@ done:
     return ok;
 }
 
+static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
+                                    ray_t* left_table, ray_t* right_table);
+
+/* Parted-input guard for asof-join / window-join — mirrors
+ * join_with_parted_guard but flatten-only (window-join has no broadcast path,
+ * and its op ext is the asof-window ext, not the equi-join ext).  A raw
+ * RAY_PARTED/MAPCOMMON column indexed to nrows OOB-reads → SIGSEGV; flatten
+ * any parted side first.  The parted-asof STREAMING path (query.c) feeds this
+ * kernel FLAT per-day tables via OP_WINDOW_JOIN, so the guard is inert there
+ * and only fires for a bare parted table handed directly to (asof-join …). */
 ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
+                        ray_t* left_table, ray_t* right_table) {
+    ray_t *lf = NULL, *rf = NULL;
+    if (join_table_has_parted_col(left_table)) {
+        lf = join_flatten_parted(left_table);
+        if (!lf || RAY_IS_ERR(lf)) return lf ? lf : ray_error("oom", NULL);
+    }
+    if (join_table_has_parted_col(right_table)) {
+        rf = join_flatten_parted(right_table);
+        if (!rf || RAY_IS_ERR(rf)) { if (lf) ray_release(lf); return rf ? rf : ray_error("oom", NULL); }
+    }
+    ray_t* r = exec_window_join_flat(g, op, lf ? lf : left_table, rf ? rf : right_table);
+    if (lf) ray_release(lf);
+    if (rf) ray_release(rf);
+    return r;
+}
+
+static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
                                ray_t* left_table, ray_t* right_table) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
