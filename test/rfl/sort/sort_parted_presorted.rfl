@@ -124,5 +124,22 @@
 (set Ad (at (.sys.mem) 'sort-perpart-runs))
 (- Ad Bd) -- 0
 
+;; ══════════════════════════════════════════════════════════════════════════
+;; NEGATIVE (d) — an AGGREGATE output over the sort key → DECLINE.  A per-row
+;;   projection is safe to stream per-partition (row-preserving), but `(sum
+;;   Seq)` collapses each partition to ONE scalar row; concatenating those
+;;   would yield an nseg-row table of partial sums, not the flat path's
+;;   single correctly-aggregated row.  try_stream_parted_order_by_topk
+;;   already gates this for the take: path (every output column must be a
+;;   bare source-column ref) — this mirrors the same gate onto the concat
+;;   path.  Pp (from the single-key POSITIVE case above) is reused unchanged.
+;; ══════════════════════════════════════════════════════════════════════════
+(set Bg (at (.sys.mem) 'sort-perpart-runs))
+;; DECLINED (aggregate output) → flat path surfaces the same loud pre-existing
+;; error as the other declines above (observed: `nyi`, not `type`).
+(select {Tot: (sum Seq) from: Pp asc: Time}) !- nyi
+(set Ag (at (.sys.mem) 'sort-perpart-runs))
+(- Ag Bg) -- 0
+
 ;; ─── cleanup ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_sps /tmp/rfl_spm /tmp/rfl_spu /tmp/rfl_spo")

@@ -4270,8 +4270,8 @@ ray_t* ray_upsert(ray_t** args, int64_t n);
  * result on the eligible path, or NULL to decline to the flat path. */
 static ray_t* try_stream_parted_order_by(
     ray_t* dict, ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
-    int64_t by_id, int64_t take_id, int64_t asc_id, int64_t desc_id,
-    int64_t nearest_id);
+    int64_t from_id, int64_t where_id, int64_t by_id, int64_t take_id,
+    int64_t asc_id, int64_t desc_id, int64_t nearest_id);
 
 static ray_t* try_stream_parted_order_by_topk(
     ray_t* dict, ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
@@ -5350,7 +5350,7 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     if (has_sort && !by_expr && !take_expr && !nearest_expr) {
         ray_t* streamed = try_stream_parted_order_by(
             dict, tbl, dict_elems, dict_n,
-            by_id, take_id, asc_id, desc_id, nearest_id);
+            from_id, where_id, by_id, take_id, asc_id, desc_id, nearest_id);
         if (streamed) {
             ray_release(tbl);
             DICT_VIEW_CLOSE(dv);
@@ -14168,8 +14168,8 @@ static int sort_stream_cmp_boundary(ray_t** ca, int64_t ra,
  * partition-then-lower-row, exactly as the flat stable sort places them. */
 static ray_t* try_stream_parted_order_by(
     ray_t* dict, ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
-    int64_t by_id, int64_t take_id, int64_t asc_id, int64_t desc_id,
-    int64_t nearest_id) {
+    int64_t from_id, int64_t where_id, int64_t by_id, int64_t take_id,
+    int64_t asc_id, int64_t desc_id, int64_t nearest_id) {
 
     int64_t nseg = asof_parted_seg_count(tbl);
     if (nseg < 1) return NULL;                 /* not parted / no segments */
@@ -14193,6 +14193,21 @@ static ray_t* try_stream_parted_order_by(
     if (n_keys < 1) return NULL;               /* no sort key */
     if (has_asc && has_desc) return NULL;      /* mixed direction */
     uint8_t descending = has_desc ? 1 : 0;
+
+    /* Every OUTPUT column must be a bare source-column ref (row-preserving) —
+     * same invariant as try_stream_parted_order_by_topk's output-shape gate.
+     * An aggregate/expression output collapses per segment (one row per
+     * partition), which would concat into nseg wrong rows instead of the
+     * flat path's single correctly-aggregated result, so it declines here. */
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id ||
+            kid == take_id || kid == asc_id || kid == desc_id ||
+            kid == nearest_id) continue;
+        ray_t* v = dict_elems[i + 1];
+        if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED)) return NULL;
+        if (!ray_table_get_col(tbl, v->i64)) return NULL;
+    }
 
     /* Carve: key syms + resolved parted columns + two per-segment key-vec
      * scratch rows (current segment, previous non-empty segment). */
