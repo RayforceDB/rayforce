@@ -13942,13 +13942,15 @@ static ray_t* asof_parted_select_operand(ray_t* arg_ast, ray_t** out_dict) {
         return NULL;
     }
     /* Per-day streaming concatenates each partition's select result.  That is
-     * equivalent to flat (whole-table) evaluation ONLY for row-preserving
-     * clauses.  `by:` (group-by), `take:` (limit), `asc:`/`desc:` (sort) and
-     * `nearest:` (ANN order) are WHOLE-ROWSET semantics: run per partition and
-     * concatenated they SILENTLY diverge from the flat result (e.g. `by:` yields
-     * one row per (DAY,key) instead of one row per key overall).  Admit only
-     * `from:` + `where:`; any other clause key declines to stream so the caller
-     * falls back to the byte-identical flat eager path (correctness first). */
+     * equivalent to flat (whole-table) evaluation for row-preserving clauses
+     * (`from:`, `where:`) and per-row PROJECTION columns (`col: expr`) — those
+     * all stream.  Only the WHOLE-ROWSET clauses must be rejected: `by:`
+     * (group-by), `take:` (limit), `asc:`/`desc:` (sort) and `nearest:` (ANN
+     * order) — run per partition and concatenated they SILENTLY diverge from
+     * the flat result (e.g. `by:` yields one row per (DAY,key) instead of one
+     * row per key overall).  Any of those declines to stream so the caller
+     * falls back to the byte-identical flat eager path (correctness first).
+     * Every OTHER key is a projection output column and is safe. */
     ray_t* keys = ray_dict_keys(dict);   /* borrowed */
     if (!keys || keys->type != RAY_SYM) { ray_release(tbl); return NULL; }
     for (int64_t i = 0; i < keys->len; i++) {
@@ -13956,9 +13958,12 @@ static ray_t* asof_parted_select_operand(ray_t* arg_ast, ray_t** out_dict) {
         if (!s) { ray_release(tbl); return NULL; }
         int64_t sl = ray_str_len(s);
         const char* sp = ray_str_ptr(s);
-        bool ok = (sl == 4 && memcmp(sp, "from", 4) == 0) ||
-                  (sl == 5 && memcmp(sp, "where", 5) == 0);
-        if (!ok) { ray_release(tbl); return NULL; }
+        bool blocked = (sl == 2 && memcmp(sp, "by",      2) == 0) ||
+                       (sl == 4 && memcmp(sp, "take",    4) == 0) ||
+                       (sl == 3 && memcmp(sp, "asc",     3) == 0) ||
+                       (sl == 4 && memcmp(sp, "desc",    4) == 0) ||
+                       (sl == 7 && memcmp(sp, "nearest", 7) == 0);
+        if (blocked) { ray_release(tbl); return NULL; }
     }
     *out_dict = dict;
     return tbl;   /* owned */
