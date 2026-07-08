@@ -1,0 +1,77 @@
+;; window_parted.rfl — exec_window must FLATTEN genuinely parted input before
+;; computing window functions, instead of silently degenerating.
+;;
+;; Before the fix, win_resolve_vec's OP_SCAN shortcut (window.c) returned the
+;; raw RAY_PARTED/MAPCOMMON wrapper columns straight through to the compute
+;; loops; every type switch in win_keys_differ/win_read_i64/win_read_f64 hits
+;; its `default: break` arm on a parted wrapper, so the whole table collapses
+;; into one degenerate partition and every window value reads back 0/NULL.
+;; No crash — silent wrong answer.
+;;
+;; Ground truth is the flat in-memory oracle: build the SAME rows as one
+;; in-memory table (no parted machinery at all) and run the IDENTICAL
+;; window {} call.  Two partition shapes are covered:
+;;   (a) part: [date Sym] — every partition is wholly contained in one day
+;;       segment (date is the physical/segment key).
+;;   (b) part: [Sym]      — a partition (Sym a, Sym b) SPANS both day
+;;       segments.  Task 1's flatten is correct for this shape too (it makes
+;;       no assumption about how partition keys relate to physical segments);
+;;       a later streaming fast-path may legitimately decline this shape, but
+;;       decline must still mean "fall back to this correct flatten", not
+;;       "return the degenerate answer".
+;;
+;;   Day 1 (2024.01.01): Sym=[a a b]  V=[5 2 9]  Seq=[1 2 3]
+;;   Day 2 (2024.01.02): Sym=[a b b]  V=[4 4 7]  Seq=[4 5 6]
+;;
+;;   case-a groups (date,Sym): (d1,a)=[5,2]  (d1,b)=[9]  (d2,a)=[4]  (d2,b)=[4,7]
+;;     mn (row order 1..6) = [2 2 9 4 4 4]
+;;     mx (row order 1..6) = [5 5 9 4 7 7]
+;;   case-b groups (Sym only, spans days): a=[5,2,4] (rows 1,2,4)  b=[9,4,7] (rows 3,5,6)
+;;     mn (row order 1..6) = [2 2 4 2 4 4]
+;;     mx (row order 1..6) = [5 5 9 5 9 9]
+
+(.sys.exec "rm -rf /tmp/rfl_window_parted")
+(set D1 (table [Sym V Seq] (list ['a 'a 'b] [5 2 9] [1 2 3])))
+(set D2 (table [Sym V Seq] (list ['a 'b 'b] [4 4 7] [4 5 6])))
+(.db.splayed.set "/tmp/rfl_window_parted/2024.01.01/t/" D1)
+(.db.splayed.set "/tmp/rfl_window_parted/2024.01.02/t/" D2)
+(set Pt (.db.parted.get "/tmp/rfl_window_parted/" 't))
+
+;; flat in-memory oracle: identical rows, one table, no parted machinery, but
+;; WITH an explicit 'date' column so the case-a part-by shape is expressible.
+(set TF (table [date Sym V Seq] (list (concat [2024.01.01 2024.01.01 2024.01.01] [2024.01.02 2024.01.02 2024.01.02]) (concat ['a 'a 'b] ['a 'b 'b]) (concat [5 2 9] [4 4 7]) (concat [1 2 3] [4 5 6]))))
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; case (a): part: [date Sym] — partitions aligned with day segments.
+;; ══════════════════════════════════════════════════════════════════════════
+(count (window {from: Pt part: [date Sym] funcs: {mn: (min V) mx: (max V)}})) -- 6
+
+;; parted == flat oracle, column for column
+(at (window {from: Pt part: [date Sym] funcs: {mn: (min V) mx: (max V)}}) 'mn) -- (at (window {from: TF part: [date Sym] funcs: {mn: (min V) mx: (max V)}}) 'mn)
+(at (window {from: Pt part: [date Sym] funcs: {mn: (min V) mx: (max V)}}) 'mx) -- (at (window {from: TF part: [date Sym] funcs: {mn: (min V) mx: (max V)}}) 'mx)
+
+;; explicit expected values (catches a shared-wrong-answer coincidence)
+(at (window {from: Pt part: [date Sym] funcs: {mn: (min V) mx: (max V)}}) 'mn) -- [2 2 9 4 4 4]
+(at (window {from: Pt part: [date Sym] funcs: {mn: (min V) mx: (max V)}}) 'mx) -- [5 5 9 4 7 7]
+
+;; pass-through columns preserved, unpermuted
+(at (window {from: Pt part: [date Sym] funcs: {mn: (min V) mx: (max V)}}) 'Seq) -- [1 2 3 4 5 6]
+(at (window {from: Pt part: [date Sym] funcs: {mn: (min V) mx: (max V)}}) 'V) -- [5 2 9 4 4 7]
+(at (window {from: Pt part: [date Sym] funcs: {mn: (min V) mx: (max V)}}) 'Sym) -- ['a 'a 'b 'a 'b 'b]
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; case (b): part: [Sym] only — a partition SPANS both day segments.
+;; ══════════════════════════════════════════════════════════════════════════
+(count (window {from: Pt part: [Sym] funcs: {mn: (min V) mx: (max V)}})) -- 6
+
+(at (window {from: Pt part: [Sym] funcs: {mn: (min V) mx: (max V)}}) 'mn) -- (at (window {from: TF part: [Sym] funcs: {mn: (min V) mx: (max V)}}) 'mn)
+(at (window {from: Pt part: [Sym] funcs: {mn: (min V) mx: (max V)}}) 'mx) -- (at (window {from: TF part: [Sym] funcs: {mn: (min V) mx: (max V)}}) 'mx)
+
+(at (window {from: Pt part: [Sym] funcs: {mn: (min V) mx: (max V)}}) 'mn) -- [2 2 4 2 4 4]
+(at (window {from: Pt part: [Sym] funcs: {mn: (min V) mx: (max V)}}) 'mx) -- [5 5 9 5 9 9]
+
+(at (window {from: Pt part: [Sym] funcs: {mn: (min V) mx: (max V)}}) 'Seq) -- [1 2 3 4 5 6]
+(at (window {from: Pt part: [Sym] funcs: {mn: (min V) mx: (max V)}}) 'V) -- [5 2 9 4 4 7]
+
+;; ─── cleanup ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_window_parted")

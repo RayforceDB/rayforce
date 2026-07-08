@@ -641,6 +641,17 @@ static void pkey_gather_fn(void* arg, uint32_t wid,
     }
 }
 
+/* Segment count of a parted table = length of any parted column's segs
+ * array (mirrors build_segment_table's own read, exec.c:3377-3384). */
+static int64_t window_parted_seg_count(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && RAY_IS_PARTED(col->type)) return col->len;
+    }
+    return 0;  /* not parted (a table of only MAPCOMMON keys can't occur) */
+}
+
 ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
@@ -668,6 +679,43 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             return ray_error("nyi", "unsupported window frame: only "
                 "ROWS BETWEEN UNBOUNDED PRECEDING AND {CURRENT ROW | "
                 "UNBOUNDED FOLLOWING} are honored");
+    }
+
+    /* Parted-input correctness guard: win_resolve_vec's OP_SCAN shortcut
+     * (above) returns raw parted/MAPCOMMON columns, which every compute
+     * loop below silently no-ops on (degenerate 0/NULL window values).
+     * Flatten (concat all segments) before compute — correct for every
+     * window shape, since the flat path scatters results to original
+     * row positions and passes through unpermuted columns. */
+    {
+        int64_t nc = ray_table_ncols(tbl);
+        for (int64_t c = 0; c < nc; c++) {
+            ray_t* col = ray_table_get_col_idx(tbl, c);
+            if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) {
+                int64_t nseg = window_parted_seg_count(tbl);
+                ray_t* flat = NULL;
+                for (int64_t s = 0; s < nseg; s++) {
+                    ray_t* seg = build_segment_table(tbl, (int32_t)s);
+                    if (!seg || RAY_IS_ERR(seg)) {
+                        ray_release(flat);
+                        return seg ? seg : ray_error("oom", NULL);
+                    }
+                    if (!flat) {
+                        flat = seg;
+                    } else {
+                        ray_t* m = ray_result_merge(flat, seg);
+                        ray_release(flat);
+                        ray_release(seg);
+                        if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+                        flat = m;
+                    }
+                }
+                /* flat has no parted columns: recurses exactly once. */
+                ray_t* r = exec_window(g, op, flat);
+                ray_release(flat);
+                return r;
+            }
+        }
     }
 
     int64_t nrows = ray_table_nrows(tbl);
