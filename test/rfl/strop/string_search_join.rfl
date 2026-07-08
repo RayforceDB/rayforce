@@ -1,0 +1,28 @@
+;; Substring index search and delimiter join.
+
+(str-find "banana" "na") -- 2
+(str-find "banana" "zz") -- 0Nl
+(str-find "banana" "") -- 0
+(str-find 'banana "na") -- 2
+(str-find "banana" 'na) -- 2
+
+(str-find ["banana" "cab" ""] "a") -- [1 1 0Nl]
+(str-find ["abc" "def" "ghi"] "e") -- [0Nl 1 0Nl]
+(str-find ['banana 'cab 'x] "a") -- [1 1 0Nl]
+(str-find (list "aba" 'cab "") "a") -- [0 1 0Nl]
+
+(str-find [1 2] "a") !- type
+(str-find "abc" 1) !- type
+(str-find (list "a" 2) "a") !- type
+
+(str-join ["a" "b" "c"] ",") -- "a,b,c"
+(str-join ['a 'b 'c] "-") -- "a-b-c"
+(str-join (list "a" 'b "c") "/") -- "a/b/c"
+(str-join (take ["a"] 0) ",") -- ""
+(str-join ["solo"] ",") -- "solo"
+(str-join "solo" ",") -- "solo"
+(str-join ["a" "" "c"] ",") -- "a,,c"
+
+(str-join [1 2] ",") !- type
+(str-join ["a"] 1) !- type
+(str-join (list "a" 2) ",") !- type

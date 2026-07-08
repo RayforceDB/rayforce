@@ -174,7 +174,7 @@
 (at (at _T8 's) 0) -- 'sym1
 (at (at _T8 's) 42) -- 'sym43
 (at (at _T8 's) 259) -- 'sym260
-;; Lexicographic min/max (k/q SYM order, NOT intern order): "sym1" is least;
+;; Lexicographic min/max (SYM lexical order, NOT intern order): "sym1" is least;
 ;; "sym99" is greatest because '9' > '2'/'1' at the 4th char.
 (min (at _T8 's)) -- 'sym1
 (max (at _T8 's)) -- 'sym99

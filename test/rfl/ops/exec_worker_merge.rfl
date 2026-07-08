@@ -119,7 +119,7 @@
 ;; distinct survivor values are exactly {1,2,3}.
 (count (distinct (at (select {from: TIN where: (in v [1 2 3])}) 'v))) -- 3
 ;; sum of survivors: 8750 each of 1/2/3 → 8750*6 = 52500.  sum widens
-;; narrow ints to i64 (k/q convention) — expected stays an i64 total.
+;; narrow ints to i64 (documented convention) — expected stays an i64 total.
 (sum (at (select {from: TIN where: (in v [1 2 3])}) 'v)) -- 52500
 ;; not-in survivors (value 4 or 5) must NOT be in {1,2,3}.
 (max (in (at (select {from: TIN where: (not-in v [1 2 3])}) 'v) [1 2 3])) -- false

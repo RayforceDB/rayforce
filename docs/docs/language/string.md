@@ -54,7 +54,7 @@ In the C API DAG, null propagation is handled automatically per morsel. String t
 
 ## String Functions
 
-Rayfall exposes the common string transforms as direct builtins. On vector inputs, `upper`, `lower`, `trim`, `substr`, and `replace` are lazy-aware and use the same morsel-based DAG opcodes that query expressions use. `ilike` remains a C API DAG opcode.
+Rayfall exposes the common string transforms as direct builtins. On vector inputs, `upper`, `lower`, `trim`, `substr`, and `replace` are lazy-aware and use the same morsel-based DAG opcodes that query expressions use. `str-find` uses the thread pool for large direct vector searches. `ilike` remains a C API DAG opcode.
 
 ### concat
 
@@ -131,6 +131,34 @@ Splits each string element by the given delimiter and returns a list of string v
 (split "a,b,c" ",")
 
 (split "hello world" " ")
+```
+
+### str-find
+
+**`(str-find str needle)`** — binary · atom/vector/list
+
+Returns the first 0-based byte index of `needle` in each string or symbol value. A missing substring returns `0Nl`, matching the collection `find` convention for "not found". Empty `needle` returns `0`. Large string/symbol vectors run through the thread pool and poll cancellation between morsels.
+
+```lisp
+(str-find "banana" "na")
+; 2
+
+(str-find ["banana" "cab" ""] "a")
+; [1 1 0Nl]
+```
+
+### str-join
+
+**`(str-join items delimiter)`** — binary
+
+Joins string or symbol atoms, vectors, or lists using a string/symbol delimiter. The result is a string atom. Empty inputs produce `""`; a single item is returned without adding the delimiter.
+
+```lisp
+(str-join ["2026" "04" "16"] "-")
+; "2026-04-16"
+
+(str-join (list "a" 'b "c") "/")
+; "a/b/c"
 ```
 
 ### format

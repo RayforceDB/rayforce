@@ -1169,7 +1169,7 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type) {
  * Scope MATCHES the validator (src/vec/validate.c): only F64/F32/I64/
  * TIMESTAMP sentinels are reserved.  I16/I32 (and I32-backed DATE/TIME) are
  * DELIBERATELY excluded — narrow-int arithmetic/truncation wraps modulo the
- * width (documented k/q rule), so INT16_MIN/INT32_MIN are legitimate
+ * width (documented wrap rule), so INT16_MIN/INT32_MIN are legitimate
  * computed values, not nulls (see test/rfl/expr/narrow_binary.rfl).  Forcing
  * HAS_NULLS for them would make a wrapped result read back as null. */
 static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {

@@ -186,8 +186,8 @@
 
 ;; ===================================================================
 ;; Overflow / wraparound boundaries — value AND width must be checked.
-;; Narrow-int arithmetic wraps modulo the type's width (documented k/q
-;; rule); a result that wraps but silently widens (or a sign-extension
+;; Narrow-int arithmetic wraps modulo the type's width (documented
+;; wrap rule); a result that wraps but silently widens (or a sign-extension
 ;; bug) would pass a type-only or in-range value-only check.
 ;; ===================================================================
 

@@ -110,7 +110,7 @@
 ;;     group 0 = {0Nl, 0}; were the null counted this would be 2, but the
 ;;     kernel returns 1 (the lone non-null 0).  This differs from the
 ;;     scalar `(count (distinct [1 0N ...]))` which keeps one null
-;;     (null/distinct.rfl:3) — a k/q per-group-vs-scalar quirk.
+;;     (null/distinct.rfl:3) — a per-group-vs-scalar behavior difference.
 ;;
 ;;     Layout: Vnull[i] = (i-5)%7 for i>=5, prefix [null 1 null 2 null].
 ;;     Group k<9000 = rows {k, k+51000}; partner value = k%7 (because

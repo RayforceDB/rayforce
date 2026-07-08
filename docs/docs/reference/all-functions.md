@@ -14,7 +14,7 @@
 | [Aggregation](#aggregation) (22) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (41) |
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (11) | [Table Operations](#table-ops) (20) |
 | [Query](#query) (4) | [Joins](#joins) (6) | [Pivot](#pivot) (1) |
-| [String](#string-ops) (9) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
+| [String](#string-ops) (11) | [Temporal](#temporal) (3) | [Type & Introspection](#type-ops) (5) |
 | [I/O & Output](#io) (12) | [System & Utility](#system) (15) | [Serialization](#serialization) (2) |
 | [Storage](#storage) (5) | [IPC](#ipc) (9) | [EAV Triple Store](#eav) (5) |
 | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) | |
@@ -58,7 +58,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `cov`, `scov`, `wsum`, `wavg`, `set`, `let`,
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `drop`, `rotate`, `cut`, `cross`, `at`, `find`, `msum`, `mavg`, `mmin`, `mmax`,
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `dict`, `concat`, `within`, `div`,
-`rand`, `bin`, `binr`, `split`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
+`rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
 `unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`, `inner-prod`, `l2-dist`, `hnsw-save`, `.attr.set`,
 `.col.link`
 
@@ -520,6 +520,8 @@ String functions are available as direct builtins. The transform functions are l
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `split` | binary | — | Split string by delimiter into a list of strings | `(split "a,b,c" ",")` → `("a" "b" "c")` |
+| `str-find` | binary | parallel vector | First byte index of a substring; `0Nl` when absent | `(str-find "banana" "na")` → `2` |
+| `str-join` | binary | — | Join string/symbol atoms, vectors, or lists with a delimiter | `(str-join ["a" "b"] ",")` → `"a,b"` |
 | `strlen` | unary | — | Length of each string | `(strlen "hello")` → `5` |
 | `upper` | unary | lazy/DAG | Uppercase string or symbol atoms/vectors | `(upper ["ab" "Cd"])` → `["AB" "CD"]` |
 | `lower` | unary | lazy/DAG | Lowercase string or symbol atoms/vectors | `(lower 'AbC)` → `'abc` |
@@ -532,6 +534,8 @@ String functions are available as direct builtins. The transform functions are l
 ```lisp
 ; Split and rejoin
 (split "2026-04-16" "-")    ; ("2026" "04" "16")
+(str-join ["2026" "04" "16"] "-") ; "2026-04-16"
+(str-find "2026-04-16" "04")      ; 5
 
 ; Pattern matching on a vector of strings
 (like ["apple" "banana" "avocado"] "a*")

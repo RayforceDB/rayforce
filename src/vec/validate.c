@@ -44,7 +44,7 @@
  * Deliberately NOT validated (return true / no-op):
  *   I16, I32 (+ DATE/TIME, which are I32-backed)
  *                   — DOCUMENTED EXCEPTION.  Narrow-int arithmetic wraps
- *                     modulo the type width (the k/q rule, see
+ *                     modulo the type width (see
  *                     test/rfl/expr/narrow_binary.rfl): 32767h + 1h == -32768h
  *                     and 2147483647i + 1i == -2147483648i are REAL wrapped
  *                     values that happen to equal NULL_I16 / NULL_I32.

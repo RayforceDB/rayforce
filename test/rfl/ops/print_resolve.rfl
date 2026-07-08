@@ -45,7 +45,7 @@
 (nil? (println 1.5)) -- true
 ;; value-check: the rendered F64 atom
 (as 'STR 1.5) -- "1.5"
-;; -0.0 normalises to "0" on render (k/q convention)
+;; -0.0 normalises to "0" on render (documented convention)
 (as 'STR -0.0) -- "0"
 
 ;; -RAY_BOOL atom — both true and false paths in the ternary (line 98)
@@ -101,7 +101,7 @@
 ;; (null_literal_str dispatch for "0Nl")
 (nil? (println 0Nl)) -- true
 ;; value-check: the null literal — distinct least value, casts to empty
-;; string on render (k/q convention).  `type` resolves the typed-null tag.
+;; string on render (documented convention).  `type` resolves the typed-null tag.
 (type 0Nl) -- 'i64
 (as 'STR 0Nl) -- ""
 

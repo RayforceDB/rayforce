@@ -3175,6 +3175,8 @@ static void ray_register_builtins(void) {
 
     /* String operations */
     register_binary("split",     RAY_FN_NONE, ray_split_fn);
+    register_binary("str-find",  RAY_FN_NONE, ray_str_find_fn);
+    register_binary("str-join",  RAY_FN_NONE, ray_str_join_fn);
     register_unary ("upper",     RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_upper_fn);
     register_unary ("lower",     RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_lower_fn);
     register_unary ("trim",      RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_trim_fn);

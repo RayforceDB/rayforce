@@ -1,5 +1,5 @@
 ;; Sort behaviour with nulls.
-;; k/q convention: null sorts FIRST in asc (null is the least value),
+;; Documented convention: null sorts FIRST in asc (null is the least value),
 ;; LAST in desc. NaN/float-null treated as least the same way.
 
 ;; asc: nulls sort first

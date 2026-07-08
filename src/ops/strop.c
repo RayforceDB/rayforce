@@ -447,6 +447,285 @@ ray_t* ray_replace_fn(ray_t** args, int64_t n) {
     return ray_lazy_wrap(g, op);
 }
 
+static const char* str_bytes_find(const char* hay, size_t hay_len,
+                                  const char* needle, size_t needle_len,
+                                  ray_pool_t* pool, bool* cancelled) {
+    if (cancelled) *cancelled = false;
+    if (needle_len == 0) return hay;
+    if (needle_len > hay_len) return NULL;
+
+    const unsigned char first = (unsigned char)needle[0];
+    const size_t chunk = (size_t)1 << 20;
+    size_t base = 0;
+    while (base + needle_len <= hay_len) {
+        if (pool_cancelled(pool)) {
+            if (cancelled) *cancelled = true;
+            return NULL;
+        }
+        size_t starts = hay_len - base - needle_len + 1;
+        size_t scan = starts < chunk ? starts : chunk;
+        const void* hit = memchr(hay + base, first, scan);
+        if (!hit) {
+            base += scan;
+            continue;
+        }
+        const char* p = (const char*)hit;
+        size_t pos = (size_t)(p - hay);
+        if (memcmp(p, needle, needle_len) == 0)
+            return p;
+        base = pos + 1;
+    }
+    return NULL;
+}
+
+static int64_t str_find_index(const char* hay, size_t hay_len,
+                              const char* needle, size_t needle_len,
+                              ray_pool_t* pool, bool* cancelled) {
+    const char* p = str_bytes_find(hay, hay_len, needle, needle_len,
+                                   pool, cancelled);
+    if (cancelled && *cancelled) return NULL_I64;
+    return p ? (int64_t)(p - hay) : NULL_I64;
+}
+
+static bool str_vec_cell_bytes(ray_t* x, int64_t row,
+                               const char** out, size_t* out_len) {
+    if (x->type == RAY_STR) {
+        const char* s = ray_str_vec_get(x, row, out_len);
+        if (!s) {
+            *out = "";
+            if (out_len) *out_len = 0;
+        } else {
+            *out = s;
+        }
+        return true;
+    }
+    if (x->type == RAY_SYM) {
+        ray_t* s = ray_sym_vec_cell(x, row);
+        *out = s ? ray_str_ptr(s) : "";
+        if (out_len) *out_len = s ? ray_str_len(s) : 0;
+        return true;
+    }
+    return false;
+}
+
+typedef struct {
+    ray_t* hay;
+    const char* needle;
+    size_t needle_len;
+    int64_t* out;
+    ray_pool_t* pool;
+    _Atomic(int) any_null;
+} str_find_vec_ctx_t;
+
+static void str_find_vec_task(void* vctx, uint32_t worker_id,
+                              int64_t lo, int64_t hi) {
+    (void)worker_id;
+    str_find_vec_ctx_t* c = (str_find_vec_ctx_t*)vctx;
+    bool any_null = false;
+    for (int64_t i = lo; i < hi; i++) {
+        if (((i - lo) & (RAY_MORSEL_ELEMS - 1)) == 0 &&
+            pool_cancelled(c->pool))
+            return;
+        const char* hp = "";
+        size_t hl = 0;
+        str_vec_cell_bytes(c->hay, i, &hp, &hl);
+        bool cancelled = false;
+        int64_t idx = str_find_index(hp, hl, c->needle, c->needle_len,
+                                     c->pool, &cancelled);
+        if (cancelled) return;
+        c->out[i] = idx;
+        if (idx == NULL_I64) any_null = true;
+    }
+    if (any_null)
+        atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
+}
+
+static ray_t* str_find_vec(ray_t* hay, const char* needle, size_t needle_len) {
+    int64_t n = hay->len;
+    ray_t* out = ray_vec_new(RAY_I64, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+
+    ray_pool_t* pool = n >= RAY_PARALLEL_THRESHOLD ? ray_pool_get() : NULL;
+    int64_t* dst = (int64_t*)ray_data(out);
+    str_find_vec_ctx_t ctx = {
+        .hay = hay,
+        .needle = needle,
+        .needle_len = needle_len,
+        .out = dst,
+        .pool = pool
+    };
+    atomic_init(&ctx.any_null, 0);
+
+    if (pool && ray_pool_total_workers(pool) >= 2) {
+        ray_pool_dispatch(pool, str_find_vec_task, &ctx, n);
+    } else {
+        str_find_vec_task(&ctx, 0, 0, n);
+    }
+
+    if (pool_cancelled(pool)) {
+        ray_release(out);
+        return ray_error("cancel", NULL);
+    }
+    if (atomic_load_explicit(&ctx.any_null, memory_order_relaxed))
+        out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
+ray_t* ray_str_find_fn(ray_t* hay, ray_t* needle) {
+    if (ray_is_lazy(hay)) hay = ray_lazy_materialize(hay);
+    if (ray_is_lazy(needle)) needle = ray_lazy_materialize(needle);
+    if (!hay || RAY_IS_ERR(hay)) return hay;
+    if (!needle || RAY_IS_ERR(needle)) return needle;
+
+    const char* np = NULL;
+    size_t nl = 0;
+    if (!str_atom_arg(needle, &np, &nl))
+        return ray_error("type", "str-find: needle must be string or symbol atom");
+
+    const char* hp = NULL;
+    size_t hl = 0;
+    if (str_atom_bytes(hay, &hp, &hl, NULL)) {
+        bool cancelled = false;
+        int64_t idx = str_find_index(hp, hl, np, nl, NULL, &cancelled);
+        if (cancelled) return ray_error("cancel", NULL);
+        return idx == NULL_I64 ? ray_typed_null(-RAY_I64) : ray_i64(idx);
+    }
+
+    if (ray_is_vec(hay) && (hay->type == RAY_STR || hay->type == RAY_SYM))
+        return str_find_vec(hay, np, nl);
+
+    if (hay->type == RAY_LIST) {
+        int64_t n = hay->len;
+        ray_t* out = ray_vec_new(RAY_I64, n);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        out->len = n;
+        int64_t* dst = (int64_t*)ray_data(out);
+        ray_t** items = (ray_t**)ray_data(hay);
+        bool any_null = false;
+        for (int64_t i = 0; i < n; i++) {
+            if ((i & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(NULL)) {
+                ray_release(out);
+                return ray_error("cancel", NULL);
+            }
+            if (!str_atom_bytes(items[i], &hp, &hl, NULL)) {
+                ray_release(out);
+                return ray_error("type", "str-find: list items must be string or symbol atoms");
+            }
+            bool cancelled = false;
+            int64_t idx = str_find_index(hp, hl, np, nl, NULL, &cancelled);
+            if (cancelled) {
+                ray_release(out);
+                return ray_error("cancel", NULL);
+            }
+            dst[i] = idx;
+            if (idx == NULL_I64) any_null = true;
+        }
+        if (any_null) out->attrs |= RAY_ATTR_HAS_NULLS;
+        return out;
+    }
+
+    return ray_error("type", "str-find: expected string, symbol, string vector, symbol vector, or list");
+}
+
+static bool str_join_seq_len(ray_t* x, int64_t* n) {
+    const char* sp = NULL;
+    size_t sl = 0;
+    if (str_atom_arg(x, &sp, &sl)) {
+        *n = 1;
+        return true;
+    }
+    if (x->type == RAY_STR || x->type == RAY_SYM || x->type == RAY_LIST) {
+        *n = x->len;
+        return true;
+    }
+    return false;
+}
+
+static bool str_join_seq_item(ray_t* x, int64_t row,
+                              const char** out, size_t* out_len) {
+    if (str_atom_arg(x, out, out_len))
+        return row == 0;
+    if (x->type == RAY_STR || x->type == RAY_SYM)
+        return str_vec_cell_bytes(x, row, out, out_len);
+    if (x->type == RAY_LIST) {
+        ray_t** items = (ray_t**)ray_data(x);
+        return str_atom_arg(items[row], out, out_len);
+    }
+    return false;
+}
+
+static bool str_size_add(size_t* total, size_t add) {
+    if (add > SIZE_MAX - *total) return false;
+    *total += add;
+    return true;
+}
+
+ray_t* ray_str_join_fn(ray_t* items, ray_t* delim) {
+    if (ray_is_lazy(items)) items = ray_lazy_materialize(items);
+    if (ray_is_lazy(delim)) delim = ray_lazy_materialize(delim);
+    if (!items || RAY_IS_ERR(items)) return items;
+    if (!delim || RAY_IS_ERR(delim)) return delim;
+
+    const char* dp = NULL;
+    size_t dl = 0;
+    if (!str_atom_arg(delim, &dp, &dl))
+        return ray_error("type", "str-join: delimiter must be string or symbol atom");
+
+    int64_t n = 0;
+    if (!str_join_seq_len(items, &n))
+        return ray_error("type", "str-join: expected string/symbol atom, string/symbol vector, or list");
+    if (n <= 0) return ray_str("", 0);
+
+    size_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if ((i & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(NULL))
+            return ray_error("cancel", NULL);
+        const char* sp = NULL;
+        size_t sl = 0;
+        if (!str_join_seq_item(items, i, &sp, &sl))
+            return ray_error("type", "str-join: items must be string or symbol values");
+        if (i > 0 && !str_size_add(&total, dl))
+            return ray_error("oom", NULL);
+        if (!str_size_add(&total, sl))
+            return ray_error("oom", NULL);
+    }
+    if (total > (size_t)INT64_MAX)
+        return ray_error("oom", NULL);
+
+    char sbuf[8192];
+    char* buf = sbuf;
+    ray_t* dyn_hdr = NULL;
+    if (total + 1 > sizeof(sbuf)) {
+        if (total == SIZE_MAX) return ray_error("oom", NULL);
+        buf = (char*)scratch_alloc(&dyn_hdr, total + 1);
+        if (!buf) return ray_error("oom", NULL);
+    }
+
+    size_t off = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if ((i & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(NULL)) {
+            scratch_free(dyn_hdr);
+            return ray_error("cancel", NULL);
+        }
+        const char* sp = NULL;
+        size_t sl = 0;
+        str_join_seq_item(items, i, &sp, &sl);
+        if (i > 0 && dl > 0) {
+            memcpy(buf + off, dp, dl);
+            off += dl;
+        }
+        if (sl > 0) {
+            memcpy(buf + off, sp, sl);
+            off += sl;
+        }
+    }
+    buf[off] = '\0';
+    ray_t* out = ray_str(buf, off);
+    scratch_free(dyn_hdr);
+    return out;
+}
+
 ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
     /* List split: (split list indices) → list of sub-lists */
     if (str->type == RAY_LIST &&

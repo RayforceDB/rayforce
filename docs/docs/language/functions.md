@@ -340,6 +340,8 @@ Rayforce supports four join types, all with time-series-aware semantics.
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `split` | binary | Split string by delimiter (returns a list) | `(split "a,b,c" ",")` → `("a" "b" "c")` |
+| `str-find` | binary | First byte index of a substring; returns `0Nl` when absent | `(str-find "banana" "na")` → `2` |
+| `str-join` | binary | Join strings or symbols with a delimiter | `(str-join ["a" "b"] ",")` → `"a,b"` |
 | `strlen` | unary | Length of each string | `(strlen "hello")` → `5` |
 | `upper` | unary | Uppercase string or symbol atoms/vectors; lazy/DAG for vectors | `(upper ["ab" "Cd"])` → `["AB" "CD"]` |
 | `lower` | unary | Lowercase string or symbol atoms/vectors; lazy/DAG for vectors | `(lower 'AbC)` → `'abc` |

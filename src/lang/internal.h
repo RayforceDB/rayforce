@@ -505,6 +505,8 @@ ray_t* ray_enlist_fn(ray_t** args, int64_t n);
 ray_t* ray_split_fn(ray_t* str, ray_t* delim);
 ray_t* ray_strlen_fn(ray_t* x);
 ray_t* ray_like_fn(ray_t* x, ray_t* pattern);
+ray_t* ray_str_find_fn(ray_t* hay, ray_t* needle);
+ray_t* ray_str_join_fn(ray_t* items, ray_t* delim);
 ray_t* ray_upper_fn(ray_t* x);
 ray_t* ray_lower_fn(ray_t* x);
 ray_t* ray_trim_fn(ray_t* x);
