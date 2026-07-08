@@ -4273,6 +4273,11 @@ static ray_t* try_stream_parted_order_by(
     int64_t by_id, int64_t take_id, int64_t asc_id, int64_t desc_id,
     int64_t nearest_id);
 
+static ray_t* try_stream_parted_order_by_topk(
+    ray_t* dict, ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
+    int64_t from_id, int64_t where_id, int64_t by_id, int64_t take_id,
+    int64_t asc_id, int64_t desc_id, int64_t nearest_id);
+
 ray_t* ray_select_fn(ray_t** args, int64_t n) {
     return ray_select(args, n);
 }
@@ -5346,6 +5351,24 @@ ray_t* ray_select(ray_t** args, int64_t n) {
         ray_t* streamed = try_stream_parted_order_by(
             dict, tbl, dict_elems, dict_n,
             by_id, take_id, asc_id, desc_id, nearest_id);
+        if (streamed) {
+            ray_release(tbl);
+            DICT_VIEW_CLOSE(dv);
+            return streamed;
+        }
+    }
+
+    /* Streaming parted ORDER BY + LIMIT: `(select {COLS…} from: PARTED
+     * [where: W] asc/desc: KEY take: k)` over a parted table.  Runs top-k on
+     * each partition's segment (bounded), concats the ≤P·k candidates, and
+     * takes the global top-k — output-bounded O(k), no whole-table flatten.
+     * Broader eligibility than the pre-sorted concat path (no per-partition
+     * sortedness required).  Declines (NULL) for non-parted / ineligible
+     * shapes, so flat tables fall through to the fused top-k below. */
+    if (has_sort && take_expr && !by_expr && !nearest_expr) {
+        ray_t* streamed = try_stream_parted_order_by_topk(
+            dict, tbl, dict_elems, dict_n,
+            from_id, where_id, by_id, take_id, asc_id, desc_id, nearest_id);
         if (streamed) {
             ray_release(tbl);
             DICT_VIEW_CLOSE(dv);
@@ -14303,6 +14326,141 @@ static ray_t* try_stream_parted_order_by(
     ray_release(sdict);
     scratch_free(hdr);
     return accum;   /* nseg >= 1 guarantees a non-NULL result */
+}
+
+/* ── streaming parted ORDER BY + LIMIT: per-partition top-k ─────────────────
+ *
+ * `(select {COLS…} from: PARTED [where: W] asc/desc: KEY take: k)` — an
+ * OUTPUT-bounded ORDER BY + LIMIT.  Instead of flattening the whole parted
+ * table, sorting O(total) rows and slicing k, run top-k on EACH partition's
+ * segment independently: the per-segment ray_select keeps the asc/desc/take
+ * clauses, so each segment yields its own local top-k (≤k rows, already
+ * sorted).  Concat the ≤P·k candidates, then run the SAME apply_sort_take ONCE
+ * MORE over the candidate table → the global top-k.  Peak working memory ≈ one
+ * segment + O(P·k) candidates; the output is O(k).
+ *
+ * Correctness (byte-identical to flatten→apply_sort_take→take):
+ *   - The union of the per-partition top-k provably contains the global top-k:
+ *     a global-top-k row has ≤k-1 rows ordered ahead of it globally, hence
+ *     ≤k-1 within its own partition, so it survives that partition's local
+ *     top-k (or its partition has <k rows and every row is kept).
+ *   - Both stages route through apply_sort_take's STABLE (key, original-row)
+ *     top-k kernels.  The candidate table is assembled in segment order and
+ *     each segment's block preserves (key, local-row) order, so equal-key rows
+ *     sit in global-flatten order in the candidate — the final stable merge
+ *     therefore breaks ties by global original position, exactly as the flat
+ *     stable sort does.
+ *
+ * Unlike the pre-sorted concat path this does NOT require partitions to be
+ * internally sorted or their key ranges disjoint — per-partition top-k works
+ * on unsorted segments — so it has BROADER eligibility.  Declines (NULL) to
+ * the flat path on any ineligible shape.
+ *
+ * Eligibility (ALL must hold; else decline):
+ *   1. `tbl` is genuinely parted (≥1 segment).
+ *   2. asc:/desc: present; take: present; no by:/nearest:.
+ *   3. take: evaluates to a POSITIVE integer atom k (>0).  Ranges / negatives /
+ *      non-atoms are slices, not top-k, and decline.
+ *   4. Every OUTPUT column is a bare (unquoted) source-column reference — a
+ *      pure per-row gather, so per-partition evaluation is row-preserving.  An
+ *      aggregate/expression output would collapse per segment (one row per
+ *      partition) and diverge from flat, so it declines.
+ *   5. Every sort key resolves to an output column (its alias), so the
+ *      candidate table carries the sort column for the final merge. */
+static ray_t* try_stream_parted_order_by_topk(
+    ray_t* dict, ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
+    int64_t from_id, int64_t where_id, int64_t by_id, int64_t take_id,
+    int64_t asc_id, int64_t desc_id, int64_t nearest_id) {
+
+    int64_t nseg = asof_parted_seg_count(tbl);
+    if (nseg < 1) return NULL;                 /* not parted / no segments */
+
+    /* Clause-shape gate: asc/desc + take present, no by/nearest. */
+    bool has_sort = false, has_take = false;
+    ray_t* take_v = NULL;
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == by_id || kid == nearest_id) return NULL;
+        if (kid == asc_id || kid == desc_id) has_sort = true;
+        if (kid == take_id) { has_take = true; take_v = dict_elems[i + 1]; }
+    }
+    if (!has_sort || !has_take || !take_v) return NULL;
+
+    /* take: must evaluate to a positive integer atom. */
+    ray_t* kv = ray_eval(take_v);
+    if (!kv || RAY_IS_ERR(kv) || !ray_is_atom(kv) ||
+        (kv->type != -RAY_I64 && kv->type != -RAY_I32)) {
+        if (kv) ray_release(kv);
+        return NULL;
+    }
+    int64_t k = (kv->type == -RAY_I64) ? kv->i64 : kv->i32;
+    ray_release(kv);
+    /* k == 0 is a well-defined top-0 (empty); handle it in-stream rather than
+     * declining, since the flat fallback cannot sort a parted table.  A
+     * negative / range take is a slice, not a top-k — decline it. */
+    if (k < 0) return NULL;
+
+    /* Every output column must be a bare source-column ref (row-preserving). */
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id ||
+            kid == take_id || kid == asc_id || kid == desc_id ||
+            kid == nearest_id) continue;
+        ray_t* v = dict_elems[i + 1];
+        if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED)) return NULL;
+        if (!ray_table_get_col(tbl, v->i64)) return NULL;
+    }
+
+    /* Every sort key must appear as an output alias (dict key of an output
+     * column), so the candidate table carries the sort column. */
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid != asc_id && kid != desc_id) continue;
+        ray_t* v = dict_elems[i + 1];
+        if (!v) return NULL;
+        int64_t nk = (v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) ? 1
+                   : (v->type == RAY_SYM ? ray_len(v) : -1);
+        if (nk < 0) return NULL;                /* computed / literal sort key */
+        for (int64_t c = 0; c < nk; c++) {
+            int64_t sk = (v->type == -RAY_SYM) ? v->i64
+                                               : sym_cell_runtime_id(v, c);
+            bool found = false;
+            for (int64_t j = 0; j + 1 < dict_n && !found; j += 2) {
+                int64_t okid = dict_elems[j]->i64;
+                if (okid == from_id || okid == where_id || okid == by_id ||
+                    okid == take_id || okid == asc_id || okid == desc_id ||
+                    okid == nearest_id) continue;
+                if (okid == sk) found = true;
+            }
+            if (!found) return NULL;
+        }
+    }
+
+    /* Eligible.  Per-partition top-k via each segment's own ray_select (keeps
+     * asc/desc/take → local top-k), concat into a candidate table, then one
+     * final apply_sort_take over the candidates → the global top-k.  One
+     * counter bump per partition. */
+    ray_t* accum = NULL;
+    for (int64_t s = 0; s < nseg; s++) {
+        ray_t* seg_res = asof_eval_select_segment(dict, tbl, (int32_t)s);
+        atomic_fetch_add_explicit(&ray_sort_perpart_runs_ctr, 1,
+                                  memory_order_relaxed);
+        if (!seg_res || RAY_IS_ERR(seg_res)) {
+            if (accum) ray_release(accum);
+            return seg_res ? seg_res : ray_error("oom", NULL);
+        }
+        ray_t* merged = ray_result_merge(accum, seg_res);
+        ray_release(seg_res);
+        if (accum) ray_release(accum);
+        accum = merged;
+        if (!accum || RAY_IS_ERR(accum))
+            return accum ? accum : ray_error("oom", NULL);
+    }
+
+    /* Final merge: apply_sort_take reads asc/desc/take straight from dict_elems
+     * and is the SAME stable kernel the flat path uses, so the k rows and their
+     * order are byte-identical to flatten→sort→take.  It consumes `accum`. */
+    return apply_sort_take(accum, dict_elems, dict_n, asc_id, desc_id, take_id);
 }
 
 /* If `tbl` is DATE-partitioned, return its (borrowed) per-partition RAY_DATE

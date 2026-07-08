@@ -1,0 +1,221 @@
+;; sort_parted_topk.rfl — streaming parted ORDER BY + LIMIT via PER-PARTITION
+;; top-k (try_stream_parted_order_by_topk, src/ops/query.c).
+;;
+;; `(select {COLS…} from: PARTED [where: W] asc/desc: KEY take: k)` runs top-k on
+;; EACH partition's segment independently (bounded heap of size k), concats the
+;; ≤P·k candidates, then takes the global top-k over the candidate table — the
+;; output is O(k), never O(total).  Unlike the pre-sorted concat path this needs
+;; NO per-partition sortedness / disjoint ranges, so it streams UNSORTED parted
+;; input too.  The (.sys.mem) 'sort-perpart-runs counter bumps once per partition
+;; processed, so a strict delta == n_parts proves the streaming path ran; column
+;; parity with an identical-data FLAT in-memory oracle (concat all partitions,
+;; then the SAME select) proves byte-for-byte correctness — INCLUDING tie order
+;; at the k boundary, which a Seq column makes observable.
+;;
+;; Tie-break contract: the flat path's stable (key, original-position) top-k
+;; kernels keep the LOWER original position (lower partition, then lower row) on
+;; equal keys straddling the k boundary; the segment-major candidate assembly
+;; makes the streamed final merge resolve ties to the same global position.
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; POSITIVE 1 — DUPLICATE key AT THE k BOUNDARY (the tie discriminator).
+;;   P1 k=[5 5 5] Seq=[0 1 2]; P2 k=[5 3] Seq=[3 4].  Flat: k=[5 5 5 5 3].
+;;   asc: k take: 3 → stable order (3,Seq4),(5,Seq0),(5,Seq1),… → Seq [4 0 1].
+;;   The 3rd (Seq1) and 4th (Seq2) rows tie on k=5: keeping Seq1 (lower position)
+;;   over Seq2/Seq3 is what a Seq of [4 0 1] proves; any wrong tie choice differs.
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_tk1")
+(set P1 (table [k Seq] (list [5 5 5] [0 1 2])))
+(set P2 (table [k Seq] (list [5 3]   [3 4])))
+(.db.splayed.set "/tmp/rfl_tk1/2024.01.01/t/" P1)
+(.db.splayed.set "/tmp/rfl_tk1/2024.01.02/t/" P2)
+(set Pp (.db.parted.get "/tmp/rfl_tk1/" 't))
+(set TF (table [k Seq] (list (concat [5 5 5] [5 3]) (concat [0 1 2] [3 4]))))
+
+(set B (at (.sys.mem) 'sort-perpart-runs))
+(set RS (select {k: k Seq: Seq from: Pp asc: k take: 3}))
+(set A (at (.sys.mem) 'sort-perpart-runs))
+(- A B) -- 2
+(set RF (select {k: k Seq: Seq from: TF asc: k take: 3}))
+(count RS) -- 3
+(at RS 'k)   -- (at RF 'k)
+(at RS 'Seq) -- (at RF 'Seq)
+(at RS 'Seq) -- [4 0 1]
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; POSITIVE 2 — k < a single partition's size (top-k lives inside one segment
+;; but the winner may come from any partition), and k=1.
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_tk2")
+(set Q1 (table [v Seq] (list [30 10 40] [0 1 2])))
+(set Q2 (table [v Seq] (list [5 25 35]  [3 4 5])))
+(set Q3 (table [v Seq] (list [15 20]    [6 7])))
+(.db.splayed.set "/tmp/rfl_tk2/2024.01.01/t/" Q1)
+(.db.splayed.set "/tmp/rfl_tk2/2024.01.02/t/" Q2)
+(.db.splayed.set "/tmp/rfl_tk2/2024.01.03/t/" Q3)
+(set Pq (.db.parted.get "/tmp/rfl_tk2/" 't))
+(set QF (table [v Seq] (list (concat (concat [30 10 40] [5 25 35]) [15 20]) (concat (concat [0 1 2] [3 4 5]) [6 7]))))
+(set B2 (at (.sys.mem) 'sort-perpart-runs))
+(set RS2 (select {v: v Seq: Seq from: Pq asc: v take: 2}))
+(set A2 (at (.sys.mem) 'sort-perpart-runs))
+(- A2 B2) -- 3
+(set RF2 (select {v: v Seq: Seq from: QF asc: v take: 2}))
+(at RS2 'v)   -- (at RF2 'v)
+(at RS2 'Seq) -- (at RF2 'Seq)
+(at RS2 'v)   -- [5 10]
+;; k=1
+(set RS1 (select {v: v Seq: Seq from: Pq asc: v take: 1}))
+(set RF1 (select {v: v Seq: Seq from: QF asc: v take: 1}))
+(at RS1 'v)   -- (at RF1 'v)
+(at RS1 'Seq) -- (at RF1 'Seq)
+(at RS1 'v)   -- [5]
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; POSITIVE 3 — k SPANS partitions (k=4 pulls winners from every partition) AND
+;; k > total (k=99 returns ALL rows, fully sorted).
+;; ══════════════════════════════════════════════════════════════════════════
+(set RS3 (select {v: v Seq: Seq from: Pq asc: v take: 4}))
+(set RF3 (select {v: v Seq: Seq from: QF asc: v take: 4}))
+(at RS3 'v)   -- (at RF3 'v)
+(at RS3 'Seq) -- (at RF3 'Seq)
+(at RS3 'v)   -- [5 10 15 20]
+(set B4 (at (.sys.mem) 'sort-perpart-runs))
+(set RSall (select {v: v Seq: Seq from: Pq asc: v take: 99}))
+(set A4 (at (.sys.mem) 'sort-perpart-runs))
+(- A4 B4) -- 3
+(set RFall (select {v: v Seq: Seq from: QF asc: v take: 99}))
+(count RSall) -- 8
+(at RSall 'v)   -- (at RFall 'v)
+(at RSall 'Seq) -- (at RFall 'Seq)
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; POSITIVE 4 — DESC top-k (largest k), duplicate key at the boundary.
+;;   Reuses P1/P2 of POSITIVE 1: flat k=[5 5 5 5 3]. desc: k take: 3 →
+;;   the three 5's with LOWEST position: Seq [0 1 2].
+;; ══════════════════════════════════════════════════════════════════════════
+(set BD (at (.sys.mem) 'sort-perpart-runs))
+(set RSd (select {k: k Seq: Seq from: Pp desc: k take: 3}))
+(set AD (at (.sys.mem) 'sort-perpart-runs))
+(- AD BD) -- 2
+(set RFd (select {k: k Seq: Seq from: TF desc: k take: 3}))
+(at RSd 'k)   -- (at RFd 'k)
+(at RSd 'Seq) -- (at RFd 'Seq)
+(at RSd 'Seq) -- [0 1 2]
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; POSITIVE 5 — MULTI-KEY asc: [g v], ties on g resolved by v then position.
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_tk5")
+(set M1 (table [g v Seq] (list [a a b] [2 2 1] [0 1 2])))
+(set M2 (table [g v Seq] (list [a b b] [2 3 1] [3 4 5])))
+(.db.splayed.set "/tmp/rfl_tk5/2024.01.01/t/" M1)
+(.db.splayed.set "/tmp/rfl_tk5/2024.01.02/t/" M2)
+(set Pm (.db.parted.get "/tmp/rfl_tk5/" 't))
+(set MF (table [g v Seq] (list (concat [a a b] [a b b]) (concat [2 2 1] [2 3 1]) (concat [0 1 2] [3 4 5]))))
+(set BM (at (.sys.mem) 'sort-perpart-runs))
+(set RSm (select {g: g v: v Seq: Seq from: Pm asc: [g v] take: 3}))
+(set AM (at (.sys.mem) 'sort-perpart-runs))
+(- AM BM) -- 2
+(set RFm (select {g: g v: v Seq: Seq from: MF asc: [g v] take: 3}))
+(at RSm 'g)   -- (at RFm 'g)
+(at RSm 'v)   -- (at RFm 'v)
+(at RSm 'Seq) -- (at RFm 'Seq)
+;; (a,2,Seq0),(a,2,Seq1),(a,2,Seq3) are the three smallest (g,v); ties by pos.
+(at RSm 'Seq) -- [0 1 3]
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; POSITIVE 6 — NULL in the key.  Nulls sort LAST for asc, so a small k never
+;; selects a null unless there are < k non-null rows.  Parity with flat proves
+;; the streamed null handling matches.
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_tk6")
+(set N1 (table [v Seq] (list [7 0N 3] [0 1 2])))
+(set N2 (table [v Seq] (list [0N 1]   [3 4])))
+(.db.splayed.set "/tmp/rfl_tk6/2024.01.01/t/" N1)
+(.db.splayed.set "/tmp/rfl_tk6/2024.01.02/t/" N2)
+(set Pn (.db.parted.get "/tmp/rfl_tk6/" 't))
+(set NF (table [v Seq] (list (concat [7 0N 3] [0N 1]) (concat [0 1 2] [3 4]))))
+(set BN (at (.sys.mem) 'sort-perpart-runs))
+(set RSn (select {v: v Seq: Seq from: Pn asc: v take: 3}))
+(set AN (at (.sys.mem) 'sort-perpart-runs))
+(- AN BN) -- 2
+(set RFn (select {v: v Seq: Seq from: NF asc: v take: 3}))
+(at RSn 'v)   -- (at RFn 'v)
+(at RSn 'Seq) -- (at RFn 'Seq)
+;; smallest three non-null: 1(Seq4),3(Seq2),7(Seq0)
+(at RSn 'Seq) -- [4 2 0]
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; POSITIVE 7 — WHERE + asc + take streaming (filter THEN top-k), == flat oracle.
+;;   Unique sort key so the filtered top-k is unambiguous.
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_tk7")
+(set W1 (table [v f Seq] (list [30 10 40] [1 0 1] [0 1 2])))
+(set W2 (table [v f Seq] (list [5 25 35]  [0 1 1] [3 4 5])))
+(.db.splayed.set "/tmp/rfl_tk7/2024.01.01/t/" W1)
+(.db.splayed.set "/tmp/rfl_tk7/2024.01.02/t/" W2)
+(set Pw (.db.parted.get "/tmp/rfl_tk7/" 't))
+(set WF (table [v f Seq] (list (concat [30 10 40] [5 25 35]) (concat [1 0 1] [0 1 1]) (concat [0 1 2] [3 4 5]))))
+(set BW (at (.sys.mem) 'sort-perpart-runs))
+(set RSw (select {v: v Seq: Seq from: Pw where: (== f 1) asc: v take: 2}))
+(set AW (at (.sys.mem) 'sort-perpart-runs))
+(- AW BW) -- 2
+(set RFw (select {v: v Seq: Seq from: WF where: (== f 1) asc: v take: 2}))
+(at RSw 'v)   -- (at RFw 'v)
+(at RSw 'Seq) -- (at RFw 'Seq)
+;; f=1 rows: v=30(Seq0),40(Seq2),25(Seq4),35(Seq5); smallest two: 25(Seq4),30(Seq0)
+(at RSw 'v)   -- [25 30]
+(at RSw 'Seq) -- [4 0]
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; EDGE — take: 0 is a well-defined top-0 (empty); handled IN-STREAM (delta 3,
+;; one run per partition) rather than declining, since the flat fallback cannot
+;; sort a parted table.  Empty result.
+;; ══════════════════════════════════════════════════════════════════════════
+(set BZ (at (.sys.mem) 'sort-perpart-runs))
+(set RSz (select {v: v Seq: Seq from: Pq asc: v take: 0}))
+(set AZ (at (.sys.mem) 'sort-perpart-runs))
+(- AZ BZ) -- 3
+(count RSz) -- 0
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; DECLINE — a non-bare (aggregate/expression) output is not row-preserving, so
+;; the top-k stream declines (delta 0).  The flat fallback cannot lazily
+;; aggregate-and-sort a parted table, so it surfaces a loud error (contract:
+;; loud error ≫ silent wrong answer) — never a per-partition-collapsed result.
+;; ══════════════════════════════════════════════════════════════════════════
+(set BG (at (.sys.mem) 'sort-perpart-runs))
+(select {s: (sum v) from: Pq asc: s take: 1}) !- nyi
+(set AG (at (.sys.mem) 'sort-perpart-runs))
+(- AG BG) -- 0
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; REVIEW MINOR (i) — the PRE-SORTED CONCAT path (no take:) still DECLINES
+;; cleanly for a 1-row partition with an UNDECIDABLE (F64) key: the base-type
+;; gate rejects F64, delta 0, and the flat path surfaces the loud `type` error
+;; (unmaterialisable lazy sort over parted) — never a silent wrong answer.
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_tkf")
+(set F1 (table [x Seq] (list (as 'F64 [1.5]) [0])))
+(set F2 (table [x Seq] (list (as 'F64 [2.5]) [1])))
+(.db.splayed.set "/tmp/rfl_tkf/2024.01.01/t/" F1)
+(.db.splayed.set "/tmp/rfl_tkf/2024.01.02/t/" F2)
+(set Pf (.db.parted.get "/tmp/rfl_tkf/" 't))
+(set BF (at (.sys.mem) 'sort-perpart-runs))
+(select {x: x Seq: Seq from: Pf asc: x}) !- type
+(set AF (at (.sys.mem) 'sort-perpart-runs))
+(- AF BF) -- 0
+;; …but WITH take:, the top-k path DOES handle an F64 key (broader eligibility):
+;; it streams (delta 2) and matches the flat oracle.
+(set FF (table [x Seq] (list (as 'F64 (concat [1.5] [2.5])) (concat [0] [1]))))
+(set BF2 (at (.sys.mem) 'sort-perpart-runs))
+(set RSf (select {x: x Seq: Seq from: Pf asc: x take: 1}))
+(set AF2 (at (.sys.mem) 'sort-perpart-runs))
+(- AF2 BF2) -- 2
+(set RFf (select {x: x Seq: Seq from: FF asc: x take: 1}))
+(at RSf 'x)   -- (at RFf 'x)
+(at RSf 'Seq) -- (at RFf 'Seq)
+(at RSf 'Seq) -- [0]
+
+;; ─── cleanup ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_tk1 /tmp/rfl_tk2 /tmp/rfl_tk5 /tmp/rfl_tk6 /tmp/rfl_tk7 /tmp/rfl_tkf")
