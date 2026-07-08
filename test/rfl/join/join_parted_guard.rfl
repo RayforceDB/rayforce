@@ -1,0 +1,116 @@
+;; join_parted_guard.rfl — parted-input guard for inner/left/full/anti join.
+;;
+;; A parted table's columns are raw RAY_PARTED wrappers whose ->len is the
+;; SEGMENT count, not the true row count.  exec_join/exec_antijoin used to
+;; index those wrappers by row position up to nrows-1 (nrows from
+;; ray_table_nrows, which DOES know the true total via ray_parted_nrows) —
+;; an out-of-bounds read that reliably SIGSEGVs (exit 139).  The fix
+;; flattens any parted/MAPCOMMON side into an in-RAM table before the flat
+;; join kernel runs, for every join type and on either (or both) sides.
+;;
+;; Every case below is a differential test against a FLAT oracle: run the
+;; SAME join on the fully-flattened (in-RAM) equivalent tables and require
+;; the parted-input result to match as a SORTED MULTISET — the radix join
+;; path does not preserve row order once right_rows exceeds the parallel
+;; threshold (not the case for these tiny tables, but sorting is cheap
+;; insurance and keeps this test robust to kernel changes).
+
+(.sys.exec "rm -rf /tmp/rfl_join_guard_q /tmp/rfl_join_guard_w")
+
+;; ── fixture: PARTED has 2 day-partitions, columns [Sym V]. ──────────────────
+;; Day 1: a, b.  Day 2: b, c.  Flattened row order = day-ascending, so
+;; FLAT == [a b b c] / [1 2 3 4] (mirrors build_segment_table's own
+;; per-segment 0..nseg-1 concatenation order).
+(set Q1 (table [Sym V] (list [a b] (as 'I64 [1 2]))))
+(set Q2 (table [Sym V] (list [b c] (as 'I64 [3 4]))))
+(.db.splayed.set "/tmp/rfl_join_guard_q/2024.01.01/pq/" Q1)
+(.db.splayed.set "/tmp/rfl_join_guard_q/2024.01.02/pq/" Q2)
+(set PARTED (.db.parted.get "/tmp/rfl_join_guard_q/" 'pq))
+(set FLAT (table [Sym V] (list [a b b c] (as 'I64 [1 2 3 4]))))
+
+;; SMALL is a plain in-RAM table: a and c match once each, b matches BOTH
+;; PARTED segments, d matches nothing at all (exercises anti-join).
+(set SMALL (table [Sym W] (list [a b c d] (as 'I64 [10 20 30 40]))))
+
+;; A second parted table (own directory/name), so a join can also be tested
+;; with BOTH sides parted at once.
+(set W1 (table [Sym W] (list [a b] (as 'I64 [10 20]))))
+(set W2 (table [Sym W] (list [c d] (as 'I64 [30 40]))))
+(.db.splayed.set "/tmp/rfl_join_guard_w/2024.01.01/pw/" W1)
+(.db.splayed.set "/tmp/rfl_join_guard_w/2024.01.02/pw/" W2)
+(set PARTED2 (.db.parted.get "/tmp/rfl_join_guard_w/" 'pw))
+(set FLAT2 (table [Sym W] (list [a b c d] (as 'I64 [10 20 30 40]))))
+
+;; ── helper pattern: sort a table by every one of its columns (canonical
+;; order for a multiset comparison), reused inline per case below. ──────────
+
+;; ════════════════════════════════════════════════════════════════════════
+;; §1  right side parted — (join [Sym] SMALL PARTED), all four join types.
+;;     Pre-fix this SIGSEGVs (exit 139) for every one of the four calls.
+;; ════════════════════════════════════════════════════════════════════════
+
+;; inner-join
+(set RS (inner-join [Sym] SMALL PARTED))
+(set RF (inner-join [Sym] SMALL FLAT))
+(count RS) -- (count RF)
+(set RSs (xasc RS (cols RS)))
+(set RFs (xasc RF (cols RF)))
+(at RSs 'Sym) -- (at RFs 'Sym)
+(at RSs 'W) -- (at RFs 'W)
+(at RSs 'V) -- (at RFs 'V)
+
+;; left-join
+(set RS (left-join [Sym] SMALL PARTED))
+(set RF (left-join [Sym] SMALL FLAT))
+(count RS) -- (count RF)
+(set RSs (xasc RS (cols RS)))
+(set RFs (xasc RF (cols RF)))
+(at RSs 'Sym) -- (at RFs 'Sym)
+(at RSs 'W) -- (at RFs 'W)
+(at RSs 'V) -- (at RFs 'V)
+
+;; full-join
+(set RS (full-join [Sym] SMALL PARTED))
+(set RF (full-join [Sym] SMALL FLAT))
+(count RS) -- (count RF)
+(set RSs (xasc RS (cols RS)))
+(set RFs (xasc RF (cols RF)))
+(at RSs 'Sym) -- (at RFs 'Sym)
+(at RSs 'W) -- (at RFs 'W)
+(at RSs 'V) -- (at RFs 'V)
+
+;; anti-join — d has no match in PARTED at all; a/b/c all match, so only d
+;; survives.  Output schema is left-only (Sym, W): no V column.
+(set RS (anti-join [Sym] SMALL PARTED))
+(set RF (anti-join [Sym] SMALL FLAT))
+(count RS) -- (count RF)
+(count RS) -- 1
+(at RS 'Sym) -- (at RF 'Sym)
+(at RS 'Sym) -- [d]
+(at RS 'W) -- (at RF 'W)
+
+;; ════════════════════════════════════════════════════════════════════════
+;; §2  left side parted — (inner-join [Sym] PARTED SMALL): the same guard
+;;     applied on the OTHER argument position.
+;; ════════════════════════════════════════════════════════════════════════
+(set RS (inner-join [Sym] PARTED SMALL))
+(set RF (inner-join [Sym] FLAT SMALL))
+(count RS) -- (count RF)
+(set RSs (xasc RS (cols RS)))
+(set RFs (xasc RF (cols RF)))
+(at RSs 'Sym) -- (at RFs 'Sym)
+(at RSs 'V) -- (at RFs 'V)
+(at RSs 'W) -- (at RFs 'W)
+
+;; ════════════════════════════════════════════════════════════════════════
+;; §3  BOTH sides parted — (inner-join [Sym] PARTED PARTED2): each side is
+;;     flattened independently before the join.
+;; ════════════════════════════════════════════════════════════════════════
+(set RS (inner-join [Sym] PARTED PARTED2))
+(set RF (inner-join [Sym] FLAT FLAT2))
+(count RS) -- (count RF)
+(set RSs (xasc RS (cols RS)))
+(set RFs (xasc RF (cols RF)))
+(at RSs 'Sym) -- (at RFs 'Sym)
+(at RSs 'V) -- (at RFs 'V)
+(at RSs 'W) -- (at RFs 'W)

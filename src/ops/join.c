@@ -872,10 +872,54 @@ static void join_fill_fn(void* raw, uint32_t wid, int64_t task_start, int64_t ta
     }
 }
 
-ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table) {
-    if (!left_table || RAY_IS_ERR(left_table)) return left_table;
-    if (!right_table || RAY_IS_ERR(right_table)) return right_table;
+/* Segment count of a parted table = length of any parted column's segs
+ * array (mirrors build_segment_table's own read, exec.c:3377-3384, and
+ * window.c's window_parted_seg_count). */
+static int64_t join_parted_seg_count(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && RAY_IS_PARTED(col->type)) return col->len;
+    }
+    return 0;
+}
 
+static bool join_table_has_parted_col(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON)) return true;
+    }
+    return false;
+}
+
+/* Flatten a parted table into one in-RAM table by concatenating every
+ * segment (mirrors window.c's flatten guard, window.c:754-789).  Returns
+ * a new ref the caller must release, or an error/NULL on failure; the
+ * input table is untouched either way. */
+static ray_t* join_flatten_parted(ray_t* tbl) {
+    int64_t nseg = join_parted_seg_count(tbl);
+    ray_t* flat = NULL;
+    for (int64_t s = 0; s < nseg; s++) {
+        ray_t* seg = build_segment_table(tbl, (int32_t)s);
+        if (!seg || RAY_IS_ERR(seg)) {
+            ray_release(flat);
+            return seg ? seg : ray_error("oom", NULL);
+        }
+        if (!flat) {
+            flat = seg;
+        } else {
+            ray_t* m = ray_result_merge(flat, seg);
+            ray_release(flat);
+            ray_release(seg);
+            if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+            flat = m;
+        }
+    }
+    return flat;
+}
+
+static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
 
@@ -1602,16 +1646,57 @@ join_cleanup:
     return result;
 }
 
+typedef ray_t* (*join_flat_fn_t)(ray_graph_t*, ray_op_t*, ray_t*, ray_t*);
+
+/* Parted-input guard: a parted table's columns are raw segment-array
+ * wrappers (->len == n_parts, not nrows) — the flat kernels index them by
+ * row position up to nrows-1, an OOB read (SIGSEGV).  Flatten any parted
+ * or MAPCOMMON side into an in-RAM table before dispatching to the
+ * unchanged flat kernel; either side (or both) may be parted.  Shared by
+ * exec_join and exec_antijoin below. */
+static ray_t* join_with_parted_guard(ray_graph_t* g, ray_op_t* op,
+                                      ray_t* left_table, ray_t* right_table,
+                                      join_flat_fn_t flat_fn) {
+    if (!left_table || RAY_IS_ERR(left_table)) return left_table;
+    if (!right_table || RAY_IS_ERR(right_table)) return right_table;
+
+    ray_t* left_flat = NULL;
+    ray_t* right_flat = NULL;
+
+    if (join_table_has_parted_col(left_table)) {
+        left_flat = join_flatten_parted(left_table);
+        if (!left_flat || RAY_IS_ERR(left_flat))
+            return left_flat ? left_flat : ray_error("oom", NULL);
+    }
+    if (join_table_has_parted_col(right_table)) {
+        right_flat = join_flatten_parted(right_table);
+        if (!right_flat || RAY_IS_ERR(right_flat)) {
+            if (left_flat) ray_release(left_flat);
+            return right_flat ? right_flat : ray_error("oom", NULL);
+        }
+    }
+
+    ray_t* result = flat_fn(g, op,
+                        left_flat ? left_flat : left_table,
+                        right_flat ? right_flat : right_table);
+
+    if (left_flat) ray_release(left_flat);
+    if (right_flat) ray_release(right_flat);
+
+    return result;
+}
+
+ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table) {
+    return join_with_parted_guard(g, op, left_table, right_table, exec_join_flat);
+}
+
 /* ============================================================================
  * OP_ANTIJOIN: anti-semi-join — keep left rows with NO matching right row
  * Build hash set from right keys, probe left, emit non-matching left rows.
  * ============================================================================ */
 
-ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
+static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
                             ray_t* left_table, ray_t* right_table) {
-    if (!left_table || RAY_IS_ERR(left_table)) return left_table;
-    if (!right_table || RAY_IS_ERR(right_table)) return right_table;
-
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
 
@@ -1805,6 +1890,12 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
 
     scratch_free(out_idx_hdr);
     return result;
+}
+
+/* Parted-input guard — see join_with_parted_guard above. */
+ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
+                            ray_t* left_table, ray_t* right_table) {
+    return join_with_parted_guard(g, op, left_table, right_table, exec_antijoin_flat);
 }
 
 /* ============================================================================
