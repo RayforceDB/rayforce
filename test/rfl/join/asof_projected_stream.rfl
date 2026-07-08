@@ -1,0 +1,48 @@
+;; asof_projected_stream.rfl — a PROJECTED select operand (col: expr ...) must
+;; still stream in the parted asof.  Regression guard: the streaming shape
+;; detector (asof_parted_select_operand, src/ops/query.c) must reject ONLY the
+;; whole-rowset clauses (by/take/asc/desc/nearest) — NOT per-row projection
+;; columns.  Every real options query projects columns
+;; (select {sym: sym time: time price: price from: ...}), so a guard that
+;; declined projections silently killed streaming for the actual workload
+;; (fell back to the flat/eager path).  This test asserts a projected +
+;; where: operand STREAMS (asof-perpart-runs increments) and matches the flat
+;; oracle.  The pre-existing streaming tests use from:-only operands and would
+;; NOT have caught this.
+
+(.sys.exec "rm -rf /tmp/rfl_asof_proj_t /tmp/rfl_asof_proj_q")
+
+;; Day 1 (2024.01.01): a quotes :00 bid99, :02 bid100; b :01 bid50.
+(set Q1 (table [Sym Time Bid] (list [a a b] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:01.000000000] (as 'F64 [99.0 100.0 50.0]))))
+(set T1 (table [Sym Time Price] (list [a] [2024.01.01D10:00:03.000000000] (as 'F64 [10.0]))))
+;; Day 2 (2024.01.02): a quotes :01 bid150.
+(set Q2 (table [Sym Time Bid] (list [a] [2024.01.02D10:00:01.000000000] (as 'F64 [150.0]))))
+;; Day 2 trades: a@:00 → carry day-1 bid100; a@:02 → same-day bid150; b@:03 → carry day-1 bid50.
+(set T2 (table [Sym Time Price] (list [a a b] [2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000 2024.01.02D10:00:03.000000000] (as 'F64 [20.0 21.0 30.0]))))
+
+(.db.splayed.set "/tmp/rfl_asof_proj_q/2024.01.01/quote/" Q1)
+(.db.splayed.set "/tmp/rfl_asof_proj_q/2024.01.02/quote/" Q2)
+(.db.splayed.set "/tmp/rfl_asof_proj_t/2024.01.01/trade/" T1)
+(.db.splayed.set "/tmp/rfl_asof_proj_t/2024.01.02/trade/" T2)
+(set Pt (.db.parted.get "/tmp/rfl_asof_proj_t/" 'trade))
+(set Pq (.db.parted.get "/tmp/rfl_asof_proj_q/" 'quote))
+
+;; flat oracle (concatenated partitions, day-ascending / trade input order).
+(set TF (table [Sym Time Price] (list [a a a b] [2024.01.01D10:00:03.000000000 2024.01.02D10:00:00.000000000 2024.01.02D10:00:02.000000000 2024.01.02D10:00:03.000000000] (as 'F64 [10.0 20.0 21.0 30.0]))))
+(set QF (table [Sym Time Bid] (list [a a b a] [2024.01.01D10:00:00.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:01.000000000 2024.01.02D10:00:01.000000000] (as 'F64 [99.0 100.0 50.0 150.0]))))
+
+;; ── PROJECTED + where operands MUST STREAM (the core options shape). ─────────
+(set B (at (.sys.mem) 'asof-perpart-runs))
+(set RS (asof-join [Sym Time] (select {Sym: Sym Time: Time Price: Price from: Pt}) (select {Sym: Sym Time: Time Bid: Bid from: Pq where: (> Bid 0.0)})))
+(set A (at (.sys.mem) 'asof-perpart-runs))
+;; streamed: union of 2 days.
+(> A B) -- true
+(- A B) -- 2
+
+;; ── parity vs the flat (non-select operand) oracle. ─────────────────────────
+(set RF (asof-join [Sym Time] TF QF))
+(count RS) -- 4
+;; a@d1:03 same-day 100; a@d2:00 carry 100; a@d2:02 same-day 150; b@d2:03 carry 50.
+(at RS 'Bid) -- (at RF 'Bid)
+(at RS 'Price) -- (at RF 'Price)
+(at RS 'Bid) -- (as 'F64 [100.0 100.0 150.0 50.0])
