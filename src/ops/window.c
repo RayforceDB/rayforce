@@ -652,6 +652,18 @@ static int64_t window_parted_seg_count(ray_t* tbl) {
     return 0;  /* not parted (a table of only MAPCOMMON keys can't occur) */
 }
 
+/* ── streaming case-a parted window (partition-key-aligned) ────────────────
+ * Monotonic count of per-segment runs taken by the case-a concat fast-path
+ * (PARTITION BY includes the physical/date key).  Bumped once per segment;
+ * surfaced via (.sys.mem)'s "window-perpart-runs" (mirrors
+ * ray_sort_perpart_runs, query.c). */
+static _Atomic(int64_t) ray_window_perpart_runs_ctr = 0;
+
+int64_t ray_window_perpart_runs(void) {
+    return atomic_load_explicit(&ray_window_perpart_runs_ctr,
+                                 memory_order_relaxed);
+}
+
 ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
@@ -679,6 +691,64 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             return ray_error("nyi", "unsupported window frame: only "
                 "ROWS BETWEEN UNBOUNDED PRECEDING AND {CURRENT ROW | "
                 "UNBOUNDED FOLLOWING} are honored");
+    }
+
+    /* Case-a streaming fast-path: if PARTITION BY includes the physical/date
+     * partition key (a RAY_MAPCOMMON column — one constant value per day
+     * segment), every logical window partition lives wholly inside one day
+     * segment.  Running exec_window per-segment and concatenating in
+     * segment order is byte-identical to the flat result (no cross-partition
+     * carry, no whole-table sort) — the flat path scatters results to
+     * original row positions and passes columns through unpermuted, and
+     * flattening a parted table IS the segment concat, so
+     * per-segment-compute-then-concat == flat.  Must run BEFORE the Task-1
+     * flatten guard below, which is the correct-but-unstreamed fallback for
+     * every shape this fast-path declines (no PARTITION BY, or a
+     * PARTITION BY that excludes the date key and can span segments). */
+    {
+        int64_t nseg = window_parted_seg_count(tbl);
+        if (nseg >= 1) {
+            bool eligible = false;
+            for (uint32_t k = 0; k < ext->window.n_part_keys && !eligible; k++) {
+                ray_op_ext_t* key_ext = find_ext(g, ext->window.part_keys[k]);
+                if (key_ext && key_ext->base.opcode == OP_SCAN) {
+                    ray_t* col = ray_table_get_col(tbl, key_ext->sym);
+                    if (col && col->type == RAY_MAPCOMMON) eligible = true;
+                }
+            }
+            if (eligible) {
+                ray_t* merged = NULL;
+                for (int64_t s = 0; s < nseg; s++) {
+                    ray_t* seg = build_segment_table(tbl, (int32_t)s);
+                    if (!seg || RAY_IS_ERR(seg)) {
+                        ray_release(merged);
+                        return seg ? seg : ray_error("oom", NULL);
+                    }
+                    /* seg is flat (no PARTED/MAPCOMMON column) so this
+                     * recursion re-checks eligibility as false and falls
+                     * through to the ordinary flat compute — terminates. */
+                    ray_t* rseg = exec_window(g, op, seg);
+                    if (!rseg || RAY_IS_ERR(rseg)) {
+                        ray_release(seg);
+                        ray_release(merged);
+                        return rseg ? rseg : ray_error("oom", NULL);
+                    }
+                    ray_release(seg);
+                    atomic_fetch_add_explicit(&ray_window_perpart_runs_ctr, 1,
+                                               memory_order_relaxed);
+                    if (!merged) {
+                        merged = rseg;
+                    } else {
+                        ray_t* m = ray_result_merge(merged, rseg);
+                        ray_release(merged);
+                        ray_release(rseg);
+                        if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+                        merged = m;
+                    }
+                }
+                return merged;
+            }
+        }
     }
 
     /* Parted-input correctness guard: win_resolve_vec's OP_SCAN shortcut

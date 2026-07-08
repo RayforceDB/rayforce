@@ -10,7 +10,7 @@
 (.sys.gc) -- 0
 (.sys.gc 0) -- 0
 (count (.sys.info)) -- 3
-(count (.sys.mem)) -- 14
+(count (.sys.mem)) -- 15
 (count (.sys.build)) -- 2
 ;; The namespace roots themselves are real dicts — typing just
 ;; `.sys` at the REPL returns a dict with every `.sys.*` entry

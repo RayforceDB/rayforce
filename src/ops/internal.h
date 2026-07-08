@@ -971,6 +971,11 @@ int64_t ray_asof_perpart_runs(void);
  * Bumped once per partition; surfaced via (.sys.mem)'s "sort-perpart-runs". */
 int64_t ray_sort_perpart_runs(void);
 
+/* Monotonic count of per-segment runs taken by the case-a streaming parted
+ * window fast-path (PARTITION BY includes the physical/date key).  Bumped
+ * once per segment; surfaced via (.sys.mem)'s "window-perpart-runs". */
+int64_t ray_window_perpart_runs(void);
+
 /* Are these key columns already sorted (single uniform direction) under the
  * sort's lexicographic ordering?  Null-free integer-family / SYM keys only;
  * everything else returns false.  O(nrows) with early bail.  Defined in

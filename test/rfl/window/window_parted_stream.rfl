@@ -1,0 +1,88 @@
+;; window_parted_stream.rfl — case-a streaming fast-path: when PARTITION BY
+;; includes the physical/date partition key (a RAY_MAPCOMMON column), every
+;; logical window partition lives wholly inside one day segment, so
+;; exec_window runs per-segment and concatenates in segment order INSTEAD of
+;; flattening (Task 1's correct-but-unstreamed fallback).  The
+;; (.sys.mem) 'window-perpart-runs counter increments once per segment
+;; processed by the fast-path, so a strict delta == nseg proves streaming
+;; ran; column-for-column parity with a flat in-memory oracle (identical
+;; rows, one table, no parted machinery, SAME window {} call) proves
+;; correctness — including a within-segment TIE on the order key.
+;;
+;;   Day 1 (2024.01.01): Sym=[a a a b]  Ord=[1 2 2 3]  V=[10 20 30 40]  Seq=[1 2 3 4]
+;;     (tie: rows 2,3 both Ord=2, within partition (d1,a))
+;;   Day 2 (2024.01.02): Sym=[a b b]    Ord=[1 1 2]    V=[50 60 70]     Seq=[5 6 7]
+;;
+;;   case-a groups (date,Sym): (d1,a)=[10,20,30] (d1,b)=[40] (d2,a)=[50] (d2,b)=[60,70]
+;;   case-b groups (Sym only, SPANS days): a=[10,20,30,50] (rows 1,2,3,5)
+;;                                          b=[40,60,70]    (rows 4,6,7)
+
+(.sys.exec "rm -rf /tmp/rfl_wps")
+(set D1 (table [Sym Ord V Seq] (list ['a 'a 'a 'b] [1 2 2 3] [10 20 30 40] [1 2 3 4])))
+(set D2 (table [Sym Ord V Seq] (list ['a 'b 'b] [1 1 2] [50 60 70] [5 6 7])))
+(.db.splayed.set "/tmp/rfl_wps/2024.01.01/t/" D1)
+(.db.splayed.set "/tmp/rfl_wps/2024.01.02/t/" D2)
+(set Pt (.db.parted.get "/tmp/rfl_wps/" 't))
+
+;; flat in-memory oracle: identical rows, one table, explicit 'date' column
+;; so the case-a part-by shape is expressible without parted machinery.
+(set TF (table [date Sym Ord V Seq] (list (concat [2024.01.01 2024.01.01 2024.01.01 2024.01.01] [2024.01.02 2024.01.02 2024.01.02]) (concat ['a 'a 'a 'b] ['a 'b 'b]) (concat [1 2 2 3] [1 1 2]) (concat [10 20 30 40] [50 60 70]) (concat [1 2 3 4] [5 6 7]))))
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; POSITIVE case-a: part: [date Sym] — partitions aligned with day segments,
+;; so the fast-path streams (2 segments).
+;; ══════════════════════════════════════════════════════════════════════════
+
+;; running frame: cumulative sum of V ordered by Ord within (date,Sym).
+;;   (d1,a) Ord=[1 2 2] V=[10 20 30]: sorted asc (tie 2,3 keeps original
+;;     order) -> cumsum 10,30,60 scattered back to rows 1,2,3.
+;;   (d1,b) single row: cumsum 40.
+;;   (d2,a) single row: cumsum 50.
+;;   (d2,b) Ord=[1 2] V=[60 70]: cumsum 60,130.
+(set Bcs (at (.sys.mem) 'window-perpart-runs))
+(set RScs (window {from: Pt part: [date Sym] order: [Ord] frame: 'running funcs: {cs: (sum V)}}))
+(set Acs (at (.sys.mem) 'window-perpart-runs))
+;; streamed: one run per segment (2 day segments).
+(- Acs Bcs) -- 2
+(set RFcs (window {from: TF part: [date Sym] order: [Ord] frame: 'running funcs: {cs: (sum V)}}))
+(at RScs 'cs) -- (at RFcs 'cs)
+(at RScs 'cs) -- [10 30 60 40 50 60 130]
+
+;; whole frame (default): max(V) broadcast within (date,Sym).
+;;   (d1,a)=30  (d1,b)=40  (d2,a)=50  (d2,b)=70
+(set Bmx (at (.sys.mem) 'window-perpart-runs))
+(set RSmx (window {from: Pt part: [date Sym] funcs: {mx: (max V)}}))
+(set Amx (at (.sys.mem) 'window-perpart-runs))
+(- Amx Bmx) -- 2
+(set RFmx (window {from: TF part: [date Sym] funcs: {mx: (max V)}}))
+(at RSmx 'mx) -- (at RFmx 'mx)
+(at RSmx 'mx) -- [30 30 30 40 50 70 70]
+
+;; pass-through columns preserved, unpermuted (case-a, both calls above).
+(at RSmx 'Seq) -- [1 2 3 4 5 6 7]
+(at RSmx 'V)   -- [10 20 30 40 50 60 70]
+(at RSmx 'Sym) -- ['a 'a 'a 'b 'a 'b 'b]
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; NEGATIVE case-b: part: [Sym] only — a partition SPANS both day segments
+;; (Sym a: rows 1,2,3,5 ; Sym b: rows 4,6,7) -> declines to Task-1's flatten.
+;; ══════════════════════════════════════════════════════════════════════════
+
+(set Bcs2 (at (.sys.mem) 'window-perpart-runs))
+(set RScs2 (window {from: Pt part: [Sym] order: [Ord] frame: 'running funcs: {cs: (sum V)}}))
+(set Acs2 (at (.sys.mem) 'window-perpart-runs))
+(- Acs2 Bcs2) -- 0
+(set RFcs2 (window {from: TF part: [Sym] order: [Ord] frame: 'running funcs: {cs: (sum V)}}))
+(at RScs2 'cs) -- (at RFcs2 'cs)
+(at RScs2 'cs) -- [10 80 110 170 60 60 130]
+
+(set Bmx2 (at (.sys.mem) 'window-perpart-runs))
+(set RSmx2 (window {from: Pt part: [Sym] funcs: {mx: (max V)}}))
+(set Amx2 (at (.sys.mem) 'window-perpart-runs))
+(- Amx2 Bmx2) -- 0
+(set RFmx2 (window {from: TF part: [Sym] funcs: {mx: (max V)}}))
+(at RSmx2 'mx) -- (at RFmx2 'mx)
+(at RSmx2 'mx) -- [50 50 50 70 50 70 70]
+
+;; ─── cleanup ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_wps")
