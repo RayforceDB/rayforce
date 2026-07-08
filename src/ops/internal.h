@@ -966,9 +966,9 @@ int64_t ray_group_perpart_runs(void);
  * O(1) per partition; surfaced via (.sys.mem)'s "asof-perpart-runs". */
 int64_t ray_asof_perpart_runs(void);
 
-/* Monotonic count of per-partition runs taken by the parted ORDER BY
- * streaming path (concat of pre-sorted partitions).  Bumped once per
- * partition; surfaced via (.sys.mem)'s "sort-perpart-runs". */
+/* Monotonic count of per-partition runs taken by either parted ORDER BY
+ * streaming path (concat of pre-sorted partitions, or per-partition top-k).
+ * Bumped once per partition; surfaced via (.sys.mem)'s "sort-perpart-runs". */
 int64_t ray_sort_perpart_runs(void);
 
 /* Are these key columns already sorted (single uniform direction) under the

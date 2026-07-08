@@ -13905,9 +13905,9 @@ int64_t ray_asof_perpart_runs(void) {
 }
 
 /* ── streaming parted ORDER BY ──────────────────────────────────────────────
- * Monotonic count of per-partition runs taken by the parted ORDER BY
- * streaming path (try_stream_parted_order_by).  Bumped ONCE per partition
- * processed — O(1) per partition, never per-row.  Surfaced via
+ * Monotonic count of per-partition runs taken by either parted ORDER BY
+ * streaming path (try_stream_parted_order_by concat, or
+ * try_stream_parted_order_by_topk).  Bumped ONCE per partition processed — O(1) per partition, never per-row.  Surfaced via
  * ray_sort_perpart_runs() / (.sys.mem)'s "sort-perpart-runs". */
 static _Atomic(int64_t) ray_sort_perpart_runs_ctr = 0;
 
