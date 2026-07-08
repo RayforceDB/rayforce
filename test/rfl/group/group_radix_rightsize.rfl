@@ -1,0 +1,35 @@
+;; group_radix_rightsize.rfl — exercises the grow-on-demand group-state
+;; arrays in agg_radix_group_fn (src/ops/agg_engine.c).  The v2 parallel
+;; radix kernel sizes states/keyp/gkeys/first_row to the distinct-group
+;; count (initial gcap=256, doubled on new-group creation) rather than the
+;; partition row count; correctness of the grown arrays is the assertion.
+;;
+;; Routing note: the radix strategy is reached only for a PARALLEL
+;; (nrows >= 65536) int-keyed group-by whose keys are too SPARSE for the v2
+;; dense direct-index plan (which would exceed its 8MB/worker budget).  A
+;; contiguous `til N` key stays dense and never reaches radix — the keys are
+;; spread with `* 1000003` so the dense plan bails and radix runs.  With
+;; 200000 distinct keys / 256 radix partitions ~= 781 groups per partition,
+;; the initial gcap of 256 is crossed and the realloc growth path fires
+;; (~512 growth events observed; verified via a temporary marker).
+
+;; ── all-distinct sparse keys: one group per row, grow fires ──────────────
+(set N 200000)
+(set Tg (table [k v] (list (as 'I64 (* 1000003 (til N))) (as 'I64 (til N)))))
+(set Rg (select {c: (count v) by: k from: Tg}))
+(count Rg) -- 200000
+;; every key distinct → each group has exactly one row.
+(== (sum (at Rg 'c)) 200000) -- true
+(== (max (at Rg 'c)) 1) -- true
+
+;; ── moderate duplication: groups << rows (the right-sizing win case) ─────
+;; 100000 distinct sparse keys over 300000 rows (each appears 3x); grow still
+;; fires (100000/256 ~= 391 groups/partition > 256) and the group-state
+;; arrays are genuinely smaller than the row count.
+(set M 300000)
+(set Td (table [k v] (list (as 'I64 (* 1000003 (% (til M) 100000))) (as 'I64 (til M)))))
+(set Rd (select {c: (count v) by: k from: Td}))
+(count Rd) -- 100000
+(== (sum (at Rd 'c)) 300000) -- true
+(== (max (at Rd 'c)) 3) -- true
+(== (min (at Rd 'c)) 3) -- true

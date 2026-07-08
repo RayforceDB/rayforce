@@ -2136,14 +2136,18 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
         uint64_t htmask = (uint64_t)htcap - 1;
         int32_t* ht        = ray_alloc_raw((size_t)htcap * sizeof(int32_t));
         uint8_t* ht_salt   = ray_alloc_raw((size_t)htcap);  /* parallel salt fingerprint per slot */
+        /* Group-state arrays sized to the distinct-group count (grow-on-
+         * demand) instead of `total` rows. gid/gv/gy stay row-sized. */
+        int64_t gcap = total < 256 ? total : 256;
+        if (gcap < 16) gcap = 16;
         /* first_row is only populated when a row-dependent agg needs it. */
-        int64_t* first_row = c->needs_row ? ray_alloc_raw((size_t)total * sizeof(int64_t)) : NULL;
-        char*    states    = ray_alloc_raw((size_t)total * c->block);
-        const int64_t** keyp = ray_alloc_raw((size_t)total * sizeof(int64_t*)); /* gid -> packed keys */
+        int64_t* first_row = c->needs_row ? ray_alloc_raw((size_t)gcap * sizeof(int64_t)) : NULL;
+        char*    states    = ray_alloc_raw((size_t)gcap * c->block);
+        const int64_t** keyp = ray_alloc_raw((size_t)gcap * sizeof(int64_t*)); /* gid -> packed keys */
         uint32_t* gid      = ray_alloc_raw((size_t)total * sizeof(uint32_t));/* row i -> local gid */
         /* Persist each group's packed keys (build order) so Phase 3 emits the
          * key columns by sequential un-pack rather than scattered gather. */
-        int64_t* gkeys     = ray_alloc_raw((size_t)total * (size_t)(n_keys ? n_keys : 1) * sizeof(int64_t));
+        int64_t* gkeys     = ray_alloc_raw((size_t)gcap * (size_t)(n_keys ? n_keys : 1) * sizeof(int64_t));
         if (!ht || !ht_salt || (c->needs_row && !first_row) || !states || !keyp || !gid || !gkeys) {
             ray_free_raw(ht); ray_free_raw(ht_salt); ray_free_raw(first_row); ray_free_raw(states); ray_free_raw(keyp); ray_free_raw(gid); ray_free_raw(gkeys);
             pr->oom = 1; return;
@@ -2199,6 +2203,29 @@ static void agg_radix_group_fn(void* vctx, uint32_t wid, int64_t start, int64_t 
                 for (;;) {
                     int32_t gp = ht[slot];
                     if (gp < 0) {                       /* new group */
+                        if ((int64_t)ng >= gcap) {      /* grow group-state arrays (sized to distinct groups, not rows) */
+                            int64_t ncap = gcap * 2;
+                            /* Assign each realloc result back before the next so
+                             * a mid-sequence failure leaves only valid pointers
+                             * for the oom: cleanup (realloc frees the old block
+                             * on success, so the pre-realloc pointer must never
+                             * survive into cleanup). */
+                            void* ns = ray_realloc_raw(states, (size_t)ncap * c->block);
+                            if (!ns) goto oom;
+                            states = ns;
+                            void* nk = ray_realloc_raw((void*)keyp, (size_t)ncap * sizeof(int64_t*));
+                            if (!nk) goto oom;
+                            keyp = nk;
+                            void* ngk = ray_realloc_raw(gkeys, (size_t)ncap * (size_t)(n_keys ? n_keys : 1) * sizeof(int64_t));
+                            if (!ngk) goto oom;
+                            gkeys = ngk;
+                            if (c->needs_row) {
+                                void* nf = ray_realloc_raw(first_row, (size_t)ncap * sizeof(int64_t));
+                                if (!nf) goto oom;
+                                first_row = nf;
+                            }
+                            gcap = ncap;
+                        }
                         gg = (int32_t)ng;
                         ht[slot] = gg;
                         ht_salt[slot] = salt;
