@@ -3934,6 +3934,44 @@ static void sorted_check_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
     }
 }
 
+/* Public: are these key columns already in sorted order under the sort's
+ * lexicographic ordering (single uniform direction across all keys)?  Only
+ * null-free integer-family / SYM keys are decidable — anything else (float,
+ * STR/LIST, or a HAS_NULLS column) returns false so the caller must NOT
+ * assume sortedness (float NaN / null placement belong to the real sort).
+ * O(nrows) with early bail on the first violation; a 0/1-row column is
+ * trivially sorted.  Used by the parted ORDER BY streaming path in query.c
+ * to verify each partition is internally sorted at O(partition), never a
+ * full sort. */
+bool ray_key_cols_sorted(ray_t** key_cols, int64_t n_keys, uint8_t descending,
+                         int64_t nrows) {
+    if (n_keys < 1) return true;
+    /* Decidability gate runs UNCONDITIONALLY — a 0/1-row segment is trivially
+     * "sorted", but an undecidable key type (float / STR / GUID) or a
+     * null-bearing key must still return false so the caller declines rather
+     * than silently treating an unorderable column as ordered. */
+    for (int64_t k = 0; k < n_keys; k++) {
+        int8_t t = key_cols[k]->type;
+        if (key_cols[k]->attrs & RAY_ATTR_HAS_NULLS) return false;
+        if (t != RAY_BOOL && t != RAY_U8 && t != RAY_I16 && t != RAY_I32 &&
+            t != RAY_I64 && t != RAY_DATE && t != RAY_TIME &&
+            t != RAY_TIMESTAMP && t != RAY_SYM)
+            return false;
+    }
+    if (nrows < 2) return true;
+    volatile int ordered = 1;
+    sorted_check_ctx_t sctx = {
+        .key_cols = key_cols, .n_keys = n_keys,
+        .descending = descending, .ordered = &ordered,
+    };
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, sorted_check_fn, &sctx, nrows);
+    else
+        sorted_check_fn(&sctx, 0, 1, nrows);
+    return ordered != 0;
+}
+
 /* Helper: resolve key symbols to table columns for xasc/xdesc */
 ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     if (!tbl || tbl->type != RAY_TABLE)

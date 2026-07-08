@@ -1,0 +1,128 @@
+;; sort_parted_presorted.rfl — streaming parted ORDER BY: when a parted table's
+;; partitions are already internally sorted on the sort key AND their key ranges
+;; are globally ordered, `(select {…} from: PARTED asc: KEY)` (no by:/take:) is
+;; answered as the ordered CONCATENATION of the per-partition selects — no
+;; whole-table flatten, no O(total) sort scratch (try_stream_parted_order_by,
+;; src/ops/query.c).  The (.sys.mem) 'sort-perpart-runs counter increments once
+;; per partition processed, so a strict delta == n_parts proves the streaming
+;; path ran; column-for-column parity with an identical-data flat in-memory
+;; oracle (concat all partitions, then the SAME select over the flat table)
+;; proves correctness — INCLUDING a duplicate sort-key spanning a partition
+;; boundary, where the flat stable sort breaks ties by original position
+;; (lower-partition-then-lower-row) exactly as the concat does.
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; POSITIVE — single key, TIMESTAMP, globally monotonic with a BOUNDARY DUP.
+;;   P1 last Time == P2 first Time (10:00:05): the flat stable sort must keep
+;;   P1's row (Seq 3) before P2's row (Seq 4); the concat visits P1 then P2, so
+;;   it does too.  Seq distinguishes the tied rows, so parity actually tests the
+;;   tie ORDER, not just the multiset.
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_sps")
+(set P1 (table [Sym Time Seq] (list [a b a] [2024.01.01D10:00:01.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:05.000000000] [1 2 3])))
+(set P2 (table [Sym Time Seq] (list [c a b] [2024.01.01D10:00:05.000000000 2024.01.01D10:00:06.000000000 2024.01.01D10:00:07.000000000] [4 5 6])))
+(set P3 (table [Sym Time Seq] (list [a a]   [2024.01.01D10:00:08.000000000 2024.01.01D10:00:09.000000000] [7 8])))
+(.db.splayed.set "/tmp/rfl_sps/2024.01.01/t/" P1)
+(.db.splayed.set "/tmp/rfl_sps/2024.01.02/t/" P2)
+(.db.splayed.set "/tmp/rfl_sps/2024.01.03/t/" P3)
+(set Pp (.db.parted.get "/tmp/rfl_sps/" 't))
+
+;; identical-data flat in-memory oracle (partition order == concat order)
+(set TF (table [Sym Time Seq] (list (concat (concat [a b a] [c a b]) [a a]) (concat (concat [2024.01.01D10:00:01.000000000 2024.01.01D10:00:02.000000000 2024.01.01D10:00:05.000000000] [2024.01.01D10:00:05.000000000 2024.01.01D10:00:06.000000000 2024.01.01D10:00:07.000000000]) [2024.01.01D10:00:08.000000000 2024.01.01D10:00:09.000000000]) (concat (concat [1 2 3] [4 5 6]) [7 8]))))
+
+(set B (at (.sys.mem) 'sort-perpart-runs))
+(set RS (select {Sym: Sym Time: Time Seq: Seq from: Pp asc: Time}))
+(set A (at (.sys.mem) 'sort-perpart-runs))
+;; streamed: one run per partition (3 partitions).
+(- A B) -- 3
+(set RF (select {Sym: Sym Time: Time Seq: Seq from: TF asc: Time}))
+(count RS) -- 8
+(count RS) -- (count RF)
+(at RS 'Seq)  -- (at RF 'Seq)
+(at RS 'Time) -- (at RF 'Time)
+(at RS 'Sym)  -- (at RF 'Sym)
+;; explicit: already globally ordered, tie (Seq 3 before 4) preserved.
+(at RS 'Seq)  -- [1 2 3 4 5 6 7 8]
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; POSITIVE — multi-key `asc: [Sym Time]`.  Each partition sorted by (Sym,Time),
+;; leading-key ranges non-overlapping and ordered across partitions.
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_spm")
+(set M1 (table [Sym Time Seq] (list [a a b] [1 2 1] [1 2 3])))
+(set M2 (table [Sym Time Seq] (list [c c d] [1 2 1] [4 5 6])))
+(set M3 (table [Sym Time Seq] (list [e]     [9]     [7])))
+(.db.splayed.set "/tmp/rfl_spm/2024.01.01/t/" M1)
+(.db.splayed.set "/tmp/rfl_spm/2024.01.02/t/" M2)
+(.db.splayed.set "/tmp/rfl_spm/2024.01.03/t/" M3)
+(set Pm (.db.parted.get "/tmp/rfl_spm/" 't))
+(set MF (table [Sym Time Seq] (list (concat (concat [a a b] [c c d]) [e]) (concat (concat [1 2 1] [1 2 1]) [9]) (concat (concat [1 2 3] [4 5 6]) [7]))))
+
+(set Bm (at (.sys.mem) 'sort-perpart-runs))
+(set RSm (select {Sym: Sym Time: Time Seq: Seq from: Pm asc: [Sym Time]}))
+(set Am (at (.sys.mem) 'sort-perpart-runs))
+(- Am Bm) -- 3
+(set RFm (select {Sym: Sym Time: Time Seq: Seq from: MF asc: [Sym Time]}))
+(count RSm) -- (count RFm)
+(at RSm 'Seq)  -- (at RFm 'Seq)
+(at RSm 'Sym)  -- (at RFm 'Sym)
+(at RSm 'Time) -- (at RFm 'Time)
+(at RSm 'Seq)  -- [1 2 3 4 5 6 7]
+
+;; ── NOTE on the decline path ────────────────────────────────────────────────
+;; When ANY eligibility gate fails, the streaming path declines (perpart delta
+;; 0) and falls through to the flat flatten+sort path.  That flat path is a
+;; PRE-EXISTING lazy-sort-over-parted limitation: `(select {asc:… from: PARTED})`
+;; is unmaterialisable in the eager path and surfaces a LOUD `type` error rather
+;; than a silently per-partition-sorted (wrong) result — the exact contract the
+;; asof fallback documents (asof_clause_fallback §C: "loud error ≫ silent wrong
+;; answer").  The negatives below therefore assert that an ineligible shape
+;; DECLINES (delta 0) AND surfaces that loud error — never a silent bad answer.
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; NEGATIVE (a) — a partition NOT internally sorted on the key → DECLINE.
+;;   P2 Time = [06,05,07] is not ascending.
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_spu")
+(set U1 (table [Sym Time Seq] (list [a b] [2024.01.01D10:00:01.000000000 2024.01.01D10:00:02.000000000] [1 2])))
+(set U2 (table [Sym Time Seq] (list [c a c] [2024.01.01D10:00:06.000000000 2024.01.01D10:00:05.000000000 2024.01.01D10:00:07.000000000] [3 4 5])))
+(.db.splayed.set "/tmp/rfl_spu/2024.01.01/t/" U1)
+(.db.splayed.set "/tmp/rfl_spu/2024.01.02/t/" U2)
+(set Pu (.db.parted.get "/tmp/rfl_spu/" 't))
+(set Bu (at (.sys.mem) 'sort-perpart-runs))
+;; DECLINED (unsorted partition) → flat path surfaces the loud pre-existing error.
+(select {Sym: Sym Time: Time Seq: Seq from: Pu asc: Time}) !- type
+(set Au (at (.sys.mem) 'sort-perpart-runs))
+(- Au Bu) -- 0
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; NEGATIVE (b) — OVERLAPPING key ranges (sorted within each partition, but
+;; p+1's min < p's max) → DECLINE (concat would NOT be globally sorted).
+;;   P1 Time up to :20, P2 Time from :05 (< :20) — overlap.
+;; ══════════════════════════════════════════════════════════════════════════
+(.sys.exec "rm -rf /tmp/rfl_spo")
+(set O1 (table [Sym Time Seq] (list [a b] [2024.01.01D10:00:10.000000000 2024.01.01D10:00:20.000000000] [1 2])))
+(set O2 (table [Sym Time Seq] (list [c a] [2024.01.01D10:00:05.000000000 2024.01.01D10:00:25.000000000] [3 4])))
+(.db.splayed.set "/tmp/rfl_spo/2024.01.01/t/" O1)
+(.db.splayed.set "/tmp/rfl_spo/2024.01.02/t/" O2)
+(set Po (.db.parted.get "/tmp/rfl_spo/" 't))
+(set Bo (at (.sys.mem) 'sort-perpart-runs))
+;; DECLINED (overlapping ranges) → flat path surfaces the loud pre-existing error.
+(select {Sym: Sym Time: Time Seq: Seq from: Po asc: Time}) !- type
+(set Ao (at (.sys.mem) 'sort-perpart-runs))
+(- Ao Bo) -- 0
+
+;; ══════════════════════════════════════════════════════════════════════════
+;; NEGATIVE (c) — DESC over ascending-stored partitions.  The per-partition
+;; sortedness check runs in the requested (descending) direction and FAILS on
+;; ascending data → DECLINE.  (Documented choice: desc streams only when
+;; partitions are physically stored descending; ascending-stored + desc
+;; declines — no reverse/re-sort — and surfaces the loud flat-path error.)
+;; ══════════════════════════════════════════════════════════════════════════
+(set Bd (at (.sys.mem) 'sort-perpart-runs))
+(select {Sym: Sym Time: Time Seq: Seq from: Pp desc: Time}) !- type
+(set Ad (at (.sys.mem) 'sort-perpart-runs))
+(- Ad Bd) -- 0
+
+;; ─── cleanup ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_sps /tmp/rfl_spm /tmp/rfl_spu /tmp/rfl_spo")

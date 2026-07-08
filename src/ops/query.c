@@ -4265,6 +4265,14 @@ ray_t* ray_update(ray_t** args, int64_t n);
 ray_t* ray_insert(ray_t** args, int64_t n);
 ray_t* ray_upsert(ray_t** args, int64_t n);
 
+/* Streaming parted ORDER BY (defined below, near the asof/segment helpers):
+ * concat pre-sorted partitions instead of flatten+sort.  Returns an owned
+ * result on the eligible path, or NULL to decline to the flat path. */
+static ray_t* try_stream_parted_order_by(
+    ray_t* dict, ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
+    int64_t by_id, int64_t take_id, int64_t asc_id, int64_t desc_id,
+    int64_t nearest_id);
+
 ray_t* ray_select_fn(ray_t** args, int64_t n) {
     return ray_select(args, n);
 }
@@ -5326,6 +5334,24 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     /* Simple case: no clauses at all → return table as-is */
     if (n_out == 0 && !where_expr && !by_expr && !take_expr && !has_sort && !nearest_expr)
         { DICT_VIEW_CLOSE(dv); return tbl; }
+
+    /* Streaming parted ORDER BY: `(select {…} from: PARTED asc/desc: KEY)`
+     * with no by:/take:/nearest: over a table whose partitions are already
+     * internally sorted on KEY and whose partition key-ranges are globally
+     * ordered.  The sorted result is then just the ordered CONCATENATION of
+     * the per-partition selects — no whole-table flatten, no O(total) sort
+     * scratch.  Declines (returns NULL) to the flat path whenever any
+     * eligibility gate fails; correctness never depends on the fast path. */
+    if (has_sort && !by_expr && !take_expr && !nearest_expr) {
+        ray_t* streamed = try_stream_parted_order_by(
+            dict, tbl, dict_elems, dict_n,
+            by_id, take_id, asc_id, desc_id, nearest_id);
+        if (streamed) {
+            ray_release(tbl);
+            DICT_VIEW_CLOSE(dv);
+            return streamed;
+        }
+    }
 
     /* Fused filter + top-K: shape `(select {col1: c1 col2: c2 …
      * from: T where: <pred> asc/desc: <key> take: <K>})` with no by/
@@ -13855,6 +13881,18 @@ int64_t ray_asof_perpart_runs(void) {
                                 memory_order_relaxed);
 }
 
+/* ── streaming parted ORDER BY ──────────────────────────────────────────────
+ * Monotonic count of per-partition runs taken by the parted ORDER BY
+ * streaming path (try_stream_parted_order_by).  Bumped ONCE per partition
+ * processed — O(1) per partition, never per-row.  Surfaced via
+ * ray_sort_perpart_runs() / (.sys.mem)'s "sort-perpart-runs". */
+static _Atomic(int64_t) ray_sort_perpart_runs_ctr = 0;
+
+int64_t ray_sort_perpart_runs(void) {
+    return atomic_load_explicit(&ray_sort_perpart_runs_ctr,
+                                memory_order_relaxed);
+}
+
 /* asof-join core: builds the disconnected asof DAG over two already-evaluated
  * flat table VALUES and runs the existing kernel.  keys_vec/left_tbl/right_tbl
  * are borrowed (caller owns).  This is the exact pre-spike behaviour; both the
@@ -14047,6 +14085,224 @@ static ray_t* asof_eval_select_segment(ray_t* dict, ray_t* parted_tbl, int32_t s
     ray_t* r = ray_select(&ndict, 1);
     ray_release(ndict);
     return r;
+}
+
+/* ── streaming parted ORDER BY: concat of pre-sorted partitions ─────────────
+ *
+ * Ascending lexicographic compare of row `ra` of key columns `ca[]` against
+ * row `rb` of key columns `cb[]` (n_keys parallel columns, one row each side).
+ * SYM keys compare by DOMAIN STRING (correct across segments even if the two
+ * segments carry distinct sym domains); integer-family keys compare raw.
+ * Direction-agnostic: returns <0 / 0 / >0 in ascending sense — the caller
+ * applies the asc/desc interpretation.  Used only for the cross-partition
+ * boundary compare (two scalar rows), never per-row. */
+static int sort_stream_cmp_boundary(ray_t** ca, int64_t ra,
+                                    ray_t** cb, int64_t rb, int64_t n_keys) {
+    for (int64_t k = 0; k < n_keys; k++) {
+        ray_t* a = ca[k];
+        ray_t* b = cb[k];
+        if (a->type == RAY_SYM) {
+            int64_t ia = ray_read_sym(ray_data(a), ra, RAY_SYM, a->attrs);
+            int64_t ib = ray_read_sym(ray_data(b), rb, RAY_SYM, b->attrs);
+            ray_t* sa = ray_sym_domain_str(ray_sym_vec_domain(a), ia);
+            ray_t* sb = ray_sym_domain_str(ray_sym_vec_domain(b), ib);
+            uint32_t la = sa ? (uint32_t)ray_str_len(sa) : 0;
+            uint32_t lb = sb ? (uint32_t)ray_str_len(sb) : 0;
+            uint32_t ml = la < lb ? la : lb;
+            int cmp = ml ? memcmp(ray_str_ptr(sa), ray_str_ptr(sb), ml) : 0;
+            if (cmp == 0) cmp = (la > lb) - (la < lb);
+            if (cmp) return cmp;
+        } else {
+            int64_t va = read_col_i64(ray_data(a), ra, a->type, a->attrs);
+            int64_t vb = read_col_i64(ray_data(b), rb, b->type, b->attrs);
+            if (va != vb) return va < vb ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+/* Detect and execute the streaming parted ORDER BY shape.  Returns an owned
+ * result (possibly RAY_IS_ERR) on the eligible path, or NULL to DECLINE to
+ * the flat flatten+sort path.  Borrows `tbl` (the caller owns / releases it).
+ *
+ * Eligibility (ALL must hold; else decline):
+ *   1. `tbl` is genuinely parted; asc:/desc: present; no by:/take:/nearest:.
+ *   2. Every sort key is a bare source-column reference (no computed key) that
+ *      resolves to a genuinely PARTED value column — a MAPCOMMON partition key
+ *      or non-parted column declines (the flat path handles those).
+ *   3. A SINGLE uniform direction across all keys (mixed asc+desc declines).
+ *   4. Each partition is internally sorted on the keys in that direction
+ *      (verified per-segment via ray_key_cols_sorted at O(partition), bailing
+ *      early; null-bearing / float / STR keys are undecidable → decline).
+ *   5. Consecutive non-empty partitions are globally ordered: last key of p
+ *      <= first key of p+1 for asc (>= for desc).  Overlapping partition key
+ *      ranges → decline (their concat would NOT be globally sorted).
+ *
+ * When all hold, the flat STABLE sort's result equals the ordered concat:
+ * partitions are visited in segment order (== the flat flatten order) and
+ * each is kept in its own (already-sorted, stable) row order, so equal keys —
+ * including duplicates that straddle a partition boundary — land lower-
+ * partition-then-lower-row, exactly as the flat stable sort places them. */
+static ray_t* try_stream_parted_order_by(
+    ray_t* dict, ray_t* tbl, ray_t** dict_elems, int64_t dict_n,
+    int64_t by_id, int64_t take_id, int64_t asc_id, int64_t desc_id,
+    int64_t nearest_id) {
+
+    int64_t nseg = asof_parted_seg_count(tbl);
+    if (nseg < 1) return NULL;                 /* not parted / no segments */
+
+    /* Gate on clause shape: asc/desc present, no by/take/nearest, single
+     * uniform direction, and only bare-column sort keys. */
+    bool has_asc = false, has_desc = false;
+    int64_t n_keys = 0;
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == by_id || kid == take_id || kid == nearest_id) return NULL;
+        if (kid != asc_id && kid != desc_id) continue;
+        if (kid == asc_id)  has_asc = true;
+        if (kid == desc_id) has_desc = true;
+        ray_t* v = dict_elems[i + 1];
+        if (!v) return NULL;
+        if (v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED)) n_keys += 1;
+        else if (v->type == RAY_SYM) n_keys += ray_len(v);
+        else return NULL;                      /* computed / literal sort key */
+    }
+    if (n_keys < 1) return NULL;               /* no sort key */
+    if (has_asc && has_desc) return NULL;      /* mixed direction */
+    uint8_t descending = has_desc ? 1 : 0;
+
+    /* Carve: key syms + resolved parted columns + two per-segment key-vec
+     * scratch rows (current segment, previous non-empty segment). */
+    ray_t* hdr = NULL;
+    int64_t* key_syms = (int64_t*)scratch_alloc(&hdr,
+        (size_t)n_keys * (sizeof(int64_t) + 3 * sizeof(ray_t*)));
+    if (!key_syms) return NULL;                /* decline (flat path retries) */
+    ray_t** kcols   = (ray_t**)(key_syms + n_keys);   /* parted key columns */
+    ray_t** segkeys = (ray_t**)(kcols + n_keys);      /* current seg key vecs */
+    ray_t** prevkeys = (ray_t**)(segkeys + n_keys);   /* prev non-empty seg */
+
+    int64_t ki = 0;
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid != asc_id && kid != desc_id) continue;
+        ray_t* v = dict_elems[i + 1];
+        if (v->type == -RAY_SYM) key_syms[ki++] = v->i64;
+        else for (int64_t c = 0; c < ray_len(v); c++)
+            key_syms[ki++] = sym_cell_runtime_id(v, c);
+    }
+
+    /* Resolve every sort key to a genuinely parted value column of matching
+     * segment count and a DECIDABLE base type (null-free integer-family / SYM
+     * — float NaN ordering and STR/GUID belong to the real sort).  MAPCOMMON /
+     * non-parted / missing / undecidable-typed → decline (the flat path, which
+     * itself surfaces the pre-existing lazy-sort-over-parted `type` error,
+     * handles those loudly).  The base-type gate here is essential: it declines
+     * an undecidable key even when every segment is 0/1 rows (where the
+     * per-segment sortedness check would trivially pass). */
+    for (int64_t k = 0; k < n_keys; k++) {
+        ray_t* col = ray_table_get_col(tbl, key_syms[k]);
+        if (!col || !RAY_IS_PARTED(col->type) || col->len != nseg) {
+            scratch_free(hdr); return NULL;
+        }
+        int8_t bt = (int8_t)RAY_PARTED_BASETYPE(col->type);
+        if (bt != RAY_BOOL && bt != RAY_U8 && bt != RAY_I16 && bt != RAY_I32 &&
+            bt != RAY_I64 && bt != RAY_DATE && bt != RAY_TIME &&
+            bt != RAY_TIMESTAMP && bt != RAY_SYM) {
+            scratch_free(hdr); return NULL;
+        }
+        kcols[k] = col;
+    }
+
+    /* Per-partition sortedness + cross-partition boundary ordering.  Empty
+     * segments contribute no rows and no boundary; the boundary is checked
+     * against the previous NON-EMPTY segment's last row. */
+    int64_t prev_last = -1;   /* last row index of prev non-empty segment */
+    bool have_prev = false;
+    for (int64_t s = 0; s < nseg; s++) {
+        int64_t seg_rows = -1;
+        for (int64_t k = 0; k < n_keys; k++) {
+            ray_t** segs = (ray_t**)ray_data(kcols[k]);
+            ray_t* sv = segs[s];
+            if (!sv) { scratch_free(hdr); return NULL; }
+            segkeys[k] = sv;
+            if (seg_rows < 0) seg_rows = sv->len;
+            else if (sv->len != seg_rows) { scratch_free(hdr); return NULL; }
+        }
+        if (seg_rows == 0) continue;   /* empty partition */
+        if (!ray_key_cols_sorted(segkeys, n_keys, descending, seg_rows)) {
+            scratch_free(hdr); return NULL;      /* not internally sorted */
+        }
+        if (have_prev) {
+            int cmp = sort_stream_cmp_boundary(prevkeys, prev_last,
+                                               segkeys, 0, n_keys);
+            /* asc: need last(prev) <= first(cur) → cmp <= 0.
+             * desc: need last(prev) >= first(cur) → cmp >= 0. */
+            if (descending ? (cmp < 0) : (cmp > 0)) {
+                scratch_free(hdr); return NULL;  /* overlapping ranges */
+            }
+        }
+        for (int64_t k = 0; k < n_keys; k++) prevkeys[k] = segkeys[k];
+        prev_last = seg_rows - 1;
+        have_prev = true;
+    }
+
+    /* Eligible.  Build the per-segment select dict once, dropping asc:/desc:
+     * (the concat is already globally ordered — no per-partition sort). */
+    ray_t* okeys = ray_dict_keys(dict);   /* borrowed SYM vec */
+    ray_t* ovals = ray_dict_vals(dict);   /* borrowed LIST */
+    if (!okeys || okeys->type != RAY_SYM || !ovals || ovals->type != RAY_LIST) {
+        scratch_free(hdr); return NULL;
+    }
+    int64_t onk = okeys->len;
+    int64_t keep = 0;
+    for (int64_t i = 0; i < onk; i++) {
+        int64_t kid = sym_cell_runtime_id(okeys, i);
+        if (kid != asc_id && kid != desc_id) keep++;
+    }
+    ray_t* nkeys = ray_vec_new(RAY_SYM, keep ? keep : 1);
+    ray_t* nvals = ray_list_new(keep ? keep : 1);
+    if (!nkeys || RAY_IS_ERR(nkeys) || !nvals || RAY_IS_ERR(nvals)) {
+        if (nkeys && !RAY_IS_ERR(nkeys)) ray_release(nkeys);
+        if (nvals && !RAY_IS_ERR(nvals)) ray_release(nvals);
+        scratch_free(hdr); return NULL;
+    }
+    nkeys->len = keep; nvals->len = keep;
+    int64_t* nkd = (int64_t*)ray_data(nkeys);
+    ray_t** ovd = (ray_t**)ray_data(ovals);
+    int64_t w = 0;
+    for (int64_t i = 0; i < onk; i++) {
+        int64_t kid = sym_cell_runtime_id(okeys, i);
+        if (kid == asc_id || kid == desc_id) continue;
+        nkd[w] = kid;
+        nvals = ray_list_set(nvals, w, ovd[i]);   /* retains ovd[i] */
+        w++;
+    }
+    ray_t* sdict = ray_dict_new(nkeys, nvals);    /* consumes both */
+    if (!sdict || RAY_IS_ERR(sdict)) { scratch_free(hdr); return sdict ? sdict : ray_error("oom", NULL); }
+
+    /* Stream: per-partition select, ordered concat, one counter bump/segment. */
+    ray_t* accum = NULL;
+    for (int64_t s = 0; s < nseg; s++) {
+        ray_t* seg_res = asof_eval_select_segment(sdict, tbl, (int32_t)s);
+        atomic_fetch_add_explicit(&ray_sort_perpart_runs_ctr, 1,
+                                  memory_order_relaxed);
+        if (!seg_res || RAY_IS_ERR(seg_res)) {
+            if (accum) ray_release(accum);
+            ray_release(sdict); scratch_free(hdr);
+            return seg_res ? seg_res : ray_error("oom", NULL);
+        }
+        ray_t* merged = ray_result_merge(accum, seg_res);
+        ray_release(seg_res);
+        if (accum) ray_release(accum);
+        accum = merged;
+        if (!accum || RAY_IS_ERR(accum)) {
+            ray_release(sdict); scratch_free(hdr);
+            return accum ? accum : ray_error("oom", NULL);
+        }
+    }
+    ray_release(sdict);
+    scratch_free(hdr);
+    return accum;   /* nseg >= 1 guarantees a non-NULL result */
 }
 
 /* If `tbl` is DATE-partitioned, return its (borrowed) per-partition RAY_DATE
