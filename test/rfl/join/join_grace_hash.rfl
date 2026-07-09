@@ -1,0 +1,73 @@
+;; join_grace_hash.rfl — grace-hash both-sides-parted INNER equi-join (join
+;; key ≠ partition key).  When BOTH inputs are parted (a shape the broadcast
+;; fast-path declines and join_with_parted_guard would otherwise flatten both
+;; sides fully into RAM, then random-probe the whole spilled table — thrash
+;; under a memory cap), grace-hash partitions BOTH sides by hash(join key)
+;; into K budget-sized buckets, joins the bucket-pairs one at a time, and
+;; concatenates.  Equal keys hash to the same bucket on both sides, so the
+;; concat of per-pair inner-joins equals the flat inner-join as a SORTED
+;; MULTISET (the radix join does not preserve row order).
+;;
+;; DECLINE-PATH TEST (this suite): K = clamp(ceil(total_bytes/(budget/4)),2,256)
+;; and the .rfl harness cannot pass -m, so at the default (physical-RAM)
+;; watermark a small fixture yields K<2 → grace-hash DECLINES and the join is
+;; answered by the unchanged flatten path.  So this suite asserts the
+;; INTEGRATION + DECLINE path: (grace-hash-runs delta == 0) AND the both-
+;; parted result equals a hand-built FLAT oracle (sorted multiset), including
+;; DUPLICATE keys (cartesian per group) and NULL keys (never match).  The
+;; STREAMING path (K>=2, grace-hash-runs>0, thrash-free) is proven by the
+;; MANUAL `-m`-constrained run on /tmp/gh_L,/tmp/gh_R outside this suite.
+;;
+;; Value columns are named distinctly (lv / rv) so `at` addresses each side
+;; unambiguously; the partition provenance column build_segment_table adds on
+;; flatten is a non-key column that `at`/`xasc` by [id lv rv] simply ignore.
+
+(.sys.exec "rm -rf /tmp/rfl_gh_L /tmp/rfl_gh_R")
+
+;; ── L: 2 day-segments [id lv].  Key 100 appears TWICE (dup → cartesian);
+;;    one row has a NULL id (0N) that must never match. ──────────────────────
+(set L1 (table [id lv] (list [100 100 200] [1 2 3])))
+(set L2 (table [id lv] (list [300 0N 400]  [4 5 6])))
+(.db.splayed.set "/tmp/rfl_gh_L/2024.01.01/t/" L1)
+(.db.splayed.set "/tmp/rfl_gh_L/2024.01.02/t/" L2)
+(set PL (.db.parted.get "/tmp/rfl_gh_L/" 't))
+
+;; ── R: 2 day-segments [id rv].  Key 100 appears TWICE; a NULL id (0N) too. ──
+(set R1 (table [id rv] (list [100 100 500] [10 11 12])))
+(set R2 (table [id rv] (list [200 300 0N]  [13 14 15])))
+(.db.splayed.set "/tmp/rfl_gh_R/2024.01.01/t/" R1)
+(.db.splayed.set "/tmp/rfl_gh_R/2024.01.02/t/" R2)
+(set PR (.db.parted.get "/tmp/rfl_gh_R/" 't))
+
+;; ── Flat oracle inputs: hand-built concat of the segments, no partition col.
+(set FL (table [id lv] (list [100 100 200 300 0N 400] [1 2 3 4 5 6])))
+(set FR (table [id rv] (list [100 100 500 200 300 0N] [10 11 12 13 14 15])))
+
+;; ── DECLINE + CORRECTNESS ───────────────────────────────────────────────────
+;; At the default watermark K<2 → grace-hash declines (delta 0); the flatten
+;; path answers the both-parted join and must match the flat oracle.
+(set B0 (at (.sys.mem) 'grace-hash-runs))
+(set RS (inner-join [id] PL PR))
+(set A0 (at (.sys.mem) 'grace-hash-runs))
+(- A0 B0) -- 0
+
+(set RF (inner-join [id] FL FR))
+(count RS) -- (count RF)
+;; Hand oracle: NULL ids never match; id=100 is 2x2 cartesian = 4; id=200,300
+;; one each → 6 rows total.  (id=400 L-only, id=500 R-only → no match.)
+(count RS) -- 6
+
+(set RSs (xasc RS [id lv rv]))
+(set RFs (xasc RF [id lv rv]))
+(at RSs 'id) -- (at RFs 'id)
+(at RSs 'lv) -- (at RFs 'lv)
+(at RSs 'rv) -- (at RFs 'rv)
+
+;; Explicit value oracle (rows sorted by id, lv, rv):
+;;   (100,1,10)(100,1,11)(100,2,10)(100,2,11)(200,3,13)(300,4,14)
+(at RSs 'id) -- (as 'I64 [100 100 100 100 200 300])
+(at RSs 'lv) -- (as 'I64 [1 1 2 2 3 4])
+(at RSs 'rv) -- (as 'I64 [10 11 10 11 13 14])
+
+;; ─── cleanup ─────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_gh_L /tmp/rfl_gh_R")

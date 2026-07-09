@@ -1659,6 +1659,18 @@ int64_t ray_join_perpart_runs(void) {
                                  memory_order_relaxed);
 }
 
+/* Monotonic count of grace-hash bucket-pair joins (both sides parted,
+ * join key ≠ partition key).  Bumped once per bucket-pair processed in
+ * the grace-hash streaming path below; surfaced via (.sys.mem)'s
+ * "grace-hash-runs" (mirrors ray_join_perpart_runs).  A non-zero delta
+ * across a join proves grace-hash streamed rather than flattened. */
+static _Atomic(int64_t) ray_grace_hash_runs_ctr = 0;
+
+int64_t ray_grace_hash_runs(void) {
+    return atomic_load_explicit(&ray_grace_hash_runs_ctr,
+                                 memory_order_relaxed);
+}
+
 /* Broadcast-streaming fast-path: exactly one side is parted (the
  * "streamed" side) and the other is a whole in-RAM table (the "resident"
  * side).  For each segment of the streamed side, replace that side with
@@ -1748,6 +1760,299 @@ static ray_t* join_broadcast_stream(ray_graph_t* g, ray_op_t* op,
     return accum;
 }
 
+/* ============================================================================
+ * Grace-hash join — both-sides-parted inner equi-join (join key ≠ part key)
+ *
+ * When BOTH inputs are parted (a shape join_broadcast_stream declines and
+ * join_with_parted_guard would otherwise flatten both sides fully into
+ * RAM), flattening + random-probing the whole spilled table thrashes under
+ * a memory cap.  Grace-hash instead partitions BOTH sides by hash(join key)
+ * into K buckets sized so one bucket-pair fits the anon budget, joins the
+ * bucket-pairs one at a time (sequential, no random whole-table probe), and
+ * concatenates.  Equal keys hash to the same bucket on both sides, so each
+ * bucket-pair is self-contained and the concat of per-pair inner-joins
+ * equals the flat inner-join as a SORTED MULTISET (the flat radix join does
+ * not preserve row order).  Null keys hash somewhere and never match.  Cold
+ * buckets spill to disk via the allocator, bounding resident anon RSS.
+ *
+ * Task 1: INNER join only (proves the memory bound).  LEFT/FULL/ANTI decline
+ * (return NULL → the existing flatten path handles them).
+ * ============================================================================ */
+
+/* Build a 0-row flat table with the same schema (column names + types, str
+ * pools, sym domains) as `tmpl` — used to stand in for a bucket that got no
+ * rows on one side, so the flat kernel always sees a real table (never NULL)
+ * and the result schema is well-formed even for empty bucket-pairs. */
+static ray_t* grace_empty_like(ray_t* tmpl) {
+    int64_t ncols = ray_table_ncols(tmpl);
+    ray_t* out = ray_table_new(ncols);
+    if (!out || RAY_IS_ERR(out)) return out;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tmpl, c);
+        if (!col) continue;
+        int64_t name_id = ray_table_col_name(tmpl, c);
+        ray_t* nc = col_vec_new(col, 0);
+        if (!nc || RAY_IS_ERR(nc)) { ray_release(out); return ray_error("oom", NULL); }
+        nc->len = 0;
+        col_propagate_str_pool(nc, col);
+        if (nc->type == RAY_SYM) ray_sym_vec_adopt_domain(nc, col);
+        out = ray_table_add_col(out, name_id, nc);
+        ray_release(nc);
+    }
+    return out;
+}
+
+/* Gather rows [idx[0..n)] of the flat segment table `seg` into a new flat
+ * sub-table (same schema).  Mirrors exec_join_flat's Pass-3 column gather
+ * (col_vec_new + gather_fn + str-pool/null/sym-domain propagation). */
+static ray_t* grace_gather_rows(ray_t* seg, const int64_t* idx, int64_t n) {
+    int64_t ncols = ray_table_ncols(seg);
+    ray_t* out = ray_table_new(ncols);
+    if (!out || RAY_IS_ERR(out)) return out;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(seg, c);
+        if (!col) continue;
+        int64_t name_id = ray_table_col_name(seg, c);
+        ray_t* nc = col_vec_new(col, n);
+        if (!nc || RAY_IS_ERR(nc)) { ray_release(out); return ray_error("oom", NULL); }
+        nc->len = n;
+        if (n > 0) {
+            gather_ctx_t gctx = {
+                .idx = (int64_t*)idx, .src_col = col, .dst_col = nc,
+                .esz = col_esz(col), .nullable = false,
+            };
+            gather_fn(&gctx, 0, 0, n);
+        }
+        col_propagate_str_pool(nc, col);
+        col_propagate_nulls_gather(nc, col, idx, n);
+        if (nc->type == RAY_SYM) ray_sym_vec_adopt_domain(nc, col);
+        out = ray_table_add_col(out, name_id, nc);
+        ray_release(nc);
+    }
+    return out;
+}
+
+/* Partition one parted side into K buckets by hash(join key) % K.  For each
+ * segment: materialize it (build_segment_table), counting-sort its rows by
+ * bucket into one index buffer, gather each bucket's rows into a sub-table
+ * and merge into buckets[k].  Releases each segment before the next.
+ * `key_syms` are the join-key column names (bare OP_SCAN syms) resolved
+ * per-segment from the flat segment.  Returns NULL on success; an error
+ * ray_t* on failure (the caller owns and frees whatever buckets are set). */
+static ray_t* grace_partition_side(ray_t* side, const int64_t* key_syms,
+                                   uint32_t n_keys, int64_t K,
+                                   ray_t** buckets) {
+    int64_t nseg = join_parted_seg_count(side);
+    for (int64_t s = 0; s < nseg; s++) {
+        ray_t* seg = build_segment_table(side, (int32_t)s);
+        if (!seg || RAY_IS_ERR(seg)) return seg ? seg : ray_error("oom", NULL);
+        int64_t srows = ray_table_nrows(seg);
+
+        ray_t* err = NULL;
+        ray_t* kv_hdr = NULL; ray_t* rb_hdr = NULL;
+        ray_t* pfx_hdr = NULL; ray_t* cur_hdr = NULL; ray_t* idx_hdr = NULL;
+
+        ray_t** kvecs = (ray_t**)scratch_alloc(&kv_hdr,
+                            (size_t)(n_keys ? n_keys : 1) * sizeof(ray_t*));
+        int64_t* row_bkt = (int64_t*)scratch_alloc(&rb_hdr,
+                            (size_t)(srows ? srows : 1) * sizeof(int64_t));
+        int64_t* prefix = (int64_t*)scratch_calloc(&pfx_hdr,
+                            (size_t)(K + 1) * sizeof(int64_t));
+        int64_t* cursor = (int64_t*)scratch_alloc(&cur_hdr,
+                            (size_t)K * sizeof(int64_t));
+        int64_t* idxbuf = (int64_t*)scratch_alloc(&idx_hdr,
+                            (size_t)(srows ? srows : 1) * sizeof(int64_t));
+        if (!kvecs || !row_bkt || !prefix || !cursor || !idxbuf) {
+            err = ray_error("oom", NULL); goto seg_cleanup;
+        }
+
+        for (uint32_t k = 0; k < n_keys; k++)
+            kvecs[k] = ray_table_get_col(seg, key_syms[k]);
+
+        /* Per-row bucket + per-bucket histogram (prefix[k+1] counts bucket k). */
+        for (int64_t r = 0; r < srows; r++) {
+            int64_t b = (int64_t)(hash_row_keys(kvecs, n_keys, r) % (uint64_t)K);
+            row_bkt[r] = b;
+            prefix[b + 1]++;
+        }
+        for (int64_t k = 0; k < K; k++) {
+            prefix[k + 1] += prefix[k];
+            cursor[k] = prefix[k];
+        }
+        /* Counting-sort row indices into contiguous per-bucket runs. */
+        for (int64_t r = 0; r < srows; r++)
+            idxbuf[cursor[row_bkt[r]]++] = r;
+
+        for (int64_t k = 0; k < K && !err; k++) {
+            int64_t cnt = prefix[k + 1] - prefix[k];
+            if (cnt == 0) continue;
+            ray_t* sub = grace_gather_rows(seg, idxbuf + prefix[k], cnt);
+            if (!sub || RAY_IS_ERR(sub)) {
+                err = sub ? sub : ray_error("oom", NULL); break;
+            }
+            if (!buckets[k]) {
+                buckets[k] = sub;
+            } else {
+                ray_t* m = ray_result_merge(buckets[k], sub);
+                ray_release(buckets[k]);
+                ray_release(sub);
+                if (!m || RAY_IS_ERR(m)) { err = m ? m : ray_error("oom", NULL); buckets[k] = NULL; break; }
+                buckets[k] = m;
+            }
+        }
+
+seg_cleanup:
+        scratch_free(kv_hdr); scratch_free(rb_hdr); scratch_free(pfx_hdr);
+        scratch_free(cur_hdr); scratch_free(idx_hdr);
+        ray_release(seg);
+        if (err) return err;
+    }
+    return NULL;
+}
+
+/* Grace-hash attempt.  Returns NULL to DECLINE (caller falls through to the
+ * flatten path — the flat path is correct and cheaper for small joins), or
+ * an owned result / error otherwise.  Declines unless BOTH sides are parted,
+ * the op is an INNER OP_JOIN, all join keys are bare OP_SCAN non-STR columns,
+ * and K (bucket count) computes to >= 2 (i.e. the combined input does not
+ * already fit the anon budget). */
+static ray_t* grace_hash_join(ray_graph_t* g, ray_op_t* op,
+                              ray_t* left, ray_t* right,
+                              join_flat_fn_t flat_fn) {
+    if (op->opcode == OP_ANTIJOIN) return NULL;   /* Task 2: anti */
+    if (!join_table_has_parted_col(left) || !join_table_has_parted_col(right))
+        return NULL;                              /* not both-parted */
+
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return NULL;
+    if (ext->join.join_type != 0) return NULL;    /* Task 2: LEFT/FULL */
+
+    uint32_t n_keys = ext->join.n_join_keys;
+    if (n_keys == 0) return NULL;
+
+    /* Resolve + validate join keys: bare OP_SCAN on both sides, non-STR. */
+    ray_t* sym_hdr = NULL;
+    int64_t* key_syms = (int64_t*)scratch_alloc(&sym_hdr,
+                            (size_t)n_keys * 2 * sizeof(int64_t));
+    if (!key_syms) return ray_error("oom", NULL);
+    int64_t* l_syms = key_syms;
+    int64_t* r_syms = key_syms + n_keys;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
+        ray_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]);
+        if (!lk || lk->base.opcode != OP_SCAN ||
+            !rk || rk->base.opcode != OP_SCAN) {
+            scratch_free(sym_hdr); return NULL;   /* non-scan key: decline */
+        }
+        l_syms[k] = lk->sym; r_syms[k] = rk->sym;
+        ray_t* lc = ray_table_get_col(left, lk->sym);
+        ray_t* rc = ray_table_get_col(right, rk->sym);
+        if (!lc || !rc) { scratch_free(sym_hdr); return NULL; }  /* key not a column: decline */
+        int8_t lt = lc ? (RAY_IS_PARTED(lc->type)
+                          ? (int8_t)RAY_PARTED_BASETYPE(lc->type) : lc->type) : -1;
+        int8_t rt = rc ? (RAY_IS_PARTED(rc->type)
+                          ? (int8_t)RAY_PARTED_BASETYPE(rc->type) : rc->type) : -1;
+        if (lt == RAY_STR || rt == RAY_STR) {
+            scratch_free(sym_hdr); return NULL;   /* STR key: decline */
+        }
+    }
+
+    /* K = clamp(ceil(total_bytes / (budget/4)), 2, 256).  ÷4 leaves headroom
+     * for the per-pair hash table + output.  8B/col is a safe over-estimate
+     * of row width (over-estimation only shrinks buckets → tighter bound). */
+    int64_t nL = ray_table_nrows(left);
+    int64_t nR = ray_table_nrows(right);
+    int64_t rowbytes_L = ray_table_ncols(left) * 8;
+    int64_t rowbytes_R = ray_table_ncols(right) * 8;
+    int64_t total = nL * rowbytes_L + nR * rowbytes_R;
+    int64_t budget = ray_heap_anon_watermark();
+    if (budget <= 0) { scratch_free(sym_hdr); return NULL; }
+    int64_t denom = budget / 4;
+    if (denom < 1) denom = 1;
+    int64_t K = (total + denom - 1) / denom;      /* ceil */
+    if (K < 2) { scratch_free(sym_hdr); return NULL; }  /* fits: decline */
+    if (K > 256) K = 256;
+
+    ray_t* bl_hdr = NULL; ray_t* br_hdr = NULL;
+    ray_t** bucket_L = (ray_t**)scratch_calloc(&bl_hdr, (size_t)K * sizeof(ray_t*));
+    ray_t** bucket_R = (ray_t**)scratch_calloc(&br_hdr, (size_t)K * sizeof(ray_t*));
+    if (!bucket_L || !bucket_R) {
+        scratch_free(bl_hdr); scratch_free(br_hdr); scratch_free(sym_hdr);
+        return ray_error("oom", NULL);
+    }
+
+    ray_t* result = NULL;
+    ray_t* tmplL = NULL; ray_t* tmplR = NULL;
+
+    /* PARTITION both sides by hash(join key) % K.  The helper returns NULL on
+     * success, an error otherwise — fold straight into result. */
+    result = grace_partition_side(left, l_syms, n_keys, K, bucket_L);
+    if (result) goto grace_cleanup;
+    result = grace_partition_side(right, r_syms, n_keys, K, bucket_R);
+    if (result) goto grace_cleanup;
+
+    /* PERSISTENT 0-row schema templates for empty-bucket stand-ins, built from
+     * the first non-empty bucket of each side (both sides had rows, else K<2
+     * declined).  These must OUTLIVE the join loop: a live bucket can't be the
+     * template because it is freed as its own pair is joined, so a later empty
+     * bucket would dereference freed memory.  If a side produced nothing,
+     * decline safely to flatten (NULL result). */
+    for (int64_t k = 0; k < K && !tmplL; k++) if (bucket_L[k]) tmplL = grace_empty_like(bucket_L[k]);
+    for (int64_t k = 0; k < K && !tmplR; k++) if (bucket_R[k]) tmplR = grace_empty_like(bucket_R[k]);
+    if (!tmplL || RAY_IS_ERR(tmplL) || !tmplR || RAY_IS_ERR(tmplR)) {
+        result = (tmplL && RAY_IS_ERR(tmplL)) ? tmplL
+               : (tmplR && RAY_IS_ERR(tmplR)) ? tmplR : NULL;
+        if (result == tmplL) tmplL = NULL;
+        if (result == tmplR) tmplR = NULL;
+        goto grace_cleanup;
+    }
+
+    /* JOIN: one bucket-pair at a time; concat-merge into the running result.
+     * An empty side uses the persistent 0-row template (never released here). */
+    for (int64_t k = 0; k < K; k++) {
+        atomic_fetch_add_explicit(&ray_grace_hash_runs_ctr, 1,
+                                   memory_order_relaxed);
+
+        int64_t lr = bucket_L[k] ? ray_table_nrows(bucket_L[k]) : 0;
+        int64_t rr = bucket_R[k] ? ray_table_nrows(bucket_R[k]) : 0;
+        if ((lr * rowbytes_L + rr * rowbytes_R) > budget)
+            fprintf(stderr, "grace-hash: bucket %lld over budget (key skew) — "
+                    "spilling one pair\n", (long long)k);
+
+        ray_t* L = bucket_L[k] ? bucket_L[k] : tmplL;
+        ray_t* R = bucket_R[k] ? bucket_R[k] : tmplR;
+        ray_t* rk = flat_fn(g, op, L, R);
+        if (bucket_L[k]) { ray_release(bucket_L[k]); bucket_L[k] = NULL; }
+        if (bucket_R[k]) { ray_release(bucket_R[k]); bucket_R[k] = NULL; }
+
+        if (!rk || RAY_IS_ERR(rk)) {
+            ray_release(result);
+            result = rk ? rk : ray_error("oom", NULL);
+            goto grace_cleanup;
+        }
+        if (!result) {
+            result = rk;
+        } else {
+            ray_t* m = ray_result_merge(result, rk);
+            ray_release(result);
+            ray_release(rk);
+            /* SURFACE mid-merge failure (the check pivot.c initially dropped). */
+            if (!m || RAY_IS_ERR(m)) { result = m ? m : ray_error("oom", NULL); goto grace_cleanup; }
+            result = m;
+        }
+    }
+
+grace_cleanup:
+    for (int64_t k = 0; k < K; k++) {
+        if (bucket_L[k]) ray_release(bucket_L[k]);
+        if (bucket_R[k]) ray_release(bucket_R[k]);
+    }
+    if (tmplL) ray_release(tmplL);
+    if (tmplR) ray_release(tmplR);
+    scratch_free(bl_hdr); scratch_free(br_hdr); scratch_free(sym_hdr);
+    return result;
+}
+
 /* Parted-input guard: a parted table's columns are raw segment-array
  * wrappers (->len == n_parts, not nrows) — the flat kernels index them by
  * row position up to nrows-1, an OOB read (SIGSEGV).  Flatten any parted
@@ -1764,6 +2069,12 @@ static ray_t* join_with_parted_guard(ray_graph_t* g, ray_op_t* op,
 
     ray_t* streamed = join_broadcast_stream(g, op, left_table, right_table, flat_fn);
     if (streamed) return streamed;
+
+    /* Both sides parted: try grace-hash (partition by hash(join key) into
+     * budget-sized buckets, join bucket-pairs one at a time — bounded RSS,
+     * no whole-table random probe).  NULL declines to the flatten below. */
+    ray_t* grace = grace_hash_join(g, op, left_table, right_table, flat_fn);
+    if (grace) return grace;
 
     ray_t* left_flat = NULL;
     ray_t* right_flat = NULL;

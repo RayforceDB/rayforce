@@ -982,6 +982,10 @@ int64_t ray_window_perpart_runs(void);
  * "join-perpart-runs". */
 int64_t ray_join_perpart_runs(void);
 
+/* Monotonic count of grace-hash bucket-pair joins (both-parted inner join,
+ * join key ≠ partition key); surfaced via (.sys.mem)'s "grace-hash-runs". */
+int64_t ray_grace_hash_runs(void);
+
 /* Are these key columns already sorted (single uniform direction) under the
  * sort's lexicographic ordering?  Null-free integer-family / SYM keys only;
  * everything else returns false.  O(nrows) with early bail.  Defined in
