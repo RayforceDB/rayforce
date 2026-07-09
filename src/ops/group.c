@@ -5020,7 +5020,10 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                               const agg_affine_t* affine,
                               const agg_prod_t* prod,
                               const double*  sumsq_f64,
-                              const int64_t* nn_counts) {
+                              const int64_t* nn_counts,
+                              const double*  sum_y_f64,
+                              const double*  sumsq_y_f64,
+                              const double*  sumxy_f64) {
     for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t agg_op = ext->agg_ops[a];
         ray_t* agg_col = agg_vecs[a];
@@ -5036,6 +5039,9 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
             case OP_AVG:
             case OP_STDDEV: case OP_STDDEV_POP:
             case OP_VAR: case OP_VAR_POP:
+            case OP_PEARSON_CORR:
+            case OP_COV: case OP_SCOV:
+            case OP_WSUM: case OP_WAVG:
                 out_type = RAY_F64; break;
             case OP_ALL:
             case OP_ANY:
@@ -5115,6 +5121,40 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                         else if (agg_op == OP_VAR) v = var_pop * cnt / (cnt - 1);
                         else if (agg_op == OP_STDDEV_POP) v = sqrt(var_pop);
                         else v = sqrt(var_pop * cnt / (cnt - 1));
+                        break;
+                    }
+                    case OP_PEARSON_CORR:
+                    case OP_COV:
+                    case OP_SCOV:
+                    case OP_WSUM:
+                    case OP_WAVG: {
+                        int64_t cnt = nn;
+                        if ((agg_op == OP_PEARSON_CORR || agg_op == OP_SCOV) && cnt < 2) {
+                            v = NULL_F64; ray_vec_set_null(new_col, gi, true); break;
+                        }
+                        if ((agg_op == OP_COV || agg_op == OP_WAVG) && cnt < 1) {
+                            v = NULL_F64; ray_vec_set_null(new_col, gi, true); break;
+                        }
+                        double sx = sum_f64 ? sum_f64[idx] : 0.0;
+                        double sy = sum_y_f64 ? sum_y_f64[idx] : 0.0;
+                        double sxx = sumsq_f64 ? sumsq_f64[idx] : 0.0;
+                        double syy = sumsq_y_f64 ? sumsq_y_f64[idx] : 0.0;
+                        double sxy = sumxy_f64 ? sumxy_f64[idx] : 0.0;
+                        if (agg_op == OP_WSUM) { v = sxy; break; }
+                        if (agg_op == OP_WAVG) {
+                            if (sx == 0.0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
+                            v = sxy / sx; break;
+                        }
+                        double dn = (double)cnt;
+                        if (agg_op == OP_COV) { v = (sxy - sx * sy / dn) / dn; break; }
+                        if (agg_op == OP_SCOV) { v = (sxy - sx * sy / dn) / (dn - 1.0); break; }
+                        double num = dn * sxy - sx * sy;
+                        double dx = dn * sxx - sx * sx;
+                        double dy = dn * syy - sy * sy;
+                        if (dx <= 0.0 || dy <= 0.0) {
+                            v = NULL_F64; ray_vec_set_null(new_col, gi, true); break;
+                        }
+                        v = num / sqrt(dx * dy);
                         break;
                     }
                     default:     v = 0.0; break;
@@ -7336,10 +7376,10 @@ grp_done:
  * filter scan, the survivor gather and group discovery all vanish; per
  * group the accumulation applies the same all_sum recurrence da_accum_row
  * applies row-by-row (same read helpers, same in-order accumulate), so
- * results match the generic path.  Ineligible shapes — non-SUM/AVG/COUNT
- * aggs, non-scan non-prod-fusable inputs, HAS_NULLS or F32/exotic agg
- * columns, binary/holistic aggs, HEAD limits, emit filters — return NULL
- * and the caller folds the slices into the equivalent selection. */
+ * results match the generic path.  Ineligible shapes — unsupported aggs,
+ * non-scan non-prod-fusable inputs, HAS_NULLS or F32/exotic agg columns,
+ * limits, emit filters — return NULL and the caller folds the slices into
+ * the equivalent selection. */
 
 /* Row-chunk task: slice gi, rows [lo, hi) within that slice.  Slices are
  * chunked so one dominant key (a most-frequent sym can carry ~95% of the
@@ -7354,10 +7394,15 @@ typedef struct {
     const ray_idx_slice_t* slices;
     const sg_task_t*  tasks;
     ray_t* const*     agg_vecs;
+    ray_t* const*     agg_vecs2;
     const agg_prod_t* prod;
     const uint16_t*   agg_ops;
     uint8_t           n_aggs;
     da_val_t*         partials; /* [n_tasks * n_aggs], zeroed */
+    double*           partial_sumsq;
+    double*           partial_sum_y;
+    double*           partial_sumsq_y;
+    double*           partial_sumxy;
     /* Shared-stream fusion: pair_sum[a] = sibling SUM agg slot whose bare
      * scan is prod[a]'s int side (-1 = none); fused_by[b] = the prod slot
      * that computes SUM b (-1 = b runs its own loop). */
@@ -7443,6 +7488,37 @@ static inline double sg_prod_range(const agg_prod_t* p, int64_t r0, int64_t n,
     return (a0 + a1) + (a2 + a3);
 }
 
+static inline double sg_num_at(ray_t* v, int64_t row) {
+    if (v->type == RAY_F64)
+        return ((const double*)ray_data(v))[row];
+    return (double)read_col_i64(ray_data(v), row, v->type, v->attrs);
+}
+
+static inline void sg_pair_accum(ray_t* x, ray_t* y, const int64_t* rows,
+                                 int64_t n, bool contig, int64_t r0,
+                                 double* sx, double* sy, double* sxx,
+                                 double* syy, double* sxy) {
+    double ax = 0.0, ay = 0.0, axx = 0.0, ayy = 0.0, axy = 0.0;
+    if (contig) {
+        for (int64_t j = 0; j < n; j++) {
+            int64_t r = r0 + j;
+            double xv = sg_num_at(x, r);
+            double yv = sg_num_at(y, r);
+            ax += xv; ay += yv;
+            axx += xv * xv; ayy += yv * yv; axy += xv * yv;
+        }
+    } else {
+        for (int64_t j = 0; j < n; j++) {
+            int64_t r = rows[j];
+            double xv = sg_num_at(x, r);
+            double yv = sg_num_at(y, r);
+            ax += xv; ay += yv;
+            axx += xv * xv; ayy += yv * yv; axy += xv * yv;
+        }
+    }
+    *sx = ax; *sy = ay; *sxx = axx; *syy = ayy; *sxy = axy;
+}
+
 static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
     (void)wid;
     sg_ctx_t* c = (sg_ctx_t*)raw;
@@ -7457,7 +7533,17 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
         int64_t r0 = (n > 0) ? rows[0] : 0;
         for (uint32_t a = 0; a < c->n_aggs; a++) {
             size_t idx = (size_t)ti * c->n_aggs + a;
-            if (c->prod[a].enabled) {
+            uint16_t op = c->agg_ops[a];
+            if (agg_is_binary_agg(op)) {
+                double sx = 0.0, sy = 0.0, sxx = 0.0, syy = 0.0, sxy = 0.0;
+                sg_pair_accum(c->agg_vecs[a], c->agg_vecs2[a], rows, n,
+                              contig, r0, &sx, &sy, &sxx, &syy, &sxy);
+                c->partials[idx].f = sx;
+                if (c->partial_sumsq)   c->partial_sumsq[idx] = sxx;
+                if (c->partial_sum_y)   c->partial_sum_y[idx] = sy;
+                if (c->partial_sumsq_y) c->partial_sumsq_y[idx] = syy;
+                if (c->partial_sumxy)   c->partial_sumxy[idx] = sxy;
+            } else if (c->prod[a].enabled) {
                 /* Fused product: gated null-free, every row counts. */
                 double acc = 0.0;
                 if (contig) {
@@ -7479,26 +7565,37 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
                  * iterate ascending and pairing enforces prod < sum? no —
                  * pairing is order-free: the prod branch writes this slot
                  * directly whichever order they appear in). */
-            } else if (c->agg_ops[a] == OP_COUNT) {
+            } else if (op == OP_COUNT) {
                 /* counts[gi] above suffices. */
             } else if (c->agg_vecs[a]->type == RAY_F64) {
                 /* NaN payload = null, skip from sum (mirror all_sum). */
                 const double* restrict d =
                     (const double*)ray_data(c->agg_vecs[a]);
                 double acc = 0.0;
+                double ssq = 0.0;
+                bool need_sq = c->partial_sumsq &&
+                    (op == OP_STDDEV || op == OP_STDDEV_POP ||
+                     op == OP_VAR || op == OP_VAR_POP);
                 if (contig) {
                     const double* restrict dr = d + r0;
                     for (int64_t j = 0; j < n; j++) {
                         double v = dr[j];
-                        if (RAY_LIKELY(v == v)) acc += v;
+                        if (RAY_LIKELY(v == v)) {
+                            acc += v;
+                            if (need_sq) ssq += v * v;
+                        }
                     }
                 } else {
                     for (int64_t j = 0; j < n; j++) {
                         double v = d[rows[j]];
-                        if (RAY_LIKELY(v == v)) acc += v;
+                        if (RAY_LIKELY(v == v)) {
+                            acc += v;
+                            if (need_sq) ssq += v * v;
+                        }
                     }
                 }
                 c->partials[idx].f = acc;
+                if (need_sq) c->partial_sumsq[idx] = ssq;
             } else {
                 /* Integer family, null-free by admission (unsigned wrap
                  * add mirrors da_accum_row). */
@@ -7507,17 +7604,33 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
                 int8_t t = av->type;
                 uint8_t at = av->attrs;
                 uint64_t acc = 0;
+                double ssq = 0.0;
+                bool need_sq = c->partial_sumsq &&
+                    (op == OP_STDDEV || op == OP_STDDEV_POP ||
+                     op == OP_VAR || op == OP_VAR_POP);
                 if (contig && (t == RAY_I64 || t == RAY_TIME)) {
                     const int64_t* restrict x = (const int64_t*)p + r0;
-                    for (int64_t j = 0; j < n; j++) acc += (uint64_t)x[j];
+                    for (int64_t j = 0; j < n; j++) {
+                        int64_t v = x[j];
+                        acc += (uint64_t)v;
+                        if (need_sq) { double d = (double)v; ssq += d * d; }
+                    }
                 } else if (contig && t == RAY_I32) {
                     const int32_t* restrict x = (const int32_t*)p + r0;
-                    for (int64_t j = 0; j < n; j++) acc += (uint64_t)(int64_t)x[j];
+                    for (int64_t j = 0; j < n; j++) {
+                        int64_t v = (int64_t)x[j];
+                        acc += (uint64_t)v;
+                        if (need_sq) { double d = (double)v; ssq += d * d; }
+                    }
                 } else {
-                    for (int64_t j = 0; j < n; j++)
-                        acc += (uint64_t)read_col_i64(p, rows[j], t, at);
+                    for (int64_t j = 0; j < n; j++) {
+                        int64_t v = read_col_i64(p, rows[j], t, at);
+                        acc += (uint64_t)v;
+                        if (need_sq) { double d = (double)v; ssq += d * d; }
+                    }
                 }
                 c->partials[idx].i = (int64_t)acc;
+                if (need_sq) c->partial_sumsq[idx] = ssq;
             }
         }
     }
@@ -7576,7 +7689,8 @@ static ray_t* sg_hint_to_selection(ray_graph_t* g, ray_t* tbl) {
  * prod (fused product plans). */
 static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                               int64_t group_limit,
-                              ray_t** agg_vecs, agg_prod_t* prod) {
+                              ray_t** agg_vecs, ray_t** agg_vecs2,
+                              agg_prod_t* prod) {
     if (group_limit != 0) return false;
     if (ray_group_emit_filter_get().enabled) return false;
     ray_op_ext_t* ext = find_ext(g, op->id);
@@ -7591,24 +7705,50 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     if (!key_col || key_col != g->sg_col) return false;
 
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
-        if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) return false;
         uint16_t aop = ext->agg_ops[a];
         if (aop == OP_COUNT) continue;    /* group size; input unused */
-        if (aop != OP_SUM && aop != OP_AVG) return false;
+        bool pair = agg_is_binary_agg(aop);
+        if (!pair &&
+            aop != OP_SUM && aop != OP_AVG &&
+            aop != OP_STDDEV && aop != OP_STDDEV_POP &&
+            aop != OP_VAR && aop != OP_VAR_POP)
+            return false;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (!in) return false;
-        if (try_prod_sumavg_input_f64(g, tbl, in, &prod[a])) continue;
+        if (!pair && (aop == OP_SUM || aop == OP_AVG) &&
+            try_prod_sumavg_input_f64(g, tbl, in, &prod[a]))
+            continue;
         ray_op_ext_t* ae = find_ext(g, in->id);
         if (!ae || ae->base.opcode != OP_SCAN) return false;
         ray_t* col = ray_table_get_col(tbl, ae->sym);
         if (!col || ray_is_atom(col)) return false;
         if (col->attrs & RAY_ATTR_HAS_NULLS) return false;
+        if (!agg_type_admitted(aop, col->type)) return false;
         switch (col->type) {
             case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
             case RAY_TIME: case RAY_F64: break;
             default: return false;  /* F32 / exotic → generic path */
         }
         agg_vecs[a] = col;
+        if (pair) {
+            if (!ext->agg_ins2 || ext->agg_ins2[a] == RAY_OP_NONE) return false;
+            ray_op_t* in2 = op_node(g, ext->agg_ins2[a]);
+            if (!in2) return false;
+            ray_op_ext_t* ae2 = find_ext(g, in2->id);
+            if (!ae2 || ae2->base.opcode != OP_SCAN) return false;
+            ray_t* col2 = ray_table_get_col(tbl, ae2->sym);
+            if (!col2 || ray_is_atom(col2)) return false;
+            if (col2->attrs & RAY_ATTR_HAS_NULLS) return false;
+            if (!agg_type_admitted(aop, col2->type)) return false;
+            switch (col2->type) {
+                case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+                case RAY_F64: break;
+                default: return false;
+            }
+            agg_vecs2[a] = col2;
+        } else if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {
+            return false;
+        }
     }
     return true;
 }
@@ -7623,9 +7763,10 @@ ray_t* ray_group_slice_hint_settle(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                    int64_t group_limit) {
     if (!g->sg_col || !tbl || tbl->type != RAY_TABLE) return NULL;
     ray_t* agg_vecs[16] = {0};
+    ray_t* agg_vecs2[16] = {0};
     agg_prod_t prod[16];
     memset(prod, 0, sizeof(prod));
-    if (sg_shape_eligible(g, op, tbl, group_limit, agg_vecs, prod))
+    if (sg_shape_eligible(g, op, tbl, group_limit, agg_vecs, agg_vecs2, prod))
         return NULL;                      /* kernel will consume it */
     return sg_hint_to_selection(g, tbl);  /* fold; NULL on success */
 }
@@ -7633,9 +7774,10 @@ ray_t* ray_group_slice_hint_settle(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                 int64_t group_limit) {
     ray_t* agg_vecs[16] = {0};
+    ray_t* agg_vecs2[16] = {0};
     agg_prod_t prod[16];
     memset(prod, 0, sizeof(prod));
-    if (!sg_shape_eligible(g, op, tbl, group_limit, agg_vecs, prod))
+    if (!sg_shape_eligible(g, op, tbl, group_limit, agg_vecs, agg_vecs2, prod))
         return NULL;
     ray_op_ext_t* ext = find_ext(g, op->id);
     ray_op_ext_t* ke = find_ext(g, ext->keys[0]);
@@ -7646,14 +7788,39 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     const ray_idx_slice_t* slices = (K > 0)
         ? (const ray_idx_slice_t*)ray_data(g->sg_slices_hdr) : NULL;
 
+    bool need_sumsq = false, need_pair = false;
+    for (uint32_t a = 0; a < n_aggs; a++) {
+        uint16_t aop = ext->agg_ops[a];
+        if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
+            aop == OP_VAR || aop == OP_VAR_POP ||
+            agg_is_binary_agg(aop))
+            need_sumsq = true;
+        if (agg_is_binary_agg(aop))
+            need_pair = true;
+    }
+
     ray_t *sum_hdr = NULL, *cnt_hdr = NULL, *task_hdr = NULL, *part_hdr = NULL;
+    ray_t *sumsq_hdr = NULL, *sum_y_hdr = NULL, *sumsq_y_hdr = NULL, *sumxy_hdr = NULL;
+    ray_t *part_sumsq_hdr = NULL, *part_sum_y_hdr = NULL, *part_sumsq_y_hdr = NULL, *part_sumxy_hdr = NULL;
     da_val_t* sums = NULL;
+    double *sumsq = NULL, *sum_y = NULL, *sumsq_y = NULL, *sumxy = NULL;
     int64_t* counts = NULL;
     if (K > 0) {
         sums = (da_val_t*)scratch_calloc(&sum_hdr,
                    (size_t)K * n_aggs * sizeof(da_val_t));
         counts = (int64_t*)scratch_calloc(&cnt_hdr,
                    (size_t)K * sizeof(int64_t));
+        if (need_sumsq)
+            sumsq = (double*)scratch_calloc(&sumsq_hdr,
+                       (size_t)K * n_aggs * sizeof(double));
+        if (need_pair) {
+            sum_y = (double*)scratch_calloc(&sum_y_hdr,
+                       (size_t)K * n_aggs * sizeof(double));
+            sumsq_y = (double*)scratch_calloc(&sumsq_y_hdr,
+                       (size_t)K * n_aggs * sizeof(double));
+            sumxy = (double*)scratch_calloc(&sumxy_hdr,
+                       (size_t)K * n_aggs * sizeof(double));
+        }
         /* Chunk slices into row tasks so one dominant key still spreads
          * across the pool (see sg_task_t). */
         int64_t n_tasks = 0;
@@ -7661,16 +7828,35 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             n_tasks += (slices[i].n + SG_CHUNK_ROWS - 1) / SG_CHUNK_ROWS;
         sg_task_t* tasks = NULL;
         da_val_t* partials = NULL;
+        double *part_sumsq = NULL, *part_sum_y = NULL, *part_sumsq_y = NULL, *part_sumxy = NULL;
         if (sums && counts) {
             task_hdr = ray_alloc((size_t)n_tasks * (int64_t)sizeof(sg_task_t));
             tasks = task_hdr ? (sg_task_t*)ray_data(task_hdr) : NULL;
             partials = (da_val_t*)scratch_calloc(&part_hdr,
                            (size_t)n_tasks * n_aggs * sizeof(da_val_t));
+            if (need_sumsq)
+                part_sumsq = (double*)scratch_calloc(&part_sumsq_hdr,
+                               (size_t)n_tasks * n_aggs * sizeof(double));
+            if (need_pair) {
+                part_sum_y = (double*)scratch_calloc(&part_sum_y_hdr,
+                               (size_t)n_tasks * n_aggs * sizeof(double));
+                part_sumsq_y = (double*)scratch_calloc(&part_sumsq_y_hdr,
+                               (size_t)n_tasks * n_aggs * sizeof(double));
+                part_sumxy = (double*)scratch_calloc(&part_sumxy_hdr,
+                               (size_t)n_tasks * n_aggs * sizeof(double));
+            }
         }
-        if (!sums || !counts || !tasks || !partials) {
+        if (!sums || !counts || !tasks || !partials ||
+            (need_sumsq && (!sumsq || !part_sumsq)) ||
+            (need_pair && (!sum_y || !sumsq_y || !sumxy ||
+                           !part_sum_y || !part_sumsq_y || !part_sumxy))) {
             scratch_free(sum_hdr); scratch_free(cnt_hdr);
+            scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
+            scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
             if (task_hdr) ray_free(task_hdr);
             scratch_free(part_hdr);
+            scratch_free(part_sumsq_hdr); scratch_free(part_sum_y_hdr);
+            scratch_free(part_sumsq_y_hdr); scratch_free(part_sumxy_hdr);
             return NULL;    /* OOM → generic path via fallback */
         }
         int64_t total_rows = 0, tw = 0;
@@ -7682,8 +7868,9 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 tasks[tw].gi = i; tasks[tw].lo = lo; tasks[tw].hi = hi; tw++;
             }
         }
-        sg_ctx_t ctx = { slices, tasks, agg_vecs, prod, ext->agg_ops,
-                         n_aggs, partials, {0}, {0} };
+        sg_ctx_t ctx = { slices, tasks, agg_vecs, agg_vecs2, prod, ext->agg_ops,
+                         n_aggs, partials, part_sumsq, part_sum_y,
+                         part_sumsq_y, part_sumxy, {0}, {0} };
         /* Shared-stream pairing: a bare-scan SUM/AVG over the same column
          * a product's int side already streams rides the product loop —
          * one pass over the column instead of two. */
@@ -7723,16 +7910,25 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             for (uint32_t a = 0; a < n_aggs; a++) {
                 size_t di = (size_t)gi * n_aggs + a;
                 size_t si = (size_t)ti * n_aggs + a;
-                if (prod[a].enabled || ext->agg_ops[a] == OP_COUNT ||
+                bool pair = agg_is_binary_agg(ext->agg_ops[a]);
+                if (pair || prod[a].enabled || ext->agg_ops[a] == OP_COUNT ||
                     (agg_vecs[a] && agg_vecs[a]->type == RAY_F64))
                     sums[di].f += partials[si].f;
                 else
                     sums[di].i = (int64_t)((uint64_t)sums[di].i +
                                            (uint64_t)partials[si].i);
+                if (sumsq) sumsq[di] += part_sumsq[si];
+                if (pair) {
+                    sum_y[di] += part_sum_y[si];
+                    sumsq_y[di] += part_sumsq_y[si];
+                    sumxy[di] += part_sumxy[si];
+                }
             }
         }
         ray_free(task_hdr);
         scratch_free(part_hdr);
+        scratch_free(part_sumsq_hdr); scratch_free(part_sum_y_hdr);
+        scratch_free(part_sumsq_y_hdr); scratch_free(part_sumxy_hdr);
     }
 
     /* Emit: key column (domain ids in slice order), then the shared agg
@@ -7741,6 +7937,8 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_t* result = ray_table_new(1 + n_aggs);
     if (!result || RAY_IS_ERR(result)) {
         scratch_free(sum_hdr); scratch_free(cnt_hdr);
+        scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
+        scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
         return NULL;
     }
     ray_t* kc = col_vec_new(key_col, K > 0 ? K : 1);
@@ -7748,6 +7946,8 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (kc) ray_release(kc);
         ray_release(result);
         scratch_free(sum_hdr); scratch_free(cnt_hdr);
+        scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
+        scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
         return NULL;
     }
     if (kc->type == RAY_SYM)
@@ -7760,15 +7960,19 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_release(kc);
     if (!result || RAY_IS_ERR(result)) {
         scratch_free(sum_hdr); scratch_free(cnt_hdr);
+        scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
+        scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
         return result;
     }
 
     emit_agg_columns(&result, g, ext, agg_vecs, (uint32_t)K, n_aggs,
                      (double*)sums, (int64_t*)sums,
                      NULL, NULL, NULL, NULL,
-                     counts, NULL, prod, NULL, NULL);
+                     counts, NULL, prod, sumsq, NULL, sum_y, sumsq_y, sumxy);
 
     scratch_free(sum_hdr); scratch_free(cnt_hdr);
+    scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
+    scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
     return result;
 }
 
@@ -8208,7 +8412,8 @@ dyn_dense_done:
                     emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
                                      (double*)dense_sum, (int64_t*)dense_sum,
                                      NULL, NULL, NULL, NULL,
-                                     dense_count, agg_affine, agg_prod, NULL, NULL);
+                                     dense_count, agg_affine, agg_prod, NULL, NULL,
+                                     NULL, NULL, NULL);
 
                     scratch_free(_h_sum); scratch_free(_h_cnt);
                     scratch_free(range_sum_hdr); scratch_free(cnt_hdr);
@@ -8924,7 +9129,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                          sums_f64, sums_i64,
                                          NULL, NULL, NULL, NULL,
                                          counts, agg_affine, agg_prod,
-                                         NULL, NULL);
+                                         NULL, NULL, NULL, NULL, NULL);
                         scratch_free(sum_hdr);
                         scratch_free(cnt_hdr);
                         ray_release(base_sum_obj);
@@ -9158,7 +9363,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                          (double*)m->sum, (int64_t*)m->sum,
                          (double*)m->min_val, (double*)m->max_val,
                          (int64_t*)m->min_val, (int64_t*)m->max_val,
-                         m->count, agg_affine, agg_prod, m->sumsq_f64, m->nn_count);
+                         m->count, agg_affine, agg_prod, m->sumsq_f64, m->nn_count,
+                         NULL, NULL, NULL);
 
         /* Wide-element (STR/GUID) min/max/first/last overflow emit_agg_columns'
          * fixed-width slots (it truncated them to 1 byte above).  Recompute
@@ -9960,7 +10166,7 @@ da_path:;
                              (double*)dense_min_val, (double*)dense_max_val,
                              (int64_t*)dense_min_val, (int64_t*)dense_max_val,
                              dense_counts, agg_affine, agg_prod, dense_sumsq,
-                             dense_nn_counts);
+                             dense_nn_counts, NULL, NULL, NULL);
 
             scratch_free(_h_dsum); scratch_free(_h_dmin);
             scratch_free(_h_dmax);
@@ -10263,7 +10469,8 @@ da_path:;
                     emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
                                      (double*)dense_sum, (int64_t*)dense_sum,
                                      NULL, NULL, NULL, NULL,
-                                     dense_count, agg_affine, agg_prod, NULL, NULL);
+                                     dense_count, agg_affine, agg_prod, NULL, NULL,
+                                     NULL, NULL, NULL);
 
                     scratch_free(_h_sum);
                     scratch_free(_h_cnt);
@@ -10489,7 +10696,8 @@ da_path:;
             emit_agg_columns(&result, g, ext, agg_vecs, grp_count, n_aggs,
                              (double*)dense_sum, (int64_t*)dense_sum,
                              NULL, NULL, NULL, NULL,
-                             dense_count, agg_affine, agg_prod, NULL, NULL);
+                             dense_count, agg_affine, agg_prod, NULL, NULL,
+                             NULL, NULL, NULL);
 
             scratch_free(_h_sum);
             scratch_free(_h_cnt);

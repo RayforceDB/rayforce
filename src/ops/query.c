@@ -1847,29 +1847,34 @@ static int is_group_dag_agg_expr(ray_t* expr);  /* defined below */
  * result.  Eligibility: >=1 extractable agg; every table-column reference
  * sits inside one; agg arguments contain no nested aggs; connectives may
  * be arbitrary calls over literals/globals. */
-/* Slice-group arming gate: the exec_group slice kernel takes only
- * SUM/AVG/COUNT over a bare column or a two-column product.  Arming the
- * hint for other agg shapes is legal (exec_group folds it back into a
- * selection) but wasteful — the fold costs a sort of every surviving
- * row id.  Checked over dag-agg outputs and decomposed hidden slots. */
+/* Slice-group arming gate: keep the hint only for aggregate shapes the
+ * direct slice path can consume.  Arming other shapes is legal, but then
+ * exec_group must fold the slices back into a selection first. */
 static int sg_agg_expr_ok(ray_t* expr) {
     if (!expr || !is_list(expr) || ray_len(expr) < 2) return 0;
     ray_t** e = (ray_t**)ray_data(expr);
     if (!e[0] || e[0]->type != -RAY_SYM) return 0;
-    static int64_t s_sum = -1, s_avg = -1, s_count = -1, s_mul = -1;
-    if (s_sum < 0) {
-        s_sum = ray_sym_intern("sum", 3);
-        s_avg = ray_sym_intern("avg", 3);
-        s_count = ray_sym_intern("count", 5);
-        s_mul = ray_sym_intern("*", 1);
-    }
-    int64_t h = e[0]->i64;
-    if (h != s_sum && h != s_avg && h != s_count) return 0;
-    if (h == s_count) return 1;           /* group size; arg unused */
+    uint16_t op = resolve_agg_opcode(e[0]->i64);
+    if (!op) return 0;
+    if (op == OP_COUNT) return 1;          /* group size; arg unused */
     ray_t* arg = e[1];
-    if (arg && arg->type == -RAY_SYM && !(arg->attrs & ATTR_QUOTED)) return 1;
+    bool arg_bare = arg && arg->type == -RAY_SYM &&
+                    !(arg->attrs & ATTR_QUOTED);
+    if (agg_is_binary_agg(op)) {
+        if (ray_len(expr) < 3) return 0;
+        ray_t* arg2 = e[2];
+        return arg_bare && arg2 && arg2->type == -RAY_SYM &&
+               !(arg2->attrs & ATTR_QUOTED);
+    }
+    if (op == OP_STDDEV || op == OP_STDDEV_POP ||
+        op == OP_VAR || op == OP_VAR_POP)
+        return arg_bare;
+    if (op != OP_SUM && op != OP_AVG) return 0;
+    if (arg_bare) return 1;
     if (arg && is_list(arg) && ray_len(arg) == 3) {
         ray_t** m = (ray_t**)ray_data(arg);
+        static int64_t s_mul = -1;
+        if (s_mul < 0) s_mul = ray_sym_intern("*", 1);
         if (m[0] && m[0]->type == -RAY_SYM && m[0]->i64 == s_mul &&
             m[1] && m[1]->type == -RAY_SYM && !(m[1]->attrs & ATTR_QUOTED) &&
             m[2] && m[2]->type == -RAY_SYM && !(m[2]->attrs & ATTR_QUOTED))

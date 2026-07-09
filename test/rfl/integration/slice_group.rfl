@@ -50,6 +50,24 @@
 (min (== (at Q2S 'p) (at Q2P 'p))) -- true
 (min (== (at Q2S 'sw) (at Q2P 'sw))) -- true
 
+(set Q2BI (select {sd: (stddev f) cp: (pearson_corr f v) cs: (pearson_corr v w) cv: (cov f w) sc: (scov f w) ws: (wsum w f) wa: (wavg w f) from: TI by: s where: (in s ['aa 'cc 'ee])}))
+(set Q2BP (select {sd: (stddev f) cp: (pearson_corr f v) cs: (pearson_corr v w) cv: (cov f w) sc: (scov f w) ws: (wsum w f) wa: (wavg w f) from: TP by: s where: (in s ['aa 'cc 'ee])}))
+(min (< (abs (- (at Q2BI 'sd) (at Q2BP 'sd))) 1e-9)) -- true
+(min (< (abs (- (at Q2BI 'cp) (at Q2BP 'cp))) 1e-9)) -- true
+(min (< (abs (- (at Q2BI 'cs) (at Q2BP 'cs))) 1e-9)) -- true
+(min (< (abs (- (at Q2BI 'cv) (at Q2BP 'cv))) 1e-9)) -- true
+(min (< (abs (- (at Q2BI 'sc) (at Q2BP 'sc))) 1e-9)) -- true
+(min (< (abs (- (at Q2BI 'ws) (at Q2BP 'ws))) 1e-9)) -- true
+(min (< (abs (- (at Q2BI 'wa) (at Q2BP 'wa))) 1e-9)) -- true
+(set Q2BS (select {sd: (stddev f) cp: (pearson_corr f v) cs: (pearson_corr v w) cv: (cov f w) sc: (scov f w) ws: (wsum w f) wa: (wavg w f) from: TSI by: s where: (in s ['aa 'cc 'ee])}))
+(min (< (abs (- (at Q2BS 'sd) (at Q2BP 'sd))) 1e-9)) -- true
+(min (< (abs (- (at Q2BS 'cp) (at Q2BP 'cp))) 1e-9)) -- true
+(min (< (abs (- (at Q2BS 'cs) (at Q2BP 'cs))) 1e-9)) -- true
+(min (< (abs (- (at Q2BS 'cv) (at Q2BP 'cv))) 1e-9)) -- true
+(min (< (abs (- (at Q2BS 'sc) (at Q2BP 'sc))) 1e-9)) -- true
+(min (< (abs (- (at Q2BS 'ws) (at Q2BP 'ws))) 1e-9)) -- true
+(min (< (abs (- (at Q2BS 'wa) (at Q2BP 'wa))) 1e-9)) -- true
+
 ;; ── shared-stream pairing: sum over the product's int side (q27 shape),
 ;;    incl. arith-of-aggs decomposition wrappers ──
 (set Q3I (select {wp: (/ (sum (* w f)) (as 'F64 (sum w))) from: TI by: s where: (in s ['aa 'bb 'cc 'dd])}))
