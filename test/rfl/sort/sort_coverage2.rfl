@@ -250,6 +250,18 @@
 (at (at (xasc Txasc2 'k) 'k) 0) -- 1
 (at (at (xdesc Txasc2 'k) 'k) 0) -- 20000000
 
+;; F32 single-key sort: query projections can explicitly narrow an F64
+;; expression to F32.  Cover both the order-preserving F32 radix encoding and
+;; stable equal-key order on a table large enough to take the radix path.
+(set Tf32base (table [i v] (list (til 4097) (take [9.0 1.0 5.0 1.0 7.0] 4097))))
+(set Tf32sort (select {i: i v: (as 'F32 v) from: Tf32base}))
+(type (at Tf32sort 'v)) -- 'F32
+(at (at (xasc Tf32sort 'v) 'v) 0) -- 1.0e
+(at (at (xdesc Tf32sort 'v) 'v) 0) -- 9.0e
+(take (at (xdesc Tf32sort 'v) 'i) 3) -- [0 5 10]
+;; <=64 rows uses the stable comparison-sort path and its F32 comparator.
+(take (at (xasc (take Tf32sort 5) 'v) 'i) 2) -- [1 3]
+
 ;; ────────────────────────────────────────────────────────────────────
 ;; 11. Multi-column composite sort with small n (< SMALL_POOL_THRESHOLD=8192)
 ;;     but > RADIX_SORT_THRESHOLD=4096 — hits the else-branch

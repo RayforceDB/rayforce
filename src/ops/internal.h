@@ -804,7 +804,7 @@ static inline uint8_t radix_key_bytes(int8_t type) {
     switch (type) {
     case RAY_BOOL: case RAY_U8:   return 1;
     case RAY_I16:                return 2;
-    case RAY_I32: case RAY_DATE: case RAY_TIME: return 4;
+    case RAY_I32: case RAY_F32: case RAY_DATE: case RAY_TIME: return 4;
     default:                    return 8;  /* I64, F64, TIMESTAMP, SYM */
     }
 }

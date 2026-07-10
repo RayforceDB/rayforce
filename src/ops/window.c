@@ -45,6 +45,12 @@ static inline bool win_keys_differ(ray_t* const* vecs, uint32_t n_keys,
             if (a != b) return true;
             break;
         }
+        case RAY_F32: {
+            float a = ((const float*)ray_data(col))[ra];
+            float b = ((const float*)ray_data(col))[rb];
+            if (a != b) return true;
+            break;
+        }
         case RAY_I32: case RAY_DATE: case RAY_TIME:
             if (((const int32_t*)ray_data(col))[ra] !=
                 ((const int32_t*)ray_data(col))[rb]) return true;
@@ -89,6 +95,7 @@ static inline bool win_keys_differ(ray_t* const* vecs, uint32_t n_keys,
 static inline double win_read_f64(ray_t* col, int64_t row) {
     switch (col->type) {
     case RAY_F64: return ((const double*)ray_data(col))[row];
+    case RAY_F32: return (double)((const float*)ray_data(col))[row];
     case RAY_I64: case RAY_TIMESTAMP:
         return (double)((const int64_t*)ray_data(col))[row];
     case RAY_I32: case RAY_DATE: case RAY_TIME:
@@ -110,6 +117,7 @@ static inline int64_t win_read_i64(ray_t* col, int64_t row) {
     case RAY_SYM:
         return sym_cell_runtime_id(col, row);
     case RAY_F64: return (int64_t)((const double*)ray_data(col))[row];
+    case RAY_F32: return (int64_t)((const float*)ray_data(col))[row];
     case RAY_I16: return (int64_t)((const int16_t*)ray_data(col))[row];
     case RAY_BOOL: case RAY_U8: return (int64_t)((const uint8_t*)ray_data(col))[row];
     default: return 0;
@@ -1346,7 +1354,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                    kind == RAY_WIN_MAX || kind == RAY_WIN_LAG ||
                    kind == RAY_WIN_LEAD || kind == RAY_WIN_FIRST_VALUE ||
                    kind == RAY_WIN_LAST_VALUE || kind == RAY_WIN_NTH_VALUE) {
-            out_f64 = fvec && fvec->type == RAY_F64;
+            out_f64 = fvec && (fvec->type == RAY_F64 || fvec->type == RAY_F32);
         }
 
         is_f64[f] = out_f64;

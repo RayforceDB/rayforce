@@ -55,6 +55,11 @@ int sort_cmp(const sort_cmp_ctx_t* ctx, int64_t a, int64_t b) {
             double vb = ((double*)ray_data(col))[b];
             if (va < vb) cmp = -1;
             else if (va > vb) cmp = 1;
+        } else if (col->type == RAY_F32) {
+            float va = ((float*)ray_data(col))[a];
+            float vb = ((float*)ray_data(col))[b];
+            if (va < vb) cmp = -1;
+            else if (va > vb) cmp = 1;
         } else if (col->type == RAY_I64 || col->type == RAY_TIMESTAMP) {
             int64_t va = ((int64_t*)ray_data(col))[a];
             int64_t vb = ((int64_t*)ray_data(col))[b];
@@ -994,6 +999,26 @@ void radix_encode_fn(void* arg, uint32_t wid, int64_t start, int64_t end) {
                     uint64_t e = bits ^ mask;
                     c->keys[i] = desc ? ~e : e;
                 }
+            }
+            break;
+        }
+        case RAY_F32: {
+            const float* d = (const float*)c->data;
+            bool nf   = c->nulls_first;
+            bool desc = c->desc;
+            uint32_t nan_e = (nf ^ desc) ? 0U : UINT32_MAX;
+            for (int64_t i = start; i < end; i++) {
+                uint32_t bits;
+                memcpy(&bits, &d[i], 4);
+                uint32_t e;
+                if ((bits & 0x7F800000U) == 0x7F800000U &&
+                    (bits & 0x007FFFFFU)) {
+                    e = nan_e;
+                } else {
+                    uint32_t mask = -(bits >> 31) | ((uint32_t)1 << 31);
+                    e = bits ^ mask;
+                }
+                c->keys[i] = desc ? (uint64_t)(~e) : (uint64_t)e;
             }
             break;
         }
@@ -2215,6 +2240,15 @@ static void radix_decode_into(void* dst, int8_t type, const uint64_t* sorted_key
             uint64_t bits = k ^ mask;
             memcpy(&d[i], &bits, 8);
         }
+    } else if (type == RAY_F32) {
+        float* d = (float*)dst;
+        for (int64_t i = 0; i < n; i++) {
+            uint32_t k = (uint32_t)sorted_keys[i];
+            if (desc) k = ~k;
+            uint32_t mask = (k >> 31) ? ((uint32_t)1 << 31) : ~(uint32_t)0;
+            uint32_t bits = k ^ mask;
+            memcpy(&d[i], &bits, 4);
+        }
     } else if (type == RAY_I32 || type == RAY_DATE || type == RAY_TIME) {
         int32_t* d = (int32_t*)dst;
         if (desc)
@@ -2308,7 +2342,9 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
             if (!cols[k]) { can_radix = false; break; }
             int8_t t = cols[k]->type;
             if (t == RAY_STR || t == RAY_GUID) { has_wide_key = true; continue; }
-            if (t != RAY_I64 && t != RAY_F64 && t != RAY_I32 && t != RAY_I16 &&
+            if (t == RAY_F32 && n_cols != 1) { can_radix = false; break; }
+            if (t != RAY_I64 && t != RAY_F64 && t != RAY_F32 &&
+                t != RAY_I32 && t != RAY_I16 &&
                 t != RAY_BOOL && t != RAY_U8 && t != RAY_SYM &&
                 t != RAY_DATE && t != RAY_TIME && t != RAY_TIMESTAMP) {
                 can_radix = false; break;
@@ -3113,7 +3149,8 @@ static ray_t* topk_indices_single(ray_t* col, uint8_t desc, uint8_t nf,
     int8_t type = col->type;
     /* Whitelist of types where radix_encode_fn produces an order-preserving
      * uint64 — exactly the cases topk can handle without a comparator. */
-    bool ok = (type == RAY_I64 || type == RAY_TIMESTAMP || type == RAY_F64 ||
+    bool ok = (type == RAY_I64 || type == RAY_TIMESTAMP ||
+               type == RAY_F64 || type == RAY_F32 ||
                type == RAY_I32 || type == RAY_DATE || type == RAY_TIME ||
                type == RAY_SYM || type == RAY_STR || type == RAY_GUID ||
                type == RAY_I16 || type == RAY_BOOL || type == RAY_U8);

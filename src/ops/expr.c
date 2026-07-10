@@ -2381,7 +2381,42 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     int64_t out_off = 0;
     uint16_t opc = op->opcode;
 
-    if (in_type == RAY_F32 && out_type == RAY_F32) {
+    if (opc == OP_CAST && out_type == RAY_F32) {
+        /* The query compiler admits `(as 'F32 expr)` for every numeric input.
+         * Keep that surface complete in the typed fallback.  Null propagation
+         * below rewrites source sentinels to NULL_F32 after conversion. */
+        if (in_type != RAY_F64 && in_type != RAY_F32 &&
+            in_type != RAY_I64 && in_type != RAY_TIMESTAMP &&
+            in_type != RAY_I32 && in_type != RAY_DATE && in_type != RAY_TIME &&
+            in_type != RAY_I16 && in_type != RAY_U8 && in_type != RAY_BOOL) {
+            ray_release(result);
+            return ray_error("type", "cast: cannot convert %s to F32",
+                             ray_type_name(in_type));
+        }
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            float* dst = (float*)ray_data(result) + out_off;
+            if (in_type == RAY_F64) {
+                const double* src = (const double*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = (float)src[i];
+            } else if (in_type == RAY_F32) {
+                memcpy(dst, m.morsel_ptr, (size_t)n * sizeof(float));
+            } else if (in_type == RAY_I64 || in_type == RAY_TIMESTAMP) {
+                const int64_t* src = (const int64_t*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = (float)src[i];
+            } else if (in_type == RAY_I32 || in_type == RAY_DATE || in_type == RAY_TIME) {
+                const int32_t* src = (const int32_t*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = (float)src[i];
+            } else if (in_type == RAY_I16) {
+                const int16_t* src = (const int16_t*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = (float)src[i];
+            } else {
+                const uint8_t* src = (const uint8_t*)m.morsel_ptr;
+                for (int64_t i = 0; i < n; i++) dst[i] = (float)src[i];
+            }
+            out_off += n;
+        }
+    } else if (in_type == RAY_F32 && out_type == RAY_F32) {
         while (ray_morsel_next(&m)) {
             int64_t n = m.morsel_len;
             float* src = (float*)m.morsel_ptr;

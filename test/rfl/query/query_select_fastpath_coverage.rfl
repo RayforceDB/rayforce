@@ -316,6 +316,15 @@
 (set Tint5 (table [v] (list [1 2 3 4 5])))
 (at (at (select {f: (as 'F64 v) from: Tint5}) 'f) 0) -- 1.0
 
+;; Explicit F64 -> F32 projection cast uses the typed executor fallback.
+;; It must round the expression result, not return an uninitialised vector.
+(set Tf32proj (select {f: (as 'F32 (/ (+ v 0.3) 2.0)) from: Tint5}))
+(type (at Tf32proj 'f)) -- 'F32
+(at (at Tf32proj 'f) 0) -- 0.65e
+(at (at (select {f: (as 'F32 v) from: Tint5}) 'f) 4) -- 5.0e
+(set Tf32i32 (table [v] (list (as 'I32 [7 8]))))
+(at (at (select {f: (as 'F32 v) from: Tf32i32}) 'f) 1) -- 8.0e
+
 ;; as cast I64→I32 in DAG
 (at (at (select {i: (as 'I32 v) from: Tint5}) 'i) 0) -- 1i
 
