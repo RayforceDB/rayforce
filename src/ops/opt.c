@@ -79,6 +79,8 @@ bool ray_opt_no_group_pushdown = false;
 static int8_t promote_type(int8_t a, int8_t b) {
     if (a == RAY_STR || b == RAY_STR) return RAY_STR;
     if (a == RAY_F64 || b == RAY_F64) return RAY_F64;
+    if (a == RAY_F32 || b == RAY_F32)
+        return (a == RAY_F32 && b == RAY_F32) ? RAY_F32 : RAY_F64;
     /* Treat SYM/TIMESTAMP/DATE/TIME as integer-class types */
     if (a == RAY_I64 || b == RAY_I64 || a == RAY_SYM || b == RAY_SYM ||
         a == RAY_TIMESTAMP || b == RAY_TIMESTAMP) return RAY_I64;
@@ -293,6 +295,11 @@ static bool atom_to_numeric(ray_t* v, double* out_f, int64_t* out_i, bool* is_f6
             *out_i = (int64_t)v->f64;
             *is_f64 = true;
             return true;
+        case -RAY_F32:
+            *out_f = (double)(float)v->f64;
+            *out_i = (int64_t)(float)v->f64;
+            *is_f64 = true;
+            return true;
         case -RAY_I64:
         case -RAY_SYM:
         case -RAY_DATE:
@@ -327,7 +334,8 @@ static bool pow_atom_type_admitted(ray_t* v) {
     if (!v || !ray_is_atom(v)) return false;
     return v->type == -RAY_BOOL || v->type == -RAY_U8 ||
            v->type == -RAY_I16 || v->type == -RAY_I32 ||
-           v->type == -RAY_I64 || v->type == -RAY_F64;
+           v->type == -RAY_I64 || v->type == -RAY_F32 ||
+           v->type == -RAY_F64;
 }
 
 static bool replace_with_const(ray_graph_t* g, ray_op_t* node, ray_t* literal) {
@@ -367,12 +375,15 @@ static bool fold_unary_const(ray_graph_t* g, ray_op_t* node) {
     ray_t* folded = NULL;
     switch (node->opcode) {
         case OP_NEG:
-            if (is_f64) folded = ray_f64(-vf);
+            if (node->out_type == RAY_F32) folded = ray_f32((float)-vf);
+            else if (is_f64) folded = ray_f64(-vf);
             else if (vi == INT64_MIN) return false;  /* -INT64_MIN overflows */
             else folded = ray_i64(-vi);
             break;
         case OP_ABS:
-            if (is_f64)
+            if (node->out_type == RAY_F32)
+                folded = ray_f32(fabsf((float)vf));
+            else if (is_f64)
                 folded = ray_f64(fabs(vf));
             else if (vi == INT64_MIN) return false;  /* -INT64_MIN overflows */
             else folded = ray_i64(vi < 0 ? -vi : vi);
@@ -418,10 +429,12 @@ static bool fold_unary_const(ray_graph_t* g, ray_op_t* node) {
             break;
         }
         case OP_CEIL:
-            folded = is_f64 ? ray_f64(ceil(vf)) : ray_i64(vi);
+            folded = node->out_type == RAY_F32 ? ray_f32(ceilf((float)vf))
+                   : is_f64 ? ray_f64(ceil(vf)) : ray_i64(vi);
             break;
         case OP_FLOOR:
-            folded = is_f64 ? ray_f64(floor(vf)) : ray_i64(vi);
+            folded = node->out_type == RAY_F32 ? ray_f32(floorf((float)vf))
+                   : is_f64 ? ray_f64(floor(vf)) : ray_i64(vi);
             break;
         default:
             return false;
@@ -453,6 +466,28 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
 
     ray_t* folded = NULL;
     switch (node->out_type) {
+        case RAY_F32: {
+            float lv = (float)(l_is_f64 ? lf : (double)li);
+            float rv = (float)(r_is_f64 ? rf : (double)ri);
+            float r = 0.0f;
+            switch (node->opcode) {
+                case OP_ADD: r = lv + rv; break;
+                case OP_SUB: r = lv - rv; break;
+                case OP_MUL: r = lv * rv; break;
+                case OP_MOD:
+                    if (rv == 0.0f) r = NULL_F32;
+                    else {
+                        r = fmodf(lv, rv);
+                        if (r != 0.0f && ((r > 0.0f) != (rv > 0.0f))) r += rv;
+                    }
+                    break;
+                case OP_MIN2: r = lv < rv ? lv : rv; break;
+                case OP_MAX2: r = lv > rv ? lv : rv; break;
+                default: return false;
+            }
+            folded = ray_f32(isfinite(r) ? r : NULL_F32);
+            break;
+        }
         case RAY_F64: {
             double lv = l_is_f64 ? lf : (double)li;
             double rv = r_is_f64 ? rf : (double)ri;

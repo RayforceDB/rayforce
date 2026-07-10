@@ -138,6 +138,10 @@ static inline int is_float_op(ray_t* a, ray_t* b) {
            a->type == -RAY_F32 || b->type == -RAY_F32;
 }
 
+static inline int both_f32_atoms(ray_t* a, ray_t* b) {
+    return a->type == -RAY_F32 && b->type == -RAY_F32;
+}
+
 /* ══════════════════════════════════════════
  * Null/type helpers
  * ══════════════════════════════════════════ */
@@ -148,6 +152,8 @@ static inline int is_float_op(ray_t* a, ray_t* b) {
 static inline ray_t* null_for_promoted(ray_t* a, ray_t* b) {
     if (a->type == -RAY_F64 || b->type == -RAY_F64)
         return ray_typed_null(-RAY_F64);
+    if (a->type == -RAY_F32 || b->type == -RAY_F32)
+        return ray_typed_null(both_f32_atoms(a, b) ? -RAY_F32 : -RAY_F64);
     if (a->type == -RAY_I64 || b->type == -RAY_I64)
         return ray_typed_null(-RAY_I64);
     if (a->type == -RAY_I32 || b->type == -RAY_I32)

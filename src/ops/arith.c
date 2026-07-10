@@ -32,7 +32,7 @@ typedef ray_op_t* (*arith_unary_ctor)(ray_graph_t*, ray_op_t*);
 static bool arith_numeric_vec_type(int8_t t) {
     if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
-           t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
 }
 
 static ray_t* arith_unary_dag_vec(ray_t* x, arith_unary_ctor ctor) {
@@ -74,7 +74,8 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
     /* Vector fast path — only when at least one operand is a typed vector */
 
     /* Temporal + integer arithmetic (only int types, not float) */
-    if (is_temporal(a) && is_numeric(b) && b->type != -RAY_F64) {
+    if (is_temporal(a) && is_numeric(b) &&
+        b->type != -RAY_F64 && b->type != -RAY_F32) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
             return ray_typed_null(a->type);
 
@@ -83,7 +84,8 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
         if (a->type == -RAY_TIME)      return ray_time(a->i64 + v);
         if (a->type == -RAY_TIMESTAMP) return ray_timestamp(a->i64 + v);
     }
-    if (is_numeric(a) && a->type != -RAY_F64 && is_temporal(b)) {
+    if (is_numeric(a) && a->type != -RAY_F64 &&
+        a->type != -RAY_F32 && is_temporal(b)) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
             return ray_typed_null(b->type);
 
@@ -93,7 +95,8 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
         if (b->type == -RAY_TIMESTAMP) return ray_timestamp(b->i64 + v);
     }
     /* Reject float + temporal */
-    if ((a->type == -RAY_F64 && is_temporal(b)) || (is_temporal(a) && b->type == -RAY_F64))
+    if (((a->type == -RAY_F64 || a->type == -RAY_F32) && is_temporal(b)) ||
+        (is_temporal(a) && (b->type == -RAY_F64 || b->type == -RAY_F32)))
         return ray_error("type", "add: temporal arithmetic requires integer offsets, got %s and %s",
                          ray_type_name(a->type), ray_type_name(b->type));
     /* Reject null_numeric + temporal (for null floats etc) */
@@ -132,6 +135,7 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
                          ray_type_name(a->type), ray_type_name(b->type));
     /* Null propagation */
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) return null_for_promoted(a, b);
+    if (both_f32_atoms(a, b)) return ray_f32((float)(as_f64(a) + as_f64(b)));
     if (is_float_op(a, b)) return make_f64(as_f64(a) + as_f64(b));
     int8_t rt = promote_int_type(a, b);
     return make_typed_int(rt, as_i64(a) + as_i64(b));
@@ -204,6 +208,7 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
     if (is_float_op(a, b)) {
         double r = as_f64(a) - as_f64(b);
         if (r == 0.0) r = 0.0; /* normalize -0.0 to +0.0 */
+        if (both_f32_atoms(a, b)) return ray_f32((float)r);
         return make_f64(r);
     }
     int8_t rt = promote_int_type_right(a, b);
@@ -233,6 +238,7 @@ ray_t* ray_mul_fn(ray_t* a, ray_t* b) {
                          ray_type_name(a->type), ray_type_name(b->type));
     /* Null propagation */
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) return null_for_promoted(a, b);
+    if (both_f32_atoms(a, b)) return ray_f32((float)(as_f64(a) * as_f64(b)));
     if (is_float_op(a, b)) return make_f64(as_f64(a) * as_f64(b));
     int8_t rt = promote_int_type(a, b);
     return make_typed_int(rt, as_i64(a) * as_i64(b));
@@ -275,8 +281,8 @@ ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
             return ray_typed_null(a->type);
         int64_t bv;
-        if (b->type == -RAY_F64) {
-            double bvf = b->f64;
+        if (b->type == -RAY_F64 || b->type == -RAY_F32) {
+            double bvf = as_f64(b);
             if (bvf == 0.0)
                 return ray_typed_null(a->type);
             bv = (int64_t)bvf;
@@ -310,21 +316,21 @@ ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
 
     /* Null propagation and division by zero: null type follows RIGHT operand */
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b)) {
-        int8_t rt = (b->type == -RAY_F64 || a->type == -RAY_F64) ? -RAY_F64 : b->type;
-        return ray_typed_null(rt);
+        return null_for_promoted(a, b);
     }
 
     /* Float modulo: result = a - b * floor(a/b), type follows RIGHT or f64 */
     if (is_float_op(a, b)) {
         double av = as_f64(a), bv = as_f64(b);
         if (bv == 0.0) {
-            int8_t rt = (b->type == -RAY_F64 || a->type == -RAY_F64) ? -RAY_F64 : b->type;
-            return ray_typed_null(rt);
+            return null_for_promoted(a, b);
         }
         double result = av - bv * floor(av / bv);
         /* Snap tiny residual to 0 */
         if (fabs(result) < 1e-12 || fabs(result - fabs(bv)) < 1e-12) result = bv > 0 ? 0.0 : -0.0;
-        if (b->type == -RAY_F64 || a->type == -RAY_F64) return make_f64(result);
+        if (both_f32_atoms(a, b)) return ray_f32((float)result);
+        if (b->type == -RAY_F64 || a->type == -RAY_F64 ||
+            b->type == -RAY_F32 || a->type == -RAY_F32) return make_f64(result);
         if (b->type == -RAY_I32) return make_i32((int32_t)(int64_t)result);
         if (b->type == -RAY_I16) return make_i16((int16_t)(int64_t)result);
         return make_i64((int64_t)result);
@@ -348,6 +354,7 @@ ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
 ray_t* ray_neg_fn(ray_t* x) {
     if (RAY_ATOM_IS_NULL(x)) { ray_retain(x); return x; }
     if (x->type == -RAY_F64) return make_f64(-x->f64);
+    if (x->type == -RAY_F32) return ray_f32((float)-x->f64);
     /* INT_MIN is the lone overflow case for signed negation: -INT_MIN
      * doesn't fit in the same width.  By convention, surface this
      * as a typed null of the same width — preserving type, avoiding UB,
@@ -370,8 +377,12 @@ ray_t* ray_neg_fn(ray_t* x) {
 
 /* round: round to nearest integer (ties go away from zero), returns f64 */
 ray_t* ray_round_fn(ray_t* x) {
-    if (RAY_ATOM_IS_NULL(x)) return ray_typed_null(-RAY_F64);
+    if (RAY_ATOM_IS_NULL(x)) {
+        if (x->type == -RAY_F32) return ray_typed_null(-RAY_F32);
+        return ray_typed_null(-RAY_F64);
+    }
     if (x->type == -RAY_F64) return make_f64(round(x->f64));
+    if (x->type == -RAY_F32) return ray_f32(roundf((float)x->f64));
     if (is_numeric(x)) return make_f64(round(as_f64(x)));
     return ray_error("type", "round: expects a numeric argument, got %s", ray_type_name(x->type));
 }
@@ -380,6 +391,7 @@ ray_t* ray_round_fn(ray_t* x) {
 ray_t* ray_floor_fn(ray_t* x) {
     if (RAY_ATOM_IS_NULL(x)) { ray_retain(x); return x; }
     if (x->type == -RAY_F64) return make_f64(floor(x->f64));
+    if (x->type == -RAY_F32) return ray_f32(floorf((float)x->f64));
     if (is_numeric(x)) { ray_retain(x); return x; }
     return ray_error("type", "floor: expects a numeric argument, got %s", ray_type_name(x->type));
 }
@@ -388,6 +400,7 @@ ray_t* ray_floor_fn(ray_t* x) {
 ray_t* ray_ceil_fn(ray_t* x) {
     if (RAY_ATOM_IS_NULL(x)) { ray_retain(x); return x; }
     if (x->type == -RAY_F64) return make_f64(ceil(x->f64));
+    if (x->type == -RAY_F32) return ray_f32(ceilf((float)x->f64));
     if (is_numeric(x)) { ray_retain(x); return x; }
     return ray_error("type", "ceil: expects a numeric argument, got %s", ray_type_name(x->type));
 }
@@ -399,6 +412,7 @@ ray_t* ray_ceil_fn(ray_t* x) {
 ray_t* ray_abs_fn(ray_t* x) {
     if (RAY_ATOM_IS_NULL(x)) { ray_retain(x); return x; }
     if (x->type == -RAY_F64) return make_f64(fabs(x->f64));
+    if (x->type == -RAY_F32) return ray_f32(fabsf((float)x->f64));
     if (x->type == -RAY_I64) {
         if (RAY_UNLIKELY(x->i64 == INT64_MIN)) return ray_typed_null(-RAY_I64);
         return make_i64(x->i64 < 0 ? -x->i64 : x->i64);

@@ -1319,7 +1319,7 @@ static ray_t* make_part_sym_table(void) {
         ray_sym_intern("part_m", 6),
         ray_sym_intern("part_b", 6)
     };
-    int64_t ends[] = {700, 2000, 2900, 4096};
+    int64_t ends[] = {500, 2800, 3400, 4096};
     ray_t* syms = ray_sym_vec_new(RAY_SYM_W64, n);
     ray_t* vals = ray_vec_new(RAY_I64, n);
     if (!syms || !vals || RAY_IS_ERR(syms) || RAY_IS_ERR(vals)) {
@@ -1411,7 +1411,7 @@ static test_result_t test_in_hash(void) {
 }
 
 /* A part index should keep dense unions as physical spans.  The chosen
- * blocks select 2496/4096 rows, which deliberately exceeds the hash route's
+ * blocks select 2996/4096 rows, which deliberately exceeds the hash route's
  * density guard, and exercise both full and partial morsels. */
 static test_result_t test_in_part_sym_dense(void) {
     ray_heap_init();
@@ -1424,7 +1424,7 @@ static test_result_t test_in_part_sym_dense(void) {
     uint64_t hits_before = ray_idx_hits[IDX_SITE_IN];
     ray_t* ra = run_filter(tbl_a, pred_in_part_syms);
     TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
-    TEST_ASSERT_EQ_I(ray_table_nrows(ra), 2496);
+    TEST_ASSERT_EQ_I(ray_table_nrows(ra), 2996);
     TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_IN] - cons_before), 1);
     TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_IN] - hits_before), 1);
 
@@ -1432,7 +1432,7 @@ static test_result_t test_in_part_sym_dense(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
     ray_t* rb = run_filter(tbl_b, pred_in_part_syms);
     TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
-    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 2496);
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 2996);
     TEST_ASSERT(v_cols_equal(ra, rb),
                 "v column mismatch between parted IN and scan");
 
@@ -1443,8 +1443,8 @@ static test_result_t test_in_part_sym_dense(void) {
     PASS();
 }
 
-/* Equality on a dense part must use its physical span directly rather than
- * tripping the hash route's density guard.  part_a occupies rows [700,2000). */
+/* Equality on a part larger than half the table must still use its physical
+ * span directly.  part_a occupies rows [500,2800). */
 static test_result_t test_eq_part_sym_dense(void) {
     ray_heap_init();
     ray_t* tbl_a = make_part_sym_table();
@@ -1456,7 +1456,7 @@ static test_result_t test_eq_part_sym_dense(void) {
     uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_PART];
     ray_t* ra = run_filter(tbl_a, pred_eq_part_a);
     TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
-    TEST_ASSERT_EQ_I(ray_table_nrows(ra), 1300);
+    TEST_ASSERT_EQ_I(ray_table_nrows(ra), 2300);
     TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_PART] - cons_before), 1);
     TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_PART] - hits_before), 1);
 
@@ -1464,7 +1464,7 @@ static test_result_t test_eq_part_sym_dense(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
     ray_t* rb = run_filter(tbl_b, pred_eq_part_a);
     TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
-    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 1300);
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 2300);
     TEST_ASSERT(v_cols_equal(ra, rb),
                 "v column mismatch between parted EQ and scan");
 

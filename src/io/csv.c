@@ -1037,6 +1037,7 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                         case CSV_TYPE_I16:  ((int16_t*)ctx->col_data[c])[row] = NULL_I16; break;
                         case CSV_TYPE_I32:  ((int32_t*)ctx->col_data[c])[row] = NULL_I32; break;
                         case CSV_TYPE_I64:  ((int64_t*)ctx->col_data[c])[row] = NULL_I64; break;
+                        case CSV_TYPE_F32:  ((float*)ctx->col_data[c])[row] = NULL_F32; break;
                         case CSV_TYPE_F64:  ((double*)ctx->col_data[c])[row] = NULL_F64; break;
                         case CSV_TYPE_DATE: ((int32_t*)ctx->col_data[c])[row] = NULL_I32; break;
                         case CSV_TYPE_TIME: ((int32_t*)ctx->col_data[c])[row] = NULL_I32; break;
@@ -1111,6 +1112,13 @@ static void csv_parse_fn(void* arg, uint32_t worker_id,
                     bool is_null;
                     double v = fast_f64(fld, flen, &is_null);
                     ((double*)ctx->col_data[c])[row] = is_null ? NULL_F64 : v;
+                    if (is_null) my_had_null[c] = true;
+                    break;
+                }
+                case CSV_TYPE_F32: {
+                    bool is_null;
+                    double v = fast_f64(fld, flen, &is_null);
+                    ((float*)ctx->col_data[c])[row] = is_null ? NULL_F32 : (float)v;
                     if (is_null) my_had_null[c] = true;
                     break;
                 }
@@ -1206,6 +1214,7 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
                         case CSV_TYPE_I16:  ((int16_t*)col_data[c])[row] = NULL_I16; break;
                         case CSV_TYPE_I32:  ((int32_t*)col_data[c])[row] = NULL_I32; break;
                         case CSV_TYPE_I64:  ((int64_t*)col_data[c])[row] = NULL_I64; break;
+                        case CSV_TYPE_F32:  ((float*)col_data[c])[row] = NULL_F32; break;
                         case CSV_TYPE_F64:  ((double*)col_data[c])[row] = NULL_F64; break;
                         case CSV_TYPE_DATE: ((int32_t*)col_data[c])[row] = NULL_I32; break;
                         case CSV_TYPE_TIME: ((int32_t*)col_data[c])[row] = NULL_I32; break;
@@ -1278,6 +1287,13 @@ static void csv_parse_serial(const char* buf, size_t buf_size,
                     bool is_null;
                     double v = fast_f64(fld, flen, &is_null);
                     ((double*)col_data[c])[row] = is_null ? NULL_F64 : v;
+                    if (is_null) col_had_null[c] = true;
+                    break;
+                }
+                case CSV_TYPE_F32: {
+                    bool is_null;
+                    double v = fast_f64(fld, flen, &is_null);
+                    ((float*)col_data[c])[row] = is_null ? NULL_F32 : (float)v;
                     if (is_null) col_had_null[c] = true;
                     break;
                 }
@@ -1629,6 +1645,7 @@ static ray_t* csv_materialize_rows(const char* buf, size_t file_size,
             case RAY_I16:       parse_types[c] = CSV_TYPE_I16;       break;
             case RAY_I32:       parse_types[c] = CSV_TYPE_I32;       break;
             case RAY_I64:       parse_types[c] = CSV_TYPE_I64;       break;
+            case RAY_F32:       parse_types[c] = CSV_TYPE_F32;       break;
             case RAY_F64:       parse_types[c] = CSV_TYPE_F64;       break;
             case RAY_DATE:      parse_types[c] = CSV_TYPE_DATE;      break;
             case RAY_TIME:      parse_types[c] = CSV_TYPE_TIME;      break;
@@ -2037,6 +2054,7 @@ ray_t* ray_read_csv_named_opts(const char* path, char delimiter, bool header,
             case RAY_I16:       parse_types[c] = CSV_TYPE_I16;       break;
             case RAY_I32:       parse_types[c] = CSV_TYPE_I32;       break;
             case RAY_I64:       parse_types[c] = CSV_TYPE_I64;       break;
+            case RAY_F32:       parse_types[c] = CSV_TYPE_F32;       break;
             case RAY_F64:       parse_types[c] = CSV_TYPE_F64;       break;
             case RAY_DATE:      parse_types[c] = CSV_TYPE_DATE;      break;
             case RAY_TIME:      parse_types[c] = CSV_TYPE_TIME;      break;

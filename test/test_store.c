@@ -141,6 +141,43 @@ static test_result_t test_col_mmap_f64(void) {
     PASS();
 }
 
+/* ---- test_col_mmap_f32 ------------------------------------------------- */
+
+static test_result_t test_col_mmap_f32(void) {
+    float raw[] = {1.25f, -2.5f, 3.75f, 0.0f};
+    ray_t* vec = ray_vec_from_raw(RAY_F32, raw, 4);
+    TEST_ASSERT_NOT_NULL(vec);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vec));
+
+    ray_err_t err = ray_col_save(vec, TMP_COL_PATH);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    ray_t* loaded = ray_col_load(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(loaded);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(loaded->type, RAY_F32);
+    TEST_ASSERT_EQ_I(loaded->len, 4);
+    float* loaded_data = (float*)ray_data(loaded);
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT(loaded_data[i] == raw[i], "f32 load value mismatch");
+    ray_release(loaded);
+
+    ray_t* mapped = ray_col_mmap(TMP_COL_PATH);
+    TEST_ASSERT_NOT_NULL(mapped);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mapped));
+    TEST_ASSERT_EQ_U(mapped->mmod, 1);
+    TEST_ASSERT_EQ_I(mapped->type, RAY_F32);
+    TEST_ASSERT_EQ_I(mapped->len, 4);
+    float* mapped_data = (float*)ray_data(mapped);
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT(mapped_data[i] == raw[i], "f32 mmap value mismatch");
+
+    ray_release(mapped);
+    ray_release(vec);
+    unlink(TMP_COL_PATH);
+    PASS();
+}
+
 /* ---- test_col_mmap_cow ------------------------------------------------- */
 
 static test_result_t test_col_mmap_cow(void) {
@@ -4909,6 +4946,7 @@ static test_result_t test_col_save_nyi_type(void) {
 const test_entry_t store_entries[] = {
     { "store/col_mmap_i64", test_col_mmap_i64, store_setup, store_teardown },
     { "store/col_mmap_f64", test_col_mmap_f64, store_setup, store_teardown },
+    { "store/col_mmap_f32", test_col_mmap_f32, store_setup, store_teardown },
     { "store/col_mmap_cow", test_col_mmap_cow, store_setup, store_teardown },
     { "store/col_mmap_refcount", test_col_mmap_refcount, store_setup, store_teardown },
     { "store/col_mmap_corrupt", test_col_mmap_corrupt, store_setup, store_teardown },

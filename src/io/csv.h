@@ -47,6 +47,7 @@ typedef enum {
     CSV_TYPE_U8,
     CSV_TYPE_I16,
     CSV_TYPE_I32,
+    CSV_TYPE_F32,
     /* Marker for "pick the narrowest integer width automatically" — used only
      * during schema processing, never returned by the resolver. */
     CSV_TYPE_AUTO

@@ -93,7 +93,7 @@ static void nth_element_dbl(double* a, int64_t lo, int64_t hi, int64_t k) {
 
 static int agg_parted_numeric_base(int8_t t) {
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
-           t == RAY_I32 || t == RAY_I64 || t == RAY_F64 ||
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64 ||
            t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
 }
 
@@ -130,15 +130,17 @@ static ray_t* agg_parted_sum(ray_t* x) {
     if (!agg_parted_numeric_base(base) || base == RAY_DATE)
         return ray_error("type", "sum expects a numeric or time-duration parted column, got %s", ray_type_name(base));
     ray_t** segs = (ray_t**)ray_data(x);
-    if (base == RAY_F64) {
+    if (base == RAY_F64 || base == RAY_F32) {
         double sum = 0.0;
         for (int64_t s = 0; s < x->len; s++) {
             ray_t* seg = segs[s];
             if (!seg) continue;
-            double* d = (double*)ray_data(seg);
             int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
             for (int64_t i = 0; i < seg->len; i++)
-                if (!has_nulls || !ray_vec_is_null(seg, i)) sum += d[i];
+                if (!has_nulls || !ray_vec_is_null(seg, i)) {
+                    if (base == RAY_F64) sum += ((double*)ray_data(seg))[i];
+                    else sum += (double)((float*)ray_data(seg))[i];
+                }
         }
         return make_f64(sum);
     }
@@ -165,11 +167,12 @@ static ray_t* agg_parted_avg(ray_t* x) {
         ray_t* seg = segs[s];
         if (!seg) continue;
         int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
-        if (base == RAY_F64) {
-            double* d = (double*)ray_data(seg);
+        if (base == RAY_F64 || base == RAY_F32) {
             for (int64_t i = 0; i < seg->len; i++) {
                 if (has_nulls && ray_vec_is_null(seg, i)) continue;
-                sum += d[i]; cnt++;
+                if (base == RAY_F64) sum += ((double*)ray_data(seg))[i];
+                else sum += (double)((float*)ray_data(seg))[i];
+                cnt++;
             }
         } else {
             for (int64_t i = 0; i < seg->len; i++) {
@@ -189,16 +192,16 @@ static ray_t* agg_parted_prod(ray_t* x) {
         return ray_error("type", "prod expects a numeric parted column, got %s", ray_type_name(base));
     }
     ray_t** segs = (ray_t**)ray_data(x);
-    if (base == RAY_F64) {
+    if (base == RAY_F64 || base == RAY_F32) {
         double prod = 1.0;
         for (int64_t s = 0; s < x->len; s++) {
             ray_t* seg = segs[s];
             if (!seg) continue;
-            double* d = (double*)ray_data(seg);
             int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
             for (int64_t i = 0; i < seg->len; i++) {
                 if (has_nulls && ray_vec_is_null(seg, i)) continue;
-                prod *= d[i];
+                if (base == RAY_F64) prod *= ((double*)ray_data(seg))[i];
+                else prod *= (double)((float*)ray_data(seg))[i];
             }
         }
         return make_f64(prod);
@@ -228,11 +231,12 @@ static ray_t* agg_parted_minmax(ray_t* x, int want_max) {
         ray_t* seg = segs[s];
         if (!seg) continue;
         int has_nulls = (seg->attrs & RAY_ATTR_HAS_NULLS) != 0;
-        if (base == RAY_F64) {
-            double* d = (double*)ray_data(seg);
+        if (base == RAY_F64 || base == RAY_F32) {
             for (int64_t i = 0; i < seg->len; i++) {
                 if (has_nulls && ray_vec_is_null(seg, i)) continue;
-                double v = d[i];
+                double v = base == RAY_F64
+                    ? ((double*)ray_data(seg))[i]
+                    : (double)((float*)ray_data(seg))[i];
                 if (!found || (want_max ? v > best_f : v < best_f)) {
                     best_f = v; found = 1;
                 }
@@ -249,18 +253,20 @@ static ray_t* agg_parted_minmax(ray_t* x, int want_max) {
     }
     if (!found) return ray_typed_null(-base);
     if (base == RAY_F64) return make_f64(best_f);
+    if (base == RAY_F32) return ray_f32((float)best_f);
     return agg_atom_i64_for_type(base, best_i);
 }
 
 static int agg_numeric_flat_type(int8_t t) {
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
-           t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
 }
 
 static int agg_read_vec_f64(ray_t* v, int64_t i, double* out) {
     void* d = ray_data(v);
     switch (v->type) {
     case RAY_F64: *out = ((double*)d)[i]; return 1;
+    case RAY_F32: *out = (double)((float*)d)[i]; return 1;
     case RAY_I64: *out = (double)((int64_t*)d)[i]; return 1;
     case RAY_I32: *out = (double)((int32_t*)d)[i]; return 1;
     case RAY_I16: *out = (double)((int16_t*)d)[i]; return 1;
@@ -362,7 +368,9 @@ static ray_t* agg_pair_vec(ray_t* x, ray_t* y, uint16_t op) {
         double xv = 0.0, yv = 0.0;
         agg_read_vec_f64(x, i, &xv);
         agg_read_vec_f64(y, i, &yv);
-        sx += xv; sy += yv; sxx += xv * xv; syy += yv * yv; sxy += xv * yv; cnt++;
+        sx += xv; sy += yv; sxx += xv * xv; syy += yv * yv;
+        sxy += xv * yv;
+        cnt++;
     }
 
     if (op == OP_WSUM) return ray_f64(ray_f64_fin(sxy));
@@ -449,10 +457,10 @@ ray_t* ray_sum_fn(ray_t* x) {
     for (int64_t i = 0; i < len; i++) {
         if (!is_numeric(elems[i])) return ray_error("type", "sum: list elements must be numeric, got %s", ray_type_name(elems[i]->type));
         if (RAY_ATOM_IS_NULL(elems[i])) {
-            if (elems[i]->type == -RAY_F64) has_float = 1;
+            if (elems[i]->type == -RAY_F64 || elems[i]->type == -RAY_F32) has_float = 1;
             continue;
         }
-        if (elems[i]->type == -RAY_F64) { has_float = 1; fsum += elems[i]->f64; }
+        if (elems[i]->type == -RAY_F64 || elems[i]->type == -RAY_F32) { has_float = 1; fsum += elems[i]->f64; }
         else if (elems[i]->type == -RAY_I64) { isum += elems[i]->i64; fsum += (double)elems[i]->i64; }
         else { int64_t v = (int64_t)as_f64(elems[i]); isum += v; fsum += (double)v; }
     }
@@ -479,10 +487,10 @@ ray_t* ray_prod_fn(ray_t* x) {
         if (!is_numeric(elems[i]))
             return ray_error("type", "prod: list elements must be numeric, got %s", ray_type_name(elems[i]->type));
         if (RAY_ATOM_IS_NULL(elems[i])) {
-            if (elems[i]->type == -RAY_F64) has_float = 1;
+            if (elems[i]->type == -RAY_F64 || elems[i]->type == -RAY_F32) has_float = 1;
             continue;
         }
-        if (elems[i]->type == -RAY_F64) {
+        if (elems[i]->type == -RAY_F64 || elems[i]->type == -RAY_F32) {
             has_float = 1;
             fprod *= elems[i]->f64;
         } else {
@@ -613,7 +621,7 @@ ray_t* ray_min_fn(ray_t* x) {
     double fmin = 0; int64_t imin = 0;
     for (int64_t i = 0; i < len; i++) {
         if (!is_numeric(elems[i])) return ray_error("type", "min: list elements must be numeric, got %s", ray_type_name(elems[i]->type));
-        if (elems[i]->type == -RAY_F64) has_float = 1;
+        if (elems[i]->type == -RAY_F64 || elems[i]->type == -RAY_F32) has_float = 1;
         if (RAY_ATOM_IS_NULL(elems[i])) continue;
         double v = as_f64(elems[i]);
         if (!found || v < fmin) { fmin = v; imin = elems[i]->type == -RAY_I64 ? elems[i]->i64 : 0; found = 1; }
@@ -667,7 +675,7 @@ ray_t* ray_max_fn(ray_t* x) {
     double fmax = 0; int64_t imax = 0;
     for (int64_t i = 0; i < len; i++) {
         if (!is_numeric(elems[i])) return ray_error("type", "max: list elements must be numeric, got %s", ray_type_name(elems[i]->type));
-        if (elems[i]->type == -RAY_F64) has_float = 1;
+        if (elems[i]->type == -RAY_F64 || elems[i]->type == -RAY_F32) has_float = 1;
         if (RAY_ATOM_IS_NULL(elems[i])) continue;
         double v = as_f64(elems[i]);
         if (!found || v > fmax) { fmax = v; imax = elems[i]->type == -RAY_I64 ? elems[i]->i64 : 0; found = 1; }
@@ -770,6 +778,9 @@ static ray_t* vec_to_f64_scratch(ray_t* x, double** out_vals) {
     } else if (x->type == RAY_F64) {
         double* d = (double*)ray_data(x);
         for (int64_t i = 0; i < len; i++) { if (!ray_vec_is_null(x, i)) vals[cnt++] = d[i]; }
+    } else if (x->type == RAY_F32) {
+        float* d = (float*)ray_data(x);
+        for (int64_t i = 0; i < len; i++) { if (!ray_vec_is_null(x, i)) vals[cnt++] = (double)d[i]; }
     } else if (x->type == RAY_I32) {
         int32_t* d = (int32_t*)ray_data(x);
         for (int64_t i = 0; i < len; i++) { if (!ray_vec_is_null(x, i)) vals[cnt++] = (double)d[i]; }

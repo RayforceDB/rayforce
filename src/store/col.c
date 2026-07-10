@@ -146,7 +146,7 @@ static size_t col_str_pool_payload_len(const ray_t* vec);
 static bool is_serializable_type(int8_t t) {
     switch (t) {
     case RAY_BOOL: case RAY_U8:   case RAY_I16:
-    case RAY_I32:  case RAY_I64:  case RAY_F64:
+    case RAY_I32:  case RAY_I64:  case RAY_F32: case RAY_F64:
     case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_GUID:
     case RAY_SYM:  case RAY_STR:
         return true;

@@ -1251,7 +1251,8 @@ static inline int64_t agg_int_null_sentinel_for(int8_t t) {
 }
 
 bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
-                        ray_t** agg_vecs, uint8_t need_flags,
+                        ray_t** agg_vecs, ray_t** agg_vecs2,
+                        uint8_t need_flags,
                         const uint16_t* agg_ops,
                         const int8_t* key_types);
 /* By-value copy that fixes the base pointers.  Dispatches on STORAGE, not

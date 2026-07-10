@@ -1,0 +1,48 @@
+;; Explicit numeric schemas must survive the streaming .csv.splayed writer
+;; and the mmap-backed .db.splayed.get reload without widening.
+
+(.sys.exec "rm -rf rf_test_explicit_numeric rf_test_explicit_numeric.csv") -- 0
+(.sys.exec "printf 'f32a,f32b,i32,i16\n1.25,0.25,100000,32000\n-2.5,1.5,-7,-300\n3.75,-0.25,42,9\n16777216,1,100001,9\n' > rf_test_explicit_numeric.csv") -- 0
+
+(set T (.csv.splayed [F32 F32 I32 I16] "rf_test_explicit_numeric.csv" "rf_test_explicit_numeric/"))
+(count T) -- 4
+(type (at T 'f32a)) -- 'F32
+(type (at T 'f32b)) -- 'F32
+(type (at T 'i32)) -- 'I32
+(type (at T 'i16)) -- 'I16
+(at (at T 'f32a) 0) -- 1.25
+(at (at T 'f32a) 1) -- -2.5
+(at (at (select {x: (- f32a f32b) from: T}) 'x) 0) -- 1.0
+(at (at (select {x: (- f32a f32b) from: T}) 'x) 2) -- 4.0
+(type (at (select {x: (+ f32a f32b) from: T}) 'x)) -- 'F32
+;; 2^24 + 1 rounds back to 2^24 at F32 precision.
+(at (at (select {x: (+ f32a f32b) from: T}) 'x) 3) -- 16777216.0
+(type (at (at T 'f32a) 0)) -- 'f32
+(type (at (at T 'f32b) 0)) -- 'f32
+(type (+ (at (at T 'f32a) 0) (at (at T 'f32b) 0))) -- 'f32
+(+ (at (at T 'f32a) 0) (at (at T 'f32b) 0)) -- 1.5
+(type (at (select {x: (neg f32a) from: T}) 'x)) -- 'F32
+(at (at (select {x: (neg f32a) from: T}) 'x) 1) -- 2.5
+(type (at (select {x: (+ f32a i32) from: T}) 'x)) -- 'F64
+(at (at (select {x: (+ f32a i32) from: T}) 'x) 0) -- 100001.25
+(type (wavg (at T 'i32) (at T 'f32b))) -- 'f64
+(set G (select {mx: (max f32a) wa: (wavg i32 f32b) by: {k: i16} from: T}))
+(count G) -- 3
+(type (at G 'mx)) -- 'F64
+(type (at G 'wa)) -- 'F64
+(set G1 (select {mx: (max f32a) wa: (wavg i32 f32b) from: T where: (== i16 32000)}))
+(at (at G1 'mx) 0) -- 1.25
+(at (at G1 'wa) 0) -- 0.25
+(at (at T 'i32) 0) -- 100000
+(at (at T 'i16) 1) -- -300
+
+(set R (.db.splayed.get "rf_test_explicit_numeric/"))
+(type (at R 'f32a)) -- 'F32
+(type (at R 'f32b)) -- 'F32
+(type (at R 'i32)) -- 'I32
+(type (at R 'i16)) -- 'I16
+(at (at R 'f32a) 2) -- 3.75
+(at (at R 'i32) 1) -- -7
+(at (at R 'i16) 2) -- 9
+
+(.sys.exec "rm -rf rf_test_explicit_numeric rf_test_explicit_numeric.csv") -- 0

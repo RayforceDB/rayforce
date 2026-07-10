@@ -37,6 +37,11 @@ static bool atom_to_numeric(ray_t* atom, double* out_f, int64_t* out_i, bool* ou
             *out_i = (int64_t)atom->f64;
             *out_is_f64 = true;
             return true;
+        case -RAY_F32:
+            *out_f = (double)(float)atom->f64;
+            *out_i = (int64_t)(float)atom->f64;
+            *out_is_f64 = true;
+            return true;
         case -RAY_I64:
         case -RAY_SYM:
         case -RAY_DATE:
@@ -673,7 +678,8 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                     out->regs[r].is_parted = true;
                     out->regs[r].col_obj = NULL; /* parted: per-segment, no zone-skip */
                     out->regs[r].parted_col = col;
-                    out->regs[r].type = (base == RAY_F64) ? RAY_F64 : RAY_I64;
+                    out->regs[r].type = (base == RAY_F64 || base == RAY_F32)
+                                      ? RAY_F64 : RAY_I64;
                     out->regs[r].nullable = col_nulls;
                     out->has_parted = true;
                 } else {
@@ -683,7 +689,8 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                     out->regs[r].is_parted = false;
                     out->regs[r].col_obj = col;
                     out->regs[r].parted_col = NULL;
-                    out->regs[r].type = (col->type == RAY_F64) ? RAY_F64 : RAY_I64;
+                    out->regs[r].type = (col->type == RAY_F64 || col->type == RAY_F32)
+                                      ? RAY_F64 : RAY_I64;
                     out->regs[r].nullable = col_nulls;
                 }
             } else if (node->opcode == OP_CONST) {
@@ -712,6 +719,12 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out) {
                 out->regs[r].const_f64 = cf;
                 out->regs[r].const_i64 = ci;
             } else if (expr_is_elementwise(node->opcode)) {
+                /* The fused VM has F64/I64 lanes only. F32 inputs can be read
+                 * exactly through the F64 lane, but a node whose result is F32
+                 * must round and store at F32 width. Keep every such node on
+                 * the typed executor until the VM has a real F32 lane. */
+                if (node->out_type == RAY_F32)
+                    EXPR_BAIL(EXPR_BAIL_OTHER);
                 if (!op_child(g, node, 0)) EXPR_BAIL(EXPR_BAIL_OTHER);
                 uint8_t s1 = node_reg[node->in_id[0]];
                 if (s1 == 0xFF) EXPR_BAIL(EXPR_BAIL_OTHER);
@@ -912,6 +925,14 @@ static void expr_load_f64(double* dst, const void* data, int8_t col_type,
             /* NaN already canonical in place — direct copy */
             memcpy(dst, (const double*)data + start, (size_t)n * 8);
             break;
+        case RAY_F32: {
+            const float* s = (const float*)data + start;
+            if (has_nulls)
+                for (int64_t j = 0; j < n; j++)
+                    dst[j] = (s[j] != s[j]) ? NULL_F64 : (double)s[j];
+            else
+                for (int64_t j = 0; j < n; j++) dst[j] = (double)s[j];
+        } break;
         case RAY_I64: case RAY_TIMESTAMP: {
             const int64_t* s = (const int64_t*)data + start;
             if (has_nulls)
@@ -2193,7 +2214,7 @@ static int8_t ew_value_base_type(ray_t* x) {
 
 static bool ew_pow_type_admitted(int8_t t) {
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
-           t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
 }
 
 /* Resolve data pointer for a vector, accounting for slices.
@@ -2333,7 +2354,7 @@ static bool ew_unary_math_type_admitted(uint16_t opcode, int8_t t) {
     if (opcode != OP_SIGNUM && !expr_is_f64_unary_math(opcode)) return true;
     if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 ||
-           t == RAY_I32 || t == RAY_I64 || t == RAY_F64;
+           t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
 }
 
 ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
@@ -2360,7 +2381,55 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     int64_t out_off = 0;
     uint16_t opc = op->opcode;
 
-    if (in_type == RAY_F64 && out_type == RAY_F64) {
+    if (in_type == RAY_F32 && out_type == RAY_F32) {
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            float* src = (float*)m.morsel_ptr;
+            float* dst = (float*)ray_data(result) + out_off;
+            switch (opc) {
+                case OP_NEG:   for (int64_t i=0;i<n;i++) dst[i] = -src[i]; break;
+                case OP_ABS:   for (int64_t i=0;i<n;i++) dst[i] = fabsf(src[i]); break;
+                case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = ceilf(src[i]); break;
+                case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = floorf(src[i]); break;
+                case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = roundf(src[i]); break;
+                default:       for (int64_t i=0;i<n;i++) dst[i] = src[i]; break;
+            }
+            out_off += n;
+        }
+    } else if (in_type == RAY_F32 && out_type == RAY_F64) {
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            float* src = (float*)m.morsel_ptr;
+            double* dst = (double*)ray_data(result) + out_off;
+            switch (opc) {
+                case OP_SQRT:  for (int64_t i=0;i<n;i++) dst[i] = ray_f64_fin(sqrt((double)src[i])); break;
+                case OP_LOG:   for (int64_t i=0;i<n;i++) dst[i] = ray_f64_fin(log((double)src[i])); break;
+                case OP_EXP:   for (int64_t i=0;i<n;i++) dst[i] = ray_f64_fin(exp((double)src[i])); break;
+                case OP_SIN:   for (int64_t i=0;i<n;i++) dst[i] = ray_f64_fin(sin((double)src[i])); break;
+                case OP_ASIN:  for (int64_t i=0;i<n;i++) dst[i] = ray_f64_fin(asin((double)src[i])); break;
+                case OP_COS:   for (int64_t i=0;i<n;i++) dst[i] = ray_f64_fin(cos((double)src[i])); break;
+                case OP_ACOS:  for (int64_t i=0;i<n;i++) dst[i] = ray_f64_fin(acos((double)src[i])); break;
+                case OP_TAN:   for (int64_t i=0;i<n;i++) dst[i] = ray_f64_fin(tan((double)src[i])); break;
+                case OP_ATAN:  for (int64_t i=0;i<n;i++) dst[i] = ray_f64_fin(atan((double)src[i])); break;
+                case OP_RECIPROCAL:
+                    for (int64_t i=0;i<n;i++) dst[i] = src[i] != 0.0f ? ray_f64_fin(1.0 / (double)src[i]) : NULL_F64;
+                    break;
+                default:       for (int64_t i=0;i<n;i++) dst[i] = (double)src[i]; break;
+            }
+            out_off += n;
+        }
+    } else if (in_type == RAY_F32 && out_type == RAY_I64) {
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            float* src = (float*)m.morsel_ptr;
+            int64_t* dst = (int64_t*)ray_data(result) + out_off;
+            if (opc == OP_SIGNUM)
+                for (int64_t i=0;i<n;i++) dst[i] = (src[i] > 0.0f) - (src[i] < 0.0f);
+            else
+                for (int64_t i=0;i<n;i++) dst[i] = (int64_t)src[i];
+            out_off += n;
+        }
+    } else if (in_type == RAY_F64 && out_type == RAY_F64) {
         while (ray_morsel_next(&m)) {
             int64_t n = m.morsel_len;
             double* src = (double*)m.morsel_ptr;
@@ -2912,8 +2981,10 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 
 
     /* Pointers into source data at offset start */
-    double* lp_f64 = NULL; int64_t* lp_i64 = NULL; uint8_t* lp_bool = NULL;
-    double* rp_f64 = NULL; int64_t* rp_i64 = NULL; uint8_t* rp_bool = NULL;
+    double* lp_f64 = NULL; float* lp_f32 = NULL;
+    int64_t* lp_i64 = NULL; uint8_t* lp_bool = NULL;
+    double* rp_f64 = NULL; float* rp_f32 = NULL;
+    int64_t* rp_i64 = NULL; uint8_t* rp_bool = NULL;
 
     int32_t* lp_i32 = NULL; uint32_t* lp_u32 = NULL; int16_t* lp_i16 = NULL;
     int32_t* rp_i32 = NULL; uint32_t* rp_u32 = NULL; int16_t* rp_i16 = NULL;
@@ -2939,6 +3010,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         void* l_data = resolve_vec_data(lhs, &l_off);
         void* lbase = (char*)l_data + l_off * ray_sym_elem_size(lhs->type, lhs->attrs);
         if (lhs->type == RAY_F64) lp_f64 = (double*)lbase;
+        else if (lhs->type == RAY_F32) lp_f32 = (float*)lbase;
         else if (lhs->type == RAY_I64 || lhs->type == RAY_TIMESTAMP) lp_i64 = (int64_t*)lbase;
         else if (RAY_IS_SYM(lhs->type)) {
             uint8_t w = lhs->attrs & RAY_SYM_W_MASK;
@@ -2960,6 +3032,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         void* r_data = resolve_vec_data(rhs, &r_off);
         void* rbase = (char*)r_data + r_off * ray_sym_elem_size(rhs->type, rhs->attrs);
         if (rhs->type == RAY_F64) rp_f64 = (double*)rbase;
+        else if (rhs->type == RAY_F32) rp_f32 = (float*)rbase;
         else if (rhs->type == RAY_I64 || rhs->type == RAY_TIMESTAMP) rp_i64 = (int64_t*)rbase;
         else if (RAY_IS_SYM(rhs->type)) {
             uint8_t w = rhs->attrs & RAY_SYM_W_MASK;
@@ -2993,12 +3066,16 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 
     /* Resolve the lhs/rhs reader to a single decision made once before the loop.
      * Each of these yields a double for the given index. */
-#define LV_READ(i)  (lp_f64 ? lp_f64[i] : lp_i64 ? (double)lp_i64[i] : lp_i32 ? (double)lp_i32[i] : lp_u32 ? (double)lp_u32[i] : lp_i16 ? (double)lp_i16[i] : lp_bool ? (double)lp_bool[i] : (l_scalar && (lhs->type == -RAY_F64 || lhs->type == RAY_F64)) ? l_f64 : (double)l_i64)
-#define RV_READ(i)  (rp_f64 ? rp_f64[i] : rp_i64 ? (double)rp_i64[i] : rp_i32 ? (double)rp_i32[i] : rp_u32 ? (double)rp_u32[i] : rp_i16 ? (double)rp_i16[i] : rp_bool ? (double)rp_bool[i] : (r_scalar && (rhs->type == -RAY_F64 || rhs->type == RAY_F64)) ? r_f64 : (double)r_i64)
+#define LV_READ(i)  (lp_f64 ? lp_f64[i] : lp_f32 ? (double)lp_f32[i] : lp_i64 ? (double)lp_i64[i] : lp_i32 ? (double)lp_i32[i] : lp_u32 ? (double)lp_u32[i] : lp_i16 ? (double)lp_i16[i] : lp_bool ? (double)lp_bool[i] : (l_scalar && (lhs->type == -RAY_F64 || lhs->type == RAY_F64 || lhs->type == -RAY_F32 || lhs->type == RAY_F32)) ? l_f64 : (double)l_i64)
+#define RV_READ(i)  (rp_f64 ? rp_f64[i] : rp_f32 ? (double)rp_f32[i] : rp_i64 ? (double)rp_i64[i] : rp_i32 ? (double)rp_i32[i] : rp_u32 ? (double)rp_u32[i] : rp_i16 ? (double)rp_i16[i] : rp_bool ? (double)rp_bool[i] : (r_scalar && (rhs->type == -RAY_F64 || rhs->type == RAY_F64 || rhs->type == -RAY_F32 || rhs->type == RAY_F32)) ? r_f64 : (double)r_i64)
 
     /* Compute once: is lhs/rhs integer-family (not float)? Used by BOOL path. */
-    int l_is_int = !(lp_f64 || (l_scalar && (lhs->type == -RAY_F64 || lhs->type == RAY_F64)));
-    int r_is_int = !(rp_f64 || (r_scalar && (rhs->type == -RAY_F64 || rhs->type == RAY_F64)));
+    int l_is_int = !(lp_f64 || lp_f32 || (l_scalar &&
+        (lhs->type == -RAY_F64 || lhs->type == RAY_F64 ||
+         lhs->type == -RAY_F32 || lhs->type == RAY_F32)));
+    int r_is_int = !(rp_f64 || rp_f32 || (r_scalar &&
+        (rhs->type == -RAY_F64 || rhs->type == RAY_F64 ||
+         rhs->type == -RAY_F32 || rhs->type == RAY_F32)));
     int src_is_i64_all = l_is_int && r_is_int;
 
     /* Hoist out_type outside the loop. Each branch is a tight per-element kernel. */
@@ -3034,6 +3111,25 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             for (int64_t i = 0; i < n; i++) any_nan |= (odst[i] != odst[i]);
             if (any_nan)
                 __atomic_fetch_or(&result->attrs, (uint8_t)RAY_ATTR_HAS_NULLS, __ATOMIC_RELAXED);
+        }
+    } else if (out_type == RAY_F32) {
+        float* odst = (float*)dst;
+        switch (op->opcode) {
+            case OP_ADD:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)+RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
+            case OP_SUB:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)-RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
+            case OP_MUL:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)*RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
+            case OP_MOD:  for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); float v; if(rv!=0.0f){v=fmodf(lv,rv);if(v&&((v>0)!=(rv>0)))v+=rv;v=isfinite(v)?v:NULL_F32;}else v=NULL_F32;odst[i]=v; } break;
+            case OP_MIN2: for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); odst[i]=lv<rv?lv:rv; } break;
+            case OP_MAX2: for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); odst[i]=lv>rv?lv:rv; } break;
+            default:      for (int64_t i=0;i<n;i++) odst[i]=0.0f; break;
+        }
+        if (op->opcode == OP_ADD || op->opcode == OP_SUB ||
+            op->opcode == OP_MUL || op->opcode == OP_MOD) {
+            int any_nan = 0;
+            for (int64_t i = 0; i < n; i++) any_nan |= (odst[i] != odst[i]);
+            if (any_nan)
+                __atomic_fetch_or(&result->attrs, (uint8_t)RAY_ATTR_HAS_NULLS,
+                                  __ATOMIC_RELAXED);
         }
     } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP) {
         int64_t* odst = (int64_t*)dst;
@@ -3296,7 +3392,8 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         if (str_resolved && lhs->type == -RAY_STR)
             l_i64_val = resolved_sym_id;
         else if (ray_is_atom(lhs)) {
-            if (lhs->type == -RAY_F64) l_f64_val = lhs->f64;
+            if (lhs->type == -RAY_F64 || lhs->type == -RAY_F32)
+                l_f64_val = lhs->f64;
             else if (lhs->type == -RAY_I32 || lhs->type == -RAY_DATE || lhs->type == -RAY_TIME)
                 l_i64_val = (int64_t)lhs->i32;
             else if (lhs->type == -RAY_I16) l_i64_val = (int64_t)lhs->i16;
@@ -3307,6 +3404,7 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
             int64_t elem = 0;
             void* data = resolve_vec_data(lhs, &elem);
             if (t == RAY_F64) l_f64_val = ((double*)data)[elem];
+            else if (t == RAY_F32) l_f64_val = (double)((float*)data)[elem];
             else l_i64_val = read_col_i64(data, elem, t, lhs->attrs);
         }
     }
@@ -3314,7 +3412,8 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         if (str_resolved && rhs->type == -RAY_STR)
             r_i64_val = resolved_sym_id;
         else if (ray_is_atom(rhs)) {
-            if (rhs->type == -RAY_F64) r_f64_val = rhs->f64;
+            if (rhs->type == -RAY_F64 || rhs->type == -RAY_F32)
+                r_f64_val = rhs->f64;
             else if (rhs->type == -RAY_I32 || rhs->type == -RAY_DATE || rhs->type == -RAY_TIME)
                 r_i64_val = (int64_t)rhs->i32;
             else if (rhs->type == -RAY_I16) r_i64_val = (int64_t)rhs->i16;
@@ -3325,6 +3424,7 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
             int64_t elem = 0;
             void* data = resolve_vec_data(rhs, &elem);
             if (t == RAY_F64) r_f64_val = ((double*)data)[elem];
+            else if (t == RAY_F32) r_f64_val = (double)((float*)data)[elem];
             else r_i64_val = read_col_i64(data, elem, t, rhs->attrs);
         }
     }
@@ -3424,7 +3524,8 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         } else {
             /* Scalar divisor: check for zero using the correct type */
             bool is_zero = false;
-            if (rhs->type == -RAY_F64 || rhs->type == RAY_F64)
+            if (rhs->type == -RAY_F64 || rhs->type == RAY_F64 ||
+                rhs->type == -RAY_F32 || rhs->type == RAY_F32)
                 is_zero = (r_f64_val == 0.0);
             else
                 is_zero = (r_i64_val == 0);
