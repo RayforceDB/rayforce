@@ -3146,6 +3146,9 @@ static void csv_write_cell(csv_writer_t* w, const csv_col_info_t* ci, int64_t r)
     case RAY_F64:
         csv_write_f64(w, ((const double*)d)[dr]);
         break;
+    case RAY_F32:
+        csv_write_f64(w, (double)((const float*)d)[dr]);
+        break;
     case RAY_DATE:
         csv_write_date(w, ((const int32_t*)d)[dr]);
         break;

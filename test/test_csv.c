@@ -111,6 +111,41 @@ static test_result_t test_csv_roundtrip_f64(void) {
     PASS();
 }
 
+static test_result_t test_csv_roundtrip_f32(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    float vals[] = {41.87f, -0.125f, 0.0f};
+    ray_t* vec = ray_vec_from_raw(RAY_F32, vals, 3);
+    int64_t name = ray_sym_intern("price", 5);
+    ray_t* tbl = ray_table_new(1);
+    tbl = ray_table_add_col(tbl, name, vec);
+    ray_release(vec);
+
+    ray_err_t err = ray_write_csv(tbl, TMP_CSV);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+
+    int8_t schema[] = {RAY_F32};
+    ray_t* loaded = ray_read_csv_opts(TMP_CSV, ',', true, schema, 1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_EQ_I(ray_table_nrows(loaded), 3);
+
+    ray_t* col = ray_table_get_col_idx(loaded, 0);
+    TEST_ASSERT_NOT_NULL(col);
+    TEST_ASSERT_EQ_I(col->type, RAY_F32);
+    float* loaded_data = (float*)ray_data(col);
+    TEST_ASSERT_EQ_F(loaded_data[0], vals[0], 1e-6);
+    TEST_ASSERT_EQ_F(loaded_data[1], vals[1], 1e-6);
+    TEST_ASSERT_EQ_F(loaded_data[2], vals[2], 1e-6);
+
+    ray_release(loaded);
+    ray_release(tbl);
+    unlink(TMP_CSV);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 static test_result_t test_csv_multi_column(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -1513,6 +1548,7 @@ const test_entry_t csv_entries[] = {
     { "csv/roundtrip_i64", test_csv_roundtrip_i64, NULL, NULL },
     { "csv/roundtrip_guid", test_csv_guid_roundtrip, NULL, NULL },
     { "csv/roundtrip_f64", test_csv_roundtrip_f64, NULL, NULL },
+    { "csv/roundtrip_f32", test_csv_roundtrip_f32, NULL, NULL },
     { "csv/multi_column", test_csv_multi_column, NULL, NULL },
     { "csv/empty_table", test_csv_empty_table, NULL, NULL },
     { "csv/null_i64", test_csv_null_i64, NULL, NULL },
