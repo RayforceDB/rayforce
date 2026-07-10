@@ -13,6 +13,10 @@
 
 ;; null is falsy in a condition → else branch, no crash
 (if null 1 2) -- 2
+
+;; Compiled lambdas use the same null-keyword semantics as the tree walker.
+(nil? ((fn [] null))) -- true
+(nil? ((fn [x] (if x 1 null)) false)) -- true
 (if 1 10 20) -- 10
 
 ;; producer parity: split-of-empty, ser/de round-trip, resolve-of-unbound

@@ -192,7 +192,7 @@ static void patch_jump(compiler_t *c, int32_t pos) {
 }
 
 /* Cached sym IDs for special forms */
-static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1;
+static _Thread_local int64_t sf_set = -1, sf_let = -1, sf_if = -1, sf_do = -1, sf_fn = -1, sf_self = -1, sf_try = -1, sf_return = -1, sf_null = -1;
 static _Thread_local int64_t sf_eval = -1, sf_resolve = -1;
 
 static void init_sf_syms(void) {
@@ -205,6 +205,7 @@ static void init_sf_syms(void) {
     sf_self = ray_sym_intern("self", 4);
     sf_try  = ray_sym_intern("try",  3);
     sf_return = ray_sym_intern("return", 6);
+    sf_null   = ray_sym_intern("null", 4);
     sf_eval    = ray_sym_intern("eval", 4);
     sf_resolve = ray_sym_intern("resolve", 7);
 }
@@ -522,6 +523,14 @@ static void compile_expr(compiler_t *c, ray_t *ast) {
 
     if (ray_is_atom(ast)) {
         if (ast->type == -RAY_SYM && !(ast->attrs & ATTR_QUOTED)) {
+            /* The tree walker treats bare `null` as the singleton value, not
+             * an environment lookup.  Compiled lambdas must do the same;
+             * otherwise any branch returning null fails with a name error. */
+            init_sf_syms();
+            if (ast->i64 == sf_null) {
+                emit_const(c, add_constant(c, RAY_NULL_OBJ));
+                return;
+            }
             int32_t slot = find_local(c, ast->i64);
             if (slot >= 0) {
                 emit(c, OP_LOADENV);
@@ -639,6 +648,6 @@ ray_span_t ray_bc_dbg_get(ray_t* dbg, int32_t ip) {
 }
 
 void ray_compile_reset(void) {
-    sf_set = sf_let = sf_if = sf_do = sf_fn = sf_self = sf_try = sf_return = -1;
+    sf_set = sf_let = sf_if = sf_do = sf_fn = sf_self = sf_try = sf_return = sf_null = -1;
     sf_eval = sf_resolve = -1;
 }
