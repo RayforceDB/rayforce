@@ -422,6 +422,59 @@ static test_result_t test_rowsel_refine_null_existing(void) {
     PASS();
 }
 
+/* MIX∩MIX must initialize its output flag even when the recycled rowsel
+ * payload previously held ALL.  The allocator zeroes object headers, not
+ * payload bytes, so reading the output flag before assigning it can turn a
+ * partial intersection into an entire morsel. */
+static test_result_t test_rowsel_intersect_mixed_reused_block(void) {
+    ray_heap_init();
+    enum { N = RAY_MORSEL_ELEMS };
+    uint8_t a_bits[N];
+    uint8_t b_bits[N];
+    memset(a_bits, 0, sizeof(a_bits));
+    memset(b_bits, 0, sizeof(b_bits));
+
+    const int64_t a_start = N / 4;
+    const int64_t b_end = (N * 5) / 8;
+    for (int64_t i = a_start; i < N; i++) a_bits[i] = 1;
+    for (int64_t i = 0; i < b_end; i++) b_bits[i] = 1;
+
+    ray_t* a_pred = make_pred(a_bits, N);
+    ray_t* b_pred = make_pred(b_bits, N);
+    TEST_ASSERT_NOT_NULL(a_pred);
+    TEST_ASSERT_NOT_NULL(b_pred);
+    ray_t* a = ray_rowsel_from_pred(a_pred);
+    ray_t* b = ray_rowsel_from_pred(b_pred);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_EQ_I(ray_rowsel_flags(a)[0], RAY_SEL_MIX);
+    TEST_ASSERT_EQ_I(ray_rowsel_flags(b)[0], RAY_SEL_MIX);
+
+    const int64_t expected = b_end - a_start;
+    ray_t* poison = ray_rowsel_new(N, expected, expected);
+    TEST_ASSERT_NOT_NULL(poison);
+    ray_rowsel_flags(poison)[0] = RAY_SEL_ALL;
+    ray_rowsel_release(poison);
+
+    ray_t* out = ray_rowsel_intersect(a, b);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ_I(ray_rowsel_meta(out)->total_pass, expected);
+    TEST_ASSERT_EQ_I(ray_rowsel_flags(out)[0], RAY_SEL_MIX);
+    int64_t rows[N];
+    int64_t count = reconstruct(out, rows);
+    TEST_ASSERT_EQ_I(count, expected);
+    TEST_ASSERT_EQ_I(rows[0], a_start);
+    TEST_ASSERT_EQ_I(rows[count - 1], b_end - 1);
+
+    ray_rowsel_release(out);
+    ray_rowsel_release(a);
+    ray_rowsel_release(b);
+    ray_release(a_pred);
+    ray_release(b_pred);
+    ray_heap_destroy();
+    PASS();
+}
+
 /* Streaming emitter must produce a block byte-identical to the
  * whole-vec ray_rowsel_from_pred over the same bools.  Pattern spans
  * >1 morsel with a NONE seg, an ALL seg, and MIX segs. */
@@ -486,8 +539,8 @@ const test_entry_t rowsel_entries[] = {
     { "rowsel/to_indices", test_rowsel_to_indices, NULL, NULL },
     { "rowsel/refine", test_rowsel_refine, NULL, NULL },
     { "rowsel/refine_null_existing", test_rowsel_refine_null_existing, NULL, NULL },
+    { "rowsel/intersect_mixed_reused_block", test_rowsel_intersect_mixed_reused_block, NULL, NULL },
     { "rowsel/emit_equiv", test_rowsel_emit_equiv, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
-
 

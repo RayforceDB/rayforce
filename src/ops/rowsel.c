@@ -681,9 +681,8 @@ ray_t* ray_rowsel_intersect(ray_t* a, ray_t* b) {
                     else if (bv < av) bp++;
                     else { oi[cum++] = av; ap++; bp++; }
                 }
+                of[s] = count == 0 ? RAY_SEL_NONE : RAY_SEL_MIX;
             }
-            if (of[s] != RAY_SEL_ALL)
-                of[s] = cum == oo[s] ? RAY_SEL_NONE : RAY_SEL_MIX;
         }
     }
     oo[ns] = cum;
