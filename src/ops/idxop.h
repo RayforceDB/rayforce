@@ -191,9 +191,9 @@ static inline ray_index_t* ray_index_payload(ray_t* idx) {
  * Diagnostic, unsynchronized (same caveat as ray_expr_bail_counts). */
 typedef enum {
     IDX_SITE_FILTER_ZONE = 0, IDX_SITE_FILTER_BLOOM, IDX_SITE_FILTER_HASH,
-    IDX_SITE_FILTER_RANGE, IDX_SITE_IN, IDX_SITE_FIND, IDX_SITE_SORT,
-    IDX_SITE_DISTINCT, IDX_SITE_ASOF, IDX_SITE_FILTER_EQRANGE,
-    IDX_SITE_GROUP_SLICE, IDX_SITE__N
+    IDX_SITE_FILTER_PART, IDX_SITE_FILTER_RANGE, IDX_SITE_IN, IDX_SITE_FIND,
+    IDX_SITE_SORT, IDX_SITE_DISTINCT, IDX_SITE_ASOF,
+    IDX_SITE_FILTER_EQRANGE, IDX_SITE_GROUP_SLICE, IDX_SITE__N
 } idx_site_t;
 extern uint64_t ray_idx_consults[IDX_SITE__N];
 extern uint64_t ray_idx_hits[IDX_SITE__N];
@@ -326,11 +326,17 @@ bool ray_index_bloom_absent(ray_t* col, int64_t key);
  * has NaN / -0 semantics the unfused compare kernel handles. */
 ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key);
 
-/* ===== Hash-index IN probe =====
+/* Direct equality selection for a fresh part index.  `key` is a numeric
+ * value or a column-domain SYM id.  Dense matches remain eligible because
+ * the part payload already stores one contiguous physical span. */
+ray_t* ray_index_part_eq_rowsel(ray_t* col, int64_t key);
+
+/* ===== Hash/part-index IN probe =====
  *
- * Build a rowsel of all rows whose value is in set_vec via per-element
- * hash-chain probes.  Integer-family and SYM columns (same conservatism as
- * the hash-eq path: F32/F64 NaN/-0 semantics belong to the scan kernel).
+ * Build a rowsel of all rows whose value is in set_vec via per-element hash
+ * probes or direct physical spans from a part index.  Integer-family and SYM
+ * columns (same conservatism as the hash-eq path: F32/F64 NaN/-0 semantics
+ * belong to the scan kernel).
  *
  * set_vec must match the column family: an integer-family typed vec for an
  * integer column, a SYM vec for a SYM column (each set symbol is resolved
@@ -340,10 +346,10 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key);
  * Returns:
  *   - A fresh rowsel block (rc=1) on success — install on g->selection.
  *     An empty set yields a valid all-NONE rowsel (NOT NULL).
- *   - NULL when the column is not eligible (no hash index, stale, float-
- *     family column, unsupported set type, OOM) or the union is too dense
- *     (total chain-step budget exceeded — the SIMD membership scan wins at
- *     that density).  Caller falls back to the scan path. */
+ *   - NULL when the column is not eligible (no hash/part index, stale,
+ *     float-family column, unsupported set type, OOM) or a hash-index union
+ *     is too dense.  Part-index unions retain dense full morsels efficiently.
+ *     Caller falls back to the scan path. */
 ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec);
 
 /* ===== Hash-index find (point lookup) =====
@@ -387,20 +393,23 @@ ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids, int64_t n);
  * valid while the index is). */
 typedef struct {
     int64_t        dom;   /* column-domain key id */
-    const int64_t* rows;  /* ascending row ids (borrowed) */
+    const int64_t* rows;  /* ascending row ids (borrowed); NULL if contiguous */
+    int64_t        first; /* first physical row when rows == NULL */
     int64_t        n;     /* slice length (> 0) */
 } ray_idx_slice_t;
 
 /* Resolve a SYM eq key (sym ATOM, global intern id) or IN set (SYM vec,
- * any domain) against `col`'s fresh CSR hash index into per-key slices,
+ * any domain) against `col`'s fresh hash or part index into per-key slices,
  * canonicalized ascending by column-domain id (duplicates collapsed;
- * absent / rowless keys dropped).  On success returns K >= 0 and, for
+ * absent / rowless keys dropped). Hash slices borrow CSR row ids; part
+ * slices use rows==NULL plus their contiguous physical first row. On success
+ * returns K >= 0 and, for
  * K > 0, *out points into a fresh alloc block returned via *hdr_out
  * (release with ray_free).  K == 0 → provably no surviving rows (*out
  * and *hdr_out NULL).  Returns -1 when ineligible: stale or missing
- * hash index, null-bearing or non-SYM column, wrong key shape. */
-int64_t ray_index_hash_sym_slices(ray_t* col, ray_t* keys,
-                                  ray_idx_slice_t** out, ray_t** hdr_out);
+ * hash/part index, null-bearing or non-SYM column, wrong key shape. */
+int64_t ray_index_sym_slices(ray_t* col, ray_t* keys,
+                             ray_idx_slice_t** out, ray_t** hdr_out);
 
 /* ===== Sort-index range probe =====
  *
@@ -420,6 +429,14 @@ int64_t ray_index_hash_sym_slices(ray_t* col, ray_t* keys,
  * contract); mismatch returns NULL defensively. */
 ray_t* ray_index_range_rowsel(ray_t* col, uint16_t cmp_op,
                               int64_t key_i, double key_f, bool is_float);
+
+/* Build a rowsel by binary-searching a physically non-descending column.
+ * Unlike the sort-index route above, matching row ids are already one
+ * contiguous interval, so dense spans are eligible and the rowsel stores
+ * only the at-most-two partial boundary morsels.  Requires the verified
+ * RAY_ATTR_SORTED marker and a null-free numeric column. */
+ray_t* ray_sorted_range_rowsel(ray_t* col, uint16_t cmp_op,
+                               int64_t key_i, double key_f, bool is_float);
 
 /* ===== Sort-index ORDER BY permutation probe =====
  *

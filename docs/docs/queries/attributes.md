@@ -1,15 +1,15 @@
 # Column Attributes
 
-Semantic properties stamped onto numeric columns — `sorted`, `unique`, `grouped`, `parted`.  Where an [accelerator index](indexes.md) is a *physical* structure (a hash table, a permutation), a column attribute is an *assertion about meaning*: this column is non-descending, these values are distinct.  The `.attr.*` family layers over the same storage as `.idx.*`, but its contract is semantic, not structural.
+Semantic properties stamped onto columns — `sorted`, `unique`, `grouped`, `parted`.  Where an [accelerator index](indexes.md) is a *physical* structure (a hash table, a permutation), a column attribute is an *assertion about meaning*: this column is non-descending, these values are distinct.  The `.attr.*` family layers over the same storage as `.idx.*`, but its contract is semantic, not structural.
 
 !!! note "v1 status"
-    The four attributes, their strict verify-on-set kernels, and the `(.attr.*)` Rayfall surface are shipped, along with the as-of-join fast paths that consume them.  All attributes are **numeric-only** in v1 — the same numeric type set as `.idx.*`; symbol / string columns are deferred.
+    The four attributes, their strict verify-on-set kernels, and the `(.attr.*)` Rayfall surface are shipped. `sorted` and `unique` are numeric; the backing-index attributes `grouped` and `parted` also support symbol columns.
 
 ## Why Attributes Are Separate from Indexes
 
 An [accelerator index](indexes.md) answers *"what structure is attached?"* — a zonemap, a hash table, a sort permutation.  A column attribute answers a different question: *"what is semantically true of these values?"*  The two markers (`sorted`, `unique`) carry no allocation at all — they are cheap flags.  The two backing-index attributes (`grouped`, `parted`) do reuse the index layer underneath (so a `grouped` or `parted` column also shows up via `.idx.has?` and `.idx.info`), but `.attr.*` exists to assert a *property* the engine can trust, not merely to build a structure.
 
-The payoff is that a consumer — most importantly the [as-of join executor](joins.md#pre-sorted-fast-path) — can trust a stamped attribute unconditionally and skip work it would otherwise have to do defensively.
+The payoff is that consumers can trust a stamped attribute unconditionally. Besides the [as-of join executor](joins.md#pre-sorted-fast-path), filters and grouped aggregation use the physical layout directly.
 
 ## The Four Attributes
 
@@ -22,7 +22,9 @@ The payoff is that a consumer — most importantly the [as-of join executor](joi
 
 The two **markers** are independent and may coexist.  A column holds at most **one backing index** at a time: setting `grouped` or `parted` replaces any prior backing index.  Markers may coexist with a backing index.
 
-`parted` is **verify-only** — it never reorders data.  It checks that the column is already block-laid-out (each distinct value occupies one contiguous, ascending run) and errors if it is not.  The caller is responsible for ordering the column first.
+`parted` is **verify-only** — it never reorders data.  It checks that the column is already block-laid-out (each distinct value occupies one contiguous run; numeric keys must also be ascending) and errors if it is not.  The caller is responsible for ordering the column first.
+
+For `where: (in key set)` on a parted key, the filter builds its row selection from the matching `[start, len)` ranges without scanning the key column or expanding full morsels into row ids. If the same query groups by that key and uses supported aggregates, Rayforce skips the filter and group discovery entirely and streams each selected partition directly into the aggregate kernel. The equivalent `grouped` path consumes hash-index row slices.
 
 ## Setting, Reading, and Dropping
 
@@ -30,7 +32,7 @@ The two **markers** are independent and may coexist.  A column holds at most **o
 
 `(.attr.set 'name v)   (.attr.get v)   (.attr.drop v)`
 
-- `(.attr.set 'name v)` — assert attribute `name` on numeric vector `v`.  Strict verify: it scans `v` and **errors on violation**, so a stamped attribute never lies.  Returns the column with the attribute recorded.
+- `(.attr.set 'name v)` — assert attribute `name` on vector `v`. Strict verification **errors on violation**, so a stamped attribute never lies. Returns the column with the attribute recorded.
 - `(.attr.get v)` — return the symbol vector of currently-held attributes (the empty symbol vector when none are set).
 - `(.attr.drop v)` — remove all attributes from `v`.
 
@@ -85,7 +87,7 @@ An unknown attribute name is rejected the same way:
 (.attr.set 'bogus [1 2 3])      ; ⇒ error (domain): unknown attribute
 ```
 
-Setting `sorted` runs an O(n) ascending scan; `unique` and `grouped` build / consult the hash to detect duplicates; `parted` walks the column verifying that each distinct value forms one contiguous ascending block.
+Setting `sorted` runs an O(n) ascending scan; `unique` and `grouped` build / consult the hash to detect duplicates; `parted` walks the column verifying that each distinct value forms one contiguous block (and ascending block order for numeric keys).
 
 ## Combining Attributes
 
@@ -160,7 +162,7 @@ For a partitioned join `(asof-join [Key Time] L R)`, if the single numeric equal
 
 ## Caveats and Limits
 
-- **Numeric types only (v1).**  Attributes accept the same numeric type set as `.idx.*` (boolean, integer, float, and temporal types).  Symbol / string columns are deferred — including the `parted` equality key in a partitioned as-of join, which must be a numeric ID.
+- **Type support.** `sorted` and `unique` accept numeric types. `grouped` and `parted` also accept `SYM`; `STR` remains unsupported.
 - **Strict verify, no silent stamping.**  `.attr.set` errors on violation rather than recording a property it cannot confirm; this is what lets consumers trust the stamp unconditionally.
 - **Conservative propagation.**  Only copy / rebind preserve attributes; every transform drops them.  Re-assert with `.attr.set` after a transform.
 - **One backing index per column.**  `grouped` and `parted` share the [accelerator-index](indexes.md) slot, so a column carries at most one of them at a time; the markers are separate and free.

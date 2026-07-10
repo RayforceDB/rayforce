@@ -4196,13 +4196,9 @@ static test_result_t test_window_i32_plain_order_key(void) {
     PASS();
 }
 
-/* Review 2.10 sub-item 4: an unsupported window frame must be a LOUD error,
- * not silently degraded to the running frame.  The compute path honors only
- * the whole partition (UNBOUNDED PRECEDING .. UNBOUNDED FOLLOWING) and the
- * running frame (ROWS, UNBOUNDED PRECEDING .. CURRENT ROW).  Any other frame
- * (N_PRECEDING / N_FOLLOWING bounds, RANGE-mode CURRENT ROW, a non-unbounded
- * start) was previously accepted and IGNORED — yielding the wrong window.
- * exec_window now rejects these. */
+/* Unsupported frames must be a LOUD error, not silently degraded to the
+ * running frame.  Whole, running, and fixed trailing ROWS frames are honored;
+ * other N_FOLLOWING/RANGE/non-trailing shapes remain unsupported. */
 static test_result_t test_window_unsupported_frame_errors(void) {
     ray_heap_init(); (void)ray_sym_init();
 
@@ -4220,8 +4216,6 @@ static test_result_t test_window_unsupported_frame_errors(void) {
 
     /* Helper: run a SUM window with the given frame and expect an error. */
     struct { uint8_t ftype, fstart, fend; int64_t sn, en; } bad[] = {
-        /* ROWS BETWEEN 1 PRECEDING AND CURRENT ROW — sliding, NOT honored */
-        { RAY_FRAME_ROWS,  RAY_BOUND_N_PRECEDING,         RAY_BOUND_CURRENT_ROW,        1, 0 },
         /* ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING — NOT honored */
         { RAY_FRAME_ROWS,  RAY_BOUND_UNBOUNDED_PRECEDING, RAY_BOUND_N_FOLLOWING,        0, 1 },
         /* RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW — RANGE not honored */
@@ -4247,7 +4241,33 @@ static test_result_t test_window_unsupported_frame_errors(void) {
         ray_release(result); ray_graph_free(g);
     }
 
-    /* Sanity: the two HONORED frames still succeed. */
+    /* ROWS BETWEEN 1 PRECEDING AND CURRENT ROW is a real sliding frame. */
+    {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* tbl_op = ray_const_table(g, tbl);
+        ray_op_t* g_op = ray_scan(g, "g");
+        ray_op_t* v_op = ray_scan(g, "v");
+        ray_op_t* parts[] = { g_op };
+        uint8_t   kinds[] = { RAY_WIN_SUM };
+        ray_op_t* fins[]  = { v_op };
+        int64_t   params[] = { 0 };
+        ray_op_t* w = ray_window_op(g, tbl_op, parts, 1, NULL, NULL, 0,
+                                    kinds, fins, params, 1, RAY_FRAME_ROWS,
+                                    RAY_BOUND_N_PRECEDING,
+                                    RAY_BOUND_CURRENT_ROW, 1, 0);
+        ray_t* result = ray_execute(g, w);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+        ray_t* sum_col = ray_table_get_col_idx(result, 2);
+        TEST_ASSERT_NOT_NULL(sum_col);
+        int64_t* sums = (int64_t*)ray_data(sum_col);
+        TEST_ASSERT_EQ_I(sums[0], 10);
+        TEST_ASSERT_EQ_I(sums[1], 30);
+        TEST_ASSERT_EQ_I(sums[2], 50);
+        TEST_ASSERT_EQ_I(sums[3], 70);
+        ray_release(result); ray_graph_free(g);
+    }
+
+    /* Sanity: the running frame still succeeds. */
     {
         ray_graph_t* g = ray_graph_new(tbl);
         ray_op_t* tbl_op = ray_const_table(g, tbl);

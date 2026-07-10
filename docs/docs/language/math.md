@@ -578,6 +578,8 @@ For common time-series scans, prefer the built-in DAG forms. They avoid per-row 
 (mins [3 1 2])              ; [3 1 1]
 (maxs [3 1 2])              ; [3 3 3]
 (fills (as 'I64 (list 0N 2 0N))) ; [0Nl 2 2]
+(fills (table [t value]
+              (list [1 2 3] (as 'I64 (list 10 0N 30))))) ; fills each column
 (differ [1 1 2 2])          ; [true false true false]
 (msum 3 [1 2 3 4])          ; [1 3 6 9]
 (mavg 3 [1 2 3 4])          ; [1.0 1.5 2.0 3.0]

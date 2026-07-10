@@ -165,7 +165,7 @@ Operations on vectors as collections.
 | `lead` | unary | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
 | `deltas` | unary | Adjacent differences; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
 | `ratios` | unary | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
-| `fills` | unary | Forward-fill nullable vectors | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
+| `fills` | unary | Forward-fill nullable vectors, or every column of a table | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
 | `sums` | unary | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
 | `avgs` | unary | Running average over non-null values | `(avgs [2 4 6])` → `[2.0 3.0 4.0]` |
 | `mins` | unary | Running minimum | `(mins [3 1 2])` → `[3 1 1]` |

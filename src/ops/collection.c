@@ -3851,7 +3851,26 @@ ray_t* ray_ratios_fn(ray_t* x) {
 ray_t* ray_fills_fn(ray_t* x) {
     if (ray_is_lazy(x)) return ray_lazy_append(x, OP_FILLS);
     if (ray_is_vec(x)) return ts_start_lazy_unary(x, ray_fills_op);
-    return ray_error("type", "fills expects a vector input, got %s", ray_type_name(x ? x->type : 0));
+    if (x && x->type == RAY_TABLE) {
+        int64_t ncols = ray_table_ncols(x);
+        ray_t* out = ray_table_new(ncols);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+
+        for (int64_t c = 0; c < ncols; c++) {
+            ray_t* col = ray_table_get_col_idx(x, c);
+            ray_t* filled = fills_vec_eager(col);
+            if (!filled || RAY_IS_ERR(filled)) {
+                ray_release(out);
+                return filled ? filled : ray_error("oom", NULL);
+            }
+
+            out = ray_table_add_col(out, ray_table_col_name(x, c), filled);
+            ray_release(filled);
+            if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        }
+        return out;
+    }
+    return ray_error("type", "fills expects a vector or table input, got %s", ray_type_name(x ? x->type : 0));
 }
 
 ray_t* ray_sums_fn(ray_t* x) {

@@ -578,3 +578,106 @@ ray_t* ray_rowsel_refine(ray_t* existing, ray_t* pred) {
     ray_release(pop_block);
     return block;
 }
+
+ray_t* ray_rowsel_intersect(ray_t* a, ray_t* b) {
+    if (!a || !b) return NULL;
+    ray_rowsel_t* am = ray_rowsel_meta(a);
+    ray_rowsel_t* bm = ray_rowsel_meta(b);
+    if (am->nrows != bm->nrows || am->n_segs != bm->n_segs) return NULL;
+
+    uint32_t ns = am->n_segs;
+    const uint8_t* af = ray_rowsel_flags(a);
+    const uint8_t* bf = ray_rowsel_flags(b);
+    const uint32_t* ao = ray_rowsel_offsets(a);
+    const uint32_t* bo = ray_rowsel_offsets(b);
+    const uint16_t* ai = ray_rowsel_idx(a);
+    const uint16_t* bi = ray_rowsel_idx(b);
+    int64_t total = 0;
+    int64_t idx_count = 0;
+
+    /* Count the intersection per segment.  MIX arrays are sorted by every
+     * producer, so MIX∩MIX is a linear two-cursor walk. */
+    for (uint32_t s = 0; s < ns; s++) {
+        int64_t ss = (int64_t)s * RAY_MORSEL_ELEMS;
+        int64_t se = ss + RAY_MORSEL_ELEMS;
+        if (se > am->nrows) se = am->nrows;
+        int64_t seg_len = se - ss;
+        int64_t pc = 0;
+        if (af[s] == RAY_SEL_NONE || bf[s] == RAY_SEL_NONE) {
+            pc = 0;
+        } else if (af[s] == RAY_SEL_ALL && bf[s] == RAY_SEL_ALL) {
+            pc = seg_len;
+        } else if (af[s] == RAY_SEL_ALL) {
+            pc = bo[s + 1] - bo[s];
+        } else if (bf[s] == RAY_SEL_ALL) {
+            pc = ao[s + 1] - ao[s];
+        } else {
+            uint32_t ap = ao[s], ae = ao[s + 1];
+            uint32_t bp = bo[s], be = bo[s + 1];
+            while (ap < ae && bp < be) {
+                uint16_t av = ai[ap], bv = bi[bp];
+                if (av < bv) ap++;
+                else if (bv < av) bp++;
+                else { pc++; ap++; bp++; }
+            }
+        }
+        total += pc;
+        if (pc > 0 && pc != seg_len) idx_count += pc;
+    }
+
+    ray_t* out = ray_rowsel_new(am->nrows, total, idx_count);
+    if (!out) return NULL;
+    uint8_t* of = ray_rowsel_flags(out);
+    uint32_t* oo = ray_rowsel_offsets(out);
+    uint16_t* oi = ray_rowsel_idx(out);
+    uint32_t cum = 0;
+
+    for (uint32_t s = 0; s < ns; s++) {
+        oo[s] = cum;
+        int64_t ss = (int64_t)s * RAY_MORSEL_ELEMS;
+        int64_t se = ss + RAY_MORSEL_ELEMS;
+        if (se > am->nrows) se = am->nrows;
+        int64_t seg_len = se - ss;
+
+        if (af[s] == RAY_SEL_NONE || bf[s] == RAY_SEL_NONE) {
+            of[s] = RAY_SEL_NONE;
+        } else if (af[s] == RAY_SEL_ALL && bf[s] == RAY_SEL_ALL) {
+            of[s] = RAY_SEL_ALL;
+        } else {
+            const uint16_t* src = NULL;
+            uint32_t begin = 0, end = 0;
+            if (af[s] == RAY_SEL_ALL) {
+                src = bi; begin = bo[s]; end = bo[s + 1];
+            } else if (bf[s] == RAY_SEL_ALL) {
+                src = ai; begin = ao[s]; end = ao[s + 1];
+            }
+
+            uint32_t start = cum;
+            if (src) {
+                for (uint32_t p = begin; p < end; p++) oi[cum++] = src[p];
+            } else {
+                uint32_t ap = ao[s], ae = ao[s + 1];
+                uint32_t bp = bo[s], be = bo[s + 1];
+                while (ap < ae && bp < be) {
+                    uint16_t av = ai[ap], bv = bi[bp];
+                    if (av < bv) ap++;
+                    else if (bv < av) bp++;
+                    else { oi[cum++] = av; ap++; bp++; }
+                }
+            }
+            uint32_t pc = cum - start;
+            if (pc == 0) {
+                of[s] = RAY_SEL_NONE;
+            } else if ((int64_t)pc == seg_len) {
+                /* This cannot arise from MIX input under canonical encoding,
+                 * but keep the representation valid defensively. */
+                of[s] = RAY_SEL_ALL;
+                cum = start;
+            } else {
+                of[s] = RAY_SEL_MIX;
+            }
+        }
+    }
+    oo[ns] = cum;
+    return out;
+}

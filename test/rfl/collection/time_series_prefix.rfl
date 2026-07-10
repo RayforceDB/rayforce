@@ -7,6 +7,17 @@
 (fills (as 'F64 (list 0Nf 1.5 0Nf 3.0))) -- (as 'F64 (list 0Nf 1.5 1.5 3.0))
 (fills [1 2 3]) -- [1 2 3]
 
+;; Tables are filled column-wise. This is the shape produced by pivot: the
+;; index column is already dense while sparse value columns carry forward
+;; independently.
+(set FT (table [t a b] (list [1 2 3 4] (as 'F64 (list 10.0 0Nf 30.0 0Nf)) (as 'I64 (list 0N 20 0N 40)))))
+(set FF (fills FT))
+(key FF) -- [t a b]
+(at FF 't) -- [1 2 3 4]
+(at FF 'a) -- (as 'F64 [10.0 10.0 30.0 30.0])
+(at FF 'b) -- (as 'I64 (list 0N 20 20 40))
+(type FF) -- 'TABLE
+
 ;; Running aggregates skip null payloads. sum/prod use aggregate identities;
 ;; avg/min/max stay null until the first non-null value.
 (sums [1 2 3 4]) -- [1 3 6 10]

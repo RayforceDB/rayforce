@@ -29,6 +29,16 @@
 ;;   full result in original row order: [7 2 16 4 8 15]
 (at (window {from: T part: [k] order: [v] frame: 'running funcs: {cs: (sum v)}}) 'cs) -- [7 2 16 4 8 15]
 
+;; ── fixed trailing frame → resets at each partition boundary ────────────
+;; A positive integer frame is the number of rows including the current row.
+(set M (table [k o v] (list ['a 'a 'b 'a 'b 'a] [1 2 1 3 2 4] [10 20 100 30 200 40])))
+(set MW (window {from: M part: [k] order: [o] frame: 3 funcs: {ma: (avg v) ms: (sum v) mn: (min v) mx: (max v) n: (count v)}}))
+(at MW 'ma) -- [10.0 15.0 100.0 20.0 150.0 30.0]
+(at MW 'ms) -- [10 30 100 60 300 90]
+(at MW 'mn) -- [10 10 100 10 100 20]
+(at MW 'mx) -- [10 20 100 30 200 40]
+(at MW 'n) -- [1 2 1 3 2 3]
+
 ;; ── fby shape: rows equal to their group's min (keeps ties) ─────────────────
 ;; min over k: a→2 (only row v=2), b→4 (rows v=4,4 both) → 3 rows total
 (count (select {from: (window {from: T part: [k] funcs: {mn: (min v)}}) where: (== v mn)})) -- 3
@@ -43,6 +53,8 @@
 (window {from: T funcs: {x: (median v)}}) !- domain
 ;; (b) bad frame symbol
 (window {from: T frame: 'bogus funcs: {mn: (min v)}}) !- domain
+;; (b2) trailing row count must be positive
+(window {from: T frame: 0 funcs: {mn: (min v)}}) !- range
 ;; (c) first without order:
 (window {from: T part: [k] funcs: {f: (first v)}}) !- domain
 ;; (d) missing funcs:

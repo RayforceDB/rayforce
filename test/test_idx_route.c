@@ -105,6 +105,27 @@ static int attach_hash_to_col(ray_t* tbl, const char* name) {
     return 0;
 }
 
+/* Attach a part index using the same retain/write-back cycle. */
+static int attach_part_to_col(ray_t* tbl, const char* name) {
+    int64_t sym_id = ray_sym_intern(name, (int64_t)strlen(name));
+    int64_t ncols = ray_table_ncols(tbl);
+    int64_t slot = -1;
+    for (int64_t i = 0; i < ncols; i++) {
+        if (ray_table_col_name(tbl, i) == sym_id) { slot = i; break; }
+    }
+    if (slot < 0) return -1;
+
+    ray_t* col = ray_table_get_col_idx(tbl, slot);
+    if (!col || RAY_IS_ERR(col)) return -1;
+    ray_t* w = col;
+    ray_retain(w);
+    ray_t* r = ray_index_attach_part(&w);
+    if (!r || RAY_IS_ERR(r)) { ray_release(w); return -1; }
+    ray_table_set_col_idx(tbl, slot, w);
+    ray_release(w);
+    return 0;
+}
+
 /* Attach a zone index to the named column in `tbl`.
  * Same retain/write-back/release cycle as attach_hash_to_col:
  * ray_table_set_col_idx retains `w` before releasing the old pointer,
@@ -1083,6 +1104,120 @@ static test_result_t test_range_sorted_all_segments(void) {
     PASS();
 }
 
+/* sorted_marker_dense_range: physically sorted k=i with only the verified
+ * sorted marker (no sort index).  (>= k 100000) selects 62% of the table —
+ * deliberately far beyond the shuffled sort-index selectivity guard.  The
+ * direct path must still hit because the result is one contiguous row span. */
+static ray_op_t* pred_ge_100000(ray_graph_t* g) {
+    return ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 100000));
+}
+
+static test_result_t test_sorted_marker_dense_range(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t N = 262144;
+    ray_t* kv = ray_vec_new(RAY_I64, N);
+    ray_t* vv = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vv));
+    kv->len = vv->len = N;
+    int64_t* kd = (int64_t*)ray_data(kv);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < N; i++) kd[i] = vd[i] = i;
+    kv->attrs |= RAY_ATTR_SORTED;  /* fixture is verified by construction */
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vv);
+    ray_release(kv);
+    ray_release(vv);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    TEST_ASSERT_EQ_I((int)ray_index_kind(ray_table_get_col(tbl,
+                     ray_sym_intern("k", 1))), RAY_IDX_NONE);
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_RANGE];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+    ray_t* r = run_filter(tbl, pred_ge_100000);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), N - 100000);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_RANGE] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE] - hits_before), 1);
+
+    ray_t* rv = ray_table_get_col(r, ray_sym_intern("v", 1));
+    TEST_ASSERT_FALSE(!rv || RAY_IS_ERR(rv));
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(rv, 0), 100000);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(rv, ray_len(rv) - 1), N - 1);
+
+    ray_release(r);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Two-sided ranges are split into chained FILTER nodes by the optimizer.
+ * Both bounds must route and intersect as rowsels; the outer bound must not
+ * fall back to scanning the inner selection. */
+static test_result_t test_sorted_marker_chained_range(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    const int64_t N = 262144;
+    ray_t* kv = ray_vec_new(RAY_I64, N);
+    ray_t* vv = ray_vec_new(RAY_I64, N);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(kv));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(vv));
+    kv->len = vv->len = N;
+    int64_t* kd = (int64_t*)ray_data(kv);
+    int64_t* vd = (int64_t*)ray_data(vv);
+    for (int64_t i = 0; i < N; i++) kd[i] = vd[i] = i;
+    kv->attrs |= RAY_ATTR_SORTED;
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("k", 1), kv);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vv);
+    ray_release(kv); ray_release(vv);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* base = ray_const_table(g, tbl);
+    ray_op_t* ge = ray_ge(g, ray_scan(g, "k"), ray_const_i64(g, 100000));
+    ray_op_t* inner = ray_filter(g, base, ge);
+    ray_op_t* lt = ray_lt(g, ray_scan(g, "k"), ray_const_i64(g, 100100));
+    ray_op_t* outer = ray_filter(g, inner, lt);
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_RANGE];
+    ray_t* r = ray_execute(g, outer);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 100);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_RANGE] - hits_before), 2);
+    ray_t* rv = ray_table_get_col(r, ray_sym_intern("v", 1));
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(rv, 0), 100000);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(rv, 99), 100099);
+
+    ray_release(r);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* The direct route trusts RAY_ATTR_SORTED, so every payload mutation must
+ * clear it even when the vector has no attached accelerator index. */
+static test_result_t test_sorted_marker_mutation_invalidates(void) {
+    ray_heap_init();
+    int64_t data[] = { 1, 2, 3 };
+    ray_t* v = ray_vec_from_raw(RAY_I64, data, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    v->attrs |= RAY_ATTR_SORTED;
+    int64_t replacement = 0;
+    v = ray_vec_set(v, 1, &replacement);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+    TEST_ASSERT_FALSE(ray_attr_is_sorted(v));
+    ray_release(v);
+    ray_heap_destroy();
+    PASS();
+}
+
 /* (== k 7) on the dense-dup fixture below. */
 static ray_op_t* pred_eq_7_dups(ray_graph_t* g) {
     return ray_eq(g, ray_scan(g, "k"), ray_const_i64(g, 7));
@@ -1175,6 +1310,69 @@ static ray_op_t* pred_in_100_5(ray_graph_t* g) {
     return ray_in(g, ray_scan(g, "k"), set_op);
 }
 
+static ray_t* make_part_sym_table(void) {
+    (void)ray_sym_init();
+    const int64_t n = 4096;
+    int64_t block_ids[] = {
+        ray_sym_intern("part_z", 6),
+        ray_sym_intern("part_a", 6),
+        ray_sym_intern("part_m", 6),
+        ray_sym_intern("part_b", 6)
+    };
+    int64_t ends[] = {700, 2000, 2900, 4096};
+    ray_t* syms = ray_sym_vec_new(RAY_SYM_W64, n);
+    ray_t* vals = ray_vec_new(RAY_I64, n);
+    if (!syms || !vals || RAY_IS_ERR(syms) || RAY_IS_ERR(vals)) {
+        if (syms && !RAY_IS_ERR(syms)) ray_release(syms);
+        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        return ray_error("oom", NULL);
+    }
+    syms->len = vals->len = n;
+    int64_t p = 0;
+    for (int64_t i = 0; i < n; i++) {
+        while (i >= ends[p]) p++;
+        ray_write_sym(ray_data(syms), i, (uint64_t)block_ids[p],
+                      RAY_SYM, syms->attrs);
+        ((int64_t*)ray_data(vals))[i] = i;
+    }
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("sym", 3), syms);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("v", 1), vals);
+    ray_release(syms);
+    ray_release(vals);
+    return tbl;
+}
+
+/* Select two non-adjacent, dense partitions plus an absent symbol. */
+static ray_op_t* pred_in_part_syms(ray_graph_t* g) {
+    int64_t ids[] = {
+        ray_sym_intern("part_a", 6),
+        ray_sym_intern("part_b", 6),
+        ray_sym_intern("part_absent", 11)
+    };
+    ray_t* set = ray_sym_vec_new(RAY_SYM_W64, 3);
+    if (!set || RAY_IS_ERR(set)) return NULL;
+    for (int64_t i = 0; i < 3; i++)
+        set = ray_vec_append(set, &ids[i]);
+    ray_op_t* set_op = ray_const_vec(g, set);
+    ray_release(set);
+    return ray_in(g, ray_scan(g, "sym"), set_op);
+}
+
+static ray_op_t* pred_eq_part_a(ray_graph_t* g) {
+    ray_t* lit = ray_sym(ray_sym_intern("part_a", 6));
+    ray_op_t* c = ray_const_atom(g, lit);
+    ray_release(lit);
+    return ray_eq(g, ray_scan(g, "sym"), c);
+}
+
+static ray_op_t* pred_eq_part_absent(ray_graph_t* g) {
+    ray_t* lit = ray_sym(ray_sym_intern("part_absent", 11));
+    ray_op_t* c = ray_const_atom(g, lit);
+    ray_release(lit);
+    return ray_eq(g, ray_scan(g, "sym"), c);
+}
+
 /* ─── IN tests ───────────────────────────────────────────────────── */
 
 /* in_hash: hash on k; FILTER(IN(k, [9 5])) → 4 rows; IDX_SITE_IN
@@ -1207,6 +1405,96 @@ static test_result_t test_in_hash(void) {
 
     ray_release(ra); ray_release(rb);
     ray_release(tbl_a); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* A part index should keep dense unions as physical spans.  The chosen
+ * blocks select 2496/4096 rows, which deliberately exceeds the hash route's
+ * density guard, and exercise both full and partial morsels. */
+static test_result_t test_in_part_sym_dense(void) {
+    ray_heap_init();
+    ray_t* tbl_a = make_part_sym_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_a));
+    TEST_ASSERT(attach_part_to_col(tbl_a, "sym") == 0,
+                "attach part (in_part_sym_dense)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_IN];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_IN];
+    ray_t* ra = run_filter(tbl_a, pred_in_part_syms);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
+    TEST_ASSERT_EQ_I(ray_table_nrows(ra), 2496);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_IN] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_IN] - hits_before), 1);
+
+    ray_t* tbl_b = make_part_sym_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+    ray_t* rb = run_filter(tbl_b, pred_in_part_syms);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 2496);
+    TEST_ASSERT(v_cols_equal(ra, rb),
+                "v column mismatch between parted IN and scan");
+
+    ray_release(ra); ray_release(rb);
+    ray_release(tbl_a); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Equality on a dense part must use its physical span directly rather than
+ * tripping the hash route's density guard.  part_a occupies rows [700,2000). */
+static test_result_t test_eq_part_sym_dense(void) {
+    ray_heap_init();
+    ray_t* tbl_a = make_part_sym_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_a));
+    TEST_ASSERT(attach_part_to_col(tbl_a, "sym") == 0,
+                "attach part (eq_part_sym_dense)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_PART];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_PART];
+    ray_t* ra = run_filter(tbl_a, pred_eq_part_a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ra));
+    TEST_ASSERT_EQ_I(ray_table_nrows(ra), 1300);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_PART] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_PART] - hits_before), 1);
+
+    ray_t* tbl_b = make_part_sym_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl_b));
+    ray_t* rb = run_filter(tbl_b, pred_eq_part_a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rb));
+    TEST_ASSERT_EQ_I(ray_table_nrows(rb), 1300);
+    TEST_ASSERT(v_cols_equal(ra, rb),
+                "v column mismatch between parted EQ and scan");
+
+    ray_release(ra); ray_release(rb);
+    ray_release(tbl_a); ray_release(tbl_b);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* A symbol can exist in the shared domain without having a physical part.
+ * That is still a successful index proof yielding a valid empty rowsel. */
+static test_result_t test_eq_part_sym_absent(void) {
+    ray_heap_init();
+    ray_t* tbl = make_part_sym_table();
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    (void)ray_sym_intern("part_absent", 11);
+    TEST_ASSERT(attach_part_to_col(tbl, "sym") == 0,
+                "attach part (eq_part_sym_absent)");
+
+    uint64_t cons_before = ray_idx_consults[IDX_SITE_FILTER_PART];
+    uint64_t hits_before = ray_idx_hits[IDX_SITE_FILTER_PART];
+    ray_t* r = run_filter(tbl, pred_eq_part_absent);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 0);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_consults[IDX_SITE_FILTER_PART] - cons_before), 1);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_PART] - hits_before), 1);
+
+    ray_release(r);
+    ray_release(tbl);
     ray_sym_destroy();
     ray_heap_destroy();
     PASS();
@@ -2542,8 +2830,14 @@ const test_entry_t idx_route_entries[] = {
     { "idx_route/range_guard",               test_range_guard,               NULL, NULL },
     { "idx_route/range_f64",                 test_range_f64,                 NULL, NULL },
     { "idx_route/range_sorted_all_segments", test_range_sorted_all_segments, NULL, NULL },
+    { "idx_route/sorted_marker_dense_range", test_sorted_marker_dense_range, NULL, NULL },
+    { "idx_route/sorted_marker_chained_range", test_sorted_marker_chained_range, NULL, NULL },
+    { "idx_route/sorted_marker_mutation_invalidates", test_sorted_marker_mutation_invalidates, NULL, NULL },
     { "idx_route/hash_eq_dense_dups",        test_hash_eq_dense_dups,        NULL, NULL },
     { "idx_route/in_hash",                   test_in_hash,                   NULL, NULL },
+    { "idx_route/in_part_sym_dense",         test_in_part_sym_dense,         NULL, NULL },
+    { "idx_route/eq_part_sym_dense",         test_eq_part_sym_dense,         NULL, NULL },
+    { "idx_route/eq_part_sym_absent",        test_eq_part_sym_absent,        NULL, NULL },
     { "idx_route/in_dup_set",                test_in_dup_set,                NULL, NULL },
     { "idx_route/in_absent_elems",           test_in_absent_elems,           NULL, NULL },
     { "idx_route/in_float_col_falls_back",   test_in_float_col_falls_back,   NULL, NULL },

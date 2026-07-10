@@ -7370,9 +7370,10 @@ grp_done:
  * ============================================================================
  *
  * The probe (exec.c ray_slice_group_probe) resolved the WHERE key set
- * against the group-key column's CSR hash index: g->sg_slices_hdr holds
- * one (domain-id, rows, n) slice per surviving key, ascending by domain
- * id — the DA path's emit order.  Aggregate each slice directly: the
+ * against the group-key column's hash or part index: g->sg_slices_hdr holds
+ * one slice per surviving key, ascending by domain id — the DA path's emit
+ * order. Hash slices borrow row-id arrays; part slices carry a contiguous
+ * physical range. Aggregate each slice directly: the
  * filter scan, the survivor gather and group discovery all vanish; per
  * group the accumulation applies the same all_sum recurrence da_accum_row
  * applies row-by-row (same read helpers, same in-order accumulate), so
@@ -7525,12 +7526,12 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
     for (int64_t ti = tstart; ti < tend; ti++) {
         const sg_task_t* tk = &c->tasks[ti];
         const ray_idx_slice_t* sl = &c->slices[tk->gi];
-        const int64_t* restrict rows = sl->rows + tk->lo;
+        const int64_t* restrict rows = sl->rows ? sl->rows + tk->lo : NULL;
         int64_t n = tk->hi - tk->lo;
         /* Parted layout: each key's rows form one contiguous run — the
          * accumulate then streams raw column pointers and vectorizes. */
-        bool contig = (n > 0 && rows[n - 1] - rows[0] + 1 == n);
-        int64_t r0 = (n > 0) ? rows[0] : 0;
+        bool contig = (n > 0 && (!rows || rows[n - 1] - rows[0] + 1 == n));
+        int64_t r0 = n > 0 ? (rows ? rows[0] : sl->first + tk->lo) : 0;
         for (uint32_t a = 0; a < c->n_aggs; a++) {
             size_t idx = (size_t)ti * c->n_aggs + a;
             uint16_t op = c->agg_ops[a];
@@ -7667,7 +7668,13 @@ static ray_t* sg_hint_to_selection(ray_graph_t* g, ray_t* tbl) {
         int64_t* ids = (int64_t*)ray_data(hdr);
         int64_t w = 0;
         for (int64_t i = 0; i < K; i++) {
-            memcpy(ids + w, sl[i].rows, (size_t)sl[i].n * sizeof(int64_t));
+            if (sl[i].rows) {
+                memcpy(ids + w, sl[i].rows,
+                       (size_t)sl[i].n * sizeof(int64_t));
+            } else {
+                for (int64_t j = 0; j < sl[i].n; j++)
+                    ids[w + j] = sl[i].first + j;
+            }
             w += sl[i].n;
         }
         /* Slices are disjoint and each ascending; a plain sort restores

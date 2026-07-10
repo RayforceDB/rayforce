@@ -184,6 +184,11 @@ ray_t* ray_rowsel_to_indices(ray_t* sel);
  * the old selection after replacing it. */
 ray_t* ray_rowsel_refine(ray_t* existing, ray_t* pred);
 
+/* Intersect two rowsels over the same source row domain.  Both inputs are
+ * borrowed; the returned rowsel is fresh.  Runs in O(n_segs + mixed ids),
+ * preserving NONE/ALL compression without materializing a bool vector. */
+ray_t* ray_rowsel_intersect(ray_t* a, ray_t* b);
+
 /* ──────────────────────────────────────────────────────────────────
  * Streaming builder — per-morsel selection emitter
  *

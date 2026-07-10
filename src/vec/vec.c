@@ -103,6 +103,9 @@ static inline bool vec_any_nulls(const ray_t* v) {
  * reads them.  Detect rc>1 and copy the saved pointers via
  * ray_index_retain_saved instead of moving them out. */
 static inline void vec_drop_index_inplace(ray_t* v) {
+    /* Any payload/length mutation invalidates the physical-order promise,
+     * even when no accelerator index is attached. */
+    v->attrs &= (uint8_t)~RAY_ATTR_SORTED;
     if (!(v->attrs & RAY_ATTR_HAS_INDEX)) return;
     ray_t* idx = v->index;
     ray_index_t* ix = ray_index_payload(idx);

@@ -519,9 +519,9 @@ typedef struct ray_graph {
     /* Slice-group hint (FILTER(in/eq on c) + GROUP(by c) fusion).
      * Armed by ray_slice_group_probe (exec.c) INSTEAD of executing the
      * WHERE filter when the predicate is exactly membership on the
-     * single bare group-key column and that column carries a fresh CSR
-     * hash index: surviving groups are then exactly the key set and
-     * each group's rows are its full CSR slice.  sg_col is the retained
+     * single bare group-key column and that column carries a fresh hash
+     * or part index: surviving groups are then exactly the key set and
+     * each group's rows are its full index slice.  sg_col is the retained
      * key column; sg_slices_hdr is an alloc block of ray_idx_slice_t
      * (idxop.h) resolved at probe time, ascending by column-domain id.
      * exec_group consumes the hint — aggregating the slices directly or

@@ -16,8 +16,11 @@ The executor consults indexes at five sites.  Each site has a specific consumpti
 | `.idx.zone` | `filter` — comparison predicates (EQ/NE/LT/LE/GT/GE) | O(1) all/none short-circuit: if the constant falls outside the column's [min, max] range the filter returns 0 rows without scanning; if every row must pass the whole table is returned.  Integer and float families both supported. |
 | `.idx.bloom` | `filter` — EQ on integer-family columns | Definite-absent proof: if all k probe bits are clear the key is absent and the filter returns 0 rows without scanning.  False positives fall through to the scan; there are no false absences. |
 | `.idx.hash` | `filter` — EQ on integer-family columns | Direct rowsel from hash-chain probe: matching rows are collected in O(matches) without a full column scan.  Null-free columns only (HAS_NULLS → scan). |
+| `part` backing (`.attr.set 'parted`) | `filter` — EQ predicates | Locate the value block and build the rowsel directly from its contiguous `[start, len)` span, including dense blocks. |
 | `.idx.sort` | `filter` — range predicates (EQ/LT/LE/GT/GE) | Binary search over the row-id permutation to identify the matching span, then a rowsel is built from that span.  NE (two disjoint spans) falls back.  A selectivity guard fires when the span exceeds n/128 (~0.78%) — see [Performance Characteristics](#performance-characteristics) for the measured rationale. |
 | `.idx.hash` | `filter` — IN predicates on integer-family columns | Hash-chain probe for each set element; result is the union rowsel over all matches. |
+| `part` backing (`.attr.set 'parted`) | `filter` — IN predicates | Match partition keys once and build the rowsel from their contiguous physical spans. |
+| `.idx.hash` / `part` backing | `where key IN …` + `group by key` | Resolve only the requested key slices and aggregate them directly, skipping filter scan and group discovery. Part slices stream as contiguous ranges. |
 | `.idx.sort` | ORDER BY — single ascending key | The pre-built permutation is reused directly rather than re-sorting.  Descending ORDER BY falls back to recompute (reversing the perm would swap tie-group positions relative to stable DESC sort). |
 | `.idx.sort` | `distinct` | Walk the sort permutation once to collect first-occurrence row ids per distinct value — O(n) with no hash table.  SYM/GUID/STR columns fall back. |
 | `.idx.hash` | `find` | Hash-chain probe returns the minimum row id matching the needle, or a provably-absent signal.  Integer-family needles only; float and cross-family needles fall through to the scan. |
@@ -71,8 +74,10 @@ Set `RAY_IDX_STATS=1` before running a process.  At exit, per-site consult and h
 idx_route filter_zone   consults=3 hits=2
 idx_route filter_bloom  consults=1 hits=1
 idx_route filter_hash   consults=5 hits=5
+idx_route filter_part   consults=3 hits=3
 idx_route filter_range  consults=4 hits=3
 idx_route in            consults=2 hits=2
+idx_route group-slice   consults=2 hits=2
 idx_route find          consults=8 hits=7
 idx_route sort          consults=6 hits=6
 idx_route distinct      consults=2 hits=2

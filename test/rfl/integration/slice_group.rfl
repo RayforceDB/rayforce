@@ -22,6 +22,9 @@
 ;; Sorted twin (contiguous slices — the streaming fast loops).
 (set TSRT (xasc TP ['s 'v]))
 (set TSI (table [s v f w] (list (.attr.set 'grouped (at TSRT 's)) (at TSRT 'v) (at TSRT 'f) (at TSRT 'w))))
+;; Same contiguous layout backed by the part index.  This must feed the same
+;; slice aggregation kernel without expanding each partition into row ids.
+(set TPI (table [s v f w] (list (.attr.set 'parted (at TSRT 's)) (at TSRT 'v) (at TSRT 'f) (at TSRT 'w))))
 
 ;; group aa sees v ∈ {0,8,…,3992}: count=500, sum=998000; bb: {1,9,…}: 998500
 ;; ── IN set: sums/counts/avg, indexed vs plain vs hand values ──
@@ -72,8 +75,11 @@
 ;;    incl. arith-of-aggs decomposition wrappers ──
 (set Q3I (select {wp: (/ (sum (* w f)) (as 'F64 (sum w))) from: TI by: s where: (in s ['aa 'bb 'cc 'dd])}))
 (set Q3P (select {wp: (/ (sum (* w f)) (as 'F64 (sum w))) from: TP by: s where: (in s ['aa 'bb 'cc 'dd])}))
+(set Q3PI (select {wp: (/ (sum (* w f)) (as 'F64 (sum w))) from: TPI by: s where: (in s ['aa 'bb 'cc 'dd])}))
 (min (== (at Q3I 'wp) (at Q3P 'wp))) -- true
 (min (== (at Q3I 's) (at Q3P 's))) -- true
+(min (== (at Q3PI 'wp) (at Q3P 'wp))) -- true
+(min (== (at Q3PI 's) (at Q3P 's))) -- true
 
 ;; ── eq single key ──
 (set Q4I (select {sv: (sum v) from: TI by: s where: (== s 'ee)}))

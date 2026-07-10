@@ -1192,8 +1192,8 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op,
  * WHERE filter, after ray_optimize.  When the compiled filter's predicate
  * is exactly membership on the single bare group-key column — (in c SET)
  * or (== c K), no other conjuncts, no chained filter — and that column
- * carries a fresh CSR hash index, the surviving groups are exactly the
- * key set and each group's rows are its full CSR slice: resolve the
+ * carries a fresh hash or part index, the surviving groups are exactly the
+ * key set and each group's rows are its full index slice: resolve the
  * slices NOW (freshness verified inside the resolver) and arm the hint
  * on g.  exec_group consumes it — aggregating the slices directly, or
  * folding them into the selection the skipped filter would have
@@ -1207,7 +1207,8 @@ bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
     if (!in0 || in0->opcode == OP_FILTER) return false;
     if (by_col->type != RAY_SYM || ray_is_atom(by_col)) return false;
     if (by_col->attrs & RAY_ATTR_HAS_NULLS) return false;
-    if (ray_index_kind(by_col) != RAY_IDX_HASH) return false;
+    ray_idx_kind_t kind = ray_index_kind(by_col);
+    if (kind != RAY_IDX_HASH && kind != RAY_IDX_PART) return false;
     ray_op_t* pred = op_child(g, root, 1);
     if (!pred) return false;
 
@@ -1236,7 +1237,7 @@ bool ray_slice_group_probe(ray_graph_t* g, ray_op_t* root, ray_t* by_col) {
     ray_idx_consults[IDX_SITE_GROUP_SLICE]++;
     ray_idx_slice_t* sl = NULL;
     ray_t* shdr = NULL;
-    int64_t k = ray_index_hash_sym_slices(by_col, keys, &sl, &shdr);
+    int64_t k = ray_index_sym_slices(by_col, keys, &sl, &shdr);
     if (eq_atom) ray_release(eq_atom);
     if (k < 0) return false;
     ray_idx_hits[IDX_SITE_GROUP_SLICE]++;
@@ -2072,6 +2073,41 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
 
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
+            /* A verified physically-sorted column remains routable even when
+             * this is the outer half of a split AND predicate.  Intersect the
+             * new contiguous range rowsel with the existing selection instead
+             * of evaluating the second bound over surviving rows. */
+            if (input->type == RAY_TABLE) {
+                ray_t* scol = NULL;
+                uint16_t sop = 0;
+                int64_t ski = 0;
+                double skf = 0.0;
+                int sisf = 0;
+                if (idx_filter_decode(g, op_child(g, op, 1), &scol, &sop,
+                                      &ski, &skf, &sisf) &&
+                    sop != OP_NE && ray_attr_is_sorted(scol)) {
+                    ray_idx_consults[IDX_SITE_FILTER_RANGE]++;
+                    ray_t* ssel = ray_sorted_range_rowsel(scol, sop, ski, skf,
+                                                          (bool)sisf);
+                    if (ssel) {
+                        if (g->selection) {
+                            ray_t* merged = ray_rowsel_intersect(g->selection,
+                                                                 ssel);
+                            ray_rowsel_release(ssel);
+                            if (merged) {
+                                ray_rowsel_release(g->selection);
+                                g->selection = merged;
+                                ray_idx_hits[IDX_SITE_FILTER_RANGE]++;
+                                return input;
+                            }
+                        } else {
+                            g->selection = ssel;
+                            ray_idx_hits[IDX_SITE_FILTER_RANGE]++;
+                            return input;
+                        }
+                    }
+                }
+            }
             /* Hash-index point-lookup fast path: when the predicate is
              * `col == K` on a column with RAY_IDX_HASH attached and
              * built for the column's current length, install the
@@ -2124,7 +2160,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                     }
 
-                    /* 3. Hash-eq: integer or SYM EQ; re-check HAS_NULLS. */
+                    /* 3. Hash/part EQ: integer or SYM; re-check HAS_NULLS.
+                     * A part hit is already one contiguous physical span, so
+                     * it stays eligible at any density. */
                     if (cmp_op == OP_EQ && !is_float &&
                         !(col->attrs & RAY_ATTR_HAS_NULLS)) {
                         /* SYM equality: idx_filter_decode passes the global intern id;
@@ -2153,21 +2191,33 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             }
                         }
                         if (!sym_probe_skip) {
-                            if (ray_index_kind(col) == RAY_IDX_HASH)
-                                ray_idx_consults[IDX_SITE_FILTER_HASH]++;
-                            ray_t* sel = ray_index_hash_eq_rowsel(col, key_i);
-                            if (sel) {
-                                ray_idx_hits[IDX_SITE_FILTER_HASH]++;
-                                g->selection = sel;
-                                return input;
+                            ray_idx_kind_t eq_kind = ray_index_kind(col);
+                            if (eq_kind == RAY_IDX_HASH ||
+                                eq_kind == RAY_IDX_PART) {
+                                idx_site_t site = eq_kind == RAY_IDX_HASH
+                                    ? IDX_SITE_FILTER_HASH
+                                    : IDX_SITE_FILTER_PART;
+                                ray_idx_consults[site]++;
+                                ray_t* sel = eq_kind == RAY_IDX_HASH
+                                    ? ray_index_hash_eq_rowsel(col, key_i)
+                                    : ray_index_part_eq_rowsel(col, key_i);
+                                if (sel) {
+                                    ray_idx_hits[site]++;
+                                    g->selection = sel;
+                                    return input;
+                                }
                             }
                             /* sel == NULL: ineligible (wrong/stale index kind,
                              * key out of range) or OOM — fall through to scan. */
                         }
                     }
 
-                    /* 4. Sort-index range: EQ/LT/LE/GT/GE (NE returns NULL). */
+                    /* 4. Sort-index range: EQ/LT/LE/GT/GE (NE returns NULL).
+                     * The physical-sorted route runs before this block so it
+                     * can also intersect an existing chained selection. */
                     if (cmp_op != OP_NE) {
+                        /* Shuffled physical rows need the
+                         * permutation probe and its sparse-span guard. */
                         if (ray_index_kind(col) == RAY_IDX_SORT) {
                             ray_idx_consults[IDX_SITE_FILTER_RANGE]++;
                             ray_t* sel = ray_index_range_rowsel(col, cmp_op,
@@ -2290,17 +2340,18 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     }
                 }
 
-                /* 5. Hash-index IN probe: FILTER(IN(SCAN col, CONST set_vec))
-                 * on an integer-family column with a hash index.  Probes the
-                 * hash chain for each unique set element; builds one rowsel
-                 * over the union of matches. */
+                /* 5. Hash/part-index IN probe:
+                 * FILTER(IN(SCAN col, CONST set_vec)).  Hash indexes probe
+                 * each unique set element; part indexes select their
+                 * contiguous physical spans directly. */
                 {
                     ray_t* in_col     = NULL;
                     ray_t* in_set_lit = NULL;
                     if (idx_filter_in_decode(g, op_child(g, op, 1), &in_col, &in_set_lit)) {
                         bool in_col_is_float = (in_col->type == RAY_F32 ||
                                                in_col->type == RAY_F64);
-                        if (ray_index_kind(in_col) == RAY_IDX_HASH &&
+                        ray_idx_kind_t in_kind = ray_index_kind(in_col);
+                        if ((in_kind == RAY_IDX_HASH || in_kind == RAY_IDX_PART) &&
                             !in_col_is_float) {
                             ray_idx_consults[IDX_SITE_IN]++;
                             ray_t* sel = ray_index_in_rowsel(in_col, in_set_lit);

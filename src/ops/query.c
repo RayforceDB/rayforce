@@ -4351,7 +4351,7 @@ static uint8_t win_kind_from_name(const char* s, size_t len) {
 }
 
 /*
- * (window {from: T part: [col …] order: [col …] frame: 'whole|'running
+ * (window {from: T part: [col …] order: [col …] frame: 'whole|'running|N
  *          funcs: {outname: (fn inputcol) …}})
  *
  * Builds a DAG OP_WINDOW node over the table T, executes it, then renames the
@@ -4360,7 +4360,9 @@ static uint8_t win_kind_from_name(const char* s, size_t len) {
  * Special form: args[0] is the unevaluated dict literal AST.
  * `from:` is the only clause that requires full eval (it's a variable ref).
  * `part:`/`order:` arrive as RAY_SYM vectors or -RAY_SYM atoms (column refs).
- * `frame:` arrives as a quoted -RAY_SYM atom ('whole or 'running).
+ * `frame:` is either a quoted -RAY_SYM atom ('whole or 'running), or a
+ * positive integer N for a fixed trailing N-row frame including the current
+ * row.
  * `funcs:` is a nested RAY_DICT whose values are list expressions (fn col).
  */
 ray_t* ray_window_fn(ray_t** args, int64_t n) {
@@ -4403,22 +4405,41 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
     }
     /* ── frame: ── */
     ray_t* frame_expr = dict_get(dict, "frame");
+    uint8_t frame_start = RAY_BOUND_UNBOUNDED_PRECEDING;
     uint8_t frame_end = RAY_BOUND_UNBOUNDED_FOLLOWING;  /* default: whole partition */
+    int64_t frame_start_n = 0;
     if (frame_expr) {
-        if (frame_expr->type != -RAY_SYM) {
-            DICT_VIEW_CLOSE(fv); ray_release(tbl);
-            return ray_error("domain", "window: frame must be 'whole or 'running");
-        }
-        ray_t* fs = ray_sym_str(frame_expr->i64);
-        if (fs) {
-            const char* fsp = ray_str_ptr(fs);
-            size_t      fsl = ray_str_len(fs);
-            if (fsl == 7 && memcmp(fsp, "running", 7) == 0)
-                frame_end = RAY_BOUND_CURRENT_ROW;
-            else if (!(fsl == 5 && memcmp(fsp, "whole", 5) == 0)) {
-                DICT_VIEW_CLOSE(fv); ray_release(tbl);
-                return ray_error("domain", "window: frame must be 'whole or 'running");
+        if (frame_expr->type == -RAY_SYM) {
+            ray_t* fs = ray_sym_str(frame_expr->i64);
+            if (fs) {
+                const char* fsp = ray_str_ptr(fs);
+                size_t      fsl = ray_str_len(fs);
+                if (fsl == 7 && memcmp(fsp, "running", 7) == 0)
+                    frame_end = RAY_BOUND_CURRENT_ROW;
+                else if (!(fsl == 5 && memcmp(fsp, "whole", 5) == 0)) {
+                    DICT_VIEW_CLOSE(fv); ray_release(tbl);
+                    return ray_error("domain", "window: frame must be 'whole, 'running, or a positive row count");
+                }
             }
+        } else {
+            int64_t width = 0;
+            switch (frame_expr->type) {
+                case -RAY_I64: width = frame_expr->i64; break;
+                case -RAY_I32: width = frame_expr->i32; break;
+                case -RAY_I16: width = frame_expr->i16; break;
+                case -RAY_U8:
+                case -RAY_BOOL: width = frame_expr->u8; break;
+                default:
+                    DICT_VIEW_CLOSE(fv); ray_release(tbl);
+                    return ray_error("domain", "window: frame must be 'whole, 'running, or a positive row count");
+            }
+            if (width < 1) {
+                DICT_VIEW_CLOSE(fv); ray_release(tbl);
+                return ray_error("range", "window: trailing frame row count must be >= 1");
+            }
+            frame_start = RAY_BOUND_N_PRECEDING;
+            frame_end = RAY_BOUND_CURRENT_ROW;
+            frame_start_n = width - 1;
         }
     }
 
@@ -4572,8 +4593,8 @@ ray_t* ray_window_fn(ray_t** args, int64_t n) {
                                      func_kinds, func_inputs, func_params,
                                      (uint32_t)n_funcs,
                                      RAY_FRAME_ROWS,
-                                     RAY_BOUND_UNBOUNDED_PRECEDING, frame_end,
-                                     0, 0);
+                                     frame_start, frame_end,
+                                     frame_start_n, 0);
     scratch_free(funcs_hdr); scratch_free(order_hdr); scratch_free(part_hdr);
     if (!win_op) {
         scratch_free(outname_hdr); ray_graph_free(g); ray_release(tbl);
@@ -8320,7 +8341,7 @@ by_dict_done:
                 root = ray_optimize(g, root);
                 /* Slice-group fusion: when the WHERE predicate is exactly
                  * membership (in/==) on the single bare group-key column
-                 * and that column carries a fresh CSR hash index, skip
+                 * and that column carries a fresh hash or part index, skip
                  * the filter scan entirely — exec_group aggregates the
                  * key slices directly (or folds them into the equivalent
                  * selection).  count-distinct outputs stay on the filter
