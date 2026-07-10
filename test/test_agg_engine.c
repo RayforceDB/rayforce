@@ -208,7 +208,7 @@ static test_result_t test_dense_plan_single_i64(void) {
     PASS();
 }
 
-/* (b) two I64 keys, ranges 100 and 50 → dense, slots 5000, strides {1,100}. */
+/* (b) two I64 keys, ranges 10 and 10 → dense, slots equal input rows. */
 static test_result_t test_dense_plan_two_keys(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -217,7 +217,7 @@ static test_result_t test_dense_plan_two_keys(void) {
     ray_t* k2 = ray_vec_new(RAY_I64, 100); k2->len = 100;
     int64_t* d1 = (int64_t*)ray_data(k1);
     int64_t* d2 = (int64_t*)ray_data(k2);
-    for (int64_t i = 0; i < 100; i++) { d1[i] = i; d2[i] = i % 50; } /* ranges 100, 50 */
+    for (int64_t i = 0; i < 100; i++) { d1[i] = i % 10; d2[i] = i / 10; }
 
     const agg_vtable_t* vt = dense_sum_i64_vt();
     TEST_ASSERT_NOT_NULL(vt);
@@ -229,11 +229,11 @@ static test_result_t test_dense_plan_two_keys(void) {
 
     TEST_ASSERT_TRUE(ok);
     TEST_ASSERT_TRUE(pl.ok);
-    TEST_ASSERT_EQ_I(pl.total_slots, 5000);
-    TEST_ASSERT_EQ_I(pl.ranges[0], 100);
-    TEST_ASSERT_EQ_I(pl.ranges[1], 50);
+    TEST_ASSERT_EQ_I(pl.total_slots, 100);
+    TEST_ASSERT_EQ_I(pl.ranges[0], 10);
+    TEST_ASSERT_EQ_I(pl.ranges[1], 10);
     TEST_ASSERT_EQ_I(pl.strides[0], 1);
-    TEST_ASSERT_EQ_I(pl.strides[1], 100);
+    TEST_ASSERT_EQ_I(pl.strides[1], 10);
 
     ray_release(k1);
     ray_release(k2);
@@ -242,14 +242,14 @@ static test_result_t test_dense_plan_two_keys(void) {
     PASS();
 }
 
-/* (c) single I64 key with huge range (0 and 10,000,000) → not dense (over cap). */
+/* (c) A two-row input cannot justify a 10,000,001-slot dense state. */
 static test_result_t test_dense_plan_huge_range(void) {
     ray_heap_init();
     (void)ray_sym_init();
 
     ray_t* k = ray_vec_new(RAY_I64, 2); k->len = 2;
     int64_t* kd = (int64_t*)ray_data(k);
-    kd[0] = 0; kd[1] = 10000000;   /* range > DENSE_MAX_SLOTS */
+    kd[0] = 0; kd[1] = 10000000;   /* dense state would exceed input size */
 
     const agg_vtable_t* vt = dense_sum_i64_vt();
     TEST_ASSERT_NOT_NULL(vt);
@@ -862,14 +862,13 @@ static ray_t* diff_make_2i64_hc(int64_t n, int64_t nk) {
 
 /* ── RADIX-FORCING builders (Phase 1c radix) ─────────────────────────────
  * The radix path is selected for high-card STREAMING int/SYM-key queries whose
- * DENSE plan is rejected (total_slots > DENSE_MAX_SLOTS=262144, or per-worker
- * slab > 8MB).  These builders give a WIDE key value range so the dense plan
- * fails and the selector routes to exec_group_v2_parallel_radix; the resulting
- * table is still compared byte-for-byte (as a key-sorted multiset) vs the old
- * engine.  At N=70000 (≥ RAY_PARALLEL_THRESHOLD) the parallel dispatch runs. */
+ * dense representation would require more slots than the contributing input
+ * has rows.  These builders give a wide key range so the structural dense-plan
+ * rule selects radix; results are compared byte-for-byte (as a key-sorted
+ * multiset) with the old engine. */
 
-/* Single I64 key "k" = (i % 50000) * 7  (≈50000 groups, range ≈350000 >
- * DENSE_MAX_SLOTS → dense plan rejected → radix).  I64 value "v" = i. */
+/* Single I64 key "k" = (i % 50000) * 7: its range needs more dense slots than
+ * the input has rows, so it follows the radix representation. */
 static ray_t* diff_make_i64_radix(int64_t n, int64_t nk) {
     (void)nk;
     ray_t* kvec = ray_vec_new(RAY_I64, n); kvec->len = n;
@@ -888,8 +887,8 @@ static ray_t* diff_make_i64_radix(int64_t n, int64_t nk) {
 
 /* Two I64 keys with WIDE composite range → dense plan rejected → radix.
  * k1 = (i%4000)*5 (range ≈20000), k2 = ((i/4000)%4000)*5 → product of ranges
- * ≫ DENSE_MAX_SLOTS.  ≈ up to 16M composite slots but only ~17500 live tuples
- * at N=70000.  I64 value "v" = i. */
+ * greatly exceeds the input row count.  There are up to 16M composite slots
+ * but only about 17500 live tuples at N=70000. */
 static ray_t* diff_make_2i64_radix(int64_t n, int64_t nk) {
     (void)nk;
     ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
@@ -939,7 +938,7 @@ static ray_t* diff_make_pearson_radix(int64_t n, int64_t nk) {
     double*  xd = (double*)ray_data(xvec);
     double*  yd = (double*)ray_data(yvec);
     for (int64_t i = 0; i < n; i++) {
-        kd[i] = (i % 20000) * 17;         /* range ≈340000 > DENSE_MAX_SLOTS */
+        kd[i] = (i % 20000) * 17;         /* dense range exceeds input rows */
         xd[i] = (double)((i % 89) * 1.0);
         yd[i] = (double)(((i * 7) % 83) * 1.0);
     }
@@ -953,7 +952,7 @@ static ray_t* diff_make_pearson_radix(int64_t n, int64_t nk) {
 /* Q10-shape 6-key tuple (high card → radix): six int/SYM keys k1..k6 + I64 "v".
  * Keys vary at independent rates so the 6-tuple space is broad (≈ thousands of
  * live tuples at N=70000) and the composite range is astronomically larger than
- * DENSE_MAX_SLOTS → dense rejected → radix exercises the 6-key tuple hash/eq. */
+ * the input row count, so radix exercises the 6-key tuple hash/eq. */
 static ray_t* diff_make_6keys_radix(int64_t n, int64_t nk) {
     (void)nk;
     ray_t* k1 = ray_vec_new(RAY_I64, n); k1->len = n;
@@ -1427,6 +1426,12 @@ static ray_op_t* gb_top100(ray_graph_t* g) {
     int64_t  kk[]  = { 100 };      ray_op_t* keys[] = { k };
     return ray_group_build(g, keys, 1, ops, ins, NULL, kk, 1);
 }
+static ray_op_t* gb_top2048(ray_graph_t* g) {
+    ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
+    uint16_t ops[] = { OP_TOP_N }; ray_op_t* ins[] = { v };
+    int64_t  kk[]  = { 2048 };     ray_op_t* keys[] = { k };
+    return ray_group_build(g, keys, 1, ops, ins, NULL, kk, 1);
+}
 /* heterogeneous: sum + top2 (LIST col) + count, single I64 key. */
 static ray_op_t* gb_sum_top2_count(ray_graph_t* g) {
     ray_op_t* k = ray_scan(g, "k"); ray_op_t* v = ray_scan(g, "v");
@@ -1603,6 +1608,17 @@ static test_result_t test_diff_group_top100(void) {
     return r;
 }
 
+/* K above the former fixed stack ceiling.  One 3000-row group ensures both
+ * engines materialize and compare a full 2048-element typed result cell. */
+static test_result_t test_diff_group_top2048(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = diff_make_topk_i64_distinctv(3000, 1);
+    test_result_t r = diff_group(tbl, gb_top2048, 1);
+    ray_release(tbl);
+    ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * WHERE-FILTERED differentials (architectural enabler: g->selection routes
  * through exec_group_v2's compact-table prologue).  Each runs OP_GROUP with a
@@ -1679,10 +1695,10 @@ DIFF_SHAPE(test_diff_group_2k_avg,    diff_make_2i64_f64,    gb_2k_avg,   2)
 DIFF_SHAPE(test_diff_group_2k_keynull, diff_make_2i64_keynull, gb_2k_sum, 2)
 
 /* ══════════════════════════════════════════════════════════════════════
- * HIGH-CARDINALITY differentials (Phase 1c). N=70000 (≥ RAY_PARALLEL_THRESHOLD
- * 65536) with the v2 flag ON forces the parallel two-phase path; MANY groups
- * mean each per-worker local table holds many groups and Phase B merges real
- * work. Compared as MULTISET (key-sorted) vs the OLD engine.
+ * HIGH-CARDINALITY differentials (Phase 1c).  These inputs are large enough to
+ * exercise the engine's parallel two-phase path; many groups make every local
+ * table and the merge do real work. Compared as a key-sorted multiset with the
+ * old engine.
  * ══════════════════════════════════════════════════════════════════════ */
 
 #define HC_N 70000
@@ -1777,8 +1793,8 @@ static test_result_t test_diff_group_radix_2k_sum(void) {
     ray_heap_init(); (void)ray_sym_init();
     ray_t* big = diff_make_2i64_radix(HC_N, 0);
     int64_t ng = v2_group_count(big, gb_2k_sum);
-    /* All (i%4000, i/4000) pairs distinct at N=70000 → 70000 groups; the wide
-     * composite range (≈1.7M slots > DENSE_MAX_SLOTS) is what forces radix. */
+    /* All (i%4000, i/4000) pairs are distinct at N=70000; their composite
+     * dense range exceeds the input size, which structurally selects radix. */
     TEST_ASSERT_FMT(ng == 70000, "expected 70000 groups, got %lld", (long long)ng);
     test_result_t r = diff_group(big, gb_2k_sum, 2);
     ray_release(big);
@@ -1811,14 +1827,12 @@ static test_result_t test_diff_group_radix_6k(void) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * SMALL-HASH differential: HIGH-REDUCTION sparse-low-card shape.
+ * SPARSE LOW-CARDINALITY differential.
  *
  * Few groups (64) whose key VALUES are wide/sparse: k=(i%64)*100000001 spans
- * 0..~6.3e9, so the dense plan is rejected (range ≫ DENSE_MAX_SLOTS), yet the
- * cardinality is tiny.  N=70000 ≥ RAY_PARALLEL_THRESHOLD so it runs parallel,
- * and the streaming int-key + LOW-estimate routing sends it to the O(groups)
- * small-hash path.  sum/count/min/max must match the OLD engine exactly
- * (key-sorted multiset).  This correctness-gates the new routing.
+ * 0..~6.3e9, so a dense representation would be superlinear in the input even
+ * though cardinality is tiny.  The deterministic sparse-key route must match
+ * the old engine exactly for sum/count/min/max (key-sorted multiset).
  * ══════════════════════════════════════════════════════════════════════ */
 static ray_t* diff_make_i64_sparse_lowcard(int64_t n, int64_t nk) {
     (void)nk;
@@ -1836,7 +1850,7 @@ static ray_t* diff_make_i64_sparse_lowcard(int64_t n, int64_t nk) {
     return tbl;
 }
 
-/* 64 groups, sparse keys, SUM+COUNT+MIN+MAX → small-hash path. */
+/* 64 groups, sparse keys, SUM+COUNT+MIN+MAX. */
 static test_result_t test_diff_group_smallhash_sparse_lowcard(void) {
     ray_heap_init(); (void)ray_sym_init();
     ray_t* big = diff_make_i64_sparse_lowcard(HC_N, 0);
@@ -2045,6 +2059,7 @@ const test_entry_t agg_engine_entries[] = {
     { "diff_group_2k_top2",          test_diff_group_2k_top2,      NULL, NULL },
     { "diff_group_mixed_top2",       test_diff_group_mixed_top2,   NULL, NULL },
     { "diff_group_top100",           test_diff_group_top100,       NULL, NULL },
+    { "diff_group_top2048",          test_diff_group_top2048,      NULL, NULL },
     { "diff_group_2k_sum",           test_diff_group_2k_sum,       NULL, NULL },
     { "diff_group_2k_four",          test_diff_group_2k_four,      NULL, NULL },
     { "diff_group_3k_count",         test_diff_group_3k_count,     NULL, NULL },

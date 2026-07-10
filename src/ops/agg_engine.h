@@ -61,10 +61,9 @@ ray_t* agg_run_one(const agg_vtable_t* vt, ray_t* val_col,
                    const uint32_t* gids, int64_t nrows, int64_t ngroups,
                    int64_t kparam);
 
-/* ── Dense grouping eligibility selector (low-cardinality int/SYM keys) ──
- * Mirrors the old direct-array group path's cap.  When dense applies, a group
- * id is the packed key offset (O(1) direct index) rather than a hash slot. */
-#define DENSE_MAX_SLOTS 262144   /* mirror the old DA path's cap */
+/* ── Dense grouping eligibility selector (compact-range int/SYM keys) ──
+ * When dense applies, a group id is the packed key offset (O(1) direct index)
+ * rather than a hash slot. */
 
 typedef struct {
     bool     ok;
@@ -77,8 +76,8 @@ typedef struct {
 
 /* Decide if dense grouping applies to (key_cols, aggs).  Eligible iff:
  *  - every key type in {I64,I32,I16,U8,BOOL,DATE,TIME,TIMESTAMP,SYM} and NOT HAS_NULLS
- *  - every agg vtable is ACC_STREAMING (no buffered median/top)
- *  - product of per-key ranges <= DENSE_MAX_SLOTS (no overflow)
+ *  - product of per-key ranges is no larger than the contributing row count
+ *    (so dense state is O(input), never controlled by a machine-size budget)
  * Does one min/max prescan over the key columns.  Sets out->ok accordingly.
  * n_keys is uint32_t (untruncated ext->n_keys): dense direct-index routing
  * self-limits to <=16 keys here (wider shapes are rejected to v2's unbounded
