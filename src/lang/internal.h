@@ -592,6 +592,8 @@ ray_t* ray_eval_builtin_fn(ray_t* x);
 ray_t* ray_parse_builtin_fn(ray_t* x);
 ray_t* ray_print_fn(ray_t** args, int64_t n);
 ray_t* ray_meta_fn(ray_t* x);
+ray_t* ray_mem_objsize_fn(ray_t* x);
+ray_t* ray_mem_ts_fn(ray_t** args, int64_t n);
 ray_t* ray_gc_fn(ray_t** args, int64_t n);
 ray_t* ray_system_fn(ray_t* x);
 /* `.sys.cmd "name args"` — registry-dispatched system commands with

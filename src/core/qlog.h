@@ -26,8 +26,7 @@
 #include <stdbool.h>
 
 #include <rayforce.h>
-#include "core/profile.h"   /* ray_profile_now_ns */
-#include "mem/sys.h"        /* ray_sys_get_stat */
+#include "core/qmeasure.h"
 
 /* Ring capacity (power of two so the write index masks cleanly) and the inline
  * caps for the two variable-length fields — both bounded so the ring is a
@@ -69,23 +68,18 @@ static inline void ray_qlog_set_enabled(bool on) {
     atomic_store_explicit(&g_qlog.enabled, on ? 1u : 0u, memory_order_relaxed);
 }
 
-/* Baseline captured before an eval; fed back to ray_qlog_end for the deltas.
- * t0_ns == 0 marks "logging was off at begin", so end is a no-op even if the
- * flag flips mid-query. */
-typedef struct { int64_t t0_ns; int64_t mem0; } ray_qlog_ctx_t;
+/* Query logging wraps the same measurement scope used by `.mem.ts`. */
+typedef struct { ray_query_measure_t measure; } ray_qlog_ctx_t;
 
 static inline void ray_qlog_begin(ray_qlog_ctx_t* c) {
-    if (!ray_qlog_enabled()) { c->t0_ns = 0; c->mem0 = 0; return; }
-    int64_t cur = 0;
-    ray_sys_get_stat(&cur, NULL);
-    c->mem0  = cur;
-    c->t0_ns = ray_profile_now_ns();
+    c->measure = (ray_query_measure_t){0};
+    if (ray_qlog_enabled()) ray_query_measure_begin(&c->measure);
 }
 
 /* Close a query and append its summary row.  No-op when logging was off at
  * begin.  `src` is the query source (truncated to RAY_QLOG_QUERY_MAX); `result`
  * is the final, materialized result (an error object sets a non-ok status). */
-void ray_qlog_end(const ray_qlog_ctx_t* c, const char* src, size_t src_len,
+void ray_qlog_end(ray_qlog_ctx_t* c, const char* src, size_t src_len,
                   ray_t* result);
 
 /* Materialize the ring into a fresh table (oldest row first).  Returns an

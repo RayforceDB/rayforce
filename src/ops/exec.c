@@ -30,6 +30,7 @@
 #include "mem/heap.h"
 #include "mem/sys.h"
 #include "core/qstats.h"   /* per-worker parallelism stats for profile spans */
+#include "core/qmeasure.h" /* shared worker aggregate */
 #include "core/runtime.h"  /* __VM — filter-compaction projection keep-set */
 
 /* Global profiler instance (zero-initialized = inactive) */
@@ -1769,8 +1770,8 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
                 int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
                 sp->sys_cur    = cur;
                 sp->qs_rows    = ray_qstats_sum_rows();
-                uint64_t sum = 0, mx = 0; uint32_t used = 0;
-                ray_qstats_agg(&used, &sum, &mx);
+                uint64_t sum = 0; uint32_t used = 0;
+                ray_query_workers_snapshot(&used, &sum);
                 sp->qs_busy_ns = sum;
             }
         }
@@ -1785,8 +1786,8 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op) {
             int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
             ep->sys_cur = cur;
             ep->qs_rows = ray_qstats_sum_rows();
-            uint64_t sum = 0, mx = 0; uint32_t used = 0;
-            ray_qstats_agg(&used, &sum, &mx);
+            uint64_t sum = 0; uint32_t used = 0;
+            ray_query_workers_snapshot(&used, &sum);
             ep->qs_busy_ns = sum;
             ep->qs_workers = used;
             /* Result footprint — rows this operator produced. */

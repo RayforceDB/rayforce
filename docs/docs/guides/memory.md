@@ -68,7 +68,11 @@ In this example, loading 10 million rows consumed roughly 800 MB of heap memory.
 
 ## 3. The `.sys.gc` Function
 
-Call `(.sys.gc 0)` to signal that the runtime should reclaim unused memory. Currently this is a lightweight hook that returns `0` — Rayforce uses deterministic ref counting and eager page release via `madvise` during buddy coalescing, so most memory is reclaimed automatically when references are dropped.
+Call `(.sys.gc)` to run allocator maintenance after references have been
+dropped. It drains cross-thread frees, flushes slab caches, coalesces free
+blocks, reclaims empty oversized pools, and incrementally releases aged free
+pages. Values themselves use deterministic reference counting; this is not a
+tracing collector.
 
 ```lisp
 (.sys.gc)  ; 0
@@ -76,7 +80,9 @@ Call `(.sys.gc 0)` to signal that the runtime should reclaim unused memory. Curr
 
 !!! note "Note"
 
-    Because Rayforce uses deterministic ref counting (not tracing GC), memory is freed immediately when the last reference is released. The buddy allocator coalesces blocks and releases pages back to the OS automatically. `(.sys.gc 0)` exists as a hook for future use.
+    Because Rayforce uses deterministic reference counting, objects become
+    reclaimable immediately when their last reference is released. `(.sys.gc)`
+    performs the allocator-side consolidation and page-return pass.
 
 ## 4. The `.sys.info` Function
 

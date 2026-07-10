@@ -1,0 +1,29 @@
+;; .mem.ts evaluates exactly once and returns named, query-scoped statistics.
+(set _mts (.mem.ts (til 10000)))
+(count (at _mts 'result)) -- 10000
+(> (at _mts 'time-ns) 0) -- true
+(>= (at _mts 'memory-bytes) 0) -- true
+(> (at _mts 'allocated-bytes) 0) -- true
+(>= (at _mts 'allocated-bytes) (at _mts 'peak-live-bytes)) -- true
+(> (at _mts 'peak-live-bytes) 0) -- true
+(> (at _mts 'result-bytes) 0) -- true
+(> (at _mts 'alloc-count) 0) -- true
+(>= (at _mts 'free-count) 0) -- true
+(>= (at _mts 'workers) 0) -- true
+(>= (at _mts 'worker-busy-ns) 0) -- true
+(>= (at _mts 'parallelism) 0.0) -- true
+
+;; The result sizing is performed after the trace and agrees with the public
+;; value-level operation.
+(== (at _mts 'result-bytes) (.mem.objsize (at _mts 'result))) -- true
+
+;; A parallel aggregation must report allocation churn and return its value.
+(set _mtsp (.mem.ts (sum (til 1000000))))
+(at _mtsp 'result) -- 499999500000
+(> (at _mtsp 'allocated-bytes) 0) -- true
+(> (at _mtsp 'workers) 0) -- true
+(> (at _mtsp 'worker-busy-ns) 0) -- true
+
+;; Measurement scopes are process-global and cannot nest.
+(try (.mem.ts (.mem.ts (til 10))) (fn [e] 'nested-rejected)) -- 'nested-rejected
+(try (.mem.ts) (fn [e] 'arity-rejected)) -- 'arity-rejected

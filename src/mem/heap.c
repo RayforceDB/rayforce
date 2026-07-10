@@ -242,6 +242,82 @@ static _Atomic(uint64_t) g_heap_id_cursor = 0;
 static _Atomic(int64_t) g_direct_bytes = 0;
 static _Atomic(int64_t) g_direct_count = 0;
 
+/* One process-wide, explicitly-scoped allocation trace for `.mem.ts`.
+ * The inactive hot-path cost is one relaxed load plus a predicted-not-taken
+ * branch in ray_alloc/ray_free.  While active, atomics make allocations from
+ * the main and every worker heap contribute to the same query measurement. */
+static _Atomic(uint32_t) g_mem_trace_active = 0;
+static _Atomic(uint64_t) g_mem_trace_alloc_count = 0;
+static _Atomic(uint64_t) g_mem_trace_free_count = 0;
+static _Atomic(uint64_t) g_mem_trace_allocated = 0;
+static _Atomic(uint64_t) g_mem_trace_freed = 0;
+static _Atomic(int64_t)  g_mem_trace_live = 0;
+static _Atomic(uint64_t) g_mem_trace_peak = 0;
+
+static inline void mem_trace_note_alloc(size_t bytes) {
+    if (RAY_LIKELY(atomic_load_explicit(&g_mem_trace_active,
+                                        memory_order_relaxed) != 1)) return;
+    atomic_fetch_add_explicit(&g_mem_trace_alloc_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_mem_trace_allocated, (uint64_t)bytes,
+                              memory_order_relaxed);
+    int64_t live = atomic_fetch_add_explicit(&g_mem_trace_live, (int64_t)bytes,
+                                             memory_order_relaxed) + (int64_t)bytes;
+    uint64_t candidate = live > 0 ? (uint64_t)live : 0;
+    uint64_t peak = atomic_load_explicit(&g_mem_trace_peak, memory_order_relaxed);
+    while (candidate > peak &&
+           !atomic_compare_exchange_weak_explicit(&g_mem_trace_peak, &peak,
+                                                   candidate,
+                                                   memory_order_relaxed,
+                                                   memory_order_relaxed)) {}
+}
+
+static inline void mem_trace_note_free(size_t bytes) {
+    if (RAY_LIKELY(atomic_load_explicit(&g_mem_trace_active,
+                                        memory_order_relaxed) != 1)) return;
+    atomic_fetch_add_explicit(&g_mem_trace_free_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_mem_trace_freed, (uint64_t)bytes,
+                              memory_order_relaxed);
+    atomic_fetch_sub_explicit(&g_mem_trace_live, (int64_t)bytes,
+                              memory_order_relaxed);
+}
+
+bool ray_mem_trace_begin(void) {
+    uint32_t expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&g_mem_trace_active, &expected, 2,
+                                                  memory_order_acq_rel,
+                                                  memory_order_relaxed))
+        return false;
+    atomic_store_explicit(&g_mem_trace_alloc_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_mem_trace_free_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_mem_trace_allocated, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_mem_trace_freed, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_mem_trace_live, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_mem_trace_peak, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_mem_trace_active, 1, memory_order_release);
+    return true;
+}
+
+void ray_mem_trace_end(ray_mem_trace_t* out) {
+    /* Freeze first: state 2 makes allocation hooks ignore the scope while
+     * preventing another caller from resetting the counters mid-snapshot. */
+    atomic_store_explicit(&g_mem_trace_active, 2, memory_order_release);
+    if (out) {
+        out->alloc_count = atomic_load_explicit(&g_mem_trace_alloc_count,
+                                                memory_order_relaxed);
+        out->free_count = atomic_load_explicit(&g_mem_trace_free_count,
+                                               memory_order_relaxed);
+        out->allocated_bytes = atomic_load_explicit(&g_mem_trace_allocated,
+                                                    memory_order_relaxed);
+        out->freed_bytes = atomic_load_explicit(&g_mem_trace_freed,
+                                                memory_order_relaxed);
+        out->net_bytes = atomic_load_explicit(&g_mem_trace_live,
+                                              memory_order_relaxed);
+        out->peak_live_bytes = atomic_load_explicit(&g_mem_trace_peak,
+                                                    memory_order_relaxed);
+    }
+    atomic_store_explicit(&g_mem_trace_active, 0, memory_order_release);
+}
+
 /* Anonymous (RAM-resident) pool + direct bytes we have committed.  File-backed
  * spill mappings are NOT counted (they can be evicted to disk, never OOM-kill).
  * When a new anon mapping would push this past the watermark, it is routed to a
@@ -1187,7 +1263,11 @@ ray_t* ray_alloc(size_t data_size) {
      * can still represent the request. */
     if (RAY_UNLIKELY(order >= RAY_HEAP_POOL_ORDER)) {
         ray_t* v = heap_alloc_direct(h, data_size);
-        if (v) return v;
+        if (v) {
+            ray_direct_hdr_t* hdr = (ray_direct_hdr_t*)((char*)v - RAY_DIRECT_HDR);
+            mem_trace_note_alloc(hdr->map_size);
+            return v;
+        }
         if (order > RAY_HEAP_MAX_ORDER) return NULL;
     }
 
@@ -1214,6 +1294,7 @@ ray_t* ray_alloc(size_t data_size) {
             RAY_STAT(h->stats.bytes_allocated += BSIZEOF(order));
             RAY_STAT(h->stats.peak_bytes = h->stats.bytes_allocated > h->stats.peak_bytes
                 ? h->stats.bytes_allocated : h->stats.peak_bytes);
+            mem_trace_note_alloc(BSIZEOF(order));
             return v;
         }
     }
@@ -1274,6 +1355,8 @@ ray_t* ray_alloc(size_t data_size) {
     RAY_STAT(h->stats.bytes_allocated += BSIZEOF(order));
     RAY_STAT(h->stats.peak_bytes = h->stats.bytes_allocated > h->stats.peak_bytes
         ? h->stats.bytes_allocated : h->stats.peak_bytes);
+
+    mem_trace_note_alloc(BSIZEOF(order));
 
     return blk;
 }
@@ -1344,6 +1427,7 @@ void ray_free(ray_t* v) {
         size_t map_size  = hdr->map_size;
         int    swap_fd   = hdr->swap_fd;
         char*  swap_path = hdr->swap_path;
+        mem_trace_note_free(map_size);
         if (h) RAY_STAT(h->stats.free_count++);
         atomic_fetch_sub_explicit(&g_direct_bytes, (int64_t)map_size, memory_order_relaxed);
         atomic_fetch_sub_explicit(&g_direct_count, 1, memory_order_relaxed);
@@ -1367,6 +1451,8 @@ void ray_free(ray_t* v) {
     uint8_t order = v->order;
 
     if (order < RAY_ORDER_MIN || order > RAY_HEAP_MAX_ORDER) return;
+
+    mem_trace_note_free(BSIZEOF(order));
 
 #if RAY_MEM_STATS
     size_t block_size = BSIZEOF(order);

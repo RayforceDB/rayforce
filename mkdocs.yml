@@ -133,6 +133,7 @@ nav:
           - .idx — Indexes: docs/namespaces/idx.md
           - .ipc — IPC client: docs/namespaces/ipc.md
           - .log — Write-ahead log: docs/namespaces/log.md
+          - .mem — Measurement: docs/namespaces/mem.md
           - .os — Process env: docs/namespaces/os.md
           - .repl — REPL control: docs/namespaces/repl.md
           - .sys — System info: docs/namespaces/sys.md

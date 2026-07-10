@@ -488,7 +488,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
      * is formatted back to source.  Only when logging is on. */
     char   qsrc[RAY_QLOG_QUERY_MAX];
     size_t qsrc_len = 0;
-    if (qc.t0_ns && msg && !RAY_IS_ERR(msg)) {
+    if (qc.measure.active && msg && !RAY_IS_ERR(msg)) {
         if (msg->type == -RAY_STR) {
             qsrc_len = ray_str_len(msg);
             if (qsrc_len > sizeof(qsrc)) qsrc_len = sizeof(qsrc);

@@ -29,7 +29,10 @@
 #include "ops/internal.h"   /* ray_group_perpart_runs — (.sys.mem) counter */
 #include "mem/heap.h"
 #include "mem/sys.h"
+#include "core/block.h"
+#include "ops/idxop.h"
 #include "core/profile.h"   /* g_ray_profile — (.sys.prof) */
+#include "core/qmeasure.h"  /* shared per-query measurement lifecycle */
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
 #include "store/serde.h"
 #include "store/splay.h"
@@ -479,9 +482,310 @@ ray_t* ray_meta_fn(ray_t* x) {
     return ray_dict_new(keys, vals);
 }
 
-/* (.sys.gc) -- no-op garbage collection trigger, return 0.  Variadic
- * so the call site can be (.sys.gc) without the dummy-arg ceremony. */
-ray_t* ray_gc_fn(ray_t** args, int64_t n) { (void)args; (void)n; return ray_i64(0); }
+/* Object-graph size -------------------------------------------------------
+ *
+ * `.mem.objsize` reports the logical bytes retained by a Rayfall value:
+ * every reachable ray_t header and its live payload, with shared children
+ * counted once.  It deliberately does not report buddy-block slack, global
+ * symbol dictionaries, or opaque native handles (graphs/HNSW/lazy plans).
+ * That makes the result stable across allocator tuning and useful as the
+ * Rayforce analogue of q's `.mem.objsize` for materialised query results.
+ *
+ * The traversal is iterative and pointer-deduplicated.  Besides preventing
+ * double-counting shared table columns, the visited set makes it safe for any
+ * future compound object that introduces a cycle. */
+typedef struct {
+    ray_t** stack;
+    size_t  stack_len;
+    size_t  stack_cap;
+    ray_t** seen;
+    size_t  seen_count;
+    size_t  seen_cap;
+} ray_objsize_walk_t;
+
+static uint64_t objsize_ptr_hash(const ray_t* p) {
+    uint64_t x = (uint64_t)(uintptr_t)p;
+    x ^= x >> 33;
+    x *= UINT64_C(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x *= UINT64_C(0xc4ceb9fe1a85ec53);
+    return x ^ (x >> 33);
+}
+
+static bool objsize_stack_push(ray_objsize_walk_t* w, ray_t* child) {
+    if (!child || RAY_IS_ERR(child)) return true;
+    if (w->stack_len == w->stack_cap) {
+        size_t cap = w->stack_cap ? w->stack_cap * 2 : 64;
+        if (cap < w->stack_cap || cap > SIZE_MAX / sizeof(ray_t*)) return false;
+        ray_t** grown = (ray_t**)ray_sys_realloc(w->stack, cap * sizeof(ray_t*));
+        if (!grown) return false;
+        w->stack = grown;
+        w->stack_cap = cap;
+    }
+    w->stack[w->stack_len++] = child;
+    return true;
+}
+
+static bool objsize_seen_grow(ray_objsize_walk_t* w) {
+    size_t cap = w->seen_cap ? w->seen_cap * 2 : 128;
+    if (cap < w->seen_cap || cap > SIZE_MAX / sizeof(ray_t*)) return false;
+    ray_t** grown = (ray_t**)ray_sys_alloc(cap * sizeof(ray_t*));
+    if (!grown) return false;
+    memset(grown, 0, cap * sizeof(ray_t*));
+
+    if (w->seen) {
+        size_t mask = cap - 1;
+        for (size_t i = 0; i < w->seen_cap; i++) {
+            ray_t* p = w->seen[i];
+            if (!p) continue;
+            size_t slot = (size_t)objsize_ptr_hash(p) & mask;
+            while (grown[slot]) slot = (slot + 1) & mask;
+            grown[slot] = p;
+        }
+        ray_sys_free(w->seen);
+    }
+    w->seen = grown;
+    w->seen_cap = cap;
+    return true;
+}
+
+/* Returns true when p was newly inserted, false when already seen.  OOM is
+ * reported separately through *ok so a duplicate is not confused with an
+ * allocation failure. */
+static bool objsize_seen_insert(ray_objsize_walk_t* w, ray_t* p, bool* ok) {
+    if (!w->seen_cap || (w->seen_count + 1) * 10 >= w->seen_cap * 7) {
+        if (!objsize_seen_grow(w)) { *ok = false; return false; }
+    }
+    size_t mask = w->seen_cap - 1;
+    size_t slot = (size_t)objsize_ptr_hash(p) & mask;
+    while (w->seen[slot]) {
+        if (w->seen[slot] == p) return false;
+        slot = (slot + 1) & mask;
+    }
+    w->seen[slot] = p;
+    w->seen_count++;
+    return true;
+}
+
+static size_t objsize_shallow(ray_t* v) {
+    if (v->attrs & RAY_ATTR_SLICE) return sizeof(ray_t);
+    if (v->type == RAY_LAMBDA)
+        return sizeof(ray_t) + 7 * sizeof(ray_t*);
+    if (v->type == RAY_INDEX)
+        return sizeof(ray_t) + sizeof(ray_index_t);
+    if (RAY_IS_PARTED(v->type))
+        return sizeof(ray_t) + (v->len > 0 ? (size_t)v->len * sizeof(ray_t*) : 0);
+    if (v->type == RAY_MAPCOMMON)
+        return sizeof(ray_t) + 2 * sizeof(ray_t*);
+    return ray_block_size(v);
+}
+
+static bool objsize_push_index_children(ray_objsize_walk_t* w, ray_index_t* ix) {
+#define OBJSIZE_PUSH(child) do { if (!objsize_stack_push(w, (child))) return false; } while (0)
+    switch ((ray_idx_kind_t)ix->kind) {
+    case RAY_IDX_HASH:
+        OBJSIZE_PUSH(ix->u.hash.table); OBJSIZE_PUSH(ix->u.hash.gkeys);
+        OBJSIZE_PUSH(ix->u.hash.offs);  OBJSIZE_PUSH(ix->u.hash.rows);
+        break;
+    case RAY_IDX_SORT:       OBJSIZE_PUSH(ix->u.sort.perm); break;
+    case RAY_IDX_BLOOM:      OBJSIZE_PUSH(ix->u.bloom.bits); break;
+    case RAY_IDX_CHUNK_ZONE:
+        OBJSIZE_PUSH(ix->u.chunk_zone.mins);
+        OBJSIZE_PUSH(ix->u.chunk_zone.maxs);
+        OBJSIZE_PUSH(ix->u.chunk_zone.null_bits);
+        break;
+    case RAY_IDX_PART:
+        OBJSIZE_PUSH(ix->u.part.keys); OBJSIZE_PUSH(ix->u.part.starts);
+        OBJSIZE_PUSH(ix->u.part.lens);
+        break;
+    case RAY_IDX_DICT:
+        OBJSIZE_PUSH(ix->u.dict.codes); OBJSIZE_PUSH(ix->u.dict.first_occ);
+        break;
+    case RAY_IDX_ZONE:
+    case RAY_IDX_NONE:
+        break;
+    }
+#undef OBJSIZE_PUSH
+    return true;
+}
+
+static bool objsize_push_children(ray_objsize_walk_t* w, ray_t* v) {
+#define OBJSIZE_PUSH(child) do { if (!objsize_stack_push(w, (child))) return false; } while (0)
+    if (v->type == RAY_LAMBDA) {
+        ray_t** slots = (ray_t**)ray_data(v);
+        for (int i = 0; i < 4; i++) OBJSIZE_PUSH(slots[i]);
+        OBJSIZE_PUSH(slots[5]);
+        OBJSIZE_PUSH(slots[6]);
+        return true;
+    }
+    if (ray_is_atom(v)) {
+        if (v->type == -RAY_GUID && v->obj) OBJSIZE_PUSH(v->obj);
+        if (v->type == -RAY_STR &&
+            !((v->slen >= 1 && v->slen <= 7) || (v->slen == 0 && !v->obj)))
+            OBJSIZE_PUSH(v->obj);
+        return true;
+    }
+    if (v->attrs & RAY_ATTR_SLICE) {
+        OBJSIZE_PUSH(v->slice_parent);
+        return true;
+    }
+    if (v->type == RAY_INDEX)
+        return objsize_push_index_children(w, ray_index_payload(v));
+    if (v->attrs & RAY_ATTR_HAS_INDEX) {
+        OBJSIZE_PUSH(v->index);
+        /* An indexed STR vector still owns its external character pool in
+         * aux bytes 8..15; the index pointer only occupies bytes 0..7. */
+        if (v->type == RAY_STR && v->str_pool)
+            OBJSIZE_PUSH(v->str_pool);
+        return true;
+    }
+    if (v->type == RAY_STR && v->str_pool)
+        OBJSIZE_PUSH(v->str_pool);
+    if (RAY_IS_PARTED(v->type)) {
+        ray_t** segs = (ray_t**)ray_data(v);
+        for (int64_t i = 0; i < v->len; i++) OBJSIZE_PUSH(segs[i]);
+        return true;
+    }
+    if (v->type == RAY_MAPCOMMON || v->type == RAY_TABLE || v->type == RAY_DICT) {
+        ray_t** slots = (ray_t**)ray_data(v);
+        OBJSIZE_PUSH(slots[0]);
+        OBJSIZE_PUSH(slots[1]);
+        return true;
+    }
+    if (v->type == RAY_LIST) {
+        ray_t** elems = (ray_t**)ray_data(v);
+        for (int64_t i = 0; i < v->len; i++) OBJSIZE_PUSH(elems[i]);
+    }
+#undef OBJSIZE_PUSH
+    return true;
+}
+
+ray_t* ray_mem_objsize_fn(ray_t* root) {
+    if (!root) return ray_error("type", "objsize expects a value");
+    ray_objsize_walk_t w = {0};
+    if (!objsize_stack_push(&w, root)) return ray_error("oom", NULL);
+
+    uint64_t total = 0;
+    bool ok = true;
+    while (w.stack_len && ok) {
+        ray_t* v = w.stack[--w.stack_len];
+        if (!objsize_seen_insert(&w, v, &ok)) continue;
+        size_t shallow = objsize_shallow(v);
+        if (UINT64_MAX - total < shallow) { ok = false; break; }
+        total += shallow;
+        if (!objsize_push_children(&w, v)) ok = false;
+    }
+    ray_sys_free(w.stack);
+    ray_sys_free(w.seen);
+    if (!ok) return ray_error("oom", "objsize traversal overflow or allocation failure");
+    if (total > INT64_MAX) return ray_error("limit", "objsize exceeds I64 range");
+    return ray_i64((int64_t)total);
+}
+
+/* (.mem.ts expr) — evaluate one expression under a process-wide allocation
+ * trace and return a named measurement dictionary.  SPECIAL_FORM: expr is
+ * deliberately not pre-evaluated.  Result sizing and dictionary construction
+ * happen after both clocks stop, so they do not contaminate the measured
+ * expression. */
+ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
+    if (n != 1)
+        return ray_error("arity", ".mem.ts expects 1 argument, got %lld",
+                         (long long)n);
+    if (!ray_mem_trace_begin())
+        return ray_error("state", ".mem.ts measurement already active");
+
+    ray_query_measure_t measure;
+    ray_query_measure_begin(&measure);
+    ray_t* result = ray_eval(args[0]);
+    ray_query_metrics_t metrics;
+    ray_query_measure_end(&measure, &metrics);
+
+    ray_mem_trace_t mt;
+    ray_mem_trace_end(&mt);
+
+    if (!result) return ray_error("state", ".mem.ts expression returned no value");
+    if (RAY_IS_ERR(result)) return result;
+
+    ray_t* result_size = ray_mem_objsize_fn(result);
+    if (!result_size || RAY_IS_ERR(result_size)) {
+        ray_release(result);
+        return result_size ? result_size : ray_error("oom", NULL);
+    }
+
+    enum { MEM_TS_FIELDS = 13 };
+    static const char* names[MEM_TS_FIELDS] = {
+        "result", "time-ns", "memory-bytes", "allocated-bytes", "freed-bytes",
+        "net-bytes", "peak-live-bytes", "result-bytes", "alloc-count",
+        "free-count", "workers", "worker-busy-ns", "parallelism"
+    };
+    static const uint8_t name_lens[MEM_TS_FIELDS] = {
+        6, 7, 12, 15, 11, 9, 15, 12, 11, 10, 7, 14, 11
+    };
+
+    ray_t* items[MEM_TS_FIELDS] = {
+        result,
+        ray_i64(metrics.time_ns),
+        ray_i64(metrics.memory_bytes),
+        ray_i64((int64_t)mt.allocated_bytes),
+        ray_i64((int64_t)mt.freed_bytes),
+        ray_i64(mt.net_bytes),
+        ray_i64((int64_t)mt.peak_live_bytes),
+        result_size,
+        ray_i64((int64_t)mt.alloc_count),
+        ray_i64((int64_t)mt.free_count),
+        ray_i64((int64_t)metrics.workers),
+        ray_i64((int64_t)metrics.worker_busy_ns),
+        ray_f64(metrics.parallelism)
+    };
+    for (int i = 0; i < MEM_TS_FIELDS; i++) {
+        if (!items[i] || RAY_IS_ERR(items[i])) {
+            ray_t* err = items[i] ? items[i] : ray_error("oom", NULL);
+            for (int j = 0; j < MEM_TS_FIELDS; j++)
+                if (j != i && items[j] && !RAY_IS_ERR(items[j])) ray_release(items[j]);
+            return err;
+        }
+    }
+
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, MEM_TS_FIELDS);
+    ray_t* vals = ray_list_new(MEM_TS_FIELDS);
+    if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
+        ray_t* err = (!keys || RAY_IS_ERR(keys))
+                   ? (keys ? keys : ray_error("oom", NULL))
+                   : vals;
+        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        for (int i = 0; i < MEM_TS_FIELDS; i++) ray_release(items[i]);
+        return err;
+    }
+
+    for (int i = 0; i < MEM_TS_FIELDS; i++) {
+        int64_t sid = ray_sym_intern(names[i], name_lens[i]);
+        keys = ray_vec_append(keys, &sid);
+        if (RAY_IS_ERR(keys)) {
+            ray_release(vals);
+            for (int j = i; j < MEM_TS_FIELDS; j++) ray_release(items[j]);
+            return keys;
+        }
+        vals = ray_list_append(vals, items[i]);
+        ray_release(items[i]);
+        if (RAY_IS_ERR(vals)) {
+            ray_release(keys);
+            for (int j = i + 1; j < MEM_TS_FIELDS; j++) ray_release(items[j]);
+            return vals;
+        }
+    }
+    return ray_dict_new(keys, vals);
+}
+
+/* (.sys.gc) -- perform the allocator maintenance pass used by v1: drain
+ * foreign frees, flush slab caches, coalesce blocks and release reclaimable
+ * pages/pools.  Rayforce values are reference-counted, so this is allocator
+ * GC rather than a tracing collector.  Variadic to allow `(.sys.gc)`. */
+ray_t* ray_gc_fn(ray_t** args, int64_t n) {
+    (void)args; (void)n;
+    ray_heap_gc();
+    return ray_i64(0);
+}
 
 /* (system cmd) -- run shell command, return exit code */
 ray_t* ray_system_fn(ray_t* x) {

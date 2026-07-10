@@ -1,0 +1,15 @@
+;; .mem.objsize reports logical retained bytes, not serialized size or buddy
+;; allocator capacity. Every ray_t contributes its 32-byte header.
+
+(.mem.objsize 42) -- 32
+(.mem.objsize [1 2 3]) -- 56
+
+;; Shared children are counted once: LIST header + two pointer slots + vector.
+(set _objsize_shared [1 2 3])
+(.mem.objsize (list _objsize_shared _objsize_shared)) -- 104
+
+;; A backing index and its child vectors are part of the retained graph.
+(> (.mem.objsize (.attr.set 'parted [1 1 2 2])) (.mem.objsize [1 1 2 2])) -- true
+
+;; The allocator-maintenance builtin remains callable from Rayfall.
+(.sys.gc) -- 0

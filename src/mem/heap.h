@@ -144,6 +144,18 @@ typedef struct {
     size_t sys_mapped_peak;  /* file-backed mapping high-water mark */
 } ray_mem_stats_t;
 
+/* Query-scoped allocation trace.  Unlike ray_mem_stats_t (a lifetime snapshot
+ * of one heap), this aggregates allocation/free activity from every thread
+ * while active.  Only one scope may be active process-wide. */
+typedef struct {
+    uint64_t alloc_count;
+    uint64_t free_count;
+    uint64_t allocated_bytes;
+    uint64_t freed_bytes;
+    int64_t  net_bytes;
+    uint64_t peak_live_bytes;
+} ray_mem_trace_t;
+
 /* ===== Forward Declarations (internal types) ===== */
 
 typedef struct ray_heap      ray_heap_t;
@@ -162,6 +174,8 @@ void     ray_heap_push_pending(ray_heap_t* heap);
 void     ray_heap_drain_pending(void);
 uint8_t  ray_order_for_size(size_t data_size);
 void     ray_mem_stats(ray_mem_stats_t* out);
+bool     ray_mem_trace_begin(void);
+void     ray_mem_trace_end(ray_mem_trace_t* out);
 
 void ray_heap_gc(void);
 void ray_heap_release_pages(void);

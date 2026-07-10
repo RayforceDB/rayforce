@@ -10,24 +10,20 @@
 
 #include <rayforce.h>
 #include "core/qlog.h"
-#include "core/qstats.h"   /* ray_qstats_agg */
 
 /* Single global instance.  Zero-initialised: disabled, empty ring. */
 ray_qlog_t g_qlog;
 
-void ray_qlog_end(const ray_qlog_ctx_t* c, const char* src, size_t src_len,
+void ray_qlog_end(ray_qlog_ctx_t* c, const char* src, size_t src_len,
                   ray_t* result) {
-    if (c->t0_ns == 0) return;   /* logging was off when the query began */
-
-    int64_t dur_ns = ray_profile_now_ns() - c->t0_ns;
-    if (dur_ns < 0) dur_ns = 0;
-    int64_t cur = 0;
-    ray_sys_get_stat(&cur, NULL);
+    if (!c->measure.active) return; /* logging was off when query began */
+    ray_query_metrics_t metrics;
+    ray_query_measure_end(&c->measure, &metrics);
 
     ray_qlog_row_t* row = &g_qlog.slot[g_qlog.head & (RAY_QLOG_CAP - 1)];
     row->time_ns     = ray_timestamp_now_ns();
-    row->duration_ms = (double)dur_ns / 1e6;
-    row->memory_kib  = (double)(cur - c->mem0) / 1024.0;
+    row->duration_ms = (double)metrics.time_ns / 1e6;
+    row->memory_kib  = (double)metrics.memory_bytes / 1024.0;
 
     /* Result summary + status.  ray_len on a scalar atom returns the value,
      * not a count (the len field aliases i64), so guard atoms as one row. */
@@ -44,12 +40,8 @@ void ray_qlog_end(const ray_qlog_ctx_t* c, const char* src, size_t src_len,
                          :                                (int64_t)ray_len(result);
     }
 
-    /* Parallelism from the query-scoped qstats aggregate (ray_eval resets the
-     * slots at each top-level query when capture is armed). */
-    uint64_t busy = 0, mx = 0; uint32_t used = 0;
-    ray_qstats_agg(&used, &busy, &mx);
-    row->workers     = (int32_t)used;
-    row->parallelism = dur_ns > 0 ? (double)busy / (double)dur_ns : 0.0;
+    row->workers     = (int32_t)metrics.workers;
+    row->parallelism = metrics.parallelism;
 
     /* Bounded copies — no allocation, ring memory stays fixed. */
     size_t qn = src ? src_len : 0;

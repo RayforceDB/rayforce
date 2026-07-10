@@ -68,7 +68,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `update`, `insert`, `upsert`, `left-join`, `inner-join`, `full-join`, `anti-join`, `window-join`, `window-join1`,
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
-`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.sys.timeit`,
+`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
 `.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.repl.disconnect`, `.log.open`, `.log.roll`,
 `.log.snapshot`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
@@ -634,6 +634,8 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `eval` | unary | — | Evaluate a parsed Rayfall expression | `(eval (parse "(+ 1 2)"))` → `3` |
 | `parse` | unary | — | Parse a string into a Rayfall expression tree | `(parse "(+ 1 2)")` |
 | `.sys.gc` | variadic | — | Trigger GC / heap flush, returns `0` | `(.sys.gc)` |
+| `.mem.objsize` | unary | — | Logical bytes retained by an object graph; shared children count once | `(.mem.objsize value)` |
+| `.mem.ts` | special form | — | Evaluate once and return result, time, allocation, peak-memory, result-size, and worker statistics as a dict | `(.mem.ts (select {from: trades}))` |
 | `.sys.exec` | unary | restricted | Execute a shell command, return exit code | `(.sys.exec "ls -la")` |
 | `.os.getenv` | unary | restricted | Get environment variable value | `(.os.getenv "HOME")` |
 | `.os.setenv` | binary | restricted | Set environment variable | `(.os.setenv "KEY" "value")` |

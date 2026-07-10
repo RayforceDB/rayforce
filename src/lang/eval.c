@@ -38,6 +38,7 @@
 #include "vec/vec.h"
 #include "core/profile.h"
 #include "core/qstats.h"   /* per-worker parallelism counters for eval-path spans */
+#include "core/qmeasure.h" /* shared per-query worker lifecycle */
 #include "core/qlog.h"     /* ray_qlog_enabled — arm capture for query logging */
 #include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "table/sym.h"
@@ -3236,6 +3237,8 @@ static void ray_register_builtins(void) {
      * the category. */
     register_vary (".sys.gc",   RAY_FN_NONE,        ray_gc_fn);
     register_unary(".sys.exec", RAY_FN_RESTRICTED,  ray_system_fn);
+    register_unary(".mem.objsize", RAY_FN_NONE,      ray_mem_objsize_fn);
+    register_vary (".mem.ts",      RAY_FN_SPECIAL_FORM, ray_mem_ts_fn);
     /* Registry-dispatched system commands.  `.sys.cmd "name args"` is
      * the colon-command entry point; the per-command direct builtins below
      * skip the string parse for callers that already have a typed arg
@@ -3454,8 +3457,8 @@ static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
     int64_t cur = 0; ray_sys_get_stat(&cur, NULL);
     s->sys_cur = cur;
     s->qs_rows = ray_qstats_sum_rows();
-    uint64_t sum = 0, mx = 0; uint32_t used = 0;
-    ray_qstats_agg(&used, &sum, &mx);
+    uint64_t sum = 0; uint32_t used = 0;
+    ray_query_workers_snapshot(&used, &sum);
     s->qs_busy_ns = sum;
     s->qs_workers = used;
     if (result && !RAY_IS_ERR(result) && !RAY_IS_NULL(result)) {
@@ -3488,9 +3491,7 @@ ray_t* ray_eval(ray_t* obj) {
          * capture strictly off (mode 0) when the profiler is disabled. */
         bool capture  = g_ray_profile.active || ray_qlog_enabled();
         bool progress = ray_progress_active();
-        uint32_t qsmode = (capture ? RAY_QS_PROF : 0) | (progress ? RAY_QS_PROGRESS : 0);
-        ray_qstats_set_mode(qsmode);
-        if (qsmode) ray_qstats_reset(0);
+        ray_query_workers_begin(capture, progress);
     }
 
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */
