@@ -322,19 +322,33 @@ static void win_compute_partition(
                         else win_set_null(rvec, sorted_idx[i]);
                     }
                 } else {
-                    for (int64_t i = ps; i < pe; i++) {
-                        int64_t lo = trailing ? i - frame_start_n : ps;
-                        if (lo < ps) lo = ps;
+                    if (!trailing) {
                         double best = want_max ? -DBL_MAX : DBL_MAX;
                         int found = 0;
-                        for (int64_t j = lo; j <= i; j++) {
-                            int64_t row = sorted_idx[j];
-                            if (ray_vec_is_null(fvec, row)) continue;
-                            double v = win_read_f64(fvec, row);
-                            if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
+                        for (int64_t i = ps; i < pe; i++) {
+                            int64_t row = sorted_idx[i];
+                            if (!ray_vec_is_null(fvec, row)) {
+                                double v = win_read_f64(fvec, row);
+                                if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
+                            }
+                            if (found) out[row] = best;
+                            else win_set_null(rvec, row);
                         }
-                        if (found) out[sorted_idx[i]] = best;
-                        else win_set_null(rvec, sorted_idx[i]);
+                    } else {
+                        for (int64_t i = ps; i < pe; i++) {
+                            int64_t lo = i - frame_start_n;
+                            if (lo < ps) lo = ps;
+                            double best = want_max ? -DBL_MAX : DBL_MAX;
+                            int found = 0;
+                            for (int64_t j = lo; j <= i; j++) {
+                                int64_t row = sorted_idx[j];
+                                if (ray_vec_is_null(fvec, row)) continue;
+                                double v = win_read_f64(fvec, row);
+                                if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
+                            }
+                            if (found) out[sorted_idx[i]] = best;
+                            else win_set_null(rvec, sorted_idx[i]);
+                        }
                     }
                 }
             } else {
@@ -353,19 +367,33 @@ static void win_compute_partition(
                         else win_set_null(rvec, sorted_idx[i]);
                     }
                 } else {
-                    for (int64_t i = ps; i < pe; i++) {
-                        int64_t lo = trailing ? i - frame_start_n : ps;
-                        if (lo < ps) lo = ps;
+                    if (!trailing) {
                         int64_t best = want_max ? INT64_MIN : INT64_MAX;
                         int found = 0;
-                        for (int64_t j = lo; j <= i; j++) {
-                            int64_t row = sorted_idx[j];
-                            if (ray_vec_is_null(fvec, row)) continue;
-                            int64_t v = win_read_i64(fvec, row);
-                            if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
+                        for (int64_t i = ps; i < pe; i++) {
+                            int64_t row = sorted_idx[i];
+                            if (!ray_vec_is_null(fvec, row)) {
+                                int64_t v = win_read_i64(fvec, row);
+                                if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
+                            }
+                            if (found) out[row] = best;
+                            else win_set_null(rvec, row);
                         }
-                        if (found) out[sorted_idx[i]] = best;
-                        else win_set_null(rvec, sorted_idx[i]);
+                    } else {
+                        for (int64_t i = ps; i < pe; i++) {
+                            int64_t lo = i - frame_start_n;
+                            if (lo < ps) lo = ps;
+                            int64_t best = want_max ? INT64_MIN : INT64_MAX;
+                            int found = 0;
+                            for (int64_t j = lo; j <= i; j++) {
+                                int64_t row = sorted_idx[j];
+                                if (ray_vec_is_null(fvec, row)) continue;
+                                int64_t v = win_read_i64(fvec, row);
+                                if (!found || (want_max ? v > best : v < best)) { best = v; found = 1; }
+                            }
+                            if (found) out[sorted_idx[i]] = best;
+                            else win_set_null(rvec, sorted_idx[i]);
+                        }
                     }
                 }
             }

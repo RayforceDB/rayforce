@@ -50,7 +50,7 @@ The returned dictionary has these fields:
 | `allocated-bytes` | Sum of allocator block bytes obtained during the scope, including temporary allocations. |
 | `freed-bytes` | Sum of allocator block bytes released before the measured evaluation returned. |
 | `net-bytes` | Allocated minus freed bytes at the measurement boundary; it may be negative when the expression releases pre-existing values. |
-| `peak-live-bytes` | Maximum positive live-byte delta above the starting boundary. This is the closest analogue of q's `.Q.ts` space value. |
+| `peak-live-bytes` | Maximum positive live-byte delta above the starting boundary. |
 | `result-bytes` | Logical `.mem.objsize` of `result`. |
 | `alloc-count` | Number of allocator blocks obtained. |
 | `free-count` | Number of allocator blocks released. |

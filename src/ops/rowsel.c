@@ -652,12 +652,29 @@ ray_t* ray_rowsel_intersect(ray_t* a, ray_t* b) {
                 src = ai; begin = ao[s]; end = ao[s + 1];
             }
 
-            uint32_t start = cum;
             if (src) {
-                for (uint32_t p = begin; p < end; p++) oi[cum++] = src[p];
+                uint32_t pc = end - begin;
+                if ((int64_t)pc == seg_len) {
+                    of[s] = RAY_SEL_ALL;
+                } else {
+                    for (uint32_t p = begin; p < end; p++) oi[cum++] = src[p];
+                    of[s] = pc == 0 ? RAY_SEL_NONE : RAY_SEL_MIX;
+                }
             } else {
                 uint32_t ap = ao[s], ae = ao[s + 1];
                 uint32_t bp = bo[s], be = bo[s + 1];
+                uint32_t count = 0;
+                uint32_t cp = ap, dp = bp;
+                while (cp < ae && dp < be) {
+                    uint16_t av = ai[cp], bv = bi[dp];
+                    if (av < bv) cp++;
+                    else if (bv < av) dp++;
+                    else { count++; cp++; dp++; }
+                }
+                if ((int64_t)count == seg_len) {
+                    of[s] = RAY_SEL_ALL;
+                    continue;
+                }
                 while (ap < ae && bp < be) {
                     uint16_t av = ai[ap], bv = bi[bp];
                     if (av < bv) ap++;
@@ -665,17 +682,8 @@ ray_t* ray_rowsel_intersect(ray_t* a, ray_t* b) {
                     else { oi[cum++] = av; ap++; bp++; }
                 }
             }
-            uint32_t pc = cum - start;
-            if (pc == 0) {
-                of[s] = RAY_SEL_NONE;
-            } else if ((int64_t)pc == seg_len) {
-                /* This cannot arise from MIX input under canonical encoding,
-                 * but keep the representation valid defensively. */
-                of[s] = RAY_SEL_ALL;
-                cum = start;
-            } else {
-                of[s] = RAY_SEL_MIX;
-            }
+            if (of[s] != RAY_SEL_ALL)
+                of[s] = cum == oo[s] ? RAY_SEL_NONE : RAY_SEL_MIX;
         }
     }
     oo[ns] = cum;

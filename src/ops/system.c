@@ -488,8 +488,8 @@ ray_t* ray_meta_fn(ray_t* x) {
  * every reachable ray_t header and its live payload, with shared children
  * counted once.  It deliberately does not report buddy-block slack, global
  * symbol dictionaries, or opaque native handles (graphs/HNSW/lazy plans).
- * That makes the result stable across allocator tuning and useful as the
- * Rayforce analogue of q's `.mem.objsize` for materialised query results.
+ * That makes the result stable across allocator tuning and useful for
+ * inspecting materialised query results.
  *
  * The traversal is iterative and pointer-deduplicated.  Besides preventing
  * double-counting shared table columns, the visited set makes it safe for any
