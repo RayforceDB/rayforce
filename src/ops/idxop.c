@@ -1505,6 +1505,13 @@ ray_t* ray_index_part_eq_rowsel(ray_t* col, int64_t key) {
             ? ray_read_sym(kb, p, RAY_SYM, keys->attrs)
             : set_vec_read_i64(kb, keys->type, p);
         if (pkey != key) continue;
+        /* A direct FILTER rowsel still feeds the generic table compactor.
+         * For a dense partition that O(selected rows × columns) gather is
+         * slower than the normal predicate scan.  Keep dense partitions on
+         * the scan path; the dedicated GROUP BY slice path remains dense-safe
+         * because it streams the range directly into its aggregates. */
+        if (ln[p] > 64 && ln[p] > (col->len >> 1))
+            return NULL;
         idx_span_t span = { .start = st[p], .len = ln[p] };
         return rowsel_from_sorted_spans(col->len, &span, 1, ln[p]);
     }
