@@ -1,0 +1,97 @@
+;; parted_live_tail.rfl - query mmap history plus an in-memory live tail
+;; Usage: ./rayforce examples/rfl/parted_live_tail.rfl
+
+(set dbroot "/tmp/rayforce_parted_live_tail")
+(set symfile (format "%/.sym" dbroot))
+
+;; Build a repeatable two-day historical fixture.
+(.sys.exec "rm -rf /tmp/rayforce_parted_live_tail")
+
+(set day12
+  (table ['ticker 'ts 'price 'qty]
+    (list ['AAPL 'MSFT]
+          [2026.07.12D09:30:00.000000000
+           2026.07.12D09:30:01.000000000]
+          [209.50 505.20]
+          [100 40])))
+
+(set day13
+  (table ['ticker 'ts 'price 'qty]
+    (list ['AAPL 'MSFT]
+          [2026.07.13D09:30:00.000000000
+           2026.07.13D09:30:01.000000000]
+          [210.10 506.40]
+          [80 60])))
+
+(.db.splayed.set
+  (format "%/2026.07.12/trades" dbroot) day12 symfile)
+(.db.splayed.set
+  (format "%/2026.07.13/trades" dbroot) day13 symfile)
+
+;; Historical partitions are mmap-backed after this load.
+(set trades (.db.parted.get dbroot 'trades))
+(println "historical rows=%" (count trades))
+
+;; A named batch may put physical columns in any order. `date` is virtual and
+;; must not appear in the payload. NVDA extends only the in-memory .sym domain.
+(insert 'trades 2026.07.14
+  {qty:    [100 50]
+   price:  [211.25 172.40]
+   ticker: ['AAPL 'NVDA]
+   ts:     [2026.07.14D09:30:00.000000000
+            2026.07.14D09:30:01.000000000]})
+
+;; A positional list follows physical order: [ticker ts price qty].
+;; Scalars broadcast when another physical column establishes the batch size.
+(insert 'trades 2026.07.14
+  (list ['AAPL 'MSFT]
+        2026.07.14D09:31:00.000000000
+        [211.30 507.80]
+        [75 25]))
+
+;; History and the live tail query as one logical table.
+(show
+  (select {from: trades
+           where: (>= date 2026.07.13)
+           ticker: ticker
+           date: date
+           ts: ts
+           price: price
+           qty: qty}))
+
+(show
+  (select {from: trades
+           by: {date: date ticker: ticker}
+           rows: (count qty)
+           volume: (sum qty)}))
+
+;; Rollover is explicit: serialize ingestion, project away the virtual date,
+;; persist the complete current partition, and reopen mmap-backed history.
+(set closed-day
+  (select {from: trades
+           where: (== date 2026.07.14)
+           ticker: ticker
+           ts: ts
+           price: price
+           qty: qty}))
+
+(.db.splayed.set
+  (format "%/2026.07.14/trades" dbroot) closed-day symfile)
+(set trades (.db.parted.get dbroot 'trades))
+(println "rows after rollover=%" (count trades))
+
+;; More than one later in-memory date is supported. Only the last key can grow
+;; once ingestion advances; inserting into 2026.07.15 after this is rejected.
+(insert 'trades 2026.07.15
+  (list 'AAPL 2026.07.15D09:30:00.000000000 212.10 100))
+(insert 'trades 2026.07.16
+  (list 'MSFT 2026.07.16D09:30:00.000000000 509.20 50))
+
+(show
+  (select {from: trades
+           by: {date: date}
+           rows: (count qty)}))
+
+;; Keep the example repeatable. Remove this line to inspect the persisted data.
+(.sys.exec "rm -rf /tmp/rayforce_parted_live_tail")
+(exit 0)

@@ -28,10 +28,15 @@
 #include <rayforce.h>
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "store/part.h"
+#include "store/splay.h"
+#include "table/domain.h"
 #include "table/sym.h"
 #include "lang/internal.h"
 #include <string.h>
 #include <stdio.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -115,6 +120,32 @@ extern ray_runtime_t *__RUNTIME;
         FAIL("explicit MUNIT_FAIL"); \
     } \
     /* _le IS an error — reclaim via ray_error_free (ray_release is a no-op). */ \
+    ray_error_free(_le); \
+} while(0)
+
+/* ASSERT_ER_CODE: also pin the semantic rejection path.  This is useful for
+ * safety guards where merely receiving some downstream schema error would be
+ * a false positive (for example, PARTED upsert must be rejected up front). */
+#define ASSERT_ER_CODE(expr, expected_code) do { \
+    ray_t* _le = ray_eval_str(expr); \
+    if (!RAY_IS_ERR(_le)) { \
+        ray_t* _s = _le ? ray_fmt(_le, 0) : NULL; \
+        fprintf(stderr, "  %s:%d: expected %s error, got: %.*s\n -- expr: %s\n", \
+                __FILE__, __LINE__, expected_code, \
+                (int)(_s ? ray_str_len(_s) : 0), \
+                _s ? ray_str_ptr(_s) : "", expr); \
+        if (_s) ray_release(_s); \
+        if (_le) ray_release(_le); \
+        FAIL("explicit MUNIT_FAIL"); \
+    } \
+    const char* _ec = ray_err_code(_le); \
+    int _code_ok = _ec && strcmp(_ec, expected_code) == 0; \
+    if (!_code_ok) { \
+        fprintf(stderr, "  %s:%d: expected error code %s, got %s\n -- expr: %s\n", \
+                __FILE__, __LINE__, expected_code, _ec ? _ec : "null", expr); \
+        ray_error_free(_le); \
+        FAIL("explicit MUNIT_FAIL"); \
+    } \
     ray_error_free(_le); \
 } while(0)
 
@@ -2519,6 +2550,300 @@ static test_result_t test_eval_select_empty_const(void) {
     PASS();
 }
 
+/* ---- Helpers: real splayed fixture for partition-aware insert --------- */
+
+static void lang_parted_insert_rm_rf(const char* root) {
+    DIR* dir = opendir(root);
+    if (!dir) {
+        (void)unlink(root);
+        return;
+    }
+
+    struct dirent* ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        char child[1200];
+        int n = snprintf(child, sizeof(child), "%s/%s", root, ent->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(child)) continue;
+        struct stat st;
+        if (lstat(child, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) lang_parted_insert_rm_rf(child);
+        else (void)unlink(child);
+    }
+    closedir(dir);
+    (void)rmdir(root);
+}
+
+static bool lang_parted_insert_save_table(const char* src, const char* dir,
+                                          const char* sym_path) {
+    ray_t* tbl = ray_eval_str(src);
+    if (!tbl || RAY_IS_ERR(tbl)) {
+        if (tbl) ray_error_free(tbl);
+        return false;
+    }
+    ray_err_t err = ray_splay_save(tbl, dir, sym_path);
+    ray_release(tbl);
+    return err == RAY_OK;
+}
+
+/* Two immutable mmap-backed days with one shared FILE-domain vocabulary.
+ * Inserts into the canonical parted view are intentionally memory-only. */
+static bool lang_parted_insert_fixture(const char* root) {
+    char day1[1024], day2[1024], sym_path[1024];
+    int n1 = snprintf(day1, sizeof(day1), "%s/2024.01.01/trades", root);
+    int n2 = snprintf(day2, sizeof(day2), "%s/2024.01.02/trades", root);
+    int ns = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    if (n1 <= 0 || (size_t)n1 >= sizeof(day1) ||
+        n2 <= 0 || (size_t)n2 >= sizeof(day2) ||
+        ns <= 0 || (size_t)ns >= sizeof(sym_path))
+        return false;
+
+    if (!lang_parted_insert_save_table(
+            "(table ['id 'ticker 'note 'qty] "
+            "       (list [1 2] ['alpha 'beta] "
+            "             [\"one\" \"two\"] [10 0Nl]))",
+            day1, sym_path))
+        return false;
+
+    return lang_parted_insert_save_table(
+        "(table ['id 'ticker 'note 'qty] "
+        "       (list [3 4] ['alpha 'beta] "
+        "             [\"three\" \"four\"] [30 40]))",
+        day2, sym_path);
+}
+
+/* Two SYM columns sharing one FILE vocabulary across both disk partitions. */
+static bool lang_parted_insert_sym_fixture(const char* root) {
+    char day1[1024], day2[1024], sym_path[1024];
+    int n1 = snprintf(day1, sizeof(day1), "%s/2024.01.01/trades", root);
+    int n2 = snprintf(day2, sizeof(day2), "%s/2024.01.02/trades", root);
+    int ns = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    if (n1 <= 0 || (size_t)n1 >= sizeof(day1) ||
+        n2 <= 0 || (size_t)n2 >= sizeof(day2) ||
+        ns <= 0 || (size_t)ns >= sizeof(sym_path))
+        return false;
+
+    if (!lang_parted_insert_save_table(
+            "(table ['id 'ticker 'venue] "
+            "       (list [1 2] ['alpha 'beta] ['xnys 'xnas]))",
+            day1, sym_path))
+        return false;
+
+    return lang_parted_insert_save_table(
+        "(table ['id 'ticker 'venue] "
+        "       (list [3 4] ['alpha 'beta] ['xnas 'xnys]))",
+        day2, sym_path);
+}
+
+/* STRL stores its little-endian entry count immediately after the magic. */
+static bool lang_parted_insert_symfile_count(const char* path, int64_t* out) {
+    if (!path || !out) return false;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    uint8_t hdr[12];
+    size_t got = 0;
+    while (got < sizeof(hdr)) {
+        ssize_t n = read(fd, hdr + got, sizeof(hdr) - got);
+        if (n <= 0) {
+            (void)close(fd);
+            return false;
+        }
+        got += (size_t)n;
+    }
+    (void)close(fd);
+
+    uint64_t count = 0;
+    for (int i = 0; i < 8; i++)
+        count |= (uint64_t)hdr[4 + i] << (unsigned)(8 * i);
+    if (count > INT64_MAX) return false;
+    *out = (int64_t)count;
+    return true;
+}
+
+static ray_t* lang_parted_insert_col(ray_t* tbl, const char* name) {
+    return ray_table_get_col(tbl, ray_sym_intern(name, strlen(name)));
+}
+
+static ray_t* lang_parted_insert_counts(ray_t* tbl) {
+    ray_t* mc = ray_table_get_col_idx(tbl, 0);
+    if (!mc || mc->type != RAY_MAPCOMMON || mc->len != 2) return NULL;
+    return ((ray_t**)ray_data(mc))[1];
+}
+
+enum {
+    LANG_WIDE_BOOL, LANG_WIDE_U8, LANG_WIDE_I16, LANG_WIDE_I32,
+    LANG_WIDE_F32, LANG_WIDE_F64, LANG_WIDE_DATE, LANG_WIDE_TIME,
+    LANG_WIDE_TIMESTAMP, LANG_WIDE_GUID, LANG_WIDE_NCOLS
+};
+
+static const int8_t lang_parted_wide_types[LANG_WIDE_NCOLS] = {
+    RAY_BOOL, RAY_U8, RAY_I16, RAY_I32, RAY_F32, RAY_F64,
+    RAY_DATE, RAY_TIME, RAY_TIMESTAMP, RAY_GUID
+};
+
+static const char* const lang_parted_wide_names[LANG_WIDE_NCOLS] = {
+    "b", "u8", "i16", "i32", "f32", "f64", "d", "tm", "ts", "g"
+};
+
+static const char* const lang_parted_wide_payload_names[LANG_WIDE_NCOLS] = {
+    "wide_bv", "wide_u8v", "wide_i16v", "wide_i32v", "wide_f32v",
+    "wide_f64v", "wide_dv", "wide_tmv", "wide_tsv", "wide_gv"
+};
+
+static const char* const lang_parted_wide_zero_names[LANG_WIDE_NCOLS] = {
+    "wide_zb", "wide_zu8", "wide_zi16", "wide_zi32", "wide_zf32",
+    "wide_zf64", "wide_zd", "wide_ztm", "wide_zts", "wide_zg"
+};
+
+static ray_t* lang_parted_wide_fixture_vec(int8_t type, int variant) {
+    ray_t* v = ray_vec_new(type, 1);
+    if (!v || RAY_IS_ERR(v)) return v;
+    v->len = 1;
+    switch (type) {
+    case RAY_BOOL: ((uint8_t*)ray_data(v))[0] = (uint8_t)(variant & 1); break;
+    case RAY_U8: ((uint8_t*)ray_data(v))[0] = (uint8_t)(10 + variant); break;
+    case RAY_I16: ((int16_t*)ray_data(v))[0] = (int16_t)(100 + variant); break;
+    case RAY_I32: ((int32_t*)ray_data(v))[0] = 1000 + variant; break;
+    case RAY_F32: ((float*)ray_data(v))[0] = (float)variant + 0.25f; break;
+    case RAY_F64: ((double*)ray_data(v))[0] = (double)variant + 0.5; break;
+    case RAY_DATE: ((int32_t*)ray_data(v))[0] = 8765 + variant; break;
+    case RAY_TIME: ((int32_t*)ray_data(v))[0] = variant * 1000; break;
+    case RAY_TIMESTAMP:
+        ((int64_t*)ray_data(v))[0] = (int64_t)variant * 1000000000LL;
+        break;
+    case RAY_GUID: {
+        uint8_t* p = (uint8_t*)ray_data(v);
+        for (int i = 0; i < 16; i++) p[i] = (uint8_t)(variant * 16 + i + 1);
+        break;
+    }
+    default: ray_release(v); return ray_error("type", NULL);
+    }
+    return v;
+}
+
+static ray_t* lang_parted_wide_table(int variant) {
+    ray_t* tbl = ray_table_new(LANG_WIDE_NCOLS);
+    if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    for (int i = 0; i < LANG_WIDE_NCOLS; i++) {
+        ray_t* col = lang_parted_wide_fixture_vec(lang_parted_wide_types[i],
+                                                   variant);
+        if (!col || RAY_IS_ERR(col)) {
+            ray_release(tbl);
+            return col ? col : ray_error("oom", NULL);
+        }
+        int64_t name = ray_sym_intern(lang_parted_wide_names[i],
+                                      strlen(lang_parted_wide_names[i]));
+        tbl = ray_table_add_col(tbl, name, col);
+        ray_release(col);
+        if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    }
+    return tbl;
+}
+
+static bool lang_parted_wide_fixture(const char* root) {
+    char day1[1024], day2[1024];
+    int n1 = snprintf(day1, sizeof(day1), "%s/2024.01.01/wide", root);
+    int n2 = snprintf(day2, sizeof(day2), "%s/2024.01.02/wide", root);
+    if (n1 <= 0 || (size_t)n1 >= sizeof(day1) ||
+        n2 <= 0 || (size_t)n2 >= sizeof(day2))
+        return false;
+
+    ray_t* t1 = lang_parted_wide_table(1);
+    if (!t1 || RAY_IS_ERR(t1)) {
+        if (t1 && RAY_IS_ERR(t1)) ray_error_free(t1);
+        return false;
+    }
+    ray_err_t err = ray_splay_save(t1, day1, NULL);
+    ray_release(t1);
+    if (err != RAY_OK) return false;
+
+    ray_t* t2 = lang_parted_wide_table(2);
+    if (!t2 || RAY_IS_ERR(t2)) {
+        if (t2 && RAY_IS_ERR(t2)) ray_error_free(t2);
+        return false;
+    }
+    err = ray_splay_save(t2, day2, NULL);
+    ray_release(t2);
+    return err == RAY_OK;
+}
+
+static ray_t* lang_parted_wide_payload_vec(int8_t type, bool empty) {
+    ray_t* v = ray_vec_new(type, empty ? 0 : 2);
+    if (!v || RAY_IS_ERR(v) || empty) return v;
+    v->len = 2;
+    switch (type) {
+    case RAY_BOOL: {
+        uint8_t* d = (uint8_t*)ray_data(v); d[0] = 1; d[1] = 0; break;
+    }
+    case RAY_U8: {
+        uint8_t* d = (uint8_t*)ray_data(v); d[0] = 7; d[1] = 8; break;
+    }
+    case RAY_I16: {
+        int16_t* d = (int16_t*)ray_data(v); d[0] = -123; d[1] = 456; break;
+    }
+    case RAY_I32: {
+        int32_t* d = (int32_t*)ray_data(v); d[0] = 123456; d[1] = -654321; break;
+    }
+    case RAY_F32: {
+        float* d = (float*)ray_data(v); d[0] = 1.5f; d[1] = 0.0f;
+        ray_vec_set_null(v, 1, true); break;
+    }
+    case RAY_F64: {
+        double* d = (double*)ray_data(v); d[0] = 2.5; d[1] = -3.5; break;
+    }
+    case RAY_DATE: {
+        int32_t* d = (int32_t*)ray_data(v); d[0] = 9132; d[1] = 9133; break;
+    }
+    case RAY_TIME: {
+        int32_t* d = (int32_t*)ray_data(v);
+        d[0] = 3723004; d[1] = 18367008; break;
+    }
+    case RAY_TIMESTAMP: {
+        int64_t* d = (int64_t*)ray_data(v);
+        d[0] = 1111111111LL; d[1] = 2222222222LL; break;
+    }
+    case RAY_GUID: {
+        uint8_t* d = (uint8_t*)ray_data(v);
+        for (int i = 0; i < 16; i++) d[i] = (uint8_t)(0xA0 + i);
+        memset(d + 16, 0, 16);
+        ray_vec_set_null(v, 1, true);
+        break;
+    }
+    default: ray_release(v); return ray_error("type", NULL);
+    }
+    return v;
+}
+
+static bool lang_parted_wide_bind_payloads(void) {
+    for (int i = 0; i < LANG_WIDE_NCOLS; i++) {
+        ray_t* payload = lang_parted_wide_payload_vec(lang_parted_wide_types[i],
+                                                       false);
+        if (!payload || RAY_IS_ERR(payload)) {
+            if (payload && RAY_IS_ERR(payload)) ray_error_free(payload);
+            return false;
+        }
+        int64_t id = ray_sym_intern(lang_parted_wide_payload_names[i],
+                                    strlen(lang_parted_wide_payload_names[i]));
+        ray_err_t err = ray_env_bind_flat(id, payload);
+        ray_release(payload);
+        if (err != RAY_OK) return false;
+
+        ray_t* zero = lang_parted_wide_payload_vec(lang_parted_wide_types[i],
+                                                    true);
+        if (!zero || RAY_IS_ERR(zero)) {
+            if (zero && RAY_IS_ERR(zero)) ray_error_free(zero);
+            return false;
+        }
+        id = ray_sym_intern(lang_parted_wide_zero_names[i],
+                            strlen(lang_parted_wide_zero_names[i]));
+        err = ray_env_bind_flat(id, zero);
+        ray_release(zero);
+        if (err != RAY_OK) return false;
+    }
+    return true;
+}
+
 /* ---- Test: insert ---- */
 static test_result_t test_eval_insert(void) {
     ray_t* result = ray_eval_str(
@@ -2697,6 +3022,1129 @@ static test_result_t test_eval_insert_positional_errors(void) {
     ASSERT_EQ("(do (set v (til 5)) (set s (take v 3)) (insert 's 0 99) s)",
               "[99 0 1 2]");
     PASS();
+}
+
+/* ---- Test: insert into a canonical parted table ----------------------- */
+
+static test_result_t test_eval_insert_parted_e2e_impl(const char* root) {
+    TEST_ASSERT(lang_parted_insert_fixture(root), "create parted fixture");
+
+    char src[1400];
+    int n = snprintf(src, sizeof(src),
+                     "(set p (.db.parted.get \"%s\" 'trades))", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    char sym_path[1200], disk_id_path[1200];
+    struct stat sym_before, sym_after, disk_id_before, disk_id_after;
+    n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(sym_path), "format sym path");
+    TEST_ASSERT(stat(sym_path, &sym_before) == 0, "stat fixture symfile");
+    n = snprintf(disk_id_path, sizeof(disk_id_path),
+                 "%s/2024.01.02/trades/id", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(disk_id_path),
+                "format current disk column path");
+    TEST_ASSERT(stat(disk_id_path, &disk_id_before) == 0,
+                "stat current disk column");
+
+    ray_t* before = ray_eval_str("p");
+    TEST_ASSERT_NOT_NULL(before);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(before));
+    TEST_ASSERT_EQ_I(before->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(before), 4);
+    TEST_ASSERT_EQ_I(ray_table_ncols(before), 5);
+
+    ray_t* mc = ray_table_get_col_idx(before, 0);
+    TEST_ASSERT_NOT_NULL(mc);
+    TEST_ASSERT_EQ_I(mc->type, RAY_MAPCOMMON);
+    TEST_ASSERT_EQ_U(mc->attrs, RAY_MC_DATE);
+    ray_t* counts = lang_parted_insert_counts(before);
+    TEST_ASSERT_NOT_NULL(counts);
+    TEST_ASSERT_EQ_I(counts->len, 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[0], 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[1], 2);
+
+    const char* physical[] = { "id", "ticker", "note", "qty" };
+    ray_t* hist_seg[4];
+    ray_t* old_tail[4];
+    for (size_t i = 0; i < 4; i++) {
+        ray_t* col = lang_parted_insert_col(before, physical[i]);
+        TEST_ASSERT_NOT_NULL(col);
+        TEST_ASSERT_TRUE(RAY_IS_PARTED(col->type));
+        TEST_ASSERT_EQ_I(col->len, 2);
+        ray_t** segs = (ray_t**)ray_data(col);
+        hist_seg[i] = segs[0];
+        old_tail[i] = segs[1];
+        TEST_ASSERT_EQ_I(segs[0]->len, 2);
+        TEST_ASSERT_EQ_I(segs[1]->len, 2);
+        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
+        TEST_ASSERT_EQ_U(segs[1]->mmod, 1);
+    }
+
+    ray_t* base_sym_col = lang_parted_insert_col(before, "ticker");
+    ray_t** base_sym_segs = (ray_t**)ray_data(base_sym_col);
+    struct ray_sym_domain_s* file_dom = ray_sym_vec_domain(base_sym_segs[0]);
+    TEST_ASSERT_NOT_NULL(file_dom);
+    TEST_ASSERT(file_dom != ray_sym_runtime_domain(),
+                "historical ticker uses FILE domain");
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(base_sym_segs[1]), file_dom);
+
+    /* Functional form returns a fresh snapshot and leaves `p` unchanged. */
+    ray_t* inserted = ray_eval_str(
+        "(set f (insert p 2024.01.02 "
+        "               (list 5 'gamma \"five\" 50)))");
+    TEST_ASSERT_NOT_NULL(inserted);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(inserted));
+    ray_release(inserted);
+
+    ray_t* functional = ray_eval_str("f");
+    TEST_ASSERT_NOT_NULL(functional);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(functional));
+    TEST_ASSERT_EQ_I(ray_table_nrows(functional), 5);
+    counts = lang_parted_insert_counts(functional);
+    TEST_ASSERT_NOT_NULL(counts);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[0], 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[1], 3);
+    for (size_t i = 0; i < 4; i++) {
+        ray_t* col = lang_parted_insert_col(functional, physical[i]);
+        TEST_ASSERT_NOT_NULL(col);
+        ray_t** segs = (ray_t**)ray_data(col);
+        TEST_ASSERT_EQ_PTR(segs[0], hist_seg[i]);
+        TEST_ASSERT(segs[1] != old_tail[i], "tail copied before append");
+        TEST_ASSERT_EQ_I(segs[1]->len, 3);
+        TEST_ASSERT_EQ_U(segs[1]->mmod, 0);
+    }
+    ray_t** functional_sym = (ray_t**)ray_data(
+        lang_parted_insert_col(functional, "ticker"));
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(functional_sym[1]), file_dom);
+    ray_t* gamma = ray_sym_vec_cell(functional_sym[1], 2);
+    TEST_ASSERT_NOT_NULL(gamma);
+    TEST_ASSERT_EQ_U(ray_str_len(gamma), 5);
+    TEST_ASSERT_MEM_EQ(5, ray_str_ptr(gamma), "gamma");
+
+    ASSERT_EQ("(count p)", "4");
+    ASSERT_EQ("(count f)", "5");
+    ASSERT_EQ("(at (select {id: id from: f where: (== ticker 'gamma)}) 'id)",
+              "[5]");
+
+    /* Symbol target returns the symbol and rebinds only that name.  The
+     * exact DICT schema is order-independent and its atoms broadcast. */
+    ASSERT_EQ("(insert 'p 2024.01.02 "
+              "        {qty: 0Nl note: \"six\" ticker: 'delta id: 6})",
+              "'p");
+    ASSERT_EQ("(count p)", "5");
+    ASSERT_EQ("(count f)", "5");
+
+    /* Retain a snapshot whose active segment is already heap-backed.  The
+     * next insert must replace that segment, never mutate it through COW. */
+    ray_t* mid_set = ray_eval_str("(set mid p)");
+    TEST_ASSERT_NOT_NULL(mid_set);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mid_set));
+    ray_release(mid_set);
+
+    ASSERT_EQ("(insert 'p 2024.01.02 "
+              "        {note: \"bulk\" qty: [70 80] "
+              "         ticker: 'alpha id: [7 8]})",
+              "'p");
+    ASSERT_EQ("(count mid)", "5");
+    ASSERT_EQ("(count (at (select {id: id from: mid where: (>= id 7)}) 'id))",
+              "0");
+
+    /* A greater key creates a new heap tail.  TABLE payload schemas are
+     * name-based, so deliberately reverse the physical-column order. */
+    ASSERT_EQ("(insert 'p 2024.01.03 "
+              "        (table ['note 'qty 'ticker 'id] "
+              "               (list [\"nine\" \"ten\"] [90 0Nl] "
+              "                     ['gamma 'beta] [9 10])))",
+              "'p");
+
+    ASSERT_EQ("(count p)", "9");
+    ASSERT_EQ("(sum (at p 'qty))", "320");
+    ASSERT_EQ("(at (select {id: id from: p where: (== ticker 'gamma)}) 'id)",
+              "[9]");
+    ASSERT_EQ("(at (select {from: p by: date c: (count id)}) 'c)",
+              "[2 5 2]");
+    ASSERT_EQ("(do (set pg (select {from: p by: ticker c: (count id)})) "
+              "    (at (select {c: c from: pg where: (== ticker 'alpha)}) 'c))",
+              "[4]");
+
+    ray_t* live = ray_eval_str("p");
+    TEST_ASSERT_NOT_NULL(live);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(live));
+    ray_t* mid = ray_eval_str("mid");
+    TEST_ASSERT_NOT_NULL(mid);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(mid));
+    TEST_ASSERT_EQ_I(ray_table_nrows(live), 9);
+    TEST_ASSERT_EQ_I(ray_table_nrows(mid), 5);
+    TEST_ASSERT_EQ_I(ray_table_nrows(before), 4);
+    TEST_ASSERT_EQ_I(ray_table_nrows(functional), 5);
+
+    for (size_t i = 0; i < 4; i++) {
+        ray_t** mid_segs = (ray_t**)ray_data(
+            lang_parted_insert_col(mid, physical[i]));
+        ray_t** live_segs_cmp = (ray_t**)ray_data(
+            lang_parted_insert_col(live, physical[i]));
+        TEST_ASSERT_EQ_PTR(mid_segs[0], hist_seg[i]);
+        TEST_ASSERT(mid_segs[1] != live_segs_cmp[1],
+                    "heap-backed retained snapshot was mutated");
+        TEST_ASSERT_EQ_I(mid_segs[1]->len, 3);
+        TEST_ASSERT_EQ_I(live_segs_cmp[1]->len, 5);
+    }
+
+    mc = ray_table_get_col_idx(live, 0);
+    TEST_ASSERT_NOT_NULL(mc);
+    ray_t** mc_parts = (ray_t**)ray_data(mc);
+    TEST_ASSERT_EQ_I(mc_parts[0]->len, 3);
+    TEST_ASSERT_EQ_I(mc_parts[1]->len, 3);
+    int64_t* live_counts = (int64_t*)ray_data(mc_parts[1]);
+    TEST_ASSERT_EQ_I(live_counts[0], 2);
+    TEST_ASSERT_EQ_I(live_counts[1], 5);
+    TEST_ASSERT_EQ_I(live_counts[2], 2);
+
+    for (size_t i = 0; i < 4; i++) {
+        ray_t* col = lang_parted_insert_col(live, physical[i]);
+        TEST_ASSERT_NOT_NULL(col);
+        TEST_ASSERT_TRUE(RAY_IS_PARTED(col->type));
+        TEST_ASSERT_EQ_I(col->len, 3);
+        ray_t** segs = (ray_t**)ray_data(col);
+        TEST_ASSERT_EQ_PTR(segs[0], hist_seg[i]);
+        TEST_ASSERT_EQ_I(segs[0]->len, 2);
+        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
+        TEST_ASSERT_EQ_I(segs[1]->len, 5);
+        TEST_ASSERT_EQ_U(segs[1]->mmod, 0);
+        TEST_ASSERT_EQ_I(segs[2]->len, 2);
+        TEST_ASSERT_EQ_U(segs[2]->mmod, 0);
+    }
+
+    ray_t** live_sym = (ray_t**)ray_data(
+        lang_parted_insert_col(live, "ticker"));
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(live_sym[0]), file_dom);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(live_sym[1]), file_dom);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(live_sym[2]), file_dom);
+    ray_t* delta = ray_sym_vec_cell(live_sym[1], 2);
+    gamma = ray_sym_vec_cell(live_sym[2], 0);
+    TEST_ASSERT_NOT_NULL(delta);
+    TEST_ASSERT_NOT_NULL(gamma);
+    TEST_ASSERT_EQ_U(ray_str_len(delta), 5);
+    TEST_ASSERT_MEM_EQ(5, ray_str_ptr(delta), "delta");
+    TEST_ASSERT_EQ_U(ray_str_len(gamma), 5);
+    TEST_ASSERT_MEM_EQ(5, ray_str_ptr(gamma), "gamma");
+
+    ray_t** live_note = (ray_t**)ray_data(
+        lang_parted_insert_col(live, "note"));
+    size_t slen = 0;
+    const char* sval = ray_str_vec_get(live_note[1], 2, &slen);
+    TEST_ASSERT_NOT_NULL(sval);
+    TEST_ASSERT_EQ_U(slen, 3);
+    TEST_ASSERT_MEM_EQ(3, sval, "six");
+    sval = ray_str_vec_get(live_note[1], 3, &slen);
+    TEST_ASSERT_NOT_NULL(sval);
+    TEST_ASSERT_EQ_U(slen, 4);
+    TEST_ASSERT_MEM_EQ(4, sval, "bulk");
+
+    ray_t** live_qty = (ray_t**)ray_data(
+        lang_parted_insert_col(live, "qty"));
+    TEST_ASSERT_TRUE(ray_vec_is_null(live_qty[0], 1));
+    TEST_ASSERT_TRUE(ray_vec_is_null(live_qty[1], 2));
+    TEST_ASSERT_TRUE(ray_vec_is_null(live_qty[2], 1));
+
+    /* A positional LIST batch is column-oriented.  Scalar physical values
+     * broadcast across the vector-established batch length.  Building a
+     * fourth partition functionally also proves that more than one heap-only
+     * date can coexist without changing the published source binding. */
+    ray_t* future_set = ray_eval_str(
+        "(set future (insert p 2024.01.04 "
+        "                    (list [11 12] ['epsilon 'alpha] "
+        "                          \"future\" [110 120])))");
+    TEST_ASSERT_NOT_NULL(future_set);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(future_set));
+    ray_release(future_set);
+
+    ASSERT_EQ("(count p)", "9");
+    ASSERT_EQ("(count future)", "11");
+    ASSERT_EQ("(at (select {from: future by: date c: (count id)}) 'c)",
+              "[2 5 2 2]");
+    ASSERT_EQ("(at (select {id: id from: future "
+              "             where: (== ticker 'epsilon)}) 'id)",
+              "[11]");
+
+    ray_t* future = ray_eval_str("future");
+    TEST_ASSERT_NOT_NULL(future);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(future));
+    ray_t** future_sym = (ray_t**)ray_data(
+        lang_parted_insert_col(future, "ticker"));
+    TEST_ASSERT_EQ_I(lang_parted_insert_col(future, "ticker")->len, 4);
+    for (int64_t pidx = 0; pidx < 4; pidx++)
+        TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(future_sym[pidx]), file_dom);
+    TEST_ASSERT_EQ_PTR(future_sym[0], live_sym[0]);
+    TEST_ASSERT_EQ_PTR(future_sym[1], live_sym[1]);
+    TEST_ASSERT_EQ_PTR(future_sym[2], live_sym[2]);
+    TEST_ASSERT_EQ_U(future_sym[0]->mmod, 1);
+    TEST_ASSERT_EQ_U(future_sym[1]->mmod, 0);
+    TEST_ASSERT_EQ_U(future_sym[2]->mmod, 0);
+    TEST_ASSERT_EQ_U(future_sym[3]->mmod, 0);
+
+    ray_t** future_note = (ray_t**)ray_data(
+        lang_parted_insert_col(future, "note"));
+    TEST_ASSERT_EQ_I(future_note[3]->len, 2);
+    sval = ray_str_vec_get(future_note[3], 0, &slen);
+    TEST_ASSERT_NOT_NULL(sval);
+    TEST_ASSERT_EQ_U(slen, 6);
+    TEST_ASSERT_MEM_EQ(6, sval, "future");
+    sval = ray_str_vec_get(future_note[3], 1, &slen);
+    TEST_ASSERT_NOT_NULL(sval);
+    TEST_ASSERT_EQ_U(slen, 6);
+    TEST_ASSERT_MEM_EQ(6, sval, "future");
+
+    /* Once 2024.01.04 exists, even the heap-backed 2024.01.03 partition is
+     * immutable.  A rejected quoted insert must preserve the exact binding. */
+    ray_t* older_err = ray_eval_str(
+        "(insert 'future 2024.01.03 (list 13 'alpha \"older\" 130))");
+    TEST_ASSERT_NOT_NULL(older_err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(older_err));
+    TEST_ASSERT_EQ_I(ray_err_from_obj(older_err), RAY_ERR_DOMAIN);
+    ray_error_free(older_err);
+    ray_t* future_after = ray_eval_str("future");
+    TEST_ASSERT_NOT_NULL(future_after);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(future_after));
+    TEST_ASSERT_EQ_PTR(future_after, future);
+    TEST_ASSERT_EQ_I(ray_table_nrows(future_after), 11);
+    ray_release(future_after);
+
+    /* Live tails are not persisted: no third directory is created and a
+     * fresh canonical read still observes the original 2+2 disk rows. */
+    char day3[1200], day4[1200];
+    n = snprintf(day3, sizeof(day3), "%s/2024.01.03", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(day3), "format day3 path");
+    TEST_ASSERT(access(day3, F_OK) != 0, "greater-key insert created a partition");
+    n = snprintf(day4, sizeof(day4), "%s/2024.01.04", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(day4), "format day4 path");
+    TEST_ASSERT(access(day4, F_OK) != 0,
+                "functional greater-key insert created a partition");
+    TEST_ASSERT(stat(sym_path, &sym_after) == 0, "stat symfile after inserts");
+    TEST_ASSERT_EQ_I(sym_after.st_size, sym_before.st_size);
+    TEST_ASSERT(stat(disk_id_path, &disk_id_after) == 0,
+                "stat current disk column after inserts");
+    TEST_ASSERT_EQ_I(disk_id_after.st_size, disk_id_before.st_size);
+
+    ray_t* cold = ray_read_parted(root, "trades");
+    TEST_ASSERT_NOT_NULL(cold);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(cold));
+    TEST_ASSERT_EQ_I(ray_table_nrows(cold), 4);
+    counts = lang_parted_insert_counts(cold);
+    TEST_ASSERT_NOT_NULL(counts);
+    TEST_ASSERT_EQ_I(counts->len, 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[0], 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[1], 2);
+    ray_t* cold_id = lang_parted_insert_col(cold, "id");
+    TEST_ASSERT_NOT_NULL(cold_id);
+    ray_t** cold_id_segs = (ray_t**)ray_data(cold_id);
+    TEST_ASSERT_EQ_U(cold_id_segs[0]->mmod, 1);
+    TEST_ASSERT_EQ_U(cold_id_segs[1]->mmod, 1);
+
+    ray_release(cold);
+    ray_release(future);
+    ray_release(live);
+    ray_release(mid);
+    ray_release(functional);
+    ray_release(before);
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_e2e(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_insert_e2e_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_e2e_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+/* ---- Test: live FILE-domain symbols persist only at explicit rollover - */
+
+static test_result_t test_eval_insert_parted_rollover_impl(const char* root) {
+    TEST_ASSERT(lang_parted_insert_sym_fixture(root),
+                "create shared-symbol parted fixture");
+
+    char src[3200], sym_path[1200], day3[1200];
+    int n = snprintf(src, sizeof(src),
+                     "(set p (.db.parted.get \"%s\" 'trades))", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    n = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(sym_path), "format sym path");
+    n = snprintf(day3, sizeof(day3), "%s/2024.01.03", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(day3), "format day3 path");
+
+    struct stat sym_before, sym_live, sym_persisted;
+    TEST_ASSERT(stat(sym_path, &sym_before) == 0, "stat fixture symfile");
+    int64_t disk_syms_before = -1, disk_syms_live = -1;
+    int64_t disk_syms_persisted = -1;
+    TEST_ASSERT(lang_parted_insert_symfile_count(sym_path, &disk_syms_before),
+                "read fixture symfile count");
+    TEST_ASSERT_EQ_I(disk_syms_before, 5); /* "", alpha, beta, xnys, xnas */
+
+    ray_t* base = ray_eval_str("p");
+    TEST_ASSERT_NOT_NULL(base);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(base));
+    ray_t** base_ticker = (ray_t**)ray_data(
+        lang_parted_insert_col(base, "ticker"));
+    ray_t** base_venue = (ray_t**)ray_data(
+        lang_parted_insert_col(base, "venue"));
+    struct ray_sym_domain_s* live_dom = ray_sym_vec_domain(base_ticker[0]);
+    TEST_ASSERT_NOT_NULL(live_dom);
+    TEST_ASSERT(live_dom != ray_sym_runtime_domain(),
+                "fixture symbols use a FILE domain");
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(base_ticker[1]), live_dom);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(base_venue[0]), live_dom);
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(base_venue[1]), live_dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(live_dom), disk_syms_before);
+
+    /* New vocabulary entries are reused across two SYM columns and across a
+     * copied last-disk segment plus a newly-created memory partition. */
+    ASSERT_EQ("(insert 'p 2024.01.02 "
+              "        (list [5 6] ['ticker_only 'omni] "
+              "              ['venue_only 'omni]))",
+              "'p");
+    ASSERT_EQ("(insert 'p 2024.01.03 "
+              "        (list [7 8] ['omni 'venue_only] "
+              "              ['omni 'ticker_only]))",
+              "'p");
+    ASSERT_EQ("(at (select {id: id from: p "
+              "             where: (== ticker 'omni)}) 'id)",
+              "[6 7]");
+    ASSERT_EQ("(at (select {id: id from: p "
+              "             where: (== venue 'omni)}) 'id)",
+              "[6 7]");
+    TEST_ASSERT(stat(sym_path, &sym_live) == 0,
+                "stat symfile with live symbols");
+    TEST_ASSERT_EQ_I(sym_live.st_size, sym_before.st_size);
+    TEST_ASSERT(lang_parted_insert_symfile_count(sym_path, &disk_syms_live),
+                "read symfile count after live inserts");
+    TEST_ASSERT_EQ_I(disk_syms_live, disk_syms_before);
+    TEST_ASSERT(access(day3, F_OK) != 0,
+                "live symbol insert created an on-disk partition");
+
+    ray_t* live = ray_eval_str("p");
+    TEST_ASSERT_NOT_NULL(live);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(live));
+    TEST_ASSERT_EQ_I(ray_table_nrows(live), 8);
+    ray_t* counts = lang_parted_insert_counts(live);
+    TEST_ASSERT_NOT_NULL(counts);
+    TEST_ASSERT_EQ_I(counts->len, 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[0], 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[1], 4);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[2], 2);
+
+    ray_t* live_ticker_col = lang_parted_insert_col(live, "ticker");
+    ray_t* live_venue_col = lang_parted_insert_col(live, "venue");
+    TEST_ASSERT_NOT_NULL(live_ticker_col);
+    TEST_ASSERT_NOT_NULL(live_venue_col);
+    TEST_ASSERT_EQ_I(live_ticker_col->len, 3);
+    TEST_ASSERT_EQ_I(live_venue_col->len, 3);
+    ray_t** live_ticker = (ray_t**)ray_data(live_ticker_col);
+    ray_t** live_venue = (ray_t**)ray_data(live_venue_col);
+    for (int64_t pidx = 0; pidx < 3; pidx++) {
+        TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(live_ticker[pidx]), live_dom);
+        TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(live_venue[pidx]), live_dom);
+    }
+    TEST_ASSERT_EQ_U(live_ticker[0]->mmod, 1);
+    TEST_ASSERT_EQ_U(live_venue[0]->mmod, 1);
+    for (int64_t pidx = 1; pidx < 3; pidx++) {
+        TEST_ASSERT_EQ_U(live_ticker[pidx]->mmod, 0);
+        TEST_ASSERT_EQ_U(live_venue[pidx]->mmod, 0);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(live_dom), disk_syms_before + 3);
+
+    int64_t omni_pos = ray_sym_domain_find(live_dom, "omni", 4);
+    TEST_ASSERT(omni_pos >= 0, "omni missing from live FILE domain");
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(live_ticker[1]), 3,
+                                  RAY_SYM, live_ticker[1]->attrs), omni_pos);
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(live_venue[1]), 3,
+                                  RAY_SYM, live_venue[1]->attrs), omni_pos);
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(live_ticker[2]), 0,
+                                  RAY_SYM, live_ticker[2]->attrs), omni_pos);
+    TEST_ASSERT_EQ_I(ray_read_sym(ray_data(live_venue[2]), 0,
+                                  RAY_SYM, live_venue[2]->attrs), omni_pos);
+    ray_t* omni = ray_sym_domain_str(live_dom, omni_pos);
+    TEST_ASSERT_NOT_NULL(omni);
+    TEST_ASSERT_EQ_U(ray_str_len(omni), 4);
+    TEST_ASSERT_MEM_EQ(4, ray_str_ptr(omni), "omni");
+
+    /* Rollover projects away the virtual partition column.  splayed.set
+     * flushes the enlarged vocabulary before writing columns that reference
+     * its new positions, then a canonical read sees an mmap-backed day. */
+    n = snprintf(
+        src, sizeof(src),
+        "(do (set closed "
+        "          (select {from: p where: (== date 2024.01.03) "
+        "                   id: id ticker: ticker venue: venue})) "
+        "    (.db.splayed.set \"%s/2024.01.03/trades\" closed \"%s\"))",
+        root, sym_path);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format rollover");
+    ray_t* saved = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(saved);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(saved));
+    ray_release(saved);
+
+    TEST_ASSERT(stat(sym_path, &sym_persisted) == 0,
+                "stat persisted symfile");
+    TEST_ASSERT(sym_persisted.st_size > sym_before.st_size,
+                "rollover did not persist the enlarged symbol vocabulary");
+    TEST_ASSERT(lang_parted_insert_symfile_count(sym_path,
+                                                  &disk_syms_persisted),
+                "read persisted symfile count");
+    TEST_ASSERT_EQ_I(disk_syms_persisted, disk_syms_before + 3);
+    TEST_ASSERT(access(day3, F_OK) == 0,
+                "rollover did not create the physical partition");
+
+    /* Drop every holder so the following read reopens the FILE domain from
+     * disk instead of observing the process cache's already-extended object. */
+    ray_release(live);
+    ray_release(base);
+    ray_t* deleted = ray_eval_str("(do (del p) (del closed))");
+    TEST_ASSERT_NOT_NULL(deleted);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(deleted));
+    ray_release(deleted);
+
+    ray_t* cold = ray_read_parted(root, "trades");
+    TEST_ASSERT_NOT_NULL(cold);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(cold));
+    TEST_ASSERT_EQ_I(ray_table_nrows(cold), 6);
+    counts = lang_parted_insert_counts(cold);
+    TEST_ASSERT_NOT_NULL(counts);
+    TEST_ASSERT_EQ_I(counts->len, 3);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[0], 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[1], 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[2], 2);
+
+    ray_t* cold_ticker_col = lang_parted_insert_col(cold, "ticker");
+    ray_t* cold_venue_col = lang_parted_insert_col(cold, "venue");
+    TEST_ASSERT_NOT_NULL(cold_ticker_col);
+    TEST_ASSERT_NOT_NULL(cold_venue_col);
+    TEST_ASSERT_EQ_I(cold_ticker_col->len, 3);
+    TEST_ASSERT_EQ_I(cold_venue_col->len, 3);
+    ray_t** cold_ticker = (ray_t**)ray_data(cold_ticker_col);
+    ray_t** cold_venue = (ray_t**)ray_data(cold_venue_col);
+    struct ray_sym_domain_s* cold_dom = ray_sym_vec_domain(cold_ticker[0]);
+    TEST_ASSERT_NOT_NULL(cold_dom);
+    for (int64_t pidx = 0; pidx < 3; pidx++) {
+        TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(cold_ticker[pidx]), cold_dom);
+        TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(cold_venue[pidx]), cold_dom);
+        TEST_ASSERT_EQ_U(cold_ticker[pidx]->mmod, 1);
+        TEST_ASSERT_EQ_U(cold_venue[pidx]->mmod, 1);
+    }
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(cold_dom), disk_syms_persisted);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(cold_dom, "omni", 4), omni_pos);
+
+    ray_t* ticker0 = ray_sym_vec_cell(cold_ticker[2], 0);
+    ray_t* ticker1 = ray_sym_vec_cell(cold_ticker[2], 1);
+    ray_t* venue0 = ray_sym_vec_cell(cold_venue[2], 0);
+    ray_t* venue1 = ray_sym_vec_cell(cold_venue[2], 1);
+    TEST_ASSERT_NOT_NULL(ticker0);
+    TEST_ASSERT_NOT_NULL(ticker1);
+    TEST_ASSERT_NOT_NULL(venue0);
+    TEST_ASSERT_NOT_NULL(venue1);
+    TEST_ASSERT_EQ_U(ray_str_len(ticker0), 4);
+    TEST_ASSERT_MEM_EQ(4, ray_str_ptr(ticker0), "omni");
+    TEST_ASSERT_EQ_U(ray_str_len(ticker1), 10);
+    TEST_ASSERT_MEM_EQ(10, ray_str_ptr(ticker1), "venue_only");
+    TEST_ASSERT_EQ_U(ray_str_len(venue0), 4);
+    TEST_ASSERT_MEM_EQ(4, ray_str_ptr(venue0), "omni");
+    TEST_ASSERT_EQ_U(ray_str_len(venue1), 11);
+    TEST_ASSERT_MEM_EQ(11, ray_str_ptr(venue1), "ticker_only");
+
+    ray_t* cold_id_col = lang_parted_insert_col(cold, "id");
+    TEST_ASSERT_NOT_NULL(cold_id_col);
+    ray_t** cold_id = (ray_t**)ray_data(cold_id_col);
+    TEST_ASSERT_EQ_U(cold_id[2]->mmod, 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(cold_id[2]))[0], 7);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(cold_id[2]))[1], 8);
+
+    ray_release(cold);
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_rollover(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_insert_rollover_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_rollover_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+/* ---- Test: partition-aware insert rejects ambiguous/unsafe shapes ------ */
+
+static test_result_t test_eval_insert_parted_errors_impl(const char* root) {
+    TEST_ASSERT(lang_parted_insert_fixture(root), "create parted fixture");
+
+    char src[1400];
+    int n = snprintf(src, sizeof(src),
+                     "(set p (.db.parted.get \"%s\" 'trades))", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    /* Rebinding a quoted reserved dotted name must fail after target
+     * resolution, without replacing or mutating the existing binding. */
+    static const char reserved_name[] = ".test.parted.insert_rebind";
+    int64_t reserved_id = ray_sym_intern(reserved_name,
+                                         sizeof(reserved_name) - 1);
+    ray_t* reserved_source = ray_eval_str("p");
+    TEST_ASSERT_NOT_NULL(reserved_source);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(reserved_source));
+    TEST_ASSERT_EQ_I(ray_table_nrows(reserved_source), 4);
+    TEST_ASSERT_EQ_I(ray_env_bind_flat(reserved_id, reserved_source), RAY_OK);
+
+    ray_t* reserved_err = ray_eval_str(
+        "(insert '.test.parted.insert_rebind 2024.01.02 "
+        "        (list 5 'alpha \"five\" 50))");
+    TEST_ASSERT_NOT_NULL(reserved_err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(reserved_err));
+    TEST_ASSERT_EQ_I(ray_err_from_obj(reserved_err), RAY_ERR_RESERVED);
+    ray_error_free(reserved_err);
+
+    ray_t* reserved_bound = ray_env_get(reserved_id); /* borrowed */
+    TEST_ASSERT_EQ_PTR(reserved_bound, reserved_source);
+    TEST_ASSERT_EQ_I(ray_table_nrows(reserved_bound), 4);
+    TEST_ASSERT_EQ_I(ray_table_nrows(reserved_source), 4);
+    ASSERT_EQ("(count .test.parted.insert_rebind)", "4");
+    ASSERT_EQ("(count p)", "4");
+
+    /* Exercise a checked dotted rebind failure after successful flat
+     * lookup: the fully-qualified name resolves directly to the PARTED
+     * table, but ray_env_set must walk through `live`, which is an atom. */
+    static const char dotted_name[] = "live.parted";
+    int64_t dotted_id = ray_sym_intern(dotted_name, sizeof(dotted_name) - 1);
+    int64_t head_id = ray_sym_intern("live", 4);
+    ray_t* head_atom = ray_i64(7);
+    TEST_ASSERT_NOT_NULL(head_atom);
+    TEST_ASSERT_EQ_I(ray_env_bind_flat(dotted_id, reserved_source), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_env_bind_flat(head_id, head_atom), RAY_OK);
+    ray_release(head_atom);
+
+    ray_t* dotted_err = ray_eval_str(
+        "(insert 'live.parted 2024.01.02 "
+        "        (list 5 'alpha \"five\" 50))");
+    TEST_ASSERT_NOT_NULL(dotted_err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(dotted_err));
+    TEST_ASSERT_EQ_I(ray_err_from_obj(dotted_err), RAY_ERR_TYPE);
+    ray_error_free(dotted_err);
+
+    ray_t* dotted_bound = ray_env_get(dotted_id); /* borrowed */
+    TEST_ASSERT_EQ_PTR(dotted_bound, reserved_source);
+    TEST_ASSERT_EQ_I(ray_table_nrows(dotted_bound), 4);
+    TEST_ASSERT_EQ_I(ray_table_nrows(reserved_source), 4);
+    ASSERT_EQ("(count live.parted)", "4");
+    ASSERT_EQ("(count p)", "4");
+    ray_release(reserved_source);
+
+    /* A PARTED table always needs its explicit partition key. */
+    ASSERT_ER_CODE("(insert p (list 5 'alpha \"five\" 50))", "arity");
+    ASSERT_ER_CODE("(insert 'p (list 5 'alpha \"five\" 50))", "arity");
+
+    /* PARTED upsert has no defined cross-segment semantics. */
+    ASSERT_ER_CODE("(upsert p 1 (list 5 'alpha \"five\" 50))", "nyi");
+    ASSERT_ER_CODE("(upsert 'p 1 (list 5 'alpha \"five\" 50))", "nyi");
+
+    /* Keys are exact typed atoms and may only equal or extend the tail. */
+    ASSERT_ER_CODE("(insert p 2024.01.01 (list 5 'alpha \"five\" 50))",
+                   "domain");
+    ASSERT_ER_CODE("(insert 'p 8767 (list 5 'alpha \"five\" 50))", "type");
+    ASSERT_ER_CODE("(insert p [2024.01.02] (list 5 'alpha \"five\" 50))",
+                   "type");
+
+    /* Positional LIST rows contain every physical column exactly once; the
+     * virtual `date` MAPCOMMON column is never part of the payload. */
+    ASSERT_ER("(insert p 2024.01.02 (list 5 'alpha \"five\"))", "");
+    ASSERT_ER("(insert p 2024.01.02 "
+              "        (list 2024.01.02 5 'alpha \"five\" 50))", "");
+
+    /* DICT payloads require the exact unique physical-name set. */
+    ASSERT_ER("(insert p 2024.01.02 "
+              "        (dict ['id 'ticker 'note] "
+              "              (list 5 'alpha \"five\")))", "");
+    ASSERT_ER("(insert p 2024.01.02 "
+              "        {id: 5 ticker: 'alpha note: \"five\" qty: 50 "
+              "         date: 2024.01.02})", "");
+    ASSERT_ER("(insert p 2024.01.02 "
+              "        (dict ['id 'id 'ticker 'note 'qty] "
+              "              (list 5 6 'alpha \"five\" 50)))", "");
+
+    /* TABLE payloads obey the same exact-schema rule. */
+    ASSERT_ER("(insert p 2024.01.02 "
+              "        (table ['id 'ticker 'note] "
+              "               (list [5] ['alpha] [\"five\"])))", "");
+    ASSERT_ER("(insert p 2024.01.02 "
+              "        (table ['id 'ticker 'note 'qty 'date] "
+              "               (list [5] ['alpha] [\"five\"] [50] "
+              "                     [2024.01.02])))", "");
+    ASSERT_ER("(insert p 2024.01.02 "
+              "        (table ['id 'id 'ticker 'note 'qty] "
+              "               (list [5] [6] ['alpha] [\"five\"] [50])))", "");
+
+    /* Collections determine batch cardinality; atoms broadcast, but two
+     * different collection lengths and wrong physical types fail loudly. */
+    ASSERT_ER_CODE("(insert p 2024.01.02 "
+                   "        (list [5 6] ['alpha 'beta 'alpha] \"bulk\" [50 60]))",
+                   "length");
+    ASSERT_ER_CODE("(insert p 2024.01.02 (list 5 'alpha \"five\" 'bad))",
+                   "type");
+
+    /* The arity-3 partition-aware form is reserved for canonical PARTED
+     * tables; it must not become an accidental positional TABLE insert. */
+    ASSERT_ER_CODE("(do (set flat "
+                   "          (table ['id 'ticker 'note 'qty] "
+                   "                 (list [1] ['alpha] [\"one\"] [10]))) "
+                   "    (insert flat 2024.01.02 (list 2 'beta \"two\" 20)))",
+                   "type");
+
+    /* Every failure above is atomic: no rebind, segment growth, or new tail. */
+    ASSERT_EQ("(count p)", "4");
+    ASSERT_EQ("(at (select {from: p by: date c: (count id)}) 'c)", "[2 2]");
+
+    ray_t* p = ray_eval_str("p");
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(p));
+    TEST_ASSERT_EQ_I(ray_table_nrows(p), 4);
+    ray_t* mc = ray_table_get_col_idx(p, 0);
+    TEST_ASSERT_NOT_NULL(mc);
+    TEST_ASSERT_EQ_I(mc->type, RAY_MAPCOMMON);
+    ray_t** mc_parts = (ray_t**)ray_data(mc);
+    TEST_ASSERT_EQ_I(mc_parts[0]->len, 2);
+    TEST_ASSERT_EQ_I(mc_parts[1]->len, 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(mc_parts[1]))[0], 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(mc_parts[1]))[1], 2);
+    for (int64_t c = 1; c < ray_table_ncols(p); c++) {
+        ray_t* col = ray_table_get_col_idx(p, c);
+        TEST_ASSERT_TRUE(RAY_IS_PARTED(col->type));
+        TEST_ASSERT_EQ_I(col->len, 2);
+        ray_t** segs = (ray_t**)ray_data(col);
+        TEST_ASSERT_EQ_I(segs[0]->len, 2);
+        TEST_ASSERT_EQ_I(segs[1]->len, 2);
+        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
+        TEST_ASSERT_EQ_U(segs[1]->mmod, 1);
+    }
+
+    char day3[1200];
+    n = snprintf(day3, sizeof(day3), "%s/2024.01.03", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(day3), "format day3 path");
+    TEST_ASSERT(access(day3, F_OK) != 0, "failed insert touched disk");
+    ray_release(p);
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_errors(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_insert_errors_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_errors_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+/* ---- Test: SYM keys and lexical-vs-numeric I64 directory ordering ------ */
+
+static bool lang_parted_insert_onecol(const char* root, const char* part,
+                                      int64_t value) {
+    char dir[1200], src[256];
+    int nd = snprintf(dir, sizeof(dir), "%s/%s/trades", root, part);
+    int ns = snprintf(src, sizeof(src),
+                      "(table ['id] (list [%lld]))", (long long)value);
+    if (nd <= 0 || (size_t)nd >= sizeof(dir) ||
+        ns <= 0 || (size_t)ns >= sizeof(src))
+        return false;
+    return lang_parted_insert_save_table(src, dir, NULL);
+}
+
+static test_result_t test_eval_insert_parted_key_types_impl(const char* root) {
+    char iroot[900], sroot[900], src[1400], next_path[1200];
+    int ni = snprintf(iroot, sizeof(iroot), "%s/i64", root);
+    int ns = snprintf(sroot, sizeof(sroot), "%s/sym", root);
+    TEST_ASSERT(ni > 0 && (size_t)ni < sizeof(iroot), "format i64 root");
+    TEST_ASSERT(ns > 0 && (size_t)ns < sizeof(sroot), "format sym root");
+
+    /* collect_part_dirs is byte-lexical, so these become [10,2].  The
+     * insert validator must reject that malformed numeric MAPCOMMON order
+     * instead of treating 2 as a growable tail after 10. */
+    TEST_ASSERT(lang_parted_insert_onecol(iroot, "10", 10),
+                "save integer partition 10");
+    TEST_ASSERT(lang_parted_insert_onecol(iroot, "2", 2),
+                "save integer partition 2");
+    int n = snprintf(src, sizeof(src),
+                     "(set pi (.db.parted.get \"%s\" 'trades))", iroot);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format i64 parted get");
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+    ASSERT_ER_CODE("(insert pi 11 (list 11))", "corrupt");
+    ASSERT_EQ("(count pi)", "2");
+
+    /* Opaque directory names use a SYM MAPCOMMON key.  Equal-key growth and
+     * a lexically later key follow the same immutable-tail contract. */
+    TEST_ASSERT(lang_parted_insert_onecol(sroot, "1.2", 1),
+                "save symbol partition 1.2");
+    TEST_ASSERT(lang_parted_insert_onecol(sroot, "2.1", 2),
+                "save symbol partition 2.1");
+    n = snprintf(src, sizeof(src),
+                 "(set ps (.db.parted.get \"%s\" 'trades))", sroot);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format sym parted get");
+    setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    ray_t* ps0 = ray_eval_str("ps");
+    TEST_ASSERT_NOT_NULL(ps0);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ps0));
+    ray_t* smc = ray_table_get_col_idx(ps0, 0);
+    TEST_ASSERT_NOT_NULL(smc);
+    TEST_ASSERT_EQ_I(smc->type, RAY_MAPCOMMON);
+    TEST_ASSERT_EQ_U(smc->attrs, RAY_MC_SYM);
+    ray_t* skeys = ((ray_t**)ray_data(smc))[0];
+    TEST_ASSERT_EQ_PTR(ray_sym_vec_domain(skeys), ray_sym_runtime_domain());
+    ray_t* ids = ray_vec_new(RAY_I64, 2);
+    TEST_ASSERT_NOT_NULL(ids);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ids));
+    int64_t id = 3;
+    ids = ray_vec_append(ids, &id);
+    id = 4;
+    ids = ray_vec_append(ids, &id);
+    ray_t* rows = ray_list_new(1);
+    TEST_ASSERT_NOT_NULL(rows);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rows));
+    rows = ray_list_append(rows, ids);
+    ray_release(ids);
+    ray_t* key = ray_sym(ray_sym_intern("2.1", 3));
+    ray_t* args[3] = { ps0, key, rows };
+    ray_t* ps1 = ray_insert(args, 3);
+    ray_release(key);
+    ray_release(rows);
+    TEST_ASSERT_NOT_NULL(ps1);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ps1));
+    TEST_ASSERT_EQ_I(ray_table_nrows(ps0), 2);
+    TEST_ASSERT_EQ_I(ray_table_nrows(ps1), 4);
+
+    rows = ray_list_new(1);
+    TEST_ASSERT_NOT_NULL(rows);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(rows));
+    ray_t* id5 = ray_i64(5);
+    rows = ray_list_append(rows, id5);
+    ray_release(id5);
+    key = ray_sym(ray_sym_intern("3.1", 3));
+    ray_t* args2[3] = { ps1, key, rows };
+    ray_t* ps2 = ray_insert(args2, 3);
+    ray_release(key);
+    ray_release(rows);
+    TEST_ASSERT_NOT_NULL(ps2);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ps2));
+    TEST_ASSERT_EQ_I(ray_table_nrows(ps1), 4);
+    TEST_ASSERT_EQ_I(ray_table_nrows(ps2), 5);
+
+    ray_env_set(ray_sym_intern("ps", 2), ps2);
+    ray_release(ps2);
+    ray_release(ps1);
+    ray_release(ps0);
+
+    ASSERT_EQ("(count ps)", "5");
+    ASSERT_EQ("(at (select {from: ps by: part c: (count id)}) 'c)",
+              "[1 3 1]");
+
+    n = snprintf(next_path, sizeof(next_path), "%s/3.1", sroot);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(next_path), "format next path");
+    TEST_ASSERT(access(next_path, F_OK) != 0,
+                "symbol-key live partition touched disk");
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_key_types(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_insert_keys_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted key fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_key_types_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
+/* ---- Test: PARTED insert preserves every remaining physical type ------- */
+
+static test_result_t test_eval_insert_parted_physical_types_impl(
+    const char* root) {
+    TEST_ASSERT(lang_parted_wide_fixture(root), "create wide parted fixture");
+    TEST_ASSERT(lang_parted_wide_bind_payloads(), "bind typed payload vectors");
+
+    char src[1400];
+    int n = snprintf(src, sizeof(src),
+                     "(set wide (.db.parted.get \"%s\" 'wide))", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format wide parted get");
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    ray_t* source = ray_eval_str("wide");
+    TEST_ASSERT_NOT_NULL(source);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(source));
+    TEST_ASSERT_EQ_I(ray_table_nrows(source), 2);
+    TEST_ASSERT_EQ_I(ray_table_ncols(source), LANG_WIDE_NCOLS + 1);
+
+    ray_t* historical[LANG_WIDE_NCOLS];
+    for (int i = 0; i < LANG_WIDE_NCOLS; i++) {
+        ray_t* wrapper = lang_parted_insert_col(source,
+                                                lang_parted_wide_names[i]);
+        TEST_ASSERT_NOT_NULL(wrapper);
+        TEST_ASSERT_TRUE(RAY_IS_PARTED(wrapper->type));
+        TEST_ASSERT_EQ_I(RAY_PARTED_BASETYPE(wrapper->type),
+                         lang_parted_wide_types[i]);
+        TEST_ASSERT_EQ_I(wrapper->len, 2);
+        ray_t** segs = (ray_t**)ray_data(wrapper);
+        historical[i] = segs[0];
+        TEST_ASSERT_EQ_I(segs[0]->len, 1);
+        TEST_ASSERT_EQ_I(segs[1]->len, 1);
+        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
+        TEST_ASSERT_EQ_U(segs[1]->mmod, 1);
+    }
+
+    /* A fully validated exact-schema zero-vector batch is pointer-identical
+     * and must not create the requested later partition. */
+    ray_t* zero = ray_eval_str(
+        "(insert wide 2024.01.03 "
+        "        (list wide_zb wide_zu8 wide_zi16 wide_zi32 wide_zf32 "
+        "              wide_zf64 wide_zd wide_ztm wide_zts wide_zg))");
+    TEST_ASSERT_NOT_NULL(zero);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(zero));
+    TEST_ASSERT_EQ_PTR(zero, source);
+    TEST_ASSERT_EQ_I(ray_table_nrows(zero), 2);
+    ray_t* zero_mc = ray_table_get_col_idx(zero, 0);
+    TEST_ASSERT_NOT_NULL(zero_mc);
+    TEST_ASSERT_EQ_I(((ray_t**)ray_data(zero_mc))[0]->len, 2);
+    ray_release(zero);
+
+    /* Exact typed vectors append two rows to the mmap-backed active day. */
+    ASSERT_EQ(
+        "(insert 'wide 2024.01.02 "
+        "        (list wide_bv wide_u8v wide_i16v wide_i32v wide_f32v "
+        "              wide_f64v wide_dv wide_tmv wide_tsv wide_gv))",
+        "'wide");
+
+    ray_t* live = ray_eval_str("wide");
+    TEST_ASSERT_NOT_NULL(live);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(live));
+    TEST_ASSERT_EQ_I(ray_table_nrows(live), 4);
+    TEST_ASSERT_EQ_I(ray_table_nrows(source), 2);
+    ray_t* counts = lang_parted_insert_counts(live);
+    TEST_ASSERT_NOT_NULL(counts);
+    TEST_ASSERT_EQ_I(counts->len, 2);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[0], 1);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(counts))[1], 3);
+
+    ray_t* tails[LANG_WIDE_NCOLS];
+    for (int i = 0; i < LANG_WIDE_NCOLS; i++) {
+        ray_t* wrapper = lang_parted_insert_col(live,
+                                                lang_parted_wide_names[i]);
+        TEST_ASSERT_NOT_NULL(wrapper);
+        TEST_ASSERT_TRUE(RAY_IS_PARTED(wrapper->type));
+        TEST_ASSERT_EQ_I(RAY_PARTED_BASETYPE(wrapper->type),
+                         lang_parted_wide_types[i]);
+        ray_t** segs = (ray_t**)ray_data(wrapper);
+        TEST_ASSERT_EQ_PTR(segs[0], historical[i]);
+        TEST_ASSERT_EQ_U(segs[0]->mmod, 1);
+        TEST_ASSERT_EQ_I(segs[0]->len, 1);
+        TEST_ASSERT_EQ_I(segs[1]->type, lang_parted_wide_types[i]);
+        TEST_ASSERT_EQ_I(segs[1]->len, 3);
+        TEST_ASSERT_EQ_U(segs[1]->mmod, 0);
+        tails[i] = segs[1];
+    }
+
+    TEST_ASSERT_EQ_I(((uint8_t*)ray_data(tails[LANG_WIDE_BOOL]))[1], 1);
+    TEST_ASSERT_EQ_I(((uint8_t*)ray_data(tails[LANG_WIDE_BOOL]))[2], 0);
+    TEST_ASSERT_EQ_I(((uint8_t*)ray_data(tails[LANG_WIDE_U8]))[1], 7);
+    TEST_ASSERT_EQ_I(((uint8_t*)ray_data(tails[LANG_WIDE_U8]))[2], 8);
+    TEST_ASSERT_EQ_I(((int16_t*)ray_data(tails[LANG_WIDE_I16]))[1], -123);
+    TEST_ASSERT_EQ_I(((int16_t*)ray_data(tails[LANG_WIDE_I16]))[2], 456);
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(tails[LANG_WIDE_I32]))[1], 123456);
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(tails[LANG_WIDE_I32]))[2], -654321);
+    TEST_ASSERT_EQ_F(((float*)ray_data(tails[LANG_WIDE_F32]))[1], 1.5f,
+                     0.00001);
+    TEST_ASSERT_TRUE(ray_vec_is_null(tails[LANG_WIDE_F32], 2));
+    TEST_ASSERT((tails[LANG_WIDE_F32]->attrs & RAY_ATTR_HAS_NULLS) != 0,
+                "F32 null metadata preserved");
+    TEST_ASSERT_EQ_F(((double*)ray_data(tails[LANG_WIDE_F64]))[1], 2.5,
+                     0.0000001);
+    TEST_ASSERT_EQ_F(((double*)ray_data(tails[LANG_WIDE_F64]))[2], -3.5,
+                     0.0000001);
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(tails[LANG_WIDE_DATE]))[1], 9132);
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(tails[LANG_WIDE_DATE]))[2], 9133);
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(tails[LANG_WIDE_TIME]))[1], 3723004);
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(tails[LANG_WIDE_TIME]))[2], 18367008);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(tails[LANG_WIDE_TIMESTAMP]))[1],
+                     1111111111LL);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(tails[LANG_WIDE_TIMESTAMP]))[2],
+                     2222222222LL);
+    uint8_t expected_guid[16];
+    for (int i = 0; i < 16; i++) expected_guid[i] = (uint8_t)(0xA0 + i);
+    TEST_ASSERT_MEM_EQ(16,
+                       (uint8_t*)ray_data(tails[LANG_WIDE_GUID]) + 16,
+                       expected_guid);
+    TEST_ASSERT_TRUE(ray_vec_is_null(tails[LANG_WIDE_GUID], 2));
+    TEST_ASSERT((tails[LANG_WIDE_GUID]->attrs & RAY_ATTR_HAS_NULLS) != 0,
+                "GUID null metadata preserved");
+
+    /* BOOL and U8 have no null representation.  Failed symbol-target
+     * inserts must leave the exact live table binding untouched. */
+    int64_t wide_id = ray_sym_intern("wide", 4);
+    ray_t* bound_before = ray_env_get(wide_id); /* borrowed */
+    TEST_ASSERT_EQ_PTR(bound_before, live);
+    ASSERT_ER_CODE(
+        "(insert 'wide 2024.01.02 "
+        "        (list 0N wide_u8v wide_i16v wide_i32v wide_f32v "
+        "              wide_f64v wide_dv wide_tmv wide_tsv wide_gv))",
+        "type");
+    TEST_ASSERT_EQ_PTR(ray_env_get(wide_id), bound_before);
+    TEST_ASSERT_EQ_I(ray_table_nrows(ray_env_get(wide_id)), 4);
+    ASSERT_ER_CODE(
+        "(insert 'wide 2024.01.02 "
+        "        (list wide_bv 0N wide_i16v wide_i32v wide_f32v "
+        "              wide_f64v wide_dv wide_tmv wide_tsv wide_gv))",
+        "type");
+    TEST_ASSERT_EQ_PTR(ray_env_get(wide_id), bound_before);
+    TEST_ASSERT_EQ_I(ray_table_nrows(ray_env_get(wide_id)), 4);
+
+    /* Manually model a legal ragged canonical active day.  A nullable I16
+     * gap is null-prefixed on same-key insertion. */
+    ray_t* gap = ray_read_parted(root, "wide");
+    TEST_ASSERT_NOT_NULL(gap);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(gap));
+    int64_t gap_id = ray_sym_intern("wide_gap", 8);
+    TEST_ASSERT_EQ_I(ray_env_bind_flat(gap_id, gap), RAY_OK);
+    ray_t* gap_i16 = lang_parted_insert_col(gap, "i16");
+    ray_t** gap_i16_segs = (ray_t**)ray_data(gap_i16);
+    ray_t* removed_i16 = gap_i16_segs[1]; /* same-key data can repair the gap */
+    gap_i16_segs[1] = NULL;
+    ray_t* gap_out = ray_eval_str(
+        "(insert wide_gap 2024.01.02 "
+        "        (list wide_bv wide_u8v wide_i16v wide_i32v wide_f32v "
+        "              wide_f64v wide_dv wide_tmv wide_tsv wide_gv))");
+    gap_i16_segs[1] = removed_i16; /* transfer ref back before asserting */
+    TEST_ASSERT_NOT_NULL(gap_out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(gap_out));
+    TEST_ASSERT_EQ_I(ray_table_nrows(gap_out), 4);
+    ray_t* out_i16 = lang_parted_insert_col(gap_out, "i16");
+    ray_t* out_i16_tail = ((ray_t**)ray_data(out_i16))[1];
+    TEST_ASSERT_EQ_I(out_i16_tail->type, RAY_I16);
+    TEST_ASSERT_EQ_I(out_i16_tail->len, 3);
+    TEST_ASSERT_TRUE(ray_vec_is_null(out_i16_tail, 0));
+    TEST_ASSERT_EQ_I(((int16_t*)ray_data(out_i16_tail))[1], -123);
+    TEST_ASSERT_EQ_I(((int16_t*)ray_data(out_i16_tail))[2], 456);
+    ray_release(gap_out);
+
+    /* Missing active BOOL/U8 segments cannot be null-backfilled. */
+    const char* missing_names[] = { "b", "u8" };
+    for (size_t i = 0; i < 2; i++) {
+        ray_t* wrapper = lang_parted_insert_col(gap, missing_names[i]);
+        ray_t** segs = (ray_t**)ray_data(wrapper);
+        ray_t* removed = segs[1];
+        segs[1] = NULL;
+        ray_t* err = ray_eval_str(
+            "(insert wide_gap 2024.01.02 "
+            "        (list wide_bv wide_u8v wide_i16v wide_i32v wide_f32v "
+            "              wide_f64v wide_dv wide_tmv wide_tsv wide_gv))");
+        segs[1] = removed;
+        TEST_ASSERT_NOT_NULL(err);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(err));
+        TEST_ASSERT_EQ_I(ray_err_from_obj(err), RAY_ERR_TYPE);
+        ray_error_free(err);
+        TEST_ASSERT_EQ_PTR(ray_env_get(gap_id), gap);
+        TEST_ASSERT_EQ_I(ray_table_nrows(gap), 2);
+    }
+
+    /* Any missing active physical segment blocks advancing to a later key. */
+    removed_i16 = gap_i16_segs[1];
+    gap_i16_segs[1] = NULL;
+    ray_t* advance_err = ray_eval_str(
+        "(insert wide_gap 2024.01.03 "
+        "        (list wide_bv wide_u8v wide_i16v wide_i32v wide_f32v "
+        "              wide_f64v wide_dv wide_tmv wide_tsv wide_gv))");
+    /* A validated empty batch is normally a no-op, but cannot claim success
+     * while leaving an active gap unmaterialized. */
+    ray_t* empty_gap_err = ray_eval_str(
+        "(insert wide_gap 2024.01.02 "
+        "        (list wide_zb wide_zu8 wide_zi16 wide_zi32 wide_zf32 "
+        "              wide_zf64 wide_zd wide_ztm wide_zts wide_zg))");
+    gap_i16_segs[1] = removed_i16;
+    TEST_ASSERT_NOT_NULL(advance_err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(advance_err));
+    TEST_ASSERT_EQ_I(ray_err_from_obj(advance_err), RAY_ERR_DOMAIN);
+    ray_error_free(advance_err);
+    TEST_ASSERT_NOT_NULL(empty_gap_err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(empty_gap_err));
+    TEST_ASSERT_EQ_I(ray_err_from_obj(empty_gap_err), RAY_ERR_DOMAIN);
+    ray_error_free(empty_gap_err);
+    TEST_ASSERT_EQ_PTR(ray_env_get(gap_id), gap);
+    TEST_ASSERT_EQ_I(ray_table_nrows(gap), 2);
+    TEST_ASSERT_EQ_I(((ray_t**)ray_data(ray_table_get_col_idx(gap, 0)))[0]->len,
+                     2);
+
+    /* A historical gap can never be repaired by tail growth: accepting it
+     * would return a table that segmented execution still cannot query. */
+    ray_t* removed_history = gap_i16_segs[0];
+    gap_i16_segs[0] = NULL;
+    ray_t* history_err = ray_eval_str(
+        "(insert wide_gap 2024.01.02 "
+        "        (list wide_bv wide_u8v wide_i16v wide_i32v wide_f32v "
+        "              wide_f64v wide_dv wide_tmv wide_tsv wide_gv))");
+    gap_i16_segs[0] = removed_history;
+    TEST_ASSERT_NOT_NULL(history_err);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(history_err));
+    TEST_ASSERT_EQ_I(ray_err_from_obj(history_err), RAY_ERR_CORRUPT);
+    ray_error_free(history_err);
+    TEST_ASSERT_EQ_PTR(ray_env_get(gap_id), gap);
+    TEST_ASSERT_EQ_I(ray_table_nrows(gap), 2);
+
+    ray_release(gap);
+    ray_release(live);
+    ray_release(source);
+    PASS();
+}
+
+static test_result_t test_eval_insert_parted_physical_types(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_insert_types_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_insert_parted_physical_types_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
 }
 
 /* ---- Test: upsert (update existing row) ---- */
@@ -7101,6 +8549,11 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_typed_null", test_eval_insert_typed_null, lang_setup, lang_teardown },
     { "lang/eval/insert_guid", test_eval_insert_guid, lang_setup, lang_teardown },
     { "lang/eval/insert_positional_errors", test_eval_insert_positional_errors, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_e2e", test_eval_insert_parted_e2e, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },
+    { "lang/eval/insert_parted_physical_types", test_eval_insert_parted_physical_types, lang_setup, lang_teardown },
     { "lang/eval/upsert", test_eval_upsert, lang_setup, lang_teardown },
     { "lang/eval/upsert_f64_key", test_eval_upsert_f64_key, lang_setup, lang_teardown },
     { "lang/eval/upsert_str_key", test_eval_upsert_str_key, lang_setup, lang_teardown },

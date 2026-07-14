@@ -238,7 +238,7 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 |---|---|---|
 | `select` | variadic, special | Query table with optional filter, projection, grouping, and aggregation |
 | `update` | variadic, special | Add or modify columns in a table |
-| `insert` | variadic, special | Append a row to a table, append to a vector/list, or insert at position(s) |
+| `insert` | variadic, special | Append to a flat table/collection, or grow the live tail of a parted table |
 | `upsert` | variadic, special | Insert or update rows (by key) |
 
 ```lisp
@@ -258,11 +258,19 @@ These are **special forms** that bridge to the Rayforce DAG executor.
           notional: (* price size)})
 ```
 
-`insert` overloads on arity. With two arguments it appends; with three arguments it inserts at a position (or positions) given by the second argument. The first argument is a quoted symbol for in-place mutation, e.g. `'v`, or any expression that evaluates to a table/vector/list.
+`insert` has two table forms:
+
+- `(insert target rows)` is the ordinary two-argument form. It returns a new flat table, or rebinds and returns a quoted target symbol such as `'trades`. The row payload can be a list, table, or dictionary, as described by the target's physical columns.
+- `(insert parted partition-key rows)` grows the in-memory live tail of a parted table and returns a fresh logical view, leaving `parted` unchanged. Quote a symbol — `(insert 'parted partition-key rows)` — to rebind that symbol to the fresh view and return the symbol. A validated zero-row batch is a no-op and returns the existing view without rebinding. This is distinct from the three-argument positional form for vectors and lists, where the second argument is an insertion index.
 
 ```lisp
 ; Append a row to a table
 (insert 'trades (list 'AAPL 150.0 100 12))
+
+; Append two rows to the live 2024.01.16 partition of a parted table.
+; `date` is virtual, so the payload contains only physical data columns.
+(insert 'trades 2024.01.16
+  (list ['AAPL 'MSFT] [151.0 410.0] [200 75] [13 14]))
 
 ; Vector / list operations
 (set v (til 5))               ; [0 1 2 3 4]
@@ -274,6 +282,17 @@ These are **special forms** that bridge to the Rayforce DAG executor.
 ```
 
 Indices are *pre-insertion* positions in `[0, count]`; `idx == count` is equivalent to append. Vector positional inserts of a same-typed vector splice that vector in. List positional inserts always add the value as a single slot — use `concat` to splice. Multi-insert is stable on duplicate indices, preserving input order. Typed-null atoms (`0Nl`, `0Nf`, …) carry their null flag through — the inserted slot is marked null, not zero.
+
+For a parted target, `rows` must match the physical data-column schema exactly in name and concrete vector type. Do **not** include the virtual `date` or `part` column. A list maps values in physical column order; a table or dictionary may reorder columns, but must contain every physical name exactly once. Atoms append one row. Equal-length vectors append a batch, and atom values alongside them broadcast across that batch. Generic `null` is accepted for sentinel-nullable columns; `SYM` and `STR` map it to their empty value because those types have no distinct null, while `BOOL` and `U8` reject it because they are non-nullable.
+
+The partition key must equal the current last key, which grows that live segment, or be strictly later, which starts a new live segment. Earlier keys — including an existing historical partition — are immutable and cannot be inserted into. Existing partition metadata must already be strictly increasing in logical key order; use zero-padded integer directory names when lexical directory order would otherwise disagree with numeric order. Every historical physical segment must be present. A missing segment in the last partition can be repaired only by a non-empty same-key append; it blocks an empty insert or a move to a later key. `BOOL`/`U8` cannot be null-backfilled when that missing segment already represents existing rows, but a missing zero-row segment needs no backfill.
+
+A non-empty functional insert returns a new logical table view; the quoted-symbol form publishes that view by rebinding the symbol. Historical mmap segments are retained without copying, while a segment receiving rows becomes heap-backed. Queries and values that already retained the previous table continue to see that snapshot; subsequent resolution of a rebound target symbol sees the newly appended rows. A non-empty same-key append rebuilds partition metadata and copies the active segment; a later key materializes a new tail instead. Batch incoming rows to avoid repeatedly copying a growing intraday segment.
+
+!!! warning "Live-tail insert is not persistence"
+    Parted `insert` changes memory only. It does not modify partition directories, column files, `.d`, or `.sym`; process exit loses an unpersisted tail. Persist the completed physical partition explicitly at rollover, then reload the parted table if it should return to a fully mmap-backed view. See [`.db.parted.get`](../namespaces/db.md#db-parted-get) for the production pattern.
+
+`upsert` is not supported on parted tables. Materialize a flat table or use an application-level update strategy when key-based replacement is required.
 
 ## Joins
 

@@ -41,6 +41,7 @@
 #include "ops/temporal.h"
 #include "core/profile.h"
 #include "table/sym.h"
+#include "table/domain.h"
 #include "table/dict.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
@@ -11904,7 +11905,1004 @@ no_where_add_col:
     DICT_VIEW_CLOSE(upda); return result;
 }
 
-/* (insert table (list val1 val2 ...)) — append a row to a table */
+/* A `.db.parted.get` table is a deliberately narrow shape: one leading
+ * MAPCOMMON virtual column followed by one PARTED wrapper per physical
+ * column.  Keep detection separate from validation so arity-2 insert and
+ * upsert can reject parted values before any wrapper is mistaken for flat
+ * vector storage. */
+static bool table_has_parted_columns(ray_t* tbl) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return false;
+    int64_t ncols = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_t* col = ray_table_get_col_idx(tbl, c);
+        if (col && (col->type == RAY_MAPCOMMON || RAY_IS_PARTED(col->type)))
+            return true;
+    }
+    return false;
+}
+
+typedef struct {
+    ray_t* mapcommon;              /* borrowed */
+    ray_t* key_values;             /* borrowed */
+    ray_t* row_counts;             /* borrowed */
+    int64_t ncols;
+    int64_t ndata;
+    int64_t nparts;
+    int64_t total_rows;
+    bool active_missing;
+    int8_t key_type;
+    struct ray_sym_domain_s* sym_dom; /* borrowed, shared by every data SYM */
+    ray_t* sym_rep;                /* borrowed SYM segment for domain adoption */
+} parted_insert_view_t;
+
+static int byte_string_cmp(const char* a, size_t an,
+                           const char* b, size_t bn) {
+    size_t n = an < bn ? an : bn;
+    int cmp = n ? memcmp(a, b, n) : 0;
+    if (cmp < 0) return -1;
+    if (cmp > 0) return 1;
+    return (an > bn) - (an < bn);
+}
+
+/* Compare two MAPCOMMON cells under their logical key type. */
+static int parted_key_cells_cmp(ray_t* keys, int64_t a, int64_t b,
+                                bool* valid) {
+    *valid = true;
+    if (keys->type == RAY_DATE) {
+        int32_t av = ((int32_t*)ray_data(keys))[a];
+        int32_t bv = ((int32_t*)ray_data(keys))[b];
+        if (av == NULL_I32 || bv == NULL_I32) { *valid = false; return 0; }
+        return (av > bv) - (av < bv);
+    }
+    if (keys->type == RAY_I64) {
+        int64_t av = ((int64_t*)ray_data(keys))[a];
+        int64_t bv = ((int64_t*)ray_data(keys))[b];
+        if (av == NULL_I64 || bv == NULL_I64) { *valid = false; return 0; }
+        return (av > bv) - (av < bv);
+    }
+    if (keys->type == RAY_SYM) {
+        ray_t* av = ray_sym_vec_cell(keys, a);
+        ray_t* bv = ray_sym_vec_cell(keys, b);
+        if (!av || !bv || ray_str_len(av) == 0 || ray_str_len(bv) == 0) {
+            *valid = false;
+            return 0;
+        }
+        return byte_string_cmp(ray_str_ptr(av), ray_str_len(av),
+                               ray_str_ptr(bv), ray_str_len(bv));
+    }
+    *valid = false;
+    return 0;
+}
+
+/* Compare an explicit runtime-domain key atom with one MAPCOMMON cell. */
+static int parted_key_atom_cmp(ray_t* key, ray_t* keys, int64_t cell,
+                               bool* valid) {
+    *valid = true;
+    if (keys->type == RAY_DATE) {
+        int32_t cv = ((int32_t*)ray_data(keys))[cell];
+        if (cv == NULL_I32 || RAY_ATOM_IS_NULL(key)) { *valid = false; return 0; }
+        return (key->i32 > cv) - (key->i32 < cv);
+    }
+    if (keys->type == RAY_I64) {
+        int64_t cv = ((int64_t*)ray_data(keys))[cell];
+        if (cv == NULL_I64 || RAY_ATOM_IS_NULL(key)) { *valid = false; return 0; }
+        return (key->i64 > cv) - (key->i64 < cv);
+    }
+    if (keys->type == RAY_SYM) {
+        ray_t* ka = ray_sym_str(key->i64);
+        ray_t* cv = ray_sym_vec_cell(keys, cell);
+        if (!ka || !cv || ray_str_len(ka) == 0 || ray_str_len(cv) == 0) {
+            *valid = false;
+            return 0;
+        }
+        return byte_string_cmp(ray_str_ptr(ka), ray_str_len(ka),
+                               ray_str_ptr(cv), ray_str_len(cv));
+    }
+    *valid = false;
+    return 0;
+}
+
+static bool parted_segment_attrs_valid(int8_t base, uint8_t attrs) {
+    uint8_t allowed = RAY_ATTR_HAS_INDEX | RAY_ATTR_SORTED;
+    if (base == RAY_SYM) allowed |= RAY_SYM_W_MASK;
+    if (base == RAY_I32 || base == RAY_I64)
+        allowed |= RAY_ATTR_HAS_LINK;
+    if (base == RAY_I16 || base == RAY_I32 || base == RAY_I64 ||
+        base == RAY_F32 || base == RAY_F64 || base == RAY_DATE ||
+        base == RAY_TIME || base == RAY_TIMESTAMP || base == RAY_GUID)
+        allowed |= RAY_ATTR_HAS_NULLS;
+    return (attrs & (uint8_t)~allowed) == 0;
+}
+
+/* Validate the complete canonical representation before looking at payload
+ * values.  A NULL segment is tolerated only in the current active partition,
+ * where a same-key non-empty append can materialise it.  Missing historical
+ * segments are unqueryable by segmented execution and must never survive into
+ * a newly returned live-tail snapshot. */
+static ray_t* validate_parted_insert_target(ray_t* tbl,
+                                            parted_insert_view_t* out) {
+    memset(out, 0, sizeof(*out));
+    if (tbl->len != 2 || tbl->attrs != 0)
+        return ray_error("corrupt", "insert: parted target has non-canonical table metadata");
+    ray_t** table_slots = (ray_t**)ray_data(tbl);
+    ray_t* schema = table_slots[0];
+    ray_t* columns = table_slots[1];
+    if (!schema || RAY_IS_ERR(schema) || schema->type != RAY_I64 ||
+        schema->attrs != 0 || schema->len < 0 ||
+        !columns || RAY_IS_ERR(columns) || columns->type != RAY_LIST ||
+        columns->attrs != 0 || columns->len != schema->len)
+        return ray_error("corrupt", "insert: parted target has a malformed table container");
+    int64_t ncols = ray_table_ncols(tbl);
+    if (ncols < 2)
+        return ray_error("type", "insert: parted target must have a MAPCOMMON column and at least one physical column");
+
+    ray_t* mc = ray_table_get_col_idx(tbl, 0);
+    if (!mc || mc->type != RAY_MAPCOMMON || mc->len != 2 ||
+        mc->attrs > RAY_MC_I64)
+        return ray_error("type", "insert: three-argument table form requires a canonical .db.parted.get table");
+
+    ray_t** mp = (ray_t**)ray_data(mc);
+    ray_t* keys = mp[0];
+    ray_t* counts = mp[1];
+    int8_t key_type = mc->attrs == RAY_MC_DATE ? RAY_DATE
+                    : mc->attrs == RAY_MC_I64  ? RAY_I64
+                    :                            RAY_SYM;
+    uint8_t key_attrs = key_type == RAY_SYM ? RAY_SYM_W64 : 0;
+    if (!keys || RAY_IS_ERR(keys) || keys->type != key_type ||
+        keys->attrs != key_attrs ||
+        !counts || RAY_IS_ERR(counts) || counts->type != RAY_I64 ||
+        counts->attrs != 0 ||
+        keys->len <= 0 || counts->len != keys->len)
+        return ray_error("corrupt", "insert: malformed MAPCOMMON partition metadata");
+    if (key_type == RAY_SYM &&
+        ray_sym_vec_domain(keys) != ray_sym_runtime_domain())
+        return ray_error("corrupt", "insert: MAPCOMMON symbol keys must use the runtime domain");
+
+    /* Schema names must be unambiguous before exact named payload gathering. */
+    for (int64_t c = 0; c < ncols; c++) {
+        int64_t name = ray_table_col_name(tbl, c);
+        if (name < 0)
+            return ray_error("corrupt", "insert: parted target has an invalid column name at index %lld", (long long)c);
+        for (int64_t d = c + 1; d < ncols; d++)
+            if (ray_table_col_name(tbl, d) == name)
+                return ray_error("corrupt", "insert: parted target has duplicate column names");
+    }
+
+    int64_t nparts = keys->len;
+    int64_t* rc = (int64_t*)ray_data(counts);
+    int64_t total = 0;
+    for (int64_t p = 0; p < nparts; p++) {
+        if (rc[p] < 0 || rc[p] == NULL_I64 || total > INT64_MAX - rc[p])
+            return ray_error("corrupt", "insert: invalid MAPCOMMON row count at partition %lld", (long long)p);
+        total += rc[p];
+        if (p > 0) {
+            bool valid = false;
+            int cmp = parted_key_cells_cmp(keys, p - 1, p, &valid);
+            if (!valid || cmp >= 0)
+                return ray_error("corrupt", "insert: MAPCOMMON partition keys are not strictly increasing");
+        } else if (key_type == RAY_DATE) {
+            if (((int32_t*)ray_data(keys))[0] == NULL_I32)
+                return ray_error("corrupt", "insert: MAPCOMMON contains a null partition key");
+        } else if (key_type == RAY_I64) {
+            if (((int64_t*)ray_data(keys))[0] == NULL_I64)
+                return ray_error("corrupt", "insert: MAPCOMMON contains a null partition key");
+        } else {
+            ray_t* first = ray_sym_vec_cell(keys, 0);
+            if (!first || ray_str_len(first) == 0)
+                return ray_error("corrupt", "insert: MAPCOMMON contains an invalid partition key");
+        }
+    }
+
+    struct ray_sym_domain_s* common_dom = NULL;
+    ray_t* common_rep = NULL;
+    bool active_missing = false;
+    for (int64_t c = 1; c < ncols; c++) {
+        ray_t* wrapper = ray_table_get_col_idx(tbl, c);
+        if (!wrapper || !RAY_IS_PARTED(wrapper->type) ||
+            wrapper->len != nparts || wrapper->attrs != 0)
+            return ray_error("corrupt", "insert: physical column %lld is not a canonical PARTED wrapper", (long long)(c - 1));
+        int8_t base = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
+        if (base < RAY_BOOL || base > RAY_STR)
+            return ray_error("type", "insert: unsupported parted base type in physical column %lld", (long long)(c - 1));
+
+        ray_t** segs = (ray_t**)ray_data(wrapper);
+        /* ray_read_parted derives every wrapper from partition zero.  Requiring
+         * that representative distinguishes this canonical shape from a table
+         * assembled manually out of wrapper-like objects. */
+        if (!segs[0])
+            return ray_error("corrupt", "insert: physical column %lld has no first-partition segment", (long long)(c - 1));
+        for (int64_t p = 0; p < nparts; p++) {
+            ray_t* seg = segs[p];
+            if (!seg) {
+                if (p != nparts - 1)
+                    return ray_error("corrupt", "insert: physical column %lld is missing historical partition %lld",
+                                     (long long)(c - 1), (long long)p);
+                active_missing = true;
+                continue;
+            }
+            if (RAY_IS_ERR(seg) || seg->type != base ||
+                !parted_segment_attrs_valid(base, seg->attrs) ||
+                seg->len != rc[p])
+                return ray_error("corrupt", "insert: segment metadata/length/type mismatch in physical column %lld partition %lld",
+                                 (long long)(c - 1), (long long)p);
+            if (seg->attrs & RAY_ATTR_HAS_INDEX) {
+                ray_t* index = seg->index;
+                if (!index || (uintptr_t)index <= 31 ||
+                    RAY_IS_ERR(index) || index->type != RAY_INDEX)
+                    return ray_error("corrupt", "insert: physical column %lld partition %lld has malformed index metadata",
+                                     (long long)(c - 1), (long long)p);
+            }
+            if (base == RAY_SYM) {
+                struct ray_sym_domain_s* dom = ray_sym_vec_domain(seg);
+                if (dom == ray_sym_runtime_domain() || !ray_sym_domain_path(dom))
+                    return ray_error("corrupt", "insert: parted SYM segments must use a FILE domain");
+                if (!common_dom) { common_dom = dom; common_rep = seg; }
+                else if (common_dom != dom)
+                    return ray_error("corrupt", "insert: parted SYM segments do not share one FILE domain");
+            }
+        }
+    }
+
+    if (common_dom) {
+        ray_t* empty = ray_sym_domain_str(common_dom, 0);
+        if (ray_sym_domain_count(common_dom) <= 0 || !empty || ray_str_len(empty) != 0)
+            return ray_error("corrupt", "insert: parted FILE symbol domain lacks the reserved empty symbol");
+    }
+
+    out->mapcommon = mc;
+    out->key_values = keys;
+    out->row_counts = counts;
+    out->ncols = ncols;
+    out->ndata = ncols - 1;
+    out->nparts = nparts;
+    out->total_rows = total;
+    out->active_missing = active_missing;
+    out->key_type = key_type;
+    out->sym_dom = common_dom;
+    out->sym_rep = common_rep;
+    return NULL;
+}
+
+static ray_t* decide_parted_insert_partition(parted_insert_view_t* v,
+                                             ray_t* key,
+                                             bool* new_partition) {
+    if (!key || RAY_IS_ERR(key) || RAY_IS_NULL(key) ||
+        key->type != -v->key_type || RAY_ATOM_IS_NULL(key))
+        return ray_error("type", "insert: partition key must be a non-null %s atom, got %s",
+                         ray_type_name(-v->key_type),
+                         key ? ray_type_name(key->type) : "null");
+    bool valid = false;
+    int cmp = parted_key_atom_cmp(key, v->key_values, v->nparts - 1, &valid);
+    if (!valid)
+        return ray_error("domain", "insert: partition key is not representable in the target key domain");
+    if (cmp < 0)
+        return ray_error("domain", "insert: partition key is historical/out of order; only the last or a later partition may grow");
+    *new_partition = cmp > 0;
+    return NULL;
+}
+
+static ray_t* parted_values_append(ray_t* vals, ray_t* value, bool owned) {
+    if (!value || RAY_IS_ERR(value)) {
+        if (owned && value && !RAY_IS_ERR(value)) ray_release(value);
+        ray_release(vals);
+        return value && RAY_IS_ERR(value) ? value
+             : ray_error("type", "insert: physical payload contains a missing value");
+    }
+    ray_t* next = ray_list_append(vals, value);
+    if (owned) ray_release(value);
+    if (!next || RAY_IS_ERR(next)) {
+        ray_release(vals);
+        return next ? next : ray_error("oom", NULL);
+    }
+    return next;
+}
+
+/* Normalize LIST/TABLE/DICT payloads into physical target-column order.  The
+ * returned list owns one ref per value; all named forms are exact and unique. */
+static ray_t* normalize_parted_insert_rows(ray_t* tbl,
+                                           parted_insert_view_t* v,
+                                           ray_t* rows) {
+    if (!rows || RAY_IS_ERR(rows) ||
+        (rows->type != RAY_LIST && rows->type != RAY_TABLE &&
+         rows->type != RAY_DICT))
+        return ray_error("type", "insert: parted rows must be a list, table or dict, got %s",
+                         rows ? ray_type_name(rows->type) : "null");
+
+    ray_t* vals = ray_list_new(v->ndata);
+    if (!vals || RAY_IS_ERR(vals)) return vals ? vals : ray_error("oom", NULL);
+
+    if (rows->type == RAY_LIST) {
+        if (rows->len != v->ndata) {
+            ray_release(vals);
+            return ray_error("domain", "insert: parted row list has %lld values, expected %lld physical columns",
+                             (long long)rows->len, (long long)v->ndata);
+        }
+        ray_t** items = (ray_t**)ray_data(rows);
+        for (int64_t c = 0; c < v->ndata; c++) {
+            vals = parted_values_append(vals, items[c], false);
+            if (!vals || RAY_IS_ERR(vals)) return vals;
+        }
+        return vals;
+    }
+
+    if (rows->type == RAY_TABLE) {
+        int64_t src_n = ray_table_ncols(rows);
+        if (src_n != v->ndata) {
+            ray_release(vals);
+            return ray_error("domain", "insert: parted row table has %lld columns, expected exactly %lld physical columns",
+                             (long long)src_n, (long long)v->ndata);
+        }
+        for (int64_t sc = 0; sc < src_n; sc++) {
+            int64_t name = ray_table_col_name(rows, sc);
+            int64_t src_matches = 0, target_matches = 0;
+            for (int64_t i = 0; i < src_n; i++)
+                if (ray_table_col_name(rows, i) == name) src_matches++;
+            for (int64_t i = 1; i < v->ncols; i++)
+                if (ray_table_col_name(tbl, i) == name) target_matches++;
+            if (src_matches != 1 || target_matches != 1) {
+                ray_release(vals);
+                return ray_error("value", "insert: parted row table schema must exactly and uniquely match physical columns");
+            }
+        }
+        for (int64_t c = 1; c < v->ncols; c++) {
+            ray_t* col = ray_table_get_col(rows, ray_table_col_name(tbl, c));
+            vals = parted_values_append(vals, col, false);
+            if (!vals || RAY_IS_ERR(vals)) return vals;
+        }
+        return vals;
+    }
+
+    ray_t* keys = ray_dict_keys(rows);
+    ray_t* dvals = ray_dict_vals(rows);
+    if (!keys || keys->type != RAY_SYM || !dvals ||
+        (dvals->type != RAY_LIST && !ray_is_vec(dvals)) ||
+        keys->len != v->ndata || dvals->len != keys->len) {
+        ray_release(vals);
+        return ray_error("type", "insert: parted row dict must have one symbol key/value per physical column");
+    }
+    for (int64_t d = 0; d < keys->len; d++) {
+        int64_t name = sym_cell_runtime_id(keys, d);
+        int64_t dict_matches = 0, target_matches = 0;
+        for (int64_t i = 0; i < keys->len; i++)
+            if (sym_cell_runtime_id(keys, i) == name) dict_matches++;
+        for (int64_t i = 1; i < v->ncols; i++)
+            if (ray_table_col_name(tbl, i) == name) target_matches++;
+        if (name < 0 || dict_matches != 1 || target_matches != 1) {
+            ray_release(vals);
+            return ray_error("value", "insert: parted row dict schema must exactly and uniquely match physical columns");
+        }
+    }
+    for (int64_t c = 1; c < v->ncols; c++) {
+        int64_t want = ray_table_col_name(tbl, c);
+        int64_t found = -1;
+        for (int64_t d = 0; d < keys->len; d++)
+            if (sym_cell_runtime_id(keys, d) == want) { found = d; break; }
+        if (found < 0) {
+            ray_release(vals);
+            return ray_error("value", "insert: parted row dict is missing a physical column");
+        }
+        if (dvals->type == RAY_LIST) {
+            ray_t* item = ((ray_t**)ray_data(dvals))[found];
+            vals = parted_values_append(vals, item, false);
+        } else {
+            int owned = 0;
+            ray_t* item = collection_elem(dvals, found, &owned);
+            vals = parted_values_append(vals, item, owned != 0);
+        }
+        if (!vals || RAY_IS_ERR(vals)) return vals;
+    }
+    return vals;
+}
+
+static bool parted_value_is_scalar(ray_t* v) {
+    return v && !RAY_IS_ERR(v) && (RAY_IS_NULL(v) || v->type < 0);
+}
+
+static bool parted_source_vec_compatible(int8_t dst, int8_t src) {
+    return src == dst;
+}
+
+static ray_t* validate_parted_payload_atom(int8_t dst, ray_t* atom,
+                                           int64_t physical_col) {
+    if (!atom || RAY_IS_ERR(atom) ||
+        (!RAY_IS_NULL(atom) && atom->type >= 0))
+        return ray_error("type", "insert: physical column %lld payload cells must be atoms",
+                         (long long)physical_col);
+    if (RAY_IS_NULL(atom)) {
+        if (dst == RAY_BOOL || dst == RAY_U8)
+            return ray_error("type", "insert: physical column %lld (%s) has no null representation",
+                             (long long)physical_col, ray_type_name(dst));
+        return NULL;
+    }
+    if (atom->type != -dst)
+        return ray_error("type", "insert: value type must exactly match physical column %lld (%s), got %s",
+                         (long long)physical_col, ray_type_name(dst),
+                         ray_type_name(atom->type));
+    if (dst == RAY_GUID &&
+        (!atom->obj || RAY_IS_ERR(atom->obj) ||
+         atom->obj->type != RAY_U8 || atom->obj->len != 16))
+        return ray_error("corrupt", "insert: GUID payload atom must own exactly 16 U8 bytes");
+    if (RAY_ATOM_IS_NULL(atom)) {
+        if (dst == RAY_BOOL || dst == RAY_U8)
+            return ray_error("type", "insert: physical column %lld (%s) has no null representation",
+                             (long long)physical_col, ray_type_name(dst));
+        return NULL;
+    }
+    if (dst == RAY_SYM && !ray_sym_str(atom->i64))
+        return ray_error("domain", "insert: SYM payload atom has an invalid runtime id");
+    if ((dst == RAY_F32 && !isfinite((float)atom->f64)) ||
+        (dst == RAY_F64 && !isfinite(atom->f64)))
+        return ray_error("domain", "insert: non-finite float payload must use the typed-null representation");
+    if (dst >= RAY_BOOL && dst <= RAY_STR) return NULL;
+    return ray_error("type", "insert: unsupported physical column %lld (%s), got %s",
+                     (long long)physical_col, ray_type_name(dst),
+                     ray_type_name(atom->type));
+}
+
+/* Scalar physical columns broadcast. Every collection column establishes the
+ * same batch length, including zero. */
+static ray_t* validate_parted_payloads(ray_t* tbl,
+                                       parted_insert_view_t* v,
+                                       ray_t* vals,
+                                       int64_t* out_batch) {
+    ray_t** pv = (ray_t**)ray_data(vals);
+    bool have_collection = false;
+    int64_t batch = 1;
+    for (int64_t c = 0; c < v->ndata; c++) {
+        ray_t* payload = pv[c];
+        if (parted_value_is_scalar(payload)) continue;
+        if (!payload || RAY_IS_ERR(payload) || !ray_is_vec(payload))
+            return ray_error("type", "insert: physical column %lld payload must be an atom or an exactly typed vector",
+                             (long long)c);
+        if (payload->len < 0)
+            return ray_error("corrupt", "insert: physical column %lld payload has a negative vector length",
+                             (long long)c);
+        if (!have_collection) { batch = payload->len; have_collection = true; }
+        else if (payload->len != batch)
+            return ray_error("length", "insert: all non-scalar physical payload columns must have the same length");
+    }
+
+    for (int64_t c = 0; c < v->ndata; c++) {
+        ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
+        int8_t dst = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
+        ray_t* payload = pv[c];
+        if (!parted_value_is_scalar(payload) &&
+            !parted_source_vec_compatible(dst, payload->type))
+            return ray_error("type", "insert: physical column %lld vector type must exactly match %s",
+                             (long long)c, ray_type_name(dst));
+
+        /* Exact vector types need no per-cell boxing.  SYM still needs a
+         * direct domain-resolvability scan (ray_sym_vec_cell deliberately
+         * avoids building the FILE->runtime LUT), while floats reject
+         * infinities but retain NaN as their typed-null representation. */
+        if (!parted_value_is_scalar(payload)) {
+            ray_t* owner = (payload->attrs & RAY_ATTR_SLICE)
+                         ? payload->slice_parent : payload;
+            if ((dst == RAY_BOOL || dst == RAY_U8) &&
+                (!owner || (owner->attrs & RAY_ATTR_HAS_NULLS)))
+                return ray_error("type", "insert: physical column %lld (%s) has no null representation",
+                                 (long long)c, ray_type_name(dst));
+            if (dst == RAY_SYM) {
+                for (int64_t r = 0; r < payload->len; r++)
+                    if (!ray_sym_vec_cell(payload, r))
+                        return ray_error("domain", "insert: physical column %lld SYM vector contains an invalid domain position",
+                                         (long long)c);
+            } else if (dst == RAY_F32) {
+                const float* d = (const float*)ray_data(payload);
+                for (int64_t r = 0; r < payload->len; r++)
+                    if (!isfinite(d[r]) && !isnan(d[r]))
+                        return ray_error("domain", "insert: physical column %lld F32 vector contains infinity",
+                                         (long long)c);
+            } else if (dst == RAY_F64) {
+                const double* d = (const double*)ray_data(payload);
+                for (int64_t r = 0; r < payload->len; r++)
+                    if (!isfinite(d[r]) && !isnan(d[r]))
+                        return ray_error("domain", "insert: physical column %lld F64 vector contains infinity",
+                                         (long long)c);
+            }
+            continue;
+        }
+
+        ray_t* err = validate_parted_payload_atom(dst, payload, c);
+        if (err) return err;
+    }
+    *out_batch = batch;
+    return NULL;
+}
+
+/* Append a prevalidated non-SYM atom, preserving every concrete splayable
+ * physical type (notably F32, which legacy flat insert does not handle). */
+static ray_t* append_parted_atom(ray_t* vec, int8_t dst, ray_t* atom) {
+    if (RAY_IS_NULL(atom) || RAY_ATOM_IS_NULL(atom)) {
+        if (dst == RAY_STR)
+            return ray_str_vec_append(vec, "", 0);
+        uint8_t zero[16] = {0};
+        ray_t* next = ray_vec_append(vec, zero);
+        if (!next || RAY_IS_ERR(next)) return next;
+        if (dst != RAY_BOOL && dst != RAY_U8 && dst != RAY_SYM)
+            ray_vec_set_null(next, next->len - 1, true);
+        return next;
+    }
+
+    switch (dst) {
+    case RAY_BOOL: { uint8_t x = atom->b8; return ray_vec_append(vec, &x); }
+    case RAY_U8:   { uint8_t x = atom->u8; return ray_vec_append(vec, &x); }
+    case RAY_I16:  { int16_t x = atom->i16; return ray_vec_append(vec, &x); }
+    case RAY_I32:  { int32_t x = atom->i32; return ray_vec_append(vec, &x); }
+    case RAY_I64:  { int64_t x = atom->i64; return ray_vec_append(vec, &x); }
+    case RAY_F32:  { float x = (float)atom->f64; return ray_vec_append(vec, &x); }
+    case RAY_F64:  { double x = atom->f64; return ray_vec_append(vec, &x); }
+    case RAY_DATE: { int32_t x = atom->i32; return ray_vec_append(vec, &x); }
+    case RAY_TIME: { int32_t x = atom->i32; return ray_vec_append(vec, &x); }
+    case RAY_TIMESTAMP: { int64_t x = atom->i64; return ray_vec_append(vec, &x); }
+    case RAY_GUID: return ray_vec_append(vec, ray_data(atom->obj));
+    case RAY_STR: return ray_str_vec_append(vec, ray_str_ptr(atom), ray_str_len(atom));
+    default: return ray_error("type", "insert: unsupported parted append type %s", ray_type_name(dst));
+    }
+}
+
+/* Concat copies sentinel payloads faithfully, but deliberately trusts the
+ * source HAS_NULLS gate.  Finalize the private segment from its bytes so raw
+ * API vectors cannot publish an unmarked null.  GUID uses an all-zero
+ * sentinel and is outside par_finalize_nulls' numeric/temporal scope. */
+static void finalize_parted_segment_nulls(ray_t* vec) {
+    par_finalize_nulls(vec);
+    if (vec->type != RAY_GUID) return;
+    const uint8_t* d = (const uint8_t*)ray_data(vec);
+    for (int64_t r = 0; r < vec->len; r++) {
+        bool all_zero = true;
+        for (int b = 0; b < 16; b++) {
+            if (d[(size_t)r * 16u + (size_t)b] != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            vec->attrs |= RAY_ATTR_HAS_NULLS;
+            return;
+        }
+    }
+}
+
+static ray_t* build_parted_null_prefix(int8_t base, int64_t len) {
+    ray_t* prefix = ray_vec_new(base, len);
+    if (!prefix || RAY_IS_ERR(prefix))
+        return prefix ? prefix : ray_error("oom", NULL);
+    for (int64_t r = 0; r < len; r++) {
+        ray_t* next = append_parted_atom(prefix, base, RAY_NULL_OBJ);
+        if (!next || RAY_IS_ERR(next)) {
+            ray_release(prefix);
+            return next ? next : ray_error("oom", NULL);
+        }
+        prefix = next;
+    }
+    return prefix;
+}
+
+static ray_t* build_parted_nonsym_segment(int8_t base,
+                                          ray_t* old_seg,
+                                          int64_t old_len,
+                                          ray_t* metadata_seg,
+                                          ray_t* payload,
+                                          int64_t batch) {
+    if (!old_seg && old_len > 0 && (base == RAY_BOOL || base == RAY_U8))
+        return ray_error("type", "insert: cannot backfill a missing active %s segment because the type has no null representation",
+                         ray_type_name(base));
+
+    ray_t* owned_prefix = NULL;
+    ray_t* prefix = old_seg;
+    if (!prefix && old_len > 0) {
+        owned_prefix = build_parted_null_prefix(base, old_len);
+        if (!owned_prefix || RAY_IS_ERR(owned_prefix))
+            return owned_prefix ? owned_prefix : ray_error("oom", NULL);
+        prefix = owned_prefix;
+    }
+
+    ray_t* result = NULL;
+    if (parted_value_is_scalar(payload)) {
+        ray_t* tail = ray_vec_new(base, batch);
+        if (!tail || RAY_IS_ERR(tail))
+            result = tail ? tail : ray_error("oom", NULL);
+        for (int64_t r = 0; r < batch; r++) {
+            if (!tail || RAY_IS_ERR(tail)) break;
+            ray_t* next = append_parted_atom(tail, base, payload);
+            if (!next || RAY_IS_ERR(next)) {
+                ray_release(tail);
+                tail = NULL;
+                result = next ? next : ray_error("oom", NULL);
+                break;
+            }
+            tail = next;
+        }
+        if (tail && !RAY_IS_ERR(tail)) {
+            if (prefix) {
+                /* Never append directly to an mmap (or any source) segment. */
+                result = ray_vec_concat(prefix, tail);
+                ray_release(tail);
+            } else {
+                result = tail;
+            }
+        }
+    } else if (prefix) {
+        /* Exact typed vector: one concat directly into the completed active
+         * segment, with no per-cell boxing and no intermediate payload copy. */
+        result = ray_vec_concat(prefix, payload);
+    } else {
+        /* A brand-new partition still needs to materialise slices/mmaps and
+         * deep-copy STR storage rather than publish the caller's vector. */
+        ray_t* empty = ray_vec_new(base, 0);
+        if (!empty || RAY_IS_ERR(empty)) {
+            result = empty ? empty : ray_error("oom", NULL);
+        } else {
+            result = ray_vec_concat(empty, payload);
+            ray_release(empty);
+        }
+    }
+
+    if (owned_prefix) ray_release(owned_prefix);
+    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+    finalize_parted_segment_nulls(result);
+
+    /* Link identity is semantic column metadata. The changed heap segment has
+     * no index, but it keeps a representative I32/I64 link target. */
+    if ((base == RAY_I32 || base == RAY_I64) && metadata_seg &&
+        (metadata_seg->attrs & RAY_ATTR_HAS_LINK)) {
+        result->attrs |= RAY_ATTR_HAS_LINK;
+        result->link_target = metadata_seg->link_target;
+    }
+    return result;
+}
+
+/* Allocate and copy the old prefix of a W64 FILE-domain SYM segment. Appended
+ * positions are intentionally zero until the late domain-intern commit pass. */
+static ray_t* build_parted_sym_skeleton(parted_insert_view_t* v,
+                                        ray_t* old_seg,
+                                        int64_t old_len,
+                                        int64_t batch) {
+    if (!v->sym_dom || !v->sym_rep)
+        return ray_error("corrupt", "insert: no shared FILE domain representative for SYM column");
+    if (old_len > INT64_MAX - batch) return ray_error("oom", NULL);
+    int64_t total = old_len + batch;
+    ray_t* out = ray_sym_vec_new(RAY_SYM_W64, total);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    ray_sym_vec_adopt_domain(out, v->sym_rep);
+    if (total) memset(ray_data(out), 0, (size_t)total * sizeof(int64_t));
+    if (old_seg) {
+        int64_t domain_n = ray_sym_domain_count(v->sym_dom);
+        for (int64_t r = 0; r < old_len; r++) {
+            int64_t pos = ray_read_sym(ray_data(old_seg), r,
+                                       old_seg->type, old_seg->attrs);
+            if (pos < 0 || pos >= domain_n) {
+                ray_release(out);
+                return ray_error("corrupt", "insert: active SYM segment contains an out-of-domain position");
+            }
+            ((int64_t*)ray_data(out))[r] = pos;
+        }
+    }
+    out->len = total;
+    return out;
+}
+
+static ray_t* parted_wrapper_metadata(ray_t* wrapper, int64_t active) {
+    ray_t** segs = (ray_t**)ray_data(wrapper);
+    if (active < wrapper->len && segs[active]) return segs[active];
+    int64_t start = active < wrapper->len ? active - 1 : wrapper->len - 1;
+    for (int64_t p = start; p >= 0; p--)
+        if (segs[p]) return segs[p];
+    return NULL;
+}
+
+static ray_t* build_parted_mapcommon(parted_insert_view_t* v,
+                                     ray_t* key,
+                                     bool new_partition,
+                                     int64_t batch) {
+    if (new_partition && v->nparts == INT64_MAX)
+        return ray_error("oom", NULL);
+    int64_t new_n = v->nparts + (new_partition ? 1 : 0);
+    ray_t* keys = ray_vec_new(v->key_type, new_n);
+    ray_t* counts = ray_vec_new(RAY_I64, new_n);
+    if (!keys || RAY_IS_ERR(keys) || !counts || RAY_IS_ERR(counts)) {
+        ray_t* ret = keys && RAY_IS_ERR(keys) ? keys
+                   : counts && RAY_IS_ERR(counts) ? counts : NULL;
+        if (keys && keys != ret) {
+            if (RAY_IS_ERR(keys)) ray_error_free(keys);
+            else ray_release(keys);
+        }
+        if (counts && counts != ret) {
+            if (RAY_IS_ERR(counts)) ray_error_free(counts);
+            else ray_release(counts);
+        }
+        return ret ? ret : ray_error("oom", NULL);
+    }
+
+    for (int64_t p = 0; p < v->nparts; p++) {
+        ray_t* next;
+        if (v->key_type == RAY_DATE) {
+            int32_t x = ((int32_t*)ray_data(v->key_values))[p];
+            next = ray_vec_append(keys, &x);
+        } else {
+            int64_t x = v->key_type == RAY_SYM
+                      ? ray_read_sym(ray_data(v->key_values), p,
+                                     RAY_SYM, v->key_values->attrs)
+                      : ((int64_t*)ray_data(v->key_values))[p];
+            next = ray_vec_append(keys, &x);
+        }
+        if (!next || RAY_IS_ERR(next)) {
+            ray_release(keys); ray_release(counts);
+            return next ? next : ray_error("oom", NULL);
+        }
+        keys = next;
+
+        int64_t rc = ((int64_t*)ray_data(v->row_counts))[p];
+        if (!new_partition && p == v->nparts - 1) rc += batch;
+        next = ray_vec_append(counts, &rc);
+        if (!next || RAY_IS_ERR(next)) {
+            ray_release(keys); ray_release(counts);
+            return next ? next : ray_error("oom", NULL);
+        }
+        counts = next;
+    }
+    if (new_partition) {
+        ray_t* next;
+        if (v->key_type == RAY_DATE) {
+            int32_t x = key->i32;
+            next = ray_vec_append(keys, &x);
+        } else {
+            int64_t x = key->i64;
+            next = ray_vec_append(keys, &x);
+        }
+        if (!next || RAY_IS_ERR(next)) {
+            ray_release(keys); ray_release(counts);
+            return next ? next : ray_error("oom", NULL);
+        }
+        keys = next;
+        next = ray_vec_append(counts, &batch);
+        if (!next || RAY_IS_ERR(next)) {
+            ray_release(keys); ray_release(counts);
+            return next ? next : ray_error("oom", NULL);
+        }
+        counts = next;
+    }
+
+    ray_t* mc = ray_alloc(2 * sizeof(ray_t*));
+    if (!mc || RAY_IS_ERR(mc)) {
+        ray_release(keys); ray_release(counts);
+        return mc ? mc : ray_error("oom", NULL);
+    }
+    mc->type = RAY_MAPCOMMON;
+    mc->len = 2;
+    mc->attrs = v->mapcommon->attrs;
+    memset(mc->aux, 0, 16);
+    ((ray_t**)ray_data(mc))[0] = keys;   /* transfer ownership */
+    ((ray_t**)ray_data(mc))[1] = counts;
+    return mc;
+}
+
+/* Borrow the logical bytes of a prevalidated SYM payload cell without
+ * allocating a runtime atom for typed vectors. */
+static bool parted_sym_payload_bytes(ray_t* payload, int64_t row,
+                                     const char** out_s, size_t* out_n) {
+    ray_t* atom = NULL;
+    if (parted_value_is_scalar(payload)) {
+        atom = payload;
+    } else if (payload->type == RAY_LIST) {
+        atom = ((ray_t**)ray_data(payload))[row];
+    } else if (payload->type == RAY_SYM) {
+        ray_t* s = ray_sym_vec_cell(payload, row);
+        if (!s) return false;
+        *out_s = ray_str_ptr(s);
+        *out_n = ray_str_len(s);
+        return true;
+    } else {
+        return false;
+    }
+    if (RAY_IS_NULL(atom)) {
+        *out_s = ""; *out_n = 0; return true;
+    }
+    if (!atom || atom->type != -RAY_SYM) return false;
+    ray_t* s = ray_sym_str(atom->i64);
+    if (!s) return false;
+    *out_s = ray_str_ptr(s);
+    *out_n = ray_str_len(s);
+    return true;
+}
+
+/* Domain growth is append-only and currently has no rollback primitive. This
+ * pass therefore runs only after the complete private result (including every
+ * allocation and every non-SYM conversion) has been built. An OOM may leave
+ * unused vocabulary entries in memory, but no row/table/env/disk state is
+ * published. */
+static ray_t* intern_parted_payload_symbols(ray_t* tbl,
+                                            parted_insert_view_t* v,
+                                            ray_t* vals,
+                                            int64_t batch) {
+    ray_t** pv = (ray_t**)ray_data(vals);
+    for (int64_t c = 0; c < v->ndata; c++) {
+        ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
+        if (RAY_PARTED_BASETYPE(wrapper->type) != RAY_SYM) continue;
+        ray_t* payload = pv[c];
+        int64_t n = parted_value_is_scalar(payload) ? (batch ? 1 : 0) : batch;
+        for (int64_t r = 0; r < n; r++) {
+            const char* s = NULL; size_t slen = 0;
+            if (!parted_sym_payload_bytes(payload, r, &s, &slen))
+                return ray_error("corrupt", "insert: could not resolve a SYM payload cell");
+            if (ray_sym_domain_intern(v->sym_dom, s, slen) < 0)
+                return ray_error("oom", "insert: could not extend the parted FILE symbol domain");
+        }
+    }
+    return NULL;
+}
+
+static ray_t* fill_parted_payload_symbols(ray_t* tbl,
+                                          parted_insert_view_t* v,
+                                          ray_t* vals,
+                                          ray_t* staged,
+                                          int64_t old_len,
+                                          int64_t batch) {
+    ray_t** pv = (ray_t**)ray_data(vals);
+    ray_t** sv = (ray_t**)ray_data(staged);
+    for (int64_t c = 0; c < v->ndata; c++) {
+        ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
+        if (RAY_PARTED_BASETYPE(wrapper->type) != RAY_SYM) continue;
+        ray_t* payload = pv[c];
+        ray_t* seg = sv[c];
+        for (int64_t r = 0; r < batch; r++) {
+            const char* s = NULL; size_t slen = 0;
+            int64_t src_r = parted_value_is_scalar(payload) ? 0 : r;
+            if (!parted_sym_payload_bytes(payload, src_r, &s, &slen))
+                return ray_error("corrupt", "insert: could not resolve a staged SYM payload cell");
+            int64_t pos = ray_sym_domain_find(v->sym_dom, s, slen);
+            if (pos < 0)
+                return ray_error("corrupt", "insert: staged SYM is absent after domain intern");
+            ray_write_sym(ray_data(seg), old_len + r, (uint64_t)pos,
+                          RAY_SYM, seg->attrs);
+        }
+    }
+    return NULL;
+}
+
+static ray_t* insert_parted_rows(ray_t* tbl, ray_t* key, ray_t* rows) {
+    parted_insert_view_t v;
+    ray_t* err = validate_parted_insert_target(tbl, &v);
+    if (err) return err;
+
+    bool new_partition = false;
+    err = decide_parted_insert_partition(&v, key, &new_partition);
+    if (err) return err;
+    if (new_partition && v.active_missing)
+        return ray_error("domain", "insert: cannot advance the partition key while the current partition has missing physical segments");
+
+    ray_t* vals = normalize_parted_insert_rows(tbl, &v, rows);
+    if (!vals || RAY_IS_ERR(vals)) return vals ? vals : ray_error("oom", NULL);
+    int64_t batch = 0;
+    err = validate_parted_payloads(tbl, &v, vals, &batch);
+    if (err) { ray_release(vals); return err; }
+
+    /* Empty batch is a validated no-op and never creates an empty partition.
+     * It cannot repair a missing active segment, so reject that shape instead
+     * of returning the same unqueryable table. */
+    if (batch == 0) {
+        ray_release(vals);
+        if (v.active_missing)
+            return ray_error("domain", "insert: an empty batch cannot materialize missing active physical segments");
+        ray_retain(tbl);
+        return tbl;
+    }
+
+    if (v.total_rows > INT64_MAX - batch) {
+        ray_release(vals);
+        return ray_error("oom", NULL);
+    }
+
+    int64_t active = new_partition ? v.nparts : v.nparts - 1;
+    int64_t old_len = new_partition ? 0
+                    : ((int64_t*)ray_data(v.row_counts))[v.nparts - 1];
+    if (old_len > INT64_MAX - batch) {
+        ray_release(vals);
+        return ray_error("oom", NULL);
+    }
+    if (new_partition &&
+        (v.nparts == INT64_MAX ||
+         (uint64_t)v.nparts + 1u > SIZE_MAX / sizeof(ray_t*))) {
+        ray_release(vals);
+        return ray_error("oom", NULL);
+    }
+
+    ray_t* staged = ray_list_new(v.ndata);
+    if (!staged || RAY_IS_ERR(staged)) {
+        ray_release(vals);
+        return staged ? staged : ray_error("oom", NULL);
+    }
+    ray_t** pv = (ray_t**)ray_data(vals);
+    for (int64_t c = 0; c < v.ndata; c++) {
+        ray_t* wrapper = ray_table_get_col_idx(tbl, c + 1);
+        ray_t** segs = (ray_t**)ray_data(wrapper);
+        int8_t base = (int8_t)RAY_PARTED_BASETYPE(wrapper->type);
+        ray_t* old_seg = new_partition ? NULL : segs[v.nparts - 1];
+        ray_t* new_seg = base == RAY_SYM
+            ? build_parted_sym_skeleton(&v, old_seg, old_len, batch)
+            : build_parted_nonsym_segment(base, old_seg, old_len,
+                                           parted_wrapper_metadata(wrapper, active),
+                                           pv[c], batch);
+        if (!new_seg || RAY_IS_ERR(new_seg)) {
+            ray_release(staged); ray_release(vals);
+            return new_seg ? new_seg : ray_error("oom", NULL);
+        }
+        ray_t* next = ray_list_append(staged, new_seg);
+        ray_release(new_seg);
+        if (!next || RAY_IS_ERR(next)) {
+            ray_release(staged); ray_release(vals);
+            return next ? next : ray_error("oom", NULL);
+        }
+        staged = next;
+    }
+
+    ray_t* mc = build_parted_mapcommon(&v, key, new_partition, batch);
+    if (!mc || RAY_IS_ERR(mc)) {
+        ray_release(staged); ray_release(vals);
+        return mc ? mc : ray_error("oom", NULL);
+    }
+    ray_t* result = ray_table_new(v.ncols);
+    if (!result || RAY_IS_ERR(result)) {
+        ray_release(mc); ray_release(staged); ray_release(vals);
+        return result ? result : ray_error("oom", NULL);
+    }
+    result = ray_table_add_col(result, ray_table_col_name(tbl, 0), mc);
+    ray_release(mc);
+    if (!result || RAY_IS_ERR(result)) {
+        ray_release(staged); ray_release(vals);
+        return result ? result : ray_error("oom", NULL);
+    }
+
+    int64_t new_nparts = v.nparts + (new_partition ? 1 : 0);
+    if ((uint64_t)new_nparts > SIZE_MAX / sizeof(ray_t*)) {
+        ray_release(result); ray_release(staged); ray_release(vals);
+        return ray_error("oom", NULL);
+    }
+    ray_t** staged_segs = (ray_t**)ray_data(staged);
+    for (int64_t c = 0; c < v.ndata; c++) {
+        ray_t* old_wrapper = ray_table_get_col_idx(tbl, c + 1);
+        ray_t** old_segs = (ray_t**)ray_data(old_wrapper);
+        ray_t* wrapper = ray_alloc((size_t)new_nparts * sizeof(ray_t*));
+        if (!wrapper || RAY_IS_ERR(wrapper)) {
+            ray_release(result); ray_release(staged); ray_release(vals);
+            return wrapper ? wrapper : ray_error("oom", NULL);
+        }
+        wrapper->type = old_wrapper->type;
+        wrapper->len = new_nparts;
+        wrapper->attrs = 0;
+        memset(wrapper->aux, 0, 16);
+        ray_t** ws = (ray_t**)ray_data(wrapper);
+        memset(ws, 0, (size_t)new_nparts * sizeof(ray_t*));
+        for (int64_t p = 0; p < v.nparts; p++) {
+            if (!new_partition && p == v.nparts - 1) continue;
+            ws[p] = old_segs[p];
+            if (ws[p]) ray_retain(ws[p]);
+        }
+        ws[active] = staged_segs[c];
+        ray_retain(ws[active]);
+
+        result = ray_table_add_col(result, ray_table_col_name(tbl, c + 1), wrapper);
+        ray_release(wrapper);
+        if (!result || RAY_IS_ERR(result)) {
+            ray_release(staged); ray_release(vals);
+            return result ? result : ray_error("oom", NULL);
+        }
+    }
+
+    /* All allocations and all fallible non-SYM conversions are complete. */
+    err = intern_parted_payload_symbols(tbl, &v, vals, batch);
+    if (!err)
+        err = fill_parted_payload_symbols(tbl, &v, vals, staged,
+                                          old_len, batch);
+    ray_release(staged);
+    ray_release(vals);
+    if (err) { ray_release(result); return err; }
+    return result;
+}
+
+/* (insert table (list val1 val2 ...)) — append a row to a table
+ * (insert parted partition-key rows) — grow the explicit live tail */
 ray_t* ray_insert_fn(ray_t** args, int64_t n) {
     return ray_insert(args, n);
 }
@@ -12118,8 +13116,76 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         return result;
     }
 
-    /* Table target: arity-3 positional row insert is not implemented. */
-    if (n != 2) { ray_release(tbl); return ray_error("nyi", NULL); }
+    /* Table arity-3 is reserved for explicit live-tail growth on the exact
+     * representation returned by `.db.parted.get`. */
+    if (n == 3) {
+        if (!table_has_parted_columns(tbl)) {
+            ray_release(tbl);
+            return ray_error("type", "insert: three-argument table form requires a canonical .db.parted.get table");
+        }
+        if (inplace_sym >= 0 && ray_sym_is_reserved(inplace_sym) &&
+            !ray_sym_is_ipc_hook(inplace_sym)) {
+            ray_release(tbl);
+            return ray_error("reserved", "insert: cannot rebind a reserved target");
+        }
+        ray_t* partition_key = already_eval
+                             ? (ray_retain(args[1]), args[1])
+                             : ray_eval(args[1]);
+        if (!partition_key || RAY_IS_ERR(partition_key)) {
+            ray_release(tbl);
+            return partition_key ? partition_key
+                                 : ray_error("type", "insert: partition key evaluation failed");
+        }
+        ray_t* rows = already_eval
+                    ? (ray_retain(args[2]), args[2])
+                    : ray_eval(args[2]);
+        if (!rows || RAY_IS_ERR(rows)) {
+            ray_release(tbl); ray_release(partition_key);
+            return rows ? rows : ray_error("type", "insert: rows evaluation failed");
+        }
+        /* Preallocate the success value before domain growth/publication. */
+        ray_t* success = NULL;
+        if (inplace_sym >= 0) {
+            success = ray_sym(inplace_sym);
+            if (!success || RAY_IS_ERR(success)) {
+                ray_release(rows);
+                ray_release(partition_key);
+                ray_release(tbl);
+                return success ? success : ray_error("oom", NULL);
+            }
+        }
+        ray_t* result = insert_parted_rows(tbl, partition_key, rows);
+        ray_release(rows);
+        ray_release(partition_key);
+        if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
+            /* Empty batches return the original table and require no rebind.
+             * Otherwise publish only after the complete private result exists,
+             * and surface dotted-path OOM/type failures instead of
+             * falsely returning the target symbol as success. */
+            ray_err_t bind_err = result == tbl ? RAY_OK
+                               : ray_env_set(inplace_sym, result);
+            ray_release(result);
+            ray_release(tbl);
+            if (bind_err != RAY_OK) {
+                ray_release(success);
+                return ray_error(ray_err_code_str(bind_err),
+                                 "insert: could not rebind the parted target");
+            }
+            return success;
+        }
+        if (success) ray_release(success);
+        ray_release(tbl);
+        return result;
+    }
+    if (n != 2) {
+        ray_release(tbl);
+        return ray_error("arity", "insert: table insert takes 2 args, or 3 for a parted live tail, got %lld",
+                         (long long)n);
+    }
+    if (table_has_parted_columns(tbl)) {
+        ray_release(tbl);
+        return ray_error("arity", "insert: parted table insert requires target, partition key and physical rows");
+    }
 
     /* Evaluate the row argument (skip if already evaluated) */
     ray_t* row = already_eval ? (ray_retain(args[1]), args[1]) : ray_eval(args[1]);
@@ -12375,6 +13441,14 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "upsert: target symbol is unbound");
             ray_retain(tbl);
         }
+    }
+
+    /* PARTED wrappers are segmented pointer arrays, not flat row storage.
+     * Reject before evaluating key/row expressions so the legacy match scan
+     * can never interpret wrapper pointers as scalar cells. */
+    if (tbl->type == RAY_TABLE && table_has_parted_columns(tbl)) {
+        ray_release(tbl);
+        return ray_error("nyi", "upsert: parted tables are not supported; use insert with an explicit partition key");
     }
 
     ray_t* key_sym = already_eval ? (ray_retain(args[1]), args[1]) : ray_eval(args[1]);

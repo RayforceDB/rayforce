@@ -444,8 +444,8 @@ Special forms that bridge to the Rayforce DAG executor for high-performance colu
 | `select` | variadic | special | Query table with optional filter, projection, grouping, and aggregation | `(select {from: t a: a})` |
 | `window` | variadic | special | Partitioned window query. `frame:` is `'whole`, `'running`, or a positive trailing row count | `(window {from: t part: [sym] order: [time] frame: 5 funcs: {avg5: (avg price)}})` |
 | `update` | variadic | special, restricted | Add or modify columns in a table (mutates in-place) | `(update {from: t b: (* a 2)})` |
-| `insert` | variadic | special, restricted | Insert rows into a table | `(insert t {x: 10 y: 20})` |
-| `upsert` | variadic | special, restricted | Insert or update rows by key match (target, key, row) | `(upsert t 'x {x: 10 y: 20})` |
+| `insert` | variadic | special, restricted | Append rows, or grow a parted table's in-memory live tail with an explicit partition key | `(insert 't 2024.01.16 rows)` |
+| `upsert` | variadic | special, restricted | Insert or update flat-table rows by key match (target, key, row) | `(upsert t 'x {x: 10 y: 20})` |
 
 ```lisp
 ; Select with filter and projection
