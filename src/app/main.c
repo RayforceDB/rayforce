@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
     int interactive = 0;
     const char* file = NULL;
     uint16_t port = 0;
-    int n_cores = -1;      /* -1 = leave pool at lazy ncpu-1 default */
+    int n_cores = -1;      /* total execution cores; -1 = leave pool lazy */
     int timeit_init = 0;   /* -t N: enable profiler at startup */
     int qlog_init = 0;     /* -Q N: enable query-statistics logging at startup */
     const char* auth_pw = NULL;
@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
     /* Parse args. Supported flags:
      *   -f FILE          run script file
      *   -p PORT          IPC listen port
-     *   -c N             worker-pool size (0 = auto: ncpu - 1)
+     *   -c N             total execution cores, main included (0 = auto)
      *   -t N             enable timeit at startup (N != 0 turns on)
      *   -Q N             enable query-statistics logging (N != 0 turns on)
      *   -i               interactive
@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
                 " [-u PW | -U PW] [-l BASE | -L BASE] [-m SIZE] [file.rfl] [-- app args]\n"
                 "  -f, --file FILE     run script file (or pass as a positional arg)\n"
                 "  -p, --port PORT     listen for IPC clients on PORT\n"
-                "  -c, --cores N       worker-pool size (0 = auto: ncpu - 1, default)\n"
+                "  -c, --cores N       total execution cores, main included (0 = auto)\n"
                 "  -t, --timeit N      enable profiler at startup (N != 0)\n"
                 "  -i, --interactive   start the REPL even after running a file\n"
                 "  -u PW               set plain auth password\n"
@@ -191,9 +191,9 @@ int main(int argc, char** argv) {
      * (file load, REPL eval, builtins).  If -c wasn't given, leave the
      * pool to its lazy default on first use. */
     if (n_cores >= 0) {
-        ray_err_t err = ray_pool_init((uint32_t)n_cores);
+        ray_err_t err = ray_pool_init_total((uint32_t)n_cores);
         if (err != RAY_OK)
-            fprintf(stderr, "warning: ray_pool_init(%d) failed (%d)\n",
+            fprintf(stderr, "warning: ray_pool_init_total(%d) failed (%d)\n",
                     n_cores, (int)err);
     }
 

@@ -662,6 +662,36 @@ static test_result_t test_pool_total_workers(void) {
 }
 
 /* --------------------------------------------------------------------------
+ * Test: total-worker initialization used by the CLI.
+ *
+ * The pool API normally accepts a background-worker count and reserves worker
+ * 0 for the calling thread. The CLI's -c contract is different: it counts all
+ * participants. In particular, total=1 must create an exact zero-background
+ * pool rather than taking ray_pool_init(0)'s auto-size path.
+ * -------------------------------------------------------------------------- */
+
+static test_result_t test_pool_init_total(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(1), RAY_OK);
+    ray_pool_t* pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    TEST_ASSERT_EQ_U(pool->n_workers, 0u);
+    TEST_ASSERT_EQ_U(ray_pool_total_workers(pool), 1u);
+
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    pool = ray_pool_get();
+    TEST_ASSERT_NOT_NULL(pool);
+    TEST_ASSERT_EQ_U(pool->n_workers, 3u);
+    TEST_ASSERT_EQ_U(ray_pool_total_workers(pool), 4u);
+
+    /* Restore the lazy/default configuration for later tests. */
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init(0), RAY_OK);
+    PASS();
+}
+
+/* --------------------------------------------------------------------------
  * Test: ray_pool_free(NULL) is a no-op (covers the early-return guard).
  * -------------------------------------------------------------------------- */
 
@@ -1217,6 +1247,7 @@ const test_entry_t pool_entries[] = {
     { "pool/dispatch_cancelled",    test_dispatch_cancelled,    NULL, NULL },
     { "pool/zero_workers",          test_pool_zero_workers,     NULL, NULL },
     { "pool/total_workers",         test_pool_total_workers,    NULL, NULL },
+    { "pool/init_total",            test_pool_init_total,       NULL, NULL },
     { "pool/free_null",             test_pool_free_null,        NULL, NULL },
     { "pool/init_idempotent",       test_pool_init_idempotent,  NULL, NULL },
     { "pool/destroy_reinit",        test_pool_destroy_and_reinit, NULL, NULL },
@@ -1234,5 +1265,4 @@ const test_entry_t pool_entries[] = {
 #endif
     { NULL, NULL, NULL, NULL },
 };
-
 

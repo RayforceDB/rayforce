@@ -120,7 +120,8 @@ static void worker_loop(void* arg) {
  * ray_pool_create
  * -------------------------------------------------------------------------- */
 
-ray_err_t ray_pool_create(ray_pool_t* pool, uint32_t n_workers) {
+static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
+                                      bool auto_size) {
     /* conc-L7: memset zeroes all fields including the `cancelled` atomic,
      * which resets any cancellation state from a prior pool instance. */
     memset(pool, 0, sizeof(*pool));
@@ -133,14 +134,14 @@ ray_err_t ray_pool_create(ray_pool_t* pool, uint32_t n_workers) {
     atomic_init(&pool->pending, 0);
     atomic_init(&pool->cancelled, 0);
 
-    if (n_workers == 0) {
+    if (auto_size) {
         /* Auto-size to ncpu-1. The RAYFORCE_CORES env var overrides this
          * default worker count — the test harness sets it (see the Makefile
          * `test` target) so neither the in-process runtime nor the server
          * children it spawns via .sys.exec each create ncpu-1 threads on a
-         * many-core box. An explicit -c (which passes n_workers > 0 through
-         * ray_pool_init) bypasses this entirely, and a non-test run with the
-         * var unset keeps the historical ncpu-1 default. */
+         * many-core box. An explicit positive -c uses ray_pool_init_total()
+         * with exact sizing and bypasses this entirely; a non-test run with
+         * the var unset keeps the historical ncpu-1 default. */
         const char* env = getenv("RAYFORCE_CORES");
         if (env && *env) {
             long v = strtol(env, NULL, 10);
@@ -219,6 +220,10 @@ ray_err_t ray_pool_create(ray_pool_t* pool, uint32_t n_workers) {
     }
 
     return RAY_OK;
+}
+
+ray_err_t ray_pool_create(ray_pool_t* pool, uint32_t n_workers) {
+    return ray_pool_create_impl(pool, n_workers, n_workers == 0);
 }
 
 /* --------------------------------------------------------------------------
@@ -506,11 +511,11 @@ ray_pool_t* ray_pool_get(void) {
  * Public API wrappers (declared in rayforce.h)
  * -------------------------------------------------------------------------- */
 
-/* conc-L4: If ray_pool_init() is called when the pool is already initialized
- * (state==2), the n_workers parameter is silently ignored and the existing
- * pool configuration is preserved. This is by design — the pool is a
- * singleton and reconfiguration requires ray_pool_destroy() + ray_pool_init(). */
-ray_err_t ray_pool_init(uint32_t n_workers) {
+/* conc-L4: If an initializer is called when the pool is already initialized
+ * (state==2), its requested size is silently ignored and the existing pool
+ * configuration is preserved. This is by design — the pool is a singleton
+ * and reconfiguration requires ray_pool_destroy() followed by initialization. */
+static ray_err_t ray_pool_init_impl(uint32_t n_workers, bool auto_size) {
     uint32_t expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&g_pool_init_state, &expected, 1,
                                                  memory_order_acq_rel,
@@ -527,13 +532,23 @@ ray_err_t ray_pool_init(uint32_t n_workers) {
         }
         return RAY_OK;  /* already initialized or completed during our spin */
     }
-    ray_err_t err = ray_pool_create(&g_pool, n_workers);
+    ray_err_t err = ray_pool_create_impl(&g_pool, n_workers, auto_size);
     if (err == RAY_OK) {
         atomic_store_explicit(&g_pool_init_state, 2, memory_order_release);
     } else {
         atomic_store_explicit(&g_pool_init_state, 0, memory_order_release);
     }
     return err;
+}
+
+ray_err_t ray_pool_init(uint32_t n_workers) {
+    return ray_pool_init_impl(n_workers, n_workers == 0);
+}
+
+ray_err_t ray_pool_init_total(uint32_t total_workers) {
+    if (total_workers == 0)
+        return ray_pool_init_impl(0, true);
+    return ray_pool_init_impl(total_workers - 1, false);
 }
 
 void ray_pool_destroy(void) {

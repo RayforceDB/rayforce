@@ -2905,9 +2905,52 @@ static test_result_t test_repl_pty_ctrl_c_during_lazy_materialize(void) {
     PASS();
 }
 
+#if defined(__linux__)
+/* Run the real launcher in piped REPL mode and count its live task threads.
+ * /proc/self/task observes the exact process-wide total, so this catches both
+ * the ordinary off-by-one and the -c 1 collision with the pool's auto mode. */
+static int run_cli_task_count(unsigned cores, long* out_count) {
+    char command[256];
+    snprintf(command, sizeof(command),
+             "printf '(count (.fs.list \"/proc/self/task\"))\\n'"
+             " | ./rayforce -c %u -i", cores);
+
+    FILE* pipe = popen(command, "r");
+    if (!pipe) return -1;
+
+    char line[128];
+    bool have_line = fgets(line, sizeof(line), pipe) != NULL;
+    int status = pclose(pipe);
+    if (!have_line || status == -1 || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0)
+        return -2;
+
+    char* end = NULL;
+    long count = strtol(line, &end, 10);
+    if (end == line) return -3;
+    *out_count = count;
+    return 0;
+}
+
+static test_result_t test_repl_cli_cores_are_total(void) {
+    long count = 0;
+    int rc = run_cli_task_count(1, &count);
+    TEST_ASSERT_FMT(rc == 0, "-c 1 launcher probe failed: %d", rc);
+    TEST_ASSERT_FMT(count == 1, "-c 1 created %ld total threads", count);
+
+    rc = run_cli_task_count(3, &count);
+    TEST_ASSERT_FMT(rc == 0, "-c 3 launcher probe failed: %d", rc);
+    TEST_ASSERT_FMT(count == 3, "-c 3 created %ld total threads", count);
+    PASS();
+}
+#endif
+
 /* ─── Suite definition ───────────────────────────────────────────── */
 
 const test_entry_t repl_entries[] = {
+#if defined(__linux__)
+    { "repl/cli/cores_are_total",       test_repl_cli_cores_are_total,       NULL,       NULL          },
+#endif
     /* file-batch entrypoint — ray_repl_run_file */
     { "repl/run_file/happy",            test_repl_run_file_happy,            repl_setup, repl_teardown },
     { "repl/run_file/multi_form",       test_repl_run_file_multi_form,       repl_setup, repl_teardown },

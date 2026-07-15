@@ -107,6 +107,9 @@ ray_pool_t* ray_pool_get(void);
 
 /* Public pool init/destroy (moved from rayforce.h) */
 ray_err_t ray_pool_init(uint32_t n_workers);
+/* Initialize by total execution participants, including the main thread.
+ * Pass 0 to auto-detect. Used by the CLI, where -c is a total-core count. */
+ray_err_t ray_pool_init_total(uint32_t total_workers);
 void     ray_pool_destroy(void);
 
 #endif /* RAY_POOL_H */

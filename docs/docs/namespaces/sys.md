@@ -31,7 +31,7 @@ Signature: `(.sys.args)`. Returns the process's command-line arguments as a dict
 |---|---|---|---|
 | `file` | str | `-f` / positional | Script path; empty if none. |
 | `port` | i64 | `-p` | IPC listen port; `0` if unset. |
-| `cores` | i64 | `-c` | Worker-pool size; `0` = auto. |
+| `cores` | i64 | `-c` | Total execution cores, including the main thread; `0` = auto. |
 | `timeit` | bool | `-t` | Profiler enabled at startup. |
 | `querylog` | bool | `-Q` | Query-statistics logging enabled at startup. |
 | `interactive` | bool | `-i` | Force the REPL after a script. |
