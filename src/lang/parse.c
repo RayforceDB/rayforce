@@ -53,7 +53,13 @@
 #define PA_MINUS   14
 #define PA_SEMI    15   /* ; comment */
 
-static const char _PA[128] =
+#if defined(__has_attribute) && __has_attribute(nonstring)
+#define RAY_NONSTRING __attribute__((nonstring))
+#else
+#define RAY_NONSTRING
+#endif
+
+static const char _PA[128] RAY_NONSTRING =
 /*  NUL                              \t \n                         */
     "\x0d\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x0c\x00\x00\x0c\x00\x00"
 /*                                                                  */
