@@ -464,6 +464,13 @@ ray_hnsw_t* ray_hnsw_build(const float* vectors, int64_t n_nodes, int32_t dim,
                            ray_hnsw_metric_t metric,
                            int32_t M, int32_t ef_construction) {
     if (!vectors || n_nodes <= 0 || dim <= 0) return NULL;
+    /* Overflow guard: n_nodes * dim * sizeof(float) sizes the copied vector
+     * block and also indexes every distance computation (vectors + id*dim).
+     * If it wraps size_t the copy under-allocates and the memcpy below — and
+     * later reads during construction — run past the buffer.  Reject before
+     * any allocation.  Mirrors the per-layer neighbor guard in the loader.
+     * n_nodes and dim are > 0 here, so the divide is safe. */
+    if ((uint64_t)n_nodes > SIZE_MAX / sizeof(float) / (uint64_t)dim) return NULL;
     if (M <= 0) M = HNSW_DEFAULT_M;
     if (ef_construction <= 0) ef_construction = HNSW_DEFAULT_EF_C;
     if (metric < RAY_HNSW_COSINE || metric > RAY_HNSW_IP) metric = RAY_HNSW_COSINE;
