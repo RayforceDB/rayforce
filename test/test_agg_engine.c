@@ -589,7 +589,16 @@ static bool scalar_elem_equal(ray_t* a, int64_t ia, ray_t* b, int64_t ib) {
     if (a->type == RAY_F64) {
         double xa = ((double*)ray_data(a))[ia];
         double xb = ((double*)ray_data(b))[ib];
-        return fabs(xa - xb) < 1e-12 || (xa != xa && xb != xb);
+        /* Combined absolute+relative epsilon.  Two engines that compute the
+         * same aggregate but sum in a different order (e.g. the dense-array
+         * per-worker path vs the hash path) cannot be expected to agree to a
+         * fixed 1e-12 ABSOLUTE — cancellation-sensitive aggregates like
+         * PEARSON_CORR (nΣxy−ΣxΣy) amplify last-bit summation differences.
+         * 1e-9 relative still catches any real algorithmic divergence (those
+         * differ by orders of magnitude), while tolerating legitimate fp
+         * reassociation. */
+        double mag = fabs(xa) > fabs(xb) ? fabs(xa) : fabs(xb);
+        return fabs(xa - xb) <= 1e-9 * (1.0 + mag) || (xa != xa && xb != xb);
     }
     return col_read_i64(a, ia) == col_read_i64(b, ib);
 }
