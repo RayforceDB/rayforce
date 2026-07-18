@@ -969,6 +969,20 @@ static test_result_t test_hnsw_mmap_load(void) {
     PASS();
 }
 
+/* Regression: ray_hnsw_build must reject dimensions whose
+ * n_nodes * dim * sizeof(float) overflows size_t, before it copies the source
+ * vectors.  Values are chosen so the byte count wraps to 16: without the guard
+ * the copy under-allocates and memcpy over-reads the 1-element source (ASan
+ * traps it); with the guard the call returns NULL and the source is never
+ * touched.  (2^62 + 2) * 2 * sizeof(float) == 2^65 + 16 == 16 (mod 2^64). */
+static test_result_t test_hnsw_build_overflow_rejected(void) {
+    float dummy[1] = { 0.0f };
+    ray_hnsw_t* idx = ray_hnsw_build(dummy, ((int64_t)1 << 62) + 2, 2,
+                                     RAY_HNSW_L2, 4, 50);
+    TEST_ASSERT_NULL(idx);
+    PASS();
+}
+
 /* Trigger the maxheap_sift_down / results-replacement path in hnsw_search_layer.
  *
  * The replacement branch (lines 342-344) fires when:
@@ -1964,6 +1978,7 @@ const test_entry_t embedding_entries[] = {
     { "embedding/hnsw_dim_accessor", test_hnsw_dim_accessor, emb_setup, emb_teardown },
     { "embedding/hnsw_search_filter_null_accept", test_hnsw_search_filter_null_accept, emb_setup, emb_teardown },
     { "embedding/hnsw_mmap_load", test_hnsw_mmap_load, emb_setup, emb_teardown },
+    { "embedding/hnsw_build_overflow_rejected", test_hnsw_build_overflow_rejected, emb_setup, emb_teardown },
     { "embedding/hnsw_search_sift_down", test_hnsw_search_sift_down, emb_setup, emb_teardown },
 
     /* rerank coverage (S7) */
