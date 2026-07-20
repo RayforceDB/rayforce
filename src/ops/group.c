@@ -36,17 +36,6 @@
 #include <stdlib.h>
 #include <time.h>
 
-/* --- diagnostic: env-gated radix-phase timing (RAY_GRPPROF=1) --- */
-static inline uint64_t grpprof_ns(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-static inline int grpprof_on(void) {
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("RAY_GRPPROF"); v = (e && *e) ? 1 : 0; }
-    return v;
-}
-
 /* Group accumulators use F64 lanes for both floating storage widths.  Keep the
  * source read width explicit so F32 payload bits are never mistaken for an
  * integer or loaded through a double pointer. */
@@ -8615,15 +8604,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
 
-    /* v2 doesn't implement the top-count emit filter (old-engine feature);
-     * when one is active, stay on the legacy path that honors it. */
-    { static int _no_v2 = -1; if (_no_v2 < 0) _no_v2 = getenv("RAY_NO_V2") ? 1 : 0;
-      if (_no_v2) goto skip_v2; }
     if (ray_agg_engine_v2 && group_limit == 0
         && !ray_group_emit_filter_get().enabled
         && agg_v2_can_handle(g, op, tbl))
         return exec_group_v2(g, op, tbl);
-    skip_v2:;
 
     /* v2 with EXPRESSION agg inputs: v2 admission requires plain-column
      * scans, so a group like {sum(a*b), stddev(c), cor(x,y)} — where ONE
@@ -11166,10 +11150,7 @@ v2_done:;
             if (!p1ctx.key_pool) { result = ray_error("oom", NULL); goto cleanup; }
             derive_key_pool(&ght_layout, key_vecs, p1ctx.key_pool);
         }
-        uint64_t _gp_t0 = grpprof_on() ? grpprof_ns() : 0;
         ray_pool_dispatch(pool, radix_phase1_fn, &p1ctx, n_scan);
-        if (grpprof_on()) fprintf(stderr, "GRPPROF p1(hist,row) n_scan=%lld n_parts=%u : %.2f ms\n",
-                                  (long long)n_scan, radix_n_parts, (grpprof_ns()-_gp_t0)/1e6);
         scratch_free(p1_kp_hdr);
         CHECK_CANCEL_GOTO(pool, cleanup);
 
@@ -11217,10 +11198,7 @@ v2_done:;
             if (!p2ctx.key_pool) { result = ray_error("oom", NULL); goto cleanup; }
             derive_key_pool(&ght_layout, key_vecs, p2ctx.key_pool);
         }
-        uint64_t _gp_t1 = grpprof_on() ? grpprof_ns() : 0;
         ray_pool_dispatch_n(pool, radix_phase2_fn, &p2ctx, radix_n_parts);
-        if (grpprof_on()) fprintf(stderr, "GRPPROF p2(htbuild,part) n_parts=%u : %.2f ms\n",
-                                  radix_n_parts, (grpprof_ns()-_gp_t1)/1e6);
         scratch_free(p2_kp_hdr);
         CHECK_CANCEL_GOTO(pool, cleanup);
 
@@ -11615,11 +11593,8 @@ v2_emit:;
                 .n_aggs       = n_aggs,
                 .key_src_data = key_data,
             };
-            uint64_t _gp_t2 = grpprof_on() ? grpprof_ns() : 0;
             ray_pool_dispatch_n(pool, radix_phase3_fn, &p3ctx,
                                 radix_n_parts);
-            if (grpprof_on()) fprintf(stderr, "GRPPROF p3(emit,part) n_parts=%u : %.2f ms\n",
-                                      radix_n_parts, (grpprof_ns()-_gp_t2)/1e6);
         }
 
         /* Post-radix holistic fill: OP_MEDIAN slots need a per-group
