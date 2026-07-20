@@ -6400,7 +6400,7 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
                             else
                                 merged->sum[idx].i = (int64_t)((uint64_t)merged->sum[idx].i * (uint64_t)wa->sum[idx].i);
                         }
-                    } else if (group_fp_type(agg_types[a]))
+                    } else if (group_fp_type(agg_types[a]) || agg_is_binary_agg(aop))
                         merged->sum[idx].f += wa->sum[idx].f;
                     else
                         merged->sum[idx].i += wa->sum[idx].i;
@@ -8610,10 +8610,13 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
     /* v2 doesn't implement the top-count emit filter (old-engine feature);
      * when one is active, stay on the legacy path that honors it. */
+    { static int _no_v2 = -1; if (_no_v2 < 0) _no_v2 = getenv("RAY_NO_V2") ? 1 : 0;
+      if (_no_v2) goto skip_v2; }
     if (ray_agg_engine_v2 && group_limit == 0
         && !ray_group_emit_filter_get().enabled
         && agg_v2_can_handle(g, op, tbl))
         return exec_group_v2(g, op, tbl);
+    skip_v2:;
 
     /* v2 with EXPRESSION agg inputs: v2 admission requires plain-column
      * scans, so a group like {sum(a*b), stddev(c), cor(x,y)} — where ONE
@@ -10021,8 +10024,8 @@ da_path:;
                             for (uint32_t a = 0; a < n_aggs; a++) {
                                 size_t idx = base + a;
                                 uint16_t aop = ext->agg_ops[a];
-                                if (aop == OP_SUM || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP) {
-                                    if (group_fp_type(agg_types[a])) merged->sum[idx].f += wa->sum[idx].f;
+                                if (aop == OP_SUM || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP || agg_is_binary_agg(aop)) {
+                                    if (group_fp_type(agg_types[a]) || agg_is_binary_agg(aop)) merged->sum[idx].f += wa->sum[idx].f;
                                     else merged->sum[idx].i += wa->sum[idx].i;
                                 } else if (aop == OP_PROD) {
                                     /* Use per-(group, agg) non-null counts when
@@ -10145,7 +10148,9 @@ da_path:;
                                         else
                                             merged->sum[idx].i = (int64_t)((uint64_t)merged->sum[idx].i * (uint64_t)wa->sum[idx].i);
                                     }
-                                } else if (group_fp_type(agg_types[a]))
+                                } else if (group_fp_type(agg_types[a]) || agg_is_binary_agg(aop))
+                                    /* binary aggs accumulate Σx as double even
+                                     * for integer x-columns — merge as float. */
                                     merged->sum[idx].f += wa->sum[idx].f;
                                 else
                                     merged->sum[idx].i += wa->sum[idx].i;
