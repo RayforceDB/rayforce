@@ -6375,6 +6375,13 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
                 for (uint32_t a = 0; a < n_aggs; a++)
                     merged->sumsq_f64[base + a] += wa->sumsq_f64[base + a];
             }
+            if (c->need_flags & DA_NEED_PAIR) {
+                for (uint32_t a = 0; a < n_aggs; a++) {
+                    merged->sum_y[base + a]   += wa->sum_y[base + a];
+                    merged->sumsq_y[base + a] += wa->sumsq_y[base + a];
+                    merged->sumxy[base + a]   += wa->sumxy[base + a];
+                }
+            }
             if (c->need_flags & DA_NEED_SUM) {
                 for (uint32_t a = 0; a < n_aggs; a++) {
                     size_t idx = base + a;
