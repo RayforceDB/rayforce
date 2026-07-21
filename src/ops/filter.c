@@ -215,16 +215,18 @@ static ray_t* exec_filter_seq(ray_t* input, ray_t* pred, int64_t ncols,
 typedef struct {
     const uint8_t* bits;
     int64_t  nrows;
+    int64_t  chunk_rows;
     int64_t* chunk_counts;   /* [n_chunks]: popcount, then prefix offset */
     int64_t* match_idx;      /* fill-phase output (NULL during count) */
 } fidx_ctx_t;
 
+/* Dispatched via ray_pool_dispatch_n — each task is ONE chunk ([i,i+1)). */
 static void fidx_count_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     fidx_ctx_t* c = (fidx_ctx_t*)ctxp;
     for (int64_t ch = start; ch < end; ch++) {
-        int64_t lo = ch * FIDX_CHUNK_ROWS;
-        int64_t hi = lo + FIDX_CHUNK_ROWS;
+        int64_t lo = ch * c->chunk_rows;
+        int64_t hi = lo + c->chunk_rows;
         if (hi > c->nrows) hi = c->nrows;
         int64_t n = 0;
         for (int64_t i = lo; i < hi; i++) n += c->bits[i] ? 1 : 0;
@@ -236,8 +238,8 @@ static void fidx_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     fidx_ctx_t* c = (fidx_ctx_t*)ctxp;
     for (int64_t ch = start; ch < end; ch++) {
-        int64_t lo = ch * FIDX_CHUNK_ROWS;
-        int64_t hi = lo + FIDX_CHUNK_ROWS;
+        int64_t lo = ch * c->chunk_rows;
+        int64_t hi = lo + c->chunk_rows;
         if (hi > c->nrows) hi = c->nrows;
         int64_t j = c->chunk_counts[ch];   /* prefix offset after phase 2 */
         for (int64_t i = lo; i < hi; i++)
@@ -258,7 +260,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
     bool fidx_par = fidx_pool && pred->type == RAY_BOOL && !ray_is_lazy(pred) &&
                     pred->len >= RAY_PARALLEL_THRESHOLD;
     ray_t* fidx_hdr = NULL;
-    fidx_ctx_t fidx = { .bits = NULL, .nrows = 0,
+    fidx_ctx_t fidx = { .bits = NULL, .nrows = 0, .chunk_rows = FIDX_CHUNK_ROWS,
                         .chunk_counts = NULL, .match_idx = NULL };
     int64_t fidx_n_chunks = 0;
 
@@ -267,11 +269,15 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
     if (fidx_par) {
         fidx.bits  = (const uint8_t*)ray_data(pred);
         fidx.nrows = pred->len;
-        fidx_n_chunks = (pred->len + FIDX_CHUNK_ROWS - 1) / FIDX_CHUNK_ROWS;
+        /* One task per chunk (dispatch_n); chunk grows past the task cap. */
+        while ((fidx.nrows + fidx.chunk_rows - 1) / fidx.chunk_rows > 60000)
+            fidx.chunk_rows *= 2;
+        fidx_n_chunks = (fidx.nrows + fidx.chunk_rows - 1) / fidx.chunk_rows;
         fidx.chunk_counts = (int64_t*)scratch_alloc(&fidx_hdr,
                                 (size_t)fidx_n_chunks * sizeof(int64_t));
         if (fidx.chunk_counts)
-            ray_pool_dispatch(fidx_pool, fidx_count_fn, &fidx, fidx_n_chunks);
+            ray_pool_dispatch_n(fidx_pool, fidx_count_fn, &fidx,
+                                (uint32_t)fidx_n_chunks);
         else
             fidx_par = false;
     }
@@ -328,7 +334,8 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
 
     if (fidx_par) {
         fidx.match_idx = match_idx;
-        ray_pool_dispatch(fidx_pool, fidx_fill_fn, &fidx, fidx_n_chunks);
+        ray_pool_dispatch_n(fidx_pool, fidx_fill_fn, &fidx,
+                            (uint32_t)fidx_n_chunks);
     } else {
         int64_t j = 0;
         ray_morsel_t mp;

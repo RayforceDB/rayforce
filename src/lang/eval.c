@@ -1432,6 +1432,32 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
  * Sorting builtins
  * ══════════════════════════════════════════ */
 
+/* Parallel fixed-width index gather for gather_by_idx: value memcpy loops
+ * split across the worker pool.  Null-bit propagation stays serial (bit
+ * writes within a shared word would race across range boundaries). */
+typedef struct {
+    const char*    src;
+    char*          dst;
+    const int64_t* idx;
+    uint8_t        esz;
+} gbi_ctx_t;
+
+static void gbi_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    gbi_ctx_t* c = (gbi_ctx_t*)ctxp;
+    const char* src = c->src;
+    char* dst = c->dst;
+    const int64_t* idx = c->idx;
+    switch (c->esz) {
+    case 8: for (int64_t i = start; i < end; i++) memcpy(dst + i*8, src + idx[i]*8, 8); break;
+    case 4: for (int64_t i = start; i < end; i++) memcpy(dst + i*4, src + idx[i]*4, 4); break;
+    case 2: for (int64_t i = start; i < end; i++) memcpy(dst + i*2, src + idx[i]*2, 2); break;
+    case 1: for (int64_t i = start; i < end; i++) dst[i] = src[idx[i]]; break;
+    case 16: for (int64_t i = start; i < end; i++) memcpy(dst + i*16, src + idx[i]*16, 16); break;
+    default: for (int64_t i = start; i < end; i++) memcpy(dst + i*c->esz, src + idx[i]*c->esz, c->esz); break;
+    }
+}
+
 /* Reorder vector elements by an index array */
 ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
     int8_t type = vec->type;
@@ -1465,15 +1491,14 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
         if (RAY_IS_ERR(result)) return result;
         result->len = n;
         uint8_t esz = (uint8_t)RAY_SYM_ELEM(w);
-        char* src = (char*)ray_data(vec);
-        char* dst = (char*)ray_data(result);
-        switch (esz) {
-        case 8: for (int64_t i = 0; i < n; i++) memcpy(dst + i*8, src + idx[i]*8, 8); break;
-        case 4: for (int64_t i = 0; i < n; i++) memcpy(dst + i*4, src + idx[i]*4, 4); break;
-        case 2: for (int64_t i = 0; i < n; i++) memcpy(dst + i*2, src + idx[i]*2, 2); break;
-        case 1: for (int64_t i = 0; i < n; i++) dst[i] = src[idx[i]]; break;
-        default: for (int64_t i = 0; i < n; i++) memcpy(dst + i*esz, src + idx[i]*esz, esz); break;
-        }
+        gbi_ctx_t gc = { .src = (const char*)ray_data(vec),
+                         .dst = (char*)ray_data(result),
+                         .idx = idx, .esz = esz };
+        ray_pool_t* gpool = ray_pool_get();
+        if (gpool && n >= RAY_PARALLEL_THRESHOLD)
+            ray_pool_dispatch(gpool, gbi_fill_fn, &gc, n);
+        else
+            gbi_fill_fn(&gc, 0, 0, n);
         if (has_nulls) {
             for (int64_t i = 0; i < n; i++)
                 if (ray_vec_is_null(vec, idx[i]))
@@ -1506,17 +1531,16 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
     if (RAY_IS_ERR(result)) return result;
     result->len = n;
     uint8_t esz = ray_type_sizes[type];
-    char* src = (char*)ray_data(vec);
-    char* dst = (char*)ray_data(result);
-    /* Typed gather — compiler constant esz enables vectorization, alias-safe */
-    switch (esz) {
-    case 8: for (int64_t i = 0; i < n; i++) memcpy(dst + i*8, src + idx[i]*8, 8); break;
-    case 4: for (int64_t i = 0; i < n; i++) memcpy(dst + i*4, src + idx[i]*4, 4); break;
-    case 2: for (int64_t i = 0; i < n; i++) memcpy(dst + i*2, src + idx[i]*2, 2); break;
-    case 1: for (int64_t i = 0; i < n; i++) dst[i] = src[idx[i]]; break;
-    default: for (int64_t i = 0; i < n; i++) memcpy(dst + i*esz, src + idx[i]*esz, esz); break;
-    case 16: for (int64_t i = 0; i < n; i++) memcpy(dst + i*16, src + idx[i]*16, 16); break;
-    }
+    /* Typed gather — compiler constant esz enables vectorization, alias-safe;
+     * pool-parallel over disjoint output ranges for large gathers. */
+    gbi_ctx_t gc = { .src = (const char*)ray_data(vec),
+                     .dst = (char*)ray_data(result),
+                     .idx = idx, .esz = esz };
+    ray_pool_t* gpool = ray_pool_get();
+    if (gpool && n >= RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(gpool, gbi_fill_fn, &gc, n);
+    else
+        gbi_fill_fn(&gc, 0, 0, n);
 
     /* Propagate null bitmap */
     if (has_nulls) {

@@ -2100,11 +2100,93 @@ ray_t* ray_nil_fn(ray_t* x) {
 }
 
 /* (where bool-vec) -> indices of true values */
+
+/* Parallel where: 3-phase chunk compaction (parallel per-chunk popcount →
+ * tiny serial prefix → parallel per-chunk emit at disjoint offsets). */
+#define WHERE_CHUNK_ROWS 65536
+
+typedef struct {
+    const uint8_t* data;
+    int64_t  n;
+    int64_t  chunk_rows;
+    int64_t* chunk_counts;   /* popcount, then exclusive-prefix offsets */
+    int64_t* out;            /* emit-phase output (NULL during count) */
+} where_ctx_t;
+
+/* Dispatched via ray_pool_dispatch_n — each task is ONE chunk ([i,i+1)). */
+static void where_count_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    where_ctx_t* c = (where_ctx_t*)ctxp;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t lo = ch * c->chunk_rows;
+        int64_t hi = lo + c->chunk_rows;
+        if (hi > c->n) hi = c->n;
+        int64_t cnt = 0;
+        for (int64_t i = lo; i < hi; i++) cnt += (c->data[i] != 0);
+        c->chunk_counts[ch] = cnt;
+    }
+}
+
+/* Word-at-a-time zero skip: sparse masks — the common WHERE shape —
+ * run at memory speed, falling to per-byte only inside a live word. */
+static void where_emit_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    where_ctx_t* c = (where_ctx_t*)ctxp;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t lo = ch * c->chunk_rows;
+        int64_t hi = lo + c->chunk_rows;
+        if (hi > c->n) hi = c->n;
+        int64_t j = c->chunk_counts[ch];
+        int64_t i = lo;
+        int64_t h8 = lo + ((hi - lo) & ~7LL);
+        for (; i < h8; i += 8) {
+            uint64_t w;
+            memcpy(&w, c->data + i, 8);
+            if (!w) continue;
+            for (int64_t k = 0; k < 8; k++)
+                if (c->data[i + k]) c->out[j++] = i + k;
+        }
+        for (; i < hi; i++)
+            if (c->data[i]) c->out[j++] = i;
+    }
+}
+
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
         return ray_error("type", "where: argument must be a b8 vector, got %s", ray_type_name(x->type));
     const uint8_t* data = (const uint8_t*)ray_data(x);
     int64_t n = x->len;
+
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && n >= RAY_PARALLEL_THRESHOLD) {
+        /* One task per chunk (ray_pool_dispatch_n); chunk grows for inputs
+         * that would exceed the pool's task cap. */
+        int64_t chunk_rows = WHERE_CHUNK_ROWS;
+        while ((n + chunk_rows - 1) / chunk_rows > 60000) chunk_rows *= 2;
+        int64_t n_chunks = (n + chunk_rows - 1) / chunk_rows;
+        ray_t* cc_hdr = ray_alloc((size_t)n_chunks * sizeof(int64_t));
+        int64_t* chunk_counts = cc_hdr ? (int64_t*)ray_data(cc_hdr) : NULL;
+        if (chunk_counts) {
+            where_ctx_t wc = { .data = data, .n = n, .chunk_rows = chunk_rows,
+                               .chunk_counts = chunk_counts, .out = NULL };
+            ray_pool_dispatch_n(pool, where_count_fn, &wc, (uint32_t)n_chunks);
+            int64_t cum = 0;
+            for (int64_t ch = 0; ch < n_chunks; ch++) {
+                int64_t v = chunk_counts[ch];
+                chunk_counts[ch] = cum;
+                cum += v;
+            }
+            ray_t* result = ray_vec_new(RAY_I64, cum);
+            if (RAY_IS_ERR(result)) { ray_release(cc_hdr); return result; }
+            wc.out = (int64_t*)ray_data(result);
+            ray_pool_dispatch_n(pool, where_emit_fn, &wc, (uint32_t)n_chunks);
+            result->len = cum;
+            ray_release(cc_hdr);
+            return result;
+        }
+        /* scratch OOM → sequential fallback below */
+    }
+
     /* Count pass: `cnt += byte != 0` vectorizes; the branchy form costs
      * a mispredict-prone compare per element. */
     int64_t cnt = 0;
