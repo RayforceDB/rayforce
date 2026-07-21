@@ -5685,7 +5685,7 @@ static inline void da_read_val(const void* ptr, int8_t type, uint8_t attrs,
                                int64_t r, double* out_f64, int64_t* out_i64) {
     if (group_fp_type(type)) {
         *out_f64 = group_fp_at(ptr, type, r);
-        *out_i64 = (int64_t)*out_f64;
+        *out_i64 = ray_cast_f64_to_i64_null(*out_f64);
     } else {
         *out_i64 = read_col_i64(ptr, r, type, attrs);
         *out_f64 = (double)*out_i64;
