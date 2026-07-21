@@ -34,12 +34,12 @@ static bool atom_to_numeric(ray_t* atom, double* out_f, int64_t* out_i, bool* ou
     switch (atom->type) {
         case -RAY_F64:
             *out_f = atom->f64;
-            *out_i = (int64_t)atom->f64;
+            *out_i = ray_cast_f64_to_i64_null(atom->f64);
             *out_is_f64 = true;
             return true;
         case -RAY_F32:
             *out_f = (double)(float)atom->f64;
-            *out_i = (int64_t)(float)atom->f64;
+            *out_i = ray_cast_f64_to_i64_null((double)(float)atom->f64);
             *out_is_f64 = true;
             return true;
         case -RAY_I64:
@@ -132,7 +132,7 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
         }
         r = ray_f64_fin(r);
         *out_f = r;
-        *out_i = (int64_t)r;
+        *out_i = ray_cast_f64_to_i64_null(r);
         *out_is_f64 = true;
         return true;
     }
@@ -168,7 +168,7 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
          * (div/mod by zero → NaN, overflow → ±Inf) canonicalizes to NULL_F64. */
         r = ray_f64_fin(r);
         *out_f = r;
-        *out_i = (int64_t)r;
+        *out_i = ray_cast_f64_to_i64_null(r);
         *out_is_f64 = true;
         return true;
     }
@@ -1358,15 +1358,10 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
              * non-null i64 — so a saturated cast stays a real value. */
             if (null_aware)
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] != a[j]) ? NULL_I64
-                         : (a[j] >= (double)INT64_MAX) ? INT64_MAX
-                         : (a[j] <= (double)INT64_MIN) ? (INT64_MIN + 1)
-                         : (int64_t)a[j];
+                    d[j] = ray_cast_f64_to_i64_null(a[j]);
             else
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] >= (double)INT64_MAX) ? INT64_MAX
-                         : (a[j] <= (double)INT64_MIN) ? (INT64_MIN + 1)
-                         : (int64_t)a[j];
+                    d[j] = ray_cast_f64_to_i64_null(a[j]);
         }
     } else if (dt == RAY_BOOL) {
         uint8_t* d = (uint8_t*)dp;
@@ -1431,9 +1426,9 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
             const double* a = (const double*)ap;
             if (null_aware)
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] != a[j]) ? NULL_I32 : (int32_t)a[j];
+                    d[j] = ray_cast_f64_to_i32_null(a[j]);
             else
-                for (int64_t j = 0; j < n; j++) d[j] = (int32_t)a[j];
+                for (int64_t j = 0; j < n; j++) d[j] = ray_cast_f64_to_i32_null(a[j]);
         } else {
             const int64_t* a = (const int64_t*)ap;
             if (null_aware)
@@ -1457,9 +1452,9 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
             const double* a = (const double*)ap;
             if (null_aware)
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] != a[j]) ? NULL_I16 : (int16_t)a[j];
+                    d[j] = ray_cast_f64_to_i16_null(a[j]);
             else
-                for (int64_t j = 0; j < n; j++) d[j] = (int16_t)a[j];
+                for (int64_t j = 0; j < n; j++) d[j] = ray_cast_f64_to_i16_null(a[j]);
         } else {
             const int64_t* a = (const int64_t*)ap;
             if (null_aware)
@@ -1472,7 +1467,7 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
         uint8_t* d = (uint8_t*)dp;
         if (t1 == RAY_F64) {
             const double* a = (const double*)ap;
-            for (int64_t j = 0; j < n; j++) d[j] = (uint8_t)a[j];
+            for (int64_t j = 0; j < n; j++) d[j] = ray_cast_f64_to_u8_null(a[j]);
         } else {
             const int64_t* a = (const int64_t*)ap;
             for (int64_t j = 0; j < n; j++) d[j] = (uint8_t)a[j];
@@ -2720,7 +2715,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     int64_t n = m.morsel_len;
                     double* src = (double*)m.morsel_ptr;
                     int32_t* dst = (int32_t*)((char*)ray_data(result) + out_off * sizeof(int32_t));
-                    for (int64_t i = 0; i < n; i++) dst[i] = (int32_t)src[i];
+                    for (int64_t i = 0; i < n; i++) dst[i] = ray_cast_f64_to_i32_null(src[i]);
                     out_off += n;
                 }
             } else if (out_type == RAY_I16) {
@@ -2728,7 +2723,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     int64_t n = m.morsel_len;
                     double* src = (double*)m.morsel_ptr;
                     int16_t* dst = (int16_t*)((char*)ray_data(result) + out_off * sizeof(int16_t));
-                    for (int64_t i = 0; i < n; i++) dst[i] = (int16_t)src[i];
+                    for (int64_t i = 0; i < n; i++) dst[i] = ray_cast_f64_to_i16_null(src[i]);
                     out_off += n;
                 }
             } else if (out_type == RAY_U8 || out_type == RAY_BOOL) {
@@ -2741,9 +2736,9 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                          * `NaN != 0.0` is true so add an explicit
                          * `src[i] == src[i]` to filter NaN to false. */
                         for (int64_t i = 0; i < n; i++)
-                            dst[i] = (src[i] != 0.0 && src[i] == src[i]) ? 1 : 0;
+                            dst[i] = ray_cast_f64_to_bool_null(src[i]);
                     else
-                        for (int64_t i = 0; i < n; i++) dst[i] = (uint8_t)src[i];
+                        for (int64_t i = 0; i < n; i++) dst[i] = ray_cast_f64_to_u8_null(src[i]);
                     out_off += n;
                 }
             }
