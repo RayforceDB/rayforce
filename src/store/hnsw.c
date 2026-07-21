@@ -895,6 +895,18 @@ ray_err_t ray_hnsw_save(const ray_hnsw_t* idx, const char* dir) {
     return RAY_OK;
 }
 
+/* Whether the vectors block — n_nodes * dim * sizeof(float) — fits in size_t.
+ * Split out of hnsw_load_impl so the overflow guard can be unit-tested
+ * directly.  n_nodes and dim come from an untrusted on-disk header; if the
+ * product wraps size_t the allocation under-sizes the buffer that the
+ * following fread then overruns (a heap-overflow write from a crafted file),
+ * so the loader must reject such a header before allocating.  Non-positive
+ * dims are rejected too.  Mirrors the per-layer neighbor guard. */
+bool ray_hnsw_vec_size_valid(int64_t n_nodes, int32_t dim) {
+    if (n_nodes <= 0 || dim <= 0) return false;
+    return (uint64_t)n_nodes <= SIZE_MAX / sizeof(float) / (uint64_t)dim;
+}
+
 static ray_hnsw_t* hnsw_load_impl(const char* dir, bool use_mmap) {
     if (!dir) return NULL;
     (void)use_mmap; /* mmap optimization deferred — both paths read into memory */
@@ -914,6 +926,10 @@ static ray_hnsw_t* hnsw_load_impl(const char* dir, bool use_mmap) {
         hdr.n_layers > HNSW_MAX_LAYERS ||
         hdr.M <= 0 || hdr.M_max0 <= 0 ||
         hdr.entry_point < 0 || hdr.entry_point >= hdr.n_nodes) return NULL;
+
+    /* Reject a header whose vectors block would overflow size_t, before any
+     * allocation (see ray_hnsw_vec_size_valid). */
+    if (!ray_hnsw_vec_size_valid(hdr.n_nodes, hdr.dim)) return NULL;
 
     ray_hnsw_t* idx = (ray_hnsw_t*)ray_sys_alloc(sizeof(ray_hnsw_t));
     if (!idx) return NULL;
