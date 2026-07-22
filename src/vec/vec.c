@@ -1152,9 +1152,10 @@ fail_range:
  *
  * Allocates the string pool once (not per-element like ray_str_vec_append).
  * Pass 1 sums pooled bytes; pass 2 fills descriptors and pool in one sweep.
- * ptrs[i] may be NULL when lens[i]==0.  nulls may be NULL (no nulls); when
- * non-NULL, nulls[i]!=0 marks element i null (STR null = empty string —
- * len==0, no RAY_ATTR_HAS_NULLS set).
+ * ptrs[i] may be NULL when lens[i]==0.  nulls may be NULL (no missing
+ * inputs); when non-NULL, nulls[i]!=0 requests a missing input.  STR cannot
+ * represent a distinct null, so that request collapses to an ordinary empty
+ * string (len==0) without RAY_ATTR_HAS_NULLS.
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens,
@@ -1197,7 +1198,7 @@ ray_t* ray_str_vec_from_parts(const char* const* ptrs, const uint32_t* lens,
         ray_str_t* d = &elems[i];
         memset(d, 0, sizeof(ray_str_t));
         if (nulls && nulls[i]) {
-            /* STR null = empty string: d is already zeroed (len=0) */
+            /* Missing STR input collapses to ordinary empty: already len=0. */
         } else if (lens[i] <= RAY_STR_INLINE_MAX) {
             d->len = lens[i];
             if (lens[i] > 0) memcpy(d->data, ptrs[i], lens[i]);

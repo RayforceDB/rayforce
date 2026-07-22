@@ -350,6 +350,47 @@ static test_result_t test_link_persistence_roundtrip(void) {
     PASS();
 }
 
+/* Regression: a link sidecar whose target sym name is longer than the old
+ * 256-byte read buffer must round-trip intact.  The buggy reader truncated to
+ * 255 bytes and interned a DIFFERENT symbol, silently linking the column to the
+ * wrong table.  Use a 300-byte name and assert the loaded link_target still
+ * resolves to the original symbol. */
+static test_result_t test_link_persistence_long_target_name(void) {
+    char longname[300];
+    memset(longname, 'a', sizeof(longname));            /* 300 bytes, > 255 */
+    int64_t long_sym = ray_sym_intern(longname, sizeof(longname));
+    TEST_ASSERT_TRUE(long_sym >= 0);
+
+    ray_t* target = build_target_table("custs");
+    ray_env_set(long_sym, target);
+    ray_release(target);
+
+    int64_t rids[] = { 0, 1, 2 };
+    ray_t* w = make_i64_vec(rids, 3);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(ray_link_attach(&w, long_sym)));
+    TEST_ASSERT_EQ_I(w->link_target, long_sym);
+
+    char path[] = "/tmp/link_long_name_test_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT_TRUE(fd >= 0);
+    close(fd);
+    TEST_ASSERT_EQ_I(ray_col_save(w, path), RAY_OK);
+
+    ray_t* loaded = ray_col_load(path);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
+    TEST_ASSERT_TRUE(loaded->attrs & RAY_ATTR_HAS_LINK);
+    /* Fails if the reader truncated the sidecar to 255 bytes (wrong symbol). */
+    TEST_ASSERT_EQ_I(loaded->link_target, long_sym);
+
+    char link_path[512];
+    snprintf(link_path, sizeof link_path, "%s.link", path);
+    unlink(path);
+    unlink(link_path);
+    ray_release(loaded);
+    ray_release(w);
+    PASS();
+}
+
 /* ─── Sidecar must be picked up by ray_col_mmap too (splay-mmap path) ── */
 
 static test_result_t test_link_mmap_loads_sidecar(void) {
@@ -1210,6 +1251,7 @@ const test_entry_t link_entries[] = {
     { "link/deref_null_propagation",         test_link_deref_null_propagation,        link_setup, link_teardown },
     { "link/deref_oob_yields_null",          test_link_deref_oob_yields_null,         link_setup, link_teardown },
     { "link/persistence_roundtrip",          test_link_persistence_roundtrip,         link_setup, link_teardown },
+    { "link/persistence_long_target_name",   test_link_persistence_long_target_name,  link_setup, link_teardown },
     { "link/coexists_with_index",            test_link_coexists_with_index,           link_setup, link_teardown },
     { "link/mmap_loads_sidecar",             test_link_mmap_loads_sidecar,            link_setup, link_teardown },
     { "link/deref_no_target_leak",           test_link_deref_no_target_leak,          link_setup, link_teardown },

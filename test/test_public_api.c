@@ -261,11 +261,20 @@ static test_result_t test_public_vec_get_i64_date(void) {
     ray_t* v = ray_vec_new(RAY_DATE, 3);
     /* Pick three distinct int32 day values that differ in both halves so
      * a wrong-width read would catch obviously-wrong adjacent bytes. */
-    int32_t xs[] = { 0, 8766, 19724 };  /* 1970.01.01, 1994.01.01, 2024.01.01 */
+    int32_t xs[] = { 0, 8766, 19724 };  /* 2000.01.01, 2024.01.01, 2054.01.01 */
     for (int i = 0; i < 3; i++) v = ray_vec_append(v, &xs[i]);
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 0), xs[0]);
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 1), xs[1]);
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 2), xs[2]);
+
+    ray_t* epoch = ray_date(xs[0]);
+    ray_t* formatted = ray_fmt(epoch, 0);
+    TEST_ASSERT_NOT_NULL(formatted);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(formatted));
+    TEST_ASSERT_EQ_I(ray_str_len(formatted), 10);
+    TEST_ASSERT_MEM_EQ(10, ray_str_ptr(formatted), "2000.01.01");
+    ray_release(formatted);
+    ray_release(epoch);
     ray_release(v);
     PASS();
 }
@@ -277,6 +286,15 @@ static test_result_t test_public_vec_get_i64_time(void) {
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 0), xs[0]);
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 1), xs[1]);
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 2), xs[2]);
+
+    ray_t* noon = ray_time(xs[1]);
+    ray_t* formatted = ray_fmt(noon, 0);
+    TEST_ASSERT_NOT_NULL(formatted);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(formatted));
+    TEST_ASSERT_EQ_I(ray_str_len(formatted), 12);
+    TEST_ASSERT_MEM_EQ(12, ray_str_ptr(formatted), "12:00:00.000");
+    ray_release(formatted);
+    ray_release(noon);
     ray_release(v);
     PASS();
 }
@@ -589,7 +607,7 @@ static test_result_t test_public_get_error_trace_populated(void) {
     TEST_ASSERT_EQ_I(frame0->type, RAY_LIST);
     TEST_ASSERT_EQ_I(ray_len(frame0), 4);
 
-    ray_release(err);
+    ray_error_free(err);
     PASS();
 }
 
@@ -601,13 +619,43 @@ static test_result_t test_public_get_error_trace_cleared_on_eval(void) {
     ray_t* err = ray_eval_str("(boom2 \"x\")");
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     TEST_ASSERT_NOT_NULL(ray_get_error_trace());
-    ray_release(err);
+    ray_error_free(err);
 
     ray_t* ok = ray_eval_str("(+ 10 20)");
     TEST_ASSERT_NOT_NULL(ok);
     TEST_ASSERT_FALSE(RAY_IS_ERR(ok));
     TEST_ASSERT_NULL(ray_get_error_trace());
     ray_release(ok);
+    PASS();
+}
+
+static test_result_t test_public_nullability_matrix(void) {
+    ray_t* ordinary[] = {
+        ray_sym(0),
+        ray_str("", 0),
+        ray_bool(false),
+        ray_u8(0),
+        ray_f32(0.0f),
+    };
+    ray_t* requested_null[] = {
+        ray_typed_null(-RAY_SYM),
+        ray_typed_null(-RAY_STR),
+        ray_typed_null(-RAY_BOOL),
+        ray_typed_null(-RAY_U8),
+        ray_typed_null(-RAY_F32),
+    };
+    const bool requested_is_null[] = { false, false, true, true, true };
+
+    for (size_t i = 0; i < sizeof(ordinary) / sizeof(ordinary[0]); i++) {
+        TEST_ASSERT_NOT_NULL(ordinary[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ordinary[i]));
+        TEST_ASSERT_FALSE(RAY_ATOM_IS_NULL(ordinary[i]));
+        TEST_ASSERT_NOT_NULL(requested_null[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(requested_null[i]));
+        TEST_ASSERT_EQ_I(RAY_ATOM_IS_NULL(requested_null[i]), requested_is_null[i]);
+        ray_release(ordinary[i]);
+        ray_release(requested_null[i]);
+    }
     PASS();
 }
 
@@ -657,6 +705,7 @@ const test_entry_t public_api_entries[] = {
     { "public/eval_restricted_allows_arith",   test_public_eval_restricted_allows_arith,   public_api_setup, public_api_teardown },
     { "public/get_error_trace_populated",      test_public_get_error_trace_populated,      public_api_setup, public_api_teardown },
     { "public/get_error_trace_cleared_on_eval",test_public_get_error_trace_cleared_on_eval,public_api_setup, public_api_teardown },
+    { "public/nullability_matrix",             test_public_nullability_matrix,             public_api_setup, public_api_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

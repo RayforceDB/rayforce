@@ -44,14 +44,13 @@ void ray_sym_destroy(void);
 ```c
 #include <rayforce.h>
 
-int main(void) {
-    ray_heap_init();
-    ray_sym_init();
+int main(int argc, char** argv) {
+    ray_runtime_t* runtime = ray_runtime_create(argc, argv);
+    if (!runtime) return 1;
 
     /* ... use Rayforce API ... */
 
-    ray_sym_destroy();
-    ray_heap_destroy();
+    ray_runtime_destroy(runtime);
     return 0;
 }
 ```
@@ -196,7 +195,7 @@ ray_t* ray_date(int64_t val);
 
 ### ray_time
 
-Creates a time atom. The value is nanoseconds since midnight.
+Creates a time atom. The value is milliseconds since midnight.
 
 ```c
 ray_t* ray_time(int64_t val);
@@ -489,7 +488,7 @@ Macro. Tests whether a `ray_t*` is an error object. Safe to call on `NULL`. Retu
 ray_t* result = ray_execute(g, root);
 if (RAY_IS_ERR(result)) {
     printf("Error: %s\n", ray_err_code(result));
-    ray_release(result);
+    ray_error_free(result);
     return 1;
 }
 ```

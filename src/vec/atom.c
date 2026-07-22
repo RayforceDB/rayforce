@@ -181,9 +181,9 @@ ray_t* ray_typed_null(int8_t type) {
     /* GUID null is the canonical all-zero 16-byte value: allocate the
      * U8 payload buffer up front (same shape as ray_guid) so consumers
      * can deref obj without a NULL check.  Other types use the payload
-     * union — the sentinel write below is the source of truth; the
-     * aux[0] bit is retained for atom types without a sentinel
-     * (BOOL/U8/F32). */
+     * union — the sentinel write below is the source of truth.  The
+     * aux[0] bit represents typed null only for BOOL/U8; F32 uses NaN.
+     * SYM/STR typed-null requests collapse to ordinary empty values. */
     if (type == -RAY_GUID) {
         static const uint8_t NULL_GUID_BYTES[16] = {0};
         ray_t* v = ray_guid(NULL_GUID_BYTES);

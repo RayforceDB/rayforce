@@ -244,8 +244,9 @@ static int   g_rfl_count = 0;
  */
 
 static int fmt_eq(ray_t* a, ray_t* b) {
-    /* ray_eval_str returns NULL for void results (like evaluating `null`).
-     * Two NULLs format-equal; one NULL differs from anything else. */
+    /* ray_eval_str returns RAY_NULL_OBJ for successful void results (like
+     * evaluating `null`). Bare C NULL is reserved for defensive no-result
+     * handling: two NULLs compare equal; one differs from anything else. */
     if (a == NULL && b == NULL) return 1;
     if (a == NULL || b == NULL) return 0;
     ray_t* sa = ray_fmt(a, 0);

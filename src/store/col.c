@@ -580,14 +580,28 @@ static void try_load_link_sidecar(ray_t* vec, const char* path) {
     memcpy(link_path + plen, ".link", 6);
     FILE* lf = fopen(link_path, "rb");
     if (!lf) return;
-    char buf[256];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, lf);
+    /* Read the whole sidecar.  The target sym name can be longer than any fixed
+     * buffer, and a truncated read would intern a DIFFERENT symbol — silently
+     * linking the column to the wrong table.  Size to the file, capped so a
+     * corrupt/oversized sidecar can't force a huge allocation. */
+    if (fseek(lf, 0, SEEK_END) != 0) { fclose(lf); return; }
+    long fsz = ftell(lf);
+    if (fsz <= 0 || fsz > (1L << 20)) { fclose(lf); return; }
+    rewind(lf);
+    char* buf = (char*)ray_alloc_raw((size_t)fsz);
+    if (!buf) { fclose(lf); return; }
+    size_t n = fread(buf, 1, (size_t)fsz, lf);
     fclose(lf);
+    /* Reject a short read (I/O error, or the sidecar shrank after the size
+     * check above): interning a partial name would link the WRONG symbol —
+     * the very failure this reader guards against. */
+    if (n != (size_t)fsz) { ray_free_raw(buf); return; }
     while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r'
                   || buf[n-1] == ' '  || buf[n-1] == '\t'
                   || buf[n-1] == '\0')) n--;
-    if (n == 0) return;
+    if (n == 0) { ray_free_raw(buf); return; }
     int64_t target_sym = ray_sym_intern(buf, n);
+    ray_free_raw(buf);
     if (target_sym < 0) return;
     vec->link_target = target_sym;
     vec->attrs |= RAY_ATTR_HAS_LINK;

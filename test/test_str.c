@@ -1827,7 +1827,7 @@ static test_result_t test_str_vec_from_parts(void) {
     p = ray_str_vec_get(v, 1, &l); TEST_ASSERT_EQ_U(l, 3); TEST_ASSERT_EQ_I(memcmp(p,"abc",3), 0);
     p = ray_str_vec_get(v, 2, &l); TEST_ASSERT_EQ_U(l, 27); TEST_ASSERT_EQ_I(memcmp(p,"this_is_long_enough_to_pool",27), 0);
     p = ray_str_vec_get(v, 3, &l); TEST_ASSERT_EQ_U(l, 1); TEST_ASSERT_EQ_I(p[0],'x');
-    /* STR has no null distinct from "" — null stored as empty string */
+    /* Missing STR input collapses to the ordinary empty string. */
     p = ray_str_vec_get(v, 4, &l); TEST_ASSERT_EQ_U(l, 0); (void)p;
     ray_release(v);
     ray_heap_destroy();
@@ -1962,4 +1962,3 @@ const test_entry_t str_entries[] = {
     { "str/ne_nonempty", test_str_ne_nonempty, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
-

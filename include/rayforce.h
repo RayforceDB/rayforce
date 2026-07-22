@@ -433,13 +433,25 @@ int64_t ray_timestamp_now_ns(void);
 ray_t* ray_guid(const uint8_t* bytes);
 ray_t* ray_typed_null(int8_t type);
 
-/* ===== Null Sentinel Values =====
+/* ===== Nullability and Null Sentinel Values =====
  *
- * Per-type null encoding for nullable scalar types.  Callers compare values
- * directly (e.g. `x == NULL_I64`, `x != x` for NaN); there are no predicate
- * macros or aliases.  Temporal types (DATE/TIME/TIMESTAMP) reuse NULL_I32 or
- * NULL_I64 based on their storage width.  SYM null = sym ID 0; STR null =
- * empty string (length 0); BOOL and U8 are non-nullable. */
+ * Public nullability matrix:
+ *
+ *   type family       atom encoding             vector encoding
+ *   ----------------  ------------------------  ------------------------
+ *   I16/I32/I64       width-correct NULL_*      width-correct NULL_*
+ *   DATE/TIME/TS      width-correct NULL_*      width-correct NULL_*
+ *   F32/F64           NaN                       NaN
+ *   GUID              16 all-zero bytes         16 all-zero bytes
+ *   BOOL/U8           ray_typed_null aux bit    non-nullable
+ *   SYM/STR           no distinct null          non-nullable
+ *
+ * Empty SYM/STR values are ordinary values.  A requested typed or input null
+ * for either type collapses to the ordinary empty value; its public null
+ * predicate remains false and a vector does not acquire HAS_NULLS.  Callers
+ * compare sentinel-backed payloads directly (for example `x == NULL_I64` or
+ * `x != x` for NaN).  Temporal types reuse NULL_I32 or NULL_I64 according to
+ * storage width. */
 #define NULL_I16  ((int16_t)INT16_MIN)
 #define NULL_I32  ((int32_t)INT32_MIN)
 #define NULL_I64  ((int64_t)INT64_MIN)
@@ -447,9 +459,9 @@ ray_t* ray_typed_null(int8_t type);
 #define NULL_F64  (__builtin_nan(""))
 
 /* Atom null check.  RAY_NULL_OBJ is the untyped null singleton.
- * Typed atoms with a defined NULL_* sentinel use payload-compare;
- * types without a sentinel (BOOL/U8/F32) fall back to the
- * aux[0]&1 bit written by ray_typed_null. */
+ * Sentinel-backed atoms use payload comparison.  BOOL/U8 typed-null atoms
+ * use the aux[0]&1 bit written by ray_typed_null.  SYM/STR always return
+ * false because their empty payloads are ordinary values. */
 static inline bool ray_atom_is_null_fn(const union ray_t* x) {
     if (RAY_IS_NULL(x)) return true;
     if (x->type >= 0) return false;
@@ -664,10 +676,10 @@ ray_runtime_t* ray_runtime_create_with_sym_err(const char* sym_path,
 void ray_runtime_destroy(ray_runtime_t* rt);
 
 /* Parse and evaluate a Rayfall source string against the global env.
- * Returns NULL for void / null results, an error ray_t* on failure
- * (test with RAY_IS_ERR and inspect with ray_err_code), or the result
- * value otherwise.  Caller owns the returned reference; release with
- * ray_release. */
+ * Returns RAY_NULL_OBJ for successful void / null results, an error ray_t*
+ * on failure (test with RAY_IS_ERR and inspect with ray_err_code), or the
+ * result value otherwise.  Caller owns the returned reference; release
+ * with ray_release. */
 ray_t* ray_eval_str(const char* source);
 
 ray_t* ray_select(ray_t** args, int64_t n);

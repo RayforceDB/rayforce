@@ -130,4 +130,9 @@ ray_err_t ray_hnsw_save(const ray_hnsw_t* idx, const char* dir);
 ray_hnsw_t* ray_hnsw_load(const char* dir);
 ray_hnsw_t* ray_hnsw_mmap(const char* dir);
 
+/* True iff n_nodes * dim * sizeof(float) (the vectors block) fits in size_t,
+ * with n_nodes and dim > 0.  The loader uses it to reject a crafted header
+ * that would overflow the vectors allocation; exposed for direct unit test. */
+bool ray_hnsw_vec_size_valid(int64_t n_nodes, int32_t dim);
+
 #endif /* RAY_HNSW_H */

@@ -38,6 +38,7 @@
 #include "store/hnsw.h"
 #include <math.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -966,6 +967,45 @@ static test_result_t test_hnsw_mmap_load(void) {
     TEST_ASSERT_EQ_I(ids[0], 0);
 
     ray_hnsw_free(loaded);
+    PASS();
+}
+
+/* Regression: ray_hnsw_build must reject dimensions whose
+ * n_nodes * dim * sizeof(float) overflows size_t, before it copies the source
+ * vectors.  Values are chosen so the byte count wraps to 16: without the guard
+ * the copy under-allocates and memcpy over-reads the 1-element source (ASan
+ * traps it); with the guard the call returns NULL and the source is never
+ * touched.  (2^62 + 2) * 2 * sizeof(float) == 2^65 + 16 == 16 (mod 2^64). */
+static test_result_t test_hnsw_build_overflow_rejected(void) {
+    float dummy[1] = { 0.0f };
+    ray_hnsw_t* idx = ray_hnsw_build(dummy, ((int64_t)1 << 62) + 2, 2,
+                                     RAY_HNSW_L2, 4, 50);
+    TEST_ASSERT_NULL(idx);
+    PASS();
+}
+
+/* Directly exercises the vectors-block overflow guard that hnsw_load_impl
+ * applies to an untrusted header (factored into ray_hnsw_vec_size_valid).  A
+ * crafted header can make n_nodes * dim * sizeof(float) wrap size_t, under-
+ * allocating the vectors buffer that the following fread overruns; the guard
+ * must reject it.  Unit-tested at this layer rather than through ray_hnsw_load
+ * because a header patched to overflow is refused earlier — the huge
+ * node-level read fails first — so a full-load test cannot distinguish this
+ * path (with or without the guard the load returns NULL). */
+static test_result_t test_hnsw_vec_size_valid_guard(void) {
+    /* Ordinary dimensions fit. */
+    TEST_ASSERT_TRUE(ray_hnsw_vec_size_valid(100000, 1536));
+    /* Non-positive dims are rejected. */
+    TEST_ASSERT_FALSE(ray_hnsw_vec_size_valid(0, 4));
+    TEST_ASSERT_FALSE(ray_hnsw_vec_size_valid(4, 0));
+    TEST_ASSERT_FALSE(ray_hnsw_vec_size_valid(-1, 4));
+    /* n_nodes * dim * sizeof(float) overflows size_t → rejected. */
+    TEST_ASSERT_FALSE(ray_hnsw_vec_size_valid((int64_t)1 << 40, 1 << 25));
+    /* Boundary: the largest element count whose * sizeof(float) still fits,
+     * then one dim past it. */
+    int64_t max_elems = (int64_t)(SIZE_MAX / sizeof(float));
+    TEST_ASSERT_TRUE(ray_hnsw_vec_size_valid(max_elems, 1));
+    TEST_ASSERT_FALSE(ray_hnsw_vec_size_valid(max_elems, 2));
     PASS();
 }
 
@@ -1964,6 +2004,8 @@ const test_entry_t embedding_entries[] = {
     { "embedding/hnsw_dim_accessor", test_hnsw_dim_accessor, emb_setup, emb_teardown },
     { "embedding/hnsw_search_filter_null_accept", test_hnsw_search_filter_null_accept, emb_setup, emb_teardown },
     { "embedding/hnsw_mmap_load", test_hnsw_mmap_load, emb_setup, emb_teardown },
+    { "embedding/hnsw_build_overflow_rejected", test_hnsw_build_overflow_rejected, emb_setup, emb_teardown },
+    { "embedding/hnsw_vec_size_valid_guard", test_hnsw_vec_size_valid_guard, emb_setup, emb_teardown },
     { "embedding/hnsw_search_sift_down", test_hnsw_search_sift_down, emb_setup, emb_teardown },
 
     /* rerank coverage (S7) */

@@ -22,7 +22,7 @@ Signatures:
 - `(.csv.read [types] "path")` — types is a SYM vector naming `B8`, `I64`, `F64`, `STR`, `SYMBOL`, `F32`, `DATE`, `TIME`, `TIMESTAMP`, `GUID` (case-insensitive). One entry per column.
 - `(.csv.read [names] [types] "path")` — also override the column names. With explicit names the input is assumed to have **no header row**.
 
-Returns: a `table`. Empty fields and the empty string are read as null with `RAY_ATTR_HAS_NULLS` set on the column.
+Returns: a `table`. Empty fields use the selected type's missing-input behavior. Sentinel-nullable columns record nulls with `RAY_ATTR_HAS_NULLS`; `SYM`/`STR` fields collapse to ordinary empty values and those columns do not acquire `RAY_ATTR_HAS_NULLS` from them.
 
 Errors: `type` (bad arg), `domain` (path is null / too long, or zero columns), `io` (open/read failure), `limit` (>256 columns).
 
