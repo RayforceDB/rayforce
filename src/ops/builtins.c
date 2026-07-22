@@ -2158,12 +2158,18 @@ ray_t* ray_where_fn(ray_t* x) {
     int64_t n = x->len;
 
     ray_pool_t* pool = ray_pool_get();
-    if (pool && n >= RAY_PARALLEL_THRESHOLD) {
-        /* One task per chunk (ray_pool_dispatch_n); chunk grows for inputs
-         * that would exceed the pool's task cap. */
+    if (pool && pool->n_workers > 0 && n >= RAY_PARALLEL_THRESHOLD) {
+        /* One task per chunk (ray_pool_dispatch_n).  Chunk count is capped
+         * at 1024 — the pool's INITIAL ring capacity — so dispatch_n never
+         * needs to grow the ring (its clamp-on-grow-failure silently DROPS
+         * tasks, which here would mean uninitialized prefix entries and
+         * out-of-bounds emit offsets).  1024 tasks is ample granularity. */
         int64_t chunk_rows = WHERE_CHUNK_ROWS;
-        while ((n + chunk_rows - 1) / chunk_rows > 60000) chunk_rows *= 2;
+        while ((n + chunk_rows - 1) / chunk_rows > 1024) chunk_rows *= 2;
         int64_t n_chunks = (n + chunk_rows - 1) / chunk_rows;
+        /* ops/internal.h's scratch_alloc idiom is unavailable here (that
+         * header clashes with builtins.c-local helpers); ray_alloc +
+         * ray_release below is its exact expansion. */
         ray_t* cc_hdr = ray_alloc((size_t)n_chunks * sizeof(int64_t));
         int64_t* chunk_counts = cc_hdr ? (int64_t*)ray_data(cc_hdr) : NULL;
         if (chunk_counts) {

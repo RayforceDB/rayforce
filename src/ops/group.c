@@ -34,7 +34,6 @@
 #include "core/runtime.h"   /* __VM — per-thread group-key cardinality hint */
 
 #include <stdlib.h>
-#include <time.h>
 
 /* Group accumulators use F64 lanes for both floating storage widths.  Keep the
  * source read width explicit so F32 payload bits are never mistaken for an
@@ -8604,6 +8603,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
 
+    /* v2 doesn't implement the top-count emit filter (old-engine feature);
+     * when one is active, stay on the legacy path that honors it. */
     if (ray_agg_engine_v2 && group_limit == 0
         && !ray_group_emit_filter_get().enabled
         && agg_v2_can_handle(g, op, tbl))
@@ -9594,11 +9595,26 @@ da_path:;
         for (uint32_t a = 0; a < n_aggs && da_eligible; a++) {
             uint16_t aop = ext->agg_ops[a];
             /* Binary aggregators (PEARSON/COV/SCOV/WSUM/WAVG) are handled by
-             * the DA co-moment slots (sum_y/sumsq_y/sumxy); they only need the
-             * paired y-column present.  (Previously forced to the slow HT
-             * scatter path — the cause of poor multi-thread scaling.) */
+             * the DA co-moment slots (sum_y/sumsq_y/sumxy).  (Previously
+             * forced to the slow HT scatter path — the cause of poor
+             * multi-thread scaling.)  Eligibility needs a paired y-column of
+             * a plain numeric/temporal type; da_accum_row's pair branch has
+             * NO sentinel machinery for the y side (only the FP NaN check),
+             * so a nullable integer/temporal y — whose null sentinel would
+             * be accumulated as a real value — must stay on the HT path. */
             if (agg_is_binary_agg(aop)) {
-                if (!agg_vecs2 || !agg_vecs2[a]) { da_eligible = false; }
+                ray_t* yv2 = (agg_vecs2 ? agg_vecs2[a] : NULL);
+                if (!yv2) { da_eligible = false; }
+                else {
+                    int8_t t2 = yv2->type;
+                    bool y_fp  = group_fp_type(t2);
+                    bool y_int = (t2 == RAY_I16 || t2 == RAY_I32 || t2 == RAY_I64 ||
+                                  t2 == RAY_DATE || t2 == RAY_TIME || t2 == RAY_TIMESTAMP ||
+                                  t2 == RAY_BOOL || t2 == RAY_U8);
+                    if (!y_fp && !y_int) da_eligible = false;           /* SYM/STR/GUID/… */
+                    else if (!y_fp && (yv2->attrs & RAY_ATTR_HAS_NULLS))
+                        da_eligible = false;                            /* nullable int y */
+                }
             }
             if (aop == OP_MEDIAN)       da_eligible = false;
             if (aop == OP_QUANTILE)     da_eligible = false;
@@ -9780,12 +9796,19 @@ da_path:;
              * with HAS_NULLS use sentinel-skip. */
             bool da_any_nullable = false;
             for (uint32_t a = 0; a < n_aggs; a++) {
-                /* y-side plumbing for binary aggs (PEARSON/COV/WAVG/WSUM). */
+                /* y-side plumbing for binary aggs (PEARSON/COV/WAVG/WSUM).
+                 * Eligibility (above) already rejected nullable-int and
+                 * non-numeric y; an FP y may still carry NaNs — the accum
+                 * branch skips those PAIRS, so nn must be allocated or the
+                 * emitter would divide by the full group count. */
                 agg_ptrs2[a] = NULL; agg_types2[a] = 0;
                 if (agg_is_binary_agg(ext->agg_ops[a]) && agg_vecs2 && agg_vecs2[a]) {
                     agg_ptrs2[a]  = ray_data(agg_vecs2[a]);
                     agg_types2[a] = agg_vecs2[a]->type;
                     agg_pair_mask |= ((uint64_t)1 << a);
+                    if (group_fp_type(agg_vecs2[a]->type) &&
+                        (agg_vecs2[a]->attrs & RAY_ATTR_HAS_NULLS))
+                        da_any_nullable = true;
                 }
                 if (agg_prod[a].enabled) {
                     /* Fused product: F64 accumulate, no source vec. */

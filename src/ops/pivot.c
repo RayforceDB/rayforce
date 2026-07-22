@@ -488,12 +488,19 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
     if (!then_op || !else_op) return NULL;
 
     /* Both branches trivial AND type-safe for the eager fill → eager
-     * (parallel elementwise) wins over the serial id-scaffolding here. */
-    if (op->out_type != RAY_STR &&
-        if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op) &&
-        if_type_eager_ok(then_op->out_type, op->out_type) &&
-        if_type_eager_ok(else_op->out_type, op->out_type))
-        return NULL;
+     * (POOL-PARALLEL elementwise) wins over the serial id-scaffolding
+     * here.  Only when workers exist: with a 0-worker pool (-c 1) the
+     * eager fill runs serially over ALL rows for BOTH branches, which
+     * loses to the selected path's touch-only-passing-rows scheme. */
+    {
+        ray_pool_t* rp = ray_pool_get();
+        if (rp && rp->n_workers > 0 &&
+            op->out_type != RAY_STR &&
+            if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op) &&
+            if_type_eager_ok(then_op->out_type, op->out_type) &&
+            if_type_eager_ok(else_op->out_type, op->out_type))
+            return NULL;
+    }
 
     if_branch_plan_t then_plan, else_plan;
     if (!if_make_branch_plan(g, then_op, &then_plan) ||
@@ -809,7 +816,7 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         }
 
         ray_pool_t* pool = ray_pool_get();
-        bool par = pool && len >= 65536;
+        bool par = pool && pool->n_workers > 0 && len >= RAY_PARALLEL_THRESHOLD;
         if (par && out_type == RAY_SYM) {
             /* Vector STR sides intern per element — serial only.  Non-STR
              * vector sides must be SYM columns; warm each non-runtime
