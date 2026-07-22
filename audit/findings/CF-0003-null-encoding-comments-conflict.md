@@ -16,7 +16,7 @@ unit:
   - test/test_str.c
   - test/rfl/integration/null.rfl
   - test/rfl/strop/split.rfl
-status: reported
+status: planned
 class: null
 members:
   - F-0004
@@ -71,6 +71,30 @@ Fifteen instances meet the project threshold of three.
 
 ## Validation
 
+Re-ran the recorded candidate census on 2026-07-22 and manually classified
+each result against `ray_atom_is_null_fn`, `ray_vec_is_null`,
+`ray_vec_set_null_checked`, and the focused `nil?` expectations. All fifteen
+recorded conflicting statements remain in their cited locations. The search
+also returns correct counterexamples that explicitly say empty SYM/STR values
+are not null; those are classification references, not defects.
+
+The current executable behavior is internally consistent enough to expose the
+norm choice but not to authorize it:
+
+- F32 atoms and vectors use NaN as a null sentinel.
+- SYM and STR atoms have no null distinct from their empty values;
+  `ray_typed_null` collapses to the ordinary empty value and
+  `RAY_ATOM_IS_NULL` returns false.
+- SYM and STR vectors are likewise treated as non-nullable by
+  `ray_vec_is_null`; missing inputs collapse to empty payloads without
+  `RAY_ATTR_HAS_NULLS`.
+- BOOL and U8 typed-null atoms use the auxiliary null bit, while BOOL and U8
+  vectors reject null insertion.
+
+The conflict is therefore substantive and the finding is validated. Because
+the Global strategy is rung (b) and explicitly requires the norm owner to
+choose the cross-surface matrix, validation does not ratify either direction.
+
 
 ## Root cause
 
@@ -87,6 +111,10 @@ contract. The norm ratification gate applies: no global edit should execute
 until triage records which semantics own SYM/STR empty values and F32.
 
 ## Remediation
+
+Planned in `audit/plans/RP-0004.md`. Execution is paused at the mandatory
+norm-ratification gate pending the human norm owner's explicit selection of
+the SYM/STR and F32 cross-surface semantics.
 
 
 ## Verification
