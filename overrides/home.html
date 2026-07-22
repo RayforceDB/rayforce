@@ -1,372 +1,309 @@
-{#-
-  Rayforce home — custom landing template.
-
-  Ports the marketing landing (formerly website/index.html) into the
-  mkdocs build so the site can be served from a single source.  This
-  template extends Material's main.html and overrides the layout blocks
-  the docs use (tabs, sidebar, content, footer) with the marketing
-  hero / why / features / architecture / demo / CTA sections.
-
-  The pill nav at the top stays — it's injected via the regular header
-  override (overrides/partials/header.html), so landing and docs share
-  one nav.  Landing-only styles and JS load via the styles/scripts
-  blocks below; everything else stays on the docs bundle.
--#}
 {% extends "main.html" %}
 
-{# Flag the document early (before <body> renders) so landing-only CSS
-   can scope itself without FOUC.  The class is set on <html> so it's
-   available before body exists.  CSS uses `html.landing-page` below. #}
 {% block extrahead %}
   <link rel="stylesheet" href="{{ 'assets/landing.css' | url }}">
-  <script>document.documentElement.classList.add('landing-page');</script>
+  <script>document.documentElement.classList.add('landing-page', 'has-reveal');</script>
 {% endblock %}
 
-{# Hide the Material tab bar on the landing page — the pill nav is enough. #}
-{% block tabs %}
-  {{ super() }}
-  <style>.md-tabs { display: none; }</style>
-{% endblock %}
+{% block tabs %}{% endblock %}
 
-{# Replace the entire docs container (sidebar + TOC + content) with the
-   marketing landing sections.  Wrapped in body.landing-page class via JS
-   below so we can scope landing-only CSS without touching base.html. #}
 {% block container %}
-<div class="landing-root">
-
-  <!-- Hero -->
-  <section class="hero">
-    <div class="hero-bg">
-      <div class="hero-gradient"></div>
-      <div class="hero-grid-lines"></div>
-    </div>
-    <div class="container">
-      <div class="hero-top">
-        <div class="hero-content">
-          <div class="hero-eyebrow">PURE C &middot; ZERO DEPS &middot; GRAPH + ANALYTICS</div>
-          <h1>Columnar analytics and<br>graph traversal in <span class="highlight">one pipeline</span></h1>
-          <p class="hero-desc">Rayforce is a zero-dependency embeddable engine where columnar analytics and graph operations share a single operation DAG, pass through a multi-pass optimizer, and execute as fused morsel-driven bytecode. Pure C. No malloc.</p>
-          <div class="hero-actions">
-            {# Primary CTA. Defaults to the releases page (works with no JS);
-               landing.js detects the OS and rewrites href + label to the
-               matching binary asset of the latest release. #}
-            <a href="https://github.com/RayforceDB/rayforce/releases/latest" class="btn-hero" data-download-cta>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              <span data-download-label>Download</span>
-            </a>
-            <a href="{{ 'docs/' | url }}" class="btn-hero-ghost">
-              Docs
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-            </a>
-            <a href="https://github.com/RayforceDB/rayforce" class="btn-hero-ghost" target="_blank" rel="noopener">GitHub</a>
-          </div>
-          <p class="hero-download-meta" data-download-meta hidden></p>
-        </div>
-
-        <aside class="hero-python" aria-labelledby="hero-python-label">
-          <div class="hero-python-head">
-            <span class="hero-python-tag" id="hero-python-label">Python</span>
-            <a class="hero-python-link" href="https://py.rayforcedb.com/" target="_blank" rel="noopener">
-              py.rayforcedb.com
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-            </a>
-          </div>
-<pre class="hero-python-code"><code><span class="hl-comment">$</span> pip install rayforce
-
-<span class="hl-kw">import</span> rayforce <span class="hl-kw">as</span> rf
-
-t = rf.read_csv(<span class="hl-str">"trades.csv"</span>)
-out = (t.where(rf.col(<span class="hl-str">"price"</span>) &gt; <span class="hl-num">100</span>)
-        .group_by(<span class="hl-str">"symbol"</span>)
-        .agg(rf.col(<span class="hl-str">"qty"</span>).sum()))</code></pre>
-          <div class="hero-python-foot">
-            <a class="hero-python-cta" href="https://py.rayforcedb.com/" target="_blank" rel="noopener">Python docs &rarr;</a>
-            <a class="hero-python-pypi" href="https://pypi.org/project/rayforce/" target="_blank" rel="noopener">PyPI</a>
-          </div>
-        </aside>
-      </div>
-
-      {# Three display-sized stats — replaces the older 4-tile icon
-         grid.  Reads as a single confident sentence rather than a
-         feature dashboard.  Pass count matches the why-card list
-         below (type inference, constant folding, SIP, factorize,
-         predicate pushdown, filter reorder, fusion, DCE) — keep
-         these in sync if the optimizer chain changes. #}
-      <div class="hero-stats">
-        <div class="hero-stat">
-          <span class="hero-stat-num">16K</span>
-          <span class="hero-stat-label">Lines of C</span>
-        </div>
-        <div class="hero-stat">
-          <span class="hero-stat-num">0</span>
-          <span class="hero-stat-label">External Dependencies</span>
-        </div>
-        <div class="hero-stat">
-          <span class="hero-stat-num">8</span>
-          <span class="hero-stat-label">Optimizer Passes</span>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Why -->
-  <section id="why" class="why-section">
-    <div class="container">
-      <div class="why-header">
-        <span class="section-tag">THE PROBLEM</span>
-        <h2>Analytics and graphs shouldn't need <span class="text-gradient">separate tools</span></h2>
-      </div>
-
-      <div class="why-grid">
-        <div class="why-card why-card-large">
-          <div class="why-card-label">THE RAYFORCE WAY</div>
-          <ul class="why-list why-list-solution">
-            <li>Single pipeline for analytics + graph</li>
-            <li>One optimizer understands both</li>
-            <li>Fused execution &mdash; no serialization overhead</li>
-            <li>Zero dependencies &mdash; embed in any C project</li>
-          </ul>
-        </div>
-
-        <div class="why-card">
-          <div class="why-card-label why-card-label-dim">TODAY'S APPROACH</div>
-          <ul class="why-list why-list-problem">
-            <li>Separate tools for analytics and graphs</li>
-            <li>Two query languages, two data models</li>
-            <li>Serialize between tools on every step</li>
-            <li>Heavy Python dependencies for simple ops</li>
-          </ul>
-        </div>
-
-        <div class="why-card why-card-small">
-          <div class="why-card-label">MULTI-PASS OPTIMIZER</div>
-          <p class="why-card-desc">Type inference, constant folding, sideways information passing, factorize, predicate pushdown, filter reorder, fusion, and DCE &mdash; all in one pass over the DAG before a single element is touched.</p>
-        </div>
-
-        <div class="why-card why-card-small">
-          <div class="why-card-label">MORSEL EXECUTION</div>
-          <p class="why-card-desc">1024-element morsel-driven bytecode. Element-wise ops fuse into single-pass pipelines. Thread-local arenas keep allocation off the critical path.</p>
-        </div>
-
-        <div class="why-card why-card-small">
-          <div class="why-card-label">CSR GRAPH ENGINE</div>
-          <p class="why-card-desc">Double-indexed compressed sparse rows. Forward + reverse indices, mmap-friendly persistence, and algorithms from BFS to worst-case optimal joins.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Features -->
-  <section id="features" class="features-section">
-    <div class="container">
-      <span class="section-tag">WHAT YOU GET</span>
-      <h2 class="features-title">Six pillars, one engine</h2>
-      <p class="features-subtitle">Everything you need for columnar analytics, graph traversal, and an interactive query language in a single embeddable library.</p>
-
-      <div class="features-grid">
-        <div class="feature-card">
-          <div class="feature-card-header">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
-            <h3>Fused Execution</h3>
-          </div>
-          <p>Morsel-driven bytecode over 1024-element chunks. Element-wise ops fused into single-pass pipelines that stay L1-resident.</p>
-        </div>
-
-        <div class="feature-card">
-          <div class="feature-card-header">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
-            <h3>Graph Engine</h3>
-          </div>
-          <p>Double-indexed CSR storage. BFS, Dijkstra, A*, PageRank, Louvain, LFTJ &mdash; all in the same DAG.</p>
-        </div>
-
-        <div class="feature-card">
-          <div class="feature-card-header">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-            <h3>Rayfall Language</h3>
-          </div>
-          <p>Lisp-like query REPL with rich builtins. Lambdas compile lazily to bytecode. <code>select</code>/<code>update</code> bridge to the DAG optimizer.</p>
-        </div>
-
-        <div class="feature-card">
-          <div class="feature-card-header">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
-            <h3>Multi-Pass Optimizer</h3>
-          </div>
-          <p>Type inference &rarr; constant folding &rarr; SIP &rarr; factorize &rarr; predicate pushdown &rarr; filter reorder &rarr; fusion &rarr; DCE.</p>
-        </div>
-
-        <div class="feature-card">
-          <div class="feature-card-header">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
-            <h3>Custom Allocator</h3>
-          </div>
-          <p>Buddy allocator with slab cache. Thread-local arenas, lock-free allocation, COW ref counting. No malloc.</p>
-        </div>
-
-        <div class="feature-card">
-          <div class="feature-card-header">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/></svg>
-            <h3>Zero Dependencies</h3>
-          </div>
-          <p>Pure C, single public header. Builds with <code>make</code>. ~16K lines of engine code. Embeds into any C/C++ project.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Architecture -->
-  <section id="architecture" class="arch-section">
-    <div class="container">
-      <span class="section-tag">ARCHITECTURE</span>
-      <h2 class="arch-title">Build, optimize, execute</h2>
-      <p class="arch-subtitle">Data flows from lazy DAG construction through a multi-pass optimizer into fused morsel-driven bytecode execution.</p>
-
-      <div class="arch-diagram">
-        <svg class="arch-svg" viewBox="0 0 800 180" xmlns="http://www.w3.org/2000/svg">
-          <defs>
-            <filter id="glow">
-              <feGaussianBlur stdDeviation="3" result="blur"/>
-              <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
-            </filter>
-          </defs>
-          <rect x="10" y="15" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
-          <text x="70" y="38" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">CSV / Tables</text>
-          <rect x="10" y="63" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
-          <text x="70" y="86" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">CSR Graphs</text>
-          <rect x="10" y="111" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
-          <text x="70" y="134" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">Rayfall</text>
-          <text x="70" y="166" text-anchor="middle" fill="rgba(255,255,255,0.25)" font-family="Oswald, sans-serif" font-size="9" font-weight="600" letter-spacing="0.12em">SOURCES</text>
-          <path d="M130,33 C185,33 185,60 240,60" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
-          <path d="M130,81 C185,81 185,90 240,90" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
-          <path d="M130,129 C185,129 185,120 240,120" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
-          <circle r="3" fill="#f5a623" filter="url(#glow)"><animateMotion dur="2.4s" repeatCount="indefinite" path="M130,33 C185,33 185,60 240,60"/></circle>
-          <circle r="3" fill="#f5a623" filter="url(#glow)"><animateMotion dur="2.8s" repeatCount="indefinite" path="M130,81 C185,81 185,90 240,90" begin="0.9s"/></circle>
-          <circle r="3" fill="#f5a623" filter="url(#glow)"><animateMotion dur="2.6s" repeatCount="indefinite" path="M130,129 C185,129 185,120 240,120" begin="1.7s"/></circle>
-          <rect class="arch-core-rect" x="240" y="10" width="320" height="160" rx="14" fill="rgba(153,119,50,0.2)" stroke="rgba(245,166,35,0.4)" stroke-width="1.5"/>
-          <text x="400" y="34" text-anchor="middle" fill="rgba(245,166,35,0.8)" font-family="Oswald, sans-serif" font-size="11" font-weight="700" letter-spacing="0.12em">RAYFORCE ENGINE</text>
-          <rect x="258" y="46" width="72" height="28" rx="6" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
-          <text x="294" y="64" text-anchor="middle" fill="#e2e8f0" font-family="'JetBrains Mono', monospace" font-size="11">scan</text>
-          <rect x="338" y="46" width="72" height="28" rx="6" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
-          <text x="374" y="64" text-anchor="middle" fill="#e2e8f0" font-family="'JetBrains Mono', monospace" font-size="11">filter</text>
-          <rect x="418" y="46" width="72" height="28" rx="6" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
-          <text x="454" y="64" text-anchor="middle" fill="#e2e8f0" font-family="'JetBrains Mono', monospace" font-size="11">group</text>
-          <rect x="498" y="46" width="52" height="28" rx="6" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.08)"/>
-          <text x="524" y="64" text-anchor="middle" fill="#e2e8f0" font-family="'JetBrains Mono', monospace" font-size="11">join</text>
-          <rect x="258" y="84" width="92" height="26" rx="6" fill="rgba(255,255,255,0.03)"/>
-          <text x="304" y="101" text-anchor="middle" fill="rgba(226,232,240,0.45)" font-family="'JetBrains Mono', monospace" font-size="10">optimizer</text>
-          <rect x="358" y="84" width="78" height="26" rx="6" fill="rgba(255,255,255,0.03)"/>
-          <text x="397" y="101" text-anchor="middle" fill="rgba(226,232,240,0.45)" font-family="'JetBrains Mono', monospace" font-size="10">fusion</text>
-          <rect x="444" y="84" width="98" height="26" rx="6" fill="rgba(255,255,255,0.03)"/>
-          <text x="493" y="101" text-anchor="middle" fill="rgba(226,232,240,0.45)" font-family="'JetBrains Mono', monospace" font-size="10">bytecode</text>
-          <text x="400" y="128" text-anchor="middle" fill="rgba(255,255,255,0.2)" font-family="Oswald, sans-serif" font-size="9" font-weight="600" letter-spacing="0.08em">EXECUTION</text>
-          <rect x="258" y="135" width="98" height="24" rx="6" fill="rgba(255,255,255,0.03)"/>
-          <text x="307" y="151" text-anchor="middle" fill="rgba(226,232,240,0.4)" font-family="'JetBrains Mono', monospace" font-size="10">morsel 1024</text>
-          <rect x="364" y="135" width="88" height="24" rx="6" fill="rgba(255,255,255,0.03)"/>
-          <text x="408" y="151" text-anchor="middle" fill="rgba(226,232,240,0.4)" font-family="'JetBrains Mono', monospace" font-size="10">graph ops</text>
-          <rect x="460" y="135" width="80" height="24" rx="6" fill="rgba(255,255,255,0.03)"/>
-          <text x="500" y="151" text-anchor="middle" fill="rgba(226,232,240,0.4)" font-family="'JetBrains Mono', monospace" font-size="10">LFTJ</text>
-          <path d="M560,60 C615,60 615,33 670,33" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
-          <path d="M560,90 C615,90 615,81 670,81" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
-          <path d="M560,120 C615,120 615,129 670,129" fill="none" stroke="rgba(245,166,35,0.15)" stroke-width="1.5"/>
-          <circle r="3" fill="#f5a623" filter="url(#glow)"><animateMotion dur="2.4s" repeatCount="indefinite" path="M560,60 C615,60 615,33 670,33" begin="1.2s"/></circle>
-          <circle r="3" fill="#f5a623" filter="url(#glow)"><animateMotion dur="2.8s" repeatCount="indefinite" path="M560,90 C615,90 615,81 670,81" begin="0.4s"/></circle>
-          <circle r="3" fill="#f5a623" filter="url(#glow)"><animateMotion dur="2.6s" repeatCount="indefinite" path="M560,120 C615,120 615,129 670,129" begin="2.1s"/></circle>
-          <rect x="670" y="15" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
-          <text x="730" y="38" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">DataFrames</text>
-          <rect x="670" y="63" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
-          <text x="730" y="86" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">Paths</text>
-          <rect x="670" y="111" width="120" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.15)"/>
-          <text x="730" y="134" text-anchor="middle" fill="#f5a623" font-family="'JetBrains Mono', monospace" font-size="12">Aggregates</text>
-          <text x="730" y="166" text-anchor="middle" fill="rgba(255,255,255,0.25)" font-family="Oswald, sans-serif" font-size="9" font-weight="600" letter-spacing="0.12em">RESULTS</text>
-        </svg>
-      </div>
-
-      <p class="arch-caption">Lazy DAG nodes &#8594; <strong>multi-pass optimizer</strong> (type inference, SIP, factorize, predicate pushdown, fusion, DCE) &#8594; <strong>fused morsel-driven executor</strong> with register-slot bytecode. Graph algorithms run in the same pipeline &mdash; no serialization between analytics and traversal.</p>
-    </div>
-  </section>
-
-  <!-- Live Demo -->
-  <section id="demo" class="demo-section">
-    <div class="container">
-      <span class="section-tag">SEE IT IN ACTION</span>
-      <h2 class="demo-title">From zero to query in seconds</h2>
-      <p class="demo-subtitle">Start the REPL, build tables, aggregate, and pivot &mdash; all in one session.</p>
-
-      <div class="demo-terminal">
-        <div class="terminal-header">
-          <span class="dot red"></span>
-          <span class="dot yellow"></span>
-          <span class="dot green"></span>
-          <span class="terminal-title">terminal</span>
-        </div>
-        <div class="terminal-body" id="terminal-output"></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- CTA -->
-  <section class="cta-section">
-    <div class="container">
-      <div class="cta-content">
-        <h2>Start building in<br>30 seconds</h2>
-        <div class="cta-terminal">
-          <div class="terminal-header">
-            <span class="dot red"></span>
-            <span class="dot yellow"></span>
-            <span class="dot green"></span>
-          </div>
-          <pre class="cta-terminal-body"><code><span class="t-cmd">$</span> make &amp;&amp; ./rayforce
-<span class="t-cmd">&#8227;</span> (pivot t 'Symbol 'Side 'Qty sum)</code></pre>
-        </div>
-        <div class="cta-buttons">
-          <a href="https://github.com/RayforceDB/rayforce/releases/latest" class="btn-hero" data-download-cta>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-            <span data-download-label>Download</span>
+<main class="landing-root">
+  <section class="hero rf-screen" aria-labelledby="hero-title">
+    <div class="hero-art" aria-hidden="true"></div>
+    <div class="hero-glow" aria-hidden="true"></div>
+    <div class="rf-container hero-layout">
+      <div class="hero-copy">
+        <p class="rf-kicker"><span></span> Open source · Pure C · Zero dependencies</p>
+        <h1 id="hero-title">Analytics and graphs.<br><em>One fast engine.</em></h1>
+        <p class="hero-lede">Rayforce fuses columnar analytics, graph traversal, and recursive queries into one embeddable execution pipeline—built for teams that measure latency in microseconds, not meetings.</p>
+        <div class="hero-actions">
+          <a class="rf-button rf-button--primary" href="https://github.com/RayforceDB/rayforce/releases/latest" data-download-cta>
+            <span data-download-label>Download Rayforce</span>
+            <span class="rf-button-icon" aria-hidden="true">{% include ".icons/material/download-outline.svg" %}</span>
           </a>
-          <a href="{{ 'docs/' | url }}" class="btn-hero-ghost">
-            Docs
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          <a class="rf-button rf-button--cloud" href="#cloud">
+            <span class="rf-button-icon" aria-hidden="true">{% include ".icons/material/cloud-outline.svg" %}</span>
+            <span>Cloud</span><small>Soon</small>
           </a>
-          <a href="https://github.com/RayforceDB/rayforce" class="btn-hero-ghost" target="_blank" rel="noopener">View on GitHub</a>
+          <a class="rf-button rf-button--quiet" href="{{ 'docs/getting-started/quick-start/' | url }}">
+            <span class="rf-button-icon" aria-hidden="true">{% include ".icons/material/book-open-page-variant-outline.svg" %}</span>
+            <span>Docs</span>
+          </a>
+        </div>
+        <script>if (window.__rfApplyCachedRelease) window.__rfApplyCachedRelease();</script>
+        <p class="hero-meta" data-download-meta hidden></p>
+      </div>
+
+      <div class="hero-console" data-live-demo aria-label="Recorded Rayforce market query execution">
+        <div class="console-bar">
+          <div class="console-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+          <a href="https://github.com/RayforceDB/rayforce/blob/master/examples/rfl/market_demo.rfl" target="_blank" rel="noopener">market_demo.rfl</a>
+          <span class="console-status"><i></i> real engine run</span>
+        </div>
+        <div class="demo-code">
+          <pre><code><span class="code-muted">; 100,000 deterministic market rows</span>
+<span class="code-key">(select</span> {from: trades
+         where: (&gt; qty <span class="code-number">100</span>)
+         by: symbol
+         trades: (count qty)
+         notional: (sum (* price qty))}<span class="code-key">)</span></code></pre>
+        </div>
+        <div class="demo-run">
+          <div class="demo-run-head">
+            <span data-demo-label>Loading 100,000 rows</span>
+            <button type="button" data-demo-replay aria-label="Replay Rayforce execution">Replay ↻</button>
+          </div>
+          <div class="demo-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" data-demo-progress-track><i data-demo-progress></i></div>
+          <ol class="demo-stages" aria-label="Rayforce execution stages">
+            <li data-demo-stage="load"><i></i><span>Load</span><small>100K rows</small></li>
+            <li data-demo-stage="optimize"><i></i><span>Optimize</span><small>rewrite DAG</small></li>
+            <li data-demo-stage="filter"><i></i><span>Filter</span><small>60K match</small></li>
+            <li data-demo-stage="group"><i></i><span>Group</span><small>4 symbols</small></li>
+          </ol>
+        </div>
+        <div class="demo-result" data-demo-result aria-live="polite">
+          <div class="demo-result-head"><span>symbol</span><span>trades</span><span>notional</span></div>
+          <div><strong>NVDA</strong><span>15,000</span><span>1,181,242,500</span></div>
+          <div><strong>GOOG</strong><span>15,000</span><span>1,191,143,000</span></div>
+          <div><strong>AAPL</strong><span>15,000</span><span>1,176,404,200</span></div>
+          <div><strong>MSFT</strong><span>15,000</span><span>1,185,774,600</span></div>
+        </div>
+        <div class="demo-foot">
+          <span>Recorded with <code>./rayforce -t 1</code></span>
+          <a href="https://wasm.rayforcedb.com/" target="_blank" rel="noopener">Run Rayforce live ↗</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="hero-foot rf-container">
+      <p>Join the community</p>
+      <div class="hero-socials" aria-label="Rayforce community links">
+        <a href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">{% include ".icons/fontawesome/brands/github.svg" %}<span>GitHub</span></a>
+        <a href="https://x.com/RayforceDB" target="_blank" rel="noopener">{% include ".icons/fontawesome/brands/x-twitter.svg" %}<span>X / Twitter</span></a>
+        <a href="https://www.reddit.com/r/rayforcedb/" target="_blank" rel="noopener">{% include ".icons/fontawesome/brands/reddit-alien.svg" %}<span>Reddit</span></a>
+        <a href="https://rayforcedb.zulipchat.com/join/l33sichu4vp7nf77hgdul4om/" target="_blank" rel="noopener">{% include ".icons/material/forum-outline.svg" %}<span>Zulip</span></a>
+        <a href="mailto:anton@rayforcedb.com">{% include ".icons/material/email-outline.svg" %}<span>Email</span></a>
+      </div>
+    </div>
+  </section>
+
+  <section id="engine" class="engine rf-screen">
+    <div class="rf-container section-grid">
+      <div class="section-copy reveal">
+        <p class="rf-kicker"><span></span> One execution model</p>
+        <h2>Stop moving data<br>between engines.</h2>
+        <p>Relational operators and graph traversals belong in the same plan. Rayforce sees the whole workload, rewrites it together, and keeps the hot path close to the metal.</p>
+        <a class="rf-text-link" href="{{ 'docs/architecture/pipeline/' | url }}">Explore the execution pipeline <span>↗</span></a>
+      </div>
+
+      <div class="pipeline reveal" aria-label="Rayforce execution pipeline">
+        <div class="pipeline-rail" aria-hidden="true"></div>
+        <article class="pipeline-step is-active">
+          <span class="pipeline-index">01</span>
+          <div><p>Compose</p><h3>Tables + graphs + rules</h3></div>
+          <small>Lazy DAG</small>
+        </article>
+        <article class="pipeline-step">
+          <span class="pipeline-index">02</span>
+          <div><p>Optimize</p><h3>Rewrite the whole plan</h3></div>
+          <small>Multi-pass</small>
+        </article>
+        <article class="pipeline-step">
+          <span class="pipeline-index">03</span>
+          <div><p>Fuse</p><h3>Remove intermediates</h3></div>
+          <small>Bytecode</small>
+        </article>
+        <article class="pipeline-step">
+          <span class="pipeline-index">04</span>
+          <div><p>Execute</p><h3>Stream cache-sized morsels</h3></div>
+          <small>Parallel</small>
+        </article>
+      </div>
+    </div>
+
+    <div class="rf-container engine-metrics reveal" aria-label="Engine facts">
+      <div><strong>16K</strong><span>lines of focused C</span></div>
+      <div><strong>0</strong><span>external dependencies</span></div>
+      <div><strong>IPC</strong><span>client/server transport built in</span></div>
+      <div><strong>MIT</strong><span>licensed and embeddable</span></div>
+    </div>
+  </section>
+
+  <section id="query" class="query rf-screen">
+    <div class="rf-container query-head reveal">
+      <div>
+        <p class="rf-kicker"><span></span> Rayfall language</p>
+        <h2>Ask complex questions.<br>Keep the syntax small.</h2>
+      </div>
+      <p>Use Rayfall interactively, embed the C API, or connect through a growing set of client interfaces. Every surface reaches the same optimizer and execution core.</p>
+    </div>
+
+    <div class="rf-container query-workbench reveal" data-code-tabs>
+      <div class="query-tabs" role="tablist" aria-label="Language examples">
+        <button type="button" role="tab" aria-selected="true" data-code-tab="rayfall">Rayfall</button>
+        <button type="button" role="tab" aria-selected="false" data-code-tab="python">Python</button>
+        <button type="button" role="tab" aria-selected="false" data-code-tab="c">C API</button>
+        <span>One engine, three surfaces</span>
+      </div>
+      <div class="query-body">
+        <div class="query-editor">
+          <pre data-code-panel="rayfall"><code><span class="code-muted">; Aggregate high-value flow, then traverse counterparties</span>
+<span class="code-key">(set</span> flow
+  <span class="code-key">(select</span> {from: trades
+           where: (&gt; Notional 1000000)
+           by: Counterparty
+           Volume: (sum Notional)}<span class="code-key">))</span>
+
+<span class="code-key">(.graph.var-expand</span> network flow 1 3<span class="code-key">)</span></code></pre>
+          <pre data-code-panel="python" hidden><code><span class="code-key">import</span> rayforce <span class="code-key">as</span> rf
+
+trades = rf.read_csv(<span class="code-string">"trades.csv"</span>)
+flow = (trades
+  .where(rf.col(<span class="code-string">"Notional"</span>) &gt; <span class="code-number">1_000_000</span>)
+  .group_by(<span class="code-string">"Counterparty"</span>)
+  .agg(rf.col(<span class="code-string">"Notional"</span>).sum()))
+
+network.expand(flow, min_depth=<span class="code-number">1</span>, max_depth=<span class="code-number">3</span>)</code></pre>
+          <pre data-code-panel="c" hidden><code>ray_t *trades = ray_read_csv(<span class="code-string">"trades.csv"</span>);
+ray_graph_t *g = ray_graph_new(trades);
+
+ray_op_t *amount = ray_scan(g, <span class="code-string">"Notional"</span>);
+ray_op_t *limit = ray_const_i64(g, <span class="code-number">1000000</span>);
+ray_op_t *hot = ray_gt(g, amount, limit);
+
+ray_t *result = ray_execute(g, ray_filter(g, trades, hot));</code></pre>
+        </div>
+        <div class="query-output" aria-label="Example query output">
+          <div class="output-head"><span>EXAMPLE RESULT</span><span>5 rows · optimized</span></div>
+          <div class="output-table">
+            <div class="output-row output-label"><span>Counterparty</span><span>Depth</span><span>Volume</span></div>
+            <div class="output-row"><span>LYNX_02</span><span>1</span><span>84.20M</span></div>
+            <div class="output-row"><span>ALPHA_17</span><span>2</span><span>61.08M</span></div>
+            <div class="output-row"><span>NODE_08</span><span>2</span><span>44.71M</span></div>
+            <div class="output-row"><span>FORT_04</span><span>3</span><span>27.19M</span></div>
+            <div class="output-row"><span>EDGE_12</span><span>3</span><span>12.42M</span></div>
+          </div>
         </div>
       </div>
     </div>
   </section>
 
-</div>
+  <section id="features" class="capabilities rf-screen">
+    <div class="rf-container capabilities-layout">
+      <div class="capabilities-intro reveal">
+        <p class="rf-kicker"><span></span> Built as one system</p>
+        <h2>Small footprint.<br>Serious machinery.</h2>
+        <p>Everything you need to move from raw columns to connected answers—without assembling a second platform around it.</p>
+      </div>
 
-<!-- Scroll-to-top button -->
-<button class="scroll-top" aria-label="Scroll to top">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 15l-6-6-6 6"/></svg>
-</button>
+      <div class="capability-list">
+        <a class="capability reveal" href="{{ 'docs/queries/select/' | url }}">
+          <span>01</span><div><h3>Columnar analytics</h3><p>Vectorized filters, joins, groups, windows, pivots, and time-series primitives.</p></div><i>↗</i>
+        </a>
+        <a class="capability reveal" href="{{ 'docs/graph/algorithms/' | url }}">
+          <span>02</span><div><h3>Native graph engine</h3><p>CSR traversal, shortest paths, centrality, communities, WCO joins, and HNSW.</p></div><i>↗</i>
+        </a>
+        <a class="capability reveal" href="{{ 'docs/guides/datalog/' | url }}">
+          <span>03</span><div><h3>Recursive Datalog</h3><p>Express reachability and recursive relationships as rules compiled into the same DAG.</p></div><i>↗</i>
+        </a>
+        <a class="capability reveal" href="{{ 'docs/guides/storage/' | url }}">
+          <span>04</span><div><h3>Storage that stays open</h3><p>CSV, splayed and partitioned tables, memory maps, IPC, and block offloading.</p></div><i>↗</i>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section id="production" class="production rf-screen">
+    <div class="rf-container production-layout">
+      <div class="production-copy reveal">
+        <p class="rf-kicker"><span></span> In production now</p>
+        <h2>Built for real work,<br>not synthetic demos.</h2>
+        <p>Rayforce is already part of production systems at teams working with trading, market connectivity, investment analytics, and risk.</p>
+        <p class="production-note">Production usage confirmed by the Rayforce project. Customer names link to their public company sites.</p>
+      </div>
+
+      <div class="customer-stack">
+        <a class="customer-card reveal" href="https://lynxtrading.com/" target="_blank" rel="noopener">
+          <div class="customer-top"><span>PRODUCTION USER · TRADING TECHNOLOGY</span><i>↗</i></div>
+          <strong class="customer-wordmark">LYNX</strong>
+          <h3>Infrastructure for fast-moving US equity markets.</h3>
+          <p>Lynx Trading Technologies builds modular connectivity, routing, risk, compliance, and analytics systems for broker-dealers.</p>
+        </a>
+        <a class="customer-card reveal" href="https://fortitudo.tech/" target="_blank" rel="noopener">
+          <div class="customer-top"><span>PRODUCTION USER · INVESTMENT TECHNOLOGY</span><i>↗</i></div>
+          <strong class="customer-wordmark customer-wordmark--fort">FORTITUDO</strong>
+          <h3>Quantitative tools for investment decisions.</h3>
+          <p>Fortitudo Technologies develops investment management software for portfolio analytics, risk, and research workflows.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section id="cloud" class="cloud rf-screen">
+    <div class="cloud-orbit cloud-orbit--one" aria-hidden="true"></div>
+    <div class="cloud-orbit cloud-orbit--two" aria-hidden="true"></div>
+    <div class="rf-container cloud-layout">
+      <div class="cloud-copy reveal">
+        <p class="rf-kicker"><span></span> Rayforce Cloud <b>Coming soon</b></p>
+        <h2>The engine you can embed.<br><em>The platform you won’t have to operate.</em></h2>
+        <p>We’re bringing Rayforce’s unified analytics and graph pipeline to a managed cloud experience—so teams can move from local prototype to production workload without rebuilding the data path.</p>
+        <div class="cloud-actions">
+          <a class="rf-button rf-button--primary" href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">Follow development <span>↗</span></a>
+          <span>No launch date announced yet.</span>
+        </div>
+      </div>
+
+      <div class="cloud-panel reveal">
+        <div class="cloud-panel-head"><span>RAYFORCE / CLOUD</span><b>PREVIEW</b></div>
+        <div class="cloud-region">
+          <p>Deployment</p><strong>eu-west</strong><span>Ready</span>
+        </div>
+        <div class="cloud-chart" aria-hidden="true">
+          <i style="--h:22%"></i><i style="--h:38%"></i><i style="--h:31%"></i><i style="--h:56%"></i><i style="--h:44%"></i><i style="--h:72%"></i><i style="--h:63%"></i><i style="--h:88%"></i><i style="--h:76%"></i><i style="--h:94%"></i><i style="--h:68%"></i><i style="--h:84%"></i>
+        </div>
+        <div class="cloud-stats"><div><span>QUERY SERVICE</span><strong>Preview</strong></div><div><span>ENGINE</span><strong>Managed</strong></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="open-source rf-screen">
+    <div class="rf-container open-layout reveal">
+      <p class="rf-kicker"><span></span> Open at the core</p>
+      <h2>Read every line.<br>Own every workload.</h2>
+      <p>One codebase. One public header. No external runtime. Clone Rayforce, compile it, embed it, and keep control of your data path.</p>
+      <div class="open-actions">
+        <a class="rf-button rf-button--primary" href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">
+          <svg class="github-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.6 22.4c.6.1.8-.2.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.4 11.4 0 0 1 6 0c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.3 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+          View on GitHub
+        </a>
+        <a class="rf-button rf-button--quiet" href="{{ 'docs/' | url }}">Read the docs <span>↗</span></a>
+      </div>
+      <div class="open-stats">
+        <div><strong data-gh-stat="stars">—</strong><span>GitHub stars</span></div>
+        <div><strong data-gh-stat="forks">—</strong><span>forks</span></div>
+        <div><strong>Linux · macOS</strong><span>supported today</span></div>
+      </div>
+    </div>
+  </section>
+</main>
 {% endblock %}
 
-{# Replace Material's footer with the marketing footer so the landing
-   matches the design from website/index.html exactly. #}
 {% block footer %}
 <footer class="footer landing-footer">
-  <div class="container">
-    <div class="footer-inner">
-      <div class="footer-brand">
-        <img src="{{ 'assets/logo-light-full.svg' | url }}" alt="Rayforce" width="168" height="28">
-      </div>
-      <div class="footer-links">
-        <a href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://x.com/RayforceDB" target="_blank" rel="noopener">X / Twitter</a>
-        <a href="https://www.reddit.com/r/rayforcedb/" target="_blank" rel="noopener">Reddit</a>
-        <a href="https://rayforcedb.zulipchat.com/join/l33sichu4vp7nf77hgdul4om/" target="_blank" rel="noopener">Zulip Chat</a>
-        <a href="https://www.linkedin.com/in/anton-kundenko-a22a3667" target="_blank" rel="noopener">LinkedIn</a>
-        <a href="{{ 'docs/' | url }}">Docs</a>
-        <a href="https://github.com/RayforceDB/rayforce/blob/master/LICENSE" target="_blank" rel="noopener">MIT License</a>
-      </div>
+  <div class="rf-container footer-grid">
+    <div class="footer-brand">
+      <img src="{{ 'assets/logo-light-full.svg' | url }}" alt="Rayforce" width="172" height="58">
+      <p>Columnar analytics and graph traversal in one embeddable engine.</p>
     </div>
+    <div class="footer-column"><span>BUILD</span><a href="{{ 'docs/' | url }}">Documentation</a><a href="{{ 'docs/getting-started/quick-start/' | url }}">Quick start</a><a href="https://wasm.rayforcedb.com/" target="_blank" rel="noopener">Live demo</a><a href="https://py.rayforcedb.com/" target="_blank" rel="noopener">Python</a></div>
+    <div class="footer-column"><span>PROJECT</span><a href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">GitHub</a><a href="{{ 'about/' | url }}">About</a><a href="#cloud">Rayforce Cloud</a><a href="https://github.com/RayforceDB/rayforce/blob/master/LICENSE" target="_blank" rel="noopener">MIT License</a></div>
+    <div class="footer-column"><span>COMMUNITY</span><a href="https://x.com/RayforceDB" target="_blank" rel="noopener">X / Twitter</a><a href="https://www.reddit.com/r/rayforcedb/" target="_blank" rel="noopener">Reddit</a><a href="https://rayforcedb.zulipchat.com/join/l33sichu4vp7nf77hgdul4om/" target="_blank" rel="noopener">Zulip</a></div>
   </div>
+  <div class="rf-container footer-bottom"><span>© 2025–2026 Anton Kundenko</span><span>Made for the shortest path between data and answers.</span></div>
 </footer>
 {% endblock %}
 
-{# Load landing-only JS (terminal demo, scroll fade-ins) after the
-   regular docs bundle so the GitHub widget counter still hooks up. #}
 {% block scripts %}
   {{ super() }}
   <script src="{{ 'javascripts/landing.js' | url }}"></script>

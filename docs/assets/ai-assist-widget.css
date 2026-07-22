@@ -325,3 +325,188 @@
   .rfai-messages { padding: 12px; }
   .rfai-msg { max-width: 100%; }
 }
+
+/* 2026 editorial shell: keep assistance present without obscuring the page. */
+.rfai-launcher {
+  right: max(22px, env(safe-area-inset-right));
+  bottom: max(22px, env(safe-area-inset-bottom));
+  min-width: 112px;
+  min-height: 48px;
+  gap: 8px;
+  padding: 0 15px 0 10px;
+  border-radius: 0;
+  background: rgba(8, 11, 16, .9);
+  border-color: rgba(233, 160, 51, .55);
+  color: var(--rfai-primary-lighter);
+  box-shadow: 0 16px 54px rgba(0, 0, 0, .42);
+  backdrop-filter: blur(14px);
+  font-family: var(--rfai-mono);
+  font-size: .72rem;
+  letter-spacing: .02em;
+}
+.rfai-launcher:hover {
+  border-color: var(--rfai-primary);
+  background: var(--rfai-primary);
+  color: #171109;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .48);
+}
+.rfai-launcher-icon { width: 28px; height: 28px; border-radius: 0; background: rgba(233,160,51,.12); }
+.rfai-launcher-icon svg { width: 18px; height: 18px; filter: none; }
+.rfai-dialog { border-radius: 0; border-color: rgba(233,160,51,.28); }
+.rfai-icon-button,.rfai-msg,.rfai-question,.rfai-send,.rfai-suggestions button,.rfai-table-wrap,.rfai-msg .rfai-content pre { border-radius: 0; }
+
+@media (max-width: 768px) {
+  .rfai-launcher {
+    right: max(12px, env(safe-area-inset-right));
+    bottom: max(12px, env(safe-area-inset-bottom));
+    min-width: 46px;
+    width: 46px;
+    min-height: 46px;
+    padding: 0;
+  }
+  .rfai-launcher > span:last-child { display: none; }
+  .rfai-launcher-icon { background: transparent; }
+  .rfai-dialog { width: calc(100vw - 16px); height: calc(100vh - 22px); border-radius: 0; }
+}
+
+/* Unified 2026 brand surface: the AI panel mirrors the landing workbench. */
+.rfai-launcher {
+  min-width: 124px;
+  min-height: 50px;
+  padding: 0 16px 0 10px;
+  border-color: rgba(233,160,51,.5);
+  background: rgba(8,11,16,.94);
+  color: #f3c46b;
+  font-family: var(--rfai-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.rfai-launcher:hover {
+  border-color: #e9a033;
+  background: #e9a033;
+  color: #171109;
+}
+.rfai-launcher-icon { border: 1px solid rgba(233,160,51,.28); box-shadow: none; }
+
+.rfai-dialog {
+  width: min(860px, calc(100vw - 48px));
+  height: min(650px, calc(100vh - 72px));
+  background: #080b10;
+  border-color: rgba(255,255,255,.18);
+  box-shadow: 0 32px 120px rgba(0,0,0,.72);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+.rfai-header {
+  min-height: 76px;
+  padding: 0 20px;
+  border-bottom-color: rgba(255,255,255,.11);
+  background: #080b10;
+}
+.rfai-title-row { gap: 18px; }
+.rfai-logo {
+  width: 122px;
+  padding-right: 18px;
+  border-right: 1px solid rgba(255,255,255,.12);
+}
+.rfai-header h2 {
+  font-size: 24px;
+  letter-spacing: -.02em;
+  text-transform: uppercase;
+}
+.rfai-header p {
+  margin-top: 4px;
+  color: #667583;
+  font-family: var(--rfai-mono);
+  font-size: 9px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.rfai-icon-button {
+  width: 40px;
+  height: 40px;
+  border-color: rgba(255,255,255,.14);
+  background: transparent;
+}
+.rfai-icon-button:hover { border-color: #e9a033; background: rgba(233,160,51,.08); }
+
+.rfai-messages {
+  gap: 14px;
+  padding: 22px;
+  background-color: #0b1017;
+  background-image:
+    linear-gradient(rgba(255,255,255,.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.022) 1px, transparent 1px);
+  background-size: 56px 56px;
+}
+.rfai-msg {
+  padding: 13px 15px;
+  border-color: rgba(255,255,255,.11);
+  background: #101720;
+  box-shadow: none;
+}
+.rfai-msg .rfai-content p,
+.rfai-msg .rfai-content ul { color: #9aa7b3; font-family: var(--rfai-font); font-size: 14px; }
+.rfai-msg-assistant.rfai-welcome {
+  border-left: 3px solid #e9a033;
+  background: rgba(17,25,35,.92);
+}
+.rfai-msg-user {
+  border-color: rgba(233,160,51,.38);
+  background: rgba(233,160,51,.1);
+}
+.rfai-msg .rfai-content h3,
+.rfai-msg .rfai-content h4,
+.rfai-msg .rfai-content h5 {
+  letter-spacing: -.01em;
+  text-transform: uppercase;
+}
+.rfai-msg .rfai-content code { border-radius: 0; }
+.rfai-suggestions { gap: 8px; margin-top: 0; }
+.rfai-suggestions button {
+  min-height: 34px;
+  padding: 7px 11px;
+  border-color: rgba(233,160,51,.22);
+  background: rgba(8,11,16,.8);
+  color: #9aa7b3;
+  font-family: var(--rfai-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.rfai-suggestions button:hover { color: #171109; border-color: #e9a033; background: #e9a033; }
+.rfai-form {
+  gap: 10px;
+  padding: 16px;
+  border-top-color: rgba(255,255,255,.11);
+  background: #080b10;
+}
+.rfai-question {
+  min-height: 54px;
+  border-color: rgba(255,255,255,.14);
+  background: #0b1017;
+  color: #f8fafc;
+  font-family: var(--rfai-font);
+  font-size: 14px;
+}
+.rfai-question:focus { border-color: #e9a033; box-shadow: none; }
+.rfai-send {
+  width: 56px;
+  min-height: 54px;
+  border-color: #e9a033;
+  background: #e9a033;
+  color: #171109;
+  box-shadow: none;
+}
+.rfai-send:hover { background: #f3c46b; }
+
+@media (max-width: 768px) {
+  .rfai-dialog { width: calc(100vw - 12px); height: calc(100svh - 12px); }
+  .rfai-header { min-height: 68px; padding: 0 14px; }
+  .rfai-logo { width: 102px; padding-right: 12px; }
+  .rfai-header h2 { font-size: 20px; }
+  .rfai-messages { padding: 14px; }
+}

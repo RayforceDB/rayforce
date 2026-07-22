@@ -1,98 +1,73 @@
-{#-
-  Rayforce header — conditional.
-
-  • Landing page (page.url == ''): renders the floating-pill marketing
-    nav (Features / Architecture / Docs / Live Demo / About + GitHub
-    widget) so the home page matches the marketing brand.
-
-  • Docs pages: renders Material's standard `.md-header` (logo + page
-    title + palette toggle + search + repo button) so docs pages stay
-    focused on docs UX — drawer toggle on mobile, search at the top
-    right, no marketing chrome.
-
-  The pill-nav HTML is a verbatim port of website/index.html's <nav>
-  with hrefs rewritten through the Jinja `url` filter so they resolve
-  from any depth.  The docs branch is a verbatim copy of Material's
-  default partials/header.html (we can't `super()` into a partial).
--#}
 {% if page and page.url in ('', 'about/') %}
-
-<nav class="nav">
-  <div class="nav-inner">
+<nav class="nav" aria-label="Primary navigation" data-md-component="header">
+  <div class="nav-inner rf-container">
     <a href="{{ '' | url }}" class="nav-brand" aria-label="Rayforce home">
-      <img src="{{ 'assets/logo-light-full.svg' | url }}" alt="Rayforce" width="118" height="40">
+      <img src="{{ 'assets/logo-light-full.svg' | url }}" alt="Rayforce" width="128" height="43">
     </a>
-    <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false">
+    <button class="nav-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false">
       <span></span><span></span><span></span>
     </button>
     <div class="nav-links">
-      <a href="#features">Features</a>
-      <a href="#architecture">Architecture</a>
+      <a href="{{ '' | url }}#engine">Engine</a>
+      <a href="{{ '' | url }}#query">Rayfall</a>
+      <a href="{{ '' | url }}#production">Users</a>
+      <a href="{{ '' | url }}#cloud" class="nav-cloud"><i aria-hidden="true"></i>Cloud</a>
       <a href="{{ 'docs/' | url }}">Docs</a>
-      <a href="https://wasm.rayforcedb.com/" class="nav-link-demo" target="_blank" rel="noopener">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-        Live Demo
+      <a href="https://wasm.rayforcedb.com/" class="nav-playground" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7Z"/></svg>Playground
       </a>
       <a href="{{ 'about/' | url }}"{% if page.url == 'about/' %} class="active"{% endif %}>About</a>
-      <div class="github-widget" role="group" aria-label="Rayforce on GitHub">
-        <a href="https://github.com/RayforceDB/rayforce" class="github-widget-icon" target="_blank" rel="noopener" aria-label="GitHub repository">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
-        </a>
-        <a href="https://github.com/RayforceDB/rayforce/stargazers" class="github-widget-stat" target="_blank" rel="noopener" title="Stars">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-          <span data-gh-stat="stars">—</span>
-        </a>
-        <a href="https://github.com/RayforceDB/rayforce/network/members" class="github-widget-stat" target="_blank" rel="noopener" title="Forks">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/><line x1="6" y1="9" x2="6" y2="11"/></svg>
-          <span data-gh-stat="forks">—</span>
-        </a>
-      </div>
+      <a class="nav-github" href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.6 22.4c.6.1.8-.2.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.4 11.4 0 0 1 6 0c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.3 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+        <span data-gh-stat="stars">—</span>
+      </a>
     </div>
   </div>
 </nav>
-
 {% else %}
-
-{% set class = "md-header" %}
-{% if "navigation.tabs.sticky" in features %}
-  {% set class = class ~ " md-header--shadow md-header--lifted" %}
-{% elif "navigation.tabs" not in features %}
-  {% set class = class ~ " md-header--shadow" %}
-{% endif %}
-<header class="{{ class }}" data-md-component="header">
-  <nav class="md-header__inner md-grid" aria-label="{{ lang.t('header') }}">
-    <a href="{{ config.extra.homepage | d(nav.homepage.url, true) | url }}" title="{{ config.site_name | e }}" class="md-header__button md-logo" aria-label="{{ config.site_name }}" data-md-component="logo">
+<header class="nav md-header docs-site-nav" data-md-component="header">
+  <nav class="nav-inner rf-container md-header__inner" aria-label="{{ lang.t('header') }}">
+    <a href="{{ config.extra.homepage | d(nav.homepage.url, true) | url }}" class="nav-brand md-logo" aria-label="{{ config.site_name }}" data-md-component="logo">
       {% include "partials/logo.html" %}
     </a>
-    <label class="md-header__button md-icon" for="__drawer">
-      {% set icon = config.theme.icon.menu or "material/menu" %}
-      {% include ".icons/" ~ icon ~ ".svg" %}
-    </label>
-    {# Title block intentionally omitted — the brand logo already
-       contains "Rayforce", and we only ship the slate scheme so no
-       palette toggle is rendered either. #}
-    <div class="md-header__spacer" aria-hidden="true"></div>
-    {% if config.theme.font != false %}
-      {% include "partials/javascripts/palette.html" %}
-    {% endif %}
-    {% if "search" in config.plugins or "material/search" in config.plugins %}
-      <label class="md-header__button md-icon" for="__search">
+    <button class="nav-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+    <div class="nav-links docs-nav-links" aria-label="Site navigation">
+      <a href="{{ '' | url }}#engine">Engine</a>
+      <a href="{{ '' | url }}#query">Rayfall</a>
+      <a href="{{ '' | url }}#production">Users</a>
+      <a href="{{ '' | url }}#cloud" class="nav-cloud"><i aria-hidden="true"></i>Cloud</a>
+      <a href="{{ 'docs/' | url }}" class="active">Docs</a>
+      <a href="https://wasm.rayforcedb.com/" class="nav-playground" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7Z"/></svg>Playground
+      </a>
+      <a href="{{ 'about/' | url }}">About</a>
+      <label class="docs-search-trigger md-icon" for="__search" aria-label="Search documentation">
         {% set icon = config.theme.icon.search or "material/magnify" %}
         {% include ".icons/" ~ icon ~ ".svg" %}
+        <span>Search</span>
       </label>
+      <label class="docs-browse-trigger" for="__drawer">Browse documentation</label>
+      <a class="nav-github" href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener" aria-label="Rayforce on GitHub">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.6 22.4c.6.1.8-.2.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.4 11.4 0 0 1 6 0c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.3 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+        <span data-gh-stat="stars">—</span>
+      </a>
+    </div>
+    {% if "search" in config.plugins or "material/search" in config.plugins %}
       {% include "partials/search.html" %}
     {% endif %}
-    {% if config.repo_url %}
-      <div class="md-header__source">
-        {% include "partials/source.html" %}
-      </div>
-    {% endif %}
   </nav>
-  {% if "navigation.tabs.sticky" in features %}
-    {% if "navigation.tabs" in features %}
-      {% include "partials/tabs.html" %}
-    {% endif %}
-  {% endif %}
 </header>
-
 {% endif %}
+<script>
+  (() => {
+    const stats = window.__rfCachedStats;
+    const format = window.__rfFormatCount;
+    if (!stats || typeof format !== 'function') return;
+    document.querySelectorAll('[data-gh-stat]').forEach(node => {
+      const value = node.dataset.ghStat === 'forks' ? stats.forks : stats.stars;
+      if (typeof value === 'number') node.textContent = format(value);
+    });
+  })();
+</script>

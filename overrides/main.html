@@ -1,5 +1,15 @@
 {% extends "base.html" %}
 
+{% block site_meta %}
+  {{ super() }}
+  <link rel="preload" href="{{ 'assets/fonts/inter-400.woff2' | url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{{ 'assets/fonts/inter-600.woff2' | url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{{ 'assets/fonts/oswald-700.woff2' | url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{{ 'assets/fonts/jbmono-400.woff2' | url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{{ 'assets/fonts/jbmono-600.woff2' | url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{{ 'assets/rayforce-engine-hero.webp' | url }}" as="image" type="image/webp" fetchpriority="high">
+{% endblock %}
+
 {#
   Rayforce docs — Material override entry point.
 
@@ -13,20 +23,86 @@
    announce slot (its .md-banner wrapper is flattened to display:contents in
    extra.css so only .rf-banner is styled).  Static text works with no JS; main.js
    fills the live version ("Rayforce vX.Y.Z is out"), rewrites the Download link to
-   the OS-matched binary, offsets the floating pill nav below it, and handles
+   the OS-matched binary, offsets the fixed site nav below it, and handles
    dismissal — keyed to the release tag, so a NEW release re-shows the banner. #}
 {% block announce %}
   <div class="rf-banner" data-rf-banner>
-    <span class="rf-banner-msg">
-      <span class="rf-banner-spark" aria-hidden="true">✨</span>
-      <span data-release-tag>Rayforce — latest release</span>
+    <div class="rf-banner-inner">
+      <span class="rf-banner-label">Release</span>
+      <span class="rf-banner-msg" data-release-tag>Rayforce — latest release</span>
       <a class="rf-banner-link" href="https://github.com/RayforceDB/rayforce/releases/latest" data-download-cta>
         <span data-download-label>Download</span>
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
       </a>
-    </span>
-    <button class="rf-banner-close" type="button" data-rf-dismiss aria-label="Dismiss release announcement">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-    </button>
+      <button class="rf-banner-close" type="button" data-rf-dismiss aria-label="Dismiss release announcement">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
   </div>
+  <script>
+    /* Hydrate cached live values before first paint. The full resolver still
+       revalidates them after load; this only prevents reload-time placeholders. */
+    (() => {
+      const formatCount = value => {
+        if (value >= 10000) return (value / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+        if (value >= 1000) return (value / 1000).toFixed(1) + 'k';
+        return String(value);
+      };
+      try {
+        window.__rfCachedStats = JSON.parse(localStorage.getItem('gh-stats:RayforceDB/rayforce'));
+        window.__rfFormatCount = formatCount;
+      } catch (error) {}
+
+      let release = null;
+      try {
+        const cached = JSON.parse(localStorage.getItem('gh-release:RayforceDB/rayforce'));
+        release = cached && cached.rel;
+      } catch (error) {}
+
+      window.__rfApplyCachedRelease = () => {
+        if (!release || !release.tag) return;
+        const platform = (navigator.userAgent || '') + ' ' + (navigator.platform || '');
+        const target = /Android/i.test(platform) ? null
+          : /Mac/i.test(platform) ? { token: 'darwin', os: 'macOS' }
+          : /Linux|X11/i.test(platform) ? { token: 'linux', os: 'Linux' }
+          : null;
+        const assetUrl = target
+          ? (release.urls || []).find(url => /\.tar\.gz$/.test(url) && url.includes(target.token))
+          : null;
+
+        document.querySelectorAll('[data-download-cta]').forEach(link => {
+          const label = link.querySelector('[data-download-label]');
+          if (assetUrl) {
+            link.href = assetUrl;
+            if (label) label.textContent = 'Download for ' + target.os;
+            link.title = 'Rayforce ' + release.tag + ' · ' + target.os;
+          } else if (label) {
+            label.textContent = 'Download';
+          }
+        });
+        document.querySelectorAll('[data-release-tag]').forEach(node => {
+          node.textContent = 'Rayforce ' + release.tag + ' is out';
+        });
+
+        const banner = document.querySelector('[data-rf-banner]');
+        if (banner) {
+          banner.dataset.tag = release.tag;
+          let dismissed = null;
+          try { dismissed = localStorage.getItem('rf-banner-dismissed'); } catch (error) {}
+          banner.hidden = dismissed === release.tag;
+          document.documentElement.style.setProperty('--rf-banner-h', banner.hidden ? '0px' : '34px');
+        }
+      };
+      window.__rfApplyCachedRelease();
+    })();
+  </script>
+  <button id="rfai-launcher" class="rfai-launcher" type="button" aria-haspopup="dialog" aria-controls="rfai-dialog" aria-expanded="false">
+    <span class="rfai-launcher-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" role="img" focusable="false">
+        <path d="M12 2.4l1.72 5.3a2.9 2.9 0 0 0 1.86 1.86l5.3 1.72-5.3 1.72a2.9 2.9 0 0 0-1.86 1.86L12 20.16l-1.72-5.3A2.9 2.9 0 0 0 8.42 13l-5.3-1.72 5.3-1.72a2.9 2.9 0 0 0 1.86-1.86L12 2.4Z"/>
+        <path d="M18.8 2.8l.56 1.72c.1.3.34.54.64.64l1.72.56-1.72.56c-.3.1-.54.34-.64.64l-.56 1.72-.56-1.72a1 1 0 0 0-.64-.64l-1.72-.56 1.72-.56a1 1 0 0 0 .64-.64l.56-1.72Z"/>
+      </svg>
+    </span>
+    <span>Ask AI</span>
+  </button>
 {% endblock %}

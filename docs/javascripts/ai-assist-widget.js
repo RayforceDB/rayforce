@@ -129,21 +129,24 @@
   }
 
   function buildWidget() {
-    const launcher = document.createElement('button');
-    launcher.id = 'rfai-launcher';
-    launcher.className = 'rfai-launcher';
-    launcher.type = 'button';
-    launcher.setAttribute('aria-haspopup', 'dialog');
-    launcher.setAttribute('aria-controls', 'rfai-dialog');
-    launcher.setAttribute('aria-expanded', 'false');
-    launcher.innerHTML = `
-      <span class="rfai-launcher-icon" aria-hidden="true">
-        <svg viewBox="0 0 24 24" role="img" focusable="false">
-          <path d="M12 2.4l1.72 5.3a2.9 2.9 0 0 0 1.86 1.86l5.3 1.72-5.3 1.72a2.9 2.9 0 0 0-1.86 1.86L12 20.16l-1.72-5.3A2.9 2.9 0 0 0 8.42 13l-5.3-1.72 5.3-1.72a2.9 2.9 0 0 0 1.86-1.86L12 2.4Z"/>
-          <path d="M18.8 2.8l.56 1.72c.1.3.34.54.64.64l1.72.56-1.72.56c-.3.1-.54.34-.64.64l-.56 1.72-.56-1.72a1 1 0 0 0-.64-.64l-1.72-.56 1.72-.56a1 1 0 0 0 .64-.64l.56-1.72Z"/>
-        </svg>
-      </span>
-      <span>Ask AI</span>`;
+    let launcher = document.querySelector('#rfai-launcher');
+    if (!launcher) {
+      launcher = document.createElement('button');
+      launcher.id = 'rfai-launcher';
+      launcher.className = 'rfai-launcher';
+      launcher.type = 'button';
+      launcher.setAttribute('aria-haspopup', 'dialog');
+      launcher.setAttribute('aria-controls', 'rfai-dialog');
+      launcher.setAttribute('aria-expanded', 'false');
+      launcher.innerHTML = `
+        <span class="rfai-launcher-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" role="img" focusable="false">
+            <path d="M12 2.4l1.72 5.3a2.9 2.9 0 0 0 1.86 1.86l5.3 1.72-5.3 1.72a2.9 2.9 0 0 0-1.86 1.86L12 20.16l-1.72-5.3A2.9 2.9 0 0 0 8.42 13l-5.3-1.72 5.3-1.72a2.9 2.9 0 0 0 1.86-1.86L12 2.4Z"/>
+            <path d="M18.8 2.8l.56 1.72c.1.3.34.54.64.64l1.72.56-1.72.56c-.3.1-.54.34-.64.64l-.56 1.72-.56-1.72a1 1 0 0 0-.64-.64l-1.72-.56 1.72-.56a1 1 0 0 0 .64-.64l.56-1.72Z"/>
+          </svg>
+        </span>
+        <span>Ask AI</span>`;
+    }
 
     const dialog = document.createElement('section');
     dialog.id = 'rfai-dialog';
@@ -178,7 +181,7 @@
         <button id="rfai-submit" class="rfai-send" type="submit" aria-label="Send question">↑</button>
       </form>`;
 
-    document.body.appendChild(launcher);
+    if (!launcher.isConnected) document.body.appendChild(launcher);
     document.body.appendChild(dialog);
     return {
       launcher,

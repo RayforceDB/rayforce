@@ -74,8 +74,7 @@ markdown_extensions:
   - footnotes
   - md_in_html
   - tables
-  - toc:
-      permalink: true
+  - toc
   - pymdownx.details
   - pymdownx.superfences
   - pymdownx.tabbed:
