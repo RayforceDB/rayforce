@@ -261,11 +261,20 @@ static test_result_t test_public_vec_get_i64_date(void) {
     ray_t* v = ray_vec_new(RAY_DATE, 3);
     /* Pick three distinct int32 day values that differ in both halves so
      * a wrong-width read would catch obviously-wrong adjacent bytes. */
-    int32_t xs[] = { 0, 8766, 19724 };  /* 1970.01.01, 1994.01.01, 2024.01.01 */
+    int32_t xs[] = { 0, 8766, 19724 };  /* 2000.01.01, 2024.01.01, 2054.01.01 */
     for (int i = 0; i < 3; i++) v = ray_vec_append(v, &xs[i]);
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 0), xs[0]);
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 1), xs[1]);
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 2), xs[2]);
+
+    ray_t* epoch = ray_date(xs[0]);
+    ray_t* formatted = ray_fmt(epoch, 0);
+    TEST_ASSERT_NOT_NULL(formatted);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(formatted));
+    TEST_ASSERT_EQ_I(ray_str_len(formatted), 10);
+    TEST_ASSERT_MEM_EQ(10, ray_str_ptr(formatted), "2000.01.01");
+    ray_release(formatted);
+    ray_release(epoch);
     ray_release(v);
     PASS();
 }
@@ -277,6 +286,15 @@ static test_result_t test_public_vec_get_i64_time(void) {
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 0), xs[0]);
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 1), xs[1]);
     TEST_ASSERT_EQ_I(ray_vec_get_i64(v, 2), xs[2]);
+
+    ray_t* noon = ray_time(xs[1]);
+    ray_t* formatted = ray_fmt(noon, 0);
+    TEST_ASSERT_NOT_NULL(formatted);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(formatted));
+    TEST_ASSERT_EQ_I(ray_str_len(formatted), 12);
+    TEST_ASSERT_MEM_EQ(12, ray_str_ptr(formatted), "12:00:00.000");
+    ray_release(formatted);
+    ray_release(noon);
     ray_release(v);
     PASS();
 }
