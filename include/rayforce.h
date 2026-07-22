@@ -664,10 +664,10 @@ ray_runtime_t* ray_runtime_create_with_sym_err(const char* sym_path,
 void ray_runtime_destroy(ray_runtime_t* rt);
 
 /* Parse and evaluate a Rayfall source string against the global env.
- * Returns NULL for void / null results, an error ray_t* on failure
- * (test with RAY_IS_ERR and inspect with ray_err_code), or the result
- * value otherwise.  Caller owns the returned reference; release with
- * ray_release. */
+ * Returns RAY_NULL_OBJ for successful void / null results, an error ray_t*
+ * on failure (test with RAY_IS_ERR and inspect with ray_err_code), or the
+ * result value otherwise.  Caller owns the returned reference; release
+ * with ray_release. */
 ray_t* ray_eval_str(const char* source);
 
 ray_t* ray_select(ray_t** args, int64_t n);

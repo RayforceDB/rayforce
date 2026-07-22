@@ -66,7 +66,9 @@ bool stress_eval_exec(stress_ctx_t* c, const char* src) {
                                "not called?)");
         return false;
     }
-    ray_t* r = ray_eval_str(src);  /* NULL = void/null result, fine */
+    /* Successful void/null evaluation returns RAY_NULL_OBJ; bare NULL remains
+     * a defensive no-result fallback in this stress harness. */
+    ray_t* r = ray_eval_str(src);
     if (r && RAY_IS_ERR(r)) {
         stress_dump_failure(c, "eval error '%s' for: %.300s",
                             ray_err_code(r), src);
