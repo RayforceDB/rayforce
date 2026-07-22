@@ -629,6 +629,36 @@ static test_result_t test_public_get_error_trace_cleared_on_eval(void) {
     PASS();
 }
 
+static test_result_t test_public_nullability_matrix(void) {
+    ray_t* ordinary[] = {
+        ray_sym(0),
+        ray_str("", 0),
+        ray_bool(false),
+        ray_u8(0),
+        ray_f32(0.0f),
+    };
+    ray_t* requested_null[] = {
+        ray_typed_null(-RAY_SYM),
+        ray_typed_null(-RAY_STR),
+        ray_typed_null(-RAY_BOOL),
+        ray_typed_null(-RAY_U8),
+        ray_typed_null(-RAY_F32),
+    };
+    const bool requested_is_null[] = { false, false, true, true, true };
+
+    for (size_t i = 0; i < sizeof(ordinary) / sizeof(ordinary[0]); i++) {
+        TEST_ASSERT_NOT_NULL(ordinary[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(ordinary[i]));
+        TEST_ASSERT_FALSE(RAY_ATOM_IS_NULL(ordinary[i]));
+        TEST_ASSERT_NOT_NULL(requested_null[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(requested_null[i]));
+        TEST_ASSERT_EQ_I(RAY_ATOM_IS_NULL(requested_null[i]), requested_is_null[i]);
+        ray_release(ordinary[i]);
+        ray_release(requested_null[i]);
+    }
+    PASS();
+}
+
 const test_entry_t public_api_entries[] = {
     { "public/ipc_client_symbols",        test_public_ipc_client_symbols,        NULL, NULL },
     { "public/query_and_format_symbols",  test_public_query_and_format_symbols,  NULL, NULL },
@@ -675,6 +705,7 @@ const test_entry_t public_api_entries[] = {
     { "public/eval_restricted_allows_arith",   test_public_eval_restricted_allows_arith,   public_api_setup, public_api_teardown },
     { "public/get_error_trace_populated",      test_public_get_error_trace_populated,      public_api_setup, public_api_teardown },
     { "public/get_error_trace_cleared_on_eval",test_public_get_error_trace_cleared_on_eval,public_api_setup, public_api_teardown },
+    { "public/nullability_matrix",             test_public_nullability_matrix,             public_api_setup, public_api_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

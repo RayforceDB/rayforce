@@ -115,7 +115,7 @@ void stress_gen_row(stress_ctx_t* c, stress_sym_pattern_t pat,
                     stress_row_t* out) {
     memset(out, 0, sizeof(*out));
     if (pat == STRESS_SYMS_NULLS && (stress_rand(c) & 1)) {
-        out->ticker[0] = '\0';        /* SYM null = sym 0, the empty string */
+        out->ticker[0] = '\0';        /* ordinary empty SYM (sym 0) */
         out->price     = NULL_F64;
         out->qty       = NULL_I64;
         return;

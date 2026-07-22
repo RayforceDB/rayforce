@@ -16,7 +16,7 @@ unit:
   - test/test_str.c
   - test/rfl/integration/null.rfl
   - test/rfl/strop/split.rfl
-status: planned
+status: fixed
 class: null
 members:
   - F-0004
@@ -112,9 +112,27 @@ until triage records which semantics own SYM/STR empty values and F32.
 
 ## Remediation
 
-Planned in `audit/plans/RP-0004.md`. Execution is paused at the mandatory
-norm-ratification gate pending the human norm owner's explicit selection of
-the SYM/STR and F32 cross-surface semantics.
+The human norm owner ratified the recommended preserve-behavior matrix on
+2026-07-22. Under `audit/plans/RP-0004.md`, the public contract in
+`include/rayforce.h` now publishes the cross-surface matrix; all fifteen
+censused statements in the header, implementation comments, documentation,
+and tests now describe empty SYM/STR values and F32 consistently. The new
+`public/nullability_matrix` test in `test/test_public_api.c` pins ordinary and
+typed-null atom behavior for SYM, STR, BOOL, U8, and F32. Executable null
+representation was not changed.
+
+Self-checks completed on 2026-07-22:
+
+- The recorded class census returned seven matches, all manually classified
+  as correct counterexamples that explicitly say empty SYM values are not
+  null; it returned zero conflicting statements.
+- The ASan/UBSan debug build completed cleanly with warnings as errors.
+- The full test suite passed 3,639/3,639 with zero skips and zero failures,
+  including `public/nullability_matrix` and every touched focused area.
+- `mkdocs build --strict` completed successfully.
+- `git diff --check` reported no whitespace errors.
 
 
 ## Verification
+
+Pending independent Verifier review.

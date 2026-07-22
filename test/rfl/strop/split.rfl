@@ -1,9 +1,8 @@
 ;; Invariants for `split`.
 
 (split "a,b,c" ",") -- ["a" "b" "c"]
-;; Empty string IS the STR null, so split-of-"" yields a one-element
-;; vector whose only element is null.  Assert via nil? rather than a
-;; [0Nc] literal (parser doesn't accept that form).
+;; Empty string is an ordinary STR value, so split-of-"" yields a
+;; one-element vector whose only element is not null.
 (count (split "" ",")) -- 1
 (nil? (at (split "" ",") 0)) -- false
 (split "abc" ",") -- ["abc"]

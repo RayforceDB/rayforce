@@ -5,7 +5,7 @@
 (nil? 0Nl) -- true
 (nil? 0) -- false
 (nil? 1) -- false
-;; STR null = empty string (len 0).
+;; STR has no distinct null; "" is the ordinary empty value.
 (nil? "") -- false
 ;; nil? distinguishes typed nulls from zero-valued atoms across types
 (nil? 0Ni)   -- true

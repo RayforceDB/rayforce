@@ -1264,9 +1264,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
          * distinguishable from a real 0 (review 2.10).  Present cells get
          * overwritten in the scatter loop below; whatever remains is null.
          * par_finalize_nulls (after scatter) flips HAS_NULLS if any
-         * sentinel survives.  Non-sentinel types (SYM/STR/BOOL/U8/GUID)
-         * fall back to zero-fill: SYM id 0 is the SYM null already; the
-         * others carry no null sentinel. */
+         * sentinel survives.  Types without a dedicated initialization arm
+         * (SYM/STR/BOOL/U8/GUID) fall back to zero-fill.  For SYM/STR/BOOL/U8
+         * that is an ordinary zero/empty value and cannot represent "no
+         * data"; GUID is also zero-filled on this path. */
         switch (new_col->type) {
             case RAY_F64: {
                 double* d = (double*)ray_data(new_col);
@@ -1425,7 +1426,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
          * sentinel — either a missing cell (no source row) left as null by
          * the init above, or (F64) a value canonicalized to NULL_F64 by
          * ray_f64_fin (avg division, sum overflow).  par_finalize_nulls is
-         * a no-op for non-sentinel types (SYM/STR/BOOL/U8/GUID). */
+         * a no-op for types it does not handle (SYM/STR/BOOL/U8/GUID). */
         par_finalize_nulls(new_col);
         result = ray_table_add_col(result, col_sym, new_col);
         ray_release(new_col);
