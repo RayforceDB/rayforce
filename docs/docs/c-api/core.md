@@ -488,7 +488,7 @@ Macro. Tests whether a `ray_t*` is an error object. Safe to call on `NULL`. Retu
 ray_t* result = ray_execute(g, root);
 if (RAY_IS_ERR(result)) {
     printf("Error: %s\n", ray_err_code(result));
-    ray_release(result);
+    ray_error_free(result);
     return 1;
 }
 ```

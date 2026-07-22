@@ -372,7 +372,7 @@ ray_t* ray_execute(ray_graph_t* g, ray_op_t* root);
 ray_t* result = ray_execute(g, ray_optimize(g, root));
 if (RAY_IS_ERR(result)) {
     /* handle error */
-    ray_release(result);
+    ray_error_free(result);
 }
 ```
 

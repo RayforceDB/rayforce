@@ -7,7 +7,7 @@ unit:
   - docs/docs/c-api/core.md
   - docs/docs/c-api/dag.md
   - test/test_public_api.c
-status: reported
+status: fixed
 class: null
 members:
   - F-0002
@@ -50,6 +50,19 @@ Four instances meet the project threshold of three.
 
 ## Validation
 
+Re-ran the recorded census on 2026-07-22:
+
+```sh
+rg -n -C 12 'ray_release\((result|err)\)' docs/docs/c-api test/test_public_api.c
+```
+
+All four recorded instances remain eligible: each value is proved to be a
+`RAY_ERROR` before cleanup. `include/rayforce.h` documents
+`ray_error_free` as the owned-error cleanup and `src/mem/cow.c` confirms that
+`ray_release` deliberately returns without freeing errors. The trace returned
+by `ray_get_error_trace` is separately owned by the VM, so freeing the error
+result does not invalidate either public trace test.
+
 
 ## Root cause
 
@@ -65,5 +78,22 @@ require zero public-contract instances.
 
 ## Remediation
 
+Planned in `audit/plans/RP-0002.md` using the accepted rung-(a) global
+strategy. No ownership norm changes or conflicts require ratification.
+
+Replaced all four eligible cleanup calls with `ray_error_free`: the
+`RAY_IS_ERR` examples in `docs/docs/c-api/core.md` and
+`docs/docs/c-api/dag.md`, plus both error-trace cases in
+`test/test_public_api.c`.
+
+Self-checks completed on 2026-07-22:
+
+- The recorded census returned only three success-path `ray_release(result)`
+  calls guarded by `!RAY_IS_ERR`; zero eligible class instances remain.
+- `make test` passed 3638 of 3638 tests with 0 skipped and 0 failed.
+- `mkdocs build --strict` completed successfully.
+
 
 ## Verification
+
+Pending independent Verifier review.

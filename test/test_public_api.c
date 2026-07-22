@@ -607,7 +607,7 @@ static test_result_t test_public_get_error_trace_populated(void) {
     TEST_ASSERT_EQ_I(frame0->type, RAY_LIST);
     TEST_ASSERT_EQ_I(ray_len(frame0), 4);
 
-    ray_release(err);
+    ray_error_free(err);
     PASS();
 }
 
@@ -619,7 +619,7 @@ static test_result_t test_public_get_error_trace_cleared_on_eval(void) {
     ray_t* err = ray_eval_str("(boom2 \"x\")");
     TEST_ASSERT_TRUE(RAY_IS_ERR(err));
     TEST_ASSERT_NOT_NULL(ray_get_error_trace());
-    ray_release(err);
+    ray_error_free(err);
 
     ray_t* ok = ray_eval_str("(+ 10 20)");
     TEST_ASSERT_NOT_NULL(ok);
