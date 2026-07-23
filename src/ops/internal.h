@@ -45,6 +45,17 @@
 #include "vec/str.h"
 #include "vec/vec.h"
 #include <string.h>
+
+/* True when a data-parallel dispatch is both worthwhile AND safe: a live
+ * pool with background workers (at -c 1 the pool exists with n_workers==0),
+ * enough elements to amortize task overhead, and NOT already inside an
+ * in-flight dispatch — ray_pool_dispatch/_n are single-producer, so a
+ * nested dispatch from a worker thread would corrupt the task ring
+ * (ray_parallel_flag is raised for the duration of a dispatch). */
+static inline bool ray_par_dispatch_ok(ray_pool_t* p, int64_t n) {
+    return p && p->n_workers > 0 && n >= RAY_PARALLEL_THRESHOLD &&
+           atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) == 0;
+}
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1085,6 +1096,13 @@ ray_t* desc_vec_eager(ray_t* x);
                               * a per-slot non-null count (off_nn) for the divisor and
                               * all-null → typed-null finalization. */
 #define GHT_AF2_TRUTHY   2u  /* OP_ALL/OP_ANY: off_sum stores truthy count */
+#define GHT_AF2_Y_NULLABLE 4u /* binary agg whose y-side column advertises
+                               * HAS_NULLS: the null-aware accumulators skip
+                               * the whole (x,y) pair when y is null, matching
+                               * the scalar reducer, the v2 engine and the DA
+                               * path (pair-skip contract).  Entry packing
+                               * canonicalizes int y nulls (NaN in F64-packed
+                               * entries, NULL_I64 in int-packed ones). */
 /* key_flags bits */
 #define GHT_KEYF_WIDE       1u  /* key does not fit in 8 B (RAY_GUID / RAY_STR) */
 #define GHT_KEYF_INLINE_STR 2u  /* key stores a 16 B ray_str_t descriptor inline */

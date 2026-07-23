@@ -47,6 +47,35 @@ static inline double group_fp_at(const void* data, int8_t t, int64_t row) {
                         : (double)((const float*)data)[row];
 }
 
+/* Pack an INTEGER agg cell into an entry's F64 slot (binary aggs whose
+ * paired side is FP force GHT_AF_F64 on both slots).  A declared null
+ * (HAS_NULLS + the type's sentinel) canonicalizes to NaN — the only null
+ * encoding agg_entry_is_null and the y-side pair-skip can see in an F64
+ * slot; a raw (double)sentinel cast would read as a huge finite value.
+ * FP cells go through group_fp_at directly: their nulls are NaN already. */
+static inline double group_pack_i64_as_f64(ray_t* col, int64_t row) {
+    int64_t v = read_col_i64(ray_data(col), row, col->type, col->attrs);
+    ray_t* src = (col->attrs & RAY_ATTR_SLICE) ? col->slice_parent : col;
+    if (src && (src->attrs & RAY_ATTR_HAS_NULLS)) {
+        int64_t sent = agg_int_null_sentinel_for(col->type);
+        if (sent != 0 && v == sent) return (double)NAN;
+    }
+    return (double)v;
+}
+
+/* Pack the y-side cell of an int×int binary agg (entry keeps i64 slots).
+ * Declared nulls canonicalize to NULL_I64 regardless of the source width so
+ * the accumulator's pair-skip needs no per-agg y-side sentinel plumbing. */
+static inline int64_t group_pack_y_i64(ray_t* col, int64_t row) {
+    int64_t v = read_col_i64(ray_data(col), row, col->type, col->attrs);
+    ray_t* src = (col->attrs & RAY_ATTR_SLICE) ? col->slice_parent : col;
+    if (src && (src->attrs & RAY_ATTR_HAS_NULLS)) {
+        int64_t sent = agg_int_null_sentinel_for(col->type);
+        if (sent != 0 && v == sent) return NULL_I64;
+    }
+    return v;
+}
+
 /* Monotonic count of exec_group_per_partition entries (the streaming parted
  * GROUP kernel).  Bumped ONCE at the kernel entry — O(1) per query, never
  * per-row, so it does not violate the "instrumentation never costs O(data)"
@@ -3019,6 +3048,19 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                 out->any_agg_null = 1;
             }
         }
+        /* Binary agg with a nullable y-side: route the layout to the
+         * null-aware accumulators and mark the pair for y pair-skip (the
+         * scalar reducer, v2 engine and DA path all skip the pair when
+         * either side is null — truth_weighted_stats.rfl asserts it). */
+        if (vslot >= 0 && agg_ops && agg_is_binary_agg(agg_ops[a]) &&
+            agg_vecs2 && agg_vecs2[a]) {
+            ray_t* ysrc = (agg_vecs2[a]->attrs & RAY_ATTR_SLICE)
+                          ? agg_vecs2[a]->slice_parent : agg_vecs2[a];
+            if (ysrc && (ysrc->attrs & RAY_ATTR_HAS_NULLS)) {
+                af2 |= GHT_AF2_Y_NULLABLE;
+                out->any_agg_null = 1;
+            }
+        }
         out->agg_flags2[a] = af2;
         out->agg_null_sentinel[a] = sent;
     }
@@ -3702,6 +3744,20 @@ static void accum_from_entry_nullable(char* row, const char* entry,
         uint8_t af = aflags[a];
         if (agg_entry_is_null(af, aflags2[a], asent[a], val))
             continue;                     /* null: no accumulate, no nn++ */
+        /* Binary-agg pair-skip: a declared-null y voids the whole (x,y)
+         * pair — no nn++, no Σx — matching the scalar reducer, the v2
+         * engine and the DA path (contract: (wsum [1 0N 3] [10 20 0N]) is
+         * 10.0).  Entry packing canonicalizes y nulls: NaN in F64-packed
+         * entries (incl. int y beside an FP x), NULL_I64 in int×int ones. */
+        if ((af & GHT_AF_BINARY) && (aflags2[a] & GHT_AF2_Y_NULLABLE)) {
+            if (af & GHT_AF_F64) {
+                double y; memcpy(&y, agg_data + (s + 1) * 8, 8);
+                if (y != y) continue;
+            } else {
+                int64_t yi; memcpy(&yi, agg_data + (s + 1) * 8, 8);
+                if (yi == NULL_I64) continue;
+            }
+        }
         nn[s]++;
         if (af & GHT_AF_F64) {
             double v; memcpy(&v, val, 8);
@@ -4062,7 +4118,7 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
             else if (af & GHT_AF_F64) {
                 double v = group_fp_type(ac->type)
                     ? group_fp_at(ray_data(ac), ac->type, row)
-                    : (double)read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
+                    : group_pack_i64_as_f64(ac, row);
                 memcpy(&ev[vi], &v, sizeof(v));
             }
             else
@@ -4074,11 +4130,11 @@ void group_rows_range(group_ht_t* ht, void** key_data, int8_t* key_types,
                 if (af & GHT_AF_F64) {
                     double v = group_fp_type(ay->type)
                         ? group_fp_at(ray_data(ay), ay->type, row)
-                        : (double)read_col_i64(ray_data(ay), row, ay->type, ay->attrs);
+                        : group_pack_i64_as_f64(ay, row);
                     memcpy(&ev[vi], &v, sizeof(v));
                 }
                 else
-                    ev[vi] = read_col_i64(ray_data(ay), row, ay->type, ay->attrs);
+                    ev[vi] = group_pack_y_i64(ay, row);
                 vi++;
             }
         }
@@ -4287,7 +4343,7 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
             else if (af & GHT_AF_F64) {
                 double v = group_fp_type(ac->type)
                     ? group_fp_at(ray_data(ac), ac->type, row)
-                    : (double)read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
+                    : group_pack_i64_as_f64(ac, row);
                 memcpy(&agg_vals[vi], &v, sizeof(v));
             }
             else
@@ -4303,11 +4359,11 @@ static void radix_phase1_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 if (af & GHT_AF_F64) {
                     double v = group_fp_type(ay->type)
                         ? group_fp_at(ray_data(ay), ay->type, row)
-                        : (double)read_col_i64(ray_data(ay), row, ay->type, ay->attrs);
+                        : group_pack_i64_as_f64(ay, row);
                     memcpy(&agg_vals[vi], &v, sizeof(v));
                 }
                 else
-                    agg_vals[vi] = read_col_i64(ray_data(ay), row, ay->type, ay->attrs);
+                    agg_vals[vi] = group_pack_y_i64(ay, row);
                 vi++;
             }
         }
@@ -4532,15 +4588,20 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                              *       sqrt((n·Σx² − Σx²)(n·Σy² − Σy²))
                              * Undefined for n<2 or constant side → emit
                              * NaN (canonicalize folds to null upstream). */
-                            if ((op == OP_PEARSON_CORR || op == OP_SCOV) && cnt < 2) { v = 0.0; grp_set_null(ao->vec, di); break; }
-                            if ((op == OP_COV || op == OP_WAVG) && cnt < 1) { v = 0.0; grp_set_null(ao->vec, di); break; }
+                            if ((op == OP_PEARSON_CORR || op == OP_SCOV) && nn < 2) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
+                            if ((op == OP_COV || op == OP_WAVG) && nn < 1) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
                             double sx  = sf ? ROW_RD_F64(row, ly->off_sum,    s)
                                             : (double)ROW_RD_I64(row, ly->off_sum, s);
                             double sxx = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
                             double sy  = ly->off_sum_y   ? ROW_RD_F64(row, ly->off_sum_y,   s) : 0.0;
                             double syy = ly->off_sumsq_y ? ROW_RD_F64(row, ly->off_sumsq_y, s) : 0.0;
                             double sxy = ly->off_sumxy   ? ROW_RD_F64(row, ly->off_sumxy,   s) : 0.0;
-                            double dn  = (double)cnt;
+                            /* Divisor = number of accumulated (x,y) pairs — the
+                             * per-slot non-null count on nullable layouts (a
+                             * null on EITHER side pair-skips), the group row
+                             * count otherwise.  cnt here would overcount and
+                             * skew pearson/cov whenever the group has nulls. */
+                            double dn  = (double)nn;
                             double num = dn * sxy - sx * sy;
                             double dx  = dn * sxx - sx * sx;
                             double dy  = dn * syy - sy * sy;
@@ -4847,7 +4908,7 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                 else if (af & GHT_AF_F64) {
                     double v = group_fp_type(ac->type)
                         ? group_fp_at(ray_data(ac), ac->type, row)
-                        : (double)read_col_i64(ray_data(ac), row, ac->type, ac->attrs);
+                        : group_pack_i64_as_f64(ac, row);
                     memcpy(&ev[vi], &v, sizeof(v));
                 }
                 else
@@ -4858,11 +4919,11 @@ static void radix_v2_phase1_fn(void* ctx, uint32_t worker_id,
                     if (af & GHT_AF_F64) {
                         double v = group_fp_type(ay->type)
                             ? group_fp_at(ray_data(ay), ay->type, row)
-                            : (double)read_col_i64(ray_data(ay), row, ay->type, ay->attrs);
+                            : group_pack_i64_as_f64(ay, row);
                         memcpy(&ev[vi], &v, sizeof(v));
                     }
                     else
-                        ev[vi] = read_col_i64(ray_data(ay), row, ay->type, ay->attrs);
+                        ev[vi] = group_pack_y_i64(ay, row);
                     vi++;
                 }
             }
@@ -5356,7 +5417,6 @@ typedef struct {
     ray_t**        agg_cols;
     void**         agg_ptrs2;    /* y-side data pointers for binary aggs [n_aggs], NULL entries otherwise */
     int8_t*        agg_types2;   /* y-side type codes [n_aggs] */
-    uint64_t       agg_pair_mask;/* bit a set if agg[a] is a binary (PEARSON/COV/WAVG/WSUM) agg */
     uint8_t*       agg_strlen;
     agg_prod_t*    agg_prod;     /* fused SUM/AVG(a*b) slots (may be NULL) */
     uint16_t*      agg_ops;      /* per-agg operation code */
@@ -9605,6 +9665,11 @@ da_path:;
             if (agg_is_binary_agg(aop)) {
                 ray_t* yv2 = (agg_vecs2 ? agg_vecs2[a] : NULL);
                 if (!yv2) { da_eligible = false; }
+                else if (yv2->len < n_scan) {
+                    /* Short y (e.g. an OP_CONST vector literal): da_accum_row
+                     * indexes y by absolute row — would read out of bounds. */
+                    da_eligible = false;
+                }
                 else {
                     int8_t t2 = yv2->type;
                     bool y_fp  = group_fp_type(t2);
@@ -9786,7 +9851,6 @@ da_path:;
             int8_t agg_types[vla_aggs];
             void* agg_ptrs2[vla_aggs];   /* y-side for binary aggs (else NULL) */
             int8_t agg_types2[vla_aggs];
-            uint64_t agg_pair_mask = 0;  /* bit a set if agg[a] is binary */
             int64_t da_int_null_sentinel[vla_aggs];
             uint64_t agg_f64_mask = 0;
             uint64_t da_int_null_mask = 0;
@@ -9805,7 +9869,6 @@ da_path:;
                 if (agg_is_binary_agg(ext->agg_ops[a]) && agg_vecs2 && agg_vecs2[a]) {
                     agg_ptrs2[a]  = ray_data(agg_vecs2[a]);
                     agg_types2[a] = agg_vecs2[a]->type;
-                    agg_pair_mask |= ((uint64_t)1 << a);
                     if (group_fp_type(agg_vecs2[a]->type) &&
                         (agg_vecs2[a]->attrs & RAY_ATTR_HAS_NULLS))
                         da_any_nullable = true;
@@ -9977,7 +10040,6 @@ da_path:;
                 .agg_ptrs    = agg_ptrs,
                 .agg_ptrs2   = agg_ptrs2,
                 .agg_types2  = agg_types2,
-                .agg_pair_mask = agg_pair_mask,
                 .agg_types   = agg_types,
                 .agg_cols    = agg_vecs,
                 .agg_strlen  = agg_strlen,
@@ -12296,15 +12358,17 @@ sequential_fallback:;
                     case OP_SCOV:
                     case OP_WSUM:
                     case OP_WAVG: {
-                        if ((agg_op == OP_PEARSON_CORR || agg_op == OP_SCOV) && cnt < 2) { v = 0.0; ray_vec_set_null(new_col, gi, true); break; }
-                        if ((agg_op == OP_COV || agg_op == OP_WAVG) && cnt < 1) { v = 0.0; ray_vec_set_null(new_col, gi, true); break; }
+                        if ((agg_op == OP_PEARSON_CORR || agg_op == OP_SCOV) && nn < 2) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
+                        if ((agg_op == OP_COV || agg_op == OP_WAVG) && nn < 1) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         double sx  = is_f64 ? ROW_RD_F64(row, ly->off_sum,    s)
                                             : (double)ROW_RD_I64(row, ly->off_sum, s);
                         double sxx = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
                         double sy  = ly->off_sum_y   ? ROW_RD_F64(row, ly->off_sum_y,   s) : 0.0;
                         double syy = ly->off_sumsq_y ? ROW_RD_F64(row, ly->off_sumsq_y, s) : 0.0;
                         double sxy = ly->off_sumxy   ? ROW_RD_F64(row, ly->off_sumxy,   s) : 0.0;
-                        double dn  = (double)cnt;
+                        /* Divisor = number of accumulated (x,y) pairs (see the
+                         * radix emitter): nn on nullable layouts, cnt otherwise. */
+                        double dn  = (double)nn;
                         double num = dn * sxy - sx * sy;
                         double dx  = dn * sxx - sx * sx;
                         double dy  = dn * syy - sy * sy;
