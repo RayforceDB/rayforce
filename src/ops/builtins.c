@@ -953,7 +953,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         case RAY_I16:   CL(int16_t,  int64_t, (int64_t)_v);
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                         CL(int32_t,  int64_t, (int64_t)_v);
-        case RAY_F64:   CL(double,   int64_t, (int64_t)_v);
+        case RAY_F64:   CL(double,   int64_t, ray_cast_f64_to_i64_null(_v));
         }
         break;
     case RAY_I32: case RAY_DATE: case RAY_TIME:
@@ -963,7 +963,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         case RAY_I16:   CL(int16_t,  int32_t, (int32_t)_v);
         case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  int32_t, (int32_t)_v);
-        case RAY_F64:   CL(double,   int32_t, (int32_t)_v);
+        case RAY_F64:   CL(double,   int32_t, ray_cast_f64_to_i32_null(_v));
         }
         break;
     case RAY_I16:
@@ -974,7 +974,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
                         CL(int32_t,  int16_t, (int16_t)_v);
         case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  int16_t, (int16_t)_v);
-        case RAY_F64:   CL(double,   int16_t, (int16_t)_v);
+        case RAY_F64:   CL(double,   int16_t, ray_cast_f64_to_i16_null(_v));
         }
         break;
     case RAY_U8:
@@ -985,7 +985,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
                         CL(int32_t,  uint8_t, (uint8_t)_v);
         case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  uint8_t, (uint8_t)_v);
-        case RAY_F64:   CL(double,   uint8_t, (uint8_t)_v);
+        case RAY_F64:   CL(double,   uint8_t, ray_cast_f64_to_u8_null(_v));
         }
         break;
     case RAY_F64:
@@ -1007,7 +1007,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
                         CL(int32_t,  uint8_t, _v != 0 ? 1 : 0);
         case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  uint8_t, _v != 0 ? 1 : 0);
-        case RAY_F64:   CL(double,   uint8_t, _v != 0.0 ? 1 : 0);
+        case RAY_F64:   CL(double,   uint8_t, ray_cast_f64_to_bool_null(_v));
         }
         break;
     }

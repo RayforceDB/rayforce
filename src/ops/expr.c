@@ -29,17 +29,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Truthiness for the integer AND/OR fallback lane.  `LV_READ`/`RV_READ` widen
+ * integer operands to double, so do not try to recognize null sentinels here:
+ * valid I64 values near NULL_I64 collapse to the same binary64 value.  The
+ * caller's null post-pass clears true null rows; this helper only avoids the
+ * old UB-prone cast-to-uint8_t truthiness and tests non-zero values. */
+static inline uint8_t truthy_intish(double v) {
+    return v != 0.0 ? 1 : 0;
+}
+
+static inline uint8_t truthy_f64ish(double v) {
+    return (v == v && v != 0.0) ? 1 : 0;
+}
+
 static bool atom_to_numeric(ray_t* atom, double* out_f, int64_t* out_i, bool* out_is_f64) {
     if (!atom || !ray_is_atom(atom)) return false;
     switch (atom->type) {
         case -RAY_F64:
             *out_f = atom->f64;
-            *out_i = (int64_t)atom->f64;
+            *out_i = ray_cast_f64_to_i64_null(atom->f64);
             *out_is_f64 = true;
             return true;
         case -RAY_F32:
             *out_f = (double)(float)atom->f64;
-            *out_i = (int64_t)(float)atom->f64;
+            *out_i = ray_cast_f64_to_i64_null((double)(float)atom->f64);
             *out_is_f64 = true;
             return true;
         case -RAY_I64:
@@ -132,7 +145,7 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
         }
         r = ray_f64_fin(r);
         *out_f = r;
-        *out_i = (int64_t)r;
+        *out_i = ray_cast_f64_to_i64_null(r);
         *out_is_f64 = true;
         return true;
     }
@@ -168,7 +181,7 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
          * (div/mod by zero → NaN, overflow → ±Inf) canonicalizes to NULL_F64. */
         r = ray_f64_fin(r);
         *out_f = r;
-        *out_i = (int64_t)r;
+        *out_i = ray_cast_f64_to_i64_null(r);
         *out_is_f64 = true;
         return true;
     }
@@ -1358,15 +1371,10 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
              * non-null i64 — so a saturated cast stays a real value. */
             if (null_aware)
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] != a[j]) ? NULL_I64
-                         : (a[j] >= (double)INT64_MAX) ? INT64_MAX
-                         : (a[j] <= (double)INT64_MIN) ? (INT64_MIN + 1)
-                         : (int64_t)a[j];
+                    d[j] = ray_cast_f64_to_i64_null(a[j]);
             else
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] >= (double)INT64_MAX) ? INT64_MAX
-                         : (a[j] <= (double)INT64_MIN) ? (INT64_MIN + 1)
-                         : (int64_t)a[j];
+                    d[j] = ray_cast_f64_to_i64_null(a[j]);
         }
     } else if (dt == RAY_BOOL) {
         uint8_t* d = (uint8_t*)dp;
@@ -1431,9 +1439,9 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
             const double* a = (const double*)ap;
             if (null_aware)
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] != a[j]) ? NULL_I32 : (int32_t)a[j];
+                    d[j] = ray_cast_f64_to_i32_null(a[j]);
             else
-                for (int64_t j = 0; j < n; j++) d[j] = (int32_t)a[j];
+                for (int64_t j = 0; j < n; j++) d[j] = ray_cast_f64_to_i32_null(a[j]);
         } else {
             const int64_t* a = (const int64_t*)ap;
             if (null_aware)
@@ -1457,9 +1465,9 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
             const double* a = (const double*)ap;
             if (null_aware)
                 for (int64_t j = 0; j < n; j++)
-                    d[j] = (a[j] != a[j]) ? NULL_I16 : (int16_t)a[j];
+                    d[j] = ray_cast_f64_to_i16_null(a[j]);
             else
-                for (int64_t j = 0; j < n; j++) d[j] = (int16_t)a[j];
+                for (int64_t j = 0; j < n; j++) d[j] = ray_cast_f64_to_i16_null(a[j]);
         } else {
             const int64_t* a = (const int64_t*)ap;
             if (null_aware)
@@ -1472,7 +1480,7 @@ static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void*
         uint8_t* d = (uint8_t*)dp;
         if (t1 == RAY_F64) {
             const double* a = (const double*)ap;
-            for (int64_t j = 0; j < n; j++) d[j] = (uint8_t)a[j];
+            for (int64_t j = 0; j < n; j++) d[j] = ray_cast_f64_to_u8_null(a[j]);
         } else {
             const int64_t* a = (const int64_t*)ap;
             for (int64_t j = 0; j < n; j++) d[j] = (uint8_t)a[j];
@@ -2509,7 +2517,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                 case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = (int64_t)ceil(src[i]); break;
                 case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)floor(src[i]); break;
                 case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)round(src[i]); break;
-                default:       for (int64_t i=0;i<n;i++) dst[i] = (int64_t)src[i]; break;
+                default:       for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(src[i]); break;
             }
             out_off += n;
         }
@@ -2720,7 +2728,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     int64_t n = m.morsel_len;
                     double* src = (double*)m.morsel_ptr;
                     int32_t* dst = (int32_t*)((char*)ray_data(result) + out_off * sizeof(int32_t));
-                    for (int64_t i = 0; i < n; i++) dst[i] = (int32_t)src[i];
+                    for (int64_t i = 0; i < n; i++) dst[i] = ray_cast_f64_to_i32_null(src[i]);
                     out_off += n;
                 }
             } else if (out_type == RAY_I16) {
@@ -2728,7 +2736,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                     int64_t n = m.morsel_len;
                     double* src = (double*)m.morsel_ptr;
                     int16_t* dst = (int16_t*)((char*)ray_data(result) + out_off * sizeof(int16_t));
-                    for (int64_t i = 0; i < n; i++) dst[i] = (int16_t)src[i];
+                    for (int64_t i = 0; i < n; i++) dst[i] = ray_cast_f64_to_i16_null(src[i]);
                     out_off += n;
                 }
             } else if (out_type == RAY_U8 || out_type == RAY_BOOL) {
@@ -2741,9 +2749,9 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                          * `NaN != 0.0` is true so add an explicit
                          * `src[i] == src[i]` to filter NaN to false. */
                         for (int64_t i = 0; i < n; i++)
-                            dst[i] = (src[i] != 0.0 && src[i] == src[i]) ? 1 : 0;
+                            dst[i] = ray_cast_f64_to_bool_null(src[i]);
                     else
-                        for (int64_t i = 0; i < n; i++) dst[i] = (uint8_t)src[i];
+                        for (int64_t i = 0; i < n; i++) dst[i] = ray_cast_f64_to_u8_null(src[i]);
                     out_off += n;
                 }
             }
@@ -3222,7 +3230,10 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     } else if (out_type == RAY_BOOL) {
         uint8_t* odst = (uint8_t*)dst;
         if (src_is_i64_all) {
-            /* Integer-family operands: compare as int64 */
+            /* Integer-family operands: compare as int64.  AND/OR truthiness
+             * only tests zero here; fix_null_comparisons clears true null rows
+             * after the range kernel without relying on lossy I64->double
+             * sentinel recognition. */
             switch (op->opcode) {
                 case OP_EQ:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li==ri;}break;
                 case OP_NE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li!=ri;}break;
@@ -3230,8 +3241,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
                 case OP_LE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li<=ri;}break;
                 case OP_GT:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li>ri;}break;
                 case OP_GE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li>=ri;}break;
-                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li&&ri;}break;
-                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li||ri;}break;
+                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=truthy_intish(LV_READ(i)),ri=truthy_intish(RV_READ(i));odst[i]=li&&ri;}break;
+                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=truthy_intish(LV_READ(i)),ri=truthy_intish(RV_READ(i));odst[i]=li||ri;}break;
                 default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
             }
         } else {
@@ -3243,8 +3254,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
                 case OP_LE:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?1:ln?1:rn?0:lv<=rv;}break;
                 case OP_GT:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?0:rn?1:ln?0:lv>rv;}break;
                 case OP_GE:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?1:rn?1:ln?0:lv>=rv;}break;
-                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li&&ri;}break;
-                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li||ri;}break;
+                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=truthy_f64ish(LV_READ(i)),ri=truthy_f64ish(RV_READ(i));odst[i]=li&&ri;}break;
+                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=truthy_f64ish(LV_READ(i)),ri=truthy_f64ish(RV_READ(i));odst[i]=li||ri;}break;
                 default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
             }
         }
