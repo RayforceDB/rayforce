@@ -1,0 +1,50 @@
+;; Pool-parallel fast paths over a >RAY_PARALLEL_THRESHOLD (65536) input.
+;; The test harness runs with RAYFORCE_CORES=2, so the pool has a background
+;; worker and every gate below takes the PARALLEL branch:
+;;   - ray_where_fn        (3-phase chunk compaction, builtins.c)
+;;   - gather_by_idx       (at col idx, eval.c)
+;;   - exec_filter         (bitmap -> match_idx, filter.c)
+;;   - sel_compact         (rowsel -> match_idx, filter.c)
+;;   - exec_if_eager       (elementwise fill incl. SYM LUT warm-up, pivot.c)
+;; Every expected value is analytic (closed-form over til N), so any
+;; parallel-path divergence from the sequential semantics fails loudly.
+
+(set N 200000)
+(set I (til N))
+(set V (as 'F64 (til N)))
+(set T (table [i v s] (list (til N) (as 'F64 (til N)) (take ['a 'b 'c 'd] N))))
+
+;; -- where builtin: matches at 0, 1000, ..., 199000 --
+(set W (where (== (% I 1000) 0)))
+(count W) -- 200
+(at W 0) -- 0
+(at W 199) -- 199000
+(sum W) -- 19900000
+
+;; -- gather by index over the where result --
+(sum (at V W)) -- 19900000.0
+(at (at V W) 199) -- 199000.0
+
+;; -- select + where (exec_filter / sel_compact): range predicate --
+(set R1 (select {sv: (sum v) cnt: (count v) from: T where: (< i 150000)}))
+(at (at R1 'sv) 0) -- 11249925000.0
+(at (at R1 'cnt) 0) -- 150000
+
+;; -- select + where: in-list SYM predicate (rows with s in [a b] = i%4 in {0,1}) --
+(set R2 (select {sv: (sum v) cnt: (count v) from: T where: (in s ['a 'b])}))
+(at (at R2 'sv) 0) -- 9999850000.0
+(at (at R2 'cnt) 0) -- 100000
+
+;; -- OP_IF eager fill, numeric out (scan/const trivial branches) --
+(set R3 (select {x: (if (< i 100000) v 0.0) from: T}))
+(count (at R3 'x)) -- 200000
+(sum (at R3 'x)) -- 4999950000.0
+(at (at R3 'x) 99999) -- 99999.0
+(at (at R3 'x) 100000) -- 0.0
+
+;; -- OP_IF eager fill, SYM out (exercises the serial LUT warm-up before
+;;    the parallel dispatch) --
+(set R4 (select {y: (if (< i 100000) s '__z) from: T}))
+(count (where (== (at R4 'y) '__z))) -- 100000
+(at (at R4 'y) 0) -- 'a
+(at (at R4 'y) 199999) -- '__z

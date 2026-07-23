@@ -258,7 +258,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
      * pred, small input) keeps the sequential morsel sweep. */
     ray_pool_t* fidx_pool = ray_pool_get();
     const int64_t fidx_rows = pred->len;   /* == table nrows for table input */
-    bool fidx_par = ray_par_dispatch_ok(fidx_pool, fidx_rows) &&
+    bool fidx_par = ray_pool_par_dispatch_ok(fidx_pool, fidx_rows, RAY_PARALLEL_THRESHOLD) &&
                     pred->type == RAY_BOOL && !ray_is_lazy(pred);
     ray_t* fidx_hdr = NULL;
     fidx_ctx_t fidx = { .bits = NULL, .nrows = 0, .chunk_rows = FIDX_CHUNK_ROWS,
@@ -275,7 +275,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
          * grow the ring (its clamp-on-grow-failure silently DROPS tasks,
          * which here would leave uninitialized prefix entries and cause
          * out-of-bounds fill offsets).  1024 tasks is ample granularity. */
-        while ((fidx.nrows + fidx.chunk_rows - 1) / fidx.chunk_rows > 1024)
+        while ((fidx.nrows + fidx.chunk_rows - 1) / fidx.chunk_rows > RAY_POOL_INIT_TASKS)
             fidx.chunk_rows *= 2;
         fidx_n_chunks = (fidx.nrows + fidx.chunk_rows - 1) / fidx.chunk_rows;
         fidx.chunk_counts = (int64_t*)scratch_alloc(&fidx_hdr,
@@ -734,7 +734,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         uint32_t n_segs = meta->n_segs;
         ray_pool_t* sc_pool = ray_pool_get();
         ray_t* soff_hdr = NULL;
-        int64_t* seg_out = ray_par_dispatch_ok(sc_pool, nrows)
+        int64_t* seg_out = ray_pool_par_dispatch_ok(sc_pool, nrows, RAY_PARALLEL_THRESHOLD)
             ? (int64_t*)scratch_alloc(&soff_hdr, (size_t)n_segs * sizeof(int64_t))
             : NULL;
         if (seg_out) {
@@ -754,7 +754,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
              * rows).  Chunk count capped at 1024 = the pool's initial ring
              * capacity, so the ring never needs to grow (see exec_filter). */
             uint32_t spc = 64;
-            while ((n_segs + spc - 1) / spc > 1024) spc *= 2;
+            while ((n_segs + spc - 1) / spc > RAY_POOL_INIT_TASKS) spc *= 2;
             uint32_t sc_chunks = (n_segs + spc - 1) / spc;
             scidx_ctx_t sc = {
                 .flags = flags, .offsets = offsets, .idx = idx,

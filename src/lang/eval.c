@@ -1437,15 +1437,11 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
  * writes within a shared word would race across range boundaries).
  *
  * gather_by_idx is a LEAF utility with 35+ call sites; unlike op-level
- * dispatch points it cannot know its execution context, so the parallel
- * path additionally requires no dispatch in flight (ray_parallel_flag) —
- * ray_pool_dispatch is single-producer, and a nested dispatch from a
- * worker would corrupt the task ring. */
-extern _Atomic(uint32_t) ray_parallel_flag;   /* core/platform.h */
-
+ * dispatch points it cannot know its execution context — the shared
+ * ray_pool_par_dispatch_ok reentrancy check (core/pool.h) is what makes
+ * dispatching from here safe. */
 static inline bool gbi_par_ok(ray_pool_t* p, int64_t n) {
-    return p && p->n_workers > 0 && n >= RAY_PARALLEL_THRESHOLD &&
-           atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) == 0;
+    return ray_pool_par_dispatch_ok(p, n, RAY_PARALLEL_THRESHOLD);
 }
 
 typedef struct {

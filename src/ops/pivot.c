@@ -466,7 +466,11 @@ static bool if_type_eager_ok(int8_t bt, int8_t out) {
     if (out == RAY_SYM)
         return b == RAY_SYM || bt == -RAY_STR;
     switch (b) {
-        case RAY_F64: case RAY_F32: case RAY_I64: case RAY_I32: case RAY_I16:
+        /* No RAY_F32: if_fill_range has no F32 fill case, so an F32 branch
+         * must stay on the selected path (unreachable today — kept off the
+         * whitelist so a future if_lazy_supported_type change cannot route
+         * it to an unwritten result buffer). */
+        case RAY_F64: case RAY_I64: case RAY_I32: case RAY_I16:
         case RAY_U8: case RAY_BOOL:
         case RAY_TIMESTAMP: case RAY_TIME: case RAY_DATE:
             return true;
@@ -816,7 +820,7 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         }
 
         ray_pool_t* pool = ray_pool_get();
-        bool par = ray_par_dispatch_ok(pool, len);
+        bool par = ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD);
         if (par && out_type == RAY_SYM) {
             /* Vector STR sides intern per element — serial only.  Non-STR
              * vector sides must be SYM columns; warm each non-runtime
