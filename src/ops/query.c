@@ -11380,9 +11380,9 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     for (int64_t r = 0; r < nrows; r++) {
                         if (!mask[r]) continue;
                         if (ct == RAY_I64 && expr_type == RAY_F64)
-                            ((int64_t*)ray_data(new_col))[r] = (int64_t)((double*)ray_data(expr_vec))[r];
+                            ((int64_t*)ray_data(new_col))[r] = ray_cast_f64_to_i64_null(((double*)ray_data(expr_vec))[r]);
                         else if (ct == RAY_I32 && expr_type == RAY_F64)
-                            ((int32_t*)ray_data(new_col))[r] = (int32_t)((double*)ray_data(expr_vec))[r];
+                            ((int32_t*)ray_data(new_col))[r] = ray_cast_f64_to_i32_null(((double*)ray_data(expr_vec))[r]);
                         else if (ct == RAY_F64 && expr_type == RAY_I64)
                             ((double*)ray_data(new_col))[r] = (double)((int64_t*)ray_data(expr_vec))[r];
                     }

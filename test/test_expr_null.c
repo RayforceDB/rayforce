@@ -24,10 +24,12 @@
 /* test/test_expr_null.c — null-aware fused expression tests */
 #include "test.h"
 #include <rayforce.h>
+#include "core/types.h"
 #include "ops/ops.h"
 #include "ops/internal.h"
 #include "mem/heap.h"
 #include "table/sym.h"
+#include <limits.h>
 #include <string.h>
 #include <math.h>
 
@@ -950,6 +952,19 @@ static test_result_t test_diff_cast_f64_to_i32(void) {
     return r;
 }
 
+static test_result_t test_cast_f64_narrow_saturates(void) {
+    TEST_ASSERT(ray_cast_f64_to_i32_null(NAN) == NULL_I32, "i32 NaN -> null");
+    TEST_ASSERT(ray_cast_f64_to_i32_null(1e300) == INT32_MAX, "i32 overflow clamps high");
+    TEST_ASSERT(ray_cast_f64_to_i32_null(-1e300) == INT32_MIN + 1, "i32 overflow preserves null sentinel");
+    TEST_ASSERT(ray_cast_f64_to_i16_null(NAN) == NULL_I16, "i16 NaN -> null");
+    TEST_ASSERT(ray_cast_f64_to_i16_null(1e300) == INT16_MAX, "i16 overflow clamps high");
+    TEST_ASSERT(ray_cast_f64_to_i16_null(-1e300) == INT16_MIN + 1, "i16 overflow preserves null sentinel");
+    TEST_ASSERT(ray_cast_f64_to_u8_null(NAN) == 0, "u8 NaN -> false/nullish");
+    TEST_ASSERT(ray_cast_f64_to_u8_null(1e300) == UINT8_MAX, "u8 overflow clamps high");
+    TEST_ASSERT(ray_cast_f64_to_u8_null(-1e300) == 0, "u8 underflow clamps low");
+    PASS();
+}
+
 /* ---- Task 9: fused agg input — attr propagation gates sentinel-aware aggregation ----
  *
  * Table: k=[1,1,2,2] (group key), x=[10,20,NULL,NULL] (values).
@@ -1334,6 +1349,7 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_cast_i32",           test_diff_cast_i32,                    NULL, NULL },
     { "expr_null/diff_cast_i16",           test_diff_cast_i16,                    NULL, NULL },
     { "expr_null/diff_cast_f64_to_i32",    test_diff_cast_f64_to_i32,             NULL, NULL },
+    { "expr_null/cast_f64_narrow_saturates", test_cast_f64_narrow_saturates,      NULL, NULL },
     /* Task 9: fused agg inputs — all-null group finalizes to NULL */
     { "expr_null/fused_agg_allnull_group", test_fused_agg_input_allnull_group,    NULL, NULL },
     /* Task 10: parted nullable columns through the fused path */
