@@ -24,10 +24,12 @@
 /* test/test_expr_null.c — null-aware fused expression tests */
 #include "test.h"
 #include <rayforce.h>
+#include "core/types.h"
 #include "ops/ops.h"
 #include "ops/internal.h"
 #include "mem/heap.h"
 #include "table/sym.h"
+#include <limits.h>
 #include <string.h>
 #include <math.h>
 
@@ -35,6 +37,22 @@
 static ray_t* vec_i64_with_nulls(const int64_t* vals, int64_t n,
                                  const int64_t* null_idx, int64_t n_nulls) {
     ray_t* v = ray_vec_from_raw(RAY_I64, (void*)vals, n);
+    for (int64_t i = 0; i < n_nulls; i++)
+        ray_vec_set_null(v, null_idx[i], true);
+    return v;
+}
+
+static ray_t* vec_i32_with_nulls(const int32_t* vals, int64_t n,
+                                 const int64_t* null_idx, int64_t n_nulls) {
+    ray_t* v = ray_vec_from_raw(RAY_I32, (void*)vals, n);
+    for (int64_t i = 0; i < n_nulls; i++)
+        ray_vec_set_null(v, null_idx[i], true);
+    return v;
+}
+
+static ray_t* vec_i16_with_nulls(const int16_t* vals, int64_t n,
+                                 const int64_t* null_idx, int64_t n_nulls) {
+    ray_t* v = ray_vec_from_raw(RAY_I16, (void*)vals, n);
     for (int64_t i = 0; i < n_nulls; i++)
         ray_vec_set_null(v, null_idx[i], true);
     return v;
@@ -514,8 +532,8 @@ static test_result_t test_isnull_nonnullable_fused(void) {
  * the null_aware I64 BOOL kernel cells are exercised.
  *
  * Fixture:
- *   x: vals {1,0,3,4,5,6,7,8,9,10}  nulls {0,4,9}
- *   y: vals {1,2,0,4,5,6,7,8,9,10}  nulls {0,3,8}
+ *   x: vals {1,0,3,4,5,6,7,8,9,10,INT64_MIN+1,INT64_MIN+2}  nulls {0,4,9}
+ *   y: vals {1,2,0,4,5,6,7,8,9,10,1,0}                     nulls {0,3,8}
  *
  * Interesting rows:
  *   row 0: x null,  y null   → both null
@@ -525,18 +543,20 @@ static test_result_t test_isnull_nonnullable_fused(void) {
  *   row 8: x=9,     y null   → y null, x truthy
  *   row 9: x null,  y=10     → x null, y truthy
  *   remaining rows: both non-null, varying truthiness
+ *   row 10: valid near-NULL_I64 value && 1 -> true
+ *   row 11: valid near-NULL_I64 value || 0 -> true
  *
  * Expected fallback semantics (any null → 0):
  *   AND: null-on-either → 0; else (a && b) ? 1 : 0
  *   OR:  null-on-either → 0; else (a || b) ? 1 : 0
  */
 static ray_t* make_raw_andor_table(void) {
-    int64_t xv[] = {1, 0, 3, 4, 5, 6, 7, 8, 9, 10};
+    int64_t xv[] = {1, 0, 3, 4, 5, 6, 7, 8, 9, 10, INT64_MIN + 1, INT64_MIN + 2};
     int64_t xi[] = {0, 4, 9};
-    int64_t yv[] = {1, 2, 0, 4, 5, 6, 7, 8, 9, 10};
+    int64_t yv[] = {1, 2, 0, 4, 5, 6, 7, 8, 9, 10, 1, 0};
     int64_t yi[] = {0, 3, 8};
-    ray_t* xcol = vec_i64_with_nulls(xv, 10, xi, 3);
-    ray_t* ycol = vec_i64_with_nulls(yv, 10, yi, 3);
+    ray_t* xcol = vec_i64_with_nulls(xv, 12, xi, 3);
+    ray_t* ycol = vec_i64_with_nulls(yv, 12, yi, 3);
     ray_t* tbl = ray_table_new(2);
     tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
     tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), ycol);
@@ -589,6 +609,71 @@ static test_result_t test_diff_i64_and_raw(void) {
 static test_result_t test_diff_i64_or_raw(void) {
     ray_heap_init(); (void)ray_sym_init();
     ray_t* tbl = make_raw_andor_table();
+    test_result_t r = diff_run(tbl, build_or_raw, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+/* Narrow-int AND/OR fallback: the fallback binary_range reads raw column
+ * memory, so an I32/I16 null arrives as (double)INT32_MIN / (double)INT16_MIN,
+ * NOT the widened NULL_I64 the VM kernel sees.  The truthiness helper must
+ * treat every per-type null sentinel as false so fallback ≡ fused for these
+ * types (regression guard for the I32/I16 null-truthiness path). */
+static ray_t* make_raw_andor_table_i32(void) {
+    int32_t xv[] = {1, 0, 3, 4, 5, 6, 7, 8, 9, 10};
+    int64_t xi[] = {0, 4, 9};
+    int32_t yv[] = {1, 2, 0, 4, 5, 6, 7, 8, 9, 10};
+    int64_t yi[] = {0, 3, 8};
+    ray_t* xcol = vec_i32_with_nulls(xv, 10, xi, 3);
+    ray_t* ycol = vec_i32_with_nulls(yv, 10, yi, 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), ycol);
+    ray_release(xcol); ray_release(ycol);
+    return tbl;
+}
+
+static ray_t* make_raw_andor_table_i16(void) {
+    int16_t xv[] = {1, 0, 3, 4, 5, 6, 7, 8, 9, 10};
+    int64_t xi[] = {0, 4, 9};
+    int16_t yv[] = {1, 2, 0, 4, 5, 6, 7, 8, 9, 10};
+    int64_t yi[] = {0, 3, 8};
+    ray_t* xcol = vec_i16_with_nulls(xv, 10, xi, 3);
+    ray_t* ycol = vec_i16_with_nulls(yv, 10, yi, 3);
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), ycol);
+    ray_release(xcol); ray_release(ycol);
+    return tbl;
+}
+
+static test_result_t test_diff_i32_and_raw(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_raw_andor_table_i32();
+    test_result_t r = diff_run(tbl, build_and_raw, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_i32_or_raw(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_raw_andor_table_i32();
+    test_result_t r = diff_run(tbl, build_or_raw, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_i16_and_raw(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_raw_andor_table_i16();
+    test_result_t r = diff_run(tbl, build_and_raw, true);
+    ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
+    return r;
+}
+
+static test_result_t test_diff_i16_or_raw(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    ray_t* tbl = make_raw_andor_table_i16();
     test_result_t r = diff_run(tbl, build_or_raw, true);
     ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
     return r;
@@ -948,6 +1033,19 @@ static test_result_t test_diff_cast_f64_to_i32(void) {
     test_result_t r = diff_run(tbl, build_cast_f64_to_i32, true);
     ray_release(tbl); ray_sym_destroy(); ray_heap_destroy();
     return r;
+}
+
+static test_result_t test_cast_f64_narrow_saturates(void) {
+    TEST_ASSERT(ray_cast_f64_to_i32_null(NAN) == NULL_I32, "i32 NaN -> null");
+    TEST_ASSERT(ray_cast_f64_to_i32_null(1e300) == INT32_MAX, "i32 overflow clamps high");
+    TEST_ASSERT(ray_cast_f64_to_i32_null(-1e300) == INT32_MIN + 1, "i32 overflow preserves null sentinel");
+    TEST_ASSERT(ray_cast_f64_to_i16_null(NAN) == NULL_I16, "i16 NaN -> null");
+    TEST_ASSERT(ray_cast_f64_to_i16_null(1e300) == INT16_MAX, "i16 overflow clamps high");
+    TEST_ASSERT(ray_cast_f64_to_i16_null(-1e300) == INT16_MIN + 1, "i16 overflow preserves null sentinel");
+    TEST_ASSERT(ray_cast_f64_to_u8_null(NAN) == 0, "u8 NaN -> false/nullish");
+    TEST_ASSERT(ray_cast_f64_to_u8_null(1e300) == UINT8_MAX, "u8 overflow clamps high");
+    TEST_ASSERT(ray_cast_f64_to_u8_null(-1e300) == 0, "u8 underflow clamps low");
+    PASS();
 }
 
 /* ---- Task 9: fused agg input — attr propagation gates sentinel-aware aggregation ----
@@ -1315,6 +1413,10 @@ const test_entry_t expr_null_entries[] = {
     /* Raw nullable i64 AND/OR: exercises the null_aware I64 BOOL kernel directly */
     { "expr_null/diff_i64_and_raw",        test_diff_i64_and_raw,                 NULL, NULL },
     { "expr_null/diff_i64_or_raw",         test_diff_i64_or_raw,                  NULL, NULL },
+    { "expr_null/diff_i32_and_raw",        test_diff_i32_and_raw,                 NULL, NULL },
+    { "expr_null/diff_i32_or_raw",         test_diff_i32_or_raw,                  NULL, NULL },
+    { "expr_null/diff_i16_and_raw",        test_diff_i16_and_raw,                 NULL, NULL },
+    { "expr_null/diff_i16_or_raw",         test_diff_i16_or_raw,                  NULL, NULL },
     /* Task 7: null-aware i64 arithmetic */
     { "expr_null/diff_i64_sub",            test_diff_i64_sub,                     NULL, NULL },
     { "expr_null/diff_i64_mul",            test_diff_i64_mul,                     NULL, NULL },
@@ -1334,6 +1436,7 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/diff_cast_i32",           test_diff_cast_i32,                    NULL, NULL },
     { "expr_null/diff_cast_i16",           test_diff_cast_i16,                    NULL, NULL },
     { "expr_null/diff_cast_f64_to_i32",    test_diff_cast_f64_to_i32,             NULL, NULL },
+    { "expr_null/cast_f64_narrow_saturates", test_cast_f64_narrow_saturates,      NULL, NULL },
     /* Task 9: fused agg inputs — all-null group finalizes to NULL */
     { "expr_null/fused_agg_allnull_group", test_fused_agg_input_allnull_group,    NULL, NULL },
     /* Task 10: parted nullable columns through the fused path */

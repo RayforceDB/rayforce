@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
   pull-requests: write
 
 concurrency:
@@ -145,16 +146,30 @@ jobs:
             fi
           } > "$body"
 
+          set +e
           comment_id=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
             --jq ".[] | select(.body | contains(\"${marker}\")) | .id" \
+            2>audit-output/rayforce-audit-comment.err \
             | tail -n 1)
+          list_status=$?
+          set -e
+
+          if [ "$list_status" -ne 0 ]; then
+            echo "::notice title=Rayforce audit comment skipped::GitHub token cannot list PR comments for ${REPO}#${PR_NUMBER}. The required check result and uploaded rayforce-audit-report artifact remain authoritative."
+            sed -n '1,80p' audit-output/rayforce-audit-comment.err || true
+            exit 0
+          fi
 
           if [ -n "$comment_id" ]; then
-            gh api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" \
-              -f body="$(cat "$body")" >/dev/null
+            if ! gh api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" \
+              -f body="$(cat "$body")" >/dev/null; then
+              echo "::notice title=Rayforce audit comment skipped::GitHub token cannot update the previous PR comment. The required check result and uploaded artifact remain authoritative."
+            fi
           else
-            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-              -f body="$(cat "$body")" >/dev/null
+            if ! gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -f body="$(cat "$body")" >/dev/null; then
+              echo "::notice title=Rayforce audit comment skipped::GitHub token cannot create a PR comment, usually because this is a fork PR. The required check result and uploaded artifact remain authoritative."
+            fi
           fi
 
       - name: Upload audit report

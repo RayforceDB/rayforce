@@ -953,7 +953,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         case RAY_I16:   CL(int16_t,  int64_t, (int64_t)_v);
         case RAY_I32: case RAY_DATE: case RAY_TIME:
                         CL(int32_t,  int64_t, (int64_t)_v);
-        case RAY_F64:   CL(double,   int64_t, (int64_t)_v);
+        case RAY_F64:   CL(double,   int64_t, ray_cast_f64_to_i64_null(_v));
         }
         break;
     case RAY_I32: case RAY_DATE: case RAY_TIME:
@@ -963,7 +963,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
         case RAY_I16:   CL(int16_t,  int32_t, (int32_t)_v);
         case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  int32_t, (int32_t)_v);
-        case RAY_F64:   CL(double,   int32_t, (int32_t)_v);
+        case RAY_F64:   CL(double,   int32_t, ray_cast_f64_to_i32_null(_v));
         }
         break;
     case RAY_I16:
@@ -974,7 +974,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
                         CL(int32_t,  int16_t, (int16_t)_v);
         case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  int16_t, (int16_t)_v);
-        case RAY_F64:   CL(double,   int16_t, (int16_t)_v);
+        case RAY_F64:   CL(double,   int16_t, ray_cast_f64_to_i16_null(_v));
         }
         break;
     case RAY_U8:
@@ -985,7 +985,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
                         CL(int32_t,  uint8_t, (uint8_t)_v);
         case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  uint8_t, (uint8_t)_v);
-        case RAY_F64:   CL(double,   uint8_t, (uint8_t)_v);
+        case RAY_F64:   CL(double,   uint8_t, ray_cast_f64_to_u8_null(_v));
         }
         break;
     case RAY_F64:
@@ -1007,7 +1007,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
                         CL(int32_t,  uint8_t, _v != 0 ? 1 : 0);
         case RAY_I64: case RAY_TIMESTAMP:
                         CL(int64_t,  uint8_t, _v != 0 ? 1 : 0);
-        case RAY_F64:   CL(double,   uint8_t, _v != 0.0 ? 1 : 0);
+        case RAY_F64:   CL(double,   uint8_t, ray_cast_f64_to_bool_null(_v));
         }
         break;
     }
@@ -2100,11 +2100,99 @@ ray_t* ray_nil_fn(ray_t* x) {
 }
 
 /* (where bool-vec) -> indices of true values */
+
+/* Parallel where: 3-phase chunk compaction (parallel per-chunk popcount →
+ * tiny serial prefix → parallel per-chunk emit at disjoint offsets). */
+#define WHERE_CHUNK_ROWS 65536
+
+typedef struct {
+    const uint8_t* data;
+    int64_t  n;
+    int64_t  chunk_rows;
+    int64_t* chunk_counts;   /* popcount, then exclusive-prefix offsets */
+    int64_t* out;            /* emit-phase output (NULL during count) */
+} where_ctx_t;
+
+/* Dispatched via ray_pool_dispatch_n — each task is ONE chunk ([i,i+1)). */
+static void where_count_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    where_ctx_t* c = (where_ctx_t*)ctxp;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t lo = ch * c->chunk_rows;
+        int64_t hi = lo + c->chunk_rows;
+        if (hi > c->n) hi = c->n;
+        int64_t cnt = 0;
+        for (int64_t i = lo; i < hi; i++) cnt += (c->data[i] != 0);
+        c->chunk_counts[ch] = cnt;
+    }
+}
+
+/* Word-at-a-time zero skip: sparse masks — the common WHERE shape —
+ * run at memory speed, falling to per-byte only inside a live word. */
+static void where_emit_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    where_ctx_t* c = (where_ctx_t*)ctxp;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t lo = ch * c->chunk_rows;
+        int64_t hi = lo + c->chunk_rows;
+        if (hi > c->n) hi = c->n;
+        int64_t j = c->chunk_counts[ch];
+        int64_t i = lo;
+        int64_t h8 = lo + ((hi - lo) & ~7LL);
+        for (; i < h8; i += 8) {
+            uint64_t w;
+            memcpy(&w, c->data + i, 8);
+            if (!w) continue;
+            for (int64_t k = 0; k < 8; k++)
+                if (c->data[i + k]) c->out[j++] = i + k;
+        }
+        for (; i < hi; i++)
+            if (c->data[i]) c->out[j++] = i;
+    }
+}
+
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
         return ray_error("type", "where: argument must be a b8 vector, got %s", ray_type_name(x->type));
     const uint8_t* data = (const uint8_t*)ray_data(x);
     int64_t n = x->len;
+
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) {
+        /* One task per chunk (ray_pool_dispatch_n).  Chunk count is capped
+         * at 1024 — the pool's INITIAL ring capacity — so dispatch_n never
+         * needs to grow the ring (its clamp-on-grow-failure silently DROPS
+         * tasks, which here would mean uninitialized prefix entries and
+         * out-of-bounds emit offsets).  1024 tasks is ample granularity. */
+        int64_t chunk_rows = WHERE_CHUNK_ROWS;
+        while ((n + chunk_rows - 1) / chunk_rows > RAY_POOL_INIT_TASKS) chunk_rows *= 2;
+        int64_t n_chunks = (n + chunk_rows - 1) / chunk_rows;
+        /* ops/internal.h's scratch_alloc idiom is unavailable here (that
+         * header clashes with builtins.c-local helpers); ray_alloc +
+         * ray_release below is its exact expansion. */
+        ray_t* cc_hdr = ray_alloc((size_t)n_chunks * sizeof(int64_t));
+        int64_t* chunk_counts = cc_hdr ? (int64_t*)ray_data(cc_hdr) : NULL;
+        if (chunk_counts) {
+            where_ctx_t wc = { .data = data, .n = n, .chunk_rows = chunk_rows,
+                               .chunk_counts = chunk_counts, .out = NULL };
+            ray_pool_dispatch_n(pool, where_count_fn, &wc, (uint32_t)n_chunks);
+            int64_t cum = 0;
+            for (int64_t ch = 0; ch < n_chunks; ch++) {
+                int64_t v = chunk_counts[ch];
+                chunk_counts[ch] = cum;
+                cum += v;
+            }
+            ray_t* result = ray_vec_new(RAY_I64, cum);
+            if (RAY_IS_ERR(result)) { ray_release(cc_hdr); return result; }
+            wc.out = (int64_t*)ray_data(result);
+            ray_pool_dispatch_n(pool, where_emit_fn, &wc, (uint32_t)n_chunks);
+            result->len = cum;
+            ray_release(cc_hdr);
+            return result;
+        }
+        /* scratch OOM → sequential fallback below */
+    }
+
     /* Count pass: `cnt += byte != 0` vectorizes; the branchy form costs
      * a mispredict-prone compare per element. */
     int64_t cnt = 0;
