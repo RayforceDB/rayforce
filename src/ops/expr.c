@@ -30,13 +30,12 @@
 #include <stdlib.h>
 
 /* Truthiness for the integer AND/OR fallback lane.  `LV_READ`/`RV_READ` widen
- * the operand to double, so a null arrives as the per-type sentinel cast to
- * double — (double)NULL_I16, (double)NULL_I32, or (double)NULL_I64 depending on
- * the bound operand pointer.  `nullv` is that sentinel; a null or zero operand
- * is false.  Comparing the widened double (never casting it back to an integer)
- * also sidesteps the UB of (uint8_t)NaN and (uint8_t)(out-of-range double). */
-static inline uint8_t truthy_intish(double v, double nullv) {
-    return (v != 0.0 && v != nullv) ? 1 : 0;
+ * integer operands to double, so do not try to recognize null sentinels here:
+ * valid I64 values near NULL_I64 collapse to the same binary64 value.  The
+ * caller's null post-pass clears true null rows; this helper only avoids the
+ * old UB-prone cast-to-uint8_t truthiness and tests non-zero values. */
+static inline uint8_t truthy_intish(double v) {
+    return v != 0.0 ? 1 : 0;
 }
 
 static inline uint8_t truthy_f64ish(double v) {
@@ -3237,13 +3236,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         uint8_t* odst = (uint8_t*)dst;
         if (src_is_i64_all) {
             /* Integer-family operands: compare as int64.  AND/OR truthiness
-             * needs each operand's null sentinel widened to double so a
-             * per-type null (I16/I32/I64, incl. DATE/TIME stored as I32) reads
-             * as false — matching the VM kernel and fix_null_comparisons.  U32/
-             * BOOL/scalar carry no narrow sentinel; NULL_I64 is unreachable for
-             * their value ranges, so it is a safe default. */
-            double l_inull = lp_i16 ? (double)NULL_I16 : lp_i32 ? (double)NULL_I32 : (double)NULL_I64;
-            double r_inull = rp_i16 ? (double)NULL_I16 : rp_i32 ? (double)NULL_I32 : (double)NULL_I64;
+             * only tests zero here; fix_null_comparisons clears true null rows
+             * after the range kernel without relying on lossy I64->double
+             * sentinel recognition. */
             switch (op->opcode) {
                 case OP_EQ:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li==ri;}break;
                 case OP_NE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li!=ri;}break;
@@ -3251,8 +3246,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
                 case OP_LE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li<=ri;}break;
                 case OP_GT:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li>ri;}break;
                 case OP_GE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li>=ri;}break;
-                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=truthy_intish(LV_READ(i),l_inull),ri=truthy_intish(RV_READ(i),r_inull);odst[i]=li&&ri;}break;
-                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=truthy_intish(LV_READ(i),l_inull),ri=truthy_intish(RV_READ(i),r_inull);odst[i]=li||ri;}break;
+                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=truthy_intish(LV_READ(i)),ri=truthy_intish(RV_READ(i));odst[i]=li&&ri;}break;
+                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=truthy_intish(LV_READ(i)),ri=truthy_intish(RV_READ(i));odst[i]=li||ri;}break;
                 default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
             }
         } else {

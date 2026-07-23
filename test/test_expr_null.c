@@ -530,8 +530,8 @@ static test_result_t test_isnull_nonnullable_fused(void) {
  * the null_aware I64 BOOL kernel cells are exercised.
  *
  * Fixture:
- *   x: vals {1,0,3,4,5,6,7,8,9,10}  nulls {0,4,9}
- *   y: vals {1,2,0,4,5,6,7,8,9,10}  nulls {0,3,8}
+ *   x: vals {1,0,3,4,5,6,7,8,9,10,INT64_MIN+1,INT64_MIN+2}  nulls {0,4,9}
+ *   y: vals {1,2,0,4,5,6,7,8,9,10,1,0}                     nulls {0,3,8}
  *
  * Interesting rows:
  *   row 0: x null,  y null   → both null
@@ -541,18 +541,20 @@ static test_result_t test_isnull_nonnullable_fused(void) {
  *   row 8: x=9,     y null   → y null, x truthy
  *   row 9: x null,  y=10     → x null, y truthy
  *   remaining rows: both non-null, varying truthiness
+ *   row 10: valid near-NULL_I64 value && 1 -> true
+ *   row 11: valid near-NULL_I64 value || 0 -> true
  *
  * Expected fallback semantics (any null → 0):
  *   AND: null-on-either → 0; else (a && b) ? 1 : 0
  *   OR:  null-on-either → 0; else (a || b) ? 1 : 0
  */
 static ray_t* make_raw_andor_table(void) {
-    int64_t xv[] = {1, 0, 3, 4, 5, 6, 7, 8, 9, 10};
+    int64_t xv[] = {1, 0, 3, 4, 5, 6, 7, 8, 9, 10, INT64_MIN + 1, INT64_MIN + 2};
     int64_t xi[] = {0, 4, 9};
-    int64_t yv[] = {1, 2, 0, 4, 5, 6, 7, 8, 9, 10};
+    int64_t yv[] = {1, 2, 0, 4, 5, 6, 7, 8, 9, 10, 1, 0};
     int64_t yi[] = {0, 3, 8};
-    ray_t* xcol = vec_i64_with_nulls(xv, 10, xi, 3);
-    ray_t* ycol = vec_i64_with_nulls(yv, 10, yi, 3);
+    ray_t* xcol = vec_i64_with_nulls(xv, 12, xi, 3);
+    ray_t* ycol = vec_i64_with_nulls(yv, 12, yi, 3);
     ray_t* tbl = ray_table_new(2);
     tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xcol);
     tbl = ray_table_add_col(tbl, ray_sym_intern("y", 1), ycol);
