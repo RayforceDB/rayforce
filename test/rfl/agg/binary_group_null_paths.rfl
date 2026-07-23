@@ -1,0 +1,102 @@
+;; Grouped binary aggregates (wsum/wavg/pearson_corr/cov/scov) must return
+;; the SAME answer on every execution path when the inputs carry nulls:
+;;
+;;   v2 engine  — plain-scan int key       (by: k)
+;;   legacy DA  — expression int key       (by: (+ k 1)) defeats the v2
+;;                scan-only gate; dense small-range key routes to DA when
+;;                the y-side is eligible, and to the legacy HT otherwise
+;;   legacy HT  — same expression key with a nullable-int y (DA-ineligible),
+;;                exercising both the F64-packed and int-packed entry lanes
+;;
+;; Null contract (matches the scalar reducers, truth_weighted_stats.rfl):
+;; a null on EITHER side voids the whole (x,y) pair — no partial sums, and
+;; the pair does not count toward the divisor.
+;;
+;; Data: k/g give two groups; x is null at row 6 (group A), y at row 3
+;; (group B).  Valid pairs per group (same for every type combo):
+;;   A: (1,10) (3,33) (5,52)   B: (2,20) (6,61) (8,83)
+;; Truth (numpy over the valid pairs):
+;;   A: wsum 369  wavg 41      pearson 0.9984917035155825  cov 28      scov 42
+;;   B: wsum 1070 wavg 66.875  pearson 0.999842784232034   cov 65.111~ scov 97.666~
+
+(set Tbn (table [k g xi yi xf yf] (list (as 'I64 [0 1 0 1 0 1 0 1]) ['A 'B 'A 'B 'A 'B 'A 'B] (as 'I64 [1 2 3 4 5 6 0N 8]) (as 'I64 [10 20 33 0N 52 61 70 83]) (as 'F64 [1 2 3 4 5 6 0N 8]) (as 'F64 [10 20 33 0N 52 61 70 83]))))
+
+;; ---- F64 x, F64 y (DA-eligible pair on the expression key) ----
+(set Rv2 (select {ws: (wsum xf yf) wa: (wavg xf yf) c: (pearson_corr xf yf) cv: (cov xf yf) sc: (scov xf yf) by: k from: Tbn where: (== g 'A)}))
+(at (at Rv2 'ws) 0) -- 369.0
+(at (at Rv2 'wa) 0) -- 41.0
+(< (abs (- (at (at Rv2 'c) 0) 0.9984917035155825)) 1e-9) -- true
+(< (abs (- (at (at Rv2 'cv) 0) 28.0)) 1e-9) -- true
+(< (abs (- (at (at Rv2 'sc) 0) 42.0)) 1e-9) -- true
+
+(set Rda (select {ws: (wsum xf yf) wa: (wavg xf yf) c: (pearson_corr xf yf) cv: (cov xf yf) sc: (scov xf yf) by: (+ k 1) from: Tbn where: (== g 'A)}))
+(at (at Rda 'ws) 0) -- 369.0
+(at (at Rda 'wa) 0) -- 41.0
+(< (abs (- (at (at Rda 'c) 0) 0.9984917035155825)) 1e-9) -- true
+(< (abs (- (at (at Rda 'cv) 0) 28.0)) 1e-9) -- true
+(< (abs (- (at (at Rda 'sc) 0) 42.0)) 1e-9) -- true
+
+(set Rv2b (select {ws: (wsum xf yf) wa: (wavg xf yf) c: (pearson_corr xf yf) cv: (cov xf yf) by: k from: Tbn where: (== g 'B)}))
+(at (at Rv2b 'ws) 0) -- 1070.0
+(at (at Rv2b 'wa) 0) -- 66.875
+(< (abs (- (at (at Rv2b 'c) 0) 0.999842784232034)) 1e-9) -- true
+(< (abs (- (at (at Rv2b 'cv) 0) 65.11111111111111)) 1e-9) -- true
+
+(set Rdab (select {ws: (wsum xf yf) wa: (wavg xf yf) c: (pearson_corr xf yf) cv: (cov xf yf) by: (+ k 1) from: Tbn where: (== g 'B)}))
+(at (at Rdab 'ws) 0) -- 1070.0
+(at (at Rdab 'wa) 0) -- 66.875
+(< (abs (- (at (at Rdab 'c) 0) 0.999842784232034)) 1e-9) -- true
+(< (abs (- (at (at Rdab 'cv) 0) 65.11111111111111)) 1e-9) -- true
+
+;; ---- I64 x, I64 y nullable (DA-ineligible → legacy HT, int-packed lane) ----
+(set Hia (select {ws: (wsum xi yi) wa: (wavg xi yi) c: (pearson_corr xi yi) cv: (cov xi yi) by: (+ k 1) from: Tbn where: (== g 'A)}))
+(at (at Hia 'ws) 0) -- 369.0
+(at (at Hia 'wa) 0) -- 41.0
+(< (abs (- (at (at Hia 'c) 0) 0.9984917035155825)) 1e-9) -- true
+(< (abs (- (at (at Hia 'cv) 0) 28.0)) 1e-9) -- true
+
+(set Hib (select {ws: (wsum xi yi) wa: (wavg xi yi) c: (pearson_corr xi yi) cv: (cov xi yi) by: (+ k 1) from: Tbn where: (== g 'B)}))
+(at (at Hib 'ws) 0) -- 1070.0
+(at (at Hib 'wa) 0) -- 66.875
+(< (abs (- (at (at Hib 'c) 0) 0.999842784232034)) 1e-9) -- true
+(< (abs (- (at (at Hib 'cv) 0) 65.11111111111111)) 1e-9) -- true
+
+;; v2 on the same int×int data (path-agreement)
+(set Via (select {ws: (wsum xi yi) wa: (wavg xi yi) c: (pearson_corr xi yi) by: k from: Tbn where: (== g 'A)}))
+(at (at Via 'ws) 0) -- 369.0
+(at (at Via 'wa) 0) -- 41.0
+(< (abs (- (at (at Via 'c) 0) 0.9984917035155825)) 1e-9) -- true
+
+;; ---- mixed lanes: nullable-int x beside FP y, and FP x beside nullable-int y
+;; (both take the F64-packed entry lane on the legacy path: int nulls must
+;; canonicalize to NaN, not read as (double)sentinel) ----
+(set Mia (select {ws: (wsum xi yf) wa: (wavg xi yf) by: (+ k 1) from: Tbn where: (== g 'A)}))
+(at (at Mia 'ws) 0) -- 369.0
+(at (at Mia 'wa) 0) -- 41.0
+
+(set Mfb (select {ws: (wsum xf yi) wa: (wavg xf yi) c: (pearson_corr xf yi) by: (+ k 1) from: Tbn where: (== g 'B)}))
+(at (at Mfb 'ws) 0) -- 1070.0
+(at (at Mfb 'wa) 0) -- 66.875
+(< (abs (- (at (at Mfb 'c) 0) 0.999842784232034)) 1e-9) -- true
+
+;; ---- all-pairs-null group: wsum is 0 (empty Σxy), the ratio/moment aggs
+;; are typed nulls — identically on every path ----
+(set Tan (table [k g xf yf xi yi] (list (as 'I64 [0 1 0 1 2 2]) ['A 'B 'A 'B 'C 'C] (as 'F64 [1 2 3 4 7 9]) (as 'F64 [10 20 33 40 0N 0N]) (as 'I64 [1 2 3 4 7 9]) (as 'I64 [10 20 33 40 0N 0N]))))
+
+(set Nv2 (select {ws: (wsum xf yf) wa: (wavg xf yf) c: (pearson_corr xf yf) cv: (cov xf yf) by: k from: Tan where: (== g 'C)}))
+(at (at Nv2 'ws) 0) -- 0.0
+(nil? (at (at Nv2 'wa) 0)) -- true
+(nil? (at (at Nv2 'c) 0)) -- true
+(nil? (at (at Nv2 'cv) 0)) -- true
+
+(set Nda (select {ws: (wsum xf yf) wa: (wavg xf yf) c: (pearson_corr xf yf) cv: (cov xf yf) by: (+ k 1) from: Tan where: (== g 'C)}))
+(at (at Nda 'ws) 0) -- 0.0
+(nil? (at (at Nda 'wa) 0)) -- true
+(nil? (at (at Nda 'c) 0)) -- true
+(nil? (at (at Nda 'cv) 0)) -- true
+
+(set Nht (select {ws: (wsum xi yi) wa: (wavg xi yi) c: (pearson_corr xi yi) cv: (cov xi yi) by: (+ k 1) from: Tan where: (== g 'C)}))
+(at (at Nht 'ws) 0) -- 0.0
+(nil? (at (at Nht 'wa) 0)) -- true
+(nil? (at (at Nht 'c) 0)) -- true
+(nil? (at (at Nht 'cv) 0)) -- true
