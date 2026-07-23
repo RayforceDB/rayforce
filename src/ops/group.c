@@ -9676,8 +9676,10 @@ da_path:;
                     bool y_int = (t2 == RAY_I16 || t2 == RAY_I32 || t2 == RAY_I64 ||
                                   t2 == RAY_DATE || t2 == RAY_TIME || t2 == RAY_TIMESTAMP ||
                                   t2 == RAY_BOOL || t2 == RAY_U8);
+                    ray_t* ysrc = (yv2->attrs & RAY_ATTR_SLICE)
+                                  ? yv2->slice_parent : yv2;
                     if (!y_fp && !y_int) da_eligible = false;           /* SYM/STR/GUID/… */
-                    else if (!y_fp && (yv2->attrs & RAY_ATTR_HAS_NULLS))
+                    else if (!y_fp && ysrc && (ysrc->attrs & RAY_ATTR_HAS_NULLS))
                         da_eligible = false;                            /* nullable int y */
                 }
             }
@@ -9869,8 +9871,10 @@ da_path:;
                 if (agg_is_binary_agg(ext->agg_ops[a]) && agg_vecs2 && agg_vecs2[a]) {
                     agg_ptrs2[a]  = ray_data(agg_vecs2[a]);
                     agg_types2[a] = agg_vecs2[a]->type;
+                    ray_t* ysrc = (agg_vecs2[a]->attrs & RAY_ATTR_SLICE)
+                                  ? agg_vecs2[a]->slice_parent : agg_vecs2[a];
                     if (group_fp_type(agg_vecs2[a]->type) &&
-                        (agg_vecs2[a]->attrs & RAY_ATTR_HAS_NULLS))
+                        ysrc && (ysrc->attrs & RAY_ATTR_HAS_NULLS))
                         da_any_nullable = true;
                 }
                 if (agg_prod[a].enabled) {

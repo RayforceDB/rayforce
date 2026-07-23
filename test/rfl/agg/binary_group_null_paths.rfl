@@ -100,3 +100,37 @@
 (nil? (at (at Nht 'wa) 0)) -- true
 (nil? (at (at Nht 'c) 0)) -- true
 (nil? (at (at Nht 'cv) 0)) -- true
+
+;; ---- sliced nullable y columns ----
+;; Dict range-take returns zero-copy slices for typed value vectors.  Slice
+;; headers deliberately omit HAS_NULLS, so the legacy DA admission/count
+;; checks must inspect the slice parent.  The expression key keeps these
+;; queries on the legacy engine and its dense-key eligibility path.
+(set Sbn (table [k xi yi xf yf] (list (value (take (dict (til 10) (as 'I64 [9 0 1 0 1 0 1 0 1 9])) [1 8])) (value (take (dict (til 10) (as 'I64 [9 1 2 3 4 5 6 7 8 9])) [1 8])) (value (take (dict (til 10) (as 'I64 [9 10 20 30 0N 50 60 70 80 9])) [1 8])) (value (take (dict (til 10) (as 'F64 [9 1 2 3 4 5 6 7 8 9])) [1 8])) (value (take (dict (til 10) (as 'F64 [9 10 20 30 0N 50 60 70 80 9])) [1 8])))))
+
+;; Nullable integer y must make DA ineligible (the HT path skips its sentinel).
+(set Sinti (select {ws: (wsum xi yi) wa: (wavg xi yi) c: (pearson_corr xi yi) cv: (cov xi yi) sc: (scov xi yi) by: (+ k 1) from: Sbn}))
+(at (at Sinti 'ws) 0) -- 840.0
+(at (at Sinti 'wa) 0) -- 52.5
+(< (abs (- (at (at Sinti 'c) 0) 1.0)) 1e-9) -- true
+(< (abs (- (at (at Sinti 'cv) 0) 50.0)) 1e-9) -- true
+(< (abs (- (at (at Sinti 'sc) 0) 66.66666666666667)) 1e-9) -- true
+(at (at Sinti 'ws) 1) -- 1040.0
+(at (at Sinti 'wa) 1) -- 65.0
+(< (abs (- (at (at Sinti 'c) 1) 1.0)) 1e-9) -- true
+(< (abs (- (at (at Sinti 'cv) 1) 62.22222222222222)) 1e-9) -- true
+(< (abs (- (at (at Sinti 'sc) 1) 93.33333333333333)) 1e-9) -- true
+
+;; Nullable F64 y remains DA-eligible, but the pair count must be allocated
+;; from its slice parent's HAS_NULLS flag so covariance divisors use 3, not 4.
+(set Sintf (select {ws: (wsum xf yf) wa: (wavg xf yf) c: (pearson_corr xf yf) cv: (cov xf yf) sc: (scov xf yf) by: (+ k 1) from: Sbn}))
+(at (at Sintf 'ws) 0) -- 840.0
+(at (at Sintf 'wa) 0) -- 52.5
+(< (abs (- (at (at Sintf 'c) 0) 1.0)) 1e-9) -- true
+(< (abs (- (at (at Sintf 'cv) 0) 50.0)) 1e-9) -- true
+(< (abs (- (at (at Sintf 'sc) 0) 66.66666666666667)) 1e-9) -- true
+(at (at Sintf 'ws) 1) -- 1040.0
+(at (at Sintf 'wa) 1) -- 65.0
+(< (abs (- (at (at Sintf 'c) 1) 1.0)) 1e-9) -- true
+(< (abs (- (at (at Sintf 'cv) 1) 62.22222222222222)) 1e-9) -- true
+(< (abs (- (at (at Sintf 'sc) 1) 93.33333333333333)) 1e-9) -- true
