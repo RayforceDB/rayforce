@@ -48,6 +48,17 @@ jobs:
               --jq '.[0].number // empty')
           fi
           if [ -z "$pr_number" ]; then
+            run_info=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}")
+            head_branch=$(printf '%s' "$run_info" | python3 -c 'import json,sys; print((json.load(sys.stdin).get("head_branch") or ""))')
+            head_repo=$(printf '%s' "$run_info" | python3 -c 'import json,sys; repo=(json.load(sys.stdin).get("head_repository") or {}); print(repo.get("full_name") or "")')
+            head_owner=${head_repo%%/*}
+            if [ -n "$head_owner" ] && [ -n "$head_branch" ]; then
+              pr_number=$(gh api \
+                "repos/${REPO}/pulls?head=${head_owner}:${head_branch}&state=all" \
+                --jq '.[0].number // empty')
+            fi
+          fi
+          if [ -z "$pr_number" ]; then
             echo "::notice title=Rayforce audit comment skipped::Could not resolve a pull request for workflow run ${RUN_ID}."
             exit 0
           fi
