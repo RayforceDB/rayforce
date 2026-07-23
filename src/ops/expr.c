@@ -2504,7 +2504,7 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                 case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = (int64_t)ceil(src[i]); break;
                 case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)floor(src[i]); break;
                 case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)round(src[i]); break;
-                default:       for (int64_t i=0;i<n;i++) dst[i] = (int64_t)src[i]; break;
+                default:       for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(src[i]); break;
             }
             out_off += n;
         }
