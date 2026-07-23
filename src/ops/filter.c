@@ -205,15 +205,97 @@ static ray_t* exec_filter_seq(ray_t* input, ray_t* pred, int64_t ncols,
     return tbl;
 }
 
+/* ── Parallel bitmap → row-index list ─────────────────────────────────
+ * Classic three-phase compaction: per-chunk popcount (parallel) → tiny
+ * serial prefix over chunks → per-chunk index fill at disjoint offsets
+ * (parallel).  Replaces the two sequential 0..nrows sweeps that made
+ * every large WHERE-select serial-bound ahead of its parallel gather. */
+#define FIDX_CHUNK_ROWS 65536
+
+typedef struct {
+    const uint8_t* bits;
+    int64_t  nrows;
+    int64_t  chunk_rows;
+    int64_t* chunk_counts;   /* [n_chunks]: popcount, then prefix offset */
+    int64_t* match_idx;      /* fill-phase output (NULL during count) */
+} fidx_ctx_t;
+
+/* Dispatched via ray_pool_dispatch_n — each task is ONE chunk ([i,i+1)). */
+static void fidx_count_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    fidx_ctx_t* c = (fidx_ctx_t*)ctxp;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t lo = ch * c->chunk_rows;
+        int64_t hi = lo + c->chunk_rows;
+        if (hi > c->nrows) hi = c->nrows;
+        int64_t n = 0;
+        for (int64_t i = lo; i < hi; i++) n += c->bits[i] ? 1 : 0;
+        c->chunk_counts[ch] = n;
+    }
+}
+
+static void fidx_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    fidx_ctx_t* c = (fidx_ctx_t*)ctxp;
+    for (int64_t ch = start; ch < end; ch++) {
+        int64_t lo = ch * c->chunk_rows;
+        int64_t hi = lo + c->chunk_rows;
+        if (hi > c->nrows) hi = c->nrows;
+        int64_t j = c->chunk_counts[ch];   /* prefix offset after phase 2 */
+        for (int64_t i = lo; i < hi; i++)
+            if (c->bits[i]) c->match_idx[j++] = i;
+    }
+}
+
 ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
     (void)g;
     (void)op;
     if (!input || RAY_IS_ERR(input)) return input;
     if (!pred || RAY_IS_ERR(pred)) return pred;
 
-    /* Count passing elements — single sequential scan over predicate */
+    /* A plain contiguous BOOL predicate over a large input takes the
+     * parallel chunked count/fill; anything else (lazy / morsel-backed
+     * pred, small input) keeps the sequential morsel sweep. */
+    ray_pool_t* fidx_pool = ray_pool_get();
+    const int64_t fidx_rows = pred->len;   /* == table nrows for table input */
+    bool fidx_par = ray_pool_par_dispatch_ok(fidx_pool, fidx_rows, RAY_PARALLEL_THRESHOLD) &&
+                    pred->type == RAY_BOOL && !ray_is_lazy(pred);
+    ray_t* fidx_hdr = NULL;
+    fidx_ctx_t fidx = { .bits = NULL, .nrows = 0, .chunk_rows = FIDX_CHUNK_ROWS,
+                        .chunk_counts = NULL, .match_idx = NULL };
+    int64_t fidx_n_chunks = 0;
+
+    /* Count passing elements */
     int64_t pass_count = 0;
-    {
+    if (fidx_par) {
+        fidx.bits  = (const uint8_t*)ray_data(pred);
+        fidx.nrows = pred->len;
+        /* One task per chunk (dispatch_n).  Chunk count is capped at 1024 —
+         * the pool's INITIAL ring capacity — so dispatch_n never needs to
+         * grow the ring (its clamp-on-grow-failure silently DROPS tasks,
+         * which here would leave uninitialized prefix entries and cause
+         * out-of-bounds fill offsets).  1024 tasks is ample granularity. */
+        while ((fidx.nrows + fidx.chunk_rows - 1) / fidx.chunk_rows > RAY_POOL_INIT_TASKS)
+            fidx.chunk_rows *= 2;
+        fidx_n_chunks = (fidx.nrows + fidx.chunk_rows - 1) / fidx.chunk_rows;
+        fidx.chunk_counts = (int64_t*)scratch_alloc(&fidx_hdr,
+                                (size_t)fidx_n_chunks * sizeof(int64_t));
+        if (fidx.chunk_counts)
+            ray_pool_dispatch_n(fidx_pool, fidx_count_fn, &fidx,
+                                (uint32_t)fidx_n_chunks);
+        else
+            fidx_par = false;
+    }
+    if (fidx_par) {
+        /* Exclusive prefix: chunk_counts becomes per-chunk write offsets. */
+        int64_t cum = 0;
+        for (int64_t ch = 0; ch < fidx_n_chunks; ch++) {
+            int64_t n = fidx.chunk_counts[ch];
+            fidx.chunk_counts[ch] = cum;
+            cum += n;
+        }
+        pass_count = cum;
+    } else {
         ray_morsel_t mp;
         ray_morsel_init(&mp, pred);
         while (ray_morsel_next(&mp)) {
@@ -223,30 +305,47 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
         }
     }
 
-    /* Vector filter — single column, use sequential path */
-    if (input->type != RAY_TABLE)
+    /* Vector filter — single column, sequential fill.  The parallel count
+     * above is NOT wasted here: pass_count sizes the output vector, saving
+     * exec_filter_vec its own counting sweep.  Only the chunk-offset prefix
+     * (≤1024 adds) goes unused. */
+    if (input->type != RAY_TABLE) {
+        scratch_free(fidx_hdr);
         return exec_filter_vec(input, pred, pass_count);
+    }
 
     /* table filter: parallel gather using compact match index */
     int64_t ncols = ray_table_ncols(input);
-    int64_t nrows = ray_table_nrows(input);
 
-    /* Fall back to sequential for tiny inputs or degenerate tables */
-    if (nrows <= RAY_PARALLEL_THRESHOLD || ncols <= 0)
+    /* Fall back to sequential for tiny inputs or degenerate tables
+     * (fidx_rows == pred->len == table nrows — the same row count the
+     * fidx_par gate keyed off, so gate and fallback can never disagree). */
+    if (fidx_rows <= RAY_PARALLEL_THRESHOLD || ncols <= 0) {
+        scratch_free(fidx_hdr);
         return exec_filter_seq(input, pred, ncols, pass_count);
+    }
 
     /* VLA guard: cap at 256 columns for stack safety (256*16 = 4KB).
      * Wider tables fall back to sequential filter. */
-    if (ncols > 256) return exec_filter_seq(input, pred, ncols, pass_count);
+    if (ncols > 256) {
+        scratch_free(fidx_hdr);
+        return exec_filter_seq(input, pred, ncols, pass_count);
+    }
 
     /* Build match_idx: match_idx[j] = row of j-th matching element */
     ray_t* idx_hdr = NULL;
     int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
                                    (size_t)pass_count * sizeof(int64_t));
-    if (!match_idx)
+    if (!match_idx) {
+        scratch_free(fidx_hdr);
         return exec_filter_seq(input, pred, ncols, pass_count);
+    }
 
-    {
+    if (fidx_par) {
+        fidx.match_idx = match_idx;
+        ray_pool_dispatch_n(fidx_pool, fidx_fill_fn, &fidx,
+                            (uint32_t)fidx_n_chunks);
+    } else {
         int64_t j = 0;
         ray_morsel_t mp;
         ray_morsel_init(&mp, pred);
@@ -258,6 +357,7 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
             row_base += mp.morsel_len;
         }
     }
+    scratch_free(fidx_hdr);
 
     /* Parallel gather — same pattern as sort gather */
     ray_pool_t* pool = ray_pool_get();
@@ -511,6 +611,48 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
  * Reuses the same parallel multi-column gather as exec_filter.
  * ============================================================================ */
 
+/* Parallel per-seg match_idx fill for sel_compact: each worker writes
+ * its segments' passing rows at the precomputed disjoint offsets.
+ * Dispatched via ray_pool_dispatch_n — one task per SEG-CHUNK ([i,i+1)),
+ * segs_per_chunk segments each. */
+typedef struct {
+    const uint8_t*  flags;
+    const uint32_t* offsets;
+    const uint16_t* idx;
+    const int64_t*  seg_out;   /* exclusive prefix of per-seg pass counts */
+    int64_t*        match_idx;
+    int64_t         nrows;
+    uint32_t        n_segs;
+    uint32_t        segs_per_chunk;
+} scidx_ctx_t;
+
+static void scidx_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    scidx_ctx_t* c = (scidx_ctx_t*)ctxp;
+    for (int64_t ch = start; ch < end; ch++) {
+        uint32_t seg0 = (uint32_t)ch * c->segs_per_chunk;
+        uint32_t seg1 = seg0 + c->segs_per_chunk;
+        if (seg1 > c->n_segs) seg1 = c->n_segs;
+        for (uint32_t seg = seg0; seg < seg1; seg++) {
+            uint8_t f = c->flags[seg];
+            if (f == RAY_SEL_NONE) continue;
+            int64_t seg_start = (int64_t)seg * RAY_MORSEL_ELEMS;
+            int64_t seg_end = seg_start + RAY_MORSEL_ELEMS;
+            if (seg_end > c->nrows) seg_end = c->nrows;
+            int64_t j = c->seg_out[seg];
+            if (f == RAY_SEL_ALL) {
+                for (int64_t r = seg_start; r < seg_end; r++)
+                    c->match_idx[j++] = r;
+            } else {
+                const uint16_t* slice = c->idx + c->offsets[seg];
+                uint32_t n = c->offsets[seg + 1] - c->offsets[seg];
+                for (uint32_t i = 0; i < n; i++)
+                    c->match_idx[j++] = seg_start + slice[i];
+            }
+        }
+    }
+}
+
 /* keep-set membership: is column name-sym `nm` present in keep_syms? */
 static inline bool sel_compact_keep(int64_t nm, const int64_t* keep_syms, int keep_n) {
     for (int j = 0; j < keep_n; j++)
@@ -576,7 +718,10 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
     int64_t ncols = ray_table_ncols(tbl);
     if (ncols <= 0) { ray_retain(tbl); return tbl; }
 
-    /* Build match_idx from bitmap */
+    /* Build match_idx from bitmap.  Per-seg pass counts are derivable
+     * from the rowsel itself (ALL→seg_len, MIX→offsets delta, NONE→0),
+     * so this parallelizes as: tiny serial prefix over segs → parallel
+     * per-seg fill at disjoint offsets. */
     ray_t* idx_hdr = NULL;
     int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
                                        (size_t)pass_count * sizeof(int64_t));
@@ -587,21 +732,54 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         const uint32_t* offsets = ray_rowsel_offsets(sel);
         const uint16_t* idx     = ray_rowsel_idx(sel);
         uint32_t n_segs = meta->n_segs;
-        int64_t j = 0;
-        for (uint32_t seg = 0; seg < n_segs; seg++) {
-            uint8_t f = flags[seg];
-            if (f == RAY_SEL_NONE) continue;
-            int64_t seg_start = (int64_t)seg * RAY_MORSEL_ELEMS;
-            int64_t seg_end = seg_start + RAY_MORSEL_ELEMS;
-            if (seg_end > nrows) seg_end = nrows;
-            if (f == RAY_SEL_ALL) {
-                for (int64_t r = seg_start; r < seg_end; r++)
-                    match_idx[j++] = r;
-            } else {
-                const uint16_t* slice = idx + offsets[seg];
-                uint32_t n = offsets[seg + 1] - offsets[seg];
-                for (uint32_t i = 0; i < n; i++)
-                    match_idx[j++] = seg_start + slice[i];
+        ray_pool_t* sc_pool = ray_pool_get();
+        ray_t* soff_hdr = NULL;
+        int64_t* seg_out = ray_pool_par_dispatch_ok(sc_pool, nrows, RAY_PARALLEL_THRESHOLD)
+            ? (int64_t*)scratch_alloc(&soff_hdr, (size_t)n_segs * sizeof(int64_t))
+            : NULL;
+        if (seg_out) {
+            int64_t cum = 0;
+            for (uint32_t seg = 0; seg < n_segs; seg++) {
+                seg_out[seg] = cum;
+                uint8_t f = flags[seg];
+                if (f == RAY_SEL_NONE) continue;
+                int64_t seg_start = (int64_t)seg * RAY_MORSEL_ELEMS;
+                int64_t seg_end = seg_start + RAY_MORSEL_ELEMS;
+                if (seg_end > nrows) seg_end = nrows;
+                cum += (f == RAY_SEL_ALL) ? (seg_end - seg_start)
+                                          : (int64_t)(offsets[seg + 1] - offsets[seg]);
+            }
+            /* One task per seg-chunk (dispatch_n; ray_pool_dispatch would
+             * morselize the seg RANGE by 8192 segs → 1 task under 8.4M
+             * rows).  Chunk count capped at 1024 = the pool's initial ring
+             * capacity, so the ring never needs to grow (see exec_filter). */
+            uint32_t spc = 64;
+            while ((n_segs + spc - 1) / spc > RAY_POOL_INIT_TASKS) spc *= 2;
+            uint32_t sc_chunks = (n_segs + spc - 1) / spc;
+            scidx_ctx_t sc = {
+                .flags = flags, .offsets = offsets, .idx = idx,
+                .seg_out = seg_out, .match_idx = match_idx, .nrows = nrows,
+                .n_segs = n_segs, .segs_per_chunk = spc,
+            };
+            ray_pool_dispatch_n(sc_pool, scidx_fill_fn, &sc, sc_chunks);
+            scratch_free(soff_hdr);
+        } else {
+            int64_t j = 0;
+            for (uint32_t seg = 0; seg < n_segs; seg++) {
+                uint8_t f = flags[seg];
+                if (f == RAY_SEL_NONE) continue;
+                int64_t seg_start = (int64_t)seg * RAY_MORSEL_ELEMS;
+                int64_t seg_end = seg_start + RAY_MORSEL_ELEMS;
+                if (seg_end > nrows) seg_end = nrows;
+                if (f == RAY_SEL_ALL) {
+                    for (int64_t r = seg_start; r < seg_end; r++)
+                        match_idx[j++] = r;
+                } else {
+                    const uint16_t* slice = idx + offsets[seg];
+                    uint32_t n = offsets[seg + 1] - offsets[seg];
+                    for (uint32_t i = 0; i < n; i++)
+                        match_idx[j++] = seg_start + slice[i];
+                }
             }
         }
     }

@@ -156,7 +156,9 @@ static ray_err_t ray_pool_create_impl(ray_pool_t* pool, uint32_t n_workers,
     atomic_store_explicit(&pool->shutdown, 0, memory_order_relaxed);
 
     /* Allocate task ring */
-    pool->task_cap = 1024;
+    _Static_assert(RAY_POOL_INIT_TASKS <= RAY_POOL_MAX_TASKS,
+                   "initial ring capacity must fit the ring ceiling");
+    pool->task_cap = RAY_POOL_INIT_TASKS;
     if (pool->task_cap < MAX_RING_CAP) {
         /* Will grow if needed in dispatch */
     }

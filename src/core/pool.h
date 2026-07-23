@@ -87,6 +87,24 @@ struct ray_pool {
  * in pool.c. */
 #define RAY_POOL_MAX_TASKS  (1u << 16)
 
+/* Initial task-ring capacity (power of 2).  ray_pool_dispatch_n callers that
+ * must never trigger ring growth (its clamp-on-grow-failure silently DROPS
+ * tasks) cap their task count at this value — one shared constant instead of
+ * a hardcoded 1024 at every site. */
+#define RAY_POOL_INIT_TASKS 1024u
+
+/* True when a data-parallel dispatch is both worthwhile AND safe: a live
+ * pool with background workers (at -c 1 the pool exists with n_workers==0),
+ * at least min_elems elements to amortize task overhead, and NOT already
+ * inside an in-flight dispatch — ray_pool_dispatch/_n are single-producer,
+ * so a nested dispatch from a worker thread would corrupt the task ring
+ * (ray_parallel_flag is raised for the duration of a dispatch). */
+static inline bool ray_pool_par_dispatch_ok(ray_pool_t* p, int64_t n,
+                                            int64_t min_elems) {
+    return p && p->n_workers > 0 && n >= min_elems &&
+           atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) == 0;
+}
+
 /* Initialize pool with n_workers background threads.
  * Pass 0 to auto-detect (nproc - 1). */
 ray_err_t ray_pool_create(ray_pool_t* pool, uint32_t n_workers);

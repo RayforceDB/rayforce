@@ -25,6 +25,7 @@
 #include "ops/hash.h"
 #include "ops/idxop.h"
 #include "ops/rowsel.h"
+#include "core/pool.h"
 
 /* Resolved string atom (borrowed) of a SYM-scalar broadcast input
  * (atom -RAY_SYM, or a 1-elem RAY_SYM_W{8,16,32,64} vec used as
@@ -438,6 +439,45 @@ static bool if_lazy_supported_type(int8_t out_type) {
            out_type == RAY_SYM;
 }
 
+/* A branch that is just a column scan or a scalar constant costs nothing
+ * to evaluate over ALL rows — for such branches the lazy selected path's
+ * scaffolding (serial true-count + id-list build + per-branch gather +
+ * scatter over nrows) strictly loses to the eager elementwise fill, which
+ * is pool-parallel.  The selected path pays off only when a branch is an
+ * EXPRESSION whose evaluation is worth restricting to its passing rows. */
+static bool if_branch_trivial(ray_graph_t* g, ray_op_t* op) {
+    if (!op) return false;
+    if (op->opcode == OP_ALIAS || op->opcode == OP_MATERIALIZE)
+        return if_branch_trivial(g, op_child(g, op, 0));
+    if (op->opcode == OP_SCAN) return true;
+    if (op->opcode == OP_CONST) {
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        return ext && ext->literal && ray_is_atom(ext->literal);
+    }
+    return false;
+}
+
+/* Is a trivial branch of static type `bt` filled CORRECTLY by the eager
+ * elementwise path for result type `out`?  Mixed numeric/string branch
+ * combinations (e.g. `(if c n1 s2)` with I64 + STR) rely on the selected
+ * path's per-value string conversion — keep those there. */
+static bool if_type_eager_ok(int8_t bt, int8_t out) {
+    int8_t b = bt < 0 ? (int8_t)-bt : bt;
+    if (out == RAY_SYM)
+        return b == RAY_SYM || bt == -RAY_STR;
+    switch (b) {
+        /* No RAY_F32: if_fill_range has no F32 fill case, so an F32 branch
+         * must stay on the selected path (unreachable today — kept off the
+         * whitelist so a future if_lazy_supported_type change cannot route
+         * it to an unwritten result buffer). */
+        case RAY_F64: case RAY_I64: case RAY_I32: case RAY_I16:
+        case RAY_U8: case RAY_BOOL:
+        case RAY_TIMESTAMP: case RAY_TIME: case RAY_DATE:
+            return true;
+        default: return false;
+    }
+}
+
 static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
     if (!g || !g->table || !cond_v || cond_v->type != RAY_BOOL)
         return NULL;
@@ -450,6 +490,21 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     ray_op_t* else_op = ext ? op_node(g, ext->third_in) : NULL;
     if (!then_op || !else_op) return NULL;
+
+    /* Both branches trivial AND type-safe for the eager fill → eager
+     * (POOL-PARALLEL elementwise) wins over the serial id-scaffolding
+     * here.  Only when workers exist: with a 0-worker pool (-c 1) the
+     * eager fill runs serially over ALL rows for BOTH branches, which
+     * loses to the selected path's touch-only-passing-rows scheme. */
+    {
+        ray_pool_t* rp = ray_pool_get();
+        if (rp && rp->n_workers > 0 &&
+            op->out_type != RAY_STR &&
+            if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op) &&
+            if_type_eager_ok(then_op->out_type, op->out_type) &&
+            if_type_eager_ok(else_op->out_type, op->out_type))
+            return NULL;
+    }
 
     if_branch_plan_t then_plan, else_plan;
     if (!if_make_branch_plan(g, then_op, &then_plan) ||
@@ -539,6 +594,83 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
  * OP_IF: ternary select  result[i] = cond[i] ? then[i] : else[i]
  * ============================================================================ */
 
+/* Shared elementwise fill for the fixed-width OP_IF branches — one body
+ * driven serially (0..len) or as a pool worker over disjoint ranges.
+ * STR output stays in the serial append path (variable-width build).
+ * SYM ranges are dispatch-safe only after the caller warms each side's
+ * runtime-id LUT (sym.c frozen-table rule; mirrors window.c setup). */
+typedef struct {
+    const uint8_t* cond;
+    ray_t*  then_v;
+    ray_t*  else_v;
+    bool    then_scalar;
+    bool    else_scalar;
+    double  t_f64, e_f64;     /* pre-resolved scalar broadcasts */
+    int64_t t_i64, e_i64;
+    void*   dst;
+    int8_t  out_type;
+} if_fill_ctx_t;
+
+static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
+    const uint8_t* cond_p = c->cond;
+    switch (c->out_type) {
+    case RAY_F64: {
+        double* dst = (double*)c->dst;
+        for (int64_t i = i0; i < i1; i++) {
+            double tv = c->then_scalar ? c->t_f64 : if_vec_f64(c->then_v, i);
+            double ev = c->else_scalar ? c->e_f64 : if_vec_f64(c->else_v, i);
+            dst[i] = cond_p[i] ? tv : ev;
+        }
+        break; }
+    case RAY_I64: case RAY_TIMESTAMP: {
+        int64_t* dst = (int64_t*)c->dst;
+        for (int64_t i = i0; i < i1; i++) {
+            int64_t tv = c->then_scalar ? c->t_i64 : if_vec_i64(c->then_v, i);
+            int64_t ev = c->else_scalar ? c->e_i64 : if_vec_i64(c->else_v, i);
+            dst[i] = cond_p[i] ? tv : ev;
+        }
+        break; }
+    case RAY_SYM: {
+        int64_t* dst = (int64_t*)c->dst;
+        for (int64_t i = i0; i < i1; i++) {
+            int64_t tv = c->then_scalar ? c->t_i64 : if_sym_cell_value(c->then_v, i);
+            int64_t ev = c->else_scalar ? c->e_i64 : if_sym_cell_value(c->else_v, i);
+            dst[i] = cond_p[i] ? tv : ev;
+        }
+        break; }
+    case RAY_I32: case RAY_TIME: case RAY_DATE: {
+        int32_t* dst = (int32_t*)c->dst;
+        for (int64_t i = i0; i < i1; i++) {
+            int32_t tv = c->then_scalar ? (int32_t)c->t_i64 : (int32_t)if_vec_i64(c->then_v, i);
+            int32_t ev = c->else_scalar ? (int32_t)c->e_i64 : (int32_t)if_vec_i64(c->else_v, i);
+            dst[i] = cond_p[i] ? tv : ev;
+        }
+        break; }
+    case RAY_I16: {
+        int16_t* dst = (int16_t*)c->dst;
+        for (int64_t i = i0; i < i1; i++) {
+            int16_t tv = c->then_scalar ? (int16_t)c->t_i64 : (int16_t)if_vec_i64(c->then_v, i);
+            int16_t ev = c->else_scalar ? (int16_t)c->e_i64 : (int16_t)if_vec_i64(c->else_v, i);
+            dst[i] = cond_p[i] ? tv : ev;
+        }
+        break; }
+    case RAY_BOOL: case RAY_U8: {
+        uint8_t* dst = (uint8_t*)c->dst;
+        for (int64_t i = i0; i < i1; i++) {
+            uint8_t tv = c->then_scalar ? (uint8_t)c->t_i64 : (uint8_t)if_vec_i64(c->then_v, i);
+            uint8_t ev = c->else_scalar ? (uint8_t)c->e_i64 : (uint8_t)if_vec_i64(c->else_v, i);
+            dst[i] = cond_p[i] ? tv : ev;
+        }
+        break; }
+    default: break;
+    }
+}
+
+static void if_fill_par_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    if_fill_range((const if_fill_ctx_t*)ctx, start, end);
+}
+
 static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
     /* cond = inputs[0], then = inputs[1], else_id stored in ext->third_in */
     ray_t* cond_v = exec_node(g, op_child(g, op, 0));
@@ -579,34 +711,7 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
 
     uint8_t* cond_p = (uint8_t*)ray_data(cond_v);
 
-    if (out_type == RAY_F64) {
-        double t_scalar = then_scalar ? if_scalar_f64(then_v) : 0.0;
-        double e_scalar = else_scalar ? if_scalar_f64(else_v) : 0.0;
-        double* dst = (double*)ray_data(result);
-        for (int64_t i = 0; i < len; i++) {
-            double tv = then_scalar ? t_scalar : if_vec_f64(then_v, i);
-            double ev = else_scalar ? e_scalar : if_vec_f64(else_v, i);
-            dst[i] = cond_p[i] ? tv : ev;
-        }
-    } else if (out_type == RAY_I64) {
-        int64_t t_scalar = then_scalar ? if_scalar_i64(then_v) : 0;
-        int64_t e_scalar = else_scalar ? if_scalar_i64(else_v) : 0;
-        int64_t* dst = (int64_t*)ray_data(result);
-        for (int64_t i = 0; i < len; i++) {
-            int64_t tv = then_scalar ? t_scalar : if_vec_i64(then_v, i);
-            int64_t ev = else_scalar ? e_scalar : if_vec_i64(else_v, i);
-            dst[i] = cond_p[i] ? tv : ev;
-        }
-    } else if (out_type == RAY_I32) {
-        int32_t t_scalar = then_scalar ? (int32_t)if_scalar_i64(then_v) : 0;
-        int32_t e_scalar = else_scalar ? (int32_t)if_scalar_i64(else_v) : 0;
-        int32_t* dst = (int32_t*)ray_data(result);
-        for (int64_t i = 0; i < len; i++) {
-            int32_t tv = then_scalar ? t_scalar : (int32_t)if_vec_i64(then_v, i);
-            int32_t ev = else_scalar ? e_scalar : (int32_t)if_vec_i64(else_v, i);
-            dst[i] = cond_p[i] ? tv : ev;
-        }
-    } else if (out_type == RAY_STR) {
+    if (out_type == RAY_STR) {
         if (!then_scalar && !else_scalar &&
             then_v->type == RAY_STR && else_v->type == RAY_STR &&
             len <= then_v->len && len <= else_v->len &&
@@ -687,72 +792,56 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
             result = ray_str_vec_append(result, sp, sl);
             if (RAY_IS_ERR(result)) break;
         }
-    } else if (out_type == RAY_SYM) {
-        /* SYM columns may have narrow widths (W8/W16/W32) — use ray_read_sym.
-         * Scalars may be string atoms that need interning. Output is always W64.
-         * The result is a fresh runtime-domain vec that can mix cells of
-         * TWO source columns, so every cell id is re-expressed in the
-         * runtime domain (raw-copy fast path while domains == runtime). */
-        int64_t t_scalar = 0, e_scalar = 0;
-        if (then_scalar) {
-            if (then_v->type == -RAY_STR) {
-                t_scalar = ray_sym_intern(ray_str_ptr(then_v), ray_str_len(then_v));
-            } else {
-                t_scalar = sym_scalar_runtime_id(then_v);
-            }
-        }
-        if (else_scalar) {
-            if (else_v->type == -RAY_STR) {
-                e_scalar = ray_sym_intern(ray_str_ptr(else_v), ray_str_len(else_v));
-            } else {
-                e_scalar = sym_scalar_runtime_id(else_v);
-            }
-        }
-        int64_t* dst = (int64_t*)ray_data(result);
-        for (int64_t i = 0; i < len; i++) {
-            int64_t tv = then_scalar ? t_scalar : if_sym_cell_value(then_v, i);
-            int64_t ev = else_scalar ? e_scalar : if_sym_cell_value(else_v, i);
-            dst[i] = cond_p[i] ? tv : ev;
-        }
-    } else if (out_type == RAY_BOOL || out_type == RAY_U8) {
-        uint8_t t_scalar = then_scalar ? (uint8_t)if_scalar_i64(then_v) : 0;
-        uint8_t e_scalar = else_scalar ? (uint8_t)if_scalar_i64(else_v) : 0;
-        uint8_t* dst = (uint8_t*)ray_data(result);
-        for (int64_t i = 0; i < len; i++) {
-            uint8_t tv = then_scalar ? t_scalar : (uint8_t)if_vec_i64(then_v, i);
-            uint8_t ev = else_scalar ? e_scalar : (uint8_t)if_vec_i64(else_v, i);
-            dst[i] = cond_p[i] ? tv : ev;
-        }
-    } else if (out_type == RAY_TIMESTAMP || out_type == RAY_TIME || out_type == RAY_DATE) {
-        /* TIMESTAMP is 8B like I64; DATE and TIME are 4B like I32 */
-        if (out_type == RAY_TIMESTAMP) {
-            int64_t t_scalar2 = then_scalar ? if_scalar_i64(then_v) : 0;
-            int64_t e_scalar2 = else_scalar ? if_scalar_i64(else_v) : 0;
-            int64_t* dst = (int64_t*)ray_data(result);
-            for (int64_t i = 0; i < len; i++) {
-                int64_t tv = then_scalar ? t_scalar2 : if_vec_i64(then_v, i);
-                int64_t ev = else_scalar ? e_scalar2 : if_vec_i64(else_v, i);
-                dst[i] = cond_p[i] ? tv : ev;
-            }
+    } else {
+        /* Fixed-width branches (F64/I64/I32/I16/BOOL/U8/SYM/temporal): one
+         * shared elementwise fill, dispatched across the worker pool for
+         * large inputs — this op previously ran serial-only, capping every
+         * `if`-projection at single-core speed regardless of -c. */
+        if_fill_ctx_t fc = {
+            .cond = cond_p, .then_v = then_v, .else_v = else_v,
+            .then_scalar = then_scalar, .else_scalar = else_scalar,
+            .t_f64 = 0.0, .e_f64 = 0.0, .t_i64 = 0, .e_i64 = 0,
+            .dst = ray_data(result), .out_type = out_type,
+        };
+        /* Pre-resolve scalar broadcasts once (serial — SYM scalars may
+         * intern, which must never happen inside a pool worker). */
+        if (out_type == RAY_SYM) {
+            if (then_scalar)
+                fc.t_i64 = (then_v->type == -RAY_STR)
+                    ? ray_sym_intern(ray_str_ptr(then_v), ray_str_len(then_v))
+                    : sym_scalar_runtime_id(then_v);
+            if (else_scalar)
+                fc.e_i64 = (else_v->type == -RAY_STR)
+                    ? ray_sym_intern(ray_str_ptr(else_v), ray_str_len(else_v))
+                    : sym_scalar_runtime_id(else_v);
         } else {
-            int32_t t_scalar2 = then_scalar ? (int32_t)if_scalar_i64(then_v) : 0;
-            int32_t e_scalar2 = else_scalar ? (int32_t)if_scalar_i64(else_v) : 0;
-            int32_t* dst = (int32_t*)ray_data(result);
-            for (int64_t i = 0; i < len; i++) {
-                int32_t tv = then_scalar ? t_scalar2 : (int32_t)if_vec_i64(then_v, i);
-                int32_t ev = else_scalar ? e_scalar2 : (int32_t)if_vec_i64(else_v, i);
-                dst[i] = cond_p[i] ? tv : ev;
+            if (then_scalar) { fc.t_f64 = if_scalar_f64(then_v); fc.t_i64 = if_scalar_i64(then_v); }
+            if (else_scalar) { fc.e_f64 = if_scalar_f64(else_v); fc.e_i64 = if_scalar_i64(else_v); }
+        }
+
+        ray_pool_t* pool = ray_pool_get();
+        bool par = ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD);
+        if (par && out_type == RAY_SYM) {
+            /* Vector STR sides intern per element — serial only.  Non-STR
+             * vector sides must be SYM columns; warm each non-runtime
+             * domain's runtime-id LUT HERE (sym.c frozen-table rule —
+             * the first LUT request interns the vocabulary, never allowed
+             * inside a worker; mirrors window.c's sequential warm-up). */
+            ray_t* sides[2] = { then_scalar ? NULL : then_v,
+                                else_scalar ? NULL : else_v };
+            for (int s = 0; s < 2 && par; s++) {
+                if (!sides[s]) continue;
+                if (sides[s]->type != RAY_SYM) { par = false; break; }
+                struct ray_sym_domain_s* dom = ray_sym_vec_domain(sides[s]);
+                if (dom != ray_sym_runtime_domain() &&
+                    !ray_sym_domain_runtime_lut(dom))
+                    par = false;   /* LUT OOM → safe serial fallback */
             }
         }
-    } else if (out_type == RAY_I16) {
-        int16_t t_scalar = then_scalar ? (int16_t)if_scalar_i64(then_v) : 0;
-        int16_t e_scalar = else_scalar ? (int16_t)if_scalar_i64(else_v) : 0;
-        int16_t* dst = (int16_t*)ray_data(result);
-        for (int64_t i = 0; i < len; i++) {
-            int16_t tv = then_scalar ? t_scalar : (int16_t)if_vec_i64(then_v, i);
-            int16_t ev = else_scalar ? e_scalar : (int16_t)if_vec_i64(else_v, i);
-            dst[i] = cond_p[i] ? tv : ev;
-        }
+        if (par)
+            ray_pool_dispatch(pool, if_fill_par_fn, &fc, len);
+        else
+            if_fill_range(&fc, 0, len);
     }
 
     ray_release(cond_v); ray_release(then_v); ray_release(else_v);
