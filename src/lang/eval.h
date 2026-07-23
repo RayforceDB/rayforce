@@ -46,6 +46,11 @@
 #define ATTR_QUOTED  0x20  /* -RAY_SYM atom with this flag SET = quoted/literal symbol;
                               CLEAR (default) = name reference, resolved at eval. */
 
+/* Internal eval flag for RAY_LIST values carried as nested IPC arguments.
+ * The evaluator still runs callable lists normally; this only makes a
+ * non-callable list head fall back to returning the list as data. */
+#define RAY_EVAL_LITERAL_FALLBACK 0x04
+
 /* Function type signatures */
 typedef ray_t* (*ray_unary_fn)(ray_t*);
 typedef ray_t* (*ray_binary_fn)(ray_t*, ray_t*);
