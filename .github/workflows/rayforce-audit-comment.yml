@@ -1,0 +1,121 @@
+name: Rayforce audit comment
+
+on:
+  workflow_run:
+    workflows: ["Rayforce audit"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  comment:
+    name: rayforce-audit-comment
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish Rayforce audit PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p audit-output
+          marker="<!-- rayforce-audit-failure-comment -->"
+          body="audit-output/rayforce-audit-comment.md"
+          report="audit-output/rayforce-audit.md"
+
+          pr_number=$(python3 - <<'PY'
+          import json, os
+          with open(os.environ['GITHUB_EVENT_PATH'], 'r', encoding='utf-8') as f:
+              event = json.load(f)
+          pulls = ((event.get('workflow_run') or {}).get('pull_requests') or [])
+          print(pulls[0].get('number', '') if pulls else '')
+          PY
+          )
+          if [ -z "$pr_number" ]; then
+            pr_number=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${REPO}/commits/${HEAD_SHA}/pulls" \
+              --jq '.[0].number // empty')
+          fi
+          if [ -z "$pr_number" ]; then
+            echo "::notice title=Rayforce audit comment skipped::Could not resolve a pull request for workflow run ${RUN_ID}."
+            exit 0
+          fi
+
+          if ! gh run download "$RUN_ID" \
+            --repo "$REPO" \
+            --name rayforce-audit-report \
+            --dir audit-output; then
+            cat > "$report" <<EOF_REPORT
+          ## Rayforce targeted audit did not publish a report
+
+          The Rayforce audit workflow completed with conclusion: ${RUN_CONCLUSION}.
+
+          Open the workflow run for logs: ${RUN_URL}
+
+          RAYFORCE_AUDIT_VERDICT: FAIL
+          EOF_REPORT
+          fi
+
+          verdict="UNKNOWN"
+          if [ -s "$report" ]; then
+            verdict=$(awk '/^RAYFORCE_AUDIT_VERDICT: / {v=$2} END {print v ? v : "UNKNOWN"}' "$report")
+          fi
+
+          if [ "$RUN_CONCLUSION" = "success" ] && [ "$verdict" = "PASS" ]; then
+            existing=$(gh api "repos/${REPO}/issues/${pr_number}/comments" \
+              --jq ".[] | select(.body | contains(\"${marker}\")) | .id" \
+              | tail -n 1)
+            if [ -n "$existing" ]; then
+              cat > "$body" <<EOF_PASS
+          $marker
+          ## Rayforce targeted audit passed
+
+          The required Rayforce audit gate passed on the latest run.
+
+          Workflow run: ${RUN_URL}
+          EOF_PASS
+              gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" \
+                -f body="$(cat "$body")" >/dev/null
+            fi
+            exit 0
+          fi
+
+          {
+            echo "$marker"
+            echo "## Rayforce targeted audit failed"
+            echo
+            echo "This PR did not pass the required Rayforce audit gate. Fix the blocking findings below and push an update; the audit will rerun automatically."
+            echo
+            echo "Workflow run: ${RUN_URL}"
+            echo
+            if [ -s "$report" ]; then
+              sed -n '1,220p' "$report"
+            else
+              echo "The audit failed before producing a report. Open the workflow run for details."
+              echo
+              echo "RAYFORCE_AUDIT_VERDICT: FAIL"
+            fi
+          } > "$body"
+
+          comment_id=$(gh api "repos/${REPO}/issues/${pr_number}/comments" \
+            --jq ".[] | select(.body | contains(\"${marker}\")) | .id" \
+            | tail -n 1)
+
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" \
+              -f body="$(cat "$body")" >/dev/null
+          else
+            gh api -X POST "repos/${REPO}/issues/${pr_number}/comments" \
+              -f body="$(cat "$body")" >/dev/null
+          fi
