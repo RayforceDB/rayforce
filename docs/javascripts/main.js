@@ -16,17 +16,32 @@ document.addEventListener('DOMContentLoaded', () => {
   const navToggle = document.querySelector('.nav-toggle');
   const navLinks = document.querySelector('.nav-links');
   if (navToggle && navLinks) {
+    const closeNavigation = () => {
+      navLinks.classList.remove('open');
+      navToggle.classList.remove('open');
+      navToggle.setAttribute('aria-expanded', 'false');
+      document.body.classList.remove('nav-open');
+    };
+
     navToggle.addEventListener('click', () => {
+      const drawer = document.querySelector('#__drawer');
+      if (drawer && drawer.checked) {
+        drawer.checked = false;
+        drawer.dispatchEvent(new Event('change', { bubbles: true }));
+        return;
+      }
       const isOpen = navLinks.classList.toggle('open');
-      navToggle.classList.toggle('open');
+      navToggle.classList.toggle('open', isOpen);
       navToggle.setAttribute('aria-expanded', String(isOpen));
+      document.body.classList.toggle('nav-open', isOpen);
     });
-    navLinks.querySelectorAll('a').forEach((link) => {
-      link.addEventListener('click', () => {
-        navLinks.classList.remove('open');
-        navToggle.classList.remove('open');
-        navToggle.setAttribute('aria-expanded', 'false');
-      });
+
+    navLinks.querySelectorAll('a, label').forEach((item) => item.addEventListener('click', closeNavigation));
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') closeNavigation();
+    });
+    window.addEventListener('resize', () => {
+      if (window.innerWidth > 1219) closeNavigation();
     });
   }
 
@@ -38,8 +53,8 @@ document.addEventListener('DOMContentLoaded', () => {
     updateNav();
   }
 
-  // ── Release banner: pill-nav offset + dismiss ─
-  // The floating pill nav (landing/about) is position:fixed and would overlap
+  // ── Release banner: site-nav offset + dismiss ─
+  // The fixed site nav (landing/about) would overlap
   // the in-flow banner. rfUpdateBannerOffset() publishes the still-visible
   // banner height as --rf-banner-h so the nav sits just below it and rises back
   // as it scrolls away. Dismissal is keyed to the release tag (set on the
@@ -91,28 +106,13 @@ function rfUpdateBannerOffset() {
     return String(n);
   }
 
-  function animateCount(el, target, duration) {
-    if (typeof target !== 'number' || isNaN(target)) return;
-    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    if (reduce) { el.textContent = fmt(target); return; }
-    const start = performance.now();
-    function tick(now) {
-      const t = Math.min(1, (now - start) / duration);
-      const eased = 1 - Math.pow(1 - t, 3); /* easeOutCubic */
-      el.textContent = fmt(Math.round(target * eased));
-      if (t < 1) requestAnimationFrame(tick);
-      else el.textContent = fmt(target);
-    }
-    requestAnimationFrame(tick);
-  }
-
   function paint(stars, forks) {
     targets.forEach(el => {
       const which = el.getAttribute('data-gh-stat');
       const target = which === 'stars' ? stars
                    : which === 'forks' ? forks
                    : NaN;
-      animateCount(el, target, 900);
+      if (typeof target === 'number' && !isNaN(target)) el.textContent = fmt(target);
     });
   }
 

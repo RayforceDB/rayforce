@@ -1,0 +1,21 @@
+; Website demo: aggregate 100,000 deterministic market rows.
+; Run with: ./rayforce -t 1 examples/rfl/market_demo.rfl
+
+(set n 100000)
+(set trades
+  (table ['symbol 'side 'price 'qty]
+    (list
+      (take ['AAPL 'MSFT 'NVDA 'GOOG] n)
+      (take ['BUY 'SELL] n)
+      (+ 100 (% (til n) 700))
+      (+ 1 (% (* (til n) 17) 250)))))
+
+(set leaders
+  (select {from: trades
+           where: (> qty 100)
+           by: symbol
+           trades: (count qty)
+           notional: (sum (* price qty))}))
+
+(show leaders)
+(exit 0)

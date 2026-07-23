@@ -75,22 +75,13 @@
 {# Reuse the marketing footer from home.html so About matches the landing. #}
 {% block footer %}
 <footer class="footer landing-footer">
-  <div class="container">
-    <div class="footer-inner">
-      <div class="footer-brand">
-        <img src="{{ 'assets/logo-light-full.svg' | url }}" alt="Rayforce" width="168" height="28">
-      </div>
-      <div class="footer-links">
-        <a href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://x.com/RayforceDB" target="_blank" rel="noopener">X / Twitter</a>
-        <a href="https://www.reddit.com/r/rayforcedb/" target="_blank" rel="noopener">Reddit</a>
-        <a href="https://rayforcedb.zulipchat.com/join/l33sichu4vp7nf77hgdul4om/" target="_blank" rel="noopener">Zulip Chat</a>
-        <a href="https://www.linkedin.com/in/anton-kundenko-a22a3667" target="_blank" rel="noopener">LinkedIn</a>
-        <a href="{{ 'docs/' | url }}">Docs</a>
-        <a href="https://github.com/RayforceDB/rayforce/blob/master/LICENSE" target="_blank" rel="noopener">MIT License</a>
-      </div>
-    </div>
+  <div class="rf-container footer-grid">
+    <div class="footer-brand"><img src="{{ 'assets/logo-light-full.svg' | url }}" alt="Rayforce" width="172" height="58"><p>Columnar analytics and graph traversal in one embeddable engine.</p></div>
+    <div class="footer-column"><span>BUILD</span><a href="{{ 'docs/' | url }}">Documentation</a><a href="{{ 'docs/getting-started/quick-start/' | url }}">Quick start</a><a href="https://wasm.rayforcedb.com/" target="_blank" rel="noopener">Live demo</a><a href="https://py.rayforcedb.com/" target="_blank" rel="noopener">Python</a></div>
+    <div class="footer-column"><span>PROJECT</span><a href="https://github.com/RayforceDB/rayforce" target="_blank" rel="noopener">GitHub</a><a href="{{ 'about/' | url }}">About</a><a href="{{ '' | url }}#cloud">Rayforce Cloud</a><a href="https://github.com/RayforceDB/rayforce/blob/master/LICENSE" target="_blank" rel="noopener">MIT License</a></div>
+    <div class="footer-column"><span>COMMUNITY</span><a href="https://x.com/RayforceDB" target="_blank" rel="noopener">X / Twitter</a><a href="https://www.reddit.com/r/rayforcedb/" target="_blank" rel="noopener">Reddit</a><a href="https://rayforcedb.zulipchat.com/join/l33sichu4vp7nf77hgdul4om/" target="_blank" rel="noopener">Zulip</a></div>
   </div>
+  <div class="rf-container footer-bottom"><span>© 2025–2026 Anton Kundenko</span><span>Made for the shortest path between data and answers.</span></div>
 </footer>
 {% endblock %}
 

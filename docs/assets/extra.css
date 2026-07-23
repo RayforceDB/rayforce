@@ -10,14 +10,14 @@
   font-family: 'Inter';
   font-style: normal;
   font-weight: 400;
-  font-display: swap;
+  font-display: block;
   src: url('/assets/fonts/inter-400.woff2') format('woff2');
 }
 @font-face {
   font-family: 'Inter';
   font-style: normal;
   font-weight: 600;
-  font-display: swap;
+  font-display: block;
   src: url('/assets/fonts/inter-600.woff2') format('woff2');
 }
 @font-face {
@@ -38,21 +38,21 @@
   font-family: 'Oswald';
   font-style: normal;
   font-weight: 700;
-  font-display: swap;
+  font-display: block;
   src: url('/assets/fonts/oswald-700.woff2') format('woff2');
 }
 @font-face {
   font-family: 'JetBrains Mono';
   font-style: normal;
   font-weight: 400;
-  font-display: swap;
+  font-display: block;
   src: url('/assets/fonts/jbmono-400.woff2') format('woff2');
 }
 @font-face {
   font-family: 'JetBrains Mono';
   font-style: normal;
   font-weight: 600;
-  font-display: swap;
+  font-display: block;
   src: url('/assets/fonts/jbmono-600.woff2') format('woff2');
 }
 
@@ -94,6 +94,7 @@
    share the same tokens as the marketing site without hand-editing
    colour values across the file. */
 :root {
+  --rf-banner-h: 34px;
   --bg: #0a0e13;
   --bg-section: #0d1219;
   --bg-card: #111820;
@@ -171,20 +172,6 @@
 [data-md-color-scheme="default"] {
   --md-typeset-a-color: #c4821a;
 }
-
-/* ── Heading permalinks: hide the ¶ but keep them clickable on hover.
-   `permalink: true` in mkdocs.yml emits a <a class="headerlink">¶</a>
-   beside every heading — useful for "copy link to section" but visually
-   noisy.  Hide by default, fade in only when the heading is hovered. */
-.md-typeset .headerlink {
-  opacity: 0;
-  margin-left: 0.4em;
-  color: var(--accent);
-  transition: opacity .15s;
-}
-.md-typeset :is(h1, h2, h3, h4, h5, h6):hover .headerlink,
-.md-typeset .headerlink:focus { opacity: 0.7; }
-.md-typeset .headerlink:hover { opacity: 1; }
 
 /* ── Headings: Oswald, marketing-style ────────────────────────── */
 
@@ -509,36 +496,845 @@ html.landing-page body .footer.landing-footer { display: block; }
    .md-banner__inner wrappers so .rf-banner is the only styled box.  In normal
    flow at the very top of every page: on docs it scrolls away above the sticky
    header (Material-native), on the landing/about pages main.js offsets the
-   floating pill nav below it via --rf-banner-h. */
+   fixed site nav below it via --rf-banner-h. */
 .md-banner, .md-banner__inner { display: contents; }
 
 .rf-banner {
-  display: flex; align-items: center; justify-content: center; gap: 10px;
-  position: relative; padding: 8px 46px; min-height: 38px;
-  background: linear-gradient(90deg, var(--navy, #0e1b24), #122430);
-  color: var(--text, #f1f5f9);
-  border-bottom: 1px solid var(--border, rgba(233, 160, 51, 0.18));
-  font-size: .82rem; text-align: center;
+  display: block; position: relative; min-height: 34px; padding: 0;
+  background: #0d292b; color: #bad0d0;
+  border-bottom: 1px solid rgba(94, 234, 212, .22);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: .63rem; letter-spacing: .035em;
 }
 .rf-banner[hidden] { display: none; }
-.rf-banner-msg {
-  display: inline-flex; align-items: center; gap: 8px;
-  flex-wrap: wrap; justify-content: center;
+.rf-banner-inner {
+  display: flex; align-items: center; gap: 14px;
+  width: min(calc(100% - 80px), 1380px); min-height: 34px; margin: 0 auto;
 }
-.rf-banner-spark { color: var(--primary, #e9a033); }
+.rf-banner-label {
+  align-self: stretch; display: inline-flex; align-items: center; padding: 0 12px;
+  background: #5eead4; color: #071516; font-weight: 700;
+  letter-spacing: .1em; text-transform: uppercase;
+}
+.rf-banner-msg {
+  overflow: hidden; color: #bad0d0; text-overflow: ellipsis; white-space: nowrap;
+}
 .rf-banner-link {
-  display: inline-flex; align-items: center; gap: 5px;
-  color: var(--primary-light, #f0b954); font-weight: 700;
-  text-decoration: none; border-bottom: 1px solid transparent;
+  display: inline-flex; align-items: center; gap: 7px; margin-left: auto;
+  width: 140px; justify-content: flex-end;
+  color: #f3c46b; font-weight: 700; text-transform: uppercase;
+  text-decoration: none;
 }
 .rf-banner-link:hover {
-  color: var(--primary-lighter, #f5d080); border-bottom-color: currentColor;
+  color: #f8fafc;
 }
 .rf-banner-close {
-  position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
   display: inline-flex; padding: 4px; border: 0; background: none;
-  color: var(--text-muted, #7b8fa0); cursor: pointer; border-radius: 6px;
+  color: #526170; cursor: pointer; border-radius: 0;
   line-height: 0; transition: color .2s, background .2s;
 }
 .rf-banner-close:hover { color: var(--text, #f1f5f9); background: rgba(255, 255, 255, 0.08); }
 
+@media screen and (max-width: 600px) {
+  .rf-banner-inner { width: calc(100% - 24px); gap: 9px; }
+  .rf-banner-label { padding-inline: 8px; }
+  .rf-banner-msg { flex: 1; }
+  .rf-banner-link { width: auto; margin-left: 0; }
+  .rf-banner-link [data-download-label] { display: none; }
+}
+
+/* 2026 documentation shell — the same sharp, technical visual language as home. */
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: #080b10;
+  --md-default-bg-color--light: #0c1118;
+  --md-default-bg-color--lighter: #111923;
+  --md-default-bg-color--lightest: #17212c;
+  --md-code-bg-color: #0b1017;
+}
+
+[data-md-color-scheme="slate"] body {
+  background-color: #080b10;
+  background-image:
+    linear-gradient(rgba(255,255,255,.014) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.014) 1px, transparent 1px);
+  background-size: 72px 72px;
+}
+
+.md-header {
+  height: 70px;
+  background: rgba(8, 11, 16, .94);
+  border-bottom: 1px solid rgba(255,255,255,.09);
+  box-shadow: none;
+  backdrop-filter: blur(16px);
+}
+.md-header__inner { height: 70px; max-width: 1240px; }
+.md-header .md-logo img,
+.md-header .md-logo svg { height: 40px; max-height: 40px; }
+.md-search__form { border: 1px solid rgba(255,255,255,.08); border-radius: 0; background: #0b1017; }
+.md-search__input { border-radius: 0; }
+
+.md-main__inner { max-width: 1240px; padding-top: 2.6rem; }
+.md-content__inner { max-width: 780px; }
+.md-sidebar { color: #9aa7b3; }
+.md-sidebar__scrollwrap { scrollbar-width: thin; }
+.md-nav__title { color: #7f8f9d; letter-spacing: .1em; }
+.md-nav__link { line-height: 1.35; }
+.md-nav__link:hover { color: #f3c46b; }
+.md-nav__link--active {
+  color: #f3c46b;
+  padding-left: .65rem;
+  border-left: 2px solid #e9a033;
+}
+
+.md-typeset h1 {
+  margin-bottom: 2.2rem;
+  color: #f8fafc;
+  font-size: clamp(2.8rem, 5vw, 4.6rem);
+  line-height: .96;
+  letter-spacing: -.025em;
+}
+.md-typeset h2 {
+  margin-top: 3.4rem;
+  padding-bottom: .55rem;
+  border-bottom-color: rgba(233,160,51,.22);
+  font-size: 2rem;
+}
+.md-typeset h3 { color: #f3c46b; }
+.md-typeset p,
+.md-typeset li { line-height: 1.7; }
+
+.md-typeset .md-button {
+  min-height: 48px;
+  padding: 12px 22px;
+  border-radius: 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: .72rem;
+}
+.md-typeset .md-button--primary {
+  color: #171109;
+  border: 1px solid #e9a033;
+  background: #e9a033;
+  box-shadow: 0 12px 36px rgba(233,160,51,.16);
+}
+.md-typeset .md-button--primary:hover {
+  color: #171109;
+  background: #f3c46b;
+  box-shadow: 0 16px 44px rgba(233,160,51,.22);
+}
+.md-typeset code { border-radius: 0; }
+.md-typeset pre > code,
+.md-typeset .highlight,
+.md-typeset table:not([class]),
+.md-typeset .admonition,
+.md-typeset details { border-radius: 0; }
+.md-typeset pre > code { border-color: rgba(255,255,255,.1); }
+.md-typeset table:not([class]) { border-color: rgba(255,255,255,.1); }
+.md-footer { border-top-color: rgba(255,255,255,.1); }
+
+[data-md-color-scheme="slate"] .md-search__output { border-radius: 0; }
+.rf-banner { background: #0d292b; border-bottom-color: rgba(94,234,212,.22); }
+
+@media screen and (max-width: 76.234375em) {
+  .md-main__inner { padding-inline: 1rem; }
+}
+
+/* Unified site navigation for documentation pages. */
+.md-header {
+  height: 76px;
+  background: rgba(8,11,16,.96);
+  border-bottom: 1px solid rgba(255,255,255,.11);
+}
+.md-header__inner {
+  width: min(calc(100% - 80px), 1380px);
+  max-width: 1380px;
+  height: 76px;
+  margin-inline: auto;
+  padding: 0;
+}
+.md-header .md-logo img,
+.md-header .md-logo svg {
+  width: 128px;
+  height: auto;
+  max-height: 44px;
+}
+.docs-nav-links {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.docs-nav-links a {
+  padding: 10px 15px;
+  color: #b5c0ca;
+  font-family: 'Inter', 'Inter Fallback', sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1;
+  text-decoration: none;
+  transition: color .2s, background .2s;
+}
+.docs-nav-links a:hover,
+.docs-nav-links a.active {
+  color: #f8fafc;
+  background: rgba(255,255,255,.05);
+}
+.docs-nav-cloud { display: inline-flex; align-items: center; gap: 7px; }
+.docs-nav-cloud i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e9a033;
+  box-shadow: 0 0 12px #e9a033;
+}
+.md-header__spacer { flex: 1 1 26px; }
+.md-search { margin-left: 10px; }
+.md-search__form { width: 184px; }
+.docs-nav-github {
+  min-width: 64px;
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-left: 12px;
+  padding: 8px 12px;
+  border: 1px solid rgba(255,255,255,.2);
+  color: #f8fafc;
+  font: 600 12px 'JetBrains Mono', monospace;
+  text-decoration: none;
+}
+.docs-nav-github:hover { border-color: #e9a033; background: rgba(233,160,51,.07); }
+.docs-nav-github svg { width: 17px; height: 17px; fill: currentColor; }
+
+/* Docs typography follows the same editorial hierarchy as the home sections. */
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3,
+.md-typeset h4 {
+  font-family: 'Oswald', 'Oswald Fallback', sans-serif;
+  text-transform: uppercase;
+}
+.md-typeset h1 { letter-spacing: -.035em; }
+.md-typeset h2 { letter-spacing: -.02em; }
+.md-nav__title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: .62rem;
+  letter-spacing: .11em;
+}
+.md-nav__link { font-family: 'Inter', 'Inter Fallback', sans-serif; }
+
+@media screen and (max-width: 76.234375em) {
+  .md-header,
+  .md-header__inner { height: 70px; }
+  .md-header__inner { width: calc(100% - 32px); }
+  .docs-nav-links,
+  .docs-nav-github { display: none; }
+  .md-header__spacer { flex: 1; }
+  .md-search { margin-left: 0; }
+}
+
+/* Editorial docs shell — the documentation is a technical section of the
+   marketing site, not a separate Material-themed product. */
+html:not(.landing-page) .md-main {
+  position: relative;
+  isolation: isolate;
+  background:
+    radial-gradient(circle at 76% 8%, rgba(233,160,51,.07), transparent 28%),
+    linear-gradient(rgba(255,255,255,.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.018) 1px, transparent 1px),
+    #080b10;
+  background-size: auto, 72px 72px, 72px 72px, auto;
+}
+html:not(.landing-page) .md-main::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  inset: 0 0 auto 38%;
+  height: 760px;
+  background: url('/assets/rayforce-engine-hero.webp') top right / cover no-repeat;
+  opacity: .075;
+  filter: saturate(.8);
+  mask-image: linear-gradient(to bottom, #000, transparent 82%);
+  pointer-events: none;
+}
+html:not(.landing-page) .md-main__inner {
+  width: min(calc(100% - 80px), 1380px);
+  max-width: 1380px;
+  margin-inline: auto;
+  padding-top: 64px;
+  padding-bottom: 100px;
+}
+html:not(.landing-page) .md-content {
+  position: relative;
+  min-width: 0;
+  padding-inline: clamp(38px, 4vw, 68px);
+  border-inline: 1px solid rgba(255,255,255,.08);
+  background: rgba(8,11,16,.6);
+  backdrop-filter: blur(2px);
+}
+html:not(.landing-page) .md-content__inner {
+  max-width: 860px;
+  margin-inline: auto;
+  padding-top: 0;
+  padding-bottom: 5rem;
+}
+html:not(.landing-page) .md-content__inner::before { display: none; }
+html:not(.landing-page) .md-typeset h1 {
+  margin: 0 0 36px;
+  color: #f8fafc;
+  font-size: clamp(3.6rem, 5vw, 5.8rem);
+  line-height: .9;
+  letter-spacing: -.045em;
+}
+html:not(.landing-page) .md-typeset h1::before {
+  content: 'RAYFORCE / DOCUMENTATION';
+  display: block;
+  margin-bottom: 26px;
+  padding-left: 46px;
+  background: linear-gradient(#e9a033,#e9a033) left center / 32px 1px no-repeat;
+  color: #f3c46b;
+  font: 600 10px/1.2 'JetBrains Mono', monospace;
+  letter-spacing: .13em;
+}
+html:not(.landing-page) .md-typeset h1 + p {
+  color: #c1cad3;
+  font-size: 1.02rem;
+  line-height: 1.75;
+}
+html:not(.landing-page) .md-typeset h2 {
+  margin-top: 4.2rem;
+  padding-bottom: .7rem;
+  border-bottom: 1px solid rgba(233,160,51,.24);
+  font-size: clamp(2.25rem, 3.2vw, 3.5rem);
+  line-height: 1;
+}
+html:not(.landing-page) .md-typeset h3 {
+  margin-top: 2.5rem;
+  font-size: 1.6rem;
+  letter-spacing: -.01em;
+}
+html:not(.landing-page) .md-typeset p,
+html:not(.landing-page) .md-typeset li { color: #aab5bf; }
+html:not(.landing-page) .md-typeset strong { color: #edf2f6; }
+html:not(.landing-page) .md-sidebar {
+  color: #8f9daa;
+}
+html:not(.landing-page) .md-sidebar__inner {
+  padding: 18px 18px 24px;
+  border-top: 2px solid rgba(233,160,51,.72);
+  border-right: 1px solid rgba(255,255,255,.08);
+  border-bottom: 1px solid rgba(255,255,255,.08);
+  border-left: 1px solid rgba(255,255,255,.08);
+  background: rgba(11,16,23,.78);
+}
+html:not(.landing-page) .md-sidebar--secondary .md-sidebar__inner {
+  border-top-color: rgba(94,234,212,.55);
+}
+html:not(.landing-page) .md-nav__title {
+  margin-bottom: 12px;
+  color: #e9a033;
+}
+html:not(.landing-page) .md-sidebar--secondary .md-nav__title { color: #5eead4; }
+html:not(.landing-page) .md-nav__link {
+  padding-block: 3px;
+  font-size: .76rem;
+}
+html:not(.landing-page) .md-nav__link--active {
+  padding-left: 10px;
+  border-left: 2px solid #e9a033;
+  color: #f3c46b;
+}
+html:not(.landing-page) .md-typeset pre > code,
+html:not(.landing-page) .md-typeset table:not([class]),
+html:not(.landing-page) .md-typeset .admonition,
+html:not(.landing-page) .md-typeset details {
+  border-color: rgba(255,255,255,.12);
+  background-color: rgba(11,16,23,.88);
+}
+html:not(.landing-page) .md-footer {
+  background: #06090d;
+  border-top: 1px solid rgba(255,255,255,.1);
+}
+
+@media screen and (max-width: 76.234375em) {
+  html:not(.landing-page) .md-main__inner {
+    width: calc(100% - 32px);
+    padding-top: 42px;
+  }
+  html:not(.landing-page) .md-content {
+    padding-inline: clamp(18px, 5vw, 48px);
+    border-inline: 0;
+  }
+  html:not(.landing-page) .md-typeset h1 { font-size: clamp(3rem, 12vw, 4.6rem); }
+}
+
+@media screen and (max-width: 30em) {
+  html:not(.landing-page) .md-typeset .md-button {
+    display: table;
+    width: fit-content;
+    max-width: 100%;
+    margin: 0 0 10px;
+  }
+}
+
+/* Documentation surface v2 — use the marketing site's actual composition,
+   not Material's scaled three-panel application shell. */
+html:not(.landing-page) { font-size: 16px; }
+html:not(.landing-page) body {
+  font-size: 1rem;
+  line-height: 1.5;
+  background: #080b10;
+}
+
+/* Exact marketing navigation, with docs-only search kept as an icon overlay. */
+html:not(.landing-page) .docs-site-nav {
+  position: fixed;
+  z-index: 1000;
+  top: var(--rf-banner-h, 0px);
+  left: 0;
+  width: 100%;
+  height: 76px;
+  color: #f8fafc;
+  background: rgba(8,11,16,.82);
+  border-bottom: 1px solid rgba(255,255,255,.11);
+  box-shadow: none;
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  transition: background .25s, border-color .25s;
+}
+html:not(.landing-page) .docs-site-nav.nav-scrolled {
+  background: rgba(8,11,16,.97);
+  border-color: rgba(233,160,51,.24);
+}
+html:not(.landing-page) .docs-site-nav .nav-inner {
+  width: min(calc(100% - 80px), 1380px);
+  max-width: 1380px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  margin-inline: auto;
+  padding: 0;
+}
+html:not(.landing-page) .docs-site-nav .nav-brand {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  margin: 0 auto 0 0;
+  padding: 0;
+}
+html:not(.landing-page) .docs-site-nav .nav-brand img,
+html:not(.landing-page) .docs-site-nav .nav-brand svg {
+  display: block;
+  width: 128px;
+  height: auto;
+  max-height: 44px;
+}
+html:not(.landing-page) .docs-site-nav .nav-links {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+html:not(.landing-page) .docs-site-nav .nav-links > a {
+  padding: 10px 15px;
+  color: #b5c0ca;
+  font: 600 .88rem/1 Inter, 'Inter Fallback', sans-serif;
+  text-decoration: none;
+  transition: color .2s, background .2s;
+}
+html:not(.landing-page) .docs-site-nav .nav-links > a:hover,
+html:not(.landing-page) .docs-site-nav .nav-links > a.active {
+  color: #f8fafc;
+  background: rgba(255,255,255,.05);
+}
+html:not(.landing-page) .docs-site-nav .nav-cloud {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+html:not(.landing-page) .docs-site-nav .nav-cloud i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e9a033;
+  box-shadow: 0 0 12px #e9a033;
+}
+html:not(.landing-page) .docs-site-nav .nav-playground {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #f3c46b;
+}
+html:not(.landing-page) .docs-site-nav .nav-playground svg {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
+}
+html:not(.landing-page) .docs-site-nav .nav-github {
+  width: 90px;
+  min-width: 64px;
+  flex: 0 0 90px;
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-left: 10px;
+  padding: 9px 12px;
+  border: 1px solid rgba(255,255,255,.2);
+  color: #f8fafc;
+  font: 600 .76rem/1 'JetBrains Mono', monospace;
+}
+html:not(.landing-page) .docs-site-nav .nav-github:hover {
+  border-color: #e9a033;
+  background: rgba(233,160,51,.07);
+}
+html:not(.landing-page) .docs-site-nav .nav-github svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+html:not(.landing-page) .docs-site-nav .nav-toggle { display: none; }
+html:not(.landing-page) .docs-search-trigger {
+  width: 42px;
+  height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 10px;
+  border: 1px solid rgba(255,255,255,.2);
+  color: #b5c0ca;
+  cursor: pointer;
+  transition: color .2s, border-color .2s, background .2s;
+}
+html:not(.landing-page) .docs-search-trigger:hover {
+  color: #f8fafc;
+  border-color: #e9a033;
+  background: rgba(233,160,51,.07);
+}
+html:not(.landing-page) .docs-search-trigger > span,
+html:not(.landing-page) .docs-browse-trigger { display: none; }
+html:not(.landing-page) .docs-site-nav .md-search {
+  flex: 0 0 0;
+  width: 0;
+  margin: 0;
+}
+html:not(.landing-page) .docs-site-nav .md-search__inner {
+  width: 0;
+  overflow: hidden;
+}
+html:not(.landing-page) .docs-site-nav .md-search__form { width: 100%; }
+
+/* Full-bleed technical canvas: navigation + article, with the third Material
+   column removed. Empty space is intentional and carries the engine artwork. */
+html:not(.landing-page) .md-container { padding-top: 76px; }
+html:not(.landing-page) .md-main {
+  position: relative;
+  isolation: isolate;
+  min-height: calc(100svh - 76px);
+  overflow: clip;
+  background:
+    radial-gradient(circle at 78% 10%, rgba(233,160,51,.07), transparent 29%),
+    linear-gradient(rgba(255,255,255,.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.02) 1px, transparent 1px),
+    #080b10;
+  background-size: auto, 76px 76px, 76px 76px, auto;
+}
+html:not(.landing-page) .md-main::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  top: 0;
+  right: 0;
+  width: 58%;
+  height: 720px;
+  background: url('/assets/rayforce-engine-hero.webp') top right / cover no-repeat;
+  opacity: .11;
+  filter: saturate(.8);
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 25%, #000 70%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 25%, #000 70%, transparent);
+  pointer-events: none;
+}
+html:not(.landing-page) .md-main__inner {
+  width: min(calc(100% - 80px), 1380px);
+  max-width: 1380px;
+  min-height: calc(100svh - 110px);
+  display: grid;
+  grid-template-columns: 240px minmax(0, 850px) minmax(80px, 1fr);
+  column-gap: clamp(42px, 5vw, 76px);
+  align-items: start;
+  margin: 0 auto;
+  padding: 72px 0 120px;
+}
+html:not(.landing-page) .md-sidebar--primary {
+  grid-column: 1;
+  width: auto;
+}
+html:not(.landing-page) .md-sidebar--secondary { display: none; }
+html:not(.landing-page) .md-content {
+  grid-column: 2;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  backdrop-filter: none;
+}
+html:not(.landing-page) .md-content__inner {
+  max-width: none;
+  margin: 0;
+  padding: 0 0 5rem;
+}
+html:not(.landing-page) .md-content__inner::before { display: none; }
+
+/* Navigation is a quiet index rail, not a boxed dashboard panel. */
+html:not(.landing-page) .md-sidebar--primary .md-sidebar__inner {
+  padding: 24px 30px 30px 0;
+  border: 0;
+  border-top: 1px solid rgba(233,160,51,.55);
+  border-right: 1px solid rgba(255,255,255,.11);
+  background: transparent;
+}
+html:not(.landing-page) .md-nav__title {
+  margin: 0 0 18px;
+  padding: 0;
+  color: #e9a033;
+  font: 600 .64rem/1.3 'JetBrains Mono', monospace;
+  letter-spacing: .13em;
+}
+html:not(.landing-page) .md-nav__link {
+  padding-block: 4px;
+  color: #8997a4;
+  font: 500 .8rem/1.4 Inter, 'Inter Fallback', sans-serif;
+}
+html:not(.landing-page) .md-nav__link:hover { color: #f8fafc; }
+html:not(.landing-page) .md-nav__link--active {
+  padding-left: 11px;
+  border-left: 2px solid #e9a033;
+  color: #f3c46b;
+  font-weight: 600;
+}
+
+/* Same editorial scale as the main site's copy—not Material's wide-screen
+   root scaling and not a second marketing hero inside the docs. */
+html:not(.landing-page) .md-typeset {
+  color: #a9b4bf;
+  font-size: 1rem;
+  line-height: 1.72;
+}
+html:not(.landing-page) .md-typeset h1,
+html:not(.landing-page) .md-typeset h2,
+html:not(.landing-page) .md-typeset h3,
+html:not(.landing-page) .md-typeset h4 {
+  color: #f8fafc;
+  font-family: Oswald, 'Oswald Fallback', sans-serif;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+html:not(.landing-page) .md-typeset h1 {
+  max-width: 800px;
+  margin: 0 0 30px;
+  font-size: clamp(3.25rem, 4.2vw, 4.5rem);
+  line-height: .94;
+  letter-spacing: -.04em;
+}
+html:not(.landing-page) .md-typeset h1::before {
+  content: 'RAYFORCE / DOCUMENTATION';
+  display: block;
+  margin-bottom: 24px;
+  padding-left: 46px;
+  background: linear-gradient(#e9a033,#e9a033) left center / 32px 1px no-repeat;
+  color: #f3c46b;
+  font: 600 .62rem/1.2 'JetBrains Mono', monospace;
+  letter-spacing: .13em;
+}
+html:not(.landing-page) .md-typeset h1 + p {
+  max-width: 760px;
+  color: #c1cad3;
+  font-size: 1.12rem;
+  line-height: 1.7;
+}
+html:not(.landing-page) .md-typeset h2 {
+  margin-top: 4rem;
+  padding-bottom: .65rem;
+  border-bottom: 1px solid rgba(233,160,51,.24);
+  font-size: clamp(2.15rem, 3vw, 3rem);
+  line-height: 1;
+  letter-spacing: -.025em;
+}
+html:not(.landing-page) .md-typeset h3 {
+  margin-top: 2.6rem;
+  color: #f3c46b;
+  font-size: 1.55rem;
+  line-height: 1.2;
+}
+html:not(.landing-page) .md-typeset p,
+html:not(.landing-page) .md-typeset li { color: #a9b4bf; }
+html:not(.landing-page) .md-typeset strong { color: #edf2f6; }
+html:not(.landing-page) .md-typeset hr {
+  margin: 30px 0;
+  border-color: rgba(255,255,255,.12);
+}
+html:not(.landing-page) .md-typeset .md-button {
+  min-height: 50px;
+  margin-right: 8px;
+  padding: 13px 22px;
+  border-radius: 0;
+  font: 600 .76rem/1 'JetBrains Mono', monospace;
+  letter-spacing: .03em;
+}
+html:not(.landing-page) .md-typeset .md-button--primary {
+  color: #15100a;
+  border: 1px solid #e9a033;
+  background: #e9a033;
+  box-shadow: 0 10px 40px rgba(233,160,51,.16);
+}
+html:not(.landing-page) .md-typeset pre > code,
+html:not(.landing-page) .md-typeset table:not([class]),
+html:not(.landing-page) .md-typeset .admonition,
+html:not(.landing-page) .md-typeset details {
+  border-radius: 0;
+  border-color: rgba(255,255,255,.12);
+  background-color: rgba(11,16,23,.88);
+}
+html:not(.landing-page) .md-footer {
+  background: #06090d;
+  border-top: 1px solid rgba(255,255,255,.1);
+}
+
+@media screen and (max-width: 76.234375em) {
+  html:not(.landing-page) .md-main__inner {
+    width: min(calc(100% - 48px), 920px);
+    display: block;
+    padding: 58px 0 100px;
+  }
+  html:not(.landing-page) .md-content { width: 100%; }
+  html:not(.landing-page) .md-sidebar--primary {
+    left: 0;
+    width: 100vw;
+    max-width: 100vw;
+    transform: translateX(-100%);
+  }
+  html:not(.landing-page) #__drawer:checked ~ .md-container .md-sidebar--primary {
+    transform: translateX(0);
+  }
+  html:not(.landing-page) .md-sidebar--primary .md-sidebar__scrollwrap {
+    background: #080b10;
+  }
+  html:not(.landing-page) .md-sidebar--primary .md-nav--primary {
+    width: min(calc(100% - 32px), 520px);
+    margin-inline: auto;
+  }
+  html:not(.landing-page) .md-sidebar--primary .md-sidebar__inner {
+    padding: 1.2rem;
+    border: 0;
+    background: #0b1017;
+  }
+}
+
+@media screen and (max-width: 76.234375em) {
+  html:not(.landing-page) .docs-site-nav { height: 70px; }
+  html:not(.landing-page) .docs-site-nav .nav-inner { width: calc(100% - 32px); }
+  html:not(.landing-page) .docs-site-nav .nav-brand img,
+  html:not(.landing-page) .docs-site-nav .nav-brand svg { width: 116px; }
+  html:not(.landing-page) .docs-site-nav .nav-toggle {
+    width: 42px;
+    height: 42px;
+    display: block;
+    padding: 10px;
+    color: #f8fafc;
+    cursor: pointer;
+  }
+  html:not(.landing-page) .docs-site-nav .nav-toggle span {
+    display: block;
+    width: 21px;
+    height: 1px;
+    margin: 5px auto;
+    background: currentColor;
+    transition: .2s;
+  }
+  html:not(.landing-page) .docs-site-nav .nav-toggle.open span:first-child { transform: translateY(6px) rotate(45deg); }
+  html:not(.landing-page) .docs-site-nav .nav-toggle.open span:nth-child(2) { opacity: 0; }
+  html:not(.landing-page) .docs-site-nav .nav-toggle.open span:last-child { transform: translateY(-6px) rotate(-45deg); }
+  html:not(.landing-page) .docs-site-nav .nav-links {
+    display: none;
+    position: fixed;
+    z-index: 1;
+    top: calc(var(--rf-banner-h, 0px) + 70px);
+    right: 0;
+    left: 0;
+    height: calc(100svh - var(--rf-banner-h, 0px) - 70px);
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    padding: clamp(28px, 8vw, 72px);
+    overflow: auto;
+    background: rgba(8,11,16,.99);
+    border-top: 1px solid rgba(255,255,255,.11);
+  }
+  html:not(.landing-page) .docs-site-nav .nav-links.open { display: flex; }
+  html:not(.landing-page) .docs-site-nav .nav-links > a,
+  html:not(.landing-page) .docs-search-trigger,
+  html:not(.landing-page) .docs-browse-trigger {
+    width: 100%;
+    height: auto;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 14px;
+    margin: 0;
+    padding: 12px 0;
+    border: 0;
+    border-bottom: 1px solid rgba(255,255,255,.11);
+    background: none;
+    color: #a8b3bd;
+    font: 600 clamp(1.8rem, 7vw, 3.3rem)/1 Oswald, 'Oswald Fallback', sans-serif;
+    letter-spacing: -.02em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+  html:not(.landing-page) .docs-site-nav .nav-links > a:hover,
+  html:not(.landing-page) .docs-site-nav .nav-links > a.active,
+  html:not(.landing-page) .docs-search-trigger:hover,
+  html:not(.landing-page) .docs-browse-trigger:hover {
+    color: #f3c46b;
+    background: none;
+  }
+  html:not(.landing-page) .docs-search-trigger > span { display: inline; }
+  html:not(.landing-page) .docs-search-trigger svg { width: 24px; height: 24px; }
+  html:not(.landing-page) .docs-site-nav .nav-github {
+    width: 100%;
+    flex: 0 0 auto;
+    margin-top: 12px;
+    border-bottom: 0;
+  }
+  html:not(.landing-page) .docs-site-nav .nav-github svg { width: 24px; height: 24px; }
+  html:not(.landing-page) .md-container { padding-top: 70px; }
+  html:not(.landing-page) .md-main { min-height: calc(100svh - 70px); }
+  html:not(.landing-page) .md-main::before { width: 100%; opacity: .07; }
+  html:not(.landing-page) .md-sidebar--primary {
+    top: calc(var(--rf-banner-h, 0px) + 70px);
+    height: calc(100svh - var(--rf-banner-h, 0px) - 70px);
+  }
+}
+
+@media screen and (max-width: 600px) {
+  html:not(.landing-page) .md-main__inner {
+    width: calc(100% - 32px);
+    padding: 44px 0 80px;
+  }
+  html:not(.landing-page) .md-typeset h1 {
+    font-size: clamp(2.8rem, 14vw, 4rem);
+  }
+  html:not(.landing-page) .md-typeset h1::before {
+    margin-bottom: 20px;
+    padding-left: 34px;
+    background-size: 22px 1px;
+    font-size: .56rem;
+  }
+  html:not(.landing-page) .md-typeset h1 + p { font-size: 1rem; }
+  html:not(.landing-page) .md-typeset .md-button {
+    display: table;
+    width: fit-content;
+    max-width: 100%;
+    margin: 0 0 10px;
+  }
+}
