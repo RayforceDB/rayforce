@@ -29,6 +29,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Truthiness for the integer AND/OR fallback lane.  `LV_READ`/`RV_READ` widen
+ * integer operands to double, so do not try to recognize null sentinels here:
+ * valid I64 values near NULL_I64 collapse to the same binary64 value.  The
+ * caller's null post-pass clears true null rows; this helper only avoids the
+ * old UB-prone cast-to-uint8_t truthiness and tests non-zero values. */
+static inline uint8_t truthy_intish(double v) {
+    return v != 0.0 ? 1 : 0;
+}
+
+static inline uint8_t truthy_f64ish(double v) {
+    return (v == v && v != 0.0) ? 1 : 0;
+}
+
 static bool atom_to_numeric(ray_t* atom, double* out_f, int64_t* out_i, bool* out_is_f64) {
     if (!atom || !ray_is_atom(atom)) return false;
     switch (atom->type) {
@@ -3217,7 +3230,10 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     } else if (out_type == RAY_BOOL) {
         uint8_t* odst = (uint8_t*)dst;
         if (src_is_i64_all) {
-            /* Integer-family operands: compare as int64 */
+            /* Integer-family operands: compare as int64.  AND/OR truthiness
+             * only tests zero here; fix_null_comparisons clears true null rows
+             * after the range kernel without relying on lossy I64->double
+             * sentinel recognition. */
             switch (op->opcode) {
                 case OP_EQ:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li==ri;}break;
                 case OP_NE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li!=ri;}break;
@@ -3225,8 +3241,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
                 case OP_LE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li<=ri;}break;
                 case OP_GT:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li>ri;}break;
                 case OP_GE:  for(int64_t i=0;i<n;i++){int64_t li=(int64_t)LV_READ(i),ri=(int64_t)RV_READ(i);odst[i]=li>=ri;}break;
-                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li&&ri;}break;
-                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li||ri;}break;
+                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=truthy_intish(LV_READ(i)),ri=truthy_intish(RV_READ(i));odst[i]=li&&ri;}break;
+                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=truthy_intish(LV_READ(i)),ri=truthy_intish(RV_READ(i));odst[i]=li||ri;}break;
                 default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
             }
         } else {
@@ -3238,8 +3254,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
                 case OP_LE:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?1:ln?1:rn?0:lv<=rv;}break;
                 case OP_GT:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?0:rn?1:ln?0:lv>rv;}break;
                 case OP_GE:  for(int64_t i=0;i<n;i++){double lv=LV_READ(i),rv=RV_READ(i);int ln=lv!=lv,rn=rv!=rv;odst[i]=(ln&&rn)?1:rn?1:ln?0:lv>=rv;}break;
-                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li&&ri;}break;
-                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=(uint8_t)LV_READ(i),ri=(uint8_t)RV_READ(i);odst[i]=li||ri;}break;
+                case OP_AND: for(int64_t i=0;i<n;i++){uint8_t li=truthy_f64ish(LV_READ(i)),ri=truthy_f64ish(RV_READ(i));odst[i]=li&&ri;}break;
+                case OP_OR:  for(int64_t i=0;i<n;i++){uint8_t li=truthy_f64ish(LV_READ(i)),ri=truthy_f64ish(RV_READ(i));odst[i]=li||ri;}break;
                 default:     for(int64_t i=0;i<n;i++)odst[i]=0;break;
             }
         }
