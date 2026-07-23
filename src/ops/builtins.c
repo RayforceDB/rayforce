@@ -2151,6 +2151,16 @@ static void where_emit_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) 
     }
 }
 
+/* Local copy of ops/internal.h's ray_par_dispatch_ok — this file cannot
+ * include ops/internal.h (its clear_neg_zero clashes with the local one).
+ * Same contract: workers exist, enough elements, and not already inside an
+ * in-flight dispatch (single-producer task ring). */
+extern _Atomic(uint32_t) ray_parallel_flag;   /* core/platform.h */
+static inline bool where_par_dispatch_ok(ray_pool_t* p, int64_t n) {
+    return p && p->n_workers > 0 && n >= RAY_PARALLEL_THRESHOLD &&
+           atomic_load_explicit(&ray_parallel_flag, memory_order_relaxed) == 0;
+}
+
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
         return ray_error("type", "where: argument must be a b8 vector, got %s", ray_type_name(x->type));
@@ -2158,7 +2168,7 @@ ray_t* ray_where_fn(ray_t* x) {
     int64_t n = x->len;
 
     ray_pool_t* pool = ray_pool_get();
-    if (pool && pool->n_workers > 0 && n >= RAY_PARALLEL_THRESHOLD) {
+    if (where_par_dispatch_ok(pool, n)) {
         /* One task per chunk (ray_pool_dispatch_n).  Chunk count is capped
          * at 1024 — the pool's INITIAL ring capacity — so dispatch_n never
          * needs to grow the ring (its clamp-on-grow-failure silently DROPS

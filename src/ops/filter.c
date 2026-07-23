@@ -257,9 +257,9 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
      * parallel chunked count/fill; anything else (lazy / morsel-backed
      * pred, small input) keeps the sequential morsel sweep. */
     ray_pool_t* fidx_pool = ray_pool_get();
-    bool fidx_par = fidx_pool && fidx_pool->n_workers > 0 &&
-                    pred->type == RAY_BOOL && !ray_is_lazy(pred) &&
-                    pred->len >= RAY_PARALLEL_THRESHOLD;
+    const int64_t fidx_rows = pred->len;   /* == table nrows for table input */
+    bool fidx_par = ray_par_dispatch_ok(fidx_pool, fidx_rows) &&
+                    pred->type == RAY_BOOL && !ray_is_lazy(pred);
     ray_t* fidx_hdr = NULL;
     fidx_ctx_t fidx = { .bits = NULL, .nrows = 0, .chunk_rows = FIDX_CHUNK_ROWS,
                         .chunk_counts = NULL, .match_idx = NULL };
@@ -305,7 +305,10 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
         }
     }
 
-    /* Vector filter — single column, use sequential path */
+    /* Vector filter — single column, sequential fill.  The parallel count
+     * above is NOT wasted here: pass_count sizes the output vector, saving
+     * exec_filter_vec its own counting sweep.  Only the chunk-offset prefix
+     * (≤1024 adds) goes unused. */
     if (input->type != RAY_TABLE) {
         scratch_free(fidx_hdr);
         return exec_filter_vec(input, pred, pass_count);
@@ -313,10 +316,11 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
 
     /* table filter: parallel gather using compact match index */
     int64_t ncols = ray_table_ncols(input);
-    int64_t nrows = ray_table_nrows(input);
 
-    /* Fall back to sequential for tiny inputs or degenerate tables */
-    if (nrows <= RAY_PARALLEL_THRESHOLD || ncols <= 0) {
+    /* Fall back to sequential for tiny inputs or degenerate tables
+     * (fidx_rows == pred->len == table nrows — the same row count the
+     * fidx_par gate keyed off, so gate and fallback can never disagree). */
+    if (fidx_rows <= RAY_PARALLEL_THRESHOLD || ncols <= 0) {
         scratch_free(fidx_hdr);
         return exec_filter_seq(input, pred, ncols, pass_count);
     }
@@ -730,8 +734,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         uint32_t n_segs = meta->n_segs;
         ray_pool_t* sc_pool = ray_pool_get();
         ray_t* soff_hdr = NULL;
-        int64_t* seg_out = (sc_pool && sc_pool->n_workers > 0 &&
-                            nrows >= RAY_PARALLEL_THRESHOLD)
+        int64_t* seg_out = ray_par_dispatch_ok(sc_pool, nrows)
             ? (int64_t*)scratch_alloc(&soff_hdr, (size_t)n_segs * sizeof(int64_t))
             : NULL;
         if (seg_out) {

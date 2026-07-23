@@ -816,7 +816,7 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op) {
         }
 
         ray_pool_t* pool = ray_pool_get();
-        bool par = pool && pool->n_workers > 0 && len >= RAY_PARALLEL_THRESHOLD;
+        bool par = ray_par_dispatch_ok(pool, len);
         if (par && out_type == RAY_SYM) {
             /* Vector STR sides intern per element — serial only.  Non-STR
              * vector sides must be SYM columns; warm each non-runtime
