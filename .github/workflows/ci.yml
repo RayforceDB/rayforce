@@ -52,6 +52,10 @@ jobs:
   # suite each run and cached so coverage accretes across runs.
   fuzz-smoke:
     runs-on: ubuntu-latest
+    env:
+      # Hosted runner `-march=native` can expose transient CPU features that
+      # clang promotes to -Werror diagnostics; fuzzing does not need native ISA.
+      RAY_MARCH: x86-64
     steps:
       - uses: actions/checkout@v4
       - name: Cache fuzz corpus

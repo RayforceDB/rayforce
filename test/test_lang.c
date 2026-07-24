@@ -411,6 +411,90 @@ static test_result_t test_eval_symbol_head_applies(void) {
     PASS();
 }
 
+static test_result_t test_eval_literal_fallback_preserves_boxed_data(void) {
+    ray_t* setup = ray_eval_str("(set echo (fn [x] x))");
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    ray_t* msg = ray_eval_str("(list 'echo (list {lo: 0 hi: 10} {lo: 10 hi: 20}))");
+    TEST_ASSERT_NOT_NULL(msg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(msg));
+    TEST_ASSERT_EQ_I(msg->type, RAY_LIST);
+
+    ray_t** msg_elems = (ray_t**)ray_data(msg);
+    msg_elems[1]->attrs |= RAY_EVAL_LITERAL_FALLBACK;
+
+    ray_t* result = ray_eval(msg);
+    ray_release(msg);
+
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(result->len, 2);
+
+    ray_t** rows = (ray_t**)ray_data(result);
+    TEST_ASSERT_EQ_I(rows[0]->type, RAY_DICT);
+    TEST_ASSERT_EQ_I(rows[1]->type, RAY_DICT);
+
+    ray_t* lo_key = ray_sym(ray_sym_intern("lo", 2));
+    ray_t* hi_key = ray_sym(ray_sym_intern("hi", 2));
+    TEST_ASSERT_NOT_NULL(lo_key);
+    TEST_ASSERT_NOT_NULL(hi_key);
+
+    ray_t* lo0 = ray_dict_get(rows[0], lo_key);
+    ray_t* hi1 = ray_dict_get(rows[1], hi_key);
+    TEST_ASSERT_NOT_NULL(lo0);
+    TEST_ASSERT_NOT_NULL(hi1);
+    TEST_ASSERT_EQ_I(lo0->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(hi1->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(lo0->i64, 0);
+    TEST_ASSERT_EQ_I(hi1->i64, 20);
+
+    ray_release(lo0);
+    ray_release(hi1);
+    ray_release(lo_key);
+    ray_release(hi_key);
+    ray_release(result);
+
+    ray_t* sym_msg = ray_eval_str("(list 'echo (list 'ipc_data_tag 1))");
+    TEST_ASSERT_NOT_NULL(sym_msg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sym_msg));
+    TEST_ASSERT_EQ_I(sym_msg->type, RAY_LIST);
+
+    ray_t** sym_elems = (ray_t**)ray_data(sym_msg);
+    sym_elems[1]->attrs |= RAY_EVAL_LITERAL_FALLBACK;
+
+    ray_t* sym_result = ray_eval(sym_msg);
+    ray_release(sym_msg);
+    TEST_ASSERT_NOT_NULL(sym_result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(sym_result));
+    TEST_ASSERT_EQ_I(sym_result->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(sym_result->len, 2);
+    ray_t** sym_rows = (ray_t**)ray_data(sym_result);
+    TEST_ASSERT_EQ_I(sym_rows[0]->type, -RAY_SYM);
+    TEST_ASSERT_EQ_I(sym_rows[1]->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(sym_rows[1]->i64, 1);
+    ray_release(sym_result);
+
+    ray_t* expr_msg = ray_eval_str("(list 'echo (list + 1 2))");
+    TEST_ASSERT_NOT_NULL(expr_msg);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(expr_msg));
+    TEST_ASSERT_EQ_I(expr_msg->type, RAY_LIST);
+
+    ray_t** expr_elems = (ray_t**)ray_data(expr_msg);
+    expr_elems[1]->attrs |= RAY_EVAL_LITERAL_FALLBACK;
+
+    ray_t* expr_result = ray_eval(expr_msg);
+    ray_release(expr_msg);
+    TEST_ASSERT_NOT_NULL(expr_result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(expr_result));
+    TEST_ASSERT_EQ_I(expr_result->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(expr_result->i64, 3);
+    ray_release(expr_result);
+    PASS();
+}
+
 /* ---- Test: eval if true ---- */
 static test_result_t test_eval_if_true(void) {
     ray_t* result = ray_eval_str("(if true 1 2)");
@@ -8439,6 +8523,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/cmp", test_eval_cmp, lang_setup, lang_teardown },
     { "lang/eval/set", test_eval_set, lang_setup, lang_teardown },
     { "lang/eval/symbol_head_applies", test_eval_symbol_head_applies, lang_setup, lang_teardown },
+    { "lang/eval/literal_fallback_preserves_boxed_data", test_eval_literal_fallback_preserves_boxed_data, lang_setup, lang_teardown },
     { "lang/eval/if_true", test_eval_if_true, lang_setup, lang_teardown },
     { "lang/eval/if_false", test_eval_if_false, lang_setup, lang_teardown },
     { "lang/eval/let", test_eval_let, lang_setup, lang_teardown },

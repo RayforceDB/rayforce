@@ -45,6 +45,9 @@ jobs:
 
   fuzz-long:
     runs-on: ubuntu-latest
+    env:
+      # Keep clang fuzz builds off hosted-runner native ISA quirks.
+      RAY_MARCH: x86-64
     strategy:
       fail-fast: false
       matrix:
