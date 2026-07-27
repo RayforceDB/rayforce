@@ -95,11 +95,11 @@
 (set Pgmk (pivot Tgmk ['a 'b] 'c 'v (fn [xs] (sum xs))))
 (count Pgmk) -- 4
 ;; Index columns survive verbatim; pivot columns p/q carry the summed
-;; values with zero-fill where the (a,b,c) combination never occurred.
+;; values with null-fill where the (a,b,c) combination never occurred.
 (at Pgmk 'a) -- ['X 'X 'Y 'Y]
 (at Pgmk 'b) -- [1 2 1 2]
-(at Pgmk 'p) -- [10 0 30 0]
-(at Pgmk 'q) -- [0 20 0 40]
+(at Pgmk 'p) -- [10 0N 30 0N]
+(at Pgmk 'q) -- [0N 20 0N 40]
 
 ;; Pivot column = i64 vec, lambda agg → fallback path that snprintfs the
 ;; i64 value into a column name ("col10" / "col20" via the i64 branch).
