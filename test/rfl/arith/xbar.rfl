@@ -15,3 +15,10 @@
 ;; distance to bucket in [0, step)
 (set D (- V (xbar V 10)))
 (count V) -- (sum (and (>= D 0) (< D 10)))
+
+;; Narrow integer vectors with a wide I64 bucket must avoid truncating the
+;; bucket to zero in the vector fast path.
+(type (xbar (as 'I32 [10 20]) 4294967296)) -- 'I64
+(xbar (as 'I32 [-10 20]) 4294967296) -- [-4294967296 0]
+(type (xbar (as 'I16 [10 20]) 65536)) -- 'I64
+(xbar (as 'I16 [-10 20]) 65536) -- [-65536 0]
