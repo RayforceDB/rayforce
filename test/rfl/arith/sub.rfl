@@ -115,6 +115,12 @@
 (- (as 'DATE 7305) (as 'I32 30)) -- 2019.12.02
 ;; DATE - I16
 (- (as 'DATE 7305) (as 'I16 5)) -- 2019.12.27
+;; DATE/TIME/TIMESTAMP offsets must be integer typed; float offsets are type errors.
+(- (as 'DATE 7305) 1.5) !- type
+(- (as 'TIME 5000) 1.5) !- type
+(- (as 'TIMESTAMP 5000) 1.5) !- type
+(- (as 'DATE [7305 7306]) 1.5) !- type
+(- (as 'DATE 7305) 0Nf) !- type
 
 ;; DATE - DATE → I32 (days)
 (- (as 'DATE 7310) (as 'DATE 7305)) -- 5
