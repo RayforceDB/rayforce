@@ -596,11 +596,17 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
 
     /* Value columns */
     for (int64_t p = 0; p < n_pv; p++) {
+        int8_t agg_type = RAY_I64;
+        for (int64_t gi = 0; gi < n_grps; gi++) {
+            if (gm_pv[gi] != p) continue;
+            if (ar[gi]->type == -RAY_F64) { agg_type = RAY_F64; break; }
+        }
+
         ray_t* col_vals = ray_list_new((int32_t)n_ix);
         for (int64_t r = 0; r < n_ix; r++) {
-            ray_t* zero = ray_i64(0);
-            col_vals = ray_list_append(col_vals, zero);
-            ray_release(zero);
+            ray_t* nullv = ray_typed_null((int8_t)-agg_type);
+            col_vals = ray_list_append(col_vals, nullv);
+            ray_release(nullv);
         }
 
         for (int64_t gi = 0; gi < n_grps; gi++) {
@@ -611,11 +617,6 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
             cv[gm_ix[gi]] = ar[gi];
         }
 
-        int8_t agg_type = RAY_I64;
-        { ray_t** cv = (ray_t**)ray_data(col_vals);
-          for (int64_t r = 0; r < n_ix; r++)
-            if (cv[r]->type == -RAY_F64) { agg_type = RAY_F64; break; }
-        }
         ray_t* agg_vec = list_to_typed_vec(col_vals, agg_type);
         if (RAY_IS_ERR(agg_vec)) { ray_release(result); result = agg_vec; goto fb_cleanup; }
 

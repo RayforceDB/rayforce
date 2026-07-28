@@ -158,6 +158,9 @@
 (nil? (at (at Pcs 'y) 1)) -- true
 ;; present cell that genuinely sums to a value stays a value (not nulled)
 (at (at Pcs 'x) 1) -- 3
+(set PcsFn (pivot Ts 'r 'c 'v (fn [xs] (sum xs))))
+(nil? (at (at PcsFn 'y) 1)) -- true
+(at (at PcsFn 'x) 1) -- 3
 (set Pcc (pivot Ts 'r 'c 'v count))
 (nil? (at (at Pcc 'y) 1)) -- true
 (at (at Pcc 'x) 1) -- 1
