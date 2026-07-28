@@ -10825,6 +10825,14 @@ static void xbar_par_fn(void* vctx, uint32_t worker_id,
     }
 }
 
+static bool xbar_bucket_fits_vec_type(int8_t out_type, int64_t b) {
+    if (out_type == RAY_I32 || out_type == RAY_DATE || out_type == RAY_TIME)
+        return b >= INT32_MIN && b <= INT32_MAX;
+    if (out_type == RAY_I16)
+        return b >= INT16_MIN && b <= INT16_MAX;
+    return true;
+}
+
 ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
     /* Vectorised fast path for `(xbar VEC scalar_int)` on integer or
      * temporal columns.  The generic atomic_map_binary path was
@@ -10847,6 +10855,8 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
         !RAY_ATOM_IS_NULL(bucket)) {
         int64_t b = bucket->i64;
         if (b == 0) return ray_error("domain", "xbar: bucket size must be non-zero");
+        if (!xbar_bucket_fits_vec_type(col->type, b))
+            return atomic_map_binary(ray_xbar_fn, col, bucket);
         int64_t n = col->len;
         ray_t* out = ray_vec_new(col->type, n);
         if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
