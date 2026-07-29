@@ -110,6 +110,12 @@
 (type (* 3 (as 'TIME 1000))) -- 'time
 (* (as 'TIME 1000) 3) -- 00:00:03.000
 (type (* (as 'TIME 1000) 3)) -- 'time
+;; TIME scaling only admits integer factors; float factors used to read raw
+;; F64 union bits as i64 and trip signed-overflow UBSan.
+(* (as 'TIME 1000) 1.5) !- type
+(* 1.5 (as 'TIME 1000)) !- type
+(* (as 'TIME [1000 2000]) 1.5) !- type
+(* (as 'TIME 1000) 0Nf) !- type
 
 ;; null-int * TIME → null TIME (line 174 path)
 (nil? (* 0Ni (as 'TIME 1000))) -- true
