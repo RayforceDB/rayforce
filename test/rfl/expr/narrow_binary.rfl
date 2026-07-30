@@ -168,17 +168,15 @@
 (set _Tu8 (table [x] (list (as 'U8 [4 5 6]))))
 (at (select {y: (* x 2.0) from: _Tu8}) 'y) -- [8.0 10.0 12.0]
 
-;; TIMESTAMP column → F64 scratch (line 625-628 I64/TIMESTAMP path)
+;; Temporal columns route to eval fallback so builtin temporal rules are preserved.
 (set _Tts (table [x] (list (as 'TIMESTAMP [1000 2000 3000]))))
-(at (select {y: (* x 2.0) from: _Tts}) 'y) -- [2000.0 4000.0 6000.0]
+(select {y: (* x 2.0) from: _Tts}) !- type
 
-;; DATE column → F64 scratch (line 633: DATE/TIME path via I32)
 (set _Td (table [x] (list (as 'DATE [0 1 2]))))
-(at (select {y: (* x 2.0) from: _Td}) 'y) -- [0.0 2.0 4.0]
+(select {y: (* x 2.0) from: _Td}) !- type
 
-;; TIME column → F64 scratch
 (set _Tt (table [x] (list (as 'TIME [100 200 300]))))
-(at (select {y: (* x 2.0) from: _Tt}) 'y) -- [200.0 400.0 600.0]
+(select {y: (* x 2.0) from: _Tt}) !- type
 
 ;; BOOL column → F64 scratch (line 637-640 U8/BOOL path)
 (set _Tb (table [x] (list (as 'BOOL [true false true]))))

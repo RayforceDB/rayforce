@@ -99,26 +99,14 @@
 (select {s: (sum (+ x 3.5)) from: Tce}) -- (table [s] (list [32.5]))
 
 ;; ===================================================================
-;; DATE constant in arithmetic → atom_to_numeric called with -RAY_DATE
-;; type (line 38: case -RAY_DATE → Branch(39:9) True).
-;; 2024.01.01 represents 8766 days; sum(x * 8766) = 15 * 8766 = 131490
+;; Temporal constants in arithmetic must follow builtin temporal rules.
+;; The query DAG used to demote them to raw integers; the eval fallback now
+;; preserves builtin results for valid pairs and type errors for invalid pairs.
 ;; ===================================================================
-(select {s: (sum (* x 2024.01.01)) from: Tce}) -- (table [s] (list [131490]))
-
-;; ===================================================================
-;; TIME constant in arithmetic → atom_to_numeric with -RAY_TIME
-;; (line 39: case -RAY_TIME → Branch(40:9) True).
-;; 12:00:00 = 43200000ms; sum(x * 43200000) = 15 * 43200000 = 648000000
-;; ===================================================================
-(select {s: (sum (* x 12:00:00)) from: Tce}) -- (table [s] (list [648000000]))
-
-;; ===================================================================
-;; TIMESTAMP constant in arithmetic → atom_to_numeric with -RAY_TIMESTAMP
-;; (line 40: case -RAY_TIMESTAMP → Branch(40:9) True).
-;; 2000.01.01D00:00:00.000000001 = 1 nanosecond since epoch.
-;; sum(x * 1) = 1+2+3+4+5 = 15
-;; ===================================================================
-(select {s: (sum (* x 2000.01.01D00:00:00.000000001)) from: Tce}) -- (table [s] (list [15]))
+(select {s: (sum (* x 2024.01.01)) from: Tce}) !- type
+(type (at (select {s: (sum (* x 12:00:00)) from: Tce}) 's)) -- 'TIME
+(as 'I32 (at (at (select {s: (sum (* x 12:00:00)) from: Tce}) 's) 0)) -- 648000000i
+(select {s: (sum (* x 2000.01.01D00:00:00.000000001)) from: Tce}) !- type
 
 ;; ===================================================================
 ;; F64 NEG constant → eval_const_numeric_expr NEG/ABS branch (line 83:25)

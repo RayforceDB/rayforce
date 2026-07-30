@@ -71,6 +71,34 @@
 (at (select {x: (<= a b) from: Tc}) 'x) -- [true true true false false]
 (sum (as 'I64 (at (select {x: (<= a b) from: Tc}) 'x))) -- 3
 
+;; ────────────── temporal arithmetic routes to eval fallback ──────────────
+;; The generic DAG treats temporal values as raw integers, which demotes
+;; special temporal semantics. Projection fallback must preserve the builtin
+;; rules instead: valid pairs keep their temporal/difference types, invalid
+;; pairs surface type errors.
+(set Ttm (table [d1 d2 t1 t2 p1 p2] (list (as 'DATE [10 20]) (as 'DATE [20 30]) (as 'TIME [1000 2000]) (as 'TIME [2000 3000]) (as 'TIMESTAMP [1000 2000]) (as 'TIMESTAMP [2000 3000]))))
+(type (at (select {x: (+ d1 2) from: Ttm}) 'x)) -- 'DATE
+(at (select {x: (+ t1 t2) from: Ttm}) 'x) -- [00:00:03.000 00:00:05.000]
+(type (at (select {x: (- d2 d1) from: Ttm}) 'x)) -- 'I32
+(at (select {x: (- d2 d1) from: Ttm}) 'x) -- [10 10]
+(type (at (select {x: (* t1 2) from: Ttm}) 'x)) -- 'TIME
+(select {x: (+ d1 d2) from: Ttm}) !- type
+(select {x: (+ p1 p2) from: Ttm}) !- type
+(select {x: (- d1 1.5) from: Ttm}) !- type
+(select {x: (* t1 1.5) from: Ttm}) !- type
+
+;; Grouped aggregations use the same temporal fallback instead of failing
+;; compile or renaming mixed fallback/DAG outputs incorrectly.
+(set Ttmg (table [k d1 d2 t1 v] (list [a a b b] [2024.01.01 2024.01.02 2024.01.03 2024.01.04] [2024.01.11 2024.01.12 2024.01.13 2024.01.14] [00:00:01.000 00:00:02.000 00:00:03.000 00:00:04.000] [1 2 3 4])))
+(set Gspan (select {span: (avg (- d2 d1)) from: Ttmg by: k}))
+(at Gspan 'span) -- [10.0 10.0]
+(set Gtime (select {total: (sum (* t1 2)) from: Ttmg by: k}))
+(type (at Gtime 'total)) -- 'TIME
+(as 'I32 (at Gtime 'total)) -- [6000 14000]
+(set Gmix (select {span: (avg (- d2 d1)) qty: (sum v) from: Ttmg by: k}))
+(at Gmix 'span) -- [10.0 10.0]
+(at Gmix 'qty) -- [3 7]
+
 ;; ────────────── compound where: AND / OR with derived comparisons ──────────────
 (set Tw (table [a b] (list [1 2 3 4 5 6 7 8] [10 20 30 40 50 60 70 80])))
 (at (select {from: Tw where: (and (> a 2) (< b 60))}) 'a) -- [3 4 5]
