@@ -1853,6 +1853,8 @@ static int expr_contains_agg(ray_t* expr) {
 }
 
 static int is_group_dag_agg_expr(ray_t* expr);  /* defined below */
+static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
+                               uint16_t* out_op, ray_t** out_arg);
 
 /* ── Arith-of-aggs decomposition ──────────────────────────────────────────
  * A select-by output like (/ (sum a) (as 'F64 (sum b))) is not itself a
@@ -2042,6 +2044,71 @@ static int is_group_dag_agg_expr(ray_t* expr) {
             return 0;
     }
     return !expr_contains_call_named(elems[1], "distinct", 8);
+}
+
+static bool expr_literal_is_temporal(ray_t* expr) {
+    if (!expr) return false;
+    int8_t t = expr->type < 0 ? (int8_t)-expr->type : expr->type;
+    return dag_type_is_temporal(t);
+}
+
+static bool expr_dag_result_is_temporal(ray_t* expr, ray_t* tbl) {
+    if (expr_literal_is_temporal(expr)) return true;
+
+    ray_graph_t* pg = ray_graph_new(tbl);
+    if (!pg) return false;
+
+    ray_op_t* op = compile_expr_dag(pg, expr);
+    bool temporal = op && dag_type_is_temporal(op->out_type);
+    ray_graph_free(pg);
+    return temporal;
+}
+
+static bool expr_contains_temporal_arith(ray_t* expr, ray_t* tbl) {
+    if (!expr || expr->type != RAY_LIST) return false;
+
+    ray_t** elems = (ray_t**)ray_data(expr);
+    int64_t n = ray_len(expr);
+    if (n >= 3 && elems[0] && elems[0]->type == -RAY_SYM) {
+        ray_t* name = ray_sym_str(elems[0]->i64);
+        size_t len = name ? ray_str_len(name) : 0;
+        const char* s = name ? ray_str_ptr(name) : NULL;
+        if (len == 1 && (s[0] == '+' || s[0] == '-' || s[0] == '*')) {
+            if (expr_dag_result_is_temporal(elems[1], tbl) ||
+                expr_dag_result_is_temporal(elems[2], tbl))
+                return true;
+        }
+    }
+
+    for (int64_t i = 0; i < n; i++)
+        if (expr_contains_temporal_arith(elems[i], tbl))
+            return true;
+    return false;
+}
+
+static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl) {
+    if (!is_group_dag_agg_expr(expr)) return 0;
+
+    ray_t** elems = (ray_t**)ray_data(expr);
+    uint16_t op = resolve_agg_opcode(elems[0]->i64);
+    ray_t* agg_arg = elems[1];
+    {
+        uint16_t new_op;
+        ray_t* new_arg;
+        if (simplify_agg_idiom(expr, tbl, &new_op, &new_arg)) {
+            op = new_op;
+            agg_arg = new_arg;
+        }
+    }
+
+    if (expr_contains_temporal_arith(agg_arg, tbl))
+        return 0;
+    if (agg_is_binary_agg(op)) {
+        if (ray_len(expr) < 3) return 1;
+        if (expr_contains_temporal_arith(elems[2], tbl))
+            return 0;
+    }
+    return 1;
 }
 
 static int is_single_group_key_projection(ray_t* by_expr, ray_t* val_expr) {
@@ -6297,7 +6364,7 @@ by_dict_done:
         (size_t)n_out_max * (3 * sizeof(int64_t) + 2 * sizeof(ray_t*)) +
         (size_t)hidden_max * (sizeof(ray_t*) + sizeof(int64_t)) +
         (size_t)nk_max * sizeof(ray_op_t*) +
-        (size_t)aggs_max * (2 * sizeof(ray_op_t*) + sizeof(int64_t) + sizeof(uint16_t)) +
+        (size_t)aggs_max * (2 * sizeof(ray_op_t*) + 2 * sizeof(int64_t) + sizeof(uint16_t)) +
         (size_t)2 * (size_t)n_dep_keys * sizeof(int64_t));
     if (!nonagg_names) {
         scratch_free(dep_src_hdr);
@@ -6314,7 +6381,8 @@ by_dict_done:
     ray_op_t** agg_ins        = key_ops + nk_max;
     ray_op_t** agg_ins2       = agg_ins + aggs_max;
     int64_t*   agg_k          = (int64_t*)(agg_ins2 + aggs_max);
-    dep_key_names             = agg_k + aggs_max;          /* [n_dep_keys] */
+    int64_t*   agg_names      = agg_k + aggs_max;
+    dep_key_names             = agg_names + aggs_max;      /* [n_dep_keys] */
     dep_key_biases            = dep_key_names + n_dep_keys; /* [n_dep_keys] */
     uint16_t*  agg_ops        = (uint16_t*)(dep_key_biases + n_dep_keys);
     /* Copy the bridged dependent-key names/biases into this block, then release
@@ -8324,7 +8392,7 @@ by_dict_done:
                 ray_t* expr = dict_elems[i + 1];
                 if (is_single_group_key_projection(by_expr, expr))
                     continue;
-                if (is_group_dag_agg_expr(expr)) {
+                if (is_group_dag_agg_expr_dag_safe(expr, tbl)) {
                     /* dag-aggs claim output slots in order.  Not a flat
                      * forcer. */
                     n_grp_agg_outputs++;
@@ -8566,7 +8634,7 @@ by_dict_done:
             if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id) continue;
 
             ray_t* val_expr = dict_elems[i + 1];
-            if (is_group_dag_agg_expr(val_expr)) {
+            if (is_group_dag_agg_expr_dag_safe(val_expr, tbl)) {
                 ray_t** agg_elems = (ray_t**)ray_data(val_expr);
                 uint16_t op = resolve_agg_opcode(agg_elems[0]->i64);
                 ray_t* agg_arg = agg_elems[1];
@@ -8585,6 +8653,7 @@ by_dict_done:
                 /* Compile the aggregation input (the column reference) */
                 agg_ins[n_aggs] = compile_expr_dag(g, agg_arg);
                 if (!agg_ins[n_aggs]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile aggregation argument"); }
+                agg_names[n_aggs] = kid;
                 /* Canonical aggregand type-admission (matches the scalar
                  * builtins): reject non-numeric / absolute-temporal inputs so a
                  * by-group sum/avg/var never silently folds symbol ids etc. */
@@ -9845,23 +9914,9 @@ by_dict_done:
                         ray_table_set_col_name(result, k, aliases[k]);
                 }
                 /* Rename only the agg columns (positions after keys).
-                 * Non-agg LIST columns were named at scatter time. */
-                ray_t* aun_hdr = NULL;
-                int64_t* agg_user_names = (int64_t*)scratch_alloc(&aun_hdr,
-                        (size_t)n_out_max * sizeof(int64_t));
-                int64_t n_agg_user = 0;
-                if (agg_user_names) {
-                    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
-                        int64_t kid = dict_elems[i]->i64;
-                        if (kid == from_id || kid == where_id || kid == by_id ||
-                            kid == take_id || kid == asc_id || kid == desc_id) continue;
-                        if (!is_group_dag_agg_expr(dict_elems[i + 1])) continue;
-                        if (n_agg_user < n_out_max) agg_user_names[n_agg_user++] = kid;
-                    }
-                    for (int64_t j = 0; j < n_agg_user && n_key_cols + j < ncols; j++)
-                        ray_table_set_col_name(result, n_key_cols + j, agg_user_names[j]);
-                }
-                scratch_free(aun_hdr);
+                 * Non-agg/fallback columns are named at scatter time. */
+                for (int64_t j = 0; j < n_aggs_real && n_key_cols + j < ncols; j++)
+                    ray_table_set_col_name(result, n_key_cols + j, agg_names[j]);
             } else {
                 /* Projection-only: columns are in dict order.  Rename each
                  * output column directly — a projection may have any number
