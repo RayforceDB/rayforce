@@ -1078,6 +1078,11 @@ static ray_t* parted_to_flat_vec(ray_t* x) {
     for (int64_t s = 0; s < x->len; s++)
         if (segs[s]) total += segs[s]->len;
 
+    /* RAY_LIST: share (retain) elements — ray_vec_new rejects type 0 and
+     * the per-cell copy below has no notion of nested elements. */
+    if (base == RAY_LIST)
+        return parted_flatten_list(segs, x->len, total);
+
     ray_t* out = ray_vec_new(base, base == RAY_STR ? 0 : total);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     if (base != RAY_STR) out->len = total;

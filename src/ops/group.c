@@ -7268,6 +7268,8 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
 
             if (base_type == RAY_STR) {
                 flat = parted_flatten_str(segs, col->len, total_rows);
+            } else if (base_type == RAY_LIST) {
+                flat = parted_flatten_list(segs, col->len, total_rows);
             } else {
                 uint8_t base_attrs = (base_type == RAY_SYM)
                                    ? parted_sym_max_attrs(segs, col->len) : 0;
@@ -7275,7 +7277,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                 if (!flat || RAY_IS_ERR(flat)) {
                     ray_release(flat_tbl);
                     scratch_free(needed_hdr);
-                    return ray_error("oom", NULL);
+                    return flat ? flat : ray_error("oom", NULL);
                 }
                 /* segment cells are copied id-preserving — all partitions
                  * resolve over the root symfile's domain (PARTED
@@ -7300,7 +7302,7 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
             if (!flat || RAY_IS_ERR(flat)) {
                 ray_release(flat_tbl);
                 scratch_free(needed_hdr);
-                return ray_error("oom", NULL);
+                return flat ? flat : ray_error("oom", NULL);
             }
 
             flat_tbl = ray_table_add_col(flat_tbl, name_id, flat);

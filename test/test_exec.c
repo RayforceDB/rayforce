@@ -26,6 +26,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "ops/ops.h"
+#include "ops/internal.h"
 #include "lang/eval.h"
 #include "table/sym.h"
 #include "core/profile.h"
@@ -17345,6 +17346,146 @@ static test_result_t test_exec_prod_sel_compact(void) {
 }
 
 /* ======================================================================
+ * LIST columns through the filter kernels (issue #355 follow-up)
+ *
+ * A LIST cell is a ray_t* — the byte-copy gather kernels must never see
+ * one (aliasing without a retain double-frees on release), and
+ * typed_vec_new rejects RAY_LIST (type 0), which used to silently DROP
+ * the column from the result.
+ * ====================================================================== */
+
+/* Build an n-row table [x: i64 0..n-1, brk: LIST cycling [10] / [20 30]]. */
+static ray_t* make_list_col_table(int64_t n) {
+    ray_t* xs = ray_vec_new(RAY_I64, n);
+    xs->len = n;
+    int64_t* xd = (int64_t*)ray_data(xs);
+    for (int64_t i = 0; i < n; i++) xd[i] = i;
+
+    int64_t a_raw[] = {10};
+    int64_t b_raw[] = {20, 30};
+    ray_t* a = ray_vec_from_raw(RAY_I64, a_raw, 1);
+    ray_t* b = ray_vec_from_raw(RAY_I64, b_raw, 2);
+    ray_t* brk = ray_list_new(n);
+    for (int64_t i = 0; i < n; i++)
+        brk = ray_list_append(brk, (i & 1) ? b : a);
+    ray_release(a);
+    ray_release(b);
+
+    ray_t* tbl = ray_table_new(2);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), xs);
+    tbl = ray_table_add_col(tbl, ray_sym_intern("brk", 3), brk);
+    ray_release(xs);
+    ray_release(brk);
+    return tbl;
+}
+
+/* All-rows BOOL predicate with the first `pass` elements set. */
+static ray_t* make_prefix_pred(int64_t n, int64_t pass) {
+    ray_t* pred = ray_vec_new(RAY_BOOL, n);
+    pred->len = n;
+    uint8_t* pd = (uint8_t*)ray_data(pred);
+    for (int64_t i = 0; i < n; i++) pd[i] = i < pass;
+    return pred;
+}
+
+/* exec_filter parallel gather (> RAY_PARALLEL_THRESHOLD rows) must keep
+ * the LIST column and retain its elements — it used to silently drop it
+ * (typed_vec_new rejects type 0 → new_cols[c] = NULL). */
+static test_result_t test_exec_filter_par_list_col(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    int64_t n = RAY_PARALLEL_THRESHOLD + 4096;
+    ray_t* tbl = make_list_col_table(n);
+    ray_t* pred = make_prefix_pred(n, 10);
+
+    ray_t* out = exec_filter(NULL, NULL, tbl, pred);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(ray_table_ncols(out), 2);
+    TEST_ASSERT_EQ_I(ray_table_nrows(out), 10);
+    ray_t* brk = ray_table_get_col(out, ray_sym_intern("brk", 3));
+    TEST_ASSERT_NOT_NULL(brk);
+    TEST_ASSERT_EQ_I(brk->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(brk->len, 10);
+    ray_t** be = (ray_t**)ray_data(brk);
+    TEST_ASSERT_EQ_I(be[0]->len, 1);   /* row 0 → [10] */
+    TEST_ASSERT_EQ_I(be[1]->len, 2);   /* row 1 → [20 30] */
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(be[1]))[1], 30);
+
+    /* Release the result BEFORE the source: an unretained aliasing gather
+     * would leave the table's elements freed (ASan double-free). */
+    ray_release(out);
+    ray_release(pred);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* exec_filter_head must keep LIST columns too (same silent-drop shape). */
+static test_result_t test_exec_filter_head_list_col(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_list_col_table(6);
+    ray_t* pred = make_prefix_pred(6, 6);  /* all pass; limit trims */
+
+    ray_t* out = exec_filter_head(tbl, pred, 3);
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+    TEST_ASSERT_EQ_I(ray_table_ncols(out), 2);
+    TEST_ASSERT_EQ_I(ray_table_nrows(out), 3);
+    ray_t* brk = ray_table_get_col(out, ray_sym_intern("brk", 3));
+    TEST_ASSERT_NOT_NULL(brk);
+    TEST_ASSERT_EQ_I(brk->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(brk->len, 3);
+    ray_t** be = (ray_t**)ray_data(brk);
+    TEST_ASSERT_EQ_I(be[1]->len, 2);   /* row 1 → [20 30] */
+
+    ray_release(out);
+    ray_release(pred);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* Filtering a standalone LIST vector (OP_FILTER over a scanned LIST
+ * column → exec_filter_vec) must gather elements with a retain — it used
+ * to reject with "type" via col_vec_new. */
+static test_result_t test_exec_filter_vec_list(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+
+    ray_t* tbl = make_list_col_table(6);
+
+    ray_graph_t* g = ray_graph_new(tbl);
+    ray_op_t* brk    = ray_scan(g, "brk");
+    ray_op_t* x      = ray_scan(g, "x");
+    ray_op_t* thresh = ray_const_i64(g, 3);
+    ray_op_t* pred   = ray_lt(g, x, thresh);
+    ray_op_t* filt   = ray_filter(g, brk, pred);
+
+    ray_t* result = ray_execute(g, filt);
+    TEST_ASSERT_NOT_NULL(result);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_LIST);
+    TEST_ASSERT_EQ_I(result->len, 3);
+    ray_t** re = (ray_t**)ray_data(result);
+    TEST_ASSERT_EQ_I(re[0]->len, 1);   /* [10] */
+    TEST_ASSERT_EQ_I(re[1]->len, 2);   /* [20 30] */
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(re[1]))[0], 20);
+
+    ray_release(result);
+    ray_graph_free(g);
+    ray_release(tbl);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
+/* ======================================================================
  * Suite
  * ====================================================================== */
 
@@ -17626,5 +17767,8 @@ const test_entry_t exec_entries[] = {
     { "exec/var_pop",                            test_exec_var_pop,                         NULL, NULL },
     { "exec/prod_f64",                           test_exec_prod_f64,                        NULL, NULL },
     { "exec/prod_sel_compact",                   test_exec_prod_sel_compact,                NULL, NULL },
+    { "exec/filter_par_list_col",                test_exec_filter_par_list_col,             NULL, NULL },
+    { "exec/filter_head_list_col",               test_exec_filter_head_list_col,            NULL, NULL },
+    { "exec/filter_vec_list",                    test_exec_filter_vec_list,                 NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

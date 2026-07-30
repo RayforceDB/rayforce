@@ -4231,6 +4231,78 @@ static test_result_t test_eval_insert_parted_physical_types(void) {
     return result;
 }
 
+/* ---- Test: nested (LIST) column through a parted view ------------------ */
+
+/* Two disk partitions, each with a LIST column whose rows are i64 vectors
+ * of different lengths (issue #355). */
+static bool lang_parted_list_fixture(const char* root) {
+    char day1[1024], day2[1024], sym_path[1024];
+    int n1 = snprintf(day1, sizeof(day1), "%s/2024.01.01/trades", root);
+    int n2 = snprintf(day2, sizeof(day2), "%s/2024.01.02/trades", root);
+    int ns = snprintf(sym_path, sizeof(sym_path), "%s/.sym", root);
+    if (n1 <= 0 || (size_t)n1 >= sizeof(day1) ||
+        n2 <= 0 || (size_t)n2 >= sizeof(day2) ||
+        ns <= 0 || (size_t)ns >= sizeof(sym_path))
+        return false;
+
+    const char* src =
+        "(table ['acct 'brk] "
+        "       (list ['a 'b] (list [0 250000] [0 250000 5000000])))";
+    return lang_parted_insert_save_table(src, day1, sym_path) &&
+           lang_parted_insert_save_table(src, day2, sym_path);
+}
+
+static test_result_t test_eval_parted_list_column_impl(const char* root) {
+    TEST_ASSERT(lang_parted_list_fixture(root), "create parted LIST fixture");
+
+    char src[1400];
+    int n = snprintf(src, sizeof(src),
+                     "(set pl (.db.parted.get \"%s\" 'trades))", root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(setup);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(setup));
+    ray_release(setup);
+
+    /* Flatten via `at`: all four rows, in partition order. */
+    ASSERT_EQ("(at pl 'brk)",
+              "(list [0 250000] [0 250000 5000000] "
+              "      [0 250000] [0 250000 5000000])");
+
+    /* Flatten via unfiltered select. */
+    ASSERT_EQ("(at (select {c: brk from: pl}) 'c)",
+              "(list [0 250000] [0 250000 5000000] "
+              "      [0 250000] [0 250000 5000000])");
+
+    /* Filtered select gathers matching rows with correct contents. */
+    ASSERT_EQ("(at (select {c: brk from: pl where: (== acct 'b)}) 'c)",
+              "(list [0 250000 5000000] [0 250000 5000000])");
+
+    /* Run the filtered select twice, releasing the first result in between
+     * (ASSERT_EQ releases it): the gather must retain the elements it
+     * copies out of the segments, or the second pass walks freed memory
+     * (double-free / use-after-free, issue #355). */
+    ASSERT_EQ("(count (select {c: brk from: pl where: (== acct 'b)}))", "2");
+    ASSERT_EQ("(count (select {c: brk from: pl where: (== acct 'b)}))", "2");
+
+    /* The parted view itself must stay usable after the reads. */
+    ASSERT_EQ("(at pl 'acct)", "['a 'b 'a 'b]");
+    PASS();
+}
+
+static test_result_t test_eval_parted_list_column(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root),
+                     "/tmp/rayforce_lang_parted_list_col_%ld",
+                     (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t result = test_eval_parted_list_column_impl(root);
+    lang_parted_insert_rm_rf(root);
+    return result;
+}
+
 /* ---- Test: upsert (update existing row) ---- */
 static test_result_t test_eval_upsert(void) {
     /* Upsert by 'name key — row with name=2 exists, update it */
@@ -8639,6 +8711,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_physical_types", test_eval_insert_parted_physical_types, lang_setup, lang_teardown },
+    { "lang/eval/parted_list_column", test_eval_parted_list_column, lang_setup, lang_teardown },
     { "lang/eval/upsert", test_eval_upsert, lang_setup, lang_teardown },
     { "lang/eval/upsert_f64_key", test_eval_upsert_f64_key, lang_setup, lang_teardown },
     { "lang/eval/upsert_str_key", test_eval_upsert_str_key, lang_setup, lang_teardown },
