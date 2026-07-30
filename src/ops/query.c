@@ -308,6 +308,19 @@ static bool dag_pow_type_admitted(int8_t t) {
     return dag_numeric_type_admitted(t);
 }
 
+static bool dag_type_is_temporal(int8_t t) {
+    if (t <= 0) return false;
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+static bool dag_temporal_arith_needs_eval(const char* name, size_t len,
+                                          int8_t left_type, int8_t right_type) {
+    if (!dag_type_is_temporal(left_type) && !dag_type_is_temporal(right_type))
+        return false;
+    return len == 1 && (name[0] == '+' || name[0] == '-' || name[0] == '*');
+}
+
 static bool dag_unary_numeric_name(const char* name, size_t len) {
     if (len == 3)
         return memcmp(name, "sin", 3) == 0 ||
@@ -1567,6 +1580,10 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 ray_op_t* right = compile_expr_dag(g, elems[2]);
                 if (!right) return NULL;
                 left = &g->nodes[left_id];
+                if (dag_temporal_arith_needs_eval(fname, fname_len,
+                                                  left->out_type,
+                                                  right->out_type))
+                    return NULL;
                 if (fname_len == 3 && memcmp(fname, "pow", 3) == 0 &&
                     (!dag_pow_type_admitted(left->out_type) ||
                      !dag_pow_type_admitted(right->out_type)))
@@ -4302,6 +4319,95 @@ static ray_t* atom_broadcast_vec(ray_t* a, int64_t n) {
             memset(v->aux, 0xFF, 16);
     }
     return v;
+}
+
+static ray_t* scalar_result_col(ray_t* value) {
+    if (!value || RAY_IS_ERR(value)) return value ? value : ray_error("domain", "select: scalar aggregate produced no result");
+
+    if (ray_is_atom(value)) {
+        ray_t* col = atom_broadcast_vec(value, 1);
+        if (col) return col;
+
+        ray_t* boxed = ray_alloc(sizeof(ray_t*));
+        if (!boxed) return ray_error("oom", NULL);
+        boxed->type = RAY_LIST;
+        boxed->len = 1;
+        ((ray_t**)ray_data(boxed))[0] = value;
+        ray_retain(value);
+        return boxed;
+    }
+
+    if (ray_len(value) != 1)
+        return ray_error("length", "select: scalar aggregate produced %lld rows", (long long)ray_len(value));
+    ray_retain(value);
+    return value;
+}
+
+static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
+                                      ray_t* tbl,
+                                      int64_t from_id, int64_t where_id,
+                                      int64_t by_id, int64_t take_id,
+                                      int64_t asc_id, int64_t desc_id,
+                                      int64_t nearest_id) {
+    ray_t* result = ray_table_new(0);
+    if (!result || RAY_IS_ERR(result))
+        return result ? result : ray_error("oom", NULL);
+
+    int64_t nrows = ray_table_nrows(tbl);
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id ||
+            kid == take_id || kid == asc_id || kid == desc_id ||
+            kid == nearest_id) continue;
+
+        ray_t* val_expr = dict_elems[i + 1];
+        if (!is_agg_expr(val_expr)) {
+            ray_release(result);
+            return ray_error("domain", "select: scalar aggregate fallback saw non-aggregate output");
+        }
+
+        ray_t** agg_elems = (ray_t**)ray_data(val_expr);
+        if (ray_len(val_expr) != 2) {
+            ray_release(result);
+            return ray_error("domain", "select: scalar aggregate fallback only supports unary aggregates");
+        }
+
+        ray_t* fn_obj = ray_env_get(agg_elems[0]->i64);
+        if (!fn_obj || fn_obj->type != RAY_UNARY) {
+            ray_release(result);
+            return ray_error("type", "select: aggregate must be a unary function, got %s",
+                             fn_obj ? ray_type_name(fn_obj->type) : "null");
+        }
+
+        ray_t* src = eval_expr_per_row(agg_elems[1], tbl, nrows);
+        if (!src || RAY_IS_ERR(src)) {
+            ray_release(result);
+            return src ? src : ray_error("domain", "select: failed to evaluate aggregation source");
+        }
+
+        ray_unary_fn uf = (ray_unary_fn)(uintptr_t)fn_obj->i64;
+        ray_t* agg_value = uf(src);
+        ray_release(src);
+        if (agg_value && !RAY_IS_ERR(agg_value) && ray_is_lazy(agg_value))
+            agg_value = ray_lazy_materialize(agg_value);
+        if (!agg_value || RAY_IS_ERR(agg_value)) {
+            ray_release(result);
+            return agg_value ? agg_value : ray_error("domain", "select: scalar aggregate evaluation failed");
+        }
+
+        ray_t* col = scalar_result_col(agg_value);
+        ray_release(agg_value);
+        if (!col || RAY_IS_ERR(col)) {
+            ray_release(result);
+            return col ? col : ray_error("domain", "select: failed to materialize scalar aggregate");
+        }
+        result = ray_table_add_col(result, kid, col);
+        ray_release(col);
+        if (!result || RAY_IS_ERR(result))
+            return result ? result : ray_error("oom", NULL);
+    }
+
+    return result;
 }
 
 /* (select {from: t [where: pred] [by: key] [col: expr ...]})
@@ -9285,6 +9391,7 @@ by_dict_done:
             uint16_t*  s_agg_ops  = (uint16_t*)(s_agg_ins2 + s_max);
             int64_t    s_n_aggs = 0;
             int        s_has_binary = 0;
+            int        s_use_eval_fallback = 0;
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id ||
@@ -9296,13 +9403,8 @@ by_dict_done:
                 s_agg_ins[s_n_aggs] = compile_expr_dag(g, agg_elems[1]);
                 s_agg_ins2[s_n_aggs] = NULL;
                 if (!s_agg_ins[s_n_aggs]) {
-                    if (g->selection) {
-                        ray_release(g->selection);
-                        g->selection = NULL;
-                    }
-                    ray_graph_free(g); ray_release(tbl);
-                    scratch_free(sagg_hdr);
-                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select: failed to compile aggregation argument");
+                    s_use_eval_fallback = 1;
+                    break;
                 }
                 /* Canonical aggregand type-admission (same table as the scalar
                  * builtins): reject non-numeric (SYM/STR/GUID) and, for sum,
@@ -9325,10 +9427,8 @@ by_dict_done:
                     }
                     s_agg_ins2[s_n_aggs] = compile_expr_dag(g, agg_elems[2]);
                     if (!s_agg_ins2[s_n_aggs]) {
-                        if (g->selection) { ray_release(g->selection); g->selection = NULL; }
-                        ray_graph_free(g); ray_release(tbl);
-                        scratch_free(sagg_hdr);
-                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select: failed to compile binary aggregation second argument");
+                        s_use_eval_fallback = 1;
+                        break;
                     }
                     if (s_agg_ins2[s_n_aggs]->out_type > 0 &&
                         !agg_type_admitted(op, s_agg_ins2[s_n_aggs]->out_type)) {
@@ -9341,6 +9441,29 @@ by_dict_done:
                     s_has_binary = 1;
                 }
                 s_n_aggs++;
+            }
+            if (s_use_eval_fallback) {
+                ray_t* eval_tbl = tbl;
+                int release_eval_tbl = 0;
+                if (g->selection) {
+                    eval_tbl = sel_compact(g, tbl, g->selection, NULL, 0);
+                    if (!eval_tbl || RAY_IS_ERR(eval_tbl)) {
+                        if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                        ray_graph_free(g); ray_release(tbl);
+                        scratch_free(sagg_hdr);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return eval_tbl ? eval_tbl : ray_error("oom", NULL);
+                    }
+                    release_eval_tbl = 1;
+                }
+                ray_t* result = eval_scalar_agg_outputs(dict_elems, dict_n, eval_tbl,
+                                                        from_id, where_id, by_id,
+                                                        take_id, asc_id, desc_id,
+                                                        nearest_id);
+                if (release_eval_tbl) ray_release(eval_tbl);
+                if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                ray_graph_free(g); ray_release(tbl);
+                scratch_free(sagg_hdr);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
             }
             if (s_has_binary)
                 root = ray_group_build(g, NULL, 0, s_agg_ops, s_agg_ins,
