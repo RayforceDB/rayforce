@@ -33,6 +33,13 @@ jobs:
           body="audit-output/rayforce-audit-comment.md"
           report="audit-output/rayforce-audit.md"
 
+          case "$RUN_CONCLUSION" in
+            cancelled|skipped)
+              echo "::notice title=Rayforce audit comment skipped::Audit workflow run ${RUN_ID} ended with conclusion '${RUN_CONCLUSION}', so no PR comment is needed."
+              exit 0
+              ;;
+          esac
+
           pr_number=$(python3 - <<'PY'
           import json, os
           with open(os.environ['GITHUB_EVENT_PATH'], 'r', encoding='utf-8') as f:
@@ -96,8 +103,10 @@ jobs:
 
           Workflow run: ${RUN_URL}
           EOF_PASS
-              gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" \
-                -f body="$(cat "$body")" >/dev/null
+              if ! gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" \
+                -f body="$(cat "$body")" >/dev/null; then
+                echo "::notice title=Rayforce audit comment write failed::Could not update the existing PR comment. The required check and artifact remain authoritative."
+              fi
             fi
             exit 0
           fi
@@ -124,9 +133,13 @@ jobs:
             | tail -n 1)
 
           if [ -n "$comment_id" ]; then
-            gh api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" \
-              -f body="$(cat "$body")" >/dev/null
+            if ! gh api -X PATCH "repos/${REPO}/issues/comments/${comment_id}" \
+              -f body="$(cat "$body")" >/dev/null; then
+              echo "::notice title=Rayforce audit comment write failed::Could not update the existing PR comment. The required check and artifact remain authoritative."
+            fi
           else
-            gh api -X POST "repos/${REPO}/issues/${pr_number}/comments" \
-              -f body="$(cat "$body")" >/dev/null
+            if ! gh api -X POST "repos/${REPO}/issues/${pr_number}/comments" \
+              -f body="$(cat "$body")" >/dev/null; then
+              echo "::notice title=Rayforce audit comment write failed::Could not create the PR comment. The required check and artifact remain authoritative."
+            fi
           fi
