@@ -145,6 +145,14 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
     if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
         return atomic_map_binary_op(ray_sub_fn, OP_SUB, a, b);
 
+    /* Match add: temporal offsets must be integer typed.  Without this,
+     * DATE/TIME/TIMESTAMP - F64 reads the float payload through as_i64() and
+     * either truncates semantics or uses raw union bits. */
+    if (((a->type == -RAY_F64 || a->type == -RAY_F32) && is_temporal(b)) ||
+        (is_temporal(a) && (b->type == -RAY_F64 || b->type == -RAY_F32)))
+        return ray_error("type", "subtract: temporal arithmetic requires integer offsets, got %s and %s",
+                         ray_type_name(a->type), ray_type_name(b->type));
+
     /* Temporal - int null propagation (both operands) */
     if (is_temporal(a) && is_numeric(b)) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
@@ -218,6 +226,11 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
 ray_t* ray_mul_fn(ray_t* a, ray_t* b) {
     if ((a && RAY_IS_PARTED(a->type)) || (b && RAY_IS_PARTED(b->type)))
         return atomic_map_binary_op(ray_mul_fn, OP_MUL, a, b);
+
+    if (((a->type == -RAY_F64 || a->type == -RAY_F32) && b->type == -RAY_TIME) ||
+        (a->type == -RAY_TIME && (b->type == -RAY_F64 || b->type == -RAY_F32)))
+        return ray_error("type", "multiply: temporal arithmetic requires integer factors, got %s and %s",
+                         ray_type_name(a->type), ray_type_name(b->type));
 
     /* int * TIME → TIME, TIME * int → TIME */
     if (is_numeric(a) && b->type == -RAY_TIME) {
