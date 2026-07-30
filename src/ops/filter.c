@@ -70,6 +70,35 @@ static void parted_gather_col(ray_t* parted_col, const int64_t* match_idx,
 
 /* Filter a single vector by boolean predicate. */
 static ray_t* exec_filter_vec(ray_t* input, ray_t* pred, int64_t pass_count) {
+    /* RAY_LIST: cells are ray_t* — gather them with a retain.  The
+     * byte-copy loop below would alias elements without a refcount (and
+     * col_vec_new rejects RAY_LIST, type 0, outright). */
+    if (input->type == RAY_LIST) {
+        if (input->len != pred->len)
+            return ray_error("length", "filter: predicate length must match input, got %lld and %lld",
+                             (long long)input->len, (long long)pred->len);
+        ray_t* result = ray_list_new(pass_count);
+        if (!result || RAY_IS_ERR(result)) return result;
+        ray_t** dst = (ray_t**)ray_data(result);
+        ray_morsel_t mi, mf;
+        ray_morsel_init(&mi, input);
+        ray_morsel_init(&mf, pred);
+        int64_t out_idx = 0;
+        while (ray_morsel_next(&mi) && ray_morsel_next(&mf)) {
+            uint8_t* bits = (uint8_t*)mf.morsel_ptr;
+            ray_t** src = (ray_t**)mi.morsel_ptr;
+            for (int64_t i = 0; i < mi.morsel_len; i++) {
+                if (!bits[i]) continue;
+                if (out_idx >= pass_count) break;
+                ray_t* e = src[i];
+                if (e) ray_retain(e);
+                dst[out_idx++] = e;
+            }
+        }
+        result->len = out_idx;
+        return result;
+    }
+
     uint8_t esz = col_esz(input);
     ray_t* result = col_vec_new(input, pass_count);
     if (!result || RAY_IS_ERR(result)) return result;
