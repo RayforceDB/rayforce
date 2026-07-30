@@ -1836,11 +1836,16 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 /* RAY_STR: deep-copy to handle multi-pool segments */
                 if (base == RAY_STR)
                     return parted_flatten_str(sps, col->len, total);
+                /* RAY_LIST: share (retain) elements — byte-copy would
+                 * alias them without a refcount (issue #355). */
+                if (base == RAY_LIST)
+                    return parted_flatten_list(sps, col->len, total);
 
                 uint8_t sba = (base == RAY_SYM)
                             ? parted_sym_max_attrs(sps, col->len) : 0;
                 ray_t* flat = typed_vec_new(base, sba, total);
-                if (!flat || RAY_IS_ERR(flat)) return ray_error("oom", NULL);
+                if (!flat || RAY_IS_ERR(flat))
+                    return flat ? flat : ray_error("oom", NULL);
                 flat->len = total;
                 ray_t** segs = sps;
                 int64_t off = 0;
@@ -2891,6 +2896,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         ray_t* head_vec;
                         if (base == RAY_STR) {
                             head_vec = parted_head_str(sp, col->len, n);
+                        } else if (base == RAY_LIST) {
+                            head_vec = parted_head_list(sp, col->len, n);
                         } else {
                             uint8_t ba = (base == RAY_SYM)
                                        ? parted_sym_max_attrs(sp, col->len) : 0;
@@ -3022,6 +3029,8 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         ray_t* tail_vec;
                         if (base == RAY_STR) {
                             tail_vec = parted_tail_str(tsp, col->len, n);
+                        } else if (base == RAY_LIST) {
+                            tail_vec = parted_tail_list(tsp, col->len, n);
                         } else {
                             uint8_t tba = (base == RAY_SYM)
                                         ? parted_sym_max_attrs(tsp, col->len) : 0;
@@ -3691,9 +3700,11 @@ static ray_t* flatten_parted_col(ray_t* col) {
     int64_t total = ray_parted_nrows(col);
     if (base == RAY_STR)
         return parted_flatten_str(segs, col->len, total);
+    if (base == RAY_LIST)
+        return parted_flatten_list(segs, col->len, total);
     uint8_t sba = (base == RAY_SYM) ? parted_sym_max_attrs(segs, col->len) : 0;
     ray_t* flat = typed_vec_new(base, sba, total);
-    if (!flat || RAY_IS_ERR(flat)) return ray_error("oom", NULL);
+    if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
     flat->len = total;
     int64_t off = 0;
     uint8_t seg_nulls = 0;

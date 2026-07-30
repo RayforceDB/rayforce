@@ -3380,6 +3380,7 @@ static ray_t* query_materialize_parted_col(ray_t* col) {
     ray_t** segs = (ray_t**)ray_data(col);
     int64_t total = ray_parted_nrows(col);
     if (base == RAY_STR) return parted_flatten_str(segs, col->len, total);
+    if (base == RAY_LIST) return parted_flatten_list(segs, col->len, total);
 
     uint8_t attrs = (base == RAY_SYM) ? parted_sym_max_attrs(segs, col->len) : 0;
     ray_t* flat = typed_vec_new(base, attrs, total);

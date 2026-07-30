@@ -448,6 +448,139 @@ static inline ray_t* parted_flatten_str(ray_t** segs, int64_t n_segs, int64_t to
     return out;
 }
 
+/* ── LIST analogues of the parted STR helpers ────────────────────────────
+ * A LIST cell is a ray_t* — every copy below SHARES elements via
+ * ray_retain, never byte-copies: a raw memcpy of the 8-byte pointers
+ * would alias the segments' elements without a refcount and double-free
+ * on release (issue #355).  NULL segments contribute zero rows, matching
+ * parted_gather_col's row numbering. */
+
+/* Flatten all rows from parted RAY_LIST segments. */
+static inline ray_t* parted_flatten_list(ray_t** segs, int64_t n_segs,
+                                         int64_t total) {
+    ray_t* out = ray_list_new(total);
+    if (!out || RAY_IS_ERR(out)) return out;
+    ray_t** dst = (ray_t**)ray_data(out);
+    int64_t pos = 0;
+    for (int64_t s = 0; s < n_segs; s++) {
+        if (!segs[s]) continue;
+        ray_t** src = (ray_t**)ray_data(segs[s]);
+        for (int64_t i = 0; i < segs[s]->len && pos < total; i++) {
+            ray_t* e = src[i];
+            if (e) ray_retain(e);
+            dst[pos++] = e;
+        }
+    }
+    out->len = pos;
+    return out;
+}
+
+/* First n rows from parted RAY_LIST segments. */
+static inline ray_t* parted_head_list(ray_t** segs, int64_t n_segs, int64_t n) {
+    ray_t* out = ray_list_new(n);
+    if (!out || RAY_IS_ERR(out)) return out;
+    ray_t** dst = (ray_t**)ray_data(out);
+    int64_t pos = 0;
+    for (int64_t s = 0; s < n_segs && pos < n; s++) {
+        if (!segs[s]) continue;
+        ray_t** src = (ray_t**)ray_data(segs[s]);
+        for (int64_t i = 0; i < segs[s]->len && pos < n; i++) {
+            ray_t* e = src[i];
+            if (e) ray_retain(e);
+            dst[pos++] = e;
+        }
+    }
+    out->len = pos;
+    return out;
+}
+
+/* Last n rows from parted RAY_LIST segments. */
+static inline ray_t* parted_tail_list(ray_t** segs, int64_t n_segs, int64_t n) {
+    int64_t total = 0;
+    for (int64_t s = 0; s < n_segs; s++)
+        if (segs[s]) total += segs[s]->len;
+    int64_t skip = total - n;
+    if (skip < 0) skip = 0;
+
+    ray_t* out = ray_list_new(total - skip);
+    if (!out || RAY_IS_ERR(out)) return out;
+    ray_t** dst = (ray_t**)ray_data(out);
+    int64_t pos = 0, seen = 0;
+    for (int64_t s = 0; s < n_segs; s++) {
+        if (!segs[s]) continue;
+        ray_t** src = (ray_t**)ray_data(segs[s]);
+        for (int64_t i = 0; i < segs[s]->len; i++, seen++) {
+            if (seen < skip) continue;
+            ray_t* e = src[i];
+            if (e) ray_retain(e);
+            dst[pos++] = e;
+        }
+    }
+    out->len = pos;
+    return out;
+}
+
+/* Gather rows (global row indices, sorted ascending) from parted RAY_LIST
+ * segments — LIST counterpart of parted_gather_str_rows. */
+static inline ray_t* parted_gather_list_rows(ray_t** segs, int64_t n_segs,
+                                             const int64_t* idx,
+                                             int64_t count) {
+    ray_t* out = ray_list_new(count);
+    if (!out || RAY_IS_ERR(out)) return out;
+    ray_t** dst = (ray_t**)ray_data(out);
+    int64_t seg = 0;
+    int64_t seg_start = 0;
+    int64_t seg_end = (n_segs > 0 && segs[0]) ? segs[0]->len : 0;
+    for (int64_t j = 0; j < count; j++) {
+        int64_t r = idx[j];
+        while (seg < n_segs - 1 && r >= seg_end) {
+            seg_start = seg_end;
+            seg++;
+            seg_end += segs[seg] ? segs[seg]->len : 0;
+        }
+        ray_t* e = NULL;
+        if (segs[seg] && r >= seg_start && r - seg_start < segs[seg]->len)
+            e = ((ray_t**)ray_data(segs[seg]))[r - seg_start];
+        if (e) ray_retain(e);
+        dst[j] = e;
+    }
+    out->len = count;
+    return out;
+}
+
+/* Filter parted RAY_LIST segments by a boolean predicate over the column's
+ * global rows. */
+static inline ray_t* parted_filter_list(ray_t** segs, int64_t n_segs,
+                                        const uint8_t* pred,
+                                        int64_t pass_count) {
+    ray_t* out = ray_list_new(pass_count);
+    if (!out || RAY_IS_ERR(out)) return out;
+    ray_t** dst = (ray_t**)ray_data(out);
+    int64_t off = 0, pos = 0;
+    for (int64_t s = 0; s < n_segs; s++) {
+        if (!segs[s]) continue;
+        ray_t** src = (ray_t**)ray_data(segs[s]);
+        for (int64_t i = 0; i < segs[s]->len; i++) {
+            if (!pred[off + i]) continue;
+            if (pos >= pass_count) break;
+            ray_t* e = src[i];
+            if (e) ray_retain(e);
+            dst[pos++] = e;
+        }
+        off += segs[s]->len;
+    }
+    out->len = pos;
+    return out;
+}
+
+/* True for a parted column whose segments are RAY_LIST vectors — such a
+ * column must go through the retaining LIST helpers above, never the
+ * byte-copy gather kernels. */
+static inline bool parted_base_is_list(const ray_t* col) {
+    return RAY_IS_PARTED(col->type) &&
+           (int8_t)RAY_PARTED_BASETYPE(col->type) == RAY_LIST;
+}
+
 /* Same but from explicit type + attrs (for parted base type, etc.) */
 static inline ray_t* typed_vec_new(int8_t type, uint8_t attrs, int64_t cap) {
     if (type == RAY_SYM)
