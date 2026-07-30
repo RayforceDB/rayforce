@@ -283,6 +283,7 @@
 (sum (at (select {r: (if (> v 0) v (sqrt s)) from: Tiflazy}) 'r)) -- 15
 (sum (at (select {r: (if (< v 0) (sqrt s) v) from: Tiflazy}) 'r)) -- 15
 (set Tifdate (table [v s d] (list [-1 1 2 -2] (as 'STR (list "2024.01.01" "bad" "bad" "2024.01.03")) [2020.01.01 2020.01.02 2020.01.03 2020.01.04])))
+(type (at (select {r: (if (< v 0) (as 'DATE s) d) from: Tifdate}) 'r)) -- 'DATE
 (at (select {r: (if (< v 0) (as 'DATE s) d) from: Tifdate}) 'r) -- [2024.01.01 2020.01.02 2020.01.03 2024.01.03]
 
 ;; do in DAG: evaluates last expression
